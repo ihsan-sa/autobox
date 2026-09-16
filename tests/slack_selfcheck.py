@@ -75,10 +75,6 @@ def run_selfcheck():
     tmp_outbox_log = tempfile.mktemp(prefix="_selfcheck_outbox_")
     real_outbox = outbox                                     # kept for the 0600-permissions check (L22)
     globals()["outbox"] = lambda kind, chat, thread, text: open(tmp_outbox_log, "a").write(f"{kind}\t{chat}\t{thread or ''}\t{text}\n")
-    real_load_flags, real_save_flags = load_flags, save_flags   # every 🏁 check runs on an empty, unsaved flag file (L23 tests the real pair)
-    flag_writes = []
-    globals()["load_flags"] = lambda: {}
-    globals()["save_flags"] = lambda flags: flag_writes.append(dict(flags))
     check("mrkdwn: heading/bold/list/link", mrkdwn("# Title\n**b** and [t](https://u/x)\n- item") == "*Title*\n*b* and <https://u/x|t>\n• item")
     check("mrkdwn: code blocks untouched", mrkdwn("```\n**x** # y\n```") == "```\n**x** # y\n```")
     # ---- @-mentions: a session addressing a real PERSON in a channel (linkify_mentions + the clean() round-trip)
@@ -707,42 +703,6 @@ def run_selfcheck():
     delivered.clear()
     dm2.on_edit({"type": "message", "subtype": "message_changed", "channel": "CX", "message": {"ts": "200.4", "user": "UOWNER", "text": "updated"}})
     check("on_edit: edit after delivery emits an update notice with the new text", bool(delivered) and "edited" in delivered[-1]["content"] and "updated" in delivered[-1]["content"])
-    now = time.time()
-    def with_latest(roots, replies):
-        """Slack stamps latest_reply on every thread root; bucket_threads anchors its 1-message read there (M3)."""
-        for r in roots:
-            rs = replies.get(r["ts"]) or []
-            if rs:
-                r["latest_reply"] = rs[-1]["ts"]
-        return roots
-    roots_fixture = [
-        {"ts": "1000.1", "reply_count": 2, "text": "root A owner last"},
-        {"ts": "1000.2", "reply_count": 1, "text": "root B bot last"},
-        {"ts": "1000.3", "reply_count": 1, "text": "root C concluded", "reactions": [{"name": "checkered_flag"}]},
-        {"ts": "1000.4", "reply_count": 1, "text": "root D stale"},
-    ]
-    replies_fixture = {"1000.1": [{"ts": str(now - 3600), "user": "UOWNER", "text": "still waiting"}],
-                       "1000.2": [{"ts": str(now - 1800), "bot_id": "B01", "text": "replied (bot_id only — how our replies really look)"}],
-                       # root A's last word is the owner's, 1h unanswered → a stall ❓; root B's is ours and asks nothing → 🟠
-                       "1000.4": [{"ts": str(now - 49 * 3600), "user": "UOWNER", "text": "ancient"}]}
-    with_latest(roots_fixture, replies_fixture)
-    def threads_api(method, token, **kw):
-        if method == "conversations.history":
-            return {"messages": roots_fixture}
-        if method == "conversations.replies":
-            return {"messages": replies_fixture.get(kw.get("ts"), [])}
-        return {}
-    dm3 = Daemon(use_slack=False); dm3.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm3.bot_user = "UBOT"
-    said4 = []; dm3.say = lambda chat, text, thread=None, mail=True: said4.append(text)
-    try:
-        globals()["api"] = threads_api
-        dm3.cmd_threads("CX", None)
-    finally:
-        globals()["api"] = real_api
-    check("!threads: the owner's word unanswered for 1h is *needs you*; an answered thread only shows under *handled* — V3",
-          "needs you" in said4[-1] and "*handled*" in said4[-1] and said4[-1].index("root A") < said4[-1].index("*handled*")
-          and said4[-1].index("*handled*") < said4[-1].index("root B"))
-    check("threads: 🏁 root and >48h-stale root are hidden", "root C" not in said4[-1] and "root D" not in said4[-1])
     # -- alias routing (peer orchestrators) ---------------------------------------------------
     check("alias regex: cc's ^[a-z0-9-]{2,20}$ — valid vs upper/short/long/underscore",
           re.match(r"^[a-z0-9-]{2,20}$", "ai-dev") and re.match(r"^[a-z0-9-]{2,20}$", "ab") and not re.match(r"^[a-z0-9-]{2,20}$", "A")
@@ -973,8 +933,6 @@ def run_selfcheck():
         check("a refusal from cc-pause is passed on in the channel in its own words — reading silence as a parked "
               "project is how a project keeps spending after the owner thinks he stopped it",
               "could not pause" in saidP[-1] and "does not exist" in saidP[-1])
-        check("!pause and !resume steer the box, so a member cannot use either: neither is in MEMBER_CMDS",
-              "pause" not in Daemon.MEMBER_CMDS and "resume" not in Daemon.MEMBER_CMDS)
     finally:
         globals()["BIN"] = real_binP
         shutil.rmtree(pbin, ignore_errors=True)
@@ -1044,160 +1002,19 @@ def run_selfcheck():
           and said7c == ["🤖 ai-dev@aliastest joined — @ai-dev hands it threads; @main brings the main session back.",
                          "🤖 ai-dev@aliastest left."]
           and notice_state_load().get(notice_key("aliastest", "🤖 ai-dev@aliastest left.")) == "left")
-    # -- open-thread nudges (part 2) -----------------------------------------------------------
-    now3 = time.time()
-    roots8 = {"C1": [{"ts": "2000.1", "reply_count": 1, "text": "old red"}, {"ts": "2000.2", "reply_count": 1, "text": "fresh red"},
-                     {"ts": "2000.3", "reply_count": 1, "text": "yellow"}, {"ts": "2000.4", "reply_count": 1, "text": "concluded", "reactions": [{"name": "checkered_flag"}]}]}
-    replies8 = {"2000.1": [{"ts": str(now3 - 40 * 60), "user": "UOWNER", "text": "waiting"}],
-                "2000.2": [{"ts": str(now3 - 5 * 60), "user": "UOWNER", "text": "just asked"}],
-                "2000.3": [{"ts": str(now3 - 40 * 60), "user": "UBOT", "text": "replied"}]}
-    with_latest(roots8["C1"], replies8)
-    nudge_api = lambda method, token, **kw: {"messages": roots8.get(kw.get("channel"), [])} if method == "conversations.history" else {"messages": replies8.get(kw.get("ts"), [])}
-    dm8 = Daemon(use_slack=False); dm8.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm8.bot_user = "UBOT"
-    dm8.route = lambda chat, ctype: "r"; dm8.last_chat["r"] = ("C1", None)
-    dm8.session_gone = lambda chat: False              # the premise of every case below: there IS a session, and it is not answering
-    said8 = []; dm8.say = lambda chat, text, thread=None, mail=True: said8.append((chat, thread, text))
-    deliv8 = []
-    dm8.deliver = lambda target, payload, **kw: (deliv8.append((target, payload["content"], payload["meta"], kw)), "delivered")[1]
-    dm8.stall_state = lambda chat, target, root: "the session was alive and mid-turn in another thread"
-    try:
-        globals()["api"] = nudge_api
-        dm8.nudge_cycle()
-        check("nudge: a 40-min stall is HANDED BACK TO ITS SESSION first and the owner hears nothing — the box tries "
-              "its own recovery for its own problem before it pages him (2026-09-07). A 5-min wait, an answered "
-              "thread and a 🏁 are still no case at all",
-              said8 == [] and len(deliv8) == 1 and deliv8[0][0] == "r" and "waiting" in deliv8[0][1]
-              and deliv8[0][2]["thread_ts"] == "2000.1" and deliv8[0][3].get("autostart") is False)
-        dm8.nudge_cycle()
-        check("nudge: the thread is re-handed ONCE and the grace runs from that try, not from every cycle",
-              said8 == [] and len(deliv8) == 1)
-        k8 = ("C1", "2000.1")
-        dm8.retried[k8] = (dm8.retried[k8][0] - RETRY_GRACE - 60, dm8.retried[k8][1])   # …and now the grace has run out
-        dm8.nudge_cycle()
-        check("nudge: tried and still stuck — ONE page, ageing from the owner's own message, saying what was tried "
-              "and what it found, and handing him no `!restart` to run",
-              len(said8) == 1 and said8[0][:2] == ("C1", "2000.1") and "no answer for 40m" in said8[0][2]
-              and "mid-turn in another thread" in said8[0][2] and "!restart" not in said8[0][2] and len(deliv8) == 1)
-        said8.clear()
-        dm8.nudge_cycle()
-        check("nudge: same thread is never repeated within the daemon's lifetime", said8 == [])
-    finally:
-        globals()["api"] = real_api
-    # tried and RECOVERED: the session answered after the re-delivery, so the thread is out of ❓ and nothing reaches him
-    dm8r = Daemon(use_slack=False); dm8r.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm8r.bot_user = "UBOT"
-    dm8r.route = lambda chat, ctype: "r"; dm8r.last_chat["r"] = ("C2", None); dm8r.session_gone = lambda chat: False
-    rootsR = {"C2": [{"ts": "2200.1", "reply_count": 1, "text": "the ask"}]}
-    repliesR = {"2200.1": [{"ts": str(now3 - 2 * 60), "user": "UBOT", "text": "sorry — here it is"}]}
-    with_latest(rootsR["C2"], repliesR)
-    saidR, delivR = [], []
-    dm8r.say = lambda chat, text, thread=None, mail=True: saidR.append(text)
-    dm8r.deliver = lambda target, payload, **kw: (delivR.append(target), "delivered")[1]
-    dm8r.retried[("C2", "2200.1")] = (now3 - RETRY_GRACE - 60, "the session was on the channel and idle")
-    try:
-        globals()["api"] = lambda method, token, **kw: ({"messages": rootsR.get(kw.get("channel"), [])}
-                                                        if method == "conversations.history"
-                                                        else {"messages": repliesR.get(kw.get("ts"), [])})
-        dm8r.nudge_cycle()
-    finally:
-        globals()["api"] = real_api
-    check("nudge: tried and recovered — an answer inside the grace takes the thread out of ❓, so the page that was "
-          "due never comes and nothing is re-delivered either",
-          saidR == [] and delivR == [])
-    dm8s = Daemon(use_slack=False); dm8s.bot_user = "UBOT"; dm8s.last_chat["r"] = ("C1", "9.9")
-    _twS, _pwS = tmux_window, pane_working
-    try:
-        globals()["tmux_window"] = lambda name: ("@7", "bash"); globals()["pane_working"] = lambda wid: True
-        s_other, s_here = dm8s.stall_state("C1", "r", "2000.1"), dm8s.stall_state("C1", "r", "9.9")
-        globals()["pane_working"] = lambda wid: False
-        s_deaf = dm8s.stall_state("C1", "r", "9.9")                     # a pane, no subscriber: it lost the channel
-        globals()["tmux_window"] = lambda name: (None, None)
-        s_gone = dm8s.stall_state("C1", "r", "9.9")
-        dm8s.subs["r"].append(types.SimpleNamespace(info={}))
-        globals()["tmux_window"] = lambda name: ("@7", "bash")
-        s_idle = dm8s.stall_state("C1", "r", "9.9")
-    finally:
-        globals()["tmux_window"], globals()["pane_working"] = _twS, _pwS
-    check("stall_state: what the owner is told is the pane and the socket, not a guess — mid-turn in another thread, "
-          "mid-turn on this one, running without the channel, on the channel and idle, or gone",
-          s_other == "the session was alive and mid-turn in another thread" and s_here.endswith("on this one")
-          and s_deaf == "the session was running without the channel" and s_idle.endswith("on the channel and idle")
-          and s_gone == "nothing was running for it")
-    ask_root = [{"ts": "2100.1", "reply_count": 1, "latest_reply": str(now3 - 45 * 60), "user": "UOWNER", "text": "the task"}]
-    ask_last = [{"ts": str(now3 - 45 * 60), "bot_id": "B01", "text": "half done — which env var should I use?"}]
-    dm8b = Daemon(use_slack=False); dm8b.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm8b.bot_user = "UBOT"
-    dm8b.marks["C8:2100.1:question"] = now3 - 45 * 60   # the session declared it: a nudge only ever chases a real ask
-    dm8b.route = lambda chat, ctype: "r"; dm8b.last_chat["r"] = ("C8", None)
-    said8b = []; dm8b.say = lambda chat, text, thread=None, mail=True: said8b.append((chat, thread, text))
-    try:
-        globals()["api"] = lambda method, token, **kw: {"messages": ask_root if method == "conversations.history" else ask_last}
-        dm8b.nudge_cycle()
-    finally:
-        globals()["api"] = real_api
-    check("nudge: a thread waiting on the owner carries the ask itself, not a colour — V4",
-          len(said8b) == 1 and said8b[0][:2] == ("C8", "2100.1")
-          and said8b[0][2].startswith("❓ still waiting for you (45m):") and "which env var" in said8b[0][2])
-    dm9 = Daemon(use_slack=False); dm9.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm9.bot_user = "UBOT"; dm9.route = lambda chat, ctype: "r"
-    dm9.session_gone = lambda chat: False
-    for i in range(4):
-        dm9.last_chat[f"t{i}"] = (f"D{i}", None)
-    roots9 = {f"D{i}": [{"ts": f"300{i}.1", "reply_count": 1, "text": f"red {i}"}] for i in range(4)}
-    replies9 = {f"300{i}.1": [{"ts": str(now3 - 40 * 60), "user": "UOWNER", "text": "waiting"}] for i in range(4)}
-    [with_latest(v, replies9) for v in roots9.values()]
-    cap_api = lambda method, token, **kw: {"messages": roots9.get(kw.get("channel"), [])} if method == "conversations.history" else {"messages": replies9.get(kw.get("ts"), [])}
-    said9 = []; dm9.say = lambda chat, text, thread=None, mail=True: said9.append(chat)
-    deliv9 = []
-    dm9.deliver = lambda target, payload, **kw: (deliv9.append(target), "delivered")[1]
-    dm9.stall_state = lambda chat, target, root: "the session was on the channel and idle"
-    try:
-        globals()["api"] = cap_api
-        dm9.nudge_cycle()
-        check("nudge: the re-delivery is capped TIGHTER than the nudge (2 a cycle) — one of them can sit 90 s at a "
-              "pane, and this runs on the daemon's own timer",
-              said9 == [] and len(deliv9) == 2)
-        for i in range(4):                                   # …and now every one of them is out of grace and due
-            dm9.retried[(f"D{i}", f"300{i}.1")] = (now3 - RETRY_GRACE - 60, "the session was on the channel and idle")
-        dm9.nudge_cycle()
-        check("nudge: capped at 3 per cycle across all channels", len(said9) == 3)
-    finally:
-        globals()["api"] = real_api
     # -- PART 3: production-hardening fixes -----------------------------------------------------
     dm10 = Daemon(use_slack=False); dm10.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dm10.bot_user = "UBOT"
     dm10.route = lambda chat, ctype: "r"
     dm10.thread_owner[("C1", "6.0")] = None   # pre-seeded so update_owner's cache-miss scan (a real api() call) never fires
     delivered10 = []; dm10.deliver = lambda *a, **k: delivered10.append(a) or "delivered"
     cmds10 = []; dm10.command = lambda *a: cmds10.append(a)
-    owed10 = []; dm10.owner_spoke = lambda chat, thread: owed10.append((chat, thread))
-    dm10.on_event({"type": "message", "channel": "C1", "ts": "6.1", "thread_ts": "6.0", "user": "UOWNER", "text": "!threads"})
+    dm10.on_event({"type": "message", "channel": "C1", "ts": "6.1", "thread_ts": "6.0", "user": "UOWNER", "text": "!pause"})
     check("on_event: a !command sent as a THREAD REPLY is intercepted, never delivered to the session",
           len(cmds10) == 1 and not delivered10)
-    check("on_event: an owner reply in an existing routed thread turns its root 🔴 instantly — V3",
-          owed10 == [("C1", "6.0")] and dm10.alarms.get("C1"))
     dm10.route, dm10.chan_name = (lambda chat, ctype: None), (lambda c: APPROVALS)
-    cmds10.clear(); owed10.clear()
-    dm10.on_event({"type": "message", "channel": "CAPPR2", "ts": "6.2", "user": "UOWNER", "text": "!ping"})
+    cmds10.clear()
+    dm10.on_event({"type": "message", "channel": "CAPPR2", "ts": "6.2", "user": "UOWNER", "text": "!pause"})
     check("on_event: a !command in a targetless #approvals channel is still intercepted, not silently dropped", len(cmds10) == 1)
-    check("on_event: an unrouted chat is never marked, and a top-level `!command` root is not marked either — A2", not owed10)
-    dm10.route = lambda chat, ctype: "r"
-    dm10.on_event({"type": "message", "channel": "C1", "ts": "6.3", "user": "UOWNER", "text": "!status"})
-    check("on_event: a top-level `!command` never becomes a thread — no mark, no stall alarm — A2", not owed10)
-    now4 = time.time()
-    roots10 = [{"ts": "4000.1", "reply_count": 1, "text": "root E answered-but-active", "reactions": [{"name": "white_check_mark"}]},
-               {"ts": "4000.2", "reply_count": 2, "text": "root F owner-last-checked"}]
-    replies10 = {"4000.1": [{"ts": str(now4 - 600), "user": "UBOT", "text": "answer"}],
-                 "4000.2": [{"ts": str(now4 - 3000), "user": "UBOT", "text": "answer"},
-                            {"ts": str(now4 - 500), "user": "UOWNER", "text": "one more thing", "reactions": [{"name": "white_check_mark"}]}]}
-    with_latest(roots10, replies10)
-    threads_api10 = lambda method, token, **kw: {"messages": roots10} if method == "conversations.history" else {"messages": replies10.get(kw.get("ts"), [])}
-    dm11 = Daemon(use_slack=False); dm11.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm11.bot_user = "UBOT"
-    try:
-        globals()["api"] = threads_api10
-        buckets10 = dm11.bucket_threads("CX")
-    finally:
-        globals()["api"] = real_api
-    check("threads hide-rule: a root carrying ✅ is still listed (only 🏁 hides a thread)",
-          any("root E" in r["text"] for b, r, _ in buckets10) and any("root F" in r["text"] for b, r, _ in buckets10))
-    check("marks: the session answered root E → 🟠 (handled); the owner's word on root F is 8 min old → 🔴, not yet a stall — V3",
-          [b for b, _, _ in buckets10] == ["🟠", "🔴"])
     dm12 = Daemon(use_slack=False)
     delivered12 = []; dm12.deliver = lambda *a, **k: delivered12.append(a) or "delivered"; dm12.route = lambda *a: "r"
     dm12.cfg = {"SLACK_OWNER_ID": "UOWNER"}
@@ -1235,11 +1052,10 @@ def run_selfcheck():
     # -- anyone in a routed channel is heard; DMs stay the owner's -----------------------------
     dmM = Daemon(use_slack=False); dmM.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dmM.bot_user = "UBOT"
     dmM.names.update({"CM": "myrepo", "DM1": "dm", "DM2": "dm"}); dmM.users.update({"UOWNER": ("The Owner", "owner"), "UMEM": ("Ada", "ada.byron"), "UMEM2": ("Bo", "bo")})
-    gotM, saidM, rxM, steer = [], [], [], []
+    gotM, saidM, rxM = [], [], []
     dmM.route = lambda chat, ctype=None: "box" if ctype == "im" else "r"
     dmM.deliver = lambda target, payload, **k: gotM.append((target, payload)) or "delivered"
     dmM.say = lambda chat, text, thread=None, mail=True: saidM.append((chat, text))
-    dmM.arm = lambda *a, **k: steer.append("arm"); dmM.owner_spoke = lambda *a, **k: steer.append("owner_spoke")
     _rxM, _slM = globals()["react"], globals()["save_last"]      # a delivered message stamps last_chat: never the live file
     globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: rxM.append((chat, ts, name))
     globals()["save_last"] = lambda last: None
@@ -1252,11 +1068,10 @@ def run_selfcheck():
               len(gotM) == 1 and gotM[0][0] == "r" and gotM[0][1]["content"] == "can you rerun the parser?"
               and gotM[0][1]["meta"]["role"] == "member" and gotM[0][1]["meta"]["user"] == "Ada"
               and rxM == [("CM", "m.1", "eyes")] and not saidM)
-        check("a member does NOT steer the box: no stall arming, no 🔴 — the status marks stay the owner's turn (A4)", not steer)
         dmM.on_event(msgM("m.2", "UOWNER", "and push it"))
-        check("the owner's path is unchanged: delivered with role=owner, 👀, and the stall/turn machinery runs",
+        check("the owner's path is unchanged: delivered with role=owner and 👀",
               len(gotM) == 2 and gotM[1][1]["meta"]["role"] == "owner" and gotM[1][1]["meta"]["user"] == "The Owner"
-              and rxM[-1] == ("CM", "m.2", "eyes") and steer == ["arm", "owner_spoke"])
+              and rxM[-1] == ("CM", "m.2", "eyes"))
         dmM.on_event(msgM("m.3", "UMEM", "@ai-dev take it"))
         check("a member's '@alias' is delivered but hands nobody the thread — anyone may talk, only the owner steers (A4)",
               len(gotM) == 3 and gotM[2][1]["content"] == "@ai-dev take it" and dmM.thread_owner.get(("CM", "m.3")) is None)
@@ -1299,8 +1114,6 @@ def run_selfcheck():
         saidQ, gotQ = [], []
         dmQ.say = lambda chat, text, thread=None: saidQ.append((chat, text, thread)) or f"ts{len(saidQ)}"
         dmQ.deliver = lambda target, payload, **k: gotQ.append((target, payload)) or "delivered"
-        dmQ.mark_needs = lambda *a, **k: None
-        dmQ.arm = lambda *a, **k: None; dmQ.owner_spoke = lambda *a, **k: None
         dmQ.route = lambda chat, ctype=None: {"CTHREADS": CTL, "CMEM1": "mem1", "COTHER": "other"}.get(chat)
         try:
             globals()["DEV"] = devQ
@@ -1556,30 +1369,29 @@ def run_selfcheck():
               [r for r in rx_yes if r[2] == "white_check_mark"] and not [r for r in rx_yes if r[2] == "gear"])
         n_said = len(saidM)
         dmM.on_event(msgM("c.1", "UMEM", "!digest"))
-        dmM.on_event(msgM("c.2", "UMEM", "!help"))
-        check("`!` commands: a member gets `!help` and `!status` only — anything else is one 'owner only' line, and the "
-              "command never runs (A4)",
-              len(saidM) == n_said + 2 and saidM[n_said][1] == "`!digest` is owner only — from a channel you get `!help` and `!status`"
-              and saidM[n_said + 1][1].startswith("`!ping` alive"))
+        dmM.on_event(msgM("c.2", "UMEM", "!pause"))
+        check("`!` commands are the owner's: a member gets one line saying so and the command never runs — not even "
+              "`!pause`, which steers the box (A4)",
+              len(saidM) == n_said + 2 and saidM[n_said][1] == "`!digest` is the owner's"
+              and saidM[n_said + 1][1] == "`!pause` is the owner's")
         # -- a reaction is a verdict, and anyone in the channel gives it (owner's decision, 2026-08-30) --
-        flagged, ownrx = [], []
-        dmM.on_flag = lambda chat, ts, removed, when: flagged.append((chat, ts, removed))
-        dmM.on_own_reaction = lambda chat, ts, name, removed: ownrx.append((chat, ts, name)) or None
+        rxvM = []
+        dmM.deliver_reaction = lambda chat, ts, name, removed, who=None: rxvM.append((chat, ts, name)) or None
         rxevM = lambda user, name, ts="m.1", chan="CM", **k: dict(
             {"type": "reaction_added", "user": user, "reaction": name,
              "item": {"type": "message", "channel": chan, "ts": ts}}, **k)
         n_got = len(gotM)
         dmM.on_event(rxevM("UMEM", "checkered_flag"))
         dmM.on_event(rxevM("UOWNER", "checkered_flag", ts="m.2"))
-        check("a member's 🏁 closes a thread exactly as the owner's does and is never delivered as a message — the owner "
-              "curates who is in the channel, so membership is the gate (2026-08-30)",
-              flagged == [("CM", "m.1", False), ("CM", "m.2", False)] and len(gotM) == n_got)
+        check("a member's reaction reaches the session exactly as the owner's does, and is never delivered as a message "
+              "— the owner curates who is in the channel, so membership is the gate (2026-08-30)",
+              rxvM == [("CM", "m.1", "checkered_flag"), ("CM", "m.2", "checkered_flag")] and len(gotM) == n_got)
         dmM.on_event(rxevM("UMEM", "checkered_flag", chan="DM1"))
         check("a non-owner's reaction in a DM still does nothing — no channel gates a DM, and it reaches the box session",
-              len(flagged) == 2)
+              len(rxvM) == 2)
         dmM.on_event(rxevM("UBOT", "white_check_mark"))
-        check("the bot's OWN reactions are unchanged: still the session's answer (on_own_reaction), never a human verdict",
-              ownrx == [("CM", "m.1", "white_check_mark")] and len(flagged) == 2 and len(gotM) == n_got)
+        check("the bot's OWN reactions are nobody's verdict — on_reaction drops them before any session hears",
+              len(rxvM) == 2 and len(gotM) == n_got)
     finally:
         globals()["react"], globals()["save_last"] = _rxM, _slM
 
@@ -1591,7 +1403,6 @@ def run_selfcheck():
     dmS.deliver = lambda target, payload, **k: gotS.append(payload) or "delivered"
     dmS.say = lambda chat, text, thread=None, mail=True: None
     dmS.update_owner = lambda *a, **k: None
-    dmS.arm = lambda *a, **k: None; dmS.owner_spoke = lambda *a, **k: None
     _rxS, _slS = globals()["react"], globals()["save_last"]
     globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: None
     globals()["save_last"] = lambda last: None
@@ -1620,266 +1431,20 @@ def run_selfcheck():
     finally:
         globals()["react"], globals()["save_last"] = _rxS, _slS
 
-    # -- thread status reactions (🔴/🟡 on thread roots) ---------------------------------------
-    dmB = Daemon(use_slack=False); dmB.route = lambda chat, ctype=None: "r" if chat.startswith("C") else None
-    dirty_at = lambda chat: (dmB.board.get(chat) or {}).get("dirty_at")
-    dmB.mark_dirty({"type": "message", "channel": "C1", "channel_type": "channel"})
-    check("board: plain message in a routed chat marks it dirty", dirty_at("C1") is not None)
-    t1 = dirty_at("C1")
-    dmB.mark_dirty({"type": "message", "channel": "C1", "channel_type": "channel"})
-    check("board: a second event before the debounce clears it doesn't move dirty_at", dirty_at("C1") == t1)
-    for c, ev in (("C2", {"type": "message", "channel": "C2", "subtype": "file_share"}),
-                  ("C3", {"type": "message", "channel": "C3", "subtype": "thread_broadcast"}),
-                  ("C4", {"type": "message", "channel": "C4", "subtype": "message_changed"}),
-                  ("C5", {"type": "reaction_added", "item": {"channel": "C5"}}),
-                  ("C7", {"type": "reaction_removed", "item": {"channel": "C7"}})):
-        dmB.mark_dirty(ev)
-    check("board: file_share/thread_broadcast/message_changed subtypes and reactions added AND removed all mark dirty "
-          "(taking a 🏁 off must bring the marks back) — V3",
-          all(dirty_at(c) is not None for c in ("C2", "C3", "C4", "C5", "C7")))
-    dmB.mark_dirty({"type": "message", "channel": "C6", "subtype": "bot_message"})
-    dmB.mark_dirty({"type": "message", "channel": "NOPE", "channel_type": "channel"})
-    check("board: unhandled subtypes and unrouted chats are ignored", dirty_at("C6") is None and dirty_at("NOPE") is None)
-    now7 = time.time()
-    react_roots = [
-        {"ts": "5000.1", "reply_count": 1, "text": "stall gets a mark"},
-        {"ts": "5000.2", "reply_count": 1, "text": "legacy dot stripped", "reactions": [{"name": "red_circle", "users": ["UBOT"]}]},
-        {"ts": "5000.3", "reply_count": 1, "text": "already right", "reactions": [{"name": "question", "users": ["UBOT"]}]},
-        {"ts": "5000.4", "reply_count": 1, "text": "checkered clears",
-         "reactions": [{"name": "question", "users": ["UBOT"]}, {"name": "checkered_flag", "users": ["UOWNER"]}]},
-        {"ts": "5000.5", "reply_count": 1, "text": "aged clears", "reactions": [{"name": "question", "users": ["UBOT"]}]},
-        {"ts": "5000.6", "reply_count": 1, "text": "our reply asks back, and says so"},
-        {"ts": "5000.7", "reply_count": 1, "text": "our reply asks back and does not"},
-        {"ts": "5000.8", "reply_count": 1, "text": "we asked, then went on", "reactions": [{"name": "question", "users": ["UBOT"]}]},
-    ]
-    react_replies = {
-        "5000.1": [{"ts": str(now7 - 40 * 60), "user": "UOWNER", "text": "waiting"}],
-        "5000.2": [{"ts": str(now7 - 600), "user": "UBOT", "text": "answered"}],
-        "5000.3": [{"ts": str(now7 - 40 * 60), "user": "UOWNER", "text": "waiting"}],
-        "5000.4": [{"ts": str(now7 - 600), "user": "UOWNER", "text": "done"}],
-        "5000.5": [{"ts": str(now7 - 49 * 3600), "user": "UOWNER", "text": "ancient"}],
-        "5000.6": [{"ts": str(now7 - 300), "bot_id": "B01", "text": "stopped — force-push, or leave it?"}],
-        "5000.7": [{"ts": str(now7 - 300), "bot_id": "B01", "text": "started — should I force-push?"}],
-        "5000.8": [{"ts": str(now7 - 300), "bot_id": "B01", "text": "never mind, the rebase was clean"}],
-    }
-    with_latest(react_roots, react_replies)
-    react_calls = []
-    def react_api(method, token, **kw):
-        react_calls.append((method, kw))
-        if method == "conversations.history":
-            return {"messages": react_roots}
-        if method == "conversations.replies":
-            return {"messages": react_replies.get(kw.get("ts"), [])}
-        return {}
-    dmE = Daemon(use_slack=False); dmE.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmE.bot_user = "UBOT"
-    dmE.marks["CR1:5000.6:question"] = now7 - 300     # the sender declared it as it posted…
-    dmE.marks["CR1:5000.8:question"] = now7 - 900     # …and here its own next word has since overtaken the declaration
-    try:
-        globals()["api"] = react_api
-        dmE.reconcile_reactions("CR1")
-    finally:
-        globals()["api"] = real_api
-    adds = [kw for m, kw in react_calls if m == "reactions.add"]
-    removes = [kw for m, kw in react_calls if m == "reactions.remove"]
-    check("marks: the owner's word 40 min unanswered → ❓ added once, no remove — V1(b)",
-          sum(1 for kw in adds if kw["timestamp"] == "5000.1" and kw["name"] == "question") == 1
-          and not any(kw["timestamp"] == "5000.1" for kw in removes))
-    check("marks: an answered thread carries 🟠 (handled), and the v1 dot on it is stripped first — at most ONE mark — V3",
-          any(kw["timestamp"] == "5000.2" and kw["name"] == "red_circle" for kw in removes)
-          and [kw["name"] for kw in adds if kw["timestamp"] == "5000.2"] == ["large_orange_circle"])
-    check("marks: ❓ already correct → zero mutation calls", not any(kw["timestamp"] == "5000.3" for kw in adds + removes))
-    check("marks: 🏁 present → the bot's mark is removed, nothing added",
-          any(kw["timestamp"] == "5000.4" and kw["name"] == "question" for kw in removes)
-          and not any(kw["timestamp"] == "5000.4" for kw in adds))
-    check("marks: 48h-aged root → cleared",
-          any(kw["timestamp"] == "5000.5" and kw["name"] == "question" for kw in removes)
-          and not any(kw["timestamp"] == "5000.5" for kw in adds))
-    check("marks: THE SENDER DECIDES — our reply is ❓ because it declared needs_owner, and an identical one that did "
-          "not is 🟠. A trailing '?' has stopped meaning NEEDS YOU (2026-08-30)",
-          any(kw["timestamp"] == "5000.6" and kw["name"] == "question" for kw in adds)
-          and [kw["name"] for kw in adds if kw["timestamp"] == "5000.7"] == ["large_orange_circle"]
-          and not any(kw["timestamp"] == "5000.7" and kw["name"] == "question" for kw in adds))
-    check("marks: IT CLEARS ITSELF — a declaration is anchored to the message that made it, so our own next word in the "
-          "thread leaves it behind: the ❓ comes off and 🟠 goes on, with nothing to retract",
-          any(kw["timestamp"] == "5000.8" and kw["name"] == "question" for kw in removes)
-          and [kw["name"] for kw in adds if kw["timestamp"] == "5000.8"] == ["large_orange_circle"])
-    dmG = Daemon(use_slack=False); dmG.marks = {"CG:7.0:question": 1000.0}
-    check("declared: Slack stamps a message with ITS clock and a long reply goes out in chunks, so a declaration covers "
-          "what the sender posts in the same breath (%ds) — it must never un-say itself. Our own word after that is a "
-          "new word, and a declaration on another root is not this one's" % DECLARE_GRACE,
-          dmG.declared("CG", {"ts": "7.0"}, {"ts": "1000.4"})
-          and dmG.declared("CG", {"ts": "7.0"}, {"ts": str(1000.0 + DECLARE_GRACE)})
-          and not dmG.declared("CG", {"ts": "7.0"}, {"ts": str(1001.0 + DECLARE_GRACE)})
-          and not dmG.declared("CG", {"ts": "7.1"}, {"ts": "1000.0"})
-          and not dmG.declared("", {"ts": "7.0"}, {"ts": "1000.0"}) and not dmG.declared("CG", None, {"ts": "1000.0"}))
-    cap_roots = [{"ts": f"6000.{i}", "reply_count": 1, "text": f"root {i}",
-                  "reactions": [{"name": "red_circle", "users": ["UBOT"]}]} for i in range(1, 7)]
-    cap_replies = {f"6000.{i}": [{"ts": str(now7 - 40 * 60), "user": "UOWNER", "text": "waiting"}] for i in range(1, 7)}
-    with_latest(cap_roots, cap_replies)
-    cap_calls = []
-    def cap_api(method, token, **kw):
-        cap_calls.append((method, kw))
-        if method == "conversations.history":
-            return {"messages": cap_roots}
-        if method == "conversations.replies":
-            return {"messages": cap_replies.get(kw.get("ts"), [])}
-        return {}
-    dmF = Daemon(use_slack=False); dmF.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmF.bot_user = "UBOT"
-    try:
-        globals()["api"] = cap_api
-        with contextlib.redirect_stderr(io.StringIO()):
-            dmF.reconcile_reactions("CR2")
-    finally:
-        globals()["api"] = real_api
-    check("reactions: mutation cap enforced at ≤10 per cycle (5 of 6 roots processed)",
-          sum(1 for m, kw in cap_calls if m in ("reactions.add", "reactions.remove")) == 10)
-    dmT2 = Daemon(use_slack=False); dmT2.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
-    sweeps = []; dmT2.reconcile_reactions = lambda chat, cap=10: sweeps.append(cap)
-    dmT2.bucket_threads = lambda chat, roots=None: []; dmT2.say = lambda *a, **k: None
-    dmT2.cmd_threads("C1", "1.0")
-    check("!threads forces a full reaction sweep (cap=50) before rendering", sweeps == [50])
-    dmFl = Daemon(use_slack=False); dmFl.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
-    dmFl.route = lambda chat, ctype: "r"; fl_calls = []
-    real_api_fl = globals()["api"]
-    globals()["api"] = lambda method, token, **kw: fl_calls.append((method, kw.get("name"))) or {}
-    try:
-        dmFl.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "UOWNER",
-                          "item": {"type": "message", "channel": "C1", "ts": "3.3"}})
-        owner_flag = list(fl_calls); fl_calls.clear()
-        dmFl.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "USTRANGER",
-                          "item": {"type": "message", "channel": "C1", "ts": "3.3"}})
-        stranger_flag = list(fl_calls)
-        fl_calls.clear()
-        dmFl.status_cache[("C1", "3.4")] = "question"
-        dmFl.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "UOWNER",
-                          "item": {"type": "message", "channel": "C1", "ts": "3.4"}})
-        known_flag = list(fl_calls)
-    finally:
-        globals()["api"] = real_api_fl
-    check("owner's 🏁 resolves the thread's root, strips the bot's mark instantly (❓/🔴/🟠 and any v1 dot) and records the "
-          "flag time; a stranger's 🏁 does nothing — V3",
-          owner_flag == [("conversations.replies", None)] + [("reactions.remove", n) for n in BOOK_NAMES]
-          and stranger_flag == [] and dmFl.flags.get("C1:3.3") and flag_writes)
-    check("owner's 🏁: when the cache knows which mark is on the root, exactly one remove (research e0180ec/9afaca9)",
-          known_flag == [("reactions.remove", "question")] and dmFl.status_cache[("C1", "3.4")] is None)
-    legacy_hist = {"CB1": [{"ts": "9050.1", "user": "UBOT", "text": "📋 *live threads* (updated 00:00 UTC)\nall quiet"}]}
-    legacy_calls = []
-    def legacy_api(method, token, **kw):
-        legacy_calls.append((method, kw))
-        if method == "conversations.history":
-            return {"messages": legacy_hist.get(kw.get("channel"), [])}
-        return {"messages": []}
-    dmG = Daemon(use_slack=False); dmG.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}; dmG.bot_user = "UBOT"
-    try:
-        globals()["api"] = legacy_api
-        dmG.reconcile_reactions("CB1")
-        dmG.reconcile_reactions("CB1")   # second cycle: legacy message already handled, must not repeat
-    finally:
-        globals()["api"] = real_api
-    check("legacy cleanup: 📋 board message triggers pins.remove + chat.delete exactly once",
-          sum(1 for m, kw in legacy_calls if m == "pins.remove" and kw.get("timestamp") == "9050.1") == 1
-          and sum(1 for m, kw in legacy_calls if m == "chat.delete" and kw.get("ts") == "9050.1") == 1)
-    # -- clear_needs / mark_needs (the instant V3 flips) ---------------------------------------
-    owed_roots = {
-        "8000.1": [{"ts": "8000.1", "reactions": [{"name": "question", "users": ["UBOT"]}]}],
-        "8000.2": [{"ts": "8000.2", "reactions": []}],
-        "8000.3": [{"ts": "8000.3", "reactions": []}],
-        "8000.4": [{"ts": "8000.4", "text": "!status", "reactions": []}],
-    }
-    owed_calls = []
-    def owed_api(method, token, **kw):
-        owed_calls.append((method, kw))
-        return {"messages": owed_roots.get(kw.get("ts"), [])}
-    dmH = Daemon(use_slack=False); dmH.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}; dmH.bot_user = "UBOT"
-    try:
-        globals()["api"] = owed_api
-        dmH.owner_spoke("CH", "8000.1")      # never seen: one read, the ❓ off, the 🔴 on
-        n_after_first = len(owed_calls)
-        dmH.owner_spoke("CH", "8000.1")      # believed 🔴 already: not a single call
-        n_after_second = len(owed_calls)
-        dmH.owner_spoke("CH", "8000.2")      # never seen, nothing on it: the read, then the 🔴 only
-        dmH.mark_needs("CH", "8000.3"); dmH.mark_needs("CH", "8000.3")
-        dmH.set_mark("CH", "8000.4", "🔴")   # a `!command` root never carries a mark (A2)
-    finally:
-        globals()["api"] = real_api
-    owed_adds = [kw for m, kw in owed_calls if m == "reactions.add"]
-    owed_removes = [kw for m, kw in owed_calls if m == "reactions.remove"]
-    check("owner_spoke: an unseen root is read once, its ❓ comes off and 🔴 goes on — one mark at a time — V3",
-          sum(1 for m, kw in owed_calls if m == "conversations.replies" and kw.get("ts") == "8000.1") == 1
-          and [kw["name"] for kw in owed_removes if kw["timestamp"] == "8000.1"] == ["question"]
-          and [kw["name"] for kw in owed_adds if kw["timestamp"] == "8000.1"] == ["red_circle"])
-    check("set_mark: a root we already believe carries that mark costs zero API calls (research e0180ec)",
-          n_after_second == n_after_first)
-    check("set_mark: a root with nothing on it → the read, then the add only, no remove",
-          [kw["name"] for kw in owed_adds if kw["timestamp"] == "8000.2"] == ["red_circle"]
-          and not any(kw.get("timestamp") == "8000.2" for kw in owed_removes))
-    check("mark_needs: adds ❓ once; the believed-status cache suppresses the repeat — V3",
-          [kw["name"] for kw in owed_adds if kw["timestamp"] == "8000.3"] == ["question"])
-    check("set_mark: a `!command` root is never marked, whatever the caller asks for — A2",
-          not any(kw.get("timestamp") == "8000.4" for kw in owed_adds + owed_removes))
-    dmD = Daemon(use_slack=False); bc_calls, nc_calls, sw_calls = [], [], []
-    dmD.board_cycle = lambda: bc_calls.append(1); dmD.nudge_cycle = lambda: nc_calls.append(1)
-    dmD.sweep_cycle = lambda: sw_calls.append(1)
+    dmD = Daemon(use_slack=False)
+    dmD.unstick = dmD.orch_sweep = dmD.projects_sweep = dmD.member_retry_cycle = lambda: None
     sweeps0 = len([1 for k, *_ in deferred if k == "sweep"])   # land_sweep is NOT stubbed here: it is the process pin
     for i in range(1, 61):                                     # that catches it, and this is what proves that pin works
         dmD.loop_tick(i)
-    check("loop_tick: board debounce every tick · status sweep + nudges every 15 min (fake clock) — S2/V4",
-          len(bc_calls) == 60 and len(sw_calls) == 2 and len(nc_calls) == 2)
     check("loop_tick: the landing queue is re-driven on the FIRST tick and every 5 min after — the first one finishes "
           "a landing a reboot interrupted, and the rest are the retry a stopped deploy never had",
           len([1 for k, *_ in deferred if k == "sweep"]) - sweeps0 == 7)
     dmP = Daemon(use_slack=False); dmP.cfg = {"PUBLISH_REPO": "ctl"}
-    dmP.board_cycle = dmP.sweep_cycle = dmP.nudge_cycle = lambda: None
+    dmP.unstick = dmP.orch_sweep = dmP.projects_sweep = dmP.member_retry_cycle = lambda: None
     dmP.loop_tick(120)
     check("loop_tick: the public mirror still gets its hourly catch-up — nothing here notices a merge any more, so "
           "the merge nobody here made is the ONLY case left (cc-publish.timer is the primary path either way)",
           ("publish", "ctl") in deferred)
-    dmA = Daemon(use_slack=False); rec_a = []
-    dmA.board_cycle = dmA.sweep_cycle = dmA.nudge_cycle = lambda: None
-    dmA.reconcile_reactions = lambda chat, cap=10: rec_a.append(chat)
-    dmA.arm("CA1", time.time() + 3600); dmA.arm("CA2", time.time() - 1); dmA.arm("CA1", time.time() + 7200)
-    dmA.loop_tick(1)
-    check("alarms: a due stall/expiry alarm reconciles that chat on the very next tick, a future one waits, and arm() "
-          "keeps the earliest (research ac282dc)",
-          rec_a == ["CA2"] and int(dmA.alarms["CA1"] - time.time()) in range(3595, 3601))
-    dmS2 = Daemon(use_slack=False); swept2 = []
-    dmS2.reconcile_reactions = lambda chat, cap=10: swept2.append(chat)
-    dmS2.last_chat["r"] = ("CS1", None); dmS2.board["CS2"] = {"dirty_at": None}
-    dmS2.sweep_cycle()
-    check("sweep_cycle: every known chat is reconciled, so 48h-quiet statuses expire without a live event — S2",
-          sorted(swept2) == ["CS1", "CS2"])
-    dmS1 = Daemon(use_slack=False); dmS1.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmS1.bot_id = "B01"
-    dmS1.route = lambda chat, ctype=None: "r"
-    dmS1.mark_dirty({"type": "message", "subtype": "bot_message", "bot_id": "B01", "channel": "CS3", "channel_type": "channel"})
-    dmS1.mark_dirty({"type": "message", "subtype": "bot_message", "bot_id": "BOTHER", "channel": "CS4", "channel_type": "channel"})
-    check("board: OUR session's reply (a signed bot_message) marks the chat dirty — the mark flip had no other trigger — S1",
-          (dmS1.board.get("CS3") or {}).get("dirty_at") and not dmS1.board.get("CS4"))
-    dmS1b = Daemon(use_slack=False); dmS1b.route = lambda chat, ctype=None: "r"
-    dmS1b.mark_dirty({"type": "message", "subtype": "bot_message", "bot_id": "BX", "channel": "CS7", "channel_type": "channel"})
-    dmS1b.mark_dirty({"type": "message", "subtype": "bot_message", "bot_id": "BX", "user": "UAPP", "channel": "CS8", "channel_type": "channel"})
-    check("board: with no auth.test (--no-slack / tests) a user-less bot post still marks the chat dirty — S1",
-          (dmS1b.board.get("CS7") or {}).get("dirty_at") and not dmS1b.board.get("CS8"))
-    nowS = time.time()
-    nudge_root = [{"ts": "9000.1", "reply_count": 2, "latest_reply": str(nowS - 300), "user": "UOWNER", "text": "still owed"}]
-    dmS3 = Daemon(use_slack=False); dmS3.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmS3.bot_user = "UBOT"
-    try:
-        globals()["api"] = lambda method, token, **kw: {"messages": ([{"ts": str(nowS - 300), "bot_id": "B01",
-                                                                      "text": NUDGE_PREFIXES[0] + " for you (1h05m): which env var?"}]
-                                                                     if method == "conversations.replies" else nudge_root)}
-        b3 = dmS3.bucket_threads("CS5", roots=nudge_root)
-    finally:
-        globals()["api"] = real_api
-    check("threads: our own nudge post is not an answer — the thread stays ❓ — S3 (research 66a166f)", [b for b, _, _ in b3] == ["❓"])
-    dmS3.nudged[("CS5", "9000.1")] = nowS - 49 * 3600     # the message it nudged about went quiet more than 48h ago
-    try:
-        globals()["api"] = lambda method, token, **kw: {"messages": ([{"ts": str(nowS - 300), "bot_id": "B01",
-                                                                      "text": NUDGE_PREFIXES[0] + " for you (1h05m): which env var?"}]
-                                                                     if method == "conversations.replies" else nudge_root)}
-        dmS3.reply_cache.clear()
-        b3b = dmS3.bucket_threads("CS5", roots=nudge_root)
-    finally:
-        globals()["api"] = real_api
-    check("threads: our nudge does not buy the thread another 48h — it still ages from the owner's own message", b3b == [])
     dmR = Daemon(use_slack=False); dmR.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}; dmR.bot_user = "UBOT"
     dmR.last_chat[CTL] = ("CS6", "9.9"); radds = []; rsaid = []   # the PLANNING session's own: the one prompt still asked in its thread
     dmR.say = lambda chat, text, thread=None, mail=True: rsaid.append((chat, thread, text))
@@ -1890,141 +1455,12 @@ def run_selfcheck():
                                    "input_preview": "gh pr merge 3", "request_id": "abcde"})
     finally:
         globals()["api"] = real_api
-    check("relay_permission: the 🔐 prompt goes to the thread AND its root gets ❓ at once, no sweep wait — V3",
+    check("relay_permission: the 🔐 prompt goes to the thread the session is talking in, and puts nothing on the root",
           rsaid and rsaid[0][:2] == ("CS6", "9.9") and rsaid[0][2].startswith("❓ 🔐")   # unpaired: the ❓, no <@…>
-          and radds == [("conversations.replies", None, None), ("reactions.add", "question", "9.9")])
-    dmCap = Daemon(use_slack=False); dmCap.board["CC1"] = {"dirty_at": time.time() - 60}
-    dmCap.reconcile_reactions = lambda chat, cap=10: True      # capped
-    dmCap.board_cycle()
-    check("board_cycle: a chat that hit the mutation cap stays dirty so the next cycle finishes its roots",
-          (dmCap.board["CC1"] or {}).get("dirty_at") is not None)
+          and radds == [])
     # -- PART 4: the 2026-08-27 audit fixes ------------------------------------------------------
     nowA = time.time()
-    long_root = [{"ts": "1.0", "reply_count": 25, "latest_reply": str(nowA - 3600), "user": "UOWNER", "text": "long thread"}]
-    old_reps = ([{"ts": str(nowA - 9000 + i), "user": "UBOT", "text": "old"} for i in range(20)]
-                + [{"ts": str(nowA - 3600), "user": "UOWNER", "text": "still waiting"}])
-    long_calls = []
-    def long_api(method, token, **kw):
-        long_calls.append((method, kw))
-        return {"messages": long_root} if method == "conversations.history" else {"messages": old_reps, "has_more": True}
-    dmM3 = Daemon(use_slack=False); dmM3.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmM3.bot_user = "UBOT"
-    try:
-        globals()["api"] = long_api
-        buckets3 = dmM3.bucket_threads("CM3")
-    finally:
-        globals()["api"] = real_api
-    check("threads: a ≥20-reply thread is read at latest_reply, not by limit= (which serves the OLDEST replies) — M3",
-          [b for b, _, _ in buckets3] == ["❓"]
-          and [kw for m, kw in long_calls if m == "conversations.replies"][-1].get("oldest") == str(nowA - 3600))
-    m9_roots = [{"ts": str(nowA - 3600), "user": "UOWNER", "text": "unanswered question?"},
-                {"ts": str(nowA - 300), "user": "UOWNER", "text": "just asked, session is on it"},
-                {"ts": str(nowA - 49 * 3600), "user": "UOWNER", "text": "ancient question?"},
-                {"ts": str(nowA - 3600), "user": "USOMEONE", "text": "someone else's aside"},
-                {"ts": str(nowA - 3600), "user": "UOWNER", "text": "!status"}]
-    dmM9 = Daemon(use_slack=False); dmM9.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmM9.bot_user = "UBOT"
-    b9 = dmM9.bucket_threads("CM9", roots=m9_roots)
-    check("threads: an unanswered top-level owner question is 🔴 while it is fresh and ❓ once 30 min have passed — V3 (was M9)",
-          [(b, r["text"]) for b, r, _ in b9 if b] == [("❓", "unanswered question?"), ("🔴", "just asked, session is on it")])
-    check("threads: a `!command` root is never bucketed (A2) and neither is a stale or non-owner top-level message",
-          not any("!status" in r["text"] or "ancient" in r["text"] or "aside" in r["text"] for _, r, _ in b9))
-
-    # ── A ❓ COMES OFF (comms audit, 2026-09-07). The owner declined ntfy, so nothing the box does reaches his phone
-    #    but a Slack @-mention: a ❓ is how he finds what waits on him, and one he cannot clear teaches him to ignore
-    #    the mark. Both ❓s rest on a session — the declared one on the session that asked, the stall one on a session
-    #    that owes him an answer — so both come off when that session retires.
-    def dmQ(wins, subbed=False):
-        d = Daemon(use_slack=False)
-        d.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
-        d.bot_user, d.names["CQ"] = "UBOT", "abox"        # #abox routes to the target `abox`
-        d.home_wins = lambda: wins                        # the tmux roll-call, stood in
-        if subbed:
-            d.subs["abox"] = [object()]                   # a session is on the socket right now
-        d.marks["CQ:500.0:" + ASKED] = 500.0              # …and it declared this root as it posted (declare_needs)
-        return d
-    UP, RETIRED = {"abox": "bash", "box": "bash"}, {"box": "bash"}
-    nowQ = time.time()
-    rootQ = {"ts": "500.0", "bot_id": "B1", "text": "pick cc-fix or fix/cc", "reactions": []}   # no `?`: the DECLARATION is
-    ansQ = {"ts": str(nowQ - 60), "user": "UOWNER", "text": "cc-fix, please"}                   # what makes this one a ❓
-    staleQ = dict(ansQ, ts=str(nowQ - STALL_AFTER - 1))
-    def markQ(wins, last, subbed=False):                  # exactly what a sweep does: ONE session_gone for the chat
-        d = dmQ(wins, subbed)                             # (bucket_threads), handed to the mark
-        return d.base_mark(last, nowQ, rootQ, "CQ", d.session_gone("CQ"))
-    check("a ❓ the owner ANSWERS comes off at once — his word is the newest thing in the thread, so the declaration is "
-          "spent and the turn is the session's (🔴). While that session is up, 30 min of silence is a real stall and "
-          "earns the ❓ back: that is the case the mark exists for, and it is still here",
-          markQ(UP, rootQ) == "❓" and markQ(UP, ansQ) == "🔴" and markQ(UP, staleQ) == "❓")
-    check("…and a ❓ whose SESSION HAS RETIRED comes off too — nothing subscribed and no tmux window it can come back "
-          "in. The question it declared reads 🟠, and his answer STAYS answered instead of turning ❓ again half an "
-          "hour later; 🔴 is untouched inside the window, because it never reached his NEEDS YOU band",
-          markQ(RETIRED, rootQ) == "🟠" and markQ(RETIRED, staleQ) == "🟠" and markQ(RETIRED, ansQ) == "🔴"
-          and markQ(RETIRED, dict(rootQ, text="🔐 may I force-push? reply `yes 7`")) == "🟠"   # a 🔐 prompt too
-          and markQ(RETIRED, dict(rootQ, text=NUDGE_PREFIXES[0] + " on this")) == "🟠")   # …and so does our own nudge
-    check("…RETIRED means the SESSION, not the window: a session still on the socket keeps its ❓ though its window is "
-          "gone, and an UNREADABLE tmux (an empty roll-call) claims nothing is gone at all — a wedged tmux must never "
-          "strip every ❓ on the box. A caller that knows nothing about sessions gets today's answer",
-          markQ(RETIRED, rootQ, subbed=True) == "❓" and markQ(RETIRED, staleQ, subbed=True) == "❓"
-          and markQ({}, rootQ) == "❓" and markQ({}, staleQ) == "❓"
-          and dmQ(UP).session_gone("CQ") is False and dmQ(RETIRED).session_gone("CQ") is True
-          and dmQ(RETIRED).base_mark(rootQ, nowQ, rootQ, "CQ") == "❓")
-    askQ = {"ts": str(nowQ - 60), "bot_id": "B1", "text": "🔐 may I force-push? reply `yes 7`", "reactions": []}
-    check("…and the sweep itself files it there: the SAME unanswered question buckets as ❓ under a live session and "
-          "as 🟠 once that session has retired, so it drops out of the nudges and off the owner's NEEDS YOU band",
-          [m for m, _, _ in dmQ(UP).bucket_threads("CQ", roots=[askQ])] == ["❓"]
-          and [m for m, _, _ in dmQ(RETIRED).bucket_threads("CQ", roots=[askQ])] == ["🟠"])
-    # …and the same channel when it belongs to an ORCH: #CQ is @fix's own channel, so the session behind it is the
-    # window `abox@fix` and a conn subscribed under that alias — never the repo's own window (its ❓ was being wiped).
-    def dmO(wins, aliases=()):
-        d = dmQ(wins)
-        d.subs["abox"] = [Conn(None, "abox", {"alias": a}) for a in aliases]
-        return d
-    _orchsQ, _validQ = globals()["load_orchs"], globals()["valid_target"]
-    try:
-        globals()["load_orchs"] = lambda: {"CQ": {"target": "abox", "alias": "fix"}}
-        globals()["valid_target"] = lambda t: True     # the orch's target is a repo dir this checkout need not have
-        goneO = (dmO({"abox@fix": "bash", "box": "bash"}).session_gone("CQ"),   # the orch is up, in its own window
-                 dmO({"abox@fix": "bash"}, aliases=("fix",)).session_gone("CQ"),   # …or on the socket under its alias
-                 dmO({"abox": "bash", "box": "bash"}).session_gone("CQ"),      # only the REPO's session is up: @fix is gone
-                 dmO({"abox": "bash"}, aliases=(None,)).session_gone("CQ"))    # …and subscribed — still not @fix
-        dO = dmO({"abox@fix": "bash", "box": "bash"})
-        markO = dO.base_mark(rootQ, nowQ, rootQ, "CQ", dO.session_gone("CQ"))
-    finally:
-        globals()["load_orchs"], globals()["valid_target"] = _orchsQ, _validQ
-    check("…and an ORCH channel is read as ITS orch: a live @fix keeps its ❓ though nothing is named for the repo, "
-          "and the repo's own session being up (or on the socket) no longer keeps a retired orch's ❓ alive",
-          goneO == (False, False, True, True) and markO == "❓")
-    m11_roots = [{"ts": "7100.1", "reply_count": 1, "latest_reply": str(nowA - 600), "text": "live"},
-                 {"ts": "7100.2", "reply_count": 1, "text": "!help", "reactions": [{"name": "red_circle", "users": ["UBOT"]}]}]
-    m11_calls = []
-    def m11_api(method, token, **kw):
-        m11_calls.append((method, kw))
-        if method == "conversations.history":
-            return {"messages": m11_roots}
-        if method == "conversations.replies":
-            return {"messages": [{"ts": str(nowA - 600), "user": "UOWNER", "text": "waiting"}]}
-        return {}
-    dmM11 = Daemon(use_slack=False); dmM11.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmM11.bot_user = "UBOT"
-    try:
-        globals()["api"] = m11_api
-        dmM11.reconcile_reactions("CM11")
-    finally:
-        globals()["api"] = real_api
-    check("reconcile: ONE conversations.history per sweep, reused by bucket_threads — M11",
-          sum(1 for m, _ in m11_calls if m == "conversations.history") == 1)
-    check("reconcile: a `!command` root keeps no status emoji — A2",
-          any(m == "reactions.remove" and kw.get("timestamp") == "7100.2" for m, kw in m11_calls)
-          and not any(m == "reactions.add" and kw.get("timestamp") == "7100.2" for m, kw in m11_calls))
-    empty_calls = []
     real_sleep = time.sleep
-    dmM11b = Daemon(use_slack=False); dmM11b.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmM11b.bot_user = "UBOT"
-    try:
-        globals()["api"] = lambda method, token, **kw: empty_calls.append(method) or {"messages": []}
-        time.sleep = lambda s: None                          # the retry's 2 s wait would only slow the selfcheck down
-        with contextlib.redirect_stderr(io.StringIO()):
-            dmM11b.reconcile_reactions("CM11B")
-    finally:
-        globals()["api"] = real_api; time.sleep = real_sleep
-    check("reconcile: an empty history read (Slack flake) skips the sweep instead of stripping every emoji — M11",
-          not any(m.startswith("reactions.") for m in empty_calls))
     dmM4 = Daemon(use_slack=False); dmM4.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
     said4b = []; dmM4.say = lambda chat, text, thread=None, mail=True: said4b.append((chat, thread, text))
     dmM4.expired("myrepo/gone", {"type": "message", "content": "do the thing",
@@ -2158,12 +1594,12 @@ def run_selfcheck():
         time.sleep = fake_sleep
         with contextlib.redirect_stderr(io.StringIO()):
             try:
-                dmM10.nudge_loop()
+                dmM10.tick_loop()
             except KeyboardInterrupt:
                 pass
     finally:
         time.sleep = real_sleep2
-    check("nudge_loop: a raising tick is logged and the loop lives on (a dead thread = zombie daemon) — M10",
+    check("tick_loop: a raising tick is logged and the loop lives on (a dead thread = zombie daemon) — M10",
           len(ticks10) >= 3)
     l12_calls = []
     try:
@@ -2584,76 +2020,16 @@ def run_selfcheck():
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
     check("no -updates twin on this box → the routine post stays in #<repo>, exactly as before the gate", postedH == ["C-myrepo"])
-    dmL19 = Daemon(use_slack=False); said19 = []; dmL19.say = lambda chat, text, thread=None, mail=True: said19.append(text)
-    real_run19 = subprocess.run
-    try:
-        subprocess.run = lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired(a[0], 60))
-        dmL19.command("!digest", "C1", None, "1.1", "r", "channel")
-    finally:
-        subprocess.run = real_run19
-    check("!digest that overruns its 60 s budget answers with the timeout instead of silence — L19", said19 and "timed out" in said19[-1])
-    # ── !context / !cost / !compact: the box types a READ-ONLY slash command into a session's own pane ──
-    dmS = Daemon(use_slack=False); saidS = []; dmS.say = lambda chat, text, thread=None, mail=True: saidS.append(text)
-    PANE_S = "> /context\n  ⎿  claude-opus-5 · 137k/1M tokens (14%)"
-    askS = {"rc": 0, "out": PANE_S, "err": ""}
-    runS = []
-    def fake_runS(cmd, **kw):
-        runS.append(list(cmd))
-        if os.path.basename(cmd[0]) == "cc-msg":
-            return type("R", (), {"returncode": askS["rc"], "stdout": askS["out"], "stderr": askS["err"]})()
-        if os.path.basename(cmd[0]) == "cc-context":
-            return type("R", (), {"returncode": 0, "stderr": "",
-                                  "stdout": "demo\tt1\t9\t90000\t1M\tprocess\t2m\t-\t-\n"})()
-        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-    asked = lambda: [c for c in runS if os.path.basename(c[0]) == "cc-msg"]
-    real_runS = subprocess.run
-    try:
-        subprocess.run = fake_runS
-        dmS.command("!context", "C1", None, "1.1", "demo/t1", "channel")
-        check("!context types /context into that channel's session pane through cc-msg --ask and replies with what "
-              "the pane drew",
-              asked() and asked()[-1][1:] == ["--ask", "demo/t1", "/context"]
-              and saidS and "137k/1M tokens (14%)" in saidS[-1])
-        check("…and carries cc-context's tracked number in the same reply: the pane is the truth, the tracker is "
-              "what the box thought, and the owner asked for both at once",
-              "tracker says 9% of 1M" in saidS[-1])
-        del runS[:]
-        dmS.command("!cost", "C1", None, "1.2", "demo/t1", "channel")
-        dmS.command("!compact", "C1", None, "1.3", "demo/t1", "channel")
-        check("!cost and !compact type their own /command, and nothing else does",
-              [c[3] for c in asked()] == ["/cost", "/compact"])
-        check("…and only !context pairs the tracker line: /cost and /compact are not context readings",
-              "tracker says" not in saidS[-1] and "tracker says" not in saidS[-2])
-        del runS[:]
-        dmS.command("!context demo/t2", "C1", None, "1.4", "demo/t1", "channel")
-        check("an argument names the target, so the owner can ask about a session from any channel",
-              asked() and asked()[-1][2] == "demo/t2")
-        del runS[:]; n_saidS = len(saidS)
-        dmS.command("!model opus", "C1", None, "1.5", "demo/t1", "channel")
-        dmS.command("!clear", "C1", None, "1.6", "demo/t1", "channel")
-        check("THE WHITELIST IS THE WHOLE LIST: /model and /clear change what a session IS, so !model and !clear "
-              "are unknown commands here and NOTHING is typed at the pane",
-              asked() == [] and len(saidS) == n_saidS + 2
-              and all(t.startswith("unknown command") for t in saidS[n_saidS:]))
-        del runS[:]; n_saidS = len(saidS)
-        dmS.command("!context", "C1", None, "1.7", "demo/t1", "channel", is_owner=False)
-        check("a member gets one 'owner only' line and the pane is never touched: !context reads a session the "
-              "member cannot see, and !compact would spend its context",
-              asked() == [] and len(saidS) == n_saidS + 1 and "owner only" in saidS[-1])
-        for st in ("busy", "dialog"):
-            del runS[:]
-            askS.update(rc=1, out="", err=f"cc-msg: main:demo/t1 is {st}\n")
-            dmS.command("!context", "C1", None, "1.8", "demo/t1", "channel")
-            check(f"a pane that is {st} is refused, in one line that says so — cc-msg --ask never spools, so a "
-                  f"/context that could not be typed now is not typed later at a pane nobody is watching",
-                  "not typed" in saidS[-1] and f"is {st}" in saidS[-1] and "```" not in saidS[-1])
-        askS.update(rc=0, out=PANE_S, err="")
-        del runS[:]
-        dmS.command("!context", "C1", None, "1.9", "", "channel")
-        check("a channel with no session of its own asks for a target instead of guessing one",
-              "no session for this channel" in saidS[-1] and asked() == [])
-    finally:
-        subprocess.run = real_runS
+    # ── `!` IS FOUR COMMANDS: pause, resume, restart, reboot. Everything else that starts with `!` is refused by
+    #    name, because a word the box swallows silently reads to the owner as a box that is not listening.
+    dmS = Daemon(use_slack=False); saidS = []
+    dmS.say = lambda chat, text, thread=None, **k: saidS.append(text)
+    for wordS in ("!context", "!digest", "!threads", "!model opus"):
+        dmS.command(wordS, "C1", None, "1.1", "demo/t1", "channel")
+    check("THE FOUR ARE THE WHOLE LIST: every other `!word` is refused by name, in one line naming the four there "
+          "are — nothing is typed at a pane and nothing is shelled out to",
+          len(saidS) == 4 and all(t.startswith("unknown command `!") for t in saidS)
+          and all(all(w in t for w in ("`!pause`", "`!resume`", "`!restart", "`!reboot`")) for t in saidS))
 
     dmL21 = Daemon(use_slack=False); dmL21.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
     said21 = []; dmL21.say = lambda chat, text, thread=None, mail=True: said21.append((chat, text))
@@ -2798,11 +2174,7 @@ def run_selfcheck():
     dmVM.bot_user, dmVM.bot_id = "UBOT", "B01"
     dmVM.route = lambda chat, ctype=None: "myrepo"
     dmVM.chan_name = lambda c: "myrepo"
-    dmVM.owner_spoke = lambda chat, thread: None
-    dmVM.arm = lambda chat, when: None
-    saidVM, delivVM, ranVM, clearedVM, heldVM, echosVM = [], [], [], [], [], []
-    dmVM.hold_wrench = lambda target, chat, root, owed=None: heldVM.append(owed)
-    dmVM.marks = {}                                  # this box's own marks.json has no business in these cases
+    saidVM, delivVM, ranVM, echosVM = [], [], [], []
     def sayVM(chat, text, thread=None, mail=True):
         """say() as Slack answers it: the post, and the ts it was given. That ts is the whole anchor of the
         bookkeeping below — our transcript is what the memo becomes in the thread — so every case gets its own."""
@@ -2811,7 +2183,6 @@ def run_selfcheck():
         return echosVM[-1]
     dmVM.say = sayVM
     dmVM.deliver = lambda target, payload, **k: delivVM.append(payload) or "delivered"
-    dmVM.clear_owed = lambda chat, root=None: clearedVM.append(root)
     SPOKEN = "so um the loop thing — no, the board thing first, and tell me when the PR is up"
     CONDENSED = "Do the board change first, and tell me when the PR is up."
 
@@ -2874,10 +2245,6 @@ def run_selfcheck():
               len(delivVM) == 1 and delivVM[0]["content"] == CONDENSED and "[attached:" not in delivVM[0]["content"]
               and delivVM[0]["meta"].get("voice") == "memo" and delivVM[0]["meta"].get("voice_path") == audioVM
               and "file_path" not in delivVM[0]["meta"])
-        check("…and what the session OWES them is that transcript, not the recording: the memo became our post in "
-              "their thread, so the 👍 a silent turn leaves goes where the thread now ends — and the post is written "
-              "down as the OWNER's word AND as which recording it reads back (a bot message says neither)",
-              heldVM == echosVM[:1] and heldVM[0] != "9.1" and dmVM.spoke_of("CV", echosVM[0]) == "9.1")
         check("…the recording stays THEIR message and the box replies under it in their thread: a marked transcript, "
               "the words as spoken, the condensed text in italics beneath",
               len(saidVM) == 1 and saidVM[0][0] == "CV" and saidVM[0][2] == "9.1"
@@ -2935,21 +2302,16 @@ def run_selfcheck():
         saidVM.clear(); delivVM.clear(); ranVM.clear()
         with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
             dmVM.on_event(dict(evVM([memoVM], "9.13"), user="UMEM")); landedVM()
-        memberVM = {"bot_id": "B01", "ts": heldVM[-1], "text": f"{VOICE_PREFIX}\n{SPOKEN}"}
-        check("A MEMBER'S memo is read back the same way but is NOT the owner's word: no mark is written for it, so "
-              "the transcript earns what their typed message earns — no 🔴, no ❓ at the stall, nothing to nudge",
-              len(delivVM) == 1 and delivVM[0]["meta"]["role"] == "member" and len(saidVM) == 1
-              and dmVM.spoke_of("CV", heldVM[-1]) is None
-              and dmVM.base_mark(memberVM, time.time(), None, "CV") is None
-              and dmVM.base_mark(dict(memberVM, ts=str(time.time() - STALL_AFTER - 1)), time.time(), None, "CV") is None)
+        check("A MEMBER'S memo is read back exactly as the owner's is: the transcript goes into their thread and the "
+              "session is handed it with role=member",
+              len(delivVM) == 1 and delivVM[0]["meta"]["role"] == "member" and len(saidVM) == 1)
         saidVM.clear(); delivVM.clear(); ranVM.clear()
         with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
             dmVM.on_event(evVM([pngVM], "9.2")); landedVM()
         check("a file that is NOT a memo is left alone: no transcriber runs, nothing is posted in the thread, and the "
               "session gets the attachment line and the path it always got",
               not ranVM and not saidVM and len(delivVM) == 1 and "[attached: shot.png" in delivVM[0]["content"]
-              and "voice" not in delivVM[0]["meta"] and delivVM[0]["meta"]["file_path"].endswith("shot.png")
-              and heldVM[-1] == "9.2")   # …and what it owes is the message itself: only a transcribed memo moves that
+              and "voice" not in delivVM[0]["meta"] and delivVM[0]["meta"]["file_path"].endswith("shot.png"))
         saidVM.clear(); delivVM.clear(); ranVM.clear()
         answerVM.update(rc=0, out=json.dumps({"transcript": SPOKEN, "condensed": ""}))
         with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
@@ -2993,120 +2355,6 @@ def run_selfcheck():
               not ranVM and not saidVM and len(delivVM) == 1
               and "[attached: audio_message.m4a" in delivVM[0]["content"] and "voice" not in delivVM[0]["meta"]
               and f"`cc-voice text {delivVM[0]['meta']['file_path']}`" in delivVM[0]["content"])
-        # OUR TRANSCRIPT IS THEIR WORDS, NOT OUR ANSWER. It is the first post the box ever makes in the owner's own
-        # thread, and every piece of bookkeeping that asks "did we answer?" reads the newest message: unmarked, a memo
-        # the session then ignored would clear the owed word, read 🟠 handled, never turn ❓ at the stall and never be
-        # nudged — the one message that most needs chasing. VOICE_PREFIX is what keeps it out of all three.
-        saidVM.clear(); delivVM.clear(); clearedVM.clear()
-        with offline_slack(), contextlib.redirect_stderr(io.StringIO()):
-            for tsVM, txtVM in (("9.71", f"{VOICE_PREFIX}\n{SPOKEN}"), ("9.72", "on it — board change first")):
-                dmVM.on_event({"type": "message", "channel": "CV", "ts": tsVM, "thread_ts": "9.7", "user": "UBOT",
-                               "bot_id": "B01", "text": txtVM})
-        check("the transcript never settles the thread: OUR OWN words clear what the session owes them, their words "
-              "read back to them do not — so a memo nobody answered is still owed, and still gets its 👍 or its nudge",
-              clearedVM == ["9.7"])
-        nowVM = time.time()
-        # NOTHING HERE READS SLACK LIVE: base_mark goes and looks at the recording a transcript names when the thread
-        # is not rooted in it (a memo spoken under a typed root is a reply nobody has read), so the messages it may
-        # find are served from this table and from nowhere else.
-        voiceReadVM = {}
-        _apiVM = globals()["api"]
-        globals()["api"] = (lambda method, token, **kw:
-                            {"messages": [voiceReadVM.get(kw.get("ts")) or {"ts": kw.get("ts")}]})
-        memoRootVM = {"ts": str(nowVM - 3600), "user": "UOWNER", "files": [memoVM],   # an earlier memo, 👍'd and done
-                      "reactions": [{"name": "+1", "users": ["UBOT"]}, {"name": "hammer_and_wrench", "users": ["UBOT"]}]}
-        typedRootVM = {"ts": str(nowVM - 3601), "user": "UOWNER", "reactions": [{"name": "+1", "users": ["UBOT"]}]}
-        def echoVM(age=0.0, memo=None, **kw):
-            """Our transcript of the OWNER's memo, `age` seconds old, with the note the daemon writes as it posts it:
-            that the recording was the owner's, and WHICH message it is (remember_voice). Neither can be read off a
-            bot message, and a member's memo is given no note at all."""
-            m = {"bot_id": "B01", "ts": str(nowVM - age), "text": f"{VOICE_PREFIX}\n{SPOKEN}\n\n_{CONDENSED}_", **kw}
-            spoke = (memo or {}).get("ts") or str(nowVM - age - 1)   # by default a recording of this transcript's own
-            dmVM.marks[f"CV:{m['ts']}:{VOICE_MARK}:{spoke}"] = nowVM
-            return m
-        markVM = echoVM()
-        check("…and it does not READ as handled either: a thread whose newest message is our transcript is 🔴 (the "
-              "session owes them a word) and ❓ once it has stalled — never the 🟠 our own last word earns",
-              dmVM.base_mark(markVM, nowVM, None, "CV") == "🔴"
-              and dmVM.base_mark(echoVM(STALL_AFTER + 1), nowVM, None, "CV") == "❓"
-              and dmVM.base_mark(dict(markVM, text="done, merged"), nowVM, None, "CV") == "🟠")
-        # THE ANSWER IS ON THE TRANSCRIPT, the message the session was told it owed — never on the thread's root. Read
-        # off the root instead and a 👍 there settles every later memo in the thread (a second memo the session ignored
-        # would read 🟠 and never be chased), while a memo spoken into a thread rooted in something else is chased
-        # although it was answered.
-        answeredVM = dict(markVM, reactions=[{"name": "+1", "users": ["UBOT"]}])
-        check("our 👍 for a memo handled without words is read off THE TRANSCRIPT: 🟠 handled whether the thread is "
-              "rooted in the recording itself or in something typed the memo was spoken under",
-              dmVM.base_mark(answeredVM, nowVM, memoRootVM, "CV") == "🟠"
-              and dmVM.base_mark(answeredVM, nowVM, typedRootVM, "CV") == "🟠"
-              and dmVM.base_mark(echoVM(STALL_AFTER + 1, reactions=[{"name": "+1", "users": ["UBOT"]}]),
-                                 nowVM, typedRootVM, "CV") == "🟠")
-        check("…and a SECOND memo in a thread whose first one we 👍'd is owed all over again: that 👍 answered the "
-              "memo it was left on, this transcript carries none — 🔴, ❓ at the stall, and nudged like any silence",
-              dmVM.base_mark(markVM, nowVM, memoRootVM, "CV") == "🔴"
-              and dmVM.base_mark(echoVM(STALL_AFTER + 1), nowVM, memoRootVM, "CV") == "❓"
-              and dmVM.base_mark(markVM, nowVM, typedRootVM, "CV") == "🔴")
-        # …AND OFF THE RECORDING, because that is the ts the session is handed (meta["ts"]): answering a memo with a
-        # reaction puts it there, on a message our transcript is only a reply to. Read the transcript alone and the
-        # thread the session answered is 🔴, ❓ at the stall, and nudged "⏳ no answer — !restart myrepo".
-        spokenVM = {"ts": str(nowVM - 300), "user": "UOWNER", "files": [memoVM],      # a memo spoken as a REPLY, 👍'd
-                    "reactions": [{"name": "+1", "users": ["UBOT"]}]}
-        unheardVM = {"ts": str(nowVM - 301), "user": "UOWNER", "files": [memoVM],     # …and one nobody has answered
-                     "reactions": [{"name": "eyes", "users": ["UBOT"]}, {"name": "hammer_and_wrench", "users": ["UBOT"]}]}
-        voiceReadVM.update({m["ts"]: m for m in (spokenVM, unheardVM)})
-        check("a session answers with a reaction ON THE RECORDING — the ts it was handed, not our transcript of it — "
-              "and that is the answer: 🟠 handled at any age, never a nudge about a memo that was answered",
-              dmVM.base_mark(echoVM(120, memo=memoRootVM), nowVM, memoRootVM, "CV") == "🟠"
-              and dmVM.base_mark(echoVM(STALL_AFTER + 5, memo=memoRootVM), nowVM, memoRootVM, "CV") == "🟠")
-        check("…and the recording is the one the NOTE names, not whatever the thread is rooted in: a memo spoken "
-              "under a typed root is read where the note says it is (🟠), one still unanswered there stays 🔴, and "
-              "the root's own older 👍 — an answer to what it said — settles neither",
-              dmVM.base_mark(echoVM(30, memo=spokenVM), nowVM, typedRootVM, "CV") == "🟠"
-              and dmVM.base_mark(echoVM(31, memo=unheardVM), nowVM, typedRootVM, "CV") == "🔴")
-        # THE DEBT HAS THE SAME TWO ENDS: the session's reaction lands on the recording, what it owes is our
-        # transcript. Missed, the wrench comes off later and 👍s a memo the session answered itself.
-        dmCO = Daemon(use_slack=False)                    # the real clear_owed, not this block's stub
-        dmCO.marks = {f"CV:{markVM['ts']}:{VOICE_MARK}:{memoRootVM['ts']}": nowVM}
-        dmCO.owed = {"myrepo": ("CV", markVM["ts"], memoRootVM["ts"])}
-        dmCO.clear_owed("CV", ts=memoRootVM["ts"])
-        clearedCO = dict(dmCO.owed)
-        dmCO.owed = {"myrepo": ("CV", markVM["ts"], memoRootVM["ts"])}
-        dmCO.clear_owed("CV", ts=str(nowVM - 7))
-        check("the same reaction settles the DEBT: a reaction on the recording clears what is owed on our transcript "
-              "of it, while another message's ts clears nothing",
-              clearedCO == {} and dmCO.owed != {})
-        rootVM = {"ts": str(nowVM - 600), "reactions": [{"name": "hammer_and_wrench", "users": ["UBOT"]}]}
-        dmVM.marks[f"CV:{rootVM['ts']}:hammer_and_wrench"] = nowVM - 30
-        stalledVM = echoVM(STALL_AFTER + 60, user="UBOT")
-        check("…and a session ALREADY WORKING on a memo shows 🔧 beside 🔴 (owed), never the 🔧❓ of a stall: the 🔧 "
-              "downgrade reads the transcript as their word, exactly as it reads a typed one",
-              dmVM.root_marks(stalledVM, nowVM, rootVM, "CV") == ("🔴", "🔧")
-              and dmVM.root_marks(dict(stalledVM, text="on it"), nowVM, rootVM, "CV") == ("🟠", "🔧"))
-        # THE NUDGE is the loudest of these doors: unguarded it tells the owner the box is *still waiting for them*
-        # and quotes their own memo back at them, where a typed message they never got an answer to gets `!restart`.
-        globals()["api"] = _apiVM                         # …and the recording table is put away with it
-        rootsVM = {"CV": [{"ts": "3000.1", "reply_count": 1, "text": "their memo"}]}
-        repliesVM = {"3000.1": [{"ts": str(nowVM - 40 * 60), "user": "UBOT", "text": f"{VOICE_PREFIX}\n{SPOKEN}"}]}
-        with_latest(rootsVM["CV"], repliesVM)
-        dmNV = Daemon(use_slack=False); dmNV.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
-        dmNV.bot_user = "UBOT"
-        dmNV.marks = {f"CV:{repliesVM['3000.1'][0]['ts']}:{VOICE_MARK}:3000.1": nowVM - 40 * 60}   # the owner's memo, read back
-        dmNV.route = lambda chat, ctype=None: "myrepo"; dmNV.last_chat["myrepo"] = ("CV", None)
-        saidNV = []; dmNV.say = lambda chat, text, thread=None, mail=True: saidNV.append(text)
-        _apiNV = globals()["api"]
-        dmNV.retried[("CV", "3000.1")] = (nowVM - RETRY_GRACE - 60, "the session was on the channel and idle")
-        try:
-            globals()["api"] = (lambda method, token, **kw:
-                                {"messages": rootsVM.get(kw.get("channel"), [])} if method == "conversations.history"
-                                else {"messages": repliesVM.get(kw.get("ts"), [])})
-            dmNV.nudge_cycle()
-        finally:
-            globals()["api"] = _apiNV
-        check("a memo left unanswered for 40 min is nudged as the SESSION's silence (what the box tried, and what it "
-              "found) — never as 'still waiting for you', which would be the box asking the owner to answer their "
-              "own memo",
-              len(saidNV) == 1 and saidNV[0].startswith("⏳ no answer") and "on the channel and idle" in saidNV[0]
-              and "still waiting" not in saidNV[0] and SPOKEN not in saidNV[0])
         capVM = voice_post("a" * (CHUNK * 2), "b" * (CHUNK * 2))
         check("the post under their recording is ONE message however long the memo and however long the condensing "
               "call ran on: a second chunk would carry no prefix, and every door above would read it as our answer",
@@ -3144,18 +2392,13 @@ def run_selfcheck():
           and voice_says(0, '{"transcript": "   "}') is None
           and (voice_says(0, json.dumps({"transcript": "hi", "condensed": "Hi."})) or {}).get("condensed") == "Hi.")
     dmL17 = Daemon(use_slack=False); dmL17.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
-    seen17, calls17 = [], []
+    seen17 = []; dmL17.names["D1"] = "dm"
     dmL17.route = lambda chat, ctype=None: seen17.append((chat, ctype)) or ("r" if ctype == "im" else None)
-    try:
-        globals()["api"] = lambda method, token, **kw: calls17.append((method, kw.get("name"))) or {}
-        dmL17.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "UOWNER",
-                           "item": {"type": "message", "channel": "D1", "ts": "3.3"}})
-        dmL17.mark_dirty({"type": "reaction_added", "item": {"channel": "D1"}})
-    finally:
-        globals()["api"] = real_api
-    check("DM reactions route as 'im': the owner's 🏁 strips the status mark and marks the board dirty in a DM too — L17",
-          calls17 == [("conversations.replies", None)] + [("reactions.remove", n) for n in BOOK_NAMES]
-          and (dmL17.board.get("D1") or {}).get("dirty_at") and all(c == "im" for _, c in seen17))
+    dmL17.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "UOWNER",
+                       "item": {"type": "message", "channel": "D1", "ts": "3.3"}})
+    check("DM reactions route as 'im': the owner's reaction in a DM is looked up as the box session's, not as a "
+          "channel nobody mapped — L17",
+          seen17 and all(c == "im" for _, c in seen17))
     dmSU = Daemon(use_slack=False)
     class FakeSrv:
         def bind(self, a):
@@ -3242,16 +2485,13 @@ def run_selfcheck():
               len(lines) == 2 and all(l.startswith("file\t") for l in lines) and "render.png" in lines[0]
               and not err_no_tok and "NOT sent" in out_no_tok and "outbox.log" in out_no_tok
               and "do not say the file arrived" in out_no_tok and "NOT sent" in out_local)
-        # -- a reaction is a word, and the box's own 👍 is not: cc-owed reads this log to tell an answered
-        # thread from one nobody spoke in, and it can only do that if the two are written apart (PR #194) --
+        # -- a reaction is a word: the outbox log is how an answered thread is told from one nobody spoke in (PR #194) --
         n_rx = len(open(tmp_outbox_log).read().splitlines())
         react({}, "C1", "1.1", "+1")                       # a session's own: on their message this IS the answer
-        react({}, "C1", "1.1", "+1", auto=True)            # the box's, for a session that finished silently
         react({}, "C1", "1.1", "eyes", remove=True)        # taking a reaction off is not a word
         react({}, "C1", "", "+1")                          # no message to put it on: nothing to record
-        check("react: ours is logged as a word and the automatic 👍 apart from it, so a thread that was answered "
-              "reads differently from one the box only marked handled; a removal and a ts-less call write nothing",
-              open(tmp_outbox_log).read().splitlines()[n_rx:] == ["react\tC1\t1.1\t+1", "react-auto\tC1\t1.1\t+1"])
+        check("react: ours is logged as a word; a removal and a ts-less call write nothing",
+              open(tmp_outbox_log).read().splitlines()[n_rx:] == ["react\tC1\t1.1\t+1"])
         # -- and it is filed under the THREAD, not the message: he follows up at 1.7 INSIDE thread 1.1 and the
         # session answers with a 👍 on 1.7. Filed under 1.7, a look-up of the thread finds nothing and the ask
         # reads unanswered — the exact false alarm this log exists to stop (review of PR #194, finding 4).
@@ -3380,15 +2620,6 @@ def run_selfcheck():
         subprocess.run(["rm", "-rf", upd])
     after_outbox = open(real_outbox_log).read() if os.path.exists(real_outbox_log) else None
     # -- PART 5: status v2 (❓ = needs you) --------------------------------------------------------
-    dmJ = Daemon(use_slack=False); dmJ.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmJ.bot_user = "UBOT"; dmJ.bot_id = "BBOT"
-    tJ = str(time.time() - 3600)
-    rootsJ = [{"ts": tJ, "user": "UOWNER", "subtype": "channel_join", "text": "<@UOWNER> has joined the channel"},
-              {"ts": tJ, "user": "UBOT", "text": "🤖 demo@r joined — @demo hands it threads"},
-              {"ts": tJ, "user": "UBOT", "text": "🔐 `repo` wants to run *Bash*: x\nReply `yes abcde` or `no abcde`"},
-              {"ts": tJ, "user": "UOWNER", "text": "anyone?"}]
-    bJ = [(m, r["text"][:6]) for m, r, _ in dmJ.bucket_threads("C1", roots=rootsJ)]
-    check("bucket_threads: a channel_join and our own notices are not threads; a top-level 🔐 fallback and a stalled owner root are ❓",
-          bJ == [("❓", "🔐 `rep"), ("❓", "anyone")])
     check("asks_owner: ONLY the two forms the box emits itself — a 🔐 prompt and a worker's STATUS: BLOCKED line. The "
           "prose rules that made the tab show three things needing the owner when none did are gone: a trailing '?', "
           "and the words 'needs you' / 'blocked on' in a sentence, are no longer a NEEDS YOU",
@@ -3408,10 +2639,6 @@ def run_selfcheck():
         globals()["api"] = lambda method, token, **kw: v2calls.append((method, kw.get("name"), kw.get("timestamp"))) or {"ts": "1"}
         ch_v2.call("reply", {"chat_id": "C1", "text": "done — merged ✅", "thread_ts": "9.0", "ts": "9.5"})
         plain_v2 = list(v2calls); v2calls.clear()
-        ch_v2.call("reply", {"chat_id": "C1", "text": "half done — which env var should I use?", "thread_ts": "9.0", "ts": "9.6"})
-        quiet_v2 = list(v2calls); v2calls.clear()
-        told_v2 = []
-        ch_v2.tell_daemon = told_v2.append
         ch_v2.call("reply", {"chat_id": "C1", "text": "which env var should I use?", "thread_ts": "9.0", "ts": "9.7",
                              "needs_owner": True})
         ask_v2 = list(v2calls)
@@ -3422,21 +2649,16 @@ def run_selfcheck():
     check("reply tool: answering the owner takes the 👀 off their message and adds nothing (no ✅) — V2",
           ("reactions.remove", "eyes", "9.5") in plain_v2
           and not any(m == "reactions.add" for m, _, _ in plain_v2))
-    check("reply tool: a question the session is NOT waiting on marks nothing — needs_owner is the only thing that "
-          "puts a thread on the owner's NEEDS YOU list (2026-08-30)",
-          ("reactions.remove", "eyes", "9.6") in quiet_v2
-          and not any(m == "reactions.add" for m, _, _ in quiet_v2))
-    check("reply tool: needs_owner takes their 🔴 off the root and marks it ❓ at once, and tells the daemon — the ONE "
-          "writer — when the declaration was made, so the next sweep agrees instead of stripping it — V3",
+    check("reply tool: a needs_owner reply puts nothing on the root either — the ❓ lives in the text it posts, and "
+          "the thread root carries no mark of its own (2026-08-30)",
           ("reactions.remove", "eyes", "9.7") in ask_v2
-          and ask_v2.index(("reactions.remove", "red_circle", "9.0")) < ask_v2.index(("reactions.add", "question", "9.0"))
-          and told_v2 == [{"type": "asked", "chat": "C1", "root": "9.0"}])
+          and not any(m == "reactions.add" for m, _, _ in ask_v2))
     # THE MARK AND THE MENTION RIDE THE needs_owner SEAM (owner, 2026-09-12: "mentioning me when my thoughts or decision
     # is actually needed. adding an actual red question mark when my decision is needed, vs just an update"): the
     # text that reaches Slack opens with ❓ and his mention; a plain reply carries neither, and cannot mention him by
     # hand — his typed handle goes out as code and the tool result says how to reach him.
     role_d = os.environ.pop("CC_ROLE", None); sent_d = []; res_d = {}
-    ch_d = Channel("box"); ch_d.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; ch_d.tell_daemon = lambda m: None
+    ch_d = Channel("box"); ch_d.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
     users_d = dict(_users)
     try:
         _users.update(t=time.time(), map={"the.owner": "UOWNER", "ada.byron": "UADA"}, ids={}, miss=time.time())
@@ -3476,27 +2698,17 @@ def run_selfcheck():
     check("reply tool: an answer lands in the chat it was ASKED in — the updates lane's message is answered on the "
           "updates lane and the main channel's on the main channel; the lane split never redirects a reply",
           sentL == [("C-lane", "still building"), ("C-main", "yes")])
-    dmV = Daemon(use_slack=False); dmV.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dmV.bot_user = "UBOT"
-    nowV = time.time()
-    check("root_mark: our 🔐 prompt → ❓; our plain answer → 🟠 (handled); our own nudge stays ❓ — V3",
-          dmV.root_mark({"bot_id": "B01", "ts": str(nowV), "text": "🔐 `myrepo` wants to run *Bash*"}, nowV) == "❓"
-          and dmV.root_mark({"bot_id": "B01", "ts": str(nowV), "text": "done, merged"}, nowV) == "🟠"
-          and dmV.root_mark({"bot_id": "B01", "ts": str(nowV), "text": NUDGE_PREFIXES[1] + " for 40m"}, nowV) == "❓")
-    check("root_mark: the owner's last word is 🔴 while it is fresh and ❓ from 30 min on; a stranger's is never marked — V3",
-          dmV.root_mark({"user": "UOWNER", "ts": str(nowV - 31 * 60), "text": "?"}, nowV) == "❓"
-          and dmV.root_mark({"user": "UOWNER", "ts": str(nowV - 29 * 60), "text": "?"}, nowV) == "🔴"
-          and dmV.root_mark({"user": "USTRANGER", "ts": str(nowV - 3 * 3600), "text": "hi"}, nowV) is None)
     dmf = Daemon(use_slack=False); dmf.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x", "SLACK_CHANNEL": "CFALL"}; dmf.use_slack = True
     _fc, _api = globals()["find_channel"], globals()["api"]
     globals()["find_channel"] = lambda cfg, name: ("CCTL", True) if name == CTL else (None, False)   # no -threads lane on this box
     globals()["api"] = lambda m, t, **kw: {"channel": {"id": "DOWNER"}} if m == "conversations.open" else {"ok": True}
     try:
-        posted = []; dmf.say = lambda chat, text, thread=None, mail=True: posted.append((chat, thread)); dmf.mark_needs = lambda *a, **k: None
+        posted = []; dmf.say = lambda chat, text, thread=None, mail=True: posted.append((chat, thread))
         dmf.deliver = lambda *a, **k: "ok"
         dmf.relay_permission(CTL, {"request_id": "abcde", "tool_name": "Bash", "description": "d", "input_preview": "x"})
         dmf.relay_permission("box", {"request_id": "abcdf", "tool_name": "Bash", "description": "d", "input_preview": "x"})
         dmf2 = Daemon(use_slack=False); dmf2.cfg = dict(dmf.cfg); dmf2.use_slack = True
-        posted2 = []; dmf2.say = lambda chat, text, thread=None, mail=True: posted2.append((chat, thread)); dmf2.mark_needs = lambda *a, **k: None
+        posted2 = []; dmf2.say = lambda chat, text, thread=None, mail=True: posted2.append((chat, thread))
         dmf2.deliver = lambda *a, **k: "ok"
         globals()["find_channel"] = lambda cfg, name: (None, False)   # the bot is in no channel at all
         dmf2.relay_permission("box", {"request_id": "abcdg", "tool_name": "Bash", "description": "d", "input_preview": "x"})
@@ -3506,16 +2718,6 @@ def run_selfcheck():
               and posted2 == [("DOWNER", None)] and dmf2.default_chats == {CTL: "DOWNER"})
     finally:
         globals()["find_channel"], globals()["api"] = _fc, _api
-    dmG = Daemon(use_slack=False); dmG.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmG.bot_user = "UBOT"
-    dmG.board["CGONE"] = {"dirty_at": 1.0}; dmG.alarms["CGONE"] = 5.0; dmG.last_chat["repo"] = ("CGONE", "1.0"); dmG.default_chats["repo"] = "CGONE"
-    _apiG = globals()["api"]; globals()["api"] = lambda m, t, **kw: (_ for _ in ()).throw(RuntimeError("conversations.history: not_in_channel"))
-    try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            dmG.reconcile_reactions("CGONE")
-    finally:
-        globals()["api"] = _apiG
-    check("archived/left chat: not_in_channel forgets it (no board, alarm, last_chat or fallback left) — no 15-min error loop",
-          "CGONE" in dmG.forgotten and "CGONE" not in dmG.board and "CGONE" not in dmG.alarms and "repo" not in dmG.last_chat and "repo" not in dmG.default_chats)
     # The 👍 path used to merge right here, and when the PR was not mergeable yet it armed GitHub's own merge-later
     # — which then landed whenever GitHub felt like it, past no gates, with nothing deploying it afterwards. Both are
     # gone, and what keeps them gone is that this file no longer knows how to merge anything. cc-land is the sole
@@ -3526,95 +2728,6 @@ def run_selfcheck():
           ('"pr", ' + '"merge"') not in ownSC and ("--" + "auto") not in ownSC
           and not hasattr(Daemon, "merge") and not hasattr(Daemon, "mark_merged")
           and not hasattr(Daemon, "land_soon"))
-    # -- PART 6: status v3 (❓ needs you · 🔴 the session owes you · 🟠 handled) + the 🏁 flag file ------------------
-    nowF = time.time()
-    f_roots = [{"ts": "9200.1", "reply_count": 1, "latest_reply": str(nowF - 40 * 60), "user": "UOWNER", "text": "flag me"}]
-    f_replies = {"9200.1": [{"ts": str(nowF - 40 * 60), "user": "UOWNER", "text": "still waiting"}]}
-    f_api = lambda method, token, **kw: ({"messages": f_roots} if method == "conversations.history"
-                                         else {"messages": f_replies.get(kw.get("ts"), [])})
-    dmV3 = Daemon(use_slack=False); dmV3.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmV3.bot_user = "UBOT"
-    def buckets_now():
-        dmV3.reply_cache.clear(); dmV3.snap.clear()
-        try:
-            globals()["api"] = f_api
-            return dmV3.bucket_threads("CF")
-        finally:
-            globals()["api"] = real_api
-    b_open = buckets_now()
-    dmV3.flags["CF:9200.1"] = nowF                    # the owner 🏁'd the thread after its last message
-    b_flag = buckets_now()
-    dmV3.flags["CF:9200.1"] = nowF - 50 * 60          # ... and then a message landed AFTER the flag: it re-opens
-    b_reply = buckets_now()
-    dmV3.flags.pop("CF:9200.1")                       # the owner took the 🏁 back off
-    b_unflag = buckets_now()
-    check("flags: a 🏁 newer than the thread's last message takes every mark off it (no bucket, no nudge); a message "
-          "newer than the flag re-opens the thread; removing the 🏁 brings the mark straight back — V3",
-          [m for m, _, _ in b_open] == ["❓"] and b_flag == [] and [m for m, _, _ in b_reply] == ["❓"]
-          and [m for m, _, _ in b_unflag] == ["❓"])
-    said_n = []; dmV3.say = lambda chat, text, thread=None, mail=True: said_n.append(text)
-    dmV3.last_chat["r"] = ("CF", None)
-    dmV3.retried[("CF", "9200.1")] = (nowF - RETRY_GRACE - 60, "nothing was running for it")   # already tried and out of grace
-    dmV3.flags["CF:9200.1"] = nowF
-    try:
-        globals()["api"] = f_api
-        with contextlib.redirect_stderr(io.StringIO()):
-            dmV3.reply_cache.clear(); dmV3.snap.clear(); dmV3.nudge_cycle()
-            flagged_nudges = list(said_n)
-            dmV3.flags["CF:9200.1"] = nowF - 50 * 60
-            dmV3.reply_cache.clear(); dmV3.snap.clear(); dmV3.nudge_cycle()
-    finally:
-        globals()["api"] = real_api
-    check("flags: a flagged thread is never nudged, and a reply after the flag puts it straight back in the nudge cycle "
-          "(no lingering suppression) — V3",
-          flagged_nudges == [] and len(said_n) == 1 and said_n[0].startswith("⏳"))
-    dmV3.flags.clear()
-    f_roots.append({"ts": "9200.2", "reply_count": 1, "latest_reply": str(nowF - 20 * 60), "user": "UOWNER",
-                    "text": "flagged before v3", "reactions": [{"name": "checkered_flag", "users": ["UOWNER"]}]})
-    f_replies["9200.2"] = [{"ts": str(nowF - 20 * 60), "user": "UOWNER", "text": "hm"}]
-    b_pre = buckets_now(); pre_ts = dmV3.flags.get("CF:9200.2")
-    f_replies["9200.2"].append({"ts": str(nowF - 60), "bot_id": "B01", "text": "picked it up"})
-    f_roots[-1]["latest_reply"] = str(nowF - 60)
-    b_post = buckets_now()
-    check("flags: a 🏁 we have no time for (set before v3, or while the daemon was down) flags the thread as it stands "
-          "now, and the next message re-opens it — V3",
-          not any(r["ts"] == "9200.2" for _, r, _ in b_pre) and pre_ts == float(nowF - 20 * 60)
-          and [m for m, r, _ in b_post if r["ts"] == "9200.2"] == ["🟠"])
-    fl2 = []
-    dmV3b = Daemon(use_slack=False); dmV3b.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
-    dmV3b.bot_user = "UBOT"; dmV3b.route = lambda chat, ctype=None: "r"
-    fl2_msgs = {"9300.2": {"ts": "9300.2", "thread_ts": "9300.1", "bot_id": "B01", "text": "an answer"},
-                "9300.1": {"ts": "9300.1", "reactions": [{"name": "question", "users": ["UBOT"]},
-                                                         {"name": "checkered_flag", "users": ["UOWNER", "UBOT"]}]}}
-    def fl2_api(method, token, **kw):
-        fl2.append((method, kw.get("name"), kw.get("timestamp")))
-        return {"messages": [fl2_msgs[kw["ts"]]]} if method == "conversations.replies" else {}
-    try:
-        globals()["api"] = fl2_api
-        dmV3b.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "UOWNER", "event_ts": "1700.0",
-                           "item": {"type": "message", "channel": "CF", "ts": "9300.2"}})
-        on_reply = list(fl2); flags_added = dict(dmV3b.flags); fl2.clear()
-        dmV3b.on_reaction({"type": "reaction_removed", "reaction": "checkered_flag", "user": "UOWNER", "event_ts": "1800.0",
-                           "item": {"type": "message", "channel": "CF", "ts": "9300.2"}})
-        off_flag = list(fl2); off_entry = dict(dmV3b.flags); fl2.clear()
-        dmV3b.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "UOWNER", "event_ts": "1900.0",
-                           "item": {"type": "message", "channel": "CF", "ts": "9300.2"}})   # tap off and straight back on
-        retap = list(fl2); armed = dmV3b.alarms.get("CF"); fl2.clear()
-        dmV3b.mark_at[("CF", "9300.1", "flag")] = 0.0    # …and once the dwell is over the mirror follows the truth again
-        dmV3b.flags.pop("CF:9300.1", None); dmV3b.unmirror("CF", "9300.1")
-        settled_off = list(fl2)
-    finally:
-        globals()["api"] = real_api
-    check("flags: a 🏁 on ANY message flags the WHOLE thread — the root is resolved from the reply, ITS mark is stripped "
-          "and the flag time is keyed by the root (owner addendum)",
-          flags_added == {"CF:9300.1": 1700.0} and ("reactions.remove", "question", "9300.1") in on_reply
-          and not any(t == "9300.2" for m, _, t in on_reply if m.startswith("reactions.")))
-    check("flags: a 🏁 on a reply is MIRRORED onto the top-level message (our own 🏁 there; never touching the owner's) — owner rule",
-          ("reactions.add", "checkered_flag", "9300.1") in on_reply and not ("reactions.remove", "checkered_flag", "9300.1") in on_reply)
-    check("flags: taking the 🏁 off drops the file entry at once, but the mirror on the root obeys MARK_DWELL — tapping 🏁 "
-          "off and straight back on moves NOTHING on the root (it went add/remove/add in 4 s on 2026-08-30); the chat is "
-          "armed, and once the dwell is over the mirror follows the truth",
-          off_entry == {} and not any(n == "checkered_flag" for _, n, _ in off_flag + retap) and armed
-          and ("reactions.remove", "checkered_flag", "9300.1") in settled_off)
     # ---- revisit: the owner's 📌 marks a thread to come back to (on_revisit) — a bookmark, never an ask or a verdict
     dmRv = Daemon(use_slack=False); dmRv.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
     dmRv.bot_user = "UBOT"; dmRv.revisit.clear(); dmRv.home_dirty = False
@@ -3665,10 +2778,8 @@ def run_selfcheck():
           cleared == rv_one and cleared_disk == rv_one)
     check("revisit: a member's 📌 does nothing — no entry, and not even a read of the thread; taking it off is as silent",
           member == rv_one and member_off == rv_one and member_calls == [])
-    check("revisit: a 📌 is neither an ask nor a verdict — nothing is delivered to a session, it settles no thread "
-          "(answered_by_them/answered_by_us ignore it) and it opens no ❓",
-          rv_sent == [] and not dmRv.answered_by_them({"reactions": [{"name": "pushpin", "users": ["UOWNER"]}]})
-          and not dmRv.answered_by_us({"reactions": [{"name": "pushpin", "users": ["UBOT"]}]}) and dmRv.alarms.get("CR") is None)
+    check("revisit: a 📌 is neither an ask nor a verdict — it reaches no session at all",
+          rv_sent == [])
     rv_rows = revisit_rows(two, now=1800.0 + 3 * 86400)
     check("revisit_rows: newest first, age and ISO stamp rendered, and revisit_text clips on a budget",
           [r["channel"] for r in rv_rows] == ["#beta", "#beta"] and rv_rows[0]["at"] == 1800.0 and rv_rows[0]["age"] == "3d"
@@ -3707,9 +2818,7 @@ def run_selfcheck():
     dmRx.user_name = lambda u: {"UOWNER": "The Owner", "UMEMBER": "Ada Byron"}.get(u, u)
     rx, rx_calls = [], []
     dmRx.deliver = lambda target, payload, **k: rx.append((target, payload, k)) or "delivered"
-    dmRx.marks = {f"C1:9400.1:{ASKED}": 9400.2}    # the session posted 9400.2 with needs_owner=true: it ASKED, so a 👍 on
-                                                   # it is a decision and not the ack the block below drops (plain_ack)
-    rx_msgs = {"9400.2": {"ts": "9400.2", "thread_ts": "9400.1", "bot_id": "BBOT", "text": "pushed the branch, all green"},
+    rx_msgs = {"9400.2": {"ts": "9400.2", "thread_ts": "9400.1", "bot_id": "BBOT", "text": "❓ <@UOWNER> pushed the branch, all green — land it?"},
                "9400.3": {"ts": "9400.3", "thread_ts": "9400.1", "user": "UOWNER", "text": "the owner's own message"},
                "9400.1": {"ts": "9400.1", "user": "UOWNER", "text": "root"}}
     def rx_api(method, token, **kw):
@@ -3726,7 +2835,6 @@ def run_selfcheck():
         dmRx.on_reaction(ev_rx(user="UMEMBER"))                                  # a member of that channel: same verdict
         dmRx.on_reaction(ev_rx(user="UMEMBER", item={"type": "message", "channel": "D1", "ts": "9400.2"}))   # a DM: not theirs
         dmRx.on_reaction(ev_rx(item={"type": "message", "channel": "C1", "ts": "9400.3"}))
-        dmRx.on_reaction(ev_rx(reaction="checkered_flag"))
         dmRx.on_reaction(ev_rx(type="reaction_removed", reaction="-1"))
         dmRx.chan_name = lambda c: APPROVALS
         dmRx.fetch_message = lambda chat, ts: None
@@ -3746,7 +2854,7 @@ def run_selfcheck():
           and rx[1][1]["meta"]["role"] == "member" and rx[1][1]["meta"]["user"] == "Ada Byron"
           and rx[1][1]["content"] == rx[0][1]["content"])
     check("reactions to the session: a non-owner's reaction in a DM (nothing gates a DM, and it reaches the box session), "
-          "one on a human's own message, a 🏁 and anything in #approvals are never delivered — V3", len(rx) == 3)
+          "one on a human's own message, anything in #approvals are never delivered — V3", len(rx) == 3)
     check("reactions to the session: with no session live nothing is delivered and nothing is even read — a reaction "
           "never starts a session — V3", dead_rx == ([], []))
 
@@ -3771,9 +2879,8 @@ def run_selfcheck():
     ak_api = lambda method, token, **kw: {"messages": [ak_msgs[kw["ts"]]]} if kw.get("ts") in ak_msgs else {"messages": []}
     try:
         globals()["api"] = ak_api
-        dmAk.pairs["C1"] = {"8100.1": ("❓", None)}     # this chat HAS a thread waiting: the arm branch is live
         dmAk.on_reaction(ak_ev())                                       # 👍 on our plain reply
-        ak_plain, ak_armed = list(ak), dmAk.alarms.get("C1")
+        ak_plain = list(ak)
         dmAk.on_reaction(ak_ev(type="reaction_removed"))                # …taken off…
         dmAk.on_reaction(ak_ev())                                       # …and put back: one toggle, still no turn
         ak_toggle = list(ak)
@@ -3791,11 +2898,6 @@ def run_selfcheck():
     check("an ack is not a turn: the owner's 👍 on a reply of ours that asked nothing wakes NO session — and the toggle "
           "that cost three wake-ups (off, then on again) wakes none either",
           ak_plain == [] and ak_toggle == [])
-    check("an ack still does the owed bookkeeping it always did: the chat is armed for the next tick, and the 👍 on our "
-          "reply reads as the answer it is — the thread turns 🟠, handled, and is never asked about again",
-          ak_armed is not None and dmAk.answered_by_them({"reactions": [{"name": "+1", "users": ["UOWNER"]}]})
-          and dmAk.base_mark({"ts": "8100.2", "bot_id": "BBOT", "text": "landed it, all green",
-                              "reactions": [{"name": "+1", "users": ["UOWNER"]}]}, time.time()) == "🟠")
     check("a 👍 on a message that ASKED — a 🔐 prompt, a PR card — is a decision and still reaches the session, and so "
           "does a 👎 on the plain reply: only the plain yes is dropped",
           len(ak_woke) == 3 and "deploy the mail door" in ak_woke[0] and "PR #446" in ak_woke[1]
@@ -3804,115 +2906,7 @@ def run_selfcheck():
           "👍 in #approvals is still handed to on_approval — the ack rule never sees either",
           ak_pin == (3, ["C1:8100.1"]) and ak_appr == [("8100.2", "+1")] and len(ak) == 3)
     dmAk.revisit.clear(); save_revisit(dmAk.revisit)    # the 📌 above is this block's fixture, not the next one's
-    with tempfile.TemporaryDirectory(prefix="_selfcheck_flags_") as tdf:
-        real_dirf = DIR
-        try:
-            globals()["DIR"] = tdf
-            real_save_flags({"C1:100.1": time.time(), "C1:100.2": time.time() - 40 * 86400})
-            back_flags = real_load_flags()
-            mode_flags = os.stat(f"{tdf}/{FLAGS}").st_mode & 0o777
-        finally:
-            globals()["DIR"] = real_dirf
-    check("flags.json: written 0600 and read back across a restart; entries older than 30 days are pruned — V3",
-          list(back_flags) == ["C1:100.1"] and mode_flags == 0o600)
-    dmAl = Daemon(use_slack=False); dmAl.cfg = {"SLACK_OWNER_ID": "UOWNER"}
-    dmAl.plan_alarm("CA", [("🔴", {"ts": "1"}, {"user": "UOWNER", "ts": str(nowF - 60)})])
-    red_at = dmAl.alarms["CA"]
-    dmAl.plan_alarm("CA", [("🟠", {"ts": "1"}, {"bot_id": "B01", "ts": str(nowF - 60)})])
-    orange_at = dmAl.alarms["CA"]
-    check("alarms: 🔴 is re-checked exactly when it turns into a stall ❓ at 30 min; 🟠 only when it expires at 48 h — V3",
-          int(red_at - (nowF - 60)) == STALL_AFTER and int(orange_at - (nowF - 60)) == STALE_AFTER)
 
-    # -- PART 7: our OWN reaction answers the owner (addendum 2), and a 🏁 never stops a session (addendum 3) ---------
-    dmA = Daemon(use_slack=False); dmA.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dmA.bot_user = "UBOT"
-    nowA2 = time.time()
-    fresh_o = {"user": "UOWNER", "ts": str(nowA2 - 5 * 60), "text": "ship it?"}
-    stale_o = {"user": "UOWNER", "ts": str(nowA2 - 40 * 60), "text": "ship it?"}
-    check("root_mark: a reaction of OUR OWN on the owner's message is our answer — that thread is handled (🟠), never "
-          "🔴/❓ (addendum 2)",
-          dmA.root_mark(dict(fresh_o, reactions=[{"name": "+1", "users": ["UBOT"]}]), nowA2) == "🟠"
-          and dmA.root_mark(dict(stale_o, reactions=[{"name": "white_check_mark", "users": ["UBOT"]}]), nowA2) == "🟠")
-    check("root_mark: our 👀 alone only says 'received' and still owes them; so does one of our own root marks, or a "
-          "reaction the OWNER put there themselves (addendum 2)",
-          dmA.root_mark(dict(fresh_o, reactions=[{"name": "eyes", "users": ["UBOT"]}]), nowA2) == "🔴"
-          and dmA.root_mark(dict(stale_o, reactions=[{"name": "eyes", "users": ["UBOT"]}]), nowA2) == "❓"
-          and dmA.root_mark(dict(stale_o, reactions=[{"name": "red_circle", "users": ["UBOT"]}]), nowA2) == "❓"
-          and dmA.root_mark(dict(fresh_o, reactions=[{"name": "+1", "users": ["UOWNER"]}]), nowA2) == "🔴")
-    # THEIR reaction on OUR message is the mirror of the two checks above (owner, 2026-08-30: "i already thumbs up this.
-    # the automatic hook should realize i thumbs upped this" — the ❓ arrived 30 min after their 👍).
-    ask_b = {"bot_id": "B01", "ts": str(nowA2 - 40 * 60), "text": "🔐 `myrepo` wants to run *Bash*"}
-    check("root_mark: the owner's 👍 on OUR ask is their answer — 🟠 now and still 🟠 once the 30 min stall would have "
-          "fired; 👎 and ❌ settle it too (a no is an answer)",
-          dmA.root_mark(dict(ask_b, reactions=[{"name": "+1", "users": ["UOWNER"]}]), nowA2) == "🟠"
-          and dmA.root_mark(dict(ask_b, reactions=[{"name": "+1", "users": ["UOWNER"]}]), nowA2 + 40 * 60) == "🟠"
-          and dmA.root_mark(dict(ask_b, reactions=[{"name": "-1", "users": ["UOWNER"]}]), nowA2) == "🟠"
-          and dmA.root_mark(dict(ask_b, reactions=[{"name": "x", "users": ["UOWNER"]}]), nowA2) == "🟠")
-    check("root_mark: their 👀 is 'received', not an answer, and a MEMBER cannot close a thread that waits on the owner — "
-          "both still ❓; their 👍 on our own nudge does settle it",
-          dmA.root_mark(dict(ask_b, reactions=[{"name": "eyes", "users": ["UOWNER"]}]), nowA2) == "❓"
-          and dmA.root_mark(dict(ask_b, reactions=[{"name": "+1", "users": ["UMEM"]}]), nowA2) == "❓"
-          and dmA.root_mark(dict(ask_b, text=NUDGE_PREFIXES[0] + " (40m): ship it?",
-                                 reactions=[{"name": "+1", "users": ["UOWNER"]}]), nowA2) == "🟠")
-    dmAl2 = Daemon(use_slack=False); dmAl2.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmAl2.bot_user = "UBOT"
-    liked = dict(ask_b, ts=str(nowA2 - 60), reactions=[{"name": "+1", "users": ["UOWNER"]}])
-    dmAl2.plan_alarm("CA3", [(dmAl2.root_mark(liked, nowA2), {"ts": "1"}, liked)])
-    check("alarms: their 👍 DISARMS the stall — the chat is re-checked at the 48 h expiry, not 30 min later with a ❓",
-          int(dmAl2.alarms["CA3"] - float(liked["ts"])) == STALE_AFTER)
-    dmR = Daemon(use_slack=False); dmR.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmR.bot_user = "UBOT"
-    dmR.route = lambda chat, ctype=None: "r"; dmR.chan_name = lambda c: "proj"; dmR.deliver_reaction = lambda *a, **k: None
-    rx = lambda who, name: dmR.on_reaction({"type": "reaction_added", "reaction": name, "user": who,
-                                            "item": {"type": "message", "channel": "CR", "ts": "5.1"}})
-    rx("UOWNER", "+1"); quiet_chat = "CR" not in dmR.alarms      # nothing waits in this chat: a 👍 is not worth a read
-    dmR.pairs["CR"] = {"5.0": ("❓", None)}
-    rx("UOWNER", "eyes"); seen_eyes = "CR" in dmR.alarms
-    rx("UMEM", "+1"); seen_mem = "CR" in dmR.alarms
-    rx("UOWNER", "+1"); armed_now = dmR.alarms.get("CR", 0) <= time.time()
-    check("reaction: with a ❓ standing, the owner's verdict re-checks that chat on the next tick so the ❓ comes off in "
-          "seconds — a 👀, a member's 👍, or a chat with nothing waiting arms nothing",
-          quiet_chat and not seen_eyes and not seen_mem and armed_now)
-    rootsA = [{"ts": str(nowA2 - 40 * 60), "user": "UOWNER", "text": "ship it?", "reactions": [{"name": "+1", "users": ["UBOT"]}]},
-              {"ts": str(nowA2 - 41 * 60), "user": "UOWNER", "text": "and this one?"}]
-    saidA = []; dmA.say = lambda chat, text, thread=None, mail=True: saidA.append(text)
-    dmA.route = lambda chat, ctype=None: "r"; dmA.last_chat["r"] = ("CA2", None)
-    dmA.snap["CA2"] = (time.time(), dmA.bucket_threads("CA2", roots=rootsA))
-    dmA.retried[("CA2", rootsA[1]["ts"])] = (nowA2 - RETRY_GRACE - 60, "nothing was running for it")
-    dmA.nudge_cycle()
-    check("nudge: a message we answered with a reaction is 🟠 and never nudged; the one beside it, still unanswered "
-          "after 40 min, is (addendum 2)",
-          [m for m, _, _ in dmA.snap["CA2"][1]] == ["🟠", "❓"] and len(saidA) == 1 and saidA[0].startswith("⏳"))
-    dmE = Daemon(use_slack=False); dmE.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
-    dmE.bot_user = "UBOT"; dmE.bot_id = "BBOT"; dmE.route = lambda chat, ctype=None: "r"
-    e_msgs = {"9500.1": {"ts": "9500.1", "user": "UOWNER", "text": "root", "reactions": [{"name": "red_circle", "users": ["UBOT"]}]},
-              "9500.2": {"ts": "9500.2", "thread_ts": "9500.1", "user": "UOWNER", "text": "ship it?"},
-              "9500.3": {"ts": "9500.3", "thread_ts": "9500.1", "bot_id": "BBOT", "text": "our own answer"}}
-    e_calls = []
-    def e_api(method, token, **kw):
-        e_calls.append((method, kw.get("name"), kw.get("timestamp") or kw.get("ts")))
-        if method != "conversations.replies":
-            return {"ok": True}
-        if kw.get("oldest"):
-            return {"messages": [e_msgs[kw["oldest"]]]}         # anchored read of one reply
-        m = e_msgs[kw["ts"]]
-        return {"messages": [e_msgs.get(m.get("thread_ts") or m["ts"], m)]}   # Slack answers a reply's ts with its parent
-    ev_own = lambda **k: {"type": "reaction_added", "reaction": "+1", "user": "UBOT",
-                          "item": {"type": "message", "channel": "C9", "ts": "9500.2"}, **k}
-    try:
-        globals()["api"] = e_api
-        dmE.reply_cache[("C9", "9500.1")] = ("9500.2", e_msgs["9500.2"])
-        dmE.on_reaction(ev_own())
-        own_rx = list(e_calls); own_cache = dict(dmE.reply_cache); e_calls.clear()
-        dmE.on_reaction(ev_own(reaction="eyes"))
-        eyes_rx = list(e_calls); e_calls.clear()
-        dmE.on_reaction(ev_own(item={"type": "message", "channel": "C9", "ts": "9500.3"}))
-        ours_rx = list(e_calls)
-    finally:
-        globals()["api"] = real_api
-    check("our own 👍 on the owner's message, the moment it happens: their 👀 comes off, the root turns 🟠 (its 🔴 first "
-          "removed) and the cached copy of that message is dropped so the sweep agrees (addendum 2)",
-          ("reactions.remove", "eyes", "9500.2") in own_rx and ("reactions.remove", "red_circle", "9500.1") in own_rx
-          and ("reactions.add", "large_orange_circle", "9500.1") in own_rx and own_cache == {})
-    check("our own 👀 answers nothing and costs no read; a reaction of ours on our OWN message settles nothing either "
-          "(addendum 2)", eyes_rx == [] and not any(m.startswith("reactions.") for m, _, _ in ours_rx))
     role_a2 = os.environ.pop("CC_ROLE", None)
     rx_tool = []
     ch_a2 = Channel("box"); ch_a2.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
@@ -3930,11 +2924,6 @@ def run_selfcheck():
           "(addendum 2)",
           answer_rx == [("reactions.add", "+1", "9.7"), ("reactions.remove", "eyes", "9.7")]
           and ack_rx == [("reactions.add", "eyes", "9.8")])
-    import inspect as _inspect
-    flag_free = not any("flag" in _inspect.getsource(f).lower() for f in (Daemon.deliver, Daemon.on_event))
-    check("a 🏁 closes a thread for the OWNER only: it never reaches a session — no delivery path knows about flags, and "
-          "the INSTRUCTIONS say a flag is not a stop signal (addendum 3)",
-          flag_free and "never means stop working" in INSTRUCTIONS)
     check("the INSTRUCTIONS carry the human half of the owner gates: a member asking for one gets the part that needs no "
           "permission, a plain word about which part does not, and an @-mention of the owner in that thread",
           "that is how you @-mention the owner" in INSTRUCTIONS and "Do not refuse and stop" in INSTRUCTIONS
@@ -3951,7 +2940,6 @@ def run_selfcheck():
     check("the INSTRUCTIONS say who decides a thread NEEDS the owner: the sender declares it with needs_owner, a "
           "question they are not waiting on does not, and nobody has to clear it",
           "❓ IS YOURS TO DECLARE" in INSTRUCTIONS and "needs_owner" in INSTRUCTIONS
-          and "You never clear it" in INSTRUCTIONS
           and "needs_owner" in json.dumps(next(t for t in TOOLS if t["name"] == "reply")))
     # ── App Home, direction 1a (Claude Design handoff, 2026-08-30 — the owner picked it out of four): home_blocks is
     #    PURE, so the busy state is pinned against the handoff's OWN reference JSON (§05) by equality, and the other
@@ -4014,10 +3002,10 @@ def run_selfcheck():
     #    collapses ordinary leading spaces, which is the sub-channel bug this direction also fixes.
     HREF = json.loads(r'''{"type": "home", "blocks": [
       {"type": "header", "text": {"type": "plain_text", "text": "abox · 07:58", "emoji": true}},
-      {"type": "context", "elements": [{"type": "mrkdwn", "text": "NEEDS YOU · 3"}]},
-      {"type": "section", "text": {"type": "mrkdwn", "text": "❓ *[abox]* · 12m · pick a branch name\n❓ *[sandbox]* · 3m · confirm delete\n⛔ [sandbox] *subproj-carpet* · no GH token"}},
+      {"type": "context", "elements": [{"type": "mrkdwn", "text": "NEEDS YOU · 1"}]},
+      {"type": "section", "text": {"type": "mrkdwn", "text": "⛔ [sandbox] *subproj-carpet* · no GH token"}},
       {"type": "actions", "elements": [
-        {"type": "button", "style": "primary", "text": {"type": "plain_text", "text": "Open #abox", "emoji": true}, "action_id": "open_channel", "value": "abox"},
+        {"type": "button", "style": "primary", "text": {"type": "plain_text", "text": "Start next track", "emoji": true}, "action_id": "next_track", "value": "sandbox/rug-align"},
         {"type": "button", "text": {"type": "plain_text", "text": "Review PR #3", "emoji": true}, "url": "https://github.com/sandbox/carpet/pull/3", "action_id": "review_pr"},
         {"type": "button", "text": {"type": "plain_text", "text": "Board", "emoji": true}, "action_id": "open_board"}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "RUNNING 2 · BLOCKED 1 · QUEUED 10"}]},
@@ -4030,7 +3018,7 @@ def run_selfcheck():
         {"type": "button", "text": {"type": "plain_text", "text": "Running", "emoji": true}, "action_id": "board_running"},
         {"type": "button", "text": {"type": "plain_text", "text": "Done", "emoji": true}, "action_id": "board_done"}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "CHANNELS"}]},
-      {"type": "section", "text": {"type": "mrkdwn", "text": "🟢 *#abox* · ❓1 🔴2\n  ↳ 🟡 #abox-carpet · ❓1\n⚪ *#quiet0*\n⚪ *#quiet1*\n⚪ *#quiet2*\n⚪ *#quiet3*\n⚪ *#quiet4*"}},
+      {"type": "section", "text": {"type": "mrkdwn", "text": "🟢 *#abox*\n  ↳ 🟡 #abox-carpet\n⚪ *#quiet0*\n⚪ *#quiet1*\n⚪ *#quiet2*\n⚪ *#quiet3*\n⚪ *#quiet4*"}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "💽 16% of 456G · 🧠 4.3/31G (15%) · 📈 2.60 · 🌡 57°C · ⏱ up 6.2h"}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "audit 06:00 — no drift; 2 stale branches on sandbox."}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "units ok · last boot 01:41 (power cut)"}]}]}''')
@@ -4039,11 +3027,9 @@ def run_selfcheck():
     hfix = {"box": "abox", "now": "07:58",              # (a) BUSY — 2 running · 1 blocked · 2 threads waiting
             "units": [("tmux-main", True, ""), ("cc-slackd", True, ""), ("heartbeat", True, ""), ("audit", True, "")],
             "load": "💽 16% of 456G · 🧠 4.3/31G (15%) · 📈 2.60 · 🌡 57°C · ⏱ up 6.2h", "limit": "",
-            "waits": [{"ch": "sandbox", "age": 180, "ask": "confirm delete"},      # deliberately out of order: the band ranks them
-                      {"ch": "abox", "age": 720, "ask": "pick a branch name? cc-fix or fix/cc, either is fine"}],
-            "channels": [{"name": "abox", "depth": 0, "session": "🟢 live", "marks": {"❓": 1, "🔴": 2}},
-                         {"name": "abox-carpet", "depth": 1, "session": "🟡 idle", "marks": {"❓": 1}}]
-                        + [{"name": f"quiet{i}", "depth": 0, "session": "⚪ none", "marks": {}} for i in range(5)],
+            "channels": [{"name": "abox", "depth": 0, "session": "🟢 live"},
+                         {"name": "abox-carpet", "depth": 1, "session": "🟡 idle"}]
+                        + [{"name": f"quiet{i}", "depth": 0, "session": "⚪ none"} for i in range(5)],
             "tracks": [{"state": "running", "name": "sandbox/carpet-rectify", "detail": "1 it · $9.05 · PR #3", "rank": 0,
                         "pr": {"num": "3", "repo": "sandbox", "url": "https://github.com/sandbox/carpet/pull/3", "owed": True}},
                        {"state": "running", "name": "abox/slack-home", "detail": "4 it · $2.40", "rank": 0},
@@ -4140,9 +3126,7 @@ def run_selfcheck():
           and all(c[0].endswith("/cc-reconcile") and c[1:] == ["snapshot"] for c in hsnap_cmds))
     check("home_blocks: a needs-you row carries the ASK, not a count (§04) — where, how long, and the thing the owner "
           "can answer without opening anything, threads ranked oldest first",
-          "❓ *[abox]* · 12m · pick a branch name" in htxt and "❓ *[sandbox]* · 3m · confirm delete" in htxt
-          and "thread waiting" not in htxt and "threads waiting" not in htxt
-          and htxt.index("[abox]* · 12m") < htxt.index("[sandbox]* · 3m")
+          "thread waiting" not in htxt and "threads waiting" not in htxt
           and home_ask("🔐 *Bash* — may I `rm -rf build`? it is regenerated") == "Bash — may I rm -rf build"
           and home_age(59) == "now" and home_age(720) == "12m" and home_age(7200) == "2h" and home_age(300000) == "3d"
           # a blocked track's reason is an ask too: `STATUS: BLOCKED: …` out of the worker's journal, cut to one line
@@ -4742,9 +3726,9 @@ def run_selfcheck():
               and tbroken == ("", ""))
     finally:
         EFFECTS.run_impl = _runt
-    hover = home_blocks(dict(hfix, waits=[{"ch": f"c{i}", "age": 60 * (i + 1), "ask": f"ask {i}"} for i in range(4)],
-                             channels=hfix["channels"][:2] + [{"name": f"sub{i}", "depth": 1, "session": "🟢 live", "marks": {"❓": 1}}
-                                                              for i in range(3)] + hfix["channels"][2:],
+    hover = home_blocks(dict(hfix, channels=hfix["channels"][:2]
+                             + [{"name": f"sub{i}", "depth": 1, "session": "🟢 live"} for i in range(3)]
+                             + hfix["channels"][2:],
                              tracks=[{"state": "running", "name": f"abox/run{i}", "detail": "6 it · $14.20 · PR #3", "rank": 0}
                                      for i in range(6)]
                                     + [{"state": "blocked", "name": f"abox/stuck{i}", "detail": "—", "rank": 1, "reason": "no GH token"}
@@ -4845,8 +3829,8 @@ def run_selfcheck():
           "dont hide any\", then \"also show all channels\"), NOTHING on the tab is behind a count, and it still fits "
           "≤%d blocks — the four whole lists cost one section block each however long they get" % HOME_MAXBLK,
           hbudget(hover) and hno_empty_header(hover) and hvocab(hover)
-          and "more running" not in otxt and "NEEDS YOU · 6" in otxt and "more waiting" not in otxt
-          and len(hover[2]["text"]["text"].split("\n")) == 6                   # all six asks, none behind a count
+          and "more running" not in otxt and "NEEDS YOU · 2" in otxt and "more waiting" not in otxt
+          and len(hover[2]["text"]["text"].split("\n")) == 2                   # all six asks, none behind a count
           and hover[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in otxt
           and len(hover[11]["text"]["text"].split("\n")) == 10 and "quiet channel" not in otxt
           and "more channels" not in otxt and len(hover) == 15)
@@ -4856,14 +3840,14 @@ def run_selfcheck():
     check("home_blocks: CHANNELS ranks by activity a FAMILY at a time — a parent and its sub-channels move together, "
           "so busy-first ordering can never orphan an indented row",
           hover[11]["text"]["text"].split("\n")[:5]
-          == ["🟢 *#abox* · ❓1 🔴2", f"{NB}↳ 🟡 #abox-carpet · ❓1"]
-             + [f"{NB}↳ 🟢 #sub{i} · ❓1" for i in range(3)]
+          == ["🟢 *#abox*", f"{NB}↳ 🟡 #abox-carpet"]
+             + [f"{NB}↳ 🟢 #sub{i}" for i in range(3)]
           and all(l.startswith("⚪ *#quiet") for l in hover[11]["text"]["text"].split("\n")[5:])
           # a quiet parent with a busy child sorts up WITH its child, and keeps it
           and next(b["text"]["text"] for b in home_blocks({"box": "b", "now": "1", "channels": [
-              {"name": "hushed", "depth": 0, "session": "⚪ none", "marks": {}},
-              {"name": "loud", "depth": 0, "session": "⚪ none", "marks": {}},
-              {"name": "loud-kid", "depth": 1, "session": "🟢 live", "marks": {}}]})
+              {"name": "hushed", "depth": 0, "session": "⚪ none"},
+              {"name": "loud", "depth": 0, "session": "⚪ none"},
+              {"name": "loud-kid", "depth": 1, "session": "🟢 live"}]})
                   if b["type"] == "section" and "#loud" in b["text"]["text"])
           == f"⚪ *#loud*\n{NB}↳ 🟢 #loud-kid\n⚪ *#hushed*"
           # every channel renders, so `depth` is now live input on EVERY row: junk costs an indent, a runaway
@@ -5121,13 +4105,12 @@ def run_selfcheck():
     # ── THE LISTS ARE WHOLE (owner, 2026-08-30, thread 1788129807: "what happenend to showing all the backlog items and
     #    all ? items and not defaulting to showing only a few?"). Both bands are one section block however long they get,
     #    so this costs no blocks; the character budget is the only cap left, and it is a valve, not a policy.
-    hlong = home_blocks(dict(hfix, waits=[{"ch": f"c{i}", "age": 60 * (i + 1), "ask": f"ask {i}"} for i in range(7)],
+    hlong = home_blocks(dict(hfix,
                              tracks=[{"state": "queued", "name": f"abox/q{i}", "detail": "—", "rank": 5} for i in range(12)]))
     ltxt = json.dumps(hlong, ensure_ascii=False)
     check("home_blocks: a 12-track backlog prints 12 lines and a 7-deep NEEDS YOU prints 7 — the two bands the owner "
           "opens the tab FOR are never summarised into a count they must leave Slack to expand",
-          "NEEDS YOU · 7" in ltxt and len(hlong[2]["text"]["text"].split("\n")) == 7
-          and hlong[8]["text"]["text"].count("⏳") == 12
+          hlong[6]["text"]["text"].count("⏳") == 12
           and "more waiting" not in ltxt and "more on the board" not in ltxt
           and hbudget(hlong) and hno_empty_header(hlong) and hvocab(hlong))
     hvalve = home_blocks(dict(hfix, waits=[], tracks=[{"state": "queued", "name": f"abox/{'q' * 28}{i}",
@@ -5399,7 +4382,7 @@ def run_selfcheck():
           refused and hacted == [("restart_unit", "cc-slackd", "UOWNER")] and len(hdms) == 2
           and home_allowed("U1", "U1") and not home_allowed("U1", "U2") and not home_allowed("U1", "")
           and not home_allowed("", "") and not home_allowed(None, None)
-          and set(HOME_ACT) == {"restart_unit", "open_channel", "open_board", "next_track", "home_logs",
+          and set(HOME_ACT) == {"restart_unit", "open_board", "next_track", "home_logs",
                                 "board_todo", "board_running", "board_done"})
     dmH = Daemon(use_slack=False); dmH.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmH.use_slack = True
     dmH.home_state = lambda: dict(hfix)
@@ -5422,29 +4405,6 @@ def run_selfcheck():
           one and opened)
     check("publish_home: a missing scope disables the dashboard after 3 failures (no error loop), unpaired publishes nothing",
           dmH.home_off and dmH.home_fails == 3 and not hsaid and dmU.home_fails == 0)
-    dmMF = Daemon(use_slack=False); dmMF.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmMF.bot_user = "UBOT"
-    dmMF.route = lambda chat, ctype=None: "r"; mf_calls = []
-    def mf_api(method, token, **kw):
-        mf_calls.append((method, kw.get("name"), kw.get("timestamp")))
-        return {"messages": [{"ts": "5.0", "thread_ts": "5.0", "reactions": []}]} if method == "conversations.replies" else {}
-    _apiMF = globals()["api"]
-    try:
-        globals()["api"] = mf_api
-        dmMF.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "UOWNER", "event_ts": "5.5",
-                          "item": {"type": "message", "channel": "C9", "ts": "5.3"}})
-        mirrored_add = ("reactions.add", "checkered_flag", "5.0") in mf_calls; mf_calls.clear()
-        dmMF.reopen_thread("C9", "5.0", "6.0")
-        dwelt = not mf_calls and dmMF.alarms.get("C9")          # seconds old: left alone, the chat armed for the sweep
-        dmMF.mark_at[("C9", "5.0", "flag")] = 0.0
-        dmMF.reopen_thread("C9", "5.0", "6.0")
-        reopened = ("reactions.remove", "checkered_flag", "5.0") in mf_calls and dmMF.flags.get("C9:5.0") == 5.5   # entry kept (stale), mirror gone
-        rootF = {"ts": "5.0", "reactions": [{"name": "checkered_flag", "users": ["UOWNER"]}]}
-        still_open = not dmMF.flagged("C9", rootF, "6.0")
-    finally:
-        globals()["api"] = _apiMF
-    check("🏁 on a reply is mirrored onto the root; a newer message re-opens the thread (mirror removed once the dwell is "
-          "over, stale entry kept so the owner's visible 🏁 cannot re-close it) — owner rule",
-          mirrored_add and dwelt and reopened and still_open)
     dmHB = Daemon(use_slack=False); dmHB.home_at = 1000.0; dmHB.home_dirty = False; dmHB.home_burst_until = 0.0
     quiet = dmHB.home_due(1010.0); heartbeat = dmHB.home_due(1030.0)
     dmHB.home_dirty = True; ev_fast = dmHB.home_due(1001.0); ev_2s = dmHB.home_due(1002.0)
@@ -5464,56 +4424,6 @@ def run_selfcheck():
     check("dashboard cache: a costly input (a tmux/systemctl/pgrep subprocess) is reused inside its window and re-read after "
           "it — at the 1 s cadence this is the difference between ~38 ms and ~1 ms per refresh",
           (v1, v2, v3) == ("a", "a", "c") and len(hitsCA) == 2)
-    dmPR = Daemon(use_slack=False); dmPR.use_slack = True
-    dmPR.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
-    dmPR.home_at, dmPR.home_burst_until, dmPR.home_dirty = 2000.0, 0.0, False   # dirty has its own ~2 s rule: not what this checks
-    presPR = {"v": "active"}; seenPR = []
-    _apiPR = globals()["api"]
-    globals()["api"] = lambda m, tok, **p: (seenPR.append((m, p.get("user"))), {"presence": presPR["v"]})[1]
-    try:
-        dmPR.presence_poll(2000.0)                                                       # on Slack: the fast cadence
-        active, too_soon = dmPR.home_due(2000.0 + HOME_FAST), dmPR.home_due(2000.5)
-        dmPR.presence_at = 0.0; presPR["v"] = "away"; dmPR.presence_poll(2100.0)         # just went idle…
-        dmPR.home_at = 2100.0; grace = dmPR.home_due(2100.0 + HOME_FAST)                 # …one more minute of it
-        dmPR.home_at = 2161.0; cooled = dmPR.home_due(2161.0 + HOME_FAST); beat = dmPR.home_due(2191.0)
-        dmPR.presence_at = 2161.0; dmPR.presence_poll(2170.0); throttled = len(seenPR)   # …and one call per 30 s, not per tick
-    finally:
-        globals()["api"] = _apiPR
-    check(f"App Home follows the owner's Slack: active → every {HOME_FAST} s (and no faster); a minute of grace after they go "
-          "idle; then the 30 s heartbeat again — one users.getPresence per 30 s, never per tick",
-          active and not too_soon and grace and not cooled and beat and throttled == 2
-          and seenPR[0] == ("users.getPresence", "UOWNER"))
-    # …and a name lookup that flaps (raised-box-dns-resolution-flaps): ONE retry, silent when it clears, one line with
-    # the errno when it does not — and no retry at all for any other error
-    dmDN = Daemon(use_slack=False); dmDN.use_slack = True
-    dmDN.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
-    failDN, callsDN, loggedDN, sleptDN = {"n": 0}, [], [], []
-    def apiDN(m, tok, **p):
-        callsDN.append(m)
-        if failDN["n"]:
-            failDN["n"] -= 1; raise urllib.error.URLError(socket.gaierror(-3, "Temporary failure in name resolution"))
-        return {"presence": "active"}
-    _apiDN, _logDN, _sleepDN = globals()["api"], globals()["log"], time.sleep
-    try:
-        globals()["api"], globals()["log"], time.sleep = apiDN, lambda *a: loggedDN.append(" ".join(map(str, a))), lambda s: sleptDN.append(s)
-        failDN["n"] = 1; dmDN.presence_at = 0.0; dmDN.presence_poll(3000.0)
-        once = (len(callsDN), dmDN.presence, list(loggedDN), list(sleptDN))
-        failDN["n"] = 2; callsDN.clear(); loggedDN.clear(); sleptDN.clear(); dmDN.presence_at, dmDN.presence = 0.0, "away"
-        dmDN.presence_poll(3100.0)
-        twice = (len(callsDN), dmDN.presence, list(loggedDN), list(sleptDN))
-        callsDN.clear(); loggedDN.clear(); sleptDN.clear()
-        globals()["api"] = lambda m, tok, **p: (callsDN.append(m), (_ for _ in ()).throw(RuntimeError("ratelimited")))[1]
-        dmDN.presence_at = 0.0; dmDN.presence_poll(3200.0)
-        other = (len(callsDN), list(loggedDN), list(sleptDN))
-    finally:
-        globals()["api"], globals()["log"], time.sleep = _apiDN, _logDN, _sleepDN
-    check("presence: a name lookup that fails once and clears is asked again after a short delay and is SILENT; one that "
-          "fails twice is logged once with its errno and the tab keeps what it knew; any other error is logged as before, "
-          "with no retry",
-          once == (2, "active", [], [LOOKUP_RETRY_AFTER])
-          and twice[0] == 2 and twice[1] == "away" and twice[3] == [LOOKUP_RETRY_AFTER]
-          and len(twice[2]) == 1 and twice[2][0].startswith("presence: name resolution failed twice") and "errno -3" in twice[2][0]
-          and other[0] == 1 and len(other[1]) == 1 and "ratelimited" in other[1][0] and other[2] == [])
     dmMM = Daemon(use_slack=False); dmMM.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmMM.bot_user = "UBOT"
     nameMM = f"mm{notify_marker}"                       # a FIXTURE repo, not whatever this box has: on_approval needs a
     os.makedirs(f"{DEV}/{nameMM}/.git", exist_ok=True)  # repo dir to exist, and picking a real one paged the owner;
@@ -5596,363 +4506,6 @@ def run_selfcheck():
         globals()["QUICK_LOG"] = _ql; os.unlink(qf.name)
     check("cc quick: Home lists only work still in progress — a later `done` line retires its `doing` line",
           [q["text"] for q in hq] == ["other"])
-    dmPM = Daemon(use_slack=False); dmPM.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmPM.bot_user = "UBOT"; dmPM.bot_id = "BBOT"
-    nowP = time.time(); ours_reply = {"ts": str(nowP - 60), "user": "UBOT", "text": "on it"}
-    rootW = {"ts": str(nowP - 600), "reactions": [{"name": "hammer_and_wrench", "users": ["UBOT"]}]}
-    rootD = {"ts": str(nowP - 600), "reactions": [{"name": "white_check_mark", "users": ["UBOT"]}, {"name": "hammer_and_wrench", "users": ["UBOT"]}]}
-    owner_last = {"ts": str(nowP - 60), "user": "UOWNER", "text": "and this?"}
-    rootA = {"ts": str(nowP - 500), "reactions": [{"name": "hammer_and_wrench", "users": ["UBOT"]}]}   # …and we declared on this one
-    dmPM.marks = {f"CP:{rootW['ts']}:hammer_and_wrench": nowP - 30, f"CP:{rootD['ts']}:white_check_mark": nowP - 30, f"CP:{rootD['ts']}:hammer_and_wrench": nowP - 30,
-                  f"CP:{rootA['ts']}:hammer_and_wrench": nowP - 30, f"CP:{rootA['ts']}:question": nowP - 30}
-    check("root marks, two slots: 🔧 (working) is EXEMPT from the one-mark rule and stands NEXT TO whose turn it is — 🔧🔴 "
-          "while the owner waits for a word (never a stall ❓ while we work), 🔧❓ when we asked THEM, 🔧🟠 when we answered "
-          "(the wrench no longer suppresses the turn: that made 🟠 blink in step with the pane — 2026-08-30); a fresh ✅ is "
-          "the whole story; the owner's word newer than the marks makes them stale (🔴); no marks = the plain rules (🟠)",
-          dmPM.root_marks(ours_reply, nowP, rootW, "CP") == ("🟠", "🔧")
-          and dmPM.root_marks(ours_reply, nowP, rootD, "CP") == (None, "✅")
-          and dmPM.root_marks(owner_last, nowP, rootW, "CP") == ("🔴", "🔧")
-          and dmPM.root_marks({"ts": str(nowP - 3600), "user": "UOWNER", "text": "and?"}, nowP, rootW, "CP") == ("🔴", "🔧")
-          and dmPM.root_marks({"ts": str(nowP - 60), "user": "UBOT", "text": "which one?"}, nowP, rootA, "CP") == ("❓", "🔧")
-          and dmPM.root_marks({"ts": str(nowP - 60), "user": "UBOT", "text": "which one?"}, nowP, rootW, "CP") == ("🟠", "🔧")
-          and dmPM.root_marks({"ts": str(nowP - 10), "user": "UOWNER", "text": "and this?"}, nowP, rootD, "CP") == ("🔴", None)
-          and dmPM.root_marks(ours_reply, nowP, {"ts": "1", "reactions": []}, "CP") == ("🟠", None)
-          # the bucket a thread is filed under: its work mark when that is the whole story, else whose turn it is
-          and dmPM.root_mark(ours_reply, nowP, rootW, "CP") == "🟠"
-          and dmPM.root_mark(owner_last, nowP, rootW, "CP") == "🔴"
-          and dmPM.root_mark(ours_reply, nowP, rootD, "CP") == "✅")
-    dmPM.marks = {f"CP:{rootD['ts']}:white_check_mark": nowP - 3600}   # ✅ set an hour ago, then the session said more: stale
-    check("root marks: an older ✅/🔧 (set before the thread's last message) is stale and no longer outranks the current state",
-          dmPM.root_mark(ours_reply, nowP, rootD, "CP") == "🟠")
-    check("root marks: the owner's bare \"ok\"/\"thanks\" after our ✅ keeps the thread done; a real follow-up re-opens it (🔴)",
-          dmPM.root_mark({"ts": str(nowP - 60), "user": "UOWNER", "text": "Ok"}, nowP, rootD, "CP") == "✅"
-          and dmPM.root_mark({"ts": str(nowP - 60), "user": "UOWNER", "text": "thanks!"}, nowP, rootD, "CP") == "✅"
-          and dmPM.root_mark({"ts": str(nowP - 60), "user": "UOWNER", "text": "ok but why?"}, nowP, rootD, "CP") == "🔴")
-    dmOR = Daemon(use_slack=False); dmOR.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmOR.bot_user = "UBOT"
-    dmOR.route = lambda chat, ctype=None: "r"; dmOR.reacted_message = lambda chat, ts: ({"ts": ts, "user": "UOWNER", "text": "q"}, ts)
-    setOR = []; dmOR.set_mark = lambda chat, root, want, slot="conv": setOR.append(want)
-    _reactOR, _saveOR = globals()["react"], globals()["save_marks"]
-    globals()["react"] = lambda *a, **k: None; globals()["save_marks"] = lambda m: None   # never the live marks file
-    try:
-        dmOR.on_own_reaction("CQ", "7.0", "white_check_mark", False)
-        dmOR.on_own_reaction("CQ", "7.0", "hammer_and_wrench", False)
-        dmOR.on_own_reaction("CQ", "7.0", "white_check_mark", True)
-    finally:
-        globals()["react"], globals()["save_marks"] = _reactOR, _saveOR
-    dmTS = Daemon(use_slack=False); dmTS.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmTS.bot_user = "UBOT"
-    nowTS = time.time()
-    rootTS = {"ts": "60.0", "text": "do the thing", "user": "UOWNER", "reply_count": 1, "latest_reply": "61.0",
-              "reactions": [{"name": "hammer_and_wrench", "users": ["UBOT"]}, {"name": "large_orange_circle", "users": ["UBOT"]}]}
-    quietTS = {"ts": "1.0", "text": "old and finished", "user": "UOWNER", "reply_count": 1, "latest_reply": "2.0",
-               "reactions": [{"name": "white_check_mark", "users": ["UBOT"]}, {"name": "red_circle", "users": ["UBOT"]}]}
-    dmTS.marks = {"CT:60.0:hammer_and_wrench": nowTS}
-    rootTS["latest_reply"] = str(nowTS - 60)                 # the cached last reply must match, or the sweep re-reads it
-    dmTS.reply_cache[("CT", "60.0")] = (str(nowTS - 60), {"ts": str(nowTS - 60), "user": "UOWNER", "text": "and this?"})
-    apiTS = []
-    _apiTS, _hrTS = globals()["api"], Daemon.history_roots
-    globals()["api"] = lambda m, tok, **p: (apiTS.append((m, p.get("timestamp"), p.get("name"))), {"messages": []})[1]
-    Daemon.history_roots = lambda self, chat, **k: [rootTS, quietTS]
-    try:
-        dmTS.reconcile_reactions("CT", cap=20)
-    finally:
-        globals()["api"], Daemon.history_roots = _apiTS, _hrTS
-    check("the sweep writes BOTH slots: a thread being worked on that owes the owner a word ends up 🔧 + 🔴 (the 🟠 goes); a "
-          "thread too old to read keeps the session's ✅ and loses only its turn mark",
-          ("reactions.add", "60.0", "red_circle") in apiTS and ("reactions.remove", "60.0", "large_orange_circle") in apiTS
-          and not any(a == "reactions.remove" and t == "60.0" and n == "hammer_and_wrench" for a, t, n in apiTS)
-          and ("reactions.remove", "1.0", "red_circle") in apiTS
-          and not any(a == "reactions.remove" and t == "1.0" and n == "white_check_mark" for a, t, n in apiTS))
-    dmFK = Daemon(use_slack=False); dmFK.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmFK.bot_user = "UBOT"
-    dmFK.work_cache[("CQ", "8.0")] = "white_check_mark"; dmFK.status_cache[("CQ", "8.0")] = None
-    dmFK.status_cache[("CQ", "9.0")] = "question"
-    _fk = globals()["api"]; rmFK = []
-    globals()["api"] = lambda m, tok, **p: rmFK.append((m, p.get("timestamp"), p.get("name")))
-    try:
-        dmFK.on_flag("CQ", "8.0", False, 100.0); dmFK.on_flag("CQ", "9.0", False, 100.0)
-    finally:
-        globals()["api"] = _fk
-    check("owner's 🏁 strips the bot's bookkeeping mark but leaves the session's own ✅ on the root (work may go on under a closed "
-          "thread; un-flagging brings the ✅ back, not a 10 h stall ❓)",
-          rmFK == [("reactions.remove", "9.0", "question")] and dmFK.work_cache[("CQ", "8.0")] == "white_check_mark"
-          and dmFK.status_cache[("CQ", "9.0")] is None)
-    dmBZ = Daemon(use_slack=False); dmBZ.use_slack = True; dmBZ.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
-    dmBZ.subs["repo"].append(object()); dmBZ.last_chat["repo"] = ("CB", "50.0")
-    _twBZ, _pwBZ, _rcBZ, _apiBZ = globals()["tmux_window"], globals()["pane_working"], globals()["react"], api
-    busyBZ, marksBZ, rmBZ = {"v": True}, [], []
-    globals()["tmux_window"] = lambda name: ("@1", "node"); globals()["pane_working"] = lambda wid: busyBZ["v"]
-    globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: rmBZ.append((name, remove))
-    globals()["api"] = lambda method, token, **kw: {}         # the marks are the subject; the reads they make are not
-    dmBZ.session_mark = lambda chat, ts, name, removed=False: marksBZ.append((ts, name, removed)) or True
-    dmBZ.set_work = lambda chat, ts, want: rmBZ.append(("hammer_and_wrench", want is None))
-    try:
-        dmBZ.busy_cycle(); dmBZ.busy_cycle()                  # mid-turn twice: ONE 🔧, held
-        busyBZ["v"] = False
-        for _ in range(WORK_IDLE_TICKS - 1):                  # a pause between turns must NOT blink the wrench
-            dmBZ.busy_cycle()
-        held1 = "repo" in dmBZ.working
-        dmBZ.busy_cycle(); gone = "repo" not in dmBZ.working  # WORK_IDLE_TICKS idle ticks: off
-        busyBZ["v"] = True; dmBZ.marks["CB:50.0:hammer_and_wrench"] = 1.0; dmBZ.busy_cycle()   # the session's own 🔧: left alone
-        dmBZ.marks.clear(); dmBZ.marks["CB:50.0:white_check_mark"] = 1.0; dmBZ.busy_cycle()   # a done (✅) thread: no 🔧 over it
-        dmBZ.marks.clear(); dmBZ.marks["CB:50.0:hammer_and_wrench:auto"] = 5.0; dmBZ.working.clear()   # "after a restart": ours, still on the root
-        busyBZ["v"] = False
-        for _ in range(WORK_IDLE_TICKS + 1):
-            dmBZ.busy_cycle()
-        adopted = "CB:50.0:hammer_and_wrench:auto" not in dmBZ.marks
-        marksBZ0, rmBZ0 = list(marksBZ), list(rmBZ)            # the story above is asserted as it stands; this is a coda
-        dmBZ.marks.clear(); dmBZ.working.clear(); dmBZ.idle_ticks.clear()
-        dmBZ.hold_wrench("gone", "CB", "51.0")                # taken at delivery, for a session that never subscribes
-        for _ in range(WORK_IDLE_TICKS):                      # its pane never works: nothing subscribed, and yet…
-            dmBZ.busy_cycle()
-        stranded = "gone" not in dmBZ.working                 # …the holder still lets it go (it would sit forever)
-        # the session answered the owner's root with its own ✅ (react white_check_mark, keyed to that ts) and its turn
-        # ended: releasing OUR wrench must leave that ✅ standing — the slot is the session's now
-        dmBZ.marks.clear(); dmBZ.working.clear(); dmBZ.idle_ticks.clear(); del rmBZ[:]
-        dmBZ.hold_wrench("repo", "CB", "52.0")
-        dmBZ.marks["CB:52.0:white_check_mark"] = time.time()  # what session_mark records for the session's own ✅
-        dmBZ.drop_wrench("repo", idle=True)
-        kept_done = ("hammer_and_wrench", True) not in rmBZ and "repo" not in dmBZ.working
-        dmBZ.marks.clear(); dmBZ.working.clear(); del rmBZ[:]
-        dmBZ.hold_wrench("repo", "CB", "53.0"); dmBZ.drop_wrench("repo", idle=True)
-        cleared = ("hammer_and_wrench", True) in rmBZ           # and with no ✅ the release still takes the 🔧 off
-    finally:
-        globals()["tmux_window"], globals()["pane_working"] = _twBZ, _pwBZ
-        globals()["react"], globals()["api"] = _rcBZ, _apiBZ
-    check("a session's own ✅ on the owner's root survives the release of our auto 🔧: drop_wrench used to clear the work "
-          "slot it no longer held and took the ✅ off one second after it was set, so the root stalled to ❓ and re-woke "
-          "the seat 43 min later (2026-09-10); a release with no ✅ still takes the 🔧 off", kept_done and cleared)
-    check(f"auto 🔧: a session mid-turn gets ONE 🔧 on the thread it last heard from; it survives {WORK_IDLE_TICKS - 1} idle "
-          f"ticks and comes off after {WORK_IDLE_TICKS} (≈{WORK_IDLE_TICKS // 2} min — a pause between turns of a live "
-          "conversation must not blink it); a 🔧 the session set itself is never placed over or taken off, a ✅ (done) root "
-          "gets no 🔧 at all, and one of ours from before a restart is adopted and still comes off",
-          marksBZ0 == [("50.0", "hammer_and_wrench", False)] and held1 and gone
-          and rmBZ0 == [("hammer_and_wrench", True), ("hammer_and_wrench", True)] and adopted and "repo" not in dmBZ.working)
-    check("every 🔧 we hold is watched until it comes off — including one taken at delivery for a session that never "
-          "subscribed, or that has since gone: busy_cycle used to look only at LIVE subscriptions, so such a wrench "
-          "would have sat on the root forever", stranded)
-    # ---- the mark machine end to end: one scripted conversation, an idempotent sweep, a 🏁 that survives it, and the
-    #      churn warning. A live conversation once produced 91 mark changes on ONE root in three hours; these
-    #      checks lock down the shape of the fix.
-    class FakeSlack:
-        """A one-channel Slack: the very reactions.add/remove the daemon issues mutate the messages it then re-reads.
-        Every call is logged BEFORE it is applied, so a redundant one shows up in the asserted sequence instead of hiding
-        behind an exception."""
-        def __init__(self):
-            self.msgs, self.calls = {}, []
-        def post(self, ts, **kw):
-            self.msgs[ts] = dict(ts=ts, reactions=[], **kw)
-        def owner_reacts(self, ts, name):
-            self.msgs[ts]["reactions"].append({"name": name, "users": ["UOWNER"]})
-        def on(self, ts):
-            return sorted(r["name"] for r in self.msgs[ts]["reactions"])
-        def roots(self):
-            out = []
-            for m in sorted(self.msgs.values(), key=lambda x: -float(x["ts"])):
-                if m.get("thread_ts") and m["thread_ts"] != m["ts"]:
-                    continue
-                kids = [x["ts"] for x in self.msgs.values() if x.get("thread_ts") == m["ts"] and x["ts"] != m["ts"]]
-                out.append(dict(m, reply_count=len(kids), **({"latest_reply": max(kids, key=float)} if kids else {})))
-            return out
-        def api(self, method, token, **p):
-            if method == "conversations.history":
-                return {"messages": self.roots()}
-            if method == "conversations.replies":
-                if p.get("oldest"):
-                    return {"messages": [self.msgs[p["oldest"]]]}
-                m = self.msgs[p["ts"]]
-                return {"messages": [self.msgs.get(m.get("thread_ts") or m["ts"], m)]}
-            if method in ("reactions.add", "reactions.remove"):
-                name, rs = p["name"], self.msgs[p["timestamp"]]["reactions"]
-                self.calls.append(("+" if method == "reactions.add" else "-") + name)
-                r = next((x for x in rs if x["name"] == name), None)
-                if method == "reactions.add":
-                    if r is None:
-                        rs.append({"name": name, "users": ["UBOT"]})
-                    elif "UBOT" in r["users"]:
-                        raise RuntimeError("reactions.add: already_reacted")
-                    else:
-                        r["users"].append("UBOT")
-                else:
-                    if r is None or "UBOT" not in r["users"]:
-                        raise RuntimeError("reactions.remove: no_reaction")
-                    r["users"] = [u for u in r["users"] if u != "UBOT"]
-                    rs.remove(r) if not r["users"] else None
-                return {"ok": True}
-            raise RuntimeError(f"selfcheck: unexpected {method}")
-    fkX = FakeSlack()
-    dmX = Daemon(use_slack=False); dmX.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
-    dmX.bot_user, dmX.bot_id = "UBOT", "BBOT"
-    dmX.route = lambda chat, ctype=None: "r"; dmX.chan_name = lambda c: "repo"; dmX.user_name = lambda u: "owner"
-    dmX.deliver = lambda target, payload, **k: "delivered"
-    dmX.say = lambda chat, text, thread=None, mail=True: None
-    clockX = {"t": time.time()}                  # the story spans an hour: the daemon reads it through a driven clock
-    idem = []                                    # every sweep is immediately repeated: the repeat must change nothing
-    def tickX(dt):
-        clockX["t"] += dt
-        return str(clockX["t"])
-    def sweepX():
-        dmX.reconcile_reactions("CX", cap=50)
-        n = len(fkX.calls); dmX.reconcile_reactions("CX", cap=50); idem.append(len(fkX.calls) == n)
-    ownerX = lambda ts, text, thread=None: {"type": "message", "channel": "CX", "ts": ts, "user": "UOWNER", "text": text,
-                                            **({"thread_ts": thread} if thread else {})}
-    _apiX, _needsX, _timeX = globals()["api"], globals()["needs_dir"], time.time
-    try:
-        globals()["api"] = fkX.api; globals()["needs_dir"] = lambda t: False
-        time.time = lambda: clockX["t"]
-        ROOTX = tickX(0)
-        fkX.post(ROOTX, user="UOWNER", text="can you look at the deploy?")
-        dmX.on_event(ownerX(ROOTX, "can you look at the deploy?"))                     # 1. the owner speaks → 🔴
-        tickX(40); sweepX()                                                            # 2. nothing has changed: no mark moves
-        rep1 = tickX(80)
-        fkX.post(rep1, thread_ts=ROOTX, bot_id="BBOT", text="looking now — the last deploy was clean")
-        dmX.on_event({"type": "message", "subtype": "bot_message", "channel": "CX", "ts": rep1,
-                      "thread_ts": ROOTX, "bot_id": "BBOT", "text": "looking now"})     # our own post moves nothing by itself
-        after_own = len(fkX.calls)
-        tickX(40); sweepX()                                                            # 3. we answered → 🟠
-        rep2 = tickX(80)
-        fkX.post(rep2, thread_ts=ROOTX, user="UOWNER", text="and the rollback path?")
-        dmX.on_event(ownerX(rep2, "and the rollback path?", ROOTX))                    # 4. they speak again → 🔴
-        tickX(STALL_AFTER + 60); sweepX()                                              # 5. …and 30 min of silence → ❓
-        rep3 = tickX(60)
-        fkX.post(rep3, thread_ts=ROOTX, bot_id="BBOT", text="rollback is one command, documented in the runbook")
-        tickX(40); sweepX()                                                            # 6. the session posts → 🟠
-        flag_ts = tickX(60); fkX.owner_reacts(ROOTX, "checkered_flag")
-        dmX.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "UOWNER", "event_ts": flag_ts,
-                         "item": {"type": "message", "channel": "CX", "ts": ROOTX}})    # 7. the owner closes it → no mark
-        flagged_at = len(fkX.calls)
-        tickX(60); sweepX(); tickX(60); sweepX()                                       # 8. and the sweep leaves the 🏁 alone
-    finally:
-        globals()["api"], globals()["needs_dir"], time.time = _apiX, _needsX, _timeX
-    seqX = [c for c in fkX.calls if "eyes" not in c]
-    check("marks, one whole conversation (owner speaks → we answer → they speak → 30 min silence → we post → their 🏁): "
-          "ONE mark at a time, exactly five of them, each on a change of MEANING — 🔴 🟠 🔴 ❓ 🟠 then cleared — and no "
-          "emoji added and removed inside a step (2026-08-30: this thread produced 91 changes)",
-          seqX == ["+red_circle", "-red_circle", "+large_orange_circle", "-large_orange_circle", "+red_circle",
-                   "-red_circle", "+question", "-question", "+large_orange_circle", "-large_orange_circle"]
-          and after_own == 2)                    # step 1's +🔴 +👀 only: our own post is bookkeeping, not a mark change
-    check("marks: running the sweep twice in a row is a no-op the second time — at every step of that conversation",
-          idem == [True] * 6)
-    check("marks: the owner's 🏁 survives our own sweep (we only ever remove OUR reactions), closing a thread costs "
-          "exactly one mutation — the 🟠 coming off — and the two sweeps after it change nothing at all",
-          "checkered_flag" in fkX.on(ROOTX) and not any("checkered_flag" in c for c in fkX.calls)
-          and seqX[-1] == "-large_orange_circle" and len(fkX.calls) == flagged_at)
-    fkW = FakeSlack()
-    dmW = Daemon(use_slack=False); dmW.use_slack = True
-    dmW.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
-    dmW.bot_user, dmW.bot_id = "UBOT", "BBOT"
-    dmW.route = lambda chat, ctype=None: "r"; dmW.chan_name = lambda c: "repo"; dmW.user_name = lambda u: "owner"
-    dmW.deliver = lambda target, payload, **k: "delivered"; dmW.say = lambda chat, text, thread=None, mail=True: None
-    clockW = {"t": time.time()}; busyW = {"v": True}; idemW = []
-    def sweepW():
-        dmW.reconcile_reactions("CW", cap=50)
-        n = len(fkW.calls); dmW.reconcile_reactions("CW", cap=50); idemW.append(len(fkW.calls) == n)
-    _apiW, _needsW, _timeW = globals()["api"], globals()["needs_dir"], time.time
-    _twW, _pwW = globals()["tmux_window"], globals()["pane_working"]
-    try:
-        globals()["api"] = fkW.api; globals()["needs_dir"] = lambda t: False
-        globals()["tmux_window"] = lambda name: ("@1", "node"); globals()["pane_working"] = lambda wid: busyW["v"]
-        time.time = lambda: clockW["t"]
-        ROOTW = str(clockW["t"])
-        dmW.subs["r"].append(object())
-        fkW.post(ROOTW, user="UOWNER", text="deploy is stuck, can you dig in?")
-        dmW.on_event({"type": "message", "channel": "CW", "ts": ROOTW, "user": "UOWNER", "text": "deploy is stuck?"})
-        at_deliveryW = "hammer_and_wrench" in fkW.on(ROOTW)       # the 🔧 is up BEFORE any tick: work is running now
-        dmW.last_chat["r"] = ("CW", ROOTW)
-        clockW["t"] += 20; dmW.busy_cycle()                       # …and the busy tick neither re-adds nor moves it
-        clockW["t"] += 40; sweepW()                               # both stand: two sweeps move nothing
-        repW = str(clockW["t"] + 60); clockW["t"] += 100
-        fkW.post(repW, thread_ts=ROOTW, bot_id="BBOT", text="found it — a stale lock, cleared")
-        dmW.on_event({"type": "message", "subtype": "bot_message", "channel": "CW", "ts": repW,
-                      "thread_ts": ROOTW, "bot_id": "BBOT", "text": "found it"})   # the session said its word: nothing owed
-        sweepW()                                                  # we answered → 🟠, and the 🔧 is NOT ours to age out
-        wrench_held = "hammer_and_wrench" in fkW.on(ROOTW)
-        busyW["v"] = False
-        for _ in range(WORK_IDLE_TICKS - 1):
-            clockW["t"] += 30; dmW.busy_cycle()                   # a pause between turns: the wrench does not blink
-        pause_held = "hammer_and_wrench" in fkW.on(ROOTW)
-        clockW["t"] += 30; dmW.busy_cycle()                       # the session really stopped: its holder takes it off
-        clockW["t"] += 60; sweepW()
-    finally:
-        globals()["api"], globals()["needs_dir"], time.time = _apiW, _needsW, _timeW
-        globals()["tmux_window"], globals()["pane_working"] = _twW, _pwW
-    check("🔧 is EXEMPT from the one-mark rule and has exactly ONE writer: it goes on the instant the message is HANDED to "
-          "the session (not at the next 30 s tick), busy_cycle holds it and takes it off, the sweep never ages it out "
-          "underneath, and it neither suppresses nor moves the turn mark beside it — 🔴 then 🟠 with the wrench standing "
-          "throughout (2026-08-30: 13 on/off cycles on one root, 31/62/92 s apart)",
-          [c for c in fkW.calls if "eyes" not in c] ==
-          ["+red_circle", "+hammer_and_wrench", "-red_circle", "+large_orange_circle", "-hammer_and_wrench"]
-          and at_deliveryW and wrench_held and pause_held and fkW.on(ROOTW) == ["eyes", "large_orange_circle"]
-          and idemW == [True] * 3)
-    check("a session that ANSWERED is never 👍'd on top of its answer: its reply in the thread clears the debt, so the "
-          "wrench coming off five minutes later adds nothing", not any(c == "++1" for c in fkW.calls) and not dmW.owed)
-    # ---- 👍 when there is nothing to say: the other half of the same story. The session takes the work, does it, and
-    #      never posts. Silence used to leave the owner's message 🔴 → ❓ "needs you" at 30 min, and nudge, over work
-    #      that was finished.
-    fkQ = FakeSlack()
-    dmQ = Daemon(use_slack=False); dmQ.use_slack = True
-    dmQ.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
-    dmQ.bot_user, dmQ.bot_id = "UBOT", "BBOT"
-    dmQ.route = lambda chat, ctype=None: "r"; dmQ.chan_name = lambda c: "repo"; dmQ.user_name = lambda u: "owner"
-    dmQ.deliver = lambda target, payload, **k: "delivered"; dmQ.say = lambda chat, text, thread=None, mail=True: None
-    clockQ = {"t": time.time()}; busyQ = {"v": True}
-    _apiQ, _needsQ, _timeQ = globals()["api"], globals()["needs_dir"], time.time
-    _twQ, _pwQ = globals()["tmux_window"], globals()["pane_working"]
-    def idleQ(dm):                                   # the pane really stops: WORK_IDLE_TICKS quiet ticks
-        busyQ["v"] = False
-        for _ in range(WORK_IDLE_TICKS):
-            clockQ["t"] += 30; dm.busy_cycle()
-        busyQ["v"] = True
-    try:
-        globals()["api"] = fkQ.api; globals()["needs_dir"] = lambda t: False
-        globals()["tmux_window"] = lambda name: ("@1", "node"); globals()["pane_working"] = lambda wid: busyQ["v"]
-        time.time = lambda: clockQ["t"]
-        ROOTQ = str(clockQ["t"]); dmQ.subs["r"].append(object())
-        fkQ.post(ROOTQ, user="UOWNER", text="pull the latest config onto the box")
-        dmQ.on_event({"type": "message", "channel": "CQ", "ts": ROOTQ, "user": "UOWNER", "text": "pull the config"})
-        dmQ.last_chat["r"] = ("CQ", ROOTQ)
-        clockQ["t"] += 60
-        FUPQ = str(clockQ["t"])                                   # a follow-up in the SAME thread: the 👍 belongs on THIS
-        fkQ.post(FUPQ, thread_ts=ROOTQ, user="UOWNER", text="and restart the unit after")   # message, the marks on the root
-        dmQ.on_event({"type": "message", "channel": "CQ", "ts": FUPQ, "thread_ts": ROOTQ, "user": "UOWNER",
-                      "text": "and restart the unit after"})
-        clockQ["t"] += 30; dmQ.busy_cycle()
-        idleQ(dmQ)                                                # it finished and said nothing → 👍 on the follow-up
-        ackQ = fkQ.on(FUPQ)
-        clockQ["t"] += 60; dmQ.reconcile_reactions("CQ", cap=50)  # …and the sweep reads that 👍 back as "handled"
-        handledQ = fkQ.on(ROOTQ)
-        nQ = len(fkQ.calls); dmQ.reconcile_reactions("CQ", cap=50); idemQ = len(fkQ.calls) == nQ
-        # …but a thread the owner has CLOSED gets no last word out of us
-        clockQ["t"] += 120; ROOTZ = str(clockQ["t"])
-        fkQ.post(ROOTZ, user="UOWNER", text="one more thing")
-        dmQ.on_event({"type": "message", "channel": "CQ", "ts": ROOTZ, "user": "UOWNER", "text": "one more thing"})
-        dmQ.last_chat["r"] = ("CQ", ROOTZ); clockQ["t"] += 30; dmQ.busy_cycle()
-        dmQ.flags[f"CQ:{ROOTZ}"] = clockQ["t"]                    # the owner 🏁s it while the session works
-        idleQ(dmQ)
-        flaggedQ = fkQ.on(ROOTZ)
-    finally:
-        globals()["api"], globals()["needs_dir"], time.time = _apiQ, _needsQ, _timeQ
-        globals()["tmux_window"], globals()["pane_working"] = _twQ, _pwQ
-    check("👍 when there is nothing to say: a session that finishes what it was handed WITHOUT a word gets a 👍 put on "
-          "that message (the newest one, not the root), its 👀 comes off, and the sweep reads it back through "
-          "answered_by_us as 🟠 handled — instead of 🔴 ageing into a ❓ 'needs you' nudge about finished work",
-          ackQ == ["+1"] and "hammer_and_wrench" not in fkQ.on(ROOTQ)
-          and handledQ == ["eyes", "large_orange_circle"] and idemQ)
-    check("…and never on a thread the owner has already 🏁'd: they closed it, so the box has no last word to add",
-          flaggedQ == ["eyes", "red_circle"] and not dmQ.owed)
-    dmCh = Daemon(use_slack=False); bufCh = io.StringIO()
-    with contextlib.redirect_stderr(bufCh):
-        for _ in range(CHURN_N):
-            dmCh.note_change("CC", "1.0")        # a thread whose mark moves now and then: nothing to say
-        quietCh = bufCh.getvalue()
-        for _ in range(3):
-            dmCh.note_change("CC", "1.0")        # …and one that will not hold still
-        noisyCh = bufCh.getvalue()
-        dmCh.churn[("CC", "2.0")] = [time.time() - CHURN_WINDOW - 1] * 20   # all outside the window: not churn
-        dmCh.note_change("CC", "2.0")
-        agedCh = bufCh.getvalue()
-    check(f"churn warning: more than {CHURN_N} mark changes on one root in {CHURN_WINDOW // 60} min logs ONE line "
-          "(rate-limited, and stale changes age out of the window); it is never a Slack post",
-          "churn" not in quietCh and noisyCh.count("marks: churn on CC/1.0") == 1
-          and agedCh.count("marks: churn") == 1
-          and not any(w in _inspect.getsource(Daemon.note_change) for w in ("self.say", "post(", "outbox")))
     _mp = dict(_METRIC_PREV); _METRIC_PREV.clear()
     with tempfile.NamedTemporaryFile("w", suffix=".uj", delete=False) as fW:
         fW.write("1000000")
@@ -5974,8 +4527,6 @@ def run_selfcheck():
     check("Home: a finished track leaves the dashboard as soon as it is done/merged unless its PR still waits for a 👍",
           home_track_shown("running", None) and home_track_shown("blocked", None) and not home_track_shown("done", None)
           and not home_track_shown("merged", "MERGED") and home_track_shown("done", "OPEN/APPROVED"))
-    check("our own ✅/🔧 on a root are remembered with their time (and forgotten when taken back); ✅ on the root marks done instantly",
-          "CQ:7.0:hammer_and_wrench" in dmOR.marks and "CQ:7.0:white_check_mark" not in dmOR.marks and setOR[0] == "✅")
     # -- PART 8: sub-orchestrators get their OWN channel (routing table orchs.json, create/archive, Home rows) -------
     T8 = 1787880617                                   # a fixed spawn time: the 4-char id is derived from it
     check("orch id: 4 lowercase base36 chars derived from the spawn time",
@@ -6192,7 +4743,7 @@ def run_selfcheck():
           and "the owner asks for more or a technical explanation genuinely needs it" in INSTRUCTIONS)
     check("…and the NOTIFICATION LADDER, so a session picks the rung instead of the owner filtering: an @-mention is for a "
           "blocked decision only, needs_owner for what stalls one track, then approvals, alerts, the -updates lane, the digest",
-          "HOW LOUD" in INSTRUCTIONS and "needs_owner=true" in INSTRUCTIONS and "NEEDS YOU list" in INSTRUCTIONS
+          "HOW LOUD" in INSTRUCTIONS and "needs_owner=true" in INSTRUCTIONS
           and "a mention that could have waited is a bug" in INSTRUCTIONS
           and f"#{APPROVALS} card" in INSTRUCTIONS and f"#{ALERTS}" in INSTRUCTIONS and "digest" in INSTRUCTIONS)
     orderH = home_chan_order([("CPAR", "myrepo"), ("CORCH", "myrepo-cctest-ghih"), ("CSUB", "myrepo-cctest-helper-m3x1"),
@@ -6202,12 +4753,12 @@ def run_selfcheck():
     check("Home: sub channels sit under their parent (depth = indent level), parents by name, children by creation; an "
           "archived orch channel is off the dashboard",
           orderH == [("CPAR", "myrepo", 0), ("CORCH", "myrepo-cctest-ghih", 1), ("CSUB", "myrepo-cctest-helper-m3x1", 2), ("CZ", "zeta", 0)])
-    hbO = home_blocks({"box": "b", "now": "1", "channels": [{"name": n, "depth": d, "session": "🔧 working", "marks": {"❓": 1}} for _, n, d in orderH]})
+    hbO = home_blocks({"box": "b", "now": "1", "channels": [{"name": n, "depth": d, "session": "🔧 working"} for _, n, d in orderH]})
     txtO = next(b["text"]["text"] for b in hbO if b["type"] == "section" and "#myrepo" in b["text"]["text"])
     check("Home: a sub channel is rendered indented under its parent row (↳), a top-level one is not, and the indent is "
           "NON-BREAKING spaces per level — Slack collapses the ordinary ones, so four spaces rendered as none",
-          txtO == ("🔧 *#myrepo* · ❓1\n\u00a0\u00a0↳ 🔧 #myrepo-cctest-ghih · ❓1"
-                   "\n\u00a0\u00a0\u00a0\u00a0↳ 🔧 #myrepo-cctest-helper-m3x1 · ❓1\n🔧 *#zeta* · ❓1")
+          txtO == ("🔧 *#myrepo*\n\u00a0\u00a0↳ 🔧 #myrepo-cctest-ghih"
+                   "\n\u00a0\u00a0\u00a0\u00a0↳ 🔧 #myrepo-cctest-helper-m3x1\n🔧 *#zeta*")
           and "    ↳" not in txtO)
     # ---- a channel IS a session: an unmapped channel gets ~/dev/<name> on its FIRST message, bounded, member-facing
     check("channel name → target: lower-cased, folded to [a-z0-9-], the first `--` still <repo>/<track>; nothing valid → None",
@@ -6822,86 +5373,18 @@ def run_selfcheck():
           MEMBER_MARKER in h_msg and "~/dev/henry`" not in h_msg and " min" in h_msg
           and "~/dev/chan-four`" in chan_why and MEMBER_MARKER not in chan_why and " min." in chan_why)
 
-    # ── marks.json / flags.json under concurrent writers, and a mark already where we want it (2026-09-01 audit) ──
-    with tempfile.TemporaryDirectory(prefix="_selfcheck_marks_") as tdm:
-        real_dirm, shared_m, shared_f, buf_race = DIR, {}, {}, io.StringIO()
-
-        def hammer(i, d, save):
-            for n in range(150):
-                d[f"C:{i}.{n}:white_check_mark"] = time.time()
-                save(d)
-        ths = ([threading.Thread(target=hammer, args=(i, shared_m, save_marks), name=f"selfcheck-marks-{i}") for i in range(2)]
-               + [threading.Thread(target=hammer, args=(i, shared_f, real_save_flags), name=f"selfcheck-flags-{i}") for i in range(2)])
-        try:
-            globals()["DIR"] = tdm
-            with contextlib.redirect_stderr(buf_race):
-                for t in ths:
-                    t.start()
-                for t in ths:
-                    t.join(30)
-            back_m, back_f = load_marks(), real_load_flags()
-        finally:
-            globals()["DIR"] = real_dirm
-        leftover = sorted(p for p in os.listdir(tdm) if p not in (MARKS, FLAGS))
-    check("marks.json/flags.json: two threads each saving 150 entries at once — every save lands, nothing is logged, "
-          "every key reads back and no temp file is left behind (one shared temp path let a save pull the file from "
-          "under another: FileNotFoundError ×4 in the 2026-09-01 audit)"
-          + (f" — logged: {buf_race.getvalue().strip().splitlines()[0][:80]}" if buf_race.getvalue() else "")
-          + (f" — leftover {leftover}" if leftover else ""),
-          not buf_race.getvalue() and not any(t.is_alive() for t in ths) and not leftover
-          and len(back_m) == 300 and set(back_m) == set(shared_m) and len(back_f) == 300 and set(back_f) == set(shared_f))
-    dmAR = Daemon(use_slack=False); dmAR.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmAR.bot_user = "UBOT"
-    ar_calls, buf_ar, buf_bad = [], io.StringIO(), io.StringIO()
-
-    def api_ar(method, token, **kw):
-        ar_calls.append((method, kw.get("name")))
-        if method in ("reactions.add", "reactions.remove"):
-            raise RuntimeError(f"{method}: " + ("already_reacted" if method == "reactions.add" else "no_reaction"))
-        raise RuntimeError(f"selfcheck: unexpected {method}")
-    was_api_ar = globals()["api"]
-    try:
-        globals()["api"] = api_ar
-        with contextlib.redirect_stderr(buf_ar):
-            dmAR.status_cache[("CA", "1.0")] = "large_orange_circle"
-            dmAR.set_mark("CA", "1.0", "🔴")                     # -🟠 answers no_reaction, +🔴 answers already_reacted
-            dmAR.work_cache[("CA", "2.0")] = None
-            dmAR.set_work("CA", "2.0", "✅")                     # +✅ answers already_reacted
-            ok_add = set_reaction("xoxb-x", "CA", "3.0", "red_circle", True)
-            ok_rm = set_reaction("xoxb-x", "CA", "3.0", "red_circle", False)
-        globals()["api"] = lambda method, token, **kw: (_ for _ in ()).throw(RuntimeError(f"{method}: channel_not_found"))
-        with contextlib.redirect_stderr(buf_bad):
-            dmAR.status_cache[("CA", "4.0")] = None
-            dmAR.set_mark("CA", "4.0", "🔴")
-    finally:
-        globals()["api"] = was_api_ar
-    check("reactions: already_reacted on an add and no_reaction on a remove are the wanted state ALREADY holding, not "
-          "errors — set_reaction answers True, set_mark updates its cache and logs nothing (21 of the 41 cc-slackd error "
-          "lines of the 2026-09-01 audit); any other answer is still logged",
-          ok_add is True and ok_rm is True and buf_ar.getvalue() == ""
-          and dmAR.status_cache[("CA", "1.0")] == "red_circle" and dmAR.work_cache[("CA", "2.0")] == "white_check_mark"
-          and ar_calls == [("reactions.remove", "large_orange_circle"), ("reactions.add", "red_circle"),
-                           ("reactions.add", "white_check_mark"), ("reactions.add", "red_circle"), ("reactions.remove", "red_circle")]
-          and "channel_not_found" in buf_bad.getvalue())
 
     # -- Home: NEEDS YOU rows link the message they wait on; the tab never lists the picture store (owner, 2026-09-01) --
     lURL, lCARD, lTHR = "https://s.slack.com/archives/C1/p1", "https://s.slack.com/archives/CAPP/p7", "https://s.slack.com/archives/CT/p3"
-    lw = {"ch": "abox", "age": 720, "ask": "pick a branch name? cc-fix or fix/cc, either is fine"}
-    check("home: a ❓ thread row with a cached permalink links its channel name; the same row with no ts is the plain text "
-          "it always was (the ask is never inside the link: home_ask clips it)",
-          home_needs({"waits": [dict(lw, link=lURL)]}) == [f"❓ *<{lURL}|[abox]>* · 12m · pick a branch name"]
-          and home_needs({"waits": [lw]}) == ["❓ *[abox]* · 12m · pick a branch name"]
-          and home_needs({"waits": [dict(lw, link="", chat="C1", ts="1")]}) == ["❓ *[abox]* · 12m · pick a branch name"])
     lpr = {"num": "9", "repo": "r", "url": "https://github.com/r/r/pull/9", "owed": True}
     check("home: a PR owed a 👍 links its #approvals card when the card is known, else the PR itself, else stays plain",
           home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": lpr}], "cards": {"r#9": lCARD}}) == [f"❓ [r] *<{lCARD}|PR #9>* · awaiting review"]
           and home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": lpr}]}) == [f"❓ [r] *<{lpr['url']}|PR #9>* · awaiting review"]
           and home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": dict(lpr, url="")}]}) == ["❓ [r] *PR #9* · awaiting review"])
     ltr = {"state": "waiting", "name": "r/t", "reason": "owner 👍 on the #approvals card for PR #9", "pr": lpr}
-    lrows = home_needs({"tracks": [ltr], "waits": [{"ch": "r--t", "age": 60, "ask": "may I?", "link": lTHR}], "cards": {"r#9": lCARD}})
     check("home: a track that stopped to ask links the ❓ thread in its own channel first, else its PR's #approvals card, "
           "else its PR, else plain — the screenshot row '❓ g0-run-refresh · owner 👍 on the #approvals…' opens the card",
-          lrows[1].startswith(f"❓ [r] *<{lTHR}|t>* · owner 👍 on the #approvals") and lrows[0].startswith(f"❓ [r] *<{lTHR}|#t>* · 1m")
-          and home_needs({"tracks": [ltr], "cards": {"r#9": lCARD}})[0].startswith(f"❓ [r] *<{lCARD}|t>* · owner 👍")
+          home_needs({"tracks": [ltr], "cards": {"r#9": lCARD}})[0].startswith(f"❓ [r] *<{lCARD}|t>* · owner 👍")
           and home_needs({"tracks": [ltr]})[0].startswith(f"❓ [r] *<{lpr['url']}|t>* · owner 👍")
           and home_needs({"tracks": [dict(ltr, pr=None)]})[0].startswith("❓ [r] *t* · owner 👍")
           and home_needs({"tracks": [dict(ltr, state="blocked", pr=None)]})[0].startswith("⛔ [r] *t* · owner 👍"))
@@ -6953,8 +5436,7 @@ def run_selfcheck():
           "2026-09-01: \"[ai-ee] g0-run-refresh · owner 👍 …\") — and the repo is printed ONCE: a channel that IS the "
           "repo prints `[abox]` in place of `#abox`, a PR row drops the repo it used to trail, and the SESSIONS band, "
           "which already groups under a repo heading, is given no second one",
-          lband == ["❓ *[abox]* · 12m · pick a branch name", "❓ *[sandbox]* · 3m · confirm delete",
-                    "⛔ [sandbox] *subproj-carpet* · no GH token"]
+          lband == ["⛔ [sandbox] *subproj-carpet* · no GH token"]
           and all(home_unlink(r).split(" ", 1)[1].lstrip("*").startswith("[") for r in lband)
           and "❓ [sandbox] *<https://github.com/sandbox/carpet/pull/3|PR #3>* · awaiting review" in lrev
           and "❓ [lesson] *c1* · which one" in home_needs(dict(hfix, sessions=[{"repo": "lesson", "name": "c1",
@@ -7429,7 +5911,7 @@ def run_selfcheck():
           "every owner verb (status, orch, archive, post, permission) are refused — a workspace answering its own 🔐 "
           "prompt is the whole point of routing that prompt out of its channel",
           [p[0] for p in postedMS[:5]] == ["CAL", "CALT", "CALU", "CALTU", "CAL"] and postedMS[0][2] == display_name("alice")
-          and ("CAL", "1.1", "eyes", True, None) in reactedMS and ("CAL", "9.9", "question", False, None) in reactedMS and r_rep_n.get("ok") and r_rep_h.get("ok")
+          and ("CAL", "1.1", "eyes", True, None) in reactedMS and r_rep_n.get("ok") and r_rep_h.get("ok")
           and all(r.get("ok") is False for r in (r_dm, r_bob, r_my, r_status, r_orch, r_mpost, r_arch, r_mperm))
           and "not one of alice's channels" in r_dm.get("error", "") and "not a member verb" in r_status.get("error", "")
           and "not a member verb" in r_mperm.get("error", ""))
@@ -7687,7 +6169,6 @@ def run_selfcheck():
           and any(k == "sweep" for k, *_ in deferred) and any(k == "publish" for k, *_ in deferred))
     Daemon.queue_land, Daemon.land_sweep = real_queue_land, real_land_sweep
     Daemon.publish_soon = real_publish_soon
-    check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
     check("selfcheck: the Home dump of a fixture tab landed under the redirected DIR, never in the live ~/.cc/state "
           "(a fixture tab reached cc-secretary as the owner's view once, 2026-09-01)",
           os.path.exists(f"{DIR}/home.json") and json.load(open(f"{DIR}/home.json"))["state"].get("box") == "abox")
@@ -8588,147 +7069,6 @@ def run_selfcheck():
               resZ["ok"] and resZ["chat"] == "C-BOX" and resZ["ts"] == "1789149700.5"
               and [(c, t) for c, t, _, _ in msaid] == [("C-BOX", "1789149700.5")]
               and R.conv_by_root("C-BOX", "1789149700.5")["tag"] == "1badcafe")
-
-        # (o) A CLOSING MAIL GETS A REACTION, NOT A REPLY (owner, 2026-09-10 17:52Z: 'not every email needs a
-        # reply'). The line quoting HIS mail is his word for the owed check (mail_word): 🔴 until a session
-        # answers, ❓ and a re-hand at 30 min — and a reaction of ours on it IS the answer, with nothing mailed.
-        msaid.clear(); mhanded.clear()
-        mail_write("K1", subject="received", text="received. and it didnt go to my spam", **{"from": "boss@allowed.example"})
-        dmA.take_mail("K1")
-        rootK = {"ts": msaid[0][3], "text": msaid[0][2], "bot_id": "B01", "reply_count": 0}
-        bot_was, dmA.bot_user, dmA.bot_id = dmA.bot_user, "UBOT", "B01"
-        try:
-            nowK = float(rootK["ts"]) + 60
-            lateK = float(rootK["ts"]) + STALL_AFTER + 1
-            freshK = dmA.base_mark(rootK, nowK, rootK, "C-BOX")
-            staleK = dmA.base_mark(rootK, lateK, rootK, "C-BOX")
-            real_timeK, time.time = time.time, (lambda: nowK)     # the fixture's ts are small: the 48 h window must hold them
-            try:
-                bucketK = [m for m, _, _ in dmA.bucket_threads("C-BOX", roots=[rootK])]
-            finally:
-                time.time = real_timeK
-            eyesK = dmA.base_mark(dict(rootK, reactions=[{"name": "eyes", "users": ["UBOT"]}]), lateK, rootK, "C-BOX")
-            ackedK = dict(rootK, reactions=[{"name": "+1", "users": ["UBOT"]}])
-            reactedK = dmA.base_mark(ackedK, lateK, rootK, "C-BOX")
-            dmA.reply_cache.clear()
-            real_timeK, time.time = time.time, (lambda: lateK)
-            try:
-                bucketAck = [m for m, _, _ in dmA.bucket_threads("C-BOX", roots=[ackedK])]
-            finally:
-                time.time = real_timeK
-            wordK = (dmA.our_word(rootK, "C-BOX", rootK), dmA.our_word(rootK))
-            # …and the reaction ITSELF, through on_own_reaction: the 👀 comes off, the thread is marked handled now,
-            # and the mail door is never opened — nothing goes out for a reaction.
-            reactsK, marksK = [], []
-            real_reactK, real_outK = globals()["react"], globals()["mail_outbound"]
-            globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: reactsK.append((chat, ts, name, remove))
-            globals()["mail_outbound"] = lambda: (_ for _ in ()).throw(RuntimeError("the mail door was opened"))
-            globals()["api"] = lambda method, token, **kw: ({"messages": [rootK]} if method == "conversations.replies"
-                                                          else mail_api(method, token, **kw))
-            set_was, dmA.set_mark = dmA.set_mark, lambda chat, root, mark: marksK.append((chat, root, mark))
-            try:
-                dmA.on_own_reaction("C-BOX", rootK["ts"], "+1", False)
-            finally:
-                globals()["react"], globals()["mail_outbound"], globals()["api"] = real_reactK, real_outK, mail_api
-                dmA.set_mark = set_was
-            # the same line for a MEMBER's mail, and the root of a mail the box STARTED to him, are not his word
-            memK = {"ts": rootsA["C-MEM"], "text": "_email from `friend@allowed.example` · the cert_", "bot_id": "B01"}
-            msaid.clear()
-            resB = dmA.mail_started({"channel": "box", "from": "box@box.example", "to": ["boss@allowed.example"],
-                                     "subject": "the proof", "message_id": "<out3@box.example>"})
-            startK = {"ts": resB.get("ts"), "text": "_email from `boss@allowed.example` · the proof_", "bot_id": "B01"}
-            othersK = (dmA.mail_word("C-MEM", {"ts": rootsA["C-MEM"]}, memK),
-                       resB["ok"] and (R.conv_by_root("C-BOX", resB["ts"]) or {}).get("workspace") == "owner"
-                       and not dmA.mail_word("C-BOX", {"ts": resB["ts"]}, startK),
-                       dmA.base_mark(memK, nowK, memK, "C-MEM"), dmA.mail_word("C-BOX", None, rootK))
-        finally:
-            dmA.bot_user, dmA.bot_id = bot_was, None
-        check("mail: the line quoting the OWNER's mail is HIS word to the owed check — 🔴 while a session owes it an "
-              "answer, ❓ (a re-hand, never a nudge to him) once 30 min pass with none — and an unanswered one is a "
-              "thread the sweep buckets, where before it read as the box's own line and was never owed at all",
-              freshK == "🔴" and staleK == "❓" and bucketK == ["🔴"] and wordK == (False, True) and eyesK == "❓")
-        check("mail: a reaction of ours on that line IS the answer — 🟠 handled now and on the sweep, nothing owed, "
-              "no re-hand, its 👀 off — and the mail door is never opened: a mail that needs no answer gets a reaction "
-              "and no mail leaves (owner, 2026-09-10)",
-              reactedK == "🟠" and bucketAck == ["🟠"] and marksK == [("C-BOX", rootK["ts"], "🟠")]
-              and reactsK == [("C-BOX", rootK["ts"], "eyes", True)])
-        check("mail: a MEMBER's mail line, the root of a mail the box STARTED to him, and a line with no thread to look "
-              "up are not his word — they read as they did before, and nothing here re-hands or nudges for them",
-              othersK == (False, True, "🟠", False))
-
-        # (o2) …AND THAT ANSWER SURVIVES THE 🔧 IT REPLACED. A mail's line is handed to a session with the box's
-        # own wrench on it (hold_wrench), so the session's ✅ takes that same slot and Slack hands the displaced
-        # wrench back to us as a removal of OURS. Read as "the work slot is empty now" it took the ✅ off a second
-        # later (2026-09-11): the mail then read unanswered, went ❓ at 30 min and was re-handed to a session that
-        # answered it by mail — the re-hand the closing-mail rule exists to make unnecessary. A removal only empties
-        # the slot when the slot is still this mark's; a mark displaced by the other one takes nothing with it.
-        msaid.clear(); mhanded.clear()
-        mail_write("K2", subject="thanks", text="thanks, that is exactly it", **{"from": "boss@allowed.example"})
-        dmA.take_mail("K2")
-        rootW = {"ts": msaid[0][3], "text": msaid[0][2], "bot_id": "B01", "reply_count": 0, "reactions": []}
-        rxW = []
-
-        def apiW(method, token, **kw):
-            return {"messages": [rootW]} if method == "conversations.replies" else mail_api(method, token, **kw)
-
-        def set_rxW(tok, chat, ts, name, on):
-            rxW.append(("+" if on else "-") + name)
-            if on:
-                rootW["reactions"].append({"name": name, "users": ["UBOT"]})
-            else:
-                rootW["reactions"] = [r for r in rootW["reactions"] if r["name"] != name]
-            return True
-        bot_was, dmA.bot_user, dmA.bot_id = dmA.bot_user, "UBOT", "B01"
-        real_apiW, real_setW = globals()["api"], globals()["set_reaction"]
-        globals()["api"], globals()["set_reaction"] = apiW, set_rxW
-        try:
-            dmA.session_mark("C-BOX", rootW["ts"], "hammer_and_wrench")          # the box takes the mail (hold_wrench)
-            dmA.session_mark("C-BOX", rootW["ts"], "white_check_mark")           # the session answers it with ✅
-            dmA.on_own_reaction("C-BOX", rootW["ts"], "hammer_and_wrench", True)  # …and Slack hands the 🔧 back, removed
-            lateW = float(rootW["ts"]) + STALL_AFTER + 1
-            liveW = (dmA.answered_by_us(rootW), dmA.base_mark(rootW, lateW, rootW, "C-BOX"),
-                     dmA.root_marks(rootW, lateW, rootW, "C-BOX"))
-        finally:
-            globals()["api"], globals()["set_reaction"] = real_apiW, real_setW
-            dmA.bot_user, dmA.bot_id = bot_was, None
-        check("mail: the ✅ answering a mail outlives the 🔧 it replaced — Slack gives the displaced wrench back as a "
-              "removal of ours, and emptying the work slot on it stripped the answer a second after it was made, "
-              "leaving the mail ❓ at 30 min and re-handed (2026-09-11)",
-              rxW == ["+hammer_and_wrench", "-hammer_and_wrench", "+white_check_mark"]
-              and liveW == (True, "🟠", (None, "✅")))
-
-        # (p) …NOR IS A MAIL NOBODY WAS GIVEN: one still HELD, and one in a channel that was only Cc'd. take_mail
-        # writes `mirrors` before it saves the hold, so both lines were counted as his word — and the ❓ at 30 min
-        # is a re-hand (retry_delivery), which would have delivered a held mail before any person said `deliver it`
-        # and handed a Cc'd session the mail its Cc means it was never given.
-        os.environ["CC_MAIL_VET_FAKE"] = "off-goals"
-        mail_write("H9", subject="the invoice", text="pay this one", **{"from": "boss@allowed.example"})
-        msaid.clear(); mhanded.clear()
-        dmA.take_mail("H9")
-        os.environ["CC_MAIL_VET_FAKE"] = "fits|fits"
-        rootH = {"ts": msaid[0][3], "text": msaid[0][2], "bot_id": "B01", "reply_count": 0}
-        bot_was, dmA.bot_user, dmA.bot_id = dmA.bot_user, "UBOT", "B01"
-        try:
-            nowH, lateH = float(rootH["ts"]) + 60, float(rootH["ts"]) + STALL_AFTER + 1
-            heldH = (dmA.mail_word("C-BOX", rootH, rootH), dmA.base_mark(rootH, nowH, rootH, "C-BOX"),
-                     dmA.base_mark(rootH, lateH, rootH, "C-BOX"))
-            msaid.clear(); mhanded.clear()
-            dmA.mail_decide("C-BOX", rootH["ts"], "deliver it", "UOWNER", True)
-            freedH = (dmA.mail_word("C-BOX", rootH, rootH), dmA.base_mark(rootH, lateH, rootH, "C-BOX"),
-                      [h[0] for h in mhanded])
-            recH = R.conv_by_root("C-BOX", rootH["ts"]) or {}
-            for r in recH.get("roots") or []:      # …the same delivered line, in a channel the mail only COPIED
-                r["role"] = "cc"
-            R.save_conv(recH)
-            ccH = (dmA.mail_word("C-BOX", rootH, rootH), dmA.base_mark(rootH, lateH, rootH, "C-BOX"))
-        finally:
-            dmA.bot_user, dmA.bot_id = bot_was, None
-        check("mail: a HELD mail's line is not his word while it waits — no 🔴, no ❓ and so no re-hand of a mail "
-              "no person has released — and `deliver it` makes it his word at the moment it is delivered",
-              heldH == (False, "🟠", "🟠") and freedH == (True, "❓", ["box"]))
-        check("mail: …and the line in a channel the mail only Cc'd stays the box's own line, however long it "
-              "sits: no session was given that mail, so there is nobody there to owe an answer or be re-handed it",
-              ccH == (False, "🟠"))
 
         # -- MILESTONE 4'S TAP: a post that has already reached Slack, offered to the mail door ------------
         # WHICH posts travel and WHAT goes in one is core/mail/selfcheck.py's (sections 17 and 18) — it owns

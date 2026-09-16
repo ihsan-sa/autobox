@@ -5,11 +5,11 @@ Run Claude Code as an always-on agent box you drive from Slack and your phone.
 One Linux box, one tmux, one Slack app. Every project gets a planning session in `#<project>`; work runs in git worktrees by
 headless workers that end in PRs; a 👍 in `#approvals` enqueues the landing job that gates, merges and deploys.
 Deterministic hooks keep agents inside their lane; a Docker
-sandbox runs the unrestricted ones. Thread marks tell you at a glance what needs you (❓), nothing else does.
+sandbox runs the unrestricted ones. A reply that needs you opens with ❓ and mentions you; nothing else does.
 
 ## What you get
 - `cc` — sessions, tracks (worktree + branch), headless `--go` workers, `done` → PR, `digest`, `handoff`. No spend cap: a worker still committing carries past its step limit, and one that stops producing stops itself.
-- `cc-slack` — two-way Slack: `#<repo>` ↔ that repo's session, DMs ↔ the box; permission prompts relayed; `!status`/`!threads`/`!restart` without tokens.
+- `cc-slack` — two-way Slack: `#<repo>` ↔ that repo's session, DMs ↔ the box; permission prompts relayed; `!restart`/`!pause` with no session.
 - Hooks — `cc-checkpoint` (auto-commit+push in worktrees only), `cc-guard` (owner gates for autonomous sessions), `cc-context` (what a session is told at the end of a turn: hand off).
 - `ccbox` — bypass-permissions Claude in Docker with an egress allowlist.
 - `cc-audit` — recurring reviews of how well the box served you (3-day), code audits (weekly, monthly), and a second opinion from another model on what to delete (day 15).
@@ -20,7 +20,7 @@ sandbox runs the unrestricted ones. Thread marks tell you at a glance what needs
 - `cc-scope` — the ledger of what the owner *asked for*, as against the board's record of what the box took on. A row closes only against evidence: a command whose exit code decides, run after the deploy.
 - `cc-publish` — a private box keeps this tree as `core/` and mirrors it back here after every merge, gated on its own name never shipping.
 - Boot/notify — survives power cuts and reboots; Slack/ntfy notices; daily digest.
-- Tests: `tests/check.sh`, `tests/selftest.sh` (200+ checks, no API calls), `cc-slack selfcheck`, `tests/slack_sim.py`.
+- Tests: `tests/check.sh`, `tests/selftest.sh` (200+ checks, no API calls), `cc-slack selfcheck`.
 
 ## Blank box
 Hand this repo to a Claude agent on a fresh Ubuntu box and it can do everything below except the owner's lines:
