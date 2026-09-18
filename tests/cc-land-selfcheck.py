@@ -3256,23 +3256,31 @@ def selfcheck():
         quiet(cmd_work, [])
         kept = read_json(job_path("myrepo", 7)) or {}
         nb = epoch_of(kept.get("not_before", ""))
-        check("a review that meets a usage limit KEEPS the job: stage deferred, not_before at the END of the minute "
-              "cc-limit names (UTC — it floors that stamp, so the minute is still running), the attempt uncounted, "
-              "nothing bought, nobody told — the PR was not read, so there is nothing to say yet",
+        check("a review that meets a usage limit KEEPS the job: stage deferred, not_before the MINUTES cc-limit says "
+              "are left counted from this reading and a minute past them (both ends of its line are rounded), never "
+              "the clock time it names resolved against a calendar — the attempt uncounted, nothing bought, nobody "
+              "told, because the PR was not read and there is nothing to say yet",
               kept.get("stage") == "deferred" and kept.get("attempts") == 0 and 0 < nb - time.time() <= 86400
-              and time.gmtime(nb)[3:5] == (4, 1) and not [c for c in calls if c[0] == CLAUDE] and not gh_merges()
+              and abs(nb - (time.time() + 36 * 60)) <= 5 and kept.get("limit_src") == "cc-limit"
+              and not [c for c in calls if c[0] == CLAUDE] and not gh_merges()
               and not ran_sub("cc-slack", "post") and not ran("cc-notify")
               # …and nothing REFUNDED either: this limit was met before a review was counted, so a refund here
               # would take the tally NEGATIVE and hand the change a second free review. That is why the refund
               # lives at the buy itself and not in the deferral branch both limits pass through.
               and root_work("myrepo", 7).get("reviews", 0) == 0)
-        check("...and the sweep that kept it arms its OWN next run — one transient timer, a minute past the reset — "
-              "because nothing on the box runs `work` on a clock, so a kept job used to wait for the next unrelated 👍",
-              len(armed()) == 1 and abs(int(armed()[0].split("=")[1]) - (nb + 60 - time.time())) <= 5)
-        seen = len(ran("gh pr view"))
+        check("...and the sweep that kept it arms its OWN next run — one transient timer, and at RETRY_AFTER rather "
+              "than at the reset when the reset is further off, because the sweep that re-asks whether the limit "
+              "still stands has to be armed by the deferral itself: nothing on the box runs `work` on a clock, and "
+              "cc-limit prints waits of hundreds of minutes, so on a quiet box the whole booking would be slept",
+              len(armed()) == 1 and int(armed()[0].split("=")[1]) == RETRY_AFTER
+              and nb + 60 - time.time() > RETRY_AFTER)
+        seen, asked = len(ran("gh pr view")), len(ran_sub("cc-limit", "status"))
         quiet(cmd_work, [])
-        check("...and a sweep before then leaves it alone: not read, not counted, not touched",
-              len(ran("gh pr view")) == seen and read_json(job_path("myrepo", 7)) == kept)
+        check("...and a sweep before then leaves it alone: not read, not counted, not touched — but it does ASK "
+              "whether the limit still stands, and an answer that still stands may not push the wait any further "
+              "out than the job already carries, so asking can never itself defer a job for ever",
+              len(ran("gh pr view")) == seen and read_json(job_path("myrepo", 7)) == kept
+              and len(ran_sub("cc-limit", "status")) == asked + 1)
         kept["not_before"] = "2000-01-01T00:00:00Z"                # the reset has come
         write_atomic(job_path("myrepo", 7), kept)
         world[f"{BIN}/cc-limit status"] = (1, "clear\n")
@@ -3280,6 +3288,20 @@ def selfcheck():
         check("...and once the limit has lifted the same job is read, gated and merged with nobody re-approving it, "
               "and no reaction from the bot",
               len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7)) and not reacted)
+        # (1a) …and the reset that comes EARLY, on its own fixture: the job's not_before is still half an hour ahead
+        # and nobody edits it. That is the whole of why the wait is asked and not slept through — a deferral is a
+        # guess about the box's weather, and before this one wrong guess parked a green PR until a person found it.
+        landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n")})
+        quiet(cmd_work, [])
+        early = read_json(job_path("myrepo", 7)) or {}
+        world[f"{BIN}/cc-limit status"] = (1, "clear\n")     # the limit lifted well before the minute it named
+        quiet(cmd_work, [])
+        check("a limit that lifts EARLY frees its job on the next sweep, with the not_before it was given still "
+              "half an hour ahead: the wait comes off and it merges. Nothing re-asked a deferred job before, so a "
+              "booking that was wrong was absorbing — PR #489 sat a day for a five-minute wait (#503 too, and "
+              "freeing it by hand threw away the review it had already paid for)",
+              early.get("stage") == "deferred" and epoch_of(early.get("not_before", "")) - time.time() > 1800
+              and len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7)))
         check("both ways the review reports a limit defer, and a verdict never does — matched on the fixed prefixes "
               "review() raises with, since a verdict's prose may quote anything",
               limited("no review: usage limit until 04:00Z (35m left) — the landing waits for the model")
@@ -3295,10 +3317,45 @@ def selfcheck():
             after = limit_until("no review: usage limit until 04:00Z")
         finally:
             time.time = real_time
-        check("a reset inside the minute we are standing in is a wait of SECONDS, never of a day: cc-limit floors its "
-              "stamp to the minute, so at 04:00:12 'until 04:00Z' still lies ahead — compared whole-minute it read as "
-              "past and the job was deferred to 04:00 TOMORROW, an approved PR asleep 24 h (review of PR #154)",
-              inside == "2026-09-01T04:01:00Z" and after == "2026-09-02T04:01:00Z")
+        check("a reset inside the minute we are standing in is a wait of SECONDS, never of a day — and with no "
+              "'(Nm left)' beside it a clock time that has gone past is NOT gambled on tomorrow either: it waits one "
+              "RETRY_AFTER and asks cc-limit again, which is the convergence this has always claimed and never had. "
+              "Read as tomorrow's it put an approved PR to sleep for 24 h (review of PR #154)",
+              inside == "2026-09-01T04:02:12Z" and after == "2026-09-01T04:16:00Z"
+              and epoch_of(after) - (T + 48) == RETRY_AFTER)
+        # THE TWO LINES THAT EACH PARKED A GREEN PR FOR A DAY, at the second each was READ rather than written: the
+        # review's unwind outlived the window cc-limit had named, so by the time the deferral was computed the clock
+        # time in the line had just gone past — and a clock time just behind us read as tomorrow's, booking a
+        # five-minute wait 24 h out. '(Nm left)' is counted from the reading, so it cannot reach tomorrow at all.
+        real_time = time.time
+        try:
+            time.time = lambda: calendar.timegm((2026, 9, 15, 20, 28, 0, 0, 0, 0))   # written 20:22:13Z, read 20:28
+            p489 = limit_until("review: no review: usage limit until 20:26Z (5m left) — the landing waits for the "
+                               "model, or --no-review")
+            time.time = lambda: calendar.timegm((2026, 9, 16, 4, 8, 0, 0, 0, 0))     # written 03:56:38Z, read 04:08
+            p503 = limit_until("no review: usage limit until 04:06Z (10m left) — the landing waits for the model")
+        finally:
+            time.time = real_time
+        check("a usage limit read a few minutes stale defers to TODAY: PR #489's five-minute wait is five minutes "
+              "from the reading and PR #503's ten is ten, both on the day they were read — off the clock alone each "
+              "was booked exactly 24 h late, #503 sat until a person found it by hand and paid for its review twice",
+              p489 == "2026-09-15T20:34:00Z" and p503 == "2026-09-16T04:19:00Z")
+        # (1d) …and the answer that is NOT a lift: cc-limit exits 1 for "no stamp binds THIS caller" as well as for
+        # "no stamp at all", and says which on stderr. A stamp hit by one run only stops binding this one as soon as
+        # the sweep runs from a different cwd (cc-limit's mykey is the cwd) — reading that as a lift would run the
+        # job straight back into the limit that is still there.
+        landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n")})
+        quiet(cmd_work, [])
+        mine = read_json(job_path("myrepo", 7)) or {}
+        world[f"{BIN}/cc-limit status"] = (1, "clear\nnote: another run hit a limit that resets 04:00Z; no second "
+                                              "run has hit it, so the box is not held by it.\n")
+        quiet(cmd_work, [])
+        check("a limit that is still LIVE but no longer binds this caller keeps its job waiting: cc-limit's exit 1 "
+              "is not evidence of a lift on its own, and the note it prints beside it says the stamp is still there",
+              mine.get("stage") == "deferred" and read_json(job_path("myrepo", 7)) == mine and not gh_merges())
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))      # still deferred, correctly: drained by hand for the cases below
+
         # …and the same limit met INSIDE the model call rather than before it. That one has already been counted
         # against the change when it fails, so the refund is what keeps this documented path open at all.
         landing(**{f"{CLAUDE} -p": (1, ""), f"{BIN}/cc-limit check": (0, "usage limit until 04:00Z\n")})
@@ -3329,6 +3386,16 @@ def selfcheck():
               "and the job still there for the reset (PR #390: ended, counted, and refused at the wall at 23:05Z)",
               kept.get("stage") == "deferred" and kept.get("attempts") == 0 and not commented()
               and not root_work("myrepo", 7).get("reviews") and not gh_merges() and not ran_sub("cc-slack", "post"))
+        asked = len(ran_sub("cc-limit", "status"))
+        quiet(cmd_work, [])
+        check("...and THAT one is never re-asked, because cc-limit never stamped it: the sweep does not ask whether "
+              "the limit lifted and does not free the job, and it arms the one timer its booking asks for and no "
+              "sooner. A clear cc-limit is not evidence about a limit only the reviewer saw, and freeing the job on "
+              "it would re-run the whole landing into the same deferral every sweep for ever — uncounted, so "
+              "LAND_TRIES never ends it",
+              read_json(job_path("myrepo", 7)) == kept and kept.get("limit_src") == "review"
+              and len(ran_sub("cc-limit", "status")) == asked and not gh_merges()
+              and abs(int(armed()[-1].split("=")[1]) - (RETRY_AFTER + 60)) <= 5)
         with contextlib.suppress(OSError):
             os.unlink(job_path("myrepo", 7))      # kept, correctly: drained by hand for the cases below
 
@@ -4620,12 +4687,20 @@ def selfcheck():
         # the cap
         L = mland(**{f"{BIN}/cc-config get MEMBER_DAILY_USD": (0, "2\n")})
         rc, said = mrun(L)
+        reset = (int(time.time()) // 86400 + 1) * 86400        # the next 00:00Z, the reset a member's day has
+        books = epoch_of(limit_until(L.why)) - reset
         check("M4: the review is charged BEFORE the buy, and over the workspace's daily cap there is no buy: the stop "
               "is the usage-limit shape naming the day's reset (00:00Z) — the weather run_job defers on, not a "
               "verdict — nothing merges and nothing is charged",
-              rc == 1 and limited(L.why) and limit_until(L.why) and "MEMBER_DAILY_USD" in said
+              rc == 1 and limited(L.why) and "MEMBER_DAILY_USD" in said
               and not asked_model() and not ran("gh pr merge")
               and not ((read_json(member_spend()) or {}).get(H) or {}).get("usd"))
+        check("M4: ...and the stamp run_job would defer it to IS that next 00:00Z, because the stop carries the "
+              "minutes to it — `00:00Z` alone is a clock time behind us, which limit_until books one RETRY_AFTER "
+              "out, and this is the one caller cc-limit cannot be re-asked about: the job would re-run the whole "
+              "landing, gates and all, every 15 min until midnight, uncounted (the deferral gives the try back, so "
+              "LAND_TRIES never ends it)",
+              re.search(r"usage limit until 00:00Z \(\d+m left\) ", L.why) and 0 < books <= 180)
         today = time.strftime("%Y-%m-%d", time.gmtime())
         L = mland(**{f"{BIN}/cc-config get MEMBER_DAILY_USD": (0, "20\n")})
         write_atomic(member_spend(), {H: {"day": today, "usd": 17.5}})

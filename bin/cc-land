@@ -691,18 +691,27 @@ def epoch_of(s):
         return 0
 
 
-LIMIT_UNTIL_RE = re.compile(r"usage limit until (\d\d):(\d\d)Z")
+# `usage limit until HH:MMZ (Nm left)`, as `cc-limit status` prints it — the clock time, and beside it the minutes
+# still to run, which is the only token in the line that says which DAY that clock time means. The group is optional
+# because `cc-limit check` reads the clock alone out of a wrecked run, and older records carry it alone too.
+LIMIT_UNTIL_RE = re.compile(r"usage limit until (\d\d):(\d\d)Z(?:\s*\((\d+)m left\))?")
+
+# …and what `cc-limit status` says on its way OUT (exit 1, on stderr) when a stamp is live but was hit by another run
+# only: the limit is real and a wait written against it is still owed — it is this caller alone that is not held by it.
+LIMIT_ELSEWHERE_RE = re.compile(r"another run hit a limit that resets")
 
 
 def limit_until(text):
-    """The reset cc-limit names (`usage limit until HH:MMZ`) as a stamp() on the last second of that UTC minute, or '' when the text names none. Only a minute wholly behind us is read as tomorrow's; a limit further off than a day converges by being asked again each sweep."""
+    """The reset cc-limit names as a stamp(), or '' when the text names none. `(Nm left)` is counted from the moment this reads it and so cannot name tomorrow — a line read minutes stale over-books by those minutes, and needs no date arithmetic at all. The clock time ALONE does not say which day it means, so it is taken only while it is ahead of us and within RETRY_AFTER, and otherwise waits RETRY_AFTER and asks again: read as tomorrow's it parked two green PRs for 24 h apiece (#489, #503), each for a limit of a few minutes that had not yet even reset."""
     m = LIMIT_UNTIL_RE.search(text or "")
     if not m:
         return ""
     now = time.time()
-    t = time.gmtime(now)
+    if m.group(3) is not None:
+        return stamp(now + int(m.group(3)) * 60 + 60)   # …and a minute past it: cc-limit rounds those minutes up
+    t = time.gmtime(now)                                # from a stamp it floors, so both ends of the line are coarse
     end = calendar.timegm((t.tm_year, t.tm_mon, t.tm_mday, int(m.group(1)), int(m.group(2)), 0, 0, 0, 0)) + 60
-    return stamp(end if end > now else end + 86400)
+    return stamp(end if now < end <= now + RETRY_AFTER else now + RETRY_AFTER)
 
 
 def limited(why):
@@ -1488,9 +1497,16 @@ class Land:
             # The review is charged to the workspace's daily cap before the buy; the cap reached is weather (limited), deferred by run_job to the day's reset.
             over = member_charge(self.member, float(REVIEW_BUDGET))
             if over:
-                raise Failed(f"no review: usage limit until 00:00Z — {self.member} has used ${over[0]:.2f} of its "
-                             f"${over[1]:.0f}/day (MEMBER_DAILY_USD) and this review asks ${float(REVIEW_BUDGET):.2f}; "
-                             f"the landing waits for the day to reset")
+                # The MINUTES to that reset are counted here, because `(Nm left)` is the only token limit_until can
+                # read a day off: the bare clock time `00:00Z` is already behind us, and a bare one behind us books
+                # one RETRY_AFTER — which would re-run this whole landing, the gates included, every 15 min until
+                # midnight, each pass uncounted because the deferral hands the attempt back. cc-limit knows nothing
+                # of a member's cap, so this deferral is never re-asked either (limit_src "review", limit_stands).
+                at = int(time.time())                       # epoch days ARE UTC days, so this is the next 00:00Z,
+                mins = ((at // 86400 + 1) * 86400 - at + 59) // 60      # rounded up as cc-limit rounds its own
+                raise Failed(f"no review: usage limit until 00:00Z ({mins}m left) — {self.member} has used "
+                             f"${over[0]:.2f} of its ${over[1]:.0f}/day (MEMBER_DAILY_USD) and this review asks "
+                             f"${float(REVIEW_BUDGET):.2f}; the landing waits for the day to reset")
         tmp, tree = self.head_checkout("review", fetch=False)   # fetched above, to answer "read this head already?"
         try:
             dpath = f"{tmp}/pr-{self.pr}.diff"
@@ -2716,6 +2732,22 @@ def job_set(path, job, **fields):
     write_atomic(path, job)
 
 
+def limit_stands(path, job):
+    """True while a job's wait is still owed, False to run it now. A deferral cc-limit itself wrote (`limit_src`, run_job) is ASKED again on each sweep instead of slept through, because the reset it named is a guess: a stamp that is gone means the limit lifted early, so the wait comes off and the job runs this sweep. A fresh answer may only bring the wait FORWARD, never push it out, so asking cannot itself defer a job for ever. Nothing else is touched or even asked — a wait that is not a usage limit (held, a fix round polling), a member's daily cap, a limit only the reviewer saw: cc-limit cannot speak for those, and freeing one on its say-so would re-run the whole job into the same deferral every sweep for ever, uncounted, because the deferral hands the attempt back."""
+    if job.get("stage") != "deferred" or job.get("limit_src") != "cc-limit":
+        return True
+    rc, out = sh([f"{BIN}/cc-limit", "status"], timeout=60)
+    until = limit_until(out) if rc == 0 else ""
+    if until:
+        if until < (job.get("not_before") or ""):
+            job_set(path, job, not_before=until)
+        return True
+    if LIMIT_ELSEWHERE_RE.search(out or ""):
+        return True     # exit 1 is "no stamp binds THIS caller" (cc-limit, believe), and this one names a live stamp
+    job_set(path, job, stage="queued", not_before=None)
+    return False
+
+
 def fix_progress(path, job):
     """A job waiting on the fix round it dispatched: re-queued once the round has ended (round_live) with a pushed head; a round that never pushes goes back to the ordinary path at its deadline; a PR that merges under the round is not waited on. Returns a line to stand down with, or '' to run the job now."""
     fix = job.get("fix") or {}
@@ -2804,9 +2836,15 @@ def run_job(path, job):
                 f"and this costs it no try; removing {path} takes it out (then `cc-land work`)")
     if rc == 1 and L.stopped == "review" and limited(L.why):
         # A usage limit is the box's state, not a verdict: the job waits for the reset cc-limit names, uncounted, and the sweep arms itself for it (rearm).
-        until = (limit_until(L.why) or limit_until(sh([f"{BIN}/cc-limit", "status"], timeout=60)[1])
-                 or stamp(time.time() + RETRY_AFTER))
-        job.update(attempts=job["attempts"] - 1, stage="deferred", not_before=until, last=f"review: {L.why}"[:400])
+        # WHICH limit named it is written on the job, because only cc-limit's own live answer can be re-asked later
+        # (limit_stands) — and it is preferred over the line in L.why, which the review's unwind may have left minutes
+        # stale. A member's daily cap arrives here in the same words (review()) and cc-limit knows nothing of it.
+        lim = sh([f"{BIN}/cc-limit", "status"], timeout=60)
+        until = limit_until(lim[1]) if lim[0] == 0 else ""
+        src = "cc-limit" if until else "review"
+        until = until or limit_until(L.why) or stamp(time.time() + RETRY_AFTER)
+        job.update(attempts=job["attempts"] - 1, stage="deferred", not_before=until, limit_src=src,
+                   last=f"review: {L.why}"[:400])
         write_atomic(path, job)
         return f"[{repo}] {L.what()}: review deferred until {until} — {L.why[:160]}"
     if (rc == 1 and L.stopped == "review" and L.verdict == "LAND-AFTER-FIX" and (not fix or fix.get("over"))
@@ -2884,7 +2922,7 @@ def run_one(path):
         line = fix_progress(path, job)           # a dispatched fix iteration: has it pushed? Asked BEFORE the wait
         if line:                                 # below, so a sweep any 👍 starts picks the push up at once
             return line
-    if stamp() < (job.get("not_before") or ""):  # deferred to a usage-limit reset: untouched, uncounted, until then
+    if stamp() < (job.get("not_before") or "") and limit_stands(path, job):   # uncounted, untouched, until then
         return (f"[{job['repo']}] {'PR #' + str(job['pr']) if job.get('pr') else 'deploy'}: waits until "
                 f"{job['not_before']} ({(job.get('last') or '')[:120]})")
     if job.get("attempts", 0) >= LAND_TRIES:
@@ -2950,7 +2988,7 @@ def due_catchup():
 
 
 def next_wake():
-    """Seconds until the earliest job on disk wants running (a deferred one a minute past its not_before, a kept one RETRY_AFTER from now, an untried one almost at once), or None with nothing to wait for. A not_before already behind us is no wait at all."""
+    """Seconds until the earliest job on disk wants running (a deferred one a minute past its not_before, a kept one RETRY_AFTER from now, an untried one almost at once), or None with nothing to wait for. A not_before already behind us is no wait at all. A wait limit_stands may cut short is capped at RETRY_AFTER: the sweep that re-asks is armed by the deferral itself, so a limit that lifts early is picked up on an idle box too and not only when other traffic happens by — cc-limit prints waits in the hundreds of minutes, and nothing on this box runs `work` on a clock."""
     now, waits = time.time(), []
     for p in glob.glob(f"{LANDQ}/*.json"):
         j = read_json(p) or {}
@@ -2959,7 +2997,12 @@ def next_wake():
         if box_hold(j):
             continue    # a parked or tier-held job wants running at no time: `cc-pause off` or `cc-tier set` re-drives it
         nb = epoch_of(j.get("not_before", ""))
-        waits.append(nb - now + 60 if nb > now else (RETRY_AFTER if j.get("attempts") else 5))
+        if nb <= now:
+            waits.append(RETRY_AFTER if j.get("attempts") else 5)
+        elif j.get("stage") == "deferred" and j.get("limit_src") == "cc-limit":
+            waits.append(min(nb - now + 60, RETRY_AFTER))    # …only the bookings the re-ask can end early: every
+        else:                                                # other wait keeps its one timer, and costs its one sweep
+            waits.append(nb - now + 60)
     return int(min(waits)) if waits else None
 
 
