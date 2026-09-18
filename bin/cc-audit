@@ -26,7 +26,19 @@
 # broad pass included: $1 routine, $2 the other two; BUD_FAIL_BROAD is the broad pass's share ($0.60: why, at its
 # line). `TEST: none` in the handoff means no narrow pass. A pass that ends without a result — budget, turns, timeout,
 # an error — is named as such in the report, the message and audit.log (the JSON's subtype and is_error, via
-# llm_why), never as a bare exit code. The report goes to ~/.cc/failures/reports/<claim>.md (CC_FAILURES moves the dir)
+# llm_why), never as a bare exit code.
+# THREE STATES, AND ONLY THE FIRST IS A RESULT. A pass RAN AND FAILED (budget, turns, timeout, a model error): it
+# happened and it cost money, and it stays booked as a failed run. A pass was REFUSED OR POSTPONED by a limit (the
+# shared usage-limit stamp, or the account's monthly spend cap in the run's own JSON — see SPEND_REFUSED_RE): nothing
+# ran and nothing was spent, so it is a deferral, not a try. A pass DID NOT RUN (no handoff to carry, no
+# discriminating test). The report is written in every case, because a cluster nobody investigated has to stay
+# visible — but when nothing was investigated it opens with
+# `**Not investigated (deferred|failed):** <why> · again after <stamp>`, and cc-failures reads that line: the claim is
+# offered again at the stamp instead of reading `reported`. Nothing was investigated when the broad pass left no
+# handoff, and equally when the narrow pass — the discriminating test — was refused before it ran (i-b3fc3b8b).
+# Same vocabulary as a usage-limited review in cc-land (`attempts - 1`, stage deferred): a run that never
+# happened costs the work nothing and comes back.
+# The report goes to ~/.cc/failures/reports/<claim>.md (CC_FAILURES moves the dir)
 # and is delivered as ONE message with the file (cc-slack post --file), to the control repo's channel (CC_AUDIT_FAILURE_TO
 # names another, a test chat) — no mention, no canvas, no cc-notify, no board row: a finding cannot make work. The
 # tier is the launcher's check, not this file's: run by hand it runs.
@@ -272,18 +284,33 @@ set -f; for s in $SECRET_PATHS; do   # set -f: four entries are globs, and this 
   DENY="$DENY,Read(/$HOME/$s),Grep(/$HOME/$s)"   # matches from $R, so this file was safe by accident; cc-evals was not.
 done; set +f
 LLM_COST=0
-POSTPONED=""
+POSTPONED=""; DEFER_UNTIL=""   # the last run's deferral: why it never ran, and when it is worth trying again
+DEFER_AGAIN=3600   # a deferral whose cause names no reset (a spend cap) comes back in an hour: being refused again costs nothing
+# THE BOX'S BILLING STATE IS NOT THE MODEL FAILING THE TASK. i-b3fc3b8b's narrow pass came back {subtype: success,
+# is_error: true, result: "You've hit your monthly spend limit …"} and was written down as a failed run on
+# claude-fable-5-1. cc-limit reads a spend cap as a limit only when the message ALSO names a reset (its LIMIT_RE);
+# that one named none, so it answered "not a limit" and the refusal fell through to llm_why. The wording is cc-limit's
+# SPEND_RE, kept here because this is the only caller that has to tell a refusal from a failure after cc-limit passes.
+SPEND_REFUSED_RE='spend(ing)? limit|spend cap|monthly (spend|usage) (limit|cap)'
 dur(){ local s=${1:-0}; if [ "$s" -lt 90 ]; then printf '%ss' "$s"; else printf '%sm %ss' $((s/60)) $((s%60)); fi; }   # how long it ran, in the report: the only cost signal this mode has
-postponed(){ printf '_(postponed: %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"; POSTPONED="$2"; }   # $2 names the model too
+postponed(){   # postponed <out> <why> [until-epoch] — the pass was refused or postponed: it never ran, so it is no result
+  printf '_(postponed: %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"   # $2 names the model too
+  POSTPONED="$2"; DEFER_UNTIL=$(date -u -d "@${3:-$(( $(date +%s) + DEFER_AGAIN ))}" +%FT%TZ); }
 llm(){   # llm <out-file> <budget> <prompt> [model] — 20 min hard cap; a failed run leaves a stub and never aborts the audit
-  local out=$1 bud=$2 prompt=$3 model=${4:-claude-opus-5} j rc res p; j=$(mktemp); LLM_WHY=""   # a postponed run leaves no stale cause behind
-  if p=$("$LIMIT" status 2>/dev/null); then postponed "$out" "Claude $p"; rm -f "$j"; return 1; fi   # a limit any run on this box hit: no LLM, no retry loop — the timer comes back
+  local out=$1 bud=$2 prompt=$3 model=${4:-claude-opus-5} j rc res p mins; j=$(mktemp)
+  LLM_WHY=""; POSTPONED=""; DEFER_UNTIL=""; LLM_COST=0   # neither a postponed nor a failed run leaves the other's cause — or an earlier pass's cost — behind
+  if p=$("$LIMIT" status 2>/dev/null); then   # a limit any run on this box hit: no LLM, no retry loop — the timer comes back
+    mins=$(sed -n 's/.*(\([0-9]\{1,\}\)m left).*/\1/p' <<<"$p")   # "usage limit until HH:MMZ (37m left)": the reset, as a delta
+    postponed "$out" "Claude $p" "$(( $(date +%s) + ${mins:-60} * 60 ))"; rm -f "$j"; return 1; fi
   CC_ROLE=worker timeout 20m "$CLAUDE" -p "$prompt" --model "$model" --max-budget-usd "$bud" --max-turns 60 \
     --output-format json --setting-sources '' --strict-mcp-config --disable-slash-commands \
     --allowedTools "$ALLOW" --disallowedTools "$DENY" >"$j" 2>>"$LOG"
   rc=$?
   if p=$("$LIMIT" check "$j" 2>/dev/null); then   # hit it mid-audit: record it, postpone, leave the stamp for everyone else
-    postponed "$out" "Claude usage limit until $(date -u -d "@${p#LIMIT }" +%H:%M)Z"; rm -f "$j"; return 1; fi
+    postponed "$out" "Claude usage limit until $(date -u -d "@${p#LIMIT }" +%H:%M)Z" "${p#LIMIT }"; rm -f "$j"; return 1; fi
+  # …and the refusal cc-limit does not call a limit: a spend cap this account has hit. Refused, not run (SPEND_REFUSED_RE above).
+  if [ "$(jq -r '.is_error // false' "$j" 2>/dev/null)" = true ] && grep -qiE "$SPEND_REFUSED_RE" <<<"$(jq -r '.result // empty' "$j" 2>/dev/null)"; then
+    postponed "$out" "the account's monthly spend limit — no reset lifts it, only raising it at claude.ai/settings/usage"; rm -f "$j"; return 1; fi
   res=$(jq -r '.result // empty' "$j" 2>/dev/null); LLM_COST=$(jq -r '.total_cost_usd // 0' "$j" 2>/dev/null)
   # A RUN THAT ENDED WITHOUT A RESULT SAYS WHY, never a bare exit code: the JSON's subtype and is_error name the cause
   # (i-b3fc3b8b, 2026-09-12: the report said `rc=1` and the owner had to ask what happened). is_error true is a failed run whatever `.result` holds — that text is the error, not a report.
@@ -311,7 +338,8 @@ short(){ local s=$1; [ ${#s} -le 160 ] || { s="${s:0:160}"; s="${s% *}…"; }; p
 failure_prompt(){ sed -e "s|@BOX@|$BOX|g" -e "s|@EVIDENCE@|$EV|g" -e "s|@ID@|$FID|g" "$R/config/audit-failure-$1-prompt.md"; }
 failure_run(){
   local FDIR="${CC_FAILURES:-$HOME/.cc/failures}" packet="$EV/01-packet.md" hand="$EV/02-handoff.md" narrow="$EV/03-narrow.md"
-  local rep band test model cap bud t0 secs cost_b cost_n why_b msg kind ok=1 to="${CC_AUDIT_FAILURE_TO:-#$CTL}"
+  local rep band test model cap bud t0 secs cost_b cost_n why_b defer_b until_b msg msg_why kind ok=1 to="${CC_AUDIT_FAILURE_TO:-#$CTL}"
+  local outcome="" owhy="" oagain=""   # what the report IS, for cc-failures to read off its first line (THREE STATES, top of file)
   log "start mode=failure id=$FID dry=$dry post=$post ev=$EV"
   # the packet is the whole evidence; an id the ledger does not hold ends here, before any model runs
   if ! "$R/bin/cc-failures" packet "$FID" > "$packet" 2>"$EV/packet.err"; then
@@ -320,38 +348,58 @@ failure_run(){
   [ "$llm_on" = 1 ] || { echo "$packet"; log "done mode=failure id=$FID no-llm: the packet only"; exit 0; }   # --no-llm: the packet, no spend, no post
   # steps 1-3, the broad pass: Sonnet, the packet, a handoff a fresh context can take
   llm "$hand" "$BUD_FAIL_BROAD" "$(failure_prompt broad)" claude-sonnet-5 || ok=0
-  cost_b=${LLM_COST:-0}; why_b=$LLM_WHY
+  cost_b=${LLM_COST:-0}; why_b=$LLM_WHY; defer_b=$POSTPONED; until_b=$DEFER_UNTIL   # the BROAD pass's own state: the narrow pass overwrites all three
   band=$(sed -n 's/^BAND:[[:space:]]*\([a-z]*\).*/\1/p' "$hand" | tail -1); test=$(sed -n 's/^TEST:[[:space:]]*\([a-z]*\).*/\1/p' "$hand" | tail -1)
   # "Sonnet for a single-tool mechanism, Opus for interacting tools or concurrency, Fable for authority, security or system-level reasoning"
   case "$band" in interacting) model=claude-opus-5; cap=$CAP_STRONG ;; authority) model=claude-fable-5-1; cap=$CAP_STRONG ;; *) band=routine; model=claude-sonnet-5; cap=$CAP_ROUTINE ;; esac
-  if [ "$ok" = 0 ]; then printf '_(no narrow pass: the broad pass ended without a handoff — %s)_\n' "${why_b:-${POSTPONED:-it did not run}}" > "$narrow"; cost_n=0   # the cause, named again where the reader lands
+  if [ "$ok" = 0 ]; then
+    # THE BROAD PASS DECIDES WHAT THE REPORT IS: it is the pass that writes the content, so no handoff means nothing was
+    # investigated. Deferred — refused or postponed by a limit: nothing ran, nothing was spent, and it comes back at the
+    # reset. Failed — it ran, it cost money, and it stays a failed run; it comes back a day on, not at once, because
+    # repeating it spends again. Either way the report is still written: "the stub is a permanent gravestone for work
+    # that never happened" was the file EXISTING standing in for an investigation, not the file being there.
+    # …with a stamp ALWAYS: the marker line is what cc-failures reads, and one with an empty `again after` matches
+    # nothing there, which would put the claim back to reading `reported` — this bug, by the back door.
+    if [ -n "$defer_b" ]; then outcome=deferred; owhy=$defer_b; oagain=${until_b:-$(date -u -d "+1 hour" +%FT%TZ)}
+    else outcome=failed; owhy=${why_b:-it did not run}; oagain=$(date -u -d "+1 day" +%FT%TZ); fi
+    printf '_(no narrow pass: the broad pass ended without a handoff — %s)_\n' "$owhy" > "$narrow"; cost_n=0   # the cause, named again where the reader lands
   elif [ "$test" = none ]; then printf '_(no narrow pass: the broad pass found no discriminating test — see its ## test)_\n' > "$narrow"; cost_n=0   # "If no discriminating test exists, stop here"
   else   # step 4, the narrow pass: a fresh context, the handoff and the packet, the band's model, what the cap has left
     bud=$(awk -v c="$cap" -v b="$cost_b" 'BEGIN{r=c-b; if (r<0.10) r=0.10; printf "%.2f", r}')
     llm "$narrow" "$bud" "$(failure_prompt narrow)" "$model" || ok=0
     cost_n=${LLM_COST:-0}
+    # THE SAME BUG ONE PASS LATER (i-b3fc3b8b): the broad pass handed off and the NARROW pass was refused by the spend
+    # cap. The discriminating test never ran and nothing was spent on it, so the report is not a result either — it
+    # gets the marker and the claim comes back, with the why naming the pass, since the handoff below is real content.
+    # A narrow pass that RAN and failed is left alone: it ran, it cost money, and that is a result.
+    if [ -n "$POSTPONED" ]; then outcome=deferred; owhy="the narrow pass was refused: $POSTPONED (the broad pass handed off — its work is below)"
+      oagain=${DEFER_UNTIL:-$(date -u -d "+1 hour" +%FT%TZ)}; fi
   fi
   secs=$(( $(date +%s) - t0 ))
   rep="$FDIR/reports/$FID.md"; [ "$dry" = 1 ] && rep="$OUTDIR/$FID.md"
   mkdir -p "$(dirname "$rep")" || exit 1
-  { printf '_investigation %s · %s · band %s (%s) · Sonnet $%.2f + $%.2f · ran %s · %s_\n\n' "$FID" "$kind" "$band" "$model" "$cost_b" "$cost_n" "$(dur "$secs")" "$STAMP"
+  { [ -z "$outcome" ] || printf '**Not investigated (%s):** %s · again after %s\n\n' "$outcome" "$(printf '%s' "$owhy" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//')" "$oagain"   # cc-failures parses this line — ONE line: a model's raw text (llm_why's catch-all, short()) can carry an embedded newline, and cc-failures' NOT_INVESTIGATED regex is `\A...` with `.` not matching newline
+    printf '_investigation %s · %s · band %s (%s) · Sonnet $%.2f + $%.2f · ran %s · %s_\n\n' "$FID" "$kind" "$band" "$model" "$cost_b" "$cost_n" "$(dur "$secs")" "$STAMP"
     printf '## broad pass (claude-sonnet-5)\n\n'; cat "$hand"; printf '\n---\n\n## narrow pass (%s)\n\n' "$model"; cat "$narrow"; } > "$rep"
   # the five lines the owner reads; a report with none gets one line and the file, never nothing
   msg=$(sed -n '/^## message/,$p' "$narrow" | sed '1d' | grep -v '^[[:space:]]*$' | head -5)
-  [ -n "$msg" ] || msg="**Investigation $FID** ($kind): $( [ "$ok" = 1 ] && echo "no five-line message came back" || echo "the model run ended without a result — ${LLM_WHY:-${POSTPONED:-postponed}}" ) — the report is attached."
+  if [ -n "$outcome" ]; then msg_why="not investigated ($outcome), $( [ "$outcome" = deferred ] && echo "the pass was refused or postponed" || echo "the model run ended without a result" ) — $owhy. It is offered again after $oagain"
+  elif [ "$ok" = 1 ]; then msg_why="no five-line message came back"
+  else msg_why="the model run ended without a result — ${LLM_WHY:-${POSTPONED:-postponed}}"; fi   # the broad pass handed off; the narrow one did not answer
+  [ -n "$msg" ] || msg="**Investigation $FID** ($kind): $msg_why — the report is attached."
   if [ "$dry" = 1 ]; then cat "$rep"; else echo "$rep"; fi
   # ONE message, the file with it, where the box's reports go — and nothing else: no canvas, no cc-notify, no board row
   [ "$post" = 0 ] || cc-slack post --file "$rep" --to "$to" -m "$msg" >/dev/null 2>>"$LOG" || log "failure $FID: post to $to failed"
-  log "done mode=failure id=$FID band=$band model=$model cost=$cost_b+$cost_n secs=$secs ok=$ok test=${test:-?} out=$rep"
+  log "done mode=failure id=$FID band=$band model=$model cost=$cost_b+$cost_n secs=$secs ok=$ok outcome=${outcome:-investigated} test=${test:-?} out=$rep"
   exit 0
 }
 
 # ---- selfcheck: the wall and the scrub, the main-gate row against a real cc-board, the gates, the failure path
 # against a stub model, the pipeline check. No network, no spend, no real files ----
 selfcheck(){
-  local d n=0 f=0 out rc LOG POSTPONED
+  local d n=0 f=0 out rc LOG POSTPONED DEFER_UNTIL
   d=$(mktemp -d "${TMPDIR:-/tmp}/cc-audit-sc.XXXXXX") || return 1   # dynamically scoped above: postponed/log see these, never the box's
-  LOG="$d/audit.log"; out="$d/report.md"; POSTPONED=""
+  LOG="$d/audit.log"; out="$d/report.md"; POSTPONED=""; DEFER_UNTIL=""
   sck(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   ntf(){ if "$@"; then echo 1; else echo 0; fi; }   # tf's inverse: the assertion is that the command FAILS
   export CC_SC_ARGV="$d/argv"
@@ -479,10 +527,22 @@ selfcheck(){
 #!/bin/sh
 printf '%s\n' "$@" >> "$CC_SC_ARGV"
 p=""; n=0; for a in "$@"; do [ "$n" = 1 ] && { p=$a; n=0; }; [ "$a" = -p ] && n=1; done
+SPEND='{"type":"result","subtype":"success","is_error":true,"result":"You'"'"'ve hit your monthly spend limit · raise it at claude.ai/settings/usage","total_cost_usd":0,"num_turns":1}'
 case "$CC_SC_END" in   # how the BROAD pass ends without a result, the way `claude -p --output-format json` really does (probed 2026-09-12)
   budget) printf '{"type":"result","subtype":"error_max_budget_usd","is_error":true,"result":null,"total_cost_usd":0.44,"num_turns":9}'; exit 1;;
   turns) printf '{"type":"result","subtype":"error_max_turns","is_error":true,"result":null,"total_cost_usd":0.21,"num_turns":60}'; exit 1;;
   timeout) exit 124;;   # what `timeout 20m` leaves the caller: rc 124 and nothing on stdout
+  # AN UNLISTED SUBTYPE WITH AN EMBEDDED NEWLINE IN .result — llm_why's catch-all interpolates raw model text through
+  # short(), which truncates at 160 chars but never collapses newlines: a marker with a real \n in it broke cc-failures'
+  # one-line NOT_INVESTIGATED regex (`\A...`, `.` not matching newline) and the claim read back `reported`.
+  newline) printf '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"## pattern\\nrefusals on text","total_cost_usd":0.05,"num_turns":3}'; exit 0;;
+  # THE BOX'S BILLING STATE, verbatim from i-b3fc3b8b's narrow pass (2026-09-12): subtype success, is_error true, and
+  # the cap in .result. It names NO reset, which is why cc-limit answers "not a limit" and cc-audit has to tell it
+  # from a model that ran and failed. exit 0, like the run that really did this one.
+  spend) printf '%s' "$SPEND"; exit 0;;
+  # …and the same refusal reaching only the NARROW pass, which is what i-b3fc3b8b was: the broad pass answers
+  # normally (no arm matches here, so the prompt case below runs) and only the band's model is refused.
+  spend-narrow) case "$p" in *"You are the narrow pass"*) printf '%s' "$SPEND"; exit 0;; esac;;
 esac
 case "$p" in
   *"You are the narrow pass"*) printf '{"result":"## hypothesis\\nthe guard reads the text, not the command\\n## message\\n**Decision:** review the guard.\\nPattern: three refusals on text.\\nHypothesis: text, not command.\\nCost so far: three turns.\\nNext review: the guard selfcheck.\\n","total_cost_usd":0.30}';;
@@ -506,7 +566,11 @@ S
   sck "$(tf test -n "$newelig")" "…and the \"days ago\" stamps beside them are eligible whatever day this runs — one command, only the stamps differ"
   CC_SC_ARGV="$d/fargv"; : > "$CC_SC_ARGV"
   # off $R, not $0: line 58 already cd-ed, so a relative $0 (core/bin/cc-audit selfcheck from the repo root) no longer resolves
-  fb(){ env HOME="$fh" CC_FAILURES="$fh/.cc/failures" CC_CLAUDE="$fh/bin/claude" CC_BOARD="$fh/bin/cc-board" CC_AUDIT_FAILURE_TO='#sc-test' "$@" "$R/bin/cc-audit" failure "$cl"; }
+  # CC_LIMIT_STAMP is pinned at the fixture's own: cc-limit reads that hook ahead of $HOME, and selftest.sh exports one
+  # of its own for the whole suite ("a test limit must never make a real loop wait"). Without it here, the usage-limit
+  # case below wrote a stamp nothing read — green alone and red under the suite — and every other case ran against
+  # whatever limit the caller's stamp happened to hold.
+  fb(){ env HOME="$fh" CC_FAILURES="$fh/.cc/failures" CC_CLAUDE="$fh/bin/claude" CC_BOARD="$fh/bin/cc-board" CC_LIMIT_STAMP="$fh/.cc/state/claude-limit" CC_AUDIT_FAILURE_TO='#sc-test' "$@" "$R/bin/cc-audit" failure "$cl"; }
   out=$(fb 2>&1); rc=$?
   sck "$(tf test "$rc" = 0)" "failure: runs end to end against the stub model — rc 0, the report path on stdout"
   sck "$(tf test -s "$fh/.cc/failures/reports/$cl.md")" "failure: ONE report, at ~/.cc/failures/reports/<claim>.md, and show says reported"
@@ -541,13 +605,58 @@ S
   sck "$(tf grep -q 'model run ended without a result — budget ran out: \$0\.44' "$fh/slack.log")" "…the one message carries it too"
   sck "$(tf grep -q 'llm .*02-handoff.md failed: budget ran out: \$0\.44 .* subtype error_max_budget_usd' "$flog")" "…and so does audit.log"
   sck "$(ntf grep -Eq 'rc=1\b' "$frep" "$fh/slack.log")" "…no bare exit code anywhere a reason belongs"
-  sck "$(tf grep -q 'Sonnet \$0\.44 + \$0\.00' "$frep")" "…the first line still says what it cost"
+  sck "$(tf grep -q 'Sonnet \$0\.44 + \$0\.00' "$frep")" "…the report says what it cost"
+  # A GENUINE MODEL FAILURE STAYS A FAILED RUN. The pass ran, spent $0.44 and died on the cap: that is a result, and
+  # telling a postponement from a failure must not turn it into one — `failed`, never `deferred`, in the report and in
+  # what cc-failures reads off it. It comes back a day on, not at once: repeating it spends the cap again.
+  sck "$(tf grep -qE '^\*\*Not investigated \(failed\):\*\* budget ran out: \$0\.44 .*· again after [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$frep")" "failure: a broad pass that ran and failed opens the report as failed, with the cause and when it comes back"
+  sck "$(tf grep -q "$cl failed" <<<"$(CC_FAILURES="$fh/.cc/failures" "$F" show --scope sc)")" "…and cc-failures says failed, not reported: rc=1 is no longer a gravestone for a cluster nobody investigated"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
+  # A NEWLINE IN THE MODEL'S OWN TEXT MUST NOT BREAK THE ONE-LINE MARKER (the exact shape of the motivating incident,
+  # i-b3fc3b8b: subtype error_during_execution, is_error true, an embedded \n in .result). cc-failures' NOT_INVESTIGATED
+  # regex is `\A...` with `.` not matching newline, so a marker split across two lines matches nothing and the claim
+  # reads back `reported` — the gravestone this PR exists to remove.
+  out=$(fb CC_SC_END=newline 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 1 && test -s "$frep")" "failure: an unlisted-subtype broad-pass error still ends in a report, rc 0, and no narrow pass is bought on a missing handoff"
+  sck "$(tf grep -qE '^\*\*Not investigated \(failed\):\*\* subtype error_during_execution.*· again after [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<<"$(head -1 "$frep")")" "failure: a newline embedded in the model's own text is collapsed — the marker stays ONE line, whatever the model's raw text does"
+  sck "$(tf grep -q "$cl failed" <<<"$(CC_FAILURES="$fh/.cc/failures" "$F" show --scope sc)")" "…so cc-failures still reads failed, not reported — a two-line marker matches nothing there"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
   out=$(fb CC_SC_END=turns 2>&1)
   sck "$(tf grep -q 'audit run failed: turns ran out: 60 turns, \$0\.21 spent (claude-sonnet-5, subtype error_max_turns)' "$frep" && grep -q 'failed: turns ran out' "$flog")" "failure: a turn-capped broad pass names that (error_max_turns), report and log"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
   out=$(fb CC_SC_END=timeout 2>&1)
   sck "$(tf grep -q 'audit run failed: timed out: the 20 min cap fell before claude-sonnet-5 answered (rc=124, no result JSON)' "$frep" && grep -q 'failed: timed out' "$flog" && ! grep -q 'no narrow pass: the broad pass did not run' "$frep")" "failure: a timed-out broad pass names the cap, not a bare rc"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
+  # A PASS THAT NEVER RAN IS NOT A PASS THAT RAN AND FAILED (raised-a-postponed-investigation-counts-as-reported).
+  # BOTH PASSES POSTPONED, on its own fixture: a live shared stamp two runs have hit, which is what makes cc-limit
+  # answer `status` for every caller. llm() postpones before it spends, so no model is launched and the report that is
+  # written must say it stands for nothing — it used to be indistinguishable from one an investigation wrote.
+  mkdir -p "$fh/.cc/state"
+  printf '%s\tbackoff:30\t%s\tsonnet\taaaaaaaa,bbbbbbbb\n' "$(( $(date +%s) + 1800 ))" "$(date +%s)" > "$fh/.cc/state/claude-limit"
+  out=$(fb 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0 && test ! -s "$CC_SC_ARGV" && test -s "$frep")" "failure: both passes postponed on a usage limit — no model is launched at all, and a report is still written"
+  sck "$(tf grep -qE '^\*\*Not investigated \(deferred\):\*\* Claude usage limit until [0-9]{2}:[0-9]{2}Z.*· again after [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$frep")" "…its first line is the deferral: why it never ran, and when it comes back"
+  sck "$(tf grep -q "$cl deferred" <<<"$(CC_FAILURES="$fh/.cc/failures" "$F" show --scope sc)")" "…so cc-failures says deferred, not reported — the cluster is offered again instead of counting as investigated"
+  sck "$(ntf grep -q 'audit run failed' "$frep")" "…and nothing in it is booked as a run that failed"
+  rm -f "$fh/.cc/state/claude-limit"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
+  # THE MONTHLY SPEND LIMIT IS THE BOX'S BILLING STATE (raised-monthly-spend-limit-reads-as-a-failed-run, i-b3fc3b8b):
+  # the run reached the API and was refused, is_error true with the cap in .result and no reset for cc-limit to read.
+  out=$(fb CC_SC_END=spend 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 1 && test -s "$frep")" "failure: a spend-limit refusal ends in a report, rc 0, and no narrow pass is bought on a refusal"
+  sck "$(tf grep -qF "**Not investigated (deferred):** the account's monthly spend limit" "$frep")" "…the report calls it a refusal, not claude-sonnet-5 failing the task"
+  sck "$(ntf grep -qE 'audit run failed|subtype success' "$frep")" "…so is_error beside a spend cap is no longer a failed model run"
+  sck "$(tf grep -q 'llm .*02-handoff.md postponed: the account' "$flog")" "…and audit.log says postponed, where the ledger of what this box ran is read"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
+  # THE SAME REFUSAL ONE PASS LATER, which is i-b3fc3b8b itself: the broad pass hands off and the NARROW pass, on the
+  # band's model, is refused by the cap. The broad pass's work is real and stays in the report — but the discriminating
+  # test never ran, so the report is not a result and the claim has to come back.
+  out=$(fb CC_SC_END=spend-narrow 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 2 && test -s "$frep")" "failure: a narrow pass refused by the spend cap — both passes were launched, and a report is still written"
+  sck "$(tf grep -qE '^\*\*Not investigated \(deferred\):\*\* the narrow pass was refused: the account.*· again after [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$frep")" "…the report opens as deferred and names the pass that was refused, not the model failing the task"
+  sck "$(tf grep -q "$cl deferred" <<<"$(CC_FAILURES="$fh/.cc/failures" "$F" show --scope sc)")" "…so cc-failures says deferred, not reported: a test that never ran leaves the cluster to come back"
+  sck "$(tf grep -q 'refusals on text' "$frep")" "…and the broad pass's handoff is still in the report: a deferral throws no work away"
+  sck "$(tf grep -q 'not investigated (deferred), the pass was refused or postponed' "$fh/slack.log")" "…and the one message says so in the same words, not that a model run ended without a result"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
   out=$(fb CC_SC_TEST=none 2>&1); rc=$?
   sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 1)" "failure: TEST: none — no discriminating test, so no narrow pass: one model context, not two"
