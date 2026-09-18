@@ -1592,6 +1592,32 @@ SH
   k "$(grep -q 'pangolin rebase' <<<"$o" && grep -q 'OUTCOME answered' <<<"$o" && ! grep -q 're-read' <<<"$o" && ! grep -q 'hook-misses' <<<"$o" && echo 0 || echo 1)" \
     "…so cc-lib ask finds it with nothing to re-read, and the misses log the sweep repaired is cleared" "$o"
   k "$([ -e "$LH/.cc/library/owner/misses.log" ] && echo 1 || echo 0)" "…the misses log itself being gone" "$(cat "$LH/.cc/library/owner/misses.log" 2>/dev/null)"
+  # ── the hand-off nudge: past the line a session is told to journal, once, whatever kind of session it is ────────
+  # The REAL cc-context beside the copy under test (a link into the checkout is what the scratch-bin rule forbids),
+  # measuring fixture transcripts of its own. $bin/cc-config answers nothing, so the line cc-context reads is its
+  # built-in 150k default and never this box's ~/.cc/config, and CC_CTX_WINDOW settles the window without a fork.
+  cp "$REALBIN/cc-context" "$bin/cc-context"; chmod +x "$bin/cc-context"
+  tx(){ printf '{"type":"assistant","isSidechain":false,"message":{"model":"m","usage":{"input_tokens":%s,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":10}}}\n' "$2" > "$T/$1.jsonl"; }
+  pay(){ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s","stop_hook_active":%s}' "$1" "$T/$1.jsonl" "${2:-$T}" "${3:-false}"; }
+  stophook(){ ( cd "${2:-$T}" && env CC_CTX_WINDOW=200000 CC_CTX_BOX_MODEL= CC_STATUSLINE_DIR="$T/nostatusline" \
+      CC_CHECKPOINT_NUDGE_MIN="${NUDGE_MIN:-60}" "$bin/cc-checkpoint" 2>/dev/null <<<"$1" ); }
+  tx big 160000; tx small 20000; tx held 160000; tx tracked 170000
+  out=$(stophook "$(pay big)")
+  k "$(grep -qF '"decision": "block"' <<<"$out" && grep -qF 'Append a dated entry' <<<"$out" && [ "$(grep -c . <<<"$out")" = 1 ] && echo 0 || echo 1)" \
+    "nudge: a session past the hand-off line is told, in ONE Stop line, to append a dated journal entry" "$out"
+  eq "…carrying the measurement cc-context made of that session's transcript" "$(grep -c '80%  160k/200k' <<<"$out")" 1
+  out=$(stophook "$(pay big)")
+  k "$([ -z "$out" ] && echo 0 || echo 1)" "…and not again next turn: a session that journalled a moment ago is not told twice" "$out"
+  NUDGE_MIN=0; out=$(stophook "$(pay big)"); NUDGE_MIN=60
+  k "$(grep -qF '"decision": "block"' <<<"$out" && echo 0 || echo 1)" "…until the cooldown is up (CC_CHECKPOINT_NUDGE_MIN), which is a cooldown and not a once-ever" "$out"
+  out=$(stophook "$(pay small)")
+  k "$([ -z "$out" ] && echo 0 || echo 1)" "nudge: a session under the line is told nothing at all" "$out"
+  out=$(stophook "$(pay held "" true)")
+  k "$([ -z "$out" ] && echo 0 || echo 1)" "nudge: nothing while a Stop hook already holds this turn open — blocking again there is a block-loop" "$out"
+  d=$(mkproj nudgews/nudgetrack); echo nudged > "$d/work.txt"
+  out=$(stophook "$(pay tracked "$d")" "$d")
+  k "$(grep -qF '"decision": "block"' <<<"$out" && git -C "$d" log -1 --format=%s | grep -q '^wip: checkpoint' && echo 0 || echo 1)" \
+    "nudge: a track is told too, and its work is committed FIRST — the session is asked to journal after the commit" "$out"
   echo "cc-checkpoint selfcheck: $((n - f)) passed, $f failed"; [ "$f" = 0 ]
 }
 [ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
@@ -1777,9 +1803,38 @@ if [ "$MODE" != commit ]; then   # push only: no payload to read, no commit, and
   [ "$rc" = 0 ] || tail -3 "$ST/push.err" >&2
   exit "$rc"
 fi
-# The hook's JSON payload on stdin is drained and not read: nothing here measures a context any more (the
-# harness reports it; cc-context is what a session asks), and a hook that leaves the pipe unread can stall the writer.
-[ "$STRICT" = 1 ] || [ -t 0 ] || timeout 5 cat >/dev/null
+# ── the hand-off nudge ───────────────────────────────────────────────────────────────────────────
+# A session past the hand-off line is told, once, to write its journal entry. That is the whole of it: #501 cut
+# the relay that used to do this, and these lines are what it was carrying. A session that dies unjournalled is
+# what makes the next handover expensive, and neither seat that crossed the line on 2026-09-16 would have
+# journalled unprompted mid-task. The Stop payload's transcript_path is the only handle a hook has on how full
+# this session is; cc-context --over sizes it against CC_CONTEXT_HANDOFF_TOKENS and prints the measurement, so
+# nothing here measures, records or decides anything of its own.
+# SAID AT MOST ONCE AN HOUR PER SESSION (CC_CHECKPOINT_NUDGE_MIN). A session told again minutes after it wrote a
+# full entry writes a two-line addendum, which is worse than silence; a session that ignored the first line is
+# still past the line an hour later. The stamp is one empty file per session, pruned when the next one is written.
+# And never while the harness says a Stop hook is already holding this turn open (stop_hook_active): blocking
+# again there is what a block-loop looks like from in here.
+journal_nudge(){   # $1 the Stop payload.  One Stop decision on stdout, or nothing at all. Never fatal, never blocks.
+  local tp sid stamp last m
+  case "${1//[[:space:]]/}" in *'"stop_hook_active":true'*) return 0;; esac   # whitespace out: one pattern, either spelling
+  tp=$(printf '%s' "$1" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$tp" ] && [ -f "$tp" ] || return 0
+  sid=${tp##*/}; stamp="$HOME/.cc/state/checkpoint/nudged/${sid%.jsonl}"   # a transcript is named for its session
+  last=$(stat -c %Y "$stamp" 2>/dev/null) || last=0   # not `find -newermt`: only GNU find reads a relative time
+  [ $(( $(printf '%(%s)T' -1) - ${last:-0} )) -ge $(( ${CC_CHECKPOINT_NUDGE_MIN:-60} * 60 )) ] || return 0
+  m=$(timeout 20 "$BIN/cc-context" --transcript "$tp" --over 2>/dev/null) || return 0   # rc 1 under the line, 2 unmeasurable
+  mkdir -p "${stamp%/*}" 2>/dev/null && : > "$stamp" 2>/dev/null
+  find "${stamp%/*}" -type f -mtime +7 -delete 2>/dev/null
+  m=${m//[\"\\]/}   # the reason below is JSON on one line, and the measurement goes inside it as plain text
+  printf '%s\n' "{\"decision\": \"block\", \"reason\": \"CONTEXT $m. Append a dated entry to this session's journal now, before this turn ends: what is done, what is next in order, the gotchas. A track journals to ~/.cc/state/<repo>/<track>/progress.md, any other session to ~/.cc/state/<repo>/<alias-or-planning>-handoff.md. Write it from what you already know, then carry on. A fresh session starts from that file and from nothing else.\"}"
+}
+# The hook's JSON payload (verified fields: session_id, transcript_path, cwd, stop_hook_active, …) — read before
+# anything can exit, capped, and never fatal: the pipe must be drained whatever happens (a hook that leaves it
+# unread can stall the writer), and asking how full a context is must not cost a session its commit. What comes
+# back is relayed AFTER the commit below, so the work is on the branch before the turn is interrupted.
+[ "$STRICT" = 1 ] || [ -t 0 ] || payload=$(timeout 5 cat)
+[ -n "${payload:-}" ] && say=$(journal_nudge "$payload")
 # INDEX-AT-WRITE for the knowledge library (cc-lib): the journal this turn appended to (~/.cc/state) and the memory
 # file it saved (~/.claude/projects) are searchable a minute later, not at the next sweep. Every session, track or
 # not, on the hook alone — never `--commit`, and never inside a member's boundary (a member reads its workspace's
@@ -1791,6 +1846,9 @@ fi
 # found by `cc-lib ask` — it rewrites nothing when nothing changed, so a running session's cached prompt is not moved.
 [ "$STRICT" = 1 ] || [ -n "${CC_MEMBER_SANDBOX:-}" ] || [ ! -x "$BIN/cc-lib" ] || timeout 20 "$BIN/cc-lib" memory >/dev/null 2>&1 || true
 [ "$STRICT" = 1 ] || [ -n "${CC_MEMBER_SANDBOX:-}" ] || [ ! -x "$BIN/cc-lib" ] || timeout 20 "$BIN/cc-lib" index --touch "$HOME/.cc/state" "$HOME/.claude/projects" >/dev/null 2>&1 || true
+exec 8>&1   # the hook's real stdout: every exit below is inside a block that discards stdout, the relay is not
+relay(){ [ -n "${say:-}" ] && printf '%s\n' "$say" >&8; return 0; }
+trap relay EXIT   # on EVERY exit, including a session with no track at all, which leaves before the commit block
 commit_end(){   # The hook stays nonblocking. Completion requires observable, clean committed work.
   [ "$STRICT" = 1 ] || exit 0
   local dirty

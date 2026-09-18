@@ -573,7 +573,7 @@ hsl=~/.claude/projects/$(readlink -f ~/.cc/worktrees/$REPO/w1 | tr '/.' '-'); mk
 "$B/cc-context" --all 2>/dev/null | grep -q "^$REPO	w1	10	20010	200000	transcript	[0-9]*	-	-$" \
   && ok "a track with no status-line file is still listed, off its transcript" || bad "--all fallback: $("$B/cc-context" --all 2>&1 | grep "	w1	")"
 rm -rf "$hsl"
-# the Stop hook: it commits, and answers nothing — no context decision rides on it any more
+# the Stop hook: UNDER the hand-off line it commits and answers nothing
 echo ctx > ~/.cc/worktrees/$REPO/w1/ctx.txt
 d0=$(printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 \
   | ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" ))
@@ -582,6 +582,16 @@ d0=$(printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' "$sid" "$PD/
 echo more > ~/.cc/worktrees/$REPO/w1/ctx2.txt
 ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" </dev/null )   # no payload (run by hand): still commits
 [ -z "$(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)" ] && ok "the hook still commits when it is given no payload" || bad "checkpoint broke without a Stop payload"
+# …and PAST the line it says one thing: write the journal entry. The commit first, the ask after — so the work is
+# on the branch before the turn is interrupted. On the real cc-context, measuring a transcript of 180k.
+echo ctx3 > ~/.cc/worktrees/$REPO/w1/ctx3.txt
+printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":179000,"output_tokens":5}}}\n' > "$PD/$sid-full.jsonl"
+d1=$(printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' "$sid-full" "$PD/$sid-full.jsonl" ~/.cc/worktrees/$REPO/w1 \
+  | ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" ))
+{ grep -q '"decision": "block"' <<<"$d1" && grep -q 'Append a dated entry' <<<"$d1" \
+  && [ -z "$(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)" ]; } \
+  && ok "past the hand-off line the hook commits and THEN asks the session for its journal entry" || bad "past the line the hook said: [$d1] / dirty: $(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)"
+rm -f "$PD/$sid-full.jsonl"
 fi
 if stanza "cc-brief (the shape of a brief, checked at the door instead of remembered)"; then
 chk cc-brief
