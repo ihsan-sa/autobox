@@ -3,15 +3,21 @@
 
 WHY. Spend was only ever visible per run (`runs/*.json`) or per session (`/cost`), so a worker left looping in a
 worktree nobody had a window on burned usage invisibly. This reads the one thing that records every call — the
-transcripts under ~/.claude/projects — so it needs no model, no network and no cooperation from what it measures.
+transcripts under ~/.claude/projects and, for a member workspace, under ~/.cc/members/<handle>/claude/projects
+(cc-sandbox binds that dir as ~/.claude inside the boundary, so a member's own sessions never land under the
+host's ~/.claude at all) — so it needs no model, no network and no cooperation from what it measures.
 
-THE TICK (`cc-spend tick`, every 5 min from cc-spend.timer). Every *.jsonl under ~/.claude/projects, at any depth
-— a subagent writes its own, one level deeper under <session>/subagents/, carrying the parent's sessionId. Each
-transcript is read only from the byte offset the last tick left in ~/.cc/state/spend/offsets.json, keyed by full
-path; a file that shrank or whose inode changed is re-read from 0, one that vanished is forgotten. Assistant
-records fold to one row per (session, model, UTC day), appended to ~/.cc/state/spend/<YYYY-MM-DD>.tsv, the day
-in the name being UTC's. Rows are dated by the RECORD's timestamp, not the tick's, so the first tick backfills
-every day this box already has instead of piling months of history onto today.
+THE TICK (`cc-spend tick`, every 5 min from cc-spend.timer). Every *.jsonl under ~/.claude/projects AND under each
+~/.cc/members/<handle>/claude/projects this box currently has (globbed fresh each tick, so a member workspace
+gained or dropped needs no edit here), at any depth — a subagent writes its own, one level deeper under
+<session>/subagents/, carrying the parent's sessionId. A member's cwd is the HOST's own path (cc-sandbox mirrors
+the layout, not a container-private one), so place() already attributes a member row to that handle exactly as
+it would a repo's — no separate accounting. Each transcript is read only from the byte offset the last tick left
+in ~/.cc/state/spend/offsets.json, keyed by full path; a file that shrank or whose inode changed is re-read from
+0, one that vanished is forgotten. Assistant records fold to one row per (session, model, UTC day), appended to
+~/.cc/state/spend/<YYYY-MM-DD>.tsv, the day in the name being UTC's — one ledger, a member's rows beside
+everyone else's. Rows are dated by the RECORD's timestamp, not the tick's, so the first tick backfills every day
+this box already has instead of piling months of history onto today.
 
 THE ONE TRAP. A single API response is written as MANY assistant records — one per content block, 15 seen on a
 long turn — and every one carries the FULL usage. Summing records triples the bill. Rows dedupe on requestId, and
@@ -88,6 +94,7 @@ from zoneinfo import ZoneInfo
 
 H = os.path.expanduser("~")
 PROJ = os.path.join(H, ".claude", "projects")
+MEMBERS = os.path.join(H, ".cc", "members")
 ST = os.path.join(H, ".cc", "state", "spend")
 OFF = os.path.join(ST, "offsets.json")
 PROCS = os.path.join(ST, "procs.tsv")
@@ -397,10 +404,19 @@ def read_rows(days):
 
 # ---------------------------------------------------------------- the tick
 
-def is_session_transcript(path):
-    """True for a session's own <project>/<session>.jsonl, false for a subagent's, which sits one level
-    deeper under <session>/subagents/."""
-    return os.path.dirname(os.path.dirname(path)) == PROJ
+def is_session_transcript(path, root=PROJ):
+    """True for a session's own <project>/<session>.jsonl under the given root, false for a subagent's,
+    which sits one level deeper under <session>/subagents/. `root` is PROJ for the host and a member's
+    own ~/.cc/members/<handle>/claude/projects for a member workspace — same shape, different root."""
+    return os.path.dirname(os.path.dirname(path)) == root
+
+
+def member_roots():
+    """Every member workspace's own transcript root, globbed fresh each tick. cc-sandbox binds
+    ~/.cc/members/<handle>/claude as ~/.claude inside the boundary, so a member's sessions never write
+    under the host's PROJ at all — a workspace gained or dropped needs no edit here, just a glob that
+    sees it (or stops seeing it) on the next tick."""
+    return sorted(p for p in glob.glob(os.path.join(MEMBERS, "*", "claude", "projects")) if os.path.isdir(p))
 
 
 def scan_file(path, prev, seen_rids=None, sub_rids=None):
@@ -547,12 +563,16 @@ def tick():
     # a sidechain copy the parent writes later — and subagent files are walked before session transcripts below
     # so a same-tick pair is caught too. Pruned below once a session's subagents/ files are gone from the walk:
     # kept forever this would be hundreds of thousands of pairs, most of them sessions long done.
-    paths = sorted(glob.glob(os.path.join(PROJ, "**", "*.jsonl"), recursive=True),
-                   key=lambda p: (is_session_transcript(p), p))
+    # A member workspace writes to its OWN root, ~/.cc/members/<handle>/claude/projects, never to PROJ — the two
+    # never overlap, so each root is walked and scored the same way, just against its own root when telling a
+    # session transcript from a subagent's.
+    roots = [PROJ] + member_roots()
+    paths = sorted(((root, p) for root in roots for p in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)),
+                   key=lambda rp: (is_session_transcript(rp[1], rp[0]), rp[1]))
     live_sub_sessions = set()                  # sessions this walk still finds a subagents/ file under
-    for path in paths:
+    for root, path in paths:
         seen_files.add(path)
-        is_parent = is_session_transcript(path)
+        is_parent = is_session_transcript(path, root)
         try:
             agg, state, rids = scan_file(path, files.get(path) or {}, seen_rids,
                                          sub_rids=sub_rids if is_parent else None)
@@ -1690,6 +1710,55 @@ def selfcheck():
                "otherdayrepo" not in by_track.stdout)
         finally:
             shutil.rmtree(th7, ignore_errors=True)
+        # A MEMBER WORKSPACE writes to its OWN root, ~/.cc/members/<handle>/claude/projects — cc-sandbox binds
+        # that dir as ~/.claude INSIDE the boundary, so nothing of it ever lands under the host's PROJ. Before
+        # this fix a tick that walked PROJ alone never saw these transcripts at all: a fixture with one host
+        # project and one member project proves the tick now reads both from one walk, and that the member's
+        # row is attributed to the member's own handle (place()'s cwd-based classification needs no help — a
+        # member's recorded cwd is the HOST's own absolute path, cc-sandbox mirrors the layout, not a
+        # container-private one).
+        th9 = tempfile.mkdtemp(prefix="ccspend-mem-")
+        try:
+            host_proj = os.path.join(th9, ".claude", "projects", "-host-proj")
+            os.makedirs(host_proj)
+            cwd_host = os.path.join(th9, "dev", "hostrepo")
+
+            mem_proj = os.path.join(th9, ".cc", "members", "acme", "claude", "projects", "-mem-proj")
+            os.makedirs(mem_proj)
+            cwd_mem = os.path.join(th9, "dev", "acme")             # a member's own workspace: ~/dev/<handle>
+            os.makedirs(os.path.join(cwd_mem, ".cc"))
+            open(os.path.join(cwd_mem, ".cc", "member-workspace"), "w").write("{}")
+
+            ts9 = iso(now())
+
+            def rec9(rid, sid, cwdv):
+                return json.dumps({"type": "assistant", "requestId": rid, "timestamp": ts9,
+                                   "cwd": cwdv, "sessionId": sid, "entrypoint": "sdk-cli",
+                                   "message": {"model": "claude-opus-5", "id": "m_" + rid,
+                                               "usage": {"input_tokens": 100, "output_tokens": 10,
+                                                         "cache_read_input_tokens": 1000,
+                                                         "cache_creation_input_tokens": 0}}}) + "\n"
+
+            open(os.path.join(host_proj, "shost.jsonl"), "w").write(rec9("req_host", "shost", cwd_host))
+            open(os.path.join(mem_proj, "smem.jsonl"), "w").write(rec9("req_mem", "smem", cwd_mem))
+            env9 = {**os.environ, "HOME": th9}
+            r9 = subprocess.run([sys.executable, me, "tick"], env=env9, capture_output=True, text=True)
+            rows9 = {r[1]: r for r in
+                     (ln.split("\t") for ln in open(os.path.join(th9, ".cc", "state", "spend", f"{ts9[:10]}.tsv"))
+                      if not ln.startswith("#"))}
+            ok("a tick counts a member workspace's transcript beside the host's, from one walk",
+               r9.returncode == 0 and set(rows9) == {"shost", "smem"})
+            mem9, host9 = rows9.get("smem"), rows9.get("shost")
+            ok("…the member row is attributed to the member's own handle, on its own `member` track — a "
+               "per-workspace figure that used to not exist at all",
+               mem9 is not None and mem9[3] == "acme" and mem9[4] == "member"
+               and host9 is not None and host9[3] == "hostrepo" and host9[4] == "session")
+            by_repo9 = subprocess.run([sys.executable, me, "--by", "repo"], env=env9,
+                                      capture_output=True, text=True).stdout
+            ok("`--by repo` names the member handle as its own line",
+               "acme" in by_repo9 and "hostrepo" in by_repo9)
+        finally:
+            shutil.rmtree(th9, ignore_errors=True)
         ok("`phantoms` before any tick says so and exits 1 rather than printing an empty all-clear",
            subprocess.run([sys.executable, me, "phantoms"],
                           env={**os.environ, "HOME": tempfile.mkdtemp(prefix="ccspend-empty-")},
