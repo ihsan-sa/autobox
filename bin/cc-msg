@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # cc-msg — the ONE deliverer of a message into a running interactive Claude session (tmux window), as if you
-# were at the keyboard.  A message handed to it is NEVER DROPPED: it is typed, or it is spooled and typed by
+# were at the keyboard.  A message handed to it is NEVER DROPPED: it is typed and its Enter is seen to take (the
+# input box is read back, and pressed again while the text still sits in it), or it is spooled and typed by
 # the next drain.  (2026-09-01: 12 panes sat on a model-limit prompt, and every pulse tick and secretary
 # finding aimed at them was refused and thrown away — nobody was watching, and nothing said so.)  …or the pane
 # it was typed at never moved, which means nothing under it is reading the keyboard: the message is kept, and a
@@ -14,7 +15,9 @@
 #                               know is reported (dialog_seen), never guessed at.
 #                               Each press is a line in ~/.cc/state/sweep.log. (2026-09-10: six paused sessions
 #                               sat on 'Switch to Fable 5.1?' for hours — nothing was delivered to them, so nothing
-#                               ever read the table at them.)
+#                               ever read the table at them.) Behind every MEMBER window it also reads the
+#                               workspace's credential file: one gone blank under a running session is said once
+#                               to #<handle> and the owner (member_signed_out).
 #   cc-msg selfcheck
 # Prints "queued" (rc 0) when the text went to the spool, nothing when it was typed.
 # The spool collapses only a RETRY — the same sender's same text inside $CC_MSG_DEDUP_S (120 s); the same words
@@ -29,6 +32,8 @@ STAND_MIN="${CC_MSG_STAND_MIN:-10}"          # how long an unknown dialog may st
 ASK_SETTLE="${CC_MSG_ASK_SETTLE:-1}"         # --ask: seconds between two reads of the pane while it draws its answer
 ASK_TRIES="${CC_MSG_ASK_TRIES:-6}"           # --ask: how many of those before it prints whatever is there
 KEY_WAIT="${CC_MSG_KEY_WAIT:-0.3}"           # between the text and its Enter (Enter is swallowed otherwise)
+SUBMIT_WAIT="${CC_MSG_SUBMIT_WAIT:-1}"       # after the Enter, before the input box is read back to see it went
+SUBMIT_TRIES="${CC_MSG_SUBMIT_TRIES:-3}"     # more Enters while the text still sits there, one SUBMIT_WAIT apart
 DIALOG_WAIT="${CC_MSG_DIALOG_WAIT:-1.5}"     # after answering a known-safe prompt, before reading the pane again
 MAX_DRAIN="${CC_MSG_MAX_DRAIN:-20}"          # messages per window per drain: a tick must stay cheap
 DEDUP_S="${CC_MSG_DEDUP_S:-120}"             # a caller repeating ITS OWN line inside this many seconds is retrying,
@@ -154,8 +159,31 @@ live_claude(){   # $1 = window id
 # take its first line as a whole turn and types the rest into the next one (cc-handoff:759 joins its relay line for
 # exactly this reason, and Slack hands us multi-line text). Only the keystrokes are flattened: the spool keeps the
 # message whole, so whoever reads the queue still sees what was sent.
-type_at(){ local text; text=$(printf '%s' "$2" | tr '\n' ' ')
-           tmux send-keys -t "$1" -l -- "$text"; sleep "$KEY_WAIT"; tmux send-keys -t "$1" Enter; }  # two calls
+# AND THE ENTER IS READ BACK, NOT TRUSTED. 2026-09-12, twice, in a member workspace session (claude under bwrap,
+# slower to read its tty): the text was on the pane, in the input box, and the Enter KEY_WAIT behind it was taken
+# as part of the paste — the prompt sat unsent, this script printed nothing and exited 0, and a bare Enter 14 s
+# later submitted it. The key is not the difference (Enter and C-m both deliver \r under tmux 3.6, probed in every
+# keyboard mode); the timing is. So after the Enter the input box is read: while it still holds the head of the
+# text — or the '[Pasted text …]' the TUI folds a long paste into — Enter is pressed again, SUBMIT_TRIES times,
+# SUBMIT_WAIT apart. Returns 1 when the text is still sitting there after the last one.
+type_at(){ local text i=0; text=$(printf '%s' "$2" | tr '\n' ' ')
+           tmux send-keys -t "$1" -l -- "$text"; sleep "$KEY_WAIT"; tmux send-keys -t "$1" Enter    # two calls
+           while :; do
+             sleep "$SUBMIT_WAIT"; unsent "$1" "$text" || return 0
+             i=$((i + 1)); [ "$i" -le "$SUBMIT_TRIES" ] || return 1
+             tmux send-keys -t "$1" Enter
+           done; }
+
+unsent(){   # $1 window id  $2 the text as typed → 0 while the input box still holds it. The box is the LOWEST line
+            # on the pane that opens with the prompt char — '❯', or '>' inside the '│' frame older builds draw — the
+            # transcript's echo of a sent turn ('> text') is always above it, and an empty box is '❯ ' alone.
+  local head line
+  head=$(printf '%s' "$2" | sed 's/^[[:space:]]*//'); head=${head:0:24}   # the first line of a wrapped box
+  [ -n "$head" ] || return 1
+  line=$(tmux capture-pane -p -t "$1" 2>/dev/null | grep -e '^[[:space:]│]*❯' -e '^[[:space:]│]*>' | tail -1)
+  case "$line" in *"$head"*|*'[Pasted text'*) return 0;; esac
+  return 1
+}
 
 # ── the spool ────────────────────────────────────────────────────────────────────────────────────────────────
 # ~/.cc/state/<repo>[/<track>]/inbox.spool — append-only, one JSON object a line {at, from, text}, oldest first.
@@ -432,14 +460,19 @@ free_pane(){  # $1 window  $2 window id → 0 when the pane will take keys now; 
 spool_pop(){ tail -n +2 "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }   # the head line is gone; under the lock
 
 drain_window(){   # $1 window — deliver the spool in order while the pane stays free; keeps what it cannot deliver
-  local sp id n=0 line text was
-  sp="$(sdir "$1")/inbox.spool"; [ -s "$sp" ] || return 0
+  local sp satf id n=0 line text was sat
+  sp="$(sdir "$1")/inbox.spool"; satf="$(sdir "$1")/inbox.sat"; [ -s "$sp" ] || return 0
   id=$(win_id "$1"); [ -n "$id" ] || { orphan_seen "$1"; return 0; }   # gone or not up yet: the spool waits, but not silently forever
   live_claude "$id" || return 0
   ( flock -w 10 9 || exit 1
     while [ "$n" -lt "$MAX_DRAIN" ] && [ -s "$sp" ]; do
       hung_frozen "$1" "$id" && break     # a pane already known to take no keys, and still frozen: not one more key
       free_pane "$1" "$id" || break
+      # A MESSAGE LEFT SITTING IN THE BOX HOLDS EVERY LATER DRAIN TOO, not just the one that saw it: free_pane calls a
+      # pane with text in its box free, and unsent() looks for the NEW text's head, so the next tick would type behind
+      # the stuck one and pop it as sent (review-489). inbox.sat keeps the text that sat; while the box still holds
+      # it nothing is typed and nothing more is said (the one notice below already did). Once it is gone, so is the stamp.
+      if [ -s "$satf" ]; then unsent "$id" "$(cat "$satf")" && break; rm -f "$satf"; fi
       line=$(head -1 "$sp")
       # A LINE THAT IS NOT A MESSAGE IS DROPPED, NOT WAITED ON. Stopping at it (the rule until review-157e) left it
       # at the head for every later tick: nothing behind it was ever typed, and nothing said so — the window exists
@@ -466,9 +499,19 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
       # A MESSAGE TYPED AT A PANE THAT DOES NOT MOVE WAS NOT TAKEN: keep it at the head, restart the session, and
       # let the drain after the restart deliver it.
       was=$(tmux capture-pane -p -t "$id" 2>/dev/null)
-      type_at "$id" "$text"
+      type_at "$id" "$text"; sat=$?
       if [ -n "$was" ] && ! moved "$id" "$was"; then hung_seen "$1" "$id"; break; fi
       spool_pop "$sp"
+      # TYPED, AND STILL IN THE BOX AFTER EVERY ENTER: the text is on the pane, one keypress from sent, so it is not
+      # typed again (a second copy behind it is one prompt of two) and not left at the head (the next tick would
+      # type exactly that). It is said once, to a person, and the queue behind it waits for them: inbox.sat holds
+      # every later drain until the box lets it go.
+      if [ "$sat" != 0 ]; then
+        printf '%s' "$text" | tr '\n' ' ' > "$satf"
+        "$BIN/cc-notify" --decision -t "[$1] typed but not submitted" \
+          "the text sits in the input box and $((SUBMIT_TRIES + 1)) Enters did not send it — press Enter there (tmux select-window -t main:$1). $(spool_n "$1") message(s) wait behind it." >/dev/null 2>&1
+        break
+      fi
       n=$((n + 1)); sleep "$KEY_WAIT"
     done
     [ -s "$sp" ] || rm -f "$sp" "$(sdir "$1")/inbox.orphan"
@@ -617,6 +660,53 @@ drain(){   # $1 = one window, or nothing = every window with a spool
   drain_queries   # …and the member-refusal queries, routed to the box's queries session (never a member's channel)
 }
 
+# ── a workspace signed out under its running session ─────────────────────────────────────────────────────────
+# 2026-09-11 06:19Z: a member workspace's credential (~/.cc/members/<h>/credentials.json) was blanked in place — a
+# refused refresh empties accessToken and refreshToken and sets expiresAt 0, the shape cc-sandbox's cred_why calls
+# 'signed out, needs minting again'. Its two sessions ran 13 h more on the token they held in memory, then stood on
+# 'Login expired · Please run /login'; an owner question to one got nothing for 20 min, and nobody had been told at
+# either point: the file is read at LAUNCH (cc's member_credential, cc-sandbox's cred_usable) and by nothing after.
+# So the sweep, already at every window every tick, reads the file behind each member window it passes, and the
+# first tick that finds it unusable tells #<h> and pages the owner — ONCE PER BLANKING: the stamp beside the file
+# holds the event id, which carries the file's mtime (the id cc's start wall uses for the same file, so a start
+# attempt at it adds nothing; a re-mint writes a new file, a new id and a credential that passes). A file GONE has
+# no mtime to carry, and the start wall's plain `credential:<h>` is already spent for a workspace it told before
+# the first mint, so that event is named after the moment it was first found missing (credential-missing). The
+# session is not touched: it works until its token runs out, and a member's session is theirs to stop.
+cred_ok(){ [ -s "$1" ] && jq -e '.claudeAiOauth.accessToken | type == "string" and length > 0' "$1" >/dev/null 2>&1; }  # cc-sandbox's cred_usable, word for word
+member_signed_out(){   # $1 window name → said once when the workspace behind a MEMBER window has lost its credential
+  local h own stamp miss cid m when=""
+  h=${1%%/*}; h=${h%%@*}; h=${h%%~*}
+  [ -f "$HOME/dev/$h/.cc/member-workspace" ] || return 0        # cc's member_workspace(): only a member's window
+  own="$HOME/.cc/members/$h/credentials.json"; stamp="$HOME/.cc/members/$h/credential-gone"
+  miss="$HOME/.cc/members/$h/credential-missing"
+  cred_ok "$own" && { rm -f "$stamp" "$miss"; return 0; }
+  mkdir -p "$(dirname "$stamp")" 2>/dev/null                    # the stamps' dir, when the whole dir went with the file
+  if [ -e "$own" ]; then rm -f "$miss"   # there is a file again: a later deletion is a later moment, not this one
+    m=$(stat -c %Y "$own" 2>/dev/null || echo 0); cid="credential:$h:blank@$m"; when=" at $(date -d "@$m" +'%b %-d %H:%M' 2>/dev/null)"
+  else
+    # THE FILE IS GONE: no mtime to name the event with, and the plain `credential:$h` is the START WALL'S — cc's
+    # member_credential has spent it for every workspace told once before its first mint, cc-slack posts an id once
+    # ever, and cc-notify answers a replay with exit 0 (cc-notify:552). Under that id this would reach nobody and
+    # still stamp itself said. So the moment it was FIRST FOUND MISSING names it, kept beside the file: every tick
+    # reads the same id (one deletion is one post, and a page nobody got still retries under it), and the re-mint
+    # above clears it with the stamp, so the next deletion is a later moment and is said again.
+    [ -s "$miss" ] || date -u +%s > "$miss"
+    m=$(cat "$miss" 2>/dev/null); cid="credential:$h:gone@${m:-0}"
+  fi
+  [ "$(cat "$stamp" 2>/dev/null)" = "$cid" ] && return 0
+  # #<h> only when it resolves: post() falls back to #alerts and exits 0 otherwise (cc's member_credential, same wall)
+  if grep -q "^#${h}[[:space:]]" <<<"$("$BIN/cc-slack" channels 2>/dev/null)"; then
+    "$BIN/cc-slack" post -c "#$h" --major --id "$cid" \
+      "*this workspace is signed out* — its credential was cleared${when} (a refused refresh); the running session stops answering once its token runs out. The owner has been asked to mint it again." >/dev/null 2>&1 \
+      && { [ -e "$HOME/.cc/members/$h/credential-told" ] || date -u +%FT%TZ > "$HOME/.cc/members/$h/credential-told"; }
+  fi          # credential-told is cc's stamp for "#<h> has the bad news": `cc-sandbox mint` posts 'ready' where it stands, and clears it
+  "$BIN/cc-notify" -t "$h" --owner --id "$cid:owner" -- \
+    "\`$h\` is signed out under a running session: $own was blanked${when} (a refused refresh). Its sessions run until their token expires, then stand on /login. Mint it again on the box: \`cc-sandbox mint $h\`." >/dev/null 2>&1 \
+    && printf '%s\n' "$cid" > "$stamp"                           # a page nobody got is retried next tick, not stamped
+  return 0
+}
+
 # ── the sweep: the table, on a timer, at every pane ──────────────────────────────────────────────────────────
 # free_pane() answers a known-safe dialog only on the way to DELIVERING something, so a pane nothing was sent to —
 # a paused project, an orch between turns — kept its dialog for as long as nobody wrote to it (six of them, hours,
@@ -631,6 +721,7 @@ sweep(){
   while read -r id w; do
     [ -n "$id" ] && [ -n "$w" ] || continue
     live_claude "$id" || continue                  # a bare shell or a `claude -p` draws no dialog anyone may press
+    member_signed_out "$w"                         # a member's FILE, not its pane: said once when it goes blank
     in_copy_mode "$id" && continue                 # somebody is scrolling: a key here is eaten and drops them out
     scr=$(tmux capture-pane -p -t "$id" 2>/dev/null)   # a cheap pre-filter, so a free or mid-turn pane — nearly all
     st=$(blocked "$scr")                              # of them — never waits on the lock. NOTHING is pressed on it.
@@ -777,7 +868,23 @@ case "$1" in
   display-message) if [ -s "$CC_FAKE_MODE_F" ]; then cat "$CC_FAKE_MODE_F"; else printf '%s\n' "${CC_FAKE_MODE:-0}"; fi;;
   send-keys)    shift; printf '%s\n' "$*" >> "$CC_FAKE_KEYS"
                 # `?*`: an EMPTY literal send types nothing, so real tmux puts no character on the pane either
-                case "$*" in *' -l -- '?*) [ -z "${CC_FAKE_HUNG:-}" ] && printf '%s\n' "${*#* -l -- }" >> "$CC_FAKE_SCREEN";; esac
+                # THE INPUT BOX: under CC_FAKE_SWALLOW=N the text lands ON the prompt line ('> text', as the TUI draws
+                # it) and the next N Enters leave it there, the way a member session's did; the Enter after those
+                # submits it — the line drops its prompt char (the transcript's echo) and an empty box comes back.
+                # CC_FAKE_PASTE=1 draws the fold a long paste gets instead of the text. Without either the text is
+                # appended bare, as before: the box reads empty and every Enter is taken.
+                if [ "${CC_FAKE_SWALLOW:-0}" != 0 ] && [ ! -f "$CC_FAKE_SWALLOW_F" ]; then printf '%s\n' "$CC_FAKE_SWALLOW" > "$CC_FAKE_SWALLOW_F"; fi
+                case "$*" in *' -l -- '?*)
+                  if [ -n "${CC_FAKE_HUNG:-}" ]; then :
+                  elif [ "${CC_FAKE_SWALLOW:-0}" != 0 ]; then
+                    if [ -n "${CC_FAKE_PASTE:-}" ]; then printf '> [Pasted text #1 +3 lines]\n' >> "$CC_FAKE_SCREEN"
+                    else printf '> %s\n' "${*#* -l -- }" >> "$CC_FAKE_SCREEN"; fi
+                  else printf '%s\n' "${*#* -l -- }" >> "$CC_FAKE_SCREEN"; fi;; esac
+                case "$*" in *' Enter')
+                  left=$(cat "$CC_FAKE_SWALLOW_F" 2>/dev/null || echo 0)
+                  if [ "$left" -gt 0 ]; then printf '%s\n' "$((left - 1))" > "$CC_FAKE_SWALLOW_F"
+                  elif tail -1 "$CC_FAKE_SCREEN" 2>/dev/null | grep -q '^> .'; then
+                    sed -i '$ s/^> //' "$CC_FAKE_SCREEN"; printf '> \n' >> "$CC_FAKE_SCREEN"; fi;; esac
                 case "$*" in *Escape*) [ -n "${CC_FAKE_ESC_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac
                 case "$*" in *' 3') [ -n "${CC_FAKE_3_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac   # a digit that confirms on its own
                 case "$*" in *' Enter') [ -n "${CC_FAKE_ENTER_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac
@@ -799,8 +906,18 @@ esac
 STUB
   cat > "$T/bin/cc-slack" <<'STUB'
 #!/usr/bin/env bash
+# THE OUTBOUND LEDGER, as the real one keeps it (cc-slack's submit): an --id Slack accepted posts NOTHING a second
+# time, and `cc-slack sent <id>` answers 0 for it — which is how a replay reaches nobody (cc-notify:552). Without
+# it a case proves a notice was CALLED, not that anyone got it, and a spent id reads the same as a fresh one.
+L="$HOME/sent-ids"; id=""; prev=""
+for a in "$@"; do [ "$prev" = --id ] && id=$a; prev=$a; done
 case "$1" in
-  post) printf 'post %s\n' "$*" >> "$CC_FAKE_CALLS"; exit 0;;   # a channel post prints nothing the caller reads
+  sent) grep -qxF -- "${2:-}" "$L" 2>/dev/null; exit;;          # 0 = already out (the real one prints its ts)
+  post) if [ -n "$id" ] && grep -qxF -- "$id" "$L" 2>/dev/null; then
+          printf 'dedup post %s\n' "$id" >> "$CC_FAKE_CALLS"; exit 0; fi    # 'already': nothing posted, rc 0
+        [ -z "$id" ] || printf '%s\n' "$id" >> "$L"
+        printf 'post %s\n' "$*" >> "$CC_FAKE_CALLS"; exit 0;;   # a channel post prints nothing the caller reads
+  channels) for c in ${CC_FAKE_CHANNELS:-}; do printf '#%s\tC1\n' "$c"; done; exit 0;;   # the channels that resolve
 esac
 printf 'inject %s\n' "$*" >> "$CC_FAKE_CALLS"
 printf '%s\n' "${CC_FAKE_INJECT:-delivered}"     # the verdict the real one prints: delivered · typed · queued · …
@@ -821,7 +938,12 @@ exit "${CC_FAKE_CC_RC:-0}"                                     # …whatever it 
 STUB
   cat > "$T/bin/cc-notify" <<'STUB'
 #!/usr/bin/env bash
+# cc-notify:552 — an --id cc-slack's ledger already holds reaches no door, not the phone either, and exits 0.
+id=""; prev=""; for a in "$@"; do [ "$prev" = --id ] && id=$a; prev=$a; done
+if [ -n "$id" ] && "$(dirname "$0")/cc-slack" sent "$id" >/dev/null 2>&1; then
+  printf 'dedup notify %s\n' "$id" >> "$CC_FAKE_CALLS"; exit 0; fi
 printf 'notify %s\n' "$*" >> "$CC_FAKE_CALLS"
+[ -z "$id" ] || printf '%s\n' "$id" >> "$HOME/sent-ids"          # a page that went is in the ledger too
 STUB
   cat > "$T/bin/cc-config" <<'STUB'
 #!/usr/bin/env bash
@@ -833,16 +955,19 @@ esac
 exit 0
 STUB
   cp "$(readlink -f "${BASH_SOURCE[0]}")" "$T/bin/cc-msg"; chmod +x "$T"/bin/*
+  # TZ: a zone of its own, never this box's (check.sh's clock rule) — and never UTC either, or the one case
+  # that proves the blank stamp is rendered in local time would pass just as well on a `date -u` regression.
   export PATH="$T/bin:$PATH" HOME="$T" CC_FAKE_SCREEN="$T/screen" CC_FAKE_KEYS="$T/keys" \
          CC_FAKE_CALLS="$T/calls" CC_FAKE_WIN="$W" CC_FAKE_ESC_CLEARS=1 CC_FAKE_PROC=claude \
-         CC_FAKE_GONE="$T/gone" CC_FAKE_MODE_F="$T/mode" CC_FAKE_SWAP_N="$T/swapn" \
-         CC_MSG_KEY_WAIT=0 CC_MSG_DIALOG_WAIT=0 CC_MSG_FROM=selfcheck
+         CC_FAKE_GONE="$T/gone" CC_FAKE_MODE_F="$T/mode" CC_FAKE_SWAP_N="$T/swapn" CC_FAKE_SWALLOW_F="$T/swallow" \
+         CC_MSG_KEY_WAIT=0 CC_MSG_SUBMIT_WAIT=0 CC_MSG_DIALOG_WAIT=0 CC_MSG_FROM=selfcheck \
+         TZ='Asia/Tokyo'
   local SP="$T/.cc/state/$W/inbox.spool" DG="$T/.cc/state/$W/inbox.dialog"
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }
   scr(){ printf '%s\n' "$1" > "$T/screen"; }
-  reset(){ : > "$T/keys"; : > "$T/calls"; rm -rf "$T/.cc/state"; rm -f "$T/gone" "$T/mode" "$T/swapn"; }
+  reset(){ : > "$T/keys"; : > "$T/calls"; rm -rf "$T/.cc/state"; rm -f "$T/gone" "$T/mode" "$T/swapn" "$T/swallow" "$T/sent-ids"; }
   msg(){ "$T/bin/cc-msg" "$W" "$1"; }
   keys(){ cat "$T/keys"; }
   calls(){ cat "$T/calls"; }
@@ -860,6 +985,34 @@ STUB
   k "$(t test "$(wc -l < "$T/keys")" = 2)" "…and takes exactly one Enter: no half a message is submitted as a turn"
   reset; scr "$PERM"; msg "$(printf 'first line\nsecond line')" >/dev/null
   k "$(t sh -c "jq -e '.text == \"first line\nsecond line\"' < '$SP'")" "…while the spool keeps the message whole"
+
+  # (1c) THE ENTER THAT WAS SWALLOWED (2026-09-12, twice, a member workspace session): the text is in the input box
+  # and the Enter behind it went into the paste. The box is read back, and while it still holds the text Enter is
+  # pressed again — up to SUBMIT_TRIES more, then it is said to a person, once, and the message is neither retyped
+  # (two copies in one box are one prompt) nor left at the head for the next tick to retype.
+  reset; scr "$FREE"; out=$(CC_FAKE_SWALLOW=1 msg "sat unsent once")
+  k "$(t test "$(grep -c ' Enter$' "$T/keys")" = 2)" "an Enter the box swallowed is pressed again: the input box still held the text"
+  k "$(t sh -c "[ -z '$out' ] && ! test -f '$SP'")" "…and the message is delivered, not queued: cc-msg stays silent and the spool is empty"
+  k "$(nt grep -q '^notify' "$T/calls")" "…and nobody is told about a retry that worked"
+  k "$(t test "$(grep -c -- '-l -- sat unsent once$' "$T/keys")" = 1)" "…and the text was typed once: the second Enter is a keypress, not a second copy"
+  reset; scr "$FREE"; out=$(CC_FAKE_SWALLOW=1 CC_FAKE_PASTE=1 msg "$(printf 'a long paste %.0s' $(seq 40))")
+  k "$(t test "$(grep -c ' Enter$' "$T/keys")" = 2)" "…the '[Pasted text …]' fold the TUI draws for a long paste is the text still sitting there, and gets its Enter too"
+  reset; scr "$FREE"; out=$(CC_MSG_SUBMIT_TRIES=2 CC_FAKE_SWALLOW=99 msg "never sent")
+  k "$(t test "$(grep -c ' Enter$' "$T/keys")" = 3)" "a box that keeps the text through every Enter gets SUBMIT_TRIES more and no more"
+  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…then it is said once, to a person"
+  k "$(t grep -q 'notify --decision.*typed but not submitted.*select-window -t main:demo/t1' "$T/calls")" "…as a decision naming the window: the text is one keypress from sent, and only a person can press it"
+  k "$(t sh -c "[ -z '$out' ] && ! test -f '$SP'")" "…and the line is off the spool: it is on the pane, and the next tick must not type it behind itself"
+  reset; scr "$FREE"; msg "one" >/dev/null; msg "two" >/dev/null   # a live pane, the kept side of the same rule
+  k "$(t test "$(grep -c ' Enter$' "$T/keys")" = 2)" "…while a pane that takes its Enter gets exactly one per message: the read-back presses nothing at a box that emptied"
+  reset; scr "$PERM"; msg "first" >/dev/null; msg "second" >/dev/null   # two queued behind a dialog…
+  scr "$FREE"; CC_FAKE_SWALLOW=99 CC_MSG_SUBMIT_TRIES=1 "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c -- '-l -- ' "$T/keys")" = 1)" "…and a drain stops behind the one that sat: nothing is typed into a box that already holds a prompt"
+  k "$(t sh -c "[ \"\$(wc -l < '$SP')\" = 1 ] && jq -e '.text == \"second\"' < '$SP'")" "…the one behind it waits in the spool, whole"
+  : > "$T/keys"; : > "$T/calls"; CC_FAKE_SWALLOW=99 CC_MSG_SUBMIT_TRIES=1 "$T/bin/cc-msg" --drain "$W"   # the NEXT tick, box still full
+  k "$(nt grep -q -- '-l -- ' "$T/keys")" "…and so does every later drain while the box still holds it: nothing typed behind it (review-489)"
+  k "$(t sh -c "! grep -q '^notify' '$T/calls' && jq -e '.text == \"second\"' < '$SP'")" "…nothing said again, and 'second' still waits"
+  scr "$FREE"; rm -f "$T/swallow"; "$T/bin/cc-msg" --drain "$W"   # a person pressed Enter: the box is empty again
+  k "$(t sh -c "grep -q -- '-l -- second$' '$T/keys' && ! test -f '$SP' && ! test -f '$T/.cc/state/$W/inbox.sat'")" "…and once the box lets it go, the drain types 'second' and the stamp is gone"
 
   # (2)+(3) the two known-safe prompts are ANSWERED with Escape (= keep what the session has) and then delivered
   reset; scr "$LIMIT"; msg "hello limit" >/dev/null
@@ -1440,6 +1593,54 @@ $BUSY"; "$T/bin/cc-msg" --sweep
   k "$(nt grep -q . "$T/keys")" "sweep: a pane that went busy between the read and the press gets NO key — the key is chosen from a read taken under the window's lock"
   reset; scr "$LIMIT3"; CC_FAKE_SWAP_AFTER=1 CC_FAKE_SWAP_TO="> " "$T/bin/cc-msg" --sweep
   k "$(nt grep -q . "$T/keys")" "…and one whose dialog was answered by whoever held the lock gets none either"
+
+  # (14) A WORKSPACE SIGNED OUT UNDER ITS RUNNING SESSION (2026-09-11). The sweep reads the credential file behind a
+  # member window: blanked in place (a refused refresh) → #<h> and the owner are told once per blanking; a working
+  # file, a non-member window, or a blanking already said → nothing.
+  local MEM="$T/.cc/members/mem" CRED="$T/.cc/members/mem/credentials.json" BN=0
+  # Each blanking gets an mtime of ITS OWN: the event id carries that mtime, and two blankings inside one second
+  # would be one id — which the stubs' ledger then dedupes, failing a case on how fast the box ran it.
+  blank(){ BN=$((BN + 1)); mkdir -p "$MEM"; jq -n '{claudeAiOauth:{accessToken:"",refreshToken:"",expiresAt:0,scopes:["user:inference"]}}' > "$CRED"; touch -m -d "@$((1900000000 + BN))" "$CRED"; }
+  minted(){ mkdir -p "$MEM"; jq -n '{claudeAiOauth:{accessToken:"ok-access",refreshToken:"ok-refresh",expiresAt:99999999999999}}' > "$CRED"; }
+  mkdir -p "$T/dev/mem/.cc"; : > "$T/dev/mem/.cc/member-workspace"           # ~/dev/mem is a member's workspace
+  reset; rm -rf "$MEM"; scr "$FREE"; blank; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
+  k "$(t grep -q "^post post -c #mem --major --id credential:mem:blank@$(stat -c %Y "$CRED") " "$T/calls")" "sweep: a member window whose credential was blanked in place → #mem is told, under the event id cc's start wall would use for that file"
+  k "$(t grep -q '^post .*signed out' "$T/calls")" "…in words that say what happened to their workspace"
+  k "$(t grep -q "^notify -t mem --owner --id credential:mem:blank@$(stat -c %Y "$CRED"):owner .*cc-sandbox mint mem" "$T/calls")" "…and the owner is paged once with the command that mints it again"
+  k "$(t test "$(cat "$MEM/credential-gone" 2>/dev/null)" = "credential:mem:blank@$(stat -c %Y "$CRED")")" "…and the blanking is stamped beside the file"
+  k "$(t test -s "$MEM/credential-told")" "…and credential-told is set: the re-mint posts 'ready' where the bad news went, and clears it (cc-sandbox mint)"
+  : > "$T/calls"; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q -e '^post' -e '^notify' "$T/calls")" "…the next tick says nothing: one blanking is said once, not every two minutes for 13 h"
+  : > "$T/calls"; CC_FAKE_WIN=mem/t1 CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q -e '^post' -e '^notify' "$T/calls")" "…nor for the same workspace's track window: the file is the handle's, and so is the stamp"
+  : > "$T/calls"; minted; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q -e '^post' -e '^notify' "$T/calls")" "a re-minted credential: nothing is said"
+  k "$(nt test -e "$MEM/credential-gone")" "…and the stamp is gone with the blanking it named"
+  : > "$T/calls"; blank; touch -m -d '@2000000000' "$CRED"; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
+  k "$(t grep -q '^post post -c #mem --major --id credential:mem:blank@2000000000 ' "$T/calls")" "blanked again later is a new event, said again — the id carries the file's own mtime"
+  k "$(t grep -q 'cleared at May 18 12:33' "$T/calls")" "…naming when, in the box's own clock, no Z"
+  # THE FILE GONE, with the start wall's ids ALREADY SPENT — cc's member_credential posts `credential:mem` and pages
+  # `credential:mem:owner` for a workspace it told before its first mint, and the stubs above keep cc-slack's ledger,
+  # so a replay of either reaches nobody and still exits 0. Under those ids this event is the silence the row was
+  # filed for; it is named after the moment the file was found missing instead.
+  : > "$T/calls"; rm -rf "$MEM"; scr "$FREE"
+  "$T/bin/cc-slack" post -c '#mem' --major --id credential:mem 'mint incomplete' >/dev/null 2>&1
+  "$T/bin/cc-notify" -t mem --owner --id credential:mem:owner -- 'needs a credential minted' >/dev/null 2>&1
+  : > "$T/calls"; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
+  k "$(t grep -q '^post post -c #mem --major --id credential:mem:gone@[0-9][0-9]* ' "$T/calls")" "a credential file gone from under a running session is said too, under an id the start wall cannot have spent"
+  k "$(t grep -q '^notify -t mem --owner --id credential:mem:gone@[0-9][0-9]*:owner .*cc-sandbox mint mem' "$T/calls")" "…and the owner's page gets through: under the start wall's plain id cc-slack's ledger swallows it and nobody is told"
+  : > "$T/calls"; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q -e '^post ' -e '^notify ' "$T/calls")" "…and the next tick is silent: one deletion is one post, however long the file stays gone"
+  : > "$T/calls"; blank; CC_FAKE_WIN=mem CC_FAKE_CHANNELS='' "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q '^post' "$T/calls")" "no #mem channel: nothing is posted anywhere else in its name (post would fall back to #alerts and exit 0)"
+  k "$(t grep -q '^notify -t mem --owner' "$T/calls")" "…and the owner's page still goes: it is the escalation"
+  : > "$T/calls"; rm -rf "$MEM"; mkdir -p "$T/.cc/members/demo"; jq -n '{claudeAiOauth:{accessToken:"",refreshToken:"",expiresAt:0}}' > "$T/.cc/members/demo/credentials.json"
+  CC_FAKE_WIN=demo/t1 CC_FAKE_CHANNELS=demo "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q -e '^post' -e '^notify' "$T/calls")" "a window that is not a member workspace's (no ~/dev/<h>/.cc/member-workspace) is never judged by a file under ~/.cc/members"
+  rm -rf "$T/.cc/members/demo"
+  : > "$T/calls"; blank; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem CC_FAKE_PROC=bash "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q -e '^post' -e '^notify' "$T/calls")" "…and a member window with no live claude under it is not 'a running session': the start wall says it when the next one starts"
+  rm -rf "$MEM" "$T/dev/mem"
 
   echo "cc-msg selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ]
