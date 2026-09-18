@@ -5728,6 +5728,51 @@ def run_selfcheck():
         r_esc_hot = ms_req({"escalate": "<!channel> @owner ```pwned",
                             "text": "click [here](https://evil.example) <@U123> & tell @owner\n```\n" + "x" * 2000})
         ran_esc = ranMS[len(ran_two):]
+        # `ask`: THE MEMBER'S QUESTION TO THE PLANNING SEAT, both directions (raised-a-workspace-cannot-ask-in-the-channel-
+        # the-rule-names, 2026-09-18). The brief: "from inside a member session one verb posts an ask card to #<ctl>-threads
+        # naming the workspace and the ask; the planning seat's thread answer reaches the member's own channel". Out: the
+        # card lands in the control repo's -threads lane (a channel alice may neither read nor post) and is handed to the
+        # control session; the lane never being hers, this is the daemon posting ON HER BEHALF, as a 🔐 prompt is. Back:
+        # a reply in the card's thread — the seat's, through the door its reply tool already hops to (mention), or the
+        # owner's, typed — is posted into #alice and handed to her session; another repo's seat in that thread is not.
+        dmMS.threads_chats[CTL] = "CTHR"; dmMS.names["CTHR"] = f"{CTL}-threads"
+        askedMS, _delA, _pmA = [], dmMS.deliver, dmMS.permalink
+        dmMS.deliver = lambda target, payload, autostart=True, alias=None: askedMS.append((target, payload, autostart)) or "delivered"
+        dmMS.permalink = lambda chat, ts: f"https://x.slack.com/{chat}/{ts}"
+        dmMS.member_asks.clear(); dmMS.ask_posts.clear(); dmMS.save_asks()
+        n_ask0 = len(postedMS)
+        r_ask = ms_req({"ask": "a repo", "text": "may I have alice-notes under the owner's account? <!channel> ping @owner ```"})
+        card_ask = postedMS[n_ask0:]; told_ask = list(askedMS); ask_rec = dict(dmMS.member_asks.get("5.5") or {})
+        # THE DAEMON RESTARTS between the ask and the answer (the review of #524: every landing that touches cc-slack
+        # restarts the unit, and an in-memory table orphaned the ask). The table is dropped and read back from disk the
+        # way Daemon.__init__ reads it; everything BACK below then runs on the restored entry.
+        ask_disk = dict(load_table(ASKS).get("5.5") or {})
+        dmMS.member_asks = collections.OrderedDict(load_table(ASKS))
+        r_ask_empty = ms_req({"ask": "a repo"})
+        r_ask_main = ms_req({"ask": "x", "text": "y"}, member=None, peer=me_peer)   # the main socket has no such verb: only a boundary asks this way
+        dmMS.ask_posts["alice"] = [time.time()] * ASK_CAP
+        r_ask_capped = ms_req({"ask": "again", "text": "and again"}); dmMS.ask_posts["alice"] = []
+        n_ask1, n_told1 = len(postedMS), len(askedMS)
+        # BACK: the control seat (me_peer, heldC) replies in the card's thread; its reply tool hops here with the posted ts
+        r_ans = ms_req({"mention": "CTHR", "ts": "8.1", "thread_ts": "5.5", "text": "made: alice-notes is yours — push as @owner"}, member=None, peer=me_peer)
+        carried = postedMS[n_ask1:]; handed = askedMS[n_told1:]
+        # …the same thread from another repo's seat, a thread that is no ask's, and the card's ts in another channel
+        hop_other = dmMS.ask_hop("CTHR", "5.5", "x", ("myrepo", None)); hop_none = dmMS.ask_hop("CTHR", "9.9", "x", (CTL, None)); hop_chan = dmMS.ask_hop("CAL", "5.5", "x", (CTL, None))
+        r_ans_wake = ms_req({"wake": "CTHR", "ts": "8.2", "thread_ts": "5.5", "text": "and it is private"}, member=None, peer=me_peer)   # `post -c` hops with wake
+        n_ask2, n_told2 = len(postedMS), len(askedMS)
+        # …and the OWNER typing in that thread reaches her too (on_event), while still reaching the control session as any
+        # line in its lane does — the lane routes to the control repo through routes.json, as on this box
+        _routesA = globals()["load_routes"]; globals()["load_routes"] = lambda: {f"#{CTL}-threads": CTL}
+        try:
+            dmMS.on_event(msgM("8.3", "UOWNER", "make it public when the course ends", chan="CTHR", thread_ts="5.5"))
+            typed_ask = postedMS[n_ask2:]; typed_handed = askedMS[n_told2:]
+            dmMS.on_event(msgM("8.4", "UAL", "me too", chan="CTHR", thread_ts="5.5"))   # not the owner: nothing carried
+            typed_other = postedMS[n_ask2 + len(typed_ask):]
+        finally:
+            globals()["load_routes"] = _routesA
+        dmMS.member_asks["5.5"]["at"] = time.time() - ASK_STALE - 1; dmMS.ask_sweep()
+        hop_stale = dmMS.ask_hop("CTHR", "5.5", "x", (CTL, None)); stale_disk = load_table(ASKS)   # the sweep's drop is on disk too
+        dmMS.deliver, dmMS.permalink = _delA, _pmA
         # `project`: the SECOND door to a sub-channel. The creating half (new_project) is covered by its own cases and
         # is stubbed here — what these prove is what the DOOR decides: whose workspace the name is built from, which
         # asks are refused and with what reason, and that the hourly window is the dir cap's, per workspace.
@@ -6099,6 +6144,49 @@ def run_selfcheck():
           r_esc_hot.get("ok") and esc_title == "alice: &lt;!channel&gt; @\u200bowner '''pwned"
           and esc_text.startswith("click [here] (https://evil.example) &lt;@U123&gt; &amp; tell @\u200bowner\n'''\n")
           and esc_text.endswith("…") and esc_text.count("x") < 2000 and "<" not in esc_text and "`" not in esc_text)
+    check("MEMBER socket: `ask` posts the workspace's question as a 🙋 card in the CONTROL repo's -threads lane — a channel "
+          "the member may neither read nor post, so the daemon posts on her behalf as it does a 🔐 prompt — naming the "
+          "workspace and the ask, every field escaped and defanged like a 🔐 field and headed UNTRUSTED, and hands the same "
+          "to the control session in the card's thread; an empty ask, a capped workspace (ASK_CAP an hour) and the main "
+          "socket are refused and post nothing; the answer names where it went and says not to ask the owner to relay",
+          r_ask.get("ok") and r_ask.get("card") == "5.5" and "do not ask the owner to relay" in r_ask.get("text", "")
+          and len(card_ask) == 1 and card_ask[0][0] == "CTHR" and card_ask[0][1].startswith("🙋 UNTRUSTED member ask")
+          and "`alice` asks — *a repo*" in card_ask[0][1] and "&lt;!channel&gt; ping @\u200bowner '''" in card_ask[0][1]
+          and "carries every reply here to #alice" in card_ask[0][1]
+          and told_ask == [(CTL, {"type": "message", "meta": {"chat_id": "CTHR", "thread_ts": "5.5", "ts": "5.5", "user": "cc-slack",
+                                                                  "role": "owner", "channel": f"#{CTL}-threads", "target": CTL},
+                                   "content": told_ask[0][1]["content"] if told_ask else None}, False)]
+          and told_ask[0][1]["content"].startswith("🙋 UNTRUSTED member ask") and "`alice` asks — *a repo*: may I have" in told_ask[0][1]["content"]
+          and ask_rec.get("h") == "alice" and ask_rec.get("chat") == "CTHR" and ask_rec.get("title") == "a repo"
+          and ask_disk == ask_rec
+          and r_ask_empty.get("ok") is False and "something to ask" in r_ask_empty.get("error", "")
+          and r_ask_main.get("ok") is False and "member-socket verb" in r_ask_main.get("error", "")
+          and r_ask_capped.get("ok") is False and "5 times" in r_ask_capped.get("error", "")
+          and n_ask1 == n_ask0 + 1)
+    check("…and the answer comes BACK to her, ACROSS A DAEMON RESTART (the table is read back from asks.json): the control "
+          "seat's reply in the card's thread (its reply tool hops to the "
+          "daemon with the posted ts; a threaded post from `post -c` hops the same way) is posted into #alice as 💬, "
+          "the replier and the thread named, every @ defanged, and handed to her session in that post's thread as a "
+          "channel wake hands a post; the door's answer says where it was carried; a reply in the same thread from another "
+          "repo's seat is NOT carried and says so, a thread no ask owns and the card's ts in another channel are nothing, "
+          "and an ask past ASK_STALE carries no more",
+          r_ans.get("ok") and r_ans.get("ask") == {"target": "alice", "result": "delivered", "name": "alice"}
+          and len(carried) == 1 and carried[0][0] == "CAL" and carried[0][1].startswith(f"💬 {CTL} answered your ask *a repo* (<https://x.slack.com/CTHR/5.5|thread>)")
+          and "push as @\u200bowner" in carried[0][1] and "another `cc-slack ask`" in carried[0][1]
+          and handed == [("alice", {"type": "message", "content": carried[0][1],
+                                    "meta": {"chat_id": "CAL", "thread_ts": "5.5", "ts": "5.5", "user": "box", "role": "owner",
+                                             "channel": "#alice", "target": "alice", "from": CTL}}, True)]
+          and hop_other == {"target": "alice", "result": "not-the-seat"} and hop_none is None and hop_chan is None
+          and r_ans_wake.get("ask", {}).get("result") == "delivered" and n_ask2 == n_ask1 + 2
+          and "ANSWER NOT CARRIED" in ask_line(hop_other) and "only a " + CTL in ask_line(hop_other)
+          and ask_line(r_ans["ask"]) == "\n\nANSWER CARRIED: posted in #alice and handed to alice (delivered)" and ask_line(None) == ""
+          and hop_stale is None and "5.5" not in dmMS.member_asks and "5.5" not in stale_disk)
+    check("…and the OWNER typing in the card's thread reaches her the same way, named as himself, while his line still "
+          "goes to the control session as any line in its lane does; a member typing there carries nothing",
+          len(typed_ask) == 1 and typed_ask[0][0] == "CAL" and typed_ask[0][1].startswith("💬 The Owner answered your ask *a repo*")
+          and "make it public when the course ends" in typed_ask[0][1]
+          and [t for t, _p, _a in typed_handed] == ["alice", CTL] and typed_handed[1][1]["content"] == "make it public when the course ends"
+          and typed_other == [])
     # THE CAP `members` PRINTS IS TODAY'S. cc's member_gate raises a workspace's cap for the day (ledger `cap`, beside
     # `usd`) — the figure beside today's spend has to be that one, not the config's; and a raise rolls with its day.
     real_spend = globals()["MEMBER_SPEND"]; spend_tmp = f"{DIR}/member-spend-case.json"; globals()["MEMBER_SPEND"] = spend_tmp
