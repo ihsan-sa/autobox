@@ -713,7 +713,7 @@ def run_selfcheck():
     said5 = []; dm5.say = lambda chat, text, thread=None, mail=True: said5.append(text); dm5.names["C1"] = "c1"
     check("route: bare text, no thread → main (None)", dm5.update_owner("r", "C1", "1.1", None, "hi there") is None)
     check("at_token: a leading real mention of our bot means @main", at_token("<@UBOT> over to you", "UBOT") == "main"
-          and at_token("<@UOTHER> hi", "UBOT") is None and at_token("plain", "UBOT") is None)
+          and at_token("<@UOTHER01> hi", "UBOT") is None and at_token("plain", "UBOT") is None)
     dm5.bot_user = "UBOT"; handed = []
     dm5.deliver = lambda target, payload, autostart=True, alias=None: handed.append((alias, payload["content"]))
     dm5.route = lambda chat, ctype: "r"          # fixture chat has no real channel mapping
@@ -5973,6 +5973,183 @@ def run_selfcheck():
           and all(r.get("ok") is False for r in (r_dm, r_bob, r_my, r_status, r_orch, r_mpost, r_arch, r_mperm))
           and "not one of alice's channels" in r_dm.get("error", "") and "not a member verb" in r_status.get("error", "")
           and "not a member verb" in r_mperm.get("error", ""))
+    # ---- A MEMBER'S REFUSAL IS THE BOX'S QUERY, NOT A LINE IN HER CHANNEL (member_verb reply → record_refusal_query).
+    # Owner, 2026-09-04: a member session's refusals "should just be routed to you instead" — the queries session;
+    # "nothing in the member's channel". One member channel carried ~10 🔐 "I cannot do that…" lines on 2026-09-17/18, each
+    # the session paraphrasing cc-guard's stderr through its reply tool. Its own fixture — daemon, workspace, spool
+    # root — so nothing here leans on the block above.
+    dmRQ = Daemon(use_slack=False); dmRQ.cfg = {"SLACK_BOT_TOKEN": "xoxb-t", "SLACK_OWNER_ID": "UOWNER"}
+    dmRQ.names.update({"CCAR": "carol"})
+    os.makedirs(f"{DEV}/carol/.cc", exist_ok=True); open(f"{DEV}/carol/{MEMBER_MARKER}", "w").close()
+    postedRQ, reactedRQ = [], []
+    real_post_rq, real_react_rq, real_qs_rq = post, react, globals()["QUERIES_STATE"]
+    globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, decision=False, **kw: (   # the ❓ head is post()'s own, built here so a case sees the line the channel sees
+        postedRQ.append((chat, decision_head(cfg, text) if decision else text, username)) or (1, "5.5"))
+    globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: reactedRQ.append((chat, ts, name, remove))
+    qs_rq = tempfile.mkdtemp(prefix="cc-slack-selfcheck-queries-"); globals()["QUERIES_STATE"] = qs_rq
+    qs_dec = tempfile.mkdtemp(prefix="cc-slack-selfcheck-queries-")   # the needs_owner case's own root, below: fresh and writable, so a spool line there would show
+    qs_lk = tempfile.mkdtemp(prefix="cc-slack-selfcheck-queries-")    # …and the planted-lock cases' own root, so nothing they leave behind reaches the cases above
+    real_wait_rq = QUERIES_LOCK_WAIT
+    spool_rq = f"{qs_rq}/carol/queries.spool"
+    def rq_req(obj):
+        """One request through handle_conn on carol's member socket, as ms_req does."""
+        a, b = socket.socketpair(); a.sendall((json.dumps(obj) + "\n").encode()); a.shutdown(socket.SHUT_WR)
+        with contextlib.redirect_stderr(io.StringIO()):
+            dmRQ.handle_conn(b, "carol")
+        out = b""; a.settimeout(2)
+        with contextlib.suppress(Exception):
+            while True:
+                d = a.recv(65536)
+                if not d:
+                    break
+                out += d
+        a.close()
+        return json.loads(out.splitlines()[0]) if out.strip() else {}
+    try:
+        r_rq_lock = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.1",
+                            "text": "🔐 I cannot do that: editing outside this session's worktree (~/dev/x) — not mine to run\nso nothing is pending"})
+        rq_lines1 = open(spool_rq).read().splitlines() if os.path.exists(spool_rq) else []
+        r_rq_name = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.2", "text": "  :closed_lock_with_key: cc-guard: blocked <curl>"})
+        r_rq_words = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.3", "text": "*I cannot do that part myself*: it opens a port"})
+        rq_lines3 = open(spool_rq).read().splitlines() if os.path.exists(spool_rq) else []
+        n_rq_refused = len(postedRQ)
+        r_rq_ok = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.4", "text": "done: the notes are in the thread"})
+        r_rq_mid = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.5", "text": "the 🔐 prompt from earlier is answered, moving on"})
+        rq_lines_ok = open(spool_rq).read().splitlines()
+        # …over 1 MB nothing is appended (cc-msg discards the file whole), and a spool root that cannot be written
+        # changes nothing about the answer: the line still does not reach the channel
+        with open(spool_rq, "ab") as f:
+            f.write(b"{}" + b" " * QUERIES_SPOOL_MAX + b"\n")
+        size_rq_big = os.path.getsize(spool_rq)
+        r_rq_big = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.6", "text": "🔐 I cannot do that either"})
+        size_rq_after = os.path.getsize(spool_rq)
+        globals()["QUERIES_STATE"] = f"{qs_rq}/carol/queries.spool"    # a FILE as the root: makedirs fails
+        r_rq_fail = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.7", "text": "🔐 I cannot do that at all"})
+        n_rq_end = len(postedRQ)
+        # …and a reply that DECLARES needs_owner is the decision ask itself, not the guard's refusal paraphrased: it
+        # goes out, behind ❓ + his mention, although its first line says "I cannot do that", and spools nothing.
+        globals()["QUERIES_STATE"] = qs_dec
+        r_rq_dec = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.8", "needs_owner": True,
+                           "text": "I cannot do that myself — deploying needs your go-ahead"})
+        rq_dec_posted = postedRQ[n_rq_end:]
+        rq_dec_spool = sorted(os.listdir(f"{qs_dec}/carol")) if os.path.isdir(f"{qs_dec}/carol") else []
+        # …and NEITHER of the two handles this dir hands the daemon may park it. The dir is bound rw inside the
+        # member's boundary, so she can plant a FIFO at .queries.lock (a blocking open never returns) or simply hold
+        # the lock (`flock .queries.lock sleep 1e9` — LOCK_EX never returns). Either one used to leak one hung
+        # handle_conn thread per 🔐 reply and leave that reply unanswered. Both must answer inside the bound.
+        globals()["QUERIES_STATE"] = qs_lk
+        os.makedirs(f"{qs_lk}/carol"); lock_lk = f"{qs_lk}/carol/.queries.lock"; spool_lk = f"{qs_lk}/carol/queries.spool"
+        os.mkfifo(lock_lk, 0o600)
+        n_rq_lk = len(postedRQ); t0 = time.monotonic()
+        r_rq_fifo = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.9", "text": "🔐 I cannot do that: a FIFO is the lock"})
+        el_fifo = time.monotonic() - t0
+        fifo_spooled = os.path.exists(spool_lk)
+        os.unlink(lock_lk)
+        globals()["QUERIES_LOCK_WAIT"] = 0.3       # the shipped bound is asserted below; this keeps the run short
+        held = os.open(lock_lk, os.O_RDWR | os.O_CREAT, 0o600)             # a second open file description: flock conflicts with it even in this process
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            t0 = time.monotonic()
+            r_rq_held = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.10", "text": "🔐 I cannot do that: the lock is held"})
+            el_held = time.monotonic() - t0
+        finally:
+            os.close(held)
+        held_spooled = os.path.exists(spool_lk)
+        r_rq_free = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.11", "text": "🔐 I cannot do that: the lock is free again"})
+        free_lines = open(spool_lk).read().splitlines() if os.path.exists(spool_lk) else []
+        n_rq_lk_end = len(postedRQ)
+    finally:
+        globals()["post"], globals()["react"], globals()["QUERIES_STATE"] = real_post_rq, real_react_rq, real_qs_rq
+        globals()["QUERIES_LOCK_WAIT"] = real_wait_rq
+        subprocess.run(["rm", "-rf", qs_rq, qs_dec, qs_lk, f"{DEV}/carol"])
+    rq_rec = json.loads(rq_lines1[0]) if rq_lines1 else {}
+    check("MEMBER socket: a reply that IS the refusal — opening 🔐 or :closed_lock_with_key:, or a first line saying "
+          "`I cannot do that` / `cc-guard: blocked` — is NOT posted into the member's channel: ONE line per reply lands in "
+          "that workspace's queries.spool in cc-guard's record_query shape (at, workspace, class nopage, reason = the first "
+          "line, command = the reply's door) for cc-msg --drain to carry to the queries session, and the answer says so "
+          "(owner, 2026-09-04: a member's refusals are routed to the box, \"nothing in the member's channel\")",
+          r_rq_lock.get("ok") is True and "not posted" in r_rq_lock.get("text", "") and "recorded" in r_rq_lock.get("text", "")
+          and "CAN do" in r_rq_lock.get("text", "")
+          and len(rq_lines1) == 1 and rq_rec.get("workspace") == "carol" and rq_rec.get("class") == "nopage"
+          and rq_rec.get("reason", "").startswith("🔐 I cannot do that: editing outside") and "\n" not in rq_rec.get("reason", "")
+          and rq_rec.get("command") == "reply into #carol" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", rq_rec.get("at", ""))
+          and r_rq_name.get("ok") is True and r_rq_words.get("ok") is True and len(rq_lines3) == 3
+          and n_rq_refused == 0 and not any(("3.1", "eyes", True) == r[1:] for r in reactedRQ)
+          # …and an ORDINARY reply posts exactly as before — into her channel, signed as her session, the 👀 off, no spool
+          # line — a 🔐 mentioned mid-sentence included; a spool over 1 MB is not appended to and a spool root that cannot
+          # be written still answers not-posted: the line never reaches the channel either way
+          and [p[0] for p in postedRQ[:n_rq_end]] == ["CCAR", "CCAR"] and postedRQ[0][1] == "done: the notes are in the thread"
+          and postedRQ[0][2] == display_name("carol") and postedRQ[1][1].startswith("the 🔐 prompt")
+          and ("CCAR", "3.4", "eyes", True) in reactedRQ and r_rq_ok.get("text", "").startswith("sent (1 message(s))")
+          and len(rq_lines_ok) == 3
+          and r_rq_big.get("ok") is True and "not posted" in r_rq_big.get("text", "") and size_rq_after == size_rq_big
+          and r_rq_fail.get("ok") is True and "not posted" in r_rq_fail.get("text", "") and n_rq_end == 2)
+    check("MEMBER socket: a reply that DECLARES needs_owner is the member session's decision ask, not the guard's "
+          "refusal paraphrased — it is posted into her channel behind ❓ + the owner's mention even though its first "
+          "line says `I cannot do that`, and writes NO spool line; needs_owner is one of only two doors to the owner "
+          "and the one the session prompt names for the part of an ask that needs him, so running the refusal filter "
+          "ahead of it swallowed every legitimate escalation a member session made",
+          r_rq_dec.get("ok") is True and r_rq_dec.get("text", "").startswith("sent (1 message(s))")
+          and len(rq_dec_posted) == 1 and rq_dec_posted[0][0] == "CCAR"
+          and rq_dec_posted[0][1] == "❓ <@UOWNER> I cannot do that myself — deploying needs your go-ahead"
+          and rq_dec_posted[0][2] == display_name("carol") and rq_dec_spool == []
+          and ("CCAR", "3.8", "eyes", True) in reactedRQ)
+    check("MEMBER socket: a FIFO planted at the member's .queries.lock does NOT park the daemon — record_refusal_query "
+          "runs on a cc-slackd handle_conn thread and that dir is bound rw inside her boundary, so a blocking open(2) "
+          "of it never returns: one leaked, hung daemon thread per 🔐 reply and a reply that never answers. The open is "
+          "O_NONBLOCK and fstat refuses anything but a regular file, so the reply comes back inside the bound, saying "
+          "not posted, with nothing spooled and nothing in her channel",
+          r_rq_fifo.get("ok") is True and "not posted" in r_rq_fifo.get("text", "") and el_fifo < 5 and not fifo_spooled)
+    check("MEMBER socket: a member HOLDING her own .queries.lock (`flock .queries.lock sleep 1e9`) does not park the "
+          "daemon either: LOCK_EX is tried, not waited on, and retried only to QUERIES_LOCK_WAIT — the 5 s cc-guard's "
+          "`flock -w 5` uses on the same file — then the reply answers not posted with nothing spooled; once the lock "
+          "is free the very next refusal spools normally, so the bound did not cost the record. Nothing any of the "
+          "planted-lock replies carried reached her channel",
+          r_rq_held.get("ok") is True and "not posted" in r_rq_held.get("text", "") and 0.3 <= el_held < 3
+          and not held_spooled and real_wait_rq == 5
+          and r_rq_free.get("ok") is True and len(free_lines) == 1 and json.loads(free_lines[0]).get("workspace") == "carol"
+          and n_rq_lk_end == n_rq_lk)
+    # ---- `member register <handle> [<@user>]` — THE RECORD FOR A WORKSPACE NO JOIN MADE (cc-sandbox convert). It reads
+    # the channel pair the workspace already has and creates nothing; refused without the marker, without the pair, or
+    # for a handle another person holds. Its own fixture: api, cfg, members table, ~/dev/<handle> — restored after.
+    class FakeReg:
+        def __init__(self, chans): self.chans, self.created = chans, []
+        def api(self, method, token, **kw):
+            if method == "conversations.list":
+                return {"channels": [{"id": c, "name": n, "is_member": True} for n, c in self.chans.items()]}
+            self.created.append(method); raise RuntimeError(f"selfcheck: register must not call {method}")
+    fkr = FakeReg({"hank": "CHK1", updates_name("hank"): "CHK2"})
+    real_api_rg, real_cfg_rg, members_rg = globals()["api"], globals()["load_cfg"], load_members()
+    globals()["api"] = fkr.api; globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-selfcheck", "SLACK_OWNER_ID": "UOWNER"}
+    for h in ("hank", "ivan"):
+        os.makedirs(f"{DEV}/{h}/.cc", exist_ok=True); open(f"{DEV}/{h}/{MEMBER_MARKER}", "w").close()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc_rg_nomark = cmd_member(["register", "nomark"]); m_rg_nomark = load_members().get("nomark")
+            rc_rg_pair = cmd_member(["register", "hank"]); m_rg_pair = dict(load_members().get("hank") or {})
+            rc_rg_who = cmd_member(["register", "hank", "<@UHANK001>"]); m_rg_who = dict(load_members().get("hank") or {})
+            rc_rg_again = cmd_member(["register", "hank", "<@UHANK001>"]); m_rg_again = dict(load_members().get("hank") or {})
+            rc_rg_other = cmd_member(["register", "hank", "<@UOTHER01>"]); m_rg_other = dict(load_members().get("hank") or {})
+            rc_rg_nopair = cmd_member(["register", "ivan"]); m_rg_nopair = load_members().get("ivan")
+            rc_rg_argv = cmd_member(["register"])
+            globals()["load_cfg"] = lambda: {}
+            rc_rg_notoken = cmd_member(["register", "ivan"]); m_rg_notoken = load_members().get("ivan")
+            rc_rg_known = cmd_member(["register", "hank"])   # a complete record needs no token: nothing to look up
+    finally:
+        globals()["api"], globals()["load_cfg"] = real_api_rg, real_cfg_rg
+        save_members(members_rg); subprocess.run(["rm", "-rf", f"{DEV}/hank", f"{DEV}/ivan"])
+    check("`member register <handle> [<@user>]` records a converted workspace from the pair it already has — chan_id + "
+          "updates_id read off conversations.list, nothing created, the member's uid only when one is named — and is "
+          "refused, writing nothing, without the marker, without the pair, without a token, or for a handle on record "
+          "for somebody else; the same record twice changes nothing and needs no token",
+          rc_rg_nomark == 1 and m_rg_nomark is None
+          and rc_rg_pair == 0 and m_rg_pair.get("chan_id") == "CHK1" and m_rg_pair.get("updates_id") == "CHK2"
+          and m_rg_pair.get("chan") == "hank" and m_rg_pair.get("updates") == updates_name("hank") and m_rg_pair.get("uid") == ""
+          and rc_rg_who == 0 and m_rg_who.get("uid") == "UHANK001" and m_rg_who.get("at") == m_rg_pair.get("at")
+          and rc_rg_again == 0 and m_rg_again == m_rg_who
+          and rc_rg_other == 1 and m_rg_other == m_rg_who
+          and rc_rg_nopair == 1 and m_rg_nopair is None and rc_rg_argv == 2
+          and rc_rg_notoken == 1 and m_rg_notoken is None and rc_rg_known == 0 and fkr.created == [])
     check("MEMBER socket: react, history and thread work on its channels and are refused elsewhere; a file is sent only from a "
           "path the host can see (the workspace), never from the boundary's private /tmp",
           r_react.get("ok") and ("CAL", "1.2", "white_check_mark", False, None) in reactedMS and r_react_dm.get("ok") is False
