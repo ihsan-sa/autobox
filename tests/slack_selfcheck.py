@@ -1817,6 +1817,56 @@ def run_selfcheck():
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
         globals()["BOX"] = rbox
+    # A TRACK IS A THREAD (owner, 2026-09-18): a worker's "<repo>/<track> …" line lands in the track's ONE thread in
+    # #<repo> when the TRACKS table has one — before the updates lane, which is where a track with no thread (a legacy
+    # channel, or a repo the bot cannot see) still goes. --mention is rung 1 and stays on the main lane, unthreaded.
+    postedT = []
+    save_table(TRACKS, {"myrepo/t1": {"chat": "C-myrepo", "ts": "5.0", "at": 1.0}})
+    try:
+        globals()["resolve_channel"] = lambda cfg, name: {"alerts": "C-alerts"}.get(name, "C-" + name)
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: postedT.append((chat, thread)) or (1, "1.0")
+        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_post(["--route", "myrepo/t1 done", "PR: x"]); cmd_post(["--route", "myrepo/t1 round over", "next: y"])
+            cmd_post(["--route", "myrepo/t2 done", "PR: z"])
+            cmd_post(["--route", "myrepo/t1 done", "--mention", "needs you"])
+    finally:
+        globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        save_table(TRACKS, {})
+    check("post --route: a track WITH a thread in #<repo> gets its 'done' and 'round over' lines IN that thread, not the "
+          "updates lane; a track without one takes the lane as before; --mention still opens on the main lane, unthreaded",
+          postedT == [("C-myrepo", "5.0"), ("C-myrepo", "5.0"), (f"C-myrepo-{UPDATES}", None), ("C-myrepo", None)])
+    # `cc-slack track-thread <repo>/<track>` is what `cc … --go` runs before the loop: one root in #<repo>, recorded,
+    # idempotent, and NO channel — ensure_channel is stubbed to record a call, and must record none.
+    rootsT, madeT, outT = [], [], []
+    real_ec = globals()["ensure_channel"]
+    os.makedirs(f"{DEV}/myrepo", exist_ok=True); os.makedirs(f"{DEV}/nochan", exist_ok=True)   # valid_target: a repo is a dir under ~/dev
+    try:
+        globals()["resolve_channel"] = lambda cfg, name: "C-myrepo" if name == "myrepo" else None
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: rootsT.append((chat, text, thread, mail)) or (1, f"7.{len(rootsT)}")
+        globals()["ensure_channel"] = lambda *a, **k: madeT.append(a) or ("C-made", "created")
+        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
+        for argv in (["myrepo/t9", "--title", "the row title"], ["myrepo/t9"], ["nochan/t1"], ["myrepo"], [], ["myrepo/t9", "extra"], ["norepo/t1"]):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                outT.append((cmd_track_thread(argv), buf.getvalue().strip()))
+        tt9 = track_thread("myrepo/t9")
+        globals()["load_cfg"] = lambda: {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc_notok = cmd_track_thread(["myrepo/t8"])
+    finally:
+        globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["ensure_channel"] = real_ec
+        save_table(TRACKS, {})
+    check("track-thread: opens ONE root in #<repo> — `🧵 `<repo>/<track>` — <title>`, unthreaded, mail=False — records it "
+          "in TRACKS and prints `<chat> <ts>`; asked again it prints the same and posts nothing; a repo with no channel "
+          "the bot is in opens nothing (exit 1, no table entry); a bare repo, no argument, two, or a repo that is not "
+          "under ~/dev are usage (2); no "
+          "token is 3 — and NOT ONE of them creates a channel",
+          outT[0] == (0, "C-myrepo 7.1") and rootsT == [("C-myrepo", "🧵 `myrepo/t9` — the row title", None, False)]
+          and tt9 == ("C-myrepo", "7.1") and outT[1] == (0, "C-myrepo 7.1")
+          and outT[2] == (1, "") and track_thread("nochan/t1") is None
+          and [rc for rc, _ in outT[3:]] == [2, 2, 2, 2] and rc_notok == 3 and not madeT)
     check("post --route: '<box> limit' goes to #alerts even when the box shares its name with a repo channel; a track's "
           "automated 'done' and the DIGEST go to the updates lane — #alerts keeps boots, limits, power and audits. The "
           "box is CC_BOX, never the kernel's hostname: the last line is titled with the HOSTNAME on a box whose CC_BOX "
@@ -2049,6 +2099,21 @@ def run_selfcheck():
           [c for c, _ in said21] == ["CUPD", "CUPD", "CMAIN"])
     check("chan_notice: the same line is not repeated inside NOTICE_WINDOW, which is minutes — a reconnect flap is "
           "not a 60 s storm — and one past the window is said again — L21", len(said21) == 3 and NOTICE_WINDOW >= 600)
+    # …and a TRACK's line goes in its thread (a track is a thread, not a channel — owner, 2026-09-18): find_channel is
+    # never asked for a `#r--t1`, and a track with no thread still takes the legacy channel if the bot is in one.
+    said21t = []; dmL21.say = lambda chat, text, thread=None, mail=True: said21t.append((chat, thread, text))
+    asked21 = []
+    save_table(TRACKS, {"r/t1": {"chat": "CMAIN", "ts": "3.0", "at": 1.0}})
+    try:
+        globals()["find_channel"] = lambda cfg, name: asked21.append(name) or ("CLEG", True)
+        dmL21.chan_notice("r/t1", "🤖 @ai-dev joined")
+        dmL21.chan_notice("r/t2", "🤖 @ai-dev joined")
+    finally:
+        globals()["find_channel"] = real_fc21
+        save_table(TRACKS, {})
+    check("chan_notice: a track's join/leave line lands in ITS THREAD in #<repo>, with no channel looked up; a track "
+          "with no thread takes a legacy #<repo>--<track> channel as before",
+          said21t == [("CMAIN", "3.0", "🤖 @ai-dev joined"), ("CLEG", None, "🤖 @ai-dev joined")] and asked21 == ["r--t2"])
     dmL22 = Daemon(use_slack=False); dmL22.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}; dmL22.last_chat[CTL] = ("C1", None)
     said22 = []; dmL22.say = lambda chat, text, thread=None, mail=True: said22.append(text)
     dmL22.relay_permission(CTL, {"tool_name": "Bash", "request_id": "abcde", "description": "curl",
@@ -4979,12 +5044,12 @@ def run_selfcheck():
             return "live-no-channel" if target == "myrepo/w1" else "delivered"
         dmL.deliver = deliverL
         dmL.on_event(evP("CTRK", "is it done?", "4.1"))
-        check("a #<repo>--<track> channel whose window is a headless --go worker: no second session on that worktree, and "
-              "no dead end — the question goes to the REPO session prefixed with where it came from, and one line in the "
-              "channel says the worker cannot chat",
+        check("a legacy #<repo>--<track> channel whose window is a headless --go worker: no second session on that worktree, "
+              "and no dead end — the question goes to the REPO session prefixed with where it came from, and NOTHING is "
+              "said in the channel (owner, 2026-09-18: the 'running a headless worker, which cannot chat' line 'adds bloat')",
               [t for t, _, _ in delivL] == ["myrepo/w1", "myrepo"] and delivL[1][2] == "myrepo"
               and delivL[1][1] == "[asked in #myrepo--w1 while its headless worker runs] is it done?"
-              and len(saidL) == 1 and "headless worker" in saidL[0] and "`myrepo` session is answering" in saidL[0])
+              and not saidL)
         # …AND THE SAME AFTER THE WORKER ENDS (2026-09-06). On 09-06 01:49Z the owner posted the dashboard design
         # packet in a track's channel once its `--go` worker had finished: the window was gone, so this was not
         # "live-no-channel", the daemon queued the message for a session that no longer existed and nobody answered.
@@ -5004,14 +5069,96 @@ def run_selfcheck():
               [t for t, _, _ in delivL] == ["myrepo/w1", "myrepo"] and delivL[1][2] == "myrepo"
               and delivL[1][1] == "[asked in #myrepo--w1 — that track has no live session] here is the design packet"
               and metasL[1] == ("CTRK", "5.1", "#myrepo--w1") and dmL.last_chat.get("myrepo") == ("CTRK", "5.1")
-              and len(saidL) == 1 and "nothing is running on `myrepo/w1`" in saidL[0]
-              and "`myrepo` session is answering" in saidL[0])
+              and not saidL)
         saidL.clear(); delivL.clear(); dmL.told.clear()
         dmL.deliver = lambda target, payload, **k: delivL.append((target, payload.get("content"), None)) or "delivered"
         dmL.on_event(evP("CTRK", "status?", "6.1"))
         check("a track WITH a live session is untouched by all of that: it takes its own message, nothing is handed to "
               "the repo session and nothing is said in the channel",
               [t for t, _, _ in delivL] == ["myrepo/w1"] and delivL[0][1] == "status?" and not saidL)
+        # A TRACK IS A THREAD, NOT A CHANNEL (owner, 2026-09-18: "whats the point of a track channel?"). The brief:
+        # "its worker's progress lines, its landing card, and anything a person or a seat sends it live in ONE thread
+        # in the project's channel". So the routing above now has a second door, the ordinary one: a reply under the
+        # track's root in #<repo> is the track's, and a message anywhere else in #<repo> is the repo session's.
+        # Its own fixture: the TRACKS table says myrepo/w1's thread is CREPO/9.0, and the channel is plain #myrepo.
+        save_table(TRACKS, {"myrepo/w1": {"chat": "CREPO", "ts": "9.0", "at": 1.0}})
+        dmT = Daemon(use_slack=False); dmT.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
+        dmT.chan_name = lambda c: "myrepo"
+        dmT.owner_spoke = lambda chat, thread: None
+        saidT, delivT, metasT = [], [], []
+        dmT.say = lambda chat, text, thread=None, mail=True: saidT.append(text)
+        def deliverT(target, payload, **k):
+            meta = payload.get("meta") or {}
+            delivT.append((target, payload.get("content"), meta.get("target")))
+            metasT.append((meta.get("chat_id"), meta.get("thread_ts")))
+            return "live-no-channel" if target == "myrepo/w1" else "delivered"
+        dmT.deliver = deliverT
+        dmT.on_event(dict(evP("CREPO", "is it done?", "9.2"), thread_ts="9.0"))
+        check("track thread: a reply under a track's root in #<repo> is THAT TRACK'S — with its worker headless it goes to "
+              "the repo session saying which track's thread it came from, the thread travels with it so the answer lands "
+              "there, and nothing is posted: the root already says what the track is",
+              [t for t, _, _ in delivT] == ["myrepo/w1", "myrepo"] and delivT[1][2] == "myrepo"
+              and delivT[1][1] == "[asked in `myrepo/w1`'s thread in #myrepo while its headless worker runs] is it done?"
+              and metasT[1] == ("CREPO", "9.0") and dmT.last_chat.get("myrepo") == ("CREPO", "9.0") and not saidT)
+        saidT.clear(); delivT.clear(); metasT.clear()
+        dmT.deliver = lambda target, payload, **k: (delivT.append((target, payload.get("content"), None)) or
+                                                    ("no-session" if target == "myrepo/w1" else "delivered"))
+        dmT.on_event(dict(evP("CREPO", "the design packet", "9.3"), thread_ts="9.0"))
+        check("…and a reply in a FINISHED track's thread reaches the project's live session with the track named "
+              "(a-message-in-a-finished-tracks-channel-reaches-its-project), again with no notice",
+              [t for t, _, _ in delivT] == ["myrepo/w1", "myrepo"]
+              and delivT[1][1] == "[asked in `myrepo/w1`'s thread in #myrepo — that track has no live session] the design packet"
+              and not saidT)
+        saidT.clear(); delivT.clear()
+        dmT.deliver = lambda target, payload, **k: delivT.append((target, payload.get("content"), None)) or "delivered"
+        dmT.on_event(dict(evP("CREPO", "status?", "9.4"), thread_ts="9.0"))
+        dmT.on_event(evP("CREPO", "top-level question", "9.5"))
+        dmT.on_event(dict(evP("CREPO", "some other thread", "9.7"), thread_ts="9.6"))
+        check("…a reply in the thread with the track's session LIVE is delivered to it alone; a top-level message in "
+              "#<repo> and a reply in any OTHER thread there are the repo session's, untouched — the thread, not the "
+              "channel, is what names the track",
+              [t for t, _, _ in delivT] == ["myrepo/w1", "myrepo", "myrepo"] and delivT[0][1] == "status?"
+              and delivT[1][1] == "top-level question" and delivT[2][1] == "some other thread" and not saidT)
+        check("track thread: the table is the whole of it — thread_target answers only the (chat, ts) recorded, "
+              "track_thread only a target recorded, and neither a chat alone nor a bare repo",
+              thread_target("CREPO", "9.0") == "myrepo/w1" and thread_target("CREPO", "9.1") is None
+              and thread_target("COTHER", "9.0") is None and thread_target("CREPO", None) is None
+              and track_thread("myrepo/w1") == ("CREPO", "9.0") and track_thread("myrepo") is None
+              and track_thread("myrepo/w2") is None)
+        # …AND A REACTION UNDER THE ROOT IS THE TRACK'S TOO (review of #532): the owner's ✅ on the track session's own
+        # question in its thread was handed to the repo session as "on your reply" while the track that asked never
+        # heard it. Own fixture: the table, a bot message in the thread, and which sessions are up.
+        save_table(TRACKS, {"myrepo/w1": {"chat": "CREPO", "ts": "9.0", "at": 1.0}})
+        dmR = Daemon(use_slack=False); dmR.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
+        dmR.bot_user = "UBOT"; dmR.bot_id = "BBOT"
+        dmR.route = lambda chat, ctype=None: "myrepo"; dmR.chan_name = lambda c: "myrepo"; dmR.user_name = lambda u: "The Owner"
+        in_thread = lambda chat, ts: ({"user": "UBOT", "ts": ts, "thread_ts": "9.0", "text": "land it now, or wait for the review?"}, "9.0")
+        top_level = lambda chat, ts: ({"user": "UBOT", "ts": ts, "text": "the day's summary"}, ts)
+        rxR, readsR = [], []
+        dmR.deliver = lambda target, payload, **k: rxR.append((target, payload["content"], payload["meta"])) or "delivered"
+        dmR.reacted_message = lambda chat, ts: readsR.append(ts) or in_thread(chat, ts)
+        dmR.subs["myrepo/w1"] = [Conn(None, "myrepo/w1", {"alias": None})]; dmR.subs["myrepo"] = []
+        dmR.deliver_reaction("CREPO", "9.8", "white_check_mark", False, "UOWNER")      # only the track is up: still its
+        dmR.subs["myrepo"] = [Conn(None, "myrepo", {"alias": None})]
+        dmR.deliver_reaction("CREPO", "9.8", "white_check_mark", False, "UOWNER")      # both up: the track's, not the repo's
+        dmR.reacted_message = top_level
+        dmR.deliver_reaction("CREPO", "9.9", "white_check_mark", False, "UOWNER")      # top level in #myrepo: the repo's
+        check("track thread: a reaction on the bot's line under a track's root in #<repo> is delivered to THAT TRACK's "
+              "session — with the repo session up or not — and one on a top-level line stays the repo session's",
+              [t for t, _, _ in rxR] == ["myrepo/w1", "myrepo/w1", "myrepo"] and rxR[0][2]["target"] == "myrepo/w1"
+              and rxR[0][2]["thread_ts"] == "9.0" and rxR[0][1].startswith("✅ on your ") and "wait for the review" in rxR[0][1]
+              and rxR[2][2]["target"] == "myrepo" and rxR[2][2]["thread_ts"] == "9.9")
+        rxR.clear(); readsR.clear(); dmR.reacted_message = lambda chat, ts: readsR.append(ts) or in_thread(chat, ts)
+        dmR.subs["myrepo/w1"] = []
+        dmR.deliver_reaction("CREPO", "9.8", "white_check_mark", False, "UOWNER")      # the track finished (or headless): the repo hears it, told whose thread
+        dmR.subs["myrepo"] = []
+        dmR.deliver_reaction("CREPO", "9.8", "white_check_mark", False, "UOWNER")      # nobody up: dropped without a read
+        check("…with the track's session gone it goes to the repo session naming the track's thread, as a reply there "
+              "does; with neither up it is dropped without a read — a reaction never starts a session",
+              [t for t, _, _ in rxR] == ["myrepo"] and rxR[0][2]["target"] == "myrepo"
+              and rxR[0][1].startswith("[in `myrepo/w1`'s thread in #myrepo — that track has no live session] ✅ on your ")
+              and readsR == ["9.8"])
+        save_table(TRACKS, {})
         # …AND THE TRACK'S QUEUED COPY GOES WITH THE HAND-OFF (review of #270). deliver() queues before it says
         # "no-session", so the copy left behind is a message the repo session has already answered still waiting on a
         # target nobody is coming for: the TTL sweep tells the owner four hours later that it "was dropped, resend",
@@ -5075,8 +5222,7 @@ def run_selfcheck():
             check("…and a repo session with no channel but a live pane counts as having it: cc-msg spooled the text "
                   "at that pane and never drops what it takes, so the track's copy goes with 'spooled' exactly as "
                   "with 'delivered'",
-                  not dmS.queues.get("myrepo/w1") and not dmS.queues.get("myrepo")
-                  and len(saidS) == 1 and "nothing is running on `myrepo/w1`" in saidS[0])
+                  not dmS.queues.get("myrepo/w1") and not dmS.queues.get("myrepo") and not saidS)
             # AND THE OTHER DOOR: what was held while the project was PARKED. drain_resumed re-delivers through
             # deliver(), which now answers "no-session" and re-queues — before this it leaned on autostart starting
             # the track's session, so the resume's "delivered now, in order" would have been said about a message
@@ -5211,7 +5357,8 @@ def run_selfcheck():
                 self.topics[kw["channel"]] = kw["topic"]; return {"ok": True}
             if method == "chat.postMessage":
                 self.posts.append((self.name_of(kw.get("channel")), str(kw.get("text") or "")))
-            if method in ("conversations.join", "chat.postMessage", "reactions.add", "reactions.remove"):
+                return {"ok": True, "ts": f"1.{len(self.posts)}", "channel": kw.get("channel")}   # a root of its own per post
+            if method in ("conversations.join", "reactions.add", "reactions.remove"):
                 return {"ok": True, "ts": "1.0", "channel": kw.get("channel")}
             raise RuntimeError(f"selfcheck: unexpected {method}")
 
@@ -5254,12 +5401,18 @@ def run_selfcheck():
         dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.1", "user": "UALICE",
                       "text": "new project todo", "channel_type": "channel"})
         made4 = sorted(fkm.created)
-        np_said = [t for t in saidw if t.startswith("`alice-b/todo`")]   # what the member was told about the pair
-        routed_p = dmw.route(fkm.chans.get("alice-b--todo", "?"), "channel")
+        np_said = [t for t in saidw if t.startswith("`alice-b/todo`")]   # what the member was told about the project
+        roots_todo = [(c, t) for c, t in fkm.posts if t.startswith("🧵 `alice-b/todo`")]   # the thread's root, in #alice-b
+        tt_todo = track_thread("alice-b/todo")
+        routed_p = thread_target(cid_a, tt_todo[1]) if tt_todo else None
+        dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.15", "user": "UALICE",
+                      "text": "new project todo", "channel_type": "channel"})              # the same project, asked again
+        roots_todo2, tt_todo2 = [t for _, t in fkm.posts if t.startswith("🧵 `alice-b/todo`")], track_thread("alice-b/todo")
         dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.2", "user": "USTRANGER",
                       "text": "new project sneaky", "channel_type": "channel"})
         made5 = sorted(fkm.created)
-        proj_upd = new_project(cfgw, "alice-b", "todo-updates")   # would fold onto #alice-b--todo's own lane
+        proj_upd = new_project(cfgw, "alice-b", "todo-updates")   # used to be refused as a name that would read as #alice-b--todo's lane
+        thr_upd, made_upd = track_thread("alice-b/todo-updates"), sorted(fkm.created)
         starts_w = []; dmw.autostart = lambda t, **k: starts_w.append(t) or "starting"   # cc would put it inside the boundary; here: asked?
         dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.3", "user": "UALICE",
                       "text": "how is it going?", "channel_type": "channel"})
@@ -5381,20 +5534,26 @@ def run_selfcheck():
           and iris_doc.startswith("# iris") and "new project <name>" in iris_doc)
     check("the OWNER's own team_join creates nothing at all — he owns the whole box",
           made3 == made2 and mem3 == mem1 and "owner" not in load_members())
-    check("routing needs no table: #<handle> IS the target and #<handle>--<x> IS <handle>/<x>",
+    check("routing needs no table: #<handle> IS the target, and a reply under the project's root in #<handle> IS "
+          "<handle>/<x> (thread_target reads the TRACKS table the root was recorded in)",
           routed == "alice-b" and routed_p == "alice-b/todo")
-    check("`new project todo` in the member's own channel creates #alice-b--todo and its updates lane…",
-          made4 == sorted(made1 + ["alice-b--todo", "alice-b--todo-updates"]))
-    check("…and the reply names #alice-b--todo as the member's and the -updates lane as the owner's — never a channel "
-          "the member cannot open as theirs",
-          len(np_said) == 1 and "#alice-b--todo is yours" in np_said[0]
-          and "#alice-b--todo-updates is the owner's lane" in np_said[0] and "are yours" not in np_said[0])
+    check("`new project todo` in the member's own channel creates NO channel — no #alice-b--todo, no updates lane — and "
+          "opens ONE thread for `alice-b/todo` in #alice-b, its root the 🧵 line naming the project, recorded in TRACKS",
+          made4 == made1 and len(roots_todo) == 1 and roots_todo[0][0] == "alice-b"
+          and tt_todo == (cid_a, "1." + str(1 + [t for _, t in fkm.posts].index(roots_todo[0][1]))))
+    check("…the reply tells the member the thread is in #alice-b and that writing there reaches the project's session "
+          "— never a channel the member cannot open as theirs",
+          len(np_said) == 1 and "its thread is in #alice-b" in np_said[0] and "🧵" in np_said[0]
+          and "#alice-b--todo" not in np_said[0])
+    check("…and asking for the same project again opens no second root and keeps the first thread (idempotent, like a "
+          "re-dispatched --go track)",
+          len(roots_todo2) == 1 and tt_todo2 == tt_todo)
     check("…but only for the workspace's own member or the owner: anyone else in the channel creates nothing",
           made5 == made4 and any("own member or the owner" in t for t in saidw))
     check("THE OWNER IS IN EVERY CHANNEL THE BOX MADE, and so is the member — in #<handle> and its sub-projects, "
           "never in an -updates lane, which holds the owner alone",
-          owner_in_all and member_in_all and updates_owner_only and len(fkm.created) == 14)   # alice, alice--todo, erin, frank, grace,
-                                                                                               # henry, ivy pairs
+          owner_in_all and member_in_all and updates_owner_only and len(fkm.created) == 12)   # alice, erin, frank, grace,
+                                                                                               # henry, ivy pairs — a project makes none
     check("a plain message in a member's channel reaches its SESSION — queued for alice-b with authority=instructions and "
           "autostart asked (cc puts that session inside the boundary); the daemon no longer answers it itself", no_session and started)
     check("a message that arrives before the workspace is minted is answered IN ITS OWN THREAD, every time, with the "
@@ -5413,8 +5572,9 @@ def run_selfcheck():
     check("`cc-slack member add <@u>` is the same join by hand — it creates the pair and the workspace, and running "
           "it again changes nothing", rc_cli == 0 and rc_cli2 == 0
           and made_cli == sorted(after_coll[0] + ["erin", "erin-updates"]) and made_cli2 == made_cli)
-    check("`new project <x>-updates` is refused: its channel would read as another project's updates lane",
-          proj_upd[0] is False and "updates lane" in proj_upd[1])
+    check("`new project <x>-updates` is an ordinary project now: it makes no channel, so there is no lane for the name "
+          "to read as — a thread of its own, and nothing created",
+          proj_upd[0] is True and thr_upd and thr_upd[0] == cid_a and thr_upd != tt_todo and made_upd == made5)
     check("a join whose provisioning is refused makes NO channel and no record — and the same join again completes it",
           st_f1 == "refused" and frank_half == (made_cli2, False, False) and st_f2 == "created" and frank_done)
     check("a join that made the workspace and then lost Slack is finished by the next one: the record says the "
@@ -6121,15 +6281,10 @@ def run_selfcheck():
     check("…and a FOLDER NAME IS A MEMBER-CONTROLLED STRING, so every shape crafted to break the naming is refused "
           "with its reason rather than folded into a channel: one carrying a workspace or a target separator "
           "(`bob--x`, `bob/x`) and one that is not a name at all (spaces, a leading dot, nothing left after "
-          "folding) at the door itself; one that folds onto an updates lane at the creating half, which is where "
-          "`#<ws>--<x>-updates` is known to be #<ws>--<x>'s own lane. Both are the REAL functions here, called "
-          "with the names those directories would produce",
+          "folding) at the door itself. The REAL door here, called with the names those directories would produce",
           all(ask_project(dmMS.cfg, "alice", n)[0] is False
               for n in ("bob--x", "bob/x", "a name with spaces", ".hidden", "", "---"))
-          and "not yours to choose" in ask_project(dmMS.cfg, "alice", "bob--x")[1]
-          and new_project(dmMS.cfg, "alice", "notes-updates")[0] is False
-          and "updates lane" in new_project(dmMS.cfg, "alice", "notes-updates")[1]
-          and reserved_name(f"alice--{member_handle('notes-updates')}"))
+          and "not yours to choose" in ask_project(dmMS.cfg, "alice", "bob--x")[1])
     check("control: the shapes above all reach ask_project as ordinary strings — a plain course name goes straight "
           "through the same call, so the refusals are the guards deciding and not the door being shut",
           ctrl_ok[0] and ctrl_made == [("alice", "ECE250")])

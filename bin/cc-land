@@ -2347,15 +2347,35 @@ def notify(*args, timeout=180):
     return sh([f"{BIN}/cc-slack", "post", *args], timeout=timeout)
 
 
+def track_thread_of(repo, pr):
+    """`<repo>/<track>` when the row carrying this PR has a thread of its own — the ONE thread a --go track lives in
+    (`cc-slack track-thread`, ~/.cc/slack/track-threads.json) — else "". The brief: "its landing card … live in ONE
+    thread in the project's channel": the landing line goes there, as a `--route "<repo>/<track> …"` post, which
+    cc-slack lands in that thread. A member project (`<handle>--<track>`) is the same target the other way round."""
+    try:
+        tt = json.load(open(os.environ.get("CC_SLACK_DIR", f"{HOME}/.cc/slack") + "/track-threads.json"))
+    except Exception:
+        return ""
+    handle, track = member_of(repo)
+    if not (handle and track):
+        track = next((name for name, t in board(repo).get("tracks", {}).items()
+                      if re.search(rf"/pull/{pr}(?:/|$)", str(t.get("pr") or "")) or str(t.get("pr") or "") == str(pr)), "")
+    target = f"{handle or repo}/{track}" if track else ""
+    return target if target and isinstance(tt.get(target), dict) and tt[target].get("ts") else ""
+
+
 def say_result(job, r):
-    """Say the result ONCE — the brief: "a landing notifies once per terminal state". One `cc-slack post` under the job's producer id (`land:<repo>:<pr>:<outcome>@<queued_at>`, so a retry never posts twice), written to the queue log as `notify`: in the reply thread when the job has one; else a member project's own lane (#<handle>-updates landed, #<handle> stopped); else a stop is routed (`post --route`, the repo's updates lane) and a landing with no thread is its card, already edited to landed ✓ — unless the text carries a restart that is the owner's, which is routed with the one @-mention allowed to page him. A stop of a box repo also wakes its planning session (`cc-slack inject`, first attempt only): the seat's wake, not a post. A stop's card is the one line result_of built (stop_card) and nothing else. Returns whether Slack took it."""
+    """Say the result ONCE — the brief: "a landing notifies once per terminal state". One `cc-slack post` under the job's producer id (`land:<repo>:<pr>:<outcome>@<queued_at>`, so a retry never posts twice), written to the queue log as `notify`: in the reply thread when the job has one; else the track's own thread when it has one (track_thread_of); else a member project's own lane (#<handle>-updates landed, #<handle> stopped); else a stop is routed (`post --route`, the repo's updates lane) and a landing with no thread is its card, already edited to landed ✓ — unless the text carries a restart that is the owner's, which is routed with the one @-mention allowed to page him. A stop of a box repo also wakes its planning session (`cc-slack inject`, first attempt only): the seat's wake, not a post. A stop's card is the one line result_of built (stop_card) and nothing else. Returns whether Slack took it."""
     chat, ts, repo, pr = job.get("chat") or "", job.get("ts") or "", job.get("repo") or "", job.get("pr")
     state = "landed" if r.get("ok") else "stopped"
     pid = f"land:{repo}:{pr or 'deploy'}:{state}" + (f"@{job['queued_at']}" if job.get("queued_at") else "")
     what = f"[{repo}] " + (f"PR #{pr}" if pr else "deploy")
     handle = member_of(repo)[0]
+    tt = "" if chat or r.get("restart") else track_thread_of(repo, pr)   # a restart that is the owner's still pages him
     if chat:
         where, args = "thread", ["-c", chat, *(["--thread", ts] if ts else [])]
+    elif tt:
+        where, args = "track thread", ["--route", f"{tt} {state}"]
     elif handle:
         where = f"#{handle}-updates" if r.get("ok") else f"#{handle}"
         args = ["-c", where]

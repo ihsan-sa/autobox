@@ -409,6 +409,20 @@ env PATH="$T/ghc:$PATH" CC_SLACK="$T/ccslack/cc-slack" "$B/cc" done $REPO c6 >"$
   && [ "$(jq -r '.executions[-1].outcome' < "$d6")" = "released: delivered" ]; } \
   && ok "cc done ends the claim the delivered work was done under — the row is in review and nobody still holds it" \
   || bad "cc done left the row claimed: $(tr -d '\n' < "$d6" | head -c 200) :: $(cat "$T/c6done.out")"
+# A TRACK IS A THREAD, NOT A CHANNEL (owner, 2026-09-18). `cc … --go` opens the track's ONE thread in #<repo> through
+# `cc-slack track-thread`, titled from the board row, once, before the loop starts — and asks cc-slack for nothing
+# else: no channel of the track's own. CC_SLACK names the stub, and its being set is what turns the link on for
+# this dispatch (as for `done`'s card): the case never touches ~/.cc/slack/enabled, the BOX's flag — this suite runs
+# in the real HOME, and a first version that toggled it left the box's Slack off (2026-09-19).
+mkdir -p ~/.cc/state/$REPO/c7 "$T/cctt"; "$B/cc-board" add $REPO c7 "the c7 title" >/dev/null 2>&1; printf 'Do the c7 thing.\n' > ~/.cc/state/$REPO/c7/task.md
+printf '#!/bin/sh\necho "$*" >> "%s"\necho "C0FIX 1.2"\nexit 0\n' "$T/tt.args" > "$T/cctt/cc-slack"; chmod +x "$T/cctt/cc-slack"; : > "$T/tt.args"
+CC_SLACK="$T/cctt/cc-slack" "$B/cc" $REPO c7 --go "" >"$T/c7on.out" 2>&1
+for id in $(wins "$REPO/c7"); do tmux kill-window -t "$id"; done
+{ [ "$(grep -c '^track-thread ' "$T/tt.args")" = 1 ] \
+  && grep -q "^track-thread $REPO/c7 --title the c7 title\$" "$T/tt.args" \
+  && ! grep -q 'mkchannel\|channel ' "$T/tt.args"; } \
+  && ok "cc … --go opens the track's one thread (cc-slack track-thread <repo>/<track> --title <row title>), once, and asks for no channel" \
+  || bad "--go did not open the track thread as expected: $(cat "$T/tt.args" | tr '\n' '|') :: $(tail -3 "$T/c7on.out" | tr '\n' ' ')"
 # …AND FROM THAT PR ON, THE ROW IS THE LANDING QUEUE'S. A plain dispatch — this process's or any other's — is
 # refused before it writes a brief or buys a turn, because the remainder of a track kept running inside a change
 # already delivered and landed it twice (arch review 2026-09-08 rec 6). The queue's own reservation for that PR

@@ -2429,6 +2429,31 @@ def selfcheck():
           len(posts) == 1 and posts[0][2:4] == ["--route", "[myrepo] PR #7 landed"] and "--mention" in posts[0]
           and posts[0][-1] == LANDED["text"] and not injects
           and line.endswith("notify myrepo#7 landed → route"))
+    # A TRACK IS A THREAD, NOT A CHANNEL (owner, 2026-09-18): the row carrying the PR has its one thread in #<repo>
+    # (cc-slack track-thread), so the landing line goes THERE — a `--route "<repo>/<track> …"` post cc-slack lands in
+    # that thread — and a stop too; a restart that is the owner's still takes the paging route.
+    tt_dir = tempfile.mkdtemp(prefix="cc-land-tt-"); os.environ["CC_SLACK_DIR"] = tt_dir
+    BOARD[0]["tracks"] = {"w1": {"pr": "https://github.com/o/myrepo/pull/7", "branch": "track/w1", "status": "review"}}
+    with open(f"{tt_dir}/track-threads.json", "w") as f:
+        json.dump({"myrepo/w1": {"chat": "CREPO", "ts": "9.1", "at": 1.0}}, f)
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7}, LANDED)
+    tt_landed = (len(posts) == 1 and posts[0][2:4] == ["--route", "myrepo/w1 landed"] and "--mention" not in posts[0]
+                 and posts[0][-1] == LANDED["text"] and not injects and line.endswith("notify myrepo#7 landed → track thread"))
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7}, STOPPED)
+    tt_stopped = (len(posts) == 1 and posts[0][2:4] == ["--route", "myrepo/w1 stopped"] and len(injects) == 1
+                  and line.endswith("notify myrepo#7 stopped → track thread"))
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7}, dict(LANDED, restart="⚠️ yours to restart: x"))
+    tt_restart = len(posts) == 1 and posts[0][2:4] == ["--route", "[myrepo] PR #7 landed"] and "--mention" in posts[0]
+    with open(f"{tt_dir}/track-threads.json", "w") as f:
+        json.dump({"myrepo/other": {"chat": "CREPO", "ts": "9.2", "at": 1.0}}, f)     # a thread, but another track's
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7}, LANDED)
+    tt_none = not posts and line.endswith("notify myrepo#7 landed → card")
+    BOARD[0]["tracks"] = {}; os.environ.pop("CC_SLACK_DIR", None); shutil.rmtree(tt_dir, ignore_errors=True)
+    check("a track with a thread of its own (cc-slack track-thread) is told THERE: the landing line and a stop go out "
+          "as `--route \"<repo>/<track> …\"`, which cc-slack lands in that thread — no card-only silence, no updates lane",
+          tt_landed and tt_stopped)
+    check("…a restart that is the owner's still pages him on the main lane, and a thread that is ANOTHER track's "
+          "changes nothing: the card alone, as before", tt_restart and tt_none)
     os.makedirs(f"{DEV}/bob/.cc", exist_ok=True)      # a member workspace, decided by the marker and never the name
     open(f"{DEV}/bob/.cc/member-workspace", "w").close()
     posts, injects, line = notified({"repo": "bob--site", "pr": 7}, LANDED)
