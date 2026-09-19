@@ -8,9 +8,10 @@ def run_selfcheck():
     os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
     nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the suite sets it; these cases read what run() was handed, not what a door did with it
     import tempfile
-    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held
+    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held, seat_of, measure_seat
     real_out = out
     real_held = worker_held      # the real one: every case below rebinds worker_held to a stub
+    _real_measure = measure_seat   # the real one: the rotation cases stub measure_seat and check one refusal of the real
     p = f = 0
 
     def ok(what, cond):
@@ -1264,6 +1265,179 @@ def run_selfcheck():
             os.environ.pop("HOME", None)
         else:
             os.environ["HOME"] = home0
+
+        # ---- ROTATION: the sweep hands off a seat past the rotate line without the seat's cooperation. seat_of and
+        # measure_seat are stubbed (the seat in a fixture window is a table entry; cc-context's own selfcheck pins
+        # the `rotate` judgement), so every case is about what the sweep does with the answer. Each case builds
+        # its own window, seat and measurement, and asserts both the seat that is rotated and the one left alone.
+        seatd, meas, mcalls, msince = {}, {}, [], {}
+
+        def seat_of(wid):
+            return seatd.get(wid)
+
+        def measure_seat(target, sid, alone, since=0):
+            mcalls.append((target, sid, alone))
+            msince[target] = since              # the seat's own start, which the real one hands cc-context as --since
+            if not sid and not alone and not target.split("@")[0].count("/"):
+                return None                     # the real one's refusal (pinned on the real one below); the rest is the table
+            return meas.get(sid or target)
+
+        def seat(name, sid, cwd="", used=0, rotate=False, line=200000, started=1234.0):
+            wins[name] = "@" + name.replace("/", "-")
+            seatd[wins[name]] = (sid, cwd or "/dev/" + name, started)
+            meas[sid or name] = {"used": used, "rotate_line": line, "rotate": rotate, "pct": 0}
+
+        home0 = os.environ.get("HOME")
+        os.environ["HOME"] = os.path.join(d, "rothome")   # journal() writes under ~, never the real one
+        rrole = os.environ.pop("CC_ROLE", None)           # the sweep runs from the timer, no role: a --go worker running the gates keeps its own
+        try:
+            os.environ["CC_HANDOFF_OVERLAP_MAX"] = "1200"
+            seat("rt1/over", "sid-over", used=250000, rotate=True)      # "a seat over the hard line is handed off"
+            seat("rt1/under", "sid-under", used=199999, rotate=False)   # "a seat under the line is untouched"
+            n0 = len(msgs)
+            ok("a bare --sweep (a bare cc-reconcile's) measures nothing and opens nothing: rotation is --rotate's, the tick's --apply",
+               sweep() == 0 and not mcalls and read("rt1/over") is None and "rt1/over~next" not in wins)
+            ok("the sweep opens the overlap for the seat past the rotate line: a record names it, the successor's window is up, "
+               "and the record says the box opened it",
+               sweep(True) == 0 and (read("rt1/over") or {}).get("phase") == "overlap" and wins.get("rt1/over~next")
+               and "rotate line" in (read("rt1/over") or {}).get("box", ""))
+            ok("...the seat under the line is untouched: no record, no successor window, nothing typed at it",
+               read("rt1/under") is None and "rt1/under~next" not in wins
+               and not any(m[0].endswith("cc-msg") and m[1].startswith("rt1/under") for m in msgs[n0:]))
+            ok("...the seat's own id is what was measured, and the overlap carries it as the predecessor's",
+               ("rt1/over", "sid-over", True) in mcalls and read("rt1/over")["predecessor"]["session_id"] == "sid-over")
+            ok("...the wake is held off the target until the successor cuts over (pulse.off is the overlap's own mark)",
+               os.path.exists(quiet_path("rt1/over")) and read("rt1/over")["quiet"] == [QUIET_MARK])
+            ok("...the ledger row says why", any(r.get("kind") == "overlap-started" and r.get("target") == "rt1/over"
+               and "rotate line" in r.get("why", "") for r in
+               (json.loads(l) for l in open(os.path.join(RECORDS, "handoffs.jsonl")) if l.strip())))
+            ok("...the seat's journal says the box did it",
+               "rotated by the box" in open(os.path.expanduser(journal_for("rt1/over"))).read())
+            with open(brief_path("rt1/over")) as fh:
+                b = fh.read()
+            ok("...and the successor's brief says THE BOX opened it, not that the predecessor left a note",
+               "THE BOX opened this overlap" in b and "predecessor's own note" not in b)
+            ok("...a stamp holds the box off that target for the retry window",
+               os.path.exists(os.path.join(HANDOFF, "rt1--over.rotated")))
+            ok("a target with an overlap open is not measured again", (mcalls.clear() or sweep(True) == 0)
+               and not any(c[0] == "rt1/over" for c in mcalls))
+
+            # the retry window: an overlap the box opened that expired is not reopened next tick
+            seat("rt1/again", "sid-again", used=300000, rotate=True)
+            os.makedirs(HANDOFF, exist_ok=True)
+            with open(os.path.join(HANDOFF, "rt1--again.rotated"), "w") as fh:
+                fh.write("{}")
+            ok("a seat past the line whose stamp is inside CC_HANDOFF_ROTATE_RETRY is left alone (not even measured)",
+               sweep(True) == 0 and read("rt1/again") is None and not any(c[0] == "rt1/again" for c in mcalls))
+            os.environ["CC_HANDOFF_ROTATE_RETRY"] = "0"
+            ok("...and once the retry window is over it is rotated", sweep(True) == 0 and (read("rt1/again") or {}).get("phase") == "overlap")
+            del os.environ["CC_HANDOFF_ROTATE_RETRY"]
+
+            # the stamp says an overlap OPENED: a start that refuses writes none, so the next tick tries again
+            seat("rt7/x", "sid-x", used=300000, rotate=True)
+            os.environ["CC_ROLE"] = "worker"               # start() refuses a worker caller (WORKER_REFUSAL)
+            ok("a start that refuses leaves no stamp and no record", sweep(True) == 0 and read("rt7/x") is None
+               and not os.path.exists(os.path.join(HANDOFF, "rt7--x.rotated")))
+            os.environ.pop("CC_ROLE", None)
+            ok("...and the next tick opens it, and only then stamps it", sweep(True) == 0
+               and (read("rt7/x") or {}).get("phase") == "overlap" and os.path.exists(os.path.join(HANDOFF, "rt7--x.rotated")))
+
+            # a headless worker's window is never a seat, however fat its transcript reads
+            seat("rt1/loop", "sid-loop", used=400000, rotate=True)
+            held.append(wins["rt1/loop"])
+            ok("a worker's window past the line is not rotated (the iteration is its own handoff), and not measured",
+               (mcalls.clear() or sweep(True) == 0) and read("rt1/loop") is None and not any(c[0] == "rt1/loop" for c in mcalls))
+            held.remove(wins["rt1/loop"])
+
+            # a seat with no id is measured by its checkout only when it is alone there
+            seat("rt2", "", cwd="/dev/rt2", used=300000, rotate=True)
+            seat("rt2@orch", "", cwd="/dev/rt2", used=300000, rotate=True)
+            mcalls.clear(); sweep(True)
+            ok("two seats with no id in one checkout are each offered as NOT alone (measure_seat says None there)",
+               ("rt2", "", False) in mcalls and ("rt2@orch", "", False) in mcalls and read("rt2") is None)
+            # the peer is counted BEFORE the filters: an orch with its own overlap open, or read as a worker, or its
+            # ~next window up, still shares the checkout — a 50k planning seat must not be measured as alone
+            seat("rt6", "", cwd="/dev/rt6", used=50000, rotate=False)
+            seat("rt6@orch", "", cwd="/dev/rt6", used=300000, rotate=True)
+            write({"id": "abc123", "target": "rt6@orch", "phase": "overlap", "live": "predecessor",
+                   "predecessor": {"tmux": wins["rt6@orch"]}, "successor": {"tmux": ""}, "started": time.time(),
+                   "deadline": time.time() + 1200})     # inside its deadline, or the reaper half expires it first
+            mcalls.clear(); sweep(True)
+            ok("a planning seat whose orch peer has an overlap open is still NOT alone in the checkout",
+               ("rt6", "", False) in mcalls and ("rt6@orch", "", False) not in mcalls and read("rt6") is None)
+            clear("rt6@orch")
+            held.append(wins["rt6@orch"])
+            mcalls.clear(); sweep(True)
+            ok("...nor when that peer is read as a worker's window", ("rt6", "", False) in mcalls and read("rt6") is None)
+            held.remove(wins["rt6@orch"])
+            seat("rt6@orch~next", "", cwd="/dev/rt6")      # a successor window, not a target name: a peer all the same
+            del wins["rt6@orch"]; mcalls.clear(); sweep(True)
+            ok("...nor when the only other seat there is a `~next` window", ("rt6", "", False) in mcalls and read("rt6") is None)
+            seat("rt3", "", cwd="/dev/rt3", used=300000, rotate=True)
+            mcalls.clear(); sweep(True)
+            ok("...and a seat alone in its checkout is measured as alone, and rotated",
+               ("rt3", "", True) in mcalls and (read("rt3") or {}).get("phase") == "overlap")
+
+            # THE MEASUREMENT IS BOUND TO THE LIVE PROCESS. A checkout holds whatever session wrote there last
+            # inside a DAY, so a seat the owner started after quitting a 300k one was measured on the DEAD
+            # session and rotated before its first turn (review of #552). The sweep hands measure_seat the
+            # seat's own start, and measure_seat hands cc-context --since.
+            seat("rt8", "", cwd="/dev/rt8", used=300000, rotate=True, started=4242.0)
+            mcalls.clear(); sweep(True)
+            ok("a no-id seat is measured from its OWN start, not from whatever wrote in that checkout",
+               ("rt8", "", True) in mcalls and msince.get("rt8") == 4242.0)
+            # ...and the real measure_seat, against the real cc-context: a checkout whose previous session left a
+            # status-line file and a 300k transcript, both written BEFORE this seat started, measures as nothing.
+            ck = os.path.join(os.environ["HOME"], "dev", "rt9")
+            os.makedirs(ck, exist_ok=True)
+            proj = os.path.join(os.environ["HOME"], ".claude", "projects",
+                                re.sub(r"[/.]", "-", os.path.realpath(ck)))
+            sld = os.path.join(d, "rot-statusline")
+            os.makedirs(proj, exist_ok=True); os.makedirs(sld, exist_ok=True)
+            txp, slp, then = os.path.join(proj, "sid-dead.jsonl"), os.path.join(sld, "sid-dead.json"), time.time() - 300
+            with open(txp, "w") as fh:
+                fh.write(json.dumps({"type": "assistant", "isSidechain": False, "message": {
+                    "model": "claude-opus-5", "usage": {"input_tokens": 10, "cache_creation_input_tokens": 0,
+                                                        "cache_read_input_tokens": 300000, "output_tokens": 10}}}) + "\n")
+            with open(slp, "w") as fh:
+                json.dump({"session_id": "sid-dead", "used": 300000, "window": 1000000, "pct": 30.0,
+                           "model": "claude-opus-5", "raw": {"cwd": ck}}, fh)
+            for pth in (txp, slp):               # stale for the 120 s freshness rule, well inside the day cc-context lists
+                os.utime(pth, (then, then))
+            keep = {k: os.environ.get(k) for k in ("CC_STATUSLINE_DIR", "CC_CTX_BOX_MODEL", "CC_CONTEXT_ROTATE_TOKENS")}
+            os.environ.update({"CC_STATUSLINE_DIR": sld, "CC_CTX_BOX_MODEL": "",   # hermetic: not the box's own dir or model
+                               "CC_CONTEXT_ROTATE_TOKENS": "200000"})
+            try:
+                ok("the finding: unbounded, the session the owner QUIT is what that checkout measures — 300k, past the rotate line",
+                   (_real_measure("rt9", "", True) or {}).get("rotate") is True)
+                ok("...and bound to a seat that started after it, nothing there is measurable: a FRESH no-id seat is not rotated",
+                   _real_measure("rt9", "", True, time.time() - 60) is None)
+            finally:
+                for k, v in keep.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+            # a window with no seat in it (a bare shell) is nothing to measure
+            wins["rt4"] = "@rt4"
+            mcalls.clear(); sweep(True)
+            ok("a window with no claude under its pane is not measured", not any(c[0] == "rt4" for c in mcalls))
+            # the real measure_seat with no id, not a track, not alone: None before any cc-context call
+            ok("the real measure_seat refuses a no-id seat that is not alone in its checkout without measuring anything",
+               _real_measure("rt5@x", "", False) is None and _real_measure("rt5", "", False) is None)
+        finally:
+            if home0 is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = home0
+            os.environ.pop("CC_HANDOFF_OVERLAP_MAX", None)
+            if rrole is not None:
+                os.environ["CC_ROLE"] = rrole
+            for k in list(wins):
+                if k.startswith("rt"):
+                    del wins[k]
+            seatd.clear(); meas.clear()
 
         # INDEX-AT-WRITE: the line journal() appends is in the library's index when it returns — `cc-lib ask` finds
         # it as a checkpoint under the target's own journal, and had nothing to re-read itself (re-read absent from

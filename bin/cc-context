@@ -6,6 +6,9 @@
   cc-context <repo> <track>        that track's session (session id from the board); `<repo>/<track>` is the same
   cc-context <repo>                the newest session in ~/dev/<repo> — the one a person steers, or an
                                    orchestrator beside it: whichever wrote its status-line file last
+                                   --since EPOCH bounds it: a session that stopped writing before that
+                                   instant is not read at all (the box measures a live seat that carries no
+                                   session id by its checkout, and the seat the owner quit is not it)
   cc-context --transcript PATH | --session ID
   cc-context --all                 TSV, one row per session active in the last day:
                                    repo track pct used window src age level -  (level: handoff or -).
@@ -31,11 +34,15 @@ raises the window.
 
 THE HAND-OFF LINE IS ONE ABSOLUTE NUMBER: CC_CONTEXT_HANDOFF_TOKENS (~/.cc/config, default 150000). Past it
 answers degrade whatever the window holds, and every wake re-reads the whole context as cache, so a session
-past the line hands off (`cc-handoff --overlap <target>`) as a spend choice of its own. This file measures
-and says; it decides nothing and interrupts nobody. The level column and a bare --over read the same line.
+past the line hands off (`cc-handoff --overlap <target>`) as a spend choice of its own; the Stop hook nags it
+once an hour. THE ROTATE LINE IS A SECOND ONE, ABOVE IT: CC_CONTEXT_ROTATE_TOKENS (default 200000; 0 = off).
+A seat still past that one is handed off BY THE BOX — `cc-handoff --sweep`, on the cc-reconcile tick, opens
+the overlap for it — because five course seats sat on five nags each and grew to 487k (2026-09-19). This file
+measures and says which lines are crossed (`level`, `rotate_line`, `rotate` in --json); the sweep decides.
+The level column and a bare --over read the hand-off line.
 
 Env: CC_CTX_WINDOW · CC_CTX_BOX_MODEL (empty = never ask the box; the selfcheck sets it) · CC_STATUSLINE_DIR ·
-CC_CONTEXT_HANDOFF_TOKENS.
+CC_CONTEXT_HANDOFF_TOKENS · CC_CONTEXT_ROTATE_TOKENS.
 """
 import glob, json, os, re, shutil, subprocess, sys, time
 
@@ -74,10 +81,20 @@ def handoff_line():
     return cfg("CC_CONTEXT_HANDOFF_TOKENS", 150000)
 
 
+def rotate_line():
+    """The rotate line in tokens: CC_CONTEXT_ROTATE_TOKENS, env else ~/.cc/config, default 200k; 0 switches the
+    box's rotation off."""
+    return cfg("CC_CONTEXT_ROTATE_TOKENS", 200000)
+
+
 def judge(m):
-    """Add the line and the level to a measurement: level is "handoff" at or past the line, else None."""
+    """Add the lines and the level to a measurement: level is "handoff" at or past the hand-off line, else None;
+    rotate is True at or past the rotate line (never when that line is 0)."""
     m["handoff_line"] = handoff_line()
     m["level"] = "handoff" if m["used"] >= m["handoff_line"] else None
+    m["rotate_line"] = rotate_line()
+    # "a seat over the hard line is handed off ... a seat under the line is untouched" (the brief): at the line counts as over
+    m["rotate"] = bool(m["rotate_line"] > 0 and m["used"] >= m["rotate_line"])
     return m
 
 
@@ -280,9 +297,11 @@ def transcript_for_session(sid):
     hits = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl"))
     return max(hits, key=os.path.getmtime) if hits else None
 
-def transcript_for_cwd(cwd):
+def transcript_for_cwd(cwd, since=0):
+    """The newest transcript written from that cwd; `since` (an epoch, 0 = no bound) drops one last written
+    before it — see newest_in()."""
     d = os.path.join(PROJECTS, re.sub(r"[/.]", "-", os.path.realpath(cwd)))
-    hits = [p for p in glob.glob(os.path.join(d, "*.jsonl"))]
+    hits = [p for p in glob.glob(os.path.join(d, "*.jsonl")) if not since or os.path.getmtime(p) >= since]
     return max(hits, key=os.path.getmtime) if hits else None
 
 def board_get(repo, track, field):
@@ -408,10 +427,14 @@ def sessions(tracks=False):
     return rows
 
 
-def newest_in(cwd):
-    """The session id of the newest status-line file whose cwd is this directory, or None."""
-    want = os.path.realpath(cwd)
+def newest_in(cwd, since=0):
+    """The session id of the newest status-line file whose cwd is this directory, or None. `since` (an epoch,
+    0 = no bound) drops a session whose last activity predates it: a seat carrying no session id is measured
+    by its checkout, and a session that stopped writing before that seat started is not that seat."""
+    want, now = os.path.realpath(cwd), time.time()
     for r in sessions():
+        if since and now - r["age"] < since:
+            continue
         if r["cwd"] and os.path.realpath(r["cwd"]) == want:
             return r["session_id"]
     return None
@@ -428,6 +451,8 @@ def line(m):
         s += "  (just compacted)"
     if m.get("level"):
         s += f"  — hand off (past the {human(m['handoff_line'])} line)"
+    if m.get("rotate"):
+        s += f"; past the {human(m['rotate_line'])} rotate line too, so the box hands it off"
     return s
 
 
@@ -435,7 +460,7 @@ def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
     as_json = quiet = do_all = False
-    over = None
+    over = since = None
     path = sid = repo = track = None
     args = []
     while argv:
@@ -453,6 +478,12 @@ def main(argv):
             path = argv.pop(0)
         elif a == "--session":
             sid = argv.pop(0)
+        elif a == "--since":
+            v = argv.pop(0) if argv else ""
+            if not re.match(r"^\d+(\.\d+)?$", v):
+                print(f"cc-context: --since takes an epoch in seconds, not '{v}'", file=sys.stderr)
+                return 2
+            since = float(v)
         elif a in ("-h", "--help"):
             print(__doc__.strip())
             return 0
@@ -489,8 +520,8 @@ def main(argv):
     if not path:
         if repo and not track:                    # the newest session in that checkout, by its status-line file
             cwd = os.path.join(DEV, repo)
-            sid = sid or newest_in(cwd)
-            path = transcript_for_session(sid) if sid else transcript_for_cwd(cwd)
+            sid = sid or newest_in(cwd, since or 0)     # --since: only what has been written since then is this seat
+            path = transcript_for_session(sid) if sid else transcript_for_cwd(cwd, since or 0)
             sid = sid or (os.path.basename(path)[:-6] if path else None)
         else:
             path, sid = resolve(repo, track, sid)
@@ -634,6 +665,18 @@ def selfcheck():
     m = judge(measure(tx([asst("claude-opus-5", 0, 0, 150000)])))
     ok("at the line the level is handoff and the line says so",
        m["level"] == "handoff" and "hand off (past the 150k line)" in line(m))
+    # the rotate line: above the hand-off line, its own number, and the box's to act on
+    ok("the rotate line defaults to 200k tokens", rotate_line() == 200000)
+    ok("one token under the rotate line is level handoff and NOT rotate, and the line does not say the box hands off",
+       not m["rotate"] and m["rotate_line"] == 200000 and "rotate line" not in line(m))
+    m = judge(measure(tx([asst("claude-opus-5", 0, 0, 200000)])))
+    ok("at the rotate line rotate is True and the line says the box hands it off",
+       m["rotate"] and m["level"] == "handoff" and "past the 200k rotate line too, so the box hands it off" in line(m))
+    os.environ["CC_CONTEXT_ROTATE_TOKENS"] = "0"
+    ok("...and CC_CONTEXT_ROTATE_TOKENS=0 switches it off at any size", not judge(m)["rotate"])
+    os.environ["CC_CONTEXT_ROTATE_TOKENS"] = "300000"
+    ok("...and a moved line is read: 200k is under 300k", not judge(m)["rotate"] and m["rotate_line"] == 300000)
+    del os.environ["CC_CONTEXT_ROTATE_TOKENS"]
 
     # --over: a percentage, or the line itself; unmeasurable is 2, never a guess
     t = tx([asst("claude-opus-5", 10, 1000, 9000)])                       # 10010 of an assumed 200k = 5%
@@ -646,8 +689,9 @@ def selfcheck():
     rc, out, err = run(["--transcript", os.path.join(cfgd, "none.jsonl"), "--over", "90"])
     ok("no transcript is exit 2 and says so", rc == 2 and out == "" and "no transcript" in err)
     rc, out, err = run(["--json", "--transcript", t])
-    ok("--json carries the line and the level", rc == 0 and json.loads(out)["handoff_line"] == 150000
-       and json.loads(out)["level"] is None)
+    ok("--json carries the lines, the level and rotate", rc == 0 and json.loads(out)["handoff_line"] == 150000
+       and json.loads(out)["level"] is None and json.loads(out)["rotate_line"] == 200000
+       and json.loads(out)["rotate"] is False)
     ok("an address with an @ in it is refused, not answered about the caller",
        run(["repo@alias"])[0] == 2 and "not <repo>" in run(["repo@alias"])[2])
 
@@ -720,6 +764,16 @@ def selfcheck():
         ok("`cc-context <repo>` is the NEWEST session in that checkout, not the older one beside it",
            newest_in(os.path.join(DEV, "repo2")) == "sid-r"
            and run(["repo2"])[1].startswith("2%  20k/1M"))
+        # --since: the box measures a seat that carries no session id by its checkout, and a session that stopped
+        # writing before that seat started is not that seat (a fresh seat rotated on a dead 300k one, review of #552)
+        ok("--since keeps a session that has written since it: 30 s ago is inside a 45 s bound",
+           newest_in(os.path.join(DEV, "repo2"), time.time() - 45) == "sid-r"
+           and run(["repo2", "--since", str(int(time.time() - 45))])[1].startswith("2%  20k/1M"))
+        ok("--since drops every session that stopped writing before it: the checkout reads as no transcript, exit 2",
+           newest_in(os.path.join(DEV, "repo2"), time.time() + 5) is None
+           and run(["repo2", "--since", str(int(time.time() + 5))])[0] == 2)
+        ok("--since without an epoch is refused, not read as a session",
+           run(["repo2", "--since"])[0] == 2 and run(["repo2", "--since", "now"])[0] == 2)
         ok("...and a checkout nothing has written under is 'no transcript', exit 2",
            run(["repo3"])[0] == 2)
         STATUSLINE_DIR, DEV, WORKTREES = sl_keep, dev_keep, wt_keep

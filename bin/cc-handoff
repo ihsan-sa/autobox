@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """cc-handoff — the overlapping handoff: a successor starts ALONGSIDE its predecessor, reads the journal, asks
 what the journal missed, and only then retires it. A session runs it itself when its context is worth the
-spend of two sessions; nothing on the box measures a line and runs it for you.
+spend of two sessions; past the ROTATE LINE the box runs it for the session (--sweep, ROTATION below).
 
   cc-handoff --overlap <target> [--session ID] [--in-flight "…"]   start a successor alongside
   cc-handoff --replace <workspace> [--session ID]   a MEMBER workspace's live session, handed off onto the
@@ -10,7 +10,9 @@ spend of two sessions; nothing on the box measures a line and runs it for you.
                                              --ready inside its sandbox); the old session drains and retires
   cc-handoff --ready [<target>] [--forced]   run BY THE SUCCESSOR: the one atomic cutover, then retire
   cc-handoff --abandon <target> [--why "…"]  give up: the successor's window goes, the record clears
-  cc-handoff --sweep                         from the cc-reconcile timer: finish what no session is left to
+  cc-handoff --sweep [--rotate]              from the cc-reconcile timer: finish what no session is left to;
+                                             with --rotate (the tick's --apply, never a bare report) also open
+                                             the overlap for a seat past the rotate line (ROTATION)
   cc-handoff --kick <target> [<id>]          internal: brief the successor once it is up, check it landed
   cc-handoff --retire <target>               internal: wait out the predecessor's subagents, DRAIN it, end it
   cc-handoff --brief <target>                ONE packet of what a successor would otherwise re-read a tool
@@ -48,6 +50,25 @@ the cc-reconcile timer, expires an overlap past it quietly (the predecessor neve
 nothing to tell it) and finalizes a record whose predecessor is gone past the grace, so the survivor is not
 gated by the record of its own success.
 
+ROTATION. A seat past CC_CONTEXT_ROTATE_TOKENS (cc-context's second line, 200k, above the 150k hand-off
+line the Stop hook nags at) is handed off by the box whether or not it acts on the nag: five course seats sat
+on five nags each, grew to 242k-487k, and one 30-minute wake across them re-read 13M cached tokens
+(2026-09-19). Every `--sweep --rotate` (cc-reconcile --apply's tick; a bare cc-reconcile reports and opens
+nothing), each live window in `main` named like a target — no record open, no `~next` beside it, not a
+worker's — is measured by the seat in it (seat_of: the `claude` under the pane, its `--session-id`/`--resume`;
+a planning seat or an orch carries none and is measured by its checkout only when no other interactive claude
+in any window of `main` shares that checkout — the peer count is taken before those filters, so a peer with
+its own overlap open or misread as a worker still counts, and the checkout is read only from that seat's OWN
+start, `cc-context --since`, or the session the owner quit is measured as the one he just started) through
+`cc-context --json`, and `rotate` true
+opens the ordinary overlap: the successor reads the journal, asks the seat its one batch, and cuts over
+itself — the seat's own transcript and journal stay the packet, and no window is killed under it.
+`<slug>.rotated` (~/.cc/state/handoff), written only when the overlap opened, holds the box off a target for
+CC_HANDOFF_ROTATE_RETRY (1 h), so an overlap that expired is not reopened every tick; a start that refused
+is tried again next tick.
+A seat the sweep cannot find under its pane or cannot measure (a member workspace's, inside its sandbox, whose
+transcript is not under ~/.claude/projects) is left alone.
+
 QUIET WHILE OPEN. start() marks the target `~/.cc/state/<target>/pulse.off` (cc-reconcile's wake honours it)
 and takes the mark back at cutover and in clear(). A mark this file did not make is never removed.
 
@@ -67,7 +88,7 @@ Env: CC_HANDOFF (the successor's own record id, exported by `cc __runnext`; it o
 `<id>.done` and not the variable says one is still open) · CC_HANDOFF_WINDOW (the successor's own tmux
 window, so it accepts its own startup dialog) · CC_HANDOFF_OVERLAP_MAX, CC_HANDOFF_RETIRE_GRACE,
 CC_HANDOFF_DRAIN, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_WAIT, CC_HANDOFF_GONE_CONFIRM, CC_HANDOFF_AGENT_IDLE,
-CC_HANDOFF_AGENT_MAX (~/.cc/config) · CC_HANDOFF_DIR, CC_CTX_RECORDS, CC_HANDOFF_TASKS (test hooks) ·
+CC_HANDOFF_AGENT_MAX, CC_HANDOFF_ROTATE_RETRY (~/.cc/config) · CC_HANDOFF_DIR, CC_CTX_RECORDS, CC_HANDOFF_TASKS (test hooks) ·
 CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log may be and still count as live, 1 h) ·
 CC_BRIEF_PACKET_BAND (--brief: the packet size, in bytes, that is recorded as context cost, 24 kB).
 """
@@ -859,7 +880,7 @@ HOST_CUTOVER_MSG = ("THIS IS A MEMBER WORKSPACE, so the host cut you over the mo
                     "it goes in your first turn; its journal is the record. ")
 
 
-def flight_line(repo, note="", host=False):
+def flight_line(repo, note="", host=False, box=False):
     """What the successor is told is unfinished RIGHT NOW. READ OFF THE LIVE WORKER TABLE — the same one --brief
     prints — and printed only when that table is non-empty: on 2026-09-16 the brief asserted "a background task
     is still running" beside a workers section that said (none), and the successor spent one of its one batch
@@ -873,14 +894,17 @@ def flight_line(repo, note="", host=False):
         # APPENDED, never assigned: a member successor's cutover notice is already in `out`, and a live loop under
         # the repo must not cost it (review of #542 — it did, and that brief fell back to "run --ready").
         out += f"Unfinished RIGHT NOW, which a journal always omits: these loops are still running under {repo} — {names} — ask about them. "
-    if note:
+    if note and box:
+        out += f"THE BOX opened this overlap, not your predecessor: {note} "
+    elif note:
         out += f"Your predecessor's own note when it opened this overlap: {note} "
     return out
 
 
-def start(target, session_id="", flight=""):
+def start(target, session_id="", flight="", box=False):
     """--overlap: the successor comes up beside the predecessor, muted and gated, with the same working
     directory. Refused while a record for this target is open — one successor at a time, never a chain.
+    `box`: the sweep's rotation opened it (ROTATION) — the brief says so, and the ledger row carries why.
     A MEMBER WORKSPACE's successor boots inside a fresh `cc-sandbox member` (cc __runnext) — the boundary as the
     box has it NOW — and cannot run --ready from in there (the record is not bound inside), so the record says
     `host_cutover` and kick() cuts over for it once its opening prompt has landed (--replace is the spelling)."""
@@ -918,12 +942,14 @@ def start(target, session_id="", flight=""):
            "quiet": quiet_claim(target),
            "host_cutover": member_workspace(repo),   # a member successor cannot run --ready: kick() does, for it
            "pct_at_start": None, "told_owner": None, "phases": []}
-    ledger(rec, "overlap-started")
+    if box:
+        rec["box"] = flight                       # the rotation's own reason, kept with the record (a reader of the file, and the selfcheck)
+    ledger(rec, "overlap-started", flight if box else "")
     write(rec)          # before the window, never after: a successor whose record is missing must find itself gated
     quiet(target, rec["quiet"])     # after the record names it, never before: see quiet_claim()
     with open(brief_path(target), "w") as f:
         f.write(BRIEF.format(target=target, journal=journal_for(target), tmux=wid, mins=int(cap // 60),
-                             flight=flight_line(repo, flight, rec["host_cutover"])))
+                             flight=flight_line(repo, flight, rec["host_cutover"], box)))
     # The successor's OWN window name, carried into it: `cc __runnext` knows the target but not this suffix, so
     # it was accepting the startup dialog in the PREDECESSOR's window and its own sat on the development-channels
     # confirmation until a human noticed (2026-09-01 02:10Z, the third time this shape of bug has parked a session).
@@ -1300,9 +1326,141 @@ def finalize(rec, why):
     print(f"cc-handoff: {target} — {why}; the record is finalized and nothing is gated by it")
 
 
-def sweep():
-    """--sweep: the reaper, run from the EXISTING cc-reconcile timer (no new unit). Nothing polices a record
-    from inside a session, so the sweep IS the deadline, and it finishes what no session is left to:
+# ---- rotation: the box hands off a seat past the rotate line (ROTATION in the header) ------------------
+
+SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")   # a session id on a command line: the shape cc-reconcile's seat_turn accepts
+
+
+def seat_of(wid):
+    """The SEAT in that window: (session id or "", cwd, started) of the interactive `claude` under its pane, or
+    None when there is none. The id is the `--session-id` (a track seat, a successor) or `--resume` (a track
+    brought back) on its command line; a planning seat (`cc <repo>`) and an orch (`cc --orch`) never carry one,
+    nor does a `-c` track — those are known by their cwd. `started` is the live process's own start (the epoch
+    /proc/<pid> was created), which is what bounds a measurement taken by cwd: see measure_seat().
+    A `-p`/`--print` claude is a worker's iteration, not a seat."""
+    todo, seen = (tmux("list-panes", "-t", wid, "-F", "#{pane_pid}") or "").split(), set()
+    while todo:
+        pid = todo.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            kids = open(f"/proc/{pid}/task/{pid}/children").read().split()
+        except OSError:
+            kids = []
+        for k in kids:
+            try:
+                if open(f"/proc/{k}/comm").read().strip() != "claude":
+                    todo.append(k)                 # a wrapper (cc, cc-sandbox, bwrap): the seat is under it
+                    continue
+                argv = open(f"/proc/{k}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+                cwd = os.readlink(f"/proc/{k}/cwd")
+                started = os.stat(f"/proc/{k}").st_ctime    # when THIS process started, in epoch seconds
+            except OSError:
+                continue
+            if any(a in ("-p", "--print") for a in argv):
+                continue
+            sid = ""
+            for flag in ("--session-id", "--resume"):
+                i = argv.index(flag) if flag in argv else -1
+                if 0 <= i < len(argv) - 1 and SID_RE.match(argv[i + 1]):
+                    sid = argv[i + 1]
+            return sid, cwd, started
+    return None
+
+
+def measure_seat(target, sid, alone, since=0):
+    """cc-context's --json for that seat, or None when it cannot be measured. By its session id when it has
+    one; a track with none by its address (the board's id, else its worktree's transcript); any other seat with
+    none by its checkout (`cc-context <repo>`, the newest session there) and ONLY when it is alone in it — a
+    planning seat and an orch share one checkout, and the newest file there says nothing about which is fat.
+    rc 2 (no transcript cc-context can read: a member workspace's lives outside ~/.claude/projects) is None.
+    THE CHECKOUT IS MEASURED ONLY FROM `since`, THE SEAT'S OWN START (`cc-context --since`): what that checkout
+    holds is the newest session file inside a DAY, so a seat the owner started after quitting a 300k one was
+    measured on the dead session's transcript and rotated before its first turn (review of #552). A seat with
+    nothing written since it started is unmeasurable, which is to say left alone."""
+    repo, alias, track = parts(target)
+    if sid:
+        argv = ["--session", sid]
+    elif track:
+        argv = [repo, track]
+    elif alone:
+        argv = [repo] + (["--since", str(int(since))] if since else [])
+    else:
+        return None
+    try:
+        r = subprocess.run([os.path.join(BIN, "cc-context")] + argv + ["--json"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=90)
+        m = json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception:
+        return None
+    return m if isinstance(m, dict) and isinstance(m.get("used"), (int, float)) else None
+
+
+def rotate():
+    """--sweep --rotate's second half — ROTATION in the header. Every live window in `main` named like a target,
+    with no record open, no `~next` beside it and not a worker's, is measured by the seat in it; one past the
+    rotate line gets the ordinary overlap opened for it, once per CC_HANDOFF_ROTATE_RETRY. Returns how many it
+    opened. PEERS ARE COUNTED FIRST, over every live window: a planning seat and its orch share one checkout and
+    neither has an id, so "alone" must see the orch even when the orch is filtered out below (its overlap open,
+    its `~next` up, a worker misread) — counted after the filters, a 50k planning seat was rotated on its orch
+    predecessor's 300k number (review of #552)."""
+    retry, now = cfg("CC_HANDOFF_ROTATE_RETRY", 3600), time.time()
+    seats, peers = [], {}                          # (target, window id, session id, cwd, start); cwd -> live seats there, any window
+    for l in (tmux("list-windows", "-t", SESSION, "-F", "#{window_id} #{pane_pid} #W") or "").splitlines():
+        col = l.split(" ", 2)
+        if len(col) < 3:
+            continue
+        wid, _, name = col
+        if not pane_live_id(wid):
+            continue                               # no session in it
+        seat = seat_of(wid)
+        if not seat:
+            continue
+        peers[seat[1]] = peers.get(seat[1], 0) + 1
+        if not TARGET_RE.match(name):
+            continue                               # a side of a handoff or an unaddressable window: a peer, never a candidate
+        if read(name) or win_id(name + NEXT):
+            continue                               # an overlap is open, or a successor window nobody recorded (orphans() reports it)
+        if worker_held(wid):
+            continue                               # a loop's window: its iteration is its own handoff (WORKER_REFUSAL)
+        seats.append((name, wid) + seat)
+    opened = 0
+    for target, wid, sid, cwd, started in seats:
+        stamp = os.path.join(HANDOFF, slug(target) + ".rotated")
+        try:
+            if now - os.path.getmtime(stamp) < retry:
+                continue                           # the box opened one inside the retry window: expired or not, not again yet
+        except OSError:
+            pass
+        m = measure_seat(target, sid, peers.get(cwd, 0) == 1, started)
+        # "a seat over the hard line is handed off ... a seat under the line is untouched" (the brief): cc-context's
+        # `rotate` is that judgement, and nothing else here reads a number
+        if not m or not m.get("rotate"):
+            continue
+        why = (f"this seat was at {int(m['used']) // 1000}k tokens, past the {int(m['rotate_line']) // 1000}k rotate "
+               f"line, and the box hands a seat off there rather than pay its whole context on every wake; "
+               f"its journal is the packet, so ask it only what the journal lacks.")
+        rc = start(target, sid, why, box=True)
+        logd(f"rotation: {target} at {int(m['used'])} tokens (line {int(m['rotate_line'])}) — start rc {rc}")
+        if rc != 0:
+            continue                               # refused (no window, a worker's caller): no stamp, so the next tick tries again
+        try:                                       # the stamp says an overlap OPENED — written only once one has
+            os.makedirs(HANDOFF, exist_ok=True)
+            with open(stamp, "w") as f:
+                json.dump({"target": target, "session_id": sid, "used": m["used"], "ts": now}, f)
+        except OSError:
+            pass
+        journal(target, f"rotated by the box: {why}")
+        opened += 1
+    return opened
+
+
+def sweep(rotate_too=False):
+    """--sweep: the reaper, run from the EXISTING cc-reconcile timer (no new unit); `--rotate` (rotate_too)
+    adds ROTATION, and only the tick's --apply passes it — a bare `cc-reconcile` reports and opens nothing.
+    Nothing polices a record from inside a session, so the sweep IS the deadline, and it finishes what no
+    session is left to:
       the predecessor's session is GONE past the retire grace -> finalize. Nobody but the successor is in
         charge of that target, and a record saying otherwise is gating the only session left.
       an overlap that never reached --ready is past its deadline (plus the grace) -> it expires QUIETLY. The
@@ -1392,6 +1550,8 @@ def sweep():
         os.replace(told_p + ".tmp", told_p)
     except OSError:
         pass
+    if rotate_too:
+        rotate()                                   # ROTATION: last, on the windows the reaping above left as they are
     return 0
 
 
@@ -1752,7 +1912,7 @@ def main(argv):
         if a in ("--session", "--why", "--in-flight"):
             opt[a[2:].replace("-", "_")] = rest[i + 1] if i + 1 < len(rest) else ""
             i += 1
-        elif a in ("--forced", "--json"):
+        elif a in ("--forced", "--json", "--rotate"):
             opt[a.lstrip("-")] = True
         elif a.startswith("--"):
             print(f"cc-handoff: unknown option {a}", file=sys.stderr)
@@ -1779,7 +1939,7 @@ def main(argv):
     if cmd == "--ready":
         return ready(target, bool(opt.get("forced")))
     if cmd == "--sweep":
-        return sweep()
+        return sweep(bool(opt.get("rotate")))
     if cmd == "--abandon":
         return abandon(target, opt.get("why", "")) if target else 1
     if cmd == "--retire":
