@@ -35,6 +35,15 @@ a check that once passed. The other half is that a check should outlive its trac
 copies the script in beside the ledger, and a check that runs a script out of a directory which dies with its
 track (a track's state dir, its worktree, /tmp) is refused.
 
+A CHECK THAT READS WHAT THE TREE NO LONGER HAS is no answer either, whatever rc it came back with. The check is
+frozen at the ask; the tree moves. a218's check read ~/.cc/state/steward/runs.jsonl, the ledger cc-steward
+kept; #483 deleted cc-steward and the row read "merged, NOT delivered" for ever, and a seat read "steward last
+ran 23 h ago" off it and spent turns probing watchers that were fine (2026-09-16). So a check that FAILS is read
+once more before it is called a failure: every path of the repo's checkout it names, every bare `cc-<name>`, and
+every ~/.cc/state/<name>/ (the ledger cc-<name> keeps) is asked of git on the base branch — gone, and once
+deleted, means the check measures nothing. That is exit 3, naming the path and the deleting commit, on every
+line you read. A check that PASSES is never second-guessed: something observable was true.
+
 A CHECK IS NOT REPLACED IN SILENCE. check-cmd will not replace a row's check without `--replace "<why>"`,
 prints the one that is there when it refuses, and keeps the reason in the row's notes. Every script under
 checks/ a check runs is fingerprinted when it is registered: `deliver` refuses (exit 3) to run one edited
@@ -209,10 +218,13 @@ def add(repo, text, who="owner", src="", track="", done_when="", check="", at=""
 
 
 # ---- the verification: a command, not a sentence ---------------------------------------------------
+DEV = os.path.join(HOME, "dev")   # where a repo's checkout lives; the selfcheck points this at a scratch dir
+
+
 def repo_dir(repo):
     """Where a row's check runs. The repo's own checkout if there is one, so a check can say `test -x bin/x`;
     otherwise the home directory, which is where a deployed thing actually lives."""
-    p = os.path.join(HOME, "dev", repo)
+    p = os.path.join(DEV, repo)
     return p if os.path.isdir(p) else HOME
 
 
@@ -228,7 +240,8 @@ def cannot_run(a):
     track's state dir. No answer is not the same as the answer no — but "no answer" has more than one cause
     (see shell_could_not_exec below), and this only tells CANNOT_RUN apart from a real failure, not one
     CANNOT_RUN cause from another."""
-    return (a.get("checked") or {}).get("rc") in CANNOT_RUN
+    c = a.get("checked") or {}
+    return c.get("rc") in CANNOT_RUN or bool(c.get("gone"))
 
 
 # bash's OWN diagnostic when it never found anything to run: always starts the line "bash: " and ends in one
@@ -382,6 +395,63 @@ def run_check(repo, a):
         return 127, "%s: %s" % (e.__class__.__name__, e)
 
 
+# ---- a check that reads what the tree no longer has ------------------------------------------------
+# The header's third cause of no answer. What a check names is read the way a person would: a bare cc-<name> is
+# a tool of this box (core/bin/ or bin/, the two places they have lived), a path whose first segment is a
+# directory of the checkout is a file of the repo, and ~/.cc/state/<name>/ is the ledger cc-<name> keeps. Only
+# the checkout's own base branch is asked (origin/HEAD as last fetched, else HEAD) and only git's own record of a
+# deletion counts: a name git never had is not gone, it was never there, and that is the check's own business.
+TOOL_DIRS = ("core/bin", "bin")
+TOOL_NAME = re.compile(r"cc-[a-z][a-z0-9-]*")
+STATE_OF = re.compile(_HOMEISH + r"/\.cc/state/([A-Za-z0-9_-]+)(?=/)")
+
+
+def git_out(root, *args):
+    try:
+        r = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def names_gone(repo, a):
+    """['<what> — deleted by <sha> <date> <subject>'] for each thing this row's check (and the scripts under
+    checks/ it runs) names that the repo's base branch no longer has. [] when ~/dev/<repo> is no git checkout:
+    a check can only be read against a tree that is there."""
+    root = repo_dir(repo)
+    if not git_out(root, "rev-parse", "--show-toplevel"):
+        return []
+    ref = (git_out(root, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")
+           or ("origin/main" if git_out(root, "rev-parse", "--verify", "-q", "origin/main") else "HEAD"))
+    have = set()
+    for f in git_out(root, "ls-tree", "-r", "--name-only", ref).splitlines():
+        parts = f.split("/")
+        have.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+    text = a.get("check") or ""
+    for p in check_files(text):
+        try: text += "\n" + open(p, errors="replace").read()
+        except OSError: pass
+    want = {}     # what the check names -> (the paths git would have had for it, how the line reads)
+    for tok in re.findall(r"[^\s;&|()<>`'\"=,]+", text):
+        tok = tok.rstrip(".:/")
+        if TOOL_NAME.fullmatch(tok):
+            want[tok] = ([d + "/" + tok for d in TOOL_DIRS], tok)
+        elif ("/" in tok and not tok.startswith(("/", "~", "$", ".")) and ".." not in tok.split("/")
+              and os.path.isdir(os.path.join(root, tok.split("/")[0]))):
+            want[tok] = ([tok], tok)
+    for m in STATE_OF.finditer(text):
+        want.setdefault(m.group(0), ([d + "/cc-" + m.group(1) for d in TOOL_DIRS], "%s (the ledger cc-%s kept)" % (m.group(0), m.group(1))))
+    out = []
+    for paths, label in want.values():
+        if any(p in have for p in paths):
+            continue
+        d = git_out(root, "log", "-1", "--diff-filter=D", "--format=%h %cs %s", ref, "--", *paths)
+        if d:
+            sha, date, subj = (d.split(" ", 2) + ["", ""])[:3]
+            out.append("%s \u2014 deleted by %s %s %s" % (label, sha, date, subj[:60] + ("\u2026" if len(subj) > 60 else "")))
+    return out
+
+
 def get(repo, aid):
     a = load(repo)["asks"].get(aid)
     if not a: sys.exit("cc-scope: %s has no ask '%s'" % (repo, aid))
@@ -414,6 +484,8 @@ def line(repo, a, many=False):
     # "has home been updated yet?" is the question this is here to answer without anyone having to go and look.
     if a["status"] == "merged":
         why = "\n       ⚠ merged, NOT delivered — %s" % (
+            "its check reads what the tree no longer has (%s), so nothing has been measured — not a red check: %s"
+            % ("; ".join(a["checked"]["gone"]), a["check"]) if (a.get("checked") or {}).get("gone") else
             "its check CANNOT RUN, so nothing has been measured either way — not a red check: %s" % a["check"]
             if cannot_run(a) else "its check has not passed: %s" % a["check"] if has_check(a)
             else "it names no check, so nothing has observed it")
@@ -489,6 +561,8 @@ def main(argv):
                                     "passed %s" % c["ts"] if c.get("rc") == 0 else
                                     "COULD NOT RUN %s (rc %d) — nothing measured" % (c["ts"], c["rc"])
                                     if c.get("rc") in CANNOT_RUN else
+                                    "reads what the tree no longer has %s (rc %d) — nothing measured: %s"
+                                    % (c["ts"], c["rc"], "; ".join(c["gone"])) if c.get("gone") else
                                     "ran and FAILED %s (rc %d)" % (c["ts"], c["rc"])))
         print("  %s" % a["text"])
         for p in a.get("parts", []): print("    – %s" % p)
@@ -547,16 +621,21 @@ def main(argv):
             return 3
         rc, o = run_check(repo, a)
         tail = " ".join((o or "").split())[-300:]
-        silent = rc in CANNOT_RUN     # no answer, which is not the answer no
+        # A FAILING CHECK IS READ ONCE MORE before it is called a failure: one that names what the tree no longer
+        # has measured nothing (the header's third cause). A pass is never second-guessed.
+        dead = names_gone(repo, a) if rc and rc not in CANNOT_RUN else []
+        silent = rc in CANNOT_RUN or bool(dead)     # no answer, which is not the answer no
         def upd(x):
             rec = {"ts": now(), "cmd": x["check"], "rc": rc, "out": tail}
+            if dead: rec["gone"] = dead
             if rc == 0:
                 x["checked"] = rec
                 x["status"], x["closed"] = "delivered", now()
                 x["evidence"] = ((ev + " \u00b7 ") if ev else "") + "check passed: " + x["check"]
             elif silent:
-                x["notes"].append({"ts": now(), "msg": "check COULD NOT RUN (rc %d) %s \u2014 %s"
-                                                      % (rc, x["check"], tail[:160])})
+                x["notes"].append({"ts": now(), "msg": ("check reads what the tree no longer has (rc %d) %s \u2014 %s"
+                                                       % (rc, x["check"], "; ".join(dead)[:200])) if dead else
+                                                      "check COULD NOT RUN (rc %d) %s \u2014 %s" % (rc, x["check"], tail[:160])})
                 # A check that was never asked must not erase the answer of one that was: overwriting a green
                 # record with rc=127 would drag a delivered row back onto the queue because a FILE went away.
                 if not passed(x): x["checked"] = rec
@@ -566,6 +645,15 @@ def main(argv):
         edit(repo, aid, upd)
         if rc and not silent and a.get("status") == "merged":
             record_undelivered(repo, a, rc, o)   # "a merged fix still fails its check": the ledger's line, once per merge
+        if dead:
+            print("cc-scope: %s %s \u2014 NO ANSWER: its check reads what the tree no longer has, so its rc %d measures\n"
+                  "  nothing%s. This is NOT a failed check.\n  %s\n%s\n"
+                  "  Scope the ask against what is there now (`git show <sha> --stat` says where it went) and give it a\n"
+                  "  check that can be true, or decline it:\n"
+                  "    cc-scope check-cmd %s %s '<command>' --replace \"<why>\"  \u00b7  cc-scope decline %s %s --why \"<why>\""
+                  % (repo, aid, rc, " and the row stays '%s' on the run that did pass" % a["status"] if passed(a) else "",
+                     a["check"], "\n".join("    " + d for d in dead), repo, aid, repo, aid), file=sys.stderr)
+            return 3
         if silent:
             if shell_could_not_exec(o):
                 # bash itself never found anything to run — the vanished-script cause #297 was written for.
@@ -641,6 +729,8 @@ def main(argv):
             if a["status"] == "merged":
                 why = ("STILL OPEN, names no check — cc-scope check-cmd %s %s '<cmd>'" % (r, a["id"])
                        if not has_check(a) else
+                       "STILL OPEN and NEVER MEASURED — its check reads what the tree no longer has (%s), which is not a red check: %s"
+                       % ("; ".join(a["checked"]["gone"]), a["check"]) if (a.get("checked") or {}).get("gone") else
                        "STILL OPEN and NEVER MEASURED — its check CANNOT RUN, which is not a red check: %s"
                        % a["check"] if cannot_run(a) else
                        "STILL OPEN, its check has not passed: %s" % a["check"])
@@ -718,9 +808,10 @@ def main(argv):
 
 # ---- selfcheck -------------------------------------------------------------------------------------
 def selfcheck():
-    global SCOPE
+    global SCOPE, DEV
     import tempfile, shutil, io
     SCOPE = tempfile.mkdtemp(prefix="cc-scope-selfcheck-")
+    DEV = os.path.join(SCOPE, "dev")   # the checkouts the gone cases read: nothing under ~/dev is touched
     _fl = os.environ.get("CC_FAILURES")
     os.environ["CC_FAILURES"] = os.path.join(SCOPE, "failures")   # the deliver cases below write records: a scratch ledger, never the box's own
     def ledger(repo):
@@ -1035,6 +1126,51 @@ def selfcheck():
         t("hook is a silent no-op: it prints nothing, exits 0 and opens no row",
           hrc == 0 and hout == "" and repos() == _ledgers and not os.path.exists(path("box")))
 
+
+        # ---- A CHECK THAT READS WHAT THE TREE NO LONGER HAS (the header's third cause) ----------------------
+        # Its own checkout: two tools, one deleted in a squash commit; its own ledger row per case.
+        G = "_scopegone"
+        gsrc = os.path.join(DEV, G)
+        os.makedirs(os.path.join(gsrc, "core", "bin"))
+        def ggit(*a_):
+            return subprocess.run(["git", "-C", gsrc, *a_], capture_output=True, text=True,
+                                  env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+        subprocess.run(["git", "init", "-q", "-b", "main", gsrc], capture_output=True)
+        for fn in ("cc-old", "cc-kept"):
+            open(os.path.join(gsrc, "core", "bin", fn), "w").write("#!/bin/sh\n")
+        ggit("add", "-A"); ggit("commit", "-qm", "base")
+        ggit("rm", "-q", "core/bin/cc-old"); ggit("commit", "-qm", "the old tool goes (#12)")
+        def gone_row(text, check):
+            aid, _ = add(G, text, check=check)
+            quiet(["merged", G, aid, "--evidence", "PR #12"])
+            return aid
+        aK = gone_row("the old tool answers in one line", "test -x core/bin/cc-old")
+        rcK, outK = run_capture_err(["deliver", G, aK])
+        t("a failing check naming a path the tree no longer has is NO ANSWER: exit 3, the path and the deleting commit",
+          rcK == 3 and "NO ANSWER" in outK and "core/bin/cc-old" in outK and "(#12)" in outK and "git show" in outK)
+        t("...and the row says so, not 'failed': the record carries what is gone and stays merged",
+          get(G, aK)["status"] == "merged" and get(G, aK)["checked"].get("gone")
+          and any("reads what the tree no longer has" in n["msg"] for n in get(G, aK)["notes"])
+          and not any("check FAILED" in n["msg"] for n in get(G, aK)["notes"]))
+        t("...on every line a person reads: list, unverified, show",
+          "reads what the tree no longer has" in run_capture(["list", G])
+          and "reads what the tree no longer has" in run_capture(["unverified", G])
+          and "reads what the tree no longer has" in run_capture(["show", G, aK]))
+        t("...and it is not written to the failures ledger — nothing was measured",
+          not any(x.get("links", {}).get("ask") == aK for x in ledger(G)))
+        aL = gone_row("the steward ran since the ask", "test -s ~/.cc/state/old/runs.jsonl")
+        rcL, outL = run_capture_err(["deliver", G, aL])
+        t("a check reading ~/.cc/state/<name>/ is read as the ledger cc-<name> kept, and that tool's deletion is named",
+          rcL == 3 and "the ledger cc-old kept" in outL and "(#12)" in outL)
+        aM = gone_row("the kept tool is executable", "test -d core/bin/cc-kept")
+        t("a failing check naming a tool that IS there is a plain failure: exit 1",
+          quiet(["deliver", G, aM]) == 1 and not get(G, aM)["checked"].get("gone"))
+        aN = gone_row("a tool nobody wrote yet", "test -x core/bin/cc-never")
+        t("a name git never had is not gone, it was never there — a plain failure too", quiet(["deliver", G, aN]) == 1)
+        aO = gone_row("the old tool is really gone", "test ! -e core/bin/cc-old")
+        t("a check that PASSES is never second-guessed, whatever it names", quiet(["deliver", G, aO]) == 0
+          and get(G, aO)["status"] == "delivered")
 
         n = int(run_capture(["count", R]))
         t("count is the number of unsettled asks", n == len(select(R)))
