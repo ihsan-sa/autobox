@@ -2,7 +2,8 @@
 # selftest.sh — end-to-end test of the cc layer against a throwaway local repo (bare "remote"). No API calls:
 export CC_NOTIFY_LOG_ONLY=1   # never push to the owner from tests
 export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage limit resets' is capped at 1 s
-export CC_SPEND_TIER=autonomous   # the box's own spend tier (cc-tier) never colours a fixture: each --go below must start
+export CC_SPEND_TIER=autonomous   # the box's own spend tier (cc-tier) never colours a fixture: each --go below must start — and cc carries
+                                  # it into the loop's tmux window (its `pre` list), where cc-loop asks the tier again; the case is by the CC_LOOP_TRIM one
 # claude is stubbed (CC_CLAUDE). Safe to run anytime, INCLUDING alongside other copies of itself from other
 # worktrees: every run is namespaced (see $RUN below), a few run at once and the rest wait (see the slots below)
 # and each cleans up after itself.  Usage: tests/selftest.sh   — or, from a landing, with CC_LAND_CHANGED naming
@@ -2290,6 +2291,15 @@ gfl=$(god env CC_FAILURES="$T/flx"); gnofl=$(god env -u CC_FAILURES)
 { grep -qF "CC_FAILURES=$T/flx " <<<"$gfl" && ! grep -q CC_FAILURES <<<"$gnofl"; } \
   && ok "CC_FAILURES crosses \`cc --go\` into the loop's window — a suite's fixture stops reach its scratch ledger, never the box's own — and nothing is carried when it is unset" \
   || bad "CC_FAILURES does not cross the tmux window: set='$(head -c 120 <<<"$gfl")' unset='$(head -c 90 <<<"$gnofl")'"
+# …and the spend tier. cc's own tier door reads the environment, but cc-loop asks `cc-tier allows` again at its start
+# and at every iteration, from inside the window: off the list it read the BOX's ~/.cc/config, and this file's own
+# `export CC_SPEND_TIER=autonomous` (line 5) never reached it — under the box's `stop` (2026-09-16..18) the w1 loop
+# above died at its door with no log line, five cases red, and nothing named the tier. "each --go below must start"
+# holds only if the word crosses.
+gtier=$(god env CC_SPEND_TIER=autonomous); gnotier=$(god env -u CC_SPEND_TIER)
+{ grep -q 'CC_SPEND_TIER=autonomous ' <<<"$gtier" && ! grep -q CC_SPEND_TIER <<<"$gnotier"; } \
+  && ok "CC_SPEND_TIER crosses \`cc --go\` into the loop's window — the tier the dispatcher answered from is the one the loop's own door asks, so a fixture under the box's stop still starts — and nothing is carried when it is unset" \
+  || bad "CC_SPEND_TIER does not cross the tmux window: set='$(head -c 120 <<<"$gtier")' unset='$(head -c 90 <<<"$gnotier")'"
 for t in w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
 
 fi
