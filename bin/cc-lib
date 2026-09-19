@@ -123,6 +123,15 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
               record or a claim id.
   live        ~/.cc/state/tier.log (cc-tier set's `<utc> <old> -> <new>` lines) — read from the file by `ask` when the
               question names the tier, never indexed: the question is what it holds now
+  per repo    REPO_SOURCES: patterns registered for ONE repo by name, never as a global glob (a second repo with the same
+              files is not read). For `lessons`, under <tree>/lessons/<course>/: COURSE.md and STUDY.md (one record
+              per heading, kind document; STUDY's "Corrections" is kind finding), materials/notes/*.md (one record
+              per heading — a "## Page N" section), materials/chats/*.md (one record per file, kind chat) and
+              claude_lessons/*/server/chat.log* (one record per turn — a CHAT_START and its CHAT_OK — kind chat,
+              titled `chat <course>/<lesson> #<chat>.<msg>`). <tree> is EACH WORKTREE under ~/.cc/worktrees/<repo>/
+              (a course seat's checkout, the track its name) and then the project path: one copy of a relative path
+              is read, the newest by mtime, a tie going to the worktree — a seat writes there and merges at
+              milestones, so a search that saw only the primary would miss the current state.
   Never read: anything not listed; a file whose name says secret, credential, password or .env, or token unless it
   is a .md (a memory file is named after its rule); a file over 4 MiB.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
@@ -154,12 +163,18 @@ HITS = 8               # search hits shown per page
 FTS_DEADLINE = 2.0     # seconds, one index operation
 RECONCILE_BUDGET = 1.5 # seconds `ask` spends bringing stale sources in before it searches
 MAX_SOURCE = 4 << 20   # a registered file over this is unreadable, not read
-NEEDS = ("current", "decision", "history", "aggregate")   # kinds: event note decision finding document checkpoint
+NEEDS = ("current", "decision", "history", "aggregate")   # kinds: event note decision finding document checkpoint chat
 # kind fit per need: "a decision outranks a journal opinion about it"; a state record outranks prose for `current`
-FIT = {"current": {"event": 3, "finding": 3, "checkpoint": 2, "note": 2, "decision": 1, "document": 0},
-       "decision": {"decision": 3, "document": 2, "note": 1, "finding": 1, "checkpoint": 0, "event": 0},
-       "history": {"checkpoint": 3, "note": 2, "event": 2, "finding": 2, "document": 1, "decision": 1},
+FIT = {"current": {"event": 3, "finding": 3, "checkpoint": 2, "note": 2, "decision": 1, "document": 0, "chat": 0},
+       "decision": {"decision": 3, "document": 2, "note": 1, "finding": 1, "checkpoint": 0, "event": 0, "chat": 0},
+       "history": {"checkpoint": 3, "note": 2, "event": 2, "finding": 2, "document": 1, "decision": 1, "chat": 1},
        "aggregate": {}}
+# PER-REPO SOURCES (design-notes-ingest.md §5, row 5): repo name -> ((pattern under <tree>, skind), …). Registered for
+# that repo by name and never as a global glob — "a member repo that happened to be registered would not match".
+REPO_SOURCES = {"lessons": (("lessons/*/COURSE.md", "course"), ("lessons/*/STUDY.md", "study"),
+                            ("lessons/*/materials/notes/*.md", "note"), ("lessons/*/materials/chats/*.md", "chat"),
+                            ("lessons/*/claude_lessons/*/server/chat.log*", "chatlog"))}
+CHATLOG_LINE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\] \[([A-Z_0-9]+)\] ?(.*)$")   # proxy.js's log()
 CAPLINE = "  …(cap reached)"
 CURRENT_CAVEAT = ("CURRENT: records say what was written, as of their stamps; a live state (a unit, a URL, a token's "
                   "reach, a process, a merged ref) is not probed by cc-lib — probe the object before claiming it is "
@@ -394,6 +409,25 @@ def registry():
             for pat in ("docs/**/*.md", "core/docs/*.md", "CLAUDE.md", "README.md", "core/README.md"):
                 for p in sorted(glob.glob(os.path.join(proj, pat), recursive=True)):
                     add(p, "doc", repo)
+            # REPO_SOURCES, "over the project path and each live course-seat worktree, worktree first": the trees are
+            # every worktree under ~/.cc/worktrees/<repo>/ and then the primary; of the copies of one relative path
+            # the newest by mtime is read (a tie goes to the worktree, first in the order) and the others are not —
+            # the design's "a newer copy in a worktree wins over the primary", and a seat left behind by main loses.
+            trees = [(t, os.path.basename(t)) for t in sorted(glob.glob(os.path.join(H, ".cc", "worktrees", repo, "*")))
+                     if os.path.isdir(t) and not os.path.islink(t)] + [(proj, "")]
+            for pat, skind in REPO_SOURCES.get(repo, ()):
+                best = {}   # relative path -> (mtime, path, track)
+                for tree, track in trees:
+                    for p in sorted(glob.glob(os.path.join(tree, pat))):
+                        try:
+                            mt = os.stat(p).st_mtime_ns
+                        except OSError:
+                            continue
+                        rel = os.path.relpath(p, tree)
+                        if rel not in best or mt > best[rel][0]:
+                            best[rel] = (mt, p, track)
+                for rel in sorted(best):
+                    add(best[rel][1], skind, repo, best[rel][2])
     for p in sorted(glob.glob(os.path.join(H, "*.md"))):
         add(p, "doc")
     for p in sorted(glob.glob(os.path.join(H, ".claude", "projects", "*", "memory", "*.md"))):
@@ -673,6 +707,68 @@ def parse_slack(path, text):
     return recs
 
 
+def course_of(path):
+    """`<course>` and `<lesson>` off a REPO_SOURCES path: …/lessons/<course>/[claude_lessons/<lesson>/…]"""
+    parts = path.split(os.sep)
+    course = lesson = ""
+    for i, seg in enumerate(parts):
+        if seg == "lessons" and i + 1 < len(parts):
+            course = parts[i + 1]
+        if seg == "claude_lessons" and i + 1 < len(parts):
+            lesson = parts[i + 1]
+    return course, lesson
+
+
+def parse_chat(path, text, track):
+    """A distilled tutor chat (materials/chats/<file>.md): ONE record per file, kind chat, titled by course and file."""
+    course, _ = course_of(path)
+    m = HEAD.match(text.split("\n", 1)[0])
+    title = f"chat {course} " + (m.group(2) if m else os.path.basename(path)[:-3])
+    ts = date_of(os.path.basename(path)) or mtime_iso(path)
+    return [dict(kind="chat", title=title, ts=ts, text=s, span=f"L1-{text.count(chr(10)) + 1}", part=i, track=track)
+            for i, s in enumerate(spans(text.strip() or title))]
+
+
+def parse_chatlog(path, text, track):
+    """The lesson server's chat.log (proxy.js's `[ts] [EVENT] k=v …` lines): ONE record per turn, kind chat — the
+    CHAT_START's `message=` and the CHAT_OK's `response=` of the same chatNum and msg, as Q and A; a turn whose answer
+    has not arrived is its question alone. A line that does not open with a stamp continues the line before it (a
+    message with a newline in it). Every other event (SERVER_START, CHAT_ERROR, …) is not a record."""
+    course, lesson = course_of(path)
+    events = []   # [line no, stamp, event, rest]
+    for i, line in enumerate(text.split("\n")):
+        m = CHATLOG_LINE.match(line)
+        if m:
+            events.append([i + 1, m.group(1), m.group(2), m.group(3)])
+        elif events and line.strip():
+            events[-1][3] += "\n" + line
+    turns, order = {}, []
+    for ln, stamp, ev, rest in events:
+        if ev not in ("CHAT_START", "CHAT_OK"):
+            continue
+        head = re.split(r" (?:message|response)=", rest, 1)[0]   # the keys before the text; the text is the last field
+        keys = dict(re.findall(r"(?:^| )(chatNum|msg)=(\d+)", head))
+        key = f"{keys.get('chatNum', '?')}.{keys.get('msg', '?')}"
+        if ev == "CHAT_START":
+            _, _, q = rest.partition("message=")
+            turns[key] = dict(ln=ln, stamp=stamp, q=q.strip(), a="")
+            order.append(key)
+        elif key in turns:
+            _, _, a = rest.partition("response=")
+            turns[key]["a"] = a.strip()
+            turns[key]["end"] = ln
+    recs = []
+    for key in order:
+        t = turns[key]
+        body = "Q: " + t["q"] + ("\n\nA: " + t["a"] if t["a"] else "")
+        ts = date_of(t["stamp"]) or mtime_iso(path)
+        span = f"L{t['ln']}-{t.get('end', t['ln'])}"
+        title = f"chat {course}/{lesson} #{key} {ts}"
+        for i, s in enumerate(spans(body)):
+            recs.append(dict(kind="chat", title=title, ts=ts, text=s, span=span, part=i, track=track))
+    return recs
+
+
 def parse(path, skind, repo, track, rows):
     with open(path, "rb") as f:
         raw = f.read(MAX_SOURCE + 1)
@@ -681,6 +777,16 @@ def parse(path, skind, repo, track, rows):
     text = raw.decode("utf-8", "replace")
     if skind in ("journal", "doc", "memory"):
         return parse_md(path, text, skind, repo, track, rows)
+    if skind in ("course", "study", "note"):   # a course file at heading grain, like a doc: a "## Page N" section is a record
+        recs = parse_md(path, text, "doc", repo, track, rows)
+        for r in recs:
+            if skind == "study" and re.match(r"corrections?\b", r["title"], re.I):   # row 5: "Corrections" is kind finding
+                r["kind"] = "finding"
+        return recs
+    if skind == "chat":
+        return parse_chat(path, text, track)
+    if skind == "chatlog":
+        return parse_chatlog(path, text, track)
     if skind == "board":
         return parse_board(path, text, repo)
     if skind in ("land-root", "land-job"):
@@ -2319,6 +2425,7 @@ def selfcheck():
         selfcheck_p3(th, ok, run, w)
         selfcheck_live(th, ok, run, w)
         selfcheck_workspaces(th, ok, run, w)
+        selfcheck_lessons(th, ok, run, w)
     finally:
         H = H0
         shutil.rmtree(th, ignore_errors=True)
@@ -2756,6 +2863,103 @@ def selfcheck_workspaces(th, ok, run, w):
        and "scope=index.sqlite" in so)
     rc, o = run("ask", "--need", "history", f"{K}-wsa-journal")
     ok("…and the owner's aggregate now names it ws=wsz, with no record left under the old handle", " ws=wsz" in o and " ws=wsa" not in o)
+
+
+def selfcheck_lessons(th, ok, run, w):
+    """REPO_SOURCES, row 5 of design-notes-ingest.md: a fixture repo `lessons` with the five files is found by `ask`
+    at the grain the design names; a newer copy in a fixture worktree wins over the primary (and an older one loses);
+    the same files under a second registered repo without the patterns are not found."""
+    def outcome(out):
+        m = re.search(r"^OUTCOME (\S+)", out, re.M)
+        return m.group(1) if m else "?"
+    proj = os.path.join(th, "dev", "lessons")
+    os.makedirs(proj, exist_ok=True)
+    w(".cc/boards/lessons.json", json.dumps({"repo": "lessons", "path": proj, "tracks": {}, "log": []}))
+    course = "lessons/ECE203/"
+    w("dev/lessons/" + course + "COURSE.md", "# ECE203 — course state\n\n## Outline\nthe QUOKKA-OUTLINE of the term.\n\n## Lesson map\n01 overview.\n")
+    st = w("dev/lessons/" + course + "STUDY.md", "# ECE203 — study state\n\n## Studied\nnote 13, the Poisson derivation.\n\n"
+           "## Corrections\n- 2026-09-16: said the QUOKKA-CORRECTION-OLD was a binomial; it is Poisson.\n\n## Weak spots\nconditional probability.\n")
+    w("dev/lessons/" + course + "materials/notes/2026-09-15-ps1.md", "# ps1\n\n## Page 1\nQUOKKA-PAGE-ONE the first problem.\n\n## Page 2\nQUOKKA-PAGE-TWO the second.\n")
+    w("dev/lessons/" + course + "materials/chats/2026-09-16-01-overview.md", "# 2026-09-16 — 01-overview (2 turns)\n\nasked about QUOKKA-DISTILLED Poisson.\n\n"
+      "## Second heading\nstill the same file.\n")
+    w("dev/lessons/" + course + "claude_lessons/01-overview/server/chat.log",
+      "[2026-09-16T10:52:00.000Z] [SERVER_START] port=3001 cwd=/x tools=Read\n"
+      "[2026-09-16T10:52:30.632Z] [CHAT_START] chatNum=17 msg=1 model=sonnet effort=high message=what is QUOKKA-TURN-ONE about?\n"
+      "a second line of the question\n"
+      "[2026-09-16T10:53:15.559Z] [CHAT_OK] chatNum=17 msg=1 input=10 output=1069 cost=0.12 totalCost=2.85 response=QUOKKA-ANSWER-ONE: a Poisson limit.\n"
+      "[2026-09-16T10:56:33.086Z] [CHAT_START] chatNum=18 msg=1 model=sonnet effort=high message=QUOKKA-TURN-TWO, unanswered yet\n"
+      "[2026-09-16T10:57:00.000Z] [CHAT_ERROR] chatNum=18 error=timeout\n")
+    # the same five files under a SECOND registered repo, which has no patterns: never read
+    other = os.path.join(th, "dev", "other")
+    w(".cc/boards/other.json", json.dumps({"repo": "other", "path": other, "tracks": {}, "log": []}))
+    for rel in (course + "COURSE.md", course + "STUDY.md", course + "materials/notes/2026-09-15-ps1.md",
+                course + "materials/chats/2026-09-16-01-overview.md", course + "claude_lessons/01-overview/server/chat.log"):
+        w("dev/other/" + rel, "# other\n\n## Corrections\nQUOKKA-OTHER-REPO must not be found.\n"
+          "[2026-09-16T10:52:30.632Z] [CHAT_START] chatNum=1 msg=1 message=QUOKKA-OTHER-REPO\n")
+    rc, o = run("index")
+    c = db()
+    kinds = {r[0]: r[1] for r in c.execute("SELECT title, kind FROM records WHERE repo='lessons'")}
+    srcs = {r[0]: r[1] for r in c.execute("SELECT path, skind FROM sources WHERE repo='lessons' AND skind!='board'")}
+    ok("the five patterns are sources of repo lessons under the project path, each at its skind",
+       rc == 0 and sorted(set(srcs.values())) == ["chat", "chatlog", "course", "note", "study"] and len(srcs) == 5)
+    ok("COURSE.md and STUDY.md are one record per heading (kind document); STUDY's 'Corrections' is kind finding",
+       kinds.get("Outline") == "document" and kinds.get("Lesson map") == "document" and kinds.get("Studied") == "document"
+       and kinds.get("Corrections") == "finding" and kinds.get("Weak spots") == "document")
+    ok("a page section of a note is a record: 'Page 1' and 'Page 2' each, kind document",
+       kinds.get("Page 1") == "document" and kinds.get("Page 2") == "document")
+    chats = c.execute("SELECT title, text, span FROM records WHERE repo='lessons' AND kind='chat' ORDER BY title").fetchall()
+    ok("a distilled chat is ONE record per file (kind chat), its second heading not a record of its own",
+       "Second heading" not in kinds and any(t.startswith("chat ECE203 2026-09-16") and "QUOKKA-DISTILLED" in x and "still the same file" in x for t, x, _ in chats))
+    t1 = [x for x in chats if "#17.1" in x[0]]
+    t2 = [x for x in chats if "#18.1" in x[0]]
+    ok("a chat.log turn is a record (kind chat): the CHAT_START's message with its continuation line and the CHAT_OK's response, "
+       "titled by course, lesson and turn; SERVER_START and CHAT_ERROR are not records",
+       len(t1) == 1 and t1[0][0] == "chat ECE203/01-overview #17.1 2026-09-16T10:52Z" and t1[0][2] == "L2-4"
+       and "Q: what is QUOKKA-TURN-ONE about?\na second line of the question\n\nA: QUOKKA-ANSWER-ONE" in t1[0][1]
+       and not c.execute("SELECT 1 FROM records WHERE repo='lessons' AND (text LIKE '%SERVER_START%' OR text LIKE '%timeout%')").fetchone())
+    ok("…a turn whose answer has not arrived is its question alone", len(t2) == 1 and t2[0][1] == "Q: QUOKKA-TURN-TWO, unanswered yet")
+    ok("the same files under the second repo are NOT sources: per repo, not a global glob",
+       not c.execute("SELECT 1 FROM sources WHERE path LIKE ?", (other + "%",)).fetchone()
+       and not c.execute("SELECT 1 FROM records WHERE text LIKE '%QUOKKA-OTHER-REPO%'").fetchone())
+    c.close()
+    rc, o = run("ask", "--repo", "lessons", "--need", "current", "QUOKKA-CORRECTION-OLD")
+    ok("found by ask: the correction, kind finding, cited at the primary's STUDY.md",
+       rc == 0 and outcome(o) == "answered" and "[finding " in o and "~/dev/lessons/lessons/ECE203/STUDY.md[" in o)
+    rc, o = run("ask", "--need", "history", "QUOKKA-OTHER-REPO")
+    ok("…and the second repo's copy is not found by ask", outcome(o) == "not-recorded" and "QUOKKA-OTHER-REPO must" not in o)
+    # ---- a course seat's worktree: its NEWER STUDY.md wins over the primary's; its OLDER COURSE.md loses to it
+    wt = os.path.join(th, ".cc", "worktrees", "lessons", "ece203")
+    st2 = w(".cc/worktrees/lessons/ece203/" + course + "STUDY.md", "# ECE203 — study state\n\n## Corrections\n- 2026-09-17: QUOKKA-CORRECTION-NEW, the seat's copy.\n")
+    co2 = w(".cc/worktrees/lessons/ece203/" + course + "COURSE.md", "# ECE203 — course state\n\n## Outline\nQUOKKA-OUTLINE-STALE, the seat's older copy.\n")
+    now = time.time()
+    os.utime(st, (now - 100, now - 100))
+    os.utime(st2, (now - 50, now - 50))
+    os.utime(os.path.join(proj, course, "COURSE.md"), (now - 50, now - 50))
+    os.utime(co2, (now - 100, now - 100))
+    rc, o = run("index")
+    c = db()
+    paths = {r[0]: r[1] for r in c.execute("SELECT path, track FROM sources WHERE repo='lessons' AND path LIKE '%.md'")}
+    c.close()
+    ok("the worktree's newer STUDY.md is the source (track = the seat), the primary's older copy is not",
+       rc == 0 and paths.get(st2) == "ece203" and st not in paths)
+    ok("control: the worktree's OLDER COURSE.md loses to the primary's newer copy — the newest wins, not the worktree as such",
+       os.path.join(proj, course, "COURSE.md") in paths and co2 not in paths)
+    rc, o = run("ask", "--repo", "lessons", "--need", "current", "QUOKKA-CORRECTION-NEW")
+    ok("found by ask: the seat's correction, cited at the worktree path",
+       rc == 0 and outcome(o) == "answered" and "~/.cc/worktrees/lessons/ece203/lessons/ECE203/STUDY.md[" in o)
+    rc, o = run("ask", "--repo", "lessons", "--need", "current", "QUOKKA-CORRECTION-OLD")
+    ok("…and the primary's older correction is gone from the index", outcome(o) == "not-recorded")
+    rc, o = run("ask", "--repo", "lessons", "--need", "current", "QUOKKA-OUTLINE-STALE")
+    ok("…as is the seat's stale outline", outcome(o) == "not-recorded")
+    # a tie goes to the worktree: "worktree first"
+    os.utime(st, (now - 50, now - 50))
+    rc, o = run("index")
+    c = db()
+    tie = c.execute("SELECT path FROM sources WHERE repo='lessons' AND path LIKE '%STUDY.md'").fetchall()
+    c.close()
+    ok("on an equal mtime the worktree's copy is the one read (worktree first)", tie == [(st2,)])
+    for p in (".cc/boards/lessons.json", ".cc/boards/other.json"):
+        os.remove(os.path.join(th, p))
 
 
 def lines_with(T, outcome):
