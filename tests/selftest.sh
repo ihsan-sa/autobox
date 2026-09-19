@@ -2674,7 +2674,17 @@ nl0=$(wc -l < "$MH/.cc/notify.log")
 ME env CC_CLAUDE="$T/probeclaude" "$B/cc-model" tick
 { [ ! -f "$MH/.cc/state/model-override" ] && [ "$(M status)" = fable ]; } && ok "tick restores fable once the reset passed and the probe answered" || bad "override survived a successful probe"
 sleep 1
-MT capture-pane -p -t _ccmodel:sess | grep -qF '/model claude-fable-5[1m]' && ok "restore typed /model claude-fable-5[1m] into the live session" || bad "restore not typed"
+# THE LIFT HANDS A SESSION BACK; IT DOES NOT RETYPE IT (owner, 2026-09-18). A window that belongs on the primary
+# gets `cc-handoff --overlap`, and the `/model` line the restore used to type is gone. cc-handoff does not run to
+# completion here: it works on `main:<window>` and this fixture's tmux server has no `main`, on purpose, so it
+# refuses and its refusal is the row's tail. What this asserts is the ask, and that the pane was left alone. The
+# card a window that is not major gets, and the 👍 that runs `cc-model return`, stay in cc-model's own selfcheck:
+# neither may reach Slack from here.
+mrows=$(grep -c $'\thandoff\t' "$MH/.cc/state/model.log")
+{ ! MT capture-pane -p -t _ccmodel:sess | grep -qF '/model claude-fable-5[1m]'; } && [ "$mrows" = 1 ] \
+  && grep -qF $'\thandoff\tclaude-fable-5[1m]\t_ccmodel:sess' "$MH/.cc/state/model.log" \
+  && ok "the lift asks cc-handoff for the live session and types no /model into it" \
+  || bad "restore: handoff rows=$mrows, typed=$(MT capture-pane -p -t _ccmodel:sess | grep -c 'claude-fable-5\[1m\]')"
 n=$(tail -n +$((nl0+1)) "$MH/.cc/notify.log" | grep -c 'is back'); [ "$n" = 1 ] && ok "exactly one 'Fable back' line to the owner" || bad "restore notify count: $n"
 # a live pane that mentions a limit: the probe decides, and one line fires once
 cat > "$T/failprobe" <<'F'
@@ -2684,10 +2694,14 @@ F
 chmod +x "$T/failprobe"
 rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/claude-limit" "$MH/.cc/state/model-seen"; : > "$MH/.cc/state/model.log"
 mline(){ MT send-keys -t _ccmodel:sess -l -- "$1"; sleep 0.3; MT send-keys -t _ccmodel:sess Enter; sleep 0.5; }
-mline "Claude usage limit reached. Your limit resets at 11:40."
+# EACH LINE NAMES ITS MODEL, the way the CLI writes one. The scan probes a pane line only when the pane names the
+# family the box is on, and these two lines took that name from the `/model claude-fable-5[1m]` the restore used
+# to type here. With the lift handing sessions back instead, both read as Opus's limit and neither case tested
+# anything (PR #533's gate, 2026-09-19).
+mline "Claude usage limit reached for Fable 5. Your limit resets at 11:40."
 ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/probeclaude" "$B/cc-model" tick
 [ "$(M status)" = fable ] && ok "a pane that mentions a limit while the model still answers does not switch" || bad "pane scan switched on a docs/question line: $(M status)"
-mline "Claude usage limit reached. Your limit resets at 12:40."
+mline "Claude usage limit reached for Fable 5. Your limit resets at 12:40."
 ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
 [ "$(M status)" = "opus until probe" ] && ok "a real limit line in a live pane switches the box (probe agrees)" || bad "pane scan: $(M status)"
 rm -f "$MH/.cc/state/model-override"; : > "$MH/.cc/state/model.log"

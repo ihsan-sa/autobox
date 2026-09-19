@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # cc-model — automatic model fallback. When a model goes out — its usage limit, or it "requires usage credits" /
 # the monthly spend cap — every live session ON THAT MODEL moves to the next rung of the chain, and back to the
-# model it was on when the outage lifts (no handoff, no restart: `/model` typed at the next turn boundary). Sessions
+# model it was on when the outage lifts: a session that belongs on the primary comes back by an overlapping HANDOFF —
+# launched unasked for a major session, on the owner's 👍 on one card for any other (see THE FABLE BAND COMES BACK BY
+# HANDOFF below) — and a session moved between the lower rungs gets `/model` typed at its next turn boundary. Sessions
 # on another model are not touched. LLM-free except one tiny probe.
 # TWO KINDS OF OUTAGE, told apart (owner, 2026-09-15): a LIMIT names a reset and every model of the account can be
 # behind it — the box waits it out on the next rung; "requires usage credits" and "You've hit your monthly spend
@@ -37,6 +39,8 @@
 #                                     refusal | error — the caller's reason to WAIT, to MOVE, or to retry
 #   cc-model chain                    the worker fallback chain, one model per line
 #   cc-model next [<model>]           the model after <model> on that chain (nothing, exit 1, at its end)
+#   cc-model return <target>          the owner's 👍 on a return card (cc-slack runs it): `cc-handoff --overlap` for that
+#                                     window, unless it is on the primary already or has an overlap open
 #   cc-model tick                     what cc-model.timer runs every 60 s (see below)
 #   cc-model selfcheck                the classifier and the chain, on fixtures
 # tick: (1) normal — switch when cc-limit's stamp says the primary model is limited AND a second run has hit that
@@ -103,6 +107,9 @@
 #   override, nothing on record) starts from none: rows an episode left when its state was cleared by hand would
 #   otherwise hold the next one's panes back. Until 2026-09-15 a switch typed into EVERY pane and the
 #   restore typed the primary into every pane, and nothing remembered what a pane had been on.
+# Returned: ~/.cc/state/model-returned = "<window>\t<epoch>\t<handoff|card>\t<detail>" — the return the lift launched or
+#   asked for, one row per window; a row younger than CC_MODEL_RETURN_GAP suppresses a second, and move_off drops it
+#   when a new outage types that window off the primary again.
 # Log: ~/.cc/state/model.log = "<iso>\t<epoch>\t<event>\t<model>\t<detail>". No secrets in either.
 # Unavailable: ~/.cc/state/model-unavailable = "<family>\t<since>\t<last-seen>\t<reason>" — a model this account cannot
 #   run (usage credits, not a limit — see A MODEL THIS ACCOUNT CANNOT RUN below); a row goes the moment the box is put
@@ -110,13 +117,16 @@
 # Env: CC_MODEL_PRIMARY · CC_MODEL_FALLBACK · CC_MODEL_PROBE (the id the probe asks for) · CC_CLAUDE
 #   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_RETUNE_GAP (600) · CC_MODEL_CHAIN
 #   · CC_MODEL_MISMATCH_GAP (3600) · CC_MODEL_STATUSLINE_FRESH (120) · CC_STATUSLINE_DIR (cc-statusline's per-session
-#   records, the same ones cc-context reads) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC, CC_MODEL_SESSIONS (a file
-#   of "<pane-id> <window>" standing in for the live session list), CC_MODEL_LIVE (a file of "<pane-id>\t<model>"
-#   standing in for what each pane's session is running).
+#   records, the same ones cc-context reads) · CC_MODEL_MAJOR (~/.cc/config: the windows handed back unasked, space- or
+#   comma-separated; unset = the default rule) · CC_MODEL_RETURN_GAP (7200) · CC_MODEL_RETURN_CHANNEL (the card's
+#   channel when the session's repo has none: `#<box>`) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC, CC_MODEL_SESSIONS
+#   (a file of "<pane-id> <window>" standing in for the live session list), CC_MODEL_LIVE (a file of
+#   "<pane-id>\t<model>" standing in for what each pane's session is running), CC_MODEL_MEMBERS (~/.cc/members).
 set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"; UNAV="$ST/model-unavailable"
 MOVED="$ST/model-moved"   # what each pane was on before the box moved it (see the header)
+RETURNED="$ST/model-returned"   # the return each window was given at the lift: a handoff launched, or a card posted
 PRIMARY="${CC_MODEL_PRIMARY:-claude-fable-5-1[1m]}"; FALLBACK="${CC_MODEL_FALLBACK:-claude-opus-5[1m]}"   # Fable 5.1 (owner, 2026-09-01)
 PROBEM="${CC_MODEL_PROBE:-claude-fable-5-1}"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 SESSION="${CC_TMUX_SESSION:-main}"; PROC="${CC_MODEL_PROC:-claude}"
@@ -407,7 +417,7 @@ move_off(){   # $1 family · $2 target model · $3 why → "/model $2" typed int
     [ "$(fam "$lm")" = "$f" ] || { note_moved "$id" "$name" "$lm" kept "$f"; continue; }   # not on it: banked as where a person left it
     moved_by_box "$id" "$f" && continue   # …for THIS move: a pane the box moved off another family is still to be moved off this one
     retuned_recently "$id" && continue
-    if type_into "$id" "$name" "/model $m"; then note_moved "$id" "$name" "$lm" moved "$f"; n=$((n+1))
+    if type_into "$id" "$name" "/model $m"; then note_moved "$id" "$name" "$lm" moved "$f"; n=$((n+1)); drop_returned "$name"
       printf '%s\t%s\tretune\t%s\t%s:%s (%s) was on %s — %s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION" "$name" "$id" "$lm" "$why" >> "$LOG"
     else printf '%s\t%s\tskip\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION:$name busy or unreachable" >> "$LOG"
       printf '%s\n' "$id" >> "$ST/model-skipped"; fi   # a pane behind a dialog: retried on later ticks (F3)
@@ -421,11 +431,85 @@ restore_all(){   # $1 = the family the box was moved TO → every live session b
     lm=$(live_model "$id" "$(rung_id "$to_f")"); was=$(moved_row "$id")   # no record: taken to be where the box put things
     if [ -n "$was" ]; then to="$was"; elif [ "$(fam "$lm")" = "$to_f" ]; then to="$PRIMARY"; else continue; fi
     [ "${to%%\[*}" = "${lm%%\[*}" ] && continue   # already there: the session moved back by itself, or was never moved
+    # the brief (owner, 2026-09-18): "major sessions like [the planning seats] automatically go back on fable via
+    # automatic handoff. the other sessions that should technically be on fable … get an automatic message asking me"
+    # — so a session that belongs on the PRIMARY is not retyped: return_session hands it off or posts its card. One
+    # already on the primary's family (its old id, say) is never handed off; tick's same-family pass retunes that.
+    if [ "$(fam "$to")" = "$(fam "$PRIMARY")" ]; then
+      [ "$(fam "$lm")" = "$(fam "$to")" ] || { return_session "$id" "$name" "$lm" && n=$((n+1)); }; continue; fi
     if type_into "$id" "$name" "/model $to"; then n=$((n+1))
       printf '%s\t%s\tretune\t%s\t%s:%s (%s) back from %s\n' "$(date -u +%FT%TZ)" "$now" "$to" "$SESSION" "$name" "$id" "$lm" >> "$LOG"
     else printf '%s\t%s\tskip\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$to" "$SESSION:$name busy or unreachable" >> "$LOG"
       printf '%s\n' "$id" >> "$ST/model-skipped"; fi
   done < <(sessions); rm -f "$MOVED"; printf '%s\n' "$n"; }
+# ── THE FABLE BAND COMES BACK BY HANDOFF, NOT BY /model (owner, 2026-09-18) ────────────────────────────────────
+# "When fable 5.1 is available again … major sessions like [the planning seats] automatically go back on fable via
+# automatic handoff. the other sessions that should technically be on fable but are not as important get an automatic
+# message asking me if i want to handoff … thumbs up means trigger handoff." Until then the owner saw Fable return,
+# then asked for each handoff by hand, and sessions ran a rung down for hours after the outage ended. So at the lift
+# a session that belongs on the primary is not retyped: a MAJOR one — its window on CC_MODEL_MAJOR, or by default
+# an orch (`<repo>@<alias>`) or a repo's planning seat (`<repo>` with no workspace under ~/.cc/members) — gets
+# `cc-handoff --overlap` with no message; every other one (a track, a course session, a member workspace) gets ONE
+# card in its own channel — the repo's when it has none of its own, the box's when the repo has none — and the
+# owner's 👍 on that card runs `cc-model return <window>`. Sessions on the lower rungs keep the /model retune above.
+# ONCE PER OUTAGE: $RETURNED holds a row per window; a row younger than CC_MODEL_RETURN_GAP (2 h — a probe that
+# answers, then is refused again minutes later, is one outage) suppresses a second handoff or card, and move_off
+# drops the row the moment a NEW outage types that window off the primary, so the next real outage gets its own
+# return. A session mid-turn is not a case here: cc-handoff's kick and retire wait it out, where a /model line typed
+# at a busy pane was the old way's failure (the 18:05Z skip row, 2026-09-18). A session already on the primary is
+# never handed off: restore_all skips it above, and `return` reads the live model first.
+major(){   # $1 window → 0 = handed back unasked. CC_MODEL_MAJOR (env, else ~/.cc/config; windows, space- or comma-
+           # separated) is the whole list when set; else the default rule above. `~next`/`~old` is mid-handoff: never.
+  local w="${1:-}" list; case "$w" in ''|*~*) return 1;; esac
+  list="${CC_MODEL_MAJOR:-$("$BIN/cc-config" get CC_MODEL_MAJOR 2>/dev/null)}"
+  if [ -n "$list" ]; then tr ' ,' '\n\n' <<<"$list" | grep -qxF -- "$w"; return; fi
+  case "$w" in */*) return 1;; *@*) return 0;; esac
+  [ ! -d "${CC_MODEL_MEMBERS:-$HOME/.cc/members}/$w" ]; }
+returned_recently(){ awk -F'\t' -v w="${1:-}" -v t="$((now - ${CC_MODEL_RETURN_GAP:-7200}))" '$1==w && $2>=t{y=1} END{exit !y}' "$RETURNED" 2>/dev/null; }
+note_returned(){ { awk -F'\t' -v w="$1" '$1!=w' "$RETURNED" 2>/dev/null; printf '%s\t%s\t%s\t%s\n' "$1" "$now" "$2" "${3:-}"; } > "$RETURNED.t" && mv "$RETURNED.t" "$RETURNED"; }
+drop_returned(){ [ -f "$RETURNED" ] && { awk -F'\t' -v w="${1:-}" '$1!=w' "$RETURNED" > "$RETURNED.t" && mv "$RETURNED.t" "$RETURNED"; }; return 0; }
+return_chan(){   # $1 window → where its card goes: `#<repo>--<track>`, the orch's own `#<repo>-<alias>-xxxx`, `#<repo>` —
+                 # the first the box has, read off cc-slack's own list — else CC_MODEL_RETURN_CHANNEL (`#<box>`)
+  local w="$1" repo rest have; repo="${w%%[@/]*}"; rest="${w#"$repo"}"
+  have=$("$BIN/cc-slack" channels --for "$repo" 2>/dev/null | awk '{print $2}')
+  case "$rest" in
+    /*) grep -qxF -- "#$repo--${rest#/}" <<<"$have" && { echo "#$repo--${rest#/}"; return 0; };;
+    @*) grep -m1 -E -- "^#$repo-${rest#@}-[a-z0-9]{4}\$" <<<"$have" && return 0;;
+  esac
+  grep -qxF -- "#$repo" <<<"$have" && { echo "#$repo"; return 0; }
+  echo "${CC_MODEL_RETURN_CHANNEL:-#${CC_BOX:-$(hostname -s)}}"; }
+card_text(){ printf '[return] %s: %s is back and this session is on %s — :+1: hands it back (a successor alongside, then cutover)' "$1" "$(label "$PRIMARY")" "$(label "$2")"; }
+card(){   # $1 window · $2 the model it is on → ONE card in its channel; 0 when it went. THE HEAD `[return] <window>:` IS
+          # WHAT cc-slack MATCHES a 👍 against (its RETURN_RE) — change one, change both. From the timer the caller is
+          # no session, so cc-slack hands the card to nobody (wake_channel: not-a-session): the owner is its reader.
+  local w="$1" lm="$2" chan ts
+  chan=$(return_chan "$w")
+  ts=$("$BIN/cc-slack" post -c "$chan" --major "$(card_text "$w" "$lm")" 2>/dev/null </dev/null | head -1) || ts=""
+  [ -n "$ts" ] || { printf '%s\t%s\tcard-failed\t%s\t%s:%s → %s\n' "$(date -u +%FT%TZ)" "$now" "$PRIMARY" "$SESSION" "$w" "$chan" >> "$LOG"; return 1; }
+  note_returned "$w" card "$chan $ts"
+  printf '%s\t%s\tcard\t%s\t%s:%s (%s) → %s %s\n' "$(date -u +%FT%TZ)" "$now" "$PRIMARY" "$SESSION" "$w" "$lm" "$chan" "$ts" >> "$LOG"; }
+launch_return(){   # $1 window · $2 the model it is on · $3 why → `cc-handoff --overlap`: the successor comes up on
+                   # `current` (the primary, the override being gone), reads the journal, cuts over. cc-handoff refuses
+                   # an open overlap, a missing window and a worker's pane, and its line is the log row's.
+  local w="$1" lm="$2" why="$3" out rc
+  out=$("$BIN/cc-handoff" --overlap "$w" 2>&1 </dev/null); rc=$?
+  printf '%s\t%s\thandoff\t%s\t%s:%s (%s) — %s: %s\n' "$(date -u +%FT%TZ)" "$now" "$PRIMARY" "$SESSION" "$w" "$lm" "$why" "$(head -1 <<<"$out" | head -c 200)" >> "$LOG"
+  [ "$rc" = 0 ] && note_returned "$w" handoff "$why"; return "$rc"; }
+return_session(){   # $1 pane · $2 window · $3 the model it is on → the lift's way back for a session that belongs on the
+                    # primary: 0 when a handoff was launched or a card went, 1 when nothing was to be done
+  local w="$2" lm="$3"
+  case "$w" in *~*) return 1;; esac   # mid-handoff already: its successor comes up on `current`
+  returned_recently "$w" && return 1  # once per outage: a second flip inside the gap sends nothing twice
+  if major "$w"; then launch_return "$w" "$lm" "$(label "$PRIMARY") is back"; else card "$w" "$lm"; fi; }
+return_cmd(){   # `cc-model return <window>`: the owner's 👍 on a card (cc-slack runs it), or a person by hand. A session
+                # already on the primary is never handed off; one with no live pane has nothing to hand off.
+  local w="${1:-}" id lm
+  id=$(sessions | awk -v w="$w" '$2==w{print $1; exit}')
+  [ -n "$id" ] || { echo "cc-model: no live session in $SESSION:$w"; return 1; }
+  lm=$(live_model "$id" "$FALLBACK")   # no record, no --model: the card went because the lift saw it off the primary
+  [ "$(fam "$lm")" = "$(fam "$PRIMARY")" ] && { echo "cc-model: $w is on $(label "$PRIMARY") already — nothing to hand off"; return 0; }
+  launch_return "$w" "$lm" "thumbs-up" && { echo "cc-model: $w — handoff to $(label "$PRIMARY") started"; return 0; }
+  echo "cc-model: $w — handoff not started ($(awk -F'\t' '$3=="handoff"{l=$5} END{print l}' "$LOG" | sed 's/.*: //'))"; return 1; }
 type_into(){   # $1 pane id · $2 window name · $3 text. cc-msg IS the box's typist — it refuses a headless pane and its
                # dialog guard keeps keystrokes off an open prompt (dialog-never-drops owns that), so this does not
                # reimplement either. It types by WINDOW name, so a split window is typed at its active pane; a claude
@@ -642,9 +726,9 @@ do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   if [ "$m" = "$PRIMARY" ]; then n=$(restore_all "$off"); else n=$(move_off "$off" "$m" "$why"); fi
   printf '%s\t%s\tswitch\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$n session(s); $why" >> "$LOG"
   [ "$SWITCH_WHAT" = limit ] || return 0   # a model the account cannot run: note_unavailable already told the owner, once, with what lifts it
-  if [ "$m" = "$PRIMARY" ]; then msg="$(label "$PRIMARY") is back — every session it moved is on it again."
-  elif [ "$to" -gt 0 ]; then msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → its sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z, then back by themselves."
-  else msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → its sessions on $(label "$m") until it answers again, then back by themselves."; fi
+  if [ "$m" = "$PRIMARY" ]; then msg="$(label "$PRIMARY") is back — its major sessions hand over to it now; every other one has a card, 👍 hands it over."
+  elif [ "$to" -gt 0 ]; then msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → its sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z, then back — major sessions by handoff, the rest on your 👍."
+  else msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → its sessions on $(label "$m") until it answers again, then back — major sessions by handoff, the rest on your 👍."; fi
   "$BIN/cc-notify" -t "$(hostname -s) model" "$msg" >/dev/null 2>&1 || true; }
 # ── CLASSIFICATION READS FIELDS, NEVER THE DOCUMENT ──────────────────────────────────────────────────────────────
 # A result JSON is kilobytes of numbers, uuids and the worker's own prose. Grepping it whole is how this classifier
@@ -857,6 +941,7 @@ selfcheck(){   # fixtures only: no network, no tmux, and none of this box's stat
   d=$(mktemp -d) || return 1
   UNAV="$d/model-unavailable"   # hermetic from the first case: a model this box has recorded must not bend the chain here
   local oldmoved="$MOVED"; MOVED="$d/model-moved"
+  local oldreturned="$RETURNED"; RETURNED="$d/model-returned"
   local oldsl="${CC_STATUSLINE_DIR:-}"
   CC_STATUSLINE_DIR="$d/statusline"; mkdir -p "$CC_STATUSLINE_DIR"   # …and this box's LIVE sessions are not this test's
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
@@ -1243,16 +1328,68 @@ TXT
     "$(typed no-record):$(moved_row %8)" "/model $FALLBACK:$PRIMARY"
   t '(b) the row an earlier episode left behind held nobody back: the box was on its primary, so this episode started from none' \
     "$(grep -c "$((now - 7200))" "$MOVED")" 0
-  t '(b) the owner'"'"'s line says its sessions come back by themselves' "$(grep -c '^notify .*its sessions on Opus 5 until .*, then back by themselves' "$d/calls")" 1
+  t '(b) the owner'"'"'s line says how its sessions come back' "$(grep -c '^notify .*its sessions on Opus 5 until .*, then back — major sessions by handoff, the rest on your 👍' "$d/calls")" 1
   printf '%s\n' '%1 seat' '%2 orch' '%3 steward' '%4 by-hand' '%7 successor' '%8 no-record' > "$d/sess"   # a handoff during the outage came up on `current`
   printf '%s\t%s\n' '%1' "$FALLBACK" '%2' "$FALLBACK" '%3' "$c3" '%4' "$exp" '%7' "$FALLBACK" > "$d/live"
+  # THE LIFT (owner, 2026-09-18): "major sessions like [the planning seats] automatically go back on fable via
+  # automatic handoff. the other sessions that should technically be on fable … get an automatic message asking me if
+  # i want to handoff … thumbs up means trigger handoff." cc-handoff and cc-slack are stubs that record what they were
+  # asked; the major list is set by hand here, the default rule has its own cases below.
+  printf '#!/bin/sh\necho "$2" >> "%s/handoffs"\n' "$d" > "$d/bin/cc-handoff"; chmod +x "$d/bin/cc-handoff"
+  printf '#!/bin/sh\ncase "$1" in channels) cat "%s/chans" 2>/dev/null;; post) printf "%%s\\t%%s\\n" "$3" "$5" >> "%s/cards"; echo 1700000000.000100;; esac\n' "$d" "$d" > "$d/bin/cc-slack"; chmod +x "$d/bin/cc-slack"
+  printf '#!/bin/sh\nexit 1\n' > "$d/bin/cc-config"; chmod +x "$d/bin/cc-config"
+  handoffs(){ paste -sd'|' "$d/handoffs" 2>/dev/null; }; cards(){ sed -n 's/^[^\t]*\t\[return\] \([^:]*\):.*/\1/p' "$d/cards" 2>/dev/null | paste -sd'|' -; }
+  : > "$d/handoffs"; : > "$d/cards"; : > "$d/chans"; rm -f "$RETURNED"
+  CC_MODEL_MAJOR="seat orch"; CC_MODEL_RETURN_CHANNEL='#box'
   : > "$d/typed"; do_switch "$PRIMARY" 'limit lifted (probe)'
-  t '(b) its lift puts each session back on what IT was on — no handoff, no restart, the exact id it had' \
-    "$(typed seat):$(typed orch)" "/model $PRIMARY:/model ${PRIMARY%%\[*}"
-  t '(b) …a session launched during the outage has no row, so it goes to the primary' "$(typed successor)" "/model $PRIMARY"
-  t '(b) …the one with no record goes back to what its row says' "$(typed no-record)" "/model $PRIMARY"
+  t '(b) its lift: a MAJOR session that was on the primary gets an overlapping handoff launched, and no message' \
+    "$(handoffs):$(typed seat)$(typed orch):$(cards)" "seat|orch::successor|no-record"
+  t '(b) …every other session that belongs on the primary — launched during the outage with no row, or with a row — gets ONE card in its channel, nothing typed' \
+    "$(cut -f1,2 "$d/cards" | tr '\t' ' ' | paste -sd'|' -)" "#box [return] successor: Fable 5.1 is back and this session is on Opus 5 — :+1: hands it back (a successor alongside, then cutover)|#box [return] no-record: Fable 5.1 is back and this session is on Opus 5 — :+1: hands it back (a successor alongside, then cutover)"
+  t '(b) …nothing is typed into any of them: no /model line, no restart' "$(wc -l < "$d/typed")" 0
   t '(b) …the steward stays on Sonnet, and the one a person put on Opus stays on Opus' "$(typed steward)$(typed by-hand)" ""
   t '(b) the episode is over: the rows go, the override goes' "$([ -e "$MOVED" ] && echo rows)$([ -e "$OV" ] && echo ov)" ""
+  t '(b) the log says which window got which, and the ledger holds one row per window' \
+    "$(awk -F'\t' '$3=="handoff"||$3=="card"{print $3}' "$LOG" | paste -sd, -):$(cut -f1,3 "$RETURNED" | tr '\t' = | paste -sd, -)" \
+    "handoff,handoff,card,card:seat=handoff,orch=handoff,successor=card,no-record=card"
+  t '(b) the owner'"'"'s line says how they come back' "$(grep -c '^notify .*is back — its major sessions hand over to it now; every other one has a card' "$d/calls")" 1
+  # a second flip inside the same outage — the probe answered, Fable refused again minutes later, the probe answers
+  # again — sends nothing twice: the ledger rows are younger than the gap
+  local pold; pold="${PRIMARY%%\[*}"; pold="${pold%-1}"   # the primary family's OLD id: same family, a different id
+  printf '%s\t%s\n' '%1' "$FALLBACK" '%2' "$FALLBACK" '%3' "$c3" '%4' "$exp" '%5' "$pold" '%7' "$FALLBACK" '%8' "$FALLBACK" > "$d/live"
+  printf '%s\n' '%1 seat' '%2 orch' '%3 steward' '%4 by-hand' '%5 self-back' '%7 successor' '%8 no-record' > "$d/sess"   # %5: back on the primary's family by itself, on its old id
+  printf '%s\tseat\t%s\t%s\tmoved\tfable\n%s\tsuccessor\t%s\t%s\tmoved\tfable\n%s\tself-back\t%s\t%s\tmoved\tfable\n' '%1' "$PRIMARY" "$now" '%7' "$PRIMARY" "$now" '%5' "$PRIMARY" "$now" > "$MOVED"
+  do_switch "$PRIMARY" 'limit lifted (probe)'
+  t '(b) a second flip within the same outage: no second handoff, no second card — and a session already on the primary'"'"'s family gets neither' \
+    "$(handoffs):$(cards)" "seat|orch:successor|no-record"
+  # …but a NEW outage that moves the window off the primary again clears its row, so the next lift returns it again
+  printf '%s\t%s\n' '%1' "$PRIMARY" '%7' "$PRIMARY" > "$d/live"; printf '%s\n' '%1 seat' '%7 successor' > "$d/sess"
+  : > "$d/typed"; : > "$LOG"   # retuned_recently reads the log, and `now` is one instant for the whole selfcheck
+  SWITCH_TILL=$((now + 3600)); do_switch "$FALLBACK" "$(fam "$PRIMARY") limit"; SWITCH_TILL=0
+  t '(b) a new outage moves the returned sessions down again, and forgets their returns' \
+    "$(typed seat):$(typed successor):$([ -s "$RETURNED" ] && cut -f1 "$RETURNED" | paste -sd, -)" "/model $FALLBACK:/model $FALLBACK:orch,no-record"
+  printf '%s\t%s\n' '%1' "$FALLBACK" '%7' "$FALLBACK" > "$d/live"; do_switch "$PRIMARY" 'limit lifted (probe)'
+  t '(b) …so its lift hands them back once more' "$(handoffs):$(cards)" "seat|orch|seat:successor|no-record|successor"
+  # THE THUMBS-UP: cc-slack runs `cc-model return <window>` on a 👍 on the card
+  : > "$d/handoffs"; printf '%s\n' '%7 successor' '%9 on-fable' > "$d/sess"; printf '%s\t%s\n' '%7' "$FALLBACK" '%9' "$PRIMARY" > "$d/live"
+  t '(b) a thumbs-up launches the handoff for that window, and says so' "$(return_cmd successor):$(handoffs)" "cc-model: successor — handoff to Fable 5.1 started:successor"
+  t '(b) …a session already on the primary is never handed off' "$({ return_cmd on-fable; printf ' rc=%s' $?; } | tr -d '\n'):$(handoffs)" "cc-model: on-fable is on Fable 5.1 already — nothing to hand off rc=0:successor"
+  t '(b) …and one with no live session has nothing to hand off' "$({ return_cmd gone; printf ' rc=%s' $?; } | tr -d '\n')" "cc-model: no live session in main:gone rc=1"
+  printf '#!/bin/sh\necho "cc-handoff: $2 already has an overlap open (phase overlap, live predecessor) — one successor at a time"; exit 1\n' > "$d/bin/cc-handoff"
+  t '(b) …cc-handoff'"'"'s refusal is the answer, and the ledger keeps no row for a handoff that did not start' \
+    "$(rm -f "$RETURNED"; { return_cmd successor; printf ' rc=%s' $?; } | tr -d '\n'):$([ -e "$RETURNED" ] && echo row)" "cc-model: successor — handoff not started (successor already has an overlap open (phase overlap, live predecessor) — one successor at a time) rc=1:"
+  printf '#!/bin/sh\necho "$2" >> "%s/handoffs"\n' "$d" > "$d/bin/cc-handoff"
+  # THE DEFAULT MAJOR LIST: a repo's planning seat and its orchs; not a track, a member workspace, or a window mid-handoff
+  unset CC_MODEL_MAJOR; CC_MODEL_MEMBERS="$d/members"; mkdir -p "$d/members/member-a"
+  t '(b) by default a planning seat and an orch are major; a track, a member workspace and a ~next window are not' \
+    "$(major demo && echo 1)$(major demo@orch && echo 1)$(major demo/track && echo 1)$(major member-a && echo 1)$(major demo~next && echo 1)" 11
+  t '(b) CC_MODEL_MAJOR, when set, is the whole list' "$(CC_MODEL_MAJOR='demo/track,other' major demo/track && echo 1)$(CC_MODEL_MAJOR='demo/track,other' major demo && echo 1)" 1
+  # THE CARD'S CHANNEL: the track's own, else the orch's own, else the repo's, else the box's
+  printf '%s\n' 'C1 #demo' 'C2 #demo--t1' 'C3 #demo-site-ab12' 'C4 #demo-updates' > "$d/chans"
+  t '(b) a card goes to the track'"'"'s own channel when it has one, the orch'"'"'s own, else the repo'"'"'s, else the box'"'"'s' \
+    "$(return_chan demo/t1) $(return_chan demo/other) $(return_chan demo@site) $(return_chan demo) $(CC_MODEL_RETURN_CHANNEL='#box' return_chan nowhere/t)" \
+    "#demo--t1 #demo #demo-site-ab12 #demo #box"
+  unset CC_MODEL_MEMBERS CC_MODEL_RETURN_CHANNEL; unset -f handoffs cards; rm -f "$RETURNED" "$d/handoffs" "$d/cards" "$d/chans"
   # (c) what a relaunch and a loop iteration resolve to: cc passes `current`; cc-loop asks `resolve` every iteration
   rm -f "$OV" "$UNAV" "$MOVED"; : > "$d/typed"
   t '(c) on its primary, a caller asking for the primary runs it' "$(resolve "$PRIMARY")" "$PRIMARY"
@@ -1269,9 +1406,10 @@ TXT
   #     (a probe, or the owner's switch) still puts it back
   rm -f "$OV"; : > "$d/typed"; printf '%%1\tseat\t%s\t%s\tmoved\n' "$PRIMARY" "$now" > "$MOVED"
   printf '%s\n' '%1 seat' > "$d/sess"; printf '%s\t%s\n' '%1' "$exp" > "$d/live"; printf '> \n' > "$d/screen.%1"
-  do_switch "$PRIMARY" 'answered as itself again (probe)'
-  t '(b) with no override but a moved session on record, the primary answering still restores it and forgets the record' \
-    "$(typed seat):$(unavail "$(fam "$PRIMARY")" && echo rec):$([ -e "$MOVED" ] && echo rows)" "/model $PRIMARY::"
+  : > "$d/handoffs"; CC_MODEL_MEMBERS="$d/members"; do_switch "$PRIMARY" 'answered as itself again (probe)'; unset CC_MODEL_MEMBERS
+  t '(b) with no override but a moved session on record, the primary answering still returns it and forgets the record' \
+    "$(cat "$d/handoffs"):$(unavail "$(fam "$PRIMARY")" && echo rec):$([ -e "$MOVED" ] && echo rows)" "seat::"
+  rm -f "$d/handoffs" "$RETURNED"
   # (d) EVERY MODEL ON RECORD IS PROBED BACK, NOT ONLY THE PRIMARY'S (fifth review of #503). The cap lands on the
   #     model a run ASKED for, and the commonest dispatch asks for the fallback: the row cc-limit writes with
   #     `cc-model unavailable claude-opus-5` had nothing that could ever clear it — tick probed the primary alone —
@@ -1331,7 +1469,7 @@ TXT
   t 'and when they agree again, status is quiet about it' "$(status_line)" "$(fam "$PRIMARY")"
   unset -f slrec
   rm -f "$CC_STATUSLINE_DIR"/*.json
-  unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"; MOVED="$oldmoved"
+  unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"; MOVED="$oldmoved"; RETURNED="$oldreturned"
   if [ -n "$oldsl" ]; then CC_STATUSLINE_DIR="$oldsl"; else unset CC_STATUSLINE_DIR; fi
   rm -rf "$d"
   printf 'cc-model selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
@@ -1350,7 +1488,8 @@ case "${1:-}" in
   chain)   chain ;;
   next)    chain_next "${2:-}" || exit 1 ;;
   tick)    tick ;;
+  return)  return_cmd "${2:?usage: cc-model return <window>}" || exit 1 ;;
   selfcheck) selfcheck || exit 1 ;;
-  *) sed -n '2,21p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,23p' "$0" >&2; exit 2 ;;
 esac
 exit 0

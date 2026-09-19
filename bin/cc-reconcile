@@ -15,7 +15,13 @@ No model is called here and nothing here launches one.
 
 ALIVE: a `claude` whose cwd is the track's worktree, a `cc-loop <repo> <track>`, a live pane in the track's tmux
 window, or an `agent` mark (cc-board) naming a window that holds an interactive session for this repo, made less
-than 6 h ago and after the start of the last usage-limit episode. Alive with nobody typing for 2 h is `idle`.
+than 6 h ago, after the start of the last usage-limit episode, and whose seat has taken a turn inside those 6 h
+(cc-statusline's per-turn file or the transcript, by the seat's --session-id, or by its cwd when it carries none and
+is the one interactive session there; a re-mark is not a turn, and a seat nothing says about — two seats in one cwd
+— keeps its clock). Alive with nobody typing for 2 h is `idle`, and neither an idle session nor a bare `agent` mark
+moves a `blocked` or `waiting` row back to `running`: those are a session's words, and only work in flight — a
+worker, a loop, a pane moved inside 2 h — overrides them. A mark flips a `queued` row and keeps a row off the
+abandoned path; it is not work in flight.
 
 WAITING: the worker's own `STATUS: BLOCKED: <question>` line makes a track `waiting` on a person, whatever is
 running; a loop sitting out a usage limit waits on the clock and never reaches the owner. Prose is never read.
@@ -23,9 +29,12 @@ running; a loop sitting out a usage limit waits on the clock and never reaches t
 DRIFT: decidable (the PR merged, a worker is in the worktree, it finished and its PR is open) is applied through
 cc-board with a `reconciled:` note. Undecidable (closed PR, gone worktree, refused checkpoint, unpushed branch,
 no worker and nothing says why) is reported and, with --notify, offered to the repo's live session through the
-broker door (CC_RECONCILE_INJECT, CC_BROKER_SOURCE from the unit); what no session takes pages the owner. A
-finished row (`merged`/`done`) raises nothing on suspicion; a merged row whose branch really holds commits origin
-lacks is still reported. A `held` row keeps its fixes, stops, safety asks and its question; the guesses go quiet.
+broker door (CC_RECONCILE_INJECT, CC_BROKER_SOURCE from the unit); what no session takes pages the owner. A row
+that never ran — no claim, never started, no journal, no worktree — is reported as never started, not as lost. A
+line about a PR is re-read at GitHub at send time and dropped if the merge ANSWERS it — a safety ask standing
+beside it, an unpushed branch, still goes out (--no-net never asks, so never drops). A finished row (`merged`/
+`done`) raises nothing on suspicion; a merged row whose branch really holds commits origin lacks is still
+reported. A `held` row keeps its fixes, stops, safety asks and its question; the guesses go quiet.
 A finished track with an open PR nobody is landing is offered once per PR and alerted once per 4 h window —
 unless the row itself waits on a person, which is somebody having picked it up: that one raises neither.
 
@@ -85,6 +94,7 @@ import calendar, datetime, glob, json, os, re, shutil, signal, subprocess, sys, 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))      # siblings come from the same bin/ as this copy
 BOARDS, WTS, STATE, DEV = f"{HOME}/.cc/boards", f"{HOME}/.cc/worktrees", f"{HOME}/.cc/state", f"{HOME}/dev"
+PROJECTS = f"{HOME}/.claude/projects"                # transcripts, one directory per cwd (path with / and . as -)
 GRACE = 600        # a track the board touched less than this ago is left alone: claude takes a moment to appear
 REPEAT = 86400     # a finding that persists is worth one push a day
 PRMAX = 40         # PR lookups per run
@@ -146,10 +156,14 @@ def setting(key, default=""):
     return p.stdout.strip() if p is not None else os.environ.get(key, default)
 
 
-def mark_why(t, wins, repo, t0, mark, started=0.0):
+def mark_why(t, wins, repo, t0, mark, started=0.0, advanced=None):
     """The `agent` mark weighed: (holds?, why not). The window must hold a session for THIS repo (`<repo>` or
     `<repo>@<alias>`); the mark goes cold at `mark` seconds, and at once if made at or before a lifted limit's start
-    (the subagent holding it died on the 429; the box works on through the episode, so a later mark is alive)."""
+    (the subagent holding it died on the 429; the box works on through the episode, so a later mark is alive).
+    `advanced` is when the seat in that window last took a turn (seat_turn), None when nothing says: a seat that
+    has not taken a turn for `mark` seconds holds nothing, however fresh the mark — a session's detached re-mark
+    loop refreshes `agent_at` on a liveness poll alone, which a stalled seat passes (an orch seat sat a day on a
+    row it kept marked, raised 2026-09-17). The brief: "a mark whose seat has not advanced expires"."""
     ag = (t.get("agent") or "").strip()
     win = wins.get(ag) or ""
     if not ag or not (win == repo or win.startswith(repo + "@")):
@@ -162,7 +176,116 @@ def mark_why(t, wins, repo, t0, mark, started=0.0):
     if started and at <= started:
         return False, ("marked before the usage limit that began at "
                        + time.strftime("%H:%MZ", time.gmtime(started)) + " — that subagent died with it")
+    if advanced is not None and t0 - advanced >= mark:
+        return False, (f"marked by a live session, but that seat has not taken a turn for "
+                       f"{(t0 - advanced) / 3600:.0f} h — a re-mark is not a turn, mark expired")
     return True, ""
+
+
+def window_panes():
+    """{"<window id>:<server pid>": pane pid} for every tmux pane, the key a mark carries (cc-board agent_id)."""
+    try:
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{window_id}:#{pid}\t#{pane_pid}"],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return {}
+    wp = {}
+    for ln in out.stdout.splitlines():
+        f = ln.split("\t")
+        if len(f) == 2 and f[0].strip() and f[1].strip().isdigit():
+            wp.setdefault(f[0].strip(), f[1].strip())
+    return wp
+
+
+def seat_turn(pane_pid):
+    """When the session in that pane last took a turn (epoch), or None when nothing says. The seat is the `claude`
+    under the pane's shell. Its id is the `--session-id` on its command line, and the turn is the newer of
+    cc-statusline's per-turn file (~/.cc/state/statusline/<id>.json, CC_STATUSLINE_DIR) and the transcript
+    (~/.claude/projects/*/<id>.jsonl). Only a cc-handoff successor carries an id; `cc <repo>` and `cc --orch` start
+    the seats that mark rows with none (review of #538), so a seat with no id is known by its cwd — the newest
+    transcript in that cwd's directory and the newest per-turn file whose raw.cwd is that cwd — and only while it is
+    the ONE interactive `claude` on the box in that cwd: two peers in one checkout (a main seat and an orch) say
+    nothing about each other, so both are None (cc-context's own rule). A stalled turn writes neither file, and
+    None is no evidence, so that mark keeps the clock it has."""
+    if not pane_pid:
+        return None
+    todo, seen, seat, sid = [str(pane_pid)], set(), "", ""
+    while todo and not seat:
+        pid = todo.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            kids = open(f"/proc/{pid}/task/{pid}/children").read().split()
+        except OSError:
+            kids = []
+        for k in kids:
+            try:
+                if open(f"/proc/{k}/comm").read().strip() != "claude":
+                    todo.append(k)
+                    continue
+                argv = open(f"/proc/{k}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+            except OSError:
+                continue
+            seat = k
+            i = argv.index("--session-id") if "--session-id" in argv else -1
+            if 0 <= i < len(argv) - 1 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", argv[i + 1]):
+                sid = argv[i + 1]
+            break
+    if not seat:
+        return None
+    sl = os.environ.get("CC_STATUSLINE_DIR") or f"{STATE}/statusline"
+    if sid:
+        paths = [f"{sl}/{sid}.json"] + glob.glob(f"{PROJECTS}/*/{sid}.jsonl")
+    else:                                               # no id: the seat is its cwd, if it is alone there
+        try:
+            cwd = os.path.realpath(os.readlink(f"/proc/{seat}/cwd"))
+        except OSError:
+            return None
+        if len(interactive_in(cwd)) != 1:
+            return None
+        paths = glob.glob(f"{PROJECTS}/{re.sub(r'[/.]', '-', cwd)}/*.jsonl")
+        for path in sorted(glob.glob(f"{sl}/*.json"), key=mtime, reverse=True):
+            try:                                        # newest first: the first whose cwd matches is the one
+                raw = json.load(open(path)).get("raw") or {}
+            except (OSError, ValueError, AttributeError):
+                continue
+            if os.path.realpath(raw.get("cwd") or "/nonexistent") == cwd:
+                paths.append(path)
+                break
+    newest = 0.0
+    for path in paths:
+        try:
+            newest = max(newest, os.stat(path).st_mtime)
+        except OSError:
+            pass
+    return newest or None
+
+
+def mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+def interactive_in(cwd):
+    """Pids of every interactive `claude` (no -p/--print) whose cwd is that directory."""
+    out = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if open(f"/proc/{pid}/comm").read().strip() != "claude":
+                continue
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+            if any(a in ("-p", "--print") for a in argv):
+                continue
+            if os.path.realpath(os.readlink(f"/proc/{pid}/cwd")) == cwd:
+                out.append(pid)
+        except OSError:
+            continue
+    return out
 
 
 # ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -485,6 +608,11 @@ def decide(f):
             return [("fix", "running" if f["live"] else "queued", "its question was answered")]
         return []
     out, settled = [], False
+    # NEVER RAN: no cc-task claim, not started by `cc <repo> <track>` or cc-handoff, no journal or loop log, and no
+    # worktree — a row made with its project channel and left, or a word set by hand. "Killed, or the box restarted"
+    # and "its worktree is gone" say something was lost; nothing was (raised 2026-09-11, a member workspace's
+    # row). The brief: "a row that has never run is reported as never started, not as lost".
+    never_ran = not (f.get("delivery") or f.get("started") or f.get("worked")) and not f["wt_exists"]
     if f.get("stop_why"):
         out.append(("stop", "blocked", f["stop_why"]))
         settled = True
@@ -494,7 +622,16 @@ def decide(f):
     elif who == "clock" and st not in TERMINAL + QUEUED:
         out.append(("held", None, "waiting on the clock, not on you: " + wwhy))
         settled = True
-    elif live and st in QUEUED + ("blocked", "waiting"):
+    elif st in QUEUED + ("blocked", "waiting") and (live if st in QUEUED
+                                                    else (f["live"] and not idle_session(f))):
+        # `blocked`/`waiting` is a word a session set; a session sitting at its prompt in the worktree is not
+        # work in flight, and flipping the word back on its presence alone reverted a correction within minutes
+        # (a member workspace's row, three times over two pulses, raised 2026-09-10). The brief: "a status a
+        # session set is not reverted by decide() while no pane is live" — only a worker, a loop or a pane moved
+        # inside IDLE overrides it. A bare `agent` mark does not: the re-mark loop keeps it fresh for as long as
+        # the seat lives, so it flipped such a row back every pass with no pane in the window at all (raised
+        # 2026-09-19). The mark still flips QUEUED, which is nobody's word, and still keeps the row off the
+        # abandoned path below — it is the only thing on the box saying somebody is on it.
         out.append(("fix", "running", "a worker is in its worktree" if f["live"]
                     else "a live session is doing it in a subagent"))
         settled = True
@@ -517,9 +654,11 @@ def decide(f):
             out.append(("fix", "merged", "its PR merged"))
         elif pr == "OPEN":
             out.append(("fix", "review", "its PR is open"))
-        else:
+        else:                                           # a cold mark says what happened; then never-ran; then lost
             out.append(("ask", "blocked", f.get("agent_stale")
-                        or "no worker, and nothing says why (killed, or the box restarted)"))
+                        or ("never started: no claim, no worktree, no journal — the word was set by hand, "
+                            "nothing was lost" if never_ran
+                            else "no worker, and nothing says why (killed, or the box restarted)")))
     if not settled:                                     # the PR outranks any status but a live process
         if pr == "MERGED" and st != "merged":
             out.append(("fix", "merged", "its PR merged"))
@@ -812,7 +951,7 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
     live |= tlive
     seen, limited = ledger(f"{STATE}/wedged.json"), limit_active()
     started = limit_started()
-    prs, remotes, t0 = 0, {}, now()
+    prs, remotes, t0, wp = 0, {}, now(), None
     for fn, d in boards():
         if d is None:
             continue
@@ -828,7 +967,11 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
             if repo not in remotes:
                 remotes[repo] = has_remote(repo)
             key = f"{repo}/{track}"
-            ag_live, ag_stale = mark_why(t, wins, repo, t0, mark, started)
+            ag = (t.get("agent") or "").strip()
+            if ag and wp is None:                       # one tmux read per run, and none on a board with no marks
+                wp = window_panes()
+            ag_live, ag_stale = mark_why(t, wins, repo, t0, mark, started,
+                                         seat_turn(wp.get(ag)) if ag and wp else None)
             f = {"agent": (t.get("agent") or "").strip(), "agent_live": ag_live, "agent_stale": ag_stale,
                  "held": str(t.get("held") or "").strip(),
                  "repo": repo, "track": track, "status": st, "pr": pr, "kind": t.get("kind") or "track",
@@ -1796,7 +1939,8 @@ def main(argv):
         who, why = waits_for(f) if state not in TERMINAL else ("", "")
         snaprows.append((repo, track, f, state, who, why))
         for kind, st, why_ in mine:
-            rec = {"repo": repo, "track": track, "kind": kind, "from": f["status"], "to": st, "why": why_}
+            rec = {"repo": repo, "track": track, "kind": kind, "from": f["status"], "to": st, "why": why_,
+                   "pr": f.get("pr") or ""}
             if kind == "stop":
                 rec["pids"] = f["workers"] + f["loops"]
             recs.append(rec)
@@ -1865,6 +2009,20 @@ def main(argv):
             p = sh(inj, "inject", "--no-start", repo, line, timeout=30)
             return p is not None and p.returncode == 0
 
+        merged_seen = {}
+
+        def merged_now(repo, pr):
+            """The PR read again AT SEND TIME. facts() read it when the run began; the tick (sweep, wake, digest,
+            three sibling tools) ran since, and PR #521 merged 16 s before its "review and land it" went out on a
+            state read minutes earlier (raised 2026-09-19). One gh call per PR per pass, only for a line about to
+            be sent; --no-net never asks, so it never drops. The brief: "a finding re-checks its PR's merge state
+            at send time and is dropped if merged"."""
+            if not pr or not net:
+                return False
+            if pr not in merged_seen:
+                merged_seen[pr] = pr_state(repo, pr, net) == "MERGED"
+            return merged_seen[pr]
+
         parked = {}
 
         def project_parked(repo):                       # a parked project is neither nagged nor paged
@@ -1872,8 +2030,22 @@ def main(argv):
                 parked[repo] = paused(repo)
             return parked[repo]
 
+        row_facts = {f"{repo}/{track}": f for repo, track, f, _, _, _ in snaprows}
+
+        def merge_answers(r):
+            """Does the merge ANSWER this line? Only then is it dropped. Dropping every ask on a MERGED PR took the
+            safety asks with it: a `merged` row whose branch really holds commits origin lacks is still reported
+            (the invariant up top), and that ask went nowhere while its key was written as 0, so each pass dropped
+            it again until the sweep deleted the branch at 48 h with the commits on it. decide() with the PR read
+            as MERGED is the test — whatever it still says is not the merge's to answer."""
+            if not merged_now(r["repo"], r.get("pr")):
+                return False
+            f = row_facts.get(f"{r['repo']}/{r['track']}")
+            return f is None or not any(w == r["why"] for _, _, w in decide(dict(f, pr_state="MERGED")))
+
         keys = {f"{r['repo']}/{r['track']}: {r['why']}": r for r in asks if not project_parked(r["repo"])}
-        fresh = [r for k, r in keys.items() if t0 - float(old.get(k, 0) or 0) >= repeat]
+        fresh = [r for k, r in keys.items() if t0 - float(old.get(k, 0) or 0) >= repeat
+                 and not merge_answers(r)]   # merged since the run began: the next pass fixes the row
         told = {f"{r['repo']}/{r['track']}: {r['why']}" for r in fresh}
         keep, busy = {}, None
         for repo, track, f, state, who, _ in snaprows:  # pending: finished, PR open, nobody landing it
@@ -1895,7 +2067,10 @@ def main(argv):
                 continue
             first = float(old.get(k) or 0) or t0
             last, stood = float(old.get(ak) or 0), t0 - first
-            keep[k] = first
+            if ((not old.get(ok_) or (stood >= pend_after and t0 - last >= pend_after))
+                    and merged_now(repo, f.get("pr"))):
+                continue                                # about to nag, and the PR has merged since facts() read it: nothing
+            keep[k] = first                             # to send, no memo, and the next pass marks the row merged
             if stood >= pend_after and t0 - last >= pend_after:
                 last = t0
                 alert(f"⏳ {repo}/{track} — finished, PR open, unlanded for {stood / 3600:.0f}h — "
@@ -1972,6 +2147,27 @@ def selfcheck():
         return effective(F(**kw), decide(F(**kw)))
 
     ok("live worker in a blocked track → running", one(status="blocked", live=True) == ("fix", "running"))
+    ok("…BUT A SESSION SITTING IDLE AT ITS PROMPT IN THE WORKTREE IS NOT A WORKER: `blocked` and `waiting` are a "
+       "session's words, and flipping one back to `running` on that presence alone reverted a correction within "
+       "minutes, three times over two pulses (a member workspace's row, raised 2026-09-10). The brief: 'a status "
+       "a session set is not reverted by decide() while no pane is live' — the word stands, and nothing is asked",
+       decide(F(status="blocked", live=True, pane_idle=3 * 3600)) == []
+       and decide(F(status="waiting", live=True, pane_idle=3 * 3600)) == [])
+    ok("…while a pane moved inside IDLE, a worker or a loop IS work in flight and still flips it — and "
+       "`queued`/`todo` is nobody's word, so an idle session in that worktree still makes it running",
+       one(status="blocked", live=True, pane_idle=600) == ("fix", "running")
+       and one(status="waiting", live=True, pane_idle=600) == ("fix", "running")
+       and one(status="blocked", live=True, pane_idle=3 * 3600, workers=[1]) == ("fix", "running")
+       and one(status="blocked", live=True, pane_idle=3 * 3600, loops=[1]) == ("fix", "running")
+       and one(status="queued", live=True, pane_idle=3 * 3600) == ("fix", "running")
+       and one(status="todo", live=True, pane_idle=3 * 3600) == ("fix", "running"))
+    ok("…AND A BARE `agent` MARK IS NOT WORK IN FLIGHT EITHER: the re-mark loop keeps `agent_at` fresh for as "
+       "long as the seat lives, so a row a session set to `blocked`/`waiting` and left marked was flipped back "
+       "to `running` on every pass with no pane in the track's window at all (raised 2026-09-19). The word "
+       "stands and nothing is asked; the mark still flips a `queued` row, which is nobody's word",
+       decide(F(status="blocked", agent="@3:900", agent_live=True)) == []
+       and decide(F(status="waiting", agent="@3:900", agent_live=True)) == []
+       and one(status="queued", agent="@3:900", agent_live=True) == ("fix", "running"))
     ok("live worker in a merged track is not un-merged", one(status="merged", live=True, pr="u", pr_state="MERGED") == ("none", None))
     ok("running + no worker, but dispatched seconds ago → left alone", one(age=5, grace=600) == ("none", None))
     ok("journal BLOCKED → waiting, and the owner is asked",
@@ -2021,6 +2217,20 @@ def selfcheck():
        "ran left a progress.md or loop.log — `worked` catches it, and the never-claimed `blocked` case above "
        "stays empty",
        ("ask", None, "its worktree is gone") in decide(F(status="running", wt_exists=False, delivery=False, started=False, worked=True)))
+    ok("A ROW THAT NEVER RAN IS NEVER STARTED, NOT LOST: no claim, not started, no journal, no worktree — a row made "
+       "with its project channel and given `running` by hand — is asked about in ONE line that says nothing was "
+       "lost; the same word on a row cc-task did claim keeps 'killed, or the box restarted' AND 'its worktree is "
+       "gone' (raised 2026-09-11, a member workspace's row). The brief: reported as never started, not as lost",
+       decide(F(status="running", wt_exists=False, delivery=False, started=False, worked=False))
+       == [("ask", "blocked", "never started: no claim, no worktree, no journal — the word was set by hand, "
+                              "nothing was lost")]
+       and [w for _, _, w in decide(F(status="running", wt_exists=False, delivery=True))]
+       == ["no worker, and nothing says why (killed, or the box restarted)", "its worktree is gone"])
+    ok("…and a cold mark still says what happened to a row nothing else ever ran: the mark's reason outranks "
+       "never-started, which outranks lost",
+       decide(F(status="running", wt_exists=False, delivery=False, started=False, worked=False,
+                agent="@3:900", agent_stale="marked by a live session 6 h ago, mark expired"))
+       == [("ask", "blocked", "marked by a live session 6 h ago, mark expired")])
     ok("a refused checkpoint is a finding", any("checkpoint" in w for _, _, w in decide(F(status="review", pr="u", commit_err=True))))
     unp = lambda **kw: any("not pushed" in w for _, _, w in decide(F(status="review", pr="u", **kw)))
     ok("an unpushed branch is a finding: the marker AND commits origin does not have", unp(push_err=True, unpushed=True))
@@ -2143,10 +2353,10 @@ def selfcheck():
     ok("…and the moment that session's window is gone the mark counts for nothing: the same row is reported "
        "abandoned, exactly as it was before any of this",
        decide(F(status="running", agent="@3:900", agent_live=False))[0][:2] == ("ask", "blocked"))
-    ok("a marked row that is still `queued` or `blocked` is running, and says WHOSE — never 'a worker is in "
-       "its worktree', which is the one thing that is not true of it",
+    ok("a marked row that is still `queued` is running, and says WHOSE — never 'a worker is in its worktree', "
+       "which is the one thing that is not true of it; a `blocked` row the mark leaves alone entirely",
        decide(F(status="queued", agent="@3:900", agent_live=True))[0] == ("fix", "running", "a live session is doing it in a subagent")
-       and decide(F(status="blocked", agent="@3:900", agent_live=True))[0][:2] == ("fix", "running")
+       and decide(F(status="blocked", agent="@3:900", agent_live=True)) == []
        and decide(F(status="queued", live=True))[0][2] == "a worker is in its worktree")
     ok("…AND IT HAS NO WORKTREE: nothing dispatched it, so there is none to be gone, and the mark has to silence "
        "that rule too — otherwise the row it just made quiet goes back to NEEDS YOU on the same run",
@@ -2187,6 +2397,88 @@ def selfcheck():
        mark_why({"agent": "@3:900", "agent_at": stamp(3600)}, W, "r", T0, AGENT_MARK, _rz)[0] is False)
     ok("…and with no episode passed in, the age bound is the whole rule, which is what this file did before",
        mark_why({"agent": "@3:900", "agent_at": stamp(5400)}, W, "r", T0, AGENT_MARK) == (True, ""))
+    ok("A MARK WHOSE SEAT HAS NOT TAKEN A TURN EXPIRES, however fresh the mark: a session's detached re-mark loop "
+       "refreshes agent_at on a liveness poll a stalled seat passes, so an orch seat held its row 29 h without a "
+       "turn (raised 2026-09-17). The seat's last turn is read beside the mark: none inside the window expires it "
+       "with the hours in the reason; one inside the window holds; and a seat nothing says about keeps the clock "
+       "it has, so the re-mark loop and this rule coexist",
+       mark_why({"agent": "@3:900", "agent_at": stamp(60)}, W, "r", T0, AGENT_MARK, 0.0, T0 - 7 * 3600)
+       == (False, "marked by a live session, but that seat has not taken a turn for 7 h — a re-mark is not a turn, "
+                  "mark expired")
+       and mark_why({"agent": "@3:900", "agent_at": stamp(60)}, W, "r", T0, AGENT_MARK, 0.0, T0 - 5 * 3600) == (True, "")
+       and mark_why({"agent": "@3:900", "agent_at": stamp(60)}, W, "r", T0, AGENT_MARK, 0.0, None) == (True, ""))
+    with tempfile.TemporaryDirectory() as _sd:
+        # seat_turn on a REAL pane-shaped process tree: a shell whose child is a `claude` (a script by that name,
+        # so comm reads claude) carrying --session-id, and cc-statusline's per-turn file for that id at a chosen
+        # time — the walk, the argv read and the file are all the real thing. Then the seats that actually mark:
+        # `cc <repo>` and `cc --orch` start theirs with NO --session-id (review of #538), so a second `claude` with
+        # none, alone in its cwd, is found by that cwd — its transcript directory and the per-turn file whose
+        # raw.cwd it is — and two such peers in one cwd are None, one never standing in for the other.
+        open(f"{_sd}/claude", "w").write("#!/bin/sh\nsleep 30\n")
+        os.chmod(f"{_sd}/claude", 0o755)
+        for _d in ("sl", "pj", "seatA", "seatB"):
+            os.makedirs(f"{_sd}/{_d}")
+
+        def _spawn(args, cwd=None):                     # a pane's shell with a `claude` under it
+            px = subprocess.Popen(["bash", "-c", f"{_sd}/claude {args}; true"], cwd=cwd,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(100):                        # until the shell's child has exec'd into `claude`
+                try:
+                    if any(open(f"/proc/{k}/comm").read().strip() == "claude"
+                           for k in open(f"/proc/{px.pid}/task/{px.pid}/children").read().split()):
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            return px
+        _seat = _spawn("--session-id selfcheck-seat-1")
+        _bare = subprocess.Popen(["sleep", "30"])       # a pane with no session under it
+        _alone = _spawn("", cwd=f"{_sd}/seatA")         # no id, the one seat in its cwd
+        _peers = [_spawn("", cwd=f"{_sd}/seatB"), _spawn("", cwd=f"{_sd}/seatB")]
+        _keep_sl, _keep_pj = os.environ.get("CC_STATUSLINE_DIR"), PROJECTS
+        os.environ["CC_STATUSLINE_DIR"] = f"{_sd}/sl"
+        globals().update(PROJECTS=f"{_sd}/pj")
+        try:
+            _none = seat_turn(_seat.pid)
+            open(f"{_sd}/sl/selfcheck-seat-1.json", "w").write("{}")
+            _t7 = now() - 7 * 3600
+            os.utime(f"{_sd}/sl/selfcheck-seat-1.json", (_t7, _t7))
+            _got = seat_turn(_seat.pid)
+            _cwd_none = seat_turn(_alone.pid)           # no id, nothing written for its cwd yet
+            for _d in ("seatA", "seatB"):               # a transcript in each cwd's directory, 7 h old
+                _pd = f"{_sd}/pj/" + re.sub(r"[/.]", "-", os.path.realpath(f"{_sd}/{_d}"))
+                os.makedirs(_pd)
+                open(f"{_pd}/some-session.jsonl", "w").write("{}\n")
+                os.utime(f"{_pd}/some-session.jsonl", (_t7, _t7))
+            _cwd_tr = seat_turn(_alone.pid)
+            _t5 = now() - 5 * 3600                      # a per-turn file for that cwd, newer: the newer wins
+            json.dump({"raw": {"cwd": f"{_sd}/seatA"}}, open(f"{_sd}/sl/other-id.json", "w"))
+            os.utime(f"{_sd}/sl/other-id.json", (_t5, _t5))
+            _cwd_sl = seat_turn(_alone.pid)
+            _peer_none = [seat_turn(px.pid) for px in _peers]
+        finally:
+            os.environ.pop("CC_STATUSLINE_DIR", None) if _keep_sl is None else os.environ.update({"CC_STATUSLINE_DIR": _keep_sl})
+            globals().update(PROJECTS=_keep_pj)
+            _bare_none = seat_turn(_bare.pid)
+            for _px in [_seat, _bare, _alone] + _peers:
+                _px.kill()
+                _px.wait(timeout=10)
+        ok("seat_turn walks the pane's process tree to the `claude` under it, reads the session id off its command "
+           "line and answers with cc-statusline's per-turn file for that id: the time that file says, and None "
+           "before there is one, for a pane with no session under it, or for no pane — no evidence is None, "
+           "never 'long ago'",
+           _got is not None and abs(_got - _t7) < 2 and _none is None and _bare_none is None
+           and seat_turn("") is None)
+        ok("…AND A SEAT WITH NO --session-id IS FOUND BY ITS CWD, the seats that actually mark (`cc <repo>`, "
+           "`cc --orch`; review of #538): None before anything is written for that cwd; the newest transcript in "
+           "the cwd's directory once there is one; and the per-turn file whose raw.cwd is that cwd when it is "
+           "newer — the seat's last turn, whichever file carries it",
+           _cwd_none is None and _cwd_tr is not None and abs(_cwd_tr - _t7) < 2
+           and _cwd_sl is not None and abs(_cwd_sl - _t5) < 2)
+        ok("…while two seats with no id in ONE cwd say nothing about each other: both are None (cc-context's own "
+           "'ambiguous cwd → no answer'), so a main seat and an orch sharing a checkout keep their clocks rather "
+           "than one hiding behind the other's turns",
+           _peer_none == [None, None])
     ok("…while a window that is gone, or is another repo's, is refused BEFORE the clock: there is no live "
        "session to name in the reason, and the row is reported exactly as any unattended row is",
        mark_why({"agent": "@9:900", "agent_at": stamp(60)}, W, "r", T0, AGENT_MARK) == (False, "")
@@ -2251,10 +2543,13 @@ def selfcheck():
        "@1:900" in _wins and "@1:901" not in _wins)
     with tempfile.TemporaryDirectory() as tb:
         _B, _W, _pr, _tl = BOARDS, WTS, procs, tmux_live
+        _wp, _stn = window_panes, seat_turn
         globals().update(BOARDS=tb, WTS=tb,
                          procs=lambda: (set(), set(), {"7"}, {}, {}),
                          tmux_live=lambda ppids, sessions=(): (
-                             set(), {}, {"@5:900": "agentrepo", "@6:900": "otherrepo"}))
+                             set(), {}, {"@5:900": "agentrepo", "@6:900": "otherrepo", "@7:900": "agentrepo"}),
+                         window_panes=lambda: {"@5:900": "5000", "@7:900": "7000"},
+                         seat_turn=lambda pid: {"5000": time.time() - 60, "7000": time.time() - 7 * 3600}.get(pid))
         try:
             for tr in ("t2", "t3"):
                 os.makedirs(f"{tb}/agentrepo/{tr}")
@@ -2264,11 +2559,18 @@ def selfcheck():
                 "t2": {"status": "running", "agent": "@6:900", "agent_at": _fresh, "updated": "2020-01-01T00:00:00Z"},
                 "t3": {"status": "running", "updated": "2020-01-01T00:00:00Z"},
                 "t4": {"status": "running", "agent": "@5:900", "agent_at": "2020-01-01T00:00:00Z",
-                       "updated": "2020-01-01T00:00:00Z"}}},
+                       "updated": "2020-01-01T00:00:00Z"},
+                "t5": {"status": "running", "agent": "@7:900", "agent_at": _fresh, "updated": "2020-01-01T00:00:00Z"}}},
                 open(f"{tb}/agentrepo.json", "w"))
             got = {tr: fa for _, tr, _, fa in facts(["agentrepo"], net=False)}
         finally:
-            globals().update(BOARDS=_B, WTS=_W, procs=_pr, tmux_live=_tl)
+            globals().update(BOARDS=_B, WTS=_W, procs=_pr, tmux_live=_tl, window_panes=_wp, seat_turn=_stn)
+        ok("facts() reads the seat behind each mark: t5's mark is a minute old and its window holds a session for "
+           "the repo, exactly as t1's — and that seat last took a turn 7 h ago, so the mark holds nothing and the "
+           "row is asked about in ONE line naming the hours, while t1's seat turned a minute ago and holds",
+           got["t5"]["agent_live"] is False and got["t1"]["agent_live"] is True
+           and decide(got["t5"]) == [("ask", "blocked", "marked by a live session, but that seat has not taken a "
+                                                         "turn for 7 h — a re-mark is not a turn, mark expired")])
         ok("facts() reads the mark off the board file and calls the row alive, worktree or none — the whole "
            "path, so the field name is under test too and no fixture stands in for the missing worktree",
            got["t1"]["agent"] == "@5:900" and got["t1"]["agent_live"] is True
@@ -2779,6 +3081,97 @@ def selfcheck():
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: …and that same row, hold lifted, is offered once — the hold was what silenced it and the "
            "finding was not lost", offered() == o2 + 1)
+        json.dump({}, open(seenp, "w"))
+
+        # THE PR IS READ AGAIN AT SEND TIME. facts() reads it when the run begins; the tick runs between; PR #521
+        # merged 16 s before "review and land it" went out on the older read, and a seat woke on it (~110k cache
+        # read) to find nothing to do (raised 2026-09-19). Own fixture: four fresh rows, a gh that answers per PR
+        # and, for two of them, differently the second time it is asked — the run's first read and its send-time
+        # read are the two calls.
+        open(f"{th}/gh", "w").write(f'''#!/bin/sh
+        case "$*" in
+          *pr/77*"--json state"*) n=$(cat {th}/gh77.n 2>/dev/null || echo 0); echo $((n + 1)) > {th}/gh77.n
+                                  [ "$n" -ge 1 ] && echo MERGED || echo OPEN ;;
+          *pr/79*"--json state"*) n=$(cat {th}/gh79.n 2>/dev/null || echo 0); echo $((n + 1)) > {th}/gh79.n
+                                  [ "$n" -ge 1 ] && echo MERGED || echo CLOSED ;;
+          *pr/80*"--json state"*) echo CLOSED ;;
+          *) echo OPEN ;;
+        esac
+        ''')
+        for tr, n in (("t7", 77), ("t8", 78), ("t9", 79), ("t10", 80)):
+            cb("add", repo, tr, f"pr {n}", "")
+            cb("status", repo, tr, "review")
+            cb("set", repo, tr, "pr", f"https://example.invalid/pr/{n}")
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        inj6 = open(f"{th}/inj.log").read()
+        led6 = json.load(open(seenp))
+        ok("end to end: a finished row whose PR read OPEN when the run began and MERGED at send time is not "
+           "offered as 'review and land it', and keeps no memo and no clock — the next pass marks it merged",
+           "t7" not in inj6 and not any("t7" in k for k in led6))
+        ok("end to end: …while the row beside it whose PR still reads OPEN at send time is offered exactly as "
+           "before — the re-read drops a merged PR, not the nag",
+           sum(f"{repo}/t8: finished, PR open, not landed" in ln for ln in inj6.splitlines()) == 1
+           and f"offered {repo}/t8 https://example.invalid/pr/78" in led6)
+        ok("end to end: …and a NEEDS-YOU finding about a PR — 'closed without merging' — is re-read the same way: "
+           "merged by send time it is not sent, and the row beside it whose PR is still closed is",
+           "t9" not in inj6 and f"board watchdog: {repo}/t10 — its PR was closed without merging" in inj6)
+        ok("end to end: …and the re-read was made — once per PR, only for a line about to go out: the two PRs "
+           "that changed were each asked twice, and the two that did not, no more than the run's own read",
+           open(f"{th}/gh77.n").read().strip() == "2" and open(f"{th}/gh79.n").read().strip() == "2")
+        for tr in ("t7", "t8", "t9", "t10"):
+            cb("rm", repo, tr)
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        json.dump({}, open(seenp, "w"))
+
+        # …AND IT DROPS ONLY WHAT THE MERGE ANSWERS. A `merged` row whose branch really holds commits origin lacks
+        # is still reported (the invariant up top, and asserted at decide level above). Dropping every line on a
+        # MERGED PR took that safety ask off the wire and wrote its key as 0, so every pass dropped it again while
+        # the sweep counted down to deleting the branch with the commits on it. Own fixture: a real checkout one
+        # commit ahead of its origin, with the failed-push marker beside it.
+        wtU, o11 = f"{th}/.cc/worktrees/{repo}/t11", f"{th}/o11.git"
+
+        def gu(*a, d=None):
+            return subprocess.run(["git", *(["-C", d] if d else []), *a], capture_output=True, text=True, timeout=30)
+
+        gu("init", "-q", "--bare", o11)
+        gu("clone", "-q", o11, wtU)
+        gu("config", "user.email", "s@e", d=wtU); gu("config", "user.name", "s", d=wtU)
+        open(f"{wtU}/a", "w").write("1")
+        gu("add", "a", d=wtU); gu("commit", "-qm", "one", d=wtU)
+        gu("push", "-q", "-u", "origin", "HEAD", d=wtU)
+        open(f"{wtU}/a", "w").write("2")
+        gu("commit", "-qam", "two", d=wtU)               # the commit origin does not have
+        os.makedirs(f"{wtU}/.cc", exist_ok=True)
+        open(f"{wtU}/.cc/push.err", "w").close()
+        open(f"{th}/gh", "w").write(f'''#!/bin/sh
+        case "$*" in
+          *pr/82*"--json state"*) n=$(cat {th}/gh82.n 2>/dev/null || echo 0); echo $((n + 1)) > {th}/gh82.n
+                                  [ "$n" -ge 1 ] && echo MERGED || echo OPEN ;;
+          *) echo MERGED ;;
+        esac
+        ''')
+        cb("add", repo, "t11", "merged, and its branch never reached origin", "")
+        cb("status", repo, "t11", "merged")
+        cb("set", repo, "t11", "pr", "https://example.invalid/pr/81")
+        cb("add", repo, "t12", "pr 82", "")
+        cb("status", repo, "t12", "review")
+        cb("set", repo, "t12", "pr", "https://example.invalid/pr/82")
+        n7 = len(open(f"{th}/inj.log").read().splitlines())
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        inj7 = "\n".join(open(f"{th}/inj.log").read().splitlines()[n7:])
+        led7 = json.load(open(seenp))
+        ok("end to end: a MERGED PR at send time drops the lines the merge answers and NOT the safety ask beside "
+           "them: a merged row holding commits origin lacks is still offered, and keeps its memo, because no "
+           "merge makes that work safe and the sweep deletes the branch at 48 h",
+           sum(f"{repo}/t11 — its branch is not pushed" in ln for ln in inj7.splitlines()) == 1
+           and float(led7.get(f"{repo}/t11: its branch is not pushed") or 0) > 0)
+        ok("end to end: …while in that same pass the row whose only finding IS the merge's answer is dropped "
+           "exactly as t7 was — 'review and land it' on a PR that merged since the run began, no memo, no clock",
+           "t12" not in inj7 and not any("t12" in k for k in led7))
+        for tr in ("t11", "t12"):
+            cb("rm", repo, tr)
+        shutil.rmtree(wtU, ignore_errors=True); shutil.rmtree(o11, ignore_errors=True)
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
         json.dump({}, open(seenp, "w"))
 
         # A ROW WAITING ON A PERSON IS NOT UNATTENDED. Its seat stood down and said so (STATUS: BLOCKED), and the

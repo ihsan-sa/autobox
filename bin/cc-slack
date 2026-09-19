@@ -42,6 +42,7 @@ A reply can @-mention a person already in the channel; @main/@<alias> are sessio
 A session's post naming @main, an orch alias or a live track (reply tool, `cc-slack post`, a card) reaches that session: mirrored into its own channel with a link back, delivered once in the original thread, the poster told where it went.
 A session handed another session's post 👍s it on the first tool call of the turn that post woke, so the channel shows it was read and taken on even when no reply follows; the box's 👀 still only means received, and the owner's own messages keep the reply-or-react rule.
 A reaction is a verdict from anyone in the channel (a member's :+1: in #approvals merges the PR, exactly as the owner's does); DM reactions stay the owner's.
+A :+1: on cc-model's return card — `[return] <window>: Fable 5.1 is back…`, posted when the outage that moved a session off the primary lifts — runs `cc-model return <window>`: that session's overlapping handoff back to it (✅ when it started, ❌ and one line when it did not).
 The owner's 📌 marks a thread "revisit", not a verdict — kept until the 📌 comes off, listed by `cc-slack revisit`.
 Only the owner steers: permission answers, `!` commands and @alias hand-offs.
 The `!` commands are `!pause`/`!resume` (each also as `-only` and `-under`), `!restart <box|repo[/track]|slack|tmux>` and `!reboot`, owner-only, any channel or thread; anything else typed is a message to the session.
@@ -132,6 +133,7 @@ REVISIT = "revisit.json"                                       # {"<chat>:<root_
 ASK_TIMEOUT = 150                  # cc-ask's own cap is CC_ASK_TIMEOUT (120 s); this is the daemon's patience past it
 ASK_CONTEXT = 8                    # the most thread messages a follow-up carries to cc-ask as context
 PR_RE = re.compile(r"^\[([a-z0-9_-]+)\] PR #([0-9]+):")
+RETURN_RE = re.compile(r"^(?:<#[A-Z0-9]+(?:\|[^>]*)?>\s+)?\[return\] (\S+):")   # cc-model's card (its card_text): a 👍 on it runs `cc-model return <window>`
 QUEUE_TTL = 4 * 3600                                                # a message queued for a session that never came up is dropped (and the owner told) after 15 min
 SECRET_RE = re.compile(r"(xox[abpsr]-[A-Za-z0-9-]+|Authorization:\s*\S+(?:\s+\S+)?|Bearer\s+[A-Za-z0-9._~+/=-]{8,}"
                         r"|AKIA[0-9A-Z]{12,}|gh[pousr]_[A-Za-z0-9]{20,})")   # what a tool preview relayed to Slack must never carry
@@ -5352,6 +5354,9 @@ class Daemon:
         msg, root = self.reacted_message(chat, ts)
         if not msg or not self.is_ours(msg):
             return None                                    # a reaction on a human's message tells a session nothing
+        m = RETURN_RE.match((msg.get("text") or "").strip())
+        if m and name in ("+1", "thumbsup"):               # the return card asks one thing, and this is its answer
+            return None if removed else self.on_return(chat, ts, m.group(1), who)
         if self.plain_ack(msg, name):
             log(f"reaction: 👍 {'off' if removed else 'on'} {chat}/{ts} is an ack — settled, no session woken")
             return None
@@ -5376,6 +5381,27 @@ class Daemon:
                 "lane": "main" if chat.startswith("D") else lane_of(self.chan_name(chat), target)}
         self.deliver(target, {"type": "message", "content": content, "meta": meta}, autostart=False, alias=alias)
         return None
+
+    def on_return(self, chat, ts, window, who=None):
+        """A 👍 on cc-model's return card — "[return] <window>: Fable 5.1 is back and this session is on Opus 5 — 👍
+        hands it back" — is the owner's word (the brief, 2026-09-18: "thumbs up means trigger handoff"): `cc-model
+        return <window>` runs cc-handoff --overlap for it, unless it is on the primary already or has an overlap
+        open. Stateless like on_approval: the card is re-read, and cc-model's own line is the verdict — ✅ on the
+        card when the handoff started, ❌ and that line in the thread when it did not. Never a session's turn: the
+        session the card is about is the one being handed off, and the successor comes up on the primary."""
+        name = self.user_name(who) if who else ""
+        log(f"return: {window} 👍 by {name} ({self.role_of(who)})")
+        try:
+            r = EFFECTS.run([f"{BIN}/cc-model", "return", window], capture_output=True, text=True, timeout=120,
+                            stdin=subprocess.DEVNULL)
+            ok, out = r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip() or "(no output)"
+        except Exception as e:
+            ok, out = False, f"{e.__class__.__name__}: {e}"[-300:]
+        log(f"return: {window} {'ok' if ok else 'FAILED'}: {last_line(out)}")
+        react(self.cfg, chat, ts, "white_check_mark" if ok else "x")
+        if not ok:
+            self.say(chat, last_line(out), ts)
+        return last_line(out)
 
     def on_approval(self, chat, ts, reaction, who=None):
         """A 👍 in #approvals on bot's PR post hands it to cc-land, the only merger; membership is the right.

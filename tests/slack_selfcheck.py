@@ -2970,6 +2970,66 @@ def run_selfcheck():
           ak_pin == (3, ["C1:8100.1"]) and ak_appr == [("8100.2", "+1")] and len(ak) == 3)
     dmAk.revisit.clear(); save_revisit(dmAk.revisit)    # the 📌 above is this block's fixture, not the next one's
 
+    # ---- A 👍 ON cc-model's RETURN CARD HANDS THAT SESSION BACK TO FABLE (the brief, 2026-09-18: "thumbs up means trigger
+    #      handoff"). The card is cc-model's, posted at the lift for a session that belongs on the primary and is not on
+    #      the major list; the daemon re-reads it and runs `cc-model return <window>` — never the session's turn.
+    dmRt = Daemon(use_slack=False); dmRt.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+    dmRt.bot_user = "UBOT"; dmRt.bot_id = "BBOT"
+    dmRt.route = lambda chat, ctype=None: "r"; dmRt.chan_name = lambda c: "repo"
+    dmRt.user_name = lambda u: "The Owner"
+    dmRt.subs["r"] = [Conn(None, "r", {"alias": None})]
+    rt_woke, rt_ran, rt_rx, rt_said = [], [], [], []
+    dmRt.deliver = lambda target, payload, **k: rt_woke.append(payload) or "delivered"
+    dmRt.say = lambda chat, text, thread=None, mail=True: rt_said.append((chat, text, thread))
+    rt_card = "[return] demo/t1: Fable 5.1 is back and this session is on Opus 5 — :+1: hands it back (a successor alongside, then cutover)"
+    rt_msgs = {"8200.1": {"ts": "8200.1", "user": "UBOT", "text": rt_card},
+               "8200.2": {"ts": "8200.2", "user": "UBOT", "text": "<#C1|repo> " + rt_card.replace("demo/t1", "demo@site")},
+               "8200.3": {"ts": "8200.3", "user": "UOWNER", "text": rt_card},
+               "8200.4": {"ts": "8200.4", "user": "UBOT", "text": "landed it, all green"}}
+    rt_ev = lambda ts="8200.1", **k: {"type": "reaction_added", "reaction": "+1", "user": "UOWNER",
+                                      "item": {"type": "message", "channel": "C1", "ts": ts}, **k}
+    rt_api = lambda method, token, **kw: {"messages": [rt_msgs[kw["ts"]]]} if kw.get("ts") in rt_msgs else {"messages": []}
+    def rt_run(cmd, **kw):
+        rt_ran.append(list(cmd))
+        rc, line = rt_verdict
+        return type("R", (), {"returncode": rc, "stdout": line + "\n", "stderr": ""})()
+    _rxRt, _runRt = globals()["react"], EFFECTS.run_impl
+    globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: rt_rx.append((ts, name))
+    EFFECTS.run_impl = rt_run
+    try:
+        globals()["api"] = rt_api
+        rt_verdict = (0, "cc-model: demo/t1 — handoff to Fable 5.1 started")
+        rt_out = dmRt.on_reaction(rt_ev())                              # 👍 on the card
+        rt_first = (list(rt_ran), list(rt_rx), list(rt_said), list(rt_woke))
+        dmRt.on_reaction(rt_ev(type="reaction_removed"))                # 👍 taken off: nothing
+        dmRt.on_reaction(rt_ev(reaction="eyes"))                        # 👀 on the card: not its answer, the usual path
+        rt_other = (list(rt_ran), list(rt_woke))
+        dmRt.on_reaction(rt_ev(ts="8200.2"))                            # the card with a channel mention in front (another sender's post)
+        rt_mention = list(rt_ran)
+        dmRt.on_reaction(rt_ev(ts="8200.3"))                            # the same words in a HUMAN's message: nobody's card
+        dmRt.on_reaction(rt_ev(ts="8200.4"))                            # a plain reply of ours: the ack rule, as before
+        rt_not_cards = (list(rt_ran), list(rt_woke))
+        rt_verdict = (1, "cc-model: demo/t1 — handoff not started (demo/t1 already has an overlap open)")
+        dmRt.on_reaction(rt_ev())
+        rt_refused = (list(rt_rx), list(rt_said))
+    finally:
+        globals()["api"] = real_api
+        globals()["react"] = _rxRt
+        EFFECTS.run_impl = _runRt
+    check("a 👍 on cc-model's return card runs `cc-model return <window>` for the window the card names, puts ✅ on the "
+          "card, says nothing more, and wakes no session — the session named is the one being handed off",
+          rt_first[0] == [[f"{BIN}/cc-model", "return", "demo/t1"]] and rt_first[1] == [("8200.1", "white_check_mark")]
+          and rt_first[2] == [] and rt_first[3] == [] and rt_out == "cc-model: demo/t1 — handoff to Fable 5.1 started")
+    check("…taking the 👍 off, or any other reaction on the card, runs nothing (👀 on it keeps the ordinary reaction path)",
+          rt_other[0] == rt_first[0] and len(rt_other[1]) == 1 and rt_other[1][0]["content"].startswith("👀 on your "))
+    check("…the card is matched with the channel mention a post from elsewhere carries, and reads the orch address too",
+          rt_mention[-1] == [f"{BIN}/cc-model", "return", "demo@site"])
+    check("…the same words in a person's message are nobody's card, and a plain reply of ours is still the ack rule: "
+          "nothing runs, nothing wakes", rt_not_cards[0] == rt_mention and rt_not_cards[1] == rt_other[1])
+    check("…cc-model's refusal is the owner's answer: ❌ on the card and its one line in the thread",
+          rt_refused[0][-1] == ("8200.1", "x")
+          and rt_refused[1] == [("C1", "cc-model: demo/t1 — handoff not started (demo/t1 already has an overlap open)", "8200.1")])
+
     role_a2 = os.environ.pop("CC_ROLE", None)
     rx_tool = []
     ch_a2 = Channel("box"); ch_a2.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
