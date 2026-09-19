@@ -26,7 +26,8 @@ no worker and nothing says why) is reported and, with --notify, offered to the r
 broker door (CC_RECONCILE_INJECT, CC_BROKER_SOURCE from the unit); what no session takes pages the owner. A
 finished row (`merged`/`done`) raises nothing on suspicion; a merged row whose branch really holds commits origin
 lacks is still reported. A `held` row keeps its fixes, stops, safety asks and its question; the guesses go quiet.
-A finished track with an open PR nobody is landing is offered once per PR and alerted once per 4 h window.
+A finished track with an open PR nobody is landing is offered once per PR and alerted once per 4 h window —
+unless the row itself waits on a person, which is somebody having picked it up: that one raises neither.
 
 RUNAWAY: a headless worker with no cc-loop above it is ended on sight; a worker alive with journal, loop log and
 worktree untouched for 3 h, seen by two passes, is ended too, never during a usage limit. --no-stop reports only.
@@ -1875,8 +1876,13 @@ def main(argv):
         fresh = [r for k, r in keys.items() if t0 - float(old.get(k, 0) or 0) >= repeat]
         told = {f"{r['repo']}/{r['track']}: {r['why']}" for r in fresh}
         keep, busy = {}, None
-        for repo, track, f, state, _, _ in snaprows:    # pending: finished, PR open, nobody landing it
-            if project_parked(repo) or f.get("held"):
+        for repo, track, f, state, who, _ in snaprows:  # pending: finished, PR open, nobody landing it
+            # A ROW WAITING ON A PERSON HAS BEEN PICKED UP: its seat stood down and asked, and the answer is that
+            # person's. "review and land it" is then a full context read the seat can do nothing with (career/
+            # positioning PR #4 was offered one every ~2 h while it sat there), and "nobody has picked it up" is
+            # not true of it either. Silent like a `held` row, memo and all, so the PR is news again — once — when
+            # the answer comes and the row stops waiting.
+            if project_parked(repo) or f.get("held") or who == "person":
                 continue
             k, ak = f"pending {repo}/{track}", f"alerted {repo}/{track}"
             ok_ = f"offered {repo}/{track} {f.get('pr') or ''}".rstrip()
@@ -2773,6 +2779,47 @@ def selfcheck():
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: …and that same row, hold lifted, is offered once — the hold was what silenced it and the "
            "finding was not lost", offered() == o2 + 1)
+        json.dump({}, open(seenp, "w"))
+
+        # A ROW WAITING ON A PERSON IS NOT UNATTENDED. Its seat stood down and said so (STATUS: BLOCKED), and the
+        # row is `pending` all the same — finished, PR open, nothing landing it, on a repo whose PRs this box does
+        # land — so nothing else in this fixture can be the reason it goes quiet. The answer is the owner's, so
+        # "review and land it" is a full context read that can change nothing: career/positioning PR #4 was offered
+        # one every ~2 h while it sat in review waiting on him.
+        st2 = f"{th}/.cc/state/{repo}/t2"
+        os.makedirs(st2, exist_ok=True)
+        open(f"{st2}/progress.md", "w").write("- asked the owner\nSTATUS: BLOCKED: land #9 now, or hold it?\n")
+
+        def blocked_run():
+            """One --apply --notify pass over the fixture as it stands, with its records for t2 back. The word is
+            set back to `done` first: the pass reconciles it to `review`, and the state under test is this one."""
+            cb("status", repo, "t2", "done")
+            r = subprocess.run(argvP + ["--json"], env=penv, capture_output=True, text=True, timeout=120)
+            return [x for x in json.loads(r.stdout or '{"records": []}')["records"] if x["track"] == "t2"]
+
+        o5, a5 = offered(), alerted()
+        rec5 = blocked_run()
+        ok("end to end: the fixture is that state itself and not a stand-in for it — the pass read the PR as OPEN "
+           "off a board word that is not `waiting` and put the row in `review`, which is `pending` exactly",
+           [(x["from"], x["to"], x["kind"]) for x in rec5] == [("done", "review", "fix")])
+        ok("end to end: …and its seat was told nothing: a row whose own journal says it is waiting on a person is "
+           "never offered 'review and land it' — it has been picked up and the answer is not that seat's to give — "
+           "is not paged about as work nobody took, and keeps no memo, so it is news again when the answer comes",
+           offered() == o5 and alerted() == a5 and not any("t2" in k for k in json.load(open(seenp))))
+        os.remove(f"{th}/gh")
+        blocked_run()
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        os.chmod(f"{th}/gh", 0o755)
+        blocked_run()
+        ok("end to end: …and a poll flap is not a way round it: the pass that could not read the PR keeps no memo, "
+           "and the next one, reading OPEN again off that clean slate, still says nothing to the seat",
+           offered() == o5)
+        os.remove(f"{st2}/progress.md")      # the owner answered — the same row, the same repo, nothing else changed
+        json.dump({}, open(seenp, "w"))
+        cb("status", repo, "t2", "done")
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: …and that same row, no longer waiting on anyone, is offered once: the wait on a person was "
+           "what silenced it, not anything else about this fixture", offered() == o5 + 1)
         json.dump({}, open(seenp, "w"))
 
         vj, HD = f"{th}/verdict.json", "09dd584c561e9e18d3025a8db244809f9d5b776a"
