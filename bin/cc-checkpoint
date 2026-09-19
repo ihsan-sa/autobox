@@ -38,6 +38,15 @@
 # the primary worktree / default branch (no marker there), so main/planning sessions stay clean.
 # Refuses (and logs to .cc/checkpoint.err) when HEAD is not the track's own branch — a session can rewrite
 # HEAD with git symbolic-ref — or when the staged names look like secrets. Push stderr → .cc/push.err.
+# A BRANCH MOVED UNDER THE WORKTREE IS NEVER COMMITTED AS A REVERT. A second worktree on the same branch (`git checkout
+# --ignore-other-worktrees`, a hand fix) commits, the branch moves, and this worktree's index still holds the old tip —
+# which `git add -A` reads as a staged diff UNDOING the fix. The commit block below tells the two apart by this
+# worktree's own HEAD reflog, carries the tree forward when the branch merely advanced (a local edit rides along; one
+# that collides with the fix refuses and touches nothing), and refuses when the branch was rewritten. Both refusals
+# leave HEAD's reflog alone, so they repeat every turn until the tree is settled by hand (a `git reset` there would
+# stamp it, and the next turn would commit the stale tree — review of #544). The journal gets one line per move.
+# A HAND PUSH FROM THIS WORKTREE DOES NOT STALE THE LEASE EITHER: when the remote holds a tip this branch's own
+# reflog has held (the pre-rebase head), .cc/pushed moves to it before the leased push (lease_refresh).
 # The push carries whatever credential `cc-gh-token gitargs` gives it for that remote — a GitHub App token for
 # the org this box has an app for, nothing at all for any other remote — so a repo whose only credential is the
 # app pushes unattended. The token is minted for the push and nothing about it is written here. For a MEMBER
@@ -482,6 +491,8 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   # recorded lease with it, so this is reachable by hand (security review of #225). With no lease of our own the
   # push is not forced.
   [ -n "$lease" ] || [ -n "$workspace" ] || lease=$(git rev-parse -q --verify "refs/remotes/$remote/$branch" 2>/dev/null)
+  # …and a lease this worktree's own hand push has overtaken moves up to what it pushed (lease_refresh) — box tracks only.
+  [ -n "$workspace" ] || [ -z "$lease" ] || lease=$(lease_refresh "$branch" "$lease")
   if [ -n "$lease" ]; then
     git_unattended "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$ST/push.err.tmp"; prc=$?
     [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; return 0; }
@@ -507,6 +518,23 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   [ -n "$workspace" ] && [ -f "$root/.cc/pushed" ] && [ ! -L "$root/.cc/pushed" ] && return 3
   return 2
 }
+lease_refresh(){   # $1 branch · $2 the lease on file → the lease to push with, on stdout. cwd = worktree root, $cred from lease_push
+  # A HAND PUSH FROM THIS WORKTREE STALES THE LEASE: a repair committed and pushed outside this file put its tip on
+  # the remote while .cc/pushed still named the push before it, so the next rebased push leased against the old
+  # value, the remote answered with the hand-pushed one, and a write this worktree made was called "something else
+  # wrote" — STATUS: BLOCKED on a track nobody else had touched (raised-hand-commit-on-track-branch-stales-push-lease,
+  # 2026-09-18). Brief: "`.cc/pushed` refreshes from origin when the remote equals the worktree's pre-rebase head". So
+  # the remote's tip is fetched (bounded, as every remote call here is) and, when it is a tip THIS BRANCH has held —
+  # its own reflog, which has the pre-rebase head and every tip before it — the lease moves to it: a commit this
+  # branch was at came out of this worktree. A tip the reflog never held is exactly what the lease exists to stop,
+  # and the caller's refusal stands. A fetch that fails changes nothing.
+  # BOX TRACKS ONLY (the caller's rule): a member workspace's .git, reflog included, is the member's to write — the
+  # tracking-ref rule below — so nothing read out of it becomes a force-with-lease target; theirs stays rc=3 and adopt.
+  local branch="$1" lease="$2" tip
+  if git_unattended "${cred[@]}" fetch -q "$remote" "refs/heads/$branch" 2>/dev/null && tip=$(git rev-parse -q --verify FETCH_HEAD 2>/dev/null) \
+     && [ -n "$tip" ] && [ "$tip" != "$lease" ] && git reflog show --format=%H "refs/heads/$branch" 2>/dev/null | grep -qx "$tip"; then
+    printf '%s\n' "$tip" > "$ST/pushed"; lease=$tip; fi
+  printf '%s\n' "$lease"; }
 lease_keep(){ git rev-parse "$1" > "$ST/pushed" 2>/dev/null   # next time's lease: what the remote holds, because we just put it there
   rm -f "$ST/push.err" "$ST/push.err.tmp" "$ST/push.rejected" "$ST/adopted"; }   # …and this lease IS one of ours now, adopted or not; a rejection the remote has since taken back is stale
 row_ids(){   # → the CALLER's local repo and track for this worktree's board row and journal.  1 = no safe name
@@ -570,6 +598,10 @@ journal_blocked(){   # $1 repo · $2 track · $3 the message — the STATUS: BLO
   [ "$(grep -v '^[[:space:]]*$' "$jf" 2>/dev/null | tail -1)" = "STATUS: BLOCKED: $3" ] && return 0
   printf '\n%s cc-checkpoint: %s\nSTATUS: BLOCKED: %s\n' "$(date -u +%FT%TZ)" "$3" "$3" \
     | dd oflag=append,nofollow conv=notrunc "of=$jf" status=none 2>/dev/null; return 0; }
+journal_line(){   # $1 repo · $2 track · $3 a dated note for the journal — the same walls, no STATUS line: nothing stops on it
+  local jf
+  jf=$(journal_file "$1" "$2") || return 0
+  printf '\n%s cc-checkpoint: %s\n' "$(date -u +%FT%TZ)" "$3" | dd oflag=append,nofollow conv=notrunc "of=$jf" status=none 2>/dev/null; return 0; }
 journal_file(){   # $1 repo · $2 track → the journal's path, once the walls listed above hold.  1 = refused
   # Their last half, O_NOFOLLOW on the append itself, is each caller's: every write to it goes through dd with it.
   local jd
@@ -1618,6 +1650,87 @@ SH
   out=$(stophook "$(pay tracked "$d")" "$d")
   k "$(grep -qF '"decision": "block"' <<<"$out" && git -C "$d" log -1 --format=%s | grep -q '^wip: checkpoint' && echo 0 || echo 1)" \
     "nudge: a track is told too, and its work is committed FIRST — the session is asked to journal after the commit" "$out"
+  # ── A BRANCH MOVED UNDER THE WORKTREE (raised-shared-branch-stages-a-revert, 2026-09-18) ──────────────────────
+  # Two worktrees of one box repo on one branch: the seat, whose hook this is, and a hand worktree that takes the
+  # branch with --ignore-other-worktrees and commits a fix. The seat's index then holds the fix REVERSED, staged.
+  git init -q -b main "$HOME/dev/shared"; echo base > "$HOME/dev/shared/work.txt"; git -C "$HOME/dev/shared" add -A
+  git -C "$HOME/dev/shared" -c user.name=t -c user.email=t@t commit -q -m base; echo '.cc/' >> "$HOME/dev/shared/.git/info/exclude"   # as `cc` stamps a repo
+  seat="$HOME/.cc/worktrees/shared/seat"; git -C "$HOME/dev/shared" worktree add -q -b track/seat "$seat"
+  mkdir -p "$seat/.cc"; printf 'shared\nseat\n' > "$seat/.cc/track"; osS=$(bare sharedS); git -C "$seat" remote add origin "$osS"
+  hand="$T/hand"; git -C "$HOME/dev/shared" worktree add -q -b scratch "$hand"
+  handfix(){   # $1 what work.txt says after the hand fix → the branch tip it leaves
+    git -C "$hand" checkout -q --ignore-other-worktrees track/seat; printf '%s\n' "$1" > "$hand/work.txt"
+    git -C "$hand" -c user.name=t -c user.email=t@t commit -qam "hand: $1"; git -C "$hand" checkout -q scratch
+    git -C "$HOME/dev/shared" rev-parse track/seat; }
+  seatrun(){ ( cd "$seat" && env CC_ROLE=worker "$bin/cc-checkpoint" </dev/null >/dev/null 2>&1 ); }
+  sj="$HOME/.cc/state/shared/seat/progress.md"
+  fix=$(handfix fix1)
+  k "$(git -C "$seat" diff --cached --quiet 2>/dev/null; [ $? = 1 ] && echo 0 || echo 1)" "moved: the fixture is the real thing — the seat's index holds a staged diff against the hand fix" "$(git -C "$seat" status --porcelain)"
+  seatrun
+  eq "moved: the hook commits no revert — the branch still ends at the hand fix" "$(git -C "$seat" rev-parse HEAD)" "$fix"
+  eq "…and the seat's index is left clean" "$(git -C "$seat" status --porcelain)" ""
+  eq "…its files carried to the fix" "$(cat "$seat/work.txt")" fix1
+  k "$([ -e "$seat/.cc/checkpoint.err" ] && echo 1 || echo 0)" "…and no refusal is lit: a carried tree is not a failed commit" "$(cat "$seat/.cc/checkpoint.err" 2>/dev/null)"
+  eq "…the journal says so, once" "$(grep -c 'track/seat moved' "$sj" 2>/dev/null)" 1
+  seatrun
+  eq "…and not again next turn: HEAD's reflog is stamped" "$(grep -c 'track/seat moved' "$sj" 2>/dev/null)" 1
+  fix=$(handfix fix2); echo mine > "$seat/notes.txt"   # the seat's own edit, to a file the fix did not touch
+  seatrun
+  eq "moved: the seat's own edit rides along — committed on top of the hand fix" "$(git -C "$seat" rev-parse 'HEAD^' 2>/dev/null)" "$fix"
+  eq "…that commit carrying only the seat's file" "$(git -C "$seat" diff --name-only 'HEAD^' HEAD 2>/dev/null)" notes.txt
+  eq "…and the fix intact" "$(cat "$seat/work.txt")" fix2
+  fix=$(handfix fix3); echo collide > "$seat/work.txt"   # the seat's own edit, to the file the fix changed
+  seatrun
+  eq "moved: an edit that collides with the fix is refused — the branch still ends at the hand fix" "$(git -C "$seat" rev-parse HEAD)" "$fix"
+  eq "…the seat's edit untouched" "$(cat "$seat/work.txt")" collide
+  k "$(grep -q 'edited here too' "$seat/.cc/checkpoint.err" 2>/dev/null && echo 0 || echo 1)" "…and checkpoint.err says which case this is" "$(cat "$seat/.cc/checkpoint.err" 2>/dev/null)"
+  seatrun   # NOT sorted: the refusal stamped nothing, so the guard fires again instead of committing the seat's stale copy over the fix
+  eq "…and unsorted, the next turn refuses again — the branch still ends at the hand fix (review of #544)" "$(git -C "$seat" rev-parse HEAD)" "$fix"
+  eq "…the seat's edit still untouched" "$(cat "$seat/work.txt")" collide
+  eq "…and checkpoint.err holds the refusal twice" "$(grep -c 'edited here too' "$seat/.cc/checkpoint.err" 2>/dev/null)" 2
+  git -C "$seat" checkout -q -- work.txt; seatrun   # sorted by hand: the next turn carries on
+  eq "…and once sorted, the next turn leaves the seat clean" "$(git -C "$seat" status --porcelain)" ""
+  # The hand worktree DROPS the last commit: the branch now ends before this seat's own tip, and the seat's files still
+  # hold the dropped commit's content — a wip commit here would land that content again (review of #544).
+  git -C "$hand" checkout -q --ignore-other-worktrees track/seat; git -C "$hand" reset -q --hard HEAD~1
+  git -C "$hand" checkout -q scratch; rw=$(git -C "$HOME/dev/shared" rev-parse track/seat); echo later > "$seat/notes.txt"
+  k "$([ "$(cat "$seat/work.txt")" != "$(git -C "$seat" show "$rw:work.txt")" ] && echo 0 || echo 1)" "rewritten: the fixture is the real thing — the seat's tree differs from the branch's new tip" "$(cat "$seat/work.txt") vs $(git -C "$seat" show "$rw:work.txt")"
+  seatrun
+  eq "rewritten: nothing is committed on a branch rewritten under the worktree" "$(git -C "$seat" rev-parse HEAD)" "$rw"
+  k "$(grep -q 'rewritten under this worktree' "$seat/.cc/checkpoint.err" 2>/dev/null && echo 0 || echo 1)" "…and the refusal names it" "$(cat "$seat/.cc/checkpoint.err" 2>/dev/null)"
+  seatrun   # the next turn: refused again, no wip re-lands the dropped commit's content
+  eq "…and the next turn refuses again — HEAD still the tip the hand left, no wip made (review of #544)" "$(git -C "$seat" rev-parse HEAD)" "$rw"
+  eq "…the seat's tree untouched" "$(cat "$seat/work.txt")" fix3
+  eq "…and checkpoint.err holds the refusal twice" "$(grep -c 'rewritten under this worktree' "$seat/.cc/checkpoint.err" 2>/dev/null)" 2
+  # THE KEPT CASE. A seat that undoes its own last wip commit by editing the file back stages a diff that reverts its
+  # branch head exactly — and it is committed, because the head was this worktree's own move.
+  seat2="$HOME/.cc/worktrees/shared/seat2"; git -C "$HOME/dev/shared" worktree add -q -b track/seat2 "$seat2"
+  mkdir -p "$seat2/.cc"; printf 'shared\nseat2\n' > "$seat2/.cc/track"   # origin: the repo's, shared with the seat
+  seat2run(){ ( cd "$seat2" && env CC_ROLE=worker "$bin/cc-checkpoint" </dev/null >/dev/null 2>&1 ); }
+  echo tried > "$seat2/work.txt"; seat2run; c1=$(git -C "$seat2" rev-parse HEAD)
+  echo base > "$seat2/work.txt"; seat2run   # back to what it was before c1: a staged revert of HEAD, the seat's own
+  k "$([ "$(git -C "$seat2" rev-parse HEAD)" != "$c1" ] && [ "$(git -C "$seat2" rev-parse 'HEAD^')" = "$c1" ] && echo 0 || echo 1)" "kept: a seat undoing its own last wip commit by hand is still committed" "$(git -C "$seat2" log --oneline -3)"
+  eq "…to the tree it had before" "$(git -C "$seat2" rev-parse 'HEAD^{tree}')" "$(git -C "$seat2" rev-parse 'HEAD~2^{tree}')"
+  # ── A HAND PUSH FROM THE WORKTREE DOES NOT STALE THE LEASE (raised-hand-commit-on-track-branch-stales-push-lease) ──
+  osL=$(bare leaseL); dl=$(mkproj boxl/tl origin "$osL")   # a box track: nothing under ~/dev/boxl calls it a workspace
+  lpush(){ ( cd "$dl" && "$bin/cc-checkpoint" --push </dev/null >/dev/null 2>&1 ); }
+  lpush; la=$(git -C "$dl" rev-parse HEAD)
+  eq "lease: the first push records its lease" "$(cat "$dl/.cc/pushed" 2>/dev/null)" "$la"
+  echo repair > "$dl/work.txt"; git -C "$dl" -c user.name=t -c user.email=t@t commit -qam "hand repair"
+  git -C "$dl" push -q origin track/tl 2>/dev/null   # pushed by hand, outside cc-checkpoint: the lease still says $la
+  git -C "$dl" -c user.name=t -c user.email=t@t commit -q --amend -m "hand repair, rebased"; lb=$(git -C "$dl" rev-parse HEAD)   # the remote now holds the pre-rebase head
+  lpush; rc=$?
+  eq "lease: a rebase over a hand push from this worktree is pushed, not refused" "rc=$rc $(git -C "$osL" rev-parse track/tl)" "rc=0 $lb"
+  eq "…and the lease is what was just pushed" "$(cat "$dl/.cc/pushed" 2>/dev/null)" "$lb"
+  k "$(grep -q 'STATUS: BLOCKED' "$HOME/.cc/state/boxl/tl/progress.md" 2>/dev/null && echo 1 || echo 0)" "…with no STATUS: BLOCKED written" "$(cat "$HOME/.cc/state/boxl/tl/progress.md" 2>/dev/null)"
+  git clone -q "$osL" "$T/elsewhere" 2>/dev/null; git -C "$T/elsewhere" checkout -q track/tl 2>/dev/null   # a writer this branch's reflog has never seen
+  echo theirs > "$T/elsewhere/work.txt"; git -C "$T/elsewhere" -c user.name=o -c user.email=o@o commit -qam "someone else"
+  git -C "$T/elsewhere" push -q origin track/tl 2>/dev/null; lc=$(git -C "$T/elsewhere" rev-parse HEAD)
+  git -C "$dl" -c user.name=t -c user.email=t@t commit -q --amend -m "rebased again"
+  lpush; rc=$?
+  eq "lease: a tip this branch never held is still refused — the remote keeps it" "rc=$rc $(git -C "$osL" rev-parse track/tl)" "rc=2 $lc"
+  eq "…and the lease is not moved to it" "$(cat "$dl/.cc/pushed" 2>/dev/null)" "$lb"
+  k "$(grep -q 'something else wrote' "$HOME/.cc/state/boxl/tl/progress.md" 2>/dev/null && echo 0 || echo 1)" "…and it is said as before" "$(cat "$HOME/.cc/state/boxl/tl/progress.md" 2>/dev/null)"
   echo "cc-checkpoint selfcheck: $((n - f)) passed, $f failed"; [ "$f" = 0 ]
 }
 [ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
@@ -1871,10 +1984,39 @@ commit_end(){   # The hook stays nonblocking. Completion requires observable, cl
   ST=${CC_CHECKPOINT_STATE_DIR:-$root/.cc}
   mkdir -p "$ST" 2>/dev/null; [ -d "$ST" ] || exit "$STRICT"
   refuse(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$ST/checkpoint.err"; git reset -q 2>/dev/null; exit "$STRICT"; }   # unstage too: a refused secret must not sit in the index
+  # …but NOT for a branch that moved under the worktree: nothing staged there is the hook's, and a pathspec-less
+  # `git reset` is an update of HEAD that stamps its reflog — the same stamp the moved-branch guard below reads as
+  # "this worktree's own move", so the next turn would skip the guard and commit the stale tree (review of #544).
+  refuse_asis(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$ST/checkpoint.err"; exit "$STRICT"; }
   track=$(sed -n 2p "$root/.cc/track"); branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)
   [ -n "$track" ] && [ "$branch" = "track/$track" ] || refuse "refused: HEAD is '$branch', not 'track/$track' — checkpoint only ever commits the track's own branch"
   if [ "$STRICT" = 1 ]; then
     path_ids "$root" && [ "$branch" = "track/$WSTRACK" ] || refuse "refused: completion needs the canonical track"
+  fi
+  # THE BRANCH MOVED UNDER THIS WORKTREE. A second worktree on the same branch (`git checkout --ignore-other-worktrees`,
+  # a subagent's hand fix) commits; the branch ref moves while this worktree's index and files still hold the old tip,
+  # and to `git add -A` that is a staged diff UNDOING the fix — the next turn's commit would have landed it on an open
+  # PR (raised-shared-branch-stages-a-revert, 2026-09-18, the ece206 seat). Brief: "the hook refuses to commit a diff
+  # that reverts its own branch head" and "the second one's index is left clean". This worktree's OWN last move of
+  # HEAD is the top of its per-worktree HEAD reflog (`git reflog show HEAD` — not HEAD@{0}, which git resolves to the
+  # current tip, with a warning, when the two disagree); a branch past it was moved by somebody else.
+  #  · advanced (the old tip is in the new one's history): the tree is carried to the new tip with the two-tree merge a
+  #    checkout does (git read-tree -m -u) — a local edit to a file the fix did not touch rides along, one to a file it
+  #    did refuses and touches nothing — and HEAD's reflog is stamped (reset --soft, moving nothing) so the move is seen
+  #    once. The index is then clean of the revert, and only this seat's own edits can be committed below.
+  #  · rewritten (it is not): refused outright — nothing here can say which tree is right, and the old tip is named.
+  # A refusal here stamps nothing (refuse_asis, not refuse), so it comes back every turn until a person settles the
+  # tree; the one stamp is the successful carry's. Otherwise turn two commits what turn one refused (review of #544).
+  # NOT the literal "any staged revert of HEAD": a session that undoes its own last wip commit by editing the file back
+  # stages exactly that, and a hook that refused it would pin the bad change on the branch (kept case in selfcheck).
+  own=$(git reflog show --format=%H -1 HEAD 2>/dev/null); head=$(git rev-parse HEAD 2>/dev/null)
+  if [ -n "$own" ] && [ -n "$head" ] && [ "$own" != "$head" ]; then
+    git merge-base --is-ancestor "$own" "$head" 2>/dev/null \
+      || refuse_asis "refused: track/$track was rewritten under this worktree — its own last tip ${own:0:12} is not in the history of ${head:0:12}, so nothing was committed; 'git log ${own:0:12}' has this worktree's work"
+    git read-tree -m -u "$own" "$head" 2>/dev/null \
+      || refuse_asis "refused: track/$track moved ${own:0:12} → ${head:0:12} under this worktree (another worktree committed on it) and a file that commit changed is edited here too, so nothing was committed; 'git diff ${own:0:12}' is this worktree's own work — put it on top of HEAD by hand"
+    git reset -q --soft HEAD 2>/dev/null
+    ( row_ids && journal_line "$repo" "$track" "track/$track moved ${own:0:12} → ${head:0:12} under this worktree (another worktree committed on it); the tree here was carried to the new tip, nothing of it reverted or lost" )
   fi
   project_readme   # a project's repository describes the project, not the workspace it is a branch of
   git add -A 2>/dev/null || { [ "$STRICT" = 0 ] && exit 0; refuse "failed: git add"; }

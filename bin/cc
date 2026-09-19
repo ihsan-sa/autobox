@@ -39,6 +39,8 @@
 #                             card's `card: <channel> <ts>`); on a kind=session row it pushes and stops there —
 #                             a living project has no PR and is never done. Nothing here merges: for a repo named
 #                             in CC_SELF_LAND_REPOS (~/.cc/config) it is cc-loop that queues the landing
+#                             Run inside ~/.cc/worktrees/<repo>/<track> the two names may be left off; a worktree made
+#                             by hand (no .cc/track) has the marker written first, and it says so
 #   cc done <repo> <track> --json   task receipt on stdout, human lines on stderr. Safe to run again: it retries
 #                             whatever projection is still pending. Nonzero when the delivery or the board write
 #                             did not land — an approval card Slack could not take is pending, not a failure
@@ -428,6 +430,11 @@ default_branch(){   # $1 = ~/dev/<repo>. THE BOARD'S BASE IS THE PROJECT'S: cc-l
   case "$b" in track/*|"") b=main;; esac
   echo "$b"; }
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] || { echo "cc: invalid repo/track name '$1' (allowed: ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\$) — no /, no . or .., no leading -"; exit 1; }; }
+cwd_track(){   # → CWDREPO/CWDTRACK from where the cwd sits under ~/.cc/worktrees/<repo>/<track>.  1 = not inside one
+  local base real rest; base=$(readlink -f "$WTBASE" 2>/dev/null) || return 1; real=$(pwd -P 2>/dev/null) || return 1
+  rest=${real#"$base/"}; [ "$rest" != "$real" ] || return 1
+  case "$rest" in */*) ;; *) return 1 ;; esac   # <repo> alone is nobody's track
+  CWDREPO=${rest%%/*}; rest=${rest#*/}; CWDTRACK=${rest%%/*}; [ -n "$CWDREPO" ] && [ -n "$CWDTRACK" ]; }
 nolink(){   # A TRACK'S STATE DIR AND ITS WORKTREE'S .cc ARE BOUND READ-WRITE into that track's worker sandbox and
   # into a member workspace, so every name the HOST opens under them is a name somebody in there can replace with a
   # link to any file the owner can write. Refuse the link instead of writing through it — and the openers below use
@@ -436,7 +443,7 @@ nolink(){   # A TRACK'S STATE DIR AND ITS WORKTREE'S .cc ARE BOUND READ-WRITE in
   local p; for p; do [ -L "$p" ] && { echo "cc: $p is a symlink — refused (nothing here writes through a planted name)"; return 1; }; done; return 0; }
 lock(){ mkdir -p "$(dirname "$1")"; nolink "$1" || exit 1; exec 9>>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
-usage(){ sed -n '2,56p' "$0"; }   # the whole header block, down to the `cc selfcheck` line — bump it when a line is added
+usage(){ sed -n '2,58p' "$0"; }   # the whole header block, down to the `cc selfcheck` line — bump it when a line is added
 
 # THE CLAIM. A row has one writer at a time, and which one is not a matter of who typed first: cc-task records the
 # owner off the running process and refuses a second live one (bin/cc-task says how it decides). Two steps, and
@@ -1047,7 +1054,15 @@ case "${1:-}" in
     done_json=0; done_args=()
     for arg in "${@:2}"; do case "$arg" in --json) done_json=1 ;; *) done_args+=("$arg") ;; esac; done
     set -- done "${done_args[@]}"
-    repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track"
+    # BARE `cc done` INSIDE A TRACK'S WORKTREE takes both names off its path, ~/.cc/worktrees/<repo>/<track>, and says
+    # so; anywhere else, or with one name, it is the usage line — not bash's "line 991: 2: repo", a line number of this
+    # file with no mention of what was wanted, which is what two sessions got and read the source to decode
+    # (raised-cc-done-blames-the-branch-for-a-missing-track-file, 2026-09-16 and 09-18).
+    if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+      [ -z "${2:-}" ] && cwd_track || { echo "usage: cc done <repo> <track>   (inside ~/.cc/worktrees/<repo>/<track> both may be left off)" >&2; exit 2; }
+      set -- done "$CWDREPO" "$CWDTRACK"; echo "cc: done $CWDREPO $CWDTRACK — read off this worktree's path"
+    fi
+    repo="$2"; track="$3"; valid_name "$repo"; valid_name "$track"
     done_managed=0; done_ready=0
     if [ -e "$STBASE/$repo/$track/delivery.json" ] || [ -L "$STBASE/$repo/$track/delivery.json" ]; then
       done_managed=1
@@ -1089,6 +1104,24 @@ case "${1:-}" in
     base=$(default_branch "$DEV/$repo"); branch="track/$track"
     rowkind=$("$BOARD" get "$repo" "$track" kind 2>/dev/null)   # a session row is a living project, not a task — see below
     member_gitdir "$repo" "$wt" || exit 1   # BEFORE any git runs in the worktree: a redirected .git is refused, not run (review-156c)
+    # A WORKTREE MADE BY HAND HAS NO .cc/track, and everything below reads it: the hook commits nothing without the
+    # marker, and --push then reads an empty track name and refuses with "HEAD is 'track/<t>', not 'track/'" — the
+    # branch blamed for a missing file (raised-cc-done-blames-the-branch-for-a-missing-track-file, 2026-09-16/18). Brief:
+    # "`cc done` in a track/<row> worktree with no .cc/track writes it and says so". The path already names repo and
+    # track, so the two lines ensure_track would have written are written here, and said. NOT into a member's tree from
+    # the host ($hostsd): that file is bound read-write into their boundary and is theirs (cc-checkpoint's header), so
+    # there it is only said. Present but not naming this track: said with the shape, and nothing opened — a word
+    # somebody put there is not rewritten by a machine.
+    tf="$wt/.cc/track"
+    if [ ! -e "$tf" ] && [ ! -L "$tf" ]; then
+      if [ "$hostsd" = 1 ]; then echo "cc: $wt has no .cc/track (a worktree made by hand?) — its hook commits nothing until it holds two lines, '$repo' then '$track'; going on without it"
+      else   # …with the exclude ensure_track stamps, or the hook's `git add -A` ships .cc/ in the next commit
+        gcd=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && { mkdir -p "$gcd/info"; grep -qxF '.cc/' "$gcd/info/exclude" 2>/dev/null || echo '.cc/' >> "$gcd/info/exclude"; }
+        mkdir -p "$wt/.cc" && printf '%s\n%s\n' "$repo" "$track" > "$tf" && echo "cc: wrote $tf ($repo, $track) — a worktree made by hand had none"; fi
+    elif [ "$(sed -n 1p "$tf" 2>/dev/null)" != "$repo" ] || [ "$(sed -n 2p "$tf" 2>/dev/null)" != "$track" ]; then
+      echo "cc: $tf does not name this track — it must be two bare lines, '$repo' then '$track' (a third, the task id, is optional)$([ "$hostsd" = 1 ] && echo '; going on, but its hook will refuse every commit until it is fixed' || echo '; fix it and run cc done again. Nothing opened')"
+      [ "$hostsd" = 1 ] || exit 1
+    fi
     # the MAIN checkout's hooks, never the worktree's: a member could otherwise plant a git dir whose hooks this
     # host-side commit would run as the owner (review-156b) — same pin cc-loop applies to its own git calls
     hp=$(git -C "$DEV/$repo" config --type=path --get core.hooksPath 2>/dev/null); case "$hp" in "") hp="$DEV/$repo/.git/hooks";; /*) ;; *) hp="$DEV/$repo/$hp";; esac

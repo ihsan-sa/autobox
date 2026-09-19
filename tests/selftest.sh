@@ -878,6 +878,38 @@ od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t2 2>&1); rd=$?
 { [ "$rd" = 0 ] && ! grep -q 'refusing to run git' <<<"$od" && grep -q 'no remote, so no PR' <<<"$od"; } \
   && ok "...and a track that really hangs off ~/dev/<handle>/.git passes the same check and finishes (no remote → no PR)" || bad "cc done refused a genuine workspace track: rc=$rd $od"
 git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t2" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t2 >/dev/null 2>&1
+# A WORKTREE MADE BY HAND HAS NO .cc/track, AND `cc done` USED TO BLAME THE BRANCH FOR IT: the hook committed nothing,
+# --push read an empty track name and said "HEAD is 'track/t9', not 'track/'" (raised-cc-done-blames-the-branch-for-a-
+# missing-track-file, 2026-09-16/18); bare `cc done` inside the worktree died on bash's "line 991: 2: repo". Now a box
+# repo's worktree gets the marker written and said, the names come off the path when left off, and a file that does
+# not name the track is said with its shape. A kind=session row and a local bare origin end the run right after the
+# push, so the whole path after the marker runs and nothing reaches GitHub.
+git init -q -b main "$GH/dev/boxr"; echo a > "$GH/dev/boxr/a.txt"; git -C "$GH/dev/boxr" add -A; git -C "$GH/dev/boxr" -c user.email=t@t -c user.name=t commit -qm base
+git init -q --bare "$T/boxr.git"; git -C "$GH/dev/boxr" remote add origin "$T/boxr.git"   # a repo cc never stamped: no .cc/ exclude yet
+mkdir -p "$GH/.cc/worktrees/boxr"; git -C "$GH/dev/boxr" worktree add -q -b track/t9 "$GH/.cc/worktrees/boxr/t9"   # by hand: no .cc/track
+env HOME="$GH" "$B/cc-board" init boxr "$GH/dev/boxr" main >/dev/null; env HOME="$GH" "$B/cc-board" add boxr t9 "hand-made" >/dev/null
+env HOME="$GH" "$B/cc-board" set boxr t9 kind session; echo work > "$GH/.cc/worktrees/boxr/t9/w.txt"
+od=$(env HOME="$GH" PATH="$B:$PATH" timeout 120 "$B/cc" done boxr t9 2>&1); rd=$?
+{ [ "$rd" = 0 ] && grep -q "wrote $GH/.cc/worktrees/boxr/t9/.cc/track (boxr, t9)" <<<"$od" && [ "$(cat "$GH/.cc/worktrees/boxr/t9/.cc/track")" = "$(printf 'boxr\nt9')" ] \
+    && ! grep -q "not 'track/'" <<<"$od" && git -C "$T/boxr.git" rev-parse -q --verify track/t9 >/dev/null && ! git -C "$T/boxr.git" ls-tree -r --name-only track/t9 | grep -q '^\.cc/'; } \
+  && ok "cc done on a hand-made box worktree writes its .cc/track, says so, and the delivery goes on from there with .cc/ excluded — no line blaming the branch" \
+  || bad "cc done on a hand-made worktree: rc=$rd track='$(cat "$GH/.cc/worktrees/boxr/t9/.cc/track" 2>/dev/null | tr '\n' '|')' $od"
+od=$(cd "$GH/.cc/worktrees/boxr/t9" && env HOME="$GH" PATH="$B:$PATH" timeout 120 "$B/cc" done 2>&1); rd=$?
+{ [ "$rd" = 0 ] && grep -q 'cc: done boxr t9 — read off this worktree' <<<"$od"; } \
+  && ok "bare \`cc done\` inside a track's worktree takes both names off its path and says so" || bad "bare cc done inside a worktree: rc=$rd $od"
+od=$(cd "$T" && env HOME="$GH" PATH="$B:$PATH" timeout 60 "$B/cc" done 2>&1); rd=$?; od1=$(cd "$T" && env HOME="$GH" PATH="$B:$PATH" timeout 60 "$B/cc" done boxr 2>&1); rd1=$?
+{ [ "$rd" = 2 ] && [ "$rd1" = 2 ] && grep -q '^usage: cc done <repo> <track>' <<<"$od" && grep -q '^usage: cc done <repo> <track>' <<<"$od1" && ! grep -q '2: repo' <<<"$od$od1"; } \
+  && ok "…and anywhere else, or with one name, it is the usage line — not bash's '2: repo'" || bad "bare cc done elsewhere: rc=$rd/$rd1 $od / $od1"
+printf 'repo: boxr\ntrack: t9\n' > "$GH/.cc/worktrees/boxr/t9/.cc/track"
+od=$(env HOME="$GH" PATH="$B:$PATH" timeout 60 "$B/cc" done boxr t9 2>&1); rd=$?
+{ [ "$rd" = 1 ] && grep -q "two bare lines, 'boxr' then 't9'" <<<"$od" && [ "$(sed -n 1p "$GH/.cc/worktrees/boxr/t9/.cc/track")" = "repo: boxr" ]; } \
+  && ok "a .cc/track that does not name the track is said with its shape and left as written — nothing opened" || bad "malformed .cc/track: rc=$rd $od"
+git -C "$GH/dev/alice" worktree add -q -b track/t2b "$GH/.cc/worktrees/alice/t2b" 2>/dev/null   # a member's hand-made worktree: the host says, and writes nothing into their tree
+od=$(env HOME="$GH" PATH="$B:$PATH" timeout 60 "$B/cc" done alice t2b 2>&1); rd=$?
+{ [ "$rd" = 0 ] && grep -q 'has no .cc/track' <<<"$od" && [ ! -e "$GH/.cc/worktrees/alice/t2b/.cc/track" ] && grep -q 'no remote, so no PR' <<<"$od"; } \
+  && ok "…while a member's hand-made worktree is only told: the host writes no .cc/track into their tree, and the run goes on as before" \
+  || bad "cc done on a member's hand-made worktree: rc=$rd written=$([ -e "$GH/.cc/worktrees/alice/t2b/.cc/track" ] && echo yes || echo no) $od"
+git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t2b" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t2b >/dev/null 2>&1
 # A PROJECT'S FIRST PUSH MAKES ITS TRACK THE REPOSITORY'S DEFAULT BRANCH (GitHub: the first branch pushed into an empty
 # repository), so `cc done` asked that repository for HEAD, was told the track itself, and tried to open a PR from the
 # branch onto itself — "PR creation failed", the row left in review (measured live 2026-09-04 on a repository the box had
