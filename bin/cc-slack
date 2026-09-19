@@ -24,7 +24,7 @@
   cc-slack permission <id> yes|no [fix]     answer a 🔐 prompt from here, the same path as a `yes <id>` Slack reply; every session's prompt but the planning session's own goes to the control repo's #<repo>-threads lane for it to decide; `fix` marks the capability granted for good.
   cc-slack updates-sweep [--dry-run]  give every repo channel that predates the split its -updates lane (idempotent; skips a bot-only channel).
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]     give a sub-orchestrator its own channel, recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it).
-  cc-slack archive <#chan|C…> | archive --orch <target> <alias>      archive a sub-orch channel; it stops routing and leaves the Home tab.
+  cc-slack archive <#chan|C…> | archive --orch <target> <alias>      archive a sub-orch channel; it stops routing and leaves home.json's channel list.
   cc-slack selfcheck                  unit checks, no Slack needed (tests/selftest.sh runs it); the cases are core/tests/slack_selfcheck.py, run in this file's namespace; every state it touches is its own scratch dir, never the box's.
   cc-slack manifest --print | --config-token xoxe.xoxp-… --app A0…      paste-ready manifest, or push it onto an existing app; the owner still taps Reinstall and generates the app-level token.
 
@@ -42,17 +42,17 @@ A session's post naming @main, an orch alias or a live track (reply tool, `cc-sl
 A session handed another session's post 👍s it on the first tool call of the turn that post woke, so the channel shows it was read and taken on even when no reply follows; the box's 👀 still only means received, and the owner's own messages keep the reply-or-react rule.
 A reaction is a verdict from anyone in the channel (a member's :+1: in #approvals merges the PR, exactly as the owner's does); DM reactions stay the owner's.
 The owner's 📌 marks a thread "revisit", not a verdict — kept until the 📌 comes off, listed by `cc-slack revisit`.
-Only the owner steers: permission answers, `!` commands, @alias hand-offs and App Home.
+Only the owner steers: permission answers, `!` commands and @alias hand-offs.
 The `!` commands are `!pause`/`!resume` (each also as `-only` and `-under`), `!restart <box|repo[/track]|slack|tmux>` and `!reboot`, owner-only, any channel or thread; anything else typed is a message to the session.
 `!pause` parks this channel's project and everything declared under it, queuing what arrives; `!resume` unparks it; a project parked on its own stays parked when its parent resumes.
 `!pause-only`/`!resume-only` stop at this project and leave what is under it exactly as it was; `!pause-under`/`!resume-under` say the walk out loud and mean what the bare verbs already do. Either way the answer ends with a `Reach:` line naming how far it went, so nobody has to predict it from CC_PROJECT_CHILDREN.
-App Home republishes every 30s and on open, leading with what needs the owner, then running/idle counts, the backlog, the channels, a 24h vitals chart, then load, handoff count, audit and boot.
+~/.cc/state/home.json is the box's one live view and the dashboard reads it: rewritten every 30 s and within 2 s of any event, leading with what needs the owner, then running/idle counts, the backlog, the channels, load, handoff count, audit and boot. There is no Slack App Home tab: the daemon publishes a one-line pointer to the dashboard once at start and never again.
 While a handoff overlap is open on a target, only the session the record calls live is delivered to (permission answers included); the muted one's reply/react/file are refused.
 See ~/COMMS.md and ~/USAGE.md.
 
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
 """
-import calendar, collections, contextlib, fcntl, glob, hashlib, io, json, os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time, types, urllib.parse, urllib.request
+import calendar, collections, contextlib, fcntl, glob, io, json, os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time, types, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("CC_SLACK_DIR", f"{HOME}/.cc/slack")
@@ -178,7 +178,7 @@ def _load_cctime():
 
 try:
     cctime = _load_cctime()
-except Exception:                                  # a bin/ without it: the tab still draws, in this process's zone
+except Exception:                                  # a bin/ without it: home.json still writes, in this process's zone
     cctime = None
 
 # Which day a figure on this tab covers is cc-spend's answer, imported the same way: one place decides it, never a
@@ -1745,12 +1745,11 @@ def orch_purpose(brief, by, at=None, link=""):
     when = hhmm(at if at is not None else time.time(), day=True)
     return " · ".join(x for x in (head, f"spawned by {by} {when}" + (f" from {link}" if link else "")) if x)[:250]
 
-def home_chan_order(known, orchs, hide=()):
-    """[(chat, name, depth)] for the dashboard: a sub-orch channel is a child of the one it was spawned from.
-    Parents first by name, children under them by creation, depth = indent. Archived orch channels are gone
-    from Home entirely, and so is VITALS_STORE and any id in `hide`."""
-    rows = [(c, n) for c, n in known if not (orchs.get(c) or {}).get("archived")
-            and n != VITALS_STORE and c not in set(hide) and c]
+def home_chan_order(known, orchs):
+    """[(chat, name, depth)] for home.json's channel list: a sub-orch channel is a child of the one it was spawned
+    from. Parents first by name, children under them by creation, depth = indent. Archived orch channels are gone
+    from the list entirely, and so is VITALS_STORE."""
+    rows = [(c, n) for c, n in known if not (orchs.get(c) or {}).get("archived") and n != VITALS_STORE and c]
     ids, kids, tops = {c for c, _ in rows}, collections.defaultdict(list), []
     for c, n in rows:
         parent = (orchs.get(c) or {}).get("parent")
@@ -1767,7 +1766,7 @@ def home_chan_order(known, orchs, hide=()):
     return out
 
 def home_chan_keep(c):
-    """Does one conversations.list entry belong on the tab? The bot must be in it, it must not be VITALS_STORE, and
+    """Does one conversations.list entry belong in home.json's channel list? The bot must be in it, it must not be VITALS_STORE, and
     it must not be a channel whose only member is the bot — that's a store, not a channel for people. A missing
     member count keeps the channel: never hide on a guess."""
     return bool(c.get("is_member")) and c.get("name") != VITALS_STORE and _home_num(c.get("num_members", 2)) > 1
@@ -1879,52 +1878,14 @@ class Conn:
         with self.lock:
             self.sock.sendall((json.dumps(obj) + "\n").encode())
 
-# ---------------------------------------------------------------- App Home dashboard (one live view, never a message)
+# ---------------------------------------------------------------- home.json (one live view for the dashboard, never a message)
 HOME_UNITS = (("tmux-main", "tmux-main.service"), ("cc-slackd", "cc-slackd.service"),
               ("heartbeat", "cc-heartbeat.service"), ("audit", "cc-audit.timer"))
 HOME_CACHE = 5                                 # seconds a costly input (tmux/systemctl/pgrep/cc-limit) is cached for
-HOME_FAST = 5                                  # dashboard refresh while the owner's on Slack — 5 s not 1, since views.publish is ~50/min
-LOOKUP_RETRY_AFTER = 2.0                       # how long a failed name lookup (or the chart upload) waits before its one retry
 HOME_LEDGER = 1 << 18                          # bytes of cc-context's handoff ledger the dashboard reads (its tail)
 HOME_SLOW = 600                                # the only two inputs that cost a network call (channel list, PR states)
-HOME_MAXBLK, HOME_MAXTEXT = 32, 2900           # our budget for one view (Slack allows 100 blocks/3000 chars); lists don't
-                                               # grow it — each is one block regardless of length. Raised only when a band
-                                               # is added (selfcheck catches it); the glance is the fold's job (home_parts 5).
-# image block needs slack_file:{id} already shared; an unshared upload is refused.
-# Id valid for the file's life; bytes live in bot-only VITALS_STORE, reuploaded only on change.
-VITALS_DIR = os.environ.get("CC_VITALS_DIR") or f"{HOME}/.cc/state/vitals"
-VITALS_STORE = "cc-vitals-store"               # bot-only private channel: the box's own picture store, not a channel for people
-VITALS_EVERY = 300                             # how often the picture redraws/re-uploads: a 24 h chart barely moves in 5 min,
-                                               # and the uploads cost nothing against the 5 s publish cadence.
-VITALS_STALE = 900                             # older than this the tab flags the drawing as stale (3 missed redraws), rather
-                                               # than silently showing an old picture as current.
-VITALS_TIMEOUT = 60                            # a wedged renderer must never hold the dashboard thread
-
-def lookup_error(e):
-    """The socket.gaierror behind an exception — bare, or as the `reason` urllib wraps it in (URLError) — or None."""
-    if isinstance(e, socket.gaierror):
-        return e
-    r = getattr(e, "reason", None)
-    return r if isinstance(r, socket.gaierror) else None
-
-def retry_lookup(what, fn):
-    """fn(), retried once after LOOKUP_RETRY_AFTER s if the first try died on name resolution — a getaddrinfo that
-    clears itself shouldn't be logged as an outage. Fails once then succeeds: silent. Fails twice: logged once
-    with its errno, returns None so the caller retries next round. Any other error is raised as the caller's own."""
-    try:
-        return fn()
-    except Exception as e:
-        if lookup_error(e) is None:
-            raise
-    time.sleep(LOOKUP_RETRY_AFTER)
-    try:
-        return fn()
-    except Exception as e:
-        g = lookup_error(e)
-        if g is None:
-            raise
-        log(f"{what}: name resolution failed twice, {LOOKUP_RETRY_AFTER:g} s apart (errno {g.errno}: {g.strerror})")
-        return None
+HOME_WIDE = 2900                               # the wider list budget NEEDS YOU, RUNNING and CHANNELS get (HOME_LIST is the rest's)
+VITALS_STORE = "cc-vitals-store"               # bot-only private channel an older daemon made for the App Home chart; still hidden from every channel list
 
 # A track has exactly one state; this row supplies its emoji and word.
 # Emoji meaning is fixed: ❓ owner, 🔧 no-track work, 🔴 unit down, ⛔ blocked/limit, 🟢/🟡/⚪ session.
@@ -1952,47 +1913,26 @@ HOME_AGENT_SPAWN = 8 * 1024 * 1024             # bytes of a session transcript's
 HOME_AGENT_LINE = 64                           # how much of that name a row prints — longer than HOME_LINE since agents
                                                # falling back to the prompt would otherwise all print the same generic row.
 HOME_LANDQ = f"{HOME}/.cc/state/land"          # cc-land's queue: one job file per PR; cc-land owns these, this only reads
-HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and CHANNELS print every row; the only cap
+HOME_LIST = 2400                               # RUNNING, BACKLOG, NEEDS YOU and CHANNELS print every row; the only cap
                                                # Character budget for one Slack text (hard limit 3000); +k more is a safety valve, not a row count.
-                                               # Backlog's tighter budget puts its tail before the ❓ tail. HOME_SLICE: board button DMs rows first.
-HOME_LINE, HOME_SHORT, HOME_ASK, HOME_AUDIT, HOME_BTN = 40, 24, 26, 180, 18   # phone widths: a line · a track name · an ask · the audit · a button label
+                                               # Backlog's tighter budget puts its tail before the ❓ tail.
+HOME_LINE, HOME_SHORT, HOME_ASK, HOME_AUDIT = 40, 24, 26, 180   # phone widths: a line · a track name · an ask · the audit
 HOME_SPEND_N, HOME_SPEND_PH = 5, 3             # spend band: sessions then phantoms before "how many more" — a summary,
                                                # not a row-by-row list (`cc-spend` / `cc-spend phantoms` hold the detail).
 HOME_DEPTH = 4                                 # deepest sub-channel indent the phone column takes; deeper nests flatten to it
 HOME_GRAPHS_DIR = ".cc/state/graphs"           # where cc-graphs keeps serve.pid/serve.port while it serves (CC_GRAPHS_DIR moves it)
 HOME_GRAPHS_PORT = 5190                        # cc-graphs' own default; a server that is up reports its real port in serve.port
 HOME_GRAPHS_PUB = "sudo tailscale serve --bg --https=443 {url}"   # the owner's line, printed and never run — it opens a port
-HOME_CUT = ("boot", "handoffs", "audit", "spend", "chart", "graphs", "idle", "sessions", "channels", "revisit", "backlog", "views")   # cut
-                                               # Drop order when the budget doesn't fit: chart first (frees 2 blocks; numbers stay in `load`).
-                                               # `graphs` drops next, since once the picture is gone that pointer is what's left.
-HOME_ACT = ("restart_unit", "open_board", "next_track", "home_logs",
-            "board_todo", "board_running", "board_done")   # Home buttons that reach the daemon
-HOME_VIEWS = (("board_todo", "To do", ("queued",)), ("board_running", "Running", ("running", "waiting")),
-              ("board_done", "Done", ("done", "review", "merged")))   # the board view buttons, in the order they sit
-HOME_VIEW = {a: (lab, st) for a, lab, st in HOME_VIEWS}   # one slice of the board each, DM'd, never the whole board
-
 def _home_sec(text):
-    return {"type": "section", "text": {"type": "mrkdwn", "text": text[:HOME_MAXTEXT]}}
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
 
 def _home_ctx(text):
-    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text[:HOME_MAXTEXT] or "·"}]}
-
-def _home_btn(label, action, value="", url="", style=""):
-    b = {"type": "button"}
-    if style:
-        b["style"] = style
-    b["text"] = {"type": "plain_text", "text": label[:HOME_BTN], "emoji": True}
-    if url:
-        b["url"] = url
-    b["action_id"] = action
-    if value:
-        b["value"] = value
-    return b
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text or "·"}]}
 
 def home_snapshot():
     """{"repo/track": row} from one `cc-reconcile snapshot`, the box's sole decider, taken fresh per dashboard
     build. Every word a track row wears comes off it: state, whether anything is alive, who it waits on and
-    why. `snapshot` writes nothing, so a tab refresh can never move a track's state. {} when it can't answer:
+    why. `snapshot` writes nothing, so a home.json rewrite can never move a track's state. {} when it can't answer:
     rows then wear the board's own word and claim nothing alive."""
     try:
         r = EFFECTS.run([f"{BIN}/cc-reconcile", "snapshot"], capture_output=True, text=True, timeout=30)
@@ -2011,7 +1951,7 @@ def home_track_state(status, snap):
 
 def home_track_stale(status, state):
     """True when cc-reconcile's word differs from the board's: the board is a file a worker updates between
-    turns. A contradiction is shown as `board stale` beside the word rather than the tab silently picking
+    turns. A contradiction is shown as `board stale` beside the word rather than the view silently picking
     one. `idle` and `waiting` are never drift: they only refine what the board already says."""
     return state not in ("idle", "waiting") and state != HOME_ALIAS.get(status, status)
 
@@ -2065,7 +2005,7 @@ def home_unlink(text):
     return re.sub(r"<[^>|]*\|([^>]*)>", r"\1", str(text or ""))
 
 def _home_num(x):
-    """A number from dashboard state, whatever a caller put there — never blank the tab on one bad field."""
+    """A number from the state, whatever a caller put there — never blank the view on one bad field."""
     try:
         return float(x)
     except (TypeError, ValueError):
@@ -2192,42 +2132,6 @@ def board_read(path):
     and a plain open here would follow whatever it planted — a pipe once hung this tool for good. None = no board,
     or one planted: cc-board refuses it, and a caller treats that as unreadable too."""
     return ccboard().read(path)
-
-def home_board_rows():
-    """(repo, track, status, title, updated) for every track on every sidecar board, including finished ones the tab
-    itself drops (home_track_shown). What the board VIEW buttons read: one file pass shared by all three via
-    `cached`, never a subprocess per press."""
-    out = []
-    for fn, d in home_boards():
-        repo = d.get("repo") or os.path.basename(fn)[:-5]
-        for tr, t in (d.get("tracks") or {}).items():
-            if (t.get("kind") or "track") == "session":
-                continue                                  # a session is never to do, running or done: not a board VIEW row
-            out.append((repo, tr, str(t.get("status") or "?"), str(t.get("title") or ""), str(t.get("updated") or "")))
-    return out
-
-def home_word(status):
-    """A board status in the tab's vocabulary. `todo` is an old alias for `queued`; anything unrecognised also falls
-    back to `queued`, the same fallback the state ladder uses, so a slice and a row never file the same track
-    differently. Unlike home_track_state this checks nothing live: a board view reports exactly what the board says."""
-    st = HOME_ALIAS.get(str(status or ""), str(status or ""))
-    return st if st in HOME_STATE else "queued"
-
-def home_slice(rows, states, label, n=HOME_SLICE):
-    """Pure: one board view as the DM prints it — tracks whose state (home_word) is in `states`, newest first. An
-    empty slice is a sentence, not an empty code block that tells the owner nothing."""
-    hit = sorted((r for r in rows if home_word(r[2]) in states), key=lambda r: r[4], reverse=True)
-    if not hit:
-        return f"nothing is *{label.lower()}* on the board."
-    out = [f"*{label}* · {len(hit)}"]
-    for repo, tr, status, title, _ in hit[:n]:
-        out.append(f"{HOME_STATE.get(home_word(status), ('·', ''))[0]} {repo}/{home_short(tr)}"
-                   + (f" — {home_clip(title, 60)}" if title else ""))
-    if len(hit) > n:
-        # `cc board show` drops old finished tracks, so a FINISHED slice points at `--all` instead of a hint that prints nothing
-        tail = " --all" if {"done", "merged"} & set(states) else ""
-        out.append(f"_+{len(hit) - n} more — `cc board show <repo>{tail}`_")
-    return "\n".join(out)
 
 def home_handoffs(day=None):
     """How often sessions handed off today, and the last one, one grey line below the fold. Reads and counts
@@ -2358,35 +2262,9 @@ def home_needs(st, names=None):
             out.append((2, 0.0, f"❓ {home_tag(s.get('repo'))}*{home_short(s.get('name'))}* · {home_ask(s.get('ask'))}"))
     return [line for _, _, line in sorted(out, key=lambda r: (r[0], r[1], r[2]))]
 
-def home_buttons(st, needs):
-    """Home's only interactive elements: at most three, one primary/danger, labels short enough for two per row.
-    The primary is whatever's most wrong right now: a unit to restart, or the next track.
-    Every one is gated on the owner's user id in on_action(), since a button isn't a permission."""
-    down = [u[0] for u in (st.get("units") or ()) if u and not (len(u) > 1 and u[1])]
-    queued = [t for t in (st.get("tracks") or ()) if t.get("state") == "queued"]
-    pr = next((t.get("pr") for t in (st.get("tracks") or ()) if (t.get("pr") or {}).get("owed")), None)
-    b = []
-    if down:
-        b.append(_home_btn(f"Restart {down[0]}", "restart_unit", down[0], style="danger"))
-    elif queued:
-        b.append(_home_btn("Start next track", "next_track", queued[0].get("name", ""), style="primary"))
-    if pr:
-        b.append(_home_btn(f"Review PR #{pr['num']}", "review_pr", url=pr.get("url") or ""))
-    if down:
-        b.append(_home_btn("Logs", "home_logs", down[0]))
-    b.append(_home_btn("Board", "open_board"))
-    return b[:3]
-
-def home_allowed(user, owner):
-    """The button gate. The App Home tab publishes per user, so any member could tap a button from their own
-    Home. Only the paired owner may act: a restart is a service change and starting a track is spend, both
-    his to authorise. A button must never be a way around that gate: anyone else is refused privately, and
-    nothing runs."""
-    return bool(owner) and bool(user) and user == owner
-
 def home_parts(st):
-    """Pure: dashboard state -> [(cut tag, block)], the whole tab built in a fixed owner-facing order. Needs-you
-    leads, since only a Slack @-mention reaches his phone otherwise; absent when empty, never blank.
+    """Pure: state -> [(band, block)], the whole view built in a fixed owner-facing order: home_text keys home.json's
+    text by the band. Needs-you leads; absent when empty, never blank.
     RUNNING/tally counts all four kinds of work (running, sub-orchs, subagents, landings). Every list is
     whole, rows all print; "+k more" is home_list's own budget valve. One line per item, phone-first."""
     tracks, chans, quick = list(st.get("tracks") or ()), list(st.get("channels") or ()), list(st.get("quick") or ())
@@ -2413,13 +2291,7 @@ def home_parts(st):
     needs = home_needs(st, names)
     if needs:                                                # every ❓, widest budget on the tab: the band he opens it for
         p += [("needs", _home_ctx(f"NEEDS YOU · {len(needs)}")),
-              ("needs", _home_sec(home_list(needs, lambda k: f"_+{k} more waiting → #{box}_", HOME_MAXTEXT)))]
-
-    # 3 — buttons, under the band they act on: after the ❓ band if there is one, else just above the fold.
-    btns = home_buttons(st, needs)
-    act = ("actions", {"type": "actions", "elements": btns}) if btns else None
-    if act and needs:
-        p.append(act)
+              ("needs", _home_sec(home_list(needs, lambda k: f"_+{k} more waiting → #{box}_", HOME_WIDE)))]
 
     # 4 — the tally, then what is running. Zero counts are omitted, never printed as 0.
     moving = [l for l in lands if l.get("stage") != "deferred"]   # a deferred job is queued, not in flight
@@ -2446,10 +2318,10 @@ def home_parts(st):
                     "_nothing is running — what is waiting is above_" if waiting or asking else
                     (f"✅ last: {last['name']} · {last.get('verb', 'done')} {last.get('when', '')}".rstrip()
                      if last.get("name") else "_the board is clear_"))
-    p.append(("tally", _home_sec(home_list(rows, lambda k: f"_+{k} more running_", HOME_MAXTEXT))))
+    p.append(("tally", _home_sec(home_list(rows, lambda k: f"_+{k} more running_", HOME_WIDE))))
 
-    # 4a — the other three kinds of work, each its own band, absent when there's none. Not in HOME_CUT: this is
-    #      RUNNING, never cut. 🤖 sub-orch session · 🧠 subagent · 🚚 PR in cc-land's queue.
+    # 4a — the other three kinds of work, each its own band, absent when there's none. This is RUNNING.
+    #      🤖 sub-orch session · 🧠 subagent · 🚚 PR in cc-land's queue.
     if orchs:
         p += [("suborchs", _home_ctx(f"SUB-ORCHS · {len(orchs)}")),
               ("suborchs", _home_sec(home_list([f"🤖 *{home_short(orch_shown(o.get('repo'), o.get('alias')))}*" for o in orchs],
@@ -2495,9 +2367,7 @@ def home_parts(st):
             [home_fit(f"💤 *{names.get(t.get('name'), '?')}*", (t.get("detail") or "").split(" · ")) for t in idling],
             lambda k: f"_+{k} more idle_"))))
 
-    # 5 — the buttons when no ❓ band led the tab, then the fold
-    if act and not needs:
-        p.append(act)
+    # 5 — the fold: above it what needs him and what runs; below, the rest
     p.append(("fold", {"type": "divider"}))
 
     # 5b TO REVISIT: threads the owner 📌'd (Daemon.on_revisit); not an ask, never nags or owed.
@@ -2516,11 +2386,6 @@ def home_parts(st):
         if not limit:                                            # while limited, the count alone says it all
             lines = [home_fit(f"⏳ {home_repo(t.get('name'))}", (t.get("detail") or "").split(" · ")) for t in queued]
             p.append(("backlog", _home_sec(home_list(lines, lambda k: f"_+{k} more on the board_"))))   # every queued track
-
-    # 6b — board VIEW buttons: one slice each, DM'd. Below the fold, so the top row still holds ≤3 buttons with one
-    #      primary, and the last thing home_cut drops — the button survives even when the backlog lines don't.
-    if tracks:
-        p.append(("views", {"type": "actions", "elements": [_home_btn(lab, aid) for aid, lab, _ in HOME_VIEWS]}))
 
     # 6c sessions: long-lived channel sessions (board kind=session), grouped under repo like sub-orch.
     # Never in RUNNING or the tally (a live claude is normal). 🟢 = claude present, ⚪ = none.
@@ -2555,20 +2420,16 @@ def home_parts(st):
                 fams.append([busy, [row]])
         lines = [r for _, rows in sorted(fams, key=lambda f: not f[0]) for r in rows]   # stable: busy families first
         p += [("channels", _home_ctx("CHANNELS")),
-              ("channels", _home_sec(home_list(lines, lambda k: f"_+{k} more channels_", HOME_MAXTEXT)))]
+              ("channels", _home_sec(home_list(lines, lambda k: f"_+{k} more channels_", HOME_WIDE)))]
 
-    # 8 — the chart, and under it the same vitals as numbers, since the line stays true when there's no picture.
-    #     Both below the fold: neither answers "does this need me?".
-    p += home_chart_blocks(st.get("chart"))
-
-    # 8b — where the same numbers are interactive: the chart above is a still, cc-graphs serves the same series
-    #      over a narrowable time axis. The URL and command sit here, on the page he opens, not just in a thread.
+    # 8 — where the vitals are interactive: cc-graphs serves the same series over a narrowable time axis. The URL and
+    #     command sit here, on the page he opens, not just in a thread.
     gline = home_graphs_line(st.get("graphs"))
     if gline:
         p.append(("graphs", _home_ctx(gline)))
 
     # 9 — SPEND: one dollar figure for the box's day across every process, rows for where it went, 👻 for the part
-    #     nobody's watching. Below the fold, cuttable: answers "what did today cost", not "does this need me?".
+    #     nobody's watching. Below the fold: answers "what did today cost", not "does this need me?".
     sp = st.get("spend") or {}
     if sp:
         slines = [f"💵 *${_home_num(sp.get('today')):.2f}* today · ${_home_num(sp.get('week')):.2f} this week _(est)_"]
@@ -2583,7 +2444,7 @@ def home_parts(st):
             slines.append(f"_+{int(_home_num(sp.get('ph_more')))} more unwatched_")
         p.append(("spend", _home_sec(home_list(slines, lambda k: f"_+{k} more · `cc-spend`_"))))
 
-    # 10-13 — grey, one line each, and the first things to go when the tab will not fit
+    # 10-13 — grey, one line each
     p.append(("load", _home_ctx(st.get("load") or "")))
     hnd, hn = st.get("handoffs") or {}, int(_home_num((st.get("handoffs") or {}).get("today")))
     if hn:                                                   # how often sessions ran out of context today; zero is silent
@@ -2597,25 +2458,8 @@ def home_parts(st):
                                                        st.get("boot") or "") if x))))
     return p
 
-def home_cut(parts, maxblk=HOME_MAXBLK):
-    """Over budget, drop in order: boot line, audit, SPEND, chart, the graphs line, channels, backlog. Spend
-    goes before the chart since a day's total is a summary he can ask for, while the chart shows what's
-    happening now. RUNNING and NEEDS YOU are never cut, the two questions the tab exists to answer; that
-    covers all four kinds of running work."""
-    out = list(parts)
-    for tag in HOME_CUT:
-        if len(out) <= maxblk:
-            break
-        out = [p for p in out if p[0] != tag]
-    return out[:maxblk]
-
-def home_blocks(st):
-    """Pure: dashboard state -> Block Kit blocks, so selfcheck can assert the whole tab against fixtures. See
-    home_parts for the layout."""
-    return [b for _, b in home_cut(home_parts(st), HOME_MAXBLK)]
-
 def home_text(parts):
-    """Pure: the tab as plain text, by band — what a reader sees minus the buttons, so nothing re-renders it."""
+    """Pure: the bands as plain text, keyed by band — what home.json carries, so nothing re-renders them."""
     out = {}
     for tag, b in parts:
         if b.get("type") in ("header", "section"):
@@ -2629,19 +2473,19 @@ def home_text(parts):
     return {k: "\n".join(v) for k, v in out.items()}
 
 def home_dump(st):
-    """~/.cc/state/home.json = {at, text, state}: the tab as published, text by band, plus its inputs minus the
-    picture. cc-secretary reads this instead of re-implementing the tab. Written atomically so Home can't break
-    from it. A daemon with DIR redirected (selfcheck, the simulator) writes under that dir, never the live path."""
+    """~/.cc/state/home.json = {at, text, state}: the box's one live view — text by band (home_parts), plus the
+    state behind it. The dashboard reads it (dashboard/sources.py, `state` on the front page, `text` on the
+    everything page) instead of re-implementing the bands. Written atomically so a reader never sees half of it.
+    A daemon with DIR redirected (selfcheck, the simulator) writes under that dir, never the live path."""
     try:
-        d = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "text": home_text(home_cut(home_parts(st), HOME_MAXBLK)),
-             "state": {k: v for k, v in st.items() if k != "chart"}}
+        d = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "text": home_text(home_parts(st)), "state": st}
         path = f"{HOME}/.cc/state/home.json" if DIR == f"{HOME}/.cc/slack" else f"{DIR}/home.json"
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(f"{path}.tmp", "w") as f:
             json.dump(d, f, default=str)
         os.replace(f"{path}.tmp", path)
     except Exception as e:
-        log(f"app home: dump failed ({e!r})")
+        log(f"home.json: dump failed ({e!r})")
 
 _CACHE = {}
 
@@ -2782,27 +2626,6 @@ def home_load(now=None):
         h = float(up) / 3600
         out.append(f"⏱ up {h / 24:.1f}d" if h >= 48 else f"⏱ up {h:.1f}h")
     return "   ·   ".join(out)
-
-def home_chart_line(chart, now=None):
-    """Pure. The grey line under the chart: what it covers and how old the drawing is when stale — a chart with no age silently claims to be `now`."""
-    if not chart:
-        return ""
-    drawn = float(chart.get("drawn") or 0)
-    age = max(0, int((now or time.time()) - drawn))
-    when = "" if not drawn else "" if age < VITALS_STALE else f"⚠ drawn {home_age(age)} ago"
-    bits = [chart.get("covers") or "", when or ("⚠ age unknown" if not drawn else "")]
-    return " · ".join(x for x in bits if x)
-
-def home_chart_blocks(chart):
-    """Pure. The chart bands, or nothing — no recorder, a failed render, a refused upload are all fine, and it must cost the rest of the tab nothing (see publish_home)."""
-    if not chart or not chart.get("file"):
-        return []
-    out = [("chart", {"type": "image", "alt_text": chart.get("alt") or "the box's vitals, last 24h",
-                      "slack_file": {"id": chart["file"]}})]
-    line = home_chart_line(chart)
-    if line:
-        out.append(("chart", _home_ctx(line)))
-    return out
 
 def home_graphs_line(g):
     """Pure. The grey line under the graphs picture: the interactive url and the command to reach it. `cc-graphs
@@ -3181,7 +3004,7 @@ def home_audit():
     `-review.md` came out in shrink M3, and globbing for one of those would have gone on showing the verdict of
     the last review ever run as the box's current audit state, for good (review of #494).
     A VERDICT THAT IS NOT OK CARRIES THE FIRST FAILING CHECK, because `ATTENTION — 3 of 23 checks failed` names
-    nothing to act on, and this line is the whole of what the Home tab says about the audit."""
+    nothing to act on, and this line is the whole of what home.json says about the audit."""
     v, at, reps = "", "", sorted(glob.glob(f"{HOME}/.cc/state/audit/*-checks.md"))
     if reps:
         lines = open(reps[-1], errors="replace").read().splitlines()
@@ -3398,7 +3221,7 @@ class Daemon:
         self.queues = collections.defaultdict(collections.deque)   # target -> deque[(t, payload, alias)]
         self.execs = collections.OrderedDict()               # chat -> ThreadPoolExecutor(1): message/edit events stay in order per chat
         self.seen = collections.OrderedDict()
-        self.last_chat = load_last()                        # target -> (chat, root) it last heard from: permission_chat's lane, the Home tab's channel list
+        self.last_chat = load_last()                        # target -> (chat, root) it last heard from: permission_chat's lane, home.json's channel list
         self.thread_owner = {}                              # (chat, thread_ts) -> alias|None (None = main); routing cache
         self.known_aliases = collections.defaultdict(set)   # target -> {alias, ...} ever subscribed (daemon lifetime)
         self.mentioned = collections.OrderedDict()           # (chat, ts, target, alias) route_mentions already handed a post
@@ -3424,12 +3247,10 @@ class Daemon:
         self.bot_id = None                                  # our own B… id: bot-authored posts carry bot_id and no user
         self.default_chats = {}                             # target -> fallback chat for relays (resolved once per daemon life)
         self.load_queues()                                  # queued messages persisted by an earlier daemon life
-        self.home_dirty, self.home_at = True, 0.0           # App Home: event-driven refresh (home_loop)
-        self.home_burst_until = 0.0                          # after app_home_opened: fast refreshes for 60 s, then 30 s
+        self.home_dirty, self.home_at = True, 0.0           # home.json: event-driven rewrite (home_loop)
         self.pair_code = None
-        self.home_chans, self.home_prs, self.home_slow_at, self.home_slow_busy, self.home_off, self.home_fails = [], {}, 0.0, False, False, 0   # App Home dashboard
+        self.home_chans, self.home_prs, self.home_slow_at, self.home_slow_busy = [], {}, 0.0, False   # home.json's slow inputs
         self.home_land_titles = {}                          # {(repo, pr): title} — a landed PR's title, off git log on home_slow_refresh's cadence
-        self.chart, self.chart_sig, self.chart_at, self.chart_busy, self.chart_store = {}, "", 0.0, False, ""   # the vitals picture on the tab
         self.t0 = time.time()
         self.connected = False
 
@@ -4476,12 +4297,9 @@ class Daemon:
             return
 
     def on_event(self, ev):
-        self.home_dirty = True                             # anything the daemon saw is worth a dashboard refresh
+        self.home_dirty = True                             # anything the daemon saw is worth a home.json rewrite
         if ev.get("type") == "team_join":
             return self.on_team_join(ev)
-        if ev.get("type") == "app_home_opened":
-            self.home_burst_until = time.time() + 60   # owner is looking: fast cadence for a minute, then back to 30s
-            return self.publish_home()          # tapped the bot: refresh the dashboard now, never post
         if ev.get("type") in ("reaction_added", "reaction_removed"):
             return self.on_reaction(ev)
         if ev.get("type") == "message" and ev.get("subtype") in ("message_deleted", "message_changed"):
@@ -5395,7 +5213,7 @@ class Daemon:
 
     def on_revisit(self, chat, ts, removed, at):
         """Owner's 📌 marks the thread "revisit": one entry in REVISIT, and it reaches no session.
-        Printed by Home tab, pulse tick, digest, `cc-slack revisit`. Keyed by root; first pin sets the time.
+        Printed in home.json, pulse tick, digest, `cc-slack revisit`. Keyed by root; first pin sets the time.
         Removing any pin clears it. Stores channel, permalink, first line, time; Slack calls paid once."""
         root_ts, root = self.thread_root(chat, ts)
         key = f"{chat}:{root_ts}"
@@ -5733,10 +5551,9 @@ class Daemon:
             self.publish_soon(self.cfg.get("PUBLISH_REPO") or "")
 
     def home_due(self, now):
-        """When to republish: every HOME_FAST s for a minute after the owner opens the tab, within ~2 s of any event
-        otherwise, and at least every 30 s — one views.publish, no reads or messages."""
+        """When to rewrite home.json: within ~2 s of any event, and at least every 30 s — one file, no reads or messages."""
         since = now - self.home_at
-        return (now < self.home_burst_until and since >= HOME_FAST) or (self.home_dirty and since >= 2) or since >= 30
+        return (self.home_dirty and since >= 2) or since >= 30
 
     def home_loop(self):
         while True:
@@ -5744,7 +5561,7 @@ class Daemon:
             try:
                 now = time.time()
                 if self.home_due(now):
-                    self.home_dirty = False; self.home_at = now; self.publish_home()
+                    self.home_dirty = False; self.home_at = now; self.write_home()
             except Exception as e:
                 log(f"home_loop: {e!r}")
 
@@ -6107,8 +5924,7 @@ class Daemon:
                 self.dispatch(req.payload.get("event", {}), pool)
             elif req.type in ("slash_commands", "interactive"):
                 client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
-                if req.type == "interactive":
-                    pool.submit(self._safe, self.on_action, req.payload)   # ACK first, always: Slack gives us 3 s
+                # `interactive` is acked and dropped: nothing this daemon publishes carries a button any more
 
         client = SocketModeClient(app_token=self.cfg["SLACK_APP_TOKEN"], web_client=WebClient(token=tok))
         client.socket_mode_request_listeners.append(on_req)
@@ -6205,7 +6021,7 @@ class Daemon:
                     self.execs.popitem(last=False)[1].shutdown(wait=False)
         return ex.submit(self._safe, self.on_event, ev)
 
-    # -- App Home dashboard -------------------------------------------------------
+    # -- home.json, the dashboard's source -----------------------------------------
     def home_wins(self):
         """{window name: pane command} for tmux session main, memoised for HOME_CACHE s — the daemon's one reader of
         the roll-call (dashboard channel rows)."""
@@ -6223,19 +6039,16 @@ class Daemon:
         return url
 
     def home_state(self):
-        """What the dashboard shows: everything free (memory, tmux, filesystem) except channels/PR status.
+        """What home.json carries: everything free (memory, tmux, filesystem) except channels/PR status.
         Those refresh via a background thread every HOME_SLOW s, so a slow `gh` can't stall the loop. No Slack read here."""
         if time.time() - self.home_slow_at > HOME_SLOW and not self.home_slow_busy:
             self.home_slow_busy = True
             threading.Thread(target=self._safe, args=(self.home_slow_refresh,), daemon=True).start()
-        if time.time() - self.chart_at > VITALS_EVERY and not self.chart_busy:
-            self.chart_busy = True                           # the picture redraws itself, off this thread (chart_refresh)
-            threading.Thread(target=self._safe, args=(self.chart_refresh,), daemon=True).start()
         wins, chans, orchs = self.home_wins(), [], cached("orchs", HOME_CACHE, load_orchs)
         now = time.time()
         known = self.home_chans or sorted((c, self.names.get(c, c)) for c in     # before the first refresh: what we already know
                                           {c for c, _ in list(self.last_chat.values())})
-        for chat, name, depth in home_chan_order(known, orchs, hide=(self.chart_store,)):   # never the picture store
+        for chat, name, depth in home_chan_order(known, orchs):
             self.names.setdefault(chat, name)              # route() resolves the name: we already have it, don't pay conversations.info
             target = self.route(chat, "im" if str(chat).startswith("D") else None)
             alias = (orchs.get(chat) or {}).get("alias")   # a sub-orch channel reports its own orch, not the repo's main session
@@ -6268,84 +6081,7 @@ class Daemon:
                 "handoffs": cached("handoffs", HOME_CACHE, home_handoffs),
                 "spend": cached("spend", HOME_CACHE, home_spend),
                 "revisit": revisit_rows(self.revisit, now),   # the owner's 📌 list (on_revisit): daemon memory, no read
-                "audit_at": audit_at, "audit": verdict, "boot": boot, "chart": self.chart}
-
-    def chart_store_id(self):
-        """The bot-only private channel the pictures live in, made once and remembered — it exists so an upload can
-        be shared (Slack refuses an unshared file in an image block) without any human seeing it."""
-        if self.chart_store:
-            return self.chart_store
-        tok = self.cfg["SLACK_BOT_TOKEN"]
-        try:
-            self.chart_store = api("conversations.create", tok, name=VITALS_STORE, is_private="true")["channel"]["id"]
-        except Exception as e:
-            if "name_taken" not in str(e):
-                raise
-            self.chart_store = next((c["id"] for c in api("conversations.list", tok, types="private_channel",
-                                                          exclude_archived="true", limit="1000").get("channels") or ()
-                                     if c.get("name") == VITALS_STORE), "")
-            if not self.chart_store:
-                raise RuntimeError(f"#{VITALS_STORE} exists but this app is not in it — invite the app, or archive it")
-        return self.chart_store
-
-    def chart_upload(self, png, title):
-        """Upload one drawing and return its file id only once Slack will accept it in a view. The wait matters: for
-        a few seconds after completeUploadExternal the file isn't shared yet and views.publish would refuse it.
-        Returns "" if it never verifies."""
-        tok = self.cfg["SLACK_BOT_TOKEN"]
-        up = api("files.getUploadURLExternal", tok, filename="vitals.png", length=str(len(png)))
-        with urllib.request.urlopen(urllib.request.Request(up["upload_url"], data=png, method="POST"), timeout=60) as r:
-            r.read()
-        fid = api("files.completeUploadExternal", tok, channel_id=self.chart_store_id(),
-                  files=json.dumps([{"id": up["file_id"], "title": title}]))["files"][0]["id"]
-        for _ in range(10):                                  # ~3 s in practice; a share that never lands is not our file
-            time.sleep(2)
-            try:
-                if (api("files.info", tok, file=fid).get("file") or {}).get("shares"):
-                    return fid
-            except Exception:
-                pass
-        log(f"app home: chart {fid} never became shareable — leaving the tab's picture as it was")
-        return ""
-
-    def chart_refresh(self):
-        """Redraw the picture and upload only if the bytes changed. Runs on its own thread every VITALS_EVERY s —
-        never in the publish path (matplotlib is too slow for a 5 s dashboard loop) — and never trusts the recorder
-        to have drawn it, since that long-lived process may be running older code."""
-        if not os.path.exists(f"{BIN}/cc-vitals"):
-            self.chart_at, self.chart_busy = time.time(), False
-            return                                           # a box with no recorder simply has no picture, and says nothing
-        try:
-            EFFECTS.run([f"{BIN}/cc-vitals", "render", "--backend", "auto", "--if-stale", str(VITALS_EVERY)],
-                        capture_output=True, timeout=VITALS_TIMEOUT)
-            png = open(f"{VITALS_DIR}/current.png", "rb").read()
-            spec = json.load(open(f"{VITALS_DIR}/current.json"))
-            drawn = os.path.getmtime(f"{VITALS_DIR}/current.png")
-            covers = (f"vitals · last {spec.get('window_h', 24):g}h · {spec.get('minutes', 0)} of "
-                      f"{spec.get('n', 0)} minutes recorded"
-                      + (f" · {spec['gaps']} missing" if spec.get("gaps") else ""))
-            sig = hashlib.sha256(png).hexdigest()
-            if sig == self.chart_sig and self.chart.get("file"):
-                self.chart = dict(self.chart, drawn=drawn, covers=covers)   # same picture: keep the id, upload nothing
-                return
-            if not (self.use_slack and self.cfg.get("SLACK_BOT_TOKEN")):
-                return
-            fid = retry_lookup("app home: chart upload", lambda: self.chart_upload(png, f"box vitals {hhmm(drawn)}"))
-            if not fid:
-                return                                   # never verified, or a lookup that failed twice (logged): the tab keeps its picture
-            was = self.chart.get("file")
-            self.chart, self.chart_sig = {"file": fid, "drawn": drawn, "covers": covers,
-                                          "alt": f"one chart of the box's vitals — {covers}"}, sig
-            self.home_dirty = True                           # the picture changed: show it on the next tick, not in 30 s
-            if was:                                          # exactly one drawing in the workspace, never a pile
-                try:
-                    api("files.delete", self.cfg["SLACK_BOT_TOKEN"], file=was)
-                except Exception as e:
-                    log(f"app home: could not delete the previous chart {was} ({e})")
-        except Exception as e:
-            log(f"app home: chart refresh failed ({e!r}) — the tab keeps the picture it has")
-        finally:
-            self.chart_at, self.chart_busy = time.time(), False
+                "audit_at": audit_at, "audit": verdict, "boot": boot}
 
     def home_slow_refresh(self):
         """Background thread: the two dashboard inputs that cost a network call. A failure just leaves the last values in place."""
@@ -6394,123 +6130,37 @@ class Daemon:
             log(f"home: #{APPROVALS} cards: {e!r}")
             return self.home_cards
 
-    def dm_user(self, user, text):
-        """One line, privately, to whoever pressed a Home button — the App Home tab has no ephemeral surface of its own."""
-        tok = self.cfg.get("SLACK_BOT_TOKEN")
-        if not (tok and user and self.use_slack):
-            return
-        try:
-            self.say(api("conversations.open", tok, users=user)["channel"]["id"], text)
-        except Exception as e:
-            log(f"dm_user({user}): {e!r}")
-
-    def on_action(self, payload):
-        """A Home button came back (`review_pr` is a plain url button Slack opens itself and never reaches here).
-        The gate (home_allowed) runs before anything is read or run, for every action_id: a refusal costs a
-        stranger nothing but one line back."""
-        if payload.get("type") != "block_actions":
-            return
-        user, owner = (payload.get("user") or {}).get("id"), self.cfg.get("SLACK_OWNER_ID")
-        for a in payload.get("actions") or ():
-            aid, val = a.get("action_id"), (a.get("value") or "")
-            if aid not in HOME_ACT:
-                continue
-            if not home_allowed(user, owner):
-                log(f"home: {aid} refused for {user} (owner {owner})")
-                self.dm_user(user, "That button belongs to the box's owner — service changes and spend are theirs to "
-                                   "authorise, so nothing was run. Ask them in the channel and they can tap it.")
-                continue
-            log(f"home: {aid} {val!r} by {user}")   # a press that runs leaves a trace too: a silent button is undebuggable
-            self.home_act(aid, val, user)
-        self.home_dirty = True
-
-    def home_act(self, aid, val, user):
-        """What a Home button does, once the gate passes. Only `restart_unit` changes anything; the rest read, and
-        the three board views share one cached read, never a subprocess per press. `next_track` doesn't dispatch a
-        worker — that costs spend the owner budgets, so the button hands back the command instead."""
-        if aid == "restart_unit":
-            unit = dict(HOME_UNITS).get(val)
-            if not unit:
-                return
-            self.dm_user(user, f"restarting `{unit}` …")     # said before restarting: it may end this very process
-            try:
-                subprocess.Popen(["systemctl", "--user", "restart", unit],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception as e:
-                self.dm_user(user, f"could not restart `{unit}`: {e}")
-        elif aid == "open_board":
-            self.dm_user(user, "```\n" + self.run_out([f"{BIN}/cc-board", "list"])[:2500] + "\n```")
-        elif aid in HOME_VIEW:
-            label, states = HOME_VIEW[aid]
-            self.dm_user(user, home_slice(cached("board_rows", HOME_CACHE, home_board_rows), states, label)[:2500])
-        elif aid == "home_logs":
-            unit = dict(HOME_UNITS).get(val) or "cc-slackd.service"
-            self.dm_user(user, f"`{unit}`\n```\n" + self.run_out(
-                ["journalctl", "--user", "-u", unit, "-n", "25", "--no-pager"])[-2500:] + "\n```")
-        elif aid == "next_track":
-            repo, _, tr = str(val).partition("/")
-            self.dm_user(user, f"next on the board: *{val}*\nstart it with `cc {repo} {tr} --go` (a worker is spend, so "
-                               f"the box does not start one from a button — the budget and turn count are yours)."
-                         if tr else "nothing is queued on the board.")
-
-    @staticmethod
-    def run_out(cmd, timeout=15):
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return (r.stdout or r.stderr or "").strip() or "(no output)"
-        except Exception as e:
-            return f"({e})"
-
-    def publish_home(self):
-        """The whole dashboard in one views.publish, replacing the tab in place — it never receives a message.
-        Three failures in a row (missing scope, home tab never enabled) turn it off until the daemon restarts."""
-        if self.home_off and time.time() < getattr(self, "home_retry_at", 0):
-            return                                           # backing off (manifest not pasted yet); retried every 10 min, no restart needed
-        if self.home_off:
-            self.home_off, self.home_fails = False, 0
-        if not (self.use_slack and self.cfg.get("SLACK_OWNER_ID") and self.cfg.get("SLACK_BOT_TOKEN")):
-            return
+    def write_home(self):
+        """home.json, rewritten whole (home_dump) — the dashboard's source. Needs no Slack: a daemon with no token
+        still writes it. A failure building the state is a bug, logged, and the last file stays."""
         try:
             st = self.home_state()
-            view = json.dumps({"type": "home", "blocks": home_blocks(st)})   # a local failure here is a bug, not a Slack refusal
         except Exception as e:
-            log(f"app home: state/blocks failed ({e!r})"); return
-        home_dump(st)                                        # the same tab as text, for readers that must not re-render it
+            log(f"home.json: state failed ({e!r})"); return
+        home_dump(st)
+
+    def retire_home_tab(self):
+        """Once, at start: the App Home tab this daemon used to publish stays in Slack showing whatever it last said
+        (the manifest still enables it), so replace it with one line that points at the dashboard — CC_DIGEST_LINK
+        when it is an https URL, else `cc digest` — and never publish again. A refusal (scope, tab disabled) is one
+        log line; nothing retries."""
+        if not (self.use_slack and self.cfg.get("SLACK_OWNER_ID") and self.cfg.get("SLACK_BOT_TOKEN")):
+            return
+        link = str(self.cfg.get("CC_DIGEST_LINK") or "")
+        where = f"<{link}|the dashboard>" if link.startswith("https://") else "the dashboard (`cc digest` in the terminal)"
+        view = json.dumps({"type": "home", "blocks": [_home_sec(f"This tab is retired. The box's live view is {where}.")]})
         try:
             api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"], view=view)
         except Exception as e:
-            # A deleted/unshared file must not fail the whole view: drop the image and publish anyway.
-            # The dropped file is forgotten, so chart_refresh uploads fresh next time instead of retrying it.
-            if st.get("chart") and self.retry_without_chart(st):
-                return
-            if "ratelimited" in str(e):
-                self.home_burst_until = 0.0              # Slack said slow down: drop the fast cadence
-            self.home_fails += 1
-            if self.home_fails >= 3:
-                self.home_off = True; self.home_retry_at = time.time() + 600
-                log(f"app home: off until restart ({e}) — re-paste core/slack/app-manifest.json (home_tab_enabled + "
-                    "app_home_opened + interactivity, which the Home buttons need), then Reinstall")
-        else:
-            self.home_fails = 0
-
-    def retry_without_chart(self, st):
-        """One re-publish with the chart removed. True means it got through without the chart, so this failure does not count against the three-strike home_off backoff."""
-        try:
-            blocks = home_blocks(dict(st, chart=None))
-            api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"],
-                view=json.dumps({"type": "home", "blocks": blocks}))
-        except Exception:
-            return False                                     # not the chart's fault: fall through to the real handler
-        log(f"app home: Slack refused the chart ({self.chart.get('file')}) — published without it, redrawing next tick")
-        self.chart, self.chart_sig, self.chart_at, self.home_fails = {}, "", 0.0, 0
-        return True
+            log(f"home tab: could not retire it ({e})")
 
     def run(self):
         self.single_instance()
         threading.Thread(target=self.serve_unix, daemon=True).start()
         threading.Thread(target=self.member_socks_loop, daemon=True).start()   # one socket per member workspace
         threading.Thread(target=self.tick_loop, daemon=True).start()
-        threading.Thread(target=self.home_loop, daemon=True).start()   # dashboard: instant on events + 5s heartbeat
+        self.retire_home_tab()
+        threading.Thread(target=self.home_loop, daemon=True).start()   # home.json: within 2 s of an event, else every 30 s
         log(f"router on {SOCK}")
         if self.use_slack:
             self.start_slack()

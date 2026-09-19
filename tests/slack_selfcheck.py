@@ -2858,8 +2858,6 @@ def run_selfcheck():
           rv_tags.count("revisit") == 2 and rv_tags[rv_tags.index("fold") + 1] == "revisit"
           and "TO REVISIT · 2" in rv_txt and "📌 <https://x.slack.com/archives/CR/p95001|a bot root> · #beta · 3d" in rv_txt
           and "revisit" not in [t for t, _ in home_parts({"box": "b", "now": "12:00"})])
-    check("home: the revisit band is cut before the backlog and after the channels — the owner's own list outlives the "
-          "channel roll, and a queued track outlives it", HOME_CUT.index("channels") < HOME_CUT.index("revisit") < HOME_CUT.index("backlog"))
     rv_out, rv_json, rv_none = io.StringIO(), io.StringIO(), io.StringIO()
     save_revisit(dict(rv_one))                       # the CLI's own fixture: the file as on_revisit leaves it, written here
     with contextlib.redirect_stdout(rv_out):
@@ -3086,16 +3084,12 @@ def run_selfcheck():
         return all(ok or (limited and lab.startswith("BACKLOG")) for lab, ok in hlabels(bs)) \
             and all(t.strip() for t in htexts(bs))
 
-    def hbudget(bs):
-        btns = [e for b in bs if b["type"] == "actions" for e in b["elements"]]
-        return (len(bs) <= HOME_MAXBLK
-                and all(b["type"] in ("header", "context", "section", "divider", "actions", "image") for b in bs)
-                and all(b.get("alt_text") and (b.get("slack_file") or b.get("image_url"))    # an image block Slack will take
-                        for b in bs if b["type"] == "image")
-                and not any(b.get("fields") for b in bs) and all(len(t) <= 3000 for t in htexts(bs))
-                and all(len(b["elements"]) <= 3 for b in bs if b["type"] == "actions")
-                and all(len(e["text"]["text"]) <= HOME_BTN for e in btns)
-                and sum(1 for e in btns if e.get("style")) <= 1)
+    def hblocks(st):                    # the bands' blocks, untagged — what home_text reads; nothing publishes them
+        return [b for _, b in home_parts(st)]
+
+    def hbudget(bs):                    # text blocks only: no button, image or field ever comes back (the tab is gone)
+        return (all(b["type"] in ("header", "context", "section", "divider") for b in bs)
+                and not any(b.get("fields") for b in bs) and all(t.strip() for t in htexts(bs)))
 
     def hvocab(bs):                     # ONE vocabulary: a line's emoji and any state word on it must be the same row
         import re as _re
@@ -3116,30 +3110,25 @@ def run_selfcheck():
     #    asserted would stop being a spec. Superseded lines of docs/2026-08-30-home-handoff.dc.html, on whose word:
     #      · thread 1788129807 ("all the backlog items and all ? items … not defaulting to showing only a few")
     #        — §01 lines 217/267/358, §03 line 489 ("per queued q, ≤3") and §05 line 578: the backlog prints all ten
-    #        queued tracks, not three and a "_+7 more on the board_", and the three board VIEW buttons sit under it.
+    #        queued tracks, not three and a "_+7 more on the board_".
     #      · thread 1788133685 ("also show all channels") — §01 lines 224 and 368, §03 lines 496-497 ("Max 6 lines",
     #        "_{k} quiet channels hidden_") and §05 line 580: CHANNELS prints EVERY channel, busy families first,
     #        and the band renders whenever the box knows of one. §01 line 376's cut order still holds, but its
-    #        "quiet channels" step is now the whole band (HOME_CUT "channels") — no quiet remainder is left to drop.
+    #        "quiet channels" step is now the whole band — no quiet remainder is left to drop.
+    #      · the Slack App Home tab itself went (app-home-tab-goes, 2026-09-19: the dashboard reads home.json): the
+    #        two `actions` blocks (three buttons under NEEDS YOU, three board views under BACKLOG) are gone from the
+    #        reference; every band of text stands as it was, since home.json's `text` is what the dashboard shows.
     #    The rest is the engineer's reference output for state (a). `  ↳` is the real payload's indent — Slack
     #    collapses ordinary leading spaces, which is the sub-channel bug this direction also fixes.
     HREF = json.loads(r'''{"type": "home", "blocks": [
       {"type": "header", "text": {"type": "plain_text", "text": "abox · 07:58", "emoji": true}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "NEEDS YOU · 1"}]},
       {"type": "section", "text": {"type": "mrkdwn", "text": "⛔ [sandbox] *subproj-carpet* · no GH token"}},
-      {"type": "actions", "elements": [
-        {"type": "button", "style": "primary", "text": {"type": "plain_text", "text": "Start next track", "emoji": true}, "action_id": "next_track", "value": "sandbox/rug-align"},
-        {"type": "button", "text": {"type": "plain_text", "text": "Review PR #3", "emoji": true}, "url": "https://github.com/sandbox/carpet/pull/3", "action_id": "review_pr"},
-        {"type": "button", "text": {"type": "plain_text", "text": "Board", "emoji": true}, "action_id": "open_board"}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "RUNNING 2 · BLOCKED 1 · QUEUED 10"}]},
       {"type": "section", "text": {"type": "mrkdwn", "text": "🏃 *carpet-rectify* · 1 it · $9.05 · <https://github.com/sandbox/carpet/pull/3|PR #3>\n🏃 *slack-home* · 4 it · $2.40"}},
       {"type": "divider"},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "BACKLOG · 10 · NEXT UP"}]},
       {"type": "section", "text": {"type": "mrkdwn", "text": "⏳ sandbox/rug-align\n⏳ abox/audit-retry\n⏳ abox/notes-index\n⏳ abox/queued0\n⏳ abox/queued1\n⏳ abox/queued2\n⏳ abox/queued3\n⏳ abox/queued4\n⏳ abox/queued5\n⏳ abox/queued6"}},
-      {"type": "actions", "elements": [
-        {"type": "button", "text": {"type": "plain_text", "text": "To do", "emoji": true}, "action_id": "board_todo"},
-        {"type": "button", "text": {"type": "plain_text", "text": "Running", "emoji": true}, "action_id": "board_running"},
-        {"type": "button", "text": {"type": "plain_text", "text": "Done", "emoji": true}, "action_id": "board_done"}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "CHANNELS"}]},
       {"type": "section", "text": {"type": "mrkdwn", "text": "🟢 *#abox*\n  ↳ 🟡 #abox-carpet\n⚪ *#quiet0*\n⚪ *#quiet1*\n⚪ *#quiet2*\n⚪ *#quiet3*\n⚪ *#quiet4*"}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "💽 16% of 456G · 🧠 4.3/31G (15%) · 📈 2.60 · 🌡 57°C · ⏱ up 6.2h"}]},
@@ -3161,15 +3150,15 @@ def run_selfcheck():
                       + [{"state": "queued", "name": n, "detail": "—", "rank": 5} for n in hqueued],
             "quick": [], "audit_at": "06:00", "audit": "no drift; 2 stale branches on sandbox.",
             "boot": "last boot 01:41 (power cut)", "last": None}
-    hb = home_blocks(hfix)
+    hb = hblocks(hfix)
     htxt = json.dumps(hb, ensure_ascii=False)
-    check("home_blocks (a) BUSY is byte-for-byte the reference output (§05 + the owner's two amendments): 15 blocks — "
-          "the ranked needs-you band and its three buttons FIRST, then the tally and the running lines, the fold, the "
-          "WHOLE backlog (all ten, no \"+k more\"), the three board-view buttons, ALL SEVEN channels and three grey lines",
-          hb == HREF["blocks"] and len(hb) == 15 and home_blocks(hfix) == hb
-          and hb[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in htxt
-          and len(hb[11]["text"]["text"].split("\n")) == 7 and "quiet channel" not in htxt
-          and "more channels" not in htxt)
+    check("home_parts (a) BUSY is byte-for-byte the reference output (§05 + the owner's amendments): 13 blocks — "
+          "the ranked needs-you band FIRST, then the tally and the running lines, the fold, the WHOLE backlog (all "
+          "ten, no \"+k more\"), ALL SEVEN channels and three grey lines; no button anywhere",
+          hb == HREF["blocks"] and len(hb) == 13 and hblocks(hfix) == hb
+          and hb[7]["text"]["text"].count("⏳") == 10 and "more on the board" not in htxt
+          and len(hb[9]["text"]["text"].split("\n")) == 7 and "quiet channel" not in htxt
+          and "more channels" not in htxt and "button" not in htxt)
     # ── WHAT NEEDS YOU LEADS (comms audit, 2026-09-07). The owner declined ntfy, so nothing the box does reaches his
     #    phone but a Slack @-mention: this tab is how he finds what waits on him, and it sat under RUNNING.
     hbusy = dict(hfix, suborchs=[{"repo": "abox", "alias": "carpet"}], subagents=[{"target": "abox", "task": "fix"}],
@@ -3178,18 +3167,16 @@ def run_selfcheck():
     hord = [t for t, _ in home_parts(hbusy)]
     hrun = hord.index("tally", hord.index("tally") + 1)      # the tally's SECOND part is the running section
     hnone = [t for t, _ in home_parts(dict(hbusy, waits=[], tracks=[]))]
-    check("home_parts: the NEEDS YOU band and its buttons come FIRST — above the counts, above the running rows and "
-          "above every other band about the box's own work (sub-orchs, subagents, landings, idle), on a tab where all "
-          "of them are present at once; the fold is still below the lot. WITH NOTHING WAITING the band is absent "
-          "rather than empty, the buttons fall back to where they always sat (just above the fold), and the tab opens "
-          "on the counts exactly as it did before",
-          hord[:4] == ["head", "needs", "needs", "actions"]
+    check("home_parts: the NEEDS YOU band comes FIRST — above the counts, above the running rows and above every "
+          "other band about the box's own work (sub-orchs, subagents, landings, idle), when all of them are present "
+          "at once; the fold is still below the lot. WITH NOTHING WAITING the band is absent rather than empty and "
+          "the view opens on the counts",
+          hord[:4] == ["head", "needs", "needs", "tally"]
           and all(hord.index("needs") < hord.index(t) for t in ("tally", "suborchs", "subagents", "landings", "idle"))
           and hrun < hord.index("fold")
-          and "needs" not in hnone and hnone[:2] == ["head", "tally"]
-          and hnone.index("actions") == hnone.index("fold") - 1)
-    ht = home_text(home_cut(home_parts(hfix), HOME_MAXBLK))
-    check("home_text: the same tab as text by band — the whole backlog and the needs-you band read back, no buttons",
+          and "needs" not in hnone and hnone[:2] == ["head", "tally"])
+    ht = home_text(home_parts(hfix))
+    check("home_text: the same view as text by band — the whole backlog and the needs-you band read back, no buttons",
           ht["backlog"].count("⏳") == 10 and "NEEDS YOU" in ht["needs"] and ht["head"].startswith("abox")
           and "actions" not in ht and "views" not in ht and "button" not in json.dumps(ht, ensure_ascii=False))
     # ── IDLE IS NOT RUNNING (owner, 2026-09-01: "why is 🏃 subproj-carpet-rectify · 1 it still in running"). The row
@@ -3198,12 +3185,10 @@ def run_selfcheck():
                                           {"state": "running", "name": "abox/slack-home", "detail": "4 it", "rank": 0}]))
     hitxt = home_text(hidle)
     check("home: an idle row renders in its OWN band, with how long it has sat and no iteration count — 🏃 is a claim "
-          "that work is in flight, the tally counts it apart from RUNNING, and the band is cuttable because it is a "
-          "nudge and not an alarm",
+          "that work is in flight, and the tally counts it apart from RUNNING",
           hitxt.get("idle") == "IDLE · 1\n💤 *carpet-rectify* · idle 43h"
           and hitxt["tally"].startswith("RUNNING 1 · IDLE 1")
           and "💤" not in hitxt["tally"] and "carpet-rectify" not in hitxt["tally"]
-          and "idle" not in {t for t, _ in home_cut(hidle, 5)}
           and home_needs({"tracks": [{"state": "idle", "name": "r/t", "reason": "x"}]}) == [])
     check("home_track_state: THE TAB READS, IT DOES NOT DECIDE — the word is cc-reconcile's snapshot word whatever the "
           "board says (a pane 2 h idle is `idle`, a declared question is `waiting`, a `claude` in a blocked worktree is "
@@ -3268,13 +3253,10 @@ def run_selfcheck():
     #    whose journal had moved past its own block.
     hpr = {"num": "9", "repo": "r", "url": ""}
     check("home_needs: a PR is only owed a 👍 when gh SAID so — a state we could not read, and one the owner has "
-          "already approved, are both silent (and neither gets the Review button)",
+          "already approved, are both silent",
           home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": dict(hpr, owed=True)}]}) == ["❓ [r] *PR #9* · awaiting review"]
           and home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": dict(hpr, owed=False)}]}) == []
-          and home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": hpr}]}) == []
-          and [b["action_id"] for b in home_buttons({"tracks": [{"state": "review", "pr": hpr}]}, [])] == ["open_board"]
-          and [b["action_id"] for b in home_buttons({"tracks": [{"state": "review", "pr": dict(hpr, owed=True)}]}, [])]
-              == ["review_pr", "open_board"])
+          and home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": hpr}]}) == [])
     check("home_needs: a blocked track with no live reason is not an ask — the board's word alone never puts a row on "
           "the owner's list",
           home_needs({"tracks": [{"state": "blocked", "name": "r/t", "reason": ""}]}) == []
@@ -3299,7 +3281,6 @@ def run_selfcheck():
                  "abox/course1": {"state": "waiting", "board": "running", "kind": "session", "live": True,
                                   "waiting_on": "person", "why": "which syllabus?"}}
         htr, _, hsess = home_tracks(hsnap, {})
-        hbrows = home_board_rows()
         details = {t["name"]: t["detail"] for t in htr}
         rows = home_needs({"tracks": htr})
         # …and the owner's row: a live pane, an aborted loop, and one run file left behind by it
@@ -3370,24 +3351,23 @@ def run_selfcheck():
           rows == ["❓ [abox] *stuck* · which deploy key should I…"]
           and details == {"abox/moved": "—", "abox/stuck": "—", "abox/stale": "board stale"}
           and {t["name"]: t["state"] for t in htr} == {"abox/moved": "blocked", "abox/stuck": "waiting", "abox/stale": "running"})
-    check("home_tracks: a board row of kind=session is NOT a track — not on the running list, not in any board view — "
+    check("home_tracks: a board row of kind=session is NOT a track — not on the running list — "
           "it comes back on its own list with its liveness and the question it declared, for the SESSIONS band "
           "(owner, 2026-09-01: course sessions are channels within the course-builder, not tasks)…",
           hsess == [{"repo": "abox", "name": "course1", "live": True, "ask": "which syllabus?"}]
-          and not any("course1" in t["name"] for t in htr) and not any(r[1] == "course1" for r in hbrows)
-          and {r[1] for r in hbrows} == {"stuck", "moved", "stale"})
+          and not any("course1" in t["name"] for t in htr) and {t["name"] for t in htr} == {"abox/stuck", "abox/moved", "abox/stale"})
     check("home_needs: …and its question still reaches NEEDS YOU, ranked with a waiting track — a session is not a "
           "task, but what it asks is the owner's like anything else (review of #132); one with no ask adds no row",
           home_needs({"tracks": htr, "sessions": hsess}) == ["❓ [abox] *course1* · which syllabus", "❓ [abox] *stuck* · which deploy key should I…"]
           and home_needs({"sessions": [{"repo": "r", "name": "s", "live": True, "ask": ""}]}) == []
           and home_needs({"tracks": [{"state": "blocked", "name": "r/b", "reason": "no GH token"}],
                           "sessions": [{"repo": "r", "name": "s", "ask": "ship it?"}]}) == ["❓ [r] *s* · ship it", "⛔ [r] *b* · no GH token"])
-    hS = home_blocks(dict(hfix, sessions=[{"repo": "lesson", "name": "course2", "live": False, "ask": "which syllabus do you want? the 2025 one is online"},
+    hS = hblocks(dict(hfix, sessions=[{"repo": "lesson", "name": "course2", "live": False, "ask": "which syllabus do you want? the 2025 one is online"},
                                           {"repo": "lesson", "name": "course1", "live": True, "ask": ""},
                                           {"repo": "abox", "name": "help", "live": True, "ask": ""}]))
     sS = json.dumps(hS, ensure_ascii=False)
     iS = next(i for i, b in enumerate(hS) if b["type"] == "context" and b["elements"][0]["text"] == "SESSIONS · 3")
-    hS0 = home_blocks(dict(hfix, sessions=[{"repo": "lesson", "name": "course1", "live": True, "ask": ""}]))   # no ask
+    hS0 = hblocks(dict(hfix, sessions=[{"repo": "lesson", "name": "course1", "live": True, "ask": ""}]))   # no ask
     hfold = lambda blocks: blocks[:blocks.index(next(b for b in blocks if b["type"] == "divider"))]   # above the fold
     check("home_blocks: SESSIONS is its own band BELOW THE FOLD — grouped under the repo and indented the way sub-orch "
           "channels are, 🟢/⚪ for a claude in the worktree, the ask on the line — and a session is never RUNNING: the "
@@ -3400,9 +3380,7 @@ def run_selfcheck():
           and "❓ [lesson] *course2* · which syllabus do you want" in json.dumps(hfold(hS), ensure_ascii=False)
           and "RUNNING 2" in sS and sS.count("🏃") == 2 and "ece" not in sS.split("SESSIONS")[0]
           and hbudget(hS) and hno_empty_header(hS)
-          and "SESSIONS" not in htxt and home_blocks(hfix) == hb       # no sessions, no band; a track-only tab is unchanged
-          and HOME_CUT.index("sessions") < HOME_CUT.index("channels")   # …and it is cut before the channels, after the chart
-          and "sessions" not in {t for t, _ in home_cut(home_parts(dict(hfix, sessions=[{"repo": "r", "name": "s"}])), 5)})
+          and "SESSIONS" not in htxt and hblocks(hfix) == hb)       # no sessions, no band; a track-only view is unchanged
     # ── ALL FOUR KINDS OF WORK (owner, 2026-09-04, thread 1788566080: "split this into a workers section, suborchs,
     #    and subagents to show all the work being done"). The tab said NOTHING RUNNING with nine subagents building
     #    rows, four landings in their gates and two orch sessions open, because RUNNING meant "a board row with a
@@ -3422,7 +3400,7 @@ def run_selfcheck():
           and tall["subagents"] == ("SUBAGENTS · 2\n*abox*\n  ↳ 🧠 Build the four Home rows · #226\n"
                                     "*sandbox*\n  ↳ 🧠 b9c0")
           and tall["landings"] == "LANDING · 2\n🚚 [abox] *PR #226* · gates\n🚚 [sandbox] *PR #7* · review"
-          and hbudget(home_blocks(hall)) and hno_empty_header(home_blocks(hall)) and hvocab(home_blocks(hall)))
+          and hbudget(hblocks(hall)) and hno_empty_header(hblocks(hall)) and hvocab(hblocks(hall)))
     htg = home_text(home_parts(dict(hfix, subagents=[
         {"id": "x1", "task": "Fix 245 review findings", "mark": "#240", "target": "repo-b",
          "title": "the spend ledger counts every transcript, subagents included"},
@@ -3465,13 +3443,13 @@ def run_selfcheck():
           "💤" in hidle[-2] and "🧠" not in hidle[-2] and "idle · PR 240: some PR title" in hidle[-2]
           and "🧠" in hidle[-1] and "💤" not in hidle[-1] and "idle" not in hidle[-1]
           and all(len(home_unlink(l).replace("*", "")) <= HOME_AGENT_LINE for l in hidle))
-    check("home_parts: a kind with nothing in it prints nothing, the three bands are never cut (they ARE what is "
-          "running), and a tab with none of them is byte-for-byte the busy reference",
-          home_blocks(hfix) == hb and not {"suborchs", "subagents", "landings"} & set(HOME_CUT)
+    check("home_parts: a kind with nothing in it prints nothing, and a view with none of them is byte-for-byte the "
+          "busy reference",
+          hblocks(hfix) == hb
           and not {"suborchs", "subagents", "landings"} & {t for t, _ in home_parts(hfix)}
-          and [t for t, _ in home_cut(home_parts(hall), 13)]      # squeezed to the bands that are never cut:
-              == ["head", "needs", "needs", "actions", "tally", "tally", "suborchs", "suborchs", "subagents",
-                  "subagents", "landings", "landings", "fold"])
+          and [t for t, _ in home_parts(hall)][:13]
+              == ["head", "needs", "needs", "tally", "tally", "suborchs", "suborchs", "subagents",
+                  "subagents", "landings", "landings", "fold", "backlog"])
     hnow = home_text(home_parts({"box": "abox", "now": "07:58", "units": [], "load": "", "channels": [], "waits": [],
                                  "quick": [], "tracks": [], "boot": "", "last": None,
                                  "landings": [{"repo": "abox", "pr": "226", "stage": "queued"},
@@ -3784,51 +3762,46 @@ def run_selfcheck():
           and home_fit("🏃 *a-rather-long-track-name*", ["9 it", "$14.20", "PR #12"]) == "🏃 *a-rather-long-track-name* · 9 it"
           and "  ↳ 🟡 #abox-carpet" in htxt and "    ↳" not in htxt
           and home_names([{"name": "a/x"}, {"name": "b/x"}]) == {"a/x": "a/x", "b/x": "b/x"})
-    hquiet = home_blocks({"box": "abox", "now": "09:12", "units": [("tmux-main", True, "")], "load": "📈 0.30",
+    hquiet = hblocks({"box": "abox", "now": "09:12", "units": [("tmux-main", True, "")], "load": "📈 0.30",
                           "channels": [{"name": "abox", "depth": 0, "session": "⚪ none", "marks": {}}],
                           "tracks": [{"state": "queued", "name": n, "detail": "—", "rank": 5} for n in hqueued + ["abox/one-more"]],
                           "waits": [], "quick": [], "audit_at": "06:00", "audit": "no drift.",
                           "boot": "last boot 01:41 (power cut)",
                           "last": {"name": "abox/slack-home", "verb": "merged", "when": "08:40", "at": "x"}})
     qtxt = json.dumps(hquiet, ensure_ascii=False)
-    check("home_blocks (b) QUIET: 13 blocks — nothing running is a SENTENCE with the last thing that finished, the "
+    check("home_parts (b) QUIET: 11 blocks — nothing running is a SENTENCE with the last thing that finished, the "
           "needs-you band is ABSENT rather than empty, the CHANNELS band is PRESENT for a channel with nothing "
-          "happening in it (owner: \"also show all channels\"), the primary button becomes the next track, and all "
-          "eleven queued tracks are printed, not three",
-          len(hquiet) == 13 and hquiet[1]["elements"][0]["text"] == "NOTHING RUNNING · QUEUED 11"
+          "happening in it (owner: \"also show all channels\"), and all eleven queued tracks are printed, not three",
+          len(hquiet) == 11 and hquiet[1]["elements"][0]["text"] == "NOTHING RUNNING · QUEUED 11"
           and hquiet[2]["text"]["text"] == "✅ last: abox/slack-home · merged 08:40"
           and "NEEDS YOU" not in qtxt and "BACKLOG · 11 · NEXT UP" in qtxt
-          and hquiet[8]["elements"][0]["text"] == "CHANNELS" and hquiet[9]["text"]["text"] == "⚪ *#abox*"
-          and hquiet[6]["text"]["text"].count("⏳") == 11 and "more on the board" not in qtxt
-          and [e["action_id"] for e in hquiet[3]["elements"]] == ["next_track", "open_board"]
-          and [e["action_id"] for e in hquiet[7]["elements"]] == ["board_todo", "board_running", "board_done"]
+          and hquiet[6]["elements"][0]["text"] == "CHANNELS" and hquiet[7]["text"]["text"] == "⚪ *#abox*"
+          and hquiet[5]["text"]["text"].count("⏳") == 11 and "more on the board" not in qtxt
           and hno_empty_header(hquiet) and hbudget(hquiet) and hvocab(hquiet))
-    hdeg = home_blocks(dict(hfix, units=[("tmux-main", True, ""), ("audit", True, ""), ("cc-slackd", False, "3 restarts · failed")],
+    hdeg = hblocks(dict(hfix, units=[("tmux-main", True, ""), ("audit", True, ""), ("cc-slackd", False, "3 restarts · failed")],
                             limit="usage limit until 09:00Z (18m left)", waits=[{"ch": "abox", "age": 2460, "ask": "approve deploy"}],
                             tracks=[t for t in hfix["tracks"] if t["state"] == "queued"] + [dict(hfix["tracks"][2])],
                             channels=[dict(c, session="⚪ none", marks={}) for c in hfix["channels"]], last=None))
     dtxt = json.dumps(hdeg, ensure_ascii=False)
-    check("home_blocks (c) DEGRADED: 14 blocks — the unit that is down and the usage limit sort ABOVE everything the "
+    check("home_parts (c) DEGRADED: 12 blocks — the unit that is down and the usage limit sort ABOVE everything the "
           "box is doing, the backlog is HELD (a count, no lines it cannot start), all seven channels are still listed "
-          "though not one of them is busy, the roll-call comes back, and the primary button is the restart",
-          len(hdeg) == 14 and hdeg[5]["text"]["text"].startswith("🔴 *cc-slackd down* · 3 restarts · failed\n⛔ *Usage limit* · no runs until 18:00")
+          "though not one of them is busy, and the roll-call comes back",
+          len(hdeg) == 12 and hdeg[4]["text"]["text"].startswith("🔴 *cc-slackd down* · 3 restarts · failed\n⛔ *Usage limit* · no runs until 18:00")
           and "BACKLOG · 10 · HELD UNTIL 18:00" in dtxt and "⏳ sandbox/rug-align" not in dtxt
-          and len(hdeg[10]["text"]["text"].split("\n")) == 7 and "quiet channel" not in dtxt
-          and [e["action_id"] for e in hdeg[3]["elements"]] == ["restart_unit", "home_logs", "open_board"]
-          and hdeg[3]["elements"][0]["style"] == "danger"
+          and len(hdeg[8]["text"]["text"].split("\n")) == 7 and "quiet channel" not in dtxt
           and "units: tmux-main ok · audit ok · cc-slackd 🔴 · last boot 01:41 (power cut)" in dtxt
           and hno_empty_header(hdeg, limited=True) and hbudget(hdeg) and hvocab(hdeg))
     # THE SPEND TIER: one row under the tally at EVERY tier, in cc-tier's words, sorted with the box's impairments
     # above whatever is running. 🪫 while the box is holding spend back, 🔋 at autonomous — which used to print no row
     # at all, so the owner opened the tab at the tier the box actually runs at and read nothing about it (2026-09-11:
     # "i dont see the current mode on the home page or the dashboard").
-    htier = home_blocks(dict(hfix, spend_tier="essential", tier="spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start, one at a time, cheapest model, one review each"))
-    hauto = home_blocks(dict(hfix, spend_tier="autonomous", tier="spend tier: autonomous — discovers, fixes and explores"))
+    htier = hblocks(dict(hfix, spend_tier="essential", tier="spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start, one at a time, cheapest model, one review each"))
+    hauto = hblocks(dict(hfix, spend_tier="autonomous", tier="spend tier: autonomous — discovers, fixes and explores"))
     hrow = lambda bs, mark: any(b.get("type") == "section" and (b.get("text") or {}).get("text", "").startswith(mark) for b in bs)
-    check("home_blocks (c') the spend tier is one row above the running rows at EVERY tier, in cc-tier's words — 🪫 "
+    check("home_parts (c') the spend tier is one row above the running rows at EVERY tier, in cc-tier's words — 🪫 "
           "while the box is holding spend back, 🔋 at autonomous, which used to print nothing at all; a state carrying "
-          "no tier (cc-tier could not answer) still prints no row, and the reference tab has none",
-          hfix.get("tier") is None and not hrow(home_blocks(hfix), "🪫") and not hrow(home_blocks(hfix), "🔋")
+          "no tier (cc-tier could not answer) still prints no row, and the reference view has none",
+          hfix.get("tier") is None and not hrow(hblocks(hfix), "🪫") and not hrow(hblocks(hfix), "🔋")
           and hrow(htier, "🪫 *spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start")
           and hrow(hauto, "🔋 *spend tier: autonomous — discovers, fixes and explores")
           and hbudget(htier) and hvocab(htier) and hbudget(hauto) and hvocab(hauto))
@@ -3849,7 +3822,7 @@ def run_selfcheck():
               and tbroken == ("", ""))
     finally:
         EFFECTS.run_impl = _runt
-    hover = home_blocks(dict(hfix, channels=hfix["channels"][:2]
+    hover = hblocks(dict(hfix, channels=hfix["channels"][:2]
                              + [{"name": f"sub{i}", "depth": 1, "session": "🟢 live"} for i in range(3)]
                              + hfix["channels"][2:],
                              tracks=[{"state": "running", "name": f"abox/run{i}", "detail": "6 it · $14.20 · PR #3", "rank": 0}
@@ -3935,7 +3908,7 @@ def run_selfcheck():
           "off a filesystem path can @-mention anyone",
           len(spF["phantoms"]) == 2 and "nobody watching" in spF["phantoms"][0]
           and "transcript idle 0.8 h" in spF["phantoms"][1] and "@" not in "".join(spF["phantoms"]))
-    hspend = home_blocks(dict(hfix, spend=spF))
+    hspend = hblocks(dict(hfix, spend=spF))
     stxt = json.dumps(hspend, ensure_ascii=False)
     check("the SPEND band renders on the busy tab — the headline, where it went, and 👻 the part nobody is "
           "watching — and the tab still fits the block and character budget with it in",
@@ -3944,30 +3917,30 @@ def run_selfcheck():
           and "abox/track-a" in stxt and "unattributed" in stxt and "👻" in stxt)
     check("an empty ledger renders NO band at all, like every other empty one — a tab that says $0.00 on a box "
           "whose tick has not run yet is stating something it does not know",
-          not spEmpty and "💵" not in json.dumps(home_blocks(hfix), ensure_ascii=False))
+          not spEmpty and "💵" not in json.dumps(hblocks(hfix), ensure_ascii=False))
 
     otxt = json.dumps(hover, ensure_ascii=False)
-    check("home_blocks (d) OVERFLOW: 13 tracks, 10 channels, 6 asks — RUNNING, NEEDS YOU, BACKLOG and now CHANNELS all "
+    check("home_parts (d) OVERFLOW: 13 tracks, 10 channels, 6 asks — RUNNING, NEEDS YOU, BACKLOG and now CHANNELS all "
           "print EVERY row (owner, 2026-08-30: \"always show ALL that are running, all that need me, and all backlog "
-          "dont hide any\", then \"also show all channels\"), NOTHING on the tab is behind a count, and it still fits "
-          "≤%d blocks — the four whole lists cost one section block each however long they get" % HOME_MAXBLK,
+          "dont hide any\", then \"also show all channels\"), NOTHING in the view is behind a count — the four whole "
+          "lists cost one section block each however long they get",
           hbudget(hover) and hno_empty_header(hover) and hvocab(hover)
           and "more running" not in otxt and "NEEDS YOU · 2" in otxt and "more waiting" not in otxt
           and len(hover[2]["text"]["text"].split("\n")) == 2                   # all six asks, none behind a count
-          and hover[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in otxt
-          and len(hover[11]["text"]["text"].split("\n")) == 10 and "quiet channel" not in otxt
-          and "more channels" not in otxt and len(hover) == 15)
+          and hover[7]["text"]["text"].count("⏳") == 10 and "more on the board" not in otxt
+          and len(hover[9]["text"]["text"].split("\n")) == 10 and "quiet channel" not in otxt
+          and "more channels" not in otxt and len(hover) == 13)
     # The busy FAMILY sorts first, whole: #abox and the four ↳ rows under it stay together and stay in their own
     # order, and no `↳` row is ever printed under a channel that is not its parent.
     NB = "\u00a0\u00a0"                             # the indent Slack cannot collapse, as home_parts writes it
-    check("home_blocks: CHANNELS ranks by activity a FAMILY at a time — a parent and its sub-channels move together, "
+    check("home_parts: CHANNELS ranks by activity a FAMILY at a time — a parent and its sub-channels move together, "
           "so busy-first ordering can never orphan an indented row",
-          hover[11]["text"]["text"].split("\n")[:5]
+          hover[9]["text"]["text"].split("\n")[:5]
           == ["🟢 *#abox*", f"{NB}↳ 🟡 #abox-carpet"]
              + [f"{NB}↳ 🟢 #sub{i}" for i in range(3)]
-          and all(l.startswith("⚪ *#quiet") for l in hover[11]["text"]["text"].split("\n")[5:])
+          and all(l.startswith("⚪ *#quiet") for l in hover[9]["text"]["text"].split("\n")[5:])
           # a quiet parent with a busy child sorts up WITH its child, and keeps it
-          and next(b["text"]["text"] for b in home_blocks({"box": "b", "now": "1", "channels": [
+          and next(b["text"]["text"] for b in hblocks({"box": "b", "now": "1", "channels": [
               {"name": "hushed", "depth": 0, "session": "⚪ none"},
               {"name": "loud", "depth": 0, "session": "⚪ none"},
               {"name": "loud-kid", "depth": 1, "session": "🟢 live"}]})
@@ -3975,82 +3948,36 @@ def run_selfcheck():
           == f"⚪ *#loud*\n{NB}↳ 🟢 #loud-kid\n⚪ *#hushed*"
           # every channel renders, so `depth` is now live input on EVERY row: junk costs an indent, a runaway
           # nest flattens at HOME_DEPTH, and neither costs the tab (the fuzz case above proves the no-crash half)
-          and [l.count("\u00a0") for l in next(b["text"]["text"] for b in home_blocks({"box": "b", "now": "1",
+          and [l.count("\u00a0") for l in next(b["text"]["text"] for b in hblocks({"box": "b", "now": "1",
               "channels": [{"name": "top", "depth": 0}, {"name": "deep", "depth": 9},
                            {"name": "junk", "depth": "x"}]}) if b["type"] == "section"
               and "#top" in b["text"]["text"]).split("\n")] == [0, 2 * HOME_DEPTH, 0])
-    hcut = lambda n: [t for t, _ in home_cut(home_parts(hfix), n)]
-    check("home_cut: over budget, things go in the OWNER's order (§01d) — boot, the handoff line, the audit, the "
-          "channels, the backlog, and the board-view buttons last of the demoted half, because when a long board costs "
-          "the tab its backlog LINES the button that prints them is exactly what is still worth a block. What is "
-          "running, and the ❓ band, are never what gets cut",
-          "boot" not in hcut(14) and "audit" in hcut(14)
-          and "audit" not in hcut(13) and "channels" in hcut(13)
-          and "channels" not in hcut(11) and "backlog" in hcut(11)
-          and "backlog" not in hcut(9) and "views" in hcut(9)
-          and "views" not in hcut(8)
-          and all(t in hcut(8) for t in ("head", "tally", "needs", "actions")) and len(hcut(8)) == 8
-          and all(t in hcut(6) for t in ("head", "tally", "needs")))
-    # …and THE BUDGET IS THE WHOLE TAB, so that order is a last resort and not a thing spent on every publish. Every
-    # band is a fixed one or two blocks however long its list gets (the whole backlog, every ❓, every channel are one
-    # section each), so the tab has a ceiling of its own — every band lit at once — and HOME_MAXBLK is that ceiling.
-    # What the owner saw on 2026-09-11 was a number nobody had raised since the tab was smaller: a live tab built 26
-    # blocks against a budget of 18 and the cut spent the difference on EIGHT bands, the channel roll among them, two
-    # weeks after he asked for every channel by name ("the list of all the channels is off the homepage"). Add a band
-    # and this case goes red — raise the budget on purpose rather than letting §01d quietly drop one he asked for.
     hfull = dict(hfix, spend_tier="essential", tier="spend tier: essential — only critical rows start",
                  tracks=list(hfix["tracks"]) + [{"state": "idle", "name": "abox/notes", "detail": "idle 2h", "rank": 3}],
                  suborchs=[{"repo": "abox", "alias": "carpet"}], subagents=[{"target": "abox", "task": "fix the band"}],
                  landings=[{"repo": "abox", "pr": "9", "stage": "queued"}],
                  sessions=[{"repo": "abox", "name": "help", "live": True, "ask": ""}],
                  revisit=[{"text": "move the lessons site?", "channel": "#beta", "age": "3d", "link": "https://x/y"}],
-                 chart={"file": "F1", "drawn": time.time(), "covers": "vitals · last 24h", "alt": "one chart"},
                  graphs={"url": "http://127.0.0.1:5190", "up": True},
                  handoffs={"today": 2, "when": "05:00", "who": "main"},
                  spend={"today": 6.75, "week": 16.75, "rows": [{"who": "abox/t", "usd": 6.5, "tok": "1.0M"}],
                         "unattributed": 0.25, "phantoms": ["nobody watching · 1 h"]})
     hfp = [t for t, _ in home_parts(hfull)]
-    hfb = home_blocks(hfull)
-    check("home_cut: with EVERY band lit at once NOTHING is cut — the tab's own ceiling fits inside HOME_MAXBLK, so "
-          "every band the owner asked for by name (all the channels, the whole backlog, the tier) is on the tab he "
-          "opens, and a band that goes missing means a band was ADDED and the budget was not raised with it",
-          len(hfp) <= HOME_MAXBLK and [t for t, _ in home_cut(home_parts(hfull), HOME_MAXBLK)] == hfp
-          and len(hfb) == len(hfp) and {"channels", "backlog", "revisit", "sessions", "spend"} <= set(hfp)
+    hfb = hblocks(hfull)
+    check("home_parts: with EVERY band lit at once every band is there — nothing is cut for a block budget any more "
+          "(the tab that had one is gone), so every band the owner asked for by name (all the channels, the whole "
+          "backlog, the tier) is in home.json's text",
+          len(hfb) == len(hfp) and {"channels", "backlog", "revisit", "sessions", "spend", "graphs"} <= set(hfp)
           and hbudget(hfb) and hno_empty_header(hfb) and hvocab(hfb))
-    # ── THE CHART ON THE TAB (owner a18/a20: "a graph of system resources … on the main home page"). Two blocks, below
-    #    the fold, sitting on top of the `load` line that says the same numbers in words.
-    hchart = {"file": "F1", "drawn": 1000.0, "covers": "vitals · last 24h · 118 of 1440 minutes recorded",
-              "alt": "one chart of the box's vitals"}
-    hcb = home_blocks(dict(hfix, chart=hchart))
-    himg = [b for b in hcb if b["type"] == "image"]
-    check("the published view CONTAINS THE CHART: one image block referencing the uploaded Slack file, with alt text, "
-          "and the grey line under it saying what the picture covers — this, and not a renderable PNG, is the ask",
-          len(himg) == 1 and himg[0]["slack_file"] == {"id": "F1"} and himg[0]["alt_text"]
-          and "118 of 1440 minutes" in json.dumps(hcb, ensure_ascii=False)
-          and hbudget(hcb) and hno_empty_header(hcb) and len(hcb) == len(hb) + 2)
-    check("HOW OLD THE DRAWING IS is visible the moment it is not fresh, and silent while it is — a picture that "
-          "cannot say it is stale is worse than no picture (current.png sat 4 h behind the data on 2026-08-31)",
-          "⚠" not in home_chart_line(hchart, now=1000.0 + VITALS_STALE - 1)
-          and home_chart_line(hchart, now=1000.0 + 1200).endswith("⚠ drawn 20m ago")
-          and "⚠ drawn" in json.dumps(home_blocks(dict(hfix, chart=dict(hchart, drawn=time.time() - 3600))),
-                                      ensure_ascii=False)
-          and home_chart_line({}) == "" and home_chart_line(None) == ""
-          # …and a drawing with no timestamp says so, instead of claiming to be 56 years old or claiming to be now
-          and home_chart_line({"covers": "c"}) == "c · ⚠ age unknown")
-    check("no picture is a legitimate answer — no recorder yet, a render that failed, an upload Slack refused: the "
-          "chart bands simply do not render and the REST OF THE TAB IS UNTOUCHED",
-          home_chart_blocks(None) == [] and home_chart_blocks({}) == [] and home_chart_blocks({"drawn": 1}) == []
-          and home_blocks(dict(hfix, chart=None)) == hb and home_blocks(dict(hfix, chart={})) == hb)
-
     # ── THE GRAPHS SITE ON THE TAB (owner a128: "add the required shell commands and website url to the homepage").
     #    The site shipped without anything pointing at it, so the owner was told the URL in a thread and had to find
-    #    that thread again. One grey line under the chart carries it, and the command on it is the one that is MISSING.
+    #    that thread again. One grey line below the fold carries it, and the command on it is the one that is MISSING.
     hgurl = "http://127.0.0.1:5190"
-    hgU = home_blocks(dict(hfix, graphs={"url": hgurl, "up": True}))
-    hgD = home_blocks(dict(hfix, graphs={"url": hgurl, "up": False}))
+    hgU = hblocks(dict(hfix, graphs={"url": hgurl, "up": True}))
+    hgD = hblocks(dict(hfix, graphs={"url": hgurl, "up": False}))
     gU = next(t for t in htexts(hgU) if t.startswith("📊"))
     gD = next(t for t in htexts(hgD) if t.startswith("📊"))
-    check("the tab carries the graphs' URL AND the shell command (a128), one grey line below the fold — while the "
+    check("the view carries the graphs' URL AND the shell command (a128), one grey line below the fold — while the "
           "site is up the URL is a LINK and the command beside it is the tailscale line that reaches it off the box; "
           "while it is down the URL is plain text (a dead link is the same lie as a chart that will not say it is "
           "stale) and the command is the one that starts it",
@@ -4059,23 +3986,14 @@ def run_selfcheck():
           and "cc-graphs serve" in gD and "not serving" in gD and "<http" not in gD and "tailscale" not in gD
           and len(hgU) == len(hb) + 1 and len(hgD) == len(hb) + 1
           and hbudget(hgU) and hno_empty_header(hgU) and hbudget(hgD) and hno_empty_header(hgD))
-    hgtxt = home_text(home_cut(home_parts(dict(hfix, graphs={"url": hgurl, "up": False})), HOME_MAXBLK))
-    check("…and it is its own band, so ~/.cc/state/home.json — the tab as text by band, which is where a reader that "
+    hgtxt = home_text(home_parts(dict(hfix, graphs={"url": hgurl, "up": False})))
+    check("…and it is its own band, so ~/.cc/state/home.json — the view as text by band, which is where a reader that "
           "must not re-render it looks — carries both halves; no input and the band is simply absent, never empty, "
-          "and the rest of the tab is byte-for-byte what it was",
+          "and the rest of the view is byte-for-byte what it was",
           hgurl in hgtxt["graphs"] and "cc-graphs serve" in hgtxt["graphs"]
           and home_graphs_line(None) == "" and home_graphs_line({}) == "" and home_graphs_line({"up": True}) == ""
           and "graphs" not in home_text(home_parts(dict(hfix, graphs={})))
-          and home_blocks(dict(hfix, graphs=None)) == hb and home_blocks(dict(hfix, graphs={})) == hb)
-    hgcut = lambda n: [t for t, _ in home_cut(home_parts(dict(hfix, chart=hchart,
-                                                              graphs={"url": hgurl, "up": True})), n)]
-    hgnopic = next(n for n in range(HOME_MAXBLK, 0, -1) if "chart" not in hgcut(n))
-    hgnoline = next(n for n in range(HOME_MAXBLK, 0, -1) if "graphs" not in hgcut(n))
-    check("home_cut: the line OUTLIVES the picture it sits under — once the chart has been dropped for space, the one "
-          "block saying where the live version of it is is exactly what is still worth keeping. It is not immortal: a "
-          "tighter budget still drops it, ahead of the channels and the backlog",
-          HOME_CUT.index("graphs") > HOME_CUT.index("chart") and "graphs" in hgcut(hgnopic)
-          and hgnoline < hgnopic and "channels" in hgcut(hgnoline))
+          and hblocks(dict(hfix, graphs=None)) == hb and hblocks(dict(hfix, graphs={})) == hb)
     #    …and the input half: cc-graphs' own two files, read the way cc-graphs' running() reads them.
     gdir = tempfile.mkdtemp(prefix="cc-slack-graphs-")
     gscr = os.path.join(gdir, "cc-graphs")           # NOT a renamed copy of /bin/sleep: on this box that binary is a
@@ -4123,122 +4041,20 @@ def run_selfcheck():
           and grecycled == {"url": f"http://127.0.0.1:{HOME_GRAPHS_PORT}", "up": False}
           and "127.0.0.1" in HOME_GRAPHS_PUB.format(url=gup["url"]))
 
-    #    …and the daemon half: the picture is redrawn on a timer, and uploaded ONLY when its bytes changed.
-    dmV = Daemon(use_slack=False); dmV.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
-    dmV.use_slack, dmV.chart_store = True, "CSTORE"
-    vt, _apiV = tempfile.mkdtemp(prefix="cc-slack-vit-"), globals()["api"]
-    vcalls, vput = [], []
-    def apiV(method, token, **kw):
-        vcalls.append(method)
-        if method == "files.getUploadURLExternal":
-            return {"upload_url": "https://files.slack.test/up", "file_id": f"F{len(vcalls)}"}
-        if method == "files.completeUploadExternal":
-            return {"files": [{"id": json.loads(kw["files"])[0]["id"]}]}
-        if method == "files.info":
-            return {"file": {"shares": {"private": {"CSTORE": [{"ts": "1.1"}]}}}}
-        return {"ok": True}
-    try:
-        globals()["api"] = apiV
-        EFFECTS.run_impl = lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-        globals()["VITALS_DIR"] = vt
-        _open, _sleep = urllib.request.urlopen, time.sleep
-        urllib.request.urlopen = lambda req, timeout=None: contextlib.closing(io.BytesIO(b""))
-        time.sleep = lambda _s: None                             # the share-settle wait, without the waiting
-        open(f"{vt}/current.png", "wb").write(b"\x89PNG one")
-        json.dump({"window_h": 24, "minutes": 118, "n": 1440, "gaps": 2}, open(f"{vt}/current.json", "w"))
-        dmV.chart_refresh()
-        first, n1 = dict(dmV.chart), len([c for c in vcalls if c.startswith("files.")])
-        dmV.chart_refresh()                                      # SAME bytes: nothing may go over the wire
-        n2 = len([c for c in vcalls if c.startswith("files.")])
-        open(f"{vt}/current.png", "wb").write(b"\x89PNG two")    # a NEW picture: upload it, and bin the old one
-        dmV.chart_refresh()
-        deleted = "files.delete" in vcalls
-    finally:
-        globals()["api"], globals()["VITALS_DIR"] = _apiV, os.environ.get("CC_VITALS_DIR") or f"{HOME}/.cc/state/vitals"
-        EFFECTS.run_impl = None
-        urllib.request.urlopen, time.sleep = _open, _sleep
-        subprocess.run(["rm", "-rf", vt], check=False)
-    check("a refresh with NO NEW DATA re-uploads NOTHING: the file id is reused for every 5 s republish, and only a "
-          "picture whose bytes actually changed costs an upload — then the previous one is deleted, so the workspace "
-          "holds exactly one drawing, never one per refresh",
-          first.get("file") and first["covers"].endswith("2 missing") and n1 == 3 and n2 == n1
-          and dmV.chart["file"] != first["file"] and deleted and dmV.home_dirty)
-    #    …and the upload's name lookup flapping (raised-box-dns-resolution-flaps): the retry lands the picture, silently
-    dmDC = Daemon(use_slack=False); dmDC.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
-    dmDC.use_slack, dmDC.chart_store = True, "CSTORE"
-    vtDC, failDC, callsDC, loggedDC = tempfile.mkdtemp(prefix="cc-slack-vit-"), {"n": 1}, [], []
-    def apiDC(method, token, **kw):
-        callsDC.append(method)
-        if method == "files.getUploadURLExternal":
-            if failDC["n"]:
-                failDC["n"] -= 1; raise urllib.error.URLError(socket.gaierror(-3, "Temporary failure in name resolution"))
-            return {"upload_url": "https://files.slack.test/up", "file_id": "F9"}
-        if method == "files.completeUploadExternal":
-            return {"files": [{"id": "F9"}]}
-        if method == "files.info":
-            return {"file": {"shares": {"private": {"CSTORE": [{"ts": "1.1"}]}}}}
-        return {"ok": True}
-    _apiDC, _logDC, _openDC, _sleepDC = globals()["api"], globals()["log"], urllib.request.urlopen, time.sleep
-    try:
-        globals()["api"], globals()["log"] = apiDC, lambda *a: loggedDC.append(" ".join(map(str, a)))
-        EFFECTS.run_impl = lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-        globals()["VITALS_DIR"] = vtDC
-        urllib.request.urlopen = lambda req, timeout=None: contextlib.closing(io.BytesIO(b""))
-        time.sleep = lambda _s: None
-        open(f"{vtDC}/current.png", "wb").write(b"\x89PNG dns")
-        json.dump({"window_h": 24, "minutes": 5, "n": 5}, open(f"{vtDC}/current.json", "w"))
-        dmDC.chart_refresh()                                     # first lookup fails, the retry uploads
-        landed, asked1, logged1 = dmDC.chart.get("file"), callsDC.count("files.getUploadURLExternal"), list(loggedDC)
-        failDC["n"] = 2; callsDC.clear(); loggedDC.clear(); dmDC.chart, dmDC.chart_sig = {}, ""
-        dmDC.chart_refresh()                                     # both fail: one line, and the tab keeps what it has
-        kept, asked2, logged2 = dict(dmDC.chart), callsDC.count("files.getUploadURLExternal"), list(loggedDC)
-    finally:
-        globals()["api"], globals()["log"] = _apiDC, _logDC
-        globals()["VITALS_DIR"] = os.environ.get("CC_VITALS_DIR") or f"{HOME}/.cc/state/vitals"
-        EFFECTS.run_impl = None; urllib.request.urlopen, time.sleep = _openDC, _sleepDC
-        shutil.rmtree(vtDC, ignore_errors=True)
-    check("chart refresh: a name lookup that fails once on the upload is retried and the picture lands, nothing logged; "
-          "one that fails twice logs the errno once and the tab keeps the picture it has",
-          landed == "F9" and asked1 == 2 and logged1 == [] and kept == {} and asked2 == 2
-          and len(logged2) == 1 and logged2[0].startswith("app home: chart upload: name resolution failed twice") and "errno -3" in logged2[0])
-
-    #    …and the promise that matters most: HOME NEVER BREAKS BECAUSE A PICTURE FAILED.
-    dmX = Daemon(use_slack=False); dmX.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
-    dmX.use_slack, dmX.chart, dmX.chart_sig = True, {"file": "FDEAD", "drawn": time.time(), "covers": "c"}, "sig"
-    dmX.home_state = lambda: dict(hfix, chart=dmX.chart)
-    xviews = []
-    def apiX(method, token, **kw):
-        if method == "views.publish":
-            xviews.append(kw["view"])
-            if "FDEAD" in kw["view"]:
-                raise RuntimeError("views.publish: invalid_arguments")
-        return {"ok": True}
-    try:
-        globals()["api"] = apiX
-        dmX.publish_home()
-    finally:
-        globals()["api"] = _apiV
-    check("a chart Slack refuses does NOT cost the owner their dashboard: the view republishes WITHOUT the image, "
-          "the failure is not counted toward the three-strikes home_off backoff, and the dead file is forgotten so "
-          "the next redraw uploads a fresh one instead of retrying a corpse forever",
-          len(xviews) == 2 and "FDEAD" in xviews[0] and "image" not in xviews[1]
-          and "RUNNING 2" in xviews[1] and "carpet-rectify" in xviews[1]
-          and dmX.home_fails == 0 and not dmX.home_off and dmX.chart == {} and dmX.chart_at == 0.0)
-
     # ── THE LISTS ARE WHOLE (owner, 2026-08-30, thread 1788129807: "what happenend to showing all the backlog items and
     #    all ? items and not defaulting to showing only a few?"). Both bands are one section block however long they get,
     #    so this costs no blocks; the character budget is the only cap left, and it is a valve, not a policy.
-    hlong = home_blocks(dict(hfix,
+    hlong = hblocks(dict(hfix,
                              tracks=[{"state": "queued", "name": f"abox/q{i}", "detail": "—", "rank": 5} for i in range(12)]))
     ltxt = json.dumps(hlong, ensure_ascii=False)
-    check("home_blocks: a 12-track backlog prints 12 lines and a 7-deep NEEDS YOU prints 7 — the two bands the owner "
-          "opens the tab FOR are never summarised into a count they must leave Slack to expand",
-          hlong[6]["text"]["text"].count("⏳") == 12
+    check("home_parts: a 12-track backlog prints 12 lines and a 7-deep NEEDS YOU prints 7 — the two bands the owner "
+          "opens the view FOR are never summarised into a count they must go elsewhere to expand",
+          hlong[5]["text"]["text"].count("⏳") == 12
           and "more waiting" not in ltxt and "more on the board" not in ltxt
           and hbudget(hlong) and hno_empty_header(hlong) and hvocab(hlong))
-    hvalve = home_blocks(dict(hfix, waits=[], tracks=[{"state": "queued", "name": f"abox/{'q' * 28}{i}",
+    hvalve = hblocks(dict(hfix, waits=[], tracks=[{"state": "queued", "name": f"abox/{'q' * 28}{i}",
                                                        "detail": "—", "rank": 5} for i in range(200)]))
-    vlines = hvalve[6]["text"]["text"].split("\n")
+    vlines = hvalve[5]["text"]["text"].split("\n")
     check("home_list: the character budget is a SAFETY VALVE, not a policy — a 200-track board degrades to whole rows "
           "plus a count, and never to a row cut in half",
           hbudget(hvalve) and vlines[-1].startswith("_+") and vlines[-1].endswith("more on the board_")
@@ -4246,47 +4062,6 @@ def run_selfcheck():
           and home_list(["a", "b", "c"], lambda k: f"_+{k}_") == "a\nb\nc"
           and home_list(["aaaa", "bbbb", "cccc"], lambda k: f"_+{k}_", 13) == "aaaa\n_+2_"
           and home_list([], lambda k: f"_+{k}_") == "")
-    # ── the board VIEW buttons: one slice each, DM'd, and the same gate as every other button
-    hrows = [("abox", "home-lists", "running", "Home shows all of the backlog", "2026-08-30T22:49:00Z"),
-             ("abox", "help-perms", "todo", "loosen two lines", "2026-08-30T20:00:00Z"),
-             ("abox", "rug-align", "queued", "", "2026-08-30T21:00:00Z"),
-             ("abox", "carpet", "merged", "rectify the carpet", "2026-08-30T19:00:00Z"),
-             ("abox", "notes", "review", "notes index", "2026-08-30T18:00:00Z")]
-    hsl = {lab: home_slice(hrows, sts, lab) for _, lab, sts in HOME_VIEWS}
-    check("board views: each button DMs ONE slice of the board, newest first and in the tab's own vocabulary — `todo` on "
-          "a board written before the rename still counts as `queued`, and an empty slice is a SENTENCE, not an empty block",
-          hsl["Running"].startswith("*Running* · 1") and "abox/home-lists" in hsl["Running"]
-          and "rug-align" not in hsl["Running"] and hsl["To do"].startswith("*To do* · 2")
-          and home_word("todo") == "queued" and home_word("running") == "running" and home_word("?") == "queued"
-          and hsl["To do"].index("abox/rug-align") < hsl["To do"].index("abox/help-perms")
-          and hsl["Done"].startswith("*Done* · 2") and "abox/carpet — rectify the carpet" in hsl["Done"]
-          and home_slice([], ("running",), "Running") == "nothing is *running* on the board."
-          and home_slice(hrows, ("blocked",), "Blocked") == "nothing is *blocked* on the board."
-          and home_slice([("r", f"t{i}", "queued", "", f"{i:04d}") for i in range(HOME_SLICE + 3)],
-                         ("queued",), "To do").endswith("_+3 more — `cc board show <repo>`_")
-          and home_slice([("r", f"t{i}", "merged", "", f"{i:04d}") for i in range(HOME_SLICE + 3)],
-                         ("done", "review", "merged"), "Done").endswith("_+3 more — `cc board show <repo> --all`_"))
-    dmV = Daemon(use_slack=False); dmV.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmV.use_slack = True
-    vdms, vlog = [], io.StringIO()
-    dmV.dm_user = lambda user, text: vdms.append((user, text))
-    _rows = globals()["home_board_rows"]
-    _CACHE.pop("board_rows", None)                 # the three views share one cached read; this run must not inherit it
-    globals()["home_board_rows"] = lambda: hrows
-    try:
-        with contextlib.redirect_stderr(vlog):
-            for aid in ("board_todo", "board_running", "board_done"):
-                dmV.on_action({"type": "block_actions", "user": {"id": "UMEMBER"}, "actions": [{"action_id": aid}]})
-            vrefused = len(vdms) == 3 and all("owner" in t for _, t in vdms)
-            vdms.clear()
-            dmV.on_action({"type": "block_actions", "user": {"id": "UOWNER"}, "actions": [{"action_id": "board_todo"}]})
-    finally:
-        globals()["home_board_rows"] = _rows
-        _CACHE.pop("board_rows", None)
-    check("a NEW button is not a way round the gate: every board view is refused for a member exactly like Restart is — "
-          "and an ACCEPTED press now leaves a line in the log, because a button that runs silently is undebuggable",
-          vrefused and len(vdms) == 1 and vdms[0][0] == "UOWNER" and vdms[0][1].startswith("*To do* · 2")
-          and "home: board_todo" in vlog.getvalue() and "by UOWNER" in vlog.getvalue()
-          and all(a in HOME_ACT for a, _, _ in HOME_VIEWS))
     # ── the handoff count: how often sessions ran out of context today (cc-context's own ledger, one read and a count)
     _homeH, hh, hh0 = globals()["HOME"], tempfile.mkdtemp(prefix="cc-slack-hnd-"), tempfile.mkdtemp(prefix="cc-slack-nil-")
     _tzH = os.environ.get("TZ")
@@ -4321,7 +4096,7 @@ def run_selfcheck():
         globals()["HOME"], ccspend._TZ = _homeH, None
         os.environ.pop("TZ", None) if _tzH is None else os.environ.update(TZ=_tzH)
         subprocess.run(["rm", "-rf", hh, hh0], check=False)
-    hhb = home_blocks(dict(hfix, handoffs={"today": 3, "when": "18:10", "who": "abox/morning"}))
+    hhb = hblocks(dict(hfix, handoffs={"today": 3, "when": "18:10", "who": "abox/morning"}))
     check("home_handoffs: today's crossings counted off cc-context's ledger on the BOX's day, so the count and the "
           "clock beside it are the same day — the two crossings after the local midnight are today's and the one at "
           "06:40 the next morning is not, where bucketing by the UTC prefix (the control) counts 2 and points at "
@@ -4330,25 +4105,25 @@ def run_selfcheck():
           and hnd_big == hnd_day                         # a ledger far past the tail budget answers the same
           and hnd_quiet == {} and hnd_none == {}
           and "3 handoffs today · last 18:10 abox/morning" in json.dumps(hhb, ensure_ascii=False)
-          and "1 handoff today" in json.dumps(home_blocks(dict(hfix, handoffs={"today": 1})), ensure_ascii=False)
-          and "handoff" not in json.dumps(home_blocks(dict(hfix, handoffs={"today": 0})), ensure_ascii=False)
-          and hbudget(hhb) and hno_empty_header(hhb) and len(hhb) == 16)
+          and "1 handoff today" in json.dumps(hblocks(dict(hfix, handoffs={"today": 1})), ensure_ascii=False)
+          and "handoff" not in json.dumps(hblocks(dict(hfix, handoffs={"today": 0})), ensure_ascii=False)
+          and hbudget(hhb) and hno_empty_header(hhb) and len(hhb) == 14)
     check("home_handoffs: a stamp nothing can parse still buckets by its literal date prefix (home_local_day's "
           "fallback) — counted, and the band never raises on it", hnd_garbled.get("today") == 4)
-    hempty = home_blocks({})
+    hempty = hblocks({})
     hwfix = {"box": "abox", "now": "10:15", "units": [("tmux-main", True, "")], "load": "📈 0.30",
              "channels": [], "waits": [], "quick": [], "boot": "",
              "last": {"name": "abox/old", "verb": "merged", "when": "08:40", "at": "x"},
              "tracks": [{"state": "waiting", "name": f"lesson/course{n}", "detail": "—", "rank": 1,
                          "reason": "which syllabus should I build from"} for n in (1, 2, 3)]}
-    hwait = home_blocks(hwfix)
+    hwait = hblocks(hwfix)
     wtxt = json.dumps(hwait, ensure_ascii=False)
     check("home_blocks (c) WAITING — the shape the owner was shown on 2026-08-31: three sessions each stopped on a "
           "question for him. The tally counts them as WAITING ON YOU and NOT as running, the top block points at the "
           "band instead of claiming the board is clear or naming the last merge, and every one of them is a NEEDS YOU "
           "row he can answer without opening anything",
-          hwait[4]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 3"
-          and hwait[5]["text"]["text"] == "_nothing is running — what is waiting is above_"
+          hwait[3]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 3"
+          and hwait[4]["text"]["text"] == "_nothing is running — what is waiting is above_"
           and hwait[1]["elements"][0]["text"] == "NEEDS YOU · 3"
           and hwait[2]["text"]["text"].count("❓") == 3
           and "❓ [lesson] *course1* · which syllabus should I b…" in wtxt
@@ -4356,29 +4131,29 @@ def run_selfcheck():
           and "✅ last" not in wtxt)
     hwsess = dict(hwfix, tracks=[], sessions=[{"repo": "lesson", "name": f"course{n}", "live": True,
                                                "ask": "which syllabus should I build from"} for n in (1, 2, 3, 4, 5)])
-    hws = home_blocks(hwsess)
+    hws = hblocks(hwsess)
     wstxt = json.dumps(hws, ensure_ascii=False)
-    hwmix = home_blocks(dict(hwsess, tracks=hwfix["tracks"][:1]))
+    hwmix = hblocks(dict(hwsess, tracks=hwfix["tracks"][:1]))
     check("home_blocks (c) WAITING, the MIGRATED shape (review of #132, 2nd pass): the same five course rows as board "
           "kind=session, no track running. Their declared questions count as WAITING ON YOU, the top block points at "
           "the band instead of claiming the board is clear or naming the last merge, and NEEDS YOU carries all five — "
           "a session with no question counts for nothing, and a waiting track plus asking sessions add up",
-          hws[4]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 5"
-          and hws[5]["text"]["text"] == "_nothing is running — what is waiting is above_"
+          hws[3]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 5"
+          and hws[4]["text"]["text"] == "_nothing is running — what is waiting is above_"
           and hws[1]["elements"][0]["text"] == "NEEDS YOU · 5"
           and hws[2]["text"]["text"].count("❓") == 5
           and "❓ [lesson] *course1* · which syllabus should I b…" in wstxt
           and "🏃" not in wstxt and "RUNNING" not in wstxt.replace("NOTHING RUNNING", "")
           and "the board is clear" not in wstxt and "✅ last" not in wstxt
-          and hwmix[4]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 6"
+          and hwmix[3]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 6"
           and hwmix[1]["elements"][0]["text"] == "NEEDS YOU · 6"
-          and htexts(home_blocks(dict(hwsess, sessions=[{"repo": "lesson", "name": "course1", "live": True,
+          and htexts(hblocks(dict(hwsess, sessions=[{"repo": "lesson", "name": "course1", "live": True,
                                                          "ask": ""}])))[1] == "✅ last: abox/old · merged 08:40"
-          and "WAITING ON YOU" not in json.dumps(home_blocks(dict(hwsess, sessions=[{"repo": "lesson", "name": "course1",
+          and "WAITING ON YOU" not in json.dumps(hblocks(dict(hwsess, sessions=[{"repo": "lesson", "name": "course1",
                                                                                       "live": True, "ask": ""}]))))
     check("home_blocks: …and one waiting track is not the same as one BLOCKED track — the blocked one is off his list "
           "(it stopped, it is not asking) and is never counted as waiting on him",
-          json.dumps(home_blocks({"box": "abox", "now": "10:15", "units": [], "load": "", "channels": [],
+          json.dumps(hblocks({"box": "abox", "now": "10:15", "units": [], "load": "", "channels": [],
                                   "waits": [], "quick": [], "boot": "", "last": None,
                                   "tracks": [{"state": "blocked", "name": "r/t", "detail": "—", "rank": 2,
                                               "reason": ""}]}), ensure_ascii=False).count("WAITING ON YOU") == 0)
@@ -4390,16 +4165,15 @@ def run_selfcheck():
     check("home_blocks: TOTAL — a malformed state (a short unit tuple, an age that is not a number, a nameless track) "
           "still renders one valid view. The dashboard redraws every 5 s off live inputs; one bad field must cost a "
           "line, never the tab",
-          all(hbudget(home_blocks(j)) and hno_empty_header(home_blocks(j), limited=True) for j in hjunk))
-    check("home_blocks: pure and total — an empty state still renders one valid view (no crash, no band with nothing "
-          "in it, no button that acts on nothing)",
-          home_blocks(hfix) == hb and len(hempty) < len(hb) and hno_empty_header(hempty) and hbudget(hempty)
-          and hvocab(hempty) and htexts(hempty)[1] == "_the board is clear_"
-          and [e["action_id"] for b in hempty if b["type"] == "actions" for e in b["elements"]] == ["open_board"])
-    hbig = home_blocks(dict(hfix, tracks=[{"state": "running", "name": f"abox/t{i}", "detail": "3 it · $1.20 · commit!",
+          all(hbudget(hblocks(j)) and hno_empty_header(hblocks(j), limited=True) for j in hjunk))
+    check("home_parts: pure and total — an empty state still renders one valid view (no crash, no band with nothing "
+          "in it)",
+          hblocks(hfix) == hb and len(hempty) < len(hb) and hno_empty_header(hempty) and hbudget(hempty)
+          and hvocab(hempty) and htexts(hempty)[1] == "_the board is clear_")
+    hbig = hblocks(dict(hfix, tracks=[{"state": "running", "name": f"abox/t{i}", "detail": "3 it · $1.20 · commit!",
                                            "rank": 0} for i in range(90)]))
-    check("home_blocks: a 90-track board still publishes one view inside every cap (≤%d blocks, ≤3000 chars a text)"
-          % HOME_MAXBLK, hbudget(hbig) and "more running_" in json.dumps(hbig, ensure_ascii=False))
+    check("home_parts: a 90-track board still renders one view of text blocks, its running list behind home_list's valve",
+          hbudget(hbig) and "more running_" in json.dumps(hbig, ensure_ascii=False))
     # ── THE CLOCK (owner, 2026-09-01: "why do all time stamps have a Z after them? And why are some still in
     #    UTC"). Everything the box WRITES INTO SLACK is HH:MM in the owner's zone with no Z; every log, journal,
     #    board file and record it keeps is UTC and ends in Z. cc-time decides the zone and is the only renderer.
@@ -4470,14 +4244,14 @@ def run_selfcheck():
           fb == [hlt(hE), hlt(hB), hlt(hI), "not a stamp"] and fb_card == hlt(hE)
           and fb_boot == f"last boot {hlt(hB)} (power cut)" and bool(re.fullmatch(r"\d\d:\d\d", fb_now)))
     htz = tempfile.mkdtemp(); real_dir_tz = DIR
-    try:                                          # the tab as published, beside the record OF that publish
+    try:                                          # the view as written, beside the record OF that write
         globals()["DIR"] = htz
         home_dump(hfix)
         hd = json.load(open(f"{htz}/home.json"))
     finally:
         globals()["DIR"] = real_dir_tz
-    check("the tab the owner reads carries no HH:MMZ anywhere — while home.json, the record cc-secretary reads "
-          "it out of, is stamped UTC and still ends in Z",
+    check("the bands the owner reads carry no HH:MMZ anywhere — while home.json's own `at`, the record's stamp, "
+          "is UTC and still ends in Z",
           not re.search(r"\d\d:\d\dZ", json.dumps(hd["text"], ensure_ascii=False))
           and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", hd["at"]))
     check("an approval card landed before the stamps went local is still recognised as landed, so it is not "
@@ -4487,56 +4261,67 @@ def run_selfcheck():
           and not LANDED_RE.search("[myrepo] PR #7: gate  ·  :+1: from the owner merges (squash)"))
     check("home_clip: the glance gets the fact, the log keeps the diagnosis",
           home_clip("a" * 20 + " " + "b" * 200, 180).endswith("…") and len(home_clip("x y z", 180)) == 5)
-    # ── the button gate: the Home tab is published PER USER, so a member gets their own copy of these buttons
-    dmA = Daemon(use_slack=False); dmA.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmA.use_slack = True
-    hacted, hdms = [], []
-    dmA.home_act = lambda aid, val, user: hacted.append((aid, val, user))
-    dmA.dm_user = lambda user, text: hdms.append((user, text))
-    press = lambda uid, aid, val="": dmA.on_action({"type": "block_actions", "user": {"id": uid},
-                                                    "actions": [{"action_id": aid, "value": val}]})
-    with contextlib.redirect_stderr(io.StringIO()):
-        press("UMEMBER", "restart_unit", "cc-slackd")
-        refused = not hacted and len(hdms) == 1 and hdms[0][0] == "UMEMBER" and "owner" in hdms[0][1]
-        press("UOWNER", "restart_unit", "cc-slackd")
-        press("UOWNER", "rm_rf", "/")                      # not one of ours: nothing runs, nobody is written to
-        dmA.cfg = {}; press("UANY", "restart_unit", "cc-slackd")     # unpaired box: there is no owner, so nobody may act
-    check("Home buttons are gated on the OWNER's user id — a member pressing Restart gets a refusal and NOTHING runs; an "
-          "action_id we never published does nothing; an unpaired box lets nobody act (a button is not a permission)",
-          refused and hacted == [("restart_unit", "cc-slackd", "UOWNER")] and len(hdms) == 2
-          and home_allowed("U1", "U1") and not home_allowed("U1", "U2") and not home_allowed("U1", "")
-          and not home_allowed("", "") and not home_allowed(None, None)
-          and set(HOME_ACT) == {"restart_unit", "open_board", "next_track", "home_logs",
-                                "board_todo", "board_running", "board_done"})
+    # ── NO APP HOME TAB (owner, 2026-09-18: "dont u know the dashboard is up??"): the daemon writes home.json for the
+    #    dashboard and publishes nothing; the tab Slack still shows (the manifest enables it) gets ONE line at start.
+    dmW = Daemon(use_slack=False); dmW.cfg = {}
+    dmW.home_state = lambda: dict(hfix)
+    wcalls = []
+    globals()["api"] = lambda m, t, **kw: wcalls.append(m) or {"ok": True}
+    try:                                                       # under the run's redirected DIR (the last case reads it back)
+        dmW.write_home()
+        whd = json.load(open(f"{DIR}/home.json"))
+        dmW.home_state = lambda: (_ for _ in ()).throw(RuntimeError("tmux gone"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            dmW.write_home()                                   # a state that fails leaves the last file, raises nothing
+        whd2 = json.load(open(f"{DIR}/home.json"))
+    finally:
+        globals()["api"] = real_api
+    check("write_home: home.json is written whole with NO Slack — no token, no owner, not one API call — text by "
+          "band and the state behind it; a state that fails to build is one log line and the last file stays",
+          not wcalls and whd["state"]["box"] == "abox" and "NEEDS YOU · 1" in whd["text"]["needs"]
+          and whd["text"]["backlog"].count("⏳") == 10 and "chart" not in whd["state"] and whd2 == whd)
     dmH = Daemon(use_slack=False); dmH.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmH.use_slack = True
     dmH.home_state = lambda: dict(hfix)
     hsaid, hcalls = [], []
     dmH.say = lambda chat, text, thread=None, mail=True: hsaid.append(text)
     globals()["api"] = lambda m, t, **kw: hcalls.append((m, kw.get("user_id"), kw.get("view"))) or {"ok": True}
     try:
-        dmH.publish_home()
-        one = len(hcalls) == 1 and hcalls[0][:2] == ("views.publish", "UOWNER") and json.loads(hcalls[0][2])["type"] == "home"
-        dmH.on_event({"type": "app_home_opened", "user": "UOWNER", "tab": "home"})     # opening the tab republishes, never posts
-        opened = len(hcalls) == 2 and not hsaid
+        dmH.retire_home_tab()
+        rview = json.loads(hcalls[0][2]) if hcalls else {}
+        dmH.on_event({"type": "app_home_opened", "user": "UOWNER", "tab": "home"})     # opening the tab does nothing now
+        dmH.cfg["CC_DIGEST_LINK"] = "https://dash.example"; dmH.retire_home_tab()
+        rlinked = json.loads(hcalls[-1][2])["blocks"][0]["text"]["text"] if len(hcalls) == 2 else ""
+        dmH.cfg["CC_DIGEST_LINK"] = "the Home tab"; dmH.retire_home_tab()      # not an https URL: no link
+        rplain = json.loads(hcalls[-1][2])["blocks"][0]["text"]["text"] if len(hcalls) == 3 else ""
+        dmU = Daemon(use_slack=False); dmU.cfg = {}; dmU.use_slack = True; dmU.retire_home_tab()   # unpaired: nothing
         globals()["api"] = lambda m, t, **kw: (_ for _ in ()).throw(RuntimeError("views.publish: missing_scope"))
-        with contextlib.redirect_stderr(io.StringIO()):
-            for _ in range(4):
-                dmH.publish_home()
-        dmU = Daemon(use_slack=False); dmU.cfg = {}; dmU.use_slack = True; dmU.publish_home()   # unpaired: nothing at all
+        rlog = io.StringIO()
+        with contextlib.redirect_stderr(rlog):
+            dmH.retire_home_tab()                                # a refusal is one line, never a retry loop or a raise
     finally:
         globals()["api"] = real_api
-    check("publish_home: one views.publish to the owner's home tab, and app_home_opened republishes it — never a message",
-          one and opened)
-    check("publish_home: a missing scope disables the dashboard after 3 failures (no error loop), unpaired publishes nothing",
-          dmH.home_off and dmH.home_fails == 3 and not hsaid and dmU.home_fails == 0)
-    dmHB = Daemon(use_slack=False); dmHB.home_at = 1000.0; dmHB.home_dirty = False; dmHB.home_burst_until = 0.0
+    check("retire_home_tab: ONE views.publish of one text block that says the tab is retired and points at the "
+          "dashboard — a link when CC_DIGEST_LINK is an https URL, `cc digest` in words otherwise — never a message; "
+          "app_home_opened publishes nothing; an unpaired box publishes nothing; a refusal is one log line",
+          len(hcalls) == 3 and all(c[:2] == ("views.publish", "UOWNER") for c in hcalls)
+          and rview.get("type") == "home" and len(rview.get("blocks") or ()) == 1
+          and rview["blocks"][0]["type"] == "section" and "retired" in rview["blocks"][0]["text"]["text"]
+          and "cc digest" in rview["blocks"][0]["text"]["text"] and "<http" not in rview["blocks"][0]["text"]["text"]
+          and "<https://dash.example|the dashboard>" in rlinked
+          and "<http" not in rplain and "cc digest" in rplain
+          and not hsaid and "could not retire" in rlog.getvalue() and rlog.getvalue().count("\n") == 1)
+    src_tab = open(__file__).read()                             # __file__ is cc-slack: the tool's own text
+    check("…and nothing else in the daemon publishes a view or answers a button: one views.publish in the whole tool "
+          "(the retirement line), no block_actions handler, no app_home_opened branch",
+          src_tab.count("views.publish") == 1 and "block_actions" not in src_tab
+          and "app_home_opened" not in src_tab
+          and "def on_action" not in src_tab and "def publish_home" not in src_tab)
+    dmHB = Daemon(use_slack=False); dmHB.home_at = 1000.0; dmHB.home_dirty = False
     quiet = dmHB.home_due(1010.0); heartbeat = dmHB.home_due(1030.0)
     dmHB.home_dirty = True; ev_fast = dmHB.home_due(1001.0); ev_2s = dmHB.home_due(1002.0)
-    dmHB.home_dirty = False; dmHB.home_burst_until = 1061.0
-    burst_too_soon = dmHB.home_due(1000.0 + HOME_FAST - 0.5); burst = dmHB.home_due(1000.0 + HOME_FAST)
-    dmHB.home_at = 1061.0; after = dmHB.home_due(1061.0 + HOME_FAST)
-    check(f"App Home cadence: every {HOME_FAST} s while the tab is open (60 s after app_home_opened), ~2 s after an event, "
-          "30 s heartbeat, never faster — owner rule",
-          not quiet and heartbeat and not ev_fast and ev_2s and burst and not burst_too_soon and not after)
+    check("home.json cadence: ~2 s after an event, 30 s heartbeat, never faster — no fast lane, since nobody is "
+          "watching a tab",
+          not quiet and heartbeat and not ev_fast and ev_2s)
     _cc = dict(_CACHE); _CACHE.clear()
     hitsCA = []
     v1 = cached("t", 5, lambda: hitsCA.append(1) or "a")
@@ -4613,12 +4398,12 @@ def run_selfcheck():
     check("queued messages survive a daemon restart (queue.json) — an owner request was lost to an in-memory queue on 2026-08-27",
           [e[1]["content"] for e in dmQ2.queues.get("repoq", [])] == ["keep me"])
     dmQ.queues.clear(); dmQ.save_queues()
-    hbQ = home_blocks({"box": "abox", "now": "1", "quick": [{"when": "20:01", "status": "doing", "repo": "r", "text": "y"}]})
+    hbQ = hblocks({"box": "abox", "now": "1", "quick": [{"when": "20:01", "status": "doing", "repo": "r", "text": "y"}]})
     txtQ = json.dumps(hbQ, ensure_ascii=False)
     check("Home: a quick task with no track is running work — it is listed in the running band, in the "
           "🔧 notation, and absent when there are none",
           hbQ[2]["text"]["text"] == "🔧 *r* · y · since 20:01" and "🔧" in txtQ
-          and "🔧" not in json.dumps(home_blocks({"box": "abox", "now": "1"}), ensure_ascii=False))
+          and "🔧" not in json.dumps(hblocks({"box": "abox", "now": "1"}), ensure_ascii=False))
     import tempfile as _tfq
     qf = _tfq.NamedTemporaryFile("w", delete=False, suffix=".log"); nowq = int(time.time())
     qf.write(f"{nowq-300}\tdoing\tr\tlong task\n{nowq-200}\tdoing\tr\tother\n{nowq-100}\tdone\tr\tlong task\n"); qf.close()
@@ -4876,7 +4661,7 @@ def run_selfcheck():
     check("Home: sub channels sit under their parent (depth = indent level), parents by name, children by creation; an "
           "archived orch channel is off the dashboard",
           orderH == [("CPAR", "myrepo", 0), ("CORCH", "myrepo-cctest-ghih", 1), ("CSUB", "myrepo-cctest-helper-m3x1", 2), ("CZ", "zeta", 0)])
-    hbO = home_blocks({"box": "b", "now": "1", "channels": [{"name": n, "depth": d, "session": "🔧 working"} for _, n, d in orderH]})
+    hbO = hblocks({"box": "b", "now": "1", "channels": [{"name": n, "depth": d, "session": "🔧 working"} for _, n, d in orderH]})
     txtO = next(b["text"]["text"] for b in hbO if b["type"] == "section" and "#myrepo" in b["text"]["text"])
     check("Home: a sub channel is rendered indented under its parent row (↳), a top-level one is not, and the indent is "
           "NON-BREAKING spaces per level — Slack collapses the ordinary ones, so four spaces rendered as none",
@@ -5617,7 +5402,7 @@ def run_selfcheck():
           and home_needs({"tracks": [ltr]})[0].startswith(f"❓ [r] *<{lpr['url']}|t>* · owner 👍")
           and home_needs({"tracks": [dict(ltr, pr=None)]})[0].startswith("❓ [r] *t* · owner 👍")
           and home_needs({"tracks": [dict(ltr, state="blocked", pr=None)]})[0].startswith("⛔ [r] *t* · owner 👍"))
-    lrun = lambda url: next(b["text"]["text"] for b in home_blocks({"box": "b", "now": "1", "tracks": [
+    lrun = lambda url: next(b["text"]["text"] for b in hblocks({"box": "b", "now": "1", "tracks": [
         {"state": "running", "name": "a/b", "detail": "1 it · $0.50 · PR #3", "pr": {"num": "3", "repo": "a", "url": url}}]})
         if b["type"] == "section")
     check("home: a running track's `PR #n` bit is a link to the PR when the board knows its url, plain when it does not, "
@@ -5645,16 +5430,15 @@ def run_selfcheck():
           (l1, l2, l3, l4) == (lURL, lURL, "", "") and lcalls[:2] == [("C1", "1"), ("C2", "2")]
           and lcards == {"r#9": lURL, "q#2": lURL} and lkept == {"old#1": "x"} and lnone == {"old#1": "x"}
           and len(lcalls) == 4)
-    check("home: the channel list never shows VITALS_STORE or a channel whose only member is the bot — by name and id in "
-          "home_chan_order, by member count at the slow refresh; a missing count keeps the channel",
-          home_chan_order([("C1", "abox"), ("CV", VITALS_STORE), ("CX", "solo")], {}, hide=("CX",)) == [("C1", "abox", 0)]
-          and home_chan_order([("CV", VITALS_STORE), ("C1", "abox")], {}) == [("C1", "abox", 0)]
-          and home_chan_order([("C1", "abox")], {}, hide=("",)) == [("C1", "abox", 0)]
+    check("home: the channel list never shows VITALS_STORE, a blank id, or a channel whose only member is the bot — by name "
+          "in home_chan_order, by member count at the slow refresh; a missing count keeps the channel",
+          home_chan_order([("CV", VITALS_STORE), ("C1", "abox")], {}) == [("C1", "abox", 0)]
+          and home_chan_order([("C1", "abox"), ("", "blank")], {}) == [("C1", "abox", 0)]
           and [home_chan_keep(c) for c in ({"is_member": True, "name": "abox"}, {"is_member": True, "name": "x", "num_members": 1},
                                            {"is_member": True, "name": VITALS_STORE, "num_members": 5},
                                            {"is_member": False, "name": "y", "num_members": 3}, {"is_member": True, "name": "z", "num_members": 2})]
               == [True, False, False, False, True]
-          and VITALS_STORE not in json.dumps(home_blocks({"box": "b", "now": "1", "channels": [
+          and VITALS_STORE not in json.dumps(hblocks({"box": "b", "now": "1", "channels": [
               {"name": n, "depth": d, "session": "⚪ none", "marks": {}} for _, n, d in
               home_chan_order([("C1", "abox"), ("CV", VITALS_STORE)], {})]}), ensure_ascii=False))
     lband = home_needs(hfix)                                 # the reference tab's own NEEDS YOU band
@@ -6481,8 +6265,8 @@ def run_selfcheck():
           and any(k == "sweep" for k, *_ in deferred) and any(k == "publish" for k, *_ in deferred))
     Daemon.queue_land, Daemon.land_sweep = real_queue_land, real_land_sweep
     Daemon.publish_soon = real_publish_soon
-    check("selfcheck: the Home dump of a fixture tab landed under the redirected DIR, never in the live ~/.cc/state "
-          "(a fixture tab reached cc-secretary as the owner's view once, 2026-09-01)",
+    check("selfcheck: the home.json of a fixture view landed under the redirected DIR, never in the live ~/.cc/state "
+          "(a fixture view reached a reader as the owner's own once, 2026-09-01)",
           os.path.exists(f"{DIR}/home.json") and json.load(open(f"{DIR}/home.json"))["state"].get("box") == "abox")
     denied = list(EFFECTS.denied)
     real_effects.install()
@@ -6513,7 +6297,7 @@ def run_selfcheck():
         ftr, _, _ = home_tracks({f"{repo}/w1": {"state": "waiting", "board": "waiting", "waiting_on": "person",
                                                 "why": "push refused: origin/track"} for repo in ("abox", "_cctest99999999", "_ccsbx99999999")}, {})
         fneeds = "\n".join(home_needs({"tracks": ftr}))
-        fbrows, fboards = home_board_rows(), [os.path.basename(fn) for fn, _ in home_boards()]
+        fboards = [os.path.basename(fn) for fn, _ in home_boards()]
         own = f"_cctest{os.getpid()}"                    # …and INSIDE its run (our own pid: the suite reading its board) it is one
         json.dump({"repo": own, "tracks": {}}, open(f"{hr}/.cc/boards/{own}.json", "w"))
         fown = [os.path.basename(fn) for fn, _ in home_boards()]
@@ -6531,11 +6315,10 @@ def run_selfcheck():
         globals()["HOME"] = _homeR
         subprocess.run(["rm", "-rf", hr], check=False)
     check("home_boards: a `_cctest<pid>` board is a selftest fixture, not a board — every tab input reads boards through "
-          "this one pass, so its waiting row never reaches NEEDS YOU, RUNNING or a board view, while the real one's does; "
+          "this one pass, so its waiting row never reaches NEEDS YOU or RUNNING, while the real one's does; "
           "a leaked `_ccsbx<pid>` is hidden on the same rule (cc-board `reals`), and myrepo_cctesting is a board",
           fboards == ["abox.json", "myrepo_cctesting.json"] and [t["name"] for t in ftr] == ["abox/w1"]
-          and fneeds.count("❓") == 1 and "push refused" in fneeds and "_cctest" not in fneeds and "_ccsbx" not in fneeds
-          and [r[0] for r in fbrows] == ["abox"])
+          and fneeds.count("❓") == 1 and "push refused" in fneeds and "_cctest" not in fneeds and "_ccsbx" not in fneeds)
     check("home_boards: a `_cctest<pid>` board IS a board to a process under <pid> — the same rule as cc-board `real`, so "
           "a suite reading its own board sees it while this daemon, never under a suite, does not",
           fown == [f"{own}.json", "abox.json", "myrepo_cctesting.json"])

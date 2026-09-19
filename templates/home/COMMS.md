@@ -30,7 +30,7 @@ Litmus: needs a decision → ❓ + mention · needs a tap → approvals · notab
 3. **Phone app → Code → session** — the *same* session with its live screen, for long pastes, approvals, or stopping it.
 4. **`ssh` + `cc <repo>`** — the same session again, in tmux. Slack, the app and the terminal are one conversation per project.
 5. **Hands-off** — in `#<repo>`: "dispatch a worker on track *name* to do *X*", or `cc <repo> <track> --go "X"`. Own branch, ends in a PR and a ping. Nothing merges without you.
-6. **Home tab** — tap the bot in the Slack sidebar: what is running, what needs you, every track's cost and PR. Live and read-only.
+6. **Dashboard** — the web page off `~/.cc/state/home.json`: what is running, what needs you, every track's cost and PR. Live and read-only.
 
 ## Who answers
 | Agent | Reach it | Does |
@@ -60,7 +60,7 @@ Split by **kind**, not by the surface the text appeared on. Answering is `~/CLAU
 - Nothing marks a thread root or nudges you: a reply that needs your decision opens with ❓ and mentions you, and that is the whole signal. `!restart <target>` if a session looks wedged.
 - On your message: 👀 it has it · a reaction back is its answer (👍 yes, or done with nothing to say · 👎 no · ✅ done · ❌ can't · 🤔 unclear) · "⏳ starting…" queued until the session is up.
 - A reaction on a session's message reaches it as `👍 on your 07:12 reply: "…"` — 👍 act, don't ask again · 👎 no.
-- Your 📌 on any message marks the thread "revisit": not an ask, nothing nags, nothing counts it as owed — it is kept until you take the 📌 off, shown on the Home tab (TO REVISIT), in the daily digest and by `cc-slack revisit`.
+- Your 📌 on any message marks the thread "revisit": not an ask, nothing nags, nothing counts it as owed — it is kept until you take the 📌 off, shown on the dashboard (TO REVISIT), in the daily digest and by `cc-slack revisit`.
 
 ## Who may do what
 - **A 🔐 permission prompt from a MEMBER workspace goes to `#<control repo>-threads`**, not to her own channel: a member cannot answer one, so a prompt left there waits on the owner happening to look (a session sat blocked on `Bash(curl:*)` twice on 2026-09-08). `yes <id>` / `no <id>` in that thread still reaches HER session — the answer is routed by request id, not by the channel — and the session reading that lane can answer it in place with `cc slack permission <id> yes|no`, which says in the thread what it decided and who did. Every other target's prompt goes where it always did.
