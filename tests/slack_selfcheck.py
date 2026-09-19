@@ -5254,6 +5254,7 @@ def run_selfcheck():
         dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.1", "user": "UALICE",
                       "text": "new project todo", "channel_type": "channel"})
         made4 = sorted(fkm.created)
+        np_said = [t for t in saidw if t.startswith("`alice-b/todo`")]   # what the member was told about the pair
         routed_p = dmw.route(fkm.chans.get("alice-b--todo", "?"), "channel")
         dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.2", "user": "USTRANGER",
                       "text": "new project sneaky", "channel_type": "channel"})
@@ -5346,8 +5347,13 @@ def run_selfcheck():
         started = [t for t in dmw.queues if dmw.queues[t]] == ["alice-b"] and starts_w == ["alice-b"] \
             and dmw.queues["alice-b"][0][1]["meta"].get("authority") == "instructions"
         owner_in_all = all("UOWNER" in fkm.invites.get(n, []) for n in fkm.created)   # every channel the box made, whoever it was for
-        member_in_all = (all("UALICE" in fkm.invites.get(n, []) for n in fkm.created if n.startswith("alice-b"))
+        member_in_all = (all("UALICE" in fkm.invites.get(n, []) for n in fkm.created
+                             if n.startswith("alice-b") and not n.endswith(f"-{UPDATES}"))
                          and "UERIN01" in fkm.invites.get("erin", []))
+        # THE -UPDATES LANE IS THE OWNER'S AMBIENT VIEW ALONE: every -updates channel the box made in this
+        # whole run, for any member, holds the owner and nobody else — the member is never carried in from
+        # #<handle> or #<handle>--<sub>, which it inherits its people from.
+        updates_owner_only = all(set(fkm.invites.get(n, [])) <= {"UOWNER"} for n in fkm.created if n.endswith(f"-{UPDATES}"))
         # BEFORE THE MINT: the workspace has no credential, autostart says so, and the member is answered in their own
         # thread — every message. The CHANNEL is told once, by `cc`; this half is what stops a member talking to a wall.
         dmw.autostart = lambda t, **k: "no-credential"
@@ -5379,11 +5385,16 @@ def run_selfcheck():
           routed == "alice-b" and routed_p == "alice-b/todo")
     check("`new project todo` in the member's own channel creates #alice-b--todo and its updates lane…",
           made4 == sorted(made1 + ["alice-b--todo", "alice-b--todo-updates"]))
+    check("…and the reply names #alice-b--todo as the member's and the -updates lane as the owner's — never a channel "
+          "the member cannot open as theirs",
+          len(np_said) == 1 and "#alice-b--todo is yours" in np_said[0]
+          and "#alice-b--todo-updates is the owner's lane" in np_said[0] and "are yours" not in np_said[0])
     check("…but only for the workspace's own member or the owner: anyone else in the channel creates nothing",
           made5 == made4 and any("own member or the owner" in t for t in saidw))
-    check("THE OWNER IS IN EVERY CHANNEL THE BOX MADE, and so is the member",
-          owner_in_all and member_in_all and len(fkm.created) == 14)   # alice, alice--todo, erin, frank, grace,
-                                                                       # henry, ivy pairs
+    check("THE OWNER IS IN EVERY CHANNEL THE BOX MADE, and so is the member — in #<handle> and its sub-projects, "
+          "never in an -updates lane, which holds the owner alone",
+          owner_in_all and member_in_all and updates_owner_only and len(fkm.created) == 14)   # alice, alice--todo, erin, frank, grace,
+                                                                                               # henry, ivy pairs
     check("a plain message in a member's channel reaches its SESSION — queued for alice-b with authority=instructions and "
           "autostart asked (cc puts that session inside the boundary); the daemon no longer answers it itself", no_session and started)
     check("a message that arrives before the workspace is minted is answered IN ITS OWN THREAD, every time, with the "
