@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # cc-limit — LLM-free detection of Claude usage/rate limits, and one shared "wait until it resets" stamp.
-#   cc-limit check <claude-json> [<stderr-file>]   prints "LIMIT <epoch>" + exit 0 when that run hit a limit, else exit 1
-#                      (a run refused for usage credits is exit 1 too: one model this account cannot run is not a
-#                      limit — cc-model is told it is unavailable and moves the box off it; see USAGE CREDITS below;
-#                      a MONTHLY SPEND CAP is a limit no reset lifts: the backoff stamp, source `spend-cap`, and the
-#                      owner told once per episode that only raising it clears it — see A SPEND CAP IS NOT LIFTED)
+#   cc-limit check <claude-json> [<stderr-file>] [<asked-model>]   prints "LIMIT <epoch>" + exit 0 when that run hit
+#                      a limit, else exit 1. A run refused for USAGE CREDITS or by the MONTHLY SPEND CAP is exit 1 too:
+#                      that is one model this account cannot run right now, not a limit — no stamp, nothing waits;
+#                      cc-model is told it is unavailable, moves the work bound to it off it, and tells the owner once
+#                      per episode what lifts it (see USAGE CREDITS below). <asked-model> is the model the run was
+#                      dispatched on, for a message that names none (the cap line does) — cc-loop passes it.
 #   cc-limit status    "usage limit until HH:MMZ (Nm left)" + exit 0 when the stamp binds THIS caller, else
 #                      "clear" + exit 1 (with a note on stderr when a stamp exists that does not bind it)
 #   cc-limit wait      sleep until the stamp expires (exit 0); exit 1 if the wait would exceed CC_LIMIT_MAX_WAIT;
@@ -802,7 +803,7 @@ EOF
   t '…in words cc-land cannot read back as a live limit out of its merged stdout+stderr' \
     "$(grep -cE 'usage limit until [0-9]{2}:[0-9]{2}Z' <<<"$out")" 0
   t 'a run the stamp does not bind has nothing to wait for' "$(me "$t6" wait >/dev/null 2>&1; echo $?)" 0
-  t 'and one run does not move the box off its model either' "$(calls '^model ')" 0
+  t 'and one run does not move the box off its model either' "$(calls '^model (limited|unavailable)')" 0   # `status` asks cc-model too, and that is no move
   me $((t6 + 60)) check "$d/run.json" >/dev/null 2>&1   # a SECOND worker hits the same limit
   t 'two runs on the same limit make it account-wide' \
     "$(cut -f5 "$d/.cc/state/claude-limit" | tr ',' '\n' | grep -c .)" 2
@@ -878,18 +879,18 @@ EOF
   : > "$d/calls"; me "$t6" check "$d/credits2.json" >/dev/null 2>&1; rc=$?
   t 'out of usage credits (2026-08-28) is the same: no stamp, and the model is the run'"'"'s own, not the side-call' \
     "$rc$([ -e "$d/.cc/state/claude-limit" ] && echo yes || echo no)$(grep -c "^model unavailable fable You're out of usage credits$" "$d/calls")" 1no1
-  # A MONTHLY SPEND CAP IS NOT A WEEKLY LIMIT (2026-09-09 06:41Z): the reset the line names is the weekly limit's,
-  # and the cap lifts only when the owner raises it. Own fixture: no stamp, the line verbatim with a reset 22 h out.
+  # A MONTHLY SPEND CAP IS THE SAME KIND AS USAGE CREDITS (owner, 2026-09-15): the reset the line names is the
+  # weekly limit's and does not lift the cap; the model that draws on credits is out, the others answer. Own
+  # fixture: the line verbatim with a reset 22 h out, naming no model — the run's asked model is the one.
   rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.disbelieved"; : > "$d/calls"; OBS=worker-f
   printf '{"is_error":true,"result":"You'"'"'ve hit your monthly spend limit · raise it at claude.ai/settings/usage · your weekly limit resets %s (UTC)"}\n' \
     "$(date -u -d "@$((t6 + 79200))" +%H:%M)" > "$d/cap.json"
-  out=$(me "$t6" check "$d/cap.json" 2>/dev/null); rc=$?
-  t 'a monthly spend cap is a limit (exit 0, LIMIT printed) but NOT one the named weekly reset lifts: the stamp is the 5-minute backoff, tagged spend-cap' \
-    "$rc:${out#LIMIT }:$(cut -f2 "$d/.cc/state/claude-limit")" "0:$((t6 + 300)):spend-cap:5"
-  t '…and the owner is told once that a cap only he can raise stopped the box' "$(grep -c '^notify .*spend cap' "$d/calls")" 1
-  me $((t6 + 400)) check "$d/cap.json" >/dev/null 2>&1
-  t '…the next probe on the same cap doubles the backoff and does not tell him again' \
-    "$(cut -f1,2 "$d/.cc/state/claude-limit")$(grep -c '^notify .*spend cap' "$d/calls")" "$(printf '%s\tspend-cap:10' $((t6 + 1000)))1"
+  out=$(me "$t6" check "$d/cap.json" '' 'claude-fable-5-1[1m]' 2>/dev/null); rc=$?
+  t 'a monthly spend cap is not a limit (exit 1, no LIMIT, no stamp): the weekly reset it quotes is not its lift, and nothing waits on it' \
+    "$rc:$out:$([ -e "$d/.cc/state/claude-limit" ] && echo stamp || echo none)" "1::none"
+  t '…the line names no model, so the model the run was dispatched on is recorded — cc-loop passes it' \
+    "$(grep -c "^model unavailable fable You've hit your monthly spend limit$" "$d/calls")" 1
+  t '…and cc-limit does not tell the owner itself: cc-model does, once per episode, with what lifts it' "$(grep -c '^notify' "$d/calls")" 0
   # …while a real limit whose text names no model is still caught, still shared, and names the right family
   printf '{"is_error":true,"api_error_status":429,"result":"Claude usage limit reached. Your limit resets at %s","modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":9},"claude-opus-5":{"inputTokens":2}}}\n' \
     "$(date -u -d "@$((t6 + 1800))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/opuslim.json"
@@ -1000,6 +1001,10 @@ EOF
 case "${1:-}" in
   clear) rm -f "$S" "$DISB"; exit 0 ;;
   status) if ! believe; then echo clear
+      # …and a model the account cannot run right now (usage credits, the spend cap) is not a limit and holds nobody,
+      # but a person reading `status` should still hear it — stderr, so a caller's "clear" is unchanged.
+      case "$([ -x "$BIN/cc-model" ] && "$BIN/cc-model" status 2>/dev/null)" in *'not available to this account'*)
+        printf 'note: %s — not a limit: nothing waits; work bound to it runs on the next model and returns when it answers again.\n' "$("$BIN/cc-model" status 2>/dev/null)" >&2;; esac
       # A stamp that does not bind this caller is still worth SAYING — on stderr, where a person reading `cc-limit
       # status` sees it and a caller capturing stdout does not have its answer changed. NOT in the words "usage
       # limit until HH:MMZ": cc-land captures stdout and stderr together and reads that phrase out of the text as a
@@ -1020,7 +1025,7 @@ case "${1:-}" in
   *) sed -n '2,15p' "$0" >&2; exit 2 ;;
 esac
 # ---- check: is_error / a run that produced no result (a non-zero rc), AND limit wording somewhere in result or stderr
-j="${2:?usage: cc-limit check <claude-json> [<stderr-file>]}"; res=""
+j="${2:?usage: cc-limit check <claude-json> [<stderr-file>] [<asked-model>]}"; res=""; asked="${4:-}"
 res=$(jq -r '[.result?, .error?, .subtype?] | map(select(type == "string")) | join(" ")' "$j" 2>/dev/null)
 { [ "$(jq -r '.is_error // empty' "$j" 2>/dev/null)" = true ] || [ -z "$res" ]; } || exit 1
 txt="$res $(tail -c 4000 "${3:-/dev/null}" 2>/dev/null)"
@@ -1030,39 +1035,35 @@ txt="$res $(tail -c 4000 "${3:-/dev/null}" 2>/dev/null)"
 newm=$(grep -oiE 'claude-(fable|opus|sonnet|haiku)[a-z0-9._-]*|\b(fable|opus|sonnet|haiku)\b' <<<"$txt" | head -1 | tr 'A-Z' 'a-z')
 [ -n "$newm" ] || newm=$(jq -r '.modelUsage? // {} | keys[]?' "$j" 2>/dev/null | grep -iE 'fable|opus|sonnet' | head -1 | tr 'A-Z' 'a-z')
 case "$newm" in *fable*) newm=fable;; *opus*) newm=opus;; *sonnet*) newm=sonnet;; *haiku*) newm=haiku;; *) newm="";; esac
-# USAGE CREDITS ARE NOT A LIMIT. "Fable 5.1 requires usage credits" (2026-09-03, the account went Pro) and "You're out
-# of usage credits" (2026-08-28) say one model cannot be run on this account: no reset lifts that, and the other
-# models answer. Read as a limit, the first parked the whole box for 14 h on a model nobody else was using. So: no
-# stamp, cc-model records the model as unavailable and moves the box off it, and the caller reads "not a limit"
-# (exit 1) and walks the chain. Real limit wording beside it still wins: a limit hit with no credits left to
-# continue on is a limit.
+# USAGE CREDITS AND THE MONTHLY SPEND CAP ARE NOT A LIMIT — THEY ARE ONE MODEL THIS ACCOUNT CANNOT RUN RIGHT NOW.
+# "Fable 5.1 requires usage credits" (2026-09-03, the account went Pro), "You're out of usage credits" (2026-08-28) and
+# "You've hit your monthly spend limit · your weekly limit resets 10pm" (2026-09-09) all say the model that draws on
+# credits is out: no reset lifts that — the cap's line names the WEEKLY limit's reset, which is not the cap's lift;
+# credits, the cap raised at claude.ai/settings/usage, or a re-login do — and the other models answer. Read as a
+# limit, the first parked the whole box for 14 h on a model nobody else was using, and the cap parked the planning
+# seat for 14 h, three of them after the owner had raised it; until 2026-09-15 the cap still wrote a backoff stamp
+# every caller waited on. So: NO STAMP for any of them. cc-model records the model as unavailable, moves the work
+# bound to it to the next rung, brings it back when a probe answers as that model, and tells the owner once per
+# episode what lifts it; the caller reads "not a limit" (exit 1) and walks the chain. Real limit wording beside the
+# credits wording still wins: a limit hit with no credits left to continue on is a limit. The cap wins over the
+# reset it quotes (owner, 2026-09-15: "a Fable-only outage — 'requires usage credits', the monthly spend limit").
 LIMIT_RE='usage limit|rate limit|rate_limit|429|too many requests|overloaded|resets? (at )?'
 CREDITS_RE='usage credits|out of credits|insufficient credits'
-if grep -qiE "$CREDITS_RE" <<<"$txt" && ! grep -qiE "$LIMIT_RE" <<<"$txt"; then
+SPEND_RE='spend(ing)? limit|spend cap|monthly (spend|usage) (limit|cap)'
+if grep -qiE "$SPEND_RE" <<<"$txt" || { grep -qiE "$CREDITS_RE" <<<"$txt" && ! grep -qiE "$LIMIT_RE" <<<"$txt"; }; then
   why=$(jq -r '.result // "" | tostring' "$j" 2>/dev/null | head -1 | sed -E 's/(\. | · ).*//' | head -c 120)
+  if [ -z "$newm" ]; then   # the cap line names no model: it is the one the run was dispatched on (cc-loop passes it)
+    case "$(tr 'A-Z' 'a-z' <<<"$asked")" in *fable*) newm=fable;; *opus*) newm=opus;; *sonnet*) newm=sonnet;; *haiku*) newm=haiku;; esac; fi
   [ -n "$newm" ] && [ -x "$BIN/cc-model" ] && "$BIN/cc-model" unavailable "$newm" "$why" >/dev/null 2>&1
   exit 1
 fi
 grep -qiE "$LIMIT_RE" <<<"$txt" || exit 1
 parse_reset "$txt"
-# A SPEND CAP IS NOT LIFTED BY A RESET. "You've hit your monthly spend limit · raise it at claude.ai/settings/usage ·
-# your weekly limit resets 10pm" (2026-09-09 06:41Z) names a reset, and it is the WEEKLY limit's — the cap it
-# reports lifts when the owner raises it, and not before. Read as a limit until 10pm, it parked the planning seat
-# for 14 h, three of them after the owner had raised it. So the reset in the text is discarded, the stamp takes
-# the backoff below (the box re-probes, and clears itself the first time a call completes), the source says
-# `spend-cap`, and the owner is told ONCE per episode that a cap only he can raise is what stopped the box.
-SPEND_RE='spend(ing)? limit|spend cap|monthly (spend|usage) (limit|cap)'
-cap=""; grep -qiE "$SPEND_RE" <<<"$txt" && cap=1
 stamp; same=0; { [ "$first" -gt 0 ] && [ "$ends" -gt $((now - 900)) ]; } && same=1   # still the same limit episode
 [ "$same" = 1 ] || first=$now
-[ -n "$cap" ] && u=0   # the reset the message names is not this cap's lift
 if [ "$u" -le "$now" ]; then   # no time in the message: exponential backoff, remembered in the stamp (5, 10, 20, 40, 60 min)
-  b=5; [ "$same" = 1 ] && case "$src" in backoff:[0-9]*|spend-cap:[0-9]*) b=$(( ${src#*:} * 2 )); [ "$b" -gt 60 ] && b=60;; esac
-  u=$((now + b * 60)); how="backoff:$b"; [ -n "$cap" ] && how="spend-cap:$b"
-fi
-if [ -n "$cap" ] && [ "$same" != 1 ] && [ -x "$BIN/cc-notify" ]; then
-  "$BIN/cc-notify" -t "$(hostname -s) spend cap" \
-    "The monthly spend cap stopped a run; no reset lifts it. Raise it at claude.ai/settings/usage and the box picks up on its next probe." >/dev/null
+  b=5; [ "$same" = 1 ] && case "$src" in backoff:[0-9]*) b=$(( ${src#*:} * 2 )); [ "$b" -gt 60 ] && b=60;; esac
+  u=$((now + b * 60)); how="backoff:$b"
 fi
 [ -n "$newm" ] || newm="$mdl"   # same episode, a message that names no model: keep what we already knew
 [ "$same" = 1 ] || obs=""       # a new episode: the runs on the old stamp saw a different limit and do not vouch for this one

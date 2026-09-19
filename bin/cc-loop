@@ -44,6 +44,15 @@
 # A run that came back with NOTHING is rerun as the same iteration — not an error, not an iteration. A run that
 # committed or journalled COUNTS like any other; only the model changes (F4, refusal_step). Off the end of the chain:
 # with nothing to show it stops (10); with work, the work stands and the loop carries on, on the same model.
+# AN OUTAGE MOVES THE LOOP DOWN THE CHAIN, AND ITS LIFT MOVES IT BACK (owner, 2026-09-15). The model is resolved
+# every iteration through `cc-model resolve`: the one the dispatcher named, or the next rung while the box has that
+# one recorded as out (usage credits, the spend cap, a limit that moved the box). So a refusal the box KNOWS about
+# is not pinned here — the next iteration asks again and runs on Fable the moment Fable answers — and only a refusal
+# the box has no record of (the classifier stopped the turn, a reroute) pins the loop to the next rung as before.
+# Until 2026-09-15 every refusal pinned MODEL for the rest of the loop, so a loop moved to Opus stayed on Opus.
+# The next fresh context is TOLD which of those happened, in one journal line, and only when an outage really began
+# or really lifted (model_change_note). A model that merely CHANGED says nothing: the commonest dispatch names no
+# --model and follows the box override, so an outage beginning changes it too, and a reroute has its own line.
 # A STOP GOES TO THE SESSION THAT DISPATCHED THE TRACK, and to the owner only as an ambient line. Every stop below
 # is a technical question — a cap, a runaway, a `cc done` that failed, a worker asking something — and the planning
 # session is the one that can answer it. Until 2026-09-07 stop() paged the owner at high priority and told that
@@ -91,9 +100,13 @@ worker_model(){   # $1 the dispatcher's --model, if any -> the model this worker
                   # default (Fable) while the policy said workers run on Opus, because only the override was passed on.
                   # `cc-model forced`, NOT `current`: since 2026-09-07 `current` also names the primary, and asking it
                   # here would hand every unmodelled worker the interactive primary again -- the 09-01 bug, back.
-  local m="${1:-}"
+  local m="${1:-}" r
   [ -n "$m" ] || m=$("$BIN/cc-model" forced 2>/dev/null)
   [ -n "$m" ] || m=$("$BIN/cc-config" get CC_WORKER_MODEL claude-opus-5)
+  # …and then the rung it runs on NOW: itself, or the next one while the box has it recorded as out (see the header).
+  # `asked` as $2 skips that step — the model as dispatched, for the journal line that says why it is not running on it.
+  [ "${2:-}" = asked ] && { printf '%s\n' "$m"; return 0; }
+  r=$("$BIN/cc-model" resolve "$m" 2>/dev/null); [ -n "$r" ] && m="$r"
   printf '%s\n' "$m"; }
 refusal_note(){   # $1 iteration · $2 the model that refused · $3 the one it moved to ("" = the chain ends here)
                   # $4 why · $5 kept|rerun|stopped → the journal's own line, for the next fresh context to read
@@ -106,6 +119,39 @@ refusal_note(){   # $1 iteration · $2 the model that refused · $3 the one it m
     *)       printf -- '- cc-loop: iteration %s was refused or rerouted on %s (%s) with nothing to show for it — switched to %s per the cc-model chain and reran it. The model would not do the work; the task and the journal below are unchanged.\n' \
                "$1" "${2:-the box default}" "$4" "$3";;
   esac; }
+model_outage_why(){   # $1 the model this iteration runs on · $2 the model as dispatched → the outage that moved it
+                     # off $2, or nothing. ASKED EVERY ITERATION, not only on the ones that changed model: an outage
+                     # already in force when the loop started changes nothing between iteration 1 and 2, and the lift
+                     # at iteration 3 still has to know that 2 was moved by it. `out` is asked only when the two ids
+                     # differ, because a model at the END of the chain resolves to itself and the loop runs ON it —
+                     # nothing moved it, and "runs on X, not X" is not a sentence worth writing.
+  [ "${1:-}" = "${2:-}" ] && return 0
+  "$BIN/cc-model" out "${2:-}" 2>/dev/null; return 0; }
+model_change_note(){   # $1 iteration · $2 the model it runs on · $3 the model as dispatched · $4 what the PREVIOUS
+                      # iteration ran on · $5 the outage that had moved THAT one ("" = none) · $6 the outage moving
+                      # THIS one ("" = none) · $7 what the PREVIOUS iteration was DISPATCHED on → the one line the
+                      # next fresh context reads, or nothing at all.
+                      # A CHANGE OF MODEL IS NOT A LIFT (review of #503). The commonest dispatch names no --model and
+                      # follows the box override, so an outage BEGINNING changes the model too, and so does a refusal
+                      # reroute pinning the next rung: calling either one "the outage that moved it to X lifted" put a
+                      # false sentence into the prompt of every iteration after it, and on the refusal path it
+                      # contradicted the refusal_note written beside it. So the lift is claimed only when the previous
+                      # iteration was REALLY outage-moved ($5) and this one is not ($6) — and when neither is, nothing
+                      # is said: a reroute has refusal_note for that, and a plain re-dispatch on another model is the
+                      # dispatcher's own doing and not this line's business.
+                      # AND LEAVING THE RUNG IS NOT A LIFT EITHER (second review of #503). $5 alone says the previous
+                      # iteration was outage-moved, not that this one came BACK: refused on the rung the outage moved
+                      # it to, the loop pins the NEXT rung down ($MODEL, below), so the rerun changes model with the
+                      # outage still in force and the old test read that as a lift — a sentence contradicting the
+                      # refusal_note written one line earlier. A lift means the loop is on the very model it was moved
+                      # off, which is what the previous iteration ASKED for ($7).
+  local i="$1" m="$2" asked="$3" lastm="$4" lastwhy="$5" why="$6" lastasked="${7:-}"
+  [ -n "$lastm" ] && [ "$m" != "$lastm" ] || return 0
+  if [ -n "$why" ]; then
+    printf -- '- cc-loop: iteration %s runs on %s, not %s — %s. It returns to %s by itself when that lifts.\n' "$i" "$m" "$asked" "$why" "$asked"
+  elif [ -n "$lastwhy" ] && [ "$m" = "$lastasked" ]; then
+    printf -- '- cc-loop: iteration %s is back on %s — the outage that moved it to %s lifted; no handoff, the journal below stands.\n' "$i" "$m" "$lastm"
+  fi; }
 refusal_step(){   # $1 refusal_next's exit code · $2 whether the iteration produced work → what the loop does.
                   # A REROUTE THAT PRODUCED WORK IS AN ITERATION (2026-09-01 review, F4): it committed, or it wrote
                   # the journal, and rerunning it would redo work the next fresh context can already read. Only the
@@ -394,14 +440,62 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
   # cases is the only thing standing between a worker and the box's interactive model (2026-09-01, and again
   # 09-07 when `current` started naming the primary).
   printf '#!/bin/sh\ncase "$1" in current) echo claude-fable-5-1;; esac\nexit 0\n' > "$d/nov/cc-model"
-  printf '#!/bin/sh\necho claude-sonnet-5\n' > "$d/ov/cc-model"
+  printf '#!/bin/sh\ncase "$1" in resolve) case "$2" in *fable*) echo claude-sonnet-5;; *) echo "$2";; esac;; *) echo claude-sonnet-5;; esac\n' > "$d/ov/cc-model"   # moved to sonnet: `resolve` moves the model it was moved off, passes the rest through
   chmod +x "$d/nov/cc-model" "$d/ov/cc-model"
   wm=$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/nov" worker_model "")
   t 'no --model and the box on its primary: a worker runs on Opus, not on that primary' "$wm" claude-opus-5
   t 'CC_WORKER_MODEL moves that default'   "$(CC_CONFIG="$d/config" BIN="$d/nov" CC_WORKER_MODEL=claude-haiku-4-5-20251001 worker_model '')" claude-haiku-4-5-20251001
   t 'a box override outranks it'           "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/ov" worker_model '')" claude-sonnet-5
-  t "--model is the dispatcher's call and passes through untouched" "$(CC_CONFIG="$d/config" BIN="$d/ov" worker_model 'fable[1m]')" 'fable[1m]'
+  t "--model is the dispatcher's call: passed through untouched when it is not the model the box was moved off" "$(CC_CONFIG="$d/config" BIN="$d/ov" worker_model 'claude-opus-5')" 'claude-opus-5'
+  t "…and the one the box WAS moved off runs where the box is this iteration (resolve), not pinned there" "$(CC_CONFIG="$d/config" BIN="$d/ov" worker_model 'fable[1m]')" 'claude-sonnet-5'
   [ -n "${CC_MODEL_CHAIN:-}" ] || t 'and the fallback chain carries on from it (opus -> sonnet)' "$("$BIN/cc-model" next "$wm")" "$last"
+  # (c) AN OUTAGE MOVES THE LOOP DOWN, AND ITS LIFT MOVES IT BACK: a stub cc-model whose `out`/`resolve` read one flag
+  # file, the way the real one reads its unavailable record and its override. Own fixture per state.
+  mkdir -p "$d/out"
+  printf '#!/bin/sh\ncase "$1" in current) echo claude-fable-5-1;; forced) [ -e "%s/fable-out" ] && echo "claude-opus-5[1m]";; out) if [ -e "%s/fable-out" ]; then case "$2" in *fable*) echo "fable is not available to this account: test"; exit 0;; esac; fi; exit 1;; resolve) if [ -e "%s/fable-out" ]; then case "$2" in *fable*) echo "claude-opus-5[1m]"; exit 0;; esac; fi; echo "$2";; esac\nexit 0\n' "$d" "$d" "$d" > "$d/out/cc-model"
+  chmod +x "$d/out/cc-model"
+  t '(c) on its primary, a loop dispatched on Fable runs on Fable' "$(CC_CONFIG="$d/config" BIN="$d/out" worker_model 'claude-fable-5-1[1m]')" 'claude-fable-5-1[1m]'
+  touch "$d/fable-out"
+  t '(c) while the box has Fable recorded as out, the same dispatch runs on the next rung — the record, not a pin' \
+    "$(CC_CONFIG="$d/config" BIN="$d/out" worker_model 'claude-fable-5-1[1m]')" 'claude-opus-5[1m]'
+  t '(c) …and the model AS DISPATCHED is still known, for the journal line that says why' "$(CC_CONFIG="$d/config" BIN="$d/out" worker_model 'claude-fable-5-1[1m]' asked)" 'claude-fable-5-1[1m]'
+  t '(c) …a worker with no --model runs on what the box was moved to, as before' "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/out" worker_model '')" 'claude-opus-5[1m]'
+  rm -f "$d/fable-out"
+  t '(c) the lift: the next iteration is back on Fable, with no handoff and nothing pinned' "$(CC_CONFIG="$d/config" BIN="$d/out" worker_model 'claude-fable-5-1[1m]')" 'claude-fable-5-1[1m]'
+  t '(c) a cc-model that does not answer `resolve` (an older copy) leaves the model as it was' "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/nov" worker_model 'fable[1m]')" 'fable[1m]'
+
+  # (c) THE LINE THE NEXT FRESH CONTEXT READS ABOUT ITS OWN MODEL, and the cases it must NOT read. Its own fixture:
+  # seven arguments in, one line or nothing out, no state between cases. Before the review of #503 a model change alone
+  # was taken for a lift, so the "no outage" cases below produced "the outage that moved it to X lifted" — a false
+  # sentence fed verbatim into the next iteration's prompt. Both halves are asserted: what is written and what is not.
+  outwhy='fable is not available to this account: test'   # what the $d/out stub's `out` says while its flag file is there
+  t '(c) an outage BEGINS: the line names what moved it and what brings it back' \
+    "$(model_change_note 4 'claude-opus-5[1m]' 'claude-fable-5-1[1m]' 'claude-fable-5-1[1m]' '' "$outwhy" 'claude-fable-5-1[1m]')" \
+    "- cc-loop: iteration 4 runs on claude-opus-5[1m], not claude-fable-5-1[1m] — $outwhy. It returns to claude-fable-5-1[1m] by itself when that lifts."
+  t '(c) the lift: the iteration after it says so, and says no handoff was needed' \
+    "$(model_change_note 5 'claude-fable-5-1[1m]' 'claude-fable-5-1[1m]' 'claude-opus-5[1m]' "$outwhy" '' 'claude-fable-5-1[1m]')" \
+    '- cc-loop: iteration 5 is back on claude-fable-5-1[1m] — the outage that moved it to claude-opus-5[1m] lifted; no handoff, the journal below stands.'
+  t '(c) an outage beginning is NOT a lift: no --model, so the override changes the model with nothing out on the ASKED one' \
+    "$(model_change_note 2 'claude-opus-5[1m]' 'claude-opus-5[1m]' 'claude-opus-5' '' '' 'claude-opus-5')" ''
+  t '(c) …nor is a refusal reroute: the model moves down the chain, refusal_note says why, and this says nothing' \
+    "$(model_change_note 3 'claude-sonnet-5' 'claude-sonnet-5' 'claude-opus-5' '' '' 'claude-opus-5')" ''
+  t '(c) the model did not change: nothing to say, outage or none' \
+    "$(model_change_note 6 'claude-opus-5[1m]' 'claude-fable-5-1[1m]' 'claude-opus-5[1m]' "$outwhy" "$outwhy" 'claude-fable-5-1[1m]')" ''
+  t '(c) iteration 1 has no previous model, so it claims nothing' \
+    "$(model_change_note 1 'claude-opus-5[1m]' 'claude-fable-5-1[1m]' '' '' "$outwhy" '')" ''
+  t '(c) a reroute WHILE an outage is in force says nothing: the loop left the rung the outage moved it to, and the outage it was moved OFF has not lifted' \
+    "$(model_change_note 7 'claude-sonnet-5' 'claude-sonnet-5' 'claude-opus-5[1m]' "$outwhy" '' 'claude-fable-5-1[1m]')" ''
+  # …and the memory those two rely on: the outage is read EVERY iteration, so a loop that started INSIDE an outage
+  # still knows it was moved when the lift comes. The $d/out stub above is the record; the flag file is the outage.
+  rm -f "$d/fable-out"   # this block builds its own state: no flag = the box is on its primary, whatever ran before
+  t '(c) on its primary nothing is out, so nothing is remembered' \
+    "$(BIN="$d/out" model_outage_why 'claude-fable-5-1[1m]' 'claude-fable-5-1[1m]')" ''
+  touch "$d/fable-out"
+  t '(c) moved off the asked model: the why is read even on an iteration that changed nothing' \
+    "$(BIN="$d/out" model_outage_why 'claude-opus-5[1m]' 'claude-fable-5-1[1m]')" "$outwhy"
+  t '(c) running ON the model that is out (the chain ends there) is not being moved by it' \
+    "$(BIN="$d/out" model_outage_why 'claude-fable-5-1[1m]' 'claude-fable-5-1[1m]')" ''
+  rm -f "$d/fable-out"
 
   # WHAT A WORKER IS TOLD ITS BASE IS. Real boards read by the real cc-board, in a $HOME of its own with no
   # checkout in it, so origin/HEAD answers nothing. A stub answering `base` would only prove the stub: three
@@ -777,6 +871,11 @@ SP=$(sp_worker "$base")
 "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
 i=0; errs=0; caps=0; spent=0; limited=0   # limited: the owner has already been told about THIS limit episode
 barren=0; rounds=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the runaway rule's memory: this track measured against itself
+lastm=""; lastwhy=""; lastasked=""   # what the previous iteration ran on, the outage that had moved it there
+                       # ("" = none), and the model it was DISPATCHED on. ALL THREE are the memory this needs: a model
+                       # change alone does not say which way it went, and an outage remembered alone does not say the
+                       # loop came BACK — see model_change_note, where each in turn put a false lift line in the next
+                       # prompt (reviews of #503).
 chainend=0   # the end of the cc-model chain is journalled once per loop, not once per iteration
 while [ $i -lt "$MAXI" ]; do
   parked   # read before the limit stamp and before anything is charged: a project paused mid-run stops at this line
@@ -787,7 +886,11 @@ while [ $i -lt "$MAXI" ]; do
   cont=""; [ "$rounds" -gt 0 ] && cont=" This loop passed its original step limit and carried on because you are still committing work — pick up exactly where the journal stops."
   prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s of %s.%s\n' "$(cat "$ST/task.md")" "$(journal_block "$ST/progress.md")" "$i" "$MAXI" "$cont")
   args=(-p "$prompt" --permission-mode auto --max-turns "$TURNS" --max-budget-usd "$BUDGET" --output-format json --append-system-prompt "$SP")
-  m=$(worker_model "$MODEL")   # resolved every iteration, not pinned at dispatch: an override mid-loop (a limit) moves this worker too
+  m=$(worker_model "$MODEL")   # resolved every iteration, not pinned at dispatch: an outage mid-loop moves this worker down, and its lift moves it back
+  asked=$(worker_model "$MODEL" asked); why=$(model_outage_why "$m" "$asked")   # both read every iteration (see there)
+  note=$(model_change_note "$i" "$m" "$asked" "$lastm" "$lastwhy" "$why" "$lastasked")   # $() ate its newline; printf puts it back
+  if [ -n "$note" ]; then log "${note#- cc-loop: }"; printf '%s\n' "$note" >> "$ST/progress.md"; fi
+  lastm="$m"; lastwhy="$why"; lastasked="$asked"
   [ -n "$m" ] && args+=(--model "$m"); [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
   # --resume-last, first iteration only: continue the session this track last ran instead of opening a cold one.
   # A fix round dispatched by the landing queue is the case it exists for — the worker already read this code and
@@ -802,7 +905,7 @@ while [ $i -lt "$MAXI" ]; do
   out="$ST/runs/$(date -u +%Y%m%dT%H%M%SZ)-$i.json"
   ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; CC_WORKER_SANDBOX=1 wraps it in bwrap (cc-sandbox), otherwise that line is exec'd untouched
   child=$!; wait "$child"; rc=$?; child=""
-  if lim=$("$BIN/cc-limit" check "$out" "$out.err"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap
+  if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
     resets=$(date -u -d "@${lim#LIMIT }" +%H:%M)
     log "usage limit — waiting until ${resets}Z, then rerunning iteration $i"
     [ "$limited" = 1 ] || { "$BIN/cc-notify" -t "$(hostname) limit" "Claude usage limit hit by $repo/$track — the loop is waiting, and resumes at ${resets}Z."; limited=1; }
@@ -891,14 +994,15 @@ while [ $i -lt "$MAXI" ]; do
       log "refused or rerouted on ${m:-the box default} ($rwhy) — nothing produced, so iteration $i reruns on $nx"
       refusal_note "$i" "$m" "$nx" "$rwhy" rerun >> "$ST/progress.md"   # the next fresh context has to know why its model changed
       "$BOARD" note "$repo" "$track" "model refused or rerouted ($rwhy) — now on $nx" >/dev/null 2>&1
-      MODEL="$nx"; i=$((i-1)); continue;;
+      "$BIN/cc-model" out "$m" >/dev/null 2>&1 || MODEL="$nx"   # pinned only when the box has no record of it: a recorded outage resolves itself, and lifts itself
+      i=$((i-1)); continue;;
     count)   # F4: it committed, or it wrote the journal. Rerunning it would redo work the next context can read.
       log "refused or rerouted on ${m:-the box default} ($rwhy) — but iteration $i produced work, so it counts${nx:+ and the model moves to $nx}"
       if [ "$rnrc" = 0 ] || [ "$chainend" = 0 ]; then   # the end of the chain is said once, not once per iteration
         refusal_note "$i" "$m" "$nx" "$rwhy" kept >> "$ST/progress.md"
         "$BOARD" note "$repo" "$track" "model refused or rerouted ($rwhy) — ${nx:+now on $nx}${nx:-no model left on the chain, but the work stands}" >/dev/null 2>&1; fi
       [ "$rnrc" = 2 ] && chainend=1
-      [ -n "$nx" ] && MODEL="$nx"; :;;   # …and on into the normal accounting below: this iteration is like any other
+      { [ -n "$nx" ] && ! "$BIN/cc-model" out "$m" >/dev/null 2>&1; } && MODEL="$nx"; :;;   # pinned only when the box has no record of it (see above); on into the normal accounting below
     stop)
       refusal_note "$i" "$m" "" "$rwhy" stopped >> "$ST/progress.md"
       stop 10 "was refused" "Every model on the cc-model chain refused or was rerouted (last: ${m:-the box default}; ${rwhy:-refused}) and the last one produced nothing. The task is not the problem — check the models, then: cc $repo $track --go \"\"";;

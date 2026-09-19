@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# cc-model — automatic model fallback. When the box's primary model hits its usage limit every live session
-# moves to the fallback model, and back when the limit lifts. LLM-free except one tiny probe.
+# cc-model — automatic model fallback. When a model goes out — its usage limit, or it "requires usage credits" /
+# the monthly spend cap — every live session ON THAT MODEL moves to the next rung of the chain, and back to the
+# model it was on when the outage lifts (no handoff, no restart: `/model` typed at the next turn boundary). Sessions
+# on another model are not touched. LLM-free except one tiny probe.
+# TWO KINDS OF OUTAGE, told apart (owner, 2026-09-15): a LIMIT names a reset and every model of the account can be
+# behind it — the box waits it out on the next rung; "requires usage credits" and "You've hit your monthly spend
+# limit" are one model this account cannot run right now, no reset lifts them (credits, the cap, or a re-login do),
+# the other models answer, and cc-limit's stamp stays empty — so only work BOUND to that model moves.
 #   cc-model status                   "fable" (normal) | "opus until 11:40Z" | "opus until probe". An until that
 #                                     is not today is dated ("opus until 2026-09-03T12:51Z"): the clock alone made
 #                                     a 24-hour override read as one that lapsed hours ago. A trailing "— 2 sessions
@@ -18,8 +24,15 @@
 #                                     --model must land on CC_WORKER_MODEL, not on the interactive primary.
 #   cc-model switch <model> [reason]  write (or, for the primary model, clear) the override + retune live sessions
 #   cc-model limited <model> [reason] cc-limit calls this after a limited run: switch only if that WAS the primary
-#   cc-model unavailable <model> [reason]  cc-limit calls this on a run refused for usage credits: that model cannot
-#                                     be run on this account, so it is recorded as such and the box moves off it
+#   cc-model unavailable <model> [reason]  cc-limit calls this on a run refused for usage credits or the spend cap:
+#                                     that model cannot be run on this account, so it is recorded as such and the
+#                                     box moves off it; the owner is told once per episode, and what lifts it
+#   cc-model out <model>              exit 0 + why when <model>'s family is out right now — recorded unavailable, or
+#                                     the override has moved the box off the primary and <model> is the primary's
+#   cc-model resolve <model>          the model to run NOW for a caller that asked for <model>: itself, or the next
+#                                     rung while it is out. cc-loop asks this every iteration, so a worker dispatched
+#                                     on Fable runs on Opus through the outage and is back on Fable the iteration
+#                                     after it lifts — until 2026-09-15 a refusal pinned the loop to Opus for good
 #   cc-model classify <json> [<err>] [<asked>]  what stopped a headless run, as "<class>\t<why>": ok | limit |
 #                                     refusal | error — the caller's reason to WAIT, to MOVE, or to retry
 #   cc-model chain                    the worker fallback chain, one model per line
@@ -37,7 +50,14 @@
 #   is "Switch to <another model> … and continue", Esc on anything else), the box moves to the fallback until the reset
 #   the text names, else 24 h, and NOTHING PROBES while that wording is on any session pane: a probe that answers there
 #   is paying with usage credits, not proof the limit lifted (2026-09-01: one such "lifted" retuned 12 panes straight
-#   back into the prompt, and a pulse tick and two secretary findings were dropped on it); (2) overridden — once `until`
+#   back into the prompt, and a pulse tick and two secretary findings were dropped on it); (1c) THE CLI'S OWN
+#   "REQUIRES USAGE CREDITS" LINE, in every state: "│ Fable 5.1 requires usage credits. Switch to another model…",
+#   "● Switched to Sonnet 5 for this session · Fable 5.1 requires usage credits" or "⎿ You've hit your monthly spend
+#   limit" on a live pane IS that model being out for THAT session — no probe, no stamp: the model is recorded
+#   unavailable, every session on it is moved to the next rung, and the pane that showed it is nudged back to work.
+#   Two orchs stood at an empty prompt on exactly this line for hours on 2026-09-15 00:5xZ while the box, already on
+#   the Opus override, read them as a `mismatch` (report only) and cc-limit read the account as clear;
+#   (2) overridden — once `until`
 #   has passed, probe the primary model at most every 15 min and restore on the first answer — unless a pane still
 #   shows the prompt or cc-limit's stamp still names the primary: then it cannot tell, and does not restore;
 #   (2b) NO OVERRIDE, SO THE BOX WANTS ITS PRIMARY: a session the CLI last put on ANOTHER ID OF THAT SAME FAMILY —
@@ -48,10 +68,15 @@
 #   line is written after the retune, and on 2026-09-01 a restore slipped into the gap and undid the switch mid-typing;
 #   (4) IN EVERY STATE, SAID OUT LOUD AND NEVER ACTED ON: a live session running a model `current` does not name —
 #   another family, or the old id of the primary's — gets one `mismatch` row in the log (at most one per session per
-#   CC_MODEL_MISMATCH_GAP) and is counted in `status`. (2b) is the only pass that MOVES a session and it is same-family
-#   by design, so before this every session on another family was invisible: 31 windows sat on the harness default on
-#   2026-09-07 and nothing anywhere said so. This one types nothing — a session on another family is an override's,
-#   the chain's or the owner's doing, and reporting it is the whole job.
+#   CC_MODEL_MISMATCH_GAP) and is counted in `status`. The passes that MOVE a session are a switch (the sessions on
+#   the model that went out, see Moved below), (1c) and same-family (2b); before (4) every session on another family
+#   was invisible: 31 windows sat on the harness default on 2026-09-07 and nothing anywhere said so. This one types
+#   nothing — a session on another family is an override's, the chain's or the owner's doing, and reporting it is
+#   the whole job; (5) NO OVERRIDE BUT A MODEL IS RECORDED UNAVAILABLE (cleared by hand, or a fresh boot with the
+#   record): EVERY recorded family is probed, each on its own rung, at most every 15 min. The first answer as the
+#   primary forgets its record and restores the sessions the box moved — without this the record alone parked them
+#   for good; an answer as any other family just drops that row, so a dispatch aims at it again. Only the primary
+#   was probed until 2026-09-18, and a cap the owner then raised left every worker a rung down for good.
 # Retuning a session = typing "/model <model>" into its pane THROUGH cc-msg (the one pane deliverer, with the dialog
 #   guard); the answers to the CLI's own prompts (Enter/Esc, "1" to "Switch model?") are single keys. Effort is not touched.
 # THE WORKER FALLBACK CHAIN LIVES HERE AND NOWHERE ELSE: fable -> opus -> sonnet. cc-loop asks `cc-model next`
@@ -64,6 +89,20 @@
 # `.result`, and only on a run the API itself ended, because a worker writing "I can't help with that" — or
 # "refused", or "usage limit" — in its own result is talking about its task, not about being refused.
 # Override: ~/.cc/state/model-override = "<model>\t<since>\t<until-epoch|0>\t<reason>\t<last-probe-epoch>"
+# Moved: ~/.cc/state/model-moved = "<pane-id>\t<window>\t<model it was on>\t<epoch>\t<moved|kept>\t<families moved
+#   off>" — one row per live pane at the moment the box moved off a model, and the MODEL is first write wins: `moved`
+#   for a pane typed at, `kept` for one left where it was. One episode can hold more than one move (Fable out, then
+#   Opus on the rung it landed on), so the last field collects the families this pane has been typed off and every
+#   "have we moved it already" guard names the one it is asking about — asked of the row alone, the second outage's
+#   panes were skipped as already moved and left at an empty prompt (third review of #503). So a lift returns each
+#   session to what IT was on (a Sonnet steward is not sent to Fable, a session
+#   the owner had put on Opus stays there), and a pane with no row was launched during the outage on the fallback and
+#   goes to the primary. A pane with no record and no --model (a hand launch, the selftest's bare cat) is taken to be
+#   on the model the pass is asking about — the one going out, or the one the box was moved to — never `current` read
+#   after the override is written. The file goes when the box restores, and a move that starts from a clean box (no
+#   override, nothing on record) starts from none: rows an episode left when its state was cleared by hand would
+#   otherwise hold the next one's panes back. Until 2026-09-15 a switch typed into EVERY pane and the
+#   restore typed the primary into every pane, and nothing remembered what a pane had been on.
 # Log: ~/.cc/state/model.log = "<iso>\t<epoch>\t<event>\t<model>\t<detail>". No secrets in either.
 # Unavailable: ~/.cc/state/model-unavailable = "<family>\t<since>\t<last-seen>\t<reason>" — a model this account cannot
 #   run (usage credits, not a limit — see A MODEL THIS ACCOUNT CANNOT RUN below); a row goes the moment the box is put
@@ -71,10 +110,13 @@
 # Env: CC_MODEL_PRIMARY · CC_MODEL_FALLBACK · CC_MODEL_PROBE (the id the probe asks for) · CC_CLAUDE
 #   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_RETUNE_GAP (600) · CC_MODEL_CHAIN
 #   · CC_MODEL_MISMATCH_GAP (3600) · CC_MODEL_STATUSLINE_FRESH (120) · CC_STATUSLINE_DIR (cc-statusline's per-session
-#   records, the same ones cc-context reads) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC.
+#   records, the same ones cc-context reads) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC, CC_MODEL_SESSIONS (a file
+#   of "<pane-id> <window>" standing in for the live session list), CC_MODEL_LIVE (a file of "<pane-id>\t<model>"
+#   standing in for what each pane's session is running).
 set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"; UNAV="$ST/model-unavailable"
+MOVED="$ST/model-moved"   # what each pane was on before the box moved it (see the header)
 PRIMARY="${CC_MODEL_PRIMARY:-claude-fable-5-1[1m]}"; FALLBACK="${CC_MODEL_FALLBACK:-claude-opus-5[1m]}"   # Fable 5.1 (owner, 2026-09-01)
 PROBEM="${CC_MODEL_PROBE:-claude-fable-5-1}"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 SESSION="${CC_TMUX_SESSION:-main}"; PROC="${CC_MODEL_PROC:-claude}"
@@ -113,8 +155,8 @@ retuned_recently(){   # $1 = pane id → 0 when this pane was retuned inside the
   [ "$((now - t))" -lt "${CC_MODEL_RETUNE_GAP:-600}" ]; }
 sldir(){ printf '%s\n' "${CC_STATUSLINE_DIR:-$ST/statusline}"; }   # cc-statusline's per-session records — cc-context's env name
 mismatches(){   # every LIVE session running a model `current` does not name: "<session-id>\t<the model it is on>".
-                # REPORT ONLY. Nothing here types into a pane: retune_to is the one pass that moves a session and it is
-                # same-family on purpose, so "what is configured" and "what is running" could disagree in silence — 31
+                # REPORT ONLY. Nothing here types into a pane: a switch moves the sessions on the model that went out,
+                # retune_to is same-family, so "what is configured" and "what is running" could disagree in silence — 31
                 # windows on the harness default on 2026-09-07, and the box said nothing until the owner asked.
                 # EVIDENCE IS cc-statusline's OWN RECORD, which is the harness's word for what that session is running.
                 # A pane's text is not: a doc, or this file in a pager, has a model id on its screen and is not running it.
@@ -186,6 +228,21 @@ current(){   # what a dispatch passes as --model, in EVERY state: what forced() 
   local m; m=$(forced); [ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
   unavail "$(fam "$PRIMARY")" && return 0   # …and the chain has nothing after it: no model to name, so name none
   printf '%s\n' "$PRIMARY"; }
+out_why(){   # $1 model → exit 0 + why when its family is OUT right now: recorded as one the account cannot run, or the
+             # override has moved the box off the primary and $1 is the primary's family. Exit 1 and nothing otherwise.
+             # The two facts this file already holds; a live cc-limit stamp is the caller's own `cc-limit status` wait.
+  local f; f=$(fam "${1:-}"); [ -n "$f" ] || return 1
+  if unavail "$f"; then printf '%s is not available to this account: %s\n' "$f" "$(awk -F'\t' -v f="$f" '$1==f{print $4; exit}' "$UNAV")"; return 0; fi
+  if ov && [ "$f" = "$(fam "$PRIMARY")" ] && [ "$(fam "$model")" != "$f" ]; then
+    printf '%s is limited: the box is on %s until %s\n' "$f" "$(fam "$model")" "$([ "$till" -gt 0 ] && untilw "$till" || echo 'it answers again')"; return 0; fi
+  return 1; }
+resolve(){   # $1 model → the model to run NOW for a caller that asked for $1: itself, or the next rung while it is out
+             # (the [1m] suffix riding along). Asked every iteration by cc-loop, so the lift brings a loop back by
+             # itself; a model with nothing after it on the chain is handed back as asked — running and being refused
+             # says more than an empty answer would.
+  local m="${1:-}"; [ -n "$(fam "$m")" ] || { printf '%s\n' "$m"; return 0; }
+  out_why "$m" >/dev/null || { printf '%s\n' "$m"; return 0; }
+  chain_next "$m" || printf '%s\n' "$m"; }
 status_line(){   # "fable" | "opus until 11:40Z" | "opus until probe", and " — fable is not available to this account" when it is
   local s mm
   if ov; then s="$(fam "$model") until $([ "$till" -gt 0 ] && untilw "$till" || echo probe)"
@@ -211,7 +268,11 @@ note_unavailable(){   # $1 family · $2 reason → one row per family: since sta
   since=$(awk -F'\t' -v f="$f" '$1==f{print $2+0; exit}' "$UNAV" 2>/dev/null); [ "${since:-0}" -gt 0 ] || since=""
   { [ -f "$UNAV" ] && awk -F'\t' -v f="$f" '$1!=f' "$UNAV"; printf '%s\t%s\t%s\t%s\n' "$f" "${since:-$now}" "$now" "$why"; } > "$UNAV.t"
   mv "$UNAV.t" "$UNAV"
-  [ -n "$since" ] || printf '%s\t%s\tunavailable\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$f" "$why" >> "$LOG"; }   # once per episode, not per probe
+  [ -n "$since" ] && return 0   # once per MODEL out, not per probe: the log row and the owner's line below. A second
+                                # model going out in the same episode is its own row, and the owner hears that one too.
+  printf '%s\t%s\tunavailable\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$f" "$why" >> "$LOG"
+  local nx; nx=$(chain_next "$f" 2>/dev/null) || nx="-"   # THE OWNER HEARS THE KIND, AND WHAT LIFTS IT — not "a limit"
+  "$BIN/cc-notify" -t "$(hostname -s) model" "$(label "$f") is not available to this account (${why:-usage credits}) — not a limit: no reset lifts it. Sessions and loops on it run on $(label "$nx") and return by themselves when it answers again (credits or the cap at claude.ai/settings/usage, or a re-login)." >/dev/null 2>&1 || true; }
 forget_unavailable(){   # $1 family → its row is dropped (nothing to do when it has none)
   unavail "${1:-}" || return 0
   awk -F'\t' -v f="$1" '$1!=f' "$UNAV" > "$UNAV.t"; mv "$UNAV.t" "$UNAV"; [ -s "$UNAV" ] || rm -f "$UNAV"
@@ -221,6 +282,7 @@ unavailable_why(){   # $1 = a classify `why` → 0 when it says the MODEL is not
   case "${1:-}" in 'needs usage credits'*|'the model would not answer as itself') return 0;; esac; return 1; }
 mark_unavailable(){   # $1 model · $2 reason → record it, and move the box off it if that is what the box is on
   local f nx cur; f=$(fam "${1:-}"); [ -n "$f" ] || return 0
+  drop_stale_rows   # before the record is written: it is what says an episode is open
   note_unavailable "$f" "${2:-}"
   cur="$PRIMARY"; ov && cur="$model"; [ "$(fam "$cur")" = "$f" ] || return 0
   nx=$(chain_next "$cur") || return 0   # nothing left to move to: recorded, and every caller reads the chain's end
@@ -273,6 +335,7 @@ sessions(){   # "<pane-id> <window-name>" per live INTERACTIVE session: a pane w
               # window's non-claude active pane is never typed into)
               # (a headless --go worker runs cc-loop in its pane and its claude is a grandchild — never a session)
   local id pp name
+  [ -n "${CC_MODEL_SESSIONS:-}" ] && { cat "$CC_MODEL_SESSIONS" 2>/dev/null; return 0; }   # test hook: a fixture's list
   while read -r id pp name; do
     [ -n "${pp:-}" ] || continue
     pgrep -P "$pp" -x "$PROC" >/dev/null 2>&1 || continue
@@ -280,6 +343,89 @@ sessions(){   # "<pane-id> <window-name>" per live INTERACTIVE session: a pane w
     printf '%s %s\n' "$id" "$name"
   done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id} #{pane_pid} #{window_name}' 2>/dev/null)
 }
+live_model(){   # $1 pane id → the model the session in that pane is RUNNING, as an id a dispatch would name (the [1m]
+                # suffix restored from the record's window, so what goes back in is what came out). The claude process
+                # is the pane's direct child and its argv carries `--session-id` (cc passes it), which names the
+                # cc-statusline record — the harness's own word, the same evidence mismatches() reads. A session with
+                # no record yet (its first turn is still open) is on what its argv asked for, and one launched by hand
+                # with neither — or the selftest's bare `cat` — is on $2, THE MODEL THE CALLING PASS IS ASKING ABOUT
+                # (the family going out when moving down, the one the box was moved to when coming back), else what
+                # the box dispatches. Never `current` from inside a switch: do_switch writes the override before it
+                # moves a pane, so on 2026-09-16 every evidence-less pane read as already on the fallback and was
+                # kept, and the restore typed that kept row back into it. A pane's TEXT is never read for this: a doc
+                # on screen names a model and is not running it.
+  local id="${1:-}" pp c sid m w
+  if [ -n "${CC_MODEL_LIVE:-}" ]; then   # test hook: the file is the whole truth — a pane not in it has no record and no --model
+    m=$(awk -F'\t' -v p="$id" '$1==p{print $2; exit}' "$CC_MODEL_LIVE" 2>/dev/null)
+  else
+    pp=$(tmux display-message -p -t "$id" '#{pane_pid}' 2>/dev/null); c=$(pgrep -P "${pp:-0}" -x "$PROC" 2>/dev/null | head -1)
+    if [ -n "$c" ] && [ -r "/proc/$c/cmdline" ]; then
+      sid=$(tr '\0' '\n' < "/proc/$c/cmdline" | grep -A1 -x -- '--session-id' | tail -1)
+      [ -n "$sid" ] && IFS=$'\t' read -r m w < <(jq -r '[(.model // ""), ((.window // 0) | tostring)] | @tsv' "$(sldir)/$sid.json" 2>/dev/null)
+      { [ -n "${m:-}" ] && [ "${w:-0}" -ge 1000000 ] 2>/dev/null; } && m="${m}[1m]"
+      [ -n "${m:-}" ] || m=$(tr '\0' '\n' < "/proc/$c/cmdline" | grep -A1 -x -- '--model' | tail -1)
+    fi
+  fi
+  [ -n "${m:-}" ] || m="${2:-$(current)}"
+  printf '%s\n' "$m"; }
+moved_row(){ awk -F'\t' -v p="${1:-}" '$1==p{print $3; exit}' "$MOVED" 2>/dev/null; }   # what a pane was on when the box moved off a model, or nothing
+moved_by_box(){   # $1 pane · $2 the family a move is off → 0 = the box has TYPED at this pane for THAT move.
+                  # A ROW IS THE PANE'S FOR THE WHOLE EPISODE; A GUARD BELONGS TO ONE MOVE (third review of #503).
+                  # Asked of the row alone, this skipped a pane the box had moved at 10:00 for Fable when Opus hit the
+                  # spend cap on it at 12:00: nothing recorded Opus out, nothing typed, and the session stood at an
+                  # empty prompt — the 00:5xZ stall, one rung down. Field 6 collects the families this pane has been
+                  # moved off, so each move asks its own question. An empty $2 asks the old one: moved at all?
+  awk -F'\t' -v p="${1:-}" -v f="${2:-}" '$1==p && $5=="moved" && (f=="" || index("," $6 ",", "," f ",")){y=1} END{exit !y}' "$MOVED" 2>/dev/null; }
+note_moved(){   # $1 pane · $2 window · $3 the model it was on · $4 moved|kept · $5 the family THIS move is off.
+                # THE MODEL IS FIRST-WRITE-WINS: a chained move (Fable out, then Opus) still restores the pane to what
+                # it was on before the first one. The rest of the row belongs to the LATEST move — field 6 collects the
+                # families the box has typed this pane off, and a pane banked `kept` that a later move does type at
+                # becomes `moved` for that family. Without that upgrade a pane a person had left on the fallback was
+                # outside every guard when the fallback went out, and was retyped on every tick past the retune gap.
+  local p="$1" w="$2" m="$3" k="${4:-moved}" f="${5:-}"
+  [ "$k" = moved ] || f=""   # nothing was typed, so the row names no move
+  awk -F'\t' -v p="$p" '$1==p{y=1} END{exit !y}' "$MOVED" 2>/dev/null ||
+    { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$w" "$m" "$now" "$k" "$f" >> "$MOVED"; return 0; }
+  [ "$k" = moved ] || return 0   # a pass that only OBSERVED the pane never rewrites the row a move wrote
+  { awk -F'\t' -v p="$p" '$1!=p' "$MOVED"
+    awk -F'\t' -v p="$p" -v f="$f" 'BEGIN{OFS="\t"} $1==p{$5="moved"
+      if (f != "" && !index("," $6 ",", "," f ",")) $6 = ($6 == "" ? f : $6 "," f)
+      print; exit}' "$MOVED"; } > "$MOVED.t" && mv "$MOVED.t" "$MOVED"; }
+episode_over(){ ! ov && [ ! -s "$UNAV" ]; }   # the box on its primary with nothing out: no episode is open
+drop_stale_rows(){ episode_over && rm -f "$MOVED"; return 0; }   # $MOVED belongs to ONE episode. Rows left when a
+                     # person cleared the override and the record by hand (the selftest does; an owner may) read as
+                     # "typed at this episode already" and held the next episode's panes back (2026-09-16): a move
+                     # that starts from a clean box starts from no rows. Called where an episode can begin.
+move_off(){   # $1 family · $2 target model · $3 why → "/model $2" typed into every live session ON $1, and ONLY those
+              # (the brief: "moves only Fable-bound work"). Each pane's old model is banked in $MOVED so the lift can
+              # put it back; a pane the box has already typed off THIS family, or one retuned inside
+              # CC_MODEL_RETUNE_GAP, is not typed at again — the statusline record says the old model until the
+              # session's next turn. Prints the count.
+  local f="$1" m="$2" why="${3:-}" id name lm n=0
+  while read -r id name; do [ -n "${id:-}" ] || continue
+    lm=$(live_model "$id" "$(rung_id "$f")")   # no record, no --model: taken to be on the family going out
+    [ "$(fam "$lm")" = "$f" ] || { note_moved "$id" "$name" "$lm" kept "$f"; continue; }   # not on it: banked as where a person left it
+    moved_by_box "$id" "$f" && continue   # …for THIS move: a pane the box moved off another family is still to be moved off this one
+    retuned_recently "$id" && continue
+    if type_into "$id" "$name" "/model $m"; then note_moved "$id" "$name" "$lm" moved "$f"; n=$((n+1))
+      printf '%s\t%s\tretune\t%s\t%s:%s (%s) was on %s — %s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION" "$name" "$id" "$lm" "$why" >> "$LOG"
+    else printf '%s\t%s\tskip\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION:$name busy or unreachable" >> "$LOG"
+      printf '%s\n' "$id" >> "$ST/model-skipped"; fi   # a pane behind a dialog: retried on later ticks (F3)
+  done < <(sessions); printf '%s\n' "$n"; }
+restore_all(){   # $1 = the family the box was moved TO → every live session back to what it was on: its $MOVED row,
+                 # or — launched during the outage, so on the fallback with no row — the primary. A session on another
+                 # family with no row was put there by a person and is left there (a Sonnet steward is not sent to
+                 # Fable; until 2026-09-15 it was). Prints the count and forgets the rows: the episode is over.
+  local to_f="${1:-}" id name lm was to n=0
+  while read -r id name; do [ -n "${id:-}" ] || continue
+    lm=$(live_model "$id" "$(rung_id "$to_f")"); was=$(moved_row "$id")   # no record: taken to be where the box put things
+    if [ -n "$was" ]; then to="$was"; elif [ "$(fam "$lm")" = "$to_f" ]; then to="$PRIMARY"; else continue; fi
+    [ "${to%%\[*}" = "${lm%%\[*}" ] && continue   # already there: the session moved back by itself, or was never moved
+    if type_into "$id" "$name" "/model $to"; then n=$((n+1))
+      printf '%s\t%s\tretune\t%s\t%s:%s (%s) back from %s\n' "$(date -u +%FT%TZ)" "$now" "$to" "$SESSION" "$name" "$id" "$lm" >> "$LOG"
+    else printf '%s\t%s\tskip\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$to" "$SESSION:$name busy or unreachable" >> "$LOG"
+      printf '%s\n' "$id" >> "$ST/model-skipped"; fi
+  done < <(sessions); rm -f "$MOVED"; printf '%s\n' "$n"; }
 type_into(){   # $1 pane id · $2 window name · $3 text. cc-msg IS the box's typist — it refuses a headless pane and its
                # dialog guard keeps keystrokes off an open prompt (dialog-never-drops owns that), so this does not
                # reimplement either. It types by WINDOW name, so a split window is typed at its active pane; a claude
@@ -413,6 +559,51 @@ prompt_panes(){   # every live session showing it: "<pane-id>\t<window>\t<family
     e=$(reset_at "$cap") || e=0
     printf '%s\t%s\t%s\t%s\n' "$id" "$name" "$f" "$e"
   done < <(sessions); }
+# THE CLI'S OWN "REQUIRES USAGE CREDITS" LINE — the three shapes it draws, off live panes on this box (2026-09-15):
+#   "  │ Fable 5.1 requires usage credits. Switch to another model, or manage usage credits at claude.ai/…"  (a box)
+#   "● Switched to Sonnet 5 for this session · Fable 5.1 requires usage credits · /model to change"  (it moved itself)
+#   "  ⎿  You've hit your monthly spend limit · your weekly limit resets 10pm (America/Los_Angeles)"  (the cap)
+# Read as a SHAPE like the limit prompt above: the sentence STARTS the line (after the CLI's mark, or its own
+# "Switched to … ·" preface), inside the live tail, and BELOW the last "Set model to" — a retune typed after it
+# makes it history. A doc, a journal or this file in a pager quotes the words mid-line and never starts one with them.
+CREDITS_LINE_RE='^[[:space:]]*(@DOT@[[:space:]]*(switched to [a-z0-9. ]+ for this session[^a-z]+)?)?((claude-)?(fable|opus|sonnet|haiku) ?[0-9.]* requires usage credits|you.?ve hit your monthly spend limit)'
+credits_line(){   # $1 = a pane's live screen → that line, when it is live (exit 1: none, or history)
+  local t n a s
+  t=$(prompt_norm "${1:-}"); n=$(grep -c '' <<<"$t")
+  a=$(grep -niE "$CREDITS_LINE_RE" <<<"$t" | tail -1 | cut -d: -f1); [ -n "$a" ] || return 1
+  [ $((n - a)) -le "${CC_MODEL_CREDITS_TAIL:-20}" ] || return 1
+  s=$(grep -n 'Set model to ' <<<"$t" | tail -1 | cut -d: -f1); { [ -n "$s" ] && [ "$s" -gt "$a" ]; } && return 1
+  sed -n "${a}p" <<<"$t"; }
+rung_id(){   # $1 family → the id the chain (or the primary) spells it as: what a restore types back
+  local f="${1:-}" m; [ "$f" = "$(fam "$PRIMARY")" ] && { printf '%s\n' "$PRIMARY"; return 0; }
+  while read -r m; do [ "$(fam "$m")" = "$f" ] && { printf '%s\n' "$m"; return 0; }; done < <(chain_all); printf '%s\n' "$f"; }
+credits_panes(){   # (1c): every live session showing the line is moved off the model it names, in EVERY state — the
+                   # box may already be off it (the 2026-09-15 00:5xZ stall: the override on Opus, two orchs launched
+                   # on Fable by their dispatcher, refused on their next turn, and read as `mismatch` for hours).
+  local id name cap hit lm pf src nx why
+  while read -r id name; do [ -n "${id:-}" ] || continue
+    cap=$(pane_text "$id"); hit=$(credits_line "$cap") || continue
+    pf=$(fam "$(grep -oiE '(claude-)?(fable|opus|sonnet|haiku) ?[0-9.]* requires usage credits' <<<"$hit")")
+    lm=$(live_model "$id" "$([ -n "$pf" ] && rung_id "$pf")")   # no record: on the model the line names
+    [ -n "$pf" ] || pf=$(fam "$lm")   # the cap names no model: it is the one this session is on
+    moved_by_box "$id" "$pf" && continue   # typed at for THIS model already — which the line has to be read first to know
+    why=$(grep -oiE "(claude-)?(fable|opus|sonnet|haiku) ?[0-9.]* requires usage credits|you.?ve hit your monthly spend limit" <<<"$hit" | head -1)
+    src="$lm"
+    if [ "$(fam "$lm")" != "$pf" ]; then   # the CLI moved the session itself ("Switched to Sonnet 5 for this session"):
+      grep -qi 'switched to' <<<"$hit" || continue   # …else the line is about a model this session is no longer on
+      src=$(rung_id "$pf"); fi                        # what it WAS on, for the restore; its own pick is not the chain's rung
+    nx=$(chain_next "$src") || { printf '%s\t%s\trefusal\t%s\t%s:%s — nothing after %s on the chain\n' "$(date -u +%FT%TZ)" "$now" "$src" "$SESSION" "$name" "$pf" >> "$LOG"; continue; }
+    if [ "$src" != "$lm" ]; then   # the CLI's own pick: moved to the chain's rung and banked as what it WAS on, before any pass banks it as kept
+      type_into "$id" "$name" "/model $nx" || continue   # busy: next tick
+      note_moved "$id" "$name" "$src" moved "$pf"
+      printf '%s\t%s\tretune\t%s\t%s:%s (%s) was on %s — the CLI had moved it to %s\n' "$(date -u +%FT%TZ)" "$now" "$nx" "$SESSION" "$name" "$id" "$src" "$lm" >> "$LOG"; fi
+    mark_unavailable "$src" "$why"   # the record, the owner's line once per model out, and the box off it when it was on it
+    move_off "$pf" "$nx" "the CLI said so in $SESSION:$name" >/dev/null   # …and every session on it, whatever the box was on
+    moved_by_box "$id" "$pf" || continue   # busy or behind a dialog: not moved off THIS model, so not nudged — next tick
+    # the pane that showed the line is at an empty prompt with its turn lost: one line puts it back to work
+    type_into "$id" "$name" "$(label "$pf") refused this session for usage credits; it is on $(label "$nx") now — carry on with what you were doing." >/dev/null &&
+      printf '%s\t%s\tnudged\t%s\t%s:%s after its %s line\n' "$(date -u +%FT%TZ)" "$now" "$nx" "$SESSION" "$name" "$(label "$pf")" >> "$LOG"
+  done < <(sessions); }
 restore_blocked(){   # $1 = prompt_panes output → why a probe that answered still cannot be read as "the limit lifted",
                      # or nothing at all (exit 1) when it can. A `claude -p` turn answers just as readily on usage credits
                      # as on the plan and the result JSON does not say which paid, so the evidence has to come from
@@ -431,24 +622,29 @@ restore_blocked(){   # $1 = prompt_panes output → why a probe that answered st
 SWITCH_TILL=0   # set by a caller that knows the deadline the limit itself named (the prompt's reset); do_switch banks it
 SWITCH_WHAT=limit; SWITCH_FROM=""   # what the owner's line says moved the box, and off which model: a limit on the primary unless told otherwise
 do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
-  local want="$1" why="${2:-}" m wf n=0 id name msg to=0
+  local want="$1" why="${2:-}" m wf n=0 msg to=0 off
+  drop_stale_rows   # before the override is written, for the same reason
   wf=$(fam "$want")
   if [ "$wf" = "$(fam "$PRIMARY")" ]; then m="$PRIMARY"; elif [ "$wf" = "$(fam "$FALLBACK")" ]; then m="$FALLBACK"; else m="$want"; fi
   [ "$m" = "$PRIMARY" ] && forget_unavailable "$(fam "$PRIMARY")"   # back onto the primary = it answered as itself, or the owner says so
-  if ov; then [ "$model" = "$m" ] && return 0; else [ "$m" = "$PRIMARY" ] && return 0; fi   # idempotent: callers may fire on every limited run
+  off=$(fam "$PRIMARY"); ov && off=$(fam "$model")   # the family the box is leaving: what a switch moves sessions OFF
+  if ov; then [ "$model" = "$m" ] && return 0
+  elif [ "$m" = "$PRIMARY" ]; then   # idempotent: callers may fire on every limited run — but sessions moved under the record alone still come back
+    [ -s "$MOVED" ] && { n=$(restore_all "$(fam "$FALLBACK")"); printf '%s\t%s\tswitch\t%s\t%s session(s); %s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$n" "$why" >> "$LOG"; }
+    return 0; fi
   if [ "$m" = "$PRIMARY" ]; then rm -f "$OV" "$ST/model-skipped"
   else limstamp; [ "$lim_till" -gt "$now" ] && to="$lim_till"
     [ "${SWITCH_TILL:-0}" -gt "$to" ] && to="$SWITCH_TILL"
     printf '%s\t%s\t%s\t%s\t0\n' "$m" "$now" "$to" "$(tr -d '\t\n' <<<"$why")" > "$OV"; fi
-  while read -r id name; do [ -n "${id:-}" ] || continue
-    if type_into "$id" "$name" "/model $m"; then n=$((n+1))
-    else printf '%s\t%s\tskip\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION:$name busy or unreachable" >> "$LOG"
-      printf '%s\n' "$id" >> "$ST/model-skipped"; fi   # a pane behind a dialog: retried on later ticks (F3)
-  done < <(sessions)
+  # ONLY THE SESSIONS ON THE MODEL THAT WENT OUT MOVE, and each goes back to what it was on (the brief, 2026-09-15:
+  # "returns to the model it was on"). Down: the panes on the family the box is leaving. Up: each banked pane to its
+  # row, a rowless pane on the fallback to the primary, anything else left where a person put it.
+  if [ "$m" = "$PRIMARY" ]; then n=$(restore_all "$off"); else n=$(move_off "$off" "$m" "$why"); fi
   printf '%s\t%s\tswitch\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$n session(s); $why" >> "$LOG"
-  if [ "$m" = "$PRIMARY" ]; then msg="$(label "$PRIMARY") is back — every session is on it again."
-  elif [ "$to" -gt 0 ]; then msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → all sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z."
-  else msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → all sessions on $(label "$m") until it answers again."; fi
+  [ "$SWITCH_WHAT" = limit ] || return 0   # a model the account cannot run: note_unavailable already told the owner, once, with what lifts it
+  if [ "$m" = "$PRIMARY" ]; then msg="$(label "$PRIMARY") is back — every session it moved is on it again."
+  elif [ "$to" -gt 0 ]; then msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → its sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z, then back by themselves."
+  else msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → its sessions on $(label "$m") until it answers again, then back by themselves."; fi
   "$BIN/cc-notify" -t "$(hostname -s) model" "$msg" >/dev/null 2>&1 || true; }
 # ── CLASSIFICATION READS FIELDS, NEVER THE DOCUMENT ──────────────────────────────────────────────────────────────
 # A result JSON is kilobytes of numbers, uuids and the worker's own prose. Grepping it whole is how this classifier
@@ -463,7 +659,9 @@ LIMIT_RE='usage limit|rate limit|rate_limit|too many requests'
 # 2026-09-03, read as a limit and it parked the box for 14 h). Not a limit — no reset lifts it, and the other models
 # answer — so it is a MOVE, and it is read before the status code: the 2026-08-28 message came with a 429 on it.
 # Real limit wording beside it still wins: a limit hit with no credits left to continue on is a limit.
-CREDITS_RE='usage credits|out of credits|insufficient credits'
+# …and the MONTHLY SPEND CAP (owner, 2026-09-15): "You've hit your monthly spend limit" names a weekly reset that is
+# not its lift — the cap lifts when the owner raises it — and the other models answer. Same kind, same record.
+CREDITS_RE='usage credits|out of credits|insufficient credits|monthly spend limit|spend cap'
 credits_said(){ grep -iE "$CREDITS_RE" <<<"${1:-}" | head -1 | sed -E 's/(\. | · ).*//' | tr -d '\t' | head -c 120; }   # the sentence, for the journal
 # every wording that means the id we asked for is not ours to call: unknown, withdrawn, suspended, not permitted.
 # API SHAPES ONLY — never the bare words refused/declined/unavailable, which a worker writes about its own task.
@@ -523,21 +721,43 @@ classify_run(){   # $1 run json · $2 its stderr · $3 the model that was ASKED 
   { [ -n "$astat" ] && [ "$astat" != 429 ]; } && { printf 'error\tthe API answered %s\n' "$astat"; return 0; }   # a 529/500: retry, not wait
   [ "$failed" = yes ] && { printf 'limit\tin-band error (%s) naming nothing — treated as a limit, as it has been since 2026-08-28\n' "${term:-no terminal_reason}"; return 0; }
   printf 'ok\t\n'; return 0; }
-probe(){   # is the primary model answering again? one cheap turn, no tools.
-           # 0 = answers · 1 = limited · 2 = could not run (unknown) · 3 = refused or rerouted (moving beats retrying)
-  local o="$ST/model-probe.json" rc cl
+probe(){   # $1 = the model id to ask for (the primary's probe id by default): is it answering again? one cheap turn,
+           # no tools. 0 = answers · 1 = limited · 2 = could not run (unknown) · 3 = refused or rerouted (moving beats retrying)
+  local o="$ST/model-probe.json" rc cl pm="${1:-$PROBEM}"
   [ -x "$CLAUDE" ] || return 2
   # --setting-sources '' keeps the probe off this box's settings/MCP servers: a plain turn, cents not dollars
-  timeout 60 "$CLAUDE" -p "reply ok" --model "$PROBEM" --max-turns 1 --setting-sources '' \
+  timeout 60 "$CLAUDE" -p "reply ok" --model "$pm" --max-turns 1 --setting-sources '' \
       --max-budget-usd "${CC_MODEL_PROBE_BUDGET:-0.50}" --output-format json >"$o" 2>"$o.err"; rc=$?
-  cl=$(classify_run "$o" "$o.err" "$PROBEM"); probe_why="${cl#*$'\t'}"; cl="${cl%%$'\t'*}"   # the JSON before the exit code
+  cl=$(classify_run "$o" "$o.err" "$pm"); probe_why="${cl#*$'\t'}"; cl="${cl%%$'\t'*}"   # the JSON before the exit code
   case "$cl" in limit) return 1;; error) return 2;;
-    refusal) unavailable_why "$probe_why" && note_unavailable "$(fam "$PROBEM")" "$probe_why"; return 3;; esac   # the record, refreshed each probe
+    refusal) unavailable_why "$probe_why" && note_unavailable "$(fam "$pm")" "$probe_why"; return 3;; esac   # the record, refreshed each probe
   [ "$rc" = 0 ] || { probe_why="exit $rc"; return 2; }
   return 0; }
 lastprobe(){ cat "$ST/model-probed" 2>/dev/null || echo 0; }   # F2: the pane-detection probe is throttled like the restore probe
+probe_unavailable(){   # EVERY family on record as one the account cannot run is probed back, not only the primary's.
+                       # The cap lands on the model a run ASKED for, and with the commonest dispatch that is the
+                       # fallback, not the primary: an opus row written by cc-limit had nothing that could ever clear
+                       # it, so every worker stayed a rung down after the owner raised the cap until someone edited
+                       # ~/.cc/state/model-unavailable by hand. The primary's row restores the box (do_switch);
+                       # another family's is simply forgotten, and the next dispatch aims at it again.
+  local f pm rc p; p=$(fam "$PRIMARY")
+  [ -s "$UNAV" ] || return 0
+  [ $((now - $(lastprobe))) -ge "${CC_MODEL_PROBE_EVERY:-900}" ] || return 0   # one pass per 15 min, as the restore probe
+  printf '%s\n' "$now" > "$ST/model-probed"
+  while read -r f; do [ -n "${f:-}" ] || continue
+    if [ "$f" = "$p" ]; then pm="$PROBEM"; else pm=$(rung_id "$f"); fi   # each family asked for on its own rung
+    probe_why=""; probe "$pm"; rc=$?
+    case "$rc" in
+      0) if [ "$f" = "$p" ]; then rate_ok && do_switch "$PRIMARY" "answered as itself again (probe)"
+         else forget_unavailable "$f"; fi;;
+      3) printf '%s\t%s\trefusal\t%s\t%s — still not this account'"'"'s to run\n' "$(date -u +%FT%TZ)" "$now" "$pm" "${probe_why:-refused}" >> "$LOG";;
+      *) printf '%s\t%s\tprobe\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$pm" "$([ "$rc" = 1 ] && echo 'still limited' || echo "could not run — unknown (${probe_why:-no json})")" >> "$LOG";;
+    esac
+  done < <(cut -f1 "$UNAV")
+  return 0; }
 tick(){
-  local id name cap line h m rc nx pp pf pe pw ptill why k
+  local id name cap line h m rc nx pp pf pe pw ptill why k pout
+  drop_stale_rows   # rows from an episode cleared by hand are gone before (1c) reads them
   # ---- (1)+(2) THE CLI'S OWN LIMIT PROMPT: answered first, and in EVERY state. A session sitting on it delivers
   # nothing at all — on 2026-09-01 a pulse tick and two secretary findings went nowhere for exactly this — and the
   # answer is the same whether or not the box has already moved off the primary model.
@@ -547,8 +767,11 @@ tick(){
     k=$(answer_prompt "$id") &&
       printf '%s\t%s\tanswered\t%s\t%s: %s limit prompt — %s\n' "$(date -u +%FT%TZ)" "$now" "$pf" "$SESSION:$name" "$(label "$pf")" "$k" >> "$LOG"
   done <<<"$pp"
+  # ---- (1c) IN EVERY STATE: the CLI's own "requires usage credits" / spend-cap line on a live pane moves that
+  # session — and every session on the model it names — to the next rung, whatever the box itself is on.
+  credits_panes
   # ---- (4) IN EVERY STATE, AND BEFORE ANY BRANCH BELOW CAN RETURN: say which live sessions are not on the model a
-  # dispatch would name. Report only — the retune pass further down is the one that types, and it is same-family.
+  # dispatch would name. Report only — the moves above and the retune pass further down are the ones that type.
   report_mismatches
   if ov; then   # ---- the fallback is on: restore once the limit has passed AND the primary model answers again
     if [ -s "$ST/model-skipped" ]; then   # F3: panes that were behind a dialog at switch time get another try
@@ -583,6 +806,12 @@ tick(){
   # is the slow path and the paid one; this one costs nothing and fires in the tick after the stamp (stamp_says_switch).
   if stamp_says_switch; then
     rate_ok && do_switch "$FALLBACK" "$(fam "$PRIMARY") limit (cc-limit stamp)"; return 0; fi
+  # ---- (5) no override, but some model is on record as one the account cannot run: probe each one back, like an
+  # override above. Only the primary's row ends the tick here — the passes below are the primary's own.
+  if [ -s "$UNAV" ]; then
+    pout=""; unavail "$(fam "$PRIMARY")" && pout=1
+    probe_unavailable
+    [ -n "$pout" ] && return 0; fi
   # ---- no override is in force, so the box wants PRIMARY: a session on another ID of that same family — the pane on
   # `claude-fable-5` while the box is on `claude-fable-5-1` — is retuned. Nothing here could see that before: to fam()
   # the two are one rung, and the sessions cc-model itself typed the old id into on 2026-09-01 were never moved back.
@@ -627,6 +856,7 @@ selfcheck(){   # fixtures only: no network, no tmux, and none of this box's stat
   local dlg dlg2 dlgwrap notice credits worker quoted perm askfirst pe0 pn pf0
   d=$(mktemp -d) || return 1
   UNAV="$d/model-unavailable"   # hermetic from the first case: a model this box has recorded must not bend the chain here
+  local oldmoved="$MOVED"; MOVED="$d/model-moved"
   local oldsl="${CC_STATUSLINE_DIR:-}"
   CC_STATUSLINE_DIR="$d/statusline"; mkdir -p "$CC_STATUSLINE_DIR"   # …and this box's LIVE sessions are not this test's
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
@@ -890,16 +1120,16 @@ TXT
   rm -f "$OV"; : > "$LOG"; : > "$d/calls"
   t 'nothing recorded: nothing is forcing the box off its primary' "$(forced)" ""
   mark_unavailable "$c3" 'Sonnet 5 requires usage credits'
-  t 'a model the box is not on is recorded, and nothing is switched or said' \
-    "$(unavail "$(fam "$c3")" && echo rec)$([ -e "$OV" ] && echo ov)$(grep -c '^notify' "$d/calls")" rec0
+  t 'a model the box is not on is recorded, nothing is switched, and the owner hears the kind once — not a limit, what lifts it' \
+    "$(unavail "$(fam "$c3")" && echo rec)$([ -e "$OV" ] && echo ov)$(grep -c "^notify .*$(label "$c3") is not available to this account (Sonnet 5 requires usage credits) — not a limit: no reset lifts it.* return by themselves when it answers again (credits or the cap at claude.ai/settings/usage, or a re-login)" "$d/calls")" rec1
   t 'the chain a caller walks leaves it out'      "$(chain | tr '\n' ' ')"      "$c1 $c2 "
   t 'and next steps over it to the chain'"'"'s end' "$(chain_next "$c2"; echo ":$?")" ":1"
   forget_unavailable "$(fam "$c3")"
   t 'forgotten, it is a rung again'               "$(chain | wc -l)"            3
-  mark_unavailable "$c1" 'Fable 5.1 requires usage credits'
+  : > "$d/calls"; mark_unavailable "$c1" 'Fable 5.1 requires usage credits'
   t 'the PRIMARY the account cannot run: the box moves to the next rung, its [1m] context riding along' "$(cut -f1 "$OV")" "$exp"
-  t 'and the owner'"'"'s line says what moved it — not a limit' \
-    "$(grep -c "^notify .*$(label "$PRIMARY") is not available to this account (Fable 5.1 requires usage credits) → all sessions on $(label "$exp") until it answers again" "$d/calls")" 1
+  t 'and the owner'"'"'s ONE line says what is out, that it is not a limit, where its sessions run and that they come back' \
+    "$(grep -c "^notify" "$d/calls"):$(grep -c "^notify .*$(label "$PRIMARY") is not available to this account (Fable 5.1 requires usage credits) — not a limit: no reset lifts it. Sessions and loops on it run on $(label "$exp") and return by themselves" "$d/calls")" 1:1
   t 'the override carries the reason'             "$(cut -f4 "$OV")" "$(fam "$c1") not available to this account: Fable 5.1 requires usage credits"
   t 'current hands a dispatch that rung'          "$(current)"      "$exp"
   t 'status says which model, and why'            "$(status_line)" "$(fam "$exp") until probe — $(fam "$c1") is not available to this account"
@@ -917,6 +1147,156 @@ TXT
   do_switch "$c2" 'test'; : > "$d/calls"; mark_unavailable "$c2" 'Opus 5 requires usage credits'
   t 'the override model the box is on can be the one: it moves on down the chain' "$(fam "$(cut -f1 "$OV")")" "$(fam "$c3")"
   t 'and that line names the model it left'       "$(grep -c "^notify -t $(hostname -s) model $(label "$c2") is not available" "$d/calls")" 1
+
+  # ── AN OUTAGE MOVES ONLY THE SESSIONS ON THAT MODEL, AND ITS LIFT PUTS EACH BACK WHERE IT WAS (2026-09-15) ──────
+  # The brief's three DONE lines, each on its own fixture: (a) a Fable-only refusal, read off the CLI's own line,
+  # moves Fable-bound work and nothing else; (b) a full limit moves the sessions on the limited model down and its
+  # lift moves them back with no handoff; (c) what a relaunch and a loop resolve to, during and after. The live
+  # sessions and what they run come from the two test hooks; cc-msg is a stub that records what it typed where.
+  local oldsess="${CC_MODEL_SESSIONS:-}" oldlive="${CC_MODEL_LIVE:-}" pn
+  rm -f "$OV" "$UNAV" "$MOVED" "$d/model-skipped"; : > "$LOG"; : > "$d/calls"; : > "$d/typed"
+  SESSION=main; PROC=claude; CC_MODEL_DIALOG_WAIT=0; CC_MODEL_SESSIONS="$d/sess"; CC_MODEL_LIVE="$d/live"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" "$1" "$2" >> "%s/typed"\n' "$d" > "$d/bin/cc-msg"; chmod +x "$d/bin/cc-msg"
+  tmux(){ case "${1:-}" in display-message) echo 1;; capture-pane) cat "$d/screen.${*: -1}" 2>/dev/null;; esac; return 0; }
+  typed(){ awk -F'\t' -v w="$1" '$1==w{print $2}' "$d/typed" | paste -sd'|' -; }   # what was typed into a window, in order
+  # (a) the box on its primary; one orch shows the CLI's boxed line at an empty prompt, one orch is quietly on Fable,
+  #     a steward is on Sonnet, and a person put one session on Opus
+  printf '%s\n' '%1 orch-a' '%2 orch-b' '%3 steward' '%4 by-hand' > "$d/sess"
+  printf '%s\t%s\n' '%1' "$PRIMARY" '%2' "${PRIMARY%%\[*}" '%3' "$c3" '%4' "$exp" > "$d/live"
+  printf '%s\n' '● I will read the journal first.' \
+    '  │ Fable 5.1 requires usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.' \
+    '' '❯ ' > "$d/screen.%1"
+  for pn in 2 3 4; do printf '> \n' > "$d/screen.%$pn"; done
+  credits_panes
+  t '(a) the CLI'"'"'s own line: the model it names is recorded as one the account cannot run — the kind, not a limit' \
+    "$(unavail fable && echo rec):$(cut -f4 "$UNAV")" "rec:Fable 5.1 requires usage credits"
+  t '(a) …and the box, which was on it, moves off it: a launch now names the next rung' "$(current)" "$exp"
+  t '(a) the pane that showed it is moved to the next rung and nudged back to work' \
+    "$(typed orch-a)" "/model $exp|Fable 5.1 refused this session for usage credits; it is on Opus 5 now — carry on with what you were doing."
+  t '(a) every other session ON that model moves too, with no nudge: it is mid-work or idle by choice' "$(typed orch-b)" "/model $exp"
+  t '(a) a session on another family is not Fable-bound: nothing is typed at the steward, nor at the one a person put on Opus' \
+    "$(typed steward)$(typed by-hand)" ""
+  t '(a) the owner hears it once' "$(grep -c '^notify' "$d/calls")" 1
+  t '(a) what each pane was on is banked, moved or kept' \
+    "$(cut -f1,3,5 "$MOVED" | tr '\t' ':' | sort | paste -sd' ' -)" "%1:$PRIMARY:moved %2:${PRIMARY%%\[*}:moved %3:$c3:kept %4:$exp:kept"
+  : > "$d/typed"; credits_panes
+  t '(a) the line is still on screen a tick later: nothing is typed twice, nobody is told twice' "$(wc -l < "$d/typed")$(grep -c '^notify' "$d/calls")" 01
+  # …AND A SECOND OUTAGE INSIDE THE SAME EPISODE IS A MOVE OF ITS OWN (third review of #503). The guard above was the
+  # pane's ROW and the row belonged to the EPISODE: a pane typed at during the Fable move carried `moved` for the rest
+  # of it, so when the account hit its monthly cap on Opus two hours later — the same panes, one rung down — both
+  # credits_panes and move_off skipped it, Opus was never recorded out, and the session stood at an empty prompt for
+  # good. That is the 00:5xZ stall again. The row now names the family each move was OFF, so the second move is
+  # guarded by its own and not by the first's.
+  local c3x; c3x=$(chain_next "$exp")   # the rung under the one the Fable move landed on
+  : > "$d/typed"
+  awk -F'\t' 'BEGIN{OFS="\t"} NF{$2=$2-7200; print}' "$LOG" > "$LOG.t" && mv "$LOG.t" "$LOG"   # two hours later: the first move's retune rows are outside CC_MODEL_RETUNE_GAP
+  printf '%s\t%s\n' '%1' "$exp" '%2' "$exp" '%3' "$c3" '%4' "$exp" > "$d/live"   # the Fable move landed: both orchs are on Opus now
+  printf '%s\n' "  ⎿  You've hit your monthly spend limit · your weekly limit resets 10pm (America/Los_Angeles)" '' '❯ ' > "$d/screen.%1"
+  credits_panes
+  t '(a) a SECOND outage in the same episode is its own move: the pane goes down a rung and is nudged, not skipped as typed at already' \
+    "$(typed orch-a)" "/model $c3x|$(label "$exp") refused this session for usage credits; it is on $(label "$c3") now — carry on with what you were doing."
+  t '(a) …and every session on THAT model moves too — the one a person had put on Opus is Opus-bound now; the steward on Sonnet is not' \
+    "$(typed orch-b):$(typed by-hand):$(typed steward)" "/model $c3x:/model $c3x:"
+  t '(a) …while the chained move still restores each pane to what it was on before the FIRST one' \
+    "$(moved_row %1):$(moved_row %4)" "$PRIMARY:$exp"
+  t '(a) …and the owner hears this model too: the line is once per model out, not once per episode' \
+    "$(grep -c "^notify .*$(label "$exp") is not available to this account" "$d/calls")" 1
+  : > "$d/typed"; credits_panes
+  t '(a) …and the cap line a tick later types nothing: the second move has a guard of its own now' "$(wc -l < "$d/typed")" 0
+  forget_unavailable "$(fam "$exp")"; printf '%s\t%s\t0\t%s\t0\n' "$exp" "$now" 'the Fable move' > "$OV"   # the rest of (a) picks up where that move left off
+  # …the other two shapes, with the box ALREADY on the override (the 00:5xZ stall): the CLI moved one session to
+  #    Sonnet by itself, and a late-launched orch on Fable hit the monthly cap
+  rm -f "$MOVED"; : > "$d/typed"; : > "$LOG"
+  printf '%s\n' '%5 moved-itself' > "$d/sess"; printf '%s\t%s\n' '%5' "$c3" > "$d/live"
+  printf '%s\n' '● Switched to Sonnet 5 for this session · Fable 5.1 requires usage credits · /model to change' '' '❯ ' > "$d/screen.%5"
+  credits_panes
+  t '(a) "Switched to Sonnet 5 for this session · Fable 5.1 requires usage credits": the CLI'"'"'s own pick is not the chain'"'"'s rung — moved to it, banked as Fable' \
+    "$(typed moved-itself | cut -d'|' -f1):$(moved_row %5)" "/model $exp:$PRIMARY"
+  rm -f "$MOVED"; : > "$d/typed"
+  printf '%s\n' '%6 orch-late' > "$d/sess"; printf '%s\t%s\n' '%6' "$PRIMARY" > "$d/live"
+  printf '%s\n' "  ⎿  You've hit your monthly spend limit · your weekly limit resets 10pm (America/Los_Angeles)" \
+    '     /usage-credits to adjust your monthly spend limit.' '' '❯ ' > "$d/screen.%6"
+  credits_panes
+  t '(a) the monthly spend cap names no model: it is the one that session is on, and it is the same kind' \
+    "$(typed orch-late | cut -d'|' -f1):$(cut -f4 "$UNAV")" "/model $exp:You've hit your monthly spend limit"
+  t '(a) the box was already off Fable: no second switch, the sessions moved all the same' "$(grep -c $'\tswitch\t' "$LOG")" 0
+  # …and the shapes that must NOT fire: history (a retune typed after the line), and prose that quotes it
+  rm -f "$MOVED"; : > "$d/typed"
+  printf '%s\n' '%8 restored' '%9 reader' > "$d/sess"; printf '%s\t%s\n' '%8' "$PRIMARY" '%9' "$PRIMARY" > "$d/live"
+  printf '%s\n' '  │ Fable 5.1 requires usage credits. Switch to another model, or manage usage credits, to continue.' \
+    "❯ /model $PRIMARY" '  ⎿  Set model to Fable 5.1 and saved as your default for new sessions' '❯ ' > "$d/screen.%8"
+  printf '%s\n' '# "Fable 5.1 requires usage credits" (2026-09-03, the account went Pro) and "You'"'"'re out of usage' \
+    '- cc-loop: iteration 1 was refused or rerouted on claude-fable-5-1[1m] (needs usage credits: Fable 5.1 requires usage credits)' \
+    '   16:  ⎿  You'"'"'ve hit your monthly spend limit · raise it at claude.ai/settings/usage' '❯ ' > "$d/screen.%9"
+  credits_panes
+  t '(a) a line the box has since retuned past is history, and prose quoting the words is prose: nothing moves' "$(wc -l < "$d/typed")" 0
+  # (b) a full limit on the primary, then its lift — the sessions on it down, and back to what each was on
+  rm -f "$OV" "$UNAV" "$MOVED"; : > "$d/typed"; : > "$LOG"; : > "$d/calls"
+  printf '%s\n' '%1 seat' '%2 orch' '%3 steward' '%4 by-hand' '%8 no-record' > "$d/sess"   # %8: no statusline record, no --model — a hand launch, or the selftest's bare cat
+  printf '%s\t%s\n' '%1' "$PRIMARY" '%2' "${PRIMARY%%\[*}" '%3' "$c3" '%4' "$exp" > "$d/live"
+  for pn in 1 2 3 4 7 8; do printf '> \n' > "$d/screen.%$pn"; done
+  printf '%s\tseat\t%s\t%s\tmoved\n' '%1' "$PRIMARY" "$((now - 7200))" > "$MOVED"   # a row an earlier episode left when its state was cleared by hand
+  SWITCH_TILL=$((now + 3600)); do_switch "$FALLBACK" "$(fam "$PRIMARY") limit"; SWITCH_TILL=0
+  t '(b) a full limit moves the sessions ON the limited model down the chain, and only those' \
+    "$(typed seat):$(typed orch):$(typed steward)$(typed by-hand)" "/model $FALLBACK:/model $FALLBACK:"
+  t '(b) a session with no record and no --model is taken to be on the model going out — not on what `current` says once the override is written — and moves' \
+    "$(typed no-record):$(moved_row %8)" "/model $FALLBACK:$PRIMARY"
+  t '(b) the row an earlier episode left behind held nobody back: the box was on its primary, so this episode started from none' \
+    "$(grep -c "$((now - 7200))" "$MOVED")" 0
+  t '(b) the owner'"'"'s line says its sessions come back by themselves' "$(grep -c '^notify .*its sessions on Opus 5 until .*, then back by themselves' "$d/calls")" 1
+  printf '%s\n' '%1 seat' '%2 orch' '%3 steward' '%4 by-hand' '%7 successor' '%8 no-record' > "$d/sess"   # a handoff during the outage came up on `current`
+  printf '%s\t%s\n' '%1' "$FALLBACK" '%2' "$FALLBACK" '%3' "$c3" '%4' "$exp" '%7' "$FALLBACK" > "$d/live"
+  : > "$d/typed"; do_switch "$PRIMARY" 'limit lifted (probe)'
+  t '(b) its lift puts each session back on what IT was on — no handoff, no restart, the exact id it had' \
+    "$(typed seat):$(typed orch)" "/model $PRIMARY:/model ${PRIMARY%%\[*}"
+  t '(b) …a session launched during the outage has no row, so it goes to the primary' "$(typed successor)" "/model $PRIMARY"
+  t '(b) …the one with no record goes back to what its row says' "$(typed no-record)" "/model $PRIMARY"
+  t '(b) …the steward stays on Sonnet, and the one a person put on Opus stays on Opus' "$(typed steward)$(typed by-hand)" ""
+  t '(b) the episode is over: the rows go, the override goes' "$([ -e "$MOVED" ] && echo rows)$([ -e "$OV" ] && echo ov)" ""
+  # (c) what a relaunch and a loop iteration resolve to: cc passes `current`; cc-loop asks `resolve` every iteration
+  rm -f "$OV" "$UNAV" "$MOVED"; : > "$d/typed"
+  t '(c) on its primary, a caller asking for the primary runs it' "$(resolve "$PRIMARY")" "$PRIMARY"
+  do_switch "$FALLBACK" 'a limit moved the box'
+  t '(c) during a limit the same ask resolves to the next rung, [1m] riding along — what the next iteration runs' "$(resolve "$PRIMARY")" "$exp"
+  t '(c) …and `out` says why' "$(out_why "$PRIMARY" | cut -d: -f1)" "$(fam "$PRIMARY") is limited"
+  t '(c) a caller asking for the rung the box is ON is not out' "$(out_why "$exp" >/dev/null; echo $?):$(resolve "$exp")" "1:$exp"
+  do_switch "$PRIMARY" 'lifted'
+  t '(c) after the lift the ask resolves to the primary again: the loop is back on Fable next iteration, unpinned' "$(resolve "$PRIMARY")" "$PRIMARY"
+  note_unavailable "$(fam "$PRIMARY")" 'Fable 5.1 requires usage credits'
+  t '(c) a Fable-only outage resolves the same way, override or none' "$(resolve "$PRIMARY"):$(out_why "$PRIMARY")" "$exp:$(fam "$PRIMARY") is not available to this account: Fable 5.1 requires usage credits"
+  t '(c) a model with no family is handed back as asked' "$(resolve nonesuch)" nonesuch
+  # (b) the record alone — the override cleared by hand — with a session the box had moved: the primary answering
+  #     (a probe, or the owner's switch) still puts it back
+  rm -f "$OV"; : > "$d/typed"; printf '%%1\tseat\t%s\t%s\tmoved\n' "$PRIMARY" "$now" > "$MOVED"
+  printf '%s\n' '%1 seat' > "$d/sess"; printf '%s\t%s\n' '%1' "$exp" > "$d/live"; printf '> \n' > "$d/screen.%1"
+  do_switch "$PRIMARY" 'answered as itself again (probe)'
+  t '(b) with no override but a moved session on record, the primary answering still restores it and forgets the record' \
+    "$(typed seat):$(unavail "$(fam "$PRIMARY")" && echo rec):$([ -e "$MOVED" ] && echo rows)" "/model $PRIMARY::"
+  # (d) EVERY MODEL ON RECORD IS PROBED BACK, NOT ONLY THE PRIMARY'S (fifth review of #503). The cap lands on the
+  #     model a run ASKED for, and the commonest dispatch asks for the fallback: the row cc-limit writes with
+  #     `cc-model unavailable claude-opus-5` had nothing that could ever clear it — tick probed the primary alone —
+  #     so every worker stayed a rung down after the owner raised the cap, until someone edited the file by hand.
+  rm -f "$OV" "$MOVED" "$UNAV" "$ST/model-probed"; : > "$LOG"; : > "$d/typed"; : > "$d/calls"
+  local asked=""   # the ids the probe was asked for, in order; this one answers as opus and nothing else
+  probe(){ asked="${asked:+$asked }${1:-}"; [ "$(fam "${1:-}")" = "$(fam "$c2")" ]; }
+  note_unavailable "$(fam "$c2")" "You've hit your monthly spend limit"
+  t '(d) a model that is not the primary recorded out by the cap: the ask is walked past it' "$(resolve "$c2")" "$c3"
+  probe_unavailable
+  t '(d) …it is probed on ITS own rung, not the primary'"'"'s' "$asked" "$c2"
+  t '(d) …and its answer forgets the row: the ask resolves to it again, with no override to clear and no switch' \
+    "$(unavail "$(fam "$c2")" && echo rec)$(resolve "$c2"):$(grep -c $'\tswitch\t' "$LOG")" "$c2:0"
+  asked=""; probe_unavailable
+  t '(d) …the 15-minute throttle covers the whole pass: nothing is asked twice inside one window' "$asked" ""
+  rm -f "$ST/model-probed"; note_unavailable "$(fam "$c2")" 'the cap again'; note_unavailable "$(fam "$PRIMARY")" 'the cap'
+  asked=""; probe_unavailable
+  t '(d) two models out: each is asked for once, the primary on its own probe id' "$asked" "$c2 $PROBEM"
+  t '(d) …the one that answered is forgotten, the one still limited is kept, and the log says which' \
+    "$(cut -f1 "$UNAV" | paste -sd, -):$(grep -c $'\tprobe\t'"$PROBEM"$'\tstill limited' "$LOG")" "$(fam "$PRIMARY"):1"
+  unset -f probe
+  forget_unavailable "$(fam "$PRIMARY")"; rm -f "$MOVED" "$OV" "$UNAV" "$d/typed"; unset -f typed
+  if [ -n "$oldsess" ]; then CC_MODEL_SESSIONS="$oldsess"; else unset CC_MODEL_SESSIONS; fi
+  if [ -n "$oldlive" ]; then CC_MODEL_LIVE="$oldlive"; else unset CC_MODEL_LIVE; fi
+  PROC=nonesuch; tmux(){ return 1; }
 
   # ── A DISAGREEMENT BETWEEN WHAT IS CONFIGURED AND WHAT IS RUNNING IS SAID, NEVER ACTED ON ────────────────────
   # retune_to above is same-family by design, so a session on ANOTHER family was invisible to everything here: on
@@ -951,7 +1331,7 @@ TXT
   t 'and when they agree again, status is quiet about it' "$(status_line)" "$(fam "$PRIMARY")"
   unset -f slrec
   rm -f "$CC_STATUSLINE_DIR"/*.json
-  unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"
+  unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"; MOVED="$oldmoved"
   if [ -n "$oldsl" ]; then CC_STATUSLINE_DIR="$oldsl"; else unset CC_STATUSLINE_DIR; fi
   rm -rf "$d"
   printf 'cc-model selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
@@ -964,6 +1344,8 @@ case "${1:-}" in
   limited) [ "$(fam "${2:?usage: cc-model limited <model> [reason]}")" = "$(fam "$PRIMARY")" ] || exit 0
            rate_ok && do_switch "$FALLBACK" "${3:-$(fam "$2") limit}" ;;
   unavailable) mark_unavailable "${2:?usage: cc-model unavailable <model> [reason]}" "${3:-}" ;;
+  out)     out_why "${2:?usage: cc-model out <model>}" || exit 1 ;;
+  resolve) resolve "${2:?usage: cc-model resolve <model>}" ;;
   classify) shift; classify_run "${1:?usage: cc-model classify <json> [<err>] [<asked-model>]}" "${2:-}" "${3:-}" ;;
   chain)   chain ;;
   next)    chain_next "${2:-}" || exit 1 ;;
