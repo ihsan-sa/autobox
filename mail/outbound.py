@@ -53,12 +53,13 @@ and then decides everything on that one fd — regular file, under the byte cap,
 plus that workspace's Slack files dir — see in_workspace). Nothing is checked by path and re-opened
 afterwards: the member owns that name and could swap a secret in between. A FILE EITHER ARRIVES AS A FILE, OR
 THE CALLER AND THE THREAD ARE TOLD IT DID NOT (owner, 2026-09-09: "Attachements dont always work well"). On
-the reply path a file that is not ours, or one over the cap, is one 📎 line in the thread naming it and the
-reason: when MAIL_OUT_LINKS maps the path to a URL the mail still goes, carrying a LINK LINE in the file's
-place, and the thread's line says it went as a link; when nothing maps it NOTHING is mailed and the line says
-where to put the file. A cold mail (`cc-mail send --json`) names its files up front, and one that cannot go
-stops the whole send with the file and the reason — see send_to(). Neither path ever says "sent" about a
-file it dropped.
+the reply path the file is judged BEFORE Slack has it: cc-slack's upload_file asks attach_check() first, and a
+file that is not ours, or one over the cap, with no MAIL_OUT_LINKS URL for it, refuses the whole call — nothing
+reaches Slack, nothing is mailed, and the tool answers with the 📎 line saying where to put the file. When
+MAIL_OUT_LINKS maps the path to a URL the mail goes, carrying a LINK LINE in the file's place, and the
+thread's line says it went as a link. A cold mail (`cc-mail send --json`) names its files up front, and one
+that cannot go stops the whole send with the file and the reason — see send_to(). Neither path ever says
+"sent" about a file it dropped, and neither posts a file to Slack it then cannot mail.
 
 SENDING IS OFF UNTIL CONFIGURED. With no MAIL_SEND_URL or no MAIL_SEND_SECRET every call is a no-op that logs
 one line per process and nothing else — the reply is in Slack and the thread says nothing about mail, because
@@ -105,15 +106,15 @@ CONFIG, all of it in ~/.cc/config, read by cc-slack and handed here as a dict:
                          (session_channel, cold_from; owner, 2026-09-10)
       MAIL_OUT_PER_HOUR  6 mails per mirror thread per hour, and 6 cold mails an hour for the whole box
       MAIL_OUT_PER_DAY   30 mails per recipient per day, counted across both paths
-      MAIL_OUT_MAX_ATTACH_BYTES  8388608 (8 MiB) per file. Over it a reply's file is a 📎 line in the thread
-                         (and a link line in the mail when MAIL_OUT_LINKS has a URL for it) and a cold mail is
-                         refused, naming the file
+      MAIL_OUT_MAX_ATTACH_BYTES  8388608 (8 MiB) per file. Over it a reply's file is refused before the upload
+                         (or goes as a link line in the mail when MAIL_OUT_LINKS has a URL for it) and a cold
+                         mail is refused, naming the file
       MAIL_OUT_ROOTS     ~/dev:~/.cc/worktrees — the trees a file may be attached from, colon-separated. A
                          member's workspace is narrowed to `<root>/<handle>` inside them. The workspace's own
                          Slack files dir (~/.cc/slack/files; a member's member dir) is always one more
       MAIL_OUT_LINKS     `<path prefix>=<url base>` rows, comma- or newline-separated, the same shape as
                          MAIL_WORKSPACE. A file under a prefix that cannot be attached goes as a URL in a link
-                         line; one under no prefix is not mailed at all, and the thread is told
+                         line; one under no prefix refuses the call, and the caller is told
 State is ~/.cc/mail/out/rate.json (the two caps' clocks) and the log is ~/.cc/mail/out.log — its own file, not
 the daemon's, because `cc-slack post` on the command line has no daemon log to write to.
 """
@@ -690,6 +691,50 @@ def by_mail(rec, chat, ts):
     return any(m.get("chat") == chat and str(m.get("ts")) == ts for m in (rec.get("mirrors") or []))
 
 
+def mail_bound(cfg, chat, thread, ts):
+    """The conversation record when a post at (chat, thread) answering `ts` would go out as mail, else None —
+    the one question send() and attach_check() both open with, so a file is judged by the same rule that
+    would mail it. `chat`/`thread` are the only way in: the addresses come off the conversation those two name
+    on disk, so there is no argument here a caller could point at somebody else. Everything that is not a `to`
+    root of a known conversation is None, which is every ordinary post on the box."""
+    if not thread or not chat:
+        return None
+    R = _router()
+    rec = R.conv_by_root(chat, thread)
+    if not rec:
+        return None
+    if not any(r.get("chat") == chat and r.get("ts") == thread and r.get("role") == "to"
+               for r in (rec.get("roots") or [])):
+        return None                     # a channel that was only copied on the mail does not speak for the box
+    # "a post answering a Slack-origin message stays in Slack; one answering a mail-origin message goes out as
+    # mail as today; a post that answers nothing in a mail thread stays in Slack" (owner, 2026-09-10)
+    if not by_mail(rec, chat, ts):
+        return None
+    if not configured(cfg):
+        log_once("sending is off (MAIL_SEND_URL or MAIL_SEND_SECRET unset) — %s stayed in Slack" % rec.get("id"))
+        return None                     # nothing was promised, so the thread says nothing
+    return rec
+
+
+def attach_check(cfg, chat, thread, ts, path):
+    """"" when `path` would travel with the mail a post at (chat, thread) answering `ts` sends — as a file, or
+    as a MAIL_OUT_LINKS link — or when that post would not be mailed at all; else the one line saying why it
+    would not, for the caller to REFUSE ON BEFORE anything reaches Slack. "an attachment that cannot be sent
+    makes the call fail, not succeed" (the brief, 2026-09-19): before this, send() found out after the Slack
+    upload, mailed nothing, and the tool call that had posted the file still reported `sent` — the session
+    then told the owner a file was attached that the sender never got. The judgement is attach_bytes(),
+    the same one send() makes when it builds the mail, so the two cannot disagree on a file."""
+    rec = mail_bound(cfg, chat, thread, ts)
+    if not rec:
+        return ""
+    cap = cfg_int(cfg, "MAIL_OUT_MAX_ATTACH_BYTES", MAX_ATTACH)
+    _data, why = attach_bytes(path, rec, cfg, cap)
+    if not why or link_for(path, cfg):
+        return ""
+    log("%s: refused before upload — %s: %s" % (rec.get("id"), clip(os.path.basename(path)), why))
+    return not_attached(path, rec, cfg, why, cap) + ". Nothing was sent, to Slack or by mail"
+
+
 def send(cfg, chat, thread, text="", path="", now=None, ts=""):
     """ONE POST IN A MIRROR THREAD, MAILED WHEN IT ANSWERS A MAIL. Returns "" when there is nothing to say in
     Slack, or the one line the caller posts in that thread saying the mail did not go and why.
@@ -701,22 +746,9 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
     `ts` is the message the post answers. It decides the medium and nothing else: a post answering a message
     that came by mail (by_mail) goes out; one answering a Slack message, or answering nothing, stays in Slack
     and this returns "" without a word — nothing was promised, so the thread says nothing."""
-    if not thread or not chat:
-        return ""
-    R = _router()
-    rec = R.conv_by_root(chat, thread)
+    rec = mail_bound(cfg, chat, thread, ts)
     if not rec:
         return ""
-    if not any(r.get("chat") == chat and r.get("ts") == thread and r.get("role") == "to"
-               for r in (rec.get("roots") or [])):
-        return ""                       # a channel that was only copied on the mail does not speak for the box
-    # "a post answering a Slack-origin message stays in Slack; one answering a mail-origin message goes out as
-    # mail as today; a post that answers nothing in a mail thread stays in Slack" (owner, 2026-09-10)
-    if not by_mail(rec, chat, ts):
-        return ""
-    if not configured(cfg):
-        log_once("sending is off (MAIL_SEND_URL or MAIL_SEND_SECRET unset) — %s stayed in Slack" % rec.get("id"))
-        return ""                       # nothing was promised, so the thread says nothing
     domain = cfg.get("MAIL_DOMAIN") or ""
     from_a = from_addr(rec, domain)
     to, cc = recipients(rec, domain)
@@ -761,6 +793,7 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
     # THE ID GOES IN THE CONVERSATION, and only after the mail is away: an id nothing was ever sent with would
     # thread a stranger's reply onto this conversation. save_conv re-reads and re-writes both indexes under its
     # own lock, so the record is loaded again here rather than reusing the one above.
+    R = _router()
     fresh = R.load_conv(rec["id"]) or rec
     if mid not in (fresh.setdefault("message_ids", [])):
         fresh["message_ids"].append(mid)

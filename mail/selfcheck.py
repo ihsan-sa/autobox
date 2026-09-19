@@ -2062,6 +2062,30 @@ def run():
         k(any("not sent" in ln and "big.pdf" in ln and "too large" in ln for ln in logged()),
           "…and the log has the refusal, not a `sent` line")
 
+        # …and the SAME judgement is made BEFORE Slack has the file. "an attachment that cannot be sent makes the
+        # call fail, not succeed" (the brief, 2026-09-19): cc-slack's upload_file asks attach_check() first and
+        # refuses the whole call on its line, so a file that would not travel reaches neither Slack nor the
+        # mail — before this Slack got it, send() mailed nothing, and the tool still reported `sent`.
+        fresh()
+        conv()
+        with FakeWorker() as w:
+            small = conf(w, MAIL_OUT_ROOTS=dev, MAIL_OUT_MAX_ATTACH_BYTES=1024)
+            pre_big = outbound.attach_check(small, "C-mem", "1700.1", "1700.1", big)
+            pre_ok = outbound.attach_check(small, "C-mem", "1700.1", "1700.1", lesson)
+            pre_slack = outbound.attach_check(small, "C-mem", "1700.1", "1700.5", big)   # answers a Slack message
+            pre_none = outbound.attach_check(small, "C-nowhere", "1.0", "1.0", big)      # not a mail thread at all
+            pre_link = outbound.attach_check(conf(w, MAIL_OUT_ROOTS=dev, MAIL_OUT_MAX_ATTACH_BYTES=1024,
+                                                  MAIL_OUT_LINKS="%s=https://pub.example/m" % dev),
+                                             "C-mem", "1700.1", "1700.1", big)
+        k(pre_big.startswith("📎 big.pdf (4 KB) is over the 1 KB attachment cap")
+          and "Nothing was sent, to Slack or by mail" in pre_big and not w.calls
+          and pre_ok == "" and pre_slack == "" and pre_none == "" and pre_link == "",
+          "attach_check: a file that would not travel with the mail is refused BEFORE the upload with the same "
+          "📎 line send() would post; one that travels, one with a URL to go as, a post answering a Slack "
+          "message and a post in no mail thread all pass with \"\", and nothing is mailed by the check itself")
+        k(any("refused before upload" in ln and "big.pdf" in ln for ln in logged()),
+          "…and the log says the refusal happened before the upload, so a `sent` line is never beside it")
+
         # …and a file NOTHING in the workspace owns is not attached at all, whatever a session says it is —
         # and its line names the OTHER reason, so out-of-tree and too-large are never one word.
         fresh()
