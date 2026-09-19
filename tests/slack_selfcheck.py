@@ -64,7 +64,7 @@ def run_selfcheck():
     deferred = []
     real_queue_land, real_land_sweep = Daemon.queue_land, Daemon.land_sweep
     real_publish_soon = Daemon.publish_soon
-    Daemon.queue_land = lambda self, repo, n, chat, ts, who="", run=None: (
+    Daemon.queue_land = lambda self, repo, n, chat, ts, who="", run=None, uid="": (
         deferred.append(("queue", repo, n)) or (True, f"[{repo}] PR #{n} queued (a stand-in for the selfcheck)"))
     Daemon.land_sweep = lambda self, run=None: deferred.append(("sweep", "", ""))
     Daemon.publish_soon = lambda self, repo: deferred.append(("publish", repo))
@@ -214,10 +214,10 @@ def run_selfcheck():
         dm = Daemon(use_slack=False); dm.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dm.bot_user = "UBOT"; dm.names.update({"CAPPR": APPROVALS, "CREPO": "myrepo"})
         posts = {"1.1": {"user": "UBOT", "text": f"[{name}] PR #7: t — https://x/7"}, "1.2": {"user": "UOWNER", "text": f"[{name}] PR #8: t"},
                  "1.3": {"user": "UBOT", "text": f"merged [{name}] PR #9:"}, "1.4": {"user": "UBOT", "text": "[no-such-repo-zz] PR #1: t"}}
-        dm.fetch_message = lambda chat, ts: posts.get(ts); said, calls = [], []
+        dm.fetch_message = lambda chat, ts: posts.get(ts); said, calls, quids = [], [], []
         dm.say = lambda chat, text, thread=None, mail=True: said.append((chat, thread))
         qok = [True]
-        dm.queue_land = lambda repo, n, chat, ts, who="", run=None: calls.append((repo, n, chat, ts, who)) or (
+        dm.queue_land = lambda repo, n, chat, ts, who="", run=None, uid="": calls.append((repo, n, chat, ts, who)) or quids.append(uid) or (
             (True, f"[{repo}] PR #{n} queued — the gates run first, then the merge, then the deploy") if qok[0]
             else (False, "cc-land: cannot write /home/x/.cc/state/land/x-7.json: Read-only file system — nothing merged"))
         ev = lambda **k: {"type": "reaction_added", "reaction": "+1", "user": "UOWNER", "item": {"type": "message", "channel": "CAPPR", "ts": "1.1"}, **k}
@@ -249,6 +249,10 @@ def run_selfcheck():
                       "so being in that channel IS the approval right (owner's decision, 2026-08-30)",
                       calls == [(name, "7", "CAPPR", "1.1", "Ada")] and "queued" in (out5 or "")
                       and marks == [("CAPPR", "1.1", "eyes")])
+                check("reaction: the REACTOR'S OWN SLACK ID goes down with the 👍, not just their display name — a "
+                      "name cannot be checked against SLACK_OWNER_ID, and a PR on a protected path queues on the "
+                      "owner's own 👍 alone",
+                      quids == ["UOWNER", "UMEM"])
                 calls.clear(); marks.clear(); qok[0] = False
                 out6 = dm.on_event(ev())
                 check("reaction: FAIL CLOSED — a queue that will not take the PR is ❌ and a plain 'NOT merged' in the "
@@ -274,6 +278,14 @@ def run_selfcheck():
               "the thread the 👍 was given in so the landing can answer where it was approved",
               okq and qrec == [[f"{BIN}/cc-land", "queue", name, "7", "--chat", "CAPPR", "--ts", "1.1",
                                 "--who", "The Owner"]])
+        qrec2 = []
+        okq2, _outq2 = real_queue_land(
+            dm, name, "7", "CAPPR", "1.1", "The Owner", uid="UOWNER",
+            run=lambda cmd, **kw: qrec2.append(cmd) or type("R", (), {"returncode": 0, "stdout": "queued\n", "stderr": ""})())
+        check("queue_land: with a uid it goes on as --approved-by, which is the ONLY thing that lifts cc-land's hold "
+              "on a protected path — --who is a display name and proves nothing",
+              okq2 and qrec2 == [[f"{BIN}/cc-land", "queue", name, "7", "--chat", "CAPPR", "--ts", "1.1",
+                                  "--who", "The Owner", "--approved-by", "UOWNER"]])
         okf, outf = real_queue_land(dm, name, "7", "CAPPR", "1.1",
                                     run=lambda cmd, **kw: type("R", (), {"returncode": 1, "stdout": "", "stderr": "the worker would not start"})())
         check("queue_land: cc-land's EXIT CODE is the whole answer — non-zero means nothing merged and nothing will "
@@ -4433,7 +4445,7 @@ def run_selfcheck():
     dmMM.fetch_message = lambda chat, ts: {"user": "UBOT", "text": f"[{nameMM}] PR #7: t — https://x/7"}
     dmMM.say = lambda *a, **k: None
     dmMM.home_dirty, qMM = False, []
-    dmMM.queue_land = lambda repo, n, chat, ts, who="", run=None: qMM.append((repo, n)) or (True, "queued")
+    dmMM.queue_land = lambda repo, n, chat, ts, who="", run=None, uid="": qMM.append((repo, n)) or (True, "queued")
     _reactMM, _runMM, runsMM = globals()["react"], subprocess.run, []
     globals()["react"] = lambda *a, **k: None
     subprocess.run = lambda cmd, **kw: runsMM.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()

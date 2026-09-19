@@ -2940,6 +2940,248 @@ def selfcheck():
               "first, so the ordinary 👍 pays nothing for it",
               rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started and not ran("gh pr view"))
 
+        # ---- PROTECTED PATHS (owner, #lessons 2026-09-18): "a PR touching one is never self-landed: cc-land holds it
+        # and asks the owner with a 👍 card, whatever the review says". The door refuses it — no job, no worker — for
+        # the grant's own queueing and for anyone's 👍 but the owner's; his uid alone queues it. Own fixture per case.
+        CFGP, CFGO, GHF = f"{BIN}/cc-config get CC_PROTECTED_PATHS_myrepo", f"{BIN}/cc-config get SLACK_OWNER_ID", "gh pr view 7 --json files"
+        GHH = "gh pr view 7 --json headRefOid"
+        BRANCH = FACTS["headRefName"]
+        LSR = f"git ls-remote origin refs/heads/{BRANCH}"
+        mark = [0]
+
+        def guarded(files, rules="learn-fetch/ core/bin/cc-land", owner="U0WNER", *extra, ref=None):
+            fresh(pr=7)
+            for p in glob.glob(f"{qdir}/myrepo-*.json"):
+                os.unlink(p)
+            del started[:]
+            mark[:] = [len(calls)]      # never calls.clear(): envs is zipped against calls further down (F4d)
+            # A tuple is cc-config's own (rc, output): an absent key exits 1, a reader that did not run exits otherwise.
+            world[CFGP], world[CFGO] = (rules if isinstance(rules, tuple) else (0, rules + "\n")), (0, owner + "\n")
+            world[GHF] = files if isinstance(files, tuple) else (0, json.dumps({"files": [{"path": f} for f in files]}))
+            # The head the owner's 👍 is pinned to (approved_head). `ref` is what ORIGIN says that branch is at — the
+            # answer pr_head prefers, because gh's headRefOid lags the ref while the gates and the merge use the ref.
+            world[GHH] = (0, json.dumps({"headRefOid": HEAD, "headRefName": BRANCH}))
+            if ref is not None:
+                world[LSR] = (0, f"{ref}\trefs/heads/{BRANCH}\n")
+            return quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1", *extra])
+        try:
+            rcQ = guarded(["docs/x.md", "learn-fetch/learn-fetch"], "learn-fetch/ core/bin/cc-land", "U0WNER", "--who", "cc done")
+            check("protected: the grant's own queueing (--who 'cc done') of a PR touching learn-fetch/ is REFUSED at the door — "
+                  "no job, no worker, non-zero, a `protected:` ledger line naming the file",
+                  rcQ == 1 and not os.path.exists(job_path("myrepo", 7)) and not started
+                  and open(f"{qdir}/queue.log").read().rstrip().endswith("refused myrepo#7 protected:learn-fetch/learn-fetch"))
+            rcQ = guarded(["core/bin/cc-land"], "learn-fetch/ core/bin/cc-land", "U0WNER", "--who", "A Member", "--approved-by", "UMEMBER")
+            check("protected: a 👍 that is not the owner's (another uid) is refused the same way — a file rule matches the file itself",
+                  rcQ == 1 and not os.path.exists(job_path("myrepo", 7)) and not started)
+            rcQ = guarded(["learn-fetch/learn-fetch"], "learn-fetch/ core/bin/cc-land", "U0WNER", "--who", "The Owner", "--approved-by", "U0WNER")
+            check("protected: the OWNER's own 👍 (--approved-by == SLACK_OWNER_ID) queues it: job written, worker started",
+                  rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started)
+            rcQ = guarded(["learn-fetcher/x", "core/bin/cc-landing", "docs/learn-fetch.md"], "learn-fetch/ core/bin/cc-land", "U0WNER", "--who", "cc done")
+            check("protected: a path that merely shares a prefix (learn-fetcher/, cc-landing) is NOT under the rule: queued by the grant",
+                  rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started)
+            rcQ = guarded((1, "gh: could not resolve host\n"), "learn-fetch/", "U0WNER", "--who", "cc done")
+            check("protected: FAIL CLOSED — a repo with a list whose PR files gh cannot name is refused, not waved through",
+                  rcQ == 1 and not os.path.exists(job_path("myrepo", 7)) and not started)
+            rcQ = guarded(["learn-fetch/learn-fetch"], "", "U0WNER", "--who", "cc done")
+            check("protected: a repo with NO list is the ordinary door — queued, and gh was never asked for the files",
+                  rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started
+                  and not [c for c in calls[mark[0]:] if "--json files" in " ".join(c)])
+            # FAIL CLOSED on the RULES too, not only on the files: member_config folds any non-zero `cc-config get`
+            # into '', and '' reads as "no rules" — the guard's own fallback would have waved the PR through.
+            # cc-config's exit 1 is its answer for a key that is not set, and stays the ordinary door: read as a
+            # failure it would make every repo on the box protected and stop every landing.
+            for rc, note in ((2, "cc-config: not a variable name\n"), (127, "FileNotFoundError: cc-config\n")):
+                rcQ = guarded(["docs/x.md"], (rc, note), "U0WNER", "--who", "cc done")
+                check(f"protected: cc-config exiting {rc} is not 'no rules' — the PR is REFUSED, not queued, and the "
+                      f"ledger line says so",
+                      rcQ == 1 and not os.path.exists(job_path("myrepo", 7)) and not started
+                      and open(f"{qdir}/queue.log").read().rstrip().endswith("refused myrepo#7 protected:?"))
+            rcQ = guarded(["docs/x.md"], (1, ""), "U0WNER", "--who", "cc done")
+            check("protected control: cc-config exiting 1 IS an answer — the key is not set, the repo has no list, "
+                  "and the ordinary door queues it",
+                  rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started)
+            # …AND ON THE FILE LIST'S LENGTH. `gh pr view --json files` hands back the first 100 paths in sort
+            # order and says nothing about the rest, so a PR with 100 files under docs/ and one under learn-fetch/
+            # read as 'no hit' — a fail-open in the guard whose whole job is to fail closed.
+            rcQ = guarded([f"docs/f{i:03d}.md" for i in range(GH_PR_FILES)], "learn-fetch/", "U0WNER", "--who", "cc done")
+            check(f"protected: {GH_PR_FILES} files and none of them protected is NOT a pass — gh lists no more than "
+                  f"that, so the ones it did not name are the uncertainty, and the door refuses",
+                  rcQ == 1 and not os.path.exists(job_path("myrepo", 7)) and not started
+                  and open(f"{qdir}/queue.log").read().rstrip().endswith("refused myrepo#7 protected:?"))
+            rcQ = guarded([f"docs/f{i:03d}.md" for i in range(GH_PR_FILES - 1)], "learn-fetch/", "U0WNER", "--who", "cc done")
+            check(f"protected control: {GH_PR_FILES - 1} files is a list gh named in full — queued, so the length "
+                  f"rule bounds the uncertainty and not the ordinary PR", rcQ == 0
+                  and os.path.exists(job_path("myrepo", 7)) and started)
+            # THE HOLD IS ASKED AGAIN, AT EVERY HEAD. The door's yes was about the head that was there when it was
+            # given: a job the grant queued while the PR touched nothing protected keeps running through its fix
+            # rounds, and a round that pushes a change under learn-fetch/ would land it on that old yes.
+            rcQ = guarded(["docs/x.md"], "learn-fetch/ core/bin/cc-land", "U0WNER", "--who", "cc done")
+            clean = rcQ == 0 and os.path.exists(job_path("myrepo", 7))
+            job_then = read_json(job_path("myrepo", 7)) or {}
+            at_log = len(open(f"{qdir}/queue.log").read())
+            world[GHF] = (0, json.dumps({"files": [{"path": "learn-fetch/learn-fetch"}]}))   # …the fix round pushed
+            quiet(cmd_work, [])
+            check("protected: a job queued clean is STOPPED when its head moves onto learn-fetch/ — nothing merged, "
+                  "the job is off the queue, the same `protected:` ledger line, and the #approvals card is left up "
+                  "for the owner's own 👍 on the head that is there now",
+                  clean and not job_then.get("approved_by") and not gh_merges()
+                  and not os.path.exists(job_path("myrepo", 7))
+                  and "refused myrepo#7 protected:learn-fetch/learn-fetch"
+                      in open(f"{qdir}/queue.log").read()[at_log:])
+            # …but NOT-KNOWING is not a hit. protected_hit fails closed on a cc-config it could not read and on a
+            # `gh pr view --json files` that failed (a resolver blip), and both arrive here as ('?', why) on every
+            # repo that has a list: dropping the job for one of them would cost the owner a second 👍 on the same
+            # card, on a landing he had already approved. Kept and asked again, the way a gh failure at L.load() is.
+            rcQ = guarded(["docs/x.md"], "learn-fetch/ core/bin/cc-land", "U0WNER", "--who", "cc done")
+            clean = rcQ == 0 and os.path.exists(job_path("myrepo", 7))
+            at_log = len(open(f"{qdir}/queue.log").read())
+            world[GHF] = (1, "gh: could not resolve host\n")
+            quiet(cmd_work, [])
+            job_then = read_json(job_path("myrepo", 7)) or {}
+            check("protected: a '?' hit — gh could not name the PR's files — KEEPS the job and asks again instead of "
+                  "refusing it: nothing merged, the job still on the queue, held with a not_before, no try spent, "
+                  "and no `refused` line",
+                  clean and not gh_merges() and os.path.exists(job_path("myrepo", 7))
+                  and job_then.get("stage") == "held" and job_then.get("not_before")
+                  and job_then.get("attempts", 0) == 0
+                  and "refused" not in open(f"{qdir}/queue.log").read()[at_log:])
+            # …and the owner's own 👍 is a yes about THE HEAD HE READ: the door writes both on the job, and a head
+            # that has moved since is a new question, however it was approved.
+            rcQ = guarded(["learn-fetch/learn-fetch"], "learn-fetch/", "U0WNER", "--who", "The Owner", "--approved-by", "U0WNER")
+            job_then = read_json(job_path("myrepo", 7)) or {}
+            check("protected: the owner's 👍 is written on the job with the head it was about (approved_by, "
+                  "approved_head) — a job file that records neither cannot tell a fix round's head from his",
+                  rcQ == 0 and job_then.get("approved_by") == "U0WNER" and job_then.get("approved_head") == HEAD)
+            at_log = len(open(f"{qdir}/queue.log").read())
+            world[GHH] = (0, json.dumps({"headRefOid": "f" * 40}))   # the round pushed on top of what he approved
+            quiet(cmd_work, [])
+            check("protected: …and when that head moves, his 👍 does not carry to the new one — stopped, nothing "
+                  "merged, off the queue", not gh_merges() and not os.path.exists(job_path("myrepo", 7))
+                  and "refused myrepo#7 protected:learn-fetch/learn-fetch"
+                      in open(f"{qdir}/queue.log").read()[at_log:])
+            # …AND THAT STOP REACHES A PERSON. Off the queue with the worker log's return string as its only record,
+            # the card sat at 👀 and nobody was told a second 👍 was needed (review of #527): said once in the card's
+            # own thread, and pushed to the owner, whose 👍 is the one thing that moves it.
+            posts = ran_sub("cc-slack", "post")
+            pushes = [c for c in calls if os.path.basename(c[0]) == "cc-notify"]
+            check("protected: …and the stop at a moved head is SAID — one post in the card's thread (its chat and ts, "
+                  "under a producer id) telling the owner to 👍 the card again for this head, and one cc-notify to "
+                  "him at the decision rung",
+                  len(posts) == 1 and posts[0][2:6] == ["-c", "CAPPR", "--thread", "1.1"] and "--id" in posts[0]
+                  and "👍 the card again" in posts[0][-1]
+                  and len(pushes) == 1 and "--decision" in pushes[0] and "👍 the card again" in pushes[0][-1])
+            # …AND A FILE LIST THAT ANSWERS '?' FOR EVER DOES NOT TURN THAT STOP INTO A HOLD. A PR over
+            # GH_PR_FILES files is a '?' hit at every look, so a job he 👍'd whose fix round pushes a new head
+            # would be held every RETRY_AFTER for ever — nothing merged, nobody told, and his second 👍 refused as
+            # 'already queued': stuck with no way out but deleting the job file (review of #527). The head having
+            # moved is certain whatever the file list could not say, so the stop is definite and is said.
+            rcQ = guarded([f"docs/f{i:03d}.md" for i in range(GH_PR_FILES)], "learn-fetch/", "U0WNER",
+                          "--who", "The Owner", "--approved-by", "U0WNER", ref=HEAD)
+            job_then = read_json(job_path("myrepo", 7)) or {}
+            at_log = len(open(f"{qdir}/queue.log").read())
+            world[GHH] = (0, json.dumps({"headRefOid": "f" * 40, "headRefName": BRANCH}))
+            world[LSR] = (0, f"{'f' * 40}\trefs/heads/{BRANCH}\n")      # the fix round's push, on origin's own ref
+            quiet(cmd_work, [])
+            posts = ran_sub("cc-slack", "post")
+            pushes = [c for c in calls if os.path.basename(c[0]) == "cc-notify"]
+            check(f"protected: …and the stop at a moved head is SAID even when the file list is the '?' — a PR over "
+                  f"{GH_PR_FILES} files answers '?' at every look, and held on that the job would sit off the queue's "
+                  f"radar for ever: off the queue, a `refused` line, one post in the card's thread, one cc-notify",
+                  rcQ == 0 and job_then.get("approved_head") == HEAD and not gh_merges()
+                  and not os.path.exists(job_path("myrepo", 7))
+                  and "refused myrepo#7 protected:moved" in open(f"{qdir}/queue.log").read()[at_log:]
+                  and len(posts) == 1 and posts[0][2:6] == ["-c", "CAPPR", "--thread", "1.1"]
+                  and "👍 the card again" in posts[0][-1]
+                  and posts[0][posts[0].index("--id") + 1].startswith("land:myrepo:7:protected")
+                  and len(pushes) == 1 and "--decision" in pushes[0])
+            # …and a '?' that is a real not-knowing on BOTH counts — gh names neither the files nor the head —
+            # still HOLDS, because that one clears on its own; the first hold is said once, so no job waits unheard of.
+            rcQ = guarded((1, "gh: could not resolve host\n"), "learn-fetch/", "U0WNER",
+                          "--who", "The Owner", "--approved-by", "U0WNER", ref=HEAD)
+            at_log = len(open(f"{qdir}/queue.log").read())
+            world[GHH], world[LSR] = (0, "{}"), (0, "")     # …and now nothing will name the head either
+            quiet(cmd_work, [])          # …and again: the reason has not changed, so the second sweep says nothing
+            quiet(cmd_work, [])
+            job_then = read_json(job_path("myrepo", 7)) or {}
+            posts, pushes = ran_sub("cc-slack", "post"), [c for c in calls if os.path.basename(c[0]) == "cc-notify"]
+            check("protected: a '?' about the FILE LIST alone still holds — the job stays on the queue, no try "
+                  "spent — but the first hold is SAID once (one thread post, one cc-notify) and the sweeps after "
+                  "it say nothing",
+                  rcQ == 0 and not gh_merges() and os.path.exists(job_path("myrepo", 7))
+                  and job_then.get("stage") == "held" and job_then.get("attempts", 0) == 0
+                  and "refused" not in open(f"{qdir}/queue.log").read()[at_log:]
+                  and len(posts) == 1 and posts[0][2:6] == ["-c", "CAPPR", "--thread", "1.1"]
+                  and "HELD" in posts[0][-1] and len(pushes) == 1 and "--decision" in pushes[0]
+                  # …under an id of the HOLD's own: a hold and the refusal that may follow it on the same job are
+                  # two things to say, and one producer id would have cc-notify swallow the second as a repeat.
+                  and posts[0][posts[0].index("--id") + 1].startswith("land:myrepo:7:held"))
+            # …AND THE HEAD BOTH SIDES MEAN IS THE BRANCH REF, NOT THE PR OBJECT. `gh pr view --json headRefOid` lags
+            # the ref (remote_head's own docstring) while everything that acts on the head — the gates' fetch, the
+            # merge's --match-head-commit — uses the ref. Pinned to gh's answer, his 👍 recorded at H1 and a push
+            # already on origin read one sweep later as "the head has not moved", and H2, which nobody 👍'd or read,
+            # is what merged. Asked of origin, the same sweep is a head he has not approved.
+            rcQ = guarded(["learn-fetch/learn-fetch"], "learn-fetch/", "U0WNER", "--who", "The Owner",
+                          "--approved-by", "U0WNER", ref=HEAD)
+            job_then = read_json(job_path("myrepo", 7)) or {}
+            at_log = len(open(f"{qdir}/queue.log").read())
+            world[LSR] = (0, f"{'a' * 40}\trefs/heads/{BRANCH}\n")     # …the push origin has and gh has not caught up with
+            quiet(cmd_work, [])
+            check("protected: a push origin already has while `gh pr view` still answers the old SHA is a head he did "
+                  "not 👍 — the stop asks ORIGIN, so nothing merges and the job is off the queue",
+                  rcQ == 0 and job_then.get("approved_head") == HEAD and not gh_merges()
+                  and not os.path.exists(job_path("myrepo", 7))
+                  and "refused myrepo#7 protected:learn-fetch/learn-fetch"
+                      in open(f"{qdir}/queue.log").read()[at_log:])
+            rcQ = guarded(["learn-fetch/learn-fetch"], "learn-fetch/", "U0WNER", "--who", "The Owner",
+                          "--approved-by", "U0WNER", ref="a" * 40)
+            job_then = read_json(job_path("myrepo", 7)) or {}
+            check("protected: …and the DOOR reads origin too, so what is written on the job is the SHA the gates and "
+                  "the merge will mean, never the one gh is lagging behind",
+                  rcQ == 0 and job_then.get("approved_head") == "a" * 40)
+            # …AND THE DIRECT PATH IS UNDER THE SAME HOLD. `cc-land myrepo 7 --no-review` is the command `cc` prints
+            # as the way to land, it never queues, and until it asked protected_hit it pinned the merge to its own
+            # head with nobody's 👍 on it (review of #527). A hit is a refusal: nothing merges, and the line says
+            # whose 👍 would. The control is the same run on a PR touching nothing protected, which merges — so the
+            # refusal is the hold and not a fixture that could never merge.
+            for files, protected in ((["learn-fetch/learn-fetch"], True), (["docs/x.md"], False)):
+                L = fresh(pr=7, review=False)
+                world[CFGP], world[CFGO] = (0, "learn-fetch/\n"), (0, "U0WNER\n")
+                world[GHF] = (0, json.dumps({"files": [{"path": f} for f in files]}))
+                world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    rc = L.run()
+                if protected:
+                    check("protected: the DIRECT path (`cc-land myrepo 7 --no-review`: no queue, no 👍) refuses a PR "
+                          "touching learn-fetch/ — nothing merged, non-zero, and the line names the owner's 👍 as the "
+                          "one thing that lands it",
+                          rc == 1 and not gh_merges() and "only the owner's own 👍 on the card queues it" in err.getvalue())
+                else:
+                    check("protected control: the same direct run on a PR touching nothing protected merges",
+                          bool(gh_merges()))
+            # …and the merge carries that pin itself. protected_stop is the door; a push landing in the seconds
+            # between it and `gh pr merge` would still be a head nobody approved, so GitHub is made to refuse it.
+            fresh(pr=7)
+            n0 = len(calls)
+            for name, approved, want in (("the head the OWNER approved", HEAD, HEAD),
+                                         ("the head the gates ran on", "", "b" * 40)):
+                at = len(calls)
+                Lp = Land("myrepo", pr=7)
+                Lp.facts, Lp.head, Lp.approved_head = dict(FACTS), "b" * 40, approved
+                quiet(Lp.merge)
+                argvs = [c for c in calls[at:] if c[:3] == ["gh", "pr", "merge"]]
+                check(f"protected: the merge is pinned to {name} — a push that outran the stop is refused by GitHub "
+                      f"itself, not by a check that has already run",
+                      len(argvs) == 1 and "--match-head-commit" in argvs[0]
+                      and argvs[0][argvs[0].index("--match-head-commit") + 1] == want)
+            # …and these two merges are taken back off the record. Every `gh pr merge` in `calls` is a merge to the
+            # cases below (gh_merges), which assert that NOTHING merged; all three lists are truncated together,
+            # because they are zipped against each other further down (F4d).
+            del calls[n0:], cwds[n0:], envs[n0:]
+        finally:
+            for k in (CFGP, CFGO, GHF, GHH, LSR):
+                world.pop(k, None)
+
         # ---- fail closed, both ways. Nothing here has a fallback that merges: that fallback IS the bug.
         for p in glob.glob(f"{qdir}/myrepo-*.json"):
             os.unlink(p)
@@ -3711,7 +3953,7 @@ def selfcheck():
               "written. This is the one way back from a refused dispatch, and nothing else re-drives it",
               lifted.get("stage") != "held" and (ran("check.sh") or [c for c in calls if c[0] == CLAUDE])
               and open(f"{LANDQ}/queue.log").read().count("held myrepo#7") == held_lines + 1)
-        repair_case(**{f"{BIN}/cc myrepo w1 --go": (0, "dispatched")}); calls.clear(); quiet(cmd_work, [])
+        repair_case(**{f"{BIN}/cc myrepo w1 --go": (0, "dispatched")}); calls.clear(); envs.clear(); quiet(cmd_work, [])   # both, or the zip below pairs this run's calls with an earlier run's envs
         machine = [e.get("CC_BRIEF_MACHINE") for c, e in zip(calls, envs)
                    if os.path.basename(c[0]) == "cc" and "--go" in c]
         check("F4d: the round's brief is the LANDING'S OWN WRITING — built here from the review, typed by nobody — so "

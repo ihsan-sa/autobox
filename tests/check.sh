@@ -347,21 +347,38 @@ chmod +x "$GD/cwd-probe"
 # /proc fd read and cc-digest's ledger line each cost a whole cc-green run on 2026-09-12. So a selfcheck that exits
 # red is run ONCE more, alone, after the rest are done. Green then is printed as LOAD-BOUND with the cases that
 # flipped, never as a clean pass, and its output is the one judged after; red twice is red, and prints both runs.
+# …AND THE PASS REPORT MUST NOT ITSELF READ AS RED. A landing does not judge a gate by its exit code alone: cc-land
+# searches the whole output for `(\d+) failed` and calls the gate red on any non-zero count, "whatever it exited
+# with" (FAILED_RE), because suites have swallowed reds before. Quoting the load run's tally verbatim put "1 failed"
+# in this PASS report, so PR #527's check.sh exited 0, said LOAD-BOUND, and the landing called the gate red anyway
+# (2026-09-19) — this rule breaking the very landing it was written to save. So the flip is told in words that carry
+# no red shape: no "<n> failed" with n non-zero, no ✗/✘/FAIL. Red twice still prints both runs untouched, because
+# that report is meant to read as red.
+unred(){ sed -e 's/\([1-9][0-9]*\) failed/\1 red/g' -e 's/✗/·/g' -e 's/✘/·/g' -e 's/FAIL/red/g'; }
 rerun_alone(){   # <tool path> <first output> -> 0 green alone (says LOAD-BOUND, output in RERUN_OUT), 1 red again (prints both)
   local t=${1##*/} rc2=0
   RERUN_OUT=$(run_sc "$1" 2>&1) || rc2=$?
   if [ "$rc2" = 0 ] && tally_ok "$t" "$RERUN_OUT"; then
-    echo "  $t: LOAD-BOUND — $(tally_line "$t" "$2") beside the other selfchecks, $(tally_line "$t" "$RERUN_OUT") alone; the cases that flipped:"
-    grep -E '✗|✘|FAIL' <<<"$2" | head -5 | sed 's/^ */    /'; return 0; fi
+    { echo "  $t: LOAD-BOUND — $(tally_line "$t" "$2") beside the other selfchecks, $(tally_line "$t" "$RERUN_OUT") alone; the cases that flipped:"
+      grep -E '✗|✘|FAIL' <<<"$2" | head -5 | sed 's/^ */    /'; } | unred
+    return 0; fi
   printf '%s\n' "$2"; echo "  $t: red again alone (exit $rc2), so not load:"; printf '%s\n' "$RERUN_OUT"; return 1; }
 # CONTROL: a fixture red on its first run and green on its second passes as LOAD-BOUND; one red both times fails.
 printf '#!/bin/sh\nn=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$0.n"\n[ $n = 1 ] && { echo "FAIL a race"; echo "cc-flaky selfcheck: 1 passed, 1 failed"; exit 1; }\necho "cc-flaky selfcheck: 2 passed, 0 failed"\n' > "$GD/cc-flaky"
 printf '#!/bin/sh\necho "FAIL a bug"; echo "cc-broken selfcheck: 1 passed, 1 failed"; exit 1\n' > "$GD/cc-broken"
 chmod +x "$GD/cc-flaky" "$GD/cc-broken"
 rf=$(run_sc "$GD/cc-flaky" 2>&1) || true; rb=$(run_sc "$GD/cc-broken" 2>&1) || true
-{ fl=$(rerun_alone "$GD/cc-flaky" "$rf") && grep -q 'LOAD-BOUND .* 1 failed beside .* 0 failed alone' <<<"$fl" && grep -q 'FAIL a race' <<<"$fl" \
+{ fl=$(rerun_alone "$GD/cc-flaky" "$rf") && grep -q 'LOAD-BOUND .* 1 red beside .* 0 failed alone' <<<"$fl" && grep -q 'a race' <<<"$fl" \
   && [ "$(cat "$GD/cc-flaky.n")" = 2 ] && ! br=$(rerun_alone "$GD/cc-broken" "$rb") && grep -q 'red again alone (exit 1)' <<<"$br" && grep -q 'FAIL a bug' <<<"$br"; } \
   || { echo "check.sh: the rerun-once rule no longer tells a load flake from a red — flaky: ${fl:-} broken: ${br:-}"; exit 1; }
+# …AND THE LOAD-BOUND REPORT IS READ BACK THE WAY A LANDING READS IT, with cc-land's own rule (FAILED_RE, and the
+# ✗/FAIL its card names the case by): a pass that still says "1 failed" anywhere is a gate the lander fails.
+if grep -qE '[1-9][0-9]* failed|✗|✘|FAIL' <<<"$fl"; then
+  echo "check.sh: the LOAD-BOUND report says a case failed, and a landing reads that as a red gate however this"
+  echo "  script exits (cc-land's FAILED_RE). Say the flip without a red shape:"; printf '%s\n' "$fl"; exit 1
+fi
+grep -qE '[1-9][0-9]* failed' <<<"$br" \
+  || { echo "check.sh: red twice no longer reports as red — the lander would read this gate as a pass"; exit 1; }
 for c in cc-board $others; do
   want_selfcheck "$c" || { skipped="$skipped $c"; part_out "$c"; continue; }
   # …and only by the half that owns it. A tool's selfcheck belongs to this box only if it says so (PART_BOX_TOOLS

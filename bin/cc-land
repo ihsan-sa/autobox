@@ -14,7 +14,13 @@
   cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does. A job
                                                   a landing has already refused for a reason a re-queue cannot mend
                                                   is refused here, in a second, non-zero; a queued one is told its
-                                                  place and whether this sweep or the next takes it
+                                                  place and whether this sweep or the next takes it. A PR touching a
+                                                  PROTECTED PATH of its repo (CC_PROTECTED_PATHS_<repo> in ~/.cc/config,
+                                                  path prefixes) is refused too — whoever asks, whatever the review
+                                                  says — unless --approved-by <uid> is the owner's own Slack id
+                                                  (SLACK_OWNER_ID): his 👍 is the only thing that lands one, and it
+                                                  is a yes about THAT head — the hold is asked again at every head
+                                                  the job reaches, so a fix round cannot push one in under it
   cc-land queue --task <repo> <row>               complete a task; JSON receipt on stdout, queue only with a grant
   cc-land queue <handle>--<track> <pr>            a MEMBER WORKSPACE'S project: lands into the member's own repo on
                                                   the workspace's token, gates inside its sandbox, no deploy, the
@@ -1118,6 +1124,82 @@ def box_comments(facts):
     return [c.get("body") or "" for c in facts.get("comments") or [] if isinstance(c, dict) and c.get("viewerDidAuthor")]
 
 
+GH_PR_FILES = 100   # `gh pr view --json files` hands back the FIRST 100 files, sorted by path, and says nothing
+                    # about there being more
+
+
+def protected_paths(repo):
+    """The repo's PROTECTED PATHS as (rules, why): `CC_PROTECTED_PATHS_<repo>` in ~/.cc/config (a box fact, never in published code; a repo name's `-` or `.` reads as `_`), whitespace-separated path prefixes — `learn-fetch/` is everything under it, `core/bin/x` that file. ([], '') when the repo has no list. (None, why) when cc-config did not answer at all, which protected_hit reports as a hit: member_config folds a failed read into '', '' reads as "no rules", and no rules waves the PR through the one guard that must fail closed. cc-config's exit 1 IS an answer — its documented "the key is not set" — and reading that as a failure would make every repo on this box protected and stop every landing."""
+    key = "CC_PROTECTED_PATHS_" + re.sub(r"[^A-Za-z0-9]", "_", repo)
+    rc, o = sh([f"{BIN}/cc-config", "get", key], timeout=30)
+    if rc not in (0, 1):
+        return None, f"cc-config could not read {key} ({last(o) or 'exit ' + str(rc)})"
+    return o.split(), ""
+
+
+def protected_hit(repo, pr):
+    """The first file PR `pr` changes under one of the repo's protected paths, as (file, rule), or None. One `gh pr view --json files` per ask. FAIL CLOSED in every way this can not-know — rules cc-config would not read, files gh could not name, a PR with more files than gh lists — each of which is a hit ('?', why), the opposite of doomed(), because here the cost of a wrong yes is a change to the thing the owner said no session may change."""
+    rules, why = protected_paths(repo)
+    if rules is None:
+        return ("?", why)
+    if not rules:
+        return None
+    j, why = pr_facts(repo_root(repo), pr, "files", timeout=60)
+    if j is None:
+        return ("?", f"gh could not list the PR's files ({why or 'no PR object'})")
+    files = j.get("files") or []
+    for f in files:
+        path = (f.get("path") or "") if isinstance(f, dict) else ""
+        for rule in rules:
+            if path == rule.rstrip("/") or path.startswith(rule.rstrip("/") + "/"):
+                return (path, rule)
+    if len(files) >= GH_PR_FILES:
+        # gh's page is the first 100 paths in sort order: a PR at or over it has files it never named, and the
+        # protected one may be among them. No file to name, so the hit is the uncertainty itself.
+        return ("?", f"gh lists only the first {GH_PR_FILES} of the PR's files and this PR has at least that "
+                     f"many — the ones it did not name may be under {', '.join(rules)}")
+    return None
+
+
+def owner_approved(uid):
+    """Was it the owner's own 👍? `--approved-by <slack uid>` is what cc-slack's approvals handler passes for the person who reacted, and it is his when it equals SLACK_OWNER_ID (~/.cc/config). Nothing else — not `--who`, which is a display name — lifts a protected-path hold."""
+    return bool(uid) and uid == member_config("SLACK_OWNER_ID", "")
+
+
+def pr_head(repo, pr):
+    """The PR's head SHA — the one thing an owner's 👍 on a protected path is pinned to — asked of the REMOTE REF itself (remote_head) and of the PR object only when origin will not say. It has to be the same SHA every other step of the landing means by "the head": the gates fetch the branch ref (Land.resolve_head), the merge pins `--match-head-commit` to it, and `gh pr view --json headRefOid` LAGS that ref (remote_head's own docstring). A door that pinned his yes to the lagging answer would approve H1 while H2 was already pushed, and the same lag at the next sweep would then read as "the head has not moved"."""
+    j = pr_facts(repo_root(repo), pr, "headRefOid,headRefName", timeout=60)[0] or {}
+    return remote_head(repo, (j.get("headRefName") or "").strip()) or (j.get("headRefOid") or "").strip()
+
+
+def protected_under(repo, hit):
+    """The hold's own words for a hit: the file and the rule it is under — or, for a '?' hit, why it could not know."""
+    return (f"it touches {hit[0]}, under {repo}'s PROTECTED path {hit[1]} (CC_PROTECTED_PATHS_{repo})"
+            if hit[0] != "?" else f"{hit[1]}, and {repo} has PROTECTED paths")
+
+
+def protected_stop(job):
+    """Why a job already on the queue must not go on, as (file, why), or None: the door's question asked AGAIN, and at every head. The door writes `approved_by` (the uid that 👍'd) and `approved_head` (the head that 👍 was about) on the job, because a job queued while the PR touched nothing protected keeps running through its fix rounds — a round that pushes a change under a protected path is a new question, and the yes given at the door was about the head that was there then. Only the owner's own uid, on the head he approved, goes on; a gh that cannot name the head is a stop, not a pass. This check is the door and not the lock: a push landing between it and the merge would still be a head nobody 👍'd, so Land.merge pins `--match-head-commit` to `approved_head` itself and GitHub refuses any other."""
+    repo, pr = job.get("repo") or "", job.get("pr")
+    hit = protected_hit(repo, pr)
+    if not hit:
+        return None
+    under = protected_under(repo, hit)
+    if not owner_approved(job.get("approved_by") or ""):
+        return hit[0], f"{under}, and no 👍 of the owner's queued it"
+    head = pr_head(repo, pr)
+    if head and head == (job.get("approved_head") or ""):
+        return None
+    why = (f"{under}, at a head the owner has not 👍'd "
+           f"({(job.get('approved_head') or 'no head recorded')[:12]} → {head[:12] or 'gh cannot say'})")
+    # A head ORIGIN NAMED that is not the one he 👍'd is a certain fact of its own, and the stop is then definite
+    # even where the FILE LIST is the not-knowing: protected_hit answers ('?', why) for ever on a PR over
+    # GH_PR_FILES files, so handing that '?' on would have run_job hold the job every RETRY_AFTER for ever — never
+    # merged, never said, and his second 👍 refused as already queued (review of #527). Only a head origin would
+    # not name leaves the whole stop a not-knowing, and that one clears on its own.
+    return ("moved" if hit[0] == "?" and head else hit[0]), why
+
+
 def doomed(repo, pr):
     """Why a landing of this PR cannot succeed, or '': asked at queue time from what Land.mark_doomed wrote and one `gh pr view`, no git. Every uncertainty (a moved head, any verdict since recorded, a raised cap, a gh error) answers '': it never refuses what could have landed."""
     d = (root_work(repo, pr) or {}).get("doomed") or {}
@@ -1314,6 +1396,8 @@ class Land:
         self.merged_on = ""      # …and the base it was merged with before they ran (merge_result); "" when the head already held it
         self.merge_unbuilt = False   # …and the third state: git could not build the merge, so the gates ran on the head alone
         self.reviewed = ""       # …and the SHA the review actually read, for the fix round's "has it pushed yet"
+        self.approved_head = ""  # …and, for a PR under a PROTECTED path, the head the owner's own 👍 was about: the
+                                 # merge is pinned to THIS and not to the head the gates happened to find (merge)
         self._review = None      # the review running BESIDE the suite (a thread) and what it decided: see gates()
         self._read = None
         self.bought = False      # …and whether that read spent a buy: given back only by a usage limit or a cap, never by a red suite
@@ -1885,14 +1969,19 @@ class Land:
         return ""
 
     def merge(self):
-        """The one place on this box that merges, after the gates: a squash pinned to the head the gates ran on (--match-head-commit), --subject the PR title, -R so gh deletes only the remote branch."""
+        """The one place on this box that merges, after the gates: a squash pinned to the head the gates ran on (--match-head-commit), or, under a protected path, to the head the owner 👍'd; --subject the PR title, -R so gh deletes only the remote branch."""
         if self.facts.get("state") == "MERGED":
             root_done(self.repo, self.pr)      # in is in: the tally goes with the change it was bounding
             return f"PR #{self.pr} was already merged — nothing to do"
         slug, title = self.slug(), self.facts.get("title") or ""
         # Pinned to the SHA the gates ran on and the review read: a push between them makes GitHub refuse the merge, and the re-run gates what is there.
+        # …and under a PROTECTED path, to the head the OWNER's 👍 was about (approved_head, carried on the job).
+        # protected_stop is the door and runs at the top of the job; this is the lock, and it is GitHub's own: a push
+        # that lands after that check, or a `gh pr view` still lagging the ref when it ran, cannot become a merge of
+        # a head nobody approved. The two agree in every ordinary round — the stop already refused any head but his.
+        pin = self.approved_head or self.head
         argv = (["gh", "pr", "merge", str(self.pr), "--squash", "--delete-branch"]
-                + (["--match-head-commit", self.head] if self.head else [])
+                + (["--match-head-commit", pin] if pin else [])
                 + (["-R", slug] if slug else []) + (["--subject", f"{title} (#{self.pr})"] if title else []))
         rc, o = sh(argv, cwd=self.root, timeout=300)
         done = any(w in o for w in ("already merged", "is closed", "already closed"))   # gh: nothing left to merge
@@ -2296,6 +2385,15 @@ class Land:
     def run(self):
         if not self.load():
             return 1
+        # THE DIRECT PATH IS UNDER THE HOLD TOO. `cc-land <repo> <pr>` is the command `cc` prints as the way to land
+        # and --no-review is typed on it, and it never asked protected_hit: with no 👍 on this path at all it pinned
+        # the merge to self.head, and a protected-path PR merged on the box's own say-so (review of #527). A hit is
+        # a refusal here — there is no approval this path could carry — and not-knowing is a hit (protected_hit).
+        hit = protected_hit(self.repo, self.pr) if self.pr else None
+        if hit:
+            return refuse(f"PR #{self.pr} is not landing — {protected_under(self.repo, hit)}. The box never lands "
+                          f"one of these on its own, whatever the gates and the review say: only the owner's own 👍 "
+                          f"on the card queues it", 1)
         return self.done(self.walk(self.steps()))
 
     def done(self, rc):
@@ -2395,6 +2493,18 @@ def say_result(job, r):
         again = f"cc-land queue {repo} {pr}" if pr else "cc-land work"
         sh([f"{BIN}/cc-slack", "inject", repo, f"{what} landing stopped: {short}. Fix it, then `{again}`."], timeout=120)
     return said
+
+
+def say_protected_stop(job, text, tag="protected"):
+    """A protected-path stop, said to the people who can move it and nobody else: once in the card's own thread when the job has one (else routed as a stop is, say_result's door), under a producer id so a sweep that stops the same job twice says it once — `tag` names WHICH stop, because a hold that is said and the refusal that may follow it are two things to say and one id would swallow the second — and to the owner through cc-notify at the decision rung, because the card's second 👍 is his alone to give. Not say_result: that wakes the planning session, which can do nothing here."""
+    chat, ts, repo, pr = job.get("chat") or "", job.get("ts") or "", job.get("repo") or "", job.get("pr")
+    pid = f"land:{repo}:{pr}:{tag}" + (f"@{job['queued_at']}" if job.get("queued_at") else "")
+    args = ["-c", chat, *(["--thread", ts] if ts else [])] if chat else ["--route", f"[{repo}] PR #{pr} stopped"]
+    rc, o = notify(*args, "--id", pid, text, timeout=60)
+    said = rc == 0 or "no SLACK_BOT_TOKEN" in o
+    ledger(f"notify {repo}#{pr} protected → {'thread' if chat else 'route'}"
+           + ("" if said else f" — Slack did not take it: {last(o, 120)}"))
+    sh([f"{BIN}/cc-notify", "--decision", "--id", f"{pid}:owner", "-t", f"{repo} approval", text], timeout=60)
 
 
 SAY_TRIES = 6   # sweeps (RETRY_AFTER apart) a result whose post Slack refuses is kept for before the ledger line is all it gets
@@ -2822,10 +2932,51 @@ def run_job(path, job):
     """One job, start to finish. Everything durable is written before the thing it describes (the try, the result, 'said'), so a kill converges to at most one merge and one message; 'did the merge happen' is asked of `gh pr view`, and an already-merged PR skips to the deploy."""
     import io
     repo, pr, span = job.get("repo") or "", job.get("pr"), job.get("span")
+    # PROTECTED PATHS, asked again here and not only at the queue door: a job queued while the PR touched nothing
+    # protected runs on through its fix rounds, and the head it would merge is not the head anybody said yes to.
+    # A stop leaves the queue as the door's refusal does — no job, nothing merged, no result card — so the card in
+    # #approvals stays pending and the owner's own 👍 on it queues the head that is there now.
+    stop = protected_stop(job) if pr else None
+    if stop and stop[0] == "?":
+        # …except when the stop is NOT-KNOWING rather than a protected file: a cc-config that would not read, a
+        # `gh pr view --json files` that failed. Those are transient on every repo that has a list, and a job
+        # dropped for one would cost the owner a second 👍 on a landing he had already approved. Kept and looked at
+        # again in RETRY_AFTER, costing no try — what a gh failure at L.load() already gets. One ledger line per
+        # reason, not per look.
+        if job.get("held") != stop[1]:
+            ledger(f"held {repo}#{pr} protected:? — {stop[1]}")
+            # …and the FIRST hold for a reason is SAID. A '?' that never clears — a cc-config that stays unreadable,
+            # a PR over GH_PR_FILES files — would otherwise be re-held every RETRY_AFTER with nobody ever told the
+            # landing had stopped. Its own producer ids, so the sweeps after it say nothing and a later refusal's
+            # post is not swallowed as a duplicate of this one.
+            say_protected_stop(job, f"[{repo}] PR #{pr} is HELD, not landing — {stop[1]}. Nothing merged and the "
+                                    f"job stays on the queue; it is asked again every {RETRY_AFTER // 60} min",
+                               tag="held")
+        job_set(path, job, stage="held", held=stop[1], last=f"protected: {stop[1]}"[:400],
+                not_before=stamp(time.time() + RETRY_AFTER))
+        return (f"[{repo}] PR #{pr}: held, not tried — {stop[1]}. Nothing merged and the job stays on the queue; "
+                f"it is asked again in {RETRY_AFTER // 60} min and this costs it no try")
+    if stop:
+        ledger(f"refused {repo}#{pr} protected:{stop[0]}")
+        # …and the stop REACHES A PERSON (cc-loop's invariant: a landing that stops still reaches one). Dropped with
+        # this return string as its only record, a PR the owner 👍'd whose fix round pushed a new head sat with its
+        # card at 👀 and nobody was told a second 👍 was needed (review of #527). His 👍 is the one thing that moves
+        # it, so it is said in the card's thread and pushed to him — before the unlink, so a kill between the two
+        # says it again (once: the producer id) rather than never.
+        text = (f"[{repo}] PR #{pr} moved to a head the owner has not 👍'd, under a protected path — 👍 the card "
+                f"again to land this head ({stop[1]})"
+                if owner_approved(job.get("approved_by") or "") else
+                f"[{repo}] PR #{pr} is NOT landing — {stop[1]}. Nothing merged and the job is off the queue; its "
+                f"card in #approvals stays up, and the owner's own 👍 on it queues this head")
+        say_protected_stop(job, text)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        return text
     job["attempts"], job["at"] = job.get("attempts", 0) + 1, stamp()
     write_atomic(path, job)                    # counted before anything irreversible: a kill mid-merge is still a try
     L = Land(repo, pr=pr) if pr else Land(repo, span=tuple(span))
     L.job = path
+    L.approved_head = job.get("approved_head") or ""   # set only for a protected-path PR: what the merge is pinned to
     buf, held = io.StringIO(), ""
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         if L.load():
@@ -3177,14 +3328,14 @@ def split_opts(argv, *names):
 def cmd_queue(argv):
     """Put a PR on the queue and start the worker (what a 👍 does); a non-zero exit means nothing has merged and nothing will until somebody acts. A doomed job is refused here in about a second, with the commands that end it."""
     if argv and argv[0] == "--task": return queue_task(argv[1:])
-    pos, opts = split_opts(argv, "--chat", "--ts", "--who")
+    pos, opts = split_opts(argv, "--chat", "--ts", "--who", "--approved-by")
     start = "--no-start" not in pos
     pos = [a for a in pos if a != "--no-start"]
     if len(pos) > 2:
         return refuse(f"queue: unexpected '{pos[2]}'")
-    (repo, pr), (chat, ts, who) = (pos + ["", ""])[:2], (opts.get(k, "") for k in ("--chat", "--ts", "--who"))
+    (repo, pr), (chat, ts, who, approved_by) = (pos + ["", ""])[:2], (opts.get(k, "") for k in ("--chat", "--ts", "--who", "--approved-by"))
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo or "") or not re.fullmatch(r"[0-9]+", pr or ""):
-        return refuse("queue takes <repo> <pr-number> [--chat C… --ts 1788… --who name]")
+        return refuse("queue takes <repo> <pr-number> [--chat C… --ts 1788… --who name --approved-by U…]")
     path = job_path(repo, pr)
     handle, mtrack = member_of(repo)
     if handle and not mtrack:
@@ -3207,6 +3358,25 @@ def cmd_queue(argv):
         print(f"[{repo}] PR #{pr} is already queued — one job per PR, so two 👍 are still one landing")
         ledger(f"again {repo}#{pr}")
     else:
+        # PROTECTED PATHS (the owner, #lessons 2026-09-18: "make sure lesson sessions, etc cant edit the fetcher"): a PR that
+        # touches one is never landed on the box's own say-so — not by the standing grant, not by a member's 👍, whatever
+        # the gates and the review would say. It is refused HERE, so no job exists and the #approvals card stays up for
+        # the owner's own 👍, which is the one thing that queues it (owner_approved).
+        hit, approved_head = protected_hit(repo, pr), ""
+        if hit and not owner_approved(approved_by):
+            ledger(f"refused {repo}#{pr} protected:{hit[0]}")
+            return refuse(f"PR #{pr} is not queued — it touches {hit[0]}, under {repo}'s PROTECTED path {hit[1]} "
+                          f"(CC_PROTECTED_PATHS_{repo}). The box never lands one of these on its own, whatever the gates "
+                          f"and the review say: only the owner's own 👍 on the card queues it", 1)
+        if hit:
+            # His 👍 is about THIS head and no other, so the head is pinned on the job beside his uid and the pair
+            # is re-asked at every head after it (protected_stop). A head gh will not name pins nothing.
+            approved_head = pr_head(repo, pr)
+            if not approved_head:
+                ledger(f"refused {repo}#{pr} protected:{hit[0]}")
+                return refuse(f"PR #{pr} is not queued — it touches {hit[0]}, under {repo}'s PROTECTED path "
+                              f"{hit[1]}, and gh cannot say what head the 👍 is about, so nothing can hold the "
+                              f"approval to one", 1)
         # At the door, before a job file exists: doomed() re-asks GitHub in one call and answers '' for every uncertainty.
         why = doomed(repo, pr)
         if why:
@@ -3215,6 +3385,7 @@ def cmd_queue(argv):
                           f"was asked for rather than after its gates:\n{why}", 1)
         try:
             write_atomic(path, {"repo": repo, "pr": int(pr), "chat": chat, "ts": ts, "who": who,
+                                "approved_by": approved_by, "approved_head": approved_head,
                                 "queued_at": stamp(), "attempts": 0, "stage": "queued"})
         except OSError as e:
             return refuse(f"cannot write {path}: {e} — nothing merged", 1)

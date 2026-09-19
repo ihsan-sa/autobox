@@ -114,6 +114,9 @@ pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+
 # called on green, so a green run reads exactly as it did.
 RED_CASES=5
 red(){ bad "$1"; grep -E '✗|✘|FAIL|Traceback' <<<"${2:-}" | head -n "$RED_CASES"; return 0; }
+# …and the same text quoted on a line that PASSED, with every shape a landing reads as red taken out of it: no
+# "<n> failed" with n non-zero, no ✗/✘/FAIL. Only chk()'s LOAD-BOUND line uses it — see the comment there.
+unred(){ sed -e 's/\([1-9][0-9]*\) failed/\1 red/g' -e 's/✗/·/g' -e 's/✘/·/g' -e 's/FAIL/red/g'; }
 . "$(dirname "$SELF")/green.sh"   # what a green run leaves for the landing to spend, how far a change reaches,
                                   # and which half of the suite this run is (CC_SUITE_PART)
 # A portable run asserts what it has before it runs a case: off this box a missing tool is not a red gate, it is a
@@ -208,8 +211,13 @@ chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · lin
     local o2 r2 flipped
     o2=$("$B/$t" selfcheck 2>&1); r2=$(grep -o "$t selfcheck: .*" <<<"$o2" | tail -1)
     if grep -qE '(: |, )0 failed' <<<"$r2"; then
+      # …AND THE PASS LINE MUST NOT READ AS RED. A landing does not judge a gate by its exit code alone: cc-land
+      # searches the whole output for `(\d+) failed` and calls the gate red on any non-zero count "whatever it
+      # exited with" (FAILED_RE). Quoting the load run's tally and its ✗ lines verbatim put "1 failed" in this PASS
+      # line, and that is what failed PR #527's landing off a check.sh that exited 0 (2026-09-19) — this rule
+      # breaking the very landing it was written to save. So the flip is told with no red shape in it.
       flipped=$(grep -E '✗|✘|FAIL' <<<"$o" | head -n "$RED_CASES" | sed 's/^ *//' | tr '\n' ';')
-      ok "$r2 — LOAD-BOUND: $r beside the suite, green alone; the cases that flipped: ${flipped%;}"; return 0
+      ok "$r2 — LOAD-BOUND: $(unred <<<"$r") beside the suite, green alone; the cases that flipped: $(unred <<<"${flipped%;}")"; return 0
     fi
     [ -n "$r2" ] && { red "$t selfcheck: $r2 (and $r the first time — red alone as well, not load)" "$o2"; return 0; }
     # …and a rerun that died (no tally) proves nothing either way: the first red stands, judged on its own output.
@@ -3317,12 +3325,19 @@ printf '#!/bin/sh\nn=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > 
 printf '#!/bin/sh\necho "FAIL the same case"; echo "cc-broken selfcheck: 9 passed, 1 failed"; exit 1\n' > "$CB/cc-broken"
 chmod +x "$CB/cc-flaky" "$CB/cc-broken"; rm -f "$CB/cc-flaky.n"
 r=$( B=$CB; REACH=""; chk cc-flaky; chk cc-broken )
-{ grep -q '✓ cc-flaky selfcheck: 10 passed, 0 failed — LOAD-BOUND: cc-flaky selfcheck: 9 passed, 1 failed beside the suite, green alone; the cases that flipped: FAIL the swap during the launch' <<<"$r" \
+{ grep -q '✓ cc-flaky selfcheck: 10 passed, 0 failed — LOAD-BOUND: cc-flaky selfcheck: 9 passed, 1 red beside the suite, green alone; the cases that flipped: red the swap during the launch' <<<"$r" \
   && [ "$(cat "$CB/cc-flaky.n")" = 2 ] \
   && grep -q '✗ cc-broken selfcheck: cc-broken selfcheck: 9 passed, 1 failed (and cc-broken selfcheck: 9 passed, 1 failed the first time — red alone as well, not load)' <<<"$r" \
   && grep -q 'FAIL the same case' <<<"$r"; } \
   && ok "chk: a tool red beside the suite and green on its one rerun is LOAD-BOUND, said so with the cases that flipped, and not red; one red both times is red with its cases" \
   || bad "chk rerun: $(tr '\n' ' ' <<<"$r")"
+# …AND THE LOAD-BOUND LINE IS READ BACK THE WAY THE LANDING READS IT (cc-land's FAILED_RE, `(\d+) failed` over the
+# whole output, and the ✗/FAIL its card names the case by). A pass that still says "1 failed" anywhere fails the
+# gate however this suite exits — that is what happened to PR #527 off a check.sh that exited 0, 2026-09-19.
+{ ! grep -qE '[1-9][0-9]* failed|✗|✘|FAIL' <<<"$(grep LOAD-BOUND <<<"$r")" \
+  && grep -qE '[1-9][0-9]* failed' <<<"$(grep cc-broken <<<"$r")"; } \
+  && ok "…and that LOAD-BOUND line carries no red shape a landing would read as a failed gate, while the one that is red twice still does" \
+  || bad "chk rerun shape: $(grep 'LOAD-BOUND' <<<"$r")"
 r=$( B=$CB; REACH=""; CC_SELFTEST_RERUN=0; rm -f "$CB/cc-flaky.n"; chk cc-flaky )
 { grep -q '✗ cc-flaky selfcheck: cc-flaky selfcheck: 9 passed, 1 failed' <<<"$r" && [ "$(cat "$CB/cc-flaky.n")" = 1 ]; } \
   && ok "…and CC_SELFTEST_RERUN=0 runs nothing twice: the first red stands" || bad "chk rerun off: $(tr '\n' ' ' <<<"$r")"
