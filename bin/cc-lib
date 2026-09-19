@@ -20,6 +20,12 @@ boundary reads one file, its own workspace's, and can reach no other.
         itself) and OUTCOME answered | partial | not-recorded. It never invents: an empty search is "not
         recorded in the covered scope", and --need current says in so many words that a live state (a unit, a
         URL, a token, a process, a merged ref) was not probed — records say what was written, as of their stamps.
+        THE LIVE LEDGER: a question that names the spend tier — the word `tier` in the query, or --object tier |
+        ~/.cc/state/tier.log — is answered first off ~/.cc/state/tier.log READ AT THAT MOMENT, never off the index:
+        `ROUTE live … read now` with the tier, since when, and the change count (any need but current lists the last
+        changes too). A log that is missing, empty or unreadable says NO ANSWER, is counted unreadable in COVERAGE
+        and makes the outcome partial: no journal line stands in for the tier. (2026-09-18: the tier was answered
+        from a two-day-old checkpoint while the log said otherwise — one owner turn, one wrong handoff fact.)
   cc-lib get <rid> [--ticket <T>] [--cap <bytes>]
         One record page (≤ 8 KiB) by the id a hit printed, with its prev/next span. --ticket charges it to the
         question's budget (24 KiB cumulative across ask, get and any subagent return); a spent ticket refuses.
@@ -115,6 +121,8 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
               failures/reports/<claim>.md (the investigation's report, a doc). The ledger stays the only writer; the
               library keeps no count of its own. `ask --object c-…|f-…|i-…` finds the records naming a cluster, a
               record or a claim id.
+  live        ~/.cc/state/tier.log (cc-tier set's `<utc> <old> -> <new>` lines) — read from the file by `ask` when the
+              question names the tier, never indexed: the question is what it holds now
   Never read: anything not listed; a file whose name says secret, credential, password or .env, or token unless it
   is a .md (a memory file is named after its rule); a file over 4 MiB.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
@@ -156,6 +164,11 @@ CAPLINE = "  …(cap reached)"
 CURRENT_CAVEAT = ("CURRENT: records say what was written, as of their stamps; a live state (a unit, a URL, a token's "
                   "reach, a process, a merged ref) is not probed by cc-lib — probe the object before claiming it is "
                   "or is not live.")
+# LIVE LEDGERS: a state file a tool writes as its record (`<utc> <old> -> <new>` per line, cc-tier set), read from the
+# file at ask time and never from the index — the index is a cache behind a reconcile budget, and the question is what
+# the log holds now. Name → (path under HOME, the words in a query that name it).
+LIVE = {"tier": (os.path.join(".cc", "state", "tier.log"), re.compile(r"\btiers?\b", re.I))}
+LEDGER_LINE = re.compile(r"^(\S+) (\S+) -> (\S+)$")
 STOP = set("a an the is are was were be been of to in on for and or not no it its this that these those with as at by "
            "from do does did should we i you he she they still yet again another which what who when where why how "
            "any all our his her their".split())
@@ -1210,6 +1223,29 @@ def render_hit(h, budget, T, label=None, also=()):
     return None, 0
 
 
+def live_read(name, path, need):
+    """The ledger read now -> (lines, err). The last line is the state and since when; every line is a change. err says
+    why there is no answer — missing, empty, unreadable, a last line that does not parse — and then there is none:
+    nothing older stands in for it."""
+    try:
+        with open(path) as f:
+            rows = [l.rstrip("\n") for l in f if l.strip()]
+    except FileNotFoundError:
+        return [], "missing (nothing has run `cc-tier set` here; `cc-tier` reads the config)"
+    except OSError as e:
+        return [], f"unreadable: {e.strerror or e}"
+    if not rows:
+        return [], "empty"
+    m = LEDGER_LINE.match(rows[-1])
+    if not m:
+        return [], f"last line does not parse: {rows[-1][:60]!r}"
+    ts, old, new = m.groups()
+    lines = [f"  spend {name}: {new} since {ts} ({old} -> {new}) · {len(rows)} change(s) on record, first {rows[0].split(' ', 1)[0]}"]
+    if need != "current":
+        lines += ["    " + r for r in reversed(rows[-5:])]
+    return lines, ""
+
+
 def ask(argv):
     obj, need, repo, cap, q = None, "history", None, PAGE, []
     i = 0
@@ -1245,6 +1281,18 @@ def ask(argv):
     c = db()
     o = parse_object(obj, repo)
     member = member_mode()
+    # THE LIVE LEDGER ROUTE: "a tier question answered by cc-lib reads the tier log and its answer matches what the log
+    # holds at that moment" — chosen here, read after the reconcile so its failure lands in COVERAGE. A member reads what
+    # the host indexed and never a file of the box's own; the tier is the box's.
+    live = None
+    if not member:
+        for name, (rel, pat) in LIVE.items():
+            path = os.path.join(H, rel)
+            named = (obj or "").strip() == name or (o is not None and o[0] == "path" and o[2] == path)
+            if named or pat.search(query):
+                live = (name, path)
+                if named:
+                    o = None   # the ledger is the object: no row or path route beside it
     if member:
         # A MEMBER READS THE HOST'S FILE OF ITS WORKSPACE AND RE-READS NOTHING: the sources are what the host indexed
         # (its sweep and write hooks), the scope is the workspace its launcher bound, and this process has no registry
@@ -1267,6 +1315,17 @@ def ask(argv):
                     if jp:
                         prefer.append(jp)
         cov = reconcile(c, deadline=RECONCILE_BUDGET, prefer=prefer, reg=reg)
+    live_lines, live_ok = [], False
+    if live:
+        name, path = live
+        ans, err = live_read(name, path, need)
+        if err:
+            # "a missing or unreadable tier log gives a said 'no answer', not a stale one"
+            live_lines = [f"ROUTE live {tilde(path)}, read now: NO ANSWER — {err}",
+                          f"  the {name} is not in this packet; a record below says what was written as of its stamp, not the {name} now"]
+            cov["unreadable"].append(f"{tilde(path)} ({err})")
+        else:
+            live_lines, live_ok = [f"ROUTE live {tilde(path)}, read now (1)"] + ans, True
     sections = []      # (label, [hits]) in route order
     object_ids = set()
     notes = []
@@ -1343,6 +1402,10 @@ def ask(argv):
         print(f"cc-lib ask: --cap {cap} leaves no room for a record (need about {reserve + 200})", file=sys.stderr)
         return 2
     used = 0
+    for l in live_lines:   # first, and never cut: the cap trims the body from its end
+        body.append(l)
+        used += len(l.encode()) + 1
+    routed += live_ok
     for label, rs in sections:
         rs = [r for r in rs if r and r[1] not in shown_rids]
         if not rs:
@@ -1399,7 +1462,7 @@ def ask(argv):
         outcome = "partial"
     else:
         outcome = "not-recorded"
-    if cov["pending"] or deadline_hit:
+    if cov["pending"] or deadline_hit or (live and not live_ok):   # the live source unread: no record answers for it
         outcome = "partial"
     ms = (time.monotonic() - t0) * 1000
     # THE CAP IS THE RULE. The accounting above is what fills the packet; this is what enforces it: the tail
@@ -2254,12 +2317,62 @@ def selfcheck():
            "(unreadable is named in coverage on its own)", "hook-misses 1 cleared" in o and not os.path.exists(ml))
         os.remove(os.path.join(th, ".cc", "boards", "r3.json"))
         selfcheck_p3(th, ok, run, w)
+        selfcheck_live(th, ok, run, w)
         selfcheck_workspaces(th, ok, run, w)
     finally:
         H = H0
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-lib selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
+
+
+def selfcheck_live(th, ok, run, w):
+    """THE LIVE LEDGER: a tier question is answered off ~/.cc/state/tier.log as it is at that moment, never off a record.
+    Its own fixture: a stale checkpoint that says the tier is stop, and a log the case moves under the ask. Red before
+    the fix (the checkpoint answered, the log was not read)."""
+    def outcome(out):
+        m = re.search(r"^OUTCOME (\S+)", out, re.M)
+        return m.group(1) if m else "?"
+    log = os.path.join(th, ".cc", "state", "tier.log")
+    w(".cc/state/r1/seat/progress.md", "# seat\n\n## 2026-09-16T18:00Z checkpoint\nthe spend tier is stop; STALE-TIER-PROSE.\n")
+    run("index")
+    w(".cc/state/tier.log", "2026-09-16T17:42:29Z autonomous -> stop\n2026-09-18T18:09:49Z stop -> essential\n")
+    rc, o = run("ask", "--object", "r1", "--need", "current", "what is the spend tier now and when was it last changed")
+    ok("a tier question is answered off tier.log first — the tier, since when, the change count — above every record",
+       rc == 0 and o.split("\n")[1] == "ROUTE live ~/.cc/state/tier.log, read now (1)"
+       and "  spend tier: essential since 2026-09-18T18:09:49Z (stop -> essential) · 2 change(s) on record, first 2026-09-16T17:42:29Z" in o
+       and outcome(o) == "answered")
+    with open(log, "a") as f:
+        f.write("2026-09-18T18:11:52Z essential -> moderate\n")
+    rc, o = run("ask", "--need", "current", "spend tier stop")
+    ok("…and the log moved under it is read as it is now — moderate since the new stamp, 3 changes — with the stale checkpoint below it, not as the tier",
+       rc == 0 and "spend tier: moderate since 2026-09-18T18:11:52Z (essential -> moderate) · 3 change(s)" in o
+       and "essential since" not in o and o.index("read now (1)") < o.index("STALE-TIER-PROSE"))
+    os.remove(log)
+    rc, o = run("ask", "--need", "current", "spend tier stop")
+    ok("a missing log is a said NO ANSWER: partial, counted unreadable, the stale checkpoint (an all-words hit) not promoted to the tier",
+       rc == 0 and "ROUTE live ~/.cc/state/tier.log, read now: NO ANSWER — missing" in o and "spend tier:" not in o
+       and "STALE-TIER-PROSE" in o and outcome(o) == "partial"
+       and re.search(r"^COVERAGE .*unreadable [1-9].*~/\.cc/state/tier\.log \(missing", o, re.M))
+    os.mkdir(log)
+    rc, o = run("ask", "--need", "current", "spend tier")
+    ok("…an unreadable one the same, naming the error", "NO ANSWER — unreadable: Is a directory" in o and outcome(o) == "partial")
+    os.rmdir(log)
+    w(".cc/state/tier.log", "2026-09-18T18:11:52Z essential -> moderate\nnot a ledger line\n")
+    rc, o = run("ask", "--need", "current", "spend tier")
+    ok("…and a last line that does not parse is no answer either, never the line above it",
+       "NO ANSWER — last line does not parse: 'not a ledger line'" in o and "spend tier:" not in o and outcome(o) == "partial")
+    w(".cc/state/tier.log", "2026-09-18T18:11:52Z essential -> moderate\n")
+    rc, o = run("ask", "--object", "tier", "--need", "current")
+    rc2, o2 = run("ask", "--object", log, "--need", "history")
+    ok("--object tier and --object <the log's path> reach it with no row or path route beside; a need but current lists the changes",
+       rc == 0 and "spend tier: moderate since" in o and "board row" not in o and "    2026-09-18T18:11:52Z" not in o
+       and rc2 == 0 and "spend tier: moderate since" in o2 and "not a registered source" not in o2
+       and "    2026-09-18T18:11:52Z essential -> moderate" in o2)
+    rc, o = run("ask", "--need", "current", "does the token reach every private repo")
+    ok("control: a question that does not name the tier has no live route", rc == 0 and "ROUTE live" not in o and "tier.log" not in o)
+    os.remove(log)
+    os.remove(os.path.join(th, ".cc", "state", "r1", "seat", "progress.md"))
 
 
 def selfcheck_p3(th, ok, run, w):
