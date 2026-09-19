@@ -934,9 +934,25 @@ def run_selfcheck():
             if argv[0] == "gh":
                 ghcwd.append(cwd)
             if argv[0].endswith("cc-board"):
+                # One row per cut board_open makes, each with a `task:` line, the unindented line its text
+                # wraps onto, and a note \u2014 so every assertion below reads the state its own row put there.
+                # The hold is the first line under a row, as cc-board prints it; the last row's task line is the
+                # last thing under it, and the footer follows it, as cc-board prints those (review of #521).
                 return ("r9  base:main  /x\n"
-                        "  \u25b6 t9 [running]  AN-OPEN-ROW\n      task: KEEP-ME\n"
-                        "  \u2713 t8 [merged]  A-FINISHED-ROW\n      task: DROP-ME\n")
+                        "  \u25b6 t9 [running]  AN-OPEN-ROW\n"
+                        "      task: LIVE-TASK-CUT\nLIVE-WRAP-CUT\n"
+                        "      - LIVE-NOTE-KEPT\n"
+                        "  \u00b7 t7 [queued]  A-QUEUED-ROW\n"
+                        "      held (@3): QUEUED-HELD-KEPT behind #309 \u2014 do not start\n"
+                        "      task: QUEUED-TASK-CUT\nQUEUED-WRAP-CUT\n"
+                        "      - QUEUED-NOTE-CUT\n"
+                        "  \u2713 t8 [merged]  A-FINISHED-ROW\n"
+                        "      held (@9): FINISHED-HELD-CUT\n"
+                        "      task: FINISHED-TASK-CUT\nFINISHED-WRAP-CUT\n"
+                        "      - FINISHED-NOTE-CUT\n"
+                        "  \u00b7 t6 [queued]  A-TASK-ONLY-ROW\n"
+                        "      task: LAST-TASK-CUT\n"
+                        "  (1 finished \u2014 cc board show r9 --all)\n")
             if argv[0] == "gh":
                 return "5      track/t9      MERGEABLE\n"
             if argv[0].endswith("cc-scope"):
@@ -972,8 +988,26 @@ def run_selfcheck():
         ok("...and it never reads past that entry: the one before it is in the file and not in the packet",
            "OLD-ENTRY-NEVER-READ" not in b and "the OLD one" not in b
            and nread < os.path.getsize(jpath) and nread <= BRIEF_CAP)
-        ok("...the board is trimmed to the rows that are not finished, notes and all",
-           "AN-OPEN-ROW" in b and "KEEP-ME" in b and "A-FINISHED-ROW" not in b and "DROP-ME" not in b)
+        ok("...the board is the rows that are not finished: a merged row's header, task, wrapped task text and "
+           "notes are all gone, and a live row's header and notes are all there",
+           "AN-OPEN-ROW" in b and "LIVE-NOTE-KEPT" in b
+           and not any(s in b for s in ("A-FINISHED-ROW", "FINISHED-TASK-CUT", "FINISHED-NOTE-CUT")))
+        ok("...and a FINISHED row's wrapped task text goes with it: unindented, it used to read as a new board "
+           "header, reset the drop and leak the line into the packet",
+           "FINISHED-WRAP-CUT" not in b and "r9  base:main  /x" in b)
+        ok("...every row loses its `task:` line and the lines that text wraps onto, live row and queued row alike, "
+           "while both keep the header above it — and the packet names the command that has the task text whole",
+           not any(s in b for s in ("LIVE-TASK-CUT", "LIVE-WRAP-CUT", "QUEUED-TASK-CUT", "QUEUED-WRAP-CUT"))
+           and "AN-OPEN-ROW" in b and "A-QUEUED-ROW" in b and "cc board get r9 <row> instructions" in b)
+        ok("...and a QUEUED row is its header alone: the successor is told the row exists, not what is under it, "
+           "while a running row beside it keeps its notes",
+           "A-QUEUED-ROW" in b and "[queued]" in b and "QUEUED-NOTE-CUT" not in b and "LIVE-NOTE-KEPT" in b)
+        ok("...except a hold a person put on it: a queued row's `held (<who>): <reason>` line survives with the header "
+           "(the packet is the only place a successor is offered it), and a finished row's hold goes with the row",
+           "held (@3): QUEUED-HELD-KEPT" in b and "do not start" in b and "FINISHED-HELD-CUT" not in b)
+        ok("...and cc-board's footer after a row whose task line was the last thing under it is kept as the board's "
+           "own line, not dropped as that row's wrapped task text",
+           "(1 finished \u2014 cc board show r9 --all)" in b and "A-TASK-ONLY-ROW" in b and "LAST-TASK-CUT" not in b)
         ok("...a live lane names its window, its PR and its waiter pid, and the queue its job and stage",
            "lane7" in b and "@70" in b and "PR 7" in b and "4242" in b and "PR 5" in b and "stage gates" in b)
         ok("...a live worker is one line, the last of its loop.log", "LAST-LOOP-LINE" in b and "older line" not in b)

@@ -9,8 +9,11 @@ spend of two sessions; nothing on the box measures a line and runs it for you.
   cc-handoff --sweep                         from the cc-reconcile timer: finish what no session is left to
   cc-handoff --kick <target> [<id>]          internal: brief the successor once it is up, check it landed
   cc-handoff --retire <target>               internal: wait out the predecessor's subagents, DRAIN it, end it
-  cc-handoff --brief <target>                ONE packet of everything a successor would otherwise re-read; a
-                                             packet at or over CC_BRIEF_PACKET_BAND (24 kB) is one failures
+  cc-handoff --brief <target>                ONE packet of what a successor would otherwise re-read a tool
+                                             call at a time — the board in it is unfinished rows, without
+                                             their truncated `task:` line, and a queued row's header (and
+                                             its hold, if a person put one on it) with nothing else under it;
+                                             a packet at or over CC_BRIEF_PACKET_BAND (24 kB) is one failures
                                              record (spend/handoff-packet-over-band), once per handoff
   cc-handoff --status [<target>] [--json]    what phase, who is live, how long left
   cc-handoff selfcheck
@@ -1304,7 +1307,11 @@ JOURNAL_HEAD = re.compile(r"^## ", re.M)         # any dated entry: what a track
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 BOARD_ROW = re.compile(r"^  \S+ (\S+) \[([a-z]+)\]")     # "  ▶ <track> [running]  <title>", ANSI stripped
 BOARD_CONT = "      "                                     # its indented task/PR/note lines
+BOARD_TASK = BOARD_CONT + "task:"                         # the row's brief, truncated: cut, see board_open
+BOARD_HELD = BOARD_CONT + "held ("                        # a hold a person put on the row: kept, see board_open
+BOARD_FOOT = re.compile(r"^  \(\d+ finished — cc board show ")   # cc-board's own last line, after the rows
 DONE_ROWS = ("merged", "done")
+BACKLOG_ROWS = ("queued",)         # of cc-board's STATES, the one nobody has started: header only, see board_open
 LANE = re.compile(r"^lane[0-9]+$")                        # the tmux land-lane crutch (retired in #154, not gone)
 PR_IN = re.compile(r"(?<![0-9])([0-9]{1,6})(?![0-9])")
 
@@ -1399,16 +1406,46 @@ def journal_view(path):
 
 
 def board_open(repo):
-    """`cc board show <repo>`, minus the rows that are finished — a successor inherits what is unfinished."""
-    keep, drop = [], False
+    """`cc board show <repo>`, minus what a successor cannot act on. Measured on this box's own board
+    (2026-09-16): 63 rows printed 32 kB of a 48 kB packet, and the successor re-reads all of it every turn.
+    Three cuts, each naming what is left to read it with:
+      · a FINISHED row (merged/done) and every line under it — a successor inherits what is unfinished.
+      · EVERY row's `task:` line, and the unindented lines its text wraps onto — 12.9 kB of the 32, and it is
+        the brief cut off mid-word. `cc board get <repo> <row> instructions` has the whole of it, for the one row picked up.
+      · a QUEUED row's notes and delivery lines — 7.1 kB more. A successor acts on what is live; of the backlog
+        it need only know the row exists, which the header it keeps says. Every other unfinished state
+        (running, waiting, review, blocked) keeps its notes: those are rows something is happening to.
+    Two lines are never cut by those rules. A row's `held (<who>): <reason>` line (cc-board: the hold is the
+    first thing under the row, and `show` is the only place a person is offered it), because a successor that
+    is not told a backlog row is deliberately on hold is the one that starts it. And cc-board's own footer,
+    `  (N finished — cc board show <repo> --all)`, which follows the last row and would otherwise read as that
+    row's wrapped task text when the task line was the last thing under it.
+    """
+    keep, done, backlog, wrap = [], False, False, False
     for line in ANSI.sub("", out([os.path.join(BIN, "cc-board"), "show", repo])).splitlines():
         m = BOARD_ROW.match(line)
         if m:
-            drop = m.group(2) in DONE_ROWS
-        elif not line.startswith(BOARD_CONT):
-            drop = False                                  # the board's own header line: not a row at all
-        if line.strip() and not drop:
-            keep.append(line)
+            done, backlog, wrap = m.group(2) in DONE_ROWS, m.group(2) in BACKLOG_ROWS, False
+            if line.strip() and not done:
+                keep.append(line)
+            continue
+        if not line.startswith(BOARD_CONT):
+            # Unindented: the board's own header (`<repo>  base:main  /path`) or footer, or a line a long
+            # `task:` wrapped onto. Only the first two are lines of their own — and before this the wrapped text
+            # was read as one, so a FINISHED row's wrapped task text reset the drop and leaked into the packet.
+            # The footer is matched by shape, not by `wrap`: after a row whose task line was the last thing
+            # under it, `wrap` is still up when the footer arrives (review of #521).
+            if wrap and not BOARD_FOOT.match(line):
+                continue
+            done = backlog = wrap = False
+            if line.strip():
+                keep.append(line)
+            continue
+        wrap = line.startswith(BOARD_TASK)
+        # "keep a line starting with BOARD_CONT + 'held (' regardless of backlog (only done drops it)" — #521
+        if done or wrap or (backlog and not line.startswith(BOARD_HELD)):
+            continue
+        keep.append(line)
     return "\n".join(keep)
 
 
@@ -1494,7 +1531,10 @@ def brief(target):
                    f"{int((rec.get('deadline', 0) - time.time()) / 60)}m left")
     sections = [
         (f"journal — checkpoint view: {jlabel}", journal),
-        (f"board — {repo}, unfinished rows only", board_open(repo)),
+        # No `task:` line and no notes on a queued row: `cc board get <repo> <row> instructions` has both, for the one
+        # row the successor actually picks up. board_open says why.
+        (f"board — {repo}, unfinished rows, without their task text; a queued row is its header and any hold on it. "
+         f"`cc board get {repo} <row> instructions` has the whole of any one of them", board_open(repo)),
         ("land — lanes and the landing queue", lanes()),
         (f"workers — live loops under {repo}, last line of each", live_workers(repo)),
         ("open PRs", prs(repo)),
