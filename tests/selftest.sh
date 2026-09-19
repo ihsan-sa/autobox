@@ -2062,6 +2062,70 @@ CC_CLAUDE="$T/bound15claude" "$B/cc-loop" $REPO w15 --max-iter 1 --no-extend --q
 { [ "$rc" = 0 ] && [ "$("$B/cc-board" get $REPO w15 status)" = blocked ]; } \
   && ok "…and one that opened no PR lands on \`blocked\`, never \`review\` — the word cc-reconcile would settle it on anyway, and the one that files no finding" \
   || bad "no-extend without a PR: rc=$rc board=$("$B/cc-board" get $REPO w15 status)"
+# 6c: AN ITERATION THAT ENDS WITH ITS OWN cc-green RUN STILL GOING IS NOT IDLE (twelve "committed nothing" stops over a
+# detached suite in ten days to 2026-09-19, each a relaunch and a planning wake). The stub cc-green answers as the real
+# one does on a root with a run going: `wait` says still running (exit 3) twice, then ended (exit 0); asked on the next
+# iteration, nothing is running. The stub claude journals NOTHING on iteration 1 — the run is all it did — so without
+# the fix that iteration is a runaway signal AND the step limit stops the loop (exit 6, one run). Own track, own
+# stub, own counter; the stub also writes where it was asked from, which must be this track's worktree and no other.
+mktrack w20 "start the suite, then read it"
+mkclaude greenclaude w20 '[ "$n" -ge 2 ] && echo "STATUS: DONE" >> "$st/progress.md"'
+cat > "$T/greenstub" <<F
+#!/bin/sh
+echo "\$PWD" >> "$T/green.cwd"; c=\$(cat "$T/green.n" 2>/dev/null || echo 0); c=\$((c+1)); echo \$c > "$T/green.n"
+case "\$1:\$c" in wait:1|wait:2) echo "cc-green: still running (pid 1, since now) — log $T/green.log"; exit 3;;
+  wait:3) echo "cc-green: the run (pid 1, started now) has ended — log $T/green.log"; echo "cc-green: green on abc"; exit 0;;
+  *) echo "cc-green: green on abc"; exit 0;; esac
+F
+chmod +x "$T/greenstub"; rm -f "$T/green.n" "$T/green.cwd"
+CC_GREEN="$T/greenstub" CC_CLAUDE="$T/greenclaude" "$B/cc-loop" $REPO w20 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 0 ] && [ "$(nruns w20)" = 2 ] && lg w20 | grep -q 'still going — waiting on it, no model call' \
+  && lg w20 | grep -q 'one more iteration to read the result' && ! lg w20 | grep -q 'runaway signal' \
+  && grep -q "^- cc-loop: the cc-green run iteration 1 started ended while the loop waited on it (exit 0, log $T/green.log)" ~/.cc/state/$REPO/w20/progress.md \
+  && [ "$(sort -u "$T/green.cwd")" = "$HOME/.cc/worktrees/$REPO/w20" ]; } \
+  && ok "an iteration that ends with its own cc-green run still going is not idle: the loop waits it out (no model call), journals the result for the next context, raises no runaway signal, and at the step limit buys ONE more iteration to read it — asked on this track's worktree, no other" \
+  || bad "gate-wait: rc=$rc runs=$(nruns w20) cwd='$(sort -u "$T/green.cwd" 2>/dev/null)' log: $(lg w20 | grep -E 'cc-green|runaway|exit' | tail -3)"
+# 6c': …AND THAT ONE ITERATION IS GRANTED ONCE PER ROUND, AND THE SPEND RULE STILL COUNTS A GATED ITERATION (review of
+# #541): a worker that ends EVERY iteration with a fresh suite run on a red gate, never committing, was extended at every
+# limit and excused from every runaway signal — no bound on the spend at all. Here every iteration is gated (the stub
+# cc-green says running, running, ended, for two iterations, then nothing running — BOUNDED, because against the
+# defective loop an unbounded stub never ends: the first draft of this case ran 490 extended iterations on the
+# pre-repair bins and was ended by its stop file), nothing commits, nothing journals, and the loop is given a $0.10
+# yardstick against $0.50 iterations: iteration 1 is gated and buys one more; iteration 2 is gated too, but the grant
+# is spent until a commit, so the loop ends there (exit 6, two runs, not three) — and its spend since the last commit,
+# 5x the yardstick, is a runaway signal in the log even though the iteration was gated.
+mktrack w22 "re-run the red suite forever"
+mkclaude green22claude w22 ':'   # commits nothing, journals nothing, ever — the run is all it does
+cat > "$T/greenstub22" <<F
+#!/bin/sh
+c=\$(cat "$T/green22.n" 2>/dev/null || echo 0); c=\$((c+1)); echo \$c > "$T/green22.n"
+case "\$1:\$c" in wait:1|wait:2|wait:4|wait:5) echo "cc-green: still running (pid 1, since now) — log $T/green22.log"; exit 3;;
+  wait:3|wait:6) echo "cc-green: the run (pid 1, started now) has ended — log $T/green22.log"; echo "cc-green: NOT green on abc"; exit 1;;
+  *) echo "cc-green: NOT green on abc"; exit 1;; esac
+F
+chmod +x "$T/greenstub22"; rm -f "$T/green22.n"
+CC_GREEN="$T/greenstub22" CC_CLAUDE="$T/green22claude" "$B/cc-loop" $REPO w22 --max-iter 1 --budget 0.1 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 6 ] && [ "$(nruns w22)" = 2 ] && [ "$(lg w22 | grep -c 'one more iteration to read the result')" = 1 ] \
+  && lg w22 | grep -q 'runaway signal 1/3: spent \$1.0* since its last commit' && ! lg w22 | grep -q 'runaway signal .*journal untouched'; } \
+  && ok "…and that extra iteration is granted ONCE per round: a worker re-running its suite every iteration without committing is extended once and then stopped at the limit (exit 6, two runs), and the spend-since-last-commit rule still counts a gated iteration — only the untouched journal and the repeated outcome are what the live run explains" \
+  || bad "gate-wait grant: rc=$rc runs=$(nruns w22) grants=$(lg w22 | grep -c 'one more iteration') log: $(lg w22 | grep -E 'runaway|exit' | tail -3)"
+# 6d: A LOOP IS STOPPED BY A FILE, NOT A KILL. Written while iteration 1 runs (here by the stub claude itself — the
+# shape of a session touching it while the worker is mid-turn), it ends the loop before iteration 2's model call:
+# one run, exit 14, the board `blocked` with the reason, one journal line, the file consumed, nobody paged. And a
+# stop file from BEFORE the dispatch is stale — cleared at start, so the re-dispatch it predates still runs its
+# first iteration: the same case proves both, since one run means the stale file did not stop it and the live one did.
+mktrack w21 "stop me by file"
+mkclaude stopclaude w21 'echo "- step $n" >> "$st/progress.md"; echo "wasted: wrong branch" > "$st/stop"'
+echo stale > ~/.cc/state/$REPO/w21/stop
+nls=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
+CC_CLAUDE="$T/stopclaude" "$B/cc-loop" $REPO w21 --max-iter 3 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 14 ] && [ "$(nruns w21)" = 1 ] && [ ! -e ~/.cc/state/$REPO/w21/stop ] && [ "$("$B/cc-board" get $REPO w21 status)" = blocked ] \
+  && lg w21 | grep -q 'stop file from before this dispatch was cleared' \
+  && lg w21 | grep -q 'exit 14: stopped by .*/w21/stop after iteration 1 — wasted: wrong branch' \
+  && grep -q '^- cc-loop: stopped by .*/w21/stop after iteration 1 — wasted: wrong branch' ~/.cc/state/$REPO/w21/progress.md \
+  && [ "$(tail -n +$((nls+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "/w21 ")" = 0 ]; } \
+  && ok "a stop file written mid-run ends the loop before its next model call: one run of three, exit 14, board \`blocked\` with the reason in the log and the journal, the file consumed, nobody paged — and a stop file from before the dispatch is cleared at start rather than obeyed" \
+  || bad "stop file: rc=$rc runs=$(nruns w21) file=$([ -e ~/.cc/state/$REPO/w21/stop ] && echo present || echo gone) board=$("$B/cc-board" get $REPO w21 status) notified=$(tail -n +$((nls+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "/w21 ") log: $(lg w21 | tail -2)"
 # 7+8: what the loop does OUTSIDE the worker's process (sandbox stage 1a, review of #129). A sandboxed worker's Stop hook
 # commits but cannot push (no credential inside), so the loop pushes whatever is ahead of origin — even with nothing
 # left to commit. And the hooks that loop-side git runs come from the MAIN checkout, never the worktree the worker edits.
@@ -2314,7 +2378,14 @@ gtier=$(god env CC_SPEND_TIER=autonomous); gnotier=$(god env -u CC_SPEND_TIER)
 { grep -q 'CC_SPEND_TIER=autonomous ' <<<"$gtier" && ! grep -q CC_SPEND_TIER <<<"$gnotier"; } \
   && ok "CC_SPEND_TIER crosses \`cc --go\` into the loop's window — the tier the dispatcher answered from is the one the loop's own door asks, so a fixture under the box's stop still starts — and nothing is carried when it is unset" \
   || bad "CC_SPEND_TIER does not cross the tmux window: set='$(head -c 120 <<<"$gtier")' unset='$(head -c 90 <<<"$gnotier")'"
-for t in w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
+# …and the orch that dispatched a track, the same way: cc-loop records CC_SLACK_ALIAS at start for its stop notice ("a
+# track dispatched by an orch has its stop notice addressed to that orch's alias"), and off this list the loop's window
+# never had it — every stop woke the repo seat (raised-a-tracks-stop-wakes-the-repo-seat-not-its-orch).
+galias=$(god env CC_SLACK_ALIAS=orc); gnoalias=$(god env -u CC_SLACK_ALIAS)
+{ grep -q 'CC_SLACK_ALIAS=orc ' <<<"$galias" && ! grep -q CC_SLACK_ALIAS <<<"$gnoalias"; } \
+  && ok "CC_SLACK_ALIAS crosses \`cc --go\` into the loop's window — the orch that dispatched a track is what its stop notice is addressed to — and nothing is carried when no orch is in front of the dispatch" \
+  || bad "CC_SLACK_ALIAS does not cross the tmux window: set='$(head -c 120 <<<"$galias")' unset='$(head -c 90 <<<"$gnoalias")'"
+for t in w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
 
 fi
 if stanza "usage limits (cc-limit + cc-loop)"; then
@@ -2365,6 +2436,24 @@ n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "$(hostname) limi
 [ "$n" = 1 ] && ok "owner told exactly once per limit episode (title '$(hostname) limit' -> #alerts)" || bad "limit notify count: $n"
 [ "$("$B/cc-limit" status)" = clear ] && ok "the stamp is cleared by the run that got through" || bad "stamp left behind"
 "$B/cc" rm $REPO w4 >/dev/null 2>&1
+# A STOP FILE WRITTEN DURING THE PRE-ITERATION LIMIT WAIT IS READ WHEN THE WAIT ENDS, before anything is charged (review
+# of #541: that wait is up to 6 h, and the file was read only after the iteration it then started — a full model call).
+# A stamp another run set binds this loop (same cwd, one observer), so it waits at its door; the stop file is written the
+# moment the log says so, inside a 3 s wait; the loop must then end on it with NO run. Own track, own stamp, cleared after.
+"$B/cc" $REPO w23 >/dev/null 2>&1; sleep 1
+for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w23$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
+echo "stop me while I wait" > ~/.cc/state/$REPO/w23/task.md; rm -f ~/.cc/state/$REPO/w23/stop
+printf '{"is_error":true,"result":"rate limit; reset in 2 minutes","total_cost_usd":0}' > "$T/w23-lim.json"
+"$B/cc-limit" check "$T/w23-lim.json" >/dev/null   # the stamp, keyed to this cwd — the loop below runs from the same one
+( for _ in $(seq 100); do grep -q 'waiting before starting' ~/.cc/state/$REPO/w23/loop.log 2>/dev/null && break; sleep 0.1; done
+  echo "wasted" > ~/.cc/state/$REPO/w23/stop ) &
+CC_LIMIT_MIN_WAIT=3 CC_LIMIT_RECORD="$T/lh/limit-interrupted" CC_LIMIT_NUDGED="$T/lh/limit-nudged" CC_LIMIT_SEEN="$T/lh/limit-seen" CC_LIMIT_ARM=- \
+  CC_CLAUDE="$T/limitclaude" "$B/cc-loop" $REPO w23 --max-iter 2 --quiet >/dev/null 2>&1; rc=$?; wait
+runs=$(ls ~/.cc/state/$REPO/w23/runs/*.json 2>/dev/null | wc -l)
+{ [ "$rc" = 14 ] && [ "$runs" = 0 ] && grep -q 'waiting before starting' ~/.cc/state/$REPO/w23/loop.log && grep -q 'exit 14: stopped by .*/w23/stop' ~/.cc/state/$REPO/w23/loop.log; } \
+  && ok "a stop file written while the loop waits out a limit at its door is read when the wait ends: exit 14 with NO run — the iteration the wait was holding is never charged" \
+  || bad "stop during limit wait: rc=$rc runs=$runs log: $(tail -3 ~/.cc/state/$REPO/w23/loop.log 2>/dev/null | cut -c1-160)"
+"$B/cc-limit" clear; "$B/cc" rm $REPO w23 >/dev/null 2>&1
 fi
 if stanza "one limit episode, end to end (cc-limit writes the record and the episode down; cc-model and cc-reconcile read them)"; then
 # The seam no selfcheck can reach. `cc-limit resume` writes ~/.cc/state/limit-resumed

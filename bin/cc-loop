@@ -70,6 +70,25 @@
 #       at dispatch the same tier is exit 2 before anything runs
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
+#     | 14 stopped by hand: ~/.cc/state/<repo>/<track>/stop existed when the next iteration was about to start (see below)
+# A LOOP IS STOPPED BY A FILE, NOT A KILL. `touch ~/.cc/state/<repo>/<track>/stop` (its text, if any, is the reason) ends the
+# loop at the next iteration boundary: the iteration in flight finishes, nothing more is charged, board `blocked`, the
+# reason in the board note and one journal line, the file consumed. Nobody is paged — whoever wrote it knows. A kill is
+# the thing the classifier rightly refuses a session, and a kill mid-iteration leaves a claude re-parented to systemd,
+# still editing the worktree. A stop file that predates the dispatch is stale and cleared: re-dispatching overrides it.
+# AN ITERATION THAT ENDS WITH ITS OWN cc-green RUN STILL GOING WAS NOT IDLE. The worker is told to detach the suite
+# (`setsid nohup cc-green run`) and wait on it; a 22-minute gate outlives an iteration, and until 2026-09-19 ten
+# tracks whose last iteration had only started that run were stopped as "committed nothing", each costing a relaunch
+# and a planning wake. So after every iteration the loop asks `cc-green wait` on the worktree (green_wait): a run
+# still going is waited out HERE, with no model call, its result is one journal line for the next fresh context, the
+# iteration is not the journal-untouched or repeated-outcome runaway signal (the run explains both; the spend rule
+# still counts it), and at the step limit it buys ONE more iteration to read that result — once per round (gext:
+# the grant is not repeated until a commit starts a new round, or a worker re-running a red suite every iteration
+# would never be stopped by anything), not a batch, and not under --no-extend, whose bound is the caller's promise.
+# A STOP IS ADDRESSED TO THE SESSION THAT DISPATCHED THE TRACK — an orch when one did (`<repo>@<alias>`, the broker's
+# own key for it), the repo seat only when none is recorded. The record is $ST/orch, written by this loop at start from
+# CC_SLACK_ALIAS, which an orch's shell exports and `cc … --go` carries into the loop's window; a dispatch with none
+# removes it (that dispatcher is the repo seat), and the variable is unset before the worker runs.
 # A STOP THAT IS A FAILURE IS WRITTEN TO THE FAILURES LEDGER BY THE LOOP, at the moment it stops (stop_record; design-failure-noticing
 # phase 2, "signals kept at their producers"): exits 5 6 9 10 as worker-loop/barren-stop, 4 12 as worker-loop/done-undelivered, 8 as
 # worker-loop/limit-outlasted-wait — one record per stop, through `cc-green red`, with a bounded excerpt of loop.log that outlives the
@@ -366,6 +385,12 @@ row_title(){ "$BOARD" get "$repo" "$track" title 2>/dev/null | grep . || printf 
 planner_line(){ printf 'loop: %s/%s %s — %s\n' "$repo" "$track" "$1" "$(printf '%s' "$2" | tr '\n' ' ')"; }   # $1 title · $2 message -> the ONE line the session gets
 # WHO THIS TRACK ANSWERS TO. `<repo>` is the session that dispatched it — the same target cc-reconcile's board
 # watchdog uses, so the planner's events all arrive by one door.
+orch_record(){   # written ONCE at start: the orch this loop was dispatched by (CC_SLACK_ALIAS in the dispatch environment), or no file
+  if [ -n "${CC_SLACK_ALIAS:-}" ]; then printf '%s\n' "$CC_SLACK_ALIAS" > "$ST/orch"; else rm -f "$ST/orch"; fi; }
+stop_target(){   # the broker key a stop goes to: "a track dispatched by an orch has its stop notice addressed to that orch's alias,
+                 # the repo seat only when none is recorded" (the brief). cc's own alias grammar; a file holding anything else is the repo seat.
+  local a; a=$(head -1 "${ST:-/nonexistent}/orch" 2>/dev/null | tr -d '[:space:]')
+  if [[ "$a" =~ ^[a-z0-9-]{2,20}$ ]]; then printf '%s@%s\n' "$repo" "$a"; else printf '%s\n' "$repo"; fi; }
 tell_planner(){   # $1 the line -> 0 the broker has it and owns the escalation from here, 1 nobody does
   case "$repo" in _cc*) return 1;; esac   # a suite's scratch namespace (`_cc<suite><pid>`, cc-board `real`) has no session, and a
                                           # fixture must not reach the box's own broker state — the reason cc-notify refuses to push one
@@ -377,7 +402,7 @@ tell_planner(){   # $1 the line -> 0 the broker has it and owns the escalation f
   # 30 s is what cc-reconcile allows its own inject. Being killed past it loses nothing: cc-broker
   # writes the event down BEFORE it sends anything, so its own 60 s flush delivers what this gave up waiting for.
   # The cost of the timeout is therefore a duplicate — a page AND a late wake — and never a dropped stop.
-  timeout 30 "$BIN/cc-broker" inject --no-start --source loop "$repo" "$1" >/dev/null 2>&1; }
+  timeout 30 "$BIN/cc-broker" inject --no-start --source loop "$(stop_target)" "$1" >/dev/null 2>&1; }
 stop_prio(){ [ "$1" = yes ] && echo low || echo high; }   # heard by a session -> the owner's line is ambient (ladder rung 5); heard by nobody -> he IS the fallback, so it pushes
 stop_kind(){ case "$1" in 5|6|9|10) echo worker-loop/barren-stop;; 4|12) echo worker-loop/done-undelivered;; 8) echo worker-loop/limit-outlasted-wait;; *) :;; esac; }
 stop_record(){   # $1 exit code, $2 title, $3 message → one failures-ledger record for a stop that is a failure (stop_kind), none for the rest.
@@ -390,6 +415,20 @@ tier_hold(){   # $1 start|continue · $2 repo/track -> 0 the spend tier says thi
                # cc-tier on this box, a crash — is "go", the same leniency `cc-pause is` gets: a tier that cannot be
                # read must never be the reason a worker stops.
   "$BIN/cc-tier" allows "$1" "$2" >/dev/null 2>&1; [ $? = 1 ]; }
+green_wait(){   # a cc-green run on THIS worktree still going when the iteration ended → wait it out here, journal its result, return 0; none → 1
+  # "a live cc-green run of its own = not idle" (the brief). `cc-green wait` answers 3 while a run holds the root's lock,
+  # else the tree's report (0/1) or 2 for no checkout at all; only a 3 on the FIRST ask means a run was live. The wait is
+  # bounded at 8 × 540 s, past the hour an iteration itself gets, and costs no model call: the planning seat used to run
+  # this same wait by hand after the loop had stopped the track for it.
+  local o rc n=0 lg
+  while :; do o=$(cd "$WT" && "${CC_GREEN:-$BIN/cc-green}" wait 540 2>&1); rc=$?; [ "$rc" = 3 ] || break   # CC_GREEN: test hook
+    [ "$n" = 0 ] && log "iter $i ended with its own cc-green run still going — waiting on it, no model call: ${o##*$'\n'}"
+    n=$((n+1)); [ "$n" -ge 8 ] && { log "…still going after $n waits — going on without it"; return 1; }; done
+  [ "$n" -gt 0 ] || return 1
+  lg=$(grep -oE -- '— log [^ ]+' <<<"$o" | head -1 | sed 's/^— log //')
+  log "the cc-green run ended: exit $rc — ${o##*$'\n'}"
+  printf -- '- cc-loop: the cc-green run iteration %s started ended while the loop waited on it (exit %s%s) — read that log before you run another\n' \
+    "$i" "$rc" "${lg:+, log $lg}" >> "$ST/progress.md"; return 0; }
 deliver_post(){   # THE WORKER'S SLACK DELIVERABLE, posted by the loop and never by the worker (raised-headless-cannot-deliver-to-slack).
   # A worker is guarded from every outward post, so a track whose done-criterion is a message in a channel reached its
   # last step, was refused, and ended BLOCKED with the work done and undelivered (a test member, 2026-09-09). It
@@ -651,6 +690,20 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   t "…addressed to the session that dispatched this track, and named as the loop" \
     "$(cat "$brec")" "inject --no-start --source loop demo $bl"
   : > "$brec"
+  # WHICH SESSION THAT IS. "a track dispatched by an orch has its stop notice addressed to that orch's alias, the repo seat
+  # only when none is recorded" (the brief). The record is $ST/orch, written from the dispatch environment; own state dir,
+  # both halves — the orch that is recorded, and the one that is not — and a file a person mangled reads as none.
+  local ST="$d/st7"; mkdir -p "$ST"
+  ( CC_SLACK_ALIAS=myorch orch_record ); t 'dispatched from an orch shell: the alias is recorded at start' "$(cat "$ST/orch")" myorch
+  t "…and a stop goes to THAT orch, by the broker's own key for it" "$(stop_target)" demo@myorch
+  tell_planner "$bl"; t '…really: the line the broker gets is addressed to the orch' "$(cat "$brec")" "inject --no-start --source loop demo@myorch $bl"
+  : > "$brec"
+  ( CC_SLACK_ALIAS='' orch_record ); t 'dispatched with no orch in front of it: the record goes, that dispatcher is the repo seat' "$(test -e "$ST/orch" || echo gone)" gone
+  t '…and the stop goes to the repo seat' "$(stop_target)" demo
+  printf 'not an alias!\n' > "$ST/orch"; t 'a record that is not an alias on cc\047s own grammar is the repo seat too, not a key nobody owns' "$(stop_target)" demo
+  rm -rf "$ST"; unset ST
+  grep -q '^orch_record; unset CC_SLACK_ALIAS' "$0"; t 'and the loop writes that record at start and unsets the variable before the worker runs' "$?" 0
+  grep -q 'CC_SLACK_ALIAS; do' "$realbin/cc"; t '…having been handed it by `cc … --go`, on the list of what crosses into the loop\047s window' "$?" 0
   ( repo=_cctest99999; tell_planner "$bl" ); t "a suite's \`_cc<suite><pid>\` scratch repo has no session to wake" "$?" 1
   t "…and a fixture's stops never reach the box's own broker state" "$(wc -c < "$brec")" 0
   ( CC_MEMBER_SANDBOX=1 tell_planner "$bl" )
@@ -830,6 +883,8 @@ mkdir -p "$ST/runs"; [ -s "$ST/task.md" ] || { echo "cc-loop: no task at $ST/tas
 [ -d "$WT" ] || { echo "cc-loop: no worktree $WT (run: cc $repo $track)" >&2; exit 2; }
 touch "$ST/progress.md"; LOG="$ST/loop.log"; SNAP="$ST/.progress.snap"
 log(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
+orch_record; unset CC_SLACK_ALIAS   # who dispatched this loop, for stop(); the worker's own environment does not carry it
+[ -e "$ST/stop" ] && { rm -f "$ST/stop"; log "a stop file from before this dispatch was cleared — re-dispatching overrides it"; }
 set -m   # each iteration runs in its own process group, so one kill takes claude AND everything it spawned
 child=""
 kill_child(){ [ -n "$child" ] || return 0   # only ever signal a group we own: if the child is not a group leader, kill just it
@@ -845,8 +900,8 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" heard=no whose=""
   log "failures ledger ($repo): $(stop_record "$code" "$title" "$msg")"   # the tool that saw it writes it down; the exit is decided already
   # THE BOARD IS WRITTEN FIRST AND THE UPDATES LINE GOES OUT LAST, whatever the broker does in between: a stop that
   # reached nobody is worse than the ping this replaces, so neither of those two depends on it.
-  tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose="  ($repo's session has this one.)"; }
-  log "the stop went to $repo's session: $heard"
+  tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose="  ($(stop_target)'s session has this one.)"; }
+  log "the stop went to $(stop_target)'s session: $heard"
   "$BIN/cc-notify" -p "$(stop_prio "$heard")" -t "$repo/$track $title" "$msg$whose"; exit "$code"; }
 # THE PROJECT PAUSE. `cc-pause on <repo>` parks a whole project; what it does to a loop that is ALREADY RUNNING is
 # signal it, so this is read from the TERM trap and again at the top of every iteration — the flag can appear at any
@@ -857,6 +912,14 @@ parked(){ "$BIN/cc-pause" is "$repo" 2>/dev/null || return 1
   "$BOARD" status "$repo" "$track" queued >/dev/null 2>&1
   "$BOARD" note "$repo" "$track" "loop exit 11: project paused — cc-pause off $repo restarts it" >/dev/null 2>&1
   log "exit 11: $repo is paused — standing down; nothing more spends here until cc-pause off $repo"; exit 11; }
+# THE STOP FILE, read at the same boundary: "a stop file written mid-run ends the loop before its next model call, and
+# its budget is not spent" (the brief). The file is the whole verb — no kill, no signal, nothing mid-iteration.
+stopped(){ [ -e "$ST/stop" ] || return 1
+  local why; why=$(head -c 200 "$ST/stop" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//'); rm -f "$ST/stop"
+  "$BOARD" status "$repo" "$track" blocked >/dev/null 2>&1
+  "$BOARD" note "$repo" "$track" "loop exit 14: stopped by $ST/stop after iteration $i${why:+ — $why}; cc $repo $track --go \"\" resumes it" >/dev/null 2>&1
+  printf -- '- cc-loop: stopped by %s after iteration %s%s\n' "$ST/stop" "$i" "${why:+ — $why}" >> "$ST/progress.md"
+  log "exit 14: stopped by $ST/stop after iteration $i${why:+ — $why} (\$$spent); cc $repo $track --go \"\" resumes it"; exit 14; }
 # THE SPEND TIER, the same way but box-wide and only at the iteration boundary: `cc-tier set` signals nothing, so
 # the iteration in flight finishes and the NEXT one asks `cc-tier allows continue` before anything is charged. Under
 # stop no worker goes on; under essential only a row marked critical does. Standing down leaves the board honest
@@ -871,6 +934,7 @@ SP=$(sp_worker "$base")
 "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
 i=0; errs=0; caps=0; spent=0; limited=0   # limited: the owner has already been told about THIS limit episode
 barren=0; rounds=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the runaway rule's memory: this track measured against itself
+gext=0   # the gate-wait's one extra iteration has been granted this round (cleared by a commit)
 lastm=""; lastwhy=""; lastasked=""   # what the previous iteration ran on, the outage that had moved it there
                        # ("" = none), and the model it was DISPATCHED on. ALL THREE are the memory this needs: a model
                        # change alone does not say which way it went, and an outage remembered alone does not say the
@@ -879,9 +943,11 @@ lastm=""; lastwhy=""; lastasked=""   # what the previous iteration ran on, the o
 chainend=0   # the end of the cc-model chain is journalled once per loop, not once per iteration
 while [ $i -lt "$MAXI" ]; do
   parked   # read before the limit stamp and before anything is charged: a project paused mid-run stops at this line
+  stopped  # …the stop file, written by a person or a session while the last iteration ran
   tiered   # …and the spend tier the same way, for iteration 2 onwards
   if p=$("$BIN/cc-limit" status 2>/dev/null); then log "$p — waiting before starting (another run hit it)"   # a stamp any run on this box set
-    "$BIN/cc-limit" wait || stop 8 "waiting" "Claude $p — longer than cc-loop waits (CC_LIMIT_MAX_WAIT); rerun with: cc $repo $track --go \"\""; fi
+    "$BIN/cc-limit" wait || stop 8 "waiting" "Claude $p — longer than cc-loop waits (CC_LIMIT_MAX_WAIT); rerun with: cc $repo $track --go \"\""
+    parked; stopped; fi   # that wait can be hours: a pause or a stop file written during it is read before anything is charged (review of #541)
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"
   cont=""; [ "$rounds" -gt 0 ] && cont=" This loop passed its original step limit and carried on because you are still committing work — pick up exactly where the journal stops."
   prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s of %s.%s\n' "$(cat "$ST/task.md")" "$(journal_block "$ST/progress.md")" "$i" "$MAXI" "$cont")
@@ -1013,15 +1079,19 @@ while [ $i -lt "$MAXI" ]; do
   elif [ "$rc" != 0 ] || [ "$iserr" = true ]; then errs=$((errs+1)); log "error ($errs): $( { head -c 300 "$out.err" 2>/dev/null; [ -s "$out.err" ] || jq -r '"\(.subtype // "")\ \(.result // "" | tostring)"' "$out" 2>/dev/null | head -c 300; } | tr '\n' ' ')"   # a run that errored in-band leaves .err empty: say why from the json
        [ $errs -ge 2 ] && stop 5 "errored" "2 consecutive failures; see $LOG"
   else errs=0; caps=0; fi
+  gated=no; green_wait && gated=yes   # its own suite still running: the iteration ends on what the work did, and the loop waits, not the worker
   # ── the runaway rule: progress-free SPEND, and every number it uses comes from this track's own history ──
   committed=no; [ "$before_head" != "$after_head" ] && committed=yes
   sig=$(jq -r '"\(.subtype // "")|\(.is_error // false)|\((.result // "")|tostring)"' "$out" 2>/dev/null | tr -d '\n' | head -c 160)
-  if [ "$committed" = yes ]; then cn=$((cn+1)); ccost=$(awk -v a="$ccost" -v b="$sincecost" -v c="${cost:-0}" 'BEGIN{printf "%.4f", a+b+c}'); sincecost=0; nocommit=0
+  if [ "$committed" = yes ]; then cn=$((cn+1)); ccost=$(awk -v a="$ccost" -v b="$sincecost" -v c="${cost:-0}" 'BEGIN{printf "%.4f", a+b+c}'); sincecost=0; nocommit=0; gext=0
   else sincecost=$(awk -v a="$sincecost" -v b="${cost:-0}" 'BEGIN{printf "%.4f", a+b}'); nocommit=$((nocommit+1)); fi
   yard=$(awk -v c="$ccost" -v n="$cn" -v b="$BUDGET" 'BEGIN{printf "%.4f", (n>0 ? c/n : b)}')   # what an iteration that DID commit costs this track; before the first one, its own budget
   why=""
-  if [ "$moved" = no ]; then why="committed nothing and left the journal untouched"
-  elif [ "$committed" = no ] && [ -n "$prevsig" ] && [ "$sig" = "$prevsig" ]; then why="repeated the previous iteration's outcome word for word, with nothing committed"
+  # A gated iteration (its own gate run, waited out above) explains away the first two signals — the journal it left
+  # untouched, the outcome it repeated — and NOT the third: money spent since the last commit is spent whether or not a
+  # suite was running, and a worker re-running a red suite every iteration is exactly what that rule is for.
+  if [ "$moved" = no ] && [ "$gated" = no ]; then why="committed nothing and left the journal untouched"
+  elif [ "$committed" = no ] && [ "$gated" = no ] && [ -n "$prevsig" ] && [ "$sig" = "$prevsig" ]; then why="repeated the previous iteration's outcome word for word, with nothing committed"
   elif [ "$nocommit" -ge 2 ] && awk -v s="$sincecost" -v y="$yard" -v x="$RUNX" 'BEGIN{exit !(y > 0 && s >= x * y)}'; then
     why="spent \$$sincecost since its last commit — ${RUNX}x what a committed iteration costs this track (\$$yard)"; fi
   prevsig="$sig"
@@ -1033,7 +1103,10 @@ while [ $i -lt "$MAXI" ]; do
   if [ $i -ge "$MAXI" ] && [ "$committed" = yes ] && [ "${NOEXT:-0}" != 1 ]; then
     rounds=$((rounds+1)); MAXI=$((MAXI + BATCH))
     log "step limit reached with work committed — carrying on for $BATCH more (round $rounds, \$$spent)"
-    "$BOARD" note "$repo" "$track" "picked itself up at the step limit: $i iterations, \$$spent, still committing" >/dev/null 2>&1; fi
+    "$BOARD" note "$repo" "$track" "picked itself up at the step limit: $i iterations, \$$spent, still committing" >/dev/null 2>&1
+  elif [ $i -ge "$MAXI" ] && [ "$gated" = yes ] && [ "$gext" = 0 ] && [ "${NOEXT:-0}" != 1 ]; then   # "…ends non-stop and re-enters" (the brief): ONE more, to read the run it waited for
+    MAXI=$((MAXI + 1)); gext=1   # …and once per round: the next grant needs a commit first
+    log "step limit reached with its own cc-green run just ended — one more iteration to read the result (\$$spent)"; fi
 done
 IFS='|' read -r ended bst <<<"$(round_end "${committed:-no}" "$("$BOARD" get "$repo" "$track" pr 2>/dev/null)")"
 if [ "$ended" = over ]; then   # bounded and still committing: the round did its job, so nobody is paged and the board says review

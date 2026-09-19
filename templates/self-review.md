@@ -24,7 +24,9 @@ already exists for it; `cc-green run` runs the ones that do not, one run per wor
 landing then spends those records instead of running the ~22-minute suite again on its own queue, where it is the
 slowest thing in the flow. A gate that long outlives a foreground tool call, so detach it — `setsid nohup cc-green
 run >/dev/null 2>&1 &` — then `cc-green wait` until its exit is not 3 (still going), and read the log it names; a
-background job that dies with your iteration leaves you with no run and no record.
+background job that dies with your iteration leaves you with no run and no record. A detached run outlives the
+iteration: if yours ends while the run is going, the loop waits on it (no model call) and journals its exit and
+log for your next context, which reads that log and finishes.
 
 `cc-green` also reads your diff for each defect class the landing review has stopped two or more PRs for, and names
 the line; a class it names holds the hand-over like a gate that has not run. The classes come from the recorded
