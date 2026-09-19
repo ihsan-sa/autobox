@@ -4,6 +4,10 @@ what the journal missed, and only then retires it. A session runs it itself when
 spend of two sessions; nothing on the box measures a line and runs it for you.
 
   cc-handoff --overlap <target> [--session ID] [--in-flight "…"]   start a successor alongside
+  cc-handoff --replace <workspace> [--session ID]   a MEMBER workspace's live session, handed off onto the
+                                             boundary the box has now: the overlap, then the host's own
+                                             cutover once the successor's prompt lands (it cannot run
+                                             --ready inside its sandbox); the old session drains and retires
   cc-handoff --ready [<target>] [--forced]   run BY THE SUCCESSOR: the one atomic cutover, then retire
   cc-handoff --abandon <target> [--why "…"]  give up: the successor's window goes, the record clears
   cc-handoff --sweep                         from the cc-reconcile timer: finish what no session is left to
@@ -24,7 +28,14 @@ TARGET IS THE SESSION'S OWN TMUX WINDOW NAME in session `main`, the address the 
   `<repo>/<track>`    a TRACK, interactive or headless, in its own worktree
 `parts` splits an address and `kind` names it. The successor's window is `<target>~next` until cutover.
 A headless run (CC_ROLE=worker) is never handed off: it journals, ends its turn, and the next iteration
-reads the journal on a fresh context (`worker`).
+reads the journal on a fresh context (`worker`). A target's window is read for a loop by its processes
+(held_in): a cc-loop, or a `claude -p`, held by the pane — never the text of an interactive session's own
+prompt or the tool calls under it, so a successor-born seat hands itself off like any other.
+
+THE SUCCESSOR'S BRIEF SAYS WHAT IS LIVE NOW. Its "unfinished right now" line is read off the live worker table
+--brief prints, and is absent when that table is empty (flight_line); a `--in-flight` text is the caller's own
+note and is labelled as such. A predecessor stays only for subagents whose transcript has not delivered its
+final turn (reported()): a report already in is not waited for, however recent.
 
 THE INVARIANT. One record, ~/.cc/state/handoff/<target>.json, names the LIVE session. The live one owns the
 channel and may act on the world; the other is muted and gated (cc-guard and cc-slack read the same record).
@@ -296,12 +307,7 @@ def worker_held(wid):
     caller is the hole: `cc handoff <repo> <track>` from a planning seat passes it, win_id() then finds the LOOP's
     window, and the record gates the running `claude -p` through cc-guard mid-iteration while an interactive
     successor spends beside it — the 2026-09-01 incident worker() describes, reached from the outside. So the
-    target is asked too, by the only thing that knows: its own pane's processes.
-    THE LOOP IS THE TELL, NOT THE ITERATION. `cc --go` makes the window as `cc-sandbox … -- cc-loop …; exec bash`
-    (core/bin/cc:1398), so cc-loop is alive between iterations too, and when it ends `exec bash` leaves a bare
-    shell that answers False. Reading only the iteration's `claude -p` would wave a handoff through in the gap
-    between two of them and gate the NEXT one. Both are read, each as a TOKEN and never as a substring: a
-    headless prompt carries the whole brief in argv and matches anything you grep for.
+    target is asked too, by the only thing that knows: its own pane's processes (held_in decides; this reads them).
     UNREADABLE SAYS HELD. A pane that will not answer — tmux gone, the window dead, ps timed out — returns True,
     because the two mistakes do not cost the same: a wrong refusal costs a retry, a wrong allow costs the incident
     above, a gated worker and a second paid session in its worktree. start() has already resolved the window by
@@ -316,6 +322,27 @@ def worker_held(wid):
         ps = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True, timeout=10).stdout
     except Exception:
         return True                     # same: no answer is not "not a worker"
+    return held_in(pids, ps)
+
+
+# recurring-defect-ok: pause-hold-missing — this file launches no worker: `claude -p` and cc-loop here are the tokens held_in READS in a pane to refuse a handoff of a worker's window
+ENV_TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")   # `CC_CLAUDE=/…/claude` in a `bash -c` line: a setting, not a command
+
+
+def held_in(pids, ps):
+    """Pure: does the process tree under the pane's `pids` (`ps -eo pid=,ppid=,args=` text) hold a headless worker?
+    THE LOOP IS THE TELL, NOT THE ITERATION. `cc --go` makes the window as `cc-sandbox … -- cc-loop …; exec bash`
+    (core/bin/cc), so cc-loop is alive between iterations too, and when it ends `exec bash` leaves a bare shell
+    that answers False. Reading only the iteration's `claude -p` would wave a handoff through in the gap between
+    two of them and gate the NEXT one. Both are read, each as a TOKEN and never as a substring: a headless prompt
+    carries the whole brief in argv and matches anything you grep for.
+    AN INTERACTIVE SESSION ENDS THE READ. A `claude` token with no `-p`/`--print` beside it is a session a person
+    or a successor drives: the tokens after it are its system prompt (a successor's carries its handoff brief —
+    which names cc-loop and `claude -p` as a matter of course), and the processes under it are its own tool
+    calls (a grep for cc-loop, a Monitor tailing a loop log). Neither is a worker. Until 2026-09-19 both were
+    scanned, and `cc handoff --overlap lessons` refused a successor-born planning seat as "a headless worker's
+    window" at the most expensive moment of its life. A `NAME=value` token is skipped, not read as a command:
+    the loop's own pane line starts `CC_CLAUDE=/…/claude …/cc-loop`."""
     kids, argv = {}, {}
     for line in ps.splitlines():
         parts = line.split(None, 2)
@@ -329,13 +356,20 @@ def worker_held(wid):
             continue
         seen.add(pid)
         toks = argv.get(pid, "").split()
+        descend = True
         for i, t in enumerate(toks):
+            if ENV_TOKEN.match(t):
+                continue
             base = os.path.basename(t)
             if base == "cc-loop":
                 return True
-            if base == "claude" and set(toks[i + 1:i + 4]) & {"-p", "--print"}:
-                return True
-        stack += kids.get(pid, [])
+            if base == "claude":
+                if set(toks[i + 1:i + 4]) & {"-p", "--print"}:
+                    return True
+                descend = False              # an interactive session: its argv tail and its children are its own
+                break
+        if descend:
+            stack += kids.get(pid, [])
     return False
 
 
@@ -522,14 +556,56 @@ def tasks_dirs(sid):
     return glob.glob(os.path.join(root, "*", sid, "tasks")) if sid else []
 
 
+REPORT_TAIL = 65536   # bytes of a transcript's end read for its last record — cc-slack's HOME_AGENT_TAIL, the same read
+
+
+def reported(path, tail=REPORT_TAIL):
+    """Has this subagent handed its report in? THE SAME RULE AS cc-slack's home_agent_done, and the two must stay
+    in step — a transcript one calls finished the other must not wait for (review of #542: the first cut here
+    keyed on `stop_reason: end_turn`, and 431 of 824 finished transcripts on the box end in an assistant record
+    with `stop_reason: null`, which the Home tab called done and --ready would have held the predecessor for).
+    The rule: the transcript's last record is an `assistant` record whose content carries no `tool_use` block —
+    a final report is text; a tool call is mid-turn. A `user` record (the parent resumed it), a record cut
+    mid-write, a tail read that landed inside the last record (size over `tail` with fewer than two lines), a
+    file that is unreadable or not JSON: False — the mtime rule below still decides, as it did before this existed,
+    because calling a live agent finished is the costly mistake. Read from the tail, never the whole file (a
+    transcript runs to hundreds of kB). Change this and cc-slack's together, or --ready and the Home tab disagree
+    about the same transcript."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - tail))
+            chunk = f.read()
+    except OSError:
+        return False
+    lines = [ln for ln in chunk.split(b"\n") if ln.strip()]
+    if not lines or (size > tail and len(lines) < 2):     # the cut landed inside the last record: no answer either way
+        return False
+    try:
+        rec = json.loads(lines[-1].decode("utf-8", "replace"))
+    except Exception:
+        return False                           # a record caught mid-write is not a finished agent
+    if not isinstance(rec, dict) or rec.get("type") != "assistant":
+        return False
+    c = (rec.get("message") or {}).get("content")
+    return not any(isinstance(b, dict) and b.get("type") == "tool_use" for b in (c if isinstance(c, list) else []))
+
+
 def subagents(sid, idle=None):
     """Session `sid`'s subagents that still look ALIVE, the busiest first. A `<id>.output` that is a SYMLINK is
     a subagent — it points at the transcript that agent is writing; a plain file beside it is a background shell
-    command, whose output nobody has to hand on. Nothing in those files says "finished", so silence is the
-    signal: a transcript untouched for CC_HANDOFF_AGENT_IDLE counts as done. The default is 30 min because an
-    agent blocked inside a SINGLE Bash call — a gate run, a long build — writes nothing at all while it waits,
-    and a live one read as finished is the expensive mistake here. Unknown session id, no such files, a harness
-    that stops keeping them: [], and every caller then does what it did before this existed."""
+    command (a Monitor too), whose output nobody has to hand on. Two things say "finished": the transcript's own
+    last record (reported(): the agent's final report, an assistant record with no tool call in it, read by the
+    rule cc-slack's Home tab reads it — a report that is in is not waited for, whether it came in five minutes
+    ago or five hours ago), and silence: a transcript
+    untouched for CC_HANDOFF_AGENT_IDLE counts as done. The default is 30 min because an agent blocked inside a
+    SINGLE Bash call — a gate run, a long build — writes nothing at all while it waits, and a live one read as
+    finished is the expensive mistake here. Before reported() existed the silence rule alone held a predecessor
+    open for subagents whose reports were journaled and landed (2026-09-15, and twice on 2026-09-16).
+    Unknown session id, no such files, a harness that stops keeping them: [], and every caller then does what it
+    did before this existed. cc-checkpoint (the Stop hook) counts no subagents at all — the "uncommitted work in
+    agent-…" line a 2026-09-16 handoff was held on was the old cc-context's, gone with #501."""
     if idle is None:
         idle = cfg("CC_HANDOFF_AGENT_IDLE", 1800)
     now, live = time.time(), []
@@ -541,7 +617,7 @@ def subagents(sid, idle=None):
                 m = os.stat(f).st_mtime            # THROUGH the link: the link itself is written once and never again
             except OSError:
                 continue                           # dangling: a transcript that is gone is nobody's report
-            if now - m < idle:
+            if now - m < idle and not reported(f):
                 live.append((m, os.path.basename(f)[:-len(".output")]))
     return [n for _, n in sorted(live, reverse=True)]
 
@@ -713,11 +789,24 @@ def kick(target, hid=""):
                 time.sleep(pause)
                 if landed(wid, text):
                     logd(f"{target}: the successor's opening prompt landed (try {tries})")
-                    return 0
+                    return host_cutover(target)
         if time.time() >= deadline:
             return kick_lost(target, f"its opening prompt did not land in {tries} tries" if tries
                              else "it never got past its startup dialog" if seen else "it never drew a prompt")
         time.sleep(pause)
+
+
+def host_cutover(target):
+    """The prompt landed. A successor that cannot run --ready itself — a member workspace's, inside its sandbox
+    where the record is not bound — is cut over from HERE, the host's own detached child, as `--ready --forced`:
+    the same commit point, the same derive, the same drain-then-retire for the old session. Any other successor
+    reads its packet and runs --ready when it is ready; nothing here hurries it."""
+    rec = read(target)
+    if not rec or not rec.get("host_cutover"):
+        return 0
+    rc = ready(target, forced=True)
+    logd(f"{target}: host cutover for the member successor — rc {rc}")
+    return rc
 
 
 def kick_lost(target, why):
@@ -758,9 +847,43 @@ def lib_touch(path):
         pass
 
 
+def member_workspace(repo):
+    """Is ~/dev/<repo> one member's whole world? The marker `cc` reads (member_workspace there): a session of it
+    runs inside `cc-sandbox member`, and so does its handoff successor (`cc __runnext`)."""
+    return os.path.isfile(os.path.join(DEV, repo, ".cc", "member-workspace"))
+
+
+HOST_CUTOVER_MSG = ("THIS IS A MEMBER WORKSPACE, so the host cut you over the moment this prompt landed: you ARE the "
+                    "live session, and `cc-handoff --ready` is not yours to run (it cannot run inside the boundary — "
+                    "do not try). Your predecessor is draining and retires within minutes, so anything you must ask "
+                    "it goes in your first turn; its journal is the record. ")
+
+
+def flight_line(repo, note="", host=False):
+    """What the successor is told is unfinished RIGHT NOW. READ OFF THE LIVE WORKER TABLE — the same one --brief
+    prints — and printed only when that table is non-empty: on 2026-09-16 the brief asserted "a background task
+    is still running" beside a workers section that said (none), and the successor spent one of its one batch
+    of questions on a phantom. The caller's own --in-flight text is kept verbatim as ITS word, labelled so, and
+    never promoted to a fact. A member successor (`host`) is told first that the host has cut it over, because
+    the brief around this slot says to run --ready, which it cannot."""
+    live = live_workers(repo)
+    out = HOST_CUTOVER_MSG if host else ""
+    if live.strip():
+        names = ", ".join(l.split(None, 1)[0] for l in live.splitlines() if l.strip())
+        # APPENDED, never assigned: a member successor's cutover notice is already in `out`, and a live loop under
+        # the repo must not cost it (review of #542 — it did, and that brief fell back to "run --ready").
+        out += f"Unfinished RIGHT NOW, which a journal always omits: these loops are still running under {repo} — {names} — ask about them. "
+    if note:
+        out += f"Your predecessor's own note when it opened this overlap: {note} "
+    return out
+
+
 def start(target, session_id="", flight=""):
     """--overlap: the successor comes up beside the predecessor, muted and gated, with the same working
-    directory. Refused while a record for this target is open — one successor at a time, never a chain."""
+    directory. Refused while a record for this target is open — one successor at a time, never a chain.
+    A MEMBER WORKSPACE's successor boots inside a fresh `cc-sandbox member` (cc __runnext) — the boundary as the
+    box has it NOW — and cannot run --ready from in there (the record is not bound inside), so the record says
+    `host_cutover` and kick() cuts over for it once its opening prompt has landed (--replace is the spelling)."""
     if not TARGET_RE.match(target):
         print(f"cc-handoff: '{target}' is not a target ({SHAPES})", file=sys.stderr)
         return 1
@@ -786,20 +909,21 @@ def start(target, session_id="", flight=""):
     hid = uuid.uuid4().hex[:12]
     sid = str(uuid.uuid4())
     cap = cfg("CC_HANDOFF_OVERLAP_MAX", DEFAULT_MAX)    # once: the deadline and the brief must name the same number
+    repo = parts(target)[0]
     rec = {"id": hid, "target": target, "phase": "overlap", "live": "predecessor",
            "predecessor": {"session_id": session_id or "", "tmux": wid, "window": target},
            "successor": {"session_id": sid, "tmux": "", "window": target + NEXT},
            "started": now, "deadline": now + cap,
            # …and for as long as that runs, nothing but the successor wakes the predecessor — see AND QUIET.
            "quiet": quiet_claim(target),
+           "host_cutover": member_workspace(repo),   # a member successor cannot run --ready: kick() does, for it
            "pct_at_start": None, "told_owner": None, "phases": []}
     ledger(rec, "overlap-started")
     write(rec)          # before the window, never after: a successor whose record is missing must find itself gated
     quiet(target, rec["quiet"])     # after the record names it, never before: see quiet_claim()
     with open(brief_path(target), "w") as f:
         f.write(BRIEF.format(target=target, journal=journal_for(target), tmux=wid, mins=int(cap // 60),
-                             flight=(f"Unfinished RIGHT NOW, which a journal always omits: {flight} — ask about it."
-                                     if flight else "")))
+                             flight=flight_line(repo, flight, rec["host_cutover"])))
     # The successor's OWN window name, carried into it: `cc __runnext` knows the target but not this suffix, so
     # it was accepting the startup dialog in the PREDECESSOR's window and its own sat on the development-channels
     # confirmation until a human noticed (2026-09-01 02:10Z, the third time this shape of bug has parked a session).
@@ -825,8 +949,24 @@ def start(target, session_id="", flight=""):
     else:
         run([os.path.realpath(__file__), "--kick", target, hid], wait=False)
     print(f"cc-handoff: {target} — successor started in main:{target}{NEXT} (id {hid}); "
-          f"it is muted and gated until it runs `cc-handoff --ready`")
+          + ("the host cuts over for it once its opening prompt lands, then the old session drains and retires"
+             if rec["host_cutover"] else "it is muted and gated until it runs `cc-handoff --ready`"))
     return 0
+
+
+def replace(target, session_id=""):
+    """--replace <workspace>: a LIVE member session is handed off onto the boundary the box has now — the one a
+    landing just changed (units.json, the bwrap args: #453's core/mail mount reached no session that was already
+    running, and the owner's test waited on a hand relaunch). It is the overlap, and nothing else: the successor
+    comes up first, inside a fresh sandbox, reads the journal, and the old session drains and retires after the
+    host's cutover — no window is killed under a session. Only a member workspace: any other kind runs --ready
+    itself, so --overlap is its spelling."""
+    if kind(target) != "session" or not member_workspace(target):
+        print(f"cc-handoff: --replace is for a member workspace's session (<repo>, with "
+              f"~/dev/<repo>/.cc/member-workspace); {target} is not one — `cc-handoff --overlap` hands off "
+              f"a session that can run --ready itself", file=sys.stderr)
+        return 1
+    return start(target, session_id)
 
 
 def ready(target=None, forced=False):
@@ -1629,6 +1769,11 @@ def main(argv):
             print("cc-handoff: --overlap needs a target", file=sys.stderr)
             return 1
         return start(target, opt.get("session", ""), opt.get("in_flight", ""))
+    if cmd == "--replace":
+        if not target:
+            print("cc-handoff: --replace needs a member workspace", file=sys.stderr)
+            return 1
+        return replace(target, opt.get("session", ""))
     if cmd == "--kick":                            # internal: the detached child start() leaves behind
         return kick(target, pos[1] if len(pos) > 1 else "") if target else 1
     if cmd == "--ready":

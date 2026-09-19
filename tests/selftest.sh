@@ -1220,7 +1220,7 @@ if stanza "overlapping handoff: two sessions, one cwd, exactly one of them live"
 chk cc-handoff
 st=$("$B/cc" handoff --status 2>&1); grep -q "no overlapping handoff is open" <<<"$st" && ok "cc handoff --status delegates by target" || bad "cc handoff --status: [$st]"
 # a real predecessor window; the successor's `claude` is /bin/true, so its pane falls through to the wrapper shell
-for t in hq hs hx hz; do mkdir -p ~/.cc/worktrees/$REPO/$t; done   # the successor's pane IS `cc __runnext` (exec: claude must be the pane's
+for t in hq hs hw hx hz; do mkdir -p ~/.cc/worktrees/$REPO/$t; done   # the successor's pane IS `cc __runnext` (exec: claude must be the pane's
                                           # direct child for cc-msg), and that cds into the track's worktree or exits
 tmux new-window -d -t main -n "$REPO/hx" -c "$T" "bash -c 'sleep 300; :'"   # a real child: `pane_live` is what tells a session from a bare shell
 out=$("$B/cc" handoff --overlap "$REPO/hx" --session sid-pre --in-flight "uncommitted work in hx" 2>&1)
@@ -1259,6 +1259,18 @@ echo '{not json' > "$T/handoff/$REPO--hx.json"
 { [ "$(h "gh pr merge 1" "" sid-pre)" = 0 ] && [ "$(h "gh pr merge 1" "$hid")" = 2 ]; } && ok "a corrupt record falls one way only: predecessor free, successor gated" || bad "corrupt record fell the wrong way"
 rm -f "$T/handoff/$REPO--hx.json"
 for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hx" '$2==r || $2==r"~next"{print $1}'); do tmux kill-window -t "$id"; done
+# THE WRAPPER ACCEPTS A SUCCESSOR-BORN SEAT. Its pane is an interactive `claude` whose argv carries its handoff
+# brief — which names cc-loop and `claude -p` as a matter of course — with the seat's own grep for cc-loop running
+# under it. Read as a worker's window, `cc handoff --overlap lessons` refused a planning seat at 167k while the
+# direct `cc-handoff --overlap` went through (2026-09-19; raised-cc-handoff-wrapper-misreads-successor-window).
+tmux new-window -d -t main -n "$REPO/hw" -c "$T" "bash -c 'exec -a claude bash -c \"sleep 300 & grep cc-loop <(sleep 300) & wait\" --append-system-prompt \"a worker runs claude -p under cc-loop\"'"; sleep 1
+out=$("$B/cc" handoff --overlap "$REPO/hw" --session sid-pre-w 2>&1)
+[ -f "$T/handoff/$REPO--hw.json" ] && ok "cc handoff --overlap accepts a seat whose prompt and tool calls name cc-loop and claude -p — a session's own words are not a worker" || bad "the wrapper refused a successor-born seat: $out"
+"$B/cc-handoff" --abandon "$REPO/hw" --why fixture >/dev/null 2>&1
+tmux new-window -d -t main -n "$REPO/hl" -c "$T" "bash -c 'exec -a cc-loop sleep 300'"; sleep 1
+out=$("$B/cc" handoff --overlap "$REPO/hl" 2>&1)
+{ grep -q "headless worker" <<<"$out" && [ ! -f "$T/handoff/$REPO--hl.json" ]; } && ok "control: a pane a loop holds is still refused as a headless worker's window" || bad "a loop's window was handed off: $out"
+for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO" '$2 ~ "^"r"/(hw|hl)(~next)?$"{print $1}'); do tmux kill-window -t "$id"; done
 # RETIREMENT ENDS THE PREDECESSOR, end to end on real windows. A session cannot exit itself (`/exit` is typed
 # by a human), so the old wait-it-out never completed on its own: on 2026-08-31 a retired session ran on for
 # 35 minutes as a second live voice, its window still the ACTIVE one. The grace expires into a kill.

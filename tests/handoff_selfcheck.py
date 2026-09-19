@@ -130,10 +130,10 @@ def run_selfcheck():
         import contextlib, io
         e = io.StringIO()
         with contextlib.redirect_stderr(e), contextlib.redirect_stdout(io.StringIO()):
-            gone = [main([c, "r1"]) for c in ("--event", "--replace", "--due", "--relay")]
+            gone = [main([c, "r1"]) for c in ("--event", "--due", "--relay")]
             gone.append(main(["--overlap", "r1", "--pct", "41"]))
-        ok("the context-line machinery is gone: --event, --replace, --due, --relay and --pct are refused outright",
-           gone == [1] * 5 and "unknown option --pct" in e.getvalue() and read("r1") is None)
+        ok("the context-line machinery is gone: --event, --due, --relay and --pct are refused outright",
+           gone == [1] * 4 and "unknown option --pct" in e.getvalue() and read("r1") is None)
         ok("an overlap needs a live window", start("nosuch") == 1)
         wins["r1/w1"] = "@w1"
         held.add("@w1")
@@ -150,6 +150,35 @@ def run_selfcheck():
            "timed out: a wrong refusal costs a retry, a wrong allow costs a gated worker and a second "
            "paid session in its worktree, so unreadable is never read as 'not a worker' (review of #501)",
            real_held("@w1") is True)     # the stub tmux answers "" to list-panes, which is the misread
+        # WHAT A PANE'S PROCESSES SAY, on ps text. The loop's own pane line, an iteration under it, and the gap
+        # between iterations all read HELD; a session — a fresh one, or a successor whose system prompt carries a
+        # handoff brief naming cc-loop and `claude -p`, with its own grep for cc-loop running under it — does not.
+        # `cc handoff --overlap lessons` refused exactly that seat on 2026-09-19 (raised-cc-handoff-wrapper-…).
+        PS = "\n".join([
+            "100 1 bash -c CC_CLAUDE=/home/u/.local/bin/claude /home/u/core/bin/cc-loop r1 w1 --max-iter 1; exec bash",
+            "101 100 bash /home/u/core/bin/cc-loop r1 w1 --max-iter 1",
+            "102 101 timeout 3600 /home/u/.local/bin/claude -p # TASK do the thing; never run cc-loop yourself",
+            "200 1 bash /home/u/core/bin/cc __runnext r1 abc123 sid-1",
+            "201 200 /home/u/.local/bin/claude --dangerously-skip-permissions --append-system-prompt You are the "
+            "SUCCESSOR. dispatch with cc r1 t --go; a worker runs claude -p under cc-loop --remote-control r1",
+            "202 201 bash -c grep cc-loop ~/.cc/state/r1/w1/loop.log | tail -1",
+            "203 201 /home/u/.local/bin/claude -p summarise this",   # a headless CHILD of a session: its own tool call
+            "300 1 bash",                                            # the loop ended: `exec bash` left a bare shell
+            "400 1 bash -c CC_CLAUDE=/home/u/.local/bin/claude /home/u/core/bin/cc-loop r1 w2; exec bash",
+            "500 1 bash -c cc-sandbox member ws1 t1 -- /home/u/core/bin/cc-loop ws1 t1 --max-iter 3; exec bash",
+            "600 1 timeout 3600 /home/u/.local/bin/claude -p # TASK a bare iteration, no loop above it"])
+        ok("held_in: a worker's pane is HELD — read off its cc-loop line, whose first token is an env setting",
+           held_in(["100"], PS) and held_in(["400"], PS))
+        ok("...the loop between two iterations is held too (the LOOP is the tell), and so is a `claude -p` alone",
+           held_in(["400"], PS) and held_in(["600"], PS) and held_in(["500"], PS))
+        ok("...a successor-born seat is NOT: its system prompt naming cc-loop and `claude -p`, its own grep for "
+           "cc-loop and a headless tool call under it are the session's own, not a worker's",
+           not held_in(["200"], PS) and not held_in(["201"], PS))
+        ok("...and a bare shell, or a pane ps does not know, is not a worker either",
+           not held_in(["300"], PS) and not held_in(["999"], PS))
+        ok("control: read from the seat's children directly — where the walk this replaced arrived — both read "
+           "held; only the interactive parent above them shields them",
+           held_in(["202"], PS) is True and held_in(["203"], PS) is True)
         clear("r1/w1")
         wins.pop("r1/w1", None); wins.pop("r1/w1" + NEXT, None)    # this case's fixture windows, not the suite's
         ov = os.environ.get("CC_HANDOFF_OVERLAP")
@@ -310,7 +339,87 @@ def run_selfcheck():
         n0, told0 = len(tui["typed"]), posts()
         ok("...a dialog that never clears is never typed at, and the owner hears within the wait",
            kick("r1", "abc") == 1 and len(tui["typed"]) == n0 and posts() == told0 + 1 and clk[0] - t0 <= 62)
+
         time.time, time.sleep = real_t, real_s
+
+        # THE FLIGHT LINE IS READ OFF THE LIVE WORKER TABLE, never asserted. 2026-09-16: the brief said "a background
+        # task is still running" beside a workers section that said (none), and one of the successor's one batch
+        # of questions went on a phantom (raised-handoff-brief-reports-a-dead-worker-as-live).
+        wins["r30"] = "@30"
+        with contextlib.redirect_stdout(io.StringIO()):
+            start("r30", "", "a background task is still running")
+        b30 = open(brief_path("r30")).read()
+        ok("with no live loop under the repo the brief carries NO 'unfinished right now' line; the caller's --in-flight "
+           "text is kept as the predecessor's own note, labelled as such, never promoted to a fact",
+           "Unfinished RIGHT NOW" not in b30 and "predecessor's own note" in b30
+           and "a background task is still running" in b30)
+        clear("r30"); wins.pop("r30~next", None)
+        os.makedirs(os.path.join(STATE, "r30", "w9"))
+        with open(os.path.join(STATE, "r30", "w9", "loop.log"), "w") as fh:
+            fh.write("iteration 2: building\n")                   # a loop that wrote a moment ago: live to --brief too
+        with contextlib.redirect_stdout(io.StringIO()):
+            start("r30")
+        b30 = open(brief_path("r30")).read()
+        ok("...and with one, the line names that loop — off the same table --brief prints — and no note is invented",
+           "Unfinished RIGHT NOW" in b30 and "w9" in b30 and "predecessor's own note" not in b30
+           and "w9" in live_workers("r30"))
+        clear("r30"); wins.pop("r30~next", None); wins.pop("r30", None)
+
+        # ---- --replace: a MEMBER workspace's live session handed off onto the boundary the box has NOW. #453
+        # (2026-09-12) bound core/mail into the member sandbox at launch; the session already running kept its
+        # old bwrap, and its successor — inside `cc-sandbox member`, where the record is not bound — could never
+        # run --ready, so the owner's test waited on a hand relaunch. The host cuts over for it instead.
+        dev0 = DEV
+        DEV = os.path.join(d, "dev")
+        os.makedirs(os.path.join(DEV, "ws1", ".cc"))
+        open(os.path.join(DEV, "ws1", ".cc", "member-workspace"), "w").close()
+        e = io.StringIO()
+        with contextlib.redirect_stderr(e), contextlib.redirect_stdout(io.StringIO()):
+            rr = [replace("r1/w1"), replace("nomember")]
+        ok("--replace is for a member workspace's session only: a track, or a repo with no member marker, is told "
+           "to use --overlap and no record is opened",
+           rr == [1, 1] and "member workspace" in e.getvalue() and read("r1/w1") is None and read("nomember") is None)
+        wins["ws1"] = "@ws1"
+        o = io.StringIO()
+        with contextlib.redirect_stdout(o):
+            rc = replace("ws1")
+        wrec = read("ws1")
+        ok("--replace opens the overlap for the workspace: the record says the HOST cuts over, and the line says so",
+           rc == 0 and bool(wrec) and wrec.get("host_cutover") is True and "the host cuts over" in o.getvalue())
+        ok("...and its brief says so too — the successor is told it is live and that --ready is not its to run, "
+           "where any other successor's brief tells it to run --ready itself",
+           "the host cut you over" in open(brief_path("ws1")).read()
+           and "Unfinished RIGHT NOW" not in open(brief_path("ws1")).read()
+           and "the host cut you over" not in open(brief_path("r1")).read()
+           and "run `cc-handoff --ready`" in open(brief_path("r1")).read())
+        # …AND A LIVE LOOP UNDER THE WORKSPACE DOES NOT COST IT THAT NOTICE. The first cut assigned the flight
+        # line over it, and a member whose repo had any loop running got the brief that says "run --ready" (#542).
+        os.makedirs(os.path.join(DEV, "ws2", ".cc"))
+        open(os.path.join(DEV, "ws2", ".cc", "member-workspace"), "w").close()
+        os.makedirs(os.path.join(STATE, "ws2", "t1"))
+        with open(os.path.join(STATE, "ws2", "t1", "loop.log"), "w") as fh:
+            fh.write("iteration 1: building\n")
+        wins["ws2"] = "@ws2"
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc2 = replace("ws2")
+        b2 = open(brief_path("ws2")).read()
+        ok("...with a live loop under the workspace the brief carries BOTH: the cutover notice and the loop's name "
+           "on the 'unfinished right now' line",
+           rc2 == 0 and "the host cut you over" in b2 and "Unfinished RIGHT NOW" in b2 and "t1" in b2)
+        clear("ws2"); wins.pop("ws2~next", None); wins.pop("ws2", None)
+        ok("...while any other kind's overlap keeps the successor's own --ready", read("r1").get("host_cutover") is False)
+        nid = wins["ws1~next"]
+        panes[nid] = IDLE
+        with contextlib.redirect_stdout(io.StringIO()):
+            krc = kick("ws1", wrec["id"])
+        wrec = read("ws1")
+        ok("...and once the successor's opening prompt has LANDED, the kick cuts over for it — it is live and holds "
+           "the window name, the old session is retiring, and no window was killed under a session",
+           krc == 0 and bool(wrec) and live_side(wrec) == "successor" and wins.get("ws1") == nid
+           and wins.get("ws1~old") == "@ws1")
+        ok("...the kick of any other successor cuts nothing over — it reads its packet and runs --ready itself",
+           live_side(read("r1")) == "predecessor")
+        DEV = dev0
 
         # THE HANDOVER LINE IS THE TABLE'S TO PLACE. This file used to name #alerts itself, which meant the line
         # skipped the table and the test-state rule had to be copied in beside it; both are cc-notify's now.
@@ -701,8 +810,63 @@ def run_selfcheck():
             os.symlink(t, os.path.join(tasks, name + ".output"))
         open(os.path.join(tasks, "b-background.output"), "w").close()   # a background command, not a subagent
         os.symlink(os.path.join(d, "no-such.jsonl"), os.path.join(tasks, "a-gone.output"))
+        # THE REPORT THAT IS ALREADY IN. A finished agent's transcript ends in its final assistant turn
+        # (`stop_reason: end_turn`) and is written a minute ago like a live one's: the mtime rule alone held a
+        # predecessor open for subagents whose reports were journaled and landed (2026-09-15, 2026-09-16 twice).
+        # The records in the shapes the harness writes them (824 transcripts probed on 2026-09-19): a final report
+        # is an assistant record of text — with `stop_reason: end_turn` (303) or `null` (431); a tool call, with
+        # either, is mid-turn. The rule is cc-slack's home_agent_done: assistant, and no tool_use block.
+        text = [{"type": "text", "text": "done: the report"}]
+        rec_end = json.dumps({"type": "assistant", "message": {"role": "assistant", "stop_reason": "end_turn", "content": text}})
+        rec_null = json.dumps({"type": "assistant", "message": {"role": "assistant", "stop_reason": None, "content": text}})
+        rec_tool = json.dumps({"type": "assistant", "message": {"role": "assistant", "stop_reason": None,
+                                                                "content": [{"type": "tool_use", "name": "Bash"}]}})
+        tdone = os.path.join(d, "a-done.jsonl")
+        with open(tdone, "w") as fh:
+            fh.write(rec_tool + "\n" + rec_end + "\n")
+        os.utime(tdone, (clk[0], clk[0]))                   # written just now — and still not counted
+        os.symlink(tdone, os.path.join(tasks, "a-done.output"))
+        tnull = os.path.join(d, "a-null.jsonl")
+        with open(tnull, "w") as fh:
+            fh.write(rec_tool + "\n" + rec_null + "\n")         # the commoner shape: the final text, no stop_reason
+        os.utime(tnull, (clk[0], clk[0]))
+        os.symlink(tnull, os.path.join(tasks, "a-null.output"))
+        tlive = os.path.join(d, "a-live.jsonl")
+        with open(tlive, "w") as fh:
+            fh.write(rec_end + "\n" + rec_tool + "\n")           # its last record is a tool call: mid-turn, alive
+        os.utime(tlive, (clk[0], clk[0]))
         ok("a subagent is a task file that is a live SYMLINK — a background command, a dangling link and a "
            "transcript gone quiet are not", subagents("sid-sub") == ["a-live"])
+        ok("...and neither is one whose transcript has DELIVERED its final report — an assistant record with no "
+           "tool call, whether its stop_reason says end_turn or nothing at all — however fresh its mtime",
+           reported(tdone) and reported(tnull) and "a-done" not in subagents("sid-sub")
+           and "a-null" not in subagents("sid-sub"))
+        os.unlink(os.path.join(tasks, "a-null.output"))
+        tcut = os.path.join(d, "a-cut.jsonl")
+        with open(tcut, "w") as fh:                          # one complete text record, longer than the tail read
+            fh.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "stop_reason": "end_turn",
+                                                                  "content": [{"type": "text", "text": "x" * 70000}]}}) + "\n")
+        ok("a tail read that lands inside the last record answers nothing — the same guard as cc-slack's — and a "
+           "transcript is read whole when it fits the tail",
+           not reported(tcut) and reported(tcut, tail=1 << 20))
+        with open(tdone, "a") as fh:
+            fh.write(json.dumps({"type": "user", "message": {"role": "user"}}) + "\n")   # the parent resumed it
+        os.utime(tdone, (clk[0], clk[0]))
+        ok("...until its parent resumes it — a record after that final turn makes it live again",
+           not reported(tdone) and sorted(subagents("sid-sub")) == ["a-done", "a-live"])
+        with open(tdone, "w") as fh:
+            fh.write(rec_tool + "\n" + rec_end + "\n")           # back to delivered, for the cases below
+        os.utime(tdone, (clk[0], clk[0]))
+        ttext = os.path.join(d, "a-text.jsonl")
+        with open(ttext, "w") as fh:
+            fh.write("not json at all\n")
+        os.utime(ttext, (clk[0], clk[0]))
+        os.symlink(ttext, os.path.join(tasks, "a-text.output"))
+        ok("an unreadable tail decides nothing — a fresh transcript that is not JSON, or one that is gone, is read "
+           "by its mtime as before: live",
+           not reported(ttext) and not reported(os.path.join(d, "no-such.jsonl"))
+           and sorted(subagents("sid-sub")) == ["a-live", "a-text"])
+        os.unlink(os.path.join(tasks, "a-text.output"))     # this case's own fixture; the cases below count a-live alone
         ok("an unknown session id, or one with no task files, reads as no subagents — and the handoff is then "
            "exactly the one it was before", subagents("") == [] and subagents("sid-none") == [])
 
