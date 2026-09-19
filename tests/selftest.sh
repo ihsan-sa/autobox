@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # selftest.sh — end-to-end test of the cc layer against a throwaway local repo (bare "remote"). No API calls:
+# NOTHING OF THE CALLER'S CC_* REACHES A CASE. Every CC_* this file inherits is dropped here, first, by rule — the
+# few knobs that are this suite's own are the whole exception (its lock and slots, which half and reach to run,
+# where to record green, the lander's config denial). A case that runs under a variable the shell happened to
+# carry is asserting against whoever runs it: an orch shell's CC_SLACK_ALIAS subscribed the fixture session as
+# shrink@_cctest… and red the seven delivery cases on #481's landing (2026-09-15); CC_ROLE and CC_HANDOFF did the
+# same, each way, four times in one night (see the unset below, which they went through by name until this line
+# dropped them by rule); a session also carries CC_SLACK_CHANNEL, CC_HANDOFF_WINDOW, CC_MEMBER_SANDBOX and
+# CC_FAILURES, and tomorrow's carries something else. A name is never added here to fix one of them; the rule holds.
+for v in "${!CC_@}"; do case $v in CC_SELFTEST_*|CC_SUITE_PART|CC_LAND_CHANGED|CC_GREEN_DIR|CC_CONFIG_DENY) ;; *) unset "$v";; esac; done
 export CC_NOTIFY_LOG_ONLY=1   # never push to the owner from tests
 export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage limit resets' is capped at 1 s
 export CC_SPEND_TIER=autonomous   # the box's own spend tier (cc-tier) never colours a fixture: each --go below must start — and cc carries
@@ -16,8 +25,9 @@ export CC_SPEND_TIER=autonomous   # the box's own spend tier (cc-tier) never col
 # inline again. Nothing is skipped either way: the same tools run, print in the same order and are judged the same.
 # Exercises the bin/ THIS file ships with (a track worktree tests its own copy, not the ~/bin symlinks).
 set -uo pipefail
-exec </dev/null; unset CC_ROLE CC_HANDOFF CLAUDECODE "${!CLAUDE_@}"   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a
-# caller's worker role NOR ITS HANDOFF ID — the guard and overlap probes set both themselves. $CC_HANDOFF stays in a
+exec </dev/null; unset CLAUDECODE "${!CLAUDE_@}"   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a
+# caller's worker role NOR ITS HANDOFF ID (CC_ROLE, CC_HANDOFF: gone with every other CC_* at the top of this file;
+# the guard and overlap probes set both themselves). $CC_HANDOFF stays in a
 # session's environment for the life of that session, deliberately, so the model cannot unset it; a suite that
 # inherits it is asserting against whoever happens to be running it. On 2026-08-31 that produced FOUR separate red
 # gates in one night, in both directions: cases that passed only for a handoff survivor, and cases that failed only
@@ -240,7 +250,7 @@ prefetch(){
 # Every run owns a namespace ($RUN): repo name, fixture dir, notify log, usage-limit stamp, tmux windows and
 # processes all carry it. Two selftests (two worktrees, one box) must never read, write or kill each other's things
 # — a global `pkill` here once failed 4 tests in a run that was, on its own, green.
-RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"
+RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"; : > "$T/born"   # born: what "modified during this run" means below
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
 export CC_LIMIT_STAMP="$T/claude-limit"   # not the box's live stamp: a test limit must never make a real loop wait
 export CC_FAILURES="$T/failures"          # not ~/.cc/failures: the loop stops and red gates below are fixtures, and the
@@ -251,6 +261,17 @@ export CC_HANDOFF_NO_KICK=1   # ...and no --kick child at all: a fixture success
                                           # 4 min and recreates $T/ctx/handoff.log after the trap; with none it gives up at once
                                           # outlived the run — `cc-handoff --status` was listing a week of _cctest
                                           # successors, and cc-guard walks that directory on every single call.
+# EVERY OTHER STATE PATH A DRIVEN TOOL WRITES WITHOUT BEING TOLD WHERE, under $T as well — the whole set, here, not
+# each one at the stanza that first noticed it. #501 dropped CC_CTX_RECORDS from its stanza and every gate run of
+# that branch appended _cctest rows to the owner's live handoffs.jsonl for 15 h (90 rows; the App Home counted
+# them). A case may still narrow one of these to its own subdir; what it may not do is leave one pointing at ~/.cc.
+# The check at the end of this file is what says whether this list is complete: a run's marker found in a box file.
+export CC_CTX_RECORDS="$T/ctx"                 # cc-handoff's ledger (state/context/handoffs.jsonl)
+export CC_STATUSLINE_DIR="$T/statusline"       # cc-context/cc-statusline per-session records
+export CC_GUARD_ASKS="$T/guard-asks"           # cc-guard's refusal spool (~/.cc/guard-asks)
+export CC_SCOPE_DIR="$T/scope"                 # cc-scope's ask ledger
+export CC_QUERIES_STATE="$T/queries-state"     # cc-slack's spool root for member queries
+export CC_LIMIT_SEEN="$T/limit-seen" CC_LIMIT_RECORD="$T/limit-interrupted" CC_LIMIT_NUDGED="$T/limit-nudged" CC_LIMIT_RESUMED="$T/limit-resumed"   # cc-limit's records (M10 hits a limit for real)
 MT(){ env -u TMUX TMUX_TMPDIR="$T" tmux "$@"; }   # the model section's scratch tmux server: own socket, under $T
 wins(){ tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | awk -v r="$1" '$2==r || index($2,r"/")==1 {print $1}'; }
 KIDS=""   # long-lived fixtures started below, and each prefetched selfcheck until its chk reaps it; the trap takes
@@ -264,6 +285,14 @@ cleanup(){ rc=$?; trap - EXIT
   ( exec 9>~/.claude.json.lock; flock 9; jq '.projects |= with_entries(select(.key | test("/'"$REPO"'(/|$)") | not))' ~/.claude.json > ~/.claude.json.$RUN.sel && mv ~/.claude.json.$RUN.sel ~/.claude.json ) 2>/dev/null   # leave no trust entries behind
   rm -f ~/.claude.json.$RUN.sel; exit $rc; }
 trap cleanup EXIT INT TERM HUP
+# THE BOX'S OWN FLAGS, AS THIS RUN FOUND THEM. Files a person set by hand and no daemon rewrites: `cc` reads
+# ~/.cc/slack/enabled straight from $HOME, no CC_* names it, and a case that toggled it left the box's Slack off for
+# 12 min (2026-09-19). Compared at the end: presence, inode, size and mtime at the resolution the filesystem keeps —
+# the flag is an empty file, so a rm and a touch inside one second are the same size and the same second; the inode
+# and the fraction are what say it happened. A toggle off and on again is a change too.
+BOX_FLAGS="config slack/enabled github-deny github-deny.gitconfig"
+box_flags(){ local f; for f in $BOX_FLAGS; do stat -c "$f %i %s %.Y" ~/.cc/$f 2>/dev/null || echo "$f absent"; done; }
+box_flags > "$T/flags.before"
 git init -q --bare "$T/remote.git"; git clone -q "$T/remote.git" ~/dev/$REPO 2>/dev/null
 ( cd ~/dev/$REPO && git config user.email t@t && git config user.name t && echo x > r.md && git add -A && git commit -qm init && git branch -M main && git push -q -u origin main && git remote set-head origin -a >/dev/null 2>&1 )
 export CC_CLAUDE=/bin/true
@@ -3315,6 +3344,50 @@ touch "$L2.go"; wait $c3; l2rc=$?
 [ $l2rc = 0 ] && ok "...and runs the moment one of them frees" || bad "the waiter never got a slot: rc=$l2rc"
 fi
 cd ~ || exit 1
+# THE RUN LEFT THE BOX'S ~/.cc AS IT FOUND IT — judged on the object, not on the export block being right. Every
+# file under ~/.cc that changed since this run began and names its fixtures ($REPO, selftest-$RUN) is found once;
+# what the run owns and is about to remove is pruned ($T, state/$REPO, boards/$REPO.*, the suite's lock files), and
+# so are the other runs' selftest-* (a sibling's cc-reconcile case reads the box-wide process table and may write
+# this run's window names into ITS fixtures), worktrees/, slack/files and voice/ (gigabytes of media nothing
+# writes by name). Then two verdicts, because the box is alive while this runs and its own watchers SEE the fixture:
+# the live cc-reconcile tick logged _cctest rows to state/reconcile.log, cc-spend's tick indexed the fixture
+# transcripts into state/spend/offsets.json, cc-lib's refresh logged the fixture board as no source (all three on
+# the first run of this case, 2026-09-19) — the box observing the fixture, not the fixture writing the box.
+#   RED: the marker in a file the export block above REDIRECTS — the box's own copy of a path a driven tool writes
+#        (BOX_PATHS: the defaults of CC_NOTIFY_LOG, CC_FAILURES, CC_LIMIT_*, CC_HANDOFF_DIR, CC_CTX_RECORDS,
+#        CC_STATUSLINE_DIR, CC_GUARD_ASKS, CC_SCOPE_DIR, CC_SLACK_DIR). Only a fixture writes there by name; the
+#        one explanation is a CC_* path a case left pointing at ~/.cc, which is what #501's 90 rows were.
+#   SAID, not red: the marker anywhere else — printed, file by file, so whoever reads the run sees what the box
+#        wrote about the fixture and can tell a new leak from a watcher. A landing is not stopped on a watcher.
+# BOX_PATHS is the mirror of the export block and is read beside it: a path added there is added here.
+BOX_PATHS="notify.log failures state/claude-limit state/handoff state/context state/statusline guard-asks scope state/limit-seen state/limit-interrupted state/limit-nudged state/limit-resumed slack"
+box_marked(){   # <root> → the files under it, changed since this run began, that name this run's fixtures
+  find "$1" -path "$1/worktrees" -prune -o -path "$1/slack/files" -prune -o -path "$1/slack/member" -prune -o -path "$1/voice" -prune \
+       -o -path "$1/selftest-*" -prune -o -path "$1/state/$REPO" -prune \
+       -o -type f -newer "$T/born" ! -name "$REPO.*" ! -name 'selftest.lock*' -print 2>/dev/null \
+     | xargs -r grep -l -e "$REPO" -e "selftest-$RUN" 2>/dev/null; }
+box_split(){   # <root> <marked files…> → $leak: under a BOX_PATHS default of <root>; $seen: anywhere else
+  local r=$1 f b hit; shift; leak=""; seen=""
+  for f in "$@"; do hit=""; for b in $BOX_PATHS; do case $f in "$r/$b"|"$r/$b"/*) hit=1;; esac; done
+    if [ -n "$hit" ]; then leak="$leak $f"; else seen="$seen $f"; fi; done; }
+# CONTROL, both directions, on a fixture ~/.cc under $T — nothing is written to the box to prove the box is not
+# written to. The same walk and the same split: a marker in state/context is the leak, in reconcile.log the watcher;
+# a file older than this run, one under a sibling selftest-*, the run's own board file and a file that never names
+# the run are not found at all.
+C=$T/boxctl; mkdir -p "$C/state/context" "$C/selftest-0" "$C/boards"
+echo "$REPO" > "$C/state/context/handoffs.jsonl"; echo "$REPO" > "$C/state/reconcile.log"
+echo "$REPO" > "$C/old"; touch -d '1 hour ago' "$C/old"; echo "$REPO" > "$C/selftest-0/log"; echo "$REPO" > "$C/boards/$REPO.json"; echo other > "$C/state/clean.log"
+box_split "$C" $(box_marked "$C")
+[ "$leak" = " $C/state/context/handoffs.jsonl" ] && [ "$seen" = " $C/state/reconcile.log" ] \
+  && ok "control: a marker in state/context reads as a leak, one in reconcile.log as a watcher; an old file, a sibling run's, a board file and a clean file are not found" \
+  || bad "the leak/watcher walk is wrong: leak=[$leak] seen=[$seen]"
+box_split ~/.cc $(box_marked ~/.cc)   # brief: "a run leaves ~/.cc byte-identical (checked)" — empty $leak is that, for the paths the block redirects
+[ -z "$leak" ] && ok "the run wrote nothing of its own into a box file: no $REPO in the box's copy of a path the export block redirects" \
+  || bad "a box file carries this run's fixtures (a CC_* state path still points at ~/.cc — add it to the export block, and its default to BOX_PATHS):$leak"
+[ -z "$seen" ] || echo "  · the box's own watchers wrote about this run's fixtures (not a leak — a live tick reading the fixture board or transcripts):$seen"
+box_flags > "$T/flags.after"
+cmp -s "$T/flags.before" "$T/flags.after" && ok "…and the box's own flags ($BOX_FLAGS) are as the run found them" \
+  || bad "a box flag changed during the run: $(diff "$T/flags.before" "$T/flags.after" | grep '^[<>]' | tr '\n' ' ')"
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it
 # EVERY STANZA IS ACCOUNTED FOR — it ran here, the other half owns it, or this change does not reach it. A

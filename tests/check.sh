@@ -6,6 +6,7 @@
 # thirds of this gate and shellcheck is most of the rest. Both now run CC_CHECK_JOBS at a time (default 4; 1 is
 # one at a time, the old behaviour). Concurrency only: every file is still shellchecked and every selfcheck still
 # runs, each judged in the same order by the same rules — nothing here is skipped to make the gate faster.
+# A selfcheck starts with NONE of the caller's CC_* (run_sc, below): the gate's own knobs pass, nothing else does.
 set -e; SELF=$(readlink -f "$0"); cd "$(dirname "$0")/.."   # $0 is resolved BEFORE the cd moves out from under it
 # WHICH HALF OF THIS GATE IS RUNNING (CC_SUITE_PART; tests/green.sh has the rule). Unset is both halves, which is
 # what the pre-commit hook and a person typing this file get, and is what this gate always did. `portable` is the
@@ -322,7 +323,13 @@ SCD=$GD   # the dir and its trap are set at the top; a second EXIT trap here wou
 # runs bought no record, 2026-09-10/11). So every selfcheck here starts in a scratch dir with a marker of its own,
 # naming no repo of this box's, and a case that reads its cwd is red HERE, in the gate that lands it.
 ROOT=$PWD; mkdir -p "$GD/cwd/.cc"; printf 'fixture-repo fixture-track\n' > "$GD/cwd/.cc/track"
-run_sc(){ cd "$GD/cwd" && "$1" selfcheck; }   # ONE way to start a selfcheck: the loop's and the control's
+# …AND WITH NONE OF THE CALLER'S CC_*. A selfcheck is hermetic by its own HOME; its environment was whatever shell
+# ran this gate: an orch's CC_SLACK_ALIAS reached cc-slack's H8 (#267 taught the tool; the next tool learns it the
+# same way), a session's CC_ROLE, CC_HANDOFF, CC_MEMBER_SANDBOX or CC_FAILURES would each prove something else. So
+# every CC_* but this gate's own knobs is dropped at the one place a selfcheck starts — by rule, never by name — and
+# what this gate's own env carries is untouched (cc-green's case 17 reads it after this file ends).
+sc_env=(); for v in "${!CC_@}"; do case $v in CC_CHECK_JOBS|CC_SUITE_PART|CC_LAND_CHANGED|CC_GREEN_DIR|CC_CONFIG_DENY|CC_FIXTURE_SCOPE) ;; *) sc_env+=(-u "$v");; esac; done
+run_sc(){ cd "$GD/cwd" && env "${sc_env[@]}" "$1" selfcheck; }   # ONE way to start a selfcheck: the loop's and the control's
 running=0; ran=""
 # cc-board is named here for a reason that is not the list's: the loop must stay one literal `for c in cc-…` line
 # holding ` cc-board `, gated by one `want_selfcheck "$c"`, because cc-board's own selfcheck reads this file and
