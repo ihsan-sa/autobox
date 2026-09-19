@@ -5,8 +5,12 @@ Every orchestrated session reads/writes it so sessions know what the others are 
 The brief itself lives in ~/.cc/state/<repo>/<track>/task.md, and `brief append|replace|annotate <repo> <track>
 <text|->` (`--top` puts an appended note first) is the ONE writer of that file — a locked read-modify-write that
 `add`, `set … instructions`, `cc --go` and `cc-brief refresh` all go through. CC_STATE points that home elsewhere
-(a test run keeps out of the box's own state), as it does for cc-brief.
+(a test run keeps out of the box's own state), as it does for cc-brief; CC_BOARD_LOCK_WAIT shortens the lock wait (the selfcheck's).
 `add` refuses a repo or row name `cc` could not dispatch (cc's valid_name: 64 characters at most), before writing.
+`add` lands whole or not at all: no board, a board lock held past the wait or a save that fails exits with one line and
+takes the brief it had written out again, so there is never a task.md without a row. `set … instructions` is the one
+deliberate way to lose a brief: it prints the size it replaced and the size it wrote, and leaves the old file whole as
+task.md.bak beside it (one back; the next replace overwrites it).
 `add` and `set … instructions` are the doors a brief comes in by: cc-brief refuses one that prescribes the steps
 by its arithmetic over the brief's shape. CC_BRIEF_FORCE=1 sends it as typed and records that; CC_BRIEF_MACHINE=1 is for a row the box
 wrote itself and records nothing. What other live tracks are holding is computed in.
@@ -303,7 +307,8 @@ def _save(repo, d):
         with open(tmp) as f: text = f.read()
         with os.fdopen(_open(p, os.O_WRONLY | os.O_TRUNC), "w") as f: f.write(text)   # in place, under the same lock every writer holds
         os.unlink(tmp)
-LOCK_WAIT = 30   # seconds a writer waits for the lock. A member's lock file is in its own directory, so a member session
+LOCK_WAIT = float(os.environ.get("CC_BOARD_LOCK_WAIT") or 30)   # CC_BOARD_LOCK_WAIT: the selfcheck's, so a held lock is a case, not a minute
+                 # seconds a writer waits for the lock. A member's lock file is in its own directory, so a member session
                  # can hold it as long as it likes: the host takes it non-blocking and gives up in one line, never for good.
                  # No writer holds it longer than a load and a save (`add` runs the shape check BEFORE taking it).
 class Lock:
@@ -450,7 +455,34 @@ def brief_edit(verb, repo, track, text, top=False, state=None, gated=True):
     with BriefLock(d):
         cur = _read_task(p); new = edit(cur)
         if new == cur: return cur, cur
+        # A REPLACE KEEPS WHAT IT TOOK OUT. `set … instructions` replaced a 13,054-byte brief with a 3,568-byte
+        # paragraph, rc=0, no output, and five planning turns went on digging the text out of a worker's transcript
+        # (lessons, 2026-09-18). The old file, whole, is task.md.bak beside it — one back, overwritten by the next
+        # replace — and the caller's line names it. Text nobody typed (an empty brief, a bare block) is not kept.
+        if verb == "replace" and human(cur).strip(): _write_task(p + ".bak", cur)
         _write_task(p, new); return cur, new
+def said(repo, track, verb, before, after):
+    """The one line a brief write prints — what it did, in bytes, and for a replace where the old text is."""
+    if after == before: return f"{repo}/{track}: brief {verb} — unchanged"
+    if verb == "replace" and human(before).strip():
+        return (f"{repo}/{track}: brief replaced — {len(before.encode())} bytes → {len(after.encode())}; "
+                f"the old brief is {tpath(repo, track)}.bak")
+    return f"{repo}/{track}: brief {verb} — written, {len(after.encode())} bytes"
+def unappend(repo, track, before, after, made):
+    """`add` could not finish (no board, its lock held past LOCK_WAIT, a save that failed): the note it had already put
+    in task.md comes out again, so a row that never reached tracks{} leaves no brief behind — a brief without a row is a
+    half-row nothing can close. Only if the file still holds exactly what `add` wrote: an edit that landed meanwhile is
+    somebody's and stays. A dir this add made for a new row goes with it."""
+    if after is None or after == before: return
+    d = track_dir(repo, track); p = os.path.join(d, "task.md")
+    with BriefLock(d):
+        if _read_task(p) != after: return
+        if before: _write_task(p, before); return
+        os.unlink(p)
+    if made:
+        for f in (os.path.join(d, "task.md.lock"), d):
+            try: (os.rmdir if f == d else os.unlink)(f)
+            except OSError: pass
 def brief(repo, track):
     """The brief, migrating a pre-#94 board copy into the file ONCE, on the first read of it. Never call this while
     holding Lock(repo): it takes the lock itself, and flock on a second fd of the same file deadlocks its owner.
@@ -562,28 +594,39 @@ def main(a):
             if not NAME_RE.fullmatch(n):
                 sys.exit(f"cc-board add: '{n}' is not a name cc can dispatch ({len(n)} characters; allowed "
                          f"{NAME_RE.pattern}, 64 at most) — nothing written")
+        # WHOLE OR NOTHING (2026-09-19). The brief used to land in task.md before the board was so much as opened, so
+        # `add` against a repo with no board, a board lock held past LOCK_WAIT or a save that failed exited with its
+        # one line and LEFT THE BRIEF: a row with a file and no entry in tracks{}, which nothing can close. The board
+        # is read first (nothing written yet), and a board step that fails takes the brief out again (unappend).
+        need(repo)
         brief(repo, track)                   # migrate a legacy JSON copy FIRST — the pop below would drop it
+        before = after = None; made = not os.path.isdir(os.path.join(STATE, repo, track))
         if instr.strip():                    # the brief goes to its one home; the board JSON keeps the title
-            before, after = brief_edit("append", repo, track, instr)   # gated, locked, and it APPENDS: never clobber
+            check_shape(repo, track, instr)  # the door's gate, before any lock
+            before, after = brief_edit("append", repo, track, instr, gated=False)   # locked, and it APPENDS: never clobber
             if human(before).strip() and after != before:              # a brief as a side effect of another command
                 print(f"cc-board add: {repo}/{track} already had a brief — appended rather than replaced.\n"
                       f"  replace it deliberately: cc-board set {repo} {track} instructions '<brief>'", file=sys.stderr)
-        with Lock(repo):
-            d = need(repo)
-            t = d["tracks"].get(track, {})
-            t.pop("instructions", None)                 # a re-add drops the pre-#94 copy too
-            t.update({"title":title, "kind":kind(t),
-                      "status":state(t.get("status","queued")),
-                      "branch":t.get("branch",f"track/{track}"),
-                      "worktree":t.get("worktree", os.path.expanduser(f"~/.cc/worktrees/{repo}/{track}")),
-                      "session_id":t.get("session_id",""),"started":t.get("started",False),
-                      "pr":t.get("pr",""),"notes":t.get("notes",[]),
-                      "created":t.get("created",now()),"updated":now()})
-            d["tracks"][track]=t
-            d["log"].append({"ts":now(),"track":track,"msg":f"added: {title}"})
-            _save(repo,d)
+        try:
+            with Lock(repo):
+                d = need(repo)
+                t = d["tracks"].get(track, {})
+                t.pop("instructions", None)                 # a re-add drops the pre-#94 copy too
+                t.update({"title":title, "kind":kind(t),
+                          "status":state(t.get("status","queued")),
+                          "branch":t.get("branch",f"track/{track}"),
+                          "worktree":t.get("worktree", os.path.expanduser(f"~/.cc/worktrees/{repo}/{track}")),
+                          "session_id":t.get("session_id",""),"started":t.get("started",False),
+                          "pr":t.get("pr",""),"notes":t.get("notes",[]),
+                          "created":t.get("created",now()),"updated":now()})
+                d["tracks"][track]=t
+                d["log"].append({"ts":now(),"track":track,"msg":f"added: {title}"})
+                _save(repo,d)
+        except BaseException:                # the row never reached the board: the brief comes out, the refusal stands
+            unappend(repo, track, before, after, made); raise
         refresh_inflight(repo, track)        # the row exists now, so the block can name every OTHER live track
-        print(f"track '{track}' added to {repo}")
+        print(f"track '{track}' added to {repo}" + (f" — brief {'appended' if human(before).strip() else 'written'}, "
+                                                    f"{len(after.encode())} bytes" if after is not None and after != before else ""))
         offer_join(repo, track)              # …and a live row already in these files is offered, not left to memory
     elif cmd == "brief":
         # THE CLI FACE OF THE ONE WRITER: `cc --go` pipes its note through `append --top … -`; the stress case in
@@ -591,14 +634,16 @@ def main(a):
         verb, repo, track, text = a[1], a[2], a[3], a[4]
         if text == "-": text = sys.stdin.read()
         before, after = brief_edit(verb, repo, track, text, top=top)
-        print(f"{repo}/{track}: brief {verb} — {'unchanged' if after == before else 'written'}")
+        print(said(repo, track, verb, before, after))
     elif cmd == "set":
         repo, track, key, val = a[1], a[2], a[3], a[4]
         if key == "instructions":            # replacing a brief is an EXPLICIT act, and this is the verb for it
+            # recurring-defect-ok: pause-hold-missing — this file IS the board: add/set store a row and launch nothing; cc-pause gates the dispatchers that read it
             if track not in need(repo)["tracks"]: sys.exit(f"no track '{track}'")
             brief(repo, track)               # migrate first, so the old copy cannot come back over the new one
-            brief_edit("replace", repo, track, val)   # gated like `add`: `set` then `--go ""` would otherwise dispatch
-            refresh_inflight(repo, track); return     # a step list past both gates, --go having no text to check
+            before, after = brief_edit("replace", repo, track, val)   # gated like `add`: `set` then `--go ""` would otherwise
+            refresh_inflight(repo, track)                             # dispatch a step list past both gates, --go having no text to check
+            print(said(repo, track, "replace", before, after)); return   # what it replaced, how big, and where the old one is
         if key == "agent_at":
             # THE CLOCK ON A MARK IS NOT A FIELD ANYONE SETS. It is written only as a side effect of `set agent
             # me` / `agent ''` below, and for the same reason a mark can only be made by the session it names:
@@ -837,9 +882,19 @@ def selfcheck():
            body.count("a one-line\n") == 2 and body.startswith("a one-line\n\n") and body.count("a one-line note\n") == 1)
         run("brief", "append", "--top", "r", "t4", "a one-line")
         ok("…and the note on top, repeated, stacks nothing up", open(f"{th}/.cc/state/r/t4/task.md").read() == body)
-        run("set", "r", "t1", "instructions", "REPLACED")
+        T1, bak = f"{th}/.cc/state/r/t1/task.md", f"{th}/.cc/state/r/t1/task.md.bak"
+        was, old = open(T1).read(), os.path.getsize(T1)
+        r = run("set", "r", "t1", "instructions", "REPLACED")
         ok("`set instructions` is the explicit way to replace it",
            open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "REPLACED")
+        # …and it is the one deliberate way to LOSE a brief, so it says what it took out and keeps it: a 13 kB brief
+        # went to 3.5 kB with rc=0 and no output, and five planning turns dug it out of a transcript (lessons, 2026-09-18).
+        ok("…and it says what it replaced — old size, new size, where the old brief is — and leaves that copy whole beside it",
+           f"replaced — {old} bytes → {os.path.getsize(T1)}; the old brief is {bak}" in r.stdout
+           and os.path.exists(bak) and open(bak).read() == was)
+        r = run("set", "r", "t1", "instructions", "REPLACED")
+        ok("…a replace that changes nothing says so and does not overwrite that copy with the same text",
+           "unchanged" in r.stdout and open(bak).read() == was)
         # …and it is a door, so it is gated like `add`: `set` then `cc … --go ""` would otherwise walk a step list
         # past both gates, --go having no text of its own to check. The brief already there must survive the refusal.
         r = run("set", "r", "t1", "instructions",
@@ -919,6 +974,35 @@ def selfcheck():
            all(rc == 0 for rc, _ in rcs) and typed.count("REPLACED: the brief, deliberately.\n") == 1
            and all(typed.count(f"late note {i}\n") in (0, 1) for i in range(3)) and "bottom note" not in typed
            and got.count(MARK_A) == 1 and got.count(MARK_B) == 1)
+        # ── A BOARD WRITE HAPPENS WHOLE OR NOT AT ALL (2026-09-19). Two course seats ran `add` at the same moment and
+        # both rows were found with a task.md, a log line and no entry in tracks{} — the board's log says `rm` took
+        # them (11:03Z, another seat), not a lost write; N adds at once ARE N rows, and this pins it. But the brief DID
+        # land before the board was so much as opened, so an add that failed at the board step (no board, a lock held
+        # past the wait, a save that failed) left exactly that half-row: a brief nothing can close. Now it leaves nothing.
+        procs = [spawn("add", "r", f"c{i}", f"C{i}", f"GOAL: row {i} lands whole.") for i in range(N)]
+        rcs = finish(procs); rows = json.load(open(f"{th}/.cc/boards/r.json"))
+        ok("12 `add`s at once are 12 rows in tracks{}, each with its log line and its brief — none refused, none lost",
+           all(rc == 0 for rc, _ in rcs) and all(f"c{i}" in rows["tracks"] for i in range(N))
+           and sum(1 for l in rows["log"] if l["msg"].startswith("added: C")) == N
+           and all(open(f"{th}/.cc/state/r/c{i}/task.md").read().startswith(f"GOAL: row {i} lands whole.") for i in range(N)))
+        r = run("add", "nob", "x", "T", "GOAL: a brief for a board that is not there.")
+        ok("an `add` for a repo with no board says so and writes nothing — no state dir, no brief",
+           r.returncode != 0 and "no board" in r.stderr and not os.path.exists(f"{th}/.cc/state/nob"))
+        holder = open(f"{th}/.cc/boards/r.lock", "w"); fcntl.flock(holder, fcntl.LOCK_EX)
+        HENV = {**SENV, "CC_BOARD_LOCK_WAIT": "0.5"}
+        def held_add(*args): return subprocess.run([sys.executable, os.path.realpath(__file__), "add", *args], env=HENV,
+                                                   capture_output=True, text=True, timeout=60)
+        was = open(ST).read()
+        r1 = held_add("r", "held1", "H", "GOAL: never lands.")
+        r2 = held_add("r", "st", "STRESS", "GOAL: a note that must come out again.")
+        holder.close()
+        ok("an `add` whose board lock is held past the wait is refused in one line, and the brief it had written comes out again — no half-row",
+           r1.returncode != 0 and "held by another process" in r1.stderr
+           and "held1" not in json.load(open(f"{th}/.cc/boards/r.json"))["tracks"] and not os.path.exists(f"{th}/.cc/state/r/held1"))
+        ok("…and on a row that had a brief, the note comes out and the brief is exactly what it was",
+           r2.returncode != 0 and "held by another process" in r2.stderr and open(ST).read() == was)
+        ok("…and the same add lands once the lock is free", run("add", "r", "held1", "H", "GOAL: never lands.").returncode == 0
+           and "held1" in json.load(open(f"{th}/.cc/boards/r.json"))["tracks"] and open(f"{th}/.cc/state/r/held1/task.md").read() == "GOAL: never lands.\n")
         # A LOCK SOMEBODY ELSE HOLDS is waited for, briefly, then refused in one line — never a hang, never a write
         # through it — and the same edit lands once it is free. In-process, ungated: the shape check is not what is under test.
         real_wait, LOCK_WAIT, sroot = LOCK_WAIT, 0.5, f"{th}/.cc/state"
