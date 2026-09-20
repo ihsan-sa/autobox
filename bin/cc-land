@@ -58,16 +58,26 @@ WHAT IT WILL NOT DO:
     stop like a red gate and the findings are ONE PR comment. `--no-review` is the only way past and a 👍 never
     takes it. It fails CLOSED: a usage limit merges nothing unread — the job waits for the reset cc-limit names.
     ONE VERDICT PER CHANGE, whoever reached it: a comment this box wrote on the PR keyed to a digest of the diff
-    against its merge-base (change_digest; a rebase does not move it, an edit does), so a landing reads a recorded
-    verdict (`cc-land record`) instead of buying a second. A review that ran out of its cap (CC_LAND_REVIEW_BUDGET,
-    CC_LAND_REVIEW_TURNS) is a third outcome, not a verdict: it says what it spent and which number to raise, and
-    that head is refused until that cap is raised.
+    against its merge-base (change_digest; a rebase does not move it, an edit does — and a verdict keyed before
+    2026-09-19, when the hunk header's tail was still hashed, is read by that older key), so a landing reads a
+    recorded verdict (`cc-land record`) instead of buying a second. A review that ran out of its cap (CC_LAND_REVIEW_BUDGET,
+    CC_LAND_REVIEW_TURNS) is a third outcome, not a verdict: it is run ONCE MORE at once at the doubled cap the
+    message names (one relaunch per head), and a second wall says what both spent and which number to raise; that
+    head is then refused until that cap is raised past the doubled one, or a person buys it (`--re-review`).
+  · Land one PR twice at once: a landing holds `~/.cc/state/land/held/<repo>-<pr>.lock` (an flock) from before
+    its first gate to its end, the direct path and the queue's alike; a second arrival — a hand `--re-review`
+    beside the queue's job, or the other way round — names the holder (pid, since, caps, flags), buys nothing
+    and exits 1; the queue's job waits its 15 min instead and deploys what the hand landing merged.
   · Spend on a PR already in: the merged state is re-read before the review and before a repair round dispatches.
   · Buy a second ROUTINE review for one change. `~/.cc/state/land/root/<repo>-<pr>.json` tallies per change and
-    outlives the job: one routine review, one automatic repair round, and the read of what that round changed;
-    past that it STOPS and asks a person (`--no-review` or `--re-review`, which is added back to what the change
-    may buy). A review a usage limit or its own cap killed is not a buy. A fix anybody pushed after a
-    LAND-AFTER-FIX counts as the round. A refusal reached at the wall is re-checked against the PR first.
+    outlives the job AND the merge (stamped `merged`, bounding nothing from then on — cc-lib indexes it as the
+    landing record, so what a landed PR bought is still there to ask for): one routine review, one automatic
+    repair round, and the read of what that round changed; past that it STOPS and says who decides — the
+    planning session buys one more (`--re-review`, which is added back to what the change may buy, the one
+    route the classifier lets a seat take), a PERSON who read it records that (`cc-land record`, refused to the
+    seat as self-approval on #521) or lands it unread (`--no-review`). A review a usage limit or its own cap
+    killed is not a buy. A fix anybody pushed after a LAND-AFTER-FIX counts as the round. A refusal reached at
+    the wall is re-checked against the PR first.
   · Time a gate on the clock: it is timed on its SILENCE — a suite waiting on a lock says so every minute.
   · Refund a read that ran beside a red gate: it was paid for, and a refund would buy a read per red head.
 
@@ -92,8 +102,9 @@ output are NOT on it: they are in the landing record — the `done …` line in 
 log and the failures ledger — and in the PR thread, which that url opens. The why keeps the words cc-replay
 classifies a stop by (`gate <g> did not pass`, `conflicts with <base> — rebase`): it reads these cards.
 
-Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a
-cosmetic step wants a hand · 4 merged and deployed, but nothing observed it reaching the owner · 2 usage.
+Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran), or another landing
+already holds this PR (nothing here ran) · 3 landed, but a cosmetic step wants a hand · 4 merged and deployed, but
+nothing observed it reaching the owner · 2 usage.
 """
 import ast, calendar, fcntl, fnmatch, glob, hashlib, json, os, re, select, shlex, shutil, signal, subprocess, sys
 import contextlib, tempfile, threading, time
@@ -432,7 +443,7 @@ def repo_root(repo):
 # A member workspace's finished track lands into the member's own repository the way a box project's does, and nothing of it touches the box. The job's repo is `<handle>--<track>`.
 #   · every GitHub call uses that workspace's token and repository, out of a host-only clone (member_clone) of a repository ~/dev/<handle> names under the owner's account;
 #   · the gates run inside the workspace's sandbox (`cc-sandbox member <h> <track> --tree <dir>`); the host runs git plumbing and gh, nothing the head wrote;
-#   · the deploy half never runs (deploy_steps); the review is charged to the workspace's daily cap (~/.cc/state/member-spend.json, MEMBER_DAILY_USD);
+#   · the deploy half never runs (deploy_steps); every review run — the automatic relaunch at the doubled cap included — is charged to the workspace's daily cap before it is asked for (member_buys_review, ~/.cc/state/member-spend.json, MEMBER_DAILY_USD);
 #   · a PR touching the boundary or a token stops before any gate (member_walls); a stop is reported in the workspace's own channel (say_result);
 #   · the repair round is the same one a box project gets; a change that spent its review and its repair is told to open a new PR.
 # The three places, read at call time like green_dir():
@@ -763,15 +774,16 @@ def cap_now(var):
     return REVIEW_BUDGET if var == "CC_LAND_REVIEW_BUDGET" else REVIEW_TURNS
 
 
-def review_caps(subtype=""):
-    """(both caps as one word, for the record and the message; then the remedy for the cap that bound: its variable, the value that doubles it, and the other variable as an aside). Read from the environment where used, never stored."""
+def review_caps(subtype="", budget="", turns=""):
+    """(both caps as one word, for the record and the message; then the remedy for the cap that bound: its variable, the value that doubles it, and the other variable as an aside). The caps a run used: the environment's, unless the run was the relaunch at the doubled one (review_now); never stored."""
+    budget, turns = budget or REVIEW_BUDGET, turns or REVIEW_TURNS
     var = (WALL_SUBTYPE.get(subtype) or WALL_SUBTYPE["error_max_budget_usd"])[1]
     try:
-        more = f"{float(cap_now(var)) * 2:g}"
+        more = f"{float(budget if var == 'CC_LAND_REVIEW_BUDGET' else turns) * 2:g}"
     except ValueError:
         more = "6" if var == "CC_LAND_REVIEW_BUDGET" else "80"
     other = "CC_LAND_REVIEW_TURNS" if var == "CC_LAND_REVIEW_BUDGET" else "CC_LAND_REVIEW_BUDGET"
-    return f"${REVIEW_BUDGET}/{REVIEW_TURNS}t", var, more, other
+    return f"${budget}/{turns}t", var, more, other
 
 
 def wall_stands(wall):
@@ -921,6 +933,51 @@ class git_lock:
         return False
 
 
+def pr_lock_path(repo, pr):
+    """The file one landing of a PR holds for its whole run, under LANDQ like the queue's own lock, so a hand `cc-land <repo> <pr>` and the worker's job meet on the same file."""
+    return f"{LANDQ}/held/{repo}-{pr}.lock"
+
+
+class pr_lock:
+    """ONE LANDING PER PR, across processes. An flock taken before a gate or a read is bought — by the direct path (Land.run) and the queue's (run_one) alike — and held to the end of that landing; the holder writes who it is into the file (pid, since, the caps it runs at, its flags) so the one that arrives second names it and stands down having bought nothing. Two landers on one PR each paid the gates and a $3 review (#496 2026-09-16, and #501 the same day: a hand --re-review beside the queue's own job, the job file's absence read as 'nobody owns this PR' — the live lander is the object, not the file). `record` and `queue` never take it. A lock that cannot be made is held by nobody: the landing goes on."""
+
+    def __init__(self, repo, pr, flags=""):
+        self.repo, self.pr, self.flags, self.fd = repo, pr, flags, None
+
+    def take(self):
+        """'' when this process now holds the PR; else one line naming the landing that does."""
+        path = pr_lock_path(self.repo, self.pr)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+        except OSError:
+            return ""
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                who = json.loads(os.read(fd, 4096) or b"{}")
+            except ValueError:
+                who = {}
+            os.close(fd)
+            return (f"PR #{self.pr} is already being landed by pid {who.get('pid', '?')} since {who.get('since', '?')} "
+                    f"at {who.get('cap', '?')}{' ' + who['flags'] if who.get('flags') else ''} — this one stands "
+                    f"down, having bought nothing; that landing merges it or says why not")
+        self.fd = fd
+        with contextlib.suppress(OSError):   # the holder's name is a courtesy to the second arrival; the lock is the fact
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps({"pid": os.getpid(), "since": stamp(), "cap": review_caps()[0],
+                                     "flags": self.flags}).encode())
+        return ""
+
+    def release(self):
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
 def emit(text):
     """Everything this tool says about a landing goes through here."""
     print(text, flush=True)
@@ -1060,11 +1117,11 @@ def tree_id(root):
 
 
 def sweep_records():
-    """Green records past their hours go, and a change's tally nothing has touched for ROOT_TTL (root_work has stopped believing it by then); an optimisation only, so it never raises."""
+    """Green records past their hours go, and a change's tally nothing has touched for ROOT_TTL (root_work has stopped believing it by then) — never a merged one, which is the landing's record (root_done); an optimisation only, so it never raises."""
     for pattern, ttl in ((f"{green_dir()}/*.json", GREEN_TTL), (f"{root_dir()}/*.json", ROOT_TTL)):
         for p in glob.glob(pattern):
             try:
-                if time.time() - os.path.getmtime(p) > ttl:
+                if time.time() - os.path.getmtime(p) > ttl and not (read_json(p) or {}).get("merged"):
                     os.unlink(p)
             except OSError:
                 pass
@@ -1080,16 +1137,19 @@ def root_path(repo, pr):
 
 
 def root_work(repo, pr):
-    """What has already been bought for this change: {'reviews': n, 'repairs': n}. Empty when nothing was spent or the record is older than ROOT_TTL; a record whose stamp will not parse is kept, not dropped."""
+    """What has already been bought for this change: {'reviews': n, 'repairs': n}. Empty when nothing was spent, the record is older than ROOT_TTL, or the change is in (`merged`, root_done: history, bounding nothing); a record whose stamp will not parse is kept, not dropped."""
     j = read_json(root_path(repo, pr)) or {}
     first = epoch_of(j.get("first", ""))
-    if j and first and time.time() - first > ROOT_TTL:
+    if j and (j.get("merged") or (first and time.time() - first > ROOT_TTL)):
         return {}
     return j
 
 
 def root_spend(repo, pr, **bump):
-    """Count a spend before it is made, on disk: an int adds to its counter, anything else (`wall=`, the cap a review died on) is set. Returns the record as it now stands."""
+    """Count a spend before it is made, on disk: an int adds to its counter, anything else (`wall=`, the cap a review died on) is set. Returns the record as it now stands; a merged change's is returned untouched — it is in, and its history is not overwritten by a late mark."""
+    j = read_json(root_path(repo, pr)) or {}
+    if j.get("merged"):
+        return j
     j = root_work(repo, pr)
     j.setdefault("first", stamp())
     j.update(repo=repo, pr=pr, at=stamp())
@@ -1102,9 +1162,12 @@ def root_spend(repo, pr, **bump):
 
 
 def root_done(repo, pr):
-    """The change is IN: its tally is spent history and goes with it, so a number GitHub reuses starts clean."""
-    with contextlib.suppress(OSError):
-        os.unlink(root_path(repo, pr))
+    """The change is IN: its tally stays on disk stamped `merged` — what the change bought is the one record of it, and it is read after the PR lands (cc-lib indexes root/<repo>-<pr>.json as the landing record; `cc-lib ask --object` finds it) — while bounding nothing from then on (root_work). Until 2026-09-19 it was unlinked here, and review spend could not be audited once a PR landed."""
+    j = read_json(root_path(repo, pr)) or {}
+    if j and not j.get("merged"):
+        j.update(merged=stamp(), at=stamp())
+        with contextlib.suppress(OSError):
+            write_atomic(root_path(repo, pr), j)
 
 
 def pr_facts(root, pr, fields, timeout=120):
@@ -1352,16 +1415,17 @@ def name_status(text):
     return rows
 
 
-HUNK = re.compile(r"^@@ -[0-9,]+ \+[0-9,]+ @@")
+HUNK = re.compile(r"^@@ -[0-9,]+ \+[0-9,]+ @@.*$")   # the whole header: its numbers AND the function-context tail git adds after it
+HUNK_LEGACY = re.compile(r"^@@ -[0-9,]+ \+[0-9,]+ @@")   # …what keyed every verdict written before 2026-09-19: the tail stayed in
 
 
-def change_digest(diff):
-    """A `git diff` text to the 40 hex characters naming the change, or '' for no diff. Only the `index <blob>..<blob>` line and the hunk header line numbers are dropped (both move under a rebase); everything else is hashed verbatim, whitespace included, which `git patch-id` would strip."""
+def change_digest(diff, legacy=False):
+    """A `git diff` text to the 40 hex characters naming the change, or '' for no diff. Only the `index <blob>..<blob>` line and the hunk header are dropped — its line numbers, and the function-context tail (`@@ … @@ def f():`) git copies from a line ABOVE the hunk, which a commit main took above the change rewrites (2026-09-19: a rebase over one such commit re-keyed the change and bought its read again); everything else is hashed verbatim, whitespace included, which `git patch-id` would strip. `legacy` keeps the tail: the key a verdict recorded before that date carries, which prior_verdict still accepts so the PRs open at the deploy are not all read again."""
     keep = []
     for ln in (diff or "").splitlines():
         if ln.startswith("index "):
             continue
-        keep.append(HUNK.sub("@@", ln) if ln.startswith("@@ ") else ln)
+        keep.append((HUNK_LEGACY if legacy else HUNK).sub("@@", ln) if ln.startswith("@@ ") else ln)
     body = "\n".join(keep).strip()
     return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:40] if body else ""
 
@@ -1515,6 +1579,22 @@ class Land:
             raise v
         return v
 
+    def member_buys_review(self, usd):
+        """Charge one review's CAP to the member workspace's day before that review is asked for, or raise the usage limit run_job defers on. Every buy comes through here — the first read and the automatic relaunch at the doubled cap alike — so the most a run can spend is booked against MEMBER_DAILY_USD before it can spend it, and a workspace with no room left gets the same deferral either way instead of a read it cannot pay for."""
+        over = member_charge(self.member, usd)
+        if not over:
+            return
+        # The MINUTES to that reset are counted here, because `(Nm left)` is the only token limit_until can
+        # read a day off: the bare clock time `00:00Z` is already behind us, and a bare one behind us books
+        # one RETRY_AFTER — which would re-run this whole landing, the gates included, every 15 min until
+        # midnight, each pass uncounted because the deferral hands the attempt back. cc-limit knows nothing
+        # of a member's cap, so this deferral is never re-asked either (limit_src "review", limit_stands).
+        at = int(time.time())                       # epoch days ARE UTC days, so this is the next 00:00Z,
+        mins = ((at // 86400 + 1) * 86400 - at + 59) // 60      # rounded up as cc-limit rounds its own
+        raise Failed(f"no review: usage limit until 00:00Z ({mins}m left) — {self.member} has used "
+                     f"${over[0]:.2f} of its ${over[1]:.0f}/day (MEMBER_DAILY_USD) and this review asks "
+                     f"${usd:.2f}; the landing waits for the day to reset")
+
     def review_now(self):
         """One headless reviewer: it reads the diff, the files at the PR's head, the track's brief (never its journal) and the repo's docs/REVIEW.md, with no shell and nothing to write with. Who reads it, or nobody, is review_model()'s answer."""
         if not self.want_review:
@@ -1559,15 +1639,20 @@ class Land:
                 f"{spent.get('reviews', 0)} review(s) and {spent.get('repairs', 0)} repair round(s), and "
                 f"the diff at {self.head[:12]} is not one they read. "
                 + (f"A new PR is a new budget: close this one and open another for the fixed branch" if self.member else
-                   f"The planning session decides now — read it "
-                   f"itself and write that down (`cc-land record {self.repo} {self.pr} LAND --by <who>`, which this "
-                   f"landing then reads), land with no verdict on the PR (`cc-land {self.repo} {self.pr} "
-                   f"--no-review`), or buy one more (`cc-land {self.repo} {self.pr} --re-review`)")))
+                   # The seat's own route FIRST: `record … LAND` was refused to the planning seat as self-approval
+                   # (#521, 2026-09-19) after this message named it first, and the seat's read was thrown away.
+                   f"The planning session decides now — buy one more read (`cc-land {self.repo} {self.pr} "
+                   f"--re-review`, the one route a seat takes on its own), or a PERSON who read the diff writes "
+                   f"that down (`cc-land record {self.repo} {self.pr} LAND --by <who>`, which this landing then "
+                   f"reads; refused to the seat that would land it, as self-approval) or lands it with no "
+                   f"verdict on the PR (`cc-land {self.repo} {self.pr} --no-review`)")))
         # ...and whether this exact head already died on a cap: refused until the cap that bound is raised (wall_stands), or --re-review.
         wall = spent.get("wall") or {}
-        if wall.get("head") == self.head and wall_stands(wall) and not self.re_review:
+        if wall.get("head") == self.head and wall_stands(wall) and not wall.get("answered") and not self.re_review:
             name = (WALL_SUBTYPE.get(wall.get("hit") or "") or ("the cap", ""))[0]
             var, more = review_caps(wall.get("hit") or "")[1:3]
+            with contextlib.suppress(TypeError, ValueError):   # doubled from the cap it HIT — after the relaunch that
+                more = f"{float(wall.get('was')) * 2:g}"       # is the doubled one already, and the environment's × 2 stands
             raise self.mark_doomed(Failed(
                 f"{WALL}: PR #{self.pr} already spent {wall.get('cost')} at {wall.get('cap')} on "
                 f"{self.head[:12]} and read nothing — {name} stopped it and has not moved since, so this "
@@ -1579,18 +1664,7 @@ class Land:
             raise Failed(f"no review: {stamp[1].strip()} — the landing waits for the model, or --no-review")
         if self.member:
             # The review is charged to the workspace's daily cap before the buy; the cap reached is weather (limited), deferred by run_job to the day's reset.
-            over = member_charge(self.member, float(REVIEW_BUDGET))
-            if over:
-                # The MINUTES to that reset are counted here, because `(Nm left)` is the only token limit_until can
-                # read a day off: the bare clock time `00:00Z` is already behind us, and a bare one behind us books
-                # one RETRY_AFTER — which would re-run this whole landing, the gates included, every 15 min until
-                # midnight, each pass uncounted because the deferral hands the attempt back. cc-limit knows nothing
-                # of a member's cap, so this deferral is never re-asked either (limit_src "review", limit_stands).
-                at = int(time.time())                       # epoch days ARE UTC days, so this is the next 00:00Z,
-                mins = ((at // 86400 + 1) * 86400 - at + 59) // 60      # rounded up as cc-limit rounds its own
-                raise Failed(f"no review: usage limit until 00:00Z ({mins}m left) — {self.member} has used "
-                             f"${over[0]:.2f} of its ${over[1]:.0f}/day (MEMBER_DAILY_USD) and this review asks "
-                             f"${float(REVIEW_BUDGET):.2f}; the landing waits for the day to reset")
+            self.member_buys_review(float(REVIEW_BUDGET))
         tmp, tree = self.head_checkout("review", fetch=False)   # fetched above, to answer "read this head already?"
         try:
             dpath = f"{tmp}/pr-{self.pr}.diff"
@@ -1599,18 +1673,51 @@ class Land:
             buy = dict(reviews=1, **({"asked": 1} if self.re_review else {}))
             root_spend(self.repo, self.pr, **buy)
             self.bought = True
-            try:
-                answer, cost, toks = self.ask_reviewer(self.review_prompt(tpl, tree, dpath), tree, tmp)
-            except Failed as e:
-                # A usage limit means the model never ran, so the count is given back here (the cc-limit pre-check above raises the same limit before anything is counted).
-                if limited(str(e)):
-                    root_spend(self.repo, self.pr, **{k: -n for k, n in buy.items()})
+            prompt, more, first = self.review_prompt(tpl, tree, dpath), {}, {}
+            # Brief 2026-09-19: "one automatic relaunch at the doubled cap the card already prints, then a person".
+            # Once per HEAD: a wall this head was already relaunched past (`again` on its record) is a person's run
+            # now — their raised cap, or their --re-review — and a second wall on it is theirs to answer.
+            relaunched = wall.get("head") == self.head and bool(wall.get("again"))
+            while True:
+                try:
+                    answer, cost, toks = self.ask_reviewer(prompt, tree, tmp, **more)
+                    if more:    # the relaunch read: the wall before it stays on the record for the tally, answered, and refuses nothing
+                        root_spend(self.repo, self.pr, wall=dict(root_work(self.repo, self.pr).get("wall") or {}, answered=True))
+                    break
+                except Failed as e:
+                    # A usage limit means the model never ran, so the count is given back here (the cc-limit pre-check above raises the same limit before anything is counted).
+                    if limited(str(e)):
+                        root_spend(self.repo, self.pr, **{k: -n for k, n in buy.items()})
+                        self.bought = False
+                        raise
+                    if not getattr(e, "wall", None):
+                        raise
+                    # A cap stopped this one: the money is gone and the wall goes on the record, so the next attempt at this head is refused above.
+                    if more:
+                        e.wall["again"] = first      # …with the run before it kept beside: two priced walls, no verdict
+                    elif relaunched:
+                        e.wall["again"] = wall.get("again")   # a person's run past the relaunch walls too: the head STAYS
+                    root_spend(self.repo, self.pr, wall=e.wall, **{k: -n for k, n in buy.items()})   # relaunched on the record, or their next raise would buy the box's relaunch again at double their cap
                     self.bought = False
-                elif getattr(e, "wall", None):
-                    # A cap stopped this one: the money is gone, the wall goes on the record, and the next attempt at this head is refused above.
-                    root_spend(self.repo, self.pr, wall=e.wall, **{k: -n for k, n in buy.items()})
-                    self.bought = False
-                raise
+                    if more or relaunched:
+                        e.args = (f"{e} Run twice at this head" + (f" ({first['cap']}, then {e.wall['cap']})" if more else "")
+                                  + " — a person decides now: that raise, the diff read yourself, or --re-review.",)
+                        raise
+                    cap, var, doubled, _ = review_caps(e.wall.get("hit") or "")
+                    first = {k: e.wall[k] for k in ("cap", "cost", "turns", "hit")}
+                    more = {"budget" if var == "CC_LAND_REVIEW_BUDGET" else "turns": doubled}
+                    if self.member:
+                        # The relaunch spends again, up to the DOUBLED money cap, so it is booked like the first read
+                        # and refused the same way: a workspace with $3 of room left does not get a $6 run on the box's
+                        # initiative. Raised before the relaunch is announced, so nothing promises a run that is not
+                        # bought — the wall above is already on the record with its buy given back, so run_job defers
+                        # this head to the day's reset rather than relaunching, and the cap holds at the cap.
+                        self.member_buys_review(float(more.get("budget") or REVIEW_BUDGET))
+                    out("·", f"{WALL} at {cap}: {e.wall['cost']} and {e.wall['turns']} turns on PR #{self.pr} read "
+                             f"nothing — run once more at {var}={doubled}, the relaunch the card would have asked a "
+                             f"person for; a second wall is theirs")
+                    root_spend(self.repo, self.pr, **buy)     # the relaunch is a buy like the first, counted before it goes
+                    self.bought = True
         finally:
             self.drop_checkout(tmp, tree)
         verdict, said = verdict_of(answer)
@@ -1660,11 +1767,17 @@ class Land:
         """What this PR is, as a key a rebase does not change: change_digest() of the diff from its merge-base to its head, or the head SHA when git could name no digest. Returns (key, merge-base), merge-base '' when git could not say; cached per head."""
         if not (self._ckey and self._ckey[0] == self.head):
             try:    # -U3 said out loud so a repo's diff.context cannot change the hash
-                key = change_digest(self.pr_diff("-U3", stdout_only=True))
+                diff = self.pr_diff("-U3", stdout_only=True)
+                key, old = change_digest(diff), change_digest(diff, legacy=True)
             except Failed:
-                key = ""
-            self._ckey = (self.head, key or self.head)   # no digest git can name: keyed on the head, which a rebase re-reads (stricter)
+                key = old = ""
+            self._ckey = (self.head, key or self.head, old or self.head)   # no digest git can name: keyed on the head, which a rebase re-reads (stricter)
         return self._ckey[1], self.merge_base()[0]
+
+    def legacy_key(self):
+        """The key this change had before 2026-09-19 (change_digest legacy=True), for the verdicts already on the PR — read, never written."""
+        self.change_key()
+        return self._ckey[2]
 
     def marker(self, verdict="", by=""):
         """The comment's machine-readable half: the change it was written about (`v2 change=<digest>`, or the head where git cannot name one) and the verdict. The verdict lives here and not in the prose, which quotes verdicts."""
@@ -1674,8 +1787,9 @@ class Land:
         return f"<!-- {REVIEW_MARK} v2 change={key} base={mb[:12]} head={self.head[:12]}{v}{w} -->"
 
     def prior_verdict(self, body):
-        """The verdict `body` records about this change, or '': verdict_in with this landing's change key. Returns (verdict, findings, who) or ''."""
-        return verdict_in(body, self.change_key()[0])
+        """The verdict `body` records about this change, or '': verdict_in with this landing's change key — or with the key the change had before 2026-09-19 (legacy_key), so a verdict recorded on a PR before the digest stopped keying on the hunk tail still answers instead of being bought again. Returns (verdict, findings, who) or ''."""
+        key, old = self.change_key()[0], self.legacy_key()
+        return verdict_in(body, key) or (verdict_in(body, old) if old != key else "")
 
     def prior_review(self):
         """The verdict this box already reached about this change, read off the PR's comments; only one this box wrote (`viewerDidAuthor`) counts. Returns (verdict, findings, who) or None, and keeps `self.stood`: the last verdict this box wrote for any change of this PR."""
@@ -1710,10 +1824,11 @@ class Land:
         return (f"{task} — the brief this change was written against; judge the diff against its DONE-criteria. "
                 f"The track's own journal is deliberately not given to you: it is the worker's account of itself.")
 
-    def ask_reviewer(self, prompt, tree, tmp):
-        """The model call, run in `tmp` (never in the checkout: a session's cwd is where CLAUDE.md is read from) with the tree as a subdirectory, answering JSON. Returns (text, cost, tokens)."""
+    def ask_reviewer(self, prompt, tree, tmp, budget="", turns=""):
+        """The model call, run in `tmp` (never in the checkout: a session's cwd is where CLAUDE.md is read from) with the tree as a subdirectory, answering JSON, at the environment's caps unless the relaunch's doubled one is passed. Returns (text, cost, tokens)."""
+        budget, turns = budget or REVIEW_BUDGET, turns or REVIEW_TURNS
         argv = [CLAUDE, "-p", prompt, "--model", self.by or REVIEW_MODEL, "--effort", "high",
-                "--max-budget-usd", REVIEW_BUDGET, "--max-turns", REVIEW_TURNS, "--output-format", "json",
+                "--max-budget-usd", budget, "--max-turns", turns, "--output-format", "json",
                 "--json-schema", REVIEW_SCHEMA,
                 "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands",
                 "--add-dir", tmp, "--allowedTools", REVIEW_ALLOW, "--disallowedTools", REVIEW_DENY]
@@ -1730,14 +1845,14 @@ class Land:
         hit = WALL_SUBTYPE.get(j.get("subtype") or "")
         if hit and not verdict_of(text)[0]:
             # The runner stopped this on a cap, not the diff: its own outcome, priced, and the command offered raises the cap that bound (review_caps).
-            cap, var, more, other = review_caps(j.get("subtype") or "")
+            cap, var, more, other = review_caps(j.get("subtype") or "", budget, turns)
             e = Failed(f"{WALL}, not the diff: {cost} and {j.get('num_turns') or '?'} turns on PR #{self.pr} read "
                        f"nothing and answered nothing — {hit[0]} ({var}) stopped it, so there is no verdict here to "
                        f"merge on. Give it more (`{var}={more} cc-land {self.repo} {self.pr}`, or {other} for the "
                        f"cap that did not), or read the diff yourself (`--no-review`). The same run at {cap} buys "
                        f"the same stop for the same {cost}, so it is not bought again.")
             e.wall = {"head": self.head, "cap": cap, "cost": cost, "turns": j.get("num_turns") or 0,
-                      "hit": j.get("subtype"), "was": cap_now(var)}
+                      "hit": j.get("subtype"), "was": budget if var == "CC_LAND_REVIEW_BUDGET" else turns}
             raise e
         if text and not verdict_of(text)[0] and not float(j.get("total_cost_usd") or 0) and LIMIT_SAID_RE.search(text):
             # A limit that answers instead of dying: rc=0, a result naming a session/usage/rate limit, no verdict, $0.00. All three conditions, and then it is the `limited()` prefix, so the buy is refunded and run_job defers the job.
@@ -1994,7 +2109,10 @@ class Land:
                 raise Failed(f"gh pr merge #{self.pr}: {last(o)}")
             root_done(self.repo, self.pr)
             return f"PR #{self.pr} merged (a second merge overlapped this one; GitHub says it is in)"
-        root_done(self.repo, self.pr)          # …and the change this tally was bounding is now on the default branch
+        if not rc or self.merged_now():
+            root_done(self.repo, self.pr)      # …and the change this tally was bounding is now on the default branch
+        # …while a PR gh calls "closed" that GitHub does not call MERGED is not in: its tally stays a bound, for the
+        # reopen (the `merged` stamp would retire it for good, and every attempt after would re-buy the same read).
         return f"PR #{self.pr} merged (squash, remote branch deleted)"
 
     # -- 4. the #approvals card: it stops reading as pending -----------------------------------------------
@@ -2382,6 +2500,11 @@ class Land:
         with contextlib.suppress(OSError):
             write_atomic(self.job, job)
 
+    def flags(self):
+        """The flags this landing runs with, as typed — what the second arrival at a held PR is shown (pr_lock)."""
+        return " ".join(f for f, on in (("--no-review", not self.want_review), ("--re-review", self.re_review),
+                                        ("--full-gates", self.full_gates)) if on)
+
     def run(self):
         if not self.load():
             return 1
@@ -2394,7 +2517,15 @@ class Land:
             return refuse(f"PR #{self.pr} is not landing — {protected_under(self.repo, hit)}. The box never lands "
                           f"one of these on its own, whatever the gates and the review say: only the owner's own 👍 "
                           f"on the card queues it", 1)
-        return self.done(self.walk(self.steps()))
+        lock = pr_lock(self.repo, self.pr, self.flags())
+        other = lock.take()   # brief: "a second landing on a PR already held by one exits saying so, having bought nothing"
+        if other:
+            emit(f"cc-land: {other}")
+            return 1
+        try:
+            return self.done(self.walk(self.steps()))
+        finally:
+            lock.release()
 
     def done(self, rc):
         if rc == UNVERIFIED:
@@ -3099,7 +3230,17 @@ def run_one(path):
     if job.get("attempts", 0) >= LAND_TRIES:
         finish(path, job)                        # gave up earlier and never got to speak
         return (job.get("result") or {}).get("short", "")
-    return run_job(path, job)
+    lock = pr_lock(job["repo"], job["pr"], "queue") if job.get("pr") else None
+    other = lock.take() if lock else ""
+    if other:
+        # A landing somebody ran by hand holds this PR: the job is not tried (no gate, no read, no try counted) and is looked at again in RETRY_AFTER — by then that landing has merged it, and this one deploys, or it has said why not.
+        job_set(path, job, last=f"held: {other}"[:400], not_before=stamp(time.time() + RETRY_AFTER))
+        return f"[{job['repo']}] {other[:200]} — the queue looks again in {RETRY_AFTER // 60} min"
+    try:
+        return run_job(path, job)
+    finally:
+        if lock:
+            lock.release()
 
 
 def known_repos():

@@ -796,6 +796,22 @@ def selfcheck():
           not [c for c in calls if c[0] == CLAUDE] and "LAND on PR #7" in str(r)
           and "reviewer-subagent" in str(r) and not root_work("myrepo", 7).get("reviews")
           and not commented())
+    # …and a pass recorded BEFORE 2026-09-19 still answers. Every verdict written until then was keyed with the hunk
+    # header's function-context tail in the hash (`@@ -40,3 +40,4 @@ def f(x):` — every Python hunk below its first
+    # line has one); dropping the tail re-keys those changes, and without this every reviewed PR open at the deploy
+    # would have bought its read again (review of #547). The legacy key is read, never written: the comment this
+    # landing would post carries the new one.
+    DIFF_TAILED = DIFF.replace("@@ -1,3 +1,4 @@", "@@ -40,3 +40,4 @@ def f(x):")
+    LEGACY = change_digest(DIFF_TAILED, legacy=True)
+    L, r = at_change(DIFF_TAILED, recorded=LEGACY)
+    check("a verdict keyed the OLD way — hunk tail and all — on a change whose hunk carries one is still the verdict: "
+          "the legacy key is a second key the landing reads by, no model is asked and nothing is bought",
+          LEGACY != change_digest(DIFF_TAILED) and not [c for c in calls if c[0] == CLAUDE]
+          and "LAND on PR #7" in str(r) and not root_work("myrepo", 7).get("reviews"))
+    L, r = at_change(DIFF_TAILED.replace("+        c()", "+        d()"), recorded=LEGACY)
+    check("...and the control: the legacy key of a DIFFERENT change answers nothing — the read is bought, as it "
+          "would be for any other key that is not this change's",
+          len([c for c in calls if c[0] == CLAUDE]) == 1 and root_work("myrepo", 7).get("reviews") == 1)
     L, r = at_change(DIFF_OTHER, recorded=KEY)
     check("...and the control: the same PR with the same recorded comment, whose diff has since become a "
           "DIFFERENT change, is read again — a record is for the change it was written about and no other",
@@ -814,6 +830,57 @@ def selfcheck():
     check("...and a recorded pass on the right change that this box did not WRITE is still no verdict: the "
           "author is checked on the v2 record exactly as it is on the older one",
           len([c for c in calls if c[0] == CLAUDE]) == 1)
+
+    # MAIN MOVES UNDER THE PR, with REAL git producing the diffs the landing keys on — not fixture strings. #496
+    # (2026-09-16) had LAND recorded on its head; main took one commit; the hand relaunch bought a second read of the
+    # same change, which walled at $3.08 having read nothing. Three shapes of "moved": main alone (an unrebased PR:
+    # the merge-base stands), main merged INTO the branch (what #496 carried), and the branch rebased onto main — the
+    # head and the merge-base move in the last two, the hunk's line numbers move in all three, the change in none.
+    def git(cwd, *args):
+        r = subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+                            "-c", "commit.gpgsign=false", *args], cwd=cwd, capture_output=True, text=True)
+        return r.stdout.strip()
+    gr = tempfile.mkdtemp(prefix="cc-land-selfcheck-moved-")
+    git(gr, "init", "-q", "-b", "main")
+    open(f"{gr}/a.py", "w").write("def f(x):\n    if x:\n        a()\n    return x\n")
+    open(f"{gr}/other.txt", "w").write("one\n")
+    git(gr, "add", "."); git(gr, "commit", "-q", "-m", "base")
+    git(gr, "checkout", "-q", "-b", "feat")
+    open(f"{gr}/a.py", "w").write("def f(x):\n    if x:\n        a()\n        c()\n    return x\n")
+    git(gr, "commit", "-q", "-am", "the change")
+
+    def shape(ref="feat"):
+        """(head, the diff a landing keys on: -U3 from the merge-base with main) as real git answers them now."""
+        head = git(gr, "rev-parse", ref)
+        return head, git(gr, "diff", "-U3", git(gr, "merge-base", "main", ref), ref) + "\n"
+    HEAD0, DIFF0 = shape()
+    KEY0 = change_digest(DIFF0)
+    git(gr, "checkout", "-q", "main")                      # main moves: two lines above the function, and another file
+    was = open(f"{gr}/a.py").read()
+    open(f"{gr}/a.py", "w").write("import os\n\n" + was)
+    open(f"{gr}/other.txt", "a").write("two\n")
+    git(gr, "commit", "-q", "-am", "main moves under the PR")
+    git(gr, "checkout", "-q", "feat")
+    HEAD1, DIFF1 = shape()                                 # (a) the PR untouched: same head, main is simply ahead
+    git(gr, "merge", "-q", "--no-edit", "main")            # (b) main merged in, as #496's head carried it
+    HEAD2, DIFF2 = shape()
+    git(gr, "reset", "-q", "--hard", HEAD1); git(gr, "rebase", "-q", "main")   # (c) rebased onto the moved main
+    HEAD3, DIFF3 = shape()
+    shutil.rmtree(gr, ignore_errors=True)
+    check("control: real git built the three moved shapes — the merged and rebased heads differ from the first, the "
+          "hunk's line numbers moved in each, and only the first still compares equal as text",
+          "+        c()" in DIFF0 and len({HEAD0, HEAD2, HEAD3}) == 3 and HEAD1 == HEAD0 and DIFF1 == DIFF0
+          and "@@ -1,4 +1,5 @@" in DIFF0 and "@@ -3,4 +3,5 @@" in DIFF2 and "@@ -3,4 +3,5 @@" in DIFF3
+          and DIFF2 != DIFF0)
+    reads = []
+    for head, diff in ((HEAD1, DIFF1), (HEAD2, DIFF2), (HEAD3, DIFF3)):
+        L, r = at_change(diff, head=head, recorded=KEY0)
+        reads.append((change_digest(diff) == KEY0, not [c for c in calls if c[0] == CLAUDE],
+                      "LAND on PR #7" in str(r), not root_work("myrepo", 7).get("reviews")))
+    check("a verdict keyed by diff content is reused when the base moves: main ahead of an untouched PR, main merged "
+          "into it, and the PR rebased onto it are one change to the landing — the recorded LAND answers each, no "
+          "model runs and nothing is counted (#496 bought a second read of exactly this and walled)",
+          all(all(row) for row in reads) and len(reads) == 3)
 
     # The writer and the reader, end to end: what `record` puts on the PR is what a landing reads back off it. Two
     # halves that agree by inspection and not by test are two halves that drift — this posts for real (through the
@@ -1043,43 +1110,71 @@ def selfcheck():
             L.facts = dict(FACTS)
             return L
 
+        # …and since 2026-09-19 the wall is answered ONCE by the box itself: "one automatic relaunch at the doubled cap
+        # the card already prints, then a person" (brief a-review-is-bought-once). #501 walled three times on one
+        # head, each relaunch a person reading a failure message for the knob; the first raise is the one the message
+        # would have prescribed, so the box makes it, and only a second wall goes to a person.
+        def capped(*argv):
+            """`--max-budget-usd` / `--max-turns` of each reviewer run, in order: the caps the walls were hit at."""
+            return [(c[c.index("--max-budget-usd") + 1], c[c.index("--max-turns") + 1]) for c in calls if c[0] == CLAUDE]
         L = fresh(pr=7)
         world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
         world[f"{CLAUDE} -p"] = (0, RANOUT())
-        r = caught(L.review)
-        check("a review that runs out of MONEY is its own outcome and is priced: what it spent, how many turns it got, "
-              "which cap stopped it and the variable that raises that cap — and it is neither a verdict nor a usage "
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            r = caught(L.review)
+        check("a review that runs out of MONEY is run ONCE MORE at the doubled cap the message would have named, by "
+              "the landing itself, and only a second wall is its own outcome — priced (both runs), naming the cap "
+              "that stopped it and the variable that raises it past the doubled one — neither a verdict nor a usage "
               "limit, so nothing downstream can read it as one",
-              exhausted(str(r)) and "$3.00" in str(r) and "35 turns" in str(r) and "no verdict" in str(r)
-              and "CC_LAND_REVIEW_BUDGET=6" in str(r) and "CC_LAND_REVIEW_TURNS=" not in str(r)
+              capped() == [("3", "40"), ("6", "40")] and "run once more at CC_LAND_REVIEW_BUDGET=6" in said.getvalue()
+              and exhausted(str(r)) and "$3.00" in str(r) and "35 turns" in str(r) and "no verdict" in str(r)
+              and "CC_LAND_REVIEW_BUDGET=12" in str(r) and "CC_LAND_REVIEW_TURNS=" not in str(r)
+              and "Run twice at this head ($3/40t, then $6/40t)" in str(r) and "a person decides now" in str(r)
               and not limited(str(r)) and not L.verdict)
-        check("...and the review it never got is given back while the WALL is written down in its place: the change is "
-              "not left owing money that bought no verdict — that is what refuses the re-run a person makes after "
-              "raising the cap — and the cap it died at is on the record with the head and the cost",
+        check("...and the reviews it never got are given back while the WALL is written down in their place — the "
+              "relaunch's, with the first kept beside it (`again`): the change is not left owing money that bought no "
+              "verdict, and the cap it died at is on the record with the head and the cost",
               root_work("myrepo", 7).get("reviews") == 0 and not root_work("myrepo", 7).get("repairs")
-              and root_work("myrepo", 7).get("wall") == {"head": HEAD, "cap": review_caps()[0], "cost": "$3.00",
-                                                         "turns": 35, "hit": "error_max_budget_usd",
-                                                         "was": REVIEW_BUDGET})
+              and root_work("myrepo", 7).get("wall") == {"head": HEAD, "cap": "$6/40t", "cost": "$3.00",
+                                                         "turns": 35, "hit": "error_max_budget_usd", "was": "6",
+                                                         "again": {"cap": "$3/40t", "cost": "$3.00", "turns": 35,
+                                                                   "hit": "error_max_budget_usd"}})
         L = fresh(pr=7)
         world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
         world[f"{CLAUDE} -p"] = (0, RANOUT("error_max_turns", cost=1.2, turns=40))
         r = caught(L.review)
-        check("...and running out of TURNS is the same outcome by the other cap, and the command it hands over "
-              "raises THAT cap and not the money — #194 stopped on the money at 35 of 40 turns, so the two are one "
-              "wall in two units and the remedy has to name the unit that ran out",
-              exhausted(str(r)) and "CC_LAND_REVIEW_TURNS=80" in str(r) and "CC_LAND_REVIEW_BUDGET=" not in str(r)
+        check("...and running out of TURNS is the same outcome by the other cap: the relaunch doubles the TURNS and "
+              "the money stands, and the command handed over raises THAT cap and not the money — #194 stopped on "
+              "the money at 35 of 40 turns, so the two are one wall in two units and the remedy has to name the "
+              "unit that ran out",
+              capped() == [("3", "40"), ("3", "80")]
+              and exhausted(str(r)) and "CC_LAND_REVIEW_TURNS=160" in str(r) and "CC_LAND_REVIEW_BUDGET=" not in str(r)
               and "$1.20" in str(r) and root_work("myrepo", 7).get("reviews") == 0
-              and root_work("myrepo", 7)["wall"]["hit"] == "error_max_turns")
+              and root_work("myrepo", 7)["wall"]["hit"] == "error_max_turns"
+              and root_work("myrepo", 7)["wall"]["was"] == "80")
+        # …and the control for the relaunch: a review that walls once and READS on the relaunch is a verdict like any
+        # other, bought once (the wall's buy given back, the relaunch's counted), the wall left on the record for the tally.
+        L = fresh(pr=7)
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        answers = iter([(0, RANOUT()), (0, REVIEWED("LAND"))])
+        world[f"{CLAUDE} -p"] = lambda a: next(answers)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = caught(L.review)
+        check("...and a relaunch that READS is the verdict: LAND at the doubled cap, one review counted for the change, "
+              "no second wall and nobody paged",
+              capped() == [("3", "40"), ("6", "40")] and "LAND on PR #7" in str(r) and L.verdict == "LAND"
+              and root_work("myrepo", 7).get("reviews") == 1 and len(commented()) == 1)
         L = fresh(pr=7)                       # this case builds its own wall rather than inherit the one above
         world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
         world[f"{CLAUDE} -p"] = (0, RANOUT())
         caught(L.review)
         r = caught(relanding().review)
-        check("the same head at the same cap is then refused BEFORE the model is asked: the cap is spent once per "
-              "CHANGE, not once per queue attempt — #194 was queued again an hour later and would have bought the "
-              "identical nothing for the identical $3",
-              exhausted(str(r)) and "already spent $3.00" in str(r) and "read nothing" in str(r)
-              and len([c for c in calls if c[0] == CLAUDE]) == 1)
+        check("the same head at the same cap is then refused BEFORE the model is asked — the wall it names is the "
+              "relaunch's, and the raise it names is past THAT: the cap is spent once per CHANGE, not once per queue "
+              "attempt — #194 was queued again an hour later and would have bought the identical nothing for the "
+              "identical $3",
+              exhausted(str(r)) and "already spent $3.00 at $6/40t" in str(r) and "read nothing" in str(r)
+              and "CC_LAND_REVIEW_BUDGET=12" in str(r) and len([c for c in calls if c[0] == CLAUDE]) == 2)
         real_budget = REVIEW_BUDGET
         L = fresh(pr=7)                       # …and its own again: what a RAISED cap does to a wall is this case, so
         world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")     # the wall it needs is built here, not inherited
@@ -1090,12 +1185,12 @@ def selfcheck():
             world[f"{CLAUDE} -p"] = (0, REVIEWED("LAND"))
             r = caught(relanding().review)
             raised = [c for c in calls if c[0] == CLAUDE][-1]
-            check("...and raising a cap is what re-opens it: the wall stays written against the cap it HIT, which is "
-                  "what makes a different cap a different question — the run the old one refused is bought at the new "
-                  "number, and nobody edited this file to get a big diff read",
-                  "LAND on PR #7" in str(r) and len([c for c in calls if c[0] == CLAUDE]) == 2
+            check("...and raising a cap past the relaunch's is what re-opens it: the wall stays written against the "
+                  "cap it HIT, which is what makes a different cap a different question — the run the old one refused "
+                  "is bought at the new number, and nobody edited this file to get a big diff read",
+                  "LAND on PR #7" in str(r) and len([c for c in calls if c[0] == CLAUDE]) == 3
                   and raised[raised.index("--max-budget-usd") + 1] == REVIEW_BUDGET != real_budget
-                  and root_work("myrepo", 7)["wall"]["cap"] == f"${real_budget}/{REVIEW_TURNS}t")
+                  and root_work("myrepo", 7)["wall"]["cap"] == f"$6/{REVIEW_TURNS}t")
         finally:
             globals()["REVIEW_BUDGET"] = real_budget
         L = fresh(pr=7)                       # …and its own once more: --re-review is the OTHER way past a wall
@@ -1104,11 +1199,34 @@ def selfcheck():
         caught(L.review)
         r = caught(relanding(re_review=True).review)
         asked = [c for c in calls if c[0] == CLAUDE][-1]
-        check("...while --re-review buys it at the SAME cap the run without the flag was just refused at: that flag is "
-              "a person deciding to spend, which this bound has never been in the way of, and they were told the price "
-              "and the answer",
-              exhausted(str(r)) and len([c for c in calls if c[0] == CLAUDE]) == 2
+        check("...while --re-review buys it at the SAME cap the run without the flag was just refused at, and ONCE: "
+              "that flag is a person deciding to spend, which this bound has never been in the way of; a head the box "
+              "has already relaunched once gets no second relaunch on their run, and they were told the price and "
+              "the answer",
+              exhausted(str(r)) and len([c for c in calls if c[0] == CLAUDE]) == 3
               and asked[asked.index("--max-budget-usd") + 1] == REVIEW_BUDGET == real_budget)
+        # …and a person's raise that walls TOO keeps the head relaunched on the record. Review of #547: the wall a
+        # person's run wrote carried no `again`, so their NEXT raise read as a head never relaunched and the box
+        # bought a second automatic relaunch at double their number — $3 walls, box at $6 walls, person's $12 walls,
+        # person's $24 walls, then $48 unasked. Four walls, four model calls, never a fifth.
+        L = fresh(pr=7)
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world[f"{CLAUDE} -p"] = (0, RANOUT())
+        caught(L.review)                      # $3 walls, the box relaunches at $6, that walls: two calls
+        try:
+            globals()["REVIEW_BUDGET"] = "12"
+            r12 = caught(relanding().review)  # the person's raise walls: one call, no relaunch (relaunched already)
+            globals()["REVIEW_BUDGET"] = "24"
+            r24 = caught(relanding().review)  # their next raise: one call at their number — not a relaunch at $48
+            check("a person's raise that walls too leaves the head RELAUNCHED on the record: their next raise buys one "
+                  "run at their number and no automatic relaunch at double it — $3, the box's $6, their $12, their "
+                  "$24: four walls, four model calls, and a person still decides",
+                  capped() == [("3", "40"), ("6", "40"), ("12", "40"), ("24", "40")]
+                  and exhausted(str(r12)) and "Run twice at this head" in str(r12)
+                  and exhausted(str(r24)) and "Run twice at this head" in str(r24)
+                  and root_work("myrepo", 7)["wall"].get("again") and root_work("myrepo", 7)["wall"]["was"] == "24")
+        finally:
+            globals()["REVIEW_BUDGET"] = real_budget
 
         L = fresh(pr=7)                       # a TURN wall of this case's own: the money is not what stopped it
         world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
@@ -1120,20 +1238,25 @@ def selfcheck():
             r = caught(relanding().review)
             check("a wall is remembered against the cap that BOUND, so raising the OTHER one does not re-open it: a "
                   "turn stop answered with more money buys the identical run and stops at the identical turn having "
-                  "read nothing, for more money — and the refusal still points at the cap that did stop it",
-                  exhausted(str(r)) and "CC_LAND_REVIEW_TURNS=80" in str(r) and "the turn cap stopped it" in str(r)
-                  and len([c for c in calls if c[0] == CLAUDE]) == 1)
+                  "read nothing, for more money — and the refusal still points at the cap that did stop it, past the "
+                  "relaunch's own doubling of it",
+                  exhausted(str(r)) and "CC_LAND_REVIEW_TURNS=160" in str(r) and "the turn cap stopped it" in str(r)
+                  and len([c for c in calls if c[0] == CLAUDE]) == 2)
         finally:
             globals()["REVIEW_BUDGET"] = real_budget
         try:
-            globals()["REVIEW_TURNS"] = "80"      # …and now the one that did, which is what the message asked for
+            globals()["REVIEW_TURNS"] = "80"      # …the relaunch's own number, which the box already bought and which
+            r = caught(relanding().review)        # the message therefore does NOT name: still the same run
+            stood = exhausted(str(r)) and len([c for c in calls if c[0] == CLAUDE]) == 2
+            globals()["REVIEW_TURNS"] = "160"     # …and now the one the message named
             world[f"{CLAUDE} -p"] = (0, REVIEWED("LAND"))
             r = caught(relanding().review)
             asked = [c for c in calls if c[0] == CLAUDE][-1]
-            check("...while raising the cap that DID stop it re-opens that head at the new number: it is the only "
+            check("...while raising the cap that DID stop it PAST the relaunch's re-opens that head at the new number: "
+                  "the relaunch's own number is a run already bought and still refused; the doubled one is the only "
                   "change to the environment that makes the next run a different run, which is why it is the one the "
                   "message names",
-                  "LAND on PR #7" in str(r) and len([c for c in calls if c[0] == CLAUDE]) == 2
+                  stood and "LAND on PR #7" in str(r) and len([c for c in calls if c[0] == CLAUDE]) == 3
                   and asked[asked.index("--max-turns") + 1] == REVIEW_TURNS != real_turns)
         finally:
             globals()["REVIEW_TURNS"] = real_turns
@@ -1346,6 +1469,14 @@ def selfcheck():
           and "1 review(s)" in str(again_r) and "0 repair round(s)" in str(again_r) and NEXT[:12] in str(again_r)
           and "record myrepo 7 LAND --by" in str(again_r)
           and "--no-review" in str(again_r) and "--re-review" in str(again_r))
+    # …and in an order the seat can act on. On #521 (2026-09-19 01:42Z) the message named `record … LAND` first; the
+    # planning seat ran exactly that and the classifier refused it as self-approval, so its read was thrown away and
+    # a third review bought. The route a seat takes on its own — --re-review — is named FIRST, and the record is a
+    # person's, said so. The text changes; the classifier does not.
+    check("...and the first route it names is the one the seat can take — `myrepo 7 --re-review` before `record`, "
+          "which is a PERSON's route and is said to be refused to the seat as self-approval",
+          str(again_r).index("myrepo 7 --re-review") < str(again_r).index("record myrepo 7 LAND")
+          and "self-approval" in str(again_r) and "PERSON who read the diff" in str(again_r))
     check("...and the tally is the CHANGE's, not the job's: one review counted, and the refusal counted nothing "
           "(a head that was never read cost nothing to refuse)",
           root_work("myrepo", 7).get("reviews") == 1)
@@ -1422,9 +1553,48 @@ def selfcheck():
     world["gh pr view 7 --json comments"] = (0, json.dumps({"comments": []}))
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         caught(L.gates); caught(L.review); L.merge()
-    check("and a tally is spent history the moment the change is IN: the merge drops it, so a PR number GitHub "
-          "hands out again starts on a clean one rather than on an abandoned branch's arithmetic",
-          ran("gh pr merge") and not os.path.exists(root_path("myrepo", 7)) and not root_work("myrepo", 7))
+    kept = read_json(root_path("myrepo", 7)) or {}
+    check("and a tally is spent history the moment the change is IN: the merge stamps it `merged` and leaves it at "
+          "the path cc-lib indexes as the landing record, counters intact — what a landed PR bought is auditable "
+          "after the merge (until 2026-09-19 the merge unlinked the only record of it) — while it bounds nothing: "
+          "a PR number GitHub hands out again starts clean rather than on an abandoned branch's arithmetic",
+          ran("gh pr merge") and kept.get("merged") and kept.get("reviews") == 9 and kept.get("repairs") == 9
+          and not root_work("myrepo", 7))
+    # …and nothing overwrites it afterwards: a late mark on a merged change (a doomed head, a repair count) is not a
+    # spend, and the sweep that retires abandoned tallies leaves a merged one where it is, however old.
+    root_spend("myrepo", 7, reviews=1, doomed={"head": HEAD, "why": "late"})
+    os.utime(root_path("myrepo", 7), (time.time() - ROOT_TTL - 3600,) * 2)
+    sweep_records()
+    kept2 = read_json(root_path("myrepo", 7)) or {}
+    check("...and the merged record is not overwritten by a later spend on that PR, nor retired by the sweep past "
+          "ROOT_TTL: it is the landing's record now, not a bound",
+          kept2 == kept and os.path.exists(root_path("myrepo", 7)))
+    # …and the control the sweep still has to pass: an abandoned tally past ROOT_TTL, never merged, does go.
+    root_spend("myrepo", 8, reviews=1)
+    os.utime(root_path("myrepo", 8), (time.time() - ROOT_TTL - 3600,) * 2)
+    sweep_records()
+    check("...while an abandoned tally past ROOT_TTL — never merged — is still retired by the same sweep",
+          not os.path.exists(root_path("myrepo", 8)))
+    # …and CLOSED is not merged. gh answers "is closed" to a merge of a PR somebody closed under the landing; the
+    # `merged` stamp there (review of #547) would have retired that PR's tally for good — reopened, it would count
+    # no review, wall or doomed mark ever again and re-buy the same read on every attempt, the loop the tally is for.
+    def closed_under(state):
+        L = fresh(pr=7)
+        root_spend("myrepo", 7, reviews=1)
+        world["gh pr merge"] = (1, "X Pull request #7 is closed\n")
+        world["gh pr view 7 --json state,mergedAt"] = (0, json.dumps({"state": state, "mergedAt": None}))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            L.merge()
+        return read_json(root_path("myrepo", 7)) or {}
+    j = closed_under("CLOSED")
+    root_spend("myrepo", 7, reviews=1)
+    check("a PR gh calls closed that GitHub does not call MERGED is not in: its tally is not stamped `merged` and "
+          "keeps counting — a review bought after the reopen is the change's second, bounded as before",
+          not j.get("merged") and j.get("reviews") == 1 and root_work("myrepo", 7).get("reviews") == 2)
+    j = closed_under("MERGED")
+    check("...and the control: closed because it MERGED (a second merge overlapped, GitHub says it is in) is stamped "
+          "as any merge is",
+          j.get("merged") and not root_work("myrepo", 7))
 
     # 2. a red gate refuses to merge, and refuses to deploy — the whole reason they run first
     L = fresh(pr=7)
@@ -2797,6 +2967,62 @@ def selfcheck():
         return [c for c in calls if c[:3] == ["gh", "pr", "merge"]]
 
     try:
+        # Q0. ONE LANDING PER PR (pr_lock). #496 (2026-09-16 06:58Z): the queue's own landing and a hand --re-review
+        # ran together, each paying the gates and a $3 review; #501 the same day: two seats answered one stop
+        # notification inside 45 s, and the second checked the job file (gone) but not for a live lander. The lock is
+        # the PR's, taken before a gate or a read, by the direct path and the queue's alike; the second arrival is
+        # told who holds it — pid, since, caps, flags — and buys nothing. Held here from THIS process on a second
+        # descriptor, which flock refuses exactly as another process's would be.
+        def other_lander(flags="--re-review"):
+            held = pr_lock("myrepo", 7, flags)
+            held.take()
+            return held
+        L = fresh(pr=7)
+        reached = []
+        L.gates = lambda: (reached.append("gates"), "gated")[1]
+        L.review = lambda: (reached.append("review"), "read")[1]
+        held = other_lander()
+        said = io.StringIO()
+        with contextlib.redirect_stdout(said), contextlib.redirect_stderr(io.StringIO()):
+            rc = L.run()
+        check("Q0: a second landing on a PR another landing already holds exits saying so — who holds it, since when, "
+              "at what caps and with what flags — having bought nothing: no gate, no read, no merge, nothing counted",
+              rc == 1 and not reached and "already being landed by pid" in said.getvalue()
+              and f"pid {os.getpid()}" in said.getvalue() and "--re-review" in said.getvalue()
+              and review_caps()[0] in said.getvalue() and not ran("gh pr merge") and not root_work("myrepo", 7))
+        held.release()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            L.run()
+        probe = pr_lock("myrepo", 7)
+        free = probe.take() == ""
+        probe.release()
+        check("...and the control: with the PR free the same landing takes it and runs its gates and its read — and "
+              "gives it back at the end, so the next landing of that PR is not refused by a ghost",
+              reached[:2] == ["gates", "review"] and free)
+        fresh(pr=7)
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world["git merge-base"] = (0, MB + "\n")
+        write_atomic(job_path("myrepo", 7), {"repo": "myrepo", "pr": 7, "queued_at": stamp()})
+        held = other_lander("")
+        line = quiet(run_one, job_path("myrepo", 7))
+        job = read_json(job_path("myrepo", 7)) or {}
+        check("Q0 queue: the queue's job finds its PR held by a hand landing and does not try it — no try counted, no "
+              "checkout, no read — says who holds it, and looks again in 15 min, by when that landing has merged it "
+              "(this job then deploys) or said why not",
+              "already being landed by pid" in line and "looks again in 15 min" in line and not job.get("attempts")
+              and job.get("not_before") and not ran("git worktree add") and not [c for c in calls if c[0] == CLAUDE])
+        held.release()
+        job_set(job_path("myrepo", 7), job, not_before=None)
+        quiet(run_one, job_path("myrepo", 7))
+        probe = pr_lock("myrepo", 7)
+        free = probe.take() == ""
+        probe.release()
+        check("...and the control: on the next look with the PR free, the same job is tried — the read is bought — "
+              "and the lock the worker took for it is given back when the job ends, the worker living on",
+              [c for c in calls if c[0] == CLAUDE] and free)
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))
+
         # Q1-Q5: both host callers share cmd_queue, and only the path-based grant can authorize it.
         rec = {"task_id": "fixture", "pr_url": "https://example.test/o/r/pull/7", "card": {"chat": "fixture", "ts": "1.2"},
                "errors": [], "pending": {}, "closed": None}
@@ -4979,6 +5205,36 @@ def selfcheck():
         rc, said = mrun(L)
         check("M4: ...and yesterday's does not — the day reset is the reset the stop names",
               rc == 0 and ((read_json(member_spend()) or {}).get(H) or {}) == {"day": today, "usd": float(REVIEW_BUDGET)})
+        # …and the RELAUNCH is a buy the cap has to see too (review of #547). A review that walls is run once more at
+        # the doubled cap by the landing itself, and that run was charged to nobody: a workspace at $17 of its $20
+        # booked $3 for the read that walled and then spent up to $6 more unbooked, ending the head at $26 against a
+        # $20/day cap — the bound this pre-check exists to hold, broken by the one path that spends twice.
+        one, two = float(REVIEW_BUDGET), float(REVIEW_BUDGET) * 2
+        L = mland(**{f"{BIN}/cc-config get MEMBER_DAILY_USD": (0, "20\n"), f"{CLAUDE} -p": (0, RANOUT())})
+        write_atomic(member_spend(), {H: {"day": today, "usd": round(20 - one, 2)}})
+        rc, said = mrun(L)
+        led = (read_json(member_spend()) or {}).get(H) or {}
+        check("M4: a review that WALLS is relaunched at the doubled cap, and that second run is charged before it goes: "
+              "a workspace with room for the first read and not the relaunch is asked for the model ONCE and stopped "
+              "in the usage-limit shape naming the doubled ask, so run_job defers the head to the day's reset instead "
+              "— the day ends at the cap, never at the cap plus a relaunch nobody booked",
+              rc == 1 and limited(L.why) and len(asked_model()) == 1 and not ran("gh pr merge")
+              and f"this review asks ${two:.2f}" in L.why and "MEMBER_DAILY_USD" in L.why
+              and re.search(r"usage limit until 00:00Z \(\d+m left\) ", L.why)
+              and led == {"day": today, "usd": 20.0}
+              and "run once more at CC_LAND_REVIEW_BUDGET" not in said)
+        check("M4: ...and the wall of the read that DID run is on the record with its buy given back, so the deferred "
+              "run finds the head owing nothing and a person's raise past that cap is still the way past it",
+              not root_work(MR, 7).get("reviews") and root_work(MR, 7)["wall"]["head"] == HEAD
+              and not root_work(MR, 7)["wall"].get("again") and root_work(MR, 7)["wall"]["cost"] == "$3.00")
+        L = mland(**{f"{BIN}/cc-config get MEMBER_DAILY_USD": (0, "20\n"), f"{CLAUDE} -p": (0, RANOUT())})
+        write_atomic(member_spend(), {H: {"day": today, "usd": round(20 - one - two, 2)}})
+        rc, said = mrun(L)
+        check("M4: ...and the control — room for BOTH runs and the relaunch happens, charged: two model calls, the "
+              "workspace's day at the cap it agreed to, and the wall that stops it is the relaunch's own",
+              rc == 1 and len(asked_model()) == 2 and not limited(L.why)
+              and ((read_json(member_spend()) or {}).get(H) or {}) == {"day": today, "usd": 20.0}
+              and "a person decides now" in L.why)
 
         # where it is said
         calls.clear()
@@ -5110,6 +5366,14 @@ def selfcheck():
               "with its ids, with nothing left for the ask to re-read",
               "landing record (review tally)" in o and "finding" in o and "myrepo#4242" in o and "zebrafish" in o
               and "OUTCOME answered" in o and "re-read" not in o)
+        # …and the merge does not take it out of the library: root_done stamps the record `merged` in place (until
+        # 2026-09-19 it unlinked it), so the same ask after the PR is in still finds what the change bought.
+        root_done("myrepo", 4242)
+        o2 = subprocess.run([lib, "ask", "--object", "myrepo#4242", "--need", "current"], capture_output=True, text=True, timeout=60).stdout
+        check("...and the same ask after the merge still finds it: the tally survives the landing, stamped merged, at the "
+              "path the library indexes — what a landed PR bought is auditable",
+              (read_json(root_path("myrepo", 4242)) or {}).get("merged") and "myrepo#4242" in o2 and "zebrafish" in o2
+              and "landing record (review tally)" in o2)
     finally:
         globals().update(LANDQ=_fl)
 
