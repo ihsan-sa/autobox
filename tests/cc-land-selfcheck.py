@@ -2837,7 +2837,11 @@ def selfcheck():
         seen = {}
         for _ in range(250):     # both have to have finished exec'ing, or the case proves nothing about either
             seen = {pid: (argv, exe) for pid, argv, _u, exe in REAL["live_processes"]()}
-            if os.path.basename(seen.get(decoy.pid, ([], ""))[1]) == "sleep" and kid.pid in seen:
+            k_argv = seen.get(kid.pid, ([], ""))[0]
+            # the served script goes env → bash, and for a beat its exe is already bash while its command line is still
+            # env's — repo_program reads argv[:2] and finds no file of the tree there. Wait for bash to own argv[0], or
+            # the case races its own child (2026-09-20: red four runs out of four on the box, green half a second later).
+            if os.path.basename(seen.get(decoy.pid, ([], ""))[1]) == "sleep" and k_argv and os.path.basename(k_argv[0]) == "bash":
                 break
             time.sleep(0.02)
         k_argv, k_exe = seen.get(kid.pid, ([], ""))
