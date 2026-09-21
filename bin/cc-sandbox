@@ -128,7 +128,7 @@
 #   and both run silent. sudo has a second wall behind it (cc-guard); egress has none. So egress is not
 #   contained here and this does not claim to contain it: it is contained when stage 1b (ccbox, an allowlist proxy)
 #   exists. His file is read, never written, and never edited by this box — the paragraph at SBX_ALLOW says why each
-#   way round.
+#   way round. DENIED in there: the Artifact tool (SBX_DENY), added to his deny even when his file lacks it.
 # INSIDE ro: ~/bin and the bin it links into · ~/mail (core/mail, the target of ~/bin/cc-mail) · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
 #   · ~/.cc/github-deny and ~/.cc/github-deny.gitconfig when the host has them (the GitHub orgs the box may not touch: cc-github-deny)
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
@@ -205,6 +205,11 @@ slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.cla
 # from `--settings` and silently matches nothing from ~/.claude/settings.json, so the wildcard is spelled out here and
 # the file rules carry the same `//**` his own `Read` rule does. Re-measure before changing a specifier.
 SBX_ALLOW='["Bash(*)","Read(//**)","Edit(//**)","Write(//**)","NotebookEdit(//**)","mcp__cc-slack__history","mcp__cc-slack__thread"]'
+# SBX_DENY: no session in a workspace has the Artifact tool. An Artifact is private to the claude.ai account that made
+# it, and the owner runs the box under several, so a link to one is dead for him and every member (owner, 2026-09-21).
+# Appended to his deny whatever his file says, for the owner's own workspace too; a deliverable goes as a file in the
+# thread, the channel canvas or docs/ instead.
+SBX_DENY='["Artifact"]'
 SBX_ASK='["Bash(sudo:*)","Bash(curl:*)","Bash(wget:*)","Bash(nc:*)","Bash(ncat:*)","Bash(netcat:*)","Bash(telnet:*)","Bash(socat:*)","Bash(ssh:*)","Bash(scp:*)","Bash(sftp:*)","WebFetch","WebSearch"]'
 settings_copy(){   # $1 "" | owner → stdout: the settings.json the sealed session sees. Read-only in there; his own file is never written.
   # rc 1 = NO copy, and the caller then binds his file unchanged and says the baseline is not applied. THE MERGE CAN
@@ -230,11 +235,12 @@ settings_copy(){   # $1 "" | owner → stdout: the settings.json the sealed sess
   if ! jq -e . "$s" >/dev/null 2>&1; then
     echo "cc-sandbox: ~/.claude/settings.json does not parse." >&2   # the reason; settings_bind prints the consequence
     return 1; fi
-  jq --argjson a "$SBX_ALLOW" --argjson k "$k" \
+  jq --argjson a "$SBX_ALLOW" --argjson k "$k" --argjson d "$SBX_DENY" \
      '. + {permissions: ((.permissions // {}) + {
             allow: ((.permissions.allow // []) + ($a - (.permissions.allow // []))),
+            deny:  ((.permissions.deny  // []) + ($d - (.permissions.deny  // []))),
             ask:   ((.permissions.ask   // []) + ($k - (.permissions.ask   // [])))})}' "$s" \
-    || { echo "cc-sandbox: the sealed-session baseline would not merge into ~/.claude/settings.json — is permissions.allow or permissions.ask something other than a list?" >&2; return 1; }; }
+    || { echo "cc-sandbox: the sealed-session baseline would not merge into ~/.claude/settings.json — is permissions.allow, .deny or .ask something other than a list?" >&2; return 1; }; }
 settings_bind(){   # $1 a host dir NO bind of this boundary reaches · $2 "" | owner (settings_copy's) · [$3 where the copy is seen inside, default his path] → put the copy there and mount it ro
   # It has to be a REAL FILE ON THE HOST, ro-bound like any other path. Measured 2026-09-02: handed in over an fd
   # (`--ro-bind-data`, `--file`) the copy is readable inside — jq reads it — and claude applies NONE of it, his own
@@ -1538,6 +1544,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
     echo his=$(jq -r "[.permissions.allow[0],.permissions.deny[0],.permissions.ask[0],.theme,.hooks.PreToolUse[0].hooks[0].command]|join(\"|\")" $s)
     echo keys=$(jq -r "keys|join(\",\")" $s)
     echo askn=$(jq -r ".permissions.ask|length" $s)
+    echo noartifact=$(jq -r "[.permissions.deny[0],(.permissions.deny|index(\"Artifact\")!=null),(.permissions.deny|length)]|join(\",\")" $s)
     echo ro=$( (echo x >> $s) 2>/dev/null && echo writable || echo ro)'
   out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
   t 'baseline: inside a member workspace, what the boundary contains is silent — Bash, Write, and reading its own Slack channel' \
@@ -1555,6 +1562,10 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
     "$(g his)/$(g keys)" 'Bash(hisown *)|Bash(tmux kill-server:*)|Bash(sudo tee *)|ownr-theme|$HOME/bin/cc-guard/hooks,permissions,theme'
   # A SESSION THAT COULD REWRITE ITS OWN settings.json COULD UNREGISTER cc-guard FROM IT: the ro comes from the mount.
   t 'baseline: the copy is read-only inside — no session grants itself permissions or drops the hook gates' "$(g ro)" ro
+  # "a member workspace session is born without it": his fixture's deny has no Artifact, the copy's does, his own
+  # deny entry stays first and nothing else is added.
+  t 'baseline: a member workspace denies the Artifact tool even when his own file does not, and keeps his deny' \
+    "$(g noartifact)" 'Bash(tmux kill-server:*),true,2'
   # ── A MEMBER'S WORKSPACE KEEPS EVERY ASK: the whole of SBX_ASK on top of his one, counted against the list itself,
   #    so the owner cases below are read against a number and not against four of thirteen entries.
   t 'baseline: a member workspace carries every entry of SBX_ASK on top of his own' "$(g askn)" "$((1 + $(jq length <<<"$SBX_ASK")))"

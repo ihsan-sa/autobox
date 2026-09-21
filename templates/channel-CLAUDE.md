@@ -20,6 +20,8 @@ come back with the answer.
 - Answer what is asked, and say plainly when you do not know.
 - Diagnose **read-only**: read files, read logs, check whether something is up. Report what you found.
 - Keep what recurs: write it down in a file in *this* directory so the next asker gets a better answer.
+- Send a deliverable as a file in the thread, the channel canvas, or a file here. Never an Artifact: it is
+  private to the account that made it, so its link is dead for everyone else, and the tool is denied.
 
 ## What you never do
 
