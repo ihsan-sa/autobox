@@ -3203,6 +3203,8 @@ def mail_seen_line(res, links=None):
                                                     or "its own thread", why, rule))
     if res.get("dropped"):
         return "_dropped — %s. Nothing was delivered.%s_" % (why, rule)
+    if res.get("quiet"):
+        return "_quiet — stored, nothing delivered, nobody told%s_" % rule
     return "_not delivered — %s%s%s_" % (why, cc, rule)
 
 class MailPlaces:
@@ -4847,7 +4849,9 @@ class Daemon:
     def mail_sort(self, mail_id):
         """One stored mail: routed, mirrored, delivered in one verb; reply says which channels, or why not.
         Mirror line posts first (its ts is the thread); a known conversation adds under its root, not new.
-        Vetted once (`vetting.py`): clean delivers, suspicious holds+mentions owner, refused tells sender."""
+        Vetted once (`vetting.py`): clean delivers, suspicious holds+mentions owner, refused tells sender.
+        A mail To a MAIL_QUIET address (router.QUIET) is none of that: `quiet` True, `reply` None, and the
+        receiver sends the sender nothing — the store is the whole delivery."""
         R = mail_router()
         try:
             with open(f"{MAIL_DIR}/inbox/{mail_id}/message.json") as f:
@@ -4855,10 +4859,19 @@ class Daemon:
         except (OSError, ValueError):
             return {"ok": False, "error": "no such mail"}
         dec = R.route(msg, MailPlaces(self), self.cfg.get("MAIL_DOMAIN") or "",
-                      self.cfg.get("MAIL_WORKSPACE") or "", self.cfg.get("MAIL_UNPLACED") or "main")
+                      self.cfg.get("MAIL_WORKSPACE") or "", self.cfg.get("MAIL_UNPLACED") or "main",
+                      self.cfg.get("MAIL_QUIET") or "")
         if dec.refuse:
             log(f"mail {mail_id} from={msg.get('from', '')} rule={dec.rule or '-'}: refused — {dec.refuse}")
             return {"ok": True, "routed": False, "dropped": True, "why": dec.refuse, "reply": dec.refuse,
+                    "rule": dec.rule}
+        if dec.quiet:
+            # THE STORE-ONLY DOOR (router.QUIET). Brief: "the router records the decision as `quiet` and delivers
+            # nothing: no task, no mirror line, no session woken, no reply to the sender" — so this returns before
+            # the vetting read, the conversation record and every say(); `reply` None is what the receiver sends
+            # nothing for. The log line and the seen line are the record.
+            log(f"mail {mail_id} from={msg.get('from', '')} rule={dec.rule}: quiet — stored, delivered nowhere")
+            return {"ok": True, "routed": False, "quiet": True, "why": "a store-only address", "reply": None,
                     "rule": dec.rule}
         rec = R.join_conv(dec.conv, msg) if dec.conv else R.new_conv(msg, dec.workspace)
         # the rule that placed it is kept on the conversation record (from the first mail only, a reply follows the thread and never rewrites it), the log line and the seen line, so an unmatched address's landing is traceable

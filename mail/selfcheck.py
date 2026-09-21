@@ -2540,6 +2540,135 @@ def run():
         finally:
             os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
 
+    # ------------------------------------------- 20b. the quiet door: a store-only address (owner, 2026-09-20)
+    # Brief: "a quiet To delivers nothing and logs `quiet`, a Cc of a quiet address changes nothing, home@ and
+    # <channel>@ behave exactly as before, and a quiet address from a NON-allow-listed sender is refused exactly
+    # as any other (the allow-list runs first — a quiet door is not an open one)". Each case is its own mail
+    # through the real door; the router is handed MAIL_QUIET the way the daemon hands it, as the raw string.
+    QUIET = "study, Archive@box.example"
+    k(router.quiet_names(QUIET) == {"study", "archive"} and router.quiet_names("") == set()
+      and router.quiet_names("home archive") == {"archive"},
+      "MAIL_QUIET splits on commas or spaces, lower-cases, takes the local part of a full address, and never "
+      "makes home@ quiet")
+    with Box(allow=",".join([ALLOWED, OWNER, STRANGER]), MAIL_RATE=500) as b:
+        os.environ["CC_MAIL_ROUTE_FAKE"] = ""
+        try:
+            def to(rcpt, sender=ALLOWED, **kw):
+                return arrived(b, sender, rcpt=rcpt + "@box.example", to=rcpt + "@box.example", **kw)
+
+            # (a) a quiet To: the whole decision is `quiet` — nothing placed, nothing refused, nobody looked up
+            d = Dir()
+            dec = router.route(to("study"), d, "box.example", quiet=QUIET)
+            k(dec.quiet and dec.rule == "quiet" and not dec.refuse and not dec.to and not dec.cc
+              and not dec.question and not dec.offer and dec.workspace == "",
+              "a mail To a quiet address is decided `quiet`: no channel, no refusal, no question, no workspace")
+            k(d.asked == [],
+              "…and nothing was looked up for it — no workspace, no channel: the store is the whole delivery")
+            dec = router.route(to("archive", OWNER, headers={"Cc": "mem@box.example, home@box.example"}), Dir(),
+                               "box.example", quiet=QUIET)
+            k(dec.quiet and dec.rule == "quiet" and not dec.to and not dec.cc,
+              "…a quiet To makes the mail quiet whatever else it names — a channel or home@ Cc'd beside it "
+              "is not delivered either")
+            dec = router.route(to("study", STRANGER), Dir(), "box.example", quiet=QUIET)
+            k(dec.quiet and dec.rule == "quiet" and not dec.to,
+              "…and a sender the door trusts but no row places is quiet too, not the owner's unplaced mail: "
+              "the door needs no workspace")
+
+            # (b) a quiet Cc changes nothing: the same mail with and without it decides the same
+            base = router.route(to("mem--site"), Dir(), "box.example", quiet=QUIET)
+            withcc = router.route(arrived(b, ALLOWED, rcpt="mem--site@box.example", to="mem--site@box.example",
+                                          headers={"Cc": "study@box.example"}), Dir(), "box.example", quiet=QUIET)
+            k(not withcc.quiet and withcc.rule == base.rule == "named"
+              and [p.name for p in withcc.to] == [p.name for p in base.to] == ["mem--site"]
+              and withcc.cc == base.cc == [],
+              "a Cc of a quiet address changes nothing: the mail is placed exactly as it is without it")
+            withcc = router.route(arrived(b, ALLOWED, headers={"Cc": "study@box.example"}), Dir(), "box.example",
+                                  quiet=QUIET)
+            k(not withcc.quiet and withcc.rule == "unsure" and [p.name for p in withcc.to] == ["mem"],
+              "…and a home@ mail with a quiet Cc is the classifier's, as without it")
+
+            # (c) the two doors already there behave exactly as before with MAIL_QUIET set
+            dec = router.route(to("mem--site"), Dir(), "box.example", quiet=QUIET)
+            k(not dec.quiet and dec.rule == "named" and [p.name for p in dec.to] == ["mem--site"],
+              "with MAIL_QUIET set a mail To a channel address still lands there, rule `named`")
+            dec = router.route(arrived(b, ALLOWED), Dir(), "box.example", quiet=QUIET)
+            k(not dec.quiet and dec.rule == "unsure" and [p.name for p in dec.to] == ["mem"],
+              "…and a home@ mail is still the classifier's, unsure in the sender's main session")
+            dec = router.route(to("nosuch"), Dir(), "box.example", quiet=QUIET)
+            k(not dec.quiet and dec.rule == "no-channel:unsure",
+              "…and a name that is neither a channel nor quiet takes the no-channel path it always took")
+            dec = router.route(to("study"), Dir(), "box.example")
+            k(not dec.quiet and dec.rule == "no-channel:unsure" and [p.name for p in dec.to] == ["mem"],
+              "…with MAIL_QUIET unset the same address is a name no channel has — quiet is configured, never "
+              "assumed")
+
+            # (d) the owner's own `addr=` row still comes first: a word a person set is read before the door
+            dec = router.route(to("study"), Dir(), "box.example", table="%s=" % ALLOWED, quiet=QUIET)
+            k(dec.refuse and not dec.quiet and "placed nowhere" in dec.refuse,
+              "the owner's `addr=` refusal outranks the quiet door: his word is read before any address is")
+
+            # (e) THE ALLOW-LIST RUNS FIRST. A stranger's mail To a quiet address never reaches the router: the
+            # receiver drops it at the door, 403 and nothing said, and nothing is stored — exactly as for any
+            # other address. Outlook "redirect" (the original From kept) lands here; "forward" (From the owner's
+            # own allow-listed address) is what the door is for.
+            before = set(b.ids())
+            code, ans = b.post(eml(frm="notices@piazza.example", to="study@box.example"),
+                               sender="notices@piazza.example", rcpt="study@box.example")
+            k(code == 403 and ans["reply"] is None and set(b.ids()) == before,
+              "a quiet address from a sender NOT on the allow-list is dropped at the door like any other — 403, "
+              "no reply, nothing stored: a quiet door is not an open one")
+            code2, ans2 = b.post(eml(frm="notices@piazza.example", to="mem--site@box.example"),
+                                 sender="notices@piazza.example", rcpt="mem--site@box.example")
+            k((code2, ans2["reply"]) == (code, ans["reply"]),
+              "…and the answer is the same one a channel address gives that sender, so the door tells nothing")
+
+            # (f) THE WIRE: the daemon's `quiet` comes back to the sender as nothing at all — `reply: null`, no
+            # ack line — while a routed mail's reply and ack are unchanged
+            asked = []
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(r.SLACKSOCK)
+            srv.listen(4)
+
+            def quiet_daemon():
+                # answers off the stored mail itself, as the real daemon does: To a quiet address = `quiet`
+                while True:
+                    try:
+                        c, _ = srv.accept()
+                    except OSError:
+                        return
+                    req = json.loads(c.recv(65536).decode().strip())
+                    asked.append(req)
+                    quiet = any(a.startswith("study@") for a in b.mail(req["mail"])["to"])
+                    ans = ({"ok": True, "routed": False, "quiet": True, "reply": None, "rule": "quiet"} if quiet
+                           else {"ok": True, "routed": True, "reply": "Received. It is in #mem--site."})
+                    c.sendall(json.dumps(ans).encode() + b"\n")
+                    c.close()
+            threading.Thread(target=quiet_daemon, daemon=True).start()
+            b.clear()
+            code, ans = b.post(eml(to="study@box.example"), rcpt="study@box.example")
+            lines = b.lines()
+            k(code == 200 and ans["status"] == "stored" and ans["reply"] is None
+              and len(lines) == 1 and " route=quiet " in lines[0],
+              "a stored mail the daemon calls quiet is answered `reply: null` — the worker sends nothing — and the "
+              "request's one log line says route=quiet: %r" % (lines,))
+            b.clear()
+            code2, ans2 = b.post(eml(to="mem--site@box.example"), rcpt="mem--site@box.example")
+            try:
+                with open(outbound.LOGFILE) as f:
+                    acks = [ln for ln in f.read().splitlines() if ": ack to=" in ln]
+            except OSError:
+                acks = []
+            k(code2 == 200 and ans2["reply"] == "Received. It is in #mem--site." and " route=yes " in b.lines()[0]
+              and [ln for ln in acks if ans["id"] in ln] == [] and len([ln for ln in acks if ans2["id"] in ln]) == 1,
+              "…a routed mail beside it is answered with its line and acked as before, and the quiet one has no "
+              "ack line at all: nothing was sent, so nothing is on record as sent: %r" % (acks,))
+            k(asked == [{"mail": ans["id"]}, {"mail": ans2["id"]}],
+              "…and what crossed the socket was the id alone: MAIL_QUIET is the daemon's to read, not this process's")
+            srv.close()
+            os.unlink(r.SLACKSOCK)
+        finally:
+            os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
+
     # ------------------------------- 21. the reply's medium follows the message it answers (owner, 2026-09-10)
     # Brief: "a message the owner sends in Slack gets a Slack reply only, even inside a mail's mirror thread; a
     # message that arrived by mail gets a mail reply; a post that answers nothing in a mail thread stays in

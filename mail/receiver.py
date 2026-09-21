@@ -12,6 +12,14 @@ belongs in and the daemon posts and delivers them. This process holds no Slack t
 The daemon's answer is what the sender hears back, so a refusal ("That address is not one I route") reaches
 them; a daemon that is down costs the delivery and not the mail. See docs/2026-09-08-email.md.
 
+THREE DOORS ON THE BOX'S DOMAIN, all decided by the router once the mail is stored (core/mail/router.py has
+the rules in full): `<channel>@` names a channel, To delivers there and Cc watches; `home@` is the
+classifier's, which picks among the sender's own places; `<quiet>@` — each word of MAIL_QUIET — is a
+STORE-ONLY door: the mail is stored like every other and then nothing happens, no channel, no session, no
+reply to the sender (`reply: null`, as a drop answers), for mail a program reads off the store. Every door is
+behind the same locks below: a quiet address from a sender not on the allow-list is dropped exactly as any
+other address is, since the allow-list runs before any address is read. `status` names the quiet addresses.
+
 BINDING IS THE BOUNDARY. It binds 127.0.0.1, never a public interface, not configurable, so no inbound port is
 open and the tunnel is the only way in. The shared secret is the second lock: a tunnel published without it, or
 any other account on this box, would otherwise be able to POST mail into the inbox. Two locks because they fail
@@ -105,8 +113,10 @@ THE WIRE, which core/mail/inbound-worker.js is written against:
 The answer is always JSON with a `status` and a `reply`. `reply` is either a string the worker relays to the
 sender with message.reply(), or null meaning the worker says nothing:
   200 {"status":"stored","id":…,"reply":…}        it is on disk. `reply` is the router's line when the daemon
-                                                  answered — where it went, or why it went nowhere — and
-                                                  "Received. It is in the queue as <id>." when it did not
+                                                  answered — where it went, or why it went nowhere — "Received.
+                                                  It is in the queue as <id>." when it did not, and null for
+                                                  a mail To a MAIL_QUIET address (stored, nothing sent,
+                                                  nothing delivered)
   401 {"status":"unauthorized","reply":null}      no secret, or the wrong one
   403 {"status":"dropped","reply":null}           the verdict says fail, no authenticated identity, or an
                                                   identity that is not on the allow-list
@@ -187,8 +197,11 @@ it is written on the reload step of the runbook.
       MAIL_WORKSPACE     the owner's override table, `addr=owner` / `addr=<handle>` rows separated by commas
                          or newlines, read by the router before it asks Slack who an address is. A row with an
                          empty value (`addr=`) refuses that address. His word, and it outranks the lookup.
-                         The only key here this process never loads: the daemon reads it, so a change takes
-                         the daemon's restart and not this one's HUP
+                         Read by the daemon, not this process, so a change takes the daemon's restart and
+                         not this one's HUP
+      MAIL_QUIET         the store-only addresses, local parts separated by commas or spaces (`archive` makes
+                         `archive@<domain>` one). Read by the daemon like MAIL_WORKSPACE, so the same restart;
+                         `status` prints it live
       MAIL_ALLOW         the allow-list, comma- or space-separated. Falls back to LESSONS_EMAILS, which is the
                          list the box already keeps of the people it will talk to. An address added here
                          reaches the door on the next HUP or restart, not on the next mail
@@ -671,13 +684,19 @@ def routed(mail_id):
     EVERY FAILURE IS QUIET TOWARDS THE SENDER. No daemon, no socket, a timeout, an answer that is not JSON:
     the line comes back empty and the caller falls to "Received. It is in the queue as <id>.", which is true.
     Routing that did not happen is this box's problem to read in `route=` in the log, not a stranger's to be
-    handed a reason for."""
+    handed a reason for.
+
+    A QUIET MAIL IS ANSWERED WITH NOTHING, AND THAT IS NOT A FAILURE: the daemon's `quiet` (a To on MAIL_QUIET)
+    comes back as None, the one answer that is not a line, and the caller sends the sender no reply at all —
+    an empty line would fall to "Received…", and the store-only door promises the sender hears nothing."""
     try:
         answer = daemon({"mail": mail_id})
     except Exception as e:
         return "", "unreachable %s" % clip(str(e))
     if not answer.get("ok"):
         return "", "failed %s" % clip(str(answer.get("error") or answer))
+    if answer.get("quiet"):
+        return None, "quiet"
     return answer.get("reply") or "", "yes" if answer.get("routed") else "nowhere"
 
 
@@ -879,8 +898,10 @@ class Handler(BaseHTTPRequestHandler):
         self.say("store id=%s from=%s(%s) to=%s bytes=%d attachments=%d auth=%s route=%s subject=%s"
                  % (rec["id"], clip(who), how, clip(rcpt), len(raw), len(rec["attachments"]),
                     rec["auth"]["verdict"], why, clip(rec["subject"])))
-        reply = line or "Received. It is in the queue as %s." % rec["id"]
-        acked(rec["id"], who, reply)
+        # None is the quiet door's answer (routed()): stored, nothing sent, no ack line — the sender hears nothing
+        reply = None if line is None else (line or "Received. It is in the queue as %s." % rec["id"])
+        if reply is not None:
+            acked(rec["id"], who, reply)
         self._json(200, {"status": "stored", "id": rec["id"], "reply": reply})
 
 
@@ -1020,6 +1041,12 @@ def status(_opt=None):
     gaps = blockers()
     print("cc-mail: config %s" % ("ready" if not gaps else "NOT ready: " + "; ".join(gaps)))
     print("cc-mail: domain %s" % (cfg("MAIL_DOMAIN", "") or "(MAIL_DOMAIN not set — a label only, see the runbook)"))
+    # the store-only addresses, read live (this process never loads MAIL_QUIET; the daemon does), as the router splits them
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import router                            # noqa: E402 — a sibling, imported here for its one parser
+    hush = sorted(router.quiet_names(cfg("MAIL_QUIET", "")))
+    print("cc-mail: quiet %s" % (", ".join("%s@%s" % (n, cfg("MAIL_DOMAIN", "") or "<domain>") for n in hush)
+                                 + " (stored, delivered nowhere, no reply)" if hush else "none (MAIL_QUIET unset)"))
     print("cc-mail: store %s (%d mails)"
           % (INBOX, len(os.listdir(INBOX)) if os.path.isdir(INBOX) else 0))
     pid = running()

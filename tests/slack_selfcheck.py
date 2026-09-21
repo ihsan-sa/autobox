@@ -7452,6 +7452,39 @@ def run_selfcheck():
               "the mail is routed and delivered as before, and no reply is attempted into a thread that is not there",
               resM["routed"] and [(c, t) for c, t, _, _ in msaid] == [("C-MEM", None)]
               and [h[0] for h in mhanded] == ["mem"])
+        # THE QUIET DOOR (owner, 2026-09-20): a To on MAIL_QUIET is stored and then nothing — "no task, no mirror
+        # line, no session woken, no reply to the sender" — and the receiver channel's own thread is the one
+        # place it is written down. Its own fixture: the key set for these mails alone, and unset after.
+        dmA.cfg["MAIL_QUIET"] = "study"
+        os.environ["CC_MAIL_VET_FAKE"] = "off-goals"      # a verdict that would HOLD a routed mail — never read here
+        mail_write("Q1", to=["study@box.example"], subject="the forwarded notice", **{"from": "boss@allowed.example"})
+        msaid.clear(); mhanded.clear()
+        resQ = dmA.take_mail("Q1")
+        check("mail: a mail To a quiet address is stored and delivered nowhere — no mirror line in any channel, no "
+              "session handed anything, no conversation, no vetting read (a verdict that would have held it is "
+              "never asked for), reply None so the receiver sends the sender nothing — and the receiver channel's "
+              "line under its arrival post says `quiet · by quiet`",
+              resQ["ok"] and resQ["quiet"] and not resQ["routed"] and resQ["reply"] is None
+              and resQ["rule"] == "quiet"
+              and [(c, t) for c, t, _, _ in msaid] == [("C-SEEN", None), ("C-SEEN", msaid[0][3])]
+              and msaid[-1][2] == "_quiet — stored, nothing delivered, nobody told · by quiet_"
+              and mhanded == [] and not R.load_conv("Q1"))
+        os.environ["CC_MAIL_VET_FAKE"] = "fits|fits"
+        mail_write("Q2", to=["mem@box.example"], cc=["study@box.example"], subject="the watched one")
+        msaid.clear(); mhanded.clear()
+        resQ2 = dmA.take_mail("Q2")
+        check("mail: …a quiet address in Cc changes nothing — the mail is routed, mirrored and handed exactly as "
+              "without it, and the quiet address is in no mirror list",
+              resQ2["routed"] and resQ2["to"] == ["#mem"] and resQ2["cc"] == [] and resQ2["rule"] == "named"
+              and [c for c, _, _, _ in msaid] == ["C-SEEN", "C-MEM", "C-SEEN"] and [h[0] for h in mhanded] == ["mem"])
+        del dmA.cfg["MAIL_QUIET"]
+        mail_write("Q3", to=["study@box.example"], subject="the same address, unset")
+        msaid.clear(); mhanded.clear()
+        resQ3 = dmA.take_mail("Q3")
+        check("mail: …and with MAIL_QUIET unset the same address is a name no channel has, placed by the "
+              "classifier in the sender's main session as it always was — quiet is configured, never assumed",
+              resQ3["routed"] and resQ3["to"] == ["#mem"] and resQ3["rule"] == "no-channel:unsure"
+              and [h[0] for h in mhanded] == ["mem"])
         del dmA.cfg["MAIL_CHANNEL"]
         mail_write("S7", to=["seen@box.example"], subject="the plain one", **{"from": "boss@allowed.example"})
         msaid.clear(); mhanded.clear()

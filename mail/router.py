@@ -6,10 +6,18 @@ message.json and answers one question: which channels does this mail belong in, 
 for. It posts nothing and delivers nothing itself — cc-slack's `mail` socket verb does that, because the token
 and the routing tables are there. Everything here is a decision, which is why it is testable without Slack.
 
-TWO DOORS, ON THE BOX'S MAIL DOMAIN.
+THREE DOORS, ON THE BOX'S MAIL DOMAIN.
   <channel>@<domain>   names a channel outright; the local part IS the channel name (`notes@…` is `#notes`).
                        To = the mail is delivered there as a task, Cc = the mirror line only.
   home@<domain>        goes through the classifier, which picks among the SENDER'S OWN places and nothing else.
+  <quiet>@<domain>     a STORE-ONLY door, one word per address in MAIL_QUIET (`MAIL_QUIET=archive` makes
+                       `archive@…` one): the receiver stores the mail as it stores every mail — allow-list,
+                       verdict, caps, all first, a quiet door is not an open one — and the router's whole
+                       decision is `quiet`: no channel, no mirror line, no session, no vetting read, no reply
+                       to the sender. A quiet address in To makes the mail quiet whatever else it names; in Cc
+                       it counts for nothing and the rest of the addresses decide. For mail a program reads
+                       off the store (owner, 2026-09-20: forwarded course notifications, dozens a week, each
+                       of which was a thread and a woken session).
 A mail with a named To keeps the named channels and does not run the classifier: an address a person typed
 outranks a model's guess. A mail whose only To is home@ is the classifier's either way — a channel Cc'd
 beside it watches, as a Cc does, and does not decide who acts.
@@ -156,15 +164,16 @@ class Decision:
 
     `rule` is the one word saying which rule placed the mail — the ledger's answer to "why is it there":
     `reply`, `named`, `cc-only`, `classified`, `unsure`, `unmapped` for a sender the door trusts and no row
-    places, and the `no-channel:` forms of `classified`/`unsure` (plus
+    places, `quiet` for a mail To a MAIL_QUIET address (stored, nothing else; `quiet` is True on it and
+    nothing else is set), and the `no-channel:` forms of `classified`/`unsure` (plus
     `no-channel:bounce`) for a mail whose To named a channel the sender cannot reach. `note` is one sentence
     for the SENDER about that address, put before the reply they get, and "" when there is nothing to say."""
 
     def __init__(self, refuse="", to=(), cc=(), question="", conv=None, workspace="", offer="", rule="",
-                 note=""):
+                 note="", quiet=False):
         self.refuse, self.to, self.cc = refuse, list(to), list(cc)
         self.question, self.conv, self.workspace, self.offer = question, conv, workspace, offer
-        self.rule, self.note = rule, note
+        self.rule, self.note, self.quiet = rule, note, quiet
 
     @property
     def places(self):
@@ -220,6 +229,19 @@ def workspace_for(sender, table, d):
         if muid and muid == uid:
             return handle
     return None
+
+
+def quiet_names(raw):
+    """The MAIL_QUIET set: local parts, one per word, split on commas, spaces or newlines, lower-cased. A word
+    written with our domain on it (`archive@box.example`) is its local part; `home` is never quiet, since that
+    address is the classifier's by name. Read by route() beside the MAIL_WORKSPACE table, off the same daemon
+    config, so a second quiet address is one more word here and a change is the daemon's restart."""
+    out = set()
+    for w in re.split(r"[,\s]+", (raw or "").lower()):
+        local = w.strip().lstrip("@").partition("@")[0].strip()
+        if local and local != HOME_LOCAL:
+            out.add(local)
+    return out
 
 
 def refused_by_row(sender, table):
@@ -705,7 +727,10 @@ def unmapped_line(sender):
             "in ~/.cc/config places it: `%s=owner`, or `%s=<member handle>`." % (a, a, a))
 
 
-def route(msg, d, domain, table=None, unplaced_to="main"):
+QUIET = "quiet"              # the `rule` of a mail To a MAIL_QUIET address: stored by the receiver, and nothing else
+
+
+def route(msg, d, domain, table=None, unplaced_to="main", quiet=""):
     """The whole decision for one stored mail. Returns a Decision; `refuse` set means nothing else happened.
 
     The order is the boundary. The workspace is settled from the authenticated sender before anything is resolved,
@@ -715,14 +740,27 @@ def route(msg, d, domain, table=None, unplaced_to="main"):
 
     `unplaced_to` is MAIL_UNPLACED: where a mail goes when its To named a channel the sender cannot reach AND
     the classifier could not place it — `main` (the default, and anything that is not the other word) delivers
-    it to the workspace's main session with the question; `bounce` refuses it in one line to the sender."""
+    it to the workspace's main session with the question; `bounce` refuses it in one line to the sender.
+
+    `quiet` is MAIL_QUIET, the store-only addresses (quiet_names). A mail To one of them is decided right after
+    the owner's own `addr=` refusal and before anything is looked up: it needs no workspace (nothing is placed),
+    so no Slack lookup, no thread match and no model runs for it. Brief: "the allow-list runs first — a quiet
+    door is not an open one": the allow-list is receiver.py's and ran before this mail was stored at all; what
+    is decided here is only that a stored mail To a quiet address goes nowhere."""
     rows = overrides(table)
+    if refused_by_row(msg.get("from", ""), rows):
+        # THE OWNER'S OWN "NOT THIS ADDRESS". An `addr=` row is a word a person set: it is read and obeyed
+        # here, never rewritten into a delivery. Refused, in a line that says what happened.
+        return Decision(refuse="This address is placed nowhere on this box, so I did not deliver it.")
+    to_names, cc_names = addressed(msg, domain)
+    hush = quiet_names(quiet)
+    # Brief: "a quiet To delivers nothing and logs `quiet`" — any To on the list, whatever else the mail names;
+    # "a Cc of a quiet address changes nothing" — a quiet Cc is dropped here and the rest decides as before.
+    if any(n in hush for n in to_names):
+        return Decision(rule=QUIET, quiet=True)
+    cc_names = [n for n in cc_names if n not in hush]
     ws = workspace_for(msg.get("from", ""), rows, d)
     if ws is None:
-        if refused_by_row(msg.get("from", ""), rows):
-            # THE OWNER'S OWN "NOT THIS ADDRESS". An `addr=` row is a word a person set: it is read and obeyed
-            # here, never rewritten into a delivery. Refused, in a line that says what happened.
-            return Decision(refuse="This address is placed nowhere on this box, so I did not deliver it.")
         # TRUSTED AT THE DOOR, PLACED BY NOBODY. The owner put this address on MAIL_ALLOW and receiver.py let the
         # mail in on the strength of that, so refusing it here answered an approved sender with the opposite of
         # what the box had decided about them (2026-09-11). It is an unplaced mail and takes the unplaced path:
@@ -744,7 +782,6 @@ def route(msg, d, domain, table=None, unplaced_to="main"):
         return Decision(to=conv_places(rec, "to"), cc=conv_places(rec, "cc"), conv=rec, workspace=ws,
                         rule="reply")
 
-    to_names, cc_names = addressed(msg, domain)
     named = [n for n in to_names + cc_names if n != HOME_LOCAL]
     home = HOME_LOCAL in to_names + cc_names
     if not named and not home:
