@@ -1404,6 +1404,102 @@ def run_selfcheck():
         dmM.on_event(rxevM("UBOT", "white_check_mark"))
         check("the bot's OWN reactions are nobody's verdict — on_reaction drops them before any session hears",
               len(rxvM) == 2 and len(gotM) == n_got)
+
+        # -- A BOX SEAT'S MISSING PERMISSION IS GRANTED FROM SLACK (row a-seat-grant-is-answered-from-slack) --
+        # The seat runs in auto mode: a refused command raised no prompt, so the owner pasted commands at a terminal.
+        # Now the seat raises a 🔐 grant card; only the owner's reply writes, and the writer is the daemon.
+        dmG = Daemon(use_slack=False); dmG.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
+        dmG.bot_user = "UBOT"; dmG.names.update({"CTHREADS": f"{CTL}-threads"}); dmG.threads_chats[CTL] = "CTHREADS"
+        dmG.users.update({"UOWNER": ("The Owner", "owner"), "UMEM": ("Ada", "ada.byron")})
+        saidG, gotG, wroteG = [], [], []
+        dmG.say = lambda chat, text, thread=None: saidG.append((chat, text, thread)) or f"g{len(saidG)}"
+        dmG.deliver = lambda target, payload, **k: gotG.append((target, payload)) or "delivered"
+        dmG.route = lambda chat, ctype=None: {"CTHREADS": CTL}.get(chat)
+        dmG.write_grant = lambda rid, g, by: wroteG.append((rid, g["kind"], g["what"], g.get("sha"), by)) or (True, f"granted: {g['what']}")
+        dmG.card_text = lambda chat, ts: next((t for c, t, th in saidG if c == chat and f"g{saidG.index((c, t, th)) + 1}" == ts), None)   # the card as posted: say() numbered them g1, g2, …
+        devG = tempfile.mkdtemp(prefix="cc-slack-selfcheck-grant-")
+        os.makedirs(f"{devG}/mem1/.cc", exist_ok=True); open(f"{devG}/mem1/{MEMBER_MARKER}", "w").close()
+        os.makedirs(f"{devG}/{CTL}", exist_ok=True)
+        _devG = globals()["DEV"]
+        try:
+            globals()["DEV"] = devG
+            bad_g = [dmG.relay_grant(None, "allow", "Bash(x *)"), dmG.relay_grant("mem1", "allow", "Bash(x *)"),
+                     dmG.relay_grant(CTL, "allow", "Bash(*)"), dmG.relay_grant(CTL, "allow", "rm -rf /"),
+                     dmG.relay_grant(CTL, "unit", "/etc/systemd/system/x.service"), dmG.relay_grant(CTL, "grant", "x")]
+            check("a grant card is refused to: no live session, a member workspace, a bare wildcard, a string that is no "
+                  "Tool(pattern) rule, a unit file outside a repo tree, an unknown kind — and none posted anything",
+                  all(not r["ok"] for r in bad_g) and saidG == [] and dmG.grant_asks == {})
+            r_g = dmG.relay_grant(CTL, "allow", "Bash(cc-config set *)", "the record assigns the flip to this seat")
+            rid_g = r_g.get("id") or ""
+            g_card = saidG[-1] if saidG else ("", "", None)
+            check("the planning seat's `cc-slack grant allow` raises ONE card in the -threads lane naming the exact allow "
+                  "line, with the owner's mention, keyed by a fresh id the table holds on disk",
+                  r_g["ok"] and re.fullmatch(r"[a-km-z]{5}", rid_g) and g_card[0] == "CTHREADS" and g_card[2] is None
+                  and "`Bash(cc-config set *)`" in g_card[1] and "<@UOWNER>" in g_card[1] and f"yes {rid_g} fix" in g_card[1]
+                  and dmG.grant_asks[rid_g]["card"] == "g1" and load_table(GRANTS).get(rid_g, {}).get("what") == "Bash(cc-config set *)")
+            n_rx, n_said, n_got = len(rxM), len(saidG), len(gotG)
+            dmG.on_event(msgM("g.1", "UMEM", f"yes {rid_g} fix", chan="CTHREADS"))
+            check("a forged `yes <id> fix` from a non-owner is refused (❌ + one line): nothing written, the card still open",
+                  wroteG == [] and rxM[n_rx:] == [("CTHREADS", "g.1", "x")] and rid_g in dmG.grant_asks
+                  and saidG[n_said:] == [("CTHREADS", "only the owner can answer permission prompts", "g.1")])
+            cli_g = dmG.answer_permission(rid_g, "yes", CTL, fix=True)
+            check("`cc-slack permission <id> yes fix` from the planning seat is refused for a grant card — a seat never "
+                  "approves a capability for the box's own seats", not cli_g["ok"] and wroteG == [] and rid_g in dmG.grant_asks)
+            n_rx, n_said, n_got = len(rxM), len(saidG), len(gotG)
+            dmG.on_event(msgM("g.2", "UOWNER", f"yes {rid_g} fix", chan="CTHREADS"))
+            check("the owner's `yes <id> fix` has the DAEMON write that one line (cc-settings grant, by name and card), "
+                  "marks his reply ✅ and the card ⚙️, says so in the thread, and the seat is told — no session wrote anything",
+                  wroteG == [(rid_g, "allow", "Bash(cc-config set *)", "", "The Owner")]
+                  and ("CTHREADS", "g.2", "white_check_mark") in rxM[n_rx:] and ("CTHREADS", "g1", "gear") in rxM[n_rx:]
+                  and saidG[n_said:] and saidG[n_said][2] == "g1" and "written" in saidG[n_said][1]
+                  and gotG[n_got:] and gotG[n_got][0] == CTL and "written" in gotG[n_got][1]["content"]
+                  and rid_g not in dmG.grant_asks and rid_g not in load_table(GRANTS)
+                  and not [g for g in gotG[n_got:] if g[1].get("type") == "permission"])
+            r_n = dmG.relay_grant(CTL, "allow", "Bash(cc-config set *)"); rid_n = r_n.get("id") or ""
+            n_rx, n_said, n_got = len(rxM), len(saidG), len(gotG)
+            dmG.on_event(msgM("g.3", "UOWNER", f"no {rid_n}", chan="CTHREADS"))
+            check("`no <id>` declines: nothing written, ❌ on the reply and the card, the seat told, the card closed",
+                  wroteG[1:] == [] and ("CTHREADS", "g.3", "x") in rxM[n_rx:] and ("CTHREADS", r_n["card"], "x") in rxM[n_rx:]
+                  and rid_n not in dmG.grant_asks and gotG[n_got:] and "declined" in gotG[n_got][1]["content"])
+            dmG.write_grant = lambda rid, g, by: (False, "cc-settings grant: refusing — this is running inside a Claude Code session")
+            r_r = dmG.relay_grant(CTL, "allow", "Bash(cc-trust *)"); rid_r = r_r.get("id") or ""
+            n_rx = len(rxM); dmG.on_event(msgM("g.4", "UOWNER", f"yes {rid_r}", chan="CTHREADS"))
+            check("a bare `yes <id>` on a grant card counts as fix — and when cc-settings refuses, the card shows ❌ with the "
+                  "reason in its thread, never ⚙️",
+                  ("CTHREADS", r_r["card"], "x") in rxM[n_rx:] and not [r for r in rxM[n_rx:] if r[2] == "gear"]
+                  and "refused" in saidG[-1][1] and "Claude Code session" in saidG[-1][1])
+            unitG = f"{devG}/{CTL}/x.service"
+            open(unitG, "w").write("[Unit]\nDescription=x\n[Service]\nExecStart=/bin/true\n")
+            _rootsG = globals()["GRANT_UNIT_ROOTS"]; globals()["GRANT_UNIT_ROOTS"] = (devG + "/",)
+            try:
+                r_u = dmG.relay_grant(CTL, "unit", unitG, "the approved stock timer"); rid_u = r_u.get("id") or ""
+            finally:
+                globals()["GRANT_UNIT_ROOTS"] = _rootsG
+            u_card = saidG[-1][1]
+            dmG.write_grant = lambda rid, g, by: wroteG.append((rid, g["kind"], g["what"], g.get("sha"), by)) or (True, "granted")
+            dmG.on_event(msgM("g.5", "UOWNER", f"yes {rid_u} fix", chan="CTHREADS"))
+            check("the unit route is the same card: the file, its sha256 and the enable are named, and the owner's yes "
+                  "hands cc-settings grant that file AND that hash, so a swap after the card is refused there",
+                  r_u["ok"] and "x.service" in u_card and "enable --now x.service" in u_card and "sha256" in u_card
+                  and wroteG[-1][1:4] == ("unit", unitG, __import__("hashlib").sha256(open(unitG, "rb").read()).hexdigest()))
+            # THE TABLE IS NOT THE AUTHORITY, THE CARD IS: grants.json is any session's to edit, the bot's own message is not
+            r_t = dmG.relay_grant(CTL, "allow", "Bash(cc-board *)"); rid_t = r_t.get("id") or ""
+            dmG.grant_asks[rid_t]["what"] = "Bash(:*)"   # a session rewriting the table between the card and the answer
+            n_w = len(wroteG); n_rx = len(rxM)
+            dmG.on_event(msgM("g.6", "UOWNER", f"yes {rid_t} fix", chan="CTHREADS"))
+            check("a table entry that no longer says what its card says is refused at answer time — nothing written, ❌ on the "
+                  "card — so rewriting grants.json buys a session nothing",
+                  wroteG[n_w:] == [] and ("CTHREADS", r_t["card"], "x") in rxM[n_rx:] and rid_t not in dmG.grant_asks)
+            wild_g = [dmG.relay_grant(CTL, "allow", w) for w in ("Bash(:*)", "Bash(**)", "Bash(* *)", "Bash(?*)", "Read(/**)")]
+            check("every wildcard dressed up — Bash(:*), Bash(**), Bash(* *), Bash(?*), Read(/**) — is refused as the whole tool",
+                  all(not r["ok"] for r in wild_g))
+            for _ in range(GRANT_CAP):
+                dmG.relay_grant(CTL, "allow", "Bash(y *)")
+            check("a seat raising grant cards faster than anyone answers is capped (GRANT_CAP an hour)",
+                  not dmG.relay_grant(CTL, "allow", "Bash(z *)")["ok"])
+        finally:
+            globals()["DEV"] = _devG
+            shutil.rmtree(devG, ignore_errors=True)
     finally:
         globals()["react"], globals()["save_last"] = _rxM, _slM
 

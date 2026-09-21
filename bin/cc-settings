@@ -5,6 +5,10 @@
 #   cc-settings check     one line naming exactly what is unapplied; exit 1 when anything is. install + audit use this.
 #   cc-settings show      one line per managed entry, with why each one exists
 #   cc-settings apply     OWNER ONLY, at a terminal: back up, then add the missing HOOKS. Never `permissions`.
+#   cc-settings grant allow '<rule>' --by <who> [--card <id>]     THE cc-slack DAEMON ONLY, carrying the owner's
+#                         `yes <id> fix` on a 🔐 grant card: back up, add that ONE rule to permissions.allow,
+#                         prove the rest of the file identical, log it (~/.cc/state/grants.log)
+#   cc-settings grant unit <file> <sha256> --by <who> [--card <id>]  same door: install + enable one user unit
 #   cc-settings selfcheck its own cases, against fixture files — the live settings are never read, never written
 #
 # WHY NOTHING AUTOMATIC WRITES THIS FILE. ~/.claude/settings.json holds `permissions`, and a hook entry runs a
@@ -12,7 +16,10 @@
 # path and it stays that way. So `check` is what the box runs — install.sh and cc-audit only ever REPORT — while
 # `apply` refuses inside a Claude Code session, refuses without a terminal, refuses in a track worktree, and
 # re-reads its own output to prove `permissions` came through byte-identical before it replaces anything. A
-# missing deny rule is named and printed for the owner to paste; it is never written.
+# missing deny rule is named and printed for the owner to paste; it is never written. `grant` is the one door
+# into `permissions.allow`, and only the owner's own Slack reply opens it: a session raises the card (cc-slack
+# grant), the cc-slack daemon — no Claude Code environment — carries his answer here, and cc-guard refuses the
+# command itself to every session (docs/design-seat-grant-from-slack.md).
 #
 # PROVEN COST (2026-08-31): a hook was canonical in config/ for days and never applied to the live file, so the
 # gate it registers never ran once and nothing the box did depended on it. The audit had been
@@ -23,7 +30,7 @@ R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 M="${CC_SETTINGS_MANIFEST:-$R/config/claude-managed.json}"
 S="${CC_SETTINGS_FILE:-$HOME/.claude/settings.json}"
 DEF="$R/config/claude-settings.json"
-USAGE="usage: cc-settings check|show|apply|selfcheck"
+USAGE="usage: cc-settings check|show|apply|grant allow <rule>|grant unit <file> <sha256> [--by <who> --card <id>]|selfcheck"
 command -v jq >/dev/null 2>&1 || { echo "cc-settings: jq is missing" >&2; exit 2; }
 [ -f "$M" ] || { echo "cc-settings: no manifest at $M" >&2; exit 2; }
 
@@ -203,8 +210,83 @@ apply(){
   echo "Claude Code reads settings at session start: restart any session that has to be gated by them."
 }
 
+# ---- grant: the owner's Slack answer, carried by the cc-slack daemon. Never a session. ----
+# `cc-settings grant allow '<rule>' --by <who> --card <id>` adds ONE rule to `permissions.allow`;
+# `cc-settings grant unit <file> <sha256> --by <who> --card <id>` installs and enables one user unit.
+# The daemon is a systemd user unit with no Claude Code environment, so the same walls as apply's stand (no
+# CLAUDECODE, no CC_ROLE, not in a track worktree) — minus the terminal, which the daemon has not got. What it
+# proves is apply's promise turned round: everything but `.permissions.allow` (deny rules included) comes through
+# identical, and allow is exactly the old list plus the one rule. Every grant is one line in $GRANT_LOG.
+# Design: docs/design-seat-grant-from-slack.md.
+GRANT_LOG="${CC_GRANT_LOG:-$HOME/.cc/state/grants.log}"
+UNIT_DIR="${CC_UNIT_DIR:-$HOME/.config/systemd/user}"
+grant_refuse(){ echo "cc-settings grant: $1" >&2; exit 3; }
+grant_log(){ mkdir -p "$(dirname "$GRANT_LOG")"; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$GRANT_LOG"; }
+grant(){
+  local kind=${1:-} what=${2:-} sha="" by="" card="" d tmp bak orig_rest new_rest want got name dest inner
+  shift $(( $# >= 2 ? 2 : $# ))
+  [ -z "${CLAUDECODE:-}${CLAUDE_CODE_SESSION_ID:-}${CLAUDE_CODE_ENTRYPOINT:-}" ] || grant_refuse "refusing — this is running inside a Claude Code session; a seat raises the card (cc-slack grant), the owner's Slack reply writes"
+  [ -z "${CC_ROLE:-}" ] || grant_refuse "refusing — CC_ROLE=${CC_ROLE} (a worker or member session)"
+  d=$PWD; while [ -n "$d" ] && [ "$d" != / ]; do [ -e "$d/.cc/track" ] && grant_refuse "refusing — $d is a track worktree"; d=$(dirname "$d"); done
+  if [ "$kind" = unit ]; then sha=${1:-}; shift $(( $# >= 1 ? 1 : 0 )); fi
+  while [ $# -gt 0 ]; do case "$1" in
+    --by) by=${2:-}; shift 2 ;; --card) card=${2:-}; shift 2 ;;
+    *) grant_refuse "unknown argument $1 ($USAGE)" ;; esac; done
+  [ -n "$by" ] || grant_refuse "--by <who> is required: a grant names who gave it"
+  by=$(tr -d '\n\r' <<<"$by"); card=$(tr -d '\n\r' <<<"$card")   # one log line per grant, whatever the caller sent
+  case "$kind" in
+  allow)
+    # one Tool(pattern) rule or one bare mcp tool name; never a bare `*` — a grant is narrow and named in the card
+    [[ "$what" == *$'\n'* ]] && grant_refuse "not an allow rule (newline): $what"   # grep -E judges per line; one rule is one line
+    grep -qE '^([A-Za-z][A-Za-z0-9_]*\([^()[:cntrl:]]{1,200}\)|mcp__[A-Za-z0-9_-]+)$' <<<"$what" || grant_refuse "not an allow rule: $what"
+    # a pattern that is nothing but wildcards, separators and slashes — Bash(*), Bash(:*), Bash(* *), Read(/**) — is the whole tool
+    inner=${what#*\(}; inner=${inner%\)}
+    [ -n "$(tr -d '*?: /' <<<"$inner")" ] || grant_refuse "refusing a bare wildcard: $what grants the whole tool"
+    [ -f "$S" ] || grant_refuse "no $S"
+    jq -e . "$S" >/dev/null 2>&1 || grant_refuse "$S is not valid json — nothing changed"
+    if jq -e --arg r "$what" '(.permissions.allow // []) | index($r) != null' "$S" >/dev/null; then
+      echo "cc-settings grant: $what is already allowed — nothing to write"; return 0; fi
+    orig_rest=$(jq -S -c 'del(.permissions.allow)' "$S")
+    want=$(jq -S -c --arg r "$what" '(.permissions.allow // []) + [$r]' "$S")
+    bak="$S.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -a "$S" "$bak" || grant_refuse "could not back up to $bak — nothing changed"
+    tmp=$(mktemp "$(dirname "$S")/.settings.grant.XXXXXX") || grant_refuse "could not make a temp file beside $S"   # never a predictable name a planted symlink could be waiting under
+    jq --arg r "$what" '.permissions //= {} | .permissions.allow = ((.permissions.allow // []) + [$r])' "$S" > "$tmp" \
+      || { rm -f "$tmp"; grant_refuse "jq failed — nothing changed ($bak holds the backup)"; }
+    jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; grant_refuse "the result is not valid json — nothing changed"; }
+    new_rest=$(jq -S -c 'del(.permissions.allow)' "$tmp"); got=$(jq -S -c '.permissions.allow' "$tmp")   # the promise, checked
+    [ "$new_rest" = "$orig_rest" ] || { rm -f "$tmp"; grant_refuse "that rewrite would have changed something besides \`permissions.allow\` — refused, nothing changed"; }
+    [ "$got" = "$want" ] || { rm -f "$tmp"; grant_refuse "that rewrite would not have added exactly one rule — refused, nothing changed"; }
+    mv -f "$tmp" "$S" || grant_refuse "could not replace $S — $bak holds the backup"
+    grant_log "allow $what by $by card ${card:--} backup $bak"
+    echo "granted: $what is now in $S permissions.allow (backup $bak). Claude Code reads settings at session start."
+    ;;
+  unit)
+    # the unit file the card named, by path AND hash: a swap between raise and approve is refused, not installed
+    what=$(readlink -f -- "$what") || grant_refuse "no unit file at $2"
+    case "$what" in "${CC_UNIT_ROOTS:-$HOME/dev}"/*|"$HOME"/.cc/worktrees/*) ;; *) grant_refuse "a unit file the card names sits in a repo tree (~/dev, ~/.cc/worktrees): $what" ;; esac
+    name=$(basename -- "$what")
+    grep -qE '^[A-Za-z0-9_@.-]+\.(service|timer)$' <<<"$name" || grant_refuse "not a user unit file: $what"
+    [ -f "$what" ] || grant_refuse "no unit file at $what"
+    got=$(sha256sum -- "$what" | cut -d' ' -f1)
+    [ -n "$sha" ] && [ "$got" = "$sha" ] || grant_refuse "refusing — $what is not the file the card named (sha256 $got, card said ${sha:-nothing})"
+    mkdir -p "$UNIT_DIR" || grant_refuse "could not make $UNIT_DIR"
+    dest="$UNIT_DIR/$name"; bak=""
+    if [ -e "$dest" ]; then bak="$dest.bak-$(date -u +%Y%m%dT%H%M%SZ)"; cp -a "$dest" "$bak" || grant_refuse "could not back up $dest — nothing changed"; fi
+    cp -- "$what" "$dest" || grant_refuse "could not write $dest${bak:+ ($bak holds the backup)}"
+    if [ -z "${CC_UNIT_DRY:-}" ]; then   # the selfcheck proves the copy and the log on a fixture dir; systemd is the live box's alone
+      systemctl --user daemon-reload || grant_refuse "daemon-reload failed — $dest is in place, not enabled"
+      systemctl --user enable --now -- "$name" || grant_refuse "enable --now $name failed — $dest is in place, not enabled"
+    fi
+    grant_log "unit $name sha256 $got from $what by $by card ${card:--} backup ${bak:--}"
+    echo "granted: $name installed from $what (sha256 $got) and enabled${bak:+ (backup $bak)}"
+    ;;
+  *) grant_refuse "grant allow <rule>|unit <file> <sha256> --by <who> [--card <id>]" ;;
+  esac
+}
+
 selfcheck(){
-  local d n=0 f=0 S M DEF CL out rc sl_cmd
+  local d n=0 f=0 S M DEF CL out rc sl_cmd self sha
   d=$(mktemp -d "${TMPDIR:-/tmp}/cc-settings-sc.XXXXXX") || return 1   # S/M/DEF are local: every case runs against fixtures
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a case that PRINTS (jq -e) must not leak into the verdict
@@ -317,6 +399,53 @@ selfcheck(){
   out=$(sed -n '/^apply(){/,/^}$/p' "$(readlink -f "$0")")
   k "$(t grep -q 'new_perm=\$(jq -S -c' <<<"$out")" "apply re-reads \`permissions\` from its own output"
   k "$(t grep -q '\[ "\$new_perm" = "\$orig_perm" \]' <<<"$out")" "…and refuses the swap unless it is byte-identical"
+  # ---- grant: the daemon's door into permissions.allow, on a fixture file, never the live one ----
+  # Every case below runs `grant` as a child with the Claude Code variables stripped: the selfcheck itself runs
+  # inside a session, and the first wall would otherwise refuse every case for the same reason.
+  self=$(readlink -f "$0")   # the cases cd into the fixture dir, so a relative $0 would not resolve
+  G(){ env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT -u CC_ROLE CC_SETTINGS_FILE="$d/g.json" \
+           CC_GRANT_LOG="$d/grants.log" CC_UNIT_DIR="$d/units" CC_UNIT_ROOTS="$d" CC_UNIT_DRY=1 ${GENV:-} "$self" grant "$@"; }   # GENV: one case's own variable, last so it wins
+  jq '.theme="dark" | .permissions.allow += ["Bash(cowsay:*)"] | .permissions.deny += ["Bash(dd *)"]' "$DEF" > "$d/g.json"
+  cp "$d/g.json" "$d/g.before.json"
+  out=$(cd "$d" && G allow 'Bash(cc-config set *)' --by owner --card abcde 2>&1); rc=$?
+  k "$(t test "$rc" -eq 0)" "grant allow writes: $out"
+  k "$(t jq -e '.permissions.allow | index("Bash(cc-config set *)") != null' "$d/g.json")" "…and the ONE rule is in permissions.allow"
+  k "$(t diff <(jq -S 'del(.permissions.allow)' "$d/g.before.json") <(jq -S 'del(.permissions.allow)' "$d/g.json"))" \
+     "…and everything but permissions.allow — deny rules, theme, hooks — came through identical"
+  k "$(t test "$(jq -S -c '.permissions.allow' "$d/g.json")" = "$(jq -S -c '.permissions.allow + ["Bash(cc-config set *)"]' "$d/g.before.json")")" \
+     "…and allow is exactly the old list plus that rule, in order"
+  k "$(t ls "$d"/g.json.bak-*)" "…and the file was backed up first"
+  k "$(t grep -q 'allow Bash(cc-config set \*) by owner card abcde' "$d/grants.log")" "…and the grant is logged: who, what, which card"
+  S="$d/g.json"; out=$(check); rc=$?
+  k "$(t test "$rc" -eq 0)" "…and check stays green afterwards: $out"
+  out=$(cd "$d" && G allow 'Bash(cc-config set *)' --by owner 2>&1); rc=$?
+  k "$(t test "$rc" -eq 0)" "a rule already allowed is reported, not stacked twice: $out"
+  k "$(t test "$(jq '[.permissions.allow[] | select(. == "Bash(cc-config set *)")] | length' "$d/g.json")" -eq 1)" "…and the file holds it once"
+  out=$(cd "$d" && G allow 'Bash(*)' --by owner 2>&1); k "$(t test $? -ne 0)" "a bare wildcard is refused: $out"
+  rc=0; for w in 'Bash(:*)' 'Bash(**)' 'Bash(* *)' 'Bash(?*)' 'Bash(*:*)' 'Read(/**)'; do (cd "$d" && G allow "$w" --by owner >/dev/null 2>&1) && rc=1; done
+  k "$rc" "…and so is every wildcard dressed up — Bash(:*), Bash(**), Bash(* *), Bash(?*), Bash(*:*), Read(/**) — each is the whole tool"
+  out=$(cd "$d" && G allow $'Bash(a *)\nBash(b *)' --by owner 2>&1); k "$(t test $? -ne 0)" "two rules on two lines are refused as one: ${out//$'\n'/ }"
+  out=$(cd "$d" && G allow 'rm -rf /' --by owner 2>&1); k "$(t test $? -ne 0)" "a string that is not a Tool(pattern) rule is refused: $out"
+  out=$(cd "$d" && G allow 'Bash(x *)' 2>&1); k "$(t test $? -ne 0)" "a grant with nobody named (--by) is refused: $out"
+  out=$(cd "$d" && GENV=CLAUDECODE=1 G allow 'Bash(x *)' --by owner 2>&1)
+  k "$(t grep -q 'inside a Claude Code session' <<<"$out")" "grant refuses inside a Claude Code session — a session cannot write the file this way either"
+  out=$(cd "$d" && GENV=CC_ROLE=worker G allow 'Bash(x *)' --by owner 2>&1)
+  k "$(t grep -q 'CC_ROLE=worker' <<<"$out")" "grant refuses for a worker or member session"
+  k "$(t jq -e '.permissions.allow | index("Bash(x *)") == null' "$d/g.json")" "…and none of the refused rules reached the file"
+  # the unit route: the file the card named, by hash; a swap since the card is refused
+  printf '[Unit]\nDescription=x\n[Service]\nExecStart=/bin/true\n' > "$d/x.service"; sha=$(sha256sum "$d/x.service" | cut -d' ' -f1)
+  out=$(cd "$d" && G unit "$d/x.service" "$sha" --by owner --card fghjk 2>&1); rc=$?
+  k "$(t test "$rc" -eq 0)" "grant unit copies the unit file into the user unit dir: $out"
+  k "$(t cmp -s "$d/x.service" "$d/units/x.service")" "…byte for byte"
+  k "$(t grep -q 'unit x.service sha256 '"$sha"' .* by owner card fghjk' "$d/grants.log")" "…and logs it with its hash"
+  printf 'ExecStart=/bin/false\n' >> "$d/x.service"
+  out=$(cd "$d" && G unit "$d/x.service" "$sha" --by owner 2>&1); rc=$?
+  k "$(t test "$rc" -ne 0)" "a unit file changed since the card named it is refused: $out"
+  k "$(t test "$(grep -c . "$d/units/x.service")" -eq 4)" "…and the installed unit is the one the card approved, untouched"
+  out=$(cd "$d" && G unit "$d/notes.txt" "$sha" --by owner 2>&1); k "$(t test $? -ne 0)" "a file that is not a .service/.timer is refused: $out"
+  mkdir -p "$d/out"; cp "$d/units/x.service" "$d/out/y.service"; ln -s "$d/out/y.service" "$d/y.service"
+  out=$(cd "$d" && GENV=CC_UNIT_ROOTS=$d/in G unit "$d/y.service" "$(sha256sum "$d/out/y.service" | cut -d' ' -f1)" --by owner 2>&1); rc=$?
+  k "$(t test "$rc" -ne 0)" "a unit file outside the repo roots is refused, through a symlink inside them too: $out"
   rm -rf "$d"
   echo "cc-settings selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]
@@ -326,6 +455,7 @@ case "${1:-}" in
   check)     check ;;
   show)      show ;;
   apply)     apply ;;
+  grant)     shift; grant "$@" ;;
   selfcheck) selfcheck ;;
   *)         echo "$USAGE" >&2; exit 2 ;;
 esac

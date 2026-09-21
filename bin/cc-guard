@@ -515,6 +515,33 @@ W11B
   { [ "$got" = 2 ] && grep -qF "sending email" "$GERR"; } || { r=1; echo "      a member's bare mail(1) went through: rc $got"; }
   ok "a member workspace's cc-mail send passes the gate, --json and the flag form, a body naming mail included — the host sends it for the workspace — while mail(1) from the same dir is still refused as sending email" $r
 
+  # 11c. NO SESSION WRITES ~/.claude/settings.json, AT ANY TIER (row a-seat-grant-is-answered-from-slack). The
+  #      file decides what a session may do; the one door is the owner's Slack reply carried by the cc-slack daemon
+  #      (cc-settings grant). Until this rule a planning session's `jq … > ~/.claude/settings.json` and `cc-settings
+  #      apply` both passed the Bash gate (2026-09-20), while the Write tool was refused — one door of two.
+  r=0
+  for what in "cc-settings apply" "cc-settings grant allow 'Bash(x *)' --by me" "env -u CLAUDECODE cc-settings grant allow x" \
+              "jq . /tmp/x > ~/.claude/settings.json" "cat x >> \$HOME/.claude/settings.json" "cat x | tee ~/.claude/settings.json" \
+              "jq . x >~/.claude/settings.json" "cat x >>\$HOME/.claude/settings.json" \
+              "cp /tmp/x.json ~/.claude/settings.json" "sed -i 's/a/b/' ~/.claude/settings.json" "mv /tmp/x \$HOME/.claude/settings.json" "jq . x > ~/./.claude//settings.json"; do
+    for role in worker member; do
+      : > "$GERR"
+      if [ "$role" = worker ]; then got=$(g Bash "{\"command\":\"$what\"}" "$WT" CC_ROLE=worker)
+      else got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/alice" CC_ROLE=member CC_GUARD_ROOT_PID=$$); fi
+      { [ "$got" = 2 ] && grep -qF "settings.json" "$GERR"; } || { r=1; echo "      $role: went through (rc $got): $what"; }
+    done
+  done
+  # The planning session is the ungated tier here by design (`case "$role"` below: no marker, no gate), so its walls
+  # for this file are the auto-mode classifier and cc-settings' own refusal under CLAUDECODE — not this rule.
+  # And a text rule is not a sandbox (rule 4's own words): a relative write after changing into ~/.claude, python's
+  # open(), perl -pi, dd of= are the classifier's to catch; this rule stops the plain shapes and the two commands.
+  for what in "cc-settings check" "cc-settings show" "cc-slack grant allow 'Bash(cc-config set *)' -t why" \
+              "cat ~/.claude/settings.json" "cp ~/.claude/settings.json /tmp/copy.json" "echo settings.json > /tmp/notes" \
+              "jq .permissions ~/.claude/settings.json > /tmp/perm.json"; do
+    : > "$GERR"; got=$(g Bash "{\"command\":\"$what\"}" "$WT" CC_ROLE=worker); [ "$got" = 0 ] || { r=1; echo "      a worker's read was refused (rc $got): $what — $(head -c 80 "$GERR")"; }
+  done
+  ok "no gated session writes ~/.claude/settings.json through Bash — cc-settings apply/grant, a redirection, tee, cp/mv, sed -i are refused for a worker and a member alike — while check/show, raising the card (cc-slack grant) and a worker's read or copy OUT of the file still pass" $r
+
   # 12. A SESSION'S OWN NOTES ARE NOT SOMEBODY ELSE'S TREE. Claude saves them under ~/.claude/projects/<slug of
   #     the project root>/memory and both sandboxes bind that dir rw, but the write-path rule refused every one
   #     of them — and from a member-facing session each refusal went out as a 🔐 line: three files in one call,
@@ -3605,6 +3632,21 @@ case "$tool" in
     # One list, so a secret added here reaches every rule that reads it. $RD is set above; these ADD to the
     # credentials no role reads at all.
     SEC='(~|\$HOME|/home/[^ /]*)/(\.cc/config|\.cc/sandbox\b|\.ssh\b|\.claude/settings\.json)'
+    # THE SETTINGS FILE IS WRITTEN BY NO SESSION, AT ANY TIER. ~/.claude/settings.json decides what a session may
+    # do; its one door is the owner's own Slack reply, carried by the cc-slack daemon (cc-settings grant, docs/
+    # design-seat-grant-from-slack.md). So the two commands that write it, and the plain ways of landing bytes in
+    # it (a redirection, tee, cp/mv/install/ln/rsync, sed -i), are refused at every gated tier (worker and member;
+    # the planning session is ungated here by design, and cc-settings itself refuses under CLAUDECODE) — the Write
+    # tool already was. A seat RAISES the card instead: `cc-slack grant allow '<rule>'`. The brief: "The writer
+    # must be the cc-slack DAEMON acting on the owner's Slack reply, never a session or a subagent."
+    SETT='(~|\$HOME|/home/[^ /]*)/+(\./)*\.claude/+(\./)*settings\.json'   # ./ and // spell the same path
+    rx "$AT"'([^ ]*/)?cc-settings +(apply|grant)\b' && never "writing ~/.claude/settings.json (cc-settings apply/grant) — a session raises the card instead: cc-slack grant allow '<rule>' [-t why]; the owner's \`yes <id> fix\` in #<repo>-threads writes it"
+    # a redirection or tee INTO it; cp/mv/install/ln/rsync with it as the LAST argument (as the first it is a read, and a
+    # worker's read is allowed: case 11); sed -i over it
+    { rx '(>>? *|\btee( +-[a-z]+)* +)'"$SETT"' *($|[ ;&|)])' \
+      || rx '\b(cp|mv|install|ln|rsync)( +-[^ ]+)*( +[^ ;&|>-][^ ;&|>]*)+ +'"$SETT"' *($|[;&|)])' \
+      || rx '\bsed +-[a-zA-Z]*i[^ ]*( +[^ ;&|>]+)* +'"$SETT"' *($|[;&|)])'; } \
+      && never "writing ~/.claude/settings.json — no session writes it; raise the card instead: cc-slack grant allow '<rule>' [-t why]"
     if [ "$role" = member ]; then
       # A MEMBER WORKSPACE DISPATCHES INSIDE ITSELF, AND ONLY THERE. ~/dev/<handle> is one member's whole world:
       # tracks, workers and channels under `<handle>` are theirs to make. Keyed on the .cc/member-workspace marker
