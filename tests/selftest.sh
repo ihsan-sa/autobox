@@ -2727,7 +2727,7 @@ ME "$B/cc-limit" check "$T/cred.json" >/dev/null
   && [ "$(M status)" = "opus until probe — fable is not available to this account" ]; } \
   && ok "cc-limit: an exhausted credit balance is not a limit — no stamp, fable recorded as unavailable, the box moved off it and status says so" \
   || bad "credits read wrong: stamp=$([ -e "$MH/.cc/state/claude-limit" ] && echo yes || echo no) status=$(M status)"
-rm -f "$MH/.cc/state/claude-limit" "$MH/.cc/state/model-unavailable" "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen"
+rm -f "$MH/.cc/state/claude-limit" "$MH/.cc/state/model-unavailable" "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen" "$MH/.cc/state/model-refused"   # model-refused: that real refusal would hold the probe below for an hour
 : > "$MH/.cc/state/model.log"; : > "$MH/.cc/notify.log"   # …and the move it just made: one switch per 10 min, so a switch row
                                                           # left here holds every case below on the anti-flap gap, and the
                                                           # credits line would be counted as the limit's notify

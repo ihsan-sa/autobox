@@ -3,8 +3,11 @@
 # the monthly spend cap — every live session ON THAT MODEL moves to the next rung of the chain, and back to the
 # model it was on when the outage lifts: a session that belongs on the primary comes back by an overlapping HANDOFF —
 # launched unasked for a major session, on the owner's 👍 on one card for any other (see THE FABLE BAND COMES BACK BY
-# HANDOFF below) — and a session moved between the lower rungs gets `/model` typed at its next turn boundary. Sessions
-# on another model are not touched. LLM-free except one tiny probe. A PLANNING SESSION (a repo's seat, an orch, a window
+# HANDOFF below) — and a session moved between the lower rungs gets `/model` typed at its next turn boundary. EVERY
+# TICK, WITH NO EVENT, `reconcile` compares each live session with the model it belongs on (want_of: a planning or
+# major window's band is the primary, a moved one's is what it was on; a rowless minor one is not touched) and makes
+# the same move up or down, so a session born on the fallback with no record comes back too. LLM-free except the
+# probe, which runs the id sessions run ([1m] and all) and is not believed while real runs on it are refused. A PLANNING SESSION (a repo's seat, an orch, a window
 # on CC_MODEL_PLANNING) never goes below the floor (Opus): with the floor out it is parked, and comes back by handoff.
 # TWO KINDS OF OUTAGE, told apart (owner, 2026-09-15): a LIMIT names a reset and every model of the account can be
 # behind it — the box waits it out on the next rung; "requires usage credits" and "You've hit your monthly spend
@@ -106,7 +109,7 @@
 #   (4) IN EVERY STATE, SAID OUT LOUD AND NEVER ACTED ON: a live session running a model `current` does not name —
 #   another family, or the old id of the primary's — gets one `mismatch` row in the log (at most one per session per
 #   CC_MODEL_MISMATCH_GAP) and is counted in `status`. The passes that MOVE a session are a switch (the sessions on
-#   the model that went out, see Moved below), (1c) and same-family (2b); before (4) every session on another family
+#   the model that went out, see Moved below), (1c), same-family (2b) and reconcile (see its comment); before (4) every session on another family
 #   was invisible: 31 windows sat on the harness default on 2026-09-07 and nothing anywhere said so. This one types
 #   nothing — a session on another family is an override's, the chain's or the owner's doing, and reporting it is
 #   the whole job; (5) NO OVERRIDE BUT A MODEL IS RECORDED UNAVAILABLE (cleared by hand, or a fresh boot with the
@@ -152,7 +155,10 @@
 #   sessions or tells the owner; `tick` does nothing under another login.
 # Credits seen: ~/.cc/state/model-credits-seen = "<pane>\t<key>\t<epoch>" — the refusal line each pane was last acted
 #   on for, so an idle pane's old line is not read as a new refusal once the record is forgotten.
-# Env: CC_MODEL_PRIMARY · CC_MODEL_FALLBACK · CC_MODEL_PROBE (the id the probe asks for) · CC_CLAUDE
+# Refused: ~/.cc/state/model-refused = "<family>\t<epoch>" — the last REAL run refused on it (mark_unavailable: a pane's
+#   line, cc-limit), never the probe's own. A probe that answers inside CC_MODEL_REFUSED_HOLD of it counts as refused
+#   (2026-09-21 17:17Z: the probe answered, the sessions moved back up were refused within a minute). Per login as above.
+# Env: CC_MODEL_PRIMARY · CC_MODEL_FALLBACK · CC_MODEL_PROBE (the id the primary's probe asks for; the primary) · CC_MODEL_REFUSED_HOLD (3600) · CC_CLAUDE
 #   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_RETUNE_GAP (600) · CC_MODEL_CHAIN
 #   · CC_MODEL_MISMATCH_GAP (3600) · CC_CLAUDE_SETTINGS (~/.claude/settings.json) · CC_MODEL_STATUSLINE_FRESH (120) · CC_STATUSLINE_DIR (cc-statusline's per-session
 #   records, the same ones cc-context reads) · CC_MODEL_MAJOR (~/.cc/config: the windows handed back unasked, space- or
@@ -166,11 +172,11 @@ set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"
 CRED="${CC_MODEL_CRED:-$([ "${CC_MEMBER_SANDBOX:-}" = 1 ] && echo member)}"   # whose login: empty = the box's own (see A MODEL THIS ACCOUNT CANNOT RUN)
-CRED=$(tr -cd 'A-Za-z0-9_-' <<<"$CRED"); UNAV="$ST/model-unavailable${CRED:+.$CRED}"
+CRED=$(tr -cd 'A-Za-z0-9_-' <<<"$CRED"); UNAV="$ST/model-unavailable${CRED:+.$CRED}"; REFUSED="$ST/model-refused${CRED:+.$CRED}"
 MOVED="$ST/model-moved"   # what each pane was on before the box moved it (see the header)
 RETURNED="$ST/model-returned"   # the return each window was given at the lift: a handoff launched, or a card posted
 PRIMARY="${CC_MODEL_PRIMARY:-claude-fable-5-1[1m]}"; FALLBACK="${CC_MODEL_FALLBACK:-claude-opus-5[1m]}"   # Fable 5.1 (owner, 2026-09-01)
-PROBEM="${CC_MODEL_PROBE:-claude-fable-5-1}"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
+PROBEM="${CC_MODEL_PROBE:-$PRIMARY}"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 SESSION="${CC_TMUX_SESSION:-main}"; PROC="${CC_MODEL_PROC:-claude}"
 now=$(date -u +%s); mkdir -p "$ST"
 fam(){ local f; f=$(grep -oiE 'fable|opus|sonnet|haiku' <<<"${1:-}" | head -1 | tr 'A-Z' 'a-z'); echo "${f:-${1:-}}"; }
@@ -337,13 +343,16 @@ unavailable_why(){   # $1 = a classify `why` → 0 when it says the MODEL is not
   case "${1:-}" in 'needs usage credits'*|'the model would not answer as itself') return 0;; esac; return 1; }
 mark_unavailable(){   # $1 model · $2 reason → record it, and move the box off it if that is what the box is on
   local f nx cur; f=$(fam "${1:-}"); [ -n "$f" ] || return 0
-  [ -z "$CRED" ] || { note_unavailable "$f" "${2:-}"; return 0; }   # another login's refusal: its record, never the box's sessions
+  [ -z "$CRED" ] || { note_unavailable "$f" "${2:-}"; note_refused "$f"; return 0; }   # another login's refusal: its record, never the box's sessions
   drop_stale_rows   # before the record is written: it is what says an episode is open
-  note_unavailable "$f" "${2:-}"
+  note_unavailable "$f" "${2:-}"; note_refused "$f"
   cur="$PRIMARY"; ov && cur="$model"; [ "$(fam "$cur")" = "$f" ] || return 0
   nx=$(chain_next "$cur") || return 0   # nothing left to move to: recorded, and every caller reads the chain's end
   SWITCH_FROM=$(label "$cur"); SWITCH_WHAT="is not available to this account${2:+ ($2)}"
   do_switch "$nx" "$f not available to this account: ${2:-usage credits}"; SWITCH_FROM=""; SWITCH_WHAT=limit; }
+note_refused(){ { awk -F'\t' -v f="$1" '$1!=f' "$REFUSED" 2>/dev/null; printf '%s\t%s\n' "$1" "$now"; } > "$REFUSED.t" && mv "$REFUSED.t" "$REFUSED"; }   # $1 family: a REAL run refused now
+refused_recently(){   # $1 family → 0 when a real run (a pane, a loop — never the probe) was refused inside CC_MODEL_REFUSED_HOLD (1 h)
+  local t; t=$(awk -F'\t' -v f="${1:-}" '$1==f{print $2+0; exit}' "$REFUSED" 2>/dev/null); [ $((now - ${t:-0})) -lt "${CC_MODEL_REFUSED_HOLD:-3600}" ]; }
 limstamp(){ lim_till=0; lim_model=""; lim_seen=0   # cc-limit's stamp: "<until>\t<how>\t<first-seen>\t<model>\t<observers>"
   local o=""
   # Split by awk, not by `IFS=$'\t' read`: tab is IFS whitespace and bash folds "\t\t" into one delimiter, so a
@@ -538,23 +547,46 @@ lift_rung(){   # $1 a family below the primary that answers again (its record ju
   printf '%s\t%s\tlift\t%s\t%s session(s)%s\n' "$(date -u +%FT%TZ)" "$now" "$to" "$n" "${old:+; override up from $old}" >> "$LOG"
   "$BIN/cc-notify" -t "$(hostname -s) model" "$(label "$f") answers again${old:+ — the box is back on it from $(label "$old")}; what moved off it returns, parked planning hands back." >/dev/null 2>&1 || true
   printf '%s\n' "$n"; }
-floor_pass(){   # every tick: a planning pane found BELOW the floor (launched on a low `current`, or the CLI moved it) is
-                # typed back to the floor rung — up when the floor answers, parked on it when it is out. Once per pane per
-                # CC_MODEL_RETUNE_GAP: its statusline record says the old model until its next turn.
-  local id name lm fr; fr=$(floor_rung)
+want_of(){   # $1 pane · $2 window → the model this session belongs on NOW, "park", or nothing (exit 1): no band here.
+             # ITS BAND: the model the box moved it off ($MOVED row), else the primary for a planning or major window; a
+             # rowless minor window is where its dispatcher or a person put it, and is left there. FROM THE BAND DOWN, the
+             # first rung that is not out (out_why: on record as not the account's, or the primary under an override).
+             # A planning window never lands below the floor: "park" when everything down to it is out.
+  local b m; if moved_by_box "$1" ""; then b=$(moved_row "$1"); elif planning "$2" || major "$2"; then b="$PRIMARY"; else return 1; fi
+  m="$b"; while out_why "$m" >/dev/null; do m=$(chain_next "$m") || { planning "$2" && echo park; return 0; }; done
+  { planning "$2" && below_floor "$m"; } && { echo park; return 0; }
+  printf '%s\n' "$m"; }
+reconcile(){   # EVERY TICK, NO EVENT NEEDED (owner, 2026-09-21): each live session's model against want_of, and the move
+               # when they disagree — up as well as down. Until then the return fired only on a recorded lift, so a seat
+               # born on the fallback (no $MOVED row, no lift) stayed there: five planning seats sat on Sonnet an hour
+               # after the 09-21 account change. UP to the primary is a handoff, or a card for a rowless minor window
+               # (return_session; one card per window until a new outage drops it); up to a lower rung is `/model`; DOWN is
+               # `/model`; a parked seat whose rung answers hands back by handoff. A planning window with its floor out is parked (a
+               # pane below the floor typed back to it first). A pane with no record is taken to be where it belongs,
+               # and each pane is typed at once per CC_MODEL_RETUNE_GAP, as every other pass.
+  local id name w lm fr; fr=$(floor_rung)
   while read -r id name; do [ -n "${id:-}" ] || continue
-    planning "$name" || continue
-    lm=$(live_model "$id" "$fr"); below_floor "$lm" || continue   # no record: taken to be on the floor
+    member_win "$name" && continue; case "$name" in *~*) continue;; esac   # never on the chain · mid-handoff
+    w=$(want_of "$id" "$name") || continue
+    if [ "$w" = park ]; then
+      parked_row "$id" && continue   # parked already: the owner heard once, and the seat is idle
+      lm=$(live_model "$id" "$fr"); retuned_recently "$id" && continue
+      if below_floor "$lm"; then type_into "$id" "$name" "/model $fr" || continue; fi   # busy: next tick
+      park "$id" "$name" "$(below_floor "$lm" && echo "$fr" || echo "$lm")" "$(fam "$lm")" "found on $lm"; continue; fi
+    lm=$(live_model "$id" "$w")
+    if parked_row "$id"; then returned_recently "$name" || launch_return "$name" "$lm" "$(label "$w") answers (planning was parked)"; continue; fi
+    [ "$(fam "$lm")" = "$(fam "$w")" ] && continue
     retuned_recently "$id" && continue
-    # ALREADY PARKED AND THE FLOOR STILL OUT: leave it alone. A parked seat is idle, so it takes no turn and its
-    # record keeps saying the low model — this pass found it below the floor again every gap, re-parked it and told
-    # the owner again for the whole outage. He gets ONE line per park: the row goes back to `kept` when the floor
-    # answers (lift_rung), so a LATER outage parks the seat afresh and tells him then.
-    parked_row "$id" && out_why "$fr" >/dev/null && continue
-    type_into "$id" "$name" "/model $fr" || continue   # busy: next tick
-    if out_why "$fr" >/dev/null; then park "$id" "$name" "$fr" "$(floor_fam)" "found on $lm"; tell_parked "found on $(label "$lm")"
-    else printf '%s\t%s\tretune\t%s\t%s:%s (%s) planning found on %s — below the floor\n' "$(date -u +%FT%TZ)" "$now" "$fr" "$SESSION" "$name" "$id" "$lm" >> "$LOG"; fi
-  done < <(sessions); }
+    if [ "$(rung_of "$lm")" -gt "$(rung_of "$w")" ] 2>/dev/null; then   # below where it belongs: UP
+      if [ "$(fam "$w")" = "$(fam "$PRIMARY")" ]; then
+        moved_by_box "$id" "" || major "$name" ||
+          ! awk -F'\t' -v w="$name" '$1==w && $3=="card"{y=1} END{exit !y}' "$RETURNED" 2>/dev/null || continue   # carded: the owner's 👍 decides
+        return_session "$id" "$name" "$lm" "$(moved_by_box "$id" "" && echo row)"; continue; fi
+    fi
+    if type_into "$id" "$name" "/model $w"; then
+      [ "$(rung_of "$lm")" -lt "$(rung_of "$w")" ] 2>/dev/null && note_moved "$id" "$name" "$lm" moved "$(fam "$lm")"   # DOWN: banked, so it comes back
+      printf '%s\t%s\tretune\t%s\t%s:%s (%s) found on %s — reconcile\n' "$(date -u +%FT%TZ)" "$now" "$w" "$SESSION" "$name" "$id" "$lm" >> "$LOG"; fi
+  done < <(sessions); tell_parked ""; }
 # ── THE FABLE BAND COMES BACK BY HANDOFF, NOT BY /model (owner, 2026-09-18) ────────────────────────────────────
 # "When fable 5.1 is available again … major sessions like [the planning seats] automatically go back on fable via
 # automatic handoff. the other sessions that should technically be on fable but are not as important get an automatic
@@ -587,8 +619,8 @@ major(){   # $1 window → 0 = handed back unasked. CC_MODEL_MAJOR (env, else ~/
 # took Opus and the chain moved every lessons planning seat to Sonnet for 14 h. So a planning session — an orch, a
 # repo's planning seat, or a window on CC_MODEL_PLANNING — is never moved below the floor, the fallback's rung
 # (CC_MODEL_FLOOR overrides). When the floor itself is out it is PARKED: banked `parked` in $MOVED, nothing typed, no
-# resume line, and the owner told once. The CLI may still put a parked seat on a lower rung by itself; the floor pass
-# in tick types it back to the floor. When the floor answers again (lift_rung, or the primary's restore) a parked seat
+# resume line, and the owner told once. The CLI may still put a parked seat on a lower rung by itself; reconcile
+# in tick types it back to the floor, and parks a seat it finds below it while the floor is out. When the floor answers again (lift_rung, or the primary's restore) a parked seat
 # comes back by `cc-handoff --overlap`, the way a major session returns to the primary. Workers, tracks and member
 # windows keep the chain as it is.
 planning(){   # $1 window → 0 = a planning session. CC_MODEL_PLANNING (env, else ~/.cc/config; windows or globs such as
@@ -1101,6 +1133,9 @@ probe(){   # $1 = the model id to ask for (the primary's probe id by default): i
   case "$cl" in limit) return 1;; error) return 2;;
     refusal) unavailable_why "$probe_why" && note_unavailable "$(fam "$pm")" "$probe_why"; return 3;; esac   # the record, refreshed each probe
   [ "$rc" = 0 ] || { probe_why="exit $rc"; return 2; }
+  # AN ANSWER WHILE REAL RUNS ARE REFUSED IS NOT AVAILABILITY (model.log 2026-09-21 17:17-17:48Z: the probe answered,
+  # every session moved back up was refused within a minute, and the next probe said the same). Counted as a refusal.
+  refused_recently "$(fam "$pm")" && { probe_why="answered, but a real run on it was refused inside ${CC_MODEL_REFUSED_HOLD:-3600} s"; return 3; }
   return 0; }
 lastprobe(){ cat "$ST/model-probed" 2>/dev/null || echo 0; }   # F2: the pane-detection probe is throttled like the restore probe
 probe_unavailable(){   # EVERY family on record as one the account cannot run is probed back, not only the primary's.
@@ -1119,7 +1154,7 @@ probe_unavailable(){   # EVERY family on record as one the account cannot run is
   printf '%s\n' "$now" > "$ST/model-probed"
   while read -r f; do [ -n "${f:-}" ] || continue
     if [ "$f" = "$p" ]; then pm="$PROBEM"; elif [ "$f" = "$(fam "$FALLBACK")" ]; then pm="$FALLBACK"   # the id its sessions run, [1m] and all
-    else pm=$(rung_id "$f"); fi   # each family asked for on its own rung
+    else pm=$(rung_id "$f"); case "$pm" in *']') ;; *) pm="$pm$(grep -oE '\[[^][]*\]$' <<<"$PRIMARY")";; esac; fi   # its own rung, as a session runs it: [1m] too
     probe_why=""; probe "$pm"; rc=$?
     case "$rc" in
       0) if [ "$f" = "$p" ]; then rate_ok && do_switch "$PRIMARY" "answered as itself again (probe)"
@@ -1158,7 +1193,7 @@ tick(){
   # session — and every session on the model it names — to the next rung, whatever the box itself is on.
   credits_panes
   flagged_panes   # (1d) …and the line the CLI leaves after a safeguards switch, when it picked a rung too low
-  floor_pass      # a planning pane below the floor goes back to it: up, or parked there while it is out
+  reconcile       # every session to the model it belongs on, up or down, event or none (see reconcile)
   # ---- (4) IN EVERY STATE, AND BEFORE ANY BRANCH BELOW CAN RETURN: say which live sessions are not on the model a
   # dispatch would name. Report only — the moves above and the retune pass further down are the ones that type.
   report_mismatches
@@ -1247,7 +1282,8 @@ selfcheck(){   # fixtures only: no network, no tmux, and none of this box's stat
   local dlg dlg2 dlgwrap notice credits worker quoted perm askfirst pe0 pn pf0
   d=$(mktemp -d) || return 1
   UNAV="$d/model-unavailable"   # hermetic from the first case: a model this box has recorded must not bend the chain here
-  local oldmoved="$MOVED"; MOVED="$d/model-moved"
+  local probe_src; probe_src=$(declare -f probe)   # cases below stub probe and `unset -f` it: (s) runs the real one
+  local oldmoved="$MOVED"; MOVED="$d/model-moved"; local oldrefused="$REFUSED"; REFUSED="$d/model-refused"
   local oldreturned="$RETURNED"; RETURNED="$d/model-returned"
   local oldsl="${CC_STATUSLINE_DIR:-}"
   CC_STATUSLINE_DIR="$d/statusline"; mkdir -p "$CC_STATUSLINE_DIR"   # …and this box's LIVE sessions are not this test's
@@ -1741,7 +1777,7 @@ TXT
   asked=""; probe_unavailable
   t '(d) two models out: each is asked for once, the primary on its own probe id' "$asked" "$pc2 $PROBEM"
   t '(d) …the one that answered is forgotten, the one still limited is kept, and the log says which' \
-    "$(cut -f1 "$UNAV" | paste -sd, -):$(grep -c $'\tprobe\t'"$PROBEM"$'\tstill limited' "$LOG")" "$(fam "$PRIMARY"):1"
+    "$(cut -f1 "$UNAV" | paste -sd, -):$(grep -cF "$(printf '\tprobe\t%s\tstill limited' "$PROBEM")" "$LOG")" "$(fam "$PRIMARY"):1"
   unset -f probe
   # ── (e) NO SESSION SITS ON A MODEL DIALOG OR LANDS BELOW ITS BAND (owner, 2026-09-20) ────────────────────────────
   # One fixture per dialog wording, each through the real tick with a tmux stub that records every key: the limit
@@ -1884,20 +1920,49 @@ TXT
   t '(p) …only the floor answers: the seat parked off the primary still hands back, and its park ends' \
     "$(paste -sd'|' "$d/handoffs"):$(awk -F'\t' '$1=="%1"{print $5}' "$MOVED"):$(fam "$(current)")" "repo:kept:$(fam "$fl")"
   # a planning seat FOUND below the floor (launched on a low `current`, or the CLI moved it) is typed back up to it
-  pl; printf '%s\t%s\n' '%1' "$lo" '%4' "$lo" > "$d/live"; floor_pass
+  pl; printf '%s\t%s\n' '%1' "$lo" '%4' "$lo" > "$d/live"; reconcile
   t '(p) a planning seat found on the rung under the floor is typed up to it; a track there is left' "$(typed repo):$(typed repo/track)" "/model $fl:"
   # …and while the floor stays out the pass does not park it again: a parked seat is idle, its record keeps saying the
   # low model, and the owner heard about the park once (the gap only held the second line back for ten minutes)
-  pl; rm -f "$OV"; note_unavailable "$(fam "$fl")" "You've hit your monthly spend limit"
-  printf '%s\t%s\n' '%1' "$lo" > "$d/live"; floor_pass
+  pl; rm -f "$OV"; note_unavailable "$(fam "$fl")" "You've hit your monthly spend limit"; note_unavailable "$(fam "$PRIMARY")" 'the cap'
+  printf '%s\t%s\n' '%1' "$lo" > "$d/live"; reconcile
   awk -F'\t' 'BEGIN{OFS="\t"} NF{$2=$2-7200; print}' "$LOG" > "$LOG.t" && mv "$LOG.t" "$LOG"   # two hours later: the park row is outside CC_MODEL_RETUNE_GAP
-  floor_pass
+  reconcile
   t '(p) …the floor still out and the seat still on the low rung: the owner is told once, not every retune gap' \
     "$(grep -c '^notify .*Planning parked' "$d/calls")" 1
   forget_unavailable "$(fam "$fl")"
   # the dialog offering the rung under the floor is not taken for a planning seat: Esc, and it stays parked
   t '(p) a limit dialog offering the rung under the floor: no offer is taken for planning' \
     "$(answer_key "$(printf ' ❯ 1. Switch to %s and continue\n   2. Stop and wait\n Enter to confirm · Esc to cancel\n' "$(label "$lo")")" "$(fam "$fl")" floor)" Escape
+
+  # ── ONE RECONCILE, NO EVENT NEEDED (owner, 2026-09-21): after the account change five seats sat on the fallback with
+  # no $MOVED row, so no lift ever returned them. Each case builds its own state and asserts the kept and the moved.
+  pl; rm -f "$OV"; printf '%s\n' '%1 repo' '%4 repo/track' > "$d/sess"; printf '%s\t%s\n' '%1' "$FALLBACK" '%4' "$FALLBACK" > "$d/live"
+  note_unavailable "$(fam "$PRIMARY")" 'Fable 5.1 requires usage credits'; reconcile
+  t '(s) born on the fallback while the primary is out: nothing moves, it is where it belongs' "$(paste -sd'|' "$d/handoffs"):$(typed repo)" ":"
+  rm -f "$UNAV"   # the record gone with no lift run (cleared, or a new login): no row, no event
+  probe(){ return 0; }; tick; unset -f probe
+  t '(s) …the primary answers: the next tick hands the seat back, a rowless track is left where it was put' \
+    "$(paste -sd'|' "$d/handoffs"):$(typed repo/track)" "repo:"
+  : > "$d/handoffs"; reconcile
+  t '(s) …and the tick after does not hand it back twice' "$(paste -sd'|' "$d/handoffs")" ""
+  pl; rm -f "$OV"; printf '%s\n' '%1 repo' > "$d/sess"; printf '%s\t%s\n' '%1' "$lo" > "$d/live"
+  note_unavailable "$(fam "$PRIMARY")" 'the cap'; note_unavailable "$(fam "$fl")" "You've hit your monthly spend limit"; reconcile
+  t '(s) a seat below its floor with the floor out: typed up to the floor and parked there, the owner told once' \
+    "$(typed repo):$(awk -F'\t' '$1=="%1"{print $5}' "$MOVED"):$(grep -c '^notify .*Planning parked: repo ' "$d/calls")" "/model $fl:parked:1"
+  pl; rm -f "$OV"; printf '%s\n' '%1 repo' > "$d/sess"; printf '%s\t%s\n' '%1' "$PRIMARY" > "$d/live"
+  note_unavailable "$(fam "$PRIMARY")" 'the cap'; reconcile
+  t '(s) DOWN with no event: a seat on a model on record as out is typed to the rung that runs, and banked to come back' \
+    "$(typed repo):$(awk -F'\t' '$1=="%1"{print $5 ":" $6}' "$MOVED")" "/model $fl:moved:$(fam "$PRIMARY")"
+  # A PROBE THAT ANSWERS WHILE A REAL RUN IS REFUSED IS NOT AVAILABILITY (model.log 2026-09-21 17:17-17:48Z)
+  pl; rm -f "$OV" "$REFUSED"; local oldclaude="$CLAUDE"; CLAUDE="$d/bin/fakeclaude"; eval "$probe_src"
+  printf '#!/bin/sh\ncat "%s/ok.json"\n' "$d" > "$CLAUDE"; chmod +x "$CLAUDE"
+  printf '%s\t%s\n' "$(fam "$PRIMARY")" "$((now - 7200))" > "$REFUSED"; probe "$PRIMARY"
+  t '(s) the probe answers and the last real refusal is two hours old: available' "$?" 0
+  mark_unavailable "$PRIMARY" 'Fable 5.1 requires usage credits'; rm -f "$ST/model-probed"; probe_unavailable
+  t '(s) …a real run refused just now: the same answer counts as unavailable, and the record stays' \
+    "$(unavail "$(fam "$PRIMARY")" && echo rec):$(grep -c $'\trefusal\t.*a real run on it was refused' "$LOG")" "rec:1"
+  CLAUDE="$oldclaude"; rm -f "$REFUSED"
 
   # ── A LINE IS READ ONCE (2026-09-21 17:17–17:48Z): the record forgotten, the same idle line is history ──────────
   pl; printf '%s\n' '%6 w/idle' > "$d/sess"; printf '%s\t%s\n' '%6' "$fl" > "$d/live"; rm -f "$OV"
@@ -1967,7 +2032,7 @@ TXT
   t 'and when they agree again, status is quiet about it' "$(status_line)" "$(fam "$PRIMARY")"
   unset -f slrec
   rm -f "$CC_STATUSLINE_DIR"/*.json
-  unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"; MOVED="$oldmoved"; RETURNED="$oldreturned"
+  unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"; MOVED="$oldmoved"; RETURNED="$oldreturned"; REFUSED="$oldrefused"
   if [ -n "$oldsl" ]; then CC_STATUSLINE_DIR="$oldsl"; else unset CC_STATUSLINE_DIR; fi
   rm -rf "$d"
   printf 'cc-model selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
