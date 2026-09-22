@@ -3,7 +3,9 @@
 # the hook registrations the box's mechanical gates are made of, plus the deny rules that must never go missing.
 # Everything else in that file belongs to whoever uses the box: never touched, never reported as drift.
 #   cc-settings check     one line naming exactly what is unapplied; exit 1 when anything is. install + audit use this.
-#   cc-settings show      one line per managed entry, with why each one exists
+#                         A hook that already runs for some tool types is named with only the rest: PreToolUse(Agent|Task).
+#   cc-settings show      one line per managed entry, with why each one exists; a partly registered hook reads
+#                         PARTIAL with its gap, not MISSING with the whole hook's why
 #   cc-settings apply     OWNER ONLY, at a terminal: back up, then add the missing HOOKS. Never `permissions`.
 #   cc-settings grant allow '<rule>' --by <who> [--card <id>]     THE cc-slack DAEMON ONLY, carrying the owner's
 #                         `yes <id> fix` on a 🔐 grant card: back up, add that ONE rule to permissions.allow,
@@ -65,23 +67,54 @@ add_hook(){ jq --arg ev "$2" --arg m "$3" --arg c "$4" '
 # instead of MISSING, so this never runs against one.
 set_statusline(){ jq --arg c "$2" '.statusLine = {type:"command", command:$c}' "$1"; }
 
-# scan sets MISSING (one row per unapplied entry: "hook<US>event<US>matcher<US>command<US>why",
+# scan sets MISSING (one row per unapplied entry: "hook<US>event<US>matcher-gap<US>command<US>why",
 # "deny<US>rule", "statusline<US>command<US>why", or "absent<US>path"), UNRELATED (lines outside the
 # subset — context, never a fault), and SL_CUSTOM (the owner's own statusLine command, when it differs
 # from the manifest's — satisfied, never flagged as drift, never written over).
+# matcher-gap: for an empty wanted matcher, "" (that event/command is either an exact match or the whole
+# row is missing — Stop and SubagentStop have no tool-type dimension). For a non-empty one, only the
+# PIPE-SEPARATED TOOL TYPES no live entry for that same event+command covers, computed over the UNION of
+# every live entry's matcher for it — so a command split across two or three registrations (or reordered)
+# reads as applied exactly like one, and only the tool types genuinely uncovered are named as the gap
+# (PROVEN 2026-09-21: cc-guard split live across two matchers covering Bash..Glob and flagged as fully
+# "MISSING", the same alarm as zero coverage, though merge/deploy — Bash — already ran; row
+# raised-settings-check-says-the-guard-hook-is-missing).
 MISSING=""; UNRELATED=0; SL_CUSTOM=""
+# gap_for <event> <command> <want-matcher> <live-rows> — the want-matcher's pipe-separated tool types not
+# named by any live row's matcher for the same event+command; "" (with success) means fully covered.
+gap_for(){
+  local ev=$1 cmd=$2 want=$3 live=$4 lev lm lcmd covered="" t rest out=""
+  while IFS=$US read -r lev lm lcmd; do
+    [ "$lev" = "$ev" ] && [ "$(norm "$lcmd")" = "$(norm "$cmd")" ] || continue
+    [ -z "$lm" ] && { covered=ALL; break; }   # an unscoped live entry for this command already covers every tool
+    covered="$covered|$lm|"
+  done <<<"$live"
+  [ "$covered" = ALL ] && return 0
+  rest=$want
+  while [ -n "$rest" ]; do
+    t=${rest%%|*}; case "$rest" in *\|*) rest=${rest#*|} ;; *) rest="" ;; esac
+    [ -n "$t" ] || continue
+    case "$covered" in *"|$t|"*) ;; *) out="${out:+$out|}$t" ;; esac
+  done
+  printf '%s' "$out"
+}
 scan(){
   MISSING=""; UNRELATED=0; SL_CUSTOM=""
-  local ev m cmd why rule found lev lm lcmd live ld n sl_want sl_live
+  local ev m cmd why rule found lev lm lcmd live ld n sl_want sl_live gap
   [ -f "$S" ] || { MISSING="absent$US$S"; return; }
   live=$(live_hooks)
   while IFS=$US read -r ev m cmd why; do
     [ -n "$ev" ] || continue
-    found=0
-    while IFS=$US read -r lev lm lcmd; do
-      [ "$lev" = "$ev" ] && [ "$(norm "$lm")" = "$(norm "$m")" ] && [ "$(norm "$lcmd")" = "$(norm "$cmd")" ] && { found=1; break; }
-    done <<<"$live"
-    [ "$found" = 1 ] || MISSING+="hook$US$ev$US$m$US$cmd$US$why"$'\n'
+    if [ -z "$m" ]; then
+      found=0
+      while IFS=$US read -r lev lm lcmd; do
+        [ "$lev" = "$ev" ] && [ -z "$lm" ] && [ "$(norm "$lcmd")" = "$(norm "$cmd")" ] && { found=1; break; }
+      done <<<"$live"
+      [ "$found" = 1 ] || MISSING+="hook$US$ev$US$US$cmd$US$why"$'\n'
+    else
+      gap=$(gap_for "$ev" "$cmd" "$m" "$live")
+      [ -n "$gap" ] && MISSING+="hook$US$ev$US$gap$US$cmd$US$why"$'\n'
+    fi
   done < <(want_hooks)
   ld=$(live_deny)
   while IFS= read -r rule; do
@@ -98,14 +131,22 @@ scan(){
   UNRELATED=${n:-0}
 }
 miss_of(){ grep "^$1$US" <<<"$MISSING"; }   # never matches when MISSING is empty: grep, not a case glob
+# partial_gap <event> <command> <gap> — true when <gap> is some but not all of the manifest's matcher for that
+# hook: the command already runs for every other tool type. check and show then name only the gap, and show drops
+# the manifest's why ("…a worker can merge, deploy and push"), which is true of a missing guard, not a partial one.
+partial_gap(){ [ -n "$3" ] && [ "$3" != "$(jq -r --arg e "$1" --arg c "$2" \
+                 'first(.hooks[] | select(.event == $e and .command == $c) | .matcher // "")' "$M")" ]; }
 
 # one line the owner can act on, and an exit code the caller can gate on
 check(){
-  local kind a hooks="" denies="" sl=""
+  local kind a g c hooks="" denies="" sl=""
   scan
   if miss_of absent >/dev/null; then echo "settings — $S does not exist (run install.sh once)"; return 1; fi
-  while IFS=$US read -r kind a _; do
-    case "$kind" in hook) hooks="$hooks $a" ;; deny) denies="$denies $a" ;; statusline) sl=1 ;; esac
+  while IFS=$US read -r kind a g c _; do
+    case "$kind" in
+      hook) if partial_gap "$a" "$c" "$g"; then hooks="$hooks $a($g)"; else hooks="$hooks $a"; fi ;;
+      deny) denies="$denies $a" ;; statusline) sl=1 ;;
+    esac
   done <<<"$MISSING"
   if [ -z "$hooks$denies$sl" ]; then
     echo "settings — all $( { want_hooks; want_deny; want_statusline; } | grep -c .) managed entries applied ($UNRELATED unrelated line(s) differ, not managed)"
@@ -117,14 +158,29 @@ check(){
   return 1
 }
 
+# hook_gap <event> <command> — 0 and sets $HGAP to that MISSING row's matcher-gap (possibly "") when one
+# exists for this event+command; 1 otherwise. cmd compared literally: both sides are always the manifest's
+# own raw string here, never normalized, so this never needs norm().
+hook_gap(){
+  local k e m c w
+  while IFS=$US read -r k e m c w; do
+    [ "$k" = hook ] && [ "$e" = "$1" ] && [ "$c" = "$2" ] && { HGAP=$m; return 0; }
+  done <<<"$MISSING"
+  return 1
+}
 show(){
   local ev m cmd why rule
   scan
   printf 'manifest: %s\nlive:     %s\n\n' "$M" "$S"
   while IFS=$US read -r ev m cmd why; do
     [ -n "$ev" ] || continue
-    if grep -qF "hook$US$ev$US$m$US$cmd" <<<"$MISSING"; then
-      printf '  MISSING  hook %-16s %s\n           why: %s\n' "$ev" "$(norm "$cmd")" "$why"
+    if hook_gap "$ev" "$cmd"; then
+      if partial_gap "$ev" "$cmd" "$HGAP"; then
+        printf '  PARTIAL  hook %-16s %s  (already covers all but: %s)\n           registered for every other tool type; only %s is ungated\n' \
+          "$ev" "$(norm "$cmd")" "$HGAP" "$HGAP"
+      else
+        printf '  MISSING  hook %-16s %s\n           why: %s\n' "$ev" "$(norm "$cmd")" "$why"
+      fi
     else printf '  ok       hook %-16s %s\n' "$ev" "$(norm "$cmd")"; fi
   done < <(want_hooks)
   while IFS= read -r rule; do
@@ -286,7 +342,7 @@ grant(){
 }
 
 selfcheck(){
-  local d n=0 f=0 S M DEF CL out rc sl_cmd self sha
+  local d n=0 f=0 S M DEF CL out rc sl_cmd self sha g_found
   d=$(mktemp -d "${TMPDIR:-/tmp}/cc-settings-sc.XXXXXX") || return 1   # S/M/DEF are local: every case runs against fixtures
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a case that PRINTS (jq -e) must not leak into the verdict
@@ -338,6 +394,48 @@ selfcheck(){
   # right event, wrong matcher: a narrowed guard leaves tools ungated, so it is drift
   jq '.hooks.PreToolUse[0].matcher = "Bash"' "$DEF" > "$d/narrow.json"; S="$d/narrow.json"
   scan; k "$(t grep -q "^hook${US}PreToolUse" <<<"$MISSING")" "a narrowed PreToolUse matcher is drift, not a match"
+  # THE PROVEN CASE (2026-09-21, row raised-settings-check-says-the-guard-hook-is-missing): the live guard
+  # hook was split across two matcher entries — Bash..NotebookEdit and Read..Glob — whose UNION covered
+  # everything the manifest wanted at the time. scan() required one entry matching byte-for-byte and called
+  # the whole registration MISSING, with the "a worker session can merge, deploy and push" warning, though
+  # merge/deploy (Bash) already ran; a seat spent a turn manually proving that before telling the owner.
+  jq '.hooks.PreToolUse = [
+        {matcher:"Bash|Edit|Write|MultiEdit|NotebookEdit", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
+        {matcher:"Read|NotebookRead|Grep|Glob|Agent|Task", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
+        .hooks.PreToolUse[1]
+      ]' "$DEF" > "$d/split-full.json"
+  S="$d/split-full.json"; scan
+  k "$(t test -z "$MISSING")" "a command split across two matcher entries whose union covers the manifest's is applied, not MISSING"
+  # …but a split that leaves a real gap must still be named — exactly what mirrors the live box that day:
+  # Bash..Glob covered, Agent|Task (the isolation:worktree spawn fence) not.
+  jq '.hooks.PreToolUse = [
+        {matcher:"Bash|Edit|Write|MultiEdit|NotebookEdit", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
+        {matcher:"Read|NotebookRead|Grep|Glob", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
+        .hooks.PreToolUse[1]
+      ]' "$DEF" > "$d/split-gap.json"
+  S="$d/split-gap.json"; scan
+  if hook_gap PreToolUse '$HOME/bin/cc-guard'; then g_found=0; else g_found=1; fi
+  k "$g_found" "a split registration with a real gap is still reported as a hook row"
+  k "$(t test "$HGAP" = 'Agent|Task')" "…and the gap names only the uncovered tool types (Agent|Task), not the whole ten-tool matcher"
+  out=$(check); rc=$?
+  k "$(t test "$rc" -ne 0)" "…and check still exits non-zero: Bash already gated is not the same as fully applied"
+  out=$(show)
+  k "$(t grep -q 'already covers all but: Agent|Task' <<<"$out")" "…and show says precisely what is left, not a blanket MISSING"
+  k "$(t test "$(grep -c 'merge, deploy and push' <<<"$out")" -eq 0)" "…and show does not raise the missing-guard merge/deploy alarm for a partial gap"
+  S="$d/split-gap.json"; out=$(check)
+  k "$(t grep -qF 'UNAPPLIED: hook PreToolUse(Agent|Task) ' <<<"$out")" "…and check names the gap, not the whole hook: $out"
+  # its control: the guard gone from every entry is the whole hook missing, and keeps the full alarm
+  jq '(.hooks.PreToolUse[] | .hooks) |= map(select(.command != "$HOME/bin/cc-guard"))' "$DEF" > "$d/no-guard.json"
+  S="$d/no-guard.json"; out=$(check)
+  k "$(t grep -qF 'UNAPPLIED: hook PreToolUse — ' <<<"$out")" "a guard missing from every entry is named as the whole hook, no gap: $out"
+  out=$(show)
+  k "$(t grep -q 'merge, deploy and push' <<<"$out")" "…and show keeps the merge/deploy alarm for it"
+  S="$d/split-gap.json"
+  # closing the loop: applying just the gap (what apply() would do, since $HGAP is what it hands add_hook)
+  # is enough — it must not duplicate the two registrations that already run.
+  add_hook "$d/split-gap.json" PreToolUse 'Agent|Task' '$HOME/bin/cc-guard' > "$d/split-fixed.json"
+  S="$d/split-fixed.json"; scan
+  k "$(t test -z "$MISSING")" "…and adding only the missing Agent|Task registration closes it"
   # an EXTRA hook of the user's own, alongside the managed ones, is not drift either
   jq '.hooks.PreToolUse[0].hooks += [{type:"command", command:"$HOME/bin/mine"}]' "$DEF" > "$d/extra-hook.json"
   S="$d/extra-hook.json"; scan
