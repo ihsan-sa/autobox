@@ -354,6 +354,25 @@ def reply_shape(text):
                 f"(the journal, docs/ or the canvas). Do not squeeze the same things into fewer characters")
     return None
 
+CHAT_ID_RE = re.compile(r"([CDGU][A-Z0-9]+|#[^\s#]+)\Z")   # what chat.postMessage takes: C… channel, D… DM, G… group, U… user, #name
+
+def not_a_chat(chat):
+    """Why `reply`, `react` and `file` cannot be aimed at this chat_id — one line — or None when it is a Slack
+    conversation. The box wakes a session with metas of its own making (inject, a pulled lesson, an approval that
+    could not be queued): they carry chat_id="local", which no Slack call can take. A seat that followed the tool's
+    own contract and answered that chat_id was told "logged to outbox.log (no SLACK_BOT_TOKEN)" — so it went hunting
+    a token that was fine, and its words were filed in outbox.log as a post, where the box's own record of what was
+    said now holds an answer that reached nobody (raised by a course seat, 2026-09-19). Refused here, before anything
+    is posted, logged or claimed, and for every shape Slack cannot address (a C…/D…/G…/U… id or a #name is
+    let through — #name is how a seat re-sends to its own channel), so the next local-style source cannot reopen it. Nothing is re-routed: where the line should go is the seat's to decide."""
+    if CHAT_ID_RE.match(chat or ""):
+        return None
+    shown = " ".join(str(chat or "").split())[:40] or "(empty)"
+    what = ("is a wake from the box itself, not a Slack conversation" if shown == "local" else
+            "is not a Slack conversation (a C…, D…, G… or U… id, or a #channel-name)")
+    return (f'not sent — chat_id "{shown}" {what}, so there is no thread to answer in and nothing was posted or '
+            f"logged; a line a person has to read goes to this session's own channel.")
+
 def member_facing_here():
     """Is this a member-facing session (`.cc/member-facing` in the cwd or a parent, cc-guard's walk)? Its replies
     go to members, not the owner, so the owner-facing shape rule doesn't apply."""
@@ -6764,7 +6783,7 @@ If a request will take more than a minute, reply with a one-line acknowledgement
 When the answer is an image or a file, send it with the `file` tool (the path, plus the chat_id and thread_ts you would reply with). Describing it is not sending it, and never say "here it is" unless a file went. The tool reads from this session's own folder, /tmp or ~/.cc/slack/files, and tells you when the file only reached the outbox.
 file_path or file_paths in the tag are the sender's attachments, saved where you can Read them (images render). A shared or forwarded message arrives as a bracketed line, `[shared message from #chan by author at …: …]`, and their own text may be only your name. That line is what they sent you, so never answer that the message arrived empty.
 voice="memo" in the tag means they spoke the message. The text is a condensed transcript, so answer it in that thread like a typed one. Transcribing takes about a minute, so a memo can arrive after something they typed later; the ts is when it was spoken. The words as spoken are in the box's reply under the recording and on disk (voice_path + ".txt"). Read them only when the condensed text is ambiguous or the exact wording matters.
-Permission prompts are relayed to Slack automatically, and the owner answers `yes <id>` or `no <id>` there. channel="local" messages were injected on the box by tests or scripts. Reply the same way: a reply to chat_id="local" lands in ~/.cc/slack/outbox.log.
+Permission prompts are relayed to Slack automatically, and the owner answers `yes <id>` or `no <id>` there. chat_id="local" is not a Slack conversation: that message was injected on the box itself, by a script or a test, so there is no thread to answer in and `reply`, `react` and `file` refuse it. If a person has to read something about it, say that in this session's own channel.
 Reactions on your messages reach you as `👍 on your 07:12 reply: "…"` (meta kind=reaction), with user= and role=. 👍 is yes and 👎 is no, so act without asking again. A member's reaction counts like the owner's for anything they could have asked in words, never as approval for what the box gates on the owner. If their message only needs yes, no or an ack, `react` on its ts instead of replying: 👍 `+1` yes, 👎 `-1` no, ✅ `white_check_mark` done, ❌ `x` can't, 🤔 `thinking_face` unclear (then ask), or any emoji that says it. 👀 `eyes` means "received" and answers nothing, and your reaction takes it off. Nothing answers for you: a message you finished without a word stays unanswered."""
 INSTRUCTIONS = "\n".join(x for x in (SLACK_RULES, writing_block()) if x)
 
@@ -6959,6 +6978,10 @@ class Channel:
     def call(self, name, a):
         if os.environ.get("CC_ROLE") == "worker":
             return "Slack tools are for interactive sessions", True   # a --go worker must not post to the owner's channels
+        if name in ("reply", "react", "file"):
+            why = not_a_chat(a.get("chat_id") or "")      # a box wake has no thread: refused before anything is sent or logged
+            if why:
+                return why, True
         if self.member:
             return self.member_call(name, a)
         if name in ("reply", "react", "file") and self.muted():
@@ -7044,7 +7067,7 @@ class Channel:
                 if a.get("ts"):
                     react(self.cfg, chat, a["ts"], "eyes", remove=True)   # the file is the answer: 👀 comes off
                 if not fid:
-                    return (f"NOT sent to Slack — logged to {DIR}/outbox.log (no SLACK_BOT_TOKEN, or chat_id=local); "
+                    return (f"NOT sent to Slack — logged to {DIR}/outbox.log (no SLACK_BOT_TOKEN); "
                             "nothing reached anyone, so do not say the file arrived"), False
                 missed = unresolved_mentions(self.cfg, a.get("text") or "", chat)
                 return (f"sent {os.path.basename(path)}" + (" in the thread" if a.get("thread_ts") else "")

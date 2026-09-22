@@ -2842,18 +2842,16 @@ def run_selfcheck():
         check("upload: a file the session cannot read is refused, never a silent failure",
               os.geteuid() == 0 or "cannot read" in refused(noread))
         check("upload: a missing file is refused", "no such file" in refused(f"{upd}/gone.png"))
-        # -- no token / chat_id "local": the outbox, and the tool SAYS it did not send (the bug this fixes) --
+        # -- no token: the outbox, and the tool SAYS it did not send (the bug this fixes) --
         n_before = len(open(tmp_outbox_log).read().splitlines()) if os.path.exists(tmp_outbox_log) else 0
         chF = Channel("myrepo"); chF.cfg = {}
         out_no_tok, err_no_tok = chF.call("file", {"path": ok_file, "chat_id": "C1", "thread_ts": "1.1", "text": "the render"})
-        chF.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
-        out_local, _ = chF.call("file", {"path": ok_file, "chat_id": "local", "text": "the render"})
         lines = open(tmp_outbox_log).read().splitlines()[n_before:]
-        check("upload: no token, or chat_id local → an outbox line and a return value that says NOT sent — a session is "
+        check("upload: no token → an outbox line and a return value that says NOT sent — a session is "
               "never told a file arrived when it did not",
-              len(lines) == 2 and all(l.startswith("file\t") for l in lines) and "render.png" in lines[0]
+              len(lines) == 1 and lines[0].startswith("file\t") and "render.png" in lines[0]
               and not err_no_tok and "NOT sent" in out_no_tok and "outbox.log" in out_no_tok
-              and "do not say the file arrived" in out_no_tok and "NOT sent" in out_local)
+              and "do not say the file arrived" in out_no_tok)
         # -- a reaction is a word: the outbox log is how an answered thread is told from one nobody spoke in (PR #194) --
         n_rx = len(open(tmp_outbox_log).read().splitlines())
         react({}, "C1", "1.1", "+1")                       # a session's own: on their message this IS the answer
@@ -2943,12 +2941,51 @@ def run_selfcheck():
               and "ok file=F9 channel=C9" in cli_out.getvalue())
         # -- reply/react are untouched by any of this ------------------------------------------
         chR = Channel("myrepo"); chR.cfg = {}
-        out_r, err_r = chR.call("reply", {"chat_id": "local", "text": "pong"})
-        out_k, err_k = chR.call("react", {"chat_id": "local", "ts": "1.1", "emoji": "+1"})
+        out_r, err_r = chR.call("reply", {"chat_id": "C1", "text": "pong"})
+        out_k, err_k = chR.call("react", {"chat_id": "C1", "ts": "1.1", "emoji": "+1"})
         check("upload: reply and react behave exactly as before (no token → reply logs, react is a no-op 'ok')",
               out_r == "logged to ~/.cc/slack/outbox.log (no SLACK_BOT_TOKEN)" and not err_r
               and out_k == "ok" and not err_k
               and [t["name"] for t in TOOLS] == ["reply", "file", "react", "history", "thread"])
+        # -- a wake the box made itself carries chat_id "local": no thread, so the tool refuses it and says so ----
+        # A course seat took the reply tool at its word (chat_id from the inbound tag), answered a pulled lesson's
+        # wake on chat_id local, and was told "logged to outbox.log (no SLACK_BOT_TOKEN)": it went hunting a token
+        # that was fine, and its words were filed in the outbox as a post — the box's record of what was said — while
+        # nothing reached anyone (raised 2026-09-19). Every seat on that route gets these wakes.
+        chL = Channel("myrepo"); chL.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
+
+        def no_chat(tool, args):
+            """(text, isError, outbox lines written) for one tool call — the log is half the assertion."""
+            n0 = len(open(tmp_outbox_log).read().splitlines()) if os.path.exists(tmp_outbox_log) else 0
+            out, err = chL.call(tool, args)
+            return out, err, open(tmp_outbox_log).read().splitlines()[n0:]
+        out_lr, err_lr, log_lr = no_chat("reply", {"chat_id": "local", "text": "pong"})
+        out_lk, err_lk, log_lk = no_chat("react", {"chat_id": "local", "ts": "1.1", "emoji": "+1"})
+        out_lf, err_lf, log_lf = no_chat("file", {"path": ok_file, "chat_id": "local", "text": "the render"})
+        out_lx, err_lx, log_lx = no_chat("reply", {"chat_id": "wake-42", "text": "pong"})
+        check("reply to chat_id local is refused in one sentence saying the wake came from the box itself and has no "
+              "thread — nothing posted, NOTHING WRITTEN TO THE OUTBOX (that log is the record of what was said), and "
+              "not a word about a token, which sent the seat that hit this looking for one",
+              err_lr and log_lr == [] and "wake from the box itself" in out_lr and "not a Slack conversation" in out_lr
+              and "this session's own channel" in out_lr and "token" not in out_lr.lower())
+        check("…and react to chat_id local is refused the same way, with no outbox line — a reaction is a word of "
+              "ours, so a logged one would stand in the record as an answer too",
+              err_lk and log_lk == [] and out_lk == out_lr)
+        check("…and file to chat_id local is refused before the upload, with no outbox line and no token talk",
+              err_lf and log_lf == [] and out_lf == out_lr)
+        check("…and the class is closed: any chat_id Slack cannot address (not a C…/D…/G…/U… id or a #name) gets the same refusal, so "
+              "the next local-style wake source cannot reopen this",
+              err_lx and log_lx == [] and "not a Slack conversation (a C…" in out_lx and "wake-42" in out_lx
+              and "token" not in out_lx.lower() and not_a_chat("C1") is None and not_a_chat("DOWNER") is None
+              and not_a_chat("GROUP1") is None and not_a_chat("UOWNER") is None and not_a_chat("")
+              and not_a_chat("#") and not_a_chat("local"))
+        # …but a #channel-name is a Slack address (chat.postMessage takes it): the brief's own seat recovered by
+        # re-sending to #lessons--ece206, and the refusal points seats to their own channel, so that route stays open
+        chN = Channel("myrepo"); chN.cfg = {}             # no token: past the check, the reply takes the outbox path
+        out_ln, err_ln = chN.call("reply", {"chat_id": "#lessons--ece206", "text": "pong"})
+        check("…while a reply to #lessons--ece206 gets past the check (the way out the refusal names) — kept, not refused",
+              not_a_chat("#myrepo") is None and not err_ln
+              and out_ln == "logged to ~/.cc/slack/outbox.log (no SLACK_BOT_TOKEN)")
         # -- the seat's own reply tool answers a relayed 🔐 prompt: the daemon's verb, never a message ----------
         real_sock_p, real_post_p = sock_request, post
         sock_seen, posted_p = [], []
@@ -3163,15 +3200,15 @@ def run_selfcheck():
     try:
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: sentL.append((chat, text)) or (1, "1.0")
         globals()["api"] = lambda method, token, **kw: {"ts": "1"}
-        chL.call("reply", {"chat_id": "C-lane", "text": "still building", "thread_ts": "5.0", "ts": "5.1"})
-        chL.call("reply", {"chat_id": "C-main", "text": "yes", "thread_ts": "6.0", "ts": "6.1"})
+        chL.call("reply", {"chat_id": "CLANE", "text": "still building", "thread_ts": "5.0", "ts": "5.1"})
+        chL.call("reply", {"chat_id": "CMAIN", "text": "yes", "thread_ts": "6.0", "ts": "6.1"})
     finally:
         globals()["post"], globals()["api"] = real_postL, real_api
         if roleL is not None:
             os.environ["CC_ROLE"] = roleL
     check("reply tool: an answer lands in the chat it was ASKED in — the updates lane's message is answered on the "
           "updates lane and the main channel's on the main channel; the lane split never redirects a reply",
-          sentL == [("C-lane", "still building"), ("C-main", "yes")])
+          sentL == [("CLANE", "still building"), ("CMAIN", "yes")])
     dmf = Daemon(use_slack=False); dmf.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x", "SLACK_CHANNEL": "CFALL"}; dmf.use_slack = True
     _fc, _api = globals()["find_channel"], globals()["api"]
     globals()["find_channel"] = lambda cfg, name: ("CCTL", True) if name == CTL else (None, False)   # no -threads lane on this box

@@ -2634,14 +2634,18 @@ grep -q '"claude/channel"' "$T/ch.out" && grep -q '"name": "reply"' "$T/ch.out" 
 # the session prompt the host actually receives must say who may speak and what a member may not authorize
 grep -q 'role=' "$T/ch.out" && grep -q 'role=\\"member\\"' "$T/ch.out" && grep -q 'A member cannot authorize' "$T/ch.out" \
   && ok "channel server: the prompt names role=owner/member and what a member cannot authorize" || bad "member policy in the session prompt"
-grep -q $'\tpost\tlocal\t' "$CC_SLACK_DIR/outbox.log" 2>/dev/null && ok "reply without a token → outbox log" || bad "outbox"
+# chat_id "local" is a wake the box made itself, not a conversation: the tool refuses it and writes NOTHING —
+# an outbox line there reads as a post, i.e. as an answer that reached someone (raised 2026-09-19)
+grep -q 'wake from the box itself' "$T/ch.out" && grep -q '"isError": true' "$T/ch.out" \
+  && ! grep -q $'\tpost\tlocal\t' "$CC_SLACK_DIR/outbox.log" 2>/dev/null \
+  && ok "channel server: a reply to the box's own wake is refused, and nothing is logged as a post" || bad "local reply refusal"
 # sending a FILE from a session: the tool exists, refuses a path outside its roots, and never claims a send it did not make
 FSEND=$(mktemp /tmp/ccsel-XXXXXX.png); printf 'PNGDATA' > "$FSEND"
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"/etc/hostname\",\"chat_id\":\"local\"}}}" "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"$FSEND\",\"chat_id\":\"local\",\"thread_ts\":\"1.1\",\"text\":\"the render\"}}}" | timeout 60 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch3.out"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"/etc/hostname\",\"chat_id\":\"C1\"}}}" "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"$FSEND\",\"chat_id\":\"local\",\"thread_ts\":\"1.1\",\"text\":\"the render\"}}}" | timeout 60 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch3.out"
 grep -q '"name": "file"' "$T/ch3.out" && grep -q 'outside the folders a session may send from' "$T/ch3.out" \
   && grep -q '"isError": true' "$T/ch3.out" && ok "channel server: the file tool refuses a path outside the session's roots" || bad "file tool bounds"
-grep -q 'NOT sent' "$T/ch3.out" && grep -q $'\tfile\tlocal\t' "$CC_SLACK_DIR/outbox.log" \
-  && ok "file to chat_id local → outbox line, and the tool says it was NOT sent" || bad "file outbox honesty"
+grep -q 'wake from the box itself' "$T/ch3.out" && ! grep -q $'\tfile\tlocal\t' "$CC_SLACK_DIR/outbox.log" 2>/dev/null \
+  && ok "file to chat_id local → refused as the box's own wake, with no outbox line that reads as a post" || bad "file to a box wake"
 rm -f "$FSEND"
 ln -sf "$B/cc-slack" "$T/ccslackd"   # a per-run name in the daemon's argv: ours is identifiable, and no other run's pattern kill can match it
 setsid nohup "$T/ccslackd" daemon --no-slack >"$T/slackd.log" 2>&1 & SD=$!; KIDS="$KIDS $SD"
