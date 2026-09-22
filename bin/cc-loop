@@ -419,7 +419,13 @@ tell_planner(){   # $1 the line -> 0 the broker has it and owns the escalation f
   # writes the event down BEFORE it sends anything, so its own 60 s flush delivers what this gave up waiting for.
   # The cost of the timeout is therefore a duplicate — a page AND a late wake — and never a dropped stop.
   timeout 30 "$BIN/cc-broker" inject --no-start --source loop "$(stop_target)" "$1" >/dev/null 2>&1; }
-stop_prio(){ [ "$1" = yes ] && echo low || echo high; }   # heard by a session -> the owner's line is ambient (ladder rung 5); heard by nobody -> he IS the fallback, so it pushes
+stop_prio(){ [ "$1" = yes ] && echo low || echo high; }   # heard by a session -> the owner's line is ambient (ladder rung 5); heard by nobody -> the updates line pushes AND the stop is filed as a planner request (stop_unheard)
+stop_unheard(){   # a stop NO session took: "a request that reached no seat is preserved and retried, never dropped and never
+                  # dumped on the owner" (core/docs/comms-contract.md). cc-notify --ask writes it under ~/.cc/requests and
+                  # cc-reconcile's tick re-offers it to the seat's broker. The id is minute-floored: two stops of one track
+                  # inside a minute (a relaunch that dies the same way) are one request; a stop a day later is a new one,
+                  # since a request file is never closed and an id already on file is not asked twice.
+  "$BIN/cc-notify" --ask --id "stop:$repo/$track:$(date -u +%Y%m%dT%H%MZ)" -t "$repo/$track $1" "$2" >/dev/null 2>&1 || true; }
 stop_kind(){ case "$1" in 5|6|9|10) echo worker-loop/barren-stop;; 4|12) echo worker-loop/done-undelivered;; 8) echo worker-loop/limit-outlasted-wait;; *) :;; esac; }
 stop_record(){   # $1 exit code, $2 title, $3 message → one failures-ledger record for a stop that is a failure (stop_kind), none for the rest.
                  # Prints what the ledger said; exit 0 always — "a writer that fails must never fail" the stop it is in.
@@ -734,6 +740,8 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   BIN="$realbin"
   t 'a stop a session has is ambient for the owner: an updates line, no push' "$(stop_prio yes)" low
   t '…and one NOBODY has is his, because there is no one else left' "$(stop_prio no)" high
+  grep -qF '[ "$heard" = yes ] || stop_unheard "$title" "$msg"' "$0"
+  t '…and a stop nobody took is ALSO filed as a planner request (cc-notify --ask), preserved and retried rather than left to his push alone' "$?" 0
   grep -qF 'tell_planner "$(planner_line "$title" "$msg")"' "$0"
   t 'and stop() really tells the session, rather than this being two files agreeing on paper' "$?" 0
   grep -qF -- '-p "$(stop_prio "$heard")"' "$0"; t "…and routes the owner's own line by the answer it got" "$?" 0
@@ -942,6 +950,7 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" heard=no whose=""
   # reached nobody is worse than the ping this replaces, so neither of those two depends on it.
   tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose=" $(stop_target)'s session has been told."; }
   log "the stop went to $(stop_target)'s session: $heard"
+  [ "$heard" = yes ] || stop_unheard "$title" "$msg"
   "$BIN/cc-notify" -p "$(stop_prio "$heard")" -t "$repo/$track $title" --heading "$(stop_headline "$title")" "$msg$whose"; exit "$code"; }   # a person reads the row's title; the title routes
 # THE PROJECT PAUSE. `cc-pause on <repo>` parks a whole project; what it does to a loop that is ALREADY RUNNING is
 # signal it, so this is read from the TERM trap and again at the top of every iteration — the flag can appear at any

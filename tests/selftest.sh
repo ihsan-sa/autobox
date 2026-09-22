@@ -1154,7 +1154,8 @@ rm -f "$GH/.cc/state/member-spend.json"
 # credential, but it refused INSIDE the tmux window cc had already opened: a member's message autostarted a pane that died
 # with the reason in it, the board row said running, and neither the member nor the owner heard a thing. cc now checks the
 # file on the host before any window or board write — the session, the track session and a --go alike — and says so where
-# it counts: ONE line in #<h> with the command that fixes it, the owner paged ONCE (a day-stamp beside the file), nothing
+# it counts: ONE line in #<h> with the command that fixes it, the planning seat asked ONCE (a day-stamp beside the file; a
+# request to the seat, cc-notify --ask, since a member-facing repo cannot promote itself to the owner's DM), nothing
 # opened, nothing charged. Once, not each time (owner, 2026-09-04): the drive loop runs exactly this — `cc <repo>` — every
 # 2 h, and a workspace waiting to be minted carried the same line in its channel for a day. A second stamp
 # (credential-told) is what makes the channel line once; the owner's page is unchanged. Both now carry the event's
@@ -1171,11 +1172,11 @@ n1=$(nocred alice); rn1=$?; n2=$(nocred alice todo); rn2=$?; n3=$(nocred alice t
 { [ "$rn1" = 1 ] && [ "$rn2" = 1 ] && [ "$rn3" = 1 ] && grep -q 'no credential of its own' <<<"$n1$n2$n3" \
   && ! grep -q 'new-window' "$T/tmux.log" && [ "$(env HOME="$GH" "$B/cc-board" get alice todo status)" = queued ] \
   && [ "$(grep -c -- '^post -c #alice --major --id credential:alice mint incomplete' "$T/cap.args")" = 1 ] \
-  && [ "$(grep -c -- '^NOTIFY: -t alice --owner --id credential:alice:owner -- .*needs a credential minted' "$T/cap.args")" = 1 ] \
+  && [ "$(grep -c -- '^NOTIFY: -t alice --ask --id credential:alice:owner -- .*needs a credential minted' "$T/cap.args")" = 1 ] \
   && [ -s "$GH/.cc/members/alice/credential-told" ] \
   && [ "$(cat "$GH/.cc/members/alice/credential-asked")" = "$(date -u +%F)" ] && [ ! -f "$GH/.cc/state/member-spend.json" ] \
   && grep -q 'cc-sandbox mint alice' <<<"$n1" && grep -q 'cc-sandbox mint alice' "$T/cap.args"; } \
-  && ok "a workspace with no credential of its own opens NO window (session, track session, --go): #alice is told ONCE what to mint however often the box tries — three attempts, one line — the owner is paged once, the row never says running and nothing is charged" \
+  && ok "a workspace with no credential of its own opens NO window (session, track session, --go): #alice is told ONCE what to mint however often the box tries — three attempts, one line — the planning seat is asked once (a request, never his DM), the row never says running and nothing is charged" \
   || bad "a workspace without a credential still died in a pane, or said it more than once (rc=$rn1/$rn2/$rn3, status=$(env HOME="$GH" "$B/cc-board" get alice todo status 2>&1), tmux='$(tr '\n' '|' < "$T/tmux.log")', args='$(tr '\n' '|' < "$T/cap.args")'): $n1"
 : > "$T/cap.args"; rm -f "$GH/.cc/members/alice/credential-told"   # a line nobody heard leaves no stamp: the next attempt says it again
 NC_SLACK_RC=1 nocred alice >/dev/null; NC_SLACK_RC=1 nocred alice >/dev/null; p1=$(grep -c -- '^post -c #alice --major --id credential:alice mint incomplete' "$T/cap.args")
@@ -1211,7 +1212,7 @@ b1=$(nocred alice); rb1=$?; b2=$(nocred alice todo); rb2=$?; b3=$(nocred alice t
 { [ "$rb1" = 1 ] && [ "$rb2" = 1 ] && [ "$rb3" = 1 ] && ! grep -q 'new-window' "$T/tmux.log" \
   && grep -q 'no credential of its own' <<<"$b1" && [ "$(printf '%s\n' "$b1" "$b2" "$b3" | grep -c 'access token is EMPTY')" = 3 ] \
   && [ "$(env HOME="$GH" "$B/cc-board" get alice todo status)" = queued ] && [ ! -f "$GH/.cc/state/member-spend.json" ] \
-  && [ "$(grep -c -- '^NOTIFY: -t alice --owner --id credential:alice:blank@[0-9]*:owner -- .*needs a credential minted.*access token is EMPTY' "$T/cap.args")" = 1 ]; } \
+  && [ "$(grep -c -- '^NOTIFY: -t alice --ask --id credential:alice:blank@[0-9]*:owner -- .*needs a credential minted.*access token is EMPTY' "$T/cap.args")" = 1 ]; } \
   && ok "a credential blanked by a refused refresh opens NO window either — session, track session and --go all refuse, the row stays queued, and the line the owner gets names the EMPTY token so he re-mints instead of hunting a live pane" \
   || bad "a blanked credential still started a session (rc=$rb1/$rb2/$rb3, status=$(env HOME="$GH" "$B/cc-board" get alice todo status 2>&1), tmux='$(tr '\n' '|' < "$T/tmux.log")', args='$(tr '\n' '|' < "$T/cap.args")'): $b1"
 rm -f "$GH/.cc/members/alice/credentials.json" "$GH/.cc/members/alice/credential-asked" "$GH/.cc/members/alice/credential-told"
@@ -1396,25 +1397,33 @@ grep -q 'cc-handoff", "--sweep"' "$B/cc-reconcile" && [ ! -e "$(dirname "$B")/co
 unset CC_HANDOFF_DIR CC_HANDOFF_RETIRE_GRACE CC_HANDOFF_DRAIN
 
 fi
-if stanza "cc-notify: an escalation reaches the OWNER, not the channel it came from"; then
-# own HOME (the box's real config and owner id stay out of this) + a stub bot: the args cc-notify hands cc-slack ARE the routing
+if stanza "cc-notify: an escalation reaches the PLANNING SEAT, not the owner and not the channel it came from"; then
+# own HOME (the box's real config and owner id stay out of this) + a stub bot and a stub broker: the args cc-notify hands
+# cc-slack ARE the routing, and the args it hands cc-broker are the request (core/docs/comms-contract.md: a member-facing
+# session asks the seat; only the control seat asks the owner)
 NH="$T/nh"; mkdir -p "$NH/bin" "$NH/.cc" "$T/chan/.cc" "$T/plain"; : > "$T/chan/.cc/member-facing"
 cat > "$NH/bin/cc-slack" <<F
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$T/slack.args"
 F
-chmod +x "$NH/bin/cc-slack"; printf 'SLACK_BOT_TOKEN=xoxb-test\nSLACK_OWNER_ID=UOWNER\n' > "$NH/.cc/config"
+cat > "$NH/bin/cc-broker" <<F
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$T/broker.args"
+F
+chmod +x "$NH/bin/cc-slack" "$NH/bin/cc-broker"; printf 'SLACK_BOT_TOKEN=xoxb-test\nSLACK_OWNER_ID=UOWNER\n' > "$NH/.cc/config"
 # -u for every config key: the environment now WINS over the file (cc-config's one rule), so a key exported by
 # whatever session is running this would beat the fixture's own config below.
-N(){ w=$1; shift; : > "$T/slack.args"
-     ( cd "$w" && env -u CC_NOTIFY_LOG_ONLY -u SLACK_BOT_TOKEN -u SLACK_OWNER_ID -u SLACK_WEBHOOK -u SLACK_ALERTS \
+N(){ w=$1; shift; : > "$T/slack.args"; : > "$T/broker.args"
+     ( cd "$w" && env -u CC_NOTIFY_LOG_ONLY -u CC_MEMBER_SANDBOX -u CC_ROLE -u SLACK_BOT_TOKEN -u SLACK_OWNER_ID -u SLACK_WEBHOOK -u SLACK_ALERTS \
            -u NTFY_TOPIC -u NTFY_SERVER -u CC_BOX HOME="$NH" CC_NOTIFY_LOG="$NH/.cc/notify.log" "$B/cc-notify" "$@" >/dev/null 2>&1 ); }
 N "$T/chan" "Alice needs the staging DB restored"
-{ grep -q -- '-c UOWNER' "$T/slack.args" && ! grep -q -- '--route' "$T/slack.args"; } \
-  && ok "a member-facing session's escalation DMs the owner, never its own channel" || bad "escalation went to the channel: $(cat "$T/slack.args")"
-grep -q 'chan escalation' "$T/slack.args" && ok "it says where it came from (default title '<session dir> escalation')" || bad "escalation title: $(head -1 "$T/slack.args")"
+{ ! grep -q -- '-c UOWNER' "$T/slack.args" && ! grep -q -- '--route' "$T/slack.args" && grep -q -- '^inject --source request .* from chan: ' "$T/broker.args"; } \
+  && ok "a member-facing session's escalation is a REQUEST to the planning seat (the broker), never the owner's DM and never its own channel" || bad "escalation went to Slack: $(cat "$T/slack.args") / broker: $(cat "$T/broker.args")"
+grep -q 'chan escalation' "$T/broker.args" && ok "it says where it came from (default title '<session dir> escalation')" || bad "escalation title: $(head -1 "$T/broker.args")"
+[ "$(ls "$NH/.cc/requests"/*.json 2>/dev/null | wc -l)" = 1 ] && [ "$(jq -r .from "$NH"/.cc/requests/*.json)" = chan ] \
+  && ok "…and the request is on file first, naming the workspace the marker names — the file is the request, the broker its transport" || bad "request file: $(ls "$NH/.cc/requests" 2>&1)"
 N "$T/plain" --owner "the disk is filling up"
-grep -q -- '-c UOWNER' "$T/slack.args" && ok "--owner reaches the owner from any session" || bad "--owner ignored: $(cat "$T/slack.args")"
+grep -q -- '-c UOWNER' "$T/slack.args" && ok "--owner from the control seat (no marker, no daemon seat claiming the process) is his DM" || bad "--owner ignored: $(cat "$T/slack.args")"
 N "$T/plain" -t "demorepo/w1 done" "PR: x"     # a REAL repo name: this fixture's own is _cctest…, which the gate below stops on purpose
 { grep -q -- "--route demorepo/w1 done" "$T/slack.args" && ! grep -q -- '-c ' "$T/slack.args"; } \
   && ok "no regression: an ordinary notice still routes by title (#<repo>, #alerts)" || bad "routing changed: $(cat "$T/slack.args")"
@@ -1431,8 +1440,8 @@ N "$T/plain" --owner -- --decision
   && ok "after --, a message that looks like a flag is the message — text somebody else wrote cannot become an option" \
   || bad "-- did not end the options: $(cat "$T/slack.args")"
 N "$T/chan" --decision "the staging DB restore needs your call"
-{ grep -q -- '-c UOWNER' "$T/slack.args" && ! grep -q -- '--mention' "$T/slack.args"; } \
-  && ok "--decision from a member-facing session still DMs the owner — a DM already IS rung 1, and the mention would have gone to the members" || bad "--decision leaked into the member channel: $(cat "$T/slack.args")"
+{ ! grep -q -- '-c UOWNER' "$T/slack.args" && ! grep -q -- '--mention' "$T/slack.args" && grep -q -- '^inject --source request ' "$T/broker.args"; } \
+  && ok "--decision from a member-facing session is that same request — a flag is not authority; only the control seat asks the owner" || bad "--decision from a member-facing session reached Slack: $(cat "$T/slack.args")"
 # THROWAWAY TEST STATE MUST NEVER PAGE THE OWNER: four days of "[_cctest…] PR #7 merged, deploy stopped" in #alerts
 # came from selfchecks whose failures are REAL calls to cc-notify. The gate is here, at the one door every outward
 # notification goes through, so it holds for a caller nobody thought to configure. The line is still LOGGED — the
@@ -1447,8 +1456,11 @@ grep -q -- '--route' "$T/slack.args" \
   || bad "real repo swallowed by the synthetic-name gate"
 printf 'SLACK_BOT_TOKEN=xoxb-test\n' > "$NH/.cc/config"   # owner not paired
 N "$T/chan" "Bob asks for an API key"
-{ grep -q -- '-c #alerts' "$T/slack.args" && ! grep -q -- '--route' "$T/slack.args"; } \
-  && ok "unpaired owner: the escalation falls back to #alerts, still not the member channel" || bad "unpaired escalation: $(cat "$T/slack.args")"
+{ [ ! -s "$T/slack.args" ] && grep -q -- '^inject --source request ' "$T/broker.args"; } \
+  && ok "unpaired owner: the escalation is the seat's request just the same — no owner id is needed to ask the seat, and nothing goes to #alerts or the member channel" || bad "unpaired escalation: $(cat "$T/slack.args")"
+rm -f "$NH/bin/cc-broker"; N "$T/chan" "Carol asks for a repo"
+{ [ ! -s "$T/slack.args" ] && [ "$(jq -r 'select(.delivered==false) | .id' "$NH"/.cc/requests/*.json | wc -l)" = 1 ]; } \
+  && ok "…and with no broker to take it the request stays on file, delivered=false, for cc-notify requests --retry — not dropped, and not dumped on the owner instead" || bad "undelivered request: slack='$(cat "$T/slack.args")' files=$(ls "$NH/.cc/requests" 2>&1)"
 # INSIDE A MEMBER WORKSPACE'S BOUNDARY (cc-sandbox member) ~/.cc/config is ABSENT, so every rung above is unconfigured:
 # `tried` stayed 0 and this exited 0 having written a tmpfs log and reached NOBODY — a blocked member told its
 # escalation worked. The one door out is the workspace's own socket; the daemon holds the token and makes the call.
@@ -2094,8 +2106,12 @@ nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
 CC_CLAUDE="$T/spinclaude" "$B/cc-loop" $REPO w8 --max-iter 20 --quiet >/dev/null 2>&1; rc=$?
 { [ "$rc" = 9 ] && [ "$(nruns w8)" = 3 ]; } && ok "three progress-free iterations stop the loop (exit 9 after 3, not 20)" || bad "runaway: rc=$rc runs=$(nruns w8)"
 lg w8 | grep -q 'runaway signal 3/3' && [ "$("$B/cc-board" get $REPO w8 status)" = blocked ] && ok "…the reason is in the log and the board says blocked — a state a person must settle" || bad "runaway log/board: $(lg w8 | tail -2)"
-n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "w8 is running away")
+n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep "w8 is running away" | grep -vc "rung=P")
 [ "$n" = 1 ] && ok "…and the owner is told once, with the numbers — not once per barren iteration" || bad "runaway notify count: $n"
+# …and a stop NO seat took is also a planner request (cc-notify --ask: kept on file and retried, never dropped and never
+# his alone to catch) — one, under the stop's own id; this fixture's repo is synthetic, so it is logged and not asked.
+nq=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep "w8 is running away" | grep -c "rung=P kind=request")
+[ "$nq" = 1 ] && ok "…and the stop nobody heard is filed once as a planner request beside that line, not dumped on the owner alone" || bad "stop request count: $nq"
 
 # 3: an expensive job that keeps producing is never touched. $50 an iteration, and no cap anywhere.
 mktrack w9 "expensive but productive"

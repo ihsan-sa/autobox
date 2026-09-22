@@ -243,6 +243,41 @@ cfg(){ "$BIN/cc-config" get "$1" 2>/dev/null; }
 ctl(){ local d=$BIN
   case "$d" in "$HOME/dev/"*) d=${d#"$HOME/dev/"}; d=${d%%/*}; [ -n "$d" ] && { printf '%s' "$d"; return 0; };; esac
   printf 'box'; }
+# THE ONE WINDOW THAT CANNOT BE ASKED ABOUT ITSELF. Everything below reports a wedged pane with `cc-notify --ask`,
+# which files a request FOR THE CONTROL REPO'S PLANNING SEAT and hands it to cc-broker. When the wedged window IS
+# that seat the request goes nowhere and looks delivered: the broker spools the line behind the pane that stopped
+# reading, counts 'spooled' as taken, and the request file is stamped delivered=true — so `cc-notify requests
+# --retry` never offers it again. And that seat is the only one cc-notify lets through to the owner (is_control), so
+# with it dead nobody is left who may say so. So that one window's notice is RAISED HERE instead of asked for, the way
+# cc-land's owner_card raises its 🔐 one: `cc-slack post --route "<ctl> blocked" --mention`, the contract's own
+# ❓ @owner *Decision needed:* card (core/docs/comms-contract.md). Asking `cc-notify --decision` for it does not work
+# from everywhere this script runs: that door reads WHO IS CALLING (is_control — CC_ROLE, a `.cc/track` or
+# `.cc/member-facing` marker above the cwd, and the daemon's word on the seat owning this pid chain), and cc-msg is
+# not always the box's bare hand — `cc <ctl> --say …` execs it inside the CALLER's worktree, under that track's
+# marker (bin/cc's --say), so a track or an orch reporting the wedge had its --decision demoted to an --ask addressed
+# to the very seat that stopped reading, spooled behind the dead pane and stamped delivered with 'told' already
+# written. Posting it here widens nothing: the fact is one this script read off the pane itself, the words are its
+# own and fixed, and the --id carries WHO froze on WHAT, so the same wedge said twice is one card while a new
+# session in that window is a new question. Every other window keeps `--ask`.
+# The test is the two rules already here: a PLANNING window is a name with no track that names a repo under ~/dev
+# (hung_seen's own branch, below), and the CONTROL repo is ctl()'s — the same reading as cc's ctl_repo and
+# cc-notify's CTL. CC_MSG_REPORT_TO is deliberately not consulted: it redirects the dialog report above, not the
+# door a request takes.
+ctl_seat(){ [ "${1#*/}" = "$1" ] && [ -d "$HOME/dev/$1" ] && [ "$1" = "$(ctl)" ]; }
+say_wedge(){   # $1 window  $2 window id  $3 tag (WHICH wedge, so two of them are two cards)  $4 title  $5 text
+  local id=""
+  case "$1" in
+    _cctest*|_selfcheck*) ;;   # throwaway test state never pages him, and cc-notify's gate on those names is behind
+                               # the door this card skips — cc-land's owner_card keeps the same copy of it
+    *) ctl_seat "$1" && id="msg:$3:$1@$(claude_pids "$2" | head -1)-$(scr_hash "$2")";;
+  esac
+  if [ -n "$id" ]; then
+    "$BIN/cc-slack" post --route "$(ctl) blocked" --mention --id "$id" "*Decision needed:* $4 — $5" >/dev/null 2>&1 ||
+      "$BIN/cc-notify" -t "$4" "$5" >/dev/null 2>&1   # Slack would not take the card: an ambient line is the only
+                                                      # record left, and it is worth more than silence
+  else
+    "$BIN/cc-notify" --ask -t "$4" "$5" >/dev/null 2>&1
+  fi; }
 # HOW IT IS TOLD: through cc-broker, the same door a stopped worker's escalation takes (cc-loop's tell_planner).
 # It writes the event down BEFORE it sends anything and owns delivery from there, so a session that is not up in
 # this second still gets it, and a line asking for a choice is delivered on arrival instead of riding a digest —
@@ -418,8 +453,12 @@ hung_seen(){   # $1 window  $2 window id → 0 when the window was restarted (ei
   [ "$told" = 1 ] && return 1
   printf '%s\t1\t%s\t%s\n' "$last" "$(claude_pids "$2" | head -1)" "$(scr_hash "$2")" > "$f"   # …and WHO froze,
                                                                         # on WHAT, so the drain can stop typing at it
-  "$BIN/cc-notify" --decision -t "[$1] stopped taking keys" \
-    "a whole message and its Enter left the pane unchanged and it was not restarted: $why. $n message(s) are queued behind it$ptr." >/dev/null 2>&1
+  # A REQUEST TO THE PLANNING SEAT (--ask), not the owner's phone: a pane the box could not unstick is the seat's to
+  # try (!restart, a hand-off) before anyone asks him — only the seat escalates what it verified it cannot settle.
+  # Unless the wedged window IS that seat, and then the request would be spooled behind it and stamped delivered:
+  # say_wedge() raises the ❓ card itself for that one window, and files the --ask for every other (see ctl_seat).
+  say_wedge "$1" "$2" hung "[$1] stopped taking keys" \
+    "a whole message and its Enter left the pane unchanged and it was not restarted: $why. $n message(s) are queued behind it$ptr."
   return 1
 }
 
@@ -512,11 +551,12 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
       # TYPED, AND STILL IN THE BOX AFTER EVERY ENTER: the text is on the pane, one keypress from sent, so it is not
       # typed again (a second copy behind it is one prompt of two) and not left at the head (the next tick would
       # type exactly that). It is said once, to a person, and the queue behind it waits for them: inbox.sat holds
-      # every later drain until the box lets it go.
+      # every later drain until the box lets it go. Through say_wedge(), so the control repo's own planning seat is
+      # not sent a request that would spool behind its own full input box (see ctl_seat).
       if [ "$sat" != 0 ]; then
         printf '%s' "$text" | tr '\n' ' ' > "$satf"
-        "$BIN/cc-notify" --decision -t "[$1] typed but not submitted" \
-          "the text sits in the input box and $((SUBMIT_TRIES + 1)) Enters did not send it — press Enter there (tmux select-window -t main:$1). $(spool_n "$1") message(s) wait behind it." >/dev/null 2>&1
+        say_wedge "$1" "$id" sat "[$1] typed but not submitted" \
+          "the text sits in the input box and $((SUBMIT_TRIES + 1)) Enters did not send it — press Enter there (tmux select-window -t main:$1). $(spool_n "$1") message(s) wait behind it."
         break
       fi
       n=$((n + 1)); sleep "$KEY_WAIT"
@@ -959,6 +999,17 @@ STUB
 id=""; prev=""; for a in "$@"; do [ "$prev" = --id ] && id=$a; prev=$a; done
 if [ -n "$id" ] && "$(dirname "$0")/cc-slack" sent "$id" >/dev/null 2>&1; then
   printf 'dedup notify %s\n' "$id" >> "$CC_FAKE_CALLS"; exit 0; fi
+# THE DOOR READS WHO IS CALLING, as the real is_control does: a `.cc/track` above the cwd is a track, and its
+# --decision is demoted to an --ask filed FOR the planning seat — which is what `cc <ctl> --say …` makes of a
+# report about that seat. Only markers inside this HOME are read: the suite may itself be run from a worktree
+# that carries a real one, and a fixture whose answer depends on where it was run is a fixture that lies.
+case "$PWD/" in
+  "$HOME"/*) d=$PWD
+    while [ -n "$d" ] && [ "$d" != "$HOME" ]; do
+      [ -f "$d/.cc/track" ] && { case "${1:-}" in --decision|--approval|--owner) shift; set -- --ask "$@";; esac; break; }
+      d=${d%/*}
+    done;;
+esac
 printf 'notify %s\n' "$*" >> "$CC_FAKE_CALLS"
 [ -z "$id" ] || printf '%s\n' "$id" >> "$HOME/sent-ids"          # a page that went is in the ledger too
 STUB
@@ -1017,7 +1068,7 @@ STUB
   reset; scr "$FREE"; out=$(CC_MSG_SUBMIT_TRIES=2 CC_FAKE_SWALLOW=99 msg "never sent")
   k "$(t test "$(grep -c ' Enter$' "$T/keys")" = 3)" "a box that keeps the text through every Enter gets SUBMIT_TRIES more and no more"
   k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…then it is said once, to a person"
-  k "$(t grep -q 'notify --decision.*typed but not submitted.*select-window -t main:demo/t1' "$T/calls")" "…as a decision naming the window: the text is one keypress from sent, and only a person can press it"
+  k "$(t grep -q 'notify --ask.*typed but not submitted.*select-window -t main:demo/t1' "$T/calls")" "…as a request to the planning seat naming the window: the text is one keypress from sent, a person must press it, and the seat asks the owner only once it cannot"
   k "$(t sh -c "[ -z '$out' ] && ! test -f '$SP'")" "…and the line is off the spool: it is on the pane, and the next tick must not type it behind itself"
   reset; scr "$FREE"; msg "one" >/dev/null; msg "two" >/dev/null   # a live pane, the kept side of the same rule
   k "$(t test "$(grep -c ' Enter$' "$T/keys")" = 2)" "…while a pane that takes its Enter gets exactly one per message: the read-back presses nothing at a box that emptied"
@@ -1217,7 +1268,7 @@ $BUSY"; out=$(msg "hello mid-turn")
   reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN='orch@a' "$T/bin/cc-msg" 'orch@a' "hi orch" >/dev/null
   k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "an orch window (repo@alias) that stops taking keys is not killed"
   k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…it is said once, with the reason"
-  k "$(t grep -q '^notify --decision .*stopped taking keys' "$T/calls")" "…and it asks for RUNG 1: nothing on the box can unstick that window, so the owner is the only one left — a plain cc-notify has been ambient since the table landed"
+  k "$(t grep -q '^notify --ask .*stopped taking keys' "$T/calls")" "…and it is a REQUEST to the planning seat (--ask), never ambient: nothing automatic unstuck that window, so a seat must — and only that seat asks the owner"
   k "$(t test "$(wc -l < "$T/.cc/state/orch@a/inbox.spool")" = 1)" "…and its message waits in its own spool"
   : > "$T/calls"; : > "$T/keys"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN='orch@a' "$T/bin/cc-msg" --drain 'orch@a'
   k "$(nt grep -q . "$T/keys")" "…and a window nothing will ever reopen is not typed at every tick for ever either"
@@ -1225,6 +1276,33 @@ $BUSY"; out=$(msg "hello mid-turn")
   k "$(t grep -qF 'hi orch' "$T/keys")" "whoever unsticks it moves the screen: the stamp is dropped and the mail goes in"
   : > "$T/calls"; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN='orch@a' "$T/bin/cc-msg" 'orch@a' "hi again" >/dev/null
   k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…and the NEXT time it wedges is said too: a stamp that never cleared silenced it for ever"
+
+  # …AND THE ONE WINDOW THAT CANNOT BE ASKED ABOUT ITSELF: the control repo's OWN planning seat. --ask files the
+  # request for that seat, so cc-broker would spool the line behind the pane that stopped reading, count 'spooled' as
+  # taken and stamp the request delivered — never offered again — while that seat is the only one cc-notify lets
+  # through to the owner. So this window, and only this one, has its ❓ card POSTED here (say_wedge, cc-land's
+  # owner_card shape), which is the one notice no caller's cwd can demote. The copy under ~/dev/ctlseat/core/bin is
+  # what makes ctl() read 'ctlseat', the same fixture (9c) uses.
+  reset; scr "$FREE"; mkdir -p "$T/dev/ctlseat/core"; cp -r "$T/bin" "$T/dev/ctlseat/core/bin"
+  CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN=ctlseat "$T/dev/ctlseat/core/bin/cc-msg" ctlseat "hi ctl" >/dev/null
+  k "$(t grep -q '^post post --route ctlseat blocked --mention --id msg:hung:ctlseat@.*Decision needed:\* \[ctlseat\] stopped taking keys' "$T/calls")" "the control repo's own planning window wedged: the ❓ @owner card is posted, because an --ask would spool behind that dead pane and be stamped delivered"
+  k "$(nt grep -q '^notify --ask' "$T/calls")" "…and no request is filed to the seat that is the thing being reported"
+  k "$(t test "$(wc -l < "$T/.cc/state/ctlseat/inbox.spool")" = 1)" "…and its message waits, like any wedged planning window's"
+  reset; scr "$FREE"; CC_FAKE_SWALLOW=99 CC_MSG_SUBMIT_TRIES=1 CC_FAKE_WIN=ctlseat \
+    "$T/dev/ctlseat/core/bin/cc-msg" ctlseat "sat at the control seat" >/dev/null
+  k "$(t grep -q '^post post --route ctlseat blocked --mention --id msg:sat:ctlseat@.*typed but not submitted' "$T/calls")" "…and the same seat holding text it never submitted is said the same way: nothing else may reach him about it"
+  k "$(nt grep -q '^notify --ask' "$T/calls")" "…and that one files no request either"
+  # AND FROM A TRACK'S WORKTREE, which is where `cc <ctl> --say …` runs this script: cc-notify's door reads the
+  # `.cc/track` marker above the cwd and files the --decision as a request for the seat being reported (the stub
+  # models that demotion), so the notice this branch exists to protect cannot be ASKED for from here — it is posted.
+  reset; scr "$FREE"; mkdir -p "$T/wt/.cc"; printf 'ctlseat\nsometrack\n' > "$T/wt/.cc/track"
+  ( cd "$T/wt" && CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN=ctlseat \
+      "$T/dev/ctlseat/core/bin/cc-msg" ctlseat "hi from a track" >/dev/null )
+  k "$(t grep -q '^post post --route ctlseat blocked --mention --id msg:hung:ctlseat@' "$T/calls")" "a track's worktree reporting the control seat wedged still gets the ❓ card out: the card is raised here, not asked for"
+  k "$(nt grep -q '^notify --ask' "$T/calls")" "…and no --ask is filed at the wedged seat, which would be spooled behind its own dead pane and stamped delivered"
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN=demo "$T/dev/ctlseat/core/bin/cc-msg" demo "hi other" >/dev/null
+  k "$(t grep -q '^notify --ask .*stopped taking keys' "$T/calls")" "…while ANOTHER repo's planning window keeps --ask: the control seat is up and it is that seat's to look at"
+  k "$(nt grep -q '^post post .*--mention' "$T/calls")" "…and nothing about it mentions the owner: one window's wedge is the only card this script raises"
 
   # A STAMP IS A CLAIM ABOUT ONE PANE, NOW. A session can come back reading without redrawing a thing, and a window
   # restarted by hand comes up on a screen that may match the frozen one to the byte — trusted for ever, either one

@@ -1875,10 +1875,25 @@ def digest_cmd(argv):
     return 0
 
 
+def retry_requests():
+    """A `cc-notify --ask` the broker did not take stays on file under ~/.cc/requests with delivered=false; every tick
+    offers each one again (`cc-notify requests --retry`) until the control seat's broker has it. Never a Slack post,
+    never the owner: the request is preserved and retried, not dropped and not dumped on him."""
+    reqs = os.path.expanduser("~/.cc/requests")           # $HOME at call time: a fixture's, under a selfcheck
+    if not any(f.endswith(".json") for f in (os.listdir(reqs) if os.path.isdir(reqs) else [])):
+        return
+    try:
+        subprocess.run([sib("cc-notify"), "requests", "--retry"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def tick(snap, net):
-    """What rides the --apply pass after the reconcile: the fixture rule, the daily sweep, the wake, the daily digest."""
+    """What rides the --apply pass after the reconcile: the fixture rule, the daily sweep, the wake, the daily digest,
+    and the planner requests the broker has not taken yet (core/docs/comms-contract.md: "queued" is not "handled")."""
     r = Sweep(False)
     sweep_fixtures(r)
+    retry_requests()
     sw = f"{STATE}/sweep.stamp"
     try:
         due = now() - os.path.getmtime(sw) > 86400
@@ -3713,6 +3728,14 @@ def selfcheck():
            btext.startswith("*fixturebox* today: 1 moving.") and "bundle: two rows on the importer" in btext and "1 queued, 1 in bundles." in btext)
         bd("merged"); btext = digest_text({})
         ok("…and once the bundle row is no longer live its member is queued again", "2 queued" in btext and "in bundles" not in btext)
+        # (e′) the tick re-offers planner requests the broker has not taken — "queued" is not "handled" — and only when there are any
+        open(f"{te}/stubs/cc-notify", "w").write(f"#!/bin/sh\necho \"$@\" >> {te}/notify.argv\n"); os.chmod(f"{te}/stubs/cc-notify", 0o755)
+        retry_requests()
+        ok("REQUESTS: a tick with nothing under ~/.cc/requests asks cc-notify nothing", not os.path.exists(f"{te}/notify.argv"))
+        os.makedirs(f"{te}/.cc/requests"); open(f"{te}/.cc/requests/stop:bd-loose.json", "w").write('{"delivered": false}')
+        retry_requests()
+        ok("…and one on file is re-offered through `cc-notify requests --retry`, never posted and never the owner's",
+           open(f"{te}/notify.argv").read().strip() == "requests --retry")
     finally:
         restore(); shutil.rmtree(te, ignore_errors=True)
     # (f) the POSTED digest fits a phone: a box as busy as the 09-10 one (1736 chars) — every section full, every

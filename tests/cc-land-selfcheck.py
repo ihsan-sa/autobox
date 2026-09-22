@@ -3217,6 +3217,102 @@ def selfcheck():
                   "no job, no worker, non-zero, a `protected:` ledger line naming the file",
                   rcQ == 1 and not os.path.exists(job_path("myrepo", 7)) and not started
                   and open(f"{qdir}/queue.log").read().rstrip().endswith("refused myrepo#7 protected:learn-fetch/learn-fetch"))
+            # …AND THAT REFUSAL RAISES THE CARD HIS 👍 IS ASKED FOR. A repo that lands its own PRs has its routine
+            # card in the log lane, where no reaction does anything (cc-slack's card_lane), and no job exists yet
+            # for say_protected_stop to speak for — so without this the one thing that could queue the PR was
+            # unreachable from Slack. One post at #approvals, opening "🔐 *Approval needed:* [<repo>] PR #<n>" so
+            # cc-slack's APPROVAL_RE reads it back, and NOT through cc-notify's owner door, which would decide it
+            # from whoever happened to run this (the seat case below).
+            cards = [c for c in calls if os.path.basename(c[0]) == "cc-slack" and c[1:2] == ["post"]]
+            check("protected: …and the door's refusal raises the 🔐 card itself — exactly one post at #approvals, "
+                  "@-mentioning him, naming this PR the way cc-slack's APPROVAL_RE reads it, under an id pinned to "
+                  "the head, with no cc-notify in the path at all",
+                  len(cards) == 1 and "#approvals" in cards[0] and "--mention" in cards[0]
+                  and cards[0][cards[0].index("--id") + 1] == f"land:myrepo:7:protected-door@{HEAD}"
+                  and cards[0][-1].startswith("🔐 *Approval needed:* [myrepo] PR #7 ")
+                  and "learn-fetch/learn-fetch" in cards[0][-1]
+                  and not [c for c in calls if os.path.basename(c[0]) == "cc-notify"])
+            first_id = cards[0][cards[0].index("--id") + 1]
+            rcQ = guarded(["docs/x.md", "learn-fetch/learn-fetch"], "learn-fetch/ core/bin/cc-land", "U0WNER", "--who", "cc done")
+            cards = [c for c in calls if os.path.basename(c[0]) == "cc-slack" and c[1:2] == ["post"]]
+            check("protected: …and refusing the SAME head again asks under the same id, which is the only card there "
+                  "is: cc-slack's sent ledger answers the replay rather than raising a second one",
+                  rcQ == 1 and len(cards) == 1 and cards[0][cards[0].index("--id") + 1] == first_id)
+            # A '?' HIT IS NOT AN AUTHORIZATION TO ASK FOR: gh could not name the files, which is an operational
+            # fault (say_protected_stop's `held` door), so the door refuses and raises no owner card.
+            rcQ = guarded((1, "gh: could not resolve host\n"), "learn-fetch/", "U0WNER", "--who", "cc done")
+            check("protected: a '?' refusal raises no 🔐 card — the box not knowing is not something he authorizes",
+                  rcQ == 1 and not [c for c in calls
+                                    if os.path.basename(c[0]) == "cc-slack" and c[1:2] == ["post"]])
+            # …AND IT REACHES HIM WHOEVER RAN THE LANDING. cc-loop queues a self-landing repo's PR from the
+            # track's own worktree, and cc's own stop line offers `cc-land queue <repo> <pr>` to a person sitting
+            # in a session — so the process that refuses at this door is under a `.cc/track` marker with CC_ROLE
+            # in its env, or in a seat the daemon can name, and those three readings are exactly what cc-notify's
+            # owner door decides authority from (is_control). box_hand() clears the first two and cannot touch the
+            # third, a walk of this process's own pid chain. So the stub below answers `seat` the way the daemon
+            # does for a track — the reading the cases above cannot see, because a stub that says nothing reads as
+            # the box's own hand — and the card is still raised, because owner_card asks nobody's leave for it.
+            wt = f"{fixture_home}/wt/myrepo/atrack"
+            os.makedirs(f"{wt}/.cc", exist_ok=True)
+            with open(f"{wt}/.cc/track", "w") as fh:
+                fh.write("myrepo\natrack\nsid\n")
+            os.makedirs(f"{fixture_home}/bin", exist_ok=True)
+            slack_args, nlog = f"{fixture_home}/notify-slack.args", f"{fixture_home}/notify.log"
+            with open(f"{fixture_home}/bin/cc-slack", "w") as fh:   # `sent` must REFUSE: an id its ledger claims is
+                fh.write("#!/usr/bin/env bash\ncase \"$1\" in sent) exit 1;; "      # already sent reaches no door
+                         "seat) echo myrepo/atrack;; "                     # …and a TRACK is what owns this pid
+                         f"post) printf '%s\\n' \"$*\" >> {slack_args};; esac\nexit 0\n")
+            os.chmod(f"{fixture_home}/bin/cc-slack", 0o755)
+            was_cwd = os.getcwd()
+            was_env = {k: os.environ.get(k) for k in ("CC_ROLE", "CC_NOTIFY_LOG", "CC_NOTIFY_LOG_ONLY",
+                                                      "SLACK_BOT_TOKEN", "SLACK_OWNER_ID", "SLACK_WEBHOOK",
+                                                      "SLACK_APPROVALS", "NTFY_TOPIC", "NTFY_SERVER")}
+            try:
+                # The environment wins over ~/.cc/config (cc-config's one rule), so every door the control below
+                # could take is named here rather than left to whatever ran this suite: one Slack, which is the
+                # stub in the fixture HOME, and no phone. Nothing leaves the box.
+                os.environ.update(CC_ROLE="worker", CC_NOTIFY_LOG=nlog, CC_NOTIFY_LOG_ONLY="",
+                                  SLACK_BOT_TOKEN="xoxb-selfcheck", SLACK_OWNER_ID="U0WNER", SLACK_WEBHOOK="",
+                                  SLACK_APPROVALS="", NTFY_TOPIC="", NTFY_SERVER="")
+                os.chdir(wt)
+                rcQ = guarded(["learn-fetch/learn-fetch"], "learn-fetch/", "U0WNER", "--who", "cc done")
+                cards = [c for c in calls if os.path.basename(c[0]) == "cc-slack" and c[1:2] == ["post"]]
+                check("protected: …and the card reaches #approvals from the track's own worktree with CC_ROLE=worker "
+                      "in the env and the daemon naming a track seat — the refusal posts it itself, from ~, so who "
+                      "ran `cc-land queue` decides nothing about whether he gets something to 👍",
+                      rcQ == 1 and len(cards) == 1 and "#approvals" in cards[0] and "--mention" in cards[0]
+                      and cards[0][cards[0].index("--id") + 1] == f"land:myrepo:7:protected-door@{HEAD}"
+                      and cards[0][-1].startswith("🔐 *Approval needed:* [myrepo] PR #7 ")
+                      and next(w for c, w in zip(calls, cwds) if c is cards[0]) == HOME)
+                # THE CONTROL, and it is the finding itself: cc-notify's owner door, handed the very cwd and env
+                # box_hand() builds, still reads the seat off the pid chain and turns the card into a request to
+                # the planning seat — kind=request in its own log, #approvals never posted to. That is what
+                # `cc-land queue` typed into a session did to the one card his 👍 could have queued the head from.
+                ctl_rc, ctl_out = real_sh([f"{BIN}/cc-notify", "--approval", "--id", "land:myrepo:7:control",
+                                           "-t", "myrepo approval", "[myrepo] PR #7 control"], timeout=60,
+                                          **box_hand())
+            finally:
+                os.chdir(was_cwd)
+                for k, v in was_env.items():
+                    os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+                os.unlink(f"{fixture_home}/bin/cc-slack")
+            said = open(slack_args).read() if os.path.exists(slack_args) else ""
+            logged = (open(nlog).read().strip().split("\n") or [""])[-1] if os.path.exists(nlog) else ""
+            check("protected control: the same words through cc-notify's owner door — box_hand's own cwd and env, "
+                  "that same track owning the pid — are filed as a request to the planning seat instead: "
+                  "kind=request in its log, nothing posted to #approvals, and it says so on stderr",
+                  "kind=request" in logged and "kind=approval" not in logged and "#approvals" not in said
+                  and "only the control seat asks the owner" in ctl_out)
+            # THROWAWAY TEST STATE STILL CANNOT PAGE HIM. The card left cc-notify, and that door keeps the gate on
+            # synthetic repo names (_cctest…/_selfcheck…, four days of fixture sirens in #alerts) — so owner_card
+            # keeps the same one, anchored the same way, and a real repo that merely contains the word still posts.
+            at = len(calls)
+            check("protected: a synthetic repo's 🔐 card is a ledger line and nothing else — a fixture cannot page "
+                  "the owner — while myrepo_cctesting is a real repo and does",
+                  owner_card("land:_cctest9:7:protected-door", "[_cctest9] PR #7 is not queued") is False
+                  and owner_card("land:x:7:protected-door", "[myrepo_cctesting] PR #7 is not queued") is not False
+                  and [c[-1] for c in calls[at:] if os.path.basename(c[0]) == "cc-slack" and c[1:2] == ["post"]]
+                      == ["🔐 *Approval needed:* [myrepo_cctesting] PR #7 is not queued"])
             rcQ = guarded(["core/bin/cc-land"], "learn-fetch/ core/bin/cc-land", "U0WNER", "--who", "A Member", "--approved-by", "UMEMBER")
             check("protected: a 👍 that is not the owner's (another uid) is refused the same way — a file rule matches the file itself",
                   rcQ == 1 and not os.path.exists(job_path("myrepo", 7)) and not started)
@@ -3310,13 +3406,16 @@ def selfcheck():
             # the card sat at 👀 and nobody was told a second 👍 was needed (review of #527): said once in the card's
             # own thread, and pushed to the owner, whose 👍 is the one thing that moves it.
             posts = ran_sub("cc-slack", "post")
-            pushes = [c for c in calls if os.path.basename(c[0]) == "cc-notify"]
+            thread, cards = [c for c in posts if "CAPPR" in c], [c for c in posts if "#approvals" in c]
             check("protected: …and the stop at a moved head is SAID — one post in the card's thread (its chat and ts, "
-                  "under a producer id) telling the owner to 👍 the card again for this head, and one cc-notify to "
-                  "him at the decision rung",
-                  len(posts) == 1 and posts[0][2:6] == ["-c", "CAPPR", "--thread", "1.1"] and "--id" in posts[0]
-                  and "👍 the card again" in posts[0][-1]
-                  and len(pushes) == 1 and "--decision" in pushes[0] and "👍 the card again" in pushes[0][-1])
+                  "under a producer id) telling the owner to 👍 the 🔐 card for this head, and the 🔐 card itself at "
+                  "#approvals naming this PR, posted from here rather than through cc-notify's owner door",
+                  len(posts) == 2 and len(thread) == 1 and len(cards) == 1
+                  and thread[0][2:6] == ["-c", "CAPPR", "--thread", "1.1"] and "--id" in thread[0]
+                  and "👍 the 🔐 card" in thread[0][-1]
+                  and "--mention" in cards[0] and "👍 the 🔐 card" in cards[0][-1]
+                  and cards[0][-1].startswith("🔐 *Approval needed:* [myrepo] PR #7 ")
+                  and not [c for c in calls if os.path.basename(c[0]) == "cc-notify"])
             # …AND A FILE LIST THAT ANSWERS '?' FOR EVER DOES NOT TURN THAT STOP INTO A HOLD. A PR over
             # GH_PR_FILES files is a '?' hit at every look, so a job he 👍'd whose fix round pushes a new head
             # would be held every RETRY_AFTER for ever — nothing merged, nobody told, and his second 👍 refused as
@@ -3330,17 +3429,18 @@ def selfcheck():
             world[LSR] = (0, f"{'f' * 40}\trefs/heads/{BRANCH}\n")      # the fix round's push, on origin's own ref
             quiet(cmd_work, [])
             posts = ran_sub("cc-slack", "post")
-            pushes = [c for c in calls if os.path.basename(c[0]) == "cc-notify"]
+            thread, cards = [c for c in posts if "CAPPR" in c], [c for c in posts if "#approvals" in c]
             check(f"protected: …and the stop at a moved head is SAID even when the file list is the '?' — a PR over "
                   f"{GH_PR_FILES} files answers '?' at every look, and held on that the job would sit off the queue's "
-                  f"radar for ever: off the queue, a `refused` line, one post in the card's thread, one cc-notify",
+                  f"radar for ever: off the queue, a `refused` line, one post in the card's thread, one 🔐 card",
                   rcQ == 0 and job_then.get("approved_head") == HEAD and not gh_merges()
                   and not os.path.exists(job_path("myrepo", 7))
                   and "refused myrepo#7 protected:moved" in open(f"{qdir}/queue.log").read()[at_log:]
-                  and len(posts) == 1 and posts[0][2:6] == ["-c", "CAPPR", "--thread", "1.1"]
-                  and "👍 the card again" in posts[0][-1]
-                  and posts[0][posts[0].index("--id") + 1].startswith("land:myrepo:7:protected")
-                  and len(pushes) == 1 and "--decision" in pushes[0])
+                  and len(posts) == 2 and len(thread) == 1 and len(cards) == 1
+                  and thread[0][2:6] == ["-c", "CAPPR", "--thread", "1.1"]
+                  and "👍 the 🔐 card" in thread[0][-1]
+                  and thread[0][thread[0].index("--id") + 1].startswith("land:myrepo:7:protected")
+                  and cards[0][-1].startswith("🔐 *Approval needed:* [myrepo] PR #7 "))
             # …and a '?' that is a real not-knowing on BOTH counts — gh names neither the files nor the head —
             # still HOLDS, because that one clears on its own; the first hold is said once, so no job waits unheard of.
             rcQ = guarded((1, "gh: could not resolve host\n"), "learn-fetch/", "U0WNER",
@@ -3358,7 +3458,9 @@ def selfcheck():
                   and job_then.get("stage") == "held" and job_then.get("attempts", 0) == 0
                   and "refused" not in open(f"{qdir}/queue.log").read()[at_log:]
                   and len(posts) == 1 and posts[0][2:6] == ["-c", "CAPPR", "--thread", "1.1"]
-                  and "HELD" in posts[0][-1] and len(pushes) == 1 and "--decision" in pushes[0]
+                  # …and the hold is a REQUEST to the planning seat (--ask), not an owner door: a '?' is the
+                  # box's fault to read through, and only the seat asks him once it cannot
+                  and "HELD" in posts[0][-1] and len(pushes) == 1 and "--ask" in pushes[0] and "--decision" not in pushes[0]
                   # …under an id of the HOLD's own: a hold and the refusal that may follow it on the same job are
                   # two things to say, and one producer id would have cc-notify swallow the second as a repeat.
                   and posts[0][posts[0].index("--id") + 1].startswith("land:myrepo:7:held"))

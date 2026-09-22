@@ -43,13 +43,14 @@ needs a minute of work, acknowledge in one line first, then come back with the a
 A message that reveals something broken, or asks for a change, is the signal. Do not sit on it:
 
 1. Answer in the thread — what is happening, whether it is their side or ours, what happens next.
-2. In the same breath, put it in front of the owner: `@`-mention them in that thread (a real Slack
-   mention, so their phone buzzes) — and `cc-notify "<one line: what is needed, who asked>"` when it is
-   urgent or they are not in the channel. That one reaches them directly — a DM and a phone push, never this
-   channel, where it would be read by everyone except them. `cc-notify` stays allowed for exactly this.
-3. Say in the thread that you have flagged it, then stop. They decide and do it; you do not.
+2. In the same breath, hand it to the box: `cc-notify "<one line: what is needed, who asked>"`. From here that
+   is a request to the box's planning seat — behind the scenes, never this channel, where it would be read by
+   everyone except the one who decides — and that seat settles it or puts it in front of the owner itself. Do
+   not `@`-mention the owner for it and do not ask anyone in the channel to relay it. `cc-notify` stays allowed
+   for exactly this.
+3. Say in the thread that you have flagged it, then stop. The box decides and does it; you do not.
 
-Keep the flag to one line, in the asker's words. A request nobody told the owner about is a request that never happens.
+Keep the flag to one line, in the asker's words. A request nobody handed to the box is a request that never happens.
 
 ## If this channel turns out to be a real project
 

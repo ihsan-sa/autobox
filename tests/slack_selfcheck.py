@@ -213,7 +213,9 @@ def run_selfcheck():
         os.makedirs(f"{d}/.git")                        # a "repo" for the approvals checks (tempfile names are lowercase → PR_RE-safe)
         dm = Daemon(use_slack=False); dm.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dm.bot_user = "UBOT"; dm.names.update({"CAPPR": APPROVALS, "CREPO": "myrepo"})
         posts = {"1.1": {"user": "UBOT", "text": f"[{name}] PR #7: t — https://x/7"}, "1.2": {"user": "UOWNER", "text": f"[{name}] PR #8: t"},
-                 "1.3": {"user": "UBOT", "text": f"merged [{name}] PR #9:"}, "1.4": {"user": "UBOT", "text": "[no-such-repo-zz] PR #1: t"}}
+                 "1.3": {"user": "UBOT", "text": f"merged [{name}] PR #9:"}, "1.4": {"user": "UBOT", "text": "[no-such-repo-zz] PR #1: t"},
+                 "1.5": {"user": "UBOT", "text": f"❓ <@UOWNER> 🔐 *Approval needed:* [{name}] PR #7 is not queued — it "
+                                                 f"touches core/bin/cc-land, and your own 👍 on this card is what queues it"}}
         dm.fetch_message = lambda chat, ts: posts.get(ts); said, calls, quids = [], [], []
         dm.say = lambda chat, text, thread=None, mail=True: said.append((chat, thread))
         qok = [True]
@@ -267,6 +269,44 @@ def run_selfcheck():
                       and injected and injected[-1][0] == name and "could not even be queued" in injected[-1][1]
                       and "Nothing merged" in injected[-1][1])
                 qok[0] = True
+                calls.clear(); marks.clear(); said.clear(); notes.clear(); injected.clear()
+                # A SELF-LANDING REPO'S CARD STANDS IN ITS LOG LANE (card_lane), and a landing that stops there
+                # still asks for his 👍 (cc-land's "Sort that out, then 👍 it again", USAGE's "your 👍 keeps it"):
+                # that 👍 went to the session as a verdict and queued nothing, so the gate the docs promise had no
+                # door. THE LEDGER is what makes a message a card — the `bad` list above sends the same text in the
+                # same channel with no record, and it stays ignored — and only HIS counts outside #approvals, since
+                # being in #approvals is the merge right there and a log lane's membership never was.
+                real_sent_ap = SENT_DIR
+                globals()["SENT_DIR"] = tempfile.mkdtemp(prefix="_selfcheck_cards_")
+                try:
+                    sent_write(CARD_ID.format(repo=name, n="7"),
+                               {"id": CARD_ID.format(repo=name, n="7"), "chat": "CREPO", "ts": "1.1",
+                                "intent": "card", "accepted": True})
+                    outl = dm.on_event(ev(item=it("1.1", "CREPO")))
+                    check("reaction: the owner's 👍 on a PR card standing OUTSIDE #approvals — a repo in "
+                          "CC_SELF_LAND_REPOS keeps its cards in #<repo>-updates — re-queues the landing, because "
+                          "a stopped landing asks him for that 👍 and it used to reach only the session, which "
+                          "merges nothing",
+                          calls == [(name, "7", "CREPO", "1.1", "The Owner")] and "queued" in (outl or "")
+                          and marks == [("CREPO", "1.1", "eyes")])
+                    check("reaction: …and that 👍 carries NO --approved-by: 👍 is how he acks a post, so an ack on "
+                          "a routine card in a log lane must not lift a protected-path hold — the re-queue is a "
+                          "queue and nothing more",
+                          quids[-1] == "")
+                    calls.clear(); marks.clear()
+                    outm = dm.on_event(ev(user="UMEM", item=it("1.1", "CREPO")))
+                    check("reaction: …and only HIS there — being in #approvals is the merge right in #approvals, "
+                          "and a log lane's membership was never that — so anyone else's 👍 on that card queues "
+                          "nothing and is the session's to read",
+                          not calls and not marks and outm is None)
+                    outp = dm.on_event(ev(item=it("1.5")))
+                    check("reaction: the authorization is still the 🔐 card in #approvals and only there — his 👍 "
+                          "on it goes down as the uid cc-land's protected door takes (--approved-by), which the "
+                          "same PR's log-lane card cannot do: the two cards are two different powers",
+                          calls == [(name, "7", "CAPPR", "1.5", "The Owner")] and quids[-1] == "UOWNER")
+                finally:
+                    shutil.rmtree(SENT_DIR, ignore_errors=True)
+                    globals()["SENT_DIR"] = real_sent_ap
                 del dm.queue_land          # nothing stubbing it now: the 👍 path lands on the process-wide pin at the
                 dm.on_event(ev())          # top of this selfcheck, which is the only thing standing between a fixture
         finally:                           # and a REAL job in this box's landing queue
@@ -574,6 +614,7 @@ def run_selfcheck():
         # mean two 👍, two overlapping merges and a false "merge failed" (the owner deleted three by hand, 2026-08-30).
         with tempfile.TemporaryDirectory(dir=DEV, prefix=notify_marker) as d2:   # carries notify_marker: see 12570
             rname = os.path.basename(d2); os.makedirs(f"{d2}/.git")
+            real_sent_pa = SENT_DIR; globals()["SENT_DIR"] = f"{d2}/sent"   # the card ledger is the fixture's own, never the box's
             cards = [{"ts": "9.1", "user": "UBOT", "text": f"[{rname}] PR #7: t — https://x/7  ·  :+1: from the owner merges (squash)"},
                      {"ts": "9.2", "user": "UOWNER", "text": f"[{rname}] PR #8: a human typing the same shape"}]
             hist, posted, real_post, real_find, real_run2 = list(cards), [], post, find_channel, subprocess.run
@@ -695,8 +736,77 @@ def run_selfcheck():
                 check("approvals-sweep: the edit is the record — a second run edits nothing and asks only about the open PR; "
                       "without --now a sweep within the interval does not even read the channel",
                       rc11 == 0 and rc12 == 0 and not edits and asked == ["7"] and "min ago" in o11.getvalue())
+                # A SELF-LANDING REPO'S CARD LEAVES #approvals (the brief comms-requests-reach-who-decides: routine PR cards
+                # leave it; a landing record goes to the log lane). It is posted under the ledger id, --print-chat names
+                # the lane it really stands in, --landed finds it there by the ledger (never by reading #approvals), and
+                # the sweep sees it without reading the lane. A repo NOT in CC_SELF_LAND_REPOS keeps #approvals: its 👍
+                # is the merge, and nothing about that changed.
+                real_cfg_pa, real_rc_pa = globals()["load_cfg"], resolve_channel
+                globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER", "CC_SELF_LAND_REPOS": f"{rname} other"}
+                globals()["resolve_channel"] = lambda cfg, name: "CUPD" if name == f"{rname}-updates" else None
+                lane_hist, posted_to = {"CAPPR": [], "CUPD": []}, []
+                def api5(method, token, **kw):
+                    if method == "auth.test":
+                        return {"user_id": "UBOT"}
+                    if method == "conversations.history":
+                        msgs = lane_hist.get(kw.get("channel"), [])
+                        return {"messages": [m for m in msgs if m["ts"] == kw["latest"]] if kw.get("latest") else list(msgs)}
+                    if method == "chat.update":
+                        edits.append((kw["channel"], kw["ts"], kw["text"]))
+                        for h in lane_hist.get(kw["channel"], []):
+                            if h["ts"] == kw["ts"]:
+                                h["text"] = kw["text"]
+                        return {"ok": True}
+                    raise AssertionError(method)
+                def post5(cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw):
+                    ts_ = f"5.{len(posted_to) + 1}"; posted_to.append((chat, text))
+                    lane_hist[chat].append({"ts": ts_, "user": "UBOT", "text": text}); return 1, ts_
+                globals()["api"], globals()["post"] = api5, post5
+                gh["7"] = {"title": "t", "url": "https://x/7", "state": "OPEN"}; edits.clear()
+                with contextlib.redirect_stdout(io.StringIO()) as oS1:
+                    rcS1 = cmd_post_approval([rname, "7", "--print-chat"])
+                with contextlib.redirect_stdout(io.StringIO()) as oS2:
+                    rcS2 = cmd_post_approval([rname, "7", "--print-chat"])
+                check("post-approval: a repo in CC_SELF_LAND_REPOS gets its card in #<repo>-updates, not #approvals — a landing "
+                      "record whose tail says the box lands it, no 👍 asked for; --print-chat names THAT lane; the second "
+                      "caller finds it through the ledger and posts nothing",
+                      rcS1 == 0 and rcS2 == 0 and posted_to == [("CUPD", f"[{rname}] PR #7: t — https://x/7  ·  lands itself (squash)")]
+                      and oS1.getvalue().strip() == "CUPD 5.1" and oS2.getvalue().strip() == "CUPD 5.1"
+                      and (sent_record(f"pr-card:{rname}:7") or {}).get("ts") == "5.1")
+                with contextlib.redirect_stdout(io.StringIO()) as oS3:
+                    rcS3 = cmd_post_approval([rname, "--landed", "7"])
+                rec_l = sent_record(f"pr-card:{rname}:7") or {}
+                check("post-approval --landed: the log-lane card is found by the ledger and edited where it stands (#approvals "
+                      "is not read for it); the ledger then says landed, so the sweep stops offering it",
+                      rcS3 == 0 and len(edits) == 1 and edits[0][:2] == ("CUPD", "5.1")
+                      and re.search(rf"^\[{rname}\] PR #7: t — https://x/7  ·  landed ✓ \d\d:\d\d$", edits[0][2])
+                      and rec_l.get("landed") is True and oS3.getvalue().strip() == "5.1")
+                lane_hist["CUPD"].clear(); posted_to.clear(); edits.clear(); asked.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rcS4a = cmd_post_approval([rname, "7"])
+                gh["7"] = {"title": "t", "url": "https://x/7", "state": "MERGED", "mergedAt": "2026-09-01T02:00:00Z"}
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rcS4 = cmd_approvals_sweep(["--now"])
+                check("post-approval: a card the owner deleted comes back in the log lane too (the stale ledger record is not the "
+                      "card); and approvals-sweep finds a log-lane card whose PR merged behind the landing's back THROUGH THE "
+                      "LEDGER — that lane is never read — and edits it to landed ✓",
+                      rcS4a == 0 and posted_to == [("CUPD", f"[{rname}] PR #7: t — https://x/7  ·  lands itself (squash)")]
+                      and rcS4 == 0 and len(edits) == 1 and edits[0][0] == "CUPD" and edits[0][2].endswith("  ·  landed ✓ 11:00")
+                      and (sent_record(f"pr-card:{rname}:7") or {}).get("landed") is True)
+                globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+                gh["7"] = {"title": "t", "url": "https://x/7", "state": "OPEN"}; posted_to.clear(); lane_hist["CUPD"].clear()
+                os.remove(sent_path(f"pr-card:{rname}:7"))
+                with contextlib.redirect_stdout(io.StringIO()) as oS5:
+                    rcS5 = cmd_post_approval([rname, "7", "--print-chat"])
+                check("post-approval: a repo NOT in CC_SELF_LAND_REPOS keeps its card in #approvals with the ':+1: merges' tail — "
+                      "the owner's 👍 there is still the merge, and the protected-path hold, the first-answer and the "
+                      "permanent grant are untouched",
+                      rcS5 == 0 and posted_to == [("CAPPR", f"[{rname}] PR #7: t — https://x/7  ·  :+1: from the owner merges (squash)")]
+                      and oS5.getvalue().strip() == "CAPPR 5.1")
+                globals()["load_cfg"], globals()["resolve_channel"] = real_cfg_pa, real_rc_pa
             finally:
                 globals()["post"], globals()["find_channel"], subprocess.run = real_post, real_find, real_run2
+                globals()["SENT_DIR"] = real_sent_pa
     finally:
         globals()["load_cfg"], globals()["api"] = real_load_cfg, real_api
         if real_role is not None:
@@ -1237,6 +1347,12 @@ def run_selfcheck():
             dmQ.last_chat[CTL] = ("CCTL", "1.1"); dmQ.last_chat[f"{CTL}/t1"] = ("CT1", "2.2"); dmQ.last_chat["box"] = ("CBOX", "3.3")
             whereB = (dmQ.permission_chat(CTL), dmQ.permission_chat(CTL, "email"), dmQ.permission_chat(f"{CTL}/t1"),
                       dmQ.permission_chat("box"), dmQ.permission_chat("other"))
+            # …AND NEVER AT THE -threads LANE ITSELF: last_chat follows the thread the seat last HEARD from, so a
+            # member's 🙋 card — or anything else said in #<ctl>-threads — aimed the next card only the owner can
+            # answer at a lane only sessions read. His card goes to #<ctl>, where he answers it.
+            dmQ.default_chats[CTL] = "CCTL"; dmQ.last_chat[CTL] = ("CTHREADS", "4.4")
+            whereT = dmQ.permission_chat(CTL)
+            dmQ.last_chat[CTL] = ("CCTL", "1.1")
             n_said, n_got = len(saidQ), len(gotQ)
             dmQ.relay_permission(CTL, {"tool_name": "Bash", "description": "send the reply", "input_preview": "cc-mail send",
                                        "request_id": "hjkmn"}, "email")
@@ -1335,6 +1451,10 @@ def run_selfcheck():
               "stays in its thread, because nobody else on the box may decide for it (2026-09-09: the email orch's card "
               "went into its own channel's thread and the seat never saw it)",
               whereB == (("CCTL", "1.1"), ("CTHREADS", None), ("CTHREADS", None), ("CTHREADS", None), ("CTHREADS", None)))
+        check("…and that one card is never aimed at the -threads lane itself: the seat's own 🔐 card opens with ❓ and "
+              "the owner's mention, and he is not paged where only sessions read (owner, 2026-09-20), so a last_chat "
+              "pointing at #<ctl>-threads falls back to #<ctl>",
+              whereT == ("CCTL", None))
         check("relay_permission: the orch's card is posted in the lane, names the target and the alias, and is stamped "
               "as the orch's target — the answer still finds it by request id",
               len(orch_said) == 1 and orch_said[0][0] == "CTHREADS" and f"`{CTL}`" in orch_said[0][1]
@@ -2166,6 +2286,27 @@ def run_selfcheck():
           "session and not to him; a post into the caller's own channel is unchanged, and so is a --route post",
           [p_[1].startswith("<#C-lessons-site> ") for p_ in postedN] == [False, False, False, True, False, True])
 
+    # ── `cc-slack seat` IS cc-notify's AUTHORITY READING (is_control), so its exit codes have to tell two different
+    # failures apart: the daemon ANSWERING that no seat owns this pid (1 — the box's own hand, a systemd unit or the
+    # operator's shell, which may ask the owner) and the daemon not answering at all (2 — who is calling is unknown).
+    # Read as one code, a daemon that was down or restarting made every unmarked caller control.
+    real_sock_s = SOCK
+    SOCK = f"{DIR}/no-such-sock"
+    errS = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errS):
+            globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
+            rc_down = main(["seat"])
+            globals()["load_cfg"] = lambda: {}
+            rc_noslack = main(["seat"])
+    finally:
+        globals()["load_cfg"] = real_load_cfg
+        SOCK = real_sock_s
+    check("seat: a daemon that cannot be reached exits 2, never 1 — cc-notify reads 1 ('the daemon says no seat owns "
+          "this pid') as the box's own hand and opens the owner's door to it, so a socket that is down has to answer "
+          "differently; on a box with no Slack at all there is no daemon to have a word and it stays a plain 1",
+          rc_down == 2 and rc_noslack == 1 and "did not answer" in errS.getvalue())
+
     check("a question mark glued to a trailing link is still a question (review-159), while a ?q= inside a link is not",
           not routine_text("can I merge https://github.com/o/r/pull/159?") and routine_text("see https://x.y/a?q=1 done")
           and not routine_text("<https://x.y/p|the PR>?"))
@@ -2842,7 +2983,8 @@ def run_selfcheck():
                                               "working through the audit findings now")))
     role_v2 = os.environ.pop("CC_ROLE", None)
     v2calls = []
-    ch_v2 = Channel("box"); ch_v2.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
+    ch_v2 = Channel(CTL); ch_v2.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}   # the CONTROL seat: the one that may declare needs_owner (the block below)
+    ch_v2.muted = lambda: False                                          # …and the box's own open handoff on CTL must not mute the fixture
     try:
         globals()["api"] = lambda method, token, **kw: v2calls.append((method, kw.get("name"), kw.get("timestamp"))) or {"ts": "1"}
         ch_v2.call("reply", {"chat_id": "C1", "text": "done — merged ✅", "thread_ts": "9.0", "ts": "9.5"})
@@ -2866,8 +3008,9 @@ def run_selfcheck():
     # text that reaches Slack opens with ❓ and his mention; a plain reply carries neither, and cannot mention him by
     # hand — his typed handle goes out as code and the tool result says how to reach him.
     role_d = os.environ.pop("CC_ROLE", None); sent_d = []; res_d = {}
-    ch_d = Channel("box"); ch_d.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
-    users_d = dict(_users)
+    ch_d = Channel(CTL); ch_d.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}   # the control seat: only it opens a reply with ❓
+    ch_d.muted = lambda: False
+    users_d = dict(_users); den_d0 = len(EFFECTS.denied)   # no shell-out is declared here: a cc-notify from this seat would be recorded as a denial
     try:
         _users.update(t=time.time(), map={"the.owner": "UOWNER", "ada.byron": "UADA"}, ids={}, miss=time.time())
         globals()["api"] = lambda method, token, **kw: (sent_d.append(kw.get("text")) if method == "chat.postMessage" else None) or {"ts": "1"}
@@ -2877,10 +3020,10 @@ def run_selfcheck():
         res_d["askhand"] = ch_d.call("reply", {"chat_id": "C1", "text": "@the.owner which?", "thread_ts": "9.0", "ts": "9.11", "needs_owner": True})
     finally:
         globals()["api"] = real_api
-        _users.update(users_d)
+        _users.update(users_d); den_d1 = len(EFFECTS.denied)
         if role_d is not None:
             os.environ["CC_ROLE"] = role_d
-    check("reply tool: a needs_owner reply ARRIVES opening with ❓ and the owner's mention — the decision seam adds it, "
+    check("reply tool: a needs_owner reply ARRIVES opening with ❓ and the owner's mention — the decision seam adds it,"
           "not the session's prose — and a plain reply arrives with neither (owner, 2026-09-12)",
           sent_d[0] == "❓ <@UOWNER> prod or staging?" and sent_d[1] == "merged, moving on")
     check("reply tool: a plain reply CANNOT mention him — his typed handle goes out as code while another person's "
@@ -2889,6 +3032,109 @@ def run_selfcheck():
           sent_d[2] == "`@the.owner` look, <@UADA> too" and "REACHED NOBODY: @the.owner" in res_d["hand"][0]
           and "needs_owner=true" in res_d["hand"][0] and "@ada.byron —" not in res_d["hand"][0]
           and sent_d[3] == "❓ <@UOWNER> <@UOWNER> which?" and "REACHED NOBODY" not in res_d["askhand"][0])
+    # …AND DECLARING IT IS NOT AUTHORITY TO USE THAT SEAM (the brief 2026-09-20, core/docs/comms-contract.md: "a
+    # --decision, a needs_owner, a message prefix or a member's payload is not authority: from anything but the control
+    # seat those are the same planner request"). The cases above are the CONTROL repo's own seat. A track, an orch,
+    # the box session or another repo's seat setting the same boolean used to get the identical ❓ + real @-mention in
+    # its own channel — one boolean, and anything running on this box could page him. Now the reply it wrote goes into
+    # the thread it was asked in with neither, and the ask leaves by `cc-notify --ask`, the one route every other
+    # request takes; cc-notify's own is_control reads the caller a second time out there.
+    role_na = os.environ.pop("CC_ROLE", None); sent_na, ran_na, res_na = [], [], {}
+    real_run_na = EFFECTS.run_impl
+    cfg_na = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+    ch_tr = Channel(f"{CTL}/some-track"); ch_tr.cfg = dict(cfg_na)          # a track seat of the control repo itself
+    ch_or = Channel(CTL); ch_or.cfg = dict(cfg_na); ch_or.alias = "an-orch"  # an orch: the control repo's target, another seat
+    ch_ot = Channel("myrepo"); ch_ot.cfg = dict(cfg_na)                      # another repo's planning seat
+    for c_na in (ch_tr, ch_or, ch_ot):
+        c_na.muted = lambda: False
+    try:
+        globals()["api"] = lambda method, token, **kw: (sent_na.append(kw.get("text")) if method == "chat.postMessage" else None) or {"ts": "1"}
+        EFFECTS.run_impl = lambda cmd, **kw: ran_na.append(list(cmd)) or types.SimpleNamespace(returncode=0, stdout="req-20260920T000000Z-9\n", stderr="")
+        res_na["track"] = ch_tr.call("reply", {"chat_id": "C1", "text": "deploy to prod or not?", "thread_ts": "9.0", "needs_owner": True})
+        res_na["orch"] = ch_or.call("reply", {"chat_id": "C1", "text": "spend past the cap?", "needs_owner": True})
+        res_na["other"] = ch_ot.call("reply", {"chat_id": "C1", "text": "merge it?", "needs_owner": True})
+        n_na = len(ran_na)
+        EFFECTS.run_impl = lambda cmd, **kw: ran_na.append(list(cmd)) or types.SimpleNamespace(returncode=1, stdout="", stderr="cc-notify: the broker did not take request req-1\n")
+        res_na["unsent"] = ch_tr.call("reply", {"chat_id": "C1", "text": "still blocked on you", "needs_owner": True})
+    finally:
+        globals()["api"], EFFECTS.run_impl = real_api, real_run_na
+        if role_na is not None:
+            os.environ["CC_ROLE"] = role_na
+    check("reply tool: a needs_owner from a seat that is NOT the control repo's own — a track, an orch, another repo's "
+          "planning seat — posts the reply into the thread it was asked in with NO ❓ and no mention of him, and files "
+          "the ask as the planner request `cc-notify --ask` files: declaring it is not authority to page him, and the "
+          "member session, worker, orch or other repo that declared it could page him with one boolean before this",
+          sent_na[:3] == ["deploy to prod or not?", "spend past the cap?", "merge it?"]
+          and [c[:4] for c in ran_na[:3]] == [[f"{BIN}/cc-notify", "-t", f"{CTL}/some-track needs a decision", "--ask"],
+                                              [f"{BIN}/cc-notify", "-t", f"{CTL} needs a decision", "--ask"],
+                                              [f"{BIN}/cc-notify", "-t", "myrepo needs a decision", "--ask"]]
+          and all("--from" not in c for c in ran_na[:3])          # the seat is the daemon's word out there, never a caller's claim
+          and ran_na[0][-1].startswith("deploy to prod or not?") and "C1" in ran_na[0][-1])
+    check("reply tool: …and the session is TOLD its escalation went to the planning seat and not to him, with the "
+          "request id — a sender that believes it has reached him stops trying — while a cc-notify that did not take "
+          "it says so instead of reading as filed; the reply itself is posted either way",
+          all(r[1] is False for r in res_na.values())
+          and all("THE OWNER WAS NOT MENTIONED" in res_na[k][0] for k in ("track", "orch", "other"))
+          and "req-20260920T000000Z-9" in res_na["track"][0] and "filed as a request" in res_na["track"][0]
+          and "THE ASK WAS NOT FILED" in res_na["unsent"][0] and "the broker did not take request" in res_na["unsent"][0]
+          and len(ran_na) == n_na + 1 and sent_na[3] == "still blocked on you")
+    check("reply tool: the control repo's OWN planning seat keeps the ❓ and the mention, and files nothing — it is the "
+          "one seat that asks him, so the rule above must not have taken his door away from it. Its own block declares "
+          "no shell-out at all, so a cc-notify from it would stand in the denial ledger; none does",
+          sent_d[0] == "❓ <@UOWNER> prod or staging?" and sent_d[3] == "❓ <@UOWNER> <@UOWNER> which?" and den_d1 == den_d0)
+    # …AND THAT SEAT STILL MAY NOT PAGE HIM WHERE ONLY SESSIONS READ. The rule above asks WHO is replying; this one
+    # asks WHERE the reply lands. The control seat answers cards in #<ctl>-threads all day — a member's 🙋 ask, and
+    # the 🔐 card tell_seat hands it with that card's own chat and thread — so a needs_owner there put "❓ @owner"
+    # inside an AI-to-AI thread. The owner, 2026-09-20: a need for him is an @-mention in #<repo>/#approvals,
+    # "never a line inside an AI-to-AI thread", and that holds once the lane is gone.
+    role_tl = os.environ.pop("CC_ROLE", None); sent_tl, ran_tl = [], []
+    real_run_tl = EFFECTS.run_impl
+    ch_tl = Channel(CTL); ch_tl.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+    ch_tl.muted = lambda: False
+    json.dump({f"{CTL}-threads": "CTHR", CTL: "CCTL", "_t": time.time()}, open(f"{DIR}/channels.json", "w"))
+    try:
+        globals()["api"] = lambda method, token, **kw: (
+            (sent_tl.append(kw.get("text")) if method == "chat.postMessage" else None)
+            or ({"permalink": f"https://x.slack.com/archives/{kw.get('channel')}/p9"} if method == "chat.getPermalink" else {"ts": "1"}))
+        EFFECTS.run_impl = lambda cmd, **kw: ran_tl.append(list(cmd)) or types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        res_tl = ch_tl.call("reply", {"chat_id": "CTHR", "text": "restore Friday's snapshot or Thursday's?",
+                                      "thread_ts": "7.0", "ts": "7.4", "needs_owner": True})
+        n_tl = len(ran_tl)
+        res_own = ch_tl.call("reply", {"chat_id": "CCTL", "text": "prod or staging?", "needs_owner": True})
+        own_filed = len(ran_tl) == n_tl      # its own channel is where the head belongs: nothing is filed for it
+        # cc-notify prints a request id on this door only when ITS OWN is_control refused the seat (an unreachable
+        # daemon reads as exit 2) — so the card became a request, and saying "his card is in #<ctl>" would be false.
+        EFFECTS.run_impl = lambda cmd, **kw: ran_tl.append(list(cmd)) or types.SimpleNamespace(
+            returncode=0, stdout="req-20260920T000000Z-4\n", stderr="")
+        res_dem = ch_tl.call("reply", {"chat_id": "CTHR", "text": "which snapshot?", "needs_owner": True})
+        EFFECTS.run_impl = lambda cmd, **kw: ran_tl.append(list(cmd)) or types.SimpleNamespace(
+            returncode=1, stdout="", stderr="cc-notify: slack post failed (logged)\n")
+        res_nocard = ch_tl.call("reply", {"chat_id": "CTHR", "text": "and this one?", "needs_owner": True})
+    finally:
+        globals()["api"], EFFECTS.run_impl = real_api, real_run_tl
+        os.path.exists(f"{DIR}/channels.json") and os.remove(f"{DIR}/channels.json")
+        if role_tl is not None:
+            os.environ["CC_ROLE"] = role_tl
+    check("reply tool: the control seat's needs_owner INTO A -threads LANE mentions nobody there — the reply goes into "
+          "the thread as written — and the question is raised as the one ❓ card in #<ctl> by `cc-notify --decision`, "
+          "under a stable id, carrying the link back; in the seat's own channel the head stays",
+          sent_tl[0] == "restore Friday's snapshot or Thursday's?" and "<@UOWNER>" not in sent_tl[0] and "❓" not in sent_tl[0]
+          and ran_tl[0][:4] == [f"{BIN}/cc-notify", "-t", f"{CTL} blocked", "--decision"]
+          and "--id" in ran_tl[0] and ran_tl[0][ran_tl[0].index("--id") + 1].startswith("seat-decision:CTHR:7.0:")
+          and ran_tl[0][-1].startswith("restore Friday's snapshot or Thursday's?")
+          and f"#{CTL}-threads" in ran_tl[0][-1] and "https://x.slack.com/archives/CTHR/p9" in ran_tl[0][-1]
+          and sent_tl[1] == "❓ <@UOWNER> prod or staging?" and own_filed)
+    check("…and the seat is TOLD where his card went and how to follow the thread back, so it does not read as if he "
+          "had been mentioned in the lane",
+          res_tl[1] is False and f"HIS ❓ CARD IS IN #{CTL}" in res_tl[0] and f"NOT IN #{CTL}-threads" in res_tl[0]
+          and "https://x.slack.com/archives/CTHR/p9" in res_tl[0] and res_own[0].count("❓ CARD") == 0)
+    check("…and a card cc-notify did NOT post is never named as one: its own is_control refusing this seat prints a "
+          "request id, and a door that failed prints why — both say the owner has no card and neither claims a "
+          "mention, while the reply itself is in the thread as written either way",
+          sent_tl[2] == "which snapshot?" and sent_tl[3] == "and this one?"
+          and "HAS NO CARD" in res_dem[0] and "req-20260920T000000Z-4" in res_dem[0]
+          and "NO ❓ CARD WAS RAISED" in res_nocard[0] and "slack post failed" in res_nocard[0]
+          and res_dem[1] is False and res_nocard[1] is False)
     # A REPLY GOES WHERE THE QUESTION WAS ASKED, lanes or not: the tool posts to the chat_id off the tag and nothing
     # in the split touches it — the -updates routing lives in cmd_post's --route, which no reply ever goes through.
     sentL, roleL = [], os.environ.pop("CC_ROLE", None)
@@ -4559,6 +4805,26 @@ def run_selfcheck():
           "no cc-notify. Every one of those is a claim about a merge that has not happened yet, and the landing makes "
           "them itself, each one only once it is true",
           qMM == [(nameMM, "7")] and not runsMM and not dmMM.home_dirty)
+    # THE 🔐 APPROVAL CARD (cc-notify --approval, raised by cc-land for a head held under a protected path) is the card
+    # the owner's 👍 now lifts the hold on: it names the PR after the head, and on_approval reads it as it reads a PR
+    # card — the uid goes on as --approved-by, so cc-land's own owner check still decides. A card of anyone else's,
+    # or one naming no PR, is ignored as before.
+    qMM.clear(); dmMM.user_name = lambda u: "The Owner"      # `who` names a person: no users.info leaves this fixture
+    dmMM.fetch_message = lambda chat, ts: {"user": "UBOT", "text": f"❓ <@UOWNER> 🔐 *Approval needed:* [{nameMM}] PR #9 is NOT landing — core/bin/cc-slack is protected. Nothing merged; your 👍 here queues this head"}
+    globals()["react"] = lambda *a, **k: None
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            dmMM.on_approval("CAPPR", "1.2", "+1", who="UOWNER")
+            dmMM.fetch_message = lambda chat, ts: {"user": "UOWNER", "text": f"❓ <@UOWNER> 🔐 *Approval needed:* [{nameMM}] PR #9 typed by a person"}
+            dmMM.on_approval("CAPPR", "1.3", "+1", who="UOWNER")
+            dmMM.fetch_message = lambda chat, ts: {"user": "UBOT", "text": "❓ <@UOWNER> 🔐 *Approval needed:* restart the daemon?"}
+            dmMM.on_approval("CAPPR", "1.4", "+1", who="UOWNER")
+    finally:
+        globals()["react"] = _reactMM
+    check("a 👍 on the bot's 🔐 *Approval needed:* card naming [repo] PR #n hands THAT head to the landing queue (the held "
+          "head's card, since a self-landing repo's routine card is in the log lane now); a person's lookalike and a 🔐 "
+          "card naming no PR hand nothing over",
+          qMM == [(nameMM, "9")])
 
     # the channel server runs the code that is DEPLOYED, not the code it started with
     fR = tempfile.NamedTemporaryFile("w", delete=False, suffix="-cc-slack"); fR.write("x"); fR.close()
@@ -5858,7 +6124,9 @@ def run_selfcheck():
         # the outbound verbs: the member's channels and lanes only, never a DM, another channel or an owner verb
         r_rep = ms_req({"reply": "CAL", "text": "hi", "target": "alice", "ts": "1.1"})
         r_rep_t = ms_req({"reply": "CALT", "text": "hi"}); r_rep_u = ms_req({"reply": "CALU", "text": "hi"}); r_rep_tu = ms_req({"reply": "CALTU", "text": "hi"})
+        n_ran_rep = len(ranMS)
         r_rep_n = ms_req({"reply": "CAL", "text": "needs you", "needs_owner": True, "thread_ts": "9.9"}); r_rep_h = ms_req({"reply": "#alice", "text": "by name"})
+        ran_rep_n = ranMS[n_ran_rep:]   # a member's needs_owner is a request to the planning seat, not his mention (the case below, and dmRQ's)
         r_dm = ms_req({"reply": "DM1", "text": "hi"}); r_bob = ms_req({"reply": "CBOB", "text": "hi"}); r_my = ms_req({"reply": "CMY", "text": "hi"})
         r_status = ms_req({"status": True}); r_orch = ms_req({"orch": "alice", "alias": "x"}); r_mpost = ms_req({"post": "CAL", "text": "x"}); r_arch = ms_req({"archive": "", "target": "alice"})
         r_mperm = ms_req({"permission": "abcde", "answer": "yes"})   # answering a 🔐 prompt is nobody's inside a boundary
@@ -5872,7 +6140,7 @@ def run_selfcheck():
         r_disp = ms_req({"dispatch": "alice/todo", "opts": ["--loop", "2", "--budget", "5"]})
         r_disp_bob = ms_req({"dispatch": "bob/todo"}); r_disp_main = ms_req({"dispatch": "alice"}); r_disp_bad = ms_req({"dispatch": "alice/todo", "opts": ["--budget", "1e9"]})
         r_disp_inj = ms_req({"dispatch": "alice/todo", "opts": ["--model", "x; rm -rf /"]})
-        ran_disp = list(ranMS)
+        ran_disp = ranMS[len(ran_rep_n) + n_ran_rep:]   # from after the reply above: what the DISPATCH verb ran
         # ONE VERB PER REQUEST. A payload used to be VETTED on the verb the scope check found first and EXECUTED on
         # whichever key the dispatch chain reached: `hello` scoped as alice, then the `reply` beside it posted into a DM.
         r_two_dm = ms_req({"hello": "alice", "reply": "DM1", "text": "hi"})
@@ -5880,16 +6148,16 @@ def run_selfcheck():
         r_two_own = ms_req({"status": True, "reply": "CAL", "text": "hi"})
         r_two_main = ms_req({"hello": "myrepo", "dispatch": "alice/todo"}, member=None, peer=(999999, os.getuid(), f"{DEV}/myrepo"))
         r_none = ms_req({"text": "no verb at all"}); r_str = ms_req("dispatch")
-        ran_two = list(ranMS)
-        # escalate: the one member verb that leaves the workspace, and it leaves only towards the OWNER — inside the
-        # boundary cc-notify has no config to push with and would log to a tmpfs and exit 0, reaching nobody.
+        ran_two = ranMS[len(ran_rep_n) + n_ran_rep:]
+        # escalate: the one member verb that leaves the workspace, and it leaves only towards the PLANNING SEAT — inside
+        # the boundary cc-notify has no config to push with and would log to a tmpfs and exit 0, reaching nobody.
         r_esc = ms_req({"escalate": "blocked", "text": "the owner must decide this"})
         r_esc_empty = ms_req({"escalate": "blocked"})
         # …and the words are a MEMBER'S, bound for the OWNER'S DM: a broadcast entity, a mention, a link and a fence
         # in either field must reach cc-notify escaped and defanged the way a 🔐 field does, and long ones capped.
         r_esc_hot = ms_req({"escalate": "<!channel> @owner ```pwned",
                             "text": "click [here](https://evil.example) <@U123> & tell @owner\n```\n" + "x" * 2000})
-        ran_esc = ranMS[len(ran_two):]
+        ran_esc = ranMS[len(ran_two) + len(ran_rep_n) + n_ran_rep:]
         # `ask`: THE MEMBER'S QUESTION TO THE PLANNING SEAT, both directions (raised-a-workspace-cannot-ask-in-the-channel-
         # the-rule-names, 2026-09-18). The brief: "from inside a member session one verb posts an ask card to #<ctl>-threads
         # naming the workspace and the ask; the planning seat's thread answer reaches the member's own channel". Out: the
@@ -6155,9 +6423,10 @@ def run_selfcheck():
           "the calling shell's environment says — and it is told `own` for its own channel and not for #myrepo's, which "
           "is what puts a <#…> in front of that post; a caller no session owns has no name, and a member socket has no "
           "such verb",
-          r_who.get("name") == display_name(CTL) and r_who.get("own") is False
+          r_who.get("name") == display_name(CTL) and r_who.get("own") is False and r_who.get("seat") == CTL
           and r_who_own.get("name") == display_name(CTL) and r_who_own.get("own") is True
-          and r_who_none.get("name") is None and r_who_none.get("own") is True and r_who_mem.get("ok") is False)
+          and r_who_none.get("name") is None and r_who_none.get("own") is True and r_who_none.get("seat") is None
+          and r_who_mem.get("ok") is False)
     check("MEMBER socket: a permission_request is scoped like every other line she writes — it was handled ABOVE that "
           "gate — so one naming a channel that is not hers is dropped whole, and one naming none is relayed to the "
           "lane the daemon picks itself and stamped as HERS",
@@ -6172,11 +6441,14 @@ def run_selfcheck():
           r_inj.get("ok") and got_inj["meta"]["role"] == "member" and got_inj["meta"]["user"] == "alice (local)" and got_inj["content"] == "from a script"
           and r_injbox.get("ok") is False and r_injbob.get("ok") is False and r_injq.get("result") == "queued" and starts_ms == [])
     check("MEMBER socket: reply lands in #alice, #alice--todo and both -updates lanes, signed as the workspace's session, the 👀 "
-          "comes off, and needs_owner marks the root ❓ — while a DM, another member's channel, the box's own repo channel and "
+          "comes off, and a needs_owner posts in her thread and files a request to the planning seat (never his mention: the "
+          "socket is not the control seat) — while a DM, another member's channel, the box's own repo channel and "
           "every owner verb (status, orch, archive, post, permission) are refused — a workspace answering its own 🔐 "
           "prompt is the whole point of routing that prompt out of its channel",
           [p[0] for p in postedMS[:5]] == ["CAL", "CALT", "CALU", "CALTU", "CAL"] and postedMS[0][2] == display_name("alice")
           and ("CAL", "1.1", "eyes", True, None) in reactedMS and r_rep_n.get("ok") and r_rep_h.get("ok")
+          and len(ran_rep_n) == 1 and ran_rep_n[0][:2] == [f"{BIN}/cc-notify", "-t"]
+          and ran_rep_n[0][3:6] == ["--ask", "--from", "alice"]
           and all(r.get("ok") is False for r in (r_dm, r_bob, r_my, r_status, r_orch, r_mpost, r_arch, r_mperm))
           and "not one of alice's channels" in r_dm.get("error", "") and "not a member verb" in r_status.get("error", "")
           and "not a member verb" in r_mperm.get("error", ""))
@@ -6188,7 +6460,7 @@ def run_selfcheck():
     dmRQ = Daemon(use_slack=False); dmRQ.cfg = {"SLACK_BOT_TOKEN": "xoxb-t", "SLACK_OWNER_ID": "UOWNER"}
     dmRQ.names.update({"CCAR": "carol"})
     os.makedirs(f"{DEV}/carol/.cc", exist_ok=True); open(f"{DEV}/carol/{MEMBER_MARKER}", "w").close()
-    postedRQ, reactedRQ = [], []
+    postedRQ, reactedRQ, ranRQ = [], [], []
     real_post_rq, real_react_rq, real_qs_rq = post, react, globals()["QUERIES_STATE"]
     globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, decision=False, **kw: (   # the ❓ head is post()'s own, built here so a case sees the line the channel sees
         postedRQ.append((chat, decision_head(cfg, text) if decision else text, username)) or (1, "5.5"))
@@ -6234,10 +6506,15 @@ def run_selfcheck():
         r_rq_fail = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.7", "text": "🔐 I cannot do that at all"})
         n_rq_end = len(postedRQ)
         # …and a reply that DECLARES needs_owner is the decision ask itself, not the guard's refusal paraphrased: it
-        # goes out, behind ❓ + his mention, although its first line says "I cannot do that", and spools nothing.
+        # goes out although its first line says "I cannot do that", and spools nothing. What it is NOT is the owner's
+        # door: a member workspace's session is never the control repo's seat, so the ❓ and his mention come off and
+        # the ask is filed to that seat by `cc-notify --ask --from carol`, the route `escalate` already takes.
         globals()["QUERIES_STATE"] = qs_dec
+        real_run_rq = EFFECTS.run_impl
+        EFFECTS.run_impl = lambda cmd, **kw: ranRQ.append(list(cmd)) or types.SimpleNamespace(returncode=0, stdout="req-20260920T000000Z-7\n", stderr="")
         r_rq_dec = rq_req({"reply": "CCAR", "thread_ts": "3.0", "ts": "3.8", "needs_owner": True,
-                           "text": "I cannot do that myself — deploying needs your go-ahead"})
+                           "text": "I cannot do that myself — deploying needs your go-ahead <!channel>"})
+        EFFECTS.run_impl = real_run_rq
         rq_dec_posted = postedRQ[n_rq_end:]
         rq_dec_spool = sorted(os.listdir(f"{qs_dec}/carol")) if os.path.isdir(f"{qs_dec}/carol") else []
         # …and NEITHER of the two handles this dir hands the daemon may park it. The dir is bound rw inside the
@@ -6292,15 +6569,25 @@ def run_selfcheck():
           and r_rq_big.get("ok") is True and "not posted" in r_rq_big.get("text", "") and size_rq_after == size_rq_big
           and r_rq_fail.get("ok") is True and "not posted" in r_rq_fail.get("text", "") and n_rq_end == 2)
     check("MEMBER socket: a reply that DECLARES needs_owner is the member session's decision ask, not the guard's "
-          "refusal paraphrased — it is posted into her channel behind ❓ + the owner's mention even though its first "
-          "line says `I cannot do that`, and writes NO spool line; needs_owner is one of only two doors to the owner "
-          "and the one the session prompt names for the part of an ask that needs him, so running the refusal filter "
-          "ahead of it swallowed every legitimate escalation a member session made",
+          "refusal paraphrased — it is posted into her channel even though its first line says `I cannot do that`, "
+          "and writes NO spool line; it is the door the session prompt names for the part of an ask that needs him, "
+          "so running the refusal filter ahead of it swallowed every legitimate escalation a member session made",
           r_rq_dec.get("ok") is True and r_rq_dec.get("text", "").startswith("sent (1 message(s))")
           and len(rq_dec_posted) == 1 and rq_dec_posted[0][0] == "CCAR"
-          and rq_dec_posted[0][1] == "❓ <@UOWNER> I cannot do that myself — deploying needs your go-ahead"
           and rq_dec_posted[0][2] == display_name("carol") and rq_dec_spool == []
           and ("CCAR", "3.8", "eyes", True) in reactedRQ)
+    check("MEMBER socket: …and it does NOT mention the owner. A member workspace's session is not the control repo's "
+          "seat, and a needs_owner is not authority to be one (the comms contract), so the ❓ and his mention come off "
+          "and the ask goes to the seat as `cc-notify --ask --from <workspace>` — the socket names the workspace, so "
+          "the seat's answer finds #carol — with the member's words defanged as `escalate` defangs them and the tool "
+          "result telling her session where its escalation went. Before this, one boolean from inside a boundary "
+          "@-mentioned him in her channel",
+          rq_dec_posted[0][1] == "I cannot do that myself — deploying needs your go-ahead <!channel>"
+          and len(ranRQ) == 1 and ranRQ[0][:2] == [f"{BIN}/cc-notify", "-t"]
+          and ranRQ[0][2].startswith("carol: ") and ranRQ[0][3:6] == ["--ask", "--from", "carol"]
+          and "<!channel>" not in ranRQ[0][-1] and "#carol" in ranRQ[0][-1]
+          and "THE OWNER WAS NOT MENTIONED" in r_rq_dec.get("text", "")
+          and "req-20260920T000000Z-7" in r_rq_dec.get("text", ""))
     check("MEMBER socket: a FIFO planted at the member's .queries.lock does NOT park the daemon — record_refusal_query "
           "runs on a cc-slackd handle_conn thread and that dir is bound rw inside her boundary, so a blocking open(2) "
           "of it never returns: one leaked, hung daemon thread per 🔐 reply and a reply that never answers. The open is "
@@ -6463,14 +6750,16 @@ def run_selfcheck():
           "off the sweep makes nothing at all",
           len(made_capped) == PROVISION_MAX and made_again == made_sweep and made_off == [])
     check("MEMBER socket: `escalate` is the way out — inside the boundary cc-notify has no config to push with, so it "
-          "hands the daemon the message and the daemon makes a REAL `cc-notify --owner` call on the host (the owner's "
-          "DM, never the member's own channel where everyone but him reads it); the call carries the title and the "
-          "words and NO priority, because how loudly an escalation lands is the table's row out here and never the "
-          "member's to set; an empty one is refused",
+          "hands the daemon the message and the daemon makes a REAL `cc-notify --ask` call on the host: a REQUEST TO "
+          "THE PLANNING SEAT (on file, over the broker), never the owner's DM (the member cannot promote itself: the "
+          "brief comms-requests-reach-who-decides) and never the member's own channel; the call carries the title and "
+          "the words and NO priority, because what the words buy is decided out here and never by the member; the "
+          "answer says the seat has it; an empty one is refused",
           r_esc.get("ok") and ran_esc[:1] == [[f"{BIN}/cc-notify", "-t", "alice: blocked",
-                                               "--owner", "--", "the owner must decide this"]]
+                                               "--ask", "--from", "alice", "--", "the owner must decide this"]]
+          and "planning seat" in r_esc.get("text", "") and "owner was told" not in r_esc.get("text", "")
           and r_esc_empty.get("ok") is False and "something to say" in r_esc_empty.get("error", ""))
-    esc_title, esc_text = (ran_esc[1][2], ran_esc[1][5]) if len(ran_esc) > 1 and len(ran_esc[1]) > 5 else ("", "")
+    esc_title, esc_text = (ran_esc[1][2], ran_esc[1][7]) if len(ran_esc) > 1 and len(ran_esc[1]) > 7 else ("", "")
     check("MEMBER socket: an escalation's title and text reach cc-notify the way a 🔐 field does — the mrkdwn entities "
           "escaped so `<!channel>` and `<@U…>` are words and not a broadcast or a ping, an @handle unhooked from the "
           "mention it would become, `](` broken so no link reads as the box's own line, backticks defanged so no fence "
