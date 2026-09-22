@@ -19,6 +19,8 @@ spend of two sessions; past the ROTATE LINE the box runs it for the session (--s
                                              call at a time — the board in it is unfinished rows, without
                                              their truncated `task:` line, and a queued row's header (and
                                              its hold, if a person put one on it) with nothing else under it;
+                                             `still out` names the predecessor's running subagents and the
+                                             workers it dispatched (--ready prints the same);
                                              a packet at or over CC_BRIEF_PACKET_BAND (24 kB) is one failures
                                              record (spend/handoff-packet-over-band), once per handoff
   cc-handoff --status [<target>] [--json]    what phase, who is live, how long left
@@ -37,7 +39,9 @@ prompt or the tool calls under it, so a successor-born seat hands itself off lik
 THE SUCCESSOR'S BRIEF SAYS WHAT IS LIVE NOW. Its "unfinished right now" line is read off the live worker table
 --brief prints, and is absent when that table is empty (flight_line); a `--in-flight` text is the caller's own
 note and is labelled as such. A predecessor stays only for subagents whose transcript has not delivered its
-final turn (reported()): a report already in is not waited for, however recent.
+final turn (reported()): a report already in is not waited for, however recent. Its "still out" section and
+--ready's output name the predecessor's running subagents and the workers it dispatched (dispatched(): live
+loops whose cc-loop `orch` file names this seat), by the same words (out_line).
 
 THE INVARIANT. One record, ~/.cc/state/handoff/<target>.json, names the LIVE session. The live one owns the
 channel and may act on the world; the other is muted and gated (cc-guard and cc-slack read the same record).
@@ -79,7 +83,12 @@ predecessor with live subagents STAYS first (read off the harness's task files; 
 CC_HANDOFF_AGENT_IDLE counts as done; capped at CC_HANDOFF_AGENT_MAX), hands each report to the successor, and
 gets the final message when the last one is in. Its board rows held by an `agent` mark move to the successor
 with the name (carry_marks). The kill is fenced by refuse_kill(): only the window the record names, only after
-cutover, never the caller's own.
+cutover, never the caller's own. A seat whose record carries no session id (a planning seat, an orch) has it
+read off its live pane at --overlap and again at --ready (seat_sid) — without it the subagents read as none.
+A bounded stay, not a refusal and not a wait before cutover: the successor is live at once, and the staying
+predecessor spends nothing between reports. A worker the seat dispatched runs in a window of its own
+(its dispatch opens one), which nothing here kills, so it outlives the handoff and the retirement; its stop
+notice is addressed to the target (cc-loop's stop_target), never to a window.
 
 EVERY PROMPT THIS FILE TYPES INTO A SESSION LEADS WITH `[cc-handoff]` (MACHINE): cc-scope's ask ledger skips it
 by the tag, never by the wording.
@@ -643,6 +652,74 @@ def subagents(sid, idle=None):
     return [n for _, n in sorted(live, reverse=True)]
 
 
+def tasks_sid(pid):
+    """The session id of claude process `pid`, off the task directory it holds open: every live interactive
+    claude keeps an fd on its own `<root>/<project>/<session id>/tasks` (probed 2026-09-22, ten seats, one fd
+    each). "" when it holds none or cannot be read."""
+    root = os.environ.get("CC_HANDOFF_TASKS") or os.path.join(tempfile.gettempdir(), "claude-%d" % os.getuid())
+    pat = re.compile(re.escape(os.path.realpath(root)) + r"/[^/]+/([A-Za-z0-9][A-Za-z0-9._-]*)/tasks$")
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return ""
+    for fd in fds:
+        try:
+            m = pat.match(os.readlink(f"/proc/{pid}/fd/{fd}"))
+        except OSError:
+            continue
+        if m:
+            return m.group(1)
+    return ""
+
+
+def seat_sid(wid):
+    """The session id of the seat in window `wid`, read off its live process (tasks_sid) — the one way to find the
+    subagents of a seat whose record carries no id. A planning seat and an orch never do (seat_of): until
+    2026-09-22 their subagents read as none, and --ready retired the voice seat two minutes after cutover with
+    three of them 12-15 minutes in, all three lost (2026-09-21 19:57Z)."""
+    pid = pane_claude(wid)
+    return tasks_sid(pid) if pid else ""
+
+
+def pre_sid(rec):
+    """The predecessor's session id: the record's, else read off its live pane (seat_sid)."""
+    pre = (rec or {}).get("predecessor") or {}
+    return pre.get("session_id") or seat_sid(pre.get("tmux") or "")
+
+
+def dispatched(target):
+    """The workers this seat dispatched that are still running: live loops under its repo (live_workers) whose
+    `orch` file (cc-loop's orch_record) names this orch's alias — or names none, for the repo's own seat. A track
+    dispatches none. They run in windows of their own, which the retirement never kills (refuse_kill), so they
+    outlive the handoff; the successor is the one they report to, and it must know they are out."""
+    repo, alias, track = parts(target)
+    if track:
+        return []
+    out = []
+    for line in live_workers(repo).splitlines():
+        t = line.split(None, 1)[0] if line.strip() else ""
+        try:
+            who = open(os.path.join(STATE, repo, t, "orch")).read().strip()
+        except OSError:
+            who = ""
+        if t and who == (alias or ""):
+            out.append(t)
+    return out
+
+
+def out_line(target, rec):
+    """What the predecessor still has out, in one line — the same words in --brief and --ready."""
+    subs, wk = subagents(pre_sid(rec)), dispatched(target)
+    bits = []
+    if subs:
+        bits.append(f"{len(subs)} subagent(s) still running ({', '.join(subs[:6])}): it stays for them after "
+                    f"cutover and hands each report on to you")
+    if wk:
+        bits.append(f"{len(wk)} worker(s) it dispatched ({', '.join(wk[:6])}): they keep running through the "
+                    f"handoff, and their stop notices are addressed to {target}, not to its window")
+    return "; ".join(bits)
+
+
 # ---- phases --------------------------------------------------------------------------------------------
 
 BRIEF = """You are the SUCCESSOR in an overlapping handoff of {target}. THE OVERLAP IS SHORT: {mins} minutes at \
@@ -935,7 +1012,9 @@ def start(target, session_id="", flight="", box=False):
     cap = cfg("CC_HANDOFF_OVERLAP_MAX", DEFAULT_MAX)    # once: the deadline and the brief must name the same number
     repo = parts(target)[0]
     rec = {"id": hid, "target": target, "phase": "overlap", "live": "predecessor",
-           "predecessor": {"session_id": session_id or "", "tmux": wid, "window": target},
+           # the seat's own id off its live process when the caller has none: a planning seat or an orch never
+           # has one, and without it its subagents are invisible to --brief, --ready and the stay (seat_sid)
+           "predecessor": {"session_id": session_id or seat_sid(wid) or "", "tmux": wid, "window": target},
            "successor": {"session_id": sid, "tmux": "", "window": target + NEXT},
            "started": now, "deadline": now + cap,
            # …and for as long as that runs, nothing but the successor wakes the predecessor — see AND QUIET.
@@ -1020,9 +1099,15 @@ def ready(target=None, forced=False):
     # answer — nor write a second journal line, nor send a second STAY_MSG (`first` below).
     pre = (rec.get("predecessor") or {}).get("tmux") or ""
     first = rec.get("held") is None
+    # "--ready no longer silently ends a predecessor that is still waiting on work it named" (the brief, 2026-09-22):
+    # the id is read off the live pane when the record has none, so a planning seat's or an orch's subagents hold it.
     if first:
-        rec["held"] = subagents((rec.get("predecessor") or {}).get("session_id") or "") if pane_live_id(pre) else []
+        sid = pre_sid(rec) if pane_live_id(pre) else ""
+        if sid:
+            rec["predecessor"]["session_id"] = sid     # stay() reads its subagents by this id, in another process
+        rec["held"] = subagents(sid) if sid else []
     held = rec.get("held") or []
+    wk = dispatched(target)
     rec["live"] = "successor"                      # ---- THE COMMIT POINT ----
     rec["phase"] = "cutover"
     rec["cutover"] = time.time()
@@ -1031,8 +1116,14 @@ def ready(target=None, forced=False):
     ledger(rec, "overlap-forced" if forced else "overlap-cutover")
     write(rec)
     derive(rec, first)
-    print(f"cc-handoff: {target} — the successor is live; " + (f"{staying}, then retires" if held
-          else "the predecessor is journalling, then retiring"))
+    print(f"cc-handoff: {target} — the successor is live; " + (f"{staying} ({', '.join(held[:6])}), then retires"
+          if held else "the predecessor is journalling, then retiring"))
+    if wk:
+        print(f"cc-handoff: {len(wk)} worker(s) your predecessor dispatched keep running and report to you: "
+              f"{', '.join(wk[:6])}")
+    if first and pane_live_id(pre) and not pre_sid(rec):
+        print(f"cc-handoff: the predecessor's session id could not be read, so its subagents could not be counted "
+              f"— if it named any it was waiting on, ask it before it retires", file=sys.stderr)
     return 0
 
 
@@ -1338,7 +1429,27 @@ def seat_of(wid):
     nor does a `-c` track — those are known by their cwd. `started` is the live process's own start (the epoch
     /proc/<pid> was created), which is what bounds a measurement taken by cwd: see measure_seat().
     A `-p`/`--print` claude is a worker's iteration, not a seat."""
-    todo, seen = (tmux("list-panes", "-t", wid, "-F", "#{pane_pid}") or "").split(), set()
+    k = pane_claude(wid)
+    if not k:
+        return None
+    try:
+        argv = open(f"/proc/{k}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+        cwd = os.readlink(f"/proc/{k}/cwd")
+        started = os.stat(f"/proc/{k}").st_ctime    # when THIS process started, in epoch seconds
+    except OSError:
+        return None
+    sid = ""
+    for flag in ("--session-id", "--resume"):
+        i = argv.index(flag) if flag in argv else -1
+        if 0 <= i < len(argv) - 1 and SID_RE.match(argv[i + 1]):
+            sid = argv[i + 1]
+    return sid, cwd, started
+
+
+def pane_claude(wid):
+    """The pid of the interactive `claude` under that window's pane, through any wrapper (cc, cc-sandbox, bwrap),
+    or "" — a `-p`/`--print` claude is a worker's iteration, not a seat."""
+    todo, seen = (tmux("list-panes", "-t", wid, "-F", "#{pane_pid}") or "").split() if wid else [], set()
     while todo:
         pid = todo.pop()
         if pid in seen:
@@ -1354,19 +1465,12 @@ def seat_of(wid):
                     todo.append(k)                 # a wrapper (cc, cc-sandbox, bwrap): the seat is under it
                     continue
                 argv = open(f"/proc/{k}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
-                cwd = os.readlink(f"/proc/{k}/cwd")
-                started = os.stat(f"/proc/{k}").st_ctime    # when THIS process started, in epoch seconds
             except OSError:
                 continue
             if any(a in ("-p", "--print") for a in argv):
                 continue
-            sid = ""
-            for flag in ("--session-id", "--resume"):
-                i = argv.index(flag) if flag in argv else -1
-                if 0 <= i < len(argv) - 1 and SID_RE.match(argv[i + 1]):
-                    sid = argv[i + 1]
-            return sid, cwd, started
-    return None
+            return k
+    return ""
 
 
 def measure_seat(target, sid, alone, since=0):
@@ -1837,6 +1941,8 @@ def brief(target):
          f"`cc board get {repo} <row> instructions` has the whole of any one of them", board_open(repo)),
         ("land — lanes and the landing queue", lanes()),
         (f"workers — live loops under {repo}, last line of each", live_workers(repo)),
+        # the predecessor's own work still out: what --ready will wait for, and what it will leave running
+        ("still out — the predecessor's subagents and the workers it dispatched", out_line(target, rec)),
         ("open PRs", prs(repo)),
         # `list`, not `count`: a successor who inherits "49 open asks" as a bare number cannot see which ones,
         # and asks for them. `list` with no --status is the same set `count` counted — the unsettled ones, one

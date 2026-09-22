@@ -8,9 +8,10 @@ def run_selfcheck():
     os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
     nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the suite sets it; these cases read what run() was handed, not what a door did with it
     import tempfile
-    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held, seat_of, measure_seat
+    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held, seat_of, measure_seat, pane_claude
     real_out = out
     real_held = worker_held      # the real one: every case below rebinds worker_held to a stub
+    _real = {"win_id": win_id, "pane_live": pane_live, "pane_live_id": pane_live_id, "pane_claude": pane_claude}   # the real-tmux case
     _real_measure = measure_seat   # the real one: the rotation cases stub measure_seat and check one refusal of the real
     p = f = 0
 
@@ -1438,6 +1439,114 @@ def run_selfcheck():
                 if k.startswith("rt"):
                     del wins[k]
             seatd.clear(); meas.clear()
+
+        # ---- A HANDOFF ENDS THE SEAT, NOT ITS WORK (2026-09-22), on a REAL scratch tmux server: an orch seat whose
+        # record carries no session id holds three subagent-shaped things out and dispatches a worker the way
+        # `cc --go` does (a window of its own) and one `setsid nohup`; it is handed off and retired by the same
+        # start/ready/retire a seat gets, and the retirement's real kill-window must end the seat and nothing it
+        # sent out. The suppressed case stands beside it: a loop left as a bare `&` child of the seat's shell IS
+        # signalled by that kill, which is what makes "the worker is alive" an answer and not a vacuous pass.
+        if shutil.which("tmux"):
+            keep = (tmux, win_id, pane_live, pane_live_id, pane_claude, me[0])
+            envk = {k: os.environ.get(k) for k in ("CC_HANDOFF_TASKS", "CC_HANDOFF_AGENT_MAX", "CC_HANDOFF_DRAIN",
+                                                   "CC_HANDOFF_RETIRE_GRACE", "CC_HANDOFF", "CC_HANDOFF_NO_KICK", "CC_ROLE")}
+            os.environ.pop("CC_ROLE", None)      # a gate run from a --go worker must not make start() refuse (see role0)
+            sk, w9 = "cchandoff-sc%d" % os.getpid(), os.path.join(d, "w9")
+            os.makedirs(w9)
+            troot9 = os.path.join(d, "tasks9")
+            t9 = os.path.join(troot9, "-proj", "sid-rw9", "tasks")
+            os.makedirs(t9)
+            tr9 = os.path.join(d, "a-out.jsonl")
+            with open(tr9, "w") as fh:
+                fh.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use"}]}}) + "\n")
+            os.symlink(tr9, os.path.join(t9, "a-out.output"))          # a subagent mid-turn: still out
+            os.environ.update({"CC_HANDOFF_TASKS": troot9, "CC_HANDOFF_AGENT_MAX": "0", "CC_HANDOFF_DRAIN": "0",
+                               "CC_HANDOFF_RETIRE_GRACE": "0", "CC_HANDOFF_NO_KICK": "1"})
+            for t, who in (("t1", "orch"), ("t2", "other"), ("t3", None)):   # this orch's, another orch's, the repo seat's
+                os.makedirs(os.path.join(STATE, "rw9", t))
+                open(os.path.join(STATE, "rw9", t, "loop.log"), "w").write("2026-09-22T07:00:00Z iter 1/1 start\n")
+                if who:
+                    open(os.path.join(STATE, "rw9", t, "orch"), "w").write(who + "\n")
+            loop = os.path.join(w9, "loop.sh")
+            with open(loop, "w") as fh:          # cc-loop's own trap, in miniature
+                fh.write('#!/bin/bash\ntrap \'echo signalled >> "$1.log"; exit 130\' HUP INT TERM\n'
+                         'echo $$ > "$1.pid"; while :; do sleep 1; done\n')
+            os.symlink(sys.executable, os.path.join(w9, "claude"))    # comm `claude`: the seat, holding its tasks fd
+            with open(os.path.join(w9, "seat.sh"), "w") as fh:
+                fh.write(f"#!/bin/bash\n{w9}/claude -c 'import os,time; os.open({json.dumps(t9)}, os.O_RDONLY); time.sleep(600)' &\n"
+                         f"tmux -L {sk} new-window -d -n rw9/t1 '{loop} {w9}/win'\n"
+                         f"setsid nohup {loop} {w9}/sid >/dev/null 2>&1 &\n{loop} {w9}/bare &\nsleep 600\n")
+            os.chmod(loop, 0o755); os.chmod(os.path.join(w9, "seat.sh"), 0o755)
+
+            def tmux(*a, **k):
+                if a and a[0] == "new-window" and "__runnext" in a[-1]:
+                    a = a[:-1] + ("sleep 600",)       # the successor: a live pane, never a real `cc __runnext`
+                try:
+                    r = subprocess.run(["tmux", "-L", sk, "-f", "/dev/null", *a], capture_output=True, text=True, timeout=10)
+                    return r.stdout if r.returncode == 0 else None
+                except Exception:
+                    return None
+            win_id, pane_live, pane_live_id, pane_claude = _real["win_id"], _real["pane_live"], _real["pane_live_id"], _real["pane_claude"]
+            me[0] = ""
+            pids = {}
+            try:
+                tmux("new-session", "-d", "-s", SESSION, "-n", "rw9@orch", os.path.join(w9, "seat.sh"))
+                for _ in range(50):
+                    if all(os.path.exists(os.path.join(w9, n + ".pid")) for n in ("win", "sid", "bare")) and seat_sid(win_id("rw9@orch")):
+                        break
+                    real_s(0.1)
+                pids = {n: int(open(os.path.join(w9, n + ".pid")).read()) for n in ("win", "sid", "bare")}
+                start("rw9@orch")
+                r9 = read("rw9@orch")
+                ok("a seat whose caller gave no session id has it read off its live pane — the tasks dir its claude "
+                   "holds open — and a process holding none has none", r9 and r9["predecessor"]["session_id"] == "sid-rw9"
+                   and tasks_sid(os.getpid()) == "")
+                with contextlib.redirect_stdout(io.StringIO()) as bo:
+                    brief("rw9@orch")
+                bo = bo.getvalue().split("== still out")[1].split("\n== ")[0] if "== still out" in bo.getvalue() else ""
+                ok("--brief says what the predecessor still has out: its running subagent, and the worker it "
+                   "dispatched — not another orch's, not the repo seat's", "a-out" in bo and "t1" in bo
+                   and "t2" not in bo and "t3" not in bo)
+                ok("...and the repo's own seat counts the loop no orch dispatched as its own",
+                   dispatched("rw9") == ["t3"] and dispatched("rw9/t1") == [])
+                os.environ["CC_HANDOFF"] = r9["id"]
+                with contextlib.redirect_stdout(io.StringIO()) as ro:
+                    rc9 = ready("rw9@orch")
+                ro = ro.getvalue()
+                ok("--ready says it: the predecessor stays for the named subagent, and the worker keeps running",
+                   rc9 == 0 and read("rw9@orch")["held"] == ["a-out"] and "staying for 1 subagent(s) (a-out)" in ro
+                   and "keep running and report to you: t1" in ro)
+                pre9 = read("rw9@orch")["predecessor"]["tmux"]
+                ok("retire ends the seat — its window is gone, the record is cleared",
+                   retire("rw9@orch") == 0 and not win_alive(pre9) and read("rw9@orch") is None)
+                real_s(1.5)
+
+                def alive(n):
+                    try:
+                        os.kill(pids[n], 0)
+                        return True
+                    except OSError:
+                        return False
+                ok("...and the worker it dispatched survives the handoff and the retirement — in its own window, "
+                   "and detached with setsid", alive("win") and alive("sid") and win_id("rw9/t1"))
+                ok("...while a loop left as a bare child of the seat's shell IS signalled by that same kill "
+                   "(the case that makes the one above an answer)", not alive("bare")
+                   and "signalled" in open(os.path.join(w9, "bare.log")).read())
+            finally:
+                tmux("kill-server")
+                for pid in pids.values():
+                    try:
+                        os.kill(pid, 15)
+                    except OSError:
+                        pass
+                tmux, win_id, pane_live, pane_live_id, pane_claude, me[0] = keep
+                for k, v in envk.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+        else:
+            ok("tmux is installed — the handoff-survival case runs on a real scratch server", False)
 
         # INDEX-AT-WRITE: the line journal() appends is in the library's index when it returns — `cc-lib ask` finds
         # it as a checkpoint under the target's own journal, and had nothing to re-read itself (re-read absent from
