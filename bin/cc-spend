@@ -8,8 +8,10 @@ transcripts under ~/.claude/projects and, for a member workspace, under ~/.cc/me
 host's ~/.claude at all) — so it needs no model, no network and no cooperation from what it measures.
 
 THE TICK (`cc-spend tick`, every 5 min from cc-spend.timer). Every *.jsonl under ~/.claude/projects AND under each
-~/.cc/members/<handle>/claude/projects this box currently has (globbed fresh each tick, so a member workspace
-gained or dropped needs no edit here), at any depth — a subagent writes its own, one level deeper under
+~/.cc/members/<handle>/claude/projects this box currently has, AND under each hosted tutor's scratch,
+~/.cc/state/<repo>/<instance>/chat/<identity>/.claude/projects (all globbed fresh each tick, so a workspace or
+tutor gained or dropped needs no edit here; a tutor row is placed from that root as <repo>/tutor, since the cwd
+it records is the sandbox's own), at any depth — a subagent writes its own, one level deeper under
 <session>/subagents/, carrying the parent's sessionId. A member's cwd is the HOST's own path (cc-sandbox mirrors
 the layout, not a container-private one), so place() already attributes a member row to that handle exactly as
 it would a repo's — no separate accounting. Each transcript is read only from the byte offset the last tick left
@@ -34,6 +36,8 @@ PHANTOMS. Each tick also snapshots the live `claude` processes to procs.tsv. A p
 watching: a session whose transcript grew this tick with no tmux window on its cwd and no live board row behind
 it, or a process alive over an hour whose transcript has not grown in thirty minutes. A window is ON a cwd when
 its pane sits there or deeper — never a parent, or the `box` window parked at ~/dev would watch the whole box.
+A hosted tutor's row (the `tutor` track) is never a phantom: it answers a student from inside its sandbox, so it
+has no window and no board row BY DESIGN, and listing every live chat would bury the leaks this list is for.
 The tick WRITES that list to phantoms.tsv as well as printing it on demand, so a reader (the Slack Home tab) can
 show it without re-deriving the rule from tmux, the boards and the loops — and the answer it shows is the same
 one `cc-spend phantoms` gives, because `grew` only changes at a tick anyway.
@@ -45,7 +49,9 @@ record (`cc-failures record --once`) under the session's repo, at the turn's tim
 (links.source spend-context:<session>:<day>), so a session that stays over the band is one record a day, not one a
 tick. Only turns inside GREW_WINDOW count, so a first tick's backfill writes no history; a session with no repo
 (`-`) has no ledger to go to and is skipped. The failure detector clusters and investigates those records like any
-other kind; a writer that fails is one stderr line and never fails the tick.
+other kind; a writer that fails is one stderr line and never fails the tick. Tutor rows are skipped too: the
+advice that record carries — hand off before a turn re-reads the band — is a thing a session can do and a
+student's chat cannot.
 
   cc-spend                     today, by session, biggest first
   cc-spend --by repo|track|model|kind [--week]
@@ -419,6 +425,16 @@ def member_roots():
     return sorted(p for p in glob.glob(os.path.join(MEMBERS, "*", "claude", "projects")) if os.path.isdir(p))
 
 
+def tutor_roots():
+    """{root: repo} for every hosted tutor's transcript root, globbed fresh each tick. A site that runs a chat
+    tutor gives each signed-in identity a scratch under its own state, ~/.cc/state/<repo>/<instance>/chat/<id>,
+    and the sandbox binds that scratch as the tutor's HOME, so the CLI writes its transcripts there under
+    .claude/projects. The cwd those records carry is the sandbox's, meaningless on the host, so place() cannot
+    attribute them: the root does instead, to <repo> on the `tutor` track."""
+    pat = os.path.join(STATE, "*", "*", "chat", "*", ".claude", "projects")
+    return {p: os.path.relpath(p, STATE).split(os.sep)[0] for p in sorted(glob.glob(pat)) if os.path.isdir(p)}
+
+
 def scan_file(path, prev, seen_rids=None, sub_rids=None):
     """Read one transcript from where the last tick stopped. Returns (rows, newstate, rids) where rows are
     ((session, model, day) -> totals), newstate is what to remember about this file, and rids is every
@@ -566,7 +582,8 @@ def tick():
     # A member workspace writes to its OWN root, ~/.cc/members/<handle>/claude/projects, never to PROJ — the two
     # never overlap, so each root is walked and scored the same way, just against its own root when telling a
     # session transcript from a subagent's.
-    roots = [PROJ] + member_roots()
+    tutors = tutor_roots()                     # a tutor's root, not its cwd, says whose it is — see tutor_roots()
+    roots = [PROJ] + member_roots() + list(tutors)
     paths = sorted(((root, p) for root in roots for p in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)),
                    key=lambda rp: (is_session_transcript(rp[1], rp[0]), rp[1]))
     live_sub_sessions = set()                  # sessions this walk still finds a subagents/ file under
@@ -585,7 +602,7 @@ def tick():
                 sub_rids.setdefault(s, set()).add(r)  # rest of this tick and every one after
         for (sid, model, _day), a in agg.items():
             i, o, cr, cw = a["tok"]
-            repo, track = place(a["cwd"])
+            repo, track = (tutors[root], "tutor") if root in tutors else place(a["cwd"])
             rows.append([iso(a["ts"]), sid, a["cwd"], repo, track, a["kind"], model, i, o, cr, cw,
                          f"{a['usd']:.6f}"])
             if (stamp - a["ts"]).total_seconds() <= GREW_WINDOW:
@@ -594,7 +611,9 @@ def tick():
                 g["usd"] += a["usd"]
                 g["tok"] += i + o + cr + cw
                 g["ts"] = max(g["ts"], iso(a["ts"]))
-            if repo != "-" and (stamp - a["turn_ts"]).total_seconds() <= GREW_WINDOW:
+            # A tutor row has a repo now, but record_context's advice is for a session that can hand off, so
+            # the band is not a failure of a student's chat — see CONTEXT COST above.
+            if repo != "-" and track != "tutor" and (stamp - a["turn_ts"]).total_seconds() <= GREW_WINDOW:
                 pk = (sid, iso(a["turn_ts"])[:10])
                 if a["turn_cr"] > peaks.get(pk, {}).get("cr", -1):
                     peaks[pk] = {"cr": a["turn_cr"], "ts": a["turn_ts"], "repo": repo, "track": track,
@@ -750,7 +769,12 @@ def watched(cwd, repo, track, panes, loops, boards):
 
     A pane watches its own directory and anything it has cd'd DEEPER into, never a parent: this box's `box`
     window sits permanently at ~/dev (tmux-main.service runs cc-rc from there), so counting an ancestor pane
-    would mark every ~/dev/<repo> and ~/dev/<member>/... session watched and rule 1 would never fire again."""
+    would mark every ~/dev/<repo> and ~/dev/<member>/... session watched and rule 1 would never fire again.
+
+    The one exception is a hosted service: a tutor's spend has no window and no board row by design, and every
+    live student chat in the phantom list is noise over the leaks it exists to show."""
+    if track == "tutor":
+        return True
     c = (cwd or "").rstrip("/")
     for p in panes:
         if c == p or p.startswith(c + "/"):
@@ -1253,6 +1277,12 @@ def selfcheck():
            and len(phantom_rows(grew, [], set(), set(), {"r/t1": "running"}, {}, at)) == 1)
         ok("a board row that merely SAYS running, with no loop, is exactly what this catches",
            len(phantom_rows(grew, [], set(), {"r/other"}, {"r/t1": "running"}, {}, at)) == 1)
+        # A hosted tutor answers a student from inside its sandbox: no pane can sit on /home/tutor and no board
+        # row stands behind it, so without this every live chat would fill the list the leaks are read from.
+        tut = {"s2": {"cwd": "/home/tutor", "repo": "lessons", "track": "tutor", "kind": "headless", "usd": 2.0}}
+        ok("a hosted tutor's chat that grew this tick is not a phantom, while the same row on any other track is",
+           phantom_rows(tut, [], set(), set(), {}, {}, at) == []
+           and len(phantom_rows({"s2": dict(tut["s2"], track="t1")}, [], set(), set(), {}, {}, at)) == 1)
         old = [{"pid": 7, "etime_s": 2 * 3600, "cwd": cwd, "repo": "r", "track": "t1", "kind": "headless"}]
         got = phantom_rows({}, old, {cwd}, set(), {}, {cwd: at - timedelta(minutes=45)}, at)
         ok("a process alive over an hour whose transcript is idle 30 min is a phantom",
@@ -1339,9 +1369,10 @@ def selfcheck():
             envc.update(HOME=thc, CC_FAILURES=fl)
             fresh = iso(now() - timedelta(minutes=2))
 
-            def recc(sid, rid, cr, ts=fresh, repo="rc"):
+            def recc(sid, rid, cr, ts=fresh, repo="rc", cwd=None):
                 return json.dumps({"type": "assistant", "requestId": rid, "timestamp": ts, "sessionId": sid,
-                                   "cwd": os.path.join(thc, ".cc", "worktrees", repo, "tc"), "entrypoint": "sdk-cli",
+                                   "cwd": cwd or os.path.join(thc, ".cc", "worktrees", repo, "tc"),
+                                   "entrypoint": "sdk-cli",
                                    "message": {"model": "claude-opus-5", "usage": {
                                        "input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": cr,
                                        "cache_creation_input_tokens": 0}}}) + "\n"
@@ -1355,6 +1386,9 @@ def selfcheck():
             open(os.path.join(projc, "cool.jsonl"), "w").write(recc("cool", "c1", CONTEXT_BAND - 1, repo="rcool"))
             open(os.path.join(projc, "old.jsonl"), "w").write(
                 recc("old", "o1", 400_000, ts=iso(now() - timedelta(seconds=GREW_WINDOW + 600)), repo="rold"))
+            tutc = os.path.join(thc, ".cc", "state", "rtut", "i1", "chat", "abc", ".claude", "projects", "-home-tutor")
+            os.makedirs(tutc)
+            open(os.path.join(tutc, "chat.jsonl"), "w").write(recc("tut", "t1", 400_000, cwd="/home/tutor"))
             rc1 = subprocess.run([sys.executable, me, "tick"], env=envc, capture_output=True, text=True)
             l1 = ledger_c("rc")
             ok("a turn at the context band writes exactly one spend/context-over-band record, under the session's repo",
@@ -1362,6 +1396,12 @@ def selfcheck():
                and l1[0]["links"]["source"] == f"spend-context:hot:{fresh[:10]}" and "1 over the context band" in rc1.stdout)
             ok("…a turn one token below the band writes none, and neither does an over-band turn older than GREW_WINDOW",
                ledger_c("rcool") == [] and ledger_c("rold") == [])
+            tsv_c = os.path.join(thc, ".cc", "state", "spend", f"{fresh[:10]}.tsv")
+            tut_c = [ln.rstrip("\n").split("\t") for ln in open(tsv_c)
+                     if not ln.startswith("#") and ln.split("\t")[1] == "tut"]
+            ok("…and a tutor turn over the band is counted as spend but files no record: handing off before the "
+               "band is something a session can do and a student's chat cannot",
+               len(tut_c) == 1 and tut_c[0][4] == "tutor" and ledger_c("rtut") == [])
             subprocess.run([sys.executable, me, "tick"], env=envc, capture_output=True, text=True)
             open(hot, "a").write(recc("hot", "h3", 300_000))
             rc3 = subprocess.run([sys.executable, me, "tick"], env=envc, capture_output=True, text=True)
@@ -1741,13 +1781,23 @@ def selfcheck():
 
             open(os.path.join(host_proj, "shost.jsonl"), "w").write(rec9("req_host", "shost", cwd_host))
             open(os.path.join(mem_proj, "smem.jsonl"), "w").write(rec9("req_mem", "smem", cwd_mem))
+            # …and a HOSTED TUTOR's, under its site's state: ~/.cc/state/<repo>/<instance>/chat/<id>/.claude/
+            # projects. Its cwd is the sandbox's /home/tutor, which place() reads as nothing, so the root says
+            # whose it is. The same requestId written twice (two content blocks) counts once.
+            tut_proj = os.path.join(th9, ".cc", "state", "siterepo", "inst1", "chat", "abc123", ".claude",
+                                    "projects", "-home-tutor")
+            os.makedirs(tut_proj)
+            open(os.path.join(tut_proj, "stut.jsonl"), "w").write(rec9("req_tut", "stut", "/home/tutor") * 2)
             env9 = {**os.environ, "HOME": th9}
             r9 = subprocess.run([sys.executable, me, "tick"], env=env9, capture_output=True, text=True)
             rows9 = {r[1]: r for r in
                      (ln.split("\t") for ln in open(os.path.join(th9, ".cc", "state", "spend", f"{ts9[:10]}.tsv"))
                       if not ln.startswith("#"))}
-            ok("a tick counts a member workspace's transcript beside the host's, from one walk",
-               r9.returncode == 0 and set(rows9) == {"shost", "smem"})
+            ok("a tick counts a member workspace's and a hosted tutor's transcripts beside the host's, from one walk",
+               r9.returncode == 0 and set(rows9) == {"shost", "smem", "stut"})
+            tut9 = rows9.get("stut")
+            ok("…a tutor row is placed from its root as <repo>/tutor, not from the sandbox cwd, and counted once",
+               tut9 is not None and tut9[3] == "siterepo" and tut9[4] == "tutor" and tut9[7] == "100")
             mem9, host9 = rows9.get("smem"), rows9.get("shost")
             ok("…the member row is attributed to the member's own handle, on its own `member` track — a "
                "per-workspace figure that used to not exist at all",
