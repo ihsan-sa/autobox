@@ -77,6 +77,7 @@ tailnet is one deliberate command and it is the owner's, not this script's:
   cc-graphs tokens [--hours N] [--by lane|track|repo|model|kind] [--bucket SEC] [--raw]   the series, JSON on
                     stdout. --bucket is one of 300 (a tick), 900, 3600 or 86400; without it the window picks one.
                     A window and bucket that would draw more than MAX_BUCKETS points is refused, not truncated.
+                    --hours is bounded first by what the bucket HOLDS: about 5.4 years daily, 90 days below that.
                     --raw adds the /usage-style undeduped total for the same window — see THE /USAGE-STYLE
                     NUMBER below for what it is and why it runs high. Off by default: it re-reads transcripts.
   cc-graphs selfcheck                         tests; own fixtures — never this box's ledger and never its recorder
@@ -319,10 +320,15 @@ def tokens(hours=24, by="lane", step=None, upto=None, raw=False):
     this function returns, so it defaults off."""
     if by not in BY:
         raise ValueError("by must be one of " + ", ".join(BY))
-    hours = max(1, min(int(hours), 24 * 90))
-    step = int(step) if step else auto_step(hours)
+    step = int(step) if step else auto_step(int(hours))
     if step not in STEPS:
         raise ValueError("bucket must be one of " + ", ".join(str(s) for s in STEPS))
+    # A window is bounded by what its BUCKET can hold, not by a flat 90 days: daily buckets reach back nearly
+    # MAX_BUCKETS days (~5.4 years), so an all-time ask over an old ledger is answered whole instead of quietly
+    # becoming the last 90 days. One bucket is held back for the epoch alignment below, which adds one.
+    # A finer step keeps the 90-day bound: that far back it is over MAX_BUCKETS anyway and is REFUSED, not cut.
+    cap = (MAX_BUCKETS - 1) * step // 3600 if step >= DAY else 24 * 90
+    hours = max(1, min(int(hours), cap))
     upto = upto or now()
     end = int(upto.timestamp())
     start = end - hours * 3600
@@ -868,6 +874,23 @@ def selfcheck(_opt=None):
         t("too many buckets refused", _raises(lambda: tokens(hours=24 * 90, step=TICK, upto=upto)))
         t("that same window is fine daily", tokens(hours=24 * 90, step=DAY, upto=upto)["n"] <= MAX_BUCKETS)
         t("bad group refused", _raises(lambda: tokens(hours=24, by="session", upto=upto)))
+        # a finer bucket is still held at 90 days, so a window past that is refused rather than silently cut
+        t("a finer bucket keeps the 90-day bound", _raises(lambda: tokens(hours=24 * 400, step=3600, upto=upto)))
+
+        # 8a — A DAILY WINDOW IS NOT CUT AT 90 DAYS (review finding, PR #578). The all-time ask — the ledger's
+        #      first day file to now — used to be clamped to 2160 h, so a ledger older than that lost its opening
+        #      months from `total` while the caller was told it had asked for every day. Fixture ledger, real
+        #      window arithmetic: the first day is 200 days back and its dollars have to be in the total.
+        LEDGER = os.path.join(root, "l8a")
+        old_day = (upto - timedelta(days=200)).date().isoformat()
+        _fixture(LEDGER, old_day, [_row(old_day + "T01:00:00Z", sess="a", usd=8.0)])
+        _fixture(LEDGER, today, [_row("2026-05-04T11:00:00Z", sess="b", usd=1.0)])
+        old_midnight = datetime.strptime(old_day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        far = int((upto - old_midnight).total_seconds() // 3600) + 1        # rounded up, as the dashboard asks it
+        r = tokens(hours=far, by="lane", step=DAY, upto=upto)
+        t("a 200-day daily window keeps its first day", abs(r["total"]["usd"] - 9.0) < 1e-9)
+        t("and the window answered is the one asked for", r["window_h"] == far and far > 24 * 90)
+        LEDGER = os.path.join(root, "l8")             # 8b's arithmetic is the empty ledger's again, not this one's
 
         # 8b — the /usage-style raw total (--raw / raw=True): every assistant record's usage, no dedup at all —
         #      not even cc-spend's requestId one — reproducing the naive sum /usage does. Off by default and

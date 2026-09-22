@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""cc-name — the ONE place a workspace or a track is NAMED for a person to READ.
+
+A slug is not a name: "<repo>/the-till-adds-tax-twice" means nothing to the person paying for it (owner,
+2026-09-21). So anything that shows a workspace or a track to a person shows a plain NAME and a one-line ABOUT
+instead, and it has to be the SAME name and the same line everywhere, or one page calls a track "Fix the till"
+while a card titles the same work "the till adds tax twice". This file is that one answer: a caller asks here and
+does not name the work itself. The dashboard is the only caller today; a card or a thread title is the same ask.
+
+    cc-name <repo> [<track>]           the name, one line
+    cc-name --about <repo> [<track>]   its one-line description — empty when nothing describes it
+    cc-name --json <repo> [<track>]    {"repo","track","name","about"}, and "member" for a workspace
+    cc-name selfcheck
+
+WHERE EACH WORD COMES FROM. A TRACK: the board row's title is its description and its slug read aloud is its
+name; with no board row, the word table; with neither, the slug read aloud and no description. A WORKSPACE: its
+own repo name, described by the word table, else by the first sentence of ~/dev/<repo>/README.md — and a
+member's own workspace says so, because a member README speaks TO the member rather than about the work.
+
+IMPORTED, NOT SHELLED OUT TO, the way cc-time is. A page resolving a name per track per refresh must not be a
+subprocess per name:
+
+    import importlib.machinery, importlib.util
+    _s = importlib.util.spec_from_loader("ccname", importlib.machinery.SourceFileLoader("ccname", f"{BIN}/cc-name"))
+    ccname = importlib.util.module_from_spec(_s); _s.loader.exec_module(ccname)
+    ccname.read("shop", "fix-the-till")          # {"repo":…, "track":…, "name": "Fix the till", "about": "…"}
+
+A caller that already holds the board (it wanted the statuses too) passes the rows as the third argument and
+this reads no board of its own: `ccname.read(repo, track, board_rows)`. Nothing else differs — the same rows in,
+the same words out.
+
+THE WORD TABLE IS THE BOX'S, NOT THIS FILE'S. This tree is published, so it carries no workspace, member, project
+or lane of any particular box. The wordings live in the overlay beside it, at config/names.json:
+
+    {"workspaces": {"<repo>":  {"name": "…", "about": "…"}},
+     "tracks":     {"<track>": {"name": "…", "about": "…"}}}
+
+Both sections are optional and so is either key in a row. CC_NAME_WORDS points somewhere else; set to the empty
+string there is no table at all, and this still answers — every name falls back to its slug read aloud, which is
+what a box that has written no table gets. A table that will not parse is said so on stderr and read as empty:
+losing a wording is a worse page, losing the reader is no page.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+USAGE = "usage: cc-name [--about|--json] <repo> [<track>] | selfcheck"
+TIMEOUT = 30                 # a wedged cc-board must not hold the caller's thread; the dashboard uses the same figure
+# The three renderings that are structure rather than wording: the ledger writes `-` where a row belonged to no
+# workspace or to no track inside one, and a member's workspace is described by what it IS, since its own README
+# is addressed to them. No box's name, lane or project is anywhere in this file — those are the table's.
+NO_REPO = "No project"
+NO_TRACK = "Other"
+MEMBER_ABOUT = "A member's own workspace on the box"
+MEMBER_README = "Your workspace"    # how cc-slack seeds a member README: it speaks to them, so it is not an `about`
+_WORDS = {}                         # the table, by the path it was read from — a table does not change under a process
+
+
+def home():
+    return os.path.expanduser("~")
+
+
+def words_path():
+    """Where the word table is. CC_NAME_WORDS wins, "" turns it off, and the default is the overlay beside core/."""
+    p = os.environ.get("CC_NAME_WORDS")
+    if p is not None:
+        return p
+    root = os.path.dirname(BIN)
+    return os.path.join(os.path.dirname(root), "config", "names.json") if os.path.basename(root) == "core" else ""
+
+
+def words():
+    """{"workspaces": {…}, "tracks": {…}} — this box's own wordings, or {} where it keeps none."""
+    p = words_path()
+    if p not in _WORDS:
+        _WORDS[p] = _load(p)
+    return _WORDS[p]
+
+
+def _load(path):
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print("cc-name: %s will not read (%s) — every name falls back to its slug" % (path, e), file=sys.stderr)
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def plain(slug):
+    """A slug read aloud: "the-till-adds-tax-twice" -> "The till adds tax twice"."""
+    s = (slug or "").replace("-", " ").replace("_", " ").strip()
+    return s[:1].upper() + s[1:] if s else "Unnamed"
+
+
+def readme_line(repo):
+    """The first sentence of ~/dev/<repo>/README.md under its heading, markdown stripped — or "" if none."""
+    try:
+        with open(os.path.join(home(), "dev", repo, "README.md")) as f:
+            lines = f.read(8192).splitlines()
+    except (OSError, ValueError):
+        return ""
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith(("#", "!", "[!", "<", "```", "|", "-", "*")):
+            continue
+        ln = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", ln).replace("**", "").replace("`", "")
+        return re.split(r"(?<=[.!?])\s", ln, maxsplit=1)[0]
+    return ""
+
+
+def board(repo):
+    """<repo>'s board rows as cc-board holds them — {} where there is no board, or it will not read.
+
+    A board that will not read costs its titles and nothing else: every track still gets a name, off the table or
+    off its own slug. Only reached when the caller hands over no rows of its own.
+    """
+    try:
+        p = subprocess.run([os.path.join(BIN, "cc-board"), "json", repo], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=TIMEOUT)
+        return (json.loads(p.stdout).get("tracks") or {}) if p.returncode == 0 else {}
+    except Exception:
+        return {}
+
+
+def is_member(repo):
+    """Whether <repo> is a member's own workspace — ~/.cc/members/<repo>, the directory cc-member-v2 makes."""
+    return os.path.isdir(os.path.join(home(), ".cc", "members", repo))
+
+
+def read(repo, track="", rows=None):
+    """(repo, track) -> {"repo", "track", "name", "about"}. No track is the WORKSPACE, which also carries "member".
+
+    `rows` is <repo>'s board rows when the caller already has them; None reads the board here.
+    """
+    repo = repo or "-"
+    return _track(repo, track, rows) if track else _workspace(repo)
+
+
+def _track(repo, track, rows):
+    row = (board(repo) if rows is None else rows).get(track)
+    if row is not None:
+        name = plain(track)
+        about = row.get("title") or ""
+        if about.strip().lower() in (track.lower(), name.lower()):
+            about = ""              # a title that only repeats the slug says nothing more
+        return {"repo": repo, "track": track, "name": name, "about": about}
+    w = (words().get("tracks") or {}).get(track) or {}
+    return {"repo": repo, "track": track,
+            "name": w.get("name") or (NO_TRACK if track == "-" else plain(track)), "about": w.get("about") or ""}
+
+
+def _workspace(repo):
+    w = (words().get("workspaces") or {}).get(repo) or {}
+    about = w.get("about") or readme_line(repo)
+    member = is_member(repo)
+    if member and (not about or about.startswith(MEMBER_README)):
+        about = MEMBER_ABOUT
+    return {"repo": repo, "track": "", "name": w.get("name") or (NO_REPO if repo == "-" else repo),
+            "about": about, "member": member}
+
+
+def selfcheck():
+    import shutil
+    import tempfile
+    n = f = 0
+
+    def check(name, cond, got=None):
+        nonlocal n, f
+        n += 1
+        print(("  ok   " if cond else "  FAIL ") + name + ("" if cond or got is None else "  << %r" % (got,)))
+        if not cond:
+            f += 1
+
+    # A WHOLE BOX OF ITS OWN: its own HOME, its own board (read through the real cc-board), its own ~/dev and its
+    # own word table. No board, workspace, member or table of this box's is read, and nothing outside the temp dir
+    # is written.
+    d = tempfile.mkdtemp(prefix="cc-name-selfcheck-")
+    was = {k: os.environ.get(k) for k in ("HOME", "CC_NAME_WORDS")}
+    try:
+        os.makedirs(os.path.join(d, ".cc", "boards"))
+        os.makedirs(os.path.join(d, ".cc", "members", "rugs-helper"))
+        for repo, text in (("shop", "# shop\n\nA [small](http://x) **shop** for rugs. Second sentence.\n"),
+                           ("mill", "# mill\n\nThe mill that weaves them. And the rest.\n"),
+                           ("rugs-helper", "# rugs-helper\n\nYour workspace on the box. Everything lives here.\n")):
+            os.makedirs(os.path.join(d, "dev", repo))
+            with open(os.path.join(d, "dev", repo, "README.md"), "w") as fh:
+                fh.write(text)
+        rows = {"fix-the-till": {"title": "the till adds tax twice", "status": "running"},
+                "no-title": {"title": "", "status": "review"},
+                "echo": {"title": "Echo", "status": "review"},
+                "session": {"title": "the planning window", "status": "running"}}
+        with open(os.path.join(d, ".cc", "boards", "shop.json"), "w") as fh:
+            json.dump({"repo": "shop", "tracks": rows, "log": []}, fh)
+        table = {"tracks": {"session": {"name": "Planning and chat", "about": "the sessions a person talks to here"},
+                            "-": {"about": "sessions the ledger could not place on a track"}},
+                 "workspaces": {"shop": {"about": "the till, the stock and the rugs"},
+                                "-": {"about": "Sessions not inside any project"}}}
+        wp = os.path.join(d, "names.json")
+        with open(wp, "w") as fh:
+            json.dump(table, fh)
+        bad = os.path.join(d, "broken.json")
+        with open(bad, "w") as fh:
+            fh.write("{ this is not json\n")
+        os.environ["HOME"], os.environ["CC_NAME_WORDS"] = d, wp
+
+        t = read("shop", "fix-the-till", rows)
+        check("a board row: its title is the description, its slug read aloud the name",
+              t == {"repo": "shop", "track": "fix-the-till", "name": "Fix the till",
+                    "about": "the till adds tax twice"}, t)
+        check("…and a title that only repeats the slug says nothing more, like no title at all",
+              read("shop", "echo", rows)["about"] == "" and read("shop", "no-title", rows)["about"] == "")
+        check("the board beats the word table where both name a track",
+              read("shop", "session", rows) == {"repo": "shop", "track": "session", "name": "Session",
+                                                "about": "the planning window"})
+        check("a track no board carries is the table's words",
+              read("shop", "session", {}) == {"repo": "shop", "track": "session", "name": "Planning and chat",
+                                              "about": "the sessions a person talks to here"})
+        check("neither: the slug read aloud, and no description",
+              read("shop", "no-row-anywhere", {}) == {"repo": "shop", "track": "no-row-anywhere",
+                                                      "name": "No row anywhere", "about": ""})
+        check("the ledger's `-` reads as words at both levels, not as a dash",
+              read("-", "-", {})["name"] == "Other" and read("-")["name"] == "No project"
+              and read("-")["about"] == "Sessions not inside any project")
+        check("a workspace is its own name, described by the table",
+              read("shop") == {"repo": "shop", "track": "", "name": "shop", "member": False,
+                               "about": "the till, the stock and the rugs"})
+        check("…and by its README's first sentence, markdown stripped, where the table says nothing",
+              read("mill")["about"] == "The mill that weaves them.", read("mill"))
+        check("a member's workspace says what it is: its README speaks to the member, not about the work",
+              read("rugs-helper") == {"repo": "rugs-helper", "track": "", "name": "rugs-helper",
+                                      "about": MEMBER_ABOUT, "member": True}, read("rugs-helper"))
+        check("the board is read through cc-board when the caller hands over no rows",
+              read("shop", "fix-the-till")["about"] == "the till adds tax twice")
+        check("a repo with no board at all still names its track, and raises nothing",
+              read("nosuch", "a-track") == {"repo": "nosuch", "track": "a-track", "name": "A track", "about": ""})
+
+        # THE EMPTY TABLE — what a box that has written no wordings gets. Every name is still a name.
+        os.environ["CC_NAME_WORDS"] = ""
+        check("with NO table at all every name is still a name, off the slug and the README",
+              read("shop", "session", {})["name"] == "Session" and read("shop", "session", {})["about"] == ""
+              and read("-")["name"] == "No project" and read("-", "-", {})["name"] == "Other"
+              and read("shop")["about"] == "A small shop for rugs.", read("shop"))
+        check("…and the board's titles still describe the tracks it carries",
+              read("shop", "fix-the-till", rows)["about"] == "the till adds tax twice")
+
+        # A TABLE THAT WILL NOT PARSE is a worse page, never no page.
+        os.environ["CC_NAME_WORDS"] = bad
+        err, done = sys.stderr, None
+        try:
+            import io
+            sys.stderr = io.StringIO()
+            got = read("shop", "session", {})
+            done = sys.stderr.getvalue()
+        finally:
+            sys.stderr = err
+        check("a table that will not parse is refused to stderr and read as empty, not raised",
+              got["name"] == "Session" and "will not read" in (done or ""), done)
+
+        # THE CLI, which is how a shell — anything that is not a Python importer — reads the same answer.
+        os.environ["CC_NAME_WORDS"] = wp
+        env = dict(os.environ, HOME=d, CC_NAME_WORDS=wp)
+        me = os.path.realpath(__file__)
+
+        def cli(*a):
+            return subprocess.run([me, *a], capture_output=True, text=True, env=env,
+                                  stdin=subprocess.DEVNULL, timeout=TIMEOUT)
+        r = cli("shop", "fix-the-till")
+        check("the CLI prints the name, one line", r.returncode == 0 and r.stdout == "Fix the till\n", r.stdout)
+        check("--about prints the description", cli("--about", "shop", "fix-the-till").stdout
+              == "the till adds tax twice\n")
+        r = cli("--json", "shop")
+        check("--json prints the object the importers get, member and all",
+              json.loads(r.stdout) == read("shop"), r.stdout)
+        check("a workspace with no track named prints the workspace", cli("shop").stdout == "shop\n")
+        check("no argument is a usage line and a non-zero exit, never a blank name",
+              cli().returncode == 2 and not cli().stdout.strip())
+    finally:
+        for k, v in was.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        shutil.rmtree(d, ignore_errors=True)
+    print("cc-name selfcheck: %d passed, %d failed" % (n - f, f))
+    return 0 if f == 0 else 1
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    mode = "name"
+    if argv[:1] and argv[0] in ("--about", "--json"):
+        mode, argv = argv[0][2:], argv[1:]
+    if not argv or len(argv) > 2 or (argv[0].startswith("-") and argv[0] != "-"):
+        print(USAGE, file=sys.stderr)
+        return 2
+    d = read(argv[0], argv[1] if len(argv) > 1 else "")
+    print(json.dumps(d) if mode == "json" else d["about"] if mode == "about" else d["name"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
