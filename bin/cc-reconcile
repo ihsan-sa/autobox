@@ -64,7 +64,8 @@ Anything uncertain is reported, never removed. Log: ~/.cc/state/janitor.log. Rep
 
 WAKE (in the tick, CC_WAKE=on only; unset, each repo logs a skip): for each repo whose board is not all `session` rows, that `cc-pause` has not parked and that
 has no ~/.cc/state/<repo>/pulse.off (cc-handoff's overlap mark; a person may touch it too), the seat is woken when a queued row could start now (`cc-brief ready`, the one network call, skipped under --no-net)
-or a row is `blocked`, and the same state (a look string) was not already sent inside 24 h
+or a row is `blocked`, and that same state was not already sent inside 24 h — one look string per half, so a queued
+row's verdict changing does not re-announce a row that has been blocked all along
 (a queued row inside a live bundle — cc-bundle's `bundle: <row>` mark, the bundle row live — is in flight and never offered)
 (~/.cc/state/<repo>/pulse.look). `cc-tier allows pulse` / `start` gate it. Waking is `cc <repo>` when tmux
 session main has no live `<repo>` window, else one `cc-msg` line — never while the pane shows a turn in progress
@@ -1560,6 +1561,7 @@ def live_session(pane_pid):
 
 
 def last_look(repo):
+    """The look the seat was last woken for — one line per half of that wake's note — and when it was written."""
     f = f"{STATE}/{repo}/pulse.look"
     try:
         return open(f).read().strip(), os.path.getmtime(f)
@@ -1631,9 +1633,15 @@ def wake_repo(repo, rows, snap, net, on):
                 start = "free" if "could start now" in could else "withheld" if could else "none"
     if not stopped and start not in ("free", "withheld", "unread"):
         return pulse_log(repo, "skip", "nothing a seat can act on")
-    look = f"start={start} due={','.join(f'{k} {words[k][0]}' for k in due)}"
+    # ONE LOOK PER HALF OF THE NOTE, not one per repo. The note below has two halves — which rows have STOPPED, and
+    # what `cc-brief ready` said about the QUEUED ones — and each is in the look only when it is in the note. Keyed
+    # together, a queued row's verdict flipping tick to tick changed the key and made a long-blocked row read as newly
+    # stopped: four wakes of the same seat in three hours for a row that changed nothing (2026-09-20). A wake now needs
+    # a half that actually moved; set_look writes both, so a wake for either half re-dates both.
+    look = "\n".join(x for x in (f"stopped={','.join(stopped)}" if stopped else "",
+                                 f"start={start} due={','.join(f'{k} {words[k][0]}' for k in due)}" if could else "") if x)
     seen, when = last_look(repo)
-    if seen == look and when and now() - when < QUIET_H * 3600:
+    if when and now() - when < QUIET_H * 3600 and all(ln in seen.splitlines() for ln in look.splitlines()):
         return pulse_log(repo, "skip", f"woken {int((now() - when) // 60)}m ago for this same state")
     note = " · ".join(x for x in (f"{len(stopped)} row(s) stopped ({', '.join(stopped[:3])})" if stopped else "",
                                   could + (f" (cc-brief ready {repo})" if start != "none" else "")) if x)
@@ -3567,7 +3575,38 @@ def selfcheck():
            typed() == ["msg wr"] and "wr skip — mid-turn" in open(f"{ti}/.cc/state/pulse.log").read())
     finally:
         restore(); shutil.rmtree(ti, ignore_errors=True)
-    # (b3) the daily line's hour and date are LA's, whatever zone the host is in
+    # (b3) ONE LOOK PER HALF: what `cc-brief ready` says about the queued rows is not news about a row that has been
+    # blocked all along. Keyed together, the queued verdict moving re-announced the blocked row every ~20 min.
+    tc = tempfile.mkdtemp(prefix="cc-reconcile-look-")
+    try:
+        scratch(tc, dict(NOOP, **{"cc-brief": f"cat {tc}/ready", "cc": f'echo "start $1" >> {tc}/cc.log'}))
+        os.makedirs(f"{tc}/dev/wr")
+        os.environ["CC_WAKE"] = "on"
+        globals().update(procs=lambda: (set(), set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}))
+
+        def rows(**tracks):
+            json.dump({"repo": "wr", "tracks": {k: {"status": v, "updated": old} for k, v in tracks.items()}},
+                      open(f"{tc}/.cc/boards/wr.json", "w"))
+
+        def woke():
+            return open(f"{tc}/cc.log").read().splitlines() if os.path.exists(f"{tc}/cc.log") else []
+        rows(b1="blocked", q1="queued")
+        open(f"{tc}/ready", "w").write("wr: 1 of 1 queued rows could start now: q1\n")
+        quietly(tick, {}, True)
+        ok("WAKE, ONE LOOK PER HALF: a blocked row beside a startable queued one wakes the seat", woke() == ["start wr"])
+        open(f"{tc}/ready", "w").write("")              # cc-brief ready prints nothing when no queued row is free
+        quietly(tick, {}, True)
+        ok("…and the queued row's verdict going away is not a new state for the blocked one: no second wake",
+           woke() == ["start wr"] and "for this same state" in open(f"{tc}/.cc/state/pulse.log").read())
+        rows(b1="blocked", q1="running")                # …nor is the due list itself: q1 is not due at all now
+        quietly(tick, {}, True)
+        ok("…nor is the queued row leaving the due list", woke() == ["start wr"])
+        rows(b1="blocked", q1="running", b2="blocked")
+        quietly(tick, {}, True)
+        ok("…while a second row stopping IS a new state, and wakes the seat once more", woke() == ["start wr"] * 2)
+    finally:
+        restore(); shutil.rmtree(tc, ignore_errors=True)
+    # (b4) the daily line's hour and date are LA's, whatever zone the host is in
     tz = tempfile.mkdtemp(prefix="cc-reconcile-digest-at-")
     try:
         scratch(tz, NOOP)
