@@ -7,6 +7,8 @@ headless workers that end in PRs; a 👍 in `#approvals` enqueues the landing jo
 Deterministic hooks keep agents inside their lane; a Docker
 sandbox runs the unrestricted ones. A reply that needs you opens with ❓ and mentions you; nothing else does.
 
+New to it? [docs/TOUR.md](docs/TOUR.md) is a five-minute tour in diagrams.
+
 ## What you get
 - `cc` — sessions, tracks (worktree + branch), headless `--go` workers, `done` → PR, `digest`, `handoff`. No spend cap: a worker still committing carries past its step limit, and one that stops producing stops itself.
 - `cc-slack` — two-way Slack: `#<repo>` ↔ that repo's session, DMs ↔ the box; permission prompts relayed; `!restart`/`!pause` with no session.
