@@ -258,6 +258,27 @@ self_lands(){
   done
   return 1
 }
+# A SELF-LAND GRANT DOES NOT REACH A PROTECTED PATH (cc-land queue's own refusal, CC_PROTECTED_PATHS_<repo> in
+# ~/.cc/config): a PR touching one is never queued by the loop or a sweep, whatever CC_SELF_LAND_REPOS says — only
+# the owner's own 👍 does. `cc done` must not tell a self-landing repo "nothing waits on a 👍" for one of these, so
+# it asks the SAME check cc-land queue refuses on, by loading cc-land as a python module rather than reading
+# CC_PROTECTED_PATHS_<repo> a second time here (PR #551, 2026-09-19: the card said the loop queues it, and nothing
+# did — the owner was told the opposite of the truth).
+protected_hit_line(){   # $1=repo $2=pr → the door's own words on stdout and exit 0 when the PR touches a
+  # protected path (or cc-config/gh could not say, which fails closed the same way); nothing and exit 1 when it
+  # plainly does not.
+  python3 - "$BIN/cc-land" "$1" "$2" 2>/dev/null <<'PY'
+import importlib.machinery, importlib.util, sys
+path, repo, pr = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_loader("cc_land_probe", importlib.machinery.SourceFileLoader("cc_land_probe", path))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+hit = mod.protected_hit(repo, pr)
+if not hit:
+    sys.exit(1)
+print(mod.protected_under(repo, hit))
+PY
+}
 inside(){ [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; }   # set by `cc-sandbox member`, never by hand: this process runs INSIDE a workspace's boundary
 member_credential(){   # $1 handle · $2 track ("" = the main session) — THE HOST'S HALF OF THE CREDENTIAL WALL. A workspace
   # runs only on a credential minted for it at ~/.cc/members/<h>/credentials.json (`cc-sandbox mint <h>` makes one, `cc-sandbox
@@ -1358,6 +1379,11 @@ PY
       # INSIDE A WORKSPACE'S BOUNDARY the grant cannot be read (~/.cc/config and ~/.cc/members are not bound), so the answer
       # is not "no" but "the host's": cc-checkpoint --sweep asks `cc lands` on the host and queues the landing for it.
       inside && sl=3
+      under=""   # a self-land grant (sl 0 or 3) does not reach a PROTECTED path — ask before promising "nothing waits on a 👍"
+      case "$sl" in 0|3) under=$(protected_hit_line "$repo" "$prn") || under="" ;; esac
+      if [ -n "$under" ]; then
+        echo "PR #$prn is not queued — $under. The box never lands one of these on its own, whatever CC_SELF_LAND_REPOS says: only the owner's own 👍 on the 🔐 card in #approvals queues it (the card cc-land raises when it refuses to queue this PR; a 👍 on the PR card itself authorizes nothing)."
+      else
       case "$sl" in
         3)  echo "the host lands this for you: cc-checkpoint --sweep queues PR #$prn within five minutes when this workspace holds the grant (CC_SELF_LAND_REPOS and a GitHub token) — nothing here does, and nothing waits on a 👍" ;;
         0)  if member_workspace "$repo"; then echo "$repo lands its own PRs (CC_SELF_LAND_REPOS): the host's sweep queues PR #$prn as $repo--$track (cc-checkpoint --sweep, within five minutes) — nothing waits on a 👍. Now? cc-land queue $repo--$track $prn"
@@ -1366,6 +1392,7 @@ PY
             else echo "cc: $repo is named in CC_SELF_LAND_REPOS but is member-facing — nothing here can land for it (self_lands says why). PR #$prn waits for a 👍."; fi ;;
         *)  echo "land it with:  cc-land $repo $prn   (gates, merge, card, board, ledger, install, units, restarts — or just 👍 the card to merge)" ;;
       esac
+      fi
     else echo "PR creation failed (no remote? try: cd $wt && gh pr create --base $base)"; "$BOARD" status "$repo" "$track" review >/dev/null; fi
     [ -f "$SLACKON" ] && "${CC_SLACK:-$BIN/cc-slack}" archive --orch "$repo" "$track" >/dev/null 2>&1   # if that name was an orch with its own channel, it is done: archive it
     exit 0 ;;

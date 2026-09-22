@@ -2058,6 +2058,18 @@ r8g=$(CC_SELF_LAND_REPOS="$REPO" "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
 { [ "$r8u" = 1 ] && [ "$r8g" = 0 ]; } \
   && ok "cc lands <repo> is the grant test and only the test: it answers with its exit code, queues nothing and writes nothing, which is why cc-loop may ask it (P8e)" \
   || bad "cc lands: ungranted=$r8u granted=$r8g"
+# P8f: a PR touching a PROTECTED PATH holds even where CC_SELF_LAND_REPOS grants the repo — cc-land queue refuses
+# to queue it, and only the owner's own 👍 does (PR #551, 2026-09-19: the card said "the loop queues PR #551 …
+# nothing waits on a 👍" and nothing did, because it touched learn-fetch/). `cc done` now asks cc-land's OWN
+# protected_hit before saying that, rather than reading CC_PROTECTED_PATHS a second time.
+printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/77";; *"pr view 77 --json files"*) echo {\\"files\\":[{\\"path\\":\\"learn-fetch/foo.py\\"}]};; esac\nexit 0\n' > "$T/ghbin8/gh"
+o8f=$(done8 CC_SELF_LAND_REPOS="$REPO" CC_PROTECTED_PATHS_"$REPO"=learn-fetch/)
+{ [ ! -s "$T/land.calls" ] && grep -q "learn-fetch/foo.py" <<<"$o8f" && grep -q "PROTECTED path" <<<"$o8f" \
+  && grep -q "owner's own 👍 on the 🔐 card in #approvals" <<<"$o8f" && ! grep -q "this card" <<<"$o8f" \
+  && ! grep -q "nothing waits on a 👍" <<<"$o8f"; } \
+  && ok "cc done: a PR touching a PROTECTED path is never said to be queued by the grant — it names the 🔐 card in #approvals as the door, never the PR card (a 👍 there does nothing) and never 'nothing waits on a 👍' (P8f)" \
+  || bad "cc done on a protected-path PR: $(cat "$T/land.calls") $o8f"
+printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"   # the plain stub again, for whatever reuses ghbin8 next
 # M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going
 "$B/cc" $REPO w2 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w2$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
