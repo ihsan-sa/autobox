@@ -1541,9 +1541,9 @@ def run_selfcheck():
         devG = tempfile.mkdtemp(prefix="cc-slack-selfcheck-grant-")
         os.makedirs(f"{devG}/mem1/.cc", exist_ok=True); open(f"{devG}/mem1/{MEMBER_MARKER}", "w").close()
         os.makedirs(f"{devG}/{CTL}", exist_ok=True)
-        _devG = globals()["DEV"]
+        _devG, _caG = globals()["DEV"], globals()["CONFIRM_ANSWERS"]
         try:
-            globals()["DEV"] = devG
+            globals()["DEV"], globals()["CONFIRM_ANSWERS"] = devG, f"{devG}/confirm-answers"
             bad_g = [dmG.relay_grant(None, "allow", "Bash(x *)"), dmG.relay_grant("mem1", "allow", "Bash(x *)"),
                      dmG.relay_grant(CTL, "allow", "Bash(*)"), dmG.relay_grant(CTL, "allow", "rm -rf /"),
                      dmG.relay_grant(CTL, "unit", "/etc/systemd/system/x.service"), dmG.relay_grant(CTL, "grant", "x")]
@@ -1611,6 +1611,26 @@ def run_selfcheck():
             check("a table entry that no longer says what its card says is refused at answer time — nothing written, ❌ on the "
                   "card — so rewriting grants.json buys a session nothing",
                   wroteG[n_w:] == [] and ("CTHREADS", r_t["card"], "x") in rxM[n_rx:] and rid_t not in dmG.grant_asks)
+            # A CONFIRM card (row a-confirm-dialog-never-parks-a-seat): cc-model's timer raises it for a seat parked on the
+            # auto-mode confirm dialog behind a write; the owner's answer is only RECORDED, and cc-model presses it once
+            n_w, n_got = len(wroteG), len(gotG)
+            r_c = dmG.relay_grant("seat-1", "confirm", "git push origin HEAD"); rid_c = r_c.get("id") or ""
+            card_c = next((t for c, t, th in saidG if f"g{saidG.index((c, t, th)) + 1}" == r_c.get("card")), "")
+            dmG.on_event(msgM("g.7", "UOWNER", f"yes {rid_c}", chan="CTHREADS"))
+            ans_c = open(f"{devG}/confirm-answers/{rid_c}").read() if os.path.exists(f"{devG}/confirm-answers/{rid_c}") else ""
+            check("a confirm card names the window and the exact command; the owner's `yes <id>` is recorded for cc-model to "
+                  "press (yes + who), the card ✅ — and nothing is granted for good or delivered to any session",
+                  r_c["ok"] and "`seat-1`" in card_c and "`git push origin HEAD`" in card_c and ans_c == "yes\tThe Owner\n"
+                  and ("CTHREADS", r_c["card"], "white_check_mark") in rxM and wroteG[n_w:] == [] and gotG[n_got:] == []
+                  and rid_c not in dmG.grant_asks)
+            r_d = dmG.relay_grant("seat-1", "confirm", "rm -r build"); rid_d = r_d.get("id") or ""
+            dmG.on_event(msgM("g.8", "UOWNER", f"no {rid_d}", chan="CTHREADS"))
+            check("…and his `no <id>` is recorded as no, the card ❌",
+                  open(f"{devG}/confirm-answers/{rid_d}").read() == "no\tThe Owner\n" and ("CTHREADS", r_d["card"], "x") in rxM)
+            for w in ("seat-2", "seat-3", "seat-4"):
+                dmG.relay_grant(w, "confirm", "git push")
+            check("confirm cards share ONE hourly cap for the box: the window is the caller's word, so a new name buys no room",
+                  not dmG.relay_grant("seat-5", "confirm", "git push")["ok"] and dmG.relay_grant("seat-9", "allow", "Bash(w *)")["ok"])
             wild_g = [dmG.relay_grant(CTL, "allow", w) for w in ("Bash(:*)", "Bash(**)", "Bash(* *)", "Bash(?*)", "Read(/**)")]
             check("every wildcard dressed up — Bash(:*), Bash(**), Bash(* *), Bash(?*), Read(/**) — is refused as the whole tool",
                   all(not r["ok"] for r in wild_g))
@@ -1619,7 +1639,7 @@ def run_selfcheck():
             check("a seat raising grant cards faster than anyone answers is capped (GRANT_CAP an hour)",
                   not dmG.relay_grant(CTL, "allow", "Bash(z *)")["ok"])
         finally:
-            globals()["DEV"] = _devG
+            globals()["DEV"], globals()["CONFIRM_ANSWERS"] = _devG, _caG
             shutil.rmtree(devG, ignore_errors=True)
     finally:
         globals()["react"], globals()["save_last"] = _rxM, _slM

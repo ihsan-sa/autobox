@@ -51,9 +51,39 @@ is checked the way `yes <id>` already is (`SLACK_OWNER_ID`). A session may only 
   is still reported and never written.
 - Grants stay narrow: one rule per card, and the rule is in the card.
 
+## The same card for the auto-mode confirm dialog
+
+Row `a-confirm-dialog-never-parks-a-seat`, 2026-09-22. After a run of blocked actions the auto-mode classifier puts
+one call to a person: "Auto mode classifier requires confirmation for this command … Do you want to proceed?
+1. Yes 2. No". A seat on it delivers nothing. cc-model's tick (1e) finds it on a live pane and reads the call from the
+seat's transcript, never from the screen. A read-only call (a short list in `confirm_readonly`) gets Yes from the box.
+A message can hold several calls and the CLI runs them in order, so the dialog is about the FIRST of them and a Yes
+releases the rest unasked: the box answers Yes only when every unresolved call in that message reads. A message is its
+`.message.id`, not its JSONL record — the CLI writes each content block as its own line under one id, and reading the
+records one by one would have shown the `ls` behind a `rm -rf build` and nothing else. `confirm_readonly`
+also refuses any `$`, backtick, redirection or `printf -v`, because an expansion builds a substitution the word list
+never sees (`printf -v x '%s(touch p)' '$'; cat ${x@P}` runs the touch); a read-only command that needs one is a card.
+What it judges has to be what the shell runs, so the command is read twice. With its quoted spans cut out, what is left
+is live shell text and may hold no brace, glob or subshell. Then a quote-aware tokeniser (Python's shlex) gives the
+words each command actually gets, and every check reads those words — `find . '-delete'` and `sort '-o' f f` are writes,
+and an option it cannot read as a plain `-x`/`--long=value` token is a card. The tokeniser is also what cuts the
+segments, on a `;`, `|`, `||` or `&&` outside quotes and nowhere else: splitting the raw text cut `sed -n '1p;wc' f`
+into `sed -n '1p` and `wc' f`, each of which reads, while sed gets the one script `1p;wc` and runs it as `w c`, writing
+every line of f to `./c`. So a sed script has to match `N[,M]p` in full, and text that will not tokenise (an unbalanced
+quote) or carries a punctuation this list does not handle (`&`, a subshell, a redirection) is a card.
+Anything else, or a call it could not read, becomes `cc-slack grant confirm '<call>' -w <window>`: the same card and
+table, and the owner answers with `yes <id>` or `no <id>`. The daemon re-reads the card, then writes only his
+answer to `~/.cc/state/confirm-answers/<id>`. Nothing reaches settings.json. The next tick presses that answer
+while the same dialog, for the same call, still stands. After a No the seat is told not to try another route to the
+same change. Only the bare "Yes" is ever pressed, never "Yes, and don't ask again", so nothing widens what the
+classifier allows. The answer file is no easier to forge than a keystroke into the pane, which any session of this
+user can already send, and confirm cards share one hourly cap for the box because the window they name is the caller's word.
+
 ## Selfcheck
 
 cc-settings: grant writes one line with the rest identical, refuses a second copy, refuses under `CLAUDECODE`,
 refuses a unit whose hash moved, and `check` is green after. cc-slack: grant card raised; owner's `yes … fix`
 runs the writer and marks ⚙️; `no` marks ❌ and writes nothing; a non-owner's reply is refused; a session's
-`cc-slack permission` on a grant card is refused. cc-guard: a session writing the file through Bash is refused.
+`cc-slack permission` on a grant card is refused; a confirm card's yes/no is recorded, never written to settings. cc-model (f):
+one fixture pane per branch — a read-only call answered Yes, a write carded once, his yes and his no pressed, a
+two-call message carded when its first call writes and answered Yes when both read. cc-guard: a session writing the file through Bash is refused.

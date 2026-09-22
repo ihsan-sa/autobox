@@ -74,6 +74,10 @@
 #   message … Switched to <F>." — is read like (1c): a pane the CLI put BELOW the next rung (Sonnet, with Opus
 #   runnable) is retuned up to it, nothing is recorded unavailable; one on the next rung is left there and reported by
 #   (4) — the flagged content stays in its transcript and the primary would flag it again every turn;
+#   (1e) THE AUTO-MODE CONFIRM DIALOG ("Auto mode classifier requires confirmation for this command … Do you want to
+#   proceed? 1. Yes 2. No"), in every state: the call behind it is read from the seat's transcript; a read-only one is
+#   answered Yes, any other is put to the owner as a 🔐 card (`cc-slack grant confirm`) and his yes/no pressed on a later
+#   tick, with a No followed by a line telling the seat not to try another route. Never a member window. See confirm_panes;
 #   (0) THE TWO SETTINGS THAT DECIDE WHETHER THE HARNESS PAUSES: every tick reads ~/.claude/settings.json
 #   (CC_CLAUDE_SETTINGS) for `switchModelsOnFlag: true` and `autoContinueAtUsageLimit: false` — the first is what
 #   stops the safeguards dialog, the second stops the CLI waiting a limit out in silence ("wait for the limit to reset
@@ -167,7 +171,8 @@
 #   `lessons/*` that are planning on top of the default rule) · CC_MODEL_FLOOR (the lowest a planning session runs;
 #   default the fallback) · CC_MODEL_CRED (whose login, see Unavailable) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC, CC_MODEL_SESSIONS
 #   (a file of "<pane-id> <window>" standing in for the live session list), CC_MODEL_LIVE (a file of
-#   "<pane-id>\t<model>" standing in for what each pane's session is running), CC_MODEL_MEMBERS (~/.cc/members).
+#   "<pane-id>\t<model>" standing in for what each pane's session is running), CC_MODEL_MEMBERS (~/.cc/members),
+#   CC_MODEL_TRANSCRIPTS (a dir of "<pane-id>.jsonl" standing in for each pane's transcript).
 set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"
@@ -923,6 +928,286 @@ flag_panes(){   # (1d) every live session on the safeguards dialog is answered "
       tmux send-keys -t "$id" Enter 2>/dev/null; sleep "${CC_MODEL_ANSWER_WAIT:-0.5}"; fi
     printf '%s\t%s\tanswered\t%s\t%s: safeguards dialog — Switch automatically (%s)\n' "$(date -u +%FT%TZ)" "$now" "$(fam "$PRIMARY")" "$SESSION:$name" "$k" >> "$LOG"
   done < <(sessions); }
+# THE AUTO-MODE CONFIRM DIALOG (1e) — owner, 2026-09-21: "in autonomous modes we need ways to automatically overcome
+# dialogs like this". After a run of blocked actions the classifier stops deciding and puts the call to a person:
+#   "Auto mode classifier requires confirmation for this command." · "Do you want to proceed?" · "1. Yes" · "2. No"
+# (his screenshot; nothing on this box has a capture). A seat sitting on it delivers nothing until someone answers.
+# THE COMMAND COMES FROM THE SEAT'S OWN TRANSCRIPT — its last tool call with no result yet — never from the screen,
+# which wraps and cuts it; the screen must still show that command's start, or the box does not know what is asked.
+# The box answers Yes ONLY for a read-only call (confirm_readonly: a short list, anything else is not). Every other
+# call — and one it could not read — goes to the owner as a 🔐 card in the -threads lane (`cc-slack grant confirm`,
+# #556's card): the daemon writes his yes/no to $ST/confirm-answers/<id>, and a later tick presses that answer while
+# the same dialog, for the same call, still stands — or, when the box could not read the call, while the pane still
+# looks exactly as it did on the card. His answer is dropped only once it has gone in, so a dialog the box could not
+# submit to is not carded again on the next tick. After his No the seat is told not to try another route to it.
+# Nothing here widens what the classifier allows: one call, answered once, and a write only on his word.
+CONFIRM_Q_RE='classifier requires confirmation'
+confirm_opt(){   # $1 = a pane's live screen · $2 Yes|No → the digit of that choice on the confirm dialog, or nothing (exit 1)
+                 # when no such dialog is live: the classifier line, "Do you want to proceed?", then "N. Yes" and "N. No"
+                 # in the live tail — prose that quotes the wording has no numbered choices under it.
+  local t n y o lo
+  t=$(prompt_norm "${1:-}"); n=$(grep -c '' <<<"$t")
+  o=$(grep -niE "^[[:space:]]*(@SEL@|[>])?[[:space:]]*[0-9]\.[[:space:]]*no([,[:space:]].*)?\$" <<<"$t" | tail -1 | cut -d: -f1); [ -n "$o" ] || return 1
+  [ $((n - o)) -le "${CC_MODEL_PROMPT_TAIL:-12}" ] || return 1
+  lo=$((o - 12)); [ "$lo" -ge 1 ] || lo=1
+  sed -n "${lo},${o}p" <<<"$t" | grep -qiE "$CONFIRM_Q_RE" || return 1
+  sed -n "${lo},${o}p" <<<"$t" | grep -qiE 'do you want to proceed' || return 1
+  # Yes is the bare "Yes" line and nothing longer: "Yes, and don't ask again" would widen what the classifier allows
+  if [ "${2:-Yes}" = No ]; then y=$(sed -n "${o}p" <<<"$t" | sed -nE 's/^[^0-9]*([0-9])\..*/\1/p')
+  else y=$(sed -n "${lo},${o}p" <<<"$t" | sed -nE "s/^[[:space:]]*(@SEL@|[>])?[[:space:]]*([0-9])\.[[:space:]]*yes\$/\2/Ip" | tail -1); fi
+  [ -n "$y" ] && printf '%s\n' "$y"; }
+transcript_of(){   # $1 pane id → the seat's transcript file, as its cc-statusline record names it (the --session-id in
+                   # the claude child's argv names the record, as live_model reads it), or nothing
+  [ -n "${CC_MODEL_TRANSCRIPTS:-}" ] && { printf '%s\n' "$CC_MODEL_TRANSCRIPTS/$1.jsonl"; return 0; }   # test hook: <dir>/<pane>.jsonl
+  local pp c sid
+  pp=$(tmux display-message -p -t "$1" '#{pane_pid}' 2>/dev/null); c=$(pgrep -P "${pp:-0}" -x "$PROC" 2>/dev/null | head -1)
+  [ -n "$c" ] && [ -r "/proc/$c/cmdline" ] || return 1
+  sid=$(tr '\0' '\n' < "/proc/$c/cmdline" | grep -A1 -x -- '--session-id' | tail -1); [ -n "$sid" ] || return 1
+  jq -r '.raw.transcript_path // empty' "$(sldir)/$sid.json" 2>/dev/null; }
+pending_calls(){   # $1 pane id → every call of the seat's LAST message that still has one unresolved, one "<tool>\t<command>"
+                   # per line IN THE ORDER THE CLI RUNS THEM — so the dialog is about the FIRST of them (the review of #586:
+                   # a message [Bash `rm -rf build`, Bash `ls`] is asking about the rm, and `ls` is queued behind it).
+                   # @tsv spells a newline \n, and confirm_readonly refuses any backslash: a multi-line call is never read-only
+                   # THE MESSAGE IS ITS .message.id, NOT ITS RECORD (the review of #586): the CLI writes every content
+                   # block of one message as its own JSONL line under the one id, so a record-by-record "last message"
+                   # holds the last block alone — [Bash `rm -rf build`, Bash `ls`] would come back as `ls` and read as
+                   # read-only. The blocks are grouped by that id, the record standing in where a line carries none.
+  local f; f=$(transcript_of "$1") || return 1; [ -r "$f" ] || return 1
+  tail -n 200 "$f" | jq -rs '[to_entries[] | select((.value.message? | type) == "object")
+      | {k: (.value.message.id // ("#" + (.key | tostring))), c: .value.message.content}
+      | select((.c | type) == "array")] as $m
+    | [$m[] | .c[] | select(.type == "tool_result") | .tool_use_id] as $done
+    | [$m[] | {k: .k, u: [.c[] | select(.type == "tool_use") | select(.id as $i | $done | index($i) | not)]}
+      | select(.u | length > 0)] as $p
+    | ($p | last | .k) as $last
+    | $p[] | select(.k == $last) | .u[] | [.name, (.input.command // .input.file_path // .input.pattern // "")] | @tsv' 2>/dev/null; }
+pending_call(){ pending_calls "$1" | head -1; }   # the one the dialog names: the screen check and press_confirm's re-check are its
+calls_readonly(){   # stdin: pending calls, one per line → 0 only when there is at least one and EVERY one of them reads.
+                    # The seat runs a message's calls in order behind the one dialog, so a Yes on the first releases the
+                    # rest unasked: one write among them makes the whole message the owner's (the review of #586).
+  local l n=0
+  while IFS= read -r l; do [ -n "$l" ] || continue; n=$((n + 1))
+    confirm_readonly "${l%%$'\t'*}" "${l#*$'\t'}" || return 1
+  done
+  [ "$n" -gt 0 ]; }
+confirm_words(){   # $1 a command line → the words THE SHELL WOULD HAND THE COMMANDS, one "W<word>" per line, with an
+                   # "S" where a `;`, `|`, `||` or `&&` outside quotes ends a segment. Exit 1 — so, not read-only —
+                   # when the text cannot be read as words at all (an unbalanced quote, a backslash), carries a
+                   # REDIRECTION that is not a bare fd duplication or a write to /dev/null (see the pass below), holds
+                   # a punctuation run this list does not handle (`&`, `(`, `)`, `;;`, `|&`), or carries a
+                   # `{}[]*?()` METACHARACTER OUTSIDE QUOTES — the quote state for that last one is tracked in the
+                   # same left-to-right pass, and not by cutting the quoted spans out (the sixth review of #586).
+                   # THE SEGMENT SPLIT HAS TO BE QUOTE-AWARE (the fifth review of #586). A `tr ';' '\n'` over the
+                   # raw text cut `sed -n '1p;wc' f` into `sed -n '1p` and `wc' f`, and each half reads on its own —
+                   # while the shell hands sed the ONE script `1p;wc`, which GNU sed runs as `w c`: every line of f
+                   # written to ./c. `'1p;which'` writes ./hich the same way. shlex cuts on those separators only
+                   # outside quotes, so what is judged below is the argv each command actually gets.
+                   # A word that is nothing BUT punctuation is read as a separator even when it was quoted, because
+                   # the token looks identical either way: `grep ';' f` becomes an owner card, never a Yes.
+  python3 - "$1" <<'PY'
+import shlex, sys
+s = sys.argv[1]
+# THE QUOTE STATE IS TRACKED A CHARACTER AT A TIME (the sixth review of #586). Cutting the quoted spans out with a sed
+# apiece — every '…' first, then every "…" — pairs a ' in one double-quoted word with a ' in a later one and swallows
+# everything between: `find . "a'" {-delete,-name} "'b"` came out of the two seds as `find . ""` with no brace left to
+# see, so the word list below showed `{-delete,-name}`, which starts with no dash and matched no check, and the shell
+# ran `find . a' -delete -name 'b`. So: a ' inside "…" and a " inside '…' are ordinary characters, and a metacharacter
+# OUTSIDE quotes — {a,b} brace expansion, a * ? [ ] glob that can expand to an option, a ( subshell ) — rewrites a word
+# before any command sees it and is refused here, where the state is already known.
+# A REDIRECTION IS READ IN THIS SAME PASS (the seventh review of #586), never stripped out by a regex first. The strip
+# was `s#[0-9]?>&[0-9]##g`, which takes `>&` and ONE digit even when the word runs on: `cat a >&1.txt` came out as the
+# text `cat a .txt` and read as two files to read, while bash sends stdout and stderr to the FILE ./1.txt whenever the
+# word after `>&` is not all digits. So the operator, the fd glued in front of it and its target are parsed here, where
+# the quote state and what is glued to what are both already known, and only two shapes live: a bare fd duplication
+# (`2>&1`, `>&2`, `1>&2`) and a write to /dev/null (`2>/dev/null`, `>>/dev/null`, `&>/dev/null`). EVERY OTHER ONE EXITS
+# 1 — another target, `>`, `>>`, `<`, `<>`, `>|`, `&>`, `>&word`, a here-doc, a here-string — and the owner gets a card.
+DIG = '0123456789'
+q = ''; keep = []; word = []; i = 0; n = len(s)
+while i < n:
+    ch = s[i]
+    if ch == '\\': sys.exit(1)          # an escape hides the next character from this pass (and from every check below)
+    if q:
+        if ch == q: q = ''
+        keep.append(ch); word.append(('q', ch)); i += 1; continue
+    if ch in ('"', "'"):
+        q = ch; keep.append(ch); word.append(('q', ch)); i += 1; continue
+    if ch in '{}[]*?()': sys.exit(1)
+    if ch in '<>' or (ch == '&' and s[i+1:i+2] == '>'):
+        # `2>f` gives the 2 to the operator, `uniq a 1 >f` does not — bash reads an fd only off digits glued to the
+        # operator, and a word dropped that the command was in fact given would hide a write (uniq IN OUT writes OUT)
+        if word and all(k == 'p' and c in DIG for k, c in word): del keep[len(keep) - len(word):]
+        word = []; op = ''
+        if ch == '&': op = '&'; i += 1
+        while i < n and s[i] in '<>&|': op += s[i]; i += 1
+        while i < n and s[i] in ' \t': i += 1
+        tq = ''; tgt = []
+        while i < n:                    # the target word, quotes off, up to the whitespace or separator that ends it
+            c = s[i]
+            if c == '\\': sys.exit(1)
+            if tq:
+                if c == tq: tq = ''
+                else: tgt.append(c)
+            elif c in ('"', "'"): tq = c
+            elif c.isspace() or c in ';|&<>()': break
+            elif c in '{}[]*?': sys.exit(1)
+            else: tgt.append(c)
+            i += 1
+        if tq: sys.exit(1)
+        t = ''.join(tgt)
+        if not ((op == '>&' and t and all(c in DIG for c in t))
+                or (op in ('>', '>>', '&>', '&>>') and t == '/dev/null')): sys.exit(1)
+        keep.append(' ')                # the redirection stood between words, and it ends the word before it
+        continue
+    if ch.isspace() or ch in ';|&': word = []
+    else: word.append(('p', ch))
+    keep.append(ch); i += 1
+if q: sys.exit(1)                       # an unbalanced quote: not text to guess at
+lx = shlex.shlex(''.join(keep), posix=True, punctuation_chars=True)
+lx.whitespace_split = True
+lx.commenters = ''      # `#` is not a comment mid-word, and dropping the rest of a line would hide a write
+try: words = list(lx)
+except ValueError: sys.exit(1)      # unbalanced quote, trailing backslash: not text to guess at
+out = []
+for w in words:
+    if w in (';', '|', '||', '&&'): out.append('S')
+    elif w and not set(w) - set('();<>|&'): sys.exit(1)
+    elif '\n' in w or '\r' in w: sys.exit(1)     # one line per call, or the owner reads it
+    else: out.append('W' + w)
+out.append('S')
+sys.stdout.write('\n'.join(out) + '\n')
+PY
+}
+confirm_seg(){   # the words of ONE segment, as the shell hands them to the command → 0 when that command only reads.
+                 # EVERY CHECK HERE READS THOSE WORDS, never the raw text (the review of #586: `find . '-delete'`,
+                 # `sort '-o' f f` and `git log '--output=/tmp/x'` all came back read-only, because a regex only saw
+                 # a dash after a space while the shell took the quotes off and ran the write).
+  [ "$#" -gt 0 ] || return 0   # `ls;` ends on an empty segment, which runs nothing
+  local -a a=("$@"); local w=${a[0]} x o t i n=0 nf=0 sc=0
+  # an option we cannot read as a plain -x / --long=value token is not on this list either: `--include=*.py` is a card
+  for x in "${a[@]}"; do case "$x" in -*) [[ $x =~ ^-[-A-Za-z0-9=_,.:/@+%]*$ ]] || return 1;; esac; done
+  case "$w" in
+    cat|head|tail|grep|egrep|fgrep|wc|ls|stat|cut|tr|nl|jq|echo|pwd|which|readlink|realpath|basename|dirname|diff|cmp|md5sum|sha256sum|du|df|column|true|cd) ;;
+    # printf -v assigns into a shell variable a later command could expand into code; read, mapfile and readarray
+    # assign the same way and are not on this list at all (the review of #586)
+    printf) for x in "${a[@]:1}"; do case "$x" in -v*) return 1;; esac; done;;
+    # rg --pre and --hostname-bin run a program of the caller's choosing, and -z/--search-zip spawns a decompressor
+    rg) for x in "${a[@]:1}"; do case "$x" in
+          --pre|--pre=*|--hostname-bin|--hostname-bin=*|--search-zip) return 1;;
+          --*) ;; -*z*) return 1;; esac; done;;
+    # sort takes ANY unambiguous shortening of a long option, so --out=f is --output=f and
+    # --compress-program runs a program (the review of #586): no long option is read-only here
+    sort) for x in "${a[@]:1}"; do case "$x" in --*) return 1;; -*o*) return 1;; esac; done;;
+    uniq) for x in "${a[@]:1}"; do case "$x" in -*) ;; *) n=$((n + 1));; esac; done; [ "$n" -le 1 ] || return 1;;   # uniq IN OUT writes OUT
+    find) for x in "${a[@]:1}"; do case "$x" in -exec*|-ok*|-delete*|-fprint*|-fls*) return 1;; esac; done;;
+    # A SED SCRIPT IS ONE WORD once the shell has split it, so it matches IN FULL or it is a card (the fifth review
+    # of #586): `N[,M]p` and nothing beside it. A `;` in the script, a w/W/r/R/e/s command, anything else, is refused
+    # here rather than picked apart — `1p;wc` is sed's `w c`, and `1p;which` is `w hich`.
+    sed) for x in "${a[@]:1}"; do
+           if [ "$sc" = 0 ]; then
+             case "$x" in
+               -*) [[ $x =~ ^-[nE]+$ ]] || return 1; case "$x" in *n*) nf=1;; esac;;
+               *) [[ $x =~ ^[0-9]+(,[0-9]+)?p$ ]] || return 1; sc=1;;
+             esac
+           # …and no option AFTER the script: GNU sed reads `f -i`, `f --in-place` and `f -e '1w x'` too
+           else case "$x" in -*) return 1;; esac; fi
+         done
+         [ "$sc" = 1 ] && [ "$nf" = 1 ] || return 1;;
+    git) case "${a[1]:-}" in -C) i=3;; *) i=1;; esac
+         case "${a[$i]:-}" in log|show|diff|status|blame|rev-parse|ls-files|grep|cat-file) ;; *) return 1;; esac
+         for x in "${a[@]:1}"; do
+           case "$x" in
+             --) ;;   # `git log -- path` names paths, it is not an option
+             # git takes any UNAMBIGUOUS PREFIX of a long option, so --open=rm is --open-files-in-pager=rm (the
+             # review of #586): every long option whose name prefixes one of these four is refused, the full
+             # spellings among them. Tested on the name, not as a bare --o/--ex/--te: `git grep --or` reads.
+             --*) o=${x%%=*}; o=${o#--}
+                  for t in output ext-diff textconv open-files-in-pager; do case "$t" in "$o"*) return 1;; esac; done;;
+             -*O*) return 1;;   # git grep -O<cmd> runs <cmd>
+           esac
+         done;;
+    *) return 1;;
+  esac
+  return 0; }
+confirm_readonly(){   # $1 tool · $2 command → 0 when the call only reads. A SHORT LIST ON PURPOSE: what it does not know is
+                      # not read-only, and the owner is asked — a false card costs him a tap, a false Yes is a write.
+  case "${1:-}" in Read|Grep|Glob|LS|NotebookRead) return 0;; Bash) ;; *) return 1;; esac
+  local c words line; local -a toks=()
+  c=${2:-}   # THE TEXT AS IT IS: a redirection is judged by confirm_words, in the pass that knows the quoting (below)
+  [ -n "${c//[[:space:]]/}" ] || return 1
+  # ANY $ IS REFUSED (the review of #586): `printf -v x '%s(touch p)' '$'; cat ${x@P}` builds a substitution out of
+  # expansions with no `$(` in its text, and prompt expansion then runs it. A read-only command that needs an expansion
+  # — `echo $HOME`, `sed -n '1,$p' f` — becomes an owner card instead, which costs him a tap; a Yes on code built by
+  # expansion is not something this list can take back.
+  grep -qE '[$`\\]' <<<"$c" && return 1   # a $ of any kind, a command substitution, an escape: not this list's
+  # A METACHARACTER OUTSIDE QUOTES REWRITES A WORD before any command sees it, and the word list below shows only the
+  # result. confirm_words refuses one, in the ONE quote-tracking pass that also finds the words — this was two seds
+  # cutting the quoted spans out, and a quote in one word paired with a quote in a later one and hid the brace between
+  # them (the sixth review of #586). A REDIRECTION IS THAT SAME PASS'S TOO (the seventh review): it was stripped out
+  # here by a regex that took `>&1` out of `cat a >&1.txt` and left a read of two files. $, ` and \ went above, and
+  # there is no second reading of the text left here.
+  words=$(confirm_words "$c") || return 1   # the shell's own words, the segments cut only outside quotes, no bare metacharacter, no write
+  while IFS= read -r line; do
+    case "$line" in
+      W*) toks+=("${line#W}");;
+      S) confirm_seg "${toks[@]}" || return 1; toks=();;
+      *) return 1;;
+    esac
+  done <<<"$words"
+  return 0; }
+confirm_row(){ awk -F'\t' -v p="$1" -v k="$2" '$1==p && $2==k{print $3 "\t" $5; exit}' "$ST/model-confirms" 2>/dev/null; }   # $1 pane · $2 call key → "<its open card's id>\t<the screen he was shown>"
+drop_confirm(){ [ -f "$ST/model-confirms" ] && { awk -F'\t' -v p="$1" '$1!=p' "$ST/model-confirms" > "$ST/model-confirms.t" && mv "$ST/model-confirms.t" "$ST/model-confirms"; }; return 0; }
+scr_hash(){ printf '%s' "${1:-}" | md5sum | cut -c1-16; }   # a pane's screen → the short hash the confirm row keeps of it
+press_confirm(){   # $1 pane · $2 Yes|No · $3 the call it answers · $4 the screen's hash when the card was raised → the
+                   # digit, then Enter only while the dialog still stands FOR THAT SAME CALL: a new dialog behind it
+                   # highlights Yes, and a blind Enter would approve it. 0 when the answer went in, 1 when it did not —
+                   # the caller keeps the owner's answer and the card's row for a later tick on a 1, so nothing is
+                   # logged as answered that was not (the sixth review of #586).
+                   # A CALL THE BOX COULD NOT READ ($3 empty) HAS NO SECOND WITNESS, so the SCREEN is one: the pane must
+                   # still look exactly as it did when the owner was asked ($4). Without that the digit went in with no
+                   # Enter behind it, the dialog stood, and the answer was deleted and the card raised again every tick.
+  local k scr; scr=$(pane_text "$1")
+  k=$(confirm_opt "$scr" "$2") || return 1
+  [ -n "$3" ] || { [ -n "${4:-}" ] && [ "$(scr_hash "$scr")" = "$4" ]; } || return 1
+  tmux send-keys -t "$1" "$k" 2>/dev/null || return 1
+  sleep "${CC_MODEL_ANSWER_WAIT:-0.5}"
+  if confirm_opt "$(pane_text "$1")" "$2" >/dev/null; then   # the digit alone did not take it
+    { [ -z "$3" ] || [ "$(pending_call "$1")" = "$3" ]; } || return 1   # another call behind it now: not this answer's dialog
+    tmux send-keys -t "$1" Enter 2>/dev/null; sleep "${CC_MODEL_ANSWER_WAIT:-0.5}"; fi
+  printf '%s\n' "$k"; }
+confirm_panes(){   # (1e) every live seat on the confirm dialog: a read-only call answered Yes, any other put to the owner
+                   # once, and his answer pressed. A member window is left to its own route (its prompts go to -threads).
+  local id name scr calls call cmd what key row rid shot ans out dir="$ST/confirm-answers"
+  while read -r id name; do [ -n "${id:-}" ] || continue
+    member_win "$name" && continue
+    scr=$(pane_text "$id")
+    confirm_opt "$scr" Yes >/dev/null || { drop_confirm "$id"; continue; }   # answered, by anyone: its card's row goes
+    calls=$(pending_calls "$id"); call=$(head -1 <<<"$calls"); cmd=${call#*$'\t'}
+    { [ -n "$call" ] && [ -n "$cmd" ] && grep -qF -- "$(printf '%s' "${cmd%%\\n*}" | tr -s '[:space:]' ' ' | cut -c1-40)" <<<"$(tr -s '[:space:]' ' ' <<<"$scr")"; } || call=""
+    # every call of that message, the one the dialog names first: a Yes on it releases the ones queued behind it too
+    if [ -n "$call" ]; then what=$(awk -F'\t' '{printf "%s%s: %s", (NR > 1 ? " · " : ""), $1, $2} END{print ""}' <<<"$calls")
+    else what='a command the box could not read off the transcript — look at the pane'; fi
+    # the brief: "the box may answer Yes on its own only when the command behind the dialog is read-only" — which now
+    # means every call that Yes releases, not the first alone (the review of #586)
+    if [ -n "$call" ] && calls_readonly <<<"$calls"; then
+      press_confirm "$id" Yes "$call" >/dev/null &&
+        printf '%s\t%s\tconfirm\t%s\t%s: confirm dialog — read-only, Yes: %s\n' "$(date -u +%FT%TZ)" "$now" "$(fam "$PRIMARY")" "$SESSION:$name" "${what:0:200}" >> "$LOG"
+      continue; fi
+    key=$(printf '%s' "$what" | md5sum | cut -c1-16); row=$(confirm_row "$id" "$key"); rid=${row%%$'\t'*}; shot=${row#*$'\t'}
+    if [ -z "$rid" ]; then   # not read-only: the owner's word, asked once per dialog
+      out=$("$BIN/cc-slack" grant confirm "$what" -w "$name" 2>&1 </dev/null)
+      rid=$(grep -oE '^card [a-km-z]{5}' <<<"$out" | cut -c6-)
+      if [ -z "$rid" ]; then printf '%s\t%s\tcard-failed\t%s\t%s: confirm card not raised — %s\n' "$(date -u +%FT%TZ)" "$now" "$(fam "$PRIMARY")" "$SESSION:$name" "${out:0:200}" >> "$LOG"; continue; fi
+      drop_confirm "$id"   # the screen rides along: for a call the box could not read it is all press_confirm has to go on
+      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$key" "$rid" "$now" "$(scr_hash "$scr")" >> "$ST/model-confirms"
+      printf '%s\t%s\tconfirm\t%s\t%s: confirm dialog — not read-only, carded %s: %s\n' "$(date -u +%FT%TZ)" "$now" "$(fam "$PRIMARY")" "$SESSION:$name" "$rid" "${what:0:200}" >> "$LOG"
+      continue; fi
+    ans=$(cut -f1 "$dir/$rid" 2>/dev/null); [ -n "$ans" ] || continue   # still the owner's to answer
+    if [ "$ans" = yes ]; then press_confirm "$id" Yes "$call" "$shot" >/dev/null || continue
+    else press_confirm "$id" No "$call" "$shot" >/dev/null || continue
+      type_into "$id" "$name" "The owner did not approve this from Slack: ${what:0:300}. Do not try another route to the same change. Carry on with what does not need it, and say what is blocked." || true; fi
+    printf '%s\t%s\tconfirm\t%s\t%s: confirm dialog — the owner answered %s on %s\n' "$(date -u +%FT%TZ)" "$now" "$(fam "$PRIMARY")" "$SESSION:$name" "$ans" "$rid" >> "$LOG"
+    rm -f "$dir/$rid"; drop_confirm "$id"
+  done < <(sessions); }
 flagged_panes(){   # (1d) the line the CLI leaves after ITS switch: a session it put BELOW the next rung — "Switched to
                    # Sonnet 5" with Opus runnable — is retuned up to that rung; nothing is recorded unavailable (the
                    # primary is not out, one message was flagged). One on the next rung is left there: (4) reports it.
@@ -1169,6 +1454,7 @@ tick(){
   drop_stale_rows   # rows from an episode cleared by hand are gone before (1c) reads them
   settings_guard    # (0) the two harness keys that stop a pause: reported to the owner when off, never written
   flag_panes        # (1d) the safeguards dialog, in every state
+  confirm_panes     # (1e) the auto-mode confirm dialog: read-only answered, a write carded to the owner
   # ---- (1)+(2) THE CLI'S OWN LIMIT PROMPT: answered first, and in EVERY state. A session sitting on it delivers
   # nothing at all — on 2026-09-01 a pulse tick and two secretary findings went nowhere for exactly this — and the
   # answer is the same whether or not the box has already moved off the primary model.
@@ -1878,6 +2164,117 @@ TXT
   t '(e) …no override, nothing recorded unavailable: the primary is not out' "$([ -e "$OV" ] && echo ov)$([ -e "$UNAV" ] && echo unav)" ""
   printf '%s\n' "$fline2" "  ⎿  Set model to Opus 5 and saved as your default for new sessions" '' '❯ ' > "$d/screen.%7"; : > "$d/typed"; : > "$LOG"; tick
   t '(e) …the line above a later "Set model to" is history: not retuned again' "$(typed w/after-sonnet)" ""
+  # ── (f) THE AUTO-MODE CONFIRM DIALOG NEVER PARKS A SEAT (owner, 2026-09-21) ─────────────────────────────────────
+  # One fixture pane per branch, the call behind each in its own fixture transcript: a read-only sed is answered Yes by
+  # the box; a push is never pressed but carded to the owner, once; his yes presses Yes; his no presses No and the seat
+  # is told not to try another route. cc-slack is a stub that records the card it was asked for.
+  local obin="$BIN"; mkdir -p "$d/binf" "$d/tr"; cp -p "$BIN"/* "$d/binf/" 2>/dev/null; BIN="$d/binf"; : > "$d/slack"; : > "$d/keys"; : > "$d/typed"; : > "$LOG"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/slack"; printf "card %%s is in #lane-threads\\n" "$(sed -n "$(wc -l < "%s/slack")p" <<<"bcdef\ncdefg\ndefgh")"\n' "$d" "$d" > "$BIN/cc-slack"; chmod +x "$BIN/cc-slack"
+  cdlg(){ printf '%s\n' '╭──────────────────────────────╮' '│ Bash command                 │' '│                              │' "│   $1" '│   Read part of a file        │' '│                              │' \
+    '│ Auto mode classifier requires confirmation for this command.' '│ 3 consecutive actions were blocked. Please review the transcript before continuing.' '│' \
+    '│ Do you want to proceed?      │' '│ ❯ 1. Yes                     │' '│   2. No                      │' '╰──────────────────────────────╯' '  Esc to cancel'; }
+  tcall(){ { printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t0","name":"Bash","input":{"command":"rm -rf /tmp/x"}}]}}\n'
+             printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t0","content":"blocked"}]}}\n'
+             jq -cn --arg c "$2" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:$c}}]}}'; } > "$d/tr/$1.jsonl"; }
+  CC_MODEL_TRANSCRIPTS="$d/tr"
+  printf '%s\n' '%21 seat-read' '%22 seat-write' '%23 seat-no' > "$d/sess"
+  tcall %21 "sed -n '1,80p' ~/bin/cc-model"; cdlg "sed -n '1,80p' ~/bin/cc-model" > "$d/screen.%21"
+  tcall %22 'git push origin HEAD';           cdlg 'git push origin HEAD' > "$d/screen.%22"
+  tcall %23 'rm -r build';                    cdlg 'rm -r build' > "$d/screen.%23"
+  t '(f) fixture: the dialog is read, its Yes is 1 and its No is 2; a resolved earlier call is not the pending one' \
+    "$(confirm_opt "$(cat "$d/screen.%21")" Yes):$(confirm_opt "$(cat "$d/screen.%21")" No):$(pending_call %22)" "1:2:Bash"$'\t'"git push origin HEAD"
+  t '(f) …the wording quoted in prose, with no numbered choices under it, is not the dialog' \
+    "$(confirm_opt "$(printf '%s\n' 'the owner saw: Auto mode classifier requires confirmation for this command.' 'Do you want to proceed? it asked' '❯ ')" Yes)" ""
+  t '(f) …and a "Yes, and don'"'"'t ask again" line is never the Yes the box presses' \
+    "$(confirm_opt "$(sed 's/1\. Yes  /1. Yes, and don'"'"'t ask again for sed/' "$d/screen.%21")" Yes)" ""
+  local ro=""
+  for c in "sed -n '1,80p' f" 'grep -n x f | head -5' 'git log --oneline -3' 'cat a 2>/dev/null' 'git grep --or -e a -e b x' 'find . -name "*.py"' "grep -n 'a;b|c' f" 'ls 2>&1' 'cat f >/dev/null'; do confirm_readonly Bash "$c" && ro="${ro}r" || ro="${ro}w"; done
+  for c in "sed -i 's/a/b/' f" 'cat a > b' 'find . -delete' 'git branch -D x' 'ls; rm x' 'echo $(rm x)' 'grep x f | tee y' 'uniq a b' 'sort -o f f' 'python3 -c 1' "sed -n '1,5p' f -i" "sed -n '1p' f --in-place" "sed -n '1p' -e '1w /tmp/x' f" "sed -n '1p' f '-i'" 'git grep -Orm x' 'git grep --open-files-in-pager=rm x' 'git grep --open=rm x' 'sort --out=f f' 'sort --compress-program=sh f' "printf -v x '%s(touch p)' '\$'; cat \${x@P}" 'echo $HOME' 'printf -v x abc' \
+          "find . '-delete'" "sort '-o' f f" "git log '--output=/tmp/x'" "git grep '-Orm' x" "rg '--pre=sh' x" 'find . -dele"t"e' 'rg --hostname-bin=sh x' 'find . -dele{t}e' 'find . -delet[e]' 'find . *delete' 'X=1 find . -delete' 'env find . -delete' 'xargs -a f rm' 'cat a <> b' 'cat f >/dev/null/../x' \
+          "sed -n '1p;wc' f" "sed -n '1p;which' f" "sed -n '1w /tmp/x' f" "cat 'a" 'ls & rm x' '(cat f)' "grep ';' f" \
+          $'find . "a\'" {-delete,-name} "\'b"' $'git log "a\'" {--output=/tmp/x,-1} "\'b"' $'sort "a\'" * "\'b"' \
+          'cat a >&1.txt' 'echo x >&2024-report.csv' 'echo x >&2x' 'echo x &> f' 'cat f >>/tmp/x' 'cat f <<<x' 'uniq a 1 >/dev/null'; do confirm_readonly Bash "$c" && ro="${ro}r" || ro="${ro}w"; done
+  confirm_readonly Edit 'f' && ro="${ro}r" || ro="${ro}w"; confirm_readonly Read 'f' && ro="${ro}r" || ro="${ro}w"
+  # the second row is the class the fourth review of #586 found: shell text the checks read as one thing and the shell
+  # runs as another — a quoted option, one glued out of quotes, a brace or a glob, a prefix or a wrapper in front.
+  # The last row is the fifth review's: the SEGMENT SPLIT itself cut inside quotes, so `sed -n '1p;wc' f` read as
+  # `sed -n '1p` plus `wc' f` while sed ran `w c` and wrote ./c. The words come off a quote-aware tokeniser now, so
+  # a quoted `;` stays inside its word (`grep -n 'a;b|c' f` reads) and a sed script has to match `N[,M]p` in full.
+  # The three at the end are the sixth review's: the metacharacter check STRIPPED the quotes, all '…' with one sed and
+  # all "…" with another, so a ' in one double-quoted word paired with a ' in a later one and everything between them
+  # went — `find . "a'" {-delete,-name} "'b"` left `find . ""`, no brace was seen, and the shell ran the -delete.
+  # The seven at the end are the seventh review's: the REDIRECTIONS were stripped by a regex before anything was read,
+  # and `s#[0-9]?>&[0-9]##g` left `cat a >&1.txt` as the text `cat a .txt` — a read, while bash writes both streams to
+  # ./1.txt. They are parsed with the words now, and only a bare fd duplication and a write to /dev/null read.
+  t '(f) read-only: sed -n, a grep pipe, git log, a 2>/dev/null read, git grep --or, a QUOTED glob in find -name and a QUOTED ;| inside a grep pattern, an ls 2>&1 and a >/dev/null; sed -i, a redirection, find -delete, git branch -D, a ; rm, a $(…), tee, uniq IN OUT, sort -o, python, sed with an option after its script, git grep -O, an ABBREVIATED --open/--out, sort --compress-program, a printf -v built ${x@P} substitution, a bare $HOME, printf -v on its own are not — and neither are the QUOTED find/sort/git/rg options, an option glued out of quotes, rg --hostname-bin, a brace-built or globbed option, an X=1 prefix, an env or xargs wrapper, a <> open, a >/dev/null/../x redirection, a sed script hiding a w behind a quoted ; (1p;wc, 1p;which), a bare 1w script, an unbalanced quote, a & job, a subshell, a quoted-punctuation word, a brace or glob hidden between two double-quoted words that each hold a lone quote, a >&word that is a FILE (>&1.txt, >&2024-report.csv, >&2x), an &> f, a >>/tmp/x, a here-string, an fd digit the shell hands the command as an argument (uniq a 1 >/dev/null), and Edit; Read is' "$ro" "rrrrrrrrrwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwr"
+  confirm_panes
+  t '(f) READ-ONLY: the box answers Yes itself (1, then Enter while the same call is still asked), logged, and no card' \
+    "$(keys %21):$(grep -c $'\tconfirm\t.*seat-read: confirm dialog — read-only, Yes: Bash: sed' "$LOG"):$(grep -c 'seat-read' "$d/slack")" "1|Enter:1:0"
+  t '(f) A WRITE: nothing is pressed into it, and ONE confirm card names the window and the exact call' \
+    "$(keys %22):$(grep -c '' "$d/slack"):$(sed -n 1p "$d/slack")" ":2:grant confirm Bash: git push origin HEAD -w seat-write"
+  confirm_panes
+  t '(f) …the next tick, the owner not having answered: still nothing pressed, and no second card' "$(keys %22)$(keys %23):$(grep -c '' "$d/slack")" ":2"
+  mkdir -p "$d/confirm-answers"; printf 'yes\tThe Owner\n' > "$d/confirm-answers/bcdef"; printf 'no\tThe Owner\n' > "$d/confirm-answers/cdefg"
+  confirm_panes
+  t '(f) HIS YES presses Yes into the dialog it was asked for, once' "$(keys %22):$([ -e "$d/confirm-answers/bcdef" ] && echo left)" "1|Enter:"
+  t '(f) HIS NO presses No, and the seat is told not to try another route to the same change' \
+    "$(keys %23):$(typed seat-no | grep -c 'did not approve this from Slack: Bash: rm -r build. Do not try another route to the same change')" "2|Enter:1"
+  t '(f) …and the dialogs gone, the rows go with them: nothing left to press on a later tick' \
+    "$(printf '> \n' > "$d/screen.%22"; printf '> \n' > "$d/screen.%23"; confirm_panes; cat "$d/model-confirms" 2>/dev/null)" ""
+  # SEVERAL CALLS IN ONE MESSAGE (the review of #586): the CLI runs them in order, so the dialog is the FIRST one's, and
+  # a Yes on it releases the rest — both fixtures show the first call on the pane, as the dialog does.
+  # THE SHAPE THE CLI WRITES: one record per content block, all of them under the one .message.id (the review of #586 —
+  # a record-by-record "last message" saw the `ls` alone and pressed Yes on the rm in front of it). tcallp keeps the
+  # other shape, both blocks packed into one record, so the fallback to the record still holds.
+  tcall2(){ { jq -cn --arg a "$2" '{type:"assistant",message:{id:"msg_1",content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:$a}}]}}'
+              jq -cn --arg b "$3" '{type:"assistant",message:{id:"msg_1",content:[{type:"tool_use",id:"t2",name:"Bash",input:{command:$b}}]}}'; } > "$d/tr/$1.jsonl"; }
+  tcallp(){ jq -cn --arg a "$2" --arg b "$3" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:$a}},{type:"tool_use",id:"t2",name:"Bash",input:{command:$b}}]}}' > "$d/tr/$1.jsonl"; }
+  rm -f "$d/model-confirms"; : > "$d/slack"; : > "$d/keys"; : > "$LOG"
+  printf '%s\n' '%24 seat-two-w' '%25 seat-two-r' > "$d/sess"
+  tcall2 %24 'rm -rf build' 'ls';       cdlg 'rm -rf build' > "$d/screen.%24"
+  tcall2 %25 'ls -l /tmp' 'cat /tmp/f'; cdlg 'ls -l /tmp' > "$d/screen.%25"
+  tcallp %26 'rm -rf build' 'ls'
+  t '(f) two unresolved calls: pending_call is the FIRST of them, not the last, and pending_calls has both in order' \
+    "$(pending_call %24):$(pending_calls %25 | paste -sd'|' -)" \
+    "Bash"$'\t'"rm -rf build:Bash"$'\t'"ls -l /tmp|Bash"$'\t'"cat /tmp/f"
+  t '(f) …one record per block under one message id, and both blocks in one record, read the same: both calls, in order' \
+    "$(pending_calls %24 | paste -sd'|' -):$(pending_calls %26 | paste -sd'|' -)" \
+    "Bash"$'\t'"rm -rf build|Bash"$'\t'"ls:Bash"$'\t'"rm -rf build|Bash"$'\t'"ls"
+  confirm_panes
+  t '(f) …a WRITING first call is never answered Yes off the read-only one behind it: nothing pressed, one card naming both' \
+    "$(keys %24):$(grep -c '' "$d/slack"):$(sed -n 1p "$d/slack")" ":1:grant confirm Bash: rm -rf build · Bash: ls -w seat-two-w"
+  t '(f) …TWO READ-ONLY calls in one message: the box answers Yes itself, and the log names both' \
+    "$(keys %25):$(grep -c $'\tconfirm\t.*seat-two-r: confirm dialog — read-only, Yes: Bash: ls -l /tmp · Bash: cat /tmp/f' "$LOG")" "1|Enter:1"
+  # A CALL THE BOX COULD NOT READ (the sixth review of #586): no transcript, so the card says "look at the pane" — and
+  # his answer still has to land. The screen he was shown is hashed into the confirm row, and the digit is followed by
+  # Enter while the pane still looks like that. Before, the Enter was held back whenever the call was unreadable, so
+  # the digit went in alone, nothing was submitted, the answer was deleted as applied and the same dialog was carded
+  # again on every tick until the grant cap.
+  rm -f "$d/model-confirms" "$d/tr/%27.jsonl" "$d/tr/%28.jsonl"; rm -rf "$d/confirm-answers"; : > "$d/slack"; : > "$d/keys"; : > "$d/typed"; : > "$LOG"
+  printf '%s\n' '%27 seat-blind' '%28 seat-blind2' > "$d/sess"
+  cdlg 'a wrapped call the box cannot read' > "$d/screen.%27"; cdlg 'another one' > "$d/screen.%28"
+  confirm_panes
+  t '(f) NO TRANSCRIPT: nothing is pressed, and each pane is carded once as a call the box could not read' \
+    "$(keys %27)$(keys %28):$(grep -c 'could not read off the transcript' "$d/slack")" ":2"
+  confirm_panes
+  t '(f) …and the tick after raises no second card' "$(grep -c '' "$d/slack")" 2
+  mkdir -p "$d/confirm-answers"; printf 'yes\tThe Owner\n' > "$d/confirm-answers/bcdef"; printf 'no\tThe Owner\n' > "$d/confirm-answers/cdefg"
+  confirm_panes
+  t '(f) …HIS YES and HIS NO each land ONCE on the unreadable call: the digit AND Enter, the answer consumed, the row gone' \
+    "$(keys %27):$(keys %28):$(ls "$d/confirm-answers"):$(cat "$d/model-confirms" 2>/dev/null):$(typed seat-blind2 | grep -c 'did not approve this from Slack')" \
+    "1|Enter:2|Enter:::1"
+  t '(f) …the dialogs gone, nothing is pressed a second time and no card follows' \
+    "$(printf '> \n' > "$d/screen.%27"; printf '> \n' > "$d/screen.%28"; confirm_panes; keys %27):$(keys %28):$(grep -c '' "$d/slack")" "1|Enter:2|Enter:2"
+  # …and when the pane no longer looks like the screen he answered about, nothing goes in: his answer is kept for a
+  # tick that can verify it, and the row stays, so he is not asked a second time either.
+  rm -f "$d/model-confirms"; rm -rf "$d/confirm-answers"; : > "$d/slack"; : > "$d/keys"
+  printf '%s\n' '%27 seat-blind' > "$d/sess"; cdlg 'a wrapped call the box cannot read' > "$d/screen.%27"
+  confirm_panes; mkdir -p "$d/confirm-answers"; printf 'yes\tThe Owner\n' > "$d/confirm-answers/bcdef"
+  cdlg 'a different call behind a new dialog' > "$d/screen.%27"; confirm_panes
+  t '(f) …a pane that changed since the card: no key, his answer kept, the row kept, no second card' \
+    "$(keys %27):$([ -e "$d/confirm-answers/bcdef" ] && echo kept):$(cut -f3 "$d/model-confirms"):$(grep -c '' "$d/slack")" ":kept:bcdef:1"
+  rm -rf "$d/confirm-answers"; rm -f "$d/model-confirms"
+  BIN="$obin"; unset CC_MODEL_TRANSCRIPTS; unset -f cdlg tcall tcall2 tcallp
   unset -f keys cards; unset CC_MODEL_ANSWER_WAIT CC_MODEL_MAJOR CC_CLAUDE_SETTINGS CC_MODEL_MEMBERS
   rm -f "$d/keys"
   # ── A PLANNING SESSION NEVER RUNS BELOW THE FLOOR (owner, 2026-09-21: "planning sessions must be at least on opus") ──

@@ -23,7 +23,7 @@
   cc-slack project <name>             from a member workspace's session, ask the daemon for the project's board row and its one thread in #<this workspace> (no channel); at most 3 an hour; the human way is `new project <name>` typed in the channel.
   cc-slack ask [-t "title"] "text"      from a member workspace's session, ask the box's planning seat (a repo, a host-side push, a question): the daemon posts a 🙋 card in the control repo's #<repo>-threads lane on the workspace's behalf, hands it to the planning session, and carries every reply in the card's thread (the seat's or the owner's) back to #<workspace>, handed to its session; at most 5 an hour. Never ask the owner to relay.
   cc-slack seat                          the seat the daemon says owns this process (`<repo>`, `<repo>/<track>`, `<repo>@<alias>`), from the socket's pid chain and the live subscriptions; empty and exit 1 when none does, exit 2 when the daemon could not be reached at all. cc-notify reads it to decide who may ask the owner, and a caller it cannot identify (exit 2) is not the box's own hand.
-  cc-slack grant allow '<rule>' [-t "why"]   from a box session (planning or a track) that a permission layer refused: the daemon posts a 🔐 grant card in the control repo's #<repo>-threads lane naming that ONE allow line; the owner's `yes <id> fix` there has the daemon write it into ~/.claude/settings.json (cc-settings grant), `no <id>` declines; the card shows ⚙️ or ❌. Never a member workspace's verb, never answerable by a session; at most 5 an hour. `cc-slack grant unit <file.service|.timer>` is the same card for a user unit install (file, sha256 and the enable both named). Design: docs/design-seat-grant-from-slack.md.
+  cc-slack grant allow '<rule>' [-t "why"]   from a box session (planning or a track) that a permission layer refused: the daemon posts a 🔐 grant card in the control repo's #<repo>-threads lane naming that ONE allow line; the owner's `yes <id> fix` there has the daemon write it into ~/.claude/settings.json (cc-settings grant), `no <id>` declines; the card shows ⚙️ or ❌. Never a member workspace's verb, never answerable by a session; at most 5 an hour. `cc-slack grant unit <file.service|.timer>` is the same card for a user unit install (file, sha256 and the enable both named). `cc-slack grant confirm '<command>' -w <window>` is the same card for a seat parked on the auto-mode confirm dialog behind a command that is not read-only (cc-model's tick raises it): the owner's `yes <id>` / `no <id>` is written to ~/.cc/state/confirm-answers/<id>, and cc-model's next tick presses that answer into the dialog — this once, never for good. Design: docs/design-seat-grant-from-slack.md.
   cc-slack permission <id> yes|no [fix]     answer a 🔐 prompt from here, the same path as a `yes <id>` Slack reply; every session's prompt but the planning session's own goes to the control repo's #<repo>-threads lane for it to decide; `fix` marks the capability granted for good.
   cc-slack updates-sweep [--dry-run]  give every repo channel that predates the split its -updates lane (idempotent; skips a bot-only channel).
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]     give a sub-orchestrator its own channel, recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it).
@@ -162,6 +162,7 @@ GRANT_WHOLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*\([*?: /]*\)$")   # Bash(*),
 GRANT_UNIT_RE = re.compile(r"^[A-Za-z0-9_@.-]+\.(?:service|timer)$")
 GRANT_UNIT_ROOTS = (f"{HOME}/dev/", f"{HOME}/.cc/worktrees/")  # a unit file the card names sits in a repo: reviewable, and hashed so a swap after the card is refused
 GRANT_UNIT_MAX = 16 * 1024
+CONFIRM_ANSWERS = f"{HOME}/.cc/state/confirm-answers"          # <id> -> "yes|no\t<who>": the owner's answer to a confirm card, which cc-model's tick presses into the dialog
 USERS_TTL = 6 * 3600                                         # how long a handle -> id table is good for
 USERS_MISS_TTL = 5 * 60                                      # an unknown @token rebuilds it at most this often (a typo must not hammer users.list)
 _users = {"t": 0.0, "map": None, "ids": {}, "miss": 0.0}     # this process's copy of the table (on disk: <DIR>/users.json); "ids" = every candidate per handle
@@ -4089,6 +4090,8 @@ class Daemon:
                 # own 🔐 grant card. Who raised it is peer_session's to say, as for `permission`: a live subscription
                 # in the caller's pid chain, never the payload; a member socket never reaches this branch (member_verb).
                 who = self.peer_session(self.peer_of(c), member)
+                if str(first["grant"] or "") == "confirm":   # raised by cc-model's timer, which is no session: the card names the
+                    who = str(first.get("window") or "")      # window it read, and nothing but the owner's answer to it does anything
                 res = self.relay_grant(who, str(first["grant"] or ""), str(first.get("what") or ""), str(first.get("why") or ""))
                 c.sendall((json.dumps(res) + "\n").encode())
             # {"post": …} was dropped (member-sandbox): it posted anywhere as the bot for any local process — refuse_reason refuses it
@@ -6203,14 +6206,18 @@ class Daemon:
                 sha = hashlib.sha256(open(what, "rb").read()).hexdigest()
             except OSError as e:
                 return {"ok": False, "error": f"{what}: {e.strerror}"}
+        elif kind == "confirm":
+            if not what:
+                return {"ok": False, "error": "a confirm card names the command the dialog is asking about"}
         else:
-            return {"ok": False, "error": "grant allow '<rule>' | grant unit <file>"}
+            return {"ok": False, "error": "grant allow '<rule>' | grant unit <file> | grant confirm '<command>' -w <window>"}
         chat = self.threads_chat(CTL) or self.default_chat(CTL)
         if not chat:
             return {"ok": False, "error": f"no Slack lane of {CTL}'s to ask in — nothing was posted"}
         now = time.time()
         self.grant_sweep(now)
-        recent = [t for t in self.grant_posts.get(target, []) if now - t < GRANT_WINDOW]
+        bucket = " confirm" if kind == "confirm" else target   # a confirm card's window is the caller's word: one cap for the box, not per name
+        recent = [t for t in self.grant_posts.get(bucket, []) if now - t < GRANT_WINDOW]
         if len(recent) >= GRANT_CAP:
             log(f"grant from {target}: {len(recent)} in {GRANT_WINDOW}s — refused")
             return {"ok": False, "error": f"{target} has raised {GRANT_CAP} grant cards in the last hour — wait for those answers"}
@@ -6220,6 +6227,10 @@ class Daemon:
             ask = (f"🔐 {who} needs a permission it does not hold — allow line:\n`{perm_field(what, 220)}`\n"
                    + (f"why: {why}\n" if why else "")
                    + f"Reply `yes {rid} fix` to write it into ~/.claude/settings.json for good, or `no {rid}`.")
+        elif kind == "confirm":
+            ask = (f"🔐 {who} is waiting on the auto-mode confirm dialog, and the command is not read-only:\n"
+                   f"`{perm_field(what, 400)}`\n"
+                   f"Reply `yes {rid}` to let it run this once, or `no {rid}` to refuse it — the seat is then told not to try another way.")
         else:
             ask = (f"🔐 {who} needs a user unit installed — file `{perm_field(what, 200)}` (sha256 `{sha[:12]}…`), "
                    f"then `systemctl --user enable --now {perm_field(name, 60)}`.\n"
@@ -6229,7 +6240,7 @@ class Daemon:
         if not card:
             return {"ok": False, "error": "the lane did not take the card — nothing was posted"}
         recent.append(now)
-        self.grant_posts[target] = recent
+        self.grant_posts[bucket] = recent
         self.grant_asks[rid] = {"target": target, "kind": kind, "what": what, "sha": sha, "why": why,
                                 "chat": chat, "card": card, "at": now}
         self.save_grants()
@@ -6264,6 +6275,8 @@ class Daemon:
             return False
         if g.get("kind") == "allow":
             return f"`{perm_field(g.get('what'), 220)}`" in text
+        if g.get("kind") == "confirm":
+            return f"`{perm_field(g.get('what'), 400)}`" in text
         return f"`{perm_field(g.get('what'), 200)}`" in text and f"`{str(g.get('sha') or '')[:12]}…`" in text
 
     def write_grant(self, rid, g, by):
@@ -6287,6 +6300,21 @@ class Daemon:
         if not g:
             return
         card, lane = g.get("card"), g.get("chat") or chat
+        if g.get("kind") == "confirm":   # a dialog, not a capability: the answer is only recorded, and cc-model presses it once
+            ok = allow and self.card_matches(g)
+            word = "allowed once" if ok else "declined" if not allow else "refused (the table's entry is not what the card says)"
+            try:
+                os.makedirs(CONFIRM_ANSWERS, exist_ok=True)
+                with open(f"{CONFIRM_ANSWERS}/{rid}", "w") as f:
+                    f.write(f"{'yes' if ok else 'no'}\t{by}\n")
+            except OSError as e:
+                word = f"not recorded ({e.strerror})"
+            react(self.cfg, chat, ts, "white_check_mark" if ok else "x")
+            if card:
+                react(self.cfg, lane, card, "white_check_mark" if ok else "x", thread=card)
+            self._safe(self.say, lane, f"🔐 {rid} {word} by `{by}`: the box presses it into the dialog within a minute", card or thread)
+            log(f"grant {rid}: confirm {word} by {by} for {g.get('target')} ({str(g.get('what'))[:80]})")
+            return
         if allow:
             if self.card_matches(g):
                 ok, line = self.write_grant(rid, g, by)
@@ -8429,18 +8457,21 @@ def main(argv):
         print(r.get("text") or "") if r.get("ok") else print(r.get("error") or "", file=sys.stderr)
         return 0 if r.get("ok") else 1
     elif cmd == "grant":   # a box session raising its own 🔐 grant card; the owner's `yes <id> fix` in Slack writes it (Daemon.relay_grant)
-        why, args = "", []
+        why, window, args = "", "", []
         i = 0
         while i < len(rest):
             if rest[i] == "-t" and i + 1 < len(rest):
                 why = rest[i + 1]; i += 2
+            elif rest[i] == "-w" and i + 1 < len(rest):
+                window = rest[i + 1]; i += 2
             else:
                 args.append(rest[i]); i += 1
-        if len(args) != 2 or args[0] not in ("allow", "unit"):
-            print("cc-slack grant allow '<Tool(pattern)>' [-t why]   |   cc-slack grant unit </abs/path/name.service|.timer> [-t why]", file=sys.stderr); return 2
+        if len(args) != 2 or args[0] not in ("allow", "unit", "confirm") or (args[0] == "confirm") != bool(window):
+            print("cc-slack grant allow '<Tool(pattern)>' [-t why]   |   cc-slack grant unit </abs/path/name.service|.timer> [-t why]"
+                  "   |   cc-slack grant confirm '<command>' -w <window>", file=sys.stderr); return 2
         what = os.path.abspath(args[1]) if args[0] == "unit" else args[1]
         try:
-            r = sock_request({"grant": args[0], "what": what, "why": why}, timeout=60)
+            r = sock_request({"grant": args[0], "what": what, "why": why, "window": window}, timeout=60)
         except Exception as e:
             print(f"the Slack daemon did not answer ({e.__class__.__name__}) — no card was raised", file=sys.stderr); return 1
         print(r.get("text") or "") if r.get("ok") else print(r.get("error") or "", file=sys.stderr)
