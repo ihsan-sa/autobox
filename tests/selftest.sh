@@ -3039,6 +3039,21 @@ inst
 rm -f "$IH/bin/foreign"
 miss=""; for u in $("$IR/bin/cc-units" link); do [ -L "$IH/.config/systemd/user/$u" ] || miss="$miss $u"; done
 [ -z "$miss" ] && ok "every unit in the manifest is linked, cc-reconcile.timer included (switching on is the services step)" || bad "units not linked:$miss"
+# the same prune, scoped the same way, for ~/.config/systemd/user: a unit a PR deletes must not leave its link
+# dangling forever — that is how `systemctl --user --failed` reads not-found for good and stays red (case
+# raised-a-deleted-unit-leaves-a-dangling-link-and-a-red: #483 deleted 10 units, 2026-09-15, none of their 10
+# links went). A foreign dangling link in the same directory — the owner's or another tool's — is left alone.
+ln -s "$IR/config/systemd-user/retired.timer" "$IH/.config/systemd/user/retired.timer"; ln -s "$T/never-ours" "$IH/.config/systemd/user/foreign.timer"
+# and the enable link left in timers.target.wants/ for it — that one is what keeps the dead timer in --failed.
+# A foreign dangling wants link (not in this tree, not pointing at a link the prune removed) stays.
+mkdir -p "$IH/.config/systemd/user/timers.target.wants"
+ln -s "$IH/.config/systemd/user/retired.timer" "$IH/.config/systemd/user/timers.target.wants/retired.timer"
+ln -s "$IH/.config/systemd/user/gone-by-hand.timer" "$IH/.config/systemd/user/timers.target.wants/gone-by-hand.timer"
+inst
+{ [ ! -L "$IH/.config/systemd/user/timers.target.wants/retired.timer" ] && [ -L "$IH/.config/systemd/user/timers.target.wants/gone-by-hand.timer" ]; } && ok "a pruned unit's enable link in timers.target.wants goes with it — a foreign dangling wants link is left alone" || bad "wants prune scope: retired wants link $([ -L "$IH/.config/systemd/user/timers.target.wants/retired.timer" ] && echo kept || echo gone), foreign wants link $([ -L "$IH/.config/systemd/user/timers.target.wants/gone-by-hand.timer" ] && echo kept || echo gone)"
+rm -f "$IH/.config/systemd/user/timers.target.wants/gone-by-hand.timer"
+{ [ ! -e "$IH/.config/systemd/user/retired.timer" ] && [ -L "$IH/.config/systemd/user/foreign.timer" ]; } && ok "a unit's dangling link is pruned once its source file is gone — a foreign dangling link is left alone" || bad "systemd-user prune scope: retired link $([ -e "$IH/.config/systemd/user/retired.timer" ] && echo kept || echo gone), foreign link $([ -L "$IH/.config/systemd/user/foreign.timer" ] && echo kept || echo gone)"
+rm -f "$IH/.config/systemd/user/foreign.timer"
 { [ -f "$IH/CLAUDE.md" ] && [ ! -L "$IH/CLAUDE.md" ] && grep -q '^# testbox — ' "$IH/CLAUDE.md" && grep -q 'Autonomy is the norm' "$IH/CLAUDE.md" && grep -q 'The owner approves' "$IH/CLAUDE.md" && grep -q '~/WORKING.md' "$IH/CLAUDE.md" && ! grep -q '<user>' "$IH/CLAUDE.md"; } && ok "~/CLAUDE.md seeded as a copy of the contract, <box>/<user> filled in, the rest left to the owner" || bad "~/CLAUDE.md not seeded as the box contract"
 miss=""; for g in USAGE COMMS RUNBOOK; do [ -f "$IH/$g.md" ] || miss="$miss $g"; done
 [ -z "$miss" ] && ok "the guides the contract points at exist at ~ (USAGE COMMS RUNBOOK; SLACK folded into COMMS)" || bad "guides missing:$miss"

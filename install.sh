@@ -98,6 +98,27 @@ if [ -n "$O" ]; then
     link "$f" ~/.config/systemd/user/"$(basename "$f")"
   done
 fi
+# prune the links THIS tree made whose unit file left it (a PR deleted it): otherwise systemd keeps the dangling
+# link forever, the unit sits in --failed as not-found, and every seat that reads --failed pays for it again
+# (case raised-a-deleted-unit-leaves-a-dangling-link-and-a-red — #483 deleted 10 units, 2026-09-15, and none of
+# their 10 links went). Same rule as the ~/bin prune above, same reason: only a link THIS tree made is ours to
+# remove, never one the owner or another tool put here by hand.
+pruned=""
+for l in ~/.config/systemd/user/*; do
+  [ -L "$l" ] && [ ! -f "$l" ] || continue
+  case "$(readlink "$l")" in "${O:-$R}"/*) rm -f "$l"; pruned="$pruned ${l##*/}" ;; esac
+done
+# ...and the links `systemctl --user enable` wrote for such a unit into *.wants/ and *.requires/: those are what
+# keep timers.target pointing at the dead timer, so they, not the bare unit link, are what put it in --failed.
+# Same scope: a dangling link whose target is in this tree, or is a unit link the loop above just removed.
+for l in ~/.config/systemd/user/*.wants/* ~/.config/systemd/user/*.requires/*; do
+  [ -L "$l" ] && [ ! -e "$l" ] || continue
+  t=$(readlink "$l")
+  case "$t" in
+    "${O:-$R}"/*) rm -f "$l"; pruned="$pruned ${l##*/}" ;;
+    "$HOME"/.config/systemd/user/*) case " $pruned " in *" ${t##*/} "*) rm -f "$l" ;; esac ;;
+  esac
+done
 
 # ~/.claude/settings.json: this installer NEVER writes an existing one, and that is not laziness. That file holds
 # `permissions`, and a hook entry runs a command on every prompt, so anything able to edit it can widen what a
@@ -120,6 +141,9 @@ B
 if [ "$services" = 1 ]; then
   sudo -n loginctl enable-linger "$USER" 2>/dev/null || true
   systemctl --user daemon-reload
+  # a pruned unit that was already in failed state stays listed in --failed until reset, even after the reload
+  # shellcheck disable=SC2086  # $pruned splits into unit names on purpose
+  [ -z "$pruned" ] || systemctl --user reset-failed $pruned 2>/dev/null || true
   # Which units come on, and how, is `enable`/`start` in config/units.json — with the reason on each row. The two
   # the installer deliberately leaves off (cc-slackd, cc-vitals) are marked enable=owner there, not omitted here.
   enable_rows=$("$R/bin/cc-units" enable)   # likewise: read the rows before the loop, so a failure aborts the install
