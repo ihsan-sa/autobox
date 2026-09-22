@@ -8,10 +8,11 @@
   cc-reconcile view                  the snapshot file as TSV: repo/track · state · waiting_on · why (no rows when stale)
   cc-reconcile sweep [<repo>…|--configured] [--dry]   remove what is finished and forgotten; report what is uncertain
   cc-reconcile digest [--notify]     the whole report: shipped, moving, waiting on you, stopped, cost; --notify posts the phone one
+  cc-reconcile investigate [--dry]   the tick's failure investigation, once, by hand; --dry names the cluster it would claim
   cc-reconcile selfcheck             the decision table and one end-to-end run of each part, no network
     flags: --json · -q · --no-net (never ask GitHub) · --grace SEC (600) · --repeat SEC (86400) · --no-stop
 
-No model is called here and nothing here launches one.
+No model is called here. The one thing launched is `cc-audit failure <claim>` (THE INVESTIGATION, below).
 
 ALIVE: a `claude` whose cwd is the track's worktree, a `cc-loop <repo> <track>`, a live pane in the track's tmux
 window, or an `agent` mark (cc-board) naming a window that holds an interactive session for this repo, made less
@@ -49,6 +50,7 @@ THE TICK (--apply, unfiltered): after the reconcile it runs, in order,
     past the rotate line: its ROTATION), cc-slack approvals-sweep (each its own tool; this gives it a turn)
   · the fixture rule (sweep rule 6) every tick; the full sweep of CC_JANITOR_REPOS once per 24 h
   · the wake, per repo with a board, only while CC_WAKE=on (~/.cc/config) — off by default, the owner's switch
+  · the failure investigation (THE INVESTIGATION, below)
   · the digest, once a day after 11:00 America/Los_Angeles (hour and stamp date both in that zone, never the host's),
     stamped but no longer posted — `digest --notify` still posts it by hand
 
@@ -80,6 +82,16 @@ longer does — it only stamps the day) is the phone one: the counts line, the l
 how many failure kinds crossed the rule (none is no line), every waiting row's question (cut to 120) and the asks count,
 then one line naming what it left out, linked to CC_DIGEST_LINK (~/.cc/config, an https URL; anything else reads "the
 Home tab"). `--notify` prints what it posts.
+
+THE INVESTIGATION rides the tick (docs/design-failure-noticing-2026-09-11.md, The investigation) and has no timer of
+its own. Each tick, if ~/.cc/config has CC_FAILURES_INVESTIGATE=on (the owner's setting; absent, it is inert), `cc-tier
+allows explore` says yes, and no `cc-audit failure` is running anywhere on the box, the pass takes ONE eligible
+cluster with `cc-failures claim` and launches `cc-audit failure <claim>` as a transient user unit that outlives this
+oneshot (a detached child where there is no user manager), one line in reconcile.log. The tier saying no claims
+nothing: the cluster stays eligible and unclaimed with its age, and the run prints that the tier holds it. Nothing here
+reads the report, opens a row or posts: cc-audit delivers. `investigate --dry` claims and launches nothing and names
+the cluster the pass would take and what holds it. CC_RECONCILE_LAUNCH=CMD (tests) runs `CMD failure <claim>` in
+place of the unit and skips the box-wide running scan unless CC_RECONCILE_PROC names a fixture /proc.
 
 A NAG THE STATE DISPROVES IS A FAILURE, WRITTEN HERE (the design's writers table: "cc-reconcile (a nag the
 authoritative state disproved)"). Every nag the --notify pass sends — the session's "review and land it", the owner's
@@ -1888,12 +1900,107 @@ def retry_requests():
         pass
 
 
+# ── the failure investigation ───────────────────────────────────────────────────────────────────────────
+INVESTIGATE_KEY = "CC_FAILURES_INVESTIGATE"   # the owner's one named setting: `cc-config set CC_FAILURES_INVESTIGATE on`
+
+
+def running_investigation(root="/proc"):
+    """True when a `cc-audit failure …` is running on the box. A `claude` whose prompt QUOTES the command is not one."""
+    for d in os.listdir(root) if os.path.isdir(root) else []:
+        if not d.isdigit() or int(d) == os.getpid():
+            continue
+        try:
+            argv = open(f"{root}/{d}/cmdline", "rb").read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if any(os.path.basename(a) == "claude" for a in argv):
+            continue
+        if any(os.path.basename(a) == "cc-audit" and argv[i + 1:i + 2] == ["failure"] for i, a in enumerate(argv)):
+            return True
+    return False
+
+
+def investigate(dry=False):
+    """Claim one eligible failure cluster and launch its investigation (docstring: THE INVESTIGATION). Returns the line
+    to print, or None when there is nothing to say. --dry claims nothing and launches nothing: it names the cluster the
+    pass would take and what, if anything, holds it. Never raises: a timer pass does not die of this."""
+    p = sh(sib("cc-failures"), "eligible", timeout=30)
+    n = sum(1 for ln in (p.stdout if p else "").splitlines() if "\tunclaimed" in ln)
+    holds, on = [], setting(INVESTIGATE_KEY).lower() == "on"
+    # "the launch checks `cc-tier allows explore` and stands down when it says no, the cluster staying eligible and
+    # visible with its age" — no claim is taken, so `cc board failures` keeps saying `unclaimed <age>`. No answer from
+    # cc-tier holds too (unlike tier_allows): this is the one spend the pass starts on its own.
+    t = sh(sib("cc-tier"), "allows", "explore", timeout=10) if on else None
+    if not on:
+        holds.append(f"{INVESTIGATE_KEY} is not on")
+    elif not t or t.returncode != 0:
+        holds.append("the tier holds explore work")
+    launcher = os.environ.get("CC_RECONCILE_LAUNCH")   # tests: a stub in place of the unit
+    # The scan is box-wide, so a stubbed pass skips it unless it names a fixture /proc: the box's own investigation
+    # in flight must never hold a fixture's launch.
+    proc = os.environ.get("CC_RECONCILE_PROC") or ("" if launcher else "/proc")
+    if proc and running_investigation(proc):
+        holds.append("an investigation is still running")   # one at a time, never two at once
+    if dry:
+        c = sh(sib("cc-failures"), "claim", "--dry", timeout=30)
+        if not c or c.returncode != 0:
+            return f"  investigation  would claim nothing: {(c.stderr.strip() if c else '') or 'cc-failures did not answer'}"
+        claim, cluster, scope, kind = (c.stdout.rstrip("\n").split("\t") + ["", "", "", ""])[:4]
+        return (f"  investigation  would claim {claim} {scope}/{kind} ({cluster})"
+                + (f" — but {'; '.join(holds)}" if holds else " and launch `cc-audit failure` on it"))
+    if holds:
+        if holds[0].startswith("the tier") and n:
+            return f"  held       failure investigation: the tier holds explore work; {n} eligible cluster(s) wait, unclaimed"
+        return None                                     # inert until the owner turns it on, or one is still running
+    c = sh(sib("cc-failures"), "claim", timeout=30)
+    if not c or c.returncode != 0:
+        return None                                     # nothing eligible, or the day's slots spent: cc-failures says why
+    claim, cluster, scope, kind = (c.stdout.rstrip("\n").split("\t") + ["", "", "", ""])[:4]
+    if launcher:
+        r = sh(launcher, "failure", claim, timeout=30); how = "stub" if r and r.returncode == 0 else "stub failed"
+    else:
+        # A transient unit, not a child: this pass is a oneshot service, and a child in its control group dies with it
+        # minutes before the model answers — the same reason the lander's queue worker is started this way.
+        unit = f"cc-audit-failure-{claim}"
+        r = sh("systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}",
+               "--description=cc-audit: one bounded failure investigation", sib("cc-audit"), "failure", claim)
+        if r and r.returncode == 0:
+            how = unit
+        else:
+            try:
+                subprocess.Popen([sib("cc-audit"), "failure", claim], start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                how = "a detached child (no systemd --user here)"
+            except Exception as e:
+                how = f"launch failed: {e.__class__.__name__}"
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(f"{STATE}/reconcile.log", "a") as log:
+            log.write(f"{stamp()}\tinvestigation\t{claim} {cluster} {scope}/{kind}\t{how}\n")
+    except OSError:
+        pass
+    return f"  investigation  {claim} {scope}/{kind} ({cluster}) — cc-audit failure launched: {how}"
+
+
+def investigate_cmd(argv):
+    if argv not in ([], ["--dry"]):
+        print("usage: cc-reconcile investigate [--dry]", file=sys.stderr)
+        return 2
+    line = investigate(dry=bool(argv))
+    print(line.strip() if line else "investigation: nothing to launch")
+    return 0
+
+
 def tick(snap, net):
     """What rides the --apply pass after the reconcile: the fixture rule, the daily sweep, the wake, the daily digest,
-    and the planner requests the broker has not taken yet (core/docs/comms-contract.md: "queued" is not "handled")."""
+    the failure investigation, and the planner requests the broker has not taken yet (core/docs/comms-contract.md:
+    "queued" is not "handled")."""
     r = Sweep(False)
     sweep_fixtures(r)
     retry_requests()
+    inv = investigate()
+    if inv:
+        print(inv)
     sw = f"{STATE}/sweep.stamp"
     try:
         due = now() - os.path.getmtime(sw) > 86400
@@ -1934,6 +2041,8 @@ def main(argv):
         return sweep_cmd(argv[1:])
     if argv[:1] == ["digest"]:
         return digest_cmd(argv[1:])
+    if argv[:1] == ["investigate"]:
+        return investigate_cmd(argv[1:])
     snap_only = argv[:1] == ["snapshot"]
     if snap_only:
         argv = argv[1:] + ["--no-net"]
@@ -3823,6 +3932,71 @@ def selfcheck():
            and "*Waiting on you*" in digest_text(snap, phone=True))
     finally:
         restore(); shutil.rmtree(tf, ignore_errors=True)
+    # ── the failure investigation: inert without the setting, held by the tier or a running one, one claim, one launch ──
+    ti = tempfile.mkdtemp(prefix="cc-reconcile-inv-")
+    _ie = {k: os.environ.get(k) for k in ("HOME", "CC_CONFIG", "CC_FAILURES", "CC_RECONCILE_LAUNCH", "CC_RECONCILE_PROC",
+                                          "CC_SPEND_TIER", "CC_RECONCILE_STUBS")}
+    _is, _inv = STATE, investigate
+    try:
+        os.environ.pop("CC_RECONCILE_STUBS", None)
+        os.environ.update(HOME=ti, CC_CONFIG=f"{ti}/.cc/config", CC_FAILURES=f"{ti}/.cc/failures",
+                          CC_RECONCILE_LAUNCH=f"{ti}/launch", CC_RECONCILE_PROC=f"{ti}/proc", CC_SPEND_TIER="autonomous")
+        globals()["STATE"] = f"{ti}/.cc/state"
+        os.makedirs(f"{ti}/.cc"); os.makedirs(f"{ti}/proc")
+        open(f"{ti}/launch", "w").write(f'#!/bin/sh\necho "$@" >> {ti}/launch.log\n'); os.chmod(f"{ti}/launch", 0o755)
+
+        def rec(kind, days_ago, *extra):
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() - days_ago * 86400))
+            sh(f"{BIN}/cc-failures", "record", "--scope", "sc", "--kind", kind, "--observed", "o", "--ts", ts, *extra)
+
+        def launched():
+            return open(f"{ti}/launch.log").read().splitlines() if os.path.exists(f"{ti}/launch.log") else []
+
+        def elig():
+            return (sh(f"{BIN}/cc-failures", "eligible") or subprocess.CompletedProcess([], 1, "", "")).stdout
+
+        def proc(pid, *argv):
+            os.makedirs(f"{ti}/proc/{pid}", exist_ok=True)
+            open(f"{ti}/proc/{pid}/cmdline", "wb").write(("\0".join(argv) + "\0").encode())
+        for d in (5, 3, 1):
+            rec("guard-policy/permitted-text-refused", d)          # three episodes: eligible on the rule
+        ok("INVESTIGATE INERT: without CC_FAILURES_INVESTIGATE=on nothing is claimed or launched, the cluster stays unclaimed",
+           investigate() is None and launched() == [] and "\tunclaimed" in elig())
+        dry = investigate(dry=True)
+        ok("…and --dry names the cluster it would claim and what holds it, claiming nothing",
+           dry.startswith("  investigation  would claim i-") and "is not on" in dry and "\tunclaimed" in elig())
+        sh(f"{BIN}/cc-config", "set", INVESTIGATE_KEY, "on")
+        os.environ["CC_SPEND_TIER"] = "moderate"               # the environment outranks the file, as selftest.sh pins it
+        ok("INVESTIGATE TIER: the setting on but `cc-tier allows explore` says no: no claim, no launch, the line says so",
+           "tier holds" in (investigate() or "") and launched() == [] and re.search(r"\tunclaimed \d", elig()))
+        os.environ["CC_SPEND_TIER"] = "autonomous"
+        proc("4242", "/usr/bin/claude", "-p", "run cc-audit failure i-x")
+        proc("4243", "/x/cc-audit", "checks")
+        ok("running_investigation: a claude QUOTING the command and a cc-audit that is not `failure` hold nothing",
+           not running_investigation(f"{ti}/proc"))
+        proc("4244", "/bin/bash", "/x/bin/cc-audit", "failure", "i-elsewhere")
+        ok("…while a `cc-audit failure` running holds the pass: no claim, no launch — never two at once",
+           running_investigation(f"{ti}/proc") and investigate() is None and launched() == [] and "\tunclaimed" in elig())
+        shutil.rmtree(f"{ti}/proc/4244")
+        line = investigate()
+        ok("INVESTIGATE LAUNCH: the setting on, the tier autonomous, nothing running: ONE claim, ONE `cc-audit failure <claim>`",
+           len(launched()) == 1 and launched()[0].startswith("failure i-") and "\tclaimed" in elig()
+           and (line or "").startswith("  investigation  i-"))
+        ok("…and the launch is one line in reconcile.log",
+           "\tinvestigation\ti-" in open(f"{ti}/.cc/state/reconcile.log").read())
+        ok("…and the next pass launches nothing: the cluster is held by its claim", investigate() is None and len(launched()) == 1)
+        rec("gate-target/wrong-revision", 1, "--critical", "main-gate-or-deploy-red")   # a critical cluster: the other slot
+        investigate()
+        ok("…while a critical cluster is the next pass's one launch", len(launched()) == 2 and launched()[1].startswith("failure i-"))
+        scratch(ti, NOOP)
+        globals()["investigate"] = lambda dry=False: "  investigation  from-the-tick"
+        ok("THE TICK carries it: the investigation's line is printed by tick(), no timer of its own",
+           "from-the-tick" in quietly(tick, {}, False))
+    finally:
+        restore(); globals().update(STATE=_is, investigate=_inv)
+        for k, v in _ie.items():
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+        shutil.rmtree(ti, ignore_errors=True)
     print(f"cc-reconcile selfcheck: {p} passed, {f} failed")
     return 1 if f else 0
 
