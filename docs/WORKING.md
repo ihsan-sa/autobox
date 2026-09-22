@@ -155,7 +155,8 @@ or a proxy. The tool retrieves; it never calls a model. The steps:
 ## model policy
 Planning sessions and orchs run the strongest available model (cc-model's primary, Fable); a headless
 worker runs on CC_WORKER_MODEL (claude-opus-5) unless the dispatcher passes `--model` for that one
-task — a limit override outranks both. The order lives in cc-loop's `worker_model`; the names live in
+task — a limit override outranks both. A planning session never runs below Opus: with Opus out
+cc-model parks it rather than move it to Sonnet, and hands it back on Opus when that answers. The order lives in cc-loop's `worker_model`; the names live in
 cc-model and nowhere else — when models change, change cc-model.
 - A subagent runs on its type's `model` line (builder and security-reviewer: opus; reviewer: sonnet) unless the spawner passes `model` on the Agent call, which outranks the type; that is how a tiny builder gets Sonnet. Verified on this box 2026-09-05: a builder spawned with model sonnet records claude-sonnet-5 in its transcript.
 - Effort is the cheap dial: high by default, down for routine turns, up for the hardest.
