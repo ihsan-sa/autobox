@@ -38,6 +38,10 @@
 # and two with defaults: CC_GH_APP_HOST (github.com) · CC_GH_API (the public API).
 # Configure none of them and nothing here reaches GitHub: gitargs prints nothing, so a box with no app pushes
 # exactly as it did before, and asking for a credential or a repository says which keys are missing.
+# THAT SILENCE IS A HOST'S ANSWER AND NOBODY ELSE'S. Inside a member workspace (CC_MEMBER_SANDBOX=1) the config
+# and the token are outside the boundary by design, so gitargs there has nothing to wire for a reason worth
+# hearing: it says so in one line on stderr and exits non-zero, rather than leaving git to fail on "could not
+# read Username" with no hint of where the credential went (a member spent a turn on that, 2026-09-21).
 #
 # THE OWNER'S OWN ACCOUNT IS A SECOND DOOR, FOR WORKSPACES ONLY. A workspace can also own repositories under his
 # personal account (CC_GH_PERSONAL_OWNER in ~/.cc/config). The credential there is a fine-grained personal access
@@ -212,6 +216,15 @@ gitargs(){   # $1 remote url, $2 the workspace pushing (optional). Prints the -c
   case "$url" in "https://$HOST/"*) rest=${url#"https://$HOST/"} ;; *) return 0 ;; esac   # ssh and every other host: not ours
   owner=${rest%%/*}
   repo=${rest#*/}; repo=${repo%.git}; repo=${repo%%/*}
+  # NOTHING TO WIRE FROM INSIDE A MEMBER WORKSPACE, AND SILENCE IS THE WRONG WAY TO SAY IT. The app's keys live in
+  # ~/.cc/config and the personal token in ~/.cc/secrets, and the boundary binds NEITHER — so an empty answer there
+  # is not the "no app configured" case below, which stays silent and exits 0 because a box with no app really does
+  # push as it always did. It is a credential that cannot be reached from where this ran, and it is told apart by
+  # exactly that: the sandbox's own CC_MEMBER_SANDBOX, with no config and no personal owner to read. Nothing is read
+  # or widened here — the fix is a sentence and an exit code.
+  if [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && ! configured && [ -z "$POWNER" ]; then
+    die "nothing to wire from inside a member workspace: the GitHub app's config and the token are outside the boundary by design, so no credential is reachable here — the HOST pushes this workspace's branches and lands its PRs for it (docs/design-member-workspaces.md, Landing), and a workspace granted its own token ('cc-sandbox github ${ws:-<handle>}', the owner's to run on the host) already carries it in git's own config inside, so nothing is needed from here"
+  fi
   # The owner's own account — "a workspace's pushes carry the credential only for remotes ~/dev/<handle> names,
   # and a workspace with no remote under that account gets none". With no workspace it is the box's own push,
   # and that keeps ~/.gitconfig's helper untouched. For a real workspace the reset goes out EVEN WHEN nothing is
@@ -423,13 +436,15 @@ EOF
 }
 
 selfcheck(){
-  local n=0 f=0 out rc port tok tok2 sig body iss ptok   # pid and T are NOT local: the EXIT trap that stops the
+  local n=0 f=0 out rc port tok tok2 sig body iss ptok seat   # pid and T are NOT local: the EXIT trap that stops the
   # fixture API and removes the temp dir fires in the global scope, after this function's locals are gone. A
   # local `pid` there reads empty, the server is never killed, and it holds the pipe of whatever captured this
   # selfcheck's output open FOR EVER — which is check.sh hanging, not a test failing.
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
   T="$(mktemp -d)"; pid=""; trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$T"' EXIT
+  unset CC_MEMBER_SANDBOX   # every case below is a HOST's run: the member-seat block sets it itself, and a suite
+                            # that inherited it would otherwise read as that case everywhere
   # Fixture values only — core/ is published and nothing in it may name a box (myrepo, owner@example.com).
   openssl genrsa -out "$T/key.pem" 2048 2>/dev/null
   openssl rsa -in "$T/key.pem" -pubout -out "$T/key.pub" 2>/dev/null
@@ -589,8 +604,9 @@ EOF
   k "$(t test -z "$(G gitargs https://gitlab.example.com/myorg/myrepo.git)")" "another host gets nothing"
   k "$(t test -z "$(G gitargs git@github.com:myorg/myrepo.git)")" "an ssh remote gets nothing (it has no credential helper to wire)"
   k "$(t test -z "$(G gitargs '')")" "a repo with no remote gets nothing"
-  k "$(t test -z "$(CC_CONFIG=/dev/null "$SELF" gitargs https://github.com/myorg/myrepo.git)")" \
-     "a box with no app configured gets nothing at all, so its pushes are untouched"
+  out=$(CC_CONFIG=/dev/null "$SELF" gitargs https://github.com/myorg/myrepo.git 2>"$T/err"); rc=$?
+  k "$(t test -z "$out" -a $rc = 0 -a ! -s "$T/err")" \
+     "a box with no app configured gets nothing at all, silently and with exit 0, so its pushes are untouched"
   out=$(printf 'protocol=https\nhost=github.com\n\n' | CC_CONFIG=/dev/null "$SELF" get 2>&1 >/dev/null)
   k "$(t grep -q CC_GH_APP_ID <<<"$out")" "…and asking one for a credential says which keys are missing"
   out=$(printf 'protocol=https\nhost=evil.example.com\n\n' | G get 2>&1 >/dev/null); rc=$?
@@ -792,6 +808,30 @@ EOF
   out=$(askws wsp org-repo)
   k "$(t test "$(jq -c .repositories "$T/body")" = '["org-repo"]')" "an app token for that workspace is still minted for its ORG repositories alone — the personal remote is not in the list"
   k "$(t test -z "$(grep -F "$ptok" <<<"$out")")" "…and the org push is not handed the personal token"
+
+  # ── inside a member workspace: nothing is reachable from in there, and it SAYS so ──
+  # The seat's own path, not a flag on the host's fixture: the boundary binds ~/dev/<handle> and sets
+  # CC_MEMBER_SANDBOX=1, and binds NEITHER ~/.cc/config NOR ~/.cc/secrets — so this HOME holds the workspace and
+  # neither of those, and CC_CONFIG is unset, exactly as a seat runs. The silent 0 this replaces cost a member a
+  # turn of diagnosing git before finding the helper had printed nothing (2026-09-21).
+  seat="$T/seat"; mkdir -p "$seat/dev/wsm/.cc"; : > "$seat/dev/wsm/.cc/member-workspace"
+  git -C "$seat/dev/wsm" init -q 2>/dev/null
+  git -C "$seat/dev/wsm" remote add proj https://github.com/myself/seat-proj.git 2>/dev/null
+  S(){ env -u CC_CONFIG -u CC_GH_TOKEN_CACHE HOME="$seat" CC_MEMBER_SANDBOX=1 CC_ROLE=member "$SELF" "$@"; }
+  out=$(S gitargs https://github.com/myself/seat-proj.git wsm 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0)" "inside a member workspace gitargs FAILS instead of printing nothing: a push with no credential must not look like one that needs none"
+  k "$(t test -z "$out")" "…and wires nothing, because from in there there is nothing to wire"
+  k "$(t test "$(wc -l < "$T/err")" = 1)" "…saying it in ONE line on stderr"
+  k "$(t grep -q 'outside the boundary' "$T/err")" "…which names the reason: the config and the token are not reachable from inside"
+  k "$(t grep -q 'HOST pushes' "$T/err")" "…and the route that works — the host pushes for the workspace and lands its PRs"
+  k "$(t grep -q 'cc-sandbox github wsm' "$T/err")" "…or the workspace's own token, named for the workspace that asked"
+  out=$(S gitargs https://github.com/myorg/repo-a.git 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a -s "$T/err")" "…and an org remote in there is told the same, whether or not a workspace was named"
+  out=$(S gitargs git@github.com:myself/seat-proj.git wsm 2>&1); rc=$?
+  k "$(t test $rc = 0 -a -z "$out")" "…while an ssh remote in there is silent and 0 still: it has no helper to wire wherever it runs"
+  # It is the unreachable credential that is refused, not the flag: with a config to read, the same seat wires up.
+  out=$(HOME="$T" CC_CONFIG="$T/config" CC_GH_TOKEN_CACHE="$T/cache.json" CC_MEMBER_SANDBOX=1 "$SELF" gitargs https://github.com/myorg/repo-a.git wsa 2>"$T/err"); rc=$?
+  k "$(t test $rc = 0 -a -n "$out" -a ! -s "$T/err")" "…and a run that CAN read the config is untouched by any of this, sandbox or no sandbox"
 
   # ── a repository opens on the project's base, never on the branch that arrived first ──
   : > "$T/patched"; rm -f "$T"/cache*.json; echo 0 > "$T/mints"; : > "$T/body"
