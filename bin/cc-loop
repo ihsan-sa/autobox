@@ -381,8 +381,24 @@ worker_base(){   # $1 repo → the branch a worker is told never to touch and re
   case "$b" in track/*|'') b=main ;; esac
   printf '%s\n' "$b"; }
 
-row_title(){ "$BOARD" get "$repo" "$track" title 2>/dev/null | grep . || printf '%s\n' "$track"; }   # what the row is ABOUT; its name when the board has no title for it
+row_title(){ "$BOARD" get "$repo" "$track" title 2>/dev/null | grep . || printf '%s\n' "${track//-/ }"; }   # what the row is ABOUT; its name in words when the board has no title for it
+# THE DONE CARD. A person reads it, so it names the work by its title and prints no empty slot ("PR: ." was a real
+# card): $1 the PR link or nothing, $2 a sentence on the landing or nothing. The title still routes it to the thread.
+done_card(){ local s=""; [ -n "$1" ] && s="The PR is $1."; [ -n "$2" ] && s="${s:+$s }$2"
+  "$BIN/cc-notify" -t "$repo/$track done" --heading "Done: $(row_title)" "${s:-It finished without a PR.}"; }
 planner_line(){ printf 'loop: %s/%s %s — %s\n' "$repo" "$track" "$1" "$(printf '%s' "$2" | tr '\n' ' ')"; }   # $1 title · $2 message -> the ONE line the session gets
+# THE HEADING OF A STOP: the row's title and then what happened to it, as a sentence. Most stop titles already read
+# as a verb phrase after the title ("needs you", "hit its cap", "is running away"); the few that do not are said in
+# words here. The title itself is untouched — it routes the notice, names the failures-ledger record and goes to the
+# planner, and only the bold line a person sees is built from it.
+stop_headline(){ local said="$1" h
+  case "$1" in
+    waiting) said="is waiting" ;;
+    paused) said="is paused" ;;
+    errored) said="failed twice in a row" ;;
+    'delivery unconfirmed') said="finished, but the box could not confirm what it delivered" ;;
+  esac
+  h="$(row_title) $said"; printf '%s\n' "${h^}"; }
 # WHO THIS TRACK ANSWERS TO. `<repo>` is the session that dispatched it — the same target cc-reconcile's board
 # watchdog uses, so the planner's events all arrive by one door.
 orch_record(){   # written ONCE at start: the orch this loop was dispatched by (CC_SLACK_ALIAS in the dispatch environment), or no file
@@ -733,7 +749,27 @@ down still leaves the board write and the updates line, which is the half of thi
   t '…and a track the board has no row for says its own name rather than nothing at all' \
     "$(repo=titled track=nosuch BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" nosuch
   t 'neither done line spends the reader on an iteration count and a dollar figure' \
-    "$(grep -c '"\$repo/\$track done" "\$(row_title)\. PR:' "$0")" 2
+    "$(grep -c '^      done_card "\$(' "$0")" 2
+  t '…and a track the board has no title for is named in words, not by its hyphenated name' \
+    "$(repo=titled track=no-such-row BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" "no such row"
+  dc(){ ( repo=titled track=t1 BOARD="$BIN/cc-board" HOME="$d/bh" BIN="$d/dcbin"; done_card "$@" ) >/dev/null; cat "$d/dc.args"; }
+  mkdir -p "$d/dcbin"; printf '#!/usr/bin/env bash\nprintf "%%s|" "$@" > "%s"\n' "$d/dc.args" > "$d/dcbin/cc-notify"; chmod +x "$d/dcbin/cc-notify"
+  t 'the done card is headed by the row title and still routed by repo/track' \
+    "$(dc https://x/pull/7 "It's queued to land, no 👍 needed.")" \
+    "-t|titled/t1 done|--heading|Done: worker stop reaches the planner|The PR is https://x/pull/7. It's queued to land, no 👍 needed.|"
+  t '…and with no PR link it prints no empty "PR: ." slot' \
+    "$(dc '' 'No PR is open for it, so there is nothing to land.')" \
+    "-t|titled/t1 done|--heading|Done: worker stop reaches the planner|No PR is open for it, so there is nothing to land.|"
+  # ── A STOP'S BOLD LINE IS A SENTENCE ── the row's title and what happened to it, with no colon between two
+  # fragments; the four titles that do not read as a verb phrase after a title are said in words instead.
+  sh_(){ ( repo=titled track=t1 BOARD="$BIN/cc-board" HOME="$d/bh"; stop_headline "$1" ); }
+  t 'a stop heading reads as a sentence rather than "<title>: <slug>"' \
+    "$(sh_ 'needs you')" "Worker stop reaches the planner needs you"
+  t '…and a bare word that is not a verb phrase is said in words' \
+    "$(sh_ waiting)|$(sh_ paused)|$(sh_ errored)" \
+    "Worker stop reaches the planner is waiting|Worker stop reaches the planner is paused|Worker stop reaches the planner failed twice in a row"
+  t '…and the notice still ROUTES on the untouched title, so the ledger and the thread are unmoved' \
+    "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0" | grep -cF -- '-t "$repo/$track $title"')" 1
   # ── THE SHARED DISPATCH TEXT REACHES THE WORKER ── `cc <repo> <track> --go` launches THIS loop's session, and its
   # prompt is built above, not in `cc`, so `cc selfcheck` (which covers the planning, orch and interactive-track
   # variants) cannot see this one. Both halves are asserted: the prompt carries the text, and with the file gone the
@@ -900,9 +936,9 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" heard=no whose=""
   log "failures ledger ($repo): $(stop_record "$code" "$title" "$msg")"   # the tool that saw it writes it down; the exit is decided already
   # THE BOARD IS WRITTEN FIRST AND THE UPDATES LINE GOES OUT LAST, whatever the broker does in between: a stop that
   # reached nobody is worse than the ping this replaces, so neither of those two depends on it.
-  tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose="  ($(stop_target)'s session has this one.)"; }
+  tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose=" $(stop_target)'s session has been told."; }
   log "the stop went to $(stop_target)'s session: $heard"
-  "$BIN/cc-notify" -p "$(stop_prio "$heard")" -t "$repo/$track $title" "$msg$whose"; exit "$code"; }
+  "$BIN/cc-notify" -p "$(stop_prio "$heard")" -t "$repo/$track $title" --heading "$(stop_headline "$title")" "$msg$whose"; exit "$code"; }   # a person reads the row's title; the title routes
 # THE PROJECT PAUSE. `cc-pause on <repo>` parks a whole project; what it does to a loop that is ALREADY RUNNING is
 # signal it, so this is read from the TERM trap and again at the top of every iteration — the flag can appear at any
 # moment. Standing down leaves the board honest (`queued`: there is work here and nobody is on it) and does NOT page:
@@ -946,7 +982,9 @@ while [ $i -lt "$MAXI" ]; do
   stopped  # …the stop file, written by a person or a session while the last iteration ran
   tiered   # …and the spend tier the same way, for iteration 2 onwards
   if p=$("$BIN/cc-limit" status 2>/dev/null); then log "$p — waiting before starting (another run hit it)"   # a stamp any run on this box set
-    "$BIN/cc-limit" wait || stop 8 "waiting" "Claude $p — longer than cc-loop waits (CC_LIMIT_MAX_WAIT); rerun with: cc $repo $track --go \"\""
+    hm=$(sed -n 's/.*until \([0-9][0-9]:[0-9][0-9]\)Z.*/\1/p' <<<"$p")   # status speaks UTC; a person reads local time
+    at=$([ -n "$hm" ] && "$BIN/cc-time" slack "$(date -u +%Y-%m-%d)T$hm:00Z" 2>/dev/null || echo "${hm:-later}${hm:+Z}")
+    "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $at, which is longer than the loop waits. To start it again: cc $repo $track --go \"\""
     parked; stopped; fi   # that wait can be hours: a pause or a stop file written during it is read before anything is charged (review of #541)
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"
   cont=""; [ "$rounds" -gt 0 ] && cont=" This loop passed its original step limit and carried on because you are still committing work — pick up exactly where the journal stops."
@@ -974,8 +1012,8 @@ while [ $i -lt "$MAXI" ]; do
   if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
     resets=$(date -u -d "@${lim#LIMIT }" +%H:%M)
     log "usage limit — waiting until ${resets}Z, then rerunning iteration $i"
-    [ "$limited" = 1 ] || { "$BIN/cc-notify" -t "$(hostname) limit" "Claude usage limit hit by $repo/$track — the loop is waiting, and resumes at ${resets}Z."; limited=1; }
-    "$BIN/cc-limit" wait || stop 8 "waiting" "Claude usage limit until ${resets}Z — longer than cc-loop waits (CC_LIMIT_MAX_WAIT); rerun with: cc $repo $track --go \"\""
+    [ "$limited" = 1 ] || { "$BIN/cc-notify" -t "$(hostname) limit" "$(row_title) hit the Claude usage limit. It's waiting, and starts again at $("$BIN/cc-time" slack "${lim#LIMIT }" 2>/dev/null || echo "${resets}Z")."; limited=1; }   # local time: a person reads it
+    "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $("$BIN/cc-time" slack "${lim#LIMIT }" 2>/dev/null || echo "${resets}Z"), which is longer than the loop waits. To start it again: cc $repo $track --go \"\""
     i=$((i-1)); continue; fi
   limited=0; "$BIN/cc-limit" clear   # the API answered: whatever else went wrong, it was not a limit
   cost=$(jq -r '.total_cost_usd // 0' "$out" 2>/dev/null); iserr=$(jq -r '.is_error // false' "$out" 2>/dev/null)
@@ -1016,7 +1054,7 @@ while [ $i -lt "$MAXI" ]; do
       # WHAT FINISHED, not how many turns it took to finish it: the iteration count and the dollar figure are the
       # loop's own bookkeeping and are in the board note and the log above. A person reading #<repo>-updates wants
       # the row (comms audit 2026-09-07).
-      "$BIN/cc-notify" -t "$repo/$track done" "$(row_title). PR: $(jq -r '.pr_url // ""' <<<"$rec"). $(jq -r '.landing.message // ""' <<<"$rec")"
+      done_card "$(jq -r '.pr_url // ""' <<<"$rec")" "$(jq -r '.landing.message // ""' <<<"$rec")"
       exit 0
     else
       log "DONE"; dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?   # captured, never `| tail -1`: the pipe dropped the status
@@ -1042,18 +1080,20 @@ while [ $i -lt "$MAXI" ]; do
         case "$lpr" in
           ''|*[!0-9]*) log "grant: $repo lands its own PRs, but this track has no PR number to queue (board pr='$lpr')" ;;
           *) if lo=$("${CC_LAND:-$BIN/cc-land}" queue "$repo" "$lpr" --who "cc done" ${lq[@]+"${lq[@]}"} 2>&1); then   # CC_LAND: test hook
-               log "grant: PR #$lpr queued to land — ${lo//$'\n'/ }"; landed=" Landing queued (no 👍 needed)."
+               log "grant: PR #$lpr queued to land — ${lo//$'\n'/ }"; landed="It's queued to land, no 👍 needed."
              else                                    # queueing is not merging: nothing has happened, and the card is
                log "grant: PR #$lpr would not queue — ${lo//$'\n'/ }"   # still there for a 👍. Said in the one notice
-               landed=" The landing would not queue, so nothing is merging — 👍 the card."
+               landed="The landing queue would not take it, so nothing is merging. A 👍 on the card lands it."
              fi ;;
         esac
       fi
-      "$BIN/cc-notify" -t "$repo/$track done" "$(row_title). PR: $("$BOARD" get "$repo" "$track" pr)$landed"; exit 0
+      done_card "$("$BOARD" get "$repo" "$track" pr)" "$landed"; exit 0
     fi
   fi
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
-    stop 3 "needs you" "$q  (answer: append it to $ST/task.md, drop the STATUS line from $ST/progress.md, then: cc $repo $track --go \"\")" waiting; fi
+    # The question, then how to answer it, as sentences rather than an aside in brackets. The two paths stay: whoever
+    # answers has to type them, and the planning session this goes to has no other way to find the worker's files.
+    stop 3 "needs you" "$q  To answer it, put the answer at the end of $ST/task.md, take the STATUS line out of $ST/progress.md, then run: cc $repo $track --go \"\"" waiting; fi
   rn=$(refusal_next "$out" "$out.err" "$m"); rnrc=$?; rwhy=${rn#*$'\t'}; nx=""; [ "$rnrc" = 0 ] && nx=${rn%%$'\t'*}
   case "$(refusal_step "$rnrc" "$moved")" in
     rerun)   # nothing to show for it: the same model asked again gives the same answer

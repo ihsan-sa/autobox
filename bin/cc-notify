@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # cc-notify — reach the owner. Always logs to ~/.cc/notify.log; pushes via ntfy and/or Slack when the KIND says so.
-#   cc-notify [-t title] [--kind <kind>] [--owner] [--decision] [--id <producer-id>] [-p …] "message"   (or message on stdin)
+#   cc-notify [-t title] [--heading <text>] [--kind <kind>] [--owner] [--decision] [--id <producer-id>] [-p …] "message"   (or message on stdin)
+#     --heading is the bold line a person sees in place of the title. The title still routes, dedups and names the kind.
 #     --id names the EVENT (land:<repo>:<pr>:<outcome>, credential:<member>, …): cc-slack's ledger sends it once, ever —
 #     a replay of an id Slack already accepted is logged `dedup` and reaches no door, phone included (rec 4, 2026-09-08)
 #   cc-notify report [today|yesterday|YYYY-MM-DD]   how much was sent to the owner that day, at which rungs
@@ -429,6 +430,11 @@ PY
   # `sent <id>` with the first code and whose `post` exits with the second, logging both calls as the stub above does.
   idstub(){ printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\ncase "$1" in sent) exit %s;; esac\nexit %s\n' "$T/slack.args" "$1" "$2" > "$NH/bin/cc-slack"
             chmod +x "$NH/bin/cc-slack"; }
+  # --heading: a person reads the work's name, while the title still routes the post to its thread
+  idstub 1 0; : > "$T/slack.args"
+  N --heading "Done: a plain title" -t "demorepo/w1 done" "The PR is open."
+  k "$(yes_ grep -q -- '^post --route demorepo/w1 done \*Done: a plain title\*' <<<"$(args)")" "--heading is the bold line and the title still routes"
+  k "$(no_ grep -q -- '\*demorepo/w1 done\*' <<<"$(args)")" "…and the title itself is not shown"
   idstub 1 0
   N --owner -t alice --id credential:alice "alice needs a credential minted"
   k "$(yes_ grep -q -- '^sent credential:alice$' <<<"$(args)")" "an --id is asked of cc-slack's ledger first (cc-slack sent <id>)"
@@ -471,7 +477,7 @@ PY
 }
 
 BOX="$(cfg CC_BOX)"; BOX="${BOX:-$(hostname -s)}"   # this box's name (override with CC_BOX in ~/.cc/config): default title + ntfy topic prefix
-title="$BOX"; prio="default"; decision=0; want=""; pid=""
+title="$BOX"; prio="default"; decision=0; want=""; pid=""; heading=""
 case "${1:-}" in
   setup)
     NTFY_TOPIC="$(cfg NTFY_TOPIC)"
@@ -492,7 +498,7 @@ owner=0; from=""; [ "${CC_ROLE:-}" = member ] && owner=1
 d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
   [ -f "$d/.cc/member-facing" ] && { owner=1; from=${d##*/}; break; }; d=${d%/*}; done
 [ -n "$from" ] && title="$from escalation"
-while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;;
+while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; --heading) heading="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;;
   --kind) want="$2"; shift 2;;
   --id) pid="$2"; shift 2;;
   --decision) decision=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
@@ -598,7 +604,7 @@ tried=0
 # Until 2026-09-07 this block sat ABOVE all routing and fired on every call that had a topic configured, so the ladder
 # — which only ever existed on the Slack side — never reached the push at all.
 push_ntfy(){ tried=$((tried + 1))   # $1 names the door for the log: the push proper, or the fallback below
-  if printf '%s' "$msg" | post "$NTFY_SERVER/$NTFY_TOPIC" -H "Title: $title" -H "Priority: $prio" -H "Tags: robot"
+  if printf '%s' "$msg" | post "$NTFY_SERVER/$NTFY_TOPIC" -H "Title: ${heading:-$title}" -H "Priority: $prio" -H "Tags: robot"
     then took "$1"; else echo "cc-notify: ntfy push failed (logged)" >&2; fi; }
 [ "$to_ntfy" = 1 ] && push_ntfy ntfy
 if [ "$to_slack" = 1 ]; then   # one channel: the bot, else the webhook
@@ -611,10 +617,10 @@ if [ "$to_slack" = 1 ]; then   # one channel: the bot, else the webhook
   elif [ "$rung" = 4 ]; then dest=(-c "#${SLACK_ALERTS:-alerts}")
   else dest=(--route "$title"); [ "$rung" = 1 ] && dest+=(--mention); fi   # rung 1: the main channel, @-mentioned
   [ -n "$pid" ] && dest+=(--id "$pid")   # the event's name: cc-slack posts it once and answers a replay with the ts it has
-  if [ -n "${SLACK_BOT_TOKEN:-}" ] && "$HOME/bin/cc-slack" post "${dest[@]}" "$(printf '*%s*%s\n%s' "$title" "$bang" "$msg")" >/dev/null 2>&1; then
+  if [ -n "${SLACK_BOT_TOKEN:-}" ] && "$HOME/bin/cc-slack" post "${dest[@]}" "$(printf '*%s*%s\n%s' "${heading:-$title}" "$bang" "$msg")" >/dev/null 2>&1; then
     took slack   # posted by the bot (owner DM, project channel or SLACK_CHANNEL)
   elif [ -n "${SLACK_WEBHOOK:-}" ] &&
-       jq -cn --arg t "$title" --arg m "$msg" --arg b "$bang" \
+       jq -cn --arg t "${heading:-$title}" --arg m "$msg" --arg b "$bang" \
          'def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
           {text: ("*" + ($t|esc) + "*" + $b + "\n" + ($m|esc))}' |
        post "$SLACK_WEBHOOK" -H 'Content-Type: application/json'; then

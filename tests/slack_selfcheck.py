@@ -3997,22 +3997,22 @@ def run_selfcheck():
     # above whatever is running. 🪫 while the box is holding spend back, 🔋 at autonomous — which used to print no row
     # at all, so the owner opened the tab at the tier the box actually runs at and read nothing about it (2026-09-11:
     # "i dont see the current mode on the home page or the dashboard").
-    htier = hblocks(dict(hfix, spend_tier="essential", tier="spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start, one at a time, cheapest model, one review each"))
-    hauto = hblocks(dict(hfix, spend_tier="autonomous", tier="spend tier: autonomous — discovers, fixes and explores"))
+    htier = hblocks(dict(hfix, spend_tier="essential", tier="The spend tier is essential, since 2026-09-11 01:00. Only critical rows start, one at a time, cheapest model, one review each"))
+    hauto = hblocks(dict(hfix, spend_tier="autonomous", tier="The spend tier is autonomous. Discovers, fixes and explores"))
     hrow = lambda bs, mark: any(b.get("type") == "section" and (b.get("text") or {}).get("text", "").startswith(mark) for b in bs)
     check("home_parts (c') the spend tier is one row above the running rows at EVERY tier, in cc-tier's words — 🪫 "
           "while the box is holding spend back, 🔋 at autonomous, which used to print nothing at all; a state carrying "
           "no tier (cc-tier could not answer) still prints no row, and the reference view has none",
           hfix.get("tier") is None and not hrow(hblocks(hfix), "🪫") and not hrow(hblocks(hfix), "🔋")
-          and hrow(htier, "🪫 *spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start")
-          and hrow(hauto, "🔋 *spend tier: autonomous — discovers, fixes and explores")
+          and hrow(htier, "🪫 *The spend tier is essential, since 2026-09-11 01:00. Only critical rows start")
+          and hrow(hauto, "🔋 *The spend tier is autonomous. Discovers, fixes and explores")
           and hbudget(htier) and hvocab(htier) and hbudget(hauto) and hvocab(hauto))
     # …and home_tier, the input behind it: the word AND cc-tier's line at every tier (home.json's `spend_tier` is the
     # dashboard's field), and a cc-tier that cannot answer is neither — never a guessed tier.
     _runt = EFFECTS.run_impl
     try:
-        tsay = {"essential": "spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start",
-                "autonomous": "spend tier: autonomous — discovers, fixes and explores"}
+        tsay = {"essential": "The spend tier is essential, since 2026-09-11 01:00. Only critical rows start",
+                "autonomous": "The spend tier is autonomous. Discovers, fixes and explores"}
         tier_run = lambda word, rc=0: (lambda cmd, **kw: types.SimpleNamespace(
             returncode=rc, stdout=(word if str(cmd[-1]).endswith("cc-tier") else tsay.get(word, "")) + "\n", stderr=""))
         EFFECTS.run_impl = tier_run("essential"); tess = home_tier()
@@ -4154,7 +4154,7 @@ def run_selfcheck():
               "channels": [{"name": "top", "depth": 0}, {"name": "deep", "depth": 9},
                            {"name": "junk", "depth": "x"}]}) if b["type"] == "section"
               and "#top" in b["text"]["text"]).split("\n")] == [0, 2 * HOME_DEPTH, 0])
-    hfull = dict(hfix, spend_tier="essential", tier="spend tier: essential — only critical rows start",
+    hfull = dict(hfix, spend_tier="essential", tier="The spend tier is essential. Only critical rows start",
                  tracks=list(hfix["tracks"]) + [{"state": "idle", "name": "abox/notes", "detail": "idle 2h", "rank": 3}],
                  suborchs=[{"repo": "abox", "alias": "carpet"}], subagents=[{"target": "abox", "task": "fix the band"}],
                  landings=[{"repo": "abox", "pr": "9", "stage": "queued"}],
@@ -6479,9 +6479,9 @@ def run_selfcheck():
           "to the control session in the card's thread; an empty ask, a capped workspace (ASK_CAP an hour) and the main "
           "socket are refused and post nothing; the answer names where it went and says not to ask the owner to relay",
           r_ask.get("ok") and r_ask.get("card") == "5.5" and "do not ask the owner to relay" in r_ask.get("text", "")
-          and len(card_ask) == 1 and card_ask[0][0] == "CTHR" and card_ask[0][1].startswith("🙋 UNTRUSTED member ask")
-          and "`alice` asks — *a repo*" in card_ask[0][1] and "&lt;!channel&gt; ping @\u200bowner '''" in card_ask[0][1]
-          and "carries every reply here to #alice" in card_ask[0][1]
+          and len(card_ask) == 1 and card_ask[0][0] == "CTHR" and card_ask[0][1].startswith("🙋 `alice` asks: *a repo*\n")
+          and "UNTRUSTED" not in card_ask[0][1] and "&lt;!channel&gt; ping @\u200bowner '''" in card_ask[0][1]
+          and "passes it to alice's session in #alice." in card_ask[0][1]
           and told_ask == [(CTL, {"type": "message", "meta": {"chat_id": "CTHR", "thread_ts": "5.5", "ts": "5.5", "user": "cc-slack",
                                                                   "role": "owner", "channel": f"#{CTL}-threads", "target": CTL},
                                    "content": told_ask[0][1]["content"] if told_ask else None}, False)]
@@ -6501,8 +6501,8 @@ def run_selfcheck():
           "and an ask past ASK_STALE carries no more",
           r_ans.get("ok") and r_ans.get("ask") == {"target": "alice", "result": "delivered", "name": "alice"}
           and len(carried) == 1 and carried[0][0] == "CAL" and carried[0][1].startswith(f"💬 {CTL} answered your ask *a repo* (<https://x.slack.com/CTHR/5.5|thread>)")
-          and "push as @\u200bowner" in carried[0][1] and "another `cc-slack ask`" in carried[0][1]
-          and handed == [("alice", {"type": "message", "content": carried[0][1],
+          and "push as @\u200bowner" in carried[0][1] and "another `cc-slack ask`" not in carried[0][1]
+          and handed == [("alice", {"type": "message", "content": carried[0][1] + "\n(A follow-up is another `cc-slack ask`.)",
                                     "meta": {"chat_id": "CAL", "thread_ts": "5.5", "ts": "5.5", "user": "box", "role": "owner",
                                              "channel": "#alice", "target": "alice", "from": CTL}}, True)]
           and hop_other == {"target": "alice", "result": "not-the-seat"} and hop_none is None and hop_chan is None

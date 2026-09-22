@@ -932,6 +932,21 @@ def board_read(path):
     return ccboard().read(path)
 
 
+def row_title(repo, track):
+    """What a person calls a row: its board title, else its name in words. A hyphenated name means nothing to him."""
+    try:
+        ti = str((board_read(f"{BOARDS}/{repo}.json").get("tracks") or {}).get(track, {}).get("title") or "")
+    except Exception:
+        ti = ""
+    return ti or re.sub(r"[-_]", " ", track)
+
+
+def spoken_hours(sec):
+    """A span as you would say it aloud: "an hour", "12 hours", "3 days"."""
+    h = max(1, round(sec / 3600))
+    return "an hour" if h == 1 else f"{h} hours" if h < 48 else f"{round(h / 24)} days"
+
+
 def boards():
     """Every real board, sorted: (path, board or None if unreadable). A `_cc<suite><pid>` board is a board only to
     a process under <pid> (cc-board `reals`)."""
@@ -1694,13 +1709,20 @@ def failures_line(named=True):
     recs, cl = int(m.group(1)), int(m.group(2))
     ep = sh(sib("cc-failures"), "eligible", timeout=30)
     rows = [ln.split("\t") for ln in (ep.stdout or "").splitlines() if ep is not None and ln.strip()]
-    kinds = [f"{r[2]} ({r[4].split(' ')[0]}, {r[6] if len(r) > 6 else 'unclaimed'})" for r in rows[:3] if len(r) > 4]
-    line = f"🧾 Failures: {recs} record{'' if recs == 1 else 's'} in {cl} cluster{'' if cl == 1 else 's'}; "
+    def held(c):   # the claim column, said: "unclaimed 3d 6h" -> "nobody on it for 3 days"
+        if not c.startswith("unclaimed"):
+            return "someone has taken it"
+        sec = sum(int(n) * {"d": 86400, "h": 3600, "m": 60}[u] for n, u in re.findall(r"(\d+)([dhm])", c))
+        return f"nobody on it for {spoken_hours(sec)}" if sec else "nobody on it"
+    kinds = [f"{r[2].split('/')[-1].replace('-', ' ')} ({r[4].split(' ')[0]} times, {held(r[6] if len(r) > 6 else 'unclaimed')})"
+             for r in rows[:3] if len(r) > 4]
     if not named:
-        return f"🧾 Failures: {len(rows)} crossed the rule." if rows else ""
+        return (f"🧾 {len(rows)} kind{' of failure needs' if len(rows) == 1 else 's of failure need'} a look." if rows else "")
+    line = f"🧾 The failure ledger holds {recs} record{'' if recs == 1 else 's'} in {cl} group{'' if cl == 1 else 's'}"
     if not rows:
-        return line + "none has crossed the rule."
-    return line + f"{len(rows)} crossed the rule: " + "; ".join(kinds) + (f"; and {len(rows) - 3} more." if len(rows) > 3 else ".")
+        return line + ", and none needs a look."
+    return (line + f". {len(rows)} happened often enough to need a look: " + "; ".join(kinds)
+            + (f"; and {len(rows) - 3} more." if len(rows) > 3 else "."))
 
 
 def digest_text(snap=None, phone=False):
@@ -1778,9 +1800,8 @@ def digest_text(snap=None, phone=False):
                                             if "not available" in ms else "its sessions return by themselves when it lifts."))
     tp = sh(sib("cc-tier"), "line", timeout=10)
     tier = (tp.stdout or "").strip() if tp is not None and tp.returncode == 0 else ""
-    if tier and not tier.startswith("spend tier: autonomous"):
-        tier = re.split(r" \(| — ", tier)[0] if phone else tier   # the phone one: the word, not since when or what it means
-        out.append(f"🪫 {tier[0].upper() + tier[1:]}.")
+    if tier and not tier.startswith("The spend tier is autonomous"):   # cc-tier line: "The spend tier is <word>, since <local>. <meaning>."
+        out.append("🪫 " + (re.split(r",|\. ", tier)[0] + "." if phone else tier))   # the phone one: the word, not since when or what it means
     fl = failures_line(named=not phone)   # the ledger's one line (#461): what it holds and what crossed the rule, or nothing
     if fl:
         out.append(fl)
@@ -2076,8 +2097,10 @@ def main(argv):
             keep[k] = first                             # to send, no memo, and the next pass marks the row merged
             if stood >= pend_after and t0 - last >= pend_after:
                 last = t0
-                alert(f"⏳ {repo}/{track} — finished, PR open, unlanded for {stood / 3600:.0f}h — "
-                      f"nobody has picked it up" + (f" · {f['pr']}" if f.get("pr") else ""))
+                # #alerts is every project's, so the line names the project as well as the work: without it nobody
+                # reading the channel can tell whose this is, and a PR link is not always there to say.
+                alert(f"⏳ {repo}: {row_title(repo, track)} has been waiting to land for {spoken_hours(stood)}, "
+                      f"and nobody has picked it up." + (f" {f['pr']}" if f.get("pr") else ""))
             if last:
                 keep[ak] = last
             if old.get(ok_):
@@ -2888,6 +2911,14 @@ def selfcheck():
         json.dump(led, open(seenp, "w"))
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: past the window nobody picked it up, so #alerts gets one line", alerted() == a0 + 1)
+        nag = [ln for ln in open(f"{th}/notify.log").read().splitlines() if ln.startswith("alerts")][-1]
+        ok("end to end: …a plain sentence with the span said aloud and the PR link, and no slug for a name",
+           "has been waiting to land for 5 hours, and nobody has picked it up. https://example.invalid/pr/9" in nag
+           and f"{repo}/t2" not in nag)
+        ok("end to end: …and it names the project, because #alerts carries every project's lines",
+           nag.startswith(f"alerts\t⏳ {repo}: "))
+        ok("a span is said as you would say it: an hour, hours, then days",
+           [spoken_hours(x) for x in (600, 3600, 12 * 3600, 3 * 86400)] == ["an hour", "an hour", "12 hours", "3 days"])
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: …one per window, however many times the timer fires in it — and still one offer",
            alerted() == a0 + 1 and offered() == 1)
@@ -3615,13 +3646,13 @@ def selfcheck():
             "c-3\tdemo\tfailure-detection/person-first\tcritical: person-first\t3 episode(s)\t2026-09-10T16:57..2026-09-11T03:30\tunclaimed 1d 9h\n"
             "c-4\tdemo\tboard-row/x\t3 episodes in 14d\t3 episode(s)\t2026-09-08T06:33..2026-09-11T17:20\tunclaimed 8h 59m\n")
         ok("…the failure ledger is one line: what it holds and what crossed the rule, three kinds named with episodes and claim word, the rest counted",
-           "🧾 Failures: 123 records in 76 clusters; 4 crossed the rule: guard-policy/permitted-text-refused (11, unclaimed 3d 6h); "
-           "notification/false-action-needed (9, claimed 2h ago i-ab12cd34); failure-detection/person-first (3, unclaimed 1d 9h); and 1 more."
+           "🧾 The failure ledger holds 123 records in 76 groups. 4 happened often enough to need a look: permitted text refused (11 times, "
+           "nobody on it for 3 days); false action needed (9 times, someone has taken it); person first (3 times, nobody on it for 33 hours); and 1 more."
            in digest_text({}))
         open(f"{td}/fmetrics", "w").write("records: 5 (5 confirmed)  clusters: 2  eligible: 0\n"); open(f"{td}/feligible", "w").close()
-        ok("…a ledger with records and nothing eligible says so", "🧾 Failures: 5 records in 2 clusters; none has crossed the rule." in digest_text({}))
+        ok("…a ledger with records and nothing eligible says so", "🧾 The failure ledger holds 5 records in 2 groups, and none needs a look." in digest_text({}))
         open(f"{td}/fmetrics", "w").write("records: 0 (0 confirmed)  clusters: 0  eligible: 0\n")
-        ok("…an empty ledger is no line at all", "Failures:" not in digest_text({}))
+        ok("…an empty ledger is no line at all", "🧾" not in digest_text({}))
         open(f"{td}/stubs/cc-failures", "w").write("#!/bin/sh\nexit 1\n")   # a box whose cc-failures cannot answer
         dnone = digest_text({})
         ok("…and a box whose cc-failures cannot answer gets no line either, and the report still prints", "Failures:" not in dnone and dnone.startswith("*fixturebox* today"))
@@ -3653,7 +3684,7 @@ def selfcheck():
             "cc-config": f'case "$2" in CC_BOX) echo fixturebox;; CC_DIGEST_LINK) cat "{tf}/link";; *) echo "$3";; esac',
             "cc-spend": "echo 'total 538.4 40.2'", "cc-limit": "echo 'is at 91% of its 5-hour window'",
             "cc-model": "echo 'opus until probe — fable is not available to this account'",
-            "cc-tier": "echo 'spend tier: essential (since 2026-09-14T18:22:47Z) — only what the owner asked for'",
+            "cc-tier": "echo 'The spend tier is essential, since 2026-09-14 14:22. Only what the owner asked for.'",
             "cc-scope": "echo '• 📋 91 asks of yours still open (5 merged but not delivered, 2 asked more than once)'",
             "cc-failures": f'case "$1" in metrics) echo "records: 123 (120 confirmed)  clusters: 76  eligible: 4";; '
                            f'eligible) cat "{tf}/feligible";; esac'}))
@@ -3694,16 +3725,16 @@ def selfcheck():
            "More on <https://example.slack.com/app-home|the dashboard>: why each stopped, what moved, your 5 📌." in ptext)
         ok("…what it left out is not listed — stopped notes, shipped titles, pins, failure kinds, held names, the tier's gloss, the asks' "
            "breakdown — while the whole report keeps every one",
-           all(x not in ptext and x in full for x in ("committed nothing", "shipped piece number", "archives/C1", "kind-0/symptom",
+           all(x not in ptext and x in full for x in ("committed nothing", "shipped piece number", "archives/C1", "symptom of some length (",
                                                      "nightly export", "since 2026-09-14", "5 merged but not delivered"))
-           and "🧾 Failures: 4 crossed the rule." in ptext and "🪫 Spend tier: essential.\n" in ptext
+           and "🧾 4 kinds of failure need a look." in ptext and "🪫 The spend tier is essential.\n" in ptext
            and "⏳ Claude is at 91% of its 5-hour window." in ptext)
         ok("…and the model line names the outage's KIND — a Fable-only one is not a limit, and its sessions come back by themselves",
            "🔁 Model: opus until probe — fable is not available to this account — not a limit; its sessions are on the next model and return by themselves when it answers again." in full
            and "🔁" not in ptext)
         open(f"{tf}/feligible", "w").close()
         ok("…and a ledger where nothing crossed the rule is no line in the phone one, while the whole report still says so",
-           "Failures" not in digest_text(snap, phone=True) and "none has crossed the rule." in digest_text(snap))
+           "🧾" not in digest_text(snap, phone=True) and "none needs a look." in digest_text(snap))
         open(f"{tf}/link", "w").write("the dashboard\n")
         ok("…a CC_DIGEST_LINK that is not an https URL is no link: the line names the Home tab",
            "More on the Home tab: why each stopped" in digest_text(snap, phone=True) and "<" not in digest_text(snap, phone=True))

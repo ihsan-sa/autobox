@@ -2691,8 +2691,8 @@ def stop_who(L):
     and every automatic round it had is spent (run_job), so the move is a person's; what differs is where they look.
     A review stop sends them to the verdict already on the PR, anything else to the thing that failed."""
     if L.stopped == "review":
-        return "yours: the verdict is on the PR" if L.verdict else "yours: re-queue to buy a read"
-    return "yours: fix it, then re-queue"
+        return "The reviewer's notes are on the PR" if L.verdict else "Re-queue it to get a review"
+    return "Fix it, then re-queue it"
 
 
 def pr_link(L):
@@ -2737,6 +2737,23 @@ def stop_rounds(L, job):
     return f"after {n} automatic fix iteration{'s' if n > 1 else ''} on this change" if n else ""
 
 
+# The step names (walk) in words a person reads: which piece of bookkeeping wants a hand, and where a deploy stopped.
+# "the deploy stopped at daemons" told the owner nothing he could act on. A step with no word here is named as it is.
+BOOKKEEPING = {"card": "turning the approval card to landed", "board": "closing the board row",
+               "ledger": "marking what the task asked for as merged"}
+DEPLOY_STAGE = {"install": "while installing the new code", "units": "while switching on a service the change added",
+                "restart": "while restarting what runs the changed code",
+                "daemons": "while restarting the box's long-running programs"}
+
+
+def in_words(names, table):
+    """The steps as a phrase: "closing the board row", or "closing the board row and marking what the task asked for as merged"."""
+    said = [table.get(n, n) for n in names]
+    if len(said) > 1:
+        return ", ".join(said[:-1]) + " and " + said[-1]
+    return said[0] if said else "a bookkeeping step"
+
+
 def result_of(L, rc, job, tail):
     """What this landing means, in one sentence the owner can act on, and whether the PR is in. A stop says it in
     one line under STOP_CARD_MAX (stop_card) and hands the rest to `detail`, which the ledger keeps."""
@@ -2745,18 +2762,20 @@ def result_of(L, rc, job, tail):
     # Which tree the gates ran on, in the sentence the owner reads: the merge, a head that already holds the base, or a merge git could not build. Asked lazily: a landing that stopped before the gates has no answer.
     def on():
         if not L.pr:
-            return "gated"
+            return "tested it"
         if L.merged_on:
-            return f"gated on {L.base()} merged with the branch"
+            return f"tested it with {L.base()} merged into the branch"
         if L.merge_unbuilt:
-            return "gated on the branch alone — the merge could not be built"
-        return f"gated on the branch, which already holds {L.base()}"
+            return "tested the branch on its own, because git could not build the merge"
+        return f"tested the branch, which already had {L.base()} in it"
     if rc == 0:
-        short = f"{what}: landed ✅ — {on()}, merged, deployed, and its check ran here and passed."
+        short = f"{what}: landed ✅. I {on()}. It's merged and deployed, and its check passed here."
     elif rc == COSMETIC:
-        short = f"{what}: landed ✅ — {on()}, merged and deployed; a bookkeeping step wants a hand."
+        short = (f"{what}: landed ✅. I {on()}. It's merged and deployed, but {in_words(L.hurt, BOOKKEEPING)} did "
+                 f"not go through. Running the same landing again picks up just that.")
     elif rc == UNVERIFIED:
-        short = f"{what}: merged and deployed ✅ — but nothing here could confirm you can see it, so the ask stays open."
+        short = (f"{what}: merged and deployed ✅, but I couldn't check that it's really showing for you, so I've "
+                 f"left your request open.")
     elif L.stopped in ("review", "gates", "load", "merge"):
         # review belongs here, not in the deploy branch: it runs before the merge, so a stop leaves the PR out.
         short = stop_card(L)
@@ -2766,12 +2785,12 @@ def result_of(L, rc, job, tail):
         detail = "; ".join(x for x in (f"{L.stopped}: {' '.join((L.why or '').split())[:400]}",
                                        stop_rounds(L, job), f"try {tries} of {LAND_TRIES}") if x)
     else:
-        short = (f"{what}: merged, but the deploy stopped at {L.stopped} ❌ after {tries} tries — the box is still "
-                 f"running the old code.")
+        short = (f"{what}: merged, but the deploy stopped {DEPLOY_STAGE.get(L.stopped, f'at {L.stopped}')} ❌ after "
+                 f"{tries} tries. The box is still running the old code.")
     # A unit whose restart the manifest keeps for the owner is on the old code, and the sentence carries the command. Only the landing that raised the ask says it.
     ask = ""
     if L.owner_asks and rc in (0, COSMETIC, UNVERIFIED):
-        ask = (f"⚠️ yours to restart: {', '.join(L.owner_asks)} — until then the box runs the old code for "
+        ask = (f"⚠️ Please restart {', '.join(L.owner_asks)}. Until then the box runs the old code for "
                f"{'them' if len(L.owner_asks) > 1 else 'it'}.")
         short += " " + ask
     # ...and the ask on its own: the one line addressed to a person, routed by say_result when the job has no thread.
@@ -3429,15 +3448,17 @@ def queue_task(argv):
     grant, _ = sh([f"{BIN}/cc", "lands", repo])
     url = rec.get("pr_url")
     pr = re.fullmatch(r"https://[^/\s]+/[^/\s]+/[^/\s]+/pull/([0-9]+)", url or "")
-    status, message, result = "approval", "PR and approval card await approval", 0
+    status, message, result = "approval", "It's waiting for your 👍 on the approval card.", 0
     if grant == 2:
-        status, message, result = "refused", "member-facing repository: task landing request refused", 2
+        status, message, result = "refused", ("The repo belongs to a member, so the box won't land it. "
+                                              "Someone has to merge it by hand."), 2
     elif grant not in (0, 1):
-        status, message, result = "failed", "landing grant could not be read", 1
+        status, message, result = "failed", "Nothing is queued, because the box could not read whether this project lands its own PRs.", 1
     elif url and not pr:
-        status, message, result = "failed", "receipt has no valid PR URL", 1
+        status, message, result = "failed", ("Nothing is queued, because the link the worker recorded isn't a "
+                                             "GitHub pull request."), 1
     elif not pr or rec.get("closed"):
-        status, message = "none", "no open PR to queue"
+        status, message = "none", "No PR is open for it, so there is nothing to land."
         result = int(any(e.get("stage") in ("commit", "push", "pr") for e in rec["errors"]))
     elif grant == 0:
         card = rec.get("card") or {}
@@ -3445,7 +3466,7 @@ def queue_task(argv):
         if card.get("chat") and card.get("ts"): args += ["--chat", card["chat"], "--ts", card["ts"]]
         with contextlib.redirect_stdout(sys.stderr): result = cmd_queue(args)
         status = "queued" if result == 0 else "failed"
-        message = "Landing queued (no 👍 needed)." if result == 0 else "Landing queue needs attention; the PR exists."
+        message = "It's queued to land, no 👍 needed." if result == 0 else "The PR is open, but the landing queue would not take it."
     rec["landing"] = {"status": status, "message": message}
     if rec.get("pending"):
         ledger(f"delivery-pending {repo}/{row} pr={url or '-'} projections={','.join(rec['pending'])}")

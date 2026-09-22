@@ -1310,24 +1310,24 @@ def selfcheck():
         "a review verdict": (Stopped("review", "DO-NOT-LAND on PR #77 ($0.42, 61k tokens, commented on the PR) — "
                                                "the landing stops here, exactly like a red gate.\n1. a.py:9 — the "
                                                "call has no timeout \u2192 name it", verdict="DO-NOT-LAND"),
-                             "DO-NOT-LAND on PR #77", "yours: the verdict is on the PR"),
+                             "DO-NOT-LAND on PR #77", "The reviewer's notes are on the PR"),
         "a review that hit its own cap": (
             Stopped("review", f"{WALL}, not the diff: $3.00 and 35 turns on PR #77 read nothing and answered "
                               f"nothing — the money cap (CC_LAND_REVIEW_BUDGET) stopped it."),
-            "the review hit its own cap", "yours: re-queue to buy a read"),
+            "the review hit its own cap", "Re-queue it to get a review"),
         "a red gate": (Stopped("gates", "gate core/tests/check.sh did not pass: ✗ the row was wrong — and these "
                                         "gates ran on main at ba5e00000000 merged with the head 1a2b3c4d5e6f, not "
                                         "on the head alone  [full output: /tmp/gate-check.sh.log]",
                                short="gate check.sh did not pass: ✗ the row was wrong"),
-                       "gate check.sh did not pass: ✗ the row was wrong", "yours: fix it, then re-queue"),
+                       "gate check.sh did not pass: ✗ the row was wrong", "Fix it, then re-queue it"),
         "a branch that conflicts": (Stopped("gates", "1a2b3c4d5e6f conflicts with main at ba5e00000000 — rebase "
                                                      "it, then land it: CONFLICT (content): Merge conflict in a.py",
                                             short="the branch conflicts with main — rebase it"),
-                                    "the branch conflicts with main — rebase it", "yours: fix it, then re-queue"),
+                                    "the branch conflicts with main — rebase it", "Fix it, then re-queue it"),
         "a PR the box could not read": (Stopped("load", "gh pr view 77 (rc=1): could not resolve to a PullRequest"),
-                                        "could not resolve to a PullRequest", "yours: fix it, then re-queue"),
+                                        "could not resolve to a PullRequest", "Fix it, then re-queue it"),
         "a merge GitHub refused": (Stopped("merge", "gh pr merge 77 (rc=1): Base branch was modified"),
-                                   "Base branch was modified", "yours: fix it, then re-queue"),
+                                   "Base branch was modified", "Fix it, then re-queue it"),
     }
     cards = {}
     for _reason, (_L, _why, _who) in REASONS.items():
@@ -1346,8 +1346,8 @@ def selfcheck():
     check("...and the two stops a person answers DIFFERENTLY still read differently: a verdict sends them to the "
           "read already on the PR, a red gate to the case that FAILED — never to a case that passed",
           cards["a review verdict"] != cards["a red gate"]
-          and "the verdict is on the PR" in cards["a review verdict"]
-          and "the verdict is on the PR" not in cards["a red gate"]
+          and "notes are on the PR" in cards["a review verdict"]
+          and "notes are on the PR" not in cards["a red gate"]
           and "✗ the row was wrong" in cards["a red gate"] and "DO-NOT-LAND" not in cards["a red gate"])
     # …and cc-replay READS these cards out of queue.log to say what stopped a PR and how often (stops_of, gate_red:
     # `gate \S+ did not pass`, STOP_CONFLICT `conflicts with \S+ — rebase`). Shortening the card is ours to do;
@@ -1360,7 +1360,7 @@ def selfcheck():
                       1, {"attempts": 1}, "")["short"]
     check("...and a reason too long for the line gives ground to the two parts without which the card is not "
           "actionable: it is cut with an ellipsis, whose move it is and the link survive whole, the bound holds",
-          len(_long) <= STOP_CARD_MAX and "…" in _long and "yours: fix it, then re-queue" in _long
+          len(_long) <= STOP_CARD_MAX and "…" in _long and "Fix it, then re-queue it" in _long
           and _long.endswith("https://github.com/o/r/pull/77"))
     _blind = Stopped("load", "gh pr view 77 (rc=1): HTTP 502")
     _blind.facts, _blind.root = {}, f"{DEV}/myrepo"
@@ -1374,7 +1374,7 @@ def selfcheck():
     check("...and a landing that could not read the PR at all still owes the owner somewhere to look: with no url "
           "from GitHub the card builds the PR's own from the checkout's origin remote",
           _card.endswith("https://github.com/o/r/pull/77") and len(_card) <= STOP_CARD_MAX
-          and "yours: fix it, then re-queue" in _card)
+          and "Fix it, then re-queue it" in _card)
 
     check("the reviewer prompt ships beside the script, and asks for exactly the fields the schema validates",
           os.access(f"{os.path.dirname(BIN)}/{REVIEW_PROMPT}", os.R_OK) and
@@ -2021,14 +2021,14 @@ def selfcheck():
               and isinstance(r, str) and L.reviewed == HEAD)
         check("...and the landed card says it too, in the owner's own words and with no SHA in them: he reads this "
               "on a phone, and the sentence he needs is which tree the suite passed on, not which commit it was",
-              "gated on main merged with the branch, merged, deployed" in card["short"]
+              "I tested it with main merged into the branch. It's merged and deployed" in card["short"]
               and BASE_SHA[:12] not in card["short"] and HEAD[:12] not in card["short"])
         L, g, r = both(gate_answer, lambda a: (0, REVIEWED("LAND")), **NO_MERGE)
         card = result_of(L, 0, {"attempts": 1}, "")
         check("CONTROL: a head that already holds main is gated as the head — there is no merge to build — and "
               "BOTH lines say that rather than claiming a merge nobody made",
               isinstance(g, str) and not L.merged_on and "already holds main — the merge is the head" in g
-              and "gated on the branch, which already holds main" in card["short"]
+              and "I tested the branch, which already had main in it" in card["short"]
               and ran("git worktree add", HEAD) and not ran("git merge-tree", "--write-tree"))
 
         # …and the THIRD state, on a GREEN landing: git could not build the merge, so the gates ran on the branch
@@ -2043,13 +2043,30 @@ def selfcheck():
               "the branch alone and say the merge could not be built, and neither claims the head holds main",
               isinstance(g, str) and not L.merged_on and L.merge_unbuilt
               and f"the branch {HEAD[:12]} alone — the merge with main could not be built" in g
-              and "gated on the branch alone — the merge could not be built" in card["short"]
-              and "already holds" not in g and "already holds" not in card["short"]
+              and "I tested the branch on its own, because git could not build the merge" in card["short"]
+              and "already holds" not in g and "already had" not in card["short"]
               and ran("git worktree add", HEAD))
         check("...and the landing SAYS SO while it runs, rather than narrowing to head-only gating in silence: the "
               "one thing a reader of the thread has to know is that these gates stopped proving what main will hold",
               "the merge of main with the head could not be built" in SAID[0]
               and "gates run on the BRANCH ALONE" in SAID[0])
+        # …and the three cards a person acts on name the STEP rather than the box's word for it. "One bookkeeping
+        # step needs a hand" and "the deploy stopped at daemons" each left the owner with nothing he could do.
+        L.hurt = ["board", "ledger"]
+        _cos = result_of(L, COSMETIC, {"attempts": 1}, "")
+        check("a landing whose bookkeeping did not go through NAMES the steps, and says what re-running does",
+              _cos["ok"] and "closing the board row and marking what the task asked for as merged did not go "
+              "through" in _cos["short"] and "bookkeeping" not in _cos["short"])
+        _unv = result_of(L, UNVERIFIED, {"attempts": 1}, "")
+        check("...and one nothing could confirm says so as a person would, with the request left open",
+              _unv["ok"] and "I couldn't check that it's really showing for you, so I've left your request open"
+              in _unv["short"])
+        L.hurt, L.stopped = [], "daemons"
+        _dep = result_of(L, 1, {"attempts": 2}, "")
+        check("...and a deploy that stopped says WHERE in words, not the step's internal name",
+              not _dep["ok"] and "the deploy stopped while restarting the box's long-running programs" in
+              _dep["short"] and "at daemons" not in _dep["short"])
+        L.stopped = ""
         L, g, r = both(lambda a: (1, "shellcheck: SC2086\n") if a[0].endswith("check.sh") else (0, "0 failed\n"),
                        lambda a: (ev("review", "asked"), (0, REVIEWED("LAND")))[1])   # nothing to meet: this case
                                                           # is about what a RED gate does to the read beside it
@@ -3910,7 +3927,7 @@ def selfcheck():
               "rather than a verdict the review never reached; what it COST and which number would change it are "
               "in the landing record, one tap away, because neither is what he decides on",
               len(ran_sub("cc-slack", "post", "CAPPR")) == 1
-              and one_line(card(), "the review hit its own cap", "yours: re-queue to buy a read")
+              and one_line(card(), "the review hit its own cap", "Re-queue it to get a review")
               and "$3.00" in record() and "CC_LAND_REVIEW_BUDGET" in record()
               and "$3.00" not in card() and "CC_LAND_REVIEW_BUDGET" not in card())
         check("...and it costs the change neither of the two things it is bounded by: the review it never got is "
@@ -3956,7 +3973,7 @@ def selfcheck():
                   read_json(job_path("myrepo", 7)) is None and not gh_merges()
                   and len(ran_sub("cc-slack", "post", "CAPPR")) == 1
                   and one_line(card(), "gate check.sh did not pass: ✗ the row was wrong",
-                               "yours: fix it, then re-queue")
+                               "Fix it, then re-queue it")
                   and "try 3 of 3" in record() and "old code" not in told()
                   and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
             landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n"),
@@ -4256,7 +4273,7 @@ def selfcheck():
               "been spent, and with no second worker dispatched",
               not os.path.exists(job_path("myrepo", 7)) and not ran_sub("cc", "myrepo", "w1", "--go")
               and len(ran_sub("cc-slack", "post", "CAPPR")) == 1
-              and one_line(card(), "LAND-AFTER-FIX", "yours: the verdict is on the PR")
+              and one_line(card(), "LAND-AFTER-FIX", "The reviewer's notes are on the PR")
               and "after one automatic fix iteration in w1" in record()
               and len(ran_sub("cc-slack", "inject", "myrepo")) == 1
               and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
