@@ -19,3 +19,9 @@ Judge:
 Answer with the verdict on the first line — LAND, FIX or DO-NOT-LAND — then the findings, each as `file:line`, what goes wrong, and the fix. Under 250 words. Nits go last, or not at all.
 
 Your Bash is read-only here: `git diff`, `git show`, `git log`, grep, running a selfcheck. Nothing that writes, deletes, pushes or restarts. Edit nothing, commit nothing, post nothing. Your answer goes back to the session that asked for it.
+
+## Writing
+
+Your report is read by the session that spawned you, and often passed on to a person.
+
+{{WRITING_BLOCK}}

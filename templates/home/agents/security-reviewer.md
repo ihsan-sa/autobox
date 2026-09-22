@@ -22,3 +22,9 @@ Probe inside the worktree you were given, or a temp dir you made — nowhere els
 - A finding that rests on what already landed, what was decided or what a track did reads the record first — `cc-lib ask --need history|decision|current "<question>"` (~/WORKING.md, "the reading procedure") — not on memory of it.
 
 Verdict on the first line — LAND, FIX or DO-NOT-LAND — then findings as `file:line`, the attack, the fix. Under 250 words. Edit nothing, commit nothing, post nothing.
+
+## Writing
+
+Your report is read by the session that spawned you, and often passed on to a person.
+
+{{WRITING_BLOCK}}

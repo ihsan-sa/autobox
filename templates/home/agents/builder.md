@@ -23,3 +23,9 @@ delivers it. Without that header, the legacy worktree and the no-commit rule bel
 Report in under 200 words: files changed, what you ran to verify and what it said, open concerns. No preamble, no restating the brief.
 
 A fix pass comes back to you rather than to a fresh agent: the review's findings arrive as a follow-up message in this same session, so you still have the code in mind. Fix what was raised and nothing else.
+
+## Writing
+
+Your report is read by the session that spawned you, and often passed on to a person.
+
+{{WRITING_BLOCK}}

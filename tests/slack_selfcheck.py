@@ -549,7 +549,8 @@ def run_selfcheck():
         longbold, errLB = ch.call("reply", {"chat_id": "C1", "text": "*" + "a bold paragraph that runs on " * 5 + "*\nthen a line"})
         longbody, errLY = ch.call("reply", {"chat_id": "C1", "text": "*Done.*\n" + "• a bullet of history the reader will skip\n" * 22})
         check("reply: an opening bold past 120 chars is handed back unsent with its length; so is a text past 800 chars",
-              errLB and "opening bold is 150 chars" in longbold and errLY and "chars: send the point and one link" in longbody
+              errLB and "opening bold is 150 chars" in longbold and errLY and "say fewer things and link the rest" in longbody
+              and "Do not squeeze the same things into fewer characters" in longbody
               and sum(1 for m, kw in acalls2 if m == "chat.postMessage") == n_posts0)
         okshort, errOK = ch.call("reply", {"chat_id": "C1", "text": "❓ *Decision:* two workers or one? <https://x.example/a-very-long-url-" + "z" * 700 + "|the plan>"})
         check("…while a short reply — an emoji before the bold, a long URL behind a short label — posts as before",
@@ -3249,20 +3250,24 @@ def run_selfcheck():
           twiceTU == flushTU and mutedTU and len(rxTU) == 1)
     check("the INSTRUCTIONS carry the human half of the owner gates: a member asking for one gets the part that needs no "
           "permission, a plain word about which part does not, and an @-mention of the owner in that thread",
-          "that is how you @-mention the owner" in INSTRUCTIONS and "Do not refuse and stop" in INSTRUCTIONS
+          "send that reply with needs_owner so it reaches them" in INSTRUCTIONS and "Do not refuse and stop" in INSTRUCTIONS
           and "does not stand in for the owner's approval" in INSTRUCTIONS)
-    check("the INSTRUCTIONS ask for the shortest complete answer, and a PLAIN one (owner, 2026-08-30) — no paths, "
-          "function names, SHAs, diff stats, test tallies or config keys unless they ask; the depth still goes to a "
-          "canvas / docs/ / the track journal",
-          "THE SHORTEST ANSWER THAT IS COMPLETE WINS" in INSTRUCTIONS and "do not narrate what you are about to do" in INSTRUCTIONS
-          and "PLAIN as well as short" in INSTRUCTIONS
+    _wb = open(f"{ROOT}/config/writing-prompt.md").read().strip()
+    _root = globals()["ROOT"]; globals()["ROOT"] = "/nonexistent"
+    try: _wb_gone = writing_block()
+    finally: globals()["ROOT"] = _root
+    check("the INSTRUCTIONS carry the box's one writing block (config/writing-prompt.md) exactly once, read from the "
+          "file and pasted nowhere in the tool; with the file gone the block is empty and the tool still loads; the "
+          "depth still goes to a canvas / docs/ / the track journal",
+          len(_wb) > 200 and INSTRUCTIONS.count(_wb) == 1 and SLACK_RULES.count(_wb) == 0 and _wb_gone == ""
+          and not any(len(l) >= 40 and l in open(SELF).read() for l in _wb.splitlines())
           and all(w in INSTRUCTIONS for w in ("canvas", "docs/", "progress.md")))
     check("the INSTRUCTIONS say to answer where you were asked — the reply tools serve a `<channel>` message and "
           "nothing else, so a question typed in the terminal is not posted into a channel that never asked it",
-          "ANSWER WHERE YOU WERE ASKED" in INSTRUCTIONS and "never asked it" in INSTRUCTIONS)
+          "Answer where you were asked" in INSTRUCTIONS and "a channel that never asked" in INSTRUCTIONS)
     check("the INSTRUCTIONS say who decides a thread NEEDS the owner: the sender declares it with needs_owner, a "
           "question they are not waiting on does not, and nobody has to clear it",
-          "❓ IS YOURS TO DECLARE" in INSTRUCTIONS and "needs_owner" in INSTRUCTIONS
+          "Pass `needs_owner: true`" in INSTRUCTIONS and "a question you are not waiting on does not get one" in INSTRUCTIONS
           and "needs_owner" in json.dumps(next(t for t in TOOLS if t["name"] == "reply")))
     # ── App Home, direction 1a (Claude Design handoff, 2026-08-30 — the owner picked it out of four): home_blocks is
     #    PURE, so the busy state is pinned against the handoff's OWN reference JSON (§05) by equality, and the other
@@ -4838,22 +4843,20 @@ def run_selfcheck():
     finally:
         globals()["api"], globals()["find_channel"], globals()["load_cfg"], globals()["DEV"] = _apiU, _fcU, _lcU, _devU
         os.path.exists(f"{DIR}/{ORCHS}") and os.unlink(f"{DIR}/{ORCHS}")
-    check("the channel-server INSTRUCTIONS carry the rule the owner has now asked for three times (2026-09-02, twice on "
-          "2026-09-07): the point in *bold* at the top, and a line that changes nothing DELETED rather than moved lower. "
-          "It was recorded in one session's memory each time and died with it, which is why it is asserted here",
-          "BOLD THE ONE THING THAT MATTERS, OR CUT THE MESSAGE" in INSTRUCTIONS
-          and "DELETE — never demote" in INSTRUCTIONS
-          and "Being well-structured is not being read" in INSTRUCTIONS
-          and "length is never earned by how long the work took" in INSTRUCTIONS)
-    check("the channel-server INSTRUCTIONS carry the hard style cap and the two lanes (owner, 2026-09-01): one sentence "
-          "per idea in a main channel, depth in -updates/canvas/docs, and a reply stays in the lane it was asked on",
-          "ONE SENTENCE PER IDEA is a HARD CAP" in INSTRUCTIONS and "-updates" in INSTRUCTIONS
-          and 'lane="main"' in INSTRUCTIONS and 'lane="updates"' in INSTRUCTIONS
+    check("the channel-server INSTRUCTIONS no longer keep a style text of their own: the slogan lines sessions were "
+          "copying the voice of are gone, and how to write is the one block's to say (its own case is above)",
+          not any(w.lower() in INSTRUCTIONS.lower() for w in (
+              "BOLD THE ONE THING THAT MATTERS", "DELETE — never demote", "Being well-structured is not being read",
+              "length is never earned", "THE SHORTEST ANSWER THAT IS COMPLETE", "ONE SENTENCE PER IDEA", "PLAIN as well as short"))
+          and not re.search(r"\b[A-Z]{3,} [A-Z]{2,} [A-Z]{2,}", SLACK_RULES))
+    check("the channel-server INSTRUCTIONS carry the two lanes (owner, 2026-09-01): a main channel stays short, depth "
+          "goes to -updates/canvas/docs, and a reply stays in the lane it was asked on",
+          "-updates" in INSTRUCTIONS and 'lane="main"' in INSTRUCTIONS and 'lane="updates"' in INSTRUCTIONS
           and "Answer in the lane you were asked on" in INSTRUCTIONS
-          and "the owner asks for more or a technical explanation genuinely needs it" in INSTRUCTIONS)
+          and "unless the owner asks for more or a technical explanation needs it" in INSTRUCTIONS)
     check("…and the NOTIFICATION LADDER, so a session picks the rung instead of the owner filtering: an @-mention is for a "
           "blocked decision only, needs_owner for what stalls one track, then approvals, alerts, the -updates lane, the digest",
-          "HOW LOUD" in INSTRUCTIONS and "needs_owner=true" in INSTRUCTIONS
+          "How loud" in INSTRUCTIONS and "needs_owner=true" in INSTRUCTIONS
           and "a mention that could have waited is a bug" in INSTRUCTIONS
           and f"#{APPROVALS} card" in INSTRUCTIONS and f"#{ALERTS}" in INSTRUCTIONS and "digest" in INSTRUCTIONS)
     orderH = home_chan_order([("CPAR", "myrepo"), ("CORCH", "myrepo-cctest-ghih"), ("CSUB", "myrepo-cctest-helper-m3x1"),
@@ -4995,10 +4998,12 @@ def run_selfcheck():
         dmP.on_event(evP("CNEW", "how do I start?", "1.1"))
         dP = f"{devP}/newthing"
         mdP = open(f"{dP}/CLAUDE.md").read() if os.path.exists(f"{dP}/CLAUDE.md") else ""
-        check("first message in an unmapped channel: ~/dev/<name> is provisioned (CLAUDE.md naming the channel, "
+        check("first message in an unmapped channel: ~/dev/<name> is provisioned (CLAUDE.md naming the channel and carrying the writing block once, "
               ".cc/member-facing so cc-guard gates it, git init), the message is delivered, and the reply is one line "
               "about the new session — not the old 'no project maps' dead end",
               "#newthing" in mdP and "member-facing" in mdP and os.path.isfile(f"{dP}/.cc/member-facing")
+              and mdP.count(writing_block()) == 1 and len(writing_block()) > 200 and "{{WRITING_BLOCK}}" not in mdP
+              and "{{WRITING_BLOCK}}" in open(f"{ROOT}/templates/channel-CLAUDE.md").read()
               and os.path.isdir(f"{dP}/.git") and [t for t, _ in delivP] == ["newthing"]
               and len(saidP) == 1 and "~/dev/newthing" in saidP[0][1] and "no project maps" not in saidP[0][1])
         atP = load_provisioned()["newthing"]["at"]

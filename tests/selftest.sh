@@ -2604,7 +2604,7 @@ export CC_SLACK_DIR="$T/slack"; mkdir -p "$CC_SLACK_DIR"
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reply","arguments":{"chat_id":"local","text":"pong"}}}' | timeout 60 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch.out"
 grep -q '"claude/channel"' "$T/ch.out" && grep -q '"name": "reply"' "$T/ch.out" && ok "channel server: claude/channel capability + reply tool" || bad "channel handshake"
 # the session prompt the host actually receives must say who may speak and what a member may not authorize
-grep -q 'role=' "$T/ch.out" && grep -q 'role=\\"member\\"' "$T/ch.out" && grep -q 'CANNOT' "$T/ch.out" \
+grep -q 'role=' "$T/ch.out" && grep -q 'role=\\"member\\"' "$T/ch.out" && grep -q 'A member cannot authorize' "$T/ch.out" \
   && ok "channel server: the prompt names role=owner/member and what a member cannot authorize" || bad "member policy in the session prompt"
 grep -q $'\tpost\tlocal\t' "$CC_SLACK_DIR/outbox.log" 2>/dev/null && ok "reply without a token → outbox log" || bad "outbox"
 # sending a FILE from a session: the tool exists, refuses a path outside its roots, and never claims a send it did not make
@@ -3043,6 +3043,15 @@ miss=""; for u in $("$IR/bin/cc-units" link); do [ -L "$IH/.config/systemd/user/
 miss=""; for g in USAGE COMMS RUNBOOK; do [ -f "$IH/$g.md" ] || miss="$miss $g"; done
 [ -z "$miss" ] && ok "the guides the contract points at exist at ~ (USAGE COMMS RUNBOOK; SLACK folded into COMMS)" || bad "guides missing:$miss"
 [ "$(readlink -f "$IH/WORKING.md")" = "$IR/docs/WORKING.md" ] && ok "~/WORKING.md links to the tree's docs/WORKING.md" || bad "~/WORKING.md not linked"
+# the one writing block: a template keeps a {{WRITING_BLOCK}} line and install.sh fills it from config/writing-prompt.md,
+# so ~/CLAUDE.md and the agent types say what the system prompts say. The guide the block names is linked beside it.
+blockn(){ python3 - "$IR/config/writing-prompt.md" "$1" <<'PY'
+import sys; b = open(sys.argv[1]).read().strip(); t = open(sys.argv[2]).read(); print(t.count(b) if len(b) > 200 else -1, int("{{WRITING_BLOCK}}" in t))
+PY
+}
+[ "$(blockn "$IH/CLAUDE.md")" = "1 0" ] && ok "the seeded ~/CLAUDE.md carries the writing block exactly once, and no unfilled placeholder" || bad "~/CLAUDE.md and the writing block: $(blockn "$IH/CLAUDE.md") (want 1 0)"
+[ "$(blockn "$IR/templates/home/CLAUDE.md")" = "0 1" ] && ok "…and its template keeps the placeholder, never a copy of the text" || bad "templates/home/CLAUDE.md holds a copy of the block: $(blockn "$IR/templates/home/CLAUDE.md") (want 0 1)"
+{ [ "$(readlink -f "$IH/WRITING.md")" = "$IR/docs/WRITING.md" ] && [ -s "$IH/WRITING.md" ] && grep -qF '~/WRITING.md' "$IR/config/writing-prompt.md"; } && ok "~/WRITING.md, the guide the block names, links to the tree's docs/WRITING.md" || bad "~/WRITING.md not linked, empty, or not the path the block names"
 [ -f "$IH/.claude/settings.json" ] && env HOME="$IH" CC_SETTINGS_FILE="$IH/.claude/settings.json" "$IR/bin/cc-settings" check >/dev/null 2>&1 && ok "default ~/.claude/settings.json installed and satisfies the managed subset" || bad "settings.json missing or drifted from claude-managed.json"
 # M4-2: the installed native hooks reach both dispatch/bootstrap and end. Missing registrations are the control.
 jq '(.hooks.PreToolUse[] | .hooks) |= map(select(.command != "$HOME/bin/cc-native")) | del(.hooks.SubagentStop)' \
@@ -3054,11 +3063,15 @@ out=$(env HOME="$IH" CC_SETTINGS_FILE="$T/unapplied-native.json" "$IR/bin/cc-set
 # the agent types, at ~/.claude/agents/ where the harness reads them. Copies, so the owner can tune one on the box —
 # which is exactly why they need a stamp: an untouched copy still follows its template, an edited one is never
 # overwritten. Both directions, because either failure is silent (a stale builder, or the owner's tuning gone).
-miss=""; for f in "$IR"/templates/home/agents/*.md; do n=$(basename "$f"); cmp -s "$f" "$IH/.claude/agents/$n" || miss="$miss $n"; done
-[ -z "$miss" ] && ok "every agent type is installed at ~/.claude/agents/ ($(cd "$IR/templates/home/agents" && echo *.md | sed 's/\.md//g'))" || bad "agent types not installed or drifted:$miss"
+filled(){ awk -v b="$IR/config/writing-prompt.md" '$0 == "{{WRITING_BLOCK}}" { while ((getline l < b) > 0) print l; close(b); next } { print }' "$1"; }   # the template as it installs
+miss=""; for f in "$IR"/templates/home/agents/*.md; do n=$(basename "$f"); { filled "$f" | cmp -s - "$IH/.claude/agents/$n"; } && [ "$(blockn "$IH/.claude/agents/$n")" = "1 0" ] && [ "$(blockn "$f")" = "0 1" ] || miss="$miss $n"; done
+[ -z "$miss" ] && ok "every agent type is installed at ~/.claude/agents/ with the writing block filled in exactly once ($(cd "$IR/templates/home/agents" && echo *.md | sed 's/\.md//g'))" || bad "agent types not installed or drifted:$miss"
 echo "# the owner's own tuning" >> "$IH/.claude/agents/builder.md"; printf '\nthe template moved on.\n' >> "$IR/templates/home/agents/reviewer.md"; inst
 grep -q "^# the owner's own tuning$" "$IH/.claude/agents/builder.md" && ok "an agent the owner edited by hand survives the next install" || bad "install.sh overwrote a hand-edited agent"
-cmp -s "$IR/templates/home/agents/reviewer.md" "$IH/.claude/agents/reviewer.md" && ok "…and an untouched one follows its template when the template changes" || bad "a changed agent template never reached ~/.claude/agents"
+{ filled "$IR/templates/home/agents/reviewer.md" | cmp -s - "$IH/.claude/agents/reviewer.md"; } && ok "…and an untouched one follows its template when the template changes" || bad "a changed agent template never reached ~/.claude/agents"
+# swapping the block is a file swap and no code: the next install carries it to an untouched agent, never to an edited one
+printf '\nA swapped line.\n' >> "$IR/config/writing-prompt.md"; inst
+{ grep -q '^A swapped line\.$' "$IH/.claude/agents/reviewer.md" && ! grep -q 'A swapped line' "$IH/.claude/agents/builder.md" && grep -q "^# the owner's own tuning$" "$IH/.claude/agents/builder.md"; } && ok "a swapped writing block reaches an untouched agent on the next install, and the hand-edited one is still kept" || bad "a swapped writing block did not reach ~/.claude/agents/reviewer.md, or it overwrote the edited builder"
 # a symlink in that directory is never written through: a dangling one reads as absent to -e, and the cp would have
 # landed on whatever it points at — here a path outside ~/.claude entirely
 mv "$IH/.claude/agents/security-reviewer.md" "$T/moved-agent"; ln -s "$T/gone-agent" "$IH/.claude/agents/security-reviewer.md"; inst

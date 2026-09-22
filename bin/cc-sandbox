@@ -38,7 +38,9 @@
 #     handle, because claude's cross-process refresh lock is made INSIDE it (~/.claude/.oauth_refresh.lock) and a lock made in a
 #     per-session tmpfs serialises nothing (launch_member says what that cost) · the control plane's core/bin bound ro AS ~/bin, so
 #     ~/dev/<control repo> does not exist inside, and its core/mail ro AS ~/mail, where ~/bin/cc-mail (the relative link
-#     ../mail/receiver.py) lands — so `cc-mail send` runs inside and hands the ask over the member socket · ONE credential
+#     ../mail/receiver.py) lands — so `cc-mail send` runs inside and hands the ask over the member socket · two files of
+#     core/ ro, the writing block AS ~/config/writing-prompt.md (where the Slack tool inside reads it) and the guide it names
+#     AS ~/WRITING.md · ONE credential
 #     at ~/.claude/.credentials.json — the workspace's OWN (~/.cc/members/<handle>/credentials.json, minted by the owner with
 #     `cc-sandbox mint`, kept whole, BOUND rw at that path so the refresh a session makes inside is what the next launch
 #     starts from and what every other live session of the handle reads next; its host path is not inside) and
@@ -129,7 +131,7 @@
 #   contained here and this does not claim to contain it: it is contained when stage 1b (ccbox, an allowlist proxy)
 #   exists. His file is read, never written, and never edited by this box — the paragraph at SBX_ALLOW says why each
 #   way round. DENIED in there: the Artifact tool (SBX_DENY), added to his deny even when his file lacks it.
-# INSIDE ro: ~/bin and the bin it links into · ~/mail (core/mail, the target of ~/bin/cc-mail) · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
+# INSIDE ro: ~/bin and the bin it links into · ~/mail (core/mail, the target of ~/bin/cc-mail) · ~/WRITING.md (core/docs/WRITING.md, the guide the writing block names) · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
 #   · ~/.cc/github-deny and ~/.cc/github-deny.gitconfig when the host has them (the GitHub orgs the box may not touch: cc-github-deny)
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
 #   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
@@ -463,6 +465,7 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   settings_bind "$H/.cc/sandbox/$1/$2"   # ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
   [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
+  [ -f "$(dirname "$cb")/docs/WRITING.md" ] && B+=(--ro-bind "$(dirname "$cb")/docs/WRITING.md" "$H/WRITING.md")   # the guide the worker's prompt tells it to open: one published file, ro
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)   # /etc/resolv.conf points here
   # …and the GitHub orgs the box may not touch: the list and the git include cc-github-deny writes from it, ro, so the
   # gh shim, the credential helper, git's url.insteadOf and cc-guard's rule hold inside exactly as they do here
@@ -703,6 +706,11 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   # is in it: core/ is the published half, and the send secret and the worker URL are in ~/.cc/config, which stays absent.
   mailsrc=$(dirname "$(readlink -f "$cb/cc-mail" 2>/dev/null || echo /nonexistent/cc-mail)")
   [ -f "$mailsrc/receiver.py" ] && B+=(--ro-bind "$mailsrc" "$H/mail")
+  # The Slack tool inside reads the box's one writing block from ../config beside its bin, which is ~/config here, and the
+  # block tells a session to open ~/WRITING.md. Both are bound ro as single files, or a member session is the one kind told
+  # to open a guide it cannot see. Both are published text from core/. A fixture bin with neither beside it binds nothing.
+  [ -f "$(dirname "$cb")/config/writing-prompt.md" ] && B+=(--ro-bind "$(dirname "$cb")/config/writing-prompt.md" "$H/config/writing-prompt.md")
+  [ -f "$(dirname "$cb")/docs/WRITING.md" ] && B+=(--ro-bind "$(dirname "$cb")/docs/WRITING.md" "$H/WRITING.md")
   [ -n "$TREE" ] && B+=(--bind "$TREE" "$TREE")   # the one host tree a landing's gates run on, rw, at its own path (see the header)
   # His hooks (cc-guard: depth inside the wall) come through this copy unchanged, with the sealed-session permissions
   # appended. ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside.
@@ -1032,6 +1040,7 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
     echo ccconfig=$(e ~/.cc/config); echo secrets=$(e ~/.cc/secrets); echo appkey=$(e '"$kf"'); echo keyread=$(cat '"$kf"' 2>/dev/null || echo unreadable); echo ledger=$(e ~/.cc/state/member-spend.json); echo states=$(ls ~/.cc/state | tr "\n" " "); echo boards=$(ls ~/.cc/boards | sort | tr "\n" " ")
     echo mine=$(jq -c "[(.claudeAiOauth.accessToken == \"'"$mine"'\"), (.claudeAiOauth.refreshToken == \"'"$miner"'\"), (keys | length)]" '"$c"' 2>/dev/null)
     echo credfile=$([ -e ~/.cc/members ] && echo present || echo absent)
+    echo writing=$(md5sum < ~/config/writing-prompt.md | cut -c1-32)/$([ -s ~/WRITING.md ] && echo guide)/$(ls -A ~/config | tr "\n" " ")/$( { echo x >> ~/WRITING.md || echo x >> ~/config/writing-prompt.md; } 2>/dev/null && echo writable || echo ro)
     echo ssh=$(e ~/.ssh); echo gh=$(e ~/.config/gh); echo gitconfig=$(e ~/.gitconfig); echo sock=$(e /var/run/docker.sock)$(e /run/docker.sock); echo tmux=${TMUX:-unset}
     echo env=$(env | grep -cE "^(CLAUDE_CODE_OAUTH_TOKEN|SLACK_BOT_TOKEN|TMUX)="); echo inside=${CC_MEMBER_SANDBOX:-unset}/${CC_ROLE:-unset}
     echo trim=${CC_LOOP_TRIM:-unset}
@@ -1064,6 +1073,8 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'member: the credential inside is the one minted for that workspace, whole — nothing arrives by fallback' "$(g mine)" '[true,true,1]'
   t 'member: the credential FILE is still outside — only its content is inside' "$(g credfile)" absent
   t 'member: and a workspace that has one is not refused' "$(grep -c "has no credential of its own" <<<"$out")" 0
+  t 'member: the writing block (where the Slack tool inside reads it) and the guide it names are inside, read-only, and ~/config holds nothing else' \
+    "$(g writing)" "$(md5sum < "$(dirname "$cb")/config/writing-prompt.md" | cut -c1-32)/guide/writing-prompt.md /ro"
   t 'member: ssh absent' "$(g ssh)" absent;  t 'member: config/gh absent' "$(g gh)" absent
   t 'member: .gitconfig absent' "$(g gitconfig)" absent;  t 'member: the container socket absent' "$(g sock)" absentabsent;  t 'member: TMUX unset' "$(g tmux)" unset
   t 'member: the environment was cleared' "$(g env)" 0;  t 'member: CC_MEMBER_SANDBOX=1 and CC_ROLE=member inside' "$(g inside)" 1/member
@@ -1810,6 +1821,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     echo commondir=$( (printf "/tmp/evil\n" > $d/worktrees/t/commondir) 2>/dev/null && echo wrote || echo refused)
     echo newname=$( (printf x > $d/shallow) 2>/dev/null && echo wrote || echo refused)   # LAST: a bogus shallow file breaks every git call after it
     echo gitconfig=$(git config user.name z 2>/dev/null && echo writable || echo ro); echo bin=$(touch ~/bin/x 2>/dev/null && echo writable || echo ro)
+    echo guide=$(if [ -s ~/WRITING.md ]; then (echo x >> ~/WRITING.md) 2>/dev/null && echo guide-writable || echo guide-ro; else echo none; fi)
     echo nsdls=$(ls -A ~/dev/'"$r"'/.git/refs/heads/track 2>/dev/null | tr "\n" " ")   # the branch namespace, from inside: this track only, no sibling to move
     echo sbxdir=$([ -e ~/.cc/sandbox ] && echo present || echo absent)                # …and the host dir that namespace is a copy of is not in here at all
     echo tracks=$(ls ~/.cc/worktrees/'"$r"' | tr "\n" " "); echo states=$(ls ~/.cc/state/'"$r"' | tr "\n" " "); echo dev=$(ls -A ~/dev/'"$r"' | tr "\n" " ")
@@ -1830,6 +1842,9 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     "$(sed -n 's/^tmux=//p' <<<"$out2")/$(sed -n 's/^pid1=//p' <<<"$out2")" /tmp/tmux-0/x/many
   t 'cwd is the worktree' "$(g cwd)" "$wt";  t 'git status works' "$(g status)" ok;  t 'the parent .git resolves' "$(g common)" "$dev/.git"
   t 'a commit works' "$(g commit)" ok;  t '.git/config is ro' "$(g gitconfig)" ro;  t 'bin is ro' "$(g bin)" ro
+  # the control bin a worker sees is the INSTALLED one (~/bin), so the guide is there once that tree carries it, and absent before
+  t 'the writing guide beside the installed bin is at ~/WRITING.md, read-only — and absent when that tree has none' "$(g guide)" \
+    "$([ -s "$(dirname "$(dirname "$(readlink -f "$H/bin/cc-loop")")")/docs/WRITING.md" ] && echo guide-ro || echo none)"
   # ── THE PARENT REF STORE IS THE HOST'S (build) ──────────────────────────────────────────────────────────────────
   # Measured against this same file with `.git` bound rw, as it was: every line below came back moved/wrote/deleted and
   # the host's main really moved, refs/heads/track/u was really gone, and .git/config.worktree really carried a
