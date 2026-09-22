@@ -45,6 +45,16 @@
 # silent refusals on a side branch cost the ece203 seat every turn-end commit it made that day, and two turns of the
 # session after it (raised-checkpoint-refuses-a-study-branch). `cc done` stays stricter than the hook — completion
 # and the landing queue need the canonical track/<track>, and it says so on stderr. Push stderr → .cc/push.err.
+# AND SO IS A TURN THAT PUSHED NOTHING while this worktree is ahead of the remote (push_gap) — the same one line, read
+# from this worktree's own receipt of the last push (.cc/pushed) and costing no network. A branch a landing deleted at
+# origin is put back by the next checkpoint, because that push is a CREATE and remote_gone has the lease accept a
+# remote holding no tip instead of calling it "something else wrote" — and so is one deleted while nothing changed
+# here, because a quiet turn whose HEAD is the last push asks the remote whether the branch is still there
+# (branch_back: one bounded ls-remote) and puts it back when it is not. A quiet turn whose HEAD is AHEAD of that
+# receipt — the session committed, or committed and pushed, by hand — pushes it there and then (push_catchup)
+# instead of telling the seat for ever that work the remote already has is not live; and a push that genuinely cannot happen is heard
+# by the session in the turn it failed, rather than sitting in push.err for a day and a half while the seat reports
+# its work as live (ece206 and ece207, 2026-09-19/20: two rescues, one false statement to the owner).
 # A BRANCH MOVED UNDER THE WORKTREE IS NEVER COMMITTED AS A REVERT. A second worktree on the same branch (`git checkout
 # --ignore-other-worktrees`, a hand fix) commits, the branch moves, and this worktree's index still holds the old tip —
 # which `git add -A` reads as a staged diff UNDOING the fix. The commit block below tells the two apart by this
@@ -519,6 +529,20 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   [ -n "$lease" ] || [ -n "$workspace" ] || lease=$(git rev-parse -q --verify "refs/remotes/$remote/$branch" 2>/dev/null)
   # …and a lease this worktree's own hand push has overtaken moves up to what it pushed (lease_refresh) — box tracks only.
   [ -n "$workspace" ] || [ -z "$lease" ] || lease=$(lease_refresh "$branch" "$lease")
+  # THE BRANCH WAS DELETED AT THE REMOTE, NOT WRITTEN TO. A landing squash-merges a track's PR and deletes
+  # track/<track> at origin, and a session row's seat keeps working on a branch that is no longer there — cc-reconcile
+  # deletes it again on every pass while the row sits `merged`, so it goes on disappearing (ece206 and ece207,
+  # 2026-09-19/20: 38 h of checkpoints that reached nobody). A push that raced that delete is rejected here, and
+  # leasing against a tip the remote no longer has is rejected 'stale info' — which this file would then call
+  # "something else wrote to that branch" and stop the track on (lease_refused, STATUS: BLOCKED). It is false: nothing
+  # wrote, the ref is gone. So the remote is ASKED what it holds before anything is forced. No ref at all and the push
+  # is a CREATE, which can overwrite nothing and needs no lease: push it plain and the work is back under its own
+  # name. A remote that still has the branch, or one that did not answer, keeps every guarantee below — this never
+  # turns a refusal into a force.
+  if [ -n "$lease" ] && remote_gone "$branch"; then
+    git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>"$ST/push.err.tmp"; prc=$?
+    [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; return 0; }
+    bound_hit "$prc" "$ST/push.err.tmp"; mv "$ST/push.err.tmp" "$ST/push.err"; push_rejected; return 1; fi
   if [ -n "$lease" ]; then
     git_unattended "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$ST/push.err.tmp"; prc=$?
     [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; return 0; }
@@ -544,6 +568,14 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   [ -n "$workspace" ] && [ -f "$root/.cc/pushed" ] && [ ! -L "$root/.cc/pushed" ] && return 3
   return 2
 }
+remote_gone(){   # $1 branch → 0 ONLY when $remote answered and holds no refs/heads/<branch>. cwd = worktree root, $cred from lease_push
+  # The question is asked of the remote itself and not of refs/remotes/<remote>/<branch>, which a `push --delete`
+  # somewhere else on the box takes away without anything here noticing, and which a fetch can refresh at any time.
+  # A remote that does not answer (no network, no credential, the bound) is NOT a deleted branch: it returns 1, the
+  # caller forces nothing and the lease's own refusal stands. Silence must never read as permission.
+  local out
+  out=$(git_unattended "${cred[@]}" ls-remote --heads "$remote" "refs/heads/$1" 2>/dev/null) || return 1
+  [ -z "$out" ]; }
 lease_refresh(){   # $1 branch · $2 the lease on file → the lease to push with, on stdout. cwd = worktree root, $cred from lease_push
   # A HAND PUSH FROM THIS WORKTREE STALES THE LEASE: a repair committed and pushed outside this file put its tip on
   # the remote while .cc/pushed still named the push before it, so the next rebased push leased against the old
@@ -602,6 +634,66 @@ lease_refused(){   # a write this worktree did not make, on a single-writer bran
   row_ids || return 0
   "$BIN/cc-board" note "$repo" "$track" "$msg" >/dev/null 2>&1
   journal_blocked "$repo" "$track" "$msg"; }
+push_gap(){   # $1 branch · $2 (optional) why nothing was pushed — ONE Stop line when the turn ends with work the remote has not got
+  # NOTHING SILENT. Every other way this file has of saying "the push did not happen" is a file somebody has to go
+  # and read: push.err, push.rejected, `push!` in `cc ls` and the digest. The session itself — the one still typing
+  # into that worktree — was told nothing, so two course seats worked a day and a half on a branch their landing had
+  # deleted at origin, reported "the hook pushes" every turn, and had the owner told work was live that existed in
+  # one directory on this box (ece206, ece207, 2026-09-19/20). So the turn end says it, in the Stop decision's reason,
+  # the same one line a refusal takes (tell): the hook cannot make a push succeed, but it can refuse to let one fail
+  # quietly. The test is this worktree's own receipt, no network: HEAD against the commit the last push PUT on the
+  # remote (.cc/pushed, written by lease_keep only after the remote took it). Equal and nothing is said — an ordinary
+  # turn is not news. NOT inside a member's boundary, where the Stop hook has no credential by design and the host's
+  # sweep does the pushing: the line would be true every turn there and mean nothing.
+  local head lease why="${2:-}"
+  [ -z "${CC_MEMBER_SANDBOX:-}" ] || return 0
+  head=$(git rev-parse -q --verify HEAD 2>/dev/null) || return 0
+  lease=$(cat "$ST/pushed" 2>/dev/null)
+  [ "$head" = "$lease" ] && [ -z "${3:-}" ] && return 0   # $3 set: the receipt is right but the remote lost it (branch_back)
+  [ -n "$why" ] || why=$(cat "$ST/push.err" 2>/dev/null | tr -s '[:space:]' ' ' | LC_ALL=C tr -cd '[:print:]' | cut -c1-200)
+  tell "push: ${head:0:12} is committed on '$1' in this worktree and is NOT on $remote — ${why:-no push was made this turn}. Nothing of this turn can be reviewed, landed or read by anyone else until it is pushed, so say nothing is live: 'cc done <repo> <track>' pushes it, and 'git ls-remote $remote refs/heads/$1' is what proves it arrived."
+  return 0; }
+branch_back(){   # $1 branch — a quiet turn whose HEAD is what the last push put on the remote: is the branch STILL there?
+  # push_gap reads the receipt alone, and the receipt cannot see a delete made after it was written: the landing's
+  # squash merge, and cc-reconcile's daily sweep deleting track/<track> again while the row sits `merged`, both
+  # take the branch away while .cc/pushed still equals HEAD, and a seat that commits nothing new after that would be
+  # told nothing, turn after turn (review of #588). So the remote is asked (remote_gone: an answer that is not "no
+  # such ref" — silence, the bound, no credential — is never a delete) and a branch that is gone is pushed back by
+  # lease_push, whose plain push is then a create. One that cannot be put back is said in the same Stop line.
+  local head rc
+  [ -z "${CC_MEMBER_SANDBOX:-}" ] || return 0   # push_gap's rule: no credential in there, the host's sweep pushes
+  head=$(git rev-parse -q --verify HEAD 2>/dev/null) || return 0
+  [ "$head" = "$(cat "$ST/pushed" 2>/dev/null)" ] || return 0   # ahead of the receipt: push_gap says that without asking anybody
+  pick_remote || return 0
+  if [ -z "$workspace" ] && member_tree "$root"; then return 0; fi   # lease_push's own rule: no scope, no credential minted
+  local -a cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$(git remote get-url "$remote" 2>/dev/null)" "$workspace" 2>/dev/null)
+  remote_gone "$1" || return 0
+  lease_push "$1"; rc=$?
+  [ "$rc" = 0 ] && return 0
+  [ "$rc" = 2 ] && lease_refused "$1"
+  push_gap "$1" "the branch was deleted at $remote and putting it back failed: $(tr -s '[:space:]' ' ' < "$ST/push.err" 2>/dev/null | LC_ALL=C tr -cd '[:print:]' | cut -c1-160)" gone
+  return 0; }
+push_catchup(){   # $1 branch — a quiet turn whose HEAD is AHEAD of the receipt: push it, rather than report it
+  # 0 = nothing was tried (the caller's own reason for the gap still stands) · 1 = a push was tried and failed, and
+  # push.err holds the remote's own words for why.
+  # NOTHING STAGED IS NOT THE SAME AS NOTHING TO PUSH. A session that ran its own `git commit` this turn, or
+  # `git commit && git push` by hand, leaves the hook a clean index and a HEAD past .cc/pushed — and the quiet
+  # branch below pushed nothing at all, so push_gap told that seat its commit "is NOT on origin — nothing was
+  # committed this turn" and to say nothing is live. After a hand push that is simply false: the remote has the
+  # commit, only the receipt is behind, and lease_refresh — which exists for exactly that hand push — lives
+  # inside lease_push and was never reached (review of #588). So the push is made here. It is plain and a
+  # fast-forward for a commit of our own, "Everything up-to-date" for one already pushed by hand, and either way
+  # lease_keep writes the receipt and push_gap has nothing left to say. Only a push that really failed is reported.
+  local head rc
+  [ -z "${CC_MEMBER_SANDBOX:-}" ] || return 0   # push_gap's rule: no credential in there, the host's sweep pushes
+  head=$(git rev-parse -q --verify HEAD 2>/dev/null) || return 0
+  [ "$head" = "$(cat "$ST/pushed" 2>/dev/null)" ] && return 0   # level with the receipt: that is branch_back's question, not this one's
+  pick_remote || return 0   # nowhere to push at all: no failed push to report, and the caller's reason is the true one
+  if [ -z "$workspace" ] && member_tree "$root"; then return 0; fi   # lease_push's own rule: no scope, no credential minted
+  lease_push "$1"; rc=$?
+  [ "$rc" = 0 ] && return 0
+  [ "$rc" = 2 ] && lease_refused "$1"
+  return 1; }
 journal_blocked(){   # $1 repo · $2 track · $3 the message — the STATUS: BLOCKED line, into a journal ITS READER CAN WRITE
   # ~/.cc/state/<repo> is bound read-WRITE into a worker's sandbox and into a member's whole boundary (cc-sandbox), so
   # progress.md and the directory holding it are theirs to replace with a link — and `>>` FOLLOWS ONE. The 5-minute
@@ -696,7 +788,8 @@ selfcheck(){   # the pick_remote rule, on fixtures of its own: a HOME, workspace
   HOME="$T/home"; export HOME GIT_CONFIG_GLOBAL="$T/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
   bin="$T/bin"; mkdir -p "$bin" "$HOME/.cc/worktrees" "$HOME/dev"
   cp "$(readlink -f "$0")" "$bin/cc-checkpoint"   # a COPY: a symlink resolves back to core/bin, and the stubs beside it would never be reached
-  CALLS="$T/calls"; NOTES="$T/notes"; DEFS="$T/defaults"; RACE="$T/race"; ROWS="$T/rows"; export CALLS NOTES DEFS RACE ROWS
+  CALLS="$T/calls"; NOTES="$T/notes"; DEFS="$T/defaults"; RACE="$T/race"; ROWS="$T/rows"; UPACK="$T/upack"
+  export CALLS NOTES DEFS RACE ROWS UPACK; : > "$UPACK"
   # `default` stands in for GitHub the way `create` does, and records into a file of its own so the create cases
   # above still read a $CALLS with one line in it. BARE, when the case sets it, makes `create` a real bare repo the
   # seeding below can actually push into.
@@ -716,6 +809,10 @@ if [ "$1" = gitargs ] && [ -s "${RACE:-/dev/null}" ]; then
     git -C "$rw" -c user.name=t -c user.email=t@t commit -q -m "a commit made while the host was pushing" >/dev/null 2>&1
   fi
 fi
+# $UPACK names a stand-in for the REMOTE's upload-pack, handed to git the way a credential is. Every read of the
+# remote inside the push path goes through it — lease_refresh's fetch and remote_gone's ls-remote — so a case can
+# make the remote lose the branch, or stop answering, between this worktree's plain push and its leased one.
+if [ "$1" = gitargs ] && [ -s "${UPACK:-/dev/null}" ]; then printf -- '-c\nremote.origin.uploadpack=%s\n' "$(cat "$UPACK")"; fi
 [ "$1" = create ] || exit 0
 [ -z "${CC_FAIL:-}" ] || { echo "GitHub refused to create $3" >&2; exit 1; }
 u="https://example.test/org/$3.git"; [ -z "${BARE:-}" ] || { git init -q --bare "$BARE/$3.git"; u="$BARE/$3.git"; }
@@ -1789,6 +1886,103 @@ SH
   eq "lease: a tip this branch never held is still refused — the remote keeps it" "rc=$rc $(git -C "$osL" rev-parse track/tl)" "rc=2 $lc"
   eq "…and the lease is not moved to it" "$(cat "$dl/.cc/pushed" 2>/dev/null)" "$lb"
   k "$(grep -q 'something else wrote' "$HOME/.cc/state/boxl/tl/progress.md" 2>/dev/null && echo 0 || echo 1)" "…and it is said as before" "$(cat "$HOME/.cc/state/boxl/tl/progress.md" 2>/dev/null)"
+  # ── THE BRANCH THE LANDING DELETED, AND THE TURN THAT PUSHED NOTHING (raised-checkpoint-push-lost-after-merge-deletes-branch) ──
+  # A session row is a living project: its branch outlives each PR. A squash merge deletes track/<track> at origin
+  # (and cc-reconcile deletes it again every pass while the row sits `merged`), the seat works on, and for 38 h
+  # nothing it committed reached anybody while it reported "the hook pushes" — two rescues and one false statement
+  # to the owner (ece206 and ece207, 2026-09-19/20).
+  tx del 20000   # under the hand-off line: the only line these cases can hear is the push's
+  osD=$(bare delD); dD=$(mkproj boxd/tD origin "$osD"); jD="$HOME/.cc/state/boxd/tD/progress.md"
+  echo '.cc/' >> "$dD/.git/info/exclude"   # as `cc` stamps a repo: a turn that changed nothing is then really one
+  hookD(){ out=$(stophook "$(pay del "$dD" "${1:-false}")" "$dD"); }
+  echo first > "$dD/work.txt"; hookD
+  k "$([ "$(git -C "$osD" rev-parse track/tD 2>/dev/null)" = "$(git -C "$dD" rev-parse HEAD)" ] && [ -z "$out" ] && echo 0 || echo 1)" \
+    "deleted branch: the first checkpoint pushes, and says nothing — a push that arrived is not news" "$out"
+  # THE DELETE BETWEEN COMMITS: the daily sweep takes the branch again while this seat commits nothing new, so the
+  # receipt still equals HEAD and only asking the remote can see it (branch_back, review of #588).
+  git -C "$osD" update-ref -d refs/heads/track/tD
+  hookD
+  eq "…and a branch deleted while nothing changed here is put back by the next quiet turn" "$(git -C "$osD" rev-parse track/tD 2>/dev/null)" "$(git -C "$dD" rev-parse HEAD)"
+  k "$([ -z "$out" ] && echo 0 || echo 1)" "…saying nothing: the work is back where it belongs" "$out"
+  hookD
+  k "$([ "$(git -C "$osD" rev-parse track/tD 2>/dev/null)" = "$(git -C "$dD" rev-parse HEAD)" ] && [ -z "$out" ] && echo 0 || echo 1)" \
+    "…and a quiet turn with the branch still there changes nothing and says nothing" "$out"
+  git -C "$osD" update-ref -d refs/heads/track/tD
+  printf '#!/bin/sh\necho "refusing every push" >&2\nexit 1\n' > "$osD/hooks/pre-receive"; chmod +x "$osD/hooks/pre-receive"
+  hookD; hq=$(git -C "$dD" rev-parse HEAD)
+  k "$(grep -qF '"decision": "block"' <<<"$out" && grep -qF "deleted at origin and putting it back failed" <<<"$out" && grep -qF "${hq:0:12}" <<<"$out" \
+      && ! git -C "$osD" rev-parse -q --verify track/tD >/dev/null 2>&1 && echo 0 || echo 1)" \
+    "…and one that cannot be put back is said in the Stop line, though the receipt still equals HEAD" "$out"
+  rm -f "$osD/hooks/pre-receive"; hookD
+  eq "…and the quiet turn after the remote takes pushes again puts it back" "$(git -C "$osD" rev-parse track/tD 2>/dev/null)" "$hq"
+  # REGRESSION GUARD, not this change: a delete followed by a NEW commit was always put back, because the plain
+  # push is then a create and succeeds before any lease is read.
+  git -C "$osD" update-ref -d refs/heads/track/tD   # the landing squash-merges the PR and deletes the branch
+  echo second > "$dD/work.txt"; hookD
+  eq "…and after the delete a new commit's plain push puts the work back on the remote under track/tD (as before)" "$(git -C "$osD" rev-parse track/tD 2>/dev/null)" "$(git -C "$dD" rev-parse HEAD)"
+  eq "…with the lease recorded again, so the turn after it leases against what is really there" "$(cat "$dD/.cc/pushed" 2>/dev/null)" "$(git -C "$dD" rev-parse HEAD)"
+  k "$([ -z "$out" ] && echo 0 || echo 1)" "…and still nothing said: the work is where it belongs" "$out"
+  k "$(grep -q 'STATUS: BLOCKED' "$jD" 2>/dev/null && echo 1 || echo 0)" "…and no STATUS: BLOCKED: nothing wrote to that branch, it was simply gone" "$(cat "$jD" 2>/dev/null)"
+  # A PUSH THAT TRULY CANNOT HAPPEN IS HEARD IN THE TURN IT FAILED, in the one line a refusal takes.
+  git -C "$dD" remote set-url origin "$T/nowhere.git"
+  echo third > "$dD/work.txt"; hookD; hD=$(git -C "$dD" rev-parse HEAD)
+  k "$(grep -qF '"decision": "block"' <<<"$out" && grep -qF "is NOT on origin" <<<"$out" && grep -qF "${hD:0:12}" <<<"$out" \
+      && grep -qF "track/tD" <<<"$out" && [ "$(grep -c . <<<"$out")" = 1 ] && echo 0 || echo 1)" \
+    "a turn that pushed nothing is said in ONE Stop line, naming the commit that did not leave and its branch" "$out"
+  k "$([ -s "$dD/.cc/push.err" ] && echo 0 || echo 1)" "…with push.err written as before, for cc ls and the digest" "$(cat "$dD/.cc/push.err" 2>/dev/null)"
+  hookD   # a turn with nothing to commit: the gap does not close by itself, so the push is tried again and said again
+  k "$(grep -qF '"decision": "block"' <<<"$out" && grep -qF "is NOT on origin" <<<"$out" && grep -qF "${hD:0:12}" <<<"$out" \
+      && ! grep -qF "nothing was committed this turn" <<<"$out" && echo 0 || echo 1)" \
+    "…and a turn with nothing to commit says it too, naming the push that failed and not the empty index" "$out"
+  hookD true
+  k "$([ -z "$out" ] && echo 0 || echo 1)" "…and said nothing while a Stop hook already holds the turn open: not a block-loop" "$out"
+  git -C "$dD" remote set-url origin "$osD"; echo fourth > "$dD/work.txt"; hookD
+  k "$([ "$(git -C "$osD" rev-parse track/tD)" = "$(git -C "$dD" rev-parse HEAD)" ] && [ -z "$out" ] && echo 0 || echo 1)" \
+    "…and a remote that answers again is pushed to, with nothing said" "$out"
+  # A COMMIT THIS HOOK DID NOT MAKE. The session committed by hand and pushed by hand, so the index is clean and HEAD
+  # is past the receipt: the quiet turn used to push nothing and tell the seat, turn after turn, that work the remote
+  # already held was not live and to say nothing was live (review of #588).
+  echo fifth > "$dD/work.txt"; git -C "$dD" -c user.name=t -c user.email=t@t commit -qam "hand commit, hand push"
+  git -C "$dD" push -q origin track/tD 2>/dev/null; hookD
+  k "$([ -z "$out" ] && echo 0 || echo 1)" "a commit pushed by hand is not called unpushed by the quiet turn after it" "$out"
+  eq "…and the receipt moves up to what the remote really holds" "$(cat "$dD/.cc/pushed" 2>/dev/null)" "$(git -C "$dD" rev-parse HEAD)"
+  echo sixth > "$dD/work.txt"; git -C "$dD" -c user.name=t -c user.email=t@t commit -qam "hand commit, no push"; hookD
+  k "$([ "$(git -C "$osD" rev-parse track/tD 2>/dev/null)" = "$(git -C "$dD" rev-parse HEAD)" ] && [ -z "$out" ] && echo 0 || echo 1)" \
+    "…and one the session committed and did not push is PUSHED by that turn, not reported to it" "$out"
+  git -C "$dD" remote remove origin; echo seventh > "$dD/work.txt"
+  git -C "$dD" -c user.name=t -c user.email=t@t commit -qam "hand commit, nowhere to push"; hookD
+  k "$(grep -qF "is NOT on origin" <<<"$out" && grep -qF "nothing was committed this turn" <<<"$out" && echo 0 || echo 1)" \
+    "…and with no remote to try, the gap is still said, in the words of a turn that committed nothing" "$out"
+  git -C "$dD" remote add origin "$osD"
+  # THE DELETE THAT LANDS MID-PUSH, which is where the lease used to call a missing tip "something else wrote". The
+  # remote is ahead (a real other writer), so the plain push is rejected; $UPACK then takes the branch away inside the
+  # push path, between that rejection and the leased push.
+  osR=$(bare delR); dR=$(mkproj boxr/tR origin "$osR"); jR2="$HOME/.cc/state/boxr/tR/progress.md"
+  rpush(){ ( cd "$dR" && "$bin/cc-checkpoint" --push </dev/null >/dev/null 2>&1 ); }
+  rpush   # a lease of our own on file
+  git clone -q "$osR" "$T/elseR" 2>/dev/null
+  theirs(){   # a writer this branch's reflog has never seen, on top of whatever the remote holds → its tip on stdout
+    git -C "$T/elseR" fetch -q origin "refs/heads/track/tR" 2>/dev/null
+    git -C "$T/elseR" checkout -q -B track/tR FETCH_HEAD 2>/dev/null
+    echo "$1" > "$T/elseR/work.txt"; git -C "$T/elseR" -c user.name=o -c user.email=o@o commit -qam "$1"
+    git -C "$T/elseR" push -q origin track/tR 2>/dev/null; git -C "$T/elseR" rev-parse HEAD; }
+  mine(){ git -C "$dR" -c user.name=t -c user.email=t@t commit -q --amend -m "$1"; }   # our own rebase: the plain push is then rejected
+  printf '#!/usr/bin/env bash\ngit -C "%s" update-ref -d refs/heads/track/tR 2>/dev/null\nexec git-upload-pack "$@"\n' "$osR" > "$bin/upack-del"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$bin/upack-dead"; chmod +x "$bin/upack-del" "$bin/upack-dead"
+  theirs one >/dev/null; mine rebased
+  printf '%s\n' "$bin/upack-del" > "$UPACK"; rpush; rc=$?
+  eq "a branch deleted between the two pushes is put back, not leased against a tip that is gone" "rc=$rc $(git -C "$osR" rev-parse track/tR 2>/dev/null)" "rc=0 $(git -C "$dR" rev-parse HEAD)"
+  eq "…and the lease is what was just pushed" "$(cat "$dR/.cc/pushed" 2>/dev/null)" "$(git -C "$dR" rev-parse HEAD)"
+  k "$(grep -q 'STATUS: BLOCKED' "$jR2" 2>/dev/null && echo 1 || echo 0)" "…with nothing blocked: no other writer was refused, the ref was gone" "$(cat "$jR2" 2>/dev/null)"
+  lrk=$(git -C "$dR" rev-parse HEAD)   # the lease that push left on file: no refusal below may move it
+  lr2=$(theirs two); mine "rebased again"
+  printf '%s\n' "$bin/upack-dead" > "$UPACK"; rpush; rc=$?
+  eq "a remote that does not answer is not a deleted branch: the refusal stands and its tip is kept" "rc=$rc $(git -C "$osR" rev-parse track/tR)" "rc=2 $lr2"
+  : > "$UPACK"   # the remote answers for itself again
+  lr3=$(theirs three); mine "rebased once more"; rpush; rc=$?
+  eq "…and a tip this branch never held, on a remote that has it, is refused exactly as before" "rc=$rc $(git -C "$osR" rev-parse track/tR)" "rc=2 $lr3"
+  eq "…and neither refusal moved the lease" "$(cat "$dR/.cc/pushed" 2>/dev/null)" "$lrk"
+  k "$(grep -q 'something else wrote' "$jR2" 2>/dev/null && echo 0 || echo 1)" "…and said, as before" "$(cat "$jR2" 2>/dev/null)"
   echo "cc-checkpoint selfcheck: $((n - f)) passed, $f failed"; [ "$f" = 0 ]
 }
 [ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
@@ -2089,7 +2283,17 @@ commit_end(){   # The hook stays nonblocking. Completion requires observable, cl
   fi
   project_readme   # a project's repository describes the project, not the workspace it is a branch of
   git add -A 2>/dev/null || { [ "$STRICT" = 0 ] && exit 0; refuse "failed: git add"; }
-  if git diff --cached --quiet 2>/dev/null; then commit_end; fi   # nothing changed
+  # NOTHING CHANGED THIS TURN — but a gap left by an earlier one does not close by itself, and a session that reads
+  # "committed and pushed" into the silence of a quiet turn is exactly how a day's work stayed here. Only a track
+  # that has pushed before is told (a lease on file), because one that never has may have nowhere to push at all.
+  if git diff --cached --quiet 2>/dev/null; then
+    # …and a commit this hook did not make is still a commit: push_catchup sends it — or finds the remote already
+    # holds it — before push_gap decides anything, so a quiet turn reports only a push that really failed.
+    if [ -e "$ST/pushed" ]; then branch_back "$branch"
+      if push_catchup "$branch"; then push_gap "$branch" "nothing was committed this turn, so nothing was pushed either"
+      else push_gap "$branch"; fi
+    fi
+    commit_end; fi
   bad=$(git diff --cached --diff-filter=A --name-only | grep -E "$SECRETS" | head -5 | tr '\n' ' ')   # only NEW files: a repo that already tracks .env.example is not leaking
   [ -z "$bad" ] || refuse "refused: staged files look like secrets: $bad (remove or ignore them, then the next turn commits)"
   files=$(git diff --cached --name-only | wc -l | tr -d ' ')
@@ -2102,6 +2306,7 @@ commit_end(){   # The hook stays nonblocking. Completion requires observable, cl
   [ "$STRICT" = 0 ] || commit_end
   if pick_remote; then   # push failures never block, but they must not be invisible either (cc ls / digest show "push!")
     lease_push "$branch"; [ $? = 2 ] && lease_refused "$branch"
+    push_gap "$branch"   # …and the session that made the commit hears it before the turn ends, whatever went wrong
   fi
 } >/dev/null 2>&1
 exit 0
