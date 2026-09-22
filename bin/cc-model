@@ -333,12 +333,9 @@ note_unavailable(){   # $1 family · $2 reason → one row per family: since sta
   since=$(awk -F'\t' -v f="$f" '$1==f{print $2+0; exit}' "$UNAV" 2>/dev/null); [ "${since:-0}" -gt 0 ] || since=""
   { [ -f "$UNAV" ] && awk -F'\t' -v f="$f" '$1!=f' "$UNAV"; printf '%s\t%s\t%s\t%s\n' "$f" "${since:-$now}" "$now" "$why"; } > "$UNAV.t"
   mv "$UNAV.t" "$UNAV"
-  [ -n "$since" ] && return 0   # once per MODEL out, not per probe: the log row and the owner's line below. A second
-                                # model going out in the same episode is its own row, and the owner hears that one too.
-  printf '%s\t%s\tunavailable\t%s\t%s%s\n' "$(date -u +%FT%TZ)" "$now" "$f" "$why" "${CRED:+ (login: $CRED)}" >> "$LOG"
-  [ -z "$CRED" ] || return 0   # another login's record: the box's sessions do not run on it, so the owner's line is not about them
-  local nx; nx=$(chain_next "$f" 2>/dev/null) || nx="-"   # THE OWNER HEARS THE KIND, AND WHAT LIFTS IT — not "a limit"
-  "$BIN/cc-notify" -t "$(hostname -s) model" "$(label "$f") is not available to this account (${why:-usage credits}) — not a limit: no reset lifts it. Sessions and loops on it run on $(label "$nx") and return by themselves when it answers again (credits or the cap at claude.ai/settings/usage, or a re-login)." >/dev/null 2>&1 || true; }
+  [ -n "$since" ] && return 0   # once per MODEL out, not per probe: the log row below. A second model going out
+                                # in the same episode is its own row.
+  printf '%s\t%s\tunavailable\t%s\t%s%s\n' "$(date -u +%FT%TZ)" "$now" "$f" "$why" "${CRED:+ (login: $CRED)}" >> "$LOG"; }
 forget_unavailable(){   # $1 family → its row is dropped (nothing to do when it has none)
   unavail "${1:-}" || return 0
   awk -F'\t' -v f="$1" '$1!=f' "$UNAV" > "$UNAV.t"; mv "$UNAV.t" "$UNAV"; [ -s "$UNAV" ] || rm -f "$UNAV"
@@ -353,8 +350,7 @@ mark_unavailable(){   # $1 model · $2 reason → record it, and move the box of
   note_unavailable "$f" "${2:-}"; note_refused "$f"
   cur="$PRIMARY"; ov && cur="$model"; [ "$(fam "$cur")" = "$f" ] || return 0
   nx=$(chain_next "$cur") || return 0   # nothing left to move to: recorded, and every caller reads the chain's end
-  SWITCH_FROM=$(label "$cur"); SWITCH_WHAT="is not available to this account${2:+ ($2)}"
-  do_switch "$nx" "$f not available to this account: ${2:-usage credits}"; SWITCH_FROM=""; SWITCH_WHAT=limit; }
+  do_switch "$nx" "$f not available to this account: ${2:-usage credits}"; }
 note_refused(){ { awk -F'\t' -v f="$1" '$1!=f' "$REFUSED" 2>/dev/null; printf '%s\t%s\n' "$1" "$now"; } > "$REFUSED.t" && mv "$REFUSED.t" "$REFUSED"; }   # $1 family: a REAL run refused now
 refused_recently(){   # $1 family → 0 when a real run (a pane, a loop — never the probe) was refused inside CC_MODEL_REFUSED_HOLD (1 h)
   local t; t=$(awk -F'\t' -v f="${1:-}" '$1==f{print $2+0; exit}' "$REFUSED" 2>/dev/null); [ $((now - ${t:-0})) -lt "${CC_MODEL_REFUSED_HOLD:-3600}" ]; }
@@ -1306,7 +1302,6 @@ restore_blocked(){   # $1 = prompt_panes output → why a probe that answered st
     { printf "cc-limit's stamp still has %s limited until %sZ\n" "$p" "$(date -u -d "@$lim_till" +%H:%M)"; return 0; }
   return 1; }
 SWITCH_TILL=0   # set by a caller that knows the deadline the limit itself named (the prompt's reset); do_switch banks it
-SWITCH_WHAT=limit; SWITCH_FROM=""   # what the owner's line says moved the box, and off which model: a limit on the primary unless told otherwise
 do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   local want="$1" why="${2:-}" m wf n=0 msg to=0 off
   drop_stale_rows   # before the override is written, for the same reason
@@ -1326,12 +1321,7 @@ do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   # "returns to the model it was on"). Down: the panes on the family the box is leaving. Up: each banked pane to its
   # row, a rowless pane on the fallback to the primary, anything else left where a person put it.
   if [ "$m" = "$PRIMARY" ]; then n=$(restore_all "$off"); else n=$(move_off "$off" "$m" "$why"); fi
-  printf '%s\t%s\tswitch\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$n session(s); $why" >> "$LOG"
-  [ "$SWITCH_WHAT" = limit ] || return 0   # a model the account cannot run: note_unavailable already told the owner, once, with what lifts it
-  if [ "$m" = "$PRIMARY" ]; then msg="$(label "$PRIMARY") is back — the sessions it moved hand over to it now; one launched on $(label "$off") meanwhile has a card, 👍 hands it over."
-  elif [ "$to" -gt 0 ]; then msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → its sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z, then back by handoff."
-  else msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → its sessions on $(label "$m") until it answers again, then back by handoff."; fi
-  "$BIN/cc-notify" -t "$(hostname -s) model" "$msg" >/dev/null 2>&1 || true; }
+  printf '%s\t%s\tswitch\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$n session(s); $why" >> "$LOG"; }
 # ── CLASSIFICATION READS FIELDS, NEVER THE DOCUMENT ──────────────────────────────────────────────────────────────
 # A result JSON is kilobytes of numbers, uuids and the worker's own prose. Grepping it whole is how this classifier
 # came to be wrong on 41 of 48 real runs (2026-09-01 review): "429" sits inside uuids, token counts and dollar costs;
@@ -1834,16 +1824,16 @@ TXT
   rm -f "$OV"; : > "$LOG"; : > "$d/calls"
   t 'nothing recorded: nothing is forcing the box off its primary' "$(forced)" ""
   mark_unavailable "$c3" 'Sonnet 5 requires usage credits'
-  t 'a model the box is not on is recorded, nothing is switched, and the owner hears the kind once — not a limit, what lifts it' \
-    "$(unavail "$(fam "$c3")" && echo rec)$([ -e "$OV" ] && echo ov)$(grep -c "^notify .*$(label "$c3") is not available to this account (Sonnet 5 requires usage credits) — not a limit: no reset lifts it.* return by themselves when it answers again (credits or the cap at claude.ai/settings/usage, or a re-login)" "$d/calls")" rec1
+  t 'a model the box is not on is recorded, nothing is switched, and nothing goes to the owner — the kind is in $LOG for cc-model status/a debugging engineer' \
+    "$(unavail "$(fam "$c3")" && echo rec)$([ -e "$OV" ] && echo ov)$(grep -c '^notify' "$d/calls")$(grep -c $'\tunavailable\t'"$(fam "$c3")"$'\tSonnet 5 requires usage credits' "$LOG")" rec01
   t 'the chain a caller walks leaves it out'      "$(chain | tr '\n' ' ')"      "$c1 $c2 "
   t 'and next steps over it to the chain'"'"'s end' "$(chain_next "$c2"; echo ":$?")" ":1"
   forget_unavailable "$(fam "$c3")"
   t 'forgotten, it is a rung again'               "$(chain | wc -l)"            3
   : > "$d/calls"; mark_unavailable "$c1" 'Fable 5.1 requires usage credits'
   t 'the PRIMARY the account cannot run: the box moves to the next rung, its [1m] context riding along' "$(cut -f1 "$OV")" "$exp"
-  t 'and the owner'"'"'s ONE line says what is out, that it is not a limit, where its sessions run and that they come back' \
-    "$(grep -c "^notify" "$d/calls"):$(grep -c "^notify .*$(label "$PRIMARY") is not available to this account (Fable 5.1 requires usage credits) — not a limit: no reset lifts it. Sessions and loops on it run on $(label "$exp") and return by themselves" "$d/calls")" 1:1
+  t 'nothing goes to the owner for it — the record is $LOG'"'"'s alone (comms review, 2026-09-22)' \
+    "$(grep -c "^notify" "$d/calls"):$(grep -c $'\tunavailable\t'"$(fam "$PRIMARY")"$'\tFable 5.1 requires usage credits' "$LOG")" 0:1
   t 'the override carries the reason'             "$(cut -f4 "$OV")" "$(fam "$c1") not available to this account: Fable 5.1 requires usage credits"
   t 'current hands a dispatch that rung'          "$(current)"      "$exp"
   t 'status says which model, and why'            "$(status_line)" "$(fam "$exp") until probe — $(fam "$c1") is not available to this account"
@@ -1860,7 +1850,8 @@ TXT
   t 'and the log says it came back'               "$(grep -c $'\tavailable\tfable\tanswered as itself again' "$LOG")" 1
   do_switch "$c2" 'test'; : > "$d/calls"; mark_unavailable "$c2" 'Opus 5 requires usage credits'
   t 'the override model the box is on can be the one: it moves on down the chain' "$(fam "$(cut -f1 "$OV")")" "$(fam "$c3")"
-  t 'and that line names the model it left'       "$(grep -c "^notify -t $(hostname -s) model $(label "$c2") is not available" "$d/calls")" 1
+  t 'nothing is sent to the owner, and the $LOG row names the model it left' \
+    "$(grep -c '^notify' "$d/calls")$(grep -c $'\tunavailable\t'"$(fam "$c2")"$'\tOpus 5 requires usage credits' "$LOG")" 01
 
   # ── AN OUTAGE MOVES ONLY THE SESSIONS ON THAT MODEL, AND ITS LIFT PUTS EACH BACK WHERE IT WAS (2026-09-15) ──────
   # The brief's three DONE lines, each on its own fixture: (a) a Fable-only refusal, read off the CLI's own line,
@@ -1890,11 +1881,12 @@ TXT
   t '(a) every other session ON that model moves too, with no nudge: it is mid-work or idle by choice' "$(typed w/orch-b)" "/model $exp"
   t '(a) a session on another family is not Fable-bound: nothing is typed at the steward, nor at the one a person put on Opus' \
     "$(typed w/steward)$(typed w/by-hand)" ""
-  t '(a) the owner hears it once' "$(grep -c '^notify' "$d/calls")" 1
+  t '(a) nothing goes to the owner (comms review, 2026-09-22) — $LOG has the row once' \
+    "$(grep -c '^notify' "$d/calls")$(grep -c $'\tunavailable\tfable\tFable 5.1 requires usage credits' "$LOG")" 01
   t '(a) what each pane was on is banked, moved or kept' \
     "$(cut -f1,3,5 "$MOVED" | tr '\t' ':' | sort | paste -sd' ' -)" "%1:$PRIMARY:moved %2:${PRIMARY%%\[*}:moved %3:$c3:kept %4:$exp:kept"
   : > "$d/typed"; credits_panes
-  t '(a) the line is still on screen a tick later: nothing is typed twice, nobody is told twice' "$(wc -l < "$d/typed")$(grep -c '^notify' "$d/calls")" 01
+  t '(a) the line is still on screen a tick later: nothing is typed twice, nobody is told twice' "$(wc -l < "$d/typed")$(grep -c '^notify' "$d/calls")" 00
   # …AND A SECOND OUTAGE INSIDE THE SAME EPISODE IS A MOVE OF ITS OWN (third review of #503). The guard above was the
   # pane's ROW and the row belonged to the EPISODE: a pane typed at during the Fable move carried `moved` for the rest
   # of it, so when the account hit its monthly cap on Opus two hours later — the same panes, one rung down — both
@@ -1913,8 +1905,8 @@ TXT
     "$(typed w/orch-b):$(typed w/by-hand):$(typed w/steward)" "/model $c3x:/model $c3x:"
   t '(a) …while the chained move still restores each pane to what it was on before the FIRST one' \
     "$(moved_row %1):$(moved_row %4)" "$PRIMARY:$exp"
-  t '(a) …and the owner hears this model too: the line is once per model out, not once per episode' \
-    "$(grep -c "^notify .*$(label "$exp") is not available to this account" "$d/calls")" 1
+  t '(a) …nothing to the owner for this model either, and $LOG gets its own row: once per model out, not once per episode' \
+    "$(grep -c '^notify' "$d/calls")$(grep -c $'\tunavailable\t'"$(fam "$exp")"$'\tYou'"'"'ve hit your monthly spend limit' "$LOG")" 01
   : > "$d/typed"; credits_panes
   t '(a) …and the cap line a tick later types nothing: the second move has a guard of its own now' "$(wc -l < "$d/typed")" 0
   forget_unavailable "$(fam "$exp")"; printf '%s\t%s\t0\t%s\t0\n' "$exp" "$now" 'the Fable move' > "$OV"   # the rest of (a) picks up where that move left off
@@ -1958,7 +1950,8 @@ TXT
     "$(typed no-record):$(moved_row %8)" "/model $FALLBACK:$PRIMARY"
   t '(b) the row an earlier episode left behind held nobody back: the box was on its primary, so this episode started from none' \
     "$(grep -c "$((now - 7200))" "$MOVED")" 0
-  t '(b) the owner'"'"'s line says how its sessions come back' "$(grep -c '^notify .*its sessions on Opus 5 until .*, then back by handoff' "$d/calls")" 1
+  t '(b) nothing goes to the owner (comms review, 2026-09-22) — the switch is a $LOG row, not a Slack post' \
+    "$(grep -c '^notify' "$d/calls")$(grep -cF $'\tswitch\t'"$FALLBACK"$'\t' "$LOG")" 01
   printf '%s\n' '%1 seat' '%2 orch' '%3 steward' '%4 by-hand' '%7 successor' '%8 no-record' > "$d/sess"   # a handoff during the outage came up on `current`
   printf '%s\t%s\n' '%1' "$FALLBACK" '%2' "$FALLBACK" '%3' "$c3" '%4' "$exp" '%7' "$FALLBACK" > "$d/live"
   # THE LIFT (owner, 2026-09-18): "major sessions like [the planning seats] automatically go back on fable via
@@ -1984,7 +1977,8 @@ TXT
   t '(b) the log says which window got which, and the ledger holds one row per window' \
     "$(awk -F'\t' '$3=="handoff"||$3=="card"{print $3}' "$LOG" | paste -sd, -):$(cut -f1,3 "$RETURNED" | tr '\t' = | paste -sd, -)" \
     "handoff,handoff,card,handoff:seat=handoff,orch=handoff,successor=card,no-record=handoff"
-  t '(b) the owner'"'"'s line says how they come back' "$(grep -c '^notify .*is back — the sessions it moved hand over to it now; one launched on Opus 5 meanwhile has a card' "$d/calls")" 1
+  t '(b) nothing goes to the owner for the restore either — the $LOG row is the record' \
+    "$(grep -c '^notify' "$d/calls")$(grep -cF $'\tswitch\t'"$PRIMARY"$'\t' "$LOG")" 01
   # a second flip inside the same outage — the probe answered, Fable refused again minutes later, the probe answers
   # again — sends nothing twice: the ledger rows are younger than the gap
   local pold; pold="${PRIMARY%%\[*}"; pold="${pold%-1}"   # the primary family's OLD id: same family, a different id
@@ -2382,7 +2376,8 @@ TXT
   credits_panes
   t '(q) …the next tick, once typing works, moves that pane down a rung and nudges it — the same line, not skipped as seen' \
     "$(typed w/busy)" "/model $lo|$(label "$fl") refused this session for usage credits; it is on $(label "$lo") now — carry on with what you were doing."
-  t '(q) …and re-reading the line told the owner nothing twice: one line per model out' "$(grep -c '^notify' "$d/calls")" 1
+  t '(q) …and nothing goes to the owner, re-read or not (comms review, 2026-09-22) — $LOG holds one row per model out' \
+    "$(grep -c '^notify' "$d/calls")$(grep -c $'\tunavailable\t'"$(fam "$fl")"$'\t' "$LOG")" 01
 
   # ── AVAILABILITY IS PER LOGIN: a member workspace's refusal is its own record, never the box's ──────────────────
   pl; rm -f "$OV"; CRED=member; UNAV="$d/model-unavailable.member"; mark_unavailable "$lo" 'Sonnet 5 requires usage credits'

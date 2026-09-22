@@ -40,10 +40,10 @@
 #   PUBLISH_ALLOW    paths inside the prefix the gate skips     (default: LICENSE README.md — they name the public repo)
 #   CC_PUSH_TIMEOUT  seconds any one command may spend on the remote (default 120; env only)
 #
-# A RUN THAT FAILS IS NOTICED ONCE. Every abort writes a line to the log, records a failure in the ledger
-# (cc-failures) and pages the owner (cc-notify) — the record and the page once per REASON, so a cause that sticks
-# across 43 timer runs is one record and one page, and the same cause coming back after a good publish is a second
-# episode. See `die` below.
+# A RUN THAT FAILS IS RECORDED ONCE, not paged (comms review, 2026-09-22 — no owner post: these appeared in
+# unread updates with no response ever evidenced). Every abort writes a line to the log and records a failure in
+# the ledger (cc-failures), once per REASON, so a cause that sticks across 43 timer runs is one record, and the
+# same cause coming back after a good publish is a second episode. See `die` below.
 #
 # AND NOTHING HERE WAITS FOR A PERSON. This runs off a timer with nobody watching, so a git that asks for a
 # username — the public repo's credential gone, a remote that stops answering — would sit on that prompt for
@@ -227,7 +227,8 @@ PY
   # A MERGED SUBJECT THAT NAMES THE BOX MUST NOT STOP THE MIRROR (2026-09-11: one did, and the composed message
   # was refused on all 43 ticks of eleven hours). The denied word is INVENTED and handed in through PUBLISH_DENY,
   # so the gate's own regex is exercised without this file — which ships — carrying anything this box is called.
-  # The failing runs below reach `die`, so they also page: CC_NOTIFY_LOG_ONLY keeps that in a file under $T.
+  # The failing runs below reach `die`, which no longer pages (comms review, 2026-09-22); CC_NOTIFY_LOG_ONLY is
+  # still set so a case here that DID call cc-notify would be caught, not silently skipped by a missing binary.
   DW=zqbox; DENYW=""; REM=""
   fpub(){ ( cd "$T/src" && PATH="$T/stub:$PATH" HOME="$T" CC_PUBLISH_STATE="$T/state" \
             CC_NOTIFY_LOG="$T/notify.log" CC_NOTIFY_LOG_ONLY=1 CC_FAILURES="$T/failures" CC_PUBLISH_ARCH="$T/arch" \
@@ -253,7 +254,7 @@ PY
   k "$(t test "$rc" = 1)" "a TREE that names the box still stops the publish — that gate is untouched"
   k "$(t test "$(wc -l < "$LED" 2>/dev/null)" = 1)" "…and three runs of the SAME failure are ONE record in the ledger, not three"
   k "$(t grep -q '"kind":"mirror-freshness/publish-blocked"' "$LED")" "…filed under the kind the catalogue names, by the box itself"
-  k "$(t test "$(wc -l < "$T/notify.log")" = 1)" "…and the owner was paged once, not once a tick"
+  k "$(t test "$(wc -l < "$T/notify.log")" = 0)" "…and the owner is not paged at all any more (comms review, 2026-09-22) — the ledger record above is the whole of it"
   k "$(t test "$(grep -c ABORT "$T/state/publish.log")" = 3)" "…while the log still says it every run"
   REM="$T/nowhere.git"; fpub >/dev/null 2>&1; REM=""
   k "$(t test "$(wc -l < "$LED" 2>/dev/null)" = 2)" "a DIFFERENT reason is a record of its own — the dedup is per reason, not per tool"
@@ -285,32 +286,30 @@ PY
   [ "$f" -eq 0 ]; exit $?
 fi
 
-# A publish that cannot happen is not silent: it is RECORDED in the failure ledger, it pages the owner (ntfy/Slack)
-# and it leaves a line in the log.
+# A publish that cannot happen is not silent: it is RECORDED in the failure ledger, and it leaves a line in the
+# log. NO ambient page any more (comms review, 2026-09-22): the audit found these "appear in unread updates" with
+# no owner response ever, for a mirror the owner never asked after. A publish somebody is actually waiting on is
+# a REPLY in that request's own thread, not this unattended path's job.
 die() {
   local sig; sig="$(cksum <<<"$1")"
   printf 'cc-publish: %s\n' "$1" >&2
   printf '%s\tABORT\t%s\n' "$(date -u +%FT%TZ)" "$(printf '%s' "$1" | tr '\n' ' ')" >> "$LOG"
-  # Only a REAL publish is a failure of the box. `status` is a query and `--dry-run` is a rehearsal: neither is,
-  # and a read-only command that pushes a phone alert teaches its reader to ignore the alert.
+  # Only a REAL publish is a failure of the box. `status` is a query and `--dry-run` is a rehearsal: neither is.
   # ONCE PER REASON, too, now that a timer runs this unattended every few minutes. A stuck cause — a gate hit, a
-  # remote that is down — must cost one record and one page, not one per tick: on 2026-09-11 the same abort
-  # repeated 43 times over eleven hours and left nothing behind but journal lines. The stderr line, the log and
-  # the unit's own failure still say it every run; the next publish that gets through forgets the reason, so a
-  # cause that comes back is recorded again and counts as a second episode. The mark is written BEFORE either
-  # call and independently of both — it used to hang off cc-notify being installed, which would have swallowed
-  # the ledger record with the page.
+  # remote that is down — must cost one record, not one per tick: on 2026-09-11 the same abort repeated 43 times
+  # over eleven hours and left nothing behind but journal lines. The stderr line and the log still say it every
+  # run; the next publish that gets through forgets the reason, so a cause that comes back is recorded again and
+  # counts as a second episode.
   if [ "$mode" = publish ] && [ "$dry" = 0 ] && [ "$(cat "$SEEN" 2>/dev/null)" != "$sig" ]; then
     printf '%s\n' "$sig" > "$SEEN"
     # BOUNDED, like everything else this unattended run calls: cc-failures appends under a lock, and a holder that
-    # never lets go must not hold the timer's run open. A record that cannot be written costs the page nothing.
+    # never lets go must not hold the timer's run open.
     [ -x "$BIN/cc-failures" ] && timeout 30 "$BIN/cc-failures" record \
       --scope "${REPO:-$(basename "${R:-$PWD}")}" --kind mirror-freshness/publish-blocked \
       --expected "the public repo follows the default branch, one publish per timer tick" \
       --observed "$1" --evidence "$LOG" --detector box \
       --detector-evidence "cc-publish aborted; recorded once per reason, not once per run" \
       --writer cc-publish >/dev/null 2>&1
-    [ -x "$BIN/cc-notify" ] && "$BIN/cc-notify" -p high -t "${REPO:+[$REPO] }publish blocked" --heading "${REPO:+$REPO: }the public copy was not updated" "$1" >/dev/null 2>&1   # a title starting with the repo routes to its channel
   fi
   exit 1
 }

@@ -35,8 +35,8 @@ line about a PR is re-read at GitHub at send time and dropped if the merge ANSWE
 beside it, an unpushed branch, still goes out (--no-net never asks, so never drops). A finished row (`merged`/
 `done`) raises nothing on suspicion; a merged row whose branch really holds commits origin lacks is still
 reported. A `held` row keeps its fixes, stops, safety asks and its question; the guesses go quiet.
-A finished track with an open PR nobody is landing is offered once per PR and alerted once per 4 h window —
-unless the row itself waits on a person, which is somebody having picked it up: that one raises neither.
+A finished track with an open PR nobody is landing is offered once per PR and alerted once, ever, past the
+4 h window — unless the row itself waits on a person, which is somebody having picked it up: that one raises neither.
 
 RUNAWAY: a headless worker with no cc-loop above it is ended on sight; a worker alive with journal, loop log and
 worktree untouched for 3 h, seen by two passes, is ended too, never during a usage limit. --no-stop reports only.
@@ -50,7 +50,7 @@ THE TICK (--apply, unfiltered): after the reconcile it runs, in order,
   · the fixture rule (sweep rule 6) every tick; the full sweep of CC_JANITOR_REPOS once per 24 h
   · the wake, per repo with a board, only while CC_WAKE=on (~/.cc/config) — off by default, the owner's switch
   · the digest, once a day after 11:00 America/Los_Angeles (hour and stamp date both in that zone, never the host's),
-    posted the way `digest --notify` posts
+    stamped but no longer posted — `digest --notify` still posts it by hand
 
 SWEEP (`sweep`): per repo, in order. Rule 1: a `merged`/`done` row past 48 h with a clean worktree and nothing
 alive in it → `cc rm`; dirty, alive, or the snapshot disagreeing → reported. Rule 2: a remote track/* branch
@@ -75,8 +75,8 @@ DIGEST (`digest`): the five questions off the boards and the snapshot — shippe
 row inside a live bundle is counted "in bundles", not queued: the bundle row is what is moving), waiting
 on you (each row's question, then the owner's 📌 pins from ~/.cc/slack/revisit.json), stopped, cost (cc-spend
 today) — and one line from the failure ledger, what it holds and what crossed the rule (cc-failures owns the numbers;
-an empty ledger is no line). That whole report is what `digest` prints. What is POSTED — `--notify`, and the tick once
-a day, a major update to the box's main channel — is the phone one: the counts line, the limit and the tier's word,
+an empty ledger is no line). That whole report is what `digest` prints. What `--notify` POSTS (the tick itself no
+longer does — it only stamps the day) is the phone one: the counts line, the limit and the tier's word,
 how many failure kinds crossed the rule (none is no line), every waiting row's question (cut to 120) and the asks count,
 then one line naming what it left out, linked to CC_DIGEST_LINK (~/.cc/config, an https URL; anything else reads "the
 Home tab"). `--notify` prints what it posts.
@@ -1919,7 +1919,9 @@ def tick(snap, net):
     except OSError:
         posted = ""
     if at.hour >= DIGEST_HOUR and posted != today:
-        digest_post(digest_text(snap, phone=True))
+        # No longer posted: the owner reads the Home tab, and a debugging engineer reads the boards/logs this
+        # digest would have summarized. The stamp still marks the day it ran, so a second tick the same day
+        # is still a no-op — `digest --notify` (a person asking for it by hand) still posts.
         open(ds, "w").write(today + "\n")
 
 
@@ -2114,14 +2116,15 @@ def main(argv):
                 continue
             first = float(old.get(k) or 0) or t0
             last, stood = float(old.get(ak) or 0), t0 - first
-            if ((not old.get(ok_) or (stood >= pend_after and t0 - last >= pend_after))
-                    and merged_now(repo, f.get("pr"))):
+            due = stood >= pend_after and not old.get(ak)   # ak, once set, never fires again — at most ONE notice ever
+            if (not old.get(ok_) or due) and merged_now(repo, f.get("pr")):
                 continue                                # about to nag, and the PR has merged since facts() read it: nothing
             keep[k] = first                             # to send, no memo, and the next pass marks the row merged
-            if stood >= pend_after and t0 - last >= pend_after:
+            if due:
                 last = t0
-                # #alerts is every project's, so the line names the project as well as the work: without it nobody
-                # reading the channel can tell whose this is, and a PR link is not always there to say.
+                # At most ONE notice per PR, ever: `ak`, once set, gates every later pass off (the `due` check
+                # above), so this never fires twice for the same unresolved PR. The age keeps counting in `k`,
+                # read by `view`/the dashboard, whether or not this fired.
                 alert(f"⏳ {repo}: {row_title(repo, track)} has been waiting to land for {spoken_hours(stood)}, "
                       f"and nobody has picked it up." + (f" {f['pr']}" if f.get("pr") else ""))
             if last:
@@ -2945,6 +2948,14 @@ def selfcheck():
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: …one per window, however many times the timer fires in it — and still one offer",
            alerted() == a0 + 1 and offered() == 1)
+        led = json.load(open(seenp))                      # …and now a SECOND window has passed since that one line
+        led[f"alerted {repo}/t2"] = now() - 5 * 3600
+        json.dump(led, open(seenp, "w"))
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: AT MOST ONE notice per PR, EVER — a second window past the first alert raises nothing more",
+           alerted() == a0 + 1)
+        ok("...but the age itself keeps counting in the file, for `view`/the dashboard to read",
+           float(json.load(open(seenp))[f"pending {repo}/t2"]) > 0)
         os.remove(f"{th}/gh")                            # no gh = no PR answer at all, which is not evidence
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: with the PR state unreadable it goes quiet rather than guessing at unlanded work",
@@ -3632,15 +3643,17 @@ def selfcheck():
         globals().update(procs=lambda: (set(), set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}),
                          now=lambda: calendar.timegm((2026, 9, 15, 17, 30, 0)))      # 10:30 PDT: past 11:00 in UTC and in EDT
         quietly(tick, {}, True)
-        ok("DIGEST AT: 17:30 UTC is 10:30 in Los Angeles, so nothing is posted and no stamp is written",
-           posts() == [] and not os.path.exists(f"{tz}/.cc/state/digest.stamp"))
+        ok("DIGEST AT: 17:30 UTC is 10:30 in Los Angeles, so no stamp is written",
+           not os.path.exists(f"{tz}/.cc/state/digest.stamp"))
         globals().update(now=lambda: calendar.timegm((2026, 9, 15, 18, 5, 0)))       # 11:05 PDT
         quietly(tick, {}, True)
-        ok("…18:05 UTC is 11:05 there: one post, stamped with LA's date",
-           len(posts()) == 1 and open(f"{tz}/.cc/state/digest.stamp").read().strip() == "2026-09-15")
+        ok("…18:05 UTC is 11:05 there: stamped with LA's date, and NOT posted — a debugging engineer reads the "
+           "boards, not the control channel, for this; `digest --notify` still posts it by hand",
+           posts() == [] and open(f"{tz}/.cc/state/digest.stamp").read().strip() == "2026-09-15")
         globals().update(now=lambda: calendar.timegm((2026, 9, 16, 5, 0, 0)))        # 22:00 PDT, still the 15th there
         quietly(tick, {}, True)
-        ok("…and 05:00 UTC the next day is still the 15th in LA: no second post", len(posts()) == 1)
+        ok("…and 05:00 UTC the next day is still the 15th in LA: the stamp does not move",
+           posts() == [] and open(f"{tz}/.cc/state/digest.stamp").read().strip() == "2026-09-15")
     finally:
         restore(); shutil.rmtree(tz, ignore_errors=True)
     # (c) sweep: a terminal track older than 48 h goes; a dirty one is reported and kept

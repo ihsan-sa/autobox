@@ -442,7 +442,10 @@ def run_selfcheck():
 
         os.environ["CC_HANDOFF"] = rec["id"]
         ok("--ready with no target finds the record by CC_HANDOFF", by_id(rec["id"])["target"] == "r1")
+        n1 = posts()
         ok("the successor cuts over", ready() == 0)
+        ok("...silently — cutover is a debugging engineer's record (the ledger line below), not an owner notice",
+           posts() == n1)
         ok("the commit point moved ownership forward", read("r1")["live"] == "successor")
         ok("the predecessor was told to journal and exit",
            any("cc-msg" in a[0] for a in msgs if isinstance(a, list)))
@@ -896,9 +899,10 @@ def run_selfcheck():
            read("r20").get("held") == ["a-live"])
         ok("...and the journal says the successor is live and this session is staying",
            "stays for the 1 subagent" in open(jp20).read())
-        ok("...and the #alerts line says it is staying, not that it is retiring",
-           any(a[1:3] == ["--kind", "alerts"] and "staying for 1 subagent" in a[-1]
-               for a in msgs if isinstance(a, list) and len(a) > 4))
+        ok("...and nothing goes to #alerts for it — a debugging engineer reads the journal line above, not "
+           "an owner notice for a routine cutover",
+           not any(a[1:3] == ["--kind", "alerts"] and "staying for 1 subagent" in a[-1]
+                   for a in msgs if isinstance(a, list) and len(a) > 4))
         n20 = len(said("r20~old"))
         ok("a retried --ready re-derives, but says nothing twice: no second STAY message, no second journal line",
            ready("r20") == 0 and len(said("r20~old")) == n20
@@ -959,10 +963,10 @@ def run_selfcheck():
         del wins["s1~old"]
         sweep()                                         # strike one: the stamp
         rr = read("s1"); rr["gone_since"] = time.time() - 301; write(rr)   # a sweep later, still nobody
+        n0 = posts()
         ok("a predecessor gone past the grace is finalized (two sweeps apart)", sweep() == 0 and read("s1") is None)
-        ok("...and the handover leaves one line in #alerts (owner, 2026-09-01) — as an `alerts` kind, which is "
-           "the rung that lands there",
-           any(a[1:3] == ["--kind", "alerts"] for a in msgs if isinstance(a, list)))
+        ok("...silently — a routine sweep finalize is not an owner notice; the ledger line and done marker "
+           "below are the record", posts() == n0)
         ok("...with the marker cc-guard reads, so the survivor is not gated by the record of its own success",
            os.path.exists(done_path(r["id"])))
         ok("...and the successor is left holding the target's window name",

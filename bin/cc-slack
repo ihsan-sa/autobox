@@ -84,41 +84,6 @@ ALERTS = "alerts"                                              # #alerts is not 
 ALERT_KINDS = ("boot", "limit", "audit", "review", "digest", "alerts", "cc-rc", "heartbeat", "power")   # "<box> <kind>" notify titles → #alerts even when the box shares its name with a repo
 UPDATES = "updates"                                            # #<repo>-updates: every project channel's second lane, for what is automated or long
 UPDATE_KINDS = ("digest",)                                     # …the "<box> <kind>" titles that are PROGRESS, not an alert: they leave #alerts for #<box>-updates
-NOTICE_WINDOW = 900                                            # how long the same join/leave line is not repeated: a reconnect flap is minutes wide, not seconds
-
-def notice_state_path():
-    """{DIR}/notices.json — "<target>\t<who>" -> joined|left, the last join/left line each alias got, across daemon
-    restarts. Read at call time: the selfcheck moves DIR, and a path fixed at import would write the live file."""
-    return f"{DIR}/notices.json"
-
-def notice_state(text):
-    """`joined` or `left` for a chan_notice line, None for any other text (those are not de-duplicated by state)."""
-    if " joined — " in text:
-        return "joined"
-    if text.endswith(" left."):
-        return "left"
-    return None
-
-def notice_key(target, text):
-    return target + "\t" + text.split(" joined — ")[0].split(" left.")[0]
-
-def notice_state_load():
-    try:
-        with open(notice_state_path()) as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-def notice_state_save(d):
-    try:
-        os.makedirs(DIR, exist_ok=True)
-        tmp = notice_state_path() + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(d, f)
-        os.replace(tmp, notice_state_path())
-    except OSError as e:
-        log(f"notice state not saved: {e}")
 VOICE_PREFIX = "🎙️ transcript"                                  # our own transcript of a memo: their message, not our answer to it
 REVISIT_NAME = "pushpin"                                       # the owner's 📌: "something I want to come back to" (on_revisit)
 REACTION_CHAR = {"+1": "👍", "thumbsup": "👍", "-1": "👎", "thumbsdown": "👎", "white_check_mark": "✅", "x": "❌",
@@ -3312,7 +3277,7 @@ def mail_tap(cfg, chat, thread, text="", path="", ts=None):
             log(f"mail out note: {e!r}")
 
 def mail_seen_line(res, links=None):
-    """What the sorter decided, the one line under a mail in the receiver's channel. Built from the socket
+    """What the sorter decided, take_mail's log line for a mail. Built from the socket
     verb's own answer, never from anything the sender wrote, so a subject line can't put words in the box's
     mouth. Every mail gets a line, including one that reached no channel. A held mail is told where its
     thread is, but is not offered "deliver it" here."""
@@ -3414,7 +3379,7 @@ class MailPlaces:
         rule as their Slack socket); the owner's are every session channel belonging to no member. An -updates
         lane isn't offered — same session, automatic half."""
         out = []
-        # Never the receiver's own channel: mail already shows there; that'd be a session on its own log.
+        # Never the receiver's own channel (MAIL_CHANNEL): it is kept out of routing even now nothing posts there.
         # Off both doors: classifier never offers it; a `<channel>@` address for it is refused as unlisted.
         seen = (self.dm.cfg.get("MAIL_CHANNEL") or "").strip().lstrip("#")
         for name, chat in sorted(self._known().items()):
@@ -3467,7 +3432,6 @@ class Daemon:
         self.unminted = set()                                # targets whose last `starting` stamp was an unminted attempt
         self.pending = {}                                   # "tmux" -> expiry (unix time) of an armed !restart tmux confirm
         self.names, self.users = {}, {}
-        self.noticed = {}                                   # (target, text) -> t of the last join/left notice (reconnects repeat them)
         self.threads_chats = {}                             # repo -> its #<repo>-threads chat id (or None), looked up once
         self.perm_asks = {}                                 # request_id -> {target, chat, thread, at, card}: who asked, so an answer given elsewhere still lands
         self.perm_posts = {}                                # target -> [ts, …] of its recent 🔐 posts (perm_room's window)
@@ -4008,10 +3972,8 @@ class Daemon:
                         q.remove(e)
                     self.save_queues()
                 note_handover(target, alias)   # @target/@alias stay handover vocabulary, never linkified into a person
-                if alias:
+                if alias:                       # a join/leave is the log's, never a post (owner's review, 2026-09-20: machine chatter)
                     self.known_aliases[target].add(alias)
-                    self.chan_notice(target, f"🤖 {orch_shown(target, alias)} joined — @{alias} hands it threads; "
-                                             f"@main brings the main session back.")
                 log(f"subscribe {target} alias={alias}{' handoff=' + hid if hid else ''} pid={first.get('pid')} backlog={len(backlog)}")
                 for t, payload, _a in backlog:
                     if time.time() - t < QUEUE_TTL:
@@ -4122,8 +4084,6 @@ class Daemon:
                     if conn in self.subs.get(conn.target, []):
                         self.subs[conn.target].remove(conn)
                 alias = conn.info.get("alias")
-                if alias:
-                    self.chan_notice(conn.target, f"🤖 {orch_shown(conn.target, alias)} left.")
                 log(f"unsubscribe {conn.target} alias={alias}"
                     f"{' handoff=' + conn.info['handoff'] if conn.info.get('handoff') else ''} pid={conn.info.get('pid')}")
             try:
@@ -4269,43 +4229,6 @@ class Daemon:
             except Exception:
                 self.names[chat] = chat
         return self.names[chat]
-
-    def chan_notice(self, target, text):
-        """Best-effort join/leave post for `target` into its -updates lane (`#repo` default); a track's goes in its
-        own thread in #<repo> (a legacy `#repo--track` channel as before).
-        Routine, not owner news; daemon posts skip cmd_post's gate, so that split is reapplied here.
-        Window isn't 60s: a reconnect storm runs minutes wide; same line in NOTICE_WINDOW just drops once."""
-        if not self.cfg.get("SLACK_BOT_TOKEN"):
-            return
-        # A join after a join is not a join: a daemon restart re-runs every orch's hello, so the last notice each
-        # alias got is kept on disk, and only a state change (joined after left, or the reverse) is posted, inside the window.
-        state = notice_state(text)
-        if state:
-            last = notice_state_load()
-            key = notice_key(target, text)
-            if last.get(key) == state:
-                return
-            last[key] = state
-            notice_state_save(last)
-        now = time.time()
-        if now - self.noticed.get((target, text), 0) < NOTICE_WINDOW:
-            return   # a socket-mode reconnect re-runs hello/bye: don't spam the channel with the same join/left line
-        self.noticed = {k: t for k, t in self.noticed.items() if now - t < NOTICE_WINDOW}   # a day of reconnects is not a leak
-        self.noticed[(target, text)] = now
-        tt = track_thread(target)
-        if tt:                                   # a track is a thread, not a channel: its session's join/leave line lives there
-            self.say(tt[0], text, tt[1]); return
-        name = target.replace("/", "--")
-        try:
-            cid, member = find_channel(self.cfg, name)
-            if lane_split(name):
-                ucid, umember = find_channel(self.cfg, updates_name(name))
-                if ucid and umember:
-                    cid, member = ucid, umember    # the ambient lane, rung 5 — his own channel keeps no join/leave line
-        except Exception:
-            return
-        if member:
-            self.say(cid, text)
 
     def permalink(self, chat, ts):
         """Slack link to one message, for the channel purpose ("… from <link>"). Best effort: no link is not an error."""
@@ -4823,8 +4746,9 @@ class Daemon:
         self.hand_off(target, out, meta, chat, thread, ts, alias)
 
     def hand_off(self, target, text, meta, chat, thread, ts, alias=None):
-        """Hands the message to the session, reports what happened; the tail every inbound message ends in.
-        Posts mail=False: plumbing (starting, missing worktree, paused repo) never reaches the mail sender."""
+        """Hands the message to the session; the tail every inbound message ends in. Says something only when no answer
+        is coming soon (paused repo, no session anywhere, a pane without the channel), with mail=False, so that
+        plumbing never reaches a mail sender."""
         self.last_chat[target] = (chat, thread or ts)      # the root of the thread it last heard from (permission_chat, Home)
         save_last(self.last_chat)
         res = self.deliver(target, {"type": "message", "content": text, "meta": meta}, alias=alias)
@@ -4832,32 +4756,37 @@ class Daemon:
         if res == "delivered":
             return
         now = time.time()
-        if res in ("live-no-channel", "no-session") and "/" in target and valid_target(target.partition("/")[0]):
-            # one route for a track channel nobody is listening on: a headless --go worker owns the window, or it finished and the window is gone — never start a session on its worktree or drop the question, the repo's session answers instead, told where it came from
+        if res in ("live-no-channel", "no-session", "no-track") and "/" in target:
+            # one route for a track channel nobody is listening on: a headless --go worker owns the window, it finished
+            # and the window is gone, or it merged and its worktree is gone too (no-track) — never start a session on
+            # its worktree, never create one from Slack, never drop the question: the repo's session answers instead, told where it came from
             # …and NO notice line (owner, 2026-09-18: "adds bloat"): the thread's root says what the track is, and
             # the answer arrives from the repo session in the same thread, which is all the person needs to see.
-            self.hand_to_repo(target, {"type": "message", "meta": meta, "content": text}, res)
-            return
+            # Only a repo session that can't be reached either is worth a line, and then just the one below.
+            r2 = self.hand_to_repo(target, {"type": "message", "meta": meta, "content": text}, res)
+            if r2 in self.WOKEN or r2 in self.NOBODY_BY_DESIGN:
+                return
+            res = "unreached"
         if res == "no-credential":
             # every message, not throttled: this answers what they just asked, in their own thread, and stays true until the owner mints — the channel only hears it once (cc's stamp), so this is what keeps a member from talking to a wall
             self.say(chat, MINT_LINE.format(h=workspace_of(target) or target), thread, mail=False)
             return
+        if res in ("starting", "spooled"):
+            # the message is queued and the session takes it in a moment, and its answer is the reply: a "⏳ starting…" or
+            # "mid-turn, queued" line before it was narration, cut (owner's review, 2026-09-20). The 👀 above says it arrived.
+            log(f"hand_off {target}: {res}")
+            return
         if now - self.told.get((target, res), 0) > 120:
             self.told[(target, res)] = now
-            if res == "starting":
-                self.say(chat, f"⏳ starting the `{target}` session — your message is queued and lands as soon as it is up.", thread, mail=False)
-            elif res == "no-track":
-                repo, _, track = target.partition("/")
-                self.say(chat, f"`{target}` has no worktree (`~/.cc/worktrees/{target}`) — I won't create a track from Slack. "
-                               f"Start it on the box (`cc {repo} {track}`) and message again.", thread, mail=False)
+            if res == "unreached":
+                repo = target.partition("/")[0]
+                self.say(chat, f"nothing is running on `{target}` and the `{repo}` session could not take it either — "
+                               f"your message is queued. On the box: `cc {repo}`.", thread, mail=False)
             elif res == "live-no-channel":
                 w = window_for(target)
                 self.say(chat, f"`{target}` has a live window that is not a Slack-enabled session (started before `cc slack on`, "
                                f"or a headless `--go` worker). On the box `cc-msg {w} <text>` types into it (its answer stays there); "
                                f"for a chat session restart it (`cc handoff …` / `tmux kill-window -t main:{w}`) and message again.", thread, mail=False)
-            elif res == "no-session":   # only when ~/dev/<repo> is gone: the hand-off above takes every other track
-                self.say(chat, f"nothing is running on `{target}` and I found no `{target.partition('/')[0]}` session to "
-                               f"hand this to — your message is queued. On the box: `cc {target.replace('/', ' ')}`.", thread, mail=False)
             elif res == "typed":
                 self.say(chat, f"typed into `{target}`'s terminal — that session runs without the channel, so its answer "
                                f"stays there. For a chat session restart it on the box (`cc handoff …`).", thread, mail=False)
@@ -4865,15 +4794,13 @@ class Daemon:
                 repo = (target or "").partition("/")[0].partition("@")[0]
                 self.say(chat, f"`{repo}` is paused — nothing there spends until `!resume`. Your message is queued and "
                                f"the session reads it then; it will not be dropped meanwhile.", thread, mail=False)
-            elif res == "spooled":
-                self.say(chat, f"`{target}` is mid-turn or holding a dialog — queued on the box; it lands the moment the pane "
-                               f"is free, and a dialog that stands 10 min is reported to the `box` session.", thread, mail=False)
             else:
                 self.say(chat, f"queued for `{target}` ({res}) — `!restart {target}` starts it.", thread, mail=False)
 
     def hand_to_repo(self, target, payload, res):
         """Hands a message for a `<repo>/<track>` with no session of its own to the repo's session instead.
-        Covers live-no-channel (--go worker holds window) and no-session (finished); returns repo's verdict.
+        Covers live-no-channel (--go worker holds window), no-session (finished) and no-track (merged, worktree gone);
+        returns the repo's verdict, or None when there is no repo to hand it to.
         Drops the track's own queued copy once the repo has it, so it never goes stale for the TTL sweep."""
         repo = (target or "").partition("/")[0]
         if "/" not in (target or "") or not valid_target(repo):
@@ -4898,12 +4825,12 @@ class Daemon:
         return r2
 
     def take_mail(self, mail_id):
-        """One stored mail, seen and then sorted — always both halves, in that order. The receiver channel sees the mail first, before anything is decided, and the sorter's answer arrives as a reply in that thread, so the channel holds one line per mail ever taken in, whatever became of it.
-
-        Adds no decision and moves none: mail_sort below is the whole of the old verb, unchanged in what it routes, vets, mirrors and delivers. A receiver channel that's unset, missing or unpostable costs just these two lines."""
-        seen = self.mail_seen(mail_id)
+        """One stored mail, sorted. What arrived and what the sorter made of it (the rule, where it went) goes in the
+        log, not in a channel: a receipt per mail was telemetry nobody read (owner's review, 2026-09-20). The mail's
+        own mirror line, its thread, a hold and its decision are mail_sort's and are posted as before."""
+        self.mail_seen(mail_id)
         res = self.mail_sort(mail_id)
-        self.mail_seen_note(seen, res)
+        log(f"mail {mail_id} sorted: {mail_seen_line(res)}")
         return res
 
     def mail_started(self, ask):
@@ -4957,42 +4884,14 @@ class Daemon:
         log(f"mail {rec['id']} started from={from_a} to={','.join(rcpts)} ws={ws} in=#{pl.name} root={root} line={ts}")
         return {"ok": True, "id": rec["id"], "chat": pl.chat, "ts": root, "line": ts, "name": pl.name}
 
-    def mail_channel(self):
-        """The receiver's own channel, or "" if MAIL_CHANNEL is unset — visibility only, so an unset box routes and delivers exactly the same. Not a lane a mail can route into: MailPlaces.places() leaves it out."""
-        n = (self.cfg.get("MAIL_CHANNEL") or "").strip().lstrip("#")
-        if not n:
-            return ""
-        try:
-            return resolve_channel(self.cfg, n) or ""
-        except Exception as e:
-            log(f"seen: {e!r}")
-            return ""
-
     def mail_seen(self, mail_id):
-        """The arrival post — (chat, ts), or None with no receiver channel or nothing reached it. Posted before anything is decided, so a refused mail and a held one leave the same line, visible while the sorter still thinks. Carries only the mirror line, same as every other channel shows."""
-        chat = self.mail_channel()
-        if not chat:
-            return None
+        """The arrival, in the log before anything is decided: a refused mail and a held one leave the same line."""
         try:
             with open(f"{MAIL_DIR}/inbox/{mail_id}/message.json") as f:
                 msg = json.load(f)
-            line = mail_router().mirror_line(msg)
+            log(f"mail {mail_id} arrived: {mail_router().mirror_line(msg)}")
         except Exception as e:
             log(f"seen {mail_id}: {e!r}")
-            return None
-        ts = self.say(chat, f"{line}\n_{mail_id} — reading it_")
-        return (chat, ts) if ts else None
-
-    def mail_seen_note(self, seen, res):
-        """The sorter's answer, posted in that mail's own thread in the receiver channel; never raises, since by now the mail is already routed and delivered and an unpostable channel must not turn that into a failure."""
-        if not seen:
-            return
-        chat, ts = seen
-        try:
-            links = {n: self.permalink(c, t) for n, (c, t) in (res.get("in") or {}).items()}
-            self.say(chat, mail_seen_line(res, links), ts)
-        except Exception as e:
-            log(f"seen note: {e!r}")
 
     def mail_sort(self, mail_id):
         """One stored mail: routed, mirrored, delivered in one verb; reply says which channels, or why not.
@@ -5017,17 +4916,18 @@ class Daemon:
             # THE STORE-ONLY DOOR (router.QUIET). Brief: "the router records the decision as `quiet` and delivers
             # nothing: no task, no mirror line, no session woken, no reply to the sender" — so this returns before
             # the vetting read, the conversation record and every say(); `reply` None is what the receiver sends
-            # nothing for. The log line and the seen line are the record.
+            # nothing for. The log lines are the record.
             log(f"mail {mail_id} from={msg.get('from', '')} rule={dec.rule}: quiet — stored, delivered nowhere")
             return {"ok": True, "routed": False, "quiet": True, "why": "a store-only address", "reply": None,
                     "rule": dec.rule}
         rec = R.join_conv(dec.conv, msg) if dec.conv else R.new_conv(msg, dec.workspace)
-        # the rule that placed it is kept on the conversation record (from the first mail only, a reply follows the thread and never rewrites it), the log line and the seen line, so an unmatched address's landing is traceable
+        # the rule that placed it is kept on the conversation record (from the first mail only, a reply follows the thread and never rewrites it), and the log lines, so an unmatched address's landing is traceable
         if not dec.conv:
             rec["rule"] = dec.rule
         # the vetting read is the only door delivery comes through: it runs before the mirror posts, so the verdict is in the line itself and a mail never sits unsaid-about; it also runs before mail_hand, since anything not `clean` is delivered and started nowhere until a person says so
         v = self.mail_vet(msg, dec)
-        line = R.mirror_line(msg) + "\n" + self.mail_note(v)
+        note = self.mail_note(v)
+        line = R.mirror_line(msg) + ("\n" + note if note else "")
         posted = {}                        # chat -> (root ts, this line's ts)
         for r in rec.get("roots") or []:
             # mail=False: this quotes the sender's own mail into the thread; mailing it back would answer them with their own words, once per mail on a long conversation
@@ -5046,7 +4946,7 @@ class Daemon:
         # which lines in the thread are a mail's is kept on the record: a reply naming one of these lines goes back out as mail (outbound.by_mail), written before either save below so a held mail's line still counts once delivered
         for c, (_root, at) in posted.items():
             rec.setdefault("mirrors", []).append({"chat": c, "ts": at, "mail": mail_id})
-        # "#name" -> [chat, root ts] for every thread this mail sits in, what the receiver channel's reply links to; carries only channels the mirror line actually reached
+        # "#name" -> [chat, root ts] for every thread this mail sits in, what the sorted log line names; carries only channels the mirror line actually reached
         threads = {"#" + r["name"]: [r["chat"], posted[r["chat"]][0]]
                    for r in rec.get("roots") or [] if r["chat"] in posted}
         if not v.clean:
@@ -5119,11 +5019,12 @@ class Daemon:
             return V.Verdict("unread")
 
     def mail_note(self, v):
-        """The one line for the mail's mirror thread, built from the verdict's fixed sentence and never the
-        sender's words, so a mail cannot put words in the box's mouth. A held mail's line is a decision ask:
-        it opens with the owner's mention (via decision_head) and says plainly that nothing has run yet."""
+        """The line under a mail's mirror, built from the verdict's fixed sentence and never the sender's words, so
+        a mail cannot put words in the box's mouth. A held mail's line is a decision ask: it opens with the owner's
+        mention (via decision_head) and says plainly that nothing has run yet. A clean mail gets none ("" — the
+        session's tag still carries the verdict, and the log has it): a pass is not news."""
         if v.verdict == "clean":
-            return f"_vetted: clean — {v.why}_"
+            return ""
         if v.verdict == "suspicious":
             return decision_head(self.cfg, f"_vetted: suspicious — {v.why}_\nNothing has been delivered and "
                                            f"nothing is running. Reply `deliver it` or `drop it` in this thread.")

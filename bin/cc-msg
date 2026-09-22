@@ -45,6 +45,12 @@ HUNG_TRIES="${CC_MSG_HUNG_TRIES:-3}"         # it never will — a live pane cos
 HUNG_COOLDOWN="${CC_MSG_HUNG_COOLDOWN:-30}"  # min before one window is restarted again: a session that comes back
                                              # wedged is not a thing to keep killing
 SWEEP_LOG="$HOME/.cc/state/sweep.log"        # one line per key the sweep pressed: when, window, key, the dialog
+MSG_LOG="$HOME/.cc/state/msg.log"            # one line per routine event this file used to post ambiently (comms
+                                             # review, 2026-09-22): a dialog/orphan told, a hung pane restarted, a
+                                             # spool line dropped. A debugging engineer's read, not the owner's —
+                                             # the actionable case (say_wedge, below) still reaches the planning seat.
+msg_log(){ mkdir -p "$(dirname "$MSG_LOG")" 2>/dev/null
+           printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" >> "$MSG_LOG" 2>/dev/null || true; }
 
 # THE DIALOG GUARD. A modal is waiting for a keypress, so the text — or the Enter after it, or a digit inside it —
 # ANSWERS it, and a tool-permission prompt answered by a script is an unattended approval of exactly what the owner
@@ -232,7 +238,8 @@ spool_n(){ local sp; sp="$(sdir "$1")/inbox.spool"; if [ -f "$sp" ]; then wc -l 
 # ── the standing-dialog report ───────────────────────────────────────────────────────────────────────────────
 # A dialog nobody answers is the whole failure this script exists for: the queue behind it never moves, and on
 # this box that meant a silent session for hours. After STAND_MIN it is said ONCE — to the box's planning session
-# (which can look, and answer), and as one ambient line for the owner saying it happened and who has it.
+# (which can look, and answer), and logged to $MSG_LOG (comms review, 2026-09-22: no owner post — that would be
+# a duplicate acknowledgement of the delivery just above it).
 # It is a dialog WITH MAIL BEHIND IT that is reported: a pane nobody is trying to reach is cc-secretary's beat,
 # not this script's, and this script only ever looks at the windows it has been handed something for.
 # WHO IS TOLD: the box's control repo — the checkout this copy of cc-msg lives in (~/bin is symlinks into its
@@ -319,17 +326,14 @@ dialog_seen(){   # $1 window  $2 pane text
     *)                   att=$((att + 1));;
   esac
   printf '%s\t%s\t%s\t%s\n' "$first" "$rep" "$att" "$line" > "$f"
-  # THE OWNER IS TOLD WHAT HAPPENED, AND THE TABLE DECIDES HOW LOUDLY. Both of these used to buy their own rung —
-  # `-p high` when a session had it, `--decision` when none could be told — and the first was ambient anyway
-  # (cc-notify overwrites a caller's -p) while the second rang his phone about a key that is not his to press.
-  # A standing dialog is a session's to clear, so this is an ambient line either way and the chasing is
-  # tell_session's job (owner, 2026-09-07: the phone is for a decision, and a modal at a pane is not one).
+  # NO AMBIENT LINE (comms review, 2026-09-22): this used to post a Slack line saying a session had ALREADY been
+  # told, or could not be reached — a duplicate acknowledgement of the tell_session delivery two lines up, not a
+  # decision for anyone. $MSG_LOG keeps it; a session that cannot be reached at all is the case tell_session's own
+  # caller escalates, not this file (owner, 2026-09-07: the phone is for a decision, a modal at a pane is not one).
   if [ "$rep" = 1 ]; then
-    "$BIN/cc-notify" -t "[$1] a dialog has stood ${STAND_MIN} min" \
-      "$n message(s) queued behind it, and $tgt has been told — $line" >/dev/null 2>&1
+    msg_log "$1" dialog-told "$n message(s) queued behind it, and $tgt has been told — $line"
   elif [ "$att" = 1 ]; then
-    "$BIN/cc-notify" -t "[$1] a dialog has stood ${STAND_MIN} min and no session could be told" \
-      "$n message(s) queued behind it; the box session could not be reached ('${res:-nothing}', rc $rc) — $line" >/dev/null 2>&1
+    msg_log "$1" dialog-untold "$n message(s) queued behind it; the box session could not be reached ('${res:-nothing}', rc $rc) — $line"
   fi
   return 0
 }
@@ -362,14 +366,11 @@ orphan_seen(){   # $1 window — its spool has NO window to drain into (a handof
     *)                   att=$((att + 1));;
   esac
   printf '%s\t%s\n' "$rep" "$att" > "$f"
-  # Ambient either way, for the same reason as dialog_seen's: a spool with no window is delivered or deleted by a
-  # session, and there is nothing in it the owner's phone could do at 3 a.m.
+  # NO AMBIENT LINE (comms review, 2026-09-22), for the same reason as dialog_seen's above: $MSG_LOG keeps it.
   if [ "$rep" = 1 ]; then
-    "$BIN/cc-notify" -t "[$1] spooled mail has no window" \
-      "$n message(s) with nowhere to go, and $tgt has been told — $(sdir "$1")/inbox.spool" >/dev/null 2>&1
+    msg_log "$1" orphan-told "$n message(s) with nowhere to go, and $tgt has been told — $(sdir "$1")/inbox.spool"
   elif [ "$att" = 1 ]; then
-    "$BIN/cc-notify" -t "[$1] spooled mail has no window and no session could be told" \
-      "$n message(s) in $(sdir "$1")/inbox.spool ('${res:-nothing}', rc $rc)" >/dev/null 2>&1
+    msg_log "$1" orphan-untold "$n message(s) in $(sdir "$1")/inbox.spool ('${res:-nothing}', rc $rc)"
   fi
   return 0
 }
@@ -443,8 +444,9 @@ hung_seen(){   # $1 window  $2 window id → 0 when the window was restarted (ei
     "$BIN/cc" "$repo" ${track:+"$track"} </dev/null >/dev/null 2>&1 || :
     if [ -n "$(win_id "$1")" ]; then
       printf '%s\t0\n' "$now" > "$f"
-      "$BIN/cc-notify" -t "[$1] stopped taking keys — restarted" \
-        "a whole message and its Enter left the pane unchanged, so nothing under it was reading the keyboard. The window was killed and reopened with 'cc $repo $track', which resumes the transcript; the $n queued message(s) go in at the next drain." >/dev/null 2>&1
+      # NO AMBIENT LINE (comms review, 2026-09-22): an automatic restart that worked is routine — $MSG_LOG keeps
+      # it. A restart that does NOT bring the window back still falls through to say_wedge below.
+      msg_log "$1" hung-restarted "a whole message and its Enter left the pane unchanged; killed and reopened with 'cc $repo $track', which resumes the transcript; $n queued message(s) go in at the next drain."
       return 0
     fi
     why="the window was killed, and 'cc $repo $track' did not bring it back — there is no window '$1' now. Run that command by hand"
@@ -522,11 +524,11 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
       line=$(head -1 "$sp")
       # A LINE THAT IS NOT A MESSAGE IS DROPPED, NOT WAITED ON. Stopping at it (the rule until review-157e) left it
       # at the head for every later tick: nothing behind it was ever typed, and nothing said so — the window exists
-      # and its pane is free, so neither report above ever fires. It is said through cc-notify instead.
+      # and its pane is free, so neither report above ever fires. It goes to $MSG_LOG instead (comms review,
+      # 2026-09-22 — a spool diagnostic, not a Slack post): a debugging engineer's read.
       if ! text=$(printf '%s' "$line" | jq -er '.text | strings' 2>/dev/null); then
         spool_pop "$sp"
-        "$BIN/cc-notify" -t "[$1] a spool line was dropped" \
-          "not a message (no .text to type), so the drain discarded it rather than stop the queue at it: ${line:0:200}" >/dev/null 2>&1
+        msg_log "$1" spool-dropped "not a message (no .text to type), so the drain discarded it rather than stop the queue at it: ${line:0:200}"
         n=$((n + 1)); continue
       fi
       # AN EMPTY LINE TYPES NOTHING, AND NOTHING IS NOT A WEDGE. `send-keys -l -- ""` puts no character on the pane
@@ -538,8 +540,7 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
       case "$text" in
         *[![:space:]]*) ;;
         *) spool_pop "$sp"
-           "$BIN/cc-notify" -t "[$1] a spool line was dropped" \
-             "nothing to type (its text is empty), so the drain discarded it rather than judge a pane it never touched: ${line:0:200}" >/dev/null 2>&1
+           msg_log "$1" spool-dropped "nothing to type (its text is empty), so the drain discarded it rather than judge a pane it never touched: ${line:0:200}"
            n=$((n + 1)); continue;;
       esac
       # A MESSAGE TYPED AT A PANE THAT DOES NOT MOVE WAS NOT TAKEN: keep it at the head, restart the session, and
@@ -579,7 +580,7 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
 #                        the control repo (ctl) so a box that sets only the channel still has its planning session
 #                        answer (owner, 2026-09-04: "keep the fallback that the planning session can answer").
 # NOTHING IS DROPPED: a query whose target session is not up, or whose channel is unset, waits for the next tick;
-# only a line that is not a query at all is discarded (and said through cc-notify), as the inbox does.
+# only a line that is not a query at all is discarded (and logged to $MSG_LOG), as the inbox does.
 # THE MEMBER WROTE THAT FILE, AND ITS DIRECTORY IS THE MEMBER'S (security review of #243). So the host opens NOTHING
 # in it: the spool ENTRY is renamed into ~/.cc/queries — the host's own dir, bound into no sandbox — and judged there,
 # where the member can no longer touch it: a symlink, a hard link, a FIFO, a directory or a flood is discarded
@@ -642,8 +643,7 @@ drain_queries(){
       # often it replants (second review of #243: a megabyte a minute grew this dir without limit).
       held=""; for f in "$QDIR/$ws".q.*; do [ -e "$f" ] && { held=1; break; }; done
       [ -z "$held" ] || continue
-      qtake "$sp" "$ws" || "$BIN/cc-notify" -t "[queries] $ws planted something at its queries.spool" \
-        "a link, hard link, pipe, directory or flood — discarded unread" >/dev/null 2>&1
+      qtake "$sp" "$ws" || msg_log "$ws" queries-plant "a link, hard link, pipe, directory or flood at its queries.spool — discarded unread"
     done
     # The v2 broker creates this intake on the host, under the same lock. Workspace identity
     # comes from its registration. The member mounts neither this directory nor its parent.
@@ -687,8 +687,7 @@ drain_queries(){
         qsay "$ws" "$text" && qpost "$text"                  # the visible line, unless a held tick already said it
         spool_pop "$f"; n=$((n + 1)); m=$((m + 1))
       done
-      [ "$dropped" = 0 ] || "$BIN/cc-notify" -t "[queries] $ws: $dropped line(s) dropped" \
-        "not queries (no fields to route), discarded rather than left at the head of the queue" >/dev/null 2>&1
+      [ "$dropped" = 0 ] || msg_log "$ws" queries-dropped "$dropped line(s) not queries (no fields to route), discarded rather than left at the head of the queue"
       [ -s "$f" ] || rm -f -- "$f" "$QDIR/.said.$ws"
     done
     [ "$paged" = 0 ] || "$BIN/cc-notify" --owner -p high -t "[queries] $paged member refusal(s), and no queries channel is set" \
@@ -1151,15 +1150,16 @@ $BUSY"; out=$(msg "hello mid-turn")
 
   # (7b) A LINE THAT IS NOT A MESSAGE does not jam the queue. A kill mid-append leaves half a line (cc-slack reads
   # the spool expecting one) and a hand-edit can leave anything; the drain used to stop at it every tick, for ever,
-  # with nothing said (review-157e). It is dropped, said through cc-notify, and the mail behind it is delivered.
+  # with nothing said (review-157e). It is dropped, logged to $MSG_LOG, and the mail behind it is delivered.
   reset; scr "$PERM"; msg "after junk" >/dev/null; msg "after junk too" >/dev/null
   { echo 'not json'; cat "$SP"; } > "$SP.new" && mv "$SP.new" "$SP"
   scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(grep -c -e ' after junk$' -e ' after junk too$' "$T/keys")" = 2)" "a spool headed by 'not json' still delivers the two good lines behind it"
   k "$(nt grep -qF 'not json' "$T/keys")" "…and the junk never reaches the keyboard"
   k "$(nt test -f "$SP")" "…and the spool is gone: nothing is jammed at its head"
-  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…and the drop is said once through cc-notify, not silently"
-  k "$(t grep -qF 'not json' "$T/calls")" "…naming the line that was dropped"
+  k "$(nt grep -q '^notify' "$T/calls")" "…and the drop is not posted to Slack at all — it is a spool diagnostic (comms review, 2026-09-22)"
+  k "$(t test "$(grep -c '	spool-dropped	' "$T/.cc/state/msg.log")" = 1)" "…said once in the log instead"
+  k "$(t grep -qF 'not json' "$T/.cc/state/msg.log")" "…naming the line that was dropped"
   reset; scr "$PERM"; msg "after null" >/dev/null
   { printf '{"at":"2026-01-01T00:00:00Z","from":"x"}\n'; cat "$SP"; } > "$SP.new" && mv "$SP.new" "$SP"
   scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
@@ -1196,7 +1196,8 @@ $BUSY"; out=$(msg "hello mid-turn")
   # /dev/null there) and an attachment-only Slack message both arrive here.
   reset; scr "$FREE"; out=$(CC_MSG_HUNG_WAIT=0 msg "" </dev/null)
   k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "an empty message at a healthy pane: the window is neither killed nor reopened"
-  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…the line is dropped and said once, like any other the drain cannot type"
+  k "$(nt grep -q '^notify' "$T/calls")" "…and nothing goes to Slack for it"
+  k "$(t test "$(grep -c 'spool-dropped' "$T/.cc/state/msg.log")" = 1)" "…the line is dropped and logged once, like any other the drain cannot type"
   k "$(nt test -f "$SP")" "…and nothing is left at the spool head to kill it again on the next tick"
   reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 msg "$(printf ' \n ')" >/dev/null
   k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "…and whitespace only is the same message: flattened it is still nothing typed"
@@ -1213,7 +1214,8 @@ $BUSY"; out=$(msg "hello mid-turn")
   # …and the other way round: cc's rc is attach_main's, so a non-zero exit with the window back is a RESTART.
   # Paging "not restarted" there also skipped the cooldown stamp, so the next tick would kill the new session too.
   reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_CC_RC=1 msg "cc exited 1" >/dev/null
-  k "$(t grep -qF 'keys — restarted' "$T/calls")" "cc exiting non-zero with the window back is a restart: what exists is the test, not the exit status"
+  k "$(nt grep -q '^notify' "$T/calls")" "…and a successful restart is not posted to Slack at all (comms review, 2026-09-22)"
+  k "$(t grep -qF 'hung-restarted' "$T/.cc/state/msg.log")" "cc exiting non-zero with the window back is logged as a restart: what exists is the test, not the exit status"
   k "$(nt grep -qF 'was not restarted' "$T/calls")" "…so nothing pages that it was not restarted"
   IFS=$'\t' read -r hs ht _ < "$T/.cc/state/$W/inbox.hung"
   k "$(t test "${ht:-1}" = 0)" "…and what it writes is a restart stamp, not a said-once one"
@@ -1321,7 +1323,7 @@ $BUSY"; out=$(msg "hello mid-turn")
   reset; scr "$PERM"; msg "sweep me" >/dev/null; scr "$FREE"; "$T/bin/cc-msg" --drain
   k "$(t grep -qF 'sweep me' "$T/keys")" "cc-msg --drain with no argument finds the window's spool by itself"
 
-  # (9) a dialog that stands: reported ONCE, to a SESSION that can clear it, with one ambient line for the owner.
+  # (9) a dialog that stands: reported ONCE, to a SESSION that can clear it, and logged once (no owner post).
   # He is not the door here and never was: a modal at a pane is answered by whoever can reach the keyboard.
   stand(){ printf '%s\t0\t0\tDo you want to make this edit?\n' "$(( $(date +%s) - 700 ))" > "$DG"; }
   reset; scr "$PERM"; msg "stuck" >/dev/null
@@ -1343,28 +1345,30 @@ $BUSY"; out=$(msg "hello mid-turn")
   while IFS= read -r mk; do [ -n "$mk" ] && case "$said" in *"$mk"*) decides=0;; esac; done <<<"$marks"
   k "$(t test -n "$marks")" "cc-broker still names the words that make an event wake a session NOW rather than ride a digest"
   k "$decides" "…and the report carries one, so a dialog blocking a queue is delivered on arrival"
-  k "$(t grep -q '^notify -t ' "$T/calls")" "…and the owner gets ONE line saying it happened and who has it"
-  k "$(nt grep -qE '^notify (--decision|--owner|-p )' "$T/calls")" "…that buys no rung of its own: the table files a standing dialog ambient, and this call says only what happened"
+  k "$(nt grep -q '^notify' "$T/calls")" "…and nothing goes to the owner for it (comms review, 2026-09-22) — a duplicate of the injection above"
+  k "$(t grep -qF 'dialog-told' "$T/.cc/state/msg.log")" "…it is logged instead, saying it happened and who has it"
   "$T/bin/cc-msg" --drain "$W"; "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(grep -c inject "$T/calls")" = 1)" "ONCE: two more ticks on the same standing dialog say nothing"
-  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…and the owner's line is said once too"
+  k "$(t test "$(grep -c 'dialog-told' "$T/.cc/state/msg.log")" = 1)" "…and the log line is written once too"
   scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
   k "$(nt test -f "$DG")" "the standing-dialog stamp is cleared when the pane comes free"
 
   # (9b) SAID IS NOT HEARD. The stamp closes only when the injector says a live session took the text; a door that
   # is not there, or a verdict that means it was only parked, leaves it open for the next tick — and since nothing
-  # reached anyone at all, the owner is told once.
+  # reached anyone at all, it is logged once (comms review, 2026-09-22: no owner post — a failed automatic attempt
+  # alone is not a decision for him).
   reset; scr "$PERM"; msg "stuck3" >/dev/null; stand
   CC_FAKE_INJECT='daemon not running (ConnectionRefusedError) — cc slack on' CC_FAKE_INJECT_RC=1 \
     "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(grep -c '^broker' "$T/calls")" = 1)" "the door is down: the report was attempted"
   k "$(t test "$(cut -f2 "$DG")" = 0)" "…and NOT stamped as reported — a failed inject must not suppress every later try"
-  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…with nothing said anywhere, the owner hears it once"
-  k "$(t grep -q '^notify -t .*no session could be told' "$T/calls")" "…and even THAT one does not ring him: he cannot press a key in a pane, so the line is ambient and the next tick keeps chasing a session"
+  k "$(nt grep -q notify "$T/calls")" "…and nothing is said to Slack anywhere"
+  k "$(t test "$(grep -c 'dialog-untold' "$T/.cc/state/msg.log")" = 1)" "…it is logged once instead"
+  k "$(t grep -q 'dialog-untold.*could not be reached' "$T/.cc/state/msg.log")" "…naming that no session could be told"
   CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(grep -c '^broker' "$T/calls")" = 2)" "the next tick tries again"
   k "$(t test "$(cut -f2 "$DG")" = 0)" "…and 'queued' is not heard either: the daemon parked it, no session read it"
-  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…and the owner is not told a second time: once a failure, not once a minute"
+  k "$(t test "$(grep -c 'dialog-untold' "$T/.cc/state/msg.log")" = 1)" "…and the log gets no second line: once a failure, not once a minute"
   CC_FAKE_INJECT=typed "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(cut -f2 "$DG")" = 1)" "'typed' (cc-msg put it on the session's keyboard) IS heard: the stamp closes"
   "$T/bin/cc-msg" --drain "$W"
@@ -1373,13 +1377,13 @@ $BUSY"; out=$(msg "hello mid-turn")
   # (9b′) …AND NOT FOR EVER. Every inject is a NEW message to the daemon (it stamps a fresh meta.ts as the sender, so
   # this script's own retry-collapse never matches it): with the told session not running, a retry a minute was a
   # copy a minute in its queue, sixty an hour, flushed at it when it came up (review-157e). A report nobody hears is
-  # tried CC_MSG_REPORT_TRIES times and then left — the owner had his line on the first failure.
+  # tried CC_MSG_REPORT_TRIES times and then left — logged on the first failure.
   reset; scr "$PERM"; msg "stuck7" >/dev/null; stand
   for _ in 1 2 3 4 5; do CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"; done
   k "$(t test "$(grep -c '^broker' "$T/calls")" = 3)" "five ticks that nobody hears: three injects (CC_MSG_REPORT_TRIES), the fourth and fifth make none"
   k "$(t test "$(cut -f3 "$DG")" = 3)" "…the stamp counts the tries"
   k "$(t test "$(cut -f2 "$DG")" = 0)" "…and is still open: the stop is a bound, not a claim it was heard"
-  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…and the owner was told once, on the first failure, as before"
+  k "$(t test "$(grep -c 'dialog-untold' "$T/.cc/state/msg.log")" = 1)" "…and it was logged once, on the first failure, as before"
 
   # (9c) WHO hears it: the control repo this copy of cc-msg lives in (~/dev/<repo>/core/bin, which ~/bin links to),
   # whose planning session can walk over to the window — not a name written into the script.
@@ -1403,7 +1407,8 @@ $BUSY"; out=$(msg "hello mid-turn")
   reset; scr "$PERM"; msg "stuck6" >/dev/null; stand
   CC_MSG_REPORT_TO="$W" "$T/bin/cc-msg" --drain "$W"
   k "$(nt grep -q '^broker' "$T/calls")" "the stuck window is the one that would hear it: nothing is injected — that is the loop"
-  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…the owner is told instead, once"
+  k "$(nt grep -q notify "$T/calls")" "…and nothing goes to Slack for it"
+  k "$(t test "$(grep -c 'dialog-untold' "$T/.cc/state/msg.log")" = 1)" "…it is logged instead, once"
   k "$(t test "$(cut -f2 "$DG")" = 0)" "…and the stamp stays open in case the session comes back"
 
   # (9e) a spool whose WINDOW is gone (a handoff rename, an exit): reported once through the same path — a spool
@@ -1568,7 +1573,8 @@ $BUSY"; out=$(msg "hello mid-turn")
   reset; rm -rf "$QD"; scr "$FREE"; qspool 'not json at all' "$Q1"
   CC_FAKE_QCHAN=qchan CC_FAKE_QSESS="$W" "$T/bin/cc-msg" --drain
   k "$(t grep -q '^inject .*gh pr merge 1' "$T/calls")" "a line that is not a query is dropped and the one behind it still delivers"
-  k "$(t test "$(grep -c '^notify .*dropped' "$T/calls")" = 1)" "…and the drop is said once, through cc-notify"
+  k "$(nt grep -q '^notify .*dropped' "$T/calls")" "…and nothing about the drop goes to Slack (comms review, 2026-09-22)"
+  k "$(t grep -q 'queries-dropped' "$T/.cc/state/msg.log")" "…it is logged instead"
   reset; rm -rf "$QD"; scr "$FREE"; mkdir -p "$(dirname "$QSP")"; printf 'SECRET\n' > "$T/victim"; ln -s "$T/victim" "$QSP"
   CC_FAKE_QCHAN=qchan CC_FAKE_QSESS="$W" "$T/bin/cc-msg" --drain
   k "$(nt grep -q SECRET "$T/calls")" "a symlink planted at queries.spool is not read: nothing of its target reaches Slack or a notify"
@@ -1604,7 +1610,8 @@ $BUSY"; out=$(msg "hello mid-turn")
   reset; rm -rf "$QD"; scr "$FREE"; mkdir -p "$(dirname "$QSP")"; head -c 1100000 /dev/zero | tr '\0' x > "$QSP"
   CC_FAKE_QCHAN=qchan CC_FAKE_QSESS="$W" "$T/bin/cc-msg" --drain
   k "$(nt grep -q '^inject' "$T/calls")" "a spool over 1 MB is a flood: discarded unread, nothing delivered"
-  k "$(t grep -q '^notify .*planted' "$T/calls")" "…and said once, as a plant"
+  k "$(nt grep -q '^notify .*planted' "$T/calls")" "…and nothing about it goes to Slack (comms review, 2026-09-22)"
+  k "$(t grep -q 'queries-plant' "$T/.cc/state/msg.log")" "…it is logged instead, as a plant"
   k "$(nt test -e "$QSP")" "…and gone from the member's directory, with nothing held"
   reset; rm -rf "$QD"; scr "$FREE"; mkdir -p "$QSP/inner"; : > "$QSP/inner/x"
   CC_FAKE_QCHAN=qchan CC_FAKE_QSESS="$W" timeout 20 "$T/bin/cc-msg" --drain; rc=$?

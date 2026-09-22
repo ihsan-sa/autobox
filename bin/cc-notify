@@ -20,8 +20,13 @@
 #                 it verified it cannot settle.
 #     --id names the EVENT (land:<repo>:<pr>:<outcome>, credential:<member>, …): cc-slack's ledger sends it once, ever —
 #     a replay of an id Slack already accepted is logged `dedup` and reaches no door, phone included (rec 4, 2026-09-08);
-#     a request under an id that is already on file is the same request, not a second one.
-#   cc-notify requests [--retry]           the requests the broker has not yet taken / hand them to it again
+#     a request under an id that is already on file and still open is the same request, not a second one; once
+#     answered, the same id asked again is a new request (the answered file moves to ~/.cc/requests/closed/).
+#   cc-notify requests [--retry]           the requests still open (the broker's untaken ones marked) / hand the untaken to it again
+#   cc-notify requests answer <id> "text"  CLOSE a request: post the answer once where it came from (a track's thread,
+#                 a workspace's channel; under --id answer:<id>@<asked-at>, so a retry never posts twice), then mark the file
+#                 answered (answered_at, by) so it is no longer listed. Control seat only. An unknown or already
+#                 answered id exits 1 and posts nothing; a request whose asker left no seat is closed with no post.
 #   cc-notify report [today|yesterday|YYYY-MM-DD]   how much was sent to the owner that day, at which rungs
 #   cc-notify setup        create the ntfy topic + show the phone subscription steps
 #   cc-notify test         send a test push
@@ -193,18 +198,46 @@ req_send(){   # $1 id — hand the record's line to the broker; sets delivered o
   jq --argjson d "$([ $rc = 0 ] && echo true || echo false)" --argjson n "$((n + 1))" '.delivered=$d | .attempts=$n' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
   return $rc
 }
-requests(){   # `cc-notify requests [--retry]`: what the broker has not taken; --retry hands each one to it again
+requests(){   # `cc-notify requests [--retry]`: what is still open; --retry hands each untaken one to the broker again
   local f id d n
+  [ "${1:-}" = answer ] && { shift; req_answer "$@"; return $?; }
   [ -d "$REQ" ] || { echo "no requests on file"; return 0; }
   for f in "$REQ"/*.json; do
     [ -f "$f" ] || continue
+    [ -n "$(jq -r '.answered_at // ""' "$f")" ] && continue   # answered is closed: nothing left to do for it
     id=$(jq -r .id "$f"); d=$(jq -r .delivered "$f"); n=$(jq -r .attempts "$f")
-    [ "$d" = true ] && continue
     if [ "${1:-}" = --retry ]; then
+      [ "$d" = true ] && continue
       if req_send "$id"; then echo "$id: handed to the broker on try $((n + 1))"; else echo "$id: the broker did not take it (try $((n + 1))) — still on file"; fi
-    else echo "$id  from $(jq -r .from "$f")  tries $n  $(jq -r .title "$f")"; fi
+    else echo "$id  from $(jq -r .from "$f")  tries $n  $([ "$d" = true ] || echo 'UNTAKEN  ')$(jq -r .title "$f")"; fi
   done
   return 0
+}
+# THE CLOSING VERB. A request was written, handed over and then left open forever: nothing marked it answered, so the
+# file said the same thing a day later as the minute it was made. The answer goes back ONCE the way req_line names
+# (a track's own thread by its title, a workspace's channel), under a producer id so a retry after a failed write
+# never posts twice, and only then is the file closed. A post that fails leaves it open for the retry.
+req_answer(){   # $1 id  $2 text
+  local id=${1:-} text=${2:-} f from ts by pid
+  [ -n "$id" ] && [ -n "$text" ] || { echo 'usage: cc-notify requests answer <id> "text"' >&2; return 2; }
+  id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9._:@-' '_'); f="$REQ/$id.json"
+  [ -f "$f" ] || { echo "cc-notify: no request $id on file — nothing posted" >&2; return 1; }
+  [ -z "$(jq -r '.answered_at // ""' "$f")" ] || { echo "cc-notify: request $id was already answered ($(jq -r .answered_at "$f")) — nothing posted" >&2; return 1; }
+  is_control || { echo "cc-notify: only ${CTL:-$BOX}'s planning seat answers a request (this is ${from_seat:-an unidentified caller}) — nothing posted" >&2; return 1; }
+  from=$(jq -r '.from // ""' "$f"); ts=""
+  pid="answer:$id@$(jq -r '.at // ""' "$f")"   # the ask's own stamp: the same id asked again after an answer is a new ask, not a ledger dedup
+  case "$from" in
+    "")  echo "cc-notify: $id names no asker, so the answer has nowhere to go — closed without a post" >&2 ;;
+    */*) ts=$("$HOME/bin/cc-slack" post --route "$from answer" --id "$pid" "$text" 2>/dev/null) \
+           || { echo "cc-notify: the answer to $id did not post — the request stays open" >&2; return 1; } ;;
+    *)   ts=$("$HOME/bin/cc-slack" post -c "#$from" --id "$pid" "$text" 2>/dev/null) \
+           || { echo "cc-notify: the answer to $id did not post — the request stays open" >&2; return 1; } ;;
+  esac
+  by="${CC_SLACK_ALIAS:+${CTL:-$BOX}@$CC_SLACK_ALIAS}"; by="${by:-${CTL:-$BOX}}"
+  jq --arg at "$(date -u +%FT%TZ)" --arg by "$by" --arg a "$text" --arg ts "$ts" \
+     '.answered_at=$at | .by=$by | .answer=$a | .answer_ts=$ts' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  printf '%s\tanswer %s\t%s\trung=P kind=request send=%s\n' "$(date -u +%FT%TZ)" "$id" "$(printf '%s' "$text" | tr '\n\t' '  ')" "$([ -n "$from" ] && echo slack || echo none)" >> "$LOG"
+  echo "$id: answered${from:+ in $from}"
 }
 
 # THE ONE PLACE A TITLE BECOMES A KIND. A caller's own `--kind` wins; otherwise the second word of the title — the
@@ -546,12 +579,57 @@ PY
   lost=$(cat "$T/out")
   out=$( cd "$T" && env HOME="$NH" CC_NOTIFY_LOG="$log" "$BIN/cc-notify" requests 2>&1 )
   k "$(yes_ grep -q "^$lost  from" <<<"$out")" "cc-notify requests lists what the broker has not taken"
-  k "$(no_ grep -q "^block:demorepo:atrack" <<<"$out")" "…and not what it has"
+  k "$(yes_ grep -q "^$lost  from .*UNTAKEN" <<<"$out")" "…marked UNTAKEN"
+  k "$(yes_ grep -q "^block:demorepo:atrack  from .*tries 1  demorepo blocked" <<<"$out")" "…and what it took but nobody answered is still open, listed without the mark"
   brokerstub 0
   out=$( cd "$T" && env HOME="$NH" CC_NOTIFY_LOG="$log" "$BIN/cc-notify" requests --retry 2>&1 )
   k "$(yes_ grep -q "^$lost: handed to the broker on try 2" <<<"$out")" "…--retry hands it over again"
   k "$(yes_ test "$(jq -r .delivered "$NH/.cc/requests/$lost.json")" = true)" "…and the file says delivered once it is"
   k "$(yes_ test "$(jq -r .attempts "$NH/.cc/requests/$lost.json")" = 2)" "…counting the tries"
+
+  # THE CLOSING VERB. `requests answer <id> "text"` posts the answer once where the request came from and closes the
+  # file; nothing else it is given posts anything. Each case has its own request, filed here.
+  rm -rf "$NH/.cc/requests"
+  NC "$T/wt" --ask --id ans:track -t "demorepo/atrack needs you" "which port?"
+  NC "$T/alice" --ask --id ans:member "I need a repo"
+  N --ask --id ans:nobody -t "demorepo blocked" "nobody named"
+  N --ask --from bob --id ans:fails -t "bob: blocked" "the post will fail"
+  A(){ NC "$1" requests answer "${@:2}"; }
+  posts(){ grep -c '^post' "$T/slack.args"; }
+  A "$T" ans:track "use 8080"; rc=$?
+  k "$(yes_ test "$rc" = 0)" "answer exits 0 once the answer is posted"
+  k "$(yes_ grep -qx -- "post --route demorepo/atrack answer --id answer:ans:track@$(jq -r .at "$NH/.cc/requests/ans:track.json") use 8080" "$T/slack.args")" "…posted into the track's own thread (routed by its repo/track title), under the producer id answer:<id>@<asked-at>"
+  k "$(yes_ test "$(posts)" = 1)" "…exactly one post"
+  k "$(yes_ test -n "$(jq -r '.answered_at // ""' "$NH/.cc/requests/ans:track.json")")" "…and the file is closed: answered_at set"
+  k "$(yes_ test "$(jq -r .by "$NH/.cc/requests/ans:track.json")" = abox)" "…by the control seat"
+  out=$( cd "$T" && env HOME="$NH" CC_NOTIFY_LOG="$log" "$BIN/cc-notify" requests 2>&1 )
+  k "$(no_ grep -q '^ans:track ' <<<"$out")" "a closed request is no longer listed"
+  k "$(yes_ grep -q '^ans:member ' <<<"$out")" "…while one still open is"
+  A "$T" ans:track "use 9090"; rc=$?
+  k "$(yes_ test "$rc" = 1)" "a second answer to a closed request is refused"
+  k "$(yes_ test "$(posts)" = 0)" "…and posts nothing"
+  k "$(yes_ test "$(jq -r .answer "$NH/.cc/requests/ans:track.json")" = "use 8080")" "…and the first answer stands"
+  A "$T" ans:nosuch "anything"; rc=$?
+  k "$(yes_ test "$rc" = 1)" "an unknown id is refused"
+  k "$(yes_ test "$(posts)" = 0)" "…and posts nothing"
+  A "$T/wt" ans:member "a worker answers"; rc=$?
+  k "$(yes_ test "$rc" = 1)" "a track cannot answer a request: only the control seat does"
+  k "$(yes_ test "$(posts)" = 0)" "…nothing posted"
+  k "$(yes_ test -z "$(jq -r '.answered_at // ""' "$NH/.cc/requests/ans:member.json")")" "…and the request stays open"
+  A "$T" ans:member "it is made"
+  k "$(yes_ grep -qx -- "post -c #alice --id answer:ans:member@$(jq -r .at "$NH/.cc/requests/ans:member.json") it is made" "$T/slack.args")" "a workspace's request is answered in its channel, the way back its request line names"
+  A "$T" ans:nobody "noted"; rc=$?
+  k "$(yes_ test "$rc:$(posts)" = 0:0)" "a request that names no asker is closed with no post"
+  k "$(yes_ test -n "$(jq -r '.answered_at // ""' "$NH/.cc/requests/ans:nobody.json")")" "…and it is closed"
+  slackstub 1
+  A "$T" ans:fails "try this"; rc=$?
+  k "$(yes_ test "$rc" = 1)" "an answer Slack refuses exits 1"
+  k "$(yes_ test -z "$(jq -r '.answered_at // ""' "$NH/.cc/requests/ans:fails.json")")" "…and leaves the request open for the retry, which the producer id keeps to one post"
+  slackstub 0
+  brokerstub 0
+  NC "$T/wt" --ask --id ans:track -t "demorepo/atrack needs you" "which port now?"
+  k "$(yes_ test "$(jq -r '.answered_at // ""' "$NH/.cc/requests/ans:track.json"):$(jq -r .text "$NH/.cc/requests/ans:track.json")" = ":which port now?")" "an answered id asked again is a new, open request, not a dedup"
+  k "$(yes_ test "$(jq -r .answer "$NH/.cc/requests/closed/ans:track@"*.json)" = "use 8080")" "…and the answered one is kept under closed/"
 
   N --ask -t "[_cctest9] blocked" "a fixture asks"
   k "$(yes_ grep -q 'send=test$' <<<"$(last)")" "synthetic test state is never a request either: logged, no file, no broker"
@@ -759,7 +837,7 @@ case "${1:-}" in
     echo "Then run: cc-notify test"; exit 0 ;;
   test) exec "$0" -t "$BOX test" --kind notify-test "Notifications work. $("$BIN/cc-time" slack)" ;;
   report) shift; report "${1:-}"; exit 0 ;;
-  requests) shift; requests "${1:-}"; exit $? ;;
+  requests) shift; requests "$@"; exit $? ;;
   selfcheck) selfcheck; exit $?;;
 esac
 NTFY_TOPIC="$(cfg NTFY_TOPIC)"; NTFY_SERVER="$(cfg NTFY_SERVER)"; NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"
@@ -839,6 +917,10 @@ if [ "$ask" = 1 ]; then
   case " $title $msg " in *[!A-Za-z0-9]_cctest*|*[!A-Za-z0-9]_selfcheck*)
     logreq test; echo "cc-notify: synthetic test state, logged and not asked ($title)" >&2; exit 0;; esac
   [ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && { logreq log-only; exit 0; }
+  # AN ANSWERED ID ASKED AGAIN IS A NEW ASK: the closed file moves to closed/ (its record kept) and this one is filed
+  # fresh. Only an OPEN request under the id is "the same request".
+  if [ -f "$REQ/$rid.json" ] && [ -n "$(jq -r '.answered_at // ""' "$REQ/$rid.json" 2>/dev/null)" ]; then
+    mkdir -p "$REQ/closed" && mv -f "$REQ/$rid.json" "$REQ/closed/$rid@$(jq -r .answered_at "$REQ/$rid.json" | tr -c 'A-Za-z0-9._:@-' '_').json"; fi
   if [ -f "$REQ/$rid.json" ]; then
     logreq dedup; echo "cc-notify: request $rid is already on file — not asked twice" >&2; echo "$rid"; exit 0; fi
   key="$(printf '%s\t%s\t%s' request "$(scope_of "$title")" "$(printf '%s' "$msg" | tr -d '0-9')" | cksum | tr ' ' '-')"

@@ -25,8 +25,10 @@ are still true.
 THE RESOLVER IS A READING TOO (2026-09-01). Two GitHub failures that morning ("Could not resolve host github.com",
 04:37Z and 04:40Z) and cc-slackd's error cluster 5 were one DNS blip, and nothing on the box noticed it. So each
 row also carries one lookup of github.com and slack.com through the SYSTEM resolver — getent, the nsswitch path git
-and curl take — under a hard 2 s timeout, and #alerts hears about a FLIP only: down once, then back once with the
-outage length, never a line a minute while it stays down. Resolver config and the network are never touched here.
+and curl take — under a hard 2 s timeout, and events.log hears about a FLIP only: down once, then back once with
+the outage length, never a line a minute while it stays down. A debugging engineer reads that file; the owner's
+Slack does not (comms review, 2026-09-22 — no meaningful user impact in a DNS blip that self-heals in minutes).
+Resolver config and the network are never touched here.
 Down waits for the SAME host to miss on a SECOND tick in a row (2026-09-04): one tick over 2 s was alerting nineteen
 times a day, and every one of them was a slow lookup that answered the next minute — the latency tail, not an outage.
 
@@ -57,7 +59,6 @@ import io
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 import time
@@ -295,7 +296,7 @@ def _save(name, state):
 
 
 def dns_flip(reading, now=None):
-    """This tick against the last one ON DISK: the one line #alerts should hear, or None. Down is any host
+    """This tick against the last one ON DISK: the one line the log should hear, or None. Down is any host
     unresolved; back is all of them answering. Down is the SAME host missing on two ticks in a row before anyone
     hears it — one miss is a slow lookup, remembered so the outage is timed from it, not announced; two different
     hosts missing on adjacent ticks are two slow lookups, and the clock restarts (review of #221)."""
@@ -362,7 +363,7 @@ def checkout(repo=None):
 
 
 def wrong(reading):
-    """What is not right about the checkout, in the words #alerts will read; [] for a clean origin/<default>
+    """What is not right about the checkout, in the words the log will read; [] for a clean origin/<default>
     or one behind it."""
     if not reading:
         return []
@@ -403,16 +404,16 @@ def checkout_flip(reading, now=None):
 
 
 def alert(line):
-    """The box's one door outward. "<host> alerts" is the title shape cc-slack routes to #alerts even on a box that
-    shares its name with a repo. The DOWN line may not get out — Slack's host is one of the two that just failed —
-    which is why the BACK line carries the outage length; cc-notify logs both regardless. Never fatal: the row is
-    the recorder's job, the notice is a courtesy."""
-    box = socket.gethostname().split(".")[0]
+    """A flip's record — no Slack post (comms review, 2026-09-22): DNS and checkout faults are a debugging
+    engineer's read, not the owner's; the planner handles faults, and a human incident thread is only for one
+    with real user impact. One line per flip, appended to DIR/events.log, UTC-stamped. Never fatal: the row is
+    the recorder's job, the log is a courtesy."""
     try:
-        subprocess.run([f"{BIN}/cc-notify", "-t", f"{box} alerts", line],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        os.makedirs(DIR, exist_ok=True)
+        with open(f"{DIR}/events.log", "a") as f:
+            f.write(f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\t{line}\n")
     except Exception as e:
-        print(f"cc-vitals: notify failed: {e}", file=sys.stderr)
+        print(f"cc-vitals: log failed: {e}", file=sys.stderr)
 
 
 def watch(row):
@@ -712,7 +713,7 @@ def cmd_record(opt):
     while True:
         row = record_minute(period, sample)
         append(row)
-        watch(row)                   # a flip is one line to #alerts; a steady state, good or bad, is silence
+        watch(row)                   # a flip is one line to events.log; a steady state, good or bad, is silence
         prune()
         try:
             render()                     # on a real change, once a minute — never inside the tab's refresh path
@@ -930,7 +931,7 @@ def selfcheck():
               not os.path.exists(f"{tmp}/2000-01-01.jsonl") and os.path.exists(f"{tmp}/{_day(time.time())}.jsonl"))
         check("a half-written last line is skipped, it does not take the chart down", isinstance(rows(24), list))
 
-        # -- THE RESOLVER, stubbed: a reading like the others, and #alerts hears a FLIP only --------------------
+        # -- THE RESOLVER, stubbed: a reading like the others, and the log hears a FLIP only -----------------------
         def stub(body):                                          # a fake `getent hosts <host>`; $2 is the host
             path = f"{tmp}/getent"
             with open(path, "w") as f:
@@ -992,16 +993,13 @@ def selfcheck():
                   and json.loads(_read(f"{tmp}/dns.json")) == {})
         finally:
             globals()["GETENT"], globals()["alert"] = live_getent, live_alert
-        # the door itself: cc-notify told to log and not push, and a _selfcheck marker its own gate stops anyway
-        env = {k: os.environ.get(k) for k in ("CC_NOTIFY_LOG_ONLY", "CC_NOTIFY_LOG")}
-        os.environ.update(CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{tmp}/notify.log")
-        try:
-            alert("dns back after 1 min (_selfcheck)")
-        finally:
-            for k, v in env.items():
-                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-        check("a flip goes out through cc-notify under the '<box> alerts' title cc-slack routes to #alerts",
-              f"\t{socket.gethostname().split('.')[0]} alerts\tdns back" in _read(f"{tmp}/notify.log"))
+        # the door itself: a flip is a log line now, never a Slack post — cc-notify is not even on the path
+        alert("dns back after 1 min (_selfcheck)")
+        events = _read(f"{tmp}/events.log")
+        check("a flip is appended to events.log, UTC-stamped, not sent through cc-notify",
+              bool(re.search(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\tdns back after 1 min \(_selfcheck\)$",
+                              events, re.M))
+              and not os.path.exists(f"{tmp}/notify.log"))
 
         # -- THE MAIN CHECKOUT, on a throwaway clone: clean is silence, anything else is one line, back is one ---
         genv = dict(os.environ, HOME=tmp, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",

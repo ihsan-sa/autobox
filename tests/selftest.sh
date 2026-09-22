@@ -2119,7 +2119,7 @@ CC_CLAUDE="$T/spinclaude" "$B/cc-loop" $REPO w8 --max-iter 20 --quiet >/dev/null
 { [ "$rc" = 9 ] && [ "$(nruns w8)" = 3 ]; } && ok "three progress-free iterations stop the loop (exit 9 after 3, not 20)" || bad "runaway: rc=$rc runs=$(nruns w8)"
 lg w8 | grep -q 'runaway signal 3/3' && [ "$("$B/cc-board" get $REPO w8 status)" = blocked ] && ok "…the reason is in the log and the board says blocked — a state a person must settle" || bad "runaway log/board: $(lg w8 | tail -2)"
 n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep "w8 is running away" | grep -vc "rung=P")
-[ "$n" = 1 ] && ok "…and the owner is told once, with the numbers — not once per barren iteration" || bad "runaway notify count: $n"
+[ "$n" = 0 ] && ok "…and nothing goes to the owner: the stop is the planning seat's request, below, and the numbers stay in the log" || bad "runaway notify count: $n"
 # …and a stop NO seat took is also a planner request (cc-notify --ask: kept on file and retried, never dropped and never
 # his alone to catch) — one, under the stop's own id; this fixture's repo is synthetic, so it is logged and not asked.
 nq=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep "w8 is running away" | grep -c "rung=P kind=request")
@@ -2542,7 +2542,7 @@ runs=$(ls ~/.cc/state/$REPO/w4/runs/*.json 2>/dev/null | wc -l)
 { grep -q 'usage limit — waiting until' ~/.cc/state/$REPO/w4/loop.log && ! grep -q '^.* error (' ~/.cc/state/$REPO/w4/loop.log; } &&
   ok "the limit was logged and did not count as an error" || bad "limit log/errs: $(grep -c 'error (' ~/.cc/state/$REPO/w4/loop.log) error lines"
 n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "$(hostname) limit")
-[ "$n" = 1 ] && ok "owner told exactly once per limit episode (title '$(hostname) limit' -> #alerts)" || bad "limit notify count: $n"
+[ "$n" = 0 ] && ok "a limit episode posts nothing to the owner: the wait is in the loop log above" || bad "limit notify count: $n"
 [ "$("$B/cc-limit" status)" = clear ] && ok "the stamp is cleared by the run that got through" || bad "stamp left behind"
 "$B/cc" rm $REPO w4 >/dev/null 2>&1
 # A STOP FILE WRITTEN DURING THE PRE-ITERATION LIMIT WAIT IS READ WHEN THE WAIT ENDS, before anything is charged (review
@@ -2776,9 +2776,9 @@ sleep 1
 MT capture-pane -p -t _ccmodel:sess | grep -q '/model claude-opus-5' && ok "switch typed /model into the live interactive session" || bad "nothing typed into the session"
 MT capture-pane -p -t _ccmodel:wkr | grep -q '/model' && bad "typed into a headless worker window!" || ok "headless worker window (cc-loop) skipped"
 n=$(grep -c ' model' "$MH/.cc/notify.log" 2>/dev/null)
-[ "$n" = 1 ] && ok "one line to the owner per switch (title '<box> model' -> #alerts)" || bad "switch notify count: $n"
+{ [ "${n:-0}" = 0 ] && grep -q $'\tswitch\tclaude-opus-5\t' "$MH/.cc/state/model.log"; } && ok "a switch posts nothing to the owner and is recorded once in model.log" || bad "switch notify count: $n / model.log switch rows: $(grep -c $'\tswitch\t' "$MH/.cc/state/model.log")"
 ME "$B/cc-limit" check "$T/fab.json" >/dev/null   # the same limit again
-[ "$(grep -c ' model' "$MH/.cc/notify.log" 2>/dev/null)" = 1 ] && ok "a second hit on the same limit is a no-op (idempotent)" || bad "switch not idempotent"
+[ "$(grep -c $'\tswitch\t' "$MH/.cc/state/model.log")" = 1 ] && ok "a second hit on the same limit is a no-op (idempotent)" || bad "switch not idempotent"
 mnow=$(date -u +%s); printf 'claude-opus-5\t%s\t%s\ttest\t0\n' "$((mnow-600))" "$((mnow-60))" > "$MH/.cc/state/model-override"
 : > "$MH/.cc/state/model.log"   # forget that switch: the 10-min anti-flap gap is not what this case is about
 rm -f "$MH/.cc/state/claude-limit"   # …and the reset this case is about HAS passed, so its stamp goes with it: a stamp
@@ -2798,7 +2798,7 @@ mrows=$(grep -c $'\thandoff\t' "$MH/.cc/state/model.log")
   && grep -qF $'\thandoff\tclaude-fable-5[1m]\t_ccmodel:sess' "$MH/.cc/state/model.log" \
   && ok "the lift asks cc-handoff for the live session and types no /model into it" \
   || bad "restore: handoff rows=$mrows, typed=$(MT capture-pane -p -t _ccmodel:sess | grep -c 'claude-fable-5\[1m\]')"
-n=$(tail -n +$((nl0+1)) "$MH/.cc/notify.log" | grep -c 'is back'); [ "$n" = 1 ] && ok "exactly one 'Fable back' line to the owner" || bad "restore notify count: $n"
+n=$(tail -n +$((nl0+1)) "$MH/.cc/notify.log" | grep -c 'is back'); [ "$n" = 0 ] && ok "a restore posts nothing to the owner: the handoff row above is its record" || bad "restore notify count: $n"
 # a live pane that mentions a limit: the probe decides, and one line fires once
 cat > "$T/failprobe" <<'F'
 #!/usr/bin/env bash

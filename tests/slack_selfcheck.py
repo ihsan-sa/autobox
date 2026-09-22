@@ -803,6 +803,25 @@ def run_selfcheck():
                       "permanent grant are untouched",
                       rcS5 == 0 and posted_to == [("CAPPR", f"[{rname}] PR #7: t — https://x/7  ·  :+1: from the owner merges (squash)")]
                       and oS5.getvalue().strip() == "CAPPR 5.1")
+                # BOTH LANES SIDE BY SIDE: one box, a self-landing repo and one that is not, both with an -updates lane.
+                # #approvals gets the second repo's card and nothing of the first's.
+                with tempfile.TemporaryDirectory(dir=DEV, prefix=notify_marker) as d3:
+                    other = os.path.basename(d3); os.makedirs(f"{d3}/.git")
+                    globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER",
+                                                     "CC_SELF_LAND_REPOS": rname}
+                    globals()["resolve_channel"] = lambda cfg, name: {f"{rname}-updates": "CUPD",
+                                                                      f"{other}-updates": "CUPD2"}.get(name)
+                    lane_hist.update({"CAPPR": [], "CUPD": [], "CUPD2": []}); posted_to.clear()
+                    gh["9"] = {"title": "t", "url": "https://x/9", "state": "OPEN"}
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        rcB1 = cmd_post_approval([rname, "9"]); rcB2 = cmd_post_approval([other, "9"])
+                check("post-approval: with a self-landing repo and an unlisted one on the same box, #approvals holds the "
+                      "unlisted repo's card and NOTHING of the self-landing one's — its card is in its -updates lane — "
+                      "and the unlisted repo's own -updates lane does not take its card",
+                      rcB1 == 0 and rcB2 == 0
+                      and posted_to == [("CUPD", f"[{rname}] PR #9: t — https://x/9  ·  lands itself (squash)"),
+                                        ("CAPPR", f"[{other}] PR #9: t — https://x/9  ·  :+1: from the owner merges (squash)")]
+                      and not lane_hist["CUPD2"] and [m["text"][:len(other) + 2] for m in lane_hist["CAPPR"]] == [f"[{other}]"])
                 globals()["load_cfg"], globals()["resolve_channel"] = real_cfg_pa, real_rc_pa
             finally:
                 globals()["post"], globals()["find_channel"], subprocess.run = real_post, real_find, real_run2
@@ -1094,37 +1113,16 @@ def run_selfcheck():
 
     real_fc = find_channel; globals()["find_channel"] = lambda cfg, name: ("CALIAS", True)
     dm7 = Daemon(use_slack=False); dm7.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
-    said7 = []; dm7.say = lambda chat, text, thread=None, mail=True: said7.append(text)
+    said7 = []; dm7.say = lambda chat, text, thread=None, **kw: said7.append(text)
     try:
         a, b = socket.socketpair()
         b.sendall((json.dumps({"hello": "aliastest", "alias": "ai-dev", "pid": 1}) + "\n").encode()); b.shutdown(socket.SHUT_WR)
         dm7.handle_conn(a); b.close()
     finally:
         globals()["find_channel"] = real_fc
-    check("hello: alias captured + join/leave notices posted once each + alias stays known after disconnect",
-          said7 == ["🤖 ai-dev@aliastest joined — @ai-dev hands it threads; @main brings the main session back.",
-                    "🤖 ai-dev@aliastest left."]
-          and "ai-dev" in dm7.known_aliases["aliastest"] and dm7.subs["aliastest"] == [])
-    # A DAEMON RESTART IS NOT A JOIN. The state is on disk: a fresh daemon whose alias is recorded `joined` (the
-    # old daemon died before any bye) says nothing on the re-hello; its bye says left; the join after that is news.
-    globals()["find_channel"] = lambda cfg, name: ("CALIAS", True)
-    try:
-        notice_state_save({notice_key("aliastest", "🤖 ai-dev@aliastest joined — x"): "joined"})
-        dm7b = Daemon(use_slack=False); dm7b.cfg = dm7.cfg; said7b = []; dm7b.say = lambda chat, text, thread=None, **kw: said7b.append(text)
-        a, b = socket.socketpair()
-        b.sendall((json.dumps({"hello": "aliastest", "alias": "ai-dev", "pid": 1}) + "\n").encode()); b.shutdown(socket.SHUT_WR)
-        dm7b.handle_conn(a); b.close()
-        dm7c = Daemon(use_slack=False); dm7c.cfg = dm7.cfg; said7c = []; dm7c.say = lambda chat, text, thread=None, **kw: said7c.append(text)
-        a, b = socket.socketpair()
-        b.sendall((json.dumps({"hello": "aliastest", "alias": "ai-dev", "pid": 1}) + "\n").encode()); b.shutdown(socket.SHUT_WR)
-        dm7c.handle_conn(a); b.close()
-    finally:
-        globals()["find_channel"] = real_fc
-    check("a re-hello after a daemon restart posts no second `joined` — only the left, and the join after a left is posted again",
-          said7b == ["🤖 ai-dev@aliastest left."]
-          and said7c == ["🤖 ai-dev@aliastest joined — @ai-dev hands it threads; @main brings the main session back.",
-                         "🤖 ai-dev@aliastest left."]
-          and notice_state_load().get(notice_key("aliastest", "🤖 ai-dev@aliastest left.")) == "left")
+    check("hello: alias captured and still known after disconnect; the join and the leave post nothing (the log has "
+          "subscribe/unsubscribe) — a join/leave line was machine chatter in the owner's lanes",
+          said7 == [] and "ai-dev" in dm7.known_aliases["aliastest"] and dm7.subs["aliastest"] == [])
     # -- PART 3: production-hardening fixes -----------------------------------------------------
     dm10 = Daemon(use_slack=False); dm10.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dm10.bot_user = "UBOT"
     dm10.route = lambda chat, ctype: "r"
@@ -2351,39 +2349,6 @@ def run_selfcheck():
           len(saidS) == 4 and all(t.startswith("unknown command `!") for t in saidS)
           and all(all(w in t for w in ("`!pause`", "`!resume`", "`!restart", "`!reboot`")) for t in saidS))
 
-    dmL21 = Daemon(use_slack=False); dmL21.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
-    said21 = []; dmL21.say = lambda chat, text, thread=None, mail=True: said21.append((chat, text))
-    real_fc21 = find_channel
-    try:
-        globals()["find_channel"] = lambda cfg, name: ("CUPD", True) if name.endswith("-" + UPDATES) else ("CMAIN", True)
-        dmL21.chan_notice("r", "🤖 @ai-dev joined")
-        dmL21.chan_notice("r", "🤖 @ai-dev joined")          # a socket-mode reconnect, minutes later
-        dmL21.noticed[("r", "🤖 @ai-dev joined")] = time.time() - NOTICE_WINDOW - 1   # …and one past the window
-        dmL21.chan_notice("r", "🤖 @ai-dev joined")
-        globals()["find_channel"] = lambda cfg, name: (None, False) if name.endswith("-" + UPDATES) else ("CMAIN", True)
-        dmL21.chan_notice("r", "🤖 @ai-dev left.")           # a target with no -updates twin
-    finally:
-        globals()["find_channel"] = real_fc21
-    check("chan_notice: a join/leave line lands in the -updates lane — the owner's own channel carries none of them, "
-          "and cmd_post's routine gate never saw these because the daemon posts them itself — L21",
-          [c for c, _ in said21] == ["CUPD", "CUPD", "CMAIN"])
-    check("chan_notice: the same line is not repeated inside NOTICE_WINDOW, which is minutes — a reconnect flap is "
-          "not a 60 s storm — and one past the window is said again — L21", len(said21) == 3 and NOTICE_WINDOW >= 600)
-    # …and a TRACK's line goes in its thread (a track is a thread, not a channel — owner, 2026-09-18): find_channel is
-    # never asked for a `#r--t1`, and a track with no thread still takes the legacy channel if the bot is in one.
-    said21t = []; dmL21.say = lambda chat, text, thread=None, mail=True: said21t.append((chat, thread, text))
-    asked21 = []
-    save_table(TRACKS, {"r/t1": {"chat": "CMAIN", "ts": "3.0", "at": 1.0}})
-    try:
-        globals()["find_channel"] = lambda cfg, name: asked21.append(name) or ("CLEG", True)
-        dmL21.chan_notice("r/t1", "🤖 @ai-dev joined")
-        dmL21.chan_notice("r/t2", "🤖 @ai-dev joined")
-    finally:
-        globals()["find_channel"] = real_fc21
-        save_table(TRACKS, {})
-    check("chan_notice: a track's join/leave line lands in ITS THREAD in #<repo>, with no channel looked up; a track "
-          "with no thread takes a legacy #<repo>--<track> channel as before",
-          said21t == [("CMAIN", "3.0", "🤖 @ai-dev joined"), ("CLEG", None, "🤖 @ai-dev joined")] and asked21 == ["r--t2"])
     dmL22 = Daemon(use_slack=False); dmL22.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}; dmL22.last_chat[CTL] = ("C1", None)
     said22 = []; dmL22.say = lambda chat, text, thread=None, mail=True: said22.append(text)
     dmL22.relay_permission(CTL, {"tool_name": "Bash", "request_id": "abcde", "description": "curl",
@@ -5424,6 +5389,39 @@ def run_selfcheck():
               [t for t, _, _ in delivT] == ["myrepo/w1", "myrepo"]
               and delivT[1][1] == "[asked in `myrepo/w1`'s thread in #myrepo — that track has no live session] the design packet"
               and not saidT)
+        # …AND ONCE IT HAS MERGED (the owner hit this twice): the worktree is gone, so autostart says "no-track", and
+        # that used to bounce with "has no worktree … Start it on the box". It routes like the finished case now; a
+        # line is said only when the repo session cannot take it either, and never the bounce.
+        saidT.clear(); delivT.clear(); metasT.clear(); dmT.told.clear()
+        repo_res = {"v": "delivered"}
+        def deliverNT(target, payload, **k):
+            meta = payload.get("meta") or {}
+            delivT.append((target, payload.get("content"), meta.get("target")))
+            metasT.append((meta.get("chat_id"), meta.get("thread_ts")))
+            return "no-track" if target == "myrepo/w1" else repo_res["v"]
+        dmT.deliver = deliverNT
+        dmT.on_event(dict(evP("CREPO", "one more thing", "9.31"), thread_ts="9.0"))
+        check("a reply in a MERGED track's thread (worktree gone → 'no-track') reaches the repo session with the "
+              "'[asked in …]' context and the thread, and nothing is posted — no 'has no worktree' bounce",
+              [t for t, _, _ in delivT] == ["myrepo/w1", "myrepo"] and delivT[1][2] == "myrepo"
+              and delivT[1][1] == "[asked in `myrepo/w1`'s thread in #myrepo — that track has no live session] one more thing"
+              and metasT[1] == ("CREPO", "9.0") and not saidT)
+        saidT.clear(); delivT.clear(); dmT.told.clear(); repo_res["v"] = "queued"
+        dmT.on_event(dict(evP("CREPO", "anyone?", "9.32"), thread_ts="9.0"))
+        check("…and when the repo session cannot take it either, ONE line says so and names `cc myrepo` — never the "
+              "bounce, and never `cc myrepo w1`, which would create the track again",
+              [t for t, _, _ in delivT] == ["myrepo/w1", "myrepo"] and len(saidT) == 1
+              and "`myrepo` session could not take it" in saidT[0] and "`cc myrepo`" in saidT[0]
+              and "no worktree" not in saidT[0] and "cc myrepo w1" not in saidT[0])
+        # A BUSY OR STARTING SESSION IS NOT NARRATED: the message is queued and its answer is the reply, so "⏳ starting…"
+        # and "mid-turn, queued" said nothing a person needed. A paused repo still says it is paused (no answer comes).
+        saidT.clear(); delivT.clear(); dmT.told.clear()
+        for resB in ("starting", "spooled", "paused"):
+            dmT.deliver = lambda target, payload, _r=resB, **k: _r
+            dmT.hand_off("myrepo", "hi", {}, "CREPO", None, f"9.4{resB[0]}")
+        check("hand_off: 'starting' and 'spooled' post nothing (the 👀 and then the answer are the whole story); "
+              "'paused' still says the repo is paused",
+              len(saidT) == 1 and "is paused" in saidT[0])
         saidT.clear(); delivT.clear()
         dmT.deliver = lambda target, payload, **k: delivT.append((target, payload.get("content"), None)) or "delivered"
         dmT.on_event(dict(evP("CREPO", "status?", "9.4"), thread_ts="9.0"))
@@ -7263,7 +7261,7 @@ def run_selfcheck():
               "honoured, in the words a name no channel has gets, with the rule in the answer",
               resC["ok"] and resC["routed"] and resC["to"] == ["#mem"] and resC["rule"] == "no-channel:unsure"
               and "#box is not a channel I could deliver to. Received as N3. It is in #mem." == resC["reply"]
-              and [c for c, _, _, _ in msaid] == ["C-MEM", "C-MEM"] and "vetted: clean" in msaid[0][2]
+              and [c for c, _, _, _ in msaid] == ["C-MEM", "C-MEM"] and "vetted:" not in msaid[0][2]
               and "#box is not a channel I could deliver to" in msaid[1][2] and "move #<channel>" in msaid[1][2]
               and [h[0] for h in mhanded] == ["mem"] and "#box is not a channel I could deliver to" in mhanded[0][1]
               and (R.load_conv("N3") or {}).get("rule") == "no-channel:unsure")
@@ -7584,10 +7582,10 @@ def run_selfcheck():
         mail_write("V4", to=["mem@box.example"], subject="the cert again")
         msaid.clear(); mhanded.clear()
         resG = dmA.take_mail("V4")
-        check("mail: a clean mail is delivered as it always was, and carries its verdict in the mirror line so "
-              "a person can see why it went through",
-              resG["routed"] and [h[0] for h in mhanded] == ["mem"]
-              and "vetted: clean" in msaid[0][2] and "_email from " in msaid[0][2])
+        check("mail: a clean mail is delivered as it always was; its verdict travels in the session's tag and the "
+              "mirror line carries none — a pass is not news in the channel",
+              resG["routed"] and [h[0] for h in mhanded] == ["mem"] and mhanded[0][2]["vetted"].startswith("clean — ")
+              and "vetted:" not in msaid[0][2] and "_email from " in msaid[0][2])
         pastV = V.past_asks("friend@allowed.example", "mem")
         check("mail: a held or refused mail leaves NO trace in what this sender has asked for before — that "
               "history is written on the clean path alone, so a sender cannot seed the read that weighs their "
@@ -7716,11 +7714,10 @@ def run_selfcheck():
               and "A person is looking at it" in resU["reply"])
 
 
-        # (m) THE RECEIVER'S OWN CHANNEL: every mail shown there as it arrives, and what became of it under it.
-        # The owner asked twice in one night whether a mail had arrived at all (2026-09-09); the only trace of
-        # one was a hold card, of the other nothing. MAIL_CHANNEL names the channel. These run with it set and,
-        # last, with it unset — "nothing changes" is a claim too. #seen has a repo dir, so without the guard in
-        # places() it would be one of the owner's own session channels: that is what the address case proves.
+        # (m) THE RECEIVER'S OWN CHANNEL IS KEPT OUT OF ROUTING, AND NOTHING POSTS THERE. The arrival post and the
+        # sorter's reply under it were telemetry (owner's review, 2026-09-20): both go to the log now, while the
+        # mail's own mirror line, its thread, its hand-off and a hold are what they were. #seen has a repo dir, so
+        # without the guard in places() it would be one of the owner's own session channels.
         os.environ["CC_MAIL_VET_FAKE"] = "fits|fits"
         mchans["seen"] = "C-SEEN"          # …in the table Slack answers with too: a lookup miss rebuilds it
         with open(f"{DIR}/channels.json", "w") as fh:
@@ -7730,96 +7727,58 @@ def run_selfcheck():
         dmA.cfg["MAIL_CHANNEL"] = "#seen"
         mail_write("S1", to=["mem@box.example"], subject="the seen one")
         msaid.clear(); mhanded.clear()
-        resS = dmA.take_mail("S1")
+        with contextlib.redirect_stderr(io.StringIO()) as logS:
+            resS = dmA.take_mail("S1")
         rootS = next((ts for c, t, _, ts in msaid if c == "C-MEM" and t is None), "")
-        check("mail: with MAIL_CHANNEL set a mail is posted there FIRST, before anything is decided — the mirror "
-              "line and its id — and once sorted that post's thread gets one reply naming where it went, linked "
-              "to the mirror thread; the mail's own placement and delivery are exactly what they were",
-              resS["routed"] and [(c, t) for c, t, _, _ in msaid] == [("C-SEEN", None), ("C-MEM", None), ("C-SEEN", msaid[0][3])]
-              and msaid[0][2].startswith("_email from ") and "the seen one" in msaid[0][2] and "S1" in msaid[0][2]
-              and msaid[-1][2] == "_routed to <https://slack.test/C-MEM/p%s|#mem> · by named_" % rootS
+        check("mail: no receipt is posted for a mail — nothing in the receiver channel, no arrival line and no "
+              "sorter reply — but its mirror line still opens the thread in the channel it is for and the session "
+              "is handed it there; the arrival and the sorter's answer (rule included) are in the log instead, "
+              "and a clean verdict is no longer a line under the mirror",
+              resS["routed"] and [(c, t) for c, t, _, _ in msaid] == [("C-MEM", None)]
+              and msaid[0][2].startswith("_email from ") and "the seen one" in msaid[0][2]
+              and "vetted:" not in msaid[0][2]
               and [(h[0], h[2]["chat_id"], h[2]["thread_ts"]) for h in mhanded] == [("mem", "C-MEM", rootS)]
-              and not R.conv_by_root("C-SEEN", msaid[0][3]))
+              and mhanded[0][2]["vetted"].startswith("clean — ")
+              and "mail S1 arrived: _email from " in logS.getvalue()
+              and "mail S1 sorted: _routed to #mem · by named_" in logS.getvalue())
         os.environ["CC_MAIL_VET_FAKE"] = "off-goals"
         mail_write("S2", to=["mem@box.example"], subject="the held one")
         msaid.clear(); mhanded.clear()
-        resH = dmA.take_mail("S2")
+        with contextlib.redirect_stderr(io.StringIO()) as logH:
+            resH = dmA.take_mail("S2")
         rootH = next((ts for c, t, _, ts in msaid if c == "C-MEM" and t is None), "")
-        seenH = msaid[0][3]
-        msaid_h = list(msaid)
-        msaid.clear()
-        talk = dmA.mail_decide("C-SEEN", seenH, "deliver it", "UOWNER", True)
-        check("mail: …a held mail's reply says held, where and why, and points at the thread that holds it — "
-              "the hold stays in the mirror thread, the receiver channel pings nobody, and `deliver it` under "
-              "its post there is just talk",
-              resH["routed"] is False and mhanded == [] and talk is False and msaid == []
-              and [(c, t) for c, t, _, _ in msaid_h] == [("C-SEEN", None), ("C-MEM", None), ("C-SEEN", seenH)]
-              and msaid_h[-1][2].startswith("_held in <https://slack.test/C-MEM/p%s|#mem> — it asks for something "
-                                            "outside what this workspace is for · by named_" % rootH)
-              and "`deliver it`" in msaid_h[-1][2] and "in its thread there" in msaid_h[-1][2]
-              and not any("<@UOWNER>" in x for c, _, x, _ in msaid_h if c == "C-SEEN")
-              and [h["mail"] for h in (R.conv_by_root("C-MEM", rootH) or {}).get("holds") or []] == ["S2"])
-        os.environ["CC_MAIL_VET_FAKE"] = "scam"
-        mail_write("S3", to=["mem@box.example"], subject="the dropped one")
-        msaid.clear(); mhanded.clear()
-        dmA.take_mail("S3")
-        droppedS = list(msaid)
-        # …and a mail whose To names no address of ours at all: a shape the router still refuses before any
-        # channel is looked at, so this mail reaches none and leaves the arrival post alone.
-        mail_write("S4", to=["someone@elsewhere.example"], subject="the one for nowhere")
-        msaid.clear(); mhanded.clear()
-        dmA.take_mail("S4")
-        check("mail: …a mail the vetting read refused says dropped and why, and so does one the router refused "
-              "before it reached any channel — one addressed to nothing of ours — that one has the "
-              "arrival post and the reply and nothing else, which is the whole point: it used to leave no trace",
-              mhanded == []
-              and [(c, t) for c, t, _, _ in droppedS] == [("C-SEEN", None), ("C-MEM", None), ("C-SEEN", droppedS[0][3])]
-              and droppedS[-1][2].startswith("_dropped — ") and "Nothing was delivered" in droppedS[-1][2]
-              and [(c, t) for c, t, _, _ in msaid] == [("C-SEEN", None), ("C-SEEN", msaid[0][3])]
-              and "the one for nowhere" in msaid[0][2]
-              and msaid[-1][2].startswith("_dropped — That address is not one I route"))
-        os.environ["CC_MAIL_VET_FAKE"] = "fits|fits"
+        check("mail: …a held mail still posts its decision ask in its own thread (the mirror line with the owner's "
+              "mention and `deliver it`), and only there — the receiver channel gets nothing, and the log says held",
+              resH["routed"] is False and mhanded == [] and [(c, t) for c, t, _, _ in msaid] == [("C-MEM", None)]
+              and "vetted: suspicious" in msaid[0][2] and "<@UOWNER>" in msaid[0][2] and "`deliver it`" in msaid[0][2]
+              and [h["mail"] for h in (R.conv_by_root("C-MEM", rootH) or {}).get("holds") or []] == ["S2"]
+              and "mail S2 sorted: _held in #mem" in logH.getvalue())
         mail_write("S5", to=["seen@box.example"], subject="the mail to the log", **{"from": "boss@allowed.example"})
+        os.environ["CC_MAIL_VET_FAKE"] = "fits|fits"
         msaid.clear(); mhanded.clear()
         resL = dmA.take_mail("S5")
         check("mail: the receiver channel is not a place a mail can be routed INTO — `seen@` from the owner, "
               "whose session channel it would otherwise be, is a name he cannot reach: the mail goes to his "
-              "main session instead, the seen line says by which rule, and nothing is delivered into #seen",
+              "main session instead, and nothing is posted in or delivered into #seen",
               resL["routed"] and resL["to"] == ["#box"] and resL["rule"] == "no-channel:unsure"
               and [h[0] for h in mhanded] == ["box"]
-              # no offer under the mirror line: his workspace has no other place to move it to
-              and [(c, t) for c, t, _, _ in msaid] == [("C-SEEN", None), ("C-BOX", None), ("C-SEEN", msaid[0][3])]
-              and "#seen is not a channel I could deliver to" in resL["reply"]
-              and msaid[-1][2].startswith("_routed to <") and "by no-channel:unsure" in msaid[-1][2])
-        mail_write("S6", to=["mem@box.example"], subject="the one the log missed")
-        msaid.clear(); mhanded.clear()
-        say_ok, dmA.say = dmA.say, (lambda chat, text, thread=None, mail=False:
-                                    None if chat == "C-SEEN" else say_ok(chat, text, thread, mail))
-        try:
-            resM = dmA.take_mail("S6")
-        finally:
-            dmA.say = say_ok
-        check("mail: a receiver channel the arrival post cannot reach costs the two lines and nothing else — "
-              "the mail is routed and delivered as before, and no reply is attempted into a thread that is not there",
-              resM["routed"] and [(c, t) for c, t, _, _ in msaid] == [("C-MEM", None)]
-              and [h[0] for h in mhanded] == ["mem"])
+              and [(c, t) for c, t, _, _ in msaid] == [("C-BOX", None)]
+              and "#seen is not a channel I could deliver to" in resL["reply"])
         # THE QUIET DOOR (owner, 2026-09-20): a To on MAIL_QUIET is stored and then nothing — "no task, no mirror
-        # line, no session woken, no reply to the sender" — and the receiver channel's own thread is the one
-        # place it is written down. Its own fixture: the key set for these mails alone, and unset after.
+        # line, no session woken, no reply to the sender" — and the log is the one place it is written down.
         dmA.cfg["MAIL_QUIET"] = "study"
         os.environ["CC_MAIL_VET_FAKE"] = "off-goals"      # a verdict that would HOLD a routed mail — never read here
         mail_write("Q1", to=["study@box.example"], subject="the forwarded notice", **{"from": "boss@allowed.example"})
         msaid.clear(); mhanded.clear()
-        resQ = dmA.take_mail("Q1")
-        check("mail: a mail To a quiet address is stored and delivered nowhere — no mirror line in any channel, no "
+        with contextlib.redirect_stderr(io.StringIO()) as logQ:
+            resQ = dmA.take_mail("Q1")
+        check("mail: a mail To a quiet address is stored and delivered nowhere — no line in any channel, no "
               "session handed anything, no conversation, no vetting read (a verdict that would have held it is "
-              "never asked for), reply None so the receiver sends the sender nothing — and the receiver channel's "
-              "line under its arrival post says `quiet · by quiet`",
+              "never asked for), reply None so the receiver sends the sender nothing — and the log line says "
+              "`quiet · by quiet`",
               resQ["ok"] and resQ["quiet"] and not resQ["routed"] and resQ["reply"] is None
-              and resQ["rule"] == "quiet"
-              and [(c, t) for c, t, _, _ in msaid] == [("C-SEEN", None), ("C-SEEN", msaid[0][3])]
-              and msaid[-1][2] == "_quiet — stored, nothing delivered, nobody told · by quiet_"
-              and mhanded == [] and not R.load_conv("Q1"))
+              and resQ["rule"] == "quiet" and msaid == [] and mhanded == [] and not R.load_conv("Q1")
+              and "mail Q1 sorted: _quiet — stored, nothing delivered, nobody told · by quiet_" in logQ.getvalue())
         os.environ["CC_MAIL_VET_FAKE"] = "fits|fits"
         mail_write("Q2", to=["mem@box.example"], cc=["study@box.example"], subject="the watched one")
         msaid.clear(); mhanded.clear()
@@ -7827,7 +7786,7 @@ def run_selfcheck():
         check("mail: …a quiet address in Cc changes nothing — the mail is routed, mirrored and handed exactly as "
               "without it, and the quiet address is in no mirror list",
               resQ2["routed"] and resQ2["to"] == ["#mem"] and resQ2["cc"] == [] and resQ2["rule"] == "named"
-              and [c for c, _, _, _ in msaid] == ["C-SEEN", "C-MEM", "C-SEEN"] and [h[0] for h in mhanded] == ["mem"])
+              and [c for c, _, _, _ in msaid] == ["C-MEM"] and [h[0] for h in mhanded] == ["mem"])
         del dmA.cfg["MAIL_QUIET"]
         mail_write("Q3", to=["study@box.example"], subject="the same address, unset")
         msaid.clear(); mhanded.clear()
@@ -7840,10 +7799,10 @@ def run_selfcheck():
         mail_write("S7", to=["seen@box.example"], subject="the plain one", **{"from": "boss@allowed.example"})
         msaid.clear(); mhanded.clear()
         resP = dmA.take_mail("S7")
-        check("mail: with MAIL_CHANNEL unset nothing here posts — no arrival line, no reply — and #seen is an "
-              "ordinary session channel of the owner's again, so `seen@` routes into it",
+        check("mail: with MAIL_CHANNEL unset #seen is an ordinary session channel of the owner's again, so `seen@` "
+              "routes into it",
               resP["routed"] and resP["to"] == ["#seen"]
-              and [(c, t) for c, t, _, _ in msaid] == [("C-SEEN", None)] and "vetted:" in msaid[0][2]
+              and [(c, t) for c, t, _, _ in msaid] == [("C-SEEN", None)] and msaid[0][2].startswith("_email from ")
               and [h[0] for h in mhanded] == ["seen"])
         del mchans["seen"]
         with open(f"{DIR}/channels.json", "w") as fh:
