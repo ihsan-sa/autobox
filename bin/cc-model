@@ -5,7 +5,8 @@
 # launched unasked for a major session, on the owner's 👍 on one card for any other (see THE FABLE BAND COMES BACK BY
 # HANDOFF below) — and a session moved between the lower rungs gets `/model` typed at its next turn boundary. EVERY
 # TICK, WITH NO EVENT, `reconcile` compares each live session with the model it belongs on (want_of: a planning or
-# major window's band is the primary, a moved one's is what it was on; a rowless minor one is not touched) and makes
+# major window's band is the primary — or, with CC_MODEL_PRIMARY_WINDOWS set, only a LISTED one's is and every other
+# planning or major window's is the floor; a moved one's is what it was on; a rowless minor one is not touched) and makes
 # the same move up or down, so a session born on the fallback with no record comes back too. LLM-free except the
 # probe, which runs the id sessions run ([1m] and all) and is not believed while real runs on it are refused. A PLANNING SESSION (a repo's seat, an orch, a window
 # on CC_MODEL_PLANNING) never goes below the floor (Opus): with the floor out it is parked, and comes back by handoff.
@@ -166,7 +167,10 @@
 #   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_RETUNE_GAP (600) · CC_MODEL_CHAIN
 #   · CC_MODEL_MISMATCH_GAP (3600) · CC_CLAUDE_SETTINGS (~/.claude/settings.json) · CC_MODEL_STATUSLINE_FRESH (120) · CC_STATUSLINE_DIR (cc-statusline's per-session
 #   records, the same ones cc-context reads) · CC_MODEL_MAJOR (~/.cc/config: the windows handed back unasked, space- or
-#   comma-separated; unset = the default rule) · CC_MODEL_RETURN_GAP (7200) · CC_MODEL_RETURN_CHANNEL (the card's
+#   comma-separated; unset = the default rule) · CC_MODEL_PRIMARY_WINDOWS (~/.cc/config: the windows whose band is the
+#   primary, windows or globs, space- or comma-separated; set, every OTHER planning or major window's band is the floor
+#   rung and a move down to it banks no moved row; unset, every planning and major window is the primary's — see ONLY
+#   LISTED WINDOWS BELONG ON THE PRIMARY) · CC_MODEL_RETURN_GAP (7200) · CC_MODEL_RETURN_CHANNEL (the card's
 #   channel when the session's repo has none: `#<box>`) · CC_MODEL_PLANNING (~/.cc/config: windows or globs such as
 #   `lessons/*` that are planning on top of the default rule) · CC_MODEL_FLOOR (the lowest a planning session runs;
 #   default the fallback) · CC_MODEL_CRED (whose login, see Unavailable) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC, CC_MODEL_SESSIONS
@@ -500,7 +504,10 @@ restore_all(){   # $1 = the family the box was moved TO → every live session b
     # a parked planning seat is on a model that was out: it hands over to the primary whatever it was on before
     awk -F'\t' -v p="$id" '$1==p && $5=="parked"{y=1} END{exit !y}' "$MOVED" 2>/dev/null &&
       { return_session "$id" "$name" "$lm" row && n=$((n+1)); continue; }
-    if [ -n "$was" ]; then to="$was"; elif [ "$(fam "$lm")" = "$to_f" ]; then to="$PRIMARY"; else continue; fi
+    # rowless on the fallback: back to its band — the primary, or the floor for a planning/major window the
+    # CC_MODEL_PRIMARY_WINDOWS list leaves out, which is then already home and skipped just below
+    if [ -n "$was" ]; then to="$was"; elif [ "$(fam "$lm")" = "$to_f" ]; then
+      if planning "$name" || major "$name"; then to=$(band_of "$name"); else to="$PRIMARY"; fi; else continue; fi
     [ "${to%%\[*}" = "${lm%%\[*}" ] && continue   # already there: the session moved back by itself, or was never moved
     # the brief (owner, 2026-09-18): "major sessions like [the planning seats] automatically go back on fable via
     # automatic handoff. the other sessions that should technically be on fable … get an automatic message asking me"
@@ -549,11 +556,12 @@ lift_rung(){   # $1 a family below the primary that answers again (its record ju
   "$BIN/cc-notify" -t "$(hostname -s) model" "$(label "$f") answers again${old:+ — the box is back on it from $(label "$old")}; what moved off it returns, parked planning hands back." >/dev/null 2>&1 || true
   printf '%s\n' "$n"; }
 want_of(){   # $1 pane · $2 window → the model this session belongs on NOW, "park", or nothing (exit 1): no band here.
-             # ITS BAND: the model the box moved it off ($MOVED row), else the primary for a planning or major window; a
+             # ITS BAND: the model the box moved it off ($MOVED row), else band_of for a planning or major window — the
+             # primary, or the floor rung when CC_MODEL_PRIMARY_WINDOWS names windows and not this one; a
              # rowless minor window is where its dispatcher or a person put it, and is left there. FROM THE BAND DOWN, the
              # first rung that is not out (out_why: on record as not the account's, or the primary under an override).
              # A planning window never lands below the floor: "park" when everything down to it is out.
-  local b m; if moved_by_box "$1" ""; then b=$(moved_row "$1"); elif planning "$2" || major "$2"; then b="$PRIMARY"; else return 1; fi
+  local b m; if moved_by_box "$1" ""; then b=$(moved_row "$1"); elif planning "$2" || major "$2"; then b=$(band_of "$2"); else return 1; fi
   m="$b"; while out_why "$m" >/dev/null; do m=$(chain_next "$m") || { planning "$2" && echo park; return 0; }; done
   { planning "$2" && below_floor "$m"; } && { echo park; return 0; }
   printf '%s\n' "$m"; }
@@ -571,7 +579,9 @@ reconcile(){   # EVERY TICK, NO EVENT NEEDED (owner, 2026-09-21): each live sess
     w=$(want_of "$id" "$name") || continue
     if [ "$w" = park ]; then
       parked_row "$id" && continue   # parked already: the owner heard once, and the seat is idle
-      lm=$(live_model "$id" "$fr"); retuned_recently "$id" && continue
+      lm=$(live_model "$id" "$fr")
+      { policy_band "$id" "$name" && ! below_floor "$lm"; } && continue   # its band is out, and it sits at the floor or above: leave it
+      retuned_recently "$id" && continue
       if below_floor "$lm"; then type_into "$id" "$name" "/model $fr" || continue; fi   # busy: next tick
       park "$id" "$name" "$(below_floor "$lm" && echo "$fr" || echo "$lm")" "$(fam "$lm")" "found on $lm"; continue; fi
     lm=$(live_model "$id" "$w")
@@ -585,7 +595,11 @@ reconcile(){   # EVERY TICK, NO EVENT NEEDED (owner, 2026-09-21): each live sess
         return_session "$id" "$name" "$lm" "$(moved_by_box "$id" "" && echo row)"; continue; fi
     fi
     if type_into "$id" "$name" "/model $w"; then
-      [ "$(rung_of "$lm")" -lt "$(rung_of "$w")" ] 2>/dev/null && note_moved "$id" "$name" "$lm" moved "$(fam "$lm")"   # DOWN: banked, so it comes back
+      # DOWN: banked, so it comes back — UNLESS the band is the policy's. The brief: "reconcile moves a window DOWN
+      # to its own band by /model as it does now, but banks NO moved row for that move (a policy move is not an outage
+      # move: today's note_moved would make want_of ask for the primary again next tick and loop a handoff)."
+      { [ "$(rung_of "$lm")" -lt "$(rung_of "$w")" ] 2>/dev/null && ! policy_band "$id" "$name"; } &&
+        note_moved "$id" "$name" "$lm" moved "$(fam "$lm")"
       printf '%s\t%s\tretune\t%s\t%s:%s (%s) found on %s — reconcile\n' "$(date -u +%FT%TZ)" "$now" "$w" "$SESSION" "$name" "$id" "$lm" >> "$LOG"; fi
   done < <(sessions); tell_parked ""; }
 # ── THE FABLE BAND COMES BACK BY HANDOFF, NOT BY /model (owner, 2026-09-18) ────────────────────────────────────
@@ -637,6 +651,35 @@ floor_fam(){ fam "${CC_MODEL_FLOOR:-$FALLBACK}"; }
 rung_of(){ chain_all | awk -v f="$(fam "${1:-}")" '{m=tolower($0)} index(m, f){print NR; exit}'; }   # $1 model → its place on the chain (1 = the primary), or nothing
 below_floor(){ local r fl; r=$(rung_of "${1:-}"); fl=$(rung_of "$(floor_fam)"); [ -n "$r" ] && [ -n "$fl" ] && [ "$r" -gt "$fl" ]; }   # $1 model → 0 = a lower rung than the floor
 floor_rung(){ if [ "$(fam "$FALLBACK")" = "$(floor_fam)" ]; then printf '%s\n' "$FALLBACK"; else rung_id "$(floor_fam)"; fi; }
+# ── ONLY LISTED WINDOWS BELONG ON THE PRIMARY (the owner names the seats that stay on the primary, 2026-09-22, and
+# asks for every other one on the floor model) ────────────────────────────────────────────────────────────────────
+# want_of bound EVERY planning and major window to the primary, so a seat a person had moved down was handed straight
+# back — a handoff for a major window, a card in its channel for the rest — and the planning seat moved each one by
+# hand and stopped the cards. With CC_MODEL_PRIMARY_WINDOWS set (~/.cc/config; windows or globs, space- or
+# comma-separated) only the windows on it have the primary as their band, and every OTHER planning or major window's
+# band is the floor rung. Unset, nothing changes: every planning and major window is the primary's.
+# reconcile moves such a window DOWN to its band with /model as it does any other, but banks NO $MOVED row for that
+# move (policy_band): an outage move is a debt the lift owes back, a policy move is where the window now lives, and a
+# row would have want_of ask for the primary again on the next tick and loop a handoff. THE OUTAGE PATH IS UNTOUCHED —
+# a pane with a row belongs on what that row says, listed or not, and still returns by handoff at the lift. Workers,
+# tracks and member windows have no band here at all and stay where their dispatcher put them.
+primary_windows(){ printf '%s\n' "${CC_MODEL_PRIMARY_WINDOWS:-$("$BIN/cc-config" get CC_MODEL_PRIMARY_WINDOWS 2>/dev/null)}"; }
+listed_primary(){   # $1 window → 0 = named on CC_MODEL_PRIMARY_WINDOWS. An empty list names nobody; `~next`/`~old` is
+                    # mid-handoff and is nobody's here, as it is for planning() and major().
+  local w="${1:-}" g gs=(); case "$w" in ''|*~*) return 1;; esac
+  IFS=', ' read -ra gs <<<"$(primary_windows)"   # read, not $(…): no pathname expansion
+  # shellcheck disable=SC2254   # $g unquoted on purpose: a glob
+  for g in "${gs[@]}"; do case "$w" in $g) return 0;; esac; done; return 1; }
+band_of(){   # $1 window (a planning or major one) → the model it belongs on before any outage: the primary, or the
+             # floor rung when the list is set and this window is not on it.
+  { [ -z "$(primary_windows)" ] || listed_primary "$1"; } && { printf '%s\n' "$PRIMARY"; return 0; }
+  floor_rung; }
+policy_band(){   # $1 pane · $2 window → 0 = this window's band is the floor BY POLICY, so a move down to it is not an
+                 # outage move and banks no row. A pane the box has already moved is the outage path's, not this one's:
+                 # its row is its band, and dropping the bank would strand it a rung down after the lift.
+  [ -n "$(primary_windows)" ] || return 1
+  moved_by_box "$1" "" && return 1
+  { planning "$2" || major "$2"; } && ! listed_primary "$2"; }
 parked_row(){   # $1 pane → 0 = banked `parked`, off whatever family: a parked seat waits for the FLOOR either way
   awk -F'\t' -v p="${1:-}" '$1==p && $5=="parked"{y=1} END{exit !y}' "$MOVED" 2>/dev/null; }
 park(){   # $1 pane · $2 window · $3 the model it is on · $4 the family going out · $5 why → banked `parked`, one log row
@@ -2277,7 +2320,7 @@ TXT
   # the floor answers again: parked seats hand back by handoff, the track is typed back up.
   local fl lo; fl=$(floor_rung); lo=$(chain_next "$fl")   # the floor and the rung under it
   typed(){ awk -F'\t' -v w="$1" '$1==w{print $2}' "$d/typed" | paste -sd'|' -; }
-  mkdir -p "$d/members/mem-a"; CC_MODEL_MEMBERS="$d/members"; CC_MODEL_PLANNING='lessons/*'
+  mkdir -p "$d/members/mem-a"; CC_MODEL_MEMBERS="$d/members"; CC_MODEL_PLANNING='lessons/*'; export CC_MODEL_PRIMARY_WINDOWS=''
   pl(){ rm -f "$OV" "$UNAV" "$MOVED" "$RETURNED" "$ST/model-probed" "$ST/model-credits-seen"; : > "$d/typed"; : > "$LOG"; : > "$d/calls"; : > "$d/handoffs"
     printf '%s\n' '%1 repo' '%2 repo@orch' '%3 lessons/ece1' '%4 repo/track' '%5 mem-a' > "$d/sess"
     printf '%s\t%s\n' '%1' "$fl" '%2' "$fl" '%3' "$fl" '%4' "$fl" '%5' "$fl" > "$d/live"
@@ -2345,6 +2388,47 @@ TXT
   note_unavailable "$(fam "$PRIMARY")" 'the cap'; reconcile
   t '(s) DOWN with no event: a seat on a model on record as out is typed to the rung that runs, and banked to come back' \
     "$(typed repo):$(awk -F'\t' '$1=="%1"{print $5 ":" $6}' "$MOVED")" "/model $fl:moved:$(fam "$PRIMARY")"
+
+  # ── ONLY LISTED WINDOWS BELONG ON THE PRIMARY (the owner names the seats that stay on the primary, 2026-09-22,
+  # and asks for every other one on the floor model). With CC_MODEL_PRIMARY_WINDOWS set, a listed window's
+  # band is the primary and every other planning or major window's is the floor. Each case builds its own state and
+  # asserts both the window that is left alone and the one that is moved.
+  pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS='rep* desk'   # one glob that matches, one literal that matches nothing
+  printf '%s\n' '%1 repo' '%2 other@orch' '%3 lessons/ece1' '%4 repo/track' > "$d/sess"
+  printf '%s\t%s\n' '%1' "$PRIMARY" '%2' "$PRIMARY" '%3' "$fl" '%4' "$fl" > "$d/live"
+  t '(w) a listed window wants the primary; an unlisted orch and an unlisted course seat want the floor; a track still has no band' \
+    "$(want_of '%1' repo):$(want_of '%2' other@orch):$(want_of '%3' lessons/ece1):$(want_of '%4' repo/track || echo none)" \
+    "$PRIMARY:$fl:$fl:none"
+  reconcile
+  t '(w) …reconcile leaves the listed one alone and types the unlisted one found on the primary DOWN to the floor' \
+    "$(typed repo):$(typed other@orch):$(typed lessons/ece1):$(typed repo/track)" ":/model $fl::"
+  t '(w) …and banks NO moved row for that policy move, so nothing owes it a way back up' \
+    "$(cat "$MOVED" 2>/dev/null):$(paste -sd'|' "$d/handoffs")" ":"
+  : > "$d/typed"; : > "$LOG"; : > "$d/cards"   # the retune gap cleared: the next tick is free to type, and does not
+  printf '%s\t%s\n' '%1' "$PRIMARY" '%2' "$fl" '%3' "$fl" '%4' "$fl" > "$d/live"; reconcile
+  t '(w) …a window on its own band is never returned, carded or retuned: the tick after types nothing and sends nothing' \
+    "$(typed repo)$(typed other@orch):$(paste -sd'|' "$d/handoffs"):$(wc -l < "$d/cards")" "::0"
+  # the outage path is untouched: a row says the box moved this window off the primary, and the lift still owes it back
+  pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS='repo'
+  printf '%s\n' '%2 other@orch' > "$d/sess"; printf '%s\t%s\n' '%2' "$fl" > "$d/live"
+  note_moved '%2' other@orch "$PRIMARY" moved "$(fam "$PRIMARY")"; reconcile
+  t '(w) an unlisted window an outage moved off the primary still returns by handoff: its row is its band, not the policy' \
+    "$(paste -sd'|' "$d/handoffs"):$(typed other@orch)" "other@orch:"
+  # …and a ROWLESS window on the fallback at the lift goes to its band: an unlisted major one is home already
+  pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS='repo'; : > "$d/cards"
+  printf '%s\n' '%1 repo' '%2 other@orch' > "$d/sess"; printf '%s\t%s\n' '%1' "$FALLBACK" '%2' "$FALLBACK" > "$d/live"
+  note_moved '%9' gone "$PRIMARY" moved "$(fam "$PRIMARY")"   # another pane's row: the episode is open, so the lift runs
+  do_switch "$PRIMARY" 'limit lifted (probe)'
+  t '(w) at the lift an unlisted rowless major window on the fallback is neither handed off nor carded; a listed one still is' \
+    "$(paste -sd'|' "$d/handoffs"):$(wc -l < "$d/cards"):$(typed other@orch)" "repo:0:"
+  # …and with the floor out, an unlisted planning window still on the primary (a fresh seat comes up there) is not
+  # parked: its band is out, but where it runs is above the floor, so no row, no owner line, nothing typed
+  pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS='repo'
+  printf '%s\n' '%2 other@orch' > "$d/sess"; printf '%s\t%s\n' '%2' "$PRIMARY" > "$d/live"
+  note_unavailable "$(fam "$fl")" "You've hit your monthly spend limit"; reconcile
+  t '(w) the floor out: an unlisted window on the primary is left there, banked nothing, the owner told nothing' \
+    "$(cat "$MOVED" 2>/dev/null):$(grep -c 'Planning parked' "$d/calls"):$(typed other@orch)" ":0:"
+  export CC_MODEL_PRIMARY_WINDOWS=''
   # A PROBE THAT ANSWERS WHILE A REAL RUN IS REFUSED IS NOT AVAILABILITY (model.log 2026-09-21 17:17-17:48Z)
   pl; rm -f "$OV" "$REFUSED"; local oldclaude="$CLAUDE"; CLAUDE="$d/bin/fakeclaude"; eval "$probe_src"
   printf '#!/bin/sh\ncat "%s/ok.json"\n' "$d" > "$CLAUDE"; chmod +x "$CLAUDE"
@@ -2385,7 +2469,7 @@ TXT
     "$([ -s "$d/model-unavailable.member" ] && echo own):$([ -e "$d/model-unavailable" ] && echo box):$([ -e "$OV" ] && echo ov):$(wc -l < "$d/typed"):$(grep -c '^notify' "$d/calls")" "own:::0:0"
   CRED=""; UNAV="$d/model-unavailable"
   t '(r) …and the box'"'"'s own record does not have it: its chain is whole' "$(chain | grep -c .)" "$(chain_all | grep -c .)"
-  rm -f "$d/model-unavailable.member"; unset CC_MODEL_PLANNING; unset -f pl
+  rm -f "$d/model-unavailable.member"; unset CC_MODEL_PLANNING CC_MODEL_PRIMARY_WINDOWS; unset -f pl
   forget_unavailable "$(fam "$PRIMARY")"; rm -f "$MOVED" "$OV" "$UNAV" "$d/typed"; unset -f typed
   if [ -n "$oldsess" ]; then CC_MODEL_SESSIONS="$oldsess"; else unset CC_MODEL_SESSIONS; fi
   if [ -n "$oldlive" ]; then CC_MODEL_LIVE="$oldlive"; else unset CC_MODEL_LIVE; fi
