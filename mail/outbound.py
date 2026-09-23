@@ -116,10 +116,12 @@ CONFIG, all of it in ~/.cc/config, read by cc-slack and handed here as a dict:
                          MAIL_WORKSPACE. A file under a prefix that cannot be attached goes as a URL in a link
                          line; one under no prefix refuses the call, and the caller is told
 State is ~/.cc/mail/out/rate.json (the two caps' clocks) and the log is ~/.cc/mail/out.log — its own file, not
-the daemon's, because `cc-slack post` on the command line has no daemon log to write to.
+the daemon's, because `cc-slack post` on the command line has no daemon log to write to. A copy of each mail
+that went is ~/.cc/mail/sent/<id>/message.json (keep_sent), which is how a reader threads sent mail with received.
 """
 import base64
 import email.message
+import email.policy
 import email.utils
 import fcntl
 import json
@@ -137,6 +139,7 @@ MAILDIR = os.environ.get("CC_MAIL_DIR") or os.path.join(H, ".cc", "mail")
 OUTDIR = os.path.join(MAILDIR, "out")
 RATEFILE = os.path.join(OUTDIR, "rate.json")
 LOGFILE = os.path.join(MAILDIR, "out.log")
+SENTDIR = os.path.join(MAILDIR, "sent")   # a copy of each mail that went — `cc-mail --help`, SENT MAIL
 
 PER_HOUR = 6            # mails per mirror thread per hour
 PER_DAY = 30            # mails per recipient per day
@@ -663,6 +666,47 @@ def call_worker(cfg, from_a, rcpts, raw):
     return True, failed, ""
 
 
+# ---------------------------------------------------------------- the copy of what went
+
+def keep_sent(raw, text, attach=None, conv="", tag="", workspace="", now=None):
+    """A COPY OF THE MAIL THAT WENT, in the received store's shape, so a reader can thread a conversation.
+
+    Written once the worker has taken the mail and never before: a copy of a mail that did not go would show
+    the owner an answer nobody got. The headers are read back off `raw`, the bytes that went, so the copy
+    cannot disagree with the mail; `text` is the body as sent. Attachments are named, sized and typed, and
+    their bytes are not kept — the file was ours to begin with. Returns the copy's id, or "" when the disk
+    refused it: the mail is already away, so that costs the copy and one log line, nothing more. The shape is
+    `cc-mail --help`, SENT MAIL."""
+    t = now if now is not None else time.time()
+    try:
+        m = email.message_from_bytes(raw, policy=email.policy.default)   # headers decoded, as the receiver's are
+
+        def addrs(h):
+            return [_norm(a) for _, a in email.utils.getaddresses([str(v) for v in m.get_all(h) or []]) if a]
+
+        cid = "%s-%s" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(t)), os.urandom(4).hex())
+        rec = {"direction": "sent", "id": cid, "from": (addrs("From") or [""])[0], "to": addrs("To"),
+               "cc": addrs("Cc"), "subject": str(m.get("Subject") or ""),
+               "message_id": str(m.get("Message-ID") or "").strip(),
+               "in_reply_to": str(m.get("In-Reply-To") or "").strip(),
+               "references": str(m.get("References") or "").split(), "date": str(m.get("Date") or ""),
+               "sent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t)), "text": text or "", "html": "",
+               "attachments": [{"name": os.path.basename(p), "size": len(d),
+                                "type": mimetypes.guess_type(p)[0] or "application/octet-stream"}
+                               for p, d in ([attach] if isinstance(attach, tuple) else attach or [])],
+               "conv": conv or "", "tag": tag or "", "workspace": workspace or ""}
+        d = os.path.join(SENTDIR, cid)
+        os.makedirs(SENTDIR, mode=0o700, exist_ok=True)
+        os.mkdir(d, 0o700)
+        fd = os.open(os.path.join(d, "message.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(rec, f, indent=1, sort_keys=True)
+        return cid
+    except (OSError, ValueError, TypeError) as e:
+        log("%s: sent, but its copy was not kept (%s)" % (conv or COLD_KEY, e.__class__.__name__))
+        return ""
+
+
 # ---------------------------------------------------------------- the tap
 
 def by_mail(rec, chat, ts):
@@ -798,9 +842,11 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
     if mid not in (fresh.setdefault("message_ids", [])):
         fresh["message_ids"].append(mid)
     R.save_conv(fresh)
-    log("%s: sent from=%s to=%s%s%s" % (rec.get("id"), from_a, ",".join(to),
-                                        " cc=" + ",".join(cc) if cc else "",
-                                        " attach=" + os.path.basename(path) if attach else ""))
+    kept = keep_sent(raw, body, attach=attach, conv=rec["id"], workspace=rec.get("workspace") or "", now=now)
+    log("%s: sent from=%s to=%s%s%s%s" % (rec.get("id"), from_a, ",".join(to),
+                                          " cc=" + ",".join(cc) if cc else "",
+                                          " attach=" + os.path.basename(path) if attach else "",
+                                          " kept=" + kept if kept else ""))
     if failed:
         one = failed[0]
         log("%s: Cloudflare refused %s — %s" % (rec.get("id"), clip(one.get("to")), clip(one.get("error"))))
@@ -939,8 +985,10 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     refused = {_norm(f.get("to")) for f in failed}
     sent = [a for a in rcpts if a not in refused]
     names = [os.path.basename(p) for p, _ in attach]
-    log("%s: sent from=%s to=%s subject=%s%s" % (COLD_KEY, from_a, ",".join(sent) or "(none)", clip(subject),
-                                                 " attach=" + ",".join(names) if names else ""))
+    kept = keep_sent(raw, body, attach=attach, tag=tag, workspace=workspace, now=now) if sent else ""
+    log("%s: sent from=%s to=%s subject=%s%s%s" % (COLD_KEY, from_a, ",".join(sent) or "(none)", clip(subject),
+                                                   " attach=" + ",".join(names) if names else "",
+                                                   " kept=" + kept if kept else ""))
     with_files = (", with %s attached" % ", ".join(names)) if names else ""
     # THE MIRROR, once the mail is away and only when somebody was reached: a thread for a mail nobody got
     # would wait for an answer that cannot come. Neither a channel nor a thread is the home@ case and keeps

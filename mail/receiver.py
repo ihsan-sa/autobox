@@ -180,6 +180,19 @@ THE STORE IS THE CONTRACT MILESTONE 2 READS. One directory per mail:
   is what makes them the file the sender sent, and written. Nothing here unzips, parses, renders, executes or
   guesses at one, and the filename the sender chose never reaches the filesystem — see safe_name().
 
+SENT MAIL IS KEPT BESIDE IT, so a reader can put a conversation back together. Every mail the box sends —
+a reply (outbound.send) or one it starts (outbound.send_to) — leaves, once the worker has taken it,
+
+  ~/.cc/mail/sent/<id>/message.json      <id> in the same shape as above, the UTC second it was sent
+
+  with the received shape's id, from, to, cc, subject, message_id, in_reply_to, references, date, text and
+  html (always ""), plus: direction "sent"; sent_at, the UTC second, ISO 8601 with a Z; attachments as
+  [{name, size, type}] and no bytes; conv, the conversation id a reply answered (""); tag, the tag a started
+  mail asked to be answered at (""); workspace. The body is the text that went, after Slack's markup came off.
+  A reader threads it with received mail on message_id / in_reply_to / references and on conv and tag, because
+  the relay may put its own Message-ID on the wire. Keeping it is best effort: a disk that refuses the write
+  costs the copy and a line in out.log, never the mail. Mail sent before this copy existed has none.
+
 CONFIG, all of it in ~/.cc/config through cc-config, none of it in this file. This directory is published:
 nothing here may name the box's domain, its addresses or its people.
 

@@ -386,8 +386,9 @@ class Box:
         vetting.CCSTATE = os.path.join(self.tmp, "ccstate")
         vetting.BOARDS = os.path.join(self.tmp, "boards")
         self.saved_out = (outbound.MAILDIR, outbound.OUTDIR, outbound.RATEFILE, outbound.LOGFILE,
-                          outbound._UNCONFIGURED_SAID[0])
+                          outbound._UNCONFIGURED_SAID[0], outbound.SENTDIR)
         outbound.MAILDIR = self.tmp
+        outbound.SENTDIR = os.path.join(self.tmp, "sent")    # a sent mail's copy lands here, never the box's
         outbound.OUTDIR = os.path.join(self.tmp, "out")
         outbound.RATEFILE = os.path.join(outbound.OUTDIR, "rate.json")
         outbound.LOGFILE = os.path.join(self.tmp, "out.log")
@@ -409,7 +410,7 @@ class Box:
         (vetting.MAILDIR, vetting.CONVDIR, vetting.STATE, vetting.DEV, vetting.WORKTREES,
          vetting.SANDBOX, vetting.CCSTATE, vetting.BOARDS) = self.saved_vet
         (outbound.MAILDIR, outbound.OUTDIR, outbound.RATEFILE, outbound.LOGFILE,
-         outbound._UNCONFIGURED_SAID[0]) = self.saved_out
+         outbound._UNCONFIGURED_SAID[0], outbound.SENTDIR) = self.saved_out
         os.environ.pop("CC_MAIL_VET_FAKE", None)
         for k, v in self.saved_env.items():
             if v is None:
@@ -1931,6 +1932,7 @@ def run():
         def fresh():
             """A clean rate file and a clean log, so each case's counts are its own."""
             shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            shutil.rmtree(outbound.SENTDIR, ignore_errors=True)
             open(outbound.LOGFILE, "w").close()
             outbound._UNCONFIGURED_SAID[0] = False
 
@@ -1963,6 +1965,18 @@ def run():
         mine = router.load_conv(rec["id"])["message_ids"]
         k(mine[0] == MID and len(mine) == 2 and mine[1] == call["msg"]["Message-ID"],
           "…and the id we sent it with joins the conversation, so the sender's answer to US comes back to it")
+        kept = [os.path.join(outbound.SENTDIR, x, "message.json") for x in os.listdir(outbound.SENTDIR)]
+        cp = json.load(open(kept[0])) if len(kept) == 1 else {}
+        k(len(kept) == 1 and cp.get("direction") == "sent" and cp.get("conv") == rec["id"]
+          and cp.get("message_id") == call["msg"]["Message-ID"] and cp.get("in_reply_to") == MID
+          and MID in cp.get("references", []) and cp.get("text") == "done — the cert is renewed"
+          and cp.get("from") == "mem@box.example" and cp.get("to") == ["friend@allowed.example", "colleague@allowed.example"]
+          and cp.get("cc") == ["watcher@allowed.example"] and re.match(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$", cp.get("id", ""))
+          and cp.get("sent_at", "").endswith("Z") and oct(os.stat(kept[0]).st_mode & 0o777) == "0o600",
+          "…and a copy of what went is kept in the sent store, 0600, with the body, the conversation and the "
+          "threading headers a reader needs to put it beside the mail it answers")
+        k([ln for ln in logged() if " sent from=" in ln and " kept=" + cp.get("id", "?") in ln],
+          "…and the send's log line names the copy, so a reader can tell a kept send from one sent before copies")
 
         # (b) THE RECIPIENTS ARE THE MAIL'S, NOT THE REPLY'S. A session that writes an address is writing text.
         fresh()
@@ -1983,6 +1997,8 @@ def run():
               "a reply in a channel the mail only COPIED sends nothing: a Cc watches, it does not answer")
             k(outbound.send(conf(w), "C-box", "9999.9", text="hello") == "" and not w.calls,
               "…and a thread that is not a mirror root at all is left alone, which is every other thread here")
+        k(not os.path.isdir(outbound.SENTDIR) or not os.listdir(outbound.SENTDIR),
+          "…and a post that was never mailed leaves no copy in the sent store")
 
         # (c2) A HELD MAIL CAN BE ANSWERED BY MAIL (owner, 2026-09-09: 'at least an ack ... or telling me to
         # check slack'). The record take_mail writes for a mail the vetting step HOLDS is the delivered mail's
@@ -2333,6 +2349,7 @@ def run():
             """A clean rate file and a clean log. Named apart from section 17's `fresh` on purpose: the two
             live in the same function and one shadowing the other is a silent way to test the wrong state."""
             shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            shutil.rmtree(outbound.SENTDIR, ignore_errors=True)
             open(outbound.LOGFILE, "w").close()
             outbound._UNCONFIGURED_SAID[0] = False
 
@@ -2366,6 +2383,28 @@ def run():
         k(call["ua"] == outbound.USER_AGENT and "urllib" not in call["ua"],
           "…and the call carries a User-Agent of our own: Cloudflare's edge answers urllib's default with a "
           "403 of its own, which is a mail lost in front of the worker on BOTH paths")
+        kept = os.listdir(outbound.SENTDIR) if os.path.isdir(outbound.SENTDIR) else []
+        cp = json.load(open(os.path.join(outbound.SENTDIR, kept[0], "message.json"))) if len(kept) == 1 else {}
+        k(cp.get("direction") == "sent" and cp.get("subject") == "a test from the box" and cp.get("conv") == ""
+          and cp.get("text") == "the door works both ways now" and cp.get("to") == [ALLOWED]
+          and cp.get("from") == "home@box.example" and cp.get("in_reply_to") == ""
+          and cp.get("message_id") == call["msg"]["Message-ID"],
+          "…and a started mail is kept in the sent store too, subject and body as they went, answering nothing")
+        # the copy is best effort: a store that refuses the write costs the copy and a log line, never the mail
+        raw, _mid = outbound.build({}, "chan@box.example", [ALLOWED], [], "x", subject="caf\u00e9 \u2713", reply_to="")
+        cid = outbound.keep_sent(raw, "x", attach=[("/d/r.pdf", b"12345")], tag="ab12cd34", workspace="mem")
+        cp = json.load(open(os.path.join(outbound.SENTDIR, cid, "message.json"))) if cid else {}
+        k(cp.get("tag") == "ab12cd34" and cp.get("workspace") == "mem" and cp.get("subject") == "caf\u00e9 \u2713"
+          and cp.get("attachments") == [{"name": "r.pdf", "size": 5, "type": "application/pdf"}],
+          "a kept copy carries the tag a started mail is answered at, its subject decoded, and its files by name, "
+          "size and type only")
+        saved_sent = outbound.SENTDIR
+        outbound.SENTDIR = os.path.join(outbound.LOGFILE, "not-a-dir")     # under a file: every write fails
+        try:
+            k(outbound.keep_sent(raw, "x") == "" and [ln for ln in cold_log() if "copy was not kept" in ln],
+              "…and a store that refuses the copy answers \"\" and says so in out.log, raising nothing")
+        finally:
+            outbound.SENTDIR = saved_sent
 
         # (b) THE REFUSAL. The list is the whole of what keeps this from being a relay, so the address is
         # checked BEFORE the wire and a mail nobody meant is a line rather than a POST somebody has to notice.
@@ -2377,6 +2416,8 @@ def run():
               "wire — the box cannot be used to mail a stranger")
             k([ln for ln in cold_log() if "cold: not sent" in ln and STRANGER in ln],
               "…and the refusal is in out.log as well, so it is not a silent nothing")
+            k(not os.path.isdir(outbound.SENTDIR) or not os.listdir(outbound.SENTDIR),
+              "…and a refused mail leaves no copy in the sent store: nobody got it")
             # …and one bad address in a list refuses the WHOLE mail. Sending to the others and naming the one
             # that was dropped reads as success to whoever typed it, on the path where being wrong is a relay.
             cold_fresh()
@@ -2700,6 +2741,7 @@ def run():
 
         def fresh():
             shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            shutil.rmtree(outbound.SENTDIR, ignore_errors=True)
             open(outbound.LOGFILE, "w").close()
             outbound._UNCONFIGURED_SAID[0] = False
 
@@ -2850,6 +2892,7 @@ def run():
 
         def fresh22():
             shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            shutil.rmtree(outbound.SENTDIR, ignore_errors=True)
             open(outbound.LOGFILE, "w").close()
             outbound._UNCONFIGURED_SAID[0] = False
 
@@ -3354,6 +3397,7 @@ def run():
                 return [ln for ln in f.read().splitlines() if ln.strip()]
 
         shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+        shutil.rmtree(outbound.SENTDIR, ignore_errors=True)
         open(outbound.LOGFILE, "w").close()
         outbound._UNCONFIGURED_SAID[0] = False
         msg = arrived(b, ALLOWED, rcpt="mem@box.example", to="mem@box.example", subject="the held ask",
@@ -3390,7 +3434,7 @@ def run():
           "writing back")
         k(stayed == 0 and note_s == "",
           "…while a post there that answers nothing stays in Slack, as in any mail thread")
-        sent = [ln for ln in held_log() if ln.endswith("%s: sent from=mem@box.example to=%s" % (msg["id"], ALLOWED))]
+        sent = [ln for ln in held_log() if re.search(r"%s: sent from=mem@box\.example to=%s( kept=\S+)?$" % (re.escape(msg["id"]), re.escape(ALLOWED)), ln)]
         k(len(sent) == 1 and held_log().index(acks[0]) < held_log().index(sent[0]),
           "…and out.log shows each — the ack first, then the reply, both against the held mail's id: %r"
           % (held_log(),))
@@ -3433,6 +3477,7 @@ def run():
 
         def fresh25():
             shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            shutil.rmtree(outbound.SENTDIR, ignore_errors=True)
             open(outbound.LOGFILE, "w").close()
             outbound._UNCONFIGURED_SAID[0] = False
 
