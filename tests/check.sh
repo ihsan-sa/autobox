@@ -57,7 +57,8 @@ for f in templates/home/agents/*.md; do
   h="$(sed -n '2,/^---$/p' "$f")"
   grep -qx "name: $n" <<<"$h" || { echo "$f: frontmatter 'name' must be '$n' (the harness spawns by it)"; exit 1; }
   grep -q '^description: .' <<<"$h" || { echo "$f: frontmatter needs a 'description' — it is what picks the type"; exit 1; }
-  grep -qE '^model: (opus|sonnet|haiku|inherit)$' <<<"$h" || { echo "$f: frontmatter needs 'model: opus|sonnet|haiku|inherit'"; exit 1; }
+  # …or a full model id, which pins the version an alias would drift off (`opus` meant Opus 5 after Opus 5.5 shipped).
+  grep -qE '^model: (opus|sonnet|haiku|inherit|claude-[a-z0-9-]+)$' <<<"$h" || { echo "$f: frontmatter needs 'model: opus|sonnet|haiku|inherit|claude-<id>'"; exit 1; }
   # `tools` is the type's reach. A name the harness does not know is dropped in silence, so a review type asking for
   # Grep and getting nothing looks like a quiet agent, not a broken file. No key at all means every tool: fine for a
   # builder, wrong for a *reviewer, which must not be able to write — so that one states its list, without Write/Edit.

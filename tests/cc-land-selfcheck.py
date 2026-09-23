@@ -673,10 +673,10 @@ def selfcheck():
     check("…and each scratch checkout NAMES the repo and the step it was made for, because its cwd is all cc-spend "
           "has to read a lane off — a bare cc-land-XXXX put $270 of reviews and gate rounds in a lane called `-`",
           lanes == ["cc-land.gates.myrepo.7", "cc-land.review.myrepo.7"])
-    check("the reviewer is opus at high effort, capped in BOTH money and turns from the environment, and cannot "
+    check("the reviewer is opus at medium effort, capped in BOTH money and turns from the environment, and cannot "
           "reach the shell, the network or a settings file — it reads the diff and answers, and that is the whole "
           "of what it can do",
-          argv[3:7] == ["--model", "claude-opus-5", "--effort", "high"]
+          argv[3:7] == ["--model", "claude-opus-5-5", "--effort", "medium"]
           and argv[argv.index("--max-budget-usd") + 1] == REVIEW_BUDGET
           and argv[argv.index("--max-turns") + 1] == REVIEW_TURNS
           and "Bash" in argv[argv.index("--disallowedTools") + 1]

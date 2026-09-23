@@ -154,12 +154,12 @@ or a proxy. The tool retrieves; it never calls a model. The steps:
 
 ## model policy
 Planning sessions and orchs run the strongest available model (cc-model's primary, Opus 5.5); a headless
-worker runs on CC_WORKER_MODEL (claude-opus-5) unless the dispatcher passes `--model` for that one
+worker runs on CC_WORKER_MODEL (claude-opus-5-5) unless the dispatcher passes `--model` for that one
 task — a limit override outranks both. A planning session never runs below Opus: with Opus out
 cc-model parks it rather than move it to Sonnet, and hands it back on Opus when that answers. The order lives in cc-loop's `worker_model`; the names live in
 cc-model and nowhere else — when models change, change cc-model.
-- A subagent runs on its type's `model` line (builder and security-reviewer: opus; reviewer: sonnet) unless the spawner passes `model` on the Agent call, which outranks the type; that is how a tiny builder gets Sonnet. Verified on this box 2026-09-05: a builder spawned with model sonnet records claude-sonnet-5 in its transcript.
-- Effort is the cheap dial: high by default, down for routine turns, up for the hardest.
+- A subagent runs on its type's `model` line (builder and security-reviewer: claude-opus-5-5; reviewer: sonnet) unless the spawner passes `model` on the Agent call, which outranks the type; that is how a tiny builder gets Sonnet. Verified on this box 2026-09-05: a builder spawned with model sonnet records claude-sonnet-5 in its transcript.
+- Effort is the cheap dial: medium by default (Opus 5.5 at medium matches Opus 5 at high), down for routine turns, up for the hardest — xhigh for the audit's authority band. Fable is a hand-picked escalation, used only when Opus 5.5 at xhigh visibly misses.
 - On each model upgrade, try deleting one harness crutch — and read the new model's own prompting guide first: a new model's regressions cost more than its crutches.
 
 ## testing bar
