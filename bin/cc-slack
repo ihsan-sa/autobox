@@ -3566,7 +3566,7 @@ class Daemon:
         handed it to, so a `post -c '#<orch channel>' "@<that orch> …"` reaches it once."""
         out = self.wake_channel(chat, ts, thread, text, peer)
         seat = self.peer_seat(peer)
-        if seat:
+        if seat and ts:                          # a file's post has no ts to key its mentions on: the channel wake only
             done = {(out["target"], self.chan_alias(chat))} if out.get("target") else set()
             out["mentions"] = self.route_mentions(chat, ts, thread, text, seat, skip=done)
             ask = self.ask_hop(chat, thread, text, seat)   # a reply in a member's ask thread is carried to the member
@@ -3641,6 +3641,9 @@ class Daemon:
         if not target or str(chat).startswith("D"):
             return {"ok": True, "result": "no-session"}
         alias = self.chan_alias(chat)
+        tt = thread_target(chat, thread)     # a post under a track's root is the track's, so a track's own thread is "own"
+        if tt:
+            target, alias = tt, None
         seat = self.peer_seat(peer)
         if not seat:
             return {"ok": True, "result": "not-a-session"}
@@ -6764,6 +6767,7 @@ class Channel:
         self.member = os.environ.get("CC_MEMBER_SANDBOX") == "1"   # in a workspace boundary: no token, socket is the member's scoped link
         self.link_started = False   # link starts only after notifications/initialized, else backlog is emitted pre-handshake and dropped
         self.acks = []              # agent posts handed to this session, waiting for the 👍 its next turn puts on them
+        self.asked = {}             # (chat, ts) of posts handed to this session: a reply there answers, anywhere else it wakes
         import asyncio
         self.aio = asyncio
         self.out_lock = asyncio.Lock()
@@ -6863,6 +6867,21 @@ class Channel:
             self.acks.append((meta["chat_id"], meta["ts"]))
             del self.acks[:-ACK_MAX]     # woken this often with no turn in between: queueing, not reading
 
+    def asked_in(self, meta):
+        """Where this session was asked: a reply or file there answers the asker, one anywhere else is this session's
+        post into another's channel and wakes it (wants_wake)."""
+        for k in ("thread_ts", "ts"):
+            if meta.get("chat_id") and meta.get(k):
+                self.asked[(meta["chat_id"], meta[k])] = 1
+        while len(self.asked) > 500:
+            del self.asked[next(iter(self.asked))]
+
+    def wants_wake(self, chat, a):
+        """True for a reply/file into a thread or channel this session was not asked in (owner, 2026-09-23: agents'
+        posts were never read in). The daemon's wake decides the rest: its own channel is "own", a DM nobody's."""
+        where = a.get("thread_ts") or a.get("ts")
+        return chat != "local" and not (where and (chat, where) in self.asked)
+
     async def ack_woken(self):
         """👍 each agent post this turn woke, once, riding that turn — no extra wake-up, no poll, no message.
         The daemon puts the reaction on: it holds the token, and inside a member workspace this process has none.
@@ -6938,12 +6957,13 @@ class Channel:
                 n, pts = post(self.cfg, chat, a.get("text", ""), a.get("thread_ts") or None, username=display_name(self.target, self.alias),
                               ts=a.get("ts") or None, decision=dec)
                 routed, named = "", bool(alias_mentions(a.get("text", "")))
-                if pts and chat != "local" and (named or a.get("thread_ts")):
+                wake = self.wants_wake(chat, a)
+                if pts and chat != "local" and (named or a.get("thread_ts") or wake):
                     # @<alias> is a hand-off: the daemon routes it (route_mentions); a threaded reply may answer a member
                     # workspace's ask, which the daemon carries to the member (ask_hop) — one local call tells both
                     r = {}
                     try:
-                        r = sock_request({"mention": chat, "ts": pts, "thread_ts": a.get("thread_ts") or None, "text": a.get("text", "")}, timeout=15)
+                        r = sock_request({"wake" if wake else "mention": chat, "ts": pts, "thread_ts": a.get("thread_ts") or None, "text": a.get("text", "")}, timeout=15)
                         if named:
                             routed = ("\n\nMENTIONS NOT ROUTED: the box sees no live session behind this reply, so no session you @-named was woken"
                                       if r.get("result") == "not-a-session" else mentions_line(r.get("mentions")) if r.get("ok") else
@@ -6952,6 +6972,9 @@ class Channel:
                         if named:
                             routed = f"\n\nMENTIONS NOT ROUTED: the daemon did not answer ({e.__class__.__name__}), so no session you @-named was woken"
                     routed += ask_line(r.get("ask"))
+                    if wake and r.get("target"):
+                        routed += (f"\n\nWOKE NOBODY on {r['target']} ({r.get('result')}) — {r['recorded']}" if r.get("recorded")
+                                   else f"\n\nhanded to {r['target']} ({r.get('result')})")
                 if a.get("ts"):
                     react(self.cfg, chat, a["ts"], "eyes", remove=True)   # the 👀 comes off, nothing replaces it
                 return ((f"sent ({n} message(s))" if n else "logged to ~/.cc/slack/outbox.log (no SLACK_BOT_TOKEN)")
@@ -6971,8 +6994,9 @@ class Channel:
                     return (f"NOT sent to Slack — logged to {DIR}/outbox.log (no SLACK_BOT_TOKEN); "
                             "nothing reached anyone, so do not say the file arrived"), False
                 missed = unresolved_mentions(self.cfg, a.get("text") or "", chat)
+                woke = file_wake(chat, a.get("thread_ts"), a.get("text") or os.path.basename(path)) if self.wants_wake(chat, a) else ""
                 return (f"sent {os.path.basename(path)}" + (" in the thread" if a.get("thread_ts") else "")
-                        + mention_warning(missed)), False
+                        + mention_warning(missed) + woke), False
             if name == "react":
                 chat, ts, emoji = a.get("chat_id", ""), a.get("ts", ""), str(a.get("emoji", "eyes"))
                 react(self.cfg, chat, ts, emoji, thread=a.get("thread_ts") or None)
@@ -7054,6 +7078,7 @@ class Channel:
                         await self.send({"jsonrpc": "2.0", "method": "notifications/claude/channel",
                                          "params": {"content": ev.get("content", ""), "meta": meta}})
                         self.woke_by(meta)
+                        self.asked_in(meta)
                     elif ev.get("type") == "permission":
                         await self.send({"jsonrpc": "2.0", "method": "notifications/claude/channel/permission",
                                          "params": {"request_id": ev.get("request_id"), "behavior": ev.get("behavior")}})
@@ -7353,6 +7378,18 @@ def cmd_post(argv):
             print("cc-slack: " + ask_line(r["ask"]).strip(), file=sys.stderr)
     return 0
 
+def file_wake(chat, thread, text):
+    """A file a session posts into another session's channel wakes that session, as `post -c` does (Daemon.wake
+    decides: its own channel is "own", a DM or a caller that is no session wakes nobody). The upload hands back no
+    message ts, so the wake carries none. Returns the line for the caller's result, "" when nobody was handed it."""
+    try:
+        r = sock_request({"wake": chat, "ts": "", "thread_ts": thread or None, "text": f"[file] {text}"}, timeout=15)
+    except Exception:
+        return ""                                    # no daemon: the file stands, and there is no session to hand it to
+    if r.get("recorded"):
+        return f" (woke nobody on {r['target']}: {r.get('result')} — {r['recorded']})"
+    return f" (handed to {r['target']}: {r.get('result')})" if r.get("target") else ""
+
 def cmd_post_file(argv):
     """post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m TEXT] — same upload_file() helper as the channel server's `file` tool. Default target: the owner's DM. Exit 2 usage/refused, 3 no token, 1 API error."""
     usage = "cc-slack post --file <path> [--to <channel-or-user-id|#name>] [--thread <ts>] [--ts <ts>] [--title <t>] [-m|--text <msg>]"
@@ -7376,7 +7413,11 @@ def cmd_post_file(argv):
                 "channel_not_found": f"no channel {tgt}: give a C…/D… id, a U… user id, or #name of a channel the bot is in"}
         err = str(e)
         print(f"cc-slack post --file failed: {err}. {next((h for k, h in hint.items() if k in err), '')}".strip(), file=sys.stderr); return 1
-    print(f"ok file={fid} channel={to}"); return 0
+    print(f"ok file={fid} channel={to}")
+    woke = file_wake(to, opt["--thread"], opt["-m"] or os.path.basename(path)) if fid else ""
+    if woke:
+        print("cc-slack:" + woke, file=sys.stderr)
+    return 0
 
 def find_channel(cfg, name):
     """#name → (id, is_member) across all channels the bot can see, or (None, False)."""

@@ -6120,6 +6120,7 @@ def run_selfcheck():
         globals()["sock_request"] = lambda o, timeout=15: ms_req(o, member=None, peer=me_peer)
         chMN = Channel(CTL); chMN.cfg = {"SLACK_BOT_TOKEN": "xoxb-t"}
         chMN.muted = lambda: False                 # the box's own open handoff on CTL must not mute this fixture's reply
+        chMN.asked.update({("CMY", th): 1 for th in ("7.5", "7.6", "7.9", "7.95")})   # replies where it was asked: mentions, no channel wake
         roleMN = os.environ.pop("CC_ROLE", None)   # Channel.call refuses every tool to a --go worker; this is a session
         try:
             dmMS.route_mentions = lambda *a, **k: []
@@ -6165,6 +6166,45 @@ def run_selfcheck():
                 dmMS.queues["myrepo"].remove(e)
             winMN.close(); save_orchs(wasMN)
             del postedMS[n0MN:]; del ranMS[r0MN:]   # the member cases below read both from their start
+        # A SESSION'S POST INTO ANOTHER SESSION'S CHANNEL WAKES IT, BY EVERY ROUTE (owner, 2026-09-23: agents' posts
+        # were never read in — only `post -c` woke, a file or a reply-tool post did not). The CTL seat (me_peer) posts
+        # into #myrepo by `post -c`, `post --file`, the file tool and the reply tool: each is one delivery to myrepo,
+        # as the box. Its own channel, a thread it was asked in, and a track's own thread wake nobody.
+        wokeFW = []
+        real_FW = {k: globals()[k] for k in ("sock_request", "load_cfg", "resolve_channel", "sender_name", "upload_file",
+                                             "unresolved_mentions", "check_upload_path", "load_track_threads")}
+        _delFW, roleFW = dmMS.deliver, os.environ.pop("CC_ROLE", None)
+        dmMS.deliver = lambda target, payload, autostart=True, alias=None: wokeFW.append((target, alias, payload)) or "delivered"
+        chFW = Channel(CTL); chFW.cfg = {"SLACK_BOT_TOKEN": "xoxb-t"}; chFW.muted = lambda: False
+        n0FW = len(postedMS)
+        woken_by = lambda f: (wokeFW.clear(), f(), [(t, al, p["meta"].get("user"), p["meta"].get("from")) for t, al, p in wokeFW])[2]
+        try:
+            globals().update(sock_request=lambda o, timeout=15: ms_req(o, member=None, peer=me_peer),
+                             load_cfg=lambda: {"SLACK_BOT_TOKEN": "xoxb-t"},
+                             resolve_channel=lambda cfg, name: {"myrepo": "CMY", CTL: "CCTL"}.get(name),
+                             sender_name=lambda chan: ("box", chan == "CCTL"), unresolved_mentions=lambda cfg, text, chat=None, **kw: [],
+                             upload_file=lambda cfg, path, to, thread=None, **kw: ("F1", to), check_upload_path=lambda p: p,
+                             load_track_threads=lambda: {"myrepo/t9": {"chat": "CMY", "ts": "4.4"}})
+            with contextlib.redirect_stdout(io.StringIO()):
+                wFW_post = woken_by(lambda: cmd_post(["-c", "#myrepo", "can you take the sweep?"]))
+                wFW_pfile = woken_by(lambda: cmd_post_file(["--file", __file__, "--to", "CMY", "-m", "the log"]))
+                wFW_pfile_own = woken_by(lambda: cmd_post_file(["--file", __file__, "--to", "CCTL"]))
+            wFW_tfile = woken_by(lambda: chFW.call("file", {"chat_id": "CMY", "path": __file__, "text": "the log"}))
+            wFW_reply = woken_by(lambda: chFW.call("reply", {"chat_id": "CMY", "text": "the sweep found two stale rows"}))
+            out_FW = chFW.call("reply", {"chat_id": "CMY", "text": "and a third"})[0]
+            wFW_own = woken_by(lambda: (chFW.call("reply", {"chat_id": "CCTL", "text": "note to self"}),
+                                        chFW.call("file", {"chat_id": "CCTL", "path": __file__})))
+            chFW.asked_in({"chat_id": "CMY", "thread_ts": "9.1", "ts": "9.2"})
+            wFW_asked = woken_by(lambda: (chFW.call("reply", {"chat_id": "CMY", "thread_ts": "9.1", "text": "answered"}),
+                                          chFW.call("file", {"chat_id": "CMY", "thread_ts": "9.1", "path": __file__})))
+            wFW_track = woken_by(lambda: chFW.call("reply", {"chat_id": "CMY", "thread_ts": "4.4", "text": "for t9"}))
+            dmMS.peer_seat = lambda peer, member=None: ("myrepo/t9", None)     # the track itself, posting in its own thread
+            wFW_tself = woken_by(lambda: dmMS.wake_channel("CMY", "4.5", "4.4", "progress", None))
+        finally:
+            globals().update(real_FW); dmMS.deliver = _delFW; dmMS.__dict__.pop("peer_seat", None)
+            if roleFW is not None:
+                os.environ["CC_ROLE"] = roleFW
+            del postedMS[n0FW:]
         subprocess.run(["rm", "-rf", f"{DEV}/alice/proj", f"{DEV}/alice/own"])
         # the MEMBER socket: hello as itself only; inject stamps member and starts nothing
         held = []
@@ -6457,6 +6497,16 @@ def run_selfcheck():
           and "@ghost → #myrepo-ghost-cd34 (queued) — NOT WOKEN" in out_mng and len(q_mn) == 1
           and q_mn[0][1]["meta"].get("thread_ts") == "7.9"
           and "MENTIONS NOT ROUTED: the daemon refused (one verb per request" in out_mnold)
+    boxFW = [("myrepo", None, "box", CTL)]
+    check("wake by every route: a session's post into another session's channel wakes it once, as the box — `post -c`, "
+          "`post --file`, the file tool and the reply tool alike, and the reply says whom it handed to (owner, "
+          "2026-09-23: agents' posts were never read in)",
+          wFW_post == boxFW and wFW_pfile == boxFW and wFW_tfile == boxFW and wFW_reply == boxFW
+          and "handed to myrepo (delivered)" in out_FW)
+    check("wake by every route: its own channel, a thread it was asked in and a track's own thread wake nobody; a post "
+          "under a track's root wakes that track, not the channel's session",
+          wFW_pfile_own == [] and wFW_own == [] and wFW_asked == [] and wFW_tself == []
+          and wFW_track == [("myrepo/t9", None, "box", CTL)])
     check("wake: a post that wakes nobody is recorded by cc-slack at that moment (i-e9fb26ce: the wake only logged its "
           "result, and the owner found the post that woke nobody) — queued, no-session, live-no-channel and no-track "
           "each write ONE record (channel-wake/nobody-woken, scope the target's repo, links.source the post's own "
