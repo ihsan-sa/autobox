@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# cc-skills — the skills every Claude session on the box gets, kept at the tip of their own git repos.
+#   cc-skills sync       clone a listed skill that is missing, fast-forward one that is there; rides cc-reconcile.service
+#   cc-skills list       name<TAB>url<TAB>branch<TAB>state for each listed skill
+#   cc-skills names      the listed skills that are installed and are clones of their url — what cc-sandbox binds
+#   cc-skills selfcheck
+# THE LIST is one file, one skill per line: `<name> <git url> [<branch>]`, `#` for comments. Adding a skill is one
+#   line there. It is the tree's own config/skills.list, and on a box that keeps this tree as core/ inside a private
+#   overlay, the overlay's config/skills.list (a skill's url names its owner, which core/ must not). CC_SKILLS_LIST
+#   points at another file (the selfcheck's). A url carrying a user or a token is refused: the clone is readable by
+#   every member workspace, so its .git/config must hold nothing a member should not read.
+# WHERE: each skill is a plain clone at ~/.claude/skills/<name>, where every host session finds it. The name `synced`
+#   belongs to the account's own sync and is never taken; a directory at a listed name that is not a clone of that url
+#   (a skill someone made by hand) is left alone and reported. A new clone is made beside it under a dot name and
+#   renamed in, so a half clone is never a skill.
+# PULL: fetch the branch (default: whichever the clone checked out, i.e. the remote's default) and merge --ff-only. A
+#   pull that fails — no network, a diverged or dirty checkout, a url that moved — changes nothing, so the last good copy
+#   stays what every session reads. It is reported ONCE: a stamp at ~/.cc/skills/<name>.fail marks it said, and the
+#   first sync that succeeds removes the stamp and says it recovered. Exit 1 when any skill failed.
+# MEMBERS AND WORKERS see the same directories through cc-sandbox (skills_bind), read-only, one bind per name this
+#   prints under `names` — never ~/.claude/skills whole, so `synced` and a hand-made skill stay the owner's.
+set -uo pipefail
+R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+SELF=$(readlink -f "$0")
+TOP="$R"; [ "$(basename "$R")" = core ] && [ -d "$R/../config" ] && TOP="$(cd "$R/.." && pwd)"
+LIST="${CC_SKILLS_LIST:-$TOP/config/skills.list}"
+SK="$HOME/.claude/skills"; ST="$HOME/.cc/skills"
+NOTIFY="${CC_SKILLS_NOTIFY:-$(dirname "$SELF")/cc-notify}"
+export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false
+TO="${CC_SKILLS_TIMEOUT:-120}"
+
+# name<TAB>url<TAB>branch for each well-formed line; a bad line is one stderr line and skipped
+entries(){
+  [ -f "$LIST" ] || return 0
+  local name url br extra ln=0
+  while read -r name url br extra; do
+    ln=$((ln+1))
+    case "$name" in ''|'#'*) continue;; esac
+    if ! [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || [ "$name" = synced ] || [ -z "$url" ] || [ -n "$extra" ]; then
+      echo "cc-skills: $LIST:$ln is not '<name> <git url> [<branch>]' with a plain lowercase name other than synced — skipped" >&2; continue; fi
+    case "$url" in
+      *://*@*) echo "cc-skills: $LIST:$ln ($name) puts a user or a token in its url — every member workspace can read the clone, so it is skipped" >&2; continue;;
+      https://*|ssh://*|git@*:*|/*) ;;
+      *) echo "cc-skills: $LIST:$ln ($name) has a url that is not https://, ssh://, git@host: or an absolute path — skipped" >&2; continue;;
+    esac
+    printf '%s\t%s\t%s\n' "$name" "$url" "$br"
+  done < "$LIST"; }
+
+# $1 dir $2 url → 0 when dir is a real directory holding a clone whose origin is url
+managed(){ [ -d "$1" ] && [ ! -L "$1" ] && [ -d "$1/.git" ] && [ ! -L "$1/.git" ] &&
+  [ "$(git -C "$1" config --get remote.origin.url 2>/dev/null)" = "$2" ]; }
+
+fail(){   # $1 name $2 why — say it once, until a sync of that skill succeeds
+  local s="$ST/$1.fail"
+  printf 'cc-skills: %s — %s\n' "$1" "$2" >&2
+  [ -e "$s" ] && return 0
+  mkdir -p "$ST" && printf '%s\n' "$2" > "$s"
+  "$NOTIFY" --ask --id "skill-pull:$1" -t "skill $1 did not update" \
+    "The shared skill $1 did not update: $2. Every session still reads the last good copy at ~/.claude/skills/$1. cc-skills sync says this once; the stamp ~/.cc/skills/$1.fail clears when a sync succeeds." >/dev/null 2>&1 || :; }
+ok(){ [ -e "$ST/$1.fail" ] && { rm -f "$ST/$1.fail"; echo "cc-skills: $1 updates again"; }; return 0; }
+
+sync1(){   # $1 name $2 url $3 branch
+  local n="$1" u="$2" b="$3" d="$SK/$1" tmp out old new
+  if [ ! -e "$d" ] && [ ! -L "$d" ]; then
+    mkdir -p "$SK" || { fail "$n" "cannot make $SK"; return 1; }
+    tmp="$SK/.$n.cc-skills.$$"; rm -rf "$tmp"
+    if out=$(timeout "$TO" git clone -q ${b:+--branch "$b"} -- "$u" "$tmp" 2>&1) && mv -T "$tmp" "$d"; then
+      echo "cc-skills: $n cloned at $(git -C "$d" rev-parse --short HEAD)"; ok "$n"; return 0; fi
+    rm -rf "$tmp"; fail "$n" "the clone failed: $(tail -1 <<<"$out")"; return 1
+  fi
+  managed "$d" "$u" || { fail "$n" "the directory $d is there but is not a clone of $u, so it is left alone"; return 1; }
+  [ -n "$b" ] || b=$(git -C "$d" symbolic-ref -q --short HEAD) || { fail "$n" "the checkout is not on a branch"; return 1; }
+  [ "$(git -C "$d" symbolic-ref -q --short HEAD)" = "$b" ] || { fail "$n" "the checkout is not on $b"; return 1; }
+  old=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+  out=$(timeout "$TO" git -C "$d" fetch -q origin -- "$b" 2>&1) || { fail "$n" "the fetch failed: $(tail -1 <<<"$out")"; return 1; }
+  out=$(git -C "$d" merge -q --ff-only FETCH_HEAD 2>&1) || { fail "$n" "not a fast-forward to origin/$b: $(tail -1 <<<"$out")"; return 1; }
+  new=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+  [ "$old" = "$new" ] || echo "cc-skills: $n ${old:0:7} -> ${new:0:7}"
+  ok "$n"; return 0; }
+
+cmd_sync(){ local n u b bad=0
+  while IFS=$'\t' read -r n u b; do sync1 "$n" "$u" "$b" || bad=1; done < <(entries)
+  return "$bad"; }
+cmd_list(){ local n u b s
+  while IFS=$'\t' read -r n u b; do
+    if [ -e "$ST/$n.fail" ]; then s="failing: $(head -1 "$ST/$n.fail")"
+    elif managed "$SK/$n" "$u"; then s="at $(git -C "$SK/$n" rev-parse --short HEAD 2>/dev/null)"
+    elif [ -e "$SK/$n" ]; then s="not a clone of the url"; else s="not cloned yet"; fi
+    printf '%s\t%s\t%s\t%s\n' "$n" "$u" "${b:-default}" "$s"; done < <(entries); }
+cmd_names(){ local n u b
+  while IFS=$'\t' read -r n u b; do managed "$SK/$n" "$u" && [ -f "$SK/$n/SKILL.md" ] && printf '%s\n' "$n"; done < <(entries); :; }
+
+selfcheck(){   # its own HOME: a fixture upstream, a fixture list, a fixture notifier; git only, no network
+  local fh n=0 bad=0 up out rc
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccskills-XXXXXX") || return 1
+  t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
+  run(){ env -u CC_SKILLS_TIMEOUT HOME="$fh" CC_SKILLS_LIST="$fh/list" CC_SKILLS_NOTIFY="$fh/notify" \
+    GIT_CONFIG_GLOBAL="$fh/gitconfig" GIT_CONFIG_NOSYSTEM=1 "$SELF" "$@"; }
+  gi(){ git -c user.name=t -c user.email=t@t "$@"; }
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/notified"\n' "$fh" > "$fh/notify"; chmod +x "$fh/notify"; : > "$fh/gitconfig"
+  up="$fh/up/fx-skill"; mkdir -p "$up" "$fh/.claude/skills/synced/own" || return 1
+  echo keep > "$fh/.claude/skills/synced/own/SKILL.md"
+  git -C "$up" init -q -b main && printf -- '---\nname: fx-skill\n---\nv1\n' > "$up/SKILL.md" && gi -C "$up" add -A && gi -C "$up" commit -qm v1 || return 1
+  mkdir -p "$fh/.claude/skills/handmade" && echo mine > "$fh/.claude/skills/handmade/SKILL.md"
+  printf '# a comment\nfx-skill %s\nhandmade %s\nsynced %s\nBad/Name %s\nleaky https://u:tok@example.invalid/x.git\n' "$up" "$up" "$up" "$up" > "$fh/list"
+  out=$(run sync 2>&1); rc=$?
+  t 'sync: a listed skill that is missing is cloned at ~/.claude/skills/<name>, at the upstream tip' "$(tail -1 "$fh/.claude/skills/fx-skill/SKILL.md" 2>/dev/null)" v1
+  t 'sync: no half-made clone is left under a dot name' "$(find "$fh/.claude/skills" -maxdepth 1 -name '.*cc-skills*' | wc -l)" 0
+  t 'sync: synced is never taken, a bad name and a url with a token in it are refused, each saying so' \
+    "$(grep -c 'other than synced' <<<"$out")/$(grep -c 'user or a token' <<<"$out")/$(cat "$fh/.claude/skills/synced/own/SKILL.md")" 2/1/keep
+  t 'sync: a hand-made directory at a listed name is left alone and the run exits 1' "$(cat "$fh/.claude/skills/handmade/SKILL.md")/$rc" mine/1
+  t 'names: only the listed skill that is a clone of its url — not synced, not the hand-made one' "$(run names 2>/dev/null | tr '\n' ' ')" 'fx-skill '
+  printf 'fx-skill %s\n' "$up" > "$fh/list"; : > "$fh/notified"; rm -f "$fh/.cc/skills/"*.fail
+  # a new commit upstream reaches the clone on the next sync
+  printf -- '---\nname: fx-skill\n---\nv2\n' > "$up/SKILL.md" && gi -C "$up" commit -qam v2 || return 1
+  out=$(run sync 2>&1); rc=$?
+  t 'sync: a new commit on the default branch reaches the clone in one sync' "$rc/$(tail -1 "$fh/.claude/skills/fx-skill/SKILL.md")/$(grep -c 'fx-skill .* -> ' <<<"$out")" 0/v2/1
+  # the upstream goes away: the fetch fails, the last good copy stays, one report
+  mv "$up" "$up.gone"
+  run sync >/dev/null 2>&1; rc=$?; run sync >/dev/null 2>&1
+  t 'sync: a failed pull exits 1 and keeps the last good copy' "$rc/$(tail -1 "$fh/.claude/skills/fx-skill/SKILL.md")" 1/v2
+  t 'sync: …and is reported once across two failing syncs, as a request under one id' "$(wc -l < "$fh/notified")/$(grep -c -- '--ask --id skill-pull:fx-skill' "$fh/notified")" 1/1
+  t 'list: says the skill is failing' "$(run list | cut -f4 | cut -c1-8)" failing:
+  mv "$up.gone" "$up"; printf -- '---\nname: fx-skill\n---\nv3\n' > "$up/SKILL.md" && gi -C "$up" commit -qam v3 || return 1
+  out=$(run sync 2>&1); rc=$?
+  t 'sync: the upstream back, the next sync catches up, clears the stamp and says so' \
+    "$rc/$(tail -1 "$fh/.claude/skills/fx-skill/SKILL.md")/$([ -e "$fh/.cc/skills/fx-skill.fail" ] && echo stamp || echo clear)/$(grep -c 'updates again' <<<"$out")" 0/v3/clear/1
+  # the clone diverges (someone committed in it): not a fast-forward, nothing moves, reported
+  gi -C "$fh/.claude/skills/fx-skill" commit -q --allow-empty -m local
+  printf -- '---\nname: fx-skill\n---\nv4\n' > "$up/SKILL.md" && gi -C "$up" commit -qam v4 || return 1
+  out=$(run sync 2>&1); rc=$?
+  t 'sync: a diverged clone is not forced — exit 1, content stays, the reason says fast-forward' \
+    "$rc/$(tail -1 "$fh/.claude/skills/fx-skill/SKILL.md")/$(grep -c 'not a fast-forward' <<<"$out")" 1/v3/1
+  t 'the clone'"'"'s own config names only the url: no credential in it' "$(git -C "$fh/.claude/skills/fx-skill" config --list --local | grep -ci 'credential\|token\|password')" 0
+  t '--help exits 0' "$("$SELF" --help >/dev/null 2>&1; echo $?)" 0
+  rm -rf "${fh:?}"
+  printf 'cc-skills selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
+
+case "${1:-}" in
+  sync) cmd_sync;;
+  list) cmd_list;;
+  names) cmd_names;;
+  selfcheck) selfcheck;;
+  -h|--help|help) sed -n '2,/^set -/p' "$SELF" | sed '$d; s/^# \{0,1\}//';;
+  *) echo "usage: cc-skills sync|list|names|selfcheck" >&2; exit 2;;
+esac

@@ -49,7 +49,9 @@
 #     ~/.claude.json copy holding only this workspace's projects, only the cc-slack MCP server, and two first-run flags MINTED for the
 #     workspace (`hasCompletedOnboarding` and `hasTrustDialogAccepted` on its own paths) so the member is not walked through the setup
 #     wizard and asked to sign in on every start. The flags are generated here from no value of his; his file is read for its
-#     `projects` alone, filtered as before, and is never written. The environment is CLEARED and rebuilt
+#     `projects` alone, filtered as before, and is never written · the box's shared skills (cc-skills names), ro, each at
+#     ~/.claude/skills/<name> over the member's own dir (skills_bind); the rest of the host's ~/.claude/skills stays out.
+#     The environment is CLEARED and rebuilt
 #     (HOME, PATH, TERM, LANG…, CC_MEMBER_SANDBOX=1, CC_ROLE=member, git identity = the handle). ABSENT: every other ~/dev/*, ~/.cc/config,
 #     ~/.ssh, ~/.config, ~/.gitconfig, ~/.npmrc, the ledger (~/.cc/state/member-spend.json), other boards, the docker and tmux sockets
 #     — except in a workspace GRANTED a GitHub token (`cc-sandbox github`, below): there ~/.config/gh and ~/.gitconfig hold
@@ -131,7 +133,7 @@
 #   contained here and this does not claim to contain it: it is contained when stage 1b (ccbox, an allowlist proxy)
 #   exists. His file is read, never written, and never edited by this box — the paragraph at SBX_ALLOW says why each
 #   way round. DENIED in there: the Artifact tool (SBX_DENY), added to his deny even when his file lacks it.
-# INSIDE ro: ~/bin and the bin it links into · ~/mail (core/mail, the target of ~/bin/cc-mail) · ~/WRITING.md (core/docs/WRITING.md, the guide the writing block names) · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
+# INSIDE ro: the box's shared skills, one ~/.claude/skills/<name> each (skills_bind) · ~/bin and the bin it links into · ~/mail (core/mail, the target of ~/bin/cc-mail) · ~/WRITING.md (core/docs/WRITING.md, the guide the writing block names) · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
 #   · ~/.cc/github-deny and ~/.cc/github-deny.gitconfig when the host has them (the GitHub orgs the box may not touch: cc-github-deny)
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
 #   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
@@ -463,6 +465,7 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # name is the host's. Refusing every worker launch because one member's board directory looks odd is the worse trade.
   for f in "$H"/.cc/members/*/board; do [ -d "$f" ] && B+=(--ro-bind "$f" "$f"); done   # ~/.cc/boards/<h>.json is a link in here (board_dir): ro, it resolves, and a worker writes no member's board
   settings_bind "$H/.cc/sandbox/$1/$2"   # ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside
+  skills_bind   # the box's shared skills, ro, one per name (skills_bind); ~/.claude is a tmpfs here, so no member name is in the way
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
   [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
   [ -f "$(dirname "$cb")/docs/WRITING.md" ] && B+=(--ro-bind "$(dirname "$cb")/docs/WRITING.md" "$H/WRITING.md")   # the guide the worker's prompt tells it to open: one published file, ro
@@ -613,6 +616,28 @@ gh_bind(){   # $1 handle — A WORKSPACE GRANTED A GITHUB TOKEN HOLDS IT INSIDE 
     || { rm -rf "$d"; echo "cc-sandbox: could not write the token copy under $d — no GitHub token inside" >&2; return 0; }
   B+=(--ro-bind "$d/hosts.yml" "$H/.config/gh/hosts.yml" --ro-bind "$d/config.yml" "$H/.config/gh/config.yml"
      --ro-bind "$d/gitconfig" "$H/.gitconfig"); }
+skills_bind(){   # [$1 the host dir the member's ~/.claude/skills is, for a member; empty for a worker] — THE BOX'S SHARED SKILLS, RO.
+  # cc-skills keeps each listed skill as a clone at ~/.claude/skills/<name> and fast-forwards it every tick. Each one
+  # `cc-skills names` prints — listed, installed, a clone of its url — is bound READ-ONLY at the same path inside, one bind
+  # per name: never ~/.claude/skills whole, so the account's `synced` dir and a skill the owner made by hand stay out. A
+  # directory bind and not a copy, so a pull on the host is what a live session reads next; ro, so nothing inside writes
+  # it (EROFS, the selfcheck drives it). The clone holds no credential: cc-skills refuses a url with one in it and never
+  # runs a helper into it, and the host's ~/.gitconfig is not bound. A symlink committed into a skill resolves INSIDE
+  # this namespace, where the host's secrets are absent. Pinned like every source (pin): a skill dir that is a link is
+  # skipped, not followed. THE DESTINATION is a member's own name — ~/.claude is theirs, rw — so a link or a file a
+  # member left at ~/.claude/skills or at a skill's name there skips that skill with one line (bwrap would otherwise die
+  # on it, and a bind dest is not resolved through a link, see build_member's worktrees loop): the launch goes on. The
+  # host never makes a directory through that name; bwrap makes the mountpoint inside the namespace.
+  local md="${1:-}" nm src
+  [ -x "$(dirname "$SELF")/cc-skills" ] || return 0
+  if [ -n "$md" ] && [ -L "$md" ]; then echo "cc-sandbox: ~/.claude/skills in this workspace is a symlink — none of the box's shared skills are bound" >&2; return 0; fi
+  while IFS= read -r nm; do
+    [[ "$nm" =~ ^[a-z0-9][a-z0-9._-]*$ ]] && [ "$nm" != synced ] || continue
+    src="$H/.claude/skills/$nm"
+    if [ -n "$md" ] && { [ -L "$md/$nm" ] || { [ -e "$md/$nm" ] && [ ! -d "$md/$nm" ]; }; }; then
+      echo "cc-sandbox: ~/.claude/skills/$nm in this workspace is not a plain directory — the box's skill $nm is not bound" >&2; continue; fi
+    pin --ro-bind "$src" || echo "cc-sandbox: ~/.claude/skills/$nm on the host is not a plain directory — not bound" >&2
+  done < <("$(dirname "$SELF")/cc-skills" names 2>/dev/null); :; }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
   local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own mailsrc
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
@@ -721,6 +746,7 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   settings_bind "$H/.cc/sandbox/$h/${tr:-_workspace}" "$own"
   lib_bind "$h"   # the knowledge library: this workspace's own index file, ro, and none of the rest of it (lib_bind)
   gh_bind "$h"   # …and a workspace GRANTED a GitHub token holds it inside (gh_bind); the grant is in $m too, and no marker
+  skills_bind "$m/claude/skills"   # the box's shared skills, ro, after the ~/.claude bind they sit in (skills_bind)
   [ -d "$H/.local/share/claude" ] && B+=(--ro-bind "$H/.local/share/claude" "$H/.local/share/claude")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
   # the GitHub orgs the box may not touch — the list and its git include, ro: read by the gh shim in ~/bin, by cc-guard
@@ -1715,6 +1741,63 @@ selfcheck_ghtoken(){   # A WORKSPACE GRANTED A GITHUB TOKEN, in a HOME of its ow
   t 'gh: the grant removed — the next launch holds none of the token, the copy is gone, and nothing is said' \
     "$(g tok)/$(g cfg)/$([ -e "$fh/.cc/sandbox/$h/gh" ] && echo copy || echo none)/$(grep -c 'GitHub token' <<<"$out")" '0/absent/none/0'
   rm -rf "${fh:?}"; }
+selfcheck_skills(){   # THE BOX'S SHARED SKILLS (skills_bind), in a HOME of its own: a fixture skill cc-skills cloned from a fixture
+  # upstream, one member workspace and one worker track. Inside each: the skill is readable and nothing writes it; the
+  # host's other skills and its git config are absent; a pull on the host is what the next launch reads; and a link a member
+  # planted at the skill's name skips that skill without following it or stopping the launch.
+  local fh h dev m up out rc probe wt sk
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxsk-XXXXXX") || return 1; chmod 700 "$fh"
+  h="ccsbxs$$"; dev="$fh/dev/$h"; m="$fh/.cc/members/$h"; up="$fh/up/fx-skill"; sk="$fh/.claude/skills"
+  mkdir -p "$dev/.cc" "$fh/bin" "$fh/.local/bin" "$fh/.cc/boards" "$m/claude/skills/synced/theirs" "$up" "$sk/synced/own" "$sk/handmade" || return 1
+  : > "$dev/.cc/member-workspace"; echo own > "$sk/synced/own/SKILL.md"; echo mine > "$sk/handmade/SKILL.md"; echo theirs > "$m/claude/skills/synced/theirs/SKILL.md"
+  { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  git -C "$dev" init -q -b main >/dev/null 2>&1
+  jq -n '{claudeAiOauth: {accessToken: "sk-access", expiresAt: 99999999999999}}' > "$m/credentials.json"
+  printf '[credential]\n\thelper = store\n' > "$fh/.gitconfig"   # the host's git config, which must stay outside
+  git -C "$up" init -q -b main && printf -- '---\nname: fx-skill\n---\nv1\n' > "$up/SKILL.md" \
+    && git -C "$up" -c user.name=t -c user.email=t@t add -A && git -C "$up" -c user.name=t -c user.email=t@t commit -qm v1 || return 1
+  printf 'fx-skill %s\nhandmade %s\n' "$up" "$up" > "$fh/list"
+  export CC_SKILLS_LIST="$fh/list" CC_SKILLS_NOTIFY=/bin/true
+  env HOME="$fh" "$(dirname "$SELF")/cc-skills" sync >/dev/null 2>&1
+  probe='s=~/.claude/skills; echo read=$(tail -1 $s/fx-skill/SKILL.md 2>/dev/null)
+    echo append=$( (echo x >> $s/fx-skill/SKILL.md) 2>/dev/null && echo wrote || echo refused)
+    echo create=$( (: > $s/fx-skill/planted) 2>/dev/null && echo wrote || echo refused)
+    echo delete=$(rm -f $s/fx-skill/SKILL.md 2>/dev/null; [ -f $s/fx-skill/SKILL.md ] && echo refused || echo deleted)
+    echo move=$(mv $s/fx-skill $s/moved 2>/dev/null && echo moved || echo refused)
+    echo git=$(git -C $s/fx-skill -c user.name=m -c user.email=m@m commit -q --allow-empty -m m 2>/dev/null && echo wrote || echo refused)
+    echo mnt=$(awk "\$5 ~ /skills\\/fx-skill\$/ {split(\$6, o, \",\"); print o[1]}" /proc/self/mountinfo | head -1)
+    echo handmade=$([ -e $s/handmade ] && echo present || echo absent); echo own=$([ -e $s/synced/own ] && echo present || echo absent)
+    echo theirs=$(cat $s/synced/theirs/SKILL.md 2>/dev/null); echo gitconfig=$([ -e ~/.gitconfig ] && echo present || echo absent)'
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'skills: a member session reads the box'"'"'s shared skill at ~/.claude/skills/<name>, on a read-only mount' "$(g read)/$(g mnt)" v1/ro
+  t 'skills: …and cannot write it — append, create, delete, rename and a git commit in it are all refused' \
+    "$(g append)/$(g create)/$(g delete)/$(g move)/$(g git)" refused/refused/refused/refused/refused
+  t 'skills: …the host copy is untouched after it' "$(tail -1 "$sk/fx-skill/SKILL.md")/$(ls -A "$sk/fx-skill" | tr '\n' ' ')" 'v1/.git SKILL.md '
+  t 'skills: the host'"'"'s synced and hand-made skills and its git config stay out; the member'"'"'s own synced dir is theirs, as before' \
+    "$(g handmade)/$(g own)/$(g theirs)/$(g gitconfig)" absent/absent/theirs/absent
+  # a new commit upstream: one host sync, and the next launch reads it
+  printf -- '---\nname: fx-skill\n---\nv2\n' > "$up/SKILL.md" && git -C "$up" -c user.name=t -c user.email=t@t commit -qam v2 || return 1
+  env HOME="$fh" "$(dirname "$SELF")/cc-skills" sync >/dev/null 2>&1
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'skills: a commit pulled on the host is what the next member launch reads' "$(g read)" v2
+  # a worker (the other boundary): the same skill, the same wall
+  wt="$fh/.cc/worktrees/r/t"; mkdir -p "$fh/dev/r" "$fh/.cc/worktrees/r" || return 1
+  git -C "$fh/dev/r" init -q -b main && git -C "$fh/dev/r" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+    && git -C "$fh/dev/r" worktree add -q -b track/t "$wt" >/dev/null 2>&1 || return 1
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- sh -c "$probe" 2>&1)
+  t 'skills: a worker reads it too, ro, and cannot write it, and the hand-made one stays out (its ~/.gitconfig is the owner'"'"'s, as before)' \
+    "$(g read)/$(g mnt)/$(g append)/$(g create)/$(g handmade)" v2/ro/refused/refused/absent
+  # the member plants a link at the skill's name, aimed at a host dir: the skill is skipped, the link not followed, the launch runs
+  mkdir -p "$fh/target"; rm -rf "$m/claude/skills/fx-skill"; ln -s "$fh/target" "$m/claude/skills/fx-skill"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'echo RAN=yes' 2>&1); rc=$?
+  t 'skills: a link a member left at the skill'"'"'s name skips that skill, says so, and the session still starts' \
+    "$rc/$(g RAN)/$(grep -c 'skill fx-skill is not bound' <<<"$out")/$(ls -A "$fh/target" | wc -l)" 0/yes/1/0
+  rm -f "$m/claude/skills/fx-skill"; ln -s "$fh/target" "$m/claude/skills.x"; mv "$m/claude/skills" "$m/claude/skills.real"; mv "$m/claude/skills.x" "$m/claude/skills"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'echo RAN=yes' 2>&1); rc=$?
+  t 'skills: …and a link at ~/.claude/skills itself binds none, and nothing is made through it on the host' \
+    "$rc/$(g RAN)/$(grep -c 'is a symlink — none of' <<<"$out")/$(ls -A "$fh/target" | wc -l)" 0/yes/1/0
+  unset CC_SKILLS_LIST CC_SKILLS_NOTIFY
+  git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
 selfcheck_vet(){   # THE BOX'S OWN BOUNDARY, driven for real: what is inside it, what cannot be reached from it, and that
   # there is no way of being outside it. The last one is the case with a history — every other profile here has an
   # opt-in (`<repo> <track>` execs the command untouched unless CC_WORKER_SANDBOX=1), and the mail door's rule is that
@@ -2076,7 +2159,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # --help prints the header and exits 0 — it used to reach the positional parse and die with `line 2079: 2: track`
   out=$("$SELF" --help 2>&1); rc=$?; t '--help exits 0 and prints the usage header' "$rc/$(head -1 <<<"$out" | cut -c1-10)/$(grep -c 'track$' <<<"$out")" '0/cc-sandbox/0'
   out=$("$SELF" -h 2>&1 | grep -c 'cc-sandbox member <handle>'); t '-h is the same header' "$([ "${out:-0}" -ge 1 ] && echo yes)" yes
-  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_vet
+  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_skills; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
   "$BIN/cc-member-v2" selfcheck; t 'v2 cases' "$?" 0
