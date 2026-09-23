@@ -2724,7 +2724,7 @@ F
 chmod +x "$T/probeclaude"
 ME(){ env -u TMUX TMUX_TMPDIR="$T" HOME="$MH" CC_TMUX_SESSION=_ccmodel CC_MODEL_PROC=cat \
       CC_NOTIFY_LOG="$MH/.cc/notify.log" CC_LIMIT_STAMP="$MH/.cc/state/claude-limit" CC_STATUSLINE_DIR="$MH/.cc/state/statusline" \
-      CC_MODEL_PRIMARY='claude-fable-5[1m]' CC_MODEL_FALLBACK=claude-opus-5 "$@"; }
+      CC_MODEL_PRIMARY='claude-fable-5[1m]' CC_MODEL_FALLBACK=claude-opus-5 CC_MODEL_CHAIN='claude-fable-5 claude-opus-5 claude-sonnet-5' "$@"; }   # the fixture pins its chain: the shipped one has no Fable rung since 2026-09-23
 M(){ ME "$B/cc-model" "$@"; }
 muntil(){   # how `cc-model status` must render the override's own until: the clock alone today, dated on any other
             # day. HH:MMZ alone made a 24-hour override read as one that lapsed hours ago (2026-09-02).

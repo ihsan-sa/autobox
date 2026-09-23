@@ -153,7 +153,7 @@ or a proxy. The tool retrieves; it never calls a model. The steps:
 - Hand off when replaying the context per turn costs more than a handoff over the turns still to come. There is one line and it is an absolute number of tokens, not a percentage: `CC_CONTEXT_HANDOFF_TOKENS` (`~/.cc/config`, default 150k), the same line on a 200k window and on a 1M one. `cc-context` measures and says so, and past the line the Stop hook asks you once an hour for a dated journal entry — that is the only thing that acts on the answer, so the handoff itself is yours: the session runs `cc-handoff --overlap` as a spend choice of its own. Past the rotate line above it (`CC_CONTEXT_ROTATE_TOKENS`, default 200k) the box rotates you: `cc-handoff --sweep` on the reconcile tick opens the overlap, the successor reads your journal and asks you once, and you retire — so journal at the nag, or be asked cold. A worker needs none of that: its iteration ends, and the loop's next one starts cold on the journal — that IS its handoff, with nothing marking the journal and nothing to decide. Keep history append-only.
 
 ## model policy
-Planning sessions and orchs run the strongest available model (cc-model's primary, Fable); a headless
+Planning sessions and orchs run the strongest available model (cc-model's primary, Opus 5.5); a headless
 worker runs on CC_WORKER_MODEL (claude-opus-5) unless the dispatcher passes `--model` for that one
 task — a limit override outranks both. A planning session never runs below Opus: with Opus out
 cc-model parks it rather than move it to Sonnet, and hands it back on Opus when that answers. The order lives in cc-loop's `worker_model`; the names live in

@@ -475,18 +475,27 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
                # The fixtures are REAL `-p` result shapes, carrying the two traps that fooled the old classifier: a
                # `subagent_stats.refused` block, and a successful worker whose own prose says "refused". The full
                # sanitized real result lives in cc-model's selfcheck — this file only has to test the loop's reaction.
-  local d n=0 bad=0 out rc head nxt last wm dtext wsp gone wtext wgone ptext pgone
-  head=$("$BIN/cc-model" chain | sed -n 1p); nxt=$("$BIN/cc-model" chain | sed -n 2p); last=$("$BIN/cc-model" chain | tail -1)
-  [ -n "$head" ] && [ -n "$nxt" ] || { echo "cc-loop selfcheck: cc-model chain is shorter than two models" >&2; return 1; }
+  local d n=0 bad=0 out rc head nxt last wm dtext wsp gone wtext wgone ptext pgone chain
   d=$(mktemp -d) || return 1
+  # THE SHIPPED CHAIN, NOT THIS BOX'S. cc-model filters its chain through ~/.cc/state/model-unavailable, so read from
+  # the real HOME this suite went red whenever the box had a family recorded out — and with two shipped rungs since
+  # 2026-09-23 one outage is enough (raised-suite-reads-live-model-record). So every real cc-model call here runs
+  # under a HOME of its own with none of the model env, the pattern cc-model's own selfcheck uses; refusal_next's
+  # `cc-model next` and `classify` (which writes a refusal record) run under it too, so the box's state is never read
+  # or written by a test.
+  mkdir -p "$d/home"
+  hermetic(){ ( unset CC_MODEL_PRIMARY CC_MODEL_FALLBACK CC_MODEL_CHAIN CC_MODEL_PROBE CC_MODEL_FLOOR CC_MODEL_CRED CC_MEMBER_SANDBOX; HOME="$d/home" "$@" ); }
+  chain=$(hermetic "$BIN/cc-model" chain)
+  head=$(sed -n 1p <<<"$chain"); nxt=$(sed -n 2p <<<"$chain"); last=$(tail -1 <<<"$chain")
+  [ -n "$head" ] && [ -n "$nxt" ] || { echo "cc-loop selfcheck: the shipped cc-model chain is shorter than two models" >&2; return 1; }
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   R='{"type":"result","subtype":"success","is_error":false,"result":"Done — the `.env.local` write was refused, as designed.","stop_reason":"end_turn","terminal_reason":"completed","permission_denials":[],"errors":null,"uuid":"14144299-9e48-4299-8f0c-0000000429ab","subagent_stats":{"spawned":0,"completed":0,"failed":0,"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0}},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":2737},"MAIN":{"inputTokens":112}}}'
   printf '%s' "${R/MAIN/$head}" > "$d/ok.json"
   jq -c '.is_error=true | .subtype="error_during_execution" | .stop_reason="refusal" | .result=""' "$d/ok.json" > "$d/refused.json"
-  out=$(refusal_next "$d/refused.json" "" "$head"); rc=$?
+  out=$(hermetic refusal_next "$d/refused.json" "" "$head"); rc=$?
   t 'a refused run moves to the next model on the chain' "$out:$rc" "$(printf '%s\tthe classifier stopped the turn:0' "$nxt")"
-  refusal_next "$d/ok.json" "" "$head" >/dev/null;   t 'a good run whose prose says "refused" is not a refusal' "$?" 1
-  refusal_next "$d/refused.json" "" "$last" >/dev/null; t 'the end of the chain has nowhere to move to' "$?" 2
+  hermetic refusal_next "$d/ok.json" "" "$head" >/dev/null;   t 'a good run whose prose says "refused" is not a refusal' "$?" 1
+  hermetic refusal_next "$d/refused.json" "" "$last" >/dev/null; t 'the end of the chain has nowhere to move to' "$?" 2
   # F4: what the loop DOES with it. A reroute that produced work is an iteration; only one that produced nothing reruns.
   t 'refused, nothing produced: rerun it'              "$(refusal_step 0 no)"  rerun
   t 'refused but it produced work: the iteration counts' "$(refusal_step 0 yes)" count
@@ -512,7 +521,7 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
   t 'a box override outranks it'           "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/ov" worker_model '')" claude-sonnet-5
   t "--model is the dispatcher's call: passed through untouched when it is not the model the box was moved off" "$(CC_CONFIG="$d/config" BIN="$d/ov" worker_model 'claude-opus-5')" 'claude-opus-5'
   t "…and the one the box WAS moved off runs where the box is this iteration (resolve), not pinned there" "$(CC_CONFIG="$d/config" BIN="$d/ov" worker_model 'fable[1m]')" 'claude-sonnet-5'
-  [ -n "${CC_MODEL_CHAIN:-}" ] || t 'and the fallback chain carries on from it (opus -> sonnet)' "$("$BIN/cc-model" next "$wm")" "$last"
+  t 'and the fallback chain carries on from it (opus -> sonnet)' "$(hermetic "$BIN/cc-model" next "$wm")" "$last"
   # (c) AN OUTAGE MOVES THE LOOP DOWN, AND ITS LIFT MOVES IT BACK: a stub cc-model whose `out`/`resolve` read one flag
   # file, the way the real one reads its unavailable record and its override. Own fixture per state.
   mkdir -p "$d/out"
