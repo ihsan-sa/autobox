@@ -283,8 +283,8 @@ def run_selfcheck():
                                {"id": CARD_ID.format(repo=name, n="7"), "chat": "CREPO", "ts": "1.1",
                                 "intent": "card", "accepted": True})
                     outl = dm.on_event(ev(item=it("1.1", "CREPO")))
-                    check("reaction: the owner's 👍 on a PR card standing OUTSIDE #approvals — a repo in "
-                          "CC_SELF_LAND_REPOS keeps its cards in #<repo>-updates — re-queues the landing, because "
+                    check("reaction: the owner's 👍 on a PR card standing OUTSIDE #approvals — a repo that lands "
+                          "itself keeps its cards in #<repo>-updates — re-queues the landing, because "
                           "a stopped landing asks him for that 👍 and it used to reach only the session, which "
                           "merges nothing",
                           calls == [(name, "7", "CREPO", "1.1", "The Owner")] and "queued" in (outl or "")
@@ -614,6 +614,9 @@ def run_selfcheck():
         # mean two 👍, two overlapping merges and a false "merge failed" (the owner deleted three by hand, 2026-08-30).
         with tempfile.TemporaryDirectory(dir=DEV, prefix=notify_marker) as d2:   # carries notify_marker: see 12570
             rname = os.path.basename(d2); os.makedirs(f"{d2}/.git")
+            # Every repo lands itself by default; these cases are about #approvals, so rname is named as the exception
+            # (the lane cases below set their own). `cc lands` answers through subprocess.call, which run2's gh fake leaves alone.
+            globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER", "CC_SELF_LAND_EXCEPT": rname}
             real_sent_pa = SENT_DIR; globals()["SENT_DIR"] = f"{d2}/sent"   # the card ledger is the fixture's own, never the box's
             cards = [{"ts": "9.1", "user": "UBOT", "text": f"[{rname}] PR #7: t — https://x/7  ·  :+1: from the owner merges (squash)"},
                      {"ts": "9.2", "user": "UOWNER", "text": f"[{rname}] PR #8: a human typing the same shape"}]
@@ -739,10 +742,10 @@ def run_selfcheck():
                 # A SELF-LANDING REPO'S CARD LEAVES #approvals (the brief comms-requests-reach-who-decides: routine PR cards
                 # leave it; a landing record goes to the log lane). It is posted under the ledger id, --print-chat names
                 # the lane it really stands in, --landed finds it there by the ledger (never by reading #approvals), and
-                # the sweep sees it without reading the lane. A repo NOT in CC_SELF_LAND_REPOS keeps #approvals: its 👍
+                # the sweep sees it without reading the lane. A repo named in CC_SELF_LAND_EXCEPT keeps #approvals: its 👍
                 # is the merge, and nothing about that changed.
                 real_cfg_pa, real_rc_pa = globals()["load_cfg"], resolve_channel
-                globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER", "CC_SELF_LAND_REPOS": f"{rname} other"}
+                globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER", "CC_SELF_LAND_EXCEPT": "other"}
                 globals()["resolve_channel"] = lambda cfg, name: "CUPD" if name == f"{rname}-updates" else None
                 lane_hist, posted_to = {"CAPPR": [], "CUPD": []}, []
                 def api5(method, token, **kw):
@@ -767,7 +770,7 @@ def run_selfcheck():
                     rcS1 = cmd_post_approval([rname, "7", "--print-chat"])
                 with contextlib.redirect_stdout(io.StringIO()) as oS2:
                     rcS2 = cmd_post_approval([rname, "7", "--print-chat"])
-                check("post-approval: a repo in CC_SELF_LAND_REPOS gets its card in #<repo>-updates, not #approvals — a landing "
+                check("post-approval: a repo not named in CC_SELF_LAND_EXCEPT gets its card in #<repo>-updates, not #approvals — a landing "
                       "record whose tail says the box lands it, no 👍 asked for; --print-chat names THAT lane; the second "
                       "caller finds it through the ledger and posts nothing",
                       rcS1 == 0 and rcS2 == 0 and posted_to == [("CUPD", f"[{rname}] PR #7: t — https://x/7  ·  lands itself (squash)")]
@@ -793,12 +796,12 @@ def run_selfcheck():
                       rcS4a == 0 and posted_to == [("CUPD", f"[{rname}] PR #7: t — https://x/7  ·  lands itself (squash)")]
                       and rcS4 == 0 and len(edits) == 1 and edits[0][0] == "CUPD" and edits[0][2].endswith("  ·  landed ✓ 11:00")
                       and (sent_record(f"pr-card:{rname}:7") or {}).get("landed") is True)
-                globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+                globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER", "CC_SELF_LAND_EXCEPT": rname}
                 gh["7"] = {"title": "t", "url": "https://x/7", "state": "OPEN"}; posted_to.clear(); lane_hist["CUPD"].clear()
                 os.remove(sent_path(f"pr-card:{rname}:7"))
                 with contextlib.redirect_stdout(io.StringIO()) as oS5:
                     rcS5 = cmd_post_approval([rname, "7", "--print-chat"])
-                check("post-approval: a repo NOT in CC_SELF_LAND_REPOS keeps its card in #approvals with the ':+1: merges' tail — "
+                check("post-approval: a repo named in CC_SELF_LAND_EXCEPT keeps its card in #approvals with the ':+1: merges' tail — "
                       "the owner's 👍 there is still the merge, and the protected-path hold, the first-answer and the "
                       "permanent grant are untouched",
                       rcS5 == 0 and posted_to == [("CAPPR", f"[{rname}] PR #7: t — https://x/7  ·  :+1: from the owner merges (squash)")]
@@ -808,7 +811,7 @@ def run_selfcheck():
                 with tempfile.TemporaryDirectory(dir=DEV, prefix=notify_marker) as d3:
                     other = os.path.basename(d3); os.makedirs(f"{d3}/.git")
                     globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER",
-                                                     "CC_SELF_LAND_REPOS": rname}
+                                                     "CC_SELF_LAND_EXCEPT": other}
                     globals()["resolve_channel"] = lambda cfg, name: {f"{rname}-updates": "CUPD",
                                                                       f"{other}-updates": "CUPD2"}.get(name)
                     lane_hist.update({"CAPPR": [], "CUPD": [], "CUPD2": []}); posted_to.clear()
@@ -3929,7 +3932,7 @@ def run_selfcheck():
           "however quiet its window is (owner, 2026-09-01)",
           hparked == (("idle", "idle 43h · $0.50"), ("running", "1 it · $0.50"), ("running", "$0.50")))
     check("home_tracks: an OPEN PR that is already on cc-land's queue is not owed a 👍 — the job file is the fact, so a "
-          "project that queues its own landing (`cc done`, CC_SELF_LAND_REPOS) does not also ask the owner for the "
+          "project that queues its own landing (`cc done`, `cc lands`) does not also ask the owner for the "
           "reaction that grant retired; and a landing that ENDS takes its job file with it, so the row comes back",
           (hopen, hlanding, hstopped) == (True, False, True))
     check("home_tracks: a member project's `push!` is the HOST's marker alone, under ~/.cc/push-state — the push.err "

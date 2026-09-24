@@ -259,6 +259,7 @@ prefetch(){
 # processes all carry it. Two selftests (two worktrees, one box) must never read, write or kill each other's things
 # — a global `pkill` here once failed 4 tests in a run that was, on its own, green.
 RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"; : > "$T/born"   # born: what "modified during this run" means below
+export CC_SELF_LAND_EXCEPT=$REPO         # every project lands itself by default, and the box's own config never decides a fixture: a case that means the grant sets this itself
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
 export CC_LIMIT_STAMP="$T/claude-limit"   # not the box's live stamp: a test limit must never make a real loop wait
 export CC_FAILURES="$T/failures"          # not ~/.cc/failures: the loop stops and red gates below are fixtures, and the
@@ -1807,7 +1808,8 @@ pass=0; fail=0
 export HOME="$T/done-home" D="$T/done-fixture" REALBIN="$B"
 mkdir -p "$HOME/dev/r" "$D/bin"
 export PATH="$D/bin:/usr/bin:/bin" GIT_CONFIG_GLOBAL="$D/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
-unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST CC_GIT_NAME CC_GIT_EMAIL CC_SELF_LAND_REPOS
+unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST CC_GIT_NAME CC_GIT_EMAIL
+export CC_SELF_LAND_EXCEPT=r   # r is the exception here: nothing in this fixture self-lands
 export GH_REPO=wrong/repository CC_SLACK="$D/bin/cc-slack"
 export CC_CLAUDE=/bin/true
 printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"
@@ -2013,8 +2015,8 @@ printf '%s %s\n' "$pass" "$fail" > "$D/counts"
 )
 read -r m2pass m2fail < "$T/done-fixture/counts"; pass=$((pass+m2pass)); fail=$((fail+m2fail))
 # M2 completion fixtures end.
-# P8: THE STANDING GRANT, and where it may NOT be spent. A project named in CC_SELF_LAND_REPOS (~/.cc/config) does not
-# wait for a 👍 — but `cc done` never queues the landing itself, however granted the repo is: a worker and a
+# P8: THE STANDING GRANT, and where it may NOT be spent. A project CC_SELF_LAND_EXCEPT (~/.cc/config) does not name
+# does not wait for a 👍 — but `cc done` never queues the landing itself, however granted the repo is: a worker and a
 # member-facing session are both told to run that command, and a queue behind it would be the merge cc-guard denies
 # them wearing another name. The queue is cc-loop's (P9 below), and all `cc done` does is say who lands this one and
 # hand over the card. `SLACK_BOT_TOKEN=` pins the real door: this is the first cc done case whose gh stub returns a
@@ -2029,41 +2031,41 @@ echo "the grant" > ~/.cc/worktrees/$REPO/w18/g.txt
 done8(){ env SLACK_BOT_TOKEN= CC_LAND="$T/landstub" PATH="$T/ghbin8:$PATH" "$@" "$B/cc" done $REPO w18 2>&1; }
 o8a=$(done8)
 { [ ! -s "$T/land.calls" ] && grep -q 'land it with:  cc-land' <<<"$o8a"; } \
-  && ok "cc done: a repo the grant does not name waits for a 👍, and it says how to land it (P8a)" \
+  && ok "cc done: a repo named as an exception waits for a 👍, and it says how to land it (P8a)" \
   || bad "cc done on an ungranted repo: $(cat "$T/land.calls") $o8a"
-o8b=$(done8 CC_SELF_LAND_REPOS="other $REPO")
+o8b=$(done8 CC_SELF_LAND_EXCEPT="other")
 { [ ! -s "$T/land.calls" ] && grep -q "lands its own PRs" <<<"$o8b" && grep -q "the loop queues PR #77" <<<"$o8b"; } \
-  && ok "cc done: even for a repo the grant DOES name, cc done queues nothing — it names the loop as what lands it, so the one command a worker is told to run is not a way round the merge gate (P8b)" \
+  && ok "cc done: even for a repo that holds the grant, cc done queues nothing — it names the loop as what lands it, so the one command a worker is told to run is not a way round the merge gate (P8b)" \
   || bad "cc done queued a landing itself: $(cat "$T/land.calls") $o8b"
 mkdir -p ~/dev/$REPO/.cc; touch ~/dev/$REPO/.cc/member-facing
-o8c=$(done8 CC_SELF_LAND_REPOS="$REPO"); rm -f ~/dev/$REPO/.cc/member-facing
-{ [ ! -s "$T/land.calls" ] && grep -q 'member-facing' <<<"$o8c" && grep -q 'waits for a 👍' <<<"$o8c"; } \
-  && ok "cc done: a MEMBER-FACING repo in the list is refused out loud — a grant that silently does nothing is worse than one that is refused (P8c)" \
-  || bad "cc done on a member-facing repo in the list: $(cat "$T/land.calls") $o8c"
+o8c=$(done8 CC_SELF_LAND_EXCEPT=); rm -f ~/dev/$REPO/.cc/member-facing
+{ [ ! -s "$T/land.calls" ] && grep -q 'land it with:  cc-land' <<<"$o8c" && ! grep -q 'lands its own PRs' <<<"$o8c"; } \
+  && ok "cc done: a MEMBER-FACING repo nobody listed holds no grant — it waits for a 👍 and says how to land it, like any exception (P8c; P8b is its control)" \
+  || bad "cc done on a member-facing repo: $(cat "$T/land.calls") $o8c"
 # P8d: the rest of the table, `self_lands` lifted out of `cc` and run over a ~/dev of its own — NOT through `cc done`:
 # marking this suite's fixture a member WORKSPACE would send cc-checkpoint down pick_remote's workspace path, where a
 # project with no repository has one CREATED for it against this box's real GitHub App. A fixture must never reach
-# that. 1 = no grant · 0 = granted · 2 = named, but member-facing or a workspace.
+# that. 1 = named as an exception, or member-facing · 0 = granted · 2 = a workspace with no token.
 mkdir -p "$T/dev8/ws/.cc" "$T/dev8/mf/.cc" "$T/dev8/proj"
 touch "$T/dev8/ws/.cc/member-workspace" "$T/dev8/mf/.cc/member-facing"
-sl8(){ ( export DEV="$T/dev8" BIN="$B" CC_SELF_LAND_REPOS="$1"
+sl8(){ ( export DEV="$T/dev8" BIN="$B" HOME="$T/dev8" CC_SELF_LAND_EXCEPT="$1"
          eval "$(sed -n '/^member_facing()/p;/^member_workspace()/p;/^self_lands(){/,/^}/p' "$B/cc")"
          self_lands "$2" ); echo $?; }
-{ [ "$(sl8 'a b' proj)" = 1 ] && [ "$(sl8 '' proj)" = 1 ] && [ "$(sl8 'a proj b' proj)" = 0 ] \
-  && [ "$(sl8 ws ws)" = 2 ] && [ "$(sl8 mf mf)" = 2 ] && [ "$(sl8 a ws)" = 1 ]; } \
-  && ok "cc self_lands: only a repo the list NAMES holds the grant (an empty list grants nothing), and a member workspace or member-facing repo that is named gets a word of its own — the host half that would land for it does not exist yet (P8d)" \
-  || bad "self_lands table: unlisted=$(sl8 'a b' proj) empty=$(sl8 '' proj) listed=$(sl8 'a proj b' proj) ws=$(sl8 ws ws) mf=$(sl8 mf mf) ws-unlisted=$(sl8 a ws)"
-r8u=$(CC_SELF_LAND_REPOS= "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
-r8g=$(CC_SELF_LAND_REPOS="$REPO" "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
+{ [ "$(sl8 'a b' proj)" = 0 ] && [ "$(sl8 '' proj)" = 0 ] && [ "$(sl8 'a proj b' proj)" = 1 ] \
+  && [ "$(sl8 '' ws)" = 2 ] && [ "$(sl8 '' mf)" = 1 ] && [ "$(sl8 ws ws)" = 1 ] && [ "$(sl8 mf mf)" = 1 ]; } \
+  && ok "cc self_lands: every repo holds the grant unless CC_SELF_LAND_EXCEPT names it (an empty list excepts nothing), a named one and a member-facing one ask, and an unnamed member workspace with no token gets a word of its own — nothing can land for it (P8d)" \
+  || bad "self_lands table: unlisted=$(sl8 'a b' proj) empty=$(sl8 '' proj) listed=$(sl8 'a proj b' proj) ws=$(sl8 '' ws) mf=$(sl8 '' mf) ws-listed=$(sl8 ws ws) mf-listed=$(sl8 mf mf)"
+r8u=$(CC_SELF_LAND_EXCEPT="$REPO" "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
+r8g=$(CC_SELF_LAND_EXCEPT= "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
 { [ "$r8u" = 1 ] && [ "$r8g" = 0 ]; } \
   && ok "cc lands <repo> is the grant test and only the test: it answers with its exit code, queues nothing and writes nothing, which is why cc-loop may ask it (P8e)" \
   || bad "cc lands: ungranted=$r8u granted=$r8g"
-# P8f: a PR touching a PROTECTED PATH holds even where CC_SELF_LAND_REPOS grants the repo — cc-land queue refuses
+# P8f: a PR touching a PROTECTED PATH holds even where the repo holds the grant — cc-land queue refuses
 # to queue it, and only the owner's own 👍 does (PR #551, 2026-09-19: the card said "the loop queues PR #551 …
 # nothing waits on a 👍" and nothing did, because it touched learn-fetch/). `cc done` now asks cc-land's OWN
 # protected_hit before saying that, rather than reading CC_PROTECTED_PATHS a second time.
 printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/77";; *"pr view 77 --json files"*) echo {\\"files\\":[{\\"path\\":\\"learn-fetch/foo.py\\"}]};; esac\nexit 0\n' > "$T/ghbin8/gh"
-o8f=$(done8 CC_SELF_LAND_REPOS="$REPO" CC_PROTECTED_PATHS_"$REPO"=learn-fetch/)
+o8f=$(done8 CC_SELF_LAND_EXCEPT= CC_PROTECTED_PATHS_"$REPO"=learn-fetch/)
 { [ ! -s "$T/land.calls" ] && grep -q "learn-fetch/foo.py" <<<"$o8f" && grep -q "PROTECTED path" <<<"$o8f" \
   && grep -q "owner's own 👍 on the 🔐 card in #approvals" <<<"$o8f" && ! grep -q "this card" <<<"$o8f" \
   && ! grep -q "nothing waits on a 👍" <<<"$o8f"; } \
@@ -2266,8 +2268,8 @@ rm -f "$T/remote.git/hooks/pre-receive"
   && ! tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 done" && tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 finished, but opened no PR"; } \
   && ok "STATUS: DONE over a dead push is not done: cc done's failure reaches the loop — exit 4, board blocked with the reason, no DONE notice (audit F3)" \
   || bad "a dead push finished green: rc=$rc status=$("$B/cc-board" get $REPO w15 status) notes=$("$B/cc-board" get $REPO w15 notes | tail -c 200)"
-# P9: THE GRANT IS SPENT BY THE LOOP, and by nothing a session can type. A track on a repo named in
-# CC_SELF_LAND_REPOS that finishes DONE has its landing queued right here, once `cc done` has returned a PR — and
+# P9: THE GRANT IS SPENT BY THE LOOP, and by nothing a session can type. A track on a repo
+# CC_SELF_LAND_EXCEPT does not name that finishes DONE has its landing queued right here, once `cc done` has returned a PR — and
 # with the coordinates of the card `cc done` just posted, so a landing that STOPS marks and answers that card instead
 # of leaving one that still reads as pending in #approvals. Both real doors are stubbed: CC_LAND, because a real
 # `queue` writes into this box's own landing queue and starts a worker that gates, MERGES and deploys; CC_SLACK,
@@ -2281,7 +2283,7 @@ printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.co
 printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "[x] PR #77 queued"\n' "$T" > "$T/landstub"
 printf '#!/bin/sh\ncase "$1" in post-approval) echo "CAPPR 1788000000.000100";; esac\nexit 0\n' > "$T/slackstub"; chmod +x "$T/ghbin8/gh" "$T/landstub" "$T/slackstub"
 : > "$T/land.calls"
-CC_SELF_LAND_REPOS=$REPO CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
+CC_SELF_LAND_EXCEPT= CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
   "$B/cc-loop" $REPO w19 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
 { [ "$rc" = 0 ] && grep -qx "queue $REPO 77 --who cc done --chat CAPPR --ts 1788000000.000100" "$T/land.calls"; } \
   && ok "cc-loop spends the grant: a DONE track on a granted repo has its PR queued by the LOOP — on the host, in a process no session can spell — carrying the #approvals card cc done just posted, so a stopped landing answers that card (P9)" \
@@ -2290,7 +2292,7 @@ CC_SELF_LAND_REPOS=$REPO CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE
 CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
   "$B/cc-loop" $REPO w19 --max-iter 1 --quiet >/dev/null 2>&1
 [ ! -s "$T/land.calls" ] \
-  && ok "…and a repo with no grant is left exactly as it was: the loop queues nothing and the PR waits for a 👍 (P9b)" \
+  && ok "…and a repo named as an exception (the suite's own CC_SELF_LAND_EXCEPT) is left exactly as it was: the loop queues nothing and the PR waits for a 👍 (P9b)" \
   || bad "the loop queued a landing for an ungranted repo: $(cat "$T/land.calls")"
 # P9c-P9j: managed host delivery. Own HOME, board, state and Git remote; systemd-run only records a start.
 (
@@ -2298,7 +2300,7 @@ pass=0; fail=0
 export HOME="$T/delivery-home" D="$T/delivery-fixture" REALBIN="$B"
 mkdir -p "$HOME/dev/r" "$D/bin"
 export PATH="$D/bin:/usr/bin:/bin" GIT_CONFIG_GLOBAL="$D/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
-export CC_CONFIG="$D/config" CC_SELF_LAND_REPOS=r CC_SLACK="$D/bin/cc-slack" CC_CLAUDE="$D/bin/claude"
+export CC_CONFIG="$D/config" CC_SELF_LAND_EXCEPT= CC_SLACK="$D/bin/cc-slack" CC_CLAUDE="$D/bin/claude"
 unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST GH_REPO TMUX TMUX_PANE CC_MEMBER_SANDBOX CC_WORKER_SANDBOX
 printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"; : > "$D/config"
 cp "$B/cc" "$B/cc-task" "$B/cc-loop" "$B/cc-land" "$B/cc-checkpoint" "$B/cc-config" "$D/bin/"
@@ -2369,13 +2371,13 @@ first_job=$(cat "$q" 2>/dev/null)
   && ok "P9c: planner and loop reach one queue job and one PR with the receipt's approval card" \
   || bad "P9c: first=$first_rc loop=$loop_rc $(cat "$D/err" "$D/loop.out")"
 rm -f "$q"; : > "$D/starts"
-CC_SELF_LAND_REPOS= "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
+CC_SELF_LAND_EXCEPT=r "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
 { [ "$rc" = 0 ] && [ ! -e "$q" ] && [ ! -s "$D/starts" ] && jq -e '.landing.status == "approval" and .card.chat == "fixture"' "$D/receipt" >/dev/null; } \
-  && ok "P9d: no grant keeps the PR and card but queues nothing; P9c is its control" || bad "P9d: $(cat "$D/receipt" "$D/err")"
+  && ok "P9d: a repo named as an exception keeps the PR and card but queues nothing; P9c is its control" || bad "P9d: $(cat "$D/receipt" "$D/err")"
 mkdir -p "$HOME/dev/r/.cc"; touch "$HOME/dev/r/.cc/member-facing"
 "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
-{ [ "$rc" = 2 ] && [ ! -e "$q" ] && [ ! -s "$D/starts" ] && grep -q 'member-facing' "$D/err"; } \
-  && ok "P9e: a granted member-facing task is a request that must be refused by path rules; P9c is its control" || bad "P9e: rc=$rc $(cat "$D/err")"
+{ [ "$rc" = 0 ] && [ ! -e "$q" ] && [ ! -s "$D/starts" ] && jq -e '.landing.status == "approval" and .card.chat == "fixture"' "$D/receipt" >/dev/null; } \
+  && ok "P9e: an unlisted member-facing task holds no grant — it keeps the PR and card and waits for a 👍, as P9d's exception does; P9c is its control" || bad "P9e: rc=$rc $(cat "$D/receipt" "$D/err")"
 rm "$HOME/dev/r/.cc/member-facing"
 for projection in board card; do
   # The same PR, with its announcement pending. A board/card outage is never the missing-PR page.

@@ -37,8 +37,8 @@
 #   cc quick [doing|done] "…"  log a small task done without a track (Slack Home shows the last 24 h)
 #   cc done <repo> <track>    push + open a PR into the base branch, and post its PR card (printing the
 #                             card's `card: <channel> <ts>`); on a kind=session row it pushes and stops there —
-#                             a living project has no PR and is never done. Nothing here merges: for a repo named
-#                             in CC_SELF_LAND_REPOS (~/.cc/config) it is cc-loop that queues the landing
+#                             a living project has no PR and is never done. Nothing here merges: for a repo that
+#                             lands itself (any not in CC_SELF_LAND_EXCEPT) it is cc-loop that queues the landing
 #                             Run inside ~/.cc/worktrees/<repo>/<track> the two names may be left off; a worktree made
 #                             by hand (no .cc/track) has the marker written first, and it says so
 #   cc done <repo> <track> --json   task receipt on stdout, human lines on stderr. Safe to run again: it retries
@@ -46,8 +46,8 @@
 #                             did not land — an approval card Slack could not take is pending, not a failure
 #                             Nothing it runs against a remote can wait for a person: each is bounded by
 #                             CC_PUSH_TIMEOUT (120 s), the same knob cc-checkpoint's pushes obey
-#   cc lands <repo>           does that repo hold the standing grant? 0 yes · 1 no · 2 named, but a member-facing repo
-#                             or a member workspace with no GitHub token — nothing can land for it
+#   cc lands <repo>           does that repo hold the standing grant? 0 yes · 1 no, it waits for a 👍 (named in
+#                             CC_SELF_LAND_EXCEPT, or member-facing) · 2 a member workspace with no GitHub token
 #   cc rm <repo> <track>      remove a track (worktree + local branch + board entry + state)
 #   cc rename <old> <new>     rename a project everywhere the box keys by its name: ~/dev, worktrees, state, board,
 #                             ask ledger, its Slack channels (renamed in place, so their history stays), routes, tmux
@@ -226,11 +226,14 @@ sp_for(){ local repo="$1" alias="$2" track="$3" base="$4"
 MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the box and ask with cc-notify (which stays allowed — inside a member workspace's boundary it goes out over that workspace's own Slack link to the box's planning seat, which answers or asks the owner itself, and it tells you if it did not go). A NEW PROJECT IS NOT ONE OF THOSE. In a member workspace you ask for one yourself: \`cc slack project <name>\` gets you its board row and one thread for it in #<workspace> (no channel of its own; the folder comes with the first session), at most 3 an hour. The name is always under your own workspace — the workspace half is not yours to choose, and an ask that tries to carry one is refused with the reason. There is also a human way in, \`new project <name>\` typed in the workspace channel, but it ONLY counts from the member or the owner: a session saying it is ignored, so ask a person for that line rather than posting it yourself. Either way, do not run cc slack mkchannel and do not send the owner a request the box answers by itself."
 MEMBER_SPEND="$STBASE/member-spend.json"   # {"<handle>": {"day": "YYYY-MM-DD", "usd": n, "cap": n?}} — the ledger behind the per-workspace daily cap; `cap` is a raise made today (member_gate)
 member_workspace(){ [ -f "$DEV/$1/.cc/member-workspace" ]; }   # ~/dev/<handle> is one member's whole world: docs/design-member-workspaces.md (overlay)
-# WHICH PROJECTS LAND THEIR OWN PRs. A standing grant used to be a sentence in a doc that one project's session had
-# read: its PRs were gated, reviewed and merged the moment they were green, and every other project's finished PR
-# waited for a 👍 that only says "yes" to what the gates and the reviewer have already decided. `CC_SELF_LAND_REPOS`
-# in ~/.cc/config names the projects that hold the grant — whitespace separated, the same shape CC_JANITOR_REPOS
-# uses, and it lives THERE rather than here because core/ is published and may not name this box's projects.
+# WHICH PROJECTS LAND THEIR OWN PRs: EVERY PROJECT, BY DEFAULT (owner, 2026-09-22: "all projects should be on
+# autoland by default"). Until then `CC_SELF_LAND_REPOS` named the projects that held the grant, and a new project's
+# green PR sat on a 👍 that only says "yes" to what the gates and the reviewer have already decided, because nobody
+# had added it to the list. Now the list names the EXCEPTIONS: `CC_SELF_LAND_EXCEPT` in ~/.cc/config — whitespace
+# separated, the same shape CC_JANITOR_REPOS uses, and it lives THERE rather than here because core/ is published
+# and may not name this box's projects. A project named there waits for a 👍; CC_SELF_LAND_REPOS is no longer read.
+# This function is the ONE reader of that rule: cc-loop and cc-checkpoint ask `cc lands`, and so does cc-slack's
+# card lane, so the rule is not copied anywhere.
 # It grants nothing else: cc-land still gates the PR's own head, still buys the review, and still stops on a red
 # gate or a finding, so a 👍 is what stops being needed, not the reading.
 #
@@ -245,21 +248,21 @@ member_workspace(){ [ -f "$DEV/$1/.cc/member-workspace" ]; }   # ~/dev/<handle> 
 # repo"), once it is GRANTED a GitHub token (cc-sandbox github <h>): the host then lands its projects' PRs on its
 # behalf, the way cc-checkpoint --sweep pushes for it — out of a host-only clone on that token, the gates inside its
 # sandbox, no deploy half, the review charged to its daily cap, a stop said in #<h> (cc-land, MEMBERS). The sweep
-# is what queues (a session inside the boundary cannot spell the queue), and it asks this first. A workspace named
-# here but granted no token is exit 2, said out loud rather than dropped — a grant that silently does nothing is
-# worse than one that is refused — and so is a member-FACING repo, which has no boundary to gate inside of.
+# is what queues (a session inside the boundary cannot spell the queue), and it asks this first. A workspace granted
+# no token is exit 2, said out loud rather than dropped — a grant that silently does nothing is
+# worse than one that is refused. A member-FACING repo has no boundary to gate inside of, so it holds no grant and is
+# exit 1: its card still goes to #approvals and the owner's 👍 there lands it, as for any exception.
 self_lands(){
   local r
-  for r in $("$BIN/cc-config" get CC_SELF_LAND_REPOS 2>/dev/null); do
-    [ "$r" = "$1" ] || continue
-    if member_workspace "$1"; then [ -f "$HOME/.cc/members/$1/github-token" ] && return 0; return 2; fi
-    member_facing "$DEV/$1" && return 2
-    return 0
+  for r in $("$BIN/cc-config" get CC_SELF_LAND_EXCEPT 2>/dev/null); do
+    [ "$r" = "$1" ] && return 1                  # "a listed exception asks" (the brief): named here, it waits for a 👍
   done
-  return 1
+  if member_workspace "$1"; then [ -f "$HOME/.cc/members/$1/github-token" ] && return 0; return 2; fi
+  member_facing "$DEV/$1" && return 1          # no boundary to gate inside of: the ordinary 👍 path
+  return 0                                       # "an unlisted repo self-lands" (the brief)
 }
 # A SELF-LAND GRANT DOES NOT REACH A PROTECTED PATH (cc-land queue's own refusal, CC_PROTECTED_PATHS_<repo> in
-# ~/.cc/config): a PR touching one is never queued by the loop or a sweep, whatever CC_SELF_LAND_REPOS says — only
+# ~/.cc/config): a PR touching one is never queued by the loop or a sweep, whatever the self-land rule says — only
 # the owner's own 👍 does. `cc done` must not tell a self-landing repo "nothing waits on a 👍" for one of these, so
 # it asks the SAME check cc-land queue refuses on, by loading cc-land as a python module rather than reading
 # CC_PROTECTED_PATHS_<repo> a second time here (PR #551, 2026-09-19: the card said the loop queues it, and nothing
@@ -1010,20 +1013,27 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   rc=0; ask "\"attachment\": [\"$T/dev/proj/report.txt\"]" >/dev/null; [ "$?" = 2 ] && has "$(cat "$T/err")" "unknown key attachment" || rc=1
   t "…and a mistyped key is refused by name (exit 2) rather than dropped" "$rc"
   kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
-  # `cc lands` — self_lands' four answers, one fixture repo, DEV/HOME pointed at $T so the box's own config is never read.
-  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS="" self_lands r1; [ "$?" = 1 ] || rc=1
-  t "cc lands: a repo not named in CC_SELF_LAND_REPOS is 1" "$rc"
-  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS=r1 self_lands r1; [ "$?" = 0 ] || rc=1
-  t "…a named, ordinary repo is 0" "$rc"
+  # `cc lands` — self_lands' answers, one fixture repo, DEV/HOME pointed at $T so the box's own config is never read.
+  # Each case builds its own markers and clears them; CC_SELF_LAND_EXCEPT is set per call, so the file is never read.
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_EXCEPT="" self_lands r1; [ "$?" = 0 ] || rc=1
+  t "cc lands: an ordinary repo nobody listed lands itself — 0 (the default)" "$rc"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_EXCEPT="other" self_lands r1; [ "$?" = 0 ] || rc=1
+  t "…and still 0 when the exception list names only another repo" "$rc"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_EXCEPT="other r1" self_lands r1; [ "$?" = 1 ] || rc=1
+  t "…a repo named in CC_SELF_LAND_EXCEPT is 1: it asks for a 👍" "$rc"
   mkdir -p "$T/dev/r1/.cc"; : > "$T/dev/r1/.cc/member-facing"
-  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS=r1 self_lands r1; [ "$?" = 2 ] || rc=1
-  t "…a named, member-facing repo is 2" "$rc"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_EXCEPT="" self_lands r1; [ "$?" = 1 ] || rc=1
+  t "…an unlisted member-facing repo is 1: it holds no grant, so it waits for a 👍" "$rc"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_EXCEPT=r1 self_lands r1; [ "$?" = 1 ] || rc=1
+  t "…and a listed member-facing repo is 1 too" "$rc"
   rm -f "$T/dev/r1/.cc/member-facing"; : > "$T/dev/r1/.cc/member-workspace"
-  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS=r1 self_lands r1; [ "$?" = 2 ] || rc=1
-  t "…a named member workspace with no GitHub token is 2" "$rc"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_EXCEPT="" self_lands r1; [ "$?" = 2 ] || rc=1
+  t "…an unlisted member workspace with no GitHub token is 2" "$rc"
   mkdir -p "$T/.cc/members/r1"; : > "$T/.cc/members/r1/github-token"
-  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS=r1 self_lands r1; [ "$?" = 0 ] || rc=1
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_EXCEPT="" self_lands r1; [ "$?" = 0 ] || rc=1
   t "…and once granted a token, that workspace is 0" "$rc"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_EXCEPT=r1 self_lands r1; [ "$?" = 1 ] || rc=1
+  t "…unless it is named as an exception: 1" "$rc"
   rm -f "$T/dev/r1/.cc/member-workspace" "$T/.cc/members/r1/github-token"
   # A WORKER'S OWN DESCRIPTION IS THE PR BODY (raised-worker-cannot-write-pr-body): pr-body.md in the track's state dir
   # leads, the brief is linked and not pasted, and the brief's Closes lines are kept; without one the body is the brief.
@@ -1137,8 +1147,9 @@ case "${1:-}" in
     if [ "$kind" = main ]; then ensure_main; tmux select-window -t "$(win_id "$a2")"; attach_main; else exec "$SELF" "$a2" "$a3"; fi; exit 0 ;;
   lands)
     # `cc lands <repo>` — the grant TEST, and only the test (self_lands, above): 0 it holds the standing grant · 1 it
-    # does not · 2 it is named but nothing can land for it (member-facing, or a workspace with no GitHub token).
-    # cc-loop asks it before queueing, and so does cc-checkpoint --sweep for a member workspace's finished track;
+    # is named in CC_SELF_LAND_EXCEPT or member-facing, and waits for a 👍 · 2 a workspace with no GitHub token.
+    # cc-loop asks it before queueing, cc-slack before choosing a PR card's lane, and cc-checkpoint --sweep for a
+    # member workspace's finished track;
     # this command queues nothing, merges nothing and writes nothing, so it is safe from any tier that can run `cc`.
     repo="${2:?repo}"; valid_name "$repo"; self_lands "$repo"; exit $? ;;
   done)
@@ -1383,14 +1394,13 @@ PY
       under=""   # a self-land grant (sl 0 or 3) does not reach a PROTECTED path — ask before promising "nothing waits on a 👍"
       case "$sl" in 0|3) under=$(protected_hit_line "$repo" "$prn") || under="" ;; esac
       if [ -n "$under" ]; then
-        echo "PR #$prn is not queued — $under. The box never lands one of these on its own, whatever CC_SELF_LAND_REPOS says: only the owner's own 👍 on the 🔐 card in #approvals queues it (the card cc-land raises when it refuses to queue this PR; a 👍 on the PR card itself authorizes nothing)."
+        echo "PR #$prn is not queued — $under. The box never lands one of these on its own, whatever the self-land rule says: only the owner's own 👍 on the 🔐 card in #approvals queues it (the card cc-land raises when it refuses to queue this PR; a 👍 on the PR card itself authorizes nothing)."
       else
       case "$sl" in
-        3)  echo "the host lands this for you: cc-checkpoint --sweep queues PR #$prn within five minutes when this workspace holds the grant (CC_SELF_LAND_REPOS and a GitHub token) — nothing here does, and nothing waits on a 👍" ;;
-        0)  if member_workspace "$repo"; then echo "$repo lands its own PRs (CC_SELF_LAND_REPOS): the host's sweep queues PR #$prn as $repo--$track (cc-checkpoint --sweep, within five minutes) — nothing waits on a 👍. Now? cc-land queue $repo--$track $prn"
-            else echo "$repo lands its own PRs (CC_SELF_LAND_REPOS): the loop queues PR #$prn — nothing here does, and nothing waits on a 👍. Started by hand? cc-land queue $repo $prn"; fi ;;
-        2)  if member_workspace "$repo"; then echo "cc: $repo is named in CC_SELF_LAND_REPOS but is granted no GitHub token (cc-sandbox github $repo) — nothing can land for it. PR #$prn waits for a 👍."
-            else echo "cc: $repo is named in CC_SELF_LAND_REPOS but is member-facing — nothing here can land for it (self_lands says why). PR #$prn waits for a 👍."; fi ;;
+        3)  echo "the host lands this for you: cc-checkpoint --sweep queues PR #$prn within five minutes when this workspace holds the grant (a GitHub token, and not named in CC_SELF_LAND_EXCEPT) — nothing here does, and nothing waits on a 👍" ;;
+        0)  if member_workspace "$repo"; then echo "$repo lands its own PRs: the host's sweep queues PR #$prn as $repo--$track (cc-checkpoint --sweep, within five minutes) — nothing waits on a 👍. Now? cc-land queue $repo--$track $prn"
+            else echo "$repo lands its own PRs: the loop queues PR #$prn — nothing here does, and nothing waits on a 👍. Started by hand? cc-land queue $repo $prn"; fi ;;
+        2)  echo "cc: $repo is granted no GitHub token (cc-sandbox github $repo) — nothing can land for it. PR #$prn waits for a 👍." ;;
         *)  echo "land it with:  cc-land $repo $prn   (gates, merge, card, board, ledger, install, units, restarts — or just 👍 the card to merge)" ;;
       esac
       fi

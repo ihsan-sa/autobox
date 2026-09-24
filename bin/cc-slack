@@ -7,7 +7,7 @@
   cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] [--route TITLE] [--id PRODUCER-ID] [--mention] [--major] "text" post as the bot (cc-notify uses --route). --id posts an event once, ever: a replay or retry returns the same ts, never a second post (~/.cc/slack/sent/). --ts is the message this answers. -c into another session's channel hands it to that session (Daemon.wake), --route never does; one that wakes nobody (queued, no-session, live-no-channel, no-track — not a paused or unminted target, which has no session by design) is written to the failures ledger by the daemon (channel-wake/nobody-woken) and the stderr line names the record: `cc-slack: woke nobody on <target> (<verdict>) — recorded f-…`. --mention opens with ❓ and an @-mention of the owner — the only post allowed to page him (a typed @handle of his is sent as code). -c '#<repo>' wants a question, a decision, or --major (alias --main); anything else goes to #<repo>-updates, one stderr line says so.
   cc-slack sent <PRODUCER-ID>         did Slack accept that id? prints its ts (exit 0), or exit 1 if not yet; an unknown flag is always exit 2, never text.
   cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m "text"] upload a file as the bot; --thread lands it in that thread (default target: DM the owner); --ts as above; Web API only.
-  cc-slack post-approval [--force|--landed] [--print-chat] <repo> <pr-number|url> "[repo] PR #n: title — url" into #approvals, where the owner's :+1: squash-merges it — or, for a repo in CC_SELF_LAND_REPOS, into #<repo>-updates as a landing record nobody taps. One card per PR — a repeat call finds the first and does nothing (--force re-posts); a merged/closed PR's card is edited to "landed ✓" instead (--landed: on the caller's word).
+  cc-slack post-approval [--force|--landed] [--print-chat] <repo> <pr-number|url> "[repo] PR #n: title — url" into #approvals, where the owner's :+1: squash-merges it — or, for a repo that lands itself (any not in CC_SELF_LAND_EXCEPT), into #<repo>-updates as a landing record nobody taps. One card per PR — a repeat call finds the first and does nothing (--force re-posts); a merged/closed PR's card is edited to "landed ✓" instead (--landed: on the caller's word).
   cc-slack approvals-sweep [--dry-run] [--now]      edit every card whose PR is in (or closed) but still reads pending.
   cc-slack history <#chan|C…|D…> [n] | thread <#chan|C…> <ts> [n]      read a channel or a full thread, newest first, cursor-paged.
   cc-slack edit <chan> <ts> "new text" | unsay <chan> <ts>      rewrite or delete one of the bot's own posts (signed ones too).
@@ -7910,8 +7910,15 @@ SWEEP_MAX = 40                                                           # cap e
 CARD_ID = "pr-card:{repo}:{n}"       # the producer id a PR card is posted under: the ledger (SENT_DIR) is how it is found again
 
 def self_lands(cfg, repo):
-    """Is `repo` named in CC_SELF_LAND_REPOS (~/.cc/config)? Then cc-loop queues its landings and no 👍 is waited on."""
-    return repo in (cfg.get("CC_SELF_LAND_REPOS") or "").split()
+    """Does `repo` land its own PRs? Every project does unless CC_SELF_LAND_EXCEPT (~/.cc/config) names it; then cc-loop
+    queues its landings and no 👍 is waited on. `cc lands` answers — the one reader of that rule — handed this cfg's
+    exception list, so a card's lane and the loop's queue cannot disagree. Anything but 0 keeps the card in #approvals."""
+    env = dict(os.environ, CC_SELF_LAND_EXCEPT=cfg.get("CC_SELF_LAND_EXCEPT") or "")
+    try:
+        return subprocess.call([os.path.join(BIN, "cc"), "lands", repo], env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30) == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 def card_lane(cfg, repo):
     """(channel id or None, channel name) for `repo`'s PR cards. A repo that lands its own PRs needs nobody's 👍, so
@@ -8026,7 +8033,7 @@ def pr_facts(repo, n):
         return None
 
 def cmd_post_approval(argv):
-    """post-approval [--force|--landed] <repo> <n|url> — posts "[repo] PR #n: title — url" into #approvals (the daemon merges on :+1:), or into #<repo>-updates for a repo in CC_SELF_LAND_REPOS (a landing record: cc-loop queues the landing and no 👍 is waited on, though the OWNER's own 👍 on that card re-queues a landing that STOPPED — card_lane, owner_card_thumb — which is what such a stop asks him for; it approves nothing and lifts no protected-path hold). Posted under the ledger id pr-card:<repo>:<n>, which is how --landed and the sweep find it again in either lane. One card per PR: a second caller finds the first and exits 0; --force posts anyway, for re-posting after a failed merge. A PR GitHub already reports MERGED/CLOSED gets its card edited to "landed ✓"/"closed ✗" instead of a new one; --landed does that edit on the caller's word and never posts. Prints the ts, or `<channel> <ts>` with --print-chat for a caller handing the card on. Exit 2 usage, 3 no token, 4 landed PR with no card, 1 gh/Slack."""
+    """post-approval [--force|--landed] <repo> <n|url> — posts "[repo] PR #n: title — url" into #approvals (the daemon merges on :+1:), or into #<repo>-updates for a repo that lands itself (`cc lands`: a landing record — cc-loop queues the landing and no 👍 is waited on, though the OWNER's own 👍 on that card re-queues a landing that STOPPED — card_lane, owner_card_thumb — which is what such a stop asks him for; it approves nothing and lifts no protected-path hold). Posted under the ledger id pr-card:<repo>:<n>, which is how --landed and the sweep find it again in either lane. One card per PR: a second caller finds the first and exits 0; --force posts anyway, for re-posting after a failed merge. A PR GitHub already reports MERGED/CLOSED gets its card edited to "landed ✓"/"closed ✗" instead of a new one; --landed does that edit on the caller's word and never posts. Prints the ts, or `<channel> <ts>` with --print-chat for a caller handing the card on. Exit 2 usage, 3 no token, 4 landed PR with no card, 1 gh/Slack."""
     force, landed = "--force" in argv, "--landed" in argv
     pchat = "--print-chat" in argv
     argv = [a for a in argv if a not in ("--force", "--landed", "--print-chat")]
