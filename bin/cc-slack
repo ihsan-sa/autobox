@@ -4,7 +4,7 @@
   cc-slack daemon [--no-slack]        the box's one Slack connection (Socket Mode) + local router on ~/.cc/slack/sock; user unit cc-slackd (`cc slack on|off`); no tokens or --no-slack = local router only.
   cc-slack channel [<target>]         stdio MCP channel server, one per session (claude spawns it); target defaults from the session cwd: ~/dev/<repo>→<repo>, a track worktree (.cc/track)→<repo>/<track>, ~/dev or ~→box.
   cc-slack inject [--no-start] <target> "text"      push a message into a session as if from Slack (tests/scripts); `<repo>@<alias>` is that orch's own session, never started for it.
-  cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] [--route TITLE] [--id PRODUCER-ID] [--mention] [--major] "text" post as the bot (cc-notify uses --route). --id posts an event once, ever: a replay or retry returns the same ts, never a second post (~/.cc/slack/sent/). --ts is the message this answers. -c into another session's channel hands it to that session (Daemon.wake), --route never does; one that wakes nobody (queued, no-session, live-no-channel, no-track — not a paused or unminted target, which has no session by design) is written to the failures ledger by the daemon (channel-wake/nobody-woken) and the stderr line names the record: `cc-slack: woke nobody on <target> (<verdict>) — recorded f-…`. --mention opens with ❓ and an @-mention of the owner — the only post allowed to page him (a typed @handle of his is sent as code). -c '#<repo>' wants a question, a decision, or --major (alias --main); anything else goes to #<repo>-updates, one stderr line says so.
+  cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] [--route TITLE] [--id PRODUCER-ID] [--mention] [--major] "text" post as the bot (cc-notify uses --route). --id posts an event once, ever: a replay or retry returns the same ts, never a second post (~/.cc/slack/sent/). --ts is the message this answers. -c into another session's channel ('#name', a bare name or its id) hands it to that session (Daemon.wake), --route never does, and two seats that keep waking each other are held after 8 wakes in 10 minutes (Daemon.pingpong); one that wakes nobody (queued, no-session, live-no-channel, no-track — not a paused or unminted target, which has no session by design) is written to the failures ledger by the daemon (channel-wake/nobody-woken) and the stderr line names the record: `cc-slack: woke nobody on <target> (<verdict>) — recorded f-…`. --mention opens with ❓ and an @-mention of the owner — the only post allowed to page him (a typed @handle of his is sent as code). -c '#<repo>' wants a question, a decision, or --major (alias --main); anything else goes to #<repo>-updates, one stderr line says so.
   cc-slack sent <PRODUCER-ID>         did Slack accept that id? prints its ts (exit 0), or exit 1 if not yet; an unknown flag is always exit 2, never text.
   cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m "text"] upload a file as the bot; --thread lands it in that thread (default target: DM the owner); --ts as above; Web API only.
   cc-slack post-approval [--force|--landed] [--print-chat] <repo> <pr-number|url> "[repo] PR #n: title — url" into #approvals, where the owner's :+1: squash-merges it — or, for a repo that lands itself (any not in CC_SELF_LAND_EXCEPT), into #<repo>-updates as a landing record nobody taps. One card per PR — a repeat call finds the first and does nothing (--force re-posts); a merged/closed PR's card is edited to "landed ✓" instead (--landed: on the caller's word).
@@ -3457,6 +3457,7 @@ class Daemon:
         self.grant_posts = {}                               # target -> [t, …] of its recent grant cards (relay_grant's window)
         self.proj_said = set()                              # (ws, dir) already logged as refused by projects_sweep, so a bad folder name doesn't log every 15 min
         self.bot_user = None
+        self.pair_wakes = {}                                # frozenset of two seats -> [(t, sender seat), …] (pingpong)
         self.bot_id = None                                  # our own B… id: bot-authored posts carry bot_id and no user
         self.default_chats = {}                             # target -> fallback chat for relays (resolved once per daemon life)
         self.load_queues()                                  # queued messages persisted by an earlier daemon life
@@ -3637,7 +3638,7 @@ class Daemon:
                          + " — answer there:\n" + re.sub(r"@(?=[A-Za-z0-9])", "@\u200b", text), tt[1] if tt else None)
             meta = {"chat_id": chat, "thread_ts": thread or ts, "ts": ts, "user": "box", "role": "owner",
                     "channel": "#" + (self.chan_name(chat) or str(chat)), "target": dest, "from": frm}
-            res = (prior[1] or "handoff") if prior is not mine else self.deliver(
+            res = (prior[1] or "handoff") if prior is not mine else self.pingpong(seat, (dest, alias)) or self.deliver(
                 dest, {"type": "message", "meta": meta, "content": f"[{frm} mentioned @{tok} — answer in this thread] {text}"},
                 autostart=dest == repo and not alias, alias=alias)
             log(f"mention {dest}{'@' + alias if alias else ''} from {frm} in {chat}/{ts}: {res}")
@@ -3666,12 +3667,30 @@ class Daemon:
         name = self.chan_name(chat)
         meta = {"chat_id": chat, "thread_ts": thread or ts, "ts": ts, "user": "box", "role": "owner",
                 "channel": "#" + (name or str(chat)), "target": target, "from": f"{seat[0]}@{seat[1]}" if seat[1] else seat[0]}
-        res = self.deliver(target, {"type": "message", "content": text, "meta": meta}, alias=alias)
+        res = self.pingpong(seat, (target, alias)) or self.deliver(target, {"type": "message", "content": text, "meta": meta}, alias=alias)
         log(f"wake {target}{'@' + alias if alias else ''} from {meta['from']}: {res}")
         out = {"ok": True, "result": res, "target": target}
         if res not in self.WOKEN and res not in self.NOBODY_BY_DESIGN:
             out["recorded"] = self.record_nobody_woken(target, alias, meta, res)
         return out
+
+    PINGPONG_MAX, PINGPONG_WINDOW = 8, 600
+
+    def pingpong(self, seat, dest):
+        """Two seats waking each other by post are held once PINGPONG_MAX wakes have passed between them inside
+        PINGPONG_WINDOW seconds, some each way: the brief (raised-box-post-in-project-channel-does-not-wake-seat) — "two
+        seats must not ping-pong". One seat sending another a run of requests is no loop and is never held. Returns
+        "held: ping-pong" (the post stands, nobody is woken, and record_nobody_woken writes it down) or None to go
+        ahead. A seat's own post never gets here: wake_channel answers it "own" first."""
+        now, src = time.time(), tuple(seat)
+        pair = frozenset((src, tuple(dest)))
+        with self.lock:
+            hits = [(t, s) for t, s in self.pair_wakes.get(pair, ()) if now - t < self.PINGPONG_WINDOW]
+            if len(hits) >= self.PINGPONG_MAX and len({s for _, s in hits} | {src}) == 2:
+                self.pair_wakes[pair] = hits
+                return "held: ping-pong"
+            self.pair_wakes[pair] = (hits + [(now, src)])[-self.PINGPONG_MAX:]
+        return None
 
     # THE OUTCOMES OF deliver() THAT WAKE SOMEBODY, and the ones where nobody is there by design. The brief
     # (a-post-that-wakes-nobody-is-recorded-by-cc-slack, 2026-09-12): "resolves to nobody woken (the outcome of
@@ -4542,14 +4561,19 @@ class Daemon:
                             autostart=False, alias=new)
 
     def scan_owner(self, target, chat, thread, default=None):
-        """Cache-miss fallback: scan the thread's newest 20 messages backwards for an @token or username-suffix alias, else `default`."""
+        """Cache-miss fallback: scan the thread's newest 20 messages backwards for an @token or username-suffix alias, else `default`.
+        In an orch's channel (`default` set) only an @token counts, never a signature."""
         try:
             msgs = replies_tail(self.cfg, chat, thread, 20)
         except Exception:
             return default
         for m in reversed(msgs):
             uname = m.get("username") or ""
-            tok = at_token((m.get("text") or "").strip()) or (uname.rsplit(" · ", 1)[-1] if " · " in uname else None)
+            # a post's signature says who spoke, and in an orch's own channel that is never a claim on the thread: the
+            # planning seat posting there addresses the orch, so the owner's answers under it are the orch's too
+            # (raised-a-post-into-an-orch-channel-reaches-the-planning-seat). Only a typed @token hands it over there.
+            sig = uname.rsplit(" · ", 1)[-1] if " · " in uname and not default else None
+            tok = at_token((m.get("text") or "").strip()) or sig
             if tok and (tok in (target, "main") or tok in self.aliases_for(target)):
                 return None if tok in (target, "main") else tok
         return default
@@ -7425,7 +7449,10 @@ def cmd_post(argv):
         else:
             args.append(argv[i]); i += 1
     text = " ".join(args) if args else sys.stdin.read()
-    named = bool(chan and chan.startswith("#"))      # a `-c '#name'` post may wake another session (see below)
+    # any `-c` post may wake another session (see below), however the channel is named: '#lessons', 'lessons' or its
+    # C… id. Only '#name' asked before, so a planning seat's `-c lessons` request (2026-09-24) and a `-c C0…` post into
+    # an orch's channel (2026-09-21) reached nobody until a person chased them. A --route post is machinery: no -c, no wake.
+    named = bool(chan)
     if os.environ.get("CC_MEMBER_SANDBOX") == "1":   # inside a boundary: use the member socket, scoped to it
         try:
             r = sock_request({"reply": chan or "", "text": text, "thread_ts": thread, "ts": ts or ""}, timeout=60)
@@ -7463,6 +7490,8 @@ def cmd_post(argv):
         print("cc-slack post: no channel (use -c, --route with a matching #channel, or SLACK_CHANNEL)", file=sys.stderr); return 3
     if chan.startswith("#"):
         chan = resolve_channel(cfg, chan[1:]) or chan
+    elif re.match(r"^[a-z0-9][a-z0-9_-]*$", chan):     # a bare `-c lessons` (Slack names are lower case, ids never are): its id, so the wake and the woken seat's reply name the channel as Slack does
+        chan = resolve_channel(cfg, chan) or chan
     # --mention is rung 1, "you, now": post() opens it with ❓ and the raw <@U…> form; without --mention a typed @handle of his is code. Every post signs with the calling session's name; a `-c '#name'` post into ANOTHER session's channel also opens with a mention of that channel, so it reads as addressed, not anonymous.
     uname, own = sender_name(chan)
     if named and not own:

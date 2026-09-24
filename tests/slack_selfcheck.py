@@ -854,6 +854,59 @@ def run_selfcheck():
           and not re.match(r"^[a-z0-9-]{2,20}$", "a") and not re.match(r"^[a-z0-9-]{2,20}$", "a" * 21) and not re.match(r"^[a-z0-9-]{2,20}$", "ai_dev"))
     check("display_name: alias form overrides the target-derived label", display_name(CTL, "ai-dev") == f"{BOX}-box · ai-dev" and display_name(CTL) == f"{BOX}-box · {CTL}")
     check("fmt_subs: `cc slack status` / `!sessions` display format — an orch reads alias@repo", fmt_subs({"myrepo": [None]}) == "myrepo [main]" and fmt_subs({"myrepo": [None, "ai-dev"]}) == "myrepo [main], ai-dev@myrepo")
+    # A BOX POST IN A PROJECT'S CHANNEL WAKES THAT PROJECT'S SEAT AND NOT THE POSTER (raised-box-post-in-project-channel-
+    # does-not-wake-seat, owner 2026-09-24: "It NEEDS to reach the session actively as if I sent a slack message"). The
+    # planning seat posts into #lessons: lessons is handed the text itself as a message in #lessons' thread, never a relay;
+    # the same seat posting into its own channel is "own" and wakes nobody; and two seats waking each other are held
+    # after PINGPONG_MAX wakes in the window, while a third seat's wake of the same target still goes through.
+    dmBW = Daemon(use_slack=False); dmBW.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmBW.bot_user = "UBOT"
+    dmBW.names.update({"CLES": "lessons", "CCTLX": "ctl"}); wokeBW = []
+    dmBW.route = lambda chat, ctype: {"CLES": "lessons", "CCTLX": "ctl"}.get(chat)
+    dmBW.chan_alias = lambda chat: None
+    dmBW.deliver = lambda target, payload, autostart=True, alias=None: wokeBW.append((target, alias, payload)) or "delivered"
+    dmBW.record_nobody_woken = lambda target, alias, meta, res: f"recorded f-{target}"
+    seatBW = {"s": ("ctl", None)}; dmBW.peer_seat = lambda peer, member=None: seatBW["s"]
+    rBW = dmBW.wake_channel("CLES", "9.1", None, "please add the Go Abroad event", ("peer",))
+    rBWown = dmBW.wake_channel("CCTLX", "9.2", None, "a note in my own lane", ("peer",))
+    firstBW = list(wokeBW)
+    check("a box post in a project channel reaches that project's seat as the post's own text in its channel and thread, "
+          "and the poster's post into its own channel wakes nobody",
+          rBW.get("result") == "delivered" and rBW.get("target") == "lessons" and rBWown.get("result") == "own"
+          and len(firstBW) == 1 and firstBW[0][0] == "lessons" and firstBW[0][1] is None
+          and firstBW[0][2]["content"] == "please add the Go Abroad event"
+          and firstBW[0][2]["meta"]["chat_id"] == "CLES" and firstBW[0][2]["meta"]["thread_ts"] == "9.1"
+          and firstBW[0][2]["meta"]["channel"] == "#lessons")
+    del wokeBW[:]; dmBW.pair_wakes.clear(); resBW = []
+    for i in range(Daemon.PINGPONG_MAX + 2):     # ctl -> lessons, lessons -> ctl, turn about
+        seatBW["s"] = ("ctl", None) if i % 2 == 0 else ("lessons", None)
+        resBW.append(dmBW.wake_channel("CLES" if i % 2 == 0 else "CCTLX", f"10.{i}", None, "and back", ("peer",)).get("result"))
+    seatBW["s"] = ("website", None)
+    rBWthird = dmBW.wake_channel("CLES", "11.1", None, "a third seat", ("peer",))
+    oneBW = [dmBW.wake_channel("CLES", f"13.{i}", None, "one more request", ("peer",)).get("result")
+             for i in range(Daemon.PINGPONG_MAX + 2)]    # website -> lessons only: a run of requests, not a loop
+    check("two seats waking each other by post are held after PINGPONG_MAX wakes between them (recorded, not delivered); "
+          "a third seat's post into the same channel still wakes it, and so does every post of a one-way run",
+          resBW[:Daemon.PINGPONG_MAX] == ["delivered"] * Daemon.PINGPONG_MAX
+          and resBW[Daemon.PINGPONG_MAX:] == ["held: ping-pong"] * 2
+          and rBWthird.get("result") == "delivered" and wokeBW[Daemon.PINGPONG_MAX][2]["content"] == "a third seat"
+          and oneBW == ["delivered"] * (Daemon.PINGPONG_MAX + 2) and len(wokeBW) == 2 * Daemon.PINGPONG_MAX + 3)
+    # …AND IN AN ORCH'S CHANNEL THE OWNER'S ANSWER UNDER A PLANNING SEAT'S POST IS THE ORCH'S (raised-a-post-into-an-
+    # orch-channel-reaches-the-planning-seat): the root's signature names the seat that spoke, not the thread's owner.
+    # Outside an orch channel the same signature still claims the thread for its orch, as before.
+    _rtSO = globals()["replies_tail"]
+    try:
+        globals()["replies_tail"] = lambda cfg, chat, ts, n, pages=10: [{"username": f"{BOX}-box · r", "text": "feedback from the owner"}]
+        soOrch = dmBW.scan_owner("r", "CORCHX", "12.1", "voice")
+        globals()["replies_tail"] = lambda cfg, chat, ts, n, pages=10: [{"username": f"{BOX}-box · voice", "text": "a status line"}]
+        dmBW.known_aliases["r"] = {"voice"}
+        soMain = dmBW.scan_owner("r", "CMAINX", "12.2", None)
+        globals()["replies_tail"] = lambda cfg, chat, ts, n, pages=10: [{"username": f"{BOX}-box · voice", "text": "@main over to you"}]
+        soTok = dmBW.scan_owner("r", "CORCHX", "12.3", "voice")
+    finally:
+        globals()["replies_tail"] = _rtSO
+    check("scan_owner: in an orch's channel a planning seat's signature does not take the thread from the orch, a typed "
+          "@main still does; in the main channel an orch's signature still claims its thread",
+          soOrch == "voice" and soMain == "voice" and soTok is None)
     dm5 = Daemon(use_slack=False); dm5.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dm5.bot_user = "UBOT"; dm5.known_aliases["r"] = {"ai-dev"}
     said5 = []; dm5.say = lambda chat, text, thread=None, mail=True: said5.append(text); dm5.names["C1"] = "c1"
     check("route: bare text, no thread → main (None)", dm5.update_owner("r", "C1", "1.1", None, "hi there") is None)
@@ -2333,6 +2386,29 @@ def run_selfcheck():
           "stay in #<repo>; #alerts, a track channel, a lane and a raw id are untouched",
           rcG == 0 and postedG == [f"C-myrepo-{UPDATES}"] + ["C-myrepo"] * 9 + [f"C-myrepo-{UPDATES}", "C-alerts", "C-myrepo--w1", f"C-myrepo-{UPDATES}", "C123"]
           and errG.getvalue().count(f"routine → #myrepo-{UPDATES}") == 2 and len(errG.getvalue().strip().splitlines()) == 2)
+    # EVERY `-c` POST ASKS THE DAEMON TO WAKE, however the channel is named (raised-box-post-in-project-channel-does-not-
+    # wake-seat): a planning seat's `-c lessons` request on 2026-09-24 and a `-c C0…` post into an orch's channel on
+    # 2026-09-21 never asked, because only '#name' did. A --route post is machinery and still never asks.
+    reqsBP = []
+    _snBP, _sockBP = globals()["sender_name"], globals()["sock_request"]
+    try:
+        globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: (1, "3.0")
+        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+        globals()["unresolved_mentions"] = lambda cfg, text, chat=None, **kw: []
+        globals()["sender_name"] = lambda chan: ("mybox · ctl", False)
+        globals()["sock_request"] = lambda req, timeout=15: reqsBP.append(req) or {"ok": True, "target": "lessons", "result": "delivered"}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            for c in ("lessons", "C0LESSONS", "#lessons"):
+                cmd_post(["-c", c, "--thread", "2.0", "please add the event"])
+            cmd_post(["--route", "[lessons] PR #3: fix things", "merge failed"])
+    finally:
+        globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["unresolved_mentions"], globals()["sender_name"], globals()["sock_request"] = real_um, _snBP, _sockBP
+    check("post -c wakes the channel's session whether the channel is '#lessons', 'lessons' or its id, a bare name going "
+          "as its id, and --route never asks",
+          [(r.get("wake"), r.get("ts"), r.get("thread_ts")) for r in reqsBP]
+          == [("C-lessons", "3.0", "2.0"), ("C0LESSONS", "3.0", "2.0"), ("C-lessons", "3.0", "2.0")])
     # THE SELFCHECK'S DELIVERY STATE IS ITS OWN (raised-a-slack-gate-is-green-only-where-it-cannot-see-the-box): a
     # `-c '#name'` post asks the daemon to wake the channel's session, and run_selfcheck points that at THIS run's
     # socket. A fixture daemon there is heard; with none there the post stands alone — and the case above counts the
