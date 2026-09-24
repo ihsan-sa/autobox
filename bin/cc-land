@@ -130,7 +130,7 @@ already holds this PR (nothing here ran) · 3 landed, but a cosmetic step wants 
 nothing observed it reaching the owner · 2 usage.
 """
 import ast, calendar, fcntl, fnmatch, glob, hashlib, json, os, re, select, shlex, shutil, signal, subprocess, sys
-import contextlib, tempfile, threading, time
+import contextlib, errno, tempfile, threading, time
 import urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
@@ -282,7 +282,20 @@ def kill_group(p):
 
 # ── the run's scratch root ───────────────────────────────────────────────────────────────────────────────
 _RUN = {"root": None, "keep": set(), "lock": threading.Lock()}
-KEPT = ".kept"       # the marker drop_run_root leaves in a root it kept a red gate's log in: cc-janitor's to reclaim, not the sweep's
+KEPT = ".kept"       # the marker drop_run_root leaves in a root it kept a red gate's log in: cc-tmp-reap's to reclaim after 72 h, not the sweep's
+SCRATCH = f"{HOME}/.cc/tmp"   # the box's scratch on disk; config/environment.d/cc-tmp.conf gives every unit the same TMPDIR
+
+
+def use_scratch(path=SCRATCH):
+    """Make `path` this process's temp root and every child's TMPDIR, whatever TMPDIR it inherited, and return it.
+    main() calls it first: a landing's run root, its gate checkouts and whatever its gates make live on disk, never on
+    /tmp. /tmp here is a tmpfs with a per-user quota that the box's own leftovers filled mid-landing, and a gate test
+    that sandboxes with `--tmpfs /tmp` cannot see a checkout under /tmp. The real path, because cc-sandbox --tree
+    compares its readlink -f with `$TMPDIR/cc-land.run.*`."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    path = os.path.realpath(path)
+    os.environ["TMPDIR"] = tempfile.tempdir = path
+    return path
 
 
 def run_root():
@@ -348,7 +361,7 @@ def clear_root(root, keep=()):
 
 
 def drop_run_root():
-    """The outermost finally: the run root goes whole except the logs keep_log() named, which are cut to FAIL_LOG_KEEP and left under a KEPT marker for cc-janitor to reclaim."""
+    """The outermost finally: the run root goes whole except the logs keep_log() named, which are cut to FAIL_LOG_KEEP and left under a KEPT marker for cc-tmp-reap to reclaim."""
     root = _RUN["root"]
     if not root or not os.path.isdir(root):
         return
@@ -390,11 +403,48 @@ def sweep_run_roots():
     return gone
 
 
+# What a write refused for space says. /tmp here is a tmpfs with a per-user quota, and git never says so: a
+# checkout that hit it failed as "Could not reset index file to revision HEAD" (#132, 2026-09-22).
+DISK_FULL = re.compile(r"Disk quota exceeded|No space left on device|\[Errno (?:122|28)\]")
+GIT_WRITE = re.compile(r"unable to write file|Could not reset index file")
+
+
+def disk_full(text=""):
+    """' — …' naming a full temp disk when `text` says a write was refused for space, or the temp root refuses a
+    1 MB write now; '' otherwise. The note a failure carries so a quota death reads as one, not as a git error."""
+    now = ""
+    try:
+        with tempfile.TemporaryFile(prefix="cc-land.probe.") as f:
+            f.write(b"\0" * (1 << 20))
+            f.flush()
+    except OSError as e:
+        if e.errno in (errno.EDQUOT, errno.ENOSPC):
+            now = e.strerror
+    if not now and not DISK_FULL.search(text or ""):
+        return (f" — git says that when {tempfile.gettempdir()} is full or at its per-user quota; "
+                f"`cc-tmp-reap` lists what can go") if GIT_WRITE.search(text or "") else ""
+    return (f" — {tempfile.gettempdir()} is full or at its per-user quota ({now or 'the output says so'}); "
+            f"`cc-tmp-reap` lists what can go")
+
+
 def run_gate(argv, cwd, log, env, stop=None):
     """Run one gate in its own process group, streaming its output to `log` as it runs; killed (the whole group) only after GATE_IDLE seconds of silence, never on wall clock, or within a second of `stop` (a threading.Event) being set, which raises GateStopped. Returns (rc, output) like sh()."""
     out_, f = [], None
     with contextlib.suppress(OSError):
         f = open(log, "w")
+
+    def put(text):   # the log is a copy: a write refused (a full /tmp) ends the copy and says why, never the gate
+        nonlocal f
+        if not f:
+            return
+        try:
+            f.write(text)
+            f.flush()
+        except OSError as e:
+            out_.append(f"\ncc-land: stopped writing {log}: {e}\n".encode())
+            with contextlib.suppress(OSError):
+                f.close()
+            f = None
     try:
         p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, env=env, start_new_session=True)
@@ -408,8 +458,7 @@ def run_gate(argv, cwd, log, env, stop=None):
                 kill_group(p)
                 p.wait()
                 line = f"\ncc-land: {os.path.basename(argv[0])} stopped — another gate is already red\n"
-                if f:
-                    f.write(line)
+                put(line)
                 raise GateStopped(line.strip())
             if ready:
                 quiet = time.monotonic()
@@ -420,20 +469,18 @@ def run_gate(argv, cwd, log, env, stop=None):
                 p.wait()
                 line = f"\ncc-land: {os.path.basename(argv[0])} said nothing for {GATE_IDLE:g} s — killed as dead\n"
                 out_.append(line.encode())
-                if f:
-                    f.write(line)
+                put(line)
                 return 124, b"".join(out_).decode("utf-8", "replace")
             chunk = os.read(p.stdout.fileno(), 65536)
             if not chunk:
                 break
             out_.append(chunk)
-            if f:
-                f.write(chunk.decode("utf-8", "replace"))
-                f.flush()
+            put(chunk.decode("utf-8", "replace"))
         return p.wait(), b"".join(out_).decode("utf-8", "replace")
     finally:
         if f:
-            f.close()
+            with contextlib.suppress(OSError):
+                f.close()
 
 
 def clean_start():
@@ -1624,8 +1671,9 @@ class Land:
         with git_lock(self.root):    # .git/worktrees is shared too; held for the bookkeeping git writes, a second
             rc, o = sh(["git", "worktree", "add", "-q", "--detach", tree, at or self.head], cwd=self.root, timeout=300)
         if rc:
+            full = disk_full(o)              # asked before the rmtree frees what the half checkout took
             shutil.rmtree(tmp, ignore_errors=True)
-            raise Failed(f"cannot check out PR #{self.pr}: {last(o)}")
+            raise Failed(f"cannot check out PR #{self.pr}: {last(o)}{full}")
         return tmp, tree
 
     def drop_checkout(self, tmp, tree):
@@ -2094,12 +2142,13 @@ class Land:
             if rc or (bad and bad.group(1) != "0"):
                 keep_log(keep)                   # the one log that outlives the run — bounded, at this path
                 record_red(self.project, g, content, keep, o, pr=self.pr)   # …and the ledger line that outlives THAT
-                raise Failed(f"gate {g} did not pass: {gate_fail(o)}{self.behind_base()}"
+                full = disk_full(o)
+                raise Failed(f"gate {g} did not pass: {gate_fail(o)}{full}{self.behind_base()}"
                              f"  [full output: {keep}]",
                              # the card gets the gate and the case that FAILED and nothing else: the stale-base
                              # reading and the log's path are the landing record's, and are kept above. In
                              # cc-replay's words (`gate \S+ did not pass`), which is how it keys a red gate.
-                             short=f"gate {os.path.basename(g)} did not pass: {gate_fail(o)}")
+                             short=f"gate {os.path.basename(g)} did not pass: {gate_fail(o)}{full}")
 
         errs, stop = {}, threading.Event()
 
@@ -4401,6 +4450,8 @@ def cmd_selfcheck():
 def main(argv):
     default_signals()                      # once, on the main thread: every gate and reviewer below inherits it
     cmd = {"selfcheck": lambda a: cmd_selfcheck(), "record": cmd_record, "queue": cmd_queue, "work": cmd_work}
+    if argv[:1] != ["selfcheck"]:          # the selfcheck keeps its own fixture temp root
+        use_scratch()
     if argv and argv[0] in cmd:
         return cmd[argv[0]](argv[1:])
     if len(argv) < 2 or argv[0].startswith("-"):

@@ -15,7 +15,8 @@ for a in "$@"; do case "$a" in
   *) echo "usage: $0 [--etc] [--no-services]" >&2; exit 2 ;;
 esac; done
 
-mkdir -p ~/bin ~/.cc/{boards,worktrees,state,slack} ~/.config/systemd/user ~/dev
+mkdir -p ~/bin ~/.cc/{boards,worktrees,state,slack} ~/.config/systemd/user ~/.config/environment.d ~/dev
+[ -d ~/.cc/tmp ] || mkdir -m 700 ~/.cc/tmp   # TMPDIR for every unit and session (config/environment.d/cc-tmp.conf): made before anything reads it
 
 # link <src> <dest> — like `ln -sfn`, except a REAL file/dir in the way is kept as <dest>.bak instead of clobbered.
 link() {
@@ -80,6 +81,7 @@ link "$R/ccbox" ~/ccbox
 link "$R/docs/WORKING.md" ~/WORKING.md          # what a session does between tasks — at ~ beside the guides it is read with
 link "$R/docs/WRITING.md" ~/WRITING.md          # the writing guide config/writing-prompt.md names in its last line
 link "$R/config/tmux.conf" ~/.tmux.conf
+link "$R/config/environment.d/cc-tmp.conf" ~/.config/environment.d/60-cc-tmp.conf   # the box's scratch off /tmp; units see it after daemon-reload
 # the live user units, from config/units.json — the ONE list (cc-mcp is retired: its unit is parked in mcp/).
 # Which are linked, which are enabled and which the audit health-checks used to be three hardcoded lists in two
 # files, and they had drifted apart: the model, reconcile and publish timers were enabled here and invisible to
@@ -196,4 +198,4 @@ fi
 [ -n "$O" ] && git -C "$O" rev-parse --git-dir >/dev/null 2>&1 &&
   git -C "$O" config core.hooksPath "$(realpath --relative-to="$O" "$R/.githooks")" ||   # pre-commit = core/tests/check.sh on the default branch
   git -C "$R" config core.hooksPath .githooks 2>/dev/null || true                        # a bare autobox clone: hook the repo itself
-echo "linked: bin/* -> ~/bin, ccbox, overlay docs, tmux.conf, user units. Packages expected: tmux git gh docker-ce jq curl python3 python3-venv bubblewrap socat shellcheck (see docs/DESIGN.md)."
+echo "linked: bin/* -> ~/bin, ccbox, overlay docs, tmux.conf, the scratch TMPDIR, user units. Packages expected: tmux git gh docker-ce jq curl python3 python3-venv bubblewrap socat shellcheck (see docs/DESIGN.md)."

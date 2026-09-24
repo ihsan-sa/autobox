@@ -2956,6 +2956,11 @@ if stanza "cc-reconcile (board vs reality: decision table + one end-to-end apply
 chk cc-reconcile
 
 fi
+if stanza "cc-tmp-reap (the box's own leftovers in /tmp, and only those)"; then
+# Fixtures in a temp root of its own and processes it spawns and kills itself: this box's /tmp is never read for it.
+chk cc-tmp-reap
+
+fi
 if stanza "cc-rename (a project's name, everywhere the box keys by it)"; then
 # Every case there builds a whole HOME of its own — a git repository with two linked worktrees, a board, a state
 # dir, an ask ledger, a config, a Slack directory and stub tmux/pgrep/cc — so it moves no path of this box's,

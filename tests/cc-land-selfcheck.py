@@ -81,6 +81,21 @@ def selfcheck():
 
     check("…and with no failure marker anywhere, the last line still stands",
           gate_fail("banner\nall quiet") == "all quiet")
+    # A landing that died of the /tmp quota said "Could not reset index file" and nothing about space (#132, 09-22).
+    check("a failure whose output says the quota was hit is named as a full temp disk",
+          "per-user quota" in disk_full("OSError: [Errno 122] Disk quota exceeded"))
+    check("…and git's own words for it are too, as git's", "git says that" in disk_full(
+          "fatal: Could not reset index file to revision 'HEAD'."))
+    check("…and a failure that says nothing of space gets no note (the temp root takes a write now)",
+          disk_full("✗ H8: the route was wrong") == "")
+    gl = f"{tempfile.mkdtemp(prefix='cc-land-selfcheck-g-')}/gate.log"
+    rc_, o_ = run_gate([sys.executable, "-c", "print('one'); print('two')"], "/", gl, dict(os.environ))
+    check("a gate's output reaches both its result and its log", rc_ == 0 and "two" in o_ and "two" in open(gl).read())
+    shutil.rmtree(os.path.dirname(gl), ignore_errors=True)
+    if os.path.exists("/dev/full"):
+        rc_, o_ = run_gate([sys.executable, "-c", "print('one'); print('two')"], "/", "/dev/full", dict(os.environ))
+        check("…and a log the disk refuses ends the copy with a line saying why, never the gate",
+              rc_ == 0 and "two" in o_ and "stopped writing /dev/full" in o_ and "No space left" in o_)
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         rc, out = sh([sys.executable, "-c", "import sys; print('{}'); print('human note', file=sys.stderr)"], stdout_only=True)
@@ -291,6 +306,63 @@ def selfcheck():
               "no longer a cc-land", sweep_run_roots() == [vroot] and roots() == [] and not os.path.exists(vroot))
     finally:
         _RUN.update(_run_before)
+
+    # THE SCRATCH IS ON DISK (row box-scratch-off-tmp, 2026-09-24): "a landing's run root and gate worktree live off
+    # /tmp; a selftest case proves it, and proves a --tmpfs /tmp sandbox test passes at the gate". The fixture is a
+    # directory of its own inside the real SCRATCH, so the default path is what is tested; TMPDIR and the temp root
+    # are put back after.
+    _run_before, _env_tmp, _tempdir = dict(_RUN), os.environ.get("TMPDIR"), tempfile.tempdir
+    os.makedirs(SCRATCH, mode=0o700, exist_ok=True)
+    fx = tempfile.mkdtemp(prefix="cc-land-selfcheck-s-", dir=SCRATCH)
+    off_tmp = lambda p: not (os.path.realpath(p) + "/").startswith("/tmp/")
+    try:
+        called = []
+        real_use = use_scratch
+        try:
+            globals()["use_scratch"] = lambda *a: called.append(a)
+            with contextlib.redirect_stderr(io.StringIO()):
+                main(["--no-such-flag"])             # the usage path: returns 2 before any landing starts
+        finally:
+            globals()["use_scratch"] = real_use
+        check("main() moves the temp root to the box's scratch before anything else, and that scratch is on disk, "
+              "not under /tmp", called == [()] and off_tmp(SCRATCH))
+        _RUN.update(root=None, keep=set())
+        got = use_scratch(fx)
+        root = run_root()
+        tree = f"{tempfile.mkdtemp(prefix='cc-land.gates.myrepo.7.', dir=root)}/head"
+        os.makedirs(tree)
+        open(f"{tree}/marker", "w").close()
+        child = subprocess.run(["sh", "-c", "mktemp -d"], capture_output=True, text=True).stdout.strip()
+        check("use_scratch: TMPDIR and the temp root both name it, the run root and a gate checkout are made in it, "
+              "and a gate's own mktemp lands there too — none of it under /tmp",
+              got == os.path.realpath(fx) == os.environ["TMPDIR"] == tempfile.gettempdir()
+              and os.path.dirname(root) == got and off_tmp(tree)
+              and os.path.dirname(child) == got and off_tmp(child))
+        if shutil.which("bwrap"):
+            # The gate's side of it: a test that sandboxes itself with a fresh /tmp still sees the checkout it runs
+            # in. The same test on a checkout under /tmp, where gates were made before, does not.
+            seen = subprocess.run(["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/tmp", "test", "-f",
+                                   f"{tree}/marker"]).returncode
+            old = tempfile.mkdtemp(prefix="cc-land-selfcheck-s-", dir="/tmp")
+            open(f"{old}/marker", "w").close()
+            hidden = subprocess.run(["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/tmp", "test", "-f",
+                                     f"{old}/marker"]).returncode
+            shutil.rmtree(old, ignore_errors=True)
+            check("A --tmpfs /tmp SANDBOX TEST PASSES AT THE GATE: inside `bwrap --tmpfs /tmp` the gate checkout is "
+                  "still there — and a checkout under /tmp, the old place, is not",
+                  seen == 0 and hidden != 0)
+        else:
+            print("  - skipped: the --tmpfs /tmp sandbox case needs bwrap, and this host has none")
+        drop_run_root()
+        check("…and the run still takes its whole root with it at the end", not os.path.exists(root))
+    finally:
+        _RUN.update(_run_before)
+        tempfile.tempdir = _tempdir
+        if _env_tmp is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = _env_tmp
+        shutil.rmtree(fx, ignore_errors=True)
 
     # A red gate on a branch that is simply OLD. On a real repo, with real git plumbing — the whole question is
     # what `merge-base`, `rev-list` and `diff` say about two lines of history, and a fake world answering them
