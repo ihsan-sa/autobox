@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""cc-stall — notice a box session that is stuck with nobody looking, clear it when that is safe, else raise a row.
+
+  cc-stall              look at every window in tmux session main and print what is stuck; press nothing, raise nothing
+  cc-stall --apply      …and clear what the KNOWN table below clears, and raise a `raised-stall-*` row for the rest
+  cc-stall selfcheck    the decisions against fake panes and a stub board; no tmux, no board
+
+It rides cc-sweep.timer (2 min), after nothing and before cc-msg's sweep, with `-` in front: a failure here is a
+line in ~/.cc/state/stall.log and never stops the sweep behind it. It asks no model and no network.
+
+WHAT IT CLEARS (--apply). Only a dialog in the KNOWN table, only at a pane where an interactive `claude` is alive
+(a dead pane still shows the last dialog it drew — pressing at that was the 2026-09-23 relaunch loop), only when the
+dialog's footer is the bottom of the screen, never with a permission dialog's words anywhere on it, never in copy
+mode, never mid-turn. Today the table holds one row:
+  dev-channels  "WARNING: Loading development channels" (1 I am using this for local development · 2 Exit):
+                the digit 1, which picks option 1 and confirms it wherever the cursor sits. Never Up: the menu
+                wraps, and Up from option 1 is "2. Exit" (that is what cc-slack accept-dialog's fallback pressed).
+A dialog it pressed and that is still up afterwards is treated as unknown from then on.
+
+WHAT IT REPORTS (a `raised-stall-<window>-<kind>` row on the control repo's board, CC_BRIEF_MACHINE=1):
+  loop    a relaunch loop: cc-rc's "claude exited (N) - restarting" line grew by LOOP_MIN or more between two passes,
+          or grew on LOOP_STREAK passes running. Nothing is pressed: a loop has a cause a key cannot know.
+  dialog  any other dialog standing STAND_S or longer at a live, idle claude: the same screen on two passes.
+ONCE PER STALL: a report is stamped in ~/.cc/state/stall.json and re-armed only after a pass where that stall is
+gone (the dialog closed, the count stood still past LOOP_REARM, cc-rc's longest wait), so the same stall never raises twice. A board that refused the row
+is retried on the next pass, TRIES times at most.
+A healthy window — no dialog, or mid-turn, or a count that does not move — is left alone and its state dropped.
+"""
+import hashlib, json, os, re, subprocess, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+STATE = os.environ.get("CC_STALL_STATE") or f"{HOME}/.cc/state/stall.json"
+LOG = os.environ.get("CC_STALL_LOG") or f"{HOME}/.cc/state/stall.log"
+SESSION = os.environ.get("CC_STALL_SESSION") or "main"
+STAND_S = int(os.environ.get("CC_STALL_STAND_S") or 180)      # an unknown dialog stands this long before it is raised
+LOOP_MIN = int(os.environ.get("CC_STALL_LOOP_MIN") or 3)      # relaunches between two passes that make a loop
+LOOP_STREAK = 3                                               # …or this many passes running that each saw one
+LOOP_GAP = 900                                                # passes further apart than this start a new baseline
+LOOP_REARM = 300                                              # a count still longer than this is a stopped loop: cc-rc's
+                                                              # longest wait between relaunches (120 s backoff, 300 s limit fallback)
+TRIES = 3                                                     # a row the board refused is tried this many times
+SETTLE = float(os.environ.get("CC_STALL_SETTLE") or 1.5)      # after a key, before the pane is read again
+
+RELAUNCH_RE = re.compile(r"^claude exited \(\d+\) - restarting", re.M)     # cc-rc's own line, one per relaunch
+WORKING = "esc to interrupt"
+DIALOG_MARKS = ("Enter to confirm", "Esc to cancel", "Do you want to", "Would you like to proceed?",
+                "No, and tell Claude what to do differently")
+PERMISSION_MARKS = ("Do you want to", "No, and tell Claude what to do differently", "Would you like to proceed?",
+                    "I trust this folder")
+# name, every substring that must be on the screen, the footer that must be at its bottom, the literal key
+KNOWN = [("dev-channels", ("WARNING: Loading development channels", "1. I am using this for local development", "2. Exit"),
+          "Enter to confirm", "1")]
+
+
+def log(line):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{line}\n")
+    except OSError:
+        pass
+
+
+def ctl():
+    """The control repo: the one this bin/ is checked out under in ~/dev (cc-msg's ctl()), else CC_STALL_REPO."""
+    if os.environ.get("CC_STALL_REPO"):
+        return os.environ["CC_STALL_REPO"]
+    rel = os.path.relpath(BIN, f"{HOME}/dev")
+    return rel.split(os.sep)[0] if not rel.startswith("..") else "box"
+
+
+class Tmux:
+    """The real box. Every call swallows its own failure: a window that vanished mid-pass is just skipped."""
+    def run(self, *a):
+        try:
+            r = subprocess.run(["tmux", *a], capture_output=True, text=True, timeout=10)
+            return r.stdout if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    def windows(self):
+        out = self.run("list-windows", "-t", SESSION, "-F", "#{window_id}\t#W\t#{pane_pid}\t#{pane_in_mode}") or ""
+        seen = []
+        for line in out.splitlines():
+            p = line.split("\t")
+            if len(p) == 4 and p[0] not in (w[0] for w in seen):
+                seen.append((p[0], p[1], p[2], p[3] == "1"))
+        return seen
+
+    def screen(self, wid):
+        return self.run("capture-pane", "-p", "-t", wid)
+
+    def history(self, wid):
+        return self.run("capture-pane", "-p", "-J", "-S", "-3000", "-t", wid)
+
+    def live_claude(self, pane_pid):
+        """An interactive `claude` somewhere under the pane (not `claude -p`)."""
+        kids = {}
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f"/proc/{d}/stat") as f:
+                    s = f.read()
+                comm = s[s.index("(") + 1:s.rindex(")")]
+                ppid = s[s.rindex(")") + 2:].split()[1]
+                kids.setdefault(ppid, []).append((d, comm))
+            except (OSError, ValueError, IndexError):
+                continue
+        q = [str(pane_pid)]
+        while q:
+            for pid, comm in kids.get(q.pop(), []):
+                q.append(pid)
+                if comm == "claude":
+                    try:
+                        argv = open(f"/proc/{pid}/cmdline").read().split("\0")
+                    except OSError:
+                        return True
+                    if "-p" not in argv and "--print" not in argv:
+                        return True
+        return False
+
+    def press(self, wid, key):
+        return self.run("send-keys", "-t", wid, "-l", "--", key) is not None
+
+
+def raise_row(repo, name, title, brief):
+    board = os.environ.get("CC_STALL_BOARD") or f"{BIN}/cc-board"
+    try:
+        r = subprocess.run([board, "add", repo, name, title, brief], capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "CC_BRIEF_MACHINE": "1"}, stdin=subprocess.DEVNULL)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def row_name(window, kind, now=None):
+    """One row per stall: the minute it was raised is part of the name, so a later stall of the same kind in the
+    same window never lands in the first one's (maybe closed) row."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", window).strip("-") or "window"
+    head = "raised-stall-"
+    stamp = time.strftime("%m%d%H%M", time.gmtime(time.time() if now is None else now))
+    tail_ = "-" + kind + "-" + stamp
+    return head + slug[:64 - len(head) - len(tail_)] + tail_
+
+
+def tail(screen, n=12):
+    lines = [l for l in (screen or "").splitlines() if l.strip()]
+    return lines[-n:]
+
+
+def known(screen):
+    """The KNOWN row this screen shows live, or None. A permission word anywhere vetoes the whole table."""
+    if any(m in screen for m in PERMISSION_MARKS):
+        return None
+    last = tail(screen, 1)
+    for name, marks, footer, key in KNOWN:
+        if all(m in screen for m in marks) and last and footer in last[0]:
+            return name, key
+    return None
+
+
+def is_dialog(screen):
+    return any(m in l for l in tail(screen) for m in DIALOG_MARKS)
+
+
+def question(screen):
+    """The dialog's first line worth quoting (the top of the bottom block), for the row."""
+    for l in tail(screen):
+        s = l.strip(" │─╭╮╰╯")
+        if s and not s.startswith("─"):
+            return s[:160]
+    return "(unreadable)"
+
+
+def report(st, key, repo, window, kind, what, detail, apply_):
+    """Raise the row once per stall. True when this pass raised it."""
+    ent = st.setdefault(key, {})
+    if ent.get("told") or ent.get("tries", 0) >= TRIES:
+        return False
+    name = row_name(window, kind)
+    title = f"main:{window} is stuck: {what}"
+    brief = (f"GOAL: main:{window} runs again, and whatever stalled it is fixed at its cause.\n"
+             f"WHY: cc-stall saw it at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}: {what}. "
+             f"The screen: {detail}\n"
+             f"DONE: the window takes a turn again, and the cause is fixed or written up.")
+    print(f"  stuck      main:{window:<24} {kind:<7} {what}")
+    if not apply_:
+        return False
+    if raise_row(repo, name, title, brief):
+        ent["told"] = True
+        log(f"{window}\t{kind}\traised {repo}/{name}\t{what}")
+        return True
+    ent["tries"] = ent.get("tries", 0) + 1
+    log(f"{window}\t{kind}\tboard refused {repo}/{name} (try {ent['tries']})")
+    return False
+
+
+def check_window(t, st, now, repo, win, apply_):
+    wid, name, pane_pid, in_mode = win
+    # ── the relaunch loop, read from scrollback whatever runs in the pane now ──
+    hist = t.history(wid)
+    if hist is not None:
+        n = len(RELAUNCH_RE.findall(hist))
+        lp = st.setdefault(f"{name}\tloop", {})
+        prev, prev_t = lp.get("count"), lp.get("t", 0)
+        if prev is None or n < prev or now - prev_t > LOOP_GAP:
+            grew = 0                                   # first look, a cleared history or a long gap: a new baseline
+        else:
+            grew = n - prev
+        lp["count"], lp["t"] = n, now
+        lp["streak"] = lp.get("streak", 0) + 1 if grew > 0 else 0
+        if grew >= LOOP_MIN or lp["streak"] >= LOOP_STREAK:
+            report(st, f"{name}\tloop", repo, name, "loop", f"relaunched {grew} time(s) since the last look",
+                   " | ".join(tail(hist, 4)), apply_)
+        if grew > 0:
+            lp.pop("still_since", None)
+        else:                                          # a pass inside one cc-rc backoff sees no growth either:
+            lp.setdefault("still_since", now)          # re-arm only once the count has stood still longer than that
+            if now - lp["still_since"] > LOOP_REARM:
+                lp.pop("told", None); lp.pop("tries", None)
+    # ── a dialog at a live session ──
+    dk = f"{name}\tdialog"
+    if in_mode or not t.live_claude(pane_pid):
+        if not in_mode:
+            st.pop(dk, None)                           # nothing live to be stuck; a scroller is left as found
+        return
+    scr = t.screen(wid)
+    if scr is None:
+        return
+    if WORKING in scr or not is_dialog(scr):
+        st.pop(dk, None)                               # mid-turn, or free: healthy
+        return
+    k = known(scr)
+    if k and apply_ and not st.get(dk, {}).get("pressed"):
+        t.press(wid, k[1])
+        log(f"{name}\t{k[0]}\tpressed {k[1]!r}")
+        print(f"  cleared    main:{name:<24} {k[0]}")
+        time.sleep(SETTLE)
+        after = t.screen(wid)
+        if after is not None and not is_dialog(after):
+            st.pop(dk, None)
+            return
+        st.setdefault(dk, {})["pressed"] = True        # still up after its key: unknown from here on
+        scr = after or scr
+    elif k and not apply_:
+        print(f"  would clear main:{name:<23} {k[0]}")
+        return
+    h = hashlib.sha1("\n".join(tail(scr)).encode()).hexdigest()[:12]
+    d = st.setdefault(dk, {})
+    if d.get("hash") != h:
+        d.update({"hash": h, "first": now, "passes": 0}); d.pop("told", None); d.pop("tries", None)
+    d["passes"] = d.get("passes", 0) + 1
+    if d["passes"] >= 2 and now - d["first"] >= STAND_S:
+        report(st, dk, repo, name, "dialog", f"a dialog has stood {int(now - d['first']) // 60} min", question(scr),
+               apply_)
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(st):
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE))
+        with os.fdopen(fd, "w") as f:
+            json.dump(st, f, indent=1)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def run(t, apply_, now=None):
+    st = load() if apply_ else {}
+    now = now or time.time()
+    repo = ctl()
+    wins = t.windows()
+    for w in wins:
+        try:
+            check_window(t, st, now, repo, w, apply_)
+        except Exception as e:                         # one odd window never stops the pass
+            log(f"{w[1]}\terror\t{e.__class__.__name__}: {e}")
+    names = {w[1] for w in wins}
+    for k in [k for k in st if k.split("\t")[0] not in names]:
+        del st[k]                                      # a window that is gone takes its stalls with it
+    if apply_:
+        save(st)
+    return st
+
+
+# ── selfcheck ─────────────────────────────────────────────────────────────────────────────────────────────────
+DEV = """────────────────────────────────
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development only.
+
+  Channels: server:cc-slack
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm · Esc to cancel
+"""
+READY = """ ▐▛███▛█   Claude Code
+❯ Try "fix typecheck errors"
+  ⏵⏵ auto mode on (shift+tab to cycle)
+"""
+BUSY = "⏺ Reading files…\n  ✻ Thinking… (esc to interrupt)\n"
+ODD = "  Something new happened\n\n  ❯ 1. Carry on\n    2. Stop\n\n  Enter to confirm · Esc to cancel\n"
+PERM = "  Do you want to make this edit?\n  WARNING: Loading development channels\n  1. I am using this for local development\n  2. Exit\n  Enter to confirm · Esc to cancel\n"
+
+
+class Fake:
+    def __init__(self):
+        self.wins, self.scr, self.hist, self.live, self.keys, self.after = [], {}, {}, {}, [], {}
+
+    def add(self, name, scr, hist="", live=True, mode=False, after=None):
+        wid = f"@{len(self.wins)}"
+        self.wins.append((wid, name, wid, mode)); self.scr[wid] = scr; self.hist[wid] = hist
+        self.live[wid] = live; self.after[wid] = after
+        return wid
+
+    def windows(self): return list(self.wins)
+    def screen(self, wid): return self.scr[wid]
+    def history(self, wid): return self.hist[wid]
+    def live_claude(self, pid): return self.live[pid]
+
+    def press(self, wid, key):
+        self.keys.append((wid, key))
+        if self.after[wid] is not None:
+            self.scr[wid] = self.after[wid]
+        return True
+
+
+def selfcheck():
+    global STATE, LOG, SETTLE
+    d = tempfile.mkdtemp(prefix="cc-stall-sc.")
+    STATE, LOG, SETTLE = f"{d}/stall.json", f"{d}/stall.log", 0
+    rows = f"{d}/rows"
+    stub = f"{d}/board"
+    with open(stub, "w") as f:
+        f.write(f"#!/bin/sh\n[ -f {d}/refuse ] && exit 1\nprintf '%s|%s|%s\\n' \"$3\" \"$4\" \"$CC_BRIEF_MACHINE\" >> {rows}\n")
+    os.chmod(stub, 0o755)
+    os.environ.update(CC_STALL_BOARD=stub, CC_STALL_REPO="ctl")
+    ok = bad = 0
+
+    def k(cond, what):
+        nonlocal ok, bad
+        if cond:
+            ok += 1
+        else:
+            bad += 1; print(f"FAIL: {what}")
+
+    def raised():
+        try:
+            return open(rows).read().splitlines()
+        except OSError:
+            return []
+
+    def fresh():
+        for p in (STATE, rows, f"{d}/refuse"):
+            if os.path.exists(p):
+                os.remove(p)
+
+    import io, contextlib
+    q = contextlib.redirect_stdout(io.StringIO())
+
+    # 1 the dev-channels dialog at a live claude is cleared with the digit 1, and raises nothing
+    fresh(); t = Fake(); w = t.add("box", DEV, after=READY)
+    with q: run(t, True, 1000)
+    k(t.keys == [(w, "1")], "dev-channels dialog: the digit 1, once — never Up, which wraps to 2. Exit")
+    k(raised() == [], "…and a dialog it cleared raises no row")
+    # 2 …but not at a DEAD pane that still shows it (the 2026-09-23 loop pressed into exactly that)
+    fresh(); t = Fake(); t.add("box", DEV + "\nclaude exited (1) - restarting in 15s\n", live=False)
+    with q: run(t, True, 1000)
+    k(t.keys == [], "a dead pane still showing the dialog gets no key")
+    # 3 …nor with its footer not at the bottom, nor with a permission word on the screen, nor in copy mode, nor bare
+    for scr, what in ((DEV + "\n❯ typed by the owner\n", "footer not at the bottom"), (PERM, "a permission word")):
+        fresh(); t = Fake(); t.add("box", scr)
+        with q: run(t, True, 1000)
+        k(t.keys == [], f"no key with {what}")
+    fresh(); t = Fake(); t.add("box", DEV, mode=True)
+    with q: run(t, True, 1000)
+    k(t.keys == [], "no key into a pane somebody is scrolling")
+    fresh(); t = Fake(); t.add("box", DEV)
+    with q: run(t, False, 1000)
+    k(t.keys == [] and raised() == [], "without --apply: nothing pressed, nothing raised")
+    # 4 a known dialog that stays up after its key is unknown from then on: never pressed twice, raised once
+    fresh(); t = Fake(); w = t.add("box", DEV, after=DEV)
+    with q:
+        for s in (1000, 1120, 1240, 1360):
+            run(t, True, s)
+    k(t.keys == [(w, "1")], "a known dialog its key did not close is pressed once, not every pass")
+    k(len(raised()) == 1 and re.match(r"raised-stall-box-dialog-\d{8}\|", raised()[0]), "…and raised once, as a dialog")
+    # 5 an unknown dialog: nothing pressed, raised once after STAND_S and two passes, never again while it stands
+    fresh(); t = Fake(); t.add("proj@voice", ODD)
+    with q:
+        run(t, True, 1000)
+        k(raised() == [], "an unknown dialog seen once is not raised yet")
+        run(t, True, 1000 + STAND_S)
+        run(t, True, 1000 + STAND_S + 120); run(t, True, 1000 + STAND_S + 240)
+    k(t.keys == [], "an unknown dialog gets no key")
+    r = raised()
+    k(len(r) == 1 and re.fullmatch(r"raised-stall-proj-voice-dialog-\d{8}", r[0].split("|")[0]) and r[0].endswith("|1"),
+      f"an unknown dialog is raised once, a machine row named after its window: {r}")
+    k("main:proj@voice is stuck" in (r[0] if r else ""), "…and its title names the window")
+    # …it closes and comes back: a new stall, a new report
+    t.scr["@0"] = READY
+    with q: run(t, True, 2000)
+    t.scr["@0"] = ODD
+    with q: run(t, True, 2100); run(t, True, 2100 + STAND_S)
+    k(len(raised()) == 2, "the same dialog back after it closed is a new stall, raised again")
+    # 6 a relaunch loop: raised once while it runs, re-armed when it stops
+    fresh(); t = Fake(); line = "claude exited (1) - restarting in 15s (Ctrl-C for a shell)\n"
+    t.add("box", "$ ", hist=line, live=False)
+    with q:
+        run(t, True, 1000)
+        t.hist["@0"] = line * 5; run(t, True, 1120)
+    r = raised()
+    k(len(r) == 1 and re.match(r"raised-stall-box-loop-\d{8}\|", r[0]), f"a relaunch loop is raised: {r}")
+    k(t.keys == [], "…and nothing is pressed for it")
+    with q:
+        t.hist["@0"] = line * 9; run(t, True, 1240)
+    k(len(raised()) == 1, "a loop still running is not raised a second time")
+    with q:
+        run(t, True, 1360)
+        t.hist["@0"] = line * 13; run(t, True, 1480)
+    k(len(raised()) == 1, "one still pass inside a backoff does not re-arm the report")
+    with q:
+        for s in (1600, 1720, 1840, 1960):
+            run(t, True, s)
+        t.hist["@0"] = line * 17; run(t, True, 2080)
+    k(len(raised()) == 2, "a loop that stopped past LOOP_REARM and started again is a new stall")
+    # a slow loop in cc-rc's 120 s backoff: +1 on most passes, a 0 between, raised exactly once
+    fresh(); t = Fake(); t.add("box", "$ ", hist=line, live=False); n, s = 1, 1000
+    with q:
+        for g in (0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1):
+            n += g; t.hist["@0"] = line * n; run(t, True, s); s += 150
+    k(len(raised()) == 1, f"a slow loop with a still pass between relaunches is raised once: {raised()}")
+    # a slow one: one relaunch per pass, three passes running
+    fresh(); t = Fake(); t.add("box", "$ ", hist=line, live=False)
+    with q:
+        for i, s in enumerate((1000, 1120, 1240, 1360)):
+            t.hist["@0"] = line * (1 + i); run(t, True, s)
+    k(len(raised()) == 1, "one relaunch on each of three passes running is a loop too")
+    # the first look, a cleared history and a long gap are baselines, not growth
+    fresh(); t = Fake(); t.add("box", "$ ", hist=line * 40, live=False)
+    with q:
+        run(t, True, 1000)
+        t.hist["@0"] = line * 44; run(t, True, 1000 + LOOP_GAP + 1)
+    k(raised() == [], "an old count seen first, or after a long gap, raises nothing")
+    # 7 a healthy session — ready, or mid-turn — is left alone, and its state dropped
+    fresh(); t = Fake(); t.add("box", READY, hist=line); t.add("lessons", BUSY)
+    with q:
+        for s in (1000, 1120, 1240, 1360):
+            run(t, True, s)
+    k(t.keys == [] and raised() == [], "a ready session and a busy one: no key, no row")
+    k(not any("dialog" in x for x in load()), "…and no dialog state kept for them")
+    # 8 a board that refuses: tried again next pass, TRIES times at most
+    fresh(); open(f"{d}/refuse", "w").close(); t = Fake(); t.add("box", ODD)
+    with q:
+        for i in range(8):
+            run(t, True, 1000 + i * STAND_S)
+    st = load()
+    k(st.get("box\tdialog", {}).get("tries") == TRIES, f"a refused row is retried {TRIES} times, then left: {st}")
+    # 9 a window that is gone takes its state with it; a long window name still makes a dispatchable row name
+    t.wins = []
+    with q: run(t, True, 9000)
+    k(load() == {}, "a window gone from tmux leaves no state")
+    k(len(row_name("x" * 90, "dialog")) <= 64 and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}",
+      row_name("lessons/ece203 x", "loop")), "row names stay inside cc's valid_name")
+    k(row_name("box", "loop", 1000) != row_name("box", "loop", 1000 + 3600),
+      "a later stall of the same kind in the same window gets a row of its own, never the first one's")
+    # 10 one broken window does not stop the pass
+    fresh(); t = Fake(); t.add("bad", ODD); t.add("box", DEV, after=READY)
+    orig = t.history
+    t.history = lambda wid: (_ for _ in ()).throw(RuntimeError("boom")) if wid == "@0" else orig(wid)
+    with q: run(t, True, 1000)
+    k(t.keys == [("@1", "1")], "a window that throws is logged and skipped; the next is still cleared")
+
+    # 11 the other half of the 2026-09-23 fix: cc-rc beside this copy clears the dead screen before it starts
+    # accept-dialog, so the dialog text that one reads is the new claude's, never the last one's
+    try:
+        rc = open(f"{BIN}/cc-rc").read()
+        k(-1 < rc.find("printf '\\033[H\\033[2J'") < rc.find("accept-dialog box"),
+          "cc-rc clears the screen before each launch's accept-dialog")
+    except OSError:
+        k(False, "cc-rc is beside cc-stall")
+
+    print(f"cc-stall selfcheck: {ok} passed, {bad} failed")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv and argv[0] not in ("--apply",):
+        print(__doc__.split("\n\n")[0], file=sys.stderr)
+        return 2
+    try:
+        run(Tmux(), "--apply" in argv)
+    except Exception as e:                             # a timer job never goes red over one bad read
+        log(f"-\terror\t{e.__class__.__name__}: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
