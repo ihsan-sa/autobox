@@ -51,7 +51,7 @@ The `!` commands are `!pause`/`!resume` (each also as `-only` and `-under`), `!r
 `!pause` parks this channel's project and everything declared under it, queuing what arrives; `!resume` unparks it; a project parked on its own stays parked when its parent resumes.
 `!pause-only`/`!resume-only` stop at this project and leave what is under it exactly as it was; `!pause-under`/`!resume-under` say the walk out loud and mean what the bare verbs already do. Either way the answer ends with a `Reach:` line naming how far it went, so nobody has to predict it from CC_PROJECT_CHILDREN.
 ~/.cc/state/home.json is the box's one live view and the dashboard reads it: rewritten every 30 s and within 2 s of any event, leading with what needs the owner, then running/idle counts, the backlog, the channels, load, handoff count, audit and boot. There is no Slack App Home tab: the daemon publishes a one-line pointer to the dashboard once at start and never again.
-While a handoff overlap is open on a target, only the session the record calls live is delivered to (permission answers included); the muted one's reply/react/file are refused.
+While a handoff overlap is open on a target, only the session the record calls live is delivered to (permission answers included); the muted one's reply/react/file are refused. The muted one is never delivered to, even alone: a message with no live side subscribed is held and handed over at the cutover (cc-handoff's `{"cutover"}` word, or the 30 s tick) or at the live side's hello. At the cutover the successor also gets what the predecessor was handed from 10 min before the overlap and never answered (no box post in its thread, no box reaction but 👀 on it, no 👍 from a woken turn), with a line saying so. An orch is a seat of its own: it reads its own record, `<repo>@<alias>`, never the repo's.
 See ~/COMMS.md and ~/USAGE.md.
 
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
@@ -2065,6 +2065,19 @@ def handoff_muted(rec, handoff_id):
     side = "successor" if handoff_id and handoff_id == rec.get("id") else "predecessor"
     return side != ("successor" if rec.get("live") == "successor" else "predecessor")
 
+
+def handoff_key(target, alias=None):
+    """Which record speaks for a seat: `<target>` for the repo's own or a track, `<target>@<alias>` for an orch."""
+    return f"{target}@{alias}" if alias else target
+
+
+def _tsf(ts):
+    """A Slack ts as a number to order by; anything unreadable sorts first."""
+    try:
+        return float(ts or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
 # ---------------------------------------------------------------- daemon
 class Conn:
     def __init__(self, sock, target, info):
@@ -3417,6 +3430,7 @@ class Daemon:
         self.subs = collections.defaultdict(list)          # target -> [Conn]
         self.member_srv = {}                                # handle -> its socket at DIR/member/<h>/sock, the boundary's one door
         self.queues = collections.defaultdict(collections.deque)   # target -> deque[(t, payload, alias)]
+        self.given = collections.defaultdict(list)          # target -> [Given] its unaliased session was handed (rehand_at_cutover)
         self.execs = collections.OrderedDict()               # chat -> ThreadPoolExecutor(1): message/edit events stay in order per chat
         self.seen = collections.OrderedDict()
         self.last_chat = load_last()                        # target -> (chat, root) it last heard from: permission_chat's lane, home.json's channel list
@@ -3662,11 +3676,12 @@ class Daemon:
     # THE OUTCOMES OF deliver() THAT WAKE SOMEBODY, and the ones where nobody is there by design. The brief
     # (a-post-that-wakes-nobody-is-recorded-by-cc-slack, 2026-09-12): "resolves to nobody woken (the outcome of
     # deliver that means no session picked it up, within a short window)" — `spooled` and `starting` are picked up
-    # inside that window (cc-msg's drain, the session's first hello), so they wake; "a post spooled for a channel
+    # inside that window (cc-msg's drain, the session's first hello), so they wake, and so does `held`, which the live
+    # side of a handoff is handed at its cutover or its hello (handoff_sweep); "a post spooled for a channel
     # that has no session by design is not a failure" — `paused` is the owner's cc-pause, `no-credential` a
     # workspace he has not minted. Everything else with a target — queued, no-session, live-no-channel, no-track, and
     # a verdict these lists do not know — is a post the sender believed handed over and nobody took: recorded.
-    WOKEN = ("delivered", "typed", "spooled", "starting")
+    WOKEN = ("delivered", "typed", "spooled", "starting", "held")
     NOBODY_BY_DESIGN = ("paused", "no-credential")
     NOBODY_WOKEN_KIND = "channel-wake/nobody-woken"
 
@@ -3705,6 +3720,7 @@ class Daemon:
         first tool call of the turn the post woke (Channel.woke_by / ack_woken)."""
         if not chat or not ts:
             return
+        self.mark_answered(chat, ts=ts)                  # the turn that read it took it on: no re-hand at a cutover
         self._safe(react, self.cfg, chat, ts, "+1")
         log(f"ack {target}{'@' + alias if alias else ''}: 👍 on {chat}/{ts}")
 
@@ -3725,7 +3741,7 @@ class Daemon:
                 "seat": f"{seat[0]}@{seat[1]}" if seat[1] else seat[0]}
 
     MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send", "ask")
-    OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "grant", "mail", "mailed", "wake", "mention", "sender")
+    OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "grant", "mail", "mailed", "wake", "mention", "sender", "cutover")
 
     def verbs_of(self, first):
         """Every recognised verb key in a request. Exactly one is allowed, because exactly one is authorised: else
@@ -4061,6 +4077,9 @@ class Daemon:
                 if ask:                  # a reply in a member's ask thread is carried to the member (answer_ask)
                     res["ask"] = ask
                 c.sendall((json.dumps(res) + "\n").encode())
+            elif verb == "cutover":      # {"cutover": target} — cc-handoff, the moment its record calls the successor live
+                self.handoff_sweep(str(first["cutover"] or ""))
+                c.sendall(b'{"ok":true}\n')
             elif verb == "sender":       # {"sender": chat|""} — `cc-slack post` asking who it is, before it posts
                 c.sendall((json.dumps(self.sender(str(first.get("sender") or ""), self.peer_of(c))) + "\n").encode())
             elif verb == "permission":   # {"permission": "<request_id>", "answer": "yes"|"no"} — same path a Slack
@@ -4096,17 +4115,116 @@ class Daemon:
 
     def live_conns(self, target, conns):
         """One channel, one voice: during a handoff overlap, only the conn the record calls live gets delivery.
-        The muted one could double-answer or steal a permission answer; matters only with >1 candidate.
-        A lone conn delivers regardless (survivor promoted); an aliased conn is an orch, left alone."""
-        sides = [c for c in conns if not (c.info.get("alias") or None)]
-        if len(sides) < 2:
-            return conns
-        rec = handoff_record(target)
-        if rec is None:
-            return conns                                   # no overlap open: exactly today's path
-        live = [c for c in sides if not handoff_muted(rec, c.info.get("handoff"))]
-        keep = min(live or sides, key=lambda c: c.info.get("since") or 0)   # nobody live → the earliest subscriber, i.e. the predecessor
-        return [c for c in conns if c is keep or (c.info.get("alias") or None)]
+        The muted one could double-answer or steal a permission answer, and whatever it is handed sits in a pane
+        whose every reply is refused. So the muted side is NEVER promoted, not even when it is the only conn left:
+        with the live side unsubscribed the unaliased side gets nobody here, and deliver() holds the message for
+        it (the brief, 2026-09-24: "it is queued and delivered to the successor at --ready … never left sitting in
+        a muted pane"). Each alias is its own seat with its own record: the repo's is `<target>`, an orch's is
+        `<target>@<alias>` (cc-handoff hands an orch off like any seat), so the repo's handoff never mutes an orch."""
+        keep = set()
+        for alias in dict.fromkeys((c.info.get("alias") or None) for c in conns):
+            group = [c for c in conns if (c.info.get("alias") or None) == alias]
+            rec = handoff_record(handoff_key(target, alias))
+            if rec is None:
+                keep.update(map(id, group))               # no overlap open: exactly today's path
+                continue
+            live = [c for c in group if not handoff_muted(rec, c.info.get("handoff"))]
+            if live:
+                keep.add(id(min(live, key=lambda c: c.info.get("since") or 0)))
+        return [c for c in conns if id(c) in keep]
+
+    # A MESSAGE HANDED TO A SEAT THAT IS ABOUT TO BE MUTED. A session mid-turn takes a channel message into its
+    # input and reads it when the turn ends; a predecessor that cuts over first reads it muted, where its answer is
+    # refused, and then it is retired. So what the unaliased side of a target is handed is remembered (Given) until
+    # something answers it — a box post in its thread, a box reaction other than 👀 on it, the 👍 a woken turn
+    # leaves (ack_post) — and at the cutover whatever the predecessor was handed from REHAND_BEFORE ahead of the
+    # overlap and never answered goes to the successor (rehand). A post answered at the top level of the channel
+    # rather than in the thread still reads as unanswered: the successor is told to check the thread first, which
+    # costs a look, where dropping it cost the owner the message.
+    GIVEN_KEEP = 30 * 60        # how long a handed message is remembered: past the overlap's cap and the drain
+    REHAND_BEFORE = 10 * 60     # how far ahead of the overlap a message the predecessor still holds is carried over
+
+    def remember_given(self, target, conn, payload):
+        meta = payload.get("meta") or {}
+        if payload.get("type") != "message" or not meta.get("ts"):
+            return
+        alias, now = conn.info.get("alias") or None, time.time()
+        key = handoff_key(target, alias)
+        with self.lock:
+            keep = [g for g in self.given[key] if now - g["t"] < self.GIVEN_KEEP]
+            keep.append({"t": now, "payload": payload, "alias": alias, "hid": conn.info.get("handoff") or None,
+                         "answered": False})
+            self.given[key] = keep[-50:]
+
+    def mark_answered(self, chat, ts=None, thread=None, after=None):
+        """A box post in (chat, thread) after a handed message's ts, or a reaction on exactly (chat, ts)."""
+        if not chat:
+            return
+        with self.lock:
+            for gs in self.given.values():
+                for g in gs:
+                    m = g["payload"].get("meta") or {}
+                    if m.get("chat_id") != chat:
+                        continue
+                    if ts and m.get("ts") == ts:
+                        g["answered"] = True
+                    elif thread and (m.get("thread_ts") or m.get("ts")) == thread and _tsf(after) > _tsf(m.get("ts")):
+                        g["answered"] = True
+
+    def handoff_sweep(self, only=None):
+        """The cutover's delivery, run when cc-handoff says it cut over ({"cutover": target}) and on every 30 s tick
+        (the fallback when that word never came). Per target: once the record calls the successor live, the
+        predecessor's unanswered messages are re-handed to it (rehand), then whatever deliver() held while no live
+        side was subscribed goes to whoever is live now — the successor after the cutover, the only session after
+        the record clears. A target still without a live conn keeps its queue for that conn's hello."""
+        mine = lambda t: only is None or t == split_orch(only)[0]    # the word names a record; a queue is keyed by target
+        with self.lock:
+            keys = [k for k in self.given if mine(split_orch(k)[0])]
+            targets = [t for t, q in self.queues.items() if q and mine(t)]
+        for key in keys:
+            rec = handoff_record(key)
+            if rec is None or rec.get("live") != "successor" or not rec.get("id"):
+                continue
+            since = float(rec.get("started") or 0) - self.REHAND_BEFORE
+            with self.lock:
+                gs = self.given.get(key) or []
+                todo = [g for g in gs if not g["answered"] and g["hid"] != rec["id"] and g["t"] >= since]
+                self.given[key] = [g for g in gs if g not in todo]
+            for g in todo:
+                self.deliver(split_orch(key)[0], self.rehand(g), autostart=False, alias=g["alias"])
+        for t in targets:
+            if paused(t):
+                continue
+            with self.lock:
+                q = list(self.queues.get(t) or [])
+                subs = list(self.subs.get(t, []))
+            ready = {a for a in {e[2] for e in q}
+                     if self.live_conns(t, [c for c in subs if (c.info.get("alias") or None) == a])}
+            if not ready:
+                continue
+            with self.lock:
+                q = self.queues.get(t)
+                out = [e for e in (q or []) if e[2] in ready]
+                for e in out:
+                    q.remove(e)
+                if out:
+                    self.save_queues()
+            for when, payload, alias in out:
+                if time.time() - when >= QUEUE_TTL:
+                    self.expired(t, payload, "waited past what the queue keeps")
+                    continue
+                res = self.deliver(t, payload, autostart=False, alias=alias)
+                log(f"handoff_sweep {t}{'@' + alias if alias else ''}: held message {res}")
+
+    @staticmethod
+    def rehand(g):
+        """The predecessor's unanswered message, as the successor gets it: the same meta, so its reply lands in the
+        thread the message came from, and one line saying why it arrives twice-removed."""
+        p = dict(g["payload"])
+        when = time.strftime("%H:%MZ", time.gmtime(g["t"]))
+        p["content"] = (f"[handed to your predecessor at {when}, before the cutover, and not answered there — it is "
+                        f"muted now, so this is yours; check its thread and the board first in case it did act] " + str(p.get("content") or ""))
+        return p
 
     def deliver(self, target, payload, autostart=True, alias=None):
         # Parked project's message goes to the durable queue (save_queues), exempt from TTL sweep.
@@ -4123,12 +4241,19 @@ class Daemon:
         for conn in conns:
             try:
                 conn.send(payload); sent += 1
+                self.remember_given(target, conn, payload)
             except Exception:
                 with self.lock:
                     if conn in self.subs[target]:
                         self.subs[target].remove(conn)
         if sent:
             return "delivered"
+        if payload.get("type") == "message" and handoff_record(handoff_key(target, alias)) is not None:
+            # mid-handoff with no live side subscribed: never the keyboard of whichever pane holds the name, never
+            # a third session — held for the live side, which handoff_sweep or its own hello hands it to
+            with self.lock:
+                self.queues[target].append((time.time(), payload, alias)); self.save_queues()
+            return "held"
         typed = self.type_into_pane(target, payload, alias)   # a session running WITHOUT the channel: the keyboard is
         if typed:                                             # the only door left, and cc-msg never drops what it takes
             return typed
@@ -4506,6 +4631,7 @@ class Daemon:
             # our own signed posts (username override => bot_message): ownership bookkeeping only, never work — this is how "@main over to you" flips a thread back
             chat0, ts0 = ev.get("channel"), ev.get("ts")
             if chat0 and ts0 and ev.get("bot_id") and ev.get("bot_id") == self.bot_id:   # another app's bot must not flip ownership
+                self.mark_answered(chat0, thread=ev.get("thread_ts") or ts0, after=ts0)   # a handed message answered in its thread
                 target0 = self.route(chat0, ev.get("channel_type"))
                 text0 = self.clean(ev.get("text") or "")
                 if target0 and at_token(text0, self.bot_user):
@@ -4774,7 +4900,7 @@ class Daemon:
             # every message, not throttled: this answers what they just asked, in their own thread, and stays true until the owner mints — the channel only hears it once (cc's stamp), so this is what keeps a member from talking to a wall
             self.say(chat, MINT_LINE.format(h=workspace_of(target) or target), thread, mail=False)
             return
-        if res in ("starting", "spooled"):
+        if res in ("starting", "spooled", "held"):
             # the message is queued and the session takes it in a moment, and its answer is the reply: a "⏳ starting…" or
             # "mid-turn, queued" line before it was narration, cut (owner's review, 2026-09-20). The 👀 above says it arrived.
             log(f"hand_off {target}: {res}")
@@ -4819,7 +4945,7 @@ class Daemon:
         r2 = self.deliver(repo, {"type": "message", "meta": dict(meta, target=repo),
                                  "content": f"[asked in {chan} {where}] {payload.get('content') or ''}"})
         log(f"{res} {target}: handed to {repo} ({r2})")
-        if r2 in ("delivered", "typed", "spooled", "starting") and chat and ts:
+        if r2 in self.WOKEN and chat and ts:
             hit = self.find_queued(chat, ts, only=target)
             if hit:
                 with self.lock:
@@ -5420,6 +5546,8 @@ class Daemon:
         who = ev.get("user")
         removed = ev.get("type") == "reaction_removed"
         if who is not None and who == self.bot_user:
+            if not removed and ev.get("reaction") != "eyes":   # 👀 is the daemon's own "it arrived", not a session's answer
+                self.mark_answered(chat, ts=ts)
             return None
         if not (who and chat and ts):
             return None
@@ -5764,7 +5892,7 @@ class Daemon:
                 # deliver() says "no-session" when nothing can start it; hand to the repo as a live message would.
                 if r == "no-session":
                     r = self.hand_to_repo(t, payload, r) or r
-                sent += r in ("delivered", "typed", "spooled", "starting")
+                sent += r in self.WOKEN
         return sent
 
     def cmd_reboot(self, arg, chat, thread):
@@ -5827,6 +5955,7 @@ class Daemon:
 
     def loop_tick(self, n):
         self.unstick()                                   # a started session that never subscribed may be waiting on a prompt
+        self._safe(self.handoff_sweep)                   # a cutover whose {"cutover"} word never came: its messages go now
         if n % 30 == 0:                                  # every 15 min: archive idle sub-orch channels, open member projects' threads
             self._safe(self.orch_sweep)
             self._safe(self.projects_sweep)
@@ -6851,10 +6980,8 @@ class Channel:
             await self.send({"jsonrpc": "2.0", "id": id_, "error": {"code": -32601, "message": f"unknown method {m}"}})
 
     def muted(self):
-        """The non-live side of an open handoff may read Slack but must not speak into it; these tools call the Slack API directly so they carry their own mute. An orch has its own channel and is never muted."""
-        if self.alias:
-            return False
-        rec = handoff_record(self.target)
+        """The non-live side of an open handoff may read Slack but must not speak into it; these tools call the Slack API directly so they carry their own mute. An orch reads its own record (handoff_key), never the repo's."""
+        rec = handoff_record(handoff_key(self.target, self.alias))
         return rec is not None and handoff_muted(rec, self.handoff)
 
     def woke_by(self, meta):

@@ -1795,9 +1795,11 @@ def run_selfcheck():
         dmH6, gotH6 = two_sides()
         rec_write("r", "predecessor")
         dmH6.subs["r"] = [c for c in dmH6.subs["r"] if c.info.get("handoff")]   # the live session's conn is gone
-        dmH6.deliver("r", {"type": "message", "content": "who answers?"}, autostart=False)
-        check("handoff: the last conn standing is promoted, not muted — nothing is queued for a session that is "
-              "gone — H6", gotH6 == ["suc"])
+        dmH6.queues.clear()
+        resH6 = dmH6.deliver("r", {"type": "message", "content": "who answers?"}, autostart=False)
+        check("handoff: the muted side is never promoted, even as the last conn standing — its every reply would be "
+              "refused — so the message is held for the live side, not typed into a pane or started over — H6",
+              gotH6 == [] and resH6 == "held" and len(dmH6.queues["r"]) == 1)
         dmH7 = Daemon(use_slack=False); dmH7.queues.clear()   # an earlier case's save_queues() is in this run's scratch DIR
         liveH7 = Conn(None, "r", {"alias": None, "handoff": None, "since": 1.0}); liveH7.send = lambda p: None
         dmH7.subs["r"] = [liveH7]
@@ -1823,6 +1825,124 @@ def run_selfcheck():
         txtH9, errH9 = chH.call("reply", {"chat_id": "C1", "text": "hi"})
         check("handoff: one os.replace() later the same session speaks — the mute is the record, nothing else — H9",
               not errH9 and "logged" in txtH9)
+
+        # ---- HP: A MESSAGE AT EVERY PHASE OF A HANDOFF REACHES EXACTLY ONE LIVE TURN (the brief, 2026-09-24: "every
+        #      channel message that arrives from overlap start to retire reaches exactly one live turn … it wakes an
+        #      idle successor. A message is never dropped or left sitting in a muted pane"). Each case builds its own
+        #      pair of seats. A seat's "turn" is modelled by what it could answer: a message it holds counts only if
+        #      the record called that side live when the seat READ it, and a mid-turn predecessor reads after the
+        #      cutover, muted — which is the loss the re-hand exists for.
+        def seats(target, with_pre=True, with_suc=True):
+            got = {"pre": [], "suc": []}
+            conns = []
+            for who, hid, since in (("pre", None, 100.0), ("suc", "h1", 200.0)):
+                if (who == "pre" and not with_pre) or (who == "suc" and not with_suc):
+                    continue
+                cn = Conn(None, target, {"alias": None, "handoff": hid, "since": since})
+                cn.send = (lambda w: lambda p: got[w].append(p))(who)
+                conns.append(cn)
+            dm = Daemon(use_slack=False); dm.queues.clear(); dm.given.clear()
+            dm.subs[target] = conns
+            return dm, got
+        def msg(text, ts, thread=None):
+            return {"type": "message", "content": text,
+                    "meta": {"chat_id": "CHP", "ts": ts, "thread_ts": thread or ts, "user": "U1", "role": "owner"}}
+        texts = lambda ps: [p["content"] for p in ps]
+        # HP1 before the overlap: one seat, one delivery — and a message it answers is never handed on at a cutover
+        dmP1, gotP1 = seats("hp1", with_suc=False)
+        if os.path.exists(f"{hdir}/hp1.json"):
+            os.remove(f"{hdir}/hp1.json")
+        rP1 = dmP1.deliver("hp1", msg("before the overlap", "10.1"), autostart=False)
+        dmP1.bot_id, dmP1.bot_user = "BHP", "UHP"
+        with offline_slack():
+            dmP1.on_event({"type": "message", "subtype": "bot_message", "channel": "CHP", "ts": "10.5",
+                           "thread_ts": "10.1", "bot_id": "BHP", "text": "answered"})
+        dmP1.subs["hp1"].append(Conn(None, "hp1", {"alias": None, "handoff": "h1", "since": 200.0}))
+        dmP1.subs["hp1"][-1].send = lambda p: gotP1["suc"].append(p)
+        rec_write("hp1", "successor")
+        dmP1.handoff_sweep("hp1")
+        check("handoff phases: a message before the overlap reaches the seat once, and one the seat answered in its "
+              "thread (a box post there) is not handed to the successor at the cutover — HP1",
+              rP1 == "delivered" and texts(gotP1["pre"]) == ["before the overlap"] and gotP1["suc"] == [])
+        # HP2 during the overlap: only the live predecessor — and what it never answered goes to the successor at the
+        # cutover, once, with its thread and a line saying why
+        dmP2, gotP2 = seats("hp2")
+        rec_write("hp2", "predecessor")
+        rP2 = dmP2.deliver("hp2", msg("during the overlap", "20.1"), autostart=False)
+        dmP2.deliver("hp2", msg("answered with a reaction", "20.2"), autostart=False)
+        dmP2.bot_user = "UHP"
+        dmP2.on_reaction({"type": "reaction_added", "user": "UHP", "reaction": "eyes",
+                          "item": {"type": "message", "channel": "CHP", "ts": "20.1"}})   # 👀 is "it arrived", not an answer
+        dmP2.on_reaction({"type": "reaction_added", "user": "UHP", "reaction": "white_check_mark",
+                          "item": {"type": "message", "channel": "CHP", "ts": "20.2"}})
+        before2 = (texts(gotP2["pre"]), list(gotP2["suc"]))
+        rec_write("hp2", "successor")
+        dmP2.handoff_sweep("hp2"); dmP2.handoff_sweep()             # the cutover word, then a tick: still once
+        suc2 = gotP2["suc"]
+        check("handoff phases: during the overlap a message reaches only the live predecessor; at the cutover the "
+              "one it never answered reaches the successor exactly once, in its own thread and saying why, and the one "
+              "it reacted to (anything but 👀) does not — HP2",
+              rP2 == "delivered" and before2 == (["during the overlap", "answered with a reaction"], [])
+              and len(suc2) == 1 and suc2[0]["content"].endswith("during the overlap")
+              and "predecessor" in suc2[0]["content"] and suc2[0]["meta"]["thread_ts"] == "20.1")
+        # HP3 at --ready, the successor not yet (or no longer) subscribed: held, never the muted predecessor, and its
+        # own hello takes it
+        dmP3, gotP3 = seats("hp3", with_suc=False)
+        rec_write("hp3", "successor")
+        rP3 = dmP3.deliver("hp3", msg("at the cutover", "30.1"), autostart=False)
+        a3, b3 = socket.socketpair()
+        a3.sendall(json.dumps({"hello": "hp3", "handoff": "h1", "pid": 1}).encode() + b"\n"); a3.shutdown(socket.SHUT_WR)
+        dmP3.handle_conn(b3)
+        hello3 = [json.loads(l) for l in a3.makefile("rb").read().splitlines() if l.strip()]
+        a3.close()
+        check("handoff phases: a message at the cutover with the successor not subscribed is held — the muted "
+              "predecessor gets nothing — and the successor's hello hands it over — HP3",
+              rP3 == "held" and gotP3["pre"] == [] and [h.get("content") for h in hello3] == ["at the cutover"]
+              and not dmP3.queues["hp3"])
+        # HP4 after the retirement: no record, the successor alone
+        dmP4, gotP4 = seats("hp4", with_pre=False)
+        if os.path.exists(f"{hdir}/hp4.json"):
+            os.remove(f"{hdir}/hp4.json")
+        rP4 = dmP4.deliver("hp4", msg("after the retirement", "40.1"), autostart=False)
+        check("handoff phases: after the retirement the successor, alone, is delivered to — HP4",
+              rP4 == "delivered" and texts(gotP4["suc"]) == ["after the retirement"])
+        # HP5 an idle successor: the predecessor's conn is gone mid-overlap, so a message is held; the cutover (here the
+        # socket word cc-handoff sends) hands it to the successor, which is what wakes a seat that sits waiting
+        dmP5, gotP5 = seats("hp5", with_pre=False)
+        rec_write("hp5", "predecessor")
+        rP5 = dmP5.deliver("hp5", msg("to an idle successor", "50.1"), autostart=False)
+        held5 = list(gotP5["suc"])
+        rec_write("hp5", "successor")
+        a5, b5 = socket.socketpair()
+        a5.sendall(json.dumps({"cutover": "hp5"}).encode() + b"\n"); a5.shutdown(socket.SHUT_WR)
+        dmP5.handle_conn(b5)
+        ok5 = a5.makefile("rb").read(); a5.close()
+        dmP5.handoff_sweep()
+        check("handoff phases: with an idle successor and no live predecessor the message is held while the successor "
+              "is muted, and cc-handoff's cutover word delivers it to the successor exactly once — HP5",
+              rP5 == "held" and held5 == [] and b'"ok":true' in ok5.replace(b" ", b"")
+              and texts(gotP5["suc"]) == ["to an idle successor"] and not dmP5.queues["hp5"])
+        # HP6 an orch is a seat of its own: its handoff reads `<repo>@<alias>`, mutes its own successor, and leaves the
+        # repo's seat alone — before this an orch's two sessions both took every message and both could answer
+        dmP6 = Daemon(use_slack=False); dmP6.queues.clear(); dmP6.given.clear()
+        got6 = []
+        c6 = [Conn(None, "hp6", {"alias": al, "handoff": hid, "since": sn})
+              for al, hid, sn in ((None, None, 50.0), ("vo", None, 100.0), ("vo", "h6", 200.0))]
+        for who, cn in zip(("repo", "pre", "suc"), c6):
+            cn.send = (lambda w: lambda p: got6.append(w))(who)
+        dmP6.subs["hp6"] = c6
+        rec_write("hp6@vo", "predecessor", hid="h6")
+        dmP6.deliver("hp6", msg("orch, overlap", "60.1"), autostart=False, alias="vo")
+        dmP6.deliver("hp6", msg("repo seat", "60.2"), autostart=False)
+        pre6 = list(got6)
+        chP6 = Channel("hp6"); chP6.cfg = {}; chP6.alias, chP6.handoff = "vo", "h6"
+        muted6 = chP6.muted()
+        rec_write("hp6@vo", "successor", hid="h6")
+        del got6[:]
+        dmP6.handoff_sweep("hp6@vo")
+        check("handoff phases: an orch's overlap delivers to its live side only and mutes its own successor, leaves the "
+              "repo's seat alone, and at the cutover its successor takes what the predecessor never answered — HP6",
+              pre6 == ["pre", "repo"] and muted6 and got6 == ["suc"] and not chP6.muted())
     finally:
         globals()["HANDOFF_DIR"] = real_hdir
         if roleH is not None:

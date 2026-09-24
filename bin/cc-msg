@@ -20,6 +20,8 @@
 #                               to #<handle> and the owner (member_signed_out).
 #   cc-msg selfcheck
 # Prints "queued" (rc 0) when the text went to the spool, nothing when it was typed.
+# A window whose name has an open handoff record (~/.cc/state/handoff) is not typed into: the text goes to
+# `cc-slack inject`, which hands it to the live side of the overlap ("queued" when it holds it for that side).
 # The spool collapses only a RETRY — the same sender's same text inside $CC_MSG_DEDUP_S (120 s); the same words
 # again later are a second message and are queued as one.
 # Refuses windows with no interactive `claude` under them: a headless --go worker's pane is a shell, and the text
@@ -797,7 +799,20 @@ sweep(){
 }
 
 send(){    # $1 window  $2 text — THE contract: delivered, or queued and reported as queued. Never dropped.
-  local id
+  local id hr res
+  # A NAME MID-HANDOFF IS TWO SESSIONS, and the keyboard of whichever holds it is the wrong door: on 2026-09-16 a
+  # relay typed into the retiring `lessons` seat was never acted on, and its successor never saw it. With an open
+  # overlap record for this name the text goes to cc-slack instead, which hands it to the live side and, at the
+  # cutover, re-hands the successor what the predecessor never answered. cc-slack's own typing (CC_MSG_FROM
+  # slack:…) never comes back through here: during an overlap it holds a message, it does not type it.
+  hr="${CC_HANDOFF_DIR:-$STATE/handoff}/${1//\//--}.json"
+  case "${CC_MSG_FROM:-}" in slack:*) hr="";; esac
+  if [ -n "$hr" ] && [ -f "$hr" ]; then
+    res=$("$BIN/cc-slack" inject --no-start "$1" "$2" 2>/dev/null) && case "$res" in
+      delivered) return 0;;
+      held) echo queued; return 0;;                # held for the live side: queued, in this file's own word
+    esac                                           # anything else (daemon down, paused): the keyboard, as before
+  fi
   id=$(win_id "$1") || true
   [ -n "$id" ] || { echo "cc-msg: no window main:$1" >&2; exit 1; }
   live_claude "$id" || { echo "cc-msg: main:$1 runs no interactive claude (headless worker or bare shell) — append to ~/.cc/state/<repo>/<track>/task.md instead" >&2; exit 1; }
@@ -1044,6 +1059,17 @@ STUB
   k "$(t test -z "$out")" "a free pane: delivered, and cc-msg stays silent (the contract every caller reads)"
   k "$(t grep -qF 'hello one' "$T/keys")" "a free pane: the text reached the keyboard"
   k "$(nt test -s "$SP")" "a free pane: the spool is emptied and removed, not left as a puddle"
+
+  # (1a) A NAME MID-HANDOFF: with an overlap record for the window the text goes to cc-slack, which knows the live
+  # side, and nothing is typed; held there reads "queued"; no record, or cc-slack's own typing, is the keyboard
+  reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; out=$(msg "relay mid-handoff")
+  k "$(t sh -c "[ -z '$out' ] && grep -qF 'inject --no-start $W relay mid-handoff' '$T/calls' && ! grep -qF 'relay mid-handoff' '$T/keys'")" "a name mid-handoff: the text is handed to cc-slack for the live side, not typed into whichever pane holds the name"
+  reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; out=$(CC_FAKE_INJECT=held msg "held one")
+  k "$(t sh -c "[ '$out' = queued ] && ! grep -qF 'held one' '$T/keys'")" "…held by cc-slack for a live side not yet subscribed, it says queued"
+  reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; CC_MSG_FROM=slack:C1:1.1 msg "from the daemon" >/dev/null
+  k "$(t sh -c "grep -qF 'from the daemon' '$T/keys' && ! grep -q '^inject' '$T/calls'")" "…but cc-slack's own typing is never sent back to cc-slack"
+  reset; scr "$FREE"; msg "no overlap" >/dev/null
+  k "$(t sh -c "grep -qF 'no overlap' '$T/keys' && ! grep -q '^inject' '$T/calls'")" "…and with no overlap record the text is typed, as always"
 
   # (1b) a MULTI-LINE message reaches the keyboard as ONE line — a newline there is a SUBMIT, and the session would
   # take "deploy the fix" as the whole instruction and type "then tell me when green" into the next turn.

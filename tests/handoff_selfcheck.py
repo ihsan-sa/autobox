@@ -8,7 +8,7 @@ def run_selfcheck():
     os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
     nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the suite sets it; these cases read what run() was handed, not what a door did with it
     import tempfile
-    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held, seat_of, measure_seat, pane_claude
+    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held, seat_of, measure_seat, pane_claude, tell_slack
     real_out = out
     real_held = worker_held      # the real one: every case below rebinds worker_held to a stub
     _real = {"win_id": win_id, "pane_live": pane_live, "pane_live_id": pane_live_id, "pane_claude": pane_claude}   # the real-tmux case
@@ -443,7 +443,11 @@ def run_selfcheck():
         os.environ["CC_HANDOFF"] = rec["id"]
         ok("--ready with no target finds the record by CC_HANDOFF", by_id(rec["id"])["target"] == "r1")
         n1 = posts()
+        told_slack = []
+        tell_slack = told_slack.append       # the socket to cc-slackd: what it says, not whether a daemon is up
         ok("the successor cuts over", ready() == 0)
+        ok("...and cc-slackd is told the cutover, so what it held for the successor reaches it now, not on a tick",
+           told_slack == ["r1"])
         ok("...silently — cutover is a debugging engineer's record (the ledger line below), not an owner notice",
            posts() == n1)
         ok("the commit point moved ownership forward", read("r1")["live"] == "successor")
@@ -606,6 +610,8 @@ def run_selfcheck():
         ok("a predecessor still alive past the drain is ENDED, and only the successor holds the name",
            retire("r2") == 0 and wins.get("r2") == suc and "r2~old" not in wins and "r2~next" not in wins)
         ok("...the record is cleared afterwards, so nothing stays gated", read("r2") is None)
+        ok("...and cc-slackd is told the retirement once the record is gone, so nothing the predecessor left "
+           "unanswered stays with it", told_slack[-1:] == ["r2"])
         ok("...and the completed retirement is remembered where clear() cannot reach it (2026-08-31: a "
            "finished handoff gated the only session left)", os.path.exists(done_path(r["id"])))
         marked = done_path(r["id"])

@@ -71,7 +71,7 @@ row's verdict changing does not re-announce a row that has been blocked all alon
 (a queued row inside a live bundle — cc-bundle's `bundle: <row>` mark, the bundle row live — is in flight and never offered)
 (~/.cc/state/<repo>/pulse.look). `cc-tier allows pulse` / `start` gate it. Waking is `cc <repo>` when tmux
 session main has no live `<repo>` window, else one `cc-msg` line — never while the pane shows a turn in progress
-or a usage-limit line, never mid-handoff. Orchs (`<repo>@<alias>`) are never woken. Log: ~/.cc/state/pulse.log.
+or a usage-limit line, never mid-handoff before the cutover (after it, the successor is the live seat). Orchs (`<repo>@<alias>`) are never woken. Log: ~/.cc/state/pulse.log.
 
 DIGEST (`digest`): the five questions off the boards and the snapshot — shipped in the last day, moving (a queued
 row inside a live bundle is counted "in bundles", not queued: the bundle row is what is moving), waiting
@@ -1658,7 +1658,11 @@ def wake_repo(repo, rows, snap, net, on):
     note = " · ".join(x for x in (f"{len(stopped)} row(s) stopped ({', '.join(stopped[:3])})" if stopped else "",
                                   could + (f" (cc-brief ready {repo})" if start != "none" else "")) if x)
     h = sh(sib("cc-handoff"), "--status", repo, timeout=60)     # 0 = a handoff is open, 1 = none, else unknown
-    if h is not None and h.returncode == 0:
+    # Only until the cutover: from then `<repo>` is the successor's name and it is live, and a drain of up to ten
+    # minutes behind it is no reason to leave a new row unseen for another tick (raised-a-row-for-a-seat-mid-
+    # handoff-sits-unseen, 2026-09-23). cc-msg hands the line to cc-slack while the record is open, so it reaches
+    # the live side and never the retiring one.
+    if h is not None and h.returncode == 0 and "live=successor" not in (h.stdout or ""):
         set_look(repo, "")
         return pulse_log(repo, "skip", "mid-handoff — a successor is taking over")
     w = windows().get(repo)
@@ -3710,6 +3714,28 @@ def selfcheck():
            typed() == ["msg wr"] and "wr skip — mid-turn" in open(f"{ti}/.cc/state/pulse.log").read())
     finally:
         restore(); shutil.rmtree(ti, ignore_errors=True)
+    # (b3) a seat MID-HANDOFF: before the cutover nothing is typed; once the record calls the successor live, the
+    # successor (which holds `<repo>` from then) is woken like any live seat, drain or no drain
+    for live, want, what in (("predecessor", [], "skip — mid-handoff"), ("successor", ["msg wr"], "tick — live and idle")):
+        th = tempfile.mkdtemp(prefix="cc-reconcile-handoff-")
+        try:
+            scratch(th, dict(NOOP, **{"cc-brief": 'echo "$2: 1 of 1 queued rows could start now: q1"',
+                                      "cc-handoff": f'echo "wr overlap live={live}"; exit 0',
+                                      "cc": f'echo "start $1" >> {th}/cc.log', "cc-msg": f'echo "msg $1" >> {th}/cc.log',
+                                      "tmux": f'[ "$1" = capture-pane ] && cat {th}/pane'}))
+            os.makedirs(f"{th}/dev/wr")
+            os.environ["CC_WAKE"] = "on"
+            globals().update(procs=lambda: (set(), set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}),
+                             windows=lambda: {"wr": ("@7", "4242")}, live_session=lambda pid: pid == "4242")
+            json.dump({"repo": "wr", "tracks": {"q1": {"status": "queued", "updated": old}}}, open(f"{th}/.cc/boards/wr.json", "w"))
+            open(f"{th}/pane", "w").write("❯ \n  ? for shortcuts\n")
+            quietly(tick, {}, True)
+            got = open(f"{th}/cc.log").read().splitlines() if os.path.exists(f"{th}/cc.log") else []
+            ok(f"WAKE, MID-HANDOFF with the {live} live: " + ("nothing is typed at a seat that is being replaced"
+               if not want else "the successor is woken for the new row, without waiting out the drain"),
+               got == want and f"wr {what}" in open(f"{th}/.cc/state/pulse.log").read())
+        finally:
+            restore(); shutil.rmtree(th, ignore_errors=True)
     # (b3) ONE LOOK PER HALF: what `cc-brief ready` says about the queued rows is not news about a row that has been
     # blocked all along. Keyed together, the queued verdict moving re-announced the blocked row every ~20 min.
     tc = tempfile.mkdtemp(prefix="cc-reconcile-look-")

@@ -47,7 +47,10 @@ THE INVARIANT. One record, ~/.cc/state/handoff/<target>.json, names the LIVE ses
 channel and may act on the world; the other is muted and gated (cc-guard and cc-slack read the same record).
 Cutover is ONE os.replace() of that record; everything after it is derived, idempotent and retried, never
 rolled back. Ownership only moves forward on an explicit successful act, so a missing, corrupt or unreadable
-record means the predecessor keeps the channel and the successor stays gated.
+record means the predecessor keeps the channel and the successor stays gated. A message is never handed to the
+muted side: cc-slack holds it for the live one, and after the cutover and again after the retirement this file
+tells cc-slackd (`{"cutover": target}`, tell_slack), which hands the successor what it held and what the
+predecessor was given and never answered.
 
 BOUNDED. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 20 min). The sweep IS the deadline: --sweep, on
 the cc-reconcile timer, expires an overlap past it quietly (the predecessor never stopped working, so there is
@@ -101,7 +104,7 @@ CC_HANDOFF_AGENT_MAX, CC_HANDOFF_ROTATE_RETRY (~/.cc/config) · CC_HANDOFF_DIR, 
 CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log may be and still count as live, 1 h) ·
 CC_BRIEF_PACKET_BAND (--brief: the packet size, in bytes, that is recorded as context cost, 24 kB).
 """
-import fcntl, glob, json, os, re, shlex, shutil, subprocess, sys, tempfile, time, uuid
+import fcntl, glob, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, time, uuid
 
 STATE = os.path.expanduser("~/.cc/state")
 DEV = os.path.expanduser("~/dev")        # where the checkouts are: --brief asks gh inside the target's own
@@ -117,6 +120,25 @@ NAME = r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}"
 ALIAS = r"[a-z0-9-]{2,20}"         # `cc <repo> --orch <alias>` accepts exactly this, so this accepts exactly it
 TARGET_RE = re.compile(rf"^{NAME}(@{ALIAS}|/{NAME})?$")   # the three shapes above, and nothing else
 MACHINE = "[cc-handoff]"           # every prompt this file types into a session leads with it — see the header
+
+
+def tell_slack(target):
+    """Say the cutover to cc-slackd, `{"cutover": target}`, so what it held while no live side was subscribed, and
+    what the predecessor was handed and never answered, reach the successor NOW rather than on its 30 s tick (the
+    brief, 2026-09-24: "queued and delivered to the successor at --ready"). Best effort: the tick is the fallback,
+    so a daemon that is down or slow costs seconds, never the message. A test's own CC_HANDOFF_DIR with no
+    CC_SLACK_DIR of its own says nothing to the box's real daemon."""
+    if os.environ.get("CC_HANDOFF_DIR") and not os.environ.get("CC_SLACK_DIR"):
+        return
+    sock = os.path.join(os.environ.get("CC_SLACK_DIR") or os.path.expanduser("~/.cc/slack"), "sock")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect(sock)
+            s.sendall((json.dumps({"cutover": target}) + "\n").encode())
+            s.recv(256)
+    except OSError:
+        pass
 
 
 def cfg(name, default):
@@ -1115,6 +1137,7 @@ def ready(target=None, forced=False):
     ledger(rec, "overlap-forced" if forced else "overlap-cutover")
     write(rec)
     derive(rec, first)
+    tell_slack(target)                             # after the names move: the successor is live, so it is delivered to
     print(f"cc-handoff: {target} — the successor is live; " + (f"{staying} ({', '.join(held[:6])}), then retires"
           if held else "the predecessor is journalling, then retiring"))
     if wk:
@@ -1366,6 +1389,7 @@ def retire(target):
     write(rec)
     mark_done(rec)                                 # before clear(), always: it is what tells cc-guard this went RIGHT
     clear(target)                                  # nobody is gated any more: the successor is the only session left
+    tell_slack(target)
     print(f"cc-handoff: {target} — the predecessor is ended, the successor has its window, nothing is gated")
     return 0
 
