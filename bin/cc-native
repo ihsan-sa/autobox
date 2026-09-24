@@ -9,6 +9,9 @@ subagent-only agent_id; PreToolUse consumes updatedInput alongside allow. Subage
 The dispatch's tool_use_id identifies a replay; the bootstrap's own agent_id identifies the child.
 SubagentStop carries agent_id and agent_transcript_path. There is no CLAUDE_CODE_AGENT_ID environment key.
 Dispatch has a 15 s runtime budget: lock waiting and Git preparation share an 11 s deadline.
+CC_NATIVE_DEADLINE (finite seconds, > 0) replaces that 11 s; unset, the hook keeps 11 s. The selfcheck widens it:
+a claim is about a dozen serial cc-board, cc-task and git processes, CPU-bound, so on a saturated box (load 15-130
+on 6 cores) one takes 3-10 s, and N2 serialises two of them under one deadline. That red is load, not the change.
 JSON decisions use exit 0, including deny: exit 2 would make the runtime use stderr instead of the JSON.
 An unrelated or unreadable input decides nothing. No header leaves the legacy Agent input byte-identical.
 """
@@ -61,12 +64,17 @@ def handoff(d, tool_input, state):
                           "The end hook commits. Do not commit, push, open a PR or queue delivery.\n")
     return updated
 
+def budget():
+    try: seconds = float(os.environ.get("CC_NATIVE_DEADLINE", ""))
+    except ValueError: return 11.0
+    return seconds if 0 < seconds < float("inf") else 11.0
+
 def dispatch(payload, tool_input, match):
     repo, row = match.groups(); state, _ = task.paths(repo, row)
-    deadline = time.monotonic() + 11
+    seconds = budget(); deadline = time.monotonic() + seconds
     # An unreadable record is outside this hook's remit, including before taking the native lock.
     task.read(state)
-    with task.Lock(Path.home() / ".cc/native", timeout=10):
+    with task.Lock(Path.home() / ".cc/native", timeout=max(.01, seconds - 1)):
         for other, d in task.native_records():
             c = d["claim"]; native = c.get("native", {})
             if native.get("session_id") == payload["session_id"] and native.get("dispatch_event") == payload["tool_use_id"]:
@@ -77,7 +85,7 @@ def dispatch(payload, tool_input, match):
         if c.get("native") and not c.get("ended_at") and task.alive(c.get("owner")):
             raise ValueError("cc-native: row is already reserved by another dispatch")
         d = json.loads(call([BIN / "cc", "claim", repo, row, "--executor", "subagent"],
-                            timeout=max(.01, min(10, deadline - time.monotonic()))))
+                            timeout=max(.01, min(seconds - 1, deadline - time.monotonic()))))
         with task.Lock(state, timeout=1):
             current = task.read(state); c = current["claim"]
             if c["claim_id"] != d["claim"]["claim_id"] or c.get("ended_at"):
@@ -136,7 +144,7 @@ def selfcheck():
     with tempfile.TemporaryDirectory(prefix="ccnative-sc-") as th:
         root = Path(th); home = root / "home"; binpath = home / "bin"; binpath.mkdir(parents=True)
         env = {"HOME": str(home), "PATH": f"{binpath}:/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1",
-               "CC_CONFIG": str(root / "config"), "CC_NATIVE_ADAPTER": "1"}
+               "CC_CONFIG": str(root / "config"), "CC_NATIVE_ADAPTER": "1", "CC_NATIVE_DEADLINE": "300"}
         for tool in ("cc-native", "cc-task", "cc", "cc-board", "cc-checkpoint", "cc-config"):
             shutil.copy2(BIN / tool, binpath / tool)
         # These fixture doors record any accidental live operation. Git uses only our own bare remote.
@@ -146,7 +154,7 @@ def selfcheck():
         (binpath / "cc-trust").write_text("#!/bin/sh\nexit 0\n"); (binpath / "cc-trust").chmod(0o755)
         def run(*args, input=None, extra=None):
             return subprocess.run([str(x) for x in args], input=input, capture_output=True, text=True,
-                                  env={**env, **(extra or {})}, cwd=home, timeout=60)
+                                  env={**env, **(extra or {})}, cwd=home, timeout=600)
         def git(*args):
             r = run("git", *args)
             if r.returncode: raise ValueError(r.stderr)
@@ -193,7 +201,7 @@ def selfcheck():
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
             for p, row in zip(ps, ("a", "b")): p.stdin.write(json.dumps(spawn(row, "Task" if row == "b" else "Agent"))); p.stdin.close(); p.stdin = None
             time.sleep(.15); held = all(p.poll() is None for p in ps)
-        outputs = [json.loads(p.communicate(timeout=30)[0])["hookSpecificOutput"] for p in ps]
+        outputs = [json.loads(p.communicate(timeout=600)[0])["hookSpecificOutput"] for p in ps]
         if any(a["permissionDecision"] != "allow" for a in outputs): raise ValueError(f"fixture dispatch: {outputs}")
         tokens = [task.native_token(record(row).parent, load(row)["claim"]) for row in ("a", "b")]
         ok("N2: concurrent Agent and Task dispatches prepare distinct canonical trees and tokens", held and all(p.returncode == 0 for p in ps)
@@ -292,6 +300,29 @@ def selfcheck():
         r = g(payload); direct = run(binpath / "cc", "claim", "absent", "missing", "--executor", "subagent")
         ok("N13: cc's refused claim is a request that must be refused with its own message; N2 is its control",
            answer(r).get("permissionDecision") == "deny" and answer(r)["permissionDecisionReason"] == (direct.stdout + direct.stderr).strip())
+        # The budget still binds when the fixture's own is short: a claim that stalls is killed, group and all,
+        # and the dispatch is refused. N2 is its control, the same dispatch allowed under the wide fixture budget.
+        slow = root / "slow-bin"; slow.mkdir()
+        for tool in ("cc-native", "cc-task", "cc-config"): shutil.copy2(BIN / tool, slow / tool)
+        (slow / "cc").write_text(f'#!/bin/sh\necho $$ > "{root}/slow-pid"\nexec sleep 60\n'); (slow / "cc").chmod(0o755)
+        started = time.monotonic()
+        r = run(slow / "cc-native", input=json.dumps(spawn("slow")), extra={"CC_NATIVE_DEADLINE": "2"})
+        took = time.monotonic() - started; pid = int((root / "slow-pid").read_text() or 0)
+        try: os.kill(pid, 0); stalled = True
+        except ProcessLookupError: stalled = False
+        ok("N15: a claim past CC_NATIVE_DEADLINE is killed and refused; N2 is its control",
+           answer(r).get("permissionDecisionReason") == "cc-native: claim/checkpoint deadline expired"
+           and not stalled and took < 50 and not record("slow").exists())
+        saved = os.environ.get("CC_NATIVE_DEADLINE")
+        try:
+            widths = []
+            for value in ("", "abc", "0", "-5", "nan", "inf", "300"):
+                os.environ["CC_NATIVE_DEADLINE"] = value; widths.append(budget())
+        finally:
+            if saved is None: os.environ.pop("CC_NATIVE_DEADLINE", None)
+            else: os.environ["CC_NATIVE_DEADLINE"] = saved
+        ok("N15 default control: an absent, unreadable or non-positive CC_NATIVE_DEADLINE is the 11 s budget",
+           widths == [11.0] * 6 + [300.0])
         calls = (root / "services").read_text() if (root / "services").exists() else ""
         ok("N14: no service, PR, queue or push was called by any managed hook; N8 records only local commits",
            not calls.strip())
