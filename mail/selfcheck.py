@@ -2710,6 +2710,176 @@ def run():
         finally:
             os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
 
+    # ------------------------------------------- 20c. the explanation door: an address whose mail asks for an
+    # explanation (owner, 2026-09-23). Brief: "Trigger: mail sent to its own address … The sender must still
+    # pass the allow-list and workspace map as usual. Make the address word a config value, the way MAIL_QUIET is."
+    # Each case is its own mail through the real door, the router handed MAIL_EXPLAIN as the daemon hands it.
+    TEACH = "explain, Why@box.example"
+    k(router.explain_names(TEACH) == {"explain", "why"} and router.explain_names("") == set()
+      and router.explain_names("home explain") == {"explain"},
+      "MAIL_EXPLAIN splits and folds as MAIL_QUIET does, and never makes home@ an explanation address")
+    with Box(allow=",".join([ALLOWED, OWNER, STRANGER]), MAIL_RATE=500) as b:
+        os.environ["CC_MAIL_ROUTE_FAKE"] = ""
+        try:
+            def to(rcpt, sender=ALLOWED, **kw):
+                return arrived(b, sender, rcpt=rcpt + "@box.example", to=rcpt + "@box.example", **kw)
+
+            # (a) a To on the door: the sender's own main session, carrying the ask to load the skill
+            dec = router.route(to("explain"), Dir(), "box.example", explain=TEACH)
+            k(not dec.refuse and not dec.quiet and dec.rule == router.EXPLAIN and dec.workspace == "mem"
+              and [p.name for p in dec.to] == ["mem"] and dec.cc == [] and dec.question == router.EXPLAIN_ASK
+              and "email-explanation skill" in dec.question and dec.note == "",
+              "a mail To an explanation address goes to the sender's own main session, rule `explain`, with the "
+              "line asking for the email-explanation skill")
+            dec = router.route(to("why", OWNER), Dir(), "box.example", explain=TEACH)
+            k(dec.rule == router.EXPLAIN and dec.workspace == "owner" and [p.name for p in dec.to] == ["dm"],
+              "…the owner's mail to it reaches his own main session, and a second word is a second address")
+            dec = router.route(to("explain", headers={"Cc": "mem--site@box.example"}), Dir(), "box.example",
+                               explain=TEACH)
+            k(dec.rule == router.EXPLAIN and [p.name for p in dec.to] == ["mem"] and dec.cc == [],
+              "…and it outranks a channel Cc'd beside it: one session answers, nobody else is handed the mail")
+
+            # (b) configured, never assumed: unset, the same address is a name no channel has
+            dec = router.route(to("explain"), Dir(), "box.example")
+            k(dec.rule == "no-channel:unsure" and dec.question != router.EXPLAIN_ASK,
+              "with MAIL_EXPLAIN unset explain@ is a name no channel has — the door is configured, never assumed")
+
+            # (c) a Cc of it asks for nothing and is not a lost name either
+            dec = router.route(to("mem--site", headers={"Cc": "explain@box.example"}), Dir(), "box.example",
+                               explain=TEACH)
+            base = router.route(to("mem--site"), Dir(), "box.example", explain=TEACH)
+            k(dec.rule == base.rule == "named" and [p.name for p in dec.to] == ["mem--site"]
+              and dec.question == "" and dec.note == "",
+              "a Cc of an explanation address changes nothing: placed as without it, no ask, no 'not a channel' note")
+
+            # (d) the workspace map runs as usual: a trusted sender no row places is the owner's unplaced mail,
+            # the owner's `addr=` row refuses, and a workspace with no main session is told so
+            dec = router.route(to("explain", STRANGER), Dir(), "box.example", explain=TEACH)
+            k(dec.rule == router.UNMAPPED and [p.name for p in dec.to] == ["dm"]
+              and dec.question != router.EXPLAIN_ASK,
+              "a sender the door trusts and no row places takes the unplaced path to the owner, not the "
+              "explanation door: the workspace map runs first")
+            dec = router.route(to("explain"), Dir(), "box.example", table="%s=" % ALLOWED, explain=TEACH)
+            k(dec.refuse and "placed nowhere" in dec.refuse and dec.rule != router.EXPLAIN,
+              "…the owner's `addr=` refusal still refuses it")
+
+            class NoMain(Dir):
+                MAIN = {"owner": "dm", "other": "other"}
+            dec = router.route(to("explain"), NoMain(), "box.example", explain=TEACH)
+            k(dec.refuse and "no channel" in dec.refuse and not dec.to,
+              "…and a workspace with no main session is refused in one line, not handed to anyone else's")
+
+            # (e) the quiet door outranks it: a quiet To is quiet whatever else it names
+            dec = router.route(arrived(b, ALLOWED, rcpt="explain@box.example",
+                                       to="explain@box.example, study@box.example"), Dir(),
+                               "box.example", quiet="study", explain=TEACH)
+            k(dec.quiet and dec.rule == "quiet" and not dec.to,
+              "a quiet To beside an explanation To makes the mail quiet: the store-only door is decided first")
+
+            # (f) the allow-list runs first: a stranger's mail to it is dropped at the door like any other
+            before = set(b.ids())
+            code, ans = b.post(eml(frm="someone@outside.example", to="explain@box.example"),
+                               sender="someone@outside.example", rcpt="explain@box.example")
+            k(code == 403 and ans["reply"] is None and set(b.ids()) == before,
+              "an explanation address from a sender NOT on the allow-list is dropped at the door — 403, nothing "
+              "stored")
+        finally:
+            os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
+
+    # ------------------------------------------- 20d. an HTML body on a mail the box starts (owner, 2026-09-24)
+    # Brief: "a short explanation goes in a formatted mail body: multipart/alternative with an HTML part ... and a
+    # diagram inlined as an image where it helps, plus the plain-text part ... keep plain text as the fallback,
+    # and change nothing for the mail that does not use it." Each case builds its own files and its own log.
+    with Box(allow=ALLOWED) as b:
+        dev20d = os.path.join(b.tmp, "dev20d")
+        os.makedirs(dev20d)
+        fig20d, pdf20d = os.path.join(dev20d, "fig-1.png"), os.path.join(dev20d, "notes.pdf")
+        with open(fig20d, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+        with open(pdf20d, "wb") as f:
+            f.write(b"%PDF-1.4 x")
+        html20d = '<html><body><h2>The answer</h2><p>Yes.</p><img src="cid:fig-1.png" alt="a figure"></body></html>'
+
+        def cold20d(worker):
+            return {"MAIL_SEND_URL": worker.url, "MAIL_SEND_SECRET": "s3cret", "MAIL_DOMAIN": "box.example",
+                    "MAIL_SEND_ALLOW": ALLOWED, "MAIL_OUT_ROOTS": dev20d}
+
+        def fresh20d():
+            shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            shutil.rmtree(outbound.SENTDIR, ignore_errors=True)
+            open(outbound.LOGFILE, "w").close()
+            outbound._UNCONFIGURED_SAID[0] = False
+
+        # (a) html and an image: text first as the fallback, then the HTML with the image inside its related part
+        fresh20d()
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold20d(w), ALLOWED, "why", "Yes, because of the figure.", html=html20d,
+                                        images=[fig20d])
+            msg = w.one()["msg"]
+        alt = msg.get_payload() if msg.get_content_type() == "multipart/alternative" else []
+        rel = alt[1] if len(alt) == 2 else None
+        pic = rel.get_payload()[1] if rel is not None and rel.is_multipart() and len(rel.get_payload()) == 2 else None
+        k(ok and len(alt) == 2 and alt[0].get_content_type() == "text/plain"
+          and alt[0].get_content().strip() == "Yes, because of the figure."
+          and rel.get_content_type() == "multipart/related"
+          and rel.get_payload()[0].get_content_type() == "text/html" and "<h2>The answer</h2>" in rel.get_payload()[0].get_content(),
+          "an HTML body makes the mail multipart/alternative: the text as written first, then the HTML")
+        k(pic is not None and pic["Content-ID"] == "<fig-1.png>" and pic.get_content_disposition() == "inline"
+          and pic.get_content_type() == "image/png" and pic.get_content().startswith(b"\x89PNG"),
+          "…and its image rides inside the HTML part, inline, as the cid:<file name> the HTML shows it by")
+        # (b) html beside an attachment: the file is a part of its own, beside the alternative
+        fresh20d()
+        with FakeWorker() as w:
+            ok, _ = outbound.send_to(cold20d(w), ALLOWED, "why", "Yes.", html=html20d, images=[fig20d],
+                                     attachments=[pdf20d])
+            msg = w.one()["msg"]
+        parts = msg.get_payload() if msg.get_content_type() == "multipart/mixed" else []
+        k(ok and len(parts) == 2 and parts[0].get_content_type() == "multipart/alternative"
+          and parts[1].get_filename() == "notes.pdf" and parts[1].get_content_disposition() == "attachment",
+          "…and a file sent beside an HTML body is still attached as a file, next to the text-and-HTML pair")
+        # (c) no html: the mail is the one text part it always was
+        fresh20d()
+        with FakeWorker() as w:
+            ok, _ = outbound.send_to(cold20d(w), ALLOWED, "plain", "just text")
+            msg = w.one()["msg"]
+        k(ok and not msg.is_multipart() and msg.get_content_type() == "text/plain"
+          and msg.get_content().strip() == "just text",
+          "a mail with no html is one text/plain part, exactly as before")
+        # (d) the refusals, each before the wire
+        fresh20d()
+        with FakeWorker() as w:
+            refusals = [
+                outbound.send_to(cold20d(w), ALLOWED, "s", "", html=html20d),
+                outbound.send_to(cold20d(w), ALLOWED, "s", "text", images=[fig20d]),
+                outbound.send_to(cold20d(w), ALLOWED, "s", "text", html=html20d, images=[pdf20d]),
+                outbound.send_to(cold20d(w), ALLOWED, "s", "text", html=html20d,
+                                 images=[os.path.join(b.tmp, "elsewhere.png")]),
+                outbound.send_to(cold20d(w), ALLOWED, "s", "text", html="x" * (outbound.HTMLMAX + 1)),
+            ]
+            n20d = len(w.calls)
+        k(n20d == 0 and not any(ok for ok, _ in refusals)
+          and "plain-text body" in refusals[0][1] and "inside an HTML body" in refusals[1][1]
+          and "cannot be an inline image" in refusals[2][1] and "cannot go inline" in refusals[3][1]
+          and "over 200 KiB" in refusals[4][1],
+          "an HTML body with no text, an image with no HTML, an image that is not one, one outside the trees and "
+          "an oversized HTML body are each refused by name, and nothing reaches the worker")
+        # (e) the command's JSON carries both keys, and a wrong type is exit 2's line
+        ask20d = os.path.join(b.tmp, "ask20d.json")
+        with open(ask20d, "w") as f:
+            json.dump({"to": ALLOWED, "subject": "s", "body": "b", "html": html20d, "images": [fig20d]}, f)
+        got = r.send_ask({"--json": ask20d})
+        with open(ask20d, "w") as f:
+            json.dump({"to": ALLOWED, "subject": "s", "body": "b"}, f)
+        bare = r.send_ask({"--json": ask20d})
+        with open(ask20d, "w") as f:
+            json.dump({"to": ALLOWED, "subject": "s", "body": "b", "html": ["no"]}, f)
+        bad = r.send_ask({"--json": ask20d})
+        k(isinstance(got, tuple) and got[5] == html20d and got[6] == [fig20d]
+          and isinstance(bare, tuple) and bare[5:] == ("", [])
+          and bad == "cc-mail send: html must be a string",
+          "`cc-mail send --json` reads html and images, leaves them empty when the ask has none, and refuses a "
+          "non-string html by name")
+
     # ------------------------------- 21. the reply's medium follows the message it answers (owner, 2026-09-10)
     # Brief: "a message the owner sends in Slack gets a Slack reply only, even inside a mail's mirror thread; a
     # message that arrived by mail gets a mail reply; a post that answers nothing in a mail thread stays in

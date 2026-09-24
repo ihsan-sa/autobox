@@ -6,7 +6,7 @@ message.json and answers one question: which channels does this mail belong in, 
 for. It posts nothing and delivers nothing itself — cc-slack's `mail` socket verb does that, because the token
 and the routing tables are there. Everything here is a decision, which is why it is testable without Slack.
 
-THREE DOORS, ON THE BOX'S MAIL DOMAIN.
+FOUR DOORS, ON THE BOX'S MAIL DOMAIN.
   <channel>@<domain>   names a channel outright; the local part IS the channel name (`notes@…` is `#notes`).
                        To = the mail is delivered there as a task, Cc = the mirror line only.
   home@<domain>        goes through the classifier, which picks among the SENDER'S OWN places and nothing else.
@@ -18,6 +18,12 @@ THREE DOORS, ON THE BOX'S MAIL DOMAIN.
                        it counts for nothing and the rest of the addresses decide. For mail a program reads
                        off the store (owner, 2026-09-20: forwarded course notifications, dozens a week, each
                        of which was a thread and a woken session).
+  <explain>@<domain>   the EXPLANATION door, one word per address in MAIL_EXPLAIN (`MAIL_EXPLAIN=explain`): the
+                       sender's workspace is settled exactly as for any mail — the allow-list ran at the receiver,
+                       the workspace map runs here, and a sender no row places is the owner's unplaced mail as
+                       ever — and then the mail goes to that workspace's main session with a line asking it to
+                       answer with the `email-explanation` skill: a formatted mail, or a short one with a PDF. A Cc of it
+                       counts for nothing, a quiet To outranks it, it outranks a channel named beside it, and a reply in its thread follows the thread.
 A mail with a named To keeps the named channels and does not run the classifier: an address a person typed
 outranks a model's guess. A mail whose only To is home@ is the classifier's either way — a channel Cc'd
 beside it watches, as a Cc does, and does not decide who acts.
@@ -164,7 +170,7 @@ class Decision:
 
     `rule` is the one word saying which rule placed the mail — the ledger's answer to "why is it there":
     `reply`, `named`, `cc-only`, `classified`, `unsure`, `unmapped` for a sender the door trusts and no row
-    places, `quiet` for a mail To a MAIL_QUIET address (stored, nothing else; `quiet` is True on it and
+    places, `explain` for a mail To a MAIL_EXPLAIN address, `quiet` for a mail To a MAIL_QUIET address (stored, nothing else; `quiet` is True on it and
     nothing else is set), and the `no-channel:` forms of `classified`/`unsure` (plus
     `no-channel:bounce`) for a mail whose To named a channel the sender cannot reach. `note` is one sentence
     for the SENDER about that address, put before the reply they get, and "" when there is nothing to say."""
@@ -242,6 +248,13 @@ def quiet_names(raw):
         if local and local != HOME_LOCAL:
             out.add(local)
     return out
+
+
+def explain_names(raw):
+    """The MAIL_EXPLAIN set, split and folded exactly as MAIL_QUIET is (quiet_names): the local parts whose mail is
+    a question to be answered with the email-explanation skill. The word is configuration, never a default here,
+    so the box's own address stays out of this file."""
+    return quiet_names(raw)
 
 
 def refused_by_row(sender, table):
@@ -728,9 +741,12 @@ def unmapped_line(sender):
 
 
 QUIET = "quiet"              # the `rule` of a mail To a MAIL_QUIET address: stored by the receiver, and nothing else
+EXPLAIN = "explain"          # the `rule` of a mail To a MAIL_EXPLAIN address: the workspace's main session, skill asked
+EXPLAIN_ASK = ("This mail came to an explanation address. Load the email-explanation skill and answer with it: a "
+               "short explanation as a formatted mail body, a long one as a short reply with a 1-3 page PDF attached.")
 
 
-def route(msg, d, domain, table=None, unplaced_to="main", quiet=""):
+def route(msg, d, domain, table=None, unplaced_to="main", quiet="", explain=""):
     """The whole decision for one stored mail. Returns a Decision; `refuse` set means nothing else happened.
 
     The order is the boundary. The workspace is settled from the authenticated sender before anything is resolved,
@@ -746,7 +762,12 @@ def route(msg, d, domain, table=None, unplaced_to="main", quiet=""):
     the owner's own `addr=` refusal and before anything is looked up: it needs no workspace (nothing is placed),
     so no Slack lookup, no thread match and no model runs for it. Brief: "the allow-list runs first — a quiet
     door is not an open one": the allow-list is receiver.py's and ran before this mail was stored at all; what
-    is decided here is only that a stored mail To a quiet address goes nowhere."""
+    is decided here is only that a stored mail To a quiet address goes nowhere.
+
+    `explain` is MAIL_EXPLAIN (explain_names). A mail To one of them is decided AFTER the workspace, since the
+    brief says "the sender must still pass the allow-list and workspace map as usual": no workspace is the
+    unplaced path below, as for any address. Then it is the workspace's main session, carrying EXPLAIN_ASK; a
+    reply to a known conversation follows its thread and carries the ask too when its To is still explain@."""
     rows = overrides(table)
     if refused_by_row(msg.get("from", ""), rows):
         # THE OWNER'S OWN "NOT THIS ADDRESS". An `addr=` row is a word a person set: it is read and obeyed
@@ -778,9 +799,18 @@ def route(msg, d, domain, table=None, unplaced_to="main", quiet=""):
     rec, foreign = conv_for_reply(msg, ws)
     if foreign:
         return Decision(refuse="That thread belongs to another workspace, so I did not deliver this.")
+    # Brief: "Trigger: mail sent to its own address (explain@ …)" — a To, like quiet; a Cc of it is only a watcher
+    teach = explain_names(explain)
+    ask = EXPLAIN_ASK if any(n in teach for n in to_names) else ""
+    cc_names = [n for n in cc_names if n not in teach]
     if rec:
         return Decision(to=conv_places(rec, "to"), cc=conv_places(rec, "cc"), conv=rec, workspace=ws,
-                        rule="reply")
+                        rule="reply", question=ask)
+    if ask:
+        main = d.main(ws)
+        if main is None:
+            return Decision(refuse="Your workspace has no channel on this box yet, so I did not deliver this.")
+        return Decision(to=[main], workspace=ws, question=ask, rule=EXPLAIN)
 
     named = [n for n in to_names + cc_names if n != HOME_LOCAL]
     home = HOME_LOCAL in to_names + cc_names

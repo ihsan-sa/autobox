@@ -12,13 +12,16 @@ belongs in and the daemon posts and delivers them. This process holds no Slack t
 The daemon's answer is what the sender hears back, so a refusal ("That address is not one I route") reaches
 them; a daemon that is down costs the delivery and not the mail. See docs/2026-09-08-email.md.
 
-THREE DOORS ON THE BOX'S DOMAIN, all decided by the router once the mail is stored (core/mail/router.py has
+FOUR DOORS ON THE BOX'S DOMAIN, all decided by the router once the mail is stored (core/mail/router.py has
 the rules in full): `<channel>@` names a channel, To delivers there and Cc watches; `home@` is the
 classifier's, which picks among the sender's own places; `<quiet>@` — each word of MAIL_QUIET — is a
 STORE-ONLY door: the mail is stored like every other and then nothing happens, no channel, no session, no
-reply to the sender (`reply: null`, as a drop answers), for mail a program reads off the store. Every door is
+reply to the sender (`reply: null`, as a drop answers), for mail a program reads off the store; `<explain>@` —
+each word of MAIL_EXPLAIN — goes to the sender's own main session with a line asking for an answer built with
+the email-explanation skill (a short reply and a PDF). Every door is
 behind the same locks below: a quiet address from a sender not on the allow-list is dropped exactly as any
-other address is, since the allow-list runs before any address is read. `status` names the quiet addresses.
+other address is, since the allow-list runs before any address is read. `status` names the quiet and the
+explanation addresses.
 
 BINDING IS THE BOUNDARY. It binds 127.0.0.1, never a public interface, not configurable, so no inbound port is
 open and the tunnel is the only way in. The shared secret is the second lock: a tunnel published without it, or
@@ -61,9 +64,13 @@ held mail the only word its sender gets until a person decides — and it is wri
   cc-mail selfcheck                         tests; own fixtures, no network, no live server, no config of the box's
   cc-mail send --json FILE                  mail somebody the box is NOT replying to. FILE (`-` = stdin) is one
                                             JSON object: {"to": "A" or ["A","B"], "subject": "S", "body": "TEXT",
-                                            "attachments": ["/abs/path", ...], "thread": "<chat_id>/<thread_ts>"}
-                                            — those five keys and no others; attachments and thread may be
-                                            left out. Every file named is attached, or the mail is not sent
+                                            "attachments": ["/abs/path", ...], "thread": "<chat_id>/<thread_ts>",
+                                            "html": "<html>…", "images": ["/abs/fig.png", ...]}
+                                            — those seven keys and no others; all but to, subject and body may
+                                            be left out. `html` makes the mail multipart/alternative with the
+                                            body as its plain-text fallback, and each of `images` is shown in
+                                            the HTML as cid:<its file name> (.png/.jpg/.gif), under the same
+                                            rules and cap as an attachment. Without html the mail is text. Every file named is attached, or the mail is not sent
                                             and the line names the file and why (a file attaches only from
                                             under MAIL_OUT_ROOTS or ~/.cc/slack/files, and under the byte
                                             cap). `thread` is the Slack thread the mail is started from —
@@ -215,6 +222,8 @@ it is written on the reload step of the runbook.
       MAIL_QUIET         the store-only addresses, local parts separated by commas or spaces (`archive` makes
                          `archive@<domain>` one). Read by the daemon like MAIL_WORKSPACE, so the same restart;
                          `status` prints it live
+      MAIL_EXPLAIN       the explanation addresses, split as MAIL_QUIET is (`explain` makes `explain@<domain>`
+                         one). Unset, there is none. Read by the daemon, so the same restart; `status` prints it
       MAIL_ALLOW         the allow-list, comma- or space-separated. Falls back to LESSONS_EMAILS, which is the
                          list the box already keeps of the people it will talk to. An address added here
                          reaches the door on the next HUP or restart, not on the next mail
@@ -1060,6 +1069,9 @@ def status(_opt=None):
     hush = sorted(router.quiet_names(cfg("MAIL_QUIET", "")))
     print("cc-mail: quiet %s" % (", ".join("%s@%s" % (n, cfg("MAIL_DOMAIN", "") or "<domain>") for n in hush)
                                  + " (stored, delivered nowhere, no reply)" if hush else "none (MAIL_QUIET unset)"))
+    teach = sorted(router.explain_names(cfg("MAIL_EXPLAIN", "")))
+    print("cc-mail: explain %s" % (", ".join("%s@%s" % (n, cfg("MAIL_DOMAIN", "") or "<domain>") for n in teach)
+                                   + " (answered with a reply and a PDF)" if teach else "none (MAIL_EXPLAIN unset)"))
     print("cc-mail: store %s (%d mails)"
           % (INBOX, len(os.listdir(INBOX)) if os.path.isdir(INBOX) else 0))
     pid = running()
@@ -1165,7 +1177,7 @@ def cmd_show(opt):
 # which costs a few forks in a command a person typed and means an owner's edit is live on the next one.
 SEND_KEYS = ("MAIL_SEND_URL", "MAIL_SEND_SECRET", "MAIL_DOMAIN", "MAIL_SEND_FROM", "MAIL_SEND_ALLOW",
              "MAIL_ALLOW", "MAIL_OUT_PER_HOUR", "MAIL_OUT_PER_DAY", "MAIL_OUT_ROOTS", "MAIL_OUT_MAX_ATTACH_BYTES")
-SEND_JSON_KEYS = ("to", "subject", "body", "attachments", "thread")
+SEND_JSON_KEYS = ("to", "subject", "body", "attachments", "thread", "html", "images")
 SEND_USAGE = ("usage: cc-mail send --json FILE   (FILE or `-`: {\"to\", \"subject\", \"body\", \"attachments\": [...], "
               "\"thread\": \"<chat_id>/<thread_ts>\"})\n"
               "       cc-mail send --to A[,B] --subject S [--body TEXT] [--thread <chat_id>/<thread_ts>]   "
@@ -1193,8 +1205,8 @@ def arg(opt, name):
 
 
 def send_ask(opt):
-    """The (to, subject, body, attachments, thread) a `cc-mail send` asks for, or a str saying what was wrong
-    with the ask. Two shapes: `--json FILE` — one object, the five SEND_JSON_KEYS and no others, so a mistyped
+    """The (to, subject, body, attachments, thread, html, images) a `cc-mail send` asks for, or a str saying what
+    was wrong with the ask. Two shapes: `--json FILE` — one object, the SEND_JSON_KEYS and no others, so a mistyped
     key (`attachment`, `file`) is refused by name rather than silently dropped — and the flag form, text only.
     `thread` is (chat, ts) or None either way (thread_of).
 
@@ -1228,7 +1240,12 @@ def send_ask(opt):
         thread = thread_of(raw)
         if isinstance(thread, str):
             return thread
-        return str(to), str(doc.get("subject") or ""), body or "", atts, thread
+        html, pics = doc.get("html"), doc.get("images") or []
+        if html is not None and not isinstance(html, str):
+            return "cc-mail send: html must be a string"
+        if not isinstance(pics, list) or not all(isinstance(a, str) and a.strip() for a in pics):
+            return "cc-mail send: images must be a list of file paths"
+        return str(to), str(doc.get("subject") or ""), body or "", atts, thread, html or "", pics
     to, subject = arg(opt, "--to"), arg(opt, "--subject")
     body = opt.get("--body")
     body = "" if body is None or body == "--body" else body
@@ -1241,7 +1258,7 @@ def send_ask(opt):
         if sys.stdin.isatty():
             return "cc-mail send: no body — pass --body TEXT, or pipe one in"
         body = sys.stdin.read()
-    return to, subject, body, [], thread
+    return to, subject, body, [], thread, "", []
 
 
 MEMBER_SEND_WAIT = 90   # seconds a workspace waits for the host's answer: the daemon's call to the worker is
@@ -1249,7 +1266,7 @@ MEMBER_SEND_WAIT = 90   # seconds a workspace waits for the host's answer: the d
                         # went as one that did not
 
 
-def send_across(to, subject, body, attachments, thread=None):
+def send_across(to, subject, body, attachments, thread=None, html="", images=None):
     """`cc-mail send` INSIDE A MEMBER WORKSPACE: the ask, read and checked here exactly as on the host, handed to
     the daemon's member verb `send` over the workspace's socket. Returns (sent?, the one line) — the host's own
     line when it answered, and a line saying the host did not when it did not. Nothing about the mail is
@@ -1257,6 +1274,10 @@ def send_across(to, subject, body, attachments, thread=None):
     `thread` (chat, ts) crosses as {"chat", "ts"} when the ask named one; the host holds it to the workspace's
     own channel."""
     ask = {"to": to, "subject": subject, "body": body, "attachments": list(attachments or [])}
+    if html:     # only an ask that has them carries them, so a host without the keys still takes a text mail
+        ask["html"] = html
+    if images:
+        ask["images"] = list(images)
     if thread:
         ask["thread"] = {"chat": str(thread[0]), "ts": str(thread[1])}
     try:
@@ -1281,9 +1302,9 @@ def cmd_send(opt):
     if isinstance(ask, str):
         print(ask, file=sys.stderr)
         return 2
-    to, subject, body, attachments, thread = ask
+    to, subject, body, attachments, thread, html, images = ask
     if os.environ.get("CC_MEMBER_SANDBOX") == "1":   # inside a boundary: no config, no secret, no worker — the host sends
-        ok, line = send_across(to, subject, body, attachments, thread)
+        ok, line = send_across(to, subject, body, attachments, thread, html, images)
         print(line, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -1294,7 +1315,8 @@ def cmd_send(opt):
     # it is started from: the line in that channel (under that thread) and the conversation its answer threads
     # under (the daemon's `mailed` verb). home@ with no thread gets neither, as before.
     ok, line = outbound.send_to({k: cfg(k, "") for k in SEND_KEYS}, to, subject, body, attachments=attachments,
-                                channel=outbound.session_channel(), mirror=mirrored, thread=thread)
+                                channel=outbound.session_channel(), mirror=mirrored, thread=thread,
+                                html=html, images=images)
     print(line, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 

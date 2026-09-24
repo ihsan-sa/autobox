@@ -3925,14 +3925,14 @@ class Daemon:
             return {"ok": True, "text": f"the box's planning seat has it (request {(r.stdout or '').strip()[-60:] or '?'}); it answers in #{h}, or asks the owner itself"}
         return {"ok": False, "error": "unknown verb"}
 
-    SEND_KEYS = ("to", "subject", "body", "attachments", "thread")   # the `send` verb's ask: cc-mail's own JSON shape, no more
+    SEND_KEYS = ("to", "subject", "body", "attachments", "thread", "html", "images")   # the `send` verb's ask: cc-mail's own JSON shape, no more
 
     def member_send(self, h, ask):
         """Workspace's own outbound mail, made by the host; `cc-mail send` has no config/secret/URL, relays it.
         Runs `outbound.send_to`; socket fixes address+attachments (own trees only), never the payload.
         Verified list, both caps apply as any cold mail; mirrors via mail_started in #<h> or a `thread`."""
         if not isinstance(ask, dict):
-            return {"ok": False, "error": "send wants one object: {\"to\", \"subject\", \"body\", \"attachments\", \"thread\"}"}
+            return {"ok": False, "error": "send wants one object: {\"to\", \"subject\", \"body\", \"attachments\", \"thread\", \"html\", \"images\"}"}
         odd = sorted(set(ask) - set(self.SEND_KEYS))
         if odd:
             return {"ok": False, "error": f"send: unknown key {', '.join(str(k)[:40] for k in odd)} — the keys are {', '.join(self.SEND_KEYS)}"}
@@ -3943,6 +3943,11 @@ class Daemon:
             return {"ok": False, "error": "send: attachments must be a list of file paths"}
         if body is not None and not isinstance(body, str):
             return {"ok": False, "error": "send: body must be a string"}
+        html, pics = ask.get("html"), ask.get("images") or []
+        if html is not None and not isinstance(html, str):
+            return {"ok": False, "error": "send: html must be a string"}
+        if not isinstance(pics, list) or not all(isinstance(a, str) and a.strip() for a in pics):
+            return {"ok": False, "error": "send: images must be a list of file paths"}
         thread = ask.get("thread")
         if thread is not None:
             # checked here, before send_to: mail_started takes any thread a message from one of our addresses names.
@@ -3957,8 +3962,10 @@ class Daemon:
         # The boundary sees its own files dir as ~/.cc/slack/files (the `file` verb's rule); a path there maps to
         # the member dir out here. Nothing else is rewritten or path-checked — send_to judges the fd it opens.
         inside = f"{HOME}/.cc/slack/files/"
-        paths = [HOME + a.strip()[1:] if a.strip().startswith("~/") else a.strip() for a in atts]
-        paths = [f"{member_dir(h)}/files/{q[len(inside):]}" if q.startswith(inside) else q for q in paths]
+        def outside(names):
+            names = [HOME + a.strip()[1:] if a.strip().startswith("~/") else a.strip() for a in names]
+            return [f"{member_dir(h)}/files/{q[len(inside):]}" if q.startswith(inside) else q for q in names]
+        paths, pics = outside(atts), outside(pics)
         try:
             OUT = mail_outbound()
         except ImportError:
@@ -3974,7 +3981,7 @@ class Daemon:
                 return f". Its line is in your thread in #{r.get('name') or t.get('chat')}, and the answer lands there"
             return f". Its thread is in #{r.get('name') or m.get('channel')}"
         ok, line = OUT.send_to(self.cfg, to, str(ask.get("subject") or ""), body or "", attachments=paths,
-                               channel=h, mirror=mirror, thread=thread, workspace=h)
+                               channel=h, mirror=mirror, thread=thread, workspace=h, html=html or "", images=pics)
         log(f"send {h}: to={to[:80]} files={len(paths)} ok={ok}")
         return {"ok": True, "text": line} if ok else {"ok": False, "error": line}
 
@@ -5051,7 +5058,8 @@ class Daemon:
         Mirror line posts first (its ts is the thread); a known conversation adds under its root, not new.
         Vetted once (`vetting.py`): clean delivers, suspicious holds+mentions owner, refused tells sender.
         A mail To a MAIL_QUIET address (router.QUIET) is none of that: `quiet` True, `reply` None, and the
-        receiver sends the sender nothing — the store is the whole delivery."""
+        receiver sends the sender nothing — the store is the whole delivery. MAIL_EXPLAIN is handed over the same
+        way; its mail is an ordinary delivery whose question asks the session for the email-explanation skill."""
         R = mail_router()
         try:
             with open(f"{MAIL_DIR}/inbox/{mail_id}/message.json") as f:
@@ -5060,7 +5068,7 @@ class Daemon:
             return {"ok": False, "error": "no such mail"}
         dec = R.route(msg, MailPlaces(self), self.cfg.get("MAIL_DOMAIN") or "",
                       self.cfg.get("MAIL_WORKSPACE") or "", self.cfg.get("MAIL_UNPLACED") or "main",
-                      self.cfg.get("MAIL_QUIET") or "")
+                      self.cfg.get("MAIL_QUIET") or "", self.cfg.get("MAIL_EXPLAIN") or "")
         if dec.refuse:
             log(f"mail {mail_id} from={msg.get('from', '')} rule={dec.rule or '-'}: refused — {dec.refuse}")
             return {"ok": True, "routed": False, "dropped": True, "why": dec.refuse, "reply": dec.refuse,

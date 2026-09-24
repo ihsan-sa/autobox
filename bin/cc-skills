@@ -9,11 +9,16 @@
 #   overlay, the overlay's config/skills.list (a skill's url names its owner, which core/ must not). CC_SKILLS_LIST
 #   points at another file (the selfcheck's). A url carrying a user or a token is refused: the clone is readable by
 #   every member workspace, so its .git/config must hold nothing a member should not read.
+# A SKILL KEPT IN THIS TREE is a line whose url is `tree:<dir>`, the dir relative to this tree's root (core/ on a box
+#   with an overlay; `tree:skills/email-explanation`). Its source is shipped with the tree, so there is nothing to
+#   clone: sync copies the dir to ~/.claude/skills/<name> whole, with a `.cc-skills-tree` file inside naming the
+#   source, and copies it again whenever the two differ. A dir that is absolute, climbs out with `..` or is not there
+#   is refused, and a directory at the name that is not that copy is left alone, as for a clone.
 # WHERE: each skill is a plain clone at ~/.claude/skills/<name>, where every host session finds it. The name `synced`
 #   belongs to the account's own sync and is never taken; a directory at a listed name that is not a clone of that url
 #   (a skill someone made by hand) is left alone and reported. A new clone is made beside it under a dot name and
 #   renamed in, so a half clone is never a skill.
-# PULL: fetch the branch (default: whichever the clone checked out, i.e. the remote's default) and merge --ff-only. A
+# PULL (a clone): fetch the branch (default: whichever the clone checked out, i.e. the remote's default) and merge --ff-only. A
 #   pull that fails — no network, a diverged or dirty checkout, a url that moved — changes nothing, so the last good copy
 #   stays what every session reads. It is reported ONCE: a stamp at ~/.cc/skills/<name>.fail marks it said, and the
 #   first sync that succeeds removes the stamp and says it recovered. Exit 1 when any skill failed.
@@ -41,14 +46,42 @@ entries(){
     case "$url" in
       *://*@*) echo "cc-skills: $LIST:$ln ($name) puts a user or a token in its url — every member workspace can read the clone, so it is skipped" >&2; continue;;
       https://*|ssh://*|git@*:*|/*) ;;
-      *) echo "cc-skills: $LIST:$ln ($name) has a url that is not https://, ssh://, git@host: or an absolute path — skipped" >&2; continue;;
+      tree:*) case "/${url#tree:}/" in //|/[/]*|*/../*|*/./*) echo "cc-skills: $LIST:$ln ($name) names a tree dir that is empty, absolute or climbs out — skipped" >&2; continue;; esac;;
+      *) echo "cc-skills: $LIST:$ln ($name) has a url that is not https://, ssh://, git@host:, tree: or an absolute path — skipped" >&2; continue;;
     esac
     printf '%s\t%s\t%s\n' "$name" "$url" "$br"
   done < "$LIST"; }
 
-# $1 dir $2 url → 0 when dir is a real directory holding a clone whose origin is url
-managed(){ [ -d "$1" ] && [ ! -L "$1" ] && [ -d "$1/.git" ] && [ ! -L "$1/.git" ] &&
+TREEMARK=.cc-skills-tree
+# $1 url → the absolute source dir of a tree: url (empty for any other url)
+TREE="${CC_SKILLS_TREE:-$R}"   # the root a tree: dir is read from; the selfcheck points it at a fixture
+treesrc(){ case "$1" in tree:*) printf '%s/%s\n' "$TREE" "${1#tree:}";; esac; }
+# $1 dir $2 url → 0 when dir is a real directory holding a clone whose origin is url, or, for a tree: url, the
+# copy sync made of that source (its mark names the source)
+managed(){ local src; src=$(treesrc "$2")
+  if [ -n "$src" ]; then [ -d "$1" ] && [ ! -L "$1" ] && [ -f "$1/$TREEMARK" ] && [ ! -L "$1/$TREEMARK" ] &&
+    [ "$(cat "$1/$TREEMARK" 2>/dev/null)" = "$src" ]; return; fi
+  [ -d "$1" ] && [ ! -L "$1" ] && [ -d "$1/.git" ] && [ ! -L "$1/.git" ] &&
   [ "$(git -C "$1" config --get remote.origin.url 2>/dev/null)" = "$2" ]; }
+# $1 dir $2 url → what `list` says a managed skill is at: the clone's short head, or `tree copy`
+at(){ if [ -n "$(treesrc "$2")" ]; then echo "tree copy"; else git -C "$1" rev-parse --short HEAD 2>/dev/null; fi; }
+
+synctree(){   # $1 name $2 url — copy a tree-kept skill in, whole, when it is missing or differs from its source
+  local n="$1" src d="$SK/$1" tmp old
+  src=$(treesrc "$2")
+  [ -d "$src" ] && [ -f "$src/SKILL.md" ] || { fail "$n" "the tree dir $src is not there or has no SKILL.md"; return 1; }
+  if [ -e "$d" ] || [ -L "$d" ]; then
+    managed "$d" "$2" || { fail "$n" "the directory $d is there but is not the copy of $src, so it is left alone"; return 1; }
+    diff -rq --exclude="$TREEMARK" -- "$src" "$d" >/dev/null 2>&1 && { ok "$n"; return 0; }
+  fi
+  mkdir -p "$SK" || { fail "$n" "cannot make $SK"; return 1; }
+  tmp="$SK/.$n.cc-skills.$$"; old="$SK/.$n.cc-skills-old.$$"; rm -rf "$tmp" "$old"
+  if cp -a -- "$src" "$tmp" && printf '%s\n' "$src" > "$tmp/$TREEMARK"; then
+    if [ -e "$d" ]; then mv -T "$d" "$old" && mv -T "$tmp" "$d" && rm -rf "$old" && { echo "cc-skills: $n copied again from the tree"; ok "$n"; return 0; }
+    elif mv -T "$tmp" "$d"; then echo "cc-skills: $n copied from the tree"; ok "$n"; return 0; fi
+  fi
+  rm -rf "$tmp"; [ -e "$old" ] && [ ! -e "$d" ] && mv -T "$old" "$d"
+  fail "$n" "the copy from $src failed"; return 1; }
 
 fail(){   # $1 name $2 why — say it once, until a sync of that skill succeeds
   local s="$ST/$1.fail"
@@ -61,6 +94,7 @@ ok(){ [ -e "$ST/$1.fail" ] && { rm -f "$ST/$1.fail"; echo "cc-skills: $1 updates
 
 sync1(){   # $1 name $2 url $3 branch
   local n="$1" u="$2" b="$3" d="$SK/$1" tmp out old new
+  [ -n "$(treesrc "$u")" ] && { synctree "$n" "$u"; return; }
   if [ ! -e "$d" ] && [ ! -L "$d" ]; then
     mkdir -p "$SK" || { fail "$n" "cannot make $SK"; return 1; }
     tmp="$SK/.$n.cc-skills.$$"; rm -rf "$tmp"
@@ -84,7 +118,7 @@ cmd_sync(){ local n u b bad=0
 cmd_list(){ local n u b s
   while IFS=$'\t' read -r n u b; do
     if [ -e "$ST/$n.fail" ]; then s="failing: $(head -1 "$ST/$n.fail")"
-    elif managed "$SK/$n" "$u"; then s="at $(git -C "$SK/$n" rev-parse --short HEAD 2>/dev/null)"
+    elif managed "$SK/$n" "$u"; then s="at $(at "$SK/$n" "$u")"
     elif [ -e "$SK/$n" ]; then s="not a clone of the url"; else s="not cloned yet"; fi
     printf '%s\t%s\t%s\t%s\n' "$n" "$u" "${b:-default}" "$s"; done < <(entries); }
 cmd_names(){ local n u b
@@ -94,7 +128,7 @@ selfcheck(){   # its own HOME: a fixture upstream, a fixture list, a fixture not
   local fh n=0 bad=0 up out rc
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccskills-XXXXXX") || return 1
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
-  run(){ env -u CC_SKILLS_TIMEOUT HOME="$fh" CC_SKILLS_LIST="$fh/list" CC_SKILLS_NOTIFY="$fh/notify" \
+  run(){ env -u CC_SKILLS_TIMEOUT HOME="$fh" CC_SKILLS_LIST="$fh/list" CC_SKILLS_NOTIFY="$fh/notify" CC_SKILLS_TREE="$fh/tree" \
     GIT_CONFIG_GLOBAL="$fh/gitconfig" GIT_CONFIG_NOSYSTEM=1 "$SELF" "$@"; }
   gi(){ git -c user.name=t -c user.email=t@t "$@"; }
   printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/notified"\n' "$fh" > "$fh/notify"; chmod +x "$fh/notify"; : > "$fh/gitconfig"
@@ -132,6 +166,24 @@ selfcheck(){   # its own HOME: a fixture upstream, a fixture list, a fixture not
   t 'sync: a diverged clone is not forced — exit 1, content stays, the reason says fast-forward' \
     "$rc/$(tail -1 "$fh/.claude/skills/fx-skill/SKILL.md")/$(grep -c 'not a fast-forward' <<<"$out")" 1/v3/1
   t 'the clone'"'"'s own config names only the url: no credential in it' "$(git -C "$fh/.claude/skills/fx-skill" config --list --local | grep -ci 'credential\|token\|password')" 0
+  # A SKILL KEPT IN THE TREE: its own list and its own fixture tree, no git
+  rm -rf "$fh/.claude/skills" "$fh/.cc/skills"; mkdir -p "$fh/tree/skills/tx" "$fh/.claude/skills/handtree"
+  printf -- '---\nname: tx\n---\nt1\n' > "$fh/tree/skills/tx/SKILL.md"; echo mine > "$fh/.claude/skills/handtree/SKILL.md"
+  printf 'tx tree:skills/tx\nhandtree tree:skills/tx\nup tree:../x\nabs tree:/etc\nnone tree:skills/none\n' > "$fh/list"
+  out=$(run sync 2>&1); rc=$?
+  t 'tree: a listed tree skill is copied whole to ~/.claude/skills/<name>, its mark naming the source' \
+    "$(tail -1 "$fh/.claude/skills/tx/SKILL.md" 2>/dev/null)/$(cat "$fh/.claude/skills/tx/.cc-skills-tree" 2>/dev/null)" "t1/$fh/tree/skills/tx"
+  t 'tree: a dir that climbs out or is absolute is refused, a missing one fails, a hand-made dir is left alone, exit 1' \
+    "$(grep -c 'absolute or climbs out' <<<"$out")/$(grep -c 'not there or has no SKILL.md' <<<"$out")/$(cat "$fh/.claude/skills/handtree/SKILL.md")/$rc" 2/1/mine/1
+  t 'tree: names lists the copy and not the hand-made dir at a tree name' "$(run names 2>/dev/null | tr '\n' ' ')" 'tx '
+  printf 'tx tree:skills/tx\n' > "$fh/list"
+  out=$(run sync 2>&1); rc=$?
+  t 'tree: an unchanged source is not copied again' "$rc/$(grep -c 'copied' <<<"$out")" 0/0
+  printf -- '---\nname: tx\n---\nt2\n' > "$fh/tree/skills/tx/SKILL.md"; echo extra > "$fh/tree/skills/tx/new.md"
+  out=$(run sync 2>&1); rc=$?
+  t 'tree: a changed source is copied again whole, in one sync, and no dot dir is left behind' \
+    "$rc/$(tail -1 "$fh/.claude/skills/tx/SKILL.md")/$(cat "$fh/.claude/skills/tx/new.md")/$(grep -c 'copied again' <<<"$out")/$(find "$fh/.claude/skills" -maxdepth 1 -name '.*cc-skills*' | wc -l)" 0/t2/extra/1/0
+  t 'list: a tree skill reads as a tree copy' "$(run list | cut -f4)" 'at tree copy'
   t '--help exits 0' "$("$SELF" --help >/dev/null 2>&1; echo $?)" 0
   rm -rf "${fh:?}"
   printf 'cc-skills selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }

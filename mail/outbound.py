@@ -147,6 +147,7 @@ MAX_ATTACH = 8 * 1024 * 1024
 SEND_TIMEOUT = 45       # seconds for the whole call to the worker. One attempt, no retry
 USER_AGENT = "cc-mail/1 (+box)"  # urllib's default UA is banned in front of the Worker (Cloudflare 1010)
 LOGMAX = 400            # a log line carries addresses and a worker's error string, so it is escaped and cut
+HTMLMAX = 200 * 1024    # of a cold mail's HTML body (send_to's `html`); its images are files, capped as files
 BODYMAX = 60 * 1024     # of reply text put in one mail. A session that pastes a file into a message is not one
 
 _UNCONFIGURED_SAID = [False]   # the "sending is off" line, once per process — see log_once()
@@ -419,8 +420,8 @@ _MRKDWN = (
 
 
 def plain(text):
-    """The reply as written, with Slack's markup taken off — no HTML part is built anywhere in this file, so
-    this IS the mail. Nothing is added and nothing is summarised: what the thread says is what is sent."""
+    """The reply as written, with Slack's markup taken off — a reply carries no HTML part (only a cold mail's
+    caller can write one, send_to's `html`), so this IS the mail. Nothing is added and nothing is summarised: what the thread says is what is sent."""
     s = str(text or "")
     for pat, rep in _MRKDWN:
         s = pat.sub(rep, s)
@@ -586,7 +587,7 @@ def tagged(addr, tag):
     return "%s+%s@%s" % (local, tag, dom)
 
 
-def build(rec, from_a, to, cc, text, attach=None, mid=None, now=None, subject=None, reply_to=""):
+def build(rec, from_a, to, cc, text, attach=None, mid=None, now=None, subject=None, reply_to="", html="", inline=None):
     """The whole RFC822 message, as bytes, plus the Message-ID it carries.
 
     THREADING IS THE POINT OF THE HEADERS. In-Reply-To names the LAST mail of the conversation — the one this
@@ -619,6 +620,18 @@ def build(rec, from_a, to, cc, text, attach=None, mid=None, now=None, subject=No
         chain = [x for x in (rec.get("references") or []) if x and x != last] + [last]
         m["References"] = " ".join(chain)
     m.set_content(text or "")
+    # AN HTML PART ONLY WHEN A CALLER WROTE ONE — the cold path's `html`, nothing else passes it. The text stays
+    # first and whole, as the fallback every client can show; `inline` is (path, bytes) pairs the HTML names as
+    # cid:<basename>, carried inside the HTML part's own multipart/related so no client lists them as files.
+    if html:
+        m.add_alternative(html, subtype="html")
+        part = m.get_payload()[-1]
+        for path, data in inline or []:
+            ctype, _ = mimetypes.guess_type(path)
+            maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
+            part.add_related(data, maintype=maintype, subtype=subtype or "octet-stream",
+                             cid="<%s>" % os.path.basename(path), disposition="inline",
+                             filename=os.path.basename(path))
     # `attach` is one (path, bytes) pair — the reply path's — or a list of them, the cold path's.
     for path, data in ([attach] if isinstance(attach, tuple) else attach or []):
         ctype, _ = mimetypes.guess_type(path)
@@ -861,7 +874,8 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
 COLD_KEY = "cold"       # every cold mail shares one per-hour bucket: see send_to()
 
 
-def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace=""):
+def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace="",
+            html="", images=None):
     """A MAIL WITH NO MAIL BEHIND IT — the box writing to somebody first. Returns (sent?, one line).
 
     `channel` is the sending session's own channel, or "" — session_channel() read off where the process
@@ -897,6 +911,13 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     refused with the file's name and the reason, before any POST. The reply path downgrades because a Slack
     thread has nowhere to put a refusal; this call has a caller reading its one line, so the line says what
     did not happen and the caller decides (copy the file under a root, or send without it).
+
+    AN HTML BODY IS THE CALLER'S TO ASK FOR, AND THE TEXT STAYS (owner, 2026-09-24: a short explanation "nicely
+    formatted" in the mail itself). `html` given, the mail is multipart/alternative — the text as the fallback,
+    then the HTML — and `images` are files the HTML shows inline as `cid:<basename>`, each read through
+    attach_bytes() under the same rules and cap as an attachment and refused the same way. An HTML body needs
+    its text (a client that shows no HTML shows that) and an image needs an HTML body to sit in. With no `html`
+    nothing here changes: the mail is the one part of text it always was.
 
     THE LINE IS THE WHOLE ANSWER, either way. This is called from a terminal and its caller prints what it
     says, so every outcome here — off, refused, capped, sent, or delivered to some and not others — is one
@@ -946,8 +967,20 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
         return refuse("%s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW when "
                       "it is unset)" % clip(unknown[0]))
     paths = [str(p).strip() for p in (attachments or []) if str(p or "").strip()]
+    html = str(html or "")
+    pics = [str(p).strip() for p in (images or []) if str(p or "").strip()]
+    if html and not body:
+        return refuse("an HTML body needs its plain-text body too, for the clients that show no HTML")
     if not body and not paths:
         return refuse("nothing to send: the mail has no text and no file")
+    if pics and not html:
+        return refuse("images go inside an HTML body, and there is none")
+    if len(html) > HTMLMAX:
+        return refuse("the HTML body is over %d KiB — nothing sent" % (HTMLMAX // 1024))
+    odd = [p for p in pics if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.(png|jpe?g|gif)", os.path.basename(p), re.I)]
+    if odd:
+        return refuse("%s cannot be an inline image — a .png, .jpg or .gif named in letters, digits, dot, dash or "
+                      "underscore, which is what the HTML names it by (cid:<name>) — nothing sent" % clip(os.path.basename(odd[0])))
     # "making the attachment actually attach or saying plainly that it did not" (owner, 2026-09-09): a file
     # that will not travel is named on the refusal line and nothing is posted — never a link line here.
     cap = cfg_int(cfg, "MAIL_OUT_MAX_ATTACH_BYTES", MAX_ATTACH)
@@ -963,6 +996,14 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
             return refuse("%s cannot be attached — not a readable regular file under %s — nothing sent"
                           % (clip(os.path.basename(path)), trees(rec, cfg)))
         attach.append((path, data))
+    inline = []
+    for path in pics:
+        data, why = attach_bytes(os.path.expanduser(path), rec, cfg, cap)
+        if why:
+            return refuse("%s cannot go inline — %s — nothing sent"
+                          % (clip(os.path.basename(path)), "over the attachment cap (MAIL_OUT_MAX_ATTACH_BYTES)"
+                             if why == TOO_BIG else "not a readable regular file under %s" % trees(rec, cfg)))
+        inline.append((path, data))
 
     why = caps(cfg, COLD_KEY, rcpts, now=now)
     if why:
@@ -977,7 +1018,8 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     tag = os.urandom(4).hex() if keyed else ""
     reply_to = tagged(from_a, tag)
     tag = tag if reply_to else ""          # a tag the mail does not carry is not one the record may index
-    raw, mid = build({}, from_a, rcpts, [], body, attach=attach, now=now, subject=subject, reply_to=reply_to)
+    raw, mid = build({}, from_a, rcpts, [], body, attach=attach, now=now, subject=subject, reply_to=reply_to,
+                     html=html, inline=inline)
     ok, failed, err = call_worker(cfg, from_a, rcpts, raw)
     if not ok:
         return refuse(err)

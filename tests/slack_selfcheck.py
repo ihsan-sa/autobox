@@ -6529,9 +6529,11 @@ def run_selfcheck():
         class FakeOut:
             """outbound.send_to as the daemon calls it: records the ask, refuses one address the way the list would."""
             @staticmethod
-            def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace=""):
+            def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace="",
+                        html="", images=None):
                 sentMS.append({"to": to, "subject": subject, "text": text, "attachments": list(attachments or []),
-                               "channel": channel, "workspace": workspace, "thread": thread})
+                               "channel": channel, "workspace": workspace, "thread": thread, "html": html,
+                               "images": list(images or [])})
                 if to == "stranger@x.example":
                     return False, "stranger@x.example is not one of the box's verified destinations — nothing sent"
                 tail = mirror({"channel": channel, "from": f"{channel}@box.example", "to": [to], "message_id": "<m@x>", "tag": "ab12",
@@ -6555,6 +6557,12 @@ def run_selfcheck():
         n_sent_before_main = len(sentMS)
         r_send_main = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b"}}, member=None, peer=(999999, os.getuid(), f"{DEV}/myrepo"))
         sent_ms = list(sentMS)
+        # AN HTML BODY AND ITS IMAGES CROSS AS THEY CAME, the images' paths mapped as a file's are; a non-string html is refused
+        r_send_html = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b", "html": "<p>hi</p>",
+                                       "images": ["~/.cc/slack/files/fig.png"]}})
+        n_sent_html = len(sentMS)
+        r_send_html_bad = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b", "html": 5}})
+        sent_html = list(sentMS)
         globals()["mail_outbound"] = real_mo_ms
 
         # ---- A COURSE THAT APPEARS GETS ITS CHANNEL, WITH NOBODY TYPING ANYTHING (workspace_projects + projects_sweep)
@@ -6985,6 +6993,12 @@ def run_selfcheck():
           and r_send_att.get("ok") is False and "list of file paths" in r_send_att.get("error", "")
           and len(sent_ms) == 5 and n_sent_before_main == 5
           and r_send_main.get("ok") is False and "member-socket verb" in r_send_main.get("error", ""))
+    check("MEMBER socket: `send` hands an html body and its images to send_to — each image path mapped as an attachment's "
+          "is — and refuses an html that is not a string before send_to; an ask without them hands html \"\" and no images",
+          r_send_html.get("ok") and n_sent_html == len(sent_ms) + 1 and sent_html[-1]["html"] == "<p>hi</p>"
+          and sent_html[-1]["images"] == [f"{member_dir('alice')}/files/fig.png"]
+          and r_send_html_bad.get("ok") is False and "html must be a string" in r_send_html_bad.get("error", "")
+          and len(sent_html) == n_sent_html and sent_ms[0]["html"] == "" and sent_ms[0]["images"] == [])
     check("MEMBER socket: a `thread` on `send` is held to the workspace's OWN channels — alice's by id and her track channel "
           "by name cross to send_to as (chat, ts) and the line says where it went; bob's channel and a thread that is not "
           "{chat, ts} are refused before send_to, so a member cannot put a mail's line, or route its answer, elsewhere",
