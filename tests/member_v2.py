@@ -9,6 +9,11 @@ import subprocess as sp
 import tempfile
 import time
 
+# THE BOX'S SPEED IS NOT UNDER TEST. A sandbox launch here is two Python starts, a bwrap and a fence, and on a box at
+# load 70-110 a fixed 30 s ran out and killed the whole selfcheck with TimeoutExpired. Every wait below is for a
+# process to answer or exit; this bound only stops a hang, and no case passes or fails on how long one took.
+GUARD = 600
+
 
 def selfcheck(m):
     passed = failed = 0
@@ -21,7 +26,7 @@ def selfcheck(m):
 
     def call(command, **kwargs):
         return sp.run([str(a) for a in command], stdin=sp.DEVNULL, stdout=sp.PIPE,
-                      stderr=sp.PIPE, timeout=30, **kwargs)
+                      stderr=sp.PIPE, timeout=GUARD, **kwargs)
 
     with tempfile.TemporaryDirectory(prefix="cc-member-v2-") as temp:
         root = Path(temp).resolve()
@@ -149,7 +154,8 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                 out = call(command + ["/usr/bin/sh", "-ec", 'cat "$HOME/.claude/settings.json"; touch /local/allowed; ! touch "$HOME/.claude/settings.json" 2>/dev/null'], env=env)
                 merged = call([m.BIN / "cc-sandbox", "__settings-copy"], env=env)
                 check(out.returncode == 0 and out.stdout == merged.stdout and (h / ".claude/settings.json").read_bytes() == original_settings,
-                      "real settings equal legacy merge; RO denial with task-write control")
+                      "real settings equal legacy merge; RO denial with task-write control",
+                      f"rc={out.returncode} {out.stderr.decode()}; merge rc={merged.returncode} {merged.stderr.decode()}")
                 # The workspace credential is the HOST FILE, bound rw at claude's path — the legacy invariant
                 # (cc-sandbox: claude rewrites it in place, and a copy lost the refresh at exit). The read-only
                 # settings.json in the case above is this one's control: both are file mounts, one each way.
@@ -171,14 +177,14 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                 import pty
                 master, slave = pty.openpty()
                 try:
-                    out = sp.run([str(x) for x in command + ["/usr/bin/true"]], env=env, stdin=slave, stdout=sp.PIPE, stderr=sp.PIPE, timeout=30)
+                    out = sp.run([str(x) for x in command + ["/usr/bin/true"]], env=env, stdin=slave, stdout=sp.PIPE, stderr=sp.PIPE, timeout=GUARD)
                     check(out.returncode == 2 and b"pipes or /dev/null" in out.stderr, "TTY refused; pipe launches above execute")
                     # …and the HOST side is not fenced by the operator's terminal: provisioning runs the seed
                     # step in the sandbox too, but hands it stdio of its own, so the same pty that refuses a
                     # launch provisions a second task fine.
                     (v / "registry/task2.json").write_text(json.dumps(r))
                     out = sp.run([str(x) for x in [m.BIN / "cc-member-v2", "provision", "task2"]], env=env,
-                                 stdin=slave, stdout=slave, stderr=sp.PIPE, timeout=60)
+                                 stdin=slave, stdout=slave, stderr=sp.PIPE, timeout=GUARD)
                     check(out.returncode == 0 and (v / "data/task2/repo/.git").is_dir(),
                           "provisioning from a terminal works; the launch above is the refusal", out.stderr.decode())
                 finally:
@@ -301,7 +307,7 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                             refused = "exposes V" in str(exc)
                         check(refused, "older live namespace exposes V: refused")
                     finally:
-                        older.communicate(b"stop\n", timeout=10)
+                        older.communicate(b"stop\n", timeout=GUARD)
                 m.inventory(v)
                 check(True, "inventory control: provisioning allowed after exposed namespace exits")
                 # …AND UNDER V IS EXPOSURE TOO, not only V and above. The registry decides a task's
@@ -321,7 +327,7 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                             except ValueError as exc:
                                 return str(exc)
                         finally:
-                            held.communicate(b"stop\n", timeout=10)
+                            held.communicate(b"stop\n", timeout=GUARD)
                 under = {str(s): bound(s) for s in (v / "registry", v / "state/task",
                                                     v / "data/task", v / "control/task-1")}
                 beside = {str(s): bound(s) for s in (v / "data/task/repo", v / "control/task-1/view",
@@ -349,7 +355,7 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                               "a sandbox holding its own / and V's spelling in its own tmpfs is not an exposure",
                               refused)
                     finally:
-                        innocent.communicate(b"stop\n", timeout=10)
+                        innocent.communicate(b"stop\n", timeout=GUARD)
                 # A PID THAT EXITS UNDER THE WALK IS NOT EVIDENCE. An unreaped child keeps its /proc entry
                 # under this UID, answers EINVAL on mountinfo and has already dropped ns/mnt — the exact
                 # shape that refused a launch on a busy box. It must be skipped. The case above is the
@@ -357,7 +363,8 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                 gone = sp.Popen(["/bin/true"])   # deliberately not polled: poll() reaps it
                 try:
                     zombie = Path(f"/proc/{gone.pid}")
-                    for _ in range(500):
+                    until = time.monotonic() + GUARD
+                    while time.monotonic() < until:
                         if zombie.exists() and not (zombie / "ns/mnt").exists():
                             break
                         time.sleep(0.01)
@@ -374,6 +381,11 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                     check(shape == "EINVAL" and zombie.stat().st_uid == os.getuid() and not refused,
                           "a pid that exits under the inventory is skipped, not read as an exposure",
                           f"mountinfo={shape or 'readable'}; {refused}")
+                    # …and one still in exit, whose ns/mnt reads a moment after its mountinfo stops: the walk
+                    # skips it on PF_EXITING. The unreaped child carries that flag for good; this process is
+                    # the control, live, and must not read as exiting.
+                    check(m.exiting(zombie) and not m.exiting(Path(f"/proc/{os.getpid()}")),
+                          "a pid part-way through exit is told from a live one by its flags")
                 finally:
                     gone.wait()
             finally:

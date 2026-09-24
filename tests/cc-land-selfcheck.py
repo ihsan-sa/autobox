@@ -3236,6 +3236,135 @@ def selfcheck():
               "approvals, or a 👍 while the worker is already on it, are still one merge",
               rcQ == 0 and len(glob.glob(f"{qdir}/myrepo-*.json")) == 1
               and read_json(job_path("myrepo", 7)).get("ts") == "1.1")
+        # ---- …UNLESS THE JOB IS AT ITS TRY CAP. A capped job answered every 👍 with 'already queued' and sat until a
+        # person deleted its file (lessons #144, 2026-09-24). A re-queue gives that one a fresh start; a job still
+        # working on the PR, or stopped for any reason but the cap, keeps the one-job rule.
+        def requeue(**state):
+            job = dict(read_json(job_path("myrepo", 7)) or {}, repo="myrepo", pr=7, chat="CAPPR", ts="1.1")
+            for k in ("state", "result", "fix", "last", "held", "capped", "say_tries"):
+                job.pop(k, None)
+            write_atomic(job_path("myrepo", 7), dict(job, **state))
+            at = len(open(f"{qdir}/queue.log").read())
+            rc = quiet(cmd_queue, ["myrepo", "7"])
+            return rc, read_json(job_path("myrepo", 7)) or {}, open(f"{qdir}/queue.log").read()[at:]
+        rcQ, job, log = requeue(attempts=LAND_TRIES - 1, stage="gates", last="gates: red")
+        check("reset: a job under its try cap is still live — a re-queue is 'again' and leaves its tries alone",
+              rcQ == 0 and job.get("attempts") == LAND_TRIES - 1 and "again myrepo#7" in log and "requeued" not in log)
+        rcQ, job, log = requeue(attempts=LAND_TRIES, stage="gates", last="gates: red", say_tries=1)
+        check("reset: a job AT its try cap gets a fresh start on a re-queue — attempts 0, stage queued, the old stop "
+              "gone, its thread kept, and a ledger line saying it was reset",
+              rcQ == 0 and job.get("attempts") == 0 and job.get("stage") == "queued" and "last" not in job
+              and "say_tries" not in job and job.get("chat") == "CAPPR" and job.get("ts") == "1.1"
+              and f"requeued myrepo#7 after the try cap (try {LAND_TRIES} of {LAND_TRIES}" in log)
+        stopped = {"ok": False, "rc": 1, "short": "[myrepo] PR #7: not merged"}
+        rcQ, job, log = requeue(attempts=LAND_TRIES, stage="gates", state="done", result=stopped, capped=True,
+                                say_tries=3)
+        check("reset: …and so does one written DONE because the cap stopped it, kept only because Slack never took "
+              "its card",
+              rcQ == 0 and job.get("attempts") == 0 and "state" not in job and "result" not in job
+              and "capped" not in job and "say_tries" not in job and "requeued myrepo#7 after the try cap" in log)
+        live = [("its fix round is still out", dict(attempts=LAND_TRIES, fix={"track": "w1"})),
+                ("it is held for a reason of its own (a draft)",
+                 dict(attempts=LAND_TRIES, stage="held", held="PR #7 is a draft")),
+                ("it landed and only its card is unsaid",
+                 dict(attempts=LAND_TRIES, state="done", result=dict(stopped, ok=True, rc=0))),
+                ("it was refused at the cap's try for a reason a re-queue cannot mend (a verdict, a refused merge)",
+                 dict(attempts=LAND_TRIES, state="done", result=stopped)),
+                ("it was refused before its cap", dict(attempts=1, state="done", result=stopped))]
+        for why, state in live:
+            rcQ, job, log = requeue(**state)
+            check(f"reset: no fresh start when {why} — 'again', the job as it was",
+                  rcQ == 0 and job.get("attempts") == state["attempts"] and "requeued" not in log
+                  and "again myrepo#7" in log and job.get("state") == state.get("state")
+                  and job.get("held") == state.get("held"))
+        held = pr_lock("myrepo", 7, "a hand landing")
+        held.take()
+        try:
+            rcQ, job, log = requeue(attempts=LAND_TRIES, stage="gates")
+        finally:
+            held.release()
+        check("reset: no fresh start while a landing holds the PR's lock, even at the cap — that landing is on it",
+              rcQ == 0 and job.get("attempts") == LAND_TRIES and "again myrepo#7" in log and "requeued" not in log)
+        real_doomed, globals()["doomed"] = doomed, lambda r, p: "the review budget for this change is spent"
+        try:
+            rcQ, job, log = requeue(attempts=LAND_TRIES, stage="review")
+        finally:
+            globals()["doomed"] = real_doomed
+        check("reset: a capped job goes through the same door as a new one — a doomed PR is refused, the old job "
+              "left exactly as it was",
+              rcQ == 1 and job.get("attempts") == LAND_TRIES and "refused myrepo#7 doomed" in log
+              and "requeued" not in log)
+        doors = []
+        real_hit, real_door = protected_hit, say_protected_door
+        globals().update(protected_hit=lambda r, p: ("lib/fetch.py", "lib/"),
+                         say_protected_door=lambda r, p, hit: doors.append((r, p)))
+        def plant(**state):
+            """The job file as a sweep left it, and nothing run: what the cases below start from."""
+            write_atomic(job_path("myrepo", 7), dict({"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1",
+                                                      "queued_at": "2026-09-24T01:00:00Z"}, **state))
+            return read_json(job_path("myrepo", 7))
+        try:
+            before = plant(attempts=LAND_TRIES, stage="gates", last="gates: red")
+            at = len(open(f"{qdir}/queue.log").read())
+            rcQ = quiet(cmd_queue, ["myrepo", "7"])
+            job, log = read_json(job_path("myrepo", 7)), open(f"{qdir}/queue.log").read()[at:]
+        finally:
+            globals().update(protected_hit=real_hit, say_protected_door=real_door)
+        check("reset: a capped job whose PR touches a PROTECTED path is refused at the same door as a new one — no "
+              "fresh start on anyone's 👍 but the owner's, the 🔐 door raised, and the old job file exactly as it was",
+              rcQ == 1 and job == before and doors == [("myrepo", "7")] and "refused myrepo#7 protected:lib/fetch.py" in log
+              and "requeued" not in log)
+        # ---- …and a re-queue never crosses a sweep that is SAYING the capped job's result (#645's security read):
+        # finish() is out in say_result, Slack slow, and its stale copy used to be written back over the fresh job,
+        # or the fresh job unlinked on the last say-try, after the 👍 was told 're-queued'.
+        real_say, during = say_result, []
+        for tries, what in ((0, "written back over it"), (SAY_TRIES - 1, "unlinked")):
+            plant(attempts=LAND_TRIES, stage="gates", last="gates: red", say_tries=tries)
+            during.clear()
+
+            def slow_say(job, r):
+                during.append(quiet(cmd_queue, ["myrepo", "7"]))       # a 👍 while the card is out
+                return False                                           # …and Slack refuses the card
+            globals()["say_result"] = slow_say
+            try:
+                at = len(open(f"{qdir}/queue.log").read())
+                quiet(run_one, job_path("myrepo", 7))
+            finally:
+                globals()["say_result"] = real_say
+            log, job = open(f"{qdir}/queue.log").read()[at:], read_json(job_path("myrepo", 7))
+            check(f"reset: a re-queue while the sweep is saying a capped job's result waits for it — 'again', not "
+                  f"'re-queued' — so nothing it was told is {what} (say try {tries + 1} of {SAY_TRIES})",
+                  during == [0] and "again myrepo#7" in log and "requeued" not in log
+                  and (job is None if tries == SAY_TRIES - 1 else (job or {}).get("say_tries") == 1))
+        for tries, what in ((0, "written back over"), (SAY_TRIES - 1, "unlinked")):
+            plant(attempts=LAND_TRIES, stage="gates", say_tries=tries)
+            fresh_job = {"repo": "myrepo", "pr": 7, "queued_at": "2026-09-24T02:00:00Z", "attempts": 0,
+                         "stage": "queued"}
+
+            def crossed_say(job, r):
+                write_atomic(job_path("myrepo", 7), fresh_job)            # a fresh job lands while the card is out
+                return False
+            globals()["say_result"] = crossed_say
+            try:
+                quiet(finish, job_path("myrepo", 7), read_json(job_path("myrepo", 7)))
+            finally:
+                globals()["say_result"] = real_say
+            check(f"reset: finish() reads the file again after say_result — a fresh job written there meanwhile is "
+                  f"not {what} by the stale copy (say try {tries + 1} of {SAY_TRIES})",
+                  read_json(job_path("myrepo", 7)) == fresh_job)
+        plant(attempts=LAND_TRIES, stage="gates", say_tries=0)
+
+        def cleared_say(job, r):
+            os.unlink(job_path("myrepo", 7))                              # a person clears the job while the card is out
+            return False
+        globals()["say_result"] = cleared_say
+        try:
+            quiet(finish, job_path("myrepo", 7), read_json(job_path("myrepo", 7)))
+        finally:
+            globals()["say_result"] = real_say
+        check("reset: a job file cleared while finish() waits on Slack stays gone — a refused post does not write "
+              "the stale copy back", read_json(job_path("myrepo", 7)) is None)
+        plant(attempts=0, stage="queued")
 
         # ---- AT THE DOOR. Measured 2026-09-07: of 25 landings that ended "the review budget for this change is
         # spent", 8 were a re-queue of a PR already refused for exactly that with no --re-review — jobs that could
@@ -4360,6 +4489,18 @@ def selfcheck():
                                "Fix it, then re-queue it")
                   and "try 3 of 3" in record() and "old code" not in told()
                   and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
+            landing(**{GATE: (1, "  ✗ the row was wrong\n1 failed\n"), f"{BIN}/cc-slack post -c CAPPR": (1, "not sent")})
+            for _ in range(LAND_TRIES):
+                quiet(cmd_work, [])
+            kept = read_json(job_path("myrepo", 7)) or {}
+            check("…and when Slack refuses that card, the job it keeps is marked as stopped by the try cap alone, so a "
+                  "re-queue gives it a fresh start instead of 'already queued' (lessons #144, 2026-09-24)",
+                  kept.get("state") == "done" and kept.get("capped") is True and kept.get("attempts") == LAND_TRIES)
+            rcQ = quiet(cmd_queue, ["myrepo", "7"])
+            kept = read_json(job_path("myrepo", 7)) or {}
+            check("…and the re-queue does: attempts 0, not done, its thread kept",
+                  rcQ == 0 and kept.get("attempts") == 0 and "state" not in kept and kept.get("chat") == "CAPPR")
+            world.pop(f"{BIN}/cc-slack post -c CAPPR", None)
             landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n"),
                        GATE: (0, "  ✓ the first\n  ✓ H4\n0 failed\n")})
             quiet(cmd_work, [])                # gated green, and THEN the limit: deferred, uncounted, PR unread —

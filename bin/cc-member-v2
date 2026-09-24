@@ -83,6 +83,12 @@ def opened(root, path, flags=os.O_PATH, directory=False):
     return fd
 
 
+def exiting(proc):
+    # Field 9 of /proc/<pid>/stat is the task's flags; PF_EXITING is 0x4. The name in field 2 may hold spaces
+    # and parentheses, so the fields are counted from its LAST closing parenthesis.
+    return bool(int((proc / "stat").read_text().rsplit(")", 1)[1].split()[6]) & 0x4)
+
+
 def inventory(v):
     # WHAT IS INSPECTED: every same-UID process whose mount namespace is not this one AND whose root
     # mount is a tmpfs — the shape every sandbox on this box has, because bwrap always builds its root
@@ -141,8 +147,14 @@ def inventory(v):
             # evidence, and the link below says which it is: exit drops the namespace, so a zombie has
             # no ns/mnt to read. One that is still live and will not be read IS evidence, and an
             # unreadable inventory fails rather than guesses. A refusal is a ValueError, not caught here.
+            # A process part-way through exit is not live either. The kernel drops its root (so `mountinfo`
+            # answers ENOENT) a moment BEFORE it drops the namespace, and on a loaded box a walk lands in that
+            # window: ns/mnt still reads while mountinfo does not. PF_EXITING is set before either goes and
+            # never cleared, so it tells that pid from one that is live and will not be read.
             try:
                 os.readlink(p / "ns/mnt")
+                if exiting(p):
+                    continue
             except OSError:
                 continue
             raise ValueError(f"live namespace {p.name} cannot be inspected") from None

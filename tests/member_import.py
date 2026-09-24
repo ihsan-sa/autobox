@@ -17,7 +17,12 @@ def selfcheck(m):
         nonlocal passed, failed
         passed += bool(ok); failed += not ok
         print(f"  {'ok' if ok else 'FAIL'} import: {name}" + (f": {detail}" if not ok else ""), flush=True)
-    oldenv = dict(os.environ)
+    oldenv, wall = dict(os.environ), m.WALL
+    # THE BOX'S SPEED IS NOT UNDER TEST. The production deadline is 20 s for a whole contained check, and on a box
+    # at load 100 an ordinary import here took longer and came back refused for TIME. The deadline case below proves
+    # enforcement with a deadline of its own, 300 times shorter than the pause it cuts off; every other case proves
+    # behaviour, so its bound only stops a hang.
+    m.WALL = 600.0
     with tempfile.TemporaryDirectory(prefix="cc-member-import-") as temp:
         root = Path(temp).resolve(); home, v = root / "home", root / "v"
         for path in (home / ".claude", home / ".local/bin", home / ".cc/members/team", v / "registry", v / "repos"):
@@ -143,26 +148,35 @@ def selfcheck(m):
                 data = bundle(commit(source, base, mode=mode, contents=b"target"))
                 ok, reason = importing(label.replace(" ", "-"), submit(label.replace(" ", "-"), data))
                 check(ok is not None, label + " imports; noncanonical mode is the refusal case", reason)
-            # The timeout case runs the same namespace and fence with a paused trusted fixture entry.
+            # The timeout case runs the same namespace and fence with a paused trusted fixture entry. The pause
+            # is 300 times the deadline, so a refusal for TIME can only be the deadline cutting it off: were the
+            # deadline not enforced the pause would end and the import succeed. The one clock reading is loose on
+            # purpose: it times only the contained call, host walk excluded, and a deadline that fired past half the
+            # pause (30 s, 150 times the deadline) would not be the deadline this file declares.
             saved = m.Importer.contained
             worker_copy = root / "timeout-runner.py"
-            worker_copy.write_text(Path(m.__file__).read_text().replace("def worker(meta):", "def worker(meta):\n    time.sleep(2)"))
+            worker_copy.write_text(Path(m.__file__).read_text().replace("def worker(meta):", "def worker(meta):\n    time.sleep(60)"))
             def timeout(self, sourcefd, scratch, meta):
                 original, original_file = m.bounded, m.__file__
                 m.__file__ = str(worker_copy)
                 m.bounded = lambda argv, **kw: original(argv, seconds=0.2, **kw)
+                start = time.monotonic()
                 try:
                     return saved(self, sourcefd, scratch, meta)
                 finally:
+                    cut.append(time.monotonic() - start)
                     m.bounded, m.__file__ = original, original_file
+            cut = []
             m.Importer.contained = timeout
-            transfer = submit("deadline", good); before = snapshot(); start = time.monotonic()
-            refused, reason = importing("deadline", transfer); elapsed = time.monotonic() - start
+            transfer = submit("deadline", good); before = snapshot()
+            refused, reason = importing("deadline", transfer)
             unchanged = snapshot() == before
             m.Importer.contained = saved
             control, detail = importing("deadline", transfer)
-            check(refused is None and unchanged and "deadline" in reason and elapsed < 2 and control is not None,
-                  f"deadline refuses at {elapsed:.3f}s; same transfer imports inside limit", detail)
+            check(refused is None and unchanged and "deadline" in reason and len(cut) == 1 and cut[0] < 30
+                  and control is not None,
+                  "a deadline cuts off a paused check with the host unchanged; the same transfer imports unpaused",
+                  f"{reason}; contained call took {cut}; control: {detail}")
             def decorated(self, sourcefd, scratch, meta):
                 result = saved(self, sourcefd, scratch, meta)
                 if meta["phase"] == "check":
@@ -408,13 +422,19 @@ def selfcheck(m):
                     os._exit(0)
                 except BaseException:
                     os._exit(1)
-            try:
-                until = time.monotonic() + 8
-                while not (leaf / "ready").exists() and time.monotonic() < until:
+            def paused(pid, leaf):
+                # Until the check says it is paused, or has exited without saying so: a fixed wait failed a loaded
+                # box that was only slow to start the namespace. WNOWAIT leaves the child for waitpid below. A hang
+                # still ends: the child's own contained call is bounded by m.WALL and exits when that runs out.
+                while not (leaf / "ready").exists():
+                    if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                        return
                     time.sleep(0.02)
+            try:
+                paused(pid, leaf)
                 def provision(name):
                     return sp.run([str(m.BIN / "cc-member-v2"), "provision", name], stdin=sp.DEVNULL,
-                                  stdout=sp.PIPE, stderr=sp.PIPE, timeout=30)
+                                  stdout=sp.PIPE, stderr=sp.PIPE, timeout=m.WALL)
                 during = provision("during")
                 (leaf / "release").touch(); status = os.waitpid(pid, 0)[1]; pid = None
                 after = provision("after")
@@ -432,9 +452,7 @@ def selfcheck(m):
                         os._exit(0)
                     except BaseException:
                         os._exit(1)
-                until = time.monotonic() + 8
-                while not (stageleaf / "ready").exists() and time.monotonic() < until:
-                    time.sleep(0.02)
+                paused(pid, stageleaf)
                 during = provision("during-stage")
                 (stageleaf / "release").touch(); status = os.waitpid(pid, 0)[1]; pid = None
                 after = provision("after-stage")
@@ -461,7 +479,7 @@ f = c.makefile('rb'); event = json.loads(f.readline())
 print(json.dumps(dict(event=event, commit=s.check_output(['git','cat-file','commit','HEAD']).hex(), tree=s.check_output(['git','cat-file','tree','HEAD^{tree}']).hex())), flush=True)
 '''
             out = sp.run([str(m.BIN / "cc-member-v2"), "run", "team", "during", "--", "/usr/bin/python3", "-IS", "-c", member],
-                         stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.PIPE, timeout=30)
+                         stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.PIPE, timeout=m.WALL)
             value = json.loads(out.stdout); result, reason = importing("during", value["event"]["transfer"])
             check(out.returncode == 0 and result is not None and value["event"]["ok"]
                   and m.git(str(host), "cat-file", "commit", result["tip"])[0].hex() == value["commit"]
@@ -472,6 +490,6 @@ print(json.dumps(dict(event=event, commit=s.check_output(['git','cat-file','comm
                   and mapping(("transfers", transfer)) is None and mapping(("registry",)) is None,
                   "transfer leaves share a non-task token; V and registry remain ungranted")
         finally:
-            os.environ.clear(); os.environ.update(oldenv)
+            os.environ.clear(); os.environ.update(oldenv); m.WALL = wall
     print(f"cc-member-import selfcheck: {passed} passed, {failed} failed")
     return int(bool(failed))

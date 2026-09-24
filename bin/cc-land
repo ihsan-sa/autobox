@@ -1035,7 +1035,7 @@ def pr_lock_path(repo, pr):
 
 
 class pr_lock:
-    """ONE LANDING PER PR, across processes. An flock taken before a gate or a read is bought — by the direct path (Land.run) and the queue's (run_one) alike — and held to the end of that landing; the holder writes who it is into the file (pid, since, the caps it runs at, its flags) so the one that arrives second names it and stands down having bought nothing. Two landers on one PR each paid the gates and a $3 review (#496 2026-09-16, and #501 the same day: a hand --re-review beside the queue's own job, the job file's absence read as 'nobody owns this PR' — the live lander is the object, not the file). `record` and `queue` never take it. A lock that cannot be made is held by nobody: the landing goes on."""
+    """ONE LANDING PER PR, across processes. An flock taken before a gate or a read is bought — by the direct path (Land.run) and the queue's (run_one) alike — and held to the end of that landing; the holder writes who it is into the file (pid, since, the caps it runs at, its flags) so the one that arrives second names it and stands down having bought nothing. Two landers on one PR each paid the gates and a $3 review (#496 2026-09-16, and #501 the same day: a hand --re-review beside the queue's own job, the job file's absence read as 'nobody owns this PR' — the live lander is the object, not the file). `record` never takes it, and `queue` takes it only to restart a job at its try cap (gave_up), and holds it just until the fresh job is written. A lock that cannot be made is held by nobody: the landing goes on."""
 
     def __init__(self, repo, pr, flags=""):
         self.repo, self.pr, self.flags, self.fd = repo, pr, flags, None
@@ -2973,10 +2973,14 @@ SAY_TRIES = 6   # sweeps (RETRY_AFTER apart) a result whose post Slack refuses i
 
 
 def finish(path, job):
-    """Say it once, then forget the job: 'said' is written before the file goes, and said means Slack took it. A refused post keeps the job on disk for the next sweep, up to SAY_TRIES, after which the ledger line is the record."""
+    """Say it once, then forget the job: 'said' is written before the file goes, and said means Slack took it. A refused post keeps the job on disk for the next sweep, up to SAY_TRIES, after which the ledger line is the record. The file is read again before a word is said and after say_result: a job re-queued over it (a new queued_at, gave_up) is not this one, and is neither said, written over nor unlinked."""
+    if not same_job(path, job):
+        return
     if not job.get("posted"):
         r = job.get("result") or {}
         said = say_result(job, r)
+        if not same_job(path, job):
+            return
         if not said and job.get("say_tries", 0) + 1 < SAY_TRIES:
             job["say_tries"] = job.get("say_tries", 0) + 1
             ledger(f"unsaid {job.get('repo')}#{job.get('pr') or 'deploy'}: Slack did not take the result (try {job['say_tries']} of {SAY_TRIES}) — kept for the next sweep")
@@ -2993,6 +2997,12 @@ def finish(path, job):
             write_atomic(path, job)
     with contextlib.suppress(OSError):
         os.unlink(path)
+
+
+def same_job(path, job):
+    """Whether the file at `path` is still `job` (the same queued_at): finish()'s guard against a re-queue. A file gone is not this job either — someone cleared it, and a refused post must not write it back."""
+    now = read_json(path)
+    return now is not None and now.get("queued_at") == job.get("queued_at")
 
 
 STOP_CARD_MAX = 200   # the whole NOT-merged card. It is the commonest thing the box puts in front of the owner and
@@ -3519,12 +3529,15 @@ def run_job(path, job):
             return line
     decided = L.stopped == "gates" and " conflicts with " in L.why    # no flake: nothing but a rebase changes it.
     # (A conflict GitHub knew of is held above; this is the one merge_result finds itself, which is fresh.)
-    if rc == 1 and (L.stopped in RETRY or L.stopped == "load") and not decided and job["attempts"] < LAND_TRIES:
+    retry = rc == 1 and (L.stopped in RETRY or L.stopped == "load") and not decided
+    if retry and job["attempts"] < LAND_TRIES:
         # Kept, so the next sweep re-drives it; the not_before goes with the try, or a spent reset would be read as the schedule; the stage is the step that stopped.
         job_set(path, job, last=f"{L.stopped}: {L.why}"[:400], stage=L.stopped, not_before=None)
         return (f"[{repo}] {L.what()}: {L.stopped} failed on try {job['attempts']} of {LAND_TRIES} — "
                 f"kept for the next sweep")
     job["state"], job["result"] = "done", result_of(L, rc, job, tail)
+    if retry:
+        job["capped"] = True                   # stopped by the try cap and nothing else: a re-queue restarts it (gave_up)
     write_atomic(path, job)                    # decided, on disk, before a word of it is said
     finish(path, job)
     return job["result"]["short"]
@@ -3572,8 +3585,7 @@ def run_one(path):
     if why:
         return f"[{job['repo']}] {'PR #' + str(job['pr']) if job.get('pr') else 'deploy'}: {why}"
     if job.get("state") == "done":
-        finish(path, job)                        # killed between deciding and saying it: say it now, once
-        return (job.get("result") or {}).get("short", "")
+        return say_alone(path, job)              # killed between deciding and saying it: say it now, once
     if (job.get("fix") or {}).get("over") is None and job.get("fix"):
         line = fix_progress(path, job)           # a dispatched fix iteration: has it pushed? Asked BEFORE the wait
         if line:                                 # below, so a sweep any 👍 starts picks the push up at once
@@ -3582,8 +3594,7 @@ def run_one(path):
         return (f"[{job['repo']}] {'PR #' + str(job['pr']) if job.get('pr') else 'deploy'}: waits until "
                 f"{job['not_before']} ({(job.get('last') or '')[:120]})")
     if job.get("attempts", 0) >= LAND_TRIES:
-        finish(path, job)                        # gave up earlier and never got to speak
-        return (job.get("result") or {}).get("short", "")
+        return say_alone(path, job)              # gave up earlier and never got to speak
     lock = pr_lock(job["repo"], job["pr"], "queue") if job.get("pr") else None
     other = lock.take() if lock else ""
     if other:
@@ -3595,6 +3606,20 @@ def run_one(path):
     finally:
         if lock:
             lock.release()
+
+
+def say_alone(path, job):
+    """run_one's finish() for a job that only has to speak (done, or at its cap), under the PR's lock — the one a re-queue holds while it writes a fresh job over a capped one (gave_up). Without it a 👍 landing while say_result was out had its fresh job written over by this stale copy, or unlinked on the last say-try, after it was told 're-queued' (#645's security read). Held by anyone else, the file is theirs: nothing is said or written, and the next sweep says it."""
+    lock = pr_lock(job["repo"], job["pr"], "queue") if job.get("pr") else None
+    other = lock.take() if lock else ""
+    if other:
+        return f"[{job['repo']}] PR #{job['pr']}: its result waits — {other[:200]}"
+    try:
+        finish(path, job)
+    finally:
+        if lock:
+            lock.release()
+    return (job.get("result") or {}).get("short", "")
 
 
 def known_repos():
@@ -3747,6 +3772,25 @@ def queue_place(path, running):
 def lane_jobs(repo):
     """This repo's job files, oldest first."""
     return queue_order([p for p in glob.glob(f"{LANDQ}/*.json") if (read_json(p) or {}).get("repo") == repo])
+
+
+def gave_up(repo, pr, job):
+    """The PR's lock, HELD, when its job has stopped at its try cap, so a re-queue gives it a fresh start instead of 'already queued'; else None. A capped job answered every 👍 with 'again' and sat until a person deleted its file (lessons #144, 2026-09-24). Only the cap: never a job that is held (a draft, a conflict, a refused repair), one with a fix round out, one done for a reason a re-queue cannot mend (a verdict, a refused merge — `capped` marks a done job the cap alone stopped, run_job), and never while a landing or a sweep saying its result holds the PR. The caller keeps the lock until the fresh job is written and then lets it go: a sweep's finish() takes the same lock (say_alone), so its stale copy is never written back over the fresh job, nor the fresh job unlinked."""
+    if not isinstance(job, dict) or not job.get("pr") or job.get("attempts", 0) < LAND_TRIES:
+        return None                              # unreadable, a deploy job, or still under its cap: 'already queued'
+    fix = job.get("fix") or {}
+    if job.get("held") or job.get("stage") == "held" or (fix and fix.get("over") is None):
+        return None
+    if job.get("state") == "done" and not job.get("capped"):
+        return None
+    lock = pr_lock(repo, pr, "queue")
+    if lock.take():
+        return None
+    now = read_json(job_path(repo, pr))          # what it read before the lock may have been said and gone since
+    if not now or now.get("queued_at") != job.get("queued_at"):
+        lock.release()
+        return None
+    return lock
 
 
 # ── the batch: ordinary PRs land together, and the suite runs on the base once ───────────────────────
@@ -4314,45 +4358,63 @@ def cmd_queue(argv):
         if not root:
             ledger(f"refused {repo}#{pr} no-clone")
             return refuse(f"PR #{pr} is not queued — {why}", 1)
-    if os.path.exists(path):
+    old = read_json(path) if os.path.exists(path) else None
+    restart = gave_up(repo, pr, old) if old else None     # the PR's lock, held until the fresh job is written
+    if os.path.exists(path) and not restart:
         print(f"[{repo}] PR #{pr} is already queued — one job per PR, so two 👍 are still one landing")
         ledger(f"again {repo}#{pr}")
     else:
-        # PROTECTED PATHS (the owner, #lessons 2026-09-18: "make sure lesson sessions, etc cant edit the fetcher"): a PR that
-        # touches one is never landed on the box's own say-so — not by the standing grant, not by a member's 👍, whatever
-        # the gates and the review would say. It is refused HERE, so no job exists — and the refusal raises the 🔐 card
-        # his 👍 queues it from (say_protected_door), because the PR's own card may be in the log lane, where no
-        # reaction does anything: only the owner's own 👍 queues it (owner_approved), and it has to have somewhere to go.
-        hit, approved_head = protected_hit(repo, pr), ""
-        if hit and not owner_approved(approved_by):
-            ledger(f"refused {repo}#{pr} protected:{hit[0]}")
-            say_protected_door(repo, pr, hit)
-            return refuse(f"PR #{pr} is not queued — it touches {hit[0]}, under {repo}'s PROTECTED path {hit[1]} "
-                          f"(CC_PROTECTED_PATHS_{repo}). The box never lands one of these on its own, whatever the gates "
-                          f"and the review say: only the owner's own 👍 on the 🔐 card in #approvals queues it", 1)
-        if hit:
-            # His 👍 is about THIS head and no other, so the head is pinned on the job beside his uid and the pair
-            # is re-asked at every head after it (protected_stop). A head gh will not name pins nothing.
-            approved_head = pr_head(repo, pr)
-            if not approved_head:
-                ledger(f"refused {repo}#{pr} protected:{hit[0]}")
-                return refuse(f"PR #{pr} is not queued — it touches {hit[0]}, under {repo}'s PROTECTED path "
-                              f"{hit[1]}, and gh cannot say what head the 👍 is about, so nothing can hold the "
-                              f"approval to one", 1)
-        # At the door, before a job file exists: doomed() re-asks GitHub in one call and answers '' for every uncertainty.
-        why = doomed(repo, pr)
-        if why:
-            ledger(f"refused {repo}#{pr} doomed")
-            return refuse(f"PR #{pr} is not queued — it cannot succeed as it stands, and this was decided when it "
-                          f"was asked for rather than after its gates:\n{why}", 1)
         try:
-            write_atomic(path, {"repo": repo, "pr": int(pr), "chat": chat, "ts": ts, "who": who,
-                                "approved_by": approved_by, "approved_head": approved_head,
-                                "queued_at": stamp(), "attempts": 0, "stage": "queued"})
-        except OSError as e:
-            return refuse(f"cannot write {path}: {e} — nothing merged", 1)
-        ledger(f"queued {repo}#{pr} who={who or '-'} chat={chat or '-'}")
-        print(f"[{repo}] PR #{pr} queued — the gates run first, then the merge, then the deploy")
+            # A job at its TRY CAP is not a job in the way: it goes through the same door as a new one (a protected path
+            # or a doomed PR is refused here and the old file stays as it was) and is written over with a fresh start —
+            # its thread kept when this 👍 names none, its approval not: the owner's 👍 was about the head it had.
+            if old:
+                chat, ts = chat or old.get("chat") or "", ts or old.get("ts") or ""
+            # PROTECTED PATHS (the owner, #lessons 2026-09-18: "make sure lesson sessions, etc cant edit the fetcher"): a PR that
+            # touches one is never landed on the box's own say-so — not by the standing grant, not by a member's 👍, whatever
+            # the gates and the review would say. It is refused HERE, so no job exists — and the refusal raises the 🔐 card
+            # his 👍 queues it from (say_protected_door), because the PR's own card may be in the log lane, where no
+            # reaction does anything: only the owner's own 👍 queues it (owner_approved), and it has to have somewhere to go.
+            hit, approved_head = protected_hit(repo, pr), ""
+            if hit and not owner_approved(approved_by):
+                ledger(f"refused {repo}#{pr} protected:{hit[0]}")
+                say_protected_door(repo, pr, hit)
+                return refuse(f"PR #{pr} is not queued — it touches {hit[0]}, under {repo}'s PROTECTED path {hit[1]} "
+                              f"(CC_PROTECTED_PATHS_{repo}). The box never lands one of these on its own, whatever the gates "
+                              f"and the review say: only the owner's own 👍 on the 🔐 card in #approvals queues it", 1)
+            if hit:
+                # His 👍 is about THIS head and no other, so the head is pinned on the job beside his uid and the pair
+                # is re-asked at every head after it (protected_stop). A head gh will not name pins nothing.
+                approved_head = pr_head(repo, pr)
+                if not approved_head:
+                    ledger(f"refused {repo}#{pr} protected:{hit[0]}")
+                    return refuse(f"PR #{pr} is not queued — it touches {hit[0]}, under {repo}'s PROTECTED path "
+                                  f"{hit[1]}, and gh cannot say what head the 👍 is about, so nothing can hold the "
+                                  f"approval to one", 1)
+            # At the door, before a job file exists: doomed() re-asks GitHub in one call and answers '' for every uncertainty.
+            why = doomed(repo, pr)
+            if why:
+                ledger(f"refused {repo}#{pr} doomed")
+                return refuse(f"PR #{pr} is not queued — it cannot succeed as it stands, and this was decided when it "
+                              f"was asked for rather than after its gates:\n{why}", 1)
+            try:
+                write_atomic(path, {"repo": repo, "pr": int(pr), "chat": chat, "ts": ts, "who": who,
+                                    "approved_by": approved_by, "approved_head": approved_head,
+                                    "queued_at": stamp(), "attempts": 0, "stage": "queued"})
+            except OSError as e:
+                return refuse(f"cannot write {path}: {e} — nothing merged", 1)
+            if restart:
+                ledger(f"requeued {repo}#{pr} after the try cap (try {old.get('attempts', 0)} of {LAND_TRIES}, "
+                       f"{old.get('stage') or old.get('state') or '-'}) who={who or '-'} "
+                       f"was: {((old.get('result') or {}).get('short') or old.get('last') or '-')[:200]}")
+                print(f"[{repo}] PR #{pr} had used up its tries — re-queued with a fresh start: the gates run first, "
+                      f"then the merge, then the deploy")
+            else:
+                ledger(f"queued {repo}#{pr} who={who or '-'} chat={chat or '-'}")
+                print(f"[{repo}] PR #{pr} queued — the gates run first, then the merge, then the deploy")
+        finally:
+            if restart:
+                restart.release()
     # Where it stands and which run of its lane takes it (queue_place): the running lane is read before start_worker, or the lane this call starts reads as one already in flight.
     running = sweep_running(repo)
     # A 👍 on a parked project is kept, not refused: the job file is written, the worker is not started. Exit 0.
