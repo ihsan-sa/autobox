@@ -70,7 +70,11 @@ if [ "${1:-}" = selfcheck ]; then
   # The RUNNER's env decides nothing here: a worker running the gates exports CC_ROLE, and a member session its
   # CC_GUARD_ASKS — each case sets what it needs and reaches the child through `env` below.
   unset CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_ROLE CC_HANDOFF CC_HANDOFF_DIR CC_GUARD_ASKS CC_GUARD_ASK_TTL CC_GUARD_ROOT_PID CC_FAILURES
-  T=$(mktemp -d); H=$T/home; WT=$H/.cc/worktrees/demo/t1; n=0; f=0; pids=""
+  # THE FIRST FIXTURE IS UNDER /tmp BY NAME, NOT UNDER $TMPDIR. Every case below was written against a $T in /tmp,
+  # and cc now hands sessions TMPDIR=~/.cc/tmp (#639): there $T sat under /home, the recursive-delete text rule
+  # matched every fixture path before the rule a case was asserting, and the three rm rows of the arch fence were
+  # refused for the wrong reason. Where a fixture must sit OUTSIDE /tmp, that is $T2, on purpose.
+  T=$(mktemp -d -p /tmp); H=$T/home; WT=$H/.cc/worktrees/demo/t1; n=0; f=0; pids=""
   # A SECOND FIXTURE HOME, AND THE POINT OF IT IS THAT IT IS NOT UNDER /tmp: the write-path rules wave /tmp
   # through as scratch, so a fixture there cannot test them at all — every path in $T is already allowed.
   # $HOME, because it is the one dir outside /tmp that exists in every place this runs; it goes with $T below.
@@ -84,11 +88,17 @@ if [ "${1:-}" = selfcheck ]; then
   printf '#!/bin/sh\necho "notify $*" >> "$CALLS"\n' > "$H/bin/cc-notify"
   printf '#!/bin/sh\necho "slack $*" >> "$CALLS"\n' > "$H/bin/cc-slack"
   chmod +x "$H/bin/cc-notify" "$H/bin/cc-slack"
-  # …and the failure ledger's door the same way: the real cc-failures beside this file, logging each call, aimed at
-  # a ledger of the FIXTURE's own. CC_FAILURES is exported for every case below, whichever binary a refusal finds:
-  # a refusal in any case here must never write the box's ledger (note_refusal).
+  # …and the failure ledger's door the same way: it logs each call and keeps the first call's arguments whole (NUL
+  # between them) in $CALLS.args. It does NOT run the real writer: the guard gives that `timeout 5`, and on a loaded
+  # box the write can outlast it, so a case reading the ledger went red on the box's speed (case 50a replays
+  # the kept arguments through the real one itself, untimed). CC_FAILURES is exported for every case below all the
+  # same, whichever binary a refusal finds: a refusal in any case here must never write the box's ledger.
   export CC_FAILURES=$T/ledger
-  printf '#!/bin/sh\necho "failures $*" >> "$CALLS"\nexec "%s/cc-failures" "$@"\n' "$(dirname "$(realpath "$0")")" > "$H/bin/cc-failures"
+  cat > "$H/bin/cc-failures" <<'FSTUB'
+#!/bin/sh
+echo "failures $*" >> "$CALLS"
+[ -e "$CALLS.args" ] || printf '%s\000' "$@" > "$CALLS.args"
+FSTUB
   chmod +x "$H/bin/cc-failures"
   # ...and a stand-in for a session process: `claude -p` is what the kill fence must never let go, and the
   # cases below need one they started themselves rather than a real session of this box's to point at.
@@ -457,13 +467,15 @@ W11B
   [ "$got" = 0 ] || { r=1; echo "      the pulse's own ledger write was refused at the ungated tier: rc $got"; }
   # …and the two bounds the walk carries, which fail OPEN on purpose. Before them one statement of 3000 words
   # — `for f in <3000 paths>` — cost 27 seconds inside a PreToolUse hook; the answer must arrive, and a long
-  # argument list must not be refused for being long. 10s against a measured 0.6s: this catches a hang, not a
-  # slow box.
+  # argument list must not be refused for being long. What is bounded is the WORK, the CPU seconds the call and
+  # everything it ran spent: 10s against a measured 0.6s. A wall-clock bound measured the box instead, and went
+  # red at load 50 with the walk as fast as ever. The wall bound left is 300s, a hang guard and nothing finer.
   big=$(printf myprog; i=0; while [ $i -lt 3000 ]; do printf ' arg%d' $i; i=$((i+1)); done)
-  t0=$SECONDS
-  got=$(g Bash "{\"command\":\"$big\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
-  { [ "$got" = 0 ] && [ $((SECONDS - t0)) -lt 10 ]; } \
-    || { r=1; echo "      a 3000-word statement was refused or took $((SECONDS - t0))s (rc $got)"; }
+  t0=$SECONDS; TIMEFORMAT='%3U %3S'
+  { time got=$(g Bash "{\"command\":\"$big\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$); } 2> "$T/time10"
+  unset TIMEFORMAT; cpu=$(awk '{ printf "%d", $1 + $2 }' "$T/time10" 2>/dev/null)
+  { [ "$got" = 0 ] && [ "${cpu:-99}" -lt 10 ] && [ $((SECONDS - t0)) -lt 300 ]; } \
+    || { r=1; echo "      a 3000-word statement was refused or spent ${cpu:-?}s of CPU in $((SECONDS - t0))s (rc $got)"; }
   # …and the bounds are PER STATEMENT, which is the difference between a bound and a bypass. Spent across the
   # whole command, that same long statement in FRONT of a wrapped stop used up the budget and the stop was
   # never walked — rc 0 through the universal gate, measured (review of #193). Same statement, same wrapper,
@@ -1438,20 +1450,26 @@ P50
   #      line. A merge, a `su -c` running the tool, and the tool behind an unlisted wrapper are refused the same way
   #      and record NOTHING — each is the rule matching the command itself. A write into ~/bin is a judgement rule
   #      with no pattern: refused, and nothing recorded either.
-  ASKS=$T/asks50a; CALLS=$T/calls50a; : > "$CALLS"; GERR=$T/err50a; r=0; rm -rf "$CC_FAILURES"
+  #      What the guard RECORDS is what it hands the writer, so the calls are counted at the stub; the one record is
+  #      then written through the real cc-failures here, untimed, which proves the ledger takes it as handed over.
+  ASKS=$T/asks50a; CALLS=$T/calls50a; : > "$CALLS"; rm -f "$CALLS.args"; GERR=$T/err50a; r=0; rm -rf "$CC_FAILURES"
   led(){ cat "$CC_FAILURES"/demo.jsonl 2>/dev/null; }
+  calls50(){ grep -c '^failures record' "$CALLS"; }
   r1=$(gc "git commit -m 'cc-land did x'" "$WT" CC_ROLE=worker)
-  { [ "$r1" = 2 ] && [ "$(led | grep -c permitted-text-refused)" = 1 ]; } || { r=1; echo "      a text refusal (rc $r1) left $(led | grep -c .) record(s), wanted 1"; }
+  a50=(); [ -s "$CALLS.args" ] && mapfile -d '' -t a50 < "$CALLS.args"
+  [ "${a50[0]:-}" = record ] && timeout 120 "$(dirname "$(realpath "$0")")/cc-failures" "${a50[@]}" </dev/null >/dev/null 2>&1
+  { [ "$r1" = 2 ] && [ "$(calls50)" = 1 ] && [ "$(led | grep -c permitted-text-refused)" = 1 ]; } \
+    || { r=1; echo "      a text refusal (rc $r1) made $(calls50) writer call(s) and left $(led | grep -c .) record(s), wanted 1 and 1"; }
   led | grep -q '"observed":"refused `git commit -m` as landing' || { r=1; echo "      the record does not carry the shape: $(led | head -c 200)"; }
   led | grep -q 'did x' && { r=1; echo "      the record carries the message text, not the shape"; }
   r2=$(gc "git commit -m 'cc-land did x'" "$WT" CC_ROLE=worker)
-  { [ "$r2" = 2 ] && [ "$(led | grep -c .)" = 1 ] && [ "$(grep -c '^failures record' "$CALLS")" = 1 ]; } || { r=1; echo "      the same line retried recorded again: $(led | grep -c .) record(s), $(grep -c '^failures' "$CALLS") call(s)"; }
+  { [ "$r2" = 2 ] && [ "$(calls50)" = 1 ]; } || { r=1; echo "      the same line retried recorded again: $(grep -c '^failures' "$CALLS") call(s)"; }
   for what in "gh pr merge 5" "su -c 'cc-land 7'" "nice -n 5 cc-land 7" "timeout 5 sudo ls"; do
     got=$(gc "$what" "$WT" CC_ROLE=worker)
     [ "$got" = 2 ] || { r=1; echo "      a correct refusal went through: rc $got for $what"; }
   done
   got=$(gc "cp x ~/bin/cc-guard" "$WT" CC_ROLE=worker); [ "$got" = 2 ] || { r=1; echo "      the write into ~/bin went through: rc $got"; }
-  [ "$(led | grep -c .)" = 1 ] || { r=1; echo "      the ledger holds $(led | grep -c .) record(s) after the correct refusals, wanted exactly 1: $(led | tail -n +2 | cut -c1-160)"; }
+  [ "$(calls50)" = 1 ] || { r=1; echo "      the writer was called $(calls50) time(s) after the correct refusals, wanted exactly 1: $(grep '^failures' "$CALLS" | tail -n +2 | cut -c1-160)"; }
   got=$(gc "git commit -m 'no cc-land here'" "$WT" CC_ROLE=worker); [ "$got" = 0 ] || { r=1; echo "      a message naming the tool mid-quote was refused: rc $got"; }
   ok "a refusal that fell on words is recorded once with the command's shape and the rule, its retry is not recorded again, and a merge, a su -c, a wrapped tool and a write into ~/bin — correct refusals — record nothing" $r
   # 50b. A LEDGER THAT CANNOT BE WRITTEN CHANGES NOTHING ABOUT THE REFUSAL. The same text refusal, with a writer that
