@@ -3310,6 +3310,20 @@ r4(){ ( CC_LAND_CHANGED="$1" land_scope "$SB4"; printf '%s' "$REACH" ); }
   && [ "$(r4 core/bin/cc-leaf)" = " cc-leaf " ]; } \
   && ok "each of the five member tools reaches all five; the independent leaf reaches only itself" \
   || bad "member-launcher reach: [$(r4 core/bin/cc-member-v2)] [$(r4 core/bin/cc-fence)] [$(r4 core/bin/cc-leaf)]"
+# …and a path OUTSIDE the tree bin/ sits in reaches nothing, because that tree ships and is tested alone: an
+# overlay's own tool or lesson beside core/ ran every case in the suite (#616, #584). Inside the tree
+# the old rules hold, and a bin/ at the top of its checkout has no outside, so there every path counts as before.
+SR="$T/scoperepo"; mkdir -p "$SR/core/bin" "$SR/flat/bin"; git -C "$SR" init -q; git -C "$SR/flat" init -q
+printf '#!/bin/sh\n' > "$SR/core/bin/cc-leaf"; printf '#!/bin/sh\n"$BIN/cc-leaf" x\n' > "$SR/core/bin/cc-caller"
+printf '#!/bin/sh\n' > "$SR/flat/bin/cc-leaf"
+r5(){ ( CC_LAND_CHANGED="$1" land_scope "$SR/$2/bin"; want cc-leaf cc-caller && w=runs || w=skips
+        printf '%s|%s|%s' "$REACH" "$SCOPE" "$w" ); }
+{ [ "$(r5 'bin-private/x lessons/a.py' core)" = " |bin-private/x lessons/a.py|skips" ] \
+  && [ "$(r5 'core/bin/cc-leaf lessons/a.py' core)" = " cc-caller cc-leaf |core/bin/cc-leaf lessons/a.py|runs" ] \
+  && [ "$(r5 'core/templates/x lessons/a.py' core)" = "||runs" ] \
+  && [ "$(r5 'lessons/a.py' flat)" = "||runs" ]; } \
+  && ok "a diff only outside core/ reaches no tool and keeps its scope for the record; beside a core tool it adds nothing; a non-tool inside core/, or any path where bin/ is at the top, still runs everything" \
+  || bad "outside-the-tree reach: [$(r5 'bin-private/x lessons/a.py' core)] [$(r5 'core/bin/cc-leaf lessons/a.py' core)] [$(r5 'core/templates/x lessons/a.py' core)] [$(r5 'lessons/a.py' flat)]"
 # …and the SCOPE it hands back is the LANDING'S OWN STRING, byte for byte. cc-land sorts the paths in python's byte
 # order and spends a green record only on a scope equal to that; sorting them again here runs in the box's locale,
 # where GNU sort ignores the `-` on its first pass and hands `core/bin/cc-graphs core/bin/ccbox` back swapped —

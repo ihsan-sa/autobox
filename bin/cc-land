@@ -5,6 +5,10 @@
   cc-land <repo> <pr-number> --no-review          …without the review gate: land a diff nothing read
   cc-land <repo> <pr-number> --re-review          …asking again about a diff already reviewed (it costs again)
   cc-land <repo> <pr-number> --full-gates         …every gate, instead of the ones the diff has earned
+  cc-land <repo> <pr-number> --warm               a batch's first pass, which `work` runs WARM_SLOTS at a time (never a
+                                                  hand's): the worker's own green for the head, the static gates on
+                                                  the merge with the read beside them, no suite and no merge; what it
+                                                  found is written on the PR's queue job for the merge pass
   cc-land record <repo> <pr> <verdict> --by <who> [--head <sha>] [--findings <text>|-]
                                                   write down a review that already happened, against the change the
                                                   PR is at now (--head: the SHA you read, refused if it has moved).
@@ -26,9 +30,23 @@
                                                   the workspace's token, gates inside its sandbox, no deploy, the
                                                   review charged to its daily cap, a stop said in #<handle>
                                                   (cc-checkpoint --sweep queues these; a session inside cannot)
-  cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min): one job at
-                                                  a time in queue order across repos, each gated, reviewed, merged and
-                                                  deployed before the next is touched. A job survives a usage-limit review (waits for
+  cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min): one lane
+  cc-land work --lane <repo>                      per repo, side by side, each taking its repo's jobs oldest first;
+                                                  bare `work` spawns the lanes. ORDINARY jobs — no protected path,
+                                                  nothing on the repo's gate-first lists (every tests/gate-first,
+                                                  read at the base; no list, nothing ordinary), into the default
+                                                  branch, files disjoint from each other —
+                                                  land as ONE BATCH when two or more are ready: their warms side by
+                                                  side (--warm, WARM_SLOTS at once), their merges one at a time in
+                                                  queue order, then ONE suite on the base; green installs the lot, red
+                                                  is believed on a second run, bisected over the squashes provably on
+                                                  the base since the batch began (the last is always run: green there
+                                                  reverts nobody), and the breaker is REVERTED and told so (its PR,
+                                                  its thread, the seat). A lane cut off before that suite leaves a
+                                                  note the next sweep resumes.
+                                                  Every other job — one alone, a gate-first path, no worker green —
+                                                  is gated, reviewed, merged and deployed before the next of that repo
+                                                  is touched. A job survives a usage-limit review (waits for
                                                   the reset) and a red gate (3 tries, 15 min apart); a LAND-AFTER-FIX
                                                   sends ONE fix iteration to the PR's track and re-queues on its push;
                                                   a draft or conflicting PR is HELD and looked at every 15 min (a
@@ -38,8 +56,9 @@
   cc-land selfcheck                               the decision table (core/tests/cc-land-selfcheck.py); no network
 
 THE FLOW, one line printed per step, stopped at the first real failure: gates and the paid review side by side on
-the base MERGED with the head (merge_result — never the head alone, never the branch alone; in a sweep each job's
-merge has the jobs queued before it already in, so the last gate is the batch's integration run) → merge → the
+the base MERGED with the head (merge_result — never the head alone, never the branch alone; a serial job's merge
+has the jobs landed before it already in; a BATCH member's warm is gated on the base as it was, its members being
+file-disjoint, and the base's own suite after the merges is the batch's integration run) → merge → the
 #approvals card edited to "landed ✓" (never posted from here) → board rows → ask ledger rows marked `merged` →
 install.sh → units this change ADDED switched on (a unit that is off stays off and is named) → restarts proved by
 a new pid (never the unit that owns the shared tmux server; a `daemons` row in config/units.json brings back what
@@ -83,8 +102,12 @@ WHAT IT WILL NOT DO:
 
 THE ONLY THING ON THIS BOX THAT MERGES. A 👍 writes `~/.cc/state/land/<repo>-<pr>.json` and starts `cc-land work`;
 gates, merge and deploy are one transaction. The queue is a FILE because the deploy restarts the daemon that asked:
-the job survives that restart, a kill and a reboot, and the next `work` resumes it. The worker holds one flock, so
-one PR cannot merge twice; `queue` never overwrites a waiting job. A merge this box did not make (GitHub's UI, an
+the job survives that restart, a kill and a reboot, and the next `work` resumes it. `work` runs ONE LANE PER REPO:
+it runs the lane of the repo whose job is oldest itself and spawns `work --lane <repo>` for every other repo with a
+job; each lane holds its repo's flock and re-reads the queue until nothing of its repo is left, so one repo's
+landing never waits behind another's suite, and a job queued while its lane runs is taken by that lane. Inside a
+repo it stays one landing at a time, so each merge is of the tree its own gates ran on (the base as the landing
+before it left it) and one PR cannot merge twice; `queue` never overwrites a waiting job. A merge this box did not make (GitHub's UI, an
 auto-merge) is caught by `work` comparing origin's default branch against the SHA install.sh last ran on.
 
 SKIP vs FAILURE: a step the box has no such thing for (no Slack, no board row, no ledger row) SKIPS and the sequence
@@ -135,6 +158,15 @@ COMMENT_RE = re.compile(r"^\s*($|#|//|--[ \t]|\*[ \t/]|\*$|/\*)")   # a line com
 WIDE_FILES = 12                           # past this many files, or this many changed lines, "narrow" is a claim
 WIDE_LINES = 600                          # nobody can check — the suite is cheaper than being wrong about it
 GREEN_TTL = 6 * 3600                      # how long a suite's own green record is spent instead of running it again (green_run)
+# AN ORDINARY PR LANDS OPTIMISTICALLY (owner, 2026-09-24: "15 min a PR x 30 = 450 min, way too long"). Ordinary: it
+# touches no protected path and nothing on the repo's GATE-FIRST list, its worker left a green record for its head,
+# and its files are disjoint from the batch it lands with. Its WARM (the static gates and the read, no suite) runs
+# beside the other warms, the suite runs ONCE on the base after the batch has merged, and a red there bisects to
+# the PR that broke it and reverts it, out loud. CC_LAND_OPTIMISTIC=0 turns the whole path off.
+OPTIMISTIC = os.environ.get("CC_LAND_OPTIMISTIC", "1") != "0"
+GATE_FIRST_LIST = ("core/tests/gate-first", "tests/gate-first")   # paths that keep every gate BEFORE the merge, read at the base; no list = nothing is ordinary
+WARM_SLOTS = max(1, int(os.environ.get("CC_LAND_WARM_SLOTS") or 4))   # how many of a batch's warms run at once
+BATCH_MAX = max(1, int(os.environ.get("CC_LAND_BATCH") or 30))       # …and how many PRs one batch takes at most
 
 
 def gate_slots():
@@ -216,6 +248,10 @@ class Failed(Exception):
 
 class Skip(Exception):
     """A step with nothing to do here (no Slack, no board row, no ledger row). Reported; the sequence goes on."""
+
+
+class GateStopped(Exception):
+    """A gate killed because a sibling gate went red first: the landing is already lost, so this one decides nothing (run_gate)."""
 
 
 # ── the outside world, each in one place, so `selfcheck` can stand in for all of it ──────────────────────
@@ -354,8 +390,8 @@ def sweep_run_roots():
     return gone
 
 
-def run_gate(argv, cwd, log, env):
-    """Run one gate in its own process group, streaming its output to `log` as it runs; killed (the whole group) only after GATE_IDLE seconds of silence, never on wall clock. Returns (rc, output) like sh()."""
+def run_gate(argv, cwd, log, env, stop=None):
+    """Run one gate in its own process group, streaming its output to `log` as it runs; killed (the whole group) only after GATE_IDLE seconds of silence, never on wall clock, or within a second of `stop` (a threading.Event) being set, which raises GateStopped. Returns (rc, output) like sh()."""
     out_, f = [], None
     with contextlib.suppress(OSError):
         f = open(log, "w")
@@ -365,8 +401,21 @@ def run_gate(argv, cwd, log, env):
     except Exception as e:
         return 127, f"{e.__class__.__name__}: {e}"
     try:
+        quiet = time.monotonic()
         while True:
-            if not select.select([p.stdout], [], [], GATE_IDLE)[0]:
+            ready = select.select([p.stdout], [], [], min(GATE_IDLE, 1))[0]
+            if stop is not None and stop.is_set():   # a sibling is red: #617's selftest ran 38 min past its red check.sh
+                kill_group(p)
+                p.wait()
+                line = f"\ncc-land: {os.path.basename(argv[0])} stopped — another gate is already red\n"
+                if f:
+                    f.write(line)
+                raise GateStopped(line.strip())
+            if ready:
+                quiet = time.monotonic()
+            elif time.monotonic() - quiet < GATE_IDLE:
+                continue
+            else:
                 kill_group(p)
                 p.wait()
                 line = f"\ncc-land: {os.path.basename(argv[0])} said nothing for {GATE_IDLE:g} s — killed as dead\n"
@@ -1033,17 +1082,40 @@ def comment_only(root, a, b, path):
     return hunk                   # no hunk at all = nothing was read; say no
 
 
-def control_paths(root, a, paths):
-    """The changed paths the repo's control-layer list (CONTROL_LIST; one path or glob per line, `#` comments) names, as (paths, declared); declared=False and every path when the repo ships no list. Read at the base side of the diff, never from the PR."""
-    for lst in CONTROL_LIST:
+def listed_paths(root, a, paths, lists, tail):
+    """The changed paths one of the repo's path lists (`lists`, the first found; one path or glob per line, `#` comments) names, as (paths, declared); declared=False and every path when the repo ships none. Read at commit `a` — the base side of the diff, never the PR."""
+    for lst in lists:
         text = blob(root, a, lst)
         if text is not None:
             # Patterns are relative to the tree the list describes (the repo, or core/ inside it); a path outside that tree is not in its layer.
-            pre = lst[:-len("tests/control-layer")]
+            pre = lst[:-len(tail)]
             pats = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
             return [p for p in paths if p.startswith(pre)
                     and any(p[len(pre):] == g or fnmatch.fnmatchcase(p[len(pre):], g) for g in pats)], True
     return list(paths), False
+
+
+def control_paths(root, a, paths):
+    """The changed paths the repo's control-layer list (CONTROL_LIST) names, as (paths, declared): what buys a paid read."""
+    return listed_paths(root, a, paths, CONTROL_LIST, "tests/control-layer")
+
+
+def gate_first_paths(root, a, paths):
+    """The changed paths the repo's gate-first lists (GATE_FIRST_LIST) name, as (paths, declared): what keeps every gate before the merge. EVERY list found at `a` is read — core's and the overlay's beside it — not the first, since core's describes only core/ and would call the overlay's host config ordinary. A path no found list's tree covers counts as named: fail closed. No list at all: every path, so a repo that ships none lands nothing optimistically."""
+    found, named = [], set()
+    for lst in GATE_FIRST_LIST:
+        text = blob(root, a, lst)
+        if text is None:
+            continue
+        pre = lst[:-len("tests/gate-first")]
+        found.append(pre)
+        pats = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        named |= {p for p in paths if p.startswith(pre)
+                  and any(p[len(pre):] == g or fnmatch.fnmatchcase(p[len(pre):], g) for g in pats)}
+    if not found:
+        return list(paths), False
+    named |= {p for p in paths if not any(p.startswith(pre) for pre in found)}
+    return [p for p in paths if p in named], True
 
 
 def churn(root, a, b):
@@ -1263,6 +1335,35 @@ def protected_stop(job):
     return ("moved" if hit[0] == "?" and head else hit[0]), why
 
 
+def ordinary(repo, pr):
+    """Why PR `pr` is NOT ordinary, or '' with its changed paths, as (why, paths). Brief: "an ordinary PR (its merge with main is file-disjoint from what's landing with it, and it touches no protected path)" — and "protected paths (cc-guard, cc-sandbox, cc-land itself, hooks, anything security) keep the full gate before merge": so it touches no PROTECTED path (protected_hit, which fails closed) and nothing the repo's gate-first list names at the base. Disjointness is the batch's question (batch_of); the worker's own green is the warm's (worker_green). A file list gh could not give, or one at GH_PR_FILES, is not ordinary either."""
+    hit = protected_hit(repo, pr)
+    if hit:
+        return protected_under(repo, hit), []
+    root = repo_root(repo)
+    j, why = pr_facts(root, pr, "files,baseRefName", timeout=60)
+    if j is None:
+        return f"gh could not list the PR's files ({why or 'no PR object'})", []
+    files = sorted({(f.get("path") or "") for f in (j.get("files") or []) if isinstance(f, dict)} - {""})
+    if not files:
+        return "gh names no changed file", []
+    if len(files) >= GH_PR_FILES:
+        return f"gh names only the first {GH_PR_FILES} of the PR's files and this PR has at least that many", []
+    # Only a PR INTO the default branch: the list is read there, the suite runs there and a revert lands there. A
+    # base the author chose is none of those, and a list read off it is the author's own.
+    base = board(repo).get("default_branch") or "main"
+    into = (j.get("baseRefName") or "").strip()
+    if into != base:
+        return f"it merges into {into or 'a branch gh would not name'}, not {base}: only a PR into {base} lands in a batch", []
+    first, declared = gate_first_paths(root, f"origin/{base}", files)
+    if not declared:
+        return f"{repo} ships no {GATE_FIRST_LIST[-1]} list on {base}, so every PR of it runs every gate before it merges", []
+    if first:
+        return (f"it touches {', '.join(first[:3])}, on {repo}'s gate-first list ({GATE_FIRST_LIST[-1]}) or outside "
+                f"every tree one covers: every gate runs before the merge"), []
+    return "", files
+
+
 def doomed(repo, pr):
     """Why a landing of this PR cannot succeed, or '': asked at queue time from what Land.mark_doomed wrote and one `gh pr view`, no git. Every uncertainty (a moved head, any verdict since recorded, a raised cap, a gh error) answers '': it never refuses what could have landed."""
     d = (root_work(repo, pr) or {}).get("doomed") or {}
@@ -1468,6 +1569,10 @@ class Land:
         self.restarted = []
         self.owner_asks = []     # …and what is on the old code because the manifest keeps its restart for the owner: carries the command
         self.unverified = []     # ledger rows this landing could not confirm: named, and left open
+        self.warm_only = False   # --warm: the static gates and the read, no merge, the outcome written on the job (warm_done)
+        self.warm = None         # …and, in the batch's merge pass, what that warm wrote (spend_warm)
+        self.warm_base = ""      # …the base SHA the warm's merge was built on, for the pass that spends it
+        self.batch = ""          # the batch this landing merges with: its deploy waits for the batch's suite (after_batch)
 
     def base(self):
         if self.member and self.mtrack:   # the project's repository, not the workspace's board: what the PR says
@@ -1887,7 +1992,7 @@ class Land:
 
     # -- 2. gates ------------------------------------------------------------------------------------------
     def gates(self):
-        """Gate the merge (merge_result), before merging: every gate at once, the paid read beside them from t=0, the suite handed CC_LAND_CHANGED and CC_SELFTEST_SLOTS, each gate timed on silence (run_gate). The first red in gate order is reported; the read's buy stands."""
+        """Gate the merge (merge_result), before merging: every gate at once, the paid read beside them from t=0, the suite handed CC_LAND_CHANGED and CC_SELFTEST_SLOTS, each gate timed on silence (run_gate). The first red stops the rest within a second; the first red in gate order is reported; the read's buy stands."""
         if self.pr and self.facts.get("state") == "MERGED":
             raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
         tree, tmp, at, base_sha = self.root, None, "", ""
@@ -1901,16 +2006,27 @@ class Land:
             # merged_on is the fact the ✗ line and gated_on() key on: a base that was MERGED IN, so it stays empty
             # when the head already held it.
             self.merged_on = base_sha if mtree else ""
+            self.warm_base = base_sha or ""     # …and the base the warm's merge was built on, for warm_done
             self.merge_unbuilt = not at   # merge_result gives the head back when the head already holds the base and
             if self.merge_unbuilt:        # "" only when it could not answer: the same empty merged_on, two meanings
                 out("!", f"the merge of {self.base()} with the head could not be built — an unfetched base, "
                          f"unrelated histories, or git unable to answer in time — so these gates run on the BRANCH "
                          f"ALONE and nothing here proves what {self.base()} holds once this lands")
+        if self.pr and self.batch and self.warm:
+            spent = self.spend_warm()   # the batch's merge pass: the warm's static gates stand in for these
+            if spent:
+                return spent
         tier, why = self.tier_for()
+        if self.warm_only and tier != "docs":
+            # Brief: "lands on its worker's own green plus a static check of about 2 min" — the suite is the base's
+            # to run after the batch, not this warm's.
+            tier, why = "warm", f"the static gates on the merge; the suite runs on {self.base()} after the batch ({why})"
         if self.pr:
             tmp, tree = self.head_checkout("gates", fetch=False, at=at)
         try:
-            found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK) and (tier != "docs" or g not in SUITE)]
+            found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK) and (tier not in ("docs", "warm") or g not in SUITE)]
+            if not found and tier == "warm":
+                raise Skip(f"no static gate in {self.repo} — the suite is its only gate, and that runs on {self.base()} after the batch")
             if not found:
                 skipped = [g for g in SUITE if os.access(f"{tree}/{g}", os.X_OK)]
                 if skipped:     # the tier took the only gate there is: run it rather than land ungated
@@ -1921,57 +2037,10 @@ class Land:
             content, reused = tree_id(tree), []   # …and of those, the ones this exact content has already passed
             scope = self.gate_scope()             # what the diff changed, for a suite that runs only what that reaches
 
-            def run(g):
-                if green_run(content, g, scope):
-                    reused.append(g)
-                    out("·", f"{g}: already green on this content ({content[:12]}) — the run that made it left the "
-                             f"record, so this landing does not buy the same answer twice")
-                    return
-                start = clean_start()
-                start["env"].pop("CC_LAND_CHANGED", None)   # never an inherited scope: a landing run from inside a
-                if scope:                                    # scoped suite would hand its gates that suite's paths
-                    start["env"]["CC_LAND_CHANGED"] = scope
-                start["env"].pop("CC_SUITE_PART", None)     # …nor an inherited half, for the same reason
-                start["env"]["CC_SELFTEST_SLOTS"] = str(SUITE_SLOTS)   # the one slot number, handed to the suite
-                keep = f"{run_root()}/cc-land-gate-{self.repo}-{self.pr or 'base'}-{os.path.basename(g)}.log"
-                argv = [f"{tree}/{g}"]
-                if self.member and self.mtrack:
-                    # A member's gates run inside the workspace's sandbox (cc-sandbox member --tree); scope and slots go in as arguments, since the boundary clears the environment.
-                    wt = f"{HOME}/.cc/worktrees/{self.member}/{self.mtrack}"
-                    argv = ([f"{BIN}/cc-sandbox", "member", self.member, self.mtrack if os.path.isdir(wt) else "",
-                             "--tree", tree, "--", "env"]
-                            + [f"{k}={start['env'][k]}" for k in ("CC_LAND_CHANGED", "CC_SELFTEST_SLOTS")
-                               if k in start["env"]]
-                            + [f"{tree}/{g}"])
-                rc, o = run_gate(argv, tree, keep, start["env"])
-                bad = FAILED_RE.search(o)
-                if rc or (bad and bad.group(1) != "0"):
-                    keep_log(keep)                   # the one log that outlives the run — bounded, at this path
-                    record_red(self.project, g, content, keep, o, pr=self.pr)   # …and the ledger line that outlives THAT
-                    raise Failed(f"gate {g} did not pass: {gate_fail(o)}{self.behind_base()}"
-                                 f"  [full output: {keep}]",
-                                 # the card gets the gate and the case that FAILED and nothing else: the stale-base
-                                 # reading and the log's path are the landing record's, and are kept above. In
-                                 # cc-replay's words (`gate \S+ did not pass`), which is how it keys a red gate.
-                                 short=f"gate {os.path.basename(g)} did not pass: {gate_fail(o)}")
-
             # All gates at once, and the read from t=0: a head a cheap gate rejects also buys a read, whose verdict goes on the PR for the retry.
             if any(not green_run(content, g, scope) for g in found):
                 self.read_alongside()
-            errs = {}
-
-            def go(g):
-                try:
-                    run(g)
-                except BaseException as e:
-                    errs[g] = e
-
-            ts = [threading.Thread(target=go, args=(g,), name=f"gate-{self.repo}-{os.path.basename(g)}", daemon=True)
-                  for g in found]
-            for t in ts:
-                t.start()
-            for t in ts:
-                t.join()     # every one of them, always: a gate left running holds a slot and writes to a checkout about to go
+            errs = self.run_gates(tree, found, scope, content, reused)
             if errs:
                 if self._review is not None:
                     try:
@@ -1991,6 +2060,63 @@ class Land:
         finally:
             if tmp:
                 self.drop_checkout(tmp, tree)
+
+    def run_gates(self, tree, found, scope, content, reused):
+        """Run `found` on `tree` at once, each on its own thread and timed on silence (run_gate), a green record on this content spent instead of a run (appended to `reused`), and the first red stopping the rest within a second. Returns {gate: the Failed} — empty when every gate passed. gates() runs it on a PR's merge; suite_on (after_batch) on the base itself."""
+        def run(g):
+            if green_run(content, g, scope):
+                reused.append(g)
+                out("·", f"{g}: already green on this content ({content[:12]}) — the run that made it left the "
+                         f"record, so this landing does not buy the same answer twice")
+                return
+            start = clean_start()
+            start["env"].pop("CC_LAND_CHANGED", None)   # never an inherited scope: a landing run from inside a
+            if scope:                                    # scoped suite would hand its gates that suite's paths
+                start["env"]["CC_LAND_CHANGED"] = scope
+            start["env"].pop("CC_SUITE_PART", None)     # …nor an inherited half, for the same reason
+            start["env"]["CC_SELFTEST_SLOTS"] = str(SUITE_SLOTS)   # the one slot number, handed to the suite
+            keep = f"{run_root()}/cc-land-gate-{self.repo}-{self.pr or 'base'}-{os.path.basename(g)}.log"
+            argv = [f"{tree}/{g}"]
+            if self.member and self.mtrack:
+                # A member's gates run inside the workspace's sandbox (cc-sandbox member --tree); scope and slots go in as arguments, since the boundary clears the environment.
+                wt = f"{HOME}/.cc/worktrees/{self.member}/{self.mtrack}"
+                argv = ([f"{BIN}/cc-sandbox", "member", self.member, self.mtrack if os.path.isdir(wt) else "",
+                         "--tree", tree, "--", "env"]
+                        + [f"{k}={start['env'][k]}" for k in ("CC_LAND_CHANGED", "CC_SELFTEST_SLOTS")
+                           if k in start["env"]]
+                        + [f"{tree}/{g}"])
+            try:
+                rc, o = run_gate(argv, tree, keep, start["env"], stop=stop)
+            except GateStopped:
+                out("·", f"{g}: stopped, not run to the end — another gate is red, so this one could not save the landing")
+                return
+            bad = FAILED_RE.search(o)
+            if rc or (bad and bad.group(1) != "0"):
+                keep_log(keep)                   # the one log that outlives the run — bounded, at this path
+                record_red(self.project, g, content, keep, o, pr=self.pr)   # …and the ledger line that outlives THAT
+                raise Failed(f"gate {g} did not pass: {gate_fail(o)}{self.behind_base()}"
+                             f"  [full output: {keep}]",
+                             # the card gets the gate and the case that FAILED and nothing else: the stale-base
+                             # reading and the log's path are the landing record's, and are kept above. In
+                             # cc-replay's words (`gate \S+ did not pass`), which is how it keys a red gate.
+                             short=f"gate {os.path.basename(g)} did not pass: {gate_fail(o)}")
+
+        errs, stop = {}, threading.Event()
+
+        def go(g):
+            try:
+                run(g)
+            except BaseException as e:
+                errs[g] = e
+                stop.set()   # one red gate ends the rest: the landing is lost, and they hold slots the queue wants
+
+        ts = [threading.Thread(target=go, args=(g,), name=f"gate-{self.repo}-{os.path.basename(g)}", daemon=True)
+              for g in found]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()     # every one of them, always: a gate left running holds a slot and writes to a checkout about to go
+        return errs
 
     def gated_on(self):
         """Which tree the gates ran on, in one phrase, for the ✓ line, the ✗ line and the card."""
@@ -2012,6 +2138,83 @@ class Land:
                     f"forked. Read the failure as that clash before reading it as this branch's own bug")
         return stale_note(self.root, f"origin/{self.base()}", self.base(), self.head,
                           [p for _, p in self.changed_files()])
+
+    def worker_green(self):
+        """--warm's first step: the worker's own green for THIS head, or the PR is not ordinary and lands on its own with every gate first. The record is keyed on the HEAD's tree — what the worker's cc-green filed; the merge's tree is other content — unscoped, or scoped to exactly this diff (green_run)."""
+        self.fetch_head()
+        if self.held():
+            raise Failed(self.held())
+        self.ordinary_at_head()
+        rc, o = sh(["git", "rev-parse", f"{self.head}^{{tree}}"], cwd=self.root)
+        tree = o.strip() if not rc else ""
+        suites = [g for g in SUITE if not sh(["git", "cat-file", "-e", f"{self.head}:{g}"], cwd=self.root)[0]]
+        missing = [g for g in suites if not green_run(tree, g, self.gate_scope())]
+        if missing:
+            raise Failed(f"no green record of the worker's own for {', '.join(missing)} on the head {self.head[:12]} "
+                         f"(tree {tree[:12] or '?'}) — not ordinary: it lands on its own, every gate first",
+                         short="no worker green for the head")
+        if not suites:
+            return f"no suite at the head of PR #{self.pr}: nothing for a worker to have run"
+        return (f"the worker's own green stands for {', '.join(suites)} on the head {self.head[:12]} "
+                f"(tree {tree[:12]}), so the suite runs once on {self.base()} after the batch")
+
+    def ordinary_at_head(self):
+        """ordinary() asked again of the head this warm FETCHED, off git and not gh: batch_of read gh's file list at pick time, tied to no head, and a push after it (one touching core/bin/cc-guard, say) must not ride that answer into a merge its suite never ran before. Raises Failed (short 'not ordinary at this head') when the head goes into a branch other than the default, touches a protected path or anything a gate-first list names or does not cover, or its diff cannot be read; warm_done then marks the job for the serial path."""
+        short = "not ordinary at this head"
+        into, base = (self.facts.get("baseRefName") or "").strip(), board(self.repo).get("default_branch") or "main"
+        if into != base:
+            raise Failed(f"PR #{self.pr} merges into {into or '?'}, not {base} — every gate first", short=short)
+        files = sorted({p for _, p in name_status(self.pr_diff("--name-status"))})
+        if not files:
+            raise Failed(f"the head {self.head[:12]} of PR #{self.pr} changes no file git can name — every gate first", short=short)
+        rules, why = protected_paths(self.repo)
+        if rules is None:
+            raise Failed(f"{why} — every gate first", short=short)
+        prot = [p for p in files if any(p == r.rstrip("/") or p.startswith(r.rstrip("/") + "/") for r in rules)]
+        first, declared = gate_first_paths(self.root, f"origin/{base}", files)
+        if prot or first or not declared:
+            what = ", ".join((prot or first or files)[:3])
+            raise Failed(f"the head {self.head[:12]} touches {what}, which keeps every gate before the merge "
+                         f"({'a PROTECTED path' if prot else 'the gate-first list'}) — not ordinary: it lands on its own",
+                         short=short)
+
+    def spend_warm(self):
+        """The batch's merge pass: the warm's static gates stand in for this landing's when it was about THIS head and the base has moved since only in files this PR does not touch — brief: "its merge with main is file-disjoint from what's landing with it". Its ✓ line, or '' and the gates run as they always did (a moved head, an overlap, a warm that could not answer). A warm that stopped at its gates is this landing's red: same head, same files."""
+        w, now = self.warm, self.fetch_head()
+        if w.get("head") != now:
+            out("!", f"the head moved since the warm ({(w.get('head') or '?')[:12]} → {now[:12]}): the gates run again")
+            return ""
+        if w.get("stopped") == "gates":
+            raise Failed(w.get("why") or "the warm's static gates were red", short=w.get("short") or "")
+        # A warm that stopped at its REVIEW passed its gates: they are spent here too, and review() reads the
+        # verdict back off the PR and stops on it — never a suite run in front of a verdict already reached.
+        if not (w.get("ok") or w.get("stopped") == "review") or not w.get("base"):
+            return ""
+        rc, o = sh(["git", "diff", "--name-only", w["base"], f"origin/{self.base()}"], cwd=self.root, timeout=120)
+        if rc:
+            return ""
+        clash = sorted({p for _, p in self.changed_files()} & set(o.split()))
+        if clash:
+            out("!", f"{self.base()} moved since the warm in {', '.join(clash[:3])}, which this PR changes too — "
+                     f"the warm is not spent, the gates run on the merge as they always did")
+            return ""
+        self.gated, self.merged_on = now, w["base"]
+        return (f"the warm's static gates passed on PR #{self.pr} on {self.gated_on()} at {w.get('at', '?')}; "
+                f"{self.base()} has since moved only in files this PR does not touch, so the merge is spent "
+                f"unrun and the suite runs on {self.base()} once the batch has merged")
+
+    def warm_done(self, rc):
+        """Write what the warm found on the PR's queue job, for the batch's merge pass (spend_warm): the head and base it was about, whether it passed, and where it stopped. A stop at `warm` (no worker green) marks the job not ordinary, so batch_of leaves it to the serial path."""
+        path = job_path(self.repo, self.pr)
+        job = read_json(path)
+        if job is None:
+            return
+        job["warm"] = {"head": self.head, "base": self.warm_base, "ok": rc == 0, "at": stamp(),
+                       "stopped": self.stopped, "why": (self.why or "")[:600], "short": self.why_short}
+        if self.stopped == "warm":
+            job["ordinary"] = self.why_short or self.why
+        with contextlib.suppress(OSError):
+            write_atomic(path, job)
 
     def gate_scope(self):
         """The paths this diff changes, sorted and space-separated: what the suite is handed as CC_LAND_CHANGED (core/tests/green.sh says how far that reaches) and the key beside a green record's tree. Empty means everything: --full-gates, a no-PR deploy, an unreadable or wide diff."""
@@ -2448,11 +2651,22 @@ class Land:
         """About the box: run once at the end of a batch. A member workspace's repository gets none of them (MEMBERS)."""
         if self.member:
             return [("deploy", self.no_deploy)]
+        if self.batch:
+            return [("deploy", self.after_batch_deploy)]
         return [("install", self.install), ("units", self.enable_units),
                 ("restart", self.restart), ("daemons", self.daemons), ("verify", self.verify_delivery)]
 
+    def warm_steps(self):
+        """--warm: is the worker's own green there, then the static gates on the merge with the read beside them. No merge, no deploy: the batch's merge pass spends what this leaves (spend_warm), and the suite runs on the base after it."""
+        return [("warm", self.worker_green), ("gates", self.gates), ("review", self.review)]
+
     def steps(self):
+        if self.warm_only:
+            return self.warm_steps()
         return self.pr_steps() + self.deploy_steps()
+
+    def after_batch_deploy(self):
+        raise Skip(f"deployed with the batch: install and the restarts follow the suite on {self.base()} once the batch has merged (after_batch)")
 
     def load(self, verb="landing"):
         """What GitHub says about the PR, read once before anything runs; `verb` is the caller's word for the log's first line."""
@@ -2503,7 +2717,7 @@ class Land:
     def flags(self):
         """The flags this landing runs with, as typed — what the second arrival at a held PR is shown (pr_lock)."""
         return " ".join(f for f, on in (("--no-review", not self.want_review), ("--re-review", self.re_review),
-                                        ("--full-gates", self.full_gates)) if on)
+                                        ("--full-gates", self.full_gates), ("--warm", self.warm_only)) if on)
 
     def run(self):
         if not self.load():
@@ -2523,7 +2737,12 @@ class Land:
             emit(f"cc-land: {other}")
             return 1
         try:
-            return self.done(self.walk(self.steps()))
+            rc = self.walk(self.steps())
+            if self.warm_only:
+                self.warm_done(rc)
+                print("warm: " + ("ready to merge with the batch" if rc == 0 else f"stopped at {self.stopped}"))
+                return rc
+            return self.done(rc)
         finally:
             lock.release()
 
@@ -2546,19 +2765,24 @@ class Land:
 
 
 # ── the queue: a landing that outlives the process that asked for it ────────────────────────────────
-def spawn_work(secs=0):
-    """`cc-land work` as a transient systemd unit — now, or on a timer `secs` from now — never a thread or a child of the caller: the deploy restarts the Slack daemon, and a child of it would die mid-install. With no user manager (a container, a cron) a detached child, sleeping first when timed; the job file is the retry. Returns (how, '') or ('', why)."""
+def spawn_work(secs=0, lane=""):
+    """`cc-land work` (or `work --lane <repo>`) as a transient systemd unit — now, or on a timer `secs` from now — never a thread or a child of the caller: the deploy restarts the Slack daemon, and a child of it would die mid-install. With no user manager (a container, a cron) a detached child, sleeping first when timed; the job file is the retry. Returns (how, '') or ('', why)."""
     unit = f"cc-land-work-at-{int(time.time()) + secs}-{os.getpid()}" if secs else f"cc-land-work-{os.getpid()}-{int(time.time())}"
+    if lane:
+        unit += "-" + re.sub(r"[^A-Za-z0-9_-]+", "-", lane)
+    work = ["work", "--lane", lane] if lane else ["work"]
     timed = [f"--on-active={secs}", "--timer-property=RemainAfterElapse=no"] if secs else []
     rc, o = sh(["systemd-run", "--user", "--collect", "--quiet", *timed, f"--unit={unit}",
-                f"--description=cc-land: {'re-drive a kept job' if secs else 'drain the landing queue'}",
-                f"{BIN}/cc-land", "work"], timeout=120)
+                f"--description=cc-land: {'re-drive a kept job' if secs else 'drain the landing queue'}"
+                + (f" ({lane} lane)" if lane else ""),
+                f"{BIN}/cc-land", *work], timeout=120)
     if rc == 0:
         return unit, ""
     try:
         os.makedirs(LANDQ, exist_ok=True)
         f = open(f"{LANDQ}/work.log", "a")
-        argv = ["sh", "-c", f"sleep {secs}; exec {shlex.quote(BIN + '/cc-land')} work"] if secs else [f"{BIN}/cc-land", "work"]
+        argv = (["sh", "-c", f"sleep {secs}; exec {shlex.quote(BIN + '/cc-land')} {shlex.join(work)}"] if secs
+                else [f"{BIN}/cc-land", *work])
         subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL, stdout=f, stderr=f)
         return "a detached child (no systemd --user here)", ""
     except Exception as e:
@@ -2826,7 +3050,10 @@ def result_of(L, rc, job, tail):
         if L.merge_unbuilt:
             return "tested the branch on its own, because git could not build the merge"
         return f"tested the branch, which already had {L.base()} in it"
-    if rc == 0:
+    if rc == 0 and L.batch:
+        short = (f"{what}: landed ✅. I {on()}. It's merged with its batch; the suite runs on {L.base()} now, "
+                 f"and the box installs the batch when that is green.")
+    elif rc == 0:
         short = f"{what}: landed ✅. I {on()}. It's merged and deployed, and its check passed here."
     elif rc == COSMETIC:
         short = (f"{what}: landed ✅. I {on()}. It's merged and deployed, but {in_words(L.hurt, BOOKKEEPING)} did "
@@ -3184,6 +3411,7 @@ def run_job(path, job):
     write_atomic(path, job)                    # counted before anything irreversible: a kill mid-merge is still a try
     L = Land(repo, pr=pr) if pr else Land(repo, span=tuple(span))
     L.job = path
+    L.batch, L.warm = job.get("batch") or "", job.get("warm") if job.get("batch") else None
     L.approved_head = job.get("approved_head") or ""   # set only for a protected-path PR: what the merge is pinned to
     buf, held = io.StringIO(), ""
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -3327,39 +3555,55 @@ def known_repos():
     return ccboard().reals(sorted(n for n in names if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", n)))
 
 
+def red_base_path(repo):
+    """Where after_batch notes a base tip its suite found red and could not mend: what the catch-up must never install."""
+    return f"{LANDQ}/{repo}.red"
+
+
+def deploy_due(repo, by="the catch-up sweep"):
+    """Queue a deploy for `repo` when its origin default branch has moved past the SHA install.sh last ran on, as the job's path, or '' when nothing is owed (or a deploy job already waits, or the tip is one after_batch found RED — a red base is said, never installed behind the batch's back). The catch-up sweep's per-repo step, and the batch's own deploy (after_batch)."""
+    root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
+    if not os.path.isdir(f"{root}/.git") or os.path.exists(job_path(repo, "deploy")):
+        return ""
+    with git_lock(root):    # the fetch writes refs/remotes/origin/<base> and the rev-parse reads it back
+        if sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=60)[0]:
+            return ""                                    # no remote, no network: nothing to compare against
+        rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
+    if rc:
+        return ""
+    tip, have = o.strip(), applied_sha(repo)
+    if not have:
+        # Nothing recorded yet, so read it off the checkout, and only while it is on the default branch.
+        if sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root)[1].strip() != base:
+            return ""
+        rc, o = sh(["git", "rev-parse", "HEAD"], cwd=root)
+        if rc:
+            return ""
+        have = o.strip()
+        record_applied(repo, have)
+    if have == tip:
+        return ""
+    if (read_json(red_base_path(repo)) or {}).get("tip") == tip:
+        return ""       # the batch's suite found this tip red and said so: a person moves it, not the poll
+    if by == "the catch-up sweep" and os.path.exists(batch_path(repo)):
+        return ""       # a batch has merged without its suite yet: its lane runs that suite and installs on green
+    write_atomic(job_path(repo, "deploy"),
+                 {"repo": repo, "pr": None, "span": [have, tip], "queued_at": stamp(), "attempts": 0,
+                  "stage": "queued", "by": by,
+                  "why": f"origin/{base} moved to {tip[:7]} without this box — what is installed is {have[:7]}"
+                         if by == "the catch-up sweep" else f"the batch's suite passed on origin/{base} at {tip[:7]}"})
+    ledger(f"queued {repo}#deploy span={have[:7]}..{tip[:7]} by={by}")
+    return job_path(repo, "deploy")
+
+
 def catchup():
-    """A merge this box never made still owes it a deploy: queue one for every repo whose origin default branch has moved past the SHA install.sh last ran on. Returns the repos it queued."""
+    """A merge this box never made still owes it a deploy: queue one for every repo whose origin default branch has moved past the SHA install.sh last ran on (deploy_due). Returns the repos it queued."""
     made = []
     for repo in known_repos():
-        if paused(repo) or member_of(repo)[0]:
-            continue        # parked: not queued; the poll is idempotent, so the first catch-up after a resume queues it
-        root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
-        if not os.path.isdir(f"{root}/.git") or os.path.exists(job_path(repo, "deploy")):
-            continue
-        with git_lock(root):    # the fetch writes refs/remotes/origin/<base> and the rev-parse reads it back
-            if sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=60)[0]:
-                continue                                 # no remote, no network: nothing to compare against
-            rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
-        if rc:
-            continue
-        tip, have = o.strip(), applied_sha(repo)
-        if not have:
-            # Nothing recorded yet, so read it off the checkout, and only while it is on the default branch.
-            if sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root)[1].strip() != base:
-                continue
-            rc, o = sh(["git", "rev-parse", "HEAD"], cwd=root)
-            if rc:
-                continue
-            have = o.strip()
-            record_applied(repo, have)
-        if have == tip:
-            continue
-        write_atomic(job_path(repo, "deploy"),
-                     {"repo": repo, "pr": None, "span": [have, tip], "queued_at": stamp(), "attempts": 0,
-                      "stage": "queued", "by": "the catch-up sweep",
-                      "why": f"origin/{base} moved to {tip[:7]} without this box — what is installed is {have[:7]}"})
-        ledger(f"queued {repo}#deploy span={have[:7]}..{tip[:7]} by=the catch-up sweep")
-        made.append(repo)
+        if paused(repo) or member_of(repo)[0] or sweep_running(repo):
+            continue        # a lane mid-landing deploys what it merges itself; parked: not queued; the poll is idempotent, so the first catch-up after a resume queues it
+        if deploy_due(repo):
+            made.append(repo)
     return made
 
 
@@ -3376,13 +3620,15 @@ def due_catchup():
     return True
 
 
-def next_wake():
-    """Seconds until the earliest job on disk wants running (a deferred one a minute past its not_before, a kept one RETRY_AFTER from now, an untried one almost at once), or None with nothing to wait for. A not_before already behind us is no wait at all. A wait limit_stands may cut short is capped at RETRY_AFTER: the sweep that re-asks is armed by the deferral itself, so a limit that lifts early is picked up on an idle box too and not only when other traffic happens by — cc-limit prints waits in the hundreds of minutes, and nothing on this box runs `work` on a clock."""
+def next_wake(skip=()):
+    """Seconds until the earliest job on disk wants running (a deferred one a minute past its not_before, a kept one RETRY_AFTER from now, an untried one almost at once), or None with nothing to wait for. A not_before already behind us is no wait at all. A wait limit_stands may cut short is capped at RETRY_AFTER: the sweep that re-asks is armed by the deferral itself, so a limit that lifts early is picked up on an idle box too and not only when other traffic happens by — cc-limit prints waits in the hundreds of minutes, and nothing on this box runs `work` on a clock. A job whose lane is running, or was just spawned (`skip`), is not waited on here: that lane re-reads the queue and arms its own wake when it ends."""
     now, waits = time.time(), []
     for p in glob.glob(f"{LANDQ}/*.json"):
         j = read_json(p) or {}
         if not j.get("repo"):
             continue
+        if j["repo"] in skip or sweep_running(j["repo"]):
+            continue    # its lane is running (or was just spawned, `skip`) and arms its own wake when it ends
         if box_hold(j):
             continue    # a parked or tier-held job wants running at no time: `cc-pause off` or `cc-tier set` re-drives it
         nb = epoch_of(j.get("not_before", ""))
@@ -3406,16 +3652,25 @@ def rearm(secs):
 
 
 def queue_order(paths):
-    """The queue oldest `queued_at` first, across repos, never file-name order. A job with no readable `queued_at` sorts after everything stamped, by path; ties fall back to the path."""
+    """The queue oldest `queued_at` first, never file-name order: the order a lane takes its repo's jobs in, and the order `work` starts the lanes in (by each repo's oldest job). A job with no readable `queued_at` sorts after everything stamped, by path; ties fall back to the path."""
     def key(p):
         at = epoch_of((read_json(p) or {}).get("queued_at", ""))
         return (0, at, p) if at else (1, 0, p)
     return sorted(paths, key=key)
 
 
-def sweep_running():
-    """The sweep holding the queue now, as its `since` stamp, or ''. Read from the marker cmd_work writes under the flock, never by probing the flock (a worker that loses it stands down for good); a dead pid means no sweep."""
-    j = read_json(f"{LANDQ}/.running") or {}
+def lane_dir():
+    """Where the lanes' flocks and markers live, derived from LANDQ at call time like root_dir()."""
+    return f"{LANDQ}/lanes"
+
+
+def lane_file(repo, ext):
+    return f"{lane_dir()}/{re.sub(r'[^A-Za-z0-9._-]+', '-', repo)}.{ext}"
+
+
+def sweep_running(repo):
+    """The lane landing `repo` now, as its `since` stamp, or ''. Read from the marker run_lane writes under the lane's flock, never by probing the flock (a lane that loses it stands down); a dead pid means no lane."""
+    j = read_json(lane_file(repo, "running")) or {}
     pid, since = j.get("pid"), j.get("since") or ""
     if not isinstance(pid, int) or pid <= 0 or not since:
         return ""
@@ -3427,16 +3682,436 @@ def sweep_running():
 
 
 def queue_place(path, running):
-    """Where this job stands and which sweep reaches it, as one line, or '' if it is not on the queue: a job queued while a sweep runs is not in that sweep's list and waits for the next. `running` is sweep_running() read before start_worker."""
-    order = queue_order(glob.glob(f"{LANDQ}/*.json"))
+    """Where this job stands in its repo's lane and which run of it reaches it, as one line, or '' if it is not on the queue. `running` is sweep_running(repo) read before start_worker; a running lane re-reads the queue after each landing, so it takes the job itself."""
+    repo = (read_json(path) or {}).get("repo") or ""
+    order = [p for p in queue_order(glob.glob(f"{LANDQ}/*.json")) if (read_json(p) or {}).get("repo") == repo]
     try:
         n = order.index(path) + 1
     except ValueError:
         return ""
     suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-    return (f"{n}{suffix} of {len(order)} on the queue, oldest first"
-            + (f"; a sweep has been running since {running} and fixed its list of jobs before this one was "
-               f"written, so the NEXT sweep takes it — armed when the running one ends" if running else ""))
+    return (f"{n}{suffix} of {len(order)} in the {repo} lane, oldest first — other repos land beside it"
+            + (f"; the {repo} lane has been running since {running} and takes it once the landing it is on ends"
+               if running else ""))
+
+
+def lane_jobs(repo):
+    """This repo's job files, oldest first."""
+    return queue_order([p for p in glob.glob(f"{LANDQ}/*.json") if (read_json(p) or {}).get("repo") == repo])
+
+
+# ── the batch: ordinary PRs land together, and the suite runs on the base once ───────────────────────
+def ready_job(job):
+    """Whether a PR job could be tried NOW, off the file alone: the same doors run_one asks, without the lock."""
+    fix = job.get("fix") or {}
+    return bool(job.get("pr")) and job.get("state") != "done" and not (fix and fix.get("over") is None) \
+        and not (stamp() < (job.get("not_before") or "")) and job.get("attempts", 0) < LAND_TRIES \
+        and not box_hold(job)
+
+
+def batch_of(repo, paths):
+    """The batch a lane run takes from its repo's queue (`paths`, oldest first): the ordinary, ready jobs whose files are pairwise disjoint, up to BATCH_MAX, as [(path, job, files)] in queue order. A job that is not ordinary is marked so on its file (`ordinary`: why) and left to the serial path, and once marked it is not asked again this queue life; one that overlaps a member ahead of it waits for the next batch, and is gated on the base that batch left. [] unless OPTIMISTIC."""
+    if not OPTIMISTIC:
+        return []
+    taken, held = [], set()
+    for p in paths:
+        job = read_json(p) or {}
+        if not ready_job(job) or job.get("ordinary"):
+            continue
+        why, files = ordinary(repo, job["pr"])
+        if why:
+            ledger(f"serial {repo}#{job['pr']} — {why}")
+            job_set(p, job, ordinary=why)
+            continue
+        if held & set(files):
+            ledger(f"waits {repo}#{job['pr']} — overlaps the batch ahead of it in "
+                   f"{', '.join(sorted(held & set(files))[:3])}; the next batch takes it")
+            continue
+        taken.append((p, job, files))
+        held |= set(files)
+        if len(taken) >= BATCH_MAX:
+            break
+    return taken
+
+
+def spawn_warm(repo, pr, log, path):
+    """One warm as a process of its own: this tool again, `<repo> <pr> --warm`, its output to `log`, its outcome written by itself on the job at `path` (warm_done). The seam warm_all runs its members through."""
+    return subprocess.Popen([sys.executable, os.path.realpath(__file__), repo, str(pr), "--warm"],
+                            stdin=subprocess.DEVNULL, stdout=open(log, "w"), stderr=subprocess.STDOUT, cwd=HOME)
+
+
+def warm_all(repo, batch):
+    """Phase 1: every member's warm — `<this> <repo> <pr> --warm`: the worker's green, the static gates on the merge, the read beside them, no merge — WARM_SLOTS at a time, each a process of its own (spawn_warm) whose output is a log under the run root, its outcome written on the job by the warm itself (warm_done). Returns one line per member. A warm that will not start, or dies without writing, leaves the job unwarmed, and the merge pass runs its gates as they always were."""
+    lines, running, todo = [], [], list(batch)
+    while todo or running:
+        while todo and len(running) < WARM_SLOTS:
+            path, job, _ = todo.pop(0)
+            log = f"{run_root()}/warm-{repo}-{job['pr']}.log"
+            try:
+                p = spawn_warm(repo, job["pr"], log, path)
+            except OSError as e:
+                lines.append(f"[{repo}] PR #{job['pr']}: the warm would not start ({e}) — its gates run at the merge pass")
+                continue
+            running.append((p, path, job, log))
+        still = []
+        for p, path, job, log in running:
+            if p.poll() is None:
+                still.append((p, path, job, log))
+                continue
+            w = (read_json(path) or {}).get("warm") or {}
+            lines.append(f"[{repo}] PR #{job['pr']}: warm " + ("passed" if w.get("ok") else
+                         f"stopped at {w.get('stopped') or 'start'} — {(w.get('why') or last(open(log).read() if os.path.exists(log) else ''))[:200]}"))
+        running = still
+        if running:
+            time.sleep(2)
+    return lines
+
+
+def suite_on(repo, sha, scope, step="suite"):
+    """Every gate the base carries, on the base at `sha` in a throwaway checkout, handed `scope` (the batch's paths, or '' for everything): (ok, why, log) — why names the gate and the case that failed. The one suite an ordinary batch buys, and what the bisect asks of each commit."""
+    L = Land(repo)
+    L.head = sha
+    tmp, tree = L.head_checkout(step, fetch=False, at=sha)
+    try:
+        found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK)]
+        if not found:
+            return True, f"no gates in {repo}", ""
+        content, reused = tree_id(tree), []
+        errs = L.run_gates(tree, found, scope, content, reused)
+        if errs:
+            e = errs[next(g for g in found if g in errs)]
+            m = re.search(r"\[full output: ([^\]]+)\]", str(e))
+            return False, getattr(e, "short", "") or str(e), (m.group(1) if m else "")
+        return True, f"{len(found)} gate(s) passed on {sha[:12]}" + (f" ({len(reused)} already green)" if reused else ""), ""
+    finally:
+        L.drop_checkout(tmp, tree)
+
+
+def bisect_batch(repo, merged, scope, tip=""):
+    """Which merge of `merged` ([(pr, sha, files)] in merge order) broke the base, as (kind, hit): ("pr", (pr, sha, files)) for the first red one by binary search over the commits themselves, each asked of suite_on — log2(n) runs; ("before", None) when the base was ALREADY red before the first of them (asked only when the first is red); ("after", None) when the LAST of them is green, so the red came from something merged after the batch. The last is always RUN, never assumed red — unless it IS `tip`, the commit the batch's suite already found red twice. Never a revert of a PR that broke nothing."""
+    lo, hi, seen = 0, len(merged), {}
+    if tip and merged[-1][1] == tip:
+        seen[hi] = False
+
+    def green_at(i):
+        if i not in seen:
+            sha = merged[i - 1][1] if i else f"{merged[0][1]}^"
+            seen[i] = suite_on(repo, sha, scope, step="bisect")[0]
+            ledger(f"bisect {repo} {sha[:12]} ({'before the batch' if not i else 'PR #' + str(merged[i - 1][0])}): "
+                   f"{'green' if seen[i] else 'red'}")
+        return seen[i]
+
+    if green_at(hi):
+        return "after", None
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if green_at(mid):
+            lo = mid
+        else:
+            hi = mid
+    if hi == 1 and not green_at(0):
+        return "before", None
+    return "pr", merged[hi - 1]
+
+
+def is_ancestor(root, a, b):
+    """`git merge-base --is-ancestor a b`: True only on git's own yes. An object this checkout does not have, or any error, is a no."""
+    return bool(a) and bool(b) and sh(["git", "merge-base", "--is-ancestor", a, b], cwd=root, timeout=60)[0] == 0
+
+
+def base_tip(repo):
+    """origin/<default branch>'s SHA, fetched now, or '' when git would not say."""
+    root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
+    with git_lock(root):
+        sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=120)
+        rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
+    return o.strip() if not rc else ""
+
+
+def batch_merged(repo, before, members, skip=()):
+    """What this batch PROVABLY put on the default branch, as [(pr, sha, files)] in merge order: `members` ([(pr, files)] in the order they were merged) asked of gh, each kept only when it is MERGED into the default branch with a single-parent squash commit that descends from the one before it (`before`, the tip read before the batch, for the first) and is on origin's tip now. A PR in `skip` (merged before this pass) is never one. Only what this returns is bisected and can be reverted, so the auto-revert can never apply the inverse of a commit that is off main, older than the batch or not the batch's."""
+    root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
+    tip = base_tip(repo)
+    merged, prev = [], before
+    if not before or not tip:
+        return merged
+    for pr, files in members:
+        if pr in skip:
+            continue
+        j = pr_facts(root, pr, "state,mergeCommit,baseRefName", timeout=60)[0] or {}
+        sha = ((j.get("mergeCommit") or {}).get("oid") or "").strip()
+        if j.get("state") != "MERGED" or not sha:
+            continue
+        parents = sh(["git", "rev-list", "--parents", "-n", "1", sha], cwd=root, timeout=60)[1].split()
+        if ((j.get("baseRefName") or "") != base or sha == prev or len(parents) != 2
+                or not is_ancestor(root, prev, sha) or not is_ancestor(root, sha, tip)):
+            ledger(f"batch-skip {repo}#{pr} sha={sha[:12]} — not a squash on {base} after {prev[:12]}: left out of the "
+                   f"batch's suite, never bisected, never reverted")
+            continue
+        merged.append((pr, sha, files))
+        prev = sha
+    return merged
+
+
+def batch_path(repo):
+    """Where a batch notes what it is merging while it runs — the tip it began on, its members, the ones merged before it began — so a lane that dies between the merges and the suite leaves the next pass enough to run that suite (resume_batch). Not `.json`: the queue's glob must never read it as a job."""
+    return f"{LANDQ}/{repo}.batch"
+
+
+def resume_batch(repo):
+    """A batch record the lane holding the lock did not write is a batch whose lane died before its suite ran on the base: run it now, on what that batch provably merged (batch_merged), and SAY it was cut off. Returns its lines; the record goes once after_batch has spoken."""
+    path = batch_path(repo)
+    rec = read_json(path)
+    if not isinstance(rec, dict):
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        ledger(f"batch-lost {repo} — its record could not be read; the catch-up deploys the tip as for any merge")
+        return [f"[{repo}] a batch's record could not be read — dropped; the catch-up handles the tip"]
+    members = [(int(m[0]), list(m[1])) for m in rec.get("members") or []]
+    if not members:
+        # Cut off before its first merge began: nothing of it is on the base, and nothing is owed but the note.
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        ledger(f"batch-dropped {repo} {rec.get('bid', '?')} — cut off before any merge; its jobs are still queued")
+        return []
+    prs = ", ".join(f"#{pr}" for pr, _ in members)
+    text = (f"[{repo}] the batch {rec.get('bid', '?')} ({prs}) was cut off before its suite ran on "
+            f"{board(repo).get('default_branch') or 'main'} — the lane died. Running that suite now")
+    ledger(f"batch-resume {repo} {rec.get('bid', '?')} prs={prs}")
+    sh([f"{BIN}/cc-slack", "inject", repo, text[:300]], timeout=120)   # the seat's wake; the suite's outcome is said by after_batch
+    lines = [text]
+    for pr, _ in members:
+        # A member still queued (cut off mid-merge, or kept) lands next on its own: every gate and its own deploy,
+        # never the dead batch's warm and deferred deploy.
+        jp = job_path(repo, pr)
+        j = read_json(jp)
+        if j and ("batch" in j or "warm" in j):
+            j.pop("batch", None); j.pop("warm", None)
+            with contextlib.suppress(OSError):
+                write_atomic(jp, j)
+    merged = batch_merged(repo, rec.get("before") or "", members, skip=set(rec.get("pre") or []))
+    lines += after_batch(repo, merged)
+    with contextlib.suppress(OSError):
+        os.unlink(path)
+    return lines
+
+
+def revert_pr(repo, pr, sha, why):
+    """Take PR `pr`'s squash `sha` back off the base — `git revert` in a throwaway checkout of the tip, pushed to the base — and SAY SO: on the PR (one comment), in the PR's track thread when it has one (else the repo's stopped route), to the repo's seat (inject), and in the queue log. Brief: "a revert is automatic and announced, never silent". Returns the revert's SHA, or '' when the revert could not be made (a conflict, a refused push), which is said the same ways."""
+    L = Land(repo)
+    root, base = L.root, L.base()
+    with git_lock(root):
+        sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=120)
+        rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
+    tip = o.strip() if not rc else ""
+    L.head, L.pr = tip, pr
+    made, said = "", ""
+    if tip and not is_ancestor(root, sha, tip):
+        # batch_merged already kept only squashes on the base; asked again at the tip the revert is built on, since
+        # the inverse of a commit that is not there would be a change nobody made, pushed to the base.
+        said, tip = f"its squash {sha[:12]} is not on origin/{base} at {tip[:12]}, so there is nothing of it to revert", ""
+    elif not tip:
+        said = f"origin/{base} could not be read"
+    if tip:
+        tmp, tree = L.head_checkout("revert", fetch=False, at=tip)
+        try:
+            rc, o = sh(["git", "revert", "--no-edit", sha], cwd=tree, timeout=300)
+            if rc:
+                said = f"git could not revert it cleanly ({last(o, 120)})"
+            else:
+                rc, o = sh(["git", "push", "-q", "origin", f"HEAD:refs/heads/{base}"], cwd=tree, timeout=300)
+                if rc:
+                    said = f"the push of the revert to {base} was refused ({last(o, 120)})"
+                else:
+                    made = sh(["git", "rev-parse", "HEAD"], cwd=tree)[1].strip()
+        finally:
+            L.drop_checkout(tmp, tree)
+    what = f"[{repo}] PR #{pr}"
+    text = (f"{what}: REVERTED ❌ — the suite on {base} went red after this batch merged and the bisect names this "
+            f"PR: {why}. Its squash {sha[:12]} is reverted in {made[:12]}; the branch is gone, so open a new PR "
+            f"with the fix, off {base} as it is now."
+            if made else
+            f"{what}: the suite on {base} went red after this batch merged and the bisect names this PR ({why}), "
+            f"but the revert did not happen — {said}. {base} is red until a person reverts {sha[:12]} or fixes it.")
+    ledger(f"{'reverted' if made else 'revert-failed'} {repo}#{pr} sha={sha[:12]}"
+           + (f" by={made[:12]}" if made else f" — {said}") + f" — {why[:200]}")
+    sh(["gh", "pr", "comment", str(pr), "--body", text], cwd=root, timeout=120)
+    tt = track_thread_of(repo, pr)
+    pid = f"land:{repo}:{pr}:reverted@{stamp()}"
+    notify(*(["--route", f"{tt} stopped"] if tt else ["--route", f"{what} stopped"]), "--id", pid, text, timeout=60)
+    sh([f"{BIN}/cc-slack", "inject", repo, f"{what} was {'reverted' if made else 'NOT reverted'} after the batch's "
+                                            f"suite went red on {base}: {why[:160]}"], timeout=120)
+    return made
+
+
+def after_batch(repo, merged):
+    """Phase 3, once per batch: ONE suite on the base, at its tip, scoped to the batch's paths when they fit WIDE_FILES (else everything). Green: the deploy the members skipped (deploy_due, run here). Red: believed on a second run only, then bisected to the merge that broke it (bisect_batch), that PR reverted and announced (revert_pr), and the suite run once more on what is left; still red, or a red the batch did not make, is SAID, the tip is noted for the catch-up to leave alone (red_base_path), and nothing is installed. Returns its lines."""
+    lines = []
+    if not merged:
+        return lines
+    L = Land(repo)
+    root, base = L.root, L.base()
+    with git_lock(root):
+        sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=120)
+        rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
+    tip = o.strip() if not rc else ""
+    if not tip:
+        return [f"[{repo}] batch: origin/{base} could not be read after the merges — nothing installed; the catch-up deploys it"]
+    files = sorted({p for _, _, fs in merged for p in fs})
+    scope = " ".join(files) if len(files) <= WIDE_FILES else ""
+    prs = ", ".join(f"#{pr}" for pr, _, _ in merged)
+    ledger(f"batch-suite {repo} tip={tip[:12]} prs={prs} scope={'all' if not scope else len(files)}")
+    ok, why, log = suite_on(repo, tip, scope)
+    if not ok:
+        ok, why2, log = suite_on(repo, tip, scope, step="suite2")    # a red is believed on the second run only
+        why = why2 if not ok else why
+    if not ok:
+        lines.append(f"[{repo}] batch ({prs}): the suite on {base} at {tip[:12]} is red twice — {why}; bisecting")
+        kind, hit = bisect_batch(repo, merged, scope, tip=tip)
+        if kind != "pr":
+            write_atomic(red_base_path(repo), {"tip": tip, "at": stamp(), "why": why})
+            if kind == "before":
+                text = (f"[{repo}] {base} was already red before this batch ({prs}) merged — {why}. Nothing "
+                        f"reverted, nothing installed: the box runs the old code until a person mends {base}.")
+            else:
+                text = (f"[{repo}] {base} is red at {tip[:12]}, but green at {merged[-1][1][:12]}, the last merge of "
+                        f"this batch ({prs}): the red came from something merged after it — {why}. Nothing "
+                        f"reverted, nothing installed: the box runs the old code until a person mends {base}.")
+            ledger(f"batch-red {repo} tip={tip[:12]} {kind}-batch — {why[:200]}")
+            notify("--route", f"[{repo}] batch stopped", "--id", f"land:{repo}:batch:red@{tip[:12]}", text, timeout=60)
+            sh([f"{BIN}/cc-slack", "inject", repo, text[:300]], timeout=120)
+            return lines + [text]
+        pr, sha, _ = hit
+        made = revert_pr(repo, pr, sha, why)
+        lines.append(f"[{repo}] PR #{pr} broke {base} ({why[:120]}) — " + (f"reverted in {made[:12]}" if made else "the revert did not happen"))
+        if made:
+            ok, why, log = suite_on(repo, made, scope, step="suite3")
+            tip = made
+        if not ok:
+            write_atomic(red_base_path(repo), {"tip": tip, "at": stamp(), "why": why})
+            text = (f"[{repo}] {base} is still red at {tip[:12]} after the batch ({prs}) and the revert of "
+                    f"PR #{pr} — {why[:160]}. Nothing installed: the box runs the old code until a person mends it.")
+            ledger(f"batch-red {repo} tip={tip[:12]} after-revert — {why[:200]}")
+            notify("--route", f"[{repo}] batch stopped", "--id", f"land:{repo}:batch:red@{tip[:12]}", text, timeout=60)
+            sh([f"{BIN}/cc-slack", "inject", repo, text[:300]], timeout=120)
+            return lines + [text]
+    with contextlib.suppress(OSError):
+        os.unlink(red_base_path(repo))
+    lines.append(f"[{repo}] batch ({prs}): the suite on {base} at {tip[:12]} is green — {why}; installing")
+    path = deploy_due(repo, by=f"the batch {prs}")
+    if path:
+        lines.append(run_one(path))
+    return lines
+
+
+def land_batch(repo, batch):
+    """One batch, three phases: the warms side by side (warm_all); the merges one at a time in queue order, each a run_one that spends its warm (spend_warm) and skips the deploy; then after_batch, on what batch_merged proves this pass put on the base. A member whose warm found it not ordinary is left on the queue for the serial path — this lane run's next look takes it. The tip before the batch, its members and the ones already merged before it are written to batch_path first, so a lane that dies before after_batch leaves the next pass what it needs (resume_batch). Returns its lines."""
+    bid = stamp()
+    before = base_tip(repo)
+    if not before:
+        # No tip to prove the merges against, so nothing this batch merged could be bisected or reverted: every
+        # member goes to the serial path, every gate before its merge.
+        for path, job, _ in batch:
+            job_set(path, read_json(path) or job, ordinary="the base's tip could not be read before the batch")
+        return [f"[{repo}] batch: origin could not name the base's tip — its members land one at a time, every gate first"]
+    ledger(f"batch {repo} {bid} before={before[:12]} prs={','.join(str(j['pr']) for _, j, _ in batch)} warms={WARM_SLOTS}")
+    rec = {"bid": bid, "before": before, "pid": os.getpid(), "members": [], "pre": []}
+    write_atomic(batch_path(repo), rec)
+    lines = warm_all(repo, batch)
+    for path, job, files in batch:
+        job = read_json(path) or {}
+        if not job or (job.get("warm") or {}).get("stopped") == "warm":
+            continue                          # not ordinary after all: the serial path's, not the batch's
+        if (pr_facts(repo_root(repo), job["pr"], "state", timeout=60)[0] or {}).get("state") == "MERGED":
+            rec["pre"].append(job["pr"])      # merged before this pass: not the batch's to bisect or revert
+        rec["members"].append([job["pr"], files])
+        write_atomic(batch_path(repo), rec)   # …noted BEFORE the merge, so a death mid-merge still finds it
+        job_set(path, job, batch=bid)
+        lines.append(run_one(path))
+        left = read_json(path)
+        if left is not None:
+            # Kept (a retry, a hold, a fix round): the batch and its warm were THIS pass's, and the serial landing
+            # that takes it next must gate and deploy it itself — a batch mark left on would skip both.
+            left.pop("batch", None); left.pop("warm", None)
+            with contextlib.suppress(OSError):
+                write_atomic(path, left)
+    merged = batch_merged(repo, before, [(pr, fs) for pr, fs in rec["members"]], skip=set(rec["pre"]))
+    lines += after_batch(repo, merged)
+    with contextlib.suppress(OSError):
+        os.unlink(batch_path(repo))
+    return lines
+
+
+def run_lane(repo):
+    """Land `repo`'s jobs one at a time, oldest first, under the repo's own flock, re-reading the queue after each so a job queued meanwhile is taken now and not by the next sweep. A job is run once per lane run (keyed by path and queued_at: a kept job waits for its wake, a re-queued one is new). Returns its lines; a lane that finds the flock held stands down, since the holder re-reads the same queue."""
+    os.makedirs(lane_dir(), exist_ok=True)
+    # Every lane holds the queue's old whole-queue flock SHARED: a worker from before the lanes takes it EXCLUSIVE, so
+    # the one running when this change deploys finishes its list alone, and never beside a lane of the same repo.
+    whole = open(f"{LANDQ}/.lock", "w")
+    try:
+        fcntl.flock(whole, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        whole.close()
+        return ["cc-land: a worker from before the lanes holds the whole queue — it lands what is in it, and its "
+                "rearm starts the lanes after it"]
+    try:
+        return _run_lane(repo)
+    finally:
+        fcntl.flock(whole, fcntl.LOCK_UN)
+        whole.close()
+
+
+def _run_lane(repo):
+    """run_lane under the shared queue lock."""
+    lines, seen = [], set()
+
+    def key(p):
+        return p, (read_json(p) or {}).get("queued_at", "")
+
+    def todo():
+        # A batch member whose warm found it not ordinary keeps its key in `seen`; its `ordinary` mark is what the
+        # next look reads, so it is taken again here — serially, every gate first — and not spun on.
+        return [p for p in lane_jobs(repo) if key(p) not in seen
+                or ((read_json(p) or {}).get("ordinary") and key(p) in seen_batch)]
+
+    seen_batch = set()
+
+    while True:
+        lock = open(lane_file(repo, "lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock.close()
+            return lines or [f"cc-land: the {repo} lane is already running — it lands what is queued, so this one "
+                             f"stands down"]
+        marker = lane_file(repo, "running")
+        with contextlib.suppress(OSError):       # the marker answers a question; it never stops a landing
+            write_atomic(marker, {"pid": os.getpid(), "since": stamp()})
+        try:
+            if os.path.exists(batch_path(repo)):
+                lines += resume_batch(repo)      # this lane holds the lock, so the batch that wrote it is dead
+            while True:
+                left = todo()
+                if not left:
+                    break
+                batch = batch_of(repo, left)
+                if len(batch) >= 2:
+                    # Two or more ordinary jobs ready: they land together (land_batch). One alone lands as it
+                    # always did — its suite runs before its merge, and a red there is a stop and not a revert.
+                    seen.update(key(p) for p, _, _ in batch)
+                    seen_batch.update(key(p) for p, _, _ in batch)
+                    lines += land_batch(repo, batch)
+                    continue
+                seen.add(key(left[0]))
+                seen_batch.discard(key(left[0]))   # a demoted member, once run serially, is not looked at again
+                lines.append(run_one(left[0]))
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(marker)                # this lane is over before the lock it held is
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        if not todo():      # a job queued between the last look and the unlock found the lane held: look once more
+            return lines
 
 
 def refuse(msg, rc=2):
@@ -3446,38 +4121,54 @@ def refuse(msg, rc=2):
 
 
 def cmd_work(argv):
-    """Drain the queue, then catch the box up. One worker at a time: the flock is what makes 'at most one merge' true, and a second worker finding it held says so and exits."""
+    """Drain the queue, one lane per repo, then catch the box up. `work --lane <repo>` is one lane (run_lane); bare `work` sweeps, runs the lane of the repo whose job is oldest itself and spawns a lane for each other repo with a job — so repos land side by side, and one repo's landings stay one at a time, each gated on the base the one before it left."""
     if "--detach" in argv:
         ok, how = start_worker()
         print(f"cc-land: worker started ({how})" if ok else f"cc-land: the worker would not start: {how}",
               file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     os.makedirs(LANDQ, exist_ok=True)
-    lock = open(f"{LANDQ}/.lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        print("cc-land: another worker holds the queue — it lands what is in it, so this one stands down")
-        return 0
-    # While this sweep holds the queue, say so on disk (sweep_running): the stamp is the line the job list is fixed on, and a job queued after it waits for the next sweep.
-    running_at = f"{LANDQ}/.running"
-    with contextlib.suppress(OSError):       # the marker answers a question; it never stops a landing
-        write_atomic(running_at, {"pid": os.getpid(), "since": stamp()})
-    lines = []
-    try:
+    lines, spawned = [], set()
+    if "--lane" in argv:
+        i = argv.index("--lane") + 1
+        repo = argv[i] if i < len(argv) else ""
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo):
+            return refuse("work --lane takes one repo name")
+        lines += run_lane(repo)
+    else:
         sweep_records()
-        sweep_run_roots()                        # what a killed or rebooted worker left in the temp root
+        sweep_run_roots()                        # what a killed or rebooted worker left in the temp root (live lanes' are kept)
+        repos = []
         for path in queue_order(glob.glob(f"{LANDQ}/*.json")):
-            lines.append(run_one(path))          # every sweep: this is what finishes a landing a reboot interrupted
+            repo = (read_json(path) or {}).get("repo")
+            if not repo:
+                lines.append(run_one(path))      # not a job: moved aside here, it has no lane
+            elif repo not in repos:
+                repos.append(repo)
+        for path in sorted(glob.glob(f"{LANDQ}/*.batch")):
+            repo = os.path.basename(path)[:-len(".batch")]
+            if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo) and repo not in repos:
+                repos.append(repo)               # a batch cut off before its suite: its lane runs that suite (resume_batch)
+        mine = []
+        for repo in repos:
+            if sweep_running(repo):
+                continue                         # its lane re-reads the queue itself
+            if not mine or all(box_hold(read_json(p) or {}) for p in lane_jobs(repo)):
+                mine.append(repo)                # the oldest job's lane runs here: this process is already paid for,
+                continue                         # and so does a lane that only says its jobs are held
+            how, why = spawn_work(lane=repo)
+            if how:
+                spawned.add(repo)
+                lines.append(f"cc-land: the {repo} lane started beside this one ({how})")
+            else:
+                mine.append(repo)                # never dropped: run here, after the others
+                lines.append(f"cc-land: the {repo} lane would not start ({why}) — run here after the rest")
+        for repo in mine:
+            lines += run_lane(repo)              # every sweep: this is what finishes a landing a reboot interrupted
         if "--catch-up" in argv or due_catchup():
             for repo in catchup():
-                lines.append(run_one(job_path(repo, "deploy")))
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(running_at)                # this sweep is over before the lock it held is
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        lock.close()
-    wake = next_wake()
+                lines += run_lane(repo)
+    wake = next_wake(spawned)
     if wake is not None:
         lines.append(rearm(wake))
     for x in lines:
@@ -3613,8 +4304,8 @@ def cmd_queue(argv):
             return refuse(f"cannot write {path}: {e} — nothing merged", 1)
         ledger(f"queued {repo}#{pr} who={who or '-'} chat={chat or '-'}")
         print(f"[{repo}] PR #{pr} queued — the gates run first, then the merge, then the deploy")
-    # Where it stands and which sweep takes it (queue_place): the running sweep is read before start_worker, or the sweep this call starts reads as one already in flight.
-    running = sweep_running()
+    # Where it stands and which run of its lane takes it (queue_place): the running lane is read before start_worker, or the lane this call starts reads as one already in flight.
+    running = sweep_running(repo)
     # A 👍 on a parked project is kept, not refused: the job file is written, the worker is not started. Exit 0.
     if paused(repo):
         print(f"cc-land: {repo} is paused — nothing lands until `cc-pause off {repo}`, and this job waits for it")
@@ -3622,7 +4313,7 @@ def cmd_queue(argv):
     place = queue_place(path, running)
     if not start:
         if place:
-            print(f"cc-land: {place}. Nothing was started — `cc-land work` is the sweep it waits for")
+            print(f"cc-land: {place}. Nothing was started — `cc-land work` is the run it waits for")
         return 0
     ok, how = start_worker()
     if not ok:
@@ -3630,7 +4321,7 @@ def cmd_queue(argv):
     print(f"cc-land: worker started ({how})")
     if place:
         print(f"cc-land: {place}"
-              + ("" if running else " — the sweep just started is the one that takes it"))
+              + ("" if running else " — the lane just started is the one that takes it"))
     return 0
 
 
@@ -3721,12 +4412,14 @@ def main(argv):
     review = "--no-review" not in rest      # the ONE way past the review gate, and it has to be typed
     re_review = "--re-review" in rest       # …and the ONE way to buy a second one for a head already reviewed
     full_gates = "--full-gates" in rest     # …and the ONE way past the scoping: every gate, whatever the diff is
-    rest = [a for a in rest if a not in ("--no-review", "--re-review", "--full-gates")]
+    warm = "--warm" in rest                 # the batch's first pass: static gates and the read, no merge (warm_all)
+    rest = [a for a in rest if a not in ("--no-review", "--re-review", "--full-gates", "--warm")]
     if not rest:
         return refuse("--no-review is not a landing on its own — name the PR too")
     if len(rest) != 1 or not re.fullmatch(r"[0-9]+", rest[0]):
         return refuse("the PR path takes one PR number and nothing else")
     land = Land(repo, pr=int(rest[0]), review=review, re_review=re_review, full_gates=full_gates)
+    land.warm_only = warm
     if not os.path.isdir(f"{land.root}/.git"):
         return refuse(f"{land.root} is not a git repo")
     return land.run()

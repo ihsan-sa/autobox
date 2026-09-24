@@ -106,13 +106,21 @@ green_record(){   # $1 = the suite that just passed, as it was invoked ("$0"); $
 # file that mentions the name in a comment. Nothing here is a list somebody keeps: the source is the graph. What
 # widens it back to everything: a path that is not a tool under bin/ (a test, a config, a template, install.sh —
 # what those touch is not something a grep can answer), a tool too short to grep for, and a tool that is gone.
+# What NARROWS it: a path outside the tree this bin/ sits in — a private overlay's bin-private/, lessons/, docs/
+# around a core/ — is out of every case's reach, because that tree ships and is tested alone (core/install.sh's
+# case copies it bare) and so nothing in its suites can read past it. Such a path adds no tool and widens
+# nothing; a diff of nothing else reaches no tool at all (REACH=" "), and runs only the `always` stanzas, with the
+# scope on the record. Where git cannot say which tree bin/ sits in, every path counts as inside, as before.
 # `cc` itself is the front door to nearly every tool, so it is never pulled in as an invoker — a stanza that calls
 # `cc` runs for a change to cc, which is everything, and not for every change to something cc can start.
 land_scope(){   # $1 = this tree's bin/. Sets SCOPE ("" = everything) and REACH (" tool tool ": the tools worth running for)
-  local b=$1 p t tools="" queue nxt
+  local b=$1 p t tools="" queue nxt pre
   SCOPE=""; REACH=""
   [ -n "${CC_LAND_CHANGED:-}" ] || return 0
+  # the tree bin/ sits in, as the checkout's top names it: "core/", or "" at the top or where git gives no answer
+  pre=$(git -C "$(dirname "$b")" rev-parse --show-prefix 2>/dev/null) || pre=""
   for p in $CC_LAND_CHANGED; do
+    case "$p" in "$pre"*) ;; *) continue;; esac   # outside that tree: no case here can read it (above)
     t=${p##*/}
     case "$p" in */bin/"$t"|bin/"$t") [ -f "$b/$t" ] && [ ${#t} -ge 3 ] || return 0;; *) return 0;; esac
     tools="$tools $t"

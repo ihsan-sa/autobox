@@ -30,6 +30,9 @@ def selfcheck():
     # under one of our own makes that collision impossible rather than one more pattern to keep in step.
     _real_tmp, tempfile.tempdir = tempfile.tempdir, tempfile.mkdtemp(prefix="cc-land-selfcheck-t-")
     _tmproot = tempfile.tempdir
+    # The optimistic path is OFF for every case below that does not ask for it: the lane cases stub run_one and
+    # land one job at a time, and a batch would take them out from under those stubs. Its own cases turn it on.
+    globals()["OPTIMISTIC"] = False
 
     def check(name, cond):
         print(("  ✓ " if cond else "  ✗ ") + name)
@@ -186,6 +189,30 @@ def selfcheck():
         check("a gate that goes silent takes its CHILDREN with it: the group is killed, not the leader — a suite "
               "that execs its real run under a launcher shell used to survive its own gate and keep going on live "
               "fixtures", rc == 124 and gone)
+        # …and a gate is stopped, group and all, within a second of a sibling going red — never left to run on.
+        globals()["GATE_IDLE"] = 60
+        halt, t0 = threading.Event(), time.time()
+        threading.Timer(0.3, halt.set).start()
+        try:
+            run_gate([f"{probe}/group.sh"], probe, f"{probe}/slog", dict(os.environ), stop=halt)
+            stopped = False
+        except GateStopped:
+            stopped = True
+        kid = int(open(f"{probe}/child.pid").read().strip())
+        end, gone = time.time() + 5, False
+        while time.time() < end and not gone:
+            try:
+                os.kill(kid, 0)
+                time.sleep(0.05)
+            except OSError:
+                gone = True
+        if not gone:
+            os.kill(kid, signal.SIGKILL)
+        check("a gate told to stop (a sibling is red) is killed with its children inside a couple of seconds and "
+              "raises GateStopped, never a red of its own", stopped and gone and time.time() - t0 < 4
+              and "another gate is already red" in open(f"{probe}/slog").read())
+        rc, o = run_gate([f"{probe}/slow.sh"], probe, f"{probe}/log", dict(os.environ), stop=threading.Event())
+        check("...while a gate handed a stop nobody sets runs to its own end, green", rc == 0 and "0 failed" in o)
     finally:
         globals()["GATE_IDLE"] = real_idle
         shutil.rmtree(probe, ignore_errors=True)
@@ -422,7 +449,7 @@ def selfcheck():
     REAL = {k: globals()[k] for k in ("sh", "run_gate", "linked_units", "read_unit", "board",
                                       "repo_root", "live_processes", "own_ancestry")}
     real_sh, real_root = sh, repo_root      # …the real ones, for the member cases that ask what a clone's git is handed
-    globals().update(sh=fake_sh, run_gate=lambda argv, cwd, log, env: fake_sh(argv, cwd=cwd, env=env, log=log),
+    globals().update(sh=fake_sh, run_gate=lambda argv, cwd, log, env, stop=None: fake_sh(argv, cwd=cwd, env=env, log=log),
                      linked_units=lambda: LINKED[0], read_unit=lambda u: BODY[0].get(u, ""),
                      board=lambda r: BOARD[0], repo_root=lambda r: "/tmp/_ccland",
                      live_processes=lambda: list(PROCS[0]), own_ancestry=lambda: set(MINE[0]))
@@ -1915,6 +1942,40 @@ def selfcheck():
               and [c for c in calls if c[0].endswith("core/tests/selftest.sh")])
     finally:
         os.access = real_access
+
+    # A RED GATE ENDS THE LANDING'S OTHER GATES. #617's check.sh was red at ~03:46 and its selftest ran on to 04:24;
+    # the landing was lost at the first red, and the rest only held slots. check.sh says red at once here, and the
+    # suite runs until it is told to stop — so a landing that waited for every gate would sit out the whole 10 s.
+    fate = {}
+
+    def racing_gate(argv, cwd, log, env, stop=None):
+        if argv[0].endswith("check.sh"):
+            return 1, "  ✗ a lint\n1 failed\n"
+        if stop is not None and stop.wait(10):
+            fate["suite"] = "stopped"
+            raise GateStopped("stopped")
+        fate["suite"] = "ran to the end"
+        return 0, "0 failed\n"
+    real_access, real_gate = os.access, run_gate
+    try:
+        os.access = lambda p, m: p.endswith(("core/tests/check.sh", "core/tests/selftest.sh"))
+        globals()["run_gate"] = racing_gate
+        L = fresh(pr=7, full_gates=True)
+        world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git merge-base": (0, A + "\n"),
+                      "git diff --name-status": (0, "M\tcore/bin/cc-x\n"), "git diff --numstat": (0, "3\t2\tx\n"),
+                      "git rev-parse HEAD^{tree}": (0, TREE + "\n")})
+        t0 = time.time()
+        with contextlib.redirect_stdout(io.StringIO()) as said, contextlib.redirect_stderr(io.StringIO()):
+            g = caught(L.gates)
+            if L._review is not None:
+                caught(L.review_aside)
+        took = time.time() - t0
+        check("a red gate stops its siblings: check.sh red ends the suite within seconds, the landing reports "
+              "check.sh and says the suite was stopped, not red",
+              isinstance(g, Failed) and "check.sh" in str(g) and "selftest" not in str(g)
+              and fate.get("suite") == "stopped" and took < 8 and "stopped, not run to the end" in said.getvalue())
+    finally:
+        os.access, globals()["run_gate"] = real_access, real_gate
 
     # 4d. THE READ RUNS BESIDE THE SUITE (owner, 2026-09-04): serial they were the whole of a landing's wall clock.
     # The proof is a rendezvous: the fake suite and the fake reviewer each answer only once the other is in
@@ -3594,20 +3655,162 @@ def selfcheck():
         check("...and it is not retried: a verdict is not a flaky step, and re-buying it costs dollars to be told "
               "the same thing", len([c for c in calls if c[0] == CLAUDE]) == 1)
 
-        # ---- one worker at a time. This is what makes "at most one merge" true when a 👍, a five-minute sweep
-        # and a reboot all ask for one in the same second.
+        # ---- one lane per repo at a time. This is what makes "at most one merge" true when a 👍, a five-minute
+        # sweep and a reboot all ask for one in the same second — and what keeps each merge on the tree its own
+        # gates ran on: inside a repo nothing lands between one landing's gates and its merge.
         fresh(pr=7)
         quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
-        held = open(f"{qdir}/.lock", "w")
+        os.makedirs(lane_dir(), exist_ok=True)
+        held = open(lane_file("myrepo", "lock"), "w")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            rcW = quiet(cmd_work, ["--lane", "myrepo"])
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN)
+            held.close()
+        check("a second lane for one repo finds its lock held and stands down without touching the queue — the one "
+              "holding it reaches the same jobs, so a race ends in one merge, not two",
+              rcW == 0 and not gh_merges() and os.path.exists(job_path("myrepo", 7)))
+
+        held = open(f"{qdir}/.lock", "w")        # the whole-queue flock a worker from before the lanes holds
         fcntl.flock(held, fcntl.LOCK_EX)
         try:
             rcW = quiet(cmd_work, [])
         finally:
             fcntl.flock(held, fcntl.LOCK_UN)
             held.close()
-        check("a second worker finds the lock held and stands down without touching the queue — the one holding "
-              "it reaches the same jobs, so a race ends in one merge, not two",
+        check("a worker from before the lanes (the one running when this deploys) holds the whole queue, and no "
+              "lane runs beside it — so no two landings of one repo overlap across the upgrade",
               rcW == 0 and not gh_merges() and os.path.exists(job_path("myrepo", 7)))
+
+        # ---- REPOS DO NOT BLOCK EACH OTHER. 2026-09-24: 30 jobs on one serial worker, and a 20-second landing of
+        # one repo waited 87 min behind another repo's run. Here zulu's lane is mid-landing (its flock and marker held by
+        # a live pid) and zulu's job is the OLDEST on the queue; myrepo's job lands now anyway, and zulu's is left
+        # to the lane that holds it.
+        write_atomic(job_path("zulu", 3), {"repo": "zulu", "pr": 3, "queued_at": "2026-09-08T07:00:00Z",
+                                           "attempts": 0, "stage": "gates"})
+        held = open(lane_file("zulu", "lock"), "w")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        write_atomic(lane_file("zulu", "running"), {"pid": os.getpid(), "since": "2026-09-08T07:01:00Z"})
+        try:
+            quiet(cmd_work, [])
+        finally:
+            os.unlink(lane_file("zulu", "running"))
+            fcntl.flock(held, fcntl.LOCK_UN)
+            held.close()
+        check("a repo lands while ANOTHER repo's lane is mid-landing: myrepo#7 merges although zulu#3 was queued "
+              "first and its lane is still running — the lane running it is not waited on, not spawned twice, "
+              "and its job is not touched",
+              [c[3] for c in gh_merges()] == ["7"]
+              and (read_json(job_path("zulu", 3)) or {}).get("stage") == "gates"
+              and not ran("systemd-run", "--lane"))
+        os.unlink(job_path("zulu", 3))
+        os.unlink(job_path("myrepo", 7))
+
+        # ---- SIDE BY SIDE, and never two at once inside a repo: run_one stood in by a rendezvous. Two lanes of
+        # different repos only get past the barrier if both are inside a landing at the same moment; two lanes of
+        # one repo racing for the same two jobs must run them one after the other, each exactly once.
+        lq = tempfile.mkdtemp(prefix="cc-land-selfcheck-l-")
+        real_run_one, real_q2 = run_one, LANDQ
+        globals()["LANDQ"] = lq
+        try:
+            for repo, pr, at in (("alpha", 1, "2026-09-08T07:00:00Z"), ("zulu", 1, "2026-09-08T07:00:01Z")):
+                write_atomic(job_path(repo, pr), {"repo": repo, "pr": pr, "queued_at": at})
+            meet, met = threading.Barrier(2, timeout=10), []
+
+            def rendezvous(path):
+                try:
+                    meet.wait()
+                    met.append(os.path.basename(path))
+                except threading.BrokenBarrierError:
+                    pass
+                os.unlink(path)
+                return ""
+            globals()["run_one"] = rendezvous
+            ts = [threading.Thread(target=run_lane, args=(r,), daemon=True) for r in ("alpha", "zulu")]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(30)
+            check("two repos' lanes land AT THE SAME TIME: both landings were in flight together (a barrier of two "
+                  "that only opens when both are), where one serial worker would have timed the barrier out",
+                  sorted(met) == ["alpha-1.json", "zulu-1.json"] and not meet.broken)
+
+            for pr, at in ((1, "2026-09-08T07:00:00Z"), (2, "2026-09-08T07:00:05Z")):
+                write_atomic(job_path("alpha", pr), {"repo": "alpha", "pr": pr, "queued_at": at})
+            inside, events, ev_lock = [0], [], threading.Lock()
+
+            def one_at_a_time(path):
+                with ev_lock:
+                    inside[0] += 1
+                    events.append(("start", os.path.basename(path), inside[0]))
+                time.sleep(0.3)             # long enough for the other thread to try its way in
+                with ev_lock:
+                    inside[0] -= 1
+                    events.append(("end", os.path.basename(path), inside[0]))
+                os.unlink(path)
+                return ""
+            globals()["run_one"] = one_at_a_time
+            ts = [threading.Thread(target=run_lane, args=("alpha",), daemon=True) for _ in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(30)
+            check("…and inside ONE repo the landings never overlap: two lanes racing for alpha land alpha#1, THEN "
+                  "alpha#2, each once — so #2's gates run on the base #1's merge left, and no merge is of a "
+                  "combination its gates did not run on",
+                  [(e[0], e[1]) for e in events] == [("start", "alpha-1.json"), ("end", "alpha-1.json"),
+                                                     ("start", "alpha-2.json"), ("end", "alpha-2.json")]
+                  and max(e[2] for e in events) == 1)
+
+            # A job queued WHILE its lane runs is taken by that lane, not left for a sweep that may be an hour off.
+            write_atomic(job_path("alpha", 1), {"repo": "alpha", "pr": 1, "queued_at": "2026-09-08T07:00:00Z"})
+            took = []
+
+            def queues_another(path):
+                took.append(os.path.basename(path))
+                if len(took) == 1:
+                    write_atomic(job_path("alpha", 5), {"repo": "alpha", "pr": 5, "queued_at": stamp()})
+                    write_atomic(job_path("zulu", 5), {"repo": "zulu", "pr": 5, "queued_at": stamp()})
+                os.unlink(path)
+                return ""
+            globals()["run_one"] = queues_another
+            run_lane("alpha")
+            check("a job queued while its repo's lane is running is landed by THAT lane before it ends — and a "
+                  "job of another repo queued at the same moment is left to that repo's own lane",
+                  took == ["alpha-1.json", "alpha-5.json"] and os.path.exists(job_path("zulu", 5))
+                  and not os.path.exists(lane_file("alpha", "running")))
+            os.unlink(job_path("zulu", 5))
+
+            # …and a job the lane kept (a retry, a wait) is not run again in the same lane run: it has a wake.
+            write_atomic(job_path("alpha", 6), {"repo": "alpha", "pr": 6, "queued_at": "2026-09-08T07:00:00Z"})
+            tries = []
+            globals()["run_one"] = lambda path: (tries.append(path), "kept")[1]
+            run_lane("alpha")
+            check("a job its landing KEPT on the queue is run once per lane run, not spun on — its retry has a "
+                  "wake of its own", len(tries) == 1 and os.path.exists(job_path("alpha", 6)))
+            os.unlink(job_path("alpha", 6))
+
+            # A lane whose every job the box holds (a parked project) is not worth a process: it is run here, where
+            # it only says so. A repo with a job to land still gets a lane of its own.
+            for repo, at in (("alpha", "2026-09-08T07:00:00Z"), ("zulu", "2026-09-08T07:00:01Z"),
+                             ("yankee", "2026-09-08T07:00:02Z")):
+                write_atomic(job_path(repo, 1), {"repo": repo, "pr": 1, "queued_at": at})
+            real_paused, real_tier, here = paused, tier_holds, []
+            globals().update(paused=lambda t: t == "zulu", tier_holds=lambda j: False,
+                             run_one=lambda path: (here.append(os.path.basename(path)), "")[1])
+            try:
+                n = len(ran("systemd-run", "--lane"))
+                quiet(cmd_work, [])
+                lanes = [c[c.index("--lane") + 1] for c in ran("systemd-run", "--lane")[n:]]
+            finally:
+                globals().update(paused=real_paused, tier_holds=real_tier)
+            check("the sweep spawns a lane only for a repo with a job to land — yankee gets one; zulu, parked, is "
+                  "answered here beside the oldest repo's own lane, never a process spent to say it is held",
+                  lanes == ["yankee"] and here == ["alpha-1.json", "zulu-1.json"])
+        finally:
+            globals()["run_one"], globals()["LANDQ"] = real_run_one, real_q2
+            shutil.rmtree(lq, ignore_errors=True)
 
         # ---- ORDER. The queue runs in the order it was ASKED FOR, across repos — not the order of the file
         # NAMES, which is what `sorted(glob(...))` gave. On 2026-09-08 the live queue held three jobs of one repo, #353 (queued
@@ -3630,10 +3833,14 @@ def selfcheck():
                   and sorted(names) == ["alpha-10.json", "alpha-9.json", "zulu-9.json"])
             quiet(cmd_work, [])
             spoke = [c[3] for c in calls if os.path.basename(c[0]) == "cc-slack" and c[1] == "post" and c[2] == "-c"]
-            check("...and that is the order the SWEEP itself drains them in, not just the sort: each job is "
-                  "reached, finished and answered in the order it was queued",
-                  spoke == ["C-zulu-9", "C-alpha-10", "C-alpha-9"]
-                  and not glob.glob(f"{odir}/*.json"))
+            check("...and the sweep runs the lane of the repo that waited longest itself and SPAWNS a lane for the "
+                  "other repo beside it, rather than making alpha wait for zulu",
+                  spoke == ["C-zulu-9"] and len(ran("systemd-run", "work", "--lane", "alpha")) == 1
+                  and not os.path.exists(job_path("zulu", 9)) and os.path.exists(job_path("alpha", 10)))
+            quiet(cmd_work, ["--lane", "alpha"])
+            spoke = [c[3] for c in calls if os.path.basename(c[0]) == "cc-slack" and c[1] == "post" and c[2] == "-c"]
+            check("...and a lane drains its own repo in the order it was queued: alpha#10 before alpha#9",
+                  spoke == ["C-zulu-9", "C-alpha-10", "C-alpha-9"] and not glob.glob(f"{odir}/*.json"))
             write_atomic(f"{odir}/alpha-1.json", {"repo": "alpha", "pr": 1})    # half a job: no queued_at
             write_atomic(job_path("zulu", 9), {"repo": "zulu", "pr": 9, "queued_at": "2026-09-08T07:47:08Z"})
             names = [os.path.basename(p) for p in queue_order(glob.glob(f"{odir}/*.json"))]
@@ -3642,59 +3849,62 @@ def selfcheck():
                   "itself in front of a real landing",
                   names == ["zulu-9.json", "alpha-1.json"])
 
-            # ---- WHICH SWEEP TAKES IT. cmd_work fixes its list of jobs once, under the flock, so a job queued
-            # while a sweep is already running is not in that sweep's paths at all: it waits for the next one.
+            # ---- WHICH RUN TAKES IT. A job is told its place in its own repo's lane, and whether that lane is
+            # already running — a running lane re-reads the queue after each landing, so it takes the job itself.
             # "worker started" alone read as "it is landing now" when the truth was "after everything the running
-            # sweep is already gating" — up to the hour those gates take.
+            # lane is already gating" — up to the hour those gates take.
             for p in glob.glob(f"{odir}/*.json"):
                 os.unlink(p)
             fresh(pr=7)
             out = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                 cmd_queue(["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
-            check("a queued job is told where it stands and which sweep takes it: nothing else is on the queue "
-                  "and no sweep was running, so it is 1st of 1 and the sweep this call just started is its own",
-                  "1st of 1 on the queue, oldest first" in out.getvalue()
-                  and "the sweep just started is the one that takes it" in out.getvalue()
-                  and "the NEXT sweep takes it" not in out.getvalue())
-            write_atomic(f"{odir}/.running", {"pid": os.getpid(), "since": "2026-09-08T08:11:00Z"})
+            check("a queued job is told where it stands and which run takes it: nothing else is on the queue "
+                  "and no lane was running, so it is 1st of 1 and the lane this call just started is its own",
+                  "1st of 1 in the myrepo lane, oldest first" in out.getvalue()
+                  and "the lane just started is the one that takes it" in out.getvalue()
+                  and "has been running since" not in out.getvalue())
+            write_atomic(job_path("zulu", 4), {"repo": "zulu", "pr": 4, "queued_at": "2026-09-08T07:00:00Z"})
+            os.makedirs(lane_dir(), exist_ok=True)
+            write_atomic(lane_file("myrepo", "running"), {"pid": os.getpid(), "since": "2026-09-08T08:11:00Z"})
             out = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                 cmd_queue(["myrepo", "8", "--chat", "CAPPR", "--ts", "1.2"])
-            check("...and with a sweep already running it is told the NEXT sweep takes it, and when that sweep "
-                  "started — the running one fixed its list of jobs before this file existed, so saying 'worker "
-                  "started' and nothing else would have promised a landing that sweep will not do",
-                  "2nd of 2 on the queue, oldest first" in out.getvalue()
+            check("...and with its lane already running it is told that lane takes it after the landing it is on, "
+                  "and when that lane started — counted in its own lane only, so another repo's older job does "
+                  "not push it back",
+                  "2nd of 2 in the myrepo lane, oldest first" in out.getvalue()
                   and "running since 2026-09-08T08:11:00Z" in out.getvalue()
-                  and "the NEXT sweep takes it" in out.getvalue()
-                  and "the sweep just started is the one that takes it" not in out.getvalue())
+                  and "takes it once the landing it is on ends" in out.getvalue()
+                  and "the lane just started is the one that takes it" not in out.getvalue())
+            os.unlink(job_path("zulu", 4))
             gone = 2 ** 31 - 1                                  # …and a marker a KILLED sweep left behind
             try:
                 gone = int(open("/proc/sys/kernel/pid_max").read())   # pids run 1..pid_max-1, so this is nobody
             except (OSError, ValueError):
                 pass
-            write_atomic(f"{odir}/.running", {"pid": gone, "since": "2026-09-08T08:11:00Z"})
+            write_atomic(lane_file("myrepo", "running"), {"pid": gone, "since": "2026-09-08T08:11:00Z"})
             os.unlink(job_path("myrepo", 8))
             out = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                 cmd_queue(["myrepo", "8", "--chat", "CAPPR", "--ts", "1.2"])
-            check("a marker a killed sweep left behind is not a running sweep: the pid is checked, so the job is "
-                  "told the truth — the sweep just started is its own — rather than waiting for one that ended",
-                  "the sweep just started is the one that takes it" in out.getvalue()
-                  and "the NEXT sweep takes it" not in out.getvalue())
+            check("a marker a killed lane left behind is not a running lane: the pid is checked, so the job is "
+                  "told the truth — the lane just started is its own — rather than waiting for one that ended",
+                  "the lane just started is the one that takes it" in out.getvalue()
+                  and "has been running since" not in out.getvalue())
             os.unlink(job_path("myrepo", 8))
-            os.unlink(f"{odir}/.running")
-            seen, real_sweep = [], sweep_records
-            globals()["sweep_records"] = lambda: seen.append(sweep_running())   # a seam INSIDE the held queue
+            os.unlink(lane_file("myrepo", "running"))
+            seen, real_one = [], run_one
+            globals()["run_one"] = lambda p: (seen.append(sweep_running("myrepo")), real_one(p))[1]   # a seam INSIDE the held lane
             try:
                 quiet(cmd_work, [])
             finally:
-                globals()["sweep_records"] = real_sweep
-            check("...and a sweep says on disk that it is running, for exactly as long as it holds the queue: a "
-                  "👍 arriving mid-sweep is answered from that, never by probing the flock — a probe that won "
-                  "the lock for a millisecond would make a real worker stand down and drain nothing — and the "
-                  "marker is gone when the sweep is, or every later job would wait for a sweep that finished",
-                  len(seen) == 1 and seen[0] and not os.path.exists(f"{odir}/.running")
+                globals()["run_one"] = real_one
+            check("...and a lane says on disk that it is running, for exactly as long as it holds its repo: a "
+                  "👍 arriving mid-lane is answered from that, never by probing the flock — a probe that won "
+                  "the lock for a millisecond would make a real lane stand down and drain nothing — and the "
+                  "marker is gone when the lane is, or every later job would wait for a lane that finished",
+                  len(seen) == 1 and seen[0] and not os.path.exists(lane_file("myrepo", "running"))
                   and not glob.glob(f"{odir}/*.unreadable"))
         finally:
             globals()["LANDQ"] = qdir
@@ -5471,6 +5681,579 @@ def selfcheck():
     finally:
         globals().update(BOARDS=_fb, LANDQ=_fl)
         shutil.rmtree(fxd, ignore_errors=True)
+
+    # ── OPTIMISTIC LANDING (owner, 2026-09-24: "15 min a PR x 30 = 450 min, way too long"). An ORDINARY PR — no
+    # protected path, nothing on the gate-first list, its worker's own green on its head, its files disjoint from
+    # the batch — lands on that green plus the static gates, warmed side by side with the batch's others; the
+    # suite runs ONCE on the base after the merges; a red there bisects to the breaker and reverts it out loud.
+    # Every case builds its own world; the fake `sh` is put back for the section since the member cases restored the
+    # real one, and taken away again after.
+    globals().update(sh=fake_sh, run_gate=lambda argv, cwd, log, env, stop=None: fake_sh(argv, cwd=cwd, env=env, log=log),
+                     OPTIMISTIC=True)
+    _oq, _pz, _th, REAL_ACCESS = LANDQ, paused, tier_holds, os.access
+    globals().update(paused=lambda t: False, tier_holds=lambda j: False)   # the box's own pause and tier are not this section's
+    globals().update(LANDQ=tempfile.mkdtemp(prefix="cc-land-selfcheck-opt-"))
+    os.makedirs(lane_dir(), exist_ok=True)
+    GF = "# the gate-first list\nbin/cc-land\nbin/cc-guard\n.githooks/*\n"
+    OV = "# the overlay's gate-first list\nconfig/etc/*\n"      # beside core's, relative to the repo root
+    S = lambda n: ("%02x" % n) * 20          # a SHA a case can name
+
+    def files_of(pr, *paths):
+        j = json.dumps({"files": [{"path": p} for p in paths], "baseRefName": "main"})
+        world[f"gh pr view {pr} --json files"] = (0, j)        # protected_hit's ask and ordinary()'s alike (prefix)
+
+    def opt_world(**w):
+        fresh()
+        world[f"{BIN}/cc-config get CC_PROTECTED_PATHS_myrepo"] = (1, "")       # no protected list on this repo
+        world[f"git show origin/main:{GATE_FIRST_LIST[0]}"] = (0, GF)
+        world[f"git show origin/main:{GATE_FIRST_LIST[1]}"] = (0, OV)
+        world.update(w)
+
+    try:
+        # 1. WHAT IS ORDINARY — the brief's own line, one case per clause. "it touches no protected path" and "Protected
+        # paths (cc-guard, cc-sandbox, cc-land itself, hooks, anything security) keep the full gate before merge".
+        opt_world()
+        files_of(21, "core/bin/cc-alpha", "docs/x.md")
+        files_of(22, "core/bin/cc-guard", "docs/x.md")
+        files_of(23, "core/bin/cc-sandbox")
+        why21, f21 = ordinary("myrepo", 21)
+        why22, _ = ordinary("myrepo", 22)
+        check("a PR outside the gate-first list and every protected path is ordinary, and its files are what the batch "
+              "is keyed on", why21 == "" and f21 == ["core/bin/cc-alpha", "docs/x.md"])
+        check("…a PR touching the gate-first list (cc-guard here) is NOT ordinary — every gate runs before its merge, "
+              "and the reason names the file and the list",
+              "core/bin/cc-guard" in why22 and "gate-first" in why22 and "before the merge" in why22)
+        world[f"{BIN}/cc-config get CC_PROTECTED_PATHS_myrepo"] = (0, "core/bin/cc-sandbox\n")
+        why23, _ = ordinary("myrepo", 23)
+        check("…a PR under the box's PROTECTED path is not ordinary either, whatever the gate-first list says: the "
+              "owner's own door outranks it", "PROTECTED" in why23 and "cc-sandbox" in why23)
+        world[f"{BIN}/cc-config get CC_PROTECTED_PATHS_myrepo"] = (1, "")
+        world[f"git show origin/main:{GATE_FIRST_LIST[0]}"] = (128, "fatal: path not in tree")
+        world[f"git show origin/main:{GATE_FIRST_LIST[1]}"] = (128, "fatal: path not in tree")
+        why, _ = ordinary("myrepo", 21)
+        check("…and a repo that ships NO gate-first list lands nothing optimistically: every PR of it runs every gate "
+              "first, as it always did — a list a PR could have deleted is read at the base, never at the head",
+              "ships no" in why and GATE_FIRST_LIST[1] in why)
+        world[f"git show origin/main:{GATE_FIRST_LIST[0]}"] = (0, GF)
+        world[f"git show origin/main:{GATE_FIRST_LIST[1]}"] = (0, OV)
+        # BOTH lists are read, core's and the overlay's: the first found is not the only one. A PR touching the
+        # overlay's host config is not ordinary although core's list, which describes only core/, never names it.
+        files_of(26, "config/etc/10-hardening.conf")
+        why, _ = ordinary("myrepo", 26)
+        check("…a PR touching a path the OVERLAY's gate-first list names (config/etc/*) is not ordinary, although "
+              "core's list is found first", "config/etc/10-hardening.conf" in why and "gate-first" in why)
+        world[f"git show origin/main:{GATE_FIRST_LIST[1]}"] = (128, "fatal: path not in tree")
+        why21, _ = ordinary("myrepo", 21)
+        files_of(25, "core/bin/cc-gamma")
+        whyc, _ = ordinary("myrepo", 25)
+        check("…and with core's list alone, a path outside core/ is covered by no list and counts as named (fail "
+              "closed), while a core/ path core's list does not name stays ordinary",
+              "docs/x.md" in why21 and whyc == "")
+        world[f"git show origin/main:{GATE_FIRST_LIST[1]}"] = (0, OV)
+        # Only a PR INTO the default branch: the list is read there, the suite runs there, a revert lands there.
+        world["gh pr view 27 --json files"] = (0, json.dumps({"files": [{"path": "core/bin/cc-alpha"}], "baseRefName": "release"}))
+        why, _ = ordinary("myrepo", 27)
+        check("…a PR whose base is some other branch (author-chosen) is not ordinary: its list would be the "
+              "author's, and its squash would never be on main", "release" in why and "not main" in why)
+        world["gh pr view 27 --json files"] = (0, json.dumps({"files": [{"path": "core/bin/cc-alpha"}]}))
+        why, _ = ordinary("myrepo", 27)
+        check("…and one whose base gh does not name is not ordinary either", "not main" in why)
+        world["gh pr view 24 --json files"] = (1, "gh: could not resolve")
+        why, _ = ordinary("myrepo", 24)
+        check("…and a PR whose files gh will not list is not ordinary (it fails closed, like protected_hit)",
+              "could not" in why or "PROTECTED" in why)
+
+        # 2. THE BATCH: the ready ordinary jobs in queue order, pairwise file-disjoint; an overlap waits for the next
+        # batch (gated on the base this one leaves); a not-ordinary job is marked once and left to the serial path.
+        opt_world()
+        files_of(21, "core/bin/cc-alpha", "docs/x.md")
+        files_of(22, "core/bin/cc-guard")
+        files_of(24, "docs/x.md", "core/bin/cc-beta")
+        files_of(25, "core/bin/cc-gamma")
+        for pr, at in ((21, "2026-09-24T12:00:00Z"), (22, "2026-09-24T12:00:01Z"), (24, "2026-09-24T12:00:02Z"),
+                       (25, "2026-09-24T12:00:03Z")):
+            write_atomic(job_path("myrepo", pr), {"repo": "myrepo", "pr": pr, "queued_at": at, "attempts": 0})
+        b = batch_of("myrepo", lane_jobs("myrepo"))
+        check("the batch takes the ordinary, disjoint jobs in queue order — #21 and #25 — and leaves #22 (gate-first) "
+              "and #24 (overlaps #21 in docs/x.md) out",
+              [j["pr"] for _, j, _ in b] == [21, 25] and [f for _, _, f in b][0] == ["core/bin/cc-alpha", "docs/x.md"])
+        check("…the not-ordinary job is marked on its file with the reason, so it is not asked of gh again this queue "
+              "life, and the overlapping one is NOT marked: the next batch takes it",
+              "gate-first" in (read_json(job_path("myrepo", 22)) or {}).get("ordinary", "")
+              and not (read_json(job_path("myrepo", 24)) or {}).get("ordinary"))
+        n = len(ran("gh", "pr", "view", "22"))
+        batch_of("myrepo", lane_jobs("myrepo"))
+        check("…asked again, the marked job costs no gh call", len(ran("gh", "pr", "view", "22")) == n)
+        write_atomic(job_path("myrepo", 25), {"repo": "myrepo", "pr": 25, "queued_at": "2026-09-24T12:00:03Z",
+                                              "attempts": 0, "not_before": "2999-01-01T00:00:00Z"})
+        check("…a job that waits (not_before ahead) is not in the batch",
+              [j["pr"] for _, j, _ in batch_of("myrepo", lane_jobs("myrepo"))] == [21])
+        globals()["OPTIMISTIC"] = False
+        check("…and with CC_LAND_OPTIMISTIC=0 there is no batch at all", batch_of("myrepo", lane_jobs("myrepo")) == [])
+        globals()["OPTIMISTIC"] = True
+        for pr in (21, 22, 24, 25):
+            os.unlink(job_path("myrepo", pr))
+
+        # 3. THE WARMS RUN SIDE BY SIDE, WARM_SLOTS at a time. Brief: "Those checks run in parallel across PRs, not one
+        # lane at a time." A fake warm process: alive for 0.3 s, then done, its outcome written on the job as the real
+        # child does (warm_done). Three warms, two slots: the first two are in flight TOGETHER, and never three.
+        live, peak, order = [0], [0], []
+        _slots = WARM_SLOTS
+
+        class FakeWarm:
+            def __init__(self, path, pr):
+                self.t0, self.path, self.pr = time.time(), path, pr
+                live[0] += 1; peak[0] = max(peak[0], live[0]); order.append(pr)
+            def poll(self):
+                if time.time() - self.t0 < 0.3:
+                    return None
+                if live[0] and self.path:
+                    live[0] -= 1
+                    j = read_json(self.path) or {}
+                    j["warm"] = {"head": S(self.pr), "base": BASE_SHA, "ok": self.pr != 33, "at": stamp(),
+                                 "stopped": "" if self.pr != 33 else "gates", "why": "gate check.sh did not pass: x" if self.pr == 33 else "", "short": ""}
+                    write_atomic(self.path, j); self.path = ""
+                return 0
+        _spawn = spawn_warm
+        globals().update(spawn_warm=lambda repo, pr, log, path: FakeWarm(path, pr), WARM_SLOTS=2)
+        batch = []
+        for pr in (31, 32, 33):
+            write_atomic(job_path("myrepo", pr), {"repo": "myrepo", "pr": pr, "queued_at": stamp(), "attempts": 0})
+            batch.append((job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]))
+        lines = warm_all("myrepo", batch)
+        check("three warms with two slots: two ran AT THE SAME TIME (peak 2) and never three; each was started once, "
+              "in queue order", peak[0] == 2 and order == [31, 32, 33])
+        check("…and each line says what the warm found: two passed, #33 stopped at its static gate — read off the job "
+              "the warm itself wrote", sum("warm passed" in l for l in lines) == 2
+              and any("PR #33: warm stopped at gates" in l and "check.sh" in l for l in lines))
+        globals().update(spawn_warm=_spawn, WARM_SLOTS=_slots)
+
+        # 4. THE MERGE PASS: one at a time, queue order, each run_one with `batch` on its job so its deploy waits; a
+        # member whose warm found it NOT ordinary is left for the serial path; what merged (gh says MERGED, with the
+        # squash SHA) is handed to after_batch in merge order.
+        write_atomic(job_path("myrepo", 33), {"repo": "myrepo", "pr": 33, "queued_at": stamp(), "attempts": 0,
+                                              "warm": {"head": S(33), "ok": False, "stopped": "warm", "why": "no green"},
+                                              "ordinary": "no worker green for the head"})
+        took, handed, rec_seen = [], [], []
+        BEFORE, TIP = S(0x30), S(0x3f)
+        MAIN = [BEFORE, S(31), S(32), TIP]     # main's history, oldest first: what `merge-base --is-ancestor` answers from
+
+        def ancestry(argv):
+            a, b = argv[-2], argv[-1]
+            return (0, "") if a in MAIN and b in MAIN and MAIN.index(a) <= MAIN.index(b) else (1, "")
+
+        def merge_stub(path):
+            j = read_json(path) or {}
+            took.append((j.get("pr"), j.get("batch")))
+            rec_seen.append(read_json(batch_path("myrepo")))
+            world["git rev-parse origin/main"] = (0, TIP + "\n")                       # the merge moves main
+            world[f"gh pr view {j['pr']} --json state,mergeCommit"] = (0, json.dumps(
+                {"state": "MERGED", "mergeCommit": {"oid": S(j["pr"])}, "baseRefName": "main"}))
+            return "landed"
+
+        def batch_world():
+            world["git rev-parse origin/main"] = (0, BEFORE + "\n")
+            world["git merge-base --is-ancestor"] = ancestry
+            world["git rev-list --parents -n 1"] = lambda argv: (0, f"{argv[-1]} {'0' * 40}\n")   # a squash: one parent
+        _ro, _wa, _ab = run_one, warm_all, after_batch
+        globals().update(run_one=merge_stub, warm_all=lambda repo, b: [], after_batch=lambda repo, m: handed.append(m) or [])
+        batch_world()
+        batch = [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32, 33)]
+        land_batch("myrepo", batch)
+        check("the merge pass runs #31 then #32, each with the batch's id on its job (so its deploy is the batch's), "
+              "and never #33, whose warm found no worker green — that one lands on its own, every gate first",
+              [t[0] for t in took] == [31, 32] and all(t[1] for t in took))
+        check("…and after_batch is handed exactly what merged, in merge order, with each PR's squash SHA and files",
+              handed == [[(31, S(31), ["f31"]), (32, S(32), ["f32"])]])
+        check("…the batch notes the tip it began on and each member BEFORE its merge (so a lane that dies mid-batch "
+              "leaves the next pass what it needs), and the note is gone once after_batch has spoken",
+              rec_seen and rec_seen[0].get("before") == BEFORE and rec_seen[0].get("members") == [[31, ["f31"]]]
+              and rec_seen[1].get("members") == [[31, ["f31"]], [32, ["f32"]]] and not os.path.exists(batch_path("myrepo")))
+        # FINDING: the auto-revert must only ever see commits provably on main from this batch. A member merged
+        # BEFORE the pass (gh says MERGED already), one whose squash is off main (not an ancestor of the tip), one
+        # with two parents (not a squash) and one into another branch are all left out of what after_batch gets.
+        for pr in (31, 32):
+            j = read_json(job_path("myrepo", pr)) or {}
+            j.pop("batch", None); write_atomic(job_path("myrepo", pr), j)
+        took.clear(); handed.clear()
+        world["gh pr view 31 --json state"] = (0, json.dumps({"state": "MERGED"}))      # merged before this pass
+        batch_world()
+        land_batch("myrepo", [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32)])
+        check("a member gh already called MERGED before the merge pass is not the batch's: never handed on, never "
+              "bisected, never reverted", handed == [[(32, S(32), ["f32"])]])
+        del world["gh pr view 31 --json state"]
+        handed.clear()
+        MAIN.remove(S(32))                                                               # #32's squash is off main
+        batch_world()
+        land_batch("myrepo", [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32)])
+        check("…a member whose squash is not on main's tip is left out", handed == [[(31, S(31), ["f31"])]]
+              and ran("git", "merge-base", "--is-ancestor", S(32)))
+        MAIN.insert(2, S(32))
+        handed.clear()
+        world[f"git rev-list --parents -n 1 {S(31)}"] = (0, f"{S(31)} {'0' * 40} {'1' * 40}\n")   # a true merge
+        world[f"gh pr view 32 --json state,mergeCommit"] = (0, json.dumps(
+            {"state": "MERGED", "mergeCommit": {"oid": S(32)}, "baseRefName": "release"}))
+        globals().update(run_one=lambda path: world.update({"git rev-parse origin/main": (0, TIP + "\n")}) or "landed")
+        batch_world()
+        land_batch("myrepo", [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32)])
+        check("…and so are a commit with two parents (not a squash) and a PR merged into another branch",
+              handed == [[]])
+        del world[f"git rev-list --parents -n 1 {S(31)}"]
+        globals().update(run_one=merge_stub)
+        # …and a base whose tip cannot be read: nothing could be proved on it, so the batch does not start and every
+        # member goes to the serial path, every gate first.
+        world["git rev-parse origin/main"] = (128, "fatal: bad revision")
+        took.clear(); handed.clear()
+        lines = land_batch("myrepo", [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32)])
+        check("a batch that cannot read main's tip before it starts merges nothing and marks its members for the "
+              "serial path", not took and not handed and all((read_json(job_path("myrepo", pr)) or {}).get("ordinary")
+                                                               for pr in (31, 32)) and "one at a time" in lines[0])
+        for pr in (31, 32):
+            j = read_json(job_path("myrepo", pr)) or {}
+            j.pop("ordinary", None); j.pop("batch", None); write_atomic(job_path("myrepo", pr), j)
+        batch_world()
+        # …a member the merge pass KEPT (held, a retry) loses the batch mark and its warm: the serial landing that takes
+        # it next gates and deploys it itself — a mark left on would have skipped both.
+        write_atomic(job_path("myrepo", 34), {"repo": "myrepo", "pr": 34, "queued_at": stamp(), "attempts": 0,
+                                              "warm": {"head": S(34), "base": BASE_SHA, "ok": True, "stopped": ""}})
+        globals().update(run_one=lambda path: "kept")
+        land_batch("myrepo", [(job_path("myrepo", 34), read_json(job_path("myrepo", 34)), ["f34"])])
+        j34 = read_json(job_path("myrepo", 34)) or {}
+        check("a member the merge pass kept on the queue has neither `batch` nor `warm` on it afterwards",
+              os.path.exists(job_path("myrepo", 34)) and "batch" not in j34 and "warm" not in j34)
+        os.unlink(job_path("myrepo", 34))
+        globals().update(run_one=_ro, warm_all=_wa, after_batch=_ab)
+        for pr in (31, 32, 33):
+            os.unlink(job_path("myrepo", pr))
+
+        # 5. SPENDING THE WARM at the merge pass — brief: "its merge with main is file-disjoint from what's landing with
+        # it". The warm was about THIS head on base B; main has since moved (the members ahead merged). Disjoint: the
+        # static gates are not run again and the merge is pinned to the warm's head. An overlap, a moved head, or a
+        # warm that stopped at its gates: the gates run as they always did (here: none found, the Skip proves the path).
+        def merge_pass(warm, moved="docs/other.md\n"):
+            L = fresh(pr=7)
+            L.batch, L.warm = "b1", warm
+            world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+            world["git merge-base"] = (0, A + "\n")
+            world["git diff --name-status"] = (0, "M\tcore/bin/cc-alpha\n")
+            world[f"git diff --name-only {BASE_SHA} origin/main"] = (0, moved)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return L, caught(L.gates)
+        os.access = lambda p, m: False
+        W = {"head": HEAD, "base": BASE_SHA, "ok": True, "at": "2026-09-24T12:10:00Z", "stopped": ""}
+        L, said = merge_pass(W)
+        check("a warm about this head, with main moved since only in files this PR does not touch, is SPENT: no gate "
+              "runs, the line says so, and the merge is pinned to the warm's head on the warm's base",
+              isinstance(said, str) and "warm's static gates passed" in said and "does not touch" in said
+              and L.gated == HEAD and L.merged_on == BASE_SHA and not ran("git", "worktree", "add"))
+        L, said = merge_pass(W, moved="core/bin/cc-alpha\n")
+        check("…main moved in a file this PR changes too: the warm is NOT spent and the gates run on the merge as they "
+              "always did", isinstance(said, Skip) and "no gates" in str(said) and ran("git", "worktree", "add"))
+        L, said = merge_pass(dict(W, head="9" * 40))
+        check("…the head moved since the warm: not spent", isinstance(said, Skip) and "no gates" in str(said))
+        L, said = merge_pass(dict(W, ok=False, stopped="gates", why="gate core/tests/check.sh did not pass: case 3",
+                                  short="gate check.sh did not pass: case 3"))
+        check("…and a warm that stopped at its static gate IS this landing's red — same head, same files — said in the "
+              "warm's words, without running anything", isinstance(said, Failed) and "case 3" in str(said)
+              and said.short == "gate check.sh did not pass: case 3" and not ran("git", "worktree", "add"))
+        L, said = merge_pass(dict(W, ok=False, stopped="review", why="LAND-AFTER-FIX: x"))
+        check("…and a warm that stopped at its REVIEW passed its gates: spent here too, no suite in front of a verdict "
+              "already on the PR — review() reads it back and stops on it",
+              isinstance(said, str) and "warm's static gates passed" in said and not ran("git", "worktree", "add"))
+
+        # 6. THE WORKER'S OWN GREEN is the warm's first question, keyed on the HEAD's tree — what the worker's
+        # cc-green filed — and a head without one is not ordinary: warm_done marks the job so.
+        def warm_L():
+            L = fresh(pr=7)
+            L.warm_only = True
+            world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+            world[f"git rev-parse {HEAD}^{{tree}}"] = (0, TREE + "\n")
+            world[f"git cat-file -e {HEAD}:core/tests/selftest.sh"] = (0, "")
+            world[f"git cat-file -e {HEAD}:tests/selftest.sh"] = (1, "")
+            world["git merge-base"] = (0, A + "\n")
+            world["git diff --name-status"] = (0, "M\tcore/bin/cc-alpha\n")
+            world[f"git show origin/main:{GATE_FIRST_LIST[0]}"] = (0, GF)
+            world[f"git show origin/main:{GATE_FIRST_LIST[1]}"] = (0, OV)
+            world[f"{BIN}/cc-config get CC_PROTECTED_PATHS_myrepo"] = (1, "")
+            L.facts["baseRefName"] = "main"
+            return L
+        L = warm_L()
+        e = caught(L.worker_green)
+        check("no green record for the head's tree: the warm stops at `warm`, short 'no worker green for the head'",
+              isinstance(e, Failed) and e.short == "no worker green for the head" and "every gate first" in str(e))
+        write_atomic(job_path("myrepo", 7), {"repo": "myrepo", "pr": 7, "queued_at": stamp(), "attempts": 0})
+        L.stopped, L.why, L.why_short = "warm", str(e), e.short
+        L.warm_done(1)
+        j = read_json(job_path("myrepo", 7)) or {}
+        check("…and warm_done writes that on the job: `ordinary` names why, and `warm.stopped` is `warm`, which is what "
+              "the merge pass skips and batch_of leaves alone",
+              j.get("ordinary") == "no worker green for the head" and (j.get("warm") or {}).get("stopped") == "warm")
+        write_atomic(f"{green_dir()}/selftest.sh-{TREE[:12]}.json",
+                     {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "", "at": stamp()})
+        L = warm_L()
+        said = caught(L.worker_green)
+        check("a green record on the head's tree (unscoped, as cc-green run files it) is the worker's own green, and "
+              "the warm goes on to the static gates", isinstance(said, str) and "worker's own green stands" in said)
+        write_atomic(f"{green_dir()}/selftest.sh-{TREE[:12]}.json",
+                     {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "docs/README.md", "at": stamp()})
+        check("…but a record scoped to some OTHER diff is not this head's green",
+              isinstance(caught(warm_L().worker_green), Failed))
+        # FINDING: batch_of read gh's file list at pick time, tied to no head. The warm asks again of the head IT
+        # fetched, off git: a push after the pick that touches core/bin/cc-guard is not ordinary, green record or not.
+        write_atomic(f"{green_dir()}/selftest.sh-{TREE[:12]}.json",
+                     {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "", "at": stamp()})
+        L = warm_L()
+        world["git diff --name-status"] = (0, "M\tcore/bin/cc-alpha\nM\tcore/bin/cc-guard\n")
+        e = caught(L.worker_green)
+        check("a head pushed after the pick that touches core/bin/cc-guard stops the warm at `warm` (not ordinary at "
+              "this head), though the worker's green stands for it — every gate runs before its merge",
+              isinstance(e, Failed) and e.short == "not ordinary at this head" and "core/bin/cc-guard" in str(e))
+        L = warm_L()
+        world[f"{BIN}/cc-config get CC_PROTECTED_PATHS_myrepo"] = (0, "core/bin/cc-alpha\n")
+        e = caught(L.worker_green)
+        check("…as does one under a PROTECTED path", isinstance(e, Failed) and "PROTECTED" in str(e))
+        L = warm_L()
+        L.facts["baseRefName"] = "release"
+        e = caught(L.worker_green)
+        check("…and one retargeted to another base since the pick", isinstance(e, Failed) and "release" in str(e))
+        L = warm_L()
+        world["git diff --name-status"] = (128, "fatal: bad object")
+        e = caught(L.worker_green)
+        check("…and a head whose diff git cannot read is not ordinary either (fail closed)", isinstance(e, Failed))
+        os.unlink(f"{green_dir()}/selftest.sh-{TREE[:12]}.json")
+        os.unlink(job_path("myrepo", 7))
+
+        # 7. THE WARM RUNS THE STATIC GATES AND NOT THE SUITE — brief: "a static check of about 2 min" — where a
+        # docs tier would run the same; and a repo whose only gate is the suite gets no warm gate at all (it is the
+        # base's to run), where the docs tier runs it rather than land ungated.
+        L = warm_L()
+        world["git diff --numstat"] = (0, "3\t2\tcore/bin/cc-alpha\n")
+        world["git rev-parse HEAD^{tree}"] = (0, TREE + "\n")
+        os.access = lambda p, m: p.endswith(("core/tests/check.sh", "core/tests/selftest.sh"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            said = caught(L.gates)
+            if L._review is not None:
+                caught(L.review_aside)
+        check("a --warm on a code change runs check.sh and NOT selftest.sh, and its line says the suite is the "
+              "base's to run after the batch",
+              isinstance(said, str) and "check.sh" in said and "warm tier" in said and "after the batch" in said
+              and not [c for c in calls if c[0].endswith("core/tests/selftest.sh")]
+              and [c for c in calls if c[0].endswith("core/tests/check.sh")])
+        os.access = lambda p, m: p.endswith("core/tests/selftest.sh")
+        L = warm_L()
+        with contextlib.redirect_stdout(io.StringIO()):
+            said = caught(L.gates)
+        check("…and a repo whose only gate is its suite warms nothing: a Skip naming the suite as the base's, never "
+              "the suite run here", isinstance(said, Skip) and "after the batch" in str(said)
+              and not [c for c in calls if c[0].endswith("core/tests/selftest.sh")])
+        os.access = REAL_ACCESS
+
+        # 8. AFTER THE BATCH: one suite on the base; a red believed on the second run only; the bisect asks log2(n)
+        # commits; the breaker is reverted OUT LOUD (revert_pr) and the suite runs once more on what is left. suite_on
+        # is scripted by SHA; deploy_due and revert_pr are stubs that record.
+        asked, reverted, deployed = [], [], []
+
+        def script(table):
+            def suite_stub(repo, sha, scope, step="suite"):
+                asked.append((sha[:2], step))
+                ok = table.get(sha[:2], True)
+                return ok, ("all green" if ok else "gate core/tests/selftest.sh did not pass: case 9"), ""
+            return suite_stub
+        _so, _rp, _dd, _ro = suite_on, revert_pr, deploy_due, run_one
+        MERGED = [(41, S(0x41), ["f41"]), (42, S(0x42), ["f42"]), (43, S(0x43), ["f43"]), (44, S(0x44), ["f44"])]
+
+        def after(table, tip="ee"):
+            asked.clear(); reverted.clear(); deployed.clear(); calls.clear()
+            world["git rev-parse origin/main"] = (0, (tip * 20) + "\n")
+            world["gh pr view"] = (0, json.dumps(dict(FACTS, state="MERGED")))
+            globals().update(suite_on=script(table), revert_pr=lambda repo, pr, sha, why: (reverted.append(pr), "aa" * 20)[1],
+                             deploy_due=lambda repo, by="": (deployed.append(by), "/nonexistent/deploy.json")[1],
+                             run_one=lambda path: f"deployed {path}")
+            with contextlib.suppress(OSError):
+                os.unlink(red_base_path("myrepo"))
+            return after_batch("myrepo", MERGED)
+        lines = after({})
+        check("green after the batch: ONE suite on the base's tip, then the deploy the members skipped — no bisect, "
+              "no revert", asked == [("ee", "suite")] and not reverted and len(deployed) == 1
+              and any("is green" in l for l in lines) and any(l.startswith("deployed") for l in lines))
+        lines = after({"ee": False, "43": False, "44": False})
+        check("red after the batch of four: believed on the second run, then the bisect RUNS the last merge #44 (red), "
+              "asks #42 (green) and #43 (red) — three runs, not four — names #43, reverts it, runs the suite once more "
+              "on the reverted tip and deploys",
+              asked == [("ee", "suite"), ("ee", "suite2"), ("44", "bisect"), ("42", "bisect"), ("43", "bisect"), ("aa", "suite3")]
+              and reverted == [43] and deployed and not os.path.exists(red_base_path("myrepo")))
+        lines = after({"ee": True}) if False else after({"ee": False, "43": False, "44": False, "aa": False})
+        check("…still red after the revert: nothing installed, the tip is noted for the catch-up to leave alone, and "
+              "it is said (route + the seat's inject)",
+              reverted == [43] and not deployed and (read_json(red_base_path("myrepo")) or {}).get("tip") == "aa" * 20
+              and ran(f"{BIN}/cc-slack", "post", "--route") and ran(f"{BIN}/cc-slack", "inject", "myrepo"))
+        lines = after({"ee": False, "41": False, "42": False, "43": False, "44": False})
+        check("the base was red BEFORE the batch (its parent, asked only once #41 itself is red, is red too): nothing "
+              "reverted — no PR broke it — nothing installed, and the stop says so", not reverted and not deployed
+              and asked.count(("41", "bisect")) == 2 and any("already red before" in l for l in lines)
+              and (read_json(red_base_path("myrepo")) or {}).get("tip") == "ee" * 20)
+        # FINDING: the bisect never ran the last merge; it assumed it red. Red at the tip, GREEN at the batch's last
+        # merge: the red came from something merged after the batch, and no PR of it is reverted.
+        lines = after({"ee": False})
+        check("red at the tip but green at the batch's last merge (#44): nothing reverted, nothing installed, the tip "
+              "noted, and the stop says the red came after the batch",
+              asked == [("ee", "suite"), ("ee", "suite2"), ("44", "bisect")] and not reverted and not deployed
+              and any("merged after it" in l for l in lines)
+              and (read_json(red_base_path("myrepo")) or {}).get("tip") == "ee" * 20)
+        lines = after({"44": False, "43": False}, tip="44")
+        check("…and when the tip IS the batch's last merge, the two reds already seen stand for it: not run a third "
+              "time", asked == [("44", "suite"), ("44", "suite2"), ("42", "bisect"), ("43", "bisect"), ("aa", "suite3")]
+              and reverted == [43])
+        globals().update(suite_on=lambda repo, sha, scope, step="suite":
+                         (asked.append((sha[:2], step)), (step != "suite", "x", ""))[1])   # red on the first run only
+        asked.clear(); reverted.clear(); deployed.clear()
+        world["git rev-parse origin/main"] = (0, "ee" * 20 + "\n")
+        with contextlib.suppress(OSError):
+            os.unlink(red_base_path("myrepo"))
+        lines = after_batch("myrepo", MERGED)
+        check("…a flake — red once, green on the second run — is green: no bisect, no revert, deployed",
+              asked == [("ee", "suite"), ("ee", "suite2")] and not reverted and deployed)
+        globals().update(suite_on=_so, revert_pr=_rp, deploy_due=_dd, run_one=_ro)
+
+        # 9. deploy_due leaves a tip after_batch found red alone — the 15-minute catch-up must not install behind
+        # the batch's back what the batch refused to — and installs it once the marker is gone.
+        fresh()
+        world["git rev-parse origin/main"] = (0, "cc" * 20 + "\n")
+        record_applied("myrepo", "bb" * 20)
+        write_atomic(red_base_path("myrepo"), {"tip": "cc" * 20, "at": stamp(), "why": "x"})
+        p1 = deploy_due("myrepo")
+        os.unlink(red_base_path("myrepo"))
+        p2 = deploy_due("myrepo")
+        check("a red tip is not queued for deploy by the catch-up; the same tip with the marker gone is",
+              p1 == "" and p2 == job_path("myrepo", "deploy") and os.path.exists(p2))
+        os.unlink(p2)
+        write_atomic(batch_path("myrepo"), {"bid": "b1", "before": "bb" * 20, "members": [[61, ["f61"]]], "pre": []})
+        p1 = deploy_due("myrepo")
+        p2 = deploy_due("myrepo", by="the batch #61")
+        check("…and a batch merged without its suite yet holds the catch-up off the tip too, but not the batch's own "
+              "deploy", p1 == "" and p2 == job_path("myrepo", "deploy"))
+        os.unlink(p2); os.unlink(batch_path("myrepo"))
+
+        # 10. THE REVERT IS ANNOUNCED: on the PR, in the thread (route), to the seat — and the push goes to the base.
+        fresh()
+        world["git rev-parse origin/main"] = (0, "ee" * 20 + "\n")
+        world["git rev-parse HEAD"] = (0, "aa" * 20 + "\n")
+        made = quiet(revert_pr, "myrepo", 43, S(0x43), "x")
+        check("revert_pr asks again that the squash is on main's tip, and a commit that is not is never reverted — "
+              "said on the PR, nothing pushed", made == "" and not ran("git", "revert") and not ran("git", "push")
+              and any("not on origin/main" in " ".join(c) for c in ran("gh", "pr", "comment", "43")))
+        calls.clear()
+        world["git merge-base --is-ancestor"] = (0, "")
+        made = quiet(revert_pr, "myrepo", 43, S(0x43), "gate core/tests/selftest.sh did not pass: case 9")
+        check("revert_pr reverts the squash in a throwaway checkout, pushes it to main, comments on the PR naming the "
+              "case and the revert, posts the stop, and wakes the seat",
+              made == "aa" * 20 and ran("git", "revert", "--no-edit", S(0x43)) and ran("git", "push", "HEAD:refs/heads/main")
+              and any("REVERTED" in " ".join(c) and "case 9" in " ".join(c) for c in ran("gh", "pr", "comment", "43"))
+              and ran(f"{BIN}/cc-slack", "post", "--route", "stopped") and ran(f"{BIN}/cc-slack", "inject", "myrepo"))
+        world["git push"] = (1, "remote: protected branch")
+        made = quiet(revert_pr, "myrepo", 43, S(0x43), "x")
+        check("…and a push the remote refuses is said the same three ways, with no SHA claimed",
+              made == "" and any("did not happen" in " ".join(c) for c in ran("gh", "pr", "comment", "43")))
+
+        # 11. THE LANE: two or more ordinary jobs ready → land_batch; one alone → run_one as it always was — its
+        # suite before its merge, a red a stop and not a revert.
+        batched, singles = [], []
+        _bo, _lb, _ro = batch_of, land_batch, run_one
+        for pr, at in ((51, "2026-09-24T12:00:00Z"), (52, "2026-09-24T12:00:01Z"), (53, "2026-09-24T12:00:02Z")):
+            write_atomic(job_path("myrepo", pr), {"repo": "myrepo", "pr": pr, "queued_at": at, "attempts": 0})
+
+        def bo_stub(repo, paths):
+            js = [(p, read_json(p) or {}, []) for p in paths]
+            return [(p, j, f) for p, j, f in js if j.get("pr") in (51, 52) and not j.get("ordinary")]
+
+        def lb_stub(repo, batch):
+            batched.append([j["pr"] for _, j, _ in batch])
+            for p, j, _ in batch:
+                os.unlink(p)
+            return []
+
+        def ro_stub(path):
+            singles.append((read_json(path) or {}).get("pr"))
+            os.unlink(path)
+            return ""
+        globals().update(batch_of=bo_stub, land_batch=lb_stub, run_one=ro_stub)
+        try:
+            run_lane("myrepo")
+        finally:
+            globals().update(batch_of=_bo, land_batch=_lb, run_one=_ro)
+        check("a lane run with #51 and #52 ordinary and #53 not: the two land as one batch, #53 lands on its own after",
+              batched == [[51, 52]] and singles == [53])
+
+        # 12. A batch member's own deploy step waits for the batch, and its card says so.
+        L = fresh(pr=7)
+        L.batch = "b1"
+        steps = L.deploy_steps()
+        check("a landing with a batch has one deploy step, which skips: install and the restarts follow the batch's "
+              "suite", len(steps) == 1 and isinstance(caught(steps[0][1]), Skip))
+        r = result_of(L, 0, {"attempts": 1}, "")
+        check("…and its landed card says the suite runs on main now and the box installs the batch when it is green",
+              "merged with its batch" in r["short"] and "installs the batch" in r["short"])
+
+        # 13. FINDING: a lane that dies between the merges and the batch's suite left the batch never bisected and
+        # never said. The next lane finds the batch's note (its lock is held, so the writer is dead), runs after_batch
+        # on what that batch provably merged, says it was cut off, and drops the note; a member still queued loses
+        # the dead batch's marks and lands on its own, every gate and its own deploy.
+        fresh()
+        BEFORE = S(0x60)
+        MAIN = [BEFORE, S(0x61), S(0x6f)]
+        world["git rev-parse origin/main"] = (0, S(0x6f) + "\n")
+        world["git merge-base --is-ancestor"] = ancestry
+        world["git rev-list --parents -n 1"] = lambda argv: (0, f"{argv[-1]} {'0' * 40}\n")
+        world["gh pr view 97 --json state,mergeCommit"] = (0, json.dumps(
+            {"state": "MERGED", "mergeCommit": {"oid": S(0x61)}, "baseRefName": "main"}))
+        write_atomic(job_path("myrepo", 98), {"repo": "myrepo", "pr": 98, "queued_at": stamp(), "attempts": 0,
+                                              "batch": "b1", "warm": {"head": S(0x62), "ok": True}})
+        write_atomic(batch_path("myrepo"), {"bid": "b1", "before": BEFORE, "pid": 1,
+                                            "members": [[97, ["f97"]], [98, ["f98"]]], "pre": []})
+        handed, serial = [], []
+        _ab, _ro, _bo = after_batch, run_one, batch_of
+        globals().update(after_batch=lambda repo, m: handed.append(m) or ["the suite spoke"],
+                         run_one=lambda path: (serial.append(read_json(path) or {}), os.unlink(path), "")[2],
+                         batch_of=lambda repo, paths: [])
+        try:
+            lines = run_lane("myrepo")
+            check("a lane that finds a dead batch's note runs after_batch on what that batch provably merged (#97, "
+                  "not the unmerged #98), says it was cut off (a line, the seat's wake) and drops the note",
+                  handed == [[(97, S(0x61), ["f97"])]] and any("cut off" in l for l in lines)
+                  and "the suite spoke" in lines and ran(f"{BIN}/cc-slack", "inject", "myrepo")
+                  and not os.path.exists(batch_path("myrepo")))
+            check("…and #98, still queued, lands on its own afterwards without the dead batch's marks",
+                  [j.get("pr") for j in serial] == [98] and "batch" not in serial[0] and "warm" not in serial[0])
+            handed.clear()
+            write_atomic(batch_path("myrepo"), {"bid": "b2", "before": BEFORE, "members": [], "pre": []})
+            lines = resume_batch("myrepo")
+            check("…a batch cut off before its first merge is dropped: no suite, no wake",
+                  lines == [] and not handed and not os.path.exists(batch_path("myrepo")))
+            with open(batch_path("myrepo"), "w") as f:
+                f.write("not json")
+            lines = resume_batch("myrepo")
+            check("…and a note that cannot be read is dropped and said, never a crash of the lane",
+                  lines and "could not be read" in lines[0] and not os.path.exists(batch_path("myrepo")))
+        finally:
+            globals().update(after_batch=_ab, run_one=_ro, batch_of=_bo)
+        # …and a sweep with NOTHING queued still runs that repo's lane when a batch note waits: the lane is what
+        # resumes it, and no job would otherwise wake it.
+        lanes = []
+        write_atomic(batch_path("myrepo"), {"bid": "b3", "before": BEFORE, "members": [[97, ["f97"]]], "pre": []})
+        _rl, _sr, _srr, _dc, _nw = run_lane, sweep_records, sweep_run_roots, due_catchup, next_wake
+        globals().update(run_lane=lambda repo: lanes.append(repo) or [], sweep_records=lambda: None,
+                         sweep_run_roots=lambda: [], due_catchup=lambda: False, next_wake=lambda skip=(): None)
+        try:
+            quiet(cmd_work, [])
+        finally:
+            globals().update(run_lane=_rl, sweep_records=_sr, sweep_run_roots=_srr, due_catchup=_dc, next_wake=_nw)
+        check("a sweep with no job queued runs the lane of a repo whose batch note waits", lanes == ["myrepo"])
+        os.unlink(batch_path("myrepo"))
+    finally:
+        os.access = REAL_ACCESS
+        shutil.rmtree(LANDQ, ignore_errors=True)
+        globals().update(LANDQ=_oq, OPTIMISTIC=False, paused=_pz, tier_holds=_th)
+        globals().update(REAL)
 
     # INDEX-AT-WRITE: a root record is in the library's index the moment write_atomic returns — `cc-lib ask --object
     # <repo>#<pr>` finds the tally as kind finding under its ids, and had nothing to re-read itself (re-read absent
