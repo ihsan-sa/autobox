@@ -57,6 +57,7 @@
 #   cc-guard selfcheck     the gates, against fixtures in a HOME of their own — never this box's state or sessions
 # Env: CC_GUARD_ASKS, CC_GUARD_ASK_TTL (where a member-facing query is de-duplicated, and for how long) ·
 # CC_GUARD_ROOT_PID (test hook: the session process the worker kill fence measures its subtree from).
+# Env: CC_GUARD_RECORD_TIMEOUT (seconds the failure-ledger write in note_refusal may take; default 5; case 50c lowers it).
 set -uo pipefail
 # No jq = no cwd, so no marker walk either: fail CLOSED on every role we can know from the env alone — `cc` sets it
 # for a worker and a member. A gated role missing from this list is a role whose gates are silently OFF on a broken
@@ -1454,14 +1455,17 @@ P50
   #      then written through the real cc-failures here, untimed, which proves the ledger takes it as handed over.
   ASKS=$T/asks50a; CALLS=$T/calls50a; : > "$CALLS"; rm -f "$CALLS.args"; GERR=$T/err50a; r=0; rm -rf "$CC_FAILURES"
   led(){ cat "$CC_FAILURES"/demo.jsonl 2>/dev/null; }
+  # A MATCH READS THE FILE, NOT `led | grep -q`: cat here is uutils, whose EOF splice takes SIGPIPE once grep -q has
+  # quit on its match, and under pipefail a found record read as missing (row raised-cc-guard-refusal-shape-case-flaky).
+  ledq(){ grep -q -- "$1" "$CC_FAILURES"/demo.jsonl 2>/dev/null; }
   calls50(){ grep -c '^failures record' "$CALLS"; }
   r1=$(gc "git commit -m 'cc-land did x'" "$WT" CC_ROLE=worker)
   a50=(); [ -s "$CALLS.args" ] && mapfile -d '' -t a50 < "$CALLS.args"
   [ "${a50[0]:-}" = record ] && timeout 120 "$(dirname "$(realpath "$0")")/cc-failures" "${a50[@]}" </dev/null >/dev/null 2>&1
   { [ "$r1" = 2 ] && [ "$(calls50)" = 1 ] && [ "$(led | grep -c permitted-text-refused)" = 1 ]; } \
     || { r=1; echo "      a text refusal (rc $r1) made $(calls50) writer call(s) and left $(led | grep -c .) record(s), wanted 1 and 1"; }
-  led | grep -q '"observed":"refused `git commit -m` as landing' || { r=1; echo "      the record does not carry the shape: $(led | head -c 200)"; }
-  led | grep -q 'did x' && { r=1; echo "      the record carries the message text, not the shape"; }
+  ledq '"observed":"refused `git commit -m` as landing' || { r=1; echo "      the record does not carry the shape: $(led | head -c 200)"; }
+  ledq 'did x' && { r=1; echo "      the record carries the message text, not the shape"; }
   r2=$(gc "git commit -m 'cc-land did x'" "$WT" CC_ROLE=worker)
   { [ "$r2" = 2 ] && [ "$(calls50)" = 1 ]; } || { r=1; echo "      the same line retried recorded again: $(grep -c '^failures' "$CALLS") call(s)"; }
   for what in "gh pr merge 5" "su -c 'cc-land 7'" "nice -n 5 cc-land 7" "timeout 5 sudo ls"; do
@@ -1482,6 +1486,11 @@ P50
   { [ "$got" = 2 ] && grep -qF 'blocked — landing a change' "$GERR" && ! grep -q 'ledger\|garbage' "$GERR" && [ "$(grep -c '^failures record' "$CALLS")" = 1 ]; } \
     || { r=1; echo "      rc $got, $(grep -c '^failures' "$CALLS") writer call(s), stderr: $(head -c 160 "$GERR")"; }
   GH=""; ok "a ledger write that fails leaves the refusal exactly as it was: rc 2, the rule's own line, and nothing the writer said" $r
+  # 50c. …and one that HANGS is cut at CC_GUARD_RECORD_TIMEOUT: the refusal still comes, and the session waits no longer.
+  ASKS=$T/asks50c; r=0; GH=$T/home50b; printf '#!/bin/sh\nexec sleep 60\n' > "$GH/bin/cc-failures"
+  t0=$(date +%s); got=$(gc "git commit -m 'cc-land did x'" "$GH/.cc/worktrees/demo/t1" CC_ROLE=worker CC_GUARD_RECORD_TIMEOUT=1); t1=$(date +%s)
+  { [ "$got" = 2 ] && [ $((t1 - t0)) -lt 30 ]; } || { r=1; echo "      rc $got after $((t1 - t0)) s with a hanging writer"; }
+  GH=""; ok "a ledger write that hangs is cut at CC_GUARD_RECORD_TIMEOUT and the refusal still comes" $r
   # 51. A NOTE THAT QUOTES A RESTART IS NOT A RESTART (row raised-guard-blocks-notes-quoting-a-restart): the
   #     exact command the reader needs, in a board note, with prose that happens to say `watch` — and the same
   #     note over two lines, which used to be read as a second statement. `watch`, `su -c` and a multi-line
@@ -2867,7 +2876,7 @@ record_query(){   # $1 = reason (why); $2 nonempty = class "page" (owner could a
 # fence and the write-path rules judge a pid or a path, never words, so they leave it empty and record nothing.
 # ONE record per scope+reason+shape per ASK_TTL, keyed beside the queries: a session retrying the same refused line
 # lost one turn, not five. THE VERDICT IS DECIDED BEFORE THIS RUNS AND NOTHING HERE CAN TOUCH IT: the writer is
-# bounded (timeout 5), its exit and output are dropped, and a ledger that cannot be written changes not one byte of
+# bounded (timeout $CC_GUARD_RECORD_TIMEOUT, 5 s live), its exit and output are dropped, and a ledger that cannot be written changes not one byte of
 # the refusal — case 50b runs the same refusal with a writer that fails and asserts the rc and the stderr line.
 RX=""
 rx(){ grep -qE -- "$1" <<<"$cmd" && RX=$1; }      # a text rule: the pattern that matched is kept for note_refusal
@@ -2914,7 +2923,7 @@ note_refusal(){   # $1 = the reason; writes guard-policy/permitted-text-refused 
     [ $((now - was)) -lt "$ASK_TTL" ] && return 0; fi       # the same line, retried: one turn lost, recorded once
   printf '%s\n' "$now" > "$ASKS/$key"
   fl=$HOME/bin/cc-failures; [ -x "$fl" ] || fl=$(command -v cc-failures 2>/dev/null) || return 0
-  timeout 5 "$fl" record --scope "$scope" --kind guard-policy/permitted-text-refused --writer cc-guard \
+  timeout "${CC_GUARD_RECORD_TIMEOUT:-5}" "$fl" record --scope "$scope" --kind guard-policy/permitted-text-refused --writer cc-guard \
     --detector box --detector-evidence "the rule matched the haystack and not the bare view of the command" \
     --expected "the guard judges the command, and permits what the policy permits" \
     --observed "refused \`$shape\` as $why: the rule matched only words in quoted text or a heredoc body, and the turn was lost" \

@@ -3,8 +3,8 @@
 # the default branch (the pre-commit hook does). Extra python files to compile can be passed as arguments
 # (a private overlay adds its own that way).
 # WALL CLOCK (measured 2026-09-08, docs/2026-09-08-gate-profile.md): the tools' own selfchecks are about two
-# thirds of this gate and shellcheck is most of the rest. Both now run CC_CHECK_JOBS at a time (default 4; 1 is
-# one at a time, the old behaviour). Concurrency only: every file is still shellchecked and every selfcheck still
+# thirds of this gate and shellcheck is most of the rest. Both now run $JOBS at a time (CC_CHECK_JOBS, else chosen
+# from CPUs and free memory, below; 1 is one at a time, the old behaviour). Concurrency only: every file is still shellchecked and every selfcheck still
 # runs, each judged in the same order by the same rules — nothing here is skipped to make the gate faster.
 # A selfcheck starts with NONE of the caller's CC_* (run_sc, below): the gate's own knobs pass, nothing else does.
 set -e; SELF=$(readlink -f "$0"); cd "$(dirname "$0")/.."   # $0 is resolved BEFORE the cd moves out from under it
@@ -17,7 +17,27 @@ set -e; SELF=$(readlink -f "$0"); cd "$(dirname "$0")/.."   # $0 is resolved BEF
 if [ "$SUITE_PART" = portable ]; then part_caps shellcheck jq python3 git || { echo "check.sh: not runnable here"; exit 1; }; fi
 sh=(); py=()
 for f in bin/* install.sh ccbox/*.sh; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
-JOBS=${CC_CHECK_JOBS:-4}   # how many of this gate's own jobs run at once. Concurrency, never coverage.
+# HOW MANY OF THIS GATE'S OWN JOBS RUN AT ONCE. Concurrency, never coverage. CC_CHECK_JOBS (or CHECK_JOBS) sets it
+# outright. Otherwise it is the smallest of 4, the CPUs, and one job per 1.5 GiB of MemAvailable — halved when swap
+# is nearly full (SwapFree under an eighth of SwapTotal) — and never below 1. A box whose swap was full of dev
+# servers went red in the heavy fixtures at 4 and green at 2 (2026-09-23): memory is a reason to go slower, not red.
+check_jobs(){   # $1 = a meminfo file, $2 = CPUs → "N why"
+  local cpu=$2 avail swt swf n why
+  read -r avail swt swf < <(awk '/^MemAvailable:/{a=$2} /^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{print a+0, t+0, f+0}' "$1" 2>/dev/null)
+  n=4; why="cap 4"
+  [ "${cpu:-0}" -ge 1 ] && [ "$cpu" -lt "$n" ] && { n=$cpu; why="$cpu CPUs"; }
+  if [ "${avail:-0}" -gt 0 ] && [ $(( avail / 1572864 )) -lt "$n" ]; then n=$(( avail / 1572864 )); why="$(( avail / 1024 )) MiB available"; fi
+  if [ "${swt:-0}" -gt 0 ] && [ "$(( swf * 8 ))" -lt "$swt" ]; then n=$(( n / 2 )); why="$why, swap nearly full ($(( swf / 1024 )) MiB free)"; fi
+  [ "$n" -ge 1 ] || { n=1; why="$why, floor 1"; }
+  echo "$n $why"
+}
+# …and the rule held to its fixtures here, every run: a fault in it would quietly run the gate one wide or four.
+_cj(){ local f; f=$(mktemp); printf 'MemAvailable: %s kB\nSwapTotal: %s kB\nSwapFree: %s kB\n' "$1" "$2" "$3" > "$f"; check_jobs "$f" "$4" | cut -d' ' -f1; rm -f "$f"; }
+[ "$(_cj 16000000 8000000 4000000 6)" = 4 ] && [ "$(_cj 16000000 0 0 2)" = 2 ] && [ "$(_cj 3200000 8000000 4000000 6)" = 2 ] \
+  && [ "$(_cj 16000000 8000000 100000 6)" = 2 ] && [ "$(_cj 500000 8000000 0 6)" = 1 ] \
+  || { echo "check.sh: the job-count rule fails its own fixtures"; exit 1; }
+if [ -n "${CC_CHECK_JOBS:-${CHECK_JOBS:-}}" ]; then JOBS=${CC_CHECK_JOBS:-$CHECK_JOBS}; echo "check.sh: $JOBS jobs at once (set by CC_CHECK_JOBS/CHECK_JOBS)"
+else read -r JOBS _why < <(check_jobs /proc/meminfo "$(nproc 2>/dev/null || echo 4)"); echo "check.sh: $JOBS jobs at once ($_why)"; fi
 GD=$(mktemp -d "${TMPDIR:-/tmp}/cc-check.XXXXXX"); trap 'rm -rf "$GD"' EXIT   # one scratch dir, one trap, both blocks
 if part_here shellcheck; then
 bash -n "${sh[@]}"

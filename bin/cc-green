@@ -4,10 +4,14 @@
 #   cc-green                 per gate: green on this working copy, or not, and why not; then the recurring defects
 #                            below. exit 1 if any gate is not green or the diff carries one
 #   cc-green run             …and run the ones that are not, unscoped, one run per worktree, into a log it names.
-#                            exit 3 and no second suite when a run is already going on this root
+#                            The run is a process of its own that outlives this one: this follows its log and exits
+#                            with its code. A Ctrl-C here is carried to the run; a TERM or hangup here ends only the
+#                            following. exit 3 and no second suite when a run is already going on this root; exit 1
+#                            when the run was killed before it finished
 #   cc-green wait [SECONDS]  block on that run, SECONDS at most (default 540, under a foreground tool call). Ended,
 #                            or none going: the report for the tree as it is NOW, exit 0/1 as above. Still going:
-#                            `still running (pid, since)`, exit 3 — call again
+#                            `still running (pid, since)`, exit 3 — call again. Killed or interrupted before it
+#                            finished: says so and exits 1, with no report
 #   cc-green red SCOPE KIND KEY --observed TEXT [--log FILE] [--writer W] [--expected TEXT] [--link k=v]... [--cost k=v]...
 #                            one failures-ledger record (cc-failures record), ONCE per KEY: a second call with a KEY the
 #                            scope's ledger already holds under links.source writes nothing and says `already <id>`. The
@@ -74,7 +78,8 @@
 # readable said so — and a loaded box ran ~20 minutes of suite twice. `run` holds a flock keyed by the root's
 # realpath for as long as it runs and writes what it is doing beside it (root, tree, pid, started, log); a second
 # `run` on that root reads the note and exits 3 without a suite. `wait` blocks on the same lock, so a worker that
-# detached the run holds nothing but a bounded call and a log path, not a pid that dies within the second.
+# detached the run holds nothing but a bounded call and a log path, not a pid that dies within the second — and
+# the run no longer dies with the worker's iteration (A RUN OUTLIVES WHOEVER STARTED IT, below).
 set -uo pipefail
 SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
 USAGE="usage: cc-green [run|wait [SECONDS]|red SCOPE KIND KEY --observed TEXT [--log FILE]…|selfcheck]"
@@ -286,7 +291,7 @@ run_missing(){
     tail -n +1 -f -s 0.2 --pid="$gp" "$gout" 9>&- 2>/dev/null & tp=$!
     trap 'kill -TERM -- -"$gp" "$tp" 2>/dev/null; exit 130' INT TERM
     wait "$gp" || rc=$?; wait "$tp" 2>/dev/null
-    trap - INT TERM
+    run_traps
     [ "$rc" = 0 ] || { echo "cc-green: $g did not pass (exit $rc) — nothing is green and nothing is handed over" >&2
                        red_seen "$r" "$g" "$tree" "$rc" "$gout" 2>&1 || true; [ "$gout" = /dev/null ] || rm -f "$gout"; return 1; }
     [ "$gout" = /dev/null ] || rm -f "$gout"
@@ -296,30 +301,90 @@ run_missing(){
 
 # ONE RUN PER ROOT. The lock is a flock on a file under $GDIR named for a hash of the root's realpath — two
 # checkouts of one repo are two roots and two suites, the same checkout reached by two paths is one. Beside it a
-# status note says what the run holding it is doing, and the run's own log: every `run` writes there as well as to
-# wherever it was started from, so a detached run has somewhere a worker can read. The lock is fd 9 for as long
-# as the process lives; nothing releases it early and nothing else needs to.
+# status note says what the run holding it is doing, and the run's own log: the run writes there and nowhere else,
+# and whoever launched it follows that file, so a detached run has somewhere a worker can read. The lock is fd 9
+# for as long as the run lives (its launcher takes it and hands it over, below); nothing releases it early.
 lock_files(){   # $1 = root → LOCK STATUS LOG
   local key; key=$(readlink -f "$1" | sha1sum | cut -c1-12)
   LOCK="$GDIR/run-$key.lock"; STATUS="$GDIR/run-$key.status"; LOG="$GDIR/run-$key.log"
 }
 status_field(){ sed -n "s/^$1=//p" "$STATUS" 2>/dev/null | head -1; }
-take_run(){   # $1 = root. Holds the lock, or says who does and returns 3 — and never starts a suite then
+run_traps(){ trap 'exit 130' INT; trap 'exit 143' TERM; }   # the run's own: a signal ends it with a code that says so
+take_run(){   # $1 = root. The RUN's side: the lock its launcher handed over on fd 9, else its own (an exec layer shut it)
   lock_files "$1"; mkdir -p "$GDIR"
+  { true >&9; } 2>/dev/null || exec 9>"$LOCK"
+  flock -n 9 || { echo "cc-green: a run is already going on $1 (pid $(status_field pid)) — no second suite" >&2; return 3; }
+  trap '' HUP; run_traps
+  begin_run "$1" ""
+  # The exit, written by the run itself whatever ends it short of a SIGKILL: `wait` tells a run that ended from one
+  # that was killed by this line being there or not. Without run_traps a TERM reaches this with $? = 0.
+  trap 'printf "exit=%s\nended=%s\n" "$?" "$(now)" >> "$STATUS"' EXIT
+}
+begin_run(){   # $1 = root, $2 = tree. Under the lock: what this run is; written first with no tree, then with it
+  printf 'root=%s\ntree=%s\npid=%s\nstarted=%s\nlog=%s\nrunid=%s\n' "$1" "$2" "$$" "$(now)" "$LOG" "$CC_GREEN_RUNID" > "$STATUS"
+  [ -z "$2" ] || echo "cc-green: run on $1 (pid $$) — log $LOG"
+}
+
+# A RUN OUTLIVES WHOEVER STARTED IT. A track iteration started `setsid nohup cc-green run &` and ended two minutes
+# later (error_max_turns); the run was gone with it — log two lines, the gate's output file empty and left behind,
+# no record, and a loop whose `green_wait` found no run to wait on. That is the signature of a TERM reaching this
+# process: run_missing's trap takes the gate's group down and exits 130 before a word is logged. `setsid` got the
+# run out of the launcher's process group and session and nothing else — not its cgroup (the tmux pane's scope),
+# not the parent chain a tool walks when it kills "everything this command started". So `run` is two processes now:
+#   the LAUNCHER (`cc-green run`) takes the root's lock, writes the status note and truncates the log, starts the
+#     RUN detached from everything it could share — a transient scope of its own (`systemd-run --user --scope`
+#     where the user manager answers, else none), a new session, a parent it does not have (the subshell that
+#     forks it exits), stdin /dev/null, HUP ignored, INT/TERM at default so its own traps hold — hands it the
+#     lock, and waits until the status names the run's pid. Then it follows the log and exits with the run's
+#     code, so a foreground `cc-green run` reads as it always did. A Ctrl-C on it is carried to the run (case 25);
+#     a TERM or HUP on it ends the launcher and nothing else (case 23).
+#   the RUN (`cc-green __run`, started only by a launcher) holds the lock for its whole life and writes `exit=`
+#     into the status on its way out. `wait` reads that: a run that ended says its exit, and one with no exit
+#     line, or 130/143, was killed or interrupted — said as such, exit 1, never green and never waited on for
+#     ever (the lock goes with the process; case 24).
+launch_run(){   # $1 = root → the run's exit; 3 when one is already going, 1 when it was killed, 2 when it never started
+  local r=$1 runid pid="" rc tp scope=()
+  lock_files "$r"; mkdir -p "$GDIR"
   exec 9>"$LOCK"
   if ! flock -n 9; then
-    echo "cc-green: a run is already going on $1 (pid $(status_field pid), started $(status_field started), log $(status_field log))" >&2
+    echo "cc-green: a run is already going on $r (pid $(status_field pid), started $(status_field started), log $(status_field log))" >&2
     echo "  — no second suite. \`cc-green wait\` blocks on it and reports when it has ended." >&2
     return 3
   fi
+  runid="$$-$(date +%s%N)"
+  : > "$LOG"
+  printf 'root=%s\npid=%s\nstarted=%s\nlog=%s\nrunid=%s\nstate=starting\n' "$r" "$$" "$(now)" "$LOG" "$runid" > "$STATUS"
+  if [ "${CC_GREEN_SCOPE:-1}" = 1 ] && command -v systemd-run >/dev/null 2>&1 \
+     && timeout 10 systemd-run --user --scope --quiet --collect true </dev/null >/dev/null 2>&1; then
+    scope=(systemd-run --user --scope --quiet --collect --unit "cc-green-$runid" --)
+  fi
+  # The subshell forks the run and exits, so the run's parent is whatever reaps orphans, not this launcher. The run
+  # inherits fd 9 — the same open lock — and this process lets go of it at once, so the lock lives as long as the run.
+  ( cd "$r" && CC_GREEN_RUNID=$runid exec "${scope[@]}" env --default-signal=INT,QUIT,TERM setsid "$SELF" __run \
+      </dev/null >>"$LOG" 2>&1 & )
+  exec 9>&-
+  for _ in $(seq 100); do
+    [ "$(status_field runid)" = "$runid" ] && [ "$(status_field state)" != starting ] && pid=$(status_field pid) && break
+    sleep 0.1
+  done
+  if [ -z "$pid" ]; then
+    echo "cc-green: the run did not start within 10 s — log $LOG:" >&2; tail -5 "$LOG" >&2; return 2
+  fi
+  # The follower is async, so this shell sits in `wait`, which a trapped signal interrupts; a foreground tail would
+  # hold the INT back until the run had ended on its own. An async job here starts with INT ignored, so a Ctrl-C
+  # leaves the follower reading to the run's last line. A TERM or HUP ends the follower and this, never the run.
+  tail -n +1 -f -s 0.2 --pid="$pid" "$LOG" 2>/dev/null & tp=$!
+  trap 'kill -INT "$pid" 2>/dev/null' INT
+  trap 'kill "$tp" 2>/dev/null; exit 143' TERM
+  trap 'kill "$tp" 2>/dev/null; exit 129' HUP
+  until wait "$tp"; do kill -0 "$tp" 2>/dev/null || break; done
+  trap - INT TERM HUP
+  rc=$(status_field exit)
+  [ -n "$rc" ] || { echo "cc-green: the run (pid $pid) was killed before it finished — nothing it ran is trusted" >&2; return 1; }
+  return "$rc"
 }
-begin_run(){   # $1 = root, $2 = tree. Under the lock: what this run is and where it writes, then write there too
-  printf 'root=%s\ntree=%s\npid=%s\nstarted=%s\nlog=%s\n' "$1" "$2" "$$" "$(now)" "$LOG" > "$STATUS"
-  : > "$LOG"; exec > >(tee -a "$LOG" 9>&-) 2>&1     # tee holds no lock of its own: it outlives this process by a write
-  echo "cc-green: run on $1 (pid $$) — log $LOG"
-}
-wait_run(){   # $1 = root, $2 = seconds. Returns 3 while a run holds the lock past that; otherwise the lock was free
-  local pid
+wait_run(){   # $1 = root, $2 = seconds. Returns 3 while a run holds the lock past that, 4 when the last run was killed
+  local pid rc
   lock_files "$1"; mkdir -p "$GDIR"
   exec 9>"$LOCK"
   # A second's grace before the first try: a `wait` in the same breath as a detached `run` can reach the lock
@@ -331,8 +396,15 @@ wait_run(){   # $1 = root, $2 = seconds. Returns 3 while a run holds the lock pa
     return 3
   fi
   flock -u 9     # released at once: the report below is a second, and a run may start behind it
-  pid=$(status_field pid)
-  [ -n "$pid" ] && echo "cc-green: the run (pid $pid, started $(status_field started)) has ended — log $(status_field log)"
+  pid=$(status_field pid); rc=$(status_field exit)
+  [ -n "$pid" ] || return 0
+  # A note with a runid is one a run writes its exit into. No exit there = the run did not end, it was ended.
+  if [ -n "$(status_field runid)" ] && [ -z "$rc" ]; then
+    echo "cc-green: the run (pid $pid, started $(status_field started)) was KILLED before it finished — no verdict; log $(status_field log)"
+    return 4
+  fi
+  case "$rc" in 130|143) echo "cc-green: the run (pid $pid, started $(status_field started)) was interrupted (exit $rc) — no verdict; log $(status_field log)"; return 4;; esac
+  echo "cc-green: the run (pid $pid, started $(status_field started)) has ended${rc:+ (exit $rc)} — log $(status_field log)"
   return 0
 }
 
@@ -342,11 +414,13 @@ main(){
   [ -n "${r:-}" ] || { echo "cc-green: not in a git checkout" >&2; exit 2; }
   # Wait BEFORE taking the tree: the report is on what the working copy holds once the run is over, not before.
   # And lock before it too: the lock is the first thing a run does, so a `wait` behind it has the least to race.
-  [ "$mode" = wait ] && { wait_run "$r" "$2" || exit 3; }
-  [ "$mode" = run ] && { take_run "$r" || exit 3; }
+  # A killed run is not green whatever an older record says: exit 1 and no report (3 stays "still going").
+  if [ "$mode" = wait ]; then wait_run "$r" "$2"; case $? in 0) ;; 3) exit 3;; *) exit 1;; esac; fi
+  [ "$mode" = run ] && { launch_run "$r"; exit $?; }
+  [ "$mode" = __run ] && { take_run "$r" || exit 3; }
   tree=$(green_tree "$r")
   [ -n "$tree" ] || { echo "cc-green: cannot take this working copy's tree" >&2; exit 2; }
-  if [ "$mode" = run ]; then
+  if [ "$mode" = __run ]; then
     begin_run "$r" "$tree"
     run_missing "$r" "$tree" || exit 1
     # A gate can leave the tree it just passed on behind it — a log, a scratch file, a rebuilt artefact — and the
@@ -380,6 +454,7 @@ selfcheck(){
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }   # …and one that must NOT hold: `t !` runs `!` as a command
   D=$(mktemp -d); trap 'rm -rf "$D"' RETURN
+  unset CC_GREEN_RUNID CC_GREEN_SCOPE   # a selfcheck run as a gate under a cc-green run must not pass for that run
   export CC_FAILURES="$D/failures"   # every record a case below writes goes to a scratch ledger, never the box's own
   export CC_REVIEWS_DIR="$D/reviews" CC_STATE_BASE="$D/state"   # …and the review record the report reads is a scratch one
 
@@ -717,6 +792,92 @@ EOS
   k "$(nt grep -qx check.sh "$D/interrupted.log")" "…and the suite it interrupted never finished"
   rm -rf "$D2"
 
+  # 23 A RUN OUTLIVES ITS LAUNCHER. A worker iteration's `setsid nohup cc-green run &` died with the iteration: log
+  # two lines, no record. Here the launcher is a group leader of its own and the whole group is TERMed mid-gate —
+  # what a tool ending "everything this command started" does. The run finishes, records green, and holds the
+  # lock while it goes: a second `run` then is "already going", which is the lock handed over, not left behind.
+  D2=$(mktemp -d); R=$(newrepo outlives 3)
+  : > "$D/outlives.log"
+  ( cd "$R" && CC_GREEN_DIR="$D2" exec setsid env --default-signal=INT,TERM "$SELF" run >/dev/null 2>&1 ) & p=$!
+  for _ in $(seq 50); do [ -f "$D/outlives.started" ] && break; sleep 0.1; done
+  k "$(nt test -e "/proc/$p/fd/9")" "a launcher whose run has started holds no fd 9 of its own"
+  kill -TERM -- -"$p" 2>/dev/null; wait "$p"; rc=$?
+  k "$(t test "$rc" -eq 143)" "a TERM on the launcher's group ends the launcher"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 3 -a -n "$(grep 'a run is already going' <<<"$out")")" "…while the run it started still holds the lock: a second run says already going, exit 3"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 20 2>&1 ); rc=$?
+  k "$rc" "…and wait on that run is the report, exit 0"
+  k "$(t grep -q 'has ended (exit 0)' <<<"$out")" "…saying the run ended with exit 0"
+  k "$(t grep -q "green   core/tests/check.sh" <<<"$out")" "…and the gate it ran recorded green"
+  k "$(t test "$(grep -cx check.sh "$D/outlives.log")" = 1)" "…one suite ran"
+  rm -rf "$D2"
+
+  # 24 A KILLED RUN IS SAID TO BE KILLED. SIGKILL leaves no exit line, and the lock goes with the process: `wait`
+  # must not call that green nor wait for ever, and the launcher following it must not exit 0.
+  D2=$(mktemp -d); R=$(newrepo killed)
+  printf '#!/usr/bin/env bash\necho $$ > "%s"\nsleep 8\necho check.sh >> "%s"\n' "$D/killed.pid" "$D/killed.log" > "$R/core/tests/check.sh"
+  chmod +x "$R/core/tests/check.sh"; ( cd "$R" && git add -A && git commit -qm killed ) >/dev/null 2>&1
+  ( cd "$R" && CC_GREEN_DIR="$D2" exec "$SELF" run >/dev/null 2>&1 ) & p=$!
+  for _ in $(seq 100); do [ -s "$D/killed.pid" ] && break; sleep 0.1; done
+  gpid=$(cat "$D/killed.pid" 2>/dev/null); pid=$(sed -n 's/^pid=//p' "$D2"/run-*.status 2>/dev/null | head -1)
+  kill -KILL "$pid" 2>/dev/null; kill -KILL -- -"$gpid" 2>/dev/null   # the gate too: a SIGKILLed run cannot take it along
+  wait "$p"; rc=$?
+  k "$(t test "$rc" -eq 1)" "a launcher whose run was SIGKILLed exits 1, not the run's green"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 10 "$SELF" wait 5 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "wait on a SIGKILLed run exits 1 at once, not 0 and not 3"
+  k "$(t grep -q "the run (pid $pid, .*) was KILLED before it finished" <<<"$out")" "…and says the run was killed"
+  rm -rf "$D2"
+
+  # 25 A CTRL-C ON THE LAUNCHER IS A CTRL-C ON THE RUN. The run is in a session of its own, so a terminal's INT
+  # reaches only the launcher; it carries the INT over, the run takes its gate down, and wait says interrupted.
+  D2=$(mktemp -d); R=$(newrepo ctrlc)
+  printf '#!/usr/bin/env bash\necho $$ > "%s"\nsleep 8\necho check.sh >> "%s"\n' "$D/ctrlc.pid" "$D/ctrlc.log" > "$R/core/tests/check.sh"
+  chmod +x "$R/core/tests/check.sh"; ( cd "$R" && git add -A && git commit -qm ctrlc ) >/dev/null 2>&1
+  : > "$D/ctrlc.log"
+  ( cd "$R" && CC_GREEN_DIR="$D2" exec env --default-signal=INT,TERM "$SELF" run >/dev/null 2>&1 ) & p=$!
+  for _ in $(seq 100); do [ -s "$D/ctrlc.pid" ] && break; sleep 0.1; done
+  gpid=$(cat "$D/ctrlc.pid" 2>/dev/null); sleep 0.5
+  kill -INT "$p" 2>/dev/null
+  wait "$p"; rc=$?
+  k "$(t test "$rc" -eq 130)" "an INT on the launcher ends the run, and the launcher exits with its 130"
+  for _ in $(seq 50); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
+  k "$(nt kill -0 "$gpid")" "…and the run's gate went with it"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'was interrupted (exit 130)' <<<"$out")")" "…and wait says interrupted, exit 1"
+  k "$(nt grep -qx check.sh "$D/ctrlc.log")" "…and the suite never finished"
+  rm -rf "$D2"
+
+  # 26 `__run` IS THE LAUNCHER'S. By hand it refuses; with a runid forged while a run holds the root it opens the
+  # lock itself and finds it taken — never a second suite.
+  D2=$(mktemp -d); R=$(newrepo byhand 3)
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" __run >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 2)" "__run by hand refuses, exit 2"
+  : > "$D/byhand.log"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ) & p=$!
+  for _ in $(seq 50); do [ -f "$D/byhand.started" ] && break; sleep 0.1; done
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_RUNID=forged "$SELF" __run 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 3 -a -n "$(grep 'a run is already going' <<<"$out")")" "…and a forged one while a run is going finds the lock taken, exit 3"
+  wait "$p"
+  k "$(t test "$(grep -cx check.sh "$D/byhand.log")" = 1)" "…so one suite ran"
+  rm -rf "$D2"
+
+  # 27 THE SCOPE. Where the user manager answers, the run sits in a transient scope of its own, out of the cgroup
+  # that started it; CC_GREEN_SCOPE=0 keeps it in place. Both, on one slow fixture each.
+  if timeout 10 systemd-run --user --scope --quiet --collect true </dev/null >/dev/null 2>&1; then
+    for p2 in 1 0; do
+      D2=$(mktemp -d); R=$(newrepo "scope$p2" 2)
+      ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_SCOPE=$p2 "$SELF" run >/dev/null 2>&1 ) & p=$!
+      for _ in $(seq 50); do [ -f "$D/scope$p2.started" ] && break; sleep 0.1; done
+      pid=$(sed -n 's/^pid=//p' "$D2"/run-*.status 2>/dev/null | head -1)
+      out=$(cat "/proc/$pid/cgroup" 2>/dev/null)
+      if [ "$p2" = 1 ]; then k "$(t grep -q 'cc-green-' <<<"$out")" "a run gets a scope of its own where systemd-run --user answers"
+      else k "$(t test -n "$out" -a "$out" = "$(cat /proc/$$/cgroup)")" "…and CC_GREEN_SCOPE=0 leaves it in the caller's cgroup"; fi
+      wait "$p"; rm -rf "$D2"
+    done
+  else
+    k 0 "no user manager answers systemd-run here: the scope cases are not checked"
+  fi
+
   # THE RECURRING DEFECTS: every catalogue class against its own fixtures, then the report holding a hand-over on one.
   out=$(python3 "$CORE/tests/recurring_defects.py" selftest 2>&1); rc=$?
   k "$rc" "every recurring-defect class goes red on its fixture diff and holds its suppressed cases ($(tail -1 <<<"$out"))"
@@ -739,6 +900,8 @@ EOS
 case "${1:-}" in
   "")        main ;;
   run)       main run ;;
+  __run)     [ -n "${CC_GREEN_RUNID:-}" ] || { echo "cc-green: __run is started by \`cc-green run\`, not by hand" >&2; exit 2; }
+             main __run ;;
   wait)      case "${2:-540}" in *[!0-9]*|"") echo "$USAGE" >&2; exit 2;; esac; main wait "${2:-540}" ;;
   red)       shift; red "$@" ;;   # no checkout needed: the landing and the loop call this from wherever they are
   selfcheck) selfcheck ;;
