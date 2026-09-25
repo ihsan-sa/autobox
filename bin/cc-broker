@@ -737,15 +737,23 @@ def selfcheck():
 
         # …AND ONE HUNG TARGET DOES NOT UNDO EVERY TARGET BEFORE IT. Its own fixture: two targets due, the second
         # hangs, the run is killed — the first one's delivery must already be durable, or it is delivered again.
+        # THE KILL WAITS FOR THE HANG, not for a clock. The flush also walks what earlier cases left pending, so a
+        # fixed 2 s sleep killed it before or inside r9a's own send under load, and the row went red on main with
+        # nothing wrong in the code. The stub records r9b's call and THEN sleeps, so that line appearing means
+        # r9a's flush is over and r9b is hanging now: the one moment this case is about.
         open(slow, "w").write("r9b\n")
         run("inject", "--source", "reconcile", "r9a", "idle: r9a/t — quiet")
         run("inject", "--source", "reconcile", "r9b", "idle: r9b/t — quiet")
         p9 = subprocess.Popen([sys.executable, os.path.realpath(__file__), "--flush"],
                               env=env(CC_BROKER_DEBOUNCE_S="0"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2.0)
+        t = time.time()
+        while "CALL r9b" not in said() and p9.poll() is None and time.time() - t < 60:
+            time.sleep(0.05)
+        hung = p9.poll() is None                 # still inside r9b's send, so the kill lands where it means to
         p9.kill(); p9.wait(timeout=10)
         ok("a target delivered before a later one hung keeps its delivery — it is not re-sent on the next tick",
-           "CALL r9a" in said() and not pending("r9a") and bool(pending("r9b")))
+           "CALL r9b" in said() and hung
+           and "CALL r9a" in said() and not pending("r9a") and bool(pending("r9b")))
         open(slow, "w").close()
         os.truncate(rec, 0)
 

@@ -2516,7 +2516,12 @@ CASES
 : > "$T/empty.json"; printf 'HTTP 429 Too Many Requests\n' > "$T/lim.err"
 L check "$T/empty.json" "$T/lim.err" >/dev/null || miss="$miss [stderr-only 429]"; L clear
 [ -z "$miss" ] && ok "cc-limit check: 6 limit phrasings + stderr-only detected, 2 non-limits ignored" || bad "cc-limit check:$miss"
-say true "rate limit; reset in 2 minutes"; u=$(L check "$lf"); u=${u#LIMIT }; d=$((u - $(date -u +%s)))
+
+# t0 is the clock cc-limit itself reads (CC_LIMIT_NOW), not one taken after `L check` returns: under load the
+# gap between the fixture write and this test's own `date` call stretched past 30s and reds every landing on
+# branches that never touch cc-limit ('+89s', '+90s' — see the row that fixed this). Pinning `now` makes the
+# parse deterministic: u is exactly t0+120 regardless of how long the subprocess took to run.
+say true "rate limit; reset in 2 minutes"; t0=$(date -u +%s); u=$(CC_LIMIT_NOW=$t0 L check "$lf"); u=${u#LIMIT }; d=$((u - t0))
 { [ "$d" -ge 100 ] && [ "$d" -le 140 ]; } && ok "cc-limit parses a relative reset ('in 2 minutes' -> +${d}s)" || bad "relative reset parsed to +${d}s"
 L status | grep -q 'usage limit until .*Z (.*left)' && ok "cc-limit status reports the live stamp" || bad "cc-limit status while set"
 L clear; [ "$(L status)" = clear ] && [ "$(L status >/dev/null; echo $?)" = 1 ] && ok "cc-limit clear -> status clear (exit 1)" || bad "cc-limit clear"
