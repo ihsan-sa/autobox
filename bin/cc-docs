@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+"""cc-docs — the document register: numbers, stamps and files every PDF the box finishes for its owner.
+
+A number is PPP-NNNN-R. PPP is the project, given the next free number in its range the first time a document is
+filed under it (work 001-099, course 101-199, member 901-999); NNNN, four digits, is the document within the project, in filing
+order; R is the revision, A for the first finished version and the next letter for each finished version whose
+content differs from the last (I and O are skipped, and after Z comes AA). A filed copy is named
+`PPP-NNNN-R_<slug>.pdf`, is written once, read-only, and never rewritten.
+
+    cc-docs file <pdf> --project <name|PPP> --title <t> [--source <path>] [--no-stamp]
+                 [--kind work|course|member] [--member <handle>] [--date YYYY-MM-DD]
+        Called by a maker at the end of a finished build. The same source path, or else the same title in the same
+        project, is the same document. Content unchanged since the current revision files nothing and prints that
+        revision; otherwise the next letter is filed. A PDF whose text carries no number gets a small grey stamp
+        `PPP-NNNN-R · 24 Sep 2026` bottom-left on every page; one that already carries its own number (a LaTeX build
+        that took it from `number`) is filed as it is; one carrying a different number is refused. --no-stamp is for
+        a document that must not show a number (a resume, anything going outside): it is kept on the document, so its
+        later revisions are not stamped either. A new project needs --kind, --member (a member project, visible to
+        that member's workspace and the owner) or a project created first with `project`. Prints `<number>\t<path>` and whether
+        it filed or found the content unchanged.
+    cc-docs number --project <name|PPP> --title <t> [--source <path>] [--tex]
+        The number `file` would give a changed build of this document now, for a build that prints its own footer:
+        plain, or with --tex as `\\def\\docnumber{…}\\def\\docstamp{… · 24 Sep 2026}` to \\input before compiling.
+        It reserves nothing, and a build whose content turns out unchanged is not filed.
+    cc-docs project <name> [--number PPP] [--kind work|course|member] [--member <handle>]
+        Create a project (at PPP, or the next free number in its kind's range), or print an existing one.
+    cc-docs find <PPP-NNNN | PPP-NNNN-R | words…>
+        The file of a document's current revision (or of the exact revision named), found by number, title or
+        words in the title, project name or source path. Several equally good matches are listed to stderr, exit 3;
+        none, exit 1.
+    cc-docs list [--project <name|PPP>]
+        One line per document: number of the current revision, date, visibility, title.
+    cc-docs selfcheck
+
+THE REGISTER is one JSON file, $CC_DOCS_ROOT/register.json (default ~/.cc/documents), with the filed copies under
+files/PPP/ beside it: private state, in no repo, and outside cc-lib's own tree (cc-lib indexes the register). Per
+document it holds number, title, project, source, visibility (the owner, or the owner and one member), starred and
+public, and per revision the letter, file, date, the PDF it was filed from and a content fingerprint. The
+fingerprint hashes the PDF's text with any document stamp taken out together with every page rendered small and grey
+with its bottom strip (stamp, footer) cut off, so a rebuild that changes only a figure is a new revision and one that
+differs only in its stamp, footer or bytes is unchanged; a PDF neither can read falls back to its bytes. A revision
+filed with the older text-only print still matches an unchanged rebuild. Writes hold a lock and replace the file whole.
+
+VISIBILITY is keyed by workspace id, the one cc-lib keys its indexes by (~/.cc/members/<handle>/workspace-id, minted
+by cc-sandbox or cc-lib, never here): a member project records its member's id, and each of its documents is visible
+to ["owner", <id>]. The owner sees the whole register. A member workspace gets a VIEW, ws/<id>/ under the root, and
+never the register itself: a register of the same shape holding only the documents that name its id, with their
+filed copies hard-linked beside it, so `CC_DOCS_ROOT=<the view> cc-docs find …` works inside it unchanged. `file`
+rewrites the views its document reaches after every filing, in place (a bind mount of the directory keeps seeing
+them), so the directory can be mounted read-only into that member's sandbox the way cc-lib mounts ws/<id>/.
+"""
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.environ.get("CC_DOCS_ROOT") or os.path.join(os.path.expanduser("~"), ".cc", "documents")
+MEMBERS = os.path.join(os.path.expanduser("~"), ".cc", "members")
+RANGES = {"work": (1, 99), "course": (101, 199), "member": (901, 999)}
+LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"   # I and O are skipped: they read like 1 and 0
+NUM = re.compile(r"^(\d{3})-(\d{4})(?:-([A-HJ-NP-Z]{1,3}))?$")
+STAMP = re.compile(r"\b\d{3}-\d{4}-[A-HJ-NP-Z]{1,3}\b(?:\s*·\s*\d{1,2} [A-Z][a-z]{2} \d{4})?")
+STOP = set("a an the of for and or to in on my me get find doc document pdf".split())
+
+
+class Refused(Exception):
+    pass
+
+
+def letter(i):
+    """0 -> A, 23 -> Z, 24 -> AA: bijective base 24 over LETTERS."""
+    s = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, len(LETTERS))
+        s = LETTERS[r] + s
+    return s
+
+
+def slugify(t):
+    return re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:60].strip("-") or "document"
+
+
+def stampdate(d):
+    return f"{d.day} {d.strftime('%b %Y')}"
+
+
+# ── the register ─────────────────────────────────────────────────────────────────────────────────────────────
+def regpath():
+    return os.path.join(ROOT, "register.json")
+
+
+def load():
+    try:
+        with open(regpath()) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"version": 1, "projects": {}, "documents": {}}
+
+
+def save(reg):
+    fd, tmp = tempfile.mkstemp(dir=ROOT, prefix=".register.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(reg, f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, regpath())
+
+
+class Lock:
+    def __enter__(self):
+        os.makedirs(ROOT, mode=0o700, exist_ok=True)
+        self.f = open(os.path.join(ROOT, ".lock"), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+def find_project(reg, name):
+    if re.fullmatch(r"\d{3}", name or ""):
+        return name if name in reg["projects"] else None
+    for p, d in reg["projects"].items():
+        if d["name"].lower() == (name or "").lower():
+            return p
+    return None
+
+
+def make_project(reg, name, number=None, kind=None, member=None):
+    """-> PPP, existing or new. A new one takes --number, or the next free number in its kind's range."""
+    p = find_project(reg, number or name)
+    if p:
+        if number and reg["projects"][p]["name"].lower() != name.lower():
+            raise Refused(f"project {p} is already {reg['projects'][p]['name']!r}")
+        return p
+    if find_project(reg, name):
+        raise Refused(f"project {name!r} already has number {find_project(reg, name)}")
+    if member:
+        kind = kind or "member"
+    if number:
+        n = int(number)
+        kind = kind or next((k for k, (a, b) in RANGES.items() if a <= n <= b), None)
+        if kind not in RANGES or not RANGES[kind][0] <= n <= RANGES[kind][1]:
+            raise Refused(f"project number {number} is outside the {kind or 'known'} ranges")
+    elif kind in RANGES:
+        a, b = RANGES[kind]
+        n = next((i for i in range(a, b + 1) if f"{i:03d}" not in reg["projects"]), None)
+        if n is None:
+            raise Refused(f"the {kind} range is full")
+    else:
+        raise Refused(f"no project {name!r}: give --kind work|course|member, --member or --number to create it")
+    if kind == "member" and not member:
+        raise Refused("a member project needs --member <handle>: it is visible to that member and the owner")
+    p = f"{n:03d}"
+    reg["projects"][p] = {"name": name, "kind": kind, "member": member if kind == "member" else None,
+                          "workspace": workspace_id(member) if kind == "member" else None,
+                          "created": datetime.date.today().isoformat()}
+    return p
+
+
+def workspace_id(handle):
+    """A member's workspace id, as cc-lib reads it: 16 hex in a regular file. None of it is minted here."""
+    f = os.path.join(MEMBERS, handle, "workspace-id")
+    try:
+        wid = "" if os.path.islink(f) else open(f).read().strip()
+    except OSError:
+        wid = ""
+    if not re.fullmatch(r"[0-9a-f]{16}", wid):
+        raise Refused(f"member {handle!r} has no workspace id at {f}; its workspace must exist before its documents")
+    return wid
+
+
+def write_views(reg, ids):
+    """Each workspace id in ids gets ws/<id>/: a register of the documents visible to it, and their files linked in."""
+    for wid in sorted(ids):
+        v = os.path.join(ROOT, "ws", wid)
+        os.makedirs(v, mode=0o700, exist_ok=True)
+        docs = {n: d for n, d in reg["documents"].items() if wid in d.get("visibility", ())}
+        for d in docs.values():
+            for r in d["revisions"]:
+                dst = os.path.join(v, r["file"])
+                if not os.path.exists(dst):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    os.link(os.path.join(ROOT, r["file"]), dst)
+        view = {"version": reg["version"], "documents": docs,
+                "projects": {p: reg["projects"][p] for p in sorted({d["project"] for d in docs.values()})}}
+        fd, tmp = tempfile.mkstemp(dir=v, prefix=".register.")
+        with os.fdopen(fd, "w") as f:
+            json.dump(view, f, indent=1, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, os.path.join(v, "register.json"))
+
+
+def match_doc(reg, proj, title, source):
+    """The same source path, else the same title in the same project, is the same document.
+    Brief: "same source path or title = same document"."""
+    if source:
+        for num, d in reg["documents"].items():
+            if d.get("source") == source:
+                if proj and d["project"] != proj:
+                    raise Refused(f"{source} is already {num}, under project {d['project']}, not {proj}")
+                return num
+    for num, d in reg["documents"].items():
+        if d["project"] == proj and d["title"].lower() == title.lower():
+            return num
+    return None
+
+
+def next_doc(reg, proj):
+    used = [int(n.split("-")[1]) for n, d in reg["documents"].items() if d["project"] == proj]
+    return f"{proj}-{max(used, default=0) + 1:04d}"
+
+
+def current(d):
+    return d["revisions"][-1] if d["revisions"] else None
+
+
+# ── the PDF ──────────────────────────────────────────────────────────────────────────────────────────────────
+def pdftext(path):
+    r = subprocess.run(["pdftotext", "-q", path, "-"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Refused(f"{path}: pdftotext could not read it ({r.stderr.strip()[:200]})")
+    return r.stdout
+
+
+def textprint(text):
+    """The text-only fingerprint the first register was filed with, or None for a PDF with no text."""
+    body = " ".join(STAMP.sub(" ", text).split())
+    return "text:" + hashlib.sha256(body.encode()).hexdigest() if body else None
+
+
+def pageprint(path):
+    """A hash of every page rendered small and grey with its bottom strip cut off, where a stamp or a footer sits,
+    so a changed figure changes it and a changed stamp does not. None when the pages cannot be rendered."""
+    with tempfile.TemporaryDirectory(prefix="cc-docs-fp-") as t:
+        r = subprocess.run(["pdftoppm", "-r", "36", "-gray", path, os.path.join(t, "p")], capture_output=True)
+        names = sorted(os.listdir(t), key=lambda x: int(re.sub(r"\D", "", x) or 0))
+        if r.returncode != 0 or not names:
+            return None
+        h = hashlib.sha256()
+        for name in names:
+            with open(os.path.join(t, name), "rb") as f:
+                m = re.match(rb"P5\s+(\d+)\s+(\d+)\s+\d+\s", f.read(64))
+                if not m:
+                    return None
+                f.seek(m.end())
+                w, rows = int(m.group(1)), int(m.group(2))
+                h.update(f.read(w * (rows - rows * 12 // 100)))
+        return h.hexdigest()
+
+
+def fingerprint(path, text):
+    """Text and page images together; a PDF neither can read falls back to its bytes."""
+    body, pix = textprint(text), pageprint(path)
+    if pix:
+        return "page:" + hashlib.sha256(f"{body}|{pix}".encode()).hexdigest()
+    if body:
+        return body
+    with open(path, "rb") as f:
+        return "bytes:" + hashlib.sha256(f.read()).hexdigest()
+
+
+def pages(path):
+    r = subprocess.run(["pdfinfo", path], capture_output=True, text=True)
+    m = re.search(r"^Pages:\s+(\d+)", r.stdout, re.M)
+    return int(m.group(1)) if m else -1
+
+
+def stamp(src, dst, text):
+    """Every page of src with `text` small and grey at the bottom left, written to dst."""
+    with tempfile.TemporaryDirectory(prefix="cc-docs-") as t:
+        shutil.copy(src, os.path.join(t, "in.pdf"))
+        tex = text.replace("·", r"\textperiodcentered{}")
+        with open(os.path.join(t, "s.tex"), "w") as f:
+            f.write("\\documentclass{article}\\usepackage[T1]{fontenc}\\usepackage{pdfpages}\\usepackage{xcolor}\n"
+                    "\\begin{document}\\includepdf[pages=-,fitpaper,picturecommand={\\put(30,20){\\fontsize{7}{8}"
+                    "\\selectfont\\sffamily\\color[gray]{0.5}" + tex + "}}]{in.pdf}\\end{document}\n")
+        r = subprocess.run(["pdflatex", "-interaction=batchmode", "-halt-on-error", "s.tex"], cwd=t,
+                           capture_output=True, text=True)
+        out = os.path.join(t, "s.pdf")
+        if r.returncode != 0 or not os.path.isfile(out) or pages(out) != pages(src):
+            raise Refused(f"{src}: the stamp overlay failed (pdflatex exit {r.returncode}); nothing filed")
+        shutil.copy(out, dst)
+
+
+# ── commands ─────────────────────────────────────────────────────────────────────────────────────────────────
+def plan(reg, a):
+    """-> (proj, docnum, doc-or-None, next letter). Creates the project in reg (the caller decides to save)."""
+    proj = find_project(reg, a.project)
+    if not proj:
+        if re.fullmatch(r"\d{3}", a.project):
+            raise Refused(f"no project {a.project}: create it by name with `cc-docs project <name> --number {a.project}`")
+        proj = make_project(reg, a.project, None, a.kind, a.member)
+    source = os.path.abspath(a.source) if a.source else None
+    num = match_doc(reg, proj, a.title, source)
+    d = reg["documents"].get(num) if num else None
+    return proj, num or next_doc(reg, proj), d, letter(len(d["revisions"]) if d else 0)
+
+
+def cmd_file(a):
+    src = os.path.abspath(a.pdf)
+    if not os.path.isfile(src):
+        raise Refused(f"{a.pdf}: no such file")
+    date = datetime.date.fromisoformat(a.date) if a.date else datetime.date.today()
+    text = pdftext(src)
+    fp = fingerprint(src, text)
+    with Lock():
+        reg = load()
+        proj, num, d, rev = plan(reg, a)
+        # brief: "a changed finished version = next letter, unchanged content = no new letter"
+        # a revision filed before page images were hashed carries a text-only print: that still counts as unchanged
+        if d and current(d) and current(d)["fingerprint"] in (fp, textprint(text)):
+            print(f"{num}-{current(d)['rev']}\t{os.path.join(ROOT, current(d)['file'])}\tunchanged, nothing filed")
+            return 0
+        full = f"{num}-{rev}"
+        carried = set(m.group(0).split()[0] for m in STAMP.finditer(text))
+        if carried - {full}:
+            raise Refused(f"{a.pdf} already carries {', '.join(sorted(carried - {full}))}, but it would be filed as "
+                          f"{full}; rebuild it with `cc-docs number`")
+        nostamp = a.no_stamp or bool(d and d.get("stamp") is False)
+        rel = os.path.join("files", proj, f"{full}_{slugify(a.title)}.pdf")
+        dst = os.path.join(ROOT, rel)
+        if os.path.exists(dst):
+            raise Refused(f"{dst} exists; a filed revision is never rewritten")
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".part"
+        if nostamp:
+            how = "none"
+            shutil.copy(src, tmp)
+        elif full in carried:
+            how = "carried"
+            shutil.copy(src, tmp)
+        else:
+            how = "overlay"
+            stamp(src, tmp, f"{full} · {stampdate(date)}")
+        os.chmod(tmp, 0o444)
+        os.replace(tmp, dst)
+        with open(dst, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        if not d:
+            pd = reg["projects"][proj]
+            d = reg["documents"][num] = {
+                "number": num, "project": proj, "title": a.title, "source": os.path.abspath(a.source) if a.source else None,
+                "visibility": ["owner"] + ([pd["workspace"]] if pd.get("workspace") else []), "member": pd.get("member"),
+                "starred": False, "public": False, "stamp": not nostamp, "revisions": []}
+        d["title"] = a.title
+        if a.source and not d.get("source"):
+            d["source"] = os.path.abspath(a.source)
+        d["revisions"].append({"rev": rev, "file": rel, "date": date.isoformat(), "from": src, "fingerprint": fp,
+                               "sha256": sha, "stamped": how,
+                               "filed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+        save(reg)
+        write_views(reg, set(d["visibility"]) - {"owner"})
+    print(f"{full}\t{dst}\tfiled")
+    return 0
+
+
+def cmd_number(a):
+    with Lock():
+        reg = load()
+        proj, num, d, rev = plan(reg, a)   # a project it would create is not saved: `number` reserves nothing
+    full = f"{num}-{rev}"
+    if a.tex:
+        print(f"\\def\\docnumber{{{full}}}\\def\\docstamp{{{full} · {stampdate(datetime.date.today())}}}")
+    else:
+        print(full)
+    return 0
+
+
+def cmd_project(a):
+    with Lock():
+        reg = load()
+        p = make_project(reg, a.name, a.number, a.kind, a.member)
+        save(reg)
+    d = reg["projects"][p]
+    print(f"{p}\t{d['name']}\t{d['kind']}" + (f"\t{d['member']}" if d.get("member") else ""))
+    return 0
+
+
+def search(reg, query):
+    """-> [(docnum, rev-or-None)] best matches for a number or words."""
+    q = " ".join(query).strip()
+    m = NUM.match(q)
+    if m:
+        num = f"{m.group(1)}-{m.group(2)}"
+        return [(num, m.group(3))] if num in reg["documents"] else []
+    words = [w for w in re.findall(r"[a-z0-9]+", q.lower()) if w not in STOP]
+    if not words:
+        return []
+    scored = []
+    for num, d in reg["documents"].items():
+        if d["title"].lower() == q.lower():
+            scored.append((100, num))
+            continue
+        hay = set(re.findall(r"[a-z0-9]+", " ".join([d["title"], reg["projects"].get(d["project"], {}).get("name", ""),
+                                                     d.get("source") or ""]).lower()))
+        tw = set(re.findall(r"[a-z0-9]+", d["title"].lower()))
+        hit = sum(1 for w in words if w in hay)
+        if hit == len(words):
+            scored.append((hit + sum(1 for w in words if w in tw) / 10, num))
+    if not scored:
+        return []
+    top = max(s for s, _ in scored)
+    return [(n, None) for s, n in sorted(scored) if s == top]
+
+
+def cmd_find(a):
+    reg = load()
+    hits = search(reg, a.query)
+    if not hits:
+        print(f"cc-docs: no document matches {' '.join(a.query)!r}", file=sys.stderr)
+        return 1
+    if len(hits) > 1:
+        for n, _ in hits:
+            print(f"{n}-{current(reg['documents'][n])['rev']}\t{reg['documents'][n]['title']}", file=sys.stderr)
+        return 3
+    n, rev = hits[0]
+    d = reg["documents"][n]
+    r = next((x for x in d["revisions"] if x["rev"] == rev), None) if rev else current(d)
+    if not r:
+        print(f"cc-docs: {n} has no revision {rev}", file=sys.stderr)
+        return 1
+    print(os.path.join(ROOT, r["file"]))
+    return 0
+
+
+def cmd_list(a):
+    reg = load()
+    proj = find_project(reg, a.project) if a.project else None
+    if a.project and not proj:
+        print(f"cc-docs: no project {a.project!r}", file=sys.stderr)
+        return 1
+    for n in sorted(reg["documents"]):
+        d = reg["documents"][n]
+        if proj and d["project"] != proj:
+            continue
+        r = current(d)
+        print(f"{n}-{r['rev']}\t{r['date']}\towner{'+' + d['member'] if d.get('member') else ''}\t{d['title']}")
+    return 0
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
+def selfcheck():
+    global ROOT, MEMBERS
+    n = [0, 0]
+
+    def ok(name, cond):
+        n[0 if cond else 1] += 1
+        print(("  ok   " if cond else "  FAIL ") + name)
+
+    def mkpdf(d, name, body):
+        """A one-page PDF saying `body`, built by pdflatex in d."""
+        with open(os.path.join(d, name + ".tex"), "w") as f:
+            f.write("\\documentclass{article}\\pagestyle{empty}\\begin{document}" + body + "\\end{document}\n")
+        subprocess.run(["pdflatex", "-interaction=batchmode", name + ".tex"], cwd=d, capture_output=True)
+        return os.path.join(d, name + ".pdf")
+
+    def run(*args):
+        out, err = sys.stdout, sys.stderr
+        import io
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        try:
+            rc = main(list(args))
+        finally:
+            o, e = sys.stdout.getvalue(), sys.stderr.getvalue()
+            sys.stdout, sys.stderr = out, err
+        return rc, o + e
+
+    print("cc-docs selfcheck")
+    ok("letters: A, H→J (I skipped), N→P (O skipped), Z, then AA", [letter(i) for i in (0, 8, 13, 23, 24, 25)]
+       == ["A", "J", "P", "Z", "AA", "AB"])
+    ok("slug: lowercase with hyphens", slugify("The Autobox: Explanation (v2)") == "the-autobox-explanation-v2")
+    with tempfile.TemporaryDirectory(prefix="cc-docs-sc-") as t:
+        src = os.path.join(t, "src")
+        os.makedirs(src)
+        MEMBERS = os.path.join(t, "members")
+        wid = "0123456789abcdef"
+        os.makedirs(os.path.join(MEMBERS, "kid1"))
+        with open(os.path.join(MEMBERS, "kid1", "workspace-id"), "w") as f:
+            f.write(wid + "\n")
+        # numbering: each case files into a register of its own
+        ROOT = os.path.join(t, "r1")
+        a = mkpdf(src, "a", "Alpha one")
+        b = mkpdf(src, "b", "Beta one\\newpage Beta two\\newpage Beta three")
+        rc, o = run("file", a, "--project", "Box", "--title", "Alpha doc")
+        ok("a new project with no kind is refused, nothing filed", rc == 2 and not os.path.exists(regpath()))
+        run("file", a, "--project", "Box", "--kind", "work", "--title", "Alpha doc")
+        rc, o = run("file", b, "--project", "Box", "--title", "Beta doc")
+        run("file", b, "--project", "Course X", "--kind", "course", "--title", "Beta doc")
+        run("file", a, "--project", "Kid", "--member", "kid1", "--title", "Alpha doc")
+        reg = load()
+        ok("the first work project is 001, its documents 001-0001 then 001-0002",
+           sorted(n for n, d in reg["documents"].items() if d["project"] == "001") == ["001-0001", "001-0002"])
+        ok("a course project starts at 101, a member project at 901",
+           reg["projects"]["101"]["name"] == "Course X" and reg["projects"]["901"]["member"] == "kid1")
+        ok("a member document is visible to that member and the owner, an owner document to the owner only",
+           reg["documents"]["901-0001"]["visibility"] == ["owner", wid] and reg["documents"]["001-0001"]["visibility"] == ["owner"])
+        v = os.path.join(ROOT, "ws", wid)
+        with open(os.path.join(v, "register.json")) as fh:
+            view = json.load(fh)
+        vf = os.path.join(v, view["documents"]["901-0001"]["revisions"][0]["file"])
+        ok("the member's view holds its own document and project and none of the owner's",
+           list(view["documents"]) == ["901-0001"] and list(view["projects"]) == ["901"])
+        ok("the view's file is the filed copy, linked and not copied",
+           os.path.samefile(vf, os.path.join(ROOT, reg["documents"]["901-0001"]["revisions"][0]["file"])))
+        owner_root, ROOT = ROOT, v
+        rc, o = run("find", "alpha")
+        rc2, o2 = run("find", "001-0001")
+        ROOT = owner_root
+        ok("find inside the view finds the member's document and not the owner's",
+           rc == 0 and o.strip() == vf and rc2 == 1)
+        ok("no view is made for the owner's documents alone", sorted(os.listdir(os.path.join(ROOT, "ws"))) == [wid])
+        f = os.path.join(ROOT, reg["documents"]["001-0002"]["revisions"][0]["file"])
+        ok("the filed copy is named PPP-NNNN-R_slug.pdf, read-only", os.path.basename(f) == "001-0002-A_beta-doc.pdf"
+           and (os.geteuid() == 0 or not os.access(f, os.W_OK)))
+        ok("an unstamped PDF gets the stamp overlaid on every page, and the original is left alone",
+           "001-0002-A" not in pdftext(b) and pages(f) == 3 and pdftext(f).count("001-0002-A · ") == 3)
+        # revisions: a register of its own
+        ROOT = os.path.join(t, "r2")
+        v1 = mkpdf(src, "v1", "Gamma first version")
+        v2 = mkpdf(src, "v2", "Gamma second version")
+        tex = os.path.join(src, "gamma.tex")
+        run("file", v1, "--project", "Box", "--kind", "work", "--title", "Gamma", "--source", tex)
+        rc, o = run("file", v1, "--project", "Box", "--title", "Gamma", "--source", tex)
+        d = load()["documents"]["001-0001"]
+        ok("the same content again files nothing and names the current revision",
+           rc == 0 and "unchanged" in o and "001-0001-A" in o and len(d["revisions"]) == 1)
+        rc, o = run("file", v2, "--project", "Box", "--title", "Gamma renamed", "--source", tex)
+        d = load()["documents"]["001-0001"]
+        ok("changed content from the same source is the next letter of the same number",
+           rc == 0 and "001-0001-B" in o and [r["rev"] for r in d["revisions"]] == ["A", "B"] and len(load()["documents"]) == 1)
+        ok("revision A's file is kept and not rewritten", os.path.isfile(os.path.join(ROOT, d["revisions"][0]["file"]))
+           and "Gamma first" in pdftext(os.path.join(ROOT, d["revisions"][0]["file"])))
+        rc, o = run("file", v1, "--project", "Box", "--title", "Gamma renamed")
+        ok("the same title with no source is the same document too (C, not a new number)",
+           "001-0001-C" in o and len(load()["documents"]) == 1)
+        # figures: a register of its own; same words, a different drawing
+        ROOT = os.path.join(t, "r2b")
+        f1 = mkpdf(src, "f1", "Delta schematic\\par\\rule{2cm}{1cm}")
+        f2 = mkpdf(src, "f2", "Delta schematic\\par\\rule{6cm}{3cm}")
+        run("file", f1, "--project", "Box", "--kind", "work", "--title", "Delta")
+        rc, o = run("file", f1, "--project", "Box", "--title", "Delta")
+        ok("the same drawing again files nothing", rc == 0 and "unchanged" in o)
+        rc, o = run("file", f2, "--project", "Box", "--title", "Delta")
+        ok("the same text with a different drawing is the next letter",
+           rc == 0 and "001-0001-B" in o and pdftext(f1) == pdftext(f2))
+        reg = load()
+        reg["documents"]["001-0001"]["revisions"][-1]["fingerprint"] = textprint(pdftext(f2))
+        save(reg)
+        rc, o = run("file", f2, "--project", "Box", "--title", "Delta")
+        ok("a revision filed with the old text-only print is unchanged on an unchanged rebuild",
+           rc == 0 and "unchanged" in o and len(load()["documents"]["001-0001"]["revisions"]) == 2)
+        rc, o = run("file", mkpdf(src, "f3", "Delta schematic rev\\par\\rule{6cm}{3cm}"), "--project", "Box", "--title", "Delta")
+        ok("changed text still bumps the letter past a text-only print", rc == 0 and "001-0001-C" in o)
+        ROOT = os.path.join(t, "r2")
+        # a build that took its number
+        rc, o = run("number", "--project", "Box", "--title", "Gamma renamed", "--tex")
+        ok("number --tex gives a changed build the next letter as TeX macros",
+           rc == 0 and o.startswith("\\def\\docnumber{001-0001-D}") and "\\docstamp{001-0001-D · " in o)
+        w = mkpdf(src, "w", "Gamma fourth 001-0001-D")
+        rc, o = run("file", w, "--project", "Box", "--title", "Gamma renamed")
+        d = load()["documents"]["001-0001"]
+        ok("a PDF carrying its own number is filed as it is, not stamped twice",
+           rc == 0 and d["revisions"][-1]["stamped"] == "carried" and pdftext(os.path.join(ROOT, d["revisions"][-1]["file"])).count("001-0001-D") == 1)
+        x = mkpdf(src, "x", "Gamma fifth 001-0001-B")
+        rc, o = run("file", x, "--project", "Box", "--title", "Gamma renamed")
+        ok("a PDF carrying another number is refused", rc == 2 and "001-0001-B" in o and len(load()["documents"]["001-0001"]["revisions"]) == 4)
+        rc, o = run("file", v2, "--project", "Box", "--title", "Resume", "--no-stamp")
+        rc2, o2 = run("file", v1, "--project", "Box", "--title", "Resume")
+        rv = load()["documents"]["001-0002"]["revisions"]
+        ok("--no-stamp files the bytes as they are, and the document's later revisions stay unstamped",
+           [r["stamped"] for r in rv] == ["none", "none"] and "001-0002" not in pdftext(os.path.join(ROOT, rv[1]["file"])))
+        # find
+        rc, o = run("find", "001-0001")
+        ok("find by number prints the current revision's file", rc == 0 and o.strip().endswith("001-0001-D_gamma-renamed.pdf"))
+        rc, o = run("find", "001-0001-A")
+        ok("find by number and letter prints that revision", rc == 0 and o.strip().endswith("001-0001-A_gamma.pdf"))
+        rc, o = run("find", "gamma")
+        ok("find by a word of the title", rc == 0 and "001-0001-D" in o)
+        rc, o = run("find", "zeta")
+        ok("find with no match exits 1", rc == 1)
+        rc, o = run("find", "box")
+        ok("an ambiguous find lists the candidates and exits 3", rc == 3 and "001-0001-D" in o and "001-0002-B" in o)
+        rc, o = run("find", "001-0009")
+        ok("an unknown number is no match", rc == 1)
+        # projects at the scheme's numbers
+        ROOT = os.path.join(t, "r3")
+        run("project", "Chip", "--number", "004")
+        rc, o = run("project", "Other", "--number", "004")
+        ok("project --number keeps a number for a named project and refuses to reuse it",
+           load()["projects"]["004"]["kind"] == "work" and rc == 2)
+        rc, o = run("project", "Tools", "--kind", "work")
+        ok("the next work project takes the first free number", o.startswith("001\t"))
+        rc, o = run("project", "Kid2", "--kind", "member")
+        ok("a member project with no member is refused", rc == 2 and "Kid2" not in json.dumps(load()))
+        rc, o = run("project", "Kid3", "--member", "nobody")
+        ok("a member with no workspace id is refused", rc == 2 and "workspace id" in o and "Kid3" not in json.dumps(load()))
+    print(f"cc-docs selfcheck: {n[0]} passed, {n[1]} failed")
+    return 1 if n[1] else 0
+
+
+def main(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="cc-docs", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("file", "number"):
+        p = sub.add_parser(name)
+        if name == "file":
+            p.add_argument("pdf")
+            p.add_argument("--no-stamp", action="store_true")
+            p.add_argument("--date")
+        else:
+            p.add_argument("--tex", action="store_true")
+        p.add_argument("--project", required=True)
+        p.add_argument("--title", required=True)
+        p.add_argument("--source")
+        p.add_argument("--kind", choices=sorted(RANGES))
+        p.add_argument("--member")
+    p = sub.add_parser("project")
+    p.add_argument("name")
+    p.add_argument("--number")
+    p.add_argument("--kind", choices=sorted(RANGES))
+    p.add_argument("--member")
+    p = sub.add_parser("find")
+    p.add_argument("query", nargs="+")
+    p = sub.add_parser("list")
+    p.add_argument("--project")
+    sub.add_parser("selfcheck")
+    a = ap.parse_args(argv)
+    if a.cmd == "selfcheck":
+        return selfcheck()
+    try:
+        return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list}[a.cmd](a)
+    except Refused as e:
+        print(f"cc-docs: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

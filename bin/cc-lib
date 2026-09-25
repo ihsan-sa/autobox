@@ -121,7 +121,11 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
               failures/reports/<claim>.md (the investigation's report, a doc). The ledger stays the only writer; the
               library keeps no count of its own. `ask --object c-…|f-…|i-…` finds the records naming a cluster, a
               record or a claim id.
-  live        ~/.cc/state/tier.log (cc-tier set's `<utc> <old> -> <new>` lines) — read from the file by `ask` when the
+  documents   ~/.cc/documents/register.json (cc-docs' register): one record per document with a filed revision
+              (kind document), titled `<PPP-NNNN-R> <title>`, the current revision's file in its text; the number and
+              every revision's full number are exact ids. Owner-only: a member's documents are indexed here and not in
+              that member's workspace index.
+  live      ~/.cc/state/tier.log (cc-tier set's `<utc> <old> -> <new>` lines) — read from the file by `ask` when the
               question names the tier, never indexed: the question is what it holds now
   per repo    REPO_SOURCES: patterns registered for ONE repo by name, never as a global glob (a second repo with the same
               files is not read). For `lessons`, under <tree>/lessons/<course>/: COURSE.md and STUDY.md (one record
@@ -455,6 +459,7 @@ def registry():
         add(p, "failures", "" if b == "claims" else b)
     for p in sorted(glob.glob(os.path.join(fl, "reports", "*.md"))):
         add(p, "doc")
+    add(os.path.join(H, ".cc", "documents", "register.json"), "docs")   # cc-docs' register: a document by number or title
     return srcs
 
 
@@ -583,6 +588,30 @@ def parse_board(path, text, repo):
         tr = e.get("track", "")
         recs.append(dict(kind="event", title=f"log {tr}", ts=e.get("ts", ""), text=f"log {e.get('ts', '')} {tr}: {e.get('msg', '')}",
                          span=f"log/{i}", part=0, track=tr, extra_ids={tr} if tr else set()))
+    return recs
+
+
+def parse_docs(path, text):
+    """cc-docs' register: one record per document, its numbers exact ids, the current revision's file in the text."""
+    d = json.loads(text)
+    projects = d.get("projects") or {}
+    recs = []
+    for num, doc in sorted((d.get("documents") or {}).items()):
+        revs = [r for r in doc.get("revisions") or [] if isinstance(r, dict)] if isinstance(doc, dict) else []
+        if not revs:
+            continue
+        cur = revs[-1]
+        proj = projects.get(doc.get("project"), {}).get("name", "")
+        full = f"{num}-{cur.get('rev', '')}"
+        lines = [f"document {full} {doc.get('title', '')}",
+                 f"project {doc.get('project', '')} {proj}; revisions {', '.join(r.get('rev', '') for r in revs)}; "
+                 f"visible to the owner{' and member ' + doc['member'] if doc.get('member') else ''}",
+                 f"file {os.path.join(os.path.dirname(path), cur.get('file', ''))} (filed {cur.get('date', '')})"]
+        if doc.get("source"):
+            lines.append(f"source {doc['source']}")
+        recs.append(dict(kind="document", title=f"{full} {doc.get('title', '')}", ts=cur.get("filed_at") or cur.get("date", ""),
+                         text="\n".join(lines), span=f"documents/{num}", part=0, track="",
+                         extra_ids={num} | {f"{num}-{r.get('rev', '')}" for r in revs}))
     return recs
 
 
@@ -797,6 +826,8 @@ def parse(path, skind, repo, track, rows):
         return parse_failures(path, text, repo)
     if skind == "slack":
         return parse_slack(path, text)
+    if skind == "docs":
+        return parse_docs(path, text)
     return []
 
 
@@ -2426,6 +2457,7 @@ def selfcheck():
         selfcheck_live(th, ok, run, w)
         selfcheck_workspaces(th, ok, run, w)
         selfcheck_lessons(th, ok, run, w)
+        selfcheck_docs(th, ok, run, w)
     finally:
         H = H0
         shutil.rmtree(th, ignore_errors=True)
@@ -2863,6 +2895,24 @@ def selfcheck_workspaces(th, ok, run, w):
        and "scope=index.sqlite" in so)
     rc, o = run("ask", "--need", "history", f"{K}-wsa-journal")
     ok("…and the owner's aggregate now names it ws=wsz, with no record left under the old handle", " ws=wsz" in o and " ws=wsa" not in o)
+
+
+def selfcheck_docs(th, ok, run, w):
+    """cc-docs' register is a source: a document is found by its title and by its number, and one with no filed
+    revision is not a record."""
+    w(".cc/documents/register.json", json.dumps({"version": 1, "projects": {"001": {"name": "Box", "kind": "work"}}, "documents": {
+        "001-0004": {"number": "001-0004", "project": "001", "title": "Quokka field explanation", "visibility": ["owner"],
+                    "revisions": [{"rev": "A", "file": "files/001/001-0004-A_quokka-field-explanation.pdf", "date": "2026-09-20"},
+                                  {"rev": "B", "file": "files/001/001-0004-B_quokka-field-explanation.pdf", "date": "2026-09-24"}]},
+        "001-0005": {"number": "001-0005", "project": "001", "title": "Wombat never filed", "revisions": []}}}))
+    run("index")
+    rc, o = run("ask", "--need", "current", "quokka field explanation")
+    ok("docs: a filed document is found by its title, with its current revision's file",
+       "001-0004-B" in o and "001-0004-B_quokka-field-explanation.pdf" in o)
+    rc, o = run("ask", "--need", "current", "document 001-0004")
+    ok("docs: a filed document is found by its number", "001-0004-B_quokka-field-explanation.pdf" in o)
+    rc, o = run("ask", "--need", "current", "wombat never filed")
+    ok("docs: a document with no filed revision is not a record", "001-0005" not in o)
 
 
 def selfcheck_lessons(th, ok, run, w):
