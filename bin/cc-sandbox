@@ -51,6 +51,10 @@
 #     wizard and asked to sign in on every start. The flags are generated here from no value of his; his file is read for its
 #     `projects` alone, filtered as before, and is never written · the box's shared skills (cc-skills names), ro, each at
 #     ~/.claude/skills/<name> over the member's own dir (skills_bind); the rest of the host's ~/.claude/skills stays out.
+#     An ALIAS among them (cc-skills' config/skills.list) binds ro at its own name too, from the RESOLVED path a second
+#     realpath check puts strictly inside another listed clone — never trusting cc-skills' own filtering twice over
+#     (skills_bind) · ~/.cc/toolchains, ro, WHEN IT IS THE HOST'S OWN: a real directory, owned by the user this script
+#     itself runs as, closed to any other write (toolchains_bind) — nothing else of ~/.cc comes with it.
 #     The environment is CLEARED and rebuilt
 #     (HOME, PATH, TERM, LANG…, CC_MEMBER_SANDBOX=1, CC_ROLE=member, git identity = the handle). ABSENT: every other ~/dev/*, ~/.cc/config,
 #     ~/.ssh, ~/.config, ~/.gitconfig, ~/.npmrc, the ledger (~/.cc/state/member-spend.json), other boards, the docker and tmux sockets
@@ -133,7 +137,9 @@
 #   contained here and this does not claim to contain it: it is contained when stage 1b (ccbox, an allowlist proxy)
 #   exists. His file is read, never written, and never edited by this box — the paragraph at SBX_ALLOW says why each
 #   way round. DENIED in there: the Artifact tool (SBX_DENY), added to his deny even when his file lacks it.
-# INSIDE ro: the box's shared skills, one ~/.claude/skills/<name> each (skills_bind) · ~/bin and the bin it links into · ~/mail (core/mail, the target of ~/bin/cc-mail) · ~/WRITING.md (core/docs/WRITING.md, the guide the writing block names) · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
+# INSIDE ro: the box's shared skills, one ~/.claude/skills/<name> each, an ALIAS'S OWN NAME included, from its RESOLVED
+#   path (skills_bind) · ~/.cc/toolchains, when it is a real directory owned by the user this script runs as and closed
+#   to any other write (toolchains_bind) — nothing else of ~/.cc with it · ~/bin and the bin it links into · ~/mail (core/mail, the target of ~/bin/cc-mail) · ~/WRITING.md (core/docs/WRITING.md, the guide the writing block names) · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
 #   · ~/.cc/github-deny and ~/.cc/github-deny.gitconfig when the host has them (the GitHub orgs the box may not touch: cc-github-deny)
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
 #   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
@@ -466,6 +472,7 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   for f in "$H"/.cc/members/*/board; do [ -d "$f" ] && B+=(--ro-bind "$f" "$f"); done   # ~/.cc/boards/<h>.json is a link in here (board_dir): ro, it resolves, and a worker writes no member's board
   settings_bind "$H/.cc/sandbox/$1/$2"   # ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside
   skills_bind   # the box's shared skills, ro, one per name (skills_bind); ~/.claude is a tmpfs here, so no member name is in the way
+  toolchains_bind   # ~/.cc/toolchains, ro, when it is the host's own and closed to every other writer (toolchains_bind)
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
   [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
   [ -f "$(dirname "$cb")/docs/WRITING.md" ] && B+=(--ro-bind "$(dirname "$cb")/docs/WRITING.md" "$H/WRITING.md")   # the guide the worker's prompt tells it to open: one published file, ro
@@ -628,16 +635,65 @@ skills_bind(){   # [$1 the host dir the member's ~/.claude/skills is, for a memb
   # member left at ~/.claude/skills or at a skill's name there skips that skill with one line (bwrap would otherwise die
   # on it, and a bind dest is not resolved through a link, see build_member's worktrees loop): the launch goes on. The
   # host never makes a directory through that name; bwrap makes the mountpoint inside the namespace.
-  local md="${1:-}" nm src
-  [ -x "$(dirname "$SELF")/cc-skills" ] || return 0
+  # AN ALIAS (config/skills.list's `<name> -> <clone>/<path...>`, cc-skills' own header) is a symlink at $src rather
+  # than a plain clone. Its candidacy comes from `cc-skills names`, same as a plain skill's — but its VALIDITY is
+  # decided HERE, not carried from there: names already applies this same test and would leave a bad one out, but a
+  # bad one is still a live symlink cc-skills' own sync put on disk (mechanical only, by its own rule), so EVERY
+  # symlink directly under ~/.claude/skills is a candidate too, named or not by `names`, and gets this same check —
+  # or a bad line would sit there refused by nobody, just quietly absent, with cc-skills' filtering the only thing
+  # that ever looked at it. realpath -e washes out every `..` and every symlink the target crosses, including one
+  # planted INSIDE the clone that points out (measured the same way lib_bind and rs_fold read a name under a tree
+  # someone else writes); what is left has to sit strictly inside ANOTHER name `cc-skills list` carries as a managed
+  # clone (`list`, not `names`: a clone that is nothing but a container for sub-skills — chip-flow, say — has no
+  # SKILL.md of its own and `names` leaves it out, but it is still a clone the list names and a legitimate thing to
+  # alias into), and that name has to be a plain directory itself — never a second alias, so there is no chain to
+  # walk. Anything else is refused, one stderr line, and never bound; the RESOLVED path is what gets pinned, at the
+  # alias's own name, so the mount inside is ~/.claude/skills/<alias> exactly where a skill's own would be.
+  local md="${1:-}" nm src cb names clones cand resolved c creal ok
+  cb="$(dirname "$SELF")/cc-skills"
+  [ -x "$cb" ] || return 0
   if [ -n "$md" ] && [ -L "$md" ]; then echo "cc-sandbox: ~/.claude/skills in this workspace is a symlink — none of the box's shared skills are bound" >&2; return 0; fi
+  names=$("$cb" names 2>/dev/null)
+  clones=$("$cb" list 2>/dev/null | awk -F'\t' '$4 ~ /^at /{print $1}')
+  cand=$(sort -u <<<"$(printf '%s\n' "$names"; find "$H/.claude/skills" -maxdepth 1 -type l -printf '%f\n' 2>/dev/null)")
   while IFS= read -r nm; do
     [[ "$nm" =~ ^[a-z0-9][a-z0-9._-]*$ ]] && [ "$nm" != synced ] || continue
     src="$H/.claude/skills/$nm"
     if [ -n "$md" ] && { [ -L "$md/$nm" ] || { [ -e "$md/$nm" ] && [ ! -d "$md/$nm" ]; }; }; then
       echo "cc-sandbox: ~/.claude/skills/$nm in this workspace is not a plain directory — the box's skill $nm is not bound" >&2; continue; fi
+    if [ -L "$src" ]; then
+      resolved=$(realpath -e "$src" 2>/dev/null) && [ -d "$resolved" ] || {
+        echo "cc-sandbox: ~/.claude/skills/$nm's alias target does not resolve to a directory — not bound" >&2; continue; }
+      ok=""
+      while IFS= read -r c; do
+        [ "$c" = "$nm" ] && continue
+        creal="$H/.claude/skills/$c"
+        [ -d "$creal" ] && [ ! -L "$creal" ] || continue
+        creal=$(realpath -e "$creal" 2>/dev/null) || continue
+        case "$resolved" in "$creal"|"$creal"/*) ok=1; break;; esac
+      done <<<"$clones"
+      if [ -z "$ok" ]; then
+        echo "cc-sandbox: ~/.claude/skills/$nm's alias target does not resolve inside a clone this box's skill list names — not bound" >&2; continue; fi
+      pin --ro-bind "$resolved" "$src" || echo "cc-sandbox: ~/.claude/skills/$nm's alias target is not the path it should be — not bound" >&2
+      continue
+    fi
     pin --ro-bind "$src" || echo "cc-sandbox: ~/.claude/skills/$nm on the host is not a plain directory — not bound" >&2
-  done < <("$(dirname "$SELF")/cc-skills" names 2>/dev/null); :; }
+  done <<<"$cand"; :; }
+toolchains_bind(){   # ~/.cc/toolchains, RO, INTO BOTH BOUNDARIES — nothing else of ~/.cc comes with it. ONE bind line,
+  # reviewable, and the checks in front of it are what make it safe to write: a real directory (not a symlink — the
+  # same trap a skill's own name refuses, skills_bind above), owned by the user THIS SCRIPT runs as — never a worker's
+  # or a member's, which this process is not — and closed to any other write, group or world. A directory a second
+  # party could write is a directory that party could point a build at anything through, so an unsafe one is left
+  # unbound rather than trusted, one stderr line; missing is the ordinary case and says nothing. Pinned like every
+  # source (pin): the checks below are a name test, and pin's own descriptor read is what actually cannot be raced.
+  local t="$H/.cc/toolchains" own perm
+  [ -e "$t" ] || [ -L "$t" ] || return 0
+  if [ -L "$t" ] || [ ! -d "$t" ]; then echo "cc-sandbox: ~/.cc/toolchains is not a plain directory — not bound" >&2; return 0; fi
+  own=$(stat -c '%u' "$t" 2>/dev/null) || { echo "cc-sandbox: ~/.cc/toolchains could not be read — not bound" >&2; return 0; }
+  if [ "$own" != "$(id -u)" ]; then echo "cc-sandbox: ~/.cc/toolchains is not owned by $(id -un) — not bound" >&2; return 0; fi
+  perm=$(stat -c '%a' "$t" 2>/dev/null) || { echo "cc-sandbox: ~/.cc/toolchains could not be read — not bound" >&2; return 0; }
+  if [ $(( 8#$perm & 0022 )) -ne 0 ]; then echo "cc-sandbox: ~/.cc/toolchains is group- or world-writable — not bound" >&2; return 0; fi
+  pin --ro-bind "$t" || echo "cc-sandbox: ~/.cc/toolchains is not the path it should be — not bound" >&2; }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
   local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own mailsrc
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
@@ -747,6 +803,7 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   lib_bind "$h"   # the knowledge library: this workspace's own index file, ro, and none of the rest of it (lib_bind)
   gh_bind "$h"   # …and a workspace GRANTED a GitHub token holds it inside (gh_bind); the grant is in $m too, and no marker
   skills_bind "$m/claude/skills"   # the box's shared skills, ro, after the ~/.claude bind they sit in (skills_bind)
+  toolchains_bind   # ~/.cc/toolchains, ro, when it is the host's own and closed to every other writer (toolchains_bind)
   [ -d "$H/.local/share/claude" ] && B+=(--ro-bind "$H/.local/share/claude" "$H/.local/share/claude")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
   # the GitHub orgs the box may not touch — the list and its git include, ro: read by the gh shim in ~/bin, by cc-guard
@@ -1044,7 +1101,7 @@ race_swap(){   # $1 a launch's pid · $2 the source it pins NEXT after the swapp
   case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in ''|*bwrap*) echo late;; *) echo swapped;; esac; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
-  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i pl tmp tree mailrec wid sw lp of
+  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i pl tmp tree mailrec wid ccw tcsafe sw lp of
   cb=$(dirname "$SELF")   # the host side of every board case below: THIS tree's cc-board, which resolves a linked board before it renames
   dev="$H/dev/$h"; mkdir -p "$dev/.cc" "$H/dev/$o" "$H/.cc/state/$o" "$H/.cc/state/$h" || return 1
   : > "$dev/.cc/member-workspace"; : > "$dev/.cc/member-facing"; echo x > "$H/dev/$o/secret"; echo '{}' > "$H/.cc/boards/$o.json"
@@ -1104,7 +1161,10 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   mcpw="cc-slack,"; [ -f "$H/.cc/slack/enabled" ] || mcpw=","
   t 'member: another repo is ABSENT' "$(g other)" absent;  t 'member: the control repo path is ABSENT' "$(g ctl)" absent
   ccw="boards library slack state worktrees"; [ -f "$H/.cc/github-deny" ] && ccw="boards github-deny$([ -f "$H/.cc/github-deny.gitconfig" ] && echo ' github-deny.gitconfig') library slack state worktrees"   # the org deny list and its include ride along, ro, when the host has them
-  t 'member: ~/dev holds the workspace alone' "$(g devls)" "$h";  t 'member: ~/.cc holds boards, library, slack, state, worktrees (and the org deny list when the host has one) and nothing else' "$(g ccls)" "$ccw"
+  tcsafe=""; [ -d "$H/.cc/toolchains" ] && [ ! -L "$H/.cc/toolchains" ] && [ "$(stat -c %u "$H/.cc/toolchains" 2>/dev/null)" = "$(id -u)" ] \
+    && [ $(( 8#$(stat -c %a "$H/.cc/toolchains" 2>/dev/null || echo 777) & 0022 )) -eq 0 ] && tcsafe=1   # toolchains_bind's own test, mirrored: it rides along too, ro, exactly when the host's copy passes it
+  [ -n "$tcsafe" ] && ccw="${ccw% worktrees} toolchains worktrees"
+  t 'member: ~/dev holds the workspace alone' "$(g devls)" "$h";  t 'member: ~/.cc holds boards, library, slack, state, worktrees (and the org deny list, and toolchains, when the host has them) and nothing else' "$(g ccls)" "$ccw"
   t 'member: ~/.cc/config absent' "$(g ccconfig)" absent
   # The app key is org admin: it pushes AND creates repositories. A workspace is member-facing, so whoever is
   # in its channel would hold anything it holds — the key stays outside, and this proves it on its own fixture.
@@ -1769,7 +1829,7 @@ selfcheck_skills(){   # THE BOX'S SHARED SKILLS (skills_bind), in a HOME of its 
   # upstream, one member workspace and one worker track. Inside each: the skill is readable and nothing writes it; the
   # host's other skills and its git config are absent; a pull on the host is what the next launch reads; and a link a member
   # planted at the skill's name skips that skill without following it or stopping the launch.
-  local fh h dev m up out rc probe wt sk
+  local fh h dev m up up2 out rc probe probe2 wt sk
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxsk-XXXXXX") || return 1; chmod 700 "$fh"
   h="ccsbxs$$"; dev="$fh/dev/$h"; m="$fh/.cc/members/$h"; up="$fh/up/fx-skill"; sk="$fh/.claude/skills"
   mkdir -p "$dev/.cc" "$fh/bin" "$fh/.local/bin" "$fh/.cc/boards" "$m/claude/skills/synced/theirs" "$up" "$sk/synced/own" "$sk/handmade" || return 1
@@ -1811,6 +1871,27 @@ selfcheck_skills(){   # THE BOX'S SHARED SKILLS (skills_bind), in a HOME of its 
   out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- sh -c "$probe" 2>&1)
   t 'skills: a worker reads it too, ro, and cannot write it, and the hand-made one stays out (its ~/.gitconfig is the owner'"'"'s, as before)' \
     "$(g read)/$(g mnt)/$(g append)/$(g create)/$(g handmade)" v2/ro/refused/refused/absent
+  # AN ALIAS (config/skills.list's `<name> -> <clone>/<path...>`): a second clone holding a sub-skill, and a symlink
+  # planted inside that clone pointing out — skills_bind has to catch that itself, never trusting cc-skills' own
+  # filtering (names) twice over
+  up2="$fh/up/fx-clone"; mkdir -p "$up2/skills/vde"
+  printf -- '---\nname: vde\n---\nav\n' > "$up2/skills/vde/SKILL.md"; ln -s /etc "$up2/skills/escape"
+  git -C "$up2" init -q -b main && git -C "$up2" -c user.name=t -c user.email=t@t add -A \
+    && git -C "$up2" -c user.name=t -c user.email=t@t commit -qm v1 || return 1
+  printf 'fx-skill %s\nhandmade %s\nfx-clone %s\nvde -> fx-clone/skills/vde\nescaped -> fx-clone/skills/escape\n' "$up" "$up" "$up2" > "$fh/list"
+  env HOME="$fh" "$(dirname "$SELF")/cc-skills" sync >/dev/null 2>&1
+  probe2='s=~/.claude/skills; echo read=$(tail -1 $s/vde/SKILL.md 2>/dev/null)
+    echo write=$( (echo x >> $s/vde/SKILL.md) 2>/dev/null && echo wrote || echo refused)
+    echo mnt=$(awk "\$5 ~ /skills\\/vde\$/ {split(\$6, o, \",\"); print o[1]}" /proc/self/mountinfo | head -1)
+    echo escaped=$([ -e $s/escaped ] && echo present || echo absent)'
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe2" 2>&1)
+  t 'skills: a valid alias reads its target'"'"'s content, ro, at the alias'"'"'s own name' "$(g read)/$(g mnt)" av/ro
+  t 'skills: …and cannot write it' "$(g write)" refused
+  t 'skills: an alias whose target escapes its clone (a symlink to /etc inside the clone) is refused, one line, and not bound' \
+    "$(g escaped)/$(grep -c 'does not resolve inside a clone' <<<"$out")" absent/1
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- sh -c "$probe2" 2>&1)
+  t 'skills: a worker gets the same alias, ro, and the same escape refusal' \
+    "$(g read)/$(g mnt)/$(g escaped)/$(grep -c 'does not resolve inside a clone' <<<"$out")" av/ro/absent/1
   # the member plants a link at the skill's name, aimed at a host dir: the skill is skipped, the link not followed, the launch runs
   mkdir -p "$fh/target"; rm -rf "$m/claude/skills/fx-skill"; ln -s "$fh/target" "$m/claude/skills/fx-skill"
   out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'echo RAN=yes' 2>&1); rc=$?
@@ -1821,6 +1902,49 @@ selfcheck_skills(){   # THE BOX'S SHARED SKILLS (skills_bind), in a HOME of its 
   t 'skills: …and a link at ~/.claude/skills itself binds none, and nothing is made through it on the host' \
     "$rc/$(g RAN)/$(grep -c 'is a symlink — none of' <<<"$out")/$(ls -A "$fh/target" | wc -l)" 0/yes/1/0
   unset CC_SKILLS_LIST CC_SKILLS_NOTIFY
+  git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
+selfcheck_toolchains(){   # ~/.cc/toolchains (toolchains_bind), in a HOME of its own: bound ro into both boundaries when it
+  # is a real directory, owned by the user this runs as, and closed to any other write; refused, one line, and never
+  # bound otherwise — missing, a symlink, group- or world-writable, and (root available) owned by someone else.
+  local fh h dev m out wt tc probe
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxtc-XXXXXX") || return 1; chmod 700 "$fh"
+  h="ccsbxtc$$"; dev="$fh/dev/$h"; m="$fh/.cc/members/$h"; tc="$fh/.cc/toolchains"
+  mkdir -p "$dev/.cc" "$fh/bin" "$fh/.local/bin" "$fh/.cc/boards" "$m/claude" || return 1
+  : > "$dev/.cc/member-workspace"
+  { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  git -C "$dev" init -q -b main >/dev/null 2>&1
+  jq -n '{claudeAiOauth: {accessToken: "sk-access", expiresAt: 99999999999999}}' > "$m/credentials.json"
+  wt="$fh/.cc/worktrees/r/t"; mkdir -p "$fh/dev/r" "$fh/.cc/worktrees/r" || return 1
+  git -C "$fh/dev/r" init -q -b main && git -C "$fh/dev/r" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+    && git -C "$fh/dev/r" worktree add -q -b track/t "$wt" >/dev/null 2>&1 || return 1
+  probe='e(){ [ -e "$1" ] && echo present || echo absent; }
+    echo dir=$(e ~/.cc/toolchains); echo read=$(cat ~/.cc/toolchains/marker 2>/dev/null)
+    echo write=$( (echo x > ~/.cc/toolchains/planted) 2>/dev/null && echo wrote || echo refused)
+    echo mnt=$(awk "\$5 ~ /toolchains\$/ {split(\$6, o, \",\"); print o[1]}" /proc/self/mountinfo | head -1)'
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'toolchains: missing is the ordinary case — no bind and nothing said' "$(g dir)/$(grep -c toolchains <<<"$out")" absent/0
+  mkdir -p "$tc"; chmod 755 "$tc"; echo hi > "$tc/marker"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'toolchains: a real directory owned by this user and closed to others is bound ro into a member, and cannot be written' \
+    "$(g dir)/$(g read)/$(g write)/$(g mnt)" present/hi/refused/ro
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" r t -- sh -c "$probe" 2>&1)
+  t 'toolchains: …and into a worker, the same way' "$(g dir)/$(g read)/$(g write)/$(g mnt)" present/hi/refused/ro
+  chmod 775 "$tc"; out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'toolchains: group-writable is refused, one line, and not bound' "$(g dir)/$(grep -c 'group- or world-writable' <<<"$out")" absent/1
+  chmod 757 "$tc"; out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'toolchains: …and so is world-writable' "$(g dir)/$(grep -c 'group- or world-writable' <<<"$out")" absent/1
+  chmod 755 "$tc"
+  rm -rf "$tc"; mkdir -p "$fh/tcreal"; ln -s "$fh/tcreal" "$tc"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'toolchains: a symlink at the name is refused, one line, not bound, and not followed' \
+    "$(g dir)/$(grep -c 'not a plain directory' <<<"$out")" absent/1
+  rm -f "$tc"; mkdir -p "$tc"; chmod 755 "$tc"; echo hi > "$tc/marker"
+  if sudo -n true 2>/dev/null && sudo -n chown 0:0 "$tc" 2>/dev/null; then
+    out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+    t 'toolchains: owned by someone else (root, here) is refused, one line, and not bound' \
+      "$(g dir)/$(grep -c 'is not owned by' <<<"$out")" absent/1
+    sudo -n chown "$(id -u):$(id -g)" "$tc" 2>/dev/null
+  fi
   git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
 selfcheck_vet(){   # THE BOX'S OWN BOUNDARY, driven for real: what is inside it, what cannot be reached from it, and that
   # there is no way of being outside it. The last one is the case with a history — every other profile here has an
@@ -2192,7 +2316,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # --help prints the header and exits 0 — it used to reach the positional parse and die with `line 2079: 2: track`
   out=$("$SELF" --help 2>&1); rc=$?; t '--help exits 0 and prints the usage header' "$rc/$(head -1 <<<"$out" | cut -c1-10)/$(grep -c 'track$' <<<"$out")" '0/cc-sandbox/0'
   out=$("$SELF" -h 2>&1 | grep -c 'cc-sandbox member <handle>'); t '-h is the same header' "$([ "${out:-0}" -ge 1 ] && echo yes)" yes
-  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_skills; selfcheck_vet
+  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_skills; selfcheck_toolchains; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
   "$BIN/cc-member-v2" selfcheck; t 'v2 cases' "$?" 0

@@ -14,6 +14,12 @@
 #   clone: sync copies the dir to ~/.claude/skills/<name> whole, with a `.cc-skills-tree` file inside naming the
 #   source, and copies it again whenever the two differ. A dir that is absolute, climbs out with `..` or is not there
 #   is refused, and a directory at the name that is not that copy is left alone, as for a clone.
+# AN ALIAS LINE reads `<name> -> <clone>/<path...>` in place of a url — `vde -> chip-flow/skills/vde` means
+#   ~/.claude/skills/vde is the directory skills/vde inside the listed clone ~/.claude/skills/chip-flow. sync only
+#   ever keeps the symlink's text matching the line; names prints the name and cc-sandbox's skills_bind binds it,
+#   each doing its own realpath check first — the target has to resolve into a directory strictly inside another
+#   line's own clone, no `..` and no symlink escaping it, or the line is refused with one stderr line and never
+#   listed or bound. The same name rules apply as any other line, synced included.
 # WHERE: each skill is a plain clone at ~/.claude/skills/<name>, where every host session finds it. The name `synced`
 #   belongs to the account's own sync and is never taken; a directory at a listed name that is not a clone of that url
 #   (a skill someone made by hand) is left alone and reported. A new clone is made beside it under a dot name and
@@ -34,13 +40,15 @@ NOTIFY="${CC_SKILLS_NOTIFY:-$(dirname "$SELF")/cc-notify}"
 export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false
 TO="${CC_SKILLS_TIMEOUT:-120}"
 
-# name<TAB>url<TAB>branch for each well-formed line; a bad line is one stderr line and skipped
+# name<TAB>url<TAB>branch for each well-formed line; a bad line is one stderr line and skipped. An ALIAS line
+#   (`<name> -> <target>`) is not this function's — alias_entries reads it, silently skipped here.
 entries(){
   [ -f "$LIST" ] || return 0
   local name url br extra ln=0
   while read -r name url br extra; do
     ln=$((ln+1))
     case "$name" in ''|'#'*) continue;; esac
+    [ "$url" = '->' ] && continue
     if ! [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || [ "$name" = synced ] || [ -z "$url" ] || [ -n "$extra" ]; then
       echo "cc-skills: $LIST:$ln is not '<name> <git url> [<branch>]' with a plain lowercase name other than synced — skipped" >&2; continue; fi
     case "$url" in
@@ -50,6 +58,22 @@ entries(){
       *) echo "cc-skills: $LIST:$ln ($name) has a url that is not https://, ssh://, git@host:, tree: or an absolute path — skipped" >&2; continue;;
     esac
     printf '%s\t%s\t%s\n' "$name" "$url" "$br"
+  done < "$LIST"; }
+
+# name<TAB>target for each well-formed ALIAS line (`<name> -> <clone>/<path...>`, the header's AN ALIAS LINE); a bad
+#   line is one stderr line and skipped. Whether <target> actually resolves into a listed clone is not decided here —
+#   sync_alias only keeps the symlink's text matching this line, and names/skills_bind each do their own realpath
+#   check on what is really on disk, every time, never trusting an earlier pass.
+alias_entries(){
+  [ -f "$LIST" ] || return 0
+  local name arrow target extra ln=0
+  while read -r name arrow target extra; do
+    ln=$((ln+1))
+    case "$name" in ''|'#'*) continue;; esac
+    [ "$arrow" = '->' ] || continue
+    if ! [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || [ "$name" = synced ] || [ -z "$target" ] || [ -n "$extra" ]; then
+      echo "cc-skills: $LIST:$ln is not '<name> -> <clone>/<path...>' with a plain lowercase name other than synced — skipped" >&2; continue; fi
+    printf '%s\t%s\n' "$name" "$target"
   done < "$LIST"; }
 
 TREEMARK=.cc-skills-tree
@@ -112,8 +136,21 @@ sync1(){   # $1 name $2 url $3 branch
   [ "$old" = "$new" ] || echo "cc-skills: $n ${old:0:7} -> ${new:0:7}"
   ok "$n"; return 0; }
 
+sync_alias(){   # $1 name $2 target (config/skills.list's ALIAS line) → keeps ~/.claude/skills/<name> a symlink to it.
+  # Mechanical only, as the header says: whether <target> resolves into a listed clone is names' and skills_bind's to
+  # decide, each time, from the real filesystem — this just keeps the symlink's text matching the line.
+  local n="$1" tgt="$2" d="$SK/$1"
+  if [ -L "$d" ]; then
+    [ "$(readlink "$d" 2>/dev/null)" = "$tgt" ] && { ok "$n"; return 0; }
+    ln -sfn "$tgt" "$d" 2>/dev/null && { echo "cc-skills: $n now points at $tgt"; ok "$n"; return 0; }
+    fail "$n" "could not repoint the alias to $tgt"; return 1; fi
+  if [ -e "$d" ]; then
+    fail "$n" "the directory $d is there and is not an alias cc-skills made — left alone"; return 1; fi
+  mkdir -p "$SK" && ln -s "$tgt" "$d" 2>/dev/null && { echo "cc-skills: $n aliased to $tgt"; ok "$n"; return 0; }
+  fail "$n" "could not make the alias to $tgt"; return 1; }
 cmd_sync(){ local n u b bad=0
   while IFS=$'\t' read -r n u b; do sync1 "$n" "$u" "$b" || bad=1; done < <(entries)
+  while IFS=$'\t' read -r n u; do sync_alias "$n" "$u" || bad=1; done < <(alias_entries)
   return "$bad"; }
 cmd_list(){ local n u b s
   while IFS=$'\t' read -r n u b; do
@@ -121,11 +158,28 @@ cmd_list(){ local n u b s
     elif managed "$SK/$n" "$u"; then s="at $(at "$SK/$n" "$u")"
     elif [ -e "$SK/$n" ]; then s="not a clone of the url"; else s="not cloned yet"; fi
     printf '%s\t%s\t%s\t%s\n' "$n" "$u" "${b:-default}" "$s"; done < <(entries); }
-cmd_names(){ local n u b
-  while IFS=$'\t' read -r n u b; do managed "$SK/$n" "$u" && [ -f "$SK/$n/SKILL.md" ] && printf '%s\n' "$n"; done < <(entries); :; }
+# alias_valid $1 name → the RESOLVED real path on stdout when ~/.claude/skills/<name> is a symlink whose target
+#   realpaths into a directory strictly inside another line's own clone (managed, and holding a SKILL.md) — never a
+#   chain onto a second alias, since only entries() (never alias_entries) supplies the candidate clones below. `..`
+#   and a symlink partway down the target both wash out in realpath -e, so the containment check on its RESULT is the
+#   whole test; anything else is 1, and the caller says so.
+alias_valid(){
+  local n="$1" resolved c cu creal
+  [ -L "$SK/$n" ] || return 1
+  resolved=$(realpath -e "$SK/$n" 2>/dev/null) || return 1
+  [ -d "$resolved" ] && [ -f "$resolved/SKILL.md" ] || return 1
+  while IFS=$'\t' read -r c cu _; do
+    managed "$SK/$c" "$cu" || continue
+    creal=$(realpath -e "$SK/$c" 2>/dev/null) || continue
+    case "$resolved" in "$creal"|"$creal"/*) printf '%s' "$resolved"; return 0;; esac
+  done < <(entries)
+  return 1; }
+cmd_names(){ local n u b tgt
+  while IFS=$'\t' read -r n u b; do managed "$SK/$n" "$u" && [ -f "$SK/$n/SKILL.md" ] && printf '%s\n' "$n"; done < <(entries)
+  while IFS=$'\t' read -r n tgt; do alias_valid "$n" >/dev/null && printf '%s\n' "$n"; done < <(alias_entries); :; }
 
 selfcheck(){   # its own HOME: a fixture upstream, a fixture list, a fixture notifier; git only, no network
-  local fh n=0 bad=0 up out rc
+  local fh n=0 bad=0 up up2 out rc
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccskills-XXXXXX") || return 1
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   run(){ env -u CC_SKILLS_TIMEOUT HOME="$fh" CC_SKILLS_LIST="$fh/list" CC_SKILLS_NOTIFY="$fh/notify" CC_SKILLS_TREE="$fh/tree" \
@@ -185,6 +239,27 @@ selfcheck(){   # its own HOME: a fixture upstream, a fixture list, a fixture not
     "$rc/$(tail -1 "$fh/.claude/skills/tx/SKILL.md")/$(cat "$fh/.claude/skills/tx/new.md")/$(grep -c 'copied again' <<<"$out")/$(find "$fh/.claude/skills" -maxdepth 1 -name '.*cc-skills*' | wc -l)" 0/t2/extra/1/0
   t 'list: a tree skill reads as a tree copy' "$(run list | cut -f4)" 'at tree copy'
   t '--help exits 0' "$("$SELF" --help >/dev/null 2>&1; echo $?)" 0
+  # ALIAS lines: a second clone holding a sub-skill, a symlink inside it that escapes, a directory sitting at an
+  # unlisted name, and every name/target failure names is supposed to catch
+  up2="$fh/up/fx-clone"; mkdir -p "$up2/skills/vde" "$up2/skills/nomd"
+  printf -- '---\nname: vde\n---\nv1\n' > "$up2/skills/vde/SKILL.md"
+  ln -s /etc "$up2/skills/escape"
+  git -C "$up2" init -q -b main && gi -C "$up2" add -A && gi -C "$up2" commit -qm v1 || return 1
+  mkdir -p "$fh/.claude/skills/nope-clone/skills/x" && printf -- '---\nname: x\n---\n' > "$fh/.claude/skills/nope-clone/skills/x/SKILL.md"
+  printf 'fx-clone %s\nvde -> fx-clone/skills/vde\nsynced -> fx-clone/skills/vde\nBad/Name -> fx-clone/skills/vde\nescaped -> fx-clone/skills/escape\ngone -> fx-clone/skills/gone\nbaremd -> fx-clone/skills/nomd\nstray -> nope-clone/skills/x\n' "$up2" > "$fh/list"
+  out=$(run sync 2>&1)
+  t 'sync: a good alias line is kept as a symlink to its target' "$(readlink "$fh/.claude/skills/vde" 2>/dev/null)" 'fx-clone/skills/vde'
+  t 'sync: synced and a bad name are refused as aliases too, each saying so' "$(grep -c 'other than synced' <<<"$out")" 2
+  t 'names: the good alias resolves inside its clone and is listed, alone' "$(run names 2>/dev/null | tr '\n' ' ')" 'vde '
+  t 'names: a symlink inside the clone that escapes it, a dangling target, one with no SKILL.md, and one naming a directory no line lists are all left out — none read outside' \
+    "$(run names 2>/dev/null | grep -cE '^(escaped|gone|baremd|stray)$')/$(cat /etc/hostname 2>/dev/null >/dev/null; echo checked)" 0/checked
+  # a changed line repoints the symlink; a hand-made directory at an alias's name is left alone and the run exits 1
+  printf 'fx-clone %s\nvde -> fx-clone/skills/nomd\n' "$up2" > "$fh/list"
+  run sync >/dev/null 2>&1
+  t 'sync: a changed alias line repoints the symlink' "$(readlink "$fh/.claude/skills/vde" 2>/dev/null)" 'fx-clone/skills/nomd'
+  rm -f "$fh/.claude/skills/vde"; mkdir -p "$fh/.claude/skills/vde"; echo mine > "$fh/.claude/skills/vde/SKILL.md"
+  out=$(run sync 2>&1); rc=$?
+  t 'sync: a hand-made directory at an alias'"'"'s name is left alone and the run exits 1' "$(cat "$fh/.claude/skills/vde/SKILL.md")/$rc" mine/1
   rm -rf "${fh:?}"
   printf 'cc-skills selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
 

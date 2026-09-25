@@ -79,6 +79,48 @@ same change. Only the bare "Yes" is ever pressed, never "Yes, and don't ask agai
 classifier allows. The answer file is no easier to forge than a keystroke into the pane, which any session of this
 user can already send, and confirm cards share one hourly cap for the box because the window they name is the caller's word.
 
+## The approver: what he has already granted needs no card
+
+Row `permissions-agent-applies-owner-grants`, 2026-09-24. Folds `raised-the-classifier-still-blocks-a-granted-config-change`.
+The card took the terminal out, but he still answered one for every key and allow line he had already granted once
+(09-22, 09-23, 09-24). His shape: "a permissions agent that only reviews and approves but doesn't use it, so no
+conflict of interest". So an `allow` or `config` ask (`cc-slack grant config KEY VALUE` is new) goes to `cc-approve`
+before any card:
+
+- **The floor, in code, built from allowlists.** Two security reviews on 09-24 stepped round a denylist floor again
+  and again (`\curl`, `c''url`, `python3.12`, `./x`, `git config core.hooksPath`, `Edit(//home/**)`, `NTFY_TOPIC`, …),
+  so only named shapes pass and everything else is referred before a model sees it. Only a planning seat's ask
+  passes, because his one-time grant is a planning seat's (the daemon passes the asker's target as `--from`, and one
+  with a `/` is a track). A file rule must sit in a named directory of one project's tree
+  (`~/dev/<name>/<dir>/…` or `~/.cc/worktrees/<repo>/<track>/<dir>/…`, literal to `<dir>`), so a glob never reaches
+  the tree's `.git` or `.claude`, and never in the box's own control checkout. A symlink anywhere on the rule's
+  literal part is referred wherever it points, since `~/dev/<name>/cfg -> ~/.claude` reads as a project directory.
+  A Bash rule is plain words headed by
+  one of a few box tools (`cc-board`, `cc-context`, `box-status`, `cc-lib ask|get`, `cc-failures record`), or
+  `bash|sh <relative script>.sh`, which is his build-all.sh case: the seat writes that script, so the judge's grant
+  has to cover running it. A config key must be on `KEY_OK`, a short list of pacing knobs, and cc-ask's turns and
+  thinking tokens only within a cap near their defaults; a key joins it by a reviewed PR, never by an ask. The
+  owner's own switches, `CC_WAKE` among them, are not on it.
+- **The judge.** One `claude -p` with no tools, no MCP and no settings reads his grants file (`APPROVER_GRANTS` in the
+  daemon's environment, default `~/CLAUDE.md`) and the ask as quoted data, and answers JSON. The file is read as the
+  default branch of the GitHub repo `APPROVER_REPO` pins has it: GitHub's API gives the sha and the checkout gives
+  the text at that sha. The pin sits in the daemon unit's environment (a drop-in), never in `~/.cc/config`, because
+  his grant 1 lets a planning seat `cc-config set` any key. The repo is never read from git, since `insteadOf` or
+  `set-url` would point it at a fork. A
+  working edit, a local commit or a rewritten `origin/main` grants nothing, and no pin or no answer from GitHub is a
+  refer. An apply must quote his grant, and the quote must be in the file word for word and not just the seat's own
+  `why` echoed back. Anything else, including no answer, is a refer.
+- **Apply.** The daemon writes it (cc-settings' grant verb with `--by approver`, or `cc-config set` plus a
+  `grants.log` line), posts a ⚙️ line in `#<ctl>-threads` naming what, for whom and under which grant, and tells the
+  seat. The line carries no ❓ and no mention, because nothing waits on him. A write that fails becomes his card.
+- **Refer.** His ❓ card as before, carrying the approver's reason. His `yes <id> fix` on a config card has the
+  daemon run `cc-config set`.
+
+Nobody gets a new power from this. The approver runs nothing and cannot write, a seat that runs `cc-approve` itself
+gets a verdict that nothing acts on, and the writer is still the daemon. A credential's key is refused before a
+card is posted, since the card would show the value, and so are the protected-path hold's keys that cc-guard bans. `APPROVER=off` in `~/.cc/config` sends every ask straight to
+his card.
+
 ## Selfcheck
 
 cc-settings: grant writes one line with the rest identical, refuses a second copy, refuses under `CLAUDECODE`,
@@ -86,4 +128,4 @@ refuses a unit whose hash moved, and `check` is green after. cc-slack: grant car
 runs the writer and marks ⚙️; `no` marks ❌ and writes nothing; a non-owner's reply is refused; a session's
 `cc-slack permission` on a grant card is refused; a confirm card's yes/no is recorded, never written to settings. cc-model (f):
 one fixture pane per branch — a read-only call answered Yes, a write carded once, his yes and his no pressed, a
-two-call message carded when its first call writes and answered Yes when both read. cc-guard: a session writing the file through Bash is refused.
+two-call message carded when its first call writes and answered Yes when both read. cc-guard: a session writing the file through Bash is refused. cc-approve: every floor case, each exploit from the security review among them, is referred even when the judge says apply, beside a kept twin; a track's ask is a refer; a grant only a local commit or a rewritten ref carries is not read; a quote not in the record, one that only echoes the `why`, prose, or no judge is a refer. cc-slack (approver): an already-granted config key and allow line are written by the daemon with a ⚙️ line and no card, a referred ask is his card and his yes sets it, a failed write becomes his card, a credential's key is refused before anything.

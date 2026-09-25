@@ -1583,7 +1583,7 @@ def run_selfcheck():
         # -- A BOX SEAT'S MISSING PERMISSION IS GRANTED FROM SLACK (row a-seat-grant-is-answered-from-slack) --
         # The seat runs in auto mode: a refused command raised no prompt, so the owner pasted commands at a terminal.
         # Now the seat raises a 🔐 grant card; only the owner's reply writes, and the writer is the daemon.
-        dmG = Daemon(use_slack=False); dmG.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
+        dmG = Daemon(use_slack=False); dmG.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test", "APPROVER": "off"}   # the card path alone; the approver has its own daemon below
         dmG.bot_user = "UBOT"; dmG.names.update({"CTHREADS": f"{CTL}-threads"}); dmG.threads_chats[CTL] = "CTHREADS"
         dmG.users.update({"UOWNER": ("The Owner", "owner"), "UMEM": ("Ada", "ada.byron")})
         saidG, gotG, wroteG = [], [], []
@@ -1692,6 +1692,104 @@ def run_selfcheck():
                 dmG.relay_grant(CTL, "allow", "Bash(y *)")
             check("a seat raising grant cards faster than anyone answers is capped (GRANT_CAP an hour)",
                   not dmG.relay_grant(CTL, "allow", "Bash(z *)")["ok"])
+
+            # -- THE APPROVER (row permissions-agent-applies-owner-grants): an allow or config ask goes to cc-approve first.
+            # What the owner's recorded grants cover, THIS DAEMON writes with no card and says so; the rest is his card.
+            dmA = Daemon(use_slack=False); dmA.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
+            dmA.bot_user = "UBOT"; dmA.names.update({"CTHREADS": f"{CTL}-threads"}); dmA.threads_chats[CTL] = "CTHREADS"
+            dmA.users.update({"UOWNER": ("The Owner", "owner")})
+            saidA, gotA, runA, verdictA = [], [], [], {}
+            dmA.say = lambda chat, text, thread=None: saidA.append((chat, text, thread)) or f"a{len(saidA)}"
+            dmA.deliver = lambda target, payload, **k: gotA.append((target, payload)) or "delivered"
+            dmA.route = lambda chat, ctype=None: {"CTHREADS": CTL}.get(chat)
+            dmA.card_text = lambda chat, ts: next((t for c, t, th in saidA if c == chat and f"a{saidA.index((c, t, th)) + 1}" == ts), None)
+            dmA.run_bg = lambda fn: fn()          # the judge's thread, run in line so each case reads its own outcome
+            dmA.approver = lambda kind, what, value, why, frm="": verdictA.get((kind, what), ("refer", "", "no grant covers it"))
+            R = lambda rc=0, out="", err="": type("R", (), {"returncode": rc, "stdout": out, "stderr": err})()
+            rcA = {}
+            _runA, _glA = EFFECTS.run_impl, globals()["GRANT_LOG"]
+            EFFECTS.run_impl = lambda cmd, **kw: runA.append(list(cmd)) or R(*rcA.get(os.path.basename(cmd[0]), (0, "granted: ok")))
+            globals()["GRANT_LOG"] = f"{devG}/grants.log"
+            try:
+                # 1. a config key the owner's grant 1 covers: set by the daemon, logged, told; no card, no mention
+                verdictA[("config", "MAIL_QUIET")] = ("apply", "change the box's own config with `cc-config set`", "grant 1")
+                n_rx = len(rxM)
+                r1 = dmA.relay_grant(CTL, "config", "MAIL_QUIET", "the lessons orch asked", value="study")
+                check("an already-granted config ask is SET by the daemon (cc-config set KEY VALUE, exactly), logged in grants.log "
+                      "by the approver, told in the -threads lane with the grant it stood on and a ⚙️, and the seat is told — "
+                      "no ❓, no owner mention, no open card",
+                      r1["ok"] and runA == [[f"{BIN}/cc-config", "set", "MAIL_QUIET", "study"]]
+                      and "config MAIL_QUIET='study' by approver card " + r1["id"] in open(f"{devG}/grants.log").read()
+                      and len(saidA) == 1 and "the approver applied `MAIL_QUIET=study`" in saidA[0][1]
+                      and "change the box's own config" in saidA[0][1] and "UOWNER" not in saidA[0][1] and "❓" not in saidA[0][1]
+                      and ("CTHREADS", "a1", "gear") in rxM[n_rx:] and gotA and gotA[-1][0] == CTL and "written" in gotA[-1][1]["content"]
+                      and r1["id"] not in dmA.grant_asks and r1["id"] not in dmA.grant_judging)
+                # 2. the build-all.sh allow line under the recorded grant for allow lines: cc-settings grant, by the approver
+                verdictA[("allow", "Bash(bash build-all.sh)")] = ("apply", "add an allow line", "grant 6")
+                runA.clear()
+                r2 = dmA.relay_grant("lessons-seat", "allow", "Bash(bash build-all.sh)", "member lesson builds")
+                check("an already-granted allow line is written through cc-settings grant --by approver, and the seat is told to restart to hold it",
+                      r2["ok"] and runA == [[f"{BIN}/cc-settings", "grant", "allow", "Bash(bash build-all.sh)", "--by", "approver", "--card", r2["id"]]]
+                      and "the approver applied `Bash(bash build-all.sh)`" in saidA[-1][1]
+                      and gotA[-1][0] == "lessons-seat" and "restart" in gotA[-1][1]["content"])
+                # 3. outside the grants: the owner's ❓ card with the approver's reason — nothing run — and HIS yes sets it
+                runA.clear(); n_said = len(saidA)
+                r3 = dmA.relay_grant(CTL, "config", "CC_TIER", value="autonomous")
+                card3 = saidA[n_said][1] if len(saidA) > n_said else ""
+                check("an ask the approver refers becomes the owner's ❓ card naming KEY=VALUE and why it came to him; nothing is written",
+                      r3["ok"] and runA == [] and card3.startswith("❓ <@UOWNER> ") and "`CC_TIER=autonomous`" in card3
+                      and "The approver sent it to you: no grant covers it" in card3 and r3["id"] in dmA.grant_asks)
+                dmA.on_event(msgM("a.3", "UOWNER", f"yes {r3['id']} fix", chan="CTHREADS"))
+                check("…and his `yes <id> fix` has the daemon set it (cc-config set, logged by him) — a Slack reply, never a terminal command",
+                      runA == [[f"{BIN}/cc-config", "set", "CC_TIER", "autonomous"]] and r3["id"] not in dmA.grant_asks
+                      and f"config CC_TIER='autonomous' by The Owner card {r3['id']}" in open(f"{devG}/grants.log").read())
+                r3n = dmA.relay_grant(CTL, "config", "CC_TIER", value="stop"); runA.clear()
+                dmA.on_event(msgM("a.4", "UOWNER", f"no {r3n['id']}", chan="CTHREADS"))
+                check("…and his `no <id>` writes nothing", runA == [] and r3n["id"] not in dmA.grant_asks)
+                # 4. the approver says apply, the writer refuses: never silent — the owner's card, with the refusal on it
+                verdictA[("config", "CC_X")] = ("apply", "change the box's own config with `cc-config set`", "grant 1")
+                rcA["cc-config"] = (1, "", "cc-config: refused"); n_said = len(saidA)
+                r4 = dmA.relay_grant(CTL, "config", "CC_X", value="1")
+                check("an apply the writer refuses becomes the owner's card, saying so", r4["id"] in dmA.grant_asks
+                      and "the write was refused: cc-config: refused" in saidA[n_said][1] and saidA[n_said][1].startswith("❓"))
+                rcA.clear()
+                dmA.grant_posts.clear()               # a fresh hour for the cases below: the cap has its own case above
+                # 5. refused before any judging: a credential's key, a value the card could not show exactly
+                runA.clear(); n_said = len(saidA)
+                bad = [dmA.relay_grant(CTL, "config", k, value=v) for k, v in (("SLACK_BOT_TOKEN", "x"), ("GH_PAT", "x"), ("MY_API_KEY", "x"),
+                        ("bad key", "x"), ("CC_X", "a  b"), ("CC_X", "<@U1>"), ("CC_X", "a`b"), ("CC_X", "x" * 501), ("CC_X", "--from"))]
+                check("a credential's key, a malformed key, or a value the card cannot show exactly is refused — no judge, no card, nothing run",
+                      all(not r["ok"] for r in bad) and runA == [] and len(saidA) == n_said)
+                check("…while a plain key and value is taken", dmA.relay_grant(CTL, "config", "CC_Y", value="on")["ok"])
+                hold = [dmA.relay_grant(CTL, "config", k, value="x") for k in ("CC_PROTECTED_PATHS_myrepo", "SLACK_OWNER_ID")]
+                check("the keys cc-guard bans setting (the protected-path hold's own) are refused before any judge — "
+                      "while CC_PROTECTED_X, not one of them, is taken to the judge",
+                      all(not r["ok"] and "protected-path hold" in r["error"] for r in hold)
+                      and dmA.relay_grant(CTL, "config", "CC_PROTECTED_X", value="1")["ok"])
+                seenA, _apA = [], dmA.approver
+                dmA.approver = lambda kind, what, value, why, frm="": seenA.append(frm) or ("refer", "", "no")
+                dmA.relay_grant(f"{CTL}/some-track", "config", "CC_W", value="1"); dmA.relay_grant(CTL, "config", "CC_W", value="2")
+                dmA.approver = _apA
+                check("the approver is told which seat asks — a track's target and the planning seat's, each as the daemon knows it",
+                      seenA == [f"{CTL}/some-track", CTL])
+                # 6. APPROVER=off: the card straight away, as before the approver
+                dmA.cfg["APPROVER"] = "off"; verdictA[("config", "CC_Z")] = ("apply", "x" * 30, "")
+                r6 = dmA.relay_grant("seat-7", "config", "CC_Z", value="1")
+                check("APPROVER=off skips the judge: the owner's card at once", r6.get("card") and r6["id"] in dmA.grant_asks)
+                # 7. the real approver() reads cc-approve's one JSON line and fails closed
+                dmB = Daemon(use_slack=False)
+                rcA["cc-approve"] = (0, '{"verdict": "apply", "grant": "g", "reason": "r"}')
+                v_ok = dmB.approver("config", "CC_Y", "on", "w", CTL)
+                argv7 = runA[-1]
+                rcA["cc-approve"] = (1, '{"verdict": "refer", "reason": "nope"}'); v_ref = dmB.approver("config", "CC_Y", "on", "w")
+                rcA["cc-approve"] = (0, 'not json'); v_bad = dmB.approver("config", "CC_Y", "on", "w")
+                rcA["cc-approve"] = (1, '{"verdict": "apply", "grant": "g"}'); v_rc = dmB.approver("config", "CC_Y", "on", "w")
+                check("approver() runs `cc-approve judge <kind> <key> <value> --why <w>` and takes apply only from exit 0 AND "
+                      "verdict apply; a refer, prose, or an exit that disagrees is a refer",
+                      v_ok == ("apply", "g", "r") and argv7 == [f"{BIN}/cc-approve", "judge", "config", "CC_Y", "on", "--why", "w", "--from", CTL]
+                      and v_ref[0] == v_bad[0] == v_rc[0] == "refer" and v_ref[2] == "nope")
+            finally:
+                EFFECTS.run_impl, globals()["GRANT_LOG"] = _runA, _glA
         finally:
             globals()["DEV"], globals()["CONFIRM_ANSWERS"] = _devG, _caG
             shutil.rmtree(devG, ignore_errors=True)
