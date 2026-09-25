@@ -1060,6 +1060,49 @@ def run_selfcheck():
     finally:
         globals()["paused"] = real_paused
 
+    # `!handoff` IS `cc-handoff --overlap` on the channel's target: a stub cc-handoff in a BIN of its own records its
+    # argv, and the channel gets exactly one line — the success line, or cc-handoff's own refusal.
+    hbin = tempfile.mkdtemp(prefix="cc-slack-selfcheck-handoff-")
+    with open(f"{hbin}/cc-handoff", "w") as f:
+        f.write('#!/usr/bin/env bash\nd=$(dirname "$0")\nprintf "%s " "$@" >> "$d/calls"; printf "\\n" >> "$d/calls"\n'
+                '[ -e "$d/fail" ] && { echo "cc-handoff: $2 already has an overlap open (phase overlap, live predecessor) — one successor at a time"; exit 1; }\n'
+                'echo "cc-handoff: $2 — successor started in main:$2~next (id abc)"\n')
+    os.chmod(f"{hbin}/cc-handoff", 0o755)
+    real_binH = BIN
+    globals()["BIN"] = hbin
+    dmH, saidH = Daemon(use_slack=False), []
+    dmH.say = lambda chat, text, thread=None, **k: saidH.append((chat, thread, text))
+
+    def hcalls():
+        try:
+            got = [ln.split() for ln in open(f"{hbin}/calls").read().splitlines()]
+        except OSError:
+            got = []
+        open(f"{hbin}/calls", "w").close()
+        return got
+
+    try:
+        dmH.command("!handoff", "C1", "1.5", "1.6", "myrepo/t1", "channel", True)
+        check("!handoff: the owner's `!handoff` in a thread hands THAT thread's session off through cc-handoff --overlap, "
+              "and the thread gets one line saying so",
+              hcalls() == [["--overlap", "myrepo/t1"]] and len(saidH) == 1 and saidH[0][:2] == ("C1", "1.5")
+              and "handing `myrepo/t1` off" in saidH[0][2])
+        dmH.command("!handoff other@scout", "C1", None, "1.7", "myrepo", "channel", True)
+        check("!handoff <target> hands off the one it names, not this channel's",
+              hcalls() == [["--overlap", "other@scout"]] and "`other@scout`" in saidH[-1][2])
+        open(f"{hbin}/fail", "w").close()
+        dmH.command("!handoff", "C1", None, "1.8", "myrepo", "channel", True)
+        check("!handoff that cc-handoff refuses: one line with its own reason, never a success line",
+              hcalls() == [["--overlap", "myrepo"]] and len(saidH) == 3 and saidH[-1][2].startswith("could not hand `myrepo` off: myrepo already has an overlap open"))
+        dmH.command("!handoff", "CDM", None, "1.9", None, "im", True)
+        check("!handoff with no session for the channel runs nothing and says how to name one",
+              hcalls() == [] and "no session for this channel" in saidH[-1][2])
+        dmH.command("!handoff", "C1", None, "2.0", "myrepo", "channel", False)
+        check("!handoff from a member runs nothing: a plain refusal", hcalls() == [] and saidH[-1][2] == "`!handoff` is the owner's")
+    finally:
+        globals()["BIN"] = real_binH
+        shutil.rmtree(hbin, ignore_errors=True)
+
     # `!pause` / `!resume` themselves. Fixture of its own: a stub cc-pause in a BIN of its own, so a selfcheck can
     # never park a project this box really has, and what it recorded is read back after every call.
     pbin = tempfile.mkdtemp(prefix="cc-slack-selfcheck-pause-")
@@ -1429,6 +1472,28 @@ def run_selfcheck():
             n_rx = len(rxM); cli_fix = dmQ.answer_permission("vwxyz", "yes", CTL, fix=True); rx_cfix, said_fix = rxM[n_rx:], saidQ[-1]
             dmQ.relay_permission(f"{CTL}/t1", {"tool_name": "Edit", "description": "plain yes", "input_preview": "x", "request_id": "rstvw"})
             n_rx = len(rxM); dmQ.on_event(msgM("q.4", "UOWNER", "yes rstvw", chan="CTHREADS")); rx_yes = rxM[n_rx:]
+            # -- A FIX ON A MEMBER'S WEB CARD GRANTS ITS WORKSPACE THE WEB (row a-web-grant-lets-auto-mode-decide) --
+            # Each case raises its own card. Kept: the owner's fix and the seat's fix on a member's WebFetch/WebSearch
+            # card. Suppressed: a plain yes, a fix on a member's Bash card, a fix on a WebFetch card from a repo that
+            # is no member workspace.
+            webQ, _runW = [], EFFECTS.run_impl
+            EFFECTS.run_impl = lambda cmd, **kw: webQ.append(cmd) or type("R", (), {"returncode": 0, "stdout": "granted", "stderr": ""})()
+            try:
+                def web_case(target, tool, rid, answer, seat=False):
+                    dmQ.relay_permission(target, {"tool_name": tool, "description": "look it up", "input_preview": "x", "request_id": rid})
+                    n_w, n_s = len(webQ), len(saidQ)
+                    if seat:
+                        dmQ.answer_permission(rid, "yes", CTL, fix=answer.endswith("fix"))
+                    else:
+                        dmQ.on_event(msgM("w." + rid, "UOWNER", answer.format(rid), chan="CTHREADS"))
+                    return [c[1:] for c in webQ[n_w:]], [x[1] for x in saidQ[n_s:] if x[1].startswith("🌐")]
+                web_owner = web_case("mem1/lessons", "WebFetch", "bcdfg", "yes {} fix")
+                web_seat = web_case("mem1", "WebSearch", "cdfgh", "yes fix", seat=True)
+                web_plain = web_case("mem1", "WebFetch", "dfghj", "yes {}")
+                web_bash = web_case("mem1", "Bash", "fghjk", "yes {} fix")
+                web_other = web_case("other", "WebFetch", "ghjkm", "yes {} fix")
+            finally:
+                EFFECTS.run_impl = _runW
         finally:
             globals()["DEV"], globals()["load_routes"], globals()["find_channel"] = _devQ, _routesQ, _fcQ
             subprocess.run(["rm", "-rf", devQ])
@@ -1554,13 +1619,22 @@ def run_selfcheck():
               and "given for good" in said_fix[1])
         check("…and a plain `yes <id>` is ✅ alone: no ⚙️ unless somebody said fix",
               [r for r in rx_yes if r[2] == "white_check_mark"] and not [r for r in rx_yes if r[2] == "gear"])
+        check("a fix on a member workspace's WebFetch or WebSearch card grants THAT workspace the web — the owner's in "
+              "Slack and the seat's alike run `cc-sandbox web <handle>` once, and the thread says it lands at the next "
+              "launch (2026-09-24: ece298a's fix drew ⚙️ and the next card came a minute later)",
+              web_owner[0] == [["web", "mem1"]] and web_seat[0] == [["web", "mem1"]]
+              and len(web_owner[1]) == 1 and "next launch" in web_owner[1][0] and "`mem1`" in web_owner[1][0])
+        check("…and nothing else grants it: a plain yes, a fix on a Bash card, a fix on a web card from a repo that is "
+              "no member workspace — no cc-sandbox call and no 🌐 line",
+              web_plain == ([], []) and web_bash == ([], []) and web_other == ([], []))
         n_said = len(saidM)
         dmM.on_event(msgM("c.1", "UMEM", "!digest"))
         dmM.on_event(msgM("c.2", "UMEM", "!pause"))
+        dmM.on_event(msgM("c.3", "UMEM", "!handoff"))
         check("`!` commands are the owner's: a member gets one line saying so and the command never runs — not even "
-              "`!pause`, which steers the box (A4)",
-              len(saidM) == n_said + 2 and saidM[n_said][1] == "`!digest` is the owner's"
-              and saidM[n_said + 1][1] == "`!pause` is the owner's")
+              "`!pause`, which steers the box (A4), nor `!handoff`",
+              len(saidM) == n_said + 3 and saidM[n_said][1] == "`!digest` is the owner's"
+              and saidM[n_said + 1][1] == "`!pause` is the owner's" and saidM[n_said + 2][1] == "`!handoff` is the owner's")
         # -- a reaction is a verdict, and anyone in the channel gives it (owner's decision, 2026-08-30) --
         rxvM = []
         dmM.deliver_reaction = lambda chat, ts, name, removed, who=None: rxvM.append((chat, ts, name)) or None
@@ -2388,6 +2462,84 @@ def run_selfcheck():
           and tt9 == ("C-myrepo", "7.1") and outT[1] == (0, "C-myrepo 7.1")
           and outT[2] == (1, "") and track_thread("nochan/t1") is None
           and [rc for rc, _ in outT[3:]] == [2, 2, 2, 2] and rc_notok == 3 and not madeT)
+    # A CHILD REPORTS TO ITS PARENT (owner, #ai-ee 2026-09-25): "when a repo has no channel and CC_PROJECT_CHILDREN
+    # names a parent, every event that would go to the repo's channel or seat goes to the parent's, named for the child
+    # repo. A repo with its own channel is unchanged." Own fixture: `par` and `own` have channels, `kid` and `lone` do
+    # not; the declaration puts kid and own under par, and lone under nobody.
+    cfgK = {"SLACK_BOT_TOKEN": "xoxb-test", "CC_PROJECT_CHILDREN": "par:kid,own loopa:loopb loopb:loopa"}
+    chansK = {"par": "C-par", "own": "C-own", f"par-{UPDATES}": "C-par-up", f"own-{UPDATES}": "C-own-up"}
+    askedK, rootsK, postedK = [], [], []
+    real_sl = globals()["self_lands"]
+    for d in ("par", "kid", "own", "lone"):
+        os.makedirs(f"{DEV}/{d}", exist_ok=True)
+    try:
+        globals()["resolve_channel"] = lambda cfg, name: askedK.append(name) or chansK.get(name)
+        homesK = [home_of(cfgK, r) for r in ("kid", "own", "par", "lone")]
+        askedLone = [n for n in askedK if n == "lone"]
+        cycleK = home_of(cfgK, "loopa")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: rootsK.append((chat, text)) or (1, f"8.{len(rootsK)}")
+        globals()["load_cfg"] = lambda: cfgK
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rcK = [cmd_track_thread(["kid/t1"]), cmd_track_thread(["own/t1"]), cmd_track_thread(["lone/t1"])]
+        ttK = (track_thread("kid/t1"), track_thread("own/t1"), track_thread("lone/t1"))
+        save_table(TRACKS, {})
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: postedK.append((chat, text)) or (1, "1.0")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cmd_post(["--route", "[kid] PR #3 stopped", "gate red"]); cmd_post(["--route", "[own] PR #4 stopped", "gate red"])
+        globals()["self_lands"] = lambda cfg, repo: True
+        lanesK = [card_lane(cfgK, "kid"), card_lane(cfgK, "own")]
+    finally:
+        globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["self_lands"] = real_sl
+        save_table(TRACKS, {})
+    check("a child with no channel: home_of is its parent; a declared child WITH a channel, the parent itself and an "
+          "undeclared repo are themselves — the undeclared one without a channel lookup — and a declared cycle ends",
+          homesK == ["par", "own", "par", "lone"] and not askedLone and cycleK in ("loopa", "loopb"))
+    check("…its track thread opens in the PARENT's channel, its root naming the child's track; a child with its own "
+          "channel keeps it; an undeclared channel-less repo still gets no thread (exit 1)",
+          rcK == [0, 0, 1] and ttK[0] == ("C-par", "8.1") and ttK[1] == ("C-own", "8.2") and ttK[2] is None
+          and rootsK[0][0] == "C-par" and "`kid/t1`" in rootsK[0][1] and rootsK[1][0] == "C-own")
+    check("…its --route line lands in the parent's updates lane, its text opening `[kid]` when it did not name the child; a child with a channel keeps "
+          "its own lane; its PR card goes to the parent's log lane, the other's to its own",
+          postedK == [("C-par-up", "[kid] gate red"), ("C-own-up", "gate red")]
+          and lanesK == [("C-par-up", f"par-{UPDATES}"), ("C-own-up", f"own-{UPDATES}")])
+    # The seat: the daemon's inject door (cc-loop's STOP line via cc-broker, the landing's wake) reaches the parent's
+    # session, opening `[kid]`; an own-channel child, an alias, and a child whose own session is live are unchanged.
+    dmK = Daemon(use_slack=False); dmK.cfg = cfgK
+    gotK = []; dmK.deliver = lambda target, payload, autostart=True, alias=None: gotK.append((target, payload["content"])) or "delivered"
+    try:
+        globals()["resolve_channel"] = lambda cfg, name: chansK.get(name)
+        for tgt in ("kid", "own", "kid", "lone"):
+            if len(gotK) == 2:
+                dmK.subs["kid"] = ["live-conn"]            # the third inject: kid's own session is subscribed
+            elif len(gotK) == 3:
+                dmK.subs.pop("kid", None)
+            aK, bK = socket.socketpair()
+            aK.sendall(json.dumps({"inject": tgt, "content": "loop STOP: x"}).encode() + b"\n")
+            aK.shutdown(socket.SHUT_WR); dmK.handle_conn(bK); aK.close()
+    finally:
+        globals()["resolve_channel"] = real_rc
+    check("inject: a channel-less child's STOP line reaches its parent's seat as `[kid] …`; an own-channel child, a child "
+          "whose own session is live, and an undeclared repo go where they did",
+          gotK == [("par", "[kid] loop STOP: x"), ("own", "loop STOP: x"), ("kid", "loop STOP: x"), ("lone", "loop STOP: x")])
+    # The thread's reply: a reply under kid/t1's root in #par once kid/t1 has finished goes to the parent's seat, not
+    # an autostarted session in the channel-less child; a child whose own seat is live, and an own-channel child, keep theirs.
+    dmH = Daemon(use_slack=False); dmH.cfg = cfgK; dmH.chan_name = lambda c: "par"
+    gotH = []; dmH.deliver = lambda target, payload, **k: gotH.append((target, payload["content"], payload["meta"]["target"])) or "delivered"
+    evH = {"type": "message", "content": "hi", "meta": {"chat_id": "C-par", "thread_ts": "8.1", "ts": "8.5"}}
+    try:
+        globals()["resolve_channel"] = lambda cfg, name: chansK.get(name)
+        with contextlib.redirect_stderr(io.StringIO()):
+            rH = [dmH.hand_to_repo("kid/t1", evH, "no-session"), dmH.hand_to_repo("own/t1", evH, "no-session")]
+            dmH.subs["kid"] = ["live-conn"]; rH.append(dmH.hand_to_repo("kid/t1", evH, "no-session"))
+    finally:
+        globals()["resolve_channel"] = real_rc
+    check("a reply in a finished channel-less child's thread in the parent's channel reaches the PARENT's seat as "
+          "`[kid] [asked in …] …`; an own-channel child and a child whose own seat is live keep their own",
+          rH == ["delivered"] * 3 and [(t, m) for t, _, m in gotH] == [("par", "par"), ("own", "own"), ("kid", "kid")]
+          and gotH[0][1].startswith("[kid] [asked in #par — that track has no live session] hi")
+          and gotH[1][1].startswith("[asked in ") and gotH[2][1].startswith("[asked in ")
+          and dmH.last_chat.get("par") == ("C-par", "8.1"))
     check("post --route: '<box> limit' goes to #alerts even when the box shares its name with a repo channel; a track's "
           "automated 'done' and the DIGEST go to the updates lane — #alerts keeps boots, limits, power and audits. The "
           "box is CC_BOX, never the kernel's hostname: the last line is titled with the HOSTNAME on a box whose CC_BOX "

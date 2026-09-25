@@ -176,22 +176,24 @@ def gh_pr(repo, pr, cache=""):
     return j
 
 
-HUNK = re.compile(r"^@@ -[0-9,]+ \+[0-9,]+ @@")
+HUNK = re.compile(r"^@@ -[0-9,]+ \+[0-9,]+ @@.*$")    # the whole header, function-context tail too: the landing's v2 key
+HUNK_LEGACY = re.compile(r"^@@ -[0-9,]+ \+[0-9,]+ @@")  # the tail kept: the key a verdict written before 2026-09-19 carries
 
 
-def change_digest(diff):
-    """cc-land's own change key, kept in step with it: the diff text with the `index` lines and the hunk line
-    numbers dropped, hashed. Two heads with the same digest are one change (a rebase between them)."""
+def change_digest(diff, legacy=False):
+    """The landing's own change key, kept in step with it: the diff text with the `index` lines and the hunk header
+    dropped (its numbers and, unless `legacy`, the function-context tail), hashed. Two heads with the same digest
+    are one change (a rebase between them)."""
     keep = []
     for ln in (diff or "").splitlines():
         if ln.startswith("index "):
             continue
-        keep.append(HUNK.sub("@@", ln) if ln.startswith("@@ ") else ln)
+        keep.append((HUNK_LEGACY if legacy else HUNK).sub("@@", ln) if ln.startswith("@@ ") else ln)
     body = "\n".join(keep).strip()
     return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:40] if body else ""
 
 
-def change_key_of(root, base, sha):
+def change_key_of(root, base, sha, legacy=False):
     """The change a head IS, read from the checkout's own objects — read-only, and "" when the head is not there.
     merge-base against the base branch as it stands: the fork point of an old head does not move."""
     rc, o = sh(["git", "rev-parse", "--verify", "-q", f"{sha}^{{commit}}"], cwd=root)
@@ -202,7 +204,12 @@ def change_key_of(root, base, sha):
     if rc or not o.strip():
         return ""
     r = subprocess.run(["git", "diff", "-U3", o.strip().split()[0], full], cwd=root, capture_output=True, text=True)
-    return change_digest(r.stdout) if r.returncode == 0 else ""
+    return change_digest(r.stdout, legacy) if r.returncode == 0 else ""
+
+
+def same_change(a, b):
+    """Two heads' key sets name one change when they share a key: a marker may carry either rule's key."""
+    return bool((set(a) & set(b)) - {""})
 
 
 def journal_lines(since):
@@ -525,19 +532,20 @@ def build_landing(repo, pr, events, gh, jf, spans, rspans, until):
         see(hexname(repo, pr, "head0"), created or (epoch(arrivals[0]["at"]) if arrivals else 0))
     order = sorted(sightings.items(), key=lambda kv: kv[1][0])
     root, base = repo_root_of(repo), (gh or {}).get("baseRefName") or "main"
-    heads, gen, last_key, keyed = [], 0, None, 0
+    heads, gen, last_key, last_keys, keyed = [], 0, None, (), 0
     for i, (sha, (at, via, key)) in enumerate(order):
         key = key or change_key_of(root, base, sha)      # the checkout's objects settle it where the marker did not
+        keys = (key, change_key_of(root, base, sha), change_key_of(root, base, sha, legacy=True)) if key else ()
         if key and (i == 0 or sightings[order[i - 1][0]][2] or True):
             keyed += 1
         if i:
             if via == "fix":
                 gen += 1
             elif key and last_key:
-                gen += 0 if key == last_key else 1
+                gen += 0 if same_change(keys, last_keys) else 1
             # no key on either side: a rebase — see the caveats
         heads.append({"at": stamp(max(at, 0)), "sha": sha, "gen": gen, "via": via if i else "push", "key": key[:12]})
-        last_key = key or last_key
+        last_key, last_keys = key or last_key, keys or last_keys
     unkeyed = sum(1 for h in heads if not h["key"])
     heads[0]["at"] = stamp(min(epoch(heads[0]["at"]), created or epoch(heads[0]["at"]),
                               epoch(arrivals[0]["at"]) if arrivals else epoch(heads[0]["at"])))
@@ -1938,6 +1946,24 @@ def cmd_selfcheck():
               tr["version"] == 2 and counts == {"memo_hits": 1, "memo_misses": 1, "stops_behind": 1, "stops_conflict": 1, "person": 1})
     finally:
         shutil.rmtree(root, ignore_errors=True)
+    # the change key is the landing's own: a rebase that only moved a hunk's line numbers and its function-context
+    # tail is one change, and a head keyed by a legacy (tail-kept) marker still matches its v2-keyed rebase.
+    lp = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-l" + "and")
+    spec = importlib.util.spec_from_loader("cc_land_digest", importlib.machinery.SourceFileLoader("cc_land_digest", lp))
+    land = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(land)
+    d1 = "diff --git a/x b/x\nindex 1..2 100644\n@@ -10,3 +10,4 @@ def f():\n a\n+b\n c\n"
+    d2 = "diff --git a/x b/x\nindex 3..4 100644\n@@ -40,3 +40,4 @@ def g():\n a\n+b\n c\n"
+    d3 = d2.replace("+b", "+z")
+    check("replay digest: equals the landing's for the same diff, both rules",
+          change_digest(d1) == land.change_digest(d1) and change_digest(d1, True) == land.change_digest(d1, legacy=True))
+    check("…a rebase that moved only the hunk's numbers and tail is one change, under the v2 rule only",
+          change_digest(d1) == change_digest(d2) and change_digest(d1, True) != change_digest(d2, True))
+    check("…a legacy-keyed head and its v2-keyed rebase share a key; a changed body shares none",
+          same_change((change_digest(d1, True), change_digest(d1), change_digest(d1, True)),
+                      (change_digest(d2), change_digest(d2), change_digest(d2, True)))
+          and not same_change((change_digest(d1, True), change_digest(d1), change_digest(d1, True)),
+                              (change_digest(d3), change_digest(d3), change_digest(d3, True))))
     print(f"cc-replay selfcheck: {len(fails)} failed")
     return 1 if fails else 0
 

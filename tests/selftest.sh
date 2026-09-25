@@ -687,7 +687,7 @@ miss=""   # M9: the bypasses the 2026-08-27 audit walked through
 for probe in 'Bash|{"command":"$(gh pr merge 1)"}' 'Bash|{"command":"bash -c \"gh pr merge\""}' 'Bash|{"command":"xargs gh pr merge"}' \
              "Bash|{\"command\":\"rm -r -f $HOME\"}" 'Bash|{"command":"rm -rf /*"}' 'Bash|{"command":"rm -rf \"$HOME/x\""}' \
              'Bash|{"command":"tmux kill-ses -t main"}' 'Bash|{"command":"pkill -f tmux"}' 'Bash|{"command":"systemctl --user restart tmux-main"}' \
-             'Bash|{"command":"tmux send-keys -t main \"tmux kill-server\" Enter"}' 'Bash|{"command":"gh api /repos/x/y"}' 'Bash|{"command":"git symbolic-ref HEAD refs/heads/main"}' \
+             'Bash|{"command":"tmux send-keys -t main \"tmux kill-server\" Enter"}' 'Bash|{"command":"gh api -X DELETE /repos/x/y"}' 'Bash|{"command":"git symbolic-ref HEAD refs/heads/main"}' \
              "Edit|{\"file_path\":\"$wt/../../../../etc/passwd\"}"; do
   [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 2 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "guard blocks all 13 bypass probes (quoting, wrappers, tmux kills, traversal)" || bad "guard bypass:$miss"

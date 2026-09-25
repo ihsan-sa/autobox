@@ -8,9 +8,10 @@ def run_selfcheck():
     os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
     nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the suite sets it; these cases read what run() was handed, not what a door did with it
     import tempfile
-    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held, seat_of, measure_seat, pane_claude, tell_slack
+    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age, worker_held, seat_of, measure_seat, pane_claude, SKILLS, skill_names, can_reload, tell_slack
     real_out = out
     real_held = worker_held      # the real one: every case below rebinds worker_held to a stub
+    _real_can_reload = can_reload
     _real = {"win_id": win_id, "pane_live": pane_live, "pane_live_id": pane_live_id, "pane_claude": pane_claude}   # the real-tmux case
     _real_measure = measure_seat   # the real one: the rotation cases stub measure_seat and check one refusal of the real
     p = f = 0
@@ -1455,6 +1456,107 @@ def run_selfcheck():
                         os.environ.pop(k, None)
                     else:
                         os.environ[k] = v
+
+            # ---- SKILL CHANGES: a seat whose skills changed after it started is typed /reload-skills by the same
+            # sweep (or, where its claude has no such command, handed off), at its first idle moment after a turn it
+            # took since the change. Each case builds its own skill, seat and transcript, and asserts both the seat
+            # that is taken and the one left alone.
+            for k in [k for k in wins if k.startswith("rt")]:
+                del wins[k]
+            SKILLS = os.path.join(d, "sk-host")
+            os.makedirs(SKILLS, exist_ok=True)
+            now = time.time()   # a SKILL.md's ctime is when it was written (now), whatever mtime it is given: turns come after it
+            can_reload = lambda pid: True
+
+            def skill(root, name, when):
+                os.makedirs(os.path.join(root, name), exist_ok=True)
+                f = os.path.join(root, name, "SKILL.md")
+                with open(f, "w") as fh:
+                    fh.write("---\nname: " + name + "\n---\n")
+                os.utime(f, (when, when))
+
+            def sk_seat(name, cwd, started, turn, pane):
+                seat(name, "sid-" + name.replace("/", "-"), cwd=cwd, started=started)
+                tx = os.path.join(d, "sk-" + name.replace("/", "-") + ".jsonl")
+                open(tx, "w").close()
+                os.utime(tx, (turn, turn))
+                meas["sid-" + name.replace("/", "-")]["transcript"] = tx
+                panes[wins[name]] = pane
+
+            def reloaded(name):
+                return sum(1 for w, t, _ in tui["typed"] if w == wins[name] and t == "/reload-skills")
+
+            # a checkout's own skill counts for the seat in that checkout and no other
+            prj = os.path.join(d, "sk-proj")
+            skill(os.path.join(prj, ".claude", "skills"), "beta", now - 50)
+            sk_seat("sk0/in", prj, now - 100, now + 60, IDLE)
+            sk_seat("sk0/out", os.path.join(d, "sk-other"), now - 100, now + 60, IDLE)
+            sweep(True)
+            ok("a seat whose checkout gained a skill after it started, and took a turn since, is typed /reload-skills "
+               "while idle, and no handoff is opened for it",
+               reloaded("sk0/in") == 1 and read("sk0/in") is None
+               and json.load(open(os.path.join(HANDOFF, "sk0--in.skills"))).get("how") == "reload")
+            ok("...a seat in another checkout, with no skill of its own changed, is left alone",
+               reloaded("sk0/out") == 0 and not os.path.exists(os.path.join(HANDOFF, "sk0--out.skills")))
+            ok("...and its journal says why", "/reload-skills for changed skills: beta" in open(os.path.expanduser(journal_for("sk0/in"))).read())
+            panes[wins["sk0/in"]] = IDLE
+            sweep(True)
+            ok("...the same change is not reloaded twice", reloaded("sk0/in") == 1)
+            skill(os.path.join(prj, ".claude", "skills"), "gamma", time.time() + 5)
+            os.utime(meas["sid-sk0-in"]["transcript"], (now + 90, now + 90))
+            sweep(True)
+            ok("...but a skill changed after that reload is", reloaded("sk0/in") == 2)
+
+            # a host skill: taken only idle, only after a turn since the change, and never by a seat born after it
+            skill(SKILLS, "alpha", now - 40)
+            sk_seat("sk1/used", "", now - 100, now + 60, IDLE)
+            sk_seat("sk1/dormant", "", now - 100, now - 60, IDLE)          # its last turn was before the change
+            sk_seat("sk1/busy", "", now - 100, now + 60, "✻ Thinking… (" + WORKING + ")\n" + BOX)
+            sk_seat("sk1/born", "", now + 30, now + 60, IDLE)               # started after the change: it has it
+            sweep(True)
+            ok("a host skill changed: the idle seat that took a turn since is reloaded", reloaded("sk1/used") == 1)
+            ok("...a dormant seat (no turn since the change) waits until it is used", reloaded("sk1/dormant") == 0)
+            ok("...a seat mid-turn is not typed at now (never mid-turn), and has no stamp, so a later tick can",
+               reloaded("sk1/busy") == 0 and not os.path.exists(os.path.join(HANDOFF, "sk1--busy.skills")))
+            ok("...a seat that started after the change already loaded it and is left alone", reloaded("sk1/born") == 0)
+            panes[wins["sk1/busy"]] = IDLE
+            sweep(True)
+            ok("...and once the busy seat is idle, the next tick takes it", reloaded("sk1/busy") == 1)
+
+            # a seat whose claude has no /reload-skills is handed off instead, and only it
+            can_reload = lambda pid: False
+            sk_seat("sk3/old", "", now - 100, now + 60, IDLE)
+            sweep(True)
+            ok("a seat whose claude has no /reload-skills gets the ordinary overlap instead; the record says the box "
+               "opened it for its skills",
+               reloaded("sk3/old") == 0 and (read("sk3/old") or {}).get("phase") == "overlap"
+               and "alpha" in (read("sk3/old") or {}).get("box", "")
+               and json.load(open(os.path.join(HANDOFF, "sk3--old.skills"))).get("how") == "handoff")
+            can_reload = lambda pid: True
+            ok("can_reload: a pid with no readable binary counts as able; one whose binary lacks the name does not",
+               _real_can_reload("") is True and _real_can_reload(str(os.getpid())) is False)
+
+            # the cap: never every seat at once
+            os.environ["CC_HANDOFF_SKILL_MAX"] = "1"
+            for i in range(3):
+                sk_seat(f"sk2/s{i}", "", now - 100, now + 60, IDLE)
+            sweep(True)
+            n1 = sum(reloaded(f"sk2/s{i}") for i in range(3))
+            for i in range(3):
+                panes[wins[f"sk2/s{i}"]] = IDLE
+            sweep(True)
+            n2 = sum(reloaded(f"sk2/s{i}") for i in range(3))
+            ok(f"CC_HANDOFF_SKILL_MAX=1: one seat a tick, the rest on later ticks (got {n1} then {n2})", n1 == 1 and n2 == 2)
+            os.environ.pop("CC_HANDOFF_SKILL_MAX", None)
+
+            # a member seat counts only the host skills its sandbox binds
+            skill_names = lambda: {"alpha"}
+            skill(SKILLS, "hostonly", now - 30)
+            ok("a member seat sees a changed skill its sandbox binds, and not one it does not",
+               set(skill_changes("", now - 100, member=True)) == {"alpha"}
+               and set(skill_changes("", now - 100)) == {"alpha", "hostonly"})
+            for k in [k for k in wins if k.startswith("sk")]:
+                del wins[k]
 
             # a window with no seat in it (a bare shell) is nothing to measure
             wins["rt4"] = "@rt4"

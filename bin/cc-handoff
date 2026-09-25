@@ -12,7 +12,8 @@ spend of two sessions; past the ROTATE LINE the box runs it for the session (--s
   cc-handoff --abandon <target> [--why "…"]  give up: the successor's window goes, the record clears
   cc-handoff --sweep [--rotate]              from the cc-reconcile timer: finish what no session is left to;
                                              with --rotate (the tick's --apply, never a bare report) also open
-                                             the overlap for a seat past the rotate line (ROTATION)
+                                             the overlap for a seat past the rotate line (ROTATION) or
+                                             one whose skills changed (SKILL CHANGES)
   cc-handoff --kick <target> [<id>]          internal: brief the successor once it is up, check it landed
   cc-handoff --retire <target>               internal: wait out the predecessor's subagents, DRAIN it, end it
   cc-handoff --brief <target>                ONE packet of what a successor would otherwise re-read a tool
@@ -77,6 +78,20 @@ is tried again next tick.
 A seat the sweep cannot find under its pane or cannot measure (a member workspace's, inside its sandbox, whose
 transcript is not under ~/.claude/projects) is left alone.
 
+SKILL CHANGES. A session reads its skills only at start, so the same `--sweep --rotate` catches a seat whose
+skill set changed — cc-skills sync, a hand sync and a landing that edits a skill all end as a changed file, so the
+sweep reads the files and none of them has to tell it. A seat's skills are the host's (~/.claude/skills; a member
+seat only the names `cc-skills names` binds into its sandbox) and its checkout's .claude/skills. Its set CHANGED
+when a SKILL.md there arrived or changed after the seat started or last reloaded (skill_changes; a skill removed is
+not noticed). The seat is then typed `/reload-skills` (Claude Code's own "pick up skills added or changed on disk
+during this session", in every version installed here since 2.1.277), which costs one short turn; only a seat whose
+claude binary has no such command (can_reload) gets the ordinary overlap instead. BOUNDED: a seat is taken only when
+it has had a turn since the change (its transcript, else its pane, is newer than the change), so a dormant seat waits
+until someone uses it; only while it is idle, never mid-turn; at most CC_HANDOFF_SKILL_MAX (2; 0 turns it off) a
+tick, the rest on later ticks; a context rotation is never doubled by it. `<slug>.skills` records what was done
+and when: a reload moves the seat's "since" to then, and a handoff holds the box off that target for
+CC_HANDOFF_ROTATE_RETRY, as `.rotated` does.
+
 QUIET WHILE OPEN. start() marks the target `~/.cc/state/<target>/pulse.off` (cc-reconcile's wake honours it)
 and takes the mark back at cutover and in clear(). A mark this file did not make is never removed.
 
@@ -103,7 +118,8 @@ Env: CC_HANDOFF (the successor's own record id, exported by `cc __runnext`; it o
 `<id>.done` and not the variable says one is still open) · CC_HANDOFF_WINDOW (the successor's own tmux
 window, so it accepts its own startup dialog) · CC_HANDOFF_OVERLAP_MAX, CC_HANDOFF_RETIRE_GRACE,
 CC_HANDOFF_DRAIN, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_WAIT, CC_HANDOFF_GONE_CONFIRM, CC_HANDOFF_AGENT_IDLE,
-CC_HANDOFF_AGENT_MAX, CC_HANDOFF_ROTATE_RETRY (~/.cc/config) · CC_HANDOFF_DIR, CC_CTX_RECORDS, CC_HANDOFF_TASKS (test hooks) ·
+CC_HANDOFF_AGENT_MAX, CC_HANDOFF_ROTATE_RETRY, CC_HANDOFF_SKILL_MAX (~/.cc/config) · CC_HANDOFF_DIR, CC_CTX_RECORDS, CC_HANDOFF_TASKS,
+CC_HANDOFF_SKILLS (test hooks) ·
 CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log may be and still count as live, 1 h) ·
 CC_BRIEF_PACKET_BAND (--brief: the packet size, in bytes, that is recorded as context cost, 24 kB).
 """
@@ -113,6 +129,7 @@ STATE = os.path.expanduser("~/.cc/state")
 DEV = os.path.expanduser("~/dev")        # where the checkouts are: --brief asks gh inside the target's own
 HANDOFF = os.environ.get("CC_HANDOFF_DIR") or os.path.join(STATE, "handoff")
 RECORDS = os.environ.get("CC_CTX_RECORDS") or os.path.join(STATE, "context")
+SKILLS = os.environ.get("CC_HANDOFF_SKILLS") or os.path.expanduser("~/.claude/skills")   # the host's skills (SKILL CHANGES)
 BIN = os.path.dirname(os.path.realpath(__file__))
 SESSION = "main"
 NEXT = "~next"                     # the successor's window suffix; `~` is not legal in a repo/track name
@@ -1572,7 +1589,7 @@ def rotate():
         if worker_held(wid):
             continue                               # a loop's window: its iteration is its own handoff (WORKER_REFUSAL)
         seats.append((name, wid) + seat)
-    opened = 0
+    opened = skilled = 0
     for target, wid, sid, cwd, started in seats:
         stamp = os.path.join(HANDOFF, slug(target) + ".rotated")
         try:
@@ -1584,6 +1601,8 @@ def rotate():
         # "a seat over the hard line is handed off ... a seat under the line is untouched" (the brief): cc-context's
         # `rotate` is that judgement, and nothing else here reads a number
         if not m or not m.get("rotate"):
+            if skilled < cfg("CC_HANDOFF_SKILL_MAX", 2):
+                skilled += skill_turn(target, wid, sid, cwd, started, m)
             continue
         why = (f"this seat was at {int(m['used']) // 1000}k tokens, past the {int(m['rotate_line']) // 1000}k rotate "
                f"line, and the box hands a seat off there rather than pay its whole context on every wake; "
@@ -1600,7 +1619,122 @@ def rotate():
             pass
         journal(target, f"rotated by the box: {why}")
         opened += 1
-    return opened
+    return opened + skilled
+
+
+def skill_names():
+    """The skills a member workspace sees: `cc-skills names`, the list cc-sandbox binds one by one. None when it
+    cannot be read, and then a member seat counts no host skill as its own."""
+    try:
+        r = subprocess.run([os.path.join(BIN, "cc-skills"), "names"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+        return set(r.stdout.split()) if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def skill_changes(cwd, since, member=False):
+    """{name: when} for every skill a seat in `cwd` loads whose SKILL.md arrived or changed after `since` (the seat's
+    start) — SKILL CHANGES in the header. The roots are the host's SKILLS and the checkout's own .claude/skills; a
+    member seat counts only the host skills its sandbox binds (skill_names). `when` is the later of the file's mtime
+    and ctime, so a skill copied in with its old mtime kept still reads as new. Dot names are half clones, never a skill."""
+    names = skill_names() if member else None
+    out = {}
+    for root in [SKILLS] + ([os.path.join(cwd, ".claude", "skills")] if cwd else []):
+        try:
+            ents = os.listdir(root)
+        except OSError:
+            continue
+        for n in ents:
+            if n.startswith(".") or (member and root == SKILLS and n not in (names or ())):
+                continue
+            try:
+                st = os.stat(os.path.join(root, n, "SKILL.md"))
+            except OSError:
+                continue
+            t = max(st.st_mtime, st.st_ctime)
+            if t > since:
+                out[n] = max(out.get(n, 0), t)
+    return out
+
+
+def activity(wid):
+    """When that window last drew anything (tmux's window_activity, epoch seconds), 0 when unreadable."""
+    try:
+        return float(tmux("display-message", "-p", "-t", wid, "#{window_activity}") or 0)
+    except ValueError:
+        return 0
+
+
+RELOAD_CMD = "/reload-skills"
+_reloads = {}
+
+
+def can_reload(pid):
+    """Does the claude binary behind that pid know RELOAD_CMD? Read once per binary (its realpath), by looking for
+    the command's registered name in it. A pid whose binary cannot be read (gone, or behind a sandbox) counts as
+    able: every version installed on this box is, and a reload typed at one that is not only prints an error."""
+    try:
+        exe = os.path.realpath(f"/proc/{pid}/exe")
+        if exe not in _reloads:
+            with open(exe, "rb") as f:
+                _reloads[exe] = f'"{RELOAD_CMD[1:]}"'.encode() in f.read()
+        return _reloads[exe]
+    except (OSError, ValueError):
+        return True
+
+
+def skill_turn(target, wid, sid, cwd, started, m):
+    """The skill half of rotate(): at a seat's first idle moment after a turn it took since its skill set changed,
+    type RELOAD_CMD at it, or open the ordinary overlap where its binary has none. 1 when it did either, else 0."""
+    stamp = os.path.join(HANDOFF, slug(target) + ".skills")
+    try:
+        with open(stamp) as f:
+            last_done = json.load(f)
+    except (OSError, ValueError):
+        last_done = {}
+    if last_done.get("how") == "handoff" and time.time() - last_done.get("ts", 0) < cfg("CC_HANDOFF_ROTATE_RETRY", 3600):
+        return 0                                   # opened one inside the retry window: expired or not, not again yet
+    since = max(started, last_done.get("ts", 0) if last_done.get("how") == "reload" and last_done.get("session_id") == sid else 0)
+    ch = skill_changes(cwd, since, member_workspace(parts(target)[0]))
+    if not ch:
+        return 0                                   # "hand off only sessions whose skill set actually changed" (the brief)
+    newest = max(ch.values())
+    try:                                           # the seat's last turn: its transcript, else what its pane last drew
+        last = os.path.getmtime(m["transcript"]) if m and m.get("transcript") else activity(wid)
+    except OSError:
+        last = activity(wid)
+    if last <= newest:
+        return 0                                   # no turn since the change: a dormant seat waits until it is used
+    if not idle(wid):
+        return 0                                   # "when each next goes idle, never mid-turn" (the brief): next tick
+    names = ", ".join(sorted(ch))
+    # "prefer typing a skills-reload command into an idle session over a full handoff ... use a handoff only where
+    # a reload is not possible" (the owner's addition to the brief)
+    if can_reload(pane_claude(wid)):
+        how = "reload"
+        ok = run([os.path.join(BIN, "cc-msg"), target, RELOAD_CMD])
+        logd(f"skills: {target} ({names}) — {RELOAD_CMD} {'typed' if ok else 'not typed'}")
+        note = f"the box typed {RELOAD_CMD} for changed skills: {names}"
+    else:
+        how = "handoff"
+        why = (f"the skills this seat loads changed after it started ({names}), its claude has no {RELOAD_CMD}, and a "
+               f"session reads its skills only at start, so the box hands it off at its first idle moment; its journal "
+               f"is the packet, so ask it only what the journal lacks.")
+        rc = start(target, sid, why, box=True)
+        logd(f"skills: {target} ({names}) — start rc {rc}")
+        ok = rc == 0
+        note = f"handed off by the box for new skills: {names}"
+    if not ok:
+        return 0                                   # not typed or refused: no stamp, so the next tick tries again
+    try:
+        os.makedirs(HANDOFF, exist_ok=True)
+        with open(stamp, "w") as f:
+            json.dump({"target": target, "session_id": sid, "skills": sorted(ch), "how": how, "ts": time.time()}, f)
+    except OSError:
+        pass
+    journal(target, note)
+    return 1
 
 
 def sweep(rotate_too=False):

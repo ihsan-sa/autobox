@@ -811,6 +811,27 @@ down still leaves the board write, which is the half of this that must never be 
       FK_ST="$lh/.cc/state/lp/ceil" FK_LINE="" FK_COMMIT=0 CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=9999 \
       "$lb/cc-loop" lp ceil --max-iter 1 ) >/dev/null 2>&1
   t 'a dispatcher that already set the ceiling is not overridden' "$(cat "$lh/.cc/state/lp/ceil/bgceil" 2>/dev/null)" 9999
+  # ── A KILLED ITERATION STILL LOGS WHAT IT SPENT ── its own fixture: a claude that writes a transcript (250k input
+  # tokens of opus-5-5 = $1.0000) and dies at the hour limit (rc=124) with no result json. The file is a RESUMED
+  # session's, so it already holds an earlier run's $12 record, which must not be priced again. Beside it, a finished
+  # iteration whose json carries its own cost, which must never be re-priced from a transcript.
+  cp "$BIN/cc-spend" "$lb/cc-spend"
+  cat > "$lb/claudekill" <<'KILL'
+#!/bin/sh
+p="$HOME/.claude/projects/$(printf %s "$PWD" | sed 's/[^A-Za-z0-9]/-/g')"; mkdir -p "$p"
+printf '%s\n' '{"type":"assistant","requestId":"r0","sessionId":"s1","timestamp":"2026-01-01T10:00:00Z","cwd":"/x","message":{"model":"claude-opus-5-5","usage":{"input_tokens":3000000}}}' > "$p/s1.jsonl"
+printf '{"type":"assistant","requestId":"r1","sessionId":"s1","timestamp":"%s","cwd":"/x","message":{"model":"claude-opus-5-5","usage":{"input_tokens":250000}}}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$p/s1.jsonl"
+exit 124
+KILL
+  chmod +x "$lb/claudekill" "$lb/cc-spend"
+  mkdir -p "$lh/.cc/state/lp/kl" "$lh/.cc/worktrees/lp/kl"; echo "the task" > "$lh/.cc/state/lp/kl/task.md"
+  git -C "$lh/.cc/worktrees/lp/kl" init -q; git -C "$lh/.cc/worktrees/lp/kl" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudekill" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+      "$lb/cc-loop" lp kl --max-iter 1 ) >/dev/null 2>&1
+  t 'an iteration killed at the hour limit logs the spend its transcript shows since it started (not a resumed session'"'"'s older records), marked as priced from it' \
+    "$(grep -c 'iter 1 end rc=124 .*cost=\$1.0000~transcript total=\$1.0000' "$lh/.cc/state/lp/kl/loop.log")" 1
+  t '…and a finished iteration keeps the cost its own json reports, unmarked' \
+    "$(grep -c 'iter 1 end .*cost=\$1.25 total=' "$lh/.cc/state/lp/it/loop.log")" 1
   lrun ro '- committed a step' 1 --max-iter 1 --no-extend
   t 'a round that is over posts nothing at all' "$(grep -c . "$d/lb.n")" 0
   t '…and the board note and loop.log carry it' "$(grep -c 'round over at its step limit' "$lh/.cc/state/lp/ro/loop.log")" 1
@@ -975,7 +996,7 @@ if "$BIN/cc-pause" is "$repo" 2>/dev/null; then   # the whole project is parked:
   echo "cc-loop: $repo is paused — \`cc-pause off $repo\` starts its workers again" >&2; exit 2
 fi
 if tier_hold start "$repo/$track"; then   # the box-wide spend tier (cc-tier): under stop nothing starts; under essential only a row marked critical, one at a time
-  echo "cc-loop: $("$BIN/cc-tier" line) — $repo/$track waits (mark it critical: cc board set $repo $track critical yes, or cc-tier set <tier>)" >&2; exit 2
+  echo "cc-loop: $("$BIN/cc-tier" line) — $repo/$track waits: $("$BIN/cc-tier" allows start "$repo/$track" 2>&1 >/dev/null)" >&2; exit 2
 fi
 ST="$HOME/.cc/state/$repo/$track"; WT="$HOME/.cc/worktrees/$repo/$track"; BOARD="$BIN/cc-board"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 # Host-side git on the worktree (the checkpoint, its push, cc done) runs the MAIN checkout's hooks, never the worktree's: with a
@@ -1081,7 +1102,7 @@ while [ $i -lt "$MAXI" ]; do
   TRIMENV=(); tb=$(trim_body); [ -n "$tb" ] && TRIMENV=("CLAUDE_CODE_EXTRA_BODY=$tb")   # empty unless CC_LOOP_TRIM is on: the child's environment is otherwise exactly what it always was
   BGENV=(); [ -z "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS+x}" ] && BGENV=("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0")   # print mode's own 600s wait for background subagents killed a $10 run mid-turn; `timeout 3600` below still bounds the iteration, so this only removes a SHORTER, silent one — never overridden when the caller already set it
   log "iter $i/$MAXI start (budget \$$BUDGET, turns $TURNS, model ${m:-box default}${TRIMENV:+, context trim on})"   # the trim is named in the log so a shadow week can tell trimmed runs from the rest; the model is in the log too (a survey of what workers ran on found this default wrong) — AFTER the "start (budget" prefix cc-secretary parses (review of #169)
-  out="$ST/runs/$(date -u +%Y%m%dT%H%M%SZ)-$i.json"
+  out="$ST/runs/$(date -u +%Y%m%dT%H%M%SZ)-$i.json"; t0=$(date +%s)
   ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; CC_WORKER_SANDBOX=1 wraps it in bwrap (cc-sandbox), otherwise that line is exec'd untouched
   child=$!; wait "$child"; rc=$?; child=""
   if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
@@ -1090,7 +1111,12 @@ while [ $i -lt "$MAXI" ]; do
     "$BIN/cc-limit" wait || stop 8 "waiting" "The Claude usage limit lasts until $("$BIN/cc-time" slack "${lim#LIMIT }" 2>/dev/null || echo "${resets}Z"), which is longer than the loop waits. To start it again: cc $repo $track --go \"\""
     i=$((i-1)); continue; fi
   "$BIN/cc-limit" clear   # the API answered: whatever else went wrong, it was not a limit
-  cost=$(jq -r '.total_cost_usd // 0' "$out" 2>/dev/null); iserr=$(jq -r '.is_error // false' "$out" 2>/dev/null)
+  cost=$(jq -r '.total_cost_usd // empty' "$out" 2>/dev/null); costsrc=""
+  # A KILLED ITERATION (rc=124 at the hour limit, or any kill) leaves no result json, so no total_cost_usd — and its
+  # spend used to vanish from total=. The session's transcript is still on disk: cc-spend prices it (its one rates
+  # table, no second pricer), and the line marks the figure as priced from the transcript.
+  if [ -z "$cost" ]; then cost=$("$BIN/cc-spend" transcript "$WT" "$t0" 2>/dev/null); costsrc="~transcript"; fi
+  cost=${cost:-0}; iserr=$(jq -r '.is_error // false' "$out" 2>/dev/null)
   turns=$(jq -r '.num_turns // 0' "$out" 2>/dev/null); subtype=$(jq -r '.subtype // ""' "$out" 2>/dev/null)
   spent=$(awk -v a="$spent" -v b="${cost:-0}" 'BEGIN{printf "%.4f", a+b}')
   # THE BRANCH THE WORKER MOVED IS ITS OWN COPY, AND THIS IS WHERE IT BECOMES THE HOST'S. Inside the sandbox
@@ -1103,7 +1129,7 @@ while [ $i -lt "$MAXI" ]; do
   ( cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" --push ) || true   # …and push whatever is ahead of origin even with nothing left to commit: inside the sandbox the Stop hook commits but cannot push (no credential), and only this line can
   after_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); after_prog=$(md5sum "$ST/progress.md" | cut -c1-8)
   moved=no; { [ "$before_head" != "$after_head" ] || [ "$before_prog" != "$after_prog" ]; } && moved=yes
-  log "iter $i end rc=$rc err=$iserr/$subtype turns=$turns cost=\$$cost total=\$$spent commits=$([ "$before_head" != "$after_head" ] && echo yes || echo no) journal=$([ "$before_prog" != "$after_prog" ] && echo updated || echo unchanged)"
+  log "iter $i end rc=$rc err=$iserr/$subtype turns=$turns cost=\$$cost$costsrc total=\$$spent commits=$([ "$before_head" != "$after_head" ] && echo yes || echo no) journal=$([ "$before_prog" != "$after_prog" ] && echo updated || echo unchanged)"
   [ "$QUIET" = 1 ] || jq -r '.result // ""' "$out" 2>/dev/null | tail -c 600 | sed 's/^/  │ /' >&2
   newprog=$(this_iteration "$SNAP" "$ST/progress.md")   # only THIS iteration's lines count, by position — see the function (a re-dispatched track must not "finish" on an old STATUS line, and must not MISS a new one that reads the same)
   if grep -qE '^STATUS: DONE' <<<"$newprog"; then

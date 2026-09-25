@@ -93,6 +93,13 @@
 #     is him, in tmux, for every curl (2026-09-10, his course workspace). Everything else about the boundary stays; a member's
 #     workspace keeps every ask. THE MARKER IS HOST-SIDE: ~/.cc/members/<repo>/owner-workspace, a directory no bind of
 #     the boundary reaches, so a session inside can neither make it nor remove it. `rm` it to take the asks back.
+#   cc-sandbox web <workspace>   ~/dev/<workspace>, a member workspace, is GRANTED THE WEB: its sealed sessions get the ask
+#     baseline WITHOUT WebFetch and WebSearch, so auto mode judges each call instead of an ask rule stopping the session on a
+#     dialog nobody on the box can clear (owner, 2026-09-24: "how do we make automode decide"). Those two tools only: sudo
+#     and the network clients still ask. The owner runs it, or the daemon does when he answers `yes <id> fix` on a WebFetch
+#     or WebSearch card. The marker is host-side beside owner-workspace — ~/.cc/members/<workspace>/web-grant — so a
+#     session can neither plant it nor remove it. It takes effect at the session's NEXT launch: the settings copy a running
+#     session holds is mounted by inode, and a new copy is a new file. `rm` the marker to take the asks back.
 #   cc-sandbox github <workspace> [<token file>]   ~/dev/<workspace>, a member workspace, is GRANTED A GITHUB TOKEN: a
 #     fine-grained PAT the owner made and scoped to the repositories that workspace may touch (docs/github-app.md; default
 #     ~/.cc/secrets/github-personal.token, mode 600). From its next launch the session inside holds it where gh and git read
@@ -192,6 +199,8 @@ slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.cla
 #   though ~/.claude/settings.json allows `curl` box-wide: inside the boundary the box is STRICTER than outside it.
 #   EXCEPT IN A WORKSPACE THE OWNER MADE FOR HIMSELF (`cc-sandbox own`, the header): there this list is not appended
 #   at all, because the only person who can answer the dialog is the one it interrupts (settings_copy, build_member).
+#   AND IN A WORKSPACE GRANTED THE WEB (`cc-sandbox web`, the header) WebFetch and WebSearch are left off it, so auto mode
+#   judges those two; every other entry stays.
 #   ITS CEILING, MEASURED (2026-09-03, these same rules through `claude -p --settings`): they are command-NAME rules
 #   and they cover a direct call, nothing more. `curl -sS https://example.com/` prompted; `sh -c 'curl …'` and
 #   `/usr/bin/curl …` did not — no denial, 559 bytes off the box, twice. `env curl` and three lines of python are the
@@ -224,7 +233,8 @@ SBX_ALLOW='["Bash(*)","Read(//**)","Edit(//**)","Write(//**)","NotebookEdit(//**
 # thread, the channel canvas or docs/ instead.
 SBX_DENY='["Artifact"]'
 SBX_ASK='["Bash(sudo:*)","Bash(curl:*)","Bash(wget:*)","Bash(nc:*)","Bash(ncat:*)","Bash(netcat:*)","Bash(telnet:*)","Bash(socat:*)","Bash(ssh:*)","Bash(scp:*)","Bash(sftp:*)","WebFetch","WebSearch"]'
-settings_copy(){   # $1 "" | owner → stdout: the settings.json the sealed session sees. Read-only in there; his own file is never written.
+SBX_WEB='["WebFetch","WebSearch"]'   # what a web grant (cc-sandbox web) takes out of SBX_ASK, and nothing else
+settings_copy(){   # $1 "" | owner | web → stdout: the settings.json the sealed session sees. Read-only in there; his own file is never written.
   # rc 1 = NO copy, and the caller then binds his file unchanged and says the baseline is not applied. THE MERGE CAN
   # FAIL ON A FILE THAT PARSES: `jq -e .` proves his file is JSON, not that this filter can run on it — a hand-edited
   # `"allow": "Bash(x)"` (a string where a list belongs) parses and then aborts jq mid-stream, because `$a - "Bash(x)"`
@@ -238,6 +248,12 @@ settings_copy(){   # $1 "" | owner → stdout: the settings.json the sealed sess
   # entries still come through, SBX_ALLOW is the same, cc-guard's member rules stand behind it as before. The caller
   # decides `owner` from a host-side marker, never from anything the session can write (build_member).
   [ "${1:-}" = owner ] && k='[]'
+  # A WORKSPACE GRANTED THE WEB (cc-sandbox web) — the brief: "WebFetch and WebSearch are no longer ask rules, so auto
+  # mode judges each call … only those two tools … sudo and the network clients stay ask." An ask rule outranks auto
+  # mode, so leaving either here is a dialog per lookup; taking them out hands each call to auto mode's own judgment,
+  # not to an allow rule. The member can then read the web without a card; what it could already send out by curl
+  # behind `sh -c` (ITS CEILING, above) is unchanged, and cc-guard still stands behind every call.
+  [ "${1:-}" = web ] && k=$(jq -c --argjson w "$SBX_WEB" '. - $w' <<<"$SBX_ASK")
   # AND HIS FILE IS WHERE THE HOOKS LIVE, so a baseline built without one is a session with permissions and no
   # cc-guard registered — while SBX_ALLOW opens Bash all the way, which makes it MORE open than no baseline at
   # all, not less. Absent is therefore refused exactly like a file that will not parse: the caller binds nothing
@@ -254,7 +270,7 @@ settings_copy(){   # $1 "" | owner → stdout: the settings.json the sealed sess
             deny:  ((.permissions.deny  // []) + ($d - (.permissions.deny  // []))),
             ask:   ((.permissions.ask   // []) + ($k - (.permissions.ask   // [])))})}' "$s" \
     || { echo "cc-sandbox: the sealed-session baseline would not merge into ~/.claude/settings.json — is permissions.allow, .deny or .ask something other than a list?" >&2; return 1; }; }
-settings_bind(){   # $1 a host dir NO bind of this boundary reaches · $2 "" | owner (settings_copy's) · [$3 where the copy is seen inside, default his path] → put the copy there and mount it ro
+settings_bind(){   # $1 a host dir NO bind of this boundary reaches · $2 "" | owner | web (settings_copy's) · [$3 where the copy is seen inside, default his path] → put the copy there and mount it ro
   # It has to be a REAL FILE ON THE HOST, ro-bound like any other path. Measured 2026-09-02: handed in over an fd
   # (`--ro-bind-data`, `--file`) the copy is readable inside — jq reads it — and claude applies NONE of it, his own
   # rules included, so a session got no settings at all. The mount, not the copy, is what makes it read-only, and a
@@ -832,7 +848,8 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   # THE OWNER'S OWN WORKSPACE asks nothing (cc-sandbox own). The marker sits in $m, which no bind above reaches — only
   # its subdirectories are bound, each at another path — so a session inside can neither plant it nor remove it: the
   # workspace's .cc/ is rw in here, which is why the marker is NOT beside .cc/member-workspace.
-  own=""; [ -f "$m/owner-workspace" ] && own=owner
+  # A WEB GRANT (cc-sandbox web) sits beside it in the same unreachable directory, for the same reason; owner wins.
+  own=""; if [ -f "$m/owner-workspace" ]; then own=owner; elif [ -f "$m/web-grant" ]; then own=web; fi
   settings_bind "$H/.cc/sandbox/$h/${tr:-_workspace}" "$own"
   lib_bind "$h"   # the knowledge library: this workspace's own index file, ro, and none of the rest of it (lib_bind)
   docs_bind "$h"   # the document register: this workspace's own view of it, ro, AS ~/.cc/documents (docs_bind)
@@ -1104,6 +1121,18 @@ own(){   # $1 repo — a member workspace the owner made for HIMSELF is marked a
                                      "# host-side on purpose — no session inside reaches this directory. rm this file to take the asks back." > "$m/owner-workspace" \
     || { echo "cc-sandbox: could not write $m/owner-workspace — nothing was changed" >&2; return 2; }
   echo "cc-sandbox: ~/dev/$r is the owner's own workspace now (~/.cc/members/$r/owner-workspace). Its sealed sessions stop asking about sudo, the network clients, WebFetch and WebSearch from their next launch — reopen any that are running. rm the marker to take it back."; }
+web(){   # $1 workspace — a member workspace is granted WebFetch and WebSearch without an ask, or the refusal says why. The
+  # grant is one host-side file, ~/.cc/members/<workspace>/web-grant, written where no session inside can (build_member).
+  # It changes ONE thing, two entries of the ask baseline (settings_copy); it is not a wider boundary.
+  local r="${1:-}" m
+  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  m="$H/.cc/members/$r"
+  [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — there is no sealed session there to grant the web to" >&2; return 2; }
+  [ -f "$m/web-grant" ] && { echo "cc-sandbox: ~/dev/$r already has the web — nothing changed."; return 0; }
+  mkdir -p "$m" && printf '%s\n%s\n' "# a web grant: this workspace's sealed sessions do not ask about WebFetch or WebSearch; auto mode judges each call (cc-sandbox web)" \
+                                     "# host-side on purpose — no session inside reaches this directory. rm this file to take the asks back." > "$m/web-grant" \
+    || { echo "cc-sandbox: could not write $m/web-grant — nothing was changed" >&2; return 2; }
+  echo "cc-sandbox: ~/dev/$r has the web now (~/.cc/members/$r/web-grant). WebFetch and WebSearch stop asking from each session's next launch, so a running session keeps asking until it is reopened. sudo and the network clients still ask. rm the marker to take it back."; }
 github(){   # $1 handle [$2 token file] — a member workspace is GRANTED a GitHub token, or the refusal says why. The grant is one
   # host-side link, ~/.cc/members/<handle>/github-token → the token file (default ~/.cc/secrets/github-personal.token), written
   # where no session inside can (build_member). From its next launch the workspace holds that token inside, where gh and git
@@ -1700,6 +1729,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
     echo his=$(jq -r "[.permissions.allow[0],.permissions.deny[0],.permissions.ask[0],.theme,.hooks.PreToolUse[0].hooks[0].command]|join(\"|\")" $s)
     echo keys=$(jq -r "keys|join(\",\")" $s)
     echo askn=$(jq -r ".permissions.ask|length" $s)
+    echo web=$(jq -r "[(.permissions.ask|index(\"WebFetch\")!=null),(.permissions.ask|index(\"WebSearch\")!=null)]|join(\",\")" $s)
     echo noartifact=$(jq -r "[.permissions.deny[0],(.permissions.deny|index(\"Artifact\")!=null),(.permissions.deny|length)]|join(\",\")" $s)
     echo ro=$( (echo x >> $s) 2>/dev/null && echo writable || echo ro)'
   out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
@@ -1755,6 +1785,31 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   out=$(env HOME="$fh" "$SELF" member "$ho" -- sh -c 'rm -rf $HOME/.cc/members; echo gone=$([ -e $HOME/.cc/members/'"$ho"'/owner-workspace ] || echo yes)' 2>&1)
   t 'own: an owner session that removes the marker at its path removes nothing of the host'"'"'s — still marked, and its next launch still asks nothing' \
     "$(g gone)/$([ -f "$fh/.cc/members/$ho/owner-workspace" ] && echo marked || echo none)/$(env HOME="$fh" "$SELF" member "$ho" -- sh -c "$probe" 2>/dev/null | sed -n 's/^crosses=//p')" yes/marked/false,false,false,false
+  # ── A WORKSPACE GRANTED THE WEB, on a fixture of its own in the same HOME. `cc-sandbox web` is refused until the
+  #    workspace marker exists, then makes one host-side file; that workspace's copy leaves WebFetch and WebSearch off
+  #    the ask list and keeps every other entry of SBX_ASK — the member fixture above ('crosses', askn) is the same
+  #    launch without the grant, so it is this case's other side.
+  hw="ccsbxpw$$"; devw="$fh/dev/$hw"; mkdir -p "$devw/.cc" "$fh/.cc/members/$hw" || return 1
+  git -C "$devw" init -q -b main >/dev/null 2>&1; cp "$fh/.cc/members/$h/credentials.json" "$fh/.cc/members/$hw/credentials.json"
+  out=$(env HOME="$fh" "$SELF" web "$hw" 2>&1); rc=$?
+  t 'web: a repo that is not a member workspace is refused, and no grant is made' \
+    "$rc/$(grep -c 'not a member workspace' <<<"$out")/$([ -e "$fh/.cc/members/$hw/web-grant" ] && echo granted || echo none)" 2/1/none
+  : > "$devw/.cc/member-workspace"
+  out=$(env HOME="$fh" "$SELF" member "$hw" -- sh -c "$probe" 2>&1)
+  t 'web: before the grant a member workspace asks about both — WebFetch and WebSearch are on its ask list' "$(g web)" true,true
+  out=$(env HOME="$fh" "$SELF" web "$hw" 2>&1); rc=$?
+  t 'web: a member workspace is granted the web — one host-side marker, and the line says a running session keeps asking until reopened' \
+    "$rc/$([ -f "$fh/.cc/members/$hw/web-grant" ] && echo granted || echo none)/$(grep -c 'next launch' <<<"$out")" 0/granted/1
+  out=$(env HOME="$fh" "$SELF" web "$hw" 2>&1); rc=$?
+  t 'web: granting it again changes nothing and says so' "$rc/$(grep -c 'nothing changed' <<<"$out")" 0/1
+  out=$(env HOME="$fh" "$SELF" member "$hw" -- sh -c "$probe" 2>&1)
+  t 'web: inside a granted workspace WebFetch and WebSearch ask no more — curl, ssh and sudo still do, and the list is two short' \
+    "$(g web)/$(g crosses)/$(g askn)" "false,false/true,true,true,false/$((1 + $(jq length <<<"$SBX_ASK") - 2))"
+  t 'web: …and everything else is the member copy — the allow baseline, his own rules in his order, his hook, read-only' \
+    "$(g silent)/$(g his)/$(g ro)" 'true,true,true,true/Bash(hisown *)|Bash(tmux kill-server:*)|Bash(sudo tee *)|ownr-theme|$HOME/bin/cc-guard/ro'
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'mkdir -p $HOME/.cc/members/'"$h"' && : > $HOME/.cc/members/'"$h"'/web-grant && echo made=$([ -f $HOME/.cc/members/'"$h"'/web-grant ] && echo yes)' 2>&1)
+  t 'web: a member session that makes the grant at its path makes it on its own tmpfs — the host has none, and its next launch still asks' \
+    "$(g made)/$([ -e "$fh/.cc/members/$h/web-grant" ] && echo granted || echo none)/$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>/dev/null | sed -n 's/^web=//p')" yes/none/true,true
   # ── THE WORKER PATH GETS THE SAME COPY, on its own fixture in the same HOME — and a marker planted under
   #    ~/.cc/members/<repo> for a repo that is no member workspace changes nothing there: only build_member reads it.
   mkdir -p "$fh/dev/$w" "$fh/.cc/state/$w/t" "$fh/.cc/worktrees/$w" "$fh/.cc/members/$w" || return 1; : > "$fh/.cc/members/$w/owner-workspace"
@@ -2440,6 +2495,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
        launch_vet "$@";;   # no CC_WORKER_SANDBOX door below: this profile is bwrap or nothing
   convert) shift; convert "${1:-}"; exit $?;;
   own) shift; own "${1:-}"; exit $?;;
+  web) shift; web "${1:-}"; exit $?;;
   github) shift; github "${1:-}" "${2:-}"; exit $?;;
   member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ] && [ "${1:-}" != --tree ]; then tr="${1:-}"; shift; fi   # <handle> [<track>|""] [--tree <dir>] [--] cmd
           if [ "${1:-}" = --tree ]; then TREE="${2:-}"; shift 2; [ -n "$TREE" ] || { echo "cc-sandbox: --tree takes a directory" >&2; exit 2; }; fi
@@ -2452,6 +2508,6 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox github <workspace> [<token file>]   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [<token file>]   |   cc-sandbox selfcheck" >&2; exit 2; }
 [ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added
 launch "$repo" "$track" "$@"

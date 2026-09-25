@@ -8,7 +8,9 @@ The brief itself lives in ~/.cc/state/<repo>/<track>/task.md, and `brief append|
 (a test run keeps out of the box's own state), as it does for cc-brief; CC_BOARD_LOCK_WAIT shortens the lock wait (the selfcheck's).
 `add` refuses a repo or row name `cc` could not dispatch (cc's valid_name: 64 characters at most), before writing.
 `add` lands whole or not at all: no board, a board lock held past the wait or a save that fails exits with one line and
-takes the brief it had written out again, so there is never a task.md without a row. `set … instructions` is the one
+takes the brief it had written out again, so there is never a task.md without a row. `add` on a row that exists keeps
+its title (only an empty one or the row's own name is replaced) and says so: a rename is `set … title`, a message `note`.
+A machine writer (CC_BRIEF_MACHINE=1, e.g. cc-audit's main-gate row) re-adds to update its own row, so its title is written. `set … instructions` is the one
 deliberate way to lose a brief: it prints the size it replaced and the size it wrote, and leaves the old file whole as
 task.md.bak beside it (one back; the next replace overwrites it).
 `add` and `set … instructions` are the doors a brief comes in by: cc-brief refuses one that prescribes the steps
@@ -621,6 +623,18 @@ def main(a):
                 d = need(repo)
                 t = d["tracks"].get(track, {})
                 t.pop("instructions", None)                 # a re-add drops the pre-#94 copy too
+                # A ROW THAT EXISTS KEEPS ITS TITLE (raised-board-add-replaces-title): two session rows carried a
+                # note as their title after `add` was used to tell them something. A title only replaces an empty one
+                # or the placeholder `cc` stamps (the row's own name); a rename is `set … title`, a message `note`.
+                old_title = (t.get("title") or "").strip()
+                # A machine writer (CC_BRIEF_MACHINE=1) updates its own row in place by re-adding it (cc-audit's
+                # main-gate row carries the current failure in its title), so its title is written, not kept.
+                machine = os.environ.get("CC_BRIEF_MACHINE") == "1"
+                if old_title and old_title != track and old_title != title and not machine:
+                    print(f"cc-board add: {repo}/{track} already exists — its title '{old_title}' is kept.\n"
+                          f"  rename it: cc-board set {repo} {track} title '<title>' · tell it something: "
+                          f"cc-board note {repo} {track} '<text>'", file=sys.stderr)
+                    title = old_title
                 t.update({"title":title, "kind":kind(t),
                           "status":state(t.get("status","queued")),
                           "branch":t.get("branch",f"track/{track}"),
@@ -854,9 +868,10 @@ def selfcheck():
     import subprocess, tempfile, shutil
     th = tempfile.mkdtemp(prefix="ccboard-sc-")
     try:
-        def run(*args):
+        def run(*args, env=None):   # env: extra variables for this one call
+            base = {k: v for k, v in os.environ.items() if k != "CC_BRIEF_MACHINE"}
             try: return subprocess.run([sys.executable, os.path.realpath(__file__), *args],
-                                       env={**os.environ, "HOME": th},
+                                       env={**base, "HOME": th, **(env or {})},
                                        capture_output=True, text=True, timeout=60)
             except subprocess.TimeoutExpired as e:   # a hang is ONE failed case, not a suite that never ends
                 out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -937,6 +952,19 @@ def selfcheck():
             "instructions": "A THIRD OLD BRIEF", "updated": now()}
         json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
         run("add", "r", "t3", "renamed")     # a bare re-add drops the JSON copy — it must migrate it, not lose it
+        rt = run("add", "r", "t3", "a note meant for the row")
+        ok("a re-add of an existing row keeps the title a person set, and says how to rename or note it",
+           json.load(open(f"{th}/.cc/boards/r.json"))["tracks"]["t3"]["title"] == "T3"
+           and "title 'T3' is kept" in rt.stderr and "cc-board note r t3" in rt.stderr)
+        run("add", "r", "ph", "ph"); rp = run("add", "r", "ph", "the real title")
+        ok("…but the placeholder title (the row's own name, as cc stamps it) is replaced, without a warning",
+           json.load(open(f"{th}/.cc/boards/r.json"))["tracks"]["ph"]["title"] == "the real title"
+           and "is kept" not in rp.stderr)
+        run("add", "r", "mg", "main is red: old failure")
+        rm = run("add", "r", "mg", "main is red: new failure", env={"CC_BRIEF_MACHINE": "1"})
+        ok("…and a machine writer (CC_BRIEF_MACHINE=1) re-adding its own row updates the title, as cc-audit's main gate does",
+           json.load(open(f"{th}/.cc/boards/r.json"))["tracks"]["mg"]["title"] == "main is red: new failure"
+           and "is kept" not in rm.stderr)
         ok("a re-add of a legacy row migrates its brief before dropping the JSON copy",
            open(f"{th}/.cc/state/r/t3/task.md").read().strip() == "A THIRD OLD BRIEF"
            and "A THIRD OLD BRIEF" not in run("json", "r").stdout)

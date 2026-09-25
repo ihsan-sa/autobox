@@ -57,6 +57,10 @@ student's chat cannot.
   cc-spend --by repo|track|model|kind [--week]
   cc-spend --week              the last 7 days
   cc-spend today [<repo>]      what AUTONOMOUS work has booked today, per repo; with a repo, that one number
+  cc-spend transcript <cwd> <since-epoch>
+                               USD of what sessions run in <cwd> wrote since <since-epoch> (a resumed session's
+                               older records in the same file are not counted)
+                               (cc-loop prices an iteration it killed, which left no result json, this way)
   cc-spend cache [--days N]    cache-read tokens per session per day, biggest first (default 7 days)
   cc-spend --json              today, the week and the last 7 days one by one, for the dashboard
   cc-spend phantoms            spend with nobody watching it (the tick also saves it to phantoms.tsv)
@@ -437,7 +441,7 @@ def tutor_roots():
     return {p: os.path.relpath(p, STATE).split(os.sep)[0] for p in sorted(glob.glob(pat)) if os.path.isdir(p)}
 
 
-def scan_file(path, prev, seen_rids=None, sub_rids=None):
+def scan_file(path, prev, seen_rids=None, sub_rids=None, since=None):
     """Read one transcript from where the last tick stopped. Returns (rows, newstate, rids) where rows are
     ((session, model, day) -> totals), newstate is what to remember about this file, and rids is every
     (session, requestId) an assistant record in the NEW bytes just read carried — whether or not it was
@@ -450,7 +454,10 @@ def scan_file(path, prev, seen_rids=None, sub_rids=None):
     record is dropped only when its OWN requestId is in its OWN session's set, because that is the one case
     where a subagent's file really holds the same record. Every other isSidechain record — no subagents/
     directory at all, or one whose files don't carry this requestId — is counted: dropping it on layout alone,
-    as before, just lost the tokens."""
+    as before, just lost the tokens.
+
+    since, when given (epoch), drops every assistant record stamped before it: a resumed session appends to its
+    old file, and only the records written from `since` on are this run's."""
     stt = os.stat(path)
     start = int(prev.get("off") or 0)
     if stt.st_ino != prev.get("ino") or stt.st_size < start:
@@ -476,6 +483,10 @@ def scan_file(path, prev, seen_rids=None, sub_rids=None):
             continue
         if rec.get("type") != "assistant":
             continue
+        if since is not None:
+            ts = parse_ts(rec.get("timestamp"))
+            if ts is None or ts.timestamp() < since:
+                continue                       # an earlier run's record in a resumed session's file
         msg = rec.get("message") or {}
         u = msg.get("usage") or {}
         rid = rec.get("requestId") or msg.get("id") or ""
@@ -1023,6 +1034,24 @@ def ledger_age(at=None):
     current than this, so anything reading a figure off it has to be told."""
     t = parse_ts((load_offsets() or {}).get("tick"))
     return (t, ((at or now()) - t).total_seconds()) if t else (None, None)
+
+
+def cmd_transcript(cwd, since):
+    """USD, 4 places, of the assistant records a session in `cwd` wrote at or after `since` (epoch), from byte 0 and
+    never touching the tick's offsets. A file older than `since` is skipped whole; a newer one — a resumed session
+    appends to its old file — counts only the records stamped from `since` on. The project directory is the cwd with every non-alphanumeric turned into a dash."""
+    d = os.path.join(PROJ, re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd)))
+    seen, tot = set(), 0.0
+    for path in sorted(glob.glob(os.path.join(d, "**", "*.jsonl"), recursive=True)):
+        try:
+            if os.stat(path).st_mtime < since:
+                continue
+            agg = scan_file(path, {}, seen, since=since)[0]
+        except OSError:
+            continue
+        tot += sum(a["usd"] for a in agg.values())
+    print(f"{tot:.4f}")
+    return 0
 
 
 def cmd_today(repo=None):
@@ -1859,6 +1888,7 @@ def selfcheck():
 # ---------------------------------------------------------------- cli
 
 USAGE = ("usage: cc-spend [--by repo|track|model|kind] [--week] | today [<repo>] | cache [--days N] "
+         "| transcript <cwd> <since-epoch> "
          "| --json | phantoms | tick | selfcheck")
 
 
@@ -1872,6 +1902,10 @@ def main(argv):
         if len(argv) > 2 or (len(argv) == 2 and argv[1].startswith("-")):
             bail()
         return cmd_today(argv[1] if len(argv) == 2 else None)
+    if argv and argv[0] == "transcript":
+        if len(argv) != 3 or not argv[2].isdigit():
+            bail()
+        return cmd_transcript(argv[1], int(argv[2]))
     if argv and argv[0] == "cache":
         rest = argv[1:]
         n = 7

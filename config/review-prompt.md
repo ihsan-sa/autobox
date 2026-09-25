@@ -3,7 +3,7 @@ gates that run after you prove the suites are green, not that the change is righ
 
 READ, in this order:
 1. `@DIFF@` — the whole diff of this PR against its base. Start here.
-2. The files it touches, at the PR's own head, under `@TREE@` — a diff hunk lies about its surroundings.
+2. The files it touches, as they will be once it merges (the base merged with the PR's head), under `@TREE@` — a diff hunk lies about its surroundings.
 3. `@BRIEF@` — what this change was asked to do, and how done is judged. The diff is judged against THOSE
    done-criteria, not against what you would have built, and not against the worker's own account of its work.
 

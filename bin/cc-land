@@ -24,8 +24,10 @@
                                                   path prefixes) is refused too — whoever asks, whatever the review
                                                   says — unless --approved-by <uid> is the owner's own Slack id
                                                   (SLACK_OWNER_ID): his 👍 is the only thing that lands one, and it
-                                                  is a yes about THAT head — the hold is asked again at every head
-                                                  the job reaches, so a fix round cannot push one in under it
+                                                  is a yes about THAT head's protected files — it carries to a new
+                                                  head only where git shows every file under those paths unchanged
+                                                  since, and is asked again otherwise, so a fix round cannot push a
+                                                  protected change in under it
   cc-land queue --task <repo> <row>               complete a task; JSON receipt on stdout, queue only with a grant
   cc-land queue <handle>--<track> <pr>            a MEMBER WORKSPACE'S project: lands into the member's own repo on
                                                   the workspace's token, gates inside its sandbox, no deploy, the
@@ -61,11 +63,19 @@
                                                   is gated, reviewed, merged and deployed before the next of that repo
                                                   is touched. A job survives a usage-limit review (waits for
                                                   the reset) and a red gate (3 tries, 15 min apart); a LAND-AFTER-FIX
-                                                  sends ONE fix iteration to the PR's track and re-queues on its push;
+                                                  sends ONE fix iteration to the PR's track and re-queues on its push
+                                                  (a branch already moved past the read is read again instead; a round
+                                                  `cc` refuses HOLDS the job until the branch moves, said once more at
+                                                  its fix deadline); a stop names the one route back in that `cc`
+                                                  accepts — the track's own worktree, never `--go` on its row;
                                                   a draft or conflicting PR is HELD and looked at every 15 min (a
                                                   conflict first gets ONE rebase round). The board step closes the
                                                   PR's row and every `Closes <row>` its body names, except a row a
                                                   person holds or a track is live on
+  cc-land will-review <repo> <pr>                 whether the landing would buy a read of this PR's diff as it stands,
+                                                  and why not — a verdict already recorded, a tier nobody reads, or the
+                                                  review budget spent — so a seat buys its own read only where the
+                                                  landing will not (it reads, spends and posts nothing)
   cc-land selfcheck                               the decision table (core/tests/cc-land-selfcheck.py); no network
 
 THE FLOW, one line printed per step, stopped at the first real failure: gates and the paid review side by side on
@@ -108,8 +118,10 @@ WHAT IT WILL NOT DO:
     landing record, so what a landed PR bought is still there to ask for): one routine review, one automatic
     repair round, and the read of what that round changed; past that it STOPS and says who decides — the
     planning session buys one more (`--re-review`, which is added back to what the change may buy, the one
-    route the classifier lets a seat take), a PERSON who read it records that (`cc-land record`, refused to the
-    seat as self-approval on #521) or lands it unread (`--no-review`). A review a usage limit or its own cap
+    route the classifier lets a seat take), a reviewer subagent that read it records its verdict at that head
+    (`cc-land record … --by <reader> --head <sha>` — signed by the seat itself it was refused as self-approval on
+    #521) or it lands unread (`--no-review`). A protected PR is offered only the record, since its door refuses
+    the other two; the stop never says re-queue, which is what produced it. A review a usage limit or its own cap
     killed is not a buy. A fix anybody pushed after a LAND-AFTER-FIX counts as the round. A refusal reached at
     the wall is re-checked against the PR first.
   · Time a gate on the clock: it is timed on its SILENCE — a suite waiting on a lock says so every minute.
@@ -900,6 +912,7 @@ def closes_rows(body):
 WALL_SUBTYPE = {"error_max_budget_usd": ("the money cap", "CC_LAND_REVIEW_BUDGET"),
                 "error_max_turns": ("the turn cap", "CC_LAND_REVIEW_TURNS")}
 WALL = "the review hit its own cap"       # …and the fixed prefix that says so downstream — see exhausted()
+BUDGET_SPENT = "the review budget for this change is spent"   # …and the budget wall's, which stop_who and handback read
 
 
 def cap_now(var):
@@ -1390,6 +1403,7 @@ def box_comments(facts):
     return [c.get("body") or "" for c in facts.get("comments") or [] if isinstance(c, dict) and c.get("viewerDidAuthor")]
 
 
+CARRIED_LOOK = 30   # how many of the latest merged PRs carried_by reads for one that already carries this PR
 GH_PR_FILES = 100   # `gh pr view --json files` hands back the FIRST 100 files, sorted by path, and says nothing
                     # about there being more
 
@@ -1444,8 +1458,27 @@ def protected_under(repo, hit):
             if hit[0] != "?" else f"{hit[1]}, and {repo} has PROTECTED paths")
 
 
+def protected_same(repo, approved, head):
+    """True only when git SHOWS that every file under the repo's protected paths is the same at `head` as at `approved` (the head the owner 👍'd) — a fetch of both by SHA when the clone lacks them, then `git diff --quiet` limited to the rules. Every doubt — no rules read, a head git will not name, a diff that fails — is False, and the caller re-asks him."""
+    rules, _ = protected_paths(repo)
+    if not rules or not approved or not head:
+        return False
+    root = repo_root(repo)
+
+    def named():
+        rc, o = sh(["git", "rev-parse", "--verify", "--end-of-options", f"{approved}^{{commit}}", f"{head}^{{commit}}"],
+                   cwd=root, timeout=30, stdout_only=True)
+        return rc == 0 and o.split() == [approved, head]
+    if not named():
+        sh(["git", "fetch", "-q", "origin", approved, head], cwd=root, timeout=120)
+        if not named():
+            return False
+    rc, _ = sh(["git", "diff", "--quiet", approved, head, "--", *rules], cwd=root, timeout=60)
+    return rc == 0
+
+
 def protected_stop(job):
-    """Why a job already on the queue must not go on, as (file, why), or None: the door's question asked AGAIN, and at every head. The door writes `approved_by` (the uid that 👍'd) and `approved_head` (the head that 👍 was about) on the job, because a job queued while the PR touched nothing protected keeps running through its fix rounds — a round that pushes a change under a protected path is a new question, and the yes given at the door was about the head that was there then. Only the owner's own uid, on the head he approved, goes on; a gh that cannot name the head is a stop, not a pass. This check is the door and not the lock: a push landing between it and the merge would still be a head nobody 👍'd, so Land.merge pins `--match-head-commit` to `approved_head` itself and GitHub refuses any other."""
+    """Why a job already on the queue must not go on, as (file, why), or None: the door's question asked AGAIN, and at every head. The door writes `approved_by` (the uid that 👍'd) and `approved_head` (the head that 👍 was about) on the job, because a job queued while the PR touched nothing protected keeps running through its fix rounds — a round that pushes a change under a protected path is a new question, and the yes given at the door was about the head that was there then. Only the owner's own uid, on the head he approved, goes on — or on a later head whose files under the protected paths are byte for byte the approved head's (protected_same), which moves `approved_head` onto it; a gh that cannot name the head is a stop, not a pass. This check is the door and not the lock: a push landing between it and the merge would still be a head nobody 👍'd, so Land.merge pins `--match-head-commit` to `approved_head` itself and GitHub refuses any other."""
     repo, pr = job.get("repo") or "", job.get("pr")
     hit = protected_hit(repo, pr)
     if not hit:
@@ -1455,6 +1488,15 @@ def protected_stop(job):
         return hit[0], f"{under}, and no 👍 of the owner's queued it"
     head = pr_head(repo, pr)
     if head and head == (job.get("approved_head") or ""):
+        return None
+    if head and protected_same(repo, job.get("approved_head") or "", head):
+        # "The landing's own repair and rebase rounds moved the heads; each time the protected door refused the new
+        # head" (raised-an-owner-approval-dies-with-every-new-head, 2026-09-21: five 👍 for three PRs). His yes was
+        # about what the PR does under the protected paths, and at this head those files are byte for byte what
+        # they were at the head he 👍'd — so the yes carries, and the merge pin moves with it (run_job writes the
+        # job before Land reads approved_head). Anything else under a rule, or a head git cannot show, re-asks.
+        ledger(f"approval {repo}#{pr} carried {job['approved_head'][:12]} → {head[:12]}: protected paths unchanged")
+        job["approved_head"] = head
         return None
     why = (f"{under}, at a head the owner has not 👍'd "
            f"({(job.get('approved_head') or 'no head recorded')[:12]} → {head[:12] or 'gh cannot say'})")
@@ -1707,6 +1749,8 @@ class Land:
         self.head = ""           # the PR head as a SHA — never "FETCH_HEAD", which the pull below overwrites
         self.gated = ""          # …the SHA the gates ran on: what the review after them, and the merge, are pinned to
         self.merged_on = ""      # …and the base it was merged with before they ran (merge_result); "" when the head already held it
+        self.carried = ""        # …a merged PR that already carries this change (carried_by): the route is then to close it
+        self.read_on = ""        # …the <base> SHA the review's tree was merged onto (merge_result), printed in its header
         self.merge_unbuilt = False   # …and the third state: git could not build the merge, so the gates ran on the head alone
         self.reviewed = ""       # …and the SHA the review actually read, for the fix round's "has it pushed yet"
         self.approved_head = ""  # …and, for a PR under a PROTECTED path, the head the owner's own 👍 was about: the
@@ -1891,17 +1935,25 @@ class Land:
                      f"and this read is the one that round earns")
         if spent.get("reviews", 0) >= reads_earned(spent) and not self.re_review:
             raise self.mark_doomed(Failed(
-                f"the review budget for this change is spent: PR #{self.pr} has already bought "
+                f"{BUDGET_SPENT}: PR #{self.pr} has already bought "
                 f"{spent.get('reviews', 0)} review(s) and {spent.get('repairs', 0)} repair round(s), and "
                 f"the diff at {self.head[:12]} is not one they read. "
                 + (f"A new PR is a new budget: close this one and open another for the fixed branch" if self.member else
-                   # The seat's own route FIRST: `record … LAND` was refused to the planning seat as self-approval
-                   # (#521, 2026-09-19) after this message named it first, and the seat's read was thrown away.
-                   f"The planning session decides now — buy one more read (`cc-land {self.repo} {self.pr} "
-                   f"--re-review`, the one route a seat takes on its own), or a PERSON who read the diff writes "
-                   f"that down (`cc-land record {self.repo} {self.pr} LAND --by <who>`, which this landing then "
-                   f"reads; refused to the seat that would land it, as self-approval) or lands it with no "
-                   f"verdict on the PR (`cc-land {self.repo} {self.pr} --no-review`)")))
+                   # A read is what moves it, never a re-queue (which is what produced this stop, lessons
+                   # #84/#86/#87). The seat's own route FIRST: `record … LAND` signed by the seat that lands it was
+                   # refused as self-approval (#521, 2026-09-19), so the record is a reader's, signed by that reader
+                   # at this head. A protected PR (approved_head is set only there) gets neither --re-review nor
+                   # --no-review, both of which its door refuses (#554, 2026-09-20): the record is its one route.
+                   "The planning session decides now — "
+                   + ("" if self.approved_head else
+                      f"buy one more read (`cc-land {self.repo} {self.pr} --re-review`, the one route a seat takes "
+                      f"on its own), or ")
+                   + f"have a reviewer subagent read the diff at {self.head[:12]} and record its verdict "
+                     f"(`cc-land record {self.repo} {self.pr} <VERDICT> --by <that reader> --head {self.head}`), "
+                     f"which this landing then reads — signed by the reader, since one the landing seat signs "
+                     f"itself is refused as self-approval"
+                   + (f"; then the owner's 👍 on the 🔐 card queues that head" if self.approved_head else
+                      f", or land it with no verdict on the PR (`cc-land {self.repo} {self.pr} --no-review`)"))))
         # ...and whether this exact head already died on a cap: refused until the cap that bound is raised (wall_stands), or --re-review.
         wall = spent.get("wall") or {}
         if wall.get("head") == self.head and wall_stands(wall) and not wall.get("answered") and not self.re_review:
@@ -1921,7 +1973,13 @@ class Land:
         if self.member:
             # The review is charged to the workspace's daily cap before the buy; the cap reached is weather (limited), deferred by run_job to the day's reset.
             self.member_buys_review(float(REVIEW_BUDGET))
-        tmp, tree = self.head_checkout("review", fetch=False)   # fetched above, to answer "read this head already?"
+        # The review reads the tree the merge will make — origin/<base> merged with the head, as the gates build it —
+        # never the branch at the base it was cut from: #63's paid read judged a base two merged PRs old, and two of
+        # its three findings were already fixed on main (raised-review-reads-a-stale-base, 2026-09-16). A merge git
+        # cannot build falls back to the head alone, and the header then names no base.
+        with git_lock(self.root):
+            at, self.read_on, _ = merge_result(self.root, f"origin/{self.base()}", self.head)
+        tmp, tree = self.head_checkout("review", fetch=False, at=at)   # fetched above, to answer "read this head already?"
         try:
             dpath = f"{tmp}/pr-{self.pr}.diff"
             open(dpath, "w").write(self.pr_diff() or "")
@@ -2175,7 +2233,9 @@ class Land:
                         f"it was recorded over {supersedes}")
         who = by or self.by or REVIEW_MODEL
         over = f"\n\nThis supersedes the **{supersedes}** recorded earlier for this change." if supersedes else ""
-        body = (f"{self.marker(verdict, who)}\n**cc-land review** — `{self.head[:12]}`, read by `{who}`\n\n"
+        body = (f"{self.marker(verdict, who)}\n**cc-land review** — `{self.head[:12]}`"
+                + (f" merged onto {self.base()} `{self.read_on[:12]}`" if self.read_on else "")
+                + f", read by `{who}`\n\n"
                 f"**VERDICT: {verdict}**{over}\n\n{said}")
         rc, o = sh(["gh", "pr", "comment", str(self.pr), "--body", body], cwd=self.root, timeout=120)
         return ", commented on the PR" if rc == 0 else f", the comment did not post ({last(o)})"
@@ -2566,12 +2626,20 @@ class Land:
             raise Skip(f"no track on the board carries PR #{self.pr} — nothing to close")
         if t not in board(self.project).get("tracks", {}):
             raise Failed(f"the {self.project} board has no track '{t}'")
-        st = "merged"
-        rc, o = sh([f"{BIN}/cc-board", "status", self.project, t, st])
-        if rc:
-            raise Failed(f"cc-board status: {last(o)}")
-        sh([f"{BIN}/cc-board", "note", self.project, t, f"landed by cc-land: {self.what()}"])
-        line = f"board: {self.project}/{t} -> {st}"
+        # "a row ... one an orch holds is not closed by a milestone merge" (the-review-reads-what-will-merge): the
+        # knowledge-library row closed on #436, its M1 design doc, with P0-P3 still to run (2026-09-11).
+        orch = orch_mark(self.project, (board(self.project).get("tracks", {}).get(t) or {}).get("agent"))
+        if orch:
+            sh([f"{BIN}/cc-board", "note", self.project, t,
+                f"milestone landed by cc-land: {self.what()}; left open, {orch} holds this row"])
+            line = f"board: {self.project}/{t} left open — {orch} holds it, so this PR is one milestone of it"
+        else:
+            st = "merged"
+            rc, o = sh([f"{BIN}/cc-board", "status", self.project, t, st])
+            if rc:
+                raise Failed(f"cc-board status: {last(o)}")
+            sh([f"{BIN}/cc-board", "note", self.project, t, f"landed by cc-land: {self.what()}"])
+            line = f"board: {self.project}/{t} -> {st}"
         # The rows the PR body says it closes (closes_rows) are closed here; a row the board does not have is said, not skipped.
         closed, unknown, held = [], [], []
         rows = board(self.project).get("tracks", {})
@@ -3069,8 +3137,8 @@ def say_result(job, r):
         # The first attempt only: the injected line carries no producer id, so a retry sweep must not say it again.
         # Short, because the thread or the updates lane has the full text — this just wakes the seat.
         short = (r.get("short") or "")[:200].replace("\n", " ")
-        again = f"cc-land queue {repo} {pr}" if pr else "cc-land work"
-        sh([f"{BIN}/cc-slack", "inject", repo, f"{what} landing stopped: {short}. Fix it, then `{again}`."], timeout=120)
+        route = r.get("route") or (f"fix it, then `cc-land queue {repo} {pr}`" if pr else "fix it, then `cc-land work`")
+        sh([f"{BIN}/cc-slack", "inject", repo, f"{what} landing stopped: {short}. The way back in: {route}."], timeout=120)
     return said
 
 
@@ -3229,8 +3297,41 @@ def stop_who(L):
     and every automatic round it had is spent (run_job), so the move is a person's; what differs is where they look.
     A review stop sends them to the verdict already on the PR, anything else to the thing that failed."""
     if L.stopped == "review":
+        if not L.verdict and BUDGET_SPENT in (L.why or ""):
+            # Re-queueing is the step that just produced this stop (lessons #84/#86/#87), so it is never the advice.
+            return "Read the diff and record a verdict at this head"
         return "The reviewer's notes are on the PR" if L.verdict else "Re-queue it to get a review"
     return "Fix it, then re-queue it"
+
+
+def track_worktree(L, track):
+    """The track's own canonical worktree, or '' when there is none on disk to work in."""
+    wt = f"{HOME}/.cc/worktrees/{L.project}/{track}" if track else ""
+    return wt if wt and os.path.isdir(wt) else ""
+
+
+def handback(L, then=""):
+    """The one route back in for a PR the queue hands back, spelled so the tool it names accepts it. `cc <repo> <row>
+    --go` is refused while the PR carries the row (cc-task: delivery-pending, "the one way back in is that queue's
+    repair round"), and a stop is handed back BECAUSE that round is spent or could not be dispatched — so naming it,
+    or "fix it", sent #516 and #517 round a loop of two refusals (2026-09-16). What works is the track's own worktree:
+    already on its branch at the reviewed head, its Stop hook commits and pushes. A budget wall is not a fix at all:
+    nothing read the diff, and what moves it is a read somebody records at that head. `then` replaces the closing
+    re-queue where the job is still on the queue and the push itself is what moves it."""
+    then = then or f"then `cc-land queue {L.repo} {L.pr}`"
+    if getattr(L, "carried", ""):
+        return f"close it (`gh pr close {L.pr}`): {L.carried}, so there is nothing left on it to fix"
+    if L.stopped == "review" and not L.verdict and BUDGET_SPENT in (L.why or ""):
+        head = getattr(L, "head", "") or getattr(L, "reviewed", "") or ""
+        return (f"have a reviewer subagent read the diff at {head[:12] or 'the head'} and record what it found there "
+                f"(`cc-land record {L.repo} {L.pr} <VERDICT> --by <that reader> --head {head or '<sha>'}`), {then}")
+    track = L.find_track() if L.pr and isinstance(L, Land) else ""   # a card built from a bare stand-in has no board
+    wt = track_worktree(L, track)
+    if not wt:
+        return f"push the fix to the PR's branch, {then}"
+    return (f"fix it in {track}'s own worktree ({wt}) with a subagent, and `cc board set {L.project} {track} agent me` "
+            f"so the watchdog leaves it — `cc {L.project} {track} --go` is refused while this PR carries the row — "
+            f"{then}")
 
 
 def pr_link(L):
@@ -3296,7 +3397,7 @@ def result_of(L, rc, job, tail):
     """What this landing means, in one sentence the owner can act on, and whether the PR is in. A stop says it in
     one line under STOP_CARD_MAX (stop_card) and hands the rest to `detail`, which the ledger keeps."""
     what = f"[{L.repo}] " + (f"PR #{L.pr}" if L.pr else L.what())
-    tries, detail = job.get("attempts", 1), ""
+    tries, detail, route = job.get("attempts", 1), "", ""
     # Which tree the gates ran on, in the sentence the owner reads: the merge, a head that already holds the base, or a merge git could not build. Asked lazily: a landing that stopped before the gates has no answer.
     def on():
         if not L.pr:
@@ -3323,6 +3424,7 @@ def result_of(L, rc, job, tail):
     elif L.stopped in ("review", "gates", "load", "merge"):
         # review belongs here, not in the deploy branch: it runs before the merge, so a stop leaves the PR out.
         short = stop_card(L)
+        route = handback(L) if L.pr else ""
         # The tallies and the full message: the record's, not the card's — finish() writes them to the queue log,
         # which is ONE LINE PER EVENT — so the step's message is flattened and bounded, and the tallies, which are
         # what the record is read for, come after it whole. The whole verdict is on the PR, which the card links.
@@ -3340,7 +3442,7 @@ def result_of(L, rc, job, tail):
     # ...and the ask on its own: the one line addressed to a person, routed by say_result when the job has no thread.
     # A NOT-merged card is the line and nothing else: the run's output rode along fenced until 2026-09-16 and made
     # the card as long as 1275 characters, and none of it is what the owner decides on. It is in the landing record.
-    return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short, "restart": ask, "detail": detail,
+    return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short, "restart": ask, "detail": detail, "route": route,
             "text": short if rc == 0 or detail else f"{short}\n```\n{tail[-900:]}\n```"}
 
 
@@ -3384,6 +3486,22 @@ def dispatch_fix(path, job, L, conflict=""):
     elif L.facts.get("headRefName") != f"track/{track}":
         # No task record, so nothing says where this PR was built; the dispatch runs only in the canonical worktree.
         return none(f"track={track} — repair request refused: not the canonical branch", "fix-identity")
+    read, tip = L.reviewed or L.head, "" if conflict else remote_head(L.repo, L.facts.get("headRefName") or "")
+    if read and tip and tip != read:
+        # The branch moved past the head the verdict read, so a fix may already be there: #60's seat had pushed both
+        # fixes before its handoff and the queue still tried to dispatch a round at the old head (2026-09-16). The
+        # new head is read instead, uncounted, and no round is bought for a fix nobody has looked at.
+        job_set(path, job, attempts=job["attempts"] - 1, stage="queued", not_before=None,
+                last=f"review: {verdict} at {read[:12]}, branch now at {tip[:12]}"[:400])
+        ledger(f"fix-moved {L.repo}#{L.pr} track={track} {read[:12]}->{tip[:12]} — the branch moved past the read; "
+               f"re-queued, no round dispatched")
+        return (f"[{L.repo}] PR #{L.pr}: {verdict} at {read[:12]}, but its branch is at {tip[:12]} now — re-queued "
+                f"to read that head, and no fix round dispatched")
+    # "a fix-dispatch is refused when a merged PR declares it carries this one (branch merged in, or a 'carries #N'
+    # line)" — lessons#71 got a paid repair round two minutes after #72 landed holding all nine of its files.
+    L.carried = carried_by(L)
+    if L.carried:
+        return none(f"track={track} — {L.carried}; no round dispatched", "fix-superseded")
     rv = f"{st}/review-{L.pr}.md"
     try:
         # ~/.cc/state/<handle>/<track> is bound read-write into a member's boundary: the directory must hold no link on the way and the file is opened O_NOFOLLOW.
@@ -3472,11 +3590,18 @@ def dispatch_fix(path, job, L, conflict=""):
                    not_before=stamp(time.time() + RETRY_AFTER))
         write_atomic(path, job)                  # the record before the word about it, as everywhere else here
         # Said once, ever (the producer id is this job's), titled on L.project so a member workspace's round is said in its own lane.
+        # The way out it names is one the dispatch tool accepts: a seat live but idle in a handoff refuses `--go`
+        # and drops `--say` (lessons #60/#63, 2026-09-16), and any push to the branch lifts this hold (fix_refused).
+        wt = track_worktree(L, track)
         notify("--route", f"{L.project}/{track} repair not dispatched",
                "--id", f"land:{L.repo}:{L.pr}:fix-refused@{job.get('queued_at') or at}",
                f"[{L.repo}] PR #{L.pr}: {verdict}, and its repair round could not be dispatched to {track} — "
-               f"{said}. The landing is held and nothing re-drives it: dispatch the round by hand, or take it "
-               f"off the queue — remove {path}, then `cc-land work`.", timeout=60)
+               f"{said}. The landing is held until the branch moves: "
+               + (f"work the findings in {rv} in {track}'s own worktree ({wt}) with a subagent, and `cc board set "
+                  f"{L.project} {track} agent me` so the watchdog leaves it; its push lifts the hold and the PR is "
+                  f"read again." if wt else f"push the fix to {L.facts.get('headRefName') or 'the PR branch'} and "
+                  f"the PR is read again.")
+               + f" To drop it instead, remove {path}, then `cc-land work`.", timeout=60)
         return (f"[{L.repo}] PR #{L.pr}: held — {why}. The reservation is kept and no retry worker was bought")
     what = "rebase" if conflict else "fix"
     ledger(f"fix-dispatch {L.repo}#{L.pr} track={track} verdict={verdict} model={FIX_MODEL} loop={FIX_LOOP} "
@@ -3486,6 +3611,39 @@ def dispatch_fix(path, job, L, conflict=""):
         f"re-queues itself when this branch pushes"], timeout=60)
     return (f"[{L.repo}] PR #{L.pr}: {verdict} — one {what} iteration dispatched to track {track} on {FIX_MODEL}, "
             f"and the PR stays queued; it is re-reviewed when that branch pushes")
+
+
+def orch_mark(repo, mark):
+    """The orchestrator a row's `agent` mark names, as its window name `<repo>@<alias>`, or '': the mark is `@<window>:<pid>` (cc-board agent_id), and only a window tmux still lists under `main` with that name is an orch's. A tmux that will not answer is '' — the row closes as before."""
+    wid = (mark or "").split(":")[0]
+    if not re.fullmatch(r"@\d+", wid):
+        return ""
+    rc, o = sh(["tmux", "list-windows", "-t", "main", "-F", "#{window_id}\t#{window_name}"], timeout=60)
+    for row in o.splitlines() if rc == 0 else []:
+        w, _, name = row.partition("\t")
+        if w == wid and re.fullmatch(re.escape(repo) + r"@[a-z0-9-]{2,20}", name):
+            return name
+    return ""
+
+
+def carried_by(L):
+    """Which merged PR already carries this one, in words, or '': one of the last CARRIED_LOOK merged PRs whose body names `#<pr>` and either says it `carries #<pr>` or has this PR's head in its own history (the branch merged in, fetched as `pull/<n>/head`). A gh or git that cannot answer is '' — the round goes out as before."""
+    rc, o = sh(["gh", "pr", "list", "--state", "merged", "--limit", str(CARRIED_LOOK), "--json", "number,body,headRefOid"],
+               cwd=L.root, timeout=120, stdout_only=True)
+    try:
+        j = json.loads(o) if rc == 0 else []
+    except ValueError:
+        j = []
+    for p in j if isinstance(j, list) else []:
+        n, body, oid = p.get("number"), p.get("body") or "", p.get("headRefOid") or ""
+        if str(n) == str(L.pr) or not re.search(rf"#{L.pr}\b", body):
+            continue
+        if re.search(rf"(?i)\bcarries\s+#{L.pr}\b", body):
+            return f"PR #{n}, merged, says it carries #{L.pr}"
+        if L.head and oid and sh(["git", "fetch", "-q", "origin", f"pull/{n}/head"], cwd=L.root, timeout=120)[0] == 0 \
+                and sh(["git", "merge-base", "--is-ancestor", L.head, oid], cwd=L.root, timeout=60)[0] == 0:
+            return f"PR #{n}, merged, has this branch's head {L.head[:12]} in it"
+    return ""
 
 
 def fix_refused(job, L):
@@ -3697,6 +3855,18 @@ def run_job(path, job):
         if job.get("held") != held:
             job["held"] = held
             ledger(f"held {repo}#{pr} — {held}")
+        late = fix.get("over") == "refused" and held == fix.get("refused") and not fix.get("late")
+        if late and stamp() >= (fix.get("deadline") or "~"):
+            # A refused round's hold reaching its fix deadline is SAID, once: #60 and #63 would have run out their
+            # deadlines with nobody told (2026-09-16). The hold stands — the branch moving is still what lifts it.
+            job["fix"] = fix = dict(fix, late=stamp())
+            ledger(f"fix-late {repo}#{pr} track={fix.get('track')} — held past its fix deadline {fix.get('deadline')}")
+            notify("--route", f"{L.project}/{fix.get('track')} repair still held",
+                   "--id", f"land:{repo}:{pr}:fix-late@{job.get('queued_at') or fix.get('at')}",
+                   f"[{repo}] PR #{pr} is still held past its fix deadline ({fix.get('deadline')}) — nothing has "
+                   f"moved its branch since the repair round was refused. The way back in: "
+                   f"{handback(L, 'and its push lifts the hold')}.",
+                   timeout=60)
         write_atomic(path, job)
         return (f"[{repo}] PR #{pr}: held, not tried — {held}. The queue looks again in {RETRY_AFTER // 60} min "
                 f"and this costs it no try; removing {path} takes it out (then `cc-land work`)")
@@ -4965,6 +5135,46 @@ def cmd_record(argv):
     return 0
 
 
+def will_review(L):
+    """(yes, why) for review()'s own order of questions, asked without buying anything: a verdict recorded for this change answers first, then the tier, then the review budget, then a cap that already stopped a read of this head."""
+    prior = L.prior_review()
+    if prior:
+        return False, f"{prior[0]} is already recorded for this change by {prior[2] or 'this box'}, and the landing reads that"
+    by, tier, why = L.review_model()
+    if not by:
+        return False, f"the {tier} tier reads nothing: {why}"
+    spent = root_work(L.repo, L.pr)
+    if spent.get("reviews", 0) >= reads_earned(spent) and not (
+            L.stood == "LAND-AFTER-FIX" and spent.get("repairs", 0) < ROOT_REPAIRS):
+        return False, (f"its review budget is spent ({spent.get('reviews', 0)} reads), so the landing stops instead — "
+                       f"record the verdict of a read you buy with `record … --head {L.head[:12]}`")
+    wall = spent.get("wall") or {}    # review()'s next question: this head already died on a cap that has not moved
+    if wall.get("head") == L.head and wall_stands(wall) and not wall.get("answered"):
+        name = (WALL_SUBTYPE.get(wall.get("hit") or "") or ("the cap", ""))[0]
+        var = review_caps(wall.get("hit") or "")[1]
+        return False, (f"{name} stopped a read of this head and has not been raised, so the landing refuses the run — "
+                       f"raise {var}, buy it again with `--re-review`, or record the verdict of a read you buy")
+    return True, f"{by} reads it (the {tier} tier: {why}) — do not buy a read of your own"
+
+
+def cmd_will_review(argv):
+    """`cc-land will-review <repo> <pr>`: will_review()'s answer for the PR's current head, one line; it reads, spends and posts nothing. Exit 0 either way, 1 when it cannot say."""
+    if len(argv) != 2 or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", argv[0]) or not argv[1].isdigit():
+        return refuse("will-review <repo> <pr>")
+    L = Land(argv[0], pr=int(argv[1]))
+    if not os.path.isdir(f"{L.root}/.git"):
+        return refuse(f"{L.root} is not a git repo")
+    if not L.load(verb="asking about"):
+        return 1
+    try:
+        L.fetch_head()
+    except Failed as e:
+        return refuse(f"{e}", 1)
+    yes, why = will_review(L)
+    print(f"[{L.repo}] PR #{L.pr} at {L.head[:12]}: the landing {'WILL' if yes else 'will NOT'} read it — {why}")
+    return 0
+
+
 # ── selfcheck: the cases live in core/tests/cc-land-selfcheck.py and run in this namespace ──────────────
 def cmd_selfcheck():
     """`cc-land selfcheck` runs core/tests/cc-land-selfcheck.py inside this module (its cases patch globals())."""
@@ -4976,7 +5186,7 @@ def cmd_selfcheck():
 def main(argv):
     default_signals()                      # once, on the main thread: every gate and reviewer below inherits it
     cmd = {"selfcheck": lambda a: cmd_selfcheck(), "record": cmd_record, "queue": cmd_queue, "work": cmd_work,
-           "batch-suite": cmd_batch_suite}
+           "will-review": cmd_will_review, "batch-suite": cmd_batch_suite}
     if argv[:1] != ["selfcheck"]:          # the selfcheck keeps its own fixture temp root
         use_scratch()
     if argv and argv[0] in cmd:

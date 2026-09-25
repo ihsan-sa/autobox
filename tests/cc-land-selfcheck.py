@@ -827,9 +827,14 @@ def selfcheck():
           "and the ✓ line names WHO read the diff and at which tier, exactly as a gate line names its own",
           rc == 0 and ran("gh pr merge") and "landed." in said and len(ran("git fetch", "pull/7/head")) == 2
           and re.search(r"✓ reviewed by \S+ at the \w+ tier \(.+\): LAND on PR #7", said))
-    check("the review reads the PR's OWN head, never the default branch — a review of main reviews nothing",
-          ran("git fetch", "origin", "pull/7/head") and ran("git worktree add", HEAD)
-          and [c for c in calls if c[:2] == ["git", "diff"] and HEAD in c])
+    # "the review's base equals the gate's merge base, printed in its header" (the-review-reads-what-will-merge):
+    # #63's read judged a base two merged PRs old and two of its three findings were already fixed on main.
+    check("the review reads the PR's OWN head merged onto main — the tree the gates build and the merge makes, never "
+          "the branch at the base it was cut from — and its PR comment names that base",
+          ran("git fetch", "origin", "pull/7/head") and ran("git worktree add", "cc-land.review.", MERGE())
+          and not ran("git worktree add", "cc-land.review.", HEAD)
+          and [c for c in calls if c[:2] == ["git", "diff"] and HEAD in c]
+          and [c for c in commented() if f"merged onto main `{BASE_SHA[:12]}`" in c[-1]])
     argv = [c for c in calls if c[0] == CLAUDE][0]
     add = argv[argv.index("--add-dir") + 1]
     check("everything the reviewer can reach is the throwaway directory this landing made — the diff it reads "
@@ -942,7 +947,7 @@ def selfcheck():
           change_digest(DIFF_REBASED) == KEY and change_digest(DIFF_DEDENT) != KEY and OTHER != KEY
           and len(KEY) == 40 and not change_digest(""))
 
-    def at_change(diff, head=HEAD, recorded="", by="reviewer-subagent", mine=True, **kw):
+    def at_change(diff, head=HEAD, recorded="", by="reviewer-subagent", mine=True, run=None, **kw):
         """A landing in front of PR #7 whose diff IS `diff` — with `recorded` (a change key) already written down
         on it by `by`, or nothing written down at all. Its own fixture, start to finish."""
         L = fresh(pr=7, **kw)
@@ -956,7 +961,7 @@ def selfcheck():
                 f"**cc-land review** — read by `{by}`\n\n**VERDICT: LAND**\n\n1. a.py:2 — VERDICT: DO-NOT-LAND quoted")
         world["gh pr view 7 --json comments"] = (0, json.dumps(
             {"comments": [{"body": body, "viewerDidAuthor": mine}] if recorded else []}))
-        return L, caught(L.review)
+        return L, caught((lambda: run(L)) if run else L.review)
 
     L, r = at_change(DIFF, recorded=KEY)
     check("a landing whose change carries a recorded pass runs NO review: no model is asked, nothing is bought, "
@@ -994,6 +999,30 @@ def selfcheck():
           "the head SHA the wrong key",
           not [c for c in calls if c[0] == CLAUDE] and "LAND on PR #7" in str(r)
           and REBASED != HEAD and not root_work("myrepo", 7).get("reviews"))
+    # `will-review` asks review()'s questions in its order and buys nothing (raised-land-review-unknown: a seat bought
+    # a Fable read the landing then bought again, because nothing could say beforehand which one would read it).
+    L, r = at_change(DIFF, recorded=KEY, run=will_review)
+    check("will-review: a verdict recorded for this change means the landing will NOT read it, and it says whose",
+          r[0] is False and "already recorded" in r[1] and "reviewer-subagent" in r[1]
+          and not [c for c in calls if c[0] == CLAUDE] and not root_work("myrepo", 7).get("reviews"))
+    L, r = at_change(DIFF, run=will_review)
+    check("...and the control: with nothing recorded the landing WILL read it, and asking bought nothing",
+          r[0] is True and "do not buy" in r[1]
+          and not [c for c in calls if c[0] == CLAUDE] and not root_work("myrepo", 7).get("reviews"))
+    L, r = at_change(DIFF, run=lambda L: (L.fetch_head(), root_spend("myrepo", 7, reviews=9), will_review(L))[2])
+    check("...and with its review budget spent the landing will NOT read it: it names the stop and the record route",
+          r[0] is False and "budget is spent" in r[1] and f"--head {HEAD[:12]}" in r[1]
+          and not [c for c in calls if c[0] == CLAUDE])
+    CAPWALL = {"hit": "error_max_budget_usd", "was": "3", "cap": "$3.00", "cost": "$3.00"}
+    L, r = at_change(DIFF, run=lambda L: (L.fetch_head(), root_spend("myrepo", 7, wall=dict(CAPWALL, head=L.head)),
+                                          will_review(L))[2])
+    check("...and a head that already died on a cap that has not moved: the landing will NOT read it, and it "
+          "names the cap and --re-review", r[0] is False and "--re-review" in r[1] and "not been raised" in r[1]
+          and not [c for c in calls if c[0] == CLAUDE])
+    L, r = at_change(DIFF, run=lambda L: (L.fetch_head(), root_spend("myrepo", 7, wall=dict(CAPWALL, head="0" * 40)),
+                                          will_review(L))[2])
+    check("...and the control: a wall standing at an OTHER head does not stop this one, so it WILL be read",
+          r[0] is True and "do not buy" in r[1])
     L, r = at_change(DIFF, recorded=KEY, mine=False)
     check("...and a recorded pass on the right change that this box did not WRITE is still no verdict: the "
           "author is checked on the v2 record exactly as it is on the older one",
@@ -1496,6 +1525,11 @@ def selfcheck():
                                         "could not resolve to a PullRequest", "Fix it, then re-queue it"),
         "a merge GitHub refused": (Stopped("merge", "gh pr merge 77 (rc=1): Base branch was modified"),
                                    "Base branch was modified", "Fix it, then re-queue it"),
+        "a review budget that is spent": (
+            Stopped("review", f"{BUDGET_SPENT}: PR #77 has already bought 2 review(s) and 1 repair round(s), and "
+                              f"the diff at 1a2b3c4d5e6f is not one they read. The planning session decides now — "
+                              f"buy one more read, or record one"),
+            BUDGET_SPENT, "Read the diff and record a verdict at this head"),
     }
     cards = {}
     for _reason, (_L, _why, _who) in REASONS.items():
@@ -1517,6 +1551,15 @@ def selfcheck():
           and "notes are on the PR" in cards["a review verdict"]
           and "notes are on the PR" not in cards["a red gate"]
           and "✗ the row was wrong" in cards["a red gate"] and "DO-NOT-LAND" not in cards["a red gate"])
+    # R1: A BUDGET WALL NAMES THE MOVE THAT MOVES IT. Lessons #84/#86/#87 (2026-09-19) were each stopped at the wall
+    # with 're-queue to buy a read' — and re-queueing was the step that had just produced that stop. What moved each
+    # was a read recorded at the head, so the card and the seat's route say that; a cap wall is its control.
+    _budget = result_of(REASONS["a review budget that is spent"][0], 1, {"attempts": 1}, "")
+    _cap = result_of(REASONS["a review that hit its own cap"][0], 1, {"attempts": 1}, "")
+    check("R1: a stop at the review-budget wall never says re-queue — its card says to read and record at this head, "
+          "and the route the seat is handed is `record <repo> <pr> <VERDICT> --head`; a cap wall keeps its own words",
+          "Re-queue" not in _budget["short"] and "record myrepo 77 <VERDICT> --by <that reader> --head" in _budget["route"]
+          and "Re-queue it to get a review" in _cap["short"] and "record myrepo 77" not in _cap["route"])
     # …and cc-replay READS these cards out of queue.log to say what stopped a PR and how often (stops_of, gate_red:
     # `gate \S+ did not pass`, STOP_CONFLICT `conflicts with \S+ — rebase`). Shortening the card is ours to do;
     # shortening it out of the words another tool classifies by would leave every gate stop unclassified there.
@@ -1609,12 +1652,14 @@ def selfcheck():
     # night of 2026-09-01. Each case below builds its own tally; `fresh` clears it, as a new PR would arrive with.
     NEXT = "77665544332211000fedcba9876543210abcdef1"
 
-    def asked(head, requeue=False, **kw):
+    def asked(head, requeue=False, approved="", **kw):
         """One review of PR #7 at `head`, with nothing yet on the PR about that head. `requeue` carries the tally
         the last job left — which is what the file on disk really does — so the pair of them is one change, pushed
-        twice, arriving on two different queue jobs. Returns (what review() said, the model calls it made)."""
+        twice, arriving on two different queue jobs; `approved` is the owner's 👍'd head a protected PR's job
+        carries. Returns (what review() said, the model calls it made)."""
         tally = read_json(root_path("myrepo", 7)) if requeue else None
         L = fresh(pr=7, **kw)
+        L.approved_head = approved
         if tally:
             os.makedirs(root_dir(), exist_ok=True)
             write_atomic(root_path("myrepo", 7), tally)
@@ -1635,16 +1680,28 @@ def selfcheck():
           "land with no verdict, or buy one more",
           "The planning session decides now" in str(again_r) and "A PERSON decides" not in str(again_r)
           and "1 review(s)" in str(again_r) and "0 repair round(s)" in str(again_r) and NEXT[:12] in str(again_r)
-          and "record myrepo 7 LAND --by" in str(again_r)
+          and "record myrepo 7 <VERDICT> --by" in str(again_r)
           and "--no-review" in str(again_r) and "--re-review" in str(again_r))
     # …and in an order the seat can act on. On #521 (2026-09-19 01:42Z) the message named `record … LAND` first; the
     # planning seat ran exactly that and the classifier refused it as self-approval, so its read was thrown away and
     # a third review bought. The route a seat takes on its own — --re-review — is named FIRST, and the record is a
     # person's, said so. The text changes; the classifier does not.
     check("...and the first route it names is the one the seat can take — `myrepo 7 --re-review` before `record`, "
-          "which is a PERSON's route and is said to be refused to the seat as self-approval",
-          str(again_r).index("myrepo 7 --re-review") < str(again_r).index("record myrepo 7 LAND")
-          and "self-approval" in str(again_r) and "PERSON who read the diff" in str(again_r))
+          "which is a reader's route and is said to be refused to the seat as self-approval",
+          str(again_r).index("myrepo 7 --re-review") < str(again_r).index("record myrepo 7 <VERDICT>")
+          and "self-approval" in str(again_r) and "reviewer subagent read the diff" in str(again_r))
+    # R2: A PROTECTED PR AT THE WALL. #554 (2026-09-20) was told to --re-review and to --no-review, and its door
+    # refuses both; the one route that moved it was a reader's recorded verdict, then the owner's 👍 on its card.
+    # Its own tally: the first read at HEAD, the wall at NEXT, the job carrying his 👍'd head.
+    asked(HEAD)
+    prot_r, bought_p = asked(NEXT, requeue=True, approved=HEAD)
+    check("R2: a protected PR at the review-budget wall is handed only the route its door accepts — a reader's "
+          "verdict recorded at the head, then the owner's 👍 — and never --re-review or --no-review; the unprotected "
+          "wall above, which names both, is its control",
+          isinstance(prot_r, Failed) and not bought_p and BUDGET_SPENT in str(prot_r)
+          and f"record myrepo 7 <VERDICT> --by <that reader> --head {NEXT}" in str(prot_r)
+          and "🔐 card" in str(prot_r) and "--re-review" not in str(prot_r) and "--no-review" not in str(prot_r)
+          and "--re-review" in str(again_r) and "--no-review" in str(again_r))
     check("...and the tally is the CHANGE's, not the job's: one review counted, and the refusal counted nothing "
           "(a head that was never read cost nothing to refuse)",
           root_work("myrepo", 7).get("reviews") == 1)
@@ -2271,11 +2328,11 @@ def selfcheck():
         L, g, r = both(gate_answer, lambda a: (0, REVIEWED("LAND")))
         card = result_of(L, 0, {"attempts": 1}, "")
         check("a green gate's ✓ line names the tree it ran on — main at its own SHA merged with the head — and the "
-              "worktree it ran in was checked out at THAT merge, while the REVIEW beside it still takes the head: "
-              "a verdict is about the change (#354) and the gates are about the result",
-              isinstance(g, str) and L.merged_on == BASE_SHA
+              "worktree it ran in was checked out at THAT merge, and so was the REVIEW's: it reads the tree that "
+              "will land, while its verdict stays keyed on the change (#354) and L.reviewed on the head",
+              isinstance(g, str) and L.merged_on == BASE_SHA == L.read_on
               and f"main at {BASE_SHA[:12]} merged with the head {HEAD[:12]}" in g
-              and ran("git worktree add", MERGE()) and ran("git worktree add", HEAD)
+              and len(ran("git worktree add", MERGE())) == 2 and not ran("git worktree add", HEAD)
               and isinstance(r, str) and L.reviewed == HEAD)
         check("...and the landed card says it too, in the owner's own words and with no SHA in them: he reads this "
               "on a phone, and the sentence he needs is which tree the suite passed on, not which commit it was",
@@ -3217,6 +3274,25 @@ def selfcheck():
           and ran_sub("cc-board", "set", "myrepo", "raised-a", "agent")
           and not ran_sub("cc-board", "status", "myrepo", "raised-b")
           and not ran_sub("cc-board", "set", "myrepo", "raised-b", "agent"))
+    # A ROW AN ORCH HOLDS IS A PROJECT, AND ONE PR IS A MILESTONE OF IT. #436, the knowledge-library project's M1
+    # design doc, closed the row with P0-P3 still to run (2026-09-11). Each case builds its own row and window.
+    def orch_row(window):
+        L = row_for("7", "track/w1")
+        BOARD[0]["tracks"]["w1"]["agent"] = "@9:4242"
+        world["tmux list-windows -t main"] = (0, f"@3\tmyrepo\n@9\t{window}\n")
+        calls.clear()
+        return L.close_board()
+    try:
+        said = orch_row("myrepo@library")
+        check("a PR whose row an orch holds (its mark's window is `<repo>@<alias>`) leaves the row open and notes "
+              "the milestone — no `merged` status on it",
+              "left open — myrepo@library holds it" in said and not ran_sub("cc-board", "status", "myrepo", "w1")
+              and ran_sub("cc-board", "note", "myrepo", "w1", "milestone landed"))
+        said = orch_row("myrepo")
+        check("…and the control: a row the planning seat's own window marked (a subagent's row) closes as merged",
+              said == "board: myrepo/w1 -> merged" and ran_sub("cc-board", "status", "myrepo", "w1", "merged"))
+    finally:
+        world.pop("tmux list-windows -t main", None)
 
     # 9. the sequence itself, and what each step's failure means
     check("the steps are the remembered ones, in that order — the GATES first (all of them at once, with the paid "
@@ -3815,6 +3891,40 @@ def selfcheck():
                   and "--mention" in cards[0] and "👍 the 🔐 card" in cards[0][-1]
                   and cards[0][-1].startswith("🔐 *Approval needed:* [myrepo] PR #7 ")
                   and not [c for c in calls if os.path.basename(c[0]) == "cc-notify"])
+            # A1. …BUT A NEW HEAD WHOSE PROTECTED FILES ARE THE ONES HE 👍'D CARRIES HIS YES. The landing's own rebase
+            # and repair rounds moved #558 #561 #562's heads and each asked the owner again — five 👍 in a day
+            # (raised-an-owner-approval-dies-with-every-new-head). Carried only on git's own word: both heads named,
+            # and the diff between them limited to the rules empty. Each case builds its own queued job.
+            RVP, DIFQ, MOVED = "git rev-parse --verify --end-of-options", "git diff --quiet", "f" * 40
+
+            def carried(diff_rc, named=True):
+                guarded(["learn-fetch/learn-fetch"], "learn-fetch/", "U0WNER",
+                        "--who", "The Owner", "--approved-by", "U0WNER", ref=HEAD)
+                job = read_json(job_path("myrepo", 7)) or {}
+                world[GHH] = (0, json.dumps({"headRefOid": MOVED, "headRefName": BRANCH}))
+                world[LSR] = (0, f"{MOVED}\trefs/heads/{BRANCH}\n")
+                world[RVP] = (0, f"{HEAD}\n{MOVED}\n" if named else "")
+                world[DIFQ] = (diff_rc, "")
+                at = len(open(f"{qdir}/queue.log").read())
+                stop = protected_stop(job)
+                return stop, job, open(f"{qdir}/queue.log").read()[at:]
+            try:
+                stop, job, log = carried(0)
+                check("A1: a new head whose protected files git shows byte-identical to the 👍'd head's goes on — no "
+                      "stop, approved_head (the merge pin) moved to the new head, one `approval … carried` line",
+                      stop is None and job.get("approved_head") == MOVED and "approval myrepo#7 carried" in log
+                      and ran("git", "diff", "--quiet", HEAD, MOVED, "--", "learn-fetch/"))
+                stop, job, log = carried(1)
+                check("A1 control: the same move with a protected file changed is still a stop, and the pin stays on "
+                      "the head he 👍'd", stop is not None and stop[0] == "learn-fetch/learn-fetch"
+                      and job.get("approved_head") == HEAD and "carried" not in log)
+                stop, job, log = carried(0, named=False)
+                check("A1 control: a head git cannot name (even after a fetch) is a stop, not a carry — the empty diff "
+                      "stub is never trusted on its own", stop is not None and job.get("approved_head") == HEAD
+                      and ran("git", "fetch", "-q", "origin", HEAD, MOVED))
+            finally:
+                world.pop(RVP, None)
+                world.pop(DIFQ, None)
             # …AND A FILE LIST THAT ANSWERS '?' FOR EVER DOES NOT TURN THAT STOP INTO A HOLD. A PR over
             # GH_PR_FILES files is a '?' hit at every look, so a job he 👍'd whose fix round pushes a new head
             # would be held every RETRY_AFTER for ever — nothing merged, nobody told, and his second 👍 refused as
@@ -4864,6 +4974,91 @@ def selfcheck():
               "written. This is the one way back from a refused dispatch, and nothing else re-drives it",
               lifted.get("stage") != "held" and (ran("check.sh") or [c for c in calls if c[0] == CLAUDE])
               and open(f"{LANDQ}/queue.log").read().count("held myrepo#7") == held_lines + 1)
+        # R4: THE BRANCH MOVED PAST THE READ. #60's seat had pushed both fixes before its handoff, and the queue still
+        # tried to dispatch a round at the old head (2026-09-16). The review reads one head (the two-ref ls-remote)
+        # while origin's branch is at another by the time the round would go: the new head is read, no round bought.
+        moved = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00"
+        repair_case(**{"git ls-remote origin refs/heads/track/w1 refs/pull": (0, f"{pushed_head}\trefs/heads/track/w1\n"),
+                       "git ls-remote origin refs/heads/track/w1": (0, f"{moved}\trefs/heads/track/w1\n")})
+        calls.clear(); quiet(cmd_work, [])
+        job = read_json(job_path("myrepo", 7)) or {}
+        check("R4: a LAND-AFTER-FIX whose branch has moved past the head it read dispatches no round and reserves "
+              "nothing — the job goes back on the queue, uncounted, to read the head that is there",
+              not ran_sub("cc", "myrepo", "w1", "--go") and not ran_sub("cc-task", "reserve-repair")
+              and job.get("stage") == "queued" and job.get("attempts") == 0 and not job.get("fix")
+              and f"fix-moved myrepo#7 track=w1 {pushed_head[:12]}->{moved[:12]}" in open(f"{LANDQ}/queue.log").read())
+        repair_case(**{f"{BIN}/cc myrepo w1 --go": (0, "dispatched"),
+                       "git ls-remote origin refs/heads/track/w1": (0, f"{pushed_head}\trefs/heads/track/w1\n")})
+        calls.clear(); quiet(cmd_work, [])
+        check("R4 control: the same verdict with origin still at the head it read dispatches its one round",
+              len(ran_sub("cc", "myrepo", "w1", "--go")) == 1)
+        # R6: A MERGED PR ALREADY CARRIES THIS ONE. lessons#72 landed holding all of #71's files two minutes after the
+        # queue bought #71 a repair round (2026-09-19). Each case builds its own queued job with origin at the read.
+        MERGED = "gh pr list --state merged"
+
+        def superseded(body, anc=0):
+            repair_case(**{f"{BIN}/cc myrepo w1 --go": (0, "dispatched"),
+                           "git ls-remote origin refs/heads/track/w1": (0, f"{pushed_head}\trefs/heads/track/w1\n"),
+                           MERGED: (0, json.dumps([{"number": 9, "body": body, "headRefOid": "9" * 40}])),
+                           "git merge-base --is-ancestor": (anc, "")})
+            at = len(open(f"{LANDQ}/queue.log").read())
+            calls.clear(); quiet(cmd_work, [])
+            said = [c for c in calls if any("gh pr close 7" in str(x) for x in c)]
+            return open(f"{LANDQ}/queue.log").read()[at:], said
+        try:
+            log, said = superseded("Adds the tool. This PR carries #7, so land it first.", anc=1)
+            check("R6: a LAND-AFTER-FIX on a PR a merged PR says it carries dispatches no round — a `fix-superseded` "
+                  "line naming #9, and the stop names the one route left: close it",
+                  not ran_sub("cc", "myrepo", "w1", "--go") and "fix-superseded myrepo#7" in log
+                  and "PR #9, merged, says it carries #7" in log and said)
+            log, said = superseded("Rebased on track/w1 (#7): land that first.")
+            check("R6: …and one whose branch head is in a merged PR's history (the branch merged in) is the same stop",
+                  not ran_sub("cc", "myrepo", "w1", "--go") and "has this branch's head" in log
+                  and ran("git", "fetch", "origin", "pull/9/head") and said)
+            log, said = superseded("An unrelated change; see #70.")
+            check("R6 control: a merged PR that never names #7 is not read as carrying it — the round goes out, and "
+                  "no pull ref is fetched for it", len(ran_sub("cc", "myrepo", "w1", "--go")) == 1
+                  and "fix-superseded" not in log and not ran("pull/9/head") and not said)
+        finally:
+            world.pop(MERGED, None)
+            world.pop("git merge-base --is-ancestor", None)
+        world.pop("git ls-remote origin refs/heads/track/w1 refs/pull", None)
+        # R5: A HELD ROUND THAT RUNS OUT ITS DEADLINE IS SAID. #60 and #63 would have reached their fix deadlines
+        # held, with nobody told (2026-09-16). Before the deadline the hold is silent (F4c); at it, one line naming
+        # the route that works, once.
+        repair_case(**{f"{BIN}/cc myrepo w1 --go": judge_no}); quiet(cmd_work, [])
+        def sweep_held(deadline=None):
+            j = read_json(job_path("myrepo", 7)); j.pop("not_before", None)
+            if deadline: j["fix"]["deadline"] = deadline
+            write_atomic(job_path("myrepo", 7), j); calls.clear(); quiet(cmd_work, [])
+            return ran_sub("cc-slack", "post", "--route", "repair still held")
+        early = sweep_held()
+        late = sweep_held("2000-01-01T00:00:00Z")
+        text = " ".join(late[0]) if late else ""
+        again = sweep_held()
+        check("R5: a refused round's hold says nothing before its fix deadline, says so ONCE when it passes — naming "
+              "the track's own worktree, the agent mark, and that its push lifts the hold — and stays held",
+              not early and len(late) == 1 and not again and wt in text and "cc board set myrepo w1 agent me" in text
+              and "its push lifts the hold" in text and "is refused while this PR carries the row" in text
+              and read_json(job_path("myrepo", 7))["stage"] == "held"
+              and open(f"{LANDQ}/queue.log").read().count("fix-late myrepo#7") == 1)
+        # R3: THE HANDBACK NAMES A ROUTE THE DISPATCH TOOL ACCEPTS. #516 and #517 (2026-09-16) were told "Fix it, then
+        # queue" once their repair round was spent, and `cc … --go` refused the delivery-pending row, naming the
+        # queue's repair round as the one way back. The seat is handed the track's own worktree instead.
+        repair_case(); root_spend("myrepo", 7, repairs=ROOT_REPAIRS); calls.clear(); quiet(cmd_work, [])
+        woke = " ".join(" ".join(c) for c in ran_sub("cc-slack", "inject", "myrepo"))
+        _tw = globals()["track_worktree"]; globals()["track_worktree"] = lambda L, t: ""
+        try:
+            repair_case(); root_spend("myrepo", 7, repairs=ROOT_REPAIRS); calls.clear(); quiet(cmd_work, [])
+        finally:
+            globals()["track_worktree"] = _tw
+        bare = " ".join(" ".join(c) for c in ran_sub("cc-slack", "inject", "myrepo"))
+        check("R3: a LAND-AFTER-FIX handed back with its round spent wakes the seat with the track's own worktree and "
+              "the agent mark, says `--go` is refused while the PR carries the row, and ends in the re-queue; with no "
+              "worktree on disk it says to push to the PR's branch — never the bare 'Fix it, then'",
+              f"fix it in w1's own worktree ({wt})" in woke and "cc board set myrepo w1 agent me" in woke
+              and "`cc-land queue myrepo 7`" in woke and "Fix it, then" not in woke
+              and "push the fix to the PR's branch, then `cc-land queue myrepo 7`" in bare and wt not in bare)
         repair_case(**{f"{BIN}/cc myrepo w1 --go": (0, "dispatched")}); calls.clear(); envs.clear(); quiet(cmd_work, [])   # both, or the zip below pairs this run's calls with an earlier run's envs
         machine = [e.get("CC_BRIEF_MACHINE") for c, e in zip(calls, envs)
                    if os.path.basename(c[0]) == "cc" and "--go" in c]

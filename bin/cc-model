@@ -19,7 +19,10 @@
 #                                     is not today is dated ("opus until 2026-09-03T12:51Z"): the clock alone made
 #                                     a 24-hour override read as one that lapsed hours ago. A trailing "— 2 sessions
 #                                     on another model" counts the live sessions NOT on the model `current` names,
-#                                     read the same way tick (4) reads them.
+#                                     read the same way tick (4) reads them. A further "— 1 session on a Claude Code
+#                                     too old for Opus 5.5" counts the live sessions the API refuses for the model
+#                                     over their CLI's version (see A SEAT WHOSE CLAUDE CODE IS TOO OLD); the two
+#                                     clauses can name the same session.
 #   cc-model current                  the model to dispatch on, ALWAYS: the override, else the next rung when the
 #                                     primary is one this account cannot run, else the primary itself — cc and cc-rc
 #                                     pass it as --model, so a session starts on the model the box names instead of
@@ -125,6 +128,8 @@
 #   was probed until 2026-09-18, and a cap the owner then raised left every worker a rung down for good.
 # Retuning a session = typing "/model <model>" into its pane THROUGH cc-msg (the one pane deliverer, with the dialog
 #   guard); the answers to the CLI's own prompts (Enter/Esc, "1" to "Switch model?") are single keys. Effort is not touched.
+#   NEVER into a pane showing the API's refusal of its Claude Code as too old for the model: /model cannot fix that, so
+#   that pane is handed off once instead (see A SEAT WHOSE CLAUDE CODE IS TOO OLD, above type_into).
 # THE WORKER FALLBACK CHAIN LIVES HERE AND NOWHERE ELSE: opus 5.5 -> sonnet (owner, 2026-09-23; Fable, the primary
 # until then, is no rung: above the primary, reconcile would type a Fable seat down and bank it). cc-loop asks `cc-model next`
 # instead of carrying a second copy of the order, so one edit here moves every caller (CC_MODEL_CHAIN overrides).
@@ -153,6 +158,9 @@
 # Returned: ~/.cc/state/model-returned = "<window>\t<epoch>\t<handoff|card>\t<detail>" — the return the lift launched or
 #   asked for, one row per window; a row younger than CC_MODEL_RETURN_GAP suppresses a second, and move_off drops it
 #   when a new outage types that window off the primary again.
+# Too old: ~/.cc/state/model-too-old = "<pane>\t<window>\t<epoch>\t<model>\t<handoff|card|failed|reported>" — a live
+#   pane whose Claude Code the API refused for <model>, and how it was moved; no /model is typed into it for
+#   CC_MODEL_RETURN_GAP, and rows of panes no longer live go at the next write.
 # Log: ~/.cc/state/model.log = "<iso>\t<epoch>\t<event>\t<model>\t<detail>". No secrets in either.
 # Unavailable: ~/.cc/state/model-unavailable = "<family>\t<since>\t<last-seen>\t<reason>" — a model this account cannot
 #   run (usage credits, not a limit — see A MODEL THIS ACCOUNT CANNOT RUN below); a row goes the moment the box is put
@@ -329,6 +337,8 @@ status_line(){   # "fable" | "opus until 11:40Z" | "opus until probe", and " —
   unavail "$(fam "$PRIMARY")" && s="$s — $(fam "$PRIMARY") is not available to this account"
   mm=$(mismatches | wc -l)   # …and what is RUNNING, when it is not what the line above says the box dispatches
   [ "$mm" -gt 0 ] && s="$s — $mm session$([ "$mm" = 1 ] || echo s) on another model"
+  mm=$(too_old_count)   # …and the seats whose Claude Code the API refuses for the model (A SEAT … TOO OLD, below)
+  [ "$mm" -gt 0 ] && s="$s — $mm session$([ "$mm" = 1 ] || echo s) on a Claude Code too old for $(label "$(current)")"
   printf '%s\n' "$s"; }
 ov(){ model=""; since=0; till=0; reason=""; probed=0   # loads the override; exit 1 = none (the box is on its primary model)
   [ -f "$OV" ] && IFS=$'\t' read -r model since till reason probed < "$OV"
@@ -721,12 +731,12 @@ return_chan(){   # $1 window → where its card goes: `#<repo>--<track>`, the or
   grep -qxF -- "#$repo" <<<"$have" && { echo "#$repo"; return 0; }
   echo "${CC_MODEL_RETURN_CHANNEL:-#${CC_BOX:-$(hostname -s)}}"; }
 card_text(){ printf '[return] %s: %s is back and this session is on %s — :+1: hands it back (a successor alongside, then cutover)' "$1" "$(label "$PRIMARY")" "$(label "$2")"; }
-card(){   # $1 window · $2 the model it is on → ONE card in its channel; 0 when it went. THE HEAD `[return] <window>:` IS
+card(){   # $1 window · $2 the model it is on · $3 the text (card_text) → ONE card in its channel; 0 when it went. THE HEAD `[return] <window>:` IS
           # WHAT cc-slack MATCHES a 👍 against (its RETURN_RE) — change one, change both. From the timer the caller is
           # no session, so cc-slack hands the card to nobody (wake_channel: not-a-session): the owner is its reader.
   local w="$1" lm="$2" chan ts
   chan=$(return_chan "$w")
-  ts=$("$BIN/cc-slack" post -c "$chan" --major "$(card_text "$w" "$lm")" 2>/dev/null </dev/null | head -1) || ts=""
+  ts=$("$BIN/cc-slack" post -c "$chan" --major "${3:-$(card_text "$w" "$lm")}" 2>/dev/null </dev/null | head -1) || ts=""
   [ -n "$ts" ] || { printf '%s\t%s\tcard-failed\t%s\t%s:%s → %s\n' "$(date -u +%FT%TZ)" "$now" "$PRIMARY" "$SESSION" "$w" "$chan" >> "$LOG"; return 1; }
   note_returned "$w" card "$chan $ts"
   printf '%s\t%s\tcard\t%s\t%s:%s (%s) → %s %s\n' "$(date -u +%FT%TZ)" "$now" "$PRIMARY" "$SESSION" "$w" "$lm" "$chan" "$ts" >> "$LOG"; }
@@ -751,9 +761,47 @@ return_cmd(){   # `cc-model return <window>`: the owner's 👍 on a card (cc-sla
   id=$(sessions | awk -v w="$w" '$2==w{print $1; exit}')
   [ -n "$id" ] || { echo "cc-model: no live session in $SESSION:$w"; return 1; }
   lm=$(live_model "$id" "$FALLBACK")   # no record, no --model: the card went because the lift saw it off the primary
-  [ "$(fam "$lm")" = "$(fam "$PRIMARY")" ] && { echo "cc-model: $w is on $(label "$PRIMARY") already — nothing to hand off"; return 0; }
+  [ "$(fam "$lm")" = "$(fam "$PRIMARY")" ] && ! too_old_row "$id" &&   # a too-old seat is on the family, and still has to move
+    { echo "cc-model: $w is on $(label "$PRIMARY") already — nothing to hand off"; return 0; }
   launch_return "$w" "$lm" "thumbs-up" && { echo "cc-model: $w — handoff to $(label "$PRIMARY") started"; return 0; }
   echo "cc-model: $w — handoff not started ($(awk -F'\t' '$3=="handoff"{l=$5} END{print l}' "$LOG" | sed 's/.*: //'))"; return 1; }
+# ── A SEAT WHOSE CLAUDE CODE IS TOO OLD FOR THE MODEL IS HANDED OFF, NEVER RETYPED (2026-09-23) ──────────────────
+# When Opus 5.5 became the primary, nine live seats ran a Claude Code the API refuses for it — a 400 whose error type
+# is claude_code_version_too_old, "2.1.280 required" — and reconcile typed `/model` into each of them every tick: every
+# attempt failed, the panes filled with the 400s, and status said only "2 sessions on another model". /model cannot fix
+# that; a successor started on the new binary can. So before any `/model` line type_into asks too_old_guard: a pane
+# whose live screen shows that refusal (TOO_OLD_RE: the CLI's "API Error … 400" line with the too-old wording on it, or
+# the JSON type field itself — never the bare words, which this file and its fixtures carry) is banked in $TOOOLD and
+# moved ONCE by the return path above — `cc-handoff --overlap` unasked for a major window or one the box moved, a card
+# in its channel for the rest (its 👍 runs `cc-model return`, which hands it off although it reads as on the primary's
+# family), nothing for a member window or one mid-handoff — and no `/model` is typed into it while its row is younger
+# than CC_MODEL_RETURN_GAP. After that a pane still showing the refusal is banked and moved once more; one that no
+# longer does (the binary updated under it) is typed at again. `status` counts these panes in a clause of their own.
+TOOOLD="$ST/model-too-old"   # "<pane>\t<window>\t<epoch>\t<target model>\t<handoff|card|failed|reported>"
+TOO_OLD_RE='\"type\"[[:space:]]*:[[:space:]]*\"claude_code_version_too_old\"|api error[^a-z]*400.*(claude_code_version_too_old|version.{0,80}too old|too old.{0,80}version|[0-9]+\.[0-9]+\.[0-9]+[^.]{0,40}(is )?required)'
+too_old_screen(){ tmux capture-pane -p -J -t "${1:-}" 2>/dev/null | grep -qiE "$TOO_OLD_RE"; }   # $1 pane → 0 = its live screen shows the refusal
+too_old_row(){ awk -F'\t' -v p="${1:-}" -v t="$((now - ${CC_MODEL_RETURN_GAP:-7200}))" '$1==p && $3>=t{y=1} END{exit !y}' "$TOOOLD" 2>/dev/null; }   # $1 pane → 0 = banked this episode
+too_old_guard(){   # $1 pane · $2 window · $3 the model a /model line would name → 0 = too old: type nothing (moved once)
+  local id="$1" name="$2" to="$3" lm how live
+  too_old_row "$id" && return 0
+  too_old_screen "$id" || return 1
+  lm=$(live_model "$id" "$to")
+  if member_win "$name"; then how=reported   # never on the chain: its CC_MEMBER_MODEL launch is the member's own
+  else case "$name" in *~*) how=reported;;   # mid-handoff already: its successor comes up on the new binary
+    *) if major "$name" || moved_by_box "$id" ""; then
+         launch_return "$name" "$lm" "its Claude Code is too old for $(label "$to")" && how=handoff || how=failed
+       else card "$name" "$lm" "$(too_old_card "$name" "$to")" && how=card || how=failed; fi;; esac; fi
+  live=$(sessions | awk '{print $1}')
+  { awk -F'\t' -v p="$id" -v l="$live" 'BEGIN{n=split(l, a, "\n"); for (i = 1; i <= n; i++) k[a[i]] = 1} $1!=p && ($1 in k)' "$TOOOLD" 2>/dev/null
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$name" "$now" "$to" "$how"; } > "$TOOOLD.t" && mv "$TOOOLD.t" "$TOOOLD"
+  printf '%s\t%s\ttoo-old\t%s\t%s:%s (%s) Claude Code too old for it — %s, no /model typed\n' "$(date -u +%FT%TZ)" "$now" "$to" "$SESSION" "$name" "$id" "$how" >> "$LOG"
+  return 0; }
+too_old_card(){ printf '[return] %s: its Claude Code is too old for %s, so /model cannot move it — :+1: hands it to a successor on the new binary' "$1" "$(label "$2")"; }
+too_old_count(){   # the live sessions banked too old this episode, or whose screen shows the refusal now
+  local id name n=0
+  while read -r id name; do [ -n "${id:-}" ] || continue
+    { too_old_row "$id" || too_old_screen "$id"; } && n=$((n+1))
+  done < <(sessions); printf '%s\n' "$n"; }
 type_into(){   # $1 pane id · $2 window name · $3 text. cc-msg IS the box's typist — it refuses a headless pane and its
                # dialog guard keeps keystrokes off an open prompt (dialog-never-drops owns that), so this does not
                # reimplement either. It types by WINDOW name, so a split window is typed at its active pane; a claude
@@ -763,6 +811,7 @@ type_into(){   # $1 pane id · $2 window name · $3 text. cc-msg IS the box's ty
                # The direct tmux path below is for the test session only, where cc-msg's contract (session main, a real
                # interactive claude) cannot hold — the selfcheck and selftest run against `cat` in a scratch server.
   local id="$1" name="$2" text="$3" out
+  case "$text" in "/model "*) too_old_guard "$id" "$name" "${text#/model }" && return 1;; esac   # its Claude Code cannot run it: handed off instead
   if [ "$SESSION" = main ] && [ "$PROC" = claude ] && [ -x "$BIN/cc-msg" ]; then
     [ "$(tmux display-message -p -t "$id" '#{pane_active}' 2>/dev/null)" = 1 ] || return 1
     # QUEUED IS NOT TYPED. cc-msg answers rc 0 both when it typed the line and when it only SPOOLED it behind a
@@ -1624,7 +1673,7 @@ selfcheck(){   # fixtures only: no network, no tmux, and none of this box's stat
   UNAV="$d/model-unavailable"   # hermetic from the first case: a model this box has recorded must not bend the chain here
   local probe_src; probe_src=$(declare -f probe)   # cases below stub probe and `unset -f` it: (s) runs the real one
   local oldmoved="$MOVED"; MOVED="$d/model-moved"; local oldrefused="$REFUSED"; REFUSED="$d/model-refused"
-  local oldreturned="$RETURNED"; RETURNED="$d/model-returned"
+  local oldreturned="$RETURNED"; RETURNED="$d/model-returned"; local oldtooold="$TOOOLD"; TOOOLD="$d/model-too-old"
   local oldsl="${CC_STATUSLINE_DIR:-}"
   CC_STATUSLINE_DIR="$d/statusline"; mkdir -p "$CC_STATUSLINE_DIR"   # …and this box's LIVE sessions are not this test's
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
@@ -2471,6 +2520,43 @@ TXT
   t '(w) …a policy move: no moved row, no handoff, no card' "$(cat "$MOVED" 2>/dev/null):$(paste -sd'|' "$d/handoffs"):$(wc -l < "$d/cards")" "::0"
   : > "$d/typed"; : > "$LOG"; printf '%s\t%s\n' '%1' "$PRIMARY" '%2' "$PRIMARY" '%4' 'claude-opus-5[1m]' > "$d/live"; reconcile
   t '(w) …and once it is there the next tick types nothing' "$(typed repo)$(typed repo@orch)$(typed repo/track)" ""
+  # ── A SEAT WHOSE CLAUDE CODE IS TOO OLD FOR THE MODEL (2026-09-23): nine seats on 2.1.278 were retyped every tick ──
+  # (x) one fixture: a major seat and a non-major planning window, each showing the API's 400 in its own wording, and
+  #     an ordinary planning window on the same old id — one quoting the error's name in prose, which is not the shape.
+  local e4="API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"claude_code""_version_too_old\",\"message\":\"upgrade\"}}"
+  handoffs(){ paste -sd'|' "$d/handoffs" 2>/dev/null; }; cards(){ sed -n 's/^[^\t]*\t\[return\] \([^:]*\):.*/\1/p' "$d/cards" 2>/dev/null | paste -sd'|' -; }
+  pl; rm -f "$OV" "$TOOOLD"; : > "$d/cards"; export CC_MODEL_MAJOR='repo'
+  printf '%s\n' '%1 repo' '%2 repo@orch' '%3 lessons/ece1' > "$d/sess"
+  printf '%s\t%s\n' '%1' 'claude-opus-5[1m]' '%2' 'claude-opus-5[1m]' '%3' 'claude-opus-5[1m]' > "$d/live"
+  printf '%s\n' '> /model claude-opus-5-5[1m]' "  ⎿  $e4" '' '> ' > "$d/screen.%1"
+  printf '%s\n' '  ⎿  API Error: 400 Claude Code version 2.1.278 is too old for this model; 2.1.280 or later is required' '> ' > "$d/screen.%2"
+  printf '%s\n' '● grep claude_code''_version_too_old found three hits in the brief' '> ' > "$d/screen.%3"
+  reconcile
+  t '(x) a pane showing the too-old 400 gets no /model; the ordinary one (prose naming the error included) still does' \
+    "$(typed repo):$(typed repo@orch):$(typed lessons/ece1)" "::/model $PRIMARY"
+  t '(x) …the major seat is handed off unasked, the other gets one card, each banked with how it moved' \
+    "$(handoffs):$(cards):$(cut -f1,5 "$TOOOLD" | tr '\t' ':' | sort | paste -sd' ' -)" "repo:repo@orch:%1:handoff %2:card"
+  t '(x) …status counts them in a clause of their own' \
+    "$(status_line | grep -o '[0-9]* sessions* on a Claude Code too old for .*')" "2 sessions on a Claude Code too old for $(label "$PRIMARY")"
+  : > "$d/typed"; : > "$LOG"; reconcile   # the retune gap cleared: only the banked row holds the two back
+  t '(x) the next tick types nothing into either and moves neither again; the ordinary pane is typed as before' \
+    "$(typed repo):$(typed repo@orch):$(handoffs):$(wc -l < "$d/cards"):$(typed lessons/ece1)" "::repo:1:/model $PRIMARY"
+  t '(x) the 👍 on its card hands it off, though it reads as on the primary'"'"'s family' \
+    "$(return_cmd repo@orch):$(handoffs)" "cc-model: repo@orch — handoff to $(label "$PRIMARY") started:repo|repo@orch"
+  : > "$d/typed"; : > "$LOG"; awk -F'\t' 'BEGIN{OFS="\t"} {$3 = $3 - 8000; print}' "$TOOOLD" > "$d/too.t" && mv "$d/too.t" "$TOOOLD"
+  printf '> \n' > "$d/screen.%1"; reconcile
+  t '(x) an episode over (row past the gap, refusal gone: the binary updated) is typed at again' "$(typed repo)" "/model $PRIMARY"
+  # (x2) the branches that move nothing or fail: a member window, a pane mid-handoff, a handoff cc-handoff refused
+  pl; rm -f "$TOOOLD"; : > "$d/cards"; printf '%s\n' '%5 mem-a' '%6 repo~next' '%7 repo' > "$d/sess"
+  for pn in 5 6 7; do printf '%s\n' "  ⎿  $e4" '> ' > "$d/screen.%$pn"; done
+  printf '#!/bin/sh\necho "$2" >> "%s/handoffs"; echo "cc-handoff: $2 already has an overlap open"; exit 1\n' "$d" > "$d/bin/cc-handoff"
+  type_into '%5' mem-a "/model $PRIMARY"; type_into '%6' 'repo~next' "/model $PRIMARY"; type_into '%7' repo "/model $PRIMARY"
+  type_into '%7' repo "/model $PRIMARY"
+  t '(x2) member and mid-handoff panes: reported, never moved; a refused handoff is banked failed and not retried each tick' \
+    "$(cat "$d/typed"):$(handoffs):$(wc -l < "$d/cards"):$(cut -f1,5 "$TOOOLD" | tr '\t' ':' | sort | paste -sd' ' -)" \
+    ":repo:0:%5:reported %6:reported %7:failed"
+  printf '#!/bin/sh\necho "$2" >> "%s/handoffs"\n' "$d" > "$d/bin/cc-handoff"; chmod +x "$d/bin/cc-handoff"
+  rm -f "$TOOOLD"; unset CC_MODEL_MAJOR; unset -f handoffs cards
   pl; rm -f "$OV"; printf '%s\t%s\n' '%1' "$PRIMARY" '%2' "$PRIMARY" '%3' "$PRIMARY" '%4' "$PRIMARY" '%5' "$PRIMARY" > "$d/live"
   do_switch "$FALLBACK" 'opus limit'
   t '(o) Opus out: the track falls to Sonnet, the three planning seats park on Opus, a launch names Sonnet' \
@@ -2561,7 +2647,7 @@ TXT
   unset -f slrec
   rm -f "$CC_STATUSLINE_DIR"/*.json
   PRIMARY="$shp"; FALLBACK="$shf"; CHAIN="$shc"; PROBEM="$shpr"; unset -f shipped
-  unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"; MOVED="$oldmoved"; RETURNED="$oldreturned"; REFUSED="$oldrefused"
+  unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"; MOVED="$oldmoved"; RETURNED="$oldreturned"; TOOOLD="$oldtooold"; REFUSED="$oldrefused"
   if [ -n "$oldsl" ]; then CC_STATUSLINE_DIR="$oldsl"; else unset CC_STATUSLINE_DIR; fi
   rm -rf "$d"
   printf 'cc-model selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"

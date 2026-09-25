@@ -131,6 +131,8 @@ WEDGED = 3 * 3600  # a worker alive with nothing moved for this long is stuck (c
 IDLE = 2 * 3600    # a live pane with nobody typing at it for this long is idle, not running
 AGENT_MARK = 6 * 3600   # an `agent` mark holds a row this long
 WEDGE_SEEN = 5400  # …and a wedge counts only if the previous run saw it too
+OFFER_AFTER = 600  # finished with an open PR this long before the session is offered it: a seat that just cleared its
+                   # mark queues the PR within minutes, and an offer before that names work it is already doing
 PENDING = 14400    # finished with an open PR for this long and nobody landing it: the owner hears
 BETWEEN_ROUNDS = 1800   # a landing record younger than this is a landing between rounds, not abandoned
 TERMINAL = ("merged", "done")
@@ -2149,6 +2151,7 @@ def main(argv):
     no_stop, wedged = False, int(os.environ.get("CC_RECONCILE_WEDGED") or WEDGED)
     mark = float(os.environ.get("CC_AGENT_MARK_HOURS") or AGENT_MARK / 3600) * 3600
     pend_after = int(os.environ.get("CC_PENDING_ALERT") or PENDING)
+    offer_after = int(os.environ.get("CC_OFFER_AFTER") or OFFER_AFTER)
     while argv:
         a = argv.pop(0)
         if a == "--apply":
@@ -2321,6 +2324,13 @@ def main(argv):
                 continue
             first = float(old.get(k) or 0) or t0
             last, stood = float(old.get(ak) or 0), t0 - first
+            if stood < offer_after and not old.get(ok_):
+                # raised-watchdog-offers-a-pr-the-lander-is-gating (2026-09-20): a subagent row's mark was cleared
+                # so the lander could close it, the watchdog offered "review and land it" in the minutes before the
+                # seat queued it, and the line reached the seat while cc-land was gating #553. The clock starts now;
+                # the offer waits out OFFER_AFTER, and a job written by then (busy, above) drops it.
+                keep[k] = first
+                continue
             due = stood >= pend_after and not old.get(ak)   # ak, once set, never fires again — at most ONE notice ever
             if (not old.get(ok_) or due) and merged_now(repo, f.get("pr")):
                 continue                                # about to nag, and the PR has merged since facts() read it: nothing
@@ -2999,7 +3009,8 @@ def selfcheck():
         ok("real git: a directory that is not a checkout cannot be judged", branch_unpushed(tg + "/nope") is None)
 
     with tempfile.TemporaryDirectory() as th:
-        env = dict(os.environ, HOME=th, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log")
+        env = dict(os.environ, HOME=th, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log",
+                   CC_OFFER_AFTER="0")        # the cases below offer on the first pass; the grace has its own case
         repo = f"selfcheckrepo{os.getpid()}"
         os.makedirs(f"{th}/.cc/worktrees/{repo}/t1", exist_ok=True)
         os.makedirs(f"{th}/.cc/worktrees/{repo}/t3", exist_ok=True)
@@ -3208,6 +3219,23 @@ def selfcheck():
         json.dump({}, open(seenp, "w"))
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: …and a record older than that is history, not a landing: the same row is nagged once",
+           offered() == o_ + 1)
+        # THE OFFER WAITS OUT OFFER_AFTER (raised-watchdog-offers-a-pr-the-lander-is-gating): a seat clears its mark
+        # and queues the PR minutes later, and an offer in between reached it while cc-land was gating #553.
+        genv, jobp = dict(penv, CC_OFFER_AFTER="600"), f"{th}/.cc/state/land/{repo}-9.json"
+        json.dump({}, open(seenp, "w"))              # (the root record above is cold, so it silences nothing)
+        o_ = offered()
+        subprocess.run(argvP, env=genv, capture_output=True, text=True, timeout=120)
+        ok("end to end: a PR that has just gone pending is not offered on the first pass — its clock starts",
+           offered() == o_ and float(json.load(open(seenp)).get(f"pending {repo}/t2") or 0) > 0)
+        json.dump({"repo": repo, "pr": 9}, open(jobp, "w"))              # …the seat queues it inside the grace
+        led = json.load(open(seenp)); led[f"pending {repo}/t2"] = now() - 900; json.dump(led, open(seenp, "w"))
+        subprocess.run(argvP, env=genv, capture_output=True, text=True, timeout=120)
+        ok("end to end: …queued inside the grace, it is never offered once the grace is over", offered() == o_)
+        os.remove(jobp)
+        led = json.load(open(seenp)); led[f"pending {repo}/t2"] = now() - 900; json.dump(led, open(seenp, "w"))
+        subprocess.run(argvP, env=genv, capture_output=True, text=True, timeout=120)
+        ok("end to end: …and the control: past the grace with nobody landing it, it is offered once",
            offered() == o_ + 1)
         os.remove(rootp)
 
