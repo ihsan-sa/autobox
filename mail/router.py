@@ -744,6 +744,13 @@ QUIET = "quiet"              # the `rule` of a mail To a MAIL_QUIET address: sto
 EXPLAIN = "explain"          # the `rule` of a mail To a MAIL_EXPLAIN address: the workspace's main session, skill asked
 EXPLAIN_ASK = ("This mail came to an explanation address. Load the email-explanation skill and answer with it: a "
                "short explanation as a formatted mail body, a long one as a short reply with a 1-3 page PDF attached.")
+# Owner, 2026-09-24: "ensure this gets picked up whenever anyone wants anything explained from any email address in
+# any workspace. its a default formatting for explanations". So every mail handed to a session carries this line
+# (cc-slack's mail_hand), host seat or member workspace, whatever address it came to; EXPLAIN_ASK above stays the
+# stronger line for the explanation door, and a mail carrying it is not given this one as well.
+EXPLAIN_DEFAULT = ("If this mail asks for something to be explained, answer it with the email-explanation skill: a "
+                   "formatted HTML mail in the house look, or a short reply with a 1-3 page PDF for a long one. "
+                   "Where this workspace cannot build the PDF, send the HTML mail and say nothing about a PDF.")
 
 
 def route(msg, d, domain, table=None, unplaced_to="main", quiet="", explain=""):

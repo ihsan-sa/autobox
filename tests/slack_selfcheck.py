@@ -7711,6 +7711,31 @@ def run_selfcheck():
               mhanded[0][2]["role"] == "mail" and "owner" not in mhanded[0][2]["role"]
               and "the address is not proof of who wrote it" in mhanded[0][1])
 
+        # (e2) AN EXPLANATION ASKED BY MAIL, ANYWHERE. Owner, 2026-09-24: "ensure this gets picked up whenever
+        # anyone wants anything explained from any email address in any workspace. its a default formatting for
+        # explanations". Its own daemon and its own mails: a member's to their workspace, the owner's to home@
+        # (his host seat), neither sent to an explanation door — and both reach the session told to use the skill.
+        xsaid, xhanded = [], []
+        dmX = mail_daemon(xsaid, xhanded)
+        mail_write("X1", to=["mem@box.example"], subject="dns", text="can you explain how dns works?")
+        mail_write("X2", subject="dns", text="explain how dns works", **{"from": "boss@allowed.example"})
+        resX1, resX2 = dmX.take_mail("X1"), dmX.take_mail("X2")
+        check("mail: a mail asking for an explanation reaches a member workspace's session AND the owner's host "
+              "seat with the line that makes it answer with the email-explanation skill, once each, though it went "
+              "to no explanation address",
+              resX1["routed"] and resX2["routed"] and [h[0] for h in xhanded] == ["mem", "box"]
+              and all(t.count(R.EXPLAIN_DEFAULT) == 1 and "email-explanation skill" in R.EXPLAIN_DEFAULT
+                      and R.EXPLAIN_ASK not in t for _, t, _, _, _ in xhanded))
+        check("mail: the default line says what to do where the PDF cannot be built — the HTML mail, and nothing "
+              "said about a PDF", "say nothing about a PDF" in R.EXPLAIN_DEFAULT)
+        # …and the explanation door's own, stronger line is not doubled by it.
+        xhanded.clear()
+        dmX.mail_hand(mail_write("X3", to=["explain@box.example"]), MailPlaces(dmX).place("mem"), "1.0", "1.0",
+                      R.Decision(to=[], workspace="mem", question=R.EXPLAIN_ASK, rule=R.EXPLAIN))
+        check("mail: a mail that came to the explanation door carries EXPLAIN_ASK and not the default line beside it",
+              len(xhanded) == 1 and xhanded[0][1].count(R.EXPLAIN_ASK) == 1
+              and R.EXPLAIN_DEFAULT not in xhanded[0][1])
+
 
         # (f) THE DAEMON'S OWN DOOR, through on_event — the half mail_move cannot prove about itself. A move is
         # answered in its thread and the message STOPS there; anything else in that thread carries on to the
