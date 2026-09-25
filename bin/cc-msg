@@ -99,10 +99,18 @@ WORKING_MARK='esc to interrupt'              # Claude Code's footer for the whol
 #      option 3, which writes the ONE shared ~/.claude.json (autoModeEnvSetup) so no session on the box draws it
 #      again; Escape here is "Not now" and it comes back next start (dismissed by hand 5 times, 2026-09-10).
 #      Nothing is scanned, no model runs, no permission changes: the worst case is the same nudge once more.
+#   4  the session/usage-limit dialog ("You've hit your session limit" · "What do you want to do?" · 1 Stop and
+#      wait for limit to reset · 2 Wait here, then continue automatically at <time> · 3 Upgrade your plan): the
+#      "continue automatically" option, because the box waits limits out, so the session resumes by itself at the
+#      reset (a session sat on it ~40 min, 2026-09-24). Nothing is bought and no plan changes; the worst case is a
+#      session that waits, which is what option 1 does too. "#" in <keys> is that option's number, read by
+#      limit_option() from the dialog drawn at the FOOT of the pane only: a transcript that quotes this dialog above
+#      some other question must not have that question answered with the quote's digit. Not read there, no press.
 KNOWN_SAFE=(
   $'Escape\tkeep my current model\tEsc to cancel'
   $'Escape\tSwitch model?\tNo, go back'
   $'3 Enter\tTeach auto mode about your environment\tDon\'t show again'
+  $'# Enter\thit your\tlimit\tcontinue automatically'
 )
 
 has(){ case "$2" in *"$1"*) return 0;; esac; return 1; }   # $1 needle in $2 haystack
@@ -113,8 +121,36 @@ safe_key(){   # $1 = pane text → the keystroke that dismisses a KNOWN-SAFE pro
   for row in "${KNOWN_SAFE[@]}"; do
     IFS=$'\t' read -r -a cols <<<"$row"; ok=1
     for m in "${cols[@]:1}"; do has "$m" "$s" || { ok=0; break; }; done
-    [ "$ok" = 1 ] && { printf '%s' "${cols[0]}"; return 0; }
+    [ "$ok" = 1 ] || continue
+    case "${cols[0]}" in
+      *'#'*) local d; d=$(limit_option "$s"); [ -n "$d" ] || continue; printf '%s' "${cols[0]//#/$d}";;
+      *)     printf '%s' "${cols[0]}";;
+    esac
+    return 0
   done
+}
+
+limit_option(){   # $1 = pane text → the number of the limit dialog's "continue automatically" option, or nothing.
+  # Only the dialog at the foot counts: after the LAST line holding "hit your" and "limit" the next line with words
+  # is "What do you want to do?", then only numbered options ("❯ 2. Wait here…"), then the "Enter to confirm" /
+  # "Esc to cancel" footer with nothing but blank or rule lines below it. Anything else between is another dialog.
+  printf '%s\n' "$1" | awk '
+    { l[NR] = $0 }
+    index($0, "hit your") && index($0, "limit") { h = NR }
+    END {
+      if (!h) exit
+      for (i = h + 1; i <= NR && l[i] !~ /[A-Za-z0-9]/; i++) ;
+      if (i > NR || !index(l[i], "What do you want to do?")) exit
+      d = ""; foot = 0
+      for (i++; i <= NR; i++) {
+        if (l[i] !~ /[A-Za-z0-9]/) continue                  # blank or a rule line
+        if (foot) exit                                        # words under the footer: not the foot of the pane
+        if (index(l[i], "Enter to confirm") || index(l[i], "Esc to cancel")) { foot = 1; continue }
+        if (l[i] !~ /^[^A-Za-z0-9]*[0-9]\. /) exit             # not an option line
+        if (index(l[i], "continue automatically")) { d = l[i]; sub(/^[^0-9]*/, "", d); d = substr(d, 1, 1) }
+      }
+      if (foot && d != "") print d
+    }'
 }
 
 press_safe(){   # $1 = window id  $2 = a KNOWN_SAFE <keys> cell → pressed in order; a key after the first only while
@@ -901,6 +937,23 @@ whenever this happens? You can change this later in /config.
      Stop here without switching, and ask me each time a message is flagged"
 FLAGLINE="● Fable 5.1's safeguards flagged this message. This sometimes happens with safe, normal conversations. Switched to Opus 5.
 > "
+SESSLIM="You've hit your session limit · resets 11:30pm (America/Los_Angeles)
+What do you want to do?
+❯ 1. Stop and wait for limit to reset
+  2. Wait here, then continue automatically at 11:30pm
+  3. Upgrade your plan
+Enter to confirm · Esc to cancel"
+USELIM="You've hit your usage limit
+What do you want to do?
+❯ 1. Upgrade your plan
+  2. Stop and wait for limit to reset
+  3. Wait here, then continue automatically shortly
+Enter to confirm · Esc to cancel"
+LIMNEAR="You've hit your session limit · resets 11:30pm (America/Los_Angeles)
+What do you want to do?
+❯ 1. Stop and wait for limit to reset
+  2. Upgrade your plan
+Enter to confirm · Esc to cancel"
 ODD="Something new?
 This dialog is in no table.
 ❯ 1. Keep going
@@ -1701,6 +1754,27 @@ $BUSY"; out=$(msg "hello mid-turn")
   k "$(t grep -q "	$W	3 Enter	Teach auto mode" "$SL")" "…logged as one press of the row's keys"
   reset; scr "$TEACH"; CC_FAKE_3_CLEARS=1 "$T/bin/cc-msg" --sweep
   k "$(t test "$(keys | awk '{print $NF}')" = '3')" "…and when the 3 closes the dialog by itself no Enter follows it into the prompt behind"
+  # the session/usage-limit dialog (a session sat on it ~40 min, 2026-09-24): the continue-automatically option,
+  # its number read off the pane, so the session resumes by itself at the reset
+  reset; scr "$SESSLIM"; "$T/bin/cc-msg" --sweep
+  k "$(t test "$(keys | awk '{print $NF}')" = $'2\nEnter')" "sweep: 'You've hit your session limit' is answered 2 then Enter = wait here, continue automatically at the reset"
+  k "$(t grep -q "	$W	2 Enter	" "$SL")" "…logged as one press of the row's keys"
+  reset; scr "$USELIM"; "$T/bin/cc-msg" --sweep
+  k "$(t test "$(keys | awk '{print $NF}')" = $'3\nEnter')" "…the 'usage limit' wording too, and the digit is the one the pane shows for continue automatically (3 here), not a fixed 2"
+  reset; scr "$LIMNEAR"; "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…but a limit dialog with no continue-automatically option gets NO key: stopping or upgrading is not the table's"
+  reset; scr "$(printf '%s\n' "$SESSLIM" | sed 's/hit your session limit/got a question/')"; "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…nor a continue-automatically option with no limit line above it"
+  reset; scr "$SESSLIM
+● That dialog is answered by the sweep now.
+Pick the next step:
+❯ 1. Land it
+  2. Wait
+Esc to cancel"; "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…nor a different dialog drawn under a transcript that quotes the limit dialog: its option 2 is someone else's question"
+  reset; scr "$SESSLIM
+  4. Something the limit dialog never offers"; "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…nor a limit dialog with lines under its footer: it is not the foot of the pane"
   reset; scr "$PERM"; "$T/bin/cc-msg" --sweep
   k "$(nt grep -q . "$T/keys")" "sweep: a PERMISSION dialog is never pressed — by the sweep, by the table"
   reset; scr "$ODD"; "$T/bin/cc-msg" --sweep
