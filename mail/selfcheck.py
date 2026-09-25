@@ -51,6 +51,14 @@ OWNER = "owner@box.example"          # the box owner's own address, for the rout
 RCPT = "brief@box.example"
 
 
+def shown(path):
+    """A path as outbound.trees() writes it for a person: `~/…` under the home directory, itself elsewhere. A
+    case's tmp is under ~/.cc/tmp since the box's scratch moved off /tmp (2026-09-24, TMPDIR), so a line that
+    names a tree names it with `~`, and a case looking for the bare path found nothing and went red."""
+    h = outbound.H
+    return "~" + path[len(h):] if path == h or path.startswith(h + "/") else path
+
+
 def eml(frm=ALLOWED, to=RCPT, subject="a brief", auth="spf=pass dkim=pass dmarc=pass",
         body="do the thing\nplease", attach=None, html=None, alt=None, headers=None):
     """One mail, built the way a real one arrives. `frm` here is the From: HEADER — the envelope sender is a
@@ -2114,7 +2122,7 @@ def run():
         with FakeWorker() as w:
             note = outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", "1700.1", ts="1700.1", text="", path=link)
         k(not w.calls and note.startswith("📎 linked.txt is not in a tree a mail may attach from")
-          and "put it under" in note and os.path.join(dev, "mem") in note and "Nothing was mailed" in note
+          and "put it under" in note and shown(os.path.join(dev, "mem")) in note and "Nothing was mailed" in note
           and "cap" not in note and "not the workspace's" not in note,
           "a symlink out of the workspace's own tree is out of the tree: the file does not leave, nothing is "
           "mailed, and the thread's line says out-of-tree (not too-large) and names the trees that would do")
@@ -2171,8 +2179,13 @@ def run():
               and outbound.attach_bytes(staged, {}, {"MAIL_OUT_ROOTS": dev}, 1 << 20) == (None, outbound.NOT_OURS),
               "…the owner's files dir is the owner's conversations' (and a cold mail's), and a member's is not it")
             k(outbound.trees({"workspace": "mem"}, {"MAIL_OUT_ROOTS": dev})
-              == "%s or %s" % (os.path.join(dev, "mem"), mem_files),
+              == "%s or %s" % (shown(os.path.join(dev, "mem")), shown(mem_files)),
               "…and the line that says where to put a file names that dir beside the roots")
+            home_root = os.path.join(outbound.H, ".cc-mail-selfcheck-none")
+            k(outbound.trees({}, {"MAIL_OUT_ROOTS": home_root + ":/cc-mail-selfcheck-none"}).split(" or ")[:2]
+              == ["~/.cc-mail-selfcheck-none", "/cc-mail-selfcheck-none"],
+              "…and it names a root under the home directory as `~/…` and one outside it by its own path, "
+              "wherever the case's own tmp happens to be")
         finally:
             outbound.SLACKDIR = saved_sd
 
@@ -3665,8 +3678,8 @@ def run():
             ok, line = outbound.send_to(cold25(w), ALLOWED, "theirs", "with another's file", attachments=[theirs25],
                                         channel="mem", workspace="mem")
             n25 = len(w.calls)
-        k(not ok and n25 == 0 and "notes.txt cannot be attached" in line and os.path.join(dev25, "mem") in line
-          and os.path.join(dev25, "other") not in line,
+        k(not ok and n25 == 0 and "notes.txt cannot be attached" in line and shown(os.path.join(dev25, "mem")) in line
+          and shown(os.path.join(dev25, "other")) not in line,
           "…and another member's file is refused by name and NOTHING is sent: the line names the workspace's own "
           "trees and not the root — one member's file never leaves in another's mail")
         fresh25()
