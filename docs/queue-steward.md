@@ -1,0 +1,5 @@
+# The landing queue's steward
+
+`cc-queue-steward` keeps the landing queue moving so that nobody has to drive landings by hand. Every 2 minutes its timer runs a pass that only reads files: the landing tool's jobs, its lane markers and its ledger. The pass wakes a model only when something has ended: a landing stopped, a suite went red, a lane stopped moving or died with work waiting, or the same red case hit two PRs. Then one Opus call reads the logs and picks actions. The pass runs them only through the landing tool's own doors: re-queue, start a lane, run a missing green, send one fix or rebase round, or file a `raised-` row. It never merges, and it never passes `--approved-by`, so a red gate, a review finding or a protected path still stops a landing.
+
+It posts one line to the landing thread (`CC_QSTEWARD_THREAD=<chat>/<ts>`) when a batch lands or it's stuck, and it logs everything else to `~/.cc/state/queue-steward.log`. To stop it, stop `cc-queue-steward.timer` or set `CC_QSTEWARD=off`. The rules are in the tool's docstring.

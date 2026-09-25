@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""cc-queue-steward — notice when the landing queue stalls, and have one Opus call decide what to do about it.
+
+  cc-queue-steward              one pass: print the events since the last --apply; wake nothing, run nothing (the
+                                very first pass only notes where the ledger ends)
+  cc-queue-steward --apply      …and act: post a batch that landed, wake the model on anything else, run what it picks
+  cc-queue-steward selfcheck    the decisions against a fake queue, a fake model and a recorded runner; no network
+
+It rides its own timer (cc-queue-steward.timer, 2 min). The pass itself asks no model: it reads the landing tool's
+files under ~/.cc/state/land and nothing else, and it never edits them. One instance: a flock, and the unit is a
+oneshot. Killable: stop the timer, or CC_QSTEWARD=off in ~/.cc/config. Spend tier `stop` skips the pass whole and
+leaves the ledger unread, so the events wait for the resume.
+
+WHAT WAKES IT — terminal states only, each said once:
+  stop       the ledger's `done <repo>#<pr> rc=N` with N not 0, once per PR and reason a day. A stop whose text is a
+             DO-NOT-LAND is a person's move and wakes nothing.
+  red        a `batch-red` line: the suite on the base went red after a batch.
+  stuck      a lane that lives but has shown no progress for CC_QSTEWARD_STUCK_S (90 min) — none of its repo's jobs
+             changed and no ledger line named the repo — while a job of it sits due outside a waiting stage.
+  lane-down  a job due for CC_QSTEWARD_GRACE_S (10 min), or a cut-off batch, with no live lane for its repo and the
+             project not paused. Said once until a lane is seen alive again.
+  same-red   one gate case in the stops of CC_QSTEWARD_SAME_RED (2) different PRs inside a day.
+The first pass starts at the ledger's end: history is not replayed.
+
+WHAT IT DOES. A batch that landed (the batch's own deploy `done … rc=0`) is one line to the landing thread, with no
+model. Every other event goes to ONE `claude -p` on CC_QSTEWARD_MODEL (claude-opus-5-5), with Read/Grep/Glob and no
+shell, which answers a JSON list of actions. The pass runs only these, each checked first, 8 at most per wake:
+  requeue <repo> <pr>        the landing tool's own `queue` door, never with --approved-by, so a protected path stays
+                             the owner's; refused for a DO-NOT-LAND job, and after 2 re-queues of that PR in a day
+  lane                       `work --detach`, which starts a lane for every repo with work and none running
+  green <repo> <track>       `cc-green run`, detached, in that track's worktree; once per track in 6 h
+  fix <repo> <pr> <track>    one fix or rebase round: `cc <repo> <track> --go <brief>`; once per PR a day
+  raise <slug>               a `raised-<slug>` row on the control repo's board, for a recurring red; once per slug a week
+  stuck <text>               the one line to the landing thread when it cannot move something itself
+None of these merges anything: a re-queued PR goes through every gate and review again. A model that fails or
+answers nothing usable is a `stuck` line of the pass's own.
+
+THE LANDING THREAD is CC_QSTEWARD_THREAD=<chat>/<ts> in ~/.cc/config; unset, a post goes to the control repo's
+updates lane as "[<repo>] landing steward". Every post and action is a line in ~/.cc/state/queue-steward.log.
+"""
+import calendar, fcntl, glob, json, os, re, subprocess, sys, tempfile, time, zlib
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+LANDER = f"{BIN}/cc-land"
+LANDQ = os.environ.get("CC_QSTEWARD_LANDQ") or f"{HOME}/.cc/state/land"
+STATE = os.environ.get("CC_QSTEWARD_STATE") or f"{HOME}/.cc/state/queue-steward.json"   # never under LANDQ: every
+LOG = os.environ.get("CC_QSTEWARD_LOG") or f"{HOME}/.cc/state/queue-steward.log"        # *.json there is a job
+CLAUDE = os.environ.get("CC_CLAUDE") or f"{HOME}/.local/bin/claude"
+DAY = 86400
+WAIT_STAGES = ("queued", "held", "deferred", "fixing")   # stages a job sits in by design, with a not_before
+MAX_ACTIONS = 8
+TOOLS = "Read,Grep,Glob"
+DENY_TOOLS = ("Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,"
+              "Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,"
+              "PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree")
+SECRET_PATHS = (".cc/config", ".cc/secrets/**", ".cc/members/**", "ccbox/env", ".ssh/**",
+                ".claude/.credentials.json", ".claude.json", ".config/gh/**")
+NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
+
+
+def conf(key, default):
+    """Environment, else ~/.cc/config, else the default."""
+    val = os.environ.get(key, "")
+    if not val:
+        try:
+            for ln in open(f"{HOME}/.cc/config"):
+                if ln.strip().startswith(key + "="):
+                    val = ln.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return val or default
+
+
+def ctl():
+    """The control repo: the one this bin/ is checked out under in ~/dev, else CC_QSTEWARD_REPO."""
+    if os.environ.get("CC_QSTEWARD_REPO"):
+        return os.environ["CC_QSTEWARD_REPO"]
+    rel = os.path.relpath(BIN, f"{HOME}/dev")
+    return rel.split(os.sep)[0] if not rel.startswith("..") else "box"
+
+
+def stamp(t=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if t is None else t))
+
+
+def epoch(s):
+    try:
+        return float(calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def say(line):
+    try:
+        with open(LOG, "a") as f:
+            f.write(f"{stamp()}\t{line}\n")
+    except OSError:
+        pass
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".qsteward.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+# ---- the seams the selfcheck replaces -------------------------------------------------------------------------
+
+def run(argv, env=None, cwd=None, detach=False):
+    """Run one door. Returns (rc, output). A detached run (a green) is started and left: its record is its outcome."""
+    try:
+        if detach:
+            subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return 0, "started"
+        p = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=300)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except Exception as e:
+        return 1, e.__class__.__name__
+
+
+def held(repo):
+    """The box itself holds this repo's jobs (cc-pause), so a lane that is not running is not a stall."""
+    return run([f"{BIN}/cc-pause", "is", repo])[0] == 0
+
+
+def tier_stop():
+    return run([f"{BIN}/cc-tier", "allows", "gates"])[0] == 1
+
+
+def lane_alive(repo):
+    m = read_json(f"{LANDQ}/lanes/{repo}.running") or {}
+    try:
+        os.kill(int(m.get("pid")), 0)
+        return True
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+
+
+def model(text):
+    """One `claude -p`. Returns (reply text or None, why). CC_QSTEWARD_FAKE is the result text the model would give."""
+    fake = os.environ.get("CC_QSTEWARD_FAKE")
+    if fake is not None:
+        return (fake or None), ("fake" if fake else "empty result")
+    cwd = f"{HOME}/.cc/queue-steward"
+    os.makedirs(cwd, exist_ok=True)
+    deny = DENY_TOOLS + "".join(f",Read(/{HOME}/{s}),Grep(/{HOME}/{s})" for s in SECRET_PATHS)
+    try:
+        p = subprocess.run([CLAUDE, "-p", "--model", conf("CC_QSTEWARD_MODEL", "claude-opus-5-5"),
+                            "--allowedTools", TOOLS, "--disallowedTools", deny,
+                            "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands",
+                            "--max-turns", conf("CC_QSTEWARD_TURNS", "30"), "--no-session-persistence",
+                            "--output-format", "json", "--max-budget-usd", conf("CC_QSTEWARD_BUDGET", "3")],
+                           input=text, capture_output=True, text=True, timeout=1200, cwd=cwd,
+                           env=dict(os.environ, CC_ROLE="steward"))
+        d = json.loads(p.stdout)
+    except subprocess.TimeoutExpired:
+        return None, "timed out"
+    except Exception as e:
+        return None, e.__class__.__name__
+    r = d.get("result")
+    say(f"model cost=${d.get('total_cost_usd', 0)} turns={d.get('num_turns', 0)}")
+    if d.get("is_error") or not isinstance(r, str) or not r.strip():
+        return None, str(d.get("subtype") or "empty result")[:120]
+    return r, ""
+
+
+# ---- reading the queue ------------------------------------------------------------------------------------------
+
+def norm_case(text):
+    """The red case a stop names, in a form two PRs share: `gate <g>: <first failing line>`, numbers and paths out."""
+    m = re.search(r"gate (\S+) did not pass: (.*)", text or "")
+    if not m:
+        return ""
+    case = m.group(2).split(" · ")[0].split("[full output")[0]
+    case = re.sub(r"/\S+", "<path>", case)
+    case = re.sub(r"\b[0-9a-f]{7,40}\b|\d+", "#", case)
+    return f"gate {os.path.basename(m.group(1))}: {' '.join(case.split())[:120]}"
+
+
+def new_lines(st):
+    """The ledger lines written since the last pass. The first pass only notes where the ledger ends."""
+    path = f"{LANDQ}/queue.log"
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    off = st.get("offset")
+    if off is None:
+        st["offset"] = size
+        return []
+    if size < off:
+        off = 0                                         # rotated or truncated: read it from the start
+    with open(path, "rb") as f:
+        f.seek(off)
+        data = f.read()
+    cut = data.rfind(b"\n") + 1                          # a half-written last line waits for the next pass
+    st["offset"] = off + cut
+    return data[:cut].decode("utf-8", "replace").splitlines()
+
+
+def once(st, key, now, ttl):
+    """True the first time `key` is seen inside `ttl` seconds, and stamps it."""
+    seen = st.setdefault("seen", {})
+    if now - seen.get(key, 0) < ttl:
+        return False
+    seen[key] = now
+    return True
+
+
+def scan(st, now=None):
+    """One pass over the ledger and the jobs. Returns (events, batches): events for the model, batches that landed."""
+    now = time.time() if now is None else now
+    events, batches = [], []
+    pending = st.setdefault("batch", {})
+    reds = st.setdefault("reds", {})
+    active = st.setdefault("active", {})
+    for ln in new_lines(st):
+        at, _, ev = ln.partition("\t")
+        who = (ev.split() + ["", ""])[1].split("#")[0]
+        if NAME.fullmatch(who):
+            active[who] = max(active.get(who, 0), epoch(at))
+        m = re.match(r"queued (\S+)#deploy .*\bby=the batch (.*)", ev)
+        if m:
+            pending[m.group(1)] = m.group(2).strip()
+            continue
+        m = re.match(r"batch-red (\S+) (.*)", ev)
+        if m:
+            if once(st, f"red:{m.group(1)}:{m.group(2)[:40]}", now, DAY):
+                events.append({"kind": "red", "repo": m.group(1), "at": at, "text": m.group(2)[:400]})
+            continue
+        m = re.match(r"done (\S+)#(\S+) rc=(-?\d+) (.*)", ev)
+        if not m:
+            continue
+        repo, pr, rc, text = m.group(1), m.group(2), m.group(3), m.group(4)
+        if pr == "deploy" and repo in pending:
+            prs = pending.pop(repo)
+            if rc == "0":
+                batches.append({"repo": repo, "prs": prs, "at": at})
+                continue
+        if rc == "0":
+            continue
+        if "DO-NOT-LAND" in text:
+            say(f"seen {repo}#{pr} stop: a DO-NOT-LAND, a person's move — no wake")
+            continue
+        # "a stop … once per PR and reason a day": the same deploy stop, re-said by every catch-up sweep, is one event
+        if once(st, f"stop:{repo}#{pr}:{re.sub(r'[0-9]', '', text)[:80]}", now, DAY):
+            events.append({"kind": "stop", "repo": repo, "pr": pr, "rc": int(rc), "at": at, "text": text[:600]})
+        case = norm_case(text)
+        if case and pr != "deploy":
+            prs = {p: t for p, t in reds.get(case, {}).items() if now - t < DAY}
+            prs[f"{repo}#{pr}"] = now
+            reds[case] = prs
+            if len(prs) >= int(conf("CC_QSTEWARD_SAME_RED", "2")) and once(st, f"same:{case}", now, DAY):
+                events.append({"kind": "same-red", "case": case, "prs": sorted(prs)})
+    for repo in [r for r, t in active.items() if now - t >= DAY]:
+        del active[repo]
+    for case in [c for c, prs in reds.items() if all(now - t >= DAY for t in prs.values())]:
+        del reds[case]
+    events += scan_jobs(st, now)
+    return events, batches
+
+
+def scan_jobs(st, now):
+    grace = int(conf("CC_QSTEWARD_GRACE_S", "600"))
+    stuck_s = int(conf("CC_QSTEWARD_STUCK_S", "5400"))
+    events, due, moved = [], {}, dict(st.get("active", {}))   # moved: when each repo's lane last showed progress
+    down = st.setdefault("down", {})
+    for path in sorted(glob.glob(f"{LANDQ}/*.json")):
+        job = read_json(path)
+        if not isinstance(job, dict) or not job.get("repo") or job.get("state") == "done":
+            continue
+        try:
+            changed = max(os.path.getmtime(path), epoch(job.get("at")), epoch(job.get("queued_at")))
+        except OSError:
+            continue
+        moved[job["repo"]] = max(moved.get(job["repo"], 0), changed)
+        nb = epoch(job.get("not_before"))
+        if nb > now - grace or changed > now - grace:
+            continue                                     # waiting by design, or it moved a moment ago
+        due.setdefault(job["repo"], []).append((job, changed))
+    for path in glob.glob(f"{LANDQ}/*.batch"):
+        due.setdefault(os.path.basename(path)[:-len(".batch")], [])
+    for repo in sorted(due):
+        if not NAME.fullmatch(repo):
+            continue
+        if lane_alive(repo):
+            down.pop(repo, None)                         # a live lane re-arms the lane-down event
+            # Stuck is the LANE not moving: a job waiting its turn behind others the lane is landing is not stuck,
+            # so the bound is on the repo's last sign of progress — any of its jobs changing, or a ledger line.
+            stale = sorted((c, j) for j, c in due[repo] if j.get("stage") not in WAIT_STAGES)
+            if stale and moved.get(repo, 0) <= now - stuck_s \
+                    and once(st, f"stuck:{repo}@{int(moved[repo])}", now, 7 * DAY):
+                changed, job = stale[0][0], stale[0][1]
+                events.append({"kind": "stuck", "repo": repo, "pr": job.get("pr"), "stage": job.get("stage"),
+                               "since": stamp(changed), "last": (job.get("last") or "")[:300],
+                               "others": [j.get("pr") for _, j in stale[1:]]})
+        elif repo not in down and not held(repo):
+            down[repo] = now
+            events.append({"kind": "lane-down", "repo": repo,
+                           "jobs": [j.get("pr") or "deploy" for j, _ in due[repo]] or ["a cut-off batch"]})
+    for repo in [r for r in down if r not in due]:
+        del down[repo]                                   # nothing due any more: the episode is over
+    return events
+
+
+def snapshot():
+    jobs = []
+    for path in sorted(glob.glob(f"{LANDQ}/*.json")):
+        j = read_json(path)
+        if isinstance(j, dict) and j.get("repo"):
+            jobs.append({k: (j.get(k)[:300] if isinstance(j.get(k), str) else j.get(k)) for k in
+                         ("repo", "pr", "stage", "state", "attempts", "at", "not_before", "last", "capped", "fix")
+                         if j.get(k) is not None})
+    lanes = sorted(os.path.basename(p)[:-len(".running")] for p in glob.glob(f"{LANDQ}/lanes/*.running")
+                   if lane_alive(os.path.basename(p)[:-len(".running")]))
+    try:
+        with open(f"{LANDQ}/queue.log", "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 12000))
+            tail = f.read().decode("utf-8", "replace").splitlines()[1:][-40:]
+    except OSError:
+        tail = []
+    return jobs, lanes, tail
+
+
+PROMPT = """You are the landing queue's steward on a headless home server. The landing tool lands PRs through gates,
+a review, a merge and a deploy, in one lane per repo. You were woken because the events below happened. Decide what,
+if anything, moves the queue again, and answer with ONE JSON object and nothing else:
+{{"actions": [...], "note": "one line on what you found"}}
+
+Each action is one of these, and nothing else is run:
+  {{"do": "requeue", "repo": R, "pr": N, "why": W}}     re-queue a PR the landing stopped for a cause that has gone
+                                                    (a flake, a box hiccup, a red that was not the PR's). It re-runs
+                                                    every gate and the review. Never for a review finding.
+  {{"do": "lane", "why": W}}                          start a lane for every repo with work and none running
+  {{"do": "green", "repo": R, "track": T, "why": W}}   run the suite in that track's worktree, so the landing finds a
+                                                    green record for the PR's tree instead of running it on the queue
+  {{"do": "fix", "repo": R, "pr": N, "track": T, "brief": B}}   one fix or rebase round in the PR's track, for a red
+                                                    that IS the PR's (B: the goal, the red it must turn green, why)
+  {{"do": "raise", "slug": S, "title": T, "body": B}}   a raised-<S> board row for a recurring red nobody owns:
+                                                    what happened, on which PRs, what it cost
+  {{"do": "stuck", "text": X}}                        one line to the owner: what is stuck and what only a person can move
+An empty list is a fine answer when the queue will move on its own. Never try to merge, and never go around a red
+gate, a review finding or a protected path: those are a person's. Read the gate logs, the job files under
+{landq} and the ledger {landq}/queue.log before you judge a red as a flake. A track's state is under
+{home}/.cc/state/<repo>/<track>, its worktree under {home}/.cc/worktrees/<repo>/<track>.
+
+EVENTS:
+{events}
+
+THE QUEUE NOW (jobs):
+{jobs}
+
+LIVE LANES: {lanes}
+
+THE LEDGER'S LAST LINES:
+{tail}
+"""
+
+
+def parse(reply):
+    m = re.search(r"\{.*\}", reply or "", re.S)
+    try:
+        d = json.loads(m.group(0)) if m else None
+    except ValueError:
+        d = None
+    return d if isinstance(d, dict) and isinstance(d.get("actions"), list) else None
+
+
+# ---- acting -------------------------------------------------------------------------------------------------------
+
+def post(text, key):
+    """One line to the landing thread; --id makes a replay of the same key post nothing."""
+    where = conf("CC_QSTEWARD_THREAD", "")
+    chat, _, ts = where.partition("/")
+    to = ["-c", chat, "--thread", ts] if chat and ts else ["--route", f"[{ctl()}] landing steward"]
+    rc, out = run([f"{BIN}/cc-slack", "post", *to, "--id", f"queue-steward:{key}", text])
+    say(f"post rc={rc} {text[:200]}" + (f" — {out[:120]}" if rc else ""))
+    return rc == 0
+
+
+def job_of(repo, pr):
+    return read_json(f"{LANDQ}/{repo}-{pr}.json") or {}
+
+
+def act(st, a, now):
+    """Run one action the model chose, after the checks the docstring names. Returns the log line."""
+    a = a if isinstance(a, dict) else {}
+    do, repo, track = a.get("do"), str(a.get("repo") or ""), str(a.get("track") or "")
+    try:
+        pr = int(a["pr"]) if a.get("pr") is not None else None
+    except (TypeError, ValueError):
+        pr = None
+    if do == "requeue":
+        # The brief: "It never merges past a red gate or a review finding, and never touches the protected-path door."
+        # A re-queue merges nothing — the landing re-runs every gate and the review — and no --approved-by is passed.
+        if not NAME.fullmatch(repo) or pr is None:
+            return "refused requeue: needs a repo and a PR number"
+        if "DO-NOT-LAND" in json.dumps(job_of(repo, pr)):
+            return f"refused requeue {repo}#{pr}: its review said DO-NOT-LAND, a person's move"
+        acted = [t for t in st.setdefault("requeues", {}).get(f"{repo}#{pr}", []) if now - t < DAY]
+        if len(acted) >= 2:
+            return f"refused requeue {repo}#{pr}: re-queued twice today already"
+        st["requeues"][f"{repo}#{pr}"] = acted + [now]
+        rc, out = run([LANDER, "queue", repo, str(pr)])
+        return f"requeue {repo}#{pr} rc={rc} {out[-160:]}"
+    if do == "lane":
+        rc, out = run([LANDER, "work", "--detach"])
+        return f"lane rc={rc} {out[-160:]}"
+    if do == "green":
+        wt = f"{HOME}/.cc/worktrees/{repo}/{track}"
+        if not (NAME.fullmatch(repo) and NAME.fullmatch(track) and os.path.isdir(wt)):
+            return f"refused green {repo}/{track}: no such worktree"
+        if not once(st, f"green:{repo}/{track}", now, 6 * 3600):
+            return f"refused green {repo}/{track}: one already started in the last 6 h"
+        rc, out = run([f"{BIN}/cc-green", "run"], cwd=wt, detach=True)
+        return f"green {repo}/{track} rc={rc} {out}"
+    if do == "fix":
+        brief = str(a.get("brief") or "").strip()
+        if not (NAME.fullmatch(repo) and NAME.fullmatch(track) and pr is not None and brief):
+            return "refused fix: needs a repo, a PR, a track and a brief"
+        if not os.path.isdir(f"{HOME}/.cc/state/{repo}/{track}"):
+            return f"refused fix {repo}#{pr}: no track state for {track}"
+        if not once(st, f"fix:{repo}#{pr}", now, DAY):
+            return f"refused fix {repo}#{pr}: one round already sent today"
+        go = f"The landing steward sends one round for PR #{pr}: {brief[:1500]}"
+        rc, out = run([f"{BIN}/cc", repo, track, "--go", go, "--loop", "1", "--no-extend",
+                       "--model", conf("CC_QSTEWARD_FIX_MODEL", "claude-opus-5-5"), "--budget", "12"],
+                      env=dict(os.environ, CC_BRIEF_MACHINE="1"))
+        return f"fix {repo}#{pr} in {track} rc={rc} {out[-160:]}"
+    if do == "raise":
+        slug = re.sub(r"^raised-", "", str(a.get("slug") or ""))
+        title, body = str(a.get("title") or "").strip(), str(a.get("body") or "").strip()
+        if not (re.fullmatch(r"[a-z0-9][a-z0-9-]{2,60}", slug) and title and body):
+            return "refused raise: needs a slug, a title and a body"
+        if not once(st, f"raise:{slug}", now, 7 * DAY):
+            return f"refused raise raised-{slug}: raised this week already"
+        rc, out = run([f"{BIN}/cc-board", "add", ctl(), f"raised-{slug}", title[:200], body[:2000]],
+                      env=dict(os.environ, CC_BRIEF_MACHINE="1"))
+        return f"raise raised-{slug} rc={rc} {out[-160:]}"
+    if do == "stuck":
+        text = str(a.get("text") or "").strip()
+        if not text:
+            return "refused stuck: no text"
+        post(text[:600], f"stuck:{stamp(now)[:13]}:{zlib.crc32(text.encode())}")
+        return f"stuck said: {text[:160]}"
+    return f"refused {str(do)[:40]!r}: not an action this runs"
+
+
+def apply(st, events, batches, now):
+    for b in batches:
+        post(f"[{b['repo']}] The batch {b['prs']} landed, and its suite passed on main.", f"batch:{b['repo']}:{b['at']}")
+    if not events:
+        return
+    for e in events:
+        say(f"event {json.dumps(e)[:400]}")
+    jobs, lanes, tail = snapshot()
+    reply, why = model(PROMPT.format(landq=LANDQ, home=HOME, events=json.dumps(events, indent=1),
+                                     jobs=json.dumps(jobs, indent=1)[:20000], lanes=", ".join(lanes) or "none",
+                                     tail="\n".join(tail)))
+    d = parse(reply)
+    if d is None:
+        say(f"model gave nothing usable: {why or (reply or '')[:200]}")
+        post(f"I couldn't decide what to do about {len(events)} landing event(s) ({', '.join(sorted({e['kind'] for e in events}))}): "
+             f"the model {why or 'answered no action list'}. They're in {LOG}.", f"nomodel:{stamp(now)[:13]}")
+        return
+    say(f"note {str(d.get('note') or '')[:300]}")
+    for a in d["actions"][:MAX_ACTIONS]:
+        say(act(st, a, now))
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    apply_ = "--apply" in argv
+    if conf("CC_QSTEWARD", "on") == "off":
+        return 0
+    lock = open(f"{STATE}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("cc-queue-steward: another pass is running")
+        return 0
+    if tier_stop():
+        return 0                                         # the spend tier's stop: leave the ledger unread for the resume
+    st = read_json(STATE, {}) or {}
+    now = time.time()
+    events, batches = scan(st, now)
+    for x in events + [dict(b, kind="batch-landed") for b in batches]:
+        print(json.dumps(x))
+    if apply_:
+        apply(st, events, batches, now)
+    if apply_ or "offset" not in (read_json(STATE, {}) or {}):
+        cut = now - 7 * DAY
+        st["seen"] = {k: t for k, t in st.get("seen", {}).items() if t >= cut}
+        write_json(STATE, st)
+    return 0
+
+
+# ---- selfcheck ------------------------------------------------------------------------------------------------------
+
+def selfcheck():
+    global LANDQ, STATE, LOG, run, held, tier_stop
+    passed, failed = 0, 0
+
+    def check(name, ok):
+        nonlocal passed, failed
+        passed, failed = passed + bool(ok), failed + (not ok)
+        print(f"  {'ok' if ok else 'FAIL'}  {name}")
+
+    calls = []
+
+    def fake_run(argv, env=None, cwd=None, detach=False):
+        calls.append({"argv": argv, "env": env or {}, "cwd": cwd, "detach": detach})
+        return 0, "ok"
+
+    run, held, tier_stop = fake_run, (lambda repo: False), (lambda: False)
+    os.environ["CC_QSTEWARD_REPO"] = "ctlrepo"
+    for k in ("CC_QSTEWARD_THREAD", "CC_QSTEWARD", "CC_QSTEWARD_GRACE_S", "CC_QSTEWARD_STUCK_S"):
+        os.environ[k] = {"CC_QSTEWARD_THREAD": "C1/111.2", "CC_QSTEWARD": "on",
+                         "CC_QSTEWARD_GRACE_S": "600", "CC_QSTEWARD_STUCK_S": "5400"}[k]
+    now = time.time()
+    old = stamp(now - 7200)
+
+    def fixture():
+        """A fresh queue dir, state and log for one case: nothing an earlier case left is read."""
+        global LANDQ, STATE, LOG
+        d = tempfile.mkdtemp(prefix="qsteward-sc-")
+        LANDQ, STATE, LOG = f"{d}/land", f"{d}/qs.json", f"{d}/qs.log"
+        os.makedirs(f"{LANDQ}/lanes")
+        open(f"{LANDQ}/queue.log", "w").write(f"{old}\tdone r#1 rc=1 [r] PR #1: gate x did not pass: ✗ a\n")
+        calls.clear()
+        return {}
+
+    def ledger(*lines):
+        with open(f"{LANDQ}/queue.log", "a") as f:
+            for ln in lines:
+                f.write(f"{stamp(now)}\t{ln}\n")
+
+    def job(repo, pr, age, **kw):
+        p = f"{LANDQ}/{repo}-{pr}.json"
+        write_json(p, dict({"repo": repo, "pr": pr, "queued_at": stamp(now - age), "stage": "queued"}, **kw))
+        os.utime(p, (now - age, now - age))
+
+    def lane(repo, pid):
+        write_json(f"{LANDQ}/lanes/{repo}.running", {"pid": pid, "since": stamp(now)})
+
+    dead = subprocess.Popen(["true"]); dead.wait()
+
+    # 1 the first pass starts at the ledger's end; a stop after it is an event, and said once
+    st = fixture()
+    e, b = scan(st, now)
+    check("first pass: a stop already in the ledger is history, not an event", e == [] and st["offset"] > 0)
+    ledger("done r#2 rc=1 [r] PR #2: NOT merged ❌ — gate core/tests/check.sh did not pass: ✗ foo 12 failed")
+    e, _ = scan(st, now)
+    check("a stop written after the first pass is one stop event", [x["kind"] for x in e] == ["stop"] and e[0]["pr"] == "2")
+    ledger("done r#2 rc=1 [r] PR #2: NOT merged ❌ — gate core/tests/check.sh did not pass: ✗ foo 13 failed")
+    e, _ = scan(st, now)
+    check("the same PR stopped again for the same reason inside a day wakes nothing", e == [])
+
+    # 2 a DO-NOT-LAND stop is a person's; a landed PR is not an event
+    st = fixture(); scan(st, now)
+    ledger("done r#3 rc=1 [r] PR #3: NOT merged ❌ — review: DO-NOT-LAND", "done r#4 rc=0 [r] PR #4: landed ✅")
+    e, b = scan(st, now)
+    check("a DO-NOT-LAND stop and a landed PR wake nothing", e == [] and b == [])
+
+    # 3 a batch lands: its deploy done rc=0 after `by=the batch` — and a plain deploy is not a batch
+    st = fixture(); scan(st, now)
+    ledger("queued r#deploy span=a..b by=the batch #5, #6", "done r#deploy rc=0 [r] deployed",
+           "queued q#deploy span=a..b by=the catch-up sweep", "done q#deploy rc=0 [q] deployed")
+    e, b = scan(st, now)
+    check("the batch's green deploy is a batch that landed; a catch-up deploy is not", e == [] and
+          [(x["repo"], x["prs"]) for x in b] == [("r", "#5, #6")])
+    ledger("queued r#deploy span=a..b by=the batch #7", "done r#deploy rc=1 [r] deploy stopped ❌")
+    e, b = scan(st, now)
+    check("a batch whose deploy stopped is a stop, not a landing", b == [] and [x["kind"] for x in e] == ["stop"])
+
+    # 4 a batch-red wakes it
+    st = fixture(); scan(st, now)
+    ledger("batch-red r tip=abc first-batch — suite red")
+    e, _ = scan(st, now)
+    check("a batch-red line is a red event", [x["kind"] for x in e] == ["red"])
+
+    # 5 the same red case on two PRs is a same-red event; two different cases are not
+    st = fixture(); scan(st, now)
+    ledger("done r#8 rc=1 [r] PR #8: gate /a/check.sh did not pass: ✗ cc-x selfcheck: 3 failed · more",
+           "done r#9 rc=1 [r] PR #9: gate /a/check.sh did not pass: ✗ cc-y selfcheck: 1 failed")
+    e, _ = scan(st, now)
+    check("two PRs red on different cases are two stops and no same-red", sorted(x["kind"] for x in e) == ["stop", "stop"])
+    ledger("done r#10 rc=1 [r] PR #10: gate /b/check.sh did not pass: ✗ cc-x selfcheck: 7 failed")
+    e, _ = scan(st, now)
+    check("a third PR red on the first case makes a same-red naming both PRs",
+          [x for x in e if x["kind"] == "same-red"] and [x for x in e if x["kind"] == "same-red"][0]["prs"] == ["r#10", "r#8"])
+
+    # 6 lane-down: a due job and no live lane — not with a live lane, not before its not_before, said once
+    st = fixture(); scan(st, now)
+    job("r", 11, 3600)
+    lane("r", dead.pid)
+    e, _ = scan(st, now)
+    check("a due job with a dead lane marker is lane-down", [x["kind"] for x in e] == ["lane-down"])
+    e, _ = scan(st, now)
+    check("lane-down is said once per episode", e == [])
+    lane("r", os.getpid()); scan(st, now); lane("r", dead.pid)
+    e, _ = scan(st, now)
+    check("a lane seen alive re-arms it", [x["kind"] for x in e] == ["lane-down"])
+    st = fixture(); scan(st, now)
+    job("r", 12, 3600, not_before=stamp(now + 300))
+    job("q", 13, 60)
+    e, _ = scan(st, now)
+    check("a job waiting on its not_before, or queued a minute ago, is not lane-down", e == [])
+    st = fixture(); scan(st, now)
+    job("r", 14, 3600)
+    held_was = held
+    held = lambda repo: True
+    e, _ = scan(st, now)
+    held = held_was
+    check("a paused project's jobs are not lane-down", e == [])
+
+    # 7 stuck: the lane lives but the job has not moved past the bound; a waiting stage is not stuck
+    st = fixture(); scan(st, now)
+    lane("r", os.getpid())
+    job("r", 15, 7200, stage="gates", at=stamp(now - 7200))
+    job("r", 16, 7200, stage="held", at=stamp(now - 7200))
+    e, _ = scan(st, now)
+    check("a lane that has not moved past the bound is stuck, naming its oldest job",
+          [(x["kind"], x["pr"]) for x in e] == [("stuck", 15)])
+    e, _ = scan(st, now)
+    check("the same stall is said once", e == [])
+    st = fixture(); scan(st, now)
+    lane("r", os.getpid())
+    job("r", 18, 7200, stage="gates", at=stamp(now - 7200))
+    job("r", 19, 1200, stage="queued", not_before=stamp(now + 600))
+    e, _ = scan(st, now)
+    check("a job waiting its turn while the lane lands others is not stuck", e == [])
+    st = fixture(); scan(st, now)
+    lane("r", os.getpid())
+    job("r", 22, 7200, stage="gates", at=stamp(now - 7200))
+    ledger("queued r#23 who=- chat=-")
+    e, _ = scan(st, now)
+    check("a ledger line naming the repo is progress too", e == [])
+
+    # 8 acting: the doors, and the checks in front of them
+    st = fixture()
+    job("r", 20, 60, last="review: DO-NOT-LAND")
+    job("r", 21, 60, stage="gates")
+    out = [act(st, a, now) for a in (
+        {"do": "requeue", "repo": "r", "pr": 21}, {"do": "requeue", "repo": "r", "pr": 20},
+        {"do": "requeue", "repo": "r", "pr": 21}, {"do": "requeue", "repo": "r", "pr": 21},
+        {"do": "merge", "repo": "r", "pr": 21}, {"do": "lane"})]
+    argvs = [c["argv"][1:] for c in calls]
+    check("requeue runs the queue door with no --approved-by; twice a day at most; DO-NOT-LAND refused",
+          argvs[:2] == [["queue", "r", "21"], ["queue", "r", "21"]] and "DO-NOT-LAND" in out[1]
+          and out[3].startswith("refused") and all("--approved-by" not in c["argv"] for c in calls))
+    check("an action outside the list is refused and runs nothing; lane starts the worker detached",
+          out[4].startswith("refused") and argvs[2:] == [["work", "--detach"]])
+    calls.clear()
+    wt = f"{HOME}/.cc/worktrees"
+    out = [act(st, a, now) for a in (
+        {"do": "green", "repo": "r", "track": "no-such-track-qs"}, {"do": "fix", "repo": "r", "pr": 21, "track": "no-such-track-qs", "brief": "b"},
+        {"do": "raise", "slug": "flaky-case", "title": "t", "body": "b"}, {"do": "raise", "slug": "flaky-case", "title": "t", "body": "b"},
+        {"do": "raise", "slug": "Bad Slug", "title": "t", "body": "b"})]
+    check("green and fix are refused without the track's worktree or state", out[0].startswith("refused")
+          and out[1].startswith("refused") and not os.path.isdir(f"{wt}/r/no-such-track-qs"))
+    check("raise files a raised- row on the control repo, machine-written, once a week; a bad slug is refused",
+          [c["argv"][1:4] for c in calls] == [["add", "ctlrepo", "raised-flaky-case"]]
+          and calls[0]["env"].get("CC_BRIEF_MACHINE") == "1" and out[3].startswith("refused") and out[4].startswith("refused"))
+
+    # 9 apply: a batch posts one line with no model; an event with a model that fails is a stuck line
+    st = fixture()
+    os.environ["CC_QSTEWARD_FAKE"] = ""
+    apply(st, [], [{"repo": "r", "prs": "#5, #6", "at": "t"}], now)
+    check("a batch that landed is one post into the landing thread and no model call",
+          len(calls) == 1 and calls[0]["argv"][2:6] == ["-c", "C1", "--thread", "111.2"] and "#5, #6" in calls[0]["argv"][-1])
+    calls.clear()
+    apply(st, [{"kind": "stop", "repo": "r", "pr": "2"}], [], now)
+    check("a model that answers nothing is a stuck post, and nothing else runs",
+          len(calls) == 1 and "couldn't decide" in calls[0]["argv"][-1])
+    calls.clear()
+    os.environ["CC_QSTEWARD_FAKE"] = json.dumps({"actions": [{"do": "lane"}], "note": "lane died"})
+    apply(st, [{"kind": "lane-down", "repo": "r"}], [], now)
+    check("a model's action list is run", [c["argv"][1:] for c in calls] == [["work", "--detach"]])
+    calls.clear()
+    apply(st, [], [], now)
+    check("no events and no batch: no model, no post", calls == [])
+    del os.environ["CC_QSTEWARD_FAKE"]
+
+    # 10 main: the off switch and the tier's stop leave the ledger unread
+    st = fixture()
+    ledger("done r#30 rc=1 [r] PR #30: gate x did not pass: ✗ z")
+    tier_stop = lambda: True
+    main(["--apply"])
+    tier_stop = lambda: False
+    check("spend tier stop: no state written, nothing run", not os.path.exists(STATE) and calls == [])
+    os.environ["CC_QSTEWARD"] = "off"
+    main(["--apply"])
+    os.environ["CC_QSTEWARD"] = "on"
+    check("CC_QSTEWARD=off: no state written", not os.path.exists(STATE))
+    main([])
+    check("a dry pass writes only the first offset and runs nothing", os.path.exists(STATE) and calls == [])
+
+    print(f"cc-queue-steward selfcheck: {passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
