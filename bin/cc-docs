@@ -48,6 +48,17 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         note, file, pages, bytes, board revision and cost. The owner sees the whole register and each public
         revision's token; a member sees only documents visible to its workspace, its own stars, and no tokens.
         Any other viewer is refused.
+    cc-docs fold <keep PPP-NNNN> <other PPP-NNNN>…
+        Makes the other documents revisions of <keep>, for old versions filed as documents of their own. Every revision
+        of them all is ordered oldest first by date (ties by the order given) with <keep>'s current revision last, so
+        the next build of its source still matches it, and relettered A, B, C…; refused when another revision is dated
+        after it. <keep> keeps its title, source, visibility and stars. The filed copies are renamed to match (their
+        bytes, and any stamp printed in them, are not rewritten), a revision whose number changed loses its public
+        link, and the other numbers are retired. All must be in one project, none with a retired revision. Prints
+        `<old number>\t<new number>\t<path>` per revision.
+    cc-docs retire <PPP-NNNN | PPP-NNNN-R>
+        Takes a document (or one revision; its last revision retires the document) out of the register, its member
+        views and its public link, for a document filed by mistake. Its filed copies move under retired/files/.
     cc-docs selfcheck
 
 THE REGISTER is one JSON file, $CC_DOCS_ROOT/register.json (default ~/.cc/documents), with the filed copies under
@@ -68,6 +79,10 @@ filed copies hard-linked beside it, so `CC_DOCS_ROOT=<the view> cc-docs find …
 rewrites the views its document reaches after every filing, in place (a bind mount of the directory keeps seeing
 them), so the directory can be mounted read-only into that member's sandbox the way cc-lib mounts ws/<id>/. A
 star or a public switch rewrites them too. A view never carries a public token.
+
+RETIRED numbers (`fold`, `retire`) are kept in the register's `retired`, and a retired revision's letter in its
+document's `retired_revs`, so neither is handed out again. What either verb takes out of the register is kept as
+retired/<number>.json beside it, and nothing is deleted.
 """
 import datetime
 import fcntl
@@ -241,6 +256,7 @@ def match_doc(reg, proj, title, source):
 
 def next_doc(reg, proj):
     used = [int(n.split("-")[1]) for n, d in reg["documents"].items() if d["project"] == proj]
+    used += [int(n.split("-")[1]) for n in reg.get("retired", {}) if n.startswith(proj + "-")]   # never handed out again
     return f"{proj}-{max(used, default=0) + 1:04d}"
 
 
@@ -327,7 +343,7 @@ def plan(reg, a):
     source = os.path.abspath(a.source) if a.source else None
     num = match_doc(reg, proj, a.title, source)
     d = reg["documents"].get(num) if num else None
-    return proj, num or next_doc(reg, proj), d, letter(len(d["revisions"]) if d else 0)
+    return proj, num or next_doc(reg, proj), d, letter(len(d["revisions"]) + len(d.get("retired_revs", ())) if d else 0)
 
 
 def cmd_file(a):
@@ -624,6 +640,122 @@ def cmd_library(a):
     return 0
 
 
+def retire_record(reg, key, entry, why):
+    """Keep what a fold or a retire takes out as retired/<key>.json, and mark a document number as never reused."""
+    os.makedirs(os.path.join(ROOT, "retired"), mode=0o700, exist_ok=True)
+    at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fd, tmp = tempfile.mkstemp(dir=os.path.join(ROOT, "retired"), prefix=".retired.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(dict(why, at=at, entry=entry), f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, os.path.join(ROOT, "retired", key + ".json"))
+    if NUM.match(key) and not NUM.match(key).group(3):
+        reg.setdefault("retired", {})[key] = dict(why, at=at)
+
+
+def prune_views(wids, rels):
+    """Take the filed copies at rels out of each view, before write_views links what the register now holds."""
+    for wid in wids:
+        for rel in rels:
+            f = os.path.join(ROOT, "ws", wid, rel)
+            if os.path.lexists(f):
+                os.unlink(f)
+
+
+def get_doc(reg, num):
+    m = NUM.match(num or "")
+    d = reg["documents"].get(num) if m and not m.group(3) else None
+    if not d:
+        raise Refused(f"no document {num!r}: give PPP-NNNN")
+    return d
+
+
+def cmd_fold(a):
+    with Lock():
+        reg = load()
+        keep = get_doc(reg, a.keep)
+        others = [get_doc(reg, n) for n in a.other]
+        docs = [keep] + others
+        if len({d["number"] for d in docs}) != len(docs):
+            raise Refused("a document is named twice")
+        if any(d["project"] != keep["project"] for d in others):
+            raise Refused(f"every document must be under {keep['number']}'s project {keep['project']}")
+        if any(d.get("retired_revs") for d in docs):
+            raise Refused("a document with a retired revision cannot be folded: its letter would be handed out again")
+        # brief: "ordered oldest first by revision date (ties go by the order given) ... its current revision must
+        # stay the newest, so the next build of its source still matches it"
+        last = current(keep)
+        rest = sorted(((r["date"], i, j, d, r) for i, d in enumerate(docs) for j, r in enumerate(d["revisions"])
+                       if r is not last), key=lambda x: x[:3])
+        late = [f"{d['number']}-{r['rev']}" for dt, _, _, d, r in rest if dt > last["date"]]
+        if late:
+            raise Refused(f"{', '.join(late)} is dated after {keep['number']}-{last['rev']}, which must stay the newest")
+        order = [(d, r) for *_, d, r in rest] + [(keep, last)]
+        slug = slugify(keep["title"])
+        moves, revs = [], []
+        for i, (d, r) in enumerate(order):
+            new = dict(r, rev=letter(i), file=os.path.join("files", keep["project"], f"{keep['number']}-{letter(i)}_{slug}.pdf"))
+            if (d is not keep or r["rev"] != new["rev"]) and new.pop("public_token", None):
+                print(f"{d['number']}-{r['rev']}\tits public link stops working", file=sys.stderr)
+            if d is not keep:
+                new["folded_from"] = f"{d['number']}-{r['rev']}"
+            moves.append((f"{d['number']}-{r['rev']}", r["file"], new["file"]))
+            revs.append(new)
+        old = {o for _, o, _ in moves}
+        missing = [o for o in old if not os.path.isfile(os.path.join(ROOT, o))]
+        clash = [n for *_, n in moves if n not in old and os.path.lexists(os.path.join(ROOT, n))]
+        if missing or clash:
+            raise Refused(f"{(missing + clash)[0]} is {'missing' if missing else 'in the way'}; nothing changed")
+        for d in others:
+            retire_record(reg, d["number"], d, {"folded_into": keep["number"]})
+        # every copy steps aside to a temporary name first, since a new name may be an old one still in place
+        for k, (_, o, n) in enumerate(moves):
+            os.rename(os.path.join(ROOT, o), os.path.join(ROOT, n + f".fold{k}"))
+        for k, (_, o, n) in enumerate(moves):
+            os.rename(os.path.join(ROOT, n + f".fold{k}"), os.path.join(ROOT, n))
+        keep["revisions"] = revs
+        wids = set().union(*(set(d.get("visibility", ())) for d in docs)) - {"owner"}
+        for d in others:
+            del reg["documents"][d["number"]]
+        save(reg)
+        prune_views(wids, old)
+        write_views(reg, wids)
+    for (was, _, n), r in zip(moves, revs):
+        print(f"{was}\t{keep['number']}-{r['rev']}\t{os.path.join(ROOT, n)}")
+    return 0
+
+
+def cmd_retire(a):
+    with Lock():
+        reg = load()
+        m = NUM.match(a.number or "")
+        if m and m.group(3):
+            d, r = get_rev(reg, a.number)
+            gone = d["revisions"] if len(d["revisions"]) == 1 else [r]
+        else:
+            d = get_doc(reg, a.number)
+            gone = d["revisions"]
+        whole = gone is d["revisions"]
+        key = d["number"] if whole else a.number
+        retire_record(reg, key, d if whole else r, {"retired": key})
+        for x in gone:
+            dst = os.path.join(ROOT, "retired", x["file"])
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(os.path.join(ROOT, x["file"]), dst)
+        if whole:
+            del reg["documents"][d["number"]]
+        else:
+            d["revisions"].remove(r)
+            d.setdefault("retired_revs", []).append(r["rev"])
+        save(reg)
+        wids = set(d.get("visibility", ())) - {"owner"}
+        prune_views(wids, [x["file"] for x in gone])
+        write_views(reg, wids)
+    for x in gone:
+        print(f"{d['number']}-{x['rev']}\tretired\t{os.path.join(ROOT, 'retired', x['file'])}")
+    return 0
+
+
 # ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
 def selfcheck():
     global ROOT, MEMBERS
@@ -853,6 +985,74 @@ def selfcheck():
         ok("a member project with no member is refused", rc == 2 and "Kid2" not in json.dumps(load()))
         rc, o = run("project", "Kid3", "--member", "nobody")
         ok("a member with no workspace id is refused", rc == 2 and "workspace id" in o and "Kid3" not in json.dumps(load()))
+        # fold: three documents, the keeper's revision newest, the others older and out of order
+        ROOT = os.path.join(t, "r4")
+        e1, e2, e3 = (mkpdf(src, f"e{i}", f"Epsilon version {w}") for i, w in ((1, "one"), (2, "two"), (3, "three")))
+        etex = os.path.join(src, "eps.tex")
+        run("file", e3, "--project", "Box", "--kind", "work", "--title", "Eps", "--source", etex, "--date", "2026-09-20")
+        run("file", e1, "--project", "Box", "--title", "Eps (v1)", "--date", "2026-09-10")
+        run("file", e2, "--project", "Box", "--title", "Eps (v2)", "--date", "2026-09-15")
+        tok = run("public", "001-0002-A", "on")[1].strip()
+        before = json.dumps(load(), sort_keys=True)
+        rc, o = run("fold", "001-0001", "001-0003", "001-0001")
+        rc2, o2 = run("fold", "001-0003", "001-0001")
+        ok("fold refuses a document named twice, and a keeper whose current revision is not the newest",
+           rc == 2 and rc2 == 2 and "must stay the newest" in o2 and json.dumps(load(), sort_keys=True) == before)
+        rc, o = run("fold", "001-0001", "001-0003", "001-0002")
+        reg = load()
+        d = reg["documents"]["001-0001"]
+        files = [os.path.join(ROOT, r["file"]) for r in d["revisions"]]
+        ok("fold makes three documents A, B, C of the keeper, oldest first, the keeper's own revision last",
+           rc == 0 and list(reg["documents"]) == ["001-0001"] and [r["rev"] for r in d["revisions"]] == ["A", "B", "C"]
+           and [r.get("folded_from") for r in d["revisions"]] == ["001-0002-A", "001-0003-A", None]
+           and d["title"] == "Eps" and d["source"] == etex)
+        ok("the filed copies are renamed to match, and each still holds its own version",
+           [os.path.basename(f) for f in files] == ["001-0001-A_eps.pdf", "001-0001-B_eps.pdf", "001-0001-C_eps.pdf"]
+           and ["one" in pdftext(files[0]), "two" in pdftext(files[1]), "three" in pdftext(files[2])] == [True] * 3
+           and sorted(os.listdir(os.path.join(ROOT, "files", "001"))) == ["001-0001-A_eps.pdf", "001-0001-B_eps.pdf",
+                                                                           "001-0001-C_eps.pdf"])
+        rc, o = run("file", e3, "--project", "Box", "--title", "Eps", "--source", etex)
+        ok("a rebuild of the keeper's source still matches its current revision and files nothing",
+           rc == 0 and "unchanged" in o and "001-0001-C" in o and len(load()["documents"]["001-0001"]["revisions"]) == 3)
+        ok("a folded revision's public link stops working, under its old number and its new one",
+           run("token", tok, "001-0002-A")[0] == 1 and run("token", tok, "001-0001-A")[0] == 1
+           and tok not in json.dumps(load()))
+        ok("the folded numbers are retired, their entries kept under retired/",
+           sorted(reg["retired"]) == ["001-0002", "001-0003"]
+           and json.load(open(os.path.join(ROOT, "retired", "001-0002.json")))["entry"]["title"] == "Eps (v1)")
+        rc, o = run("file", e1, "--project", "Box", "--title", "Zeta")
+        ok("the next document takes a number past the retired ones", rc == 0 and o.startswith("001-0004-A"))
+        # retire: a member's document with a public link, and one revision of another
+        ROOT = os.path.join(t, "r5")
+        run("file", e1, "--project", "Kid", "--member", "kid1", "--title", "Junk")
+        run("file", e1, "--project", "Kid", "--title", "Keep")
+        run("file", e2, "--project", "Kid", "--title", "Keep")
+        run("file", e3, "--project", "Kid", "--title", "Keep")
+        tok = run("public", "901-0001-A", "on")[1].strip()
+        junk = os.path.join(ROOT, load()["documents"]["901-0001"]["revisions"][0]["file"])
+        vjunk = os.path.join(ROOT, "ws", wid, os.path.relpath(junk, ROOT))
+        ok("before the retire, the member's view links the document", os.path.exists(vjunk))
+        rc, o = run("retire", "901-0001")
+        with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:
+            view = json.load(fh)
+        ok("retire takes the document out of the register and its member view, and its files move under retired/",
+           rc == 0 and "901-0001" not in load()["documents"] and not os.path.exists(junk) and not os.path.exists(vjunk)
+           and list(view["documents"]) == ["901-0002"]
+           and os.path.isfile(os.path.join(ROOT, "retired", os.path.relpath(junk, ROOT)))
+           and os.path.isfile(os.path.join(ROOT, "retired", "901-0001.json")))
+        ok("a retired document's public link stops working", run("token", tok, "901-0001-A")[0] == 1)
+        rc, o = run("file", e1, "--project", "Kid", "--title", "Junk")
+        ok("a retired number is never handed out again: the same title files as a new number",
+           rc == 0 and o.startswith("901-0003-A") and "901-0001" not in load()["documents"])
+        rc, o = run("retire", "901-0002-C")
+        rc2, o2 = run("file", e3, "--project", "Kid", "--title", "Keep")
+        d = load()["documents"]["901-0002"]
+        ok("retiring one revision keeps the document, and its letter is not filed again",
+           rc == 0 and rc2 == 0 and [r["rev"] for r in d["revisions"]] == ["A", "B", "D"] and d["retired_revs"] == ["C"])
+        rc, o = run("retire", "901-0001")
+        rc2, o2 = run("fold", "901-0002", "901-0003")
+        ok("retiring a retired number is refused, and so is folding a document with a retired revision",
+           rc == 2 and rc2 == 2 and "901-0003" in load()["documents"])
     print(f"cc-docs selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
 
@@ -898,13 +1098,19 @@ def main(argv):
     p.add_argument("number")
     p = sub.add_parser("library")
     p.add_argument("--viewer", required=True)
+    p = sub.add_parser("fold")
+    p.add_argument("keep")
+    p.add_argument("other", nargs="+")
+    p = sub.add_parser("retire")
+    p.add_argument("number")
     sub.add_parser("selfcheck")
     a = ap.parse_args(argv)
     if a.cmd == "selfcheck":
         return selfcheck()
     try:
         return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list,
-                "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library}[a.cmd](a)
+                "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library,
+                "fold": cmd_fold, "retire": cmd_retire}[a.cmd](a)
     except Refused as e:
         print(f"cc-docs: {e}", file=sys.stderr)
         return 2
