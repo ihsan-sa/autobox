@@ -1026,9 +1026,25 @@ github(){   # $1 handle [$2 token file] — a member workspace is GRANTED a GitH
   mkdir -p "$m" && ln -sfn "$f" "$m/github-token" \
     || { echo "cc-sandbox: could not write $m/github-token — nothing was changed" >&2; return 2; }
   echo "cc-sandbox: ~/dev/$r holds $f from its next launch (~/.cc/members/$r/github-token) — git push, gh and the API answer with it, on the repositories that token is scoped to. Reopen any session that is running. rm the link to take it back."; }
+race_swap(){   # $1 a launch's pid · $2 the source it pins NEXT after the swapped name's last pin · $3 the swap → swapped | late | missed
+  # THE SWAP CASES ARE ORDERED BY WHAT THE LAUNCH HAS DONE, NOT BY SLEEPS. A fixed 0.4 s head start guessed how fast the
+  # box was, and at load ~50 the launch had not pinned yet when the racer moved the name, so it refused and every landing
+  # went red on the box, not the code (2026-09-24). Here the racer waits until the launch holds a descriptor on $2 (its
+  # own /proc fd table), swaps, and then reads the launch's exe: still this shell and not bwrap means the swap landed
+  # after the pin and BEFORE the mount — `swapped`. A swap after exec is `late` and one never tried is `missed`, and the
+  # cases want `swapped`, so a racer that missed the window reds the case instead of letting it pass without a race.
+  # $2 is the pin AFTER the last one under the swapped name, never that one itself: pin opens and then checks the
+  # descriptor's name, and a swap between the two is a refused launch (seen once in 8 runs under load), not the mount.
+  local pid=$1 p=$2 i=0 f hit=
+  while [ -z "$hit" ] && [ $i -lt 1200 ] && kill -0 "$pid" 2>/dev/null; do
+    for f in /proc/"$pid"/fd/*; do [ "$(readlink "$f" 2>/dev/null)" = "$p" ] && { hit=1; break; }; done
+    [ -n "$hit" ] || { i=$((i+1)); sleep 0.05; }; done
+  [ -n "$hit" ] || { echo missed; return 0; }
+  "$3"
+  case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in ''|*bwrap*) echo late;; *) echo swapped;; esac; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
-  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i pl tmp tree mailrec wid
+  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i pl tmp tree mailrec wid sw lp of
   cb=$(dirname "$SELF")   # the host side of every board case below: THIS tree's cc-board, which resolves a linked board before it renames
   dev="$H/dev/$h"; mkdir -p "$dev/.cc" "$H/dev/$o" "$H/.cc/state/$o" "$H/.cc/state/$h" || return 1
   : > "$dev/.cc/member-workspace"; : > "$dev/.cc/member-facing"; echo x > "$H/dev/$o/secret"; echo '{}' > "$H/.cc/boards/$o.json"
@@ -1185,12 +1201,15 @@ PY
   #    2, a track session launched while 1 holds it, must find that lock TAKEN — the same host directory, so its own refresh
   #    would wait for 1's — and once it is released must read the token 1 wrote, so it never posts the stale one. A lock in
   #    a per-session tmpfs said 'free' here. And afterwards the lock is free again and the file whole for the next launch.
+  #    Session 1 holds the lock until session 2 has probed it (~/.claude/.lock-probed), not for a fixed 2 s: at load ~50 a
+  #    track launch took longer than that, found the lock released, and the case went red on the box, not the code. A lock
+  #    session 2 cannot see still reds it: its mkdir succeeds, whatever session 1 is doing.
   lockdir="$H/.cc/members/$h/claude/.oauth_refresh.lock"
-  "$SELF" member "$h" -- sh -c 'mkdir ~/.claude/.oauth_refresh.lock || exit 9; jq -c ".claudeAiOauth.accessToken = \"rotated-'"$$"'\" | .claudeAiOauth.refreshToken = \"rotated-r-'"$$"'\"" ~/.claude/.credentials.json > /tmp/c && cat /tmp/c > ~/.claude/.credentials.json; sleep 2; rmdir ~/.claude/.oauth_refresh.lock' >/dev/null 2>&1 &
+  "$SELF" member "$h" -- sh -c 'mkdir ~/.claude/.oauth_refresh.lock || exit 9; jq -c ".claudeAiOauth.accessToken = \"rotated-'"$$"'\" | .claudeAiOauth.refreshToken = \"rotated-r-'"$$"'\"" ~/.claude/.credentials.json > /tmp/c && cat /tmp/c > ~/.claude/.credentials.json; i=0; while [ ! -e ~/.claude/.lock-probed ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.1; done; rmdir ~/.claude/.oauth_refresh.lock' >/dev/null 2>&1 &
   s1=$!
   i=0; while [ $i -lt 50 ] && [ ! -d "$lockdir" ]; do i=$((i+1)); sleep 0.1; done
   t 'credential: the refresh lock a session takes is a directory on the host, in the handle'"'"'s own config dir' "$([ -d "$lockdir" ] && echo held || echo none)" held
-  out=$("$SELF" member "$h" t -- sh -c 'if mkdir ~/.claude/.oauth_refresh.lock 2>/dev/null; then echo lock=free; rmdir ~/.claude/.oauth_refresh.lock; else echo lock=taken; fi; i=0; while [ $i -lt 80 ] && [ -d ~/.claude/.oauth_refresh.lock ]; do i=$((i+1)); sleep 0.1; done; echo after=$(jq -r .claudeAiOauth.accessToken ~/.claude/.credentials.json)' 2>&1); wait "$s1"
+  out=$("$SELF" member "$h" t -- sh -c 'if mkdir ~/.claude/.oauth_refresh.lock 2>/dev/null; then echo lock=free; rmdir ~/.claude/.oauth_refresh.lock; else echo lock=taken; fi; : > ~/.claude/.lock-probed; i=0; while [ $i -lt 600 ] && [ -d ~/.claude/.oauth_refresh.lock ]; do i=$((i+1)); sleep 0.1; done; echo after=$(jq -r .claudeAiOauth.accessToken ~/.claude/.credentials.json)' 2>&1); wait "$s1"; rm -f "$H/.cc/members/$h/claude/.lock-probed"
   t 'credential: a track session launched while the workspace session holds the lock finds it TAKEN — its refresh waits, it does not race' "$(g lock)" taken
   t 'credential: …and once released it reads the token the first session rotated — it keeps working on that, never posting its own stale refresh' "$(g after)" "rotated-$$"
   out=$("$SELF" member "$h" t -- sh -c 'if mkdir ~/.claude/.oauth_refresh.lock 2>/dev/null; then echo lock=free; rmdir ~/.claude/.oauth_refresh.lock; else echo lock=taken; fi' 2>&1)
@@ -1260,12 +1279,17 @@ PY
   #     measured, this bwrap follows a symlink in a bind SOURCE but refuses to create a bind DEST through one, so a
   #     link swap only kills the launch, while a rename leaves the destination valid and the source pointing at the
   #     member's own file. Named, the session gets that file; pinned, it gets the gitlink the host opened.
-  ( sleep 0.4; mv "$H/.cc/worktrees/$h/t" "$H/.cc/worktrees/$h/t.real" 2>/dev/null \
-      && mkdir -p "$H/.cc/worktrees/$h/t" && printf 'gitdir: /tmp/decoy-git\n' > "$H/.cc/worktrees/$h/t/.git"
-    sleep 1.4; rm -rf "$H/.cc/worktrees/$h/t"; mv "$H/.cc/worktrees/$h/t.real" "$H/.cc/worktrees/$h/t" 2>/dev/null ) &
-  out=$(CC_SANDBOX_TEST_DELAY=1 "$SELF" member "$h" t -- sh -c 'echo RAN=yes; echo gitlink=$(cat ~/.cc/worktrees/'"$h"'/t/.git 2>/dev/null)' 2>&1); wait
+  #     Ordered by race_swap — after the gitlink's pin (the admin dir's commondir is the one after it), before bwrap's exec
+  #     — and the name restored once the launch is over.
+  swap_gitlink(){ mv "$H/.cc/worktrees/$h/t" "$H/.cc/worktrees/$h/t.real" 2>/dev/null \
+      && mkdir -p "$H/.cc/worktrees/$h/t" && printf 'gitdir: /tmp/decoy-git\n' > "$H/.cc/worktrees/$h/t/.git"; }
+  of="$H/.cc/swap-out.$$"
+  CC_SANDBOX_TEST_DELAY=3 "$SELF" member "$h" t -- sh -c 'echo RAN=yes; echo gitlink=$(cat ~/.cc/worktrees/'"$h"'/t/.git 2>/dev/null)' >"$of" 2>&1 & lp=$!
+  sw=$(race_swap "$lp" "$dev/.git/worktrees/t/commondir" swap_gitlink); wait "$lp"; out=$(cat "$of"); rm -f "$of"
+  [ -e "$H/.cc/worktrees/$h/t.real" ] && { rm -rf "$H/.cc/worktrees/$h/t"; mv "$H/.cc/worktrees/$h/t.real" "$H/.cc/worktrees/$h/t"; }
   t 'gitwall: a second session swapping a track name DURING the launch never reaches the mount — the descriptor was already the real gitlink' \
-    "$(g RAN)/$(grep -c decoy-git <<<"$out")" yes/0
+    "$(g RAN)/$(grep -c decoy-git <<<"$out")/$sw" yes/0/swapped
+  [ -n "$(g RAN)" ] || sed -n '1,4s/^/      /p' <<<"$out"   # a launch that never started says why here
   out=$("$SELF" member "$o" -- true 2>&1); t 'member: a repo without the marker is refused' "${out#*: ~/dev/}" "$o is not a member workspace (no .cc/member-workspace)"
   # ── --tree: A LANDING'S OWN CHECKOUT AND NOTHING ELSE (launch_member, build_member). Under a TMPDIR of the fixture's,
   #    so nothing is made in /tmp. A real directory elsewhere, a link at the right name (to elsewhere, and to another
@@ -1821,6 +1845,7 @@ selfcheck_vet(){   # THE BOX'S OWN BOUNDARY, driven for real: what is inside it,
   out=$(sh -c 'e(){ [ -e "$1" ] && echo present || echo absent; }; echo home=$(e '"$H"')' 2>&1)
   t 'control: the same test outside a boundary DOES find this box' "$(g home)" present; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
+  local sw lp of sname pw
   local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out out2 want rc c m0 t0 u0 hd held rsd rsd2 sec
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
@@ -2056,6 +2081,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   t 'a store that could not be folded is moved aside and kept, and the launch goes on with a freshly seeded one' \
     "$(grep -c STARTED <<<"$out2")/$(cat "$rsd".unfolded.*/refs/t 2>/dev/null)/$(cat "$rsd/refs/t" 2>/dev/null)" \
     "1/0000000000000000000000000000000000000001/$(git -C "$dev" rev-parse refs/heads/track/t)"
+  grep -q STARTED <<<"$out2" || sed -n '1,4s/^/      /p' <<<"$out2"   # a launch that never started says why here
   rm -rf "$rsd".unfolded.*
   # THE OBJECT STORE: WHAT IS CLOSED AND WHAT IS ACCEPTED, each read against the other rather than one of them claimed.
   # objects/ is rw because every commit a worker makes writes one, so a LOOSE object it can delete and this says so.
@@ -2145,12 +2171,19 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # which reach these names — renames the source aside and puts its own directory at that name inside the window
   # CC_SANDBOX_TEST_DELAY opens between the pins and the mount. A rename is the shape that decides it: a link only kills
   # the launch (above), while a rename leaves the destination valid and the source pointing at the racer's directory.
+  swap_decoy(){ mv "$sname" "$sname.real" 2>/dev/null && mkdir -p "$sname" && : > "$sname/decoy-swapped"; }
   for c in "the track worktree:$wt" "the parent .git/hooks:$dev/.git/hooks"; do
-    ( sleep 0.4; mv "${c#*:}" "${c#*:}.real" 2>/dev/null && mkdir -p "${c#*:}" && : > "${c#*:}/decoy-swapped"
-      sleep 1.4; rm -rf "${c#*:}"; mv "${c#*:}.real" "${c#*:}" 2>/dev/null ) &
-    out=$(CC_SANDBOX_TEST_DELAY=1 CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo RAN=yes; ls -A '"${c#*:}"' 2>/dev/null' 2>&1); wait
+    # Ordered by race_swap, not by sleeps; the delay only has to outlast one poll of the racer, and the name comes back
+    # after the launch is over, so nothing the session sees depends on how long the box took.
+    # The worktree's last pin is its own `.git`, then the admin dir's commondir; hooks is pinned in the .git/* loop, then
+    # objects/pack.
+    sname=${c#*:}; pw="$dev/.git/objects/pack"; [ "$sname" = "$wt" ] && pw="$dev/.git/worktrees/t/commondir"; of="$H/.cc/swap-out.$$"
+    CC_SANDBOX_TEST_DELAY=3 CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo RAN=yes; ls -A '"$sname"' 2>/dev/null' >"$of" 2>&1 & lp=$!
+    sw=$(race_swap "$lp" "$pw" swap_decoy); wait "$lp"; out=$(cat "$of"); rm -f "$of"
+    [ -e "$sname.real" ] && { rm -rf "$sname"; mv "$sname.real" "$sname"; }
     t "a process swapping ${c%%:*} DURING the launch never reaches the mount — the descriptor was already the real one" \
-      "$(g RAN)/$(grep -c decoy-swapped <<<"$out")" yes/0
+      "$(g RAN)/$(grep -c decoy-swapped <<<"$out")/$sw" yes/0/swapped
+    [ -n "$(g RAN)" ] || sed -n '1,4s/^/      /p' <<<"$out"   # a launch that never started says why here
   done
   # OFF: nothing changes — argv byte for byte, the environment untouched
   out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
