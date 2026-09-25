@@ -24,8 +24,9 @@ anything you would phrase as "it might be worth". A finding earns its line by ch
 ANSWER AS THE JSON OBJECT THE SCHEMA ASKS FOR, and nothing else:
 
 - `verdict` — exactly one of `LAND`, `LAND-AFTER-FIX`, `DO-NOT-LAND`.
-- `findings` — the numbered list, one object each: `where` is `<path>:<line>`, `what` is what is wrong in one
-  sentence, `fix` is what to do about it, named. Ten maximum; if there are more than ten the verdict is
+- `findings` — the numbered list, one object each: `kind` is `correctness`, `security` or `other` (what the
+  finding is about: a wrong result, a crash or a broken contract is correctness; anything else is `other`), `where`
+  is `<path>:<line>`, `what` is what is wrong in one sentence, `fix` is what to do about it, named. Ten maximum; if there are more than ten the verdict is
   `DO-NOT-LAND` and you list the ten that matter. `LAND` with nothing to say is an empty list.
 
 WHO CARRIES OUT A FIX. A `LAND-AFTER-FIX` sends one round to the track's own worker, in its own worktree, on this
@@ -43,6 +44,8 @@ What each verdict COSTS, so you pick it on purpose:
 - `LAND` — merge it. The landing carries on: gates, merge, deploy.
 - `LAND-AFTER-FIX` — right idea, and one or two named fixes stand between it and landing. THE LANDING STOPS, so
   every finding you list here must be one you would hold the merge for; name the fix, do not describe the smell.
+  A `LAND-AFTER-FIX` whose findings are ALL `other` does not stop it: the change lands and the findings go to a
+  follow-up row. So a finding you would hold the merge for is `correctness` or `security`.
 - `DO-NOT-LAND` — the change is wrong, unsafe, or not what was asked. THE LANDING STOPS.
 
 The verdict is the `verdict` FIELD and only that field. Quote whatever you need to inside a finding — a verdict

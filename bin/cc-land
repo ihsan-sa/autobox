@@ -87,7 +87,9 @@ WHAT IT WILL NOT DO:
   · Merge a diff nobody read, when the diff is worth a paid read (the control layer, a wide diff, tests, install,
     config, the reviewer's rules; the rest lands on its gates and the planning session's read). The review is one
     headless `claude -p` on the PR's head with no shell, answering LAND / LAND-AFTER-FIX / DO-NOT-LAND; the two stops
-    stop like a red gate and the findings are ONE PR comment. `--no-review` is the only way past and a 👍 never
+    stop like a red gate and the findings are ONE PR comment — except a LAND-AFTER-FIX whose every finding is of
+    kind `other` (not correctness, not security): that one lands, and its findings become board row
+    review-followup-pr<N> instead of a fix round, filed once and only after the merge. `--no-review` is the only way past and a 👍 never
     takes it. It fails CLOSED: a usage limit merges nothing unread — the job waits for the reset cc-limit names.
     ONE VERDICT PER CHANGE, whoever reached it: a comment this box wrote on the PR keyed to a digest of the diff
     against its merge-base (change_digest; a rebase does not move it, an edit does — and a verdict keyed before
@@ -111,6 +113,10 @@ WHAT IT WILL NOT DO:
     killed is not a buy. A fix anybody pushed after a LAND-AFTER-FIX counts as the round. A refusal reached at
     the wall is re-checked against the PR first.
   · Time a gate on the clock: it is timed on its SILENCE — a suite waiting on a lock says so every minute.
+  · Run a gate again on a tree it already went red on (red_run): the same tree is red at once, with the first red's
+    case, until GREEN_TTL — unless the box caused that red (silent past GATE_IDLE, a full disk or quota, no memory),
+    which files no record. A case on core/tests/quarantine or tests/quarantine does not red a gate (tests/green.sh
+    says where it may not) and is named on the ✓ line.
   · Refund a read that ran beside a red gate: it was paid for, and a refund would buy a read per red head.
 
 THE ONLY THING ON THIS BOX THAT MERGES. A 👍 writes `~/.cc/state/land/<repo>-<pr>.json` and starts `cc-land work`;
@@ -128,7 +134,9 @@ carries on. A failure that would leave the box WRONG (a red gate, a merge that d
 restart) stops everything; a failure in the BOOKKEEPING (card, board, ledger) is reported and the sequence carries
 ON. Re-running is the recovery and is safe: merged, carded, settled and enabled are each "nothing to do". A red gate
 is also written to the failures ledger the moment it is seen (record_red → `cc-green red`, keyed gate:<gate>:<tree>
-so the worker's cc-green and a fix round's see one record); the record never decides anything.
+so the worker's cc-green and a fix round's see one record); the record never decides anything. One thing reads the
+ledger back: a gate red kept for another try is NOT kept when every case it names is one a recurring-red investigator
+holds (recurring_held → `cc-failures recurring held`, cc-reconcile's THE DEEP FIX) — it stops, and its why names the claim.
 
 WHAT A STOP SAYS. A landing that does not merge is ONE line under STOP_CARD_MAX characters, everywhere it is said
 (the ask thread, #<repo>-updates, a member's lane): `[<repo>] PR #<n>: NOT merged ❌ — <why, in a few words>.
@@ -158,6 +166,8 @@ CATCHUP_EVERY = 900                       # how often the box polls origin for a
 # The gates, in the order a person runs them; a repo with none lands ungated and says so.
 GATES = ("core/tests/check.sh", "tests/check.sh", "tests/check-extra.sh", "core/tests/selftest.sh", "tests/selftest.sh")
 FAILED_RE = re.compile(r"(\d+) failed")   # a suite ending "0 failed" passed; "1 failed" did not, whatever it exited with
+# A red the BOX caused, not the tree: a gate killed on silence (124), a full disk or quota, no memory, no fork. Such a red files no red record (red_run), so the next sweep runs the same tree again.
+BOX_STATE_RE = re.compile(r"Disk quota exceeded|No space left on device|Cannot allocate memory|fork: retry|Resource temporarily unavailable")
 # The end-to-end gates, the only slow ones: they run on every code diff, handed the changed paths (CC_LAND_CHANGED), beside the paid review. --full-gates runs every gate; the tier removes gates, never invents one.
 SUITE = ("core/tests/selftest.sh", "tests/selftest.sh")
 # What earns every gate and a paid read: paths that gate everything by construction, a wide diff, and the repo's own control layer, declared one path or glob per line in this file:
@@ -204,14 +214,20 @@ REVIEW_TURNS = os.environ.get("CC_LAND_REVIEW_TURNS") or "40"    # …and turns 
 REVIEW_MODEL = os.environ.get("CC_LAND_REVIEW_MODEL") or "claude-opus-5-5"
 REVIEW_MARK = "cc-land-review"                # the HTML comment that makes re-posting the same review a no-op
 REVIEW_VERDICTS = ("LAND", "LAND-AFTER-FIX", "DO-NOT-LAND")
+# A LAND-AFTER-FIX all of whose findings are `other` lands (verdict_result) and files them as a follow-up row once merged (file_followup); correctness or security stops it.
+FINDING_KINDS = ("correctness", "security", "other")
+NIT_ROW_RE = re.compile(r"^\d+\. \[other\] ")   # a finding row as verdict_of renders an `other` one
+# …except on a protected path, which keeps every gate and so the whole review loop: the guard, the sandbox, this lander, the member tools, hooks, the quarantine lists.
+PROTECTED_RE = re.compile(r"(^|/)bin/(cc-guard|cc-sandbox|cc-land|cc-fence|cc-member-[\w-]+)$|(^|/)hooks/|(^|/)tests/quarantine$")
 # The verdict is a field the runner validates, never a sentence grepped for: a finding quotes verdicts.
 REVIEW_SCHEMA = json.dumps({
     "type": "object", "additionalProperties": False, "required": ["verdict", "findings"],
     "properties": {
         "verdict": {"type": "string", "enum": list(REVIEW_VERDICTS)},
         "findings": {"type": "array", "maxItems": 10, "items": {
-            "type": "object", "additionalProperties": False, "required": ["where", "what", "fix"],
-            "properties": {"where": {"type": "string"},      # file:line
+            "type": "object", "additionalProperties": False, "required": ["kind", "where", "what", "fix"],
+            "properties": {"kind": {"type": "string", "enum": list(FINDING_KINDS)},   # what a finding is ABOUT (nits_only)
+                           "where": {"type": "string"},      # file:line
                            "what": {"type": "string"},       # what is wrong, one sentence
                            "fix": {"type": "string"}}}}}})   # what to do about it, named
 # The fallback for a runner without --json-schema: the first match wins, and two different verdicts are none (verdict_of).
@@ -1272,6 +1288,31 @@ def green_run(content, gate, scope="", part="", ttl=GREEN_TTL):
     return False
 
 
+def red_path(content, gate):
+    return f"{green_dir()}/{os.path.basename(gate)}-red-{content[:12]}.json"
+
+
+def red_run(content, gate, scope=""):
+    """Has this gate already gone red on this exact content, at this scope? The same tree gives the same answer, and #617's was bought three times over; a new head or a moved base is a new tree and runs. Aged out with the green records (GREEN_TTL, sweep_records); deleting the file runs it again."""
+    j = read_json(red_path(content, gate)) if content else None
+    if (j and j.get("tree") == content and j.get("suite") == gate and (j.get("scope") or "") == scope
+            and time.time() - epoch_of(j.get("at", "")) <= GREEN_TTL):
+        return j
+    return None
+
+
+def note_red(content, gate, scope, rc, output):
+    """File the red record red_run reads — unless the box caused the red (BOX_STATE_RE, or 124: silent past GATE_IDLE), which says nothing about the tree. Returns whether it filed one; never raises."""
+    if not content or rc == 124 or BOX_STATE_RE.search(output or ""):
+        return False
+    try:
+        write_atomic(red_path(content, gate), {"tree": content, "suite": gate, "scope": scope, "at": stamp(),
+                                               "why": gate_fail(output)})
+        return True
+    except OSError:
+        return False
+
+
 def tree_id(root):
     """What a checkout HOLDS, as git names it: the key a green record is filed under."""
     rc, o = sh(["git", "rev-parse", "HEAD^{tree}"], cwd=root)
@@ -1502,6 +1543,15 @@ def record_red(scope, gate, content, log, text, pr="", writer="cc-land"):
     out("·", f"failures ledger ({scope}): {word}")
 
 
+def recurring_held(scope, why):
+    """'held: <claim> (<track>)' when every case this red names is one a recurring-red investigator holds (`cc-failures recurring held`, cc-reconcile's THE DEEP FIX), else ''. Never a verdict: no answer is ''."""
+    try:
+        rc, o = sh([f"{BIN}/cc-failures", "recurring", "held", "--scope", scope, "--text", why], timeout=60)
+        return last(o) if rc == 0 else ""
+    except Exception:                         # noqa: BLE001 — the ledger must never decide a gate
+        return ""
+
+
 def stale_note(root, base_ref, base, head, mine=()):
     """Why a red gate may be the calendar rather than a bug, as a sentence for the failure line, or '': how many commits the base has that this head does not, and which files those moved that this head does not itself change, naming the commit measured. '' whenever git cannot say."""
     rc, o = sh(["git", "rev-list", "--count", f"{head}..{base_ref}"], cwd=root)
@@ -1586,7 +1636,8 @@ def verdict_of(answer):
         rows = []
         for i, f in enumerate(j.get("findings") or [], 1):
             f = f if isinstance(f, dict) else {"what": str(f)}
-            rows.append(f"{i}. {f.get('where') or '(nowhere named)'} — {f.get('what') or ''}"
+            kind = f"[{f['kind']}] " if f.get("kind") in FINDING_KINDS else ""   # kept in the prose, so a verdict
+            rows.append(f"{i}. {kind}{f.get('where') or '(nowhere named)'} — {f.get('what') or ''}"   # read back off the PR still has it
                         + (f" → {f['fix']}" if f.get("fix") else ""))
         return j["verdict"], "\n".join(rows) or "No findings."
     said = (answer or "").strip()
@@ -1594,6 +1645,12 @@ def verdict_of(answer):
     if len(seen) != 1:
         return "", last(said) if said else "(nothing at all)"
     return seen.pop(), said
+
+
+def nits_only(said):
+    """Every finding of a verdict is `other` (not correctness, not security), as verdict_of renders them — and there is at least one."""
+    rows = [ln for ln in (said or "").splitlines() if re.match(r"^\d+\. ", ln)]
+    return bool(rows) and all(NIT_ROW_RE.match(ln) for ln in rows)
 
 
 def name_status(text):
@@ -1628,6 +1685,7 @@ class Land:
         self.want_review = review    # --no-review turns the gate off. Default ON everywhere, the 👍 path included
         self.re_review = re_review   # …and --re-review buys a SECOND opinion on a head one was already bought for
         self.full_gates = full_gates  # --full-gates: never scope the gates to the diff, run every one of them
+        self.followup = ""       # a LAND-AFTER-FIX's findings for the follow-up row merge() files (verdict_result)
         self.verdict = ""        # the review's answer as a FIELD, so the queue can act on LAND-AFTER-FIX without
         self.findings = ""       # re-reading its own error message — and what the reviewer said, for the fix brief
         self.by = ""             # which model actually read it, so the PR comment cannot claim a different one
@@ -1928,10 +1986,49 @@ class Land:
     def verdict_result(self, verdict, said, verb, cost, posted):
         """One place decides what a verdict means, so a verdict read back off the PR and one just bought stop the landing on the same terms."""
         self.verdict, self.findings = verdict, said
+        # The brief: "a LAND-AFTER-FIX whose findings aren't about correctness or security lands the PR and files a
+        # follow-up board row instead of buying a fix round." A row with no kind (free-text runner) counts as one
+        # that is about correctness.
+        # "Protected paths (cc-guard, cc-sandbox, cc-land, hooks, security) keep every gate": there it stops as before.
+        # The row is filed by merge(), once GitHub says the PR is in: this runs beside the gates and again on every
+        # verdict read back, and a row filed here would say "landed" of a PR a red gate then held (review of #646).
+        if verdict == "LAND-AFTER-FIX" and nits_only(said) and not self.protected_diff():
+            self.followup = said
+            return (f"{verb}: LAND-AFTER-FIX on PR #{self.pr} ({cost}{posted}) with no correctness or security "
+                    f"finding — landing, and its findings become board row {self.followup_row()} once it merges")
         if verdict != "LAND":
             raise Failed(f"{verdict} on PR #{self.pr} ({cost}{posted}) — the landing stops here, exactly "
                          f"like a red gate.\n{said}")
         return f"{verb}: LAND on PR #{self.pr} ({cost}{posted})"
+
+    def protected_diff(self):
+        """Does this diff touch a PROTECTED_RE path? A diff that cannot be read counts as one that does."""
+        try:
+            paths = [p for _, p in self.changed_files()]
+        except (Failed, Skip, OSError):
+            return True
+        return not paths or any(PROTECTED_RE.search(p) for p in paths)
+
+    def followup_row(self):
+        return f"review-followup-pr{self.pr}"
+
+    def file_followup(self):
+        """After the merge only: the findings of a LAND-AFTER-FIX that landed anyway (verdict_result), as a board row of their own. Once per PR — a row already on the board is not added again (cc-board add appends to a brief rather than refusing). Returns the note for merge()'s line; never raises: the PR is in whatever the board says."""
+        said, row = self.followup, self.followup_row()
+        if not said:
+            return ""
+        rc, o = sh([f"{BIN}/cc-board", "get", self.project, row, "status"])
+        if not rc and o.strip():
+            return f"; its review findings are already board row {row}"
+        brief = (f"GOAL: the review's non-blocking findings on PR #{self.pr} ({self.what()}) are answered on main. "
+                 f"WHY: the landing review said LAND-AFTER-FIX, but none of its findings is about correctness or "
+                 f"security, so the PR landed and these came here instead of a fix round.\nFINDINGS:\n{said}")
+        rc, o = sh([f"{BIN}/cc-board", "add", self.project, row, f"review follow-up for PR #{self.pr}", brief])
+        if rc:
+            out("!", f"PR #{self.pr} merged, but its follow-up row {row} could not be filed ({last(o)}) — its "
+                     f"findings are on the PR's review comment and in this landing's log:\n{said}")
+            return ""
+        return f"; its review findings are board row {row}"
 
     def mark_doomed(self, why, **rec):
         """Write down, against the change, that a landing at this head cannot succeed (head, change key, the cap that bound) and hand the Failed back tagged `doomed`, so review() re-reads the PR before it stands: `raise self.mark_doomed(Failed(...))`. Never raises itself."""
@@ -2131,11 +2228,22 @@ class Land:
             out("·", f"the {tier} tier: {', '.join(found)} — {why}")
             content, reused = tree_id(tree), []   # …and of those, the ones this exact content has already passed
             scope = self.gate_scope()             # what the diff changed, for a suite that runs only what that reaches
+            # NEVER RE-RUN AN UNCHANGED RED TREE: a gate that already went red on this content, at this scope, is red
+            # again at once — before a gate or a read is bought. The brief: "never re-run an unchanged red tree".
+            for g in found:
+                prior = red_run(content, g, scope)
+                if prior:
+                    raise Failed(f"gate {g} did not pass: {prior.get('why') or 'red'} — already red on this exact tree "
+                                 f"({content[:12]}) at {prior.get('at')}, so not run again; a new head or a moved "
+                                 f"base runs it{self.behind_base()}",
+                                 short=f"gate {os.path.basename(g)} did not pass: {prior.get('why') or 'red'} "
+                                       f"(the same tree as before, not run again)")
+            quarantined = []   # QUARANTINED lines a passing gate printed (core/tests/green.sh): reported on the ✓ line
 
             # All gates at once, and the read from t=0: a head a cheap gate rejects also buys a read, whose verdict goes on the PR for the retry.
             if any(not green_run(content, g, scope) for g in found):
                 self.read_alongside()
-            errs = self.run_gates(tree, found, scope, content, reused)
+            errs = self.run_gates(tree, found, scope, content, reused, quarantined)
             if errs:
                 if self._review is not None:
                     try:
@@ -2150,13 +2258,14 @@ class Land:
             on = f"PR #{self.pr} on {self.gated_on()}" if self.head else f"the {self.base()} checkout"
             again = f" — {len(reused)} of them already green on {content[:12]}, not run again" if reused else ""
             beside = " — the review ran beside the gates" if self._review is not None else ""
+            held = (f" — quarantined, reported and not red: {' · '.join(quarantined[:3])}" if quarantined else "")
             return (f"{len(found)} gate(s) passed on {on} at the {tier} tier ({why}): "
-                    f"{', '.join(found)}{again}{beside}")
+                    f"{', '.join(found)}{again}{beside}{held}")
         finally:
             if tmp:
                 self.drop_checkout(tmp, tree)
 
-    def run_gates(self, tree, found, scope, content, reused):
+    def run_gates(self, tree, found, scope, content, reused, quarantined=None):
         """Run `found` on `tree` at once, each on its own thread and timed on silence (run_gate), a green record on this content spent instead of a run (appended to `reused`), and the first red stopping the rest within a second. Returns {gate: the Failed} — empty when every gate passed. gates() runs it on a PR's merge; suite_on (after_batch) on the base itself."""
         def run(g):
             if green_run(content, g, scope):
@@ -2190,12 +2299,17 @@ class Land:
                 keep_log(keep)                   # the one log that outlives the run — bounded, at this path
                 record_red(self.project, g, content, keep, o, pr=self.pr)   # …and the ledger line that outlives THAT
                 full = disk_full(o)
+                if not note_red(content, g, scope, rc, o):   # …and the record red_run spends, unless the box caused it
+                    out("·", f"{g}: red on the box's state (silent past {GATE_IDLE}s, a full disk, no memory), "
+                             f"not the tree's — no red record, so the next sweep runs it again")
                 raise Failed(f"gate {g} did not pass: {gate_fail(o)}{full}{self.behind_base()}"
                              f"  [full output: {keep}]",
                              # the card gets the gate and the case that FAILED and nothing else: the stale-base
                              # reading and the log's path are the landing record's, and are kept above. In
                              # cc-replay's words (`gate \S+ did not pass`), which is how it keys a red gate.
                              short=f"gate {os.path.basename(g)} did not pass: {gate_fail(o)}{full}")
+            if quarantined is not None:   # QUARANTINED lines a passing gate printed, for the caller's ✓ line
+                quarantined.extend(ln.strip() for ln in o.splitlines() if "QUARANTINED —" in ln)
 
         errs, stop = {}, threading.Event()
 
@@ -2387,7 +2501,7 @@ class Land:
         """The one place on this box that merges, after the gates: a squash pinned to the head the gates ran on (--match-head-commit), or, under a protected path, to the head the owner 👍'd; --subject the PR title, -R so gh deletes only the remote branch."""
         if self.facts.get("state") == "MERGED":
             root_done(self.repo, self.pr)      # in is in: the tally goes with the change it was bounding
-            return f"PR #{self.pr} was already merged — nothing to do"
+            return f"PR #{self.pr} was already merged — nothing to do" + self.file_followup()
         slug, title = self.slug(), self.facts.get("title") or ""
         # Pinned to the SHA the gates ran on and the review read: a push between them makes GitHub refuse the merge, and the re-run gates what is there.
         # …and under a PROTECTED path, to the head the OWNER's 👍 was about (approved_head, carried on the job).
@@ -2408,12 +2522,12 @@ class Land:
             if not self.merged_now():
                 raise Failed(f"gh pr merge #{self.pr}: {last(o)}")
             root_done(self.repo, self.pr)
-            return f"PR #{self.pr} merged (a second merge overlapped this one; GitHub says it is in)"
+            return f"PR #{self.pr} merged (a second merge overlapped this one; GitHub says it is in)" + self.file_followup()
         if not rc or self.merged_now():
             root_done(self.repo, self.pr)      # …and the change this tally was bounding is now on the default branch
         # …while a PR gh calls "closed" that GitHub does not call MERGED is not in: its tally stays a bound, for the
         # reopen (the `merged` stamp would retire it for good, and every attempt after would re-buy the same read).
-        return f"PR #{self.pr} merged (squash, remote branch deleted)"
+        return f"PR #{self.pr} merged (squash, remote branch deleted)" + self.file_followup()
 
     # -- 4. the #approvals card: it stops reading as pending -----------------------------------------------
     def card(self):
@@ -3615,6 +3729,10 @@ def run_job(path, job):
             return line
     decided = L.stopped == "gates" and " conflicts with " in L.why    # no flake: nothing but a rebase changes it.
     # (A conflict GitHub knew of is held above; this is the one merge_result finds itself, which is fresh.)
+    # "the box stops paying for another retry … of the PRs it blocks": a red that is only a case an investigator holds is not re-run.
+    held = recurring_held(L.project, L.why) if rc == 1 and L.stopped == "gates" and not decided else ""
+    if held:
+        L.why, decided = f"{L.why} — not retried, {held}"[:600], True
     retry = rc == 1 and (L.stopped in RETRY or L.stopped == "load") and not decided
     if retry and job["attempts"] < LAND_TRIES:
         # Kept, so the next sweep re-drives it; the not_before goes with the try, or a spent reset would be read as the schedule; the stage is the step that stopped.

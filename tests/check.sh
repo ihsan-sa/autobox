@@ -434,7 +434,12 @@ for c in $ran; do
   # Its line is printed and stays visible — that is not a pass. Any other tool exiting 77, and cc-fence exiting
   # 77 for any other reason (it refuses to report a skip when the kernel HAS Landlock and declined), fails here.
   if [ "$rc" = 77 ] && [ "$c" = cc-fence ]; then echo "$o"
-  elif [ "$rc" != 0 ]; then rerun_alone "$ROOT/bin/$c" "$o" || exit 1; o=$RERUN_OUT; fi   # the tally judged below is the green run's
+  elif [ "$rc" != 0 ]; then   # the tally judged below is the green run's
+    ra=0; rerun_alone "$ROOT/bin/$c" "$o" > "$SCD/$c.ra" || ra=$?
+    # RED TWICE ON ONLY QUARANTINED CASES is reported, not red (green.sh, QUARANTINE) — and rerun_alone's report,
+    # which quotes both runs' tallies verbatim, is not printed then, because a landing reads "1 failed" as red.
+    if [ "$ra" != 0 ] && q=$(quarantined "$c" "$RERUN_OUT"); then echo "  $q"; continue; fi
+    cat "$SCD/$c.ra"; [ "$ra" = 0 ] || exit 1; o=$RERUN_OUT; fi
   tally_ok "$c" "$o" || { g=$(tally_line "$c" "$o")
     echo "$c: its cases passed, but its tally line is a shape selftest.sh's chk() cannot read, so the suite will"
     echo "  call this tool dead when it is green. Fix the tool's last line — chk() is right, see its comment."

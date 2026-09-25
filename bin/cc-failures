@@ -10,6 +10,8 @@ usage: cc-failures record --scope S --kind CONTRACT/SYMPTOM --observed TEXT [--e
        cc-failures show [--scope S] [--as-of UTC] [--all] [ID]   (--json: the records, corrections folded in)
        cc-failures eligible [--scope S] [--as-of UTC]
        cc-failures claim [--scope S] [--as-of UTC] [--dry]      (one eligible cluster, claimed once; the launch's call)
+       cc-failures recurring [claim [--dry] | held --scope S --text TEXT] [--scope S] [--as-of UTC]
+                                                        (gate cases red on landing after landing: RECURRING)
        cc-failures packet ID                                   (the investigation's packet, markdown; ID a claim or a cluster)
        cc-failures metrics [FIXTURE] [--scope S]        (the shipped one: tests/failures-fixture.jsonl)
        cc-failures replay [EVENTS] [--catalogue JSON] [--candidate EXE] [--candidate-catalogue JSON] [--json]
@@ -67,6 +69,18 @@ counted from the moment the rule fired, so a cluster nobody may investigate stay
 prints what the investigation reads: the count, span, writers, detectors and costs, the first, the crossing and the
 newest record, at most six excerpts of distinct evidence, and the scope's other clusters.
 
+RECURRING (cc-reconcile's THE DEEP FIX). A `gate-verdict/red` record is one fingerprint for every gate, so the CASE
+is read out of it: each ✗/✘/FAIL/not ok line of its excerpt's red section (both writers keep one; the observed text
+when there is none), with paths, shas and numbers taken out, keyed by scope and gate. A LANDING is the record's PR,
+else its tree, so one PR re-run counts once. `recurring` lists the cases in the last CC_RECURRING_RED_WINDOW_H hours
+(72) with their landings; `recurring claim` takes the first case red on CC_RECURRING_RED_MIN landings (3) that no
+claim holds, writes one line to ~/.cc/failures/recurring/claims.jsonl and prints it as JSON (exit 1 and why on stderr
+when there is none). A claim holds its case for CC_RECURRING_RED_COOL_H hours (24), and past that while its worker's
+journal (<CC_STATE>/<scope>/<track>/progress.md) has no STATUS line and moved inside two cool-downs; a held-then-freed
+case is claimed again only when it has gone red on the threshold again since its claim. Two claims a rolling day,
+whatever the cases. `recurring held` exits 0 and names the claim when every case a landing's red text names is held.
+The three thresholds are cc-config keys (the environment wins). Nothing here launches: cc-reconcile does.
+
 PERSON-FIRST: `--detector person` writes the record AND a `failure-detection/person-first` record beside it,
 critical, linked by `links.episode` — a person catching a failure the box did not record is critical every time,
 and the gap is a failure of its own that stays out of the failure count.
@@ -97,7 +111,7 @@ cluster must stay quiet (one episode written three times, two episodes, three ac
 never confirmed, a refuted critical); a control cluster holds control events only, and a run in which one fires
 — or a control that shares a cluster with a real event — exits 1, so a candidate that fires on a control is not
 scored green. No model call, no board, no claim: `replay` writes nothing outside its temporary directory."""
-import sys, os, re, json, fcntl, hashlib, datetime, subprocess, statistics, tempfile, shutil, collections
+import sys, os, re, json, fcntl, hashlib, datetime, subprocess, statistics, tempfile, shutil, collections, time
 
 B = os.path.dirname(os.path.realpath(__file__))
 DIR = os.environ.get("CC_FAILURES") or os.path.expanduser("~/.cc/failures")
@@ -660,6 +674,130 @@ def replay(path, cat_path=None, candidate=None, cand_cat=None, as_json=False):
 def fired_controls(run): return [c for c in run["clusters"].values() if c["control"] and c["fired"]]
 
 # ---------------------------------------------------------------- selfcheck: hermetic, its own HOME, ledger and board
+# ---------------------------------------------------------------- recurring gate reds (RECURRING, docstring)
+RED_KIND = "gate-verdict/red"                       # what cc-land's record_red and cc-green's red_seen both write
+CASE_MARK = re.compile(r"[✗✘]|(?:^|\s)FAIL\b|^\s*not ok\b")   # a failing CASE, not a tally or a traceback
+KNOBS = {"CC_RECURRING_RED_MIN": 3, "CC_RECURRING_RED_WINDOW_H": 72, "CC_RECURRING_RED_COOL_H": 24}
+RECUR_DAY_CAP = 2                                   # claims a rolling day, whatever the cases: a burst of flakes buys two
+_knobs = {}
+def knob(key):
+    """A threshold through cc-config (the environment wins there); a value that is not a whole number >= 1 is the default."""
+    if key in _knobs: return _knobs[key]
+    _knobs[key] = KNOBS[key]
+    try:
+        p = subprocess.run([os.path.join(B, "cc-config"), "get", key, str(KNOBS[key])], capture_output=True, text=True, timeout=20)
+        v = int(p.stdout.strip())
+        if v >= 1: _knobs[key] = v
+    except (OSError, ValueError, subprocess.SubprocessError): pass
+    return _knobs[key]
+def recur_path(): return os.path.join(DIR, "recurring", "claims.jsonl")   # a subdir: scopes() lists DIR/*.jsonl only
+
+def case_text(line):
+    """One red line → the case it names, with what changes run to run (paths, shas, numbers) taken out."""
+    s = re.sub(r"^\s*\d+:", "", line)                                   # the excerpt's `grep -n` prefix
+    s = re.sub(r"^.*?(?:[✗✘]|\bFAIL\b|\bnot ok\b)\s*", "", s.strip(), count=1)
+    s = re.sub(r"(?:~|\.{1,2})?(?:/[\w.@+-]+){2,}/?", "<path>", s)
+    s = re.sub(r"\b[0-9a-f]{7,40}\b", "<sha>", s)
+    s = re.sub(r"\d+(?:\.\d+)?", "N", s)
+    return re.sub(r"\s+", " ", s).strip(" :—-")[:100]
+
+def red_lines(r):
+    """The red lines one gate-verdict/red record carries: its excerpt's red section (both writers keep one), else
+    the ✗ pieces of its observed text (cc-land joins gate_fail's hits with ' · ')."""
+    for ev in r.get("evidence") or []:
+        if isinstance(ev, str) and ev.startswith("excerpt:") and os.path.isfile(ev[8:]):
+            try: txt = open(ev[8:], encoding="utf-8", errors="replace").read(65536)
+            except OSError: break
+            body = txt.split("\n\n", 1)[-1].split("\n--- tail ---", 1)[0]
+            return body.splitlines()
+    return re.split(r" · |; first red line: |: (?=[✗✘])", r.get("observed") or "")
+
+def cases_of_text(lines):
+    out = []
+    for ln in lines:
+        t = case_text(ln) if CASE_MARK.search(ln) else ""
+        if len(t) >= 8 and t not in out: out.append(t)
+    return out[:5]                                      # a suite that fell over names dozens; the first few are the case
+
+def recurring(scope=None, as_of=None):
+    """Every red case in the window: {id, scope, gate, text, landings: {key: ts}, records, excerpts, first, last}.
+    A landing is a PR (links.pr), else the tree the red was on — the same PR re-run counts once."""
+    as_of = as_of or now_dt(); win = knob("CC_RECURRING_RED_WINDOW_H") * 3600
+    by = {}
+    for r in load(scope):
+        t = parse_ts(r.get("ts"))
+        if r.get("kind") != RED_KIND or r.get("status") == "refuted" or not t: continue
+        if not 0 <= (as_of - t).total_seconds() < win: continue
+        L = r.get("links") or {}
+        gate = L.get("gate") or "?"
+        land = f"PR #{L['pr']}" if L.get("pr") else f"tree {(L.get('tree') or L.get('source') or r['id'])[:12]}"
+        for text in cases_of_text(red_lines(r)):
+            cid = "g-" + hashlib.sha1(f"{r['scope']}|{gate}|{text}".encode()).hexdigest()[:8]
+            c = by.setdefault(cid, {"id": cid, "scope": r["scope"], "gate": gate, "text": text, "landings": {},
+                                    "records": [], "excerpts": [], "first": r["ts"], "last": r["ts"]})
+            c["landings"][land] = max(c["landings"].get(land, ""), r["ts"]); c["records"].append(r["id"])
+            c["first"], c["last"] = min(c["first"], r["ts"]), max(c["last"], r["ts"])
+            c["excerpts"] += [e[8:] for e in r.get("evidence") or [] if isinstance(e, str) and e.startswith("excerpt:")][:1]
+    return sorted(by.values(), key=lambda c: (-len(c["landings"]), c["first"]))
+
+def recur_claims():
+    p = recur_path()
+    if not os.path.isfile(p): return []
+    out = []
+    for line in open(p):
+        try: out.append(json.loads(line))
+        except ValueError: pass
+    return out
+
+def recur_live(k, as_of):
+    """A claim still holding its case: inside the cool-down, or its investigator's journal has no STATUS line yet and
+    moved inside two cool-downs (a worker that died without one stops holding then)."""
+    t = parse_ts(k.get("ts")); cool = knob("CC_RECURRING_RED_COOL_H") * 3600
+    if t and (as_of - t).total_seconds() < cool: return "cool-down"
+    pj = os.path.join(STATE, k.get("scope", ""), k.get("track", ""), "progress.md")
+    try:
+        if time.time() - os.path.getmtime(pj) < 2 * cool and not re.search(r"^STATUS: (DONE|BLOCKED)", open(pj).read(), re.M):
+            return "running"
+    except OSError: pass
+    return ""
+
+def recur_claim(scope=None, as_of=None, dry=False):
+    """(claim, None) for the first case over the threshold nobody holds, written once; (None, why) otherwise."""
+    as_of = as_of or now_dt(); need = knob("CC_RECURRING_RED_MIN"); ks = recur_claims()
+    day = [k for k in ks if parse_ts(k.get("ts")) and 0 <= (as_of - parse_ts(k["ts"])).total_seconds() < DAY]
+    over = [c for c in recurring(scope, as_of) if len(c["landings"]) >= need]
+    if not over: return None, f"no red case on {need} or more landings"
+    if len(day) >= RECUR_DAY_CAP: return None, f"{len(day)} claims in the last day already (the cap)"
+    whys = []
+    for c in over:
+        mine = sorted((k for k in ks if k.get("case") == c["id"]), key=lambda k: k["ts"])
+        if mine:
+            if recur_live(mine[-1], as_of):
+                whys.append(f"{c['id']} held by {mine[-1]['id']} ({recur_live(mine[-1], as_of)})"); continue
+            since = [l for l, ts in c["landings"].items() if ts > mine[-1]["ts"]]
+            if len(since) < need:
+                whys.append(f"{c['id']} red on {len(since)} landing(s) since {mine[-1]['id']}"); continue
+        k = {"id": "d-" + hashlib.sha1(f"{c['id']}|{utc(as_of)}".encode()).hexdigest()[:8], "ts": utc(as_of),
+             "case": c["id"], "scope": c["scope"], "gate": c["gate"], "text": c["text"],
+             "landings": sorted(c["landings"]), "excerpts": sorted(set(c["excerpts"]))[:4],
+             "track": f"recurring-red-{c['id'][2:]}"}
+        if not dry:
+            os.makedirs(os.path.dirname(recur_path()), exist_ok=True)
+            with open(recur_path(), "a") as f:
+                fcntl.flock(f, fcntl.LOCK_EX); f.write(json.dumps(k, ensure_ascii=False) + "\n")
+        return k, None
+    return None, "; ".join(whys)
+
+def recur_held(scope, text, as_of=None):
+    """The claim line when EVERY case the red text names is one an investigator holds, else ''."""
+    as_of = as_of or now_dt(); cs = cases_of_text(re.split(r" · |: (?=[✗✘])|\n", text))
+    ks = [k for k in recur_claims() if k.get("scope") == scope and k.get("text") and recur_live(k, as_of)]
+    # A prefix either way: cc-land cuts its why at 400 characters, and appends the stale-base note and the log's path to the last case.
+    same = lambda t, k: t.startswith(k["text"]) or k["text"].startswith(t)
+    hit = [next((k for k in ks if same(t, k)), None) for t in cs]
+    if not cs or not all(hit): return ""
+    return "held: " + ", ".join(sorted({f"{k['id']} ({k['track']})" for k in hit}))
+
 def selfcheck():
     n = f = 0
     def ok(what, cond):
@@ -984,6 +1122,51 @@ def selfcheck():
             fh.write('{"label": "ctl", "control": "must not fire", "ts": "2026-09-02T10:00Z", "scope": "s", "kind": "a/b", "text": "a control in the same cluster", "detector": "box"}\n')
         rc, out, err = C("replay", mixed)
         ok("a control that shares a cluster with a real event is a fixture error: said, and rc 1", rc == 1 and "ERROR control 'must not fire' shares cluster" in out)
+        # ---- recurring gate reds: a case, counted by landing, claimed once, held through its cool-down
+        env["CC_CONFIG"] = os.path.join(T, "config")          # the thresholds' defaults, whatever the box's own file says
+        def red(pr, line, ts, scope="rr", gate="core/tests/selftest.sh", excerpt=None):
+            return C("record", "--scope", scope, "--kind", RED_KIND, "--ts", ts, "--writer", "cc-land",
+                     "--observed", f"gate {gate} did not pass at the landing of {scope} PR #{pr} on abcdef012345: {line}",
+                     "--link", f"gate={gate}", "--link", f"pr={pr}", *(["--evidence", f"excerpt:{excerpt}"] if excerpt else []))
+        at = lambda h: utc(now_dt() - datetime.timedelta(hours=h))
+        rcl = lambda *a: C("recurring", "claim", "--scope", "rr", *a)
+        claimed = lambda: [json.loads(l) for l in open(os.path.join(T, "failures", "recurring", "claims.jsonl"))] if os.path.isfile(os.path.join(T, "failures", "recurring", "claims.jsonl")) else []
+        for h in (5, 4, 3):
+            red(101, "✗ relative reset parsed to +72s · /tmp/x.123/log", at(h))    # one PR, re-run three times
+        rc, out, err = rcl()
+        ok("RECURRING: a case red once, however often that one PR re-runs, is one landing — nothing is claimed", rc == 1 and claimed() == [] and "no red case on 3" in err)
+        ok("…and `recurring` lists it with its one landing", "\t1 landing(s)\tunclaimed\trelative reset parsed to +Ns" in C("recurring", "--scope", "rr")[1])
+        ex = os.path.join(T, "excerpt.log")
+        with open(ex, "w") as fh: fh.write("source=gate:x\nlog=/tmp/y (9 bytes)\n\n14:  ✗ relative reset parsed to +91s\n\n--- tail ---\n  ✗ a tail line is not a case\n")
+        red(102, "✗ relative reset parsed to +80s", at(2)); red(103, "(no ✗ in this observed text)", at(1), excerpt=ex)
+        rc, out, err = rcl()
+        k = json.loads(out) if rc == 0 else {}
+        ok("…red on three PRs (one of them read from its excerpt, numbers aside): ONE claim, naming the case, its landings and the worker's track",
+           rc == 0 and len(claimed()) == 1 and k.get("text") == "relative reset parsed to +Ns" and k.get("landings") == ["PR #101", "PR #102", "PR #103"]
+           and k.get("track", "").startswith("recurring-red-") and k.get("excerpts") == [ex])
+        ok("…the excerpt's tail is not read as a case", "a tail line" not in C("recurring", "--scope", "rr")[1])
+        red(104, "✗ relative reset parsed to +5s", at(0))
+        rc, out, err = rcl()
+        ok("…and the next ask inside the cool-down claims nothing, even with the case red again: held by its claim", rc == 1 and len(claimed()) == 1 and "held by d-" in err)
+        rc, out, err = C("recurring", "held", "--scope", "rr", "--text", "gate core/tests/selftest.sh did not pass: ✗ relative reset parsed to +12s  [full output: /tmp/a/b.log]")
+        ok("HELD: a landing's red that is only the held case is held, and says by which claim", rc == 0 and out.startswith("held: d-") and "recurring-red-" in out)
+        rc, out, err = C("recurring", "held", "--scope", "rr", "--text", "gate g did not pass: ✗ relative reset parsed to +1s · ✗ a case of its own")
+        ok("…while a red that also names a case of its own is not", rc == 1 and out == "")
+        ok("…nor the same case in another scope", C("recurring", "held", "--scope", "other", "--text", "✗ relative reset parsed to +1s")[0] == 1)
+        later = utc(now_dt() + datetime.timedelta(hours=25))
+        rc, out, err = rcl("--as-of", later)
+        ok("PAST THE COOL-DOWN, a case not red on the threshold again since its claim is not claimed again", rc == 1 and len(claimed()) == 1 and "since d-" in err)
+        ok("…and the landing no longer holds for it", C("recurring", "held", "--scope", "rr", "--text", "✗ relative reset parsed to +1s", "--as-of", later)[0] == 1)
+        rc, out, err = rcl("--dry")
+        ok("--dry claims nothing", rc == 1 and len(claimed()) == 1)
+        env["CC_RECURRING_RED_MIN"] = "2"
+        red(201, "✗ another case entirely", at(2)); red(202, "✗ another case entirely", at(1))
+        rc, out, err = rcl()
+        ok("THE THRESHOLD is a cc-config key (the environment wins): at 2, a case red on two PRs is claimed", rc == 0 and json.loads(out)["text"] == "another case entirely" and len(claimed()) == 2)
+        red(301, "✗ a third case", at(2)); red(302, "✗ a third case", at(1))
+        rc, out, err = rcl()
+        ok("…and two claims a rolling day is the cap, whatever the cases", rc == 1 and len(claimed()) == 2 and "the cap" in err)
+        del env["CC_RECURRING_RED_MIN"]
         rc, out, err = C("kinds")
         ok("kinds prints the catalogue's kinds and the critical reasons", rc == 0 and out.count("/") >= 6 and "person-first" in out and K in out)
         rc, out, err = C("sideways")
@@ -1015,7 +1198,7 @@ def opts(a, flags, lists=()):
         else: pos.append(x); i += 1
     return out, pos
 
-USAGE = "usage: cc-failures record|show|eligible|claim|packet|metrics|replay|import|kinds|selfcheck ...  (the docstring has the flags)"
+USAGE = "usage: cc-failures record|show|eligible|claim|recurring|packet|metrics|replay|import|kinds|selfcheck ...  (the docstring has the flags)"
 def as_of(o):
     if not o.get("as-of"): return None
     t = parse_ts(o["as-of"])
@@ -1097,6 +1280,25 @@ def main(a):
         print(f"catalogue v{cat.get('version')}: {os.path.normpath(CATALOGUE)}")
         for k, v in cat["kinds"].items(): print(f"  {k}\n      contract: {v.get('contract','')}\n      symptom:  {v.get('symptom','')}")
         print("critical reasons: " + ", ".join(f"{k} ({v})" for k, v in cat["critical"].items()))
+    elif cmd == "recurring":
+        o, pos = opts(a, ("scope", "as-of", "text"))
+        sub = pos[0] if pos else "show"
+        if sub == "claim":
+            k, why = recur_claim(o.get("scope"), as_of(o), dry=bool(o.get("dry")))
+            if not k: print(f"cc-failures: nothing to claim: {why}", file=sys.stderr); sys.exit(1)
+            print(json.dumps(k, ensure_ascii=False))
+        elif sub == "held":
+            if not o.get("scope") or "text" not in o: die("recurring held needs --scope S --text TEXT")
+            h = recur_held(o["scope"], o["text"], as_of(o))
+            if not h: sys.exit(1)
+            print(h)
+        elif sub == "show":
+            need, ks = knob("CC_RECURRING_RED_MIN"), recur_claims()
+            for c in recurring(o.get("scope"), as_of(o)):
+                k = max((k for k in ks if k.get("case") == c["id"]), key=lambda k: k["ts"], default=None)
+                print(f"{c['id']}\t{c['scope']}\t{c['gate']}\t{len(c['landings'])} landing(s){' ≥ ' + str(need) if len(c['landings']) >= need else ''}"
+                      f"\t{k['id'] + ' ' + k['ts'] if k else 'unclaimed'}\t{c['text']}")
+        else: die("recurring [show] | claim [--dry] | held --scope S --text TEXT")
     elif cmd == "selfcheck":
         sys.exit(selfcheck())
     else: die(USAGE)

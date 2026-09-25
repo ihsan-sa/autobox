@@ -500,11 +500,11 @@ def selfcheck():
           "conflicts with origin/main" in conflict and clash[:12] in conflict)
     shutil.rmtree(mrepo, ignore_errors=True)
 
-    def REVIEWED(verdict, where="", what="", fix="", cost=0.42):
+    def REVIEWED(verdict, where="", what="", fix="", cost=0.42, kind=""):
         """What `claude -p --output-format json --json-schema …` hands back — the fake model, standing in for the
         whole call. `structured_output` is the schema-validated object; `result` is its text twin, and the two are
         deliberately the same thing said twice, because that is what the runner really returns."""
-        found = [{"where": where, "what": what, "fix": fix}] if where else []
+        found = [dict({"where": where, "what": what, "fix": fix}, **({"kind": kind} if kind else {}))] if where else []
         obj = {"verdict": verdict, "findings": found}
         return json.dumps({"result": json.dumps(obj), "structured_output": obj, "total_cost_usd": cost,
                            "usage": {"input_tokens": 40000, "output_tokens": 900, "cache_read_input_tokens": 12000}})
@@ -556,6 +556,8 @@ def selfcheck():
         shutil.rmtree(root_dir(), ignore_errors=True)   # a change's review/repair tally OUTLIVES its job file, which
                                                         # is the point of it — so a case that wants a spent one builds
                                                         # it, and no case inherits the one before it left behind
+        for p in glob.glob(f"{green_dir()}/*-red-*.json"):   # …and the same for a red record (red_run): a case that
+            os.unlink(p)                                      # re-gates one tree after a red builds the record itself
         PROCS[0], MINE[0] = [], set()
         LINKED[0] = ["cc-new.service", "cc-slackd.service", NEVER]
         BODY[0] = {"cc-new.service": "[Service]\nExecStart=%h/bin/cc-new\n[Install]\nWantedBy=default.target\n",
@@ -718,10 +720,16 @@ def selfcheck():
     GATED = lambda head=HEAD, base=None: mtree(["git", "merge-tree", "--write-tree", base or AT[0], head])[1].strip()
     MERGE = lambda head=HEAD, base=None: mcommit(["git", "commit-tree", GATED(head, base)])[1].strip()
 
-    def reviewed(verdict, *finding, **kw):
+    def reviewed(verdict, *finding, kind="", board=None, changed="", board_get=None, **kw):
         L = fresh(pr=7, **kw)
         world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
-        world[f"{CLAUDE} -p"] = (0, REVIEWED(verdict, *finding))
+        world[f"{CLAUDE} -p"] = (0, REVIEWED(verdict, *finding, kind=kind))
+        if board:
+            world[f"{BIN}/cc-board add"] = board
+        if board_get:
+            world[f"{BIN}/cc-board get"] = board_get
+        if changed:
+            world["git diff --name-status"] = (0, changed)
         world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
         world[f"{BIN}/cc-scope list"] = (0, "[]")
         with contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()) as e:
@@ -737,6 +745,67 @@ def selfcheck():
     rc, said = reviewed("LAND-AFTER-FIX", "a.py:9", "the call has no timeout", "name the timeout")
     check("LAND-AFTER-FIX stops too, with the fix named — 'nearly' is not a verdict this box merges on",
           rc == 1 and "LAND-AFTER-FIX" in said and "name the timeout" in said and not ran("gh pr merge"))
+    # (5) of the brief: "a LAND-AFTER-FIX whose findings aren't about correctness or security lands the PR and files
+    # a follow-up board row instead of buying a fix round." Each case its own review; both sides asserted.
+    filed = lambda: [c for c in calls if c[:2] == [f"{BIN}/cc-board", "add"]]
+    rc, said = reviewed("LAND-AFTER-FIX", "a.py:9", "the name reads oddly", "rename it", kind="other",
+                        changed="M\tinstall.sh\n")
+    check("a LAND-AFTER-FIX whose only finding is `other` LANDS, and the finding becomes board row "
+          "review-followup-pr7 carrying it — no fix round bought",
+          rc == 0 and ran("gh pr merge") and len(filed()) == 1 and filed()[0][3] == "review-followup-pr7"
+          and "rename it" in filed()[0][-1] and "[other] a.py:9" in filed()[0][-1]
+          and "board row review-followup-pr7" in said)
+    rc, said = reviewed("LAND-AFTER-FIX", "a.py:9", "the call has no timeout", "name the timeout", kind="correctness")
+    check("...but one whose finding is about correctness stops as before, and files no row",
+          rc == 1 and not ran("gh pr merge") and not filed() and "stops here" in said)
+    rc, said = reviewed("LAND-AFTER-FIX", "a.py:9", "the name reads oddly", "rename it", kind="other",
+                        board=(1, "cc-board add: no board for myrepo"), changed="M\tinstall.sh\n")
+    check("...and one the board would not take has still merged (the row is filed after it), and says so with the "
+          "findings on its own line — they are never dropped",
+          rc == 0 and ran("gh pr merge") and "could not be filed" in said and "rename it" in said)
+    # Review of #646: the row is filed only once GitHub says the PR is in, and once per PR. An `other`-only
+    # LAND-AFTER-FIX that meets a red gate, then a merge GitHub refuses, then a green retry, then a re-run after that.
+    adds = 0
+    L = fresh(pr=7)
+    world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+    world[f"{CLAUDE} -p"] = (0, REVIEWED("LAND-AFTER-FIX", "a.py:9", "the name reads oddly", "rename it", kind="other"))
+    world["git diff --name-status"] = (0, "M\tinstall.sh\n")
+    L.gates = lambda: (_ for _ in ()).throw(Failed("gate tests/check.sh did not pass: 1 failed"))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        rc1 = L.run()
+    adds += len(filed())
+    red_gate = rc1 == 1 and not filed()
+    L = fresh(pr=7)
+    world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+    world[f"{CLAUDE} -p"] = (0, REVIEWED("LAND-AFTER-FIX", "a.py:9", "the name reads oddly", "rename it", kind="other"))
+    world["git diff --name-status"] = (0, "M\tinstall.sh\n")
+    world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+    world[f"{BIN}/cc-scope list"] = (0, "[]")
+    world["gh pr merge"] = (1, "GraphQL: Head branch was modified")
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        rc3 = L.run()
+    refused = rc3 == 1 and ran("gh pr merge") and not filed()
+    check("an `other`-only LAND-AFTER-FIX files no row while the PR is not in: not beside a red gate, not after a "
+          "merge GitHub refused", red_gate and refused)
+    adds += len(filed())
+    rc4, _ = reviewed("LAND-AFTER-FIX", "a.py:9", "the name reads oddly", "rename it", kind="other",
+                      changed="M\tinstall.sh\n")
+    adds += len(filed())
+    rc5, said = reviewed("LAND-AFTER-FIX", "a.py:9", "the name reads oddly", "rename it", kind="other",
+                         changed="M\tinstall.sh\n",
+                         board_get=(0, "queued\n"))
+    adds += len(filed())
+    check("...and the green retry files it exactly once; a later run with the row already on the board adds nothing "
+          "(cc-board add appends rather than refusing)",
+          rc4 == 0 and rc5 == 0 and adds == 1 and "already board row review-followup-pr7" in said)
+    rc, said = reviewed("LAND-AFTER-FIX", "core/bin/cc-guard:9", "the name reads oddly", "rename it", kind="other",
+                        changed="M\tinstall.sh\nM\tcore/bin/cc-guard\n")    # install.sh: the `full` tier, so a model reads it
+    check("...and on a protected path (cc-guard here) even an `other`-only LAND-AFTER-FIX stops as before — those "
+          "keep every gate", rc == 1 and not ran("gh pr merge") and not filed())
+    check("nits_only: every rendered row `other` is a nit list; a correctness or security row among them, a row with "
+          "no kind (a free-text runner) or no rows at all is not",
+          nits_only("1. [other] a:1 — x → y\n2. [other] b:2 — z") and not nits_only("1. [other] a:1 — x\n2. [security] b:2 — z")
+          and not nits_only("1. a:1 — x → y") and not nits_only("No findings."))
 
     # A reviewer QUOTES verdicts — reviewing this file quotes all three — and free text cannot tell the quote from
     # the answer. The verdict is a schema field, so a finding that says LAND inside a DO-NOT-LAND is just words.
@@ -782,10 +851,10 @@ def selfcheck():
           and argv[argv.index("--setting-sources") + 1] == ""
           and "--strict-mcp-config" in argv and argv[argv.index("--allowedTools") + 1] == REVIEW_ALLOW)
     check("...and the verdict is asked for as a SCHEMA field the runner validates, not as a sentence to grep for: "
-          "the enum is the three verdicts, and each finding names where, what and the fix",
+          "the enum is the three verdicts, and each finding names its kind, where, what and the fix",
           json.loads(argv[argv.index("--json-schema") + 1])["properties"]["verdict"]["enum"] == list(REVIEW_VERDICTS)
           and set(json.loads(argv[argv.index("--json-schema") + 1])["properties"]["findings"]["items"]
-                  ["properties"]) == {"where", "what", "fix"})
+                  ["properties"]) == {"kind", "where", "what", "fix"})
     check("the reviewer runs in the throwaway directory and NOT in the checkout — cwd is where a session reads "
           "its CLAUDE.md from, so a PR that adds one would be loaded as the reviewer's own instructions",
           next(w for c, w in zip(calls, cwds) if c[0] == CLAUDE) == add)
@@ -2048,6 +2117,62 @@ def selfcheck():
               and fate.get("suite") == "stopped" and took < 8 and "stopped, not run to the end" in said.getvalue())
     finally:
         os.access, globals()["run_gate"] = real_access, real_gate
+
+    # A RED TREE IS NOT RUN TWICE, A BOX-STATE RED IS NOT A TREE'S, AND A QUARANTINED CASE IS SAID ON THE ✓ LINE.
+    # #617's same red tree was re-run up to three times. Each case below builds its own red-record state.
+    gate_ran, answer = [], {}
+
+    def counted_gate(argv, cwd, log, env, stop=None):
+        gate_ran.append(argv[0])
+        return answer["rc"], answer["out"]
+    real_access, real_gate = os.access, run_gate
+    try:
+        os.access = lambda p, m: p.endswith("core/tests/check.sh")
+        globals()["run_gate"] = counted_gate
+
+        def gated(tree):   # tree "" = from no red record; a tree = keep the red records the last run filed
+            kept = {p: read_json(p) for p in glob.glob(f"{green_dir()}/*-red-*.json")} if tree else {}
+            L = fresh(pr=7, full_gates=True)   # fresh() clears red records, so a kept one is put back
+            for p, j in kept.items():
+                write_atomic(p, j)
+            world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git merge-base": (0, A + "\n"),
+                          "git diff --name-status": (0, "M\tcore/bin/cc-x\n"), "git diff --numstat": (0, "3\t2\tx\n"),
+                          "git rev-parse HEAD^{tree}": (0, (tree or TREE) + "\n")})
+            del gate_ran[:]
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                g = caught(L.gates)
+                if L._review is not None:
+                    caught(L.review_aside)
+            return g, list(gate_ran)
+        answer.update(rc=1, out="  ✗ a real bug\n1 failed\n")
+        g1, r1 = gated("")                    # "" = start from no red record
+        g2, r2 = gated(TREE)                  # the same tree again, record kept
+        check("a gate red on a tree is not run again on the same tree: the second landing is red at once, names the "
+              "first red and says why it did not run",
+              isinstance(g1, Failed) and len(r1) == 1 and isinstance(g2, Failed) and r2 == []
+              and "not run again" in str(g2) and "a real bug" in str(g2)
+              and re.search(r"gate \S+ did not pass", g2.short or ""))
+        g3, r3 = gated("f" * 40)              # a moved base or a new head: another tree
+        check("...but another tree (a new head, a moved base) runs the gate", len(r3) == 1)
+        answer.update(rc=1, out="write error: Disk quota exceeded\n1 failed\n")
+        gated("")
+        g4, r4 = gated(TREE)
+        answer.update(rc=124, out="silent\n")
+        gated("")
+        g5, r5 = gated(TREE)
+        check("a red the box caused — a full quota, a gate killed on silence — files no red record, so the same tree "
+              "runs again", len(r4) == 1 and len(r5) == 1 and not glob.glob(f"{green_dir()}/*-red-*.json"))
+        answer.update(rc=0, out="  ⚠ cc-x: QUARANTINED — red only on known load-sensitive cases: red the race\n0 failed\n")
+        g6, r6 = gated("")
+        answer.update(rc=0, out="0 failed\n")
+        g7, _ = gated("")
+        check("a gate that passed with a quarantined case says so on its ✓ line; one that passed clean says nothing of it",
+              isinstance(g6, str) and "quarantined, reported and not red" in g6 and "red the race" in g6
+              and isinstance(g7, str) and "quarantined" not in g7)
+    finally:
+        os.access, globals()["run_gate"] = real_access, real_gate
+        for p in glob.glob(f"{green_dir()}/*-red-*.json"):
+            os.unlink(p)
 
     # 4d. THE READ RUNS BESIDE THE SUITE (owner, 2026-09-04): serial they were the whole of a landing's wall clock.
     # The proof is a rendezvous: the fake suite and the fake reviewer each answer only once the other is in
@@ -4481,8 +4606,10 @@ def selfcheck():
                 0, json.dumps({"comments": [{"body": c[c.index("--body") + 1], "viewerDidAuthor": True}
                                             for c in commented()]}))
             world[GATE] = (0, "  ✓ the first\n  ✓ H4\n0 failed\n")            # the flake passes this time
+            # …on ANOTHER tree: the base moved between sweeps. The same tree would be red at once, unrun (red_run).
+            world["git rev-parse HEAD^{tree}"] = (0, "e" * 40 + "\n")
             quiet(cmd_work, [])
-            check("...and the next sweep re-drives the same job: gated green, merged, one ✅ — no second 👍, no "
+            check("...and the next sweep, on a base that moved, re-drives the same job: gated green, merged, one ✅ — no second 👍, no "
                   "reaction from the bot, and NO second read: the one the red gate paid for is read back off the "
                   "PR, so a flaking gate cannot spend a change's review budget a try at a time",
                   len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7))

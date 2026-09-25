@@ -9,10 +9,12 @@
   cc-reconcile sweep [<repo>…|--configured] [--dry]   remove what is finished and forgotten; report what is uncertain
   cc-reconcile digest [--notify]     the whole report: shipped, moving, waiting on you, stopped, cost; --notify posts the phone one
   cc-reconcile investigate [--dry]   the tick's failure investigation, once, by hand; --dry names the cluster it would claim
+  cc-reconcile deep-fix [--dry]      the tick's recurring-red investigator, once, by hand; --dry names the case it would claim
   cc-reconcile selfcheck             the decision table and one end-to-end run of each part, no network
     flags: --json · -q · --no-net (never ask GitHub) · --grace SEC (600) · --repeat SEC (86400) · --no-stop
 
-No model is called here. The one thing launched is `cc-audit failure <claim>` (THE INVESTIGATION, below).
+No model is called here. Two things are launched: `cc-audit failure <claim>` (THE INVESTIGATION, below) and one
+worker per recurring gate red (THE DEEP FIX, below).
 
 ALIVE: a `claude` whose cwd is the track's worktree, a `cc-loop <repo> <track>`, a live pane in the track's tmux
 window, or an `agent` mark (cc-board) naming a window that holds an interactive session for this repo, made less
@@ -92,6 +94,18 @@ nothing: the cluster stays eligible and unclaimed with its age, and the run prin
 reads the report, opens a row or posts: cc-audit delivers. `investigate --dry` claims and launches nothing and names
 the cluster the pass would take and what holds it. CC_RECONCILE_LAUNCH=CMD (tests) runs `CMD failure <claim>` in
 place of the unit and skips the box-wide running scan unless CC_RECONCILE_PROC names a fixture /proc.
+
+THE DEEP FIX rides the same tick. A gate case that goes red on landing after landing is not bought again by every PR
+it blocks: once `cc-failures recurring` counts it red on CC_RECURRING_RED_MIN landings (3) inside
+CC_RECURRING_RED_WINDOW_H hours (72), and ~/.cc/config has CC_RECURRING_RED_FIX=on (absent, inert) and `cc-tier allows
+explore` says yes (no answer holds, as above), the pass takes ONE case with `cc-failures recurring claim` and launches
+ONE worker on it: `cc <scope> recurring-red-<case> --go <brief> --model claude-opus-5-5 --effort max`. The worker
+finds the cause and lands its fix through the lane like any PR, or files a raised- row when the cause is outside the
+repo. The claim holds the case for CC_RECURRING_RED_COOL_H hours (24) and while its worker's journal has no STATUS
+line; after that the case is taken again only when it has gone red on the threshold again since the claim, and two
+claims a rolling day is the cap. While a claim holds, the landing does not re-run the gates of a PR whose red is only
+that case (`cc-failures recurring held`). The thresholds are cc-config keys. CC_RECONCILE_DEEP_LAUNCH=CMD (tests)
+runs CMD in place of `cc`.
 
 A NAG THE STATE DISPROVES IS A FAILURE, WRITTEN HERE (the design's writers table: "cc-reconcile (a nag the
 authoritative state disproved)"). Every nag the --notify pass sends — the session's "review and land it", the owner's
@@ -1986,6 +2000,79 @@ def investigate(dry=False):
     return f"  investigation  {claim} {scope}/{kind} ({cluster}) — cc-audit failure launched: {how}"
 
 
+# ── the deep fix ────────────────────────────────────────────────────────────────────────────────────────
+DEEP_KEY = "CC_RECURRING_RED_FIX"   # the switch: `cc-config set CC_RECURRING_RED_FIX on`
+DEEP_MODEL, DEEP_EFFORT, DEEP_LOOP, DEEP_BUDGET = "claude-opus-5-5", "max", "3", "25"   # the brief: "claude-opus-5-5 at --effort max"
+
+
+def deep_brief(k):
+    """The worker's brief for one claim: goal, why, boundaries, done. The evidence is the claim's own."""
+    return (f"GOAL: the gate case below has gone red on {len(k['landings'])} landings of other work, and every PR it "
+            f"blocked paid for its own gate runs against it. Find the root cause and open a fix PR against main. If the "
+            f"cause is outside this repo (the host, a service, an account), file it with `cc board add {k['scope']} "
+            f"raised-<short-name> ...` saying what you found, and stop.\n"
+            f"CASE: {k['text']}\nGATE: {k['gate']}\nRED ON: {', '.join(k['landings'][:15])}\n"
+            f"EXCERPTS: {' '.join(k['excerpts']) or '(none kept)'}\n"
+            f"WHY: one deep read instead of the same red bought again by each landing (claim {k['id']}, case {k['case']}).\n"
+            f"BOUNDARIES: fix the cause, not the case's assertion; land through the lane (`cc done`), never merge by "
+            f"hand; leave the blocked PRs alone.\nDONE: the case passes on main, or a raised- row names the outside cause.")
+
+
+def deep_fix(dry=False):
+    """Claim one recurring gate red and launch its one worker (docstring: THE DEEP FIX). Returns the line to print, or
+    None when there is nothing to say. --dry claims and launches nothing. Never raises."""
+    holds, on = [], setting(DEEP_KEY).lower() == "on"
+    t = sh(sib("cc-tier"), "allows", "explore", timeout=10) if on else None
+    if not on:
+        holds.append(f"{DEEP_KEY} is not on")
+    elif not t or t.returncode != 0:
+        holds.append("the tier holds explore work")
+    if not on and not dry:
+        return None                                     # inert: not even the ledger is read
+    try:
+        if dry or holds:
+            c = sh(sib("cc-failures"), "recurring", "claim", "--dry", timeout=60)
+            if not c or c.returncode != 0:
+                why = (c.stderr.strip() if c else "") or "cc-failures did not answer"
+                return f"  deep fix   would claim nothing: {why}" if dry else None
+            k = json.loads(c.stdout)
+            if dry:
+                return (f"  deep fix   would claim {k['case']} in {k['scope']} ({len(k['landings'])} landings)"
+                        + (f" — but {'; '.join(holds)}" if holds else
+                           f" and launch {k['track']} on {DEEP_MODEL} at --effort {DEEP_EFFORT}"))
+            return (f"  held       deep fix: the tier holds explore work; case {k['case']} waits, unclaimed"
+                    if holds[0].startswith("the tier") else None)
+        c = sh(sib("cc-failures"), "recurring", "claim", timeout=60)
+        if not c or c.returncode != 0:
+            return None                                 # nothing over the threshold, or all held: cc-failures says why
+        k = json.loads(c.stdout)
+    except ValueError:
+        return None
+    r = sh(os.environ.get("CC_RECONCILE_DEEP_LAUNCH") or sib("cc"), k["scope"], k["track"], "--go", deep_brief(k),
+           "--model", DEEP_MODEL, "--effort", DEEP_EFFORT, "--loop", DEEP_LOOP, "--budget", DEEP_BUDGET, timeout=180)
+    if r and r.returncode == 0:
+        how = "launched"
+    else:
+        said = ((r.stdout + r.stderr).strip().splitlines() or ["no output"])[-1][:200] if r else "no answer"
+        how = f"launch failed: {said}"
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(f"{STATE}/reconcile.log", "a") as log:
+            log.write(f"{stamp()}\tdeep-fix\t{k['id']} {k['case']} {k['scope']}/{k['track']}\t{how}\n")
+    except OSError:
+        pass
+    return f"  deep fix   {k['id']} {k['scope']}/{k['track']} ({len(k['landings'])} landings) — {how}"
+
+
+def deep_fix_cmd(argv):
+    if argv not in ([], ["--dry"]):
+        print("usage: cc-reconcile deep-fix [--dry]", file=sys.stderr)
+        return 2
+    line = deep_fix(dry=bool(argv))
+    print(line.strip() if line else "deep fix: nothing to launch")
+    return 0
+
+
 def investigate_cmd(argv):
     if argv not in ([], ["--dry"]):
         print("usage: cc-reconcile investigate [--dry]", file=sys.stderr)
@@ -2005,6 +2092,9 @@ def tick(snap, net):
     inv = investigate()
     if inv:
         print(inv)
+    deep = deep_fix()
+    if deep:
+        print(deep)
     sw = f"{STATE}/sweep.stamp"
     try:
         due = now() - os.path.getmtime(sw) > 86400
@@ -2047,6 +2137,8 @@ def main(argv):
         return digest_cmd(argv[1:])
     if argv[:1] == ["investigate"]:
         return investigate_cmd(argv[1:])
+    if argv[:1] == ["deep-fix"]:
+        return deep_fix_cmd(argv[1:])
     snap_only = argv[:1] == ["snapshot"]
     if snap_only:
         argv = argv[1:] + ["--no-net"]
@@ -3961,8 +4053,9 @@ def selfcheck():
     # ── the failure investigation: inert without the setting, held by the tier or a running one, one claim, one launch ──
     ti = tempfile.mkdtemp(prefix="cc-reconcile-inv-")
     _ie = {k: os.environ.get(k) for k in ("HOME", "CC_CONFIG", "CC_FAILURES", "CC_RECONCILE_LAUNCH", "CC_RECONCILE_PROC",
+                                          "CC_RECONCILE_DEEP_LAUNCH",
                                           "CC_SPEND_TIER", "CC_RECONCILE_STUBS")}
-    _is, _inv = STATE, investigate
+    _is, _inv, _deep = STATE, investigate, deep_fix
     try:
         os.environ.pop("CC_RECONCILE_STUBS", None)
         os.environ.update(HOME=ti, CC_CONFIG=f"{ti}/.cc/config", CC_FAILURES=f"{ti}/.cc/failures",
@@ -4014,12 +4107,53 @@ def selfcheck():
         rec("gate-target/wrong-revision", 1, "--critical", "main-gate-or-deploy-red")   # a critical cluster: the other slot
         investigate()
         ok("…while a critical cluster is the next pass's one launch", len(launched()) == 2 and launched()[1].startswith("failure i-"))
+        # ── the deep fix: a case red once launches nothing; red on three landings, one claim and ONE max-effort launch ──
+        os.environ["CC_RECONCILE_DEEP_LAUNCH"] = f"{ti}/deep"
+        open(f"{ti}/deep", "w").write(f'#!/bin/sh\nprintf "%s " "$1" "$2" "$3" "$5" "$6" "$7" "$8" "$9" "${{10}}" "${{11}}" "${{12}}" >> {ti}/deep.log\n'
+                                      f'echo >> {ti}/deep.log\nprintf "%s" "$4" > {ti}/deep.brief\n')
+        os.chmod(f"{ti}/deep", 0o755)
+
+        def deeps():
+            return open(f"{ti}/deep.log").read().splitlines() if os.path.exists(f"{ti}/deep.log") else []
+
+        def red(pr, hours_ago):
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() - hours_ago * 3600))
+            sh(f"{BIN}/cc-failures", "record", "--scope", "dp", "--kind", "gate-verdict/red", "--ts", ts, "--link", f"pr={pr}",
+               "--link", "gate=core/tests/selftest.sh", "--observed", "gate core/tests/selftest.sh did not pass: ✗ cc-guard case 7 is red")
+        sh(f"{BIN}/cc-config", "set", DEEP_KEY, "on")
+        red(1, 3)
+        ok("DEEP FIX: the switch on, the tier autonomous, a case red on ONE landing: nothing claimed, nothing launched",
+           deep_fix() is None and deeps() == [] and not os.path.exists(f"{ti}/.cc/failures/recurring/claims.jsonl"))
+        red(2, 2); red(3, 1)
+        sh(f"{BIN}/cc-config", "set", DEEP_KEY, "off")
+        ok("…red on three, but CC_RECURRING_RED_FIX off: inert, and --dry names the case and what holds it",
+           deep_fix() is None and deeps() == [] and "is not on" in (deep_fix(dry=True) or ""))
+        sh(f"{BIN}/cc-config", "set", DEEP_KEY, "on")
+        os.environ["CC_SPEND_TIER"] = "moderate"
+        ok("…on, but the tier holds explore work: no claim, no launch, the line says the tier holds it",
+           "tier holds" in (deep_fix() or "") and deeps() == [] and not os.path.exists(f"{ti}/.cc/failures/recurring/claims.jsonl"))
+        os.environ["CC_SPEND_TIER"] = "autonomous"
+        line = deep_fix()
+        ok("…allowed: ONE claim and ONE worker, `cc dp recurring-red-<case> --go` on claude-opus-5-5 at --effort max",
+           len(deeps()) == 1 and re.fullmatch(r"dp recurring-red-[0-9a-f]{8} --go --model claude-opus-5-5 --effort max --loop 3 --budget 25 ",
+                                              deeps()[0]) is not None
+           and len(open(f"{ti}/.cc/failures/recurring/claims.jsonl").read().splitlines()) == 1
+           and "launched" in (line or "") and "\tdeep-fix\td-" in open(f"{ti}/.cc/state/reconcile.log").read())
+        ok("…its brief names the case, the landings and the way out for a cause outside the repo",
+           all(w in open(f"{ti}/deep.brief").read() for w in ("CASE: cc-guard case N is red", "PR #1, PR #2, PR #3", "raised-", "never merge by hand")))
+        red(4, 0)
+        ok("…and inside the cool-down the next pass launches nothing, the case red again or not",
+           deep_fix() is None and len(deeps()) == 1)
+        os.environ.pop("CC_RECONCILE_DEEP_LAUNCH")
+        sh(f"{BIN}/cc-config", "set", DEEP_KEY, "off")
         scratch(ti, NOOP)
         globals()["investigate"] = lambda dry=False: "  investigation  from-the-tick"
+        globals()["deep_fix"] = lambda dry=False: "  deep fix   from-the-tick"
         ok("THE TICK carries it: the investigation's line is printed by tick(), no timer of its own",
-           "from-the-tick" in quietly(tick, {}, False))
+           "investigation  from-the-tick" in quietly(tick, {}, False))
+        ok("…and so does the deep fix's", "deep fix   from-the-tick" in quietly(tick, {}, False))
     finally:
-        restore(); globals().update(STATE=_is, investigate=_inv)
+        restore(); globals().update(STATE=_is, investigate=_inv, deep_fix=_deep)
         for k, v in _ie.items():
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
         shutil.rmtree(ti, ignore_errors=True)

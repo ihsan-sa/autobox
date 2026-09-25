@@ -250,3 +250,44 @@ part_line(){   # the one sentence every suite ends on, so a `portable` run and a
   echo "$suite: the $SUITE_PART half — $(part_n "$PART_RAN") unit(s) ran here, $(part_n "$PART_DEFERRED") in the other half"
   [ -z "$PART_DEFERRED" ] || echo "  the other half owns, and is where these report: $(part_names "$PART_DEFERRED")"
   return 0; }
+
+# QUARANTINE. A case that asserts on timing against a loaded box flips under the landing's own load and is green
+# alone on the same tree — cc-guard's 50a, cc-native's deadline, the sandbox swap race and the rest named in the
+# list — and each such red held the serial lane for a whole suite and bought nothing. The list is a FILE, one case
+# per line, beside this one (`quarantine`) and, for an overlay's own tools, at the top of the repo in
+# tests/quarantine; nothing here skips anything. The cases still run, still rerun once alone (chk, rerun_alone),
+# and still report; a tool whose red, twice, is ONLY listed cases is reported by the line `quarantined` prints
+# instead of failing its gate. An inline selftest case with no selfcheck to rerun reports through qbad <tool>,
+# once. It never applies where a red could be the change's own:
+#   - the landing did not say what the diff is (no CC_LAND_CHANGED: a hand run, cc-green's unscoped run);
+#   - the diff touches the tool itself (bin/<tool>, or <tool>/ for an overlay directory like lessons/);
+#   - the diff touches a protected path: cc-guard, cc-sandbox, cc-land, cc-fence, the member tools, hooks, or any
+#     tests/ file — which holds the list itself, so a PR can never quarantine its own red.
+QUARANTINE_FILES="$(dirname "${BASH_SOURCE[0]}")/quarantine"
+qtop=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null) || qtop=""
+[ -z "$qtop" ] || [ ! -f "$qtop/tests/quarantine" ] || [ "$(realpath "$qtop/tests/quarantine")" = "$(realpath "$QUARANTINE_FILES" 2>/dev/null)" ] \
+  || QUARANTINE_FILES="$QUARANTINE_FILES $qtop/tests/quarantine"
+unset qtop
+quarantine_open(){   # $1 = tool -> 0 when a quarantined case of that tool may pass here; 1 with QUAR_WHY when not
+  local p
+  [ -n "${CC_LAND_CHANGED:-}" ] || { QUAR_WHY="no landing diff named (CC_LAND_CHANGED), so every case counts"; return 1; }
+  for p in $CC_LAND_CHANGED; do
+    case "$p" in
+      */"$1"|"$1"|"$1"/*|*/"$1"/*) QUAR_WHY="this change touches $1 ($p)"; return 1;;
+      *bin/cc-guard|*bin/cc-sandbox|*bin/cc-land|*bin/cc-fence|*bin/cc-member-*|*hooks/*|tests/*|*/tests/*)
+        QUAR_WHY="this change touches a protected path ($p)"; return 1;;
+    esac
+  done; return 0; }
+quarantined(){   # $1 = tool, $2 = its red output -> 0 and one line to report (no red shape in it) when every red
+                 # line of $2 is a listed case of $1 and quarantine_open allows it; 1 and nothing printed otherwise
+  local reds frags line f hit left=""
+  frags=$(cat $QUARANTINE_FILES 2>/dev/null | awk -F'\t' -v t="$1" '$1 == t && $2 != "" {print $2}')
+  [ -n "$frags" ] || return 1
+  reds=$(grep -E '✗|✘|FAIL|[A-Za-z]Error:' <<<"$2") || return 1   # a red with no case line named is not a listed case
+  while IFS= read -r line; do
+    hit=""; while IFS= read -r f; do case "$line" in *"$f"*) hit=1; break;; esac; done <<<"$frags"
+    [ -n "$hit" ] || left=1
+  done <<<"$reds"
+  [ -z "$left" ] || return 1
+  quarantine_open "$1" || return 1
+  echo "$1: QUARANTINED — red only on known load-sensitive cases (listed in core/tests/quarantine or tests/quarantine), not this change's: $(sed 's/^ *//' <<<"$reds" | head -5 | tr '\n' ';' | sed -e 's/;$//' -e 's/\([1-9][0-9]*\) failed/\1 red/g' -e 's/✗/·/g' -e 's/✘/·/g' -e 's/FAIL/red/g' -e 's/Error:/Error -/g')"; }

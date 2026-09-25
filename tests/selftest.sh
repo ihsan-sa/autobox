@@ -128,6 +128,9 @@ if [ -n "${CC_SELFTEST_LOCK_ONLY:-}" ]; then   # the case below re-runs this fil
   exit 0
 fi
 pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+1)); echo "  ✗ $1"; }
+# qbad <tool> <text>: bad, unless the case is in the quarantine list for <tool> and quarantine_open allows it (green.sh,
+# QUARANTINE) — then the QUARANTINED report. For an inline case with no selfcheck of its own to rerun alone.
+qbad(){ local q; q=$(quarantined "$1" "✗ $2") && { ok "$q"; return 0; }; bad "$2"; }
 # A RED stanza NAMES ITS CASES. `cc-scope selfcheck: 69 passed, 1 failed` was the whole record of the red gate that
 # stopped PR #211's landing on 2026-09-04: the case names were captured and thrown away, and finding out what broke
 # cost a baseline against main, a worktree at the PR head and a full re-run of the suite. Every stanza that runs
@@ -204,7 +207,7 @@ stanza(){   # `stanza "<title>" [always]`: the header, and whether this change r
   return 0; }
 chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · line when the change does not reach it. The
          # tally is the tool's own line, found by name, never whatever printed last — no tally = it died = red.
-  local t=$1 o r rc keep
+  local t=$1 o r rc keep q
   want_selfcheck "$t" || { echo "  · $t selfcheck: not in this change's reach, not run"; return 0; }
   if [ -n "${PFPID[$t]:-}" ]; then   # `prefetch` started this one earlier; it is READ here, where it always printed
     wait "${PFPID[$t]}" 2>/dev/null || true
@@ -241,9 +244,13 @@ chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · lin
       flipped=$(grep -E '✗|✘|FAIL' <<<"$o" | head -n "$RED_CASES" | sed 's/^ *//' | tr '\n' ';')
       ok "$r2 — LOAD-BOUND: $(unred <<<"$r") beside the suite, green alone; the cases that flipped: $(unred <<<"${flipped%;}")"; return 0
     fi
-    [ -n "$r2" ] && { red "$t selfcheck: $r2 (and $r the first time — red alone as well, not load)" "$o2"; return 0; }
+    # RED TWICE ON ONLY QUARANTINED CASES is reported, not red — green.sh's QUARANTINE says when it may be.
+    [ -n "$r2" ] && { q=$(quarantined "$t" "$o2") && { ok "$q"; return 0; }
+                      red "$t selfcheck: $r2 (and $r the first time — red alone as well, not load)" "$o2"; return 0; }
     # …and a rerun that died (no tally) proves nothing either way: the first red stands, judged on its own output.
   fi
+  # …and the first red too (no rerun, or a death with no tally — cc-native's deadline dies that way).
+  q=$(quarantined "$t" "$o") && { ok "$q"; return 0; }
   [ -n "$r" ] && { red "$t selfcheck: $r" "$o"; return 0; }
   # NO TALLY is not a failed case — the selfcheck never reached its last line: killed, or never started. PR #235's
   # gate said "it printed no tally line" and not one thing more, and the same suite was green in ten re-runs after
@@ -441,7 +448,7 @@ c5tid=$(jq -r .task_id < "$d5" 2>/dev/null)
   && [ "$(jq -r .claim.generation < "$d5")" = 2 ] \
   && [ "$(jq -r '.executions[0].outcome' < "$d5")" = "superseded (a worker took over from a subagent)" ]; } \
   && ok "…while a worker dispatch takes that same row over — one task, a new generation, and the record says why" \
-  || bad "a repair dispatch was refused a row a subagent still holds: rc=$h2 $(cat "$T/c5go.out")"
+  || qbad cc "a repair dispatch was refused a row a subagent still holds: rc=$h2 $(cat "$T/c5go.out")"
 for id in $(wins "$REPO/c5"); do tmux kill-window -t "$id"; done
 touch "$T/c5.stop"; wait $holder 2>/dev/null; KIDS="${KIDS% $holder}"
 rm -f "$T/c5.stop" "$d5"; hold worker; holder=$!; KIDS="$KIDS $holder"
@@ -2544,7 +2551,7 @@ L check "$T/empty.json" "$T/lim.err" >/dev/null || miss="$miss [stderr-only 429]
 # branches that never touch cc-limit ('+89s', '+90s' — see the row that fixed this). Pinning `now` makes the
 # parse deterministic: u is exactly t0+120 regardless of how long the subprocess took to run.
 say true "rate limit; reset in 2 minutes"; t0=$(date -u +%s); u=$(CC_LIMIT_NOW=$t0 L check "$lf"); u=${u#LIMIT }; d=$((u - t0))
-{ [ "$d" -ge 100 ] && [ "$d" -le 140 ]; } && ok "cc-limit parses a relative reset ('in 2 minutes' -> +${d}s)" || bad "relative reset parsed to +${d}s"
+{ [ "$d" -ge 100 ] && [ "$d" -le 140 ]; } && ok "cc-limit parses a relative reset ('in 2 minutes' -> +${d}s)" || qbad cc-limit "relative reset parsed to +${d}s"
 L status | grep -q 'usage limit until .*Z (.*left)' && ok "cc-limit status reports the live stamp" || bad "cc-limit status while set"
 L clear; [ "$(L status)" = clear ] && [ "$(L status >/dev/null; echo $?)" = 1 ] && ok "cc-limit clear -> status clear (exit 1)" || bad "cc-limit clear"
 # The record/resume state machine — arm, resume, first_seen, nudged_recently and the exit-code contract — is
@@ -2788,6 +2795,14 @@ ME "$B/cc-limit" check "$T/cred.json" >/dev/null
   && [ "$(M status)" = "opus until probe — fable is not available to this account" ]; } \
   && ok "cc-limit: an exhausted credit balance is not a limit — no stamp, fable recorded as unavailable, the box moved off it and status says so" \
   || bad "credits read wrong: stamp=$([ -e "$MH/.cc/state/claude-limit" ] && echo yes || echo no) status=$(M status)"
+# The brief: "live-host and account assertions (tutor credentials, account/model availability) move out of PR gates
+# into monitoring." The account/model cases above assert on a fixture HOME and a fixture refusal, never on what this
+# account can run today — that is cc-model tick's to watch on the box. Asserted, so a case that starts reading the
+# live account is caught here rather than as a landing red on a day the account changes.
+{ [ "$MH" != "$HOME" ] && [ "$(ME sh -c 'printf %s "$HOME"')" = "$MH" ] \
+  && [ "$(ME sh -c 'cat "$HOME/.cc/state/model-unavailable"' | cut -f1)" = fable ]; } \
+  && ok "the account/model-availability cases read a fixture home and its record, never this box's live account" \
+  || bad "an account/model case reached past its fixture home ($MH)"
 rm -f "$MH/.cc/state/claude-limit" "$MH/.cc/state/model-unavailable" "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen" "$MH/.cc/state/model-refused"   # model-refused: that real refusal would hold the probe below for an hour
 : > "$MH/.cc/state/model.log"; : > "$MH/.cc/notify.log"   # …and the move it just made: one switch per 10 min, so a switch row
                                                           # left here holds every case below on the anti-flap gap, and the
@@ -3449,6 +3464,39 @@ r=$( B=$CB; REACH=""; chk cc-flaky; chk cc-broken )
 r=$( B=$CB; REACH=""; CC_SELFTEST_RERUN=0; rm -f "$CB/cc-flaky.n"; chk cc-flaky )
 { grep -q '✗ cc-flaky selfcheck: cc-flaky selfcheck: 9 passed, 1 failed' <<<"$r" && [ "$(cat "$CB/cc-flaky.n")" = 1 ]; } \
   && ok "…and CC_SELFTEST_RERUN=0 runs nothing twice: the first red stands" || bad "chk rerun off: $(tr '\n' ' ' <<<"$r")"
+# QUARANTINE (green.sh): a tool red twice on ONLY a listed case is reported, not red — and only where the landing
+# named a diff that touches neither that tool nor a protected path. Each case below builds its own list and tool.
+printf '#!/bin/sh\nn=$(cat "$0.n" 2>/dev/null || echo 0); echo $((n+1)) > "$0.n"\necho "FAIL the listed race"; echo "cc-qrace selfcheck: 9 passed, 1 failed"; exit 1\n' > "$CB/cc-qrace"
+printf '#!/bin/sh\necho "FAIL the listed race"; echo "FAIL a real bug"; echo "cc-qmix selfcheck: 8 passed, 2 failed"; exit 1\n' > "$CB/cc-qmix"
+chmod +x "$CB/cc-qrace" "$CB/cc-qmix"; printf 'cc-qrace\tthe listed race\twhy\ncc-qmix\tthe listed race\twhy\n' > "$CB/quarantine"
+qchk(){ ( B=$CB; REACH=""; QUARANTINE_FILES=$CB/quarantine; CC_LAND_CHANGED=$1; rm -f "$CB/cc-qrace.n"; chk "$2" ); }
+r=$(qchk "core/bin/cc-other" cc-qrace)
+{ grep -q '✓ cc-qrace: QUARANTINED — red only on known load-sensitive cases .*red the listed race' <<<"$r" \
+  && ! grep -qE '[1-9][0-9]* failed|✗|✘|FAIL' <<<"$r" && [ "$(cat "$CB/cc-qrace.n")" = 2 ]; } \
+  && ok "quarantine: a tool red twice on only a listed case, for a diff that does not touch it, is reported QUARANTINED — rerun once first, and with no red shape a landing would read" \
+  || bad "quarantine kept: $(tr '\n' ' ' <<<"$r")"
+r=$(qchk "core/bin/cc-qrace" cc-qrace)
+{ grep -q '✗ cc-qrace selfcheck' <<<"$r" && ! grep -q QUARANTINED <<<"$r"; } \
+  && ok "quarantine: …but a diff that touches the tool itself keeps its listed case red" || bad "quarantine own tool: $(tr '\n' ' ' <<<"$r")"
+r=$(qchk "core/bin/cc-guard" cc-qrace)
+{ grep -q '✗ cc-qrace selfcheck' <<<"$r" && ! grep -q QUARANTINED <<<"$r"; } \
+  && ok "quarantine: …and so does a diff to a protected path (cc-guard here)" || bad "quarantine protected: $(tr '\n' ' ' <<<"$r")"
+r=$(qchk "core/tests/quarantine" cc-qrace)
+{ grep -q '✗ cc-qrace selfcheck' <<<"$r" && ! grep -q QUARANTINED <<<"$r"; } \
+  && ok "quarantine: …and a diff to the list itself, so no PR quarantines its own red" || bad "quarantine list edit: $(tr '\n' ' ' <<<"$r")"
+r=$(qchk "" cc-qrace)
+{ grep -q '✗ cc-qrace selfcheck' <<<"$r" && ! grep -q QUARANTINED <<<"$r"; } \
+  && ok "quarantine: …and a run that names no diff (a hand run, cc-green's) is strict" || bad "quarantine no diff: $(tr '\n' ' ' <<<"$r")"
+r=$(qchk "core/bin/cc-other" cc-qmix)
+{ grep -q '✗ cc-qmix selfcheck' <<<"$r" && grep -q 'FAIL a real bug' <<<"$r" && ! grep -q QUARANTINED <<<"$r"; } \
+  && ok "quarantine: …and a listed case beside one that is not listed is red, with the unlisted case named" || bad "quarantine mixed: $(tr '\n' ' ' <<<"$r")"
+r=$( B=$CB; QUARANTINE_FILES=$CB/quarantine; CC_LAND_CHANGED=docs/x.md; fail=0; qbad cc-qrace "the listed race took +97s"; echo "fail=$fail" )
+r2=$( B=$CB; QUARANTINE_FILES=$CB/quarantine; CC_LAND_CHANGED=docs/x.md; fail=0; qbad cc-qrace "an unlisted case"; echo "fail=$fail" )
+r3=$( B=$CB; QUARANTINE_FILES=$CB/quarantine; unset CC_LAND_CHANGED; fail=0; qbad cc-qrace "the listed race took +97s"; echo "fail=$fail" )
+{ grep -q '✓ cc-qrace: QUARANTINED' <<<"$r" && grep -q '✗ an unlisted case' <<<"$r2" && grep -q 'fail=1' <<<"$r2" \
+  && grep -q '✗ the listed race' <<<"$r3" && grep -q 'fail=1' <<<"$r3"; } \
+  && ok "quarantine: an inline case (qbad) listed for its tool is reported QUARANTINED; an unlisted one, or one with no diff named, is red" \
+  || bad "quarantine inline: $(tr '\n' ' ' <<<"$r $r2 $r3")"
 fi
 
 if stanza "the suite's own slots (a cap, not a queue)" always; then
@@ -3576,8 +3624,18 @@ box_split ~/.cc $(box_marked ~/.cc)   # brief: "a run leaves ~/.cc byte-identica
   || bad "a box file carries this run's fixtures (a CC_* state path still points at ~/.cc — add it to the export block, and its default to BOX_PATHS):$leak"
 [ -z "$seen" ] || echo "  · the box's own watchers wrote about this run's fixtures (not a leak — a live tick reading the fixture board or transcripts):$seen"
 box_flags > "$T/flags.after"
-cmp -s "$T/flags.before" "$T/flags.after" && ok "…and the box's own flags ($BOX_FLAGS) are as the run found them" \
-  || bad "a box flag changed during the run: $(diff "$T/flags.before" "$T/flags.after" | grep '^[<>]' | tr '\n' ' ')"
+# …BUT ~/.cc/config IS LIVE. `cc-config set` is how every planning seat changes the box, and a seat that set a key
+# while this ~20 min suite ran turned unrelated landings red (five retained logs, 2026-09 — the box's state, not the
+# change). So a config that moved is RED only when it names this run's fixtures ($REPO, selftest-$RUN): that is a
+# case writing the box's own config. Otherwise the change is said on a · line and the landing goes on. The other
+# flags nothing live rewrites, so any change to them stays red.
+flagdiff=$(diff "$T/flags.before" "$T/flags.after" | grep '^[<>]'); cfgdiff=$(grep '^[<>] config ' <<<"$flagdiff")
+if [ -n "$cfgdiff" ] && ! grep -q -e "$REPO" -e "selftest-$RUN" ~/.cc/config 2>/dev/null; then
+  echo "  · the box's config changed during the run and names none of its fixtures — a live cc-config set, not this run's: $(tr '\n' ' ' <<<"$cfgdiff")"
+  flagdiff=$(grep -v '^[<>] config ' <<<"$flagdiff")
+fi
+[ -z "$flagdiff" ] && ok "…and the box's own flags ($BOX_FLAGS) are as the run found them, or config moved by a live set that names no fixture" \
+  || bad "a box flag changed during the run: $(tr '\n' ' ' <<<"$flagdiff")"
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it
 # EVERY STANZA IS ACCOUNTED FOR — it ran here, the other half owns it, or this change does not reach it. A
