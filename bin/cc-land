@@ -37,11 +37,15 @@
                                                   nothing on the repo's gate-first lists (every tests/gate-first,
                                                   read at the base; no list, nothing ordinary), into the default
                                                   branch, files disjoint from each other —
-                                                  land as ONE BATCH when two or more are ready: their warms side by
-                                                  side (--warm, WARM_SLOTS at once), their merges one at a time in
-                                                  queue order, then ONE suite on the base, run BESIDE the lane so the
+                                                  land as ONE BATCH, however many are ready (one too): their warms
+                                                  side by side (--warm, WARM_SLOTS at once; a worker green on the head
+                                                  is spent there for 48 h), each member merged the
+                                                  moment its own warm ends, one merge at a time, with a `stages` line
+                                                  in queue.log (waited, warm, merge, total), then ONE suite on the
+                                                  base, run BESIDE the lane so the
                                                   next batch starts at once (`cc-land batch-suite`, one per repo at a
-                                                  time), and none when what merged is docs only (docs/, *.md, *.pdf);
+                                                  time), and none when what merged is prose only (docs/, *.md, *.pdf —
+                                                  never tests, config, templates or an instruction file);
                                                   it runs at the batch's own last merge, or at an earlier suite's
                                                   revert past it; green installs the tip it ran on, never origin's
                                                   (unless another batch is merging or its suite waits: that one
@@ -53,7 +57,7 @@
                                                   whose process died, leaves a note the next sweep resumes. A job
                                                   whose PR is closed, or merged and already installed, is dropped,
                                                   with one queue.log line.
-                                                  Every other job — one alone, a gate-first path —
+                                                  Every other job — a protected or gate-first path —
                                                   is gated, reviewed, merged and deployed before the next of that repo
                                                   is touched. A job survives a usage-limit review (waits for
                                                   the reset) and a red gate (3 tries, 15 min apart); a LAND-AFTER-FIX
@@ -167,6 +171,9 @@ COMMENT_RE = re.compile(r"^\s*($|#|//|--[ \t]|\*[ \t/]|\*$|/\*)")   # a line com
 WIDE_FILES = 12                           # past this many files, or this many changed lines, "narrow" is a claim
 WIDE_LINES = 600                          # nobody can check — the suite is cheaper than being wrong about it
 GREEN_TTL = 6 * 3600                      # how long a suite's own green record is spent instead of running it again (green_run)
+WORKER_GREEN_TTL = 48 * 3600              # …and a worker's green on a batch member's HEAD (worker_green): the suite runs on the
+                                          # base after the batch anyway, so an older record costs a revert at worst, not a red main
+                                          # nobody sees — and 6 h retired the greens of PRs that waited that long in the queue
 # AN ORDINARY PR LANDS OPTIMISTICALLY (owner, 2026-09-24: "15 min a PR x 30 = 450 min, way too long"). Ordinary: it
 # touches no protected path and nothing on the repo's GATE-FIRST list, its worker left a green record for its head,
 # and its files are disjoint from the batch it lands with. Its WARM (the static gates and the read, no suite) runs
@@ -1202,6 +1209,18 @@ def churn(root, a, b):
     return n                                              # are never doc or comment, so they cannot reach `docs`
 
 
+def instruction_path(p):
+    """Whether `p` is something a session loads and acts on — CLAUDE.md, AGENTS.md, a skill, anything under .claude/ — which reads like prose and is not."""
+    return (os.path.basename(p) in ("CLAUDE.md", "AGENTS.md", "SKILL.md")
+            or p.startswith((".claude/", "skills/")) or "/.claude/" in p or "/skills/" in p)
+
+
+def prose_only(paths):
+    """Whether every path is prose a person reads — docs/, *.md and the like, a PDF — so no runtime suite can have anything to say about it (brief: "A docs- or prose-only PR runs no runtime suite at all, before or after the merge. Instructions, policy files and templates are not prose and keep their tests"): never the tests, config or templates (SHARED_PATH_RE), the reviewer's rules or an instruction file. Nothing at all is not prose-only."""
+    return bool(paths) and all((DOC_RE.search(p) or p.lower().endswith(".pdf")) and not SHARED_PATH_RE.search(p)
+                               and p != REVIEW_RULES and not instruction_path(p) for p in paths)
+
+
 def gate_tier(root, a, b, changed):
     """Which gates this diff has earned, as (tier, why): `full` every gate and the paid review, `focused` the gates scoped to what the change reaches and nobody paid to read it, `docs` the cheap static gates only. Every path out that is not a positive answer is `full`."""
     paths = [p for _, p in changed]
@@ -1215,8 +1234,7 @@ def gate_tier(root, a, b, changed):
     if REVIEW_RULES in paths:
         # The reviewer's rules are read from origin/<base>; a `docs` tier here would let a markdown-only PR rewrite them unread.
         return "full", f"{REVIEW_RULES} — the rules the reviewer is judged by are never a documentation change"
-    inst = [p for p in paths if os.path.basename(p) in ("CLAUDE.md", "AGENTS.md")
-            or p.startswith(".claude/") or "/.claude/" in p]
+    inst = [p for p in paths if instruction_path(p)]
     if inst:
         # Same hole, one ring out: files every session loads must not land unread.
         return "full", f"instructions every session loads are never a documentation change ({', '.join(inst[:3])})"
@@ -1240,8 +1258,8 @@ def green_dir():
     return os.environ.get("CC_GREEN_DIR") or f"{LANDQ}/green"
 
 
-def green_run(content, gate, scope="", part=""):
-    """Has this gate already passed on this content? A green record is keyed on the git tree, spent until GREEN_TTL retires it, and answers only the same scope (CC_LAND_CHANGED paths; an unscoped record answers any) and the same half (a whole run answers either)."""
+def green_run(content, gate, scope="", part="", ttl=GREEN_TTL):
+    """Has this gate already passed on this content? A green record is keyed on the git tree, spent until `ttl` (GREEN_TTL; WORKER_GREEN_TTL for a batch warm's worker green) retires it, and answers only the same scope (CC_LAND_CHANGED paths; an unscoped record answers any) and the same half (a whole run answers either)."""
     if not content:
         return False
     base = f"{green_dir()}/{os.path.basename(gate)}"
@@ -1249,7 +1267,7 @@ def green_run(content, gate, scope="", part=""):
         j = read_json(p) or {}
         if (j.get("tree") == content and j.get("suite") == gate and (j.get("scope") or "") in ("", scope)
                 and (j.get("part") or "") in ("", part)
-                and time.time() - epoch_of(j.get("at", "")) <= GREEN_TTL):
+                and time.time() - epoch_of(j.get("at", "")) <= ttl):
             return True
     return False
 
@@ -1262,7 +1280,7 @@ def tree_id(root):
 
 def sweep_records():
     """Green records past their hours go, and a change's tally nothing has touched for ROOT_TTL (root_work has stopped believing it by then) — never a merged one, which is the landing's record (root_done); an optimisation only, so it never raises."""
-    for pattern, ttl in ((f"{green_dir()}/*.json", GREEN_TTL), (f"{root_dir()}/*.json", ROOT_TTL)):
+    for pattern, ttl in ((f"{green_dir()}/*.json", WORKER_GREEN_TTL), (f"{root_dir()}/*.json", ROOT_TTL)):
         for p in glob.glob(pattern):
             try:
                 if time.time() - os.path.getmtime(p) > ttl and not (read_json(p) or {}).get("merged"):
@@ -2227,7 +2245,7 @@ class Land:
         tree = o.strip() if not rc else ""
         suites = [g for g in SUITE if not sh(["git", "cat-file", "-e", f"{self.head}:{g}"], cwd=self.root)[0]]
         # Brief: "A missing worker green should cost a suite run in the warm, not demote the PR to serial for good."
-        self.warm_suites = [g for g in suites if not green_run(tree, g, self.gate_scope())]
+        self.warm_suites = [g for g in suites if not green_run(tree, g, self.gate_scope(), ttl=WORKER_GREEN_TTL)]
         if self.warm_suites:
             return (f"no green record of the worker's own for {', '.join(self.warm_suites)} on the head "
                     f"{self.head[:12]} (tree {tree[:12] or '?'}), so the warm's gates run it on the merge (unless the "
@@ -3035,11 +3053,33 @@ def finish(path, job):
         ledger(f"done {job.get('repo')}#{job.get('pr') or 'deploy'} rc={r.get('rc')} {r.get('short', '')}"
                + (f" | {r['detail']}" if r.get("detail") else "")
                + ("" if said else " (Slack never took the result)"))
+        stages = stage_line(job)
+        if stages:
+            ledger(stages)
         job["posted"] = True
         with contextlib.suppress(OSError):
             write_atomic(path, job)
     with contextlib.suppress(OSError):
         os.unlink(path)
+
+
+def stage_line(job, now=None):
+    """The queue.log line a finished PR job's stage times go in, written once beside its `done` line (finish), or '': `stages <repo>#<pr> path=batch|serial ok=yes|no total=Ns`, and for a batch member also `waited=` (queued → its warm began), `warm=` (the warm) and `merge=` (the warm's end → this line). What the landing's p95 is measured on (brief: "stage times in queue.log"). Seconds, off the second-resolution stamps the job carries; a stamp that is missing or out of order drops that field, never the line."""
+    if not job.get("pr") or not job.get("queued_at"):
+        return ""
+    now = time.time() if now is None else now
+    q, w0 = epoch_of(job["queued_at"]), epoch_of(job.get("warm_from") or "")
+    w1 = epoch_of((job.get("warm") or {}).get("at") or "")
+    batch = bool(job.get("batch"))
+    parts = [f"stages {job.get('repo')}#{job['pr']}", f"path={'batch' if batch else 'serial'}",
+             f"ok={'yes' if (job.get('result') or {}).get('ok') else 'no'}"]
+    if q and now >= q:
+        parts.append(f"total={int(now - q)}s")
+    if batch:
+        for name, a, b in (("waited", q, w0), ("warm", w0, w1), ("merge", w1, now)):
+            if a and b and b >= a:
+                parts.append(f"{name}={int(b - a)}s")
+    return " ".join(parts)
 
 
 def same_job(path, job):
@@ -3881,28 +3921,37 @@ def spawn_warm(repo, pr, log, path):
                             stdin=subprocess.DEVNULL, stdout=open(log, "w"), stderr=subprocess.STDOUT, cwd=HOME)
 
 
-def warm_all(repo, batch):
-    """Phase 1: every member's warm — `<this> <repo> <pr> --warm`: the worker's green, the static gates on the merge, the read beside them, no merge — WARM_SLOTS at a time, each a process of its own (spawn_warm) whose output is a log under the run root, its outcome written on the job by the warm itself (warm_done). Returns one line per member. A warm that will not start, or dies without writing, leaves the job unwarmed, and the merge pass runs its gates as they always were."""
+def warm_all(repo, batch, on_done=None):
+    """Phase 1: every member's warm — `<this> <repo> <pr> --warm`: the worker's green, the static gates on the merge, the read beside them, no merge — WARM_SLOTS at a time, each a process of its own (spawn_warm) whose output is a log under the run root, its outcome written on the job by the warm itself (warm_done). Each warm's start goes on its job first (`warm_from`, for finish's stage line). Returns one line per member. `on_done(path, job, files)` is called for each member as ITS warm ends, while the others still run: the merge pass takes a member the moment it is ready instead of waiting for the slowest warm (a warm with no worker green runs the suite, ~35 min under load, and held every other member of its batch that long on 2026-09-25). A warm that will not start, or dies without writing, leaves the job unwarmed, and the merge pass runs its gates as they always were."""
     lines, running, todo = [], [], list(batch)
     while todo or running:
         while todo and len(running) < WARM_SLOTS:
-            path, job, _ = todo.pop(0)
+            path, job, files = todo.pop(0)
             log = f"{run_root()}/warm-{repo}-{job['pr']}.log"
+            now = read_json(path)
+            if now:                           # before the spawn, since the warm writes the job next; a job gone stays gone
+                job_set(path, now, warm_from=stamp())
             try:
                 p = spawn_warm(repo, job["pr"], log, path)
             except OSError as e:
                 lines.append(f"[{repo}] PR #{job['pr']}: the warm would not start ({e}) — its gates run at the merge pass")
+                if on_done:
+                    on_done(path, job, files)
                 continue
-            running.append((p, path, job, log))
-        still = []
-        for p, path, job, log in running:
+            running.append((p, path, job, files, log))
+        still, ready = [], []
+        for p, path, job, files, log in running:
             if p.poll() is None:
-                still.append((p, path, job, log))
+                still.append((p, path, job, files, log))
                 continue
             w = (read_json(path) or {}).get("warm") or {}
             lines.append(f"[{repo}] PR #{job['pr']}: warm " + ("passed" if w.get("ok") else
                          f"stopped at {w.get('stopped') or 'start'} — {(w.get('why') or last(open(log).read() if os.path.exists(log) else ''))[:200]}"))
+            ready.append((path, job, files))
         running = still
+        for path, job, files in ready:
+            if on_done:
+                on_done(path, job, files)     # the merge runs here, and the warms still running go on beside it
         if running:
             time.sleep(2)
     return lines
@@ -4209,15 +4258,16 @@ def pid_alive(pid):
 
 
 def batch_suite(repo, merged, bid):
-    """Phase 3 handed off: the batch's suite (after_batch) runs BESIDE the lane, so the next batch starts at once (owner, 2026-09-24: #651's suite held the lane from 19:42Z past 21:05Z and nothing landed for two hours). Its merges are written to suite_path first, and spawn_suite runs them there; a suite whose process dies is spawned again by the next lane (resume_suites). A batch whose merged diff has no code in it — every path docs/, *.md or *.pdf — runs no suite and installs nothing. Returns its lines."""
+    """Phase 3 handed off: the batch's suite (after_batch) runs BESIDE the lane, so the next batch starts at once (owner, 2026-09-24: #651's suite held the lane from 19:42Z past 21:05Z and nothing landed for two hours). Its merges are written to suite_path first, and spawn_suite runs them there; a suite whose process dies is spawned again by the next lane (resume_suites). A batch whose merged diff is prose only (prose_only: docs/, *.md, *.pdf, but never tests, config, templates, the reviewer's rules or an instruction file) runs no suite and installs nothing. Returns its lines."""
     if not merged:
         return []
     prs = ", ".join(f"#{pr}" for pr, _, _ in merged)
     files = sorted({p for _, _, fs in merged for p in fs})
-    # Brief: "run none when the merged diff touches no code (docs/, *.md, *.pdf)".
-    if not [p for p in files if not DOC_RE.search(p) and not p.lower().endswith(".pdf")]:
-        ledger(f"batch-suite-skipped {repo} prs={prs} — no code in the {len(files)} file(s) merged")
-        return [f"[{repo}] batch ({prs}): no code in what merged (docs only), so no suite and nothing to install"]
+    # Brief: "A docs- or prose-only PR runs no runtime suite at all, before or after the merge. Instructions, policy
+    # files and templates are not prose and keep their tests."
+    if prose_only(files):
+        ledger(f"batch-suite-skipped {repo} prs={prs} — prose only in the {len(files)} file(s) merged")
+        return [f"[{repo}] batch ({prs}): prose only in what merged, so no suite and nothing to install"]
     path = suite_path(repo, bid)
     write_atomic(path, {"repo": repo, "bid": bid, "merged": merged, "at": stamp()})
     ledger(f"batch-suite-beside {repo} {bid} prs={prs}")
@@ -4363,7 +4413,7 @@ def unbatch(repo, path, job=None):
 
 
 def land_batch(repo, batch):
-    """One batch, three phases: the warms side by side (warm_all); the merges one at a time in queue order, each a run_one that spends its warm (spend_warm) and skips the deploy; then after_batch, on what batch_merged proves this pass put on the base, beside the lane (batch_suite). A member whose warm found it not ordinary is left on the queue for the serial path — this lane run's next look takes it. The tip before the batch, its members and the ones already merged before it are written to batch_path first, so a lane that dies before after_batch leaves the next pass what it needs (resume_batch). Returns its lines."""
+    """One batch, three phases: the warms side by side (warm_all); the merges one at a time, each a run_one that spends its warm (spend_warm) and skips the deploy, taken in the order the warms END — a member merges as soon as its own warm has, while slower warms still run (warm_all's on_done), and one no warm handed over is merged after them in queue order; then after_batch, on what batch_merged proves this pass put on the base, beside the lane (batch_suite). A member whose warm found it not ordinary is left on the queue for the serial path — this lane run's next look takes it. The tip before the batch, its members and the ones already merged before it are written to batch_path first, so a lane that dies before after_batch leaves the next pass what it needs (resume_batch). Returns its lines."""
     bid = stamp()
     before = base_tip(repo)
     if not before:
@@ -4375,20 +4425,29 @@ def land_batch(repo, batch):
     ledger(f"batch {repo} {bid} before={before[:12]} prs={','.join(str(j['pr']) for _, j, _ in batch)} warms={WARM_SLOTS}")
     rec = {"bid": bid, "before": before, "pid": os.getpid(), "members": [], "pre": []}
     write_atomic(batch_path(repo), rec)
-    lines = warm_all(repo, batch)
-    for path, job, files in batch:
+    done, merges = set(), []
+
+    def merge(path, job, files):
+        if path in done:
+            return
+        done.add(path)
         job = read_json(path) or {}
         if not job or (job.get("warm") or {}).get("stopped") == "warm":
-            continue                          # not ordinary after all: the serial path's, not the batch's
+            return                            # not ordinary after all: the serial path's, not the batch's
         if (pr_facts(repo_root(repo), job["pr"], "state", timeout=60)[0] or {}).get("state") == "MERGED":
             rec["pre"].append(job["pr"])      # merged before this pass: not the batch's to bisect or revert
         rec["members"].append([job["pr"], files])
         write_atomic(batch_path(repo), rec)   # …noted BEFORE the merge, so a death mid-merge still finds it
         job_set(path, job, batch=bid)
-        lines.append(run_one(path))
+        merges.append(run_one(path))
         # Kept (a retry, a hold, a fix round): the batch and its warm were THIS pass's, and the serial landing that
         # takes it next must gate and deploy it itself — a batch mark left on would skip both.
         unbatch(repo, path, job)
+
+    lines = warm_all(repo, batch, on_done=merge)
+    for path, job, files in batch:
+        merge(path, job, files)
+    lines += merges
     merged = batch_merged(repo, before, [(pr, fs) for pr, fs in rec["members"]], skip=set(rec["pre"]))
     lines += batch_suite(repo, merged, bid)
     with contextlib.suppress(OSError):
@@ -4470,9 +4529,10 @@ def _run_lane(repo):
                 if not left:
                     break
                 batch = batch_of(repo, left)
-                if len(batch) >= 2:
-                    # Two or more ordinary jobs ready: they land together (land_batch). One alone lands as it
-                    # always did — its suite runs before its merge, and a red there is a stop and not a revert.
+                if batch:
+                    # Ordinary jobs ready land together (land_batch) — ONE alone too. Brief: "an ordinary PR
+                    # goes from queued to merged in under 15 minutes": a lone one sent down the serial path held the
+                    # lane for the whole suite before its merge, which is the wait the batch exists to take away.
                     seen.update(key(p) for p, _, _ in batch)
                     seen_batch.update(key(p) for p, _, _ in batch)
                     lines += land_batch(repo, batch)

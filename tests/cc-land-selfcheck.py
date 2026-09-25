@@ -6085,7 +6085,7 @@ def selfcheck():
             world["git merge-base --is-ancestor"] = ancestry
             world["git rev-list --parents -n 1"] = lambda argv: (0, f"{argv[-1]} {'0' * 40}\n")   # a squash: one parent
         _ro, _wa, _ab = run_one, warm_all, after_batch
-        globals().update(run_one=merge_stub, warm_all=lambda repo, b: [], after_batch=lambda repo, m, **kw: handed.append(m) or [])
+        globals().update(run_one=merge_stub, warm_all=lambda repo, b, **kw: [], after_batch=lambda repo, m, **kw: handed.append(m) or [])
         batch_world()
         batch = [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32, 33)]
         land_batch("myrepo", batch)
@@ -6170,7 +6170,64 @@ def selfcheck():
         check("…and a job re-queued over the member while its marks come off is left exactly as the re-queue wrote it",
               j34.get("queued_at") == "2026-09-24T13:00:00Z" and j34.get("attempts") == 0 and j34.get("batch") == "b2")
         os.unlink(job_path("myrepo", 34))
+        # FINDING (2026-09-25): the merge pass waited for EVERY warm, so one member with no worker green (its warm runs
+        # the suite, ~35 min under load) held the others that long. A member merges as soon as its own warm ends. Its
+        # own fixture: #61's warm is slow, #62's quick; #62 merges first and while #61's warm is still running.
+        slow = {61: 3.0, 62: 0.1}      # warm_all polls every 2 s: #62 ends at the first poll after that, #61 two later
+        alive = set()
+
+        class TimedWarm:
+            def __init__(self, path, pr):
+                self.t0, self.path, self.pr = time.time(), path, pr
+                alive.add(pr)
+            def poll(self):
+                if time.time() - self.t0 < slow[self.pr]:
+                    return None
+                if self.pr in alive:
+                    alive.discard(self.pr)
+                    j = read_json(self.path) or {}
+                    j["warm"] = {"head": S(self.pr), "base": BASE_SHA, "ok": True, "at": stamp(), "stopped": ""}
+                    write_atomic(self.path, j)
+                return 0
+        merged_when = []
+
+        def timed_merge(path):
+            j = read_json(path) or {}
+            merged_when.append((j.get("pr"), sorted(alive), bool(j.get("warm_from"))))
+            return merge_stub(path)
+        _spawn = spawn_warm
+        globals().update(spawn_warm=lambda repo, pr, log, path: TimedWarm(path, pr), warm_all=_wa, run_one=timed_merge)
+        try:
+            batch_world(); took.clear(); handed.clear()
+            for pr in (61, 62):
+                write_atomic(job_path("myrepo", pr), {"repo": "myrepo", "pr": pr, "queued_at": stamp(), "attempts": 0})
+            MAIN[2:2] = [S(62), S(61)]
+            land_batch("myrepo", [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (61, 62)])
+        finally:
+            globals().update(spawn_warm=_spawn)
+            del MAIN[2:4]
+        check("a member merges the moment ITS warm ends: #62 (quick) merges while #61's warm still runs, then #61; "
+              "each warm's start was on its job first",
+              merged_when == [(62, [61], True), (61, [], True)])
+        check("…and after_batch gets them in the order they MERGED, which is the order the bisect and revert trust",
+              handed == [[(62, S(62), ["f62"]), (61, S(61), ["f61"])]])
+        for pr in (61, 62):
+            with contextlib.suppress(OSError):
+                os.unlink(job_path("myrepo", pr))
         globals().update(run_one=_ro, warm_all=_wa, after_batch=_ab)
+        # STAGE TIMES — brief: "with stage times in queue.log". Each case its own job dict.
+        T0 = epoch_of("2026-09-25T10:00:00Z")
+        line = stage_line({"repo": "myrepo", "pr": 71, "queued_at": "2026-09-25T10:00:00Z", "batch": "b1",
+                           "warm_from": "2026-09-25T10:01:00Z", "warm": {"at": "2026-09-25T10:06:00Z"},
+                           "result": {"ok": True}}, now=T0 + 480)
+        check("a batch member's stage line: path, outcome, total, waited, warm and merge, in seconds",
+              line == "stages myrepo#71 path=batch ok=yes total=480s waited=60s warm=300s merge=120s")
+        line = stage_line({"repo": "myrepo", "pr": 72, "queued_at": "2026-09-25T10:00:00Z",
+                           "warm_from": "2026-09-25T10:01:00Z", "result": {"ok": False}}, now=T0 + 1500)
+        check("…a serial job's has its total only, even with a warm_from left over from a batch that kept it",
+              line == "stages myrepo#72 path=serial ok=no total=1500s")
+        check("…and a deploy job (no PR) writes none", stage_line({"repo": "myrepo", "span": "a..b",
+                                                                  "queued_at": "2026-09-25T10:00:00Z"}) == "")
         for pr in (31, 32, 33):
             os.unlink(job_path("myrepo", pr))
 
@@ -6252,6 +6309,23 @@ def selfcheck():
         caught(L.worker_green)
         check("…but a record scoped to some OTHER diff is not this head's green: the warm runs the suite itself",
               L.warm_suites == ["core/tests/selftest.sh"])
+        # FINDING (2026-09-25): GREEN_TTL (6 h) retired the worker greens of PRs that waited that long in the queue,
+        # and each then ran the suite in its warm. The warm spends one for WORKER_GREEN_TTL; any other gate still 6 h.
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 20 * 3600))
+        write_atomic(f"{green_dir()}/selftest.sh-{TREE[:12]}.json",
+                     {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "", "at": old})
+        L = warm_L()
+        said = caught(L.worker_green)
+        check("a worker green 20 h old still stands in the warm (WORKER_GREEN_TTL), while the same record is past "
+              "GREEN_TTL for every other gate", isinstance(said, str) and "worker's own green stands" in said
+              and L.warm_suites == [] and not green_run(TREE, "core/tests/selftest.sh"))
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - WORKER_GREEN_TTL - 3600))
+        write_atomic(f"{green_dir()}/selftest.sh-{TREE[:12]}.json",
+                     {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "", "at": old})
+        L = warm_L()
+        caught(L.worker_green)
+        check("…and one past WORKER_GREEN_TTL does not: the warm runs the suite itself",
+              L.warm_suites == ["core/tests/selftest.sh"])
         # FINDING: batch_of read gh's file list at pick time, tied to no head. The warm asks again of the head IT
         # fetched, off git: a push after the pick that touches core/bin/cc-guard is not ordinary, green record or not.
         write_atomic(f"{green_dir()}/selftest.sh-{TREE[:12]}.json",
@@ -6315,7 +6389,7 @@ def selfcheck():
         took.clear(); handed.clear()
         MAIN.insert(1, S(7))
         _ro, _wa, _ab = run_one, warm_all, after_batch
-        globals().update(run_one=merge_stub, warm_all=lambda repo, b: [], after_batch=lambda repo, m, **kw: handed.append(m) or [])
+        globals().update(run_one=merge_stub, warm_all=lambda repo, b, **kw: [], after_batch=lambda repo, m, **kw: handed.append(m) or [])
         try:
             batch_world()
             land_batch("myrepo", [(job_path("myrepo", 7), read_json(job_path("myrepo", 7)), ["core/bin/cc-alpha"])])
@@ -6463,8 +6537,8 @@ def selfcheck():
         check("…and a push the remote refuses is said the same three ways, with no SHA claimed",
               made == "" and any("did not happen" in " ".join(c) for c in ran("gh", "pr", "comment", "43")))
 
-        # 11. THE LANE: two or more ordinary jobs ready → land_batch; one alone → run_one as it always was — its
-        # suite before its merge, a red a stop and not a revert.
+        # 11. THE LANE: the ordinary jobs ready → land_batch, however many; a job that is not ordinary → run_one as it
+        # always was — its suite before its merge, a red a stop and not a revert.
         batched, singles = [], []
         _bo, _lb, _ro = batch_of, land_batch, run_one
         for pr, at in ((51, "2026-09-24T12:00:00Z"), (52, "2026-09-24T12:00:01Z"), (53, "2026-09-24T12:00:02Z")):
@@ -6491,6 +6565,20 @@ def selfcheck():
             globals().update(batch_of=_bo, land_batch=_lb, run_one=_ro)
         check("a lane run with #51 and #52 ordinary and #53 not: the two land as one batch, #53 lands on its own after",
               batched == [[51, 52]] and singles == [53])
+        # Brief: "a docs or single-tool PR lands in under 15 minutes". A lone ordinary job went down the serial path,
+        # the whole suite before its merge; now it is a batch of one. Its own fixture: #56 ordinary alone, #57 not.
+        batched.clear(); singles.clear()
+        for pr, at in ((56, "2026-09-24T12:00:05Z"), (57, "2026-09-24T12:00:06Z")):
+            write_atomic(job_path("myrepo", pr), {"repo": "myrepo", "pr": pr, "queued_at": at, "attempts": 0})
+        globals().update(batch_of=lambda repo, paths: [(p, j, []) for p, j in ((p, read_json(p) or {}) for p in paths)
+                                                       if j.get("pr") == 56],
+                         land_batch=lb_stub, run_one=ro_stub)
+        try:
+            run_lane("myrepo")
+        finally:
+            globals().update(batch_of=_bo, land_batch=_lb, run_one=_ro)
+        check("…and ONE ordinary job alone is a batch of one (no suite before its merge), while #57, not ordinary, "
+              "still lands serially", batched == [[56]] and singles == [57])
         # FINDING (2026-09-24): a fix round's push re-queues its job with the same queued_at, so a live lane that had
         # already seen it never asked again, and #617/#624/#629/#635/#644 sat for hours. Now a job with a fix out is
         # taken again once its FIX_POLL wait is over — and not before, so a lane never spins on it.
@@ -6637,10 +6725,25 @@ def selfcheck():
             DOCS = [(81, S(0x81), ["docs/any/any.pdf", "docs/any/any.tex"]), (82, S(0x82), ["README.md", "x.pdf"])]
             n = open(f"{LANDQ}/queue.log").read().count("batch-suite-skipped myrepo")
             lines = batch_suite("myrepo", DOCS, "b14")
-            check("a batch whose merged diff is docs only (docs/, *.md, *.pdf) runs no suite and installs nothing: "
+            check("a batch whose merged diff is prose only (docs/, *.md, *.pdf) runs no suite and installs nothing: "
                   "the lane is free at once, and one queue.log line says why",
                   not spawned and not handed and "no suite" in lines[0] and not suites_pending("myrepo")
                   and open(f"{LANDQ}/queue.log").read().count("batch-suite-skipped myrepo") == n + 1)
+            # Added scope (owner, 2026-09-25): "Instructions, policy files and templates are not prose and keep their
+            # tests." Each is a batch of its own beside the same prose, and each runs the suite.
+            for kept in ("CLAUDE.md", "home/CLAUDE.md", "core/templates/home/WORKING.md", "config/threads-rules.md",
+                         "core/skills/email-explanation/SKILL.md", ".claude/agents/x.md", "docs/REVIEW.md",
+                         "core/tests/README.md"):
+                spawned.clear()
+                bid = f"b14-{kept.replace('/', '-')}"
+                lines = batch_suite("myrepo", DOCS + [(84, S(0x84), [kept])], bid)
+                check(f"…but {kept} among the prose is not prose: the suite runs", spawned == [suite_path("myrepo", bid)])
+                with contextlib.suppress(OSError):
+                    os.unlink(suite_path("myrepo", bid))
+            spawned.clear()
+            check("…and prose_only answers the same outside a batch: docs/, a README, a PDF are prose; nothing is not",
+                  prose_only(["docs/a.md", "core/README.md", "docs/x/y.tex", "z.pdf"]) and not prose_only([])
+                  and not prose_only(["docs/a.md", "core/bin/cc-alpha"]))
             CODE = DOCS + [(83, S(0x83), ["core/bin/cc-alpha"])]
             lines = batch_suite("myrepo", CODE, "b15")
             rec = read_json(suite_path("myrepo", "b15")) or {}
