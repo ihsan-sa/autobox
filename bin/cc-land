@@ -7,8 +7,9 @@
   cc-land <repo> <pr-number> --full-gates         …every gate, instead of the ones the diff has earned
   cc-land <repo> <pr-number> --warm               a batch's first pass, which `work` runs WARM_SLOTS at a time (never a
                                                   hand's): the worker's own green for the head, the static gates on
-                                                  the merge with the read beside them, no suite and no merge; what it
-                                                  found is written on the PR's queue job for the merge pass
+                                                  the merge with the read beside them, no merge; the suite runs only
+                                                  where the head has no worker green, on the merge, in the warm; what
+                                                  it found is written on the PR's queue job for the merge pass
   cc-land record <repo> <pr> <verdict> --by <who> [--head <sha>] [--findings <text>|-]
                                                   write down a review that already happened, against the change the
                                                   PR is at now (--head: the SHA you read, refused if it has moved).
@@ -38,13 +39,21 @@
                                                   branch, files disjoint from each other —
                                                   land as ONE BATCH when two or more are ready: their warms side by
                                                   side (--warm, WARM_SLOTS at once), their merges one at a time in
-                                                  queue order, then ONE suite on the base; green installs the lot, red
+                                                  queue order, then ONE suite on the base, run BESIDE the lane so the
+                                                  next batch starts at once (`cc-land batch-suite`, one per repo at a
+                                                  time), and none when what merged is docs only (docs/, *.md, *.pdf);
+                                                  it runs at the batch's own last merge, or at an earlier suite's
+                                                  revert past it; green installs the tip it ran on, never origin's
+                                                  (unless another batch is merging or its suite waits: that one
+                                                  installs, and a lone landing's install waits for it too), red
                                                   is believed on a second run, bisected over the squashes provably on
                                                   the base since the batch began (the last is always run: green there
                                                   reverts nobody), and the breaker is REVERTED and told so (its PR,
-                                                  its thread, the seat). A lane cut off before that suite leaves a
-                                                  note the next sweep resumes.
-                                                  Every other job — one alone, a gate-first path, no worker green —
+                                                  its thread, the seat). A lane cut off before that suite, or a suite
+                                                  whose process died, leaves a note the next sweep resumes. A job
+                                                  whose PR is closed, or merged and already installed, is dropped,
+                                                  with one queue.log line.
+                                                  Every other job — one alone, a gate-first path —
                                                   is gated, reviewed, merged and deployed before the next of that repo
                                                   is touched. A job survives a usage-limit review (waits for
                                                   the reset) and a red gate (3 tries, 15 min apart); a LAND-AFTER-FIX
@@ -225,6 +234,7 @@ FIX_MODEL = os.environ.get("CC_LAND_FIX_MODEL") or "claude-opus-5-5"   # the wor
 FIX_LOOP, FIX_BUDGET = "1", "12"          # one repair round (--no-extend), resuming the worker's own session (--resume-last)
 FIX_WAIT = 5400                           # how long the fix has to push before the owner is told it did not
 FIX_POLL = 300                            # …and how often the queue asks whether it has
+LOCK_WAIT = 30                            # how long a short step waits for a PR's lock another short step holds (take_within)
 # Root work is the change (the PR), not the SHA or the job, which restart per round and bound nothing. These two numbers are the bound, in a file that outlives the job (docs/architecture-usage-efficiency-audit-2026-09-02.md, P0).
 ROOT_REVIEWS = 1        # routine paid reviews per change; a repair round earns one more, --re-review is unbounded (reads_earned)
 ROOT_REPAIRS = 1        # …and repair rounds per change: the fix that answers a LAND-AFTER-FIX, whoever pushed it; a second stop goes to a person
@@ -248,6 +258,10 @@ class Failed(Exception):
 
 class Skip(Exception):
     """A step with nothing to do here (no Slack, no board row, no ledger row). Reported; the sequence goes on."""
+
+
+class Waits(Skip):
+    """A step whose wait is every later step's too — a PR's install while a batch's suite is still owed on the base (install_waits). Reported like a Skip; nothing after it runs, and the landing is not a stop."""
 
 
 class GateStopped(Exception):
@@ -1066,6 +1080,17 @@ class pr_lock:
                                      "flags": self.flags}).encode())
         return ""
 
+    def take_within(self, secs):
+        """take(), asked again once a second for up to `secs`: for a caller whose own step is seconds long and must
+        not lose to another that is too — a re-queue arriving while a result is said (gave_up), a batch mark taken
+        off a kept member (unbatch). '' when held; else the holder's line."""
+        until = time.time() + secs
+        while True:
+            other = self.take()
+            if not other or time.time() >= until:
+                return other
+            time.sleep(1)
+
     def release(self):
         if self.fd is not None:
             fd, self.fd = self.fd, None
@@ -1619,7 +1644,9 @@ class Land:
         self.warm_only = False   # --warm: the static gates and the read, no merge, the outcome written on the job (warm_done)
         self.warm = None         # …and, in the batch's merge pass, what that warm wrote (spend_warm)
         self.warm_base = ""      # …the base SHA the warm's merge was built on, for the pass that spends it
+        self.warm_suites = []    # …and the suites the head has no worker green for, which the warm's gates run itself
         self.batch = ""          # the batch this landing merges with: its deploy waits for the batch's suite (after_batch)
+        self.deploy_waits = ""   # …or why a landing's own install stood down for a batch's suite (install_waits)
 
     def base(self):
         if self.member and self.mtrack:   # the project's repository, not the workspace's board: what the PR says
@@ -2067,12 +2094,14 @@ class Land:
         tier, why = self.tier_for()
         if self.warm_only and tier != "docs":
             # Brief: "lands on its worker's own green plus a static check of about 2 min" — the suite is the base's
-            # to run after the batch, not this warm's.
-            tier, why = "warm", f"the static gates on the merge; the suite runs on {self.base()} after the batch ({why})"
+            # to run after the batch, not this warm's, unless the head has no worker green for it (worker_green).
+            own = f" and {', '.join(self.warm_suites)}, which the head has no worker green for," if self.warm_suites else ""
+            tier, why = "warm", f"the static gates{own} on the merge; the suite runs on {self.base()} after the batch ({why})"
         if self.pr:
             tmp, tree = self.head_checkout("gates", fetch=False, at=at)
         try:
-            found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK) and (tier not in ("docs", "warm") or g not in SUITE)]
+            found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK)
+                     and (tier not in ("docs", "warm") or g not in SUITE or (tier == "warm" and g in self.warm_suites))]
             if not found and tier == "warm":
                 raise Skip(f"no static gate in {self.repo} — the suite is its only gate, and that runs on {self.base()} after the batch")
             if not found:
@@ -2189,7 +2218,7 @@ class Land:
                           [p for _, p in self.changed_files()])
 
     def worker_green(self):
-        """--warm's first step: the worker's own green for THIS head, or the PR is not ordinary and lands on its own with every gate first. The record is keyed on the HEAD's tree — what the worker's cc-green filed; the merge's tree is other content — unscoped, or scoped to exactly this diff (green_run)."""
+        """--warm's first step: the worker's own green for THIS head, keyed on the HEAD's tree — what the worker's cc-green filed; the merge's tree is other content — unscoped, or scoped to exactly this diff (green_run). A suite with no such record is not a demotion: it goes on self.warm_suites and the warm's gates run it on the merge, beside the static ones, so the PR stays in the batch on a suite run it paid for here (13 of 14 warms fell to the serial path on this, 2026-09-24). A head that is not ordinary (ordinary_at_head) still stops the warm at `warm`."""
         self.fetch_head()
         if self.held():
             raise Failed(self.held())
@@ -2197,11 +2226,12 @@ class Land:
         rc, o = sh(["git", "rev-parse", f"{self.head}^{{tree}}"], cwd=self.root)
         tree = o.strip() if not rc else ""
         suites = [g for g in SUITE if not sh(["git", "cat-file", "-e", f"{self.head}:{g}"], cwd=self.root)[0]]
-        missing = [g for g in suites if not green_run(tree, g, self.gate_scope())]
-        if missing:
-            raise Failed(f"no green record of the worker's own for {', '.join(missing)} on the head {self.head[:12]} "
-                         f"(tree {tree[:12] or '?'}) — not ordinary: it lands on its own, every gate first",
-                         short="no worker green for the head")
+        # Brief: "A missing worker green should cost a suite run in the warm, not demote the PR to serial for good."
+        self.warm_suites = [g for g in suites if not green_run(tree, g, self.gate_scope())]
+        if self.warm_suites:
+            return (f"no green record of the worker's own for {', '.join(self.warm_suites)} on the head "
+                    f"{self.head[:12]} (tree {tree[:12] or '?'}), so the warm's gates run it on the merge (unless the "
+                    f"diff's tier is docs), and the suite still runs on {self.base()} after the batch")
         if not suites:
             return f"no suite at the head of PR #{self.pr}: nothing for a worker to have run"
         return (f"the worker's own green stands for {', '.join(suites)} on the head {self.head[:12]} "
@@ -2253,7 +2283,7 @@ class Land:
                 f"unrun and the suite runs on {self.base()} once the batch has merged")
 
     def warm_done(self, rc):
-        """Write what the warm found on the PR's queue job, for the batch's merge pass (spend_warm): the head and base it was about, whether it passed, and where it stopped. A stop at `warm` (no worker green) marks the job not ordinary, so batch_of leaves it to the serial path."""
+        """Write what the warm found on the PR's queue job, for the batch's merge pass (spend_warm): the head and base it was about, whether it passed, and where it stopped. A stop at `warm` (the head is not ordinary: ordinary_at_head) marks the job so, and batch_of leaves it to the serial path; a head with no worker green is not a stop — its warm ran the suite (worker_green)."""
         path = job_path(self.repo, self.pr)
         job = read_json(path)
         if job is None:
@@ -2472,15 +2502,26 @@ class Land:
 
     # -- 7. pull, install, daemon-reload -------------------------------------------------------------------
     def install(self):
-        """Pull the default branch (~/bin points into this checkout) and run install.sh, which links a file the change added; record the applied SHA."""
+        """Pull the default branch (~/bin points into this checkout) and run install.sh, which links a file the change added; record the applied SHA. A deploy job (span) moves the checkout to the tip it was queued for and no further: a batch's install is of the tip its suite proved (deploy_due), and origin may hold merges since that no suite has passed. A PR's pull is of origin's tip, so it stands down while a batch's suite is owed (install_waits): ~/bin would run that batch's merges before the suite passed them, and a red suite's revert would come after the install (review of #660)."""
         rc, o = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.root)
         cur = o.strip()
         if rc or cur != self.base():
             raise Failed(f"{self.root} is on '{cur}', not '{self.base()}' — land from the default-branch checkout")
+        waits = install_waits(self.repo) if self.pr else ""
+        if waits:
+            self.deploy_waits = waits
+            raise Waits(f"not installed yet: {waits}, and a pull now would put what no suite has passed live. That "
+                        f"suite's install is of the tip it proved; the catch-up installs this merge once no batch's "
+                        f"suite is owed")
         with git_lock(self.root):   # a pull is a fetch: it moves refs/remotes/origin/<base>, which a sibling's fetch writes too
-            rc, o = sh(["git", "pull", "--ff-only", "-q"], cwd=self.root, timeout=300)
+            if self.span:
+                sh(["git", "fetch", "-q", "origin", self.base()], cwd=self.root, timeout=300)
+                rc, o = sh(["git", "merge", "--ff-only", "-q", self.span[1]], cwd=self.root, timeout=300)
+            else:
+                rc, o = sh(["git", "pull", "--ff-only", "-q"], cwd=self.root, timeout=300)
         if rc:
-            raise Failed(f"git pull --ff-only in {self.root}: {last(o)}")
+            how = f"merge --ff-only {self.span[1][:12]}" if self.span else "pull --ff-only"
+            raise Failed(f"git {how} in {self.root}: {last(o)}")
         # What is installed, written down (record_applied): the next catch-up compares origin against it. Recorded once install.sh has run, or right after the pull for a repo with none.
         def note():
             rc, o = sh(["git", "rev-parse", "HEAD"], cwd=self.root)
@@ -2740,6 +2781,8 @@ class Land:
                 out("✓", fn())
             except Skip as e:
                 out("·", str(e))
+                if isinstance(e, Waits):
+                    break                # the deploy is not this landing's yet: no unit, restart or check on old code
             except Failed as e:
                 out("✗", f"{name}: {e}")
                 self.stopped, self.why, self.why_short = name, str(e), getattr(e, "short", "")
@@ -3112,6 +3155,9 @@ def result_of(L, rc, job, tail):
     if rc == 0 and L.batch:
         short = (f"{what}: landed ✅. I {on()}. It's merged with its batch; the suite runs on {L.base()} now, "
                  f"and the box installs the batch when that is green.")
+    elif rc == 0 and L.deploy_waits:
+        short = (f"{what}: landed ✅. I {on()}. It's merged, but not installed yet: a batch's suite is still owed on "
+                 f"{L.base()}, and the box installs this once that has passed.")
     elif rc == 0:
         short = f"{what}: landed ✅. I {on()}. It's merged and deployed, and its check passed here."
     elif rc == COSMETIC:
@@ -3634,18 +3680,20 @@ def red_base_path(repo):
     return f"{LANDQ}/{repo}.red"
 
 
-def deploy_due(repo, by="the catch-up sweep"):
-    """Queue a deploy for `repo` when its origin default branch has moved past the SHA install.sh last ran on, as the job's path, or '' when nothing is owed (or a deploy job already waits, or the tip is one after_batch found RED — a red base is said, never installed behind the batch's back). The catch-up sweep's per-repo step, and the batch's own deploy (after_batch)."""
+def deploy_due(repo, by="the catch-up sweep", tip=""):
+    """Queue a deploy for `repo` when its origin default branch has moved past the SHA install.sh last ran on, as the job's path, or '' when nothing is owed (or a deploy job already waits, or the tip is one after_batch found RED — a red base is said, never installed behind the batch's back). The catch-up sweep's per-repo step, and the batch's own deploy (after_batch), which names the `tip` its suite proved: the job installs that one (install), never origin's."""
     root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
     if not os.path.isdir(f"{root}/.git") or os.path.exists(job_path(repo, "deploy")):
         return ""
-    with git_lock(root):    # the fetch writes refs/remotes/origin/<base> and the rev-parse reads it back
-        if sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=60)[0]:
-            return ""                                    # no remote, no network: nothing to compare against
-        rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
-    if rc:
-        return ""
-    tip, have = o.strip(), applied_sha(repo)
+    if not tip:
+        with git_lock(root):    # the fetch writes refs/remotes/origin/<base> and the rev-parse reads it back
+            if sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=60)[0]:
+                return ""                                # no remote, no network: nothing to compare against
+            rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
+        if rc:
+            return ""
+        tip = o.strip()
+    have = applied_sha(repo)
     if not have:
         # Nothing recorded yet, so read it off the checkout, and only while it is on the default branch.
         if sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root)[1].strip() != base:
@@ -3659,8 +3707,8 @@ def deploy_due(repo, by="the catch-up sweep"):
         return ""
     if (read_json(red_base_path(repo)) or {}).get("tip") == tip:
         return ""       # the batch's suite found this tip red and said so: a person moves it, not the poll
-    if by == "the catch-up sweep" and os.path.exists(batch_path(repo)):
-        return ""       # a batch has merged without its suite yet: its lane runs that suite and installs on green
+    if by == "the catch-up sweep" and (os.path.exists(batch_path(repo)) or suites_pending(repo)):
+        return ""       # a batch has merged without its suite yet: that suite (batch_suite) installs on green
     write_atomic(job_path(repo, "deploy"),
                  {"repo": repo, "pr": None, "span": [have, tip], "queued_at": stamp(), "attempts": 0,
                   "stage": "queued", "by": by,
@@ -3775,7 +3823,7 @@ def lane_jobs(repo):
 
 
 def gave_up(repo, pr, job):
-    """The PR's lock, HELD, when its job has stopped at its try cap, so a re-queue gives it a fresh start instead of 'already queued'; else None. A capped job answered every 👍 with 'again' and sat until a person deleted its file (lessons #144, 2026-09-24). Only the cap: never a job that is held (a draft, a conflict, a refused repair), one with a fix round out, one done for a reason a re-queue cannot mend (a verdict, a refused merge — `capped` marks a done job the cap alone stopped, run_job), and never while a landing or a sweep saying its result holds the PR. The caller keeps the lock until the fresh job is written and then lets it go: a sweep's finish() takes the same lock (say_alone), so its stale copy is never written back over the fresh job, nor the fresh job unlinked."""
+    """The PR's lock, HELD, when its job has stopped at its try cap, so a re-queue gives it a fresh start instead of 'already queued'; else None. A capped job answered every 👍 with 'again' and sat until a person deleted its file (lessons #144, 2026-09-24). Only the cap: never a job that is held (a draft, a conflict, a refused repair), one with a fix round out, one done for a reason a re-queue cannot mend (a verdict, a refused merge — `capped` marks a done job the cap alone stopped, run_job), and never while a landing holds the PR — a sweep saying its result holds it for seconds, and that is waited out (LOCK_WAIT). The caller keeps the lock until the fresh job is written and then lets it go: a sweep's finish() takes the same lock (say_alone), so its stale copy is never written back over the fresh job, nor the fresh job unlinked."""
     if not isinstance(job, dict) or not job.get("pr") or job.get("attempts", 0) < LAND_TRIES:
         return None                              # unreadable, a deploy job, or still under its cap: 'already queued'
     fix = job.get("fix") or {}
@@ -3784,8 +3832,8 @@ def gave_up(repo, pr, job):
     if job.get("state") == "done" and not job.get("capped"):
         return None
     lock = pr_lock(repo, pr, "queue")
-    if lock.take():
-        return None
+    if lock.take_within(LOCK_WAIT):              # a sweep saying the capped result holds it for seconds: a 👍 then
+        return None                              # waits it out, not 'already queued' (#645's security read)
     now = read_json(job_path(repo, pr))          # what it read before the lock may have been said and gone since
     if not now or now.get("queued_at") != job.get("queued_at"):
         lock.release()
@@ -3952,7 +4000,7 @@ def batch_path(repo):
 
 
 def resume_batch(repo):
-    """A batch record the lane holding the lock did not write is a batch whose lane died before its suite ran on the base: run it now, on what that batch provably merged (batch_merged), and SAY it was cut off. Returns its lines; the record goes once after_batch has spoken."""
+    """A batch record the lane holding the lock did not write is a batch whose lane died before its suite ran on the base: start it now, beside the lane (batch_suite), on what that batch provably merged (batch_merged), and SAY it was cut off. Returns its lines; the record goes once its suite is handed on (batch_suite)."""
     path = batch_path(repo)
     rec = read_json(path)
     if not isinstance(rec, dict):
@@ -3976,14 +4024,9 @@ def resume_batch(repo):
     for pr, _ in members:
         # A member still queued (cut off mid-merge, or kept) lands next on its own: every gate and its own deploy,
         # never the dead batch's warm and deferred deploy.
-        jp = job_path(repo, pr)
-        j = read_json(jp)
-        if j and ("batch" in j or "warm" in j):
-            j.pop("batch", None); j.pop("warm", None)
-            with contextlib.suppress(OSError):
-                write_atomic(jp, j)
+        unbatch(repo, job_path(repo, pr))
     merged = batch_merged(repo, rec.get("before") or "", members, skip=set(rec.get("pre") or []))
-    lines += after_batch(repo, merged)
+    lines += batch_suite(repo, merged, rec.get("bid") or stamp())
     with contextlib.suppress(OSError):
         os.unlink(path)
     return lines
@@ -4037,8 +4080,8 @@ def revert_pr(repo, pr, sha, why):
     return made
 
 
-def after_batch(repo, merged):
-    """Phase 3, once per batch: ONE suite on the base, at its tip, scoped to the batch's paths when they fit WIDE_FILES (else everything). Green: the deploy the members skipped (deploy_due, run here). Red: believed on a second run only, then bisected to the merge that broke it (bisect_batch), that PR reverted and announced (revert_pr), and the suite run once more on what is left; still red, or a red the batch did not make, is SAID, the tip is noted for the catch-up to leave alone (red_base_path), and nothing is installed. Returns its lines."""
+def after_batch(repo, merged, tip="", record="", reverts=()):
+    """Phase 3, once per batch: ONE suite on the base, at its tip (or at `tip`, the batch's own last merge, when its suite runs beside the lane: the next batch may have merged since — or the last of `reverts`, an earlier suite's revert of a squash that merge still holds: run_suite_record), scoped to the batch's paths when they fit WIDE_FILES (else everything). Green: the deploy the members skipped (deploy_due, run here). Red: believed on a second run only, then bisected to the merge that broke it (bisect_batch), that PR reverted and announced (revert_pr), and the suite run once more on what is left; still red, or a red the batch did not make, is SAID, the tip is noted for the catch-up to leave alone (red_base_path), and nothing is installed. Returns its lines."""
     lines = []
     if not merged:
         return lines
@@ -4047,7 +4090,7 @@ def after_batch(repo, merged):
     with git_lock(root):
         sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=120)
         rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
-    tip = o.strip() if not rc else ""
+    tip = tip or (o.strip() if not rc else "")
     if not tip:
         return [f"[{repo}] batch: origin/{base} could not be read after the merges — nothing installed; the catch-up deploys it"]
     files = sorted({p for _, _, fs in merged for p in fs})
@@ -4058,6 +4101,17 @@ def after_batch(repo, merged):
     if not ok:
         ok, why2, log = suite_on(repo, tip, scope, step="suite2")    # a red is believed on the second run only
         why = why2 if not ok else why
+    if not ok and reverts:
+        # The batch's own merges all predate that revert, so each still holds what it took out: a bisect over them
+        # would find that red, not this batch's, and call the base red before the batch after several full runs.
+        write_atomic(red_base_path(repo), {"tip": tip, "at": stamp(), "why": why})
+        text = (f"[{repo}] {base} is red at {tip[:12]} after the batch ({prs}) — {why}. That tip carries the revert "
+                f"{', '.join(r[:12] for r in reverts)}, which this batch's merges predate, so no bisect over them can "
+                f"name a PR: nothing reverted, nothing installed, until a person mends {base}.")
+        ledger(f"batch-red {repo} tip={tip[:12]} past-revert — {why[:200]}")
+        notify("--route", f"[{repo}] batch stopped", "--id", f"land:{repo}:batch:red@{tip[:12]}", text, timeout=60)
+        sh([f"{BIN}/cc-slack", "inject", repo, text[:300]], timeout=120)
+        return lines + [text]
     if not ok:
         lines.append(f"[{repo}] batch ({prs}): the suite on {base} at {tip[:12]} is red twice — {why}; bisecting")
         kind, hit = bisect_batch(repo, merged, scope, tip=tip)
@@ -4090,15 +4144,226 @@ def after_batch(repo, merged):
             return lines + [text]
     with contextlib.suppress(OSError):
         os.unlink(red_base_path(repo))
+    waits = install_waits(repo, record)
+    if waits:
+        # A later batch is merging, or its suite waits on this one (run_suite_record): that suite installs a tip
+        # holding this one when it is green, or the catch-up does once none is owed (review of #660: the note too).
+        lines.append(f"[{repo}] batch ({prs}): the suite on {base} at {tip[:12]} is green — {why}; not installed "
+                     f"here, because {waits}: a later batch's suite installs")
+        return lines
     lines.append(f"[{repo}] batch ({prs}): the suite on {base} at {tip[:12]} is green — {why}; installing")
-    path = deploy_due(repo, by=f"the batch {prs}")
+    path = deploy_due(repo, by=f"the batch {prs}", tip=tip)
     if path:
-        lines.append(run_one(path))
+        lines.append(install_beside(repo, path))
     return lines
 
 
+def install_beside(repo, path):
+    """The batch's install from a suite that ran beside the lane (batch_suite): run_one on the deploy job under the lane's own flock, so it never runs beside a landing of the same repo. A lane holding that flock takes the job itself on its next look — a new job is a new key (_run_lane)."""
+    os.makedirs(lane_dir(), exist_ok=True)
+    lock = open(lane_file(repo, "lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return f"[{repo}] the install is queued, and the {repo} lane running now takes it on its next look"
+    try:
+        return run_one(path)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def suite_path(repo, bid):
+    """Where a batch's suite waits and runs beside the lane (batch_suite): the batch's merges, one file per batch, so the next batch's note never lands on it. Not `.json`: the queue's glob must never read it as a job."""
+    return f"{LANDQ}/{repo}.{re.sub(r'[^A-Za-z0-9_-]+', '-', bid)}.suite"
+
+
+def suites_pending(repo=None):
+    """The suite records waiting or running, as [(path, record)] — one repo's, or every repo's when None."""
+    got = []
+    for p in sorted(glob.glob(f"{LANDQ}/*.suite")):
+        rec = read_json(p)
+        if isinstance(rec, dict) and rec.get("repo") and (repo is None or rec["repo"] == repo):
+            got.append((p, rec))
+    return got
+
+
+def install_waits(repo, record=""):
+    """Why an install must wait, or '': a batch is merging onto the base (its note), or has merged and its suite is waiting or running (a suite record). A PR landing's pull then would put merges no suite has passed live (install). A green suite asks it too, with its own `record`, which — and whose batch's note, still there while a resumed batch hands its suite on — is not counted: then a later batch's suite installs (after_batch)."""
+    mine = (read_json(record) or {}).get("bid") if record else None
+    if os.path.exists(batch_path(repo)) and not (mine and (read_json(batch_path(repo)) or {}).get("bid") == mine):
+        return "a batch is merging onto the base and its suite has not run yet"
+    owed = [rec.get("bid") or "?" for p, rec in suites_pending(repo) if p != record]
+    if owed:
+        return f"the suite of the batch {', '.join(owed)} has not passed on the base yet"
+    return ""
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def batch_suite(repo, merged, bid):
+    """Phase 3 handed off: the batch's suite (after_batch) runs BESIDE the lane, so the next batch starts at once (owner, 2026-09-24: #651's suite held the lane from 19:42Z past 21:05Z and nothing landed for two hours). Its merges are written to suite_path first, and spawn_suite runs them there; a suite whose process dies is spawned again by the next lane (resume_suites). A batch whose merged diff has no code in it — every path docs/, *.md or *.pdf — runs no suite and installs nothing. Returns its lines."""
+    if not merged:
+        return []
+    prs = ", ".join(f"#{pr}" for pr, _, _ in merged)
+    files = sorted({p for _, _, fs in merged for p in fs})
+    # Brief: "run none when the merged diff touches no code (docs/, *.md, *.pdf)".
+    if not [p for p in files if not DOC_RE.search(p) and not p.lower().endswith(".pdf")]:
+        ledger(f"batch-suite-skipped {repo} prs={prs} — no code in the {len(files)} file(s) merged")
+        return [f"[{repo}] batch ({prs}): no code in what merged (docs only), so no suite and nothing to install"]
+    path = suite_path(repo, bid)
+    write_atomic(path, {"repo": repo, "bid": bid, "merged": merged, "at": stamp()})
+    ledger(f"batch-suite-beside {repo} {bid} prs={prs}")
+    return spawn_suite(repo, path)
+
+
+def spawn_suite(repo, path):
+    """The batch's suite as a process of its own: this tool again, `batch-suite <repo> <record>`, in a session of its own so the lane's end does not end it. Returns the lane's lines. The seam the selfcheck runs the suite inline through."""
+    log = path + ".log"
+    try:
+        p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "batch-suite", repo, path],
+                             stdin=subprocess.DEVNULL, stdout=open(log, "a"), stderr=subprocess.STDOUT, cwd=HOME,
+                             start_new_session=True)
+    except OSError as e:
+        return [f"[{repo}] the batch's suite would not start beside the lane ({e}) — the next lane starts it"]
+    rec = read_json(path) or {}
+    if not rec.get("pid"):
+        with contextlib.suppress(OSError):
+            write_atomic(path, dict(rec, pid=p.pid))
+    return [f"[{repo}] the batch's suite runs beside the lane (pid {p.pid}, log {log}); the next batch goes on"]
+
+
+def run_suite_record(repo, path):
+    """The suite at `path` (batch_suite), one at a time per repo under the lane's `suite` flock: after_batch on its merges, then the record goes. Returns after_batch's lines."""
+    os.makedirs(lane_dir(), exist_ok=True)
+    lock = open(lane_file(repo, "suite"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)          # the batch before this one's suite first: installs stay in order
+        rec = read_json(path)
+        if not isinstance(rec, dict) or rec.get("repo") != repo:
+            return []                             # run already, by a process that finished while this one waited
+        with contextlib.suppress(OSError):
+            write_atomic(path, dict(rec, pid=os.getpid()))
+        merged = [tuple(m) for m in rec.get("merged") or []]
+        tip = merged[-1][1] if merged else ""
+        # An earlier batch's suite, run while this one waited, may have reverted a squash this batch merged on top of:
+        # the revert lands after these merges, so the suite runs where the base holds it, not at the last merge,
+        # which would go red on that PR's defect (review of #660).
+        reverts = reverts_since(repo_root(repo), tip, base_tip(repo)) if tip else []
+        lines = after_batch(repo, merged, tip=reverts[-1] if reverts else tip, record=path, reverts=reverts)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        return lines
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def reverts_since(root, sha, tip):
+    """The commits in sha..tip that revert a commit `sha` holds — read off `git revert`'s own "This reverts commit <sha>." line, which revert_pr's commits carry — oldest first. [] when git cannot say."""
+    if not sha or not tip:
+        return []
+    rc, o = sh(["git", "log", "--reverse", "--format=%H%x1f%B%x1e", f"{sha}..{tip}"], cwd=root, timeout=60)
+    if rc:
+        return []
+    got = []
+    for entry in o.split("\x1e"):
+        h, _, body = entry.strip().partition("\x1f")
+        m = re.search(r"This reverts commit ([0-9a-f]{40})", body)
+        if re.fullmatch(r"[0-9a-f]{40,64}", h) and m and is_ancestor(root, m.group(1), sha):
+            got.append(h)
+    return got
+
+
+def resume_suites(repo):
+    """A suite record whose process is gone (no pid, or a dead one) is a batch's suite that never spoke: start it again beside the lane. Returns the lines."""
+    lines = []
+    for path, rec in suites_pending(repo):
+        if rec.get("pid") and pid_alive(rec["pid"]):
+            continue
+        ledger(f"batch-suite-resume {repo} {rec.get('bid', '?')} — its process is gone")
+        with contextlib.suppress(OSError):
+            write_atomic(path, {k: v for k, v in rec.items() if k != "pid"})
+        lines += spawn_suite(repo, path)
+    return lines
+
+
+def cmd_batch_suite(argv):
+    """`batch-suite <repo> <record>`: what spawn_suite starts. The record must be a suite_path in the queue."""
+    if len(argv) != 2 or os.path.dirname(os.path.abspath(argv[1])) != os.path.abspath(LANDQ) \
+            or not os.path.basename(argv[1]).startswith(argv[0] + ".") or not argv[1].endswith(".suite"):
+        return refuse("usage: cc-land batch-suite <repo> <queue>/<repo>.<batch>.suite")
+    for line in run_suite_record(argv[0], argv[1]):
+        print(line)
+    with contextlib.suppress(OSError):
+        os.unlink(argv[1] + ".log")               # it spoke: what it said is in the queue log; a crash keeps the log
+    return 0
+
+
+def gone_why(repo, pr):
+    """Why the job of PR `pr` has nothing left to do, or '': CLOSED unmerged, or MERGED with its squash already in what install.sh last ran on (applied_sha), so a deploy would reinstall what is there. A merged PR whose install is still owed is not gone: run_one takes it straight to the deploy (a job killed after its merge). '' too when gh or git could not answer, so a job is never dropped on a read that failed."""
+    root = repo_root(repo)
+    facts = pr_facts(root, pr, "state,mergeCommit", timeout=60)[0] or {}
+    st = (facts.get("state") or "").upper()
+    if st == "CLOSED":
+        return "the PR is closed, unmerged"
+    sha, have = (facts.get("mergeCommit") or {}).get("oid") or "", applied_sha(repo)
+    if st == "MERGED" and sha and have and not sh(["git", "merge-base", "--is-ancestor", sha, have], cwd=root)[0]:
+        return f"the PR is merged and {sha[:12]} is already installed (at {have[:12]})"
+    return ""
+
+
+def drop_gone(repo, path):
+    """Drop the job at `path` when its PR has nothing left to land (gone_why), with one queue.log line: the lane would spend full gates or a reinstall on it (#630 #632 #636 #637 closed and #639 #640 #641 #643 merged sat queued, 2026-09-24). Under the PR's lock and only while the file is still that job (same_job); a job a landing holds is left to it. Never a job whose state is done: it is kept to SAY its result (finish, after Slack refused the post), and its PR is merged and installed by then, so gone_why would drop the landed card unsaid (review of #660). True when dropped."""
+    job = read_json(path) or {}
+    if not job.get("pr") or job.get("state") == "done":
+        return False
+    why = gone_why(repo, job["pr"])
+    if not why:
+        return False
+    lock = pr_lock(repo, job["pr"], "queue")
+    if lock.take():
+        return False
+    try:
+        if not same_job(path, job):
+            return False
+        os.unlink(path)
+        ledger(f"dropped {repo}#{job['pr']} — {why}, so there is nothing to land "
+               f"(queued {job.get('queued_at', '?')}, stage {job.get('stage', '?')})")
+        return True
+    finally:
+        lock.release()
+
+
+def unbatch(repo, path, job=None):
+    """Take a batch's `batch` and `warm` marks off the member job at `path`, if it is still queued — under the PR's lock (take_within), and only while the file is still `job` (same_job; any job when None): a re-queue writes its fresh job under that lock, and a copy read before it must never be written back over it (#645's security read)."""
+    j = read_json(path)
+    if not j or not j.get("pr") or not ("batch" in j or "warm" in j):
+        return
+    lock = pr_lock(repo, j["pr"], "queue")
+    other = lock.take_within(LOCK_WAIT)
+    try:
+        j = read_json(path)                      # read again under the lock: what was there may have been re-queued
+        if not j or (job is not None and not same_job(path, job)):
+            return
+        if other:
+            ledger(f"unbatch {repo}#{j['pr']} without the lock — {other[:160]}")
+        j.pop("batch", None); j.pop("warm", None)
+        with contextlib.suppress(OSError):
+            write_atomic(path, j)
+    finally:
+        lock.release()
+
+
 def land_batch(repo, batch):
-    """One batch, three phases: the warms side by side (warm_all); the merges one at a time in queue order, each a run_one that spends its warm (spend_warm) and skips the deploy; then after_batch, on what batch_merged proves this pass put on the base. A member whose warm found it not ordinary is left on the queue for the serial path — this lane run's next look takes it. The tip before the batch, its members and the ones already merged before it are written to batch_path first, so a lane that dies before after_batch leaves the next pass what it needs (resume_batch). Returns its lines."""
+    """One batch, three phases: the warms side by side (warm_all); the merges one at a time in queue order, each a run_one that spends its warm (spend_warm) and skips the deploy; then after_batch, on what batch_merged proves this pass put on the base, beside the lane (batch_suite). A member whose warm found it not ordinary is left on the queue for the serial path — this lane run's next look takes it. The tip before the batch, its members and the ones already merged before it are written to batch_path first, so a lane that dies before after_batch leaves the next pass what it needs (resume_batch). Returns its lines."""
     bid = stamp()
     before = base_tip(repo)
     if not before:
@@ -4121,22 +4386,18 @@ def land_batch(repo, batch):
         write_atomic(batch_path(repo), rec)   # …noted BEFORE the merge, so a death mid-merge still finds it
         job_set(path, job, batch=bid)
         lines.append(run_one(path))
-        left = read_json(path)
-        if left is not None:
-            # Kept (a retry, a hold, a fix round): the batch and its warm were THIS pass's, and the serial landing
-            # that takes it next must gate and deploy it itself — a batch mark left on would skip both.
-            left.pop("batch", None); left.pop("warm", None)
-            with contextlib.suppress(OSError):
-                write_atomic(path, left)
+        # Kept (a retry, a hold, a fix round): the batch and its warm were THIS pass's, and the serial landing that
+        # takes it next must gate and deploy it itself — a batch mark left on would skip both.
+        unbatch(repo, path, job)
     merged = batch_merged(repo, before, [(pr, fs) for pr, fs in rec["members"]], skip=set(rec["pre"]))
-    lines += after_batch(repo, merged)
+    lines += batch_suite(repo, merged, bid)
     with contextlib.suppress(OSError):
         os.unlink(batch_path(repo))
     return lines
 
 
 def run_lane(repo):
-    """Land `repo`'s jobs one at a time, oldest first, under the repo's own flock, re-reading the queue after each so a job queued meanwhile is taken now and not by the next sweep. A job is run once per lane run (keyed by path and queued_at: a kept job waits for its wake, a re-queued one is new). Returns its lines; a lane that finds the flock held stands down, since the holder re-reads the same queue."""
+    """Land `repo`'s jobs one at a time, oldest first, under the repo's own flock, re-reading the queue after each so a job queued meanwhile is taken now and not by the next sweep. A job is run once per lane run (keyed by path and queued_at: a kept job waits for its wake, a re-queued one is new) — except one waiting on its fix round, which is taken again each time its FIX_POLL wait is over, so the push it waits for is read by this lane and not hours later by the next (fix_progress). Returns its lines; a lane that finds the flock held stands down, since the holder re-reads the same queue."""
     os.makedirs(lane_dir(), exist_ok=True)
     # Every lane holds the queue's old whole-queue flock SHARED: a worker from before the lanes takes it EXCLUSIVE, so
     # the one running when this change deploys finishes its list alone, and never beside a lane of the same repo.
@@ -4161,13 +4422,24 @@ def _run_lane(repo):
     def key(p):
         return p, (read_json(p) or {}).get("queued_at", "")
 
+    def fix_due(p):
+        # Brief: "a re-queued job in stage 'fixing' whose head moved is taken by the live lane on its next pass". A
+        # fix round's push re-queues the job with its queued_at unchanged, so its key stays in `seen`: the lane sat
+        # on #617/#624/#629/#635/#644 for hours (2026-09-24). A job with a fix out is asked again once its wait is
+        # over; fix_progress then re-queues and runs it, or waits FIX_POLL more. Once per wait (`polled`): a run_one
+        # that stood down without touching it (a parked project) is not taken again until the wait changes.
+        j = read_json(p) or {}
+        fix = j.get("fix") or {}
+        return (bool(fix) and fix.get("over") is None and not stamp() < (j.get("not_before") or "")
+                and (p, j.get("not_before") or "") not in polled)
+
     def todo():
         # A batch member whose warm found it not ordinary keeps its key in `seen`; its `ordinary` mark is what the
         # next look reads, so it is taken again here — serially, every gate first — and not spun on.
-        return [p for p in lane_jobs(repo) if key(p) not in seen
+        return [p for p in lane_jobs(repo) if key(p) not in seen or fix_due(p)
                 or ((read_json(p) or {}).get("ordinary") and key(p) in seen_batch)]
 
-    seen_batch = set()
+    seen_batch, polled, asked = set(), set(), set()
 
     while True:
         lock = open(lane_file(repo, "lock"), "w")
@@ -4183,8 +4455,18 @@ def _run_lane(repo):
         try:
             if os.path.exists(batch_path(repo)):
                 lines += resume_batch(repo)      # this lane holds the lock, so the batch that wrote it is dead
+            lines += resume_suites(repo)         # …and a batch's suite whose process died is started again
             while True:
-                left = todo()
+                left = []
+                for p in todo():
+                    # Brief: "The lane drops a job whose PR is no longer open, logging one queue.log line". Asked
+                    # once per job this lane run (`asked`), and only once its wait is over: a job waiting out a
+                    # limit or a retry gap costs no gh call until it would be tried.
+                    if key(p) not in asked and not stamp() < ((read_json(p) or {}).get("not_before") or ""):
+                        asked.add(key(p))
+                        if drop_gone(repo, p):
+                            continue
+                    left.append(p)
                 if not left:
                     break
                 batch = batch_of(repo, left)
@@ -4197,6 +4479,7 @@ def _run_lane(repo):
                     continue
                 seen.add(key(left[0]))
                 seen_batch.discard(key(left[0]))   # a demoted member, once run serially, is not looked at again
+                polled.add((left[0], (read_json(left[0]) or {}).get("not_before") or ""))   # …and a fix wait, once asked
                 lines.append(run_one(left[0]))
         finally:
             with contextlib.suppress(OSError):
@@ -4242,6 +4525,9 @@ def cmd_work(argv):
             repo = os.path.basename(path)[:-len(".batch")]
             if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo) and repo not in repos:
                 repos.append(repo)               # a batch cut off before its suite: its lane runs that suite (resume_batch)
+        for _, rec in suites_pending():
+            if not (rec.get("pid") and pid_alive(rec["pid"])) and rec["repo"] not in repos:
+                repos.append(rec["repo"])        # a batch's suite whose process died: its lane starts it again
         mine = []
         for repo in repos:
             if sweep_running(repo):
@@ -4511,7 +4797,8 @@ def cmd_selfcheck():
 
 def main(argv):
     default_signals()                      # once, on the main thread: every gate and reviewer below inherits it
-    cmd = {"selfcheck": lambda a: cmd_selfcheck(), "record": cmd_record, "queue": cmd_queue, "work": cmd_work}
+    cmd = {"selfcheck": lambda a: cmd_selfcheck(), "record": cmd_record, "queue": cmd_queue, "work": cmd_work,
+           "batch-suite": cmd_batch_suite}
     if argv[:1] != ["selfcheck"]:          # the selfcheck keeps its own fixture temp root
         use_scratch()
     if argv and argv[0] in cmd:

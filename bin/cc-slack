@@ -383,8 +383,7 @@ def ask_line(a):
         return ""
     if a.get("result") == "not-the-seat":
         return f"\n\nANSWER NOT CARRIED: this thread is {a.get('target')}'s ask, and only a {CTL} session's reply in it reaches that workspace"
-    where = f"#{a['name']}" if a.get("name") else f"{a.get('target')}'s session"
-    return f"\n\nANSWER CARRIED: posted in {where} and handed to {a.get('target')} ({a.get('result')})"
+    return f"\n\nANSWER CARRIED: handed to {a.get('target')}'s session ({a.get('result')}); nothing posted in its channel"
 
 def mentions_line(ms):
     """The poster's result line for route_mentions: where each @alias went, loud when nobody took it."""
@@ -6451,7 +6450,7 @@ class Daemon:
         lane = "#" + (self.chan_name(chat) or threads_name(CTL))
         # A person reads the card, so it carries no warning meant for a session: ASK_HEAD goes to the session's copy below.
         card_text = (f"🙋 {who} asks" + (f": *{title}*" if title else "") + f"\n{text}\n"
-                     f"Reply in this thread and the box passes it to {h}'s session in #{h}.")
+                     f"Reply in this thread and the box passes it to {h}'s session.")
         card = self.say(chat, card_text)
         if not card:
             return {"ok": False, "error": f"{lane} did not take the card — nothing was posted"}
@@ -6463,11 +6462,11 @@ class Daemon:
                 "channel": lane, "target": CTL}
         res = self.deliver(CTL, {"type": "message", "meta": meta,
                                  "content": f"{self.ASK_HEAD}{who} asks" + (f" — *{title}*" if title else "") + f": {text} "
-                                            f"— answer in this thread (the card in {lane}); the box carries your reply to #{h}."},
+                                            f"— answer in this thread (the card in {lane}); the box hands your reply to {h}'s session, not its channel."},
                            autostart=False)
         log(f"ask from {h}: card {chat}/{card}, told {CTL} ({res})")
-        return {"ok": True, "card": card, "text": f"asked in {lane} ({CTL} {res}): the answer comes to #{h}, handed to "
-                                                  f"your session — do not ask the owner to relay it"}
+        return {"ok": True, "card": card, "text": f"asked in {lane} ({CTL} {res}): the answer is handed to your "
+                                                  f"session as a turn — do not ask the owner to relay it"}
 
     def ask_sweep(self, now=None):
         """An ask thread stops carrying replies at ASK_STALE; the table never holds more than ASK_MAX (oldest out)."""
@@ -6512,22 +6511,20 @@ class Daemon:
         return self.answer_ask(chat, thread, text, f"{seat[0]}@{seat[1]}" if seat[1] else seat[0])
 
     def answer_ask(self, chat, thread, text, frm):
-        """The other direction of relay_ask: a reply in an ask card's thread is posted into the member's own channel
-        (💬, the replier named, the thread linked) and handed to its session as wake_channel hands a post — the one
-        place it can read. The entry stays: a thread carries follow-ups until ask_sweep retires it."""
+        """The other direction of relay_ask: a reply in an ask card's thread is handed to the member's session as a
+        local turn (chat_id "local"), the replier named. Nothing is posted in the member's channel: that is the people's
+        channel, and session-to-session traffic stays out of it (owner, 2026-09-23). The entry stays: a thread carries
+        follow-ups until ask_sweep retires it."""
         ask = self.member_asks[str(thread)]
         h = ask["h"]
-        mchat = self.member_chat(h)
-        link = self.permalink(chat, thread) if mchat else ""
         body = re.sub(r"@(?=[A-Za-z0-9])", "@\u200b", text)   # an @ in the seat's words is a name here, never a hand-off
-        line = (f"💬 {frm} answered your ask" + (f" *{ask['title']}*" if ask.get("title") else "")
-                + (f" (<{link}|thread>)" if link else "") + ":\n" + body)   # what the member reads; the hint is the session's
-        posted = self.say(mchat, line) if mchat else None
-        meta = {"chat_id": mchat or "local", "thread_ts": posted or "", "ts": posted or "", "user": "box", "role": "owner",
-                "channel": "#" + ((self.chan_name(mchat) if mchat else None) or h), "target": h, "from": frm}
-        res = self.deliver(h, {"type": "message", "content": line + "\n(A follow-up is another `cc-slack ask`.)", "meta": meta})
-        log(f"ask {h} answered by {frm} in {chat}/{thread}: posted={bool(posted)} {res}")
-        return {"target": h, "result": res, "name": self.chan_name(mchat) if mchat else None}
+        line = (f"💬 {frm} answered your ask" + (f" *{ask['title']}*" if ask.get("title") else "") + ":\n" + body
+                + "\n(A follow-up is another `cc-slack ask`.)")
+        meta = {"chat_id": "local", "thread_ts": "", "ts": str(time.time()), "user": "box", "role": "owner",
+                "channel": "#" + (self.chan_name(chat) or "local"), "target": h, "from": frm}
+        res = self.deliver(h, {"type": "message", "content": line, "meta": meta})
+        log(f"ask {h} answered by {frm} in {chat}/{thread}: {res}")
+        return {"target": h, "result": res}
 
     def default_chat(self, target):
         """Where to reach the owner about `target` with no thread remembered: its own channel (#repo; a track's is the
@@ -8538,8 +8535,8 @@ def main(argv):
     elif cmd in ("escalate", "ask"):
         # escalate: member boundary lacks ~/.cc/config, so the daemon makes the push call and tells the OWNER.
         # ask: the workspace's question to the box's PLANNING SEAT (a repo, a host-side push, a question) — the daemon
-        # posts the card in the control repo's -threads lane on its behalf and carries the thread's answer back to
-        # #<workspace> (Daemon.relay_ask / answer_ask). Same -t title; `-p` is escalate's and dropped either way.
+        # posts the card in the control repo's -threads lane on its behalf and hands the thread's answer back to the
+        # workspace's session, never its channel (Daemon.relay_ask / answer_ask). Same -t title; `-p` is escalate's and dropped either way.
         title, args = "", []
         i = 0
         while i < len(rest):

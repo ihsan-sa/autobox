@@ -6458,7 +6458,7 @@ def run_selfcheck():
         # card lands in the control repo's -threads lane (a channel alice may neither read nor post) and is handed to the
         # control session; the lane never being hers, this is the daemon posting ON HER BEHALF, as a 🔐 prompt is. Back:
         # a reply in the card's thread — the seat's, through the door its reply tool already hops to (mention), or the
-        # owner's, typed — is posted into #alice and handed to her session; another repo's seat in that thread is not.
+        # owner's, typed — is handed to her session as a local turn and posted NOWHERE; another repo's seat is not carried.
         dmMS.threads_chats[CTL] = "CTHR"; dmMS.names["CTHR"] = f"{CTL}-threads"
         askedMS, _delA, _pmA = [], dmMS.deliver, dmMS.permalink
         dmMS.deliver = lambda target, payload, autostart=True, alias=None: askedMS.append((target, payload, autostart)) or "delivered"
@@ -7093,7 +7093,7 @@ def run_selfcheck():
           r_ask.get("ok") and r_ask.get("card") == "5.5" and "do not ask the owner to relay" in r_ask.get("text", "")
           and len(card_ask) == 1 and card_ask[0][0] == "CTHR" and card_ask[0][1].startswith("🙋 `alice` asks: *a repo*\n")
           and "UNTRUSTED" not in card_ask[0][1] and "&lt;!channel&gt; ping @\u200bowner '''" in card_ask[0][1]
-          and "passes it to alice's session in #alice." in card_ask[0][1]
+          and "passes it to alice's session." in card_ask[0][1]
           and told_ask == [(CTL, {"type": "message", "meta": {"chat_id": "CTHR", "thread_ts": "5.5", "ts": "5.5", "user": "cc-slack",
                                                                   "role": "owner", "channel": f"#{CTL}-threads", "target": CTL},
                                    "content": told_ask[0][1]["content"] if told_ask else None}, False)]
@@ -7106,26 +7106,28 @@ def run_selfcheck():
           and n_ask1 == n_ask0 + 1)
     check("…and the answer comes BACK to her, ACROSS A DAEMON RESTART (the table is read back from asks.json): the control "
           "seat's reply in the card's thread (its reply tool hops to the "
-          "daemon with the posted ts; a threaded post from `post -c` hops the same way) is posted into #alice as 💬, "
-          "the replier and the thread named, every @ defanged, and handed to her session in that post's thread as a "
-          "channel wake hands a post; the door's answer says where it was carried; a reply in the same thread from another "
+          "daemon with the posted ts; a threaded post from `post -c` hops the same way) is handed to her session as a "
+          "local turn (chat_id local) as 💬, the replier named, every @ defanged, with the follow-up hint, and NOTHING is "
+          "posted in #alice or anywhere; the door's answer says where it was carried; a reply in the same thread from another "
           "repo's seat is NOT carried and says so, a thread no ask owns and the card's ts in another channel are nothing, "
           "and an ask past ASK_STALE carries no more",
-          r_ans.get("ok") and r_ans.get("ask") == {"target": "alice", "result": "delivered", "name": "alice"}
-          and len(carried) == 1 and carried[0][0] == "CAL" and carried[0][1].startswith(f"💬 {CTL} answered your ask *a repo* (<https://x.slack.com/CTHR/5.5|thread>)")
-          and "push as @\u200bowner" in carried[0][1] and "another `cc-slack ask`" not in carried[0][1]
-          and handed == [("alice", {"type": "message", "content": carried[0][1] + "\n(A follow-up is another `cc-slack ask`.)",
-                                    "meta": {"chat_id": "CAL", "thread_ts": "5.5", "ts": "5.5", "user": "box", "role": "owner",
-                                             "channel": "#alice", "target": "alice", "from": CTL}}, True)]
+          r_ans.get("ok") and r_ans.get("ask") == {"target": "alice", "result": "delivered"}
+          and carried == [] and len(handed) == 1 and handed[0][0] == "alice" and handed[0][2] is True
+          and handed[0][1]["content"] == f"💬 {CTL} answered your ask *a repo*:\nmade: alice-notes is yours — push as @\u200bowner"
+                                         "\n(A follow-up is another `cc-slack ask`.)"
+          and {k: v for k, v in handed[0][1]["meta"].items() if k != "ts"} == {
+              "chat_id": "local", "thread_ts": "", "user": "box", "role": "owner", "channel": f"#{CTL}-threads",
+              "target": "alice", "from": CTL}
+          and float(handed[0][1]["meta"]["ts"]) > 0
           and hop_other == {"target": "alice", "result": "not-the-seat"} and hop_none is None and hop_chan is None
-          and r_ans_wake.get("ask", {}).get("result") == "delivered" and n_ask2 == n_ask1 + 2
+          and r_ans_wake.get("ask", {}).get("result") == "delivered" and n_ask2 == n_ask1
           and "ANSWER NOT CARRIED" in ask_line(hop_other) and "only a " + CTL in ask_line(hop_other)
-          and ask_line(r_ans["ask"]) == "\n\nANSWER CARRIED: posted in #alice and handed to alice (delivered)" and ask_line(None) == ""
+          and ask_line(r_ans["ask"]) == "\n\nANSWER CARRIED: handed to alice's session (delivered); nothing posted in its channel" and ask_line(None) == ""
           and hop_stale is None and "5.5" not in dmMS.member_asks and "5.5" not in stale_disk)
-    check("…and the OWNER typing in the card's thread reaches her the same way, named as himself, while his line still "
-          "goes to the control session as any line in its lane does; a member typing there carries nothing",
-          len(typed_ask) == 1 and typed_ask[0][0] == "CAL" and typed_ask[0][1].startswith("💬 The Owner answered your ask *a repo*")
-          and "make it public when the course ends" in typed_ask[0][1]
+    check("…and the OWNER typing in the card's thread reaches her the same way, named as himself and posted nowhere, "
+          "while his line still goes to the control session as any line in its lane does; a member typing there carries nothing",
+          typed_ask == [] and typed_handed and typed_handed[0][1]["content"].startswith("💬 The Owner answered your ask *a repo*")
+          and "make it public when the course ends" in typed_handed[0][1]["content"] and typed_handed[0][1]["meta"]["chat_id"] == "local"
           and [t for t, _p, _a in typed_handed] == ["alice", CTL] and typed_handed[1][1]["content"] == "make it public when the course ends"
           and typed_other == [])
     # THE CAP `members` PRINTS IS TODAY'S. cc's member_gate raises a workspace's cap for the day (ledger `cap`, beside

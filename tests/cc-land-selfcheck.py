@@ -3277,14 +3277,26 @@ def selfcheck():
                   rcQ == 0 and job.get("attempts") == state["attempts"] and "requeued" not in log
                   and "again myrepo#7" in log and job.get("state") == state.get("state")
                   and job.get("held") == state.get("held"))
-        held = pr_lock("myrepo", 7, "a hand landing")
+        held, _lw = pr_lock("myrepo", 7, "a hand landing"), LOCK_WAIT
         held.take()
+        globals()["LOCK_WAIT"] = 1
         try:
             rcQ, job, log = requeue(attempts=LAND_TRIES, stage="gates")
         finally:
             held.release()
-        check("reset: no fresh start while a landing holds the PR's lock, even at the cap — that landing is on it",
-              rcQ == 0 and job.get("attempts") == LAND_TRIES and "again myrepo#7" in log and "requeued" not in log)
+            globals()["LOCK_WAIT"] = _lw
+        check("reset: no fresh start while a landing holds the PR's lock past LOCK_WAIT, even at the cap — that "
+              "landing is on it", rcQ == 0 and job.get("attempts") == LAND_TRIES and "again myrepo#7" in log
+              and "requeued" not in log)
+        # FINDING (#645's security read): a 👍 landing while a sweep said the capped job's result — say_alone holds the
+        # same lock for the seconds a post takes — was told 'already queued' and did nothing. It waits that out now.
+        held = pr_lock("myrepo", 7, "a sweep saying the result")
+        held.take()
+        threading.Timer(1.5, held.release).start()
+        rcQ, job, log = requeue(attempts=LAND_TRIES, stage="gates")
+        held.release()
+        check("reset: a lock let go within LOCK_WAIT (a result being said) is waited out, and the capped job gets its "
+              "fresh start", rcQ == 0 and job.get("attempts") == 0 and "requeued" in log)
         real_doomed, globals()["doomed"] = doomed, lambda r, p: "the review budget for this change is spent"
         try:
             rcQ, job, log = requeue(attempts=LAND_TRIES, stage="review")
@@ -5905,6 +5917,10 @@ def selfcheck():
                      OPTIMISTIC=True)
     _oq, _pz, _th, REAL_ACCESS = LANDQ, paused, tier_holds, os.access
     globals().update(paused=lambda t: False, tier_holds=lambda j: False)   # the box's own pause and tier are not this section's
+    # The batch's suite runs beside the lane as a process of its own (spawn_suite); here it runs inline, through the
+    # same record, so each case reads what it said. The spawn itself has its own case (14).
+    _ss = spawn_suite
+    globals().update(spawn_suite=lambda repo, path: run_suite_record(repo, path))
     globals().update(LANDQ=tempfile.mkdtemp(prefix="cc-land-selfcheck-opt-"))
     os.makedirs(lane_dir(), exist_ok=True)
     GF = "# the gate-first list\nbin/cc-land\nbin/cc-guard\n.githooks/*\n"
@@ -6069,7 +6085,7 @@ def selfcheck():
             world["git merge-base --is-ancestor"] = ancestry
             world["git rev-list --parents -n 1"] = lambda argv: (0, f"{argv[-1]} {'0' * 40}\n")   # a squash: one parent
         _ro, _wa, _ab = run_one, warm_all, after_batch
-        globals().update(run_one=merge_stub, warm_all=lambda repo, b: [], after_batch=lambda repo, m: handed.append(m) or [])
+        globals().update(run_one=merge_stub, warm_all=lambda repo, b: [], after_batch=lambda repo, m, **kw: handed.append(m) or [])
         batch_world()
         batch = [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32, 33)]
         land_batch("myrepo", batch)
@@ -6109,8 +6125,8 @@ def selfcheck():
         globals().update(run_one=lambda path: world.update({"git rev-parse origin/main": (0, TIP + "\n")}) or "landed")
         batch_world()
         land_batch("myrepo", [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32)])
-        check("…and so are a commit with two parents (not a squash) and a PR merged into another branch",
-              handed == [[]])
+        check("…and so are a commit with two parents (not a squash) and a PR merged into another branch: nothing "
+              "provably merged, so no suite is handed anything", handed == [])
         del world[f"git rev-list --parents -n 1 {S(31)}"]
         globals().update(run_one=merge_stub)
         # …and a base whose tip cannot be read: nothing could be proved on it, so the batch does not start and every
@@ -6134,6 +6150,25 @@ def selfcheck():
         j34 = read_json(job_path("myrepo", 34)) or {}
         check("a member the merge pass kept on the queue has neither `batch` nor `warm` on it afterwards",
               os.path.exists(job_path("myrepo", 34)) and "batch" not in j34 and "warm" not in j34)
+        os.unlink(job_path("myrepo", 34))
+        # FINDING (#645's security read): that write-back had no lock and no same-job check, so a re-queue landing
+        # between the merge pass's read and its write was overwritten by the stale copy. unbatch waits for the PR's
+        # lock, reads again under it, and leaves a job that is no longer the member's alone.
+        old = {"repo": "myrepo", "pr": 34, "queued_at": "2026-09-24T12:00:00Z", "attempts": 1, "batch": "b1",
+               "warm": {"head": S(34), "ok": True}}
+        write_atomic(job_path("myrepo", 34), old)
+        held = pr_lock("myrepo", 34, "a re-queue")
+        held.take()
+
+        def requeued():
+            write_atomic(job_path("myrepo", 34), {"repo": "myrepo", "pr": 34, "queued_at": "2026-09-24T13:00:00Z",
+                                                  "attempts": 0, "stage": "queued", "batch": "b2"})
+            held.release()
+        threading.Timer(1.0, requeued).start()
+        unbatch("myrepo", job_path("myrepo", 34), old)
+        j34 = read_json(job_path("myrepo", 34)) or {}
+        check("…and a job re-queued over the member while its marks come off is left exactly as the re-queue wrote it",
+              j34.get("queued_at") == "2026-09-24T13:00:00Z" and j34.get("attempts") == 0 and j34.get("batch") == "b2")
         os.unlink(job_path("myrepo", 34))
         globals().update(run_one=_ro, warm_all=_wa, after_batch=_ab)
         for pr in (31, 32, 33):
@@ -6175,7 +6210,8 @@ def selfcheck():
               isinstance(said, str) and "warm's static gates passed" in said and not ran("git", "worktree", "add"))
 
         # 6. THE WORKER'S OWN GREEN is the warm's first question, keyed on the HEAD's tree — what the worker's
-        # cc-green filed — and a head without one is not ordinary: warm_done marks the job so.
+        # cc-green filed. A head without one is still ordinary: the warm runs the suite itself (brief: "A missing
+        # worker green should cost a suite run in the warm, not demote the PR to serial for good").
         def warm_L():
             L = fresh(pr=7)
             L.warm_only = True
@@ -6191,26 +6227,31 @@ def selfcheck():
             L.facts["baseRefName"] = "main"
             return L
         L = warm_L()
-        e = caught(L.worker_green)
-        check("no green record for the head's tree: the warm stops at `warm`, short 'no worker green for the head'",
-              isinstance(e, Failed) and e.short == "no worker green for the head" and "every gate first" in str(e))
+        said = caught(L.worker_green)
+        check("no green record for the head's tree: the warm does NOT stop — it names the suite as its own to run on "
+              "the merge, and the job stays ordinary",
+              isinstance(said, str) and "no green record of the worker's own" in said
+              and L.warm_suites == ["core/tests/selftest.sh"])
         write_atomic(job_path("myrepo", 7), {"repo": "myrepo", "pr": 7, "queued_at": stamp(), "attempts": 0})
-        L.stopped, L.why, L.why_short = "warm", str(e), e.short
+        L.stopped, L.why, L.why_short = "warm", "the head touches core/bin/cc-guard", "not ordinary at this head"
         L.warm_done(1)
         j = read_json(job_path("myrepo", 7)) or {}
-        check("…and warm_done writes that on the job: `ordinary` names why, and `warm.stopped` is `warm`, which is what "
-              "the merge pass skips and batch_of leaves alone",
-              j.get("ordinary") == "no worker green for the head" and (j.get("warm") or {}).get("stopped") == "warm")
+        check("…while a warm that DID stop at `warm` (a head that is not ordinary) is written on the job: `ordinary` "
+              "names why, and `warm.stopped` is `warm`, which is what the merge pass skips and batch_of leaves alone",
+              j.get("ordinary") == "not ordinary at this head" and (j.get("warm") or {}).get("stopped") == "warm")
         write_atomic(f"{green_dir()}/selftest.sh-{TREE[:12]}.json",
                      {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "", "at": stamp()})
         L = warm_L()
         said = caught(L.worker_green)
         check("a green record on the head's tree (unscoped, as cc-green run files it) is the worker's own green, and "
-              "the warm goes on to the static gates", isinstance(said, str) and "worker's own green stands" in said)
+              "the warm goes on to the static gates alone", isinstance(said, str) and "worker's own green stands" in said
+              and L.warm_suites == [])
         write_atomic(f"{green_dir()}/selftest.sh-{TREE[:12]}.json",
                      {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "docs/README.md", "at": stamp()})
-        check("…but a record scoped to some OTHER diff is not this head's green",
-              isinstance(caught(warm_L().worker_green), Failed))
+        L = warm_L()
+        caught(L.worker_green)
+        check("…but a record scoped to some OTHER diff is not this head's green: the warm runs the suite itself",
+              L.warm_suites == ["core/tests/selftest.sh"])
         # FINDING: batch_of read gh's file list at pick time, tied to no head. The warm asks again of the head IT
         # fetched, off git: a push after the pick that touches core/bin/cc-guard is not ordinary, green record or not.
         write_atomic(f"{green_dir()}/selftest.sh-{TREE[:12]}.json",
@@ -6252,6 +6293,41 @@ def selfcheck():
               isinstance(said, str) and "check.sh" in said and "warm tier" in said and "after the batch" in said
               and not [c for c in calls if c[0].endswith("core/tests/selftest.sh")]
               and [c for c in calls if c[0].endswith("core/tests/check.sh")])
+        # FINDING (2026-09-24): 13 of 14 warms found no worker green and demoted their PR to the serial path, a full
+        # suite each before its merge. Now the warm runs that suite itself, on the merge, and the PR lands in the batch.
+        L = warm_L()
+        with contextlib.redirect_stdout(io.StringIO()):
+            first = caught(L.worker_green)
+            said = caught(L.gates)
+            if L._review is not None:
+                caught(L.review_aside)
+        check("a --warm whose head has NO worker green runs selftest.sh on the merge beside check.sh, and says why",
+              isinstance(first, str) and isinstance(said, str) and "no worker green" in said and "warm tier" in said
+              and [c for c in calls if c[0].endswith("core/tests/selftest.sh")]
+              and [c for c in calls if c[0].endswith("core/tests/check.sh")])
+        st = [cwds[i] for i, c in enumerate(calls) if c[0].endswith("core/tests/selftest.sh")]
+        at = [c[-1] for c in calls if list(c[:3]) == ["git", "worktree", "add"] and st and c[-2] == st[0]]
+        check("…and that suite runs in the checkout of the head MERGED with main, never the head alone (a stale head "
+              "reds on a defect main already fixed, 2026-09-24 20:4xZ)", at == [MERGE()] and MERGE() != HEAD)
+        write_atomic(job_path("myrepo", 7), {"repo": "myrepo", "pr": 7, "queued_at": stamp(), "attempts": 0})
+        L.stopped = ""
+        L.warm_done(0)
+        took.clear(); handed.clear()
+        MAIN.insert(1, S(7))
+        _ro, _wa, _ab = run_one, warm_all, after_batch
+        globals().update(run_one=merge_stub, warm_all=lambda repo, b: [], after_batch=lambda repo, m, **kw: handed.append(m) or [])
+        try:
+            batch_world()
+            land_batch("myrepo", [(job_path("myrepo", 7), read_json(job_path("myrepo", 7)), ["core/bin/cc-alpha"])])
+        finally:
+            globals().update(run_one=_ro, warm_all=_wa, after_batch=_ab)
+            MAIN.remove(S(7))
+        check("…and that warm, green, keeps the PR in the batch: not marked for the serial path, merged by the merge "
+              "pass with the batch's id, and handed to the batch's suite",
+              [t[0] for t in took] == [7] and all(t[1] for t in took)
+              and handed == [[(7, S(7), ["core/bin/cc-alpha"])]])
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))
         os.access = lambda p, m: p.endswith("core/tests/selftest.sh")
         L = warm_L()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -6280,7 +6356,7 @@ def selfcheck():
             world["git rev-parse origin/main"] = (0, (tip * 20) + "\n")
             world["gh pr view"] = (0, json.dumps(dict(FACTS, state="MERGED")))
             globals().update(suite_on=script(table), revert_pr=lambda repo, pr, sha, why: (reverted.append(pr), "aa" * 20)[1],
-                             deploy_due=lambda repo, by="": (deployed.append(by), "/nonexistent/deploy.json")[1],
+                             deploy_due=lambda repo, by="", tip="": (deployed.append(by), "/nonexistent/deploy.json")[1],
                              run_one=lambda path: f"deployed {path}")
             with contextlib.suppress(OSError):
                 os.unlink(red_base_path("myrepo"))
@@ -6326,6 +6402,25 @@ def selfcheck():
         lines = after_batch("myrepo", MERGED)
         check("…a flake — red once, green on the second run — is green: no bisect, no revert, deployed",
               asked == [("ee", "suite"), ("ee", "suite2")] and not reverted and deployed)
+        # A suite beside the lane (run_suite_record) runs at its own batch's last merge, not at a tip a later batch
+        # has merged onto since; and while that later batch's suite waits, its green installs nothing: the install is
+        # of the tip, and only the later suite has passed on it.
+        globals().update(suite_on=lambda repo, sha, scope, step="suite": (asked.append((sha[:2], step)), (True, "ok", ""))[1])
+        asked.clear(); deployed.clear()
+        later = suite_path("myrepo", "b-later")
+        write_atomic(later, {"repo": "myrepo", "bid": "b-later", "merged": [list(m) for m in MERGED], "pid": os.getpid()})
+        mine = suite_path("myrepo", "b-mine")
+        write_atomic(mine, {"repo": "myrepo", "bid": "b-mine", "merged": [list(m) for m in MERGED], "pid": os.getpid()})
+        lines = after_batch("myrepo", MERGED, tip=MERGED[-1][1], record=mine)
+        check("a suite beside the lane runs at its batch's last merge, and with a later batch's suite waiting its "
+              "green installs nothing and says the later one will",
+              asked == [(MERGED[-1][1][:2], "suite")] and not deployed and "later batch" in lines[-1])
+        os.unlink(later)
+        asked.clear()
+        lines = after_batch("myrepo", MERGED, tip=MERGED[-1][1], record=mine)
+        check("…and with none waiting but its own record, it installs",
+              asked == [(MERGED[-1][1][:2], "suite")] and deployed)
+        os.unlink(mine)
         globals().update(suite_on=_so, revert_pr=_rp, deploy_due=_dd, run_one=_ro)
 
         # 9. deploy_due leaves a tip after_batch found red alone — the 15-minute catch-up must not install behind
@@ -6396,6 +6491,74 @@ def selfcheck():
             globals().update(batch_of=_bo, land_batch=_lb, run_one=_ro)
         check("a lane run with #51 and #52 ordinary and #53 not: the two land as one batch, #53 lands on its own after",
               batched == [[51, 52]] and singles == [53])
+        # FINDING (2026-09-24): a fix round's push re-queues its job with the same queued_at, so a live lane that had
+        # already seen it never asked again, and #617/#624/#629/#635/#644 sat for hours. Now a job with a fix out is
+        # taken again once its FIX_POLL wait is over — and not before, so a lane never spins on it.
+        OLD, NEW = S(0x54), S(0x5f)
+
+        def fix_lane(wait_over):
+            landed = []
+            write_atomic(job_path("myrepo", 54), {
+                "repo": "myrepo", "pr": 54, "queued_at": "2026-09-24T12:00:00Z", "attempts": 0, "stage": "fixing",
+                "not_before": stamp(time.time() + FIX_POLL),
+                "fix": {"track": "w54", "verdict": "CONFLICT", "head": OLD, "at": "2026-09-24T12:00:00Z",
+                        "deadline": stamp(time.time() + FIX_WAIT)}})
+            write_atomic(job_path("myrepo", 55), {"repo": "myrepo", "pr": 55, "queued_at": "2026-09-24T12:00:01Z",
+                                                  "attempts": 0})
+            world["gh pr view 54"] = (0, json.dumps({"headRefOid": OLD, "headRefName": "track/w54", "state": "OPEN"}))
+            world["git ls-remote origin refs/heads/track/w54"] = (0, f"{OLD}\trefs/heads/track/w54\n")
+            world[f"{BIN}/cc-board get myrepo w54 status"] = (0, "done\n")
+            world["tmux list-windows"] = (0, "")
+
+            def rj_stub(path, job):
+                landed.append((job.get("pr"), job.get("stage"), (job.get("fix") or {}).get("over")))
+                if job.get("pr") == 55:
+                    # #55's landing is the long one: the round pushes meanwhile, and maybe its wait runs out too
+                    world["git ls-remote origin refs/heads/track/w54"] = (0, f"{NEW}\trefs/heads/track/w54\n")
+                    if wait_over:
+                        j = read_json(job_path("myrepo", 54)) or {}
+                        j["not_before"] = stamp(time.time() - 1)
+                        write_atomic(job_path("myrepo", 54), j)
+                os.unlink(path)
+                return "landed"
+            _rj, _bo = run_job, batch_of
+            globals().update(run_job=rj_stub, batch_of=lambda repo, paths: [])
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    run_lane("myrepo")
+            finally:
+                globals().update(run_job=_rj, batch_of=_bo)
+            return landed
+        landed = fix_lane(wait_over=False)
+        j54 = read_json(job_path("myrepo", 54)) or {}
+        check("a live lane that has already asked a fixing job does NOT take it again while its FIX_POLL wait runs, "
+              "even with the branch pushed meanwhile — #55 lands, #54 stays fixing for the next look",
+              landed == [(55, None, None)] and j54.get("stage") == "fixing" and (j54.get("fix") or {}).get("over") is None)
+        landed = fix_lane(wait_over=True)
+        check("…but once that wait is over the SAME live lane takes it again on its next pass: the head moved and the "
+              "round has ended, so fix_progress re-queues it and it runs (re-queued, fix over 'pushed')",
+              landed == [(55, None, None), (54, "queued", "pushed")] and not os.path.exists(job_path("myrepo", 54)))
+        # …and a fixing job run_one stands down on without touching (a parked project: box_hold) is asked once per
+        # wait, never spun on: the lane ends.
+        write_atomic(job_path("myrepo", 54), {"repo": "myrepo", "pr": 54, "queued_at": "2026-09-24T12:00:00Z",
+                                              "attempts": 0, "stage": "fixing", "not_before": stamp(time.time() - 1),
+                                              "fix": {"track": "w54", "head": OLD, "at": "2026-09-24T12:00:00Z"}})
+        taken, _bh = [], box_hold
+        globals().update(box_hold=lambda job: taken.append(job.get("pr")) and "" or "myrepo is parked")
+        try:
+            t = threading.Thread(target=lambda: quiet(run_lane, "myrepo"), daemon=True)
+            t.start(); t.join(20)
+        finally:
+            globals()["box_hold"] = _bh
+        check("…while a fixing job the lane cannot act on (parked) is taken once for that wait and the lane ends — "
+              "no spin", not t.is_alive() and 1 <= len(taken) <= 3)
+        os.unlink(job_path("myrepo", 54))
+        for k in ("gh pr view 54", "git ls-remote origin refs/heads/track/w54", f"{BIN}/cc-board get myrepo w54 status",
+                  "tmux list-windows"):
+            world.pop(k, None)
+        for pr in (54, 55):
+            with contextlib.suppress(OSError):
+                os.unlink(job_path("myrepo", pr))
 
         # 12. A batch member's own deploy step waits for the batch, and its card says so.
         L = fresh(pr=7)
@@ -6425,7 +6588,7 @@ def selfcheck():
                                             "members": [[97, ["f97"]], [98, ["f98"]]], "pre": []})
         handed, serial = [], []
         _ab, _ro, _bo = after_batch, run_one, batch_of
-        globals().update(after_batch=lambda repo, m: handed.append(m) or ["the suite spoke"],
+        globals().update(after_batch=lambda repo, m, **kw: handed.append(m) or ["the suite spoke"],
                          run_one=lambda path: (serial.append(read_json(path) or {}), os.unlink(path), "")[2],
                          batch_of=lambda repo, paths: [])
         try:
@@ -6462,10 +6625,235 @@ def selfcheck():
             globals().update(run_lane=_rl, sweep_records=_sr, sweep_run_roots=_srr, due_catchup=_dc, next_wake=_nw)
         check("a sweep with no job queued runs the lane of a repo whose batch note waits", lanes == ["myrepo"])
         os.unlink(batch_path("myrepo"))
+
+        # 14. FINDING (owner, 2026-09-24: nothing landed in 2 h): the batch's suite held the lane — #651, a PDF-only
+        # merge, from 19:42Z past 21:05Z. It now runs BESIDE the lane (spawn_suite), and not at all for docs only.
+        fresh()
+        spawned, handed = [], []
+        _ss2, _ab = spawn_suite, after_batch
+        globals().update(spawn_suite=lambda repo, path: spawned.append(path) or ["beside"],
+                         after_batch=lambda repo, m, tip="", record="", reverts=(): handed.append((m, tip, record)) or ["the suite spoke"])
+        try:
+            DOCS = [(81, S(0x81), ["docs/any/any.pdf", "docs/any/any.tex"]), (82, S(0x82), ["README.md", "x.pdf"])]
+            n = open(f"{LANDQ}/queue.log").read().count("batch-suite-skipped myrepo")
+            lines = batch_suite("myrepo", DOCS, "b14")
+            check("a batch whose merged diff is docs only (docs/, *.md, *.pdf) runs no suite and installs nothing: "
+                  "the lane is free at once, and one queue.log line says why",
+                  not spawned and not handed and "no suite" in lines[0] and not suites_pending("myrepo")
+                  and open(f"{LANDQ}/queue.log").read().count("batch-suite-skipped myrepo") == n + 1)
+            CODE = DOCS + [(83, S(0x83), ["core/bin/cc-alpha"])]
+            lines = batch_suite("myrepo", CODE, "b15")
+            rec = read_json(suite_path("myrepo", "b15")) or {}
+            check("…one code file among them and the suite runs, BESIDE the lane: its merges are on a record of its "
+                  "own and the spawn returns without the suite having run",
+                  spawned == [suite_path("myrepo", "b15")] and lines == ["beside"] and not handed
+                  and [tuple(m) for m in rec.get("merged") or []] == CODE and suite_path("myrepo", "b15") != batch_path("myrepo"))
+            lines = run_suite_record("myrepo", suite_path("myrepo", "b15"))
+            check("…and the process it starts runs after_batch on exactly those merges, at the last of them, then "
+                  "drops the record",
+                  handed == [(CODE, CODE[-1][1], suite_path("myrepo", "b15"))] and lines == ["the suite spoke"] and not os.path.exists(suite_path("myrepo", "b15")))
+            # A suite whose process died is started again by the next lane; one whose process lives is left alone.
+            spawned.clear()
+            write_atomic(suite_path("myrepo", "b16"), {"repo": "myrepo", "bid": "b16", "merged": CODE, "pid": 2 ** 22 + 7})
+            write_atomic(suite_path("myrepo", "b17"), {"repo": "myrepo", "bid": "b17", "merged": CODE, "pid": os.getpid()})
+            resume_suites("myrepo")
+            check("a suite record whose process is dead is spawned again; one whose process lives is not",
+                  spawned == [suite_path("myrepo", "b16")])
+            check("…and while either waits, the catch-up does not install behind it",
+                  deploy_due("myrepo") == "" and not os.path.exists(job_path("myrepo", "deploy")))
+            for b in ("b16", "b17"):
+                os.unlink(suite_path("myrepo", b))
+            check("the suite's own subcommand refuses a record outside the queue",
+                  quiet(cmd_batch_suite, ["myrepo", "/tmp/myrepo.x.suite"]) == 2)
+        finally:
+            globals().update(spawn_suite=_ss2, after_batch=_ab)
+        # …and the install a suite beside the lane earns never runs beside a landing: with the lane's flock held it is
+        # left queued for that lane; free, it runs here.
+        installs = []
+        _ro = run_one
+        globals().update(run_one=lambda path: installs.append(path) or "installed")
+        try:
+            os.makedirs(lane_dir(), exist_ok=True)
+            held = open(lane_file("myrepo", "lock"), "w")
+            fcntl.flock(held, fcntl.LOCK_EX)
+            said = install_beside("myrepo", "/q/deploy.json")
+            fcntl.flock(held, fcntl.LOCK_UN); held.close()
+            check("a suite's install with the lane running is left to that lane's next look, not run beside it",
+                  not installs and "next look" in said)
+            check("…and with no lane running it installs there and then", install_beside("myrepo", "/q/deploy.json")
+                  == "installed" and installs == ["/q/deploy.json"])
+        finally:
+            globals().update(run_one=_ro)
+
+        # 15. FINDING (2026-09-24 20:0xZ): the queue held jobs whose PR was CLOSED (#630 #632 #636 #637) or MERGED
+        # (#639 #640 #641 #643), and the lane would spend full gates or a reinstall on each. It drops them now, one
+        # queue.log line each — but not a merged PR whose install is still owed (run_one deploys that one).
+        fresh()
+        INSTALLED = S(0x9a)
+        record_applied("myrepo", INSTALLED)
+        for pr in (91, 92, 93, 94):
+            write_atomic(job_path("myrepo", pr), {"repo": "myrepo", "pr": pr, "queued_at": f"2026-09-24T12:00:0{pr - 90}Z",
+                                                  "attempts": 0, "stage": "queued"})
+        world["gh pr view 91 --json state,mergeCommit"] = (0, json.dumps({"state": "CLOSED", "mergeCommit": None}))
+        world["gh pr view 93 --json state,mergeCommit"] = (0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": S(0x93)}}))
+        world["gh pr view 94 --json state,mergeCommit"] = (0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": S(0x94)}}))
+        world[f"git merge-base --is-ancestor {S(0x93)} {INSTALLED}"] = (0, "")    # #93's squash is installed
+        #                                                                      #94's is not: the fresh() default, rc 1
+        taken = []
+        _ro, _bo = run_one, batch_of
+        globals().update(run_one=lambda path: (taken.append((read_json(path) or {}).get("pr")), os.unlink(path), "")[2],
+                         batch_of=lambda repo, paths: [])
+        try:
+            log0 = open(f"{LANDQ}/queue.log").read()
+            run_lane("myrepo")
+            new = open(f"{LANDQ}/queue.log").read()[len(log0):]
+        finally:
+            globals().update(run_one=_ro, batch_of=_bo)
+        check("the lane drops a job whose PR is closed, and one merged and already installed, with one queue.log "
+              "line each and no landing run on either",
+              91 not in taken and 93 not in taken and new.count("dropped myrepo#91") == 1
+              and new.count("dropped myrepo#93") == 1 and "closed" in new and "already installed" in new)
+        check("…while an open PR, and a merged one whose install is still owed, are landed as before",
+              sorted(taken) == [92, 94] and "dropped myrepo#92" not in new and "dropped myrepo#94" not in new)
+        # FINDING (review of #660): a job kept only to SAY its result — done, merged, installed, Slack refused the
+        # post — read as merged-and-installed to gone_why, and the landed card was dropped unsaid.
+        write_atomic(job_path("myrepo", 96), {
+            "repo": "myrepo", "pr": 96, "queued_at": "2026-09-24T12:00:06Z", "attempts": 1, "stage": "verify",
+            "state": "done", "say_tries": 1, "result": {"ok": True, "rc": 0, "short": "[myrepo] PR #96: landed"}})
+        world["gh pr view 96 --json state,mergeCommit"] = (0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": S(0x96)}}))
+        world[f"git merge-base --is-ancestor {S(0x96)} {INSTALLED}"] = (0, "")
+        taken.clear(); calls.clear()
+        globals().update(run_one=lambda path: (taken.append((read_json(path) or {}).get("pr")), os.unlink(path), "")[2],
+                         batch_of=lambda repo, paths: [])
+        try:
+            log0 = open(f"{LANDQ}/queue.log").read()
+            run_lane("myrepo")
+            new = open(f"{LANDQ}/queue.log").read()[len(log0):]
+        finally:
+            globals().update(run_one=_ro, batch_of=_bo)
+        check("a done job kept to say its result is never dropped, though its PR is merged and installed: the lane "
+              "hands it to run_one, which says it, and no gh call is spent asking",
+              taken == [96] and "dropped myrepo#96" not in new and not ran("gh", "pr", "view", "96"))
+        os.unlink(f"{LANDQ}/myrepo.applied")
+
+        # 16. FINDING (review of #660): a lone landing's install pulled origin's tip while a batch's suite was still
+        # owed, so ~/bin ran that batch's merges before any suite passed them, and a red suite's revert came after.
+        # It waits now and says so; a batch's install is of the tip its suite proved, never origin's.
+        def lone_deploy():
+            L = fresh(pr=7)
+            world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+            later = []
+            rc = quiet(L.walk, [("install", L.install), ("units", lambda: later.append(1) or "ran")])
+            return L, rc, later
+        owed = suite_path("myrepo", "b-owed")
+        write_atomic(owed, {"repo": "myrepo", "bid": "b-owed", "merged": [], "pid": os.getpid()})
+        L, rc, later = lone_deploy()
+        card = result_of(L, rc, {"attempts": 1}, "")["short"]
+        check("a lone landing's install with a batch's suite still owed pulls nothing and runs no deploy step after "
+              "it, and its landed card says it is not installed yet",
+              rc == 0 and "b-owed" in getattr(L, "deploy_waits", "") and not ran("git", "pull") and not later
+              and "not installed yet" in card and "deployed" not in card)
+        os.unlink(owed)
+        write_atomic(batch_path("myrepo"), {"bid": "b-merging", "before": S(0x70), "members": [], "pre": []})
+        L, rc, later = lone_deploy()
+        check("…nor while a batch is merging (its note)",
+              rc == 0 and "merging" in getattr(L, "deploy_waits", "") and not ran("git", "pull") and not later)
+        os.unlink(batch_path("myrepo"))
+        L, rc, later = lone_deploy()
+        check("…and with neither it pulls, and the deploy goes on, as it always did",
+              not getattr(L, "deploy_waits", "") and ran("git", "pull", "--ff-only") and later)
+
+        fresh()
+        record_applied("myrepo", S(0x70))
+        world["git rev-parse origin/main"] = (0, S(0x7e) + "\n")               # a later merge no suite has passed
+        spans = []
+        PROVED = [(71, S(0x71), ["f71"]), (72, S(0x72), ["f72"])]
+        mine = suite_path("myrepo", "b-proved")
+
+        def green_suite(note=None):
+            spans.clear()
+            write_atomic(mine, {"repo": "myrepo", "bid": "b-proved", "merged": [list(m) for m in PROVED],
+                                "pid": os.getpid()})
+            if note:
+                write_atomic(batch_path("myrepo"), {"bid": note, "before": S(0x72), "members": [[73, ["f73"]]], "pre": []})
+            _so2, _ro2 = suite_on, run_one
+            globals().update(suite_on=lambda repo, sha, scope, step="suite": (True, "ok", ""),
+                             run_one=lambda path: spans.append((read_json(path) or {}).get("span")) or "installed")
+            try:
+                return after_batch("myrepo", PROVED, tip=S(0x72), record=mine)
+            finally:
+                globals().update(suite_on=_so2, run_one=_ro2)
+                for f in (job_path("myrepo", "deploy"), batch_path("myrepo")):
+                    with contextlib.suppress(OSError):
+                        os.unlink(f)
+        green_suite()
+        check("a batch's green suite queues the install of the tip it proved (its last merge), not origin's tip, "
+              "which holds a merge no suite has passed", spans == [[S(0x70), S(0x72)]])
+        L = fresh(span=(S(0x70), S(0x72)))
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+        caught(L.install)
+        check("…and that deploy moves the checkout to its own tip (merge --ff-only), never pulling origin's, and does "
+              "not wait on its own suite's record", ran("git", "merge", "--ff-only", S(0x72)) and not ran("git", "pull")
+              and not getattr(L, "deploy_waits", ""))
+        world["git merge --ff-only"] = (1, "fatal: Not possible to fast-forward, aborting.")
+        e = caught(L.install)
+        check("…and a tip it cannot fast-forward to is a stop that names the tip, never a pull of something else",
+              isinstance(e, Failed) and f"merge --ff-only {S(0x72)[:12]}" in str(e) and not ran("git", "pull"))
+        lines = green_suite(note="b-next")
+        check("…while another batch is merging (its note), a green suite installs nothing and says a later batch's "
+              "suite installs", spans == [] and "not installed here" in lines[-1] and "merging" in lines[-1])
+        green_suite(note="b-proved")
+        check("…but the note of its OWN batch (a resumed batch hands its suite on before its note goes) holds nothing",
+              spans == [[S(0x70), S(0x72)]])
+        os.unlink(mine)
+
+        # FINDING (review of #660): a later batch's suite ran at its own last merge, which lacks the revert an earlier
+        # suite made meanwhile of a squash under it: red on that PR's defect, then a bisect that called main red
+        # before the batch, several full suite runs under the suite lock. It runs where the base holds the revert.
+        fresh()
+        record_applied("myrepo", S(0x70))
+        REV, AFTER = S(0x7a), [(75, S(0x75), ["f75"]), (76, S(0x76), ["f76"])]
+        world["git rev-parse origin/main"] = (0, S(0x7f) + "\n")
+        world[f"git log --reverse --format=%H%x1f%B%x1e {S(0x76)}..{S(0x7f)}"] = (0, (
+            f"{S(0x7b)}\x1fa later merge\n\x1e\n"
+            f"{REV}\x1fRevert \"#74\"\n\nThis reverts commit {S(0x74)}.\n\x1e\n"
+            f"{S(0x7c)}\x1fRevert \"#7b\"\n\nThis reverts commit {S(0x7b)}.\n\x1e\n"))
+        world[f"git merge-base --is-ancestor {S(0x74)} {S(0x76)}"] = (0, "")   # #74's squash is under this batch
+
+        def later_suite(red=()):
+            asked.clear(); spans.clear()
+            rec = suite_path("myrepo", "b-after")
+            write_atomic(rec, {"repo": "myrepo", "bid": "b-after", "merged": [list(m) for m in AFTER], "pid": 0})
+            _so2, _ro2 = suite_on, run_one
+            globals().update(suite_on=lambda repo, sha, scope, step="suite":
+                             (asked.append((sha[:2], step)), (sha not in red, "gate x did not pass: case 1", ""))[1],
+                             run_one=lambda path: spans.append((read_json(path) or {}).get("span")) or "installed")
+            try:
+                return run_suite_record("myrepo", rec)
+            finally:
+                globals().update(suite_on=_so2, run_one=_ro2)
+                with contextlib.suppress(OSError):
+                    os.unlink(job_path("myrepo", "deploy"))
+        later_suite()
+        check("a later batch's suite runs at the earlier suite's revert of a squash under it (#74's), not at its own "
+              "last merge — and not at a revert of something it does not hold — and installs that tip",
+              asked == [(REV[:2], "suite")] and spans == [[S(0x70), REV]])
+        lines = later_suite(red=(REV,))
+        check("…red there, twice, it is said and noted without a bisect: every merge of the batch predates that "
+              "revert, so a bisect over them could only find #74's red",
+              asked == [(REV[:2], "suite"), (REV[:2], "suite2")] and not spans
+              and "carries the revert" in lines[-1] and (read_json(red_base_path("myrepo")) or {}).get("tip") == REV)
+        with contextlib.suppress(OSError):
+            os.unlink(red_base_path("myrepo"))
+        world[f"git log --reverse --format=%H%x1f%B%x1e {S(0x76)}..{S(0x7f)}"] = (128, "fatal: bad revision")
+        later_suite()
+        check("…and where git cannot list what came after, no revert is assumed: the suite runs at the last merge",
+              asked == [(S(0x76)[:2], "suite")] and spans == [[S(0x70), S(0x76)]])
+        os.unlink(f"{LANDQ}/myrepo.applied")
     finally:
         os.access = REAL_ACCESS
         shutil.rmtree(LANDQ, ignore_errors=True)
-        globals().update(LANDQ=_oq, OPTIMISTIC=False, paused=_pz, tier_holds=_th)
+        globals().update(LANDQ=_oq, OPTIMISTIC=False, paused=_pz, tier_holds=_th, spawn_suite=_ss)
         globals().update(REAL)
 
     # INDEX-AT-WRITE: a root record is in the library's index the moment write_atomic returns — `cc-lib ask --object

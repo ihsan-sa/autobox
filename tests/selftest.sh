@@ -14,7 +14,7 @@ export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage li
 export CC_SPEND_TIER=autonomous   # the box's own spend tier (cc-tier) never colours a fixture: each --go below must start — and cc carries
                                   # it into the loop's tmux window (its `pre` list), where cc-loop asks the tier again; the case is by the CC_LOOP_TRIM one
 # claude is stubbed (CC_CLAUDE). Safe to run anytime, INCLUDING alongside other copies of itself from other
-# worktrees: every run is namespaced (see $RUN below), a few run at once and the rest wait (see the slots below)
+# worktrees: every run is namespaced (see $RUN below), a few run at once and the rest wait, a landing's first (see the slots below)
 # and each cleans up after itself.  Usage: tests/selftest.sh   — or, from a landing, with CC_LAND_CHANGED naming
 # the paths a PR changed, in which case only what that change reaches runs (see "WHAT RUNS" below).
 # CC_SUITE_PART names WHICH HALF to run — `portable`, the stanzas that are nothing but a tool's own selfcheck and
@@ -59,28 +59,48 @@ if [ -z "${CC_SELFTEST_SLOTS:-}" ]; then
   SLOTS=$(( $(nproc 2>/dev/null || echo 4) * 2 / 3 ))
   [ "$SLOTS" -ge 2 ] || SLOTS=2      # `||` and never `&&`: a true test must not be this line's exit status
   [ "$SLOTS" -le 6 ] || SLOTS=6
+  LANDING=
 else
-  SLOTS=$CC_SELFTEST_SLOTS
+  SLOTS=$CC_SELFTEST_SLOTS; LANDING=1
 fi
+# A LANDING GOES FIRST. The run that set CC_SELFTEST_SLOTS is a landing's (cc-land hands every suite it starts that
+# number, and nothing else sets it); every other run — a builder's, cc-green's, a person's — is not. The slots had no
+# order until 2026-09-24, when #617's second landing try sat 36 minutes without running a case while builders and a
+# hand run held all four, at a time a run took 61-78 min. Two rules now, each proved by the slots stanza below:
+#   RESERVED: slot 1 is a landing's alone. A run that is not a landing's takes only slots 2..$SLOTS, so however many
+#     of them there are, they cannot hold every slot and starve a landing out. (Never under 2 slots: see above.)
+#   AHEAD: a landing that waits holds a SHARED flock on $LOCKF.landing for as long as it waits, and a run that is not a
+#     landing's takes no slot while it cannot take that file exclusively — so the next slot to free goes to the landing.
+#     The flock goes when its holder does, so a landing that died waiting leaves nothing behind to hold the others up.
 slot(){ [ "$1" = 1 ] && echo "$LOCKF" || echo "$LOCKF.$1"; }   # slot 1 is the file the lock always was; the rest sit beside it
 if [ -z "${CC_SELFTEST_HELD:-}" ]; then
-  waited=0
+  waited=0; first=1; [ -n "$LANDING" ] || first=2; PRIO=; said=
+  exec {LQ}>>"$LOCKF.landing"
   while :; do
-    for i in $(seq 1 "$SLOTS"); do
-      exec {LK}>>"$(slot "$i")"   # >> and never >: a waiter that truncated the file would wipe the pid it is about to read
-      flock -n $LK && break 2
-      exec {LK}>&-
-    done
-    if [ $((waited % 60)) = 0 ]; then
+    ahead=
+    if [ -z "$LANDING" ]; then
+      flock -n -x $LQ && flock -u $LQ || ahead=" and a landing waiting ahead of this run"
+    fi
+    if [ -z "$ahead" ]; then
+      for i in $(seq "$first" "$SLOTS"); do
+        exec {LK}>>"$(slot "$i")"   # >> and never >: a waiter that truncated the file would wipe the pid it is about to read
+        flock -n $LK && break 2
+        exec {LK}>&-
+      done
+    fi
+    [ -z "$LANDING" ] || [ -n "$PRIO" ] || { flock -s $LQ; PRIO=1; }   # waiting, so the runs that are not landings' wait behind it
+    if [ $((waited % 60)) = 0 ] || [ "$ahead" != "$said" ]; then   # every minute, and at once when a landing starts or stops being ahead
+      said=$ahead
       # Whoever holds a slot wrote their pid a hair after taking it, so what a file says for that hair is the pid
       # the PREVIOUS run left. Read until every name is of something actually alive, then say them, and wait.
       h=""; for _ in $(seq 1 40); do
-        h=$(for i in $(seq 1 "$SLOTS"); do head -1 "$(slot "$i")" 2>/dev/null; done | tr '\n' ' '); h=${h% }; live=1
+        h=$(for i in $(seq "$first" "$SLOTS"); do head -1 "$(slot "$i")" 2>/dev/null; done | tr '\n' ' '); h=${h% }; live=1
         for q in $h; do kill -0 "$q" 2>/dev/null || live=; done; [ -n "$h" ] && [ -n "$live" ] && break; sleep 0.05; done
-      echo "== waiting: $LOCKF is held by pid ${h:-?} ($((waited / 60)) min) =="
+      echo "== waiting: $LOCKF is held by pid ${h:-?}$ahead ($((waited / 60)) min) =="
     fi
     sleep 1; waited=$((waited + 1))
   done
+  exec {LQ}>&-   # a slot is ours: the landing that was waiting stops holding the others back, and no child inherits it
   : >"$(slot "$i")"; echo $$ >&$LK   # ours, and named for whoever waits next
   # Hold it HERE, and run the suite as a child with the fd shut ({LK}>&-). An flock lives until every copy of its
   # fd is closed, and a fd the suite held would be inherited by everything it spawns: one orphan it failed to reap
@@ -103,6 +123,8 @@ if [ -n "${CC_SELFTEST_LOCK_ONLY:-}" ]; then   # the case below re-runs this fil
   echo "== lock taken by pid $HOLDER =="                # it stops before a single fixture exists
   # ...and, asked to, leaves one child behind on purpose, so the case can prove the child did NOT inherit the lock.
   if [ -n "${CC_SELFTEST_LOCK_ORPHAN:-}" ]; then sleep 60 & echo "== orphan $! =="; fi
+  # ...and, asked to, keeps its slot until that file appears, so the case can see who holds what.
+  if [ -n "${CC_SELFTEST_LOCK_HOLD:-}" ]; then for _ in $(seq 1 600); do [ -e "$CC_SELFTEST_LOCK_HOLD" ] && break; sleep 0.1; done; fi
   exit 0
 fi
 pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+1)); echo "  ✗ $1"; }
@@ -3475,6 +3497,41 @@ for _ in $(seq 1 300); do grep -q '^== waiting:' "$T/lock2.out" 2>/dev/null && b
   || bad "the third run did not wait on both: $(tr '\n' ' ' <"$T/lock2.out")"
 touch "$L2.go"; wait $c3; l2rc=$?
 [ $l2rc = 0 ] && ok "...and runs the moment one of them frees" || bad "the waiter never got a slot: rc=$l2rc"
+# A LANDING GOES FIRST, on a lock of its own. Stand-ins hold slots 2..6 — every slot a run that is not a landing's may
+# use, whatever this host's core count makes its cap — and slot 1 stays free. The run with no CC_SELFTEST_SLOTS (not
+# a landing's) must wait with slot 1 free; a landing's must take slot 1 at once. Then slot 1 is held as well, a landing
+# waits, one slot frees, and the landing gets it while the other run, which was waiting first, is still waiting.
+L3="$T/lock3"; h3=""
+for i in 2 3 4 5 6; do
+  ( exec 8>>"$L3.$i"; flock 8; : >"$L3.$i"; echo $BASHPID >&8; for _ in $(seq 1 600); do [ -e "$L3.go$i" ] || [ -e "$L3.go" ] && break; sleep 0.1; done ) &
+  h3="$h3 $!"; KIDS="$KIDS $!"
+done
+for i in 2 3 4 5 6; do for _ in $(seq 1 100); do [ -s "$L3.$i" ] && break; sleep 0.1; done; done
+env -u CC_SELFTEST_SLOTS CC_SELFTEST_LOCK="$L3" CC_SELFTEST_LOCK_ONLY=1 "$SELF" >"$T/lock3n.out" 2>&1 & c3n=$!; KIDS="$KIDS $c3n"
+for _ in $(seq 1 300); do grep -q '^== waiting:' "$T/lock3n.out" 2>/dev/null && break; sleep 0.1; done
+{ grep -q '^== waiting:' "$T/lock3n.out" && ! grep -q '^== lock taken' "$T/lock3n.out" && kill -0 $c3n 2>/dev/null \
+  && flock -n "$L3" -c true; } \
+  && ok "a run that is not a landing's waits with slot 1 free — that slot is a landing's alone" \
+  || bad "the non-landing run took or failed past the reserved slot: $(tr '\n' ' ' <"$T/lock3n.out")"
+land=$(env CC_SELFTEST_LOCK="$L3" CC_SELFTEST_SLOTS=6 CC_SELFTEST_LOCK_ONLY=1 "$SELF" 2>&1)
+{ ! grep -q '^== waiting' <<<"$land" && grep -q '^== lock taken' <<<"$land"; } \
+  && ok "...and a landing's run takes it at once, however many other runs hold the rest" \
+  || bad "the landing did not get the reserved slot: $(tr '\n' ' ' <<<"$land")"
+( exec 8>>"$L3"; flock 8; : >"$L3"; echo $BASHPID >&8; for _ in $(seq 1 600); do [ -e "$L3.go" ] && break; sleep 0.1; done ) & KIDS="$KIDS $!"
+for _ in $(seq 1 100); do [ "$(head -1 "$L3" 2>/dev/null)" = "$!" ] && break; sleep 0.1; done
+env CC_SELFTEST_LOCK="$L3" CC_SELFTEST_SLOTS=6 CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_LOCK_HOLD="$L3.go" "$SELF" >"$T/lock3l.out" 2>&1 & c3l=$!; KIDS="$KIDS $c3l"
+for _ in $(seq 1 300); do grep -q '^== waiting:' "$T/lock3l.out" 2>/dev/null && break; sleep 0.1; done
+touch "$L3.go3"
+for _ in $(seq 1 300); do grep -q '^== lock taken' "$T/lock3l.out" 2>/dev/null && break; sleep 0.1; done
+sleep 2   # two of the waiters' one-second turns: time enough for the other run to take slot 3 if it were going to
+{ grep -q '^== lock taken' "$T/lock3l.out" && ! grep -q '^== lock taken' "$T/lock3n.out" && kill -0 $c3n 2>/dev/null; } \
+  && ok "...and with every slot held, the slot that frees goes to the waiting landing, not the run that was waiting before it" \
+  || bad "the landing did not go first: landing=[$(tr '\n' ' ' <"$T/lock3l.out")] other=[$(tr '\n' ' ' <"$T/lock3n.out")]"
+grep -q 'a landing waiting ahead' "$T/lock3n.out" \
+  && ok "...and the run held back says it is waiting behind a landing" || bad "no 'landing ahead' line: $(tr '\n' ' ' <"$T/lock3n.out")"
+touch "$L3.go"; wait $c3l; wait $c3n; l3rc=$?
+[ $l3rc = 0 ] && grep -q '^== lock taken' "$T/lock3n.out" \
+  && ok "...and it runs once the landing has its slot and one frees" || bad "the held-back run never got a slot: rc=$l3rc"
 fi
 cd ~ || exit 1
 # THE RUN LEFT THE BOX'S ~/.cc AS IT FOUND IT — judged on the object, not on the export block being right. Every
