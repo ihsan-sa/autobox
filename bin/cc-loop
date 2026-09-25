@@ -788,7 +788,7 @@ down still leaves the board write, which is the half of this that must never be 
   printf '#!/bin/sh\nfor a in "$@"; do printf "%%s|" "$a"; done >> "%s"; echo >> "%s"\n' "$d/lb.n" "$d/lb.n" > "$lb/cc-notify"
   printf '#!/bin/sh\n[ "$1" = reconcile ] && exit 0\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift; exec "$@"\n' > "$lb/cc-sandbox"
   printf '#!/bin/sh\nexit 0\n' > "$lb/cc-tier"
-  printf '#!/bin/sh\n[ -n "$FK_LINE" ] && printf "%%s\\n" "$FK_LINE" >> "$FK_ST/progress.md"\n[ "$FK_COMMIT" = 1 ] && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m step\nprintf "%%s\\n" "{\\"type\\":\\"result\\",\\"subtype\\":\\"success\\",\\"is_error\\":false,\\"num_turns\\":3,\\"total_cost_usd\\":1.25,\\"result\\":\\"did a step\\"}"\n' > "$lb/claude"
+  printf '#!/bin/sh\nprintf "%%s\\n" "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS-UNSET}" > "$FK_ST/bgceil"\n[ -n "$FK_LINE" ] && printf "%%s\\n" "$FK_LINE" >> "$FK_ST/progress.md"\n[ "$FK_COMMIT" = 1 ] && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m step\nprintf "%%s\\n" "{\\"type\\":\\"result\\",\\"subtype\\":\\"success\\",\\"is_error\\":false,\\"num_turns\\":3,\\"total_cost_usd\\":1.25,\\"result\\":\\"did a step\\"}"\n' > "$lb/claude"
   printf '#!/bin/sh\nprintf "%%s\\n" "{\\"task_id\\":\\"x\\",\\"committed_sha\\":\\"abc\\",\\"pending\\":{},\\"errors\\":[],\\"pr_url\\":\\"https://x/pull/9\\",\\"landing\\":{\\"message\\":\\"It is queued to land.\\"}}"\n' > "$lb/cc-land"
   chmod +x "$lb"/*
   lrun(){ c=$1; mkdir -p "$lh/.cc/state/lp/$c" "$lh/.cc/worktrees/lp/$c"; echo "the task" > "$lh/.cc/state/lp/$c/task.md"
@@ -799,9 +799,18 @@ down still leaves the board write, which is the half of this that must never be 
         FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$2" FK_COMMIT="$3" "$lb/cc-loop" lp "$c" "${@:4}" ) >/dev/null 2>&1; }
   slackn(){ grep -v '^--ask|' "$d/lb.n" | grep -c .; }   # the calls that reach Slack: all but the planner intake
   lrun it '- did one step, more to do' 0 --max-iter 1
+  t "the worker's own print run gets the background-wait ceiling removed, so a subagent still running at turn end does not kill the iteration at 600s (the 1h iteration timeout still bounds it)" \
+    "$(cat "$lh/.cc/state/lp/it/bgceil" 2>/dev/null)" 0
   t 'an iteration that ends a loop with nothing committed posts nothing to Slack: its totals and spend stay in loop.log' "$(slackn)" 0
   t '…the stop goes to the planner intake instead' "$(grep -c '^--ask|' "$d/lb.n")" 1
   t '…and loop.log still has the iteration and its budget' "$(grep -c 'iter 1 end .*total=\$1.25' "$lh/.cc/state/lp/it/loop.log")" 1
+  mkdir -p "$lh/.cc/state/lp/ceil" "$lh/.cc/worktrees/lp/ceil"; echo "the task" > "$lh/.cc/state/lp/ceil/task.md"
+  git -C "$lh/.cc/worktrees/lp/ceil" init -q; git -C "$lh/.cc/worktrees/lp/ceil" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  : > "$d/lb.n"
+  ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+      FK_ST="$lh/.cc/state/lp/ceil" FK_LINE="" FK_COMMIT=0 CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=9999 \
+      "$lb/cc-loop" lp ceil --max-iter 1 ) >/dev/null 2>&1
+  t 'a dispatcher that already set the ceiling is not overridden' "$(cat "$lh/.cc/state/lp/ceil/bgceil" 2>/dev/null)" 9999
   lrun ro '- committed a step' 1 --max-iter 1 --no-extend
   t 'a round that is over posts nothing at all' "$(grep -c . "$d/lb.n")" 0
   t '…and the board note and loop.log carry it' "$(grep -c 'round over at its step limit' "$lh/.cc/state/lp/ro/loop.log")" 1
@@ -1070,9 +1079,10 @@ while [ $i -lt "$MAXI" ]; do
     else log "iter 1 was asked to resume, but no run of this track recorded a session id — starting fresh"; fi
   fi
   TRIMENV=(); tb=$(trim_body); [ -n "$tb" ] && TRIMENV=("CLAUDE_CODE_EXTRA_BODY=$tb")   # empty unless CC_LOOP_TRIM is on: the child's environment is otherwise exactly what it always was
+  BGENV=(); [ -z "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS+x}" ] && BGENV=("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0")   # print mode's own 600s wait for background subagents killed a $10 run mid-turn; `timeout 3600` below still bounds the iteration, so this only removes a SHORTER, silent one — never overridden when the caller already set it
   log "iter $i/$MAXI start (budget \$$BUDGET, turns $TURNS, model ${m:-box default}${TRIMENV:+, context trim on})"   # the trim is named in the log so a shadow week can tell trimmed runs from the rest; the model is in the log too (a survey of what workers ran on found this default wrong) — AFTER the "start (budget" prefix cc-secretary parses (review of #169)
   out="$ST/runs/$(date -u +%Y%m%dT%H%M%SZ)-$i.json"
-  ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; CC_WORKER_SANDBOX=1 wraps it in bwrap (cc-sandbox), otherwise that line is exec'd untouched
+  ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "${BGENV[@]}" "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; CC_WORKER_SANDBOX=1 wraps it in bwrap (cc-sandbox), otherwise that line is exec'd untouched
   child=$!; wait "$child"; rc=$?; child=""
   if lim=$("$BIN/cc-limit" check "$out" "$out.err" "$m"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap ($m: the model asked, for a cap line that names none)
     resets=$(date -u -d "@${lim#LIMIT }" +%H:%M)
