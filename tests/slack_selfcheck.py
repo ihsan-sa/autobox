@@ -5523,7 +5523,7 @@ def run_selfcheck():
               (dmP.route("CASK", "channel"), dmP.route("CASK2", "channel"), dmP.route("CASK3", "channel"))
               == (None, "nosuchrepo-ask", "memberish-ask"))
         askedP = []
-        dmP.ask_start = lambda repo, text, chat, thread, ts: askedP.append((repo, text, chat, thread, ts))
+        dmP.ask_start = lambda repo, text, chat, thread, ts, owner=False: askedP.append((repo, text, chat, thread, ts, owner))
         dmP.on_event(evU("CASK", "how do I run the gates?", "4.1"))
         dmP.on_event({"type": "message", "channel": "CASK", "ts": "4.2", "user": "UMEMBER", "text": "and where is the log?",
                       "thread_ts": "4.1", "channel_type": "channel"})
@@ -5532,8 +5532,8 @@ def run_selfcheck():
         check("a question in #<repo>-ask — the owner's or a member's, root or follow-up — goes to cc-ask with the repo and "
               "the thread; nothing is delivered, no session is started, no dir is provisioned, no 'no project maps' "
               "notice; a `!command` there is still the daemon's and an empty message (a bare file) is no question",
-              askedP == [("myrepo", "how do I run the gates?", "CASK", "4.1", "4.1"),
-                         ("myrepo", "and where is the log?", "CASK", "4.1", "4.2")]
+              askedP == [("myrepo", "how do I run the gates?", "CASK", "4.1", "4.1", True),
+                         ("myrepo", "and where is the log?", "CASK", "4.1", "4.2", False)]
               and delivP == [] and not [t for _, t in saidP if "no project maps" in t] and not os.path.exists(f"{devP}/myrepo-ask"))
         del dmP.ask_start
         # ask_soon itself, through a stub cc-ask: the reply is posted in the thread as printed, a follow-up carries the
@@ -5568,6 +5568,53 @@ def run_selfcheck():
               and [t for c, t in saidP if c == "CASK"] == ["*Run `cc-green`.*\n_source: ~/USAGE.md § cc-green_"] * 2
               + ["no answer this time (cc-ask: no reply — Budget of $0.25 exceeded) — ask again, or ask in #myrepo",
                  f"no answer this time (no answer in {ASK_TIMEOUT} s) — ask again, or ask in #myrepo"])
+        # a document ask (brief: "an ask that names a document gets the PDF attached in the thread ... an ask can never
+        # attach a file from outside the register"): the owner's question carries --documents and a `_file:` reply
+        # inside the register goes up as the file with the text as its comment; a path outside it, or anyone else's
+        # question, is never uploaded and the `_file:` line never reaches the thread
+        docsD = tempfile.mkdtemp(prefix="cc-slack-docs-")
+        os.makedirs(f"{docsD}/reg/files/001")
+        os.makedirs(f"{docsD}/reg/ws/0123456789abcdef/files/901")
+        filed = f"{docsD}/reg/files/001/001-0003-A_autobox-pitch.pdf"
+        stray = f"{docsD}/stray.pdf"
+        other = f"{docsD}/reg/ws/0123456789abcdef/files/901/901-0001-A_study-plan.pdf"   # under the root, not registered
+        for f in (filed, stray, other):
+            open(f, "w").write("%PDF-1.4\n")
+        json.dump({"version": 1, "projects": {}, "documents": {"001-0003": {"title": "Autobox pitch", "revisions": [
+            {"rev": "A", "file": "files/001/001-0003-A_autobox-pitch.pdf", "date": "2026-09-23"}]}}},
+            open(f"{docsD}/reg/register.json", "w"))
+        runsD, upsD = [], []
+        def runD(cmd, **k):
+            runsD.append(cmd)
+            where = {"the stray": stray, "the view": other}.get(cmd[-1], filed)
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"*001-0003-A* Autobox pitch\n_source: the document register_\n_file: {where}_\n", stderr="")
+        def upD(cfg, path, to, thread=None, comment=None, mail=True, **k):
+            upsD.append((path, to, thread, comment, mail))
+            return "F1", to
+        wasD = Effects("askdoc", run=runD, dev=devP).install()
+        _upD, _rootD = globals()["upload_file"], globals()["DOCS_ROOT"]
+        globals()["upload_file"], globals()["DOCS_ROOT"] = upD, f"{docsD}/reg"
+        try:
+            saidP.clear()
+            dmP.ask_soon("myrepo", "the pitch", "CASK", "5.1", "5.1", True)
+            dmP.ask_soon("myrepo", "the stray", "CASK", "5.2", "5.2", True)
+            dmP.ask_soon("myrepo", "the pitch", "CASK", "5.3", "5.3", False)
+            dmP.ask_soon("myrepo", "the view", "CASK", "5.4", "5.4", True)
+        finally:
+            wasD.install(); globals()["DEV"] = devP
+            globals()["upload_file"], globals()["DOCS_ROOT"] = _upD, _rootD
+            shutil.rmtree(docsD, ignore_errors=True)
+        said5 = [t for c, t in saidP if c == "CASK"]
+        check("ask_soon, a document: the owner's question runs `cc-ask answer --documents`, anyone else's plain "
+              "`answer`; a `_file:` inside the register is uploaded in the thread with the reply (less that line) as "
+              "its comment and not mailed; a `_file:` outside the register is not uploaded and says so; a member's "
+              "reply is never read for a file; and a PDF under the register's root that register.json does not list "
+              "(another workspace's ws/<id>/ copy, a forged `_file:` line) is refused the same way",
+              [c[2] for c in runsD] == ["--documents", "--documents", "myrepo", "--documents"]
+              and upsD == [(os.path.realpath(filed), "CASK", "5.1", "*001-0003-A* Autobox pitch\n_source: the document register_", False)]
+              and len(said5) == 3 and "nothing attached: that file is not in the document register" in said5[0]
+              and "_file:" not in said5[0] and said5[1].rstrip().endswith(f"_file: {filed}_")
+              and "nothing attached: that file is not in the document register" in said5[2] and "_file:" not in said5[2])
         shutil.rmtree(f"{devP}/memberish")               # this block's own fixture; the provisioning cases below count devP's dirs
         delivP.clear(); saidP.clear()
         dmP.on_event(evU("CUPD", "how is the deploy going?", "3.1"))

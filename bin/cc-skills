@@ -2,7 +2,9 @@
 # cc-skills — the skills every Claude session on the box gets, kept at the tip of their own git repos.
 #   cc-skills sync       clone a listed skill that is missing, fast-forward one that is there; rides cc-reconcile.service
 #   cc-skills list       name<TAB>url<TAB>branch<TAB>state for each listed skill
-#   cc-skills names      the listed skills that are installed and are clones of their url — what cc-sandbox binds
+#   cc-skills names      the listed skills that are installed and are clones of their url — what cc-sandbox binds;
+#                        cc-sandbox adds the clone each valid alias resolves into
+#   cc-skills aliases    name<TAB>target for each well-formed alias line — the only aliases cc-sandbox looks at
 #   cc-skills selfcheck
 # THE LIST is one file, one skill per line: `<name> <git url> [<branch>]`, `#` for comments. Adding a skill is one
 #   line there. It is the tree's own config/skills.list, and on a box that keeps this tree as core/ inside a private
@@ -16,10 +18,14 @@
 #   is refused, and a directory at the name that is not that copy is left alone, as for a clone.
 # AN ALIAS LINE reads `<name> -> <clone>/<path...>` in place of a url — `vde -> chip-flow/skills/vde` means
 #   ~/.claude/skills/vde is the directory skills/vde inside the listed clone ~/.claude/skills/chip-flow. sync only
-#   ever keeps the symlink's text matching the line; names prints the name and cc-sandbox's skills_bind binds it,
-#   each doing its own realpath check first — the target has to resolve into a directory strictly inside another
-#   line's own clone, no `..` and no symlink escaping it, or the line is refused with one stderr line and never
-#   listed or bound. The same name rules apply as any other line, synced included.
+#   ever keeps the symlink's text matching the line, and only once the target passes the same check names makes: a
+#   target that is absolute or climbs out with `..`, or that does not resolve into a skill inside another line's own
+#   clone, gets no link (and loses the one it had), one stderr line. names prints the name and cc-sandbox's skills_bind
+#   binds it, each doing its own realpath check again — no `..` and no symlink escaping the clone — or the line is
+#   refused and never listed or bound. The clone a valid alias resolves into is bound too, at its own name, because a
+#   sub-skill runs its clone's own tools (chip-flow's bin/eda) from there. The same name rules apply as any other line,
+#   synced included. A LINE DROPPED from the list takes its link with it: sync records the alias links it keeps in
+#   ~/.cc/skills/aliases and removes one whose line is gone, never a symlink it did not make.
 # WHERE: each skill is a plain clone at ~/.claude/skills/<name>, where every host session finds it. The name `synced`
 #   belongs to the account's own sync and is never taken; a directory at a listed name that is not a clone of that url
 #   (a skill someone made by hand) is left alone and reported. A new clone is made beside it under a dot name and
@@ -62,8 +68,8 @@ entries(){
 
 # name<TAB>target for each well-formed ALIAS line (`<name> -> <clone>/<path...>`, the header's AN ALIAS LINE); a bad
 #   line is one stderr line and skipped. Whether <target> actually resolves into a listed clone is not decided here —
-#   sync_alias only keeps the symlink's text matching this line, and names/skills_bind each do their own realpath
-#   check on what is really on disk, every time, never trusting an earlier pass.
+#   sync_alias checks it before it links, and names/skills_bind each check again on what is really on disk, every
+#   time, never trusting an earlier pass.
 alias_entries(){
   [ -f "$LIST" ] || return 0
   local name arrow target extra ln=0
@@ -137,20 +143,47 @@ sync1(){   # $1 name $2 url $3 branch
   ok "$n"; return 0; }
 
 sync_alias(){   # $1 name $2 target (config/skills.list's ALIAS line) → keeps ~/.claude/skills/<name> a symlink to it.
-  # Mechanical only, as the header says: whether <target> resolves into a listed clone is names' and skills_bind's to
-  # decide, each time, from the real filesystem — this just keeps the symlink's text matching the line.
-  local n="$1" tgt="$2" d="$SK/$1"
+  # The target is checked BEFORE any link is written (alias_in, the test names makes): absolute or `..` is refused on its
+  # text, anything else has to resolve into a skill inside a managed clone. A refused line leaves no link at the name,
+  # the old one included. names and skills_bind still check the link on disk again each time, trusting no earlier pass.
+  local n="$1" tgt="$2" d="$SK/$1" why=""
+  if [ -e "$d" ] && [ ! -L "$d" ]; then
+    fail "$n" "the directory $d is there and is not an alias cc-skills made — left alone"; return 1; fi
+  case "/$tgt/" in
+    //|/[/]*|*/../*|*/./*) why="is absolute or climbs out with ..";;
+    *) alias_in "$SK/$tgt" >/dev/null || why="does not resolve to a skill (a dir with a SKILL.md) inside a clone this list manages";;
+  esac
+  if [ -n "$why" ]; then
+    [ -L "$d" ] && rm -f "$d"
+    fail "$n" "the alias target $tgt $why — no link made"; return 1; fi
   if [ -L "$d" ]; then
     [ "$(readlink "$d" 2>/dev/null)" = "$tgt" ] && { ok "$n"; return 0; }
     ln -sfn "$tgt" "$d" 2>/dev/null && { echo "cc-skills: $n now points at $tgt"; ok "$n"; return 0; }
     fail "$n" "could not repoint the alias to $tgt"; return 1; fi
-  if [ -e "$d" ]; then
-    fail "$n" "the directory $d is there and is not an alias cc-skills made — left alone"; return 1; fi
   mkdir -p "$SK" && ln -s "$tgt" "$d" 2>/dev/null && { echo "cc-skills: $n aliased to $tgt"; ok "$n"; return 0; }
   fail "$n" "could not make the alias to $tgt"; return 1; }
+# THE ALIAS RECORD, ~/.cc/skills/aliases: one name per line, each an alias link sync keeps. A recorded name with no alias
+#   line now loses its link (a symlink only: whatever else sits there is not the link sync made), before the clones sync,
+#   so a name moved from an alias line to a clone line is free for its clone. Nothing unrecorded is ever removed.
+prune_aliases(){ local f="$ST/aliases" cur n
+  [ -f "$f" ] || return 0
+  cur=$(alias_entries 2>/dev/null | cut -f1)
+  while IFS= read -r n; do
+    [[ "$n" =~ ^[a-z0-9][a-z0-9._-]*$ ]] && [ "$n" != synced ] || continue
+    grep -qxF -- "$n" <<<"$cur" && continue
+    [ -L "$SK/$n" ] && rm -f "$SK/$n" && echo "cc-skills: $n has no alias line now — its link is removed"
+    rm -f "$ST/$n.fail"
+  done < "$f"; }
+record_aliases(){ local f="$ST/aliases" n
+  mkdir -p "$ST" || return 0
+  { alias_entries 2>/dev/null | cut -f1; cat "$f" 2>/dev/null || :; } | sort -u | while IFS= read -r n; do
+    if [[ "$n" =~ ^[a-z0-9][a-z0-9._-]*$ ]] && [ "$n" != synced ] && [ -L "$SK/$n" ]; then printf '%s\n' "$n"; fi; done > "$f.new.$$" \
+    && mv -f "$f.new.$$" "$f"; rm -f "$f.new.$$"; }
 cmd_sync(){ local n u b bad=0
+  prune_aliases
   while IFS=$'\t' read -r n u b; do sync1 "$n" "$u" "$b" || bad=1; done < <(entries)
   while IFS=$'\t' read -r n u; do sync_alias "$n" "$u" || bad=1; done < <(alias_entries)
+  record_aliases
   return "$bad"; }
 cmd_list(){ local n u b s
   while IFS=$'\t' read -r n u b; do
@@ -158,28 +191,30 @@ cmd_list(){ local n u b s
     elif managed "$SK/$n" "$u"; then s="at $(at "$SK/$n" "$u")"
     elif [ -e "$SK/$n" ]; then s="not a clone of the url"; else s="not cloned yet"; fi
     printf '%s\t%s\t%s\t%s\n' "$n" "$u" "${b:-default}" "$s"; done < <(entries); }
-# alias_valid $1 name → the RESOLVED real path on stdout when ~/.claude/skills/<name> is a symlink whose target
+# alias_valid $1 name → "<RESOLVED real path>\t<clone>" on stdout when ~/.claude/skills/<name> is a symlink whose target
 #   realpaths into a directory strictly inside another line's own clone (managed, and holding a SKILL.md) — never a
 #   chain onto a second alias, since only entries() (never alias_entries) supplies the candidate clones below. `..`
 #   and a symlink partway down the target both wash out in realpath -e, so the containment check on its RESULT is the
 #   whole test; anything else is 1, and the caller says so.
-alias_valid(){
-  local n="$1" resolved c cu creal
-  [ -L "$SK/$n" ] || return 1
-  resolved=$(realpath -e "$SK/$n" 2>/dev/null) || return 1
+alias_valid(){ [ -L "$SK/$1" ] && alias_in "$SK/$1"; }
+# alias_in $1 a path → the same test on any path (sync_alias runs it on ~/.claude/skills/<target> BEFORE it makes the link,
+#   which resolves exactly as the link would, the link being relative to ~/.claude/skills): "<resolved>\t<clone>" or 1.
+alias_in(){
+  local resolved c cu creal
+  resolved=$(realpath -e "$1" 2>/dev/null) || return 1
   [ -d "$resolved" ] && [ -f "$resolved/SKILL.md" ] || return 1
   while IFS=$'\t' read -r c cu _; do
     managed "$SK/$c" "$cu" || continue
     creal=$(realpath -e "$SK/$c" 2>/dev/null) || continue
-    case "$resolved" in "$creal"|"$creal"/*) printf '%s' "$resolved"; return 0;; esac
-  done < <(entries)
+    case "$resolved" in "$creal"|"$creal"/*) printf '%s\t%s\n' "$resolved" "$c"; return 0;; esac
+  done < <(entries 2>/dev/null)
   return 1; }
 cmd_names(){ local n u b tgt
   while IFS=$'\t' read -r n u b; do managed "$SK/$n" "$u" && [ -f "$SK/$n/SKILL.md" ] && printf '%s\n' "$n"; done < <(entries)
   while IFS=$'\t' read -r n tgt; do alias_valid "$n" >/dev/null && printf '%s\n' "$n"; done < <(alias_entries); :; }
 
 selfcheck(){   # its own HOME: a fixture upstream, a fixture list, a fixture notifier; git only, no network
-  local fh n=0 bad=0 up up2 out rc
+  local fh n=0 bad=0 up up2 out rc a
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccskills-XXXXXX") || return 1
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   run(){ env -u CC_SKILLS_TIMEOUT HOME="$fh" CC_SKILLS_LIST="$fh/list" CC_SKILLS_NOTIFY="$fh/notify" CC_SKILLS_TREE="$fh/tree" \
@@ -241,22 +276,42 @@ selfcheck(){   # its own HOME: a fixture upstream, a fixture list, a fixture not
   t '--help exits 0' "$("$SELF" --help >/dev/null 2>&1; echo $?)" 0
   # ALIAS lines: a second clone holding a sub-skill, a symlink inside it that escapes, a directory sitting at an
   # unlisted name, and every name/target failure names is supposed to catch
-  up2="$fh/up/fx-clone"; mkdir -p "$up2/skills/vde" "$up2/skills/nomd"
-  printf -- '---\nname: vde\n---\nv1\n' > "$up2/skills/vde/SKILL.md"
+  up2="$fh/up/fx-clone"; mkdir -p "$up2/skills/vde" "$up2/skills/ade" "$up2/skills/nomd"
+  printf -- '---\nname: vde\n---\nv1\n' > "$up2/skills/vde/SKILL.md"; printf -- '---\nname: ade\n---\na1\n' > "$up2/skills/ade/SKILL.md"
   ln -s /etc "$up2/skills/escape"
   git -C "$up2" init -q -b main && gi -C "$up2" add -A && gi -C "$up2" commit -qm v1 || return 1
   mkdir -p "$fh/.claude/skills/nope-clone/skills/x" && printf -- '---\nname: x\n---\n' > "$fh/.claude/skills/nope-clone/skills/x/SKILL.md"
-  printf 'fx-clone %s\nvde -> fx-clone/skills/vde\nsynced -> fx-clone/skills/vde\nBad/Name -> fx-clone/skills/vde\nescaped -> fx-clone/skills/escape\ngone -> fx-clone/skills/gone\nbaremd -> fx-clone/skills/nomd\nstray -> nope-clone/skills/x\n' "$up2" > "$fh/list"
-  out=$(run sync 2>&1)
+  printf 'fx-clone %s\nvde -> fx-clone/skills/vde\nsynced -> fx-clone/skills/vde\nBad/Name -> fx-clone/skills/vde\nescaped -> fx-clone/skills/escape\ngone -> fx-clone/skills/gone\nbaremd -> fx-clone/skills/nomd\nstray -> nope-clone/skills/x\nabs -> /etc\nclimb -> fx-clone/../nope-clone/skills/x\n' "$up2" > "$fh/list"
+  out=$(run sync 2>&1); rc=$?
   t 'sync: a good alias line is kept as a symlink to its target' "$(readlink "$fh/.claude/skills/vde" 2>/dev/null)" 'fx-clone/skills/vde'
+  t 'sync: a target that is absolute or climbs out with .., escapes its clone, dangles, has no SKILL.md or sits in no listed clone gets no link at all, each saying so, exit 1' \
+    "$(find "$fh/.claude/skills" -maxdepth 1 -type l -printf '%f\n' | sort | tr '\n' ' ')/$(grep -c 'absolute or climbs out with' <<<"$out")/$(grep -c 'does not resolve to a skill' <<<"$out")/$rc" 'vde /2/4/1'
+  t 'aliases: prints each well-formed alias line, refused targets included, for cc-sandbox to check itself' \
+    "$(run aliases 2>/dev/null | cut -f1 | tr '\n' ' ')" 'vde escaped gone baremd stray abs climb '
   t 'sync: synced and a bad name are refused as aliases too, each saying so' "$(grep -c 'other than synced' <<<"$out")" 2
+  # sync made none of the bad links, so plant them by hand: names has to refuse what is on disk on its own
+  for a in escaped:escape gone:gone baremd:nomd; do ln -s "fx-clone/skills/${a#*:}" "$fh/.claude/skills/${a%%:*}"; done
+  ln -s nope-clone/skills/x "$fh/.claude/skills/stray"
   t 'names: the good alias resolves inside its clone and is listed, alone' "$(run names 2>/dev/null | tr '\n' ' ')" 'vde '
   t 'names: a symlink inside the clone that escapes it, a dangling target, one with no SKILL.md, and one naming a directory no line lists are all left out — none read outside' \
     "$(run names 2>/dev/null | grep -cE '^(escaped|gone|baremd|stray)$')/$(cat /etc/hostname 2>/dev/null >/dev/null; echo checked)" 0/checked
   # a changed line repoints the symlink; a hand-made directory at an alias's name is left alone and the run exits 1
+  printf 'fx-clone %s\nvde -> fx-clone/skills/ade\n' "$up2" > "$fh/list"
+  run sync >/dev/null 2>&1
+  t 'sync: a changed alias line repoints the symlink' "$(readlink "$fh/.claude/skills/vde" 2>/dev/null)" 'fx-clone/skills/ade'
   printf 'fx-clone %s\nvde -> fx-clone/skills/nomd\n' "$up2" > "$fh/list"
   run sync >/dev/null 2>&1
-  t 'sync: a changed alias line repoints the symlink' "$(readlink "$fh/.claude/skills/vde" 2>/dev/null)" 'fx-clone/skills/nomd'
+  t 'sync: a line changed to a target that fails the check loses the link it had' "$([ -L "$fh/.claude/skills/vde" ] && echo link || echo none)" none
+  # a DROPPED line: the link sync made goes; a symlink the owner made by hand, never recorded, stays
+  printf 'fx-clone %s\nvde -> fx-clone/skills/vde\nade -> fx-clone/skills/ade\n' "$up2" > "$fh/list"
+  run sync >/dev/null 2>&1; ln -s fx-clone/skills/ade "$fh/.claude/skills/byhand"
+  printf 'fx-clone %s\nvde -> fx-clone/skills/vde\n' "$up2" > "$fh/list"
+  out=$(run sync 2>&1); rc=$?
+  t 'sync: an alias whose line was dropped loses its link, says so, and a symlink sync never made stays' \
+    "$rc/$([ -L "$fh/.claude/skills/ade" ] && echo link || echo gone)/$(grep -c 'ade has no alias line now' <<<"$out")/$(readlink "$fh/.claude/skills/byhand")/$(readlink "$fh/.claude/skills/vde")" \
+    '0/gone/1/fx-clone/skills/ade/fx-clone/skills/vde'
+  printf 'fx-clone %s\nvde -> fx-clone/skills/nomd\n' "$up2" > "$fh/list"
+  run sync >/dev/null 2>&1
   rm -f "$fh/.claude/skills/vde"; mkdir -p "$fh/.claude/skills/vde"; echo mine > "$fh/.claude/skills/vde/SKILL.md"
   out=$(run sync 2>&1); rc=$?
   t 'sync: a hand-made directory at an alias'"'"'s name is left alone and the run exits 1' "$(cat "$fh/.claude/skills/vde/SKILL.md")/$rc" mine/1
@@ -267,7 +322,8 @@ case "${1:-}" in
   sync) cmd_sync;;
   list) cmd_list;;
   names) cmd_names;;
+  aliases) alias_entries;;
   selfcheck) selfcheck;;
   -h|--help|help) sed -n '2,/^set -/p' "$SELF" | sed '$d; s/^# \{0,1\}//';;
-  *) echo "usage: cc-skills sync|list|names|selfcheck" >&2; exit 2;;
+  *) echo "usage: cc-skills sync|list|names|aliases|selfcheck" >&2; exit 2;;
 esac

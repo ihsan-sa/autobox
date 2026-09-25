@@ -33,7 +33,7 @@
 
 Routing: #<repo> → its planning session, a reply in a track's 🧵 thread in #<repo> → that track's session (a legacy #<repo>--<track> channel routes the same), DMs and #box → the box's own Remote-Control session.
 Two lanes per project: #<repo> is for the owner (questions, decisions), #<repo>-updates carries what is automated or long; a reply stays on the lane it was asked on.
-A third name is not a session: #<repo>-ask is the question lane — what is typed there goes to `cc-ask <repo>` (one small-model read of the docs and the knowledge library, the source named in the reply) and comes back in the thread; no session is woken, started or provisioned for it, and a reaction there reaches nobody.
+A third name is not a session: #<repo>-ask is the question lane — what is typed there goes to `cc-ask <repo>` (one small-model read of the docs and the knowledge library, the source named in the reply) and comes back in the thread; no session is woken, started or provisioned for it, and a reaction there reaches nobody. The owner's ask there for a filed document ("001-0004", "the pitch") comes back as its PDF from the document register.
 #approvals and #alerts keep their own jobs; a sub-orch or track channel isn't split, it inherits its parent's lanes.
 A sub-orchestrator gets its own channel (~/.cc/slack/orchs.json): "@alias" in the repo channel reaches it, "@main"/"@other" hands the thread back.
 Override routing in ~/.cc/slack/routes.json.
@@ -99,6 +99,7 @@ CANVASES = "canvases.json"                                     # {"<chat>": {can
 REVISIT = "revisit.json"                                       # {"<chat>:<root_ts>": {...}}: threads the owner 📌'd, until the 📌 comes off
 ASK_TIMEOUT = 150                  # cc-ask's own cap is CC_ASK_TIMEOUT (120 s); this is the daemon's patience past it
 ASK_CONTEXT = 8                    # the most thread messages a follow-up carries to cc-ask as context
+DOCS_ROOT = os.environ.get("CC_DOCS_ROOT") or f"{HOME}/.cc/documents"   # cc-docs' register: the only files the ask lane attaches
 PR_RE = re.compile(r"^\[([a-z0-9_-]+)\] PR #([0-9]+):")
 # The card in #approvals ("❓ <@owner> 🔐 *Approval needed:* [repo] PR #n …"): cc-land posts one itself for
 # a head held under a protected path, and the owner's own 👍 on THAT card is what queues the head (on_approval) — the
@@ -1230,6 +1231,34 @@ def ask_lane(name):
         return None
     return base
 
+def doc_registered(real):
+    """True when `real` (a resolved path) is a revision the register at DOCS_ROOT lists: register.json's own entries,
+    resolved the same way, and nothing else under the root. The ws/<id>/ views sit under the root too, and a member's
+    copy there is not a revision of the owner's register — cc-ask's doc_revision is the same test."""
+    root = os.path.realpath(DOCS_ROOT)
+    try:
+        with open(os.path.join(root, "register.json")) as f:
+            reg = json.load(f)
+        docs = reg.get("documents") or {}
+        return any(os.path.realpath(os.path.join(root, r.get("file") or "")) == real
+                   for d in docs.values() for r in d.get("revisions") or ())
+    except (OSError, ValueError, AttributeError):
+        return False
+
+def ask_file(out):
+    """cc-ask's reply → (text, path or None). A document answer ends `_file: <path>_` (cc-ask --documents); the line
+    is stripped from the text, and the path is kept only when it resolves to a PDF inside the register's root that
+    register.json lists as a revision — "an ask can never attach a file from outside the register" (the brief),
+    checked here as well as in cc-ask, which strips any `_file:` line a model wrote."""
+    head, _, last = out.rstrip().rpartition("\n")
+    m = re.fullmatch(r"_file: (.+)_", last.strip())
+    if not m:
+        return out, None
+    real, root = os.path.realpath(m.group(1)), os.path.realpath(DOCS_ROOT)
+    if real.startswith(root + os.sep) and real.endswith(".pdf") and os.path.isfile(real) and doc_registered(real):
+        return head.rstrip(), real
+    return head.rstrip() + "\n(nothing attached: that file is not in the document register)", None
+
 def lane_split(name):
     """Does #name get an -updates sibling? A repo channel does; #approvals, #alerts, an already-split lane, a
     `#<repo>--<track>` channel (already a detail lane), VITALS_STORE (nobody talks there) and the ask lane (a lane
@@ -1377,6 +1406,8 @@ MEMBER_INSTRUCTIONS = """## Projects
   with nobody typing anything. Same three an hour, same rules on the name: it is your folder's name, so a name
   the box cannot use is refused with the reason rather than folded into some other project's.
 - `#{chan}-updates` carries the automated flow — progress, budget notices, audits.
+- The documents the box has filed for you are under `~/.cc/documents` (`cc-docs find <number or words>`). They are
+  read-only: to send one, copy it into your own folder first and send it with the file tool.
 """
 MEMBER_README = """# {handle}
 
@@ -4763,7 +4794,7 @@ class Daemon:
             return
         askr = ask_lane(self.chan_name(chat)) if ctype != "im" else None
         if askr:   # #<repo>-ask: the question lane. cc-ask answers from the record; no session is looked for or started
-            return self.ask_start(askr, text, chat, thread, ts) if text.strip() else None   # a bare file is no question
+            return self.ask_start(askr, text, chat, thread, ts, is_owner) if text.strip() else None   # a bare file is no question
         m = PERM_RE.match(text)
         if m:
             allow = m.group(1).lower().startswith("y")
@@ -4835,18 +4866,21 @@ class Daemon:
             text = self.attach(text, ev["files"], got, meta, ws)
         return self.hand_off(target, text, meta, chat, thread, ts, route_alias)
 
-    def ask_start(self, repo, text, chat, thread, ts):
+    def ask_start(self, repo, text, chat, thread, ts, owner=False):
         """A question in #<repo>-ask: 👀 at once, then cc-ask on a thread of its own (a read of the record takes seconds
         to tens of seconds and on_event runs on this chat's single executor), and what it prints goes back in the
         thread. Nothing here reaches a session: no deliver, no autostart, no dir, no mark."""
         react(self.cfg, chat, ts, "eyes")
-        threading.Thread(target=self._safe, args=(self.ask_soon, repo, text, chat, thread, ts), daemon=True).start()
+        threading.Thread(target=self._safe, args=(self.ask_soon, repo, text, chat, thread, ts, owner), daemon=True).start()
         return None
 
-    def ask_soon(self, repo, text, chat, thread, ts):
+    def ask_soon(self, repo, text, chat, thread, ts, owner=False):
         """The question, off the executor. A follow-up carries the thread so far (its last few messages, who said each)
         on cc-ask's stdin; the reply is cc-ask's stdout, posted as it is. No reply (exit 1, a timeout, a crash) is ONE
-        line in the thread naming why and where to ask instead: a 👀 with nothing after it is a failure the owner cannot see."""
+        line in the thread naming why and where to ask instead: a 👀 with nothing after it is a failure the owner cannot see.
+        The owner's question may be for a document (cc-ask --documents; the whole register is his): a reply naming a
+        filed PDF (ask_file) goes up as that file with the reply as its comment. Anyone else in the lane gets no
+        lookup, because a member may only ever reach that member's own documents and nothing here says whose they are."""
         ctx = ""
         if thread != ts:
             try:
@@ -4858,7 +4892,7 @@ class Daemon:
                             for m in msgs if m.get("ts") != ts)
         out, why = "", ""
         try:
-            p = EFFECTS.run([f"{BIN}/cc-ask", "answer", repo, text], input=ctx, capture_output=True, text=True,
+            p = EFFECTS.run([f"{BIN}/cc-ask", "answer"] + (["--documents"] if owner else []) + [repo, text], input=ctx, capture_output=True, text=True,
                             timeout=ASK_TIMEOUT)
             out = (p.stdout or "").strip()
             why = ((p.stderr or "").strip().splitlines() or [f"cc-ask exit {p.returncode}"])[-1]
@@ -4868,6 +4902,14 @@ class Daemon:
             why = f"no answer in {ASK_TIMEOUT} s"
         except Exception as e:
             why = e.__class__.__name__
+        out, path = ask_file(out) if owner else (out, None)
+        if path:
+            try:
+                upload_file(self.cfg, path, chat, thread, comment=out, mail=False)
+                return
+            except Exception as e:
+                log(f"ask {repo}: {path} not attached ({e!r})")
+                out += "\n(the file could not be attached this time — ask again)"
         if out:
             self.say(chat, out, thread)
         else:
