@@ -56,6 +56,22 @@ reminders. Technical records stay on disk (journals, logs, the board) without be
 posts a landing record in `#<repo>-updates`. A protected action that still needs the owner's authority is described
 as that action, even when a PR implements it, and an ordinary reaction never authorizes it.
 
+**A command only the owner may run goes on the card itself.** When the auto-mode classifier refuses a command to
+every session, the control seat posts `cc-notify --approval --run '<cmd>' "<what it does>"`. The card shows the
+command and a `run:<sha256>` stamp, and the command is stored on the host under the card's ts
+(`~/.cc/approvals/run/<ts>.json`, 0600). The owner's own 👍 on that card starts `cc-slack run-approved`, which checks
+the record is the box user's own and unshared, its sha256 still matches, the card is the bot's, was never edited and
+ends with that exact command and stamp (a stamp in the middle of a card, say in a PR title, matches nothing), and the
+owner's 👍 is on it in Slack. Then it claims the card on the host (an O_EXCL `.ran` file) and in Slack (the bot's ⏳ on
+the card, refused if it is already there), runs the stored text with `bash -c` as the box's user, and replies in the
+thread with the exit code only. Members read `#approvals`, so the output tail goes to the owner's DM, with tokens, keys
+and `NAME=secret` values masked; the whole output stays in `~/.cc/approvals/run/<ts>.ran`. It runs in a
+transient user unit, so a command that restarts the daemon still reports back. A member's 👍, a second 👍, an edited
+card or a changed record runs nothing, and `~/.cc/approvals/run/log` says why. Only the control seat can post such a
+card: from a worker, a member workspace or any kind but `--approval`, `--run` is refused and nothing is posted.
+So is a card with three backticks anywhere in it, or a command holding a control, bidi or zero-width
+character, because either can make the card show one command while another runs.
+
 **`#<repo>-updates` is the one box log lane; nobody has to read it.**
 
 ## Session style rules

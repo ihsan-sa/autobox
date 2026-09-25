@@ -10,6 +10,11 @@
 #     --decision  A CHOICE ONLY THE OWNER CAN MAKE: #<repo>, `❓ @owner *Decision needed:* <one question>`.
 #     --approval  AN AUTHORIZATION (a protected path, a restart, spend beyond authority): #approvals,
 #                 `❓ @owner 🔐 *Approval needed:* <action and consequence>`. One live card per --id.
+#     --run '<cmd>'  with --approval only: the card carries the exact command and a `run:<sha>` stamp, and the command
+#                 is stored on the host beside it (~/.cc/approvals/run/<card ts>.json, 0600). The owner's own 👍 on that
+#                 card runs it once, as the box's user: the exit code comes back in the card's thread, the output in his DM
+#                 (`cc-slack run-approved`). Refused, with nothing posted, anywhere a --approval card cannot be made:
+#                 a caller that is not the control seat, a member workspace, or a box with no bot token.
 #     --owner     the owner's DM. Same authority as --decision.
 #     --heading   the bold line a person sees in place of the title. The title still routes, dedups and names the kind.
 #     AUTHORITY: only the CONTROL SEAT reaches the owner — the control repo's planning session, or the box's own hand
@@ -483,6 +488,47 @@ PY
   k "$(yes_ grep -q -- '-c #approvals --mention 🔐 \*Approval needed:\* PR #7 touches' <<<"$(args)")" "…posted in #approvals as ❓ @owner 🔐 *Approval needed:* <action and consequence>"
   k "$(no_ grep -q -- '--route' <<<"$(args)")" "…and never routed by title into the main lane: an authorization is not a decision"
 
+  # A CARD THAT CARRIES A COMMAND (--run): the command and its stamp are on the card, and the command is stored on the
+  # host under the card's ts, 0600 in a 0700 dir — cc-slack run-approved reads it from there, never from Slack.
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n[ "$1" = post ] && echo 1790000000.000100\nexit 0\n' "$T/slack.args" > "$NH/bin/cc-slack"
+  chmod +x "$NH/bin/cc-slack"; rm -rf "$NH/.cc/approvals"
+  runcmd='systemctl --user restart cc-land-lane@a.service && echo "done > ok"'
+  runsha=$(printf '%s' "$runcmd" | sha256sum | cut -c1-64)
+  N --approval --run "$runcmd" -t "demorepo approval" "restart the landing lane, which drops its queue"
+  rrec="$NH/.cc/approvals/run/1790000000.000100.json"
+  k "$(yes_ grep -qF -- "restart cc-land-lane@a.service &amp;&amp; echo \"done &gt; ok\"" <<<"$(args)")" "--run: the card shows the exact command, &<> escaped so Slack cannot read it as a link"
+  k "$(yes_ grep -qF -- "\`run:${runsha:0:16}\`" <<<"$(args)")" "…and carries the run:<sha256> stamp run-approved checks the card by"
+  k "$(yes_ test "$(jq -r .cmd "$rrec" 2>/dev/null)" = "$runcmd")" "…and the command is stored on the host under the card's ts, as written (unescaped)"
+  k "$(yes_ test "$(jq -r .sha256 "$rrec" 2>/dev/null)" = "$runsha")" "…with its sha256"
+  k "$(yes_ test "$(stat -c %a "$rrec" 2>/dev/null)/$(stat -c %a "${rrec%/*}" 2>/dev/null)" = 600/700)" "…in a file only this user reads (0600, dir 0700)"
+  echo '{"cmd":"kept"}' > "$rrec"
+  N --approval --run "echo other" -t "demorepo approval" "a second card the stub gives the same ts"
+  k "$(yes_ test "$(jq -r .cmd "$rrec")" = kept)" "…and a record already on file for that ts is never rewritten"
+  mkdir -p "$T/rwt/.cc"; printf 'demorepo\nrtrack\nsid\n' > "$T/rwt/.cc/track"; rm -rf "$NH/.cc/approvals"
+  NC "$T/rwt" --approval --run "echo from a worker" -t "demorepo approval" "may a worker's card run this?"
+  k "$(yes_ test "$(no_ test -s "$T/slack.args")$(no_ test -e "$NH/.cc/approvals/run")$(grep -c 'nothing posted' "$T/err")" = 001)" "--run from a worker is refused whole: nothing posted, no record, one stderr line"
+  N --decision --run "echo on a decision" -t "demorepo blocked" "does a decision card run this?"
+  k "$(yes_ test "$(no_ grep -q "^post" "$T/slack.args")$(no_ test -e "$NH/.cc/approvals/run")" = 00)" "--run on anything but --approval is refused, nothing posted"
+  : > "$T/slack.args"
+  ( cd "$T" && env -u CC_NOTIFY_LOG_ONLY -u CC_ROLE CC_MEMBER_SANDBOX=1 HOME="$NH" CC_NOTIFY_LOG="$log" \
+      "$BIN/cc-notify" --approval --run "echo from a workspace" "may a workspace's card run this?" >/dev/null 2>"$T/err" ); rc=$?
+  k "$(yes_ test "$rc/$(no_ test -s "$T/slack.args")" = 2/0)" "--run inside a member workspace is refused (exit 2), and nothing crosses its socket"
+  # A CARD THAT SHOWS ONE COMMAND AND RUNS ANOTHER (security read): an open fence in the description, or a character
+  # that hides or reorders the command, is refused whole — no post, no record.
+  rm -rf "$NH/.cc/approvals"
+  N --approval --run "echo real" -t "demorepo approval" 'restart it. ```echo harmless'
+  k "$(yes_ test "$(no_ grep -q "^post" "$T/slack.args")$(no_ test -e "$NH/.cc/approvals/run")$(grep -c 'three backticks anywhere' "$T/err")" = 001)" "--run: three backticks in the DESCRIPTION are refused too, nothing posted, no record"
+  for bad in "RLO:"$'echo a\xe2\x80\xaeb' "LRI:"$'echo a\xe2\x81\xa6b' "ZWSP:"$'echo a\xe2\x80\x8bb' "BOM:"$'echo a\xef\xbb\xbfb' "CR:"$'echo a\rb' "ESC:"$'echo a\x1b[2Kb' \
+             "RLM:"$'echo a\xe2\x80\x8fb' "LSEP:"$'echo a\xe2\x80\xa8b' "TAG:"$'echo a\xf3\xa0\x80\x81b'; do
+    N --approval --run "${bad#*:}" -t "demorepo approval" "restart it"
+    k "$(yes_ test "$(no_ grep -q "^post" "$T/slack.args")$(no_ test -e "$NH/.cc/approvals/run")$(grep -c 'control, bidi or zero-width' "$T/err")" = 001)" "--run holding a ${bad%%:*} character is refused, nothing posted, no record"
+  done
+  N --approval --run "echo plain" -t "demorepo approval" $'restart it\xe2\x80\xae ti trats'
+  k "$(yes_ test "$(no_ grep -q "^post" "$T/slack.args")$(no_ test -e "$NH/.cc/approvals/run")$(grep -c 'control, bidi or zero-width' "$T/err")" = 001)" "--run: an RLO in the DESCRIPTION is refused too (run-approved would refuse the card), nothing posted, no record"
+  N --approval --run $'echo a\tb\necho done' -t "demorepo approval" "a tab and a newline are plain"
+  k "$(yes_ grep -q "^post" "$T/slack.args")" "…while a command with a tab and a newline in it still makes its card"
+  slackstub 0
+
   # A PLANNER REQUEST: on file, then over the broker to the control repo's seat; no Slack, no phone.
   rm -rf "$NH/.cc/requests"       # the sp_track case above already filed one; these count their own
   N --ask -t "demorepo blocked" "the image script is missing; may I rebuild it from the notes?"
@@ -847,16 +893,18 @@ CC_NOTIFY_LOG_ONLY="$(cfg CC_NOTIFY_LOG_ONLY)"
 # Is this a member-facing session's call? Same walk as cc-guard: the marker is the truth, CC_ROLE only a convenience.
 # `from` is the session dir's name — its Slack channel's name too — and it makes a better default title than the
 # box's. Such a call is a request to the planning seat (it used to be the owner's DM: the member cannot promote itself).
-owner=0; ask=0; approval=0; from=""; from_arg=""; [ "${CC_ROLE:-}" = member ] && ask=1
+owner=0; ask=0; approval=0; from=""; from_arg=""; run=""; [ "${CC_ROLE:-}" = member ] && ask=1
 d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
   [ -f "$d/.cc/member-facing" ] && { ask=1; from=${d##*/}; break; }; d=${d%/*}; done
 [ -n "$from" ] && title="$from escalation"
 while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; --heading) heading="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;;
   --kind) want="$2"; shift 2;;
   --id) pid="$2"; shift 2;;
-  --ask) ask=1; shift;; --approval) approval=1; shift;; --from) from_arg="$2"; shift 2;;
+  --ask) ask=1; shift;; --approval) approval=1; shift;; --from) from_arg="$2"; shift 2;; --run) run="$2"; shift 2;;
   --decision) decision=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
 msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
+# --run is refused here rather than carried: a workspace's words cross its socket as text, never as a command.
+[ -n "$run" ] && [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && { echo "cc-notify: --run cannot leave a member workspace — nothing posted" >&2; exit 2; }
 
 # INSIDE A MEMBER WORKSPACE'S BOUNDARY (cc-sandbox member) there is no ~/.cc/config and no token: every rung below is
 # unconfigured, `tried` would stay 0 and this would exit 0 having reached NOBODY — a blocked member told its call
@@ -904,6 +952,29 @@ fi
 # WHAT IT WAS ASKED AS, for the seat to weigh: the resolved kind, since the caller may have named it with --kind or
 # in its title rather than with a flag. Anything else is a plain ask.
 why=ask; case "$kind" in decision|approval) why=$kind;; escalation) why=owner;; esac
+
+# A COMMAND THE OWNER'S 👍 RUNS rides only on a card the control seat itself posts to #approvals; anything else that
+# names one is refused whole, never downgraded to a request that drops the command and asks anyway. The command goes
+# into the message, so the card, the log and the dedup key all carry it, with the stamp cc-slack checks the card by.
+if [ -n "$run" ]; then
+  if [ "$ask" = 1 ] || [ "$kind" != approval ] || [ "$owner" = 1 ]; then
+    echo "cc-notify: --run rides only on the control seat's --approval card — nothing posted" >&2; exit 2; fi
+  [ -n "${SLACK_BOT_TOKEN:-}" ] || { echo "cc-notify: --run needs the bot's own post (no SLACK_BOT_TOKEN) — nothing posted" >&2; exit 2; }
+  # Three backticks ANYWHERE on the card, not just in the command: an open fence in the description turns the code
+  # block below inside out, and the command that runs reads as plain text under a harmless-looking one.
+  case "$run$msg$title$heading" in *'```'*) echo "cc-notify: a --run card cannot hold three backticks anywhere (the card shows its command in a code block) — nothing posted" >&2; exit 2;; esac
+  # Characters that make the card show one command and bash run another: control characters (Cc; a tab and a
+  # newline are kept), every invisible format character (Cf: bidi marks, overrides and isolates, zero-width ones, the
+  # BOM, tag characters) and the Unicode line and paragraph separators, which Slack breaks a line on and bash does not.
+  # The whole card, as with the backticks: `cc-slack run-approved` asks both again of the card it finds, and a card
+  # this posted with one in its description would never run.
+  if perl -CA -e 'exit($ARGV[0] =~ /(?![\t\n])\p{Cc}|[\p{Cf}\p{Zl}\p{Zp}]/ ? 0 : 1)' "$run$msg$title$heading"; then
+    echo "cc-notify: a --run card holds a control, bidi or zero-width character, so it would not show what runs — nothing posted" >&2; exit 2; fi
+  [ "${#run}" -le 2000 ] || { echo "cc-notify: --run is over 2000 characters, and a card split in two runs nothing — nothing posted" >&2; exit 2; }
+  runsha=$(printf '%s' "$run" | sha256sum | cut -c1-64)
+  shown=$(printf '%s' "$run" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')   # Slack reads <…> as a link
+  msg="$(printf '%s\n```\n%s\n```\nYour 👍 runs this once on the box; the exit code comes back here and the output in your DM · `run:%s`' "$msg" "$shown" "${runsha:0:16}")"
+fi
 
 # A PLANNER REQUEST leaves by the broker and stops here: no rung, no phone, no Slack. Its id is the caller's --id
 # when it gave one (the same event asked twice is one request), else a stamp; the window below is the same as the
@@ -1032,9 +1103,24 @@ if [ "$to_slack" = 1 ]; then   # one channel: the bot, else the webhook
   elif [ "$rung" = 4 ]; then dest=(-c "#${SLACK_ALERTS:-alerts}")
   else dest=(--route "$title"); [ "$rung" = 1 ] && dest+=(--mention); fi   # rung 1: the main channel, @-mentioned
   [ -n "$pid" ] && dest+=(--id "$pid")   # the event's name: cc-slack posts it once and answers a replay with the ts it has
-  if [ -n "${SLACK_BOT_TOKEN:-}" ] && "$HOME/bin/cc-slack" post "${dest[@]}" "$body" >/dev/null 2>&1; then
+  if [ -n "${SLACK_BOT_TOKEN:-}" ] && cardts=$("$HOME/bin/cc-slack" post "${dest[@]}" "$body" 2>/dev/null); then
     took slack   # posted by the bot (owner DM, project channel or SLACK_CHANNEL)
-  elif [ -n "${SLACK_WEBHOOK:-}" ] &&
+    # THE RUN RECORD, written once the card has a ts: the command lives here, on the host, and never comes back from
+    # Slack. A replay of the same --id answers with the ts it has, and a record already there is never rewritten.
+    if [ -n "$run" ]; then
+      rdir="$HOME/.cc/approvals/run"; cardts=$(printf '%s' "$cardts" | tail -1)
+      if ! printf '%s' "$cardts" | grep -qE '^[0-9]+\.[0-9]+$'; then
+        echo "cc-notify: the card went out but cc-slack gave no ts — no run record, so a 👍 on it runs nothing" >&2
+      elif [ -e "$rdir/$cardts.json" ]; then
+        echo "cc-notify: a run record for card $cardts is already on file — left as it was" >&2
+      elif ! (umask 077 && mkdir -p "$rdir" && chmod 700 "$rdir" &&
+              jq -n --arg ts "$cardts" --arg cmd "$run" --arg sha "$runsha" --arg from "${from_seat:-${BOX:-}}" \
+                 --arg at "$(date -u +%FT%TZ)" '{ts:$ts, cmd:$cmd, sha256:$sha, from:$from, posted_at:$at}' \
+                 > "$rdir/$cardts.json.tmp" && mv "$rdir/$cardts.json.tmp" "$rdir/$cardts.json"); then
+        echo "cc-notify: the card went out but its run record could not be written — a 👍 on it runs nothing" >&2
+      fi
+    fi
+  elif [ -z "$run" ] && [ -n "${SLACK_WEBHOOK:-}" ] &&
        jq -cn --arg t "${heading:-$title}" --arg m "$msg" --arg b "$bang" \
          'def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
           {text: ("*" + ($t|esc) + "*" + $b + "\n" + ($m|esc))}' |

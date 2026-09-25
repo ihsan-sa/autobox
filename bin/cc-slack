@@ -28,6 +28,21 @@
   cc-slack updates-sweep [--dry-run]  give every repo channel that predates the split its -updates lane (idempotent; skips a bot-only channel).
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]     give a sub-orchestrator its own channel, recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it).
   cc-slack archive <#chan|C…> | archive --orch <target> <alias>      archive a sub-orch channel; it stops routing and leaves home.json's channel list.
+  cc-slack run-approved <chat> <ts>   run the command a `cc-notify --approval --run` card carries, once, as this user, and
+                                      reply in the card's thread with the exit code only; the output tail goes to the owner's
+                                      DM, since members read #approvals. The daemon starts it
+                                      (a transient user unit, so a command that restarts the daemon still reports) when the
+                                      OWNER's own 👍 lands on such a card in #approvals; anyone else's 👍 is logged and runs
+                                      nothing. It checks everything again itself — the record on the host (its own, 0600, its
+                                      sha256 still the command's), the card (the bot's, never edited, ENDING with that command and
+                                      its `run:` stamp, with no fence of its own or hidden character in either) and the owner's
+                                      👍 on it through Slack. The owner, the token, #approvals and the record dir come from the
+                                      password database's home and its ~/.cc/config, never the environment, and the command runs
+                                      in an environment built there, not the caller's. It claims the card twice before
+                                      it runs, on the host (an O_EXCL .ran file) and in Slack (the bot's ⏳ on the card), and
+                                      either one already there refuses the run. The DM masks tokens, keys and NAME=secret
+                                      values; the whole output stays in ~/.cc/approvals/run/<ts>.ran. Every refusal and
+                                      every run is a line in ~/.cc/approvals/run/log.
   cc-slack selfcheck                  unit checks, no Slack needed (tests/selftest.sh runs it); the cases are core/tests/slack_selfcheck.py, run in this file's namespace; every state it touches is its own scratch dir, never the box's.
   cc-slack manifest --print | --config-token xoxe.xoxp-… --app A0…      paste-ready manifest, or push it onto an existing app; the owner still taps Reinstall and generates the app-level token.
 
@@ -43,7 +58,7 @@ ANYONE who can post in a routed channel is heard — Slack channel membership is
 A reply can @-mention a person already in the channel; @main/@<alias> are session hand-offs, not people.
 A session's post naming @main, an orch alias or a live track (reply tool, `cc-slack post`, a card) reaches that session: mirrored into its own channel with a link back, delivered once in the original thread, the poster told where it went.
 A session handed another session's post 👍s it on the first tool call of the turn that post woke, so the channel shows it was read and taken on even when no reply follows; the box's 👀 still only means received, and the owner's own messages keep the reply-or-react rule.
-A reaction is a verdict from anyone in the channel (a member's :+1: in #approvals merges the PR, exactly as the owner's does); DM reactions stay the owner's.
+A reaction is a verdict from anyone in the channel (a member's :+1: in #approvals merges the PR, exactly as the owner's does); DM reactions stay the owner's, and so does the :+1: on a card that carries a command (`cc-notify --approval --run`, see run-approved above).
 A :+1: on cc-model's return card — `[return] <window>: Fable 5.1 is back…`, posted when the outage that moved a session off the primary lifts — runs `cc-model return <window>`: that session's overlapping handoff back to it (✅ when it started, ❌ and one line when it did not).
 The owner's 📌 marks a thread "revisit", not a verdict — kept until the 📌 comes off, listed by `cc-slack revisit`.
 Only the owner steers: permission answers, `!` commands and @alias hand-offs.
@@ -56,7 +71,7 @@ See ~/COMMS.md and ~/USAGE.md.
 
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
 """
-import calendar, collections, contextlib, fcntl, glob, io, json, os, re, shutil, signal, socket, stat, struct, subprocess, sys, tempfile, threading, time, types, urllib.parse, urllib.request
+import calendar, collections, contextlib, fcntl, glob, io, json, os, pwd, re, shutil, signal, socket, stat, struct, subprocess, sys, tempfile, threading, time, types, unicodedata, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("CC_SLACK_DIR", f"{HOME}/.cc/slack")
@@ -77,6 +92,29 @@ PERM_RE = re.compile(r"^\s*(y|yes|n|no)\s+([a-km-z]{5})(?:\s+(fix))?\s*$", re.I)
 SENT_USING_RE = re.compile(r"\s*\*Sent using\*\s+\S+\s*$")     # claude.ai's Slack connector signs every message it sends
 CHUNK = 3900
 APPROVALS = "approvals"                                        # #approvals is not a session: the owner's :+1: on a bot post there merges the PR
+try:   # run-approved's home, from the password database: $HOME is whoever started it, and it takes nothing from its caller
+    _PW = pwd.getpwuid(os.getuid())
+except KeyError:
+    _PW = None
+PW_HOME, PW_USER = (_PW.pw_dir or None, _PW.pw_name) if _PW else (None, "")   # no entry: run-approved refuses (run_cfg)
+RUN_CARDS = f"{PW_HOME or '/nonexistent'}/.cc/approvals/run"   # cc-notify --approval --run: <card ts>.json holds the command the owner's 👍 runs (/nonexistent: passwd's own word for no home)
+RUN_TS_RE = re.compile(r"^[0-9]{6,12}\.[0-9]{1,9}$")           # a card ts, and the only thing a path under RUN_CARDS is built from
+RUN_TIMEOUT = 900                                              # seconds an approved command may run before it is killed and reported as exit 124
+RUN_TAIL = 1500                                                # characters of its output the owner's DM shows (never #approvals: members read it)
+RUN_LINE = "Your 👍 runs this once on the box; the exit code comes back here and the output in your DM"   # cc-notify --run writes these words; the selfcheck holds the two to each other
+RUN_CLAIM = "hourglass_flowing_sand"                            # the bot's own reaction on a run card, placed before its command starts: Slack's record that it ran
+# NAME=value, NAME: value and "NAME":"value" (credentials JSON), masked in what a run reports; NTFY_TOPIC is a secret too.
+# The value may be quoted either way (API_KEY='…', YAML password: '…') and is masked whole, spaces and all; an
+# unterminated quote still masks the word after it.
+RUN_SECRET_RE = re.compile(r"(?i)\b([a-z0-9_]*(?:token|secret|passw(?:or)?d|api_?key|topic|webhook|credential|private_?key)[a-z0-9_]*)"
+                           r"(\"?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[\"']?[^\s\"']+)")
+RUN_MASKS = (   # what SECRET_RE (the tool-preview mask) does not know, each seen in a real config or credentials file
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S), "[redacted private key]"),
+    (re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}"), "[redacted]"),               # Anthropic/OpenAI keys and OAuth tokens
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[redacted]"),                 # a fine-grained GitHub PAT
+    (re.compile(r"https?://hooks\.slack\.com/\S+"), "[redacted]"),                 # a Slack webhook: posting rights in its URL
+    (re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@", re.I), r"\1[redacted]@"),   # user:pass@ in a URL
+)
 ACK_MAX = 10                                                   # agent posts one session can be waiting to 👍 at once
 REEXEC = "CC_SLACK_REEXEC"                                     # set on a re-exec'd channel server: the host initialised the copy before it
 GIT_WORK = threading.Lock()                                    # two publishes fetching the same checkout at once race index.lock
@@ -5627,7 +5665,8 @@ class Daemon:
             log(f"file prune failed: {e!r}")
 
     def on_reaction(self, ev):
-        """Three jobs: the owner's 📌 bookmarks a thread (on_revisit), a :+1: in #approvals squash-merges that PR, and
+        """Three jobs, and a fourth: the owner's 📌 bookmarks a thread (on_revisit), a :+1: in #approvals squash-merges that PR
+        (on a card that carries a command, only the owner's runs it: on_run_card), and
         anything else on one of our messages is handed to that session as that person's verdict. Our own reactions
         are nobody's verdict. Returns #approvals' reply text, or None."""
         item = ev.get("item") or {}
@@ -5651,6 +5690,8 @@ class Daemon:
             if who == self.cfg.get("SLACK_OWNER_ID"):
                 self.on_revisit(chat, ts, removed, float(ev.get("event_ts") or time.time()))
             return None
+        if self.chan_name(chat) == APPROVALS and run_card_known(ts):   # a card that carries a command: only the owner's 👍 runs it
+            return None if removed else self.on_run_card(chat, ts, ev.get("reaction"), who)
         if self.chan_name(chat) == APPROVALS:              # #approvals is not a session: PR merges only, and only on add
             return None if removed else self.on_approval(chat, ts, ev.get("reaction"), who)
         if not removed and self.owner_card_thumb(chat, ts, ev.get("reaction"), who):
@@ -5794,6 +5835,24 @@ class Daemon:
         if not ok:
             self.say(chat, last_line(out), ts)
         return last_line(out)
+
+    def on_run_card(self, chat, ts, reaction, who):
+        """A reaction on a card `cc-notify --approval --run` posted. The brief: "only a reaction by the owner's own Slack
+        user id counts, never a member's and never text" — so anyone else's 👍 is a log line and nothing more, and the
+        owner's starts `cc-slack run-approved`, which checks everything again itself before it runs anything. It runs as
+        a transient user unit, not a child of this process, because the command may well restart this daemon."""
+        if reaction not in ("+1", "thumbsup"):
+            return None
+        owner = self.cfg.get("SLACK_OWNER_ID")
+        if not owner or who != owner:
+            run_log(f"{ts}: :{reaction}: by {who} is not the owner's — nothing runs"); return None
+        try:
+            EFFECTS.popen(run_approved_argv(chat, ts), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, start_new_session=True)
+            run_log(f"{ts}: the owner's 👍 — run-approved started")
+        except Exception as e:
+            run_log(f"{ts}: the owner's 👍, but run-approved did not start: {e!r}")
+        return None
 
     def on_approval(self, chat, ts, reaction, who=None, approves=True):
         """A 👍 in #approvals on bot's PR post hands it to cc-land, the only merger; membership is the right.
@@ -8235,6 +8294,205 @@ def pr_facts(repo, n):
     except Exception:
         return None
 
+def run_log(line):
+    """One line to the daemon's own log and to ~/.cc/approvals/run/log, the trail the owner (or a seat) reads for why a
+    👍 on a run card did or did not run anything."""
+    log(f"run-card: {line}")
+    try:
+        with open(f"{RUN_CARDS}/log", "a") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {line}\n")
+    except OSError:
+        pass
+
+def run_card_known(ts):
+    """Does a run record exist for this card? Off disk, so an ordinary reaction in #approvals costs no Slack call."""
+    return bool(ts and RUN_TS_RE.match(ts) and os.path.isfile(f"{RUN_CARDS}/{ts}.json"))
+
+def run_approved_argv(chat, ts):
+    """How the daemon starts `run-approved`: its own transient user unit where systemd has one, so a command that
+    restarts cc-slackd does not kill the run that is reporting on it; a detached child otherwise. The unit name is the
+    card's, so a second start while the first still runs is refused by systemd too (the .ran claim is the real once)."""
+    me = [sys.executable, SELF, "run-approved", chat, ts]
+    if shutil.which("systemd-run"):
+        return ["systemd-run", "--user", "--quiet", "--collect", f"--unit=cc-run-approved-{ts.replace('.', '-')}",
+                f"--setenv=PATH={os.environ.get('PATH', '')}", f"--setenv=HOME={HOME}", *me]
+    return me
+
+def run_card_tail(cmd, sha):
+    """The exact end of a run card, as cc-notify --run builds it: the command, escaped as Slack keeps it, in a code block,
+    then RUN_LINE and the stamp. A card is run only if its text ENDS with this, so a stamp or a code block that
+    somebody else's words carry in the middle of a card (a PR title on a merge card) matches nothing."""
+    shown = cmd.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"\n```\n{shown}\n```\n{RUN_LINE} · `run:{sha[:16]}`"
+
+RUN_CFG_KEYS = ("SLACK_BOT_TOKEN", "SLACK_OWNER_ID", "SLACK_APPROVALS")
+
+def run_cfg():
+    """The three keys run-approved trusts — the bot token, the owner's id and #approvals' name — from the config file in
+    this user's password-database home, and from nowhere else. cc-config (the one parser) runs with an environment
+    built here, so no SLACK_OWNER_ID, CC_CONFIG or $HOME of the caller's can move one: with the environment winning,
+    any session could name the bot as the owner and have the bot's own 👍 run a card (security read of PR #659). A
+    gate's CC_CONFIG_DENY is the one thing passed on, since all it can do is make the file read as empty. Anything
+    that fails gives {}, which refuses."""
+    if not PW_HOME:
+        return {}
+    env = {"PATH": "/usr/bin:/bin", "HOME": PW_HOME, "CC_CONFIG": f"{PW_HOME}/.cc/config"}
+    if os.environ.get("CC_CONFIG_DENY"):
+        env["CC_CONFIG_DENY"] = os.environ["CC_CONFIG_DENY"]
+    try:
+        r = subprocess.run([f"{BIN}/cc-config", "list"], env=env, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=10)
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+    return {k: v for k, eq, v in (line.partition("=") for line in r.stdout.splitlines()) if eq and k in RUN_CFG_KEYS}
+
+def run_env():
+    """What an approved command runs in: built from the password database and fixed values, never the caller's, so
+    no BASH_ENV, PATH or HOME of theirs decides what the approved text does — and it runs the same whoever started it."""
+    uid = os.getuid()
+    return {"HOME": PW_HOME, "USER": PW_USER, "LOGNAME": PW_USER, "SHELL": "/bin/bash", "LANG": "C.UTF-8",
+            "PATH": f"{PW_HOME}/bin:{PW_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "XDG_RUNTIME_DIR": f"/run/user/{uid}", "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus"}
+
+def run_hidden(s):
+    r"""Does s hold a character that makes a card show one command and bash run another? cc-notify refuses the same set
+    before it posts (perl: `(?![\t\n])\p{Cc}|[\p{Cf}\p{Zl}\p{Zp}]`): control characters bar a tab and a newline,
+    every invisible format character (bidi marks, overrides and isolates, zero-width ones, the BOM, tag characters)
+    and the Unicode line and paragraph separators, which Slack breaks a line on and bash does not."""
+    return any(ch not in "\t\n" and unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") for ch in s or "")
+
+def run_card_refusal(cfg, chat, ts):
+    """(None, record) when the card at (chat, ts) may run, else (why not, None). The brief: "the command is fixed when
+    the card is posted, stored on the host beside the card and hashed; an edited card or a changed file does not run",
+    and "only a reaction by the owner's own Slack user id counts". Each is checked here, in the process that runs it,
+    and none of it is taken from the daemon that started this — so a session calling run-approved by hand gets nothing
+    the owner's 👍 did not already give it. The third value says whether the refusal is his to hear in the thread: only
+    those found once the card is known to be the bot's own with his 👍 on it, so no one else can make the bot speak."""
+    import hashlib
+    if not RUN_TS_RE.match(ts or ""):
+        return "not a card ts", None, False
+    tok, owner = cfg.get("SLACK_BOT_TOKEN"), cfg.get("SLACK_OWNER_ID")
+    if not tok or not owner:
+        return "no bot token or owner id in the config", None, False
+    path = f"{RUN_CARDS}/{ts}.json"
+    try:
+        for p, want_dir in ((RUN_CARDS, True), (path, False)):
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode) or stat.S_ISDIR(st.st_mode) != want_dir or st.st_uid != os.getuid() or st.st_mode & 0o022:
+                return f"{p} is not this user's own, unshared {'dir' if want_dir else 'file'}", None, False
+        rec = json.load(open(path))
+    except (OSError, ValueError) as e:
+        return f"no readable run record ({e.__class__.__name__})", None, False
+    try:
+        # #approvals asked of Slack itself, never of the channel cache: that file sits under CC_SLACK_DIR, the caller's
+        cid, member = find_channel(cfg, cfg.get("SLACK_APPROVALS") or APPROVALS)
+        if not cid or not member or chat != cid:
+            return f"{chat} is not #approvals", None, False
+        bot = api("auth.test", tok).get("user_id")
+        msgs = api("conversations.history", tok, channel=chat, latest=ts, inclusive="true", limit="1").get("messages") or []
+        msg = msgs[0] if msgs and msgs[0].get("ts") == ts else None
+        got = api("reactions.get", tok, channel=chat, timestamp=ts, full="true").get("message") or {}
+    except Exception as e:
+        return f"Slack could not be read ({e.__class__.__name__})", None, False
+    if not msg or not bot or msg.get("user") != bot:
+        return "the card is not the bot's own post", None, False
+    if not any(r.get("name") in ("+1", "thumbsup") and owner in (r.get("users") or []) for r in got.get("reactions") or []):
+        return "the owner's 👍 is not on the card", None, False
+    if any(r.get("name") == RUN_CLAIM and bot in (r.get("users") or []) for r in got.get("reactions") or []):
+        return f"the bot's :{RUN_CLAIM}: claim is already on the card, so it ran (or began to) once", None, False
+    cmd, sha = rec.get("cmd"), rec.get("sha256") or ""
+    if not isinstance(cmd, str) or not cmd or rec.get("ts") != ts or hashlib.sha256(cmd.encode()).hexdigest() != sha:
+        return "the command on file was changed after the card went out (its sha256 no longer matches)", None, True
+    if msg.get("edited"):
+        return "the card was edited after it went out", None, True
+    text, tail = msg.get("text") or "", run_card_tail(cmd, sha)
+    if "🔐 *Approval needed:*" not in text or not text.endswith(tail):
+        return "the card does not end with this command and its run: stamp", None, True
+    # cc-notify refuses both before it posts; they are asked again here because a card need not have come from it
+    # (a `cc-slack post` and a hand-written record): an open fence turns the code block inside out, and a hidden
+    # character makes the card show one command while bash runs another.
+    if "```" in cmd or "```" in text[:-len(tail)]:
+        return "the card or its command holds three backticks of its own, so it may not show what runs", None, True
+    if run_hidden(cmd) or run_hidden(text):
+        return "the card or its command holds a control, bidi or zero-width character, so it may not show what runs", None, True
+    return None, rec, False
+
+def run_approved(cfg, chat, ts, run=None):
+    """Check the card (run_card_refusal), claim it once, run its command as this user with `bash -c` on the STORED
+    text — nothing from Slack reaches the shell — and reply in the card's thread. Returns the exit code, or None when
+    nothing ran. "It runs once": before the command starts it is claimed twice, by an O_EXCL file beside the record and
+    by the bot's RUN_CLAIM reaction on the card, so a second 👍, a re-added one or a second start finds one of them and
+    runs nothing — and the card itself says it ran, where a lost or restored .ran file cannot."""
+    why, rec, tell = run_card_refusal(cfg, chat, ts)
+    if why:
+        run_log(f"{ts}: not run — {why}")
+        if tell:
+            post(cfg, chat, f"Not run: {why}. Nothing ran on the box.", thread=ts, mail=False)
+        return None
+    try:
+        fd = os.open(f"{RUN_CARDS}/{ts}.ran", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        run_log(f"{ts}: not run — it already ran once ({RUN_CARDS}/{ts}.ran)"); return None
+    try:
+        api("reactions.add", cfg["SLACK_BOT_TOKEN"], channel=chat, timestamp=ts, name=RUN_CLAIM)
+    except Exception as e:   # already_reacted, or Slack down: either way the card is not claimed there, so nothing runs
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"rc": None, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                       "out": f"not run: the claim reaction was not placed ({e})"}, fh)
+        run_log(f"{ts}: not run — the bot's :{RUN_CLAIM}: claim could not be placed on the card ({e}); the .ran claim "
+                f"stays, so this card runs nothing now"); return None
+    run_log(f"{ts}: running {rec['cmd'][:200]!r}")
+    try:
+        r = (run or EFFECTS.run)(["bash", "-c", rec["cmd"]], cwd=PW_HOME, env=run_env(), stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=RUN_TIMEOUT)
+        rc, out = r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        rc = 124
+        out = "".join(x.decode(errors="replace") if isinstance(x, bytes) else (x or "") for x in (e.stdout, e.stderr))
+        out += f"\n(killed after {RUN_TIMEOUT}s)"
+    except Exception as e:
+        rc, out = 127, f"{e.__class__.__name__}: {e}"
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"rc": rc, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "out": out}, fh)
+    run_log(f"{ts}: exit {rc}")
+    # #approvals has members in it, so the card's thread gets the exit code and not a word of the output. The tail goes
+    # to the owner's DM, masked all the same since Slack keeps it; the whole output stays in the .ran file beside the
+    # record, which only this user reads.
+    mark = "✅" if rc == 0 else "❌"
+    post(cfg, chat, f"{mark} Ran it: exit {rc}. The output went to the owner's DM.", thread=ts, mail=False)
+    try:
+        post(cfg, cfg["SLACK_OWNER_ID"], f"{mark} The command on your #approvals card {ts} exited {rc}:\n"
+             f"```\n{run_shown(rec['cmd'], 300)}\n```\nIts output, secrets masked:\n```\n{run_shown(out.strip(), RUN_TAIL) or '(no output)'}\n```\n"
+             f"The whole output is in ~/.cc/approvals/run/{ts}.ran", mail=False)
+    except Exception as e:
+        run_log(f"{ts}: the output did not reach the owner's DM ({e!r}); it is in the .ran file")
+    react(cfg, chat, ts, "white_check_mark" if rc == 0 else "x")
+    return rc
+
+def run_mask(text):
+    """A run's output with every secret shape this box has met masked: SECRET_RE's, RUN_MASKS' and NAME=value pairs.
+    Masked whole, before any tail is cut, so a key block the cut would split is still found by its BEGIN line."""
+    text = SECRET_RE.sub("[redacted]", text or "")
+    for rx, to in RUN_MASKS:
+        text = rx.sub(to, text)
+    def masked(m):   # a quoted value keeps its quotes, so the line still reads as the file had it
+        v = m.group(3)
+        q = v[0] if len(v) > 1 and v[0] in "\"'" and v[-1] == v[0] else ""
+        return f"{m.group(1)}{m.group(2)}{q}[redacted]{q}"
+    return RUN_SECRET_RE.sub(masked, text)
+
+def run_shown(text, n):
+    """The last n characters of text, masked, fit for a Slack code block: no fence of its own and nothing read as a link."""
+    return (run_mask(text)[-n:].replace("```", "ˋˋˋ").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+def cmd_run_approved(argv):
+    if len(argv) != 2:
+        print("cc-slack run-approved <chat> <ts>", file=sys.stderr); return 2
+    rc = run_approved(run_cfg(), argv[0], argv[1])
+    return 1 if rc is None else (0 if rc == 0 else 3)
+
 def cmd_post_approval(argv):
     """post-approval [--force|--landed] <repo> <n|url> — posts "[repo] PR #n: title — url" into #approvals (the daemon merges on :+1:), or into #<repo>-updates for a repo that lands itself (`cc lands`: a landing record — cc-loop queues the landing and no 👍 is waited on, though the OWNER's own 👍 on that card re-queues a landing that STOPPED — card_lane, owner_card_thumb — which is what such a stop asks him for; it approves nothing and lifts no protected-path hold). Posted under the ledger id pr-card:<repo>:<n>, which is how --landed and the sweep find it again in either lane. One card per PR: a second caller finds the first and exits 0; --force posts anyway, for re-posting after a failed merge. A PR GitHub already reports MERGED/CLOSED gets its card edited to "landed ✓"/"closed ✗" instead of a new one; --landed does that edit on the caller's word and never posts. Prints the ts, or `<channel> <ts>` with --print-chat for a caller handing the card on. Exit 2 usage, 3 no token, 4 landed PR with no card, 1 gh/Slack."""
     force, landed = "--force" in argv, "--landed" in argv
@@ -8816,6 +9074,8 @@ def main(argv):
         return 1
     elif cmd == "post-approval":
         return cmd_post_approval(rest)
+    elif cmd == "run-approved":
+        return cmd_run_approved(rest)
     elif cmd == "approvals-sweep":
         return cmd_approvals_sweep(rest)
     elif cmd == "accept-dialog":
