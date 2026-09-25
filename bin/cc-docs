@@ -9,6 +9,7 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
 
     cc-docs file <pdf> --project <name|PPP> --title <t> [--source <path>] [--no-stamp]
                  [--kind work|course|member] [--member <handle>] [--date YYYY-MM-DD]
+                 [--describes PCB-NNNN-R] [--note <text>] [--cost <step>=<usd>]…
         Called by a maker at the end of a finished build. The same source path, or else the same title in the same
         project, is the same document. Content unchanged since the current revision files nothing and prints that
         revision; otherwise the next letter is filed. A PDF whose text carries no number gets a small grey stamp
@@ -17,8 +18,11 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         a document that must not show a number (a resume, anything going outside): it is kept on the document, so its
         later revisions are not stamped either. A new project needs --kind, --member (a member project, visible to
         that member's workspace and the owner) or a project created first with `project`. Prints `<number>\t<path>` and whether
-        it filed or found the content unchanged.
-    cc-docs number --project <name|PPP> --title <t> [--source <path>] [--tex]
+        it filed or found the content unchanged. The rest is recorded on the revision it files, and nothing is recorded
+        when nothing is filed: --describes the board revision a document is about (a board's part number, PCB-0001-B),
+        which the stamp then carries too, as `002-0012-A · PCB-0001-B · 24 Sep 2026`; --note a line on what changed;
+        --cost, once per step, what the maker spent generating it in US dollars (`--cost draft=0.80 --cost review=0.43`).
+    cc-docs number --project <name|PPP> --title <t> [--source <path>] [--describes PCB-NNNN-R] [--tex]
         The number `file` would give a changed build of this document now, for a build that prints its own footer:
         plain, or with --tex as `\\def\\docnumber{…}\\def\\docstamp{… · 24 Sep 2026}` to \\input before compiling.
         It reserves nothing, and a build whose content turns out unchanged is not filed.
@@ -30,12 +34,27 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         none, exit 1.
     cc-docs list [--project <name|PPP>]
         One line per document: number of the current revision, date, visibility, title.
+    cc-docs star <PPP-NNNN> on|off [--viewer owner|<workspace id>]
+        Star or unstar a document for one viewer (the owner by default). Stars are per viewer, and a viewer can
+        star only a document visible to it.
+    cc-docs public <PPP-NNNN-R> on|off
+        On gives that one revision a public link: an unguessable token, printed, kept while it stays public (on
+        again prints the same one). Off deletes the token for good, so the old link never works again and on
+        afterwards mints a different one. The register's owner runs this; nobody else may.
+    cc-docs token <token> <PPP-NNNN-R>
+        The filed copy a public link serves: printed only when the token is that revision's, exit 1 otherwise.
+    cc-docs library --viewer owner|<workspace id>
+        Everything that viewer may see, as JSON: projects, documents, per-viewer star, and per revision its date,
+        note, file, pages, bytes, board revision and cost. The owner sees the whole register and each public
+        revision's token; a member sees only documents visible to its workspace, its own stars, and no tokens.
+        Any other viewer is refused.
     cc-docs selfcheck
 
 THE REGISTER is one JSON file, $CC_DOCS_ROOT/register.json (default ~/.cc/documents), with the filed copies under
 files/PPP/ beside it: private state, in no repo, and outside cc-lib's own tree (cc-lib indexes the register). Per
-document it holds number, title, project, source, visibility (the owner, or the owner and one member), starred and
-public, and per revision the letter, file, date, the PDF it was filed from and a content fingerprint. The
+document it holds number, title, project, source, visibility (the owner, or the owner and one member), who starred
+it (starred_by, viewer ids), and per revision the letter, file, date, the PDF it was filed from, a content
+fingerprint, and when given the note, board revision, cost and public token. The
 fingerprint hashes the PDF's text with any document stamp taken out together with every page rendered small and grey
 with its bottom strip (stamp, footer) cut off, so a rebuild that changes only a figure is a new revision and one that
 differs only in its stamp, footer or bytes is unchanged; a PDF neither can read falls back to its bytes. A revision
@@ -47,7 +66,8 @@ to ["owner", <id>]. The owner sees the whole register. A member workspace gets a
 never the register itself: a register of the same shape holding only the documents that name its id, with their
 filed copies hard-linked beside it, so `CC_DOCS_ROOT=<the view> cc-docs find …` works inside it unchanged. `file`
 rewrites the views its document reaches after every filing, in place (a bind mount of the directory keeps seeing
-them), so the directory can be mounted read-only into that member's sandbox the way cc-lib mounts ws/<id>/.
+them), so the directory can be mounted read-only into that member's sandbox the way cc-lib mounts ws/<id>/. A
+star or a public switch rewrites them too. A view never carries a public token.
 """
 import datetime
 import fcntl
@@ -55,6 +75,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -65,7 +86,11 @@ MEMBERS = os.path.join(os.path.expanduser("~"), ".cc", "members")
 RANGES = {"work": (1, 99), "course": (101, 199), "member": (901, 999)}
 LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"   # I and O are skipped: they read like 1 and 0
 NUM = re.compile(r"^(\d{3})-(\d{4})(?:-([A-HJ-NP-Z]{1,3}))?$")
-STAMP = re.compile(r"\b\d{3}-\d{4}-[A-HJ-NP-Z]{1,3}\b(?:\s*·\s*\d{1,2} [A-Z][a-z]{2} \d{4})?")
+BOARD = re.compile(r"^PCB-\d{4}-[A-HJ-NP-Z]{1,3}$")   # a board's part number and hardware revision
+STAMP = re.compile(r"\b\d{3}-\d{4}-[A-HJ-NP-Z]{1,3}\b(?:\s*·\s*PCB-\d{4}-[A-HJ-NP-Z]{1,3}\b)?"
+                   r"(?:\s*·\s*\d{1,2} [A-Z][a-z]{2} \d{4})?")
+STEP = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+WID = re.compile(r"^[0-9a-f]{16}$")
 STOP = set("a an the of for and or to in on my me get find doc document pdf".split())
 
 
@@ -181,7 +206,9 @@ def write_views(reg, ids):
     for wid in sorted(ids):
         v = os.path.join(ROOT, "ws", wid)
         os.makedirs(v, mode=0o700, exist_ok=True)
-        docs = {n: d for n, d in reg["documents"].items() if wid in d.get("visibility", ())}
+        # a view never carries a public token: only the owner can see or kill a public link
+        docs = {n: dict(d, revisions=[{k: v for k, v in r.items() if k != "public_token"} for r in d["revisions"]])
+                for n, d in reg["documents"].items() if wid in d.get("visibility", ())}
         for d in docs.values():
             for r in d["revisions"]:
                 dst = os.path.join(v, r["file"])
@@ -308,6 +335,7 @@ def cmd_file(a):
     if not os.path.isfile(src):
         raise Refused(f"{a.pdf}: no such file")
     date = datetime.date.fromisoformat(a.date) if a.date else datetime.date.today()
+    describes, cost = check_describes(a.describes), parse_cost(a.cost)
     text = pdftext(src)
     fp = fingerprint(src, text)
     with Lock():
@@ -338,7 +366,7 @@ def cmd_file(a):
             shutil.copy(src, tmp)
         else:
             how = "overlay"
-            stamp(src, tmp, f"{full} · {stampdate(date)}")
+            stamp(src, tmp, " · ".join([full] + ([describes] if describes else []) + [stampdate(date)]))
         os.chmod(tmp, 0o444)
         os.replace(tmp, dst)
         with open(dst, "rb") as f:
@@ -348,13 +376,16 @@ def cmd_file(a):
             d = reg["documents"][num] = {
                 "number": num, "project": proj, "title": a.title, "source": os.path.abspath(a.source) if a.source else None,
                 "visibility": ["owner"] + ([pd["workspace"]] if pd.get("workspace") else []), "member": pd.get("member"),
-                "starred": False, "public": False, "stamp": not nostamp, "revisions": []}
+                "starred_by": [], "stamp": not nostamp, "revisions": []}
         d["title"] = a.title
         if a.source and not d.get("source"):
             d["source"] = os.path.abspath(a.source)
         d["revisions"].append({"rev": rev, "file": rel, "date": date.isoformat(), "from": src, "fingerprint": fp,
-                               "sha256": sha, "stamped": how,
+                               "sha256": sha, "stamped": how, "pages": pages(dst), "bytes": os.path.getsize(dst),
                                "filed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+        for k, v in (("note", (a.note or "").strip() or None), ("describes", describes), ("cost", cost)):
+            if v:
+                d["revisions"][-1][k] = v
         save(reg)
         write_views(reg, set(d["visibility"]) - {"owner"})
     print(f"{full}\t{dst}\tfiled")
@@ -362,12 +393,14 @@ def cmd_file(a):
 
 
 def cmd_number(a):
+    describes = check_describes(a.describes)
     with Lock():
         reg = load()
         proj, num, d, rev = plan(reg, a)   # a project it would create is not saved: `number` reserves nothing
     full = f"{num}-{rev}"
     if a.tex:
-        print(f"\\def\\docnumber{{{full}}}\\def\\docstamp{{{full} · {stampdate(datetime.date.today())}}}")
+        st = " · ".join([full] + ([describes] if describes else []) + [stampdate(datetime.date.today())])
+        print(f"\\def\\docnumber{{{full}}}\\def\\docstamp{{{st}}}")
     else:
         print(full)
     return 0
@@ -442,6 +475,152 @@ def cmd_list(a):
             continue
         r = current(d)
         print(f"{n}-{r['rev']}\t{r['date']}\towner{'+' + d['member'] if d.get('member') else ''}\t{d['title']}")
+    return 0
+
+
+def check_describes(b):
+    if b and not BOARD.match(b):
+        raise Refused(f"--describes {b!r} is not a board revision like PCB-0001-B")
+    return b or None
+
+
+def parse_cost(items):
+    """--cost step=usd, once per step -> {"total", "steps": [{"step", "usd"}]} in the order given, or None."""
+    steps = []
+    for it in items or ():
+        step, _, usd = it.partition("=")
+        step = step.strip().lower()
+        try:
+            v = float(usd)
+        except ValueError:
+            v = -1.0
+        if not STEP.match(step) or not 0 <= v < 1e6 or any(x["step"] == step for x in steps):
+            raise Refused(f"--cost {it!r} is not one step=usd (e.g. draft=0.80), each step once")
+        steps.append({"step": step, "usd": round(v, 4)})
+    return {"total": round(sum(x["usd"] for x in steps), 4), "steps": steps} if steps else None
+
+
+def viewer_ok(v):
+    if v != "owner" and not WID.match(v or ""):
+        raise Refused(f"no viewer {v!r}: the owner, or a member's workspace id")
+    return v
+
+
+def visible(d, viewer):
+    return viewer == "owner" or viewer in d.get("visibility", ())
+
+
+def starred_by(d):
+    """Viewer ids that starred d. A document filed before stars were per viewer holds `starred`, the owner's."""
+    return list(d.get("starred_by") or (["owner"] if d.get("starred") else []))
+
+
+def get_rev(reg, full):
+    m = NUM.match(full or "")
+    d = reg["documents"].get(f"{m.group(1)}-{m.group(2)}") if m and m.group(3) else None
+    r = next((x for x in d["revisions"] if x["rev"] == m.group(3)), None) if d else None
+    if not r:
+        raise Refused(f"no revision {full!r}: give PPP-NNNN-R")
+    return d, r
+
+
+def cmd_star(a):
+    viewer = viewer_ok(a.viewer)
+    with Lock():
+        reg = load()
+        d = reg["documents"].get(a.number)
+        if not d or not visible(d, viewer):   # a document the viewer cannot see answers as one that does not exist
+            raise Refused(f"no document {a.number!r}")
+        who = [v for v in starred_by(d) if v != viewer] + ([viewer] if a.state == "on" else [])
+        d["starred_by"] = sorted(who)
+        d.pop("starred", None)
+        save(reg)
+        write_views(reg, set(d["visibility"]) - {"owner"})
+    print(f"{a.number}\t{'starred' if a.state == 'on' else 'not starred'}")
+    return 0
+
+
+def cmd_public(a):
+    with Lock():
+        reg = load()
+        d, r = get_rev(reg, a.number)
+        if a.state == "on":
+            # brief: "going public mints an unguessable token for exactly one revision"
+            r.setdefault("public_token", secrets.token_urlsafe(24))
+        else:
+            # brief: "going private deletes it for good"
+            r.pop("public_token", None)
+        d.pop("public", None)
+        save(reg)
+        write_views(reg, set(d["visibility"]) - {"owner"})
+    print(r.get("public_token") or "private")
+    return 0
+
+
+def public_file(reg, token, full):
+    """The filed copy a public link serves, or None: the token must be that one revision's, and still held."""
+    try:
+        d, r = get_rev(reg, full)
+    except Refused:
+        return None
+    held = r.get("public_token") or ""
+    return os.path.join(ROOT, r["file"]) if held and secrets.compare_digest(held, token) else None
+
+
+def cmd_token(a):
+    f = public_file(load(), a.token, a.number)
+    if f:
+        print(f)
+    return 0 if f else 1
+
+
+_PAGE_COUNTS = {}
+
+
+def _pages(f):
+    """pages(), remembered: a filed copy is never rewritten, and a revision filed before `pages` was recorded
+    would otherwise cost a pdfinfo on every library() a long-running caller makes."""
+    if f not in _PAGE_COUNTS:
+        _PAGE_COUNTS[f] = pages(f)
+    return _PAGE_COUNTS[f]
+
+
+def library(reg, viewer):
+    """What `viewer` may see, and nothing else: a member never gets another workspace's document, project, star
+    or any public token."""
+    owner = viewer == "owner"
+    host = os.uname().nodename
+    home = os.path.expanduser("~")
+    docs = []
+    for n in sorted(reg["documents"]):
+        d = reg["documents"][n]
+        if not visible(d, viewer) or not d["revisions"]:
+            continue
+        revs = []
+        for r in d["revisions"]:
+            f = os.path.join(ROOT, r["file"])
+            out = {"rev": r["rev"], "date": r["date"], "note": r.get("note"), "file": f"/files/{n}-{r['rev']}.pdf",
+                   "pages": r.get("pages") or _pages(f), "bytes": r.get("bytes") or (os.path.getsize(f) if os.path.exists(f) else 0),
+                   "describes": r.get("describes"), "cost": r.get("cost"),
+                   "public": owner and bool(r.get("public_token"))}
+            if owner and r.get("public_token"):
+                out["token"] = r["public_token"]
+            revs.append(out)
+        src = d.get("source")
+        if src and src.startswith(home + "/"):
+            src = "~" + src[len(home):]
+        docs.append({"number": n, "project": d["project"], "title": d["title"], "current": d["revisions"][-1]["rev"],
+                     "starred": viewer in starred_by(d), "access": list(d.get("visibility", ["owner"])),
+                     "source": f"{host}:{src}" if src else None, "revisions": revs})
+    projs = sorted({d["project"] for d in docs} | (set(reg["projects"]) if owner else set()))
+    return {"viewer": {"id": viewer, "role": "owner" if owner else "member"},
+            "projects": [{"number": p, "name": reg["projects"][p]["name"]} for p in projs],
+            "documents": docs}
+
+
+def cmd_library(a):
+    json.dump(library(load(), viewer_ok(a.viewer)), sys.stdout, indent=1)
+    print()
     return 0
 
 
@@ -521,6 +700,54 @@ def selfcheck():
            and (os.geteuid() == 0 or not os.access(f, os.W_OK)))
         ok("an unstamped PDF gets the stamp overlaid on every page, and the original is left alone",
            "001-0002-A" not in pdftext(b) and pages(f) == 3 and pdftext(f).count("001-0002-A · ") == 3)
+        # stars, public links and what each viewer is sent: r1 as the cases above left it, rebuilt here on its own
+        ROOT = os.path.join(t, "r1s")
+        run("file", a, "--project", "Box", "--kind", "work", "--title", "Alpha doc")
+        run("file", a, "--project", "Kid", "--member", "kid1", "--title", "Kid doc")
+        run("star", "001-0001", "on")
+        run("star", "901-0001", "on", "--viewer", wid)
+        rc, o = run("star", "001-0001", "on", "--viewer", wid)
+        reg = load()
+        ok("stars are per viewer, and a member cannot star a document it cannot see",
+           reg["documents"]["001-0001"]["starred_by"] == ["owner"] and reg["documents"]["901-0001"]["starred_by"] == [wid]
+           and rc == 2)
+        rc, o = run("library", "--viewer", wid)
+        mine = json.loads(o)
+        ok("a member's library holds its own documents and projects and nothing of the owner's",
+           rc == 0 and [d["number"] for d in mine["documents"]] == ["901-0001"]
+           and [p["number"] for p in mine["projects"]] == ["901"] and mine["viewer"]["role"] == "member"
+           and mine["documents"][0]["starred"] is True)
+        rc, o = run("library", "--viewer", "owner")
+        own = json.loads(o)
+        ok("the owner's library holds every document, with the owner's own stars only",
+           [d["number"] for d in own["documents"]] == ["001-0001", "901-0001"]
+           and [d["starred"] for d in own["documents"]] == [True, False] and own["viewer"]["role"] == "owner")
+        rc, o = run("library", "--viewer", "fedcba9876543210")
+        rc2, o2 = run("library", "--viewer", "someone")
+        ok("an unknown workspace sees nothing, and a viewer that is not an id is refused",
+           rc == 0 and json.loads(o)["documents"] == [] and json.loads(o)["projects"] == [] and rc2 == 2)
+        rc, tok = run("public", "901-0001-A", "on")
+        tok = tok.strip()
+        rc2, again = run("public", "901-0001-A", "on")
+        ok("public mints an unguessable token for the revision, and on again keeps it",
+           rc == 0 and len(tok) >= 32 and again.strip() == tok)
+        rc, o = run("token", tok, "901-0001-A")
+        rc2, o2 = run("token", tok, "001-0001-A")
+        rc3, o3 = run("token", tok[:-1] + ("A" if tok[-1] != "A" else "B"), "901-0001-A")
+        ok("the token serves its own revision and no other, and a wrong token serves nothing",
+           rc == 0 and o.strip().endswith("901-0001-A_kid-doc.pdf") and rc2 == 1 and rc3 == 1)
+        mine = json.loads(run("library", "--viewer", wid)[1])
+        own = json.loads(run("library", "--viewer", "owner")[1])
+        with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:
+            vtext = fh.read()
+        ok("the owner is sent the token; the member and the member's view never are",
+           own["documents"][1]["revisions"][0].get("token") == tok and tok not in json.dumps(mine) and tok not in vtext)
+        run("public", "901-0001-A", "off")
+        rc, o = run("token", tok, "901-0001-A")
+        rc2, tok2 = run("public", "901-0001-A", "on")
+        rc3, o3 = run("token", tok, "901-0001-A")
+        ok("private deletes the token for good: the old one never serves again, and public again is a new one",
+           rc == 1 and rc2 == 0 and tok2.strip() != tok and rc3 == 1 and run("token", tok2.strip(), "901-0001-A")[0] == 0)
         # revisions: a register of its own
         ROOT = os.path.join(t, "r2")
         v1 = mkpdf(src, "v1", "Gamma first version")
@@ -540,6 +767,31 @@ def selfcheck():
         rc, o = run("file", v1, "--project", "Box", "--title", "Gamma renamed")
         ok("the same title with no source is the same document too (C, not a new number)",
            "001-0001-C" in o and len(load()["documents"]) == 1)
+        # board revision, note and cost: a register of its own
+        ROOT = os.path.join(t, "r2c")
+        rc, o = run("file", v1, "--project", "Boards", "--kind", "work", "--title", "Board doc", "--describes", "PCB-1")
+        rc2, o2 = run("file", v1, "--project", "Boards", "--kind", "work", "--title", "Board doc", "--cost", "draft=x")
+        ok("a board revision not like PCB-0001-B, or a cost not step=usd, is refused and nothing filed",
+           rc == 2 and rc2 == 2 and not os.path.exists(regpath()))
+        rc, o = run("number", "--project", "Boards", "--kind", "work", "--title", "Board doc", "--describes", "PCB-0001-B", "--tex")
+        ok("number --tex puts the board revision in the stamp", "\\docstamp{001-0001-A · PCB-0001-B · " in o)
+        rc, o = run("file", v1, "--project", "Boards", "--kind", "work", "--title", "Board doc", "--describes", "PCB-0001-B",
+                    "--note", "First cut", "--cost", "draft=0.80", "--cost", "review=0.43")
+        r = load()["documents"]["001-0001"]["revisions"][0]
+        ok("file records the board revision, note and cost on the revision, and stamps `number · board · date`",
+           rc == 0 and r["describes"] == "PCB-0001-B" and r["note"] == "First cut"
+           and r["cost"] == {"total": 1.23, "steps": [{"step": "draft", "usd": 0.8}, {"step": "review", "usd": 0.43}]}
+           and "001-0001-A · PCB-0001-B · " in pdftext(os.path.join(ROOT, r["file"])))
+        rc, o = run("file", v1, "--project", "Boards", "--title", "Board doc", "--describes", "PCB-0001-C")
+        lib = json.loads(run("library", "--viewer", "owner")[1])["documents"][0]["revisions"]
+        ok("an unchanged rebuild records nothing, and the library sends board revision, cost, pages and bytes",
+           "unchanged" in o and len(lib) == 1 and lib[0]["describes"] == "PCB-0001-B" and lib[0]["cost"]["total"] == 1.23
+           and lib[0]["pages"] == 1 and lib[0]["bytes"] > 0 and lib[0]["file"] == "/files/001-0001-A.pdf")
+        rc, o = run("file", v2, "--project", "Boards", "--title", "Board doc")
+        r = load()["documents"]["001-0001"]["revisions"][1]
+        ok("a revision filed with no board revision or cost carries neither",
+           rc == 0 and "describes" not in r and "cost" not in r and "note" not in r)
+        ROOT = os.path.join(t, "r2")
         # figures: a register of its own; same words, a different drawing
         ROOT = os.path.join(t, "r2b")
         f1 = mkpdf(src, "f1", "Delta schematic\\par\\rule{2cm}{1cm}")
@@ -615,6 +867,8 @@ def main(argv):
             p.add_argument("pdf")
             p.add_argument("--no-stamp", action="store_true")
             p.add_argument("--date")
+            p.add_argument("--note")
+            p.add_argument("--cost", action="append")
         else:
             p.add_argument("--tex", action="store_true")
         p.add_argument("--project", required=True)
@@ -622,6 +876,7 @@ def main(argv):
         p.add_argument("--source")
         p.add_argument("--kind", choices=sorted(RANGES))
         p.add_argument("--member")
+        p.add_argument("--describes")
     p = sub.add_parser("project")
     p.add_argument("name")
     p.add_argument("--number")
@@ -631,12 +886,25 @@ def main(argv):
     p.add_argument("query", nargs="+")
     p = sub.add_parser("list")
     p.add_argument("--project")
+    p = sub.add_parser("star")
+    p.add_argument("number")
+    p.add_argument("state", choices=("on", "off"))
+    p.add_argument("--viewer", default="owner")
+    p = sub.add_parser("public")
+    p.add_argument("number")
+    p.add_argument("state", choices=("on", "off"))
+    p = sub.add_parser("token")
+    p.add_argument("token")
+    p.add_argument("number")
+    p = sub.add_parser("library")
+    p.add_argument("--viewer", required=True)
     sub.add_parser("selfcheck")
     a = ap.parse_args(argv)
     if a.cmd == "selfcheck":
         return selfcheck()
     try:
-        return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list}[a.cmd](a)
+        return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list,
+                "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library}[a.cmd](a)
     except Refused as e:
         print(f"cc-docs: {e}", file=sys.stderr)
         return 2
