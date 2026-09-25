@@ -20,7 +20,8 @@ spend of two sessions; past the ROTATE LINE the box runs it for the session (--s
                                              their truncated `task:` line, and a queued row's header (and
                                              its hold, if a person put one on it) with nothing else under it;
                                              `still out` names the predecessor's running subagents and the
-                                             workers it dispatched (--ready prints the same);
+                                             workers it dispatched, or says it could not read its task files
+                                             (--ready prints the same);
                                              a packet at or over CC_BRIEF_PACKET_BAND (24 kB) is one failures
                                              record (spend/handoff-packet-over-band), once per handoff
   cc-handoff --status [<target>] [--json]    what phase, who is live, how long left
@@ -87,7 +88,9 @@ CC_HANDOFF_AGENT_IDLE counts as done; capped at CC_HANDOFF_AGENT_MAX), hands eac
 gets the final message when the last one is in. Its board rows held by an `agent` mark move to the successor
 with the name (carry_marks). The kill is fenced by refuse_kill(): only the window the record names, only after
 cutover, never the caller's own. A seat whose record carries no session id (a planning seat, an orch) has it
-read off its live pane at --overlap and again at --ready (seat_sid) — without it the subagents read as none.
+read off its live pane at --overlap and again at --ready (seat_sid). Task files are read under both /tmp and
+TMPDIR (task_roots); a predecessor whose task files are found under neither is named as unread in `still out`, never
+as having none.
 A bounded stay, not a refusal and not a wait before cutover: the successor is live at once, and the staying
 predecessor spends nothing between reports. A worker the seat dispatched runs in a window of its own
 (its dispatch opens one), which nothing here kills, so it outlives the handoff and the retirement; its stop
@@ -600,12 +603,25 @@ def alert(target, msg):
 
 # ---- the predecessor's subagents -----------------------------------------------------------------------
 
+def task_roots():
+    """Where the harness may keep task files: <tmp>/claude-<uid>, where <tmp> is the TMPDIR of the claude process
+    that runs the session — /tmp for some seats, ~/.cc/tmp for others (both probed 2026-09-24). This process's own
+    TMPDIR says nothing about the predecessor's: a seat's Bash runs with TMPDIR=~/.cc/tmp, so reading that root
+    alone found no task files for a predecessor that wrote under /tmp, and the chip-flow packet said its three
+    running builders were (none) (2026-09-24 20:02Z; the successor re-dispatched into two of their worktrees).
+    So both are read. CC_HANDOFF_TASKS replaces them (os.pathsep-separated) — for a fixture, and for a harness
+    that moves them."""
+    env = os.environ.get("CC_HANDOFF_TASKS")
+    roots = env.split(os.pathsep) if env else [os.path.join(t, "claude-%d" % os.getuid())
+                                              for t in (tempfile.gettempdir(), "/tmp")]
+    return list(dict.fromkeys(os.path.realpath(r) for r in roots if r))
+
+
 def tasks_dirs(sid):
-    """Where the harness keeps what session `sid` is running: <tmp>/claude-<uid>/<project>/<session id>/tasks,
-    one `<id>.output` per task. The project part is that session's own directory, so it is globbed and never
-    guessed. CC_HANDOFF_TASKS replaces the root — for a fixture, and for a harness that moves it."""
-    root = os.environ.get("CC_HANDOFF_TASKS") or os.path.join(tempfile.gettempdir(), "claude-%d" % os.getuid())
-    return glob.glob(os.path.join(root, "*", sid, "tasks")) if sid else []
+    """Where the harness keeps what session `sid` is running: <root>/<project>/<session id>/tasks under any of
+    task_roots(), one `<id>.output` per task. The project part is that session's own directory, so it is globbed
+    and never guessed."""
+    return [d for r in task_roots() for d in glob.glob(os.path.join(r, "*", sid, "tasks"))] if sid else []
 
 
 REPORT_TAIL = 65536   # bytes of a transcript's end read for its last record — cc-slack's HOME_AGENT_TAIL, the same read
@@ -678,8 +694,7 @@ def tasks_sid(pid):
     """The session id of claude process `pid`, off the task directory it holds open: every live interactive
     claude keeps an fd on its own `<root>/<project>/<session id>/tasks` (probed 2026-09-22, ten seats, one fd
     each). "" when it holds none or cannot be read."""
-    root = os.environ.get("CC_HANDOFF_TASKS") or os.path.join(tempfile.gettempdir(), "claude-%d" % os.getuid())
-    pat = re.compile(re.escape(os.path.realpath(root)) + r"/[^/]+/([A-Za-z0-9][A-Za-z0-9._-]*)/tasks$")
+    pat = re.compile("(?:" + "|".join(re.escape(r) for r in task_roots()) + r")/[^/]+/([A-Za-z0-9][A-Za-z0-9._-]*)/tasks$")
     try:
         fds = os.listdir(f"/proc/{pid}/fd")
     except OSError:
@@ -731,8 +746,14 @@ def dispatched(target):
 
 def out_line(target, rec):
     """What the predecessor still has out, in one line — the same words in --brief and --ready."""
-    subs, wk = subagents(pre_sid(rec)), dispatched(target)
+    sid = pre_sid(rec)
+    subs, wk = subagents(sid), dispatched(target)
     bits = []
+    if not sid or not tasks_dirs(sid):
+        # "(none)" must mean none were found, never that nobody could look: a successor reads it as leave to
+        # re-dispatch into the predecessor's worktrees (chip-flow, 2026-09-24)
+        bits.append("its subagents could not be read (" + (f"no task files for session {sid}" if sid else
+                    "no session id") + "): ask it which are still running before you dispatch into a worktree")
     if subs:
         bits.append(f"{len(subs)} subagent(s) still running ({', '.join(subs[:6])}): it stays for them after "
                     f"cutover and hands each report on to you")

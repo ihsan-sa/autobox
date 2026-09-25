@@ -881,6 +881,32 @@ def run_selfcheck():
         ok("an unknown session id, or one with no task files, reads as no subagents — and the handoff is then "
            "exactly the one it was before", subagents("") == [] and subagents("sid-none") == [])
 
+        # TWO ROOTS. The predecessor's claude writes under ITS OWN TMPDIR (/tmp for some seats, ~/.cc/tmp for
+        # others); the successor's Bash runs with TMPDIR=~/.cc/tmp. Reading only the caller's root printed "(none)"
+        # for three running builders (chip-flow, 2026-09-24). Its own fixture: two roots, the agent under the SECOND.
+        troot2a, troot2b = os.path.join(d, "tasks-root-a"), os.path.join(d, "tasks-root-b")
+        tasks2 = os.path.join(troot2b, "project", "sid-two", "tasks")
+        os.makedirs(tasks2)
+        os.makedirs(os.path.join(troot2a, "project", "sid-empty", "tasks"))
+        t2 = os.path.join(d, "a-second.jsonl")
+        with open(t2, "w") as fh:
+            fh.write(rec_tool + "\n")                          # mid-turn
+        os.utime(t2, (clk[0], clk[0]))
+        os.symlink(t2, os.path.join(tasks2, "a-second.output"))
+        os.environ["CC_HANDOFF_TASKS"] = troot2a + os.pathsep + troot2b
+        ok("a subagent whose task files are under the SECOND task root is found — the caller's own TMPDIR is not "
+           "where the predecessor's harness wrote", subagents("sid-two") == ["a-second"]
+           and task_roots() == [os.path.realpath(troot2a), os.path.realpath(troot2b)])
+        _dispatched = globals()["dispatched"]
+        globals()["dispatched"] = lambda t: []            # this case is the subagents' half of the line alone
+        line = lambda sid: out_line("r2x", {"predecessor": {"session_id": sid}})
+        ok("`still out` never says (none) when it could not look: no task files for the session is named as "
+           "unread, and a session with task files and nothing running says nothing",
+           "could not be read" in line("sid-gone") and "sid-gone" in line("sid-gone")
+           and line("sid-empty") == "" and "a-second" in line("sid-two") and "could not" not in line("sid-two"))
+        globals()["dispatched"] = _dispatched
+        os.environ["CC_HANDOFF_TASKS"] = troot
+
         def cutover_sub(t):
             """cutover(), for a predecessor whose session id is the one the fixture's subagents belong to"""
             wins[t] = "@" + t
