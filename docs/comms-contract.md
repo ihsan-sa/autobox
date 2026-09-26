@@ -23,6 +23,13 @@ the promised result was checked.
 The box does not post handoffs, worker iterations, reconnects, routine merges, automatic recoveries or repeated
 reminders. Technical records stay on disk (journals, logs, the board) without becoming reading assignments.
 
+Every post says who sent it without the reader opening it: `cc-slack` signs it `<box>-box · <session>` (an orch by
+its alias, a headless loop by its track's display name), and a post into another session's channel opens with that
+channel's `<#C…>` mention, so it reads as addressed to it. `CC_SLACK_PLAIN_NAME=1` drops the name, not the mention.
+
+An answer to "what is running" is one bold line with the counts, then bullets nested by project and then by kind,
+one item per line, each named by what it does for a person. A compressed slug is still a slug.
+
 ## Questions go to whoever can answer them
 
 | request | route | who may send it |
