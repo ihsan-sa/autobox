@@ -28,7 +28,14 @@ def selfcheck(m):
         return sp.run([str(a) for a in command], stdin=sp.DEVNULL, stdout=sp.PIPE,
                       stderr=sp.PIPE, timeout=GUARD, **kwargs)
 
-    with tempfile.TemporaryDirectory(prefix="cc-member-v2-") as temp:
+    # THE FIXTURE VAULT IS NOT IN TMPDIR. The inventory walks every live namespace on the box and refuses one that binds
+    # V or any parent of it, as it must. TMPDIR is shared scratch that other sandboxes bind into (a landing's --tree
+    # checkout lives there), so a vault under it refused the good record whenever an unrelated one bound a parent
+    # (2026-09-24). No sandbox profile binds ~ or ~/.cc whole, so a directory of its own under ~/.cc is parent to
+    # nothing a live sandbox holds. The cases after "inventory control" prove both halves.
+    scratch = Path(os.environ["HOME"]) / ".cc/member-v2-selfcheck"
+    scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="cc-member-v2-", dir=scratch) as temp:
         root = Path(temp).resolve()
         h, v = root / "home", root / "vault"
         for p in (h / ".claude", h / ".local/bin", h / ".cc/members/team", v / "registry", v / "repos"):
@@ -336,6 +343,14 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                       "a namespace binding the registry, the host lock, a task's data or its control is "
                       "refused; one binding a session's own leaf, or a directory outside V, is not",
                       str(under | beside))
+                # BESIDE A LIVE SANDBOX THAT BINDS TMPDIR, the walk still passes, because the fixture vault is not in
+                # there; and one binding the vault's real parent is still refused. The second is the production refusal
+                # firing on this fixture, so the first passes by where V lives and not by a softer walk.
+                tmp = Path(tempfile.gettempdir()).resolve()
+                beside_tmp, above_v = bound(tmp), bound(root)
+                check(not beside_tmp and "exposes V" in above_v,
+                      "a live namespace binding TMPDIR leaves the inventory green; one binding V's parent is refused",
+                      f"{tmp}: {beside_tmp or 'allowed'}; {root}: {above_v or 'allowed'}")
                 # AND AN INNOCENT SANDBOX MUST NOT REFUSE THE BOX. Its private root spells "/", which is a
                 # parent of V, and it can mkdir V's own spelling in its own tmpfs: both are text, naming
                 # different objects on a different filesystem. `exec 3< /` is the whole attack, one line
