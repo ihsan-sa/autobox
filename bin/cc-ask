@@ -21,7 +21,9 @@ the context that costs the money.
 
 WHAT IT ANSWERS FROM, and in what order (the FRAME below is the whole instruction): the knowledge library's packet
 for the question — `cc-lib ask` is run HERE, before the model, so the model never needs a shell to reach the record
-— then the home guides (~/USAGE.md, ~/COMMS.md, ~/RUNBOOK.md, ~/WORKING.md, ~/CLAUDE.md), the project's CLAUDE.md,
+— and, for a question about cost, the board or the failure ledger, that tool's own output (THE TOOL ROUTE: its words
+pick `cc-spend --by track --week`, `cc board show <repo>` or `cc-failures show --scope <repo>`, a fixed argv run HERE
+with nothing from the question in it, cut to the lines naming the question's words) — then the home guides (~/USAGE.md, ~/COMMS.md, ~/RUNBOOK.md, ~/WORKING.md, ~/CLAUDE.md), the project's CLAUDE.md,
 docs/ and core/docs/, and a tool's own docstring. Every reply ends with the file it came from. A question the record
 does not answer gets one line saying so and where the answer would live, never a guess.
 
@@ -43,7 +45,7 @@ document ask with none says so. Anything else falls through to the model untouch
 revision the register at that root lists, resolved inside that root, so an ask can never attach a file from
 outside the register; without cc-docs, or without --documents, there is no lookup and the lane answers as before.
 
-EVERY RUN IS A LINE in ~/.cc/state/ask/runs.jsonl (ts, repo, model, cost, turns, tokens, seconds, outcome): with
+EVERY RUN IS A LINE in ~/.cc/state/ask/runs.jsonl (ts, repo, model, cost, turns, tokens, seconds, outcome, the tools it ran): with
 `--no-session-persistence` there is no transcript for cc-spend to price, so this is where the lane's spend is read.
 
 Knobs (env, else ~/.cc/config): CC_ASK_MODEL (sonnet) · CC_ASK_BUDGET (0.25 USD) · CC_ASK_TURNS (12) ·
@@ -79,6 +81,7 @@ def deny():
 FRAME = """You answer ONE question about this box — a headless home server run by Claude Code sessions — from its WRITTEN RECORD, for a person reading Slack on a phone.
 
 WHERE THE ANSWERS LIVE. Read in this order and stop at the first that answers:
+0. THE TOOL OUTPUT below, when there is one — what the box's own tool printed just now: cc-spend for what something cost (its USD is an estimate, and `--week` is the last 7 days, so say so), cc board for rows and their status, cc-failures for the failure ledger. For a cost, board or ledger question this is the source: cite the command, e.g. `_source: cc-spend --by track --week_`. When a row there is the thing asked about, its figure is the answer: name the row you read.
 1. THE RECORD PACKET below — what the box's knowledge library (cc-lib) found for this question: journals, board rows, landing records, decisions. This is the source for "what happened", "did X land", "what did track Y do", "what was decided".
 2. The home guides: {home}/USAGE.md (the commands), {home}/COMMS.md (reaching a project or agent in Slack), {home}/RUNBOOK.md (getting in, what to do when it breaks), {home}/WORKING.md (what a session does between tasks), {home}/CLAUDE.md (the rules).
 3. The project: {dev}/{repo}/CLAUDE.md, {dev}/{repo}/docs/ (incidents, audits, designs), {dev}/{repo}/core/docs/ (DESIGN.md: why the system is shaped this way).
@@ -87,7 +90,7 @@ WHERE THE ANSWERS LIVE. Read in this order and stop at the first that answers:
 RULES.
 1. Cite. Every reply ends with one line `_source: <path>_` — `path § heading` or `path:line`, two paths at most. A reply with no source is not a reply.
 2. Not in the record → ONE line, exactly this shape: `{nr}. It would live in <path or place> — ask in #{repo}.` Never guess, never answer from general knowledge, never invent a command, a flag or a file you did not read.
-3. Read, do not run. You have Read, Grep and Glob and nothing else. You cannot probe a live process, a URL, a token or a service: for a question about live state, give what the record says and its stamp, and say it was not probed.
+3. Read, do not run. You have Read, Grep and Glob and nothing else; any TOOL OUTPUT was run for you. Beyond it you cannot probe a live process, a URL, a token or a service: for a question about live state, give what the record says and its stamp, and say it was not probed.
 4. Secrets never leave the record: no token, key, password, webhook URL or credential contents, even when a file shows one — say where it is set instead.
 5. Slack mrkdwn: *bold*, `code`, ``` blocks; no # headings, no **. Short: the answer in one to four lines, bold the one thing that matters, then the source line. Start with the answer itself — no "Found it", no "Here is", no restating the question, no offer of more.
 6. Output the reply text only."""
@@ -118,10 +121,52 @@ def packet(repo, question, cap):
         return ""
 
 
-def prompt(repo, question, context, pkt):
+# THE TOOL ROUTE. A cost, board or ledger question is answered by a tool, not a doc: on 2026-09-18 the lane told the
+# owner a project's cost was "Not in the record" while `cc-spend --by track --week` had it. The question only picks
+# a route by its words; the argv is fixed here and names nothing from the question but the (already checked) repo.
+ROUTES = (
+    (re.compile(r"\b(?:cost|costs|costed|spend|spent|spending|how much|dollars?|usd|price|bill|tokens?)\b|\$", re.I),
+     lambda repo: ["cc-spend", "--by", "track", "--week"]),
+    (re.compile(r"\b(?:board|rows?|queued|in review|blocked|dispatched)\b", re.I),
+     lambda repo: ["cc", "board", "show", repo]),
+    (re.compile(r"\b(?:failures?|ledger|recurring|refusals?)\b", re.I),
+     lambda repo: ["cc-failures", "show", "--scope", repo]),
+)
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+TOOL_STOP = set("what which when where does did have much cost costs spend spent project from start finish the and "
+                "that this with about how many total whole board rows queued review blocked dispatched failures "
+                "failure ledger recurring refusals".split())   # a route's own words pick the tool, they do not filter it
+
+
+def tools(repo, question, cap):
+    """-> [(command, output)] for each route the question's words pick. Each output keeps its first two lines (the
+    tool's header) and then only the lines naming a word of the question (four letters or more), else its head; ANSI
+    stripped, capped at `cap` bytes. A tool that is missing, slow or red is left out, and the model reads the rest."""
+    words = {w.lower() for w in re.findall(r"[A-Za-z0-9][\w.-]{3,}", question)} - TOOL_STOP
+    out = []
+    for rx, argv in ROUTES:
+        if not rx.search(question):
+            continue
+        cmd = argv(repo)
+        try:
+            p = subprocess.run([f"{BIN}/{cmd[0]}", *cmd[1:]], capture_output=True, text=True, timeout=30,
+                               stdin=subprocess.DEVNULL)
+        except Exception:
+            continue
+        lines = ANSI.sub("", p.stdout or "").splitlines()
+        if p.returncode != 0 or not lines:
+            continue
+        hit = [ln for ln in lines[2:] if any(w in ln.lower() for w in words)]
+        out.append((" ".join(cmd), "\n".join(lines[:2] + (hit or lines[2:]))[:cap]))
+    return out
+
+
+def prompt(repo, question, context, pkt, tool_out=()):
     parts = [FRAME.format(home=HOME, dev=DEV, repo=repo, nr=NOT_RECORDED), "THE QUESTION:\n" + question.strip()]
     if context.strip():
         parts.append("EARLIER IN THIS THREAD (oldest first, for context only — answer the question above):\n" + context.strip())
+    for cmd, text in tool_out:
+        parts.append(f"THE TOOL OUTPUT (`{cmd}`, run just now for this question, read-only):\n{text}")
     parts.append("THE RECORD PACKET (cc-lib ask, read-only):\n" + (pkt or "(nothing recorded for these words — read the guides)"))
     return "\n\n".join(parts)
 
@@ -273,10 +318,12 @@ def answer(repo, question, context, documents=False):
                 "secs": round(time.time() - t0, 1), "cost": 0})
         return 0, doc[1], ""
     pkt = packet(repo, question, int(conf("CC_ASK_PACKET", 4096)))
-    reply, usage = model(repo, prompt(repo, question, context, pkt), int(conf("CC_ASK_TIMEOUT", 120)))
+    tool_out = tools(repo, question, int(conf("CC_ASK_PACKET", 4096)))
+    reply, usage = model(repo, prompt(repo, question, context, pkt, tool_out), int(conf("CC_ASK_TIMEOUT", 120)))
     outcome = "error" if reply is None else "not-recorded" if reply.startswith(NOT_RECORDED) else "answered"
     record({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "repo": repo, "outcome": outcome,
-            "secs": round(time.time() - t0, 1), "packet": len(pkt), "chars": len(reply or ""), **usage})
+            "secs": round(time.time() - t0, 1), "packet": len(pkt), "chars": len(reply or ""),
+            "tools": [c.split()[0] for c, _ in tool_out], **usage})
     if reply is None:
         return 1, "", f"cc-ask: no reply — {usage.get('error', 'unknown')}"
     return 0, reply, ""
@@ -486,6 +533,45 @@ def selfcheck():
         rcX, outX, _ = answer("myrepo", "send me the study plan", "", documents=True)
         check("document: with no cc-docs there is no lookup and the lane answers as it did before",
               rcX == 0 and outX.startswith("*Run `cc-green`.*"))
+        # THE TOOL ROUTE, on its own stubs: the owner's 2026-09-18 question drew "Not in the record" while cc-spend had
+        # the figure. Each stub logs its argv to $TOOLS_CALLED, so a question that picks no route is seen to run none.
+        called = f"{th}/tools-called"
+        os.environ["TOOLS_CALLED"] = called
+        for name, body in (("cc-spend", 'echo "cc-spend 2026-09-12..2026-09-18 — by track"\necho "  track  est \\$"\n'
+                                        'echo "  home/session  900.1"\necho "  chip101/counter  28.0432"\n'),
+                           ("cc", 'printf "\\033[1mboard\\033[0m %s\\n--\\n  fix-x  queued\\n" "$3"\n'),
+                           ("cc-failures", 'exit 1\n')):
+            with open(f"{BIN}/{name}", "w") as f:
+                f.write(f'#!/usr/bin/env bash\necho "{name} $*" >> "$TOOLS_CALLED"\n{body}')
+            os.chmod(f"{BIN}/{name}", 0o755)
+        q = "how much did the chip101 counter project cost start to finish?"
+        got = tools("myrepo", q, 4096)
+        spent = open(called).read().splitlines()
+        check("tool route: a cost question runs `cc-spend --by track --week` and nothing else, and its output is cut "
+              "to the header and the row naming the project (the other track's row is dropped)",
+              spent == ["cc-spend --by track --week"] and len(got) == 1 and got[0][0] == "cc-spend --by track --week"
+              and "chip101/counter  28.0432" in got[0][1] and "home/session" not in got[0][1]
+              and got[0][1].startswith("cc-spend 2026-09-12"))
+        text = prompt("myrepo", q, "", "", got)
+        check("tool route: the prompt carries the tool output under its command, and the frame says to cite it",
+              "THE TOOL OUTPUT (`cc-spend --by track --week`" in text and "28.0432" in text
+              and "_source: cc-spend --by track --week_" in text)
+        os.remove(called)
+        check("tool route: a question with no cost, board or ledger word runs no tool at all",
+              tools("myrepo", "how do I run the gates?", 4096) == [] and not os.path.exists(called))
+        board = tools("myrepo", "what is queued on the board?", 4096)
+        check("tool route: a board question runs `cc board show <repo>` with ANSI stripped",
+              [c for c, _ in board] == ["cc board show myrepo"] and board[0][1].startswith("board myrepo")
+              and "\x1b" not in board[0][1] and "fix-x  queued" in board[0][1])
+        check("tool route: a red tool (cc-failures exiting 1) is left out, not handed to the model",
+              tools("myrepo", "any recurring failures?", 4096) == [])
+        os.environ["CC_ASK_FAKE"] = ok_json
+        answer("myrepo", q, "")
+        check("tool route: the run's log line names the tools it ran",
+              json.loads(open(LOG).read().splitlines()[-1]).get("tools") == ["cc-spend"])
+        for name in ("cc-spend", "cc", "cc-failures"):
+            os.remove(f"{BIN}/{name}")
+        del os.environ["TOOLS_CALLED"]
         del os.environ["CC_ASK_FAKE"]
         # the docstring says what the code does: the knobs and the log path it names exist here
         src = open(os.path.realpath(__file__)).read()
