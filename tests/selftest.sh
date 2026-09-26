@@ -1050,6 +1050,21 @@ od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t3 2>&1); rd=$?
   && ok "cc done on a project whose repository's default branch is the track itself ends clean — the branch is the delivery, not a PR onto itself" \
   || bad "cc done tried a PR from the track onto itself: rc=$rd $od"
 git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t3" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t3 >/dev/null 2>&1; rm -rf "$T/t3.git"
+# THE SAME SHAPE AFTER main EXISTS (ece298a/r2r-dac, 2026-09-25): the default is still the track, but main is there, so
+# the PR goes onto main instead of the "no other branch" ending. gh is not reachable here, so the run may fail at the PR.
+git init -q --bare "$T/t3b.git"
+git -C "$GH/dev/alice" worktree add -q -b track/t3b "$GH/.cc/worktrees/alice/t3b" 2>/dev/null
+mkdir -p "$GH/.cc/worktrees/alice/t3b/.cc"; printf 'alice\nt3b\n' > "$GH/.cc/worktrees/alice/t3b/.cc/track"
+git -C "$GH/.cc/worktrees/alice/t3b" remote add t3b "$T/t3b.git"
+git -C "$GH/.cc/worktrees/alice/t3b" -c user.email=t@t -c user.name=t commit -q --allow-empty -m t3b
+git -C "$GH/.cc/worktrees/alice/t3b" push -q t3b track/t3b 2>/dev/null; git -C "$GH/.cc/worktrees/alice/t3b" push -q t3b track/t3b:refs/heads/main 2>/dev/null
+git -C "$T/t3b.git" symbolic-ref HEAD refs/heads/track/t3b
+mkdir -p "$T/t3b-bin"; printf '#!/bin/sh\nexit 1\n' > "$T/t3b-bin/gh"; chmod +x "$T/t3b-bin/gh"   # a gh that fails at once; the real one waits on a pipe
+od=$(env HOME="$GH" PATH="$T/t3b-bin:$B:$PATH" timeout 60 "$B/cc" done alice t3b 2>&1 </dev/null)
+{ grep -q 'opening the PR against main' <<<"$od" && ! grep -q 'no other branch there' <<<"$od"; } \
+  && ok "cc done with the default still on the track but main present opens the PR against main" \
+  || bad "cc done ignored main when the default was the track: $od"
+git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t3b" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t3b >/dev/null 2>&1; rm -rf "$T/t3b.git" "$T/t3b-bin"
 # A KIND=SESSION ROW IS A LIVING PROJECT, NOT A TASK: alive is its normal state, so `cc done` delivers and stops there.
 # Run against a member project in daily use it pushed and then ended the row as finished (2026-09-04). The two endings
 # above are a kind=track row's and are unchanged.
