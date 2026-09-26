@@ -25,7 +25,7 @@
   cc-slack ask [-t "title"] "text"      from a member workspace's session, ask the box's planning seat (a repo, a host-side push, a question): the daemon posts a 🙋 card in the control repo's #<repo>-threads lane on the workspace's behalf, hands it to the planning session, and carries every reply in the card's thread (the seat's or the owner's) back to #<workspace>, handed to its session; at most 5 an hour. Never ask the owner to relay.
   cc-slack seat                          the seat the daemon says owns this process (`<repo>`, `<repo>/<track>`, `<repo>@<alias>`), from the socket's pid chain and the live subscriptions; empty and exit 1 when none does, exit 2 when the daemon could not be reached at all. cc-notify reads it to decide who may ask the owner, and a caller it cannot identify (exit 2) is not the box's own hand.
   cc-slack grant allow '<rule>' [-t "why"]   from a box session (planning or a track) that a permission layer refused: the daemon posts a 🔐 grant card in the control repo's #<repo>-threads lane naming that ONE allow line; the owner's `yes <id> fix` there has the daemon write it into ~/.claude/settings.json (cc-settings grant), `no <id>` declines; the card shows ⚙️ or ❌. `cc-slack grant config KEY VALUE` is the same for one ~/.cc/config key (never a credential's). An allow or config ask goes to the box's approver first (cc-approve, APPROVER=off skips it): what the owner's merged grants cover, asked by a planning seat, the daemon writes with no card and a ⚙️ line in that lane; the rest is the card. Never a member workspace's verb, never answerable by a session; at most 5 an hour. `cc-slack grant unit <file.service|.timer>` is the same card for a user unit install (file, sha256 and the enable both named). `cc-slack grant confirm '<command>' -w <window>` is the same card for a seat parked on the auto-mode confirm dialog behind a command that is not read-only (cc-model's tick raises it): the owner's `yes <id>` / `no <id>` is written to ~/.cc/state/confirm-answers/<id>, and cc-model's next tick presses that answer into the dialog — this once, never for good. Design: docs/design-seat-grant-from-slack.md.
-  cc-slack permission <id> yes|no [fix]     answer a 🔐 prompt from here, the same path as a `yes <id>` Slack reply; every session's prompt but the planning session's own goes to the control repo's #<repo>-threads lane for it to decide; `fix` marks the capability granted for good. On a member workspace's WebFetch or WebSearch card, `yes <id> fix` (here or the owner's in Slack) also grants that workspace the web (`cc-sandbox web`): from its next launch those two tools are no ask rule, and auto mode judges each call.
+  cc-slack permission <id> yes|no [fix]     answer a 🔐 prompt from here, the same path as a `yes <id>` Slack reply; every session's prompt but the planning session's own goes to the control repo's #<repo>-threads lane for it to decide; `fix` marks the capability granted for good. On a member workspace's WebFetch or WebSearch card, `yes <id> fix` (here or the owner's in Slack) also grants that workspace the web (`cc-sandbox web`): from its next launch those two tools are no ask rule, and auto mode judges each call. It re-reads the session's pane: a dialog still standing unchanged after the answer went out is reported as not landed (exit 1, the prompt stays open), never as delivered.
   cc-slack updates-sweep [--dry-run]  give every repo channel that predates the split its -updates lane (idempotent; skips a bot-only channel).
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]     give a sub-orchestrator its own channel, recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it).
   cc-slack archive <#chan|C…> | archive --orch <target> <alias>      archive a sub-orch channel; it stops routing and leaves home.json's channel list.
@@ -155,6 +155,8 @@ HANDOVER = {"main"}                                          # @tokens that addr
 MENTION_RE = re.compile(r"(^|[\s(\[])@([A-Za-z0-9][A-Za-z0-9._-]*)")   # only at a word boundary: a@b.com / foo@bar / .../@x are not mentions
 PERM_OPEN, PERM_WINDOW = 5, 300                              # 🔐 prompts one target may have open in this window — more is a loop, not a question
 PERM_STALE = 24 * 3600                                       # an unanswered prompt this old leaves perm_asks unanswered — waiting on nobody
+PERM_SPINNER = re.compile(r"esc to interrupt|\btokens\b", re.I)   # the running-turn line above a dialog: its timer ticks
+PERM_SETTLE = 4.0                                            # seconds `cc-slack permission` gives a sent answer to close the dialog on the pane
 PERM_MAX = 400                                               # …and the table's hard ceiling, whatever the number of targets
 ASK_CAP, ASK_WINDOW = 5, 3600                                # 🙋 asks one member workspace may post in this window — more is a loop, not a question
 ASK_STALE, ASK_MAX = 3 * 24 * 3600, 200                     # an ask thread this old stops carrying replies; the table's ceiling
@@ -1171,6 +1173,35 @@ def tmux_window(name):
         if wname == name:
             return wid, cmd
     return None, None
+
+
+def perm_dialog(pane):
+    """The permission dialog standing at the foot of a pane as a comparable signature, "" when none stands.
+    Digits are dropped from the spinner line alone (the ticking timer above it) — never from the dialog body, where
+    "lecture 3" and "lecture 4" are two dialogs; a question further up than a dialog's height is transcript text."""
+    lines = [l.rstrip() for l in (pane or "").splitlines() if l.strip()]
+    at = max((i for i, l in enumerate(lines) if "Do you want to" in l), default=None)
+    if at is None or len(lines) - at > 12:
+        return ""
+    return "\n".join(re.sub(r"\d", "", l) if PERM_SPINNER.search(l) else l for l in lines[max(0, at - 8):])
+
+
+def perm_words(preview):
+    """The words a 🔐 prompt's input shows on its dialog: a JSON input's string values (`{"query": "x"}` is drawn
+    as Search("x")), else the text itself; the first eight word runs, digits kept."""
+    text = str(preview or "")
+    with contextlib.suppress(Exception):
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            text = " ".join(str(v) for v in obj.values() if isinstance(v, (str, int, float)))
+    return re.findall(r"\w+", text)[:8]
+
+
+def perm_mine(dialog, preview):
+    """Is the dialog on screen this prompt's? Only when every word of its input is in the dialog — with several
+    prompts open for one session (PERM_OPEN), the one on screen may be another's, and an absent preview claims none."""
+    words = perm_words(preview)
+    return bool(dialog and words) and all(w in dialog for w in words)
 
 
 def pane_idle(wid):
@@ -4307,7 +4338,8 @@ class Daemon:
                 # `<repo>@<alias>` reaches only that orch's subscription (steward escalations arrive this way).
                 # Queues alias-keyed when down; never autostarted (that would start the planning seat instead).
                 target, alias = split_orch(first["inject"])
-                if not valid_target(target) or (alias and not orch_lookup(load_orchs(), target, alias)):
+                if not valid_target(target) or (alias and not orch_lookup(load_orchs(), target, alias)
+                                                and first["inject"] != self.cfg.get("CC_QUERIES_SESSION")):   # the threads seat has no channel of its own
                     c.sendall(b'{"ok":false,"error":"bad target"}\n'); return
                 content = first.get("content", "")
                 home = target if member or alias or self.subs.get(target) else home_of(self.cfg, target)
@@ -4375,7 +4407,8 @@ class Daemon:
             elif verb == "permission":   # {"permission": "<request_id>", "answer": "yes"|"no"} — same path a Slack
                 # `yes <id>` takes, so the -threads session can answer without a round trip through the owner's
                 # phone. Who answered is peer_session's to say (socket + live subscription, never the payload).
-                who = self.peer_session(self.peer_of(c), member)
+                seat = self.peer_seat(self.peer_of(c), member)
+                who = (f"{seat[0]}@{seat[1]}" if seat[1] else seat[0]) if seat else None   # an orch is named with its alias
                 res = self.answer_permission(str(first["permission"] or ""), str(first.get("answer") or ""), who,
                                              fix=bool(first.get("fix")))
                 c.sendall((json.dumps(res) + "\n").encode())
@@ -4799,9 +4832,27 @@ class Daemon:
         return ct if ct and "/" not in ct else None
 
     def chan_alias(self, chat):
-        """The orch a whole channel belongs to (None = the main session); in an orch's own channel a plain message is its, though @main/@<other> still hands the thread over."""
+        """The orch a whole channel belongs to (None = the main session); in an orch's own channel a plain message is its, though @main/@<other> still hands the thread over. The control repo's -threads lane is the threads seat's while that is up (threads_seat)."""
         e = load_orchs().get(chat) or {}
+        if not e and chat and self.cfg.get("CC_QUERIES_SESSION") and chat == self.threads_chat(CTL):
+            return self.threads_seat()[1]                # the control repo's -threads lane is its threads seat's while that is up
         return None if e.get("archived") else (e.get("alias") or None)
+
+    def threads_seat(self):
+        """(target, alias) of the seat that answers the control repo's -threads lane: the 🔐 member prompts, the 🙋
+        member asks and what people say there (owner, 2026-09-24: "yes set it up" — ten member prompts in five minutes
+        were ten full-context wakes of the planning seat). CC_QUERIES_SESSION (cc-config) names it `<ctl>@<alias>`, the
+        same orch window cc-msg hands member refusals to. While it is up — subscribed, or its window runs something
+        other than a shell — the lane is its; when it is not, or the key names nothing, (CTL, None): the planning seat,
+        as before, so nothing waits on a seat that is gone."""
+        t, a = split_orch(str(self.cfg.get("CC_QUERIES_SESSION") or ""))
+        if t != CTL or not a:
+            return CTL, None
+        with self.lock:
+            up = any((c.info.get("alias") or None) == a for c in self.subs.get(CTL, []))
+        if up or home_windows().get(f"{CTL}@{a}", "bash") not in ("bash", "sh", "zsh", ""):
+            return CTL, a
+        return CTL, None
 
     def aliases_for(self, target):
         """Aliases whose @token we honour: this daemon life's subscribers plus every live orch channel's, read from disk so routing survives a daemon restart."""
@@ -6434,7 +6485,8 @@ class Daemon:
     def answer_permission(self, rid, answer, who=None, fix=False):
         """Answers a 🔐 prompt by id from a session on this box, not Slack; same deliver()/payload as a reply.
         Answer + who gave it go into the prompt's own thread, visible where the owner would have answered.
-        Only control-repo sessions may answer. `fix` grants the capability for good; changes ⚙️ + the word."""
+        Only control-repo sessions may answer. `fix` grants the capability for good; changes ⚙️ + the word — never
+        from the threads seat (CC_QUERIES_SESSION): "It answers with a one-time yes, never a permanent grant" (brief)."""
         rid, answer = str(rid or "").strip().lower(), str(answer or "").strip().lower()
         if not re.fullmatch(r"[a-km-z]{5}", rid):
             return {"ok": False, "error": f"{rid!r} is not a request id (five letters, from the 🔐 prompt)"}
@@ -6443,6 +6495,9 @@ class Daemon:
         if (str(who or "").partition("/")[0].partition("@")[0]) != CTL:
             return {"ok": False, "error": f"a permission answer is {CTL}'s to give — this call came from "
                                           f"{who or 'a session the box cannot name'}"}
+        if fix and who and who == self.cfg.get("CC_QUERIES_SESSION"):   # the threads seat answers once, never for good
+            return {"ok": False, "error": f"{who} gives one-time answers only — a permanent grant is the planning seat's "
+                                          f"or the owner's: answer `{answer} {rid}` without fix"}
         if rid in self.grant_asks:   # a seat never approves a capability for the box's own seats — that is the owner's word, in Slack
             return {"ok": False, "error": f"{rid} is a grant card: only the owner answers it, with `yes {rid} fix` or `no {rid}` in Slack"}
         ask = self.perm_asks.get(rid)
@@ -6450,10 +6505,27 @@ class Daemon:
             return {"ok": False, "error": f"no prompt {rid} is waiting (already answered, or from before a restart "
                                           f"— answer it in Slack with `{answer} {rid}`)"}
         allow = answer.startswith("y")
+        before = perm_dialog(self.perm_screen(ask["target"]))
+        before = before if perm_mine(before, ask.get("preview")) else ""   # another prompt's dialog: nothing to read
         res = self.deliver(ask["target"], {"type": "permission", "request_id": rid,
                                            "behavior": "allow" if allow else "deny"}, autostart=False)
-        self.perm_asks.pop(rid, None)
         word = ("allowed" if allow else "denied") + (" — and given for good" if fix else "")
+        # "delivered" is only the channel server taking the line; the dialog closing is what unblocks the session.
+        # A subagent's dialog has been seen to stay up through a delivered answer (2026-09-24), so read the pane again,
+        # and if it still stands press the same answer into it, as a person at the pane would; only then call it standing.
+        if res == "delivered" and before and self.perm_standing(ask["target"], before):
+            self.perm_press(ask["target"], allow)
+            res = "pressed at the pane"
+            log(f"permission {rid}: dialog still up after delivery — pressed {'yes' if allow else 'esc'} on {ask['target']}")
+        if res == "pressed at the pane" and self.perm_standing(ask["target"], before):
+            why = (f"{ask['target']} {rid}: {word} was sent and pressed, but the dialog on its screen is still standing — "
+                   f"the answer did not land, and the prompt stays open (answer it at the pane, or `{answer} {rid}` again)")
+            if ask.get("chat"):
+                self._safe(self.say, ask["chat"], f"🔐 `{ask['target']}` {rid}: *{word}* by `{who}`, but the dialog "
+                                                  f"is still on its screen — not landed", ask.get("thread"))
+            log(f"permission {rid}: {word} by {who} for {ask['target']} (sent, dialog still standing)")
+            return {"ok": False, "error": why, "target": ask["target"], "result": "standing"}
+        self.perm_asks.pop(rid, None)
         if ask.get("chat"):
             self._safe(self.say, ask["chat"], f"🔐 `{ask['target']}` {rid}: *{word}* by `{who}`", ask.get("thread"))
         self._safe(self.perm_react, ask, allow, fix)
@@ -6484,6 +6556,35 @@ class Daemon:
         if ask.get("chat"):
             self.say(ask["chat"], line, ask.get("thread"))
         log(f"web grant for {ws} by {by}: {'ok' if ok else 'refused'} ({out.splitlines()[-1]})")
+
+    def perm_screen(self, target):
+        """The target's pane as text, "" when it has no window here."""
+        wid, _ = tmux_window(window_for(target))
+        if not wid:
+            return ""
+        rc, out = tmux("capture-pane", "-p", "-t", wid)
+        return out if rc == 0 else ""
+
+    def perm_press(self, target, allow):
+        """Answer the dialog standing on the target's pane with keys: `1` (Yes, this once) or Esc (no)."""
+        wid, _ = tmux_window(window_for(target))
+        if not wid:
+            return
+        if allow:
+            tmux("send-keys", "-t", wid, "-l", "--", "1"); time.sleep(0.3); tmux("send-keys", "-t", wid, "Enter")
+        else:
+            tmux("send-keys", "-t", wid, "Escape")
+
+    def perm_standing(self, target, before):
+        """Is the dialog `before` still on the target's pane PERM_SETTLE s after its answer went out? Any change —
+        gone, or the next dialog in its place — counts as landed."""
+        end = time.time() + PERM_SETTLE
+        while True:
+            time.sleep(min(0.5, PERM_SETTLE))
+            if perm_dialog(self.perm_screen(target)) != before:
+                return False
+            if time.time() >= end:
+                return True
 
     def perm_sweep(self, now=None):
         """Drop only what nobody is waiting on — every entry here is a blocked session, so an id evicted for any
@@ -6562,7 +6663,8 @@ class Daemon:
             # Bounded by perm_room and perm_sweep, never by dropping the oldest; each entry is still waiting.
             self.perm_asks[rid] = {"target": target, "chat": chat, "thread": thread or root, "at": time.time(),
                                    "card": root if root != thread else None,   # the card's own ts: where its outcome is marked
-                                   "tool": str(msg.get("tool_name") or "")}    # what a fix grants for good (web_grant)
+                                   "tool": str(msg.get("tool_name") or ""),   # what a fix grants for good (web_grant)
+                                   "preview": str(msg.get("input_preview") or "")[:500]}   # tells its dialog from another's
         if not (target == CTL and not alias):
             self.tell_seat(target, alias, rid, msg, chat, root)
 
@@ -6580,8 +6682,10 @@ class Daemon:
                 f"{how}The card is in #{self.chan_name(chat) or threads_name(CTL)}.")
         meta = {"chat_id": chat, "thread_ts": card or "", "ts": card or "", "user": "cc-slack", "role": "owner",
                 "channel": "#" + (self.chan_name(chat) or threads_name(CTL)), "target": CTL}
-        res = self.deliver(CTL, {"type": "message", "content": text, "meta": meta}, autostart=False)
-        log(f"permission_request {rid or '(no id)'} from {target}{'@' + alias if alias else ''}: told {CTL} ({res})")
+        seat, salias = self.threads_seat()               # the threads seat while it is up, else the planning seat
+        res = self.deliver(seat, {"type": "message", "content": text, "meta": meta}, autostart=False, alias=salias)
+        log(f"permission_request {rid or '(no id)'} from {target}{'@' + alias if alias else ''}: "
+            f"told {seat}{'@' + salias if salias else ''} ({res})")
 
     # ---- a box session's own missing permission, granted from Slack (docs/design-seat-grant-from-slack.md) ----
     # The seat runs in auto mode: a refused command raises no 🔐 prompt for anyone to answer, so the seat raised the
@@ -6894,7 +6998,7 @@ class Daemon:
         (raised-a-workspace-cannot-ask-in-the-channel-the-rule-names, 2026-09-18): the rule 'ask in #<ctl>-threads'
         had no mechanism — a member session can neither read nor post there, so the owner relayed twice. The card
         goes to the control repo's -threads lane as UNTRUSTED data (every field through perm_field) and is handed to
-        the planning session like tell_seat's line; the card's ts keys member_asks, so a reply in its thread finds
+        the threads seat while it is up, else the planning session, like tell_seat's line; the card's ts keys member_asks, so a reply in its thread finds
         its way home (answer_ask) — and the table is on disk (save_asks), so a reply after a daemon restart still
         does. ASK_CAP per workspace per ASK_WINDOW; the lane is never the member's own."""
         title = perm_field(title.strip(), 80)
@@ -6924,11 +7028,12 @@ class Daemon:
         self.save_asks()
         meta = {"chat_id": chat, "thread_ts": card, "ts": card, "user": "cc-slack", "role": "owner",
                 "channel": lane, "target": CTL}
-        res = self.deliver(CTL, {"type": "message", "meta": meta,
-                                 "content": f"{self.ASK_HEAD}{who} asks" + (f" — *{title}*" if title else "") + f": {text} "
-                                            f"— answer in this thread (the card in {lane}); the box hands your reply to {h}'s session, not its channel."},
-                           autostart=False)
-        log(f"ask from {h}: card {chat}/{card}, told {CTL} ({res})")
+        seat, salias = self.threads_seat()               # the threads seat while it is up, else the planning seat
+        res = self.deliver(seat, {"type": "message", "meta": meta,
+                                  "content": f"{self.ASK_HEAD}{who} asks" + (f" — *{title}*" if title else "") + f": {text} "
+                                             f"— answer in this thread (the card in {lane}); the box hands your reply to {h}'s session, not its channel."},
+                           autostart=False, alias=salias)
+        log(f"ask from {h}: card {chat}/{card}, told {seat}{'@' + salias if salias else ''} ({res})")
         return {"ok": True, "card": card, "text": f"asked in {lane} ({CTL} {res}): the answer is handed to your "
                                                   f"session as a turn — do not ask the owner to relay it"}
 

@@ -30,8 +30,9 @@
 #   cc-notify requests [--retry]           the requests still open (the broker's untaken ones marked) / hand the untaken to it again
 #   cc-notify requests answer <id> "text"  CLOSE a request: post the answer once where it came from (a track's thread,
 #                 a workspace's channel; under --id answer:<id>@<asked-at>, so a retry never posts twice), then mark the file
-#                 answered (answered_at, by) so it is no longer listed. Control seat only. An unknown or already
-#                 answered id exits 1 and posts nothing; a request whose asker left no seat is closed with no post.
+#                 answered (answered_at, by) so it is no longer listed. Control seat or its own requests seat
+#                 (<box>@requests — the peer session that owns the 🙋 queue) only; no other seat. An unknown or
+#                 already answered id exits 1 and posts nothing; a request whose asker left no seat is closed with no post.
 #   cc-notify report [today|yesterday|YYYY-MM-DD]   how much was sent to the owner that day, at which rungs
 #   cc-notify setup        create the ntfy topic + show the phone subscription steps
 #   cc-notify test         send a test push
@@ -230,7 +231,14 @@ req_answer(){   # $1 id  $2 text
   id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9._:@-' '_'); f="$REQ/$id.json"
   [ -f "$f" ] || { echo "cc-notify: no request $id on file — nothing posted" >&2; return 1; }
   [ -z "$(jq -r '.answered_at // ""' "$f")" ] || { echo "cc-notify: request $id was already answered ($(jq -r .answered_at "$f")) — nothing posted" >&2; return 1; }
-  is_control || { echo "cc-notify: only ${CTL:-$BOX}'s planning seat answers a request (this is ${from_seat:-an unidentified caller}) — nothing posted" >&2; return 1; }
+  # THE QUEUE'S OWN SEAT ANSWERS TOO. `<box>@requests` is the peer session set up to own the 🙋 queue (an orch
+  # alias, never a claim in the payload): `is_control` names it in `from_seat` and refuses it like any other
+  # non-control seat, so it is let back in here by that exact name — and by nothing looser, so no other seat's
+  # name ever matches this line.
+  if ! is_control; then
+    [ "$from_seat" = "${CTL:-$BOX}@requests" ] \
+      || { echo "cc-notify: only ${CTL:-$BOX}'s planning seat or its requests seat answers a request (this is ${from_seat:-an unidentified caller}) — nothing posted" >&2; return 1; }
+  fi
   from=$(jq -r '.from // ""' "$f"); ts=""
   pid="answer:$id@$(jq -r '.at // ""' "$f")"   # the ask's own stamp: the same id asked again after an answer is a new ask, not a ledger dedup
   case "$from" in
@@ -664,6 +672,22 @@ PY
   k "$(yes_ test "$rc" = 1)" "a track cannot answer a request: only the control seat does"
   k "$(yes_ test "$(posts)" = 0)" "…nothing posted"
   k "$(yes_ test -z "$(jq -r '.answered_at // ""' "$NH/.cc/requests/ans:member.json")")" "…and the request stays open"
+
+  # THE QUEUE'S OWN SEAT (<box>@requests) IS LET IN BY THAT EXACT NAME, and no orch alias gets the same door
+  # just for being an orch: `cc-slack seat` is asked here the same way it named `abox@improve` above.
+  N --ask --id ans:queue -t "demorepo blocked" "the queue's own seat closes this one"
+  seatstub "abox@requests"
+  A "$T" ans:queue "closed by the queue's seat"; rc=$?
+  k "$(yes_ test "$rc" = 0)" "the seat that owns the 🙋 queue (<box>@requests) answers a request too"
+  k "$(yes_ test -n "$(jq -r '.answered_at // ""' "$NH/.cc/requests/ans:queue.json")")" "…and closes it"
+  k "$(yes_ test "$(jq -r .by "$NH/.cc/requests/ans:queue.json")" = abox)" "…filed under the box's own name, same as the control seat"
+  N --ask --id ans:otherseat -t "demorepo blocked" "no other orch alias gets this"
+  seatstub "abox@improve"
+  A "$T" ans:otherseat "not the requests seat"; rc=$?
+  k "$(yes_ test "$rc" = 1)" "no other orch of the control repo shares that door — only the exact name <box>@requests does"
+  k "$(yes_ test -z "$(jq -r '.answered_at // ""' "$NH/.cc/requests/ans:otherseat.json")")" "…and the request stays open"
+  slackstub 0
+
   A "$T" ans:member "it is made"
   k "$(yes_ grep -qx -- "post -c #alice --id answer:ans:member@$(jq -r .at "$NH/.cc/requests/ans:member.json") it is made" "$T/slack.args")" "a workspace's request is answered in its channel, the way back its request line names"
   A "$T" ans:nobody "noted"; rc=$?

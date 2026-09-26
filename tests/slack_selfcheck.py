@@ -1500,6 +1500,112 @@ def run_selfcheck():
             check("a 🔐 card folds a long tool input: the card shows its head and says where the rest is, the whole input is the "
                   "next message in the card's thread, the ask stamps the card — and a short input stays on the card, one message",
                   fold_ok and fold_card and len(short_said) == 1 and "```\nls\n```" in short_said[0][1])
+        # -- THE THREADS SEAT TAKES THE LANE WHILE IT IS UP (row a-threads-seat-answers-member-asks) ----------------
+        # 2026-09-24: ten member WebSearch prompts in five minutes were ten full-context wakes of the planning seat.
+        # CC_QUERIES_SESSION names the seat that answers #<ctl>-threads; while it is up, the 🔐 card's copy, the 🙋
+        # ask's copy and a plain message in the lane go to it and NOT to planning; when it is gone, to planning again.
+        devT = tempfile.mkdtemp(prefix="cc-slack-selfcheck-threads-")
+        os.makedirs(f"{devT}/mem1/.cc", exist_ok=True); open(f"{devT}/mem1/{MEMBER_MARKER}", "w").close()
+        os.makedirs(f"{devT}/{CTL}", exist_ok=True)
+        _keepT = {k: globals()[k] for k in ("DEV", "load_routes", "find_channel", "home_windows", "react", "api")}
+        dmT = Daemon(use_slack=False)
+        dmT.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test", "CC_QUERIES_SESSION": f"{CTL}@threads"}
+        dmT.bot_user = "UBOT"; dmT.names.update({"CTHREADS": f"{CTL}-threads", "CMEM1": "mem1"})
+        dmT.users.update({"UOWNER": ("The Owner", "owner")}); dmT.set_mark = lambda *a, **k: None
+        saidT, gotT = [], []
+        dmT.say = lambda chat, text, thread=None, **k: saidT.append((chat, text, thread)) or f"ts{len(saidT)}"
+        dmT.deliver = lambda target, payload, autostart=True, alias=None: gotT.append(
+            (target, alias, payload.get("type"), payload.get("content") or "")) or "delivered"
+        try:
+            globals()["DEV"] = devT
+            globals()["load_routes"] = lambda: {f"#{CTL}-threads": CTL}
+            globals()["find_channel"] = lambda cfg, name: (("CTHREADS", True) if name == f"{CTL}-threads"
+                                                           else ("CMEM1", True) if name == "mem1" else (None, False))
+            globals()["home_windows"] = lambda: {}      # the seat's liveness is its subscription below, nothing else
+            globals()["react"] = lambda *a, **k: None
+            globals()["api"] = lambda method, token, **kw: {}
+            dmT.last_chat["mem1"] = ("CMEM1", "9.1")
+            dmT.subs[CTL] = [Conn(None, CTL, {"alias": "threads"}), Conn(None, CTL, {"alias": None})]
+            dmT.relay_permission("mem1", {"tool_name": "WebSearch", "description": "search", "input_preview": "q",
+                                          "request_id": "kqmtw"})
+            dmT.relay_ask("mem1", "a repo", "may I have a repo?")
+            dmT.on_event(msgM("t.1", "UOWNER", "what is waiting here?", chan="CTHREADS"))
+            upT = list(gotT); gotT.clear()
+            dmT.subs[CTL] = [Conn(None, CTL, {"alias": None})]      # the threads seat is gone
+            dmT.relay_permission("mem1", {"tool_name": "WebFetch", "description": "fetch", "input_preview": "u",
+                                          "request_id": "kqmtx"})
+            dmT.relay_ask("mem1", "again", "and now?")
+            dmT.on_event(msgM("t.2", "UOWNER", "anyone?", chan="CTHREADS"))
+            downT = list(gotT); gotT.clear()
+            fixT = dmT.answer_permission("kqmtx", "yes", f"{CTL}@threads", fix=True)
+            oneT = dmT.answer_permission("kqmtx", "yes", f"{CTL}@threads")
+        finally:
+            globals().update(_keepT)
+            subprocess.run(["rm", "-rf", devT])
+        check("threads seat: while CC_QUERIES_SESSION's seat is up, a member's 🔐 prompt, a member's 🙋 ask and a message "
+              "in #<ctl>-threads each reach THAT seat (<ctl>@threads) and not the planning seat",
+              [(t, a) for t, a, *_ in upT] == [(CTL, "threads")] * 3
+              and "WebSearch" in upT[0][3] and "may I have a repo?" in upT[1][3] and upT[2][3] == "what is waiting here?")
+        check("threads seat: with that seat gone the same three reach the planning seat again — nothing waits on it",
+              [(t, a) for t, a, *_ in downT] == [(CTL, None)] * 3 and "WebFetch" in downT[0][3])
+        check("threads seat: it answers once and never for good — `fix` from it is refused and the prompt stays open; "
+              "a plain yes from it is taken",
+              not fixT.get("ok") and "one-time" in fixT.get("error", "") and oneT.get("ok"))
+        # A DELIVERED ANSWER IS NOT A CLOSED DIALOG (2026-09-24): a member's research subagents raised WebSearch
+        # dialogs, every `cc-slack permission <id> yes` printed "allowed (delivered)", and the dialogs stayed on the
+        # pane. "delivered" only ever meant the channel server took the line, so the verb now reads the pane again.
+        _keepP = {k: globals()[k] for k in ("PERM_SETTLE", "react")}
+        dmP = Daemon(use_slack=False); dmP.cfg = {"SLACK_OWNER_ID": "UOWNER"}
+        saidP = []
+        dmP.say = lambda chat, text, thread=None, **k: saidP.append(text) or f"ts{len(saidP)}"
+        dmP.deliver = lambda target, payload, **k: "delivered"
+        dlgP = lambda q, t=12: (f"✻ Researching… ({t}s · esc to interrupt)\n╭────╮\n│ Tool use\n│   Web Search(\"{q}\")\n"
+                                f"│ Do you want to proceed?\n│ ❯ 1. Yes\n│   2. No, and tell Claude what to do\n╰────╯\n"
+                                f"   Esc to cancel")
+        pressedP = []
+        dmP.perm_press = lambda t, allow: pressedP.append((t, allow))
+        def askP(rid, screens, preview='{"query": "syllabus"}', press_clears=False):
+            it = iter(screens); last = [""]; n0 = len(pressedP)
+            def screen(t):
+                if press_clears and len(pressedP) > n0:
+                    return "❯ \n  ? for shortcuts"                           # the pressed key closed it
+                last[0] = next(it, last[0]); return last[0]
+            dmP.perm_screen = screen
+            dmP.perm_asks[rid] = {"target": "mem1/lessons", "chat": "CTHREADS", "thread": "1.1", "at": time.time(),
+                                  "card": "1.1", "preview": preview}
+            n = len(saidP); r = dmP.answer_permission(rid, "yes", CTL)
+            return r, saidP[n:], rid in dmP.perm_asks, pressedP[n0:]
+        try:
+            globals()["PERM_SETTLE"] = 0.2; globals()["react"] = lambda *a, **k: None
+            standP = askP("bcdfa", [dlgP("syllabus", 12), dlgP("syllabus", 13), dlgP("syllabus", 15)])  # only its timer ticks
+            goneP = askP("bcdfb", [dlgP("syllabus"), "❯ \n  ? for shortcuts"])
+            nextP = askP("bcdfc", [dlgP("syllabus"), dlgP("lecture notes")])   # the next queued dialog took its place
+            bareP = askP("bcdfd", ["❯ \n  ? for shortcuts"])                   # no dialog on screen: nothing to read
+            pressP = askP("bcdfe", [dlgP("syllabus", 12), dlgP("syllabus", 13)], press_clears=True)
+            queuedP = askP("bcdfg", [dlgP("lecture 3")] * 4, preview='{"query": "lecture 4"}')  # A on screen, B answered
+        finally:
+            globals().update(_keepP)
+        check("cc-slack permission: when the dialog is still on the session's screen after the answer went out, the "
+              "daemon presses the answer into that pane, and when the press closes it the answer is ok and the "
+              "prompt retired",
+              pressP[0].get("ok") and pressP[0].get("result") == "pressed at the pane" and not pressP[2]
+              and pressP[3] == [("mem1/lessons", True)])
+        check("cc-slack permission: answering the second-queued prompt while the FIRST one's dialog is on screen — "
+              "their queries differ only in a digit — is ok and retired, nothing pressed, the first left alone",
+              queuedP[0].get("ok") and queuedP[0].get("result") == "delivered" and not queuedP[2] and not queuedP[3]
+              and perm_dialog(dlgP("lecture 3")) != perm_dialog(dlgP("lecture 4"))
+              and perm_dialog(dlgP("lecture 3", 12)) == perm_dialog(dlgP("lecture 3", 15)))
+        check("cc-slack permission: an answer sent and pressed while the dialog still stays on the session's screen — "
+              "only a timer ticking above it — is reported as NOT landed: not ok, never 'delivered', the lane told so, "
+              "and the prompt kept open so it can be answered again",
+              standP[0].get("ok") is False and standP[0].get("result") == "standing" and standP[3]
+              and "still standing" in standP[0].get("error", "") and "delivered" not in standP[0].get("error", "")
+              and standP[1] and "not landed" in standP[1][-1] and standP[2])
+        check("…and an answer whose dialog closed, or gave way to the next one, or that had no dialog on screen to "
+              "read, is delivered as before and the prompt retired",
+              all(r.get("ok") and r.get("result") == "delivered" and "(delivered)" in r.get("text", "") and not kept
+                  and not pressed for r, _s, kept, pressed in (goneP, nextP, bareP))
+              and perm_dialog(dlgP("x")) and not perm_dialog("❯ \n  ? for shortcuts"))
         check("relay_permission: a MEMBER workspace's 🔐 prompt is posted in the control repo's #<repo>-threads lane "
               "— found through routes.json, which is where this box says which channel is which — and NOT in her own "
               "channel, where she may not answer it and the owner has to happen to look. It still names the target "
