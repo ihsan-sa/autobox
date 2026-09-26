@@ -1074,6 +1074,68 @@ def selfcheck():
                                           will_review(L))[2])
     check("...and the control: a wall standing at an OTHER head does not stop this one, so it WILL be read",
           r[0] is True and "do not buy" in r[1])
+    # raised-cc-land-dies-with-its-session (lessons #126, 2026-09-22): a landing killed with its session left the root
+    # tally at reviews:1 with no verdict, and the next landing refused "review budget spent" for a read nobody got. The
+    # read in flight is on the record as `reading` (its lander's pid); one whose lander is dead is refunded before
+    # the budget is asked, and one whose lander still lives is its own and stands.
+    DEAD, LIVE = 2 ** 22 + 7, 2 ** 22 + 9
+    L, r = at_change(DIFF, run=lambda L: (L.fetch_head(), root_spend("myrepo", 7, reviews=1, reading={
+        "pid": DEAD, "head": HEAD, "at": stamp()}), will_review(L))[2])
+    dead_rec, dead_log = read_json(root_path("myrepo", 7)) or {}, open(f"{LANDQ}/queue.log").read()
+    _ll = live_lander
+    globals()["live_lander"] = lambda pid: pid == LIVE
+    try:
+        L, r2 = at_change(DIFF, run=lambda L: (L.fetch_head(), root_spend("myrepo", 7, reviews=1, reading={
+            "pid": LIVE, "head": HEAD, "at": stamp()}), will_review(L))[2])
+        live_rec = read_json(root_path("myrepo", 7)) or {}
+    finally:
+        globals()["live_lander"] = _ll
+    L, r3 = at_change(DIFF)                 # …and a read that ends in its verdict takes its own reading off
+    read_rec = read_json(root_path("myrepo", 7)) or {}
+    check("a read counted on the record whose lander died before its verdict is refunded before the budget is asked "
+          "(reviews back to 0, the reading dropped, a queue.log line naming the pid), so the landing WILL read it; a "
+          "reading whose lander lives stands and the budget stays spent; a read that ended leaves no reading",
+          r[0] is True and not dead_rec.get("reviews") and "reading" not in dead_rec
+          and f"lander pid {DEAD} died before a verdict" in dead_log
+          and r2[0] is False and "budget is spent" in r2[1] and live_rec.get("reviews") == 1
+          and (live_rec.get("reading") or {}).get("pid") == LIVE
+          and "LAND on PR #7" in str(r3) and read_rec.get("reviews") == 1 and "reading" not in read_rec)
+    # raised-land-tmp-quota (2026-09-24): ai-ee's ~1 GB checkouts failed "Could not reset index file" on a /tmp full
+    # of 35 run roots killed landers left. A checkout refused for SPACE sweeps the dead roots and is tried once more;
+    # any other failure is not retried, and a second refusal stops as before.
+    L = fresh(pr=7)
+    tries, swept, answers = [], [], []
+
+    def add_once(argv):
+        tries.append(argv)
+        return answers.pop(0) if answers else (0, "")
+    QUOTA = (128, "error: unable to write file a.bin: No space left on device\n"
+                  "fatal: Could not reset index file to revision 'HEAD'.")
+    world["git worktree add"] = add_once
+    _swr = sweep_run_roots
+    globals()["sweep_run_roots"] = lambda: swept.append(1) or []
+    try:
+        answers[:] = [QUOTA]
+        got = caught(lambda: L.head_checkout("gates", fetch=False, at=HEAD))
+        retried = (isinstance(got, tuple) and swept == [1] and len(tries) == 2 and tries[0][5] != tries[1][5]
+                   and got[1] == tries[1][5] and not os.path.exists(os.path.dirname(tries[0][5]))
+                   and "checkout-retry myrepo#7 gates" in open(f"{LANDQ}/queue.log").read())
+        if isinstance(got, tuple):
+            L.drop_checkout(*got)
+        tries.clear(); swept.clear()
+        answers[:] = [(128, "fatal: invalid reference: " + HEAD)]
+        other = caught(lambda: L.head_checkout("gates", fetch=False, at=HEAD))
+        other_ok = isinstance(other, Failed) and not swept and len(tries) == 1
+        tries.clear(); swept.clear()
+        answers[:] = [QUOTA, QUOTA]
+        twice = caught(lambda: L.head_checkout("gates", fetch=False, at=HEAD))
+        twice_ok = isinstance(twice, Failed) and swept == [1] and len(tries) == 2 and "per-user quota" in str(twice)
+    finally:
+        globals()["sweep_run_roots"] = _swr
+    check("a checkout the temp disk refused for space sweeps the dead landers' run roots and is tried ONCE more in a "
+          "fresh dir, with a queue.log line; a failure that is not about space is not retried, and a second refusal "
+          "stops as before, naming the quota",
+          retried and other_ok and twice_ok)
     L, r = at_change(DIFF, recorded=KEY, mine=False)
     check("...and a recorded pass on the right change that this box did not WRITE is still no verdict: the "
           "author is checked on the v2 record exactly as it is on the older one",
@@ -3070,6 +3132,31 @@ def selfcheck():
         say_result(job, r)
         lines = [l for l in open(f"{LANDQ}/queue.log").read().splitlines() if "\tnotify " in l]
         return ran_sub("cc-slack", "post"), ran_sub("cc-slack", "inject"), (lines[-1] if lines else "")
+
+    # raised-landing-stop-with-empty-reason (lessons #134, 2026-09-23): a stop whose reason held no word said
+    # "landing stopped: . Fix it", and Slack refused the post (no_text) — the real cause was the /tmp quota. The card
+    # names the stage instead, carries the quota when the temp disk refuses a write now, and nothing posts empty.
+    L = fresh(pr=7)
+    L.stopped, L.why, L.why_short = "gates", "", "."
+    _df = disk_full
+    try:
+        globals()["disk_full"] = lambda text="": ""
+        bare = stop_card(L)
+        globals()["disk_full"] = lambda text="": " — /tmp is at its per-user quota"
+        full = stop_card(L)
+    finally:
+        globals()["disk_full"] = _df
+    L.why_short = "gate selftest.sh did not pass: case 9"
+    normal = stop_card(L)
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7, "stage": "gates"}, {"ok": False, "text": "", "short": ""})
+    check("a stop whose reason has no word in it names its stage ('it stopped in gates without saying why'), never "
+          "'— ..', and carries the quota note when the temp disk refuses a write; a stop with a reason keeps it as "
+          "it was; and an empty result posts '… stopped in gates' and wakes the seat with words, never an empty text",
+          "stopped in gates without saying why" in bare and "— ." not in bare and "per-user quota" in full
+          and "— ." not in full and "gate selftest.sh did not pass: case 9" in normal
+          and stop_why(L) == L.why_short
+          and len(posts) == 1 and "stopped in gates" in posts[0][-1]
+          and len(injects) == 1 and "without saying why" in injects[0][-1] and "stopped: ." not in injects[0][-1])
 
     LANDED = {"ok": True, "text": "[myrepo] PR #7: landed ✅", "short": "landed", "restart": ""}
     STOPPED = {"ok": False, "text": "[myrepo] PR #7: NOT merged ❌", "short": "the gate went red"}
@@ -7508,6 +7595,94 @@ def selfcheck():
         check("a done job kept to say its result is never dropped, though its PR is merged and installed: the lane "
               "hands it to run_one, which says it, and no gh call is spent asking",
               taken == [96] and "dropped myrepo#96" not in new and not ran("gh", "pr", "view", "96"))
+        # raised-queue-keeps-closed-and-merged-prs, pinned (#660 fixed it): drop_gone asked of each kind of job alone.
+        # Closed: dropped. Merged and installed: dropped. Merged, install still owed: kept (run_one deploys it). gh
+        # failing: kept, never dropped on a read that failed. A done job kept to say its result: kept.
+        fresh()
+        for pr in (111, 112, 113, 114, 115):
+            write_atomic(job_path("myrepo", pr), {"repo": "myrepo", "pr": pr, "queued_at": "2026-09-26T12:00:00Z",
+                                                  "attempts": 0, "stage": "queued",
+                                                  **({"state": "done"} if pr == 115 else {})})
+        world["gh pr view 111 --json state,mergeCommit"] = (0, json.dumps({"state": "CLOSED", "mergeCommit": None}))
+        world["gh pr view 112 --json state,mergeCommit"] = (0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": S(0xc2)}}))
+        world["gh pr view 113 --json state,mergeCommit"] = (0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": S(0xc3)}}))
+        world["gh pr view 114 --json state,mergeCommit"] = (1, "HTTP 502: Bad Gateway")
+        world["gh pr view 115 --json state,mergeCommit"] = (0, json.dumps({"state": "CLOSED", "mergeCommit": None}))
+        world[f"git merge-base --is-ancestor {S(0xc2)} {INSTALLED}"] = (0, "")
+        log0 = open(f"{LANDQ}/queue.log").read()
+        dropped = [drop_gone("myrepo", job_path("myrepo", pr)) for pr in (111, 112, 113, 114, 115)]
+        new = open(f"{LANDQ}/queue.log").read()[len(log0):]
+        check("drop_gone drops a closed PR's job and a merged-and-installed one, one queue.log line each, and keeps a "
+              "merged one whose install is owed, one gh could not answer for, and a done one kept to say its result",
+              dropped == [True, True, False, False, False]
+              and [os.path.exists(job_path("myrepo", pr)) for pr in (111, 112, 113, 114, 115)] == [False, False, True, True, True]
+              and new.count("dropped myrepo#111") == 1 and new.count("dropped myrepo#112") == 1
+              and not any(f"dropped myrepo#{pr}" in new for pr in (113, 114, 115)))
+        for pr in (113, 114, 115):
+            os.unlink(job_path("myrepo", pr))
+
+        # raised-a-batch-bisect-outlives-its-batch (2026-09-26): a batch suite was 48 min into a bisect of a base
+        # main had long left while a second batch's suite waited behind it on the `suite` flock, and install_waits
+        # held #691's install for hours. A suite with a newer one pending stops before its first run and leaves its
+        # record; the newer one, holding the flock, folds the older's merges into its own and runs once on the union.
+        fresh()
+        OLDB, NEWB = "2026-09-26T10:00:00Z", "2026-09-26T11:00:00Z"
+        OLDP, NEWP = suite_path("myrepo", OLDB), suite_path("myrepo", NEWB)
+        MA = [(101, S(0xa1), ["fa1"]), (102, S(0xa2), ["fa2"])]
+        MB_ = [(102, S(0xa2), ["fa2"]), (103, S(0xb3), ["fb3"])]      # one merge on both: the union holds it once
+        write_atomic(OLDP, {"repo": "myrepo", "bid": OLDB, "merged": [list(m) for m in MA], "at": OLDB})
+        write_atomic(NEWP, {"repo": "myrepo", "bid": NEWB, "merged": [list(m) for m in MB_], "at": NEWB})
+        suited, handed = [], []
+        _so, _ab = suite_on, after_batch
+        globals()["suite_on"] = lambda repo, sha, scope, step="suite": (suited.append(step), (True, "ok", ""))[1]
+        try:
+            log0 = open(f"{LANDQ}/queue.log").read()
+            older = run_suite_record("myrepo", OLDP)
+            deferred = (not suited and os.path.exists(OLDP) and os.path.exists(NEWP) and "newer batch" in " ".join(older)
+                        and f"batch-suite-superseded myrepo {OLDB}" in open(f"{LANDQ}/queue.log").read()[len(log0):])
+            globals()["after_batch"] = lambda repo, m, tip="", record="", reverts=(): handed.append((list(m), tip, record)) or ["spoke"]
+            run_suite_record("myrepo", NEWP)
+            folded = (handed == [(MA + MB_[1:], S(0xb3), NEWP)] and not os.path.exists(OLDP) and not os.path.exists(NEWP)
+                      and f"batch-suite-folded myrepo {OLDB} into {NEWB}" in open(f"{LANDQ}/queue.log").read()[len(log0):])
+        finally:
+            globals().update(suite_on=_so, after_batch=_ab)
+            for p in (OLDP, NEWP):
+                with contextlib.suppress(OSError):
+                    os.unlink(p)
+        check("an older batch's suite with a newer one pending runs no suite and leaves its record (superseded); the "
+              "newer one folds the older's merges into its own — oldest first, each SHA once — runs after_batch once "
+              "on the union at its own last merge, and both records go",
+              deferred and folded)
+        # …and a lone landing that merged BETWEEN the two batches goes on the union as pr 0: a red it brought is then
+        # named by the bisect, never pinned on the newer batch's first member, and after_batch reverts nothing for it.
+        fresh()
+        LONE, MB2 = S(0xc9), [(104, S(0xb4), ["fb4"])]
+        write_atomic(OLDP, {"repo": "myrepo", "bid": OLDB, "merged": [list(m) for m in MA], "at": OLDB})
+        write_atomic(NEWP, {"repo": "myrepo", "bid": NEWB, "merged": [list(m) for m in MB2], "at": NEWB})
+        gap = [f"git rev-list --first-parent --reverse {S(0xa2)}..{S(0xb4)}^", f"git diff-tree --no-commit-id --name-only -r {LONE}"]
+        world.update({gap[0]: (0, LONE + "\n"), gap[1]: (0, "lone.py\n")})
+        handed, reverted = [], []
+        _so, _ab, _bb, _rp = suite_on, after_batch, bisect_batch, revert_pr
+        globals()["after_batch"] = lambda repo, m, tip="", record="", reverts=(): handed.append(list(m)) or ["spoke"]
+        try:
+            run_suite_record("myrepo", NEWP)
+            globals().update(after_batch=_ab, suite_on=lambda repo, sha, scope, step="suite": (False, "✗ L1: red", ""),
+                             bisect_batch=lambda repo, m, scope, tip="", green_from=0, stop=None: ("pr", (0, LONE, ["lone.py"])),
+                             revert_pr=lambda *a: reverted.append(a) or "")
+            said = after_batch("myrepo", MA + [(0, LONE, ["lone.py"])] + MB2, tip=S(0xb4))
+        finally:
+            globals().update(suite_on=_so, after_batch=_ab, bisect_batch=_bb, revert_pr=_rp)
+            for k in gap:
+                world.pop(k, None)
+            for p in (OLDP, NEWP):
+                with contextlib.suppress(OSError):
+                    os.unlink(p)
+            with contextlib.suppress(OSError):
+                os.unlink(red_base_path("myrepo"))
+        check("…and a squash a lone landing merged between the two batches goes on the union as pr 0, so a bisect "
+              "that lands on it names that commit and reverts nothing",
+              handed == [MA + [(0, LONE, ["lone.py"])] + MB2] and not reverted
+              and any(LONE[:12] in x and "between them" in x for x in said))
         os.unlink(f"{LANDQ}/myrepo.applied")
 
         # 16. FINDING (review of #660): a lone landing's install pulled origin's tip while a batch's suite was still

@@ -56,7 +56,10 @@
                                                   the base since the batch began (the last is always run: green there
                                                   reverts nobody), and the breaker is REVERTED and told so (its PR,
                                                   its thread, the seat). A lane cut off before that suite, or a suite
-                                                  whose process died, leaves a note the next sweep resumes. A job
+                                                  whose process died, leaves a note the next sweep resumes; one
+                                                  with a NEWER batch's suite pending stops before its next run and
+                                                  leaves its record, and the newer folds its merges into its own, so
+                                                  one suite runs on both (never two in a row behind a flock). A job
                                                   whose PR is closed, or merged and already installed, is dropped,
                                                   with one queue.log line.
                                                   Every other job — a protected or gate-first path —
@@ -77,7 +80,8 @@
   cc-land will-review <repo> <pr>                 whether the landing would buy a read of this PR's diff as it stands,
                                                   and why not — a verdict already recorded, a tier nobody reads, or the
                                                   review budget spent — so a seat buys its own read only where the
-                                                  landing will not (it reads, spends and posts nothing)
+                                                  landing will not (it reads, spends and posts nothing; a read whose
+                                                  lander died before its verdict is given back first, as a landing does)
   cc-land times [--days N] [--repo R]             how long landings took, from queue.log: queued → merged at p50 and
                                                   p95 over the last N days (7), counted from a PR's first queue and
                                                   from the queue that landed it, then queued → a lane and each gate's
@@ -129,8 +133,14 @@ WHAT IT WILL NOT DO:
     (`cc-land record … --by <reader> --head <sha>` — signed by the seat itself it was refused as self-approval on
     #521) or it lands unread (`--no-review`). A protected PR is offered only the record, since its door refuses
     the other two; the stop never says re-queue, which is what produced it. A review a usage limit or its own cap
-    killed is not a buy. A fix anybody pushed after a LAND-AFTER-FIX counts as the round. A refusal reached at
-    the wall is re-checked against the PR first.
+    killed is not a buy, and neither is one whose lander DIED before its verdict: the read in flight is on the tally
+    as `reading` (its lander's pid), and one naming a pid that is no live cc-land is given back before the budget is
+    asked. A fix anybody pushed after a LAND-AFTER-FIX counts as the round. A refusal reached at the wall is
+    re-checked against the PR first.
+  · Give up a checkout the temp disk refused for SPACE without sweeping first: the run roots of dead landers go
+    (sweep_run_roots) and the checkout is tried once more; any other checkout failure stops at once, as before.
+  · Say a stop with no reason: a reason with no word in it becomes "it stopped in <stage> without saying why" (plus
+    the quota, when the temp disk refuses a write now), and no post or wake-up goes out empty.
   · Time a gate on the clock: it is timed on its SILENCE — a suite waiting on a lock says so every minute. Nor wait on
     what a gate left behind: once the gate itself exits, its output is read GATE_DRAIN seconds more and whatever it
     started that still holds the pipe is killed, the gate's own exit standing as its result.
@@ -1554,7 +1564,7 @@ def root_work(repo, pr):
 
 
 def root_spend(repo, pr, **bump):
-    """Count a spend before it is made, on disk: an int adds to its counter, anything else (`wall=`, the cap a review died on) is set. Returns the record as it now stands; a merged change's is returned untouched — it is in, and its history is not overwritten by a late mark."""
+    """Count a spend before it is made, on disk: an int adds to its counter, None takes the key off, anything else (`wall=`, the cap a review died on; `reading=`, the read in flight) is set. Returns the record as it now stands; a merged change's is returned untouched — it is in, and its history is not overwritten by a late mark."""
     j = read_json(root_path(repo, pr)) or {}
     if j.get("merged"):
         return j
@@ -1562,11 +1572,43 @@ def root_spend(repo, pr, **bump):
     j.setdefault("first", stamp())
     j.update(repo=repo, pr=pr, at=stamp())
     for k, n in bump.items():
+        if n is None:
+            j.pop(k, None)                                        # a record that no longer stands (a read that ended)
+            continue
         j[k] = (j.get(k) or 0) + n if isinstance(n, int) else n   # a counter adds; a record (the cap a review died on) is set
     with contextlib.suppress(OSError):   # the tally is a bound, not the landing: a queue dir that cannot be written
         os.makedirs(root_dir(), exist_ok=True)      # is caught where the job file is written, and this must not be
         write_atomic(root_path(repo, pr), j)        # the thing that stops a merge
     return j
+
+
+def reading_of(head, asked):
+    """The `reading` a paid read carries on the root record while it is in flight (review_now): this lander's pid, the
+    head it reads, when, and whether it was a --re-review (`asked`, refunded with it)."""
+    return {"pid": os.getpid(), "head": head, "at": stamp(), **({"asked": True} if asked else {})}
+
+
+def refund_dead_read(repo, pr):
+    """A read counted on the root record whose lander DIED before it ended — its `reading` names a pid that is not a
+    live cc-land (live_lander) and not this process — is given back: `reviews` −1 (and `asked` −1 for a --re-review),
+    the reading dropped, one queue.log line. raised-cc-land-dies-with-its-session (lessons #126, 2026-09-22): a
+    landing killed with its session left reviews:1 and no verdict, and the next landing refused "review budget spent"
+    for a read nobody got. A SIGKILL or a SIGTERM (on_death dies of the signal) runs no finally, so the record is the
+    only witness. Asked before every budget check (review_now, will_review). True when it refunded."""
+    j = read_json(root_path(repo, pr)) or {}
+    r = j.get("reading")
+    if not j or j.get("merged") or not isinstance(r, dict):
+        return False
+    pid = r.get("pid")
+    if type(pid) is int and (pid == os.getpid() or live_lander(pid)):
+        return False
+    back = {"reviews": -1 if (j.get("reviews") or 0) > 0 else 0}
+    if r.get("asked") and (j.get("asked") or 0) > 0:
+        back["asked"] = -1
+    root_spend(repo, pr, reading=None, **back)
+    ledger(f"refunded a read of {repo}#{pr} at {str(r.get('head') or '?')[:12]} (counted {r.get('at') or '?'}) — its "
+           f"lander pid {pid} died before a verdict")
+    return True
 
 
 def root_done(repo, pr):
@@ -2011,15 +2053,27 @@ class Land:
         if fetch:
             self.fetch_head()
         tag = re.sub(r"[^A-Za-z0-9_-]+", "-", self.repo or "") or "repo"      # no dots: they separate the fields
-        tmp = tempfile.mkdtemp(prefix=f"cc-land.{step}.{tag}.{self.pr or 'base'}.", dir=run_root())
+        prefix = f"cc-land.{step}.{tag}.{self.pr or 'base'}."
+        tmp = tempfile.mkdtemp(prefix=prefix, dir=run_root())
         tree = f"{tmp}/head"
-        with git_lock(self.root):    # .git/worktrees is shared too; held for the bookkeeping git writes, a second
-            rc, o = sh(["git", "worktree", "add", "-q", "--detach", tree, at or self.head], cwd=self.root, timeout=300)
-        if rc:
+        for again in (False, True):
+            with git_lock(self.root):    # .git/worktrees is shared too; held for the bookkeeping git writes, a second
+                rc, o = sh(["git", "worktree", "add", "-q", "--detach", tree, at or self.head], cwd=self.root, timeout=300)
+            if not rc:
+                return tmp, tree
             full = disk_full(o)              # asked before the rmtree frees what the half checkout took
             shutil.rmtree(tmp, ignore_errors=True)
-            raise Failed(f"cannot check out PR #{self.pr}: {last(o)}{full}")
-        return tmp, tree
+            if again or not full:
+                raise Failed(f"cannot check out PR #{self.pr}: {last(o)}{full}")
+            # raised-land-tmp-quota (2026-09-24): ai-ee's ~1 GB checkouts failed "Could not reset index file" on a
+            # full /tmp holding 35 run roots of landers long dead. A write refused for space is swept for those
+            # (sweep_run_roots removes only a dead lander's root) and tried ONCE more; a second refusal, or any
+            # other failure, stops as it always did.
+            gone = sweep_run_roots()
+            ledger(f"checkout-retry {self.repo}#{self.pr or 'base'} {step} — the temp disk refused the write; swept "
+                   f"{len(gone)} dead run root(s) and tried once more")
+            tmp = tempfile.mkdtemp(prefix=prefix, dir=run_root())    # the rmtree above took the first one
+            tree = f"{tmp}/head"
 
     def drop_checkout(self, tmp, tree):
         with git_lock(self.root):
@@ -2101,7 +2155,21 @@ class Land:
                      f"${usd:.2f}; the landing waits for the day to reset")
 
     def review_now(self):
-        """One headless reviewer: it reads the diff, the files at the PR's head, the track's brief (never its journal) and the repo's docs/REVIEW.md, with no shell and nothing to write with. Who reads it, or nobody, is review_model()'s answer."""
+        """One headless reviewer: it reads the diff, the files at the PR's head, the track's brief (never its journal) and the repo's docs/REVIEW.md, with no shell and nothing to write with. Who reads it, or nobody, is review_model()'s answer. The read in flight is on the root record as `reading` from its buy until it ends in any handled way (a verdict, a limit, a wall, a raise), and taken off here; only a lander that died leaves it, and refund_dead_read gives that read back."""
+        try:
+            return self._review_now()
+        finally:
+            self.drop_reading()
+
+    def drop_reading(self):
+        """Take this run's `reading` off the root record (review_now's finally). One another lander wrote is not ours."""
+        if not getattr(self, "_reading", False):
+            return
+        self._reading = False
+        if ((read_json(root_path(self.repo, self.pr)) or {}).get("reading") or {}).get("pid") == os.getpid():
+            root_spend(self.repo, self.pr, reading=None)
+
+    def _review_now(self):
         if not self.want_review:
             raise Skip("--no-review: nothing read this diff before it merged")
         if self.merged_since():
@@ -2131,6 +2199,7 @@ class Land:
             # Nothing needs to read prose: a verdict about it costs more than the change.
             raise Skip(f"no model read this diff — the {tier} tier: {why}")
         # ...and how many reads this change has bought already: ROOT_REVIEWS plus one per repair round; past that a person judges. --re-review is a person asking and is not counted against them.
+        refund_dead_read(self.repo, self.pr)     # a read whose lander died before its verdict is no buy (lessons #126)
         spent = root_work(self.repo, self.pr)
         if (self.stood == "LAND-AFTER-FIX" and spent.get("repairs", 0) < ROOT_REPAIRS
                 and spent.get("reviews", 0) >= reads_earned(spent) and not self.re_review):
@@ -2190,8 +2259,8 @@ class Land:
             open(dpath, "w").write(self.pr_diff() or "")
             # Counted before the money goes; a --re-review is counted as `asked` beside it (reads_earned).
             buy = dict(reviews=1, **({"asked": 1} if self.re_review else {}))
-            root_spend(self.repo, self.pr, **buy)
-            self.bought = True
+            root_spend(self.repo, self.pr, reading=reading_of(self.head, self.re_review), **buy)
+            self.bought = self._reading = True
             prompt, more, first = self.review_prompt(tpl, tree, dpath), {}, {}
             # Brief 2026-09-19: "one automatic relaunch at the doubled cap the card already prints, then a person".
             # Once per HEAD: a wall this head was already relaunched past (`again` on its record) is a person's run
@@ -2206,7 +2275,7 @@ class Land:
                 except Failed as e:
                     # A usage limit means the model never ran, so the count is given back here (the cc-limit pre-check above raises the same limit before anything is counted).
                     if limited(str(e)):
-                        root_spend(self.repo, self.pr, **{k: -n for k, n in buy.items()})
+                        root_spend(self.repo, self.pr, reading=None, **{k: -n for k, n in buy.items()})
                         self.bought = False
                         raise
                     if not getattr(e, "wall", None):
@@ -2216,7 +2285,7 @@ class Land:
                         e.wall["again"] = first      # …with the run before it kept beside: two priced walls, no verdict
                     elif relaunched:
                         e.wall["again"] = wall.get("again")   # a person's run past the relaunch walls too: the head STAYS
-                    root_spend(self.repo, self.pr, wall=e.wall, **{k: -n for k, n in buy.items()})   # relaunched on the record, or their next raise would buy the box's relaunch again at double their cap
+                    root_spend(self.repo, self.pr, wall=e.wall, reading=None, **{k: -n for k, n in buy.items()})   # relaunched on the record, or their next raise would buy the box's relaunch again at double their cap
                     self.bought = False
                     if more or relaunched:
                         e.args = (f"{e} Run twice at this head" + (f" ({first['cap']}, then {e.wall['cap']})" if more else "")
@@ -2235,7 +2304,7 @@ class Land:
                     out("·", f"{WALL} at {cap}: {e.wall['cost']} and {e.wall['turns']} turns on PR #{self.pr} read "
                              f"nothing — run once more at {var}={doubled}, the relaunch the card would have asked a "
                              f"person for; a second wall is theirs")
-                    root_spend(self.repo, self.pr, **buy)     # the relaunch is a buy like the first, counted before it goes
+                    root_spend(self.repo, self.pr, reading=reading_of(self.head, self.re_review), **buy)     # the relaunch is a buy like the first, counted before it goes
                     self.bought = True
         finally:
             self.drop_checkout(tmp, tree)
@@ -3388,14 +3457,19 @@ def say_result(job, r):
     else:
         where, args = "route", ["--route", f"{what} {state}"] + (["--mention"] if r.get("restart") else [])
     said = True
+    # Never an empty post (Slack refuses it, no_text) nor an empty reason in the seat's wake (lessons #134).
+    stage = job.get("stage") or "its run"
+    fallback = f"{what} {'landed' if r.get('ok') else f'stopped in {stage}'}"
+    text = r.get("text") if re.search(r"\w", r.get("text") or "") else (r.get("short") or fallback)
     if args:
-        rc, o = notify(*args, "--id", pid, r.get("text", ""), timeout=180 if chat else 60)
+        rc, o = notify(*args, "--id", pid, text if re.search(r"\w", text) else fallback, timeout=180 if chat else 60)
         said = rc == 0 or "no SLACK_BOT_TOKEN" in o
     ledger(f"notify {repo}#{pr or 'deploy'} {state} → {where}" + ("" if said else f" — Slack did not take it: {last(o, 120)}"))
     if not r.get("ok") and not handle and not job.get("say_tries"):
         # The first attempt only: the injected line carries no producer id, so a retry sweep must not say it again.
         # Short, because the thread or the updates lane has the full text — this just wakes the seat.
         short = (r.get("short") or "")[:200].replace("\n", " ")
+        short = short if re.search(r"\w", short) else f"it stopped in {stage} without saying why"
         route = r.get("route") or (f"fix it, then `cc-land queue {repo} {pr}`" if pr else "fix it, then `cc-land work`")
         sh([f"{BIN}/cc-slack", "inject", repo, f"{what} landing stopped: {short}. The way back in: {route}."], timeout=120)
     return said
@@ -3545,10 +3619,15 @@ def stop_why(L):
     if L.stopped == "review" and exhausted(L.why):
         # A cap is not a verdict — nothing read this diff — so the card says that and not what the reviewer charged.
         return "the review hit its own cap: nothing read the diff"
-    if L.why_short:
+    if L.why_short and re.search(r"\w", L.why_short):
         return L.why_short
     why = STOP_PROSE.sub("", STOP_ASIDE.sub("", (L.why or "").strip())).strip(" .")
-    return why or "the box could not read it"
+    if re.search(r"\w", why):
+        return why
+    # raised-landing-stop-with-empty-reason (lessons #134, 2026-09-23): a stop whose reason held no word said
+    # "landing stopped: . Fix it" and Slack refused the post (no_text); the cause was the /tmp quota. A reason with no
+    # word in it is not one: the card names the stage, and a temp disk that refuses a write NOW is said beside it.
+    return f"it stopped in {L.stopped or 'its run'} without saying why{disk_full('')}"
 
 
 def stop_who(L):
@@ -4535,17 +4614,34 @@ def suite_on(repo, sha, scope, step="suite"):
         L.drop_checkout(tmp, tree)
 
 
-def bisect_batch(repo, merged, scope, tip="", green_from=0):
-    """Which merge of `merged` ([(pr, sha, files)] in merge order) broke the base, as (kind, hit): ("pr", (pr, sha, files)) for the first red one by binary search over the commits themselves, each asked of suite_on — log2(n) runs; ("before", None) when the base was ALREADY red before the first of them (asked only when the first is red); ("after", None) when the LAST of them is green, so the red came from something merged after the batch. The last is always RUN, never assumed red — unless it IS `tip`, the commit the batch's suite already found red twice. `green_from` is an index already found green (1 = the first merge), where the search starts. Never a revert of a PR that broke nothing."""
+class Superseded(Exception):
+    """A batch's suite a NEWER batch's suite record is waiting behind (newer_suite): it stops where it is, its record
+    stays, and the newer one folds its merges in once it holds the `suite` flock (run_suite_record)."""
+
+
+def newer_suite(repo, record):
+    """The bid of a pending suite record of `repo` newer than the one at `record` (a larger bid), or ''. '' with no
+    record: a suite run inline has nothing to defer to."""
+    mine = (read_json(record) or {}).get("bid") if record else None
+    if not isinstance(mine, str):
+        return ""
+    return next((rec["bid"] for p, rec in suites_pending(repo)
+                 if p != record and isinstance(rec.get("bid"), str) and rec["bid"] > mine), "")
+
+
+def bisect_batch(repo, merged, scope, tip="", green_from=0, stop=None):
+    """Which merge of `merged` ([(pr, sha, files)] in merge order) broke the base, as (kind, hit): ("pr", (pr, sha, files)) for the first red one by binary search over the commits themselves, each asked of suite_on — log2(n) runs; ("before", None) when the base was ALREADY red before the first of them (asked only when the first is red); ("after", None) when the LAST of them is green, so the red came from something merged after the batch. The last is always RUN, never assumed red — unless it IS `tip`, the commit the batch's suite already found red twice. `green_from` is an index already found green (1 = the first merge), where the search starts. `stop`, asked before each run, raises Superseded to end the search (after_batch). Never a revert of a PR that broke nothing."""
     lo, hi, seen = green_from, len(merged), {green_from: True} if green_from else {}
     if tip and merged[-1][1] == tip:
         seen[hi] = False
 
     def green_at(i):
         if i not in seen:
+            if stop:
+                stop()
             sha = merged[i - 1][1] if i else f"{merged[0][1]}^"
             seen[i] = suite_on(repo, sha, scope, step="bisect")[0]
-            ledger(f"bisect {repo} {sha[:12]} ({'before the batch' if not i else 'PR #' + str(merged[i - 1][0])}): "
+            ledger(f"bisect {repo} {sha[:12]} ({'before the batch' if not i else 'PR #' + str(merged[i - 1][0]) if merged[i - 1][0] else 'merged between two batches'}): "
                    f"{'green' if seen[i] else 'red'}")
         return seen[i]
 
@@ -4708,6 +4804,19 @@ def after_batch(repo, merged, tip="", record="", reverts=()):
     lines = []
     if not merged:
         return lines
+
+    def stale():
+        # raised-a-batch-bisect-outlives-its-batch (2026-09-26): a batch suite was 48 min into a bisect of a base main
+        # had long left, a second batch's suite waited behind it on the `suite` flock, and install_waits held #691's
+        # install for hours. A suite with a NEWER one waiting stops before each run it would start (the first, the
+        # second, each bisect step) and hands its merges on: the newer folds them into its own (run_suite_record).
+        # The newest never defers, so the two never wait on each other.
+        newer = newer_suite(repo, record)
+        if newer:
+            ledger(f"batch-suite-superseded {repo} {(read_json(record) or {}).get('bid') or '?'} — the suite of "
+                   f"{newer} waits and folds this batch's merges into its own")
+            raise Superseded(newer)
+    stale()
     L = Land(repo)
     root, base = L.root, L.base()
     with git_lock(root):
@@ -4718,10 +4827,11 @@ def after_batch(repo, merged, tip="", record="", reverts=()):
         return [f"[{repo}] batch: origin/{base} could not be read after the merges — nothing installed; the catch-up deploys it"]
     files = sorted({p for _, _, fs in merged for p in fs})
     scope = " ".join(files) if len(files) <= WIDE_FILES else ""
-    prs = ", ".join(f"#{pr}" for pr, _, _ in merged)
+    prs = ", ".join(f"#{pr}" for pr, _, _ in merged if pr)   # pr 0: a squash between two folded batches (fold_suites)
     ledger(f"batch-suite {repo} tip={tip[:12]} prs={prs} scope={'all' if not scope else len(files)}")
     ok, why, log = suite_on(repo, tip, scope)
     if not ok:
+        stale()
         ok, why2, log = suite_on(repo, tip, scope, step="suite2")    # a red is believed on the second run only
         why = why2 if not ok else why
     if not ok and reverts:
@@ -4742,6 +4852,7 @@ def after_batch(repo, merged, tip="", record="", reverts=()):
         # The batch began on a tip an earlier suite already found red. One run at its FIRST merge says whether that
         # red is still there: a batch [fix, re-break] mended it and broke it again, and only a bisect names the second
         # (security read of #694). Still red there, and the old cut stands.
+        stale()
         green_from = 1 if suite_on(repo, merged[0][1], scope, step="first")[0] else 0
         ledger(f"batch-first {repo} {merged[0][1][:12]} (PR #{merged[0][0]}) on red base {noted[:12]}: "
                f"{'green — bisecting' if green_from else 'red'}")
@@ -4758,7 +4869,7 @@ def after_batch(repo, merged, tip="", record="", reverts=()):
         return lines + [text]
     if not ok:
         lines.append(f"[{repo}] batch ({prs}): the suite on {base} at {tip[:12]} is red twice — {why}; bisecting")
-        kind, hit = bisect_batch(repo, merged, scope, tip=tip, green_from=green_from)
+        kind, hit = bisect_batch(repo, merged, scope, tip=tip, green_from=green_from, stop=stale)
         if kind != "pr":
             write_atomic(red_base_path(repo), {"tip": tip, "at": stamp(), "why": why})
             if kind == "before":
@@ -4773,6 +4884,18 @@ def after_batch(repo, merged, tip="", record="", reverts=()):
             sh([f"{BIN}/cc-slack", "inject", repo, text[:300]], timeout=120)
             return lines + [text]
         pr, sha, _ = hit
+        if not pr:
+            # A squash that landed BETWEEN two folded batches (fold_suites), on its own landing's gates: it is on the
+            # bisect so the red is not pinned on the newer batch's first member, but no batch merged it, so it is
+            # named and never reverted from here.
+            write_atomic(red_base_path(repo), {"tip": tip, "at": stamp(), "why": why})
+            text = (f"[{repo}] {base} is red at {tip[:12]}, and the bisect over the batches ({prs}) names {sha[:12]}, "
+                    f"which landed on its own between them — {why}. Nothing reverted, nothing installed, until a "
+                    f"person mends {base}.")
+            ledger(f"batch-red {repo} tip={tip[:12]} between-batches {sha[:12]} — {why[:200]}")
+            notify("--route", f"[{repo}] batch stopped", "--id", f"land:{repo}:batch:red@{tip[:12]}", text, timeout=60)
+            sh([f"{BIN}/cc-slack", "inject", repo, text[:300]], timeout=120)
+            return lines + [text]
         made = revert_pr(repo, pr, sha, why)
         lines.append(f"[{repo}] PR #{pr} broke {base} ({why[:120]}) — " + (f"reverted in {made[:12]}" if made else "the revert did not happen"))
         if made:
@@ -4886,7 +5009,7 @@ def spawn_suite(repo, path):
 
 
 def run_suite_record(repo, path):
-    """The suite at `path` (batch_suite), one at a time per repo under the lane's `suite` flock: after_batch on its merges, then the record goes. A record whose merges are not the shapes batch_suite writes (suite_merges) is dropped and ledgered (suite-lost), never run. Returns after_batch's lines."""
+    """The suite at `path` (batch_suite), one at a time per repo under the lane's `suite` flock: after_batch on its merges, then the record goes. A record whose merges are not the shapes batch_suite writes (suite_merges) is dropped and ledgered (suite-lost), never run. Every OLDER pending suite record of the repo is folded into this one first (fold_suites), so one suite runs on the union instead of each in turn; one a newer record waits behind stops (Superseded) and leaves its record for that one to fold. Returns after_batch's lines."""
     os.makedirs(lane_dir(), exist_ok=True)
     lock = open(lane_file(repo, "suite"), "w")
     try:
@@ -4904,18 +5027,66 @@ def run_suite_record(repo, path):
                 os.unlink(path)
             ledger(f"suite-lost {repo} {rec.get('bid') or '?'} — its record is malformed; the catch-up deploys the tip")
             return [f"[{repo}] a batch suite's record could not be read — dropped; the catch-up handles the tip"]
+        merged = fold_suites(repo, path, dict(rec, pid=os.getpid()), merged)
         tip = merged[-1][1] if merged else ""
         # An earlier batch's suite, run while this one waited, may have reverted a squash this batch merged on top of:
         # the revert lands after these merges, so the suite runs where the base holds it, not at the last merge,
         # which would go red on that PR's defect (review of #660).
         reverts = reverts_since(repo_root(repo), tip, base_tip(repo)) if tip else []
-        lines = after_batch(repo, merged, tip=reverts[-1] if reverts else tip, record=path, reverts=reverts)
+        try:
+            lines = after_batch(repo, merged, tip=reverts[-1] if reverts else tip, record=path, reverts=reverts)
+        except Superseded as e:
+            # The record stays: the newer suite, waiting on this flock, folds it in (fold_suites).
+            return [f"[{repo}] this batch's suite stopped for the newer batch {e}'s, which runs on both batches' merges"]
         with contextlib.suppress(OSError):
             os.unlink(path)
         return lines
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
+
+
+def fold_suites(repo, path, rec, merged):
+    """Fold every OLDER pending suite record of `repo` (a smaller bid) into the one at `path` (`rec`, its merges
+    `merged`): their merges, oldest bid first, then these, each SHA once. This record is written with the union FIRST
+    and theirs unlinked after, so a death between the two leaves a merge on two records, never on none. A record whose
+    merges will not parse is left for its own run to drop. A squash that landed between two of them (a lone landing)
+    goes on the union as pr 0, so a bisect can name it but after_batch never reverts it. Returns the union. Under the `suite` flock only
+    (run_suite_record): no older suite is running while it is held. raised-a-batch-bisect-outlives-its-batch."""
+    mine = rec.get("bid")
+    older = sorted(((r.get("bid"), p, suite_merges(r.get("merged"))) for p, r in suites_pending(repo)
+                    if p != path and isinstance(r.get("bid"), str) and isinstance(mine, str) and r["bid"] < mine),
+                   key=lambda t: t[0])
+    older = [t for t in older if t[2] is not None]
+    if not older:
+        return merged
+    # A lone landing can merge between two batches. Its squashes go on the union as pr 0, so a bisect that finds the
+    # red there names that commit (after_batch: never reverted) instead of the next batch's first member. A gap git
+    # cannot list leaves the records unfolded: each then runs as before.
+    root, union, seen = repo_root(repo), [], set()
+    for ms in [ms for _, _, ms in older] + [list(merged)]:
+        if union and ms:
+            rc, o = sh(["git", "rev-list", "--first-parent", "--reverse", f"{union[-1][1]}..{ms[0][1]}^"], cwd=root, timeout=60)
+            if rc:
+                return merged
+            for c in o.split():
+                rc, fs = sh(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", c], cwd=root, timeout=60)
+                if rc or not re.fullmatch(r"[0-9a-f]{40,64}", c):
+                    return merged
+                if c not in seen:
+                    seen.add(c)
+                    union.append((0, c, fs.split()))
+        for m in ms:
+            if m[1] not in seen:
+                seen.add(m[1])
+                union.append(m)
+    write_atomic(path, dict(rec, merged=[list(m) for m in union]))
+    for _, p, _ in older:
+        with contextlib.suppress(OSError):
+            os.unlink(p)
+    ledger(f"batch-suite-folded {repo} {', '.join(b for b, _, _ in older)} into {mine} — "
+           f"prs={', '.join(f'#{m[0]}' if m[0] else m[1][:12] for m in union)}")
+    return union
 
 
 def suite_merges(raw):
@@ -5472,6 +5643,7 @@ def will_review(L):
     by, tier, why = L.review_model()
     if not by:
         return False, f"the {tier} tier reads nothing: {why}"
+    refund_dead_read(L.repo, L.pr)       # a read whose lander died before its verdict is not spent (lessons #126)
     spent = root_work(L.repo, L.pr)
     if spent.get("reviews", 0) >= reads_earned(spent) and not (
             L.stood == "LAND-AFTER-FIX" and spent.get("repairs", 0) < ROOT_REPAIRS):
