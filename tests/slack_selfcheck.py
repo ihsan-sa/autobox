@@ -7004,6 +7004,15 @@ def run_selfcheck():
         sent_html = list(sentMS)
         globals()["mail_outbound"] = real_mo_ms
 
+        # ---- A DOCUMENT THE WORKSPACE FILES IS FILED OUT HERE (member verb `docs`): cc-docs decides; the handle it is
+        # handed is the socket's, whatever the ask says.
+        docsMS = []
+        real_rd_ms = globals()["run_docs"]
+        globals()["run_docs"] = lambda h, ask: docsMS.append((h, ask)) or {"ok": True, "text": f"901-0001-A\tx\tfiled"}
+        r_docs = ms_req({"docs": {"op": "file", "title": "T", "pdf": f"{DEV}/alice/a.pdf", "member": "alice"}}, member="bob")
+        r_docs_main = ms_req({"docs": {"op": "file", "title": "T"}}, member=None, peer=(999999, os.getuid(), f"{DEV}/myrepo"))
+        globals()["run_docs"] = real_rd_ms
+
         # ---- A COURSE THAT APPEARS GETS ITS CHANNEL, WITH NOBODY TYPING ANYTHING (workspace_projects + projects_sweep)
         # Same door as the asks above, so what these prove is the SWEEP's own two decisions: which directories it
         # calls projects, and that a folder name — which is a MEMBER-CONTROLLED STRING, the thing this whole row
@@ -7432,6 +7441,10 @@ def run_selfcheck():
           and r_send_att.get("ok") is False and "list of file paths" in r_send_att.get("error", "")
           and len(sent_ms) == 5 and n_sent_before_main == 5
           and r_send_main.get("ok") is False and "member-socket verb" in r_send_main.get("error", ""))
+    check("MEMBER socket: `docs` hands cc-docs the socket's workspace, not the one the ask names, and the answer comes "
+          "back as it is; on the main socket `docs` is refused as a member-socket verb and runs nothing",
+          r_docs.get("ok") and r_docs.get("text", "").startswith("901-0001-A") and len(docsMS) == 1 and docsMS[0][0] == "bob"
+          and r_docs_main.get("ok") is False and "member-socket verb" in r_docs_main.get("error", ""))
     check("MEMBER socket: `send` hands an html body and its images to send_to — each image path mapped as an attachment's "
           "is — and refuses an html that is not a string before send_to; an ask without them hands html \"\" and no images",
           r_send_html.get("ok") and n_sent_html == len(sent_ms) + 1 and sent_html[-1]["html"] == "<p>hi</p>"

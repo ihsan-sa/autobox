@@ -48,6 +48,9 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         note, file, pages, bytes, board revision and cost. The owner sees the whole register and each public
         revision's token; a member sees only documents visible to its workspace, its own stars, and no tokens.
         Any other viewer is refused.
+    cc-docs member <handle> [--files <dir>]
+        The host's half of filing from inside a member workspace, run by the Slack daemon for its member verb `docs`
+        (below): one ask as JSON on stdin, {"ok", "text"|"error"} on stdout. Nobody else calls it.
     cc-docs fold <keep PPP-NNNN> <other PPP-NNNN>…
         Makes the other documents revisions of <keep>, for old versions filed as documents of their own. Every revision
         of them all is ordered oldest first by date (ties by the order given) with <keep>'s current revision last, so
@@ -60,6 +63,17 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         Takes a document (or one revision; its last revision retires the document) out of the register, its member
         views and its public link, for a document filed by mistake. Its filed copies move under retired/files/.
     cc-docs selfcheck
+
+INSIDE A MEMBER WORKSPACE (CC_MEMBER_SANDBOX=1) the register is that member's read-only view, so `file` and `number`
+cross the workspace's own socket (~/.cc/slack/sock inside) as the daemon's member verb `docs`, the way `cc-mail send`
+does, and print the host's line. --project may be left out there. The host files under the workspace's own member
+project: the one the ask names when it is that member's, else that member's first, else a new one named after the
+handle. It takes the handle from the socket and never from the ask; refuses another member's project or --member,
+a PDF or --source outside the workspace's own trees (~/dev/<h>, its track worktrees, its Slack files), a file that
+is not a PDF, and one over 64 MiB; reads the PDF from one fd so it cannot be swapped between the check and the
+read; and ignores --kind. A project an owner's maker names that is not the member's files under the member's own
+instead, so a build that sets DOC_PROJECT still files. `project`, `star`, `public`, `token`, `fold` and `retire` are
+refused inside.
 
 THE REGISTER is one JSON file, $CC_DOCS_ROOT/register.json (default ~/.cc/documents), with the filed copies under
 files/PPP/ beside it: private state, in no repo, and outside cc-lib's own tree (cc-lib indexes the register). Per
@@ -92,6 +106,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -348,8 +363,9 @@ def plan(reg, a):
 
 def cmd_file(a):
     src = os.path.abspath(a.pdf)
+    shown = getattr(a, "origin", None) or a.pdf   # a member's PDF is filed from the host's copy; its own path is the one named
     if not os.path.isfile(src):
-        raise Refused(f"{a.pdf}: no such file")
+        raise Refused(f"{shown}: no such file")
     date = datetime.date.fromisoformat(a.date) if a.date else datetime.date.today()
     describes, cost = check_describes(a.describes), parse_cost(a.cost)
     text = pdftext(src)
@@ -365,7 +381,7 @@ def cmd_file(a):
         full = f"{num}-{rev}"
         carried = set(m.group(0).split()[0] for m in STAMP.finditer(text))
         if carried - {full}:
-            raise Refused(f"{a.pdf} already carries {', '.join(sorted(carried - {full}))}, but it would be filed as "
+            raise Refused(f"{shown} already carries {', '.join(sorted(carried - {full}))}, but it would be filed as "
                           f"{full}; rebuild it with `cc-docs number`")
         nostamp = a.no_stamp or bool(d and d.get("stamp") is False)
         rel = os.path.join("files", proj, f"{full}_{slugify(a.title)}.pdf")
@@ -396,7 +412,7 @@ def cmd_file(a):
         d["title"] = a.title
         if a.source and not d.get("source"):
             d["source"] = os.path.abspath(a.source)
-        d["revisions"].append({"rev": rev, "file": rel, "date": date.isoformat(), "from": src, "fingerprint": fp,
+        d["revisions"].append({"rev": rev, "file": rel, "date": date.isoformat(), "from": getattr(a, "origin", None) or src, "fingerprint": fp,
                                "sha256": sha, "stamped": how, "pages": pages(dst), "bytes": os.path.getsize(dst),
                                "filed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
         for k, v in (("note", (a.note or "").strip() or None), ("describes", describes), ("cost", cost)):
@@ -757,8 +773,191 @@ def cmd_retire(a):
 
 
 # ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
+# ── a member workspace files across its socket ───────────────────────────────────────────────────────────────
+# Inside a member's sandbox ~/.cc/documents is that member's read-only view, so `file` and `number` there cannot
+# write. They cross the workspace's own socket instead (across), as `cc-mail send` does: the daemon's member verb
+# `docs` runs `cc-docs member <handle>` on the host with the handle it read off the socket, and member_ask decides.
+HOME = os.path.expanduser("~")
+SLACKSOCK = os.path.join(os.environ.get("CC_SLACK_DIR") or os.path.join(HOME, ".cc", "slack"), "sock")
+IN_SANDBOX = os.environ.get("CC_MEMBER_SANDBOX") == "1"
+MEMBER_CAP = 64 << 20     # the largest PDF a workspace may file, in bytes
+MEMBER_WAIT = 300         # seconds the workspace waits on the host: stamping and printing a long PDF takes a while
+HANDLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+ASK = {"op", "pdf", "title", "project", "source", "kind", "member", "describes", "note", "date", "cost", "no_stamp", "tex"}
+
+
+def across(a):
+    """`file` or `number` inside a member workspace: the flags as an ask on the member socket, the host's line back."""
+    import socket
+    ask = {"op": a.cmd, "title": a.title}
+    for k in ("project", "kind", "member", "describes", "note", "date", "cost"):
+        if getattr(a, k, None):
+            ask[k] = getattr(a, k)
+    if a.source:
+        ask["source"] = os.path.abspath(a.source)
+    if a.cmd == "file":
+        ask["pdf"] = os.path.abspath(a.pdf)
+        ask["no_stamp"] = bool(a.no_stamp)
+    else:
+        ask["tex"] = bool(a.tex)
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(MEMBER_WAIT)
+    try:
+        c.connect(SLACKSOCK)
+        c.sendall((json.dumps({"docs": ask}) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            d = c.recv(65536)
+            if not d:
+                break
+            buf += d
+        answer = json.loads(buf or b"{}")
+    except Exception as e:
+        print(f"cc-docs: nothing filed — the workspace's socket did not answer ({str(e)[:200]}): the host files for "
+              "this workspace, and nothing there is listening", file=sys.stderr)
+        return 1
+    if isinstance(answer, dict) and answer.get("ok"):
+        print(str(answer.get("text") or ""))
+        return 0
+    print(f"cc-docs: {(answer.get('error') if isinstance(answer, dict) else '') or 'the host refused'}", file=sys.stderr)
+    return 2
+
+
+def member_trees(handle, files):
+    """The directories a workspace may file from, resolved: its ~/dev/<h>, its track worktrees and its Slack files."""
+    return [os.path.realpath(p) for p in (os.path.join(HOME, "dev", handle),
+                                          os.path.join(HOME, ".cc", "worktrees", handle), files) if p]
+
+
+def within(path, trees):
+    return any(path == t or path.startswith(t.rstrip("/") + "/") for t in trees)
+
+
+def member_pdf(path, trees):
+    """The bytes of a workspace's PDF, read from ONE fd: O_NOFOLLOW refuses a link as the last part, the fd's own
+    /proc path must be inside the workspace (which catches a linked directory), and the read stops past the cap —
+    so the file cannot be swapped between the check and the read (outbound.attach_bytes, the same reasoning)."""
+    nope = f"{path} is not a file inside this workspace"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        raise Refused(nope)
+    try:
+        st = os.fstat(fd)
+        try:
+            real = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            raise Refused(nope)
+        if not stat.S_ISREG(st.st_mode) or real.endswith(" (deleted)") or not within(real, trees):
+            raise Refused(nope)
+        if st.st_size > MEMBER_CAP:
+            raise Refused(f"{path} is {st.st_size >> 20} MiB; a workspace files a PDF of {MEMBER_CAP >> 20} MiB at most")
+        data = b""
+        while len(data) <= MEMBER_CAP:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > MEMBER_CAP:
+        raise Refused(f"{path} grew past {MEMBER_CAP >> 20} MiB while it was read")
+    if not data.startswith(b"%PDF-"):
+        raise Refused(f"{path} is not a PDF; a workspace files PDFs only")
+    return data
+
+
+def member_project(reg, handle, named):
+    """-> (project, kind, member) for plan(). The workspace's own project is the one its ask names when that one is
+    its own, else its first; a workspace with none gets one named after it. Another member's project is refused.
+    An owner project named from a workspace is not the workspace's to file into, so its own takes its place: a
+    maker that set DOC_PROJECT for the host still files, under the member."""
+    p = find_project(reg, named) if named else None
+    if p and reg["projects"][p].get("member") == handle:
+        return p, None, None
+    if p and reg["projects"][p].get("member"):
+        raise Refused(f"project {named!r} is another member's; a workspace files only under its own")
+    own = sorted(q for q, d in reg["projects"].items() if d.get("member") == handle)
+    if own:
+        return own[0], None, None
+    if find_project(reg, handle):
+        raise Refused(f"project {handle!r} is not this workspace's, and it has none of its own to file under")
+    return handle, "member", handle
+
+
+def member_ask(handle, ask, files=""):
+    """One workspace's `file` or `number`, decided on the host. `handle` is the daemon's, read off the socket the ask
+    came on, and never the ask's; the ask may name its PDF, title, source, note, date, cost, board revision and
+    whether to stamp. -> the line `file` or `number` prints. Refused: another member's project or --member, a PDF
+    or source outside the workspace's own trees, anything but a PDF, one over MEMBER_CAP, any op but these two."""
+    import argparse
+    import contextlib
+    import io
+    # brief: "The host files only into the project that belongs to the asking workspace, identified by the socket,
+    # never by anything the workspace says." `handle` is the socket's; the ask's `member` can only agree with it.
+    if not HANDLE.match(handle or ""):
+        raise Refused(f"no workspace {handle!r}")
+    if not isinstance(ask, dict):
+        raise Refused("docs wants one object")
+    odd = sorted(str(k)[:40] for k in set(ask) - ASK)
+    if odd:
+        raise Refused(f"unknown key {', '.join(odd)} — the keys are {', '.join(sorted(ASK))}")
+    op = ask.get("op")
+    if op not in ("file", "number"):
+        raise Refused(f"a workspace can file and number its documents, not {str(op)[:40]!r}; only the owner makes "
+                      "anything public, stars for someone else, or makes a project")
+    title, cost = ask.get("title"), ask.get("cost") or []
+    if not isinstance(title, str) or not title.strip():
+        raise Refused("a document needs a title")
+    if not isinstance(cost, list) or not all(isinstance(c, str) for c in cost):
+        raise Refused("cost is a list of <step>=<usd>")
+    for k in ("project", "kind", "member", "describes", "note", "date", "source", "pdf"):
+        if ask.get(k) is not None and not isinstance(ask[k], str):
+            raise Refused(f"{k} must be a string")
+    if ask.get("member") and ask["member"] != handle:
+        raise Refused(f"a workspace files only for itself, not for {ask['member'][:40]!r}")
+    inside = os.path.join(HOME, ".cc", "slack", "files") + "/"
+    here = lambda q: os.path.join(files, q[len(inside):]) if files and q.startswith(inside) else q   # the boundary's ~/.cc/slack is the member dir
+    trees = member_trees(handle, files)
+    source = ask.get("source")
+    if source and not within(os.path.normpath(here(source)), trees):
+        raise Refused(f"{source} is not a path inside this workspace")
+    tmp = None
+    try:
+        if op == "file":
+            data = member_pdf(here(str(ask.get("pdf") or "")), trees)
+            os.makedirs(ROOT, mode=0o700, exist_ok=True)
+            tmp = tempfile.mkdtemp(dir=ROOT, prefix=".incoming.")
+            pdf = os.path.join(tmp, "in.pdf")
+            with open(pdf, "wb") as f:
+                f.write(data)
+        a = argparse.Namespace(cmd=op, title=title.strip(), source=source or None, describes=ask.get("describes"),
+                               note=ask.get("note"), date=ask.get("date"), cost=cost, no_stamp=bool(ask.get("no_stamp")),
+                               tex=bool(ask.get("tex")), origin=ask.get("pdf"), pdf=pdf if op == "file" else None)
+        with Lock():
+            a.project, a.kind, a.member = member_project(load(), handle, ask.get("project"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            (cmd_file if op == "file" else cmd_number)(a)
+        return out.getvalue().strip()
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_member(a):
+    """The daemon's half of the member verb `docs`: the ask as JSON on stdin, the answer as JSON on stdout."""
+    try:
+        ask = json.loads(sys.stdin.read() or "null")
+        print(json.dumps({"ok": True, "text": member_ask(a.handle, ask, a.files or "")}))
+        return 0
+    except (Refused, ValueError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 2
+
+
 def selfcheck():
-    global ROOT, MEMBERS
+    global ROOT, MEMBERS, HOME, IN_SANDBOX, SLACKSOCK, MEMBER_CAP
     n = [0, 0]
 
     def ok(name, cond):
@@ -1053,6 +1252,106 @@ def selfcheck():
         rc2, o2 = run("fold", "901-0002", "901-0003")
         ok("retiring a retired number is refused, and so is folding a document with a retired revision",
            rc == 2 and rc2 == 2 and "901-0003" in load()["documents"])
+        # a member workspace files across its socket: each case on a register and a HOME of its own
+        HOME, ROOT = os.path.join(t, "home"), os.path.join(t, "r6")
+        for h, i in (("kid1", wid), ("kid2", "fedcba9876543210")):
+            os.makedirs(os.path.join(HOME, "dev", h), exist_ok=True)
+            os.makedirs(os.path.join(MEMBERS, h), exist_ok=True)
+            with open(os.path.join(MEMBERS, h, "workspace-id"), "w") as f:
+                f.write(i + "\n")
+        ws = os.path.join(HOME, "dev", "kid1")
+        m1 = mkpdf(ws, "m1", "Member physics one")
+
+        def ask(h, **k):
+            try:
+                return member_ask(h, dict({"op": "file", "title": "Physics"}, **k)), ""
+            except Refused as e:
+                return None, str(e)
+        run("project", "Owner work", "--kind", "work")
+        run("project", "Kid2 stuff", "--member", "kid2")
+        o, e = ask("kid1", pdf=m1, project="Owner work")
+        reg = load()
+        k1 = [p for p, d in reg["projects"].items() if d.get("member") == "kid1"]
+        ok("a workspace with no project files under a new one of its own, not the owner project it named",
+           o and o.endswith("filed") and len(k1) == 1 and reg["documents"][f"{k1[0]}-0001"]["visibility"] == ["owner", wid]
+           and not [d for d in reg["documents"].values() if d["project"] != k1[0]])
+        o, e = ask("kid1", pdf=m1, project="Kid2 stuff", title="Other")
+        ok("another member's project is refused, and nothing is filed", o is None and "another member's" in e
+           and len(load()["documents"]) == 1)
+        o, e = ask("kid1", pdf=m1, member="kid2", title="Other")
+        ok("--member naming another member is refused", o is None and "only for itself" in e and len(load()["documents"]) == 1)
+        out = mkpdf(src, "out", "Outside the workspace")
+        o, e = ask("kid1", pdf=out, title="Other")
+        os.symlink(out, os.path.join(ws, "link.pdf"))
+        o2, e2 = ask("kid1", pdf=os.path.join(ws, "link.pdf"), title="Other")
+        os.symlink(src, os.path.join(ws, "dirlink"))
+        o3, e3 = ask("kid1", pdf=os.path.join(ws, "dirlink", "out.pdf"), title="Other")
+        ok("a PDF outside the workspace is refused, through a link to it or a linked directory too",
+           o is None and o2 is None and o3 is None and all("not a file inside this workspace" in x for x in (e, e2, e3))
+           and len(load()["documents"]) == 1)
+        o, e = ask("kid1", pdf=m1, source=os.path.join(src, "a.tex"), title="Other")
+        ok("a source outside the workspace is refused", o is None and "not a path inside" in e)
+        with open(os.path.join(ws, "notes.pdf"), "w") as f:
+            f.write("just text\n")
+        o, e = ask("kid1", pdf=os.path.join(ws, "notes.pdf"), title="Other")
+        ok("a file that is not a PDF is refused, whatever its name", o is None and "not a PDF" in e)
+        cap, MEMBER_CAP = MEMBER_CAP, 100
+        o, e = ask("kid1", pdf=m1, title="Other")
+        MEMBER_CAP = cap
+        ok("a PDF over the cap is refused", o is None and "at most" in e and len(load()["documents"]) == 1)
+        o, e = ask("kid1", op="public")
+        o2, e2 = ask("kid1", op="star")
+        ok("public and star are not ops a workspace can ask for", o is None and o2 is None and "not 'public'" in e
+           and "not 'star'" in e2)
+        # the whole route: `cc-docs file` inside the sandbox, over a socket the fixture serves as the daemon does
+        import socket
+        import threading
+        SLACKSOCK = os.path.join(t, "sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(SLACKSOCK)
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                with c:
+                    f = c.makefile("rb")
+                    q = json.loads(f.readline())["docs"]
+                    try:
+                        r = {"ok": True, "text": member_ask("kid1", q)}
+                    except Refused as x:
+                        r = {"ok": False, "error": str(x)}
+                    c.sendall((json.dumps(r) + "\n").encode())
+        threading.Thread(target=serve, daemon=True).start()
+        m2 = mkpdf(ws, "m2", "Member physics two")
+        IN_SANDBOX = True
+        try:
+            rc, o = run("file", "--title", "Physics two", m2)
+            rcp, op_ = run("public", f"{k1[0]}-0001-A", "on")
+            rct, ot = run("token", "x", f"{k1[0]}-0001-A")
+            rcr, orr = run("retire", f"{k1[0]}-0001")
+            rcf, of = run("fold", f"{k1[0]}-0001", f"{k1[0]}-0002")
+        finally:
+            IN_SANDBOX = False
+            srv.close()
+        reg = load()
+        d2 = reg["documents"].get(f"{k1[0]}-0002") or {}
+        with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:
+            view = json.load(fh)
+        ok("inside a workspace `cc-docs file --title T <pdf>` files under its project, next number, stamped, in its view",
+           rc == 0 and o.startswith(f"{k1[0]}-0002-A\t") and d2.get("revisions", [{}])[0].get("stamped") == "overlay"
+           and d2["revisions"][0]["from"] == m2 and f"{k1[0]}-0002" in view["documents"]
+           and f"{k1[0]}-0002-A" in pdftext(os.path.join(ROOT, d2["revisions"][0]["file"])))
+        ok("inside a workspace public and token are refused, and no revision gains a token",
+           rcp == 2 and rct == 2 and "the host's" in op_ + ot
+           and not any("public_token" in r for d in reg["documents"].values() for r in d["revisions"]))
+        ok("inside a workspace retire and fold are refused, and both documents stay",
+           rcr == 2 and rcf == 2 and "the host's" in orr + of
+           and f"{k1[0]}-0001" in reg["documents"] and d2)
+        ok("no incoming copy is left behind", not [x for x in os.listdir(ROOT) if x.startswith(".incoming.")])
     print(f"cc-docs selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
 
@@ -1071,7 +1370,7 @@ def main(argv):
             p.add_argument("--cost", action="append")
         else:
             p.add_argument("--tex", action="store_true")
-        p.add_argument("--project", required=True)
+        p.add_argument("--project", required=not IN_SANDBOX)   # inside a workspace the host picks the member's own
         p.add_argument("--title", required=True)
         p.add_argument("--source")
         p.add_argument("--kind", choices=sorted(RANGES))
@@ -1098,6 +1397,9 @@ def main(argv):
     p.add_argument("number")
     p = sub.add_parser("library")
     p.add_argument("--viewer", required=True)
+    p = sub.add_parser("member")
+    p.add_argument("handle")
+    p.add_argument("--files")
     p = sub.add_parser("fold")
     p.add_argument("keep")
     p.add_argument("other", nargs="+")
@@ -1107,7 +1409,14 @@ def main(argv):
     a = ap.parse_args(argv)
     if a.cmd == "selfcheck":
         return selfcheck()
+    if IN_SANDBOX and a.cmd in ("file", "number"):
+        return across(a)
     try:
+        if IN_SANDBOX and a.cmd in ("project", "star", "public", "token", "member", "fold", "retire"):
+            # brief: "A member can't … make anything public, star for someone else, or read the owner's register"
+            raise Refused(f"{a.cmd} is the host's: a workspace can file, number, find and list its own documents")
+        if a.cmd == "member":
+            return cmd_member(a)
         return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list,
                 "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library,
                 "fold": cmd_fold, "retire": cmd_retire}[a.cmd](a)

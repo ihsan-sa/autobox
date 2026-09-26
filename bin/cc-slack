@@ -3411,6 +3411,19 @@ def mail_outbound():
     import outbound
     return outbound
 
+DOCS_WAIT = 280   # under cc-docs' own MEMBER_WAIT, so the workspace hears this answer rather than its own timeout
+
+def run_docs(h, ask):
+    """`cc-docs member <h>` beside this script, the ask on stdin, its JSON answer back — or why there was none."""
+    exe = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-docs")
+    try:
+        p = subprocess.run([exe, "member", h, "--files", f"{member_dir(h)}/files"], input=json.dumps(ask),
+                           capture_output=True, text=True, timeout=DOCS_WAIT)
+        res = json.loads((p.stdout.strip().splitlines() or ["null"])[-1])
+    except Exception as e:
+        return {"ok": False, "error": f"nothing filed — the register did not answer ({str(e)[:160]})"}
+    return res if isinstance(res, dict) else {"ok": False, "error": "nothing filed — the register gave no answer"}
+
 def mail_tap(cfg, chat, thread, text="", path="", ts=None):
     """Offers one already-sent Slack post to milestone 4 (outbound). A top-level post (empty `thread`) is
     filtered out first. `ts` passes through as-is; the door decides whether it came by mail, not this
@@ -3901,7 +3914,7 @@ class Daemon:
         return {"ok": True, "name": display_name(seat[0], seat[1]), "own": own,
                 "seat": f"{seat[0]}@{seat[1]}" if seat[1] else seat[0]}
 
-    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send", "ask")
+    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send", "ask", "docs")
     OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "grant", "mail", "mailed", "wake", "mention", "sender", "cutover")
 
     def verbs_of(self, first):
@@ -3936,6 +3949,8 @@ class Daemon:
                 pass                    # names no channel: relay_ask posts in the control repo's -threads lane, on this socket's workspace's behalf
             elif verb == "send":
                 pass                    # from/files come from this socket's workspace (member_send); the recipient allow-list refuses, not a channel check
+            elif verb == "docs":
+                pass                    # names no channel: cc-docs files under this socket's workspace, from its own trees (member_docs)
             elif verb in self.MEMBER_VERBS:
                 chat = str(first[verb])
                 name = chat[1:] if chat.startswith("#") else self.chan_name(chat) if chat and chat != "local" else chat
@@ -3965,6 +3980,8 @@ class Daemon:
             return {"ok": True, "text": msg} if ok else {"ok": False, "error": msg}
         if verb == "send":      # the workspace's own outbound mail, made out here: the secret and the worker never enter the boundary
             return self.member_send(h, first[verb])
+        if verb == "docs":      # `cc-docs file`/`number` inside: the register is read-only in there, so the host files for it
+            return self.member_docs(h, first[verb])
         if verb == "ask":       # the workspace's question to the planning seat, posted out here where the seat reads (relay_ask)
             return self.relay_ask(h, str(first[verb] or ""), str(first.get("text") or ""))
         chat = str(first[verb]); target = str(first.get("target") or h)
@@ -4220,6 +4237,13 @@ class Daemon:
                                channel=h, mirror=mirror, thread=thread, workspace=h, html=html or "", images=pics)
         log(f"send {h}: to={to[:80]} files={len(paths)} ok={ok}")
         return {"ok": True, "text": line} if ok else {"ok": False, "error": line}
+
+    def member_docs(self, h, ask):
+        """A workspace's `cc-docs file` or `number`, made out here, where the register is writable. `cc-docs member`
+        decides all of it (its member_ask); this hands it the handle read off the socket, never one from the ask."""
+        res = run_docs(h, ask)
+        log(f"docs {h}: {str((ask or {}).get('op') if isinstance(ask, dict) else '?')[:10]} ok={res.get('ok')}")
+        return res
 
     def handle_conn(self, c, member=None):
         f = c.makefile("rb")
