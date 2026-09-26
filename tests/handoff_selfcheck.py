@@ -1041,14 +1041,44 @@ def run_selfcheck():
         write(rr)
         ok("an overdue overlap that never reached --ready expires",
            sweep() == 0 and read("s2") is None and "s2~next" not in wins)
-        ok("...QUIETLY: its predecessor never stopped working, so there is nothing to tell the owner",
+        ok("...with no notice to the owner: nothing is broken that the seat cannot restart itself",
            sum(1 for m in msgs if m and m[0] == "notify") == told)
+        ok("...but the PREDECESSOR is told in its own pane, as a [cc-handoff] line (2026-09-24: d861dd1f3971 expired "
+           "unheard and its seat ran an hour past its hand-off line)",
+           any(m[0].endswith("cc-msg") and m[1] == "s2" and m[2].startswith(MACHINE) and "cc-handoff --overlap s2" in m[2]
+               for m in msgs))
         wins["s2"] = "@s2"
         start("s2")
         rr = read("s2"); rr["deadline"] = time.time() - 1; write(rr)
         wins["s2-moved"] = wins.pop("s2~next")           # the successor's window no longer carries its name
         ok("an expiry finds the successor by the id the record names when its name is gone",
            sweep() == 0 and read("s2") is None and rr["successor"]["tmux"] not in wins.values())
+
+        # A SUCCESSOR THAT DIES mid-overlap, inside its deadline: its own fixture, both the kept and the expired case.
+        wins["s7"] = "@s7"
+        start("s7")
+        rr = read("s7"); rr["started"] = time.time() - 200; write(rr)      # past the grace, well inside the deadline
+        n7 = len(msgs)
+        ok("a live successor inside its deadline is left alone",
+           sweep() == 0 and read("s7") is not None and not read("s7").get("succ_gone_since") and "s7~next" in wins)
+        dead.add("s7~next")                             # its session exited: the window is a bare shell
+        ok("one sweep that finds the successor dead only stamps it — a misread must not kill its window",
+           sweep() == 0 and read("s7") is not None and bool(read("s7").get("succ_gone_since")) and "s7~next" in wins)
+        dead.discard("s7~next")
+        ok("...a successor seen alive again withdraws the stamp",
+           sweep() == 0 and read("s7") is not None and not read("s7").get("succ_gone_since"))
+        dead.add("s7~next")
+        sweep()
+        rr = read("s7"); rr["succ_gone_since"] = time.time() - 301; write(rr)
+        ok("a successor dead two sweeps apart expires the overlap before its deadline, and its shell goes",
+           sweep() == 0 and read("s7") is None and "s7~next" not in wins and wins.get("s7") == "@s7")
+        ok("...and the predecessor hears it in its own pane, once",
+           [m[2] for m in msgs[n7:] if m[0].endswith("cc-msg") and m[1] == "s7" and "died before --ready" in m[2]].__len__() == 1)
+        ok("...and the ledger says why",
+           json.loads(list(open(os.path.join(RECORDS, "handoffs.jsonl")))[-1]).get("why")
+           == "the successor's session died before --ready")
+        dead.discard("s7~next")
+        wins.pop("s7", None)
 
         # 2026-09-01 05:15Z: six `~next` windows sat parked for hours with no record. Their predecessors had
         # EXITED before --ready — a bare shell still holding `<target>` — so the sweep finalized the record but

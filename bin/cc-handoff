@@ -55,8 +55,9 @@ tells cc-slackd (`{"cutover": target}`, tell_slack), which hands the successor w
 predecessor was given and never answered.
 
 BOUNDED. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 20 min). The sweep IS the deadline: --sweep, on
-the cc-reconcile timer, expires an overlap past it quietly (the predecessor never stopped working, so there is
-nothing to tell it) and finalizes a record whose predecessor is gone past the grace, so the survivor is not
+the cc-reconcile timer, expires an overlap past it, or one whose successor's session died (two sweeps apart),
+and types a `[cc-handoff]` line into the predecessor saying so (it has written its hand-off entry and is waiting
+on the successor; the owner is not told), and finalizes a record whose predecessor is gone past the grace, so the survivor is not
 gated by the record of its own success.
 
 ROTATION. A seat past CC_CONTEXT_ROTATE_TOKENS (cc-context's second line, 200k, above the 150k hand-off
@@ -1453,6 +1454,24 @@ def abandon(target, why=""):
     return 0
 
 
+def expire(rec, why):
+    """An overlap that ends with no cutover: the successor's window goes, the record clears, and the PREDECESSOR is
+    told in its own pane and journal. It is still live and was waiting on the successor, so an expiry it never
+    hears of is an hour of work past its hand-off line and a second successor started by hand (2026-09-24, d861dd1f3971,
+    and twice before that). The owner is not told: nothing is broken that the seat cannot restart itself."""
+    target = rec["target"]
+    wid = side_wid(rec, "successor")
+    if wid:
+        tmux("kill-window", "-t", wid)
+    ledger(rec, "overlap-expired", why)
+    clear(target)
+    line = (f"{MACHINE} Your handoff {rec.get('id', '')} is over with no cutover: {why}. You are still the live "
+            f"session for {target}. Hand off again with `cc-handoff --overlap {target}` when you are ready.")
+    run([os.path.join(BIN, "cc-msg"), target, line])
+    journal(target, line)
+    print(f"cc-handoff: {target} — the overlap expired without a cutover ({why}); the predecessor carries on and was told")
+
+
 def finalize(rec, why):
     """A retirement nobody is left to finish. mark_done() BEFORE clear(), always: that order is the only reason
     the survivor of a completed handoff is not gated by the record of its own success."""
@@ -1744,8 +1763,9 @@ def sweep(rotate_too=False):
     session is left to:
       the predecessor's session is GONE past the retire grace -> finalize. Nobody but the successor is in
         charge of that target, and a record saying otherwise is gating the only session left.
-      an overlap that never reached --ready is past its deadline (plus the grace) -> it expires QUIETLY. The
-        predecessor never stopped working and was never told anything, so there is nothing to tell it now.
+      an overlap that never reached --ready is past its deadline (plus the grace), or its successor's session is
+        gone two sweeps apart -> it expires (expire): the owner is not told, but the predecessor is, in its pane
+        and its journal, because it is waiting on a successor that will never come.
       a cut-over predecessor STILL ALIVE past drain+grace -> ended here, then finalized (one told to STAY for
         its subagents is past nothing until that stay ends or its cap runs out: drain_start). The --retire that
         should have ended it died, or refused because a --forced cutover runs it from the predecessor's own pane
@@ -1790,12 +1810,23 @@ def sweep(rotate_too=False):
             rec = read(target)                     # the DECIDING read: a --ready committing after the loop copied
             if not rec or live_side(rec) != "predecessor" or now <= rec.get("deadline", 0) + grace:
                 continue                           # this record means the kill below would hit the LIVE successor
-            wid = side_wid(rec, "successor")
-            if wid:
-                tmux("kill-window", "-t", wid)
-            ledger(rec, "overlap-expired", "the overlap window passed with no --ready")
-            clear(target)
-            print(f"cc-handoff: {target} — the overlap expired without a cutover; the predecessor carries on")
+            expire(rec, "the overlap window passed with no --ready")
+        elif live_side(rec) == "predecessor" and now - (rec.get("started") or 0) > grace:
+            # A SUCCESSOR THAT DIED before --ready: its window closed, or its session exited to a bare shell. Two
+            # strikes a sweep apart, as for the predecessor above, because this expiry kills a window.
+            if side_live(rec, "successor"):
+                if rec.get("succ_gone_since"):
+                    rec.pop("succ_gone_since", None)
+                    write(rec)
+                continue
+            gone = rec.get("succ_gone_since") or 0
+            if not gone:
+                rec["succ_gone_since"] = now
+                write(rec)
+            elif now - gone >= cfg("CC_HANDOFF_GONE_CONFIRM", 300):
+                rec = read(target)                 # the DECIDING read, as above
+                if rec and live_side(rec) == "predecessor" and not side_live(rec, "successor"):
+                    expire(rec, "the successor's session died before --ready")
     # A `~next` or `~old` window with NO record is one nothing here will ever finish: reported, once per window,
     # not killed — a session with no record is exactly the case where nobody can say whose it is.
     told_p = os.path.join(HANDOFF, "orphans.told")
