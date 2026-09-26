@@ -2969,6 +2969,21 @@ def selfcheck():
           "has no seat of the box's to wake",
           len(posts) == 1 and posts[0][2:4] == ["-c", "#bob"] and not injects
           and line.endswith("notify bob--site#7 stopped → #bob"))
+    # …and a member project whose track has its thread (cc --go opened it in #bob) is told THERE, as a box track is:
+    # the target the other way round, `bob/site` (a-finished-worker-reaches-its-thread: a landing line that reaches
+    # only a lane the person is not reading is a result that sits unseen).
+    tt_dir = tempfile.mkdtemp(prefix="land-tt-"); os.environ["CC_SLACK_DIR"] = tt_dir
+    with open(f"{tt_dir}/track-threads.json", "w") as f:
+        json.dump({"bob/site": {"chat": "CBOB", "ts": "9.3", "at": 1.0}}, f)
+    posts, injects, line = notified({"repo": "bob--site", "pr": 7}, LANDED)
+    mt_landed = (len(posts) == 1 and posts[0][2:4] == ["--route", "bob/site landed"] and posts[0][-1] == LANDED["text"]
+                 and not injects and line.endswith("notify bob--site#7 landed → track thread"))
+    posts, injects, line = notified({"repo": "bob--site", "pr": 7}, STOPPED)
+    mt_stopped = len(posts) == 1 and posts[0][2:4] == ["--route", "bob/site stopped"] and not injects
+    os.environ.pop("CC_SLACK_DIR", None); shutil.rmtree(tt_dir, ignore_errors=True)
+    check("…but a member project whose track has a thread of its own is told in THAT thread, landed and stopped alike "
+          "(`--route \"<handle>/<track> …\"`, the same door a box track's line takes), and still wakes no seat",
+          mt_landed and mt_stopped)
     world[f"{BIN}/cc-slack post"] = (1, "cc-slack post: not sent (ratelimited)")
     posts, injects, line = notified({"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1"}, LANDED)
     check("…and a door that REFUSED says so on the same ledger line: the record is what the retry and anyone "

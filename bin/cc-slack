@@ -21,6 +21,7 @@
   cc-slack track-thread <repo>/<track> [--title T]   the ONE thread a --go track lives in, in #<repo> (a member workspace: its own #<handle>): opened by `cc … --go`, idempotent, prints `<chat> <ts>`; a track gets no channel of its own, and a repo with none of its own that CC_PROJECT_CHILDREN puts under a parent gets its threads — and its --route lines and PR cards — in the parent's channels. Its worker's lines (post --route "<repo>/<track> …") and its landing line go there, and a reply there reaches the track's session — or, for a headless or finished track, the repo's session with the track named; no notice line is posted.
   cc-slack mkchannel <name>… [--public]     create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the topic; a #<repo>--<sub> name inherits #<repo>'s people; comes paired with #<name>-updates.
   cc-slack project <name>             from a member workspace's session, ask the daemon for the project's board row and its one thread in #<this workspace> (no channel); at most 3 an hour; the human way is `new project <name>` typed in the channel.
+  cc-slack escalate --notice [--file P] [--id ID] -t "<h>/<track> <kind>" "text"   from inside a member boundary: a worker's END LINE or its Slack deliverable — posted by the host into the track's thread (the file with it, under the text) and one `loop:` line to the control seat; never a request or a page. --id posts it once (the ledger keeps it under the workspace's name); the seat's line goes every time. cc-notify (a plain call titled with the track) and cc-loop use it. Without --notice, `escalate` is cc-notify's --ask relay.
   cc-slack ask [-t "title"] "text"      from a member workspace's session, ask the box's planning seat (a repo, a host-side push, a question): the daemon posts a 🙋 card in the control repo's #<repo>-threads lane on the workspace's behalf, hands it to the planning session, and carries every reply in the card's thread (the seat's or the owner's) back to #<workspace>, handed to its session; at most 5 an hour. Never ask the owner to relay.
   cc-slack seat                          the seat the daemon says owns this process (`<repo>`, `<repo>/<track>`, `<repo>@<alias>`), from the socket's pid chain and the live subscriptions; empty and exit 1 when none does, exit 2 when the daemon could not be reached at all. cc-notify reads it to decide who may ask the owner, and a caller it cannot identify (exit 2) is not the box's own hand.
   cc-slack grant allow '<rule>' [-t "why"]   from a box session (planning or a track) that a permission layer refused: the daemon posts a 🔐 grant card in the control repo's #<repo>-threads lane naming that ONE allow line; the owner's `yes <id> fix` there has the daemon write it into ~/.claude/settings.json (cc-settings grant), `no <id>` declines; the card shows ⚙️ or ❌. `cc-slack grant config KEY VALUE` is the same for one ~/.cc/config key (never a credential's). An allow or config ask goes to the box's approver first (cc-approve, APPROVER=off skips it): what the owner's merged grants cover, asked by a planning seat, the daemon writes with no card and a ⚙️ line in that lane; the rest is the card. Never a member workspace's verb, never answerable by a session; at most 5 an hour. `cc-slack grant unit <file.service|.timer>` is the same card for a user unit install (file, sha256 and the enable both named). `cc-slack grant confirm '<command>' -w <window>` is the same card for a seat parked on the auto-mode confirm dialog behind a command that is not read-only (cc-model's tick raises it): the owner's `yes <id>` / `no <id>` is written to ~/.cc/state/confirm-answers/<id>, and cc-model's next tick presses that answer into the dialog — this once, never for good. Design: docs/design-seat-grant-from-slack.md.
@@ -1057,12 +1058,49 @@ def voice_text(path, timeout=VOICE_MAX):
         log(f"voice: cc-voice said nothing usable for {os.path.basename(path)}"); return None
     return d if (d.get("transcript") or "").strip() else None
 
-def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True, ts=None):
+def open_member_file(path, roots):
+    """A file a member named, OPENED ONCE and judged by what was opened, with no name she can write resolved twice
+    (review of #561 and its security read). A realpath check and then an open by name let a member swap a directory
+    on the way — or a root itself: member_dir(h)/files lies in the dir cc-sandbox binds read-write into the
+    boundary — for a link to ~/.cc between the two, and the daemon uploaded its own config, token and all, into her
+    thread. So nothing here is realpath'd: `path` must lie under one of `roots` as written, with no empty, `.` or
+    `..` part; the root is opened O_DIRECTORY|O_NOFOLLOW and every part below it is walked with openat, O_NOFOLLOW
+    each, so a link anywhere on the way is refused, never followed. The last open is O_NONBLOCK (a FIFO planted
+    there cannot park this thread), and fstat must say a regular file with one link: a hard link to a box file
+    passes every name check there is. Returns the fd — the caller's to close, and to upload from as
+    /proc/self/fd/<fd>, which reopens that same file and not the name. Raises OSError or UploadRefused, every fd
+    closed."""
+    root = next((r for r in roots if path.startswith(r + "/")), None)
+    parts = path[len(root) + 1:].split("/") if root else []
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise UploadRefused(f"{path} is not a plain path under {', '.join(roots)}")
+    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for p in parts[:-1]:
+            nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+            os.close(dfd)
+            dfd = nfd
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise UploadRefused(f"{path} is not a regular file")
+        if st.st_nlink > 1:
+            raise UploadRefused(f"{path} has {st.st_nlink} hard links, and one of them can be anywhere")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True, ts=None, name=None):
     """Upload one file to `to` (a chat id, #name, user id, or None for the owner's DM), into `thread`. Same
     contract as post(): no token, or local, means outbox log only, never a false claim of sending. Returns
     (file_id, chat); file_id None means nothing reached Slack. `mail` is post()'s tap for a file: answering a
     mail, the file either goes as an attachment (or a MAIL_OUT_LINKS link) or the call is refused before the
-    upload — UploadRefused names why — so `sent` is never said of a file the sender did not get."""
+    upload — UploadRefused names why — so `sent` is never said of a file the sender did not get. `name` is the
+    file's name in Slack when `path` does not carry it (an open fd's /proc/self/fd/<n>, open_member_file)."""
     if os.path.isdir(path):
         raise UploadRefused(f"{path} is a directory — send one file, not a folder")
     if not os.path.isfile(path):
@@ -1072,10 +1110,13 @@ def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True,
         raise UploadRefused(f"{path} is {size / (1024 * 1024):.1f} MB — the limit is {MAX_UPLOAD // (1024 * 1024)} MB")
     try:
         with open(path, "rb") as f:
-            data = f.read()
-    except OSError as e:
+            data = f.read(MAX_UPLOAD + 1)   # BOUNDED: the size above is the file's before this open, and a file can grow
+    except OSError as e:                    # between the two — a member's can, while the daemon reads it into memory
         raise UploadRefused(f"cannot read {path}: {e.strerror or e}")
-    name = os.path.basename(path)
+    if len(data) > MAX_UPLOAD:
+        raise UploadRefused(f"{path} is over the {MAX_UPLOAD // (1024 * 1024)} MB limit as read (it said {size} bytes before)")
+    size = len(data)   # what goes up is what was read, and Slack is told that length
+    name = name or os.path.basename(path)
     line = f"{path} ({size} bytes)" + (f" — {comment}" if comment else "")
     tok = cfg.get("SLACK_BOT_TOKEN")
     if not tok or to == "local":   # "local" = test/script injection: outbox only, never a real upload
@@ -4007,6 +4048,8 @@ class Daemon:
             out = ((r.stdout or "") + (r.stderr or "")).strip()[-1500:]
             log(f"dispatch {h}: {repo}/{track} {' '.join(opts)} rc={r.returncode}")
             return {"ok": r.returncode == 0, "text": out} if r.returncode == 0 else {"ok": False, "error": out or f"cc exited {r.returncode}"}
+        if verb == "escalate" and first.get("notice"):
+            return self.member_notice(h, first)
         if verb == "escalate":   # the way out: inside the boundary ~/.cc/config is absent, so cc-notify has no rung to
             # A member's escalation is a REQUEST TO THE PLANNING SEAT (`cc-notify --ask`, on file and over the
             # broker), never the owner's DM and never the member's own channel: the socket says which workspace it
@@ -4025,6 +4068,98 @@ class Daemon:
                 return {"ok": False, "error": ((r.stderr or r.stdout or "").strip()[-300:]) or "cc-notify reached nobody"}
             return {"ok": True, "text": f"the box's planning seat has it (request {(r.stdout or '').strip()[-60:] or '?'}); it answers in #{h}, or asks the owner itself"}
         return {"ok": False, "error": "unknown verb"}
+
+    OWNER_KINDS = ("decision", "approval", "escalation", "notify-test")   # cc-notify's rung 1 rows, the ones a title's second word must not reach from a notice
+
+    def member_notice(self, h, first):
+        """A WORKER'S END LINE (or its Slack deliverable) from inside the boundary: `{"escalate": "<h>/<track> <kind>",
+        "text": …, "notice": true, "attach": path?}`. Not a request: a track that finished, blocked or ran out is not
+        asking the seat for anything, so it does not become a `--ask` card (that is what a member's DONE was on
+        2026-09-20 — an escalation to the owner's DM, and nothing in the project thread; a-finished-worker-reaches-
+        its-thread). The title must name a track of THIS socket's workspace: the socket is the authority on the
+        workspace, the title only picks the thread (its second word is cc-notify's kind, ambient). Out here it is the same plain
+        `cc-notify -t "<h>/<track> <kind>"` a host loop runs — `post --route` into the track's thread, the table's
+        rung (no phone) — plus ONE `loop:` line to the control seat through cc-broker (source loop, so a batch of
+        ends costs the seat one turn), and the file, when there is one, uploaded into the same thread under the
+        text. A notice carrying a file that cannot go up — no thread yet, or a failed upload — sends NOTHING and
+        answers not-ok, so the worker's deliverable stays on disk for the next round rather than being marked
+        sent without it. An `id` (cc-loop's done id, "one card per PR") posts the card once: it is kept in the sent
+        ledger under `member:<h>:`, so a member can never claim a host card's id and silence it, and a second notice
+        with it posts nothing. The seat's line goes on every notice all the same, as it does on the host (decided on
+        #561). No token, no priority and no destination cross the boundary."""
+        title = perm_field(str(first["escalate"] or "").strip(), 120)
+        text = perm_field(str(first.get("text") or "").strip(), 1500, inline=False)
+        m = re.fullmatch(r"([a-z0-9][a-z0-9-]{0,39}/[A-Za-z0-9_][A-Za-z0-9._-]{0,63}) (.+)", title)
+        if not m or workspace_of(m.group(1)) != h:
+            return {"ok": False, "error": f"a notice names one of {h}'s own tracks: -t '{h}/<track> <kind>'"}
+        target = m.group(1)
+        # THE KIND WORD BUYS NO OWNER DOOR. The plain cc-notify below runs as the box's own hand (control), and
+        # cc-notify's kind_of reads a title's second word, so `<h>/<track> decision` sent as a notice would raise the
+        # ❓ @owner card that #558 shut to a track on the host. Those rows (cc-notify's RUNGS, rung 1) stay a request
+        # — `escalate` without --notice — which the seat weighs. cc-notify keeps the same gate on its side.
+        if m.group(2).split()[0].lower() in self.OWNER_KINDS:
+            return {"ok": False, "error": f"'{m.group(2).split()[0]}' is the owner's door, not a track's line — a notice is ambient; ask the seat with escalate (no --notice)"}
+        if not text:
+            return {"ok": False, "error": "a notice needs something to say"}
+        # ONE CARD PER ID (review of #561): the member's id, checked and then named under the workspace, so the
+        # ledger entry can never be a host card's — the socket is the authority on whose it is.
+        raw = str(first.get("id") or "")
+        if raw and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,119}", raw):
+            return {"ok": False, "error": "a notice's id is at most 120 of A-Z a-z 0-9 . _ : @ / + -, starting with a letter or digit"}
+        nid = f"member:{h}:{raw}" if raw else ""
+        dup = bool(nid) and bool((sent_record(nid) or {}).get("accepted"))   # the ledger first: an id already posted posts nothing again
+        path = str(first.get("attach") or "")   # `attach`, not `file`: that word is a member verb of its own
+        if path:   # BY NAME, AS WRITTEN — no realpath out here, it would resolve names the member can write (open_member_file)
+            roots = (f"{DEV}/{h}", f"{HOME}/.cc/worktrees/{h}", f"{HOME}/.cc/state/{h}", f"{member_dir(h)}/files")
+            if not any(path.startswith(r + "/") for r in roots):
+                return {"ok": False, "error": f"{first.get('attach')} is not visible outside the boundary — put it under the worktree first"}
+        tt = track_thread(target)
+        if dup:
+            said = "it was posted in the track's thread before under this id, so not again"
+        elif path:   # text and file in ONE message, in the thread: the file's comment is the text
+            # A DELIVERABLE THAT LOST ITS FILE IS NOT DELIVERED. No thread to upload into, or an upload that
+            # failed, refuses the whole notice — text and all — so `escalate --notice` exits non-zero and the
+            # caller (cc-loop's deliver_post) leaves slack-post.md where it is and tries again next round. The
+            # host door already behaves this way: no thread ts there means an empty ts and the file stands.
+            if not tt:
+                return {"ok": False, "error": f"{target} has no thread yet and the notice carries a file — nothing sent; retry once the thread is open"}
+            # THE CHECK ABOVE IS BY NAME, AND A NAME CAN CHANGE UNDER IT: ~/dev/<h> is the member's to write, and so
+            # is the dir member_dir(h)/files sits in, so a directory on the path — or the root — can become a link to
+            # ~/.cc before the upload opens it. The authority is the one walk (open_member_file), no link followed,
+            # and the upload reads that fd, never the name (review of #561).
+            try:
+                fd = open_member_file(path, roots)
+            except (OSError, UploadRefused) as e:
+                log(f"notice {h}: {target} file {path} refused: {e}")
+                return {"ok": False, "error": f"{first.get('attach')} is not a regular file the box can read under the workspace — nothing sent"}
+            try:
+                fid, fchat = upload_file(self.cfg, f"/proc/self/fd/{fd}", tt[0], tt[1], comment=text, name=os.path.basename(path),
+                                         mail=False)   # a track's thread is no mail's, and the mail door would reopen by name
+            except Exception as e:
+                log(f"notice {h}: {target} file {path} not uploaded: {e!r}")
+                return {"ok": False, "error": f"the file {os.path.basename(path)} did not reach the thread ({e}) — nothing sent"[:300]}
+            finally:
+                os.close(fd)
+            if not fid:
+                log(f"notice {h}: {target} file {path} reached nobody")
+                return {"ok": False, "error": f"the file {os.path.basename(path)} reached nobody (no token, or the box is local) — nothing sent"}
+            if nid:
+                now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                sent_write(nid, {"id": nid, "chat": fchat, "thread": tt[1], "intent": now, "accepted": now, "ts": None, "file": fid})
+            said = f"the file {os.path.basename(path)} and the text are in the track's thread"
+        else:
+            r = EFFECTS.run([f"{BIN}/cc-notify", "-t", title] + (["--id", nid] if nid else []) + ["--", text],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                log(f"notice {h}: {title} rc={r.returncode}: {(r.stderr or r.stdout or '').strip()[-200:]}")
+                return {"ok": False, "error": ((r.stderr or r.stdout or "").strip()[-300:]) or "cc-notify reached nobody"}
+            said = "in the track's thread" if tt else "in the workspace's lane (the track has no thread)"
+        # THE SEAT'S TURN: one line, the shape cc-loop's own tell_planner sends from the host (source loop → a digest,
+        # never a page); `--no-start` as there — an end line does not open a session that is not running.
+        seat = EFFECTS.run([f"{BIN}/cc-broker", "inject", "--no-start", "--source", "loop", CTL,
+                            f"loop: {title} — {text.replace(chr(10), ' ')[:600]}"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        log(f"notice {h}: {title} → thread={bool(tt)} file={bool(path)} dup={dup} seat rc={seat.returncode}")
+        return {"ok": True, "text": f"{said}; {CTL}'s seat has the line" + ("" if seat.returncode == 0 else " (the broker refused it — cc-broker's log)")}
 
     SEND_KEYS = ("to", "subject", "body", "attachments", "thread", "html", "images")   # the `send` verb's ask: cc-mail's own JSON shape, no more
 
@@ -7731,7 +7866,7 @@ def sender_name(chat=None):
 
 def cmd_post(argv):
     cfg = load_cfg()
-    chan = thread = route = ts = pid = None
+    chan = thread = route = ts = pid = rtrack = None
     mention = major = False
     args = []
     i = 0
@@ -7783,7 +7918,7 @@ def cmd_post(argv):
         elif not mention and track_thread(words[0].lower() if words else ""):
             # "<repo>/<track> done|round over|<stop>": the track's own thread in #<repo> — the brief: "its worker's
             # progress lines … live in ONE thread"; a --mention still goes to the main lane, where paging him lives.
-            chan, thread = track_thread(words[0].lower())
+            chan, thread = track_thread(words[0].lower()); rtrack = words[0].lower()
         else:
             name = re.split(r"[/\s\]]", route.strip().lstrip("["), maxsplit=1)[0].lower()   # "[repo] PR #n …" → repo
             home = home_of(cfg, name) if name else name       # a channel-less child's title lands in its parent's lane…
@@ -7809,6 +7944,8 @@ def cmd_post(argv):
         chan = resolve_channel(cfg, chan) or chan
     # --mention is rung 1, "you, now": post() opens it with ❓ and the raw <@U…> form; without --mention a typed @handle of his is code. Every post signs with the calling session's name; a `-c '#name'` post into ANOTHER session's channel also opens with a mention of that channel, so it reads as addressed, not anonymous.
     uname, own = sender_name(chan)
+    if rtrack and not uname and os.environ.get("CC_SLACK_PLAIN_NAME") != "1":   # a headless loop has no seat: its line into the track's thread is signed with the track (posts name their sender)
+        uname = display_name(rtrack)
     if named and not own:
         text = f"<#{chan}> {text}"
     missed = unresolved_mentions(cfg, text, chan, decision=mention)
@@ -9050,23 +9187,34 @@ def main(argv):
             print(f"the box's socket did not answer ({e.__class__.__name__}) — nothing dispatched", file=sys.stderr); return 1
         print(r.get("text") or r.get("error") or ""); return 0 if r.get("ok") else 1
     elif cmd in ("escalate", "ask"):
-        # escalate: member boundary lacks ~/.cc/config, so the daemon makes the push call and tells the OWNER.
+        # escalate: member boundary lacks ~/.cc/config, so the daemon relays it as a request to the planning seat.
+        # escalate --notice [--file P] [--id ID]: a WORKER'S END LINE or its Slack deliverable, `-t "<h>/<track> <kind>"` — into
+        # the track's thread and one line to the seat, never a request (Daemon.member_notice); cc-notify and cc-loop
+        # inside the boundary use it, a person has no reason to.
         # ask: the workspace's question to the box's PLANNING SEAT (a repo, a host-side push, a question) — the daemon
         # posts the card in the control repo's -threads lane on its behalf and hands the thread's answer back to the
         # workspace's session, never its channel (Daemon.relay_ask / answer_ask). Same -t title; `-p` is escalate's and dropped either way.
-        title, args = "", []
+        title, args, req = "", [], {}
         i = 0
         while i < len(rest):
             if rest[i] == "-t" and i + 1 < len(rest):
                 title = rest[i + 1]; i += 2
             elif rest[i] == "-p" and i + 1 < len(rest):
                 i += 2                     # severity is the table's call, not the caller's; drop it so `-p high` doesn't leak into the message
+            elif cmd == "escalate" and rest[i] == "--notice":
+                req["notice"] = True; i += 1
+            elif cmd == "escalate" and rest[i] == "--file" and i + 1 < len(rest):
+                req["attach"] = os.path.realpath(rest[i + 1]); i += 2
+            elif cmd == "escalate" and rest[i] == "--id" and i + 1 < len(rest):
+                req["id"] = rest[i + 1]; i += 2   # the notice's dedup id; the daemon checks it and files it under the workspace
+            elif rest[i] == "--" :
+                args += rest[i + 1:]; break
             else:
                 args.append(rest[i]); i += 1
         text = " ".join(args) if args else sys.stdin.read()
         nothing = "nobody was told" if cmd == "escalate" else "nothing was asked"
         try:
-            r = sock_request({cmd: title, "text": text}, timeout=60)
+            r = sock_request({cmd: title, "text": text, **req}, timeout=90)
         except Exception as e:
             print(f"the workspace's Slack link did not answer ({e.__class__.__name__}) — {nothing}", file=sys.stderr); return 1
         print(r.get("text") or "") if r.get("ok") else print(r.get("error") or "", file=sys.stderr)

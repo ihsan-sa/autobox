@@ -31,6 +31,7 @@ reminders. Technical records stay on disk (journals, logs, the board) without be
 | owner choice | `cc-notify --decision` — `#<repo>`: `❓ @owner *Decision needed:* <one question>` | the control seat only; cc-msg posts the same card itself when that seat's OWN window has stopped taking keys, because a request for it would spool behind the dead pane and be stamped delivered |
 | owner authorization | `cc-notify --approval` — `#approvals`: `❓ @owner 🔐 *Approval needed:* <action and consequence>` | the control seat only; cc-land's protected door posts the same card itself, because a gate is machinery and has no seat |
 | work reply | the thread the work lives in | the session doing it |
+| a track's end | `cc-notify -t "<repo>/<track> <done\|needs you\|round over\|…>"` — the track's own thread in `#<repo>` (its dispatcher reads there) and one `loop:` line to the planning seat; its Slack deliverable (`slack-post.md`: `thread` on line 1, an optional `file:` line) goes the same way, the file with it; its landing line too. From inside a member boundary the same call crosses the member socket as a notice (`cc-slack escalate --notice`) and the host posts it — no token in there | the loop and the lander; never a person |
 | machine log | `#<repo>-updates` (`cc-notify` with no flag) | any session |
 
 - A worker, a member session, an orch or a unit asks the planning seat. The seat settles permissions and technical

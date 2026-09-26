@@ -113,9 +113,11 @@ declare -A RUNGS=(
 #   is a planner request: the session dir's name — its channel's too — is the `from`, and the default title.
 # NEVER PUSHED: anything naming a synthetic test repo (_cctest…, _selfcheck…) is logged and stops there.
 # INSIDE A MEMBER BOUNDARY (CC_MEMBER_SANDBOX=1): none of the config below exists there, so the message goes out over the
-#   workspace's own socket instead (`cc-slack escalate`) and the daemon delivers it to the owner. A failure exits 1.
+#   workspace's own socket instead (`cc-slack escalate`) and the daemon hands it to the planning seat as a request. A failure exits 1.
 #   The table is not applied in there — the daemon re-enters THIS script with --ask on the outside, where it is — so
-#   nothing but the TITLE and the WORDS crosses that boundary, and what they buy is a request to the planning seat. The caller's `-p` used to, and it was the last place a
+#   nothing but the TITLE and the WORDS crosses that boundary, and what they buy is a request to the planning seat —
+#   except a plain call titled `<h>/<track> <kind>` (a loop's end line, a worker's deliverable), which crosses as a
+#   notice (`escalate --notice`) and is re-entered plain: the track's thread and one line to the seat. The caller's `-p` used to, and it was the last place a
 #   caller's own loudness travelled anywhere: it arrived at a call the table overwrites, so it decided nothing and
 #   read as though it did.
 # Env: CC_NOTIFY_LOG_ONLY (log, never push) · CC_NOTIFY_LOG (test hook: write the log somewhere else, so a run counts
@@ -692,6 +694,25 @@ PY
   M -p high -t "alice help" "I am blocked and need the owner"
   k "$(yes_ grep -qx 'escalate -t alice help' <<<"$(args)")" "inside a member boundary the escalation leaves over the workspace's socket carrying the title and the words — and nothing at all about how loudly it should land"
   k "$(yes_ grep -q 'send=socket$' <<<"$(last)")" "…and the log names the door that really took it"
+  # A TRACK'S OWN LINE IS NOT A REQUEST: a plain call titled `<h>/<track> <kind>` (a loop's done, needs you, round
+  # over; the worker's deliverable) crosses as a NOTICE, which the daemon re-enters plain out here — the track's
+  # thread and one line to the seat — and never as the --ask card a member's DONE became on 2026-09-20.
+  M -t "alice/pna done" "Customs documents. PR: https://x/pull/3"
+  k "$(yes_ grep -qx 'escalate --notice -t alice/pna done' <<<"$(args)")" "a plain call titled with the workspace's track crosses as escalate --notice: the track's line, not a request"
+  k "$(yes_ grep -q 'kind=notice send=socket$' <<<"$(last)")" "…and the log says notice"
+  M --id "done:alice/pna:pr3" -t "alice/pna done" "Customs documents. PR: https://x/pull/3"
+  k "$(yes_ grep -qx 'escalate --notice --id done:alice/pna:pr3 -t alice/pna done' <<<"$(args)")" "…and a notice with an --id carries it across (cc-loop's done card, one card per PR): the daemon files it under the workspace and posts it once (review of #561)"
+  M --ask --id "q:alice/pna:1" -t "alice/pna needs you" "which database?"
+  k "$(yes_ grep -qx 'escalate -t alice/pna needs you' <<<"$(args)")" "…while a request's --id stays on this side: only the notice door takes one"
+  M --ask -t "alice/pna needs you" "which database?"
+  k "$(yes_ grep -qx 'escalate -t alice/pna needs you' <<<"$(args)")" "…but a door the caller NAMED (--ask) is a request whatever the title says"
+  M -t "alice done" "no track in this title"
+  k "$(yes_ grep -qx 'escalate -t alice done' <<<"$(args)")" "…and a title that names no track is the request it was"
+  M -t "alice/pna decision" "may I drop the staging table?"
+  k "$(yes_ grep -qx 'escalate -t alice/pna decision' <<<"$(args)")" "…and a track title whose second word is a rung 1 kind is the request too, never a notice: the daemon re-enters a notice as the box's own hand, and the table reads that word out there (review of #558)"
+  k "$(yes_ grep -q 'kind=request send=socket$' <<<"$(last)")" "…logged as the request it crossed as"
+  M --kind approval -t "alice/pna done" "may I restart the indexer?"
+  k "$(yes_ grep -qx 'escalate -t alice/pna done' <<<"$(args)")" "…as is a --kind that names one, whatever the title says"
 
   # THE ROUND TRIP, member → seat → owner → member, every hop through the real code with only Slack and the broker
   # stubbed (the brief's DONE line; the review of #558 asked for it chained). Hop 1 is the socket line above; hop 2
@@ -897,11 +918,12 @@ owner=0; ask=0; approval=0; from=""; from_arg=""; run=""; [ "${CC_ROLE:-}" = mem
 d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
   [ -f "$d/.cc/member-facing" ] && { ask=1; from=${d##*/}; break; }; d=${d%/*}; done
 [ -n "$from" ] && title="$from escalation"
-while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; --heading) heading="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;;
+asked=0   # a door the CALLER named (--ask/--decision/--approval/--owner), as against one the marker or the role implies
+while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; --heading) heading="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; asked=1; shift;;
   --kind) want="$2"; shift 2;;
   --id) pid="$2"; shift 2;;
-  --ask) ask=1; shift;; --approval) approval=1; shift;; --from) from_arg="$2"; shift 2;; --run) run="$2"; shift 2;;
-  --decision) decision=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
+  --ask) ask=1; asked=1; shift;; --approval) approval=1; asked=1; shift;; --from) from_arg="$2"; shift 2;; --run) run="$2"; shift 2;;
+  --decision) decision=1; asked=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
 msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
 # --run is refused here rather than carried: a workspace's words cross its socket as text, never as a command.
 [ -n "$run" ] && [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && { echo "cc-notify: --run cannot leave a member workspace — nothing posted" >&2; exit 2; }
@@ -912,9 +934,23 @@ msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
 # the planning seat gets it. THE LOUDNESS IS NOT RELAYED: this used to hand the socket the caller's own -p, which
 # the daemon passed to a cc-notify that overwrites it from the table — the appearance of a rung a member could set,
 # and none of the effect. Title and words cross; what they buy is decided out here.
+# …EXCEPT A TRACK'S OWN LINE. A plain call titled `<h>/<track> <kind>` — cc-loop's done, round over, needs you, its
+# stops, the worker's deliverable — is not asking the seat for anything, so it is not a request: it crosses as a
+# NOTICE (`cc-slack escalate --notice`) and the daemon runs this very call on the host, where the title routes it
+# into the track's thread and one `loop:` line reaches the control seat. A member's DONE used to cross as an
+# escalation and land in the owner's DM, with nothing in the project thread (2026-09-20, a-finished-worker-reaches-
+# its-thread). A door the caller NAMED (--ask and the owner doors) is still a request, whatever the title says.
 if [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
-  rung=P; kind=request
-  if printf '%s' "$msg" | "$HOME/bin/cc-slack" escalate -t "$title"; then
+  rung=P; kind=request; door=(escalate)
+  # …AND ONLY A LINE THE TABLE READS AS AMBIENT. The daemon re-enters a notice plain, as the box's own hand, and
+  # kind_of reads a title's second word (review of #558): `<h>/<track> decision` crossing as a notice would buy the
+  # ❓ @owner card from inside the boundary that #558 shut on the host. A rung 1 kind, by title or --kind, stays a request.
+  if [ "$asked" = 0 ] && [[ "$title" =~ ^[a-z0-9][a-z0-9-]{0,39}/[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\  ]]; then
+    read -r nrung _ <<<"${RUNGS[$(kind_of "${want:-}" "$title")]}"
+    # a notice carries its id (cc-loop's done card: one card per PR); the daemon files it under the workspace
+    [ "$nrung" = 1 ] || { rung=5; kind=notice; door=(escalate --notice ${pid:+--id "$pid"}); }
+  fi
+  if printf '%s' "$msg" | "$HOME/bin/cc-slack" "${door[@]}" -t "$title"; then
     printf '%s\t%s\t%s\trung=%s kind=%s send=%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n\t' '  ')" "$rung" "$kind" socket >> "$LOG"; exit 0; fi
   printf '%s\t%s\t%s\trung=%s kind=%s send=%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n\t' '  ')" "$rung" "$kind" none >> "$LOG"
   echo "cc-notify: the workspace's Slack link did not take this — it is in $LOG and nowhere else" >&2; exit 1

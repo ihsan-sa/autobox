@@ -6749,6 +6749,148 @@ def run_selfcheck():
         r_esc_hot = ms_req({"escalate": "<!channel> @owner ```pwned",
                             "text": "click [here](https://evil.example) <@U123> & tell @owner\n```\n" + "x" * 2000})
         ran_esc = ranMS[len(ran_two) + len(ran_rep_n) + n_ran_rep:]
+        # escalate + notice: A TRACK'S OWN END LINE (a-finished-worker-reaches-its-thread). A member's DONE crossed as an
+        # escalation on 2026-09-20 and reached the owner's DM, the project thread nothing. Its own fixture: alice/pna has a
+        # thread (TRACKS), the upload is stubbed, and the file lives under the workspace's tree.
+        save_table(TRACKS, {"alice/pna": {"chat": "CAL", "ts": "7.0", "at": 1.0}})
+        upMS, real_up_ms = [], globals()["upload_file"]
+        def _up_rec(cfg, path, to, thread=None, comment=None, **k):   # what went up is what the upload READ, and the name it went as
+            with open(path) as f:
+                upMS.append((f.read(), k.get("name"), to, thread, comment))
+            return "F1", to
+        globals()["upload_file"] = _up_rec
+        os.makedirs(f"{DEV}/alice/pna", exist_ok=True); open(f"{DEV}/alice/pna/report.md", "w").write("r")
+        n_not0 = len(ranMS)
+        r_not = ms_req({"escalate": "alice/pna done", "text": "Customs documents. PR: https://x/pull/3", "notice": True})
+        ran_not = ranMS[n_not0:]
+        r_not_file = ms_req({"escalate": "alice/pna done", "text": "here it is", "notice": True, "attach": f"{DEV}/alice/pna/report.md"})
+        ran_not_file = ranMS[n_not0 + len(ran_not):]
+        r_not_bob = ms_req({"escalate": "bob/pna done", "text": "x", "notice": True})
+        r_not_notrack = ms_req({"escalate": "alice done", "text": "x", "notice": True})
+        r_not_owner = ms_req({"escalate": "alice/pna decision", "text": "may I drop the table?", "notice": True})   # a rung 1 kind word: never a notice
+        r_not_out = ms_req({"escalate": "alice/pna done", "text": "x", "notice": True, "attach": f"{DEV}/bob/secret"})
+        save_table(TRACKS, {}); r_not_nothread = ms_req({"escalate": "alice/pna done", "text": "no thread yet", "notice": True})
+        ran_not_nothread = ranMS[-2:]
+        # A DELIVERABLE'S FILE THAT DID NOT GO UP is a failed notice (review of #561): each of the three ways — no thread to
+        # upload into, an upload that raises, an upload that reaches nobody — answers not-ok and sends nothing, so cc-loop
+        # keeps slack-post.md for a retry. Each case has its own table and stub; the kept case (thread + working upload)
+        # is r_not_file above.
+        n_nf0, up_n0 = len(ranMS), len(upMS)
+        r_nf_nothread = ms_req({"escalate": "alice/pna done", "text": "with a file", "notice": True, "attach": f"{DEV}/alice/pna/report.md"})
+        save_table(TRACKS, {"alice/pna": {"chat": "CAL", "ts": "7.0", "at": 1.0}})
+        def _up_raises(cfg, path, to, thread=None, comment=None, **k): raise UploadRefused("Slack said no")
+        globals()["upload_file"] = _up_raises
+        r_nf_raises = ms_req({"escalate": "alice/pna done", "text": "with a file", "notice": True, "attach": f"{DEV}/alice/pna/report.md"})
+        globals()["upload_file"] = lambda cfg, path, to, thread=None, comment=None, **k: (None, to)
+        r_nf_nobody = ms_req({"escalate": "alice/pna done", "text": "with a file", "notice": True, "attach": f"{DEV}/alice/pna/report.md"})
+        n_nf_ran, n_nf_up = len(ranMS) - n_nf0, len(upMS) - up_n0
+        # THE ONE OPEN (review of #561): the check above is by name, and ~/dev/<h> is the member's to write, so a directory on
+        # the path can turn into a link to somewhere outside between that check and the upload. Two moments: the swap lands
+        # after the name check and before the open (track_thread runs between the two, so a wrapped one swaps) → the open
+        # lands outside and is refused, nothing goes up; the swap lands after the open (the upload stub swaps, then reads what
+        # it was handed) → what goes up is still the file that was opened, never the one the name now leads to. The open
+        # takes no link at the last name either (O_NOFOLLOW), and no FIFO (O_NONBLOCK: it cannot park the daemon's thread).
+        out_ms, sw = f"{DIR}/outside-ms", f"{DEV}/alice/pna/d"
+        os.makedirs(out_ms, exist_ok=True); open(f"{out_ms}/cfg", "w").write("SECRET")
+        def _sw_reset():
+            if os.path.islink(sw):
+                os.unlink(sw)
+            shutil.rmtree(sw + ".was", ignore_errors=True); shutil.rmtree(sw, ignore_errors=True)
+            os.makedirs(sw); open(f"{sw}/cfg", "w").write("inside")
+        def _sw_dir():    # the member's move: the directory out of the way, a link to outside in its place
+            os.rename(sw, sw + ".was"); os.symlink(out_ms, sw)
+        def _sw_last():   # …or the file itself becomes a link to outside
+            os.unlink(f"{sw}/cfg"); os.symlink(f"{out_ms}/cfg", f"{sw}/cfg")
+        sw_at, upSW, real_tt_ms = {}, [], globals()["track_thread"]
+        def _tt_swap(target):
+            sw_at.pop("open", lambda: None)()
+            return real_tt_ms(target)
+        def _up_swap(cfg, path, to, thread=None, comment=None, **k):
+            sw_at.pop("upload", lambda: None)()
+            with open(path) as f:
+                upSW.append((f.read(), k.get("name"), path))
+            return "F2", to
+        globals()["track_thread"], globals()["upload_file"] = _tt_swap, _up_swap
+        n_sw0 = len(ranMS)
+        _sw_reset(); sw_at["open"] = _sw_dir
+        r_sw_open = ms_req({"escalate": "alice/pna done", "text": "swapped", "notice": True, "attach": f"{sw}/cfg"})
+        _sw_reset(); sw_at["open"] = _sw_last
+        r_sw_last = ms_req({"escalate": "alice/pna done", "text": "swapped", "notice": True, "attach": f"{sw}/cfg"})
+        n_sw_refused_ran, n_sw_refused_up = len(ranMS) - n_sw0, len(upSW)
+        _sw_reset(); sw_at["upload"] = _sw_dir
+        r_sw_up = ms_req({"escalate": "alice/pna done", "text": "swapped late", "notice": True, "attach": f"{sw}/cfg"})
+        sw_up = list(upSW)
+        os.mkfifo(f"{DEV}/alice/pna/pipe"); fifo_res = []
+        fifo_t = threading.Thread(target=lambda: fifo_res.append(ms_req({"escalate": "alice/pna done", "text": "a pipe", "notice": True,
+                                                                          "attach": f"{DEV}/alice/pna/pipe"})), daemon=True)
+        fifo_t.start(); fifo_t.join(10)
+        r_fifo = fifo_res[0] if fifo_res else {"ok": None, "error": "the open parked on the FIFO"}
+        n_fifo_up = len(upSW) - len(sw_up)
+        # THE SECURITY READ OF 9a202b11. The ROOT is a name the member can write as well: member_dir(h)/files sits in the
+        # dir cc-sandbox binds read-write, so a root realpath'd at check time could be repointed at ~/.cc between the name
+        # check and the open — swapped for a link at that moment here, and then met as one from the start. And a hard link
+        # to a file outside passes every name check there is, so its link count refuses it.
+        mfiles = f"{member_dir('alice')}/files"
+        os.makedirs(mfiles, exist_ok=True); open(f"{mfiles}/cfg", "w").write("inside")
+        def _sw_root():
+            os.rename(mfiles, mfiles + ".was"); os.symlink(out_ms, mfiles)
+        n_rt0, up_rt0 = len(ranMS), len(upSW)
+        sw_at["open"] = _sw_root
+        r_root_race = ms_req({"escalate": "alice/pna done", "text": "root swapped", "notice": True, "attach": f"{mfiles}/cfg"})
+        r_root_link = ms_req({"escalate": "alice/pna done", "text": "root a link", "notice": True, "attach": f"{mfiles}/cfg"})
+        if os.path.islink(mfiles):
+            os.unlink(mfiles); os.rename(mfiles + ".was", mfiles)
+        os.unlink(f"{mfiles}/cfg")
+        os.makedirs(f"{DEV}/bob", exist_ok=True); open(f"{DEV}/bob/hsecret", "w").write("SECRET")
+        os.link(f"{DEV}/bob/hsecret", f"{DEV}/alice/pna/hl")
+        r_hard = ms_req({"escalate": "alice/pna done", "text": "hard link", "notice": True, "attach": f"{DEV}/alice/pna/hl"})
+        n_rt_ran, n_rt_up = len(ranMS) - n_rt0, len(upSW) - up_rt0
+        os.unlink(f"{DEV}/alice/pna/hl"); os.unlink(f"{DEV}/bob/hsecret")
+        # …and upload_file reads at most the limit and one byte, whatever the size said before its open: /proc/self/status
+        # says 0 bytes and reads a kilobyte and more, as a file growing under the daemon would.
+        real_max_ms = MAX_UPLOAD; globals()["MAX_UPLOAD"] = 16
+        open(f"{DIR}/sixteen", "w").write("x" * 16)
+        try:
+            real_up_ms({}, "/proc/self/status", "local"); big_read = "read it all"
+        except UploadRefused as e:
+            big_read = str(e)
+        try:
+            small_read = real_up_ms({}, f"{DIR}/sixteen", "local")
+        except UploadRefused as e:
+            small_read = str(e)
+        globals()["MAX_UPLOAD"] = real_max_ms
+        globals()["track_thread"] = real_tt_ms
+        os.unlink(f"{DEV}/alice/pna/pipe"); _sw_reset(); shutil.rmtree(sw, ignore_errors=True)
+        # ONE CARD PER ID (review of #561): cc-loop's done card carries `done:<repo>/<track>:pr<n>` so a fix round that ends
+        # DONE on the same PR posts no second card. The id crosses the socket; the daemon files it as member:<h>:<id> in the
+        # sent ledger (its own dir here, never the box's), reads the ledger first, and a second notice posts nothing — while
+        # the seat still gets its line every time (decided on #561). The stubbed cc-notify writes the ledger as the real
+        # one's `cc-slack post --id` does once Slack took it.
+        real_sent_id, real_run_id = SENT_DIR, EFFECTS.run_impl
+        globals()["SENT_DIR"] = tempfile.mkdtemp(prefix="_selfcheck_notice_id_")
+        def _run_ledger(cmd, **kw):
+            if cmd and cmd[0].endswith("/cc-notify") and "--id" in cmd:
+                i = cmd.index("--id"); sent_write(cmd[i + 1], {"id": cmd[i + 1], "accepted": "2026-09-24T00:00:00Z", "ts": "8.8"})
+            return real_run_id(cmd, **kw)
+        EFFECTS.run_impl = _run_ledger
+        sent_write("done:alice/pna:pr9", {"id": "done:alice/pna:pr9", "accepted": "2026-09-24T00:00:00Z", "ts": "9.9"})   # a HOST card, sent
+        n_id0 = len(ranMS)
+        r_id1 = ms_req({"escalate": "alice/pna done", "text": "The PR is https://x/pull/3.", "notice": True, "id": "done:alice/pna:pr3"})
+        r_id2 = ms_req({"escalate": "alice/pna done", "text": "The PR is https://x/pull/3.", "notice": True, "id": "done:alice/pna:pr3"})
+        ran_id, n_id1 = ranMS[n_id0:], len(ranMS)
+        host_free = sent_record("done:alice/pna:pr3") is None   # the member's id never took the host's name for that card
+        r_id_host = ms_req({"escalate": "alice/pna done", "text": "x", "notice": True, "id": "done:alice/pna:pr9"})
+        ran_id_host, n_id2 = ranMS[n_id1:], len(ranMS)
+        r_id_bad = ms_req({"escalate": "alice/pna done", "text": "x", "notice": True, "id": "../x y"})
+        r_id_long = ms_req({"escalate": "alice/pna done", "text": "x", "notice": True, "id": "a" * 121})
+        n_id_bad, up_id0 = len(ranMS) - n_id2, len(upMS)
+        globals()["upload_file"] = _up_rec
+        r_idf1 = ms_req({"escalate": "alice/pna done", "text": "here it is", "notice": True, "attach": f"{DEV}/alice/pna/report.md", "id": "done:alice/pna:file"})
+        r_idf2 = ms_req({"escalate": "alice/pna done", "text": "here it is", "notice": True, "attach": f"{DEV}/alice/pna/report.md", "id": "done:alice/pna:file"})
+        n_idf_up, ran_idf = len(upMS) - up_id0, ranMS[n_id2:]
+        shutil.rmtree(SENT_DIR, ignore_errors=True)
+        globals()["SENT_DIR"], EFFECTS.run_impl = real_sent_id, real_run_id
+        globals()["upload_file"] = real_up_ms
         # `ask`: THE MEMBER'S QUESTION TO THE PLANNING SEAT, both directions (raised-a-workspace-cannot-ask-in-the-channel-
         # the-rule-names, 2026-09-18). The brief: "from inside a member session one verb posts an ask card to #<ctl>-threads
         # naming the workspace and the ask; the planning seat's thread answer reaches the member's own channel". Out: the
@@ -7382,6 +7524,72 @@ def run_selfcheck():
           r_esc_hot.get("ok") and esc_title == "alice: &lt;!channel&gt; @\u200bowner '''pwned"
           and esc_text.startswith("click [here] (https://evil.example) &lt;@U123&gt; &amp; tell @\u200bowner\n'''\n")
           and esc_text.endswith("…") and esc_text.count("x") < 2000 and "<" not in esc_text and "`" not in esc_text)
+    check("MEMBER socket: `escalate` with `notice` is a TRACK'S OWN LINE, not a request — the daemon re-enters cc-notify PLAIN "
+          "on the host with the very title (`<h>/<track> <kind>` routes it into the track's thread, the table's rung, no phone) "
+          "and hands the control seat ONE `loop:` line through cc-broker (source loop, --no-start), so the thread that "
+          "dispatched it and the seat both have the end within the minute; the answer says where it went",
+          r_not.get("ok") and ran_not == [[f"{BIN}/cc-notify", "-t", "alice/pna done", "--", "Customs documents. PR: https://x/pull/3"],
+                                          [f"{BIN}/cc-broker", "inject", "--no-start", "--source", "loop", CTL,
+                                           "loop: alice/pna done — Customs documents. PR: https://x/pull/3"]]
+          and "track's thread" in r_not.get("text", "") and "seat has the line" in r_not.get("text", ""))
+    check("MEMBER socket: …with an `attach` (a file: that word is a verb), the deliverable goes up INTO the track's thread as one message, the text as its "
+          "comment (the brief's 'with the file'), and the seat still gets its line; the file must be visible outside the "
+          "boundary (the workspace's own trees), else refused before any upload",
+          r_not_file.get("ok") and upMS[:1] == [("r", "report.md", "CAL", "7.0", "here it is")]
+          and [c[0].rsplit("/", 1)[-1] for c in ran_not_file] == ["cc-broker"] and "report.md" in r_not_file.get("text", "")
+          and r_not_out.get("ok") is False and "not visible outside" in r_not_out.get("error", ""))
+    check("MEMBER socket: a notice names one of THIS socket's workspace's tracks and nothing else — another workspace's track "
+          "and a title with no track are refused (the socket is the authority on the workspace; the title only picks the "
+          "thread), and so is a kind word that is the owner's door (`decision`: the plain cc-notify runs as the box's own "
+          "hand, and #558 shut that door to a track's title); a track with no thread yet still goes out plain (cc-notify's lane) and reaches the seat",
+          r_not_bob.get("ok") is False and "alice's own tracks" in r_not_bob.get("error", "")
+          and r_not_notrack.get("ok") is False and "alice's own tracks" in r_not_notrack.get("error", "")
+          and r_not_owner.get("ok") is False and "owner's door" in r_not_owner.get("error", "")
+          and r_not_nothread.get("ok") and "no thread" in r_not_nothread.get("text", "")
+          and [c[0].rsplit("/", 1)[-1] for c in ran_not_nothread] == ["cc-notify", "cc-broker"])
+    check("MEMBER socket: a notice carrying a file that cannot go up — the track has no thread yet, the upload raises, or it "
+          "reaches nobody — is NOT delivered: not-ok naming the file or the thread, nothing run (no plain cc-notify without the "
+          "file, no seat line), so `escalate --notice` exits non-zero and cc-loop keeps slack-post.md for the next round",
+          r_nf_nothread.get("ok") is False and "no thread yet" in r_nf_nothread.get("error", "")
+          and r_nf_raises.get("ok") is False and "report.md" in r_nf_raises.get("error", "") and "nothing sent" in r_nf_raises.get("error", "")
+          and r_nf_nobody.get("ok") is False and "reached nobody" in r_nf_nobody.get("error", "")
+          and n_nf_ran == 0 and n_nf_up == 0)
+    check("MEMBER socket: a notice's file is OPENED ONCE and judged by what was opened (review of #561) — a directory on its path "
+          "swapped for a link to outside after the name check, or the file itself swapped for one, is refused with nothing "
+          "uploaded and nothing run; swapped after the open, the upload still reads the file that was opened (by its fd, under "
+          "its own name), never the outside one; and a FIFO is refused at once, not waited on",
+          r_sw_open.get("ok") is False and "not a regular file the box can read" in r_sw_open.get("error", "")
+          and r_sw_last.get("ok") is False and "not a regular file the box can read" in r_sw_last.get("error", "")
+          and n_sw_refused_ran == 0 and n_sw_refused_up == 0
+          and r_sw_up.get("ok") and len(sw_up) == 1 and sw_up[0][:2] == ("inside", "cfg") and sw_up[0][2].startswith("/proc/self/fd/")
+          and not any("SECRET" in u[0] for u in sw_up)
+          and r_fifo.get("ok") is False and "not a regular file the box can read" in r_fifo.get("error", "") and n_fifo_up == 0)
+    check("MEMBER socket: a notice's file is walked from its root, the root itself opened O_NOFOLLOW (security read of "
+          "9a202b11) — the member's files root swapped for a link to outside after the name check, or a link from the "
+          "start, is refused, and so is a hard link to a file outside the workspace (its link count); nothing uploaded, "
+          "nothing run",
+          r_root_race.get("ok") is False and "not a regular file the box can read" in r_root_race.get("error", "")
+          and r_root_link.get("ok") is False
+          and r_hard.get("ok") is False and "not a regular file the box can read" in r_hard.get("error", "")
+          and n_rt_ran == 0 and n_rt_up == 0)
+    check("upload_file reads at most the limit and one byte from what it opened, never trusting the size it read before "
+          "(security read of 9a202b11: a file growing under the daemon could fill its memory) — past the limit as read it "
+          "is refused, and a file exactly at the limit still goes",
+          "limit as read" in big_read and small_read == (None, "local"))
+    notif_id = [c for c in ran_id if c[0].endswith("/cc-notify")]
+    check("MEMBER socket: a notice's `id` posts the card ONCE (review of #561: two DONEs on one PR gave two cards) — the daemon "
+          "files it under the workspace (`member:alice:…`), so the plain cc-notify gets that id, the second notice with it "
+          "posts nothing, and the seat still has its line both times; the host's card of the same name stays free, a host "
+          "card already sent does not silence the member's, a malformed id is refused with nothing run, and a notice with a "
+          "file dedups the same way (one upload, two seat lines)",
+          r_id1.get("ok") and r_id2.get("ok") and "not again" in r_id2.get("text", "")
+          and notif_id == [[f"{BIN}/cc-notify", "-t", "alice/pna done", "--id", "member:alice:done:alice/pna:pr3", "--", "The PR is https://x/pull/3."]]
+          and [c[0].rsplit("/", 1)[-1] for c in ran_id].count("cc-broker") == 2 and host_free
+          and r_id_host.get("ok") and [c[3:5] for c in ran_id_host if c[0].endswith("/cc-notify")] == [["--id", "member:alice:done:alice/pna:pr9"]]
+          and r_id_bad.get("ok") is False and "a notice's id" in r_id_bad.get("error", "")
+          and r_id_long.get("ok") is False and "a notice's id" in r_id_long.get("error", "") and n_id_bad == 0
+          and r_idf1.get("ok") and r_idf2.get("ok") and "not again" in r_idf2.get("text", "") and n_idf_up == 1
+          and [c[0].rsplit("/", 1)[-1] for c in ran_idf] == ["cc-broker", "cc-broker"])
     check("MEMBER socket: `ask` posts the workspace's question as a 🙋 card in the CONTROL repo's -threads lane — a channel "
           "the member may neither read nor post, so the daemon posts on her behalf as it does a 🔐 prompt — naming the "
           "workspace and the ask, every field escaped and defanged like a 🔐 field and headed UNTRUSTED, and hands the same "
