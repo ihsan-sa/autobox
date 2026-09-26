@@ -8,6 +8,19 @@
 #                            with its code. A Ctrl-C here is carried to the run; a TERM or hangup here ends only the
 #                            following. exit 3 and no second suite when a run is already going on this root; exit 1
 #                            when the run was killed before it finished
+#   cc-green start           …the same run, and return as soon as it has started: the ROUTE FOR A WORKER, whose gate
+#                            outlives a foreground tool call. It needs no `setsid`, `nohup` or `&` from the caller —
+#                            the run detaches itself (below), and a caller that types those is read by the auto-mode
+#                            classifier as a bypass and refused (twice on 2026-09-25). Then `cc-green wait` until it
+#                            does not exit 3. exit 0 once the run is going, 3 when one already is
+#   cc-green start -- SUITE  the same for one of the repo's own suites that is not a landing gate: a
+#                            `[core/]tests/check*.sh` or `selftest*.sh` (`tests/check-slow.sh`), or a tool's
+#                            `[core/]bin/<tool> selfcheck` for a tool that ships one — nothing else, no other
+#                            arguments, and only a file the branch's HEAD already tracks, so it cannot be a general way to detach any command past
+#                            the classifier (review of PR #675). Run from the root, on the same lock, log and status,
+#                            so `wait` and cc-loop's green_wait follow it too. It files no record. `wait` on it says
+#                            the suite's exit and exits 0 when that was 0, else 1 — no gate report. `run -- SUITE`
+#                            is the same, followed in the foreground
 #   cc-green wait [SECONDS]  block on that run, SECONDS at most (default 540, under a foreground tool call). Ended,
 #                            or none going: the report for the tree as it is NOW, exit 0/1 as above. Still going:
 #                            `still running (pid, since)`, exit 3 — call again. Killed or interrupted before it
@@ -83,7 +96,7 @@
 # the run no longer dies with the worker's iteration (A RUN OUTLIVES WHOEVER STARTED IT, below).
 set -uo pipefail
 SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
-USAGE="usage: cc-green [run|wait [SECONDS]|red SCOPE KIND KEY --observed TEXT [--log FILE]…|selfcheck]"
+USAGE="usage: cc-green [run|start [-- SUITE]|wait [SECONDS]|red SCOPE KIND KEY --observed TEXT [--log FILE]…|selfcheck]"
 # The tree is taken by tests/green.sh's green_tree — the SUITE's own hash, not a second one of ours. See the note
 # there: a reader with an algorithm of its own is how a green comes to name content it did not pass on.
 # shellcheck source=/dev/null
@@ -135,6 +148,7 @@ gates_here(){ local r=$1 g; for g in $GATES; do [ -x "$r/$g" ] && echo "$g"; don
 # something else, and otherwise note_ran writes a note per gate, keyed like a record, that ran_here reads back
 # for the same GREEN_TTL — in this process or a later one, so a plain call after the run says what the run said.
 RAN=""
+CMD=""      # the command a `start -- CMD` run carries instead of the gates; set in the run only
 note_of(){ echo "$GDIR/$(basename "$1")-${2:0:12}.ran"; }   # $1 = gate, $2 = tree. NEVER .json: cc-land spends those
 note_ran(){   # $1 = tree. A note for each gate that ran and still has nothing to spend; stale notes go with it
   local tree=$1 g
@@ -323,10 +337,12 @@ take_run(){   # $1 = root. The RUN's side: the lock its launcher handed over on 
 }
 begin_run(){   # $1 = root, $2 = tree. Under the lock: what this run is; written first with no tree, then with it
   printf 'root=%s\ntree=%s\npid=%s\nstarted=%s\nlog=%s\nrunid=%s\n' "$1" "$2" "$$" "$(now)" "$LOG" "$CC_GREEN_RUNID" > "$STATUS"
+  [ -z "$CMD" ] || printf 'cmd=%s\n' "$CMD" >> "$STATUS"
   [ -z "$2" ] || echo "cc-green: run on $1 (pid $$) — log $LOG"
 }
 
-# A RUN OUTLIVES WHOEVER STARTED IT. A track iteration started `setsid nohup cc-green run &` and ended two minutes
+# A RUN OUTLIVES WHOEVER STARTED IT. A track iteration started `setsid nohup cc-green run &` (the advice then; it is
+# `cc-green start` now, because the classifier refuses a worker's own setsid/nohup) and ended two minutes
 # later (error_max_turns); the run was gone with it — log two lines, the gate's output file empty and left behind,
 # no record, and a loop whose `green_wait` found no run to wait on. That is the signature of a TERM reaching this
 # process: run_missing's trap takes the gate's group down and exits 130 before a word is logged. `setsid` got the
@@ -343,8 +359,10 @@ begin_run(){   # $1 = root, $2 = tree. Under the lock: what this run is; written
 #     into the status on its way out. `wait` reads that: a run that ended says its exit, and one with no exit
 #     line, or 130/143, was killed or interrupted — said as such, exit 1, never green and never waited on for
 #     ever (the lock goes with the process; case 24).
-launch_run(){   # $1 = root → the run's exit; 3 when one is already going, 1 when it was killed, 2 when it never started
-  local r=$1 runid pid="" rc tp scope=()
+launch_run(){   # $1 = root, $2 = follow it (1) or return once it has started (0), $3… = a command in place of the gates
+                # → the run's exit (0 once started, unfollowed); 3 when one is already going, 1 when it was killed, 2 when it never started
+  local r=$1 follow=$2 runid pid="" rc tp scope=() sub=(__run); shift 2
+  [ $# = 0 ] || sub+=(-- "$@")
   lock_files "$r"; mkdir -p "$GDIR"
   exec 9>"$LOCK"
   if ! flock -n 9; then
@@ -361,7 +379,7 @@ launch_run(){   # $1 = root → the run's exit; 3 when one is already going, 1 w
   fi
   # The subshell forks the run and exits, so the run's parent is whatever reaps orphans, not this launcher. The run
   # inherits fd 9 — the same open lock — and this process lets go of it at once, so the lock lives as long as the run.
-  ( cd "$r" && CC_GREEN_RUNID=$runid exec "${scope[@]}" env --default-signal=INT,QUIT,TERM setsid "$SELF" __run \
+  ( cd "$r" && CC_GREEN_RUNID=$runid exec "${scope[@]}" env --default-signal=INT,QUIT,TERM setsid "$SELF" "${sub[@]}" \
       </dev/null >>"$LOG" 2>&1 & )
   exec 9>&-
   for _ in $(seq 100); do
@@ -370,6 +388,11 @@ launch_run(){   # $1 = root → the run's exit; 3 when one is already going, 1 w
   done
   if [ -z "$pid" ]; then
     echo "cc-green: the run did not start within 10 s — log $LOG:" >&2; tail -5 "$LOG" >&2; return 2
+  fi
+  if [ "$follow" = 0 ]; then
+    echo "cc-green: started ${*:-the gates} on $r (pid $pid) — log $LOG"
+    echo "  \`cc-green wait\` blocks up to 540 s and says when it has ended; exit 3 is still going, so call it again."
+    return 0
   fi
   # The follower is async, so this shell sits in `wait`, which a trapped signal interrupts; a foreground tail would
   # hold the INT back until the run had ended on its own. An async job here starts with INT ignored, so a Ctrl-C
@@ -382,6 +405,48 @@ launch_run(){   # $1 = root → the run's exit; 3 when one is already going, 1 w
   trap - INT TERM HUP
   rc=$(status_field exit)
   [ -n "$rc" ] || { echo "cc-green: the run (pid $pid) was killed before it finished — nothing it ran is trusted" >&2; return 1; }
+  return "$rc"
+}
+suite_ok(){   # $1 = root, $2… = what `-- …` carries. 0 when it is one of the repo's own suites, else says why and 1.
+  # ONLY A SUITE, NEVER A COMMAND. `start` detaches what it runs, and the classifier refuses a worker detaching a
+  # process itself; an open `-- CMD` would have made this the way round that refusal. So the form is fixed — a
+  # tests/ suite with no arguments or a bin/ tool's `selfcheck` — the path is a plain name (no `..`, no absolute
+  # path), and the file is a regular one, not a symlink, that HEAD already tracks, so not a script written a moment
+  # ago. A TOOL MUST SHIP A SELFCHECK: ccbox, cc-rc, cc-trust, cc-boot-notify and cc-heartbeat have none and read the
+  # word as an ordinary argument, so their `selfcheck` would do their real work (security review of PR #675). HEAD's
+  # copy is asked, in the shapes check.sh's ships_selfcheck reads (keep the two the same).
+  # WHAT RUNS IS THE WORKING COPY, not HEAD's: these checks say the file is one the branch has committed, and a
+  # tool whose committed copy has a selfcheck, but an edit made since is run as it stands. That is the same trust
+  # every gate here already gives the tree — a worker can edit tests/check.sh too — and no more than it.
+  local r=$1 p=${2:-} head; shift
+  p=${p#./}
+  if { [ $# = 1 ] && [[ "$p" =~ ^(core/)?tests/(check|selftest)[A-Za-z0-9_-]*\.sh$ ]]; } \
+     || { [ $# = 2 ] && [ "$2" = selfcheck ] && [[ "$p" =~ ^(core/)?bin/[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; }; then
+    if [ -f "$r/$p" ] && [ ! -L "$r/$p" ] && [ -x "$r/$p" ] && head=$(git -C "$r" show "HEAD:$p" 2>/dev/null); then
+      [ $# = 1 ] && return 0
+      if grep -qF "${p##*/} selfcheck:" <<<"$head" ||
+         grep -qE 'selfcheck\)|"selfcheck":|== *\[?"selfcheck"\]?|add_parser\("selfcheck"|def cmd_selfcheck|= *"?selfcheck"?( *\]|$)' <<<"$head"; then
+        return 0
+      fi
+      echo "cc-green: refused: $p ships no selfcheck, so \`$p selfcheck\` would run the tool itself" >&2
+      return 1
+    fi
+    echo "cc-green: $p is not an executable file this branch's HEAD tracks — only a committed suite runs detached" >&2
+    return 1
+  fi
+  echo "cc-green: refused: \`-- $*\` is not one of this repo's suites. \`-- \` takes only [core/]tests/check*.sh or" >&2
+  echo "  selftest*.sh with no arguments, or [core/]bin/<tool> selfcheck; it does not detach any other command." >&2
+  return 1
+}
+run_cmd(){   # $1 = root, $2… = the suite (suite_ok has passed it). The RUN's side of `start -- CMD`: its exit is the run's, and it records nothing
+  local r=$1 gp rc=0; shift
+  echo "cc-green: running $* in $r (pid $$) — log $LOG"
+  # Its own process group, as a gate gets in run_missing, so an INT or TERM on the run takes the command down with it.
+  ( cd "$r" && exec setsid "$@" ) </dev/null 9>&- & gp=$!
+  trap 'kill -TERM -- -"$gp" 2>/dev/null; exit 130' INT TERM
+  wait "$gp" || rc=$?
+  run_traps
+  echo "cc-green: $* exited $rc"
   return "$rc"
 }
 wait_run(){   # $1 = root, $2 = seconds. Returns 3 while a run holds the lock past that, 4 when the last run was killed
@@ -416,9 +481,21 @@ main(){
   # Wait BEFORE taking the tree: the report is on what the working copy holds once the run is over, not before.
   # And lock before it too: the lock is the first thing a run does, so a `wait` behind it has the least to race.
   # A killed run is not green whatever an older record says: exit 1 and no report (3 stays "still going").
-  if [ "$mode" = wait ]; then wait_run "$r" "$2"; case $? in 0) ;; 3) exit 3;; *) exit 1;; esac; fi
-  [ "$mode" = run ] && { launch_run "$r"; exit $?; }
+  if [ "$mode" = wait ]; then wait_run "$r" "$2"; case $? in 0) ;; 3) exit 3;; *) exit 1;; esac
+    # A command's run has no gates to report on: its own exit is the answer (wait_run has said it).
+    [ -z "$(status_field cmd)" ] || { [ "$(status_field exit)" = 0 ]; exit $?; }
+  fi
+  # Every door that takes `-- …` checks it the same way, __run too: the check is on what runs, not on who asked.
+  # (The dispatcher below has already taken the `--` off for run/start; __run still carries it.)
+  case "$mode" in
+    run|start) [ $# -lt 2 ] || suite_ok "$r" "${@:2}" || exit 2 ;;
+    __run)     [ "${2:-}" != -- ] || suite_ok "$r" "${@:3}" || exit 2 ;;
+  esac
+  [ "$mode" = run ] && { shift; launch_run "$r" 1 "$@"; exit $?; }
+  [ "$mode" = start ] && { shift; launch_run "$r" 0 "$@"; exit $?; }
+  [ "$mode" = __run ] && [ "${2:-}" = -- ] && CMD="${*:3}"
   [ "$mode" = __run ] && { take_run "$r" || exit 3; }
+  [ "$mode" = __run ] && [ -n "$CMD" ] && { shift 2; run_cmd "$r" "$@"; exit $?; }
   tree=$(green_tree "$r")
   [ -n "$tree" ] || { echo "cc-green: cannot take this working copy's tree" >&2; exit 2; }
   if [ "$mode" = __run ]; then
@@ -879,6 +956,55 @@ EOS
     k 0 "no user manager answers systemd-run here: the scope cases are not checked"
   fi
 
+  # 28 `start` IS THE WORKER'S ROUTE PAST A FOREGROUND TOOL CALL, with no setsid/nohup/& typed by the caller (the
+  # classifier refused those twice, 2026-09-25). It returns while the gate is still going; `wait` is 3, then the
+  # report. `start -- SUITE` runs one of the repo's own suites in place of the gates, and `wait` answers with its exit
+  # and no gate report — 1 for a suite that failed, 0 for one that passed.
+  D2=$(mktemp -d); R=$(newrepo started 3)
+  : > "$D/started.log"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -n "$(grep 'started the gates on' <<<"$out")")" "start returns 0 once the run is going, and says so"
+  k "$(nt grep -qx check.sh "$D/started.log")" "…before its gate has finished"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 3)" "…so a short wait on it says still running, exit 3"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 20 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -n "$(grep 'green   core/tests/check.sh' <<<"$out")")" "…and a longer one is the gate report, green, exit 0"
+  k "$(t test "$(grep -cx check.sh "$D/started.log")" = 1)" "…one suite ran"
+  mkdir -p "$R/tests" "$R/bin"
+  printf '#!/bin/sh\nsleep 1; echo slow-suite-ran; exit 5\n' > "$R/tests/check-slow.sh"
+  printf '#!/bin/sh\n[ "$1" = selfcheck ] && echo tool-selfcheck-ran\n' > "$R/bin/cc-tool"
+  chmod +x "$R/tests/check-slow.sh" "$R/bin/cc-tool"; ( cd "$R" && git add -A && git commit -qm suites )
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start -- tests/check-slow.sh 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0)" "start -- SUITE returns 0 once the repo's own suite is going"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 20 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'has ended (exit 5)' <<<"$out")")" "…and wait on a suite that failed says its exit, exit 1"
+  k "$(nt grep -q 'core/tests/check.sh' <<<"$out")" "…with no gate report, which would answer a question nobody asked"
+  k "$(t grep -qx slow-suite-ran "$(ls "$D2"/run-*.log)")" "…and the suite's output is in the run's log"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" start -- ./bin/cc-tool selfcheck >/dev/null 2>&1 )
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 20 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -n "$(grep 'has ended (exit 0)' <<<"$out")")" "…a tool's selfcheck runs the same way, and on one that passed, exit 0"
+  # 28b NOTHING ELSE DETACHES. An open `-- CMD` would be a general way round the classifier's refusal of a detached
+  # process (review of PR #675): any command, a tool with other arguments, a path out of the repo, a symlink, a
+  # script HEAD does not track, and __run called straight — each refused, exit 2, and none of them runs.
+  printf '#!/bin/sh\ntouch "%s/escaped"\n' "$D" > "$R/tests/check-new.sh"; chmod +x "$R/tests/check-new.sh"
+  ln -s /bin/true "$R/tests/check-link.sh"
+  printf '#!/bin/sh\ntouch "%s/escaped"\n' "$D" > "$R/bin/cc-nosc"; chmod +x "$R/bin/cc-nosc"
+  ( cd "$R" && git add bin/cc-nosc && git commit -qm nosc )     # tracked, executable, and no selfcheck arm
+  for c in "bin/cc-nosc selfcheck" "sh -c true" "bin/cc-tool rm" "tests/check-slow.sh extra" "../x/tests/check.sh" \
+           "/bin/true" "tests/check-new.sh" "tests/check-link.sh" "bin/../tests/check-new.sh"; do
+    # shellcheck disable=SC2086   # the words are the case
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start -- $c 2>&1 ); rc=$?
+    k "$(t test "$rc" -eq 2 -a -n "$(grep -E 'refused|not an executable file' <<<"$out")")" "start -- $c is refused with a reason, exit 2"
+  done
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" run -- sh -c "touch $D/escaped" 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 2)" "…run -- CMD is refused the same way"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_RUNID=x timeout 20 "$SELF" __run -- sh -c "touch $D/escaped" 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 2)" "…and so is __run -- CMD called straight"
+  sleep 1; k "$(nt test -e "$D/escaped")" "…and not one of them ran"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" start -- >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 2)" "start -- with no command is a usage error, exit 2"
+  rm -rf "$D2"
+
   # THE RECURRING DEFECTS: every catalogue class against its own fixtures, then the report holding a hand-over on one.
   out=$(python3 "$CORE/tests/recurring_defects.py" selftest 2>&1); rc=$?
   k "$rc" "every recurring-defect class goes red on its fixture diff and holds its suppressed cases ($(tail -1 <<<"$out"))"
@@ -900,9 +1026,10 @@ EOS
 
 case "${1:-}" in
   "")        main ;;
-  run)       main run ;;
+  run|start) case "${2-}" in "") main "$1" ;; --) [ $# -gt 2 ] || { echo "$USAGE" >&2; exit 2; }; main "$1" "${@:3}" ;;
+             *) echo "$USAGE" >&2; exit 2 ;; esac ;;
   __run)     [ -n "${CC_GREEN_RUNID:-}" ] || { echo "cc-green: __run is started by \`cc-green run\`, not by hand" >&2; exit 2; }
-             main __run ;;
+             main "$@" ;;
   wait)      case "${2:-540}" in *[!0-9]*|"") echo "$USAGE" >&2; exit 2;; esac; main wait "${2:-540}" ;;
   red)       shift; red "$@" ;;   # no checkout needed: the landing and the loop call this from wherever they are
   selfcheck) selfcheck ;;

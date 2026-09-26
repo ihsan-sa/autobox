@@ -22,9 +22,11 @@ a stop costs a fix iteration, a re-review and a re-lane, all of which reading th
 Run `cc-green`. It takes the tree your working copy would commit and says, per gate, whether a green record
 already exists for it; `cc-green run` runs the ones that do not, one run per worktree, into a log it names. The
 landing then spends those records instead of running the ~22-minute suite again on its own queue, where it is the
-slowest thing in the flow. A gate that long outlives a foreground tool call, so detach it — `setsid nohup cc-green
-run >/dev/null 2>&1 &` — then `cc-green wait` until its exit is not 3 (still going), and read the log it names; a
-background job that dies with your iteration leaves you with no run and no record. A detached run outlives the
+slowest thing in the flow. A gate that long outlives a foreground tool call, so start it with `cc-green start`,
+which detaches the run itself and returns, then `cc-green wait` until its exit is not 3 (still going), and read the
+log it names. One of your repo's own suites that is not a landing gate goes the same way, `cc-green start --
+tests/check-slow.sh` or `cc-green start -- bin/<tool> selfcheck`; it takes a committed suite and nothing else. Never add `setsid`, `nohup` or `&` yourself, because the auto-mode classifier
+refuses those as a bypass, and a `run_in_background` job dies with your iteration. The run outlives the
 iteration: if yours ends while the run is going, the loop waits on it (no model call) and journals its exit and
 log for your next context, which reads that log and finishes.
 
