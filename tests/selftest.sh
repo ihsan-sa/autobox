@@ -608,6 +608,31 @@ rm -f ~/.cc/state/$REPO/c1/.lock
   && [ ! -L ~/.cc/worktrees/$REPO/c1/.cc/done.lock ]; } \
   && ok "…and with plain files back at those names the same command runs as before" \
   || bad "the link check refuses an honest lock too: $(cat "$T/lk3.out")"
+# THE REFUSAL NAMES THE REAL REASON, NOT THE MARK (2026-09-23): an owner-asked row already marked critical, held
+# under essential because another row is already running (one at a time), was told "mark it critical" — a re-mark,
+# a retry and a read of cc-tier's source cost three turns before the real cause (another row running) turned up.
+# Fresh rows: c1/c5/c6 above finished their own scenes and their status is not this test's to depend on.
+# w1, w9 and others (lines 373, 381...) are left `running` for the rest of the suite — parked here so the ONLY
+# row `other_running` can name is other1; otherwise this case would pass or fail on board scan order, not on
+# the fix (cc-tier's other_running prints the FIRST running row it finds across every board on the box).
+running_rows=$("$B/cc-board" json $REPO 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k, t in (d.get("tracks") or {}).items():
+    if isinstance(t, dict) and t.get("status") == "running": print(k)')
+for rr in $running_rows; do "$B/cc-board" status $REPO "$rr" queued >/dev/null 2>&1; done
+"$B/cc-board" add $REPO crit1 "an owner-asked critical row" >/dev/null 2>&1
+"$B/cc-board" set $REPO crit1 critical yes >/dev/null 2>&1
+mkdir -p ~/.cc/state/$REPO/crit1; printf 'Do the crit1 thing.\n' > ~/.cc/state/$REPO/crit1/task.md
+"$B/cc-board" add $REPO other1 "another row already running" >/dev/null 2>&1
+"$B/cc-board" status $REPO other1 running >/dev/null 2>&1
+CC_SPEND_TIER=essential "$B/cc" $REPO crit1 --go "" >"$T/tiername.out" 2>&1; trn=$?
+"$B/cc-board" status $REPO other1 queued >/dev/null 2>&1
+for rr in $running_rows; do "$B/cc-board" status $REPO "$rr" running >/dev/null 2>&1; done
+{ [ "$trn" = 1 ] && grep -q "$REPO/other1 is running" "$T/tiername.out" \
+  && ! grep -qi 'mark it critical\|not marked critical' "$T/tiername.out" && [ -z "$(wins "$REPO/crit1")" ]; } \
+  && ok "a row already marked critical, held because another row is running, is told THAT — not sent back to mark itself critical" \
+  || bad "tier refusal misnamed the cause: rc=$trn $(cat "$T/tiername.out")"
 # THE THREE THAT MUST STAMP NOTHING. A row with no brief (task.md is the brief's one home, and a claim may not
 # quietly become a re-brief), a session row (a channel has no task to finish), and a repository that is not there.
 "$B/cc-board" add $REPO c2 "no brief yet" >/dev/null 2>&1
