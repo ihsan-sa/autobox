@@ -135,3 +135,4 @@ How the conversation itself works — channels, threads, marks, who may do what,
                                          journal, a rule — capped, cited, with COVERAGE and a ticket; `cc-lib --help`
     cc-docs file <pdf> --project P --title T   number, stamp and file a finished PDF (PPP-NNNN-R); `cc-docs find 001-0004`
                                          or words prints the current revision's file; `cc-docs --help`
+    cc-unfiled [--hours 24] [--to F]     PDFs built lately that look finished but are not filed; a daily timer runs it

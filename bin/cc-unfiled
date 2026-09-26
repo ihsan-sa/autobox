@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""cc-unfiled — the daily net under the filing rule: PDFs built lately that look finished but are not in the library.
+
+    cc-unfiled [--hours N] [--root DIR]… [--to FILE]
+        Lists every PDF under the roots (default ~/dev, which holds the member workspaces, ~/.cc/worktrees, which
+        holds every track's, each session scratchpad ~/.cc/tmp/*/*/*/scratchpad, and ~/.cc/slack/files, where a
+        PDF sent to Slack is often left) modified in the last N hours (default 24) that looks like a finished document and that
+        the register (cc-docs, $CC_DOCS_ROOT) does not hold. The list goes to stdout; with --to it is also appended
+        to FILE as one dated journal entry, and nothing is appended when the list is empty. Exit 0 either way.
+    cc-unfiled selfcheck
+
+FILED means the register already holds this content: the same bytes as a filed revision or its filed copy, or the
+same fingerprint cc-docs itself would compare (so an unchanged rebuild of a filed document is filed), or this very
+path filed at or after its last change. A PDF cc-docs cannot fingerprint counts as unfiled.
+
+LOOKS FINISHED is a guess and is meant to err loud: a false entry costs a reader one line, a real miss is the thing
+this exists to end. Skipped: anything under a directory named for inputs or by-products (figures, images, assets,
+tests, fixtures, tmp, scratch, drafts, vendor, third_party, refs, references, inputs, downloads, sources,
+datasheets, old, archive, *.old, node_modules, .git and the like), a file whose name has the word draft, figure, plot,
+test, tmp, scratch, preview or datasheet, a one-page PDF whose page is not letter or A4, which is what a plotted
+figure is, and a PDF whose Creator or Producer is a tool the box does not run (Word, Acrobat, InDesign, iText, a
+vendor's formatter), which is somebody else's document. So is a PDF git holds unchanged from a commit
+older than the window: a new worktree gives every committed PDF a fresh mtime, and none of them was built there.
+A file Slack delivered (cc-slack names a download <stamp>Z-<file id>-<name>) is an input and skipped too.
+A PDF whose bytes are found at several paths is listed once. Everything else is listed, slides included.
+"""
+import datetime
+import glob
+import hashlib
+import importlib.machinery
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser("~")
+SKIP_DIRS = {".git", ".cc", ".venv", "venv", "node_modules", "__pycache__", ".cache", "site-packages",
+             "fig", "figs", "figure", "figures", "img", "imgs", "image", "images", "assets", "plots",
+             "test", "tests", "testdata", "fixtures", "tmp", "temp", "scratch", "draft", "drafts",
+             "vendor", "third_party", "third-party", "refs", "references", "inputs", "downloads", "sources",
+             "datasheets", "old", "archive"}
+# A whole word of the name, so configuration-guide or latest-results is not taken for a figure or a test.
+SKIP_NAME = re.compile(r"(?:^|[^a-z])(draft|figs?|figure|plot|test|tmp|scratch|preview|datasheet)(?:s|[^a-z]|$)", re.I)
+# The tools a PDF somebody else wrote comes out of; the box builds with TeX, KiCad, cairo, Chromium and the like.
+FOREIGN = re.compile(r"acrobat|adobe|microsoft|itext|pdflib|antenna house|xsl formatter|framemaker|indesign|"
+                     r"distiller|pdffactory|bullzip|pdfcreator|quartz|wps|topleaf|windows|macintosh", re.I)
+INBOUND = re.compile(r"^\d{8}T\d{6}Z-F[0-9A-Z]+-")   # cc-slack's name for an attachment it downloaded
+PAPER = [(612, 792), (595, 842)]   # letter, A4, in points
+
+
+def docs_module():
+    """cc-docs itself, loaded from beside this file, so a fingerprint here is exactly the one `file` compares."""
+    return importlib.machinery.SourceFileLoader("ccdocs", os.path.join(BIN, "cc-docs")).load_module()
+
+
+def register(root):
+    try:
+        with open(os.path.join(root, "register.json")) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"documents": {}}
+
+
+def known(reg, root):
+    """(byte hashes, fingerprints, {from path: latest filed_at epoch}) over every revision in the register."""
+    shas, fps, paths = set(), set(), {}
+    for d in reg.get("documents", {}).values():
+        for r in d.get("revisions", []):
+            if r.get("sha256"):
+                shas.add(r["sha256"])
+            if r.get("fingerprint"):
+                fps.add(r["fingerprint"])
+            f = os.path.join(root, r["file"]) if r.get("file") else None
+            if f and os.path.isfile(f):
+                shas.add(sha(f))
+            if r.get("from") and r.get("filed_at"):
+                try:
+                    t = datetime.datetime.strptime(r["filed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=datetime.timezone.utc).timestamp()
+                except ValueError:
+                    continue
+                paths[r["from"]] = max(paths.get(r["from"], 0), t)
+    return shas, fps, paths
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def pdfinfo(path):
+    """(pages, (width, height) of page 1 in points, its Creator and Producer) — (0, None, "") when poppler cannot
+    read it."""
+    r = subprocess.run(["pdfinfo", path], capture_output=True, text=True, errors="replace")
+    p = re.search(r"^Pages:\s+(\d+)", r.stdout, re.M)
+    s = re.search(r"^Page size:\s+([\d.]+) x ([\d.]+) pts", r.stdout, re.M)
+    made = " ".join(re.findall(r"^(?:Creator|Producer):\s*(.*)$", r.stdout, re.M))
+    return (int(p.group(1)) if p else 0), ((float(s.group(1)), float(s.group(2))) if s else None), made
+
+
+def paper(size):
+    if not size:
+        return False
+    w, h = sorted(size)
+    return any(abs(w - a) / a < 0.03 and abs(h - b) / b < 0.03 for a, b in PAPER)
+
+
+def git_lines(d, *args):
+    r = subprocess.run(["git", "-C", d, *args], capture_output=True, text=True)
+    return [x for x in r.stdout.split("\0") if x] if r.returncode == 0 else []
+
+
+def checked_out(d, since):
+    """PDFs in the git tree at d that are only a checkout: tracked, unmodified, and last committed before `since`.
+    A new worktree gives every committed PDF a fresh mtime, and none of them was built there."""
+    pdfs = ("*.pdf", "*.PDF")
+    tracked = set(git_lines(d, "ls-files", "-z", "--", *pdfs))
+    if not tracked:
+        return set()
+    changed = set(git_lines(d, "ls-files", "-z", "-m", "--", *pdfs))
+    recent = set(git_lines(d, "log", f"--since=@{int(since)}", "--name-only", "--format=", "-z", "--", *pdfs))
+    return {os.path.join(d, x) for x in tracked - changed - {r.strip("\n") for r in recent}}
+
+
+def candidates(roots, since):
+    """Every PDF under the roots changed after `since` that looks like a finished document, as (path, pages,
+    mtime, sha256), one per distinct content: a PDF copied into many trees is one document."""
+    seen, shas, skip = set(), set(), set()
+    for root in roots:
+        for d, dirs, files in os.walk(root):
+            if ".git" in dirs or ".git" in files:
+                skip |= checked_out(d, since)
+            dirs[:] = [x for x in dirs if x.lower() not in SKIP_DIRS and not x.lower().endswith(".old")
+                       and not os.path.islink(os.path.join(d, x))]
+            for n in files:
+                if not n.lower().endswith(".pdf") or SKIP_NAME.search(n[:-4]) or INBOUND.match(n):
+                    continue
+                p = os.path.join(d, n)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                rp = os.path.realpath(p)
+                if st.st_mtime < since or not st.st_size or rp in seen or p in skip:
+                    continue
+                seen.add(rp)
+                h = sha(p)
+                if h in shas:
+                    continue
+                shas.add(h)
+                pages, size, made = pdfinfo(p)
+                if pages == 1 and not paper(size):
+                    continue   # a one-page PDF off paper size is a plotted figure
+                if FOREIGN.search(made):
+                    continue   # made by Word, Acrobat, a vendor's formatter: somebody else's document
+                yield p, pages, st.st_mtime, h
+
+
+def unfiled(roots, hours, docs_root):
+    cd = docs_module()
+    shas, fps, paths = known(register(docs_root), docs_root)
+    out = []
+    for p, pages, mtime, h in candidates(roots, time.time() - hours * 3600):
+        if paths.get(p, 0) >= int(mtime) or paths.get(os.path.realpath(p), 0) >= int(mtime):
+            continue   # filed from this path at or after its last change (filed_at is floored to the second)
+        if h in shas:
+            continue
+        try:
+            text = cd.pdftext(p)
+            if cd.fingerprint(p, text) in fps or cd.textprint(text) in fps:
+                continue   # an unchanged rebuild of a filed revision, which `file` would not file again
+        except Exception:
+            pass
+        out.append((p, pages, mtime))
+    return out
+
+
+def entry(found, hours):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    lines = [f"## {now:%Y-%m-%dT%H:%MZ} — unfiled PDFs (cc-unfiled, last {hours:g} h)",
+             f"{len(found)} PDF(s) built lately look finished but are not in the library. File each one meant for a "
+             "person with `cc-docs file <pdf> --project <p> --title <t> --source <src>` (or fix the maker that built "
+             "it so it files itself); drafts and inputs listed here can be ignored."]
+    for p, pages, mtime in found:
+        t = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc)
+        lines.append(f"- {p} ({pages} pp, {t:%Y-%m-%d %H:%MZ})")
+    return "\n".join(lines) + "\n"
+
+
+def selfcheck():
+    n = [0, 0]
+
+    def ok(name, cond):
+        n[0 if cond else 1] += 1
+        print(("  ok   " if cond else "  FAIL ") + name)
+
+    def mkpdf(d, name, body, opts=""):
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name + ".tex"), "w") as f:
+            f.write("\\documentclass{article}" + opts + "\\pagestyle{empty}\\begin{document}" + body
+                    + "\\end{document}\n")
+        subprocess.run(["pdflatex", "-interaction=batchmode", name + ".tex"], cwd=d, capture_output=True)
+        return os.path.join(d, name + ".pdf")
+
+    def docs(root, *args):
+        return subprocess.run([os.path.join(BIN, "cc-docs"), *args], capture_output=True, text=True,
+                              env={**os.environ, "CC_DOCS_ROOT": root, "HOME": root})
+
+    print("cc-unfiled selfcheck")
+    with tempfile.TemporaryDirectory(prefix="cc-unfiled-sc-") as t:
+        # each case builds its own tree and register, so none leans on what an earlier one left behind
+        dev, reg = os.path.join(t, "c1", "dev"), os.path.join(t, "c1", "docs")
+        filed = mkpdf(os.path.join(dev, "proj", "out"), "report", "Filed report\\newpage page two")
+        loose = mkpdf(os.path.join(dev, "kid1", "notes"), "notes", "Unfiled notes\\newpage page two")
+        r = docs(reg, "file", filed, "--project", "proj", "--kind", "work", "--title", "Report",
+                 "--source", filed[:-4] + ".tex")
+        ok("fixture: cc-docs filed the one document", r.returncode == 0)
+        found = [p for p, *_ in unfiled([dev], 24, reg)]
+        ok("an unfiled finished PDF is named", loose in found)
+        ok("a filed one is skipped", filed not in found)
+
+        # an unchanged rebuild (new bytes, new mtime) is still filed; a changed one is not
+        dev, reg = os.path.join(t, "c2", "dev"), os.path.join(t, "c2", "docs")
+        a = mkpdf(os.path.join(dev, "p"), "guide", "Guide one\\newpage two")
+        docs(reg, "file", a, "--project", "p", "--kind", "work", "--title", "Guide", "--source", a[:-4] + ".tex")
+        time.sleep(1.1)
+        mkpdf(os.path.join(dev, "p"), "guide", "Guide one\\newpage two")
+        ok("an unchanged rebuild of a filed PDF is skipped", a not in [p for p, *_ in unfiled([dev], 24, reg)])
+        mkpdf(os.path.join(dev, "p"), "guide", "Guide one, revised\\newpage two")
+        ok("a changed rebuild that was not filed again is named", a in [p for p, *_ in unfiled([dev], 24, reg)])
+
+        # the heuristics: figures, drafts, test output and inputs are skipped; an old PDF is outside the window
+        dev, reg = os.path.join(t, "c3", "dev"), os.path.join(t, "c3", "docs")
+        kept = mkpdf(os.path.join(dev, "w"), "handout", "One-page handout")
+        fig = mkpdf(os.path.join(dev, "w"), "chart", "x", "\\usepackage[paperwidth=4in,paperheight=3in]{geometry}")
+        skips = [mkpdf(os.path.join(dev, "w", "figures"), "a", "In a figures dir\\newpage two"),
+                 mkpdf(os.path.join(dev, "w"), "draft-2", "A draft\\newpage two"),
+                 mkpdf(os.path.join(dev, "w", "tests"), "out", "Test output\\newpage two"),
+                 mkpdf(os.path.join(dev, "w", "references"), "paper", "Somebody else's\\newpage two")]
+        skips.append(mkpdf(os.path.join(dev, "w"), "vendor-part", "\\pdfinfo{/Producer (Acrobat Distiller 9.5)}"
+                           "A vendor's part\\newpage two"))
+        words = [mkpdf(os.path.join(dev, "w"), n, "A finished one\\newpage two")
+                 for n in ("latest-report", "configuration-guide")]
+        skips.append(mkpdf(os.path.join(dev, "w"), "fig3", "A numbered figure\\newpage two"))
+        old = mkpdf(os.path.join(dev, "w"), "old", "Last week\\newpage two")
+        os.utime(old, (time.time() - 3 * 86400,) * 2)
+        found = [p for p, *_ in unfiled([dev], 24, reg)]
+        ok("a one-page PDF on paper size is named", kept in found)
+        ok("a one-page PDF off paper size (a figure) is skipped", fig not in found)
+        ok("figures/, a draft name, tests/, references/ and a PDF Acrobat made are skipped", not set(skips) & set(found))
+        ok("a PDF older than the window is skipped", old not in found)
+        ok("a skip word only counts whole: latest-report and configuration-guide are named", set(words) <= set(found))
+        ok("…while draft-2 and fig3 are still skipped", not {skips[1], skips[-1]} & set(found))
+
+        # a PDF left in the Slack files dir: one sent out is named, one Slack delivered in is skipped
+        files, reg = os.path.join(t, "c7", "files"), os.path.join(t, "c7", "docs")
+        sent = mkpdf(files, "guide", "A guide sent out\\newpage two")
+        got = mkpdf(files, "20260909T062610Z-F0C0BKNN9S7-syllabus", "A syllabus sent in\\newpage two")
+        found = [p for p, *_ in unfiled([files], 24, reg)]
+        ok("a PDF sent to Slack is named", sent in found)
+        ok("a PDF Slack delivered is skipped", got not in found)
+
+        # a committed PDF checked out afresh is not a build; the same PDF rebuilt and changed in that checkout is
+        repo = os.path.join(t, "c5", "dev", "repo")
+        made = mkpdf(os.path.join(t, "c5", "src"), "manual", "Committed manual\\newpage two")
+        os.makedirs(repo)
+        shutil.copy(made, os.path.join(repo, "manual.pdf"))
+        g = ["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(g[:3] + ["init", "-q"], capture_output=True)
+        subprocess.run(g + ["add", "-A"], capture_output=True)
+        subprocess.run(g + ["commit", "-q", "-m", "m", "--date=2020-01-01T00:00:00"],
+                       capture_output=True, env={**os.environ, "GIT_COMMITTER_DATE": "2020-01-01T00:00:00"})
+        found = [p for p, *_ in unfiled([os.path.dirname(repo)], 24, reg)]
+        ok("a PDF git holds unchanged from an old commit is skipped", os.path.join(repo, "manual.pdf") not in found)
+        shutil.copy(mkpdf(os.path.join(t, "c5", "src"), "manual", "Manual, rebuilt\\newpage two"),
+                    os.path.join(repo, "manual.pdf"))
+        found = [p for p, *_ in unfiled([os.path.dirname(repo)], 24, reg)]
+        ok("…and named once rebuilt and changed", os.path.join(repo, "manual.pdf") in found)
+        dup = os.path.join(t, "c5", "dev", "copy", "manual.pdf")
+        os.makedirs(os.path.dirname(dup))
+        shutil.copy(os.path.join(repo, "manual.pdf"), dup)
+        found = [p for p, *_ in unfiled([os.path.join(t, "c5", "dev")], 24, reg)]
+        ok("the same bytes at two paths are listed once", len(found) == 1)
+
+        # --to appends one entry when there is something to say, and nothing when there is not
+        dev, reg = os.path.join(t, "c6", "dev"), os.path.join(t, "c6", "docs")
+        kept = mkpdf(os.path.join(dev, "w"), "summary", "A summary\\newpage two")
+        j = os.path.join(t, "journal.md")
+        with open(j, "w") as f:
+            f.write("# journal\n")
+        rc = main(["--root", dev, "--to", j], docs_root=reg, quiet=True)
+        body = open(j).read()
+        ok("--to appends a dated entry naming the PDF", rc == 0 and "unfiled PDFs" in body and kept in body)
+        empty = os.path.join(t, "c4", "dev")
+        os.makedirs(empty)
+        main(["--root", empty, "--to", j], docs_root=reg, quiet=True)
+        ok("…and appends nothing when nothing is unfiled", open(j).read() == body)
+    print(f"cc-unfiled selfcheck: {n[0]} passed, {n[1]} failed")
+    return 1 if n[1] else 0
+
+
+def main(argv, docs_root=None, quiet=False):
+    import argparse
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    ap = argparse.ArgumentParser(prog="cc-unfiled", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--hours", type=float, default=24)
+    ap.add_argument("--root", action="append")
+    ap.add_argument("--to")
+    a = ap.parse_args(argv)
+    roots = a.root or [os.path.join(HOME, "dev"), os.path.join(HOME, ".cc", "worktrees"),
+                       *sorted(glob.glob(os.path.join(HOME, ".cc", "tmp", "*", "*", "*", "scratchpad"))),
+                       os.path.join(HOME, ".cc", "slack", "files")]
+    docs_root = docs_root or os.environ.get("CC_DOCS_ROOT") or os.path.join(HOME, ".cc", "documents")
+    found = unfiled([r for r in roots if os.path.isdir(r)], a.hours, docs_root)
+    if not quiet:
+        for p, pages, _ in found:
+            print(f"{p}\t{pages} pp")
+    if found and a.to:
+        with open(a.to, "a") as f:
+            f.write("\n" + entry(found, a.hours))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

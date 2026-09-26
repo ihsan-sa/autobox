@@ -3791,7 +3791,7 @@ box_split(){   # <root> <marked files…> → $leak: under a BOX_PATHS default o
 # the run are not found at all.
 C=$T/boxctl; mkdir -p "$C/state/context" "$C/selftest-0" "$C/boards"
 echo "$REPO" > "$C/state/context/handoffs.jsonl"; echo "$REPO" > "$C/state/reconcile.log"
-echo "$REPO" > "$C/old"; touch -d '1 hour ago' "$C/old"; echo "$REPO" > "$C/selftest-0/log"; echo "$REPO" > "$C/boards/$REPO.json"; echo other > "$C/state/clean.log"
+echo "$REPO" > "$C/old"; touch -d "@$(($(stat -c %Y "$T/born") - 3600))" "$C/old"; echo "$REPO" > "$C/selftest-0/log"; echo "$REPO" > "$C/boards/$REPO.json"; echo other > "$C/state/clean.log"
 box_split "$C" $(box_marked "$C")
 [ "$leak" = " $C/state/context/handoffs.jsonl" ] && [ "$seen" = " $C/state/reconcile.log" ] \
   && ok "control: a marker in state/context reads as a leak, one in reconcile.log as a watcher; an old file, a sibling run's, a board file and a clean file are not found" \
