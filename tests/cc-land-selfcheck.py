@@ -232,6 +232,38 @@ def selfcheck():
               and "another gate is already red" in open(f"{probe}/slog").read())
         rc, o = run_gate([f"{probe}/slow.sh"], probe, f"{probe}/log", dict(os.environ), stop=threading.Event())
         check("...while a gate handed a stop nobody sets runs to its own end, green", rc == 0 and "0 failed" in o)
+        # raised-land-gate-hangs-on-a-leaked-child: lessons#100's suite backgrounded a stub server with '&' and never
+        # killed it; the suite exited, the stub held the pipe, and the read waited on it for 40 min with every repo's
+        # landings queued behind. A gate that has exited is read GATE_DRAIN more seconds, then its leftovers go.
+        real_drain = GATE_DRAIN
+        globals()["GATE_DRAIN"] = 0.5
+        with open(f"{probe}/leak.sh", "w") as f:
+            f.write("#!/usr/bin/env bash\n( exec sleep 30 ) &\necho $! > leak.pid\necho '0 failed'\nexit 0\n")
+        with open(f"{probe}/tail.sh", "w") as f:
+            f.write("#!/usr/bin/env bash\n( sleep 0.2; echo 'late line' ) &\necho '0 failed'\nexit 0\n")
+        os.chmod(f"{probe}/leak.sh", 0o755)
+        os.chmod(f"{probe}/tail.sh", 0o755)
+        try:
+            t0 = time.time()
+            rc, o = run_gate([f"{probe}/leak.sh"], probe, f"{probe}/llog", dict(os.environ))
+            took, kid = time.time() - t0, int(open(f"{probe}/leak.pid").read().strip())
+            end, gone = time.time() + 5, False
+            while time.time() < end and not gone:
+                try:
+                    os.kill(kid, 0)
+                    time.sleep(0.05)
+                except OSError:
+                    gone = True
+            if not gone:
+                os.kill(kid, signal.SIGKILL)
+            check("a gate that exits green while a child it backgrounded still holds its output returns green within "
+                  "the drain, says so, and the child is killed — never an hour's wait nor a silence red",
+                  rc == 0 and took < 4 and gone and "still held its output" in o and "0 failed" in o)
+            rc, o = run_gate([f"{probe}/tail.sh"], probe, f"{probe}/tlog", dict(os.environ))
+            check("...while a child that finishes inside the drain has its last line kept, and no kill is said",
+                  rc == 0 and "late line" in o and "still held" not in o)
+        finally:
+            globals()["GATE_DRAIN"] = real_drain
     finally:
         globals()["GATE_IDLE"] = real_idle
         shutil.rmtree(probe, ignore_errors=True)
@@ -839,6 +871,21 @@ def selfcheck():
           and not ran("git worktree add", "cc-land.review.", HEAD)
           and [c for c in calls if c[:2] == ["git", "diff"] and HEAD in c]
           and [c for c in commented() if f"merged onto main `{BASE_SHA[:12]}`" in c[-1]])
+    # …and it is the SAME base the gates merged onto: a sibling landing's pull can move origin/main between the
+    # gates' merge and the read beside them, and the read must not follow it.
+    saved, L = (list(calls), list(cwds), list(envs)), fresh(pr=7)
+    L.head = L.gated = HEAD
+    L.gate_base = "ab" * 20
+    calls.clear()
+    L.merge_base()
+    pinned = L.base_ref() == "ab" * 20 and ran("git merge-base", "ab" * 20, HEAD) and not ran("git merge-base", "origin/main")
+    L.gated = "cd" * 20             # the gates gated another head: their base says nothing of this one
+    calls.clear()
+    L.merge_base()
+    check("the review and its diff read the base SHA the gates merged the head onto, not wherever origin/main is by "
+          "then — and only while the gates gate that same head",
+          pinned and L.base_ref() == "origin/main" and ran("git merge-base", "origin/main", HEAD))
+    calls[:], cwds[:], envs[:] = saved   # the checks below read the review run's own calls
     argv = [c for c in calls if c[0] == CLAUDE][0]
     add = argv[argv.index("--add-dir") + 1]
     check("everything the reviewer can reach is the throwaway directory this landing made — the diff it reads "
@@ -7031,11 +7078,19 @@ def selfcheck():
         # anyway — every commit it asks carries that red, so it ends at "before" after log2(n)+1 full runs (2h46m).
         ALLRED = {"ee": False, "41": False, "42": False, "43": False, "44": False}
         lines = after(ALLRED, red=S(0x40))
-        check("red after a batch that began on a base already noted red: said at once — no bisect, nothing reverted, "
-              "nothing installed, the new tip noted",
-              asked == [("ee", "suite"), ("ee", "suite2")] and not reverted and not deployed
+        check("red after a batch that began on a base already noted red, and red at its first merge: said with one "
+              "run there — no bisect, nothing reverted, nothing installed, the new tip noted",
+              asked == [("ee", "suite"), ("ee", "suite2"), ("41", "first")] and not reverted and not deployed
               and "already red" in lines[-1] and "Not bisected" in lines[-1]
               and (read_json(red_base_path("myrepo")) or {}).get("tip") == "ee" * 20)
+        # #694's security read: a batch [fix, re-break] begun on a red tip — #41 mends the base, #43 breaks it again.
+        # The first merge is green, so the bisect runs from there, names #43 and reverts it, never asking the red base.
+        lines = after({"ee": False, "43": False, "44": False}, red=S(0x40))
+        check("…but GREEN at its first merge (#41 mended the red base, #43 broke it again): bisected from there, #43 "
+              "named and reverted, the base's parent never asked",
+              asked == [("ee", "suite"), ("ee", "suite2"), ("41", "first"), ("44", "bisect"), ("42", "bisect"),
+                        ("43", "bisect"), ("aa", "suite3")]
+              and reverted == [43] and deployed and ("40", "bisect") not in asked)
         lines = after(ALLRED, red=S(0x3e))
         check("…but a red note on some OTHER tip than the batch's base does not stop the bisect",
               ("41", "bisect") in asked and not reverted and any("already red before" in l for l in lines))
@@ -7281,7 +7336,10 @@ def selfcheck():
                    {"bid": "b3", "before": BEFORE, "members": "97", "pre": []},
                    {"bid": "b3", "before": BEFORE, "members": [[97, 5]], "pre": []},
                    {"bid": "b3", "before": BEFORE, "members": [[97, ["f97"]]], "pre": ["x"]},
-                   {"bid": "b3", "before": {"x": 1}, "members": [[97, ["f97"]]], "pre": []}]
+                   {"bid": "b3", "before": {"x": 1}, "members": [[97, ["f97"]]], "pre": []},
+                   # #694's security read: json writes and reads Infinity, and int() of it is an OverflowError
+                   {"bid": "b3", "before": BEFORE, "members": [[float("inf"), ["f97"]]], "pre": []},
+                   {"bid": "b3", "before": BEFORE, "members": [[97, ["f97"]]], "pre": [float("inf")]}]
             said = []
             for rec in bad:
                 handed.clear()
@@ -7293,7 +7351,7 @@ def selfcheck():
                 said.append(bool(lines) and "could not be read" in lines[0] and not handed
                             and not os.path.exists(batch_path("myrepo")))
             check("…a note that parses but is malformed (a PR that is not a number, a member without files, members "
-                  "not a list, files not a list, a bad `pre`, a bad `before`) is dropped and said, never a crash",
+                  "not a list, files not a list, a bad `pre`, a bad `before`, an Infinity) is dropped and said, never a crash",
                   all(said) and len(said) == len(bad))
         finally:
             globals().update(after_batch=_ab, run_one=_ro, batch_of=_bo)
@@ -7352,6 +7410,22 @@ def selfcheck():
             check("…and the process it starts runs after_batch on exactly those merges, at the last of them, then "
                   "drops the record",
                   handed == [(CODE, CODE[-1][1], suite_path("myrepo", "b15"))] and lines == ["the suite spoke"] and not os.path.exists(suite_path("myrepo", "b15")))
+            # #694's security read: the suite record wants the same shape check as the batch note. Each malformed
+            # `merged` is dropped and said, and after_batch never sees it; the well-formed one above did run.
+            said = []
+            for m in ([[83, S(0x83)]], [["83", S(0x83), []]], [[83, "HEAD~1", []]], [[83, S(0x83), "f"]],
+                      [[float("inf"), S(0x83), []]], "83", [[83, S(0x83), [7]]]):
+                handed.clear()
+                write_atomic(suite_path("myrepo", "b18"), {"repo": "myrepo", "bid": "b18", "merged": m})
+                try:
+                    lines = run_suite_record("myrepo", suite_path("myrepo", "b18"))
+                except Exception as e:        # the crash this case exists to catch
+                    lines = [f"crashed: {e!r}"]
+                said.append(bool(lines) and "could not be read" in lines[0] and not handed
+                            and not os.path.exists(suite_path("myrepo", "b18")))
+            check("…a suite record whose merges are malformed (a member short of a field, a PR that is not a number, "
+                  "a SHA that is not hex, files not a list, an Infinity, merges not a list, a file not a string) is "
+                  "dropped and said, never a crash and never a suite", all(said) and len(said) == 7)
             # A suite whose process died is started again by the next lane; one whose process lives is left alone.
             spawned.clear()
             write_atomic(suite_path("myrepo", "b16"), {"repo": "myrepo", "bid": "b16", "merged": CODE, "pid": 2 ** 22 + 7})

@@ -131,7 +131,9 @@ WHAT IT WILL NOT DO:
     the other two; the stop never says re-queue, which is what produced it. A review a usage limit or its own cap
     killed is not a buy. A fix anybody pushed after a LAND-AFTER-FIX counts as the round. A refusal reached at
     the wall is re-checked against the PR first.
-  · Time a gate on the clock: it is timed on its SILENCE — a suite waiting on a lock says so every minute.
+  · Time a gate on the clock: it is timed on its SILENCE — a suite waiting on a lock says so every minute. Nor wait on
+    what a gate left behind: once the gate itself exits, its output is read GATE_DRAIN seconds more and whatever it
+    started that still holds the pipe is killed, the gate's own exit standing as its result.
   · Leave a gate running once the landing is lost: the first red gate, or a read beside them answering LAND-AFTER-FIX
     or DO-NOT-LAND, kills the others' process groups. A lander killed by SIGTERM or SIGHUP kills its gates as it goes
     (on_death), and every gate carries CC_LAND_GATE_OF=<its lander's pid>, so each sweep kills the groups of a lander
@@ -228,6 +230,7 @@ def gate_slots():
 
 SUITE_SLOTS = gate_slots()
 GATE_IDLE = 3600                          # a gate that has said nothing for this long is killed: silence, not wall clock
+GATE_DRAIN = 10                           # how long a gate's output is still read after the gate itself exits, before what it left is killed
 FAIL_LOG_KEEP = 256 * 1024                # what stays of a red gate's log after the run: its last bytes
 # The review gate: one generic prompt beside this script (core/config/); a repo's own rules are docs/REVIEW.md, read from the base branch, never the PR. CC_CLAUDE points the model elsewhere.
 CLAUDE = os.environ.get("CC_CLAUDE", f"{HOME}/.local/bin/claude")
@@ -558,7 +561,7 @@ def disk_full(text=""):
 
 
 def run_gate(argv, cwd, log, env, stop=None):
-    """Run one gate in its own process group, streaming its output to `log` as it runs; killed (the whole group) only after GATE_IDLE seconds of silence, never on wall clock, or within a second of `stop` (a threading.Event) being set, which raises GateStopped. Returns (rc, output) like sh()."""
+    """Run one gate in its own process group, streaming its output to `log` as it runs; killed (the whole group) only after GATE_IDLE seconds of silence, never on wall clock, or within a second of `stop` (a threading.Event) being set, which raises GateStopped. Once the gate itself exits, its output is read for GATE_DRAIN seconds more and then whatever it left in its group is killed: a child it backgrounded and never stopped holds the pipe open, and lessons#100's stub server held every repo's landings 40 min that way (2026-09-20). Returns (rc, output) like sh(), rc the gate's own."""
     out_, f = [], None
     with contextlib.suppress(OSError):
         f = open(log, "w")
@@ -582,9 +585,18 @@ def run_gate(argv, cwd, log, env, stop=None):
         return 127, f"{e.__class__.__name__}: {e}"
     _GATES.add(p)
     try:
-        quiet = time.monotonic()
+        quiet, ended = time.monotonic(), None
         while True:
             ready = select.select([p.stdout], [], [], min(GATE_IDLE, 1))[0]
+            if ended is None and p.poll() is not None:
+                ended = time.monotonic()
+            if ended is not None and time.monotonic() - ended >= GATE_DRAIN:
+                kill_group(p)            # the gate is done; what still holds its pipe is a leak of its own, not the gate
+                line = (f"\ncc-land: {os.path.basename(argv[0])} exited {p.returncode}, but something it started still "
+                        f"held its output {GATE_DRAIN:g} s later — killed\n")
+                out_.append(line.encode())
+                put(line)
+                break
             if stop is not None and stop.is_set():   # a sibling is red: #617's selftest ran 38 min past its red check.sh
                 kill_group(p)
                 p.wait()
@@ -1913,7 +1925,7 @@ class Land:
         self.by = ""             # which model actually read it, so the PR comment cannot claim a different one
         self.stood = ""          # the last verdict this box wrote on the PR for any change of it (prior_review)
         self._ckey = None        # (head, digest): what change this IS — see change_key()
-        self._mb = None          # (head, merge-base, why): where it left the base — see merge_base()
+        self._mb = None          # ((head, base_ref), merge-base, why): where it left the base — see merge_base()
         self._tier = None        # (head, tier, why): decided ONCE per head and shared by the review and the gates
         self._scope = None       # ((head, paths), scope): gate_scope's answer, which asks cc-config and git once per head
         self.span = span         # (installed_sha, tip_sha): a deploy with no PR, catching the box up to a merge it missed
@@ -1949,6 +1961,7 @@ class Land:
         self.warm_only = False   # --warm: the static gates and the read, no merge, the outcome written on the job (warm_done)
         self.warm = None         # …and, in the batch's merge pass, what that warm wrote (spend_warm)
         self.warm_base = ""      # …the base SHA the warm's merge was built on, for the pass that spends it
+        self.gate_base = ""      # …the base SHA this run's gates merged the head onto: the review and its diff read that one (base_ref)
         self.warm_suites = []    # …and the suites the head has no worker green for, which the warm's gates run itself
         self.batch = ""          # the batch this landing merges with: its deploy waits for the batch's suite (after_batch)
         self.deploy_waits = ""   # …or why a landing's own install stood down for a batch's suite (install_waits)
@@ -2170,7 +2183,7 @@ class Land:
         # its three findings were already fixed on main (raised-review-reads-a-stale-base, 2026-09-16). A merge git
         # cannot build falls back to the head alone, and the header then names no base.
         with git_lock(self.root):
-            at, self.read_on, _ = merge_result(self.root, f"origin/{self.base()}", self.head)
+            at, self.read_on, _ = merge_result(self.root, self.base_ref(), self.head)
         tmp, tree = self.head_checkout("review", fetch=False, at=at)   # fetched above, to answer "read this head already?"
         try:
             dpath = f"{tmp}/pr-{self.pr}.diff"
@@ -2292,11 +2305,16 @@ class Land:
         why.doomed = True
         return why
 
+    def base_ref(self):
+        """The base this head is read and diffed against: the SHA this run's gates merged it onto (gate_base) while they gate this head, else origin/<base>. The brief: "the review's base equals the gate's merge base" — a sibling landing's pull can move origin/<base> between the gates' merge and the read beside them."""
+        return self.gate_base if self.gate_base and self.gated == self.head else f"origin/{self.base()}"
+
     def merge_base(self):
-        """Where this head left origin/<base>, as (sha, why): why is git's last line when the ask failed, and '' when it answered. Cached per head: the fork point does not move under a head that has not."""
-        if not (self._mb and self._mb[0] == self.head):
-            rc, o = sh(["git", "merge-base", f"origin/{self.base()}", self.head], cwd=self.root, timeout=120)
-            self._mb = (self.head, (o.split() or [""])[0] if rc == 0 else "", (last(o) or f"exit {rc}") if rc else "")
+        """Where this head left the base (base_ref), as (sha, why): why is git's last line when the ask failed, and '' when it answered. Cached per head and base: the fork point does not move under a head that has not."""
+        ref = self.base_ref()
+        if not (self._mb and self._mb[0] == (self.head, ref)):
+            rc, o = sh(["git", "merge-base", ref, self.head], cwd=self.root, timeout=120)
+            self._mb = ((self.head, ref), (o.split() or [""])[0] if rc == 0 else "", (last(o) or f"exit {rc}") if rc else "")
         return self._mb[1:]
 
     def pr_diff(self, *flags, **kw):
@@ -2450,6 +2468,7 @@ class Land:
             # when the head already held it.
             self.merged_on = base_sha if mtree else ""
             self.warm_base = base_sha or ""     # …and the base the warm's merge was built on, for warm_done
+            self.gate_base = base_sha or ""     # …and the one the review beside them reads (base_ref)
             self.merge_unbuilt = not at   # merge_result gives the head back when the head already holds the base and
             if self.merge_unbuilt:        # "" only when it could not answer: the same empty merged_on, two meanings
                 out("!", f"the merge of {self.base()} with the head could not be built — an unfetched base, "
@@ -4516,9 +4535,9 @@ def suite_on(repo, sha, scope, step="suite"):
         L.drop_checkout(tmp, tree)
 
 
-def bisect_batch(repo, merged, scope, tip=""):
-    """Which merge of `merged` ([(pr, sha, files)] in merge order) broke the base, as (kind, hit): ("pr", (pr, sha, files)) for the first red one by binary search over the commits themselves, each asked of suite_on — log2(n) runs; ("before", None) when the base was ALREADY red before the first of them (asked only when the first is red); ("after", None) when the LAST of them is green, so the red came from something merged after the batch. The last is always RUN, never assumed red — unless it IS `tip`, the commit the batch's suite already found red twice. Never a revert of a PR that broke nothing."""
-    lo, hi, seen = 0, len(merged), {}
+def bisect_batch(repo, merged, scope, tip="", green_from=0):
+    """Which merge of `merged` ([(pr, sha, files)] in merge order) broke the base, as (kind, hit): ("pr", (pr, sha, files)) for the first red one by binary search over the commits themselves, each asked of suite_on — log2(n) runs; ("before", None) when the base was ALREADY red before the first of them (asked only when the first is red); ("after", None) when the LAST of them is green, so the red came from something merged after the batch. The last is always RUN, never assumed red — unless it IS `tip`, the commit the batch's suite already found red twice. `green_from` is an index already found green (1 = the first merge), where the search starts. Never a revert of a PR that broke nothing."""
+    lo, hi, seen = green_from, len(merged), {green_from: True} if green_from else {}
     if tip and merged[-1][1] == tip:
         seen[hi] = False
 
@@ -4606,7 +4625,7 @@ def resume_batch(repo):
             raise ValueError("the batch note's fields are not the shapes land_batch writes")
         members = [(int(m[0]), [str(p) for p in m[1]]) for m in raw]
         pre = {int(p) for p in pre}
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # int(Infinity), which json reads as a float, is an OverflowError (security read of #694)
         # Readable JSON, unreadable batch: dropped and ledgered like a note that would not parse — never a crash of
         # the lane, which would leave every repo's queue behind it (security read of #640).
         with contextlib.suppress(OSError):
@@ -4685,7 +4704,7 @@ def revert_pr(repo, pr, sha, why):
 
 
 def after_batch(repo, merged, tip="", record="", reverts=()):
-    """Phase 3, once per batch: ONE suite on the base, at its tip (or at `tip`, the batch's own last merge, when its suite runs beside the lane: the next batch may have merged since — or the last of `reverts`, an earlier suite's revert of a squash that merge still holds: run_suite_record), scoped to the batch's paths when they fit WIDE_FILES (else everything). Green: the deploy the members skipped (deploy_due, run here). Red: believed on a second run only; on a base an earlier suite noted red (red_base_path names the first merge's parent) it is said without a bisect, since every commit asked would carry that red; otherwise bisected to the merge that broke it (bisect_batch), that PR reverted and announced (revert_pr), and the suite run once more on what is left; still red, or a red the batch did not make, is SAID, the tip is noted for the catch-up to leave alone (red_base_path), and nothing is installed. Returns its lines."""
+    """Phase 3, once per batch: ONE suite on the base, at its tip (or at `tip`, the batch's own last merge, when its suite runs beside the lane: the next batch may have merged since — or the last of `reverts`, an earlier suite's revert of a squash that merge still holds: run_suite_record), scoped to the batch's paths when they fit WIDE_FILES (else everything). Green: the deploy the members skipped (deploy_due, run here). Red: believed on a second run only; on a base an earlier suite noted red (red_base_path names the first merge's parent) the suite runs once at the first merge — red there, it is said without a bisect, since every commit asked would carry that red; green there, the batch mended it and broke it again, so the bisect starts from it; otherwise bisected to the merge that broke it (bisect_batch), that PR reverted and announced (revert_pr), and the suite run once more on what is left; still red, or a red the batch did not make, is SAID, the tip is noted for the catch-up to leave alone (red_base_path), and nothing is installed. Returns its lines."""
     lines = []
     if not merged:
         return lines
@@ -4718,7 +4737,15 @@ def after_batch(repo, merged, tip="", record="", reverts=()):
         return lines + [text]
     noted = ((read_json(red_base_path(repo)) or {}).get("tip") or "") if not ok else ""
     first = sh(["git", "rev-list", "--parents", "-n", "1", merged[0][1]], cwd=root, timeout=60)[1].split() if noted else []
-    if noted and first[1:] == [noted]:
+    green_from = 0
+    if noted and first[1:] == [noted] and len(merged) > 1:
+        # The batch began on a tip an earlier suite already found red. One run at its FIRST merge says whether that
+        # red is still there: a batch [fix, re-break] mended it and broke it again, and only a bisect names the second
+        # (security read of #694). Still red there, and the old cut stands.
+        green_from = 1 if suite_on(repo, merged[0][1], scope, step="first")[0] else 0
+        ledger(f"batch-first {repo} {merged[0][1][:12]} (PR #{merged[0][0]}) on red base {noted[:12]}: "
+               f"{'green — bisecting' if green_from else 'red'}")
+    if noted and first[1:] == [noted] and not green_from:
         # The batch began on a tip an earlier suite already found red and nobody has mended: every commit the bisect
         # could ask carries that red, so it would end at "before" after log2(n)+1 full runs (2h46m once) and name no PR.
         write_atomic(red_base_path(repo), {"tip": tip, "at": stamp(), "why": why})
@@ -4731,7 +4758,7 @@ def after_batch(repo, merged, tip="", record="", reverts=()):
         return lines + [text]
     if not ok:
         lines.append(f"[{repo}] batch ({prs}): the suite on {base} at {tip[:12]} is red twice — {why}; bisecting")
-        kind, hit = bisect_batch(repo, merged, scope, tip=tip)
+        kind, hit = bisect_batch(repo, merged, scope, tip=tip, green_from=green_from)
         if kind != "pr":
             write_atomic(red_base_path(repo), {"tip": tip, "at": stamp(), "why": why})
             if kind == "before":
@@ -4859,7 +4886,7 @@ def spawn_suite(repo, path):
 
 
 def run_suite_record(repo, path):
-    """The suite at `path` (batch_suite), one at a time per repo under the lane's `suite` flock: after_batch on its merges, then the record goes. Returns after_batch's lines."""
+    """The suite at `path` (batch_suite), one at a time per repo under the lane's `suite` flock: after_batch on its merges, then the record goes. A record whose merges are not the shapes batch_suite writes (suite_merges) is dropped and ledgered (suite-lost), never run. Returns after_batch's lines."""
     os.makedirs(lane_dir(), exist_ok=True)
     lock = open(lane_file(repo, "suite"), "w")
     try:
@@ -4869,7 +4896,14 @@ def run_suite_record(repo, path):
             return []                             # run already, by a process that finished while this one waited
         with contextlib.suppress(OSError):
             write_atomic(path, dict(rec, pid=os.getpid()))
-        merged = [tuple(m) for m in rec.get("merged") or []]
+        merged = suite_merges(rec.get("merged"))
+        if merged is None:
+            # A record whose merges are not the shapes batch_suite writes is dropped and ledgered, never a crash of the
+            # suite: the same check resume_batch makes of a batch note (security read of #694).
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            ledger(f"suite-lost {repo} {rec.get('bid') or '?'} — its record is malformed; the catch-up deploys the tip")
+            return [f"[{repo}] a batch suite's record could not be read — dropped; the catch-up handles the tip"]
         tip = merged[-1][1] if merged else ""
         # An earlier batch's suite, run while this one waited, may have reverted a squash this batch merged on top of:
         # the revert lands after these merges, so the suite runs where the base holds it, not at the last merge,
@@ -4882,6 +4916,20 @@ def run_suite_record(repo, path):
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
+
+
+def suite_merges(raw):
+    """A suite record's `merged` as [(pr, sha, files)], or None when it is not the shape batch_suite writes: a list of [int, 40-64 hex, [str…]]."""
+    if not isinstance(raw, list):
+        return None
+    got = []
+    for m in raw:
+        if not (isinstance(m, list) and len(m) == 3 and type(m[0]) is int and isinstance(m[1], str)
+                and re.fullmatch(r"[0-9a-f]{40,64}", m[1]) and isinstance(m[2], list)
+                and all(isinstance(f, str) for f in m[2])):
+            return None
+        got.append((m[0], m[1], m[2]))
+    return got
 
 
 def reverts_since(root, sha, tip):
