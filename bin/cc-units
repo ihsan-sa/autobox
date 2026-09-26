@@ -33,7 +33,18 @@ command -v jq >/dev/null 2>&1 || { echo "cc-units: jq is missing" >&2; exit 2; }
 [ -f "$M" ] || { echo "cc-units: no manifest at $M" >&2; exit 2; }
 
 rows(){ jq -r '.units[] | [.unit, .enable, .start, .health, .restart] | @tsv' "$M"; }
-cell(){ jq -r --arg u "$1" --arg f "$2" '.units[] | select(.unit==$u) | .[$f] // ""' "$M"; }
+# `policy` reads every manifest a landing does (manifests(), defined below) — not just $M — because a unit only
+# the overlay declares (its own enable=owner among them) is invisible to a bare `jq .. "$M"` and a landing that
+# asked would always hear silence and enable it anyway: this is the gap #679's review caught (config/units.json's
+# enable=owner on a new overlay timer changed nothing, because cc-land's `unit_policy` asked only the core file).
+cell(){
+  local u="$1" f="$2" t m d v
+  while IFS=$'\t' read -r t m d; do
+    v=$(jq -r --arg u "$u" --arg f "$f" '.units[] | select(.unit==$u) | .[$f] // empty' "$m")
+    [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
+  done < <(manifests)
+  return 0
+}
 CT="$(cd "$(dirname "$M")/.." && pwd)"   # the tree $M describes — its rows' paths are relative to this
 ROOT="${OV:-$CT}"                        # …and so is a changed path handed to restart-for, unless --root says otherwise
 
@@ -248,8 +259,9 @@ selfcheck(){
                  "restart": ["bin/graphs", "serve"] } ] }
 J
   cat > "$T/config/units.json" <<'J'
-{ "units": [ { "unit": "dash.service",  "restart": "restart", "paths": ["dashboard", "bin-private/dashsrc"] },
-             { "unit": "quiet.service", "restart": "restart", "paths": ["quiet"] } ],
+{ "units": [ { "unit": "dash.service",  "restart": "restart", "enable": "owner", "paths": ["dashboard", "bin-private/dashsrc"] },
+             { "unit": "quiet.service", "restart": "restart", "paths": ["quiet"] },
+             { "unit": "tool.service", "enable": "owner" } ],
   "daemons": [ { "daemon": "site", "runs": "bin-private/site", "restart": "owner" } ] }
 J
   printf '[Service]\nExecStart=%%h/bin/tool run\n' > "$T/core/config/systemd-user/tool.service"
@@ -284,6 +296,18 @@ J
   k "$(t grep -qx 'site	owner	bin-private/site' <<<"$out")" "an overlay's own daemon is read, its paths default to the file it runs, and restart=owner comes back as that word — the landing names it instead of restarting it"
   out=$(df --root "$T/elsewhere" core/bin/graphs bin-private/site)
   k "$(t test -z "$out")" "…and landing ANOTHER repo declares none of them"
+
+  # `policy` used to answer only from $M — a unit an overlay declares (its own enable=owner among them) came back
+  # empty, and cc-land's unit_policy(u, "enable") == "owner" check never held: a landing enabled a brand new
+  # overlay timer straight past the owner (#679's review). It must read every manifest a landing does.
+  pl(){ CC_UNITS_MANIFEST="$T/core/config/units.json" CC_UNITS_DIR="$T/core/config/systemd-user" \
+        CC_UNITS_OVERLAY="$T" "$0" policy "$@"; }
+  k "$(t test "$(pl tool.service enable)" = required)" "policy answers a core-declared field from the core manifest"
+  k "$(t test "$(pl dash.service enable)" = owner)" "…and an OVERLAY-declared field too — the gap #679's review caught"
+  k "$(t test "$(pl tool.service enable)" = required)" "a unit both manifests name answers from core — the overlay only fills a field core leaves blank"
+  k "$(t test -z "$(pl quiet.service enable)")" "…and a field no row names comes back empty, not a stale answer"
+  k "$(t test -z "$(pl no-such.service enable)")" "…and a unit no manifest declares comes back empty, not an error"
+  unset -f pl
 
   # a manifest with a typo in it must not read as "this tree declares nothing": jq complains on stderr and keeps
   # going, and an empty answer that exits 0 is what a landing believes
