@@ -58,7 +58,9 @@ THE TICK (--apply, unfiltered): after the reconcile it runs, in order,
 
 SWEEP (`sweep`): per repo, in order. Rule 1: a `merged`/`done` row past 48 h with a clean worktree and nothing
 alive in it → `cc rm`; dirty, alive, or the snapshot disagreeing → reported. Rule 2: a remote track/* branch
-whose PR MERGED → deleted on origin (one `gh pr list` per repo, 200 PRs); any other PR state is reported.
+whose PR MERGED → deleted on origin (one `gh pr list` per repo, 200 PRs) once, at the merge: only while origin's
+tip is still the merged PR's head. A tip pushed after the merge is reported, never deleted, and a `session` row's
+branch is never touched — a seat's branch outlives each PR. Any other PR state is reported.
 Rule 3: a bare tmux window (session main) of a gone or terminal track → killed; `<track>~next` follows its base.
 Rule 4: never the planning window, a live pane, or a row that is not terminal. Rule 6 (box-wide): a
 `_cc<suite><pid>` fixture whose pid is dead → removed, its windows killed, its handoff-ledger lines dropped;
@@ -1186,12 +1188,12 @@ def pane_bare(wid):
 
 
 def pr_states(repo, net=True):
-    """{branch: (STATE, merged_at)} from one `gh pr list`; None when GitHub could not be asked."""
+    """{branch: (STATE, merged_at, head_oid)} from one `gh pr list`; None when GitHub could not be asked."""
     cwd = f"{DEV}/{repo}"
     if not net or not shutil.which("gh") or not os.path.isdir(cwd):
         return None
     p = sh("gh", "pr", "list", "--state", "all", "--limit", str(SWEEP_PRS), "--json",
-           "number,state,headRefName,mergedAt", cwd=cwd, timeout=60)
+           "number,state,headRefName,headRefOid,mergedAt", cwd=cwd, timeout=60)
     try:
         rows = json.loads(p.stdout) if p is not None and p.returncode == 0 else None
     except Exception:
@@ -1200,21 +1202,23 @@ def pr_states(repo, net=True):
         return None
     out = {}
     for r in rows:                                      # newest first: an older PR on the branch never overwrites
-        out.setdefault(r.get("headRefName") or "", (str(r.get("state", "")).upper(), epoch(r.get("mergedAt"))))
+        out.setdefault(r.get("headRefName") or "", (str(r.get("state", "")).upper(), epoch(r.get("mergedAt")),
+                                                    str(r.get("headRefOid") or "")))
     return out
 
 
 def pr_of(prs, branch):
-    """('?', 0.0) when GitHub could not be asked; (None, 0.0) when the branch has no PR."""
-    return ("?", 0.0) if prs is None else (prs.get(branch) or (None, 0.0))
+    """(STATE, merged_at, head_oid); ('?', 0.0, '') when GitHub could not be asked; (None, 0.0, '') when the branch
+    has no PR."""
+    return ("?", 0.0, "") if prs is None else (prs.get(branch) or (None, 0.0, ""))
 
 
 def remote_tracks(repo):
-    """The track/* branches on origin, or None when origin could not be listed."""
+    """{branch: tip sha} for the track/* branches on origin, or None when origin could not be listed."""
     p = sh("git", "-C", f"{DEV}/{repo}", "ls-remote", "--heads", "origin", "refs/heads/track/*", timeout=60)
     if p is None or p.returncode != 0:
         return None
-    return [ln.split("refs/heads/")[-1] for ln in p.stdout.splitlines() if "refs/heads/track/" in ln]
+    return {ln.split("refs/heads/")[-1]: ln.split()[0] for ln in p.stdout.splitlines() if "refs/heads/track/" in ln}
 
 
 def newest_write(path):
@@ -1309,13 +1313,19 @@ def track_verdict(f):
 
 
 def branch_verdict(f):
-    """Rule 2, pure: {board, pr, dirty} → (delete|report|keep, why). Only MERGED is proof."""
+    """Rule 2, pure: {board, kind, pr, head, tip, dirty} → (delete|report|keep, why). Only MERGED is proof, and only
+    of the tip it merged: the delete happens once, at the merge, never again on each pass."""
+    if f.get("kind") == "session":      # "never the branch of a living session row whose branch outlives each PR"
+        return ("keep", "")
     if f["board"] and f["board"] not in TERMINAL:
         return ("keep", "")
     if f["dirty"]:
         return ("report", "its worktree has uncommitted changes")
-    if f["pr"] == "MERGED":
+    if f["pr"] == "MERGED" and f.get("head") and f.get("tip") == f["head"]:   # "once, at the merge"
         return ("delete", "its PR is merged")
+    if f["pr"] == "MERGED":
+        return ("report", "its PR merged, but origin's tip is not the head that merged — work pushed after it is kept"
+                if f.get("head") else "its PR merged, but the head that merged could not be read")
     if f["pr"] in ("OPEN", "CLOSED"):
         return ("report", f"its PR is {f['pr'].lower()}")
     return ("report", "its PR state could not be read" if f["pr"] == "?" else "no PR was ever opened for it")
@@ -1435,10 +1445,13 @@ def sweep_repo(repo, r, snap, net=True, stale=STALE):
         for b in sorted(branches):
             track = b[len("track/"):]
             t = tracks.get(track) or {}
-            verdict, why = branch_verdict({"board": t.get("status", ""), "pr": pr_of(prs, b)[0],
+            state, _, head = pr_of(prs, b)
+            verdict, why = branch_verdict({"board": t.get("status", ""), "kind": t.get("kind") or "track",
+                                           "pr": state, "head": head, "tip": branches[b],
                                            "dirty": dirty(t.get("worktree") or f"{WTS}/{repo}/{track}")})
             if verdict == "delete":
-                r.act(repo, "delete", f"origin/{b}", why, ["git", "-C", f"{DEV}/{repo}", "push", "origin", "--delete", b])
+                r.act(repo, "delete", f"origin/{b}", why, ["git", "-C", f"{DEV}/{repo}", "push", "origin",   # the lease: a
+                      f"--force-with-lease=refs/heads/{b}:{branches[b]}", "--delete", b])   # push since ls-remote survives
             elif verdict == "report":
                 r.report(repo, f"origin/{b}", why)
     for name, (wid, _) in windows().items():                          # 3 and 4 — windows; `<repo>` itself is never one
@@ -1457,7 +1470,7 @@ def sweep_repo(repo, r, snap, net=True, stale=STALE):
             r.report(repo, f"window {name}", why)
     hours = agent_hours()                                             # 9 — subagent worktrees inside the checkout
     for w in agent_worktrees(repo):
-        state, merged = pr_of(prs, w["branch"])
+        state, merged, _ = pr_of(prs, w["branch"])
         verdict, why = agent_wt_verdict(dict(w, pr=state, merged=merged, hours=hours))
         if verdict == "rm":
             spared = held_by(w["path"])
@@ -3935,6 +3948,48 @@ def selfcheck():
         ok("…and --dry removes nothing and says what it would", "would rm sw/gone" in quietly(sweep_cmd, ["sw", "--dry"]) and did == ["rm sw gone"])
     finally:
         restore(); shutil.rmtree(tc, ignore_errors=True)
+    # (c2) sweep rule 2: a merged row's branch goes once, at the merge; a tip pushed after it, or a session row's, stays
+    tb = tempfile.mkdtemp(prefix="cc-reconcile-branch-")
+    try:
+        def git(*a):
+            return subprocess.run(["git", *a], capture_output=True, text=True, check=True).stdout.strip()
+        git("init", "-q", "--bare", f"{tb}/origin.git")
+        git("init", "-q", f"{tb}/dev/br")
+        git("-C", f"{tb}/dev/br", "remote", "add", "origin", f"{tb}/origin.git")
+        heads = {}
+        for i, t in enumerate(("once", "later", "seat")):
+            git("-C", f"{tb}/dev/br", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", t)
+            heads[t] = git("-C", f"{tb}/dev/br", "rev-parse", "HEAD")
+            git("-C", f"{tb}/dev/br", "push", "-q", "origin", f"HEAD:refs/heads/track/{t}")
+        # `later` merged at its first tip, then the row's worker pushed again: origin's tip is not the merged head
+        git("-C", f"{tb}/dev/br", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "after")
+        git("-C", f"{tb}/dev/br", "push", "-q", "origin", "HEAD:refs/heads/track/later")
+        prs = [{"number": n, "state": "MERGED", "headRefName": f"track/{t}", "headRefOid": heads[t],
+                "mergedAt": "2026-09-20T00:00:00Z"} for n, t in enumerate(("once", "later", "seat"), 1)]
+        scratch(tb, dict(NOOP, gh=f"cat {tb}/prs.json"))
+        json.dump(prs, open(f"{tb}/prs.json", "w"))
+        young = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        json.dump({"repo": "br", "tracks": {"once": {"status": "merged", "updated": young},
+                                            "later": {"status": "merged", "updated": young},
+                                            "seat": {"status": "merged", "kind": "session", "updated": young}}},
+                  open(f"{tb}/.cc/boards/br.json", "w"))
+        globals().update(procs=lambda: (set(), set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}))
+        on_origin = lambda: sorted(ln.split("refs/heads/")[-1] for ln in
+                                   git("ls-remote", "--heads", f"{tb}/origin.git").splitlines())
+        out = quietly(sweep_cmd, ["br"])
+        ok("SWEEP rule 2: a one-shot row whose PR merged at origin's tip has its branch deleted",
+           "track/once" not in on_origin() and "delete origin/track/once — its PR is merged" in out)
+        ok("…but a tip pushed after the merge is kept and reported, not deleted on every pass (the lessons rescues)",
+           "track/later" in on_origin() and "origin/track/later — its PR merged, but origin's tip" in out)
+        ok("…and a session row's branch is never touched, merged PR and matching tip or not: a seat outlives each PR",
+           "track/seat" in on_origin() and "track/seat" not in out)
+        out = quietly(sweep_cmd, ["br"])
+        ok("…and the next pass deletes nothing more: the delete ran once, at the merge",
+           on_origin() == ["track/later", "track/seat"] and "track/seat" not in out)
+    finally:
+        restore(); shutil.rmtree(tb, ignore_errors=True)
+    ok("branch_verdict: a MERGED PR with no head read deletes nothing",
+       branch_verdict({"board": "merged", "pr": "MERGED", "head": "", "tip": "", "dirty": False})[0] == "report")
     # (d) digest: a waiting row's question is listed; a merged-and-quiet row is not there at all
     td = tempfile.mkdtemp(prefix="cc-reconcile-digest-")
     try:
