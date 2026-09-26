@@ -33,6 +33,10 @@ def selfcheck():
     # The optimistic path is OFF for every case below that does not ask for it: the lane cases stub run_one and
     # land one job at a time, and a batch would take them out from under those stubs. Its own cases turn it on.
     globals()["OPTIMISTIC"] = False
+    # …and every sweep's reap_orphans reads the box's real /proc: the cases below never let it, and its own case hands
+    # the real one a fake /proc.
+    _reap_orphans = reap_orphans
+    globals()["reap_orphans"] = lambda proc="/proc": []
 
     def check(name, cond):
         print(("  ✓ " if cond else "  ✗ ") + name)
@@ -2078,13 +2082,22 @@ def selfcheck():
     check("a repo that ships no list has not said which of its files run unattended, so every code change of its is "
           "read — and the reason names the file it could have shipped", t == "full" and "no control-layer list" in why)
     for changed, w, name in (
-            ([("M", "core/tests/selftest.sh")], {}, "the tests themselves"),
+            ([("M", "core/tests/green.sh")], {}, "a shared test file — what decides how far every change reaches"),
+            ([("M", "core/tests/check.sh"), ("M", "core/tests/selftest.sh")], {}, "a shared test file beside a case file"),
             ([("M", "install.sh")], {}, "what installs it"),
-            ([("M", "config/units.json")], {}, "what configures it"),
-            ([("M", f"docs/{i}.md") for i in range(WIDE_FILES + 1)], {}, "a diff too wide to scope by eye"),
-            ([("M", "docs/a.md")], {"git diff --numstat": (0, f"{WIDE_LINES}\t{WIDE_LINES}\tdocs/a.md\n")},
-             "a diff too long to scope by eye")):
+            ([("M", "config/units.json")], {}, "what configures it")):
         check(f"{name} runs every gate there is", tier(changed, **w)[0] == "full")
+    # Planning, 2026-09-25: "A PR that edits a selftest case runs that case and its component, not everything.
+    # 'Wide' is judged by what the change reaches, not by file count." 59 of 64 landings in a day ran `full`, 34 for
+    # a test edit and 17 for width; each of these is now `focused`, and the suite's reach (tests/green.sh) scopes it.
+    for changed, name in (
+            ([("M", "core/tests/selftest.sh"), ("M", "core/bin/cc-alpha")], "a tool and its case in selftest.sh"),
+            ([("M", "core/tests/cc-alpha-selfcheck.py"), ("M", "core/tests/slack_selfcheck.py")], "a tool's own selfcheck file"),
+            ([("M", f"core/bin/cc-alpha{i}") for i in range(20)], "twenty tools outside the control layer")):
+        t, why = tier(changed, **dict(lst, **{k: v for f in changed for k, v in code_at(f[1]).items()},
+                                      **{"git diff --numstat": (0, "5000\t5000\tx\n")}))
+        check(f"{name}, however many lines, is `focused`, not `full`: the suite runs what it reaches",
+              t == "focused" and "outside the control layer" in why)
     check("a diff nothing could be read about runs every gate: this is the answer that costs ten minutes, and it is "
           "the one every unreadable question falls back to", tier([])[0] == "full")
     check("and --full-gates is the way past the whole question, for a person who wants the lot",
@@ -2134,6 +2147,22 @@ def selfcheck():
         write_atomic(green, {"suite": "core/tests/check.sh", "tree": TREE, "at": stamp()})
         check("...nor on a record of a DIFFERENT suite that happens to share the content", "already green"
               not in docs_diff(full_gates=True))
+        # REVIEW OF #693, 2: a warm handed CC_LAND_BASE ran only the stanzas its selftest.sh edit sits in. The batch's
+        # suite after the merge is handed no base and would run every stanza, so on the same tree it must not spend
+        # that record. The key carries the base (green_key), and the suite files the same string (green.sh).
+        X, B_ = "core/bin/cc-alpha core/tests/selftest.sh", "b" * 40
+        sh_key = subprocess.run(["bash", "-c", f'. "{os.path.dirname(BIN)}/tests/green.sh"; placed_scope "$1" "$2"',
+                                 "_", X, B_], capture_output=True, text=True).stdout
+        write_atomic(green, {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": sh_key, "at": stamp()})
+        check("a placed run's record (selftest.sh handed a base) answers the same placed ask, and the key cc-land asks "
+              "with is the string green.sh files",
+              sh_key == green_key(X, B_) == f"{X} @base:{B_}" and green_run(TREE, "core/tests/selftest.sh", green_key(X, B_)))
+        check("…but not the post-merge suite's ask on the same tree and paths with no base, which runs every stanza",
+              not green_run(TREE, "core/tests/selftest.sh", green_key(X, "")))
+        write_atomic(green, {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": X, "at": stamp()})
+        check("…while a run of every stanza on those paths answers a placed ask, and a diff with no selftest.sh edit "
+              "keys on its paths alone, base or not",
+              green_run(TREE, "core/tests/selftest.sh", green_key(X, B_)) and green_key("core/bin/cc-alpha", B_) == "core/bin/cc-alpha")
         os.unlink(green)
         check("a head nothing has run the suite on still runs it — the second run is dropped, never the first",
               "already green" not in docs_diff(full_gates=True)
@@ -2174,6 +2203,99 @@ def selfcheck():
               and fate.get("suite") == "stopped" and took < 8 and "stopped, not run to the end" in said.getvalue())
     finally:
         os.access, globals()["run_gate"] = real_access, real_gate
+
+    # A STOPPING VERDICT ENDS THE GATES TOO. The brief: "it stops at the first red gate or non-LAND verdict: kill the
+    # sibling gates". Both gates here run until told to stop (3 s); the read beside them answers at once.
+    def waiting_gate(argv, cwd, log, env, stop=None):
+        if stop is not None and stop.wait(3):
+            fate[os.path.basename(argv[0])] = "stopped"
+            raise GateStopped("stopped")
+        fate[os.path.basename(argv[0])] = "ran to the end"
+        return 0, "0 failed\n"
+    real_access, real_gate = os.access, run_gate
+    try:
+        os.access = lambda p, m: p.endswith(("core/tests/check.sh", "core/tests/selftest.sh"))
+        globals()["run_gate"] = waiting_gate
+        for verdict in ("DO-NOT-LAND", "LAND"):
+            fate.clear()
+            L = fresh(pr=7, full_gates=True)
+            world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git merge-base": (0, A + "\n"),
+                          "git diff --name-status": (0, "M\tcore/bin/cc-x\n"), "git diff --numstat": (0, "3\t2\tx\n"),
+                          "git rev-parse HEAD^{tree}": (0, ("9" if verdict == "LAND" else "8") * 40 + "\n")})
+            L.review_now = lambda L=L, v=verdict: L.verdict_result(v, "1. [correctness] the row is wrong", "read",
+                                                                   "$1.00", "")
+            t0 = time.time()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                g = caught(L.gates)
+                r = caught(L.review)
+            took = time.time() - t0
+            if verdict == "DO-NOT-LAND":
+                check("a DO-NOT-LAND read beside the gates stops them within a second — both are stopped, neither ran "
+                      "to the end — and the gates step says stopped, not passed; the review step then stops the landing "
+                      "with the verdict, so the stop is still the review's",
+                      isinstance(g, Skip) and "stopped, not passed" in str(g) and isinstance(r, Failed)
+                      and "DO-NOT-LAND" in str(r) and set(fate.values()) == {"stopped"} and took < 2.5)
+            else:
+                check("…while a LAND read leaves the gates running to their end, and they pass",
+                      not isinstance(g, BaseException) and "passed" in str(g)
+                      and set(fate.values()) == {"ran to the end"} and not L.verdict_stopped)
+    finally:
+        os.access, globals()["run_gate"] = real_access, real_gate
+
+    # A GATE DIES WITH ITS LANDER. The brief: "kill … their process groups": each case its own processes, and a fake
+    # /proc holding only them, so nothing else on the box is looked at, let alone killed.
+    dead = subprocess.Popen(["true"])
+    dead.wait()                                  # a pid nothing runs under now
+    kids = {who: subprocess.Popen(["sleep", "60"], start_new_session=True,
+                                  env=dict(os.environ, **({GATE_OF: of} if of else {})))
+            for who, of in (("orphan", str(dead.pid)), ("ours", str(os.getpid())), ("unmarked", ""))}
+    fproc = tempfile.mkdtemp(prefix="cc-land-selfcheck-proc-")
+    try:
+        for p in kids.values():
+            os.makedirs(f"{fproc}/{p.pid}")
+            shutil.copy(f"/proc/{p.pid}/environ", f"{fproc}/{p.pid}/environ")
+        killed = _reap_orphans(proc=fproc)
+        time.sleep(0.2)
+        check("reap_orphans kills the group of a gate whose lander is gone, and only that group: a gate of this live "
+              "lander and a process with no lander named run on",
+              killed == [kids["orphan"].pid] and kids["orphan"].poll() is not None
+              and kids["ours"].poll() is None and kids["unmarked"].poll() is None)
+        seen, real_kill, real_signal = [], os.kill, signal.signal
+        _GATES.add(kids["ours"])
+        try:
+            os.kill, signal.signal = (lambda pid, sig: seen.append(("kill", pid, sig))), (lambda s, h: seen.append(("sig", s, h)))
+            on_death(signal.SIGTERM, None)
+        finally:
+            os.kill, signal.signal = real_kill, real_signal
+            _GATES.discard(kids["ours"])
+        time.sleep(0.2)
+        check("…and a SIGTERM'd lander kills its own gates' groups before it dies of the same signal (on_death)",
+              kids["ours"].poll() is not None and kids["unmarked"].poll() is None
+              and seen == [("sig", signal.SIGTERM, signal.SIG_DFL), ("kill", os.getpid(), signal.SIGTERM)])
+        # review of #692: the paid review ran through sh outside _GATES, so a SIGTERM'd lander left it running
+        rv = {}
+        th = threading.Thread(target=lambda: rv.setdefault("r", real_sh(["sleep", "60"], track=True)), daemon=True)
+        th.start()
+        for _ in range(100):
+            if _GATES:
+                break
+            time.sleep(0.05)
+        tracked = list(_GATES)
+        try:
+            os.kill, signal.signal = (lambda pid, sig: None), (lambda s, h: None)
+            on_death(signal.SIGTERM, None)
+        finally:
+            os.kill, signal.signal = real_kill, real_signal
+        th.join(5)
+        check("…and the paid review too: sh(track=True) is in _GATES while it runs, so on_death kills it, and it leaves "
+              "_GATES when it ends", len(tracked) == 1 and not th.is_alive() and tracked[0].poll() is not None
+              and rv.get("r", (0,))[0] != 0 and not _GATES)
+    finally:
+        for p in kids.values():
+            with contextlib.suppress(OSError):
+                p.kill()
+            p.wait()
+        shutil.rmtree(fproc, ignore_errors=True)
 
     # A RED TREE IS NOT RUN TWICE, A BOX-STATE RED IS NOT A TREE'S, AND A QUARANTINED CASE IS SAID ON THE ✓ LINE.
     # #617's same red tree was re-run up to three times. Each case below builds its own red-record state.
@@ -2490,6 +2612,13 @@ def selfcheck():
         L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\nM\tcore/bin/cc-graphs\n", **graphs)
         check("the suite is handed the paths the diff changed — CC_LAND_CHANGED, sorted, as git names them — so a "
               "suite that knows its own shape runs only what those reach", told() == ["core/bin/cc-graphs install.sh"])
+        based = lambda: [e.get("CC_LAND_BASE") for c, e in zip(calls, envs) if c[0].endswith("selftest.sh")]
+        scoped_base = based()
+        L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\nM\tcore/bin/cc-graphs\n",
+                       land={"full_gates": True}, **graphs)
+        check("...with the base its merge was built on (CC_LAND_BASE), so selftest.sh can place an edit to itself in "
+              "the stanza it sits in — and an unscoped run (--full-gates) is handed neither",
+              len(scoped_base) == 1 and bool(scoped_base[0]) and told() == [None] and based() == [None])
         slots = lambda: [e.get("CC_SELFTEST_SLOTS") for c, e in zip(calls, envs) if c[0].endswith("selftest.sh")]
         check("...and the ONE concurrency number with it: what the lander hands the suite IS what the suite's own "
               "lock allows at once, said out loud in the suite's environment, so no landing ever waits at a cap "
@@ -4710,56 +4839,58 @@ def selfcheck():
               "then refused for a budget that bought no verdict (#194's stop consumed both and was dropped)",
               root_work("myrepo", 7).get("reviews") == 0 and not root_work("myrepo", 7).get("repairs"))
 
-        # (2) a red gate is a try, not a verdict
+        # (2) a red the BOX caused is a try; a red the TREE caused is a verdict. The brief: "never re-run an unchanged
+        # red tree (retry only on a new head, or once on a case named load-bound)".
         real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
+        BOXRED = "  ✓ the first\n  ✗ H4: write failed: No space left on device\n1 failed\n"
         try:
-            landing(**{GATE: (1, "  ✓ the first\n  ✗ H4: a HUP'd loop must kill its claude\n1 failed\n")})
+            landing(**{GATE: (1, BOXRED)})
             quiet(cmd_work, [])
             kept = read_json(job_path("myrepo", 7)) or {}
-            check("a red gate is a TRY, not a verdict: the job is kept with the ✗ line and the attempt counted, nothing "
-                  "merged, nobody told yet — the suite flakes (cc-slack's selfcheck, boarded apart), and a job that "
-                  "ENDED on a flake is what the 39 lanes were working around",
+            check("a red the BOX caused (a full disk) is a TRY, not a verdict: the job is kept with the ✗ line and the "
+                  "attempt counted, nothing merged, nobody told yet, the next try armed 15 min out",
                   kept.get("attempts") == 1 and (kept.get("last") or "").startswith("gates: gate core/tests/check.sh")
                   and "✗ H4" in kept["last"] and not gh_merges() and not ran_sub("cc-slack", "post")
                   and not ran("cc-notify") and armed() == [f"--on-active={RETRY_AFTER}"] and RETRY_AFTER == 900)
             # The read ran BESIDE that red gate — that is the trade for taking the cheap gates off the front of it
             # (gates) — so its verdict is on the PR now and the fake GitHub is told so. Which is exactly what keeps
             # the trade cheap: the buy stands, and the re-drive reads that verdict back instead of buying a second.
-            # Without it a gate that flakes twice would spend a change's whole review budget on nothing and the
-            # re-drive below would be refused for it.
             world["gh pr view 7 --json comments"] = (
                 0, json.dumps({"comments": [{"body": c[c.index("--body") + 1], "viewerDidAuthor": True}
                                             for c in commented()]}))
-            world[GATE] = (0, "  ✓ the first\n  ✓ H4\n0 failed\n")            # the flake passes this time
-            # …on ANOTHER tree: the base moved between sweeps. The same tree would be red at once, unrun (red_run).
-            world["git rev-parse HEAD^{tree}"] = (0, "e" * 40 + "\n")
+            world[GATE] = (0, "  ✓ the first\n  ✓ H4\n0 failed\n")            # the box has room again
             quiet(cmd_work, [])
-            check("...and the next sweep, on a base that moved, re-drives the same job: gated green, merged, one ✅ — no second 👍, no "
+            check("...and the next sweep re-drives the same job: gated green, merged, one ✅ — no second 👍, no "
                   "reaction from the bot, and NO second read: the one the red gate paid for is read back off the "
-                  "PR, so a flaking gate cannot spend a change's review budget a try at a time",
+                  "PR, so a box-caused red cannot spend a change's review budget a try at a time",
                   len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7))
                   and not reacted and len(ran_sub("cc-slack", "post")) == 1
                   and len(commented()) == 1 and len([c for c in calls if c[0] == CLAUDE]) == 1)
             landing(**{GATE: (1, "  ✗ the row was wrong\n1 failed\n")})
-            for _ in range(LAND_TRIES):
-                quiet(cmd_work, [])
-            check("...while one that stays red stops after 3 tries and says NOT merged ONCE, in the thread that "
-                  "asked, in ONE line naming the gate and the case that FAILED — never 'the deploy stopped', since "
-                  "nothing merged; the try count is in the landing record, and nothing routed to #myrepo-updates "
-                  "saying it a second time, no push",
-                  read_json(job_path("myrepo", 7)) is None and not gh_merges()
+            quiet(cmd_work, [])
+            check("...while a red the TREE caused stops at ONCE — no second try, nothing armed — and says NOT merged "
+                  "ONCE, in the thread that asked, in ONE line naming the gate and the case that FAILED; only a new "
+                  "head changes that tree, and a new head is a new queue",
+                  read_json(job_path("myrepo", 7)) is None and not gh_merges() and not armed()
                   and len(ran_sub("cc-slack", "post", "CAPPR")) == 1
                   and one_line(card(), "gate check.sh did not pass: ✗ the row was wrong",
                                "Fix it, then re-queue it")
-                  and "try 3 of 3" in record() and "old code" not in told()
+                  and "try 1 of" in record() and "old code" not in told()
                   and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
-            landing(**{GATE: (1, "  ✗ the row was wrong\n1 failed\n"), f"{BIN}/cc-slack post -c CAPPR": (1, "not sent")})
-            for _ in range(LAND_TRIES):
-                quiet(cmd_work, [])
+            landing(**{GATE: (1, BOXRED)})
+            quiet(cmd_work, [])
+            quiet(cmd_work, [])
+            check("...and a box-caused red is run ONCE more, not three times: red again, it stops after the second "
+                  "try and says so once",
+                  read_json(job_path("myrepo", 7)) is None and not gh_merges()
+                  and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "try 2 of" in record())
+            landing(**{GATE: (1, BOXRED), f"{BIN}/cc-slack post -c CAPPR": (1, "not sent")})
+            quiet(cmd_work, [])
+            quiet(cmd_work, [])
             kept = read_json(job_path("myrepo", 7)) or {}
             check("…and when Slack refuses that card, the job it keeps is marked as stopped by the try cap alone, so a "
                   "re-queue gives it a fresh start instead of 'already queued' (lessons #144, 2026-09-24)",
-                  kept.get("state") == "done" and kept.get("capped") is True and kept.get("attempts") == LAND_TRIES)
+                  kept.get("state") == "done" and kept.get("capped") is True and kept.get("attempts") == 2)
             rcQ = quiet(cmd_queue, ["myrepo", "7"])
             kept = read_json(job_path("myrepo", 7)) or {}
             check("…and the re-queue does: attempts 0, not done, its thread kept",
@@ -4771,12 +4902,13 @@ def selfcheck():
             waited = read_json(job_path("myrepo", 7)) or {}      # the gates run first, so the limit is met after them
             write_atomic(job_path("myrepo", 7), dict(waited, not_before="2000-01-01T00:00:00Z"))   # the reset comes
             world[f"{BIN}/cc-limit status"] = (1, "clear\n")
-            world[GATE] = (1, "  ✗ H4: a HUP'd loop must kill its claude\n1 failed\n")
-            quiet(cmd_work, [])                                  # ...and THEN the gate flakes
+            world[GATE] = (1, BOXRED)
+            world["git rev-parse HEAD^{tree}"] = (0, "f" * 40 + "\n")   # a tree no earlier case left a record on
+            quiet(cmd_work, [])                                  # ...and THEN the box runs out of disk
             kept = read_json(job_path("myrepo", 7)) or {}
-            check("...and a gate that flakes AFTER a usage-limit deferral waits the retry gap, not the reset it has "
-                  "already spent: the old not_before goes with the try, so the re-run is armed 15 min out and the 3 "
-                  "tries stand 15 min apart — left on, it was read as the schedule and burned all three in two minutes",
+            check("...and a box-caused red AFTER a usage-limit deferral waits the retry gap, not the reset it has "
+                  "already spent: the old not_before goes with the try, so the re-run is armed 15 min out — left on, "
+                  "it was read as the schedule and burned the tries in two minutes",
                   waited.get("not_before") and kept.get("attempts") == 1 and "not_before" not in kept
                   and kept.get("stage") == "gates" and len(armed()) == 2
                   and armed()[1] == f"--on-active={RETRY_AFTER}" and not gh_merges())
@@ -6408,6 +6540,11 @@ def selfcheck():
             a, b = argv[-2], argv[-1]
             return (0, "") if a in MAIN and b in MAIN and MAIN.index(a) <= MAIN.index(b) else (1, "")
 
+        def squash_parent(argv):
+            # A squash: one parent, the commit before it on MAIN (none known for a commit off it).
+            sha = argv[-1]
+            return (0, f"{sha} {MAIN[MAIN.index(sha) - 1] if sha in MAIN[1:] else '0' * 40}\n")
+
         def merge_stub(path):
             j = read_json(path) or {}
             took.append((j.get("pr"), j.get("batch")))
@@ -6420,7 +6557,7 @@ def selfcheck():
         def batch_world():
             world["git rev-parse origin/main"] = (0, BEFORE + "\n")
             world["git merge-base --is-ancestor"] = ancestry
-            world["git rev-list --parents -n 1"] = lambda argv: (0, f"{argv[-1]} {'0' * 40}\n")   # a squash: one parent
+            world["git rev-list --parents -n 1"] = squash_parent
         _ro, _wa, _ab = run_one, warm_all, after_batch
         globals().update(run_one=merge_stub, warm_all=lambda repo, b, **kw: [], after_batch=lambda repo, m, **kw: handed.append(m) or [])
         batch_world()
@@ -6443,10 +6580,12 @@ def selfcheck():
             j.pop("batch", None); write_atomic(job_path("myrepo", pr), j)
         took.clear(); handed.clear()
         world["gh pr view 31 --json state"] = (0, json.dumps({"state": "MERGED"}))      # merged before this pass
+        MAIN[:] = [S(31), BEFORE, S(32), TIP]                                            # …and before the batch began
         batch_world()
         land_batch("myrepo", [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32)])
         check("a member gh already called MERGED before the merge pass is not the batch's: never handed on, never "
               "bisected, never reverted", handed == [[(32, S(32), ["f32"])]])
+        MAIN[:] = [BEFORE, S(31), S(32), TIP]
         del world["gh pr view 31 --json state"]
         handed.clear()
         MAIN.remove(S(32))                                                               # #32's squash is off main
@@ -6466,6 +6605,29 @@ def selfcheck():
               "provably merged, so no suite is handed anything", handed == [])
         del world[f"git rev-list --parents -n 1 {S(31)}"]
         globals().update(run_one=merge_stub)
+        # FINDING (#640's security read): a squash was kept when it merely DESCENDED from the member before it, so a
+        # commit hand-merged between two members sat inside the bisect's range and its red could be reverted as the
+        # later member. Kept only when its parent IS the one before; the chain broken, nothing after it is kept.
+        HAND = S(0x3a)
+
+        def hand_merged_at(i):
+            for pr in (31, 32):
+                j = read_json(job_path("myrepo", pr)) or {}
+                j.pop("batch", None); write_atomic(job_path("myrepo", pr), j)
+            handed.clear()
+            MAIN[:] = [BEFORE, S(31), S(32), TIP]
+            if i is not None:
+                MAIN.insert(i, HAND)
+            batch_world()
+            land_batch("myrepo", [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (31, 32)])
+            MAIN[:] = [BEFORE, S(31), S(32), TIP]
+            return list(handed)
+        check("a batch whose members sit directly on each other keeps both",
+              hand_merged_at(None) == [[(31, S(31), ["f31"]), (32, S(32), ["f32"])]])
+        check("…a commit hand-merged between #31 and #32 leaves #32 out: #31 alone is handed on, bisected or reverted",
+              hand_merged_at(2) == [[(31, S(31), ["f31"])]])
+        check("…and one hand-merged before the first member leaves the whole batch out: no suite is handed anything",
+              hand_merged_at(1) == [])
         # …and a base whose tip cannot be read: nothing could be proved on it, so the batch does not start and every
         # member goes to the serial path, every gate first.
         world["git rev-parse origin/main"] = (128, "fatal: bad revision")
@@ -6538,11 +6700,11 @@ def selfcheck():
             batch_world(); took.clear(); handed.clear()
             for pr in (61, 62):
                 write_atomic(job_path("myrepo", pr), {"repo": "myrepo", "pr": pr, "queued_at": stamp(), "attempts": 0})
-            MAIN[2:2] = [S(62), S(61)]
+            MAIN[1:1] = [S(62), S(61)]
             land_batch("myrepo", [(job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]) for pr in (61, 62)])
         finally:
             globals().update(spawn_warm=_spawn)
-            del MAIN[2:4]
+            del MAIN[1:3]
         check("a member merges the moment ITS warm ends: #62 (quick) merges while #61's warm still runs, then #61; "
               "each warm's start was on its job first",
               merged_when == [(62, [61], True), (61, [], True)])
@@ -6565,6 +6727,52 @@ def selfcheck():
               line == "stages myrepo#72 path=serial ok=no total=1500s")
         check("…and a deploy job (no PR) writes none", stage_line({"repo": "myrepo", "span": "a..b",
                                                                   "queued_at": "2026-09-25T10:00:00Z"}) == "")
+        # LEAD TIMES — brief: "stage events to queue.log (queued, lane acquired, each gate's end, verdict, merged) and a
+        # command reports queued-to-merged at p50/p95". Its own log lines; nothing an earlier case wrote.
+        check("pctl is nearest-rank: p50 of 1..4 is 2, p95 of 1..20 is 19, and of nothing None",
+              pctl([4, 1, 3, 2], 50) == 2 and pctl(range(1, 21), 95) == 19 and pctl([], 95) is None)
+        log = ["2026-09-25T10:00:00Z\tqueued r#1 who=-", "2026-09-25T10:02:00Z\tstage r#1 lane attempt=1",
+               "2026-09-25T10:07:00Z\tstage r#1 gate gate=check.sh ok=yes secs=300",
+               "2026-09-25T10:07:00Z\tstage r#1 gate gate=selftest.sh ok=stopped secs=280",
+               "2026-09-25T10:08:00Z\tstage r#1 verdict verdict=LAND",
+               "2026-09-25T10:10:00Z\tstage r#1 merged sha=abc",
+               "2026-09-25T10:10:05Z\tdone r#1 rc=0 landed",                    # the same landing, not a second
+               "2026-09-25T09:00:00Z\tqueued r#2 who=-", "2026-09-25T09:30:00Z\tdone r#2 rc=1 NOT merged",
+               "2026-09-25T11:00:00Z\tfix-pushed r#2 track=t a->b — re-queued",
+               "2026-09-25T11:20:00Z\tdone r#2 rc=4 merged, unverified",          # a log from before the stage lines
+               "2026-09-25T09:00:00Z\tqueued r#3 who=-", "2026-09-25T09:10:00Z\tdone r#3 rc=1 NOT merged",
+               "2026-09-25T09:00:00Z\tqueued other#9 who=-", "2026-09-25T09:05:00Z\tstage other#9 merged",
+               "2026-09-25T09:06:00Z\tstages r#1 path=serial ok=yes total=60s"]
+        got = lead_times(log, repo="r")
+        check("a landing is timed from its first queue to its `stage merged` line, and the `done` after it is not a "
+              "second landing; a PR logged before the stage lines is timed to its `done rc=4`; a red stop (r#3) and "
+              "another repo's PR are not counted",
+              sorted(got["first"]) == [600, 8400] and got["lane"] == [120])
+        check("…from the queue that landed it, a fix round's push starts the clock again",
+              sorted(got["last"]) == [600, 1200])
+        check("…and a gate's figure is its GREEN runs only: the stopped selftest.sh is not one",
+              got["gates"] == {"check.sh": [300]})
+        check("…a merge before `since` is not counted",
+              lead_times(log, since=epoch_of("2026-09-25T10:30:00Z"), repo="r")["first"] == [8400])
+        _lq = LANDQ
+        globals()["LANDQ"] = tempfile.mkdtemp(prefix="cc-land-selfcheck-times-")
+        try:
+            stage_event("r", 5, "gate", gate="check.sh", ok="yes", secs=12, empty="")
+            stage_event("r", None, "lane")
+            written = open(f"{LANDQ}/queue.log").read().splitlines()
+            check("stage_event writes one `stage` line, drops an empty field, and writes nothing for a deploy job",
+                  len(written) == 1 and written[0].endswith("\tstage r#5 gate gate=check.sh ok=yes secs=12"))
+            with open(f"{LANDQ}/queue.log", "a") as f:
+                f.write("\n".join(log) + "\n")
+            o = io.StringIO()
+            with contextlib.redirect_stdout(o):
+                rc = cmd_times(["--repo", "r", "--days", "100000"])
+            check("`times` prints p50 and p95 off queue.log",
+                  rc == 0 and "from the first queue: p50 10m, p95 2h20m over 2" in o.getvalue())
+            with contextlib.redirect_stderr(io.StringIO()):
+                check("…and refuses an option it does not know", cmd_times(["--weeks", "2"]) == 2)
+        finally:
+            globals()["LANDQ"] = _lq
         for pr in (31, 32, 33):
             os.unlink(job_path("myrepo", pr))
 
@@ -6685,6 +6893,22 @@ def selfcheck():
         world["git diff --name-status"] = (128, "fatal: bad object")
         e = caught(L.worker_green)
         check("…and a head whose diff git cannot read is not ordinary either (fail closed)", isinstance(e, Failed))
+        # REVIEW OF #693, 1: a diff that keeps every gate before its merge gets no suite AFTER it, so its one suite
+        # runs every stanza — never the few a test edit or a narrow reach would pick. An ordinary diff keeps its scope.
+        def scope_of(names, cfg=(1, "")):
+            L = warm_L()
+            L.head = HEAD
+            world["git diff --name-status"] = (0, "".join(f"M\t{n}\n" for n in names))
+            world[f"{BIN}/cc-config get CC_PROTECTED_PATHS_myrepo"] = cfg
+            return L.gate_scope()
+        check("a diff on the gate-first list (cc-guard beside a selftest.sh edit) hands its suite no scope: every "
+              "stanza runs before the merge, since none runs after it",
+              scope_of(["core/bin/cc-guard", "core/tests/selftest.sh"]) == "")
+        check("…as does one under a PROTECTED path, and one when cc-config will not say what is protected (fail closed)",
+              scope_of(["core/bin/cc-alpha"], cfg=(0, "core/bin/cc-alpha\n")) == ""
+              and scope_of(["core/bin/cc-alpha"], cfg=(2, "boom")) == "")
+        check("…while an ordinary diff keeps its paths as the scope, so its suite runs what they reach",
+              scope_of(["core/bin/cc-alpha", "core/tests/selftest.sh"]) == "core/bin/cc-alpha core/tests/selftest.sh")
         os.unlink(f"{green_dir()}/selftest.sh-{TREE[:12]}.json")
         os.unlink(job_path("myrepo", 7))
 
@@ -6762,15 +6986,18 @@ def selfcheck():
         _so, _rp, _dd, _ro = suite_on, revert_pr, deploy_due, run_one
         MERGED = [(41, S(0x41), ["f41"]), (42, S(0x42), ["f42"]), (43, S(0x43), ["f43"]), (44, S(0x44), ["f44"])]
 
-        def after(table, tip="ee"):
+        def after(table, tip="ee", red=""):
             asked.clear(); reverted.clear(); deployed.clear(); calls.clear()
             world["git rev-parse origin/main"] = (0, (tip * 20) + "\n")
             world["gh pr view"] = (0, json.dumps(dict(FACTS, state="MERGED")))
+            world[f"git rev-list --parents -n 1 {MERGED[0][1]}"] = (0, f"{MERGED[0][1]} {S(0x40)}\n")   # the batch's base
             globals().update(suite_on=script(table), revert_pr=lambda repo, pr, sha, why: (reverted.append(pr), "aa" * 20)[1],
                              deploy_due=lambda repo, by="", tip="": (deployed.append(by), "/nonexistent/deploy.json")[1],
                              run_one=lambda path: f"deployed {path}")
             with contextlib.suppress(OSError):
                 os.unlink(red_base_path("myrepo"))
+            if red:
+                write_atomic(red_base_path("myrepo"), {"tip": red, "at": stamp(), "why": "an earlier batch's red"})
             return after_batch("myrepo", MERGED)
         lines = after({})
         check("green after the batch: ONE suite on the base's tip, then the deploy the members skipped — no bisect, "
@@ -6800,6 +7027,18 @@ def selfcheck():
               asked == [("ee", "suite"), ("ee", "suite2"), ("44", "bisect")] and not reverted and not deployed
               and any("merged after it" in l for l in lines)
               and (read_json(red_base_path("myrepo")) or {}).get("tip") == "ee" * 20)
+        # FINDING (#640's follow-up): a batch that began on a base an earlier suite had already noted red bisected
+        # anyway — every commit it asks carries that red, so it ends at "before" after log2(n)+1 full runs (2h46m).
+        ALLRED = {"ee": False, "41": False, "42": False, "43": False, "44": False}
+        lines = after(ALLRED, red=S(0x40))
+        check("red after a batch that began on a base already noted red: said at once — no bisect, nothing reverted, "
+              "nothing installed, the new tip noted",
+              asked == [("ee", "suite"), ("ee", "suite2")] and not reverted and not deployed
+              and "already red" in lines[-1] and "Not bisected" in lines[-1]
+              and (read_json(red_base_path("myrepo")) or {}).get("tip") == "ee" * 20)
+        lines = after(ALLRED, red=S(0x3e))
+        check("…but a red note on some OTHER tip than the batch's base does not stop the bisect",
+              ("41", "bisect") in asked and not reverted and any("already red before" in l for l in lines))
         lines = after({"44": False, "43": False}, tip="44")
         check("…and when the tip IS the batch's last merge, the two reds already seen stand for it: not run a third "
               "time", asked == [("44", "suite"), ("44", "suite2"), ("42", "bisect"), ("43", "bisect"), ("aa", "suite3")]
@@ -7004,7 +7243,7 @@ def selfcheck():
         MAIN = [BEFORE, S(0x61), S(0x6f)]
         world["git rev-parse origin/main"] = (0, S(0x6f) + "\n")
         world["git merge-base --is-ancestor"] = ancestry
-        world["git rev-list --parents -n 1"] = lambda argv: (0, f"{argv[-1]} {'0' * 40}\n")
+        world["git rev-list --parents -n 1"] = squash_parent
         world["gh pr view 97 --json state,mergeCommit"] = (0, json.dumps(
             {"state": "MERGED", "mergeCommit": {"oid": S(0x61)}, "baseRefName": "main"}))
         write_atomic(job_path("myrepo", 98), {"repo": "myrepo", "pr": 98, "queued_at": stamp(), "attempts": 0,
@@ -7035,6 +7274,27 @@ def selfcheck():
             lines = resume_batch("myrepo")
             check("…and a note that cannot be read is dropped and said, never a crash of the lane",
                   lines and "could not be read" in lines[0] and not os.path.exists(batch_path("myrepo")))
+            # FINDING (#640's security read): a note that parses but whose members are not [pr, [files]] crashed the
+            # lane in int()/list(). Each such shape is dropped and ledgered like one that would not parse.
+            bad = [{"bid": "b3", "before": BEFORE, "members": [["x", ["f97"]]], "pre": []},
+                   {"bid": "b3", "before": BEFORE, "members": [[97]], "pre": []},
+                   {"bid": "b3", "before": BEFORE, "members": "97", "pre": []},
+                   {"bid": "b3", "before": BEFORE, "members": [[97, 5]], "pre": []},
+                   {"bid": "b3", "before": BEFORE, "members": [[97, ["f97"]]], "pre": ["x"]},
+                   {"bid": "b3", "before": {"x": 1}, "members": [[97, ["f97"]]], "pre": []}]
+            said = []
+            for rec in bad:
+                handed.clear()
+                write_atomic(batch_path("myrepo"), rec)
+                try:
+                    lines = resume_batch("myrepo")
+                except Exception as e:        # the crash this case exists to catch
+                    lines = [f"crashed: {e!r}"]
+                said.append(bool(lines) and "could not be read" in lines[0] and not handed
+                            and not os.path.exists(batch_path("myrepo")))
+            check("…a note that parses but is malformed (a PR that is not a number, a member without files, members "
+                  "not a list, files not a list, a bad `pre`, a bad `before`) is dropped and said, never a crash",
+                  all(said) and len(said) == len(bad))
         finally:
             globals().update(after_batch=_ab, run_one=_ro, batch_of=_bo)
         # …and a sweep with NOTHING queued still runs that repo's lane when a batch note waits: the lane is what

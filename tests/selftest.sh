@@ -8,13 +8,14 @@
 # same, each way, four times in one night (see the unset below, which they went through by name until this line
 # dropped them by rule); a session also carries CC_SLACK_CHANNEL, CC_HANDOFF_WINDOW, CC_MEMBER_SANDBOX and
 # CC_FAILURES, and tomorrow's carries something else. A name is never added here to fix one of them; the rule holds.
-for v in "${!CC_@}"; do case $v in CC_SELFTEST_*|CC_SUITE_PART|CC_LAND_CHANGED|CC_GREEN_DIR|CC_CONFIG_DENY) ;; *) unset "$v";; esac; done
+for v in "${!CC_@}"; do case $v in CC_SELFTEST_*|CC_SUITE_PART|CC_LAND_CHANGED|CC_LAND_BASE|CC_GREEN_DIR|CC_CONFIG_DENY) ;; *) unset "$v";; esac; done
 export CC_NOTIFY_LOG_ONLY=1   # never push to the owner from tests
 export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage limit resets' is capped at 1 s
 export CC_SPEND_TIER=autonomous   # the box's own spend tier (cc-tier) never colours a fixture: each --go below must start — and cc carries
                                   # it into the loop's tmux window (its `pre` list), where cc-loop asks the tier again; the case is by the CC_LOOP_TRIM one
 # claude is stubbed (CC_CLAUDE). Safe to run anytime, INCLUDING alongside other copies of itself from other
 # worktrees: every run is namespaced (see $RUN below), a few run at once and the rest wait, a landing's first (see the slots below)
+# — or go to a runner on another machine FIRST while one answers free and fit (core/bin/cc-suites; CC_SELFTEST_SPILL=0 keeps a run here)
 # and each cleans up after itself.  Usage: tests/selftest.sh   — or, from a landing, with CC_LAND_CHANGED naming
 # the paths a PR changed, in which case only what that change reaches runs (see "WHAT RUNS" below).
 # CC_SUITE_PART names WHICH HALF to run — `portable`, the stanzas that are nothing but a tool's own selfcheck and
@@ -74,7 +75,19 @@ fi
 #     The flock goes when its holder does, so a landing that died waiting leaves nothing behind to hold the others up.
 slot(){ [ "$1" = 1 ] && echo "$LOCKF" || echo "$LOCKF.$1"; }   # slot 1 is the file the lock always was; the rest sit beside it
 if [ -z "${CC_SELFTEST_HELD:-}" ]; then
-  waited=0; first=1; [ -n "$LANDING" ] || first=2; PRIO=; said=
+  waited=0; first=1; [ -n "$LANDING" ] || first=2; PRIO=; said=; nospill=
+  # THE RUNNER FIRST (owner, 2026-09-25: offload as much as possible). Before this run takes a slot here, it goes
+  # to the runner if that answers free and fit (cc-suites spill; its header has the rules). 0 is a pass there, its
+  # green record filed; 75 is "nothing ran there", so this run takes a slot here and may be offered again while it
+  # waits; 76 is "it ran there and no pass came back" (red, cut off, out of time), so it runs here and is not
+  # offered again. Only the box's own lock does this: a fixture below runs this file with a scratch
+  # CC_SELFTEST_LOCK, and must neither reap the box's processes nor ship anything anywhere — unless it hands over a
+  # stub of its own in CC_SELFTEST_SUITES, as the spill-first case does.
+  SUITES=${CC_SELFTEST_SUITES:-$(dirname "$SELF")/../bin/cc-suites}
+  if { [ -z "${CC_SELFTEST_LOCK:-}" ] || [ -n "${CC_SELFTEST_SUITES:-}" ]; } && [ "${CC_SELFTEST_SPILL:-1}" != 0 ]; then
+    "$SUITES" spill "$SELF" "$@"; src=$?
+    case $src in 75) ;; 76) nospill=1;; *) exit "$src";; esac
+  fi
   exec {LQ}>>"$LOCKF.landing"
   while :; do
     ahead=
@@ -87,6 +100,16 @@ if [ -z "${CC_SELFTEST_HELD:-}" ]; then
         flock -n $LK && break 2
         exec {LK}>&-
       done
+    fi
+    # NO SLOT FREE: once a minute, reap the runs nobody owns (they hold no slot and still load the box) and, unless it
+    # already ran there with no pass (76 above), offer this run to the runner again: it may have come free. Codes as above.
+    if { [ -z "${CC_SELFTEST_LOCK:-}" ] || [ -n "${CC_SELFTEST_SUITES:-}" ]; } && [ "${CC_SELFTEST_SPILL:-1}" != 0 ] && [ $((waited % 60)) = 0 ]; then
+      "$SUITES" reap || true
+      if [ -z "$nospill" ]; then
+        [ -z "$PRIO" ] || { flock -u $LQ; PRIO=; }   # a landing waiting on the runner holds no one back here
+        "$SUITES" spill "$SELF" "$@" {LQ}>&-; src=$?
+        case $src in 75) ;; 76) nospill=1;; *) exit "$src";; esac
+      fi
     fi
     [ -z "$LANDING" ] || [ -n "$PRIO" ] || { flock -s $LQ; PRIO=1; }   # waiting, so the runs that are not landings' wait behind it
     if [ $((waited % 60)) = 0 ] || [ "$ahead" != "$said" ]; then   # every minute, and at once when a landing starts or stops being ahead
@@ -113,10 +136,16 @@ if [ -z "${CC_SELFTEST_HELD:-}" ]; then
   # loop kill") went red 3/3 from that shell and green from tmux, with the env unset for good measure and the real
   # difference unnoticed. Bash cannot undo it either, so the exec goes through python, which puts HUP/INT/QUIT/TERM
   # back to default — the way tmux and systemd start things. (Repro: nohup a cc-loop, HUP it, its claude lives on.)
+  # …and the suite DIES WITH THIS SHELL (PR_SET_PDEATHSIG, SIGTERM — its EXIT trap takes the fixtures down). When
+  # this shell was killed alone the slot went free while the suite ran on unowned: three such orphans loaded the
+  # box on 2026-09-25 beside the four it allows. `cc-suites reap` takes any that get away some other way.
   export CC_SELFTEST_HELD=$$
-  python3 -c 'import os, signal, sys
+  python3 -c 'import ctypes, os, signal, sys
 for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM): signal.signal(s, signal.SIG_DFL)
-os.execv(sys.argv[1], sys.argv[1:])' "$SELF" "$@" {LK}>&-; exit $?
+try: ctypes.CDLL(None).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+except Exception: pass
+if os.getppid() != int(sys.argv[1]): sys.exit(143)   # the holder died before the line above took hold
+os.execv(sys.argv[2], sys.argv[2:])' "$$" "$SELF" "$@" {LK}>&-; exit $?
 fi
 HOLDER=$CC_SELFTEST_HELD; unset CC_SELFTEST_HELD   # our children must not think they are already inside the lock
 if [ -n "${CC_SELFTEST_LOCK_ONLY:-}" ]; then   # the case below re-runs this file to here and no further —
@@ -191,6 +220,39 @@ done < <(awk -v have=" $(ls "$B" | tr '\n' ' ')" '
                           if (rest ~ /--go/) found("cc-loop"); if (rest ~ /--say/) found("cc-msg") }   # what `cc … --go` and `--say` start
       found(m); line = rest } }
   END { if (title != "") emit() }' "$SELF")
+# A CHANGE TO THIS FILE (land_scope marked it: SELFTEST_EDITED) runs the stanzas its hunks sit in and the tools
+# those drive, not every stanza — brief: "a PR that edits a selftest case runs that case and its component, not
+# everything". Each changed line of the diff against CC_LAND_BASE (the base the landing built its merge on) is
+# placed in the stanza whose `if stanza "…"` line and column-0 `fi` hold it. A line outside every stanza (the
+# helpers, the fixtures, this block), a line in an `always` stanza the others stand on, a stanza that drives no
+# tool, no base, or a diff that cannot be read: each reaches everything, which is what this file did before.
+selftest_reach(){   # $1 = this file, $2 = the base → the tools the edited stanzas drive, or rc 1 = everything
+  local f=$1 d spans title tools="" t
+  [ -n "${2:-}" ] || return 1
+  d=$(git -C "$(dirname "$f")" diff -U0 "$2" -- "$f" 2>/dev/null) || return 1
+  # "@@ -a,b +s,c @@" → the new side's lines s..s+c-1; a pure deletion (c=0) sits between s and s+1, so both count
+  spans=$(awk '/^@@/ { split($3, n, ","); s = substr(n[1], 2) + 0; c = (n[2] == "" ? 1 : n[2] + 0)
+                       print s, (c ? s + c - 1 : s + 1) }' <<<"$d")
+  [ -n "$spans" ] || return 1
+  while IFS= read -r title; do
+    [ -n "$title" ] && [ -n "${STANZA_TOOLS[$title]:-}" ] || return 1
+    tools="$tools ${STANZA_TOOLS[$title]}"
+  done < <(awk -v spans="$spans" '
+    BEGIN { n = split(spans, a, "\n"); for (i = 1; i <= n; i++) { split(a[i], r, " "); lo[i] = r[1]; hi[i] = r[2] } }
+    /^if stanza "/ { title = $0; sub(/^if stanza "/, "", title); sub(/".*$/, "", title); alw = ($0 ~ /^if stanza "[^"]*" always/); open = 1 }
+    { for (i = 1; i <= n; i++) if (NR >= lo[i] && NR <= hi[i]) { seen[i] = 1; print (open && !alw) ? title : "" } }
+    /^fi$/ { open = 0 }
+    END { for (i = 1; i <= n; i++) if (!seen[i]) print "" }' "$f" | sort -u)   # a span no line reached: everything
+  printf '%s' "$tools"; }
+if [ -n "${SELFTEST_EDITED:-}" ] && [ -n "$REACH" ]; then
+  if st_add=$(selftest_reach "$SELF" "${CC_LAND_BASE:-}"); then
+    REACH=" $(tr ' ' '\n' <<<"$REACH $st_add" | grep . | sort -u | tr '\n' ' ')"
+    SCOPE=$(placed_scope "$SCOPE" "$CC_LAND_BASE")   # a run of some stanzas never answers for one of them all (green.sh)
+    echo "  · this file changed: the stanzas its hunks sit in run, with the tools they drive (${st_add# })"
+  else
+    REACH=""; echo "  · this file changed outside a stanza that can be scoped (or no base to diff against): every stanza runs"
+  fi
+fi
 stanza(){   # `stanza "<title>" [always]`: the header, and whether this change reaches anything the stanza drives.
             # WHICH HALF runs it is not a word here — it is read off the stanza's own body (STANZA_HALF, above),
             # so there is nothing to keep in step. A body of its own = this box; nothing but `chk` = anywhere.
@@ -3342,6 +3404,27 @@ r2(){ ( CC_LAND_CHANGED="$1" land_scope "$SB2"; printf '%s' "$REACH" ); }
 edge=$( CC_LAND_CHANGED="core/bin/cc-checkpoint" land_scope "$B"; printf '%s' "$REACH" )
 case "$edge" in *" cc-member-import "*) ok "a change to cc-checkpoint alone reaches cc-member-import, which reads its staged-name policy";;
   *) bad "cc-checkpoint does not reach cc-member-import: [$edge]";; esac
+# …and a CASE FILE reaches what it tests, not everything: a tool's own selfcheck file stands for the tool, and an
+# edit to selftest.sh runs the stanza it sits in (selftest_reach) — outside every stanza, or in an `always` one, it
+# still runs them all. Each case builds its own file and repo; STANZA_TOOLS is set in the subshell for that file.
+[ "$(reach core/tests/cc-leaf-selfcheck.py)" = " cc-caller cc-leaf |core/tests/cc-leaf-selfcheck.py" ] \
+  && [ "$(reach core/tests/leaf_selfcheck.py)" = " cc-caller cc-leaf |core/tests/leaf_selfcheck.py" ] \
+  && [ "$(reach core/tests/nobody_selfcheck.py)" = "|" ] && [ "$(reach core/tests/check.sh)" = "|" ] \
+  && [ "$(CC_LAND_CHANGED=core/tests/selftest.sh land_scope "$SB"; printf '%s|%s' "$REACH" "$SELFTEST_EDITED")" = " |1" ] \
+  && ok "a tool's selfcheck file reaches that tool, selftest.sh is marked for the suite to place, and a selfcheck of no tool or any other test file reaches everything" \
+  || bad "case-file reach: [$(reach core/tests/cc-leaf-selfcheck.py)] [$(reach core/tests/leaf_selfcheck.py)] [$(reach core/tests/nobody_selfcheck.py)] [$(reach core/tests/check.sh)]"
+SR6="$T/stanzareach"; mkdir -p "$SR6"; git -C "$SR6" init -q
+printf '%s\n' '# prelude' 'if stanza "one"; then' '  "$B/cc-leaf" x' 'fi' 'if stanza "base" always; then' '  echo base' 'fi' \
+  'if stanza "bare"; then' '  echo nothing' 'fi' > "$SR6/st.sh"
+git -C "$SR6" add st.sh && git -C "$SR6" -c user.email=t@t -c user.name=t commit -qm base
+sr6=$(git -C "$SR6" rev-parse HEAD)
+r6(){ ( declare -A STANZA_TOOLS=([one]="cc-leaf" [base]="cc-other" [bare]="")
+        cp "$SR6/st.sh" "$SR6/st.orig"; sed -i "$1" "$SR6/st.sh"; o=$(selftest_reach "$SR6/st.sh" "$2") && printf '%s' "$o" || printf 'ALL'
+        mv "$SR6/st.orig" "$SR6/st.sh" ); }
+[ "$(r6 '3s/x/y/' "$sr6")" = " cc-leaf" ] && [ "$(r6 '1s/prelude/p/' "$sr6")" = ALL ] && [ "$(r6 '6s/base/b/' "$sr6")" = ALL ] \
+  && [ "$(r6 '9s/nothing/n/' "$sr6")" = ALL ] && [ "$(r6 '3s/x/y/' "")" = ALL ] && [ "$(r6 '3d' "$sr6")" = " cc-leaf" ] \
+  && ok "an edit inside a stanza runs that stanza's tools, and one in the prelude, an always stanza, a stanza that drives nothing, or with no base runs everything" \
+  || bad "selftest_reach: in=[$(r6 '3s/x/y/' "$sr6")] prelude=[$(r6 '1s/prelude/p/' "$sr6")] always=[$(r6 '6s/base/b/' "$sr6")] bare=[$(r6 '9s/nothing/n/' "$sr6")] nobase=[$(r6 '3s/x/y/' "")] del=[$(r6 '3d' "$sr6")]"
 # …and the ONE EDGE THE GREP CANNOT SEE: the member launcher runs cc-fence at its path INSIDE bwrap
 # ("$HOME/bin/cc-fence"), which no `$BIN/`-shaped pattern matches, and its cases live under cc-sandbox's
 # selfcheck rather than its own. green.sh names the five tools outright; without it a change to cc-member-v2
@@ -3468,7 +3551,7 @@ r=$( B=$CB; REACH=""; CC_SELFTEST_RERUN=0; rm -f "$CB/cc-flaky.n"; chk cc-flaky 
 # named a diff that touches neither that tool nor a protected path. Each case below builds its own list and tool.
 printf '#!/bin/sh\nn=$(cat "$0.n" 2>/dev/null || echo 0); echo $((n+1)) > "$0.n"\necho "FAIL the listed race"; echo "cc-qrace selfcheck: 9 passed, 1 failed"; exit 1\n' > "$CB/cc-qrace"
 printf '#!/bin/sh\necho "FAIL the listed race"; echo "FAIL a real bug"; echo "cc-qmix selfcheck: 8 passed, 2 failed"; exit 1\n' > "$CB/cc-qmix"
-chmod +x "$CB/cc-qrace" "$CB/cc-qmix"; printf 'cc-qrace\tthe listed race\twhy\ncc-qmix\tthe listed race\twhy\n' > "$CB/quarantine"
+chmod +x "$CB/cc-qrace" "$CB/cc-qmix"; qexp=$(date -d '+30 days' +%F); printf 'cc-qrace\tthe listed race\twhy\towner\t%s\ncc-qmix\tthe listed race\twhy\towner\t%s\n' "$qexp" "$qexp" > "$CB/quarantine"
 qchk(){ ( B=$CB; REACH=""; QUARANTINE_FILES=$CB/quarantine; CC_LAND_CHANGED=$1; rm -f "$CB/cc-qrace.n"; chk "$2" ); }
 r=$(qchk "core/bin/cc-other" cc-qrace)
 { grep -q '✓ cc-qrace: QUARANTINED — red only on known load-sensitive cases .*red the listed race' <<<"$r" \
@@ -3497,6 +3580,23 @@ r3=$( B=$CB; QUARANTINE_FILES=$CB/quarantine; unset CC_LAND_CHANGED; fail=0; qba
   && grep -q '✗ the listed race' <<<"$r3" && grep -q 'fail=1' <<<"$r3"; } \
   && ok "quarantine: an inline case (qbad) listed for its tool is reported QUARANTINED; an unlisted one, or one with no diff named, is red" \
   || bad "quarantine inline: $(tr '\n' ' ' <<<"$r $r2 $r3")"
+# brief: "each with an owner and an expiry" — a row past its date, or with none, no longer quarantines; one due today still does
+printf 'cc-qrace\tthe listed race\twhy\towner\t2000-01-01\n' > "$CB/quarantine.old"
+printf 'cc-qrace\tthe listed race\twhy\n' > "$CB/quarantine.bare"; printf 'cc-qrace\tthe listed race\twhy\towner\t%s\n' "$(date +%F)" > "$CB/quarantine.today"
+r=$( B=$CB; QUARANTINE_FILES=$CB/quarantine.old; CC_LAND_CHANGED=docs/x.md; fail=0; qbad cc-qrace "the listed race took +97s"; echo "fail=$fail" )
+r2=$( B=$CB; QUARANTINE_FILES=$CB/quarantine.bare; CC_LAND_CHANGED=docs/x.md; fail=0; qbad cc-qrace "the listed race took +97s"; echo "fail=$fail" )
+r3=$( B=$CB; QUARANTINE_FILES=$CB/quarantine.today; CC_LAND_CHANGED=docs/x.md; fail=0; qbad cc-qrace "the listed race took +97s"; echo "fail=$fail" )
+{ grep -q '✗ the listed race' <<<"$r" && grep -q 'fail=1' <<<"$r" && grep -q '✗ the listed race' <<<"$r2" && grep -q 'fail=1' <<<"$r2" \
+  && grep -q '✓ cc-qrace: QUARANTINED' <<<"$r3" && grep -q 'fail=0' <<<"$r3"; } \
+  && ok "quarantine: a row past its expiry, or with none, is red again; one that expires today still counts" \
+  || bad "quarantine expiry: $(tr '\n' ' ' <<<"$r $r2 $r3")"
+# review of #692: awk compared the expiry as a string, so "never" or 2999-01-01 sorted after today and quarantined for good
+printf 'cc-qrace\tthe listed race\twhy\towner\tnever\n' > "$CB/quarantine.word"; printf 'cc-qrace\tthe listed race\twhy\towner\t2999-01-01\n' > "$CB/quarantine.far"
+r=$( B=$CB; QUARANTINE_FILES=$CB/quarantine.word; CC_LAND_CHANGED=docs/x.md; fail=0; qbad cc-qrace "the listed race took +97s"; echo "fail=$fail" )
+r2=$( B=$CB; QUARANTINE_FILES=$CB/quarantine.far; CC_LAND_CHANGED=docs/x.md; fail=0; qbad cc-qrace "the listed race took +97s"; echo "fail=$fail" )
+{ grep -q '✗ the listed race' <<<"$r" && grep -q 'fail=1' <<<"$r" && grep -q '✗ the listed race' <<<"$r2" && grep -q 'fail=1' <<<"$r2"; } \
+  && ok "quarantine: an expiry that is not a date, or one more than 60 days out, does not count" \
+  || bad "quarantine expiry shape: $(tr '\n' ' ' <<<"$r $r2")"
 fi
 
 if stanza "the suite's own slots (a cap, not a queue)" always; then
@@ -3527,6 +3627,18 @@ orp=$(sed -n 's/^== orphan \([0-9]*\) ==$/\1/p' "$T/lock.out")
   && ok "a child that outlives a run does not outlive its lock — nobody queues behind a ghost" \
   || bad "the lock outlived the run (orphan=[$orp] holder=[$(fuser "$L" 2>&1 | tr -s " ")])"
 kill "$orp" 2>/dev/null
+# …and the suite DIES WITH ITS HOLDER. Killed alone, the holder freed the slot while the suite ran on unowned, and
+# three such runs loaded the box on 2026-09-25 beside the ones the cap let in (PR_SET_PDEATHSIG, at the holder).
+L4=$T/lock4
+env CC_SELFTEST_LOCK="$L4" CC_SELFTEST_SLOTS=2 CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_LOCK_HOLD="$L4.go" "$SELF" >"$T/lock4.out" 2>&1 & h4=$!; KIDS="$KIDS $h4"
+for _ in $(seq 1 100); do grep -q '^== lock taken' "$T/lock4.out" 2>/dev/null && break; sleep 0.1; done
+s4=$(pgrep -P "$h4" | head -1)
+kill -KILL "$h4" 2>/dev/null; wait "$h4" 2>/dev/null
+for _ in $(seq 1 50); do kill -0 "$s4" 2>/dev/null || break; sleep 0.1; done
+{ [ -n "$s4" ] && ! kill -0 "$s4" 2>/dev/null; } \
+  && ok "…and a suite whose holder is killed dies with it, so no run goes on outside the cap" \
+  || bad "the suite outlived its killed holder (holder $h4, suite ${s4:-not found}): $(tr '\n' ' ' <"$T/lock4.out")"
+touch "$L4.go"; kill "$s4" 2>/dev/null
 # …and with TWO slots, two runs are in at once and a third waits on both of them — the whole of what the cap is
 # for: landings' suites side by side, each on fixtures it owns. Same stand-in holders, same lock-only runs.
 L2="$T/lock2"
@@ -3580,6 +3692,31 @@ grep -q 'a landing waiting ahead' "$T/lock3n.out" \
 touch "$L3.go"; wait $c3l; wait $c3n; l3rc=$?
 [ $l3rc = 0 ] && grep -q '^== lock taken' "$T/lock3n.out" \
   && ok "...and it runs once the landing has its slot and one frees" || bad "the held-back run never got a slot: rc=$l3rc"
+# THE RUNNER FIRST: a run offers itself to the runner before it takes a slot here. A stub cc-suites (CC_SELFTEST_SUITES)
+# logs each call and answers what the case says; the real one has its own selfcheck.
+LS="$T/lockspill"; printf '#!/usr/bin/env bash\necho "$1" >> "%s.calls"; [ "$1" = spill ] && exit "$(cat "%s.rc")"; exit 0\n' "$LS" "$LS" > "$T/suites-stub"
+chmod +x "$T/suites-stub"
+echo 0 > "$LS.rc"; sp=$(env CC_SELFTEST_LOCK="$LS" CC_SELFTEST_SLOTS=1 CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_SUITES="$T/suites-stub" "$SELF" 2>&1); sprc=$?
+{ [ "$sprc" = 0 ] && ! grep -q '^== lock taken' <<<"$sp" && [ "$(cat "$LS.calls")" = spill ]; } \
+  && ok "a run the runner passes takes no slot here: offered first, and its pass is the exit" || bad "spill-first: rc=$sprc calls=[$(tr '\n' ' ' <"$LS.calls")] $(tr '\n' ' ' <<<"$sp")"
+rm -f "$LS.calls"; echo 76 > "$LS.rc"
+sp=$(env CC_SELFTEST_LOCK="$LS" CC_SELFTEST_SLOTS=1 CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_SUITES="$T/suites-stub" "$SELF" 2>&1); sprc=$?
+{ [ "$sprc" = 0 ] && grep -q '^== lock taken' <<<"$sp"; } \
+  && ok "...a red (or cut-off) run there runs here: 76 takes a slot" || bad "76 did not run here: rc=$sprc $(tr '\n' ' ' <<<"$sp")"
+# …and is not offered again while it waits: with the only slot held, a 76 run calls spill once, a 75 run again at once
+( exec 8>>"$LS"; flock 8; : >"$LS"; echo $BASHPID >&8; for _ in $(seq 1 600); do [ -e "$LS.go" ] && break; sleep 0.1; done ) & hs=$!; KIDS="$KIDS $hs"
+for _ in $(seq 1 100); do [ "$(head -1 "$LS" 2>/dev/null)" = "$hs" ] && break; sleep 0.1; done
+for want in 76 75; do
+  rm -f "$LS.calls"; echo "$want" > "$LS.rc"
+  env CC_SELFTEST_LOCK="$LS" CC_SELFTEST_SLOTS=1 CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_SUITES="$T/suites-stub" "$SELF" >"$T/lockspill.$want.out" 2>&1 & sw=$!; KIDS="$KIDS $sw"
+  for _ in $(seq 1 300); do grep -q '^== waiting:' "$T/lockspill.$want.out" 2>/dev/null && break; sleep 0.1; done
+  sleep 1.5; kill "$sw" 2>/dev/null; wait "$sw" 2>/dev/null
+  eval "spills$want=$(grep -cx spill "$LS.calls" 2>/dev/null)"
+done
+touch "$LS.go"; wait "$hs" 2>/dev/null
+{ [ "${spills76:-}" = 1 ] && [ "${spills75:-}" = 2 ]; } \
+  && ok "...and, waiting, a run that ran there is not offered again, while one that never ran there is (76 → 1 offer, 75 → 2)" \
+  || bad "re-offer rule: 76 → ${spills76:-?} offers (want 1), 75 → ${spills75:-?} (want 2)"
 fi
 cd ~ || exit 1
 # THE RUN LEFT THE BOX'S ~/.cc AS IT FOUND IT — judged on the object, not on the export block being right. Every
@@ -3627,15 +3764,24 @@ box_flags > "$T/flags.after"
 # …BUT ~/.cc/config IS LIVE. `cc-config set` is how every planning seat changes the box, and a seat that set a key
 # while this ~20 min suite ran turned unrelated landings red (five retained logs, 2026-09 — the box's state, not the
 # change). So a config that moved is RED only when it names this run's fixtures ($REPO, selftest-$RUN): that is a
-# case writing the box's own config. Otherwise the change is said on a · line and the landing goes on. The other
-# flags nothing live rewrites, so any change to them stays red.
+# case writing the box's own config. Otherwise the change is said on a · line and the landing goes on. slack/enabled
+# is a person's to set, and a person can set one while the run goes, so their change is reported, not red:
+# the brief moved live-state checks "out of the landing verdict" (landing-stops-at-first-red). A case that writes
+# it still shows on the · line, in the gate log a reviewer reads.
 flagdiff=$(diff "$T/flags.before" "$T/flags.after" | grep '^[<>]'); cfgdiff=$(grep '^[<>] config ' <<<"$flagdiff")
 if [ -n "$cfgdiff" ] && ! grep -q -e "$REPO" -e "selftest-$RUN" ~/.cc/config 2>/dev/null; then
   echo "  · the box's config changed during the run and names none of its fixtures — a live cc-config set, not this run's: $(tr '\n' ' ' <<<"$cfgdiff")"
   flagdiff=$(grep -v '^[<>] config ' <<<"$flagdiff")
 fi
-[ -z "$flagdiff" ] && ok "…and the box's own flags ($BOX_FLAGS) are as the run found them, or config moved by a live set that names no fixture" \
-  || bad "a box flag changed during the run: $(tr '\n' ' ' <<<"$flagdiff")"
+cfgdiff=$(grep '^[<>] config ' <<<"$flagdiff"); flagdiff=$(grep -v '^[<>] config ' <<<"$flagdiff")
+# github-deny and its gitconfig are security controls, not a person's switch: a case that rewrote them must not land
+# green, so they are red unless they are back as the run found them (review of #692). slack/enabled stays reported.
+secdiff=$(grep '^[<>] github-deny' <<<"$flagdiff"); flagdiff=$(grep -v '^[<>] github-deny' <<<"$flagdiff")
+[ -z "$secdiff" ] && ok "…and github-deny and its gitconfig are as the run found them" \
+  || bad "a security control changed during the run (github-deny): $(tr '\n' ' ' <<<"$secdiff")"
+[ -z "$cfgdiff" ] && ok "…and the box's config is as the run found it, or moved by a live set that names no fixture" \
+  || bad "the box's config changed during the run and names this run's fixtures: $(tr '\n' ' ' <<<"$cfgdiff")"
+[ -z "$flagdiff" ] || echo "  · a box flag changed while the run went (a person's, or a case's — reported, not red): $(tr '\n' ' ' <<<"$flagdiff")"
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it
 # EVERY STANZA IS ACCOUNTED FOR — it ran here, the other half owns it, or this change does not reach it. A

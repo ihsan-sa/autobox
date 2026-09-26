@@ -1,0 +1,605 @@
+#!/usr/bin/env bash
+# cc-suites — the box's long test suite (tests/selftest.sh): reap the runs nobody owns any more, and send every run
+# to a runner on another machine (the owner's laptop) FIRST, whenever that answers free and fit (owner, 2026-09-25:
+# offload as much as possible); the box runs a suite only when the runner cannot take it or brings back no pass.
+#
+#   cc-suites reap [--dry]        kill every selftest.sh run whose owner or log is gone (below). One line per run it
+#                                 kills, nothing when there is none. exit 0
+#   cc-suites spill SUITE [ARG…]  run SUITE on the runner in ~/.cc/suites/remote if that answers and has a free slot:
+#                                 ship the tree SUITE's checkout would commit, stream the run's output here, and on a
+#                                 pass exit 0 after filing the green record a local pass would have.
+#                                 exit 75 when nothing ran there: no runner set, not reachable, busy or unfit. The
+#                                 caller runs the suite itself and may offer it again later.
+#                                 exit 76 when it ran there and no pass came back: the connection ended (lid shut) or
+#                                 ran out of time before a verdict, or the verdict was RED. The caller runs the suite
+#                                 itself and does not offer it again. A red there is never a red here on its own: the
+#                                 laptop is not the box (2026-09-25, a live run came back 481 passed, 7 failed, every
+#                                 red a gap in the runner's environment), so only this box's own run can fail a landing.
+#   cc-suites status              the runner this box would use, and what it answers. exit 0 reachable, 75 not
+#   cc-suites runner              the runner's side, on the other machine: the forced command of the key, reading
+#                                 SSH_ORIGINAL_COMMAND (`status`, or `run SUITE TREE PART CHANGED-B64`) and a tar on stdin
+#   cc-suites laptop-setup [NODE] print the PowerShell script the owner runs once on a Windows laptop (below), and on
+#                                 this box make the key and point ~/.cc/suites/remote at ccsuite@NODE
+#                                 (default cc-suites-runner, the tailnet name the script gives the runner)
+#   cc-suites selfcheck           fixtures of its own: a scratch runner reached through a stub transport, fake runs
+#                                 in a temp dir. It never reads this box's processes outside that dir, nor its keys
+#
+# WHY. On 2026-09-25 at 19:52Z ten suites and three orphans ran on six cores (load 45-56) and a landing waited 86 min
+# on its own run. The suite already capped itself (selftest.sh's slots, two thirds of the cores); what broke the cap
+# was ORPHANS — a suite whose holder shell died and freed the slot while the suite ran on, unowned, into a log file
+# already deleted. selftest.sh now makes the suite die with its holder (PR_SET_PDEATHSIG), and this reaps the ones
+# that got away before that, or in some way that does not.
+#
+# AN ORPHAN is a process running bash on a …/tests/selftest.sh, of this user, where any of these holds:
+#   owner gone   CC_SELFTEST_HELD (the pid of the holder shell that took its slot) names a process that is gone
+#   log gone     its stdout is a file that has been deleted
+#   tree gone    the suite file it runs has been deleted (its worktree was removed)
+# It gets a TERM (its EXIT trap takes its fixtures down) and, 10 s on, a KILL for it and every descendant left.
+# A run that is only WAITING for a slot holds nothing and is never reaped for waiting.
+#
+# THE RUNNER. A verdict from another machine counts only for the exact tree it ran: this ships `git archive` of the
+# tree green_tree names, the runner commits what it unpacked and refuses unless its own tree hash is that one, and it
+# ends on `cc-suite-runner: verdict exit=N tree=T`. Every line the SUITE prints reaches the box prefixed `| ` (the
+# runner relays it), and the runner kills the suite's whole process group before it prints the verdict, so no suite
+# line, and no child a suite leaves behind, can pass for one. The box accepts exactly one unprefixed
+# `cc-suite-runner: verdict` line, as the last line, naming exit=N and the tree it shipped; anything else (a second
+# verdict, the lid shut, the tailnet dropped) is no verdict at all and the suite runs here instead.
+# What goes over: `git archive` of the tree under test, which is the WHOLE repository at that tree, a private overlay
+# (its docs, config and private tools) included, so the runner's account can read all of it; and CC_SUITE_PART /
+# CC_LAND_CHANGED. No environment variable, token or key of this box's, and nothing outside that repository. The key (~/.cc/suites/id_ed25519) is this tool's alone and the runner's authorized_keys pins it to
+# `cc-suites runner` with `restrict`, so it opens no shell, forwards nothing and runs nothing else.
+# The runner takes at most N runs at once and answers `free 0` past that. N is the number in the runner's own
+# ~/.cc-suite-runner/slots (1..32) if there is one, else about one per 8 of its cores (1..8; 22 cores → 3), so the
+# suites take about half the machine: one run peaks near 4 busy cores (a serial main line plus the 3 selfchecks
+# it prefetches at once), and 13 runs on the box's 6 cores held a load of 45-56 on 2026-09-25, about 4 each.
+# READY. The runner also answers `unfit (…)` while a tool the suite needs is missing or does not work there
+# (RUNNER_NEEDS below, bwrap by actually running it): a machine that would fail the suite for want of a tool takes none.
+# THE OWNER'S LAPTOP COMES FIRST. The runner also answers busy, and starts nothing, while the machine is on battery
+# (a Mains supply offline, or a Battery discharging; no power_supply info at all counts as on AC, as in a WSL with
+# none) or its 1-minute load is above half its cores. A run it does start is `nice -n 19` and idle-class I/O.
+# Both sides bound a run in wall-clock time: the runner stops the suite after CC_SUITES_RUNNER_TIMEOUT (85m) and
+# gives no verdict, and the box stops waiting after CC_SUITES_SPILL_TIMEOUT (90m) and runs the suite itself (76).
+# The runner's host key is made here by laptop-setup, pinned in ~/.cc/suites/known_hosts (StrictHostKeyChecking=yes)
+# and its private half handed over in the script only, never kept on this box.
+#
+# THE LAPTOP (laptop-setup). A WSL distro of its own (cc-suites), so its settings touch nothing the owner uses:
+# systemd on, Windows interop and the C: mount OFF (a process there cannot start a Windows program or read the
+# owner's files), its own Tailscale node, sshd taking only the key above, only from the tailnet, only as ccsuite.
+# A logon task keeps the distro running while the owner is logged in. Closed or asleep, the node drops off the
+# tailnet, `spill` answers 75 inside its connect timeout, and the box queues exactly as it did before.
+set -uo pipefail
+SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
+SD="${CC_SUITES_DIR:-$HOME/.cc/suites}"            # remote (user@host), id_ed25519, known_hosts
+RUNNER_DIR="${CC_SUITES_RUNNER_DIR:-$HOME/.cc-suite-runner}"   # the runner's slots and scratch trees, on its machine
+USAGE="usage: cc-suites [reap [--dry]|spill SUITE [ARG…]|status|runner|laptop-setup [NODE]|selfcheck]"
+ALLOWED_SUITES="core/tests/selftest.sh tests/selftest.sh"
+SUITE_RE='(^|/)tests/selftest\.sh$'
+
+# ---- reap ---------------------------------------------------------------------------------------------------------
+descendants(){ ps -eo pid=,ppid= | awk -v root="$1" '{kid[$2]=kid[$2] " " $1} END {n=split(kid[root],q," "); while (n) {p=q[n--]; print p; m=split(kid[p],c," "); for (i=1;i<=m;i++) q[++n]=c[i]}}'; }
+orphan_why(){   # $1 = pid → why it is an orphan, or nothing
+  local p=$1 held out
+  held=$(tr '\0' '\n' 2>/dev/null <"/proc/$p/environ" | sed -n 's/^CC_SELFTEST_HELD=//p' | head -1)
+  if [ -n "$held" ] && [ "$held" != "$p" ] && ! kill -0 "$held" 2>/dev/null; then echo "its slot holder $held is gone"; return; fi
+  out=$(readlink "/proc/$p/fd/1" 2>/dev/null)
+  case $out in /*' (deleted)') echo "its log ${out% (deleted)} was deleted"; return;; esac
+  [ -e "$2" ] || { echo "its suite file $2 was deleted"; return; }   # $2 is absolute: reap resolved it from the run's cwd
+}
+reap(){
+  local dry=${1:-} me pid bin script why kids k under=${CC_SUITES_REAP_UNDER:-}
+  me=$(id -u)
+  while read -r pid bin script; do
+    [ "$pid" != "$$" ] || continue
+    case $bin in bash|*/bash) ;; *) continue;; esac
+    [[ $script =~ $SUITE_RE ]] || continue
+    # a relative path is the run's own, so it is resolved from ITS cwd, never from this one (`cd core && tests/selftest.sh`)
+    case $script in /*) ;; *) script="$(readlink "/proc/$pid/cwd" 2>/dev/null)/$script";; esac
+    [ -z "$under" ] || case $script in "$under"/*) ;; *) continue;; esac
+    why=$(orphan_why "$pid" "$script"); [ -n "$why" ] || continue
+    if [ -n "$dry" ]; then echo "cc-suites: would reap $pid ($script) — $why"; continue; fi
+    kids=$(descendants "$pid")
+    kill -TERM "$pid" 2>/dev/null || continue
+    echo "cc-suites: reaped $pid ($script) — $why"
+    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    for k in $pid $kids; do kill -KILL "$k" 2>/dev/null; done
+  done < <(ps -u "$me" -o pid=,args= | awk '{print $1, $2, $3}')
+  return 0
+}
+
+# ---- the transport ------------------------------------------------------------------------------------------------
+remote(){ [ -s "$SD/remote" ] && head -1 "$SD/remote" | tr -d '[:space:]'; }
+xport_argv(){   # sets XP to the transport command. CC_SUITES_SSH replaces ssh for the selfcheck
+  if [ -n "${CC_SUITES_SSH:-}" ]; then XP=("$CC_SUITES_SSH"); return 0; fi
+  local r; r=$(remote); [ -n "$r" ] && [ -s "$SD/id_ed25519" ] && [ -s "$SD/known_hosts" ] || return 75
+  # The host key is the one laptop-setup made and pinned: an unknown or changed key is no runner.
+  XP=(ssh -F /dev/null -i "$SD/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=8
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o StrictHostKeyChecking=yes
+      -o UserKnownHostsFile="$SD/known_hosts" -o GlobalKnownHostsFile=/dev/null -o ClearAllForwardings=yes
+      -a -x -T -C "$r" --)
+}
+xport(){ xport_argv || return 75; "${XP[@]}" "$@"; }   # $@ = the remote command; stdin goes with it
+configured(){ [ -n "${CC_SUITES_SSH:-}" ] || { [ -n "$(remote)" ] && [ -s "$SD/id_ed25519" ] && [ -s "$SD/known_hosts" ]; }; }
+# A wall-clock bound in timeout(1)'s form (90m, 2s); anything else is the default.
+limit(){ local v=${1:-}; [[ $v =~ ^[0-9]+[smh]?$ ]] && [ "${v%[smh]}" != 0 ] && echo "$v" || echo "$2"; }
+
+status(){
+  configured || { echo "cc-suites: no runner set ($SD/remote) — every suite runs here"; return 75; }
+  local a; local -a XP; xport_argv || return 75
+  a=$(timeout "$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)" "${XP[@]}" status </dev/null 2>/dev/null | tail -1)
+  case $a in "free "*) echo "cc-suites: runner $(remote) answers: $a"; return 0;;
+                      "busy"*|"unfit"*) echo "cc-suites: runner $(remote) answers: $a — every suite runs here for now"; return 75;;
+             *) echo "cc-suites: runner $(remote) does not answer${a:+ ($a)}"; return 75;; esac
+}
+
+# ---- spill --------------------------------------------------------------------------------------------------------
+# The verdict in a runner's stream ($1), or nothing: exactly one unprefixed `cc-suite-runner: verdict` line, it is the
+# last line, and it reads exit=N tree=<40 hex>. Two of them (one forged by the suite, one real) is none.
+verdict_of(){
+  local vs last
+  vs=$(grep -a -v '^| ' "$1" | grep -a '^cc-suite-runner: verdict'); last=$(tail -n 1 "$1")
+  [ -n "$vs" ] && [ "$(printf '%s\n' "$vs" | wc -l)" = 1 ] && [ "$vs" = "$last" ] || return 0
+  [[ $vs =~ ^cc-suite-runner:\ verdict\ exit=[0-9]+\ tree=[0-9a-f]{40}$ ]] && echo "$vs"
+}
+spill(){
+  local suite root rel tree part changed out a rc v lim
+  local -a XP
+  suite=$(readlink -f "${1:-}" 2>/dev/null) || return 75; shift
+  configured || return 75
+  root=$(cd "$(dirname "$suite")" && git rev-parse --show-toplevel 2>/dev/null) || return 75
+  rel=${suite#"$root"/}
+  case " $ALLOWED_SUITES " in *" $rel "*) ;; *) return 75;; esac
+  [ "$#" = 0 ] || return 75          # the runner takes no arguments for the suite; a run that has some stays here
+  xport_argv || return 75
+  a=$(timeout "$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)" "${XP[@]}" status </dev/null 2>/dev/null | tail -1)   # a runner that answers nothing in 20 s is none
+  case $a in "free "[1-9]*) ;; *) return 75;; esac
+  # green.sh's start tree is taken HERE, as it is sourced, and names the suite: the tree shipped is that tree, and
+  # green_record below refuses to file anything if the checkout moved while the runner ran it.
+  part=${CC_SUITE_PART:-all}   # taken BEFORE green.sh, which unsets CC_SUITE_PART as it is sourced
+  SELF=$suite; . "$CORE/tests/green.sh"
+  tree=$GREEN_START_TREE; [ -n "$tree" ] && [ "$GREEN_START_ROOT" = "$root" ] || return 75
+  changed=$(printf '%s' "${CC_LAND_CHANGED:-}" | base64 -w0); changed=${changed:--}
+  out=$(mktemp "${TMPDIR:-/tmp}/cc-suites.out.XXXXXX") || return 75
+  lim=$(limit "${CC_SUITES_SPILL_TIMEOUT:-}" 90m)
+  echo "== running on the runner $(remote) (tree ${tree:0:12}), not here: it answered free and fit =="
+  # Bounded: a runner that stays up while the suite hangs must not hold this box. Past $lim the transport is killed
+  # (its whole group), which is no verdict, and the suite runs here.
+  # What the suite printed comes over prefixed `| `; the log here shows it without the prefix, and the verdict is
+  # read from the stream as it came ($out), where only the runner's own lines are unprefixed.
+  git -C "$root" archive --format=tar "$tree" | timeout -k 10 "$lim" "${XP[@]}" run "$rel" "$tree" "$part" "$changed" \
+    | tee "$out" | sed -u 's/^| //'
+  rc=${PIPESTATUS[1]}
+  case $rc in 124|137) echo "== the runner took longer than $lim — stopped it ==";; esac
+  v=$(verdict_of "$out"); rm -f "$out"
+  # "A laptop verdict counts only for the exact tree it ran" (the brief): no verdict line, or one for another tree, is none.
+  if [ -z "$v" ] || [ "${v##* tree=}" != "$tree" ]; then
+    echo "== the runner gave no verdict for ${tree:0:12} (transport exit $rc) — running it here instead =="
+    return 76
+  fi
+  rc=${v#*exit=}; rc=${rc%% *}
+  if [ "$rc" != 0 ]; then
+    echo "== the runner's verdict for ${tree:0:12} is red (exit $rc) — a red there fails nothing: running it here =="
+    return 76
+  fi
+  # A pass there is filed as a pass here, at the scope this checkout would have run it at — land_scope is a pure
+  # function of the tree and CC_LAND_CHANGED, so it is the scope the runner's own copy printed.
+  land_scope "$(cd "$(dirname "$suite")/../bin" 2>/dev/null && pwd)"
+  green_record "$suite" "${SCOPE:-}" || return 1
+  return 0
+}
+
+# ---- runner (the other machine) -----------------------------------------------------------------------------------
+slots_for(){ local n=$(( ($1 + 4) / 8 )); [ "$n" -ge 1 ] || n=1; [ "$n" -le 8 ] || n=8; echo "$n"; }   # $1 = cores
+runner_slots(){
+  local v; v=$(head -1 "$RUNNER_DIR/slots" 2>/dev/null | tr -d '[:space:]')
+  if [[ $v =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 32 ]; then echo "$v"; else slots_for "$(nproc 2>/dev/null || echo 2)"; fi
+}
+# What the suite needs of the machine it runs on; a runner missing one is unfit (what laptop-setup installs).
+RUNNER_NEEDS="git jq python3 tmux flock setsid timeout nice script sqlite3 bwrap"
+runner_missing(){   # the needs this machine lacks, space-separated, or nothing
+  local c m=""
+  for c in ${CC_SUITES_RUNNER_NEEDS:-$RUNNER_NEEDS}; do
+    command -v "$c" >/dev/null 2>&1 || { m="$m $c"; continue; }
+    # bwrap present is not bwrap usable (user namespaces off, or an AppArmor rule against it): cc-sandbox needs it to run
+    [ "$c" != bwrap ] || bwrap --ro-bind / / --dev /dev --proc /proc true >/dev/null 2>&1 || m="$m bwrap(does-not-run)"
+  done
+  echo "${m# }"
+}
+# Why this machine should take no new run now (on battery, or loaded), or nothing when it may. The laptop is the
+# owner's, and a suite is never worth his battery or his work. CC_SUITES_POWER_DIR / CC_SUITES_LOADAVG: the selfcheck.
+runner_unfit(){
+  local ps=${CC_SUITES_POWER_DIR:-/sys/class/power_supply} d ty v mains="" ac="" dis=""
+  for d in "$ps"/*/; do
+    [ -r "$d/type" ] || continue; ty=$(head -1 "$d/type" 2>/dev/null)
+    case $ty in
+      Mains) mains=1; v=$(head -1 "$d/online" 2>/dev/null); [ "$v" = 1 ] && ac=1;;
+      Battery) v=$(head -1 "$d/status" 2>/dev/null); [ "$v" = Discharging ] && dis=1;;
+    esac
+  done
+  if [ -n "$dis" ] || { [ -n "$mains" ] && [ -z "$ac" ]; }; then echo "on battery"; return; fi
+  local l1 n; n=$(nproc 2>/dev/null || echo 2)
+  read -r l1 _ < "${CC_SUITES_LOADAVG:-/proc/loadavg}" 2>/dev/null || return 0
+  awk -v l="$l1" -v n="$n" 'BEGIN { exit !(l + 0 > n / 2) }' && echo "load $l1 on $n cores"
+}
+# What status adds after its answer, for a person reading `cc-suites status`: `cores=N load=L ac=0|1`. The box parses
+# only the leading `free N`, and ac=1 includes "no power supply info".
+runner_facts(){
+  local l1="?" ac=1
+  read -r l1 _ < "${CC_SUITES_LOADAVG:-/proc/loadavg}" 2>/dev/null || l1="?"
+  [ "$(runner_unfit)" != "on battery" ] || ac=0
+  echo "cores=$(nproc 2>/dev/null || echo "?") slots=$(runner_slots) load=$l1 ac=$ac"
+}
+runner(){
+  local -a a pre; local rel tree part changed i slot t rc why lim rp
+  w=""; gp=""; pg=""   # global, not local: the EXIT trap reads them after this function has returned
+  read -r -a a <<<"${SSH_ORIGINAL_COMMAND:-}"
+  mkdir -p "$RUNNER_DIR"
+  case ${a[0]:-} in
+    status)
+      why=$(runner_missing); [ -z "$why" ] || { echo "unfit (missing: $why) $(runner_facts)"; return 0; }
+      why=$(runner_unfit); [ -z "$why" ] || { echo "busy ($why) $(runner_facts)"; return 0; }
+      i=0; for slot in $(seq 1 "$(runner_slots)"); do
+        ( flock -n 9 ) 9>>"$RUNNER_DIR/slot.$slot" && i=$((i + 1)); done
+      echo "free $i $(runner_facts)"; return 0;;
+    run) ;;
+    *) echo "cc-suite-runner: refused: ${a[0]:-nothing}" >&2; return 2;;
+  esac
+  [ "${#a[@]}" = 5 ] || { echo "cc-suite-runner: refused: run takes SUITE TREE PART CHANGED" >&2; return 2; }
+  rel=${a[1]}; tree=${a[2]}; part=${a[3]}; changed=${a[4]}
+  case " $ALLOWED_SUITES " in *" $rel "*) ;; *) echo "cc-suite-runner: refused suite $rel" >&2; return 2;; esac
+  [[ $tree =~ ^[0-9a-f]{40}$ ]] || { echo "cc-suite-runner: refused tree" >&2; return 2; }
+  case $part in all|box|portable) ;; *) echo "cc-suite-runner: refused part" >&2; return 2;; esac
+  [[ $changed =~ ^[A-Za-z0-9+/=]+$|^-$ ]] || { echo "cc-suite-runner: refused changed" >&2; return 2; }
+  [ "$changed" = - ] && changed="" || changed=$(printf '%s' "$changed" | base64 -d 2>/dev/null) || return 2
+  for slot in $(seq 1 "$(runner_slots)"); do
+    exec {LK}>>"$RUNNER_DIR/slot.$slot"; flock -n $LK && break; exec {LK}>&-; LK=
+  done
+  [ -n "${LK:-}" ] || { echo "cc-suite-runner: busy"; return 75; }
+  why=$(runner_unfit); [ -z "$why" ] || { echo "cc-suite-runner: busy ($why)"; return 75; }   # changed since status
+  why=$(runner_missing); [ -z "$why" ] || { echo "cc-suite-runner: unfit (missing: $why)"; return 75; }
+  w=$(mktemp -d "$RUNNER_DIR/run.XXXXXX") || return 1
+  trap 'rc=$?; [ -z "$pg" ] || kill -TERM -- -"$pg" 2>/dev/null; sleep 1; [ -z "$pg" ] || kill -KILL -- -"$pg" 2>/dev/null; [ -z "$w" ] || rm -rf "$w" "$w.relay"; exit $rc' EXIT
+  trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+  tar -x -C "$w" -f - --no-same-owner 2>/dev/null || { echo "cc-suite-runner: the tree did not unpack"; return 1; }
+  t=$(cd "$w" && git init -q && git add -A -f && git write-tree 2>/dev/null) || t=""
+  [ "$t" = "$tree" ] || { echo "cc-suite-runner: unpacked tree ${t:-none} is not $tree — refused"; return 1; }
+  ( cd "$w" && git -c user.name=cc-suites -c user.email=cc-suites@localhost commit -qm "tree $tree" --no-verify ) \
+    || { echo "cc-suite-runner: could not commit the tree"; return 1; }
+  # WHAT A BOX HAS THAT A FRESH ACCOUNT DOES NOT, and the box half of the suite leans on: a tmux session `main` to
+  # open windows in, and a ~/.local/bin/claude for the one window (`cc <repo>`) that starts it and must stay up.
+  # Every model call in the suite is stubbed by the suite itself (CC_CLAUDE); this stub only waits. Never on a
+  # machine that has a real one — the runner's account is its own. CC_SUITES_RUNNER_PREP=0 skips it (selfcheck).
+  if [ "${CC_SUITES_RUNNER_PREP:-1}" != 0 ]; then
+    [ -e "$HOME/.local/bin/claude" ] || { mkdir -p "$HOME/.local/bin" &&
+      printf '#!/bin/sh\n# cc-suites runner stub: the suite stubs every model call; this only keeps a window up\nexec sleep 3600\n' \
+        > "$HOME/.local/bin/claude" && chmod +x "$HOME/.local/bin/claude"; }
+  fi
+  # …on a tmux server of the runner's own (TMUX_TMPDIR, and no inherited $TMUX, which would beat it), so a window
+  # the suite opens carries this account's HOME and never lands in some other server's `main`.
+  unset TMUX; export TMUX_TMPDIR="$RUNNER_DIR/tmux"; mkdir -p "$TMUX_TMPDIR" && chmod 700 "$TMUX_TMPDIR"
+  [ "${CC_SUITES_RUNNER_PREP:-1}" = 0 ] || tmux has-session -t main 2>/dev/null ||
+    tmux new-session -d -s main -x 200 -y 50 2>/dev/null || true
+  # A clean environment: nothing of this shell's, and CC_SELFTEST_HELD set so the suite takes no slot of its own —
+  # this runner's slot is the one it runs in, and it dies with this runner. Lowest CPU and I/O priority, so the
+  # owner's own work always goes first, and a wall-clock bound a little inside the box's, so it stops first.
+  lim=$(limit "${CC_SUITES_RUNNER_TIMEOUT:-}" 85m)
+  pre=(timeout -k 30 "$lim" nice -n 19)
+  command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
+  # The suite writes into a fifo and nowhere else; the relay prefixes each of its lines `| `, so nothing the suite
+  # prints can pass for a line of this runner's (the verdict).
+  mkfifo -m 600 "$w.relay" || { echo "cc-suite-runner: no relay"; return 1; }
+  awk '{ print "| " $0; fflush() }' <"$w.relay" & rp=$!
+  ( cd "$w" && exec setsid env -i HOME="$HOME" USER="${USER:-$(id -un)}" LOGNAME="${USER:-$(id -un)}" \
+      PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TERM=dumb SHELL=/bin/bash TMUX_TMPDIR="$TMUX_TMPDIR" \
+      CC_SELFTEST_HELD=$$ CC_SUITE_PART="$([ "$part" = all ] || echo "$part")" CC_LAND_CHANGED="$changed" \
+      "${pre[@]}" bash "$w/$rel" ) </dev/null {LK}>&- >"$w.relay" 2>&1 & gp=$!; pg=$gp   # setsid: its pid is its group
+  rc=0; wait "$gp" || rc=$?; gp=""
+  # The suite is done: whatever it left in its group goes now, before a verdict is printed (a child it left could
+  # otherwise hold the stream open, or print after it). The relay gets 5 s to drain what is left of it, then goes too.
+  kill -KILL -- -"$pg" 2>/dev/null
+  for _ in $(seq 1 50); do kill -0 "$rp" 2>/dev/null || break; sleep 0.1; done
+  kill -KILL "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; rm -f "$w.relay"
+  # Out of time is no verdict on the tree: the box runs it itself. Still a `verdict` line, so that one a suite
+  # forged some other way makes two, which is none.
+  case $rc in 124|137) echo "cc-suite-runner: verdict none — the suite ran past $lim and was stopped"; return 0;; esac
+  echo "cc-suite-runner: verdict exit=$rc tree=$tree"
+  return 0
+}
+
+# ---- laptop-setup -------------------------------------------------------------------------------------------------
+laptop_setup(){
+  local node=${1:-cc-suites-runner} pub b64 hk
+  [[ $node =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "cc-suites: NODE is a tailnet host name ([a-z0-9-])" >&2; return 2; }
+  mkdir -p "$SD" && chmod 700 "$SD"
+  [ -s "$SD/id_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -C "cc-suites@$(hostname -s)" -f "$SD/id_ed25519" >/dev/null || return 1
+  # The runner's host key is made HERE and pinned before the laptop is ever reached: the box trusts that key for
+  # NODE and no other (StrictHostKeyChecking=yes), so a tailnet name that answers with another key is no runner.
+  # Its private half goes into the script below and is NOT kept here: each run makes a new key and pins that one, so
+  # the script printed last is the only one that works (run it again after any rerun of laptop-setup).
+  local kd; kd=$(mktemp -d "${TMPDIR:-/tmp}/cc-suites-hostkey.XXXXXX") || return 1
+  ssh-keygen -q -t ed25519 -N "" -C "cc-suites-runner" -f "$kd/k" >/dev/null || { rm -rf "$kd"; return 1; }
+  echo "$node $(cut -d' ' -f1,2 "$kd/k.pub")" > "$SD/known_hosts"
+  hk=$(cat "$kd/k"); rm -rf "$kd"
+  echo "ccsuite@$node" > "$SD/remote"
+  pub=$(cat "$SD/id_ed25519.pub"); b64=$(base64 -w76 "$SELF")
+  echo "cc-suites: the script below is SECRET — it carries the runner's private host key. Run it on the laptop and delete it; never paste it into Slack, a doc or a shared file." >&2
+  cat <<PS1
+# SECRET: this script carries the runner's private SSH host key. Run it, then delete it; do not share or paste it.
+# cc-suites runner for this laptop. Run once in an ADMINISTRATOR PowerShell; running it again is safe.
+# It makes a WSL distro of its own (cc-suites) that runs the box's test suites while this laptop is open, and
+# touches no other distro: in it Windows interop and the C: mount are off, sshd takes one key, from the tailnet only.
+\$ErrorActionPreference = 'Stop'
+\$Distro = 'cc-suites'
+wsl.exe --update | Out-Null
+\$have = (wsl.exe -l -q) -replace "\`0","" | Where-Object { \$_.Trim() -eq \$Distro }
+if (-not \$have) {
+  wsl.exe --install -d Ubuntu-24.04 --name \$Distro --no-launch
+  if (\$LASTEXITCODE -ne 0) { throw "WSL could not install Ubuntu as '\$Distro'. If it asked for a reboot, reboot and run this again." }
+}
+\$sh = @'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+cat >/etc/wsl.conf <<'EOF'
+[boot]
+systemd=true
+[interop]
+enabled=false
+appendWindowsPath=false
+[automount]
+enabled=false
+mountFsTab=false
+EOF
+apt-get update -qq </dev/null   # nothing below may read stdin: it is this script
+apt-get install -y -qq git jq tmux python3 curl ca-certificates openssh-server util-linux bsdutils procps psmisc \\
+  gawk bc sqlite3 file lsof shellcheck bubblewrap </dev/null >/dev/null
+command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
+id ccsuite >/dev/null 2>&1 || useradd -m -s /bin/bash ccsuite
+base64 -d >/usr/local/bin/cc-suites <<'B64'
+$b64
+B64
+chmod 755 /usr/local/bin/cc-suites
+install -d -m 700 -o ccsuite -g ccsuite /home/ccsuite/.ssh
+echo 'restrict,command="/usr/local/bin/cc-suites runner" $pub' >/home/ccsuite/.ssh/authorized_keys
+chown ccsuite:ccsuite /home/ccsuite/.ssh/authorized_keys; chmod 600 /home/ccsuite/.ssh/authorized_keys
+# the host key the box has pinned for this runner; sshd offers it and no other
+install -m 600 -o root -g root /dev/null /etc/ssh/ssh_host_cc_suites_ed25519
+cat >/etc/ssh/ssh_host_cc_suites_ed25519 <<'KEY'
+$hk
+KEY
+cat >/etc/ssh/sshd_config.d/cc-suites.conf <<'EOF'
+HostKey /etc/ssh/ssh_host_cc_suites_ed25519
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers ccsuite@100.64.0.0/10
+EOF
+'@
+# On stdin, not through a file: after the first run the distro has no C: mount to read one from.
+\$OutputEncoding = New-Object System.Text.UTF8Encoding \$false
+((\$sh -replace "\`r\`n", "\`n") + "\`nexit 0\`n") | wsl.exe -d \$Distro -u root -- bash -s
+if (\$LASTEXITCODE -ne 0) { throw "the setup inside WSL failed (above)" }
+wsl.exe --terminate \$Distro   # restart it so wsl.conf (systemd on, interop and C: off) takes hold
+wsl.exe -d \$Distro -u root -- sh -c 'systemctl enable --now ssh tailscaled >/dev/null 2>&1; systemctl restart ssh'
+# Keep the distro up while you are logged in; closed or asleep, the box runs every suite itself.
+\$act = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument "-d \$Distro --exec /bin/sleep infinity"
+\$set = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden
+Register-ScheduledTask -TaskName 'cc-suites keep-alive' -Action \$act -Trigger (New-ScheduledTaskTrigger -AtLogOn -User \$env:USERNAME) -Settings \$set -Force | Out-Null
+Start-ScheduledTask -TaskName 'cc-suites keep-alive'
+Write-Host "Last step: open the link below and log this runner into your tailnet (as '$node')."
+wsl.exe -d \$Distro -u root -- tailscale up --hostname=$node --accept-dns=false
+\$ready = wsl.exe -d \$Distro -u ccsuite -- env SSH_ORIGINAL_COMMAND=status /usr/local/bin/cc-suites runner
+Write-Host "The runner answers: \$ready  ('free N' is ready; 'unfit (missing: ...)' names what this laptop still lacks)"
+Write-Host "Done. The box will send suites here while this laptop is open, on power, and not busy."
+PS1
+}
+
+# ---- selfcheck ----------------------------------------------------------------------------------------------------
+selfcheck(){
+  local D pass=0 fail=0 R out rc p1 p2 p3 p4 tree
+  D=$(mktemp -d "${TMPDIR:-/tmp}/cc-suites-selfcheck.XXXXXX") || return 1
+  k(){ if [ "$1" = 0 ]; then pass=$((pass + 1)); echo "  ✓ $2"; else fail=$((fail + 1)); echo "  ✗ $2"; fi; }
+  t(){ "$@" >/dev/null 2>&1; echo $?; }
+  b(){ if eval "$1"; then echo 0; else echo 1; fi; }   # a condition as a case
+  export CC_SUITES_DIR="$D/sd" CC_SUITES_RUNNER_DIR="$D/runner" CC_GREEN_DIR="$D/green"
+  SD="$D/sd"; RUNNER_DIR="$D/runner"   # this shell's own view too: the cases below call its functions
+  unset CC_SUITES_SSH CC_SUITE_PART CC_LAND_CHANGED CC_SUITES_SPILL_TIMEOUT CC_SUITES_RUNNER_TIMEOUT
+  # the runner's view of power and load is a fixture too: on AC (no supply info) and idle, unless a case says not
+  mkdir -p "$D/power" && echo "0.00 0.00 0.00 1/1 1" > "$D/loadavg"
+  export CC_SUITES_POWER_DIR="$D/power" CC_SUITES_LOADAVG="$D/loadavg" CC_SUITES_RUNNER_NEEDS="bash git"
+  # --- REAP: four fake runs under $D, each on a fixture of its own; only $D is looked at (CC_SUITES_REAP_UNDER)
+  mkdir -p "$D/a/tests" "$D/b/tests" "$D/c/tests" "$D/d/tests"
+  for x in a b c d; do printf 'sleep 300\n' > "$D/$x/tests/selftest.sh"; done
+  sleep 300 & local live=$!
+  ( exec env CC_SELFTEST_HELD=999999999 bash "$D/a/tests/selftest.sh" ) >/dev/null 2>&1 & p1=$!     # owner gone
+  ( exec env CC_SELFTEST_HELD=$live bash "$D/b/tests/selftest.sh" ) >"$D/b.log" 2>&1 & p2=$!        # owned, logging: kept
+  ( exec env CC_SELFTEST_HELD=$live bash "$D/c/tests/selftest.sh" ) >"$D/c.log" 2>&1 & p3=$!        # log deleted
+  ( exec env CC_SELFTEST_HELD=$live bash "$D/d/tests/selftest.sh" ) >"$D/d.log" 2>&1 & p4=$!        # tree deleted
+  sleep 0.5; rm -f "$D/c.log"; rm -rf "$D/d"
+  out=$(CC_SUITES_REAP_UNDER="$D" reap --dry)
+  k "$(t kill -0 $p1)" "a dry reap kills nothing…"
+  k "$(b 'grep -c '\''would reap'\'' <<<"$out" | grep -qx 3')" "…and names the three orphans: $(grep -o 'gone\|deleted' <<<"$out" | tr '\n' ' ')"
+  out=$(CC_SUITES_REAP_UNDER="$D" reap)
+  sleep 0.3
+  k "$(b '! kill -0 $p1 2>/dev/null')" "a run whose slot holder is gone is reaped"
+  k "$(t kill -0 $p2)" "…and a run whose holder and log are both there is kept"
+  k "$(b '! kill -0 $p3 2>/dev/null')" "a run whose log was deleted is reaped"
+  k "$(b '! kill -0 $p4 2>/dev/null')" "a run whose suite file was deleted (worktree removed) is reaped"
+  out=$(CC_SUITES_REAP_UNDER="$D/elsewhere" reap)
+  k "$(b '[ -z "$out" ] && kill -0 $p2 2>/dev/null')" "a reap scoped elsewhere touches nothing under $D"
+  # a run started by a RELATIVE path from its own dir, reaped from a cwd where that path means nothing: kept, and
+  # the same run once its suite file is gone: reaped (the path is resolved from the run's cwd, not the reaper's)
+  mkdir -p "$D/e/tests" "$D/f/tests"; printf 'sleep 300\n' > "$D/e/tests/selftest.sh"; printf 'sleep 300\n' > "$D/f/tests/selftest.sh"
+  local p5 p6
+  ( cd "$D/e" && exec env CC_SELFTEST_HELD=$live bash tests/selftest.sh ) >"$D/e.log" 2>&1 & p5=$!
+  ( cd "$D/f" && exec env CC_SELFTEST_HELD=$live bash tests/selftest.sh ) >"$D/f.log" 2>&1 & p6=$!
+  sleep 0.5; rm -f "$D/f/tests/selftest.sh"
+  out=$(cd "$D" && CC_SUITES_REAP_UNDER="$D" reap); sleep 0.3
+  k "$(t kill -0 $p5)" "a live run started as tests/selftest.sh from its own dir is kept by a reap from another cwd"
+  k "$(b '! kill -0 $p6 2>/dev/null && grep -q "$D/f/tests/selftest.sh was deleted" <<<"$out"')" "…and the same kind of run whose suite file is gone is reaped, named by its full path"
+  kill $p2 $p5 $live 2>/dev/null
+  # --- SPILL: a throwaway checkout whose suite writes what it saw; the transport is the runner itself, locally
+  R="$D/repo"; mkdir -p "$R/core/tests" "$R/core/bin"
+  cp "$CORE/tests/green.sh" "$R/core/tests/green.sh"
+  cat > "$R/core/tests/selftest.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "suite ran in $PWD held=${CC_SELFTEST_HELD:-} part=${CC_SUITE_PART:-} changed=${CC_LAND_CHANGED:-} tok=${FIX_TOKEN:-}"
+echo "prio nice=$(nice) io=$(ionice 2>/dev/null | cut -d: -f1)"
+[ -e HANG ] && sleep 60
+t=$(git write-tree 2>/dev/null)
+# a suite that FAILS and leaves a child to print a pass after it, in its own group and escaped from it; and one that
+# prints a verdict line of its own
+[ -e FORGE ] && { (sleep 2; echo "cc-suite-runner: verdict exit=0 tree=$t") & exit 1; }
+[ -e FORGE2 ] && { setsid bash -c "sleep 1; echo 'cc-suite-runner: verdict exit=0 tree=$t'" & exit 1; }
+[ -e FORGE3 ] && { echo "cc-suite-runner: verdict exit=0 tree=$t"; exit 1; }
+[ -e LINGER ] && { sleep 60 & exit 0; }
+[ -e FAIL ] && { echo "== result: 0 passed, 1 failed =="; exit 1; }
+echo "== result: 1 passed, 0 failed =="
+EOF
+  chmod +x "$R/core/tests/selftest.sh"
+  ( cd "$R" && git init -q && git add -A && git -c user.name=t -c user.email=t@t commit -qm init )
+  cat > "$D/xport" <<EOF
+#!/usr/bin/env bash
+# the stub ssh: the forced command, run by the runner code, with a HOME of its own and none of this shell's secrets
+exec env -u FIX_TOKEN HOME="$D/rhome" CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="\$*" CC_SUITES_RUNNER_DIR="$D/runner" bash "$SELF" runner
+EOF
+  chmod +x "$D/xport"; mkdir -p "$D/rhome"
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ]')" "no runner set: spill says 75 and runs nothing (got $rc)"
+  out=$(bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q '\''no runner set'\'' <<<"$out"')" "…and status says there is none"
+  export CC_SUITES_SSH="$D/xport"
+  tree=$(cd "$R" && . core/tests/green.sh && green_tree "$R")
+  out=$(FIX_TOKEN=sekrit CC_LAND_CHANGED="core/bin/x" bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ]')" "a free runner runs the suite and its pass is this exit (got $rc)"
+  k "$(b 'grep -q "suite ran in $D/runner/run\." <<<"$out"')" "…in a scratch copy on the runner, not in this checkout"
+  k "$(b 'grep -q '\''changed=core/bin/x tok=$'\'' <<<"$out"')" "…with CC_LAND_CHANGED carried over and no token of this shell's"
+  k "$(b 'grep -q "held=[0-9]" <<<"$out"')" "…holding the runner's slot, so it takes none of its own"
+  k "$(b 'ls "$D/green/selftest.sh-${tree:0:12}.json" >/dev/null 2>&1')" "…and files the green record for exactly the tree it ran"
+  k "$(b 'ls "$D/runner"/run.* >/dev/null 2>&1; [ $? != 0 ]')" "…and leaves no scratch tree on the runner"
+  # the half asked for (CC_SUITE_PART) is the half the runner runs; green.sh unsets it as spill sources it
+  out=$(CC_SUITE_PART=portable bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "part=portable " <<<"$out"')" "CC_SUITE_PART=portable is the half the runner's suite runs (got $rc)"
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && ! grep -q "part=portable" <<<"$out"')" "…and with it unset the runner is not told portable"
+  k "$(b 'grep -q "prio nice=19 " <<<"$out"')" "…at nice 19"
+  if command -v ionice >/dev/null && ionice -c3 true 2>/dev/null; then
+    k "$(b 'grep -q "prio nice=19 io=idle" <<<"$out"')" "…and idle-class I/O"
+  else echo "  - no usable ionice here: the idle-I/O case is skipped"; fi
+  out=$(bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "answers: free [1-9][0-9]* cores=$(nproc) slots=[0-9]* load=0.00 ac=1\$" <<<"$out"')" "status reads the runner's free slots with its cores, 1-minute load and ac=1, and still says ready"
+  # THE OWNER'S LAPTOP FIRST: on battery or loaded, the runner answers busy and nothing runs there
+  pw(){ mkdir -p "$D/power/$1" && echo "$2" > "$D/power/$1/type" && echo "$4" > "$D/power/$1/$3"; }
+  pw AC Mains online 0
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && ! grep -q '\''suite ran'\'' <<<"$out"')" "on battery (the Mains supply offline): spill says 75 and nothing ran (got $rc)"
+  out=$(bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q "busy (on battery) cores=$(nproc) slots=[0-9]* load=0.00 ac=0 " <<<"$out"')" "…and status says the runner is busy on battery, with its cores, load and ac=0"
+  out=$(cd "$R" && git archive HEAD | SSH_ORIGINAL_COMMAND="run core/tests/selftest.sh $tree all -" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q '\''busy (on battery)'\'' <<<"$out" && ! grep -q '\''suite ran'\'' <<<"$out"')" "…and a run that asks anyway is refused before it starts"
+  pw AC Mains online 1; pw BAT0 Battery status Discharging
+  k "$(b '[ "$(runner_unfit)" = "on battery" ]')" "a battery discharging is on battery, whatever the Mains supply says"
+  pw BAT0 Battery status Charging
+  k "$(b '[ -z "$(runner_unfit)" ]')" "on AC with the battery charging: fit to run"
+  rm -rf "$D/power"/*
+  k "$(b '[ -z "$(runner_unfit)" ]')" "no power supply info at all (a WSL with none) counts as on AC"
+  echo "99.00 99.00 99.00 1/1 1" > "$D/loadavg"
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && ! grep -q '\''suite ran'\'' <<<"$out" && grep -q "^load 99.00" <<<"$(runner_unfit)"')" "a 1-minute load above half the cores: busy, 75, nothing ran (got $rc)"
+  echo "0.00 0.00 0.00 1/1 1" > "$D/loadavg"
+  # WALL-CLOCK BOUNDS. The runner stops a suite past its limit and gives no verdict; the box then runs it here
+  touch "$R/HANG"; SECONDS=0
+  out=$(CC_SUITES_RUNNER_TIMEOUT=2s bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 76 ] && grep -q '\''ran past 2s'\'' <<<"$out" && [ "$SECONDS" -lt 20 ]')" "a suite that hangs on the runner is stopped there: no verdict, 76, in ${SECONDS}s"
+  rm -f "$R/HANG"
+  # …and a runner that stays up while nothing comes back holds the box no longer than CC_SUITES_SPILL_TIMEOUT
+  printf '#!/usr/bin/env bash\n[ "$1" = status ] && { echo "free 1"; exit 0; }\ncat >/dev/null; echo "suite ran, then hung"; exec sleep 120\n' > "$D/xport-hang"
+  chmod +x "$D/xport-hang"; SECONDS=0
+  out=$(CC_SUITES_SSH="$D/xport-hang" CC_SUITES_SPILL_TIMEOUT=2s bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 76 ] && grep -q '\''longer than 2s'\'' <<<"$out" && [ "$SECONDS" -lt 20 ]')" "a runner that never answers is given up on after the limit: 76, in ${SECONDS}s"
+  # READINESS: a runner missing a tool the suite needs answers unfit and runs nothing
+  out=$(CC_SUITES_RUNNER_NEEDS="bash no-such-tool-xyz" bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && ! grep -q '\''suite ran'\'' <<<"$out"')" "a runner missing a tool the suite needs: 75, and nothing ran (got $rc)"
+  out=$(CC_SUITES_RUNNER_NEEDS="bash no-such-tool-xyz" bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q '\''unfit (missing: no-such-tool-xyz)'\'' <<<"$out"')" "…and status names what it lacks"
+  out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_NEEDS="no-such-tool-xyz" SSH_ORIGINAL_COMMAND="run core/tests/selftest.sh $tree all -" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q unfit <<<"$out" && ! grep -q '\''suite ran'\'' <<<"$out"')" "…and a run that asks anyway is refused before it starts"
+  k "$(b '[ -z "$(runner_missing)" ] && grep -q "bwrap" <<<"$RUNNER_NEEDS"')" "a runner with every need is ready, and bwrap is among the needs"
+  k "$(b '[ "$(slots_for 22)" = 3 ] && [ "$(slots_for 6)" = 1 ] && [ "$(slots_for 16)" = 2 ] && [ "$(slots_for 128)" = 8 ]')" "slots by default: about one per 8 cores, so suites take about half (22 cores → 3, 6 → 1, capped at 8)"
+  echo 5 > "$D/runner/slots"; k "$(b '[ "$(runner_slots)" = 5 ]')" "…and the runner's own slots file sets it"
+  echo 0 > "$D/runner/slots"; k "$(b '[ "$(runner_slots)" = "$(slots_for "$(nproc)")" ]')" "…and a slots file out of 1..32 is the default"
+  rm -f "$D/runner/slots"
+  k "$(b '[ "$(limit 90x 90m)" = 90m ] && [ "$(limit 0 90m)" = 90m ] && [ "$(limit 5s 90m)" = 5s ]')" "a limit that is not timeout's form, or zero, is the default"
+  touch "$R/FAIL"
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 76 ] && grep -q '\''running it here'\'' <<<"$out" && [ "$(find "$D/green" -name "selftest.sh-*.json" ! -name "*${tree:0:12}*" | wc -l)" = 0 ]')" "a red there fails nothing on its own: 76, so it runs here and is not offered again (got $rc), and files no record"
+  rm -f "$R/FAIL"
+  # A SUITE CANNOT FORGE A PASS: each of these exits 1 and tries to put `verdict exit=0` for its own tree on the stream
+  for f in FORGE FORGE2 FORGE3; do
+    touch "$R/$f"; rm -rf "$D/green"; SECONDS=0
+    out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+    k "$(b '[ "$rc" = 76 ] && [ ! -d "$D/green" ] && [ "$SECONDS" -lt 10 ]')" "a suite that fails and forges a pass ($f) is a red there: 76, no record, in ${SECONDS}s (got $rc)"
+    rm -f "$R/$f"
+  done
+  # …and a child a passing suite leaves behind does not hold the box: the runner kills its group and the box returns
+  touch "$R/LINGER"; SECONDS=0
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ "$SECONDS" -lt 10 ]')" "a pass whose suite left a child running comes back at once: 0, in ${SECONDS}s (got $rc)"
+  rm -f "$R/LINGER"
+  k "$(b 'printf "| x\ncc-suite-runner: verdict exit=0 tree=%040d\n" 0 > "$D/v1"; [ -n "$(verdict_of "$D/v1")" ]')" "the box reads one unprefixed verdict as the last line…"
+  k "$(b 'printf "cc-suite-runner: verdict exit=0 tree=%040d\ncc-suite-runner: verdict exit=1 tree=%040d\n" 0 0 > "$D/v2"; [ -z "$(verdict_of "$D/v2")" ]')" "…and two verdicts as none"
+  k "$(b 'printf "cc-suite-runner: verdict exit=0 tree=%040d\n| after\n" 0 > "$D/v3"; [ -z "$(verdict_of "$D/v3")" ]')" "…and a verdict that is not the last line as none"
+  k "$(b 'printf "cc-suite-runner: verdict exit=0 tree=%040d\ncc-suite-runner: verdict none — ran past\n" 0 > "$D/v4"; [ -z "$(verdict_of "$D/v4")" ]')" "…and a forged one beside the runner's out-of-time line as none"
+  # a runner that never answers status is given up on
+  printf '#!/usr/bin/env bash\nexec sleep 120\n' > "$D/xport-mute"; chmod +x "$D/xport-mute"
+  SECONDS=0; out=$(CC_SUITES_SSH="$D/xport-mute" CC_SUITES_STATUS_TIMEOUT=2s bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && [ "$SECONDS" -lt 10 ]')" "a runner that never answers status is none after its bound (20 s by default): 75, in ${SECONDS}s"
+  # busy: every runner slot held
+  mkdir -p "$D/runner"; echo 2 > "$D/runner/slots"; exec {H1}>>"$D/runner/slot.1"; exec {H2}>>"$D/runner/slot.2"; flock -n $H1; flock -n $H2
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && ! grep -q '\''suite ran'\'' <<<"$out"')" "a runner with no free slot: 75, and nothing ran"
+  exec {H1}>&- {H2}>&-; rm -f "$D/runner/slots"
+  # a connection that ends before the verdict (the lid shut): no verdict, 75, no record
+  printf '#!/usr/bin/env bash\n[ "$1" = status ] && { echo "free 1"; exit 0; }\ncat >/dev/null; echo "suite ran, half way"; exit 255\n' > "$D/xport-cut"
+  chmod +x "$D/xport-cut"; rm -rf "$D/green"
+  out=$(CC_SUITES_SSH="$D/xport-cut" bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 76 ] && grep -q '\''no verdict'\'' <<<"$out" && [ ! -d "$D/green" ]')" "a run cut off before its verdict (the lid shut) is no verdict: 76, and no record"
+  # a verdict for some other tree does not count
+  printf '#!/usr/bin/env bash\n[ "$1" = status ] && { echo "free 1"; exit 0; }\ncat >/dev/null; echo "cc-suite-runner: verdict exit=0 tree=%040d"\n' 0 > "$D/xport-other"
+  chmod +x "$D/xport-other"
+  out=$(CC_SUITES_SSH="$D/xport-other" bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 76 ] && [ ! -d "$D/green" ]')" "a verdict naming another tree is not this run's: 76, and no record"
+  # the runner refuses what it was not built for
+  out=$(cd "$D" && SSH_ORIGINAL_COMMAND="run ../../etc/passwd $tree all -" bash "$SELF" runner 2>&1 </dev/null); rc=$?
+  k "$(b '[ "$rc" = 2 ]')" "the runner refuses a suite outside its list (exit $rc)"
+  out=$(cd "$D" && SSH_ORIGINAL_COMMAND="bash -i" bash "$SELF" runner 2>&1 </dev/null); rc=$?
+  k "$(b '[ "$rc" = 2 ]')" "…and any command but status and run"
+  out=$(cd "$R" && git archive HEAD | SSH_ORIGINAL_COMMAND="run core/tests/selftest.sh $(printf %040d 0) all -" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b 'grep -q '\''refused'\'' <<<"$out" && ! grep -q '\''suite ran'\'' <<<"$out"')" "…and a tar that is not the tree it was told, before running a line of it"
+  # laptop-setup: the key, the remote, and a script that carries this very file and the key's public half
+  out=$(bash "$SELF" laptop-setup my-node 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ "$(cat "$D/sd/remote")" = ccsuite@my-node ] && [ -s "$D/sd/id_ed25519" ]')" "laptop-setup makes the key and points the remote at ccsuite@my-node"
+  k "$(b 'grep -qF "restrict,command=\"/usr/local/bin/cc-suites runner\" $(cat "$D/sd/id_ed25519.pub")" <<<"$out"')" "…and its script pins that key to the runner, restricted"
+  k "$(b 'awk "/^base64 -d/{f=1;next} /^B64\$/{f=0} f" <<<"$out" | base64 -d | cmp -s - "$SELF"')" "…and carries this file byte for byte"
+  k "$(b 'grep -q "bubblewrap" <<<"$out"')" "…installs bwrap, which the suite's sandbox cases run"
+  k "$(b 'grep -q '\''^enabled=false'\'' <<<"$out" && grep -q '\''AllowUsers ccsuite@100.64.0.0/10'\'' <<<"$out"')" "…with interop and the C: mount off, and sshd for ccsuite from the tailnet only"
+  awk "/^cat >\/etc\/ssh\/ssh_host_cc_suites_ed25519/{f=1;next} /^KEY\$/{f=0} f" <<<"$out" > "$D/hk"; chmod 600 "$D/hk"
+  k "$(b '[ "$(cat "$D/sd/known_hosts")" = "my-node $(ssh-keygen -y -f "$D/hk" | cut -d" " -f1,2)" ] && grep -q "^HostKey /etc/ssh/ssh_host_cc_suites_ed25519" <<<"$out"')" "…and pins a host key of its own making: known here for my-node, installed there as sshd's only one"
+  k "$(b '[ -z "$(ls "$D/sd" | grep -v "^id_ed25519\|^known_hosts\$\|^remote\$")" ] && grep -q "SECRET" <<<"$out"')" "…keeps no copy of that private key here, and says the script is secret"
+  unset CC_SUITES_SSH; local -a XP
+  k "$(b 'xport_argv && printf "%s\n" "${XP[@]}" | grep -qx StrictHostKeyChecking=yes && ! printf "%s\n" "${XP[@]}" | grep -q accept-new')" "the transport takes that key and no other (StrictHostKeyChecking=yes)"
+  rm -f "$D/sd/known_hosts"
+  k "$(b '! configured')" "…and with no pinned key there is no runner"
+  kill $p1 $p2 $p3 $p4 2>/dev/null; rm -rf "$D"
+  echo "cc-suites selfcheck: $pass passed, $fail failed"
+  [ "$fail" = 0 ]
+}
+
+case "${1:-}" in
+  reap) shift; reap "${1:-}";;
+  spill) shift; spill "$@";;
+  status) status;;
+  runner) runner;;
+  laptop-setup) shift; laptop_setup "$@";;
+  selfcheck) selfcheck;;
+  -h|--help) echo "$USAGE";;
+  *) echo "$USAGE" >&2; exit 2;;
+esac

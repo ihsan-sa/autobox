@@ -104,8 +104,9 @@ green_record(){   # $1 = the suite that just passed, as it was invoked ("$0"); $
 # names them). A tool's own selfcheck, and every case that drives it, is then worth running only if that tool
 # changed or a tool that INVOKES it did — `$BIN/cc-foo` in the source, which is a smaller and truer list than every
 # file that mentions the name in a comment. Nothing here is a list somebody keeps: the source is the graph. What
-# widens it back to everything: a path that is not a tool under bin/ (a test, a config, a template, install.sh —
-# what those touch is not something a grep can answer), a tool too short to grep for, and a tool that is gone.
+# widens it back to everything: a path that is not a tool under bin/ (a config, a template, install.sh, a test other
+# than a case file — what those touch is not something a grep can answer), a tool too short to grep for, and a tool
+# that is gone. A case file is the exception, and reaches what it tests (the loop below says how).
 # What NARROWS it: a path outside the tree this bin/ sits in — a private overlay's bin-private/, lessons/, docs/
 # around a core/ — is out of every case's reach, because that tree ships and is tested alone (core/install.sh's
 # case copies it bare) and so nothing in its suites can read past it. Such a path adds no tool and widens
@@ -114,15 +115,28 @@ green_record(){   # $1 = the suite that just passed, as it was invoked ("$0"); $
 # `cc` itself is the front door to nearly every tool, so it is never pulled in as an invoker — a stanza that calls
 # `cc` runs for a change to cc, which is everything, and not for every change to something cc can start.
 land_scope(){   # $1 = this tree's bin/. Sets SCOPE ("" = everything) and REACH (" tool tool ": the tools worth running for)
+                # …and SELFTEST_EDITED=1 when selftest.sh is among the changed paths (selftest_reach)
   local b=$1 p t tools="" queue nxt pre
-  SCOPE=""; REACH=""
+  SCOPE=""; REACH=""; SELFTEST_EDITED=""
   [ -n "${CC_LAND_CHANGED:-}" ] || return 0
   # the tree bin/ sits in, as the checkout's top names it: "core/", or "" at the top or where git gives no answer
   pre=$(git -C "$(dirname "$b")" rev-parse --show-prefix 2>/dev/null) || pre=""
   for p in $CC_LAND_CHANGED; do
     case "$p" in "$pre"*) ;; *) continue;; esac   # outside that tree: no case here can read it (above)
     t=${p##*/}
-    case "$p" in */bin/"$t"|bin/"$t") [ -f "$b/$t" ] && [ ${#t} -ge 3 ] || return 0;; *) return 0;; esac
+    # A CHANGED TEST reaches what it tests, not everything (brief: "a PR that edits a selftest case runs that case
+    # and its component, not everything"). A tool's own selfcheck file — tests/cc-foo-selfcheck.py, or
+    # tests/foo_selfcheck.py for cc-foo — stands for that tool. selftest.sh is marked, and the suite itself maps the
+    # hunks to the stanzas they sit in (selftest.sh, after STANZA_TOOLS); every other suite reads the mark as nothing
+    # of its own. Any other test file — green.sh, check.sh, a fixture — still reaches everything.
+    case "$p" in
+      */bin/"$t"|bin/"$t") [ -f "$b/$t" ] && [ ${#t} -ge 3 ] || return 0;;
+      */tests/selftest.sh|tests/selftest.sh) SELFTEST_EDITED=1; continue;;
+      */tests/*-selfcheck.py|tests/*-selfcheck.py|*/tests/*_selfcheck.py|tests/*_selfcheck.py)
+        t=${t%-selfcheck.py}; t=${t%_selfcheck.py}
+        if [ -f "$b/$t" ] && [ ${#t} -ge 3 ]; then :; elif [ -f "$b/cc-$t" ]; then t=cc-$t; else return 0; fi;;
+      *) return 0;;
+    esac
     tools="$tools $t"
   done
   # …and TRANSITIVELY: a caller's caller drives the changed tool just as surely, so this walks out from the changed
@@ -156,6 +170,11 @@ land_scope(){   # $1 = this tree's bin/. Sets SCOPE ("" = everything) and REACH 
   # nothing ever matches, and the suite that already passed on that content runs again every landing.
   SCOPE=$CC_LAND_CHANGED
 }
+# …AND A PLACED EDIT SAYS SO ON ITS RECORD. selftest.sh handed a base (CC_LAND_BASE) runs only the stanzas an edit
+# to itself sits in; the same paths with no base run every stanza. The batch's suite after the merge is handed no
+# base, and on the same tree it would have spent the warm's record for a run it never made (review of #693). So a
+# placed run files its scope as `<paths> @base:<sha>`, and cc-land's green_key asks for exactly that string.
+placed_scope(){ printf '%s @base:%s' "$1" "$2"; }   # $1 = the scope, $2 = the base the edit was placed against
 want(){ [ -z "${REACH:-}" ] && return 0; local t; for t; do case "$REACH" in *" $t "*) return 0;; esac; done; return 1; }
 
 # A SELFCHECK THAT READS ITS SIBLINGS runs for a change to any of them, and the graph above cannot say so: it maps
@@ -256,7 +275,8 @@ part_line(){   # the one sentence every suite ends on, so a `portable` run and a
 # list — and each such red held the serial lane for a whole suite and bought nothing. The list is a FILE, one case
 # per line, beside this one (`quarantine`) and, for an overlay's own tools, at the top of the repo in
 # tests/quarantine; nothing here skips anything. The cases still run, still rerun once alone (chk, rerun_alone),
-# and still report; a tool whose red, twice, is ONLY listed cases is reported by the line `quarantined` prints
+# and still report; a row counts only through its expiry date (column 5, YYYY-MM-DD, at most 60 days out; an owner in column 4 fixes it), so a
+# lapsed quarantine turns red again. A tool whose red, twice, is ONLY listed cases is reported by the line `quarantined` prints
 # instead of failing its gate. An inline selftest case with no selfcheck to rerun reports through qbad <tool>,
 # once. It never applies where a red could be the change's own:
 #   - the landing did not say what the diff is (no CC_LAND_CHANGED: a hand run, cc-green's unscoped run);
@@ -281,7 +301,10 @@ quarantine_open(){   # $1 = tool -> 0 when a quarantined case of that tool may p
 quarantined(){   # $1 = tool, $2 = its red output -> 0 and one line to report (no red shape in it) when every red
                  # line of $2 is a listed case of $1 and quarantine_open allows it; 1 and nothing printed otherwise
   local reds frags line f hit left=""
-  frags=$(cat $QUARANTINE_FILES 2>/dev/null | awk -F'\t' -v t="$1" '$1 == t && $2 != "" {print $2}')
+  # the expiry is a real date, today or later and at most QUARANTINE_MAX_DAYS out: awk compares strings, so "never"
+  # or 2999-01-01 would otherwise sort after today and quarantine a case for good
+  frags=$(cat $QUARANTINE_FILES 2>/dev/null | awk -F'\t' -v t="$1" -v d="$(date +%F)" -v m="$(date -d "+${QUARANTINE_MAX_DAYS:-60} days" +%F)" \
+    '$1 == t && $2 != "" && $5 ~ /^[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]$/ && $5 >= d && $5 <= m {print $2}')
   [ -n "$frags" ] || return 1
   reds=$(grep -E '✗|✘|FAIL|[A-Za-z]Error:' <<<"$2") || return 1   # a red with no case line named is not a listed case
   while IFS= read -r line; do

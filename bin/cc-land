@@ -62,7 +62,9 @@
                                                   Every other job — a protected or gate-first path —
                                                   is gated, reviewed, merged and deployed before the next of that repo
                                                   is touched. A job survives a usage-limit review (waits for
-                                                  the reset) and a red gate (3 tries, 15 min apart); a LAND-AFTER-FIX
+                                                  the reset) and a red the BOX caused (silent, a full disk, no
+                                                  memory: run once more, 15 min on); a red the tree caused stops
+                                                  it at once, since only a new head changes it; a LAND-AFTER-FIX
                                                   sends ONE fix iteration to the PR's track and re-queues on its push
                                                   (a branch already moved past the read is read again instead; a round
                                                   `cc` refuses HOLDS the job until the branch moves, said once more at
@@ -76,6 +78,11 @@
                                                   and why not — a verdict already recorded, a tier nobody reads, or the
                                                   review budget spent — so a seat buys its own read only where the
                                                   landing will not (it reads, spends and posts nothing)
+  cc-land times [--days N] [--repo R]             how long landings took, from queue.log: queued → merged at p50 and
+                                                  p95 over the last N days (7), counted from a PR's first queue and
+                                                  from the queue that landed it, then queued → a lane and each gate's
+                                                  green runs. A landing writes `stage <repo>#<pr> <name>` lines as it
+                                                  goes (lane, gate, verdict, merged; stage_event) for this to read
   cc-land selfcheck                               the decision table (core/tests/cc-land-selfcheck.py); no network
 
 THE FLOW, one line printed per step, stopped at the first real failure: gates and the paid review side by side on
@@ -94,7 +101,7 @@ WHAT IT WILL NOT DO:
   · Start a suite for a job that cannot succeed: a refusal a re-queue cannot mend (review budget spent, the head
     died on a cap) is written against the change and `queue` answers it in a second, after ONE gh call confirms
     the head, the verdict and the cap have not moved; a gh that does not answer queues as before.
-  · Merge a diff nobody read, when the diff is worth a paid read (the control layer, a wide diff, tests, install,
+  · Merge a diff nobody read, when the diff is worth a paid read (the control layer, a shared test file, install,
     config, the reviewer's rules; the rest lands on its gates and the planning session's read). The review is one
     headless `claude -p` on the PR's head with no shell, answering LAND / LAND-AFTER-FIX / DO-NOT-LAND; the two stops
     stop like a red gate and the findings are ONE PR comment — except a LAND-AFTER-FIX whose every finding is of
@@ -125,6 +132,10 @@ WHAT IT WILL NOT DO:
     killed is not a buy. A fix anybody pushed after a LAND-AFTER-FIX counts as the round. A refusal reached at
     the wall is re-checked against the PR first.
   · Time a gate on the clock: it is timed on its SILENCE — a suite waiting on a lock says so every minute.
+  · Leave a gate running once the landing is lost: the first red gate, or a read beside them answering LAND-AFTER-FIX
+    or DO-NOT-LAND, kills the others' process groups. A lander killed by SIGTERM or SIGHUP kills its gates as it goes
+    (on_death), and every gate carries CC_LAND_GATE_OF=<its lander's pid>, so each sweep kills the groups of a lander
+    that died some other way (reap_orphans).
   · Run a gate again on a tree it already went red on (red_run): the same tree is red at once, with the first red's
     case, until GREEN_TTL — unless the box caused that red (silent past GATE_IDLE, a full disk or quota, no memory),
     which files no record. A case on core/tests/quarantine or tests/quarantine does not red a gate (tests/green.sh
@@ -182,7 +193,7 @@ FAILED_RE = re.compile(r"(\d+) failed")   # a suite ending "0 failed" passed; "1
 BOX_STATE_RE = re.compile(r"Disk quota exceeded|No space left on device|Cannot allocate memory|fork: retry|Resource temporarily unavailable")
 # The end-to-end gates, the only slow ones: they run on every code diff, handed the changed paths (CC_LAND_CHANGED), beside the paid review. --full-gates runs every gate; the tier removes gates, never invents one.
 SUITE = ("core/tests/selftest.sh", "tests/selftest.sh")
-# What earns every gate and a paid read: paths that gate everything by construction, a wide diff, and the repo's own control layer, declared one path or glob per line in this file:
+# What earns every gate and a paid read: paths that gate everything by construction and the repo's own control layer, declared one path or glob per line in this file:
 CONTROL_LIST = ("core/tests/control-layer", "tests/control-layer")
 # Read from the base side of the diff, like REVIEW_RULES. No list means every code change is read; what is not on it lands on its gates and the planning session's own read, unpaid.
 SHARED_PATH_RE = re.compile(r"(^|/)(tests?|config|templates|\.github|\.githooks|\.circleci)/"
@@ -190,8 +201,11 @@ SHARED_PATH_RE = re.compile(r"(^|/)(tests?|config|templates|\.github|\.githooks|
                             r"requirements\.txt|go\.mod|Cargo\.toml)$")
 DOC_RE = re.compile(r"\.(md|markdown|txt|rst|adoc|org)$|(^|/)(docs|doc)/|(^|/)(LICENSE|COPYING|NOTICE)$", re.I)
 COMMENT_RE = re.compile(r"^\s*($|#|//|--[ \t]|\*[ \t/]|\*$|/\*)")   # a line comment in the syntaxes this box writes
-WIDE_FILES = 12                           # past this many files, or this many changed lines, "narrow" is a claim
-WIDE_LINES = 600                          # nobody can check — the suite is cheaper than being wrong about it
+# A test file that stands for one case or one tool (tests/green.sh land_scope, selftest.sh selftest_reach): the suite
+# runs what it tests, so editing it is not a reason for every gate. Any other test file still is.
+TEST_CASE_RE = re.compile(r"(^|/)tests/(selftest\.sh|[A-Za-z0-9_-]+[-_]selfcheck\.py)$")
+WIDE_FILES = 12                           # past this many files a BATCH's suite on the base runs everything (after_batch);
+                                          # a single PR's width is what it reaches (land_scope), never its file count
 GREEN_TTL = 6 * 3600                      # how long a suite's own green record is spent instead of running it again (green_run)
 WORKER_GREEN_TTL = 48 * 3600              # …and a worker's green on a batch member's HEAD (worker_green): the suite runs on the
                                           # base after the batch anyway, so an older record costs a revert at worst, not a red main
@@ -291,6 +305,14 @@ class Failed(Exception):
         self.short = short
 
 
+class RedGate(Failed):
+    """A gate's red, carrying whether the BOX caused it (`box`: silent past GATE_IDLE, a full disk, no memory — note_red
+    filed no record), which is the one red the queue runs again (run_job)."""
+    def __init__(self, box, *args, short=""):
+        super().__init__(*args, short=short)
+        self.box = box
+
+
 class Skip(Exception):
     """A step with nothing to do here (no Slack, no board row, no ledger row). Reported; the sequence goes on."""
 
@@ -311,8 +333,23 @@ def sh(argv, cwd=None, timeout=300, stdout_only=False, **kw):
         if not tok:
             return 1, f"no GitHub token granted to workspace {member_root(cwd)} (cc-sandbox github <workspace>) — nothing asked"
         kw["env"] = dict(kw.get("env") or os.environ, GH_TOKEN=tok, GH_CONFIG_DIR=f"{cwd}/.gh-none")   # env, never argv
+    track = kw.pop("track", False)   # the paid review: in _GATES while it runs, so on_death kills it with the gates
     try:
-        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, **kw)
+        if track:
+            p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                 stdin=subprocess.DEVNULL, start_new_session=True, **kw)
+            _GATES.add(p)
+            try:
+                out, err = p.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                kill_group(p)
+                p.communicate()
+                raise
+            finally:
+                _GATES.discard(p)
+            r = subprocess.CompletedProcess(argv, p.returncode, out, err)
+        else:
+            r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, **kw)
         if stdout_only:
             if r.stderr: print(r.stderr, end="", file=sys.stderr)
             return r.returncode, r.stdout
@@ -327,6 +364,50 @@ def kill_group(p):
         os.killpg(p.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         p.kill()
+
+
+# A GATE DIES WITH ITS LANDER. Every gate runs in a process group of its own, so a lander killed mid-gate left the
+# group running: on 2026-09-24 three of four suite slots were held by orphans of killed landers. The brief: "kill a
+# gate's process group when its lander dies". Two ways, since a SIGKILL runs no handler: a SIGTERM or SIGHUP kills this
+# lander's groups before it goes (on_death), and every gate carries GATE_OF=<its lander's pid> in its environment, so the
+# next sweep finds what a dead lander left and kills those groups (reap_orphans).
+GATE_OF = "CC_LAND_GATE_OF"
+_GATES = set()      # the Popen of every gate this lander has running, and of its paid review (sh track=True), for on_death
+
+
+def on_death(signum, frame):
+    """SIGTERM/SIGHUP: kill every gate group this lander started, then die of the same signal."""
+    for p in list(_GATES):
+        kill_group(p)
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def reap_orphans(proc="/proc"):
+    """Kill the process group of every process whose environment names a lander (GATE_OF) that is no longer a live
+    cc-land (live_lander): a dead lander's gates and what they forked. Run once at the start of a sweep. Returns the
+    pids of the groups it killed; never raises."""
+    groups = {}
+    for d in os.listdir(proc):
+        if not d.isdigit() or int(d) == os.getpid():
+            continue
+        try:
+            env = open(f"{proc}/{d}/environ", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        of = next((e.split(b"=", 1)[1] for e in env if e.startswith(GATE_OF.encode() + b"=")), b"")
+        if of.isdigit() and int(of) != os.getpid() and not live_lander(int(of)):
+            with contextlib.suppress(OSError):
+                groups.setdefault(os.getpgid(int(d)), of.decode())
+    killed = []
+    for g, of in sorted(groups.items()):
+        if g in (os.getpgid(0), 0, 1):   # never our own group, whatever an inherited environment says
+            continue
+        with contextlib.suppress(OSError):
+            os.killpg(g, signal.SIGKILL)
+            killed.append(g)
+            ledger(f"reaped gate group {g} — its lander, pid {of}, is gone")
+    return killed
 
 
 # ── the run's scratch root ───────────────────────────────────────────────────────────────────────────────
@@ -499,6 +580,7 @@ def run_gate(argv, cwd, log, env, stop=None):
                              stdin=subprocess.DEVNULL, env=env, start_new_session=True)
     except Exception as e:
         return 127, f"{e.__class__.__name__}: {e}"
+    _GATES.add(p)
     try:
         quiet = time.monotonic()
         while True:
@@ -527,6 +609,7 @@ def run_gate(argv, cwd, log, env, stop=None):
             put(chunk.decode("utf-8", "replace"))
         return p.wait(), b"".join(out_).decode("utf-8", "replace")
     finally:
+        _GATES.discard(p)
         if f:
             with contextlib.suppress(OSError):
                 f.close()
@@ -995,6 +1078,106 @@ def ledger(line):
         pass
 
 
+def stage_event(repo, pr, name, **kv):
+    """One `stage <repo>#<pr> <name> k=v…` line in queue.log, written as the stage happens: `lane` (a lane took the job,
+    or a batch started its warm), `gate` (one gate ended: gate=, ok=yes|no|reused|stopped, secs=), `verdict`
+    (verdict=) and `merged`. With the `queued` line cmd_queue already writes, these are what `cc-land times` measures
+    a landing on. The brief: "cc-land writes stage events to queue.log (queued, lane acquired, each gate's end,
+    verdict, merged)". A deploy job (no PR) writes none."""
+    if pr:
+        ledger(" ".join([f"stage {repo}#{pr} {name}"] + [f"{k}={v}" for k, v in kv.items() if v not in (None, "")]))
+
+
+def pctl(values, p):
+    """The nearest-rank p-th percentile of `values` (p50 of 1..4 is 2, p95 of 1..20 is 19), or None when empty."""
+    v = sorted(values)
+    return v[max(0, -(-len(v) * p // 100) - 1)] if v else None
+
+
+def span_words(secs):
+    """A duration the way a person reads it: 45s, 12m, 4h05m."""
+    secs = int(secs)
+    if secs < 90:
+        return f"{secs}s"
+    if secs < 90 * 60:
+        return f"{round(secs / 60)}m"
+    return f"{secs // 3600}h{secs % 3600 // 60:02d}m"
+
+
+LOG_EVENT_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\t(?:(queued|requeued|fix-pushed|done) ([\w.-]+)#(\d+)(?: rc=(\d+))?"
+                          r"|stage ([\w.-]+)#(\d+) (\w+)(.*))")
+
+
+def lead_times(lines, since=0.0, repo=""):
+    """What `cc-land times` reports, from queue.log's lines: {"first": […], "last": […], "lane": […], "gates": {gate: […]}}
+    in seconds. A PR's lead time runs from a `queued` line to the landing that merged it — its `stage … merged` line, or,
+    in the log written before those lines, a `done … rc=0|3|4` (merged; 3 and 4 are merged with a step still owed).
+    `first` counts from the PR's first queue (what a person waited, fix rounds included), `last` from the queue that
+    landed it — a `requeued`, or a fix round's `fix-pushed`, starts it again — so it is what the lane cost. `lane` is that last queue to the first lane after it; `gates` each gate's own run.
+    Only landings whose merge falls at or after `since` (an epoch) count, and only `repo`'s when one is named."""
+    first, last, lane_at, got = {}, {}, {}, {"first": [], "last": [], "lane": [], "gates": {}}
+    for ln in lines:
+        m = LOG_EVENT_RE.match(ln)
+        if not m:
+            continue
+        at = epoch_of(m.group(1))
+        if m.group(2):
+            kind, key, rc, rest = m.group(2), (m.group(3), m.group(4)), m.group(5), ""
+        else:
+            kind, key, rc, rest = m.group(8), (m.group(6), m.group(7)), None, m.group(9)
+        if repo and key[0] != repo:
+            continue
+        if kind in ("queued", "requeued", "fix-pushed"):
+            first.setdefault(key, at)
+            last[key] = at
+            lane_at.pop(key, None)
+        elif kind == "lane":
+            lane_at.setdefault(key, at)
+        elif kind == "gate" and at >= since:
+            g, s = re.search(r"\bgate=(\S+)", rest), re.search(r"\bok=yes\b.*\bsecs=(\d+)", rest)
+            if g and s:   # a green run's own length: a red or stopped one ended early and would flatter the figure
+                got["gates"].setdefault(g.group(1), []).append(int(s.group(1)))
+        elif (kind == "merged" or (kind == "done" and rc in ("0", "3", "4"))) and key in last:
+            if at >= since:
+                got["first"].append(at - first[key])
+                got["last"].append(at - last[key])
+                if key in lane_at:
+                    got["lane"].append(lane_at[key] - last[key])
+            for d in (first, last, lane_at):   # merged once: the `done` after a `stage merged` is the same landing
+                d.pop(key, None)
+    return got
+
+
+def cmd_times(argv):
+    """`cc-land times [--days N] [--repo R]`: queued-to-merged at p50 and p95 over the last N days (7), from queue.log."""
+    days, repo = 7.0, ""
+    try:
+        opts = dict(zip(argv[::2], argv[1::2]))
+        if len(argv) % 2 or set(opts) - {"--days", "--repo"}:
+            raise ValueError
+        days, repo = float(opts.get("--days", days)), opts.get("--repo", "")
+    except ValueError:
+        return refuse("usage: cc-land times [--days N] [--repo R]")
+    try:
+        with open(f"{LANDQ}/queue.log", errors="replace") as f:
+            got = lead_times(f, since=time.time() - days * 86400, repo=repo)
+    except OSError as e:
+        return refuse(f"no queue log to measure: {e}", rc=1)
+    where = f" of {repo}" if repo else ""
+
+    def row(name, vals):
+        if not vals:
+            return f"{name}: none"
+        return f"{name}: p50 {span_words(pctl(vals, 50))}, p95 {span_words(pctl(vals, 95))} over {len(vals)}"
+    print(f"landings{where} merged in the last {days:g} days — {len(got['first'])}")
+    print("  " + row("queued → merged, from the first queue", got["first"]))
+    print("  " + row("queued → merged, from the queue that landed it", got["last"]))
+    print("  " + row("queued → a lane took it", got["lane"]))
+    for g in sorted(got["gates"]):
+        print("  " + row(f"gate {g}, green runs", got["gates"][g]))
+    return 0
+
+
 def read_json(path):
     try:
         with open(path) as f:
@@ -1226,18 +1409,6 @@ def gate_first_paths(root, a, paths):
     return [p for p in paths if p in named], True
 
 
-def churn(root, a, b):
-    """Lines added plus lines removed. WIDE_LINES + 1 when it cannot be read, so unreadable counts as wide."""
-    rc, o = sh(["git", "diff", "--numstat", a, b], cwd=root, timeout=120)
-    if rc:
-        return WIDE_LINES + 1
-    n = 0
-    for ln in o.splitlines():
-        f = ln.split("\t")
-        n += sum(int(x) for x in f[:2] if x.isdigit())    # "-" for a binary file: counted as nothing, and binaries
-    return n                                              # are never doc or comment, so they cannot reach `docs`
-
-
 def instruction_path(p):
     """Whether `p` is something a session loads and acts on — CLAUDE.md, AGENTS.md, a skill, anything under .claude/ — which reads like prose and is not."""
     return (os.path.basename(p) in ("CLAUDE.md", "AGENTS.md", "SKILL.md")
@@ -1255,11 +1426,12 @@ def gate_tier(root, a, b, changed):
     paths = [p for _, p in changed]
     if not paths:
         return "full", "nothing could be read about what this changes"
-    if len(paths) > WIDE_FILES:
-        return "full", f"a wide diff — {len(paths)} files, more than anyone can scope by eye"
-    hit = [p for p in paths if SHARED_PATH_RE.search(p)]
+    # Planning, 2026-09-25: "A PR that edits a selftest case runs that case and its component, not everything.
+    # 'Wide' is judged by what the change reaches, not by file count." So neither a case file nor a count of files
+    # or lines sends a diff here; the suite's own reach (tests/green.sh) decides how much of it runs.
+    hit = [p for p in paths if SHARED_PATH_RE.search(p) and not TEST_CASE_RE.search(p)]
     if hit:
-        return "full", f"the tests, the install, the config, the templates or CI changed ({', '.join(hit[:3])})"
+        return "full", f"the install, the config, the templates, CI or a shared test file changed ({', '.join(hit[:3])})"
     if REVIEW_RULES in paths:
         # The reviewer's rules are read from origin/<base>; a `docs` tier here would let a markdown-only PR rewrite them unread.
         return "full", f"{REVIEW_RULES} — the rules the reviewer is judged by are never a documentation change"
@@ -1267,9 +1439,6 @@ def gate_tier(root, a, b, changed):
     if inst:
         # Same hole, one ring out: files every session loads must not land unread.
         return "full", f"instructions every session loads are never a documentation change ({', '.join(inst[:3])})"
-    n = churn(root, a, b)
-    if n > WIDE_LINES:
-        return "full", f"a wide diff — {n} changed lines across {len(paths)} file(s)"
     code = [p for p in paths if not DOC_RE.search(p) and not comment_only(root, a, b, p)]
     if not code:
         return "docs", f"documentation and comments only — {len(paths)} file(s), no code changed"
@@ -1294,11 +1463,22 @@ def green_run(content, gate, scope="", part="", ttl=GREEN_TTL):
     base = f"{green_dir()}/{os.path.basename(gate)}"
     for p in ([f"{base}-{part}-{content[:12]}.json"] if part else []) + [f"{base}-{content[:12]}.json"]:
         j = read_json(p) or {}
-        if (j.get("tree") == content and j.get("suite") == gate and (j.get("scope") or "") in ("", scope)
+        if (j.get("tree") == content and j.get("suite") == gate
+                and (j.get("scope") or "") in ("", scope, scope.split(" @base:")[0])   # a placed ask spends a whole-file run
                 and (j.get("part") or "") in ("", part)
                 and time.time() - epoch_of(j.get("at", "")) <= ttl):
             return True
     return False
+
+
+SELFTEST_RE = re.compile(r"(^|/)tests/selftest\.sh$")
+
+
+def green_key(scope, base=""):
+    """The scope a suite's record is filed and read under: the paths, and — when selftest.sh is among them and the run was handed CC_LAND_BASE — ` @base:<sha>` after them, as core/tests/selftest.sh files it. That run placed the edit in the stanzas it sits in and ran only those; the same paths with no base run every stanza, so the batch's suite after the merge must not spend the warm's record on the same tree (review of #693)."""
+    if scope and base and any(SELFTEST_RE.search(p) for p in scope.split()):
+        return f"{scope} @base:{base}"
+    return scope
 
 
 def red_path(content, gate):
@@ -1735,6 +1915,7 @@ class Land:
         self._ckey = None        # (head, digest): what change this IS — see change_key()
         self._mb = None          # (head, merge-base, why): where it left the base — see merge_base()
         self._tier = None        # (head, tier, why): decided ONCE per head and shared by the review and the gates
+        self._scope = None       # ((head, paths), scope): gate_scope's answer, which asks cc-config and git once per head
         self.span = span         # (installed_sha, tip_sha): a deploy with no PR, catching the box up to a merge it missed
         self.job = ""            # the queue file this landing is running out of, if any — the stage is written to it
         self.stopped = ""        # the step that stopped it, so the worker knows whether trying again could differ
@@ -1757,6 +1938,10 @@ class Land:
                                  # merge is pinned to THIS and not to the head the gates happened to find (merge)
         self._review = None      # the review running BESIDE the suite (a thread) and what it decided: see gates()
         self._read = None
+        self.gate_stop = None        # the Event that stops the running gates (gates, run_gates, read_alongside)
+        self.verdict_stopped = False   # …and whether a stopping verdict was what set it
+        self.red_box = False           # the red that stopped the gates was the box's (note_red filed nothing)…
+        self.red_tree = False          # …or the tree's (a red record stands): run_job retries the one, never the other
         self.bought = False      # …and whether that read spent a buy: given back only by a usage limit or a cap, never by a red suite
         self.restarted = []
         self.owner_asks = []     # …and what is on the old code because the manifest keeps its restart for the owner: carries the command
@@ -1867,6 +2052,13 @@ class Land:
                 self._read = ("ok", self.review_now())
             except BaseException as e:
                 self._read = ("err", e)
+                # "It stops at the first red gate or non-LAND verdict": a verdict that stops the landing stops the
+                # gates still running beside it too (gates), since no green of theirs can land this head. A wall, a
+                # usage limit or a crash is not a verdict, and the gates run on.
+                if (isinstance(e, Failed) and not getattr(e, "doomed", False)
+                        and self.verdict in ("LAND-AFTER-FIX", "DO-NOT-LAND") and self.gate_stop is not None):
+                    self.verdict_stopped = True
+                    self.gate_stop.set()
         self._review = threading.Thread(target=go, name=f"review-{self.repo}-{self.pr}", daemon=True)
         self._review.start()
 
@@ -2044,6 +2236,7 @@ class Land:
     def verdict_result(self, verdict, said, verb, cost, posted):
         """One place decides what a verdict means, so a verdict read back off the PR and one just bought stop the landing on the same terms."""
         self.verdict, self.findings = verdict, said
+        stage_event(self.repo, self.pr, "verdict", verdict=verdict)
         # The brief: "a LAND-AFTER-FIX whose findings aren't about correctness or security lands the PR and files a
         # follow-up board row instead of buying a fix round." A row with no kind (free-text runner) counts as one
         # that is about correctness.
@@ -2185,7 +2378,7 @@ class Land:
                 "--json-schema", REVIEW_SCHEMA,
                 "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands",
                 "--add-dir", tmp, "--allowedTools", REVIEW_ALLOW, "--disallowedTools", REVIEW_DENY]
-        rc, o = sh(argv, cwd=tmp, timeout=1800, **clean_start())
+        rc, o = sh(argv, cwd=tmp, timeout=1800, track=True, **clean_start())
         try:
             j = json.loads(o)
         except ValueError:
@@ -2242,7 +2435,7 @@ class Land:
 
     # -- 2. gates ------------------------------------------------------------------------------------------
     def gates(self):
-        """Gate the merge (merge_result), before merging: every gate at once, the paid read beside them from t=0, the suite handed CC_LAND_CHANGED and CC_SELFTEST_SLOTS, each gate timed on silence (run_gate). The first red stops the rest within a second; the first red in gate order is reported; the read's buy stands."""
+        """Gate the merge (merge_result), before merging: every gate at once, the paid read beside them from t=0, the suite handed CC_LAND_CHANGED and CC_SELFTEST_SLOTS, each gate timed on silence (run_gate). The first red, or a read beside them that answers LAND-AFTER-FIX or DO-NOT-LAND, stops the rest within a second; the first red in gate order is reported; the read's buy stands."""
         if self.pr and self.facts.get("state") == "MERGED":
             raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
         tree, tmp, at, base_sha = self.root, None, "", ""
@@ -2288,11 +2481,14 @@ class Land:
             out("·", f"the {tier} tier: {', '.join(found)} — {why}")
             content, reused = tree_id(tree), []   # …and of those, the ones this exact content has already passed
             scope = self.gate_scope()             # what the diff changed, for a suite that runs only what that reaches
+            placed = self.scope_base(base_sha)    # …the base selftest.sh places an edit to itself against
+            key = green_key(scope, placed)        # …and the two as a record is keyed (green_key)
             # NEVER RE-RUN AN UNCHANGED RED TREE: a gate that already went red on this content, at this scope, is red
             # again at once — before a gate or a read is bought. The brief: "never re-run an unchanged red tree".
             for g in found:
-                prior = red_run(content, g, scope)
+                prior = red_run(content, g, key)
                 if prior:
+                    self.red_tree = True
                     raise Failed(f"gate {g} did not pass: {prior.get('why') or 'red'} — already red on this exact tree "
                                  f"({content[:12]}) at {prior.get('at')}, so not run again; a new head or a moved "
                                  f"base runs it{self.behind_base()}",
@@ -2301,9 +2497,15 @@ class Land:
             quarantined = []   # QUARANTINED lines a passing gate printed (core/tests/green.sh): reported on the ✓ line
 
             # All gates at once, and the read from t=0: a head a cheap gate rejects also buys a read, whose verdict goes on the PR for the retry.
-            if any(not green_run(content, g, scope) for g in found):
+            self.gate_stop = threading.Event()   # set by the first red gate, or by a stopping verdict (read_alongside)
+            if any(not green_run(content, g, key) for g in found):
                 self.read_alongside()
-            errs = self.run_gates(tree, found, scope, content, reused, quarantined)
+            errs = self.run_gates(tree, found, scope, content, reused, quarantined, base=placed)
+            if not errs and self.verdict_stopped:
+                # The gates were stopped by the verdict, not passed: no ✓ here. The review step next raises that verdict
+                # itself, as the stop — so a LAND-AFTER-FIX still gets its fix round (run_job keys on the review step).
+                raise Skip(f"the gates were stopped, not passed: the read beside them answered {self.verdict}, "
+                           f"so nothing they found could land this head")
             if errs:
                 if self._review is not None:
                     try:
@@ -2314,7 +2516,10 @@ class Land:
                         # Not given back: the money went, and a refund would let red head after red head buy a read with `reviews` at 0. The retry reads the verdict back for free.
                         out("·", "the review that ran beside the gates is COUNTED against this change — the read "
                                  "was paid for — and its verdict is on the PR for the retry to read back")
-                raise errs[next(g for g in found if g in errs)]   # the first red in gate order, not whichever thread finished first
+                first = errs[next(g for g in found if g in errs)]   # the first red in gate order, not whichever thread finished first
+                self.red_box = getattr(first, "box", False)
+                self.red_tree = isinstance(first, RedGate) and not first.box
+                raise first
             on = f"PR #{self.pr} on {self.gated_on()}" if self.head else f"the {self.base()} checkout"
             again = f" — {len(reused)} of them already green on {content[:12]}, not run again" if reused else ""
             beside = " — the review ran beside the gates" if self._review is not None else ""
@@ -2325,20 +2530,26 @@ class Land:
             if tmp:
                 self.drop_checkout(tmp, tree)
 
-    def run_gates(self, tree, found, scope, content, reused, quarantined=None):
+    def run_gates(self, tree, found, scope, content, reused, quarantined=None, base=""):
         """Run `found` on `tree` at once, each on its own thread and timed on silence (run_gate), a green record on this content spent instead of a run (appended to `reused`), and the first red stopping the rest within a second. Returns {gate: the Failed} — empty when every gate passed. gates() runs it on a PR's merge; suite_on (after_batch) on the base itself."""
+        key = green_key(scope, base)   # the scope a record answers under: a run handed a base placed its selftest.sh edit
         def run(g):
-            if green_run(content, g, scope):
+            if green_run(content, g, key):
                 reused.append(g)
+                stage_event(self.repo, self.pr, "gate", gate=os.path.basename(g), ok="reused")
                 out("·", f"{g}: already green on this content ({content[:12]}) — the run that made it left the "
                          f"record, so this landing does not buy the same answer twice")
                 return
             start = clean_start()
             start["env"].pop("CC_LAND_CHANGED", None)   # never an inherited scope: a landing run from inside a
+            start["env"].pop("CC_LAND_BASE", None)
             if scope:                                    # scoped suite would hand its gates that suite's paths
                 start["env"]["CC_LAND_CHANGED"] = scope
+                if base:                                 # …and the base the merge was built on, for selftest.sh to
+                    start["env"]["CC_LAND_BASE"] = base  # place an edit to it in the stanza it sits in (selftest_reach)
             start["env"].pop("CC_SUITE_PART", None)     # …nor an inherited half, for the same reason
             start["env"]["CC_SELFTEST_SLOTS"] = str(SUITE_SLOTS)   # the one slot number, handed to the suite
+            start["env"][GATE_OF] = str(os.getpid())    # …and whose it is, so a sweep can kill it if this lander dies
             keep = f"{run_root()}/cc-land-gate-{self.repo}-{self.pr or 'base'}-{os.path.basename(g)}.log"
             argv = [f"{tree}/{g}"]
             if self.member and self.mtrack:
@@ -2349,20 +2560,27 @@ class Land:
                         + [f"{k}={start['env'][k]}" for k in ("CC_LAND_CHANGED", "CC_SELFTEST_SLOTS")
                            if k in start["env"]]
                         + [f"{tree}/{g}"])
+            t0 = time.monotonic()
             try:
                 rc, o = run_gate(argv, tree, keep, start["env"], stop=stop)
             except GateStopped:
+                stage_event(self.repo, self.pr, "gate", gate=os.path.basename(g), ok="stopped",
+                            secs=int(time.monotonic() - t0))
                 out("·", f"{g}: stopped, not run to the end — another gate is red, so this one could not save the landing")
                 return
             bad = FAILED_RE.search(o)
-            if rc or (bad and bad.group(1) != "0"):
+            red = bool(rc or (bad and bad.group(1) != "0"))
+            stage_event(self.repo, self.pr, "gate", gate=os.path.basename(g), ok="no" if red else "yes",
+                        secs=int(time.monotonic() - t0))
+            if red:
                 keep_log(keep)                   # the one log that outlives the run — bounded, at this path
                 record_red(self.project, g, content, keep, o, pr=self.pr)   # …and the ledger line that outlives THAT
                 full = disk_full(o)
-                if not note_red(content, g, scope, rc, o):   # …and the record red_run spends, unless the box caused it
+                box = not note_red(content, g, key, rc, o)   # …and the record red_run spends, unless the box caused it
+                if box:
                     out("·", f"{g}: red on the box's state (silent past {GATE_IDLE}s, a full disk, no memory), "
-                             f"not the tree's — no red record, so the next sweep runs it again")
-                raise Failed(f"gate {g} did not pass: {gate_fail(o)}{full}{self.behind_base()}"
+                             f"not the tree's — no red record, so the next sweep runs it again, once")
+                raise RedGate(box, f"gate {g} did not pass: {gate_fail(o)}{full}{self.behind_base()}"
                              f"  [full output: {keep}]",
                              # the card gets the gate and the case that FAILED and nothing else: the stale-base
                              # reading and the log's path are the landing record's, and are kept above. In
@@ -2371,7 +2589,7 @@ class Land:
             if quarantined is not None:   # QUARANTINED lines a passing gate printed, for the caller's ✓ line
                 quarantined.extend(ln.strip() for ln in o.splitlines() if "QUARANTINED —" in ln)
 
-        errs, stop = {}, threading.Event()
+        errs, stop = {}, getattr(self, "gate_stop", None) or threading.Event()
 
         def go(g):
             try:
@@ -2438,16 +2656,24 @@ class Land:
         files = sorted({p for _, p in name_status(self.pr_diff("--name-status"))})
         if not files:
             raise Failed(f"the head {self.head[:12]} of PR #{self.pr} changes no file git can name — every gate first", short=short)
+        hit = self.gate_first_hit(files, base)
+        if hit and hit[0] == "?":
+            raise Failed(f"{hit[1]} — every gate first", short=short)
+        if hit:
+            raise Failed(f"the head {self.head[:12]} touches {hit[0]}, which keeps every gate before the merge "
+                         f"({hit[1]}) — not ordinary: it lands on its own", short=short)
+
+    def gate_first_hit(self, files, base=""):
+        """Whether `files` keep every gate before the merge, off git and cc-config, as (what, why) or None: a PROTECTED path, a path the gate-first list names or no list covers, or no list at all. ('?', why) when cc-config would not say which paths are protected — fail closed. ordinary_at_head stops a warm on it; gate_scope hands such a diff's suite no scope, because no suite runs after its merge."""
+        base = base or board(self.repo).get("default_branch") or "main"
         rules, why = protected_paths(self.repo)
         if rules is None:
-            raise Failed(f"{why} — every gate first", short=short)
+            return "?", why
         prot = [p for p in files if any(p == r.rstrip("/") or p.startswith(r.rstrip("/") + "/") for r in rules)]
         first, declared = gate_first_paths(self.root, f"origin/{base}", files)
         if prot or first or not declared:
-            what = ", ".join((prot or first or files)[:3])
-            raise Failed(f"the head {self.head[:12]} touches {what}, which keeps every gate before the merge "
-                         f"({'a PROTECTED path' if prot else 'the gate-first list'}) — not ordinary: it lands on its own",
-                         short=short)
+            return ", ".join((prot or first or files)[:3]), ("a PROTECTED path" if prot else "the gate-first list")
+        return None
 
     def spend_warm(self):
         """The batch's merge pass: the warm's static gates stand in for this landing's when it was about THIS head and the base has moved since only in files this PR does not touch — brief: "its merge with main is file-disjoint from what's landing with it". Its ✓ line, or '' and the gates run as they always did (a moved head, an overlap, a warm that could not answer). A warm that stopped at its gates is this landing's red: same head, same files."""
@@ -2487,14 +2713,25 @@ class Land:
         with contextlib.suppress(OSError):
             write_atomic(path, job)
 
+    def scope_base(self, base_sha):
+        """The base commit a scoped suite diffs its own case file against (CC_LAND_BASE): the base merged in, else the base the head already holds. '' when it cannot be read, and then an edit to selftest.sh runs every stanza."""
+        if base_sha:
+            return base_sha
+        rc, o = sh(["git", "rev-parse", "--verify", "-q", f"origin/{self.base()}"], cwd=self.root)
+        return o.strip() if not rc else ""
+
     def gate_scope(self):
-        """The paths this diff changes, sorted and space-separated: what the suite is handed as CC_LAND_CHANGED (core/tests/green.sh says how far that reaches) and the key beside a green record's tree. Empty means everything: --full-gates, a no-PR deploy, an unreadable or wide diff."""
+        """The paths this diff changes, sorted and space-separated: what the suite is handed as CC_LAND_CHANGED (core/tests/green.sh says how far that reaches) and the key beside a green record's tree. Empty means everything: --full-gates, a no-PR deploy, an unreadable diff, and a diff that keeps every gate before its merge (gate_first_hit) — a protected path gets no suite after the merge, so its one suite runs every stanza. How WIDE it is, is the suite's own reach, not a count here."""
         if self.full_gates or not self.pr or not self.head:
             return ""
         paths = sorted({p for _, p in self.changed_files()})
-        if not paths or len(paths) > WIDE_FILES:
+        if not paths:
             return ""
-        return " ".join(paths)
+        if self._scope and self._scope[0] == (self.head, tuple(paths)):
+            return self._scope[1]
+        scope = "" if self.gate_first_hit(paths) else " ".join(paths)
+        self._scope = ((self.head, tuple(paths)), scope)
+        return scope
 
     def tier_for(self):
         """What this diff has earned as (tier, why), decided once per head and cached so the review and the gates cannot disagree. Only a PR is ever scoped; a no-PR deploy is `full`."""
@@ -2561,6 +2798,7 @@ class Land:
         """The one place on this box that merges, after the gates: a squash pinned to the head the gates ran on (--match-head-commit), or, under a protected path, to the head the owner 👍'd; --subject the PR title, -R so gh deletes only the remote branch."""
         if self.facts.get("state") == "MERGED":
             root_done(self.repo, self.pr)      # in is in: the tally goes with the change it was bounding
+            stage_event(self.repo, self.pr, "merged", by="before")
             return f"PR #{self.pr} was already merged — nothing to do" + self.file_followup()
         slug, title = self.slug(), self.facts.get("title") or ""
         # Pinned to the SHA the gates ran on and the review read: a push between them makes GitHub refuse the merge, and the re-run gates what is there.
@@ -2582,9 +2820,11 @@ class Land:
             if not self.merged_now():
                 raise Failed(f"gh pr merge #{self.pr}: {last(o)}")
             root_done(self.repo, self.pr)
+            stage_event(self.repo, self.pr, "merged", by="overlap")
             return f"PR #{self.pr} merged (a second merge overlapped this one; GitHub says it is in)" + self.file_followup()
         if not rc or self.merged_now():
             root_done(self.repo, self.pr)      # …and the change this tally was bounding is now on the default branch
+            stage_event(self.repo, self.pr, "merged", sha=(self.approved_head or self.head or "")[:12])
         # …while a PR gh calls "closed" that GitHub does not call MERGED is not in: its tally stays a bound, for the
         # reopen (the `merged` stamp would retire it for good, and every attempt after would re-buy the same read).
         return f"PR #{self.pr} merged (squash, remote branch deleted)" + self.file_followup()
@@ -3826,6 +4066,7 @@ def run_job(path, job):
         return text
     job["attempts"], job["at"] = job.get("attempts", 0) + 1, stamp()
     write_atomic(path, job)                    # counted before anything irreversible: a kill mid-merge is still a try
+    stage_event(repo, pr, "lane", attempt=job["attempts"])
     L = Land(repo, pr=pr) if pr else Land(repo, span=tuple(span))
     L.job = path
     L.batch, L.warm = job.get("batch") or "", job.get("warm") if job.get("batch") else None
@@ -3903,11 +4144,19 @@ def run_job(path, job):
     held = recurring_held(L.project, L.why) if rc == 1 and L.stopped == "gates" and not decided else ""
     if held:
         L.why, decided = f"{L.why} — not retried, {held}"[:600], True
+    # The brief: "never re-run an unchanged red tree (retry only on a new head, or once on a case named load-bound)".
+    # A red the TREE caused (a red record stands: red_tree) is decided at once — a new head is a new queue, and the
+    # worker is told now rather than after two 15-min waits that could only end the same way. A red the BOX caused
+    # (silent past GATE_IDLE, a full disk, no memory: red_box, the load-bound reds the box can name) is run once more.
+    # A load-flaky CASE never gets this far: the quarantine list keeps it from reddening the gate at all (green.sh).
+    if rc == 1 and L.stopped == "gates" and L.red_tree:
+        decided = True
     retry = rc == 1 and (L.stopped in RETRY or L.stopped == "load") and not decided
-    if retry and job["attempts"] < LAND_TRIES:
+    cap = 2 if L.stopped == "gates" and L.red_box else LAND_TRIES
+    if retry and job["attempts"] < cap:
         # Kept, so the next sweep re-drives it; the not_before goes with the try, or a spent reset would be read as the schedule; the stage is the step that stopped.
         job_set(path, job, last=f"{L.stopped}: {L.why}"[:400], stage=L.stopped, not_before=None)
-        return (f"[{repo}] {L.what()}: {L.stopped} failed on try {job['attempts']} of {LAND_TRIES} — "
+        return (f"[{repo}] {L.what()}: {L.stopped} failed on try {job['attempts']} of {cap} — "
                 f"kept for the next sweep")
     job["state"], job["result"] = "done", result_of(L, rc, job, tail)
     if retry:
@@ -4152,8 +4401,9 @@ def lane_jobs(repo):
 
 def gave_up(repo, pr, job):
     """The PR's lock, HELD, when its job has stopped at its try cap, so a re-queue gives it a fresh start instead of 'already queued'; else None. A capped job answered every 👍 with 'again' and sat until a person deleted its file (lessons #144, 2026-09-24). Only the cap: never a job that is held (a draft, a conflict, a refused repair), one with a fix round out, one done for a reason a re-queue cannot mend (a verdict, a refused merge — `capped` marks a done job the cap alone stopped, run_job), and never while a landing holds the PR — a sweep saying its result holds it for seconds, and that is waited out (LOCK_WAIT). The caller keeps the lock until the fresh job is written and then lets it go: a sweep's finish() takes the same lock (say_alone), so its stale copy is never written back over the fresh job, nor the fresh job unlinked."""
-    if not isinstance(job, dict) or not job.get("pr") or job.get("attempts", 0) < LAND_TRIES:
+    if not isinstance(job, dict) or not job.get("pr") or (job.get("attempts", 0) < LAND_TRIES and not job.get("capped")):
         return None                              # unreadable, a deploy job, or still under its cap: 'already queued'
+                                                 # (a box-caused red caps at 2 tries, run_job, and says so by `capped`)
     fix = job.get("fix") or {}
     if job.get("held") or job.get("stage") == "held" or (fix and fix.get("over") is None):
         return None
@@ -4219,6 +4469,7 @@ def warm_all(repo, batch, on_done=None):
             now = read_json(path)
             if now:                           # before the spawn, since the warm writes the job next; a job gone stays gone
                 job_set(path, now, warm_from=stamp())
+                stage_event(repo, job["pr"], "lane", path="warm")
             try:
                 p = spawn_warm(repo, job["pr"], log, path)
             except OSError as e:
@@ -4307,7 +4558,7 @@ def base_tip(repo):
 
 
 def batch_merged(repo, before, members, skip=()):
-    """What this batch PROVABLY put on the default branch, as [(pr, sha, files)] in merge order: `members` ([(pr, files)] in the order they were merged) asked of gh, each kept only when it is MERGED into the default branch with a single-parent squash commit that descends from the one before it (`before`, the tip read before the batch, for the first) and is on origin's tip now. A PR in `skip` (merged before this pass) is never one. Only what this returns is bisected and can be reverted, so the auto-revert can never apply the inverse of a commit that is off main, older than the batch or not the batch's."""
+    """What this batch PROVABLY put on the default branch, as [(pr, sha, files)] in merge order: `members` ([(pr, files)] in the order they were merged) asked of gh, each kept only when it is MERGED into the default branch with a single-parent squash commit whose parent IS the one kept before it (`before`, the tip read before the batch, for the first) and is on origin's tip now; a merged squash that breaks that chain (a hand-merge before it) leaves every later one out too. A PR in `skip` (merged before this pass) is never one. Only what this returns is bisected and can be reverted, so the auto-revert can never apply the inverse of a commit that is off main, older than the batch or not the batch's."""
     root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
     tip = base_tip(repo)
     merged, prev = [], before
@@ -4321,10 +4572,13 @@ def batch_merged(repo, before, members, skip=()):
         if j.get("state") != "MERGED" or not sha:
             continue
         parents = sh(["git", "rev-list", "--parents", "-n", "1", sha], cwd=root, timeout=60)[1].split()
+        # Its parent must BE the one before it, not merely an ancestor (security read of #640): a commit hand-merged
+        # between two members would otherwise sit inside the bisect's range, and its red be blamed on, and reverted
+        # as, the member after it. Once the chain breaks nothing after it is the batch's provably, so `prev` stays.
         if ((j.get("baseRefName") or "") != base or sha == prev or len(parents) != 2
-                or not is_ancestor(root, prev, sha) or not is_ancestor(root, sha, tip)):
-            ledger(f"batch-skip {repo}#{pr} sha={sha[:12]} — not a squash on {base} after {prev[:12]}: left out of the "
-                   f"batch's suite, never bisected, never reverted")
+                or not is_ancestor(root, sha, tip) or parents[1] != prev):
+            ledger(f"batch-skip {repo}#{pr} sha={sha[:12]} — not a squash on {base} directly on {prev[:12]}: left out "
+                   f"of the batch's suite, never bisected, never reverted")
             continue
         merged.append((pr, sha, files))
         prev = sha
@@ -4337,7 +4591,7 @@ def batch_path(repo):
 
 
 def resume_batch(repo):
-    """A batch record the lane holding the lock did not write is a batch whose lane died before its suite ran on the base: start it now, beside the lane (batch_suite), on what that batch provably merged (batch_merged), and SAY it was cut off. Returns its lines; the record goes once its suite is handed on (batch_suite)."""
+    """A batch record the lane holding the lock did not write is a batch whose lane died before its suite ran on the base: start it now, beside the lane (batch_suite), on what that batch provably merged (batch_merged), and SAY it was cut off. A record that is not JSON, or whose fields are not the shapes land_batch writes, is dropped and ledgered (batch-lost) — never a crash of the lane. Returns its lines; the record goes once its suite is handed on (batch_suite)."""
     path = batch_path(repo)
     rec = read_json(path)
     if not isinstance(rec, dict):
@@ -4345,25 +4599,38 @@ def resume_batch(repo):
             os.unlink(path)
         ledger(f"batch-lost {repo} — its record could not be read; the catch-up deploys the tip as for any merge")
         return [f"[{repo}] a batch's record could not be read — dropped; the catch-up handles the tip"]
-    members = [(int(m[0]), list(m[1])) for m in rec.get("members") or []]
+    try:
+        raw, pre, before, bid = rec.get("members") or [], rec.get("pre") or [], rec.get("before") or "", rec.get("bid") or ""
+        if not (isinstance(raw, list) and isinstance(pre, list) and isinstance(before, str) and isinstance(bid, str)
+                and all(isinstance(m, list) and len(m) == 2 and isinstance(m[1], list) for m in raw)):
+            raise ValueError("the batch note's fields are not the shapes land_batch writes")
+        members = [(int(m[0]), [str(p) for p in m[1]]) for m in raw]
+        pre = {int(p) for p in pre}
+    except (TypeError, ValueError):
+        # Readable JSON, unreadable batch: dropped and ledgered like a note that would not parse — never a crash of
+        # the lane, which would leave every repo's queue behind it (security read of #640).
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        ledger(f"batch-lost {repo} — its record is malformed; the catch-up deploys the tip as for any merge")
+        return [f"[{repo}] a batch's record could not be read — dropped; the catch-up handles the tip"]
     if not members:
         # Cut off before its first merge began: nothing of it is on the base, and nothing is owed but the note.
         with contextlib.suppress(OSError):
             os.unlink(path)
-        ledger(f"batch-dropped {repo} {rec.get('bid', '?')} — cut off before any merge; its jobs are still queued")
+        ledger(f"batch-dropped {repo} {bid or '?'} — cut off before any merge; its jobs are still queued")
         return []
     prs = ", ".join(f"#{pr}" for pr, _ in members)
-    text = (f"[{repo}] the batch {rec.get('bid', '?')} ({prs}) was cut off before its suite ran on "
+    text = (f"[{repo}] the batch {bid or '?'} ({prs}) was cut off before its suite ran on "
             f"{board(repo).get('default_branch') or 'main'} — the lane died. Running that suite now")
-    ledger(f"batch-resume {repo} {rec.get('bid', '?')} prs={prs}")
+    ledger(f"batch-resume {repo} {bid or '?'} prs={prs}")
     sh([f"{BIN}/cc-slack", "inject", repo, text[:300]], timeout=120)   # the seat's wake; the suite's outcome is said by after_batch
     lines = [text]
     for pr, _ in members:
         # A member still queued (cut off mid-merge, or kept) lands next on its own: every gate and its own deploy,
         # never the dead batch's warm and deferred deploy.
         unbatch(repo, job_path(repo, pr))
-    merged = batch_merged(repo, rec.get("before") or "", members, skip=set(rec.get("pre") or []))
-    lines += batch_suite(repo, merged, rec.get("bid") or stamp())
+    merged = batch_merged(repo, before, members, skip=pre)
+    lines += batch_suite(repo, merged, bid or stamp())
     with contextlib.suppress(OSError):
         os.unlink(path)
     return lines
@@ -4418,7 +4685,7 @@ def revert_pr(repo, pr, sha, why):
 
 
 def after_batch(repo, merged, tip="", record="", reverts=()):
-    """Phase 3, once per batch: ONE suite on the base, at its tip (or at `tip`, the batch's own last merge, when its suite runs beside the lane: the next batch may have merged since — or the last of `reverts`, an earlier suite's revert of a squash that merge still holds: run_suite_record), scoped to the batch's paths when they fit WIDE_FILES (else everything). Green: the deploy the members skipped (deploy_due, run here). Red: believed on a second run only, then bisected to the merge that broke it (bisect_batch), that PR reverted and announced (revert_pr), and the suite run once more on what is left; still red, or a red the batch did not make, is SAID, the tip is noted for the catch-up to leave alone (red_base_path), and nothing is installed. Returns its lines."""
+    """Phase 3, once per batch: ONE suite on the base, at its tip (or at `tip`, the batch's own last merge, when its suite runs beside the lane: the next batch may have merged since — or the last of `reverts`, an earlier suite's revert of a squash that merge still holds: run_suite_record), scoped to the batch's paths when they fit WIDE_FILES (else everything). Green: the deploy the members skipped (deploy_due, run here). Red: believed on a second run only; on a base an earlier suite noted red (red_base_path names the first merge's parent) it is said without a bisect, since every commit asked would carry that red; otherwise bisected to the merge that broke it (bisect_batch), that PR reverted and announced (revert_pr), and the suite run once more on what is left; still red, or a red the batch did not make, is SAID, the tip is noted for the catch-up to leave alone (red_base_path), and nothing is installed. Returns its lines."""
     lines = []
     if not merged:
         return lines
@@ -4446,6 +4713,19 @@ def after_batch(repo, merged, tip="", record="", reverts=()):
                 f"{', '.join(r[:12] for r in reverts)}, which this batch's merges predate, so no bisect over them can "
                 f"name a PR: nothing reverted, nothing installed, until a person mends {base}.")
         ledger(f"batch-red {repo} tip={tip[:12]} past-revert — {why[:200]}")
+        notify("--route", f"[{repo}] batch stopped", "--id", f"land:{repo}:batch:red@{tip[:12]}", text, timeout=60)
+        sh([f"{BIN}/cc-slack", "inject", repo, text[:300]], timeout=120)
+        return lines + [text]
+    noted = ((read_json(red_base_path(repo)) or {}).get("tip") or "") if not ok else ""
+    first = sh(["git", "rev-list", "--parents", "-n", "1", merged[0][1]], cwd=root, timeout=60)[1].split() if noted else []
+    if noted and first[1:] == [noted]:
+        # The batch began on a tip an earlier suite already found red and nobody has mended: every commit the bisect
+        # could ask carries that red, so it would end at "before" after log2(n)+1 full runs (2h46m once) and name no PR.
+        write_atomic(red_base_path(repo), {"tip": tip, "at": stamp(), "why": why})
+        text = (f"[{repo}] {base} was already red at {noted[:12]}, where this batch ({prs}) began, and is red at "
+                f"{tip[:12]} after it — {why}. Not bisected, nothing reverted, nothing installed, until a person "
+                f"mends {base}.")
+        ledger(f"batch-red {repo} tip={tip[:12]} on-red-base {noted[:12]} — {why[:200]}")
         notify("--route", f"[{repo}] batch stopped", "--id", f"land:{repo}:batch:red@{tip[:12]}", text, timeout=60)
         sh([f"{BIN}/cc-slack", "inject", repo, text[:300]], timeout=120)
         return lines + [text]
@@ -4862,6 +5142,7 @@ def cmd_work(argv):
     else:
         sweep_records()
         sweep_run_roots()                        # what a killed or rebooted worker left in the temp root (live lanes' are kept)
+        reap_orphans()                           # …and the gates it left running: they hold suite slots nobody will read
         repos = []
         for path in queue_order(glob.glob(f"{LANDQ}/*.json")):
             repo = (read_json(path) or {}).get("repo")
@@ -5185,8 +5466,10 @@ def cmd_selfcheck():
 
 def main(argv):
     default_signals()                      # once, on the main thread: every gate and reviewer below inherits it
+    for s in (signal.SIGTERM, signal.SIGHUP):   # …and then this process's own: its gates go with it (on_death). A
+        signal.signal(s, on_death)              # handler is not inherited across exec, so no child sees it
     cmd = {"selfcheck": lambda a: cmd_selfcheck(), "record": cmd_record, "queue": cmd_queue, "work": cmd_work,
-           "will-review": cmd_will_review, "batch-suite": cmd_batch_suite}
+           "will-review": cmd_will_review, "batch-suite": cmd_batch_suite, "times": cmd_times}
     if argv[:1] != ["selfcheck"]:          # the selfcheck keeps its own fixture temp root
         use_scratch()
     if argv and argv[0] in cmd:
