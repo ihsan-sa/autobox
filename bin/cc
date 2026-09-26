@@ -82,6 +82,17 @@ member_model_args(){ local m; m=$("$BIN/cc-config" get CC_MEMBER_MODEL claude-so
 AUTO=(--permission-mode auto)   # every interactive session starts in auto mode, so nobody has to press shift+tab in a fresh one (owner, 2026-09-04).
                                 # It is the harness's permission prompt and nothing else: cc-guard still runs as a hook and denies what it denies.
                                 # A --go worker gets the same mode from cc-loop's own argv.
+INBOUND='{"crossSessionInbound":"accept"}'
+inbound_args(){ [ "${CC_ROLE:-}" = member ] && return 0; member_facing "$DEV/$1" && return 0
+  case " $("$BIN/cc-config" get CC_CROSS_SESSION_ACCEPT 2>/dev/null) " in *" $1 "*) printf '%s\n%s\n' --settings "$INBOUND";; esac; return 0; }
+                                # A PLANNING SEAT THE CONFIG NAMES TAKES ANOTHER SESSION'S MESSAGE WITH NO TAP. CC_CROSS_SESSION_ACCEPT
+                                # (~/.cc/config, whitespace-separated project names) lists them; for those, the planning seat (__runmain) and
+                                # its handoff successor (__runnext, no track or alias) start with --settings $INBOUND. Claude Code honours that
+                                # key only from --settings or user settings, never a project's, and holds a message between two sessions in
+                                # different permission modes, so a bypass-mode session's reply parks on a dialog without it. Not
+                                # ~/.claude/settings.json, which every session and sandbox copies. Never an orch, a track, a --go worker, a
+                                # plain-folder seat, a member-facing seat or a member workspace: none of them call this, and the first line
+                                # refuses the member ones even when named.
 worker_model(){ "$BIN/cc-loop" worker-model "${1:-}"; }   # what a --go worker will run on; cc-loop owns that order (--model, then the override, then CC_WORKER_MODEL) and this only names it
 chan_accept(){ [ -f "$SLACKON" ] && { export CC_SLACK_CHANNEL=1; ( "$BIN/cc-slack" accept-dialog "$1" >/dev/null 2>&1 & ); }; return 0; }   # auto-accepts the dev-channels dialog in that tmux window
 start_check(){ ( "$BIN/cc-started" "$@" >/dev/null 2>&1 & ); return 0; }   # …and reads the pane back a minute later: a popup is
@@ -928,6 +939,9 @@ $(sed 's/Say fewer things/Say less/' "$ROOT/config/writing-prompt.md")"; rc=$?; 
   t "…and it starts the successor's claude through cc-sandbox member <handle>, on claude-sonnet-5, with the handoff's session id (got: $w)" "$rc"
   rc=0; has "$w" '--remote-control' && rc=1; has "$w" 'MEMBER WORKSPACE' || rc=1
   t "…inside the boundary: no --remote-control, and the member-workspace prompt is in its system prompt" "$rc"
+  printf 'CC_CROSS_SESSION_ACCEPT=m1\n' > "$T/xs-m1"; rm -f "$T/sbx"; CC_CONFIG="$T/xs-m1" runnext __runnext m1 h1 s1; w=$(cat "$T/sbx" 2>/dev/null | tr '\n' ' ')
+  rc=0; has "$w" 'crossSessionInbound' && rc=1; has "$w" ' --session-id s1 ' || rc=1
+  t "…and even when CC_CROSS_SESSION_ACCEPT names it, a member workspace's successor starts without --settings $INBOUND" "$rc"
   rm -f "$T/sbx"; runnext __runmain m1; mrc=$?
   rc=0; grep -q 'Refused' "$T/next.out" || rc=1; [ "$mrc" = 1 ] || rc=1; [ -e "$T/sbx" ] && rc=1
   t "control: the guard still refuses a bare __runmain for the same workspace — the exemption is __runnext's alone" "$rc"
@@ -941,6 +955,29 @@ $(sed 's/Say fewer things/Say less/' "$ROOT/config/writing-prompt.md")"; rc=$?; 
   mkdir -p "$T/dev/r1/.cc"; : > "$T/dev/r1/.cc/member-facing"; runplain argv4; rm -f "$T/dev/r1/.cc/member-facing"
   rc=0; { has "$(cat "$T/argv4" 2>/dev/null)" "$M" && has "$(cat "$T/argv4" 2>/dev/null)" "MEMBER-FACING"; } || rc=1
   t "…and a member-facing folder keeps its own prompt and gains the mail capability beside it" "$rc"
+  # ONLY A PLANNING SEAT THE CONFIG NAMES HEARS ANOTHER SESSION WITH NO TAP. Each launch is its own run against the
+  # stub, with its own config, and is read for the one --settings pair.
+  printf 'CC_CROSS_SESSION_ACCEPT=other r1\n' > "$T/xs-r1"; mkdir -p "$T/dev/r1" "$T/dev/r2"
+  xs(){ local out="$1"; shift; HOME="$T" PATH="$T/bin:$PATH" CC_CLAUDE="$T/bin/claude" CC_ARGV="$T/$out" CC_CONFIG="$T/xs-r1" \
+          CC_HANDOFF_DIR="$T/no-handoff" bash "$S" "$@" </dev/null >/dev/null 2>&1; }
+  xs xs1 __runmain r1
+  rc=0; grep -qxF -- "$INBOUND" "$T/xs1" 2>/dev/null && grep -qxF -- --settings "$T/xs1" || rc=1
+  t "a planning seat CC_CROSS_SESSION_ACCEPT names starts with --settings $INBOUND" "$rc"
+  xs xs2 __runnext r1 h2 s2
+  rc=0; grep -qxF -- "$INBOUND" "$T/xs2" 2>/dev/null && grep -qxF -- s2 "$T/xs2" || rc=1
+  t "…and so does its handoff successor" "$rc"
+  xs xs3 __runmain r2
+  rc=0; grep -qF -- crossSessionInbound "$T/xs3" 2>/dev/null && rc=1; [ -s "$T/xs3" ] || rc=1
+  t "control: a planning seat the config does not name starts without it" "$rc"
+  xs xs4 __runnext r1@a1 h3 s3
+  rc=0; grep -qF -- crossSessionInbound "$T/xs4" 2>/dev/null && rc=1; grep -qxF -- s3 "$T/xs4" || rc=1
+  t "control: an orch's successor in a named project starts without it" "$rc"
+  xs xs5 __runorch r1 a1
+  rc=0; grep -qF -- crossSessionInbound "$T/xs5" 2>/dev/null && rc=1; [ -s "$T/xs5" ] || rc=1
+  t "control: …and so does a fresh orch there" "$rc"
+  mkdir -p "$T/dev/r1/.cc"; : > "$T/dev/r1/.cc/member-facing"; xs xs6 __runmain r1; rm -f "$T/dev/r1/.cc/member-facing"
+  rc=0; grep -qF -- crossSessionInbound "$T/xs6" 2>/dev/null && rc=1; [ -s "$T/xs6" ] || rc=1
+  t "control: a named planning seat that is member-facing starts without it" "$rc"
   # A CHANNEL WITH NO MAIL HISTORY CAN START A MAIL. The text says `cc-mail send` works from any channel; this
   # holds the door to it. An EMPTY mail dir — no conversation record, no log, no rate file: a channel that never
   # exchanged a mail — and the send goes, against a loopback stand-in for the worker that answers as the real one
@@ -1502,7 +1539,8 @@ PY
       sp="$sp $MEMBER_WS_SP"; mapfile -t MO < <(member_model_args)
       "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --session-id "$sid" "${CH[@]}" "${MO[@]}"
     else
-      "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}"
+      IN=(); [ -z "$track$alias" ] && mapfile -t IN < <(inbound_args "$repo")   # the planning seat's successor only, as __runmain
+      "$CLAUDE" "${AUTO[@]}" "${IN[@]}" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}"
     fi
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runmain)  # internal: planning session in the primary worktree
@@ -1510,7 +1548,8 @@ PY
     sp=$(sp_main "$repo" "$base")
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"; start_check "$repo"
     member_facing "$DEV/$repo" && { export CC_ROLE=member; sp="$sp $MEMBER_SP"; }   # convenience only — the marker is what cc-guard actually reads
-    "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    mapfile -t IN < <(inbound_args "$repo")
+    "$CLAUDE" "${AUTO[@]}" "${IN[@]}" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runorch)  # internal: peer orchestrator session in the primary worktree, addressable in Slack by alias
     repo="$2"; alias="$3"; brief="${4:-}"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp=$(sp_orch "$repo" "$alias" "$base")
