@@ -8984,8 +8984,42 @@ def startup_prompt(pane):
     """Is one of the two startup dialogs on the pane? Read-only — accept_prompts is what presses them."""
     return any(m in pane for m in STARTUP_MCP + STARTUP_DEV)
 
+def limit_option(pane):
+    """Pane text → the digit for the session/usage-limit dialog's "continue automatically" option, or None.
+    Ported from cc-msg's limit_option() (awk) — the box waits limits out, so that option is always the answer
+    (a session sat on this dialog ~40 min, 2026-09-24; #557 already covers the MODEL-switch dialog, not this one).
+    Only the dialog at the FOOT of the pane counts: after the last line holding "hit your" and "limit" the next
+    line with words must be "What do you want to do?", then only numbered option lines, then the
+    "Enter to confirm" / "Esc to cancel" footer with nothing but blank lines below it. Anything else: not it."""
+    lines = pane.split("\n")
+    h = next((i for i in range(len(lines) - 1, -1, -1) if "hit your" in lines[i] and "limit" in lines[i]), None)
+    if h is None:
+        return None
+    i = h + 1
+    while i < len(lines) and not re.search(r'[A-Za-z0-9]', lines[i]):
+        i += 1
+    if i >= len(lines) or "What do you want to do?" not in lines[i]:
+        return None
+    d, foot = "", False
+    i += 1
+    while i < len(lines):
+        l = lines[i]; i += 1
+        if not re.search(r'[A-Za-z0-9]', l):
+            continue
+        if foot:
+            return None                                    # words under the footer: not the foot of the pane
+        if "Enter to confirm" in l or "Esc to cancel" in l:
+            foot = True; continue
+        if not re.match(r'^[^A-Za-z0-9]*[0-9]\. ', l):
+            return None                                    # not an option line
+        if "continue automatically" in l:
+            m = re.search(r'[0-9]', l); d = m.group(0) if m else ""
+    return d if foot and d else None
+
 def accept_prompts(wid):
-    """Press through the two startup dialogs blocking a session from loading its channel (MCP-server trust: option 2 trusts this and future servers; dev-channels warning). True if something was pressed."""
+    """Press through the dialogs blocking a session (MCP-server trust: option 2 trusts this and future servers;
+    dev-channels warning; the session/usage-limit dialog: "continue automatically", never a fixed digit — the box
+    waits limits out). True if something was pressed."""
     rc, pane = tmux("capture-pane", "-p", "-t", wid)
     if rc != 0:
         return False
@@ -8999,10 +9033,15 @@ def accept_prompts(wid):
         if "local development" in pane:          # still open: select the first option explicitly
             tmux("send-keys", "-t", wid, "Up", "Enter")
         return True
+    d = limit_option(pane)
+    if d:
+        tmux("send-keys", "-t", wid, "-l", "--", d); time.sleep(0.3); tmux("send-keys", "-t", wid, "Enter")
+        return True
     return False
 
 def cmd_accept_dialog(win, seconds=180):
-    """Auto-accept the startup dialogs in a tmux window (dev-channels warning, MCP-server trust) for up to `seconds`."""
+    """Auto-accept the startup dialogs in a tmux window (dev-channels warning, MCP-server trust) and the
+    session/usage-limit dialog ("continue automatically") for up to `seconds`."""
     deadline = time.time() + seconds; pressed = 0
     while time.time() < deadline:
         wid, _ = tmux_window(win)

@@ -5336,6 +5336,41 @@ def run_selfcheck():
         globals()["tmux"] = _tmuxP
     check("startup prompts: the MCP-server trust dialog is pressed through (option 2 + Enter) — a session stuck there never joins Slack",
           okP and [a[-1] for a in pressedP] == ["2", "Enter"])
+    SESSLIM = ("You've hit your session limit · resets 11:30pm (America/Los_Angeles)\nWhat do you want to do?\n"
+               "❯ 1. Stop and wait for limit to reset\n  2. Wait here, then continue automatically at 11:30pm\n"
+               "  3. Upgrade your plan\nEnter to confirm · Esc to cancel")
+    USELIM = ("You've hit your usage limit\nWhat do you want to do?\n❯ 1. Upgrade your plan\n"
+              "  2. Stop and wait for limit to reset\n  3. Wait here, then continue automatically shortly\n"
+              "Enter to confirm · Esc to cancel")
+    LIMNEAR = ("You've hit your session limit · resets 11:30pm (America/Los_Angeles)\nWhat do you want to do?\n"
+               "❯ 1. Stop and wait for limit to reset\n  2. Upgrade your plan\nEnter to confirm · Esc to cancel")
+    pressedL = []; _tmuxL = globals()["tmux"]
+    globals()["tmux"] = lambda *a: (pressedL.append(a) or (0, "")) if a[0] == "send-keys" else (0, SESSLIM)
+    try:
+        okL = accept_prompts("@9")
+    finally:
+        globals()["tmux"] = _tmuxL
+    check("the session-limit dialog is answered with 'continue automatically' (option 2 here), never a fixed digit "
+          "— the box waits limits out, and a session sat on this one ~40 min unanswered (2026-09-24)",
+          okL and [a[-1] for a in pressedL] == ["2", "Enter"])
+    pressedU = []; _tmuxU = globals()["tmux"]
+    globals()["tmux"] = lambda *a: (pressedU.append(a) or (0, "")) if a[0] == "send-keys" else (0, USELIM)
+    try:
+        okU = accept_prompts("@9")
+    finally:
+        globals()["tmux"] = _tmuxU
+    check("…the 'usage limit' wording too, and the digit pressed is whatever the pane draws for 'continue "
+          "automatically' (3 here), not a fixed 2",
+          okU and [a[-1] for a in pressedU] == ["3", "Enter"])
+    pressedN = []; _tmuxN = globals()["tmux"]
+    globals()["tmux"] = lambda *a: (pressedN.append(a) or (0, "")) if a[0] == "send-keys" else (0, LIMNEAR)
+    try:
+        okN = accept_prompts("@9")
+    finally:
+        globals()["tmux"] = _tmuxN
+    check("…and a limit dialog with no 'continue automatically' option (about to expire) is left alone — nothing "
+          "is pressed rather than guessing at Stop or Upgrade",
+          not okN and not pressedN)
     dmQ = Daemon(use_slack=False); dmQ.cfg = {"SLACK_OWNER_ID": "UOWNER"}
     dmQ.queues["repoq"].append((time.time(), {"type": "message", "content": "keep me", "meta": {}}, None)); dmQ.save_queues()
     dmQ2 = Daemon(use_slack=False)
