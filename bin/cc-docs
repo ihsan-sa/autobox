@@ -7,7 +7,7 @@ order; R is the revision, A for the first finished version and the next letter f
 content differs from the last (I and O are skipped, and after Z comes AA). A filed copy is named
 `PPP-NNNN-R_<slug>.pdf`, is written once, read-only, and never rewritten.
 
-    cc-docs file <pdf> --project <name|PPP> --title <t> [--source <path>] [--no-stamp]
+    cc-docs file <pdf> --project <name|PPP> --title <t> [--source <path>] [--latex <main.tex>] [--no-stamp]
                  [--kind work|course|member] [--member <handle>] [--date YYYY-MM-DD]
                  [--describes PCB-NNNN-R] [--note <text>] [--cost <step>=<usd>]…
         Called by a maker at the end of a finished build. The same source path, or else the same title in the same
@@ -22,6 +22,16 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         when nothing is filed: --describes the board revision a document is about (a board's part number, PCB-0001-B),
         which the stamp then carries too, as `002-0012-A · PCB-0001-B · 24 Sep 2026`; --note a line on what changed;
         --cost, once per step, what the maker spent generating it in US dollars (`--cost draft=0.80 --cost review=0.43`).
+        A filed revision also keeps its SOURCE, as sources/PPP/PPP-NNNN-R.tar.gz beside files/: for a LaTeX build (the
+        --latex file, else a --source ending .tex, else a .tex of the PDF's own name beside it) the .tex and every
+        local file it pulls in (\\input, \\include, figures, .bib, .bst, a .sty/.cls beside it or found by kpsewhich
+        under ~), else the --source file alone; at most 48 MiB, the rest listed on stderr. It records WHO FILED it
+        (filer: repo, session, cc-slack target, Slack channel and thread) from the track worktree, orch alias or
+        ~/dev/<repo> the filing ran under. A new revision marks its document's open feedback (feedback.json, written
+        by the box's library poller) done, "answered by rev X", for the poller to tell the site.
+    cc-docs backfill-sources
+        For each document whose current revision keeps no source, keeps what its recorded --source finds now (the
+        same rules as `file`), and lists each document it could not.
     cc-docs number --project <name|PPP> --title <t> [--source <path>] [--describes PCB-NNNN-R] [--tex]
         The number `file` would give a changed build of this document now, for a build that prints its own footer:
         plain, or with --tex as `\\def\\docnumber{…}\\def\\docstamp{… · 24 Sep 2026}` to \\input before compiling.
@@ -76,8 +86,9 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
     cc-docs move <PPP-NNNN> <project> [--kind work|course|member]
         Renumbers a document into another project, made the way `file --project` makes one when it does not exist:
         it takes that project's next number, keeps its letters, title, source, stars and history, and records the
-        old number in its moved_from. Its filed copies are renamed to match (their bytes, and any stamp printed in
-        them, are not rewritten), each public link stops working, and the old number is retired. A move that would
+        old number in its moved_from. Its filed copies and kept sources are renamed to match (their bytes, and any
+        stamp printed in them, are not rewritten), feedback left on the old number is answered by its next revision
+        under the new one, each public link stops working, and the old number is retired. A move that would
         change who can see the document (to or from a member's project) is refused. Prints
         `<old number>\t<new number>\t<path>` per revision.
     cc-docs selfcheck
@@ -90,15 +101,16 @@ handle. It takes the handle from the socket and never from the ask; refuses anot
 a PDF or --source outside the workspace's own trees (~/dev/<h>, its track worktrees, its Slack files), a file that
 is not a PDF, and one over 64 MiB; reads the PDF from one fd so it cannot be swapped between the check and the
 read; and ignores --kind. A project an owner's maker names that is not the member's files under the member's own
-instead, so a build that sets DOC_PROJECT still files. `project`, `star`, `public`, `token`, `fold`, `retire` and
-`move` are refused inside.
+instead, so a build that sets DOC_PROJECT still files. `project`, `star`, `public`, `token`, `fold`, `retire`,
+`move` and `backfill-sources` are refused inside.
 
 THE REGISTER is one JSON file, $CC_DOCS_ROOT/register.json (default ~/.cc/documents), with the filed copies under
 files/PPP/ beside it: private state, in no repo, and outside cc-lib's own tree (cc-lib indexes the register). Per
 project it holds the name, the parent group (`group`, null for none: the site groups projects by it), kind, member
 and workspace. Per document it holds number, title, project, source, visibility (the owner, or the owner and one member), who starred
 it (starred_by, viewer ids), and per revision the letter, file, date, the PDF it was filed from, a content
-fingerprint, and when given the note, board revision, cost and public token. The
+fingerprint, and when given the note, board revision, cost, public token, filer and its kept source (sources/,
+source_files). A member view carries neither the token nor the filer. The
 fingerprint hashes the PDF's text with any document stamp taken out together with every page rendered small and grey
 with its bottom strip (stamp, footer) cut off, so a rebuild that changes only a figure is a new revision and one that
 differs only in its stamp, footer or bytes is unchanged; a PDF neither can read falls back to its bytes. A revision
@@ -288,7 +300,9 @@ def write_views(reg, ids):
         v = os.path.join(ROOT, "ws", wid)
         os.makedirs(v, mode=0o700, exist_ok=True)
         # a view never carries a public token: only the owner can see or kill a public link
-        docs = {n: dict(d, revisions=[{k: v for k, v in r.items() if k != "public_token"} for r in d["revisions"]])
+        # nor who filed it: the owner's own sessions and channels are no workspace's business
+        docs = {n: dict(d, revisions=[{k: v for k, v in r.items() if k not in ("public_token", "filer")}
+                                      for r in d["revisions"]])
                 for n, d in reg["documents"].items() if wid in d.get("visibility", ())}
         for d in docs.values():
             for r in d["revisions"]:
@@ -398,6 +412,218 @@ def stamp(src, dst, text):
         shutil.copy(out, dst)
 
 
+# ── the source ───────────────────────────────────────────────────────────────────────────────────────────────
+TEXREF = re.compile(r"\\(input|include|subfile|includegraphics|includesvg|includepdf|lstinputlisting|bibliography|"
+                    r"addbibresource|bibliographystyle|usepackage|RequirePackage|documentclass|LoadClass|graphicspath)"
+                    r"\*?\s*(?:\[[^\]]*\]\s*)*\{((?:[^{}]|\{[^{}]*\})*)\}|\\input\s+([^\s{}\\%]+)")
+EXTS = {"input": (".tex", ""), "include": (".tex",), "subfile": (".tex", ""), "lstinputlisting": ("",),
+        "includegraphics": ("", ".pdf", ".png", ".jpg", ".jpeg", ".eps"), "includesvg": (".svg", ""),
+        "includepdf": ("", ".pdf"), "bibliography": (".bib",), "addbibresource": ("",), "bibliographystyle": (".bst",),
+        "usepackage": (".sty",), "RequirePackage": (".sty",), "documentclass": (".cls",), "LoadClass": (".cls",)}
+SRC_CAP = 48 << 20        # the most source kept for one revision, in bytes: a file past it is left out and listed
+SRC_FILES = 400
+
+
+def tex_sources(tex, trees=None):
+    """[(path, name in the tarball)] for a LaTeX build: the .tex and every local file it pulls in, read the way
+    LaTeX finds them — beside the .tex (and its \\graphicspath), and a package or class through kpsewhich when
+    that lands under ~ (a house style on TEXINPUTS), never one of TeX's own. With trees (a member's filing) a file
+    whose real path is outside them is not read at all."""
+    base = os.path.dirname(os.path.abspath(tex))
+    todo, seen, out, gpath = [os.path.abspath(tex)], set(), [], [""]
+    while todo and len(out) < SRC_FILES:
+        f = todo.pop(0)
+        real = os.path.realpath(f)
+        if real in seen or not os.path.isfile(real) or (trees is not None and not within(real, trees)):
+            continue
+        seen.add(real)
+        out.append((real, os.path.relpath(f, base) if f.startswith(base + "/") else
+                    "_ext/" + (os.path.relpath(f, HOME) if f.startswith(HOME + "/") else f.lstrip("/"))))
+        if not f.endswith((".tex", ".sty", ".cls")):
+            continue
+        try:
+            body = re.sub(r"(?<!\\)%.*", "", open(real, errors="replace").read())
+        except OSError:
+            continue
+        for m in TEXREF.finditer(body):
+            cmd, arg = (m.group(1), m.group(2)) if m.group(1) else ("input", m.group(3))
+            if cmd == "graphicspath":
+                gpath += re.findall(r"\{([^{}]*)\}", arg)
+                continue
+            for name in (x.strip() for x in arg.split(",") if x.strip()):
+                dirs = gpath if cmd in ("includegraphics", "includesvg") else [""]
+                hit = next((p for d in dirs for e in EXTS[cmd] for p in [os.path.normpath(os.path.join(base, d, name + e))]
+                            if os.path.isfile(p)), None)
+                if not hit and cmd in ("usepackage", "RequirePackage", "documentclass", "LoadClass") and trees is None:
+                    r = subprocess.run(["kpsewhich", name + EXTS[cmd][0]], capture_output=True, text=True)
+                    k = r.stdout.strip()
+                    hit = k if k.startswith(HOME + "/") and os.path.isfile(k) else None
+                if hit:
+                    todo.append(hit)
+    return out
+
+
+def find_sources(a, pdf):
+    """What `file` keeps as a revision's source: --latex, else a --source that is a .tex, else a .tex of the PDF's
+    own name beside it (a LaTeX build), each with what it includes; else the --source file itself; else nothing."""
+    trees = getattr(a, "trees", None)
+    source = getattr(a, "srcpath", None) or a.source     # a member's Slack-files path, as the host sees it
+    tex = getattr(a, "latex", None)
+    if not tex and source and source.endswith(".tex"):
+        tex = source
+    if not tex and not getattr(a, "origin", None):
+        sib = os.path.splitext(pdf)[0] + ".tex"
+        tex = sib if os.path.isfile(sib) else None
+    if tex:
+        return tex_sources(tex, trees)
+    if source and os.path.isfile(source) and (trees is None or within(os.path.realpath(source), trees)):
+        return [(os.path.abspath(source), os.path.basename(source))]
+    return []
+
+
+def pack(files, dst, trees=None):
+    """files as one gzip tarball at dst, the same bytes for the same files (sorted, mtime 0, no owner). -> (names
+    kept, names left out past SRC_CAP). With trees each file is read from one fd whose own path must be inside them
+    (member_pdf's reasoning), so a link swapped in after tex_sources looked cannot pull a host file in."""
+    import gzip
+    import io
+    import tarfile
+    kept, left, total = [], [], 0
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst + ".part", "wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz, \
+            tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for path, name in sorted(files, key=lambda x: x[1]):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError:
+                continue
+            with os.fdopen(fd, "rb") as f:
+                if trees is not None and not within(os.readlink(f"/proc/self/fd/{fd}"), trees):
+                    continue
+                data = f.read(SRC_CAP + 1)
+            if total + len(data) > SRC_CAP:
+                left.append(name)
+                continue
+            total += len(data)
+            ti = tarfile.TarInfo(name)
+            ti.size, ti.mode, ti.mtime = len(data), 0o644, 0
+            tar.addfile(ti, io.BytesIO(data))
+            kept.append(name)
+    os.chmod(dst + ".part", 0o444)
+    os.replace(dst + ".part", dst)
+    return kept, left
+
+
+def keep_sources(files, proj, full, trees=None):
+    """Pack a revision's source into sources/PPP/<full>.tar.gz. -> the fields its revision records, or {}."""
+    if not files:
+        return {}
+    rel = os.path.join("sources", proj, f"{full}.tar.gz")
+    try:
+        kept, left = pack(files, os.path.join(ROOT, rel), trees)
+    except OSError as e:
+        print(f"cc-docs: the source of {full} was not kept: {e}", file=sys.stderr)
+        return {}
+    if left:
+        print(f"cc-docs: {full}: {len(left)} source file(s) left out past {SRC_CAP >> 20} MiB: {', '.join(left[:5])}",
+              file=sys.stderr)
+    return {"sources": rel, "source_files": kept} if kept else {}
+
+
+# ── who filed it ─────────────────────────────────────────────────────────────────────────────────────────────
+def _cwds():
+    """This process's cwd, then each ancestor's: a maker's build runs in a scratch dir, its session in the tree."""
+    out, pid = [os.getcwd()], os.getppid()
+    for _ in range(16):
+        try:
+            out.append(os.readlink(f"/proc/{pid}/cwd"))
+            pid = int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if pid <= 1:
+            break
+    return out
+
+
+def filer():
+    """{repo, session, target, channel, thread, alias} of the session filing, as far as the box can tell: a track
+    worktree's .cc/track (its thread from cc-slack's track-threads.json), an orch's CC_SLACK_ALIAS (its channel from
+    orchs.json), else ~/dev/<repo> (the repo's channel). Keys it cannot tell are left out."""
+    slack = os.environ.get("CC_SLACK_DIR") or os.path.join(HOME, ".cc", "slack")
+
+    def table(name):
+        try:
+            with open(os.path.join(slack, name)) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+    out, dev = {}, os.path.join(HOME, "dev") + "/"
+    for c in _cwds():
+        x = os.path.realpath(c)
+        while x not in ("/", "") and "target" not in out:
+            try:
+                repo, track = (open(os.path.join(x, ".cc", "track")).read().split() + ["", ""])[:2]
+            except OSError:
+                repo = track = ""
+            if repo and track:
+                out.update(repo=repo, session=track, target=f"{repo}/{track}")
+                t = table("track-threads.json").get(out["target"]) or {}
+                if t.get("chat") and t.get("ts"):
+                    out.update(channel=t["chat"], thread=t["ts"])
+            x = os.path.dirname(x)
+        if "target" not in out and os.path.realpath(c).startswith(dev):
+            out.setdefault("repo", os.path.realpath(c)[len(dev):].split("/")[0])
+        if "target" in out:
+            break
+    alias = os.environ.get("CC_SLACK_ALIAS")
+    if alias and "target" not in out:
+        out.update(alias=alias, session=alias)
+        for chan, o in table("orchs.json").items():
+            if isinstance(o, dict) and o.get("alias") == alias and not o.get("archived") \
+                    and (not out.get("repo") or o.get("target") == out["repo"]):
+                out.update(channel=chan, repo=o.get("target"), target=o.get("target"))
+                break
+    if out.get("repo") and "target" not in out:
+        out["target"] = out["repo"]
+    if out.get("target") and "channel" not in out:
+        ch = table("channels.json").get(out["target"])
+        if isinstance(ch, str):
+            out["channel"] = ch
+    return {k: v for k, v in out.items() if v}
+
+
+# ── feedback from the library site ───────────────────────────────────────────────────────────────────────────
+def feedback_path():
+    return os.path.join(ROOT, "feedback.json")
+
+
+def answer_feedback(num, rev, old=()):
+    """A new revision answers its document's open feedback: each item delivered (or new) for `num`, or for a number
+    it was moved from (`old`), becomes done, reply "answered by rev <rev>", unsynced until the box's poller tells the
+    site. Called under Lock. -> count."""
+    try:
+        with open(feedback_path()) as f:
+            fb = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    n = 0
+    for it in fb.get("items", {}).values():
+        doc = str(it.get("number") or "")
+        if doc.count("-") == 2:
+            doc = doc.rsplit("-", 1)[0]
+        if (doc == num or doc in old) and it.get("status") in ("new", "delivered"):
+            it.update(status="done", reply=f"answered by rev {rev}", synced=False,
+                      done_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            n += 1
+    if n:
+        fd, tmp = tempfile.mkstemp(dir=ROOT, prefix=".feedback.")
+        with os.fdopen(fd, "w") as f:
+            json.dump(fb, f, indent=1, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, feedback_path())
+    return n
+
+
 # ── commands ─────────────────────────────────────────────────────────────────────────────────────────────────
 def plan(reg, a):
     """-> (proj, docnum, doc-or-None, next letter). Creates the project in reg (the caller decides to save)."""
@@ -421,6 +647,7 @@ def cmd_file(a):
     describes, cost = check_describes(a.describes), parse_cost(a.cost)
     text = pdftext(src)
     fp = fingerprint(src, text)
+    sources = find_sources(a, src)
     with Lock():
         reg = load()
         proj, num, d, rev = plan(reg, a)
@@ -466,12 +693,21 @@ def cmd_file(a):
         d["revisions"].append({"rev": rev, "file": rel, "date": date.isoformat(), "from": getattr(a, "origin", None) or src, "fingerprint": fp,
                                "sha256": sha, "stamped": how, "pages": pages(dst), "bytes": os.path.getsize(dst),
                                "filed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
-        for k, v in (("note", (a.note or "").strip() or None), ("describes", describes), ("cost", cost)):
+        who = getattr(a, "filer", None)
+        who = filer() if who is None else who
+        for k, v in (("note", (a.note or "").strip() or None), ("describes", describes), ("cost", cost),
+                     ("filer", who)):
             if v:
                 d["revisions"][-1][k] = v
+        d["revisions"][-1].update(keep_sources(sources, proj, full, getattr(a, "trees", None)))
         save(reg)
         write_views(reg, set(d["visibility"]) - {"owner"})
-    print(f"{full}\t{dst}\tfiled")
+        # brief: "When cc-docs files a new revision of a document with open feedback, mark those done"
+        answered = answer_feedback(num, rev, d.get("moved_from", ()))
+    print(f"{full}\t{dst}\tfiled", flush=True)   # first: a maker that folds stderr in reads its first line
+    if answered:
+        print(f"cc-docs: {full} answers {answered} feedback item(s) on {num}; the library poller tells the site",
+              file=sys.stderr)
     return 0
 
 
@@ -827,6 +1063,29 @@ def cmd_fold(a):
     return 0
 
 
+def cmd_backfill(a):
+    import argparse
+    with Lock():
+        reg = load()
+        for num in sorted(reg["documents"]):
+            d = reg["documents"][num]
+            r = current(d)
+            if not r or r.get("sources"):
+                continue
+            full = f"{num}-{r['rev']}"
+            member = d.get("member")
+            ns = argparse.Namespace(source=d.get("source"), latex=None, origin=member or None,
+                                    trees=member_trees(member, "") if member else None)
+            got = keep_sources(find_sources(ns, r.get("from") or ""), d["project"], full, ns.trees)
+            if got:
+                r.update(got, sources_backfilled=True)
+                print(f"{full}\tkept\t{len(got['source_files'])} file(s)")
+            else:
+                print(f"{full}\tno source\t{d.get('source') or 'no --source recorded'}")
+        save(reg)
+    return 0
+
+
 def cmd_retire(a):
     with Lock():
         reg = load()
@@ -877,7 +1136,10 @@ def cmd_move(a):
         slug = slugify(d["title"])
         moves = [(r, os.path.join("files", proj, f"{new}-{r['rev']}_{slug}.pdf")) for r in d["revisions"]]
         missing = [r["file"] for r, _ in moves if not os.path.isfile(os.path.join(ROOT, r["file"]))]
-        clash = [n for _, n in moves if os.path.lexists(os.path.join(ROOT, n))]
+        # a kept source moves with its revision, so its name keeps matching the PDF's
+        srcs = [(r, os.path.join("sources", proj, f"{new}-{r['rev']}.tar.gz")) for r in d["revisions"]
+                if r.get("sources") and os.path.isfile(os.path.join(ROOT, r["sources"]))]
+        clash = [n for _, n in moves + srcs if os.path.lexists(os.path.join(ROOT, n))]
         if missing or clash:
             raise Refused(f"{(missing + clash)[0]} is {'missing' if missing else 'in the way'}; nothing changed")
         # brief: "the old number is retired and never reused, and a note of the old number is kept on the document"
@@ -885,6 +1147,11 @@ def cmd_move(a):
         os.makedirs(os.path.join(ROOT, "files", proj), exist_ok=True)
         for r, n in moves:
             os.rename(os.path.join(ROOT, r["file"]), os.path.join(ROOT, n))
+        if srcs:
+            os.makedirs(os.path.join(ROOT, "sources", proj), exist_ok=True)
+        for r, n in srcs:
+            os.rename(os.path.join(ROOT, r["sources"]), os.path.join(ROOT, n))
+            r["sources"] = n
         gone = [r["file"] for r, _ in moves]
         for r, n in moves:
             if r.pop("public_token", None):
@@ -1063,7 +1330,9 @@ def member_ask(handle, ask, files=""):
                 f.write(data)
         a = argparse.Namespace(cmd=op, title=title.strip(), source=source or None, describes=ask.get("describes"),
                                note=ask.get("note"), date=ask.get("date"), cost=cost, no_stamp=bool(ask.get("no_stamp")),
-                               tex=bool(ask.get("tex")), origin=ask.get("pdf"), pdf=pdf if op == "file" else None)
+                               tex=bool(ask.get("tex")), origin=ask.get("pdf"), pdf=pdf if op == "file" else None,
+                               trees=trees, filer={"member": handle},
+                               srcpath=os.path.normpath(here(source)) if source else None)
         with Lock():
             a.project, a.kind, a.member = member_project(load(), handle, ask.get("project"))
         out = io.StringIO()
@@ -1543,6 +1812,181 @@ def selfcheck():
            rcr == 2 and rcf == 2 and "the host's" in orr + of
            and f"{k1[0]}-0001" in reg["documents"] and d2)
         ok("no incoming copy is left behind", not [x for x in os.listdir(ROOT) if x.startswith(".incoming.")])
+        # sources, filer and feedback: a register of their own, a scratch Slack dir, a fixed chain of cwds
+        import tarfile
+        ROOT = os.path.join(t, "r-src")
+        sd = os.path.join(t, "slackdir")
+        os.makedirs(sd)
+        old_env, old_cwds = os.environ.get("CC_SLACK_DIR"), _cwds
+        os.environ["CC_SLACK_DIR"] = sd
+        try:
+            lx = os.path.join(t, "lx")
+            os.makedirs(os.path.join(lx, "fig"))
+            for fn, body in (("sec.tex", "Section \\includegraphics{plot}"), ("local.sty", "\\RequirePackage{inner}"),
+                             ("inner.sty", ""), ("refs.bib", "@misc{x}"), ("fig/plot.png", "png"),
+                             ("secret.tex", "never"), ("unused.txt", "never")):
+                with open(os.path.join(lx, fn), "w") as f:
+                    f.write(body)
+            with open(os.path.join(lx, "main.tex"), "w") as f:
+                f.write("\\documentclass{article}\\usepackage{local,amsmath}\\graphicspath{{fig/}}\n"
+                        "% \\input{secret}\n\\begin{document}\\input{sec}\\bibliography{refs}\\end{document}\n")
+            lp = mkpdf(src, "lx1", "Latex source one")
+            rc, o = run("file", lp, "--project", "Src", "--kind", "work", "--title", "Latex doc",
+                        "--latex", os.path.join(lx, "main.tex"))
+            r = load()["documents"]["001-0001"]["revisions"][-1]
+            names = sorted(tarfile.open(os.path.join(ROOT, r.get("sources", "x"))).getnames()) if r.get("sources") else []
+            ok("--latex keeps the .tex and what it includes (input, figure via graphicspath, local .sty and what it "
+               "requires, .bib) and not a commented-out input, a stray file or TeX's own amsmath",
+               rc == 0 and r.get("sources") == "sources/001/001-0001-A.tar.gz"
+               and names == ["fig/plot.png", "inner.sty", "local.sty", "main.tex", "refs.bib", "sec.tex"]
+               and r.get("source_files") == names)
+            tb = open(os.path.join(ROOT, r["sources"]), "rb").read()
+            os.remove(os.path.join(ROOT, r["sources"]))
+            keep_sources(tex_sources(os.path.join(lx, "main.tex")), "001", "001-0001-A")
+            ok("the same source packs to the same bytes", open(os.path.join(ROOT, r["sources"]), "rb").read() == tb)
+            # a LaTeX build found by itself: a .tex of the PDF's own name beside it (the way mkpdf leaves one)
+            sib = mkpdf(src, "sib", "Sibling tex one")
+            run("file", sib, "--project", "Src", "--title", "Sibling doc")
+            r = load()["documents"]["001-0002"]["revisions"][-1]
+            ok("a .tex beside the PDF with its name is kept with no flag",
+               r.get("source_files") == ["sib.tex"])
+            # a plain --source, and a PDF with nothing findable
+            alone = os.path.join(t, "alone")
+            os.makedirs(alone)
+            shutil.copy(mkpdf(src, "pl", "Plain source one"), os.path.join(alone, "pl.pdf"))
+            shutil.copy(mkpdf(src, "no", "Nothing found one"), os.path.join(alone, "no.pdf"))
+            notes = os.path.join(t, "notes.md")
+            with open(notes, "w") as f:
+                f.write("# notes\n")
+            run("file", os.path.join(alone, "pl.pdf"), "--project", "Src", "--title", "Plain doc", "--source", notes)
+            run("file", os.path.join(alone, "no.pdf"), "--project", "Src", "--title", "Bare doc")
+            reg = load()
+            ok("a --source that is not LaTeX is kept alone; a PDF with no source findable keeps none",
+               reg["documents"]["001-0003"]["revisions"][-1].get("source_files") == ["notes.md"]
+               and "sources" not in reg["documents"]["001-0004"]["revisions"][-1])
+            # a member's .tex that reaches outside its trees: the outside file is never read
+            mt = os.path.join(t, "mtree")
+            os.makedirs(mt)
+            with open(os.path.join(mt, "m.tex"), "w") as f:
+                f.write("\\input{" + os.path.join(lx, "secret") + "}\\input{mine}")
+            with open(os.path.join(mt, "mine.tex"), "w") as f:
+                f.write("mine")
+            os.symlink(os.path.join(lx, "unused.txt"), os.path.join(mt, "link.txt"))
+            got = [n for _, n in tex_sources(os.path.join(mt, "m.tex"), [os.path.realpath(mt)])]
+            ok("a member's source keeps only files inside its trees", sorted(got) == ["m.tex", "mine.tex"])
+            kept, _ = pack([(os.path.join(mt, "link.txt"), "link.txt"), (os.path.join(mt, "mine.tex"), "mine.tex")],
+                           os.path.join(t, "m.tar.gz"), [os.path.realpath(mt)])
+            ok("packing for a member refuses a link, even one tex_sources did not see", kept == ["mine.tex"])
+            # backfill (a register of its own): the current revision of a document with a findable --source gains
+            # it; one with none is listed; one that already keeps its source is left alone
+            ROOT = os.path.join(t, "r-bf")
+            run("file", os.path.join(alone, "pl.pdf"), "--project", "Src", "--kind", "work", "--title", "Plain doc",
+                "--source", notes)
+            run("file", os.path.join(alone, "no.pdf"), "--project", "Src", "--title", "Bare doc")
+            run("file", sib, "--project", "Src", "--title", "Sibling doc")
+            reg = load()
+            reg["documents"]["001-0001"]["revisions"][-1].pop("sources", None)
+            save(reg)
+            rc, o = run("backfill-sources")
+            reg = load()
+            ok("backfill keeps what a recorded --source finds, lists a document with none, skips one that has its own",
+               rc == 0 and "001-0001-A\tkept\t1 file(s)" in o and "001-0002-A\tno source" in o
+               and reg["documents"]["001-0001"]["revisions"][-1].get("sources_backfilled") is True
+               and "001-0003" not in o and "sources_backfilled" not in reg["documents"]["001-0003"]["revisions"][-1])
+            ROOT = os.path.join(t, "r-filer")
+            # filer: a track worktree, its thread from track-threads.json
+            wt = os.path.join(t, "wt", "sub")
+            os.makedirs(os.path.join(t, "wt", ".cc"))
+            os.makedirs(wt)
+            with open(os.path.join(t, "wt", ".cc", "track"), "w") as f:
+                f.write("repo1\ntrack1\nid\n")
+            with open(os.path.join(sd, "track-threads.json"), "w") as f:
+                json.dump({"repo1/track1": {"chat": "C1", "ts": "111.222"}}, f)
+            with open(os.path.join(sd, "channels.json"), "w") as f:
+                json.dump({"repo1": "CREPO"}, f)
+            with open(os.path.join(sd, "orchs.json"), "w") as f:
+                json.dump({"CORCH": {"target": "repo1", "alias": "lib"},
+                           "COLD": {"target": "repo1", "alias": "gone", "archived": True}}, f)
+            globals()["_cwds"] = lambda: [os.path.join(t, "scratch-build"), wt]
+            rc, o = run("file", mkpdf(src, "f1", "Filer one"), "--project", "Src", "--kind", "work", "--title", "Filer doc")
+            f1 = load()["documents"]["001-0001"]["revisions"][-1].get("filer")
+            ok("a filing from a track worktree records repo, track, target and its thread",
+               f1 == {"repo": "repo1", "session": "track1", "target": "repo1/track1", "channel": "C1", "thread": "111.222"})
+            globals()["_cwds"] = lambda: [os.path.join(t, "nowhere")]
+            os.environ["CC_SLACK_ALIAS"] = "lib"
+            try:
+                run("file", mkpdf(src, "f2", "Filer two"), "--project", "Src", "--title", "Filer two")
+                os.environ["CC_SLACK_ALIAS"] = "gone"
+                run("file", mkpdf(src, "f3", "Filer three"), "--project", "Src", "--title", "Filer three")
+            finally:
+                os.environ.pop("CC_SLACK_ALIAS", None)
+            run("file", mkpdf(src, "f4", "Filer four"), "--project", "Src", "--title", "Filer four")
+            reg = load()
+            fs = [reg["documents"][dn]["revisions"][-1].get("filer") for dn in ("001-0002", "001-0003", "001-0004")]
+            ok("an orch's alias records its live channel; an archived orch's is not used; nothing known records none",
+               fs[0] == {"alias": "lib", "session": "lib", "channel": "CORCH", "repo": "repo1", "target": "repo1"}
+               and fs[1] == {"alias": "gone", "session": "gone"} and fs[2] is None)
+            # feedback (a register of its own): a new revision answers its document's open items, and only those
+            ROOT = os.path.join(t, "r-fb")
+            globals()["_cwds"] = lambda: [wt]
+            run("file", mkpdf(src, "x1", "Feedback x"), "--project", "Src", "--kind", "work", "--title", "X doc")
+            run("file", mkpdf(src, "y1", "Feedback y"), "--project", "Src", "--title", "Y doc")
+            fb = {"items": {"1": {"id": "1", "number": "001-0001", "rev": "A", "status": "delivered"},
+                            "2": {"id": "2", "number": "001-0002-A", "status": "delivered"},
+                            "3": {"id": "3", "number": "001-0001", "rev": "A", "status": "done", "reply": "by hand",
+                                  "synced": True},
+                            "4": {"id": "4", "number": "001-0001", "rev": "A", "status": "posting"}}}
+            with open(feedback_path(), "w") as f:
+                json.dump(fb, f)
+            rc0, o0 = run("file", mkpdf(src, "x1", "Feedback x"), "--project", "Src", "--title", "X doc")
+            unchanged = json.load(open(feedback_path())) == fb
+            rc, o = run("file", mkpdf(src, "x1", "Feedback x changed"), "--project", "Src", "--title", "X doc")
+            items = json.load(open(feedback_path()))["items"]
+            ok("an unchanged rebuild answers nothing; a new revision marks its document's delivered feedback done "
+               "(answered by rev B, unsynced) and leaves another document's, an already-done and a not-yet-posted "
+               "item alone", "unchanged" in o0 and unchanged and rc == 0 and "answers 1 feedback" in o
+               and o.startswith("001-0001-B\t")
+               and items["1"]["status"] == "done" and items["1"]["reply"] == "answered by rev B"
+               and items["1"]["synced"] is False and items["2"] == fb["items"]["2"]
+               and items["3"] == fb["items"]["3"] and items["4"] == fb["items"]["4"])
+            # a move (a register of its own): the kept source moves with its revision; feedback on the old number
+            # is answered by the next revision under the new one
+            ROOT = os.path.join(t, "r-mv")
+            ms = os.path.join(t, "mv.md")
+            with open(ms, "w") as f:
+                f.write("moved source")
+            run("file", mkpdf(src, "m1", "Move one"), "--project", "Src", "--kind", "work", "--title", "M doc",
+                "--source", ms)
+            with open(feedback_path(), "w") as f:
+                json.dump({"items": {"1": {"id": "1", "number": "001-0001", "rev": "A", "status": "delivered"}}}, f)
+            rcm, om = run("move", "001-0001", "Other", "--kind", "work")
+            mr = load()["documents"].get("002-0001", {}).get("revisions", [{}])[0]
+            ok("move carries a revision's kept source to the new number, and the old path is gone",
+               rcm == 0 and mr.get("sources") == "sources/002/002-0001-A.tar.gz"
+               and os.path.isfile(os.path.join(ROOT, mr["sources"]))
+               and not os.path.exists(os.path.join(ROOT, "sources", "001", "001-0001-A.tar.gz")))
+            rc, o = run("file", mkpdf(src, "m1", "Move one changed"), "--project", "Other", "--title", "M doc")
+            it = json.load(open(feedback_path()))["items"]["1"]
+            ok("a new revision under the new number answers feedback left on the old one",
+               rc == 0 and o.startswith("002-0001-B\t") and it["status"] == "done"
+               and it["reply"] == "answered by rev B")
+            # a member view (a register of its own) never carries the filer the owner's copy does
+            ROOT = os.path.join(t, "r-view")
+            run("file", mkpdf(src, "v1", "View one"), "--project", "Src", "--kind", "work", "--title", "V doc")
+            reg = load()
+            reg["documents"]["001-0001"]["visibility"].append(wid)
+            save(reg)
+            write_views(reg, {wid})
+            with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:
+                vr = json.load(fh)["documents"]["001-0001"]["revisions"]
+            ok("a member view carries no filer, while the register has it",
+               vr and not any("filer" in x for x in vr) and reg["documents"]["001-0001"]["revisions"][0].get("filer"))
+        finally:
+            globals()["_cwds"] = old_cwds
+            if old_env is None:
+                os.environ.pop("CC_SLACK_DIR", None)
+            else:
+                os.environ["CC_SLACK_DIR"] = old_env
     print(f"cc-docs selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
 
@@ -1559,6 +2003,7 @@ def main(argv):
             p.add_argument("--date")
             p.add_argument("--note")
             p.add_argument("--cost", action="append")
+            p.add_argument("--latex")
         else:
             p.add_argument("--tex", action="store_true")
         p.add_argument("--project", required=not IN_SANDBOX)   # inside a workspace the host picks the member's own
@@ -1595,6 +2040,7 @@ def main(argv):
     p = sub.add_parser("fold")
     p.add_argument("keep")
     p.add_argument("other", nargs="+")
+    sub.add_parser("backfill-sources")
     p = sub.add_parser("retire")
     p.add_argument("number")
     p = sub.add_parser("move")
@@ -1608,14 +2054,16 @@ def main(argv):
     if IN_SANDBOX and a.cmd in ("file", "number"):
         return across(a)
     try:
-        if IN_SANDBOX and a.cmd in ("project", "star", "public", "token", "member", "fold", "retire", "move"):
+        if IN_SANDBOX and a.cmd in ("project", "star", "public", "token", "member", "fold", "retire", "move",
+                                    "backfill-sources"):
             # brief: "A member can't … make anything public, star for someone else, or read the owner's register"
             raise Refused(f"{a.cmd} is the host's: a workspace can file, number, find and list its own documents")
         if a.cmd == "member":
             return cmd_member(a)
         return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list,
                 "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library,
-                "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move}[a.cmd](a)
+                "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move,
+                "backfill-sources": cmd_backfill}[a.cmd](a)
     except Refused as e:
         print(f"cc-docs: {e}", file=sys.stderr)
         return 2
