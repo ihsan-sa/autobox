@@ -7,7 +7,8 @@
 # TICK, WITH NO EVENT, `reconcile` compares each live session with the model it belongs on (want_of: a planning or
 # major window's band is the primary — or, with CC_MODEL_PRIMARY_WINDOWS set, only a LISTED one's is and every other
 # planning or major window's is the floor; a moved one's is what it was on; a rowless minor one is not touched) and makes
-# the same move up or down, so a session born on the fallback with no record comes back too. LLM-free except the
+# the same move up or down, so a session born on the fallback with no record comes back too. A non-planning window with
+# every rung out has nothing to move to and is left where it is, and no pass ever types a /model that names no model (reconcile drops one left queued in a spool, and reads a banked [1m][1m] once). LLM-free except the
 # probe, which runs the id sessions run ([1m] and all) and is not believed while real runs on it are refused. A PLANNING SESSION (a repo's seat, an orch, a window
 # on CC_MODEL_PLANNING) never goes below the floor, Opus — the primary itself since 2026-09-23, so with Opus out it is
 # parked, never on Sonnet, and comes back by handoff.
@@ -454,13 +455,33 @@ live_model(){   # $1 pane id → the model the session in that pane is RUNNING, 
     if [ -n "$c" ] && [ -r "/proc/$c/cmdline" ]; then
       sid=$(tr '\0' '\n' < "/proc/$c/cmdline" | grep -A1 -x -- '--session-id' | tail -1)
       [ -n "$sid" ] && IFS=$'\t' read -r m w < <(jq -r '[(.model // ""), ((.window // 0) | tostring)] | @tsv' "$(sldir)/$sid.json" 2>/dev/null)
-      { [ -n "${m:-}" ] && [ "${w:-0}" -ge 1000000 ] 2>/dev/null; } && m="${m}[1m]"
+      m=$(sl_id "${m:-}" "${w:-0}")
       [ -n "${m:-}" ] || m=$(tr '\0' '\n' < "/proc/$c/cmdline" | grep -A1 -x -- '--model' | tail -1)
     fi
   fi
   [ -n "${m:-}" ] || m="${2:-$(current)}"
   printf '%s\n' "$m"; }
-moved_row(){ awk -F'\t' -v p="${1:-}" '$1==p{print $3; exit}' "$MOVED" 2>/dev/null; }   # what a pane was on when the box moved off a model, or nothing
+sl_id(){   # $1 a statusline record's model · $2 its window → the id a dispatch names: [1m] added for a 1M window, ONCE.
+           # The record already says `claude-sonnet-5[1m]` for a session launched with it, and adding the suffix again
+           # read `claude-sonnet-5[1m][1m]` off five tutor windows on 2026-09-25 and banked it in their $MOVED rows.
+  local m="${1:-}"; [ -n "$m" ] || return 0
+  case "$m" in *']') ;; *) [ "${2:-0}" -ge 1000000 ] 2>/dev/null && m="${m}[1m]";; esac; printf '%s\n' "$m"; }
+one_sfx(){ sed -E 's/(\[[^][]*\])+$/\1/' <<<"${1:-}"; }   # $1 model → the same with a doubled suffix read once: [1m][1m] → [1m]
+moved_row(){ one_sfx "$(awk -F'\t' -v p="${1:-}" '$1==p{print $3; exit}' "$MOVED" 2>/dev/null)"; }   # what a pane was on when the box moved off a model, or nothing (a row banked as [1m][1m] reads once)
+repair_moved(){   # rows banked as [1m][1m] before 2026-09-25 are rewritten with one suffix, in place, once
+  awk -F'\t' '$3 ~ /\]\[[^][]*\]$/{y=1} END{exit !y}' "$MOVED" 2>/dev/null || return 0
+  awk -F'\t' -v OFS='\t' '{while ($3 ~ /\[[^][]*\]\[[^][]*\]$/) sub(/\[[^][]*\]$/, "", $3); print}' "$MOVED" > "$MOVED.tmp" && mv "$MOVED.tmp" "$MOVED"
+  printf '%s\t%s\trepair\t\tmoved rows with a doubled model suffix read once\n' "$(date -u +%FT%TZ)" "$now" >> "$LOG"; }
+purge_bare_model(){   # $1 window → a bare "/model" cc-msg spooled for it is dropped, under cc-msg's own lock. Before
+                      # type_into refused one, each tick queued another (5-6 per tutor window, 2026-09-25) and every
+                      # Esc delivered the next, reopening the picker.
+  local sp="$ST/$1/inbox.spool" n
+  [ -s "$sp" ] && grep -q '"/model *"' "$sp" 2>/dev/null || return 0
+  n=$( ( flock -w 10 9 || exit 1
+         b=$(wc -l < "$sp"); jq -c 'select((.text // "") | test("^/model\\s*$") | not)' "$sp" > "$sp.tmp" && mv "$sp.tmp" "$sp"
+         echo $((b - $(wc -l < "$sp"))) ) 9>"$ST/$1/.inbox.lock" ) || return 0
+  [ "${n:-0}" -gt 0 ] 2>/dev/null &&
+    printf '%s\t%s\tpurge\t\t%s: %s queued bare /model line(s) dropped\n' "$(date -u +%FT%TZ)" "$now" "$1" "$n" >> "$LOG"; }
 moved_by_box(){   # $1 pane · $2 the family a move is off → 0 = the box has TYPED at this pane for THAT move.
                   # A ROW IS THE PANE'S FOR THE WHOLE EPISODE; A GUARD BELONGS TO ONE MOVE (third review of #503).
                   # Asked of the row alone, this skipped a pane the box had moved at 10:00 for Fable when Opus hit the
@@ -476,7 +497,7 @@ note_moved(){   # $1 pane · $2 window · $3 the model it was on · $4 moved|kep
                 # families the box has typed this pane off, and a pane banked `kept` that a later move does type at
                 # becomes `moved` for that family. Without that upgrade a pane a person had left on the fallback was
                 # outside every guard when the fallback went out, and was retyped on every tick past the retune gap.
-  local p="$1" w="$2" m="$3" k="${4:-moved}" f="${5:-}"
+  local p="$1" w="$2" m k="${4:-moved}" f="${5:-}"; m=$(one_sfx "$3")   # never bank a [1m][1m] (2026-09-25)
   case "$k" in moved|parked) ;; *) f="";; esac   # kept: nothing was done to it, so the row names no move
   awk -F'\t' -v p="$p" '$1==p{y=1} END{exit !y}' "$MOVED" 2>/dev/null ||
     { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$w" "$m" "$now" "$k" "$f" >> "$MOVED"; return 0; }
@@ -581,7 +602,9 @@ want_of(){   # $1 pane · $2 window → the model this session belongs on NOW, "
              # first rung that is not out (out_why: on record as not the account's, or the primary under an override).
              # A planning window never lands below the floor: "park" when everything down to it is out.
   local b m; if moved_by_box "$1" ""; then b=$(moved_row "$1"); elif planning "$2" || major "$2"; then b=$(band_of "$2"); else return 1; fi
-  m="$b"; while out_why "$m" >/dev/null; do m=$(chain_next "$m") || { planning "$2" && echo park; return 0; }; done
+  # every rung out: a planning window parks, any other has nothing to be moved to (exit 1, reconcile leaves it). Until
+  # 2026-09-25 that second case returned 0 with no model, and reconcile typed a bare /model into five tutor windows.
+  m="$b"; while out_why "$m" >/dev/null; do m=$(chain_next "$m") || { planning "$2" && { echo park; return 0; }; return 1; }; done
   { planning "$2" && below_floor "$m"; } && { echo park; return 0; }
   printf '%s\n' "$m"; }
 reconcile(){   # EVERY TICK, NO EVENT NEEDED (owner, 2026-09-21): each live session's model against want_of, and the move
@@ -592,9 +615,10 @@ reconcile(){   # EVERY TICK, NO EVENT NEEDED (owner, 2026-09-21): each live sess
                # `/model`; a parked seat whose rung answers hands back by handoff. A planning window with its floor out is parked (a
                # pane below the floor typed back to it first). A pane with no record is taken to be where it belongs,
                # and each pane is typed at once per CC_MODEL_RETUNE_GAP, as every other pass.
-  local id name w lm fr; fr=$(floor_rung)
+  local id name w lm fr; fr=$(floor_rung); repair_moved
   while read -r id name; do [ -n "${id:-}" ] || continue
     member_win "$name" && continue; case "$name" in *~*) continue;; esac   # never on the chain · mid-handoff
+    purge_bare_model "$name"
     w=$(want_of "$id" "$name") || continue
     if [ "$w" = park ]; then
       parked_row "$id" && continue   # parked already: the owner heard once, and the seat is idle
@@ -675,7 +699,7 @@ planning(){   # $1 window → 0 = a planning session. CC_MODEL_PLANNING (env, el
   case "$w" in */*) return 1;; *@*) return 0;; esac; return 0; }
 floor_fam(){ local f="${CC_MODEL_FLOOR:-}"   # unset: Opus when it is on the chain (the owner's word), else the fallback
   [ -n "$f" ] || { [ -n "$(chain_all | grep -i opus)" ] && f=opus || f="$FALLBACK"; }; fam "$f"; }   # no -q: pipefail + SIGPIPE
-rung_of(){ chain_all | awk -v f="$(fam "${1:-}")" '{m=tolower($0)} index(m, f){print NR; exit}'; }   # $1 model → its place on the chain (1 = the primary), or nothing
+rung_of(){ [ -n "$(fam "${1:-}")" ] || return 0; chain_all | awk -v f="$(fam "${1:-}")" '{m=tolower($0)} index(m, f){print NR; exit}'; }   # $1 model → its place on the chain (1 = the primary), or nothing
 below_floor(){ local r fl; r=$(rung_of "${1:-}"); fl=$(rung_of "$(floor_fam)"); [ -n "$r" ] && [ -n "$fl" ] && [ "$r" -gt "$fl" ]; }   # $1 model → 0 = a lower rung than the floor
 floor_rung(){ if [ "$(fam "$FALLBACK")" = "$(floor_fam)" ]; then printf '%s\n' "$FALLBACK"; else rung_id "$(floor_fam)"; fi; }
 # ── ONLY LISTED WINDOWS BELONG ON THE PRIMARY (the owner names the seats that stay on the primary, 2026-09-22, and
@@ -811,6 +835,11 @@ type_into(){   # $1 pane id · $2 window name · $3 text. cc-msg IS the box's ty
                # The direct tmux path below is for the test session only, where cc-msg's contract (session main, a real
                # interactive claude) cannot hold — the selfcheck and selftest run against `cat` in a scratch server.
   local id="$1" name="$2" text="$3" out
+  # NEVER A BARE /model: with no id it opens the CLI's model picker, and the session's messages queue behind it
+  # (2026-09-25, five tutor windows for ~35 min). Refused here whatever the caller computed.
+  if [[ "$text" =~ ^/model[[:space:]]*$ ]]; then
+    printf '%s\t%s\trefuse\t\t%s:%s (%s) — /model with no model, nothing typed\n' "$(date -u +%FT%TZ)" "$now" "$SESSION" "$name" "$id" >> "$LOG"
+    return 1; fi
   case "$text" in "/model "*) too_old_guard "$id" "$name" "${text#/model }" && return 1;; esac   # its Claude Code cannot run it: handed off instead
   if [ "$SESSION" = main ] && [ "$PROC" = claude ] && [ -x "$BIN/cc-msg" ]; then
     [ "$(tmux display-message -p -t "$id" '#{pane_active}' 2>/dev/null)" = 1 ] || return 1
@@ -2566,6 +2595,40 @@ TXT
   do_switch "$PRIMARY" 'limit lifted (probe)'
   t '(o) …Opus answers: every seat and the track hand back to Opus 5.5 by handoff, nothing typed' \
     "$(LC_ALL=C sort "$d/handoffs" | paste -sd'|' -):$(cat "$d/typed")" "lessons/ece1|repo|repo/track|repo@orch:"
+  # THE TUTOR WINDOWS, 2026-09-25 17:58Z: Opus and then Sonnet out on the spend limit, five course windows the switch had
+  # moved (their rows banked as [1m][1m]) and not planning here. want_of fell off the chain and answered 0 with no model,
+  # and reconcile typed a bare /model — the CLI's picker — into each. Each case builds its own state.
+  pl; rm -f "$OV"; local oldpl="$CC_MODEL_PLANNING"; CC_MODEL_PLANNING=''
+  printf '%s\n' '%3 lessons/ece203' > "$d/sess"; printf '%s\t%s\n' '%3' "${FALLBACK}[1m]" > "$d/live"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' '%3' lessons/ece203 "${PRIMARY%%\[*}[1m][1m]" "$now" moved "$(fam "$PRIMARY")" > "$MOVED"   # as live banked it
+  note_moved '%9' lessons/ece231 "${PRIMARY%%\[*}[1m][1m]" moved "$(fam "$PRIMARY")"
+  t '(t) note_moved banks a doubled suffix once' "$(awk -F'\t' '$1=="%9"{print $3}' "$MOVED")" "${PRIMARY%%\[*}[1m]"
+  note_unavailable "$(fam "$PRIMARY")" "You've hit your monthly spend limit"
+  t '(t) Opus alone out: the moved tutor window wants Sonnet, its doubled row read once as the band' \
+    "$(moved_row '%3'):$(want_of '%3' lessons/ece203)" "$PRIMARY:$FALLBACK"
+  note_unavailable "$(fam "$FALLBACK")" "You've hit your monthly spend limit"
+  t '(t) Opus and Sonnet out: want_of has nothing for it and says so (exit 1, no model)' \
+    "$(want_of '%3' lessons/ece203; printf 'rc=%s' $?)" "rc=1"
+  reconcile
+  t '(t) …and reconcile types nothing into it' "$(typed lessons/ece203):$(grep -c $'\tretune\t' "$LOG")" ":0"
+  t '(t) …and the doubled row it read is repaired in the file itself, once' \
+    "$(awk -F'\t' '$1=="%3"{print $3}' "$MOVED"):$(grep -c $'\trepair\t' "$LOG")" "${PRIMARY%%\[*}[1m]:1"
+  CC_MODEL_PLANNING="$oldpl"
+  pl; mkdir -p "$ST/lessons/ece206"
+  { jq -cn '{at:"x",from:"cc-model",text:"/model "}'; jq -cn '{at:"x",from:"slack",text:"hello tutor"}'
+    jq -cn '{at:"x",from:"cc-model",text:"/model"}'; jq -cn '{at:"x",from:"cc-model",text:"/model claude-sonnet-5"}'; } > "$ST/lessons/ece206/inbox.spool"
+  purge_bare_model lessons/ece206
+  t '(t) queued bare /model lines are dropped from the spool; a message and a /model that names a model stay, in order' \
+    "$(jq -r .text "$ST/lessons/ece206/inbox.spool" | paste -sd'|' -):$(grep -c $'\tpurge\t' "$LOG")" "hello tutor|/model claude-sonnet-5:1"
+  purge_bare_model lessons/ece206; purge_bare_model lessons/nospool
+  t '(t) …and a spool with none, or no spool at all, is left alone and logs nothing' "$(grep -c $'\tpurge\t' "$LOG")" 1
+  pl; printf '%s\n' '%3 lessons/ece203' > "$d/sess"
+  type_into '%3' lessons/ece203 '/model'; type_into '%3' lessons/ece203 '/model  '; type_into '%3' lessons/ece203 "/model $FALLBACK"
+  t '(t) type_into refuses a bare /model and logs it, and still types one that names a model' \
+    "$(typed lessons/ece203):$(grep -c $'\trefuse\t' "$LOG")" "/model $FALLBACK:2"
+  t '(t) a statusline record that already says [1m] keeps one suffix; a bare id on a 1M window gains it; a 200k one does not' \
+    "$(sl_id "$FALLBACK" 1000000):$(sl_id claude-sonnet-5 1000000):$(sl_id claude-sonnet-5 200000):$(sl_id '' 1000000)" \
+    "$FALLBACK:claude-sonnet-5[1m]:claude-sonnet-5:"
   PRIMARY="$fxp"; FALLBACK="$fxf"; CHAIN="$fxc"; PROBEM="$PRIMARY"
   # A PROBE THAT ANSWERS WHILE A REAL RUN IS REFUSED IS NOT AVAILABILITY (model.log 2026-09-21 17:17-17:48Z)
   pl; rm -f "$OV" "$REFUSED"; local oldclaude="$CLAUDE"; CLAUDE="$d/bin/fakeclaude"; eval "$probe_src"
