@@ -20,6 +20,12 @@ WHAT IS LOOKED AT: the lines the working copy adds against its merge-base with o
 untracked files. A class fires on a changed file whose path matches `path`, with an added line matching `added`,
 unless the file as it now stands matches `unless` or the file's added lines match `unless_added`. A class that is
 answered some other way is marked on an added line of that file: `recurring-defect-ok: <class> — <why>`.
+
+VENDORED CODE gets no vote either way: a file under a directory `git subtree add|pull --squash` brought in carries
+that action's own trailer (`git-subtree-dir: <prefix>`) on the commit that added it, reachable from HEAD forever.
+A path under such a prefix is skipped for every class before any regex runs — it is copied verbatim from upstream,
+so neither a waiver line nor an `unless` match can be added to it without the copy drifting from where it came
+from. The skip reads git's own record of the add, never a line inside the vendored file.
 """
 import contextlib, glob, hashlib, json, os, re, shutil, subprocess, sys, tempfile
 
@@ -141,9 +147,25 @@ def added_lines(root, mb):
     return out
 
 
+def subtree_dirs(root):
+    """The prefixes `git subtree add|pull --squash` has ever brought in, read from the trailer it leaves on the
+    commit that did it (reachable from HEAD) — not from anything committed inside the vendored files."""
+    out = git(root, "log", "HEAD", "--format=%B")
+    if out.returncode != 0:
+        return set()
+    return {m.group(1).strip().rstrip("/") for m in re.finditer(r"^git-subtree-dir:\s*(.+)$", out.stdout, re.M)}
+
+
+def vendored(path, dirs):
+    return any(path == d or path.startswith(d + "/") for d in dirs)
+
+
 def hits(root, mb, live):
     found = []
+    dirs = subtree_dirs(root)
     for path, lines in sorted(added_lines(root, mb).items()):
+        if vendored(path, dirs):
+            continue
         post, added = read(os.path.join(root, path)) or "", "\n".join(t for _, t in lines)
         for c in live:
             if not re.search(c["path"], path):
@@ -234,6 +256,59 @@ def selftest():
                 rc, out = run(root, {"CC_REVIEWS_DIR": revs, "CC_STATE_BASE": st})
                 named = f"DEFECT  {c['name']} at {fx['path']}:" in out
                 ok(f"{c['name']}: {case} → {'red' if want else 'not red'}", rc == want and named == bool(want), out)
+        # A file under a directory git itself recorded as a subtree target is skipped for every class — the skip
+        # reads the commit's own trailer, never a line inside the vendored file, and stays narrow to that prefix.
+        c = classes[0]
+        d = os.path.join(top, f"{c['name']}-vendored")
+        root, revs, st = os.path.join(d, "repo"), os.path.join(d, "reviews"), os.path.join(d, "state")
+        os.makedirs(revs)
+        os.makedirs(root)
+        git(root, "init", "-q")
+        git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+        git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        fx = c["red"]
+        vpath = f"vendor/skill/{fx['path']}"      # the whole fixture path, so the class's `path` regex still matches
+        os.makedirs(os.path.dirname(os.path.join(root, vpath)), exist_ok=True)
+        with open(os.path.join(root, vpath), "w") as f:
+            f.write(fx["text"])
+        os.makedirs(os.path.dirname(os.path.join(root, fx["path"])), exist_ok=True)
+        with open(os.path.join(root, fx["path"]), "w") as f:
+            f.write(fx["text"])
+        git(root, "add", "-A")
+        git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m",
+            "Add hwde skill via subtree\n\ngit-subtree-dir: vendor/skill\n"
+            "git-subtree-split: 0000000000000000000000000000000000000000")
+        for pr in (11, 12):
+            body = f"**VERDICT: LAND-AFTER-FIX**\n\n1. x:1 — {c['example']}\n"
+            with open(os.path.join(revs, f"r-{pr}-{hashlib.sha1(body.encode() + bytes([pr])).hexdigest()[:12]}.md"), "w") as f:
+                f.write(body)
+        rc, out = run(root, {"CC_REVIEWS_DIR": revs, "CC_STATE_BASE": st})
+        ok(f"{c['name']}: the red fixture vendored under a git-subtree-dir prefix is not flagged, "
+           "the same text outside it still is",
+           f"DEFECT  {c['name']} at {vpath}:" not in out and f"DEFECT  {c['name']} at {fx['path']}:" in out, out)
+        # …and only a trailer HEAD reaches counts: one on a side branch (another track's, an abandoned one) does not.
+        d = os.path.join(top, f"{c['name']}-vendored-elsewhere")
+        root, revs, st = os.path.join(d, "repo"), os.path.join(d, "reviews"), os.path.join(d, "state")
+        os.makedirs(revs)
+        os.makedirs(root)
+        git(root, "init", "-q")
+        git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+        git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        git(root, "checkout", "-q", "-b", "side")
+        git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m",
+            "Add skill via subtree\n\ngit-subtree-dir: vendor/skill\n"
+            "git-subtree-split: 0000000000000000000000000000000000000000")
+        git(root, "checkout", "-q", "-")
+        os.makedirs(os.path.dirname(os.path.join(root, vpath)), exist_ok=True)
+        with open(os.path.join(root, vpath), "w") as f:
+            f.write(fx["text"])
+        for pr in (11, 12):
+            body = f"**VERDICT: LAND-AFTER-FIX**\n\n1. x:1 — {c['example']}\n"
+            with open(os.path.join(revs, f"r-{pr}-{hashlib.sha1(body.encode() + bytes([pr])).hexdigest()[:12]}.md"), "w") as f:
+                f.write(body)
+        rc, out = run(root, {"CC_REVIEWS_DIR": revs, "CC_STATE_BASE": st})
+        ok(f"{c['name']}: a git-subtree-dir trailer only on a branch HEAD cannot reach exempts nothing",
+           rc == 1 and f"DEFECT  {c['name']} at {vpath}:" in out, out)
         # The record outlives the track: a live brief is copied, and still counts once its track dir is gone.
         d = os.path.join(top, "sweep")
         revs, st, c = os.path.join(d, "reviews"), os.path.join(d, "state"), classes[0]
