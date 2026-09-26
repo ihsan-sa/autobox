@@ -26,7 +26,8 @@ slowest thing in the flow. A gate that long outlives a foreground tool call, so 
 which detaches the run itself and returns, then `cc-green wait` until its exit is not 3 (still going), and read the
 log it names. One of your repo's own suites that is not a landing gate goes the same way, `cc-green start --
 tests/check-slow.sh` or `cc-green start -- bin/<tool> selfcheck`; it takes a committed suite and nothing else. Never add `setsid`, `nohup` or `&` yourself, because the auto-mode classifier
-refuses those as a bypass, and a `run_in_background` job dies with your iteration. The run outlives the
+refuses those as a bypass, and a `run_in_background` job dies with your iteration. If you edit while it runs, its
+verdict no longer answers for your tree: `cc-green stop` ends your own run (never `kill` it), then `start` again. The run outlives the
 iteration: if yours ends while the run is going, the loop waits on it (no model call) and journals its exit and
 log for your next context, which reads that log and finishes.
 

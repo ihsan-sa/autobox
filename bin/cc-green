@@ -25,6 +25,17 @@
 #                            or none going: the report for the tree as it is NOW, exit 0/1 as above. Still going:
 #                            `still running (pid, since)`, exit 3 — call again. Killed or interrupted before it
 #                            finished: says so and exits 1, with no report
+#   cc-green stop            end THIS worktree's run, so a run whose tree has moved under it — a verdict nobody will
+#                            spend — does not hold `start` at exit 3 until it is over. The route for a worker, whose own
+#                            `kill` of the run the classifier refuses as interfering with a workload (2026-09-26, ~22 min
+#                            lost behind a stale suite). It reaches only the pid this root's status note names and the
+#                            gate groups that run wrote there, and only after reading each one's environment for the
+#                            run's own CC_GREEN_RUNID — no process is found by name or pattern, and another worktree's
+#                            run has another lock, note and runid. TERM first, so the run takes its gate down and says
+#                            `interrupted`; a run still holding the lock 30 s later gets KILL, and so does a gate group
+#                            of its still there 5 s after that.
+#                            Then `cc-green start` runs on the tree as it is now. exit 0 once none is going (or none
+#                            was), 1 when the lock is held by something this cannot prove is the run
 #   cc-green red SCOPE KIND KEY --observed TEXT [--log FILE] [--writer W] [--expected TEXT] [--link k=v]... [--cost k=v]...
 #                            one failures-ledger record (cc-failures record), ONCE per KEY: a second call with a KEY the
 #                            scope's ledger already holds under links.source writes nothing and says `already <id>`. The
@@ -96,7 +107,7 @@
 # the run no longer dies with the worker's iteration (A RUN OUTLIVES WHOEVER STARTED IT, below).
 set -uo pipefail
 SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
-USAGE="usage: cc-green [run|start [-- SUITE]|wait [SECONDS]|red SCOPE KIND KEY --observed TEXT [--log FILE]…|selfcheck]"
+USAGE="usage: cc-green [run|start [-- SUITE]|wait [SECONDS]|stop|red SCOPE KIND KEY --observed TEXT [--log FILE]…|selfcheck]"
 # The tree is taken by tests/green.sh's green_tree — the SUITE's own hash, not a second one of ours. See the note
 # there: a reader with an algorithm of its own is how a green comes to name content it did not pass on.
 # shellcheck source=/dev/null
@@ -303,6 +314,7 @@ run_missing(){
     # group the trap below can TERM, so the signal ends the suite the way the foreground gate used to. Case 22.
     gout=$(mktemp "${TMPDIR:-/tmp}/cc-green.gate.XXXXXX") || gout=/dev/null
     ( cd "$r" && exec setsid env -u CC_LAND_CHANGED "${scrub[@]}" CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" "$r/$g" ) </dev/null 9>&- >"$gout" 2>&1 & gp=$!
+    printf 'gate_pgid=%s\n' "$gp" >> "$STATUS"     # what `stop` may reach besides the run itself
     tail -n +1 -f -s 0.2 --pid="$gp" "$gout" 9>&- 2>/dev/null & tp=$!
     trap 'kill -TERM -- -"$gp" "$tp" 2>/dev/null; exit 130' INT TERM
     wait "$gp" || rc=$?; wait "$tp" 2>/dev/null
@@ -368,6 +380,7 @@ launch_run(){   # $1 = root, $2 = follow it (1) or return once it has started (0
   if ! flock -n 9; then
     echo "cc-green: a run is already going on $r (pid $(status_field pid), started $(status_field started), log $(status_field log))" >&2
     echo "  — no second suite. \`cc-green wait\` blocks on it and reports when it has ended." >&2
+    stale_hint "$r" >&2
     return 3
   fi
   runid="$$-$(date +%s%N)"
@@ -443,6 +456,7 @@ run_cmd(){   # $1 = root, $2… = the suite (suite_ok has passed it). The RUN's 
   echo "cc-green: running $* in $r (pid $$) — log $LOG"
   # Its own process group, as a gate gets in run_missing, so an INT or TERM on the run takes the command down with it.
   ( cd "$r" && exec setsid "$@" ) </dev/null 9>&- & gp=$!
+  printf 'gate_pgid=%s\n' "$gp" >> "$STATUS"
   trap 'kill -TERM -- -"$gp" 2>/dev/null; exit 130' INT TERM
   wait "$gp" || rc=$?
   run_traps
@@ -459,6 +473,7 @@ wait_run(){   # $1 = root, $2 = seconds. Returns 3 while a run holds the lock pa
   sleep 1
   if ! flock -w "$(( $2 > 1 ? $2 - 1 : 0 ))" 9; then
     echo "cc-green: still running (pid $(status_field pid), since $(status_field started)) — log $(status_field log)"
+    stale_hint "$1"
     return 3
   fi
   flock -u 9     # released at once: the report below is a second, and a run may start behind it
@@ -474,6 +489,42 @@ wait_run(){   # $1 = root, $2 = seconds. Returns 3 while a run holds the lock pa
   return 0
 }
 
+# A RUN ON A TREE THIS CHECKOUT NO LONGER HOLDS is one whose verdict nobody will spend, so say so where a caller
+# meets it held: the refused `start` and the still-going `wait`. A command's run names no tree and gets no hint.
+stale_hint(){   # $1 = root (lock_files already read). Says nothing unless the run's tree and the working copy's differ
+  local was now_t; was=$(status_field tree); [ -n "$was" ] || return 0
+  now_t=$(green_tree "$1"); [ -n "$now_t" ] && [ "$now_t" != "$was" ] || return 0
+  echo "  That run is on ${was:0:12} and this working copy is ${now_t:0:12} now, so its verdict will not answer for it:"
+  echo "  \`cc-green stop\` ends it, then \`cc-green start\` runs on the tree as it is."
+}
+# `cc-green stop`. Every pid it signals is one this root's status note names AND whose environment carries that
+# note's runid, which a run and its gates inherit from the launcher: a pid reused since, or a lock held by anything
+# else, is left alone and said. Never pgrep/pkill -f — a -f pattern once killed ~26 sessions.
+is_ours(){ [ -n "$2" ] && tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep -qxF "CC_GREEN_RUNID=$2"; }   # $1 = pid, $2 = runid
+stop_run(){   # $1 = root → 0 when no run holds the root any more, 1 when this cannot end what holds it
+  local pid runid g
+  lock_files "$1"; mkdir -p "$GDIR"
+  exec 9>"$LOCK"
+  if flock -n 9; then flock -u 9; echo "cc-green: no run is going on $1 — nothing to stop"; return 0; fi
+  pid=$(status_field pid); runid=$(status_field runid)
+  if ! is_ours "$pid" "$runid"; then
+    echo "cc-green: the run lock on $1 is held, but pid ${pid:-?} is not a run carrying runid ${runid:-?} — nothing signalled" >&2
+    return 1
+  fi
+  echo "cc-green: stopping the run on $1 (pid $pid, started $(status_field started), tree $(status_field tree | cut -c1-12))"
+  kill -TERM "$pid" 2>/dev/null
+  flock -w 30 9 || { echo "cc-green: the run still holds the lock 30 s after TERM — KILL"; is_ours "$pid" "$runid" && kill -KILL "$pid" 2>/dev/null; }
+  # A gate holds no fd of the lock, so a free lock does not mean its gate is gone: one that ignored the TERM the run
+  # passed it, or one a KILLed run could not pass it to, is KILLed here — its group, once it proves to be this run's.
+  while read -r g; do
+    for _ in $(seq 50); do is_ours "$g" "$runid" || break; sleep 0.1; done
+    is_ours "$g" "$runid" && kill -KILL -- -"$g" 2>/dev/null
+  done < <(sed -n 's/^gate_pgid=//p' "$STATUS")
+  flock -w 10 9 || { echo "cc-green: the lock on $1 is still held — log $(status_field log)" >&2; return 1; }
+  flock -u 9
+  echo "cc-green: stopped — \`cc-green start\` runs the gates on the tree as it is now"
+}
+
 main(){
   local mode=${1:-} r tree tree2 moved
   r=$(root) || true
@@ -481,6 +532,7 @@ main(){
   # Wait BEFORE taking the tree: the report is on what the working copy holds once the run is over, not before.
   # And lock before it too: the lock is the first thing a run does, so a `wait` behind it has the least to race.
   # A killed run is not green whatever an older record says: exit 1 and no report (3 stays "still going").
+  [ "$mode" = stop ] && { stop_run "$r"; exit $?; }
   if [ "$mode" = wait ]; then wait_run "$r" "$2"; case $? in 0) ;; 3) exit 3;; *) exit 1;; esac
     # A command's run has no gates to report on: its own exit is the answer (wait_run has said it).
     [ -z "$(status_field cmd)" ] || { [ "$(status_field exit)" = 0 ]; exit $?; }
@@ -527,7 +579,7 @@ main(){
 }
 
 selfcheck(){
-  local n=0 f=0 D D2 R R2 out rc rc2 tree rec p p2 pid gpid log
+  local n=0 f=0 D D2 R R2 out rc rc2 tree rec p p2 pid gpid log runid
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }   # …and one that must NOT hold: `t !` runs `!` as a command
@@ -1005,6 +1057,57 @@ EOS
   k "$(t test "$rc" -eq 2)" "start -- with no command is a usage error, exit 2"
   rm -rf "$D2"
 
+  # 29 A STALE RUN IS STOPPED FOR ITS OWN WORKTREE, AND ONLY ITS OWN. Two roots each start a slow gate; one root's
+  # tree moves under its run. `start` there is refused and says the run is stale and names `stop`; `stop` ends that
+  # run and its gate, `wait` calls it interrupted, and `start` then runs on the new tree — while the other root's run
+  # and gate go on untouched. A lock held by a process that carries no runid of the note's is never signalled.
+  D2=$(mktemp -d)
+  for p2 in stA stB; do
+    R=$(newrepo "$p2")
+    printf '#!/usr/bin/env bash\necho $$ >> "%s"\nsleep 30\necho check.sh >> "%s"\n' "$D/$p2.pid" "$D/$p2.log" > "$R/core/tests/check.sh"
+    ( cd "$R" && git add -A && git commit -qm slow ) >/dev/null 2>&1
+    : > "$D/$p2.log"; : > "$D/$p2.pid"
+    ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_SCOPE=0 timeout 20 "$SELF" start >/dev/null 2>&1 )
+    for _ in $(seq 100); do [ -s "$D/$p2.pid" ] && break; sleep 0.1; done
+  done
+  R="$D/stA"; R2="$D/stB"; gpid=$(head -1 "$D/stA.pid"); p=$(head -1 "$D/stB.pid")
+  GDIR=$D2 lock_files "$R2"; p2=$(status_field pid)
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -n "$(grep 'stopped' <<<"$out")")" "stop on a root whose run is going ends it, exit 0"
+  k "$(nt kill -0 "$gpid")" "…and its gate is gone"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'was interrupted' <<<"$out")")" "…and wait on it says interrupted, exit 1 — never green"
+  k "$(t kill -0 "$p")" "…while the other root's gate is still going"
+  k "$(t kill -0 "$p2")" "…and so is the other root's run"
+  out=$( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 3)" "…which its own wait still calls running, exit 3"
+  out=$( cd "$R2" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 3)" "start on a root whose run is going is still refused, exit 3"
+  k "$(nt grep -q 'cc-green stop' <<<"$out")" "…and with its tree unmoved nothing calls that run stale"
+  echo two > "$R2/a.txt"
+  out=$( cd "$R2" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 3 -a -n "$(grep 'its verdict will not answer for it' <<<"$out")")" "…but once its tree has moved, the refusal says the run is stale"
+  k "$(t grep -q 'cc-green stop' <<<"$out")" "…and names cc-green stop"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0)" "after stop, start on that root runs again, exit 0 — no stale run holds it"
+  for _ in $(seq 100); do [ "$(wc -l < "$D/stA.pid")" -ge 2 ] && break; sleep 0.1; done
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop 2>&1 ); rc2=$?
+  k "$(t test "$rc$rc2" = 00 -a -n "$(grep 'nothing to stop' <<<"$out")")" "stop with no run going says so, exit 0"
+  GDIR=$D2 lock_files "$R2"; runid=$(status_field runid)
+  sleep 60 & pid=$!                                        # a process of ours that is no run: it carries no runid
+  printf 'pid=%s\nrunid=%s\n' "$pid" "$runid" > "$STATUS"   # the lock held, the note naming it
+  out=$( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" stop 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'nothing signalled' <<<"$out")")" "a note naming a pid that is not the run's is refused, exit 1"
+  k "$(t kill -0 "$pid")" "…and that pid is not signalled"
+  k "$(t kill -0 "$p")" "…nor the run's gate"
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  printf 'pid=%s\nrunid=%s\n' "$p2" "$runid" > "$STATUS"
+  ( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" stop >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0)" "…and the note put right, the other root's own stop ends its run"
+  k "$(t test "$(cat "$D/stA.log" "$D/stB.log")" = "")" "…and no stopped suite ever finished"
+  rm -rf "$D2"
+
   # THE RECURRING DEFECTS: every catalogue class against its own fixtures, then the report holding a hand-over on one.
   out=$(python3 "$CORE/tests/recurring_defects.py" selftest 2>&1); rc=$?
   k "$rc" "every recurring-defect class goes red on its fixture diff and holds its suppressed cases ($(tail -1 <<<"$out"))"
@@ -1031,6 +1134,7 @@ case "${1:-}" in
   __run)     [ -n "${CC_GREEN_RUNID:-}" ] || { echo "cc-green: __run is started by \`cc-green run\`, not by hand" >&2; exit 2; }
              main "$@" ;;
   wait)      case "${2:-540}" in *[!0-9]*|"") echo "$USAGE" >&2; exit 2;; esac; main wait "${2:-540}" ;;
+  stop)      [ $# = 1 ] || { echo "$USAGE" >&2; exit 2; }; main stop ;;
   red)       shift; red "$@" ;;   # no checkout needed: the landing and the loop call this from wherever they are
   selfcheck) selfcheck ;;
   *)         echo "$USAGE" >&2; exit 2 ;;
