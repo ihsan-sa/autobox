@@ -5402,6 +5402,39 @@ def run_selfcheck():
           "head's card, since a self-landing repo's routine card is in the log lane now); a person's lookalike and a 🔐 "
           "card naming no PR hand nothing over",
           qMM == [(nameMM, "9")])
+    # A SIGNED CARD (raised-approvals-ignores-a-thumbs-up-on-a-card): the protected-door card is posted by a seat through
+    # cc-notify as `<box>-box · <seat>`, so Slack gives it bot_id and no user; #601's 👍 was logged "not a bot PR post".
+    qMM.clear(); saidMM = []; dmMM.bot_id = "BBOT"
+    dmMM.say = lambda chat, text, thread=None, **k: saidMM.append((thread, text))
+    signed = {"bot_id": "BBOT", "username": "demo-box · planning"}
+    globals()["react"] = lambda *a, **k: None
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            dmMM.fetch_message = lambda chat, ts: {**signed, "text": f"❓ <@UOWNER> 🔐 *Approval needed:* [{nameMM}] PR #11 is NOT landing"}
+            dmMM.on_approval("CAPPR", "1.5", "+1", who="UOWNER")
+            dmMM.fetch_message = lambda chat, ts: {"bot_id": "BOTHERAPP", "username": "x", "text": f"❓ <@UOWNER> 🔐 *Approval needed:* [{nameMM}] PR #12 is NOT landing"}
+            dmMM.on_approval("CAPPR", "1.6", "+1", who="UOWNER")
+    finally:
+        globals()["react"] = _reactMM
+    check("a 👍 on the bot's SIGNED 🔐 card (bot_id, no user) hands that head to the landing queue; another app's "
+          "bot's card hands nothing over",
+          qMM == [(nameMM, "11")] and not saidMM)
+    qMM.clear()
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            dmMM.fetch_message = lambda chat, ts: {**signed, "text": "❓ <@UOWNER> 🔐 *Approval needed:* install texlive"}
+            dmMM.on_approval("CAPPR", "1.7", "+1", who="UMEMBER")
+            dmMM.on_approval("CAPPR", "1.7", "+1", who="UOWNER", approves=False)
+            nMM = len(saidMM)
+            dmMM.on_approval("CAPPR", "1.7", "+1", who="UOWNER")
+            dmMM.fetch_message = lambda chat, ts: {**signed, "text": "Not run: the card was edited."}
+            dmMM.on_approval("CAPPR", "1.8", "+1", who="UOWNER")
+    finally:
+        globals()["react"] = _reactMM
+    check("the owner's 👍 on the bot's 🔐 card that names no PR and carries no command queues nothing but tells him, in "
+          "its thread, that nothing on the box acts on it; a member's 👍, a log-lane 👍 and his 👍 on any other post of "
+          "ours say nothing",
+          not qMM and nMM == 0 and len(saidMM) == 1 and saidMM[0][0] == "1.7" and "cc-notify --approval --run" in saidMM[0][1])
 
     # the channel server runs the code that is DEPLOYED, not the code it started with
     fR = tempfile.NamedTemporaryFile("w", delete=False, suffix="-cc-slack"); fR.write("x"); fR.close()
@@ -7851,7 +7884,7 @@ def run_selfcheck():
     # Slack, and a fake shell that records what it was asked to run. Every case asserts what ran AND what did not.
     import hashlib
     def rc_case(cmd="echo hi", text=None, edited=False, reactors=("UOWNER",), mode=0o600, rewrite=None, chat="CAPPR",
-                claimed=False, claim_fails=False):
+                claimed=False, claim_fails=False, author=None):
         d = tempfile.mkdtemp(prefix="cc-slack-selfcheck-run-")
         os.chmod(d, 0o700)
         ts, sha = "1790000000.000100", hashlib.sha256(cmd.encode()).hexdigest()
@@ -7861,7 +7894,9 @@ def run_selfcheck():
         if rewrite:
             with open(f"{d}/{ts}.json", "w") as fh:
                 json.dump(rewrite(ts, cmd, sha), fh)
-        msg = {"ts": ts, "user": "UBOT", "text": text if text is not None else
+        # author: who Slack says posted the card — the bot's user id by default; a SIGNED post, as cc-notify's cards
+        # are, gives {"bot_id": "BBOT", "username": …} and no user
+        msg = {"ts": ts, **(author or {"user": "UBOT"}), "text": text if text is not None else
                "<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* restart it" + run_card_tail(cmd, sha)}
         if edited:
             msg["edited"] = {"user": "UBOT", "ts": "1790000001.000000"}
@@ -7871,7 +7906,7 @@ def run_selfcheck():
              "claim": ["UBOT"] if claimed else []}
         def fake(method, token, **kw):
             if method == "auth.test":
-                return {"user_id": "UBOT"}
+                return {"user_id": "UBOT", "bot_id": "BBOT"}
             if method == "conversations.list":
                 return {"channels": [{"name": "approvals", "id": "CAPPR", "is_member": True}]}
             if method == "conversations.history":
@@ -7967,6 +8002,22 @@ def run_selfcheck():
     c = rc_case(chat="COTHER")
     check("run card: a card outside #approvals runs nothing, and nothing is posted",
           rc_go(c) is None and not c["ran"] and not c["posts"] and "is not #approvals" in rc_log(c))
+    # A SIGNED CARD (raised-a-run-card-thumbs-up-never-runs): cc-notify posts as `<box>-box · <seat>`, and Slack gives
+    # that post bot_id and no user. Every card on record (09-25, 09-26) was refused as "not the bot's own post", silently.
+    c = rc_case(author={"bot_id": "BBOT", "username": "demo-box · planning"})
+    check("run card: the owner's 👍 on a SIGNED card of the bot's (bot_id, no user) runs its command once",
+          rc_go(c) == 0 and len(c["ran"]) == 1 and "not the bot's own post" not in rc_log(c))
+    c = rc_case(author={"bot_id": "BOTHERAPP", "username": "demo-box · planning"})
+    check("run card: …while the same card signed by another app's bot runs nothing, and the owner is told so in its "
+          "thread (his 👍 is on it and a record is on file) rather than left waiting",
+          rc_go(c) is None and not c["ran"] and "not the bot's own post" in rc_log(c)
+          and len(c["posts"]) == 1 and c["posts"][0] == (c["ts"], "Not run: the card is not the bot's own post. Nothing ran on the box."))
+    c = rc_case(author={"user": "UPERSON"}, reactors=("UMEMBER",))
+    check("run card: a person's post with only a member's 👍 on it runs nothing and makes the bot say nothing",
+          rc_go(c) is None and not c["ran"] and not c["posts"] and "owner's 👍 is not on the card" in rc_log(c))
+    c = rc_case(author={"user": "UPERSON"})
+    check("run card: …and a person's post the owner thumbed runs nothing either; the thread hears why",
+          rc_go(c) is None and not c["ran"] and len(c["posts"]) == 1 and "not the bot's own post" in c["posts"][0][1])
     c = rc_case(text="❓ <@UOWNER> 🔐 *Approval needed:* restart it")
     check("run card: a card that does not carry the record's run: stamp runs nothing",
           rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))

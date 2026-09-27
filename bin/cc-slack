@@ -59,7 +59,7 @@ ANYONE who can post in a routed channel is heard — Slack channel membership is
 A reply can @-mention a person already in the channel; @main/@<alias> are session hand-offs, not people.
 A session's post naming @main, an orch alias or a live track (reply tool, `cc-slack post`, a card) reaches that session: mirrored into its own channel with a link back, delivered once in the original thread, the poster told where it went.
 A session handed another session's post 👍s it on the first tool call of the turn that post woke, so the channel shows it was read and taken on even when no reply follows; the box's 👀 still only means received, and the owner's own messages keep the reply-or-react rule.
-A reaction is a verdict from anyone in the channel (a member's :+1: in #approvals merges the PR, exactly as the owner's does); DM reactions stay the owner's, and so does the :+1: on a card that carries a command (`cc-notify --approval --run`, see run-approved above).
+A reaction is a verdict from anyone in the channel (a member's :+1: in #approvals merges the PR, exactly as the owner's does); DM reactions stay the owner's, and so does the :+1: on a card that carries a command (`cc-notify --approval --run`, see run-approved above). His :+1: on a 🔐 card that names no PR and carries no command runs nothing, and the card's thread says so.
 A :+1: on cc-model's return card — `[return] <window>: Fable 5.1 is back…`, posted when the outage that moved a session off the primary lifts — runs `cc-model return <window>`: that session's overlapping handoff back to it (✅ when it started, ❌ and one line when it did not).
 The owner's 📌 marks a thread "revisit", not a verdict — kept until the 📌 comes off, listed by `cc-slack revisit`.
 Only the owner steers: permission answers, `!` commands and @alias hand-offs.
@@ -6108,8 +6108,17 @@ class Daemon:
             return None
         msg = self.fetch_message(chat, ts) or {}
         m = PR_RE.match(msg.get("text") or "") or APPROVAL_RE.search(msg.get("text") or "")   # a PR card, or the 🔐 card for a held head
-        if msg.get("user") != self.bot_user or not m or not os.path.isdir(f"{DEV}/{m.group(1)}/.git"):
-            log(f"approvals: ignored :+1: on {ts} (not a bot PR post)"); return None
+        # is_ours, not user == bot_user: a card is a signed post, which carries bot_id and no user (every 👍 on 09-25's
+        # cards, #601's protected-door card among them, was logged "not a bot PR post" and woke nobody)
+        if not self.is_ours(msg) or not m or not os.path.isdir(f"{DEV}/{m.group(1)}/.git"):
+            log(f"approvals: ignored :+1: on {ts} (not a bot PR post)")
+            if approves and who and who == self.cfg.get("SLACK_OWNER_ID") and self.is_ours(msg) and not m \
+                    and "🔐 *Approval needed:*" in (msg.get("text") or ""):
+                # the owner's 👍 on our own 🔐 card that names no PR and carries no command (an ack on any other post stays quiet): nothing on the box can act
+                # on it, so he hears that rather than nothing
+                self.say(chat, "Nothing ran: this card carries no command and names no PR, so a 👍 here does nothing "
+                               "on the box. The seat that asked has to re-post it with `cc-notify --approval --run`.", ts)
+            return None
         repo, n = m.groups()
         name = self.user_name(who) if who else ""
         if who:
@@ -8717,8 +8726,9 @@ def run_card_refusal(cfg, chat, ts):
     the card is posted, stored on the host beside the card and hashed; an edited card or a changed file does not run",
     and "only a reaction by the owner's own Slack user id counts". Each is checked here, in the process that runs it,
     and none of it is taken from the daemon that started this — so a session calling run-approved by hand gets nothing
-    the owner's 👍 did not already give it. The third value says whether the refusal is his to hear in the thread: only
-    those found once the card is known to be the bot's own with his 👍 on it, so no one else can make the bot speak."""
+    the owner's 👍 did not already give it. The bot's own post is its user id or, for a signed one, its bot_id. The third
+    value says whether the refusal is his to hear in the thread: only those found once the card is in #approvals, has a
+    record on file and carries his 👍, so no one else can make the bot speak."""
     import hashlib
     if not RUN_TS_RE.match(ts or ""):
         return "not a card ts", None, False
@@ -8739,16 +8749,22 @@ def run_card_refusal(cfg, chat, ts):
         cid, member = find_channel(cfg, cfg.get("SLACK_APPROVALS") or APPROVALS)
         if not cid or not member or chat != cid:
             return f"{chat} is not #approvals", None, False
-        bot = api("auth.test", tok).get("user_id")
+        me = api("auth.test", tok)
+        bot, bot_id = me.get("user_id"), me.get("bot_id")
         msgs = api("conversations.history", tok, channel=chat, latest=ts, inclusive="true", limit="1").get("messages") or []
         msg = msgs[0] if msgs and msgs[0].get("ts") == ts else None
         got = api("reactions.get", tok, channel=chat, timestamp=ts, full="true").get("message") or {}
     except Exception as e:
         return f"Slack could not be read ({e.__class__.__name__})", None, False
-    if not msg or not bot or msg.get("user") != bot:
+    if not msg or not bot:
         return "the card is not the bot's own post", None, False
     if not any(r.get("name") in ("+1", "thumbsup") and owner in (r.get("users") or []) for r in got.get("reactions") or []):
         return "the owner's 👍 is not on the card", None, False
+    # A card is a SIGNED post (username= <box>-box · <seat>), and Slack gives a signed post bot_id and no user: matching
+    # user alone refused every card on record (09-25, 09-26) and told nobody. With a record on file, in #approvals and
+    # the owner's 👍 on it, the refusal is his to hear — he tapped it, and silence left four PRs unmerged for 3 h.
+    if msg.get("user") != bot and not (bot_id and msg.get("bot_id") == bot_id):
+        return "the card is not the bot's own post", None, True
     if any(r.get("name") == RUN_CLAIM and bot in (r.get("users") or []) for r in got.get("reactions") or []):
         return f"the bot's :{RUN_CLAIM}: claim is already on the card, so it ran (or began to) once", None, False
     cmd, sha = rec.get("cmd"), rec.get("sha256") or ""
