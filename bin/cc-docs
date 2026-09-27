@@ -998,7 +998,22 @@ def cmd_file(a):
         # brief: "a changed finished version = next letter, unchanged content = no new letter"
         # a revision filed before page images were hashed carries a text-only print: that still counts as unchanged
         if d and current(d) and current(d)["fingerprint"] in (fp, textprint(text)):
-            print(f"{num}-{current(d)['rev']}\t{os.path.join(ROOT, current(d)['file'])}\tunchanged, nothing filed")
+            cur = current(d)
+            print(f"{num}-{cur['rev']}\t{os.path.join(ROOT, cur['file'])}\tunchanged, nothing filed")
+            # brief: "a --source on an unchanged rebuild is how a session attaches a .tex found after filing"
+            recorded = []
+            if a.source:
+                if not d.get("source") or not os.path.exists(d["source"]):
+                    d["source"] = os.path.abspath(a.source)
+                    recorded.append(f"source {d['source']}")
+                if "sources" not in cur and sources:
+                    got = keep_sources(sources, proj, f"{num}-{cur['rev']}", getattr(a, "trees", None))
+                    if got:
+                        cur.update(got)
+                        recorded.append(f"sources {got['sources']}")
+            if recorded:
+                save(reg)
+                print(f"cc-docs: {num}-{cur['rev']}: recorded {' and '.join(recorded)}", file=sys.stderr)
             return 0
         full = f"{num}-{rev}"
         carried = set(m.group(0).split()[0] for m in STAMP.finditer(text))
@@ -1032,7 +1047,7 @@ def cmd_file(a):
                 "visibility": ["owner"] + ([pd["workspace"]] if pd.get("workspace") else []), "member": pd.get("member"),
                 "starred_by": [], "stamp": not nostamp, "revisions": []}
         d["title"] = a.title
-        if a.source and not d.get("source"):
+        if a.source and (not d.get("source") or not os.path.exists(d["source"])):
             d["source"] = os.path.abspath(a.source)
         d["revisions"].append({"rev": rev, "file": rel, "date": date.isoformat(), "from": getattr(a, "origin", None) or src, "fingerprint": fp,
                                "sha256": sha, "stamped": how, "pages": pages(dst), "bytes": os.path.getsize(dst),
@@ -1876,6 +1891,30 @@ def selfcheck():
         rc, o = run("file", v1, "--project", "Box", "--title", "Gamma renamed")
         ok("the same title with no source is the same document too (C, not a new number)",
            "001-0001-C" in o and len(load()["documents"]) == 1)
+        # --source on an unchanged rebuild: a session attaches a .tex it found after the PDF was filed
+        ROOT = os.path.join(t, "r2d")
+        alone2 = os.path.join(t, "alone2")
+        os.makedirs(alone2)
+        shutil.copy(mkpdf(src, "z1", "Zeta first version"), os.path.join(alone2, "z1.pdf"))
+        z1 = os.path.join(alone2, "z1.pdf")
+        run("file", z1, "--project", "Box", "--kind", "work", "--title", "Zeta")
+        d = load()["documents"]["001-0001"]
+        ok("filed with nothing findable keeps no source and packs nothing",
+           d.get("source") is None and "sources" not in d["revisions"][0])
+        found = os.path.join(alone2, "found.tex")
+        with open(found, "w") as f:
+            f.write("\\documentclass{article}\\begin{document}Zeta\\end{document}\n")
+        rc, o = run("file", z1, "--project", "Box", "--title", "Zeta", "--source", found)
+        d = load()["documents"]["001-0001"]
+        ok("--source on an unchanged rebuild records the found source and packs it, filing no new revision",
+           rc == 0 and "unchanged" in o and len(d["revisions"]) == 1
+           and d["source"] == os.path.abspath(found) and d["revisions"][0].get("source_files") == ["found.tex"])
+        moved = found + ".moved"
+        os.replace(found, moved)
+        rc, o = run("file", z1, "--project", "Box", "--title", "Zeta", "--source", moved)
+        d = load()["documents"]["001-0001"]
+        ok("a recorded source whose path is gone is replaced on an unchanged rebuild too",
+           rc == 0 and "unchanged" in o and len(d["revisions"]) == 1 and d["source"] == os.path.abspath(moved))
         # board revision, note and cost: a register of its own
         ROOT = os.path.join(t, "r2c")
         rc, o = run("file", v1, "--project", "Boards", "--kind", "work", "--title", "Board doc", "--describes", "PCB-1")
