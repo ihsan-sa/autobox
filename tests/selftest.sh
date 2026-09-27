@@ -1651,8 +1651,14 @@ tmux new-window -d -t main -n "$REPO/m9" "bash $T/m9.sh"; sleep 1
 for w in m8 m9; do tmux kill-window -t "$(tmux list-windows -t main -F '#{window_id} #W' | awk -v n="$REPO/$w" '$2==n{print $1}')" 2>/dev/null; done
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w1$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
+ll0=$(wc -l < ~/.cc/state/$REPO/w1/loop.log 2>/dev/null || echo 0)
 CC_CLAUDE="$T/fakeclaude" "$B/cc" $REPO w1 --go "build the thing" --loop 3 >/dev/null 2>&1
-for _ in $(seq 1 40); do grep -q 'STATUS: DONE' ~/.cc/state/$REPO/w1/progress.md 2>/dev/null && grep -qE 'DONE' ~/.cc/state/$REPO/w1/loop.log 2>/dev/null && break; sleep 1; done
+# WAIT ON THE LOOP'S OWN END, NOT THE CLOCK. A fixed 40 s here went red on a loaded box (#670, #699, #722, 09-25..27:
+# `loop DONE` + `loop iteration count: 1`, while the notify and board cases below passed — the loop DID finish, a
+# beat after the wait gave up). Every stop of cc-loop logs `exit <n>:`, and this fixture ends in one (exit 4, no PR);
+# this run's lines only, since w1's loop.log carries earlier stanzas'. The cap only keeps a hung loop from hanging the suite.
+for _ in $(seq 1 300); do tail -n +$((ll0+1)) ~/.cc/state/$REPO/w1/loop.log 2>/dev/null | grep -qE '^[^ ]+ exit [0-9]+:' && break; sleep 1; done
+for _ in $(seq 1 30); do pgrep -f "cc-loop $REPO w1 " >/dev/null || break; sleep 1; done   # …and its process gone, so nothing below races its last writes
 grep -q 'STATUS: DONE' ~/.cc/state/$REPO/w1/progress.md 2>/dev/null && ok "loop ran to DONE via journal" || bad "loop DONE"
 [ "$(ls ~/.cc/state/$REPO/w1/runs/*.json 2>/dev/null | wc -l)" = 2 ] && ok "loop stopped after DONE (2 iterations, not 3)" || bad "loop iteration count: $(ls ~/.cc/state/$REPO/w1/runs/*.json 2>/dev/null | wc -l)"
 rlog=$(git -C "$T/remote.git" log --oneline track/w1 2>/dev/null)   # capture, don't pipe: grep -q exits on the first match, git log takes SIGPIPE and pipefail calls the whole line a failure once the branch has more than a handful of commits

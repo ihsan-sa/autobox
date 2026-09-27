@@ -13,8 +13,10 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         Called by a maker at the end of a finished build. The same source path, or else the same title in the same
         project, is the same document. Content unchanged since the current revision files nothing and prints that
         revision; otherwise the next letter is filed. A PDF whose text carries no number gets a small grey stamp
-        `PPP-NNNN-R · 24 Sep 2026` bottom-left on every page; one that already carries its own number (a LaTeX build
-        that took it from `number`) is filed as it is; one carrying a different number is refused. --no-stamp is for
+        `PPP-NNNN-R · 24 Sep 2026` bottom-left on every page, appended to the PDF rather than re-rendering it, so its
+        links, outline and metadata survive (a PDF the appender cannot read is re-rendered and loses them, with a
+        warning); one that already carries its own number (a LaTeX build that took it from `number`) is filed as it
+        is; one carrying a different number is refused. --no-stamp is for
         a document that must not show a number (a resume, anything going outside): it is kept on the document, so its
         later revisions are not stamped either. A new project needs --kind, --member (a member project, visible to
         that member's workspace and the owner) or a project created first with `project`. Prints `<number>\t<path>` and whether
@@ -141,6 +143,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import zlib
 
 ROOT = os.environ.get("CC_DOCS_ROOT") or os.path.join(os.path.expanduser("~"), ".cc", "documents")
 MEMBERS = os.path.join(os.path.expanduser("~"), ".cc", "members")
@@ -395,8 +398,349 @@ def pages(path):
     return int(m.group(1)) if m else -1
 
 
+# The stamp is appended to the PDF as an incremental update: every page gets a content stream that draws the line,
+# its old bytes are left as they are, and a new cross-reference section points past them. Nothing is re-rendered,
+# so links, the outline and the document's metadata survive (a pdfpages re-render dropped all three). The reader
+# below knows only what that needs: the cross-reference table or stream, object streams and FlateDecode.
+class _Name(str):
+    pass
+
+
+class _Ref(tuple):
+    pass
+
+
+class _Real(float):
+    pass
+
+
+class _Stream:
+    def __init__(self, d, data):
+        self.d, self.data = d, data
+
+
+class _Unreadable(Exception):
+    pass
+
+
+_WS, _DELIM = b"\x00\t\n\x0c\r ", b"()<>[]{}/%"
+_NUMRE = re.compile(rb"[+-]?(\d+\.?\d*|\.\d+)")
+_REFRE = re.compile(rb"\s*(\d+)\s+(\d+)\s+R(?![^\x00\t\n\x0c\r ()<>\[\]{}/%])")
+
+
+def _skip(b, i):
+    while i < len(b):
+        if b[i] in _WS:
+            i += 1
+        elif b[i] == 37:                                  # % comment to end of line
+            while i < len(b) and b[i] not in b"\r\n":
+                i += 1
+        else:
+            break
+    return i
+
+
+def _obj(b, i):
+    """The PDF object at b[i:] and the offset after it."""
+    i = _skip(b, i)
+    c = b[i:i + 1]
+    if b[i:i + 2] == b"<<":
+        d, i = {}, i + 2
+        while True:
+            i = _skip(b, i)
+            if b[i:i + 2] == b">>":
+                return d, i + 2
+            k, i = _obj(b, i)
+            d[str(k)], i = _obj(b, i)
+    if c == b"[":
+        a, i = [], i + 1
+        while True:
+            i = _skip(b, i)
+            if b[i:i + 1] == b"]":
+                return a, i + 1
+            v, i = _obj(b, i)
+            a.append(v)
+    if c == b"/":
+        j = i + 1
+        while j < len(b) and b[j] not in _WS and b[j] not in _DELIM:
+            j += 1
+        return _Name(b[i + 1:j].decode("latin-1")), j
+    if c == b"(":
+        out, depth, j = bytearray(), 1, i + 1
+        while True:
+            ch = b[j]
+            if ch == 92:                                  # backslash: keep the escape, the string is only copied
+                out += b[j:j + 2]
+                j += 2
+                continue
+            depth += ch == 40
+            depth -= ch == 41
+            if depth == 0:
+                return bytes(out), j + 1
+            out.append(ch)
+            j += 1
+    if c == b"<":
+        j = b.index(b">", i)
+        return ("hex", b[i + 1:j]), j + 1
+    m = _NUMRE.match(b, i)
+    if m:
+        s = m.group(0)
+        if b"." not in s:
+            r = _REFRE.match(b, i)
+            if r:
+                return _Ref((int(r.group(1)), int(r.group(2)))), r.end()
+            return int(s), m.end()
+        return _Real(s.decode()), m.end()
+    for word, v in ((b"true", True), (b"false", False), (b"null", None)):
+        if b.startswith(word, i):
+            return v, i + len(word)
+    raise _Unreadable(f"unexpected {b[i:i + 12]!r} at {i}")
+
+
+def _ser(o):
+    if isinstance(o, _Name):
+        return b"/" + o.encode("latin-1")
+    if isinstance(o, _Ref):
+        return b"%d %d R" % o
+    if isinstance(o, bool):
+        return b"true" if o else b"false"
+    if o is None:
+        return b"null"
+    if isinstance(o, int):
+        return b"%d" % o
+    if isinstance(o, float):
+        return (repr(o) if isinstance(o, _Real) else "%.3f" % o).encode()
+    if isinstance(o, bytes):
+        return b"(" + o + b")"
+    if isinstance(o, tuple):                              # ("hex", digits)
+        return b"<" + o[1] + b">"
+    if isinstance(o, list):
+        return b"[" + b" ".join(_ser(v) for v in o) + b"]"
+    if isinstance(o, dict):
+        return b"<<" + b"".join(b"/" + k.encode("latin-1") + b" " + _ser(v) + b"\n" for k, v in o.items()) + b">>"
+    raise _Unreadable(f"cannot write {type(o).__name__}")
+
+
+class _PDF:
+    def __init__(self, data):
+        self.b, self.xref, self.trailer, self._stms = data, {}, None, {}
+        m = list(re.finditer(rb"startxref\s+(\d+)", data[-2048:]))
+        if not m:
+            raise _Unreadable("no startxref")
+        off, seen = int(m[-1].group(1)), set()
+        self.last_is_stream = not data.startswith(b"xref", off)
+        while off is not None and off not in seen:
+            seen.add(off)
+            t = self._section(off)
+            if self.trailer is None:
+                self.trailer = t
+            if "XRefStm" in t:
+                self._section(t["XRefStm"])
+            off = t.get("Prev")
+        if "Encrypt" in self.trailer:
+            raise _Unreadable("encrypted")
+        self.lastxref = int(m[-1].group(1))
+
+    def _put(self, n, entry):
+        self.xref.setdefault(n, entry)                    # newest section first, so the first entry wins
+
+    def _section(self, off):
+        b = self.b
+        if b.startswith(b"xref", off):
+            i = off + 4
+            while True:
+                i = _skip(b, i)
+                if b.startswith(b"trailer", i):
+                    return _obj(b, i + 7)[0]
+                m = re.compile(rb"(\d+)\s+(\d+)").match(b, i)
+                first, count = int(m.group(1)), int(m.group(2))
+                i = _skip(b, m.end())
+                for k in range(count):
+                    f = b[i:i + 20].split()
+                    if f[2] == b"n":
+                        self._put(first + k, (1, int(f[0]), int(f[1])))
+                    else:
+                        self._put(first + k, (0,))
+                    i = _skip(b, i + 18)
+        s = self._at(off)
+        if not isinstance(s, _Stream) or s.d.get("Type") != "XRef":
+            raise _Unreadable(f"no cross-reference at {off}")
+        w, data = s.d["W"], self._decode(s)
+        idx, pos = s.d.get("Index", [0, s.d["Size"]]), 0
+        for first, count in zip(idx[::2], idx[1::2]):
+            for k in range(count):
+                f = []
+                for width in w:
+                    f.append(int.from_bytes(data[pos:pos + width], "big"))
+                    pos += width
+                typ = f[0] if w[0] else 1
+                self._put(first + k, (typ, f[1], f[2]) if typ in (1, 2) else (0,))
+        return s.d
+
+    def _decode(self, s):
+        f = s.d.get("Filter")
+        f = f if isinstance(f, list) else [f] if f else []
+        if f not in ([], ["FlateDecode"]):
+            raise _Unreadable(f"filter {f}")
+        data = zlib.decompress(s.data) if f else s.data
+        p = s.d.get("DecodeParms") or {}
+        p = p[0] if isinstance(p, list) else p
+        if p.get("Predictor", 1) >= 10:                   # PNG rows, each led by its filter byte
+            cols = p.get("Columns", 1) * p.get("Colors", 1) * p.get("BitsPerComponent", 8) // 8
+            out, prev = bytearray(), bytearray(cols)
+            for r in range(0, len(data), cols + 1):
+                t, row = data[r], bytearray(data[r + 1:r + 1 + cols])
+                for x in range(len(row)):
+                    left = row[x - 1] if x else 0
+                    up = prev[x]
+                    if t == 1:
+                        row[x] = (row[x] + left) & 255
+                    elif t == 2:
+                        row[x] = (row[x] + up) & 255
+                    elif t == 3:
+                        row[x] = (row[x] + (left + up) // 2) & 255
+                    elif t == 4:
+                        ul = prev[x - 1] if x else 0
+                        pa, pb, pc = abs(up - ul), abs(left - ul), abs(left + up - 2 * ul)
+                        row[x] = (row[x] + (left if pa <= pb and pa <= pc else up if pb <= pc else ul)) & 255
+                out += row
+                prev = row
+            data = bytes(out)
+        return data
+
+    def _at(self, off):
+        """The indirect object at byte offset `off`."""
+        m = re.compile(rb"\s*\d+\s+\d+\s+obj").match(self.b, off)
+        if not m:
+            raise _Unreadable(f"no object at {off}")
+        o, i = _obj(self.b, m.end())
+        i = _skip(self.b, i)
+        if isinstance(o, dict) and self.b.startswith(b"stream", i):
+            i += 6
+            i += 2 if self.b.startswith(b"\r\n", i) else 1
+            n = self.get(o["Length"])
+            return _Stream(o, self.b[i:i + n])
+        return o
+
+    def get(self, o):
+        """o, with a reference followed."""
+        if not isinstance(o, _Ref):
+            return o
+        e = self.xref.get(o[0], (0,))
+        if e[0] == 1:
+            return self._at(e[1])
+        if e[0] == 2:
+            if e[1] not in self._stms:
+                s = self._at(self.xref[e[1]][1])
+                data = self._decode(s)
+                nums = [int(x) for x in data[:s.d["First"]].split()]
+                self._stms[e[1]] = (data, s.d["First"], dict(zip(nums[::2], nums[1::2])))
+            data, first, offs = self._stms[e[1]]
+            return _obj(data, first + offs[o[0]])[0]
+        return None
+
+    def gen(self, n):
+        e = self.xref.get(n, (0,))
+        return e[2] if e[0] == 1 else 0
+
+    def pages(self, node=None, inherit=None):
+        """(ref, page dict, inherited Resources/MediaBox/CropBox) for every page in order."""
+        if node is None:
+            node = self.get(self.get(self.trailer["Root"])["Pages"])
+        inherit = dict(inherit or {})
+        for k in ("Resources", "MediaBox", "CropBox"):
+            if k in node:
+                inherit[k] = node[k]
+        for kid in node.get("Kids", []):
+            d = self.get(kid)
+            if d.get("Type") == "Pages" or "Kids" in d:
+                yield from self.pages(d, inherit)
+            else:
+                yield kid, d, inherit
+
+
+def overlay(src, dst, text):
+    """src with `text` small and grey at the bottom left of every page, appended as an incremental update, to dst."""
+    with open(src, "rb") as f:
+        data = f.read()
+    pdf = _PDF(data)
+    size = pdf.trailer["Size"]
+    new, nums = [], {}
+
+    def add(o):
+        new.append((len(new) + size, 0, o))
+        return _Ref((new[-1][0], 0))
+
+    font = add({"Type": _Name("Font"), "Subtype": _Name("Type1"), "BaseFont": _Name("Helvetica"),
+                "Encoding": _Name("WinAnsiEncoding")})
+    push = add(_Stream({}, b"q\n"))
+    lit = text.encode("cp1252").replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+    for ref, page, inh in list(pdf.pages()):
+        if not isinstance(ref, _Ref):
+            raise _Unreadable("a page that is not an indirect object")
+        box = [float(pdf.get(v)) for v in pdf.get(page.get("CropBox") or inh.get("CropBox") or page.get("MediaBox")
+                                                    or inh.get("MediaBox"))]
+        at = (min(box[0], box[2]) + 30, min(box[1], box[3]) + 20)
+        if at not in nums:
+            nums[at] = add(_Stream({}, b"Q q BT /CCDocsStamp 7 Tf 0.5 g %.2f %.2f Td (%s) Tj ET Q\n"
+                                   % (at[0], at[1], lit)))
+        res = dict(pdf.get(page.get("Resources", inh.get("Resources"))) or {})
+        res["Font"] = dict(pdf.get(res.get("Font")) or {}, CCDocsStamp=font)
+        c = page.get("Contents")
+        c = pdf.get(c) if isinstance(c, _Ref) and not isinstance(pdf.get(c), _Stream) else c
+        c = c if isinstance(c, list) else [] if c is None else [c]
+        new.append((ref[0], ref[1], dict(page, Resources=res, Contents=[push] + c + [nums[at]])))
+    out = bytearray(data if data.endswith(b"\n") else data + b"\n")
+    offs = {}
+    for n, g, o in new:
+        offs[n] = (len(out), g)
+        out += b"%d %d obj\n" % (n, g)
+        if isinstance(o, _Stream):
+            out += _ser(dict(o.d, Length=len(o.data))) + b"\nstream\n" + o.data + b"\nendstream"
+        else:
+            out += _ser(o)
+        out += b"\nendobj\n"
+    t = {k: pdf.trailer[k] for k in ("Root", "Info", "ID") if k in pdf.trailer}
+    t.update(Size=max(offs) + 1, Prev=pdf.lastxref)
+    if pdf.last_is_stream:
+        n = t["Size"]
+        t["Size"] = n + 1
+        offs[n] = (len(out), 0)
+        rows = sorted(offs)
+        idx = []
+        for k in rows:
+            if idx and idx[-2] + idx[-1] == k:
+                idx[-1] += 1
+            else:
+                idx += [k, 1]
+        body = b"".join(b"\x01" + offs[k][0].to_bytes(4, "big") + offs[k][1].to_bytes(2, "big") for k in rows)
+        xref = len(out)
+        out += b"%d 0 obj\n" % n + _ser(dict(t, Type=_Name("XRef"), W=[1, 4, 2], Index=idx, Length=len(body)))
+        out += b"\nstream\n" + body + b"\nendstream\nendobj\n"
+    else:
+        xref = len(out)
+        out += b"xref\n"
+        for k in sorted(offs):
+            out += b"%d 1\n%010d %05d n\r\n" % (k, offs[k][0], offs[k][1])
+        out += b"trailer\n" + _ser(t) + b"\n"
+    out += b"startxref\n%d\n%%%%EOF\n" % xref
+    with open(dst, "wb") as f:
+        f.write(out)
+
+
 def stamp(src, dst, text):
-    """Every page of src with `text` small and grey at the bottom left, written to dst."""
+    """Every page of src with `text` small and grey at the bottom left, written to dst. The line is appended to the
+    PDF (overlay above), so its links, outline and metadata survive; a PDF that reader cannot follow (encrypted, or
+    a filter it does not know) is re-rendered through pdfpages instead, which loses them, and says so on stderr."""
+    try:
+        overlay(src, dst, text)
+        if pages(dst) == pages(src) and text in pdftext(dst):
+            return
+        why = "the appended stamp did not read back"
+    except (_Unreadable, Refused, KeyError, ValueError, IndexError, TypeError, AttributeError, zlib.error) as e:
+        why = str(e) or type(e).__name__
+    print(f"cc-docs: {src}: stamping by re-rendering its pages ({why}); its links and outline are lost",
+          file=sys.stderr)
     with tempfile.TemporaryDirectory(prefix="cc-docs-") as t:
         shutil.copy(src, os.path.join(t, "in.pdf"))
         tex = text.replace("·", r"\textperiodcentered{}")
@@ -1430,6 +1774,41 @@ def selfcheck():
            and (os.geteuid() == 0 or not os.access(f, os.W_OK)))
         ok("an unstamped PDF gets the stamp overlaid on every page, and the original is left alone",
            "001-0002-A" not in pdftext(b) and pages(f) == 3 and pdftext(f).count("001-0002-A · ") == 3)
+        # the stamp is appended, not re-rendered: links, outline and metadata survive, on both cross-reference kinds
+        def marks(path):
+            p = _PDF(open(path, "rb").read())
+            links = sum(p.get(x).get("Subtype") == "Link" for _, pg, _ in p.pages() for x in p.get(pg.get("Annots")) or [])
+            info = subprocess.run(["pdfinfo", path], capture_output=True, text=True).stdout
+            return links, "Outlines" in p.get(p.trailer["Root"]), "".join(re.findall(r"^Title:\s*(.*)$", info, re.M))
+        body = ("\\tableofcontents\\section{One}\\label{a}See \\ref{b}.\\newpage\\section{Two}\\label{b}See \\ref{a}"
+                " and \\url{https://example.org}.")
+        for name, pre in (("xs", ""), ("xt", "\\pdfobjcompresslevel=0 ")):
+            with open(os.path.join(src, name + ".tex"), "w") as fh:
+                fh.write(pre + "\\documentclass{article}\\usepackage[pdftitle={Hyper doc}]{hyperref}\\begin{document}"
+                         + body + "\\end{document}\n")
+            for _ in range(2):
+                subprocess.run(["pdflatex", "-interaction=batchmode", name + ".tex"], cwd=src, capture_output=True)
+            h, hs = os.path.join(src, name + ".pdf"), os.path.join(src, name + "-s.pdf")
+            stamp(h, hs, "001-0009-A · 25 Sep 2026")
+            with open(h, "rb") as f1, open(hs, "rb") as f2:
+                kept = f2.read().startswith(f1.read())
+            ok(f"a stamp keeps links, outline and title ({'classic table' if pre else 'xref stream'}), appended to "
+               "the original bytes", marks(h)[0] > 0 and marks(hs) == marks(h) == (marks(h)[0], True, "Hyper doc")
+               and kept and pdftext(hs).count("001-0009-A · 25 Sep 2026") == 2)
+        real, err = overlay, sys.stderr
+        import io
+        sys.stderr = io.StringIO()
+
+        def unreadable(*_):
+            raise _Unreadable("encrypted")
+        try:
+            globals()["overlay"] = unreadable
+            stamp(h, os.path.join(src, "fb.pdf"), "001-0009-B · 25 Sep 2026")
+        finally:
+            globals()["overlay"], said, sys.stderr = real, sys.stderr.getvalue(), err
+        fb = os.path.join(src, "fb.pdf")
+        ok("a PDF the appender cannot read is re-rendered instead, stamped, and says its links are lost",
+           pdftext(fb).count("001-0009-B · 25 Sep 2026") == 2 and marks(fb)[0] == 0 and "links and outline are lost" in said)
         # stars, public links and what each viewer is sent: r1 as the cases above left it, rebuilt here on its own
         ROOT = os.path.join(t, "r1s")
         run("file", a, "--project", "Box", "--kind", "work", "--title", "Alpha doc")
