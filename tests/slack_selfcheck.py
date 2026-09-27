@@ -2571,7 +2571,8 @@ def run_selfcheck():
         globals()["resolve_channel"] = lambda cfg, name: {"alerts": "C-alerts"}.get(name, "C-" + name)   # every channel exists, incl. #<hostname>
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: postedB.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
-        host = socket.gethostname().split(".")[0]
+        host = socket.gethostname().split(".")[0]   # as the kernel spells it: upper-case on a WSL runner (a Windows
+                                                    # machine's name), where the lane it lands in is still lower-case
         rbox = BOX; alt = f"{host}-alt"              # CC_BOX set to something that is NOT this host's name: cc-notify
         globals()["BOX"] = alt                       # titles on it, so --route has to as well or the alert misses #alerts
         with contextlib.redirect_stdout(io.StringIO()):
@@ -2713,7 +2714,7 @@ def run_selfcheck():
           "automated 'done' and the DIGEST go to the updates lane — #alerts keeps boots, limits, power and audits. The "
           "box is CC_BOX, never the kernel's hostname: the last line is titled with the HOSTNAME on a box whose CC_BOX "
           "is something else, and it must NOT reach #alerts — that is the case gethostname() cannot pass (audit F6)",
-          postedB == ["C-alerts", "C-alerts", f"C-{alt}-{UPDATES}", f"C-{alt}-{UPDATES}", f"C-{host}-{UPDATES}"])
+          postedB == ["C-alerts", "C-alerts", f"C-{alt.lower()}-{UPDATES}", f"C-{alt.lower()}-{UPDATES}", f"C-{host.lower()}-{UPDATES}"])
     postedC = []
     try:                                                     # …and a box with no lane yet: the digest still reaches #alerts
         globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") else ("C-alerts" if name == "alerts" else "C-" + name)

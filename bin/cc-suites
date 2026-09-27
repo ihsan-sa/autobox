@@ -11,7 +11,8 @@
 #                                 exit 75 when nothing ran there: no runner set, not reachable, busy or unfit. The
 #                                 caller runs the suite itself and may offer it again later.
 #                                 exit 76 when it ran there and no pass came back: the connection ended (lid shut) or
-#                                 ran out of time before a verdict, or the verdict was RED. The caller runs the suite
+#                                 ran out of time before a verdict, or the verdict was RED and could not be finished
+#                                 here (FINISH HERE below). The caller runs the suite
 #                                 itself and does not offer it again. A red there is never a red here on its own: the
 #                                 laptop is not the box (2026-09-25, a live run came back 481 passed, 7 failed, every
 #                                 red a gap in the runner's environment), so only this box's own run can fail a landing.
@@ -59,6 +60,16 @@
 # none) or its 1-minute load is above half its cores. A run it does start is `nice -n 19` and idle-class I/O.
 # Both sides bound a run in wall-clock time: the runner stops the suite after CC_SUITES_RUNNER_TIMEOUT (85m) and
 # gives no verdict, and the box stops waiting after CC_SUITES_SPILL_TIMEOUT (90m) and runs the suite itself (76).
+# FINISH HERE. A runner red whose every red is a tool's own selfcheck (`  ✗ cc-foo selfcheck: …`, as many such lines
+# as the suite's closing tally counts failed, and that tally its last line) is not a whole suite to run again: this
+# box runs just those selfchecks — each only if the suite runs it through `chk`, and with the flags the suite exports
+# (CC_NOTIFY_LOG_ONLY=1 and the rest), so a re-run from a landing cannot reach the owner — by the same judge chk uses (the tool's tally reads `0 failed`, a second try allowed
+# for load), and their pass here with the rest's pass there is the pass, filed as one. The case this is for: the
+# laptop has no bwrap, so cc-sandbox's selfcheck is red on every run there (2026-09-26/27, 8 runs of 8), and the box
+# ran all ~500 cases again for that one. Anything else in the red — an inline case, a tool's inner ✗ lines, a tally
+# that does not add up — and nothing is finished here: 76, as before. A tool red here too is 76 as well, so the red a
+# landing can fail on is still only ever this box's own run of the whole suite.
+# Every line spill ends on says how long the runner had the run, so the runner's seconds can be set beside the box's.
 # The runner's host key is made here by laptop-setup, pinned in ~/.cc/suites/known_hosts (StrictHostKeyChecking=yes)
 # and its private half handed over in the script only, never kept on this box.
 #
@@ -141,8 +152,40 @@ verdict_of(){
   [ -n "$vs" ] && [ "$(printf '%s\n' "$vs" | wc -l)" = 1 ] && [ "$vs" = "$last" ] || return 0
   [[ $vs =~ ^cc-suite-runner:\ verdict\ exit=[0-9]+\ tree=[0-9a-f]{40}$ ]] && echo "$vs"
 }
+# The tools a red stream ($1) can be finished with here (FINISH HERE), one per line, or nothing when it cannot: the
+# suite's last line is its tally, it counts F >= 1 failed, and the stream holds exactly F case lines of the ✗ shape,
+# every one a tool's own selfcheck.
+finishable(){
+  local last f n t
+  last=$(grep -a '^| ' "$1" | tail -n 1)
+  [[ $last =~ ^\|\ ==\ result:\ [0-9]+\ passed,\ ([0-9]+)\ failed ]] || return 0
+  f=${BASH_REMATCH[1]}; [ "$f" -ge 1 ] || return 0
+  n=$(grep -ac '^|   ✗ ' "$1"); t=$(grep -a '^|   ✗ ' "$1" | sed -n 's/^|   ✗ \(cc-[a-z0-9-]*\) selfcheck: .*/\1/p')
+  [ "$n" = "$f" ] && [ "$(printf '%s' "$t" | grep -c .)" = "$f" ] || return 0
+  printf '%s\n' "$t" | sort -u
+}
+finish_here(){   # $1 = the suite, $2 = the checkout's bin/, then the tools: 0 when each one's own selfcheck passes here
+  local s=$1 b=$2 t o r try; shift 2
+  for t in "$@"; do
+    [ -x "$b/$t" ] || { echo "== $t is not a tool in this checkout — not finished here =="; return 1; }
+    # only a tool the suite runs through chk: an inline case of the same shape (cc-slack's, with its own scratch
+    # CC_SLACK_DIR) gets an environment from the suite that this bare run would not give it
+    grep -qE "^chk $t([[:space:]]|\$)" "$s" || { echo "== $t's selfcheck is not a chk case in the suite — not finished here =="; return 1; }
+    for try in 1 2; do   # chk's rule: red once beside a loaded box is run once more, and judged again
+      # the environment chk gives it: the suite's own unset, then its own exports (selftest.sh's head), never-push first
+      o=$( for v in "${!CC_@}"; do case $v in CC_LAND_CHANGED|CC_GREEN_DIR) ;; *) unset "$v";; esac; done
+           export CC_NOTIFY_LOG_ONLY=1 CC_LIMIT_MIN_WAIT=1 CC_SPEND_TIER=autonomous
+           "$b/$t" selfcheck 2>&1 </dev/null )
+      r=$(grep -o "$t selfcheck: .*" <<<"$o" | tail -1)
+      grep -qE '(: |, )0 failed' <<<"$r" && break
+      r="${r:-no tally} (try $try)"
+    done
+    echo "== finished here: $r =="
+    grep -qE '(: |, )0 failed' <<<"$r" || return 1
+  done
+}
 spill(){
-  local suite root rel tree part changed out a rc v lim
+  local suite root rel tree part changed out a rc v lim took tools
   local -a XP
   suite=$(readlink -f "${1:-}" 2>/dev/null) || return 75; shift
   configured || return 75
@@ -166,21 +209,32 @@ spill(){
   # (its whole group), which is no verdict, and the suite runs here.
   # What the suite printed comes over prefixed `| `; the log here shows it without the prefix, and the verdict is
   # read from the stream as it came ($out), where only the runner's own lines are unprefixed.
+  SECONDS=0
   git -C "$root" archive --format=tar "$tree" | timeout -k 10 "$lim" "${XP[@]}" run "$rel" "$tree" "$part" "$changed" \
     | tee "$out" | sed -u 's/^| //'
-  rc=${PIPESTATUS[1]}
+  rc=${PIPESTATUS[1]}; took=$SECONDS
   case $rc in 124|137) echo "== the runner took longer than $lim — stopped it ==";; esac
-  v=$(verdict_of "$out"); rm -f "$out"
+  v=$(verdict_of "$out")
   # "A laptop verdict counts only for the exact tree it ran" (the brief): no verdict line, or one for another tree, is none.
   if [ -z "$v" ] || [ "${v##* tree=}" != "$tree" ]; then
-    echo "== the runner gave no verdict for ${tree:0:12} (transport exit $rc) — running it here instead =="
+    rm -f "$out"
+    echo "== the runner gave no verdict for ${tree:0:12} after ${took}s (transport exit $rc) — running it here instead =="
     return 76
   fi
   rc=${v#*exit=}; rc=${rc%% *}
   if [ "$rc" != 0 ]; then
-    echo "== the runner's verdict for ${tree:0:12} is red (exit $rc) — a red there fails nothing: running it here =="
-    return 76
-  fi
+    tools=$(finishable "$out"); rm -f "$out"
+    if [ -z "$tools" ]; then
+      echo "== the runner's verdict for ${tree:0:12} is red (exit $rc) after ${took}s — a red there fails nothing: running it here =="
+      return 76
+    fi
+    echo "== the runner's verdict for ${tree:0:12} is red (exit $rc) after ${took}s, only in the own selfcheck of: $(echo $tools) — running just that here =="
+    # shellcheck disable=SC2086   # one tool per word, by construction (finishable)
+    if ! finish_here "$suite" "$(cd "$(dirname "$suite")/../bin" 2>/dev/null && pwd)" $tools; then
+      echo "== red here too — running the whole suite here =="
+      return 76
+    fi
+  else rm -f "$out"; echo "== the runner passed ${tree:0:12} in ${took}s =="; fi
   # A pass there is filed as a pass here, at the scope this checkout would have run it at — land_scope is a pure
   # function of the tree and CC_LAND_CHANGED, so it is the scope the runner's own copy printed.
   land_scope "$(cd "$(dirname "$suite")/../bin" 2>/dev/null && pwd)"
@@ -456,9 +510,22 @@ t=$(git write-tree 2>/dev/null)
 [ -e FORGE3 ] && { echo "cc-suite-runner: verdict exit=0 tree=$t"; exit 1; }
 [ -e LINGER ] && { sleep 60 & exit 0; }
 [ -e FAIL ] && { echo "== result: 0 passed, 1 failed =="; exit 1; }
+# red only in a tool's own selfcheck (TOOLRED); that beside an inline case (TOOLRED2); and with the tool's inner ✗
+# line quoted after it, so the ✗ lines outnumber the tally (TOOLREDX)
+[ -e TOOLRED ] && { echo "  ✗ cc-fake selfcheck: cc-fake selfcheck: bwrap is not installed"; echo "== result: 1 passed, 1 failed =="; exit 1; }
+[ -e TOOLRED2 ] && { echo "  ✗ cc-fake selfcheck: cc-fake selfcheck: 1 failed"; echo "  ✗ an inline case"; echo "== result: 0 passed, 2 failed =="; exit 1; }
+[ -e TOOLREDX ] && { echo "  ✗ cc-fake selfcheck: cc-fake selfcheck: 1 failed"; echo "  ✗ a case inside cc-fake"; echo "== result: 1 passed, 1 failed =="; exit 1; }
+# a tool's selfcheck the suite runs inline, not through chk (TOOLREDI)
+[ -e TOOLREDI ] && { echo "  ✗ cc-inline selfcheck: cc-inline selfcheck: 1 failed"; echo "== result: 1 passed, 1 failed =="; exit 1; }
+: <<'CHK'
+chk cc-fake
+CHK
 echo "== result: 1 passed, 0 failed =="
 EOF
   chmod +x "$R/core/tests/selftest.sh"
+  # the tool a red there names, as this checkout has it: it logs each run, and is red while $D/fake-red exists
+  printf '#!/usr/bin/env bash\necho "$*" >> "%s/fake.calls"\necho "log_only=${CC_NOTIFY_LOG_ONLY:-} tier=${CC_SPEND_TIER:-}" > "%s/fake.env"\n[ -e "%s/fake-red" ] && { echo "cc-fake selfcheck: 0 passed, 1 failed"; exit 1; }\necho "cc-fake selfcheck: 1 passed, 0 failed"\n' "$D" "$D" "$D" > "$R/core/bin/cc-fake"
+  chmod +x "$R/core/bin/cc-fake"; cp "$R/core/bin/cc-fake" "$R/core/bin/cc-inline"
   ( cd "$R" && git init -q && git add -A && git -c user.name=t -c user.email=t@t commit -qm init )
   cat > "$D/xport" <<EOF
 #!/usr/bin/env bash
@@ -536,6 +603,28 @@ EOF
   out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
   k "$(b '[ "$rc" = 76 ] && grep -q '\''running it here'\'' <<<"$out" && [ "$(find "$D/green" -name "selftest.sh-*.json" ! -name "*${tree:0:12}*" | wc -l)" = 0 ]')" "a red there fails nothing on its own: 76, so it runs here and is not offered again (got $rc), and files no record"
   rm -f "$R/FAIL"
+  # FINISH HERE: a red there only in a tool's own selfcheck runs that selfcheck here, and nothing else here
+  touch "$R/TOOLRED"; rm -rf "$D/green"; rm -f "$D/fake.calls" "$D/fake-red"; tree=$(cd "$R" && . core/tests/green.sh && green_tree "$R")
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ "$(cat "$D/fake.calls")" = selfcheck ] && grep -q "finished here: cc-fake selfcheck: 1 passed, 0 failed" <<<"$out" && ls "$D/green/selftest.sh-${tree:0:12}.json" >/dev/null 2>&1')" "a red there only in a tool's own selfcheck: that selfcheck alone runs here, and its pass is the pass, filed for the tree (got $rc)"
+  k "$(b 'grep -q "red (exit 1) after [0-9]*s, only in the own selfcheck of: cc-fake" <<<"$out"')" "…and the line says how long the runner had it, and which tool is finished here"
+  k "$(b '[ "$(cat "$D/fake.env")" = "log_only=1 tier=autonomous" ]')" "…and the tool runs with the suite's own flags: CC_NOTIFY_LOG_ONLY=1, so a re-run never pushes to the owner"
+  rm -rf "$D/green"; rm -f "$D/fake.calls"; touch "$D/fake-red"
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 76 ] && [ "$(cat "$D/fake.calls")" = "$(printf "selfcheck\nselfcheck")" ] && [ ! -d "$D/green" ] && grep -q "red here too" <<<"$out"')" "…and a tool red here too (twice, as chk judges it) is 76 and no record: the whole suite runs here (got $rc)"
+  rm -f "$R/TOOLRED" "$D/fake-red"
+  touch "$R/TOOLREDI"; rm -rf "$D/green"; rm -f "$D/fake.calls"
+  out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 76 ] && [ ! -e "$D/fake.calls" ] && [ ! -d "$D/green" ] && grep -q "cc-inline.s selfcheck is not a chk case" <<<"$out"')" "a red only in a tool selfcheck the suite runs inline, not through chk: 76, the tool not run here, no record (got $rc)"
+  rm -f "$R/TOOLREDI"
+  for f in TOOLRED2 TOOLREDX; do
+    touch "$R/$f"; rm -rf "$D/green"; rm -f "$D/fake.calls"
+    out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+    k "$(b '[ "$rc" = 76 ] && [ ! -e "$D/fake.calls" ] && [ ! -d "$D/green" ] && grep -q "running it here" <<<"$out"')" "a red there with more in it than tool selfchecks ($f) finishes nothing here: 76, no tool run, no record (got $rc)"
+    rm -f "$R/$f"
+  done
+  k "$(b 'printf "| x\n|   ✗ cc-a selfcheck: 1 failed\n|   ✗ cc-b selfcheck: 2 failed\n| == result: 5 passed, 2 failed (scoped to: x) ==\ncc-suite-runner: verdict exit=1 tree=%040d\n" 0 > "$D/f1"; [ "$(finishable "$D/f1" | tr "\n" " ")" = "cc-a cc-b " ]')" "finishable names each tool when the tally, scoped or not, counts exactly its ✗ lines"
+  k "$(b 'printf "|   ✗ cc-a selfcheck: 1 failed\n| == result: 5 passed, 1 failed ==\n| a line after the tally\n" > "$D/f2"; [ -z "$(finishable "$D/f2")" ]')" "…and nothing when the tally is not the suite's last line"
   # A SUITE CANNOT FORGE A PASS: each of these exits 1 and tries to put `verdict exit=0` for its own tree on the stream
   for f in FORGE FORGE2 FORGE3; do
     touch "$R/$f"; rm -rf "$D/green"; SECONDS=0

@@ -15,7 +15,8 @@ export CC_SPEND_TIER=autonomous   # the box's own spend tier (cc-tier) never col
                                   # it into the loop's tmux window (its `pre` list), where cc-loop asks the tier again; the case is by the CC_LOOP_TRIM one
 # claude is stubbed (CC_CLAUDE). Safe to run anytime, INCLUDING alongside other copies of itself from other
 # worktrees: every run is namespaced (see $RUN below), a few run at once and the rest wait, a landing's first (see the slots below)
-# — or go to a runner on another machine FIRST while one answers free and fit (core/bin/cc-suites; CC_SELFTEST_SPILL=0 keeps a run here)
+# — or go to a runner on another machine FIRST while one answers free and fit (core/bin/cc-suites; CC_SELFTEST_SPILL=0 keeps a run here),
+# and a run that is not a landing's waits a while for a full runner when this box is loaded (CC_SELFTEST_RUNNER_WAIT)
 # and each cleans up after itself.  Usage: tests/selftest.sh   — or, from a landing, with CC_LAND_CHANGED naming
 # the paths a PR changed, in which case only what that change reaches runs (see "WHAT RUNS" below).
 # CC_SUITE_PART names WHICH HALF to run — `portable`, the stanzas that are nothing but a tool's own selfcheck and
@@ -73,20 +74,42 @@ fi
 #   AHEAD: a landing that waits holds a SHARED flock on $LOCKF.landing for as long as it waits, and a run that is not a
 #     landing's takes no slot while it cannot take that file exclusively — so the next slot to free goes to the landing.
 #     The flock goes when its holder does, so a landing that died waiting leaves nothing behind to hold the others up.
-slot(){ [ "$1" = 1 ] && echo "$LOCKF" || echo "$LOCKF.$1"; }   # slot 1 is the file the lock always was; the rest sit beside it
+slot(){ [ "$1" = 1 ] && echo "$LOCKF" || echo "$LOCKF.$1"; }
+runner_full(){ "$SUITES" status 2>/dev/null | grep -qE 'answers: free 0( |$)'; }   # reachable and fit, every slot taken
+box_load(){ local l; read -r l _ < "${CC_SELFTEST_LOADAVG:-/proc/loadavg}" 2>/dev/null; echo "load ${l:-0} on $(nproc 2>/dev/null || echo 1) cores"; }
+box_loaded(){ local l; read -r l _ < "${CC_SELFTEST_LOADAVG:-/proc/loadavg}" 2>/dev/null || return 1   # 1-minute load above the cores
+              awk -v l="$l" -v n="$(nproc 2>/dev/null || echo 1)" 'BEGIN { exit !(l + 0 > n + 0) }'; }   # slot 1 is the file the lock always was; the rest sit beside it
 if [ -z "${CC_SELFTEST_HELD:-}" ]; then
   waited=0; first=1; [ -n "$LANDING" ] || first=2; PRIO=; said=; nospill=
   # THE RUNNER FIRST (owner, 2026-09-25: offload as much as possible). Before this run takes a slot here, it goes
-  # to the runner if that answers free and fit (cc-suites spill; its header has the rules). 0 is a pass there, its
-  # green record filed; 75 is "nothing ran there", so this run takes a slot here and may be offered again while it
-  # waits; 76 is "it ran there and no pass came back" (red, cut off, out of time), so it runs here and is not
-  # offered again. Only the box's own lock does this: a fixture below runs this file with a scratch
+  # to the runner if that answers free and fit (cc-suites spill; its header has the rules). 0 is a pass there (or a
+  # pass there bar a tool's own selfcheck, which then passed here: FINISH HERE), its green record filed; 75 is
+  # "nothing ran there", so this run takes a slot here and may be offered again while it waits; 76 is "it ran there
+  # and no pass came back" (red, cut off, out of time), so it runs here and is not offered again. Only the box's own lock does this: a fixture below runs this file with a scratch
   # CC_SELFTEST_LOCK, and must neither reap the box's processes nor ship anything anywhere — unless it hands over a
   # stub of its own in CC_SELFTEST_SUITES, as the spill-first case does.
   SUITES=${CC_SELFTEST_SUITES:-$(dirname "$SELF")/../bin/cc-suites}
   if { [ -z "${CC_SELFTEST_LOCK:-}" ] || [ -n "${CC_SELFTEST_SUITES:-}" ]; } && [ "${CC_SELFTEST_SPILL:-1}" != 0 ]; then
     "$SUITES" spill "$SELF" "$@"; src=$?
     case $src in 75) ;; 76) nospill=1;; *) exit "$src";; esac
+    # A FULL RUNNER IS WORTH A SHORT WAIT WHEN THIS BOX IS LOADED ("make a busy slot queue or wait briefly rather
+    # than silently falling back when that is faster overall", 2026-09-27; that night the box ran at load ~20 while
+    # the runner answered free 0). A run that is NOT a landing's, turned away (75) by a runner that is reachable and
+    # fit but has every slot taken (`free 0`), while this box's 1-minute load is above its cores, does not start a
+    # fourth suite here at once: it offers itself again every CC_SELFTEST_RUNNER_POLL s (60) for up to
+    # CC_SELFTEST_RUNNER_WAIT s (900), and says so. It stops waiting the moment the runner stops being full, the box
+    # stops being loaded or the bound passes, and then takes a slot here as before. A landing never waits for it.
+    if [ "$src" = 75 ] && [ -z "$LANDING" ] && runner_full && box_loaded; then
+      rw=${CC_SELFTEST_RUNNER_WAIT:-900}; rp=${CC_SELFTEST_RUNNER_POLL:-60}; ws=0
+      echo "== the runner is full and this box is loaded ($(box_load)): waiting up to ${rw}s for the runner before running here =="
+      while [ "$ws" -lt "$rw" ]; do
+        sleep "$rp"; ws=$((ws + rp))
+        "$SUITES" spill "$SELF" "$@"; src=$?
+        case $src in 75) ;; 76) nospill=1; break;; *) exit "$src";; esac
+        runner_full && box_loaded || break
+      done
+      [ "$src" != 75 ] || echo "== waited ${ws}s for the runner — running here =="
+    fi
   fi
   exec {LQ}>>"$LOCKF.landing"
   while :; do
@@ -2841,10 +2864,15 @@ pp=$(timeout 30 python3 "$T/sockask.py" '{"post": "C1", "text": "as the bot"}')
 grep -q 'not that session' <<<"$hp" && [ -z "$hq" ] && grep -q 'not a socket verb' <<<"$pp" \
   && ok "the daemon socket refuses a hello from a process that is not that session (cwd check on SO_PEERCRED's pid) and serves one from the session's own cwd, and the owner-level post verb is gone" \
   || bad "socket peer check (foreign hello: ${hp:0:60} | own cwd: ${hq:0:60} | post: ${pp:0:60})"
-"$B/cc-slack" 2>&1 | grep -q -- 'PRIVATE unless --public' && "$B/cc-slack" 2>&1 | grep -q 'ANYONE who can post in a routed channel is heard' \
+# The help is read WHOLE before a grep sees it. `cc-slack | grep -q` under pipefail passes only where grep reads to
+# the end (GNU grep 3.12 does): the help is 17 KB, the first match sits in its first 8 KB, and a grep that quits there
+# closes the pipe on cc-slack's next write, which exits 120 — the pipeline's status. Both cases were red on every
+# laptop-runner run (2026-09-26/27) and green here, which is what that looks like.
+sh_help=$("$B/cc-slack" 2>&1); sh_status=$(SLACK_BOT_TOKEN= "$B/cc-slack" status 2>/dev/null)
+grep -q -- 'PRIVATE unless --public' <<<"$sh_help" && grep -q 'ANYONE who can post in a routed channel is heard' <<<"$sh_help" \
   && ok "help: channels are private by default; anyone in a routed channel is heard" || bad "cc-slack help policy"
-"$B/cc-slack" 2>&1 | grep -q 'EVERY channel the bot is in answers' \
-  && SLACK_BOT_TOKEN= "$B/cc-slack" status 2>/dev/null | grep -q 'policy: every channel the bot is in answers' \
+grep -q 'EVERY channel the bot is in answers' <<<"$sh_help" \
+  && grep -q 'policy: every channel the bot is in answers' <<<"$sh_status" \
   && ok "help + status state the policy: every channel answers, DMs are the owner's, #approvals/#alerts are not sessions" || bad "cc-slack channel-is-a-session policy"
 : > "$T/fifo.done"   # the channel server's stdin may close now: every case that needed it subscribed is done
 pg=$(ps -o pgid= -p "$SD" 2>/dev/null | tr -d ' ')   # OUR daemon, by recorded pid and its group — a bare pattern would kill another run's
@@ -3763,6 +3791,36 @@ touch "$LS.go"; wait "$hs" 2>/dev/null
 { [ "${spills76:-}" = 1 ] && [ "${spills75:-}" = 2 ]; } \
   && ok "...and, waiting, a run that ran there is not offered again, while one that never ran there is (76 → 1 offer, 75 → 2)" \
   || bad "re-offer rule: 76 → ${spills76:-?} offers (want 1), 75 → ${spills75:-?} (want 2)"
+# A FULL RUNNER AND A LOADED BOX: a run that is not a landing's waits for the runner a while before running here. The
+# stub answers `free 0` to status and 75 to a spill until its Nth call ($LW.pass: the spill that passes, 0 = none).
+LW="$T/lockwait"; printf '#!/usr/bin/env bash
+echo "$1" >> "%s.calls"
+[ "$1" = status ] && { echo "cc-suites: runner r answers: free 0 cores=8"; exit 0; }
+[ "$1" = spill ] && { [ "$(grep -cx spill "%s.calls")" = "$(cat "%s.pass")" ] && exit 0; exit 75; }
+exit 0
+' "$LW" "$LW" "$LW" > "$T/suites-wait"
+chmod +x "$T/suites-wait"; echo "99.00 99.00 99.00 1/1 1" > "$LW.loaded"; echo "0.00 0.00 0.00 1/1 1" > "$LW.idle"
+lw(){ rm -f "$LW.calls"; echo "$1" > "$LW.pass"; shift
+      env -u CC_SELFTEST_SLOTS CC_SELFTEST_LOCK="$LW" CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_SUITES="$T/suites-wait" \
+        CC_SELFTEST_RUNNER_POLL=1 "$@" "$SELF" 2>&1; }
+w1=$(lw 2 CC_SELFTEST_LOADAVG="$LW.loaded" CC_SELFTEST_RUNNER_WAIT=30); w1rc=$?
+{ [ "$w1rc" = 0 ] && grep -q 'waiting up to 30s for the runner' <<<"$w1" && ! grep -q '^== lock taken' <<<"$w1" && [ "$(grep -cx spill "$LW.calls")" = 2 ]; } \
+  && ok "a run that is not a landing's, turned away by a full runner while this box is loaded, waits and offers itself again, and the runner's pass is its exit" \
+  || bad "wait for a full runner: rc=$w1rc calls=[$(tr '\n' ' ' <"$LW.calls")] $(tr '\n' ' ' <<<"$w1")"
+w2=$(lw 0 CC_SELFTEST_LOADAVG="$LW.loaded" CC_SELFTEST_RUNNER_WAIT=2); w2rc=$?
+{ [ "$w2rc" = 0 ] && grep -q '^== waited 2s for the runner — running here' <<<"$w2" && grep -q '^== lock taken' <<<"$w2" && [ "$(grep -cx spill "$LW.calls")" = 3 ]; } \
+  && ok "...and waits no longer than CC_SELFTEST_RUNNER_WAIT, then takes a slot here" \
+  || bad "runner wait bound: rc=$w2rc calls=[$(tr '\n' ' ' <"$LW.calls")] $(tr '\n' ' ' <<<"$w2")"
+w3=$(lw 2 CC_SELFTEST_LOADAVG="$LW.idle" CC_SELFTEST_RUNNER_WAIT=30); w3rc=$?
+{ [ "$w3rc" = 0 ] && ! grep -q 'waiting up to' <<<"$w3" && grep -q '^== lock taken' <<<"$w3" && [ "$(grep -cx spill "$LW.calls")" = 1 ]; } \
+  && ok "...but on a box that is not loaded it runs here at once" \
+  || bad "runner wait on an idle box: rc=$w3rc calls=[$(tr '\n' ' ' <"$LW.calls")] $(tr '\n' ' ' <<<"$w3")"
+rm -f "$LW.calls"; echo 2 > "$LW.pass"
+w4=$(env CC_SELFTEST_LOCK="$LW" CC_SELFTEST_SLOTS=1 CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_SUITES="$T/suites-wait" CC_SELFTEST_RUNNER_POLL=1 \
+       CC_SELFTEST_LOADAVG="$LW.loaded" CC_SELFTEST_RUNNER_WAIT=30 "$SELF" 2>&1); w4rc=$?
+{ [ "$w4rc" = 0 ] && ! grep -q 'waiting up to' <<<"$w4" && grep -q '^== lock taken' <<<"$w4"; } \
+  && ok "...and a landing never waits for the runner, loaded box or not" \
+  || bad "a landing waited for the runner: rc=$w4rc $(tr '\n' ' ' <<<"$w4")"
 fi
 cd ~ || exit 1
 # THE RUN LEFT THE BOX'S ~/.cc AS IT FOUND IT — judged on the object, not on the export block being right. Every
