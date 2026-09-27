@@ -642,8 +642,21 @@ def main(a):
                           "session_id":t.get("session_id",""),"started":t.get("started",False),
                           "pr":t.get("pr",""),"notes":notes_list(t),
                           "created":t.get("created",now()),"updated":now()})
+                # SCOPE APPENDED AFTER DISPATCH IS SAID ON THE ROW (a-held-pr-can-be-repaired, DONE 3): five sections of
+                # owner scope appended to a row whose PR was queued reached nobody, and one iteration was rebuilt as a
+                # new row. The next iteration reads task.md whole (cc-loop builds each prompt from it), so the row says
+                # what came in and, where no iteration is due — a PR out, a row in review — what will read it.
+                grew = after is not None and human(before).strip() and after != before
+                if grew:
+                    head = next((l.strip() for l in human(after)[len(human(before)):].splitlines() if l.strip()), "")
+                    out = t.get("pr") or t.get("status") in ("review", "waiting")
+                    t["notes"].append({"ts": now(), "msg": (
+                        f"scope appended ({len(after.encode()) - len(before.encode())} bytes): {head[:160]}"
+                        + (" — its PR is out, so no iteration reads this until the PR is handed back (the next "
+                           "iteration, fix round or subagent in its worktree reads task.md whole) or it goes to a new row"
+                           if out else " — the next iteration reads it"))})
                 d["tracks"][track]=t
-                d["log"].append({"ts":now(),"track":track,"msg":f"added: {title}"})
+                d["log"].append({"ts":now(),"track":track,"msg":f"scope appended: {title}" if grew else f"added: {title}"})
                 _save(repo,d)
         except BaseException:                # the row never reached the board: the brief comes out, the refusal stands
             unappend(repo, track, before, after, made); raise
@@ -909,6 +922,36 @@ def selfcheck():
         run("add", "r", "t1", "T", "a one-line note")
         ok("…and adding the same thing twice stacks nothing up",
            open(f"{th}/.cc/state/r/t1/task.md").read() == body)
+        # SCOPE APPENDED AFTER DISPATCH IS SAID ON THE ROW: owner scope appended to a row whose PR was out reached
+        # nobody. Own rows: t5 fresh then grown, t6 grown with its PR out; the fresh add and a repeat are the controls.
+        def row(track):
+            d = json.loads(run("json", "r").stdout)
+            return d["tracks"][track], [e["msg"] for e in d["log"] if e.get("track") == track]
+        run("add", "r", "t5", "T5", "GOAL: the first scope.")
+        t5, log5 = row("t5")
+        ok("a fresh `add` writes no 'scope appended' note, and its log line says added",
+           not any("scope appended" in (x.get("msg") or "") for x in t5.get("notes") or [])
+           and log5 == ["added: T5"])
+        run("add", "r", "t5", "T5", "GOAL: a second scope, appended.")
+        t5, log5 = row("t5")
+        grown = [x.get("msg") or "" for x in t5.get("notes") or [] if "scope appended" in (x.get("msg") or "")]
+        ok("`add` that grows an existing brief notes it on the row — its first new line, and that the next iteration "
+           "reads it — and logs 'scope appended: <title>'",
+           len(grown) == 1 and grown[0].startswith("scope appended (") and "GOAL: a second scope, appended." in grown[0]
+           and "the next iteration reads it" in grown[0] and "PR is out" not in grown[0]
+           and log5[-1] == "scope appended: T5")
+        run("add", "r", "t5", "T5", "GOAL: a second scope, appended.")
+        t5, log5 = row("t5")
+        ok("…and the same text again grows nothing, so no second note and the log says added",
+           sum("scope appended" in (x.get("msg") or "") for x in t5.get("notes") or []) == 1
+           and log5[-1] == "added: T5")
+        run("add", "r", "t6", "T6", "GOAL: the first scope.")
+        run("set", "r", "t6", "pr", "https://example.test/o/r/pull/9")
+        run("add", "r", "t6", "T6", "GOAL: scope that came after the PR.")
+        t6, _ = row("t6")
+        grown = [x.get("msg") or "" for x in t6.get("notes") or [] if "scope appended" in (x.get("msg") or "")]
+        ok("…and on a row whose PR is out, the note says no iteration reads it until the PR is handed back",
+           len(grown) == 1 and "its PR is out" in grown[0] and "the next iteration reads it" not in grown[0])
         # …but "the same thing" is a WHOLE LINE, not a prefix: `add` used a substring and --go a `head -c`, and both
         # took "note 1" for "note 10" — a dispatch note silently dropped (the stress case below found it).
         run("add", "r", "t4", "T4", "a one-line note")   # its own row: the longer line first, then the prefix, both ways

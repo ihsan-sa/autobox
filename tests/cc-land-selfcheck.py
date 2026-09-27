@@ -594,6 +594,8 @@ def selfcheck():
                                                         # it, and no case inherits the one before it left behind
         for p in glob.glob(f"{green_dir()}/*-red-*.json"):   # …and the same for a red record (red_run): a case that
             os.unlink(p)                                      # re-gates one tree after a red builds the record itself
+        shutil.rmtree(os.path.dirname(handed_path("x", 0)), ignore_errors=True)   # …and a handed-back PR's watch
+                                                              # (watch_handed): the stop before this case's is not its own
         PROCS[0], MINE[0] = [], set()
         LINKED[0] = ["cc-new.service", "cc-slackd.service", NEVER]
         BODY[0] = {"cc-new.service": "[Service]\nExecStart=%h/bin/cc-new\n[Install]\nWantedBy=default.target\n",
@@ -4314,6 +4316,70 @@ def selfcheck():
             # cases below (gh_merges), which assert that NOTHING merged; all three lists are truncated together,
             # because they are zipped against each other further down (F4d).
             del calls[n0:], cwds[n0:], envs[n0:]
+            # GIT NAMES WHAT GH DOES NOT (git_pr_files). #706 had 181 files, none protected, and needed the owner's
+            # 👍 because gh lists 100. Own fixture per case: gh's full page, then git's answer for the whole diff.
+            GMB = "5eed" + "0" * 36
+
+            def git_named(names, fetch=(0, ""), rules="learn-fetch/"):
+                guarded([f"docs/f{i:03d}.md" for i in range(GH_PR_FILES)], rules, "U0WNER", "--who", "cc done")
+                for p in glob.glob(f"{qdir}/myrepo-*.json"):
+                    os.unlink(p)
+                world["gh pr view 7 --json baseRefName"] = (0, json.dumps({"baseRefName": "main"}))
+                world["git fetch -q origin main"] = fetch
+                world["git merge-base origin/main"] = (0, GMB + "\n")
+                world["git diff --name-only --no-renames"] = (0, "".join(n + "\n" for n in names))
+                return protected_hit("myrepo", 7)
+            every = [f"docs/f{i:03d}.md" for i in range(GH_PR_FILES + 80)]
+            hit = git_named(every + ["learn-fetch/learn-fetch"])
+            check(f"git_pr_files: a PR over {GH_PR_FILES} files whose git diff names a file under a protected path is "
+                  f"that hit, named — fetched by the pinned head, diffed from its merge-base with the base",
+                  hit == ("learn-fetch/learn-fetch", "learn-fetch/") and ran("git", "fetch", "origin", "main", HEAD)
+                  and ran("git", "diff", "--name-only", GMB, HEAD))
+            hit = git_named(every)
+            rcQ = quiet(cmd_queue, ["myrepo", "7", "--who", "cc done"])
+            check(f"…and where git names every file and none is protected, it is no hit at all, and the door queues "
+                  f"it — the {GH_PR_FILES}-file '?' case above is gh alone, with git unable to answer",
+                  hit is None and rcQ == 0 and os.path.exists(job_path("myrepo", 7)))
+            hit = git_named(every, fetch=(1, "fatal: couldn't find remote ref"))
+            check("…while a git that cannot fetch the head leaves the uncertainty a '?' hit, said as such — never a pass",
+                  hit and hit[0] == "?" and "git could not list the rest" in hit[1])
+            world[CFGP] = (1, "")      # no protected list: ordinary() asks git for the same reason
+            why_bad = ordinary("myrepo", 7)[0]
+            world["git fetch -q origin main"] = (0, "")
+            why_ok = ordinary("myrepo", 7)[0]
+            check(f"…and ordinary() the same: over {GH_PR_FILES} files with git failing it is not ordinary, saying git "
+                  f"could not list the rest; with git answering, the file count is no longer its reason",
+                  "git could not list the rest" in why_bad and "the first" not in why_ok)
+
+            # AN OWNER-APPROVED PROTECTED PR AT THE REVIEW-BUDGET WALL (#554): its door refuses --re-review and
+            # --no-review, and the doomed refusal turned his own 👍 away. His 👍 buys that head ONE read. Own fixture per
+            # case: doomed() stood in for with the wall's own reason, or another.
+            _dm = doomed
+
+            def at_wall(files, why, *extra):
+                globals()["doomed"] = lambda repo, pr: why
+                try:
+                    rc = guarded(files, "learn-fetch/", "U0WNER", "--who", "owner", *extra)
+                finally:
+                    globals()["doomed"] = _dm
+                return rc, read_json(job_path("myrepo", 7))
+            SPENT_WHY = f"{BUDGET_SPENT}: PR #7 has already bought 1 review(s) and 1 repair round(s)"
+            rcQ, job = at_wall(["docs/x.md", "learn-fetch/learn-fetch"], SPENT_WHY, "--approved-by", "U0WNER")
+            check("R2 door: the owner's 👍 on a protected PR at the review-budget wall queues it with ONE read bought "
+                  "(re_review on the job), pinned to the head he approved",
+                  rcQ == 0 and job and job.get("re_review") is True and job.get("approved_head") == HEAD)
+            rcQ, job = at_wall(["docs/x.md"], SPENT_WHY, "--approved-by", "U0WNER")
+            check("…while an unprotected PR at the same wall is still refused at the door — its routes are the seat's "
+                  "(--re-review, a recorded read), not a 👍",
+                  rcQ == 1 and job is None
+                  and open(f"{qdir}/queue.log").read().rstrip().endswith("refused myrepo#7 doomed"))
+            rcQ, job = at_wall(["docs/x.md", "learn-fetch/learn-fetch"], "DO-NOT-LAND at this head: the call leaks",
+                               "--approved-by", "U0WNER")
+            check("…and a protected PR doomed for any other reason is refused too, 👍 or not: only the wall is bought",
+                  rcQ == 1 and job is None)
+            rcQ, job = at_wall(["docs/x.md", "learn-fetch/learn-fetch"], "", "--approved-by", "U0WNER")
+            check("…and his 👍 on a protected PR NOT at the wall queues it with nothing bought", rcQ == 0 and job
+                  and "re_review" not in job)
         finally:
             for k in (CFGP, CFGO, GHF, GHH, LSR):
                 world.pop(k, None)
@@ -4781,6 +4847,12 @@ def selfcheck():
         def armed():
             return [next(a for a in c if a.startswith("--on-active=")) for c in ran("systemd-run", "--on-active=")]
 
+        def watch_only():
+            """No retry armed: the one timer is the handed-back watch's (watch_handed), a look for a push at
+            RETRY_AFTER plus next_wake's minute, and it is there exactly when the watch was written."""
+            return ([abs(int(a.split("=")[1]) - (RETRY_AFTER + 60)) <= 5 for a in armed()] == [True]
+                    and os.path.exists(handed_path("myrepo", 7)))
+
         def told():
             posts = ran_sub("cc-slack", "post", "CAPPR")
             return " ".join(posts[0]) if posts else ""
@@ -5002,13 +5074,14 @@ def selfcheck():
                   and len(commented()) == 1 and len([c for c in calls if c[0] == CLAUDE]) == 1)
             landing(**{GATE: (1, "  ✗ the row was wrong\n1 failed\n")})
             quiet(cmd_work, [])
-            check("...while a red the TREE caused stops at ONCE — no second try, nothing armed — and says NOT merged "
-                  "ONCE, in the thread that asked, in ONE line naming the gate and the case that FAILED; only a new "
-                  "head changes that tree, and a new head is a new queue",
-                  read_json(job_path("myrepo", 7)) is None and not gh_merges() and not armed()
+            # The one timer it arms is the handed-back watch's (watch_handed), a look for a push, never a second try.
+            check("...while a red the TREE caused stops at ONCE — no second try, no retry armed, only the watch for "
+                  "its push — and says NOT merged ONCE, in the thread that asked, in ONE line naming the gate and the "
+                  "case that FAILED; only a new head changes that tree, and that head's push re-queues it",
+                  read_json(job_path("myrepo", 7)) is None and not gh_merges() and watch_only()
                   and len(ran_sub("cc-slack", "post", "CAPPR")) == 1
                   and one_line(card(), "gate check.sh did not pass: ✗ the row was wrong",
-                               "Fix it, then re-queue it")
+                               "Fix it, and its push re-queues it")
                   and "try 1 of" in record() and "old code" not in told()
                   and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
             landing(**{GATE: (1, BOXRED)})
@@ -5073,7 +5146,7 @@ def selfcheck():
         check("a LAND-AFTER-FIX with nowhere to dispatch a fix to — no track state dir carries this PR — still ends "
               "the job at once: a verdict is a decision about the PR, not the box's weather, and an automatic fix "
               "that cannot be written down is one nobody could act on",
-              not os.path.exists(job_path("myrepo", 7)) and not armed() and not gh_merges()
+              not os.path.exists(job_path("myrepo", 7)) and watch_only() and not gh_merges()
               and not ran_sub("cc", "myrepo", "w1", "--go")
               and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told() and "LAND-AFTER-FIX" in told()
               and len([c for c in calls if c[0] == CLAUDE]) == 1)
@@ -5111,12 +5184,12 @@ def selfcheck():
                   f"in hand — nobody re-queued it",
                   len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7)))
         # CONTROL: the conflict git finds ITSELF while building the merge — GitHub's answer can be hours old — is
-        # still a red gate and still no flake: ended at once, unarmed, told to rebase, exactly as before.
+        # still a red gate and still no flake: ended at once, no retry armed (only the watch for its push), told to rebase, exactly as before.
         landing(**{"git merge-tree --write-tree": lambda a: (1, "<<<<<<< CONFLICT (content): Merge conflict in a.py\n")})
         quiet(cmd_work, [])
         check("...while a conflict GitHub did NOT know of, met by git building the merge, is a gates stop and no "
-              "flake: ended at once, unarmed, told to rebase — the hold reads GitHub's word, the gate reads git's",
-              not os.path.exists(job_path("myrepo", 7)) and not armed() and not gh_merges()
+              "flake: ended at once, no retry armed, told to rebase — the hold reads GitHub's word, the gate reads git's",
+              not os.path.exists(job_path("myrepo", 7)) and watch_only() and not gh_merges()
               and "conflicts with" in told() and "NOT merged" in told())
         # (4) …and where there IS a track to fix in, the queue dispatches ONE fix iteration and stays out of the
         # planning session's way. Every LAND-AFTER-FIX used to cost it a dozen full-context turns — read the verdict,
@@ -5334,12 +5407,216 @@ def selfcheck():
         finally:
             globals()["track_worktree"] = _tw
         bare = " ".join(" ".join(c) for c in ran_sub("cc-slack", "inject", "myrepo"))
+        watch = read_json(handed_path("myrepo", 7)) or {}
         check("R3: a LAND-AFTER-FIX handed back with its round spent wakes the seat with the track's own worktree and "
-              "the agent mark, says `--go` is refused while the PR carries the row, and ends in the re-queue; with no "
-              "worktree on disk it says to push to the PR's branch — never the bare 'Fix it, then'",
+              "the agent mark, says `--go` is refused while the PR carries the row, and ends in the push that "
+              "re-queues it (the hand re-queue named beside it); with no worktree on disk it says to push to the PR's "
+              "branch — never the bare 'Fix it, then'",
               f"fix it in w1's own worktree ({wt})" in woke and "cc board set myrepo w1 agent me" in woke
-              and "`cc-land queue myrepo 7`" in woke and "Fix it, then" not in woke
-              and "push the fix to the PR's branch, then `cc-land queue myrepo 7`" in bare and wt not in bare)
+              and "and its push re-queues it" in woke and "`cc-land queue myrepo 7` does it at once" in woke
+              and "Fix it, then" not in woke
+              and "push the fix to the PR's branch, and its push re-queues it" in bare and wt not in bare)
+        # HANDED BACK, WATCHED (a-held-pr-can-be-repaired): #517 and #653 were hand-fixed after that stop, and the push
+        # made no job, because the job was gone. The stop above leaves a watch on the head it read and its branch.
+        check("R3 watch: that stop writes the watch a push re-queues from — the head the review read, the PR's "
+              "branch, the verdict, the card's thread, and a first look RETRY_AFTER on; the ledger says so",
+              watch.get("repo") == "myrepo" and watch.get("pr") == 7 and watch.get("branch") == "track/w1"
+              and len(watch.get("head") or "") == 40 and watch.get("verdict") == "LAND-AFTER-FIX"
+              and watch.get("stopped") == "review" and watch.get("chat") == "CAPPR"
+              and epoch_of(watch.get("not_before") or "") > time.time() + RETRY_AFTER - 60
+              and epoch_of(watch.get("until") or "") > time.time() + (HANDED_DAYS - 1) * 86400
+              and "\thanded myrepo#7 review head=" in open(f"{LANDQ}/queue.log").read())
+        shutil.rmtree(os.path.dirname(handed_path("myrepo", 7)), ignore_errors=True)
+        # WHICH STOPS ARE WATCHED (handed_back): a verdict or a red gate, which only a new head changes. Not the
+        # budget wall — nothing read the diff, and a recorded read moves it, not a push — nor a PR a merged one carries.
+        def watched(stopped, verdict="", why="", rc=1, carried=""):
+            L = fresh(pr=7)
+            L.stopped, L.verdict, L.why, L.carried = stopped, verdict, why, carried
+            return handed_back(L, rc)
+        check("handed_back: a LAND-AFTER-FIX, a DO-NOT-LAND and a red gate are each watched for a push",
+              watched("review", "LAND-AFTER-FIX") and watched("review", "DO-NOT-LAND") and watched("gates", why="red"))
+        check("…while the budget wall, a load stop, a landing that succeeded and a PR a merged one carries are not",
+              not watched("review", why=f"{BUDGET_SPENT}: PR #7 has already bought 2 review(s)")
+              and not watched("load", why="cannot read PR #7") and not watched("gates", why="red", rc=0)
+              and not watched("review", "LAND-AFTER-FIX", carried="PR #9, merged, says it carries #7"))
+        # …and a watch that cannot be written is not promised on the card: watch_handed runs before result_of.
+        L = fresh(pr=7)
+        L.stopped, L.why, L.head = "gates", "gate check.sh did not pass", HEAD
+        L.facts = dict(FACTS, headRefName="")
+        L.watched = handed_back(L, 1)
+        watch_handed(L, {"chat": "CAPPR", "ts": "1.1"})
+        check("…and a stop whose branch gh never named writes no watch, and its card says re-queue by hand, "
+              "promising no push that would do it",
+              not L.watched and not os.path.exists(handed_path("myrepo", 7)) and handed_then(L) == ""
+              and stop_who(L) == "Fix it, then re-queue it")
+
+        # THE SWEEP THAT READS THE WATCH (sweep_handed). Own fixture per case: a watch due now at WATCHED, origin's
+        # branch at `now`, GitHub's state, and whatever job is already on the queue for the PR.
+        WATCHED, PUSHED = "a1" * 20, "b2" * 20
+
+        def handed_sweep(now, state="OPEN", job=None, **w):
+            fresh(pr=7)
+            with contextlib.suppress(OSError):
+                os.unlink(job_path("myrepo", 7))
+            world[f"{BIN}/cc-config get CC_PROTECTED_PATHS_myrepo"] = (1, "")     # no protected list
+            world["gh pr view 7 --json headRefOid,state"] = (0, json.dumps({"headRefOid": now, "state": state}))
+            world["git ls-remote origin refs/heads/track/w1"] = (0, f"{now}\trefs/heads/track/w1\n")
+            os.makedirs(os.path.dirname(handed_path("myrepo", 7)), exist_ok=True)
+            write_atomic(handed_path("myrepo", 7), dict({
+                "repo": "myrepo", "pr": 7, "head": WATCHED, "branch": "track/w1", "at": stamp(),
+                "until": stamp(time.time() + 86400), "not_before": stamp(time.time() - 1), "chat": "CAPPR",
+                "ts": "1.1", "stopped": "review", "verdict": "LAND-AFTER-FIX"}, **w))
+            if job:
+                write_atomic(job_path("myrepo", 7), job)
+            at = len(open(f"{LANDQ}/queue.log").read())
+            lines = quiet(sweep_handed)
+            return lines, open(f"{LANDQ}/queue.log").read()[at:], read_json(job_path("myrepo", 7))
+        lines, log, job = handed_sweep(PUSHED)
+        check("sweep_handed: a push past the watched head re-queues the PR through the queue's own door — a job "
+              "in the card's thread, who 'handback push', a `handed-pushed` line — and the watch ends",
+              job and job.get("stage") == "queued" and job.get("who") == "handback push"
+              and (job.get("chat"), job.get("ts")) == ("CAPPR", "1.1")
+              and f"handed-pushed myrepo#7 {WATCHED[:12]}->{PUSHED[:12]} — re-queued" in log
+              and "\tqueued myrepo#7 who=handback push" in log and len(lines) == 1 and "re-queued" in lines[0]
+              and not os.path.exists(handed_path("myrepo", 7)))
+        lines, log, job = handed_sweep(WATCHED)
+        kept = read_json(handed_path("myrepo", 7)) or {}
+        check("…while the branch still at the watched head queues nothing, says nothing, and keeps the watch for "
+              "another look RETRY_AFTER on",
+              job is None and not lines and "handed" not in log and kept.get("head") == WATCHED
+              and epoch_of(kept.get("not_before") or "") > time.time() + RETRY_AFTER - 60)
+        lines, log, job = handed_sweep(PUSHED, state="MERGED")
+        check("…and a PR that merged ends the watch with one line, queueing nothing whatever its head says",
+              job is None and "handed-end myrepo#7 — merged" in log and "handed-pushed" not in log
+              and not os.path.exists(handed_path("myrepo", 7)))
+        lines, log, job = handed_sweep(PUSHED, until=stamp(time.time() - 1))
+        check("…and so does a watch past its HANDED_DAYS, even with a push on the branch",
+              job is None and "watched long enough" in log and not os.path.exists(handed_path("myrepo", 7)))
+        lines, log, job = handed_sweep(PUSHED, not_before=stamp(time.time() + 600))
+        check("…and a watch not yet due is not even asked about: no gh, no ls-remote, the watch as it was",
+              job is None and not ran("gh", "pr", "view", "7") and not ran("git", "ls-remote")
+              and os.path.exists(handed_path("myrepo", 7)))
+        lines, log, job = handed_sweep(PUSHED, job={"repo": "myrepo", "pr": 7, "stage": "queued", "attempts": 0,
+                                                    "queued_at": stamp(), "who": "the owner"})
+        check("…and a PR somebody queued again meanwhile is that job's now: the watch ends, the job is untouched",
+              job and job.get("who") == "the owner" and "handed-over myrepo#7" in log
+              and not os.path.exists(handed_path("myrepo", 7)))
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))
+        shutil.rmtree(os.path.dirname(handed_path("myrepo", 7)), ignore_errors=True)
+
+        # R7: A LIVE SEAT IS TYPED THE ROUND. `cc … --go` refuses any live pane, busy or idle, and lessons #60/#63 sat
+        # HELD to their deadlines behind seats idle in a handoff. The same round is typed to the seat with --say.
+        LIVE = (1, f"cc: myrepo/w1 {LIVE_SEAT} (pane %3) — `cc myrepo w1 --say` reaches it")
+        said_n = open(f"{LANDQ}/queue.log").read().count("fix-said myrepo#7")
+        repair_case(**{f"{BIN}/cc myrepo w1 --go": LIVE, f"{BIN}/cc myrepo w1 --say": (0, "typed")})
+        calls.clear(); quiet(cmd_work, [])
+        job, log = read_json(job_path("myrepo", 7)) or {}, open(f"{LANDQ}/queue.log").read()
+        cc_verb = lambda v: [c for c in calls if os.path.basename(c[0]) == "cc" and c[1:4] == ["myrepo", "w1", v]]
+        typed = cc_verb("--say")
+        check("R7: a round `--go` refuses for a live seat is typed to that seat (`--say` with the round's own brief), "
+              "the job stays fixing on it with `said` on the round, a `fix-said` line — and it is not held",
+              len(cc_verb("--go")) == 1 and len(typed) == 1 and "GOAL:" in typed[0][-1]
+              and job.get("stage") == "fixing" and (job.get("fix") or {}).get("said") and not job.get("held")
+              and log.count("fix-said myrepo#7") == said_n + 1
+              and not ran_sub("cc-slack", "post", "--route", "repair not dispatched"))
+        held_n = open(f"{LANDQ}/queue.log").read().count("held myrepo#7")
+        repair_case(**{f"{BIN}/cc myrepo w1 --go": LIVE, f"{BIN}/cc myrepo w1 --say": (1, "cc: no pane answers")})
+        calls.clear(); quiet(cmd_work, [])
+        job, log = read_json(job_path("myrepo", 7)) or {}, open(f"{LANDQ}/queue.log").read()
+        check("R7: …while a `--say` that fails too leaves the round HELD as any refusal is, naming both answers",
+              job.get("stage") == "held" and "`--say` to that seat failed too" in (job.get("held") or "")
+              and not (job.get("fix") or {}).get("said") and log.count("held myrepo#7") == held_n + 1
+              and log.count("fix-said myrepo#7") == said_n + 1)
+        # …and its push: a live seat never "ends" its round, so the head is taken once it holds for one poll.
+        ROUND0, ROUND1, ROUND2 = "c3" * 20, "d4" * 20, "e5" * 20
+
+        def said_poll(said=True, now=ROUND1, seen=""):
+            fresh(pr=7)
+            world["git ls-remote origin refs/heads/track/w1"] = (0, f"{now}\trefs/heads/track/w1\n")
+            world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")   # the seat's row reads running
+            fix = {"track": "w1", "verdict": "LAND-AFTER-FIX", "head": ROUND0, "at": stamp(),
+                   "deadline": stamp(time.time() + FIX_WAIT)}
+            fix.update({"said": stamp()} if said else {}, **({"seen": seen} if seen else {}))
+            write_atomic(job_path("myrepo", 7), {"repo": "myrepo", "pr": 7, "queued_at": stamp(), "attempts": 0,
+                                                 "stage": "fixing", "fix": fix})
+            line = fix_progress(job_path("myrepo", 7), read_json(job_path("myrepo", 7)))
+            return line, read_json(job_path("myrepo", 7)) or {}
+        pushed_n = open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7")
+        line, job = said_poll()
+        check("R7 push: the first new head a typed round pushes is recorded and waited on for one poll — not "
+              "re-queued, since the seat may push again",
+              line and "holds for one poll" in line and job.get("stage") == "fixing"
+              and job["fix"].get("seen") == ROUND1 and not job["fix"].get("over"))
+        line, job = said_poll(seen=ROUND1)
+        check("R7 push: …the same head at the next poll re-queues it (fix over 'pushed', a `fix-pushed` line), though "
+              "the seat's row still reads running",
+              line == "" and job.get("stage") == "queued" and job["fix"].get("over") == "pushed"
+              and job["fix"].get("pushed") == ROUND1
+              and open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == pushed_n + 1)
+        line, job = said_poll(now=ROUND2, seen=ROUND1)
+        check("R7 push: …and a head that moved again since is waited on afresh", line and job.get("stage") == "fixing"
+              and job["fix"].get("seen") == ROUND2)
+        line, job = said_poll(said=False, seen=ROUND1)
+        check("R7 push control: a round `--go` launched, its row running, still waits for the round to end whatever "
+              "head it pushed — the one-poll rule is the typed round's alone",
+              "still running" in line and job.get("stage") == "fixing" and not job["fix"].get("over"))
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))
+
+        # THE READ AFTER A LAND-AFTER-FIX starts from its findings and the diff since its head (prior_read): #527 took
+        # four reads and #528 five, each cold on the whole diff and each finding something the last had not.
+        SINCE = "f6" * 20
+        L = fresh(pr=7)
+        L.head, rtmp = HEAD, tempfile.mkdtemp(prefix="cc-land-selfcheck-prior-")
+        world["git rev-parse --verify -q"] = (0, SINCE + "\n")
+        world[f"git diff {SINCE} {HEAD}"] = (0, "+        timeout=60\n")
+        L.stood, L.stood_at = "LAND", (SINCE[:12], "a.py:9 the call has no timeout")
+        was_land = L.prior_read(rtmp)
+        L.stood, L.stood_at = "LAND-AFTER-FIX", (HEAD[:12], "a.py:9 the call has no timeout")
+        same_head = L.prior_read(rtmp)
+        L.stood_at = (SINCE[:12], "a.py:9 the call has no timeout")
+        text = L.prior_read(rtmp)
+        dpath = f"{rtmp}/pr-7.since-{SINCE[:12]}.diff"
+        check("prior_read: after a LAND-AFTER-FIX at another head the read is handed that verdict's findings and the "
+              "diff since its head, written to a file it names, and asked to check them first",
+              f"LAND-AFTER-FIX at {SINCE[:12]}" in text and "a.py:9 the call has no timeout" in text
+              and dpath in text and "Read it FIRST" in text and os.path.exists(dpath)
+              and open(dpath).read() == "+        timeout=60\n")
+        world["git rev-parse --verify -q"] = (1, "")
+        gone = L.prior_read(rtmp)
+        check("…while after a LAND, at the head that verdict read, or with a head git cannot name, it adds nothing",
+              was_land == "" and same_head == "" and gone == "")
+        shutil.rmtree(rtmp, ignore_errors=True)
+
+        # A GATE GITHUB ACTIONS ALREADY PASSED on this exact tree is not run again (gate_decl, actions_green): only a
+        # gate the repo declares at its base, only where the head's tree is the tree under test, only with the base's
+        # .github/, and only when every run of that check on the head succeeded. Own fixture per case.
+        world["git show origin/main:core/tests/gates"] = (0, "core/tests/check.sh actions=static+check  # the static gate\n"
+                                                          "/etc/passwd\n../up/x.sh\n\n# a comment only\ntests/extra.sh\n")
+        world["git show origin/main:tests/gates"] = (128, "fatal: path 'tests/gates' does not exist")
+        check("gate_decl: each declared path with its Actions check (`+` for a space), absolute and `..` paths and "
+              "comments dropped, and a list that is not there adding nothing",
+              gate_decl("/tmp/_ccland", "origin/main") == {"core/tests/check.sh": "static check", "tests/extra.sh": ""})
+        TREE = "7ee0" + "0" * 36
+        RUN = {"name": "static check", "head_sha": HEAD, "status": "completed", "conclusion": "success"}
+
+        def actions(content=TREE, github=0, runs=(RUN,), decl=None, gate="core/tests/check.sh"):
+            L = fresh(pr=7)
+            L.head = HEAD
+            L.decl = {"core/tests/check.sh": "static check"} if decl is None else decl
+            world[f"git rev-parse {HEAD}^{{tree}}"] = (0, TREE + "\n")
+            world["git diff --quiet origin/main"] = (github, "")
+            world[f"gh api repos/{{owner}}/{{repo}}/commits/{HEAD}"] = (0, json.dumps({"check_runs": list(runs)}))
+            return L.actions_green(gate, content)
+        check("actions_green: a declared check that succeeded on the head, whose tree IS the tree under test and "
+              "whose .github/ is the base's, stands in for the gate's run", actions() == "static check")
+        check("…but not on another tree (the merge built something new), not with .github/ changed by the PR, not "
+              "with one run of that check failed or none at all, and not for a gate declared with no check",
+              actions(content="8" * 40) == "" and actions(github=1) == ""
+              and actions(runs=(RUN, dict(RUN, conclusion="failure"))) == "" and actions(runs=()) == ""
+              and actions(runs=(dict(RUN, status="in_progress", conclusion=None),)) == ""
+              and actions(decl={"core/tests/check.sh": ""}) == "" and actions(gate="tests/extra.sh") == "")
         repair_case(**{f"{BIN}/cc myrepo w1 --go": (0, "dispatched")}); calls.clear(); envs.clear(); quiet(cmd_work, [])   # both, or the zip below pairs this run's calls with an earlier run's envs
         machine = [e.get("CC_BRIEF_MACHINE") for c, e in zip(calls, envs)
                    if os.path.basename(c[0]) == "cc" and "--go" in c]
@@ -5381,6 +5658,7 @@ def selfcheck():
         check("...and the sweep arms its own next look, so nothing else has to poll on the queue's behalf",
               len(armed()) == 1 and 60 <= int(armed()[0].split("=")[1]) <= FIX_POLL + 70)
         calls.clear()
+        n_mid = open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7")   # R7 above pushed its own
         world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": "f" * 40}))
         world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")
         quiet(cmd_work, [])
@@ -5389,7 +5667,7 @@ def selfcheck():
               "intermediate checkpoint (review-176c)",
               os.path.exists(job_path("myrepo", 7))
               and (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing"
-              and "fix-pushed myrepo#7" not in open(f"{LANDQ}/queue.log").read()
+              and open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_mid
               and not [c for c in calls if c[0] == CLAUDE])
         world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "review\n")
         world["tmux list-windows"] = (0, "@9 myrepo/w1\n")
