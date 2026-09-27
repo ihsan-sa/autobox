@@ -890,6 +890,68 @@ def run_selfcheck():
           and resBW[Daemon.PINGPONG_MAX:] == ["held: ping-pong"] * 2
           and rBWthird.get("result") == "delivered" and wokeBW[Daemon.PINGPONG_MAX][2]["content"] == "a third seat"
           and oneBW == ["delivered"] * (Daemon.PINGPONG_MAX + 2) and len(wokeBW) == 2 * Daemon.PINGPONG_MAX + 3)
+    # ANY POST IN A SEAT'S CHANNEL REACHES THAT SEAT, WHOEVER WROTE IT, AND NEVER ITS OWN (raised-a-box-post-in-a-seat-
+    # channel-never-reaches-the-seat, 2026-09-27: the library editor's post of an owner's edit package into the orch's
+    # channel woke nobody). A box process no session owns (a service, a shell) and another app's bot are handed over as
+    # role=bot; the seat's own post, a headless track loop's post into its own track, our own bot's post read back
+    # off the event stream, and a box line into the -updates lane are not.
+    dmBP = Daemon(use_slack=False); dmBP.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmBP.bot_user = "UBOT"; dmBP.bot_id = "BOURS"
+    dmBP.names.update({"CLES": "lessons", "CLESU": "lessons-updates", "CTRK": "lessons--t1"}); wokeBP = []
+    dmBP.route = lambda chat, ctype: {"CLES": "lessons", "CLESU": "lessons", "CTRK": "lessons/t1"}.get(chat)
+    dmBP.chan_alias = lambda chat: "library" if chat == "CLES" else None
+    dmBP.deliver = lambda target, payload, autostart=True, alias=None: wokeBP.append((target, alias, payload)) or "delivered"
+    dmBP.record_nobody_woken = lambda *a: "recorded f-x"
+    dmBP.peer_seat = lambda peer, member=None: None                    # nobody's session: the editor's service
+    wtBP = tempfile.mkdtemp(prefix="cc-slack-bp-"); os.makedirs(f"{wtBP}/.cc"); open(f"{wtBP}/.cc/track", "w").write("lessons t1\n")
+    rBPsvc = dmBP.wake_channel("CLES", "20.1", None, "edit package for chapter 3", (4242, os.getuid(), HOME))
+    rBPloop = dmBP.wake_channel("CTRK", "20.2", None, "round over", (4243, os.getuid(), wtBP))
+    rBPupd = dmBP.wake_channel("CLESU", "20.3", None, "backup ok", (4244, os.getuid(), HOME))
+    svcBP = list(wokeBP)
+    dmBP.peer_seat = lambda peer, member=None: ("lessons", "library")  # the seat itself, posting into its own channel
+    rBPown = dmBP.wake_channel("CLES", "20.4", None, "a note to myself", ("peer",))
+    ownBP = wokeBP[len(svcBP):]
+    subprocess.run(["rm", "-rf", wtBP])
+    check("a box post from a process no session owns (the library editor) reaches the seat of the channel it went to, "
+          "in its thread, as role=bot and never role=owner; the seat's own post into its channel does not, and neither "
+          "does a headless track loop's post into its own track or a box line into the -updates lane",
+          rBPsvc.get("result") == "delivered" and len(svcBP) == 1 and svcBP[0][:2] == ("lessons", "library")
+          and svcBP[0][2]["content"] == "edit package for chapter 3" and svcBP[0][2]["meta"]["role"] == "bot"
+          and svcBP[0][2]["meta"]["user"] == "box" and svcBP[0][2]["meta"]["thread_ts"] == "20.1"
+          and svcBP[0][2]["meta"]["chat_id"] == "CLES"
+          and rBPloop.get("result") == "own" and rBPupd.get("result") == "updates-lane"
+          and rBPown.get("result") == "own" and ownBP == [])
+    handBP = []
+    dmBP.hand_off = lambda target, text, meta, chat, thread, ts, alias=None: handBP.append((target, alias, text, meta))
+    dmBP.command = lambda *a, **k: handBP.append(("COMMAND",))
+    _ndBP = globals()["needs_dir"]
+    try:
+        globals()["needs_dir"] = lambda target: False                   # the fixture's target has its dir
+        with offline_slack():
+            dmBP.on_event({"type": "message", "subtype": "bot_message", "channel": "CLES", "ts": "21.1", "bot_id": "BOTHER",
+                           "username": "GitHub", "text": "PR #12 opened", "channel_type": "channel"})
+            dmBP.on_event({"type": "message", "channel": "CLES", "ts": "21.2", "bot_id": "BOTHER", "user": "UOTHERBOT",
+                           "text": "a deploy finished", "channel_type": "channel"})
+            dmBP.on_event({"type": "message", "channel": "CLES", "ts": "21.2", "bot_id": "BOTHER", "user": "UOTHERBOT",
+                           "text": "a deploy finished", "channel_type": "channel"})              # the same event again
+            dmBP.on_event({"type": "message", "subtype": "bot_message", "channel": "CLES", "ts": "21.3", "bot_id": "BOURS",
+                           "username": f"{BOX}-box · library", "text": "my own reply", "channel_type": "channel"})
+            dmBP.on_event({"type": "message", "channel": "CLES", "ts": "21.4", "user": "UBOT", "text": "a plain post of ours",
+                           "channel_type": "channel"})
+            dmBP.on_event({"type": "message", "channel": "CLES", "ts": "21.5", "bot_id": "BOTHER", "user": "UOTHERBOT",
+                           "text": "!pause lessons", "channel_type": "channel"})
+            dmBP.on_event({"type": "message", "channel": "DX", "ts": "21.6", "bot_id": "BOTHER", "user": "UOTHERBOT",
+                           "text": "hello", "channel_type": "im"})
+            dmBP.bot_id = None                                          # before auth.test: nothing is anybody else's
+            dmBP.on_event({"type": "message", "subtype": "bot_message", "channel": "CLES", "ts": "21.7", "bot_id": "BOTHER",
+                           "text": "too early to tell", "channel_type": "channel"})
+    finally:
+        globals()["needs_dir"] = _ndBP
+    check("another app's bot post in a seat's channel reaches that seat once, as role=bot with the bot's name; our own "
+          "posts read back off the event stream (signed or plain) do not; its `!` line is handed over as text, never "
+          "run as a command; its DM reaches nobody; and before our bot id is known no bot post is taken for another's",
+          [(h[0], h[1], h[2], h[3]["role"], h[3]["user"]) for h in handBP[:2]]
+          == [("lessons", "library", "PR #12 opened", "bot", "GitHub"), ("lessons", "library", "a deploy finished", "bot", "BOTHER")]
+          and len(handBP) == 3 and handBP[2][2] == "!pause lessons" and handBP[2][3]["role"] == "bot")
     # …AND IN AN ORCH'S CHANNEL THE OWNER'S ANSWER UNDER A PLANNING SEAT'S POST IS THE ORCH'S (raised-a-post-into-an-
     # orch-channel-reaches-the-planning-seat): the root's signature names the seat that spoke, not the thread's owner.
     # Outside an orch channel the same signature still claims the thread for its orch, as before.
@@ -927,10 +989,11 @@ def run_selfcheck():
                   "bot_id": "B01", "text": "no token here", "channel_type": "channel"})
     check("bot_message without an @token: ignored entirely (no flip, no delivery)", len(handed) == n_handed and dm5.thread_owner[("C1", "5.5")] is None)
     dm5.known_aliases["r"].add("ai-dev"); dm5.thread_owner[("C1", "5.5")] = None
-    dm5.on_event({"type": "message", "subtype": "bot_message", "channel": "C1", "ts": "5.8", "thread_ts": "5.5",
-                  "bot_id": "BSTRANGER", "text": "@ai-dev take it", "channel_type": "channel"})
+    with offline_slack():             # it is handed over as role=bot now (bot_post), and that marks the post 👀
+        dm5.on_event({"type": "message", "subtype": "bot_message", "channel": "C1", "ts": "5.8", "thread_ts": "5.5",
+                      "bot_id": "BSTRANGER", "text": "@ai-dev take it", "channel_type": "channel"})
     check("bot_message from ANOTHER app's bot never flips thread ownership (M2)",
-          dm5.thread_owner[("C1", "5.5")] is None and len(handed) == n_handed)
+          dm5.thread_owner[("C1", "5.5")] is None)
     with offline_slack():             # a member's message: the name lookup and the mark are not this case's subject
         dm5.on_event({"type": "message", "channel": "C1", "ts": "5.9", "thread_ts": "5.5", "user": "UOTHER",
                       "text": "@ai-dev take it", "channel_type": "channel"})
@@ -6722,8 +6785,8 @@ def run_selfcheck():
         r_psub = ms_req({"permission": "abcde", "answer": "yes"}, member=None, peer=(os.getpid(), os.getuid(), f"{DEV}/alice/proj"))
         # wake: ONE SESSION'S POST INTO ANOTHER SESSION'S CHANNEL IS HANDED TO THAT SESSION — the caller is the CTL
         # session (heldC owns this pid), #myrepo is somebody else's, so it is delivered there in the post's own
-        # thread as the box's word; the same seat's post into its OWN lane is "own", a caller no session owns wakes
-        # nothing, and a member socket has no such verb
+        # thread as the box's word; the same seat's post into its OWN lane is "own", a caller no session owns is
+        # handed over as role=bot, and a member socket has no such verb
         os.makedirs(f"{DEV}/{CTL}", exist_ok=True); dmMS.names["CCTL"] = CTL
         wokeMS = []; _delW = dmMS.deliver
         dmMS.deliver = lambda target, payload, autostart=True, alias=None: wokeMS.append((target, alias, payload)) or "delivered"
@@ -7291,14 +7354,14 @@ def run_selfcheck():
           and r_psub.get("ok") is False and "is waiting" in r_psub.get("error", ""))
     check("wake: a session's `post -c '#other'` is handed to #other's session in the post's own thread, as the box's word "
           "(2026-09-11: a hand-off posted into an orch's channel started nothing there); its post into its own lane is "
-          "'own', a caller no session owns wakes nothing, and the member socket has no such verb",
-          r_wake.get("result") == "delivered" and r_wake.get("target") == "myrepo" and len(wokeMS) == 1
+          "'own', a caller no session owns (a cron) is handed over too as role=bot, and the member socket has no such verb",
+          r_wake.get("result") == "delivered" and r_wake.get("target") == "myrepo"
           and wokeMS[0][0] == "myrepo" and wokeMS[0][2]["content"] == "please take this"
           and wokeMS[0][2]["meta"].get("chat_id") == "CMY" and wokeMS[0][2]["meta"].get("thread_ts") == "7.7"
           and wokeMS[0][2]["meta"].get("role") == "owner" and wokeMS[0][2]["meta"].get("user") == "box"
           and wokeMS[0][2]["meta"].get("from") == CTL
-          and r_wown.get("result") == "own" and r_wnone.get("result") == "not-a-session"
-          and r_wmem.get("ok") is False)
+          and r_wown.get("result") == "own" and r_wnone.get("result") == "delivered" and len(wokeMS) == 2
+          and wokeMS[1][2]["meta"].get("role") == "bot" and r_wmem.get("ok") is False)
     check("mention: a session's reply naming @<alias> reaches that alias's own window once, as a <channel> message in the "
           "ORIGINAL chat and thread, mirrored into the alias's own channel with the source channel and every @ defanged, "
           "and the reply's result says where it went (2026-09-14: a reply asked @improve and @shrink, neither was woken); "
