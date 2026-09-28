@@ -518,10 +518,14 @@ for id in $(wins "$REPO/c1"); do tmux kill-window -t "$id"; done
 # the very worktree the subagent built, and a subagent that never reached `cc done` must not block it for the
 # life of its session (review of #279). A live WORKER's claim is taken by nothing.
 mkdir -p ~/.cc/state/$REPO/c5; printf 'Do the c5 thing.\n' > ~/.cc/state/$REPO/c5/task.md
-hold(){ ( "$B/cc" claim $REPO c5 --executor "$1" >/dev/null 2>&1; while [ ! -f "$T/c5.stop" ]; do sleep 0.2; done ) & }
+# The holder says when its claim has RETURNED, and the case waits for that, not for delivery.json to appear: under
+# load (45 on 2026-09-27) one `cc claim` outran a 10 s wait on the file, so the task id was read before the record
+# existed (the repair case red with rc=0 on #741 and #752) or the second subagent below claimed first (#735).
+hold(){ ( "$B/cc" claim $REPO c5 --executor "$1" >/dev/null 2>&1; : > "$T/c5.held"; while [ ! -f "$T/c5.stop" ]; do sleep 0.2; done ) & }
+held(){ for _ in $(seq 1 1500); do [ -f "$T/c5.held" ] && return 0; sleep 0.2; done; return 1; }   # 5 min: a bound, not a pace
 d5=~/.cc/state/$REPO/c5/delivery.json
-rm -f "$T/c5.stop"; hold subagent; holder=$!; KIDS="$KIDS $holder"
-for _ in $(seq 1 100); do [ -f "$d5" ] && break; sleep 0.1; done
+rm -f "$T/c5.stop" "$T/c5.held"; hold subagent; holder=$!; KIDS="$KIDS $holder"
+held
 c5tid=$(jq -r .task_id < "$d5" 2>/dev/null)
 "$B/cc" claim $REPO c5 --executor subagent >"$T/c5.out" 2>&1; h1=$?
 { [ "$h1" != 0 ] && grep -q 'live owner' "$T/c5.out" \
@@ -536,8 +540,8 @@ c5tid=$(jq -r .task_id < "$d5" 2>/dev/null)
   || qbad cc "a repair dispatch was refused a row a subagent still holds: rc=$h2 $(cat "$T/c5go.out")"
 for id in $(wins "$REPO/c5"); do tmux kill-window -t "$id"; done
 touch "$T/c5.stop"; wait $holder 2>/dev/null; KIDS="${KIDS% $holder}"
-rm -f "$T/c5.stop" "$d5"; hold worker; holder=$!; KIDS="$KIDS $holder"
-for _ in $(seq 1 100); do [ -f "$d5" ] && break; sleep 0.1; done
+rm -f "$T/c5.stop" "$T/c5.held" "$d5"; hold worker; holder=$!; KIDS="$KIDS $holder"
+held
 "$B/cc" claim $REPO c5 --executor subagent >"$T/c5w1.out" 2>&1; h3=$?
 "$B/cc" $REPO c5 --go "" >"$T/c5w2.out" 2>&1; h4=$?
 { [ "$h3" != 0 ] && [ "$h4" != 0 ] && [ -z "$(wins "$REPO/c5")" ] \
@@ -1456,8 +1460,10 @@ tmux list-windows -t main -F '#W' | grep -qx "$REPO/hx~next" && ok "the successo
 # THE SUCCESSOR MUST ACCEPT ITS OWN STARTUP DIALOG. Its window is "<target>~next"; `cc __runnext` knew only
 # the target, so it accepted in the PREDECESSOR's window and its own sat on the --dangerously-load-development-
 # channels confirmation until a human noticed (2026-09-01 02:10Z; the 2026-08-28 incident, again).
-tmux display-message -p -t "$REPO/hx~next" '#{pane_start_command}' 2>/dev/null | grep -q "CC_HANDOFF_WINDOW='$REPO/hx~next'" \
-  && ok "the successor is started knowing its OWN window, so it accepts its own dialog and does not park on it" || bad "no CC_HANDOFF_WINDOW on the successor: $(tmux display-message -p -t "$REPO/hx~next" '#{pane_start_command}' 2>&1)"
+# `main:` — a bare window name resolves in whichever session was active last, and a session outside main's group
+# (one was on 2026-09-27) finds no such window and prints an empty line, exit 0: this case went red that way on #736.
+tmux display-message -p -t "main:$REPO/hx~next" '#{pane_start_command}' 2>/dev/null | grep -q "CC_HANDOFF_WINDOW='$REPO/hx~next'" \
+  && ok "the successor is started knowing its OWN window, so it accepts its own dialog and does not park on it" || bad "no CC_HANDOFF_WINDOW on the successor: $(tmux display-message -p -t "main:$REPO/hx~next" '#{pane_start_command}' 2>&1)"
 "$B/cc" handoff --overlap "$REPO/hx" >/dev/null 2>&1 && bad "a second overlap was allowed for one target" || ok "an overlap is refused while one is open — one successor at a time"
 # the guard, from BOTH sides of the record. cwd is $T: no marker, so only the record can gate.
 h(){ printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s","session_id":"%s"}' "$1" "$T" "${3:-}" | env CC_HANDOFF="${2:-}" "$B/cc-guard" >/dev/null 2>&1; echo $?; }
@@ -2867,13 +2873,15 @@ grep -q 'not that session' <<<"$hp" && [ -z "$hq" ] && grep -q 'not a socket ver
 # The help is read WHOLE before a grep sees it. `cc-slack | grep -q` under pipefail passes only where grep reads to
 # the end (GNU grep 3.12 does): the help is 17 KB, the first match sits in its first 8 KB, and a grep that quits there
 # closes the pipe on cc-slack's next write, which exits 120 — the pipeline's status. Both cases were red on every
-# laptop-runner run (2026-09-26/27) and green here, which is what that looks like.
-sh_help=$("$B/cc-slack" 2>&1); sh_status=$(SLACK_BOT_TOKEN= "$B/cc-slack" status 2>/dev/null)
+# laptop-runner run (2026-09-26/27) and green here, which is what that looks like. A red says how cc-slack exited.
+sh_help=$("$B/cc-slack" 2>&1); sh_hrc=$?; sh_status=$(SLACK_BOT_TOKEN= "$B/cc-slack" status 2>/dev/null); sh_src=$?
 grep -q -- 'PRIVATE unless --public' <<<"$sh_help" && grep -q 'ANYONE who can post in a routed channel is heard' <<<"$sh_help" \
-  && ok "help: channels are private by default; anyone in a routed channel is heard" || bad "cc-slack help policy"
+  && ok "help: channels are private by default; anyone in a routed channel is heard" \
+  || bad "cc-slack help policy (rc=$sh_hrc: $(head -c 300 <<<"$sh_help" | tr '\n' ' '))"
 grep -q 'EVERY channel the bot is in answers' <<<"$sh_help" \
   && grep -q 'policy: every channel the bot is in answers' <<<"$sh_status" \
-  && ok "help + status state the policy: every channel answers, DMs are the owner's, #approvals/#alerts are not sessions" || bad "cc-slack channel-is-a-session policy"
+  && ok "help + status state the policy: every channel answers, DMs are the owner's, #approvals/#alerts are not sessions" \
+  || bad "cc-slack channel-is-a-session policy (status rc=$sh_src: $(tail -c 300 <<<"$sh_status" | tr '\n' ' '))"
 : > "$T/fifo.done"   # the channel server's stdin may close now: every case that needed it subscribed is done
 pg=$(ps -o pgid= -p "$SD" 2>/dev/null | tr -d ' ')   # OUR daemon, by recorded pid and its group — a bare pattern would kill another run's
 if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$SD" 2>/dev/null; fi

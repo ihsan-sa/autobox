@@ -3732,7 +3732,8 @@ def run_selfcheck():
     real_run_tl = EFFECTS.run_impl
     ch_tl = Channel(CTL); ch_tl.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
     ch_tl.muted = lambda: False
-    json.dump({f"{CTL}-threads": "CTHR", CTL: "CCTL", "_t": time.time()}, open(f"{DIR}/channels.json", "w"))
+    # lowercased as Slack names every channel: off ~/dev CTL is the hostname, a WSL runner's is upper case
+    json.dump({f"{CTL.lower()}-threads": "CTHR", CTL.lower(): "CCTL", "_t": time.time()}, open(f"{DIR}/channels.json", "w"))
     try:
         globals()["api"] = lambda method, token, **kw: (
             (sent_tl.append(kw.get("text")) if method == "chat.postMessage" else None)
@@ -3763,11 +3764,11 @@ def run_selfcheck():
           and ran_tl[0][:4] == [f"{BIN}/cc-notify", "-t", f"{CTL} blocked", "--decision"]
           and "--id" in ran_tl[0] and ran_tl[0][ran_tl[0].index("--id") + 1].startswith("seat-decision:CTHR:7.0:")
           and ran_tl[0][-1].startswith("restore Friday's snapshot or Thursday's?")
-          and f"#{CTL}-threads" in ran_tl[0][-1] and "https://x.slack.com/archives/CTHR/p9" in ran_tl[0][-1]
+          and f"#{CTL.lower()}-threads" in ran_tl[0][-1] and "https://x.slack.com/archives/CTHR/p9" in ran_tl[0][-1]
           and sent_tl[1] == "❓ <@UOWNER> prod or staging?" and own_filed)
     check("…and the seat is TOLD where his card went and how to follow the thread back, so it does not read as if he "
           "had been mentioned in the lane",
-          res_tl[1] is False and f"HIS ❓ CARD IS IN #{CTL}" in res_tl[0] and f"NOT IN #{CTL}-threads" in res_tl[0]
+          res_tl[1] is False and f"HIS ❓ CARD IS IN #{CTL}" in res_tl[0] and f"NOT IN #{CTL.lower()}-threads" in res_tl[0]
           and "https://x.slack.com/archives/CTHR/p9" in res_tl[0] and res_own[0].count("❓ CARD") == 0)
     check("…and a card cc-notify did NOT post is never named as one: its own is_control refusing this seat prints a "
           "request id, and a door that failed prints why — both say the owner has no card and neither claims a "
