@@ -1,0 +1,612 @@
+"""U2's run cases: the tree, the status rules, the sandbox, admission and scopes, the runners, the store, the
+failures ledger, quarantine, judging a red against the base, and `lander check` / `lander sweep`.
+
+    python3 -m unittest discover -s core/tests/lander -p 'test_run.py'
+
+Cases that start bwrap or a systemd scope skip, saying so, on a machine without one. Every case uses its own
+LANDER_STATE and its own git repo.
+"""
+import contextlib
+import datetime
+import fcntl
+import io
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import unittest
+from unittest import mock
+
+CORE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+HERE = os.path.dirname(os.path.realpath(__file__))
+for p in (CORE, HERE):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from lander import admission as A  # noqa: E402
+from lander import check as CK  # noqa: E402
+from lander import manifest as M  # noqa: E402
+from lander import records as REC  # noqa: E402
+from lander import run as RUN  # noqa: E402
+from lander import sandbox as S  # noqa: E402
+from lander import types as T  # noqa: E402
+from test_plan import git, write  # noqa: E402
+
+HAS_BWRAP = S.available() and subprocess.run(["bwrap", "--ro-bind", "/", "/", "true"],
+                                             capture_output=True).returncode == 0
+CLI = os.path.join(CORE, "lander", "cli.py")
+
+
+def chk(name="c", run="true", klass=T.HERMETIC, **kw):
+    return T.Check(name=name, run=run, klass=klass, **kw)
+
+
+class Env(unittest.TestCase):
+    """Its own state dir, no scope unless a case asks, and a repo holding one committed tree."""
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.tmp = d.name
+        self.state = os.path.join(self.tmp, "state")
+        p = mock.patch.dict(os.environ, {"LANDER_STATE": self.state, "LANDER_SCOPE": "0"})
+        p.start()
+        self.addCleanup(p.stop)
+        self.repo = os.path.join(self.tmp, "repo")
+        os.mkdir(self.repo)
+        git(self.repo, "init", "-q")
+        write(self.repo, {"core/bin/tool": "#!/bin/sh\necho tool\n", "README.md": "x\n"})
+        os.chmod(os.path.join(self.repo, "core/bin/tool"), 0o755)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "base")
+        self.tree = RUN.tree_of(self.repo, "HEAD")
+
+    def run_(self, check, where="box", **kw):
+        return RUN.run(check, self.tree, where, repo_root=self.repo, **kw)
+
+
+class Status(unittest.TestCase):
+    def test_the_status_rules(self):
+        cases = [((0, "all good"), T.PASSED), ((0, "tool: 1 failed"), T.FAILED),
+                 ((0, "3 failed\nretry: 0 failed"), T.PASSED), ((1, "boom"), T.FAILED),
+                 ((124, ""), T.UNRUNNABLE), ((137, ""), T.UNRUNNABLE), ((-9, ""), T.UNRUNNABLE),
+                 ((1, "write: No space left on device"), T.UNRUNNABLE),
+                 ((1, "bwrap: Can't mount proc on /newroot/proc"), T.UNRUNNABLE),
+                 ((1, "Failed to connect to user scope bus via local transport"), T.UNRUNNABLE),
+                 ((0, "bwrap: a line of the check's own that says bwrap:"), T.PASSED)]
+        for (rc, text), want in cases:
+            self.assertEqual(RUN.status_of(rc, text)[0], want, (rc, text))
+        self.assertEqual(RUN.status_of(0, "", capped=True)[0], T.UNRUNNABLE)
+
+    def test_red_lines_leave_out_pass_lines(self):
+        self.assertEqual(RUN.red_lines("ok 1 fine\n✗ broke here\nFAIL two\n✓ FAIL-looking pass"),
+                         ["✗ broke here", "FAIL two"])
+
+
+class Tree(Env):
+    def test_materialise_writes_the_exact_tree_as_a_git_repo_in_the_member_path_shape(self):
+        run_dir, head = RUN.materialise(self.repo, self.tree, "repo.7")
+        self.addCleanup(lambda: __import__("shutil").rmtree(run_dir, ignore_errors=True))
+        self.assertRegex(head, r"/cc-land\.run\.\d+\.[^/]+/cc-land\.gates\.repo\.7\.[^/]+/head$")
+        self.assertEqual(git(head, "rev-parse", "HEAD^{tree}"), self.tree)
+        self.assertTrue(os.access(os.path.join(head, "core/bin/tool"), os.X_OK))
+        self.assertEqual(git(head, "status", "--porcelain"), "")
+
+    def test_a_bad_tree_is_unrunnable_and_leaves_nothing(self):
+        tmp = os.path.join(self.tmp, "private-tmp")   # its own TMPDIR: nothing else on the box writes here
+        os.mkdir(tmp)
+        with mock.patch.dict(os.environ, {"TMPDIR": tmp}):
+            with self.assertRaises(RUN.Unrunnable):
+                RUN.materialise(self.repo, "0" * 40)
+            with self.assertRaises(RUN.Unrunnable):
+                RUN.materialise(self.repo, "HEAD")
+        self.assertEqual(os.listdir(tmp), [])
+
+    def test_tree_of_the_working_copy_includes_untracked_files(self):
+        write(self.repo, {"new.txt": "n"})
+        wt = RUN.tree_of(self.repo, "")
+        self.assertNotEqual(wt, self.tree)
+        self.assertIn("new.txt", git(self.repo, "ls-tree", "--name-only", wt))
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "?? new.txt")   # the real index is untouched
+
+
+@unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
+class Sandbox(Env):
+    def test_inside_there_is_the_tree_and_none_of_the_box(self):
+        home = os.path.expanduser("~")
+        probe = textwrap.dedent(f'''
+            set -e
+            test -x core/bin/tool
+            test "$(git rev-parse HEAD^{{tree}})" = {self.tree}
+            test "$HOME" = /tmp/home
+            test ! -e "{home}" && test "$PWD" = /work/tree
+            test -z "${{SECRET_TOKEN:-}}" && test -z "${{CLAUDECODE:-}}"
+            tmux has-session -t main
+            command -v claude | grep -q /tmp/home/.local/bin/claude
+            test "$(grep -c : /proc/net/dev)" = 1
+            test "$CC_SELFTEST_SPILL" = 0
+            echo "0 failed"
+        ''')
+        with mock.patch.dict(os.environ, {"SECRET_TOKEN": "s3cret", "CLAUDECODE": "1"}):
+            r = self.run_(chk(run=probe))
+        self.assertEqual(r.status, T.PASSED, r.extra)
+        self.assertTrue(r.runner.startswith("box:bwrap:"), r.runner)
+
+    def test_net_true_shares_the_network(self):
+        r = self.run_(chk(run='test "$(grep -c : /proc/net/dev)" -gt 1', net=True))
+        self.assertEqual(r.status, T.PASSED, r.extra)
+
+    def test_a_mount_is_read_only_and_a_missing_mount_is_unrunnable(self):
+        m = os.path.join(self.tmp, "venv")
+        os.mkdir(m)
+        write(m, {"marker": "here"})
+        r = self.run_(chk(run=f'grep -q here {m}/marker && ! touch {m}/w 2>/dev/null', mounts=[m]))
+        self.assertEqual(r.status, T.PASSED, r.extra)
+        r = self.run_(chk(run="true", mounts=[m + "-gone"]))
+        self.assertEqual(r.status, T.UNRUNNABLE)
+        self.assertIn("mount", r.extra["why"])
+
+    def test_the_check_runs_from_its_manifest_prefix(self):
+        r = self.run_(chk(run="test -x bin/tool"), cwd="core/")
+        self.assertEqual(r.status, T.PASSED, r.extra)
+
+    def test_a_red_carries_its_red_lines_as_cases(self):
+        r = self.run_(chk(run='echo "ok 1 fine"; echo "FAIL the thing"; exit 1'))
+        self.assertEqual(r.status, T.FAILED)
+        self.assertEqual(r.cases, [{"name": "FAIL the thing", "status": T.FAILED}])
+
+    def test_the_cap_makes_it_unrunnable_not_red(self):
+        r = self.run_(chk(run="sleep 30", cap=1))
+        self.assertEqual((r.status, r.extra["why"]), (T.UNRUNNABLE, "stopped at its cap"))
+        self.assertLess(r.secs, 15)
+
+    def test_no_bwrap_makes_a_sandboxed_class_unrunnable_never_a_host_run(self):
+        with mock.patch.object(S, "available", return_value=False):
+            r = self.run_(chk(run="true"))
+        self.assertEqual(r.status, T.UNRUNNABLE)
+
+    @unittest.skipUnless(A.scope_available.__call__ and os.path.exists(f"/run/user/{os.getuid()}/bus"),
+                         "no user systemd bus")
+    def test_in_a_scope_and_memory_max_kills_to_unrunnable(self):
+        with mock.patch.dict(os.environ, {"LANDER_SCOPE": "1"}), mock.patch.object(A, "MEM_MAX", "64M"):
+            ok = self.run_(chk(run="cat /proc/self/cgroup; echo 0 failed"))
+            big = self.run_(chk(run="python3 -c 'b = bytearray(512 * 1024 * 1024); print(len(b))'"))
+        self.assertEqual(ok.status, T.PASSED, ok.extra)
+        self.assertTrue(ok.runner.endswith(":scope"), ok.runner)
+        self.assertEqual(big.status, T.UNRUNNABLE, big.extra)
+
+
+class HostAndRunners(Env):
+    def test_host_class_runs_with_the_environment_scrubbed(self):
+        probe = ('test -z "${GH_TOKEN:-}${CLAUDE_X:-}${CLAUDECODE:-}${A_PASSWORD:-}" && test -n "$CC_CONFIG_DENY" '
+                 '&& test "$KEEP" = yes && test -x core/bin/tool')
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "t", "CLAUDE_X": "1", "CLAUDECODE": "1", "A_PASSWORD": "p",
+                                          "KEEP": "yes"}):
+            r = self.run_(chk(run=probe, klass=T.HOST))
+        self.assertEqual((r.status, r.runner.split(":")[1]), (T.PASSED, "host"), r.extra)
+
+    def test_a_runner_the_check_does_not_list_is_refused(self):
+        r = self.run_(chk(run="true", where=["box"]), where="laptop")
+        self.assertEqual(r.status, T.UNRUNNABLE)
+        self.assertIn("not one of this check's runners", r.extra["why"])
+
+    def test_the_member_runner_keeps_cc_sandboxs_tree_shape(self):
+        argv, wd, env, how = RUN._member_argv(chk(run="bin/x selfcheck"), "/t/head", "core/", "member:ann:t1",
+                                              {"CC_LAND_CHANGED": "a b"})
+        self.assertEqual(argv[1:8], ["member", "ann", "t1", "--tree", "/t/head", "--", "env"])
+        self.assertTrue(argv[0].endswith("/bin/cc-sandbox"))
+        self.assertEqual(argv[8:], ["CC_LAND_CHANGED=a b", "/bin/sh", "-c", "cd core/ && bin/x selfcheck"])
+        self.assertEqual((wd, how), ("/t/head", "member"))
+        self.assertEqual(RUN._member_argv(chk(), "/h", "", "member:ann", {})[0][3], "")
+
+    def test_the_laptop_round_trip_gives_every_job_a_fresh_home(self):
+        shim = os.path.join(self.tmp, "shim")
+        os.mkdir(shim)
+        with open(os.path.join(shim, "ssh"), "w") as f:   # drops ssh's options and destination, runs job-serve here
+            f.write(f'#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done; shift\n'
+                    f'exec python3 -P {CLI} job-serve "$@"\n')
+        os.chmod(os.path.join(shim, "ssh"), 0o755)
+        env = {"LANDER_LAPTOP": "runner", "PATH": shim + ":" + os.environ["PATH"]}
+        once = 'test ! -e "$HOME/seen" && touch "$HOME/seen" && test -x core/bin/tool && echo "0 failed"'
+        with mock.patch.dict(os.environ, env):
+            a = self.run_(chk(run=once, where=["box", "laptop"]), where="laptop")
+            b = self.run_(chk(run=once, where=["box", "laptop"]), where="laptop")
+            red = self.run_(chk(run="echo FAIL x; exit 1", where=["laptop"]), where="laptop")
+            host = self.run_(chk(run="true", klass=T.HOST, where=["laptop"]), where="laptop")
+        self.assertEqual((a.status, b.status), (T.PASSED, T.PASSED), (a.extra, b.extra))
+        self.assertEqual(red.status, T.FAILED, red.extra)
+        self.assertEqual(host.status, T.UNRUNNABLE)
+        with mock.patch.dict(os.environ, {"LANDER_LAPTOP": ""}):
+            self.assertEqual(self.run_(chk(where=["laptop"]), where="laptop").status, T.UNRUNNABLE)
+
+    def test_a_laptop_that_refuses_is_unrunnable(self):
+        shim = os.path.join(self.tmp, "shim2")
+        os.mkdir(shim)
+        with open(os.path.join(shim, "ssh"), "w") as f:
+            f.write('#!/bin/sh\ncat >/dev/null; echo "cc-suite-runner: refused: job"; exit 2\n')
+        os.chmod(os.path.join(shim, "ssh"), 0o755)
+        with mock.patch.dict(os.environ, {"LANDER_LAPTOP": "r", "PATH": shim + ":" + os.environ["PATH"]}):
+            r = self.run_(chk(where=["laptop"]), where="laptop")
+        self.assertEqual(r.status, T.UNRUNNABLE)
+
+    def test_job_serve_refuses_what_is_not_a_job(self):
+        for cmd in ("run x", "job ../x " + "a" * 40 + " 5 dHJ1ZQ== -", "job c nottree 5 dHJ1ZQ== -",
+                    "job c " + "a" * 40 + " 5 dHJ1ZQ== Li4v"):
+            with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": cmd}), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(RUN.cmd_job_serve([]), 2, cmd)
+            self.assertIn("refused", out.getvalue())
+
+    def test_manifest_widen_runs_in_process_on_two_trees(self):
+        write(self.repo, {"tests/LANDING.toml": '[[check]]\nname="x"\nrun="true"\n'})
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "m")
+        base = RUN.tree_of(self.repo, "HEAD")
+        write(self.repo, {"tests/LANDING.toml": ""})
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "drop")
+        head = RUN.tree_of(self.repo, "HEAD")
+        b = M.builtin_check()
+        self.assertEqual(RUN.run(b, head, repo_root=self.repo, base_tree=base).status, T.FAILED)
+        self.assertEqual(RUN.run(b, base, repo_root=self.repo, base_tree=base).status, T.PASSED)
+        self.assertEqual(RUN.run(b, head, repo_root=self.repo).status, T.UNRUNNABLE)
+
+
+class Admission(unittest.TestCase):
+    def psi_dir(self, mem, cpu):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d))
+        for k, v in (("memory", mem), ("cpu", cpu)):
+            with open(os.path.join(d, k), "w") as f:
+                f.write(f"some avg10={v} avg60=0 avg300=0 total=1\nfull avg10=0 avg60=0 avg300=0 total=0\n")
+        return d
+
+    def test_pressure_throttles_to_one_and_never_zero(self):
+        self.assertEqual(A.slots_now(self.psi_dir(1.0, 50.0), 3), 3)
+        self.assertEqual(A.slots_now(self.psi_dir(40.0, 50.0), 3), 1)
+        self.assertEqual(A.slots_now(self.psi_dir(1.0, 99.9), 3), 1)
+        self.assertEqual(A.slots_now(self.psi_dir(1.0, 1.0), 0), 1)
+        self.assertEqual(A.psi("memory", "/nonexistent"), 0.0)
+
+    def test_slots_admit_k_then_wait_and_alone_takes_them_all(self):
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        calm = self.psi_dir(0, 0)
+        with A.slot(st, psi_root=calm, k=2) as a, A.slot(st, psi_root=calm, k=2) as b:
+            self.assertEqual(sorted(a + b), [1, 2])
+            with self.assertRaises(TimeoutError):
+                with A.slot(st, psi_root=calm, k=2, poll=0.05, deadline=0.2):
+                    pass
+        with A.slot(st, psi_root=calm, k=2) as a:
+            with self.assertRaises(TimeoutError):
+                with A.slot(st, alone=True, psi_root=calm, k=2, poll=0.05, deadline=0.2):
+                    pass
+        with A.slot(st, alone=True, psi_root=calm, k=2) as held:
+            self.assertEqual(held, [1, 2])
+
+    def test_under_pressure_only_slot_one_admits(self):
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        hot = self.psi_dir(90, 0)
+        with A.slot(st, psi_root=hot, k=3) as a:
+            self.assertEqual(a, [1])
+            with self.assertRaises(TimeoutError):
+                with A.slot(st, psi_root=hot, k=3, poll=0.05, deadline=0.2):
+                    pass
+
+    def test_wrap_puts_the_run_in_a_scope_and_nices_only_the_sandboxed(self):
+        with mock.patch.object(A, "scope_available", return_value=True):
+            argv, how = A.wrap(chk(klass=T.HERMETIC), ["x"])
+            self.assertEqual(how, "scope")
+            self.assertIn("--slice=lander.slice", argv)
+            self.assertIn(f"MemoryMax={A.MEM_MAX}", argv)
+            self.assertEqual(argv[-4:], ["nice", "-n", "10", "x"])
+            argv, _ = A.wrap(chk(klass=T.HOST), ["x"])
+            self.assertEqual(argv[-2:], ["--", "x"])
+        with mock.patch.dict(os.environ, {"LANDER_SCOPE": "0"}):
+            self.assertEqual(A.wrap(chk(klass=T.HOST), ["x"]), (["x"], "noscope"))
+
+
+class Store(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.root = d.name
+        os.makedirs(os.path.join(self.root, "lanes"))
+        self.lock = open(os.path.join(self.root, "lanes", "repo.lock"), "a")
+        self.addCleanup(self.lock.close)
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        self.r = T.Result(check="c", tree="a" * 40, status=T.PASSED)
+
+    def test_only_the_lane_writes(self):
+        with self.assertRaises(REC.NotTheLane):
+            REC.Store("repo", None, self.root).put("repo-1", self.r)
+        other = open(os.path.join(self.root, "lanes", "repo.lock"), "a")   # another holder's view of the lock
+        self.addCleanup(other.close)
+        with self.assertRaises(REC.NotTheLane):
+            REC.Store("repo", other, self.root).put("repo-1", self.r)
+        s = REC.Store("repo", self.lock, self.root)
+        self.assertEqual(s.put("repo-1", self.r), "c/" + "a" * 40)
+        self.assertEqual(s.get("repo-1", "c", "a" * 40).status, T.PASSED)
+        self.assertIsNone(s.get("repo-2", "c", "a" * 40))   # one job's run is not another's
+
+    def test_a_shared_base_run_is_reused_only_at_this_release_and_nonce(self):
+        s = REC.Store("repo", self.lock, self.root)
+        with self.assertRaises(REC.NotTheLane):   # no lane nonce yet
+            s.put_base(self.r)
+        REC.new_nonce("repo", self.root)
+        s.put_base(self.r)
+        self.assertIsNotNone(s.base("c", "a" * 40))
+        s.release = "another-release"
+        self.assertIsNone(s.base("c", "a" * 40))
+        s.release = REC.release()
+        REC.new_nonce("repo", self.root)            # a new lane: every earlier shared run is stale
+        self.assertIsNone(s.base("c", "a" * 40))
+
+    def test_names_that_would_leave_the_store_are_refused(self):
+        s = REC.Store("repo", self.lock, self.root)
+        with self.assertRaises(ValueError):
+            s.put("../x", self.r)
+        with self.assertRaises(ValueError):
+            REC.Store("../repo")
+
+    def test_the_red_record_goes_once_by_the_shared_key_and_never_raises(self):
+        b = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(b))
+        out = os.path.join(b, "args")
+        with open(os.path.join(b, "cc-failures"), "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > {out}\necho "recorded F-1"\n')
+        os.chmod(os.path.join(b, "cc-failures"), 0o755)
+        r = T.Result(check="c", tree="b" * 40, status=T.FAILED, cases=[{"name": "FAIL one", "status": T.FAILED}])
+        word = REC.record_red("repo", r, "text", pr=7, bin_dir=b)
+        self.assertEqual(word, "recorded recorded F-1")
+        with open(out) as f:
+            args = f.read().splitlines()
+        for want in ("record", "--once", "gate-verdict/red", "source=gate:c:" + "b" * 12, "pr=7"):
+            self.assertIn(want, args)
+        self.assertTrue(any("FAIL one" in a for a in args))
+        with open(os.path.join(b, "cc-failures"), "w") as f:
+            f.write("#!/bin/sh\necho nope >&2; exit 3\n")
+        self.assertTrue(REC.record_red("repo", r, "t", bin_dir=b).startswith("not recorded"))
+        self.assertTrue(REC.record_red("repo", r, "t", bin_dir=b + "/gone").startswith("not recorded"))
+
+
+class Quarantine(unittest.TestCase):
+    TODAY = datetime.date(2026, 9, 27)
+
+    def test_only_live_rows_count(self):
+        text = ("# comment\n"
+                "tool\tflaky text\twhy\towner\t2026-10-20\n"
+                "tool\texpired\twhy\towner\t2026-09-26\n"
+                "tool\ttoo far\twhy\towner\t2027-01-01\n"
+                "tool\tno date\twhy\towner\tsoon\n"
+                "tool\ttoday\twhy\towner\t2026-09-27\n")
+        self.assertEqual(REC.quarantine_rows(text, self.TODAY), [("tool", "flaky text"), ("tool", "today")])
+
+    def test_every_red_line_must_match_a_row_of_this_check(self):
+        c = chk(name="selfcheck-tool", paths=["core/bin/tool"])
+        rows = [("tool", "flaky text"), ("other", "boom")]
+        self.assertTrue(REC.quarantined(c, ["FAIL: flaky text here"], rows))
+        self.assertFalse(REC.quarantined(c, ["FAIL: flaky text here", "FAIL: real"], rows))
+        self.assertFalse(REC.quarantined(c, ["FAIL boom"], rows))          # another tool's row
+        self.assertFalse(REC.quarantined(c, [], rows))                     # a red with no lines is not quarantined
+
+
+class Judge(unittest.TestCase):
+    """judge() with a scripted runner: statuses by (tree, alone)."""
+
+    def runner(self, script, loaded=False):
+        calls = []
+
+        def run(check, tree, where, alone=False, **kw):
+            calls.append((tree, alone))
+            st = script[(tree, alone)] if (tree, alone) in script else script[tree]
+            return T.Result(check=check.name, tree=tree, status=st,
+                            cases=[{"name": "FAIL flaky text", "status": T.FAILED}] if st == T.FAILED else [],
+                            extra={"loaded": loaded, "why": st})
+        return run, calls
+
+    H, B = "h" * 40, "b" * 40
+
+    def test_green_runs_once(self):
+        run, calls = self.runner({self.H: T.PASSED})
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run).status, T.PASSED)
+        self.assertEqual(calls, [(self.H, False)])
+
+    def test_unrunnable_is_never_red_and_records_nothing(self):
+        run, calls = self.runner({self.H: T.UNRUNNABLE})
+        rec = mock.Mock()
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, record=rec).status, T.UNRUNNABLE)
+        self.assertEqual(len(calls), 1)
+        rec.assert_not_called()
+
+    def test_red_on_the_base_too_is_main_and_not_blamed(self):
+        run, calls = self.runner({self.H: T.FAILED, self.B: T.FAILED})
+        rec = mock.Mock()
+        o = RUN.judge(chk(name="c"), self.H, self.B, runner=run, record=rec)
+        self.assertEqual((o.status, o.note), (RUN.BLOCKED, "blocked-by-main:c"))
+        rec.assert_not_called()
+
+    def test_the_base_run_is_shared_through_the_lanes_store(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d))
+        os.makedirs(os.path.join(d, "lanes"))
+        lock = open(os.path.join(d, "lanes", "repo.lock"), "a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        REC.new_nonce("repo", d)
+        store = REC.Store("repo", lock, d)
+        run, calls = self.runner({self.H: T.FAILED, self.B: T.FAILED})
+        RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-1")
+        RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-2")
+        self.assertEqual(calls.count((self.B, False)), 1)     # the second job read the lane's base run
+        self.assertIsNotNone(store.get("repo-1", "c", self.H))
+
+    def test_a_red_under_load_gets_one_rerun_alone(self):
+        run, calls = self.runner({(self.H, False): T.FAILED, (self.H, True): T.PASSED, self.B: T.PASSED},
+                                 loaded=True)
+        o = RUN.judge(chk(), self.H, self.B, runner=run)
+        self.assertEqual((o.status, o.note[:5]), (T.PASSED, "flaky"))
+        self.assertEqual(calls, [(self.H, False), (self.B, False), (self.H, True)])
+
+    def store(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d))
+        os.makedirs(os.path.join(d, "lanes"))
+        lock = open(os.path.join(d, "lanes", "repo.lock"), "a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        REC.new_nonce("repo", d)
+        return REC.Store("repo", lock, d)
+
+    def test_a_base_red_under_load_is_rerun_alone_and_only_the_rerun_is_shared(self):
+        store = self.store()
+        calls = []
+
+        def run(check, tree, where, alone=False, **kw):
+            calls.append((tree, alone))
+            st = T.PASSED if (tree, alone) == (self.B, True) else T.FAILED
+            return T.Result(check=check.name, tree=tree, status=st, extra={"loaded": not alone, "why": st})
+        o = RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-1")
+        self.assertEqual(calls[:3], [(self.H, False), (self.B, False), (self.B, True)])
+        self.assertNotEqual(o.status, RUN.BLOCKED)                # main is green alone, so the red is not main's
+        self.assertEqual(store.base("c", self.B).status, T.PASSED)  # the loaded red was never shared
+
+    def test_a_check_the_base_lacks_is_never_run_on_the_base_and_its_red_is_the_diffs(self):
+        run, calls = self.runner({self.H: T.FAILED, self.B: T.FAILED})
+        rec = mock.Mock()
+        o = RUN.judge(chk(), self.H, self.B, runner=run, record=rec, on_base=False)
+        self.assertEqual(o.status, T.FAILED)
+        self.assertNotIn((self.B, False), calls)
+        rec.assert_called_once()
+
+    def test_run_plan_skips_the_base_for_a_check_or_run_file_the_base_lacks(self):
+        from test_plan import Repo
+        r = Repo(self)
+        head = r.commit("head", {"core/tests/LANDING.toml": __import__("test_plan").CORE_MANIFEST
+                                 + '\n[[check]]\nname = "new"\nrun = "tests/new.sh"\nclass = "hermetic"\n',
+                                 "core/tests/new.sh": "exit 1\n", "core/bin/a": "#!/bin/sh\nexit 1\n"})
+        m = M.widen(M.load(r.root, r.base), M.load(r.root, head, strict=False))
+        base_m = M.load(r.root, r.base)
+        self.assertFalse(RUN.runs_on_base(r.root, r.base, base_m, "new"))     # not in the base manifest
+        self.assertTrue(RUN.runs_on_base(r.root, r.base, base_m, "a"))        # bin/a is there
+        self.assertFalse(RUN.runs_on_base(r.root, r.base, base_m, "e2e-x"))   # tests/e2e/x.sh is not
+        self.assertTrue(RUN.runs_on_base(r.root, r.base, base_m, "docs-lint"))  # no run file to miss
+        run, calls = self.runner({head: T.FAILED, r.base: T.FAILED})
+        outs = RUN.run_plan(r.root, m, T.Plan(checks=["new", "e2e-x", "a"]), ["core/tests/new.sh"], head, r.base,
+                            runner=run)
+        self.assertEqual((outs["new"].status, outs["e2e-x"].status), (T.FAILED, T.FAILED))
+        self.assertEqual(outs["a"].status, RUN.BLOCKED)                # a base that has it still compares
+        self.assertEqual(calls.count((r.base, False)), 1)
+
+    def test_a_red_not_under_load_is_not_rerun_and_is_recorded_once(self):
+        run, calls = self.runner({self.H: T.FAILED, self.B: T.PASSED})
+        rec = mock.Mock()
+        o = RUN.judge(chk(), self.H, self.B, runner=run, record=rec)
+        self.assertEqual(o.status, T.FAILED)
+        self.assertNotIn((self.H, True), calls)
+        rec.assert_called_once()
+
+    def test_quarantine_passes_a_matching_red_but_not_for_security_or_a_touched_check(self):
+        rows = [("c", "flaky text")]
+        run, _ = self.runner({self.H: T.FAILED, self.B: T.PASSED})
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, quarantine=rows).note, "quarantined")
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, quarantine=rows, security=True).status,
+                         T.FAILED)
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, quarantine=rows, touched=True).status,
+                         T.FAILED)
+
+    def test_run_plan_derives_security_and_touched_from_the_manifest(self):
+        m = M.Manifest(checks={"guard": chk(name="guard", paths=["core/bin/guard"]),
+                               "c": chk(name="c", paths=["core/bin/c"])},
+                       cwd={"guard": "", "c": ""},
+                       policy=T.Policy(gate_first=["core/bin/guard"]))
+        plan = T.Plan(checks=["c", "guard", "gone"])
+        run, _ = self.runner({self.H: T.FAILED, self.B: T.PASSED})
+        q = "guard\tflaky text\tw\to\t2099-01-01\nc\tflaky text\tw\to\t2099-01-01\n"
+        with mock.patch.object(REC, "quarantine_rows", return_value=[("guard", "flaky text"), ("c", "flaky text")]):
+            outs = RUN.run_plan(".", m, plan, ["README.md"], self.H, self.B, runner=run, quarantine_text=q)
+            self.assertEqual(outs["c"].note, "quarantined")
+            self.assertEqual(outs["guard"].status, T.FAILED)         # guards a gate-first path
+            self.assertEqual(outs["gone"].status, T.UNRUNNABLE)
+            outs = RUN.run_plan(".", m, plan, ["core/bin/c"], self.H, self.B, runner=run, quarantine_text=q)
+            self.assertEqual(outs["c"].status, T.FAILED)             # the change touches the check
+
+    def test_member_and_laptop_routing(self):
+        c = chk(where=["box", "laptop"])
+        self.assertEqual(RUN.choose_where(c, "ann"), "member:ann")
+        with mock.patch.dict(os.environ, {"LANDER_LAPTOP": "r"}), mock.patch.object(A, "loaded", return_value=True):
+            self.assertEqual(RUN.choose_where(c), "laptop")
+            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "box")
+        with mock.patch.dict(os.environ, {"LANDER_LAPTOP": "r"}), mock.patch.object(A, "loaded", return_value=False):
+            self.assertEqual(RUN.choose_where(c), "box")
+
+
+@unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
+class CheckCommand(Env):
+    MANIFEST = textwrap.dedent('''
+        [[check]]
+        name = "tool"
+        run = "bin/tool | grep -q tool"
+        paths = ["bin/tool"]
+        class = "hermetic"
+
+        [[check]]
+        name = "e2e"
+        run = "true"
+        paths = ["bin/tool"]
+        class = "box"
+    ''')
+
+    def setUp(self):
+        super().setUp()
+        write(self.repo, {"core/tests/LANDING.toml": self.MANIFEST})
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "manifest")
+        git(self.repo, "branch", "base")
+
+    def check(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = CK.cmd_check([self.repo, "--base", "base"])
+        return rc, out.getvalue()
+
+    def test_green_red_and_main_red(self):
+        write(self.repo, {"core/bin/tool": "#!/bin/sh\necho tool again\n"})
+        rc, out = self.check()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("passed   tool", out)
+        self.assertIn("tip      e2e", out)                 # box-class: listed, not run
+        write(self.repo, {"core/bin/tool": "#!/bin/sh\necho FAIL nope\nexit 1\n"})
+        rc, out = self.check()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RED      tool", out)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "break main")
+        git(self.repo, "branch", "-f", "base")
+        write(self.repo, {"core/bin/tool": "#!/bin/sh\necho FAIL still\nexit 1\n"})
+        rc, out = self.check()
+        self.assertEqual(rc, 0, out)                           # red on the base too: main's, said, not held
+        self.assertIn("main-red", out)
+
+
+class Sweep(unittest.TestCase):
+    def rows(self, bwrap, host, tail=""):
+        def run(check, tree, where, **kw):
+            st = bwrap if check.klass != T.HOST else host
+            return T.Result(check=check.name, tree=tree, status=st, extra={"tail": [tail], "why": ""})
+        m = M.Manifest(checks={"x": chk(name="x", klass=T.HOST)}, cwd={"x": ""})
+        return CK.sweep_one(".", m, "x", "t" * 40, True, runner=run)["verdict"]
+
+    def test_the_acceptance_verdicts(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(self.rows(T.PASSED, T.FAILED), "passes-in-bwrap")
+        self.assertEqual(self.rows(T.FAILED, T.PASSED, f"{home}/.venv/bin/python: No such file"), "needs-mount")
+        self.assertEqual(self.rows(T.FAILED, T.PASSED, "tmux: lost server"), "host")
+        self.assertEqual(self.rows(T.FAILED, T.FAILED), "red")
+        self.assertEqual(self.rows(T.UNRUNNABLE, T.UNRUNNABLE), "unrunnable")
+
+
+if __name__ == "__main__":
+    unittest.main()

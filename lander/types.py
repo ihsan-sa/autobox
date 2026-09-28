@@ -301,6 +301,10 @@ class Planner(Protocol):
         """U2, lander/plan.py. Pure: reads the manifest and policy from base_sha (the head may only widen) and
         answers which checks the change reaches. No side effects; `lander plan <repo> <pr>` prints it."""
 
+    def checks(self, repo_root: str, sha: str) -> list:
+        """U2, lander/plan.py. The manifest's [[check]] entries read at `sha`, as Check records, so the lane can
+        hand run() the Check a plan names."""
+
 
 class Runner(Protocol):
     def run(self, check: Check, tree_sha: str, where: str) -> Result:

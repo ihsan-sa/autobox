@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# generated from selftest.sh by split.py; edit selftest.sh and re-run split.py.
+# limit-episode.sh — the stanza "one limit episode, end to end (cc-limit writes the record and the episode down; cc-model and cc-reconcile read them)", run alone on the fixtures it stands on.
+. "$(dirname "$0")/lib.sh"
+. "$(dirname "$SELF")/green.sh"   # this stanza calls what green.sh defines
+# ── fixture: cc main + track creation
+if stanza "cc main + track creation" always; then
+cd ~ && "$B/cc" $REPO >/dev/null 2>&1; sleep 1; tmux list-windows -t main -F '#W' | grep -qx "$REPO" && ok "main window created" || bad "main window"
+"$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
+[ -d ~/.cc/worktrees/$REPO/w1/.cc ] && [ "$(git -C ~/.cc/worktrees/$REPO/w1 symbolic-ref --short HEAD)" = track/w1 ] && ok "worktree on track/w1 with marker" || bad "worktree/branch"
+grep -qxF '.cc/' "$(git -C ~/dev/$REPO rev-parse --path-format=absolute --git-common-dir)/info/exclude" && ok ".cc/ git-excluded" || bad ".cc/ exclusion"
+[ "$("$B/cc-board" get $REPO w1 status)" = running ] && ok "board tracks status" || bad "board status"
+# A TRACK IS CUT FROM THE PROJECT'S BASE, NOT FROM WHATEVER THE REMOTE CALLS ITS DEFAULT. GitHub makes the first branch
+# pushed into a new repository its default, so a workspace's origin/HEAD came to name another project's TRACK, and the
+# next track was cut from that — carrying a whole other project's tree into a fresh repository (2026-09-04). The board
+# records the base and cc-land already lands against it; creation asks the same place.
+( cd ~/dev/$REPO && git checkout -q -b other && echo carpet > carpet.txt && git add -A && git commit -qm "another project's tree" \
+  && git push -q origin other:track/other && git checkout -q main && git branch -q -D other ) >/dev/null 2>&1
+git -C ~/dev/$REPO fetch -q origin; git -C ~/dev/$REPO symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/track/other
+"$B/cc" $REPO w9 >/dev/null 2>&1; sleep 1
+{ [ ! -e ~/.cc/worktrees/$REPO/w9/carpet.txt ] && git -C ~/.cc/worktrees/$REPO/w9 merge-base --is-ancestor origin/main HEAD; } \
+  && ok "a new track is cut from the board's base even when origin/HEAD names a track branch" \
+  || bad "track w9 was cut from origin/HEAD: another project's tree came with it"
+git -C ~/dev/$REPO symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+fi
+# ── fixture: checkpoint hook
+if stanza "checkpoint hook" always; then
+echo hi > ~/.cc/worktrees/$REPO/w1/a.txt; ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" )
+git -C "$T/remote.git" branch | grep -q track/w1 && ok "checkpoint committed + pushed track branch" || bad "checkpoint push"
+echo junk > ~/dev/$REPO/junk.txt; ( cd ~/dev/$REPO && "$B/cc-checkpoint" ); git -C ~/dev/$REPO status --short | grep -q junk && ok "checkpoint no-op on primary worktree" || bad "primary worktree touched!"
+# H1: a session that repoints HEAD at the default branch must not get its work committed+pushed there
+wt=~/.cc/worktrees/$REPO/w1; m0=$(git -C "$T/remote.git" rev-parse main)
+( cd "$wt" && git symbolic-ref HEAD refs/heads/main && echo a > a.txt && "$B/cc-checkpoint" )
+[ "$(git -C "$T/remote.git" rev-parse main)" = "$m0" ] && [ -s "$wt/.cc/checkpoint.err" ] && ok "checkpoint refuses a HEAD repointed at main (remote main untouched)" || bad "checkpoint pushed a rewritten HEAD!"
+( cd "$wt" && git symbolic-ref HEAD refs/heads/track/w1; rm -f a.txt "$wt/.cc/checkpoint.err" )
+printf 'x\n' > "$wt/.env.local"; ( cd "$wt" && "$B/cc-checkpoint" )
+[ -s "$wt/.cc/checkpoint.err" ] && ! git -C "$wt" log -1 --name-only 2>/dev/null | grep -q '\.env\.local' && ok "checkpoint refuses secret-looking files (.env.local)" || bad "secret committed"
+rm -f "$wt/.env.local" "$wt/.cc/checkpoint.err"
+touch "$wt/.cc/push.err"; lsout=$("$B/cc" ls 2>/dev/null)   # capture, don't pipe: grep -q would SIGPIPE cc and pipefail would call that a failure
+grep -q 'push!' <<<"$lsout" && ok "cc ls surfaces a failed push" || bad "push.err invisible"; rm -f "$wt/.cc/push.err"
+# ── the lease. 2026-08-31: a track rebased its own branch, the plain push was rejected non-fast-forward, and it
+# finished green with everything committed and NO PR — only the watchdog saw it. A track branch has exactly one
+# writer, so its own rewrite has to land; a write it did NOT make has to stop it dead, and out loud.
+echo pre > "$wt/pre.txt"; ( cd "$wt" && "$B/cc-checkpoint" )   # a commit of OUR OWN to rewrite below: later cases still read the branch this suite built above
+( cd "$wt" && git commit -q --amend -m "rewritten by a rebase" )   # what a rebase leaves behind: a diverged branch
+echo rebased > "$wt/b.txt"; ( cd "$wt" && "$B/cc-checkpoint" )
+{ [ "$(git -C "$T/remote.git" rev-parse track/w1)" = "$(git -C "$wt" rev-parse HEAD)" ] && [ ! -f "$wt/.cc/push.err" ]; } \
+  && ok "checkpoint pushes a branch this worktree rebased — the lease holds, no non-fast-forward dead end" || bad "a rebased branch never reached the remote"
+git clone -q "$T/remote.git" "$T/foreign" 2>/dev/null   # somebody ELSE writes to that branch: the one case the lease exists for
+( cd "$T/foreign" && git config user.email o@o && git config user.name o && git checkout -q track/w1 \
+  && echo not-ours > f.txt && git add -A && git commit -qm "a write this track did not make" && git push -q origin track/w1 )
+fw=$(git -C "$T/remote.git" rev-parse track/w1)
+( cd "$wt" && git commit -q --amend -m "and this track rebases again" )   # diverged too, so a plain push could not have landed either
+echo more > "$wt/c.txt"; ( cd "$wt" && "$B/cc-checkpoint" )
+[ "$(git -C "$T/remote.git" rev-parse track/w1)" = "$fw" ] && ok "a foreign write is NOT overwritten — the lease refuses rather than force" || bad "the lease clobbered somebody else's commit"
+{ grep -q 'push refused' "$wt/.cc/push.err" && grep -q '^STATUS: BLOCKED: push refused' ~/.cc/state/$REPO/w1/progress.md \
+  && "$B/cc-board" show $REPO 2>/dev/null | grep -q 'push refused'; } \
+  && ok "...and says so in all three places at once: push.err (cc ls), the journal (STATUS: BLOCKED stops the loop) and the board" \
+  || bad "the refusal was silent somewhere — err=$(grep -c refused "$wt/.cc/push.err" 2>/dev/null) journal=$(grep -c 'STATUS: BLOCKED' ~/.cc/state/$REPO/w1/progress.md 2>/dev/null) board=$("$B/cc-board" show $REPO 2>/dev/null | grep -c 'push refused')"
+echo again > "$wt/c2.txt"; ( cd "$wt" && "$B/cc-checkpoint" )   # the hook fires again next turn (with work, or it never reaches the push) and the branch is still blocked
+[ "$(grep -c '^STATUS: BLOCKED: push refused' ~/.cc/state/$REPO/w1/progress.md)" = 1 ] && ok "a hook firing every turn does not spam the journal with the same refusal" || bad "duplicate STATUS lines: $(grep -c '^STATUS: BLOCKED' ~/.cc/state/$REPO/w1/progress.md)"
+( cd "$wt" && git fetch -q origin && git rebase -q origin/track/w1 >/dev/null 2>&1 )   # the human answer: take the foreign commit in, then carry on
+echo after > "$wt/d.txt"; ( cd "$wt" && "$B/cc-checkpoint" )
+{ [ "$(git -C "$T/remote.git" rev-parse track/w1)" = "$(git -C "$wt" rev-parse HEAD)" ] && [ ! -f "$wt/.cc/push.err" ]; } \
+  && ok "once the foreign commit is rebased in, the very next checkpoint pushes again (the block is not sticky)" || bad "still blocked after the branch was reconciled"
+rm -rf "$T/foreign"
+# H2: a hand-deleted worktree dir stays registered in git; cc must prune + rebuild it, never stamp a plain dir
+# THE RELAUNCH MUST FIND W1'S TRANSCRIPT. `cc __run` on a started session with no transcript mints a NEW session_id,
+# a second or more later in its own window. The cc-context fixture below reads the id after this, so under load it
+# read the old one and every cc-context case said 'no transcript' (the #463 and #465 landings, 2026-09-12). With a
+# transcript there, the relaunch resumes the id it has; the fixture fills the file in.
+PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"; : > "$PD/$("$B/cc-board" get $REPO w1 session_id).jsonl"
+rm -rf "$wt"; "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
+[ "$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" = "$(readlink -f "$wt")" ] && [ -f "$wt/.cc/track" ] && ok "hand-deleted worktree is rebuilt as a real worktree" || bad "worktree rebuilt as a plain dir"
+# H3: repo/track names are validated — no path traversal, no options as track names
+mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/null 2>&1
+[ $? != 0 ] && [ -d ~/.cc/state/${REPO}_canary ] && ok "cc rm refuses a traversing track name" || bad "cc rm traversal!"
+rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
+"$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
+fi
+# ── top level, between stanzas
+export CC_STATUSLINE_DIR="$T/statusline" CC_CONTEXT_HANDOFF_TOKENS=150000 CC_CTX_BOX_MODEL=   # status-line files under $T, and this box's own model never sizes a fixture
+mkdir -p "$CC_STATUSLINE_DIR"
+PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"    # a transcript for the session the board names for w1 (and see H2: it must exist before a relaunch)
+sid=$("$B/cc-board" get $REPO w1 session_id)
+printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":19000,"output_tokens":5}}}\n' > "$PD/$sid.jsonl"
+# ── top level, between stanzas
+export CC_HANDOFF_DIR="$T/handoff" CC_CTX_RECORDS="$T/ctx" CC_HANDOFF_RETIRE_GRACE=1 CC_HANDOFF_DRAIN=1   # never the box's own records — CC_CTX_RECORDS is
+# ── the stanza
+if stanza "one limit episode, end to end (cc-limit writes the record and the episode down; cc-model and cc-reconcile read them)"; then
+# The seam no selfcheck can reach. `cc-limit resume` writes ~/.cc/state/limit-resumed
+# ("<started>\t<reset>\t<resumed>") and cc-reconcile reads field 1 — the episode's START — to decide that a
+# subagent's mark predates the limit that killed it (cc-pulse used to read it too; it takes the mark's verdict off
+# cc-reconcile's snapshot now, so there is one reader). One bash writer, one python reader, each green against its
+# own literal: move field 1 and both stay green while every mark goes warm again, which is the six hours of rows
+# nobody was doing that this ended.
+EH=$T/ehome; mkdir -p "$EH/.cc/state"; ereset=$(( $(date -u +%s) - 300 ))   # an episode whose reset has passed
+estart=$(( ereset - 7200 ))                                                # …and which began two hours before that
+# A pane id no tmux has: `resume` captures it, gets nothing, and says so — no pane on this box is read or typed
+# at, no timer is armed (CC_LIMIT_ARM=-), and the episode is published anyway, which is the rule ("a pane that
+# moved on by itself still lost its subagents"). Five fields since the review of #264 — see cc-limit record().
+printf '%%99999\t%s/e2e\t%s\t%s\tindep\n' "$REPO" "$ereset" "$estart" > "$EH/.cc/state/limit-interrupted"
+HOME=$EH CC_LIMIT_STAMP="$EH/.cc/state/claude-limit" CC_LIMIT_RECORD="$EH/.cc/state/limit-interrupted" \
+  CC_LIMIT_NUDGED="$EH/.cc/state/limit-nudged" CC_LIMIT_RESUMED="$EH/.cc/state/limit-resumed" \
+  CC_LIMIT_ARM=- "$B/cc-limit" resume >/dev/null 2>&1
+[ "$(cut -f1,2 "$EH/.cc/state/limit-resumed" 2>/dev/null)" = "$(printf '%s\t%s' "$estart" "$ereset")" ] \
+  && ok "cc-limit resume publishes the episode's START and its reset, and drops the record it finished with" \
+  || bad "limit-resumed fields 1,2: [$(cat "$EH/.cc/state/limit-resumed" 2>/dev/null)] want $estart/$ereset"
+erd(){   # what one reader's own limit_started() makes of the file on disk — its code, not a copy of its rule
+  HOME=$EH CC_LIMIT_RESUMED="$EH/.cc/state/limit-resumed" python3 - "$1" <<'PY' || echo "exit $?"
+import importlib.machinery, importlib.util, sys
+s = importlib.util.spec_from_loader("r", importlib.machinery.SourceFileLoader("r", sys.argv[1]))
+m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(int(m.limit_started()))
+PY
+}
+ereads(){ emiss=""; local et eg; for et in "$B/cc-reconcile"; do
+  eg=$(erd "$et"); [ "$eg" = "$1" ] || emiss="$emiss [$(basename "$et"): $eg, want $1]"; done; }
+ereads "$estart"
+[ -z "$emiss" ] && ok "…and the reader reads that same file as that same START — a mark older than it is cold" \
+  || bad "a reader disagrees with the writer:$emiss"
+# The suppressed case, so the two above cannot pass by echoing field 1 back: an episode whose RESET is still ahead
+# has not ended, its subagents are not dead yet, and both readers must decide nothing off it.
+printf '%s\t%s\t%s\n' "$estart" "$(( $(date -u +%s) + 3600 ))" "$(date -u +%s)" > "$EH/.cc/state/limit-resumed"
+ereads 0
+[ -z "$emiss" ] && ok "…and an episode whose reset has NOT passed decides nothing in it" \
+  || bad "a reader acted on a limit that is still standing:$emiss"
+# The record has a second reader: cc-model, which counts a row tagged `indep` as the second run that hit the limit
+# and moves every session to the fallback on it (review of #264). Same seam, same risk — cc-limit writes the tag,
+# cc-model tests for it — so its own function is lifted out of the file and run over a record in that format. An
+# empty extraction (the function reshaped past the range below) is not a command, so the case goes red, not quiet.
+sed -n '/^lim_interrupted(){/,/limit-interrupted" 2>\/dev\/null; }$/p' "$B/cc-model" > "$EH/limfn.sh"
+elim(){ ( now=$(date -u +%s); ST="$EH/.cc/state"; . "$EH/limfn.sh" && lim_interrupted ) ; echo $?; }
+eahead=$(( $(date -u +%s) + 3600 ))
+printf '%%99999\t%s/e2e\t%s\t%s\tindep\n' "$REPO" "$eahead" "$estart" > "$EH/.cc/state/limit-interrupted"
+[ "$(elim)" = 0 ] && ok "…and cc-model reads the same record: a row cc-limit tagged indep is the second run that hit the limit" \
+  || bad "cc-model did not read the indep tag cc-limit writes"
+printf '%%99999\t%s/e2e\t%s\t%s\tworking\n' "$REPO" "$eahead" "$estart" > "$EH/.cc/state/limit-interrupted"
+[ "$(elim)" = 1 ] && ok "…and an untagged row is no witness at all: it is the stamp agreeing with itself, which is the 09-04 regression" \
+  || bad "cc-model counted a record that is not an independent sighting"
+rm -rf "$EH"
+fi
+e2e_end
+# recurring-defect-ok: pause-hold-missing — a test of cc on a fixture repo; the pause check is the tool's, not the stanza's
+# recurring-defect-ok: held-files-unchecked — a test of cc on a fixture repo; held_files is checked in the tool it drives
