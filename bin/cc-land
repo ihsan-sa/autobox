@@ -41,7 +41,8 @@
                                                   read at the base; no list, nothing ordinary), into the default
                                                   branch, files disjoint from each other —
                                                   land as ONE BATCH, however many are ready (one too): their warms
-                                                  side by side (--warm, WARM_SLOTS at once; a worker green on the head
+                                                  side by side (--warm, WARM_SLOTS at once, none started while the
+                                                  1-minute load is above twice the cores; a worker green on the head
                                                   is spent there for 48 h), each member merged the
                                                   moment its own warm ends, one merge at a time, with a `stages` line
                                                   in queue.log (waited, warm, merge, total), then ONE suite on the
@@ -57,7 +58,8 @@
                                                   the base since the batch began (the last is always run: green there
                                                   reverts nobody), and the breaker is REVERTED and told so (its PR,
                                                   its thread, the seat). A lane cut off before that suite, or a suite
-                                                  whose process died, leaves a note the next sweep resumes; one
+                                                  whose process died, leaves a note the next sweep resumes (a
+                                                  suite dead twice the lane runs itself, install and all); one
                                                   with a NEWER batch's suite pending stops before its next run and
                                                   leaves its record, and the newer folds its merges into its own, so
                                                   one suite runs on both (never two in a row behind a flock). A job
@@ -247,6 +249,19 @@ GATE_DECL = ("core/tests/gates", "tests/gates")
 GATE_FIRST_LIST = ("core/tests/gate-first", "tests/gate-first")   # paths that keep every gate BEFORE the merge, read at the base; no list = nothing is ordinary
 WARM_SLOTS = max(1, int(os.environ.get("CC_LAND_WARM_SLOTS") or 4))   # how many of a batch's warms run at once
 BATCH_MAX = max(1, int(os.environ.get("CC_LAND_BATCH") or 30))       # …and how many PRs one batch takes at most
+WARM_LOAD = 2        # no new warm starts while the 1-minute load is above this many times the cores (warm_all)
+WARM_HOLD_POLL = 30  # …and how often, in seconds, a held warm looks at the load again
+
+
+def load_high():
+    """(load, ceiling) when the box's 1-minute load is ABOVE WARM_LOAD × the cores, else None — and None when the box will not say. warm_all starts no new warm while it answers. check-extra and check.sh went red at load (2026-09-27: red runs took a median 2,434 s at mean load 100, green ones 169 s at 29.5)."""
+    try:
+        one = os.getloadavg()[0]
+    except OSError:
+        return None
+    top = WARM_LOAD * (os.cpu_count() or 1)
+    # Brief: "Don't start a new gate warm while the 1-minute load is above twice the core count; wait instead."
+    return (one, top) if one > top else None
 
 
 def gate_slots():
@@ -4328,6 +4343,7 @@ def run_job(path, job):
             os.unlink(path)
         return text
     job["attempts"], job["at"] = job.get("attempts", 0) + 1, stamp()
+    job.pop("kept_at", None)                   # only a keep below writes it again (the lane's retry_due reads it)
     write_atomic(path, job)                    # counted before anything irreversible: a kill mid-merge is still a try
     stage_event(repo, pr, "lane", attempt=job["attempts"])
     # re_review: the owner's 👍 on a protected PR at the review-budget wall buys ONE read (cmd_queue), spent by the
@@ -4423,7 +4439,7 @@ def run_job(path, job):
     cap = 2 if L.stopped == "gates" and L.red_box else LAND_TRIES
     if retry and job["attempts"] < cap:
         # Kept, so the next sweep re-drives it; the not_before goes with the try, or a spent reset would be read as the schedule; the stage is the step that stopped.
-        job_set(path, job, last=f"{L.stopped}: {L.why}"[:400], stage=L.stopped, not_before=None)
+        job_set(path, job, last=f"{L.stopped}: {L.why}"[:400], stage=L.stopped, not_before=None, kept_at=stamp())
         return (f"[{repo}] {L.what()}: {L.stopped} failed on try {job['attempts']} of {cap} — "
                 f"kept for the next sweep")
     L.watched = handed_back(L, rc)
@@ -4814,10 +4830,14 @@ def spawn_warm(repo, pr, log, path):
 
 
 def warm_all(repo, batch, on_done=None):
-    """Phase 1: every member's warm — `<this> <repo> <pr> --warm`: the worker's green, the static gates on the merge, the read beside them, no merge — WARM_SLOTS at a time, each a process of its own (spawn_warm) whose output is a log under the run root, its outcome written on the job by the warm itself (warm_done). Each warm's start goes on its job first (`warm_from`, for finish's stage line). Returns one line per member. `on_done(path, job, files)` is called for each member as ITS warm ends, while the others still run: the merge pass takes a member the moment it is ready instead of waiting for the slowest warm (a warm with no worker green runs the suite, ~35 min under load, and held every other member of its batch that long on 2026-09-25). A warm that will not start, or dies without writing, leaves the job unwarmed, and the merge pass runs its gates as they always were."""
-    lines, running, todo = [], [], list(batch)
+    """Phase 1: every member's warm — `<this> <repo> <pr> --warm`: the worker's green, the static gates on the merge, the read beside them, no merge — WARM_SLOTS at a time, and none started while the load is high (load_high: the warm waits, the ones running go on), each a process of its own (spawn_warm) whose output is a log under the run root, its outcome written on the job by the warm itself (warm_done). Each warm's start goes on its job first (`warm_from`, for finish's stage line). Returns one line per member. `on_done(path, job, files)` is called for each member as ITS warm ends, while the others still run: the merge pass takes a member the moment it is ready instead of waiting for the slowest warm (a warm with no worker green runs the suite, ~35 min under load, and held every other member of its batch that long on 2026-09-25). A warm that will not start, or dies without writing, leaves the job unwarmed, and the merge pass runs its gates as they always were."""
+    lines, running, todo, held = [], [], list(batch), False
     while todo or running:
-        while todo and len(running) < WARM_SLOTS:
+        high = load_high() if todo and len(running) < WARM_SLOTS else None
+        if high and not held:             # one line per hold, not per look
+            ledger(f"warm-held {repo} load={high[0]:.1f} above {high[1]:g} — {len(todo)} warm(s) wait for it to fall")
+        held = bool(high)
+        while todo and len(running) < WARM_SLOTS and not high:
             path, job, files = todo.pop(0)
             log = f"{run_root()}/warm-{repo}-{job['pr']}.log"
             now = read_json(path)
@@ -4847,6 +4867,8 @@ def warm_all(repo, batch, on_done=None):
                 on_done(path, job, files)     # the merge runs here, and the warms still running go on beside it
         if running:
             time.sleep(2)
+        elif todo:
+            time.sleep(WARM_HOLD_POLL)        # nothing running and the load too high to start one: wait, then look again
     return lines
 
 
@@ -5376,14 +5398,23 @@ def reverts_since(root, sha, tip):
 
 
 def resume_suites(repo):
-    """A suite record whose process is gone (no pid, or a dead one) is a batch's suite that never spoke: start it again beside the lane. Returns the lines."""
+    """A suite record whose process is gone (no pid, or a dead one) is a batch's suite that never spoke: start it again beside the lane, once. Gone a second time (`gone` counts it on the record), the lane runs it ITSELF (run_suite_record): the suite, and on green the install, whose deploy job this lane takes on its next look (install_beside finds the lane's flock held). Returns the lines."""
     lines = []
     for path, rec in suites_pending(repo):
         if rec.get("pid") and pid_alive(rec["pid"]):
             continue
-        ledger(f"batch-suite-resume {repo} {rec.get('bid', '?')} — its process is gone")
+        gone = (rec.get("gone") if type(rec.get("gone")) is int else 0) + 1
         with contextlib.suppress(OSError):
-            write_atomic(path, {k: v for k, v in rec.items() if k != "pid"})
+            write_atomic(path, dict({k: v for k, v in rec.items() if k != "pid"}, gone=gone))
+        # Brief: "After a second 'process gone' for one suite, stop relaunching it and hand the install to the serial
+        # path, which gates and installs in one job." The suite of 04:02Z on 2026-09-27 was relaunched 26 times and
+        # nothing merged after 03:59Z was installed for 13 h. I think each spawn died with the lane's systemd unit.
+        if gone >= 2:
+            ledger(f"batch-suite-inline {repo} {rec.get('bid', '?')} — its process is gone a second time; the lane "
+                   f"runs the suite and the install itself")
+            lines += run_suite_record(repo, path)
+            continue
+        ledger(f"batch-suite-resume {repo} {rec.get('bid', '?')} — its process is gone")
         lines += spawn_suite(repo, path)
     return lines
 
@@ -5499,7 +5530,7 @@ def land_batch(repo, batch):
 
 
 def run_lane(repo):
-    """Land `repo`'s jobs one at a time, oldest first, under the repo's own flock, re-reading the queue after each so a job queued meanwhile is taken now and not by the next sweep. A job is run once per lane run (keyed by path and queued_at: a kept job waits for its wake, a re-queued one is new) — except one waiting on its fix round, which is taken again each time its FIX_POLL wait is over, so the push it waits for is read by this lane and not hours later by the next (fix_progress). Returns its lines; a lane that finds the flock held stands down, since the holder re-reads the same queue."""
+    """Land `repo`'s jobs one at a time, oldest first, under the repo's own flock, re-reading the queue after each so a job queued meanwhile is taken now and not by the next sweep. A job is run once per lane run (keyed by path and queued_at: a kept job waits for its wake, a re-queued one is new) — except one waiting on its fix round, which is taken again each time its FIX_POLL wait is over, so the push it waits for is read by this lane and not hours later by the next (fix_progress), and one kept for another try, which is taken again RETRY_AFTER after the keep (`kept_at`), so a lane that never ends still re-drives it. Returns its lines; a lane that finds the flock held stands down, since the holder re-reads the same queue."""
     os.makedirs(lane_dir(), exist_ok=True)
     # Every lane holds the queue's old whole-queue flock SHARED: a worker from before the lanes takes it EXCLUSIVE, so
     # the one running when this change deploys finishes its list alone, and never beside a lane of the same repo.
@@ -5535,13 +5566,26 @@ def _run_lane(repo):
         return (bool(fix) and fix.get("over") is None and not stamp() < (j.get("not_before") or "")
                 and (p, j.get("not_before") or "") not in polled)
 
+    def kept(p):
+        return p, (read_json(p) or {}).get("kept_at") or ""
+
+    def retry_due(p):
+        # Brief: "find why a PR that gets a red warm is left with no next step". A job kept for another try (a red
+        # warm spent in the merge pass, a box-caused red) keeps its key in `seen`, so only the lane's END re-drove it
+        # (rearm): one repo's lane ran from 06:43Z past 17:00Z on 2026-09-27, and #738 #739 #742 #743 sat at "lane
+        # attempt=1" all day. It is taken again RETRY_AFTER after it was kept, once per keep (`retried`).
+        j = read_json(p) or {}
+        at = j.get("kept_at") or ""
+        return (bool(at) and j.get("state") != "done" and time.time() - epoch_of(at) >= RETRY_AFTER
+                and not stamp() < (j.get("not_before") or "") and (p, at) not in retried)
+
     def todo():
         # A batch member whose warm found it not ordinary keeps its key in `seen`; its `ordinary` mark is what the
         # next look reads, so it is taken again here — serially, every gate first — and not spun on.
-        return [p for p in lane_jobs(repo) if key(p) not in seen or fix_due(p)
+        return [p for p in lane_jobs(repo) if key(p) not in seen or fix_due(p) or retry_due(p)
                 or ((read_json(p) or {}).get("ordinary") and key(p) in seen_batch)]
 
-    seen_batch, polled, asked = set(), set(), set()
+    seen_batch, polled, asked, retried = set(), set(), set(), set()
 
     while True:
         lock = open(lane_file(repo, "lock"), "w")
@@ -5578,11 +5622,13 @@ def _run_lane(repo):
                     # lane for the whole suite before its merge, which is the wait the batch exists to take away.
                     seen.update(key(p) for p, _, _ in batch)
                     seen_batch.update(key(p) for p, _, _ in batch)
+                    retried.update(kept(p) for p, _, _ in batch)
                     lines += land_batch(repo, batch)
                     continue
                 seen.add(key(left[0]))
                 seen_batch.discard(key(left[0]))   # a demoted member, once run serially, is not looked at again
                 polled.add((left[0], (read_json(left[0]) or {}).get("not_before") or ""))   # …and a fix wait, once asked
+                retried.add(kept(left[0]))                                                  # …and a keep, once retried
                 lines.append(run_one(left[0]))
         finally:
             with contextlib.suppress(OSError):

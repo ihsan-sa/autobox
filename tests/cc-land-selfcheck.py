@@ -6800,8 +6800,9 @@ def selfcheck():
     globals().update(paused=lambda t: False, tier_holds=lambda j: False)   # the box's own pause and tier are not this section's
     # The batch's suite runs beside the lane as a process of its own (spawn_suite); here it runs inline, through the
     # same record, so each case reads what it said. The spawn itself has its own case (14).
-    _ss = spawn_suite
+    _ss, _lh = spawn_suite, load_high
     globals().update(spawn_suite=lambda repo, path: run_suite_record(repo, path))
+    globals().update(load_high=lambda: None)   # the box's own load is not this section's: the hold has its case
     globals().update(LANDQ=tempfile.mkdtemp(prefix="cc-land-selfcheck-opt-"))
     os.makedirs(lane_dir(), exist_ok=True)
     GF = "# the gate-first list\nbin/cc-land\nbin/cc-guard\n.githooks/*\n"
@@ -6937,6 +6938,38 @@ def selfcheck():
               "the warm itself wrote", sum("warm passed" in l for l in lines) == 2
               and any("PR #33: warm stopped at gates" in l and "check.sh" in l for l in lines))
         globals().update(spawn_warm=_spawn, WARM_SLOTS=_slots)
+        # FINDING (2026-09-27): check-extra and check.sh went red at load — red runs a median 2,434 s at mean load 100,
+        # green ones 169 s at 29.5. Brief: "Don't start a new gate warm while the 1-minute load is above twice the core
+        # count; wait instead." Its own fixture: the load is high for three looks, then falls.
+        cores = os.cpu_count() or 1
+        _gl, said = os.getloadavg, []
+        try:
+            for one in (2 * cores + 0.5, 2 * cores, 0.0):
+                os.getloadavg = lambda one=one: (one, one, one)
+                said.append(_lh())
+        finally:
+            os.getloadavg = _gl
+        check("load_high: a 1-minute load ABOVE twice the cores is high; at exactly twice, or under, it is not",
+              said == [(2 * cores + 0.5, 2 * cores), None, None])
+        looks, order[:], live[0] = [], [], 0
+        _lh2, _poll = load_high, WARM_HOLD_POLL
+        globals().update(spawn_warm=lambda repo, pr, log, path: FakeWarm(path, pr), WARM_SLOTS=2, WARM_HOLD_POLL=0.01,
+                         load_high=lambda: looks.append(len(order)) or ((100.0, 2.0 * cores) if len(looks) <= 3 else None))
+        batch = []
+        for pr in (34, 35):
+            write_atomic(job_path("myrepo", pr), {"repo": "myrepo", "pr": pr, "queued_at": stamp(), "attempts": 0})
+            batch.append((job_path("myrepo", pr), read_json(job_path("myrepo", pr)), [f"f{pr}"]))
+        n = open(f"{LANDQ}/queue.log").read().count("warm-held myrepo")
+        try:
+            warm_all("myrepo", batch)
+        finally:
+            globals().update(spawn_warm=_spawn, WARM_SLOTS=_slots, WARM_HOLD_POLL=_poll, load_high=_lh2)
+        check("…a warm does not start while the load is high: three looks at a high load and nothing started, then "
+              "both warms once it fell", looks[:3] == [0, 0, 0] and order == [34, 35])
+        check("…and the hold is ONE queue.log line, not one per look",
+              open(f"{LANDQ}/queue.log").read().count("warm-held myrepo") == n + 1)
+        for pr in (34, 35):
+            os.unlink(job_path("myrepo", pr))
 
         # 4. THE MERGE PASS: one at a time, queue order, each run_one with `batch` on its job so its deploy waits; a
         # member whose warm found it NOT ordinary is left for the serial path; what merged (gh says MERGED, with the
@@ -7644,6 +7677,58 @@ def selfcheck():
             with contextlib.suppress(OSError):
                 os.unlink(job_path("myrepo", pr))
 
+        # FINDING (2026-09-27): seven PRs got "lane attempt=1" after a red warm and nothing more. The warm's red was
+        # KEPT for another try, but its key stayed in the lane's `seen`, and one repo's lane ran from 06:43Z past 17:00Z
+        # without ending, so nothing re-drove it. Now a kept job is taken again RETRY_AFTER after the keep. Its own
+        # fixture: #58 is kept by its first run, then #59 lands, and `ago` has passed on the keep by its end.
+        def kept_lane(ago):
+            landed = []
+            write_atomic(job_path("myrepo", 58), {"repo": "myrepo", "pr": 58, "queued_at": "2026-09-27T08:00:00Z",
+                                                  "attempts": 0})
+            write_atomic(job_path("myrepo", 59), {"repo": "myrepo", "pr": 59, "queued_at": "2026-09-27T08:00:01Z",
+                                                  "attempts": 0})
+
+            def rj_stub(path, job):
+                landed.append(job.get("pr"))
+                if job.get("pr") == 58 and landed.count(58) == 1:
+                    job_set(path, job, attempts=1, stage="gates", last="gates: check-extra.sh red", kept_at=stamp())
+                    return "kept for the next sweep"
+                if job.get("pr") == 59:          # #59's landing is the long one: `ago` passes on #58's keep meanwhile
+                    j = read_json(job_path("myrepo", 58)) or {}
+                    write_atomic(job_path("myrepo", 58), dict(j, kept_at=stamp(time.time() - ago)))
+                os.unlink(path)
+                return "landed"
+            _rj, _bo = run_job, batch_of
+            globals().update(run_job=rj_stub, batch_of=lambda repo, paths: [])
+            try:
+                t = threading.Thread(target=lambda: quiet(run_lane, "myrepo"), daemon=True)
+                t.start(); t.join(20)
+            finally:
+                globals().update(run_job=_rj, batch_of=_bo)
+            return landed, not t.is_alive()
+        landed, ended = kept_lane(ago=RETRY_AFTER + 60)
+        check("a job kept RETRY_AFTER ago is taken again by the SAME live lane, after the job behind it: #58 kept, "
+              "#59 lands, #58's second try runs", landed == [58, 59, 58] and ended
+              and not os.path.exists(job_path("myrepo", 58)))
+        landed, ended = kept_lane(ago=0)
+        check("…but one kept just now is left for its RETRY_AFTER wait (the rearm), and the lane ends",
+              landed == [58, 59] and ended and (read_json(job_path("myrepo", 58)) or {}).get("stage") == "gates")
+        os.unlink(job_path("myrepo", 58))
+        # …and a kept job the lane cannot act on (parked: run_one stands down, the keep untouched) is taken once for
+        # that keep, never spun on.
+        write_atomic(job_path("myrepo", 58), {"repo": "myrepo", "pr": 58, "queued_at": "2026-09-27T08:00:00Z",
+                                              "attempts": 1, "stage": "gates", "kept_at": stamp(time.time() - RETRY_AFTER - 60)})
+        taken, _bh = [], box_hold
+        globals().update(box_hold=lambda job: taken.append(job.get("pr")) and "" or "myrepo is parked")
+        try:
+            t = threading.Thread(target=lambda: quiet(run_lane, "myrepo"), daemon=True)
+            t.start(); t.join(20)
+        finally:
+            globals()["box_hold"] = _bh
+        check("…while a kept job the lane cannot act on (parked) is taken once for that keep and the lane ends — "
+              "no spin", not t.is_alive() and 1 <= len(taken) <= 3)
+        os.unlink(job_path("myrepo", 58))
+
         # 12. A batch member's own deploy step waits for the batch, and its card says so.
         L = fresh(pr=7)
         L.batch = "b1"
@@ -7802,6 +7887,23 @@ def selfcheck():
                   deploy_due("myrepo") == "" and not os.path.exists(job_path("myrepo", "deploy")))
             for b in ("b16", "b17"):
                 os.unlink(suite_path("myrepo", b))
+            # FINDING (2026-09-27): the suite of 04:02Z was relaunched 26 times ("its process is gone") and nothing
+            # merged after 03:59Z was installed. Brief: "After a second 'process gone' for one suite, stop relaunching
+            # it and hand the install to the serial path, which gates and installs in one job." Its own record.
+            spawned.clear(); handed.clear()
+            write_atomic(suite_path("myrepo", "b19"), {"repo": "myrepo", "bid": "b19", "merged": CODE, "pid": 2 ** 22 + 7})
+            resume_suites("myrepo")
+            rec = read_json(suite_path("myrepo", "b19")) or {}
+            check("a suite gone ONCE is spawned again beside the lane, and the record counts it",
+                  spawned == [suite_path("myrepo", "b19")] and not handed and rec.get("gone") == 1)
+            write_atomic(suite_path("myrepo", "b19"), dict(rec, pid=2 ** 22 + 7))   # …and that spawn died too
+            n = open(f"{LANDQ}/queue.log").read().count("batch-suite-inline myrepo b19")
+            lines = resume_suites("myrepo")
+            check("…gone a SECOND time it is not spawned again: the lane runs the suite itself (after_batch on its "
+                  "merges, which installs on green), the record goes, and one queue.log line says so",
+                  spawned == [suite_path("myrepo", "b19")] and handed == [(CODE, CODE[-1][1], suite_path("myrepo", "b19"))]
+                  and lines == ["the suite spoke"] and not os.path.exists(suite_path("myrepo", "b19"))
+                  and open(f"{LANDQ}/queue.log").read().count("batch-suite-inline myrepo b19") == n + 1)
             check("the suite's own subcommand refuses a record outside the queue",
                   quiet(cmd_batch_suite, ["myrepo", "/tmp/myrepo.x.suite"]) == 2)
         finally:
@@ -8080,7 +8182,7 @@ def selfcheck():
     finally:
         os.access = REAL_ACCESS
         shutil.rmtree(LANDQ, ignore_errors=True)
-        globals().update(LANDQ=_oq, OPTIMISTIC=False, paused=_pz, tier_holds=_th, spawn_suite=_ss)
+        globals().update(LANDQ=_oq, OPTIMISTIC=False, paused=_pz, tier_holds=_th, spawn_suite=_ss, load_high=_lh)
         globals().update(REAL)
 
     # INDEX-AT-WRITE: a root record is in the library's index the moment write_atomic returns — `cc-lib ask --object
