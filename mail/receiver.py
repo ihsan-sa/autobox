@@ -63,11 +63,15 @@ held mail the only word its sender gets until a person decides — and it is wri
   cc-mail show <id>                         one mail's message.json on stdout
   cc-mail selfcheck                         tests; own fixtures, no network, no live server, no config of the box's
   cc-mail send --json FILE                  mail somebody the box is NOT replying to. FILE (`-` = stdin) is one
-                                            JSON object: {"to": "A" or ["A","B"], "subject": "S", "body": "TEXT",
+                                            JSON object: {"to": "A" or ["A","B"], "bcc": "C" or ["C","D"],
+                                            "subject": "S", "body": "TEXT",
                                             "attachments": ["/abs/path", ...], "thread": "<chat_id>/<thread_ts>",
                                             "html": "<html>…", "images": ["/abs/fig.png", ...]}
-                                            — those seven keys and no others; all but to, subject and body may
-                                            be left out. `html` makes the mail multipart/alternative with the
+                                            — those eight keys and no others; all but to, subject and body may
+                                            be left out. `bcc` is a blind copy: each address is checked against
+                                            the verified list like `to` (one that is not refuses the whole
+                                            mail), it is delivered to, and no header of the mail names it; the
+                                            sent copy keeps it (SENT MAIL, below). `html` makes the mail multipart/alternative with the
                                             body as its plain-text fallback, and each of `images` is shown in
                                             the HTML as cid:<its file name> (.png/.jpg/.gif), under the same
                                             rules and cap as an attachment. Without html the mail is text. Every file named is attached, or the mail is not sent
@@ -79,7 +83,7 @@ held mail the only word its sender gets until a person decides — and it is wri
                                             mail went, stderr and exit 1 when it did not, exit 2 when the ask
                                             itself was malformed. From a session with a channel, or with a
                                             thread, the line ends with where the mail's thread is
-  cc-mail send --to A[,B] --subject S [--body TEXT] [--thread <chat_id>/<thread_ts>]
+  cc-mail send --to A[,B] [--bcc C[,D]] --subject S [--body TEXT] [--thread <chat_id>/<thread_ts>]
                                             the same with no files: the body is --body, or stdin without it
 
 SENDING IS THE ONLY THING HERE THAT IS NOT THE SERVER'S. `send` runs in the terminal it was typed in, talks to
@@ -195,7 +199,8 @@ a reply (outbound.send) or one it starts (outbound.send_to) — leaves, once the
   with the received shape's id, from, to, cc, subject, message_id, in_reply_to, references, date, text and
   html (always ""), plus: direction "sent"; sent_at, the UTC second, ISO 8601 with a Z; attachments as
   [{name, size, type}] and no bytes; conv, the conversation id a reply answered (""); tag, the tag a started
-  mail asked to be answered at (""); workspace. The body is the text that went, after Slack's markup came off.
+  mail asked to be answered at (""); workspace; bcc, the blind copies a started mail went to ([]), which
+  no header of the mail carries. The body is the text that went, after Slack's markup came off.
   A reader threads it with received mail on message_id / in_reply_to / references and on conv and tag, because
   the relay may put its own Message-ID on the wire. Keeping it is best effort: a disk that refuses the write
   costs the copy and a line in out.log, never the mail. Mail sent before this copy existed has none.
@@ -1177,10 +1182,10 @@ def cmd_show(opt):
 # which costs a few forks in a command a person typed and means an owner's edit is live on the next one.
 SEND_KEYS = ("MAIL_SEND_URL", "MAIL_SEND_SECRET", "MAIL_DOMAIN", "MAIL_SEND_FROM", "MAIL_SEND_ALLOW",
              "MAIL_ALLOW", "MAIL_OUT_PER_HOUR", "MAIL_OUT_PER_DAY", "MAIL_OUT_ROOTS", "MAIL_OUT_MAX_ATTACH_BYTES")
-SEND_JSON_KEYS = ("to", "subject", "body", "attachments", "thread", "html", "images")
+SEND_JSON_KEYS = ("to", "bcc", "subject", "body", "attachments", "thread", "html", "images")
 SEND_USAGE = ("usage: cc-mail send --json FILE   (FILE or `-`: {\"to\", \"subject\", \"body\", \"attachments\": [...], "
               "\"thread\": \"<chat_id>/<thread_ts>\"})\n"
-              "       cc-mail send --to A[,B] --subject S [--body TEXT] [--thread <chat_id>/<thread_ts>]   "
+              "       cc-mail send --to A[,B] [--bcc C[,D]] --subject S [--body TEXT] [--thread <chat_id>/<thread_ts>]   "
               "(body on stdin without --body)")
 # The thread a mail is started from, as the session's `<channel>` tag names it: the chat id (or `#name`) and
 # the thread's ts. Read here so a malformed one is exit 2 with the shape, never a mail with no thread.
@@ -1205,7 +1210,7 @@ def arg(opt, name):
 
 
 def send_ask(opt):
-    """The (to, subject, body, attachments, thread, html, images) a `cc-mail send` asks for, or a str saying what
+    """The (to, subject, body, attachments, thread, html, images, bcc) a `cc-mail send` asks for, or a str saying what
     was wrong with the ask. Two shapes: `--json FILE` — one object, the SEND_JSON_KEYS and no others, so a mistyped
     key (`attachment`, `file`) is refused by name rather than silently dropped — and the flag form, text only.
     `thread` is (chat, ts) or None either way (thread_of).
@@ -1231,6 +1236,11 @@ def send_ask(opt):
             to = ",".join(str(a) for a in to)
         if not str(to or "").strip():
             return "cc-mail send: no \"to\""
+        bcc = doc.get("bcc")
+        if isinstance(bcc, list) and all(isinstance(a, str) for a in bcc):
+            bcc = ",".join(bcc)
+        if bcc is not None and not isinstance(bcc, str):
+            return "cc-mail send: bcc must be an address or a list of them"
         body = doc.get("body")
         if body is not None and not isinstance(body, str):
             return "cc-mail send: body must be a string"
@@ -1245,7 +1255,7 @@ def send_ask(opt):
             return "cc-mail send: html must be a string"
         if not isinstance(pics, list) or not all(isinstance(a, str) and a.strip() for a in pics):
             return "cc-mail send: images must be a list of file paths"
-        return str(to), str(doc.get("subject") or ""), body or "", atts, thread, html or "", pics
+        return str(to), str(doc.get("subject") or ""), body or "", atts, thread, html or "", pics, (bcc or "").strip()
     to, subject = arg(opt, "--to"), arg(opt, "--subject")
     body = opt.get("--body")
     body = "" if body is None or body == "--body" else body
@@ -1258,7 +1268,7 @@ def send_ask(opt):
         if sys.stdin.isatty():
             return "cc-mail send: no body — pass --body TEXT, or pipe one in"
         body = sys.stdin.read()
-    return to, subject, body, [], thread, "", []
+    return to, subject, body, [], thread, "", [], arg(opt, "--bcc")
 
 
 MEMBER_SEND_WAIT = 90   # seconds a workspace waits for the host's answer: the daemon's call to the worker is
@@ -1266,7 +1276,7 @@ MEMBER_SEND_WAIT = 90   # seconds a workspace waits for the host's answer: the d
                         # went as one that did not
 
 
-def send_across(to, subject, body, attachments, thread=None, html="", images=None):
+def send_across(to, subject, body, attachments, thread=None, html="", images=None, bcc=""):
     """`cc-mail send` INSIDE A MEMBER WORKSPACE: the ask, read and checked here exactly as on the host, handed to
     the daemon's member verb `send` over the workspace's socket. Returns (sent?, the one line) — the host's own
     line when it answered, and a line saying the host did not when it did not. Nothing about the mail is
@@ -1278,6 +1288,8 @@ def send_across(to, subject, body, attachments, thread=None, html="", images=Non
         ask["html"] = html
     if images:
         ask["images"] = list(images)
+    if bcc:
+        ask["bcc"] = bcc
     if thread:
         ask["thread"] = {"chat": str(thread[0]), "ts": str(thread[1])}
     try:
@@ -1302,9 +1314,9 @@ def cmd_send(opt):
     if isinstance(ask, str):
         print(ask, file=sys.stderr)
         return 2
-    to, subject, body, attachments, thread, html, images = ask
+    to, subject, body, attachments, thread, html, images, bcc = ask
     if os.environ.get("CC_MEMBER_SANDBOX") == "1":   # inside a boundary: no config, no secret, no worker — the host sends
-        ok, line = send_across(to, subject, body, attachments, thread, html, images)
+        ok, line = send_across(to, subject, body, attachments, thread, html, images, bcc)
         print(line, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -1316,7 +1328,7 @@ def cmd_send(opt):
     # under (the daemon's `mailed` verb). home@ with no thread gets neither, as before.
     ok, line = outbound.send_to({k: cfg(k, "") for k in SEND_KEYS}, to, subject, body, attachments=attachments,
                                 channel=outbound.session_channel(), mirror=mirrored, thread=thread,
-                                html=html, images=images)
+                                html=html, images=images, bcc=bcc)
     print(line, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 

@@ -681,14 +681,15 @@ def call_worker(cfg, from_a, rcpts, raw):
 
 # ---------------------------------------------------------------- the copy of what went
 
-def keep_sent(raw, text, attach=None, conv="", tag="", workspace="", now=None):
+def keep_sent(raw, text, attach=None, conv="", tag="", workspace="", now=None, bcc=None):
     """A COPY OF THE MAIL THAT WENT, in the received store's shape, so a reader can thread a conversation.
 
     Written once the worker has taken the mail and never before: a copy of a mail that did not go would show
     the owner an answer nobody got. The headers are read back off `raw`, the bytes that went, so the copy
     cannot disagree with the mail; `text` is the body as sent. Attachments are named, sized and typed, and
     their bytes are not kept — the file was ours to begin with. Returns the copy's id, or "" when the disk
-    refused it: the mail is already away, so that costs the copy and one log line, nothing more. The shape is
+    refused it: the mail is already away, so that costs the copy and one log line, nothing more. `bcc` is the
+    blind copies the envelope carried, which `raw` never names, so it is the one field not read off it. The shape is
     `cc-mail --help`, SENT MAIL."""
     t = now if now is not None else time.time()
     try:
@@ -707,7 +708,8 @@ def keep_sent(raw, text, attach=None, conv="", tag="", workspace="", now=None):
                "attachments": [{"name": os.path.basename(p), "size": len(d),
                                 "type": mimetypes.guess_type(p)[0] or "application/octet-stream"}
                                for p, d in ([attach] if isinstance(attach, tuple) else attach or [])],
-               "conv": conv or "", "tag": tag or "", "workspace": workspace or ""}
+               "conv": conv or "", "tag": tag or "", "workspace": workspace or "",
+               "bcc": [_norm(a) for a in bcc or [] if a]}
         d = os.path.join(SENTDIR, cid)
         os.makedirs(SENTDIR, mode=0o700, exist_ok=True)
         os.mkdir(d, 0o700)
@@ -875,7 +877,7 @@ COLD_KEY = "cold"       # every cold mail shares one per-hour bucket: see send_t
 
 
 def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace="",
-            html="", images=None):
+            html="", images=None, bcc=None):
     """A MAIL WITH NO MAIL BEHIND IT — the box writing to somebody first. Returns (sent?, one line).
 
     `channel` is the sending session's own channel, or "" — session_channel() read off where the process
@@ -919,6 +921,13 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     its text (a client that shows no HTML shows that) and an image needs an HTML body to sit in. With no `html`
     nothing here changes: the mail is the one part of text it always was.
 
+    A BLIND COPY IS AN ENVELOPE RECIPIENT AND NOTHING ELSE (owner, 2026-09-27: "cc-mail send takes bcc").
+    `bcc` is read like `to`, and each address in it is checked against verified() the same way — one that is
+    not on the list refuses the whole send, naming it. It goes to the worker in the call's recipient list, which
+    is all the worker delivers to, and never into any header of the mail, so nobody who gets it can see it. It
+    is kept in the sent copy's `bcc`, charged the caps like any recipient, and left out of the mirror, so a
+    reply in the mail's thread never goes to it. An address in both `to` and `bcc` is a `to`.
+
     THE LINE IS THE WHOLE ANSWER, either way. This is called from a terminal and its caller prints what it
     says, so every outcome here — off, refused, capped, sent, or delivered to some and not others — is one
     sentence a person can act on, and every one of them is in ~/.cc/mail/out.log as well. There is one attempt
@@ -944,11 +953,15 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     record is never the one a reply names — see build()). A session with no channel gets the same through
     `thread`. An answer to a mail from a channel-less session that named no thread (home@) still arrives at
     the door as a new mail and is routed like one."""
-    rcpts, allowed = [], verified(cfg)
+    rcpts, blind, allowed = [], [], verified(cfg)
     for piece in (to if isinstance(to, (list, tuple)) else re.split(r"[,\s]+", str(to or ""))):
         a = _norm(piece)
         if a and a not in rcpts:
             rcpts.append(a)
+    for piece in (bcc if isinstance(bcc, (list, tuple)) else re.split(r"[,\s]+", str(bcc or ""))):
+        a = _norm(piece)
+        if a and a not in rcpts and a not in blind:
+            blind.append(a)
     subject, body = str(subject or "").strip() or "(no subject)", plain(text)
 
     def refuse(line):
@@ -965,6 +978,11 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     unknown = [a for a in rcpts if a not in allowed]
     if unknown:
         return refuse("%s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW when "
+                      "it is unset)" % clip(unknown[0]))
+    # "every bcc address passes the same verified-list check as to ... a refused bcc refuses the whole send"
+    unknown = [a for a in blind if a not in allowed]
+    if unknown:
+        return refuse("bcc %s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW when "
                       "it is unset)" % clip(unknown[0]))
     paths = [str(p).strip() for p in (attachments or []) if str(p or "").strip()]
     html = str(html or "")
@@ -1005,7 +1023,7 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
                              if why == TOO_BIG else "not a readable regular file under %s" % trees(rec, cfg)))
         inline.append((path, data))
 
-    why = caps(cfg, COLD_KEY, rcpts, now=now)
+    why = caps(cfg, COLD_KEY, rcpts + blind, now=now)
     if why:
         return refuse(why)
     # THE TAG IS THE THREAD'S KEY, minted here because it has to be on the wire before the daemon writes the
@@ -1020,18 +1038,23 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     tag = tag if reply_to else ""          # a tag the mail does not carry is not one the record may index
     raw, mid = build({}, from_a, rcpts, [], body, attach=attach, now=now, subject=subject, reply_to=reply_to,
                      html=html, inline=inline)
-    ok, failed, err = call_worker(cfg, from_a, rcpts, raw)
+    # The headers name `rcpts` only; `blind` is on the envelope and nowhere in `raw`.
+    ok, failed, err = call_worker(cfg, from_a, rcpts + blind, raw)
     if not ok:
         return refuse(err)
 
     refused = {_norm(f.get("to")) for f in failed}
     sent = [a for a in rcpts if a not in refused]
+    sent_bcc = [a for a in blind if a not in refused]
     names = [os.path.basename(p) for p, _ in attach]
-    kept = keep_sent(raw, body, attach=attach, tag=tag, workspace=workspace, now=now) if sent else ""
-    log("%s: sent from=%s to=%s subject=%s%s%s" % (COLD_KEY, from_a, ",".join(sent) or "(none)", clip(subject),
-                                                   " attach=" + ",".join(names) if names else "",
-                                                   " kept=" + kept if kept else ""))
+    kept = keep_sent(raw, body, attach=attach, tag=tag, workspace=workspace, now=now,
+                     bcc=sent_bcc) if sent or sent_bcc else ""
+    log("%s: sent from=%s to=%s%s subject=%s%s%s" % (COLD_KEY, from_a, ",".join(sent) or "(none)",
+                                                     " bcc=" + ",".join(sent_bcc) if sent_bcc else "", clip(subject),
+                                                     " attach=" + ",".join(names) if names else "",
+                                                     " kept=" + kept if kept else ""))
     with_files = (", with %s attached" % ", ".join(names)) if names else ""
+    with_bcc = (", bcc %s" % ", ".join(sent_bcc)) if sent_bcc else ""
     # THE MIRROR, once the mail is away and only when somebody was reached: a thread for a mail nobody got
     # would wait for an answer that cannot come. Neither a channel nor a thread is the home@ case and keeps
     # today's behaviour: no line, and the answer arrives as a new mail.
@@ -1046,5 +1069,5 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
         log("%s: %s" % (COLD_KEY, line))
         # A verified address of ours that Cloudflare still refuses is the owner's runbook to fix, not a bug
         # here, so it is named rather than counted — and the people it DID reach are named beside it.
-        return bool(sent), ("mailed %s%s. %s%s" % (", ".join(sent), with_files, line, tail)) if sent else line
-    return True, "mailed %s from %s%s%s" % (", ".join(sent), from_a, with_files, tail)
+        return bool(sent), ("mailed %s%s%s. %s%s" % (", ".join(sent), with_bcc, with_files, line, tail)) if sent else line
+    return True, "mailed %s%s from %s%s%s" % (", ".join(sent), with_bcc, from_a, with_files, tail)

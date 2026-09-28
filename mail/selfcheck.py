@@ -2888,7 +2888,7 @@ def run():
             json.dump({"to": ALLOWED, "subject": "s", "body": "b", "html": ["no"]}, f)
         bad = r.send_ask({"--json": ask20d})
         k(isinstance(got, tuple) and got[5] == html20d and got[6] == [fig20d]
-          and isinstance(bare, tuple) and bare[5:] == ("", [])
+          and isinstance(bare, tuple) and bare[5:] == ("", [], "")
           and bad == "cc-mail send: html must be a string",
           "`cc-mail send --json` reads html and images, leaves them empty when the ask has none, and refuses a "
           "non-string html by name")
@@ -3754,6 +3754,105 @@ def run():
           "for the host to hold to the workspace's own channel, and an ask without one carries no thread key")
         k(rc_none == 1 and "socket did not answer" in erred_none and "nothing there is listening" in erred_none,
           "…and with nothing listening on the host, exit 1 and a line saying that rather than a hang or a traceback")
+
+    # ------------------------------- 26. a blind copy (owner, 2026-09-27: "cc-mail send takes bcc")
+    # Brief: "every bcc address passes the same verified-list check as to ... a refused bcc refuses the whole send
+    # with the reason. Bcc addresses never appear in any header of the delivered mail, and they are kept in the sent
+    # record." Each case builds its own store and log, and asserts the blind copy that goes and the one that is stopped.
+    with Box(allow=ALLOWED + "," + OTHER) as b:
+        def cold26(worker):
+            return {"MAIL_SEND_URL": worker.url, "MAIL_SEND_SECRET": "s3cret", "MAIL_DOMAIN": "box.example",
+                    "MAIL_SEND_ALLOW": ALLOWED + "," + OTHER}
+
+        def fresh26():
+            shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            shutil.rmtree(outbound.SENTDIR, ignore_errors=True)
+            open(outbound.LOGFILE, "w").close()
+
+        # (a) THE BLIND COPY GOES, AND NO HEADER NAMES IT. A channel's mail, so the mirror runs and can be read too.
+        fresh26()
+        mirrored26 = []
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold26(w), ALLOWED, "the stock report", "numbers", channel="mem",
+                                        bcc=[OTHER.upper()], mirror=lambda m: mirrored26.append(m) or "")
+            call = w.one()
+        heads = "\n".join("%s: %s" % (h, v) for h, v in call["msg"].items())
+        k(ok and call["to"] == [ALLOWED, OTHER] and OTHER in line,
+          "a bcc address is on the worker's recipient list beside `to`, so it is delivered to, and the line names it")
+        k(OTHER not in heads.lower() and "bcc" not in heads.lower() and OTHER.encode() not in call["raw"].lower()
+          and call["msg"]["To"] == ALLOWED,
+          "…and no header of the mail names it — not To, not Cc, no Bcc: header — nor anywhere in the bytes that went")
+        kept26 = os.listdir(outbound.SENTDIR) if os.path.isdir(outbound.SENTDIR) else []
+        cp26 = json.load(open(os.path.join(outbound.SENTDIR, kept26[0], "message.json"))) if len(kept26) == 1 else {}
+        k(cp26.get("to") == [ALLOWED] and cp26.get("bcc") == [OTHER],
+          "…and the sent record keeps it as `bcc`, apart from `to`")
+        k(len(mirrored26) == 1 and mirrored26[0]["to"] == [ALLOWED],
+          "…and the mirror's thread is given the `to` only, so a reply in it never reaches the blind copy")
+        fresh26()
+        with FakeWorker() as w:
+            ok, _ = outbound.send_to(cold26(w), ALLOWED, "s", "b", bcc="%s, %s" % (ALLOWED, ""))
+            call = w.one()
+        k(ok and call["to"] == [ALLOWED],
+          "…an address in both `to` and `bcc` is sent once, as a `to`")
+
+        # (b) A REFUSED BLIND COPY REFUSES THE WHOLE SEND, before the wire, and says which and why.
+        fresh26()
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold26(w), ALLOWED, "s", "b", bcc=[OTHER, STRANGER])
+            k(not ok and ("bcc %s" % STRANGER) in line and "verified destinations" in line and not w.calls
+              and (not os.path.isdir(outbound.SENTDIR) or not os.listdir(outbound.SENTDIR)),
+              "a bcc that is not a verified destination refuses the whole mail by name, nothing reaches the worker "
+              "— not even the `to` or the verified blind copy — and nothing is kept")
+
+        # (c) THE COMMAND READS IT: --bcc on the flag form, "bcc" (a string or a list) in the JSON, a wrong type exit 2's line
+        ask26 = os.path.join(b.tmp, "ask26.json")
+        flag26 = r.send_ask({"--to": ALLOWED, "--bcc": OTHER, "--subject": "s", "--body": "b"})
+        noflag26 = r.send_ask({"--to": ALLOWED, "--subject": "s", "--body": "b"})
+        with open(ask26, "w") as f:
+            json.dump({"to": ALLOWED, "bcc": [OTHER, "third@allowed.example"], "subject": "s", "body": "b"}, f)
+        json26 = r.send_ask({"--json": ask26})
+        with open(ask26, "w") as f:
+            json.dump({"to": ALLOWED, "bcc": 5, "subject": "s", "body": "b"}, f)
+        bad26 = r.send_ask({"--json": ask26})
+        k(isinstance(flag26, tuple) and flag26[7] == OTHER and noflag26[7] == ""
+          and isinstance(json26, tuple) and json26[7] == OTHER + ",third@allowed.example"
+          and bad26 == "cc-mail send: bcc must be an address or a list of them",
+          "`cc-mail send` reads --bcc and a JSON \"bcc\", string or list, leaves it empty without one, and refuses a "
+          "bcc that is neither by name")
+
+        # (d) INSIDE A MEMBER BOUNDARY the blind copy crosses the socket as the ask's `bcc`; the host decides it
+        env26 = {k: "" for k in r.SEND_KEYS if k not in Box.KEYS}
+        env26["CC_MEMBER_SANDBOX"] = "1"
+        saved26 = {k: os.environ.get(k) for k in env26}
+        out26, err26 = sys.stdout, sys.stderr
+        try:
+            os.environ.update(env26)
+            with open(ask26, "w") as f:
+                json.dump({"to": ALLOWED, "bcc": [OTHER], "subject": "s", "body": "b"}, f)
+            with FakeDaemon({"ok": True, "text": "mailed %s, bcc %s from mem@box.example" % (ALLOWED, OTHER)}) as d:
+                sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+                rc26 = r.cmd_send({"--json": ask26})
+                sys.stdout, sys.stderr = out26, err26
+                crossed26 = list(d.asked)
+            with open(ask26, "w") as f:
+                json.dump({"to": ALLOWED, "bcc": STRANGER, "subject": "s", "body": "b"}, f)
+            with FakeDaemon({"ok": False, "error": "bcc %s is not one of the box's verified destinations" % STRANGER}) as d:
+                sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+                rc26_ref = r.cmd_send({"--json": ask26})
+                erred26_ref = sys.stderr.getvalue()
+                sys.stdout, sys.stderr = out26, err26
+        finally:
+            sys.stdout, sys.stderr = out26, err26
+            for k26, v in saved26.items():
+                if v is None:
+                    os.environ.pop(k26, None)
+                else:
+                    os.environ[k26] = v
+        k(rc26 == 0 and crossed26 and crossed26[0]["send"].get("bcc") == OTHER
+          and crossed26[0]["send"].get("to") == ALLOWED,
+          "`cc-mail send` inside a member boundary hands its bcc across the socket as the ask's `bcc`")
+        k(rc26_ref == 1 and ("bcc %s" % STRANGER) in erred26_ref,
+          "…and the host's refusal of an unverified blind copy is the line, on stderr, exit 1")
 
     print("cc-mail selfcheck: %d passed, %d failed" % (n[0] - len(fails), len(fails)))
     return 1 if fails else 0

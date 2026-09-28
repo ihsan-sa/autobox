@@ -7208,12 +7208,14 @@ def run_selfcheck():
             """outbound.send_to as the daemon calls it: records the ask, refuses one address the way the list would."""
             @staticmethod
             def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace="",
-                        html="", images=None):
+                        html="", images=None, bcc=None):
                 sentMS.append({"to": to, "subject": subject, "text": text, "attachments": list(attachments or []),
                                "channel": channel, "workspace": workspace, "thread": thread, "html": html,
-                               "images": list(images or [])})
+                               "images": list(images or []), "bcc": bcc})
                 if to == "stranger@x.example":
                     return False, "stranger@x.example is not one of the box's verified destinations — nothing sent"
+                if "stranger@x.example" in str(bcc or ""):
+                    return False, "bcc stranger@x.example is not one of the box's verified destinations — nothing sent"
                 tail = mirror({"channel": channel, "from": f"{channel}@box.example", "to": [to], "message_id": "<m@x>", "tag": "ab12",
                                "thread": {"chat": thread[0], "ts": thread[1]} if thread else None}) if mirror else ""
                 return True, f"mailed to {to} from {channel}@box.example" + tail
@@ -7241,6 +7243,10 @@ def run_selfcheck():
         n_sent_html = len(sentMS)
         r_send_html_bad = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b", "html": 5}})
         sent_html = list(sentMS)
+        # A BLIND COPY CROSSES TO send_to AS ITS `bcc`, a list joined as `to` is; send_to's refusal of one comes back whole
+        r_send_bcc = ms_req({"send": {"to": "a@x.example", "bcc": ["c@x.example", "d@x.example"], "subject": "s", "body": "b"}})
+        r_send_bcc_ref = ms_req({"send": {"to": "a@x.example", "bcc": "stranger@x.example", "subject": "s", "body": "b"}})
+        sent_bcc = list(sentMS)
         globals()["mail_outbound"] = real_mo_ms
 
         # ---- A DOCUMENT THE WORKSPACE FILES IS FILED OUT HERE (member verb `docs`): cc-docs decides; the handle it is
@@ -7690,6 +7696,11 @@ def run_selfcheck():
           and sent_html[-1]["images"] == [f"{member_dir('alice')}/files/fig.png"]
           and r_send_html_bad.get("ok") is False and "html must be a string" in r_send_html_bad.get("error", "")
           and len(sent_html) == n_sent_html and sent_ms[0]["html"] == "" and sent_ms[0]["images"] == [])
+    check("MEMBER socket: a `bcc` on `send` crosses to send_to as `bcc` (a list joined as `to` is), an ask without one hands "
+          "none, and send_to's refusal of an unverified blind copy comes back as the workspace's error",
+          r_send_bcc.get("ok") and sent_bcc[-2]["bcc"] == "c@x.example,d@x.example" and sent_bcc[-2]["to"] == "a@x.example"
+          and sent_ms[0]["bcc"] == ""
+          and r_send_bcc_ref.get("ok") is False and "bcc stranger@x.example" in r_send_bcc_ref.get("error", ""))
     check("MEMBER socket: a `thread` on `send` is held to the workspace's OWN channels — alice's by id and her track channel "
           "by name cross to send_to as (chat, ts) and the line says where it went; bob's channel and a thread that is not "
           "{chat, ts} are refused before send_to, so a member cannot put a mail's line, or route its answer, elsewhere",
