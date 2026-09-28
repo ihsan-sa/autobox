@@ -64,7 +64,10 @@
                                                   leaves its record, and the newer folds its merges into its own, so
                                                   one suite runs on both (never two in a row behind a flock). A job
                                                   whose PR is closed, or merged and already installed, is dropped,
-                                                  with one queue.log line.
+                                                  with one queue.log line. A deploy job that stops unmended (its
+                                                  tries spent, or a stop no retry mends) notes its span's tip in
+                                                  <repo>.deploy-stopped, and the catch-up does not queue that tip
+                                                  again: origin moving past it, or a person deleting the note, does.
                                                   Every other job — a protected or gate-first path —
                                                   is gated, reviewed, merged and deployed before the next of that repo
                                                   is touched. A job survives a usage-limit review (waits for
@@ -83,7 +86,8 @@
                                                   PR handed back on a verdict or a red gate is WATCHED for HANDED_DAYS:
                                                   a push to its branch re-queues it through the queue's own door;
                                                   a draft or conflicting PR is HELD and looked at every 15 min (a
-                                                  conflict first gets ONE rebase round). The board step closes the
+                                                  conflict first gets ONE rebase round); a held conflict is never
+                                                  warmed for a batch, only looked at, until its branch moves. The board step closes the
                                                   PR's row and every `Closes <row>` its body names, except a row a
                                                   person holds or a track is live on
   cc-land will-review <repo> <pr>                 whether the landing would buy a read of this PR's diff as it stands,
@@ -1253,6 +1257,8 @@ def applied_sha(repo):
 
 def record_applied(repo, sha):
     write_atomic(f"{LANDQ}/{repo}.applied", {"sha": sha, "at": stamp()})
+    with contextlib.suppress(OSError):
+        os.unlink(deploy_stopped_path(repo))   # something installed since: a stopped span's note is behind it
 
 
 _LOCKS, _LOCKS_GUARD = {}, threading.Lock()
@@ -4360,6 +4366,9 @@ def run_job(path, job):
         else:
             rc, L.stopped, L.why = 1, "load", f"cannot read PR #{pr} in {L.root}"
     print(buf.getvalue(), end="", flush=True)
+    if not held and L.stopped != "load" and " conflicts with " in (job.get("held") or ""):
+        job.pop("held")                        # the branch moved off its conflict: a batch may warm it again (ready_job)
+        write_atomic(path, job)
     if job.get("re_review") and getattr(L, "bought", False):
         job.pop("re_review")
         write_atomic(path, job)
@@ -4448,6 +4457,12 @@ def run_job(path, job):
     job["state"], job["result"] = "done", result_of(L, rc, job, tail)
     if retry:
         job["capped"] = True                   # stopped by the try cap and nothing else: a re-queue restarts it (gave_up)
+    if span and rc:
+        # The deploy gave up: its span is noted so the catch-up does not queue the same tip every 15 min (deploy_due).
+        write_atomic(deploy_stopped_path(repo), {"span": list(span), "tip": span[1], "at": stamp(),
+                                                 "why": f"{L.stopped}: {L.why}"[:400]})
+        ledger(f"deploy-stopped {repo} span={span[0][:7]}..{span[1][:7]} — not queued again until origin moves "
+               f"past it or {deploy_stopped_path(repo)} is deleted")
     write_atomic(path, job)                    # decided, on disk, before a word of it is said
     finish(path, job)
     return job["result"]["short"]
@@ -4618,6 +4633,11 @@ def known_repos():
     return ccboard().reals(sorted(n for n in names if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", n)))
 
 
+def deploy_stopped_path(repo):
+    """Where a deploy job that stopped unmended notes its span (run_job): the tip the catch-up must not queue again, since the same span fails the same way (0c6b884..ec0c977 was queued and failed 14 times in 3 h on 2026-09-24). Origin moving past it (a new tip) or a person deleting the file lifts it; an install that succeeds deletes it."""
+    return f"{LANDQ}/{repo}.deploy-stopped"
+
+
 def red_base_path(repo):
     """Where after_batch notes a base tip its suite found red and could not mend: what the catch-up must never install."""
     return f"{LANDQ}/{repo}.red"
@@ -4650,6 +4670,9 @@ def deploy_due(repo, by="the catch-up sweep", tip=""):
         return ""
     if (read_json(red_base_path(repo)) or {}).get("tip") == tip:
         return ""       # the batch's suite found this tip red and said so: a person moves it, not the poll
+    # Brief: "After the give-up, keep the span refused until main moves past it or a person clears it."
+    if (read_json(deploy_stopped_path(repo)) or {}).get("tip") == tip:
+        return ""       # a deploy of this very tip stopped unmended: re-queued, it fails the same way
     if by == "the catch-up sweep" and (os.path.exists(batch_path(repo)) or suites_pending(repo)):
         return ""       # a batch has merged without its suite yet: that suite (batch_suite) installs on green
     write_atomic(job_path(repo, "deploy"),
@@ -4791,11 +4814,12 @@ def gave_up(repo, pr, job):
 
 # ── the batch: ordinary PRs land together, and the suite runs on the base once ───────────────────────
 def ready_job(job):
-    """Whether a PR job could be tried NOW, off the file alone: the same doors run_one asks, without the lock."""
+    """Whether a PR job could be tried NOW, off the file alone: the same doors run_one asks, without the lock. A job held on a conflict is not: warming it spends a suite on a head that cannot merge (one PR was warmed 12 times), so it goes to the serial path, which only reads GitHub's answer (Land.held) until the branch moves and run_job takes the hold off."""
     fix = job.get("fix") or {}
+    # Brief: "A held conflict should wait for a new head."
     return bool(job.get("pr")) and job.get("state") != "done" and not (fix and fix.get("over") is None) \
         and not (stamp() < (job.get("not_before") or "")) and job.get("attempts", 0) < LAND_TRIES \
-        and not box_hold(job)
+        and " conflicts with " not in (job.get("held") or "") and not box_hold(job)
 
 
 def batch_of(repo, paths):

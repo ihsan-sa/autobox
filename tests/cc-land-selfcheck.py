@@ -5178,6 +5178,10 @@ def selfcheck():
                   and open(f"{LANDQ}/queue.log").read().count("held myrepo#7") == n_held + 1)
             kept = dict(read_json(job_path("myrepo", 7)) or {}, not_before="2000-01-01T00:00:00Z")
             write_atomic(job_path("myrepo", 7), kept)
+            # Brief: "A held conflict should wait for a new head" — one PR was warmed 12 times with no route forward.
+            check(f"...{what}, its wait over, is " + ("still ready for a batch: a draft costs no warm to find out"
+                  if what == "a DRAFT" else "NOT ready for a batch: a conflict is only looked at, never warmed, "
+                  "until its branch moves"), ready_job(kept) == (what == "a DRAFT"))
             world["gh pr view"] = (0, json.dumps(FACTS))    # marked ready, or rebased: it can merge now
             quiet(cmd_work, [])
             check(f"...and once {what} can merge, the SAME job lands on its first real try, with all three still "
@@ -6222,6 +6226,36 @@ def selfcheck():
         check("...and a box already on that commit queues nothing — the sweep is silent when there is nothing to "
               "catch up on",
               catchup() == [] and not os.path.exists(job_path("myrepo", "deploy")))
+        # ---- a deploy that GAVE UP is not queued again for the same tip. Forgotten, 0c6b884..ec0c977 was queued by
+        # the catch-up and failed 14 times in 3 h on 2026-09-24, one identical stop post each. Its own fixture.
+        fresh(pr=7)
+        record_applied("myrepo", "aaaaaaa")
+        world["git rev-parse origin/main"] = (0, "bbbbbbb\n")
+        world["git merge --ff-only"] = (1, "fatal: not possible to fast-forward")
+        dep = deploy_due("myrepo")
+        for _ in range(LAND_TRIES + 2):
+            if not os.path.exists(dep):
+                break
+            write_atomic(dep, {k: v for k, v in read_json(dep).items() if k != "not_before"})   # each retry, now
+            quiet(run_one, dep)
+        note = read_json(deploy_stopped_path("myrepo")) or {}
+        check("a deploy job that stops unmended notes its span's tip, and the catch-up then queues nothing for that "
+              "tip (brief: keep the span refused until main moves past it)",
+              not os.path.exists(dep) and note.get("tip") == "bbbbbbb" and note.get("span") == ["aaaaaaa", "bbbbbbb"]
+              and catchup() == [] and not os.path.exists(job_path("myrepo", "deploy")))
+        world["git rev-parse origin/main"] = (0, "ccccccc\n")
+        check("…origin moving past it queues the new span",
+              catchup() == ["myrepo"] and read_json(job_path("myrepo", "deploy"))["span"] == ["aaaaaaa", "ccccccc"])
+        os.unlink(job_path("myrepo", "deploy"))
+        world["git rev-parse origin/main"] = (0, "bbbbbbb\n")
+        os.unlink(deploy_stopped_path("myrepo"))
+        check("…and a person deleting the note lets the same tip be queued again",
+              catchup() == ["myrepo"] and read_json(job_path("myrepo", "deploy"))["span"] == ["aaaaaaa", "bbbbbbb"])
+        os.unlink(job_path("myrepo", "deploy"))
+        write_atomic(deploy_stopped_path("myrepo"), {"tip": "bbbbbbb", "span": ["aaaaaaa", "bbbbbbb"]})
+        record_applied("myrepo", "bbbbbbb")
+        check("…and an install that is recorded takes the note away", not os.path.exists(deploy_stopped_path("myrepo")))
+        del world["git merge --ff-only"]
         # ---- a repo with NO install.sh: the pull is its whole deploy. The applied SHA used to be recorded only
         # AFTER install.sh had run — so where there was none, the Skip came first and nothing was ever written, and
         # every 15-min catch-up found origin past "what is installed", re-pulled, and told the channel it had landed

@@ -22,6 +22,8 @@
 #   · spent 5x what a committed iteration has cost this track, with no commit for two iterations.
 # One of those is normal. Three consecutively is a loop going nowhere, so it is stopped, the board says `blocked`,
 # and the owner is told once with the numbers.
+# ERRORS — two failed iterations in a row stop the track as `errored`. One killed at the 1 h iteration limit (rc=124)
+#   says so in its error line, and is not a failure at all if it committed.
 # WHAT A LEGITIMATE EXPENSIVE JOB LOOKS LIKE HERE, and why it survives: a $25-an-iteration opus worker on a
 # 40-step refactor commits something most iterations and journals every one. Signal 1 needs BOTH to fail;
 # signal 2 needs the model's own summary to repeat verbatim; signal 3 measures it against ITS OWN mean cost
@@ -864,6 +866,25 @@ KILL
       "$lb/cc-loop" lp kl --max-iter 1 ) >/dev/null 2>&1
   t 'an iteration killed at the hour limit logs the spend its transcript shows since it started (not a resumed session'"'"'s older records), marked as priced from it' \
     "$(grep -c 'iter 1 end rc=124 .*cost=\$1.0000~transcript total=\$1.0000' "$lh/.cc/state/lp/kl/loop.log")" 1
+  # ── A TIMED-OUT ITERATION IS NAMED, AND ONE THAT COMMITTED IS NO FAILURE ── each run its own track and fixture: a
+  # claude that dies at the hour limit (rc=124), committing (FK_COMMIT=1) or not. 67 of 513 iterations died this way
+  # with an empty "error (N): " line, and two in a row stopped the track even when both had committed.
+  cat > "$lb/claudeto" <<'TO'
+#!/bin/sh
+[ "$FK_COMMIT" = 1 ] && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m step
+exit 124
+TO
+  chmod +x "$lb/claudeto"
+  for tk in toc ton; do
+    mkdir -p "$lh/.cc/state/lp/$tk" "$lh/.cc/worktrees/lp/$tk"; echo "the task" > "$lh/.cc/state/lp/$tk/task.md"
+    git -C "$lh/.cc/worktrees/lp/$tk" init -q; git -C "$lh/.cc/worktrees/lp/$tk" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claudeto" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+        FK_COMMIT="$([ "$tk" = toc ] && echo 1 || echo 0)" "$lb/cc-loop" lp "$tk" --max-iter 2 --no-extend ) >/dev/null 2>&1
+  done
+  t 'two timed-out iterations that each committed are not failures: no error line, no errored stop' \
+    "$(grep -c 'error (\|2 consecutive failures' "$lh/.cc/state/lp/toc/loop.log")/$(grep -c 'timed out at the 1 h iteration limit (rc=124), but it committed' "$lh/.cc/state/lp/toc/loop.log")" 0/2
+  t '…while two that committed nothing count, each error line naming the timeout, and stop the track as errored' \
+    "$(grep -c 'error ([12]): timed out at the 1 h iteration limit (rc=124) with nothing committed' "$lh/.cc/state/lp/ton/loop.log")/$(grep -c '2 consecutive failures' "$lh/.cc/state/lp/ton/loop.log")" 2/1
   t '…and a finished iteration keeps the cost its own json reports, unmarked' \
     "$(grep -c 'iter 1 end .*cost=\$1.25 total=' "$lh/.cc/state/lp/it/loop.log")" 1
   lrun ro '- committed a step' 1 --max-iter 1 --no-extend
@@ -1275,6 +1296,10 @@ while [ $i -lt "$MAXI" ]; do
   if [[ "$subtype" == error_max_* ]] && [ "$moved" = yes ]; then errs=0; caps=0; log "capped ($subtype) but the iteration produced work — not an error, continuing"
   elif [[ "$subtype" == error_max_* ]]; then caps=$((caps+1)); log "capped ($subtype) with nothing to show ($caps)"
        [ $caps -ge 2 ] && stop 7 "hit its cap" "Two capped iterations with no commits or journal change (\$$spent). Raise --budget/--turns or split the task; log: $LOG"
+  elif [ "$rc" = 124 ] && [ "$before_head" != "$after_head" ]; then errs=0; log "timed out at the 1 h iteration limit (rc=124), but it committed — not counted as a failure"
+       # brief: "don't count a timed-out iteration that committed as a failure"; one that did not is counted below
+  elif [ "$rc" = 124 ]; then errs=$((errs+1)); log "error ($errs): timed out at the 1 h iteration limit (rc=124) with nothing committed"
+       [ $errs -ge 2 ] && stop 5 "errored" "2 consecutive failures; see $LOG"
   elif [ "$rc" != 0 ] || [ "$iserr" = true ]; then errs=$((errs+1)); log "error ($errs): $( { head -c 300 "$out.err" 2>/dev/null; [ -s "$out.err" ] || jq -r '"\(.subtype // "")\ \(.result // "" | tostring)"' "$out" 2>/dev/null | head -c 300; } | tr '\n' ' ')"   # a run that errored in-band leaves .err empty: say why from the json
        [ $errs -ge 2 ] && stop 5 "errored" "2 consecutive failures; see $LOG"
   else errs=0; caps=0; fi
