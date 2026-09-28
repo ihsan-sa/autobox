@@ -739,8 +739,13 @@ def pending(f, state):
     return state == "review" and (f.get("pr_state") or "") == "OPEN" and f["status"] != "waiting"
 
 
-LAND_ARGV = re.compile(r"(?:^|[\s/])cc-land\s+(?:queue\s+)?([A-Za-z0-9_][A-Za-z0-9._-]*)"
+# The old tool's argv, the shim's (same words), or the lander's own: `python3 -P …/core/lander/cli.py queue r 7`
+# and `…/bin/lander queue r 7`. A lane's argv names only its repo; its job files are what say which PR.
+LAND_ARGV = re.compile(r"(?:^|[\s/])(?:cc-land|lander(?:/cli\.py)?)\s+(?:queue\s+)?([A-Za-z0-9_][A-Za-z0-9._-]*)"
                        r"((?:\s+(?:--no-review|--re-review|[0-9]+))+)(?=\s|$)")
+
+
+LAND_IDLE = ("done", "handback", "handed", "query")   # a job's state/stage the lander is no longer working on
 
 
 def pr_number(url):
@@ -749,14 +754,18 @@ def pr_number(url):
 
 
 def landing():
-    """{(repo, pr)} somebody is landing: a job under ~/.cc/state/land/, a work record under land/root/ touched
-    inside BETWEEN_ROUNDS, or a live lander argv naming the PR (a session's prompt quoting it does not count)."""
+    """{(repo, pr)} somebody is landing: a job under ~/.cc/state/land/ that is not at rest with the seat (the lander
+    keeps a job file after it finishes: state done, handback or query — stage done, handed or query — is nobody's
+    landing, so a handed-back PR is nagged like any other), a spend record under land/root/ touched inside
+    BETWEEN_ROUNDS, or a live lander argv naming the PR (a session's prompt quoting it does not count)."""
     out = set()
     for path in glob.glob(f"{STATE}/land/*.json") + glob.glob(f"{STATE}/land/root/*.json"):
         try:
             if "/root/" in path and now() - os.path.getmtime(path) > BETWEEN_ROUNDS:
                 continue
             j = json.load(open(path))
+            if "/root/" not in path and (j.get("state") in LAND_IDLE or j.get("stage") in LAND_IDLE):
+                continue
             if j.get("repo") and j.get("pr"):
                 out.add((j["repo"], int(j["pr"])))
         except Exception:
@@ -3209,16 +3218,33 @@ def selfcheck():
         json.dump({}, open(seenp, "w"))                  # a clean ledger: only the job file can silence this run
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: a PR with a job in the landing queue is being landed — no nag", offered() == 2)
+        json.dump({"repo": repo, "pr": 9, "state": "handback", "stage": "handed"},
+                  open(f"{th}/.cc/state/land/{repo}-9.json", "w"))
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: …but a job the lander handed back (state handback) is nobody's landing: offered once", offered() == 3)
         os.remove(f"{th}/.cc/state/land/{repo}-9.json")
-        open(f"{th}/cc-land", "w").write("#!/bin/sh\nsleep 60\n")   # a live argv naming the PR, not a real landing
-        os.chmod(f"{th}/cc-land", 0o755)
-        lander = subprocess.Popen([f"{th}/cc-land", repo, "9"], start_new_session=True)
+        json.dump({}, open(seenp, "w"))
+        os.makedirs(f"{th}/lnd/core/lander", exist_ok=True)
+        open(f"{th}/lnd/core/lander/cli.py", "w").write("import time\ntime.sleep(60)\n")
+        lander = subprocess.Popen([sys.executable, "-P", f"{th}/lnd/core/lander/cli.py", "queue", repo, "9"],
+                                  start_new_session=True)
+        o_ = offered()
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         lander.kill()
         lander.wait(timeout=10)
-        ok("end to end: a PR named by a live cc-land argv is being landed — no nag", offered() == 2)
+        ok("end to end: a PR named by a live lander argv (python3 -P …/core/lander/cli.py queue) — no nag",
+           offered() == o_)
+        json.dump({}, open(seenp, "w"))
+        open(f"{th}/cc-land", "w").write("#!/bin/sh\nsleep 60\n")   # a live argv naming the PR, not a real landing
+        os.chmod(f"{th}/cc-land", 0o755)
+        lander = subprocess.Popen([f"{th}/cc-land", repo, "9"], start_new_session=True)
+        o_ = offered()
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
-        ok("end to end: …and one that falls out of a lane unlanded is news again, once", offered() == 3)
+        lander.kill()
+        lander.wait(timeout=10)
+        ok("end to end: a PR named by a live cc-land argv is being landed — no nag", offered() == o_)
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: …and one that falls out of a lane unlanded is news again, once", offered() == o_ + 1)
         os.makedirs(f"{th}/.cc/state/land/root", exist_ok=True)
         rootp = f"{th}/.cc/state/land/root/{repo}-9.json"
         json.dump({"repo": repo, "pr": 9, "reviews": 2, "repairs": 1}, open(rootp, "w"))

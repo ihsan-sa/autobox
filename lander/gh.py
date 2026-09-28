@@ -110,12 +110,10 @@ def merge_state(root, pr, token=None):
 
 
 def slug(root) -> str:
-    """owner/repo off origin's url, so gh deletes only the remote branch; '' when origin is not GitHub."""
-    try:
-        url = subprocess.run(["git", "remote", "get-url", "origin"], cwd=root, capture_output=True, text=True,
-                             timeout=30).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        url = ""
+    """owner/repo off the URL the lander holds for the checkout (git.remote_url, not the shared config's origin),
+    so gh deletes only the remote branch; '' when it is not GitHub."""
+    from lander import git as G
+    url = G.remote_url(root)
     m = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$", url)
     return m.group(1) if m else ""
 

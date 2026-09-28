@@ -440,12 +440,14 @@ def choose_where(check: T.Check, member: str = "") -> str:
 
 def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree: str, base_tree: str = "", *,
              member: str = "", store=None, job_key: str = "", scope: str = "", pr: int | None = None,
-             quarantine_text: str = "", runner=None, only=None, record_reds: bool = True) -> dict:
+             quarantine_text: str = "", runner=None, only=None, record_reds: bool = True,
+             fallback: str = "") -> dict:
     """Every check in plan.checks through judge(), one after another; -> {name: Outcome}. The lane calls it with
-    its store; `lander check` with none (a worker's own red is its work, and is not recorded)."""
+    its store; `lander check` with none (a worker's own red is its work, and is not recorded). fallback: the host
+    manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks."""
     rows = REC.quarantine_rows(quarantine_text)
     record = (lambda r, text: REC.record_red(scope, r, text, pr)) if (record_reds and scope) else None
-    base_m = M.load(repo_root, base_tree, strict=False) if base_tree else None
+    base_m = M.load(repo_root, base_tree, fallback=fallback, strict=False) if base_tree else None
     out = {}
     for name in plan.checks:
         if only and name not in only:

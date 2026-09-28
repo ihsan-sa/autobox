@@ -10,7 +10,10 @@ WHERE THE LIST COMES FROM. Not from this file, and not from the catalogue alone:
                  ($CC_STATE_BASE/<repo>/<track>/review-<pr>.md) and their copies in $CC_REVIEWS_DIR
                  (~/.cc/state/land/reviews/<repo>-<pr>-<key>.md). A brief goes when its track dir goes, so every
                  check copies the live ones across first. The copies made before 2026-09-15 were taken from the
-                 cc-land-review comments on the PRs.
+                 cc-land-review comments on the PRs. The lander writes no brief file: a PR it hands back for its
+                 review's blocking findings leaves a watch, <lander state>/handed/<repo>-<pr>.json ($CC_LANDER_STATE,
+                 else $CC_STATE_BASE/land), whose `verdict` holds them, and each check copies that across the same
+                 way, as a LAND-AFTER-FIX brief (HANDBACK is the lander's word for it).
   the catalogue  config/recurring-defects.json: per class, a `finding` regex that places a recorded review in it,
                  and the shape the class takes in a diff.
 A class is CHECKED only when its finding regex matches reviews of RECUR or more distinct PRs. Below that it is not
@@ -32,7 +35,7 @@ import contextlib, glob, hashlib, json, os, re, shutil, subprocess, sys, tempfil
 RECUR = 2        # "caught more than once": distinct PRs, not review rounds of one PR
 HERE = os.path.dirname(os.path.realpath(__file__))
 CATALOGUE = os.path.join(HERE, "..", "config", "recurring-defects.json")
-VERDICT_RE = re.compile(r"^\s*(?:\*\*)?VERDICT:?(?:\*\*)?\s*[:\-]?\s*(LAND-AFTER-FIX|DO-NOT-LAND|LAND)\b", re.M)  # cc-land's
+VERDICT_RE = re.compile(r"^\s*(?:\*\*)?VERDICT:?(?:\*\*)?\s*[:\-]?\s*(LAND-AFTER-FIX|DO-NOT-LAND|LAND)\b", re.M)  # a brief's
 COPY_RE = re.compile(r"^(.+)-(\d+)-([0-9a-f]{12})\.md$")
 
 
@@ -89,6 +92,36 @@ def sweep():
                 os.replace(dst + ".tmp", dst)
         except OSError:
             pass
+    for repo, pr, text in handed_briefs():
+        dst = os.path.join(d, f"{repo}-{pr}-{hashlib.sha1(text.encode()).hexdigest()[:12]}.md")
+        try:
+            if not os.path.exists(dst):
+                os.makedirs(d, exist_ok=True)
+                with open(dst + ".tmp", "w") as f:
+                    f.write(text)
+                os.replace(dst + ".tmp", dst)
+        except OSError:
+            pass
+
+
+def handed_dir():
+    return os.path.join(os.environ.get("CC_LANDER_STATE") or os.path.join(state_base(), "land"), "handed")
+
+
+def handed_briefs():
+    """[(repo, pr, text)]: each lander handback whose verdict carries blocking findings, as a LAND-AFTER-FIX brief."""
+    out = []
+    for p in glob.glob(os.path.join(handed_dir(), "*.json")):
+        try:
+            j = json.loads(read(p) or "")
+            v, repo, pr = j.get("verdict") or {}, str(j["repo"]), int(j["pr"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        rows = [str(b) for b in (v.get("blocking") or []) if str(b).strip()] if isinstance(v, dict) else []
+        if rows and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", repo):
+            out.append((repo, pr, f"# lander review of PR #{pr}\n\nVERDICT: LAND-AFTER-FIX\n\n"
+                                  + "\n".join(f"{i}. {b}" for i, b in enumerate(rows, 1)) + "\n"))
+    return out
 
 
 def record():
@@ -322,9 +355,18 @@ def selftest():
         shutil.rmtree(st)
         with open(os.path.join(revs, "r-24-000000000000.md"), "w") as f:      # a copy that says LAND counts for nothing
             f.write(f"VERDICT: LAND\n\n1. x:1 — {c['example']}\n")
+        hd = os.path.join(st, "land", "handed")
+        os.makedirs(hd)
+        for pr, v in ((25, {"verdict": "handback", "blocking": [f"x:1 — {c['example']}"]}), (26, {})):
+            with open(os.path.join(hd, f"r-{pr}.json"), "w") as f:
+                json.dump({"repo": "r", "pr": pr, "verdict": v}, f)
+        sweep()
+        shutil.rmtree(st)
         prs = stopped(classes, record())
+        ok("a lander handback's blocking findings are copied as a LAND-AFTER-FIX brief and count after the watch "
+           "goes; a handback with no findings adds nothing", prs[c["name"]] == ["r#21", "r#22", "r#25"], str(prs))
         ok("a live LAND-AFTER-FIX brief is copied and counts after its track dir is gone; a LAND brief or copy does not",
-           prs[c["name"]] == ["r#21", "r#22"], str(prs))
+           {"r#21", "r#22"} <= set(prs[c["name"]]) and "r#24" not in prs[c["name"]], str(prs))
         rc, out = run(os.path.join(top, "nowhere"), {"CC_REVIEWS_DIR": os.path.join(d, "empty"), "CC_STATE_BASE": st})
         ok("an empty record checks nothing and says so", rc == 0 and "no LAND-AFTER-FIX review" in out, out)
         bogus = os.path.join(d, "bogus.json")

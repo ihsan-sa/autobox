@@ -55,6 +55,24 @@ class ManifestError(ValueError):
     pass
 
 
+# --- the host's fallback for a repo that ships no manifest ----------------------------------------------------------
+
+CORE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+FALLBACK_DIR = ""   # tests set it; otherwise <release>/tests/landing-repos, beside the core/ this module runs from
+
+
+def host_fallback(repo: str) -> str:
+    """tests/landing-repos/<repo>.toml of the RELEASE this lander runs from (lander-self builds it into
+    releases/<sha>/tests/landing-repos), or "" when there is none. A repo that ships no LANDING.toml is planned and
+    checked by it (load's fallback). It is read from the promoted release and never from a PR's tree, so a PR cannot
+    rewrite the checks it is judged by. Nothing in the environment moves it."""
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo or ""):
+        return ""
+    d = FALLBACK_DIR or os.path.join(os.path.dirname(CORE), "tests", "landing-repos")
+    p = os.path.join(d, repo + ".toml")
+    return p if os.path.isfile(p) else ""
+
+
 # --- globs ---------------------------------------------------------------------------------------------------------
 
 _GLOBS: dict = {}

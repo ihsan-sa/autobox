@@ -3,7 +3,8 @@
 Run Claude Code as an always-on agent box you drive from Slack and your phone.
 
 One Linux box, one tmux, one Slack app. Every project gets a planning session in `#<project>`; work runs in git worktrees by
-headless workers that end in PRs; a 👍 in `#approvals` enqueues the landing job that gates, merges and deploys.
+headless workers that end in PRs, which gate, get reviewed and land themselves — a 👍 in `#approvals` is only for the
+project's own approval list.
 Deterministic hooks keep agents inside their lane; a Docker
 sandbox runs the unrestricted ones. A reply that needs you opens with ❓ and mentions you; nothing else does.
 
@@ -15,7 +16,7 @@ New to it? [docs/TOUR.md](docs/TOUR.md) is a five-minute tour in diagrams.
 - Hooks — `cc-checkpoint` (auto-commit+push in worktrees only), `cc-guard` (owner gates for autonomous sessions), `cc-context` (what a session is told at the end of a turn: hand off).
 - `ccbox` — bypass-permissions Claude in Docker with an egress allowlist.
 - `cc-audit` — recurring reviews of how well the box served you (3-day), code audits (weekly, monthly), and a second opinion from another model on what to delete (day 15).
-- `cc-land` — **the only thing that merges, and the owner of the deploy that follows.** Gates against the PR's own head, then merge, `install.sh`, the units the change added, the restarts. A 👍 does not merge: it queues a job on disk and starts a worker, because the deploy restarts the daemon that took the 👍.
+- `cc-land` — **the only thing that merges, and the owner of the deploy that follows.** Gates against the PR's own head, then a review verdict, then merge, `install.sh`, the units the change added, the restarts. Every project lands its own green PRs by default; only a project named in `CC_SELF_LAND_EXCEPT` waits on a 👍, which queues a job on disk and starts a worker rather than merging directly, because the deploy restarts the daemon that took the 👍.
 - `cc-reconcile` — the board against the box every 20 min: applies the drift that has one right answer (a PR merged, a worker is gone), ends a worker that is spending without working, sweeps dead tracks and worktrees once a day, wakes a planning seat when a row can start or has stopped, and reports the rest. Its snapshot is the one place `cc ls`, `cc digest` and the Slack Home tab read a track's state from.
 - `cc-handoff` — the whole handoff lifecycle: a successor starts alongside its predecessor, reads the journal, then retires it; one record file names the live session and cutover is a single atomic write.
 - `cc-units` / `cc-settings` — one declaration each of what must be installed (`config/units.json`, `config/claude-managed.json`) and a check that it is. `cc-settings apply` is the owner's own hand, never a script's.

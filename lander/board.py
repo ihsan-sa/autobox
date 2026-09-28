@@ -16,7 +16,7 @@ track will finish it then; closed `done` with a note and its agent mark cleared 
 or underscore that is not on the board is reported; a bare word ("Closes the gap") is prose and ignored.
 
 Nothing here raises: a board write that fails is a line in the answer, and the merge already happened. The job's
-`extra` supplies `head_ref`, `title`, `body` and, when U1 set them, `project` (the board's name; the repo by default)
+`extra` supplies `branch` (or the older `head_ref`), `title`, `body` and, when U1 set them, `project` (the board's name; the repo by default)
 and `track`.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ CLOSES_RE = re.compile(r"\bCloses:?\s+([A-Za-z0-9][A-Za-z0-9_-]*(?:\s*(?:,\s*(?:
                        r"[A-Za-z0-9][A-Za-z0-9_-]*)*)")
 CLOSES_SPLIT = re.compile(r"\s*,\s*(?:and\s+)?|\s+and\s+")
 BRANCH_RE = re.compile(r"^(?:track|planning|builder)/(.+)$")
-ORCH_MARK = re.compile(r"^@(\d+):\d+$")
+ORCH_MARK = re.compile(r"^@\d+$")
 
 
 def tool(name):
@@ -38,7 +38,11 @@ def tool(name):
 
 
 def rows(project):
-    d = C.read_json(os.path.join(os.path.expanduser(C.conf("CC_BOARDS", "~/.cc/boards")), f"{project}.json"), {})
+    """The board's tracks; {} for a symlinked board file (a member's board could link into a dir the member writes)."""
+    p = os.path.join(os.path.expanduser(C.conf("CC_BOARDS", "~/.cc/boards")), f"{project}.json")
+    if os.path.islink(p):
+        return {}
+    d = C.read_json(p, {})
     t = (d or {}).get("tracks")
     return t if isinstance(t, dict) else {}
 
@@ -65,7 +69,13 @@ def project_of(job):
 
 
 def track_for(job):
-    return job.extra.get("track") or track_of(project_of(job), job.pr, job.extra.get("head_ref", ""))
+    """The job's row: U1's `track`, a member landing's own <t> (repo `<h>--<t>`), else looked up by PR and by the head
+    branch (the lane keeps it as `branch`; `head_ref` is the older name)."""
+    if job.extra.get("track"):
+        return job.extra["track"]
+    if job.member and "--" in job.repo:
+        return job.repo.partition("--")[2]
+    return track_of(project_of(job), job.pr, job.extra.get("branch") or job.extra.get("head_ref") or "")
 
 
 def what(job):
@@ -75,13 +85,13 @@ def what(job):
 
 def orch_of(repo, agent):
     """The orch window holding a row: its agent mark is `@<window id>:<pid>` and that window is `<repo>@<alias>`."""
-    m = ORCH_MARK.match(agent or "")
-    if not m:
+    wid = (agent or "").strip().split(":")[0]
+    if not ORCH_MARK.fullmatch(wid):
         return ""
     rc, out = C.sh(["tmux", "list-windows", "-t", "main", "-F", "#{window_id}\t#{window_name}"], timeout=60)
     for ln in out.splitlines() if rc == 0 else []:
-        wid, _, name = ln.partition("\t")
-        if wid == f"@{m.group(1)}" and re.fullmatch(rf"{re.escape(repo)}@[a-z0-9-]{{2,20}}", name):
+        w, _, name = ln.partition("\t")
+        if w == wid and re.fullmatch(rf"{re.escape(repo)}@[a-z0-9-]{{2,20}}", name):
             return name
     return ""
 
@@ -113,7 +123,7 @@ def _close(job, project, track):
     if not isinstance(row, dict):
         return f"board: {project}/{track} is not on the board"
     b = tool("cc-board")
-    orch = orch_of(job.repo, row.get("agent", ""))
+    orch = orch_of(project, row.get("agent", ""))
     if orch:
         C.sh([b, "note", project, track, f"milestone landed by the lander: {what(job)}; left open, {orch} holds this row"],
              timeout=60)
@@ -133,7 +143,8 @@ def _close(job, project, track):
             if re.search(r"[-_0-9]", r):
                 unknown.append(r)
             continue
-        if cur.get("held") or (cur.get("status") in ("running", "review") and not cur.get("agent")):
+        mark = str(cur.get("agent") or "").strip()
+        if cur.get("held") or (cur.get("status") in ("running", "review") and not mark):
             held.append(r)
             continue
         rc, out = C.sh([b, "status", project, r, "done"], timeout=60)
@@ -141,7 +152,7 @@ def _close(job, project, track):
             line += f"; cc-board status {r} failed: {out.strip()[-120:]}"
             continue
         C.sh([b, "note", project, r, f"closed by the lander: {what(job)} says Closes {r}"], timeout=60)
-        if cur.get("agent"):
+        if mark:
             C.sh([b, "set", project, r, "agent", ""], timeout=60)
         shut.append(r)
     if shut:

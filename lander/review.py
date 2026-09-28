@@ -494,7 +494,7 @@ def _buy(job, template, diff, more):
         return _stop(job, f"two reads already spent on PR #{pr}; the planning seat decides", cap=True)
     wall = j.get("wall") or {}
     root = root_of(job)
-    base_ref = f"origin/{job.extra.get('base', 'main')}"
+    base_ref = f"refs/remotes/origin/{job.extra.get('base', 'main')}"
     facts = pr_view(root, pr, "title") or {}
     files = [f for f in job.files] or [ln[6:] for ln in diff.splitlines() if ln.startswith("+++ b/")]
     text = prompt(load_prompt(template), PR=pr, REPO=repo, TITLE=facts.get("title") or "(untitled)",
@@ -539,10 +539,13 @@ def _job_of(repo, pr):
     if not facts:
         return None, f"cannot read PR #{pr} of {repo} from GitHub"
     base = facts.get("baseRefName") or "main"
-    git(root, "fetch", "-q", "origin", base, f"pull/{pr}/head", timeout=300)
-    job.head, job.extra.update(base=base, head_ref=facts.get("headRefName") or "")
-    rc, b = git(root, "rev-parse", f"origin/{base}")
-    job.base_sha = b.strip() if not rc else ""
+    from lander import deploy as D
+    from lander import git as G
+    with D.git_lock(root):   # base from the lander's own URL, checked against ls-remote; never the checkout's origin
+        job.base_sha = D.verified_tip(root, base)
+        if G.remote_url(root):
+            git(root, "fetch", "-q", G.remote_url(root), f"refs/pull/{pr}/head", timeout=300)
+    job.extra.update(base=base, head_ref=facts.get("headRefName") or "")
     job.files = [f.get("path", "") for f in facts.get("files") or []]
     job.head = facts.get("headRefOid") or ""
     job.digest = change_digest(diff_of(root, job.base_sha, job.head))
@@ -582,7 +585,9 @@ def cmd_record(argv):
         return 1
     findings = sys.stdin.read() if opts.get("findings") == "-" else (opts.get("findings") or "")
     stands = recorded(facts.get("comments") or [], {job.digest})
-    if stands and stands.verdict == word:
+    who = re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"])
+    # a second reader's LAND is posted too: lander-self needs an Opus read and a security read at one head
+    if stands and stands.verdict == word and (word != T.LAND or stands.model == who):
         print(f"lander record: {word} is already recorded for this change; nothing to do")
         return 0
     if stands and stands.verdict == T.HANDBACK_VERDICT and word == T.LAND:

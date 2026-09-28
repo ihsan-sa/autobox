@@ -9,6 +9,10 @@ PATHS are read from the environment at CALL time, so a test (or a second box lay
            its repo's lock, folds a request into the job (drain). So the lane is the job file's one writer.
   lanes    <LANDQ>/lanes/<repo>.lock (flock) + <repo>.running {pid, since}; <LANDQ>/lanes/gh.backoff (gh.py).
   handed   <LANDQ>/handed/<repo>-<pr>.json — the watch on a handed-back PR (lane.handback, tick).
+  rest     <LANDQ>/rest/<repo>-<pr>.json — a job that has ENDED (done, query, handback). The old lander unlinked its
+           job file when the landing finished, and every reader counts <LANDQ>/*.json as a landing in flight (the Home
+           tab's RUNNING tally, cc-bundle's queue depth), so an ended job leaves that directory; load() still finds it
+           here, so a re-queue keeps reads_used and the prior verdict.
   log      <LANDQ>/queue.log (events.py).
   BIN $CC_BIN or <core>/bin · DEV $CC_DEV or $HOME/dev · BOARDS $CC_BOARDS or $HOME/.cc/boards ·
   MEMBERS $CC_MEMBERS or $HOME/.cc/members.
@@ -17,13 +21,21 @@ PATHS are read from the environment at CALL time, so a test (or a second box lay
 
 THE MACHINE. A job's `state` moves only along NEXT; move() refuses any other edge (ValueError), appends one
 history entry, sets `stage`, saves atomically and writes `stage <repo>#<pr> <state>` to queue.log. Every save
-sets `stage` from `state`, and the record is validated (T.Job.to_dict) before it is written.
+sets `stage` (stage_of: STAGE_OF[state], in the old lander's words where the readers filter on one — `review` for a
+checked job waiting on its read, `deferred` for a job held till a usage limit resets, which the Home tab and the
+dashboard do not count as running), and the record is validated (T.Job.to_dict) before it is written.
 
 DRAIN (the lane only, under the lane lock): a request with no job makes a queued job; one for a job at rest
 (done, query, handback, or held for a reason a push mends) is a fresh start that keeps reads_used and the prior
-verdict (`requeued`); one for an active job fills chat/ts/who where empty and an owner approval in it replaces
-the job's (`again`). A job held by the box itself (hold="box": a usage wall, a cap, an unrunnable check) is
-active: a fresh start would not mend it.
+verdict (`requeued`); one for an active job fills chat/ts/who where empty (`again`). A job held by the box itself
+(hold="box": a usage wall, a cap, an unrunnable check) is active: a fresh start would not mend it.
+A REQUEST IS UNTRUSTED. Anyone may write the inbox, so drain takes only chat, ts and who from it (repo and pr route
+it). An approval, a verdict or a reads count in a request is dropped: the owner's 👍 is the approval record
+`lander queue` writes after it checked the uid itself (approvals/<repo>-<pr>.json, read by the lane's door), and a
+verdict comes only from the lane's own review or from PR markers the box's login wrote (review.recorded).
+  approvals <LANDQ>/approvals/<repo>-<pr>.json {approved_by, approved_head, at} — approve()/approval().
+  carry     <LANDQ>/carry/<repo>-<pr>.json {reads_used} — a handed-back job's spent reads, written by the tick
+            when a push re-queues it and taken by drain, so the reads cap still holds across the handback.
 """
 from __future__ import annotations
 
@@ -80,6 +92,10 @@ def lanes_dir() -> str:
     return f"{landq()}/lanes"
 
 
+def rest_dir() -> str:
+    return f"{landq()}/rest"
+
+
 def handed_dir() -> str:
     return f"{landq()}/handed"
 
@@ -94,6 +110,10 @@ def safe(repo: str) -> str:
 
 def job_path(repo: str, pr) -> str:
     return f"{landq()}/{repo}-{int(pr)}.json"
+
+
+def rest_path(repo: str, pr) -> str:
+    return f"{rest_dir()}/{repo}-{int(pr)}.json"
 
 
 def handed_path(repo: str, pr) -> str:
@@ -148,7 +168,7 @@ def repo_root(repo: str) -> str:
 
 # --- the machine ---------------------------------------------------------------------------------------------------
 
-STAGE_OF = {T.QUEUED: "queued", T.PLANNED: "plan", T.CHECKING: "gates", T.MERGEABLE: "merge", T.MERGED: "merged",
+STAGE_OF = {T.QUEUED: "queued", T.PLANNED: "gates", T.CHECKING: "gates", T.MERGEABLE: "merge", T.MERGED: "merged",
             T.DEPLOY_PENDING: "install", T.DEPLOYED: "verify", T.DONE: "done", T.HANDBACK: "handed",
             T.HELD: "held", T.QUERY: "query"}
 
@@ -168,6 +188,21 @@ NEXT = {
 
 # At rest: nothing the lane does moves it; a request (drain) or a tick does.
 RESTING = (T.QUERY, T.DONE, T.DEPLOY_PENDING, T.DEPLOYED, T.HANDBACK)
+# Ended: the job file leaves <LANDQ>/*.json for rest/ (the readers count every file there as in flight).
+ENDED = (T.DONE, T.QUERY, T.HANDBACK)
+
+
+def stage_of(job: T.Job) -> str:
+    if job.state == T.HELD and job.extra.get("deferred"):
+        return "deferred"
+    if job.state == T.CHECKING and job.plan and job.plan.paid and all(n in job.results for n in job.plan.checks):
+        return "review"
+    return STAGE_OF[job.state]
+
+
+def file_of(job: T.Job) -> str:
+    """Where the job's file sits for its state: today's path while it is live, rest/ once it has ended."""
+    return rest_path(job.repo, job.pr) if job.state in ENDED else job_path(job.repo, job.pr)
 
 
 def load_path(path: str):
@@ -181,17 +216,23 @@ def load_path(path: str):
 
 
 def load(repo: str, pr):
-    return load_path(job_path(repo, pr))
+    """The live job, else the ended one in rest/, else None."""
+    return load_path(job_path(repo, pr)) or load_path(rest_path(repo, pr))
 
 
 def save(job: T.Job) -> None:
-    job.stage = STAGE_OF[job.state]
-    write_atomic(job_path(job.repo, job.pr), job.to_dict())
+    job.stage = stage_of(job)
+    path = file_of(job)
+    write_atomic(path, job.to_dict())
+    other = rest_path(job.repo, job.pr) if path == job_path(job.repo, job.pr) else job_path(job.repo, job.pr)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(other)
 
 
 def remove(job: T.Job) -> None:
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(job_path(job.repo, job.pr))
+    for p in (job_path(job.repo, job.pr), rest_path(job.repo, job.pr)):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(p)
 
 
 def move(job: T.Job, state: str, why: str = "", **kv) -> T.Job:
@@ -236,13 +277,58 @@ def requests(repo: str = ""):
     return out
 
 
-CARRY = ("chat", "ts", "who")
-APPROVAL = ("approved_by", "approved_head")
+CARRY = ("chat", "ts", "who")   # the only fields drain takes from a request (review of #771: an inbox request is
+                                # anyone's, so an approval or a verdict in one is dropped, never trusted)
+
+
+def approvals_dir() -> str:
+    return f"{landq()}/approvals"
+
+
+def approval_path(repo: str, pr) -> str:
+    return f"{approvals_dir()}/{safe(repo)}-{int(pr)}.json"
+
+
+def approve(repo: str, pr, by: str, head: str) -> None:
+    """Record the owner's 👍 on (repo, pr) at `head`. Only `lander queue`, after owner_approved(by) and a head gh named,
+    and the door carrying it to a head whose protected files are identical, call this."""
+    os.makedirs(approvals_dir(), exist_ok=True)
+    write_atomic(approval_path(repo, pr), {"approved_by": by, "approved_head": head, "at": E.stamp()})
+
+
+def approval(repo: str, pr) -> dict:
+    """{approved_by, approved_head} from the approval record, or {} (none, or not that shape)."""
+    r = read_json(approval_path(repo, pr))
+    if not (isinstance(r, dict) and isinstance(r.get("approved_by"), str) and isinstance(r.get("approved_head"), str)
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", r["approved_head"])):
+        return {}
+    return {"approved_by": r["approved_by"], "approved_head": r["approved_head"]}
+
+
+def carry_path(repo: str, pr) -> str:
+    return f"{landq()}/carry/{safe(repo)}-{int(pr)}.json"
+
+
+def carry(repo: str, pr, reads_used: int) -> None:
+    """What a handed-back job had spent, for the lane to pick up when the push re-queues it (tick.sweep_handed). It
+    is the lane's own record, never a request field: a request is anyone's."""
+    os.makedirs(os.path.dirname(carry_path(repo, pr)), exist_ok=True)
+    write_atomic(carry_path(repo, pr), {"reads_used": int(reads_used or 0), "at": E.stamp()})
+
+
+def take_carry(repo: str, pr) -> int:
+    """The reads a handed-back job had used (0 when none was carried); the record is removed."""
+    p = carry_path(repo, pr)
+    r = read_json(p)
+    with contextlib.suppress(OSError):
+        os.unlink(p)
+    n = r.get("reads_used") if isinstance(r, dict) else 0
+    return n if isinstance(n, int) and n > 0 else 0
 
 
 def _fresh(job: T.Job, req: dict) -> None:
     """Back to queued with a clean slate: what a person (or a push) asked for starts again; reads_used and the
-    prior verdict stay, since the reads cap is per change family, not per queue."""
+    prior verdict stay, since the reads cap is per change family, not per queue. Only CARRY comes from `req`."""
     keep = {k: job.extra[k] for k in ("verdict",) + CARRY if k in job.extra}
     job.head = job.base_sha = job.digest = job.review_key = ""
     job.files, job.plan, job.results = [], None, {}
@@ -250,13 +336,6 @@ def _fresh(job: T.Job, req: dict) -> None:
     for k in CARRY:
         if req.get(k):
             job.extra[k] = req[k]
-    for k in APPROVAL:   # an approval was about the head it saw: only this request's counts
-        if req.get(k):
-            job.extra[k] = req[k]
-    if "reads_used" in req:
-        job.reads_used = max(job.reads_used, int(req["reads_used"] or 0))
-    if req.get("verdict"):
-        job.extra["verdict"] = req["verdict"]
     job.extra.update(queued_at=E.stamp(), attempts=0)
 
 
@@ -265,19 +344,20 @@ def drain(repo: str) -> list:
     lines = []
     for path, req in requests(repo):
         pr = req["pr"]
-        job = load(repo, pr)
+        job, spent = load(repo, pr), take_carry(repo, pr)
         if job is None:
-            job = T.Job(repo=repo, pr=pr, reads_used=int(req.get("reads_used") or 0))
+            job = T.Job(repo=repo, pr=pr, reads_used=spent)
             from lander import members as M
             h, t = M.member_of(repo)
             job.member = h if h and t else None
-            job.extra = {k: req[k] for k in CARRY + APPROVAL + ("verdict",) if req.get(k)}
+            job.extra = {k: req[k] for k in CARRY if req.get(k)}
             job.extra.update(queued_at=E.stamp(), attempts=0)
             job.history.append({"at": E.stamp(), "state": T.QUEUED})
             save(job)
             lines.append(f"{repo}#{pr} queued")
         elif job.state in (T.DONE, T.QUERY, T.HANDBACK) or (job.state == T.HELD and job.extra.get("hold") != "box"):
             _fresh(job, req)
+            job.reads_used = max(job.reads_used, spent)
             move(job, T.QUEUED, why="requeued")
             E.log("requeued", repo, pr, who=req.get("who") or "-")
             lines.append(f"{repo}#{pr} requeued")
@@ -285,8 +365,6 @@ def drain(repo: str) -> list:
             for k in CARRY:
                 if req.get(k) and not job.extra.get(k):
                     job.extra[k] = req[k]
-            if req.get("approved_by") and req.get("approved_head"):
-                job.extra.update(approved_by=req["approved_by"], approved_head=req["approved_head"])
             save(job)
             E.log("again", repo, pr)
             lines.append(f"{repo}#{pr} again")
@@ -299,6 +377,13 @@ def drain(repo: str) -> list:
 
 def lane_file(repo: str, ext: str) -> str:
     return f"{lanes_dir()}/{safe(repo)}.{ext}"
+
+
+_HELD: dict = {}   # repo -> the fd on which this process holds lanes/<repo>.lock (records.Store checks it)
+
+
+def lane_fd(repo: str):
+    return _HELD.get(repo)
 
 
 def pid_alive(pid) -> bool:
@@ -322,9 +407,11 @@ def lane_lock(repo: str, wait: bool = False):
             yield False
             return
         write_atomic(lane_file(repo, "running"), {"pid": os.getpid(), "since": E.stamp()})
+        _HELD[repo] = fd
         try:
             yield True
         finally:
+            _HELD.pop(repo, None)
             with contextlib.suppress(OSError):
                 os.unlink(lane_file(repo, "running"))
             fcntl.flock(fd, fcntl.LOCK_UN)

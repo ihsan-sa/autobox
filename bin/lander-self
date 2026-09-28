@@ -1,0 +1,1255 @@
+#!/usr/bin/env python3
+"""lander-self — land a change to the lander itself, and move the release the lander runs.
+
+The lander refuses a PR that touches its own paths (the `lander` list in the base's tests/LANDING-policy.toml) and
+sends it here. This file shares no code with lander/: a change to the lander cannot change how it is judged.
+A planning seat runs it by hand; the lander never installs itself.
+
+    lander-self pin [--repo DIR] [--rev REV]
+        Copy lander-self as committed at REV (default origin/main) to ~/.cc/lander/self/<sha>/ and point
+        self/current at it. Every other command, run from a checkout, re-execs that pinned copy, so a checkout
+        edited in place never runs. With no pin they refuse (exit 3). Pin and promote both first pin, in
+        remotes.json, the URL of the GitHub repo each checkout's origin names (this one and every board repo's),
+        once: every fetch, ls-remote and push of the lander and of lander-self goes there, never to "origin".
+    lander-self check <repo> <pr> [--repo-dir DIR]
+        (cc-guard keeps this, like land/promote/rollback/pin, from a worker: it fetches a PR and runs its code.)
+        Refuses the PR whole unless: every changed path is on the base's `lander` list; a LAND record by a reader
+        whose name says `security` and a LAND record by another reader both stand at the PR's head (`lander record
+        --by`, which cc-guard keeps closed to workers); the candidate's own tests (`<core>/bin/lander selfcheck` and
+        `<core>/tests/lander`) pass on the merge tree inside bwrap (no network, empty HOME, no ~/.cc). Then prints a
+        shadow plan: every job in the live queue planned by the current release and by the candidate, side by
+        side, also inside bwrap. A job the current release plans and the candidate cannot is a refusal.
+        Exit 0 passed, 1 refused, 3 could not run.
+    lander-self land <repo> <pr> [--repo-dir DIR]
+        check, then `gh pr merge --squash --match-head-commit <head> --delete-branch`. It does not promote.
+    lander-self promote [REV] [--repo DIR] [--pr N]
+        Build ~/.cc/lander/releases/<sha>/ from `git archive` of REV (default origin/main) — committed code only,
+        plus the repo's tests/landing-repos/ (the host fallback manifests the lander reads for a repo that ships
+        none) — run that release's `lander selfcheck`, and only if it is green point `current` at it, keeping the
+        one before as `previous`. A releases/<sha> already there is rebuilt beside it and kept only when the two
+        trees are byte-identical; otherwise the fresh build replaces it (a planted or edited release never runs).
+        REV must be origin/main or an ancestor of it. THE ONE EXCEPTION is the cutover's step 5, which promotes the
+        switch PR's head before it merges: `--pr N` allows a REV that is not on main only when it is exactly the
+        head GitHub names for OPEN PR #N, and only for a caller that is not a worker or a member session (CC_ROLE,
+        or a .cc/track or .cc/member-facing marker above the cwd). Clears a legacy rollback. Promote never kills a
+        lane: each lane re-execs `current` between jobs, so the next job runs the new release.
+    lander-self rollback [--legacy]
+        Point `current` back at `previous` (and `previous` at what current was). --legacy instead sends every
+        `cc-land` call to the release pinned by `lander-self legacy` (the old lander, before the switch), and first
+        hands the queue back to it: it refuses while a lane of the new lander is running; moves the new lander's
+        job files, its inbox and its handed-back watches to <state>/post-cutover/<stamp>/; puts back into <state>
+        every job exported at the cutover (pre-cutover/*.json) that the new lander never took up, and the old
+        handed-back watches; and prints — and writes to post-cutover/<stamp>/requeue.txt — one `cc-land queue`
+        line for each PR the new lander still had in flight or waiting, to run once the switch is made.
+    lander-self legacy REV [--repo DIR]
+        Pin REV's tree as the legacy release, for `rollback --legacy`. Run it at cutover with the commit before
+        the switch.
+    lander-self shadow [REV] [--repo DIR]
+        The cutover's first step: plan every job in the live queue with the release REV would build (default
+        origin/main), and with the current release beside it when there is one, both in bwrap. A job whose file
+        names no head (the old lander's files do not) takes its head from GitHub and its base from origin/main.
+        Exit 1 when the candidate cannot plan a job it was given a head for, 0 otherwise, 3 when it could not run.
+    lander-self status
+    lander-self selfcheck
+
+Layout under ~/.cc/lander: releases/<sha>/core (+ tests/landing-repos), current -> releases/<sha>,
+previous -> releases/<sha>, remotes.json (realpath of a checkout -> the URL the lander fetches it from),
+self/<sha>/lander-self, self/current -> self/<sha>, legacy/<sha>/<core>, legacy-on -> legacy/<sha>, repo (the
+checkout releases are built from). A release is always laid out with the core tree under `core/`, whatever prefix
+the repo keeps it under, because bin/lander execs `current/core/lander/cli.py`.
+"""
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, ".cc", "lander")
+ME = os.path.realpath(__file__)
+REPO_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
+SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+MARK_RE = re.compile(r"\A\s*<!-- cc-land-review v2 change=[0-9a-f]+ [^>]*?\bhead=([0-9a-f]+) [^>]*?"
+                     r"\bverdict=([A-Z-]+) by=([A-Za-z0-9._@-]+) -->")
+DONE = {"done", "merged", "deployed", "deploy-pending", "handback"}
+TEST_CAP = 1800
+
+
+def die(msg, rc=1):
+    print(f"lander-self: {msg}", file=sys.stderr)
+    return rc
+
+
+def sh(argv, cwd=None, timeout=600, **kw):
+    try:
+        p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, **kw)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s"
+    except OSError as e:
+        return 127, "", str(e)
+
+
+def git(root, *a, timeout=300):
+    return sh(["git", "-C", root, *a], timeout=timeout)
+
+
+def git_lock(root):
+    """The checkout's repo lock, `.git/cc-land.lock` of the main gitdir, the file cc-publish and the lane take
+    around anything that writes FETCH_HEAD. Returns the open file; closing it releases the lock."""
+    rc, out, _ = git(root, "rev-parse", "--git-common-dir")
+    gd = os.path.join(root, out.strip()) if rc == 0 else os.path.join(root, ".git")
+    f = open(os.path.join(os.path.realpath(gd), "cc-land.lock"), "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+# --- the remotes the lander holds ------------------------------------------------------------------------------------
+# The lander never fetches, ls-remotes or pushes "origin" as the checkout's shared .git/config names it: a worker can
+# repoint that, unset its fetch refspec or plant refs/remotes/origin/<b>. pin and promote write ROOT/remotes.json
+# (realpath of a checkout -> URL) for this checkout and every board repo's, from `gh repo view`'s URL for the
+# GitHub repo origin names. An entry is never overwritten: a checkout whose origin later names another repo keeps
+# the URL pinned first (to change it, a person edits remotes.json). A checkout with no entry is refused.
+
+ALLOW_LOCAL = False   # the selfcheck's bare repos; nothing outside this process can set it
+GH_URL_RE = re.compile(r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+                       r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+GH_PIN_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?(?:\.git)?")
+
+
+def load_remotes():
+    try:
+        pins = json.load(open(os.path.join(ROOT, "remotes.json")))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in pins.items() if isinstance(k, str) and isinstance(v, str) and v} \
+        if isinstance(pins, dict) else {}
+
+
+def remote_for(root):
+    """The pinned URL for root; '' when none, or when a url.<x>.insteadOf / pushInsteadOf in the config git reads
+    for root would send it elsewhere (the shared .git/config is a worker's to write)."""
+    url = load_remotes().get(os.path.realpath(root), "")
+    if not (GH_PIN_RE.fullmatch(url) or ALLOW_LOCAL and os.path.isabs(url)):
+        return ""   # remotes.json is a file a worker could reach: only a GitHub https URL is taken from it
+    # -z: records are NUL-separated, key and value split at the first newline, so a subsection with a space in it
+    # (url./tmp/e x.insteadof) cannot shift where the value starts
+    rc, out, _ = git(root, "config", "-z", "--get-regexp", r"^url\..*\.(push)?insteadof$")
+    if rc not in (0, 1) or any(v and url.startswith(v) for v in (rec.partition("\n")[2]
+                                                                 for rec in out.split("\0") if rec)):
+        return ""
+    return url
+
+
+def url_to_pin(root):
+    """The URL to pin for root: the GitHub repo origin names, as `gh repo view` gives its URL; '' otherwise."""
+    rc, out, _ = git(root, "remote", "get-url", "origin")
+    url = out.strip() if rc == 0 else ""
+    m = GH_URL_RE.match(url)
+    if m:
+        rc, out, _ = sh(["gh", "repo", "view", f"{m[1]}/{m[2]}", "--json", "url", "-q", ".url"], timeout=60)
+        u = out.strip().rstrip("/") if rc == 0 else ""
+        return u + ".git" if re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", u) else ""
+    return url if ALLOW_LOCAL and os.path.isabs(url) else ""
+
+
+def board_roots():
+    """Every checkout the lander may land into: each board repo's `path` and $CC_DEV/<repo>, where they exist.
+    A member workspace's repo (<h>--<t>) is cloned by the lander itself and is not pinned here."""
+    d = os.environ.get("CC_BOARDS") or os.path.join(HOME, ".cc", "boards")
+    dev = os.environ.get("CC_DEV") or os.path.join(HOME, "dev")
+    out = []
+    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        repo = f[:-len(".json")]
+        if not f.endswith(".json") or not REPO_RE.match(repo) or "--" in repo:
+            continue
+        try:
+            b = json.load(open(os.path.join(d, f)))
+        except (OSError, ValueError):
+            continue
+        for r in ((b.get("path") if isinstance(b, dict) else "") or "", os.path.join(dev, repo)):
+            if r and os.path.exists(os.path.join(r, ".git")) and os.path.realpath(r) not in out:
+                out.append(os.path.realpath(r))
+    return out
+
+
+def pin_remotes(root):
+    """Pin a URL for root and every board checkout that has none. -> the lines to print."""
+    pins, lines, new = load_remotes(), [], 0
+    for r in [os.path.realpath(root)] + [b for b in board_roots() if b != os.path.realpath(root)]:
+        if r in pins:
+            rc, out, _ = git(r, "remote", "get-url", "origin")
+            m, p = GH_URL_RE.match(out.strip() if rc == 0 else ""), GH_URL_RE.match(pins[r])
+            if m and p and (m[1].lower(), m[2].lower()) != (p[1].lower(), p[2].lower()):
+                lines.append(f"{r}: origin now names {m[1]}/{m[2]}; the lander keeps {pins[r]} (edit "
+                             f"{ROOT}/remotes.json by hand to change it)")
+            continue
+        url = url_to_pin(r)
+        if url:
+            pins[r], new = url, new + 1
+            lines.append(f"{r}: pinned {url}")
+        else:
+            lines.append(f"{r}: origin is not a GitHub repo gh can view; the lander will not fetch it")
+    if new:
+        os.makedirs(ROOT, exist_ok=True)
+        tmp = os.path.join(ROOT, f".remotes.json.{os.getpid()}")
+        with open(tmp, "w") as f:
+            json.dump(pins, f, indent=1, sort_keys=True)
+        os.replace(tmp, os.path.join(ROOT, "remotes.json"))
+    return lines
+
+
+def gh_repo(root):
+    """["-R", owner/name] for the GitHub repo pinned for root, so gh never takes its repo from the shared config."""
+    m = GH_URL_RE.match(remote_for(root))
+    return ["-R", f"{m[1]}/{m[2]}"] if m else []
+
+
+def fetch(root, *refs):
+    """Fetch from the URL pinned for root: a branch b into refs/remotes/origin/b (a forced refspec, so no config of
+    the checkout's decides where it lands), pull/<n>/head into FETCH_HEAD only. False on no pin or a failed fetch."""
+    url = remote_for(root)
+    if not url:
+        return False
+    specs = [f"refs/{r}" if r.startswith("pull/") else f"+refs/heads/{r}:refs/remotes/origin/{r}" for r in refs]
+    lk = git_lock(root)
+    try:
+        return git(root, "fetch", "-q", url, *specs)[0] == 0
+    finally:
+        lk.close()
+
+
+def main_sha(root, branch="main"):
+    """origin's <branch> as this box may trust it: the fetch from the pinned URL went through, and
+    refs/remotes/origin/<branch> is the very sha `git ls-remote <pinned URL> refs/heads/<branch>` names. '' on any
+    doubt."""
+    if not fetch(root, branch):
+        return ""
+    local = resolve(root, f"refs/remotes/origin/{branch}")
+    rc, out, _ = git(root, "ls-remote", remote_for(root), f"refs/heads/{branch}")
+    remote = [ln.split("\t")[0] for ln in out.splitlines() if ln.endswith(f"\trefs/heads/{branch}")] if rc == 0 else []
+    return local if local and remote == [local] else ""
+
+
+# --- layout --------------------------------------------------------------------------------------------------------
+
+def link_target(name):
+    p = os.path.join(ROOT, name)
+    return os.path.realpath(p) if os.path.islink(p) else ""
+
+
+def swap(name, target):
+    """Point ROOT/name at target atomically (a new symlink renamed over the old)."""
+    os.makedirs(ROOT, exist_ok=True)
+    tmp = os.path.join(ROOT, f".{name}.{os.getpid()}")
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(target, tmp)
+    os.replace(tmp, os.path.join(ROOT, name))
+
+
+def unlink(name):
+    p = os.path.join(ROOT, name)
+    if os.path.islink(p):
+        os.unlink(p)
+
+
+def repo_of(opt=""):
+    if opt:
+        return os.path.realpath(opt)
+    try:
+        return open(os.path.join(ROOT, "repo")).read().strip()
+    except OSError:
+        pass
+    rc, out, _ = git(os.path.dirname(ME), "rev-parse", "--show-toplevel")
+    return out.strip() if rc == 0 else ""
+
+
+def core_prefix(root, sha):
+    """'core/' when the repo keeps the core tree under core/, '' when the core tree is the repo."""
+    rc, _, _ = git(root, "cat-file", "-e", f"{sha}:core/lander/cli.py")
+    return "core/" if rc == 0 else ""
+
+
+def resolve(root, rev):
+    """A commit sha for rev. origin/<b> is read as refs/remotes/origin/<b> in full, so a local branch someone named
+    origin/<b> (refs/heads/origin/<b>) never stands in for it."""
+    if rev.startswith("origin/"):
+        rev = "refs/remotes/" + rev
+    for r in ([rev] if rev else ["refs/remotes/origin/main", "refs/remotes/origin/HEAD", "HEAD"]):
+        rc, out, _ = git(root, "rev-parse", "--verify", "-q", f"{r}^{{commit}}")
+        if rc == 0:
+            return out.strip()
+    return ""
+
+
+def tree_digest(d):
+    """sha256 over every entry under d: its path, its kind (dir, link and target, file and exec bit) and a file's
+    bytes. Two builds of one commit are equal; a release anyone edited, or a link planted in it, is not."""
+    import hashlib
+    h = hashlib.sha256()
+    for top, dirs, files in os.walk(d):
+        dirs.sort()
+        for n in sorted(dirs + files):
+            p = os.path.join(top, n)
+            rel = os.path.relpath(p, d)
+            if os.path.islink(p):
+                h.update(f"L {rel} {os.readlink(p)}\n".encode())
+            elif os.path.isdir(p):
+                h.update(f"D {rel}\n".encode())
+            else:
+                h.update(f"F {rel} {os.stat(p).st_mode & 0o111 and 'x' or '-'}\n".encode())
+                with open(p, "rb") as f:
+                    h.update(hashlib.sha256(f.read()).digest())
+    return h.hexdigest()
+
+
+def build(root, sha, kind, must="lander/cli.py"):
+    """ROOT/<kind>/<sha>/core/ from `git archive` of the commit's core tree, which must hold `must`, and — when the
+    repo keeps core under core/ — <sha>/tests/landing-repos/ from the same commit (the host fallback manifests).
+    Always built afresh: a <sha> dir already there is kept only when it is byte-identical to the new build
+    (tree_digest), else replaced — so a release planted or edited under ROOT never runs. Returns the release dir;
+    raises RuntimeError."""
+    if not SHA_RE.match(sha or ""):
+        raise RuntimeError(f"{sha!r} is not a commit sha")
+    dest = os.path.join(ROOT, kind, sha)
+    pre = core_prefix(root, sha)
+    os.makedirs(os.path.join(ROOT, kind), exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=f".{sha[:12]}.", dir=os.path.join(ROOT, kind))
+    os.makedirs(os.path.join(tmp, "core"))
+    arch = subprocess.run(["git", "-C", root, "archive", "--format=tar", f"{sha}:{pre.rstrip('/')}" if pre else sha],
+                          capture_output=True)
+    if arch.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"git archive {sha[:12]} failed: {arch.stderr.decode()[-300:]}")
+    x = subprocess.run(["tar", "-x", "-C", os.path.join(tmp, "core")], input=arch.stdout, capture_output=True)
+    if x.returncode != 0 or not os.path.isfile(os.path.join(tmp, "core", must)):
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"{sha[:12]} holds no {must} under its core tree")
+    if pre and git(root, "cat-file", "-e", f"{sha}:tests/landing-repos")[0] == 0:
+        fb = os.path.join(tmp, "tests", "landing-repos")
+        os.makedirs(fb)
+        a2 = subprocess.run(["git", "-C", root, "archive", "--format=tar", f"{sha}:tests/landing-repos"],
+                            capture_output=True)
+        x2 = subprocess.run(["tar", "-x", "-C", fb], input=a2.stdout, capture_output=True) if not a2.returncode else a2
+        if x2.returncode != 0:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise RuntimeError(f"{sha[:12]}'s tests/landing-repos would not extract")
+    if os.path.isdir(dest) and not os.path.islink(dest) and tree_digest(dest) == tree_digest(tmp):
+        shutil.rmtree(tmp, ignore_errors=True)
+        return dest
+    if os.path.lexists(dest):
+        old = os.path.join(ROOT, kind, f".{sha[:12]}.old.{os.getpid()}")
+        os.rename(dest, old)
+        os.rename(tmp, dest)
+        if os.path.islink(old):
+            os.unlink(old)
+        else:
+            shutil.rmtree(old, ignore_errors=True)
+        print(f"lander-self: {kind}/{sha[:12]} did not match a fresh build of that commit; replaced it",
+              file=sys.stderr)
+        return dest
+    os.rename(tmp, dest)
+    return dest
+
+
+# --- pin -----------------------------------------------------------------------------------------------------------
+
+def cmd_pin(args, opts):
+    root = repo_of(opts.get("repo", ""))
+    if not root:
+        return die("pin: no checkout to pin from (--repo DIR)", 2)
+    rel = os.path.relpath(ME, root) if ME.startswith(root + "/") else ""
+    rel = rel or "core/bin/lander-self"
+    for ln in pin_remotes(root):
+        print(f"lander-self: {ln}")
+    main = main_sha(root)
+    if not main:
+        return die(f"pin: cannot fetch origin/main in {root}, or it differs from what origin names", 2)
+    sha = resolve(root, opts.get("rev", "")) if opts.get("rev") else main
+    if not sha:
+        return die(f"pin: cannot resolve {opts.get('rev')} in {root}", 2)
+    rc, body, err = git(root, "show", f"{sha}:{rel}")
+    if rc != 0:
+        rel = "bin/lander-self"
+        rc, body, err = git(root, "show", f"{sha}:{rel}")
+    if rc != 0:
+        return die(f"pin: {sha[:12]} has no lander-self: {err.strip()[-200:]}")
+    d = os.path.join(ROOT, "self", sha)
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "lander-self")
+    with open(p + ".tmp", "w") as f:
+        f.write(body)
+    os.chmod(p + ".tmp", 0o755)
+    os.replace(p + ".tmp", p)
+    _swap_self(d)
+    with open(os.path.join(ROOT, "repo"), "w") as f:
+        f.write(root + "\n")
+    print(f"lander-self: pinned lander-self at {sha[:12]} ({p})")
+    return 0
+
+
+def _swap_self(d):
+    os.makedirs(os.path.join(ROOT, "self"), exist_ok=True)
+    tmp = os.path.join(ROOT, "self", f".current.{os.getpid()}")
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(d, tmp)
+    os.replace(tmp, os.path.join(ROOT, "self", "current"))
+
+
+# --- promote / rollback / legacy -----------------------------------------------------------------------------------
+
+def release_green(rel):
+    rc, out, err = sh([sys.executable, "-P", os.path.join(rel, "core", "lander", "cli.py"), "selfcheck"],
+                      timeout=900, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    tail = (out + err).strip().splitlines()[-1:] or ["no output"]
+    return rc == 0, tail[0]
+
+
+def worker_caller(cwd=None):
+    """True for a worker or a member session: CC_ROLE says so, or a .cc/track / .cc/member-facing marker sits in
+    the cwd or above it (the marker cc-guard trusts over the env)."""
+    if os.environ.get("CC_ROLE", "") in ("worker", "member"):
+        return True
+    d = os.path.realpath(cwd or os.getcwd())
+    while True:
+        if any(os.path.exists(os.path.join(d, ".cc", m)) for m in ("track", "member-facing")):
+            return True
+        up = os.path.dirname(d)
+        if up == d:
+            return False
+        d = up
+
+
+def open_pr_head(root, pr):
+    """(head sha, comments) GitHub names for PR #pr when it is OPEN, else ("", [])."""
+    rc, out, _ = sh(["gh", "pr", "view", str(pr), *gh_repo(root), "--json", "headRefOid,state,comments"], cwd=root, timeout=60)
+    try:
+        j = json.loads(out) if rc == 0 else {}
+    except ValueError:
+        j = {}
+    if not isinstance(j, dict) or j.get("state") != "OPEN":
+        return "", []
+    return j.get("headRefOid") or "", j.get("comments") or []
+
+
+def promotable(root, sha, pr="", head_of=open_pr_head, main=""):
+    """'' when `sha` may be promoted, else why not. On origin/main (`main`, the sha main_sha verified, or an
+    ancestor of it) always; otherwise only as the cutover's step 5: --pr N, N an OPEN PR whose head is exactly sha,
+    both LAND records `land` demands standing at that head, and a caller that is no worker."""
+    if not main:
+        return "origin/main could not be fetched and checked against origin"
+    if git(root, "merge-base", "--is-ancestor", sha, main)[0] == 0:
+        return ""
+    if not pr:
+        return (f"{sha[:12]} is not on origin/main; only a merged commit is promoted (the cutover's step 5 names "
+                f"its PR with --pr)")
+    if not str(pr).isdigit():
+        return f"--pr {pr!r} is not a PR number"
+    if worker_caller():
+        return "a worker or member session may not promote a commit that is not on origin/main"
+    head, comments = head_of(root, pr)
+    if head != sha:
+        return (f"{sha[:12]} is not the head of open PR #{pr} "
+                f"({'GitHub names ' + head[:12] if head else 'GitHub names no open head'})")
+    miss = reads_missing(readers(comments, head))
+    if miss:
+        return f"PR #{pr} at {head[:12]} needs {' and '.join(miss)} recorded as LAND at this head"
+    return ""
+
+
+def cmd_promote(args, opts):
+    root = repo_of(opts.get("repo", ""))
+    if not root:
+        return die("promote: no checkout (--repo DIR)", 2)
+    for ln in pin_remotes(root):
+        print(f"lander-self: {ln}")
+    main = main_sha(root)
+    if not main:
+        return die(f"promote: cannot fetch origin/main in {root}, or it differs from what origin names", 2)
+    sha = resolve(root, args[0]) if args else main
+    if not sha:
+        return die(f"promote: cannot resolve {args[0]}", 2)
+    why = promotable(root, sha, opts.get("pr", ""), main=main)
+    if why:
+        return die(f"promote: refused — {why}")
+    try:
+        rel = build(root, sha, "releases")
+    except RuntimeError as e:
+        return die(f"promote: {e}")
+    ok, tail = release_green(rel)
+    if not ok:
+        return die(f"promote: {sha[:12]}'s own selfcheck is red, current is unchanged: {tail}")
+    cur = link_target("current")
+    if cur == os.path.realpath(rel):
+        unlink("legacy-on")
+        print(f"lander-self: {sha[:12]} is already current")
+        return 0
+    if cur:
+        swap("previous", cur)
+    swap("current", rel)
+    unlink("legacy-on")
+    print(f"lander-self: promoted {sha[:12]} (was {os.path.basename(cur)[:12] or 'none'}); "
+          f"`lander-self rollback` puts it back")
+    return 0
+
+
+def landq():
+    return os.environ.get("CC_LANDER_STATE") or os.path.join(HOME, ".cc", "state", "land")
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def running_lanes(q):
+    """The repos whose new-lander lane is running now (lanes/<repo>.running names a live pid)."""
+    out = []
+    for f in sorted(os.listdir(os.path.join(q, "lanes"))) if os.path.isdir(os.path.join(q, "lanes")) else []:
+        if f.endswith(".running"):
+            try:
+                pid = json.load(open(os.path.join(q, "lanes", f))).get("pid")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if pid_alive(pid):
+                out.append(f[:-len(".running")])
+    return out
+
+
+JOB_FILE = re.compile(r"^(?P<repo>[A-Za-z0-9_][A-Za-z0-9._-]{0,63})-(?P<pr>[0-9]+)\.json$")
+
+
+def hand_back_to_legacy(q, stamp):
+    """Move the new lander's queue out of the old one's way (see `rollback --legacy`). -> (requeue, lines)."""
+    post = os.path.join(q, "post-cutover", stamp)
+    os.makedirs(post, exist_ok=True)
+    requeue, lines, taken = [], [], set()
+
+    def read(p):
+        try:
+            j = json.load(open(p))
+            return j if isinstance(j, dict) else None
+        except (OSError, ValueError):
+            return None
+    for f in sorted(os.listdir(q)):
+        m, p = JOB_FILE.match(f), os.path.join(q, f)
+        j = read(p) if m and os.path.isfile(p) else None
+        if not (j and "state" in j and "history" in j):   # the new lander's job; the old one's have neither
+            continue
+        os.replace(p, os.path.join(post, f))
+        taken.add(f)
+        if j.get("state") not in DONE:
+            requeue.append((m["repo"], m["pr"]))
+    inbox = os.path.join(q, "jobs", "new")
+    for f in sorted(os.listdir(inbox)) if os.path.isdir(inbox) else []:
+        j = read(os.path.join(inbox, f))
+        os.makedirs(os.path.join(post, "inbox"), exist_ok=True)
+        os.replace(os.path.join(inbox, f), os.path.join(post, "inbox", f))
+        if j and REPO_RE.match(str(j.get("repo") or "")) and str(j.get("pr") or "").isdigit():
+            requeue.append((j["repo"], str(j["pr"])))
+    handed, pre = os.path.join(q, "handed"), os.path.join(q, "pre-cutover")
+    if os.path.isdir(handed):
+        os.replace(handed, os.path.join(post, "handed"))
+        lines.append(f"the new lander's handed-back watches are in {post}/handed; a seat's next `cc done` re-queues "
+                     "those PRs")
+    if os.path.isdir(os.path.join(pre, "handed")):
+        shutil.copytree(os.path.join(pre, "handed"), handed, symlinks=True)
+        lines.append("the old lander's handed-back watches are back from pre-cutover/handed")
+    back = 0
+    for f in sorted(os.listdir(pre)) if os.path.isdir(pre) else []:
+        if JOB_FILE.match(f) and f not in taken and not os.path.exists(os.path.join(q, f)):
+            shutil.copy2(os.path.join(pre, f), os.path.join(q, f))
+            back += 1
+    if back:
+        lines.append(f"{back} job(s) exported at the cutover and never taken up by the new lander are back in {q}")
+    seen, uniq = set(), []
+    for rp in requeue:
+        if rp not in seen:
+            seen.add(rp)
+            uniq.append(rp)
+    with open(os.path.join(post, "requeue.txt"), "w") as f:
+        f.writelines(f"cc-land queue {r} {n}\n" for r, n in uniq)
+    return uniq, lines
+
+
+def cmd_rollback(args, opts):
+    if opts.get("legacy"):
+        ld = os.path.join(ROOT, "legacy")
+        leg = sorted((os.path.join(ld, d) for d in os.listdir(ld) if not d.startswith(".")
+                      and os.path.isdir(os.path.join(ld, d)) and not os.path.islink(os.path.join(ld, d))),
+                     key=os.path.getmtime) if os.path.isdir(ld) else []
+        if not leg:
+            return die("rollback --legacy: no legacy release; `lander-self legacy <rev>` pins one")
+        q = landq()
+        busy = running_lanes(q)
+        if busy:
+            return die(f"rollback --legacy: the new lander's lane is running for {', '.join(busy)} — pause those "
+                       f"repos (cc-pause on <repo> --only) and wait for it to stop, then run this again")
+        swap("legacy-on", leg[-1])
+        import time
+        requeue, lines = hand_back_to_legacy(q, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())) \
+            if os.path.isdir(q) else ([], [])
+        print(f"lander-self: cc-land now runs the legacy lander at {os.path.basename(leg[-1])[:12]}; "
+              f"`lander-self promote` switches back")
+        for ln in lines:
+            print(f"  {ln}")
+        if requeue:
+            print(f"  {len(requeue)} PR(s) the new lander had in flight or waiting; queue each on the old lander:")
+            for r, n in requeue:
+                print(f"    cc-land queue {r} {n}")
+        return 0
+    cur, prev = link_target("current"), link_target("previous")
+    under = os.path.realpath(os.path.join(ROOT, "releases")) + os.sep
+    if not prev or not prev.startswith(under) or not os.path.isfile(os.path.join(prev, "core", "lander", "cli.py")):
+        return die("rollback: there is no previous release to go back to")
+    swap("current", prev)
+    if cur:
+        swap("previous", cur)
+    print(f"lander-self: rolled back to {os.path.basename(prev)[:12]} (from {os.path.basename(cur)[:12]})")
+    return 0
+
+
+def cmd_legacy(args, opts):
+    root = repo_of(opts.get("repo", ""))
+    if len(args) != 1 or not root:
+        return die("usage: lander-self legacy REV [--repo DIR]", 2)
+    sha = resolve(root, args[0])
+    if not sha:
+        return die(f"legacy: cannot resolve {args[0]}", 2)
+    try:
+        d = build(root, sha, "legacy", must="bin/cc-land")
+    except RuntimeError as e:
+        return die(f"legacy: {e}")
+    os.utime(d)
+    print(f"lander-self: legacy lander pinned at {sha[:12]}; `lander-self rollback --legacy` switches cc-land to it")
+    return 0
+
+
+def cmd_status(args, opts):
+    for name in ("current", "previous", "legacy-on", os.path.join("self", "current")):
+        t = link_target(name)
+        print(f"{name:13} {os.path.basename(t)[:12] if t else '-'}")
+    return 0
+
+
+# --- check / land --------------------------------------------------------------------------------------------------
+
+def glob_re(pat):
+    out, i = "", 0
+    while i < len(pat):
+        if pat.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pat[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pat[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(pat[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+def lander_list(policy_text):
+    """The `lander` list out of LANDING-policy.toml's [paths]. Raises ValueError when it is not there."""
+    import tomllib
+    lst = (tomllib.loads(policy_text).get("paths") or {}).get("lander")
+    if not isinstance(lst, list) or not lst or not all(isinstance(p, str) for p in lst):
+        raise ValueError("no [paths] lander list")
+    return lst
+
+
+def outside(files, pats):
+    rx = [glob_re(p) for p in pats]
+    return [f for f in files if not any(r.match(f) for r in rx)]
+
+
+def readers(comments, head):
+    """Who recorded LAND at this head, from markers this box's own login wrote. -> set of `by` names."""
+    out = set()
+    for c in comments or []:
+        m = MARK_RE.match(c.get("body") or "") if c.get("viewerDidAuthor") else None
+        if m and head.startswith(m.group(1)) and len(m.group(1)) >= 7 and m.group(2) == "LAND":
+            out.add(m.group(3))
+    return out
+
+
+def reads_missing(by):
+    sec = {b for b in by if "security" in b.lower()}
+    miss = []
+    if not sec:
+        miss.append("a security read")
+    if not (by - sec):
+        miss.append("an Opus read")
+    return miss
+
+
+def bwrap(tree, argv, ro=(), cap=TEST_CAP, rw=True):
+    """Run argv (a list: no shell, so nothing in it is parsed) in `tree` — bound rw at the same path when rw, else
+    read-only — with no network, a tmpfs HOME and a clear env."""
+    a = ["bwrap", "--die-with-parent", "--new-session", "--unshare-all", "--clearenv", "--ro-bind", "/usr", "/usr"]
+    for d in ("bin", "lib", "lib32", "lib64", "sbin"):
+        p = "/" + d
+        if os.path.islink(p):
+            a += ["--symlink", os.readlink(p), p]
+        elif os.path.isdir(p):
+            a += ["--ro-bind", p, p]
+    a += ["--ro-bind", "/etc", "/etc", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/run",
+          "--tmpfs", HOME]
+    for p in ro:
+        a += ["--ro-bind", p, p]
+    a += ["--bind" if rw else "--ro-bind", tree, tree, "--chdir", tree]
+    for k, v in {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": HOME, "LANG": "C.UTF-8", "TMPDIR": "/tmp",
+                 "PYTHONDONTWRITEBYTECODE": "1", "USER": os.environ.get("USER", "lander")}.items():
+        a += ["--setenv", k, v]
+    return sh(a + ["--", *argv], timeout=cap)
+
+
+def merge_tree(root, base, head):
+    rc, out, err = git(root, "merge-tree", "--write-tree", base, head)
+    return out.split()[0] if rc == 0 and out.split() else ""
+
+
+def candidate_tests(root, tree, pre):
+    """The candidate's own tests on its merge tree, in bwrap. -> (ok, lines)."""
+    tmp = tempfile.mkdtemp(prefix="lander-self.check.")
+    try:
+        a = subprocess.run(["git", "-C", root, "archive", "--format=tar", tree], capture_output=True)
+        subprocess.run(["tar", "-x", "-C", tmp], input=a.stdout, check=False)
+        c = f"{tmp}/{pre}"
+        out, ok = [], True
+        for name, argv in (("lander selfcheck", ["python3", "-P", f"{c}lander/cli.py", "selfcheck"]),
+                           ("tests/lander", ["python3", "-m", "unittest", "discover", "-s", f"{c}tests/lander",
+                                             "-t", f"{c}tests/lander"])):
+            rc, o, e = bwrap(tmp, argv)
+            tail = [ln for ln in (o + e).strip().splitlines() if ln.strip()][-1:] or ["no output"]
+            out.append(f"{name}: {'passed' if rc == 0 else f'FAILED (rc {rc})'} — {tail[0]}")
+            ok = ok and rc == 0
+        return ok, out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def live_jobs():
+    q = os.environ.get("CC_LANDER_STATE") or os.path.join(HOME, ".cc", "state", "land")
+    jobs = []
+    for f in sorted(os.listdir(q)) if os.path.isdir(q) else []:
+        if not f.endswith(".json"):
+            continue
+        try:
+            j = json.load(open(os.path.join(q, f)))
+        except (OSError, ValueError):
+            continue
+        st = j.get("state") or j.get("stage") or ""
+        if isinstance(j, dict) and j.get("repo") and j.get("pr") and st not in DONE:
+            jobs.append(j)
+    return jobs
+
+
+def shadow(cand_core, cur_core, jobs, dev):
+    """Plan each live job with the current release and the candidate, both in bwrap with the repo read-only.
+    -> (regressions, lines)."""
+    lines, bad = [], 0
+    for j in jobs:
+        repo = str(j.get("repo"))
+        root = os.path.join(dev, repo)
+        base, head = str(j.get("base_sha") or j.get("base") or ""), str(j.get("head") or "")
+        if not (REPO_RE.match(repo) and os.path.isdir(os.path.join(root, ".git")) and SHA_RE.match(base)
+                and SHA_RE.match(head)):
+            lines.append(f"  {repo}#{j.get('pr')}: skipped (no checkout, or no base and head sha in its job)")
+            continue
+        res = []
+        for core in (cur_core, cand_core):
+            if not core:
+                res.append(None)
+                continue
+            rc, o, e = bwrap(core, ["python3", "-P", f"{core}/lander/cli.py", "plan", "--repo", root, base, head],
+                             ro=(root,), cap=300, rw=False)
+            try:
+                p = json.loads(o) if rc == 0 else None
+            except ValueError:
+                p = None
+            res.append(p)
+        show = lambda p: "cannot plan" if p is None else f"{p.get('klass')} {len(p.get('checks') or [])} checks"  # noqa
+        cur, cand = res
+        mark = "" if (cur or {}).get("klass") == (cand or {}).get("klass") and \
+            sorted((cur or {}).get("checks") or []) == sorted((cand or {}).get("checks") or []) else "  ← differs"
+        if cur is not None and cand is None:
+            bad += 1
+            mark = "  ← REGRESSION: the candidate cannot plan it"
+        lines.append(f"  {repo}#{j.get('pr')}: current {show(cur)} → candidate {show(cand)}{mark}")
+    return bad, lines
+
+
+def fill_heads(jobs, dev):
+    """Give each job a head (from GitHub) and a base (origin/main) when its file names none."""
+    for j in jobs:
+        root = os.path.join(dev, str(j.get("repo")))
+        if j.get("head") or not REPO_RE.match(str(j.get("repo"))) or not str(j.get("pr")).isdigit() \
+                or not os.path.isdir(os.path.join(root, ".git")):
+            continue
+        rc, out, _ = sh(["gh", "pr", "view", str(j.get("pr")), "--json", "headRefOid", "-q", ".headRefOid"],
+                        cwd=root, timeout=60)
+        head = out.strip() if rc == 0 and SHA_RE.match(out.strip()) else ""
+        if head and fetch(root, "main", f"pull/{j.get('pr')}/head"):
+            j["head"], j["base_sha"] = head, j.get("base_sha") or resolve(root, "refs/remotes/origin/main")
+    return jobs
+
+
+def cmd_shadow(args, opts):
+    root = repo_of(opts.get("repo", ""))
+    if len(args) > 1 or not root:
+        return die("usage: lander-self shadow [REV] [--repo DIR]", 2)
+    sha = resolve(root, args[0] if args else "")
+    if not sha:
+        return die(f"shadow: cannot resolve {args[0] if args else 'origin/main'} in {root}", 3)
+    if not shutil.which("bwrap"):
+        return die("shadow: bwrap is not installed, so the plans cannot run sandboxed", 3)
+    dev = os.environ.get("CC_DEV") or os.path.join(HOME, "dev")
+    pre = core_prefix(root, sha)
+    tmp = tempfile.mkdtemp(prefix="lander-self.shadow.")
+    try:
+        a = subprocess.run(["git", "-C", root, "archive", "--format=tar", f"{sha}:{pre.rstrip('/')}" if pre else sha],
+                           capture_output=True)
+        subprocess.run(["tar", "-x", "-C", tmp], input=a.stdout, check=False)
+        if not os.path.isfile(os.path.join(tmp, "lander", "cli.py")):
+            return die(f"shadow: {sha[:12]} holds no lander/cli.py under its core tree", 3)
+        cur = link_target("current")
+        _, sl = shadow(tmp, os.path.join(cur, "core") if cur else "", fill_heads(live_jobs(), dev), dev)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    bad = [ln for ln in sl if "→ candidate cannot plan" in ln]
+    print(f"lander-self shadow: {sha[:12]} over the live queue ({len(sl)} job(s)):")
+    for ln in sl:
+        print(ln)
+    if bad:
+        return die(f"shadow: the candidate cannot plan {len(bad)} job(s)")
+    return 0
+
+
+def cmd_check(args, opts):
+    if len(args) != 2 or not REPO_RE.match(args[0]) or not args[1].isdigit():
+        return die("usage: lander-self check <repo> <pr> [--repo-dir DIR]", 2), None
+    repo, pr = args[0], args[1]
+    dev = os.environ.get("CC_DEV") or os.path.join(HOME, "dev")
+    root = os.path.realpath(opts.get("repo-dir") or os.path.join(dev, repo))
+    if not os.path.isdir(os.path.join(root, ".git")) and not os.path.isfile(os.path.join(root, ".git")):
+        return die(f"check: no checkout at {root}", 3), None
+    rc, out, err = sh(["gh", "pr", "view", pr, *gh_repo(root), "--json", "headRefOid,baseRefName,state,files,comments"],
+                      cwd=root)
+    try:
+        facts = json.loads(out) if rc == 0 else None
+    except ValueError:
+        facts = None
+    if not facts:
+        return die(f"check: cannot read PR #{pr} from GitHub: {err.strip()[-200:]}", 3), None
+    if facts.get("state") != "OPEN":
+        return die(f"check: PR #{pr} is {facts.get('state')}"), None
+    head, base = facts.get("headRefOid") or "", facts.get("baseRefName") or "main"
+    base_sha = main_sha(root, base) if re.fullmatch(r"[A-Za-z0-9._/-]+", base) else ""
+    if not base_sha or not fetch(root, f"pull/{pr}/head") or git(root, "cat-file", "-e", f"{head}^{{commit}}")[0]:
+        return die(f"check: cannot fetch {base} and PR #{pr}'s head from the pinned remote", 3), None
+    rc, mb, _ = git(root, "merge-base", base_sha, head)
+    rc2, names, _ = git(root, "diff", "--name-only", "--no-renames", mb.strip(), head)
+    files = sorted(set(names.split()) | {f.get("path", "") for f in facts.get("files") or []} - {""})
+    if rc or rc2 or not files:
+        return die(f"check: cannot list PR #{pr}'s changed files", 3), None
+    rc, pol, _ = git(root, "show", f"{base_sha}:tests/LANDING-policy.toml")
+    try:
+        pats = lander_list(pol) if rc == 0 else None
+    except ValueError:
+        pats = None
+    if not pats:
+        return die(f"check: the base {base_sha[:12]} has no lander list in tests/LANDING-policy.toml, so no path "
+                   "may land this way"), None
+    out_ = outside(files, pats)
+    if out_:
+        return die(f"check: PR #{pr} is refused whole: {len(out_)} changed path(s) are not the lander's — "
+                   f"{', '.join(out_[:8])}. Split them into an ordinary PR."), None
+    by = readers(facts.get("comments"), head)
+    miss = reads_missing(by)
+    if miss:
+        return die(f"check: PR #{pr} at {head[:12]} needs {' and '.join(miss)} recorded at this head "
+                   f"(`lander record {repo} {pr} LAND --by <reader> --head {head[:12]}`); found: "
+                   f"{', '.join(sorted(by)) or 'none'}"), None
+    tree = merge_tree(root, base_sha, head)
+    if not tree:
+        return die(f"check: PR #{pr} does not merge cleanly onto {base}"), None
+    pre = core_prefix(root, head)
+    if not shutil.which("bwrap"):
+        return die("check: bwrap is not installed, so the candidate's tests cannot run sandboxed", 3), None
+    ok, lines = candidate_tests(root, tree, pre)
+    for ln in lines:
+        print(f"  {ln}")
+    if not ok:
+        return die(f"check: PR #{pr}'s own tests are red on its merge tree"), None
+    tmp = tempfile.mkdtemp(prefix="lander-self.shadow.")
+    try:
+        a = subprocess.run(["git", "-C", root, "archive", "--format=tar", f"{tree}:{pre.rstrip('/')}" if pre else tree],
+                           capture_output=True)
+        subprocess.run(["tar", "-x", "-C", tmp], input=a.stdout, check=False)
+        cur = link_target("current")
+        bad, sl = shadow(tmp, os.path.join(cur, "core") if cur else "", live_jobs(), dev)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"  shadow plan over the live queue ({len(sl)} job(s)):")
+    for ln in sl:
+        print(ln)
+    if bad:
+        return die(f"check: the candidate cannot plan {bad} job(s) the current release plans"), None
+    print(f"lander-self check: {repo}#{pr} at {head[:12]} passed — {len(files)} lander path(s), read by "
+          f"{', '.join(sorted(by))}, own tests green in bwrap")
+    return 0, head
+
+
+def cmd_land(args, opts):
+    rc, head = cmd_check(args, opts)
+    if rc != 0:
+        return rc
+    dev = os.environ.get("CC_DEV") or os.path.join(HOME, "dev")
+    root = os.path.realpath(opts.get("repo-dir") or os.path.join(dev, args[0]))
+    rc, out, err = sh(["gh", "pr", "merge", args[1], *gh_repo(root), "--squash", "--match-head-commit", head,
+                       "--delete-branch"], cwd=root)
+    if rc != 0:
+        return die(f"land: the merge did not go through: {(out + err).strip()[-300:]}")
+    print(f"lander-self: merged {args[0]}#{args[1]} at {head[:12]}; `lander-self promote` switches the lander to it")
+    return 0
+
+
+# --- selfcheck -----------------------------------------------------------------------------------------------------
+
+def selfcheck():
+    """Every case builds its own HOME and repo. Prints `lander-self selfcheck: N passed, M failed`."""
+    global HOME, ROOT, ALLOW_LOCAL
+    results = []
+
+    def case(name, cond):
+        results.append((name, bool(cond)))
+        if not cond:
+            print(f"lander-self selfcheck: FAIL {name}")
+
+    old = HOME, ROOT
+    # the path rule: every changed path must be on the list, and ** crosses segments while * does not
+    pats = ["core/lander/**", "core/bin/lander", "core/bin/lander-self", "tests/LANDING.toml"]
+    case("paths on the list pass", outside(["core/lander/a/b.py", "core/bin/lander-self"], pats) == [])
+    case("a path off the list is named", outside(["core/lander/x.py", "core/bin/cc-land"], pats) == ["core/bin/cc-land"])
+    case("* stays in one segment", outside(["core/bin/lander/x"], ["core/bin/*"]) == ["core/bin/lander/x"])
+    case("policy without a lander list refuses", _raises(lambda: lander_list("[paths]\ngate_first=['a']\n")))
+    case("policy lander list parses", lander_list('[paths]\nlander = ["core/lander/**"]\n') == ["core/lander/**"])
+    # records: only the box's own LAND markers at this head count, and both kinds of reader are needed
+    h = "0123456789abcdef0123"
+    mk = lambda hd, v, b, own=True: {"viewerDidAuthor": own, "body":  # noqa: E731
+                                     f"<!-- cc-land-review v2 change=ab base=cd head={hd} verdict={v} by={b} -->\nx"}
+    by = readers([mk(h[:12], "LAND", "opus-5.5"), mk(h[:12], "LAND", "security-reviewer"),
+                  mk(h[:12], "LAND", "forged-security", own=False), mk("fedcba987654", "LAND", "old-security"),
+                  mk(h[:12], "HANDBACK", "sec-security")], h)
+    case("readers keep own LAND at head only", by == {"opus-5.5", "security-reviewer"})
+    case("both reads present -> nothing missing", reads_missing(by) == [])
+    case("no security read is named", reads_missing({"opus-5.5"}) == ["a security read"])
+    case("a security read alone is not enough", reads_missing({"security-reviewer"}) == ["an Opus read"])
+    # pin / promote / rollback / legacy on a throwaway repo and HOME
+    with tempfile.TemporaryDirectory() as t:
+        HOME, ROOT = t, os.path.join(t, ".cc", "lander")
+        repo = os.path.join(t, "repo")
+        os.makedirs(os.path.join(repo, "core", "lander"))
+        os.makedirs(os.path.join(repo, "core", "bin"))
+        cli = os.path.join(repo, "core", "lander", "cli.py")
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def commit(rc_word, msg):
+            with open(cli, "w") as f:
+                f.write(f"import sys; print('lander selfcheck: 1 passed'); sys.exit({rc_word})\n")
+            with open(os.path.join(repo, "core", "bin", "lander-self"), "w") as f:
+                f.write(f"# {msg}\n")
+            with open(os.path.join(repo, "core", "bin", "cc-land"), "w") as f:
+                f.write("# old\n")
+            os.makedirs(os.path.join(repo, "tests", "landing-repos"), exist_ok=True)
+            with open(os.path.join(repo, "tests", "landing-repos", "demo.toml"), "w") as f:
+                f.write(f"# {msg}\n")
+            subprocess.run(["git", "-C", repo, "add", "-A"], env=env, capture_output=True)
+            subprocess.run(["git", "-C", repo, "commit", "-qm", msg], env=env, capture_output=True)
+            return git(repo, "rev-parse", "HEAD")[1].strip()
+
+        subprocess.run(["git", "init", "-q", repo], env=env, capture_output=True)
+        a = commit(0, "a")
+        b = commit(0, "b")
+        red = commit(1, "red")
+        bare = os.path.join(t, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", bare], env=env, capture_output=True)
+        subprocess.run(["git", "-C", repo, "remote", "add", "origin", bare], capture_output=True)
+        subprocess.run(["git", "-C", repo, "push", "-q", "origin", f"{red}:refs/heads/main"], capture_output=True)
+        side = commit(0, "side")          # a commit that is not on origin/main: a PR head, or anything else
+        # a local branch named origin/main (refs/heads/origin/main) at `side` must not pass for origin's main
+        subprocess.run(["git", "-C", repo, "branch", "-f", "origin/main", side], capture_output=True)
+        o = {"repo": repo}
+        # the boards: a project's checkout (pinned with the tool's own), a member repo's (never pinned here)
+        boards, other = os.path.join(t, "boards"), os.path.join(t, "dev", "other")
+        os.makedirs(boards)
+        for d in (other, os.path.join(t, "dev", "h--t")):
+            subprocess.run(["git", "init", "-q", d], capture_output=True)
+            subprocess.run(["git", "-C", d, "remote", "add", "origin", bare], capture_output=True)
+        for n, path in (("other", other), ("h--t", os.path.join(t, "dev", "h--t"))):
+            with open(os.path.join(boards, f"{n}.json"), "w") as f:
+                json.dump({"path": path}, f)
+        saved_env = {k: os.environ.get(k) for k in ("CC_BOARDS", "CC_DEV")}
+        os.environ.update(CC_BOARDS=boards, CC_DEV=os.path.join(t, "dev"))
+        quiet = open(os.devnull, "w")
+        _out, _err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = quiet
+        try:
+            nolocal = pin_remotes(repo)          # a local path is no GitHub repo: nothing is pinned
+            pins_nolocal = load_remotes()
+            ALLOW_LOCAL = True
+            r_pin = cmd_pin([], {**o, "rev": a})
+            pins_first = load_remotes()
+            pinned_a = open(os.path.join(ROOT, "self", "current", "lander-self")).read()
+            r1 = cmd_promote([a], o)
+            r2 = cmd_promote([b], o)
+            cur_b, prev_a = link_target("current"), link_target("previous")
+            r3 = cmd_promote([red], o)
+            cur_after_red = link_target("current")
+            r4 = cmd_rollback([], {})
+            cur_rb, prev_rb = link_target("current"), link_target("previous")
+            r5 = cmd_rollback([], {"legacy": True})
+            r6 = cmd_legacy([a], o)
+            r7 = cmd_rollback([], {"legacy": True})
+            leg = link_target("legacy-on")
+            r8 = cmd_promote([b], o)
+            leg_after = link_target("legacy-on")
+            r_side = cmd_promote([side], o)
+            cur_side = link_target("current")
+            r_pin_side = cmd_pin([], o)
+            pinned_side = open(os.path.join(ROOT, "self", "current", "lander-self")).read()
+            # a worker's forgery in the shared .git: origin repointed to its own bare repo whose main is `side`,
+            # the fetch refspec unset, refs/remotes/origin/main planted — the pinned URL is fetched all the same
+            evil = os.path.join(t, "evil.git")
+            subprocess.run(["git", "clone", "-q", "--bare", bare, evil], capture_output=True)
+            subprocess.run(["git", "-C", repo, "push", "-q", "-f", evil, f"{side}:refs/heads/main"],
+                           capture_output=True)
+            subprocess.run(["git", "-C", repo, "remote", "set-url", "origin", evil], capture_output=True)
+            subprocess.run(["git", "-C", repo, "config", "--unset-all", "remote.origin.fetch"], capture_output=True)
+            subprocess.run(["git", "-C", repo, "update-ref", "refs/remotes/origin/main", side], capture_output=True)
+            r_forged = cmd_promote([side], o)
+            cur_forged = link_target("current")
+            main_forged = main_sha(repo)
+            pins_forged = load_remotes()
+            subprocess.run(["git", "-C", repo, "config", f"url.{evil}.insteadOf", bare], capture_output=True)
+            main_rewritten = main_sha(repo)      # a config rewrite of the pinned URL: refused, not followed
+            subprocess.run(["git", "-C", repo, "config", "--unset", f"url.{evil}.insteadOf"], capture_output=True)
+            # the same rewrite with a space in its subsection, brought in through include.path, to a repo that exists
+            subprocess.run(["git", "clone", "-q", "--bare", evil, os.path.join(t, "e x")], capture_output=True)
+            with open(os.path.join(t, "x.cfg"), "w") as f:
+                f.write(f'[url "{t}/e x"]\n\tinsteadOf = {bare}\n')
+            subprocess.run(["git", "-C", repo, "config", "include.path", os.path.join(t, "x.cfg")], capture_output=True)
+            main_spaced = main_sha(repo)
+            subprocess.run(["git", "-C", repo, "config", "--unset", "include.path"], capture_output=True)
+            # remotes.json: only an https://github.com/<owner>/<repo> URL is taken from it
+            pins_path = os.path.join(ROOT, "remotes.json")
+            pins_saved = open(pins_path).read()
+            ALLOW_LOCAL = False
+            gh_only = []
+            for u in (bare, "https://evil.example/o/r.git", "ssh://git@github.com/o/r.git",
+                      "https://github.com/o/r.git"):
+                with open(pins_path, "w") as f:
+                    json.dump({os.path.realpath(repo): u}, f)
+                gh_only.append(remote_for(repo))
+            ALLOW_LOCAL = True
+            with open(pins_path, "w") as f:
+                f.write(pins_saved)
+            os.rename(bare, bare + ".away")      # the pinned remote cannot be reached
+            r_nofetch = cmd_promote([b], o)
+            r_pin_nofetch = cmd_pin([], {**o, "rev": a})
+            os.rename(bare + ".away", bare)
+            # a release planted (or edited) under releases/<sha> is rebuilt, never run as it stands
+            with open(os.path.join(ROOT, "releases", b, "core", "lander", "cli.py"), "a") as f:
+                f.write("\n# planted\n")
+            r_plant = cmd_promote([b], o)
+            clean = "planted" not in open(os.path.join(ROOT, "releases", b, "core", "lander", "cli.py")).read()
+        finally:
+            sys.stdout, sys.stderr = _out, _err
+            quiet.close()
+            ALLOW_LOCAL = False
+            for k, v in saved_env.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        case("a checkout whose origin is not GitHub is not pinned", pins_nolocal == {} and
+             any("will not fetch" in ln for ln in nolocal))
+        case("pin pins the tool's checkout and each project board's, not a member repo's",
+             pins_first == {os.path.realpath(repo): bare, os.path.realpath(other): bare})
+        case("a forged origin in the shared .git is ignored: main is the pinned remote's, side is refused",
+             main_forged == red and r_forged != 0 and cur_forged == cur_side and
+             pins_forged.get(os.path.realpath(repo)) == bare)
+        case("a url.<x>.insteadOf in the shared config that rewrites the pinned URL is refused", main_rewritten == "")
+        case("a url.<x>.insteadOf with a space in its subsection, via include.path, is refused", main_spaced == "")
+        case("only an https://github.com/<owner>/<repo> URL is taken from remotes.json",
+             gh_only == ["", "", "", "https://github.com/o/r.git"])
+        case("pin copies the committed tool", r_pin == 0 and pinned_a == "# a\n")
+        case("promote builds and switches", r1 == 0 and r2 == 0 and cur_b.endswith(b) and prev_a.endswith(a))
+        case("release laid out under core/", os.path.isfile(os.path.join(cur_b, "core", "lander", "cli.py")))
+        case("release carries the host fallback manifests",
+             os.path.isfile(os.path.join(cur_b, "tests", "landing-repos", "demo.toml")))
+        case("a red release is refused, current kept", r3 != 0 and cur_after_red == cur_b)
+        case("rollback swaps current and previous", r4 == 0 and cur_rb.endswith(a) and prev_rb.endswith(b))
+        case("rollback --legacy with nothing pinned refuses", r5 != 0)
+        case("legacy pins and rollback --legacy points at it", r6 == 0 and r7 == 0 and leg.endswith(a))
+        case("promote clears the legacy switch", r8 == 0 and leg_after == "")
+        case("a commit not on origin/main is refused", r_side != 0 and cur_side == cur_b)
+        case("origin/main resolves to origin's, not to a local branch named origin/main",
+             resolve(repo, "origin/main") == red and resolve(repo, "") == red)
+        case("pin with no rev takes origin's main, not a local origin/main branch",
+             r_pin_side == 0 and pinned_side == "# red\n")
+        case("promote refuses when the pinned remote cannot be fetched", r_nofetch != 0)
+        case("pin refuses when the fetch fails", r_pin_nofetch != 0)
+        case("an edited release dir is rebuilt from the commit", r_plant == 0 and clean)
+        role, here = os.environ.pop("CC_ROLE", None), os.getcwd()
+        os.chdir(t)   # no .cc/track above: this selfcheck may itself run inside a worker's worktree
+        both = [mk(side[:12], "LAND", "opus-5.5"), mk(side[:12], "LAND", "security-reviewer")]
+        m = red
+        try:
+            case("--pr allows exactly the open PR's head with both LAND records",
+                 promotable(repo, side, "5", lambda r, n: (side, both), main=m) == "")
+            case("--pr with another head is refused", promotable(repo, side, "5", lambda r, n: (a, both), main=m) != "")
+            case("--pr without a security LAND at the head is refused", "security" in promotable(
+                repo, side, "5", lambda r, n: (side, both[:1]), main=m))
+            case("--pr with LAND records at an older head is refused", promotable(
+                repo, side, "5", lambda r, n: (side, [mk(a[:12], "LAND", "opus-5.5"),
+                                                      mk(a[:12], "LAND", "security-reviewer")]), main=m) != "")
+            case("no --pr: a non-main commit is refused", promotable(repo, side, "", main=m) != "")
+            case("no verified main: everything is refused", promotable(repo, b, "") != "")
+            os.environ["CC_ROLE"] = "worker"
+            case("a worker may not use --pr", "worker" in promotable(repo, side, "5", lambda r, n: (side, both),
+                                                                     main=m))
+            case("a worker may still promote main", promotable(repo, b, "", main=m) == "")
+            os.environ.pop("CC_ROLE", None)
+            os.makedirs(os.path.join(t, "wt", ".cc"))
+            open(os.path.join(t, "wt", ".cc", "track"), "w").close()
+            os.chdir(os.path.join(t, "wt"))
+            case("a .cc/track above the cwd is a worker too",
+                 "worker" in promotable(repo, side, "5", lambda r, n: (side, both), main=m))
+        finally:
+            os.chdir(here)
+            os.environ.pop("CC_ROLE", None)
+            if role is not None:
+                os.environ["CC_ROLE"] = role
+        rollback_legacy_cases(case, t)
+    # shadow: a job that already names a head, or has no checkout, is left as it is (GitHub is never asked);
+    # a second REV is a usage refusal before anything is read
+    with tempfile.TemporaryDirectory() as dev:
+        os.makedirs(os.path.join(dev, "r", ".git"))
+        given = [{"repo": "r", "pr": 1, "head": "h" * 40, "base_sha": "b" * 40}, {"repo": "gone", "pr": 2}]
+        case("shadow leaves a job with a head, and one with no checkout, alone",
+             fill_heads([dict(j) for j in given], dev) == given)
+        _, sl = shadow("", "", [{"repo": "r", "pr": 1, "head": "$(touch /tmp/x)", "base_sha": "b" * 40}], dev)
+        case("shadow skips a job whose head is not a sha (nothing reaches a command line)", "skipped" in sl[0])
+        _err, sys.stderr = sys.stderr, open(os.devnull, "w")
+        try:
+            r_use = cmd_shadow(["a", "b"], {"repo": dev})
+        finally:
+            sys.stderr.close()
+            sys.stderr = _err
+        case("shadow with two revs is a usage refusal", r_use == 2)
+    HOME, ROOT = old
+    bad = sum(1 for _, ok in results if not ok)
+    print(f"lander-self selfcheck: {len(results) - bad} passed, {bad} failed")
+    return 1 if bad else 0
+
+
+def rollback_legacy_cases(case, t):
+    """rollback --legacy hands the queue back: the new lander's jobs, inbox and watches move aside, the exported old
+    jobs it never took up come back, and every PR still in flight is named for a re-queue; a running lane refuses."""
+    q = os.path.join(t, "q")
+    old = os.environ.get("CC_LANDER_STATE")
+    os.environ["CC_LANDER_STATE"] = q
+
+    def w(p, j):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(j, f)
+    new = lambda st: {"repo": "r", "pr": 1, "state": st, "stage": st, "history": []}  # noqa: E731
+    w(os.path.join(q, "r-1.json"), new("checking"))
+    w(os.path.join(q, "r-2.json"), dict(new("done"), pr=2))
+    w(os.path.join(q, "jobs", "new", "s-3.1.ab.json"), {"repo": "s", "pr": 3})
+    w(os.path.join(q, "handed", "r-4.json"), {"repo": "r", "pr": 4, "since": "x"})
+    w(os.path.join(q, "pre-cutover", "r-1.json"), {"repo": "r", "pr": 1, "stage": "gates"})
+    w(os.path.join(q, "pre-cutover", "u-5.json"), {"repo": "u", "pr": 5, "stage": "queued"})
+    w(os.path.join(q, "pre-cutover", "handed", "v-6.json"), {"repo": "v", "pr": 6})
+    w(os.path.join(q, "lanes", "r.running"), {"pid": os.getpid()})
+    quiet, keep = open(os.devnull, "w"), (sys.stdout, sys.stderr)
+    sys.stdout = sys.stderr = quiet
+    try:
+        r_busy = cmd_rollback([], {"legacy": True})
+        on_busy = link_target("legacy-on")
+        os.unlink(os.path.join(q, "lanes", "r.running"))
+        r_ok = cmd_rollback([], {"legacy": True})
+    finally:
+        sys.stdout, sys.stderr = keep
+        quiet.close()
+        if old is None:
+            os.environ.pop("CC_LANDER_STATE", None)
+        else:
+            os.environ["CC_LANDER_STATE"] = old
+    posts = [os.path.join(q, "post-cutover", d) for d in os.listdir(os.path.join(q, "post-cutover"))] \
+        if os.path.isdir(os.path.join(q, "post-cutover")) else []
+    req = open(os.path.join(posts[0], "requeue.txt")).read() if posts else ""
+    case("rollback --legacy refuses while a new lane runs", r_busy != 0 and on_busy == "")
+    case("rollback --legacy names every PR in flight for the old lander",
+         r_ok == 0 and req == "cc-land queue r 1\ncc-land queue s 3\n")
+    case("…moves the new lander's jobs, inbox and watches aside",
+         not os.path.exists(os.path.join(q, "r-2.json")) and not os.listdir(os.path.join(q, "jobs", "new"))
+         and os.path.isfile(os.path.join(posts[0] if posts else q, "handed", "r-4.json")))
+    case("…and puts back the old jobs and watches the new lander never took up",
+         os.path.isfile(os.path.join(q, "u-5.json")) and not os.path.exists(os.path.join(q, "r-1.json"))
+         and os.path.isfile(os.path.join(q, "handed", "v-6.json")))
+
+
+def _raises(f):
+    try:
+        f()
+    except ValueError:
+        return True
+    return False
+
+
+# --- main ----------------------------------------------------------------------------------------------------------
+
+def parse(argv):
+    args, opts, it = [], {}, iter(argv)
+    for a in it:
+        if a in ("--repo", "--rev", "--repo-dir", "--pr"):
+            opts[a[2:]] = next(it, "")
+        elif a == "--legacy":
+            opts["legacy"] = True
+        else:
+            args.append(a)
+    return args, opts
+
+
+def main(argv):
+    cmd = argv[0] if argv else ""
+    if cmd in ("", "-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if cmd else 2
+    if cmd == "selfcheck":
+        return selfcheck()
+    pinned = os.path.realpath(os.path.join(ROOT, "self"))
+    if cmd != "pin" and not ME.startswith(pinned + "/"):
+        p = os.path.join(ROOT, "self", "current", "lander-self")
+        if not os.path.isfile(p):
+            return die("not pinned: run `lander-self pin` once (it copies the committed tool out of the checkout)", 3)
+        os.execv(sys.executable, [sys.executable, "-P", p, *argv])
+    args, opts = parse(argv[1:])
+    table = {"pin": cmd_pin, "promote": cmd_promote, "rollback": cmd_rollback, "legacy": cmd_legacy,
+             "status": cmd_status, "land": cmd_land, "shadow": cmd_shadow, "check": lambda a, o: cmd_check(a, o)[0]}
+    if cmd not in table:
+        return die(f"no command {cmd!r} (lander-self --help)", 2)
+    return table[cmd](args, opts)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

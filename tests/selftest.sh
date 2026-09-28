@@ -2476,7 +2476,15 @@ export PATH="$D/bin:/usr/bin:/bin" GIT_CONFIG_GLOBAL="$D/gitconfig" GIT_CONFIG_S
 export CC_CONFIG="$D/config" CC_SELF_LAND_EXCEPT= CC_SLACK="$D/bin/cc-slack" CC_CLAUDE="$D/bin/claude"
 unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST GH_REPO TMUX TMUX_PANE CC_MEMBER_SANDBOX CC_WORKER_SANDBOX
 printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"; : > "$D/config"
-cp "$B/cc" "$B/cc-task" "$B/cc-loop" "$B/cc-land" "$B/cc-checkpoint" "$B/cc-config" "$D/bin/"
+cp "$B/cc" "$B/cc-task" "$B/cc-loop" "$B/cc-land" "$B/lander" "$B/cc-checkpoint" "$B/cc-config" "$D/bin/"
+# cc-land is a shim over `lander`, which runs only a pinned release: this HOME gets one, the lander beside $B.
+mkdir -p "$HOME/.cc/lander/current/core"; cp -r "$B/../lander" "$HOME/.cc/lander/current/core/"
+# `lander queue` writes a request into the inbox, and the job file appears when a lane folds it in. No lane runs
+# here (systemd-run is a stub), so fold_r does that fold, as the next lane would, before a job file is read.
+fold_r(){ python3 -P -c 'import sys; sys.path.insert(0, sys.argv[1])
+from lander import jobs as J
+with J.lane_lock("r", wait=True):
+    J.drain("r")' "$HOME/.cc/lander/current/core"; }
 cat > "$D/bin/cc-board" <<'SH'
 #!/bin/bash
 case "$*" in 'status r row review') [ ! -e "$D/board.fail" ] || exit 1;; esac
@@ -2535,20 +2543,23 @@ mkdir -p "$(dirname "$wt")"; git -C "$HOME/dev/r" worktree add -q -b track/row "
 "$D/bin/cc-task" claim r row --executor subagent >/dev/null
 echo work > "$wt/work.txt"
 "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; first_rc=$?
-first_job=$(cat "$q" 2>/dev/null)
+fold_r; first_job=$(cat "$q" 2>/dev/null)
 "$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; loop_rc=$?
+fold_r
 { [ "$first_rc" = 0 ] && [ "$loop_rc" = 0 ] && [ "$(cat "$q")" = "$first_job" ] \
   && [ "$(wc -l < "$D/creates")" = 1 ] && grep -qx 'queue --task r row' "$D/host.calls" \
   && jq -e '.chat == "fixture" and .ts == "123.456"' "$q" >/dev/null \
   && jq -e '.landing.status == "queued"' "$D/receipt" >/dev/null; } \
   && ok "P9c: planner and loop reach one queue job and one PR with the receipt's approval card" \
   || bad "P9c: first=$first_rc loop=$loop_rc $(cat "$D/err" "$D/loop.out")"
-rm -f "$q"; : > "$D/starts"
+rm -f "$q" "$HOME/.cc/state/land/rest/r-77.json"; : > "$D/starts"
 CC_SELF_LAND_EXCEPT=r "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
+fold_r
 { [ "$rc" = 0 ] && [ ! -e "$q" ] && [ ! -s "$D/starts" ] && jq -e '.landing.status == "approval" and .card.chat == "fixture"' "$D/receipt" >/dev/null; } \
   && ok "P9d: a repo named as an exception keeps the PR and card but queues nothing; P9c is its control" || bad "P9d: $(cat "$D/receipt" "$D/err")"
 mkdir -p "$HOME/dev/r/.cc"; touch "$HOME/dev/r/.cc/member-facing"
 "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
+fold_r
 { [ "$rc" = 0 ] && [ ! -e "$q" ] && [ ! -s "$D/starts" ] && jq -e '.landing.status == "approval" and .card.chat == "fixture"' "$D/receipt" >/dev/null; } \
   && ok "P9e: an unlisted member-facing task holds no grant — it keeps the PR and card and waits for a 👍, as P9d's exception does; P9c is its control" || bad "P9e: rc=$rc $(cat "$D/receipt" "$D/err")"
 rm "$HOME/dev/r/.cc/member-facing"
@@ -2558,6 +2569,7 @@ for projection in board card; do
     "$st/delivery.json" > "$D/record"; mv "$D/record" "$st/delivery.json"
   touch "$D/$projection.fail"; : > "$D/notices"
   "$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; rc=$?
+  fold_r
   { [ "$rc" = 0 ] && [ -e "$q" ] && ! grep -q 'finished, but opened no PR' "$D/notices" \
     && grep -q "delivery projection pending: $projection" "$st/loop.log" \
     && [ "$("$B/cc-board" get r row status)" != blocked ]; } \
@@ -2569,6 +2581,7 @@ for projection in board card; do
 done
 rm "$q"; mv "$st/delivery.json" "$D/saved-record"
 "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
+fold_r
 { [ "$rc" != 0 ] && [ ! -e "$q" ] && grep -q 'needs a task record' "$D/err"; } \
   && ok "P9g: queue --task refuses a legacy row out loud; P9c is its control" || bad "P9g: rc=$rc $(cat "$D/err")"
 mv "$D/saved-record" "$st/delivery.json"
@@ -2577,6 +2590,7 @@ jq '.pr=null | .card=null' "$st/delivery.json" > "$D/record"; mv "$D/record" "$s
 printf '#!/bin/sh\necho "fixture push refused" >&2\nexit 1\n' > "$D/remote.git/hooks/pre-receive"; chmod +x "$D/remote.git/hooks/pre-receive"
 : > "$D/notices"; : > "$D/gh.calls"
 "$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; rc=$?
+fold_r
 { [ "$rc" = 4 ] && [ ! -e "$q" ] && [ "$("$B/cc-board" get r row status)" = blocked ] \
   && grep -q 'finished, but opened no PR' "$D/notices" && grep -q 'push failed' "$st/loop.log" && [ ! -s "$D/gh.calls" ]; } \
   && ok "P9h: no PR after a failed push keeps exit 4, blocked and the existing page; P9f is its control" || bad "P9h: rc=$rc $(cat "$D/loop.out")"

@@ -16,8 +16,12 @@ WHAT IT MAY REMOVE — every rule, all of them at once:
     touched, however old — `tmp.XXXX`, a bare mkdtemp and a person's `/tmp/notes` included;
   · whose newest mtime/ctime anywhere inside is older than --hours (24);
   · that no process of this user holds: no cwd, open file or mapped file under it;
-  · `cc-land.run.<pid>.*`: and the pid is not a live cc-land. One carrying cc-land's `.kept` marker (a red gate's
-    log kept for a person) is left for 72 h;
+  · `cc-land.run.<pid>.*` (the lander's run root, which kept the old tool's name): and the pid is not a live lander,
+    that is a process whose first three argv words name cc-land, bin/lander, lander-self or core/lander/cli.py (the
+    shim execs the lander, so a running landing's argv is `python3 -P …/core/lander/cli.py <cmd> …`). One carrying
+    the `.kept` marker (a red gate's log kept for a person) is left for 72 h;
+  · `lander-job.*` (a spilled check's tree and HOME, run.py job-serve) and `lander-self.check.*` /
+    `lander-self.shadow.*` (lander-self's scratch) are ordinary families: their tools remove them, this is the floor;
   · `claude-<uid>/<cwd-slug>/<session-id>`: a Claude session's scratch, and no process of this user names that
     session id in its argv or environment, and no live claude process has it in ~/.claude/sessions/<pid>.json.
     A live claude process whose id neither says (some resumed and remote sessions) keeps every session dir under
@@ -50,6 +54,7 @@ FAMILIES = [
     ("cc-green gate logs", r"cc-green\.gate\." + TAIL),
     ("cc-slack selfcheck", r"cc-slack-[A-Za-z-]+-_?" + TAIL),
     ("cc-land selfcheck", r"cc-land-selfcheck-[a-z]+-" + TAIL),
+    ("lander scratch", r"lander-(job|self\.check|self\.shadow)\." + TAIL),
     ("lessons selfcheck", r"lessons-(resolv|creds|creds-real|creds-rescope)-" + TAIL),
     ("slack outbox fixtures", r"_selfcheck_outbox_" + TAIL),
     ("other selfchecks", r"(cc-wakes\.|cc-check(-extra(-id)?)?\.|cc-bin-at\.|ccboard-sc(-lib)?-|cc-bundle-sc\.|"
@@ -58,10 +63,12 @@ FAMILIES = [
                          r"ccskills-|ccsbx[a-z]+-|cc-mint-)" + TAIL),
 ]
 LAND_RUN = re.compile(r"cc-land\.run\.(\d+)\..+")
+# A live lander's argv word: the old tool, the shim's target, lander-self, or the package's entry run by python3 -P.
+LANDER_WORD = re.compile(rb"(?:cc-land|(?:^|/)lander(?:-self)?$|(?:^|/)lander/cli\.py$)")
 KEPT, KEPT_HOURS = ".kept", 72
 SESSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 HOURS, SESSION_HOURS = 24.0, 24   # the default line, and the floor under a session's scratch (a resumed one reads it)
-SESS_FAM, LAND_FAM = "dead sessions' scratch", "dead cc-land runs"
+SESS_FAM, LAND_FAM = "dead sessions' scratch", "dead lander runs"
 RECHECK_S = 5   # a full /proc read costs seconds on a busy box, so between two, only new pids are read
 
 
@@ -183,7 +190,7 @@ def live_sessions(ps, sessions_dir):
 
 def live(ps, root, sessions_dir):
     """What the processes `ps` keep alive under `root`: (held names — top entries and claude-<uid>/<slug>/<sid> —,
-    session ids named, blind cwd slugs, live cc-land pids)."""
+    session ids named, blind cwd slugs, live lander pids)."""
     held = set()
     for _, _, _, paths in ps:
         for h in paths:
@@ -192,7 +199,7 @@ def live(ps, root, sessions_dir):
                 held.add(parts[0])
                 held.add("/".join(parts[:3]))
     named, blind = live_sessions(ps, sessions_dir)
-    landers = {pid for pid, argv, _, _ in ps if any(b"cc-land" in a for a in argv.split(b"\0")[:3])}
+    landers = {pid for pid, argv, _, _ in ps if any(LANDER_WORD.search(a) for a in argv.split(b"\0")[:3])}
     return held, named, blind, landers
 
 
@@ -371,6 +378,7 @@ def selfcheck():
         run_dead = mk("cc-land.run.999999999.dead1234", ("cc-land.gates.r.1.x",))
         run_live = mk("cc-land.run.PID.live1234")
         run_kept = mk("cc-land.run.999999998.kept1234", (KEPT, "cc-land-gate-x.log"))
+        lander_scr = [mk("lander-job.ab12cd34"), mk("lander-self.check.ab12cd34"), mk("lander-self.shadow.ab12cd34")]
         s_dead = mk(f"claude-{uid}/-home-u-dev-r/{sid_dead}/scratchpad")
         s_argv = mk(f"claude-{uid}/-home-u-dev-r/{sid_argv}/scratchpad")
         s_env = mk(f"claude-{uid}/-home-u-dev-r/{sid_env}/tasks")
@@ -403,6 +411,17 @@ def selfcheck():
         live_name = f"cc-land.run.{lander.pid}.live1234"
         os.rename(run_live, f"{root}/{live_name}")
         run_live = f"{root}/{live_name}"
+        # the new lander: `python3 -P …/core/lander/cli.py lane r`, and lander-self; and a pid that is neither
+        os.makedirs(f"{base}/x/core/lander")
+        for f in ("core/lander/cli.py", "landerish.py"):
+            open(f"{base}/x/{f}", "w").write("import time\ntime.sleep(60)\n")
+        new_l = spawn([sys.executable, "-P", f"{base}/x/core/lander/cli.py", "lane", "r"])
+        self_l = spawn(["bash", "-c", "exec -a /x/core/bin/lander-self sleep 60"])
+        not_l = spawn([sys.executable, "-P", f"{base}/x/landerish.py", "lander"])
+        kids += [new_l, self_l, not_l]
+        run_new = mk(f"cc-land.run.{new_l.pid}.newlnd12")
+        run_self = mk(f"cc-land.run.{self_l.pid}.selfln12")
+        run_other = mk(f"cc-land.run.{not_l.pid}.other123")
         kids.append(spawn(["bash", "-c", "sleep 60; :", sid_argv]))
         kids.append(spawn([sleep, "60"], env={**os.environ, "SOME_SESSION": sid_env}))
         kids.append(spawn([sleep, "60"], cwd=s_cwd))
@@ -434,6 +453,10 @@ def selfcheck():
         ok("a dir holding a file some process has mapped stays", map_held not in dry)
         ok("a cc-land run root whose pid is dead goes", run_dead in dry)
         ok("…and one whose pid is a live cc-land stays", run_live not in dry)
+        ok("…and one whose pid is the new lander (python3 -P …/core/lander/cli.py) or lander-self stays",
+           run_new not in dry and run_self not in dry)
+        ok("…while a live pid that is no lander keeps nothing", run_other in dry)
+        ok("old lander-job.* / lander-self.check.* / lander-self.shadow.* scratch goes", set(lander_scr) <= dry)
         ok("…and one with the .kept marker stays for 72 h", run_kept not in dry)
         ok("…and goes after them", run_kept in reap(False, when=now + 3 * 86400)[0])
         ok("a session's scratch whose id no process names goes", os.path.dirname(s_dead) in dry)

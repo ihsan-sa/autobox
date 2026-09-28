@@ -2655,6 +2655,18 @@ def run():
             k(not dec.quiet and dec.rule == "no-channel:unsure" and [p.name for p in dec.to] == ["mem"],
               "…with MAIL_QUIET unset the same address is a name no channel has — quiet is configured, never "
               "assumed")
+            # The owner's forward of 2026-09-24: To study@ and an address off the box. With the key set it is quiet
+            # and says nothing to him; unset, it is the "#study is not a channel" ack he was then told to act on.
+            fwd = lambda: arrived(b, OWNER, rcpt="study@box.example",
+                                  to="study@box.example, him@elsewhere.example")
+            dec = router.route(fwd(), Dir(), "box.example", quiet="study")
+            k(dec.quiet and dec.rule == "quiet" and not dec.note and not dec.to and not dec.refuse,
+              "the owner's forward To study@ and an outside address is quiet with MAIL_QUIET=study: no note, no "
+              "session, nothing said back")
+            dec = router.route(fwd(), Dir(), "box.example")
+            k(not dec.quiet and dec.note == "#study is not a channel I could deliver to.",
+              "…and the same forward with MAIL_QUIET unset carries the 'not a channel' note: the key is the whole "
+              "difference")
 
             # (d) the owner's own `addr=` row still comes first: a word a person set is read before the door
             dec = router.route(to("study"), Dir(), "box.example", table="%s=" % ALLOWED, quiet=QUIET)

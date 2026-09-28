@@ -9,9 +9,10 @@ the workspace itself and needs the granted token, a repository the board row nam
 and the host-only clone (members.py), each refusal one `refused` line. A PR touching one of the repo's protected
 paths (CC_PROTECTED_PATHS_<repo>, cc-config; a config that will not read is a hit) is refused unless --approved-by
 is the owner's own uid (SLACK_OWNER_ID): `refused <repo>#<pr> protected:<file>`, the 🔐 card (cards.stopped, route
-"door"), exit 1. With his 👍 the request pins `approved_head` — a head gh cannot name refuses. The request goes to
-the inbox (jobs.submit); `queued` is logged only for a PR with no job yet (drain logs `again` or `requeued` for
-the rest, so `times` is not restarted). A paused project keeps the request and says so (exit 0); --no-start
+"door"), exit 1. With his 👍 queue writes the approval record (jobs.approve: his uid and the head gh names — a
+head gh cannot name refuses); the inbox request carries no approval, because anyone may write the inbox and drain
+takes only chat/ts/who from it. The request goes to the inbox (jobs.submit); `queued` is logged only for a PR
+with no job yet (drain logs `again` or `requeued` for the rest, so `times` is not restarted). A paused project keeps the request and says so (exit 0); --no-start
 says where it waits (exit 0); otherwise `lander tick --repo <repo>` is started detached, and a start that fails is
 exit 1 "queued, but…". `queue --task` is the old queue_task unchanged: `cc done <repo> <row> --json`, `cc lands`
 0 queue / 1 approval / 2 refused, anything else failed; the receipt (with `landing`) is the one line on stdout.
@@ -22,20 +23,26 @@ re-reading the list after each. BOX HOLDS come first and leave the file untouche
 `cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds jobs before the merge.
   queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a draft or a conflict -> held 15 min. Under
              the git lock fetch base and head; base_sha, files (merge-base..head), digest. A member PR meets its
-             walls (-> handback). THE PROTECTED DOOR, asked again at every head: the owner's uid, and the head he
-             👍'd — or a later head whose protected files are byte-identical, which carries approved_head to it
-             (`approval … carried`); else -> query, route "owner". plan(); klass lander -> query "lander-self".
-  checking   the plan's checks (planner.checks at base) on merge-tree(base_sha, head) — a member's on
-             "member:<h>" — skipping those already in results; FAILED -> handback; UNRUNNABLE -> held 15 min, the
-             3rd -> query. Then, when the plan is paid, one read (a delta read when a prior verdict exists; none
-             when a LAND is already recorded at this digest): INCOMPLETE -> held, no read counted; HANDBACK ->
+             walls (-> handback). THE PROTECTED DOOR, asked again at every head, reads the approval record
+             (jobs.approval, never the request): the owner's uid, and the head he 👍'd — or a later head whose
+             protected files are byte-identical, which carries approved_head to it (`approval … carried`); else
+             -> query, route "owner". plan(); klass lander -> query "lander-self".
+  checking   the plan's checks on merge-tree(base_sha, head), each through runner.run_plan (run.judge: the red-vs-
+             base rule, the rerun alone under load, quarantine, the lane's records.Store under its lock, and the
+             failures-ledger record of a red that is the diff's) against the manifest at base widened by the head's —
+             a member's on "member:<h>" — skipping those already in results. FAILED -> handback;
+             blocked-by-main (red on the base tree too) -> held 15 min and planned again from main then, not blamed;
+             a check the manifest lacks -> query "planning"; UNRUNNABLE -> held 15 min, the 3rd -> query. Then,
+             when the plan is paid, one read (a delta read when a prior verdict exists; none when a LAND is already
+             recorded at this digest): INCOMPLETE -> held till the `until` it names (a usage limit's reset; stage
+             `deferred`, which no reader counts as running), no read counted; HANDBACK ->
              reads_used+1, handback, or query "planning" at the 2nd; LAND counts a read only when it was bought.
              A member over its day's cap is held; a bought read is charged to it.
   mergeable  the head moved -> queued. main moved -> Δ re-plan (S2): rerun = (new − old) ∪ (new ∩ checks Δ
              reaches); non-empty -> checking with only those; empty -> base_sha = main and merge. THE MERGE (S1),
              all under the git lock: fetch; main_before must be base_sha (else back to Δ); expected =
              merge-tree(main_before, head); merge_attempt {main_before, expected, pin} written BEFORE gh; the squash
-             pinned to head (the door made approved_head equal it), --delete-branch, --subject "<title> (#N)";
+             pinned to head (the door made the approved head equal it), --delete-branch, --subject "<title> (#N)";
              fetch; the tip's tree must equal expected, else the tip is `unvalidated` (no deploy request; `stage …
              merged … proof=mismatch`). A refused merge drops merge_attempt; one GitHub cannot confirm either way
              keeps it and holds (box). A resume that finds merge_attempt asks GitHub first: MERGED proves against
@@ -43,7 +50,8 @@ re-reading the list after each. BOX HOLDS come first and leave the file untouche
   merged     board.close, cards.landed, tip.kick, deploy.request(repo, tip) — each once (job.post flags) —
              then deploy-pending; done (rc=0) for a member or an unvalidated tip. Members never deploy.
 HANDBACK writes handed/<repo>-<pr>.json (7 days) and REMOVES the job file (N12); cards.stopped routes it to
-"#<h>" or "seat". QUERY stays as a job in state query. A unit that is not installed holds the job ("<unit> is not
+"#<h>" or "seat". DONE and QUERY move the job file to rest/ (jobs.py): off the readers' queue, as the old lander's
+unlink was, but still loaded by a re-queue. A unit that is not installed holds the job ("<unit> is not
 installed"); a board unit that is absent is BoardRules below: the row carrying the PR -> merged (an orch-held row
 gets a note only), each `Closes <row>` of the same board -> done unless held or live without an agent mark, that
 mark cleared, an unknown row named; a symlinked board file is refused.
@@ -65,7 +73,10 @@ from lander import events as E
 from lander import gh as GH
 from lander import git as G
 from lander import jobs as J
+from lander import manifest as MF
 from lander import members as M
+from lander import records as REC
+from lander import run as RUN
 from lander import types as T
 
 HOLD_SECS = 900          # a held job waits this long before the lane tries it again
@@ -162,8 +173,8 @@ def git_pr_files(root, pr, token=None, genv=None):
     try:
         with G.git_lock(root):
             G.fetch(root, base, branch, env=genv)
-        mb = G.merge_base(root, f"origin/{base}", f"origin/{branch}", env=genv)
-        return G.changed(root, mb, f"origin/{branch}", env=genv) or None
+        mb = G.merge_base(root, f"refs/remotes/origin/{base}", f"refs/remotes/origin/{branch}", env=genv)
+        return G.changed(root, mb, f"refs/remotes/origin/{branch}", env=genv) or None
     except G.GitError:
         return None
 
@@ -299,6 +310,7 @@ class Lane:
         self.root = J.repo_root(repo)
         self.genv = M.env(self.member) if self.member else None
         self.token = (self.genv or {}).get("GH_TOKEN")
+        self.fallback = MF.host_fallback(repo)   # the release's landing-repos/<repo>.toml; "" when the repo has none
         self.lines = []
 
     def say(self, text):
@@ -307,9 +319,9 @@ class Lane:
     def unit(self, name):
         return self.units.get(name)
 
-    def call(self, name, fn, *args):
+    def call(self, name, fn, *args, **kw):
         try:
-            return getattr(self.unit(name), fn)(*args)
+            return getattr(self.unit(name), fn)(*args, **kw)
         except (UnitFault, G.GitError):
             raise
         except Exception as e:  # noqa: BLE001 — a unit's fault holds the job, never the lane
@@ -322,6 +334,8 @@ class Lane:
                 if not got:
                     self.say("a lane is already running; it re-reads the queue itself")
                     return self.lines
+                with contextlib.suppress(OSError, ValueError):   # base runs an earlier lane shared are not reused
+                    REC.new_nonce(self.repo, J.landq())
                 tried = set()
                 while True:
                     for ln in J.drain(self.repo):
@@ -374,17 +388,22 @@ class Lane:
             self.hold(job, str(e), kind="box")
 
     # -- leaving the lane --
-    def hold(self, job, why, kind="pr", secs=HOLD_SECS):
-        """kind "pr": a push mends it (a new queue starts fresh); "box": time mends it (a new queue joins it)."""
+    def hold(self, job, why, kind="pr", secs=HOLD_SECS, until=0, then=None, deferred=False):
+        """kind "pr": a push mends it (a new queue starts fresh); "box": time mends it (a new queue joins it).
+        until: an epoch to wait for instead of secs (a usage limit's reset). then: the state to go back to (default
+        the one it was held from). deferred: the job waits on a limit, not on work — stage `deferred`."""
         if job.state == T.HELD:
             return
-        job.extra.update(held_from=job.state, hold=kind, why=why, not_before=E.stamp(time.time() + secs))
+        at = until if until > time.time() else time.time() + secs
+        job.extra.update(held_from=then or job.state, hold=kind, why=why, not_before=E.stamp(at))
+        if deferred:
+            job.extra["deferred"] = True
         J.move(job, T.HELD, why)
         self.say(f"PR #{job.pr} held: {why}")
 
     def unhold(self, job):
         target = job.extra.pop("held_from", T.QUEUED)
-        for k in ("hold", "not_before"):
+        for k in ("hold", "not_before", "deferred"):
             job.extra.pop(k, None)
         J.move(job, target if target in J.NEXT[T.HELD] else T.QUEUED, why="retry after hold")
 
@@ -437,8 +456,8 @@ class Lane:
             return self.hold(job, f"PR #{job.pr} conflicts with {base} — rebase it")
         with self.lock():
             G.fetch(self.root, base, branch, env=self.genv)
-            job.base_sha = G.rev(self.root, f"origin/{base}", env=self.genv)
-            job.head = G.rev(self.root, f"origin/{branch}", env=self.genv)
+            job.base_sha = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
+            job.head = G.rev(self.root, f"refs/remotes/origin/{branch}", env=self.genv)
         mb = G.merge_base(self.root, job.base_sha, job.head, env=self.genv)
         job.files = G.changed(self.root, mb, job.head, env=self.genv)
         job.digest = G.patch_digest(self.root, job.base_sha, job.head, env=self.genv)
@@ -453,7 +472,7 @@ class Lane:
             return self.query(job, why, "owner")
         if not self.unit("planner"):
             return self.hold(job, "planner is not installed", kind="box")
-        job.plan = self.call("planner", "plan", self.root, job.base_sha, job.head, job.files)
+        job.plan = self.call("planner", "plan", self.root, job.base_sha, job.head, job.files, fallback=self.fallback)
         if job.plan.klass == T.LANDER:
             return self.query(job, "it changes the lander itself — lander-self lands it", "lander-self")
         J.move(job, T.PLANNED)
@@ -465,50 +484,71 @@ class Lane:
         if not hit:
             return ""
         words = hold_words(self.repo, hit)
-        if not owner_approved(job.extra.get("approved_by") or ""):
+        rec = J.approval(job.repo, job.pr)   # the lane's own record of the 👍, written by `lander queue`
+        by = rec.get("approved_by") or ""
+        if not owner_approved(by):
             return f"{words}, and no 👍 of the owner's queued it"
-        ah = job.extra.get("approved_head") or ""
+        ah = rec.get("approved_head") or ""
         if job.head == ah:
             return ""
-        if rules and G.protected_same(self.root, rules, ah, job.head, env=self.genv):
+        if rules and ah and G.protected_same(self.root, rules, ah, job.head, env=self.genv):
             E.log("approval", job.repo, job.pr, f"carried {ah[:12]} → {job.head[:12]}: protected paths unchanged")
-            job.extra["approved_head"] = job.head
-            J.save(job)
+            J.approve(job.repo, job.pr, by, job.head)
             return ""
         return f"{words}, at a head the owner has not 👍'd ({ah[:12] or 'no head recorded'} → {job.head[:12]})"
 
     def planned(self, job):
         J.move(job, T.CHECKING)
 
+    def manifest(self, job):
+        """The manifest at base, widened by the head's (what plan() planned on and `lander check` runs by)."""
+        try:
+            return MF.widen(MF.load(self.root, job.base_sha, fallback=self.fallback),
+                            MF.load(self.root, job.head, fallback=self.fallback, strict=False))
+        except MF.ManifestError as e:
+            raise UnitFault(f"the manifest at {job.base_sha[:12]} does not parse: {e}") from None
+
     def checking(self, job):
         if not self.unit("runner"):
             return self.hold(job, "runner is not installed", kind="box")
-        manifest = {c.name: c for c in self.call("planner", "checks", self.root, job.base_sha)}
         names = list(job.plan.checks if job.plan else [])
-        missing = [n for n in names if n not in manifest]
-        if missing:
-            return self.query(job, f"the plan names checks the manifest at base lacks: {', '.join(missing)}", "planning")
-        with self.lock():
-            tree, conflicts = G.merge_tree(self.root, job.base_sha, job.head, env=self.genv)
-        if tree is None:
-            return self.hold(job, f"PR #{job.pr} conflicts with {job.extra.get('base_ref')}: {', '.join(conflicts[:5])}")
-        job.extra["tree"] = tree
-        for n in names:
-            if n in job.results:
-                continue
-            c = manifest[n]
-            where = f"member:{self.member}" if self.member else (c.where[0] if c.where else "box")
-            r = self.call("runner", "run", c, tree, where)
-            E.stage(job.repo, job.pr, "gate", gate=n, ok="yes" if r.status == T.PASSED else "no", secs=int(r.secs))
-            if r.status == T.FAILED:
-                return self.handback(job, f"check {n} failed on the merge with {job.extra.get('base_ref')} ({tree[:12]})")
-            if r.status == T.UNRUNNABLE:
+        todo = [n for n in names if n not in job.results]
+        base_ref = job.extra.get("base_ref") or "main"
+        if todo:
+            m = self.manifest(job)
+            with self.lock():
+                tree, conflicts = G.merge_tree(self.root, job.base_sha, job.head, env=self.genv)
+            if tree is None:
+                return self.hold(job, f"PR #{job.pr} conflicts with {base_ref}: {', '.join(conflicts[:5])}")
+            base_tree = G.tree_of(self.root, job.base_sha, env=self.genv)
+            job.extra["tree"] = tree
+            store = REC.Store(self.repo, J.lane_fd(self.repo), J.landq()) if J.lane_fd(self.repo) is not None else None
+            quarantine = RUN.quarantine_text(self.root, job.base_sha)
+        for n in todo:
+            outs = self.call("runner", "run_plan", self.root, m, job.plan, job.files, tree, base_tree,
+                             member=self.member, store=store, job_key=job.key, scope=self.member or self.repo,
+                             pr=job.pr, quarantine_text=quarantine, only=[n], fallback=self.fallback)
+            o = outs.get(n) or RUN.Outcome(n, T.UNRUNNABLE, "the runner gave no outcome")
+            secs = int(sum(r.secs for r in o.results))
+            word = {T.PASSED: "yes", RUN.BLOCKED: "main-red"}.get(o.status, "no")
+            E.stage(job.repo, job.pr, "gate", gate=n, ok=word, secs=secs, note=o.note if o.status == T.PASSED else "")
+            if o.status == T.FAILED:
+                return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]})"
+                                          + (f": {o.note}" if o.note else ""))
+            if o.status == RUN.BLOCKED:
+                # design §0: base red too -> blocked-by-main, not blamed; it is planned again from main after the hold
+                return self.hold(job, f"{o.note}: check {n} is red on {base_ref} ({job.base_sha[:12]}) too, so it "
+                                      f"is main's, not this PR's — tried again from {base_ref} later",
+                                 kind="box", then=T.QUEUED)
+            if o.status == T.UNRUNNABLE and o.note == "not in the manifest":
+                return self.query(job, f"the plan names checks the manifest at base lacks: {n}", "planning")
+            if o.status == T.UNRUNNABLE:
                 job.extra["attempts"] = int(job.extra.get("attempts") or 0) + 1
                 if job.extra["attempts"] >= UNRUNNABLE_TRIES:
                     return self.query(job, f"check {n} could not run {UNRUNNABLE_TRIES} times", "planning")
                 return self.hold(job, f"check {n} could not run (try {job.extra['attempts']} of "
-                                      f"{UNRUNNABLE_TRIES})", kind="box")
-            job.results[n] = r.key
+                                      f"{UNRUNNABLE_TRIES}): {o.note}", kind="box")
+            job.results[n] = o.results[0].key if o.results else ""
             J.save(job)
         if job.plan and job.plan.paid and not self.review(job):
             return
@@ -532,8 +572,11 @@ class Lane:
         E.stage(job.repo, job.pr, "verdict", verdict=v.verdict)
         if self.member and v.tokens > 0:
             M.charge(self.member, float(v.extra.get("usd") or 1.0))
-        if v.verdict == T.INCOMPLETE:
-            self.hold(job, "the review stopped on a usage or budget wall; no read was counted", kind="box")
+        if v.verdict == T.INCOMPLETE:   # a usage or budget wall: wait for the reset it names, no read counted
+            until = v.extra.get("until") or ""
+            self.hold(job, f"the review stopped on a usage or budget wall ({v.extra.get('why') or 'no reason given'}); "
+                           f"no read was counted" + (f", asked again at {until}" if until else ""),
+                      kind="box", until=E.epoch_of(until), deferred=True)
             return False
         job.extra["verdict"], job.review_key = v.to_dict(), v.digest
         if v.verdict == T.HANDBACK_VERDICT:
@@ -559,7 +602,7 @@ class Lane:
                 base = job.extra.get("base_ref") or ""
                 with self.lock():
                     G.fetch(self.root, base, env=self.genv)
-                    tip = oid or G.rev(self.root, f"origin/{base}", env=self.genv)
+                    tip = oid or G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
                 return self.proved(job, ma.get("expected") or "", tip, ma.get("pin") or job.head)
             job.extra.pop("merge_attempt", None)
             J.save(job)
@@ -567,8 +610,8 @@ class Lane:
         for _ in range(MOVES_BEFORE_HOLD):
             with self.lock():
                 G.fetch(self.root, base, branch, env=self.genv)
-                head_now = G.rev(self.root, f"origin/{branch}", env=self.genv)
-                main_now = G.rev(self.root, f"origin/{base}", env=self.genv)
+                head_now = G.rev(self.root, f"refs/remotes/origin/{branch}", env=self.genv)
+                main_now = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
             if head_now != job.head:
                 return J.move(job, T.QUEUED, why=f"the head moved to {head_now[:12]}")
             if main_now != job.base_sha and self.revalidate(job, main_now):
@@ -580,8 +623,8 @@ class Lane:
     def revalidate(self, job, main_now):
         """Δ re-plan (S2). True when something must run again (only those checks' results are dropped)."""
         delta = G.changed(self.root, job.base_sha, main_now, env=self.genv)
-        new = self.call("planner", "plan", self.root, main_now, job.head, job.files)
-        own = self.call("planner", "plan", self.root, job.base_sha, main_now, delta).checks
+        new = self.call("planner", "plan", self.root, main_now, job.head, job.files, fallback=self.fallback)
+        own = self.call("planner", "plan", self.root, job.base_sha, main_now, delta, fallback=self.fallback).checks
         old = set(job.plan.checks if job.plan else [])
         rerun = sorted((set(new.checks) - old) | (set(new.checks) & set(own)))
         # a plan that became paid with no LAND at this digest must go through the review too
@@ -599,7 +642,7 @@ class Lane:
         base = job.extra.get("base_ref") or ""
         with self.lock():
             G.fetch(self.root, base, env=self.genv)
-            main_before = G.rev(self.root, f"origin/{base}", env=self.genv)
+            main_before = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
             if main_before != job.base_sha:
                 return "moved"
             expected, conflicts = G.merge_tree(self.root, main_before, job.head, env=self.genv)
@@ -621,7 +664,7 @@ class Lane:
                     self.hold(job, text, kind="box" if GH.backoff() else "pr")
                 return "held"
             G.fetch(self.root, base, env=self.genv)
-            tip = G.rev(self.root, f"origin/{base}", env=self.genv)
+            tip = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
         self.proved(job, expected, tip, pin)
         return "merged"
 
@@ -660,7 +703,7 @@ class Lane:
             base = job.extra.get("base_ref") or ""
             with self.lock():
                 G.fetch(self.root, base, env=self.genv)
-                job.extra["tip_sha"] = G.rev(self.root, f"origin/{base}", env=self.genv)
+                job.extra["tip_sha"] = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
         once("deploy", "deploy", "request", job.repo, job.extra["tip_sha"], [])
         J.move(job, T.DEPLOY_PENDING)
 
@@ -747,7 +790,9 @@ def cmd_queue(argv):
                           f"is about", 1)
     fresh = J.load(repo, int(pr)) is None
     try:
-        J.submit(repo, pr, chat=chat, ts=ts, who=who, approved_by=approved_by, approved_head=approved_head)
+        if approved_head:
+            J.approve(repo, pr, approved_by, approved_head)
+        J.submit(repo, pr, chat=chat, ts=ts, who=who)
     except OSError as e:
         return refuse(f"cannot write the request: {e} — nothing merged", 1)
     if fresh:   # a PR with a job already gets `again` or `requeued` from drain; a second `queued` restarts `times`

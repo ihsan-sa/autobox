@@ -152,8 +152,9 @@ class Planner:
         self.owners = dict(owners or {"a": "a/", "b": "b/", "c": "c/"})
         self.paid, self.klass, self.calls = paid, klass, []
 
-    def plan(self, root, base, head, files):
+    def plan(self, root, base, head, files, fallback=""):
         self.calls.append((base, head, tuple(files)))
+        self.fallback = fallback
         checks = sorted(n for n, p in self.owners.items() if any(f.startswith(p) for f in files))
         return T.Plan(checks=checks, klass=self.klass, paid=self.paid)
 
@@ -162,8 +163,22 @@ class Planner:
 
 
 class Runner:
-    def __init__(self, status=None, hook=None):
-        self.status, self.hook, self.calls = dict(status or {}), hook, []
+    def __init__(self, status=None, hook=None, missing=()):
+        self.status, self.hook, self.calls, self.missing = dict(status or {}), hook, [], set(missing)
+
+    def run_plan(self, root, m, plan, files, head_tree, base_tree="", *, member="", only=None, **kw):
+        """lander.run.run_plan's shape: {name: Outcome}; a name in `missing` is one the manifest lacks."""
+        from lander import run as RUN
+        out = {}
+        for n in plan.checks:
+            if only and n not in only:
+                continue
+            if n in self.missing:
+                out[n] = RUN.Outcome(n, T.UNRUNNABLE, "not in the manifest")
+                continue
+            r = self.run(T.Check(name=n, run="true"), head_tree, f"member:{member}" if member else "box")
+            out[n] = RUN.Outcome(n, r.status, "", [r])
+        return out
 
     def run(self, check, tree, where):
         self.calls.append((check.name, tree, where))
@@ -275,11 +290,24 @@ class Fixture(unittest.TestCase):
         copy_repo(f"{tpl}/work", self.work, f"{tpl}/origin.git", self.origin)
         copy_repo(f"{tpl}/root", self.root, f"{tpl}/origin.git", self.origin)
         self.set_box(origin=self.origin, prs={}, config={}, paused=[])
+        self.pin_remote(self.root, self.origin)
+        p = mock.patch.object(G, "ALLOW_LOCAL", True)   # the pinned URL is this bare repo, not GitHub
+        p.start()
+        self.addCleanup(p.stop)
         p = mock.patch.object(L, "spawn_tick", lambda repo: (True, "test"))
         p.start()
         self.addCleanup(p.stop)
 
     # helpers
+    def pin_remote(self, root, url):
+        """What `lander-self promote` writes: the URL the lander fetches this checkout from."""
+        p = f"{self.home}/.cc/lander/remotes.json"
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        pins = json.load(open(p)) if os.path.exists(p) else {}
+        pins[os.path.realpath(root)] = url
+        with open(p, "w") as f:
+            json.dump(pins, f)
+
     def git(self, cwd, *a):
         return subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
@@ -516,7 +544,7 @@ class Machine(Fixture):
                 with self.subTest(f"{s}->{t}"):
                     if t in J.NEXT.get(s, ()):
                         J.move(j, t)
-                        d = J.read_json(J.job_path("edge", 1))
+                        d = J.read_json(J.file_of(j))
                         self.assertEqual((d["state"], d["stage"]), (t, J.STAGE_OF[t]))
                     else:
                         with self.assertRaises(ValueError):
@@ -535,6 +563,118 @@ class Machine(Fixture):
         self.assertEqual(u["deploy"].calls, [("request", "demo", self.origin_rev("main"), [])])
         self.assertEqual([c[0] for c in u["board"].calls + u["cards"].calls + u["tip"].calls],
                          ["close", "landed", "kick"])
+
+    def test_a_local_branch_named_origin_main_is_not_main(self):
+        """refs/heads/origin/<b> (a worker's `git branch origin/main`) must never stand in for origin's <b>."""
+        head = self.pr(1, {"a/x": "n\n"})
+        base = self.origin_rev("main")
+        tree = self.git(self.root, "rev-parse", "HEAD^{tree}")
+        planted = self.git(self.root, "commit-tree", tree, "-m", "planted")
+        self.git(self.root, "branch", "-f", "origin/main", planted)
+        self.git(self.root, "branch", "-f", "origin/track/row-1", planted)
+        J.submit("demo", 1)
+        u, _ = self.land()
+        d = J.read_json(f"{os.environ['CC_LANDER_STATE']}/demo-1.json")
+        self.assertEqual(d["state"], T.DEPLOY_PENDING)
+        self.assertEqual((d["base_sha"], d["head"]), (base, head))
+        self.assertEqual(u["deploy"].calls, [("request", "demo", self.origin_rev("main"), [])])
+
+    def forge_origin(self):
+        """What a worker can do to the shared .git with no guard in its way: origin repointed to its own bare repo
+        whose main is a planted child of main, the fetch refspec unset, refs/remotes/origin/main written to it."""
+        evil = os.path.join(self.tmp, "evil.git")
+        shutil.copytree(self.origin, evil, symlinks=True)
+        tree = self.git(self.root, "rev-parse", "HEAD^{tree}")
+        planted = self.git(self.root, "commit-tree", tree, "-p", "HEAD", "-m", "planted")
+        self.git(self.root, "push", "-q", "-f", evil, f"{planted}:refs/heads/main")
+        self.git(self.root, "remote", "set-url", "origin", evil)
+        self.git(self.root, "config", "--unset-all", "remote.origin.fetch")
+        self.git(self.root, "update-ref", "refs/remotes/origin/main", planted)
+        return planted
+
+    def test_a_forged_origin_in_the_shared_git_dir_is_ignored(self):
+        """The tip, lane and deploy paths fetch the URL the lander holds, never the checkout's "origin"."""
+        from lander import deploy as D
+        from lander import tip as TP
+        head = self.pr(1, {"a/x": "n\n"})
+        real = self.origin_rev("main")
+        planted = self.forge_origin()
+        self.assertEqual(TP.origin_tip(self.root, "main"), real)                                    # tip
+        self.assertEqual(self.git(self.root, "rev-parse", "refs/remotes/origin/main"), real)
+        self.git(self.root, "update-ref", "refs/remotes/origin/main", planted)
+        J.submit("demo", 1)                                                                          # lane
+        u, _ = self.land()
+        d = J.read_json(f"{os.environ['CC_LANDER_STATE']}/demo-1.json")
+        self.assertEqual((d["state"], d["base_sha"], d["head"]), (T.DEPLOY_PENDING, real, head))
+        merged = self.origin_rev("main")
+        self.assertEqual(u["deploy"].calls, [("request", "demo", merged, [])])
+        self.git(self.root, "update-ref", "refs/remotes/origin/main", planted)                     # deploy
+        with self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", planted)
+        self.assertIn("is not on origin/main", e.exception.why)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), real)
+        D.pull(self.root, "main", merged)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), merged)
+        self.assertEqual(G.remote_head(self.root, "main"), merged)
+
+    def test_a_config_rewrite_of_the_pinned_url_is_refused(self):
+        """url.<x>.insteadOf in the shared .git/config would redirect even the pinned URL: the lander refuses."""
+        from lander import deploy as D
+        from lander import tip as TP
+        self.forge_origin()
+        self.git(self.root, "config", f"url.{self.tmp}/evil.git.insteadOf", self.origin)
+        self.assertEqual((G.remote_url(self.root), TP.origin_tip(self.root, "main")), ("", ""))
+        with self.assertRaises(G.GitError):
+            G.fetch(self.root, "main")
+        with self.assertRaises(D.Failed):
+            D.pull(self.root, "main", self.origin_rev("main"))
+        self.git(self.root, "config", "--unset", f"url.{self.tmp}/evil.git.insteadOf")
+        self.git(self.root, "config", f"url.{self.tmp}/evil.git.pushInsteadOf", self.origin)
+        self.assertEqual(G.remote_url(self.root), "")
+
+    def test_a_rewrite_with_a_space_in_its_subsection_via_include_is_refused(self):
+        """url.<tmp>/e x.insteadOf, brought in through include.path: -z parsing still finds the value."""
+        from lander import tip as TP
+        self.forge_origin()
+        shutil.copytree(os.path.join(self.tmp, "evil.git"), os.path.join(self.tmp, "e x"), symlinks=True)
+        cfg = os.path.join(self.tmp, "x.cfg")
+        with open(cfg, "w") as f:
+            f.write(f'[url "{self.tmp}/e x"]\n\tinsteadOf = {self.origin}\n')
+        self.git(self.root, "config", "include.path", cfg)
+        self.assertIn(f"url.{self.tmp}/e x.insteadof",
+                      self.git(self.root, "config", "--get-regexp", r"^url\..*\.insteadof$"))
+        self.assertTrue(G.rewritten(self.root, self.origin))
+        self.assertEqual((G.remote_url(self.root), TP.origin_tip(self.root, "main")), ("", ""))
+        with self.assertRaises(G.GitError):
+            G.fetch(self.root, "main")
+
+    def test_only_a_github_https_url_is_taken_from_remotes_json(self):
+        """remotes.json is reachable by a worker: outside the member clones dir only https://github.com/o/r is
+        taken; a member's clone keeps the URL the lander set on it."""
+        with mock.patch.object(G, "ALLOW_LOCAL", False):
+            for bad in (self.origin, "file:///tmp/x.git", "https://evil.example/o/demo.git",
+                        "https://github.com.evil/o/demo.git", "ssh://git@github.com/o/demo.git",
+                        "https://github.com/o/demo.git/../../x"):
+                self.pin_remote(self.root, bad)
+                self.assertEqual(G.remote_url(self.root), "", bad)
+            for good in ("https://github.com/o/demo.git", "https://github.com/o/demo"):
+                self.pin_remote(self.root, good)
+                self.assertEqual(G.remote_url(self.root), good)
+            clone = f"{J.clones_dir()}/h--t"
+            os.makedirs(J.clones_dir(), exist_ok=True)
+            self.git(self.tmp, "clone", "-q", "--bare", self.origin, clone)
+            self.assertEqual(G.remote_url(clone), self.origin)
+
+    def test_a_checkout_with_no_pinned_url_is_refused(self):
+        from lander import deploy as D
+        from lander import tip as TP
+        os.unlink(f"{self.home}/.cc/lander/remotes.json")
+        self.assertEqual(TP.origin_tip(self.root, "main"), "")
+        self.assertEqual(G.remote_head(self.root, "main"), "")
+        with self.assertRaises(G.GitError):
+            G.fetch(self.root, "main")
+        with self.assertRaises(D.Failed):
+            D.pull(self.root, "main", self.origin_rev("main"))
 
     def test_missing_planner_holds(self):
         self.pr(1, {"a/x": "n\n"})
@@ -761,7 +901,8 @@ class Merge(Fixture):
 
     def test_merge_pins_head_not_a_stale_approved_head(self):
         head = self.pr(1, {"b/y": "n\n"})
-        J.submit("demo", 1, approved_by="UOWNER", approved_head="0" * 40)   # no protected path: nothing to pin to
+        J.approve("demo", 1, "UOWNER", "0" * 40)   # no protected path: nothing to pin to
+        J.submit("demo", 1)
         self.land()
         argv = self.box()["merges"][0]
         self.assertEqual(argv[argv.index("--match-head-commit") + 1], head)
@@ -780,6 +921,37 @@ class Merge(Fixture):
         u, _ = self.land(runner=Runner(hook=hook))
         self.assertEqual(self.job(2).head, self.git(self.work, "rev-parse", "track/row-2"))
         self.assertIn("queued", [h["state"] for h in self.job(2).history[1:]])
+
+
+class HostFallback(Fixture):
+    """A repo that ships no LANDING.toml gets its checks from the release's tests/landing-repos/<repo>.toml
+    (review of #771). The lane plans and checks by it, and the tip run reaches its box checks."""
+    FB = ('[[check]]\nname = "check"\nrun = "tests/check.sh"\npaths = ["**"]\nclass = "host"\n\n'
+          '[[check]]\nname = "e2e"\nrun = "true"\npaths = ["**"]\nclass = "box"\n')
+
+    def test_a_repo_with_no_manifest_is_planned_and_checked_by_its_fallback(self):
+        from lander import manifest as MF
+        from lander import plan as P
+        fb = os.path.join(self.tmp, "release", "tests", "landing-repos")
+        self.write(fb, {"demo.toml": self.FB})
+        head = self.pr(1, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        rv = Runner()
+        with mock.patch.object(MF, "FALLBACK_DIR", fb):
+            self.assertEqual(L.Lane("demo", self.units()).fallback, os.path.join(fb, "demo.toml"))
+            self.land(planner=P, runner=rv)
+            base = self.origin_rev("main")
+            tip = TK.tip_plan(self.root, base, head, ["b/y"], fallback=MF.host_fallback("demo"))
+        self.assertEqual([c[0] for c in rv.calls], ["check"])
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+        self.assertEqual(tip.checks, ["e2e"])
+        # …and with no fallback for the repo the same change plans no check at all
+        self.pr(2, {"b/y": "m\n"})
+        J.submit("demo", 2)
+        rv2 = Runner()
+        with mock.patch.object(MF, "FALLBACK_DIR", os.path.join(self.tmp, "empty")):
+            self.land(planner=P, runner=rv2)
+        self.assertEqual(rv2.calls, [])
 
 
 class Review(Fixture):
@@ -805,12 +977,14 @@ class Review(Fixture):
         self.assertEqual(u["cards"].calls[0][3], "seat")
         w = J.read_json(J.handed_path("demo", 1))
         self.assertEqual((w["reads_used"], w["verdict"]["verdict"]), (1, "HANDBACK"))
-        J.submit("demo", 1, reads_used=1, verdict=w["verdict"])
+        J.carry("demo", 1, w["reads_used"])          # what the tick does on a push (sweep_handed)
+        J.submit("demo", 1)
         rv = Reviewer(V(T.HANDBACK_VERDICT, blocking=["still"]))
         u, _ = self.land(planner=Planner(paid=True), reviewer=rv)
         j = self.job()
         self.assertEqual((j.state, j.reads_used), (T.QUERY, 2))
-        self.assertEqual(rv.calls, [("delta", "HANDBACK")])
+        # the prior verdict is not carried by the lane: the reviewer finds it among the box's own PR markers
+        self.assertEqual([c[0] for c in rv.calls], ["review"])
         self.assertEqual(u["cards"].calls[0][3], "planning")
 
     def test_unrunnable_holds_then_queries(self):
@@ -843,12 +1017,32 @@ class Door(Fixture):
         self.assertEqual(J.requests(), [])
         rc, _, err = self.queue("demo", "1", "--approved-by", "UOWNER", "--no-start")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(J.requests()[0][1]["approved_head"], head)
+        self.assertEqual(J.approval("demo", 1)["approved_head"], head)
+        self.assertNotIn("approved_head", J.requests()[0][1])        # the request carries no approval
         u, _ = self.land()
         self.assertEqual(self.job().state, T.DEPLOY_PENDING)
         # a PR under no protected path queues on anyone's say
         self.pr(2, {"b/y": "n\n"})
         self.assertEqual(self.queue("demo", "2", "--no-start")[0], 0)
+
+    def test_a_forged_request_lands_nothing_without_a_real_read(self):
+        """Anyone may write the inbox (review of #771): an approval or a verdict in a request is dropped, so a forged
+        owner approval stops at the door, and a forged LAND buys the read it tried to skip."""
+        head = self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1, approved_by="UOWNER", approved_head=head, reads_used=0,
+                 verdict={"verdict": "LAND", "digest": "d" * 64, "blocking": [], "advisory": []})
+        u, _ = self.land()
+        j = self.job()
+        self.assertEqual(j.state, T.QUERY)
+        self.assertIn("no 👍 of the owner's queued it", j.extra["why"])
+        self.assertEqual(self.box().get("merges", []), [])
+        self.assertNotIn("verdict", j.extra)
+        self.pr(2, {"b/y": "n\n"})                    # no protected path: the forged LAND must not skip the read
+        J.submit("demo", 2, verdict={"verdict": "LAND", "digest": "d" * 64, "blocking": [], "advisory": []})
+        rv = Reviewer(V(T.HANDBACK_VERDICT, blocking=["a real read"]))
+        self.land(planner=Planner(paid=True), reviewer=rv)
+        self.assertEqual([c[0] for c in rv.calls], ["review"])
+        self.assertEqual(self.box().get("merges", []), [])
 
     def test_unreadable_config_fails_closed(self):
         self.set_box(config={"SLACK_OWNER_ID": "UOWNER", "CC_PROTECTED_PATHS_demo": False})
@@ -1081,9 +1275,7 @@ class Branches(Fixture):
         self.assertIn("done demo#1 rc=1", self.log())
         self.pr(2, {"b/y": "n\n"})
         J.submit("demo", 2)
-        planner = Planner()
-        planner.checks = lambda root, sha: [T.Check(name="a", run="true")]   # the manifest lacks b
-        self.land(planner=planner)
+        self.land(runner=Runner(missing={"b"}))   # the manifest lacks b
         self.assertEqual(self.job(2).state, T.QUERY)
         self.assertIn("lacks: b", self.job(2).extra["why"])
 
@@ -1119,7 +1311,8 @@ class Branches(Fixture):
         started = []
         fake = mock.Mock(side_effect=lambda argv, **kw: started.append((argv, kw)) or mock.Mock(pid=7))
         J.submit("demo", 2)
-        with mock.patch.object(TK.subprocess, "Popen", fake), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(TK.subprocess, "Popen", fake), mock.patch.object(TK, "rearm", lambda r: []), \
+                mock.patch.object(TK, "tip_and_deploy", lambda r, u: []), contextlib.redirect_stdout(io.StringIO()):
             TK.cmd_tick(["--detach"])
         self.assertEqual(started[0][0][-2:], ["lane", "demo"])
         self.assertTrue(started[0][1]["start_new_session"])

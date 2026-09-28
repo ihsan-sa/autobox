@@ -19,12 +19,12 @@ a stop costs a fix iteration, a re-review and a re-lane, all of which reading th
 
 ## And then the last thing you do: hand over a tree a suite has already passed on
 
-Run `cc-green`. It takes the tree your working copy would commit and says, per gate, whether a green record
-already exists for it; `cc-green run` runs the ones that do not, one run per worktree, into a log it names. The
-landing then spends those records instead of running the ~22-minute suite again on its own queue, where it is the
-slowest thing in the flow. A gate that long outlives a foreground tool call, so start it with `cc-green start`,
+Run `cc-green`. It takes the tree your working copy would commit and says whether `lander check` has already
+passed on it: the checks the landing's own plan selects for your change, not the whole suite, so a red there is the
+red the landing would stop on. `cc-green run` runs it when it has not, one run per worktree, into a log it names.
+A check can outlive a foreground tool call, so start it with `cc-green start`,
 which detaches the run itself and returns, then `cc-green wait` until its exit is not 3 (still going), and read the
-log it names. One of your repo's own suites that is not a landing gate goes the same way, `cc-green start --
+log it names. One of your repo's own suites the plan does not select goes the same way, `cc-green start --
 tests/check-slow.sh` or `cc-green start -- bin/<tool> selfcheck`; it takes a committed suite and nothing else. Never add `setsid`, `nohup` or `&` yourself, because the auto-mode classifier
 refuses those as a bypass, and a `run_in_background` job dies with your iteration. If you edit while it runs, its
 verdict no longer answers for your tree: `cc-green stop` ends your own run (never `kill` it), then `start` again. The run outlives the
@@ -32,11 +32,11 @@ iteration: if yours ends while the run is going, the loop waits on it (no model 
 log for your next context, which reads that log and finishes.
 
 `cc-green` also reads your diff for each defect class the landing review has stopped two or more PRs for, and names
-the line; a class it names holds the hand-over like a gate that has not run. The classes come from the recorded
+the line; a class it names holds the hand-over like a check that has not run. The classes come from the recorded
 reviews, not from this file — `core/tests/recurring_defects.py` says how. Fix it, or mark an added line of that file
 `recurring-defect-ok: <class> — <why>` when it is answered some other way.
 
 **Fix everything above BEFORE that run, and edit nothing after it.** A doc fix, a comment, a rebuilt artefact —
 each makes a tree nothing has passed on, and reasoning about how harmless it was does not change that. Of the 34
-gate-landings inside one record window on 2026-09-07, 7 spent a record; 11 had run the gate green and then moved
-between one and eight of their own files afterwards, one of them a docs edit its journal called harmless.
+landings inside one record window on 2026-09-07, 11 had run the gate green and then moved between one and eight of
+their own files afterwards, one of them a docs edit its journal called harmless.

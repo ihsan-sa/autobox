@@ -84,7 +84,6 @@ run on their own. It owns only the paths no narrower check covers.
 | `py-compile-cc-member-v2` | static | reads the file only: python compiles it |
 | `py-compile-cc-name` | static | reads the file only: python compiles it |
 | `py-compile-cc-native` | static | reads the file only: python compiles it |
-| `py-compile-cc-queue-steward` | static | reads the file only: python compiles it |
 | `py-compile-cc-reconcile` | static | reads the file only: python compiles it |
 | `py-compile-cc-rename` | static | reads the file only: python compiles it |
 | `py-compile-cc-replay` | static | reads the file only: python compiles it |
@@ -100,6 +99,7 @@ run on their own. It owns only the paths no narrower check covers.
 | `py-compile-cc-vitals` | static | reads the file only: python compiles it |
 | `py-compile-cc-voice` | static | reads the file only: python compiles it |
 | `py-compile-cc-wakes` | static | reads the file only: python compiles it |
+| `py-compile-lander-self` | static | reads the file only: python compiles it |
 | `py-compile-tests` | static | reads the file only: python compiles it |
 | `json-manifests` | static | jq over files, nothing else |
 | `landing-data` | static | parses this manifest and the reach graph, nothing else |
@@ -124,6 +124,7 @@ run on their own. It owns only the paths no narrower check covers.
 | `selfcheck-cc-github-deny` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-graphs` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-lander` | host | runs the new lander's unit cases, which start the launcher under a temp HOME; not yet proven in the sandbox |
+| `selfcheck-lander-self` | host | builds its own temp HOME and git repo and runs a release's selfcheck from it; not yet proven in the sandbox |
 | `selfcheck-cc-green` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-guard` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-handoff` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
@@ -143,7 +144,6 @@ run on their own. It owns only the paths no narrower check covers.
 | `selfcheck-cc-notify` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-pause` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-publish` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
-| `selfcheck-cc-queue-steward` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-reconcile` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-refusals` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-rename` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |

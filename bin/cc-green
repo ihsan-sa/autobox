@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
-# cc-green — the tree you are about to hand over, and whether a suite has already passed on THAT tree.
+# cc-green — a worker's own green: `lander check` on the tree you are about to hand over, and whether it has
+# already passed on THAT tree.
 #
-#   cc-green                 per gate: green on this working copy, or not, and why not; then the recurring defects
-#                            below. exit 1 if any gate is not green or the diff carries one
-#   cc-green run             …and run the ones that are not, unscoped, one run per worktree, into a log it names.
+#   cc-green                 what `lander check` last said on this worktree, and whether that was on the tree the
+#                            working copy holds now; then the recurring defects below. exit 1 unless the last verdict
+#                            is green on this very tree and the diff carries no recurring defect
+#   cc-green run             …and run `lander check` on the worktree, one run per worktree, into a log it names.
 #                            The run is a process of its own that outlives this one: this follows its log and exits
 #                            with its code. A Ctrl-C here is carried to the run; a TERM or hangup here ends only the
-#                            following. exit 3 and no second suite when a run is already going on this root; exit 1
+#                            following. exit 3 and no second run when a run is already going on this root; exit 1
 #                            when the run was killed before it finished
-#   cc-green start           …the same run, and return as soon as it has started: the ROUTE FOR A WORKER, whose gate
+#   cc-green start           …the same run, and return as soon as it has started: the ROUTE FOR A WORKER, whose check
 #                            outlives a foreground tool call. It needs no `setsid`, `nohup` or `&` from the caller —
 #                            the run detaches itself (below), and a caller that types those is read by the auto-mode
 #                            classifier as a bypass and refused (twice on 2026-09-25). Then `cc-green wait` until it
 #                            does not exit 3. exit 0 once the run is going, 3 when one already is
-#   cc-green start -- SUITE  the same for one of the repo's own suites that is not a landing gate: a
-#                            `[core/]tests/check*.sh` or `selftest*.sh` (`tests/check-slow.sh`), or a tool's
-#                            `[core/]bin/<tool> selfcheck` for a tool that ships one — nothing else, no other
-#                            arguments, and only a file the branch's HEAD already tracks, so it cannot be a general way to detach any command past
-#                            the classifier (review of PR #675). Run from the root, on the same lock, log and status,
-#                            so `wait` and cc-loop's green_wait follow it too. It files no record. `wait` on it says
-#                            the suite's exit and exits 0 when that was 0, else 1 — no gate report. `run -- SUITE`
-#                            is the same, followed in the foreground
+#   cc-green start -- SUITE  the same for one of the repo's own suites: a `[core/]tests/check*.sh` or `selftest*.sh`
+#                            (`tests/check-slow.sh`), or a tool's `[core/]bin/<tool> selfcheck` for a tool that ships
+#                            one — nothing else, no other arguments, and only a file the branch's HEAD already tracks,
+#                            so it cannot be a general way to detach any command past the classifier (review of PR
+#                            #675). Run from the root, on the same lock, log and status, so `wait` and cc-loop's
+#                            green_wait follow it too. It leaves no verdict. `wait` on it says the suite's exit and
+#                            exits 0 when that was 0, else 1 — no report. `run -- SUITE` is the same, in the foreground
 #   cc-green wait [SECONDS]  block on that run, SECONDS at most (default 540, under a foreground tool call). Ended,
 #                            or none going: the report for the tree as it is NOW, exit 0/1 as above. Still going:
 #                            `still running (pid, since)`, exit 3 — call again. Killed or interrupted before it
@@ -29,157 +30,71 @@
 #                            spend — does not hold `start` at exit 3 until it is over. The route for a worker, whose own
 #                            `kill` of the run the classifier refuses as interfering with a workload (2026-09-26, ~22 min
 #                            lost behind a stale suite). It reaches only the pid this root's status note names and the
-#                            gate groups that run wrote there, and only after reading each one's environment for the
+#                            process group that run wrote there, and only after reading each one's environment for the
 #                            run's own CC_GREEN_RUNID — no process is found by name or pattern, and another worktree's
-#                            run has another lock, note and runid. TERM first, so the run takes its gate down and says
-#                            `interrupted`; a run still holding the lock 30 s later gets KILL, and so does a gate group
-#                            of its still there 5 s after that.
+#                            run has another lock, note and runid. TERM first, so the run takes its check down and says
+#                            `interrupted`; a run still holding the lock 30 s later gets KILL, and so does a group of
+#                            its still there 5 s after that.
 #                            Then `cc-green start` runs on the tree as it is now. exit 0 once none is going (or none
 #                            was), 1 when the lock is held by something this cannot prove is the run
 #   cc-green red SCOPE KIND KEY --observed TEXT [--log FILE] [--writer W] [--expected TEXT] [--link k=v]... [--cost k=v]...
 #                            one failures-ledger record (cc-failures record), ONCE per KEY: a second call with a KEY the
 #                            scope's ledger already holds under links.source writes nothing and says `already <id>`. The
 #                            last 8 KiB of --log and its ✗/FAIL lines go to a bounded excerpt under
-#                            $CC_FAILURES/excerpts/<scope>/ that outlives the log. ALWAYS exit 0 — the gate, landing
-#                            or loop calling it keeps its own verdict whatever the ledger does; what happened is one
+#                            $CC_FAILURES/excerpts/<scope>/ that outlives the log. ALWAYS exit 0 — the caller (cc-loop's
+#                            stops, among others) keeps its own verdict whatever the ledger does; what happened is one
 #                            line on stdout: `recorded <id>` · `already <id>` · `not recorded: <why>`
-#   cc-green selfcheck       fixtures of its own: a scratch record directory, stub gates, a throwaway repo
-# A RED IS WRITTEN DOWN BY THE TOOL THAT SAW IT (docs/design-failure-noticing-2026-09-11.md, phase 2). `run` records
-# a gate that did not pass as kind gate-verdict/red, keyed gate:<gate>:<tree>, so the landing gating the same tree and
-# a fix round's worker seeing the same red land on the same record. A WORKER'S OWN RED IS NOT A FAILURE: a red-first
-# case, or a gate the branch is fixing, is the work — so a red whose ✗ lines name only files the branch itself
-# touches (its diff against the base, plus the working copy) or the gate script itself is said and not recorded.
-# A red that names a file the branch never touched, or names none, is somebody else's — the base, the box, a flake
-# — and is recorded. cc-land's gates and cc-loop's stops call `red` too, with their own kinds (they say which).
-# A gate `run` starts carries no *_TOKEN / *_KEY / *_SECRET / *_CREDS / *_WEBHOOK / *_PASSWORD or named API token from this shell, and has the live
-# ~/.cc/config denied (CC_CONFIG_DENY) — the scrub cc-land's own gate run applies.
-# Three states per gate, not two: `green` a record the landing will spend · `ran` it passed here but files no
-# record, so the landing runs it again · `RUN` neither, and that is what holds a hand-over back.
+#   cc-green selfcheck       fixtures of its own: a scratch verdict directory, a fake lander, throwaway repos
 #
-# WHY. A landing re-runs a suite the worker already ran, on the same content, and the suite is ~22 minutes.
-# tests/green.sh has recorded what a green run passed on since 2026-09-04 and cc-land's green_run spends it, so
-# the saving is already built — but of the 34 gate-landings inside one record window (2026-09-07, 17:14Z to
-# 23:49Z) only 7 spent a record. It is not the record and not a rebase, which three branches carry and which
-# explains none of them. In 11 the gate HAD run green on the worker's own tree and then 1 to 8 of that branch's
-# own files moved after it: the worker's last suite run was not its last act, it kept editing, the Stop hook
-# committed, and the tree the PR carried was one nothing had ever passed on. #327's journal says so in as many
-# words. The other 16 had no record for any tree the branch ever held.
+# WHAT RUNS. `lander check <root>` plans the worktree's change against its base and runs only the checks that plan
+# selects, the way the landing will (core/lander/check.py). It exits 0 green, 1 a check red, 3 no verdict (a check
+# could not run); cc-green's own answer is 0 for green and 1 for anything else. Which lander: the worktree's own
+# core/lander/cli.py through `python3 -P` when the worktree has one — so a worker on this repo tests the lander its
+# branch carries, and never needs a pinned release to exist — else the `lander` on PATH. Neither is no verdict.
+# The check runs with no *_TOKEN / *_KEY / *_SECRET / *_CREDS / *_WEBHOOK / *_PASSWORD or named API token from this
+# shell, and with the live ~/.cc/config denied (CC_CONFIG_DENY).
+# A RED IS NOT WRITTEN TO THE FAILURES LEDGER from here. lander check holds a check that is red on the base too
+# against main, not the change, so a red it reports is red only on the branch: that is the worker's own work.
 #
-# So the missing thing was never a rule. It was that a worker could not ASK. This answers in about a second: it
-# takes the tree the working copy would commit and looks for the record the suite would have filed under it.
-#
-# WHAT IT WILL NOT DO IS CLAIM A MATCH THE LANDING WILL NOT HONOUR. green_run spends a record only when the tree,
-# the suite name, the scope and the clock all agree, so this reads all four the same way and calls anything else
-# not green. Two of those are worth saying out loud:
-#   scope   a suite told what a diff changed (CC_LAND_CHANGED) records the paths it narrowed to, and that record
-#           answers only for a landing narrowed to exactly the same. A worker cannot know what the landing's diff
-#           will be, so a scoped record is reported as not green and `run` always runs unscoped.
-#   clock   a record is spent for GREEN_TTL and then it is not — except by a batch's warm, which spends a record
-#           on the PR's head for 48 h (cc-land's WORKER_GREEN_TTL), since the suite runs on the base after the batch.
-#           This report says GREEN_TTL's answer, so a record it calls stale may still be spent there.
+# THE VERDICT IS KEYED BY THE TREE. A worker's check ran green, then it kept editing, the Stop hook committed, and
+# the tree the PR carried was one nothing had passed on (11 of 34 landings on 2026-09-07). So the run writes what
+# it answered beside its lock — the tree it ran on (tests/green.sh's green_tree: every tracked and addable file,
+# hashed by git), the exit, the time — and the report calls it green only while the working copy is still that
+# tree. A check that itself moves the tree leaves no verdict at all: it passed on content this checkout no longer
+# holds. The note is one per root and says nothing to the landing, which plans and checks the change on its own.
 #
 # THE RECURRING DEFECTS. The report also looks at the diff against origin/HEAD for each defect class the landing
-# review has stopped two or more PRs for, and a class it finds holds the hand-over like a gate that has not run. No
-# model call. The classes come from the record, not from here: tests/recurring_defects.py counts the recorded
-# LAND-AFTER-FIX reviews (~/.cc/state/land/reviews, and the review-<pr>.md briefs in live track dirs, which it copies
-# there) against config/recurring-defects.json, which says how each class is placed and how it shows in a diff.
-#
-# AND WHAT A GATE MUST READ TO BE RUN HERE AT ALL. A record is written from the WORKING COPY, and spent by a
-# landing that has checked the head out — so a gate reads the files in front of it, never `HEAD`, or it answers a
-# different question in the two places. tests/check-extra.sh's private-string grep read HEAD until 2026-09-14,
-# and four tracks paid the same way: `run` scored the working copy, the gate failed the commit behind it, and the
-# same tree failed again once the hook had committed the fix. It reads the working tree now (tracked files as
-# they are on disk, plus untracked ones git would add — the set green_tree hashes) and files a record like the
-# rest. A gate that must read the commit itself has no place in this run; it belongs to the landing's own steps.
-#
-# …AND `ran` IS WRITTEN DOWN, NOT JUST REMEMBERED. `run` ended "green — hand over now" with check-extra.sh as `ran`,
-# and a plain call on the same tree a minute later said "RUN tests/check-extra.sh — no record" for ever: both true
-# in-process, and a worker polled the second for the first's word for 550 s, twice. Run and status must agree for
-# one tree, so a gate that passes here and files nothing leaves a note under $GDIR — gate, time, keyed like a
-# record, and a .ran rather than a .json because cc-land globs the .json files as records to spend — and both
-# read it, for the same GREEN_TTL. A tree the run itself moved gets no note: whatever passed, passed elsewhere.
+# review has stopped two or more PRs for, and a class it finds holds the hand-over like a red check. No model
+# call. The classes come from the record, not from here: tests/recurring_defects.py counts the recorded
+# LAND-AFTER-FIX reviews against config/recurring-defects.json, which says how each class is placed and how it
+# shows in a diff.
 #
 # ONE RUN PER WORKTREE. Two `run`s went at one tree at once — an earlier iteration's was still going and nothing
-# readable said so — and a loaded box ran ~20 minutes of suite twice. `run` holds a flock keyed by the root's
-# realpath for as long as it runs and writes what it is doing beside it (root, tree, pid, started, log); a second
-# `run` on that root reads the note and exits 3 without a suite. `wait` blocks on the same lock, so a worker that
-# detached the run holds nothing but a bounded call and a log path, not a pid that dies within the second — and
-# the run no longer dies with the worker's iteration (A RUN OUTLIVES WHOEVER STARTED IT, below).
+# readable said so — and a loaded box ran the whole thing twice. `run` holds a flock keyed by the root's realpath
+# for as long as it runs and writes what it is doing beside it (root, tree, pid, started, log); a second `run` on
+# that root reads the note and exits 3. `wait` blocks on the same lock, so a worker that detached the run holds
+# nothing but a bounded call and a log path — and the run does not die with the worker's iteration (A RUN
+# OUTLIVES WHOEVER STARTED IT, below).
 set -uo pipefail
 SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
 USAGE="usage: cc-green [run|start [-- SUITE]|wait [SECONDS]|stop|red SCOPE KIND KEY --observed TEXT [--log FILE]…|selfcheck]"
-# The tree is taken by tests/green.sh's green_tree — the SUITE's own hash, not a second one of ours. See the note
-# there: a reader with an algorithm of its own is how a green comes to name content it did not pass on.
+# The tree is taken by tests/green.sh's green_tree: one algorithm for every reader of "the tree this working copy
+# would commit".
 # shellcheck source=/dev/null
 . "$CORE/tests/green.sh"
-
-# The gates a landing runs, in the order it runs them, copied from cc-land's own GATES tuple. A copy that
-# drifts would leave a worker believing it is green on a gate the landing is still going to run, so the selfcheck
-# reads that tuple out of "$BIN/cc-land" and fails when the two disagree. Naming the file that way is also what
-# puts this selfcheck in the reach of a change to cc-land (land_scope, tests/green.sh).
-GATES="core/tests/check.sh tests/check.sh tests/check-extra.sh core/tests/selftest.sh tests/selftest.sh"
-GREEN_TTL=$((6 * 3600))                             # cc-land's GREEN_TTL. NOT settable from the environment: a knob
-                                                    # here would only move THIS tool's view of the clock, and the
-                                                    # landing would go on spending nothing. The selfcheck ages a
-                                                    # record instead, which is the thing that really happens.
 GDIR="${CC_GREEN_DIR:-$HOME/.cc/state/land/green}"
 
 for t in jq flock; do command -v "$t" >/dev/null 2>&1 || { echo "cc-green: $t is missing" >&2; exit 2; }; done
 
 root(){ git rev-parse --show-toplevel 2>/dev/null; }
 now(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
-age_of(){ echo $(( $(date -u +%s) - $(date -u -d "$1" +%s 2>/dev/null || echo 0) )); }   # $1 = a stamp → seconds since
-
-# Is there a record this landing would spend for $1 (the gate, as the landing names it) on tree $2? Prints the
-# reason it is NOT spendable, and nothing at all when it is — so the caller reads emptiness as green.
-why_not(){
-  local gate=$1 tree=$2 f v tree_r suite scope at age
-  f="$GDIR/$(basename "$gate")-${tree:0:12}.json"
-  [ -f "$f" ] || { echo "no record for this tree"; return; }
-  # A field at a time, one line each. NOT @tsv into `read`: tab is IFS whitespace, so an empty scope — which is
-  # the ordinary case, and the only one a landing spends freely — collapses and every later field shifts left.
-  mapfile -t v < <(jq -r '.tree // "", .suite // "", .scope // "", .at // ""' "$f" 2>/dev/null)
-  [ "${#v[@]}" = 4 ] || { echo "its record is unreadable"; return; }
-  tree_r=${v[0]}; suite=${v[1]}; scope=${v[2]}; at=${v[3]}
-  # The file is named for the tree, so a mismatch here is a collision or a hand-written file, not an edit.
-  [ "$tree_r" = "$tree" ] || { echo "its record names another tree ($tree_r)"; return; }
-  [ "$suite" = "$gate" ] || { echo "that record is $suite's, not this gate's"; return; }
-  [ -z "$scope" ] || { echo "recorded scoped to '$scope' — only a landing whose diff is exactly that spends it"; return; }
-  age=$(age_of "$at")
-  [ "$age" -le "$GREEN_TTL" ] || { echo "green at $at, which is past the ${GREEN_TTL}s the landing trusts"; return; }
-}
-
-# Every gate this tree actually has, as the landing names it.
-gates_here(){ local r=$1 g; for g in $GATES; do [ -x "$r/$g" ] && echo "$g"; done; }
-
-# A gate that has run HERE and passed, and files no record at all: every gate in a repo whose suites do not
-# source tests/green.sh (tests/check-extra.sh was one until 2026-09-14). Its answer is as good as a record's —
-# the tree has not moved since — but the landing has nothing to spend and will run it again, so say both. run_missing
-# collects what ran; main() drops the list entirely if the tree moved afterwards, because then it passed on
-# something else, and otherwise note_ran writes a note per gate, keyed like a record, that ran_here reads back
-# for the same GREEN_TTL — in this process or a later one, so a plain call after the run says what the run said.
-RAN=""
-CMD=""      # the command a `start -- CMD` run carries instead of the gates; set in the run only
-note_of(){ echo "$GDIR/$(basename "$1")-${2:0:12}.ran"; }   # $1 = gate, $2 = tree. NEVER .json: cc-land spends those
-note_ran(){   # $1 = tree. A note for each gate that ran and still has nothing to spend; stale notes go with it
-  local tree=$1 g
-  find "$GDIR" -maxdepth 1 -name '*.ran' -mmin "+$((GREEN_TTL / 60))" -delete 2>/dev/null
-  for g in $RAN; do
-    [ -n "$(why_not "$g" "$tree")" ] || continue
-    printf '%s\n%s\n' "$g" "$(now)" > "$(note_of "$g" "$tree")" 2>/dev/null
-  done
-}
-ran_here(){   # $1 = gate, $2 = tree → the note is this gate's and inside the TTL
-  local f v; f=$(note_of "$1" "$2"); [ -f "$f" ] || return 1
-  mapfile -t v < "$f"
-  [ "${v[0]:-}" = "$1" ] && [ "$(age_of "${v[1]:-}")" -le "$GREEN_TTL" ]
-}
+CMD=""      # the suite a `start -- SUITE` run carries instead of lander check; set in the run only
 
 # ── the failures ledger: `red`, and the rule that keeps a worker's own red out of it ──────────────────────────
 FDIR="${CC_FAILURES:-$HOME/.cc/failures}"   # cc-failures' own default; a test run points both at a scratch dir
 RED_TAIL=8192                                # bytes of a log an excerpt keeps — bounded, so a red never fills a disk
 RED_LINES=40                                 # …and at most this many ✗/FAIL lines ahead of that tail
-RED_RE='✗|✘|FAIL|Error\b|error:|not ok|Traceback|[1-9][0-9]* failed'   # cc-land's gate_fail lines, plus a red tally
+RED_RE='✗|✘|FAIL|Error\b|error:|not ok|Traceback|[1-9][0-9]* failed'   # the ✗/FAIL lines an excerpt leads with, plus a red tally
 
 excerpt(){   # SCOPE KEY LOG → the path of a bounded excerpt of LOG under the ledger's dir, or nothing when there is no log
   local scope=$1 key=$2 log=$3 d f n
@@ -220,63 +135,6 @@ red(){   # SCOPE KIND KEY --observed TEXT [--log FILE] [--writer W] [--expected 
   return 0
 }
 
-# A WORKER'S OWN RED IS THE WORK. The branch is measured against the base it was dispatched onto — origin/HEAD is
-# what a clone knows; a fixture with no remote falls to main, then master; with none, "own" is the working copy.
-base_ref(){ local b; for b in origin/HEAD origin/main main master; do
-  git -C "$1" rev-parse -q --verify "$b^{commit}" >/dev/null 2>&1 && { echo "$b"; return; }; done; }
-changed_paths(){   # $1 = root → the repo-relative path of every file the branch touches: its diff from the merge-base,
-  local r=$1 b mb   #   plus the working copy. The gate-itself rule reads THESE, not the basenames below.
-  b=$(base_ref "$r"); mb=HEAD; [ -z "$b" ] || mb=$(git -C "$r" merge-base HEAD "$b" 2>/dev/null || echo HEAD)
-  { git -C "$r" diff --name-only "$mb" 2>/dev/null; git -C "$r" ls-files --others --exclude-standard 2>/dev/null; } | sort -u
-}
-red_names(){   # $1 = a gate's output → basenames of the files its red names: a tool by its red tally, a file by a
-               # `path.sh:12`/`In path line 12`/`File "path"` location, a bin/<tool> word after a space or a quote
-  { sed -nE 's/^([A-Za-z0-9_.-]+) selfcheck: .*[1-9][0-9]* failed.*/\1/p' "$1"
-    grep -E "$RED_RE" "$1" | grep -oE '(^|[[:space:]"'"'"'])[A-Za-z0-9_./-]+\.(sh|py):[0-9]+' | sed -E 's/^[[:space:]"'"'"']//; s/:[0-9]+$//'
-    sed -nE 's/^In ([A-Za-z0-9_./-]+) line [0-9]+:.*/\1/p' "$1"
-    grep -oE '(^|[[:space:]"'"'"'`(])(core/)?bin/[A-Za-z0-9_.-]+' "$1" | sed 's#.*bin/##'
-  } 2>/dev/null | sed 's#.*/##' | sort -u
-}
-own_red(){   # $1 = root, $2 = gate, $3 = its output → 0 when the red is the branch's own work; says why either way
-  local r=$1 g=$2 out=$3 paths changed names n miss=""
-  paths=$(changed_paths "$r")
-  [ -n "$paths" ] || { echo "this branch touches nothing, so the red is not its work"; return 1; }
-  changed=$(sed 's#.*/##' <<<"$paths" | sort -u)   # …and their basenames, which is what red_names gives to compare
-  # THE GATE ITSELF IS MATCHED BY PATH. Against the basename list this repo's own GATES carries two check.sh, so a
-  # branch that edited only tests/check.sh made a red core/tests/check.sh read as its own work and the red was lost.
-  grep -qxF "$g" <<<"$paths" && { echo "this branch edits $g itself"; return 0; }
-  names=$(red_names "$out")
-  [ -n "$names" ] || { echo "the red names no file, so it cannot be this branch's own"; return 1; }
-  for n in $names; do grep -qxF "$n" <<<"$changed" || miss="$miss $n"; done
-  [ -z "$miss" ] && { echo "the red names only files this branch touches ($(tr '\n' ' ' <<<"$names" | sed 's/ $//'))"; return 0; }
-  echo "the red names files this branch never touched:$miss"; return 1
-}
-scope_of(){   # $1 = root → the project the ledger files this under: the worktree's `.cc/track` marker, else the checkout's name
-  local s; s=$(awk '{print $1; exit}' "$1/.cc/track" 2>/dev/null); [ -n "$s" ] || s=$(basename "$(readlink -f "$1")")
-  printf '%s' "$s" | tr -c 'A-Za-z0-9._-' '_'
-}
-red_seen(){   # $1 = root, $2 = gate, $3 = tree, $4 = its exit, $5 = its output file. Says what it did; never fails the run
-  local r=$1 g=$2 tree=$3 rc=$4 out=$5 why line scope
-  if why=$(own_red "$r" "$g" "$out"); then echo "cc-green: not recorded — $why; a worker's own red is the work, not a failure"; return 0; fi
-  line=$(grep -E "$RED_RE" "$out" 2>/dev/null | head -1 | cut -c1-200); scope=$(scope_of "$r")
-  echo "cc-green: failures ledger ($scope): $(red "$scope" gate-verdict/red "gate:$g:${tree:0:12}" \
-      --observed "gate $g did not pass (exit $rc) under cc-green on ${tree:0:12} in $r — $why${line:+; first red line: $line}" \
-      --expected "a tree handed over passes its gates" --log "$out" --writer cc-green --cost suite-run=1 \
-      --link "gate=$g" --link "tree=$tree" ${LOG:+--link "run-log=$LOG"} 2>&1 | tail -1)"
-}
-
-report(){   # $1 = root, $2 = tree. Prints a line per gate; returns 1 if any gate is not green on that tree.
-  local r=$1 tree=$2 g w bad=0 any=0
-  while read -r g; do
-    any=1; w=$(why_not "$g" "$tree")
-    if [ -z "$w" ]; then echo "  green   $g"
-    elif ran_here "$g" "$tree"; then echo "  ran     $g — passed here, but it files no record, so the landing runs it again"
-    else echo "  RUN     $g — $w"; bad=1; fi
-  done < <(gates_here "$r")
-  [ "$any" = 1 ] || { echo "  cc-green: no gate in this repo ($(echo "$GATES" | cut -d' ' -f1), …) — nothing to hand over green"; return 1; }
-  return "$bad"
-}
-
 # Every credential-shaped name in this environment — _TOKEN, _KEY, _SECRET, and the named API and login tokens —
 # one per line, for `env -u`. The list cc-land's SECRET_ENV and clean_start() drop; the two must stay the same.
 secret_names(){
@@ -284,63 +142,65 @@ secret_names(){
     | grep -E '(_TOKEN|_KEY|_SECRET|_CREDS|_WEBHOOK|_PASSWORD)$|^(ANTHROPIC_API_KEY|OPENAI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|GH_TOKEN|GITHUB_TOKEN)$'
 }
 
-# Run the gates that are not green, in the landing's own order, unscoped and in the foreground.
-run_missing(){
-  local r=$1 tree=$2 g w rc n scrub gout gp tp
-  while read -r g; do
-    w=$(why_not "$g" "$tree"); [ -n "$w" ] || continue
-    echo "cc-green: $g — $w; running it"
-    rc=0
-    # NEVER an inherited scope. A worker started from inside a scoped run would otherwise hand this gate that
-    # run's paths, and file a record narrowed to a diff that is not its own.
-    # …and never on the loop's own stdin. The gate names below come from a process substitution, so a gate left
-    # holding that on fd 0 drains it and `read` hits EOF: the run of 2026-09-08T00:20Z went green on
-    # core/tests/check.sh and reported the two gates behind it as never run. It never claimed a false green, but
-    # it did one gate an invocation. Case 13 is that gate.
-    # …nor holding the run lock (fd 9): a child a gate leaves behind would keep this root locked after the run.
-    # …and NO CREDENTIAL, on any branch: the same scrub as cc-land's clean_start (PR #323's gate read the live
-    # keys through cc-config and completed a billed turn, 2026-09-09), so a worker's run and the landing's agree.
-    scrub=(); while read -r n; do scrub+=(-u "$n"); done < <(secret_names)
-    # …and its output kept in a file of its own beside the stream: a red is recorded from what THIS gate said
-    # (red_seen), not from whatever the run log holds around it. Gone once the gate passes. The gate writes that
-    # file ITSELF and a tail streams it into the run log until the gate's own exit — never a pipe into tee: a
-    # pipeline ends when every holder of the gate's stdout has, so a child a gate left behind (`sleep 300 &`) held
-    # the run, its lock through tee, and every `wait` on it for the child's whole life (review of #464). Case 21.
-    # …and in a process group of its own, with a Ctrl-C on this run carried into it. bash starts an async job in a
-    # shell without job control with SIGINT and SIGQUIT ignored, and the gate's own bash keeps them ignored: the
-    # Ctrl-C killed cc-green and with it the fd-9 lock while the 20-minute suite ran on as an orphan, and the next
-    # `run` on that root started a second suite beside it. `setsid` in the async subshell — which is not a group
-    # leader, so it sets the group in place and $gp stays its leader — makes the gate and everything it starts one
-    # group the trap below can TERM, so the signal ends the suite the way the foreground gate used to. Case 22.
-    gout=$(mktemp "${TMPDIR:-/tmp}/cc-green.gate.XXXXXX") || gout=/dev/null
-    ( cd "$r" && exec setsid env -u CC_LAND_CHANGED "${scrub[@]}" CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" "$r/$g" ) </dev/null 9>&- >"$gout" 2>&1 & gp=$!
-    printf 'gate_pgid=%s\n' "$gp" >> "$STATUS"     # what `stop` may reach besides the run itself
-    tail -n +1 -f -s 0.2 --pid="$gp" "$gout" 9>&- 2>/dev/null & tp=$!
-    trap 'kill -TERM -- -"$gp" "$tp" 2>/dev/null; exit 130' INT TERM
-    wait "$gp" || rc=$?; wait "$tp" 2>/dev/null
-    run_traps
-    [ "$rc" = 0 ] || { echo "cc-green: $g did not pass (exit $rc) — nothing is green and nothing is handed over" >&2
-                       red_seen "$r" "$g" "$tree" "$rc" "$gout" 2>&1 || true; [ "$gout" = /dev/null ] || rm -f "$gout"; return 1; }
-    [ "$gout" = /dev/null ] || rm -f "$gout"
-    RAN="$RAN $g"
-  done < <(gates_here "$r")
+# ── the check: lander check on the root, and its verdict note ──────────────────────────────────────────────────
+lander_cmd(){   # $1 = root → sets LCMD to the lander check to run there; 1 when there is none
+  if [ -f "$1/core/lander/cli.py" ]; then LCMD=(python3 -P "$1/core/lander/cli.py" check "$1")
+  elif command -v lander >/dev/null 2>&1; then LCMD=(lander check "$1")
+  else return 1; fi
+}
+verdict_field(){ sed -n "s/^$1=//p" "$VERDICT" 2>/dev/null | head -1; }
+
+# The RUN's side: lander check on $1, its output into the run's log (this process's stdout), in a process group of
+# its own with a Ctrl-C or TERM on this run carried into it — bash starts an async job in a shell with no job
+# control with SIGINT ignored, so without the group and the trap an INT ended cc-green and its lock while the check
+# ran on as an orphan, and the next `run` on that root started a second one beside it. Never on this shell's stdin,
+# and never holding the run lock (fd 9): a child the check leaves behind would keep the root locked after the run.
+# The log is a file, not a pipe, so the run comes back on the check's own exit whatever it left running.
+run_check(){   # $1 = root → lander check's exit; 3 when there is no lander to run
+  local r=$1 rc=0 n gp scrub=()
+  local -a LCMD=()
+  if ! lander_cmd "$r"; then
+    echo "cc-green: no lander here — neither $r/core/lander/cli.py nor a \`lander\` on PATH — no verdict"
+    return 3
+  fi
+  echo "cc-green: ${LCMD[*]}"
+  while read -r n; do scrub+=(-u "$n"); done < <(secret_names)
+  ( cd "$r" && exec setsid env "${scrub[@]}" PYTHONDONTWRITEBYTECODE=1 CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" \
+      "${LCMD[@]}" ) </dev/null 9>&- & gp=$!
+  printf 'gate_pgid=%s\n' "$gp" >> "$STATUS"     # what `stop` may reach besides the run itself
+  trap 'kill -TERM -- -"$gp" 2>/dev/null; exit 130' INT TERM
+  wait "$gp" || rc=$?
+  run_traps
+  return "$rc"
+}
+
+report(){   # $1 = tree → one line for lander check's last verdict on this root; 0 only when it is green on $1
+  local t c at lg
+  t=$(verdict_field tree); c=$(verdict_field check); at=$(verdict_field at); lg=$(verdict_field log)
+  if [ -z "$t" ]; then echo "  RUN     lander check — no verdict on this worktree"; return 1; fi
+  [ "$t" = "$1" ] || { echo "  RUN     lander check — its last verdict ($at) is on ${t:0:12}, not this tree"; return 1; }
+  case "$c" in
+    0) echo "  green   lander check — passed on this tree at $at"; return 0 ;;
+    1) echo "  RED     lander check — a check it selected failed on this tree at $at; log $lg"; return 1 ;;
+    *) echo "  RUN     lander check — no verdict (exit $c: a check could not run, or no lander) at $at; log $lg"; return 1 ;;
+  esac
 }
 
 # ONE RUN PER ROOT. The lock is a flock on a file under $GDIR named for a hash of the root's realpath — two
-# checkouts of one repo are two roots and two suites, the same checkout reached by two paths is one. Beside it a
+# checkouts of one repo are two roots and two runs, the same checkout reached by two paths is one. Beside it a
 # status note says what the run holding it is doing, and the run's own log: the run writes there and nowhere else,
 # and whoever launched it follows that file, so a detached run has somewhere a worker can read. The lock is fd 9
 # for as long as the run lives (its launcher takes it and hands it over, below); nothing releases it early.
-lock_files(){   # $1 = root → LOCK STATUS LOG
+lock_files(){   # $1 = root → LOCK STATUS LOG VERDICT
   local key; key=$(readlink -f "$1" | sha1sum | cut -c1-12)
-  LOCK="$GDIR/run-$key.lock"; STATUS="$GDIR/run-$key.status"; LOG="$GDIR/run-$key.log"
+  LOCK="$GDIR/run-$key.lock"; STATUS="$GDIR/run-$key.status"; LOG="$GDIR/run-$key.log"; VERDICT="$GDIR/run-$key.verdict"
 }
 status_field(){ sed -n "s/^$1=//p" "$STATUS" 2>/dev/null | head -1; }
 run_traps(){ trap 'exit 130' INT; trap 'exit 143' TERM; }   # the run's own: a signal ends it with a code that says so
 take_run(){   # $1 = root. The RUN's side: the lock its launcher handed over on fd 9, else its own (an exec layer shut it)
   lock_files "$1"; mkdir -p "$GDIR"
   { true >&9; } 2>/dev/null || exec 9>"$LOCK"
-  flock -n 9 || { echo "cc-green: a run is already going on $1 (pid $(status_field pid)) — no second suite" >&2; return 3; }
+  flock -n 9 || { echo "cc-green: a run is already going on $1 (pid $(status_field pid)) — no second run" >&2; return 3; }
   trap '' HUP; run_traps
   begin_run "$1" ""
   # The exit, written by the run itself whatever ends it short of a SIGKILL: `wait` tells a run that ended from one
@@ -355,9 +215,8 @@ begin_run(){   # $1 = root, $2 = tree. Under the lock: what this run is; written
 
 # A RUN OUTLIVES WHOEVER STARTED IT. A track iteration started `setsid nohup cc-green run &` (the advice then; it is
 # `cc-green start` now, because the classifier refuses a worker's own setsid/nohup) and ended two minutes
-# later (error_max_turns); the run was gone with it — log two lines, the gate's output file empty and left behind,
-# no record, and a loop whose `green_wait` found no run to wait on. That is the signature of a TERM reaching this
-# process: run_missing's trap takes the gate's group down and exits 130 before a word is logged. `setsid` got the
+# later (error_max_turns); the run was gone with it — log two lines, nothing recorded, and a loop whose `green_wait` found no run to wait on. That is the signature of a TERM reaching this
+# process: the run's trap takes its check's group down and exits 130 before a word is logged. `setsid` got the
 # run out of the launcher's process group and session and nothing else — not its cgroup (the tmux pane's scope),
 # not the parent chain a tool walks when it kills "everything this command started". So `run` is two processes now:
 #   the LAUNCHER (`cc-green run`) takes the root's lock, writes the status note and truncates the log, starts the
@@ -371,7 +230,7 @@ begin_run(){   # $1 = root, $2 = tree. Under the lock: what this run is; written
 #     into the status on its way out. `wait` reads that: a run that ended says its exit, and one with no exit
 #     line, or 130/143, was killed or interrupted — said as such, exit 1, never green and never waited on for
 #     ever (the lock goes with the process; case 24).
-launch_run(){   # $1 = root, $2 = follow it (1) or return once it has started (0), $3… = a command in place of the gates
+launch_run(){   # $1 = root, $2 = follow it (1) or return once it has started (0), $3… = a suite in place of lander check
                 # → the run's exit (0 once started, unfollowed); 3 when one is already going, 1 when it was killed, 2 when it never started
   local r=$1 follow=$2 runid pid="" rc tp scope=() sub=(__run); shift 2
   [ $# = 0 ] || sub+=(-- "$@")
@@ -379,7 +238,7 @@ launch_run(){   # $1 = root, $2 = follow it (1) or return once it has started (0
   exec 9>"$LOCK"
   if ! flock -n 9; then
     echo "cc-green: a run is already going on $r (pid $(status_field pid), started $(status_field started), log $(status_field log))" >&2
-    echo "  — no second suite. \`cc-green wait\` blocks on it and reports when it has ended." >&2
+    echo "  — no second run. \`cc-green wait\` blocks on it and reports when it has ended." >&2
     stale_hint "$r" >&2
     return 3
   fi
@@ -403,7 +262,7 @@ launch_run(){   # $1 = root, $2 = follow it (1) or return once it has started (0
     echo "cc-green: the run did not start within 10 s — log $LOG:" >&2; tail -5 "$LOG" >&2; return 2
   fi
   if [ "$follow" = 0 ]; then
-    echo "cc-green: started ${*:-the gates} on $r (pid $pid) — log $LOG"
+    echo "cc-green: started ${*:-lander check} on $r (pid $pid) — log $LOG"
     echo "  \`cc-green wait\` blocks up to 540 s and says when it has ended; exit 3 is still going, so call it again."
     return 0
   fi
@@ -430,7 +289,7 @@ suite_ok(){   # $1 = root, $2… = what `-- …` carries. 0 when it is one of th
   # copy is asked, in the shapes check.sh's ships_selfcheck reads (keep the two the same).
   # WHAT RUNS IS THE WORKING COPY, not HEAD's: these checks say the file is one the branch has committed, and a
   # tool whose committed copy has a selfcheck, but an edit made since is run as it stands. That is the same trust
-  # every gate here already gives the tree — a worker can edit tests/check.sh too — and no more than it.
+  # lander check already gives the tree — a worker can edit the checks it runs too — and no more than it.
   local r=$1 p=${2:-} head; shift
   p=${p#./}
   if { [ $# = 1 ] && [[ "$p" =~ ^(core/)?tests/(check|selftest)[A-Za-z0-9_-]*\.sh$ ]]; } \
@@ -454,7 +313,7 @@ suite_ok(){   # $1 = root, $2… = what `-- …` carries. 0 when it is one of th
 run_cmd(){   # $1 = root, $2… = the suite (suite_ok has passed it). The RUN's side of `start -- CMD`: its exit is the run's, and it records nothing
   local r=$1 gp rc=0; shift
   echo "cc-green: running $* in $r (pid $$) — log $LOG"
-  # Its own process group, as a gate gets in run_missing, so an INT or TERM on the run takes the command down with it.
+  # Its own process group, as lander check gets in run_check, so an INT or TERM on the run takes the command down with it.
   ( cd "$r" && exec setsid "$@" ) </dev/null 9>&- & gp=$!
   printf 'gate_pgid=%s\n' "$gp" >> "$STATUS"
   trap 'kill -TERM -- -"$gp" 2>/dev/null; exit 130' INT TERM
@@ -498,7 +357,7 @@ stale_hint(){   # $1 = root (lock_files already read). Says nothing unless the r
   echo "  \`cc-green stop\` ends it, then \`cc-green start\` runs on the tree as it is."
 }
 # `cc-green stop`. Every pid it signals is one this root's status note names AND whose environment carries that
-# note's runid, which a run and its gates inherit from the launcher: a pid reused since, or a lock held by anything
+# note's runid, which a run and its check inherit from the launcher: a pid reused since, or a lock held by anything
 # else, is left alone and said. Never pgrep/pkill -f — a -f pattern once killed ~26 sessions.
 is_ours(){ [ -n "$2" ] && tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep -qxF "CC_GREEN_RUNID=$2"; }   # $1 = pid, $2 = runid
 stop_run(){   # $1 = root → 0 when no run holds the root any more, 1 when this cannot end what holds it
@@ -514,7 +373,7 @@ stop_run(){   # $1 = root → 0 when no run holds the root any more, 1 when this
   echo "cc-green: stopping the run on $1 (pid $pid, started $(status_field started), tree $(status_field tree | cut -c1-12))"
   kill -TERM "$pid" 2>/dev/null
   flock -w 30 9 || { echo "cc-green: the run still holds the lock 30 s after TERM — KILL"; is_ours "$pid" "$runid" && kill -KILL "$pid" 2>/dev/null; }
-  # A gate holds no fd of the lock, so a free lock does not mean its gate is gone: one that ignored the TERM the run
+  # A check holds no fd of the lock, so a free lock does not mean it is gone: one that ignored the TERM the run
   # passed it, or one a KILLed run could not pass it to, is KILLed here — its group, once it proves to be this run's.
   while read -r g; do
     for _ in $(seq 50); do is_ours "$g" "$runid" || break; sleep 0.1; done
@@ -522,19 +381,19 @@ stop_run(){   # $1 = root → 0 when no run holds the root any more, 1 when this
   done < <(sed -n 's/^gate_pgid=//p' "$STATUS")
   flock -w 10 9 || { echo "cc-green: the lock on $1 is still held — log $(status_field log)" >&2; return 1; }
   flock -u 9
-  echo "cc-green: stopped — \`cc-green start\` runs the gates on the tree as it is now"
+  echo "cc-green: stopped — \`cc-green start\` runs lander check on the tree as it is now"
 }
 
 main(){
-  local mode=${1:-} r tree tree2 moved
+  local mode=${1:-} r tree tree2 moved crc
   r=$(root) || true
   [ -n "${r:-}" ] || { echo "cc-green: not in a git checkout" >&2; exit 2; }
   # Wait BEFORE taking the tree: the report is on what the working copy holds once the run is over, not before.
   # And lock before it too: the lock is the first thing a run does, so a `wait` behind it has the least to race.
-  # A killed run is not green whatever an older record says: exit 1 and no report (3 stays "still going").
+  # A killed run is not green whatever an older verdict says: exit 1 and no report (3 stays "still going").
   [ "$mode" = stop ] && { stop_run "$r"; exit $?; }
   if [ "$mode" = wait ]; then wait_run "$r" "$2"; case $? in 0) ;; 3) exit 3;; *) exit 1;; esac
-    # A command's run has no gates to report on: its own exit is the answer (wait_run has said it).
+    # A suite's run has no verdict to report on: its own exit is the answer (wait_run has said it).
     [ -z "$(status_field cmd)" ] || { [ "$(status_field exit)" = 0 ]; exit $?; }
   fi
   # Every door that takes `-- …` checks it the same way, __run too: the check is on what runs, not on who asked.
@@ -548,386 +407,241 @@ main(){
   [ "$mode" = __run ] && [ "${2:-}" = -- ] && CMD="${*:3}"
   [ "$mode" = __run ] && { take_run "$r" || exit 3; }
   [ "$mode" = __run ] && [ -n "$CMD" ] && { shift 2; run_cmd "$r" "$@"; exit $?; }
+  lock_files "$r"
   tree=$(green_tree "$r")
   [ -n "$tree" ] || { echo "cc-green: cannot take this working copy's tree" >&2; exit 2; }
   if [ "$mode" = __run ]; then
     begin_run "$r" "$tree"
-    run_missing "$r" "$tree" || exit 1
-    # A gate can leave the tree it just passed on behind it — a log, a scratch file, a rebuilt artefact — and the
-    # record it filed then names a tree that no longer exists here. Ask again, on what the working copy holds NOW.
+    crc=0; run_check "$r" || crc=$?
+    # A check can leave the tree it just passed on behind it — a log, a scratch file, a rebuilt artefact. Ask again,
+    # on what the working copy holds NOW: a moved tree gets no verdict, since whatever passed, passed on other content.
     tree2=$(green_tree "$r")
     if [ -n "$tree2" ] && [ "$tree2" != "$tree" ]; then
       moved=$(cd "$r" && git diff --name-only "$tree" "$tree2" 2>/dev/null | tr '\n' ' ')
-      echo "cc-green: the run itself moved the tree ($tree -> $tree2): ${moved:-<unnameable>}"
-      tree=$tree2; RAN=""     # whatever passed, it passed on content this checkout no longer holds
+      echo "cc-green: the run itself moved the tree ($tree -> $tree2): ${moved:-<unnameable>} — no verdict is kept"
+      tree=$tree2; rm -f "$VERDICT"
+    else
+      printf 'tree=%s\ncheck=%s\nat=%s\nlog=%s\n' "$tree" "$crc" "$(now)" "$LOG" > "$VERDICT"
     fi
-    note_ran "$tree"          # …and only now, so a moved tree gets no note
+  elif [ -z "$mode" ] && [ -e "$LOCK" ] && ! flock -n "$LOCK" true 2>/dev/null; then
+    echo "cc-green: a run is going on this worktree (pid $(status_field pid), since $(status_field started)) — \`cc-green wait\` for its verdict"
   fi
-  echo "cc-green: what a landing would find on ${tree:0:12}"
+  echo "cc-green: what lander check found on ${tree:0:12}"
   local gates=0 defects=0
-  report "$r" "$tree" || gates=1
+  report "$tree" || gates=1
   python3 "$CORE/tests/recurring_defects.py" check "$r" || defects=1
   if [ "$gates$defects" = 00 ]; then
-    echo "cc-green: green on ${tree:0:12} — hand over now. Anything you edit from here is a tree nothing has passed on,"
-    echo "  and the landing runs every gate above again."
+    echo "cc-green: green on ${tree:0:12} — hand over now. Anything you edit from here is a tree nothing has passed on;"
+    echo "  the landing plans and checks the change again on its own."
     return 0
   fi
   [ "$defects" = 0 ] || echo "cc-green: the diff carries a defect the review keeps stopping PRs for — fix it, or mark an added line of that file \`recurring-defect-ok: <class> — <why>\`."
-  [ "$gates" = 0 ] || { echo "cc-green: NOT green on ${tree:0:12}. \`cc-green run\` runs what is missing; the landing will otherwise run it"
-                        echo "  for you, on its own queue, where it is the slowest thing in the flow."; }
+  [ "$gates" = 0 ] || echo "cc-green: NOT green on ${tree:0:12}. \`cc-green start\` runs lander check on it, then \`cc-green wait\` for the verdict."
   return 1
 }
 
 selfcheck(){
-  local n=0 f=0 D D2 R R2 out rc rc2 tree rec p p2 pid gpid log runid
+  local n=0 f=0 D D2 R R2 out rc rc2 p p2 pid gpid log runid np
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }   # …and one that must NOT hold: `t !` runs `!` as a command
   D=$(mktemp -d); trap 'rm -rf "$D"' RETURN
-  unset CC_GREEN_RUNID CC_GREEN_SCOPE   # a selfcheck run as a gate under a cc-green run must not pass for that run
+  unset CC_GREEN_RUNID CC_GREEN_SCOPE   # a selfcheck run under a cc-green run must not pass for that run
   export CC_FAILURES="$D/failures"   # every record a case below writes goes to a scratch ledger, never the box's own
   export CC_REVIEWS_DIR="$D/reviews" CC_STATE_BASE="$D/state"   # …and the review record the report reads is a scratch one
 
-  # A fixture repo with a stub gate of its own. Every case below builds the state it asserts on: nothing here
-  # reads this box's record directory, and no real suite is ever run.
-  newrepo(){   # $1 = a name, $2 = seconds the gate takes (none = instant) → a repo with one file and a stub gate
-    local w="$D/$1"                                     #   that records green and appends to a log
-    mkdir -p "$w/core/tests"
+  # A fixture repo whose core/lander/cli.py is a FAKE lander: it writes its arguments and pid beside the fixture
+  # (under $D, never in the tree), sleeps $2 seconds, runs $D/<name>.py if a case wrote one, appends `check` to
+  # $D/<name>.log and exits with the code in $D/<name>.rc (0 when there is none). No real check ever runs.
+  newrepo(){   # $1 = a name, $2 = seconds the fake check takes (none = instant) → the repo's path
+    local w="$D/$1"
+    mkdir -p "$w/core/lander"
     ( cd "$w" && git init -q && git config user.email t@t && git config user.name t )
     echo one > "$w/a.txt"
-    cat > "$w/core/tests/check.sh" <<EOS
-#!/usr/bin/env bash
-set -e; SELF=\$(readlink -f "\$0"); cd "\$(dirname "\$0")/../.."
-${2:+touch "$D/$1.started"; sleep $2}
-echo check.sh >> "$D/$1.log"
-. "$CORE/tests/green.sh"; green_record "\$SELF" "\${CC_FIXTURE_SCOPE:-}"
+    cat > "$w/core/lander/cli.py" <<EOS
+import os, sys, time
+D, NAME, SECS = "$D", "$1", ${2:-0}
+open(f"{D}/{NAME}.args", "w").write(" ".join(sys.argv[1:]) + "\n")
+with open(f"{D}/{NAME}.pid", "a") as fh: fh.write(f"{os.getpid()}\n")
+if SECS:
+    open(f"{D}/{NAME}.started", "w").close(); time.sleep(SECS)
+if os.path.exists(f"{D}/{NAME}.py"):
+    exec(open(f"{D}/{NAME}.py").read())
+rc = int(open(f"{D}/{NAME}.rc").read()) if os.path.exists(f"{D}/{NAME}.rc") else 0
+print(f"lander check: fake {NAME}, exit {rc}", flush=True)
+with open(f"{D}/{NAME}.log", "a") as fh: fh.write("check\n")
+sys.exit(rc)
 EOS
-    chmod +x "$w/core/tests/check.sh"
     ( cd "$w" && git add -A && git commit -qm one )
     echo "$w"
   }
 
-  # 1-2 THE ONE CASE THIS TOOL EXISTS FOR: a green run, then an edit, and the record must no longer answer.
+  # 1 THE CASE THIS TOOL EXISTS FOR: a green run, then an edit, and the verdict must no longer answer.
   D2=$(mktemp -d); R=$(newrepo moved)
-  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
+  k "$rc" "a run whose lander check exits 0 is green, exit 0"
+  k "$(t test "$(cat "$D/moved.args")" = "check $(git -C "$R" rev-parse --show-toplevel)")" "…having run the worktree's own core/lander/cli.py as \`check <root>\`"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
-  k "$rc" "a working copy the suite just passed on is green"
-  grep -q "green   core/tests/check.sh" <<<"$out"; k "$?" "…and it says which gate the landing will skip"
+  k "$(t test "$rc" -eq 0 -a -n "$(grep 'green   lander check' <<<"$out")")" "…and a plain call on the same tree says green, exit 0, without running it again"
+  k "$(t test "$(grep -cx check "$D/moved.log")" = 1)" "…one check ran"
   echo two > "$R/a.txt"            # ONE tracked file edited after the run — the whole failure this measures
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 1)" "a head that moved after its green run does NOT match"
-  grep -q "RUN     core/tests/check.sh — no record for this tree" <<<"$out"; k "$?" "…and says the record is for another tree"
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'RUN     lander check — its last verdict .* not this tree' <<<"$out")")" "a tree that moved after its green run does NOT match, exit 1"
+  k "$(t grep -q 'NOT green' <<<"$out")" "…and says NOT green"
   git -C "$R" checkout -q -- a.txt
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 )
-  grep -q "green   core/tests/check.sh" <<<"$out"; k "$?" "…and putting the file back makes the same record answer again"
-  rm -rf "$D2"
-
-  # 3 AN UNTRACKED FILE IS PART OF THE TREE TOO, because green_record hashes what the working copy would COMMIT
-  # and the Stop hook commits it. A worker that drops a note in the tree after its run has moved the tree.
-  D2=$(mktemp -d); R=$(newrepo untracked)
-  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
-  echo scratch > "$R/note.md"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
+  k "$rc" "…and putting the file back makes the same verdict answer again"
+  echo scratch > "$R/note.md"      # an untracked file is part of the tree too: the Stop hook commits it
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1)" "an untracked file added after the run also moves the tree"
   rm -rf "$D2"
-
-  # 4 SCOPE. A record of a narrowed run answers only a landing narrowed to the same, and a worker cannot know
-  # what that will be — so it is reported as not green, with the scope named, and never quietly spent.
-  D2=$(mktemp -d); R=$(newrepo scoped)
-  ( cd "$R" && CC_GREEN_DIR="$D2" CC_FIXTURE_SCOPE="core/bin/cc-x" ./core/tests/check.sh ) >/dev/null 2>&1
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" bash "$SELF" 2>&1 ) || true
-  grep -q "recorded scoped to 'core/bin/cc-x'" <<<"$out"; k "$?" "a scoped record is not green, and says what it was scoped to"
-  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1     # …the same tree, run unscoped
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" bash "$SELF" 2>&1 ); rc=$?
-  k "$rc" "…and an unscoped run of the same tree is"
+  D2=$(mktemp -d); R=$(newrepo never)
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'no verdict on this worktree' <<<"$out")")" "a worktree nothing has run on is not green, exit 1"
+  k "$(nt test -e "$D/never.args")" "…and a plain call runs nothing"
   rm -rf "$D2"
 
-  # 5 THE CLOCK. Past the TTL the landing stops trusting the record, so this must stop reporting it as green —
-  # both sides of the edge, on one fixture, because a TTL that never expires and one that always does look alike.
-  D2=$(mktemp -d); R=$(newrepo aged)
-  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
-  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" >/dev/null 2>&1 ); rc=$?
-  k "$rc" "inside the TTL a record is green"
-  rec=$(ls "$D2"/*.json)     # the same record, aged an hour past the TTL and not otherwise touched
-  jq --arg a "$(date -u -d "@$(( $(date -u +%s) - GREEN_TTL - 3600 ))" +%Y-%m-%dT%H:%M:%SZ)" '.at=$a' "$rec" > "$rec.n" && mv "$rec.n" "$rec"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ) || true
-  grep -q "past the ${GREEN_TTL}s the landing trusts" <<<"$out"; k "$?" "…and past it the same record is not"
+  # 2 LANDER CHECK'S EXIT → cc-green's ANSWER. 1 (a check red) and 3 (no verdict) are both exit 1, each said as
+  # what it is, in the run, in `wait` and in a later plain call; and a red files nothing in the failures ledger —
+  # lander check holds a red that is main's against main, so what it reports is the branch's own work.
+  for p in 1 3; do
+    D2=$(mktemp -d); R=$(newrepo "rc$p"); echo "$p" > "$D/rc$p.rc"
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+    if [ "$p" = 1 ]; then k "$(t test "$rc" -eq 1 -a -n "$(grep 'RED     lander check' <<<"$out")")" "lander check exit 1: the run is red, exit 1, and says RED"
+    else k "$(t test "$rc" -eq 1 -a -n "$(grep 'RUN     lander check — no verdict (exit 3' <<<"$out")")" "lander check exit 3: the run is not green, exit 1, and says no verdict"; fi
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
+    k "$(t test "$rc" -eq 1 -a -n "$(grep 'has ended (exit 1)' <<<"$out")")" "…wait after it says the run ended with exit 1, and exits 1"
+    ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" >/dev/null 2>&1 ); rc=$?
+    k "$(t test "$rc" -eq 1)" "…and so does a plain call on the same tree"
+    rm -rf "$D2"
+  done
+  k "$(t test -z "$(find "$CC_FAILURES" -name '*.jsonl' -size +0 2>/dev/null)")" "a red check writes nothing to the failures ledger"
+
+  # 3 WHICH LANDER. No core/lander in the worktree: the `lander` on PATH, given `check <root>`. Neither: no verdict,
+  # exit 1 — never a green, and never the pinned release's absence mistaken for a pass.
+  D2=$(mktemp -d); R=$(newrepo onpath)
+  ( cd "$R" && git rm -rq core/lander && git commit -qm nolander )
+  mkdir -p "$D/pbin"; printf '#!/bin/sh\necho "$*" > "%s"\nexit 0\n' "$D/onpath.pathargs" > "$D/pbin/lander"; chmod +x "$D/pbin/lander"
+  ( cd "$R" && PATH="$D/pbin:$PATH" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a "$(cat "$D/onpath.pathargs" 2>/dev/null)" = "check $(git -C "$R" rev-parse --show-toplevel)")" "a worktree with no core/lander runs the lander on PATH, \`check <root>\`"
+  np=$(tr ':' '\n' <<<"$PATH" | while read -r p; do [ -x "$p/lander" ] || printf '%s:' "$p"; done); np=${np%:}
+  out=$( cd "$R" && PATH="$np" CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1 -a -n "$(grep 'no lander here' <<<"$out")")" "…and with none on PATH either, the run says so and is not green, exit 1"
   rm -rf "$D2"
 
-  # 6 A RECORD OF ANOTHER GATE, under the same tree, is not this gate's answer. green_run checks the suite name
-  # for exactly this reason: "core/tests/check.sh" and "tests/check.sh" are filed under the same basename.
-  D2=$(mktemp -d); R=$(newrepo othergate)
-  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
-  rec=$(ls "$D2"/*.json); jq '.suite="tests/check.sh"' "$rec" > "$rec.n" && mv "$rec.n" "$rec"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ) || true
-  grep -q "that record is tests/check.sh's, not this gate's" <<<"$out"; k "$?" "a record filed by another gate does not answer for this one"
-  rm -rf "$D2"
-
-  # 7 `run` RUNS ONLY WHAT IS MISSING — the saving is the whole point, so a run that re-ran an already-green gate
-  # would cost exactly what it was built to save. Two gates, one already green, and the log says which ran.
-  D2=$(mktemp -d); R=$(newrepo runsome)
-  sed 's#check\.sh#check-extra.sh#g' "$R/core/tests/check.sh" > "$R/tests-extra.tmp"
-  mkdir -p "$R/tests"; mv "$R/tests-extra.tmp" "$R/tests/check-extra.sh"; chmod +x "$R/tests/check-extra.sh"
-  ( cd "$R" && git add -A && git commit -qm two )
-  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1     # check.sh green on THIS tree
-  : > "$D/runsome.log"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$rc" "run leaves every gate green"
-  k "$(t grep -qx check-extra.sh "$D/runsome.log")" "…having run the gate that had no record"
-  k "$(nt grep -qx check.sh "$D/runsome.log")" "…and not the one that had"
-  rm -rf "$D2"
-
-  # 8 A GATE THAT MOVES THE TREE AFTER IT RECORDS leaves a record for content this checkout no longer holds. That
-  # is the one way `run` could hand back a false green, so it re-takes the tree afterwards and says what moved.
+  # 4 A CHECK THAT MOVES THE TREE leaves a verdict for content this checkout no longer holds. That is the one way
+  # `run` could hand back a false green, so it re-takes the tree afterwards, says what moved and keeps no verdict.
   D2=$(mktemp -d); R=$(newrepo dirty)
-  echo 'echo residue > residue.txt' >> "$R/core/tests/check.sh"
-  ( cd "$R" && git add -A && git commit -qm dirty )
+  printf '%s\n' 'open("residue.txt", "w").write("x")' > "$D/dirty.py"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 1)" "a gate that dirties the tree after recording does not come back green"
-  grep -q "the run itself moved the tree" <<<"$out" && grep -q residue.txt <<<"$out"
-  k "$?" "…and the file it left is named"
-  k "$(nt ls "$D2"/*.ran)" "…and no note calls anything ran on the tree it moved to"
-  rm -rf "$D2"
+  k "$(t test "$rc" -eq 1)" "a check that dirties the tree does not come back green"
+  k "$(t grep -q 'the run itself moved the tree.*residue.txt' <<<"$out")" "…and the file it left is named"
+  k "$(nt ls "$D2"/*.verdict)" "…and no verdict is kept"
 
-  # 9 A GATE THAT FAILS stops everything: no later gate runs, and nothing is called green.
-  D2=$(mktemp -d); R=$(newrepo red)
-  echo 'exit 3' >> "$R/core/tests/check.sh"; ( cd "$R" && git add -A && git commit -qm red )
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 1)" "a gate that fails leaves cc-green red"
-  k "$(t grep -q 'did not pass (exit 3)' <<<"$out")" "…and says which gate and how it exited"
-  rm -rf "$D2"
-
-  # 10 A GATE THAT FILES NO RECORD — every gate in a repo whose suites do not source tests/green.sh; the stub
-  # below borrows tests/check-extra.sh's name because that is a name GATES carries, not because the real one
-  # files nothing (it has since 2026-09-14). Before it runs there is nothing to spend and this says so; after it
-  # has run and passed here, on a tree that has not moved, its answer is as good as a record's and only the landing loses.
-  # Both sides, because crediting it always would call a stale tree green and crediting it never would loop a
-  # worker on a gate that can never satisfy it.
-  D2=$(mktemp -d); R=$(newrepo norecord)
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$R/tests-x"; mkdir -p "$R/tests"
-  mv "$R/tests-x" "$R/tests/check-extra.sh"; chmod +x "$R/tests/check-extra.sh"
-  ( cd "$R" && git add -A && git commit -qm three )
-  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
-  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" >/dev/null 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 1)" "a gate that files no record is not green before it has run"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$rc" "…and having run and passed here, it no longer holds the hand-over back"
-  k "$(t grep -q "ran     tests/check-extra.sh — passed here, but it files no record" <<<"$out")" \
-     "…and is reported as a gate the landing will run again, not as one it will skip"
-  rm -rf "$D2"
-
-  # 11 THE COPIED LIST. GATES above is cc-land's, and a landing that gained a gate this does not know would let a
-  # worker hand over believing it is green. Read the tuple out of that source rather than trusting the copy.
-  out=$(sed -n 's/^GATES = (\(.*\))$/\1/p' "$BIN/cc-land" 2>/dev/null | tr -d '"' | tr -d ',' | tr -s ' ')
-  if [ -z "$out" ]; then
-    k 1 "cc-land's GATES tuple could not be read from $BIN/cc-land — the copy below is unchecked"
-  else
-    k "$(t test "$out" = "$GATES")" "the gate list is still cc-land's — got '$out'"
-  fi
-
-  # 12 NOT IN A CHECKOUT is exit 2, not a green: an answer about no tree at all must never read as an answer.
+  # 5 NOT IN A CHECKOUT is exit 2, not a green: an answer about no tree at all must never read as an answer.
   mkdir -p "$D/nogit"; ( cd "$D/nogit" && "$SELF" >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 2)" "outside a git checkout it refuses, and does not report green"
 
-  # 13 A GATE THAT READS STDIN MUST NOT SWALLOW THE GATES BEHIND IT. `run` walks its gate names on fd 0, and a
-  # gate that inherits that fd eats the rest of the list — which is how the first real run of this tool ran one
-  # gate, filed its record and called the other two never run. Case 7's stubs read nothing, so it stayed green
-  # over the bug; this one drains fd 0 on purpose and asserts BOTH gates ran, in order.
-  D2=$(mktemp -d); R=$(newrepo eatstdin)
-  sed 's#check\.sh#check-extra.sh#g' "$R/core/tests/check.sh" > "$R/tests-extra.tmp"
-  mkdir -p "$R/tests"; mv "$R/tests-extra.tmp" "$R/tests/check-extra.sh"; chmod +x "$R/tests/check-extra.sh"
-  echo 'cat > /dev/null' >> "$R/core/tests/check.sh"     # …the first gate, after it has recorded, eats all of fd 0
-  ( cd "$R" && git add -A && git commit -qm eat )
-  : > "$D/eatstdin.log"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$(t grep -qx check.sh "$D/eatstdin.log")" "a gate that reads stdin still runs"
-  k "$(t grep -qx check-extra.sh "$D/eatstdin.log")" "…and does not swallow the gate behind it with the loop's stdin"
-  k "$rc" "…so run comes back green on both, not on the first alone"
-  rm -rf "$D2"
-
-  # 14 `ran` OUTLIVES THE PROCESS THAT RAN IT. Case 10's fixture, but the question is asked by a LATER call: a run
-  # that ended "hand over now" and a plain call on the same tree that said RUN for ever is the disagreement a
-  # worker polled for 550 s, twice. The note that makes them agree is not a record — the landing must still find
-  # nothing to spend for that gate — and it answers only until a tracked file moves.
-  D2=$(mktemp -d); R=$(newrepo persists)
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$R/tests-x"; mkdir -p "$R/tests"
-  mv "$R/tests-x" "$R/tests/check-extra.sh"; chmod +x "$R/tests/check-extra.sh"
-  ( cd "$R" && git add -A && git commit -qm three )
-  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ); rc=$?
-  k "$rc" "a run on a repo whose extra gate files no record ends green"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
-  k "$rc" "…and a plain call on the same tree agrees with it"
-  k "$(t grep -q "ran     tests/check-extra.sh" <<<"$out")" "…saying the gate ran here, from the note the run left"
-  k "$(nt ls "$D2"/check-extra.sh-*.json)" "…which is not a record the landing would spend"
-  echo two > "$R/a.txt"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 1)" "…and one tracked edit later the note no longer answers"
-  k "$(t grep -q "RUN     tests/check-extra.sh — no record for this tree" <<<"$out")" "…so the gate is RUN again"
-  rm -rf "$D2"
-
-  # 15 ONE RUN PER ROOT. A gate slow enough to be caught going: a second `run` on the same root while it holds the
+  # 6 ONE RUN PER ROOT. A check slow enough to be caught going: a second `run` on the same root while it holds the
   # lock starts nothing and says so; `wait` says the same and gives the call back inside its bound; once it is
-  # over, `wait` is the report. One line in the stub's log is the whole claim — one suite ran.
-  D2=$(mktemp -d); R=$(newrepo locked 4)
-  : > "$D/locked.log"
+  # over, `wait` is the report. One line in the fake's log is the whole claim — one check ran.
+  D2=$(mktemp -d); R=$(newrepo locked 15)
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ) & p=$!
-  for _ in $(seq 50); do [ -f "$D/locked.started" ] && break; sleep 0.1; done     # …the gate is going, so the lock is held
+  for _ in $(seq 50); do [ -f "$D/locked.started" ] && break; sleep 0.1; done     # …the check is going, so the lock is held
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "a second run on the same root while one is going exits 3"
   k "$(t grep -q 'a run is already going' <<<"$out")" "…and says so"
   pid=$(sed -n 's/.*(pid \([0-9]*\),.*/\1/p' <<<"$out" | head -1)
   k "$(t test -n "$pid")" "…with the pid of the run that is"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 )
+  k "$(t grep -q "a run is going on this worktree (pid $pid," <<<"$out")" "a plain call meanwhile says a run is going"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "wait while it is going gives the call back and exits 3"
   k "$(t grep -q "still running (pid $pid," <<<"$out")" "…naming the same pid"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 20 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
   k "$rc" "wait after it has ended is the report, exit 0"
-  k "$(t grep -q "green   core/tests/check.sh" <<<"$out")" "…for the tree the run passed on"
+  k "$(t grep -q "green   lander check" <<<"$out")" "…for the tree the run passed on"
   wait "$p"
-  k "$(t test "$(grep -cx check.sh "$D/locked.log")" = 1)" "…and exactly one suite ran"
+  k "$(t test "$(grep -cx check "$D/locked.log")" = 1)" "…and exactly one check ran"
   log=$(sed -n 's/^log=//p' "$D2"/run-*.status)
   k "$(t grep -q 'hand over now' "$log")" "…whose own log, at the path the status names, holds its report"
   rm -rf "$D2"
 
-  # 16 …AND THE LOCK IS THE ROOT'S, NOT THE BOX'S. Two repos, two runs at once: a lock keyed by anything wider
-  # than the root would have the second exit 3, and a worker on one worktree waiting on a suite on another.
+  # 7 …AND THE LOCK IS THE ROOT'S, NOT THE BOX'S. Two repos, two runs at once: a lock keyed by anything wider
+  # than the root would have the second exit 3, and a worker on one worktree waiting on a check on another.
   D2=$(mktemp -d); R=$(newrepo rootA 2); R2=$(newrepo rootB 2)
-  : > "$D/rootA.log"; : > "$D/rootB.log"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ) & p=$!
   ( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ) & p2=$!
   wait "$p"; rc=$?; wait "$p2"; rc2=$?
   k "$(t test "$rc$rc2" = 00)" "two roots run at once, and neither is told the other's run is its own"
-  k "$(t test "$(grep -cx check.sh "$D/rootA.log")$(grep -cx check.sh "$D/rootB.log")" = 11)" "…each running its own suite once"
+  k "$(t test "$(grep -cx check "$D/rootA.log")$(grep -cx check "$D/rootB.log")" = 11)" "…each running its own check once"
   rm -rf "$D2"
 
-  # 17 A GATE CANNOT REACH A CREDENTIAL from here either. The stub gate prints its environment; the run is started
-  # with a token of each shape in its own, and the gate must see none of them — but must see the non-secret CC_*
-  # and the denial of the live config that cc-config honours. The control is the same stub run by hand.
+  # 8 THE CHECK CANNOT REACH A CREDENTIAL from here. The fake prints its environment; the run is started with a
+  # token of each shape in its own, and the check must see none of them — but must see the non-secret CC_* and
+  # the denial of the live config that cc-config honours. The control is the same fake run by hand.
   D2=$(mktemp -d); R=$(newrepo secret)
-  echo 'env | grep -E "^(FIX_TOKEN|FIX_API_KEY|FIX_SECRET|FIX_CREDS|GH_TOKEN|CC_KEEP|CC_CONFIG_DENY)=" | sort >> "'"$D"'/secret.env"' >> "$R/core/tests/check.sh"
-  ( cd "$R" && git add -A && git commit -qm secret )
-  : > "$D/secret.env"
-  ( cd "$R" && FIX_TOKEN=t FIX_API_KEY=k FIX_SECRET=s FIX_CREDS=c GH_TOKEN=g CC_KEEP=yes ./core/tests/check.sh ) >/dev/null 2>&1
-  k "$(t grep -q '^FIX_TOKEN=t$' "$D/secret.env")" "control: run by hand, the gate carries the tokens it was given"
-  : > "$D/secret.env"
+  printf '%s\n' "import re" "open('$D/secret.env', 'w').write(''.join(f'{k}={v}\\n' for k, v in sorted(os.environ.items()) if re.match(r'(FIX_TOKEN|FIX_API_KEY|FIX_SECRET|FIX_CREDS|GH_TOKEN|CC_KEEP|CC_CONFIG_DENY)\$', k)))" > "$D/secret.py"
+  ( cd "$R" && FIX_TOKEN=t FIX_API_KEY=k FIX_SECRET=s FIX_CREDS=c GH_TOKEN=g CC_KEEP=yes python3 -P core/lander/cli.py check . ) >/dev/null 2>&1
+  k "$(t grep -q '^FIX_TOKEN=t$' "$D/secret.env")" "control: run by hand, the fake carries the tokens it was given"
   ( cd "$R" && FIX_TOKEN=t FIX_API_KEY=k FIX_SECRET=s FIX_CREDS=c GH_TOKEN=g CC_KEEP=yes CC_GREEN_DIR="$D2" "$SELF" run ) >/dev/null 2>&1; rc=$?
   k "$rc" "a run with a token of each shape in its environment still goes green"
-  k "$(nt grep -qE '^(FIX_TOKEN|FIX_API_KEY|FIX_SECRET|FIX_CREDS|GH_TOKEN)=' "$D/secret.env")" "…and the gate saw none of them: *_TOKEN, *_KEY, *_SECRET and the named tokens are dropped"
+  k "$(nt grep -qE '^(FIX_TOKEN|FIX_API_KEY|FIX_SECRET|FIX_CREDS|GH_TOKEN)=' "$D/secret.env")" "…and the check saw none of them: *_TOKEN, *_KEY, *_SECRET and the named tokens are dropped"
   k "$(t grep -q '^CC_KEEP=yes$' "$D/secret.env")" "…while a non-secret CC_* passes"
   k "$(t grep -q "^CC_CONFIG_DENY=$(realpath -m "$HOME/.cc/config")\$" "$D/secret.env")" "…and the live ~/.cc/config is denied to it (CC_CONFIG_DENY, which cc-config reads as empty)"
   rm -rf "$D2"
 
-  # 18 A RED IS WRITTEN DOWN BY THE TOOL THAT SAW IT — once per gate and tree, in a record that outlives the gate's
-  # output. The fixture is a worker branch off a base whose gate is red naming a tool the branch never touched: nobody's
-  # red-first case, so it is recorded. The gate's own output file is gone by the time the run ends (run_missing
-  # removes it), and the excerpt beside the ledger is what still reads.
-  redrepo(){   # $1 = name, $2 = what the gate prints before failing, $3... = files the branch changes → a repo on track/x
-    local w x; w=$(newrepo "$1")
-    printf 'echo "%s"; exit 1\n' "$2" > "$w/red.sh"; chmod +x "$w/red.sh"
-    printf '#!/usr/bin/env bash\ncd "$(dirname "$0")/../.." && ./red.sh\n' > "$w/core/tests/check.sh"
-    ( cd "$w" && git add -A && git commit -qm base-red && { git rev-parse -q --verify main >/dev/null || git branch main; } \
-      && git checkout -q -b track/x ) >/dev/null 2>&1   # the base is `main` whatever git init called its first branch
-    shift 2; for x in "$@"; do mkdir -p "$w/$(dirname "$x")"; echo change >> "$w/$x"; done   # the branch's own work
-    ( cd "$w" && git add -A && git commit -qm branch ) >/dev/null 2>&1; echo "$w"
-  }
-  D2=$(mktemp -d); R=$(redrepo recorded 'cc-y selfcheck: 3 passed, 1 failed' docs/note.md)
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 1)" "a red gate naming a tool the branch never touched is still red"
-  k "$(t grep -q 'failures ledger (recorded): recorded f-' <<<"$out")" "…and is recorded, once, by cc-green"
-  rec=$("$BIN/cc-failures" show --json --scope recorded | jq -c '.[] | select(.kind=="gate-verdict/red")')
-  k "$(t test "$(wc -l <<<"$rec")" = 1)" "…one record of kind gate-verdict/red"
-  tree=$(green_tree "$R")
-  k "$(t test "$(jq -r .links.source <<<"$rec")" = "gate:core/tests/check.sh:${tree:0:12}")" "…keyed gate:<gate>:<tree>, the key the landing will look for"
-  k "$(t grep -q 'never touched: cc-y' <<<"$(jq -r .observed <<<"$rec")")" "…saying which file the red named that the branch did not"
-  ex=$(jq -r '.evidence[] | select(startswith("excerpt:")) | sub("^excerpt:";"")' <<<"$rec")
-  k "$(nt test -e "$(jq -r .links.log <<<"$rec")")" "the gate's own output file is gone after the run"
-  k "$(t grep -q 'cc-y selfcheck: 3 passed, 1 failed' "$ex")" "…and the excerpt beside the ledger still reads the red line"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ) || true
-  k "$(t grep -q 'failures ledger (recorded): already f-' <<<"$out")" "the same red on the same tree a second time is 'already', not a second record"
-  k "$(t test "$("$BIN/cc-failures" show --json --scope recorded | jq 'length')" = 1)" "…and the ledger still holds one"
-  out=$("$SELF" red recorded gate-verdict/red "gate:core/tests/check.sh:${tree:0:12}" --observed "the landing saw it too" --writer the-landing 2>&1)
-  k "$(t test "$out" = "already $(jq -r .id <<<"$rec")")" "…and the landing, calling 'red' with the same key, gets the same id back"
-  rm -rf "$D2"
-
-  # 19 A WORKER'S OWN RED IS NOT RECORDED: the red-first case (the red names only a tool the branch edits), and the
-  # gate the branch is fixing (the branch edits the gate script itself). The control is case 18: the same shape of
-  # red, naming a tool the branch did not touch, IS recorded — so this cannot pass by never writing.
-  D2=$(mktemp -d); R=$(redrepo ownred 'cc-y selfcheck: 3 passed, 1 failed' core/bin/cc-y)
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 1)" "a red-first case is still red"
-  k "$(t grep -q 'not recorded — the red names only files this branch touches (cc-y)' <<<"$out")" "…and is NOT recorded: the red names only a tool the branch edits"
-  k "$(nt test -s "$D/failures/ownred.jsonl")" "…so the scope's ledger holds nothing"
-  R2=$(redrepo fixgate 'something else entirely' docs/x.md)
-  echo '# fixing' >> "$R2/core/tests/check.sh"   # the gate itself, edited in the working copy, uncommitted
-  out=$( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ) || true
-  k "$(t grep -q 'not recorded — this branch edits core/tests/check.sh itself' <<<"$out")" "a gate the branch is fixing is its own red, not recorded"
-  k "$(nt test -s "$D/failures/fixgate.jsonl")" "…and writes nothing"
-  # …and the control for that rule: the branch edits tests/check.sh, which this repo's GATES carries as a gate of
-  # its own and which shares a basename with the red gate. Matched by basename that read as "the branch edits the
-  # gate itself" and a red naming cc-y — a tool untouched here — was lost.
-  R2=$(redrepo sharedname 'cc-y selfcheck: 3 passed, 1 failed' tests/check.sh)
-  out=$( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ) || true
-  k "$(t grep -q 'failures ledger (sharedname): recorded f-' <<<"$out")" \
-     "a branch editing tests/check.sh does not own a red core/tests/check.sh: the gate is matched by path, not basename"
-  rm -rf "$D2"
-
-  # 20 A WRITER THAT FAILS NEVER FAILS THE GATE: the ledger unwritable, the same red, the same verdict and the same
-  # line — and one line saying it was not recorded.
-  D2=$(mktemp -d); R=$(redrepo unwritable 'cc-y selfcheck: 3 passed, 1 failed' docs/note.md)
+  # 9 `red` WRITES ONE LEDGER RECORD PER KEY, with a bounded excerpt of the log that outlives it, and never fails
+  # its caller: cc-loop's stops call it.
+  printf 'line\n  ✗ the thing that broke\nmore\n' > "$D/red.log"
+  out=$("$SELF" red redscope worker-loop/barren-stop "loop:x:5:1" --observed "cc-loop exit 5" --log "$D/red.log" --writer cc-loop 2>&1); rc=$?
+  k "$(t test "$rc" -eq 0 -a -n "$(grep '^recorded f-' <<<"$out")")" "red records once and says the id"
+  p=$("$BIN/cc-failures" show --json --scope redscope | jq -r '.[0].evidence[] | select(startswith("excerpt:")) | sub("^excerpt:";"")')
+  rm -f "$D/red.log"
+  k "$(t grep -q '✗ the thing that broke' "$p")" "…with an excerpt that still reads the red line once the log is gone"
+  out=$("$SELF" red redscope worker-loop/barren-stop "loop:x:5:1" --observed "again" 2>&1)
+  k "$(t test "$out" = "already $("$BIN/cc-failures" show --json --scope redscope | jq -r '.[0].id')")" "…and the same key again is 'already <id>', no second record"
   mkdir -p "$D/ro"; chmod 500 "$D/ro"
-  out=$( cd "$R" && CC_FAILURES="$D/ro/failures" CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 1)" "with the ledger unwritable the gate is exactly as red"
-  k "$(t grep -q 'core/tests/check.sh did not pass (exit 1)' <<<"$out")" "…with the same verdict line"
-  k "$(t grep -q 'failures ledger (unwritable): not recorded:' <<<"$out")" "…and one line saying the record was not written"
-  chmod 700 "$D/ro"; rm -rf "$D2"
+  out=$(CC_FAILURES="$D/ro/failures" "$SELF" red roscope worker-loop/barren-stop "k" --observed "x" 2>&1); rc=$?
+  k "$(t test "$rc" -eq 0 -a -n "$(grep 'not recorded:' <<<"$out")")" "…and with the ledger unwritable it says not recorded, exit 0"
+  chmod 700 "$D/ro"
 
-  # 21 THE RUN WAITS ON THE GATE, NOT ON WHAT IT LEAVES BEHIND. A gate that ends `sleep N &` leaves a child holding
-  # its stdout; through a pipe into tee that child held the run, the root's lock and every `wait` on it until it
-  # was gone (review of #464). `run` comes back on the gate's own exit — the record filed, the lock free — while
-  # the child is still going; the child's marker not being there yet is the whole claim.
+  # 10 THE RUN WAITS ON THE CHECK, NOT ON WHAT IT LEAVES BEHIND. A check that leaves a child holding its stdout:
+  # `run` comes back on the check's own exit — the verdict kept, the lock free — while the child is still going.
   D2=$(mktemp -d); R=$(newrepo linger)
-  printf '( sleep 15; touch "%s" ) &\n' "$D/linger.done" >> "$R/core/tests/check.sh"
-  ( cd "$R" && git add -A && git commit -qm linger )
+  printf '%s\n' "import subprocess" "subprocess.Popen(['sh', '-c', 'sleep 15; touch $D/linger.done'])" > "$D/linger.py"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
-  k "$rc" "a gate that leaves a child behind is green on its own exit"
+  k "$rc" "a check that leaves a child behind is green on its own exit"
   k "$(t test ! -f "$D/linger.done")" "…and run came back while the child was still going, not when it was gone"
   k "$(t grep -q 'hand over now' <<<"$out")" "…with its report given"
   k "$(t flock -n "$(ls "$D2"/run-*.lock)" true)" "…and the root's lock free: the child holds no fd of the run's"
-  k "$(t test "$(grep -cx check.sh "$D/linger.log")" = 1)" "…one suite ran"
   rm -rf "$D2"
 
-  # 22 A CTRL-C TAKES THE SUITE WITH IT. The gate runs async in a shell with no job control, which starts it with
-  # SIGINT ignored: without a group of its own and this run forwarding the signal, the INT ended cc-green and its
-  # lock while the suite ran on as an orphan, and the next `run` on that root was a second suite beside the first.
-  # The gate here says what pid it is, so its death — not just the run's — is what this asserts.
-  D2=$(mktemp -d); R=$(newrepo interrupted)
-  printf '#!/usr/bin/env bash\necho $$ > "%s"\nsleep 8\necho check.sh >> "%s"\n' "$D/interrupted.pid" "$D/interrupted.log" > "$R/core/tests/check.sh"
-  chmod +x "$R/core/tests/check.sh"; ( cd "$R" && git add -A && git commit -qm interrupt ) >/dev/null 2>&1
-  : > "$D/interrupted.log"
-  # …started the way a terminal starts it, INT at default: a shell without job control starts an async job with
-  # INT ignored, and a signal ignored at entry cannot be trapped, so the run under a plain `&` here would sit
-  # through the INT and this case would pass on a tool that never handled one.
+  # 11 A CTRL-C TAKES THE CHECK WITH IT. The check runs async in a shell with no job control, which starts it with
+  # SIGINT ignored: without a group of its own and the run forwarding the signal, the INT ended cc-green and its
+  # lock while the check ran on as an orphan. The fake says what pid it is, so its death is what this asserts.
+  D2=$(mktemp -d); R=$(newrepo interrupted 8)
+  # …started the way a terminal starts it, INT at default: a signal ignored at entry cannot be trapped, so the run
+  # under a plain `&` here would sit through the INT and this case would pass on a tool that never handled one.
   ( cd "$R" && CC_GREEN_DIR="$D2" env --default-signal=INT,TERM "$SELF" run >/dev/null 2>&1 ) & p=$!
   for _ in $(seq 100); do [ -s "$D/interrupted.pid" ] && break; sleep 0.1; done
-  gpid=$(cat "$D/interrupted.pid" 2>/dev/null)
+  gpid=$(head -1 "$D/interrupted.pid" 2>/dev/null)
   pid=$(sed -n 's/^pid=//p' "$D2"/run-*.status 2>/dev/null | head -1)
-  k "$(t test -n "$gpid")" "a run with a slow gate has a gate of its own to lose"
-  sleep 0.5                        # the run is on `wait`, past the breath between starting the gate and trapping
+  k "$(t test -n "$gpid")" "a run with a slow check has a check of its own to lose"
+  sleep 0.5                        # the run is on `wait`, past the breath between starting the check and trapping
   kill -INT "$pid" 2>/dev/null
   wait "$p"; rc=$?
   k "$(t test "$rc" -eq 130)" "an INT on a foreground run ends it, 130"
   for _ in $(seq 50); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
-  k "$(nt kill -0 "$gpid")" "…and the gate goes with it, rather than running on as an orphan"
-  k "$(t flock -n "$(ls "$D2"/run-*.lock)" true)" "…so the root's lock is free, and the next run is not a second suite"
-  k "$(nt grep -qx check.sh "$D/interrupted.log")" "…and the suite it interrupted never finished"
+  k "$(nt kill -0 "$gpid")" "…and the check goes with it, rather than running on as an orphan"
+  k "$(t flock -n "$(ls "$D2"/run-*.lock)" true)" "…so the root's lock is free, and the next run is not a second one"
+  k "$(nt grep -qx check "$D/interrupted.log")" "…and the check it interrupted never finished"
   rm -rf "$D2"
 
-  # 23 A RUN OUTLIVES ITS LAUNCHER. A worker iteration's `setsid nohup cc-green run &` died with the iteration: log
-  # two lines, no record. Here the launcher is a group leader of its own and the whole group is TERMed mid-gate —
-  # what a tool ending "everything this command started" does. The run finishes, records green, and holds the
-  # lock while it goes: a second `run` then is "already going", which is the lock handed over, not left behind.
-  D2=$(mktemp -d); R=$(newrepo outlives 3)
-  : > "$D/outlives.log"
+  # 12 A RUN OUTLIVES ITS LAUNCHER. A worker iteration's `setsid nohup cc-green run &` died with the iteration. Here
+  # the launcher is a group leader of its own and the whole group is TERMed mid-check — what a tool ending
+  # "everything this command started" does. The run finishes, keeps its verdict, and holds the lock while it goes.
+  D2=$(mktemp -d); R=$(newrepo outlives 15)
   ( cd "$R" && CC_GREEN_DIR="$D2" exec setsid env --default-signal=INT,TERM "$SELF" run >/dev/null 2>&1 ) & p=$!
   for _ in $(seq 50); do [ -f "$D/outlives.started" ] && break; sleep 0.1; done
   k "$(nt test -e "/proc/$p/fd/9")" "a launcher whose run has started holds no fd 9 of its own"
@@ -935,22 +649,20 @@ EOS
   k "$(t test "$rc" -eq 143)" "a TERM on the launcher's group ends the launcher"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3 -a -n "$(grep 'a run is already going' <<<"$out")")" "…while the run it started still holds the lock: a second run says already going, exit 3"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 20 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
   k "$rc" "…and wait on that run is the report, exit 0"
   k "$(t grep -q 'has ended (exit 0)' <<<"$out")" "…saying the run ended with exit 0"
-  k "$(t grep -q "green   core/tests/check.sh" <<<"$out")" "…and the gate it ran recorded green"
-  k "$(t test "$(grep -cx check.sh "$D/outlives.log")" = 1)" "…one suite ran"
+  k "$(t grep -q "green   lander check" <<<"$out")" "…and the check it ran is green"
+  k "$(t test "$(grep -cx check "$D/outlives.log")" = 1)" "…one check ran"
   rm -rf "$D2"
 
-  # 24 A KILLED RUN IS SAID TO BE KILLED. SIGKILL leaves no exit line, and the lock goes with the process: `wait`
+  # 13 A KILLED RUN IS SAID TO BE KILLED. SIGKILL leaves no exit line, and the lock goes with the process: `wait`
   # must not call that green nor wait for ever, and the launcher following it must not exit 0.
-  D2=$(mktemp -d); R=$(newrepo killed)
-  printf '#!/usr/bin/env bash\necho $$ > "%s"\nsleep 8\necho check.sh >> "%s"\n' "$D/killed.pid" "$D/killed.log" > "$R/core/tests/check.sh"
-  chmod +x "$R/core/tests/check.sh"; ( cd "$R" && git add -A && git commit -qm killed ) >/dev/null 2>&1
+  D2=$(mktemp -d); R=$(newrepo killed 8)
   ( cd "$R" && CC_GREEN_DIR="$D2" exec "$SELF" run >/dev/null 2>&1 ) & p=$!
   for _ in $(seq 100); do [ -s "$D/killed.pid" ] && break; sleep 0.1; done
-  gpid=$(cat "$D/killed.pid" 2>/dev/null); pid=$(sed -n 's/^pid=//p' "$D2"/run-*.status 2>/dev/null | head -1)
-  kill -KILL "$pid" 2>/dev/null; kill -KILL -- -"$gpid" 2>/dev/null   # the gate too: a SIGKILLed run cannot take it along
+  gpid=$(head -1 "$D/killed.pid" 2>/dev/null); pid=$(sed -n 's/^pid=//p' "$D2"/run-*.status 2>/dev/null | head -1)
+  kill -KILL "$pid" 2>/dev/null; kill -KILL -- -"$gpid" 2>/dev/null   # the check too: a SIGKILLed run cannot take it along
   wait "$p"; rc=$?
   k "$(t test "$rc" -eq 1)" "a launcher whose run was SIGKILLed exits 1, not the run's green"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 10 "$SELF" wait 5 2>&1 ); rc=$?
@@ -958,40 +670,36 @@ EOS
   k "$(t grep -q "the run (pid $pid, .*) was KILLED before it finished" <<<"$out")" "…and says the run was killed"
   rm -rf "$D2"
 
-  # 25 A CTRL-C ON THE LAUNCHER IS A CTRL-C ON THE RUN. The run is in a session of its own, so a terminal's INT
-  # reaches only the launcher; it carries the INT over, the run takes its gate down, and wait says interrupted.
-  D2=$(mktemp -d); R=$(newrepo ctrlc)
-  printf '#!/usr/bin/env bash\necho $$ > "%s"\nsleep 8\necho check.sh >> "%s"\n' "$D/ctrlc.pid" "$D/ctrlc.log" > "$R/core/tests/check.sh"
-  chmod +x "$R/core/tests/check.sh"; ( cd "$R" && git add -A && git commit -qm ctrlc ) >/dev/null 2>&1
-  : > "$D/ctrlc.log"
+  # 14 A CTRL-C ON THE LAUNCHER IS A CTRL-C ON THE RUN. The run is in a session of its own, so a terminal's INT
+  # reaches only the launcher; it carries the INT over, the run takes its check down, and wait says interrupted.
+  D2=$(mktemp -d); R=$(newrepo ctrlc 8)
   ( cd "$R" && CC_GREEN_DIR="$D2" exec env --default-signal=INT,TERM "$SELF" run >/dev/null 2>&1 ) & p=$!
   for _ in $(seq 100); do [ -s "$D/ctrlc.pid" ] && break; sleep 0.1; done
-  gpid=$(cat "$D/ctrlc.pid" 2>/dev/null); sleep 0.5
+  gpid=$(head -1 "$D/ctrlc.pid" 2>/dev/null); sleep 0.5
   kill -INT "$p" 2>/dev/null
   wait "$p"; rc=$?
   k "$(t test "$rc" -eq 130)" "an INT on the launcher ends the run, and the launcher exits with its 130"
   for _ in $(seq 50); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
-  k "$(nt kill -0 "$gpid")" "…and the run's gate went with it"
+  k "$(nt kill -0 "$gpid")" "…and the run's check went with it"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'was interrupted (exit 130)' <<<"$out")")" "…and wait says interrupted, exit 1"
-  k "$(nt grep -qx check.sh "$D/ctrlc.log")" "…and the suite never finished"
+  k "$(nt grep -qx check "$D/ctrlc.log")" "…and the check never finished"
   rm -rf "$D2"
 
-  # 26 `__run` IS THE LAUNCHER'S. By hand it refuses; with a runid forged while a run holds the root it opens the
-  # lock itself and finds it taken — never a second suite.
+  # 15 `__run` IS THE LAUNCHER'S. By hand it refuses; with a runid forged while a run holds the root it opens the
+  # lock itself and finds it taken — never a second run.
   D2=$(mktemp -d); R=$(newrepo byhand 3)
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" __run >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 2)" "__run by hand refuses, exit 2"
-  : > "$D/byhand.log"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 ) & p=$!
   for _ in $(seq 50); do [ -f "$D/byhand.started" ] && break; sleep 0.1; done
   out=$( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_RUNID=forged "$SELF" __run 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3 -a -n "$(grep 'a run is already going' <<<"$out")")" "…and a forged one while a run is going finds the lock taken, exit 3"
   wait "$p"
-  k "$(t test "$(grep -cx check.sh "$D/byhand.log")" = 1)" "…so one suite ran"
+  k "$(t test "$(grep -cx check "$D/byhand.log")" = 1)" "…so one check ran"
   rm -rf "$D2"
 
-  # 27 THE SCOPE. Where the user manager answers, the run sits in a transient scope of its own, out of the cgroup
+  # 16 THE SCOPE. Where the user manager answers, the run sits in a transient scope of its own, out of the cgroup
   # that started it; CC_GREEN_SCOPE=0 keeps it in place. Both, on one slow fixture each.
   if timeout 10 systemd-run --user --scope --quiet --collect true </dev/null >/dev/null 2>&1; then
     for p2 in 1 0; do
@@ -1008,34 +716,33 @@ EOS
     k 0 "no user manager answers systemd-run here: the scope cases are not checked"
   fi
 
-  # 28 `start` IS THE WORKER'S ROUTE PAST A FOREGROUND TOOL CALL, with no setsid/nohup/& typed by the caller (the
-  # classifier refused those twice, 2026-09-25). It returns while the gate is still going; `wait` is 3, then the
-  # report. `start -- SUITE` runs one of the repo's own suites in place of the gates, and `wait` answers with its exit
-  # and no gate report — 1 for a suite that failed, 0 for one that passed.
-  D2=$(mktemp -d); R=$(newrepo started 3)
-  : > "$D/started.log"
+  # 17 `start` IS THE WORKER'S ROUTE PAST A FOREGROUND TOOL CALL, with no setsid/nohup/& typed by the caller (the
+  # classifier refused those twice, 2026-09-25). It returns while the check is still going; `wait` is 3, then the
+  # report. `start -- SUITE` runs one of the repo's own suites in place of lander check, and `wait` answers with its
+  # exit and no report — 1 for a suite that failed, 0 for one that passed.
+  D2=$(mktemp -d); R=$(newrepo started 15)
   out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 0 -a -n "$(grep 'started the gates on' <<<"$out")")" "start returns 0 once the run is going, and says so"
-  k "$(nt grep -qx check.sh "$D/started.log")" "…before its gate has finished"
+  k "$(t test "$rc" -eq 0 -a -n "$(grep 'started lander check on' <<<"$out")")" "start returns 0 once the run is going, and says so"
+  k "$(nt grep -qx check "$D/started.log")" "…before its check has finished"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "…so a short wait on it says still running, exit 3"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 20 2>&1 ); rc=$?
-  k "$(t test "$rc" -eq 0 -a -n "$(grep 'green   core/tests/check.sh' <<<"$out")")" "…and a longer one is the gate report, green, exit 0"
-  k "$(t test "$(grep -cx check.sh "$D/started.log")" = 1)" "…one suite ran"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 0 -a -n "$(grep 'green   lander check' <<<"$out")")" "…and a longer one is the report, green, exit 0"
+  k "$(t test "$(grep -cx check "$D/started.log")" = 1)" "…one check ran"
   mkdir -p "$R/tests" "$R/bin"
   printf '#!/bin/sh\nsleep 1; echo slow-suite-ran; exit 5\n' > "$R/tests/check-slow.sh"
   printf '#!/bin/sh\n[ "$1" = selfcheck ] && echo tool-selfcheck-ran\n' > "$R/bin/cc-tool"
   chmod +x "$R/tests/check-slow.sh" "$R/bin/cc-tool"; ( cd "$R" && git add -A && git commit -qm suites )
   out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 20 "$SELF" start -- tests/check-slow.sh 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0)" "start -- SUITE returns 0 once the repo's own suite is going"
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 20 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'has ended (exit 5)' <<<"$out")")" "…and wait on a suite that failed says its exit, exit 1"
-  k "$(nt grep -q 'core/tests/check.sh' <<<"$out")" "…with no gate report, which would answer a question nobody asked"
+  k "$(nt grep -q 'lander check' <<<"$out")" "…with no check report, which would answer a question nobody asked"
   k "$(t grep -qx slow-suite-ran "$(ls "$D2"/run-*.log)")" "…and the suite's output is in the run's log"
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" start -- ./bin/cc-tool selfcheck >/dev/null 2>&1 )
-  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 20 2>&1 ); rc=$?
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 60 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -n "$(grep 'has ended (exit 0)' <<<"$out")")" "…a tool's selfcheck runs the same way, and on one that passed, exit 0"
-  # 28b NOTHING ELSE DETACHES. An open `-- CMD` would be a general way round the classifier's refusal of a detached
+  # 17b NOTHING ELSE DETACHES. An open `-- CMD` would be a general way round the classifier's refusal of a detached
   # process (review of PR #675): any command, a tool with other arguments, a path out of the repo, a symlink, a
   # script HEAD does not track, and __run called straight — each refused, exit 2, and none of them runs.
   printf '#!/bin/sh\ntouch "%s/escaped"\n' "$D" > "$R/tests/check-new.sh"; chmod +x "$R/tests/check-new.sh"
@@ -1057,16 +764,13 @@ EOS
   k "$(t test "$rc" -eq 2)" "start -- with no command is a usage error, exit 2"
   rm -rf "$D2"
 
-  # 29 A STALE RUN IS STOPPED FOR ITS OWN WORKTREE, AND ONLY ITS OWN. Two roots each start a slow gate; one root's
+  # 18 A STALE RUN IS STOPPED FOR ITS OWN WORKTREE, AND ONLY ITS OWN. Two roots each start a slow check; one root's
   # tree moves under its run. `start` there is refused and says the run is stale and names `stop`; `stop` ends that
-  # run and its gate, `wait` calls it interrupted, and `start` then runs on the new tree — while the other root's run
-  # and gate go on untouched. A lock held by a process that carries no runid of the note's is never signalled.
+  # run and its check, `wait` calls it interrupted, and `start` then runs on the new tree — while the other root's
+  # run and check go on untouched. A lock held by a process that carries no runid of the note's is never signalled.
   D2=$(mktemp -d)
   for p2 in stA stB; do
-    R=$(newrepo "$p2")
-    printf '#!/usr/bin/env bash\necho $$ >> "%s"\nsleep 30\necho check.sh >> "%s"\n' "$D/$p2.pid" "$D/$p2.log" > "$R/core/tests/check.sh"
-    ( cd "$R" && git add -A && git commit -qm slow ) >/dev/null 2>&1
-    : > "$D/$p2.log"; : > "$D/$p2.pid"
+    R=$(newrepo "$p2" 120)
     ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_SCOPE=0 timeout 20 "$SELF" start >/dev/null 2>&1 )
     for _ in $(seq 100); do [ -s "$D/$p2.pid" ] && break; sleep 0.1; done
   done
@@ -1074,10 +778,10 @@ EOS
   GDIR=$D2 lock_files "$R2"; p2=$(status_field pid)
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" stop 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0 -a -n "$(grep 'stopped' <<<"$out")")" "stop on a root whose run is going ends it, exit 0"
-  k "$(nt kill -0 "$gpid")" "…and its gate is gone"
+  k "$(nt kill -0 "$gpid")" "…and its check is gone"
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'was interrupted' <<<"$out")")" "…and wait on it says interrupted, exit 1 — never green"
-  k "$(t kill -0 "$p")" "…while the other root's gate is still going"
+  k "$(t kill -0 "$p")" "…while the other root's check is still going"
   k "$(t kill -0 "$p2")" "…and so is the other root's run"
   out=$( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" wait 1 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 3)" "…which its own wait still calls running, exit 3"
@@ -1100,12 +804,12 @@ EOS
   out=$( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" stop 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'nothing signalled' <<<"$out")")" "a note naming a pid that is not the run's is refused, exit 1"
   k "$(t kill -0 "$pid")" "…and that pid is not signalled"
-  k "$(t kill -0 "$p")" "…nor the run's gate"
+  k "$(t kill -0 "$p")" "…nor the run's check"
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
   printf 'pid=%s\nrunid=%s\n' "$p2" "$runid" > "$STATUS"
   ( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" stop >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 0)" "…and the note put right, the other root's own stop ends its run"
-  k "$(t test "$(cat "$D/stA.log" "$D/stB.log")" = "")" "…and no stopped suite ever finished"
+  k "$(t test "$(cat "$D/stA.log" "$D/stB.log" 2>/dev/null)" = "")" "…and no stopped check ever finished"
   rm -rf "$D2"
 
   # THE RECURRING DEFECTS: every catalogue class against its own fixtures, then the report holding a hand-over on one.
@@ -1113,14 +817,15 @@ EOS
   k "$rc" "every recurring-defect class goes red on its fixture diff and holds its suppressed cases ($(tail -1 <<<"$out"))"
   [ "$rc" = 0 ] || grep -A3 FAIL <<<"$out"
   D2=$(mktemp -d); R=$(newrepo defects); mkdir -p "$R/bin" "$D/reviews"
-  ( cd "$R" && git update-ref refs/remotes/origin/main HEAD && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  ( cd "$R" && git update-ref refs/remotes/origin/main HEAD && CC_GREEN_DIR="$D2" "$SELF" run ) >/dev/null 2>&1
   for p in 1 2; do printf 'VERDICT: LAND-AFTER-FIX\n\n1. x:1 — the tick never asks cc-pause is <repo>\n' > "$D/reviews/r-$p-00000000000$p.md"; done
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
   k "$(t test "$rc" = 0 -a -n "$(grep 'clean   recurring defects' <<<"$out")")" "a green tree whose diff carries no recurring defect is green, and says it looked"
   printf '#!/usr/bin/env bash\ncc "$repo" "$row" --go "$brief"\n' > "$R/bin/cc-tick"
-  ( cd "$R" && git add -A && git commit -qm tick && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  ( cd "$R" && git add -A && git commit -qm tick && CC_GREEN_DIR="$D2" "$SELF" run ) >/dev/null 2>&1
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
   k "$(t test "$rc" = 1 -a -n "$(grep 'DEFECT  pause-hold-missing at bin/cc-tick:2' <<<"$out")")" "a green tree whose diff launches with no pause check is NOT green, and names the line"
+  k "$(t grep -q 'green   lander check' <<<"$out")" "…while its check itself is green"
   rm -rf "$D2"
 
   echo "cc-green selfcheck: $((n - f)) passed, $f failed"

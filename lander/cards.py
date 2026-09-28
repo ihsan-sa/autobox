@@ -9,9 +9,10 @@ someone is listening; `stopped(job, why, route)` says a job left the lane and wh
     route     `--route <title>` last: the job's own `route` if the queue call carried one, else `[<repo>] PR #<n> …`
 
 A clean landing with none of the first three says nothing beyond the #approvals card. stopped()'s route "seat" also
-puts the stop into the repo's session with `cc-slack inject`, once; "query" also files a planner request
-(`cc-notify --ask`) for the planning seat, never a page to the owner. owner_card() is the 🔐 card, and only
-deploy calls it, for what cc-units policy keeps for the owner.
+and "query" put the stop into the repo's session with `cc-slack inject`, once; "query", "planning" and "lander-self" file
+a planner request (`cc-notify --ask`) for the planning seat, never a page to the owner. owner_card() is the 🔐 card
+in #approvals, the one cc-slack turns the owner's 👍 into a queue from: the protected door's refusal ("door"), a
+protected head stopped in the lane ("owner"), and what cc-units policy keeps for the owner at deploy.
 
 DEDUPE BY PRODUCER ID. Every card carries `--id land:<repo>:<pr>:<kind>@<queued_at>` (the old lander's shape, so a
 card either sent goes once). An id in `cards/sent.json` is not sent again. A card Slack refuses is kept in
@@ -156,23 +157,24 @@ def _pending_path():
     return state("cards", "pending.json")
 
 
-def _post(argv, pid):
-    rc, out = sh(argv, timeout=180)
+def _post(argv, pid, hand=False):
+    rc, out = sh(argv, timeout=180, **(box_hand() if hand else {}))
     return rc == 0 or "no SLACK_BOT_TOKEN" in out, out
 
 
-def say(pid, argv, repo, pr):
-    """Send one card once. A refusal is kept in pending and retried by the next say() up to SAY_TRIES."""
+def say(pid, argv, repo, pr, hand=False):
+    """Send one card once. A refusal is kept in pending and retried by the next say() up to SAY_TRIES. `hand`: send it
+    from box_hand() (the 🔐 card), and so does its retry."""
     retry()
     sent = read_json(_sent_path(), []) or []
     if pid in sent:
         return True
-    ok, out = _post(argv, pid)
+    ok, out = _post(argv, pid, hand)
     if ok:
         write_json(_sent_path(), (sent + [pid])[-500:])
         return True
     pending = read_json(_pending_path(), {}) or {}
-    pending[pid] = {"argv": argv, "tries": 1, "repo": repo, "pr": pr}
+    pending[pid] = {"argv": argv, "tries": 1, "repo": repo, "pr": pr, "hand": bool(hand)}
     write_json(_pending_path(), pending)
     log("unsaid", repo, pr, id=pid, tries=f"1/{SAY_TRIES}", why=out.strip()[-120:].replace("\n", " "))
     return False
@@ -184,7 +186,7 @@ def retry():
         return
     sent = read_json(_sent_path(), []) or []
     for pid, p in list(pending.items()):
-        ok, out = _post(p["argv"], pid)
+        ok, out = _post(p["argv"], pid, bool(p.get("hand")))
         if ok:
             sent.append(pid)
             del pending[pid]
@@ -220,36 +222,122 @@ def landed(job):
     return post(job, "landed", text, args) if args else rc in (0, 3, 4)
 
 
+QUERY_ROUTES = ("query", "planning", "lander-self")
+PROTECTED_RE = re.compile(r"\(CC_PROTECTED_PATHS_[^)]*\)")
+
+
 def stopped(job, why, route):
-    """`route` says who picks it up: "seat" (the row's own seat fixes it and pushes), "query" (the planning seat
-    decides; a planner request, never the owner), or a --route target of the queue call's own."""
+    """`route` says who picks it up, in the lane's words:
+
+        seat         the row's own seat fixes it and pushes; the stop also goes into the repo's session (inject, once)
+        #<h>         a member's landing: its own `#<h>` (where() already says so); a member is never injected
+        query, planning, lander-self
+                     the planning seat decides: the stop is said where a stop is said and a planner request
+                     (`cc-notify --ask`) is filed, never a page to the owner; only "query" also wakes the repo's
+                     session, because "planning" and "lander-self" are the planning seat's own, and an inject on top of
+                     the request would wake it twice
+        owner        a protected head the owner has not 👍'd, found in the lane: said once in the thread or routed,
+                     then the 🔐 card (say_protected_stop)
+        door         the queue call's own refusal at the protected door: only the 🔐 card (say_protected_door)
+
+    Anything else is the queue call's own --route title, as before."""
     why = " ".join(str(why).split()) or "it stopped without saying why"
+    if route == "door":
+        return protected_door(job, why)
+    if route == "owner":
+        return protected_stop(job, why)
     short = why if len(why) <= STOP_CARD_MAX else why[:STOP_CARD_MAX - 1] + "…"
     who = {"seat": "The track's seat fixes it and pushes; the lane takes the new head",
-           "query": "The planning seat decides what happens to it"}.get(route, "")
+           "query": "The planning seat decides what happens to it",
+           "planning": "The planning seat decides what happens to it",
+           "lander-self": "It changes the lander itself, so the planning seat lands it by hand"}.get(route, "")
     url = job.extra.get("url", "")
     text = f"[{job.repo}] PR #{job.pr}: NOT merged ❌ — {short}." + (f" {who}." if who else "") + (f" {url}" if url else "")
     args = where(job, False)
-    if route not in ("seat", "query") and not job.extra.get("chat"):
+    known = route in ("seat",) + QUERY_ROUTES or route.startswith("#")
+    if not known and not job.extra.get("chat"):
         args = ["--route", route]
     said = post(job, "stopped", text, args)
-    if route == "query":
+    if route in QUERY_ROUTES:
         sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", producer_id(job, "query"), "-t", f"{job.repo} landing",
-            text], timeout=60)
-    if not job.member and route == "seat":
+            text], timeout=60, **box_hand())
+    if not job.member and route in ("seat", "query"):
         sent = read_json(_sent_path(), []) or []
         pid = producer_id(job, "inject")
         if pid not in sent:
-            sh([slack(), "inject", job.repo, f"PR #{job.pr} landing stopped: {short}. The way back in: fix it and "
-                f"push; the lane takes the new head."], timeout=120)
+            sh([slack(), "inject", job.repo, f"[{job.repo}] PR #{job.pr} landing stopped: {short}. The way back in: "
+                f"fix it and push; the lane takes the new head."], timeout=120)
             write_json(_sent_path(), (sent + [pid])[-500:])
     return said
 
 
-def owner_card(pid, text):
-    """The 🔐 card in #approvals. Only for what policy keeps for the owner (a unit enable cc-units says is his)."""
+def box_hand():
+    """The cwd and env a card to the owner is raised from: ~ and no role. cc-notify and cc-slack read who is asking
+    from the caller (CC_ROLE, CC_MEMBER_SANDBOX, a .cc/track marker above the cwd), and a lane started from a track's
+    worktree must not make the 🔐 card a track's request."""
+    return {"cwd": os.path.expanduser("~"),
+            "env": {k: v for k, v in os.environ.items() if k not in ("CC_ROLE", "CC_MEMBER_SANDBOX")}}
+
+
+def _door_head(job):
+    """The PR's head for the door card's id; the queue call refuses before a job has one, so ask gh. "" on doubt."""
+    if job.head:
+        return job.head
+    try:
+        from lander import jobs as J
+        from lander import lane as L
+        from lander import members as M
+        genv = M.env(job.member) if job.member else None
+        return L.pr_head(J.repo_root(job.repo), job.pr, (genv or {}).get("GH_TOKEN"), genv) or ""
+    except Exception:   # noqa: BLE001 — the card goes without a head in its id rather than not at all
+        return ""
+
+
+def protected_door(job, why):
+    """The 🔐 card the door's own refusal leaves, worded as cc-slack reads an authorization card ("[<repo>] PR #<n>
+    …", APPROVAL_RE), so the owner's 👍 on it queues the head. The id carries the head: the same refusal is one card
+    and a new head a new question. A hit the box could not read (no named file) is not his to answer: no card."""
+    if not PROTECTED_RE.search(why):
+        log("unsaid", job.repo, job.pr, why="protected door not-knowing, no 🔐 card")
+        return False
+    head = _door_head(job)
+    pid = f"land:{job.repo}:{job.pr}:protected-door" + (f"@{head}" if head else "")
+    return owner_card(pid, f"[{job.repo}] PR #{job.pr} is not queued — {why}. Nothing merged, and your own 👍 on "
+                           f"this card is what queues it")
+
+
+def protected_stop(job, why):
+    """A protected head stopped in the lane: said once in the job's thread (else routed as a stop), then the 🔐 card
+    for a named file, or a planner request when the box could not read which file it was."""
+    if "has not 👍'd" in why:
+        text = (f"[{job.repo}] PR #{job.pr} moved to a head the owner has not 👍'd, under a protected path — 👍 the "
+                f"🔐 card in #approvals to land this head ({why})")
+    else:
+        text = (f"[{job.repo}] PR #{job.pr} is NOT landing — {why}. Nothing merged and the job is off the queue; "
+                f"the owner's own 👍 on the 🔐 card in #approvals queues this head")
+    pid = producer_id(job, "protected")
+    chat, ts = job.extra.get("chat") or "", job.extra.get("ts") or ""
+    args = ["-c", chat, *(["--thread", ts] if ts else [])] if chat else ["--route", f"[{job.repo}] PR #{job.pr} stopped"]
+    said = say(pid, [slack(), "post", *args, "--id", pid, text], job.repo, job.pr)
+    if PROTECTED_RE.search(why):
+        owner_card(f"{pid}:owner", text)
+    else:
+        sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", f"{pid}:owner", "-t", f"{job.repo} approval", text],
+           timeout=60, **box_hand())
+    return said
+
+
+def owner_card(pid, text, run=None):
+    """The 🔐 card in #approvals. Only for what policy keeps for the owner (a unit enable cc-units says is his).
+    With `run`, the card goes out as `cc-notify --approval --run <cmd>` from the box's own hand, so the owner's 👍
+    runs that command once; without it, the 👍 is read by cc-slack's authorization-card handler (a door card)."""
     if TEST_STATE.search(text):
         log("unsaid", "-", 0, id=pid, why="synthetic test state, no 🔐 card posted")
         return False
+    if run:
+        rc, out = sh([os.path.join(BIN, "cc-notify"), "--approval", "--run", run, "--id", pid, "-t",
+                      "lander approval", text], timeout=60, **box_hand())
+        log("owner-card", "-", 0, id=pid, rc=rc)
+        return rc == 0
     return say(pid, [slack(), "post", "-c", "#approvals", "--mention", "--id", pid, f"🔐 *Approval needed:* {text}"],
-               "-", 0)
+               "-", 0, hand=True)

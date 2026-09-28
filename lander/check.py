@@ -7,7 +7,9 @@ check once, the nightly full run and the sandbox acceptance table (B2d).
         way the lane will: same runner, same sandbox, same red-vs-base rule. Box-class checks are listed, not run:
         they run on main's tip after the merge. Nothing is stored and nothing goes to the failures ledger: a
         worker's own red is its work. Exit 0 green (a check red on the base too is main's, and is said, not held
-        against the change), 1 some check red, 3 no verdict (a check could not run), 2 usage.
+        against the change), 1 some check red, 3 no verdict (a check could not run), 2 usage. A repo that ships no
+        manifest is checked by the release's tests/landing-repos/<repo>.toml (manifest.host_fallback), as the lane
+        does; --manifest FILE names another.
 
     lander sweep [--repo DIR] [--rev REV] [--manifest FILE] [--only NAME]… [--sandbox] [--jobs N]
         Runs every check in the manifest at REV (default HEAD) once, each on its own class's runner, and prints a
@@ -56,11 +58,25 @@ def _opts(argv, flags, multi=("--only",), bools=()):
 
 
 def default_base(wt: str) -> str:
-    for ref in ("origin/HEAD", "origin/main", "main", "master"):
+    for ref in ("refs/remotes/origin/HEAD", "refs/remotes/origin/main", "main", "master"):
         p = subprocess.run(["git", "-C", wt, "merge-base", "HEAD", ref], capture_output=True, text=True)
         if p.returncode == 0 and p.stdout.strip():
             return p.stdout.strip()
     return ""
+
+
+def repo_name(wt: str) -> str:
+    """The repo a worktree belongs to: the directory holding its main gitdir (~/dev/<repo>/.git -> <repo>), which is
+    the name the lane knows it by and host_fallback looks it up under."""
+    p = subprocess.run(["git", "-C", wt, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                       capture_output=True, text=True)
+    gd = p.stdout.strip() if p.returncode == 0 else ""
+    if not gd:
+        return ""
+    gd = os.path.realpath(gd)
+    if os.path.basename(gd) == ".git":
+        return os.path.basename(os.path.dirname(gd))
+    return os.path.basename(gd)[:-4] if gd.endswith(".git") else ""
 
 
 def usage(doc_part: int) -> int:
@@ -69,6 +85,8 @@ def usage(doc_part: int) -> int:
 
 
 def cmd_check(argv):
+    if hasattr(sys.stdout, "reconfigure"):   # a worker's log (cc-green) shows each line as it is said, not at exit
+        sys.stdout.reconfigure(line_buffering=True)
     try:
         a, pos = _opts(argv, ("--base", "--manifest", "--only"))
     except ValueError as e:
@@ -82,7 +100,7 @@ def cmd_check(argv):
     if not base_tree or not head_tree:
         print(f"lander check: {wt} is not a git checkout with a base to compare against", file=sys.stderr)
         return EXIT_USAGE
-    fb = os.path.abspath(a["--manifest"]) if a["--manifest"] else ""
+    fb = os.path.abspath(a["--manifest"]) if a["--manifest"] else M.host_fallback(repo_name(wt))
     try:
         m = M.widen(M.load(wt, base, fallback=fb), M.load(wt, head_tree, fallback=fb, strict=False))
     except M.ManifestError as e:
@@ -97,7 +115,7 @@ def cmd_check(argv):
     for f in plan.extra.get("faults", []):
         print(f"  fault    {f}")
     outs = RUN.run_plan(wt, m, plan, files, head_tree, base_tree, only=a["--only"] or None, record_reds=False,
-                        quarantine_text=RUN.quarantine_text(wt, base))
+                        quarantine_text=RUN.quarantine_text(wt, base), fallback=fb)
     return report(outs)
 
 
@@ -168,7 +186,7 @@ def cmd_sweep(argv):
     repo = os.path.abspath(a["--repo"] or ".")
     rev = a["--rev"] or "HEAD"
     tree = RUN.tree_of(repo, rev)
-    fb = os.path.abspath(a["--manifest"]) if a["--manifest"] else ""
+    fb = os.path.abspath(a["--manifest"]) if a["--manifest"] else M.host_fallback(repo_name(repo))
     try:
         m = M.load(repo, rev, fallback=fb)
     except M.ManifestError as e:

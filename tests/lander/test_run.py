@@ -51,7 +51,12 @@ class Env(unittest.TestCase):
         self.addCleanup(d.cleanup)
         self.tmp = d.name
         self.state = os.path.join(self.tmp, "state")
-        p = mock.patch.dict(os.environ, {"LANDER_STATE": self.state, "LANDER_SCOPE": "0"})
+        # TMPDIR is the case's own: a run root `cc-land.run.<pid>.*` in the shared $TMPDIR whose pid is no lander
+        # (this suite's is python -m unittest) is removed by a landing's sweep of dead runs, mid-check, so the log
+        # and the tree vanished under load and a case read an empty log (rc 1, no lines) or a failed `git init`.
+        tmpdir = os.path.join(self.tmp, "t")
+        os.mkdir(tmpdir)
+        p = mock.patch.dict(os.environ, {"LANDER_STATE": self.state, "LANDER_SCOPE": "0", "TMPDIR": tmpdir})
         p.start()
         self.addCleanup(p.stop)
         self.repo = os.path.join(self.tmp, "repo")
@@ -545,6 +550,35 @@ class Judge(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
+class CheckFallback(Env):
+    """A repo that ships no LANDING.toml is checked by the release's tests/landing-repos/<repo>.toml, the way the lane
+    plans it (review of #771: without it every other repo planned with no checks). cc-green's worker green runs this."""
+
+    def check(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = CK.cmd_check([self.repo, "--base", "base"])
+        return rc, out.getvalue()
+
+    def test_a_repo_without_a_manifest_gets_its_fallback(self):
+        git(self.repo, "branch", "base")
+        write(self.repo, {"core/bin/tool": "#!/bin/sh\necho tool again\n"})
+        self.assertEqual(CK.repo_name(self.repo), "repo")
+        fb = os.path.join(self.tmp, "release", "tests", "landing-repos")
+        os.makedirs(fb)
+        with mock.patch.object(M, "FALLBACK_DIR", fb):
+            rc, out = self.check()
+            self.assertEqual(rc, 0, out)
+            self.assertNotIn("tip      e2e", out)             # no repo.toml in the release: nothing to fall back on
+            write(fb, {"repo.toml": '[[check]]\nname = "e2e"\nrun = "true"\npaths = ["**"]\nclass = "box"\n'})
+            rc, out = self.check()
+            self.assertEqual(rc, 0, out)
+            self.assertIn("tip      e2e", out)                # the release's fallback planned it
+            # the PR's own tree cannot supply one: only the release's directory is read
+            write(self.repo, {"tests/landing-repos/other.toml": '[[check]]\nname = "x"\nrun = "true"\n'})
+            self.assertEqual(M.host_fallback("other"), "")
+        self.assertEqual(M.host_fallback("../etc/passwd"), "")
+
+
 class CheckCommand(Env):
     MANIFEST = textwrap.dedent('''
         [[check]]

@@ -10,6 +10,8 @@
       Make a v1 trace v2 without re-reading what may be gone since (gate logs, transcripts): add the three event
       classes from the journal and the checkout's own objects, keep the rest as it was read then.
   cc-replay score --candidate PATH --trace FILE [--conflicts history|files|none] [--verbose] [--keep]
+      PATH must be a copy of the OLD single-file landing tool (`cc-bin-at <ref>` before the lander cut over). The
+      file at core/bin of today is a shim onto the lander package, and it is refused with one line saying so.
       Import PATH as a module, stand the world in for it from the trace, and drive its own `queue` and `work`
       commands through the trace's arrivals on a VIRTUAL clock: a gate or a review parks its thread until the
       clock reaches its recorded duration, and the clock advances to the earliest wake only when every live
@@ -1458,6 +1460,10 @@ class World:
 
 
 # ── the harness: import the candidate, rebind its seams, drive the trace through it ──────────────────────
+NOT_MONOLITH = ("not the old single-file landing tool, the only kind this harness holds; the lander that "
+                "replaced it is a package, and scoring it is retired with cc-improve (docs/improve-loop.md)")
+
+
 def load_candidate(path, root, world, clock, verbose_log):
     binq = f"{root}/bin"
     os.makedirs(binq, exist_ok=True)
@@ -1472,7 +1478,7 @@ def load_candidate(path, root, world, clock, verbose_log):
     ns = mod.__dict__
     for k in ("sh", "run_gate", "cmd_work", "cmd_queue", "write_atomic", "stamp", "LANDQ", "STATE", "BOARDS"):
         if k not in ns:
-            raise SystemExit(f"cc-replay: {path} has no `{k}` — not a cc-land this harness knows how to hold")
+            raise SystemExit(f"cc-replay: {path} has no `{k}` — {NOT_MONOLITH}")
     real_write = ns["write_atomic"]
     world.digest = ns.get("change_digest") or change_digest
     world.mark = ns.get("REVIEW_MARK") or "cc-land-review"
@@ -1712,6 +1718,15 @@ def cmd_selfcheck():
         t.start()
     for t in ts:
         t.join()
+    _t = tempfile.mkdtemp(prefix="cc-replay-shim-")
+    try:
+        load_candidate(os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-la" + "nd"), _t, None, None, None)
+        _said = ""
+    except SystemExit as e:
+        _said = str(e)
+    finally:
+        shutil.rmtree(_t, ignore_errors=True)
+    check("today's core/bin shim onto the lander is refused as a candidate, with one line saying why", NOT_MONOLITH in _said)
     check("virtual clock: four parked gate threads advance the clock to the longest (1400), in wake order, in no wall time",
           clock.now == 1400 and sorted(ends) == [1100, 1200, 1300, 1400] and time.time() - w0 < 2)
     check("…and it advanced exactly four times — once per distinct wake, never on a tick", clock.advances == 4)
@@ -1838,10 +1853,18 @@ def cmd_selfcheck():
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
-    # 4. determinism, end to end: the cc-land beside this file scores the fixture twice to the same bytes, every PR
-    #    merges, and the PRs on a shared file were gated one after the other (the second's merge is later).
-    cand = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-land")
-    if os.path.exists(cand):
+    # 4. determinism, end to end: the OLD single-file tool scores the fixture twice to the same bytes, every PR
+    #    merges, and the PRs on a shared file were gated one after the other (the second's merge is later). The file
+    #    beside this one is a shim onto the lander now, so these run only on a copy CC_REPLAY_CANDIDATE names
+    #    (`cc-bin-at <ref>` from before the cutover), and say they were skipped otherwise.
+    cand = os.environ.get("CC_REPLAY_CANDIDATE") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-land")
+    try:
+        monolith = "def cmd_work(" in open(cand, errors="replace").read()
+    except OSError:
+        monolith = False
+    if not monolith:
+        print("  - end-to-end scoring skipped: no old single-file landing tool here (CC_REPLAY_CANDIDATE names one)")
+    if monolith:
         a, la, ca = score(cand, fixture_trace(), verbose=True)
         b, _, _ = score(cand, fixture_trace())
         check("determinism: two scores of the fixture trace against the cc-land beside this file are byte-identical", a == b)
@@ -1948,10 +1971,11 @@ def cmd_selfcheck():
         shutil.rmtree(root, ignore_errors=True)
     # the change key is the landing's own: a rebase that only moved a hunk's line numbers and its function-context
     # tail is one change, and a head keyed by a legacy (tail-kept) marker still matches its v2-keyed rebase.
-    lp = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-l" + "and")
-    spec = importlib.util.spec_from_loader("cc_land_digest", importlib.machinery.SourceFileLoader("cc_land_digest", lp))
-    land = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(land)
+    # The landing's own is the lander's review.change_digest now (core/lander/review.py, beside this file's bin/).
+    core = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if core not in sys.path:
+        sys.path.insert(0, core)
+    import lander.review as land
     d1 = "diff --git a/x b/x\nindex 1..2 100644\n@@ -10,3 +10,4 @@ def f():\n a\n+b\n c\n"
     d2 = "diff --git a/x b/x\nindex 3..4 100644\n@@ -40,3 +40,4 @@ def g():\n a\n+b\n c\n"
     d3 = d2.replace("+b", "+z")

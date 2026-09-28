@@ -11,8 +11,10 @@ The request file is not land/<repo>-deploy.json, because the old lander still re
 THE STEPS, per target, in order; the first that fails stops that target and says so:
 
   1. branch   the checkout is on its base branch (board `default_branch`, else main)
-  2. pull     `git fetch origin <base>` and `git merge --ff-only <sha>` under the repo's git lock (U1's, shared with
-              cc-publish), so a checkout a person moved is refused, never reset
+  2. pull     under the repo's git lock (U1's, shared with cc-publish): verified_tip fetches <base> from the URL the
+              lander holds (git.remote_url, never the checkout's "origin") and checks it against ls-remote; a sha
+              that is not that tip or an ancestor of it is refused; then `git merge --ff-only <sha>`, so a
+              checkout a person moved is refused, never reset
   3. install  the first executable of core/install.sh, install.sh, with no flags; then `systemctl --user
               daemon-reload`; then <repo>.applied records the sha
   4. units    a systemd-user unit this change ADDED is enabled with `enable --now`, unless its .timer does it, it
@@ -24,7 +26,8 @@ THE STEPS, per target, in order; the first that fails stops that target and says
   6. daemons  `cc-units daemons-for`: a bare process running a changed program is restarted by its policy's
               command and PROVED by a pid that was not there before
   7. verify   the track's open cc-scope asks run their own checks (scope.deliver) — LAST, so what it measures is
-              what now runs. A check that is red, absent or could not run leaves the deploy `unverified`.
+              what now runs. A check that is red, absent or could not run leaves the deploy `unverified`,
+              and one card says it was deployed but NOT delivered (`lander deploy` exits 4, as UNVERIFIED did)
 
 A member workspace's repo (`<h>--<t>`) installs nothing: no units, no restarts; its request is answered "nothing to
 deploy". The request's `targets` map records each target's state: requested, held, deployed, verified, unverified
@@ -40,6 +43,7 @@ import re
 import shlex
 
 from lander import cards as C
+from lander import git as G
 from lander import scope
 
 NEVER = "tmux-main.service"
@@ -90,6 +94,7 @@ def held(target):
 
 
 WAITING = ("requested", "held")
+TRIES = 3   # a failed target is deployed again by this many calls of run(), then waits for a new request
 
 
 def waiting(repo):
@@ -185,6 +190,23 @@ def git_lock(root):
             os.close(fd)
 
 
+def verified_tip(root, base):
+    """origin's <base> as the lander may trust it, or '' on any doubt: fetched from the lander's own URL with a
+    forced refspec, and refs/remotes/origin/<base> is then the very sha ls-remote names. The caller holds git_lock."""
+    url = G.remote_url(root)
+    if not url or not re.fullmatch(r"[A-Za-z0-9._/-]+", base or ""):
+        return ""
+    rc, _ = git(root, "fetch", "-q", url, f"+refs/heads/{base}:refs/remotes/origin/{base}", timeout=120)
+    if rc:
+        return ""
+    rc, sha = git(root, "rev-parse", f"refs/remotes/origin/{base}")
+    if rc or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return ""
+    rc, ls = git(root, "ls-remote", url, f"refs/heads/{base}", timeout=120)
+    named = [ln.split("\t")[0] for ln in ls.splitlines() if ln.endswith(f"\trefs/heads/{base}")] if rc == 0 else []
+    return sha if named == [sha] else ""
+
+
 # --- the steps -----------------------------------------------------------------------------------------------------
 
 def pull(root, base, sha, since=""):
@@ -198,7 +220,12 @@ def pull(root, base, sha, since=""):
     if since and git(root, "cat-file", "-e", f"{since}^{{commit}}")[0] == 0:
         before = since
     with git_lock(root):
-        git(root, "fetch", "-q", "origin", base)
+        tip = verified_tip(root, base)
+        if not tip:
+            raise Failed("pull", f"origin/{base} could not be fetched from the lander's own remote and checked "
+                                 f"against it; nothing merged in {root}")
+        if sha != tip and git(root, "merge-base", "--is-ancestor", sha, tip)[0] != 0:
+            raise Failed("pull", f"{sha[:12]} is not on origin/{base} ({tip[:12]}); nothing merged in {root}")
         rc, out = git(root, "merge", "--ff-only", "-q", sha)
     if rc:
         raise Failed("pull", f"git merge --ff-only {sha[:12]} in {root}: {last(out)}")
@@ -237,7 +264,7 @@ def enable_units(changes, repo, sha):
         if pol.strip() == "owner":
             C.owner_card(f"land:{repo}:deploy:enable-{u}@{sha[:12]}",
                          f"[{repo}] {u} is new, and cc-units keeps turning it on for you: "
-                         f"`systemctl --user enable --now {u}`")
+                         f"`systemctl --user enable --now {u}`", run=f"systemctl --user enable --now {u}")
             notes.append(f"{u} linked and left off; the owner has the card")
             continue
         _, st = systemctl("is-enabled", u)
@@ -410,7 +437,8 @@ def deploy_one(repo, target, sha, since=None):
 
 
 def run(repo, green=None):
-    """Deploy the repo's request to every target the tip passed and nobody holds. -> the request dict, or None."""
+    """Deploy the repo's request to every target the tip passed and nobody holds. -> the request dict, or None.
+    A failed target is tried again by the next call, TRIES times in all; after that only a new request moves it."""
     if "--" in repo:
         with contextlib.suppress(OSError):
             os.unlink(req_path(repo))
@@ -430,29 +458,50 @@ def run(repo, green=None):
     for target, st in req["targets"].items():
         if st.get("state") in ("deployed", "verified", "unverified"):
             continue
+        if st.get("state") == "failed" and int(st.get("tries") or 0) >= TRIES:
+            continue
         h = held(target)
         if h:
             st.update(state="held", why=h.get("why", ""))
             continue
         state, line, asks = deploy_one(repo, target, sha, since)
         st.update(state=state, why=line, at=C.now())
+        if state == "failed":
+            st["tries"] = int(st.get("tries") or 0) + 1
         C.log("deployed" if state != "failed" else "deploy-failed", repo, "deploy", target=target, sha=sha[:12],
               state=state)
         pid = f"land:{repo}:deploy:{target}:{state}@{sha[:12]}"
         if state == "failed":
             C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] deploy stopped", "--id", pid,
                         f"[{repo}] main at {sha[:12]} merged but did not deploy to {target} — {line}"], repo, 0)
-        elif asks:
+            continue
+        text = f"[{repo}] deployed {sha[:12]}" + (f" to {target}" if target != repo else "")
+        if state == "unverified":
+            # the old lander's UNVERIFIED (exit 4): merged and deployed, but what was asked for is not proved here
+            text += (f" — but NOT delivered: {line}. The asks stay open; `cc-scope unverified {repo}` lists them.")
+        if asks:
+            text += (f" ⚠️ Please restart {', '.join(asks)}. Until then the box runs the old code for "
+                     f"{'it' if len(asks) == 1 else 'them'}.")
+        if state == "unverified" or asks:
             C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] deploy", "--mention", "--id",
-                        pid, f"[{repo}] deployed {sha[:12]}. ⚠️ Please restart {', '.join(asks)}. Until then the box "
-                        f"runs the old code for {'it' if len(asks) == 1 else 'them'}."], repo, 0)
+                        pid, text], repo, 0)
     C.write_json(req_path(repo), req)
     return req
 
 
+def outcome(req):
+    """-> the exit code the old lander gave a deploy: 1 a target failed, 4 one is UNVERIFIED, 0 all verified.
+    None while a target still waits (requested, or held by a red tip)."""
+    states = [(st or {}).get("state") for st in ((req or {}).get("targets") or {}).values()]
+    if not states or any(s in WAITING for s in states):
+        return None
+    return 1 if "failed" in states else 4 if "unverified" in states else 0
+
+
 def cmd_deploy(argv):
     if len(argv) != 1:
-        print("usage: lander deploy <repo>   do the repo's pending deploy request if its tip is green")
+        print("usage: lander deploy <repo>   do the repo's pending deploy request if its tip is green "
+              "(exit 1 failed, 4 unverified)")
         return 2
     req = run(argv[0])
     if not req:
@@ -460,7 +509,7 @@ def cmd_deploy(argv):
         return 0
     for t, st in req["targets"].items():
         print(f"{t}: {st['state']}" + (f" — {st['why']}" if st.get("why") else ""))
-    return 1 if any(st["state"] == "failed" for st in req["targets"].values()) else 0
+    return outcome(req) or 0
 
 
 COMMANDS = {"deploy": (cmd_deploy, "do <repo>'s pending deploy request once its tip is green")}

@@ -6,7 +6,10 @@
                                    `check(name, sha) -> Result` runs one named check on one commit (the tick builds it
                                    from U2's runner). Answers "green", "red", "retry", "wait" or "idle".
     catchup(repo)                  origin's main moved without this box (a hand merge, another box): kick a tip run
-                                   for it, so it is checked and deployed like any merge
+                                   for it, so it is checked and deployed like any merge. No <repo>.applied yet: it
+                                   is seeded from the checkout's HEAD. A tip <repo>.tip-red (or the old lander's
+                                   <repo>.red) names is skipped: a person mends it, not the poll
+    lock(repo)                     one tip run per repo at a time (tick takes it; a second tick skips, never waits)
     green(repo, sha)               the tip run passed at exactly `sha` (deploy.run asks this)
 
 GREEN: every check the plan names over <last green>..<tip> passed. The green sha is recorded, and a deploy of that
@@ -18,11 +21,13 @@ each failing check alone is bisected over the first-parent commits since the las
 when it fails that check twice and its parent passed it; then, and only then, it is reverted: a throwaway worktree
 at the tip, `git revert`, a push to the base branch, a comment on its PR, a card to its thread and the repo's seat
 told. Anything short of proof (an unrunnable step, a flaky second run) reverts nothing and says the tip is red.
-A revert moves the tip, so the run kicks itself; the next tick checks the reverted tip.
+A revert moves the tip, so the run kicks itself; the next tick checks the reverted tip. A kick for a tip already
+found red (<repo>.tip-red names it) runs nothing again: it answers "red" until the tip moves.
 """
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 import re
 import shutil
@@ -30,6 +35,7 @@ import tempfile
 
 from lander import cards as C
 from lander import deploy as D
+from lander import git as G
 from lander import types as T
 
 PR_RE = re.compile(r"\(#(\d+)\)$")
@@ -47,6 +53,28 @@ def red_path(repo):
     return C.state(f"{repo}.tip-red")
 
 
+def old_red_path(repo):
+    """The old lander's note of a red base tip (after_batch); kept honoured until nothing writes it."""
+    return C.state(f"{repo}.red")
+
+
+@contextlib.contextmanager
+def lock(repo):
+    """Yields True when this process holds the repo's tip lock, False when another does (it does not wait)."""
+    path = C.state("tip", f"{repo}.lock")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
 def kick(repo):
     if not os.path.exists(want_path(repo)):
         C.write_json(want_path(repo), {"at": C.now()})
@@ -62,10 +90,9 @@ def git(root, *args, timeout=300):
 
 
 def origin_tip(root, base):
+    """origin's <base> fetched from the lander's own URL and checked against ls-remote (deploy.verified_tip), or ''."""
     with D.git_lock(root):
-        git(root, "fetch", "-q", "origin", base, timeout=120)
-    rc, out = git(root, "rev-parse", f"origin/{base}")
-    return out if rc == 0 and re.fullmatch(r"[0-9a-f]{40}", out) else ""
+        return D.verified_tip(root, base)
 
 
 def catchup(repo):
@@ -86,7 +113,8 @@ def catchup(repo):
         D.record_applied(repo, head)
         have = head
     red = C.read_json(red_path(repo), {}) or {}
-    if have == tip or red.get("tip") == tip or D.waiting(repo):
+    old = C.read_json(old_red_path(repo), {}) or {}
+    if have == tip or tip in (red.get("tip"), old.get("tip")) or D.waiting(repo):
         return False
     kick(repo)
     return True
@@ -100,7 +128,12 @@ def run(repo, plan, check, targets=None):
     tip = origin_tip(root, base)
     if not tip:
         return "retry"
-    last = (C.read_json(green_path(repo), {}) or {}).get("sha") or D.applied(repo)
+    if (C.read_json(red_path(repo), {}) or {}).get("tip") == tip:
+        # already found red and said so: a kick (the tick's, for a job still waiting) does not run it all again
+        with contextlib.suppress(OSError):
+            os.unlink(want_path(repo))
+        return "red"
+    last =(C.read_json(green_path(repo), {}) or {}).get("sha") or D.applied(repo)
     if not last:
         C.write_json(green_path(repo), {"sha": tip, "at": C.now(), "seeded": True})
         return "idle"
@@ -203,7 +236,9 @@ def revert(repo, root, base, sha, why):
                 if rc:
                     said = f"git revert: {D.last(out)}"
                 else:
-                    rc, out = git(tree, "push", "-q", "origin", f"HEAD:refs/heads/{base}")
+                    url = G.remote_url(root)
+                    rc, out = (git(tree, "push", "-q", url, f"HEAD:refs/heads/{base}") if url
+                               else (1, "the lander holds no remote URL for this checkout"))
                     if rc:
                         said = f"git push: {D.last(out)}"
                     else:

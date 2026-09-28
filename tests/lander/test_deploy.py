@@ -19,6 +19,7 @@ from test_review import Case, FakeBox  # noqa: E402
 from lander import board as B  # noqa: E402
 from lander import cards as C  # noqa: E402
 from lander import deploy as D  # noqa: E402
+from lander import git as G  # noqa: E402
 from lander import scope as S  # noqa: E402
 from lander import tip as TP  # noqa: E402
 from lander import types as T  # noqa: E402
@@ -41,11 +42,14 @@ class Box(Case):
         os.chmod(inst, 0o755)
         self.pids = {}
         self.real_running = D.running
+        G.REMOTES = os.path.join(self.tmp, "remotes.json")   # what `lander-self promote` pins
+        C.write_json(G.REMOTES, {os.path.realpath(self.root): "https://github.com/o/demo.git"})
 
     def tearDown(self):
         for k in ("CC_DEV", "CC_UNITS_DIR"):
             os.environ.pop(k, None)
         D.running = self.real_running
+        G.REMOTES = None
         super().tearDown()
 
     def unit(self, name, text="[Service]\nExecStart=%h/dev/demo/bin/daemon\n[Install]\nWantedBy=default.target\n"):
@@ -61,6 +65,10 @@ class Box(Case):
                 return 0, branch + "\n"
             if sub[:2] == ["rev-parse", "HEAD"]:
                 return 0, OLD + "\n"
+            if sub[:2] == ["rev-parse", "refs/remotes/origin/main"]:
+                return 0, NEW + "\n"
+            if sub[:1] == ["ls-remote"]:
+                return 0, NEW + "\trefs/heads/main\n"
             if sub[:1] == ["diff"]:
                 return 0, changes + "\n"
             if sub[:1] == ["log"]:
@@ -79,7 +87,7 @@ class Box(Case):
                 pids[u] = pids.get(u, 100) + (0 if u.startswith("stuck") else 1)
             return 0, ""
 
-        answers = {"git " + k: git for k in ("rev-parse", "diff", "log", "fetch", "merge")}
+        answers = {"git " + k: git for k in ("rev-parse", "diff", "log", "fetch", "merge", "ls-remote", "merge-base")}
         answers.update({"systemctl": systemctl, "install.sh": (0, "linked\n"), "cc-units restart-for": (0, ""),
                         "cc-units daemons-for": (0, ""), "cc-units policy": (0, "box\n"),
                         "cc-scope list": (0, "[]"), "cc-slack post": (0, ""), "cc-slack inject": (0, ""),
@@ -117,6 +125,8 @@ class TestDeploy(Box):
 
     def test_a_held_target_waits_and_another_goes(self):
         os.makedirs(os.path.join(self.dev, "demo2", ".git"))
+        C.write_json(G.REMOTES, {os.path.realpath(p): "https://github.com/o/demo.git"
+                                 for p in (self.root, os.path.join(self.dev, "demo2"))})
         self.fake()
         D.hold("demo", "a check is red")
         D.request("demo", NEW, ["demo", "demo2"])
@@ -224,9 +234,10 @@ class TestDeploy(Box):
         D.run("demo", green=lambda r, s: True)
         enabled = [c["argv"][-1] for c in box.called("systemctl") if c["argv"][2] == "enable"]
         self.assertEqual(enabled, ["new.service"])
-        cards = [c["argv"] for c in box.called("cc-slack post") if "#approvals" in c["argv"]]
-        self.assertEqual(len(cards), 1)
+        cards = [c["argv"] for c in box.called("cc-notify --approval")]
+        self.assertEqual(len(cards), 1)                     # the 👍 runs the command the card carries
         self.assertIn("mine.service", cards[0][-1])
+        self.assertEqual(cards[0][cards[0].index("--run") + 1], "systemctl --user enable --now mine.service")
 
     def test_a_bare_daemon_restart_is_proved_by_new_pids(self):
         box = self.fake(**{"cc-units daemons-for": (0, "watcher\tbin/restart-watcher\tbin/daemon\n"),
@@ -271,8 +282,10 @@ class Tip(Box):
     def tipbox(self, tip=NEW, commits=()):
         def git(argv):
             sub = argv[1:]
-            if sub[:1] == ["rev-parse"] and sub[1:2] == ["origin/main"]:
+            if sub[:1] == ["rev-parse"] and sub[1:2] == ["refs/remotes/origin/main"]:
                 return 0, tip + "\n"
+            if sub[:1] == ["ls-remote"]:
+                return 0, tip + "\trefs/heads/main\n"
             if sub[:1] == ["rev-list"]:
                 return 0, "\n".join(commits) + "\n"
             if sub[:1] == ["diff"]:
@@ -286,7 +299,7 @@ class Tip(Box):
             return 0, ""
         box = self.fake()
         box.answers.update({"git " + k: git for k in ("rev-parse", "rev-list", "diff", "log", "fetch", "merge",
-                                                      "worktree", "revert", "push", "merge-base")})
+                                                      "worktree", "revert", "push", "merge-base", "ls-remote")})
         box.answers["gh pr comment"] = (0, "")
         return box
 
