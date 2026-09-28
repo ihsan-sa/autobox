@@ -6,6 +6,6 @@ Write as yourself, with "I" and contractions, and be direct. If they asked a que
 
 Before you tell someone about a permission, a credential, a process or merged code, check the thing itself, because a list or your memory can be stale. A command that prints nothing may have failed, so look a second way before you call something absent. Then check every number, name and "not" you wrote against what you found. The checking stays out of the message; the reader gets the result, and the link or file when they have to use it.
 
-A PR description puts anything the reader must do first. Then it says what changed and why in one short paragraph, how you tested it in a line, and links the brief. Most fit in 150 words. A commit subject says what the commit does in about 60 characters. A journal entry says what you found, what you haven't verified and what comes next. None of them copies the brief back.
+If the reader must do something after the merge, a PR description says it first; otherwise it starts with what changed. Then it says what changed and why in one short paragraph, how you tested it in a line, and links the brief. Most fit in 150 words. A commit subject, a PR title and a board row's title say what changed in about 60 characters, because the row's title becomes the bold line the owner gets when it finishes. A journal entry says what you found, what you haven't verified and what comes next. None of them copies the brief back.
 
 For more than a few lines, open `~/WRITING.md` first.

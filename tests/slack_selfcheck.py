@@ -2623,12 +2623,12 @@ def run_selfcheck():
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
         globals()["ensure_channel"] = real_ec
         save_table(TRACKS, {})
-    check("track-thread: opens ONE root in #<repo> — `🧵 `<repo>/<track>` — <title>`, unthreaded, mail=False — records it "
+    check("track-thread: opens ONE root in #<repo> — `🧵 <title> (`<repo>/<track>`)`, unthreaded, mail=False — records it "
           "in TRACKS and prints `<chat> <ts>`; asked again it prints the same and posts nothing; a repo with no channel "
           "the bot is in opens nothing (exit 1, no table entry); a bare repo, no argument, two, or a repo that is not "
           "under ~/dev are usage (2); no "
           "token is 3 — and NOT ONE of them creates a channel",
-          outT[0] == (0, "C-myrepo 7.1") and rootsT == [("C-myrepo", "🧵 `myrepo/t9` — the row title", None, False)]
+          outT[0] == (0, "C-myrepo 7.1") and rootsT == [("C-myrepo", "🧵 the row title (`myrepo/t9`)", None, False)]
           and tt9 == ("C-myrepo", "7.1") and outT[1] == (0, "C-myrepo 7.1")
           and outT[2] == (1, "") and track_thread("nochan/t1") is None
           and [rc for rc, _ in outT[3:]] == [2, 2, 2, 2] and rc_notok == 3 and not madeT)
