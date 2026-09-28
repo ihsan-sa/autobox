@@ -57,7 +57,9 @@
 # (RUNNER_NEEDS below, bwrap by actually running it): a machine that would fail the suite for want of a tool takes none.
 # THE OWNER'S LAPTOP COMES FIRST. The runner also answers busy, and starts nothing, while the machine is on battery
 # (a Mains supply offline, or a Battery discharging; no power_supply info at all counts as on AC, as in a WSL with
-# none) or its 1-minute load is above half its cores. A run it does start is `nice -n 19` and idle-class I/O.
+# none) or its 1-minute load is above a bound: the number in the runner's own ~/.cc-suite-runner/maxload if it holds
+# a positive one (the same way slots reads its own file), else half its cores. A run it does start is `nice -n 19`
+# and idle-class I/O.
 # Both sides bound a run in wall-clock time: the runner stops the suite after CC_SUITES_RUNNER_TIMEOUT (85m) and
 # gives no verdict, and the box stops waiting after CC_SUITES_SPILL_TIMEOUT (90m) and runs the suite itself (76).
 # FINISH HERE. A runner red whose every red is a tool's own selfcheck (`  ✗ cc-foo selfcheck: …`, as many such lines
@@ -248,6 +250,12 @@ runner_slots(){
   local v; v=$(head -1 "$RUNNER_DIR/slots" 2>/dev/null | tr -d '[:space:]')
   if [[ $v =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 32 ]; then echo "$v"; else slots_for "$(nproc 2>/dev/null || echo 2)"; fi
 }
+# The runner's own load bound, from ~/.cc-suite-runner/maxload the same way runner_slots reads slots: a positive
+# number if it holds one, else nothing (runner_unfit then falls back to half the cores).
+runner_maxload(){
+  local v; v=$(head -1 "$RUNNER_DIR/maxload" 2>/dev/null | tr -d '[:space:]')
+  [[ $v =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v v="$v" 'BEGIN { exit !(v > 0) }' && echo "$v"
+}
 # What the suite needs of the machine it runs on; a runner missing one is unfit (what laptop-setup installs).
 RUNNER_NEEDS="git jq python3 tmux flock setsid timeout nice script sqlite3 bwrap"
 runner_missing(){   # the needs this machine lacks, space-separated, or nothing
@@ -271,17 +279,19 @@ runner_unfit(){
     esac
   done
   if [ -n "$dis" ] || { [ -n "$mains" ] && [ -z "$ac" ]; }; then echo "on battery"; return; fi
-  local l1 n; n=$(nproc 2>/dev/null || echo 2)
+  local l1 n mx; n=$(nproc 2>/dev/null || echo 2); mx=$(runner_maxload)
   read -r l1 _ < "${CC_SUITES_LOADAVG:-/proc/loadavg}" 2>/dev/null || return 0
-  awk -v l="$l1" -v n="$n" 'BEGIN { exit !(l + 0 > n / 2) }' && echo "load $l1 on $n cores"
+  awk -v l="$l1" -v n="$n" -v mx="$mx" 'BEGIN { b = (mx != "" ? mx + 0 : n / 2); exit !(l + 0 > b) }' && echo "load $l1 on $n cores"
 }
-# What status adds after its answer, for a person reading `cc-suites status`: `cores=N load=L ac=0|1`. The box parses
-# only the leading `free N`, and ac=1 includes "no power supply info".
+# What status adds after its answer, for a person reading `cc-suites status`: `cores=N slots=N maxload=L load=L ac=0|1`.
+# The box parses only the leading `free N`, and ac=1 includes "no power supply info". maxload is the bound in force:
+# the runner's own file if it set one, else the n/2 default.
 runner_facts(){
-  local l1="?" ac=1
+  local l1="?" ac=1 mx
   read -r l1 _ < "${CC_SUITES_LOADAVG:-/proc/loadavg}" 2>/dev/null || l1="?"
   [ "$(runner_unfit)" != "on battery" ] || ac=0
-  echo "cores=$(nproc 2>/dev/null || echo "?") slots=$(runner_slots) load=$l1 ac=$ac"
+  mx=$(runner_maxload); mx=${mx:-$(awk -v n="$(nproc 2>/dev/null || echo 2)" 'BEGIN { print n / 2 }')}
+  echo "cores=$(nproc 2>/dev/null || echo "?") slots=$(runner_slots) maxload=$mx load=$l1 ac=$ac"
 }
 runner(){
   local -a a pre; local rel tree part changed i slot t rc why lim rp
@@ -556,14 +566,14 @@ EOF
     k "$(b 'grep -q "prio nice=19 io=idle" <<<"$out"')" "…and idle-class I/O"
   else echo "  - no usable ionice here: the idle-I/O case is skipped"; fi
   out=$(bash "$SELF" status 2>&1); rc=$?
-  k "$(b '[ "$rc" = 0 ] && grep -q "answers: free [1-9][0-9]* cores=$(nproc) slots=[0-9]* load=0.00 ac=1\$" <<<"$out"')" "status reads the runner's free slots with its cores, 1-minute load and ac=1, and still says ready"
+  k "$(b '[ "$rc" = 0 ] && grep -q "answers: free [1-9][0-9]* cores=$(nproc) slots=[0-9]* maxload=[0-9.]* load=0.00 ac=1\$" <<<"$out"')" "status reads the runner's free slots with its cores, maxload, 1-minute load and ac=1, and still says ready"
   # THE OWNER'S LAPTOP FIRST: on battery or loaded, the runner answers busy and nothing runs there
   pw(){ mkdir -p "$D/power/$1" && echo "$2" > "$D/power/$1/type" && echo "$4" > "$D/power/$1/$3"; }
   pw AC Mains online 0
   out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
   k "$(b '[ "$rc" = 75 ] && ! grep -q '\''suite ran'\'' <<<"$out"')" "on battery (the Mains supply offline): spill says 75 and nothing ran (got $rc)"
   out=$(bash "$SELF" status 2>&1); rc=$?
-  k "$(b '[ "$rc" = 75 ] && grep -q "busy (on battery) cores=$(nproc) slots=[0-9]* load=0.00 ac=0 " <<<"$out"')" "…and status says the runner is busy on battery, with its cores, load and ac=0"
+  k "$(b '[ "$rc" = 75 ] && grep -q "busy (on battery) cores=$(nproc) slots=[0-9]* maxload=[0-9.]* load=0.00 ac=0 " <<<"$out"')" "…and status says the runner is busy on battery, with its cores, maxload, load and ac=0"
   out=$(cd "$R" && git archive HEAD | SSH_ORIGINAL_COMMAND="run core/tests/selftest.sh $tree all -" bash "$SELF" runner 2>&1); rc=$?
   k "$(b '[ "$rc" = 75 ] && grep -q '\''busy (on battery)'\'' <<<"$out" && ! grep -q '\''suite ran'\'' <<<"$out"')" "…and a run that asks anyway is refused before it starts"
   pw AC Mains online 1; pw BAT0 Battery status Discharging
@@ -575,6 +585,13 @@ EOF
   echo "99.00 99.00 99.00 1/1 1" > "$D/loadavg"
   out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
   k "$(b '[ "$rc" = 75 ] && ! grep -q '\''suite ran'\'' <<<"$out" && grep -q "^load 99.00" <<<"$(runner_unfit)"')" "a 1-minute load above half the cores: busy, 75, nothing ran (got $rc)"
+  # the runner's own maxload file replaces the n/2 default, the same way slots does
+  echo 100 > "$D/runner/maxload"
+  k "$(b '[ -z "$(runner_unfit)" ]')" "…and a maxload file above the current load answers fit, though it is above n/2"
+  out=$(bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "maxload=100 " <<<"$out"')" "…named in status as the bound in force"
+  rm -f "$D/runner/maxload"
+  k "$(b '[ -n "$(runner_unfit)" ]')" "…and with the file gone the n/2 default answers busy again"
   echo "0.00 0.00 0.00 1/1 1" > "$D/loadavg"
   # WALL-CLOCK BOUNDS. The runner stops a suite past its limit and gives no verdict; the box then runs it here
   touch "$R/HANG"; SECONDS=0

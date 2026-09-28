@@ -1389,6 +1389,45 @@ def run():
         srv.close()
         os.unlink(r.SLACKSOCK)
 
+    # A SLOW ROUTING ANSWER STILL REACHES THE SENDER. On 2026-09-25 a 28 s vetting outran the 25 s wait and the
+    # sender got "Received…" instead of the hold notice. The wait must outlast the slowest vetting seen and the
+    # vetting read's own timeout, and stay under the ~100 s Cloudflare gives an origin.
+    k(28 < r.ROUTE_WAIT and vetting.TIMEOUT <= r.ROUTE_WAIT < 100,
+      "the routing wait (%ss) outlasts a 28 s vetting and the vetting read's %ss, and stays under Cloudflare's "
+      "100 s" % (r.ROUTE_WAIT, vetting.TIMEOUT))
+    with Box(allow=allow, MAIL_RATE=500) as b:
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(r.SLACKSOCK)
+        srv.listen(4)
+        HOLD = "Your mail is held until someone looks at it."
+
+        def slow_daemon():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                c.recv(65536)
+                time.sleep(0.6)             # the vetting, scaled down: see the two waits below
+                try:
+                    c.sendall(json.dumps({"ok": True, "routed": True, "reply": HOLD}).encode() + b"\n")
+                except OSError:
+                    pass
+                c.close()
+        threading.Thread(target=slow_daemon, daemon=True).start()
+        saved_wait = r.ROUTE_WAIT
+        try:
+            r.ROUTE_WAIT = 2
+            k(b.post(eml())[1]["reply"] == HOLD,
+              "a routing answer that comes late but inside the wait is what the sender hears — the hold notice")
+            r.ROUTE_WAIT = 0.2
+            k(b.post(eml())[1]["reply"].startswith("Received. It is in the queue as "),
+              "…and one that outruns the wait falls to the generic ack, which is why the wait needs headroom")
+        finally:
+            r.ROUTE_WAIT = saved_wait
+            srv.close()
+            os.unlink(r.SLACKSOCK)
+
     # ---------------------------------------------------------------- 16. the vetting step
     # Every case builds its own world: a store, a conversation directory, a day-count file, the box-side files
     # a workspace is judged against, and — where an attachment is involved — a FAKE BOUNDARY, a script standing
@@ -2296,6 +2335,36 @@ def run():
         k(router.load_conv(refused["id"])["message_ids"] == [MID],
           "…and an id nothing was ever sent with does not join the conversation")
 
+        # (h) EVERY RECIPIENT REFUSED IS NOT A SEND (2026-09-25: three replies Cloudflare refused for everyone
+        # were logged `sent`, kept, and threaded). Its own conversation; the partial case is (g) above.
+        fresh()
+        nobody = conv()
+        with FakeWorker({"ok": True, "sent": [],
+                         "failed": [{"to": a, "error": "destination address not verified"}
+                                    for a in ("friend@allowed.example", "colleague@allowed.example",
+                                              "watcher@allowed.example")]}) as w:
+            note = outbound.send(conf(w), "C-mem", "1700.1", ts="1700.1", text="done")
+        k(len(w.calls) == 1 and "not mailed" in note and "friend@allowed.example" in note
+          and "not verified" in note and "2 others" in note,
+          "a reply Cloudflare refused for every recipient says in the thread that it was not mailed: %r" % note)
+        k(router.load_conv(nobody["id"])["message_ids"] == [MID],
+          "…and its Message-ID does not join the conversation")
+        k(not os.path.isdir(outbound.SENTDIR) or not os.listdir(outbound.SENTDIR),
+          "…and it leaves no copy in the sent store")
+        k([ln for ln in logged() if "not sent" in ln and "refused every recipient" in ln]
+          and not [ln for ln in logged() if ": sent from=" in ln],
+          "…and out.log says it was refused, never `sent`")
+        # …while (g)'s partial refusal still counts as a send for the one it reached
+        fresh()
+        some = conv()
+        with FakeWorker({"ok": True, "sent": ["friend@allowed.example"],
+                         "failed": [{"to": "watcher@allowed.example", "error": "not verified"},
+                                    {"to": "colleague@allowed.example", "error": "not verified"}]}) as w:
+            note = outbound.send(conf(w), "C-mem", "1700.1", ts="1700.1", text="done")
+        k("not mailed" not in note and len(router.load_conv(some["id"])["message_ids"]) == 2
+          and len(os.listdir(outbound.SENTDIR)) == 1 and [ln for ln in logged() if ": sent from=" in ln],
+          "…but a reply that reached one recipient is still a send: logged, kept and threaded")
+
     # ------------------------------------------------ 18. the Worker's send half (what the box may ask of it)
     v = send_verdicts([
         {"name": "ok", "json": {"from": "mem@box.example", "to": ["a@x.example", "b@x.example"],
@@ -2418,6 +2487,19 @@ def run():
               "…and a store that refuses the copy answers \"\" and says so in out.log, raising nothing")
         finally:
             outbound.SENTDIR = saved_sent
+
+        # (a2) A SUBJECT WITH A LINE BREAK is refused before the caps are charged — build() raised on it after
+        # caps() had taken a slot (2026-09-27). One slot an hour: the refusal must not use it up.
+        cold_fresh()
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold_conf(w, MAIL_OUT_PER_HOUR=1), ALLOWED, "one\r\nBcc: x@evil.example",
+                                        "text")
+            k(not ok and "line break" in line and not w.calls
+              and [ln for ln in cold_log() if "cold: not sent" in ln and "line break" in ln],
+              "a subject with CR/LF in it is refused in one line, raising nothing and sending nothing: %r" % line)
+            ok, line = outbound.send_to(cold_conf(w, MAIL_OUT_PER_HOUR=1), ALLOWED, "one line", "text")
+            k(ok and len(w.calls) == 1,
+              "…and it charged no rate: the next mail still has the hour's one slot: %r" % line)
 
         # (b) THE REFUSAL. The list is the whole of what keeps this from being a relay, so the address is
         # checked BEFORE the wire and a mail nobody meant is a line rather than a POST somebody has to notice.

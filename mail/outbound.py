@@ -81,7 +81,8 @@ THE WIRE, which the `fetch` half of core/mail/inbound-worker.js is written again
   200 {"ok": true,  "sent": [...], "failed": [{"to":…, "error":…}, ...]}
   400/401/403 {"ok": false, "error": "…"}   a malformed call, a wrong secret, a From that is not on the domain
 `failed` is Cloudflare's own refusal — an unverified destination address, a daily limit — and it is shown in the
-thread and logged. It is never a silent drop.
+thread and logged. It is never a silent drop. A mail Cloudflare refused for EVERY recipient did not go: it is
+logged `not sent`, keeps no copy and threads nothing, on both paths; one that reached anybody is a send.
 
 CONFIG, all of it in ~/.cc/config, read by cc-slack and handed here as a dict:
       MAIL_SEND_URL      the worker's send path, https://<worker>/send. Unset = sending is off
@@ -849,6 +850,18 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
     if not ok:
         log("%s: not sent — %s" % (rec.get("id"), err))
         return "📪 not mailed to the sender: %s. The reply is here." % err
+    # EVERY RECIPIENT REFUSED IS A MAIL THAT DID NOT GO: "when every recipient is refused, log it as refused,
+    # keep no sent copy, do not add the Message-ID to the conversation, and return failure" (the brief,
+    # 2026-09-27 — three replies on 09-25 were logged `sent`, kept and threaded, and nobody got them). send_to()
+    # below reads the same `failed` list the same way.
+    refused = {_norm(f.get("to")) for f in failed}
+    if failed and not [a for a in rcpts if _norm(a) not in refused]:
+        one = failed[0]
+        log("%s: not sent — Cloudflare refused every recipient: %s — %s" % (
+            rec.get("id"), clip(one.get("to")), clip(one.get("error"))))
+        return "📪 not mailed: Cloudflare would not deliver to %s: %s%s. The reply is here." % (
+            clip(one.get("to")), clip(one.get("error")),
+            " (nor to %d other%s)" % (len(failed) - 1, "" if len(failed) == 2 else "s") if len(failed) > 1 else "")
     # THE ID GOES IN THE CONVERSATION, and only after the mail is away: an id nothing was ever sent with would
     # thread a stranger's reply onto this conversation. save_conv re-reads and re-writes both indexes under its
     # own lock, so the record is loaded again here rather than reusing the one above.
@@ -993,6 +1006,11 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
         return refuse("nothing to send: the mail has no text and no file")
     if pics and not html:
         return refuse("images go inside an HTML body, and there is none")
+    # A header cannot carry a line break, and build() raises on one — after caps() below has charged the rate,
+    # so a bad subject cost a slot and a traceback (the brief, 2026-09-27: "validate before charging, and
+    # refuse in one line like the other refusals").
+    if len(subject.splitlines()) > 1:     # CR, LF and every other break str.splitlines knows; build() refuses them all
+        return refuse("the subject has a line break in it, which a mail header cannot carry — nothing sent")
     if len(html) > HTMLMAX:
         return refuse("the HTML body is over %d KiB — nothing sent" % (HTMLMAX // 1024))
     odd = [p for p in pics if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.(png|jpe?g|gif)", os.path.basename(p), re.I)]

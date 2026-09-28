@@ -288,7 +288,11 @@ RATE_WINDOW = 3600
 # The daemon's own socket (cc-slack). It is how a stored mail reaches the session it is for without a second
 # Slack connection: this process holds no token and makes no Slack call of its own — it hands over an id.
 SLACKSOCK = os.path.join(os.environ.get("CC_SLACK_DIR") or os.path.join(H, ".cc", "slack"), "sock")
-ROUTE_WAIT = 25         # seconds to wait for the routing answer, which rides inside the worker's own event
+# Seconds to wait for the routing answer, which rides inside the worker's own event. It has to outlast the
+# slowest vetting, or the sender gets "Received…" instead of the hold notice routing decided on: 25 was shorter
+# than a 28 s vetting on 2026-09-25, and the vetting read may take vetting.TIMEOUT (60). It has to stay under
+# the ~100 s Cloudflare waits on an origin before it answers 524 in front of us, which the worker retries.
+ROUTE_WAIT = 75
 
 # A method result that means the mail failed its check. `none` (no policy published), `neutral` and `temperror`
 # are not failures and must not be treated as one — a temporary DNS error at Cloudflare would otherwise drop a
@@ -727,12 +731,12 @@ def routed(mail_id):
     return answer.get("reply") or "", "yes" if answer.get("routed") else "nowhere"
 
 
-def daemon(req, timeout=ROUTE_WAIT):
+def daemon(req, timeout=None):
     """One request on cc-slack's owner socket (the member socket, inside a workspace), one JSON answer back.
     Raises on no daemon, a timeout or an answer that is not JSON — each caller says what that costs in its
-    own words."""
+    own words. `timeout` defaults to ROUTE_WAIT, read at the call."""
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    c.settimeout(timeout)
+    c.settimeout(ROUTE_WAIT if timeout is None else timeout)
     try:
         c.connect(SLACKSOCK)
         c.sendall((json.dumps(req) + "\n").encode())
