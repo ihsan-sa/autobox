@@ -10,10 +10,13 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
            the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set).
            Every one inside an admission slot and a transient scope (admission.py). Timing runs only while the box
            is not loaded. No bwrap on this machine makes a sandboxed class unrunnable, never a host run.
-  laptop   static and hermetic only: the tree goes over ssh (LANDER_LAPTOP = the ssh destination) to `lander
-           job-serve` there, which unpacks it into a fresh directory with a fresh HOME per job, runs it, and removes
-           both. cc-suites' runner keeps one HOME across runs; this does not. The laptop's forced command must name
-           `lander job-serve` before this route can answer; until then it is unrunnable ("laptop refused").
+  laptop   static and hermetic only, over cc-suites' own transport: its key, the destination and the pinned host key
+           in ~/.cc/suites (CC_SUITES_DIR: id_ed25519, remote, known_hosts, StrictHostKeyChecking=yes), so the laptop
+           is configured exactly when cc-suites' runner is, and a destination known_hosts does not name is refused
+           before ssh starts. The tree goes to the runner's `job` form (`cc-suites runner`, the key's forced command),
+           which unpacks it into a fresh directory with a fresh HOME per job, proves it by write-tree, runs it and
+           removes both; `lander job-serve` is the same end in Python. Busy, on battery, unfit or not answering is
+           unrunnable there, never red, and judge() then runs the check on the box.
   member   `cc-sandbox member <h> <t> --tree <head> -- env … /bin/sh -c <run>`, the workspace's own boundary (B5).
 
 THE STATUS. passed: exit 0 and no `N failed` with N > 0 in the output (a suite that says "1 failed" failed whatever
@@ -222,14 +225,42 @@ def _member_argv(check, head, cwd, where, env_extra):
     return argv, head, clean_env(), "member"
 
 
+def _suites_dir() -> str:
+    return os.environ.get("CC_SUITES_DIR") or os.path.expanduser("~/.cc/suites")
+
+
+def laptop_dest() -> str:
+    """cc-suites' runner (user@host) when its key, destination and pinned host key are all there, else ''."""
+    d = _suites_dir()
+    try:
+        with open(os.path.join(d, "remote")) as f:
+            dest = "".join(f.readline().split())
+    except OSError:
+        return ""
+    ok = all(os.path.isfile(p) and os.path.getsize(p) for p in (os.path.join(d, "id_ed25519"),
+                                                                 os.path.join(d, "known_hosts")))
+    return dest if ok and re.fullmatch(r"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+", dest) else ""
+
+
 def laptop_argv(check, tree, cwd):
-    dest = os.environ.get("LANDER_LAPTOP", "")
+    dest = laptop_dest()
     if not dest:
-        raise Unrunnable("no laptop is configured (LANDER_LAPTOP)")
+        raise Unrunnable(f"no laptop is configured (cc-suites: {_suites_dir()})")
     if check.klass not in (T.STATIC, T.HERMETIC):
         raise Unrunnable(f"a {check.klass} check does not leave the box")
+    d = _suites_dir()
+    kh, host = os.path.join(d, "known_hosts"), dest.split("@", 1)[1]
+    with open(kh) as f:
+        pinned = {h for ln in f if ln.strip() and not ln.startswith("#") for h in ln.split()[0].split(",")}
+    if host not in pinned:
+        raise Unrunnable(f"the laptop {host} has no pinned host key in {kh}")
     b = lambda s: base64.b64encode(s.encode()).decode() or "-"   # noqa: E731
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", dest,
+    # cc-suites xport_argv's options, so this is the path the owner approved and no other
+    return ["ssh", "-F", "/dev/null", "-i", os.path.join(d, "id_ed25519"), "-o", "IdentitiesOnly=yes",
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=4", "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={kh}",
+            "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ClearAllForwardings=yes",
+            "-o", "KexAlgorithms=curve25519-sha256", "-a", "-x", "-T", "-C", dest, "--",
             "job", check.name, tree, str(check.cap), b(check.run), b(cwd)]
 
 
@@ -381,7 +412,22 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
     kw = {**run_kw, "base_tree": base_tree}
 
     def go(tree, alone=False, base=False, keep=True):
+        # once the box has taken a check over, every later run of it (alone, base) stays on the box: a laptop pass
+        # must never overturn a box red
+        nonlocal where
         r = runner(check, tree, where, alone=alone, **kw)
+        # a laptop that cannot take it (busy, on battery, gone) is no answer: the box runs it, as cc-suites spill did
+        if where == "laptop" and r.status == T.UNRUNNABLE and "box" in check.where:
+            why = r.extra.get("why", "")
+            r = runner(check, tree, "box", alone=alone, **kw)
+            r.extra["laptop"] = why
+            where = "box"
+        # a laptop red is not final: its python and shellcheck are older than the box's, so the box says it again
+        elif where == "laptop" and r.status == T.FAILED and "box" in check.where:
+            why = r.extra.get("why", "")
+            r = runner(check, tree, "box", alone=alone, **kw)
+            r.extra["laptop_red"] = why
+            where = "box"
         if keep and store is not None and r.status != T.UNRUNNABLE:
             store.put_base(r) if base else store.put(job_key, r)
         return r
@@ -432,8 +478,7 @@ def choose_where(check: T.Check, member: str = "") -> str:
     """member:<h> for a member's landing; the laptop when the box is loaded and the check may go; else box."""
     if member:
         return f"member:{member}"
-    if "laptop" in check.where and os.environ.get("LANDER_LAPTOP") and check.klass in (T.STATIC, T.HERMETIC) \
-            and A.loaded():
+    if "laptop" in check.where and check.klass in (T.STATIC, T.HERMETIC) and A.loaded() and laptop_dest():
         return "laptop"
     return "box"
 
@@ -448,7 +493,7 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
     rows = REC.quarantine_rows(quarantine_text)
     record = (lambda r, text: REC.record_red(scope, r, text, pr)) if (record_reds and scope) else None
     base_m = M.load(repo_root, base_tree, fallback=fallback, strict=False) if base_tree else None
-    out = {}
+    out, laptop_gone = {}, False
     for name in plan.checks:
         if only and name not in only:
             continue
@@ -459,11 +504,15 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
         own = [p for p in c.paths if "*" not in p] + [m.cwd.get(name, "") + M.run_file(c.run)]
         security = any(M.match(m.policy.gate_first, p) for p in own if p)
         touched = any(m.owns(name, f) for f in files) if name in m.checks else False
-        out[name] = judge(c, head_tree, base_tree, choose_where(c, member), runner=runner, store=store,
+        where = choose_where(c, member)
+        if laptop_gone and where == "laptop" and "box" in c.where:
+            where = "box"   # the laptop gave no answer once in this plan: do not wait out its timeout per check
+        out[name] = judge(c, head_tree, base_tree, where, runner=runner, store=store,
                           job_key=job_key, security=security, touched=touched, quarantine=rows, record=record,
                           on_base=name == M.BUILTIN or runs_on_base(repo_root, base_tree, base_m, name),
                           repo_root=repo_root, cwd=m.cwd.get(name, ""), changed=files,
                           label=".".join(job_key.rsplit("-", 1)) if job_key else "lander.0")
+        laptop_gone = laptop_gone or any("laptop" in r.extra for r in out[name].results)
     return out
 
 

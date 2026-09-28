@@ -56,7 +56,9 @@ class Env(unittest.TestCase):
         # and the tree vanished under load and a case read an empty log (rc 1, no lines) or a failed `git init`.
         tmpdir = os.path.join(self.tmp, "t")
         os.mkdir(tmpdir)
-        p = mock.patch.dict(os.environ, {"LANDER_STATE": self.state, "LANDER_SCOPE": "0", "TMPDIR": tmpdir})
+        # CC_SUITES_DIR: no laptop unless a case makes one (this box's own ~/.cc/suites would route a loaded run there)
+        p = mock.patch.dict(os.environ, {"LANDER_STATE": self.state, "LANDER_SCOPE": "0", "TMPDIR": tmpdir,
+                                         "CC_SUITES_DIR": os.path.join(self.tmp, "suites")})
         p.start()
         self.addCleanup(p.stop)
         self.repo = os.path.join(self.tmp, "repo")
@@ -206,35 +208,107 @@ class HostAndRunners(Env):
         self.assertEqual((wd, how), ("/t/head", "member"))
         self.assertEqual(RUN._member_argv(chk(), "/h", "", "member:ann", {})[0][3], "")
 
+    def laptop(self, host="runner", pinned="runner"):
+        # cc-suites' transport as laptop-setup leaves it: a key, the destination, and a host key pinned for `pinned`
+        d = os.path.join(self.tmp, "suites")
+        os.makedirs(d, exist_ok=True)
+        write(d, {"id_ed25519": "k\n", "remote": f"ccsuite@{host}\n",
+                  "known_hosts": f"{pinned} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIxx\n"})
+        return d
+
+    def shim(self, name, body):
+        d = os.path.join(self.tmp, name)
+        os.mkdir(d)
+        with open(os.path.join(d, "ssh"), "w") as f:
+            f.write("#!/bin/bash\n" + body)
+        os.chmod(os.path.join(d, "ssh"), 0o755)
+        return {"PATH": d + ":" + os.environ["PATH"]}
+
+    def forced(self, power):
+        # the stub ssh: checks the box passed the key and the pinned host, then runs the key's forced command here
+        return f'''for a in "$@"; do case "$a" in -i) k=1;; StrictHostKeyChecking=yes) s=1;; esac; done
+[ "$k$s" = 11 ] || {{ echo "ssh: no key or no pinned host"; exit 255; }}
+while [ "$1" != -- ]; do shift; done; shift
+export SSH_ORIGINAL_COMMAND="$*" CC_SUITES_RUNNER_DIR={self.tmp}/runner CC_SUITES_POWER_DIR={power}
+export CC_SUITES_LOADAVG={self.tmp}/loadavg
+exec bash {RUN.BIN}/cc-suites runner
+'''
+
+    def test_the_laptop_goes_by_cc_suites_key_and_pinned_host_and_refuses_an_unpinned_one(self):
+        d = self.laptop()
+        argv = RUN.laptop_argv(chk(), self.tree, "core/")
+        dest = argv.index("ccsuite@runner")
+        self.assertEqual(argv[argv.index("-i") + 1], os.path.join(d, "id_ed25519"))
+        for o in ("StrictHostKeyChecking=yes", f"UserKnownHostsFile={d}/known_hosts", "IdentitiesOnly=yes",
+                  "GlobalKnownHostsFile=/dev/null", "BatchMode=yes"):
+            self.assertIn(o, argv)
+        self.assertEqual(argv[dest + 1:dest + 4], ["--", "job", "c"])
+        self.laptop(host="elsewhere")        # a destination whose host key nobody pinned: no ssh at all
+        with self.assertRaisesRegex(RUN.Unrunnable, "no pinned host key"):
+            RUN.laptop_argv(chk(), self.tree, "")
+        os.remove(os.path.join(d, "known_hosts"))
+        self.assertEqual(RUN.laptop_dest(), "")
+        with mock.patch.object(A, "loaded", return_value=True):
+            self.assertEqual(RUN.choose_where(chk(where=["box", "laptop"])), "box")
+
     def test_the_laptop_round_trip_gives_every_job_a_fresh_home(self):
-        shim = os.path.join(self.tmp, "shim")
-        os.mkdir(shim)
-        with open(os.path.join(shim, "ssh"), "w") as f:   # drops ssh's options and destination, runs job-serve here
-            f.write(f'#!/bin/sh\nwhile [ "$1" = -o ]; do shift 2; done; shift\n'
-                    f'exec python3 -P {CLI} job-serve "$@"\n')
-        os.chmod(os.path.join(shim, "ssh"), 0o755)
-        env = {"LANDER_LAPTOP": "runner", "PATH": shim + ":" + os.environ["PATH"]}
+        self.laptop()
+        write(self.tmp, {"loadavg": "0.00 0.00 0.00 1/1 1\n"})
+        env = self.shim("shim", self.forced(os.path.join(self.tmp, "nopower")))
         once = 'test ! -e "$HOME/seen" && touch "$HOME/seen" && test -x core/bin/tool && echo "0 failed"'
         with mock.patch.dict(os.environ, env):
             a = self.run_(chk(run=once, where=["box", "laptop"]), where="laptop")
             b = self.run_(chk(run=once, where=["box", "laptop"]), where="laptop")
             red = self.run_(chk(run="echo FAIL x; exit 1", where=["laptop"]), where="laptop")
+            capped = self.run_(chk(run="sleep 30", where=["laptop"], cap=1), where="laptop")
             host = self.run_(chk(run="true", klass=T.HOST, where=["laptop"]), where="laptop")
         self.assertEqual((a.status, b.status), (T.PASSED, T.PASSED), (a.extra, b.extra))
         self.assertEqual(red.status, T.FAILED, red.extra)
+        self.assertEqual(capped.status, T.UNRUNNABLE, capped.extra)
         self.assertEqual(host.status, T.UNRUNNABLE)
-        with mock.patch.dict(os.environ, {"LANDER_LAPTOP": ""}):
-            self.assertEqual(self.run_(chk(where=["laptop"]), where="laptop").status, T.UNRUNNABLE)
+        self.assertEqual([f for f in os.listdir(os.path.join(self.tmp, "runner")) if f.startswith("job.")], [])
+        os.remove(os.path.join(self.tmp, "suites", "remote"))
+        self.assertEqual(self.run_(chk(where=["laptop"]), where="laptop").status, T.UNRUNNABLE)
 
-    def test_a_laptop_that_refuses_is_unrunnable(self):
-        shim = os.path.join(self.tmp, "shim2")
-        os.mkdir(shim)
-        with open(os.path.join(shim, "ssh"), "w") as f:
-            f.write('#!/bin/sh\ncat >/dev/null; echo "cc-suite-runner: refused: job"; exit 2\n')
-        os.chmod(os.path.join(shim, "ssh"), 0o755)
-        with mock.patch.dict(os.environ, {"LANDER_LAPTOP": "r", "PATH": shim + ":" + os.environ["PATH"]}):
-            r = self.run_(chk(where=["laptop"]), where="laptop")
-        self.assertEqual(r.status, T.UNRUNNABLE)
+    def test_a_laptop_on_battery_or_busy_is_unrunnable_and_the_box_runs_it(self):
+        self.laptop()
+        power = os.path.join(self.tmp, "power")
+        write(power, {"AC/type": "Mains\n", "AC/online": "0\n"})
+        write(self.tmp, {"loadavg": "0.00 0.00 0.00 1/1 1\n"})
+        env = self.shim("shim2", self.forced(power))
+        c = chk(run="echo ran", where=["box", "laptop"])
+        with mock.patch.dict(os.environ, env):
+            r = self.run_(c, where="laptop")
+            self.assertEqual(r.status, T.UNRUNNABLE, r.extra)
+            self.assertIn("busy (on battery)", r.extra["why"])
+            write(power, {"AC/online": "1\n"})
+            write(self.tmp, {"loadavg": "999.00 0.00 0.00 1/1 1\n"})
+            r = self.run_(c, where="laptop")
+            self.assertEqual(r.status, T.UNRUNNABLE, r.extra)
+            self.assertIn("busy (load 999.00", r.extra["why"])
+            seen = []
+
+            def runner(check, tree, where, **kw):
+                seen.append(where)
+                return self.run_(check, where=where) if where == "laptop" else \
+                    T.Result(check=check.name, tree=tree, status=T.PASSED, runner="box")
+            # judge() takes that as no answer and runs it on the box: neither red nor held
+            o = RUN.judge(c, self.tree, "", "laptop", runner=runner)
+        self.assertEqual((o.status, seen), (T.PASSED, ["laptop", "box"]))
+        self.assertIn("busy", o.results[0].extra["laptop"])
+        o = RUN.judge(chk(where=["laptop"]), self.tree, "", "laptop",
+                      runner=lambda *a, **k: T.Result(check="c", tree="t", status=T.UNRUNNABLE, extra={"why": "x"}))
+        self.assertEqual(o.status, T.UNRUNNABLE)             # a check the box may not run stays unrunnable
+
+    def test_the_runner_job_refuses_what_is_not_a_job(self):
+        t = "a" * 40
+        for cmd in ("job ../x " + t + " 5 dHJ1ZQ== -", "job c nottree 5 dHJ1ZQ== -", "job c " + t + " 5 dHJ1ZQ== Li4v",
+                    "job c " + t + " 5 dHJ1ZQ== Lw==", "job c " + t + " x dHJ1ZQ== -", "job c " + t + " 5"):
+            p = subprocess.run(["bash", f"{RUN.BIN}/cc-suites", "runner"], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, env={**os.environ, "SSH_ORIGINAL_COMMAND": cmd,
+                                                              "CC_SUITES_RUNNER_DIR": self.tmp + "/r"})
+            self.assertEqual(p.returncode, 2, (cmd, p.stdout))
+            self.assertIn("refused", p.stdout)
 
     def test_job_serve_refuses_what_is_not_a_job(self):
         for cmd in ("run x", "job ../x " + "a" * 40 + " 5 dHJ1ZQ== -", "job c nottree 5 dHJ1ZQ== -",
@@ -415,6 +489,32 @@ class Judge(unittest.TestCase):
 
     H, B = "h" * 40, "b" * 40
 
+    def test_a_laptop_red_is_said_again_by_the_box(self):
+        seen = []
+
+        def run(check, tree, where, alone=False, **kw):
+            seen.append(where)
+            st = T.FAILED if where == "laptop" else T.PASSED
+            return T.Result(check=check.name, tree=tree, status=st, extra={"why": where})
+        o = RUN.judge(chk(where=["box", "laptop"]), self.H, self.B, "laptop", runner=run)
+        self.assertEqual((o.status, seen), (T.PASSED, ["laptop", "box"]))
+        self.assertEqual(o.results[0].extra["laptop_red"], "laptop")
+        # a laptop-only check has no box to ask, so its red stands
+        seen.clear()
+        o = RUN.judge(chk(where=["laptop"]), self.H, "", "laptop", runner=run, on_base=False)
+        self.assertEqual((o.status, seen), (T.FAILED, ["laptop"]))
+
+    def test_a_box_red_under_load_is_never_overturned_by_the_laptop(self):
+        seen = []
+
+        def run(check, tree, where, alone=False, **kw):
+            seen.append((where, alone))
+            st = T.PASSED if (where == "laptop" and alone) else T.FAILED
+            return T.Result(check=check.name, tree=tree, status=st, extra={"why": where, "loaded": True})
+        o = RUN.judge(chk(where=["box", "laptop"]), self.H, "", "laptop", runner=run, on_base=False)
+        self.assertEqual(o.status, T.FAILED)
+        self.assertNotIn(("laptop", True), seen)
+
     def test_green_runs_once(self):
         run, calls = self.runner({self.H: T.PASSED})
         self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run).status, T.PASSED)
@@ -539,13 +639,33 @@ class Judge(unittest.TestCase):
             outs = RUN.run_plan(".", m, plan, ["core/bin/c"], self.H, self.B, runner=run, quarantine_text=q)
             self.assertEqual(outs["c"].status, T.FAILED)             # the change touches the check
 
+    def test_after_one_laptop_no_answer_the_rest_of_the_plan_goes_to_the_box(self):
+        m = M.Manifest(checks={n: chk(name=n, where=["box", "laptop"]) for n in ("a", "b")}, cwd={"a": "", "b": ""})
+        seen = []
+
+        def run(check, tree, where, alone=False, **kw):
+            seen.append(where)
+            st = T.UNRUNNABLE if where == "laptop" else T.PASSED
+            return T.Result(check=check.name, tree=tree, status=st, extra={"why": "no answer"})
+        with mock.patch.object(A, "loaded", return_value=True), \
+                mock.patch.object(RUN, "laptop_dest", return_value="ccsuite@r"):
+            outs = RUN.run_plan(".", m, T.Plan(checks=["a", "b"]), ["README.md"], self.H, "", runner=run)
+        self.assertEqual(seen, ["laptop", "box", "box"])
+        self.assertEqual([outs[n].status for n in ("a", "b")], [T.PASSED, T.PASSED])
+
     def test_member_and_laptop_routing(self):
         c = chk(where=["box", "laptop"])
         self.assertEqual(RUN.choose_where(c, "ann"), "member:ann")
-        with mock.patch.dict(os.environ, {"LANDER_LAPTOP": "r"}), mock.patch.object(A, "loaded", return_value=True):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write(d.name, {"id_ed25519": "k\n", "remote": "ccsuite@r\n", "known_hosts": "r ssh-ed25519 AAAA\n"})
+        p = mock.patch.dict(os.environ, {"CC_SUITES_DIR": d.name})
+        p.start()
+        self.addCleanup(p.stop)
+        with mock.patch.object(A, "loaded", return_value=True):
             self.assertEqual(RUN.choose_where(c), "laptop")
             self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "box")
-        with mock.patch.dict(os.environ, {"LANDER_LAPTOP": "r"}), mock.patch.object(A, "loaded", return_value=False):
+        with mock.patch.object(A, "loaded", return_value=False):
             self.assertEqual(RUN.choose_where(c), "box")
 
 
