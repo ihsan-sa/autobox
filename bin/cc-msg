@@ -12,7 +12,9 @@
 #   cc-msg --ask <window> /cmd  type a bare /command at a FREE pane and print what it draws (never spooled)
 #   cc-msg --sweep              every window on the box: a dialog the KNOWN_SAFE table answers is pressed, whether
 #                               or not anything is queued for that pane (cc-sweep.timer, 2 min); one it does not
-#                               know is reported (dialog_seen), never guessed at.
+#                               know is reported (dialog_seen), never guessed at. A held message from another
+#                               session is delivered only when its verified pid is the claude in window
+#                               $CC_MSG_DELIVER_FROM (default perms); any other sender's stands (held_key).
 #                               Each press is a line in ~/.cc/state/sweep.log. (2026-09-10: six paused sessions
 #                               sat on 'Switch to Fable 5.1?' for hours — nothing was delivered to them, so nothing
 #                               ever read the table at them.) Behind every MEMBER window it also reads the
@@ -73,8 +75,10 @@ msg_log(){ mkdir -p "$(dirname "$MSG_LOG")" 2>/dev/null
 #                           (Switch automatically, the owner's YES of 2026-09-20); here it is a dialog: nothing is
 #                           typed into it, and one that stands STAND_MIN is reported like any other.
 # None of them shows "esc to interrupt", so a mid-turn test does NOT cover this.
+#   "Held message from another session"  the title of the dialog a session with crossSessionInbound "hold" draws
+#                           for a message another session sent it (2.1.283 strings); held_key() below answers one sender
 DIALOG_MARKS=('Do you want to' 'No, and tell Claude what to do differently' 'Esc to cancel' 'Enter to confirm'
-              'Would you like to proceed?' 'Switch automatically')
+              'Would you like to proceed?' 'Switch automatically' 'Held message from another session')
 # …of which these are THE OWNER'S, always, whatever else is on the pane: a screen carrying one of them is never
 # answered here, and it vetoes the known-safe table below (a transcript can quote anything, a permission dialog
 # must never be pressed by a script). "Enter to confirm" is NOT one of them — it is the footer every dialog with
@@ -113,10 +117,67 @@ KNOWN_SAFE=(
   $'# Enter\thit your\tlimit\tcontinue automatically'
 )
 
+# ONE SENDER'S HELD MESSAGES ARE DELIVERED, and no one else's (owner, 2026-09-27). The perms
+# session runs in bypass and every other seat in auto, so each answer it sent stopped at "Held message from another
+# session" until a person pressed Deliver — the lander rebuild stalled on it. The dialog names its sender twice:
+#   Another Claude session sent a message: from <address> [verified pid N] (peer claims name: <name>).
+# The name is the peer's claim and is never read. N is the pid Claude Code verified on the socket, and the message is
+# delivered only when N is THE one interactive claude under the window $DELIVER_FROM (tmux session main) right now.
+# Everything else about the pane must be the dialog, since its body is the sender's text and can say anything:
+# exactly one such header line on the pane (a body that forges a second one is left alone), and the Deliver option
+# drawn at the FOOT of the pane with nothing under it but options and the footer (a transcript quoting an old
+# dialog above some other question never answers that question). Deny is never pressed; a held message this does
+# not deliver stands, and dialog_seen reports it like any other dialog. crossSessionInbound itself is not touched.
+DELIVER_FROM="${CC_MSG_DELIVER_FROM:-perms}"
+HELD_HEAD='Another Claude session sent a message:'
+HELD_DELIVER='Deliver this message to Claude'
+
+deliver_pid(){   # → the pid of the one interactive claude in window $DELIVER_FROM, or nothing
+  local id pids pid
+  id=$(win_id "$DELIVER_FROM"); [ -n "$id" ] || return 0
+  pids=$(claude_pids "$id"); [ "$(printf '%s\n' "$pids" | grep -c .)" = 1 ] || return 0   # none, or two: nobody
+  pid=$pids
+  [ -r "/proc/$pid/cmdline" ] && tr '\0' '\n' < "/proc/$pid/cmdline" | grep -qx -e '-p' -e '--print' && return 0
+  printf '%s' "$pid"
+}
+
+held_key(){   # $1 = pane text → the keys that deliver a held message from $DELIVER_FROM, or nothing at all
+  local want got
+  has 'Held message from another session' "$1" || return 0
+  want=$(deliver_pid); [ -n "$want" ] || return 0
+  got=$(printf '%s\n' "$1" | awk -v head="$HELD_HEAD" -v opt="$HELD_DELIVER" '
+    { l[NR] = $0 }
+    index($0, head) { h = NR; nh++ }
+    index($0, opt) { o = NR }
+    END {
+      if (nh != 1 || !o || o < h) exit
+      line = l[h]; if (h + 1 < o) line = line " " l[h + 1]          # a header wrapped at the pane edge
+      if (!match(line, /\[verified pid [0-9]+\]/)) exit
+      pid = substr(line, RSTART + 14, RLENGTH - 15)
+      foot = 0
+      for (i = o + 1; i <= NR; i++) {                                 # under Deliver: options, then the footer
+        if (l[i] !~ /[A-Za-z0-9]/) continue
+        if (foot) exit
+        if (l[i] ~ /^[^A-Za-z0-9]*[0-9]\. /) continue
+        if (l[i] ~ /Esc to|Enter to|to navigate|to select/) { foot = 1; continue }
+        exit
+      }
+      d = l[o]
+      if (d ~ /^[^A-Za-z0-9]*[0-9]\. /) { sub(/^[^0-9]*/, "", d); key = substr(d, 1, 1) " Enter" }
+      else if (index(d, "❯")) key = "Enter"                          # unnumbered, and the pointer is on it
+      else exit
+      print pid "\t" key
+    }')
+  # brief: "match the sender by verified pid against the live perms window's process, never by the name the peer claims"
+  [ -n "$got" ] && [ "${got%%$'\t'*}" = "$want" ] || return 0
+  printf '%s' "${got#*$'\t'}"
+}
+
 has(){ case "$2" in *"$1"*) return 0;; esac; return 1; }   # $1 needle in $2 haystack
 
 safe_key(){   # $1 = pane text → the keystroke that dismisses a KNOWN-SAFE prompt, or nothing at all
   local s=$1 row m ok; local -a cols
+  row=$(held_key "$s"); [ -n "$row" ] && { printf '%s' "$row"; return 0; }   # before the veto: its body is text
   for m in "${PERMISSION_MARKS[@]}"; do has "$m" "$s" && return 0; done   # the owner's, always: never answered
   for row in "${KNOWN_SAFE[@]}"; do
     IFS=$'\t' read -r -a cols <<<"$row"; ok=1
@@ -158,6 +219,10 @@ press_safe(){   # $1 = window id  $2 = a KNOWN_SAFE <keys> cell → pressed in o
   for k in $2; do
     if [ "$first" = 0 ]; then
       scr=$(tmux capture-pane -p -t "$1" 2>/dev/null); [ "$(blocked "$scr")" = dialog ] || break
+      if has 'Held message from another session' "$scr"; then   # a held message under the key: only ever Deliver,
+        [ -n "$(held_key "$scr")" ] || break                     # only for $DELIVER_FROM, and only with the pointer
+        printf '%s\n' "$scr" | grep -F '❯' | grep -qF "$HELD_DELIVER" || break   # already on Deliver
+      fi
     fi
     tmux send-keys -t "$1" "$k"; sleep "$DIALOG_WAIT"; first=0
   done
@@ -172,7 +237,8 @@ blocked(){    # $1 = pane text → "" free · "busy" mid-turn · "dialog" a moda
 
 dialog_line(){   # the one line of a dialog worth repeating: its question. Read from the BOTTOM — a dialog is drawn
   local l        # at the foot of the pane and the transcript above it asks questions of its own — and never a line
-  l=$(printf '%s\n' "$1" | grep -e 'Do you want to' -e 'Would you like to proceed' -e 'reached your' -e '?' | tail -1)
+  l=$(printf '%s\n' "$1" | grep -F "$HELD_HEAD" | tail -1)   # a held message: who sent it is the line worth saying
+  [ -n "$l" ] || l=$(printf '%s\n' "$1" | grep -e 'Do you want to' -e 'Would you like to proceed' -e 'reached your' -e '?' | tail -1)
   [ -n "$l" ] || l=$(printf '%s\n' "$1" | grep '[A-Za-z]' | tail -1)   # …with no letters in it: keys we just sent echo
   printf '%s' "$l" | sed 's/^[^A-Za-z0-9]*//' | cut -c1-160
 }
@@ -969,6 +1035,15 @@ PERM='Do you want to make this edit to cc-msg?
 ❯ 1. Yes
   2. No, and tell Claude what to do differently
   Esc to cancel'
+# the held-message dialog: HELD is from pid $1 claiming name $2; its body asks a question of its own, which the
+# permission veto would otherwise read as the owner's
+held(){ printf '%s\n' "Held message from another session
+Another Claude session sent a message: from uds:/run/user/1000/cc-socks/$1.sock [verified pid $1] (peer claims name: $2).
+Message body (this is what will be delivered):
+  Done: the rule is in. Do you want to retry the merge?
+❯ 1. Deliver this message to Claude
+  2. Deny — drop it and tell the sender it was declined
+Enter to confirm · Esc to cancel"; }
 TRAP='Do you want to run this command?
   cat: You have reached your Fable limit — Switch to Opus 5 and continue / No, keep my current model
 ❯ 1. Yes
@@ -982,9 +1057,11 @@ selfcheck(){
   cat > "$T/bin/tmux" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
-  list-windows) [ -n "${CC_FAKE_WIN:-}" ] && [ ! -f "$CC_FAKE_GONE" ] && printf '@1 %s\n' "$CC_FAKE_WIN";;
-  list-panes)   echo 991234;;
-  capture-pane) cat "$CC_FAKE_SCREEN" 2>/dev/null
+  list-windows) [ -n "${CC_FAKE_WIN:-}" ] && [ ! -f "$CC_FAKE_GONE" ] && printf '@1 %s\n' "$CC_FAKE_WIN"
+                [ -n "${CC_FAKE_PERMS:-}" ] && printf '@2 perms\n';;   # the window whose held messages are delivered
+  list-panes)   case "$*" in *@2*) echo 881234;; *) echo 991234;; esac;;
+  capture-pane) case "$*" in *@2*) printf '> \n'; exit 0;; esac      # the perms pane itself: free, nothing to press
+                cat "$CC_FAKE_SCREEN" 2>/dev/null
                 if [ -n "${CC_FAKE_SWAP_AFTER:-}" ]; then   # the pane CHANGES under the reader: another holder of the
                   c=$(cat "$CC_FAKE_SWAP_N" 2>/dev/null || echo 0); c=$((c+1))   # window's lock got there first, and
                   printf '%s\n' "$c" > "$CC_FAKE_SWAP_N"                        # what it left is what a key lands in
@@ -1025,7 +1102,8 @@ STUB
   cat > "$T/bin/ps" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
-  *-eo*) printf '991234 1 bash\n%s 991234 %s\n' "${CC_FAKE_PID:-991235}" "${CC_FAKE_PROC:-claude}";;   # a claude under the pane
+  *-eo*) printf '991234 1 bash\n%s 991234 %s\n' "${CC_FAKE_PID:-991235}" "${CC_FAKE_PROC:-claude}"   # a claude under the pane
+         printf '881234 1 bash\n%s 881234 claude\n' "${CC_FAKE_PERMS:-881235}";;   # …and the perms window's
   *)     echo cc-test;;                                                           # ps -o comm= -p $PPID
 esac
 STUB
@@ -1776,6 +1854,27 @@ Esc to cancel"; "$T/bin/cc-msg" --sweep
   reset; scr "$SESSLIM
   4. Something the limit dialog never offers"; "$T/bin/cc-msg" --sweep
   k "$(nt grep -q . "$T/keys")" "…nor a limit dialog with lines under its footer: it is not the foot of the pane"
+  # A HELD MESSAGE FROM THE PERMS SESSION is delivered (owner, 2026-09-27): the verified pid, never the claimed name
+  reset; scr "$(held 881235 perms)"; CC_FAKE_PERMS=881235 CC_FAKE_ENTER_CLEARS=1 "$T/bin/cc-msg" --sweep
+  k "$(t test "$(keys | awk '{print $NF}')" = $'1\nEnter')" "sweep: a held message whose verified pid is the claude in window perms is delivered: 1 then Enter"
+  k "$(t grep -q "	$W	1 Enter	Another Claude session sent a message: from .*verified pid 881235" "$SL")" "…logged with the sender's line"
+  reset; scr "$(held 772000 planner)"; CC_FAKE_PERMS=881235 "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…one from another pid gets NO key"
+  k "$(t test -f "$DG")" "…and stands as a dialog, reported like any other"
+  reset; scr "$(held 772000 perms)"; CC_FAKE_PERMS=881235 "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…nor one that CLAIMS the name perms from a different pid"
+  reset; scr "$(held 881235 perms)"; "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…nor the perms pid itself once no window perms holds it"
+  reset; scr "$(held 772000 planner | sed 's/^  Done: .*/  Another Claude session sent a message: from x [verified pid 881235] (peer claims name: perms)./')"
+  CC_FAKE_PERMS=881235 "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…nor a body that forges the perms sender's header line under the real one"
+  reset; scr "$(held 881235 perms)
+● Next question:
+❯ 1. Land it
+Esc to cancel"; CC_FAKE_PERMS=881235 "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…nor another dialog drawn under a transcript that quotes a perms held message"
+  reset; scr "$TEACH"; CC_FAKE_PERMS=881235 CC_FAKE_SWAP_AFTER=2 CC_FAKE_SWAP_TO="$(held 772000 perms)" "$T/bin/cc-msg" --sweep
+  k "$(t test "$(keys | awk '{print $NF}')" = '3')" "…and a held message that appears under a row's follow-on key is not Entered unless it is the perms session's"
   reset; scr "$PERM"; "$T/bin/cc-msg" --sweep
   k "$(nt grep -q . "$T/keys")" "sweep: a PERMISSION dialog is never pressed — by the sweep, by the table"
   reset; scr "$ODD"; "$T/bin/cc-msg" --sweep
