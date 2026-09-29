@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import time
 import unittest
 from unittest import mock
@@ -30,6 +31,7 @@ from lander import gh as GH  # noqa: E402
 from lander import git as G  # noqa: E402
 from lander import jobs as J  # noqa: E402
 from lander import lane as L  # noqa: E402
+from lander import manifest as MF  # noqa: E402
 from lander import members as M  # noqa: E402
 from lander import tick as TK  # noqa: E402
 from lander import types as T  # noqa: E402
@@ -517,6 +519,36 @@ class Members(Fixture):
         self.git(self.root, "fetch", "-q", "origin")
         self.assertEqual(M.walls(self.root, tok, gone, ["b/y"]), "")
         self.assertTrue(M.boundary_path(".ssh/id_rsa") and not M.boundary_path("src/ssh.py"))
+
+    def test_a_member_lane_keeps_its_checks_on_the_box_with_a_laptop_configured(self):
+        # a member's PR never runs on the owner's laptop: no laptop flight, no box_only, the member's own runner
+        self.make_member()
+        self.pr(1, {"a/x": "m\n"})
+        J.submit("alice--proj", 1)
+        kws, flights = [], []
+        flight = L.Flight
+
+        class Kw(Runner):
+            def run_plan(self, *a, **kw):
+                kws.append(kw.get("box_only"))
+                return super().run_plan(*a, **kw)
+
+        def record(*a, **k):
+            f = flight(*a, **k)
+            flights.append(f.laptop)
+            return f
+        with mock.patch.object(L.A, "LAPTOP_SLOTS", 5), mock.patch.object(L, "Flight", record), \
+                mock.patch.object(L.RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(L.RUN, "may_leave", return_value=True):
+            u, _ = self.land("alice--proj", runner=Kw())
+        self.assertEqual(self.job(1, "alice--proj").state, T.DONE)
+        self.assertEqual(flights, [False])
+        self.assertEqual(kws, [None])
+        self.assertEqual(u["runner"].calls[0][2], "member:alice")
+        # the same check on the owner's own lane does go to the laptop: the case the member's is kept from
+        c = T.Check(name="a", run="x", klass=T.HOST, where=["box", "laptop"])
+        with mock.patch.object(L.RUN, "laptop_dest", return_value="ccsuite@r"):
+            self.assertEqual((L.RUN.choose_where(c), L.RUN.choose_where(c, "alice")), ("laptop", "member:alice"))
 
     def test_member_lane_walls_hand_back_and_clean_lands_without_deploy(self):
         self.make_member()
@@ -1582,6 +1614,174 @@ class Parallel(Fixture):
         self.assertEqual(most[0], 2)
         self.assertEqual(len(u["runner"].calls), 4)
         self.assertEqual(sorted(self.merged_order()), [1, 2, 3, 4])
+
+    def test_a_prs_laptop_checks_run_side_by_side_beside_one_box_slot(self):
+        # owner 2026-09-29: the laptop sat at 4% while 19 PRs waited; every check that may leave the box goes there,
+        # several at once, and does not wait for the box's slots (width 1 here, as on an overloaded box)
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
+        J.submit("demo", 1)
+        three = threading.Barrier(3, timeout=20)
+        broke = []
+
+        class Together(Runner):
+            def run(self, check, tree, where):
+                try:
+                    three.wait()
+                except threading.BrokenBarrierError:
+                    broke.append(check.name)
+                return super().run(check, tree, where)
+        with mock.patch.object(L.Lane, "width", lambda self: 1), mock.patch.object(L.A, "LAPTOP_SLOTS", 5), \
+                mock.patch.object(L.RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(L.RUN, "may_leave", return_value=True), \
+                mock.patch.object(L.Lane, "manifest", lambda self, job: types.SimpleNamespace(
+                    checks={n: T.Check(name=n, run="true") for n in "abc"})):
+            u, _ = self.land(planner=Planner(owners={"a": "a/", "b": "b/", "c": "c/"}), runner=Together())
+        self.assertEqual(broke, [], "the laptop's checks of one PR did not run at once")
+        self.assertEqual(sorted(c[0] for c in u["runner"].calls), ["a", "b", "c"])
+        self.assertEqual(self.merged_order(), [1])
+
+    def test_only_a_silent_laptop_rests_it_a_busy_one_does_not(self):
+        from lander import run as RUN
+
+        def outs(why):
+            return {"a": RUN.Outcome("a", T.PASSED, "", [T.Result(check="a", tree="t", status=T.PASSED,
+                                                                  extra={"laptop": why} if why is not None else {})])}
+        self.assertTrue(RUN.laptop_gone(outs("laptop refused or did not answer: timeout")))
+        self.assertFalse(RUN.laptop_gone(outs("cc-suite-runner: busy (no free slot)")))
+        self.assertFalse(RUN.laptop_gone(outs(None)))
+
+    def test_a_laptop_that_gave_no_answer_sends_the_next_checks_to_the_box_one_per_job(self):
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
+        J.submit("demo", 1)
+        kws, live, most, lock = [], [0], [0], threading.Lock()
+
+        class Box(Runner):
+            def run_plan(self, *a, **kw):
+                kws.append(kw.get("box_only"))
+                return super().run_plan(*a, **kw)
+
+            def run(self, check, tree, where):
+                with lock:
+                    live[0] += 1
+                    most[0] = max(most[0], live[0])
+                time.sleep(0.1)
+                with lock:
+                    live[0] -= 1
+                return super().run(check, tree, where)
+        lane_init = L.Lane.__init__
+
+        def init(self, *a, **k):
+            lane_init(self, *a, **k)
+            self.laptop_down = time.time()
+        with mock.patch.object(L.Lane, "__init__", init), \
+                mock.patch.object(L.RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(L.RUN, "may_leave", return_value=True), \
+                mock.patch.object(L.Lane, "manifest", lambda self, job: types.SimpleNamespace(
+                    checks={n: T.Check(name=n, run="true") for n in "ab"})):
+            u, _ = self.land(planner=Planner(owners={"a": "a/", "b": "b/"}), runner=Box())
+        self.assertEqual(kws, [True, True])
+        self.assertEqual(most[0], 1)   # on the box, one check of a job at a time
+        self.assertEqual(self.merged_order(), [1])
+
+    def test_a_laptop_that_gives_no_answer_mid_lane_rests_and_the_next_checks_go_to_the_box(self):
+        # lane.reap: a laptop check whose result says the laptop gave no answer rests the laptop for LAPTOP_REST, so
+        # the job's next checks go to the box (box_only)
+        self.assertEqual(self.laptop_answers("laptop refused or did not answer: timeout"), [False, True, True])
+
+    def test_a_laptop_that_answers_busy_is_not_rested(self):
+        # the suppressed case: a full runner takes the next check when a slot frees, so the laptop stays in use
+        self.assertEqual(self.laptop_answers("cc-suite-runner: busy (no free slot)"), [False, False, False])
+
+    def laptop_answers(self, why):
+        """Land one PR of three laptop checks whose laptop runs say `why`; -> box_only per run_plan, in order."""
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
+        J.submit("demo", 1)
+        kws = []
+
+        class Said(Runner):
+            def run_plan(self, *a, **kw):
+                kws.append(bool(kw.get("box_only")))
+                out = super().run_plan(*a, **kw)
+                if not kw.get("box_only"):
+                    for o in out.values():
+                        for r in o.results:
+                            r.extra["laptop"] = why
+                return out
+        # the box has no slot while the laptop is up, so the checks go one after another and only the rest (or its
+        # absence) decides where the next one runs
+        with mock.patch.object(L.Lane, "width", lambda self: 1 if self.laptop_down else 0), \
+                mock.patch.object(L.A, "LAPTOP_SLOTS", 1), \
+                mock.patch.object(L.RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(L.RUN, "may_leave", return_value=True), \
+                mock.patch.object(L.Lane, "manifest", lambda self, job: types.SimpleNamespace(
+                    checks={n: T.Check(name=n, run="true") for n in "abc"})):
+            self.land(planner=Planner(owners={"a": "a/", "b": "b/", "c": "c/"}), runner=Said())
+        self.assertEqual(self.merged_order(), [1])
+        return kws
+
+    def test_where_a_check_runs_is_the_base_tips_word_not_the_prs_stale_base(self):
+        # 17:3xZ 2026-09-29: PRs based before main let host checks leave kept them on a box at load 20; main's
+        # `where` is taken for a check with the same run, class and cwd, and only for that
+        def m(**checks):
+            return MF.Manifest(checks=checks, cwd={n: "" for n in checks})
+        old = m(a=T.Check(name="a", run="x", klass=T.HOST, where=["box"]),
+                b=T.Check(name="b", run="y", klass=T.HOST, where=["box"]),
+                c=T.Check(name="c", run="z", klass=T.HOST, where=["box", "laptop"]),
+                d=T.Check(name="d", run="w", klass=T.HOST, where=["box"]))
+        tip = m(a=T.Check(name="a", run="x", klass=T.HOST, where=["box", "laptop"]),
+                b=T.Check(name="b", run="y2", klass=T.HOST, where=["box", "laptop"]),
+                c=T.Check(name="c", run="z", klass=T.HOST, where=["box"]))
+        got = MF.placed(old, tip)
+        self.assertEqual(got.checks["a"].where, ["box", "laptop"])   # main let it go: it goes
+        self.assertEqual(got.checks["b"].where, ["box"])             # its run is not main's: the PR's own word
+        self.assertEqual(got.checks["c"].where, ["box"])             # main took it back: it stays
+        self.assertEqual(got.checks["d"].where, ["box"])             # main has no such check
+        self.assertEqual(old.checks["a"].where, ["box"])             # the PR's manifest itself is not changed
+
+    def test_a_job_whose_checks_all_need_the_box_waits_for_a_box_slot_while_the_laptop_has_room(self):
+        # review 2026-09-29: the laptop's free room let the job in, every check skipped it, and it sat in `tried`
+        # with nothing in flight until the lane restarted; it now waits for the box slot and lands after #1
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        with mock.patch.object(L.Lane, "width", lambda self: 1), mock.patch.object(L.A, "LAPTOP_SLOTS", 5), \
+                mock.patch.object(L.RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(L.RUN, "may_leave", return_value=False), \
+                mock.patch.object(L.Lane, "manifest", lambda self, job: types.SimpleNamespace(
+                    checks={n: T.Check(name=n, run="true") for n in "ab"})):
+            u, _ = self.land(planner=Planner(owners={"a": "a/", "b": "b/"}),
+                             runner=Runner(hook=lambda n, i: time.sleep(0.2)))
+        self.assertEqual(sorted(self.merged_order()), [1, 2])
+
+    def test_a_check_that_may_leave_runs_on_a_free_box_slot_when_the_laptop_is_full(self):
+        # review 2026-09-29: the box sat idle while a check waited for the laptop's one slot; the laptop is still
+        # taken first, and the box (box_only, so it is not sent on to ssh) takes the next one beside it
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
+        J.submit("demo", 1)
+        two = threading.Barrier(2, timeout=10)
+        broke, kws = [], []
+
+        class Both(Runner):
+            def run_plan(self, *a, **kw):
+                kws.append(bool(kw.get("box_only")))
+                return super().run_plan(*a, **kw)
+
+            def run(self, check, tree, where):
+                try:
+                    two.wait()
+                except threading.BrokenBarrierError:
+                    broke.append(check.name)
+                return super().run(check, tree, where)
+        with mock.patch.object(L.Lane, "width", lambda self: 1), mock.patch.object(L.A, "LAPTOP_SLOTS", 1), \
+                mock.patch.object(L.RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(L.RUN, "may_leave", return_value=True), \
+                mock.patch.object(L.Lane, "manifest", lambda self, job: types.SimpleNamespace(
+                    checks={n: T.Check(name=n, run="true") for n in "ab"})):
+            u, _ = self.land(planner=Planner(owners={"a": "a/", "b": "b/"}), runner=Both())
+        self.assertEqual(broke, [], "the box did not take a check beside the laptop's")
+        self.assertEqual(kws, [False, True])   # the laptop's slot first, then the box's
+        self.assertEqual(self.merged_order(), [1])
 
     def test_a_pr_overlapping_one_in_flight_waits_and_is_planned_after_it_merges(self):
         # design: "Two changes that overlap from the start don't both burn CPU; the later one waits"

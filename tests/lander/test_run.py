@@ -809,8 +809,11 @@ class Judge(unittest.TestCase):
             for k in (T.BOX, T.TIMING):
                 self.assertEqual(RUN.choose_where(chk(klass=k, where=["box", "laptop"])), "box")
         with mock.patch.object(A, "busy", return_value=False):
-            self.assertEqual(RUN.choose_where(c), "box")
-            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "box")
+            # laptop first (owner 2026-09-29): a calm box still sends what may leave it; the box is the fallback
+            self.assertEqual(RUN.choose_where(c), "laptop")
+            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "laptop")
+            # the lane saw the laptop give no answer a moment ago: the box takes it without waiting out ssh
+            self.assertEqual(RUN.choose_where(c, box_only=True), "box")
 
     def test_a_busy_box_sends_check_sh_and_the_e2e_suites_and_keeps_what_needs_it(self):
         # the shipped manifests, as the lane reads them: the heavy host checks go, the ones bound to this host stay

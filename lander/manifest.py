@@ -24,6 +24,10 @@ it to lander-self.
 
 A broken BASE manifest raises ManifestError: nothing can be planned on it. A broken HEAD manifest is not fatal to the
 plan (the base rules), but its faults are carried out and make manifest-widen red.
+
+WHERE IT RUNS comes from the tip of the branch the PR lands on, not from its base (placed(); 2026-09-29 a PR based
+before main let host checks leave the box kept all ten of them on a box at load 20 for hours). The tip is main's
+reviewed text; its `where` is taken only for a check whose run, class and working directory match the PR's own.
 """
 from __future__ import annotations
 
@@ -284,6 +288,17 @@ def widen(base: Manifest, head: Manifest) -> Manifest:
         if more or fx:
             out.checks[n] = dataclasses.replace(b, paths=b.paths + more, fixtures=b.fixtures + fx)
     out.reach += [e for e in head.reach if e not in out.reach]
+    return out
+
+
+def placed(m: Manifest, tip: Manifest) -> Manifest:
+    """m with each check's `where` taken from tip, where tip has the same check (same run, class and cwd): the
+    runners a check may use are main's current word on it, not the stale base's. Every other field stays m's."""
+    out = dataclasses.replace(m, checks=dict(m.checks))
+    for n, c in m.checks.items():
+        t = tip.checks.get(n)
+        if t is not None and (t.run, t.klass) == (c.run, c.klass) and tip.cwd.get(n, "") == m.cwd.get(n, ""):
+            out.checks[n] = dataclasses.replace(c, where=list(t.where))
     return out
 
 

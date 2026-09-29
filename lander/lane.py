@@ -25,9 +25,12 @@ land side by side"; 2026-09-29 a three-file PR waited 7 h behind ~11 half-hour P
 a checking job hands its next check to the lane's pool and the lane goes on to other jobs; everything else — the gh
 facts, planning, the review, the Δ re-plan and the merge — happens on the lane's own thread, so merges stay serial
 and pinned. The lane keeps at most A.slots_now() checks in flight (LANDER_SLOTS, default 3; 1 while the box is
-overloaded()), and each run still takes its box-wide admission slot, so another repo's lane can hold this one's
-check at the door. A job holds one check in flight at a time, so a red still stops its suite at the first red. A
-finished check is recorded on the lane's thread; one whose job left checking, or its head or base, meanwhile is not.
+overloaded()) on the box, and up to A.LAPTOP_SLOTS more on the laptop; each box run still takes its box-wide
+admission slot, so another repo's lane can hold this one's check at the door. A job holds one check at a time on the
+box, but its checks that may leave the box run on the laptop side by side, so a red stops the rest of the suite only
+once it is recorded (the ones already in flight finish). A member's lane never sends a check to the laptop. A laptop
+that gave no answer rests for LAPTOP_REST: the box takes the lane's checks meanwhile. Where a check may run is the
+tip of the PR's base branch's word on it (manifest.placed), not the PR's base. A finished check is recorded on the lane's thread; one whose job left checking, or its head or base, meanwhile is not.
 SMALL FIRST (owner, 2026-09-28: a one-line PR waited behind ~20 full-suite PRs): a free slot goes to the oldest job
 that is not heavy — a plan of more than LANDER_SMALL_CHECKS (default 5) checks, or one with a full-suite check
 (LANDER_FULL_CHECKS, default check-sh) — and only then to the oldest heavy one; a job not planned yet counts as small.
@@ -122,6 +125,7 @@ FULL_CHECKS = tuple((os.environ.get("LANDER_FULL_CHECKS") or "check-sh").split()
 # a job parked on an overlap is retried at every wake; within this many seconds of its last read of GitHub it is
 # checked against the files that read gave, with no new call (a head moved meanwhile is read once this runs out)
 PARK_FRESH = float(os.environ.get("LANDER_PARK_FRESH") or 300)
+LAPTOP_REST = 300       # seconds the box takes the laptop's checks after the laptop gave no answer
 POLL = 5                 # seconds the lane waits on its checks before it looks at the inbox again
 MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": "cards", "board": "board",
              "deploy": "deploy", "tip": "tip"}
@@ -130,8 +134,9 @@ MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": 
 class Flight:
     """One check a job has in the lane's pool, and the head, base and merge tree it was started on."""
 
-    def __init__(self, future, pr, name, head, base, tree):
+    def __init__(self, future, pr, name, head, base, tree, laptop=False):
         self.future, self.pr, self.name, self.head, self.base, self.tree = future, pr, name, head, base, tree
+        self.laptop = laptop   # sent to the laptop: it counts against LAPTOP_SLOTS, not the box's slots
 
 
 class UnitFault(Exception):
@@ -356,7 +361,9 @@ class Lane:
         self.lines = []
         self.tried = set()
         self.waiting = set()     # tried and waiting on a slot or an overlapping job: tried again when either moves
-        self.inflight = {}       # job key -> Flight: the one check each job has in the pool
+        self.inflight = {}       # (job key, check) -> Flight: every check the lane has in the pool
+        self.laptop_down = 0.0   # when the laptop last gave no answer: the box takes its checks for LAPTOP_REST
+        self.tips = {}           # {"sha", "m"}: the base branch tip's manifest, for where a check may run
         self.said = set()        # (job, job it waits for): said once
         self.parked = set()      # queued jobs waiting on an overlapping one
         self.pool = None
@@ -387,7 +394,8 @@ class Lane:
                     REC.new_nonce(self.repo, J.landq())
                 tried = self.tried = set()
                 self.waiting, self.inflight = set(), {}
-                with futures.ThreadPoolExecutor(max_workers=max(1, A.SLOTS), thread_name_prefix="check") as pool:
+                with futures.ThreadPoolExecutor(max_workers=max(1, A.SLOTS) + A.LAPTOP_SLOTS,
+                                                thread_name_prefix="check") as pool:
                     self.pool = pool
                     moved = self.loop(tried)
             if moved:   # the lock is let go first, so the lane started from `current` can take it
@@ -413,7 +421,7 @@ class Lane:
             for ln in J.drain(self.repo):
                 self.say(ln)
             todo = [j for j in J.lane_jobs(self.repo)
-                    if j.key not in tried and j.key not in self.inflight and self.due(j)]
+                    if j.key not in tried and self.due(j)]
             if not todo:   # every due job has had its turn: record what finished (a freed slot), or wait for it
                 if not self.inflight:
                     return ""
@@ -435,8 +443,16 @@ class Lane:
         self.waiting &= {but}
 
     def width(self) -> int:
-        """How many checks this lane keeps in flight: the admission slots the box allows now."""
+        """How many box checks this lane keeps in flight: the admission slots the box allows now."""
         return A.slots_now()
+
+    def room(self, laptop: bool) -> bool:
+        """A free place for one more check: on the laptop (LAPTOP_SLOTS), else among the box's width()."""
+        n = sum(1 for f in self.inflight.values() if f.laptop == laptop)
+        return n < (A.LAPTOP_SLOTS if laptop else self.width())
+
+    def laptop_up(self) -> bool:
+        return time.time() - self.laptop_down >= LAPTOP_REST
 
     def reap(self, wait):
         """Record each check the pool has finished (waiting up to `wait` seconds for the first) on the lane's thread;
@@ -449,14 +465,17 @@ class Lane:
             if f.future not in done:
                 continue
             del self.inflight[key]
-            self.tried.discard(key)
+            self.tried.discard(key[0])
             job = J.load(self.repo, f.pr)
             if (job is None or job.state != T.CHECKING or (job.head, job.base_sha) != (f.head, f.base)
                     or f.name in job.results):
                 self.say(f"PR #{f.pr}: check {f.name} finished for a head or base the job has left; not recorded")
                 continue
             try:
-                self.took(job, f, f.future.result())
+                outs = f.future.result()
+                if f.laptop and RUN.laptop_gone(outs):
+                    self.laptop_down = time.time()   # it gave no answer: the box takes the next ones for a while
+                self.took(job, f, outs)
             except (UnitFault, G.GitError) as e:
                 self.hold(job, str(e), kind="box")
         if done:
@@ -655,12 +674,30 @@ class Lane:
         J.move(job, T.CHECKING)
 
     def manifest(self, job):
-        """The manifest at base, widened by the head's (what plan() planned on and `lander check` runs by)."""
+        """The manifest at base, widened by the head's (what plan() planned on and `lander check` runs by), with each
+        check's `where` from the tip of the base branch (MF.placed): a PR based before main let a check leave the box
+        still sends it (2026-09-29, #800 waited hours on ten box-only host checks main had let go)."""
         try:
-            return MF.widen(MF.load(self.root, job.base_sha, fallback=self.fallback),
-                            MF.load(self.root, job.head, fallback=self.fallback, strict=False))
+            m = MF.widen(MF.load(self.root, job.base_sha, fallback=self.fallback),
+                         MF.load(self.root, job.head, fallback=self.fallback, strict=False))
         except MF.ManifestError as e:
             raise UnitFault(f"the manifest at {job.base_sha[:12]} does not parse: {e}") from None
+        tip = self.tip_manifest(job.extra.get("base_ref") or "main")
+        return MF.placed(m, tip) if tip is not None else m
+
+    def tip_manifest(self, base: str):
+        """The manifest at the tip of origin/<base>, read once per tip; None when it cannot be read (m keeps its own
+        `where`, as before)."""
+        try:
+            sha = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
+        except G.GitError:
+            return None
+        if self.tips.get("sha") != sha:
+            try:
+                self.tips = {"sha": sha, "m": MF.load(self.root, sha, fallback=self.fallback)}
+            except MF.ManifestError:
+                self.tips = {"sha": sha, "m": None}
+        return self.tips["m"]
 
     def checking(self, job):
         """Hand the job's next check to the pool (when the lane has a slot for it), or, when the plan is paid, go on
@@ -669,7 +706,13 @@ class Lane:
             return self.hold(job, "runner is not installed", kind="box")
         todo = [n for n in (job.plan.checks if job.plan else []) if n not in job.results]
         if todo:
-            if len(self.inflight) >= self.width():
+            # the laptop's slots first (every check of the plan that may leave the box, several PRs' at once), the
+            # box's beside them (one check per job there); a check waits only for a place of its own kind
+            todo = [n for n in todo if (job.key, n) not in self.inflight]
+            dest = bool(RUN.laptop_dest()) and not self.member
+            up = dest and self.laptop_up()
+            kw = {"box_only": True} if dest else {}   # a box slot's check stays on the box, not a wait on ssh
+            if not todo or not (self.room(False) or (up and self.room(True))):
                 self.waiting.add(job.key)    # it goes on when a check finishes and frees a slot
                 return None
             m = self.manifest(job)
@@ -684,11 +727,22 @@ class Lane:
                 J.save(job)
             store = REC.Store(self.repo, J.lane_fd(self.repo), J.landq()) if J.lane_fd(self.repo) is not None else None
             quarantine = RUN.quarantine_text(self.root, job.base_sha)
-            n = todo[0]
-            fut = self.pool.submit(self.call, "runner", "run_plan", self.root, m, job.plan, job.files, tree, base_tree,
-                                   member=self.member, store=store, job_key=job.key, scope=self.member or self.repo,
-                                   pr=job.pr, quarantine_text=quarantine, only=[n], fallback=self.fallback)
-            self.inflight[job.key] = Flight(fut, job.pr, n, job.head, job.base_sha, tree)
+            for n in todo:
+                c = MF.builtin_check() if n == MF.BUILTIN else m.checks.get(n)
+                if up and c is not None and RUN.may_leave(c) and self.room(True):
+                    laptop = True
+                elif self.room(False) and not any(k[0] == job.key and not f.laptop for k, f in self.inflight.items()):
+                    # the box, one check per job at a time (so an older heavy PR does not take every box slot); a
+                    # check that may leave runs here too when the laptop is full or resting and the box has room
+                    laptop = False
+                else:
+                    continue   # no place of either kind for it now: tried again when a check finishes
+                fut = self.pool.submit(self.call, "runner", "run_plan", self.root, m, job.plan, job.files, tree,
+                                       base_tree, member=self.member, store=store, job_key=job.key,
+                                       scope=self.member or self.repo, pr=job.pr, quarantine_text=quarantine,
+                                       only=[n], fallback=self.fallback, **({} if laptop else kw))
+                self.inflight[(job.key, n)] = Flight(fut, job.pr, n, job.head, job.base_sha, tree, laptop)
+            self.waiting.add(job.key)   # submitted or not, it goes on when a check finishes and frees a slot
             return None
         if job.plan and job.plan.paid and not self.review(job):
             return None

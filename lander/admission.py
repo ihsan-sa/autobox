@@ -14,7 +14,9 @@ the one signal for "the box is overloaded": the lander serializes on it and give
 `cc-room` queues new `--go` workers on the same call until it clears, so the landing queue keeps moving while the
 load that is already there drains. Nothing is stopped or paused; only starts wait.
 
-LAPTOP. busy() is the bar for sending a check to the laptop: cpu `some avg10` at PSI_LAPTOP (default 25), memory at
+LAPTOP. Every check that may leave the box goes to the laptop first (run.choose_where, owner 2026-09-29), and the lane
+keeps up to LAPTOP_SLOTS (LANDER_LAPTOP_SLOTS, default 5) of them in flight beside the box's slots, which they do not
+take; a laptop that answers busy sends the check back to the box. busy() no longer places checks; it was the bar: cpu `some avg10` at PSI_LAPTOP (default 25), memory at
 PSI_MEM, or a 1-minute load average at LANDER_LAPTOP_LOAD (default 1) times the cores. A box under loaded()'s
 near-saturation mark all day is still slow: on 2026-09-29 it sat at load 9-27 on 6 cores with cpu PSI near 38, and
 sent 1 check of 200 out. busy() is not overloaded(): slots and cc-room ignore it.
@@ -47,6 +49,7 @@ SLOTS = int(os.environ.get("LANDER_SLOTS", "3") or 3)
 PSI_MEM = float(os.environ.get("LANDER_PSI_MEM", "20"))
 PSI_CPU = float(os.environ.get("LANDER_PSI_CPU", "99.5"))
 PSI_LAPTOP = float(os.environ.get("LANDER_PSI_LAPTOP", "25"))
+LAPTOP_SLOTS = max(0, int(os.environ.get("LANDER_LAPTOP_SLOTS", "5") or 0))
 LAPTOP_LOAD = float(os.environ.get("LANDER_LAPTOP_LOAD", "1") or 1)
 MEM_MAX = os.environ.get("LANDER_MEM_MAX", "6G")
 SWAP_MAX = os.environ.get("LANDER_SWAP_MAX", "0")

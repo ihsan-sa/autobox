@@ -475,32 +475,43 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
     return out
 
 
-def choose_where(check: T.Check, member: str = "") -> str:
-    """member:<h> for a member's landing; the laptop when the box is busy and the check may leave it; else box."""
+def may_leave(check: T.Check) -> bool:
+    """A static, hermetic or host check whose `where` names the laptop. Box and timing never go."""
+    return check.klass in (T.STATIC, T.HERMETIC, T.HOST) and "laptop" in check.where
+
+
+def choose_where(check: T.Check, member: str = "", box_only: bool = False) -> str:
+    """member:<h> for a member's landing; the laptop for every check that may leave the box; else box.
+    box_only: the lane saw the laptop give no answer a moment ago, so the box takes it without waiting out ssh."""
     if member:
         return f"member:{member}"
-    # the brief: "a loaded box sends at least check.sh and the e2e suites that can run off-box to the laptop … and a
-    # check that truly needs the box host stays on the box". A static, hermetic or host check whose `where` names the
-    # laptop goes whenever the box is busy(): the PR's code already runs unsandboxed there as the whole suite
-    # (cc-suites spill, first, owner 2026-09-25). Box and timing never go. A laptop pass stands; a red is said again
-    # on the box (judge).
-    spill = check.klass in (T.STATIC, T.HERMETIC, T.HOST) and A.busy()
-    if "laptop" in check.where and spill and laptop_dest():
+    # Laptop first (owner 2026-09-29: "move as much as possible to the laptop … the box is the fallback"), whether or
+    # not the box is busy: the PR's code already runs unsandboxed there as the whole suite. A laptop that is busy,
+    # on battery or gone is unrunnable and the box runs it; a laptop pass stands; a red is said again on the box
+    # (judge).
+    if not box_only and may_leave(check) and laptop_dest():
         return "laptop"
     return "box"
+
+
+def laptop_gone(outs: dict) -> bool:
+    """A laptop run that fell back to the box because the laptop gave no answer (not because it answered busy: a
+    full runner takes the next check when a slot frees, so only a silent one rests the laptop for LAPTOP_REST)."""
+    return any("laptop" in r.extra and "busy" not in str(r.extra["laptop"])
+               for o in outs.values() for r in o.results)
 
 
 def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree: str, base_tree: str = "", *,
              member: str = "", store=None, job_key: str = "", scope: str = "", pr: int | None = None,
              quarantine_text: str = "", runner=None, only=None, record_reds: bool = True,
-             fallback: str = "") -> dict:
+             fallback: str = "", box_only: bool = False) -> dict:
     """Every check in plan.checks through judge(), one after another; -> {name: Outcome}. The lane calls it with
     its store; `lander check` with none (a worker's own red is its work, and is not recorded). fallback: the host
     manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks."""
     rows = REC.quarantine_rows(quarantine_text)
     record = (lambda r, text: REC.record_red(scope, r, text, pr)) if (record_reds and scope) else None
     base_m = M.load(repo_root, base_tree, fallback=fallback, strict=False) if base_tree else None
-    out, laptop_gone = {}, False
+    out, gone = {}, False
     for name in plan.checks:
         if only and name not in only:
             continue
@@ -511,15 +522,15 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
         own = [p for p in c.paths if "*" not in p] + [m.cwd.get(name, "") + M.run_file(c.run)]
         security = any(M.match(m.policy.gate_first, p) for p in own if p)
         touched = any(m.owns(name, f) for f in files) if name in m.checks else False
-        where = choose_where(c, member)
-        if laptop_gone and where == "laptop" and "box" in c.where:
+        where = choose_where(c, member, box_only=box_only)
+        if gone and where == "laptop" and "box" in c.where:
             where = "box"   # the laptop gave no answer once in this plan: do not wait out its timeout per check
         out[name] = judge(c, head_tree, base_tree, where, runner=runner, store=store,
                           job_key=job_key, security=security, touched=touched, quarantine=rows, record=record,
                           on_base=name == M.BUILTIN or runs_on_base(repo_root, base_tree, base_m, name),
                           repo_root=repo_root, cwd=m.cwd.get(name, ""), changed=files,
                           label=".".join(job_key.rsplit("-", 1)) if job_key else "lander.0")
-        laptop_gone = laptop_gone or any("laptop" in r.extra for r in out[name].results)
+        gone = gone or laptop_gone({name: out[name]})
     return out
 
 
