@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""cc-collect — one daily snapshot of the box's own recent workings, gathered with no model, for improvement passes.
+
+WHY. A pass that looks for what the box keeps getting wrong (the owner nudging it, a landing that keeps failing, a
+worker that stalls) needs a day of the box's record in one place and small enough to read in one go. Every source
+already exists on disk; this only reads them, trims them and writes one file per source. It calls no model, posts
+nothing and wakes no session, so it costs nothing to run every day.
+
+WHAT IT READS (read-only, all under ~/.cc) and WHAT IT WRITES, one JSON line per row, each row with a `repo` field:
+  slack.jsonl     owner and member messages from slack/archive/<target>/<chat>/<YYYY-MM>.jsonl, plus any rows
+                  `backfill-slack` recovered; each carries `prev_box`, the box's last post before it in the same
+                  thread (else the same chat), react*/post-failed skipped, so a nudge pass needs nothing else
+  outbox.jsonl    the box's own posts and files from slack/outbox.log; reactions are only counted in index.json
+  landings.jsonl  state/land/queue.log folded to one row per repo#pr (event counts, stage order, verdicts, the last
+                  event); a line whose repo has no board (a selftest's fixture writes demo#…) is dropped and counted
+  board.jsonl     boards/<repo>.json's log folded to one row per track: its status changes in order and its last
+                  two notes. A track whose only entry is the janitor's `removed` is counted, not listed, and a
+                  board whose file name starts with `_` (a suite's scratch board) is skipped
+  failures.jsonl  cc-failures records (failures/*.jsonl) folded per repo and kind, commonest first: count, first
+                  and last, ids, clusters and two observed examples
+  loops.jsonl     worker loop logs (state/<repo>/<track>/loop.log) folded per track: iterations ended, how many
+                  of them did not end rc=0 err=false, DONE and BLOCKED counts, and the first three other exit lines
+                  (loop exits, step limits, cc-green verdicts)
+  journals.jsonl  progress.md and *-handoff.md files under state/ modified in the window: size, last STATUS line
+                  and the journal's tail
+  handoffs.jsonl  state/context/handoffs.jsonl in the window
+  spend.jsonl     state/spend/<day>.tsv summed per repo, kind and model (`by: kind`), and the top tracks by
+                  dollars (`by: track`)
+  index.json      the window, rows, bytes and truncation per source, counts per repo, and sources that were missing
+Every text is cut to a fixed length and every file to a line cap that grows with the window's days (a file past it
+keeps its newest rows, and failures and spend their biggest), and what was cut is counted in index.json, so a day's snapshot stays small enough for one model pass without a subagent.
+
+WHERE. ~/.cc/state/improve/snapshots/<name>/, where <name> is the window's end date (UTC) for the default window
+and <since-date>..<until-date> for any other; a second run with the same name replaces it. `latest` points at the
+newest, and a snapshot written more than 90 days ago is removed. Times compare as the sources print them, to the second, UTC; a
+window holds its first second and not its last, so consecutive windows never both hold a row.
+
+  cc-collect [--since WHEN] [--until WHEN] [--out DIR]
+                        write a snapshot; WHEN is YYYY-MM-DD, YYYY-MM-DDTHH:MM:SSZ, or Nh / Nd before now.
+                        Default: the last 24 h up to now. Prints one line per file with its rows and bytes
+  cc-collect backfill-slack --since WHEN --until WHEN
+                        read the owner's own messages back from Slack's history with the box's existing bot token
+                        (conversations.history and conversations.replies, nothing else) for every chat the box
+                        knows, into ~/.cc/state/improve/slack-backfill.jsonl, which the snapshot reads beside the
+                        archive. The archive itself is never written. A chat the token cannot read is named and skipped
+  cc-collect selfcheck  fixtures in a HOME of its own, never this box's
+"""
+import bisect
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+KEEP_DAYS = 90
+TEXT = {"slack": 1500, "prev": 160, "outbox": 100, "board": 120, "fail": 200, "loop": 160, "journal": 200, "land": 160}
+CAP = {"slack": 600, "outbox": 300, "landings": 300, "board": 300, "failures": 100, "loops": 200, "journals": 200,
+       "handoffs": 300, "spend": 200}          # lines per day of window; a longer window scales them
+LOOP_KEEP = re.compile(r"iter \d+ end|\bDONE\b|BLOCKED|^exit \d+:|step limit|signalled|cc-green run ended|capped \(")
+QUEUE_PR = re.compile(r"^([A-Za-z0-9._-]+)#(\S+)$")
+ISO = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def home(*p):
+    return os.path.join(os.path.expanduser("~"), ".cc", *p)
+
+
+def iso(dt):
+    return dt.astimezone(timezone.utc).strftime(ISO)
+
+
+def parse_when(s, now):
+    m = re.fullmatch(r"(\d+)([hd])", s)
+    if m:
+        return now - timedelta(hours=int(m[1]) * (24 if m[2] == "d" else 1))
+    for f in ("%Y-%m-%d", ISO):
+        try:
+            return datetime.strptime(s, f).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    raise SystemExit(f"cc-collect: cannot read a time from {s!r} (YYYY-MM-DD, YYYY-MM-DDTHH:MM:SSZ, Nh or Nd)")
+
+
+def cut(s, n):
+    s = " ".join(str(s or "").split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def jlines(path):
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict):
+                    yield r
+    except OSError:
+        return
+
+
+def repo_of(target):
+    return (target or "").split("@")[0]
+
+
+class Window:
+    def __init__(self, since, until):
+        self.since, self.until = iso(since), iso(until)
+        self.days = max(1, -(-int((until - since).total_seconds()) // 86400))
+
+    def has(self, ts):
+        # [since, until): one run's end is the next run's start, so a row on that second is in exactly one snapshot
+        return isinstance(ts, str) and len(ts) >= 20 and self.since <= ts[:20] < self.until
+
+    def months(self):
+        a, b = self.since[:7], self.until[:7]
+        y, m, out = int(a[:4]), int(a[5:7]), []
+        while f"{y:04d}-{m:02d}" <= b:
+            out.append(f"{y:04d}-{m:02d}")
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        return out
+
+    def dates(self):
+        d, end, out = datetime.strptime(self.since[:10], "%Y-%m-%d"), self.until[:10], []
+        while d.strftime("%Y-%m-%d") <= end:
+            out.append(d.strftime("%Y-%m-%d"))
+            d += timedelta(days=1)
+        return out
+
+
+def chat_repos():
+    """chat id -> repo, from what the box already keeps: the archive's own layout, the channel and route tables, orchs."""
+    m = {}
+    for d in glob.glob(home("slack", "archive", "*", "*")):
+        m.setdefault(os.path.basename(d), repo_of(os.path.basename(os.path.dirname(d))))
+    boards = {os.path.basename(p)[:-5] for p in glob.glob(home("boards", "*.json"))}
+    for name, fn in (("channels.json", lambda k, v: (v, k)), ("routes.json", lambda k, v: (k, v)),
+                     ("orchs.json", lambda k, v: (k, (v or {}).get("target") if isinstance(v, dict) else None))):
+        try:
+            tab = json.load(open(home("slack", name)))
+        except (OSError, ValueError):
+            continue
+        for k, v in (tab.items() if isinstance(tab, dict) else ()):
+            chat, repo = fn(k, v)
+            if isinstance(chat, str) and isinstance(repo, str) and not chat.startswith("#"):
+                repo = repo_of(repo)
+                if repo in boards or name != "channels.json":
+                    m.setdefault(chat, repo)
+    return m
+
+
+def read_outbox():
+    rows = []
+    try:
+        with open(home("slack", "outbox.log"), errors="replace") as f:
+            for line in f:
+                p = line.rstrip("\n").split("\t", 4)
+                if len(p) == 5:
+                    rows.append(p)
+    except OSError:
+        return None
+    return rows
+
+
+def prev_index(outbox):
+    """(chat, thread) and chat -> sorted list of (at, kind, text) over every box post, react*/post-failed skipped."""
+    by_thread, by_chat = {}, {}
+    for at, kind, chat, thread, text in outbox:
+        if kind.startswith("react") or kind == "post-failed":
+            continue
+        by_thread.setdefault((chat, thread), []).append((at, kind, text))
+        by_chat.setdefault(chat, []).append((at, kind, text))
+    for t in (by_thread, by_chat):
+        for v in t.values():
+            v.sort(key=lambda r: r[0])
+    return by_thread, by_chat
+
+
+def before(lst, at):
+    if not lst:
+        return None
+    i = bisect.bisect_left(lst, (at,)) - 1
+    return lst[i] if i >= 0 else None
+
+
+def g_slack(w, repos, outbox, missing):
+    by_thread, by_chat = prev_index(outbox or [])
+    seen, rows = set(), []
+    files = [p for mo in w.months() for p in glob.glob(home("slack", "archive", "*", "*", f"{mo}.jsonl"))]
+    if not glob.glob(home("slack", "archive")):
+        missing.append("slack/archive")
+    files.append(home("state", "improve", "slack-backfill.jsonl"))
+    for p in files:
+        for r in jlines(p):
+            if r.get("role") not in ("owner", "member") or not w.has(r.get("at", "")):
+                continue
+            key = (r.get("chat"), r.get("ts"))
+            if key in seen:
+                continue
+            seen.add(key)
+            chat, at = r.get("chat", ""), r.get("at", "")
+            thread = r.get("thread_ts") or ""
+            prev = before(by_thread.get((chat, thread)), at) or before(by_chat.get(chat), at)
+            rows.append({"at": at, "repo": repo_of(r.get("target")) or repos.get(chat, ""), "chat": chat,
+                         "channel": r.get("channel", ""), "ts": r.get("ts", ""), "thread_ts": thread,
+                         "role": r.get("role"), "user": r.get("user", ""), "text": cut(r.get("text"), TEXT["slack"]),
+                         "prev_box": {"at": prev[0], "kind": prev[1], "text": cut(prev[2], TEXT["prev"])} if prev else None,
+                         **({"source": r["source"]} if r.get("source") else {})})
+    rows.sort(key=lambda r: (r["at"], r["ts"]))
+    return rows, {}
+
+
+def g_outbox(w, repos, outbox, missing):
+    if outbox is None:
+        missing.append("slack/outbox.log")
+    rows, reacts = [], 0
+    for at, kind, chat, thread, text in outbox or []:
+        if not w.has(at):
+            continue
+        if kind.startswith("react"):
+            reacts += 1
+            continue
+        rows.append({"at": at, "repo": repos.get(chat, ""), "chat": chat, "thread_ts": thread, "kind": kind,
+                     "text": cut(text, TEXT["outbox"])})
+    return rows, {"reactions": reacts}
+
+
+def g_landings(w, repos, outbox, missing):
+    boards = {os.path.basename(p)[:-5] for p in glob.glob(home("boards", "*.json"))}
+    prs, box, dropped = {}, {}, 0
+    try:
+        f = open(home("state", "land", "queue.log"), errors="replace")
+    except OSError:
+        missing.append("state/land/queue.log")
+        return [], {}
+    with f:
+        for line in f:
+            p = line.rstrip("\n").split("\t", 1)
+            if len(p) < 2 or not w.has(p[0]):
+                continue
+            ev, _, rest = p[1].partition(" ")
+            ref, _, detail = rest.partition(" ")
+            m = QUEUE_PR.match(ref)
+            if not m:
+                box[ev] = box.get(ev, 0) + 1
+                continue
+            if m[1] not in boards:
+                dropped += 1
+                continue
+            r = prs.setdefault(ref, {"pr": ref, "repo": m[1], "first": p[0], "last": p[0], "n": 0, "events": {},
+                                     "stages": [], "verdicts": [], "last_event": ""})
+            r["last"], r["n"] = p[0], r["n"] + 1
+            r["events"][ev] = r["events"].get(ev, 0) + 1
+            if ev == "stage" and (not r["stages"] or r["stages"][-1] != detail.split(" ")[0]) and len(r["stages"]) < 15:
+                r["stages"].append(detail.split(" ")[0])
+            if ev == "recorded":
+                v = re.search(r"verdict=(\S+)", detail)
+                if v and len(r["verdicts"]) < 5:
+                    r["verdicts"].append(v[1])
+            if ev != "stage":
+                r["last_event"] = cut(f"{ev} {detail}", TEXT["land"])
+    rows = sorted(prs.values(), key=lambda r: (r["first"], r["pr"]))
+    return rows, {"dropped_no_board": dropped, "box_events": box}
+
+
+def g_board(w, repos, outbox, missing):
+    rows, removed = {}, 0
+    files = sorted(glob.glob(home("boards", "*.json")))
+    if not files:
+        missing.append("boards")
+    for p in files:
+        try:
+            d = json.load(open(p))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict) or not isinstance(d.get("log"), list):
+            continue
+        repo = d.get("repo") or os.path.basename(p)[:-5]
+        if os.path.basename(p).startswith("_"):          # a suite's scratch board (_cctest…), not work
+            continue
+        for e in d["log"]:
+            if not (isinstance(e, dict) and w.has(e.get("ts", ""))):
+                continue
+            msg = str(e.get("msg") or "")
+            if msg == "removed" and (repo, e.get("track", "")) not in rows:
+                removed += 1                             # the janitor clearing a finished row: counted, not listed
+                continue
+            r = rows.setdefault((repo, e.get("track", "")), {"repo": repo, "track": e.get("track", ""), "first": e["ts"],
+                                                             "last": e["ts"], "n": 0, "statuses": [], "notes": []})
+            r["last"], r["n"] = e["ts"], r["n"] + 1
+            if msg.startswith("status -> "):
+                r["statuses"].append(f"{e['ts'][5:16]} {msg[10:].strip()}")
+            else:
+                r["notes"] = (r["notes"] + [f"{e['ts'][5:16]} {cut(msg, TEXT['board'])}"])[-2:]
+    rows = sorted(rows.values(), key=lambda r: (r["first"], r["repo"], r["track"]))
+    for r in rows:
+        r["statuses"] = r["statuses"][:4] + ["…"] + r["statuses"][-4:] if len(r["statuses"]) > 9 else r["statuses"]
+    return rows, {"removed_only": removed}
+
+
+def g_failures(w, repos, outbox, missing):
+    rows = {}
+    files = sorted(glob.glob(home("failures", "*.jsonl")))
+    if not files:
+        missing.append("failures")
+    for p in files:
+        for r in sorted(jlines(p), key=lambda r: str(r.get("ts", ""))):
+            if not w.has(r.get("ts", "")):
+                continue
+            g = rows.setdefault((r.get("scope", ""), r.get("kind", "")), {
+                "repo": r.get("scope", ""), "kind": r.get("kind", ""), "first": r["ts"], "n": 0, "ids": [],
+                "clusters": [], "writers": [], "expected": cut(r.get("expected"), 160), "examples": []})
+            g["last"], g["n"] = r["ts"], g["n"] + 1
+            for k, v in (("ids", r.get("id")), ("clusters", r.get("cluster")), ("writers", r.get("writer"))):
+                if v and v not in g[k] and len(g[k]) < 5:
+                    g[k].append(v)
+            if len(g["examples"]) < 2:
+                g["examples"].append(cut(r.get("observed"), TEXT["fail"]))
+    rows = sorted(rows.values(), key=lambda r: (-r["n"], r["repo"], r["kind"]))
+    return rows, {}
+
+
+def track_dirs():
+    for p in sorted(glob.glob(home("state", "*", "*"))):
+        if os.path.isdir(p) and not os.path.islink(p):
+            yield p, repo_of(os.path.basename(os.path.dirname(p))), os.path.basename(p)
+
+
+def g_loops(w, repos, outbox, missing):
+    rows = {}
+    for d, repo, track in track_dirs():
+        try:
+            f = open(os.path.join(d, "loop.log"), errors="replace")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                ts, _, rest = line.rstrip("\n").partition(" ")
+                if not (w.has(ts) and LOOP_KEEP.search(rest)):
+                    continue
+                r = rows.setdefault((repo, track), {"repo": repo, "track": track, "first": ts, "iters": 0,
+                                                    "iter_errors": 0, "done": 0, "blocked": 0, "exits": []})
+                r["last"], r["last_line"] = ts, cut(rest, TEXT["loop"])
+                if re.match(r"iter \d+ end", rest):
+                    r["iters"] += 1
+                    r["iter_errors"] += not re.search(r" rc=0 err=false", rest)
+                elif re.match(r"(STATUS: )?DONE\b|DONE$", rest):
+                    r["done"] += 1
+                elif "BLOCKED" in rest:
+                    r["blocked"] += 1
+                elif len(r["exits"]) < 3:
+                    r["exits"].append(f"{ts[5:16]} {cut(rest, TEXT['loop'])}")
+    rows = sorted(rows.values(), key=lambda r: (r["first"], r["repo"], r["track"]))
+    return rows, {}
+
+
+def g_journals(w, repos, outbox, missing):
+    rows, st = [], home("state")
+    paths = set(glob.glob(os.path.join(st, "*", "*", "progress.md")))
+    paths |= set(glob.glob(os.path.join(st, "*", "*-handoff.md"))) | set(glob.glob(os.path.join(st, "*", "*", "*-handoff.md")))
+    for p in sorted(paths):
+        try:
+            s = os.stat(p)
+        except OSError:
+            continue
+        mt = iso(datetime.fromtimestamp(s.st_mtime, timezone.utc))
+        if not w.has(mt):
+            continue
+        rel = os.path.relpath(p, st).split(os.sep)
+        try:
+            with open(p, "rb") as f:
+                f.seek(max(0, s.st_size - 4000))
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        status = [ln.strip() for ln in tail.splitlines() if ln.startswith("STATUS:")]
+        rows.append({"mtime": mt, "repo": repo_of(rel[0]), "track": rel[1] if len(rel) == 3 else "",
+                     "kind": "journal" if rel[-1] == "progress.md" else "handoff", "path": "/".join(rel),
+                     "bytes": s.st_size, "status": status[-1] if status else "",
+                     "tail": cut(tail[-TEXT["journal"]:], TEXT["journal"])})
+    rows.sort(key=lambda r: (r["mtime"], r["path"]))
+    return rows, {}
+
+
+def g_handoffs(w, repos, outbox, missing):
+    p = home("state", "context", "handoffs.jsonl")
+    if not os.path.exists(p):
+        missing.append("state/context/handoffs.jsonl")
+    rows = []
+    for r in jlines(p):
+        ts = r.get("ts")
+        if isinstance(ts, (int, float)):                 # older lines carry epoch seconds
+            ts = iso(datetime.fromtimestamp(ts, timezone.utc))
+        if w.has(ts):
+            rows.append({"ts": ts, "repo": r.get("repo") or repo_of(r.get("target")) or "",
+                         **{k: r[k] for k in ("kind", "target", "alias", "track", "pct", "handoff") if r.get(k) is not None}})
+    rows.sort(key=lambda r: r["ts"])
+    return rows, {}
+
+
+def g_spend(w, repos, outbox, missing):
+    agg, tracks, files = {}, {}, 0
+    nums = ("in", "out", "cache_read", "cache_write")
+    for day in w.dates():
+        try:
+            f = open(home("state", "spend", f"{day}.tsv"), errors="replace")
+        except OSError:
+            continue
+        files += 1
+        with f:
+            head = None
+            for line in f:
+                p = line.rstrip("\n").split("\t")
+                if head is None and p[0] in ("#ts", "ts"):
+                    head = [c.lstrip("#") for c in p]
+                    continue
+                if head is None or len(p) != len(head):
+                    continue
+                r = dict(zip(head, p))
+                if not w.has(r.get("ts", "")):
+                    continue
+                try:
+                    v = [int(r[k]) for k in nums] + [float(r.get("est_usd") or 0)]
+                except (KeyError, ValueError):
+                    continue
+                for tab, key in ((agg, (r.get("repo", ""), r.get("kind", ""), r.get("model", ""))),
+                                 (tracks, (r.get("repo", ""), r.get("track", "")))):
+                    a = tab.setdefault(key, {"sessions": set(), "v": [0, 0, 0, 0, 0.0]})
+                    a["sessions"].add(r.get("session", ""))
+                    a["v"] = [x + y for x, y in zip(a["v"], v)]
+    if not files:
+        missing.append("state/spend")
+
+    def row(by, key, a):
+        return {"by": by, **key, "sessions": len(a["sessions"]), **dict(zip(nums, a["v"][:4])), "usd": round(a["v"][4], 2)}
+    rows = [row("kind", {"repo": k[0], "kind": k[1], "model": k[2]}, a)
+            for k, a in sorted(agg.items(), key=lambda kv: -kv[1]["v"][4])]
+    top = sorted(tracks.items(), key=lambda kv: -kv[1]["v"][4])[:25 * w.days]
+    rows += [row("track", {"repo": k[0], "track": k[1]}, a) for k, a in top]
+    return rows, {"tracks_not_listed": max(0, len(tracks) - len(top))}
+
+
+RANKED = ("failures", "spend")                     # sorted biggest first, not by time
+SOURCES = [("slack", g_slack), ("outbox", g_outbox), ("landings", g_landings), ("board", g_board),
+           ("failures", g_failures), ("loops", g_loops), ("journals", g_journals), ("handoffs", g_handoffs),
+           ("spend", g_spend)]
+
+
+def write_atomic(path, data):
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def collect(w, out):
+    os.makedirs(out, exist_ok=True)
+    repos, outbox, missing = chat_repos(), read_outbox(), []
+    index = {"window": {"since": w.since, "until": w.until}, "generated": iso(datetime.now(timezone.utc)),
+             "sources": {}, "per_repo": {}, "missing": missing}
+    for name, fn in SOURCES:
+        rows, extra = fn(w, repos, outbox, missing)
+        cap = CAP[name] * w.days
+        kept = rows[:cap] if name in RANKED else rows[-cap:]    # a ranked file keeps its top, the rest their newest
+        data = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in kept)
+        write_atomic(os.path.join(out, f"{name}.jsonl"), data)
+        index["sources"][name] = {"file": f"{name}.jsonl", "rows": len(kept), "bytes": len(data.encode()),
+                                  "truncated": len(rows) - len(kept), **extra}
+        for r in kept:
+            if name == "spend" and r["by"] != "kind":
+                continue
+            pr = index["per_repo"].setdefault(r.get("repo") or "-", {})
+            k = f"slack_{r['role']}" if name == "slack" else name
+            if name == "spend":
+                pr["usd"] = round(pr.get("usd", 0) + r["usd"], 2)
+            else:
+                pr[k] = pr.get(k, 0) + 1
+    index["per_repo"] = dict(sorted(index["per_repo"].items()))
+    write_atomic(os.path.join(out, "index.json"), json.dumps(index, indent=1, sort_keys=True) + "\n")
+    return index
+
+
+def prune_and_link(root, name):
+    cutoff = time.time() - KEEP_DAYS * 86400             # by when it was written: a backfill of old dates is new
+    for d in glob.glob(os.path.join(root, "????-??-??*")):
+        if os.path.isdir(d) and not os.path.islink(d) and os.path.getmtime(d) < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+    tmp = os.path.join(root, f".latest{os.getpid()}")
+    os.symlink(name, tmp)
+    os.replace(tmp, os.path.join(root, "latest"))
+
+
+def cmd_collect(argv):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    opts = parse_opts(argv, ("--since", "--until", "--out"))
+    until = parse_when(opts["--until"], now) if "--until" in opts else now
+    since = parse_when(opts["--since"], now) if "--since" in opts else until - timedelta(hours=24)
+    if since >= until:
+        raise SystemExit("cc-collect: --since must be before --until")
+    w = Window(since, until)
+    default = "--since" not in opts and "--until" not in opts
+    name = w.until[:10] if default else f"{w.since[:10]}..{w.until[:10]}"
+    root = home("state", "improve", "snapshots")
+    out = opts.get("--out") or os.path.join(root, name)
+    index = collect(w, out)
+    if "--out" not in opts:
+        prune_and_link(root, name)
+    total = 0
+    for n, s in index["sources"].items():
+        total += s["bytes"]
+        print(f"  {n + '.jsonl':16} {s['rows']:6} rows {s['bytes']:9} bytes" + (f"  ({s['truncated']} cut)" if s["truncated"] else ""))
+    print(f"cc-collect: {out} — {w.since}..{w.until}, {total} bytes"
+          + (f"; missing: {', '.join(index['missing'])}" if index["missing"] else ""))
+    return 0
+
+
+def parse_opts(argv, allowed):
+    opts, i = {}, 0
+    while i < len(argv):
+        if argv[i] not in allowed or i + 1 >= len(argv):
+            raise SystemExit(f"cc-collect: unknown or incomplete option {argv[i]!r} (cc-collect --help)")
+        opts[argv[i]] = argv[i + 1]
+        i += 2
+    return opts
+
+
+# ---- backfill ----------------------------------------------------------------------------------------------------
+
+def backfill(api, token, owner, chats, since, until, pause=1.2):
+    """The owner's messages in [since, until) from every chat in `chats` (id -> repo), via conversations.history and,
+    for a thread, conversations.replies. Returns (rows, {chat: error})."""
+    rows, errors = [], {}
+    oldest, latest = str(since.timestamp()), str(until.timestamp())
+
+    def pages(method, **kw):
+        cursor = None
+        while True:
+            r = api(method, token, limit="200", oldest=oldest, latest=latest, **kw, **({"cursor": cursor} if cursor else {}))
+            yield from r.get("messages") or []
+            cursor = ((r.get("response_metadata") or {}).get("next_cursor")) or None
+            if not cursor:
+                return
+            time.sleep(pause)
+
+    def keep(m, chat):
+        if m.get("user") == owner and not m.get("subtype") and not m.get("bot_id"):
+            ts = m.get("ts", "")
+            rows.append({"ts": ts, "thread_ts": m.get("thread_ts") or ts, "chat": chat, "channel": "", "user": owner,
+                         "role": "owner", "target": chats[chat], "text": m.get("text", ""), "source": "backfill",
+                         "at": iso(datetime.fromtimestamp(float(ts), timezone.utc))})
+
+    for chat in sorted(chats):
+        try:
+            for m in pages("conversations.history", channel=chat):
+                keep(m, chat)
+                if m.get("reply_count"):
+                    time.sleep(pause)
+                    for rm in pages("conversations.replies", channel=chat, ts=m["ts"]):
+                        if rm.get("ts") != m.get("ts"):
+                            keep(rm, chat)
+        except Exception as e:                 # not_in_channel, missing_scope, channel_not_found: named, then skipped
+            errors[chat] = cut(str(e), 120)
+        time.sleep(pause)
+    return rows, errors
+
+
+def load_slack():
+    loader = importlib.machinery.SourceFileLoader("cc_slack_mod", os.path.join(BIN, "cc-slack"))
+    spec = importlib.util.spec_from_loader("cc_slack_mod", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def merge_backfill(rows):
+    path = home("state", "improve", "slack-backfill.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    have = {(r.get("chat"), r.get("ts")): r for r in jlines(path)}
+    for r in rows:
+        have[(r["chat"], r["ts"])] = r
+    write_atomic(path, "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
+                               for r in sorted(have.values(), key=lambda r: r.get("at", ""))))
+    return path, len(have)
+
+
+def cmd_backfill(argv):
+    now = datetime.now(timezone.utc)
+    opts = parse_opts(argv, ("--since", "--until"))
+    if "--since" not in opts or "--until" not in opts:
+        raise SystemExit("cc-collect backfill-slack: --since and --until are both required")
+    since, until = parse_when(opts["--since"], now), parse_when(opts["--until"], now)
+    sl = load_slack()
+    cfg = sl.load_cfg()
+    token, owner = cfg.get("SLACK_BOT_TOKEN"), cfg.get("SLACK_OWNER_ID")
+    if not token or not owner:
+        print("cc-collect: no SLACK_BOT_TOKEN or SLACK_OWNER_ID in the box's config, so nothing was read", file=sys.stderr)
+        return 1
+    chats = {c: r for c, r in chat_repos().items() if c[:1] in ("C", "G", "D")}
+    rows, errors = backfill(sl.api, token, owner, chats, since, until)
+    path, n = merge_backfill(rows)
+    for c, e in sorted(errors.items()):
+        print(f"  {c} ({chats[c] or '?'}): not read — {e}")
+    print(f"cc-collect backfill-slack: {len(rows)} owner messages from {len(chats) - len(errors)} of {len(chats)} chats, "
+          f"{iso(since)}..{iso(until)}; {path} holds {n}")
+    return 0
+
+
+# ---- selfcheck ---------------------------------------------------------------------------------------------------
+
+def selfcheck():
+    results = []
+
+    def case(label, ok):
+        results.append(bool(ok))
+        print(f"  {'ok' if ok else 'FAIL'}  {label}")
+
+    real_home, homes = os.environ.get("HOME"), []
+    W = Window(datetime(2026, 1, 10, tzinfo=timezone.utc), datetime(2026, 1, 11, tzinfo=timezone.utc))
+    IN, OUT = "2026-01-10T12:00:00Z", "2026-01-09T12:00:00Z"
+
+    def fx(files):
+        """A fresh HOME holding only `files` (path under ~/.cc -> text), and a board for repo r so r is a known repo."""
+        h = tempfile.mkdtemp(prefix="cc-collect-sc.")
+        homes.append(h)
+        os.environ["HOME"] = h
+        files = {"boards/r.json": json.dumps({"repo": "r", "log": []}), **files}
+        for rel, text in files.items():
+            p = home(rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(text)
+        return h
+
+    def run(files):
+        h = fx(files)
+        out = os.path.join(h, "snap")
+        idx = collect(W, out)
+        got = {n: list(jlines(os.path.join(out, f"{n}.jsonl"))) for n, _ in SOURCES}
+        return h, idx, got
+
+    def arch(*rows):
+        return "".join(json.dumps(r) + "\n" for r in rows)
+
+    try:
+        # slack: owner and member kept, a bot and an out-of-window message dropped
+        _, idx, got = run({"slack/archive/r/C1/2026-01.jsonl": arch(
+            {"ts": "1.1", "thread_ts": "1.1", "chat": "C1", "role": "owner", "target": "r", "text": "status?", "at": IN},
+            {"ts": "1.2", "thread_ts": "1.2", "chat": "C1", "role": "member", "target": "r", "text": "hi", "at": IN},
+            {"ts": "1.3", "thread_ts": "1.3", "chat": "C1", "role": "bot", "target": "r", "text": "x", "at": IN},
+            {"ts": "0.9", "thread_ts": "0.9", "chat": "C1", "role": "owner", "target": "r", "text": "old", "at": OUT})})
+        case("slack keeps owner and member messages in the window, drops a bot's and an older one",
+             [r["text"] for r in got["slack"]] == ["status?", "hi"] and got["slack"][0]["repo"] == "r"
+             and idx["per_repo"]["r"] == {"slack_owner": 1, "slack_member": 1})
+
+        # the window's edges: its first second is in, its last is not
+        _, _, got = run({"slack/outbox.log": "".join(f"{t}\tpost\tC1\t\t{t}\n" for t in (
+            "2026-01-09T23:59:59Z", "2026-01-10T00:00:00Z", "2026-01-10T23:59:59Z", "2026-01-11T00:00:00Z"))})
+        case("a window holds its first second and not the second it ends on",
+             [r["text"] for r in got["outbox"]] == ["2026-01-10T00:00:00Z", "2026-01-10T23:59:59Z"])
+
+        # prev_box: same thread first, then same chat; reactions and failed posts never count
+        _, _, got = run({
+            "slack/archive/r/C1/2026-01.jsonl": arch(
+                {"ts": "5.0", "thread_ts": "4.0", "chat": "C1", "role": "owner", "target": "r", "text": "in thread", "at": IN},
+                {"ts": "6.0", "thread_ts": "6.0", "chat": "C1", "role": "owner", "target": "r", "text": "top", "at": "2026-01-10T13:00:00Z"}),
+            "slack/outbox.log": "".join("\t".join(r) + "\n" for r in [
+                ("2026-01-10T11:00:00Z", "post", "C1", "4.0", "thread post"),
+                ("2026-01-10T11:30:00Z", "post", "C1", "", "channel post"),
+                ("2026-01-10T11:40:00Z", "react", "C1", "4.0", "eyes"),
+                ("2026-01-10T11:50:00Z", "post-failed", "C1", "4.0", "lost"),
+                ("2026-01-10T13:30:00Z", "post", "C1", "", "later")])})
+        pb = {r["text"]: (r["prev_box"] or {}).get("text") for r in got["slack"]}
+        case("prev_box is the box's last post in the same thread, else the chat; react and post-failed skipped",
+             pb == {"in thread": "thread post", "top": "channel post"})
+        case("outbox lists posts and failed posts but never a reaction",
+             [r["text"] for r in got["outbox"]] == ["thread post", "channel post", "lost", "later"])
+
+        # outbox: reactions counted in the index, not listed; an older post dropped
+        _, idx, got = run({"slack/outbox.log": f"{IN}\treact\tC1\t\teyes\n{IN}\tpost\tC1\t\tnow\n{OUT}\tpost\tC1\t\tthen\n"})
+        case("outbox counts a reaction in index.json and drops a post before the window",
+             [r["text"] for r in got["outbox"]] == ["now"] and idx["sources"]["outbox"]["reactions"] == 1)
+
+        # landings: folded per PR, a repo with no board dropped
+        q = "".join(f"{t}\t{e}\n" for t, e in [
+            ("2026-01-10T10:00:00Z", "queued r#7 who=x"), ("2026-01-10T10:01:00Z", "stage r#7 checking"),
+            ("2026-01-10T10:02:00Z", "stage r#7 checking"), ("2026-01-10T10:03:00Z", "stage r#7 review"),
+            ("2026-01-10T10:04:00Z", "recorded r#7 verdict=LAND by=y"), ("2026-01-10T10:05:00Z", "done r#7 rc=0"),
+            ("2026-01-10T10:06:00Z", "reverted demo#7 sha=1"), ("2026-01-10T10:07:00Z", "removed 2 scratch roots"),
+            (OUT, "queued r#6 who=x")])
+        _, idx, got = run({"state/land/queue.log": q})
+        L = got["landings"]
+        case("landings fold to one row per PR with stages, verdicts and the last event; no-board and older lines dropped",
+             len(L) == 1 and L[0]["pr"] == "r#7" and L[0]["stages"] == ["checking", "review"] and L[0]["verdicts"] == ["LAND"]
+             and L[0]["last_event"] == "done rc=0" and L[0]["events"]["stage"] == 3
+             and idx["sources"]["landings"]["dropped_no_board"] == 1 and idx["sources"]["landings"]["box_events"] == {"removed": 1})
+
+        # board log
+        _, idx, got = run({"boards/r.json": json.dumps({"repo": "r", "log": [
+            {"ts": OUT, "track": "t", "msg": "status -> queued"}, {"ts": IN, "track": "t", "msg": "status -> running"},
+            {"ts": IN, "track": "t", "msg": "note one"}, {"ts": IN, "track": "t", "msg": "note two"},
+            {"ts": IN, "track": "t", "msg": "note three"}, {"ts": IN, "track": "gone", "msg": "removed"}]}),
+            "boards/_scratch.json": json.dumps({"repo": "_scratch", "log": [{"ts": IN, "track": "x", "msg": "status -> running"}]})})
+        B = got["board"]
+        case("board folds a track's log in the window to its statuses and last two notes; a removal alone, an older "
+             "entry and a scratch board are left out",
+             len(B) == 1 and B[0]["track"] == "t" and B[0]["statuses"] == ["01-10T12:00 running"] and B[0]["n"] == 4
+             and [n[12:] for n in B[0]["notes"]] == ["note two", "note three"] and idx["sources"]["board"]["removed_only"] == 1)
+
+        # failures
+        _, _, got = run({"failures/r.jsonl": arch(
+            {"id": "f1", "ts": IN, "scope": "r", "kind": "a/b", "observed": "o1", "cluster": "c1"},
+            {"id": "f2", "ts": "2026-01-10T13:00:00Z", "scope": "r", "kind": "a/b", "observed": "o2", "cluster": "c1"},
+            {"id": "f3", "ts": IN, "scope": "r", "kind": "a/b", "observed": "o3", "cluster": "c1"},
+            {"id": "f4", "ts": IN, "scope": "r", "kind": "c/d", "observed": "o4"},
+            {"id": "f0", "ts": OUT, "scope": "r", "kind": "a/b", "observed": "old"})})
+        F = {r["kind"]: r for r in got["failures"]}
+        case("failures fold per repo and kind, commonest first, two examples each; an older record left out",
+             [r["kind"] for r in got["failures"]] == ["a/b", "c/d"] and F["a/b"]["n"] == 3 and F["a/b"]["ids"] == ["f1", "f3", "f2"]
+             and F["a/b"]["examples"] == ["o1", "o3"] and F["a/b"]["last"] == "2026-01-10T13:00:00Z" and F["a/b"]["clusters"] == ["c1"])
+
+        # loops
+        _, _, got = run({"state/r/t/loop.log": f"{IN} iter 1/3 start (budget $5)\n{IN} iter 1 end rc=0 err=false/success\n"
+                                                f"{IN} iter 2 end rc=124 err=/ turns=\n{IN} exit 1: 3 consecutive failures\n"
+                                                f"{IN} DONE\n{OUT} DONE\n{OUT} iter 1 end rc=1 err=true\n"})
+        Lp = got["loops"]
+        case("loops fold a track's exits in the window: iterations, failed ones, DONE and exit lines; starts and older lines not",
+             len(Lp) == 1 and (Lp[0]["iters"], Lp[0]["iter_errors"], Lp[0]["done"], Lp[0]["blocked"]) == (2, 1, 1, 0)
+             and Lp[0]["exits"] == ["01-10T12:00 exit 1: 3 consecutive failures"] and Lp[0]["last_line"] == "DONE")
+
+        # journals: touched in the window kept, an older one not
+        h = fx({"state/r/t/progress.md": "## entry\nSTATUS: DONE\n", "state/r/u/progress.md": "old\n",
+                "state/r/plan-handoff.md": "handing over\n"})
+        for rel, when in (("state/r/t/progress.md", IN), ("state/r/u/progress.md", OUT), ("state/r/plan-handoff.md", IN)):
+            t = datetime.strptime(when, ISO).replace(tzinfo=timezone.utc).timestamp()
+            os.utime(home(rel), (t, t))
+        collect(W, os.path.join(h, "snap"))
+        J = list(jlines(os.path.join(h, "snap", "journals.jsonl")))
+        case("journals lists files modified in the window with their STATUS, and skips an older one",
+             sorted((r["path"], r["kind"], r["status"]) for r in J)
+             == [("r/plan-handoff.md", "handoff", ""), ("r/t/progress.md", "journal", "STATUS: DONE")])
+
+        # handoffs
+        _, _, got = run({"state/context/handoffs.jsonl": arch(
+            {"ts": IN, "kind": "started", "repo": "r", "target": "r"}, {"ts": OUT, "kind": "old", "repo": "r"},
+            {"ts": datetime(2026, 1, 10, 14, tzinfo=timezone.utc).timestamp(), "kind": "epoch", "repo": "r"},
+            {"ts": 1.0, "kind": "epoch-old", "repo": "r"})})
+        case("handoffs keeps rows in the window, an epoch-seconds stamp read as the same UTC time",
+             [(r["kind"], r["ts"]) for r in got["handoffs"]] == [("started", IN), ("epoch", "2026-01-10T14:00:00Z")])
+
+        # spend: summed per repo/kind/model, sessions counted once, an older row out
+        tsv = "#ts\tsession\tcwd\trepo\ttrack\tkind\tmodel\tin\tout\tcache_read\tcache_write\test_usd\n" + "".join(
+            "\t".join(map(str, r)) + "\n" for r in [
+                (IN, "s1", "/", "r", "t", "headless", "m", 1, 2, 3, 4, 0.5), (IN, "s1", "/", "r", "t", "headless", "m", 1, 2, 3, 4, 0.25),
+                (IN, "s2", "/", "r", "u", "headless", "m", 1, 1, 1, 1, 1.0)])
+        _, idx, got = run({"state/spend/2026-01-10.tsv": tsv,
+                           "state/spend/2026-01-09.tsv": tsv.split("\n")[0] + f"\n{OUT}\ts9\t/\tr\tt\theadless\tm\t9\t9\t9\t9\t9\n"})
+        K = [r for r in got["spend"] if r["by"] == "kind"]
+        T = {r["track"]: r["usd"] for r in got["spend"] if r["by"] == "track"}
+        case("spend sums per repo, kind and model and ranks tracks, rows before the window left out",
+             len(K) == 1 and K[0]["sessions"] == 2 and K[0]["cache_read"] == 7 and K[0]["usd"] == 1.75
+             and T == {"u": 1.0, "t": 0.75} and idx["per_repo"]["r"]["usd"] == 1.75)
+
+        # caps: text cut and a file over its line cap keeps its newest rows, the rest counted
+        long = "x" * 5000
+        _, idx, got = run({"slack/outbox.log": "".join(f"2026-01-10T{i // 60:02d}:{i % 60:02d}:00Z\tpost\tC1\t\t{long}\n"
+                                                       for i in range(CAP["outbox"] + 5))})
+        case("a text is cut to its length and a file past its cap keeps the newest rows and counts the rest",
+             len(got["outbox"]) == CAP["outbox"] and len(got["outbox"][0]["text"]) == TEXT["outbox"]
+             and idx["sources"]["outbox"]["truncated"] == 5 and got["outbox"][0]["at"] == "2026-01-10T00:05:00Z")
+
+        # a ranked file past its cap keeps its biggest rows, not its newest
+        _, idx, got = run({"failures/r.jsonl": arch(*[{"id": f"f{k}.{i}", "ts": f"2026-01-10T{k % 24:02d}:00:00Z", "scope": "r",
+                                                        "kind": f"k/{k}"} for k in range(CAP["failures"] + 2) for i in range(1 + (k < 2))])})
+        case("failures past the cap keep the commonest kinds first and count the rest",
+             [r["kind"] for r in got["failures"][:2]] == ["k/0", "k/1"] and len(got["failures"]) == CAP["failures"]
+             and idx["sources"]["failures"]["truncated"] == 2)
+
+        # missing sources named, not an error
+        _, idx, _ = run({})
+        case("an empty box writes every file and names what was missing",
+             "slack/outbox.log" in idx["missing"] and "state/land/queue.log" in idx["missing"]
+             and set(idx["sources"]) == {n for n, _ in SOURCES})
+
+        # backfill: owner only, threads followed, errors named; its rows reach slack.jsonl, deduped against the archive
+        h = fx({"slack/archive/r/C1/2026-01.jsonl": arch(
+            {"ts": "1768046400.000100", "thread_ts": "1768046400.000100", "chat": "C1", "role": "owner", "target": "r", "text": "dup", "at": IN})})
+        calls = []
+
+        def fake(method, token, **kw):
+            calls.append((method, kw.get("channel"), kw.get("oldest"), kw.get("latest")))
+            if kw["channel"] == "C2":
+                raise RuntimeError("not_in_channel")
+            if method == "conversations.history":
+                if not kw.get("cursor"):
+                    return {"messages": [{"ts": "1768046400.000100", "user": "UO", "text": "dup"},
+                                         {"ts": "1768046500.0", "user": "UO", "text": "parent", "reply_count": 1}],
+                            "response_metadata": {"next_cursor": "p2"}}
+                return {"messages": [{"ts": "1768046600.0", "user": "UM", "text": "member"},
+                                     {"ts": "1768046700.0", "user": "UO", "subtype": "channel_join", "text": "j"}]}
+            return {"messages": [{"ts": "1768046500.0", "user": "UO", "text": "parent"},
+                                 {"ts": "1768046550.0", "user": "UO", "text": "reply", "thread_ts": "1768046500.0"}]}
+        rows, errs = backfill(fake, "tok", "UO", {"C1": "r", "C2": "r"}, datetime(2026, 1, 10, tzinfo=timezone.utc),
+                              datetime(2026, 1, 11, tzinfo=timezone.utc), pause=0)
+        merge_backfill(rows)
+        collect(W, os.path.join(h, "snap"))
+        S = list(jlines(os.path.join(h, "snap", "slack.jsonl")))
+        case("backfill keeps the owner's messages and replies, skips members and joins, names a chat it cannot read",
+             sorted(r["text"] for r in rows) == ["dup", "parent", "reply"] and errs.keys() == {"C2"}
+             and all(c[0].startswith("conversations.") for c in calls) and calls[0][2] == str(datetime(2026, 1, 10, tzinfo=timezone.utc).timestamp()))
+        case("backfilled rows reach slack.jsonl, a message already archived appears once",
+             sorted(r["text"] for r in S) == ["dup", "parent", "reply"]
+             and [r.get("source") for r in S if r["text"] == "dup"] == [None]
+             and not os.path.exists(home("slack", "archive", "r", "C1", "backfill.jsonl")))
+
+        # the command itself: default name, latest link, a second run replaces, old ones pruned
+        h = fx({"slack/outbox.log": ""})
+        old = home("state", "improve", "snapshots", "2000-01-01")
+        os.makedirs(old)
+        os.utime(old, (time.time() - (KEEP_DAYS + 1) * 86400,) * 2)
+        p1 = subprocess.run([sys.executable, __file__], capture_output=True, text=True, env={**os.environ, "HOME": h}, timeout=60)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        root = home("state", "improve", "snapshots")
+        case("a default run writes <today>/, points latest at it and removes a snapshot written over 90 days ago",
+             p1.returncode == 0 and os.readlink(os.path.join(root, "latest")) == today
+             and os.path.exists(os.path.join(root, today, "index.json")) and not os.path.exists(old))
+        p2 = subprocess.run([sys.executable, __file__, "--since", "2026-01-01", "--until", "2026-01-03"], capture_output=True,
+                            text=True, env={**os.environ, "HOME": h}, timeout=60)
+        case("--since/--until name the snapshot by both dates; --help prints the contract",
+             p2.returncode == 0 and os.path.isdir(os.path.join(root, "2026-01-01..2026-01-03"))
+             and os.readlink(os.path.join(root, "latest")) == "2026-01-01..2026-01-03"
+             and "backfill-slack" in subprocess.run([sys.executable, __file__, "--help"], capture_output=True, text=True).stdout)
+        case("a bad time is refused with a line, not a traceback",
+             subprocess.run([sys.executable, __file__, "--since", "yesterdayish"], capture_output=True, text=True,
+                            env={**os.environ, "HOME": h}).stderr.startswith("cc-collect: cannot read"))
+    finally:
+        if real_home is not None:
+            os.environ["HOME"] = real_home
+        for h in homes:
+            shutil.rmtree(h, ignore_errors=True)
+    bad = results.count(False)
+    print(f"cc-collect selfcheck: {len(results) - bad} passed, {bad} failed")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"], ["help"]):
+        print(__doc__)
+        return 0
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] == ["backfill-slack"]:
+        return cmd_backfill(argv[1:])
+    return cmd_collect(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
