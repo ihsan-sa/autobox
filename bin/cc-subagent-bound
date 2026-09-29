@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""cc-subagent-bound — a subagent's context has a bound, the way a seat's hand-off line bounds a seat.
+
+  cc-subagent-bound hook < payload.json     PreToolUse, every tool: a subagent's call past the bound is refused
+                                            with an order to save its work and return a report
+  cc-subagent-bound measure [--since YYYY-MM-DD] [--over TOKENS]
+                                            the spend figure the bound is judged by, over ~/.claude/projects/*/*/
+                                            subagents/agent-*.jsonl touched since that day (UTC, default 7 days ago)
+  cc-subagent-bound selfcheck               fixture transcripts and payloads in a HOME of their own
+
+WHY. A seat hands off near 150k (cc-context) and a worker starts fresh every cc-loop iteration, but a subagent had
+no bound at all, and every call re-reads its whole context as cache, so its cost grows with the square of its
+length. Since 2026-09-24, 18 of 615 subagent transcripts grew past 300k and carried 3.9B of the 6.6B cache-read
+tokens all subagents read; one Sonnet builder made 2070 calls and reached 966k.
+
+THE RULE. The hook acts only on a payload carrying agent_id, which the harness sets on a subagent's own tool calls
+and never on a session's. It reads that subagent's transcript (agent_transcript_path when the payload has one,
+else <transcript_path minus .jsonl>/subagents/agent-<agent_id>.jsonl) and takes USED as cc-context does: the last
+assistant entry's input + cache_creation + cache_read, or a later compact_boundary's postTokens.
+  used < BOUND, never crossed    nothing: no output, the call runs
+  used >= BOUND, first time      the call is REFUSED with the wrap-up order (save the work in the worktree and a
+                                 progress file there, then end the turn with a report the parent can re-spawn from);
+                                 the crossing is recorded in ~/.cc/state/subagent-bound/<session>-<agent>.json
+  crossed, used < crossed+GRACE  the call runs: this is the room to commit and write the report
+  crossed, used >= crossed+GRACE every call is refused: end the turn now. Ending a turn needs no tool, so the report
+                                 still reaches the parent and nothing the subagent wrote is lost.
+BOUND is CC_SUBAGENT_CONTEXT_TOKENS (env, else ~/.cc/config; default 150000, the seat's hand-off figure; 0 = off),
+GRACE is CC_SUBAGENT_WRAPUP_TOKENS (default 30000). At the bound counts as past it. No model call is made, and any
+error decides nothing: a hook that cannot read its input or transcript leaves the call alone.
+
+MEASURE prints, per the method the brief used: the files, the sum of cache_read_input_tokens over every assistant
+line, the count of files whose largest context passed --over (default 300000) and their share of that sum. The
+harness logs one message's usage once per content block, so that sum counts a turn more than once; the same
+figures deduplicated by requestId follow on a second line, which is the real spend.
+"""
+import datetime, glob, json, os, re, shutil, subprocess, sys, tempfile, time
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+STATE = os.path.join(os.path.expanduser("~"), ".cc", "state", "subagent-bound")
+PROJECTS = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+TAIL = 256 * 1024
+MAX_TAIL = 32 * 1024 * 1024
+
+WRAP = ("CONTEXT BOUND: this subagent's context is {used:,} tokens, at or past the box's bound of {bound:,} "
+        "(CC_SUBAGENT_CONTEXT_TOKENS), and every further call re-reads all of it. This call was NOT run. Wrap up now, "
+        "and do not start new work: (1) save what you have, so leave or commit your edits in your worktree and write "
+        "a short progress file there (what is done, what is left, the next step); (2) then end your turn with a final "
+        "report the parent can re-spawn you from, saying you stopped at the context bound, what is done and where it "
+        "is, what is left, and the exact next step. You have about {grace:,} more tokens for that; after them every "
+        "tool call is refused.")
+STOP = ("CONTEXT BOUND: this subagent is {used:,} tokens in, past the bound of {bound:,} plus its {grace:,}-token "
+        "wrap-up. Every tool call is refused from here. End your turn now with your final report: that you stopped "
+        "at the context bound, what is done and where it is, what is left, and the exact next step.")
+
+
+def cfg(name, default):
+    """A number from the environment, else ~/.cc/config through cc-config (which never sources the file)."""
+    v = os.environ.get(name)
+    if v is None:
+        try:
+            r = subprocess.run([os.path.join(BIN, "cc-config"), "get", name], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=5)
+            v = r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            v = None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def used_of(path):
+    """The subagent's context now: the last assistant usage in the file's tail, or a later compact's postTokens.
+    None when there is no assistant entry at all (a subagent's first call)."""
+    n = TAIL
+    size = os.path.getsize(path)
+    while True:
+        with open(path, "rb") as f:
+            start = max(0, size - n)
+            f.seek(start)
+            buf = f.read()
+        if start:
+            buf = buf.split(b"\n", 1)[1] if b"\n" in buf else b""
+        used = None
+        for line in buf.decode("utf-8", "replace").split("\n"):
+            if '"assistant"' not in line and '"compact_boundary"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue                      # a half-written last line is normal while the subagent runs
+            if not isinstance(d, dict):
+                continue
+            if d.get("type") == "assistant":
+                u = (d.get("message") or {}).get("usage") or {}
+                if u:
+                    used = sum(int(u.get(k) or 0) for k in
+                               ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+            elif d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+                post = (d.get("compactMetadata") or {}).get("postTokens")
+                if isinstance(post, int):
+                    used = post
+        if used is not None or start == 0 or n >= MAX_TAIL:
+            return used
+        n *= 4
+
+
+def transcript_of(p):
+    t = p.get("agent_transcript_path")
+    if isinstance(t, str) and t:
+        return t
+    base = p.get("transcript_path")
+    if not (isinstance(base, str) and base.endswith(".jsonl")):
+        return None
+    return os.path.join(base[:-len(".jsonl")], "subagents", f"agent-{p['agent_id']}.jsonl")
+
+
+def deny(reason):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
+
+
+def hook(raw):
+    """The decision for one payload, printed; 0 always (a deny is JSON on exit 0, never exit 2)."""
+    try:
+        p = json.loads(raw)
+    except Exception:
+        return 0
+    if not isinstance(p, dict):
+        return 0
+    agent = p.get("agent_id")
+    if not (isinstance(agent, str) and AGENT_RE.match(agent)):
+        return 0                              # a session's own call: seats have cc-context, workers cc-loop
+    bound = cfg("CC_SUBAGENT_CONTEXT_TOKENS", 150000)
+    if bound <= 0:
+        return 0
+    grace = max(0, cfg("CC_SUBAGENT_WRAPUP_TOKENS", 30000))
+    try:
+        path = transcript_of(p)
+        used = used_of(path) if path and os.path.isfile(path) else None
+    except Exception:
+        used = None
+    if used is None:
+        return 0
+    sid = p.get("session_id") if isinstance(p.get("session_id"), str) and AGENT_RE.match(p["session_id"]) else "-"
+    mark = os.path.join(STATE, f"{sid}-{agent}.json")
+    try:
+        with open(mark) as f:
+            crossed = int(json.load(f)["used"])
+    except Exception:
+        crossed = None
+    if crossed is None:
+        # "a subagent past a configurable context bound ... is made to wrap up and return" (the brief): at counts as past
+        if used < bound:
+            return 0
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(mark, "w") as f:
+                json.dump({"used": used, "bound": bound, "ts": int(time.time()), "transcript": path}, f)
+        except OSError:
+            pass                              # unrecorded, the next call is refused the same way: never lets it run on
+        deny(WRAP.format(used=used, bound=bound, grace=grace))
+        return 0
+    if used < crossed + grace:
+        return 0
+    deny(STOP.format(used=used, bound=bound, grace=grace))
+    return 0
+
+
+def measure(since, over, out=sys.stdout, root=None):
+    files = n_over = 0
+    tot = [0, 0]
+    big = [0, 0]
+    for f in glob.glob(os.path.join(root or PROJECTS, "*", "*", "subagents", "agent-*.jsonl")):
+        try:
+            if os.path.getmtime(f) < since:
+                continue
+            fh = open(f, errors="replace")
+        except OSError:
+            continue
+        files += 1
+        s = [0, 0]
+        peak = 0
+        seen = set()
+        with fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(d, dict) or d.get("type") != "assistant":
+                    continue
+                m = d.get("message") or {}
+                u = m.get("usage") or {}
+                cr = int(u.get("cache_read_input_tokens") or 0)
+                s[0] += cr
+                key = d.get("requestId") or m.get("id") or id(d)
+                if key not in seen:
+                    seen.add(key)
+                    s[1] += cr
+                peak = max(peak, int(u.get("input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0) + cr)
+        tot = [tot[0] + s[0], tot[1] + s[1]]
+        if peak > over:
+            n_over += 1
+            big = [big[0] + s[0], big[1] + s[1]]
+    day = datetime.datetime.fromtimestamp(since, datetime.timezone.utc).strftime("%Y-%m-%d")
+    share = lambda a, b: f"{100 * a / b:.0f}%" if b else "-"
+    print(f"since {day}: {files} subagent transcripts; cache_read summed per line {tot[0] / 1e9:.2f}B; "
+          f"{n_over} over {over:,} context carry {big[0] / 1e9:.2f}B ({share(big[0], tot[0])})", file=out)
+    print(f"  deduplicated by requestId: {tot[1] / 1e9:.2f}B; those {n_over} carry {big[1] / 1e9:.2f}B "
+          f"({share(big[1], tot[1])})", file=out)
+    return files, tot, n_over, big
+
+
+def selfcheck():
+    import contextlib, io
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        if cond:
+            p += 1
+        else:
+            f += 1
+            print(f"  FAIL {name}")
+
+    global STATE
+    home = tempfile.mkdtemp(prefix="cc-subagent-bound-selfcheck-")
+    state0, env0 = STATE, {k: os.environ.pop(k, None) for k in
+                           ("CC_SUBAGENT_CONTEXT_TOKENS", "CC_SUBAGENT_WRAPUP_TOKENS", "CC_CONFIG")}
+    STATE = os.path.join(home, "state")
+    os.environ["CC_CONFIG"] = os.path.join(home, "config")        # an empty config: the box's own must not move a line
+    open(os.environ["CC_CONFIG"], "w").close()
+    proj = os.path.join(home, "projects", "-dev-x")
+    os.makedirs(proj)
+
+    def asst(cr, rid="r", cc=100, inp=5):
+        return {"type": "assistant", "isSidechain": True, "requestId": rid, "message": {"usage": {
+            "input_tokens": inp, "cache_creation_input_tokens": cc, "cache_read_input_tokens": cr}}}
+
+    def sub(parent, agent, entries):
+        d = os.path.join(proj, parent, "subagents")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"agent-{agent}.jsonl")
+        with open(path, "w") as fh:
+            for e in entries:
+                fh.write(json.dumps(e) + "\n")
+        return path
+
+    def payload(parent, agent=None, **kw):
+        d = {"session_id": parent, "transcript_path": os.path.join(proj, parent + ".jsonl"), "cwd": home,
+             "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "true"}}
+        if agent:
+            d["agent_id"] = agent
+        d.update(kw)
+        return json.dumps(d)
+
+    def run(raw):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = hook(raw)
+        s = out.getvalue()
+        return rc, (json.loads(s)["hookSpecificOutput"] if s.strip() else None)
+
+    try:
+        # 1. under the bound: the call runs, nothing is recorded
+        sub("s1", "a1", [asst(9000), asst(100000)])
+        rc, d = run(payload("s1", "a1"))
+        ok("under the bound: no decision", rc == 0 and d is None)
+        ok("under the bound: no crossing recorded", not os.path.exists(os.path.join(STATE, "s1-a1.json")))
+
+        # 2. at the bound exactly, on its own fixture: refused with the wrap-up order, and the crossing recorded
+        sub("s2", "a2", [asst(9000), asst(150000 - 105)])
+        rc, d = run(payload("s2", "a2"))
+        ok("at the bound: refused", rc == 0 and d and d["permissionDecision"] == "deny")
+        ok("the refusal orders a save and a report", d and "progress file" in d["permissionDecisionReason"]
+           and "re-spawn" in d["permissionDecisionReason"] and "150,000" in d["permissionDecisionReason"])
+        ok("the crossing is recorded", json.load(open(os.path.join(STATE, "s2-a2.json")))["used"] == 150000)
+        # one token under, a sibling: untouched
+        sub("s2", "a2b", [asst(150000 - 106)])
+        ok("one token under the bound: no decision", run(payload("s2", "a2b"))[1] is None)
+
+        # 3. inside the wrap-up room the calls run; past it every call is refused with the stop order
+        sub("s3", "a3", [asst(200000)])
+        run(payload("s3", "a3"))
+        sub("s3", "a3", [asst(200000), asst(229000)])
+        ok("inside the wrap-up room: the call runs", run(payload("s3", "a3"))[1] is None)
+        sub("s3", "a3", [asst(200000), asst(229000), asst(240000)])
+        rc, d = run(payload("s3", "a3"))
+        ok("past the wrap-up room: refused with the stop order",
+           d and d["permissionDecision"] == "deny" and "End your turn now" in d["permissionDecisionReason"])
+        ok("…and again on the next call", (run(payload("s3", "a3"))[1] or {}).get("permissionDecision") == "deny")
+
+        # 4. a session's own call (no agent_id) is never judged, however large its context
+        with open(os.path.join(proj, "s4.jsonl"), "w") as fh:
+            fh.write(json.dumps(asst(900000)) + "\n")
+        sub("s4", "a4", [asst(900000)])
+        ok("a session's own call: no decision", run(payload("s4"))[1] is None)
+        ok("the same subagent's call: refused", (run(payload("s4", "a4"))[1] or {}).get("permissionDecision") == "deny")
+
+        # 5. the bound is configurable, and 0 switches it off
+        sub("s5", "a5", [asst(60000)])
+        os.environ["CC_SUBAGENT_CONTEXT_TOKENS"] = "50000"
+        ok("a lower configured bound refuses at 60k", (run(payload("s5", "a5"))[1] or {}).get("permissionDecision") == "deny")
+        sub("s5", "a5b", [asst(60000)])
+        os.environ["CC_SUBAGENT_CONTEXT_TOKENS"] = "0"
+        ok("bound 0: off", run(payload("s5", "a5b"))[1] is None)
+        with open(os.environ["CC_CONFIG"], "w") as fh:
+            fh.write("CC_SUBAGENT_CONTEXT_TOKENS=50000\n")
+        os.environ.pop("CC_SUBAGENT_CONTEXT_TOKENS")
+        ok("the bound is read from ~/.cc/config", (run(payload("s5", "a5b"))[1] or {}).get("permissionDecision") == "deny")
+        open(os.environ["CC_CONFIG"], "w").close()
+
+        # 6. a compact after the last turn measures its postTokens; agent_transcript_path wins over the derived path
+        sub("s6", "a6", [asst(400000), {"type": "system", "subtype": "compact_boundary",
+                                          "compactMetadata": {"preTokens": 400000, "postTokens": 20000}}])
+        ok("a compact brings it under: no decision", run(payload("s6", "a6"))[1] is None)
+        other = sub("s6x", "elsewhere", [asst(300000)])
+        ok("agent_transcript_path is the file read",
+           (run(payload("s6", "a6", agent_transcript_path=other))[1] or {}).get("permissionDecision") == "deny")
+
+        # 7. nothing readable decides nothing: bad JSON, a missing transcript, a first call with no turn yet, a bad id
+        ok("bad JSON: no decision", run("{not json")[1] is None)
+        ok("no transcript: no decision", run(payload("s7", "missing"))[1] is None)
+        sub("s7", "fresh", [{"type": "user", "message": {"content": "go"}}])
+        ok("no assistant turn yet: no decision", run(payload("s7", "fresh"))[1] is None)
+        sub("s7", "a7", [asst(900000)])
+        ok("an agent_id with a path in it: no decision", run(payload("s7", "../s7/subagents/agent-a7"))[1] is None)
+
+        # 8. the file on disk is what is measured: a real transcript's usage shape, a half-written last line
+        path = sub("s8", "a8", [asst(10, rid="x")])
+        with open(path, "a") as fh:
+            fh.write(json.dumps(asst(170000, rid="y")) + "\n" + '{"type":"assistant","message":{"usa')
+        ok("a half-written last line is skipped", used_of(path) == 170105)
+
+        # 9. measure: per-line and deduplicated sums, and the over-count by peak context
+        mroot = os.path.join(home, "m")
+        for parent, agent, entries in (("p", "big", [asst(200000, "r1"), asst(200000, "r1"), asst(310000, "r2")]),
+                                       ("p", "small", [asst(1000, "q1"), asst(2000, "q2")])):
+            d = os.path.join(mroot, "-dev-y", parent, "subagents")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, f"agent-{agent}.jsonl"), "w") as fh:
+                fh.write("".join(json.dumps(e) + "\n" for e in entries))
+        buf = io.StringIO()
+        files, tot, n_over, big = measure(0, 300000, out=buf, root=mroot)
+        ok("measure: files, per-line sum, dedup sum", files == 2 and tot == [713000, 513000])
+        ok("measure: the over-count is by peak context", n_over == 1 and big == [710000, 510000])
+        ok("measure: the report names both figures", "per line 0.00B" in buf.getvalue()
+           and "deduplicated" in buf.getvalue())
+        old = os.path.join(mroot, "-dev-y", "p", "subagents", "agent-small.jsonl")
+        os.utime(old, (1000, 1000))
+        ok("measure: --since drops an older file", measure(2000, 300000, out=io.StringIO(), root=mroot)[0] == 1)
+    finally:
+        STATE = state0
+        for k, v in env0.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(home, ignore_errors=True)
+    print(f"cc-subagent-bound selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+def main(argv):
+    if argv[:1] == ["hook"]:
+        try:
+            return hook(sys.stdin.read())
+        except Exception:
+            return 0
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] == ["measure"]:
+        since = time.time() - 7 * 86400
+        over = 300000
+        a = argv[1:]
+        try:
+            while a:
+                k = a.pop(0)
+                if k == "--since":
+                    since = datetime.datetime.strptime(a.pop(0), "%Y-%m-%d").replace(
+                        tzinfo=datetime.timezone.utc).timestamp()
+                elif k == "--over":
+                    over = int(a.pop(0))
+                else:
+                    raise ValueError(k)
+        except (ValueError, IndexError):
+            print(__doc__.split("\n\n")[1], file=sys.stderr)
+            return 2
+        measure(since, over)
+        return 0
+    print(__doc__.split("\n\n")[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
