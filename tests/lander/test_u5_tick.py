@@ -269,6 +269,55 @@ class Tick(unittest.TestCase):
             self.assertTrue(got)
             self.assertIn("a tip run is already going", self.tick())
 
+    def test_a_busy_lane_does_not_keep_a_deployed_job_pending(self):
+        # merged PRs sat deploy-pending for hours: the lane gated back to back and settle waited on its lock.
+        D.record_applied("demo", self.first)
+        sha = self.merged({"app/x": "5\n"})
+        with J.lane_lock("demo") as got:
+            self.assertTrue(got)
+            self.tick()
+        self.assertEqual(D.applied("demo"), sha)
+        self.assertEqual(J.load("demo", 7).state, T.DONE)
+        self.assertIn("done demo#7 rc=0", self.log())
+
+    def test_a_second_tick_skips_the_settle_while_one_holds_the_rest_lock(self):
+        D.record_applied("demo", self.first)
+        self.merged({"app/x": "6\n"})
+        with mock.patch.object(TK, "settle", lambda repo: []):   # deployed, not yet settled
+            self.tick()
+        with J.rest_lock("demo") as got:   # held by another tick (this test calls settle itself: its lane's
+            self.assertTrue(got)           # drain would wait on this lock)
+            self.assertEqual(TK.settle("demo"), [])
+            self.assertEqual(TK.retry_deploys(["demo"]), [])
+            self.assertEqual(J.load("demo", 7).state, T.DEPLOY_PENDING)
+        self.tick()
+        self.assertEqual(J.load("demo", 7).state, T.DONE)
+
+    def test_a_deploy_retry_leaves_a_job_a_settle_ended(self):
+        D.record_applied("demo", self.first)
+        self.merged({"app/x": "7\n"})
+        stale = J.load("demo", 7)
+        stale.extra["post"].pop("deploy")
+        self.tick()
+        self.assertEqual(J.load("demo", 7).state, T.DONE)
+        with mock.patch.object(J, "lane_jobs", lambda repo: [stale]):
+            self.assertEqual(TK.retry_deploys(["demo"]), [])
+        self.assertEqual(J.load("demo", 7).state, T.DONE)
+
+    def test_a_drain_waits_for_a_settle_holding_the_rest_lock(self):
+        import threading
+        J.submit("demo", 8, who="test")
+        out = []
+        with J.rest_lock("demo") as got:
+            self.assertTrue(got)
+            t = threading.Thread(target=lambda: out.extend(J.drain("demo")))
+            t.start()
+            t.join(0.3)
+            self.assertTrue(t.is_alive())
+            self.assertIsNone(J.load("demo", 8))
+        t.join(10)
+        self.assertEqual(out, ["demo#8 queued"])
+
 
 if __name__ == "__main__":
     unittest.main()

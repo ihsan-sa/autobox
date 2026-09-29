@@ -91,6 +91,16 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0") -> tuple:
         g = ["git", "-C", head, "-c", "user.name=lander", "-c", "user.email=lander@localhost"]
         subprocess.run(g + ["init", "-q"], check=True, capture_output=True)
         subprocess.run(g + ["add", "-A", "-f"], check=True, capture_output=True)
+        # a submodule (gitlink) is written out as an empty directory, which add cannot turn back into the link; it
+        # has no files to prove, so it is taken from the tree itself (a repo with a submodule was never runnable)
+        ls = subprocess.run(["git", "-C", repo_root, "ls-tree", "-r", "-z", tree], capture_output=True, text=True)
+        if ls.returncode:
+            raise Unrunnable(f"could not list the tree: {ls.stderr.strip()[-300:]}")
+        for ent in ls.stdout.split("\0"):
+            meta, _, path = ent.partition("\t")
+            if meta.startswith("160000 commit "):
+                subprocess.run(g + ["update-index", "--add", "--cacheinfo", f"160000,{meta.split()[2]},{path}"],
+                               check=True, capture_output=True)
         got = subprocess.run(g + ["write-tree"], capture_output=True, text=True).stdout.strip()
         if got != tree:
             raise Unrunnable(f"the tree written out is {got or 'none'}, not {tree}")

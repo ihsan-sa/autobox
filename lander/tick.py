@@ -7,16 +7,17 @@
             member) -> the reads it used go to carry/ and a request (chat/ts/who only) to the inbox, `handed-pushed`,
             removed. The prior verdict is not carried: the reviewer finds it among the box's own PR markers.
             A job for the PR already on the queue ends the watch.
-  deploy    for each repo with a deploy-pending job, under its lane lock: tip.kick(repo) and a deploy.request not
-            yet made — only when those units are installed.
+  deploy    for each repo with a deploy-pending job, under its rest lock (jobs.rest_lock): tip.kick(repo) and a
+            deploy.request not yet made — only when those units are installed.
   tip       for each repo the box knows (boards, <repo>.applied, jobs; members and paused repos skipped), under the
             repo's tip lock (a second tick skips it, never waits): tip.catchup at most every $LANDER_CATCHUP_SECS
             (900) per repo — origin's main past <repo>.applied kicks a tip run, a first sight seeds .applied; then
             tip.run, whose checks are the box-class checks the merged range reaches (tip_plan), each run on its
             commit by U2's runner (make_check). Green deploys that sha (deploy.run); red holds the targets, bisects
             and reverts a proven breaker. Then deploy.run again, for a request whose tip is already green (a retry).
-  settle    each deploy-pending job, under the lane lock, once the request covering its tip_sha (that sha or a
-            later one) has no target waiting: -> deployed -> done, and `done` rc 0 (verified), 4 (UNVERIFIED) or 1
+  settle    each deploy-pending job, under the rest lock (not the lane lock: a busy lane holds that from one job to
+            the next, and the lane never takes up a job it rested), once the request covering its tip_sha (that sha
+            or a later one) has no target waiting: -> deployed -> done, and `done` rc 0 (verified), 4 (UNVERIFIED) or 1
             (failed). A job whose merge the tip run reverted -> done rc 1.
   backoff   while the GitHub backoff runs (gh.py) no gh work is done: said once, lanes and watches wait.
   rearm     every tick (--rearm is accepted and adds nothing): ONE transient timer per repo that still waits on
@@ -104,13 +105,16 @@ def retry_deploys(repos) -> list:
         pending = [j for j in J.lane_jobs(repo) if j.state == T.DEPLOY_PENDING]
         if not pending:
             continue
-        with J.lane_lock(repo) as got:
-            if not got:
+        with J.rest_lock(repo) as got:
+            if not got:   # a settle or a drain has it; the next tick retries
                 continue
             if tip:
                 with contextlib.suppress(Exception):
                     tip.kick(repo)
             for job in pending if deploy else []:
+                job = J.load(repo, job.pr)   # read again under the lock: a settle may have ended it
+                if job is None or job.state != T.DEPLOY_PENDING:
+                    continue
                 post = job.extra.setdefault("post", {})
                 if post.get("deploy") == "ok" or not job.extra.get("tip_sha"):
                     continue
@@ -254,8 +258,8 @@ def settle(repo) -> list:
     rc = D.outcome(req)
     reverted = C.read_json(C.state("tip", f"{repo}.reverted"), []) or []
     root, lines = D.root_of(repo), []
-    with J.lane_lock(repo) as got:
-        if not got:   # the lane is running; the timer brings the next tick
+    with J.rest_lock(repo) as got:
+        if not got:   # another tick is settling, or the lane is draining a request; the timer brings the next tick
             return []
         for job in pending:
             job = J.load(repo, job.pr)

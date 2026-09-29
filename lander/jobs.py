@@ -8,6 +8,9 @@ PATHS are read from the environment at CALL time, so a test (or a second box lay
   inbox    <LANDQ>/jobs/new/<repo>-<pr>.<pid>.<nonce>.json — what anyone may write (submit); only the lane, holding
            its repo's lock, folds a request into the job (drain). So the lane is the job file's one writer.
   lanes    <LANDQ>/lanes/<repo>.lock (flock) + <repo>.running {pid, since}; <LANDQ>/lanes/gh.backoff (gh.py).
+           <LANDQ>/lanes/<repo>.settle (flock): what the tick holds to settle a deploy-pending job, and drain
+           holds to write one. The lane rests a job there and never takes it up again, so settling does not need
+           the lane lock, which a busy lane holds from one job to the next.
   handed   <LANDQ>/handed/<repo>-<pr>.json — the watch on a handed-back PR (lane.handback, tick).
   rest     <LANDQ>/rest/<repo>-<pr>.json — a job that has ENDED (done, query, handback). The old lander unlinked its
            job file when the landing finished, and every reader counts <LANDQ>/*.json as a landing in flight (the Home
@@ -25,8 +28,8 @@ sets `stage` (stage_of: STAGE_OF[state], in the old lander's words where the rea
 checked job waiting on its read, `deferred` for a job held till a usage limit resets, which the Home tab and the
 dashboard do not count as running), and the record is validated (T.Job.to_dict) before it is written.
 
-DRAIN (the lane only, under the lane lock): a request with no job makes a queued job; one for a job at rest
-(done, query, handback, or held for a reason a push mends) is a fresh start that keeps reads_used and the prior
+DRAIN (the lane only, under the lane lock, then rest_lock): a request with no job makes a queued job; one for a job
+at rest (done, query, handback, or held for a reason a push mends) is a fresh start that keeps reads_used and the prior
 verdict (`requeued`); one for an active job fills chat/ts/who where empty (`again`). A job held by the box itself
 (hold="box": a usage wall, a cap, an unrunnable check) is active: a fresh start would not mend it.
 A REQUEST IS UNTRUSTED. Anyone may write the inbox, so drain takes only chat, ts and who from it (repo and pr route
@@ -340,7 +343,13 @@ def _fresh(job: T.Job, req: dict) -> None:
 
 
 def drain(repo: str) -> list:
-    """Fold every inbox request for `repo` into its job. Call only under lane_lock(repo). Returns one line each."""
+    """Fold every inbox request for `repo` into its job. Call only under lane_lock(repo). Returns one line each.
+    It takes rest_lock too (waiting: a settle holds it briefly), since a request may name a job the tick settles."""
+    with rest_lock(repo, wait=True):
+        return _drain(repo)
+
+
+def _drain(repo: str) -> list:
     lines = []
     for path, req in requests(repo):
         pr = req["pr"]
@@ -392,6 +401,26 @@ def pid_alive(pid) -> bool:
         return True
     except (OSError, ValueError, TypeError):
         return False
+
+
+@contextlib.contextmanager
+def rest_lock(repo: str, wait: bool = False):
+    """`with rest_lock(r) as got:` — the lock on the jobs the lane has rested at deploy-pending or deployed. Taken
+    after lane_lock when both are held (drain), never the other way round."""
+    os.makedirs(lanes_dir(), exist_ok=True)
+    fd = os.open(lane_file(repo, "settle"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 @contextlib.contextmanager

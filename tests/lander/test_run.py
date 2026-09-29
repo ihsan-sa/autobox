@@ -11,6 +11,7 @@ import datetime
 import fcntl
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -95,11 +96,19 @@ class Status(unittest.TestCase):
 class Tree(Env):
     def test_materialise_writes_the_exact_tree_as_a_git_repo_in_the_member_path_shape(self):
         run_dir, head = RUN.materialise(self.repo, self.tree, "repo.7")
-        self.addCleanup(lambda: __import__("shutil").rmtree(run_dir, ignore_errors=True))
+        self.addCleanup(lambda: shutil.rmtree(run_dir, ignore_errors=True))
         self.assertRegex(head, r"/cc-land\.run\.\d+\.[^/]+/cc-land\.gates\.repo\.7\.[^/]+/head$")
         self.assertEqual(git(head, "rev-parse", "HEAD^{tree}"), self.tree)
         self.assertTrue(os.access(os.path.join(head, "core/bin/tool"), os.X_OK))
         self.assertEqual(git(head, "status", "--porcelain"), "")
+
+    def test_a_tree_with_a_submodule_is_written_out_and_proved(self):
+        git(self.repo, "update-index", "--add", "--cacheinfo", "160000," + "1" * 40 + ",vendor/sub")
+        git(self.repo, "update-index", "--add", "--cacheinfo", "160000," + "2" * 40 + ",a dir/deeper/sub two")
+        tree = git(self.repo, "write-tree")
+        run_dir, head = RUN.materialise(self.repo, tree)
+        self.addCleanup(lambda: shutil.rmtree(run_dir, ignore_errors=True))
+        self.assertEqual(git(head, "rev-parse", "HEAD^{tree}"), tree)
 
     def test_a_bad_tree_is_unrunnable_and_leaves_nothing(self):
         tmp = os.path.join(self.tmp, "private-tmp")   # its own TMPDIR: nothing else on the box writes here
