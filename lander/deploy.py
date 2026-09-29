@@ -472,7 +472,9 @@ def run(repo, green=None):
               state=state)
         pid = f"land:{repo}:deploy:{target}:{state}@{sha[:12]}"
         if state == "failed":
-            C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] deploy stopped", "--id", pid,
+            # --major: the owner was told "merged", so a deploy that failed is his to know, on #<repo> and not only in
+            # the -updates lane (#770 was called live by hand while its deploy had failed, 2026-09-28)
+            C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] deploy stopped", "--major", "--id", pid,
                         f"[{repo}] main at {sha[:12]} merged but did not deploy to {target} — {line}"], repo, 0)
             continue
         text = f"[{repo}] deployed {sha[:12]}" + (f" to {target}" if target != repo else "")

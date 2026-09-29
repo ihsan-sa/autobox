@@ -114,6 +114,7 @@ class TestDeploy(Box):
         self.assertEqual(len(box.called("install.sh")), 1)
         self.assertIn(["systemctl", "--user", "daemon-reload"], [c["argv"] for c in box.calls])
         self.assertEqual(D.applied("demo"), NEW)
+        self.assertEqual(box.called("cc-slack post"), [])      # a clean deploy says nothing: the landed line already went
 
     def test_a_checkout_off_its_branch_is_refused_not_reset(self):
         box = self.fake(branch="feature")
@@ -122,6 +123,12 @@ class TestDeploy(Box):
         self.assertEqual(st["state"], "failed")
         self.assertIn("branch", st["why"])
         self.assertEqual(box.called("git merge"), [])
+        # the owner heard "merged", so a failed deploy is said on #<repo> (--major), once per target and sha
+        D.run("demo", green=lambda r, s: True)
+        said = box.called("cc-slack post")
+        self.assertEqual(len(said), 1)
+        self.assertIn("--major", said[0]["argv"])
+        self.assertIn("did not deploy", said[0]["argv"][-1])
 
     def test_a_held_target_waits_and_another_goes(self):
         os.makedirs(os.path.join(self.dev, "demo2", ".git"))
@@ -404,10 +411,12 @@ class TestCards(Box):
         with open(os.path.join(os.environ["CC_SLACK_DIR"], "track-threads.json"), "w") as f:
             json.dump({"demo/row-a": {"chat": "C2", "ts": "3.4"}}, f)
         self.assertEqual(C.where(self.job(track="row-a"), False), ["--route", "demo/row-a stopped"])
+        # a landing is not said in the track's thread (it sits in the -updates lane now) but once on #<repo>
+        self.assertEqual(C.where(self.job(track="row-a"), True), ["--route", "[demo] PR #7 landed", "--major"])
         m = T.Job(repo="h--t", pr=7, member="h")
         self.assertEqual(C.where(m, True), ["-c", "#h-updates"])
         self.assertEqual(C.where(m, False), ["-c", "#h"])
-        self.assertIsNone(C.where(self.job(), True))
+        self.assertIsNone(C.where(self.job(), True))     # a PR no row owns: the card alone, its seat tells him
         self.assertEqual(C.where(self.job(), False), ["--route", "[demo] PR #7 stopped"])
 
     def test_a_card_goes_once_by_producer_id(self):
@@ -430,10 +439,15 @@ class TestCards(Box):
     def test_landed_turns_the_approval_card_and_names_owner_restarts(self):
         box = self.fake(**{"cc-slack post-approval": (0, "")})
         C.landed(self.job())
-        self.assertEqual(len(box.called("cc-slack post-approval")), 1)
-        self.assertEqual(box.called("cc-slack post"), [])
+        self.assertEqual(box.called("cc-slack post"), [])         # no row: the card alone
+        C.landed(self.job(track="row-a"))
+        C.landed(self.job(track="row-a"))
+        self.assertEqual(len(box.called("cc-slack post-approval")), 3)
+        self.assertEqual(len(box.called("cc-slack post")), 1)          # the landed line once, on the main lane
+        self.assertIn("--major", box.called("cc-slack post")[0]["argv"])
+        self.assertNotIn("--mention", box.called("cc-slack post")[0]["argv"])
         C.landed(self.job(owner_asks=["x.service (`systemctl --user restart x.service`)"], queued_at="2"))
-        self.assertIn("--mention", box.called("cc-slack post")[0]["argv"])
+        self.assertIn("--mention", box.called("cc-slack post")[1]["argv"])
 
     def test_test_state_never_reaches_the_owner(self):
         box = self.fake()

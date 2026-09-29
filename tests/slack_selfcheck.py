@@ -2637,11 +2637,14 @@ def run_selfcheck():
     # repo. A repo with its own channel is unchanged." Own fixture: `par` and `own` have channels, `kid` and `lone` do
     # not; the declaration puts kid and own under par, and lone under nobody.
     cfgK = {"SLACK_BOT_TOKEN": "xoxb-test", "CC_PROJECT_CHILDREN": "par:kid,own loopa:loopb loopb:loopa"}
-    chansK = {"par": "C-par", "own": "C-own", f"par-{UPDATES}": "C-par-up", f"own-{UPDATES}": "C-own-up"}
+    chansK = {"par": "C-par", "own": "C-own", f"par-{UPDATES}": "C-par-up", f"own-{UPDATES}": "C-own-up",
+              "mfk": "C-mfk", f"mfk-{UPDATES}": "C-mfk-up"}   # mfk: a member-facing repo with a lane
     askedK, rootsK, postedK = [], [], []
-    real_sl = globals()["self_lands"]
+    real_sl, real_lm = globals()["self_lands"], globals()["load_members"]
     for d in ("par", "kid", "own", "lone"):
         os.makedirs(f"{DEV}/{d}", exist_ok=True)
+    os.makedirs(f"{DEV}/mfk/.cc", exist_ok=True)
+    open(f"{DEV}/mfk/.cc/member-facing", "a").close()
     try:
         globals()["resolve_channel"] = lambda cfg, name: askedK.append(name) or chansK.get(name)
         homesK = [home_of(cfgK, r) for r in ("kid", "own", "par", "lone")]
@@ -2649,9 +2652,14 @@ def run_selfcheck():
         cycleK = home_of(cfgK, "loopa")
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: rootsK.append((chat, text)) or (1, f"8.{len(rootsK)}")
         globals()["load_cfg"] = lambda: cfgK
+        # `own` stands in for a member's #<handle> here: a member cannot see the -updates lane, so its thread stays put
+        globals()["load_members"] = lambda: {"own": {"chan": "own"}}
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             rcK = [cmd_track_thread(["kid/t1"]), cmd_track_thread(["own/t1"]), cmd_track_thread(["lone/t1"])]
+            rcMF = cmd_track_thread(["mfk/t1"])
+        globals()["load_members"] = real_lm
         ttK = (track_thread("kid/t1"), track_thread("own/t1"), track_thread("lone/t1"))
+        ttMF = track_thread("mfk/t1")
         save_table(TRACKS, {})
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: postedK.append((chat, text)) or (1, "1.0")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -2660,15 +2668,18 @@ def run_selfcheck():
         lanesK = [card_lane(cfgK, "kid"), card_lane(cfgK, "own")]
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
-        globals()["self_lands"] = real_sl
+        globals()["self_lands"], globals()["load_members"] = real_sl, real_lm
         save_table(TRACKS, {})
     check("a child with no channel: home_of is its parent; a declared child WITH a channel, the parent itself and an "
           "undeclared repo are themselves — the undeclared one without a channel lookup — and a declared cycle ends",
           homesK == ["par", "own", "par", "lone"] and not askedLone and cycleK in ("loopa", "loopb"))
-    check("…its track thread opens in the PARENT's channel, its root naming the child's track; a child with its own "
-          "channel keeps it; an undeclared channel-less repo still gets no thread (exit 1)",
-          rcK == [0, 0, 1] and ttK[0] == ("C-par", "8.1") and ttK[1] == ("C-own", "8.2") and ttK[2] is None
-          and rootsK[0][0] == "C-par" and "`kid/t1`" in rootsK[0][1] and rootsK[1][0] == "C-own")
+    check("…its track thread opens in the PARENT's updates lane (a repo with a lane keeps its track roots out of the "
+          "owner's main channel), its root naming the child's track; a member's #<handle> keeps the thread even with a "
+          "lane beside it; an undeclared channel-less repo still gets no thread (exit 1)",
+          rcK == [0, 0, 1] and ttK[0] == ("C-par-up", "8.1") and ttK[1] == ("C-own", "8.2") and ttK[2] is None
+          and rootsK[0][0] == "C-par-up" and "`kid/t1`" in rootsK[0][1] and rootsK[1][0] == "C-own")
+    check("…a member-facing repo with an updates lane keeps its track thread in #<repo>: its members are not in the "
+          "owner-only lane", rcMF == 0 and ttMF == ("C-mfk", "8.3") and rootsK[2][0] == "C-mfk")
     check("…its --route line lands in the parent's updates lane, its text opening `[kid]` when it did not name the child; a child with a channel keeps "
           "its own lane; its PR card goes to the parent's log lane, the other's to its own",
           postedK == [("C-par-up", "[kid] gate red"), ("C-own-up", "gate red")]

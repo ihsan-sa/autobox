@@ -4,12 +4,13 @@ A CARD is one message about one job. `landed(job)` turns the PR's #approvals car
 someone is listening; `stopped(job, why, route)` says a job left the lane and who picks it up. Where it goes (where()):
 
     chat      the Slack thread the landing was asked from (job extra `chat`, `ts`)
-    track     the track's own thread (cc-slack track-thread made one), when no chat asked
     member    `#<h>-updates` for a member's landing, `#<h>` for its stop; the owner's channels never hear of it
+    landed    a board row's landing: ONE line on #<repo> itself (`--route "[<repo>] PR #<n> landed" --major`); a
+              PR no row owns gets only the #approvals card
+    track     a stop: the track's own thread (cc-slack track-thread made one), when no chat asked
     route     `--route <title>` last: the job's own `route` if the queue call carried one, else `[<repo>] PR #<n> …`
 
-A clean landing with none of the first three says nothing beyond the #approvals card. stopped()'s route "seat" also
-and "query" put the stop into the repo's session with `cc-slack inject`, once; "query", "planning" and "lander-self" file
+stopped()'s route "seat" and "query" put the stop into the repo's session with `cc-slack inject`, once; "query", "planning" and "lander-self" file
 a planner request (`cc-notify --ask`) for the planning seat, never a page to the owner. owner_card() is the 🔐 card
 in #approvals, the one cc-slack turns the owner's 👍 into a queue from: the protected door's refusal ("door"), a
 protected head stopped in the lane ("owner"), and what cc-units policy keeps for the owner at deploy.
@@ -134,18 +135,22 @@ def track_thread(job):
 
 
 def where(job, ok, restart=False):
-    """The post's arguments, or None when the #approvals card is all a clean landing gets. Precedence: the chat the
-    landing was asked from, the track's thread, `#<h>` for a member, and the --route line last."""
+    """The post's arguments. Precedence: the chat the landing was asked from, `#<h>` for a member, and then a landing
+    goes to #<repo> itself while a stop goes to the track's thread, else its --route line. The owner wants a landing
+    "pushed once, at the moment it happens" (comms audit, 2026-09-28): a track's thread now sits in the -updates
+    lane he does not read, so a board row's landing is said on the main lane (--major), and nowhere else. A PR no row
+    owns (a seat's own fix) still gets only the #approvals card: its seat is the one who tells him."""
     kind = "landed" if ok else "stopped"
     if job.extra.get("chat"):
         return ["-c", job.extra["chat"]] + (["--thread", job.extra["ts"]] if job.extra.get("ts") else [])
-    tt = "" if restart else track_thread(job)
-    if tt:
-        return ["--route", f"{tt} {kind}"]
     if job.member:
         return ["-c", f"#{job.member}-updates" if ok else f"#{job.member}"]
     if ok and not restart:
-        return None
+        from lander import board
+        return ["--route", f"[{job.repo}] PR #{job.pr} landed", "--major"] if board.track_for(job) else None
+    tt = "" if restart else track_thread(job)
+    if tt:
+        return ["--route", f"{tt} {kind}"]
     return ["--route", job.extra.get("route") or f"[{job.repo}] PR #{job.pr} {kind}"] + (["--mention"] if restart else [])
 
 
@@ -206,7 +211,7 @@ def post(job, kind, text, args):
 
 
 def landed(job):
-    """The #approvals card reads landed, and the one line a thread hears. A restart the owner keeps goes with it."""
+    """The #approvals card reads landed, and the one line the landing gets (where()). A restart the owner keeps goes with it."""
     rc, out = sh([slack(), "post-approval", "--landed", job.repo, str(job.pr)], timeout=120)
     if rc not in (0, 3, 4):
         log("card", job.repo, job.pr, pending="yes", why=out.strip()[-120:].replace("\n", " "))

@@ -53,7 +53,7 @@ sequenceDiagram
   L->>L: gates, review verdict
   L->>G: squash-merge
   L->>L: install and restart what changed
-  L-->>S: landed, in the track's thread
+  L-->>S: landed, once on #<repo>
 ```
 
 A small job can skip the worker: the planning session does it itself, or hands it to a subagent. Either way it ends
