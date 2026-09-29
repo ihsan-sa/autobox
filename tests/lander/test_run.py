@@ -261,6 +261,7 @@ exec bash {RUN.BIN}/cc-suites runner
         with mock.patch.object(A, "busy", return_value=True):
             self.assertEqual(RUN.choose_where(chk(where=["box", "laptop"])), "box")
 
+    @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
     def test_the_laptop_round_trip_gives_every_job_a_fresh_home(self):
         self.laptop()
         write(self.tmp, {"loadavg": "0.00 0.00 0.00 1/1 1\n"})
@@ -294,6 +295,7 @@ exec bash {RUN.BIN}/cc-suites runner
         os.remove(os.path.join(self.tmp, "suites", "remote"))
         self.assertEqual(self.run_(chk(where=["laptop"]), where="laptop").status, T.UNRUNNABLE)
 
+    @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
     def test_a_laptop_on_battery_runs_it_and_a_busy_one_is_unrunnable_so_the_box_runs_it(self):
         self.laptop()
         power = os.path.join(self.tmp, "power")
@@ -905,6 +907,7 @@ class CheckCommand(Env):
             rc = CK.cmd_check([self.repo, "--base", "base"])
         return rc, out.getvalue()
 
+    @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
     def test_green_red_and_main_red(self):
         write(self.repo, {"core/bin/tool": "#!/bin/sh\necho tool again\n"})
         rc, out = self.check()

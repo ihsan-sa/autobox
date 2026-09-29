@@ -57,6 +57,9 @@
 # it prefetches at once), and 13 runs on the box's 6 cores held a load of 45-56 on 2026-09-25, about 4 each.
 # READY. The runner also answers `unfit (…)` while a tool the suite needs is missing or does not work there
 # (RUNNER_NEEDS below, bwrap by actually running it): a machine that would fail the suite for want of a tool takes none.
+# It answers unfit too while its python3 or shellcheck is older than the box's (FLOOR, which laptop-setup writes and
+# brings the laptop up to): a laptop pass is final for the lander's static, hermetic and host checks, so an older tool
+# there could pass what the box would fail.
 # THE OWNER'S LAPTOP COMES FIRST. The runner also answers busy, and starts nothing, while its 1-minute load is above
 # a bound (battery does not matter: the owner wants it to run no matter what, and status only reports ac=0|1): the number in the runner's own ~/.cc-suite-runner/maxload if it holds
 # a positive one (the same way slots reads its own file), else half its cores. A run it does start is `nice -n 19`
@@ -79,6 +82,8 @@
 # THE LAPTOP (laptop-setup). A WSL distro of its own (cc-suites), so its settings touch nothing the owner uses:
 # systemd on, Windows interop and the C: mount OFF (a process there cannot start a Windows program or read the
 # owner's files), its own Tailscale node, sshd taking only the key above, only from the tailnet, only as ccsuite.
+# The box's python3 (major.minor) and shellcheck, or newer: from the deadsnakes PPA and shellcheck's own release (its
+# sha256 pinned here, SHELLCHECK_SUMS) when the distro's are older, and written to FLOOR, root's.
 # ccsuite owns nothing that decides what it runs or says: the runner, its home, .ssh and authorized_keys are root's,
 # its shell reads no rc file, and whatever it runs is caged (THE CAGE, below), so a PR's code cannot change a later
 # verdict. Each run of the script wipes and remakes that home, keeping its slots and maxload. A logon task keeps the distro running while the owner is logged in. Closed or asleep, the node drops off the
@@ -261,6 +266,26 @@ runner_maxload(){
 }
 # What the suite needs of the machine it runs on; a runner missing one is unfit (what laptop-setup installs).
 RUNNER_NEEDS="git jq python3 tmux flock setsid timeout nice script sqlite3 bwrap"
+# The box's versions of the tools a check's verdict turns on, one `tool version` a line, root's (laptop-setup writes it)
+FLOOR="${CC_SUITES_FLOOR:-/etc/cc-suites/floor}"
+SHELLCHECK_SUMS="0.11.0=8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"   # linux.x86_64.tar.xz
+tool_version(){
+  case $1 in
+    python3) python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null;;
+    shellcheck) shellcheck --version 2>/dev/null | awk '/^version:/ { print $2 }';;
+  esac
+}
+runner_older(){   # the tools older here than FLOOR says, as tool(have<want), space-separated, or nothing
+  local t v have m=""
+  [ -r "$FLOOR" ] || return 0
+  while read -r t v _; do
+    case $t in python3|shellcheck) ;; *) continue;; esac
+    [[ $v =~ ^[0-9]+(\.[0-9]+)*$ ]] || continue
+    have=$(tool_version "$t")
+    [ "$(printf '%s\n%s\n' "$have" "$v" | sort -V | head -1)" = "$v" ] || m="$m $t(${have:-none}<$v)"
+  done < "$FLOOR"
+  echo "${m# }"
+}
 runner_missing(){   # the needs this machine lacks, space-separated, or nothing
   local c m=""
   for c in ${CC_SUITES_RUNNER_NEEDS:-$RUNNER_NEEDS}; do
@@ -286,8 +311,11 @@ cage_argv(){
   local d; for d in "$@"; do CG+=(--bind "$d" "$d"); done
   CG+=(--unshare-pid --unshare-ipc --die-with-parent --new-session --)
 }
-# the needs this machine lacks, the cage first: no override of the needs (CC_SUITES_*_NEEDS) drops bwrap
-needs_missing(){ local m; m=$(CC_SUITES_RUNNER_NEEDS=bwrap runner_missing); echo "$m${m:+ }$(CC_SUITES_RUNNER_NEEDS=$1 runner_missing)" | sed 's/ *$//'; }
+# the needs this machine lacks, the cage first: no override of the needs (CC_SUITES_*_NEEDS) drops bwrap or the FLOOR
+needs_missing(){
+  local m; m="$(CC_SUITES_RUNNER_NEEDS=bwrap runner_missing) $(CC_SUITES_RUNNER_NEEDS=$1 runner_missing) $(runner_older)"
+  m=$(tr -s ' ' <<<"$m"); m=${m# }; echo "${m% }"
+}
 # Whether the machine is on battery (a Mains supply offline, or a Battery discharging; no power_supply info at all
 # counts as on AC, as in a WSL with none). Only status reports it; it never stops a run.
 # CC_SUITES_POWER_DIR: the selfcheck.
@@ -449,8 +477,13 @@ runner_job(){
 
 # ---- laptop-setup -------------------------------------------------------------------------------------------------
 laptop_setup(){
-  local node=${1:-cc-suites-runner} pub b64 hk
+  local node=${1:-cc-suites-runner} pub b64 hk pymm scv scsum=""
   [[ $node =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "cc-suites: NODE is a tailnet host name ([a-z0-9-])" >&2; return 2; }
+  pymm=$(tool_version python3 | cut -d. -f1,2); scv=$(tool_version shellcheck)
+  [[ $pymm =~ ^[0-9]+\.[0-9]+$ ]] && [[ $scv =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || { echo "cc-suites: this box's python3 or shellcheck gives no version ($pymm, $scv)" >&2; return 1; }
+  local e; for e in $SHELLCHECK_SUMS; do [ "${e%%=*}" != "$scv" ] || scsum=${e#*=}; done
+  [ -n "$scsum" ] || echo "cc-suites: no pinned sum for shellcheck $scv (SHELLCHECK_SUMS): the laptop keeps its own, and answers unfit while it is older" >&2
   mkdir -p "$SD" && chmod 700 "$SD"
   [ -s "$SD/id_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -C "cc-suites@$(hostname -s)" -f "$SD/id_ed25519" >/dev/null || return 1
   # The runner's host key is made HERE and pinned before the laptop is ever reached: the box trusts that key for
@@ -494,6 +527,24 @@ apt-get update -qq </dev/null   # nothing below may read stdin: it is this scrip
 apt-get install -y -qq git jq tmux python3 curl ca-certificates openssh-server util-linux bsdutils procps psmisc \\
   gawk bc sqlite3 file lsof shellcheck bubblewrap </dev/null >/dev/null
 command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
+# The box's python3 and shellcheck, or newer (a laptop pass is final for the lander's checks); the runner answers
+# unfit while either is older than the floor
+older(){ [ "\$(printf '%s\\n%s\\n' "\$1" "\$2" | sort -V | head -1)" != "\$2" ]; }
+if older "\$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" $pymm; then
+  apt-get install -y -qq software-properties-common </dev/null >/dev/null
+  add-apt-repository -y ppa:deadsnakes/ppa </dev/null >/dev/null
+  apt-get install -y -qq python$pymm </dev/null >/dev/null
+  ln -sf /usr/bin/python$pymm /usr/local/bin/python3
+fi
+if [ -n "$scsum" ] && older "\$(shellcheck --version 2>/dev/null | awk '/^version:/ { print \$2 }')" $scv; then
+  t=\$(mktemp -d)
+  curl -fsSL -o "\$t/sc.tar.xz" https://github.com/koalaman/shellcheck/releases/download/v$scv/shellcheck-v$scv.linux.x86_64.tar.xz
+  echo "$scsum  \$t/sc.tar.xz" | sha256sum -c --quiet
+  tar -xJf "\$t/sc.tar.xz" -C "\$t"
+  install -m 755 -o root -g root "\$t/shellcheck-v$scv/shellcheck" /usr/local/bin/shellcheck; rm -rf "\$t"
+fi
+install -d -m 755 -o root -g root /etc/cc-suites
+printf 'python3 %s\\nshellcheck %s\\n' $pymm $scv >/etc/cc-suites/floor; chmod 644 /etc/cc-suites/floor
 # The runner account can write nothing that decides what it runs or says: the runner, its home, its dotfiles and
 # authorized_keys are root's, its shell reads no rc file, and a suite or job it runs is caged (cc-suites, THE CAGE).
 # A runner set up before the cage ran PR code as this account, so its home is wiped and made again on every run,
@@ -568,6 +619,7 @@ selfcheck(){
   # the runner's view of power and load is a fixture too: on AC (no supply info) and idle, unless a case says not
   mkdir -p "$D/power" && echo "0.00 0.00 0.00 1/1 1" > "$D/loadavg"
   export CC_SUITES_POWER_DIR="$D/power" CC_SUITES_LOADAVG="$D/loadavg" CC_SUITES_RUNNER_NEEDS="bash git"
+  export CC_SUITES_FLOOR="$D/floor"; FLOOR="$D/floor"   # none unless a case writes one (never this host's /etc)
   # --- REAP: four fake runs under $D, each on a fixture of its own; only $D is looked at (CC_SUITES_REAP_UNDER)
   mkdir -p "$D/a/tests" "$D/b/tests" "$D/c/tests" "$D/d/tests"
   for x in a b c d; do printf 'sleep 300\n' > "$D/$x/tests/selftest.sh"; done
@@ -754,6 +806,15 @@ echo own > core/own && echo OWN; exit 1" | base64 -w0)
   out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_NEEDS="no-such-tool-xyz" SSH_ORIGINAL_COMMAND="run core/tests/selftest.sh $tree all -" bash "$SELF" runner 2>&1); rc=$?
   k "$(b '[ "$rc" = 75 ] && grep -q unfit <<<"$out" && ! grep -q '\''suite ran'\'' <<<"$out"')" "…and a run that asks anyway is refused before it starts"
   k "$(b '[ -z "$(runner_missing)" ] && grep -q "bwrap" <<<"$RUNNER_NEEDS"')" "a runner with every need is ready, and bwrap is among the needs"
+  # FLOOR: a laptop pass is final, so a python3 older than the box's answers unfit, and one at or above it does not
+  echo "python3 99.0" > "$D/floor"
+  out=$(bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q "unfit (missing: python3([0-9.]*<99.0))" <<<"$out"')" "a runner whose python3 is older than the floor answers unfit and names it (got $rc)"
+  out=$(cd "$R" && git archive HEAD | SSH_ORIGINAL_COMMAND="job c $(printf %040d 0) 60 $(printf true | base64) -" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q "unfit (missing: python3(" <<<"$out"')" "…and so does the lander's job, though its own needs leave python3 out (got $rc)"
+  printf 'python3 3.0\nsh 99\n' > "$D/floor"
+  k "$(b '[ -z "$(runner_older)" ]')" "…a python3 at or above the floor is fit, and a floor line naming any other tool is not read"
+  rm -f "$D/floor"
   k "$(b '[ "$(slots_for 22)" = 3 ] && [ "$(slots_for 6)" = 1 ] && [ "$(slots_for 16)" = 2 ] && [ "$(slots_for 128)" = 8 ]')" "slots by default: about one per 8 cores, so suites take about half (22 cores → 3, 6 → 1, capped at 8)"
   echo 5 > "$D/runner/slots"; k "$(b '[ "$(runner_slots)" = 5 ]')" "…and the runner's own slots file sets it"
   echo 0 > "$D/runner/slots"; k "$(b '[ "$(runner_slots)" = "$(slots_for "$(nproc)")" ]')" "…and a slots file out of 1..32 is the default"
@@ -833,6 +894,7 @@ echo own > core/own && echo OWN; exit 1" | base64 -w0)
   k "$(b 'grep -qF "restrict,command=\"/usr/local/bin/cc-suites runner\" $(cat "$D/sd/id_ed25519.pub")" <<<"$out"')" "…and its script pins that key to the runner, restricted"
   k "$(b 'awk "/^base64 -d/{f=1;next} /^B64\$/{f=0} f" <<<"$out" | base64 -d | cmp -s - "$SELF"')" "…and carries this file byte for byte"
   k "$(b 'grep -q "bubblewrap" <<<"$out"')" "…installs bwrap, which the suite's sandbox cases run"
+  k "$(b 'grep -qx "printf '\''python3 %s\\\\nshellcheck %s\\\\n'\'' $(tool_version python3 | cut -d. -f1,2) $(tool_version shellcheck) >/etc/cc-suites/floor; chmod 644 /etc/cc-suites/floor" <<<"$out" && grep -q "sha256sum -c" <<<"$out"')" "…writes this box's python3 and shellcheck as the floor, and checks the shellcheck it fetches"
   # …and leaves the runner account nothing of its own to rewrite: the runner, the home, .ssh and authorized_keys root's
   k "$(b 'grep -qx "chown root:root /usr/local/bin/cc-suites; chmod 755 /usr/local/bin/cc-suites" <<<"$out" && grep -qx "install -d -m 755 -o root -g root /home/ccsuite /home/ccsuite/.ssh" <<<"$out" && grep -qx "chown root:root /home/ccsuite/.ssh/authorized_keys; chmod 644 /home/ccsuite/.ssh/authorized_keys" <<<"$out" && ! grep -q "chown ccsuite\|-o ccsuite -g ccsuite /home/ccsuite/.ssh\|useradd -m" <<<"$out"')" "…makes the runner, the runner account's home, .ssh and authorized_keys root's, never the account's"
   k "$(b 'grep -qx "usermod -s /bin/sh ccsuite" <<<"$out" && grep -qx "pkill -KILL -u ccsuite 2>/dev/null || true" <<<"$out" && grep -qx "rm -rf /home/ccsuite" <<<"$out" && grep -qx "keep_slots=; keep_maxload=; r=/home/ccsuite/.cc-suite-runner" <<<"$out" && ! grep -q "cp /home/ccsuite" <<<"$out"')" "…and wipes what an uncaged run could have left there (its processes, its home) but keeps its slots and maxload"
