@@ -1559,18 +1559,26 @@ class Parallel(Fixture):
             self.pr(n, {f"x{n}/f": "n\n"})
             J.submit("demo", n)
         live, most, lock = [0], [0], threading.Lock()
+        started = [0]
+        both = threading.Barrier(2, timeout=30)   # the first two checks wait for each other, so both are live at once
 
         class Counting(Runner):
             def run(self, check, tree, where):
                 with lock:
                     live[0] += 1
                     most[0] = max(most[0], live[0])
-                time.sleep(0.2)
+                    started[0] += 1
+                    first_two = started[0] <= 2
+                if first_two:
+                    both.wait()
+                else:
+                    time.sleep(0.05)
                 with lock:
                     live[0] -= 1
                 return super().run(check, tree, where)
         with mock.patch.object(L.Lane, "width", lambda self: 2):
             u, _ = self.land(planner=Planner(owners={f"p{n}": f"x{n}/" for n in (1, 2, 3, 4)}), runner=Counting())
+        self.assertLessEqual(most[0], 2)
         self.assertEqual(most[0], 2)
         self.assertEqual(len(u["runner"].calls), 4)
         self.assertEqual(sorted(self.merged_order()), [1, 2, 3, 4])
