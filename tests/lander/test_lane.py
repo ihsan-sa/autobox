@@ -1593,6 +1593,74 @@ class Parallel(Fixture):
         self.assertEqual(self.log().count("stage demo#2 lane"), 1)                         # staged once
         self.assertEqual(self.job(2).state, T.DEPLOY_PENDING)
 
+    def test_an_older_parked_pr_is_not_jumped_by_a_newer_one_sharing_a_file(self):
+        # review 2026-09-29: #2 (a/x, b/y) parks behind #1 (a/x); #3 (b/y only) must not be planned ahead of #2,
+        # or #2 waits on #3, then on the next newer PR, for as long as they arrive
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"a/x": "n\n", "b/y": "n\n"})
+        self.pr(3, {"b/y": "n\n"})
+        for n in (1, 2, 3):
+            J.submit("demo", n)
+        _, lines = self.land()
+        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
+        self.assertIn("[demo] PR #3 waits for PR #2: both change b/y", lines)
+        self.assertEqual(self.merged_order(), [1, 2, 3])
+        self.assertEqual([self.job(n).state for n in (1, 2, 3)], [T.DEPLOY_PENDING] * 3)
+        self.assertNotIn("parked", self.job(2).extra)
+
+    def facts_calls(self, pr):
+        """Run the lane counting its `gh pr view` reads of PR `pr` from queued() (FIELDS)."""
+        real, n = GH.pr_facts, [0]
+
+        def counting(root, num, fields, *a, **k):
+            if int(num) == pr and fields == L.FIELDS:
+                n[0] += 1
+            return real(root, num, fields, *a, **k)
+        with mock.patch.object(GH, "pr_facts", counting):
+            _, lines = self.land(planner=Planner(owners={"a": "a/", "b": "b/", "c": "c/", "d": "d/", "e": "e/"}))
+        return n[0], lines
+
+    def test_a_parked_pr_is_not_read_from_github_at_every_wake(self):
+        # review 2026-09-29: each wake re-ran queued() for every parked job, and many parked jobs reach GH backoff
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n", "d/w": "n\n", "e/v": "n\n"})   # five checks: five wakes
+        self.pr(2, {"a/x": "n\n"})
+        for n in (1, 2):
+            J.submit("demo", n)
+        calls, lines = self.facts_calls(2)
+        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
+        self.assertEqual(calls, 2)   # the read that parked it, and the read before it is planned
+        self.assertEqual(self.merged_order(), [1, 2])
+
+    def test_a_parked_pr_is_read_again_once_its_read_is_stale(self):
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n", "d/w": "n\n", "e/v": "n\n"})
+        self.pr(2, {"a/x": "n\n"})
+        for n in (1, 2):
+            J.submit("demo", n)
+        with mock.patch.object(L, "PARK_FRESH", 0):
+            calls, _ = self.facts_calls(2)
+        self.assertGreater(calls, 2)
+
+    def test_a_parked_pr_whose_head_moved_is_planned_and_pinned_at_the_new_head(self):
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
+        self.pr(2, {"a/x": "n\n"})
+        for n in (1, 2):
+            J.submit("demo", n)
+        new = []
+
+        def hook(name, n):   # while #2 is parked on #1, a push moves #2 off a/x
+            if n == 1:
+                end = time.time() + 10
+                while not (J.load("demo", 2).extra or {}).get("parked") and time.time() < end:
+                    time.sleep(0.02)
+                new.append(self.push("track/row-2", {"c/z": "n\n"}))
+        planner = Planner()
+        _, lines = self.land(planner=planner, runner=Runner(hook=hook))
+        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
+        self.assertEqual(self.job(2).head, new[0])
+        self.assertEqual([c[1] for c in planner.calls if c[2] == ("c/z",)], [new[0]])
+        pin = self.box()["merges"][-1]
+        self.assertEqual(pin[pin.index("--match-head-commit") + 1], new[0])
+
     def test_a_check_whose_job_left_checking_meanwhile_is_not_recorded(self):
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)

@@ -119,6 +119,9 @@ ACTIVE = (T.PLANNED, T.CHECKING, T.MERGEABLE)   # planned from a base and not me
 SMALL_CHECKS = int(os.environ.get("LANDER_SMALL_CHECKS") or 5)   # a plan with more checks than this is heavy
 # …and so is a plan with one of these, however few its checks: a count is not a cost, and check-sh is the whole suite
 FULL_CHECKS = tuple((os.environ.get("LANDER_FULL_CHECKS") or "check-sh").split())
+# a job parked on an overlap is retried at every wake; within this many seconds of its last read of GitHub it is
+# checked against the files that read gave, with no new call (a head moved meanwhile is read once this runs out)
+PARK_FRESH = float(os.environ.get("LANDER_PARK_FRESH") or 300)
 POLL = 5                 # seconds the lane waits on its checks before it looks at the inbox again
 MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": "cards", "board": "board",
              "deploy": "deploy", "tip": "tip"}
@@ -470,10 +473,31 @@ class Lane:
                                   or any(n in FULL_CHECKS for n in job.plan.checks)))
 
     def overlapping(self, job):
-        """A job already planned, checking or mergeable that changes one of this job's files, or None."""
-        mine = set(job.files)
-        return next((j for j in J.lane_jobs(self.repo) if j.key != job.key and j.state in ACTIVE
-                     and mine & set(j.files)), None)
+        """A job that changes one of this job's files and goes first, or None: one already planned, checking or
+        mergeable, or an older one parked on an overlap itself — so a newer PR never jumps an older one it shares a
+        file with, and overlapping PRs keep their arrival order."""
+        mine, older = set(job.files), True
+        for j in J.lane_jobs(self.repo):
+            if j.key == job.key:
+                older = False
+                continue
+            if mine & set(j.files) and (j.state in ACTIVE
+                                        or (older and j.state == T.QUEUED and j.extra.get("parked"))):
+                return j
+        return None
+
+    def park(self, job, other, read):
+        """`job` waits for `other`. read: its facts were just read from GitHub, so the files are kept (saved) with
+        the time, and later wakes check them without a new call until PARK_FRESH runs out."""
+        self.waiting.add(job.key)
+        self.parked.add(job.key)
+        if read:
+            job.extra["parked"] = {"at": time.time(), "head": job.head, "on": other.pr}
+            J.save(job)
+        if (job.key, other.key) not in self.said:
+            self.said.add((job.key, other.key))
+            self.say(f"PR #{job.pr} waits for PR #{other.pr}: both change "
+                     f"{sorted(set(job.files) & set(other.files))[0]}")
 
     def box_hold(self, job):
         target = self.member or self.repo
@@ -485,7 +509,7 @@ class Lane:
         return ""
 
     def advance(self, job):
-        if job.state == T.QUEUED and job.key not in self.parked:   # a job waiting on an overlap is staged once
+        if job.state == T.QUEUED and job.key not in self.parked and not job.extra.get("parked"):   # staged once
             E.stage(job.repo, job.pr, "lane")
         for _ in range(MAX_STEPS):
             if not self.due(job):
@@ -513,6 +537,7 @@ class Lane:
         the one it was held from). deferred: the job waits on a limit, not on work — stage `deferred`."""
         if job.state == T.HELD:
             return
+        job.extra.pop("parked", None)   # a held job's files are read again when it comes back
         at = until if until > time.time() else time.time() + secs
         job.extra.update(held_from=then or job.state, hold=kind, why=why, not_before=E.stamp(at))
         if deferred:
@@ -557,6 +582,11 @@ class Lane:
         return G.git_lock(self.root)
 
     def queued(self, job):
+        park = job.extra.get("parked")
+        if isinstance(park, dict) and job.files and time.time() - float(park.get("at") or 0) < PARK_FRESH:
+            other = self.overlapping(job)
+            if other:   # still waiting: no GitHub call, no fetch; it is read afresh before it is ever planned
+                return self.park(job, other, read=False)
         facts, why = GH.pr_facts(self.root, job.pr, FIELDS, self.token)
         if facts is None:
             return self.hold(job, f"gh could not read PR #{job.pr}: {why}", kind="box")
@@ -591,14 +621,9 @@ class Lane:
             return self.query(job, why, "owner")
         other = self.overlapping(job)
         if other:   # design: "Two changes that overlap from the start don't both burn CPU; the later one waits"
-            self.waiting.add(job.key)
-            self.parked.add(job.key)
-            if (job.key, other.key) not in self.said:
-                self.said.add((job.key, other.key))
-                self.say(f"PR #{job.pr} waits for PR #{other.pr}: both change "
-                         f"{sorted(set(job.files) & set(other.files))[0]}")
-            return None
+            return self.park(job, other, read=True)
         self.parked.discard(job.key)
+        job.extra.pop("parked", None)
         if not self.unit("planner"):
             return self.hold(job, "planner is not installed", kind="box")
         job.plan = self.call("planner", "plan", self.root, job.base_sha, job.head, job.files, fallback=self.fallback)

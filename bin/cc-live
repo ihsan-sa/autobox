@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""cc-live — the box on one screen, redrawn on its own: what was just handed off, what is running, what is landing,
+and which seats are idle or offline. Read-only; makes no model call and starts no collector.
+
+WHY. The owner steers from a laptop and a phone and had to ask in Slack to learn what the box was doing. He asked for
+"some sort of terminal display to show a new task handed off, whats running etc? or if it's offline or idle". So this
+is a box command he runs over the SSH login he already has (`ssh -t <box> ~/bin/cc-live`): it opens no port, tunnel or key.
+
+WHAT IT READS, every refresh, and nothing else — each is a record the box already keeps:
+  boards   $CC_BOARDS or ~/.cc/boards/<repo>.json   rows (`_`-named test boards skipped); a file is re-parsed only when
+           its mtime moves. A HAND-OFF is a row's newest of: `created` (added), a note starting "dispatched"
+           (a worker went out), `agent_at` (a session or subagent took it). Newest first, last 24 h; under 10 min is NEW.
+  procs    /proc, one pass: a `cc-loop <repo> <track>` argv, or a `claude` whose cwd is under the worktrees root,
+           makes that track LIVE. A `running` row with neither is OFFLINE, unless it carries a `held` reason: a
+           row parked on purpose is named on one line instead.
+  activity $CC_STATE or ~/.cc/state/<repo>/<track>/{loop.log,progress.md}: a live worker's last move is their newest mtime.
+  landings $CC_LANDER_STATE or ~/.cc/state/land/*.json, the lander's in-flight jobs (ended ones live in rest/, not here).
+  tmux     `tmux list-windows -t $CC_TMUX_SESSION` (default main): a window whose pane has no `claude` under it is
+           OFFLINE; one whose pane printed nothing for 10 min is IDLE; otherwise working. `repo@alias` is an orch
+           and is shown `alias@repo`, the name `cc` takes back; a name with `/` is a track or session, the rest seats.
+           An offline track window (its session ended, the window left open) is only counted; `_` windows are skipped.
+  laptop   `cc-suites status` (capped at 6 s; one line saying so if it does not answer) and the checks the lander has
+           spilled there now: an `ssh … job CHECK TREE CAP RUN CWD` in /proc (run.laptop_argv), the lander keeps no file.
+  limit    ~/.cc/state/reconcile.json `limit_until`, when it is still ahead: the usage limit is holding work.
+Times are shown in the box's own timezone.
+
+  cc-live [--every SEC]   redraw every SEC seconds (default 10) until Ctrl-C
+  cc-live --once          print one frame and exit
+  cc-live selfcheck       cases over fixtures and a stub tmux in a temp dir; no board, process or tmux of the box's
+"""
+import calendar
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+IDLE = 600          # a seat whose pane printed nothing for this long is idle
+NEW = 600           # a hand-off this recent is marked NEW
+RECENT = 86400      # hand-offs shown from this far back
+SHOW_HANDOFFS = 8
+
+
+def boards_dir():
+    return os.environ.get("CC_BOARDS") or f"{HOME}/.cc/boards"
+
+
+def state_dir():
+    return os.environ.get("CC_STATE") or f"{HOME}/.cc/state"
+
+
+def land_dir():
+    return os.environ.get("CC_LANDER_STATE") or f"{state_dir()}/land"
+
+
+def wt_root():
+    return os.environ.get("CC_WORKTREES") or f"{HOME}/.cc/worktrees"
+
+
+def ts(s):
+    """An ISO stamp the board writes (2026-09-28T19:31:30Z) as epoch seconds, or 0."""
+    try:
+        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def mtime(p):
+    try:
+        return os.stat(p).st_mtime
+    except OSError:
+        return 0
+
+
+def ago(sec):
+    sec = max(0, int(sec))
+    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
+        if sec >= div:
+            return f"{sec // div}{unit}"
+    return f"{sec}s"
+
+
+# ── the records ───────────────────────────────────────────────────────────────────────────────────────────────
+_CACHE = {}
+
+
+def boards():
+    """{repo: tracks} for every real board; a file is parsed again only when its mtime moved."""
+    out = {}
+    for path in sorted(glob.glob(f"{boards_dir()}/*.json")):
+        repo = os.path.basename(path)[:-5]
+        if repo.startswith("_"):
+            continue
+        m = mtime(path)
+        if _CACHE.get(path, (None,))[0] != m:
+            try:
+                t = json.load(open(path)).get("tracks")
+            except (OSError, ValueError, AttributeError):
+                t = None
+            _CACHE[path] = (m, t if isinstance(t, dict) else {})
+        out[repo] = _CACHE[path][1]
+    return out
+
+
+def handoffs(bds, now):
+    """[(when, word, repo, track, row)] newest first, within RECENT."""
+    out = []
+    for repo, tracks in bds.items():
+        for name, row in tracks.items():
+            if not isinstance(row, dict):
+                continue
+            ev = [(ts(row.get("created")), "added")]
+            for n in row.get("notes") or []:
+                if isinstance(n, dict) and str(n.get("msg", "")).startswith("dispatched"):
+                    ev.append((ts(n.get("ts")), "dispatched"))
+            if row.get("agent_at"):
+                ev.append((ts(row.get("agent_at")), "taken"))
+            when, word = max(ev)
+            if when and now - when <= RECENT:
+                out.append((when, word, repo, name, row))
+    return sorted(out, key=lambda e: e[0], reverse=True)
+
+
+def procs(proc="/proc"):
+    """(live tracks {repo/track}, {pid: (ppid, comm)}) from one pass over /proc."""
+    live, table, root = set(), {}, wt_root().rstrip("/") + "/"
+    for pid in os.listdir(proc):
+        if not pid.isdigit():
+            continue
+        try:
+            comm = open(f"{proc}/{pid}/comm").read().strip()
+            ppid = next(ln.split()[1] for ln in open(f"{proc}/{pid}/status") if ln.startswith("PPid:"))
+            argv = open(f"{proc}/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+        except (OSError, StopIteration):
+            continue
+        table[pid] = (ppid, comm)
+        for i, a in enumerate(argv):
+            if os.path.basename(a) == "cc-loop" and len(argv) > i + 2 and argv[i + 1] and argv[i + 2]:
+                live.add(f"{argv[i + 1]}/{argv[i + 2]}")
+                break
+        if comm == "claude":
+            try:
+                cwd = os.readlink(f"{proc}/{pid}/cwd")
+            except OSError:
+                continue
+            if cwd.startswith(root):
+                live.add("/".join(cwd[len(root):].split("/")[:2]))
+    return live, table
+
+
+def laptop_line():
+    """cc-suites status's one line, or one saying the runner gave none; never waits more than 6 s."""
+    exe = os.environ.get("CC_LIVE_SUITES") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-suites")
+    try:
+        r = subprocess.run([exe, "status"], capture_output=True, text=True, timeout=6, stdin=subprocess.DEVNULL,
+                           env={**os.environ, "CC_SUITES_STATUS_TIMEOUT": "5s"})
+        return (r.stdout.strip().splitlines() or ["cc-suites status printed nothing"])[-1]
+    except (OSError, subprocess.SubprocessError):
+        return "the laptop runner did not answer in 6 s"
+
+
+def spilled(proc="/proc"):
+    """Names of the checks the lander has out on the laptop: the argv of run.laptop_argv, `ssh … job NAME TREE CAP RUN CWD`."""
+    out = []
+    for pid in os.listdir(proc):
+        try:
+            argv = open(f"{proc}/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")[:-1]
+        except OSError:
+            continue
+        if len(argv) > 6 and os.path.basename(argv[0]) == "ssh" and argv[-6] == "job" and "BatchMode=yes" in argv:
+            out.append(f"{argv[-5]} {argv[-4][:8]}")
+    return sorted(out)
+
+
+def has_claude(pane_pid, table):
+    """Whether a `claude` is that pane's own process or runs anywhere under it."""
+    if table.get(str(pane_pid), ("", ""))[1] == "claude":
+        return True
+    kids = {}
+    for pid, (ppid, _) in table.items():
+        kids.setdefault(ppid, []).append(pid)
+    todo, seen = [str(pane_pid)], set()
+    while todo:
+        p = todo.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        for k in kids.get(p, []):
+            if table[k][1] == "claude":
+                return True
+            todo.append(k)
+    return False
+
+
+def windows():
+    """[(name, activity epoch, pane pid)] of the tmux session, or None when there is no such session."""
+    sess = os.environ.get("CC_TMUX_SESSION") or "main"
+    try:
+        r = subprocess.run(["tmux", "list-windows", "-t", sess, "-F", "#W\t#{window_activity}\t#{pane_pid}"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode:
+        return None
+    out = []
+    for ln in r.stdout.splitlines():
+        p = ln.split("\t")
+        if len(p) == 3 and p[1].isdigit():
+            out.append((p[0], int(p[1]), p[2]))
+    return out
+
+
+def seat_state(name, activity, pane_pid, table, now):
+    """'offline' | 'idle 12m' | 'working' for one window."""
+    if not has_claude(pane_pid, table):
+        return "offline"
+    if now - activity >= IDLE:
+        return f"idle {ago(now - activity)}"
+    return "working"
+
+
+def shown(name):
+    """An orch window `repo@alias` is typed `alias@repo`; everything else as tmux names it."""
+    if "@" in name and "/" not in name:
+        repo, alias = name.split("@", 1)
+        return f"{alias}@{repo}"
+    return name
+
+
+def landings():
+    out = []
+    for path in glob.glob(f"{land_dir()}/*.json"):
+        try:
+            j = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        if isinstance(j, dict) and j.get("repo") and j.get("pr"):
+            out.append((mtime(path), j))
+    return sorted(out, key=lambda e: e[0], reverse=True)
+
+
+def limit_until():
+    try:
+        v = json.load(open(f"{state_dir()}/reconcile.json")).get("limit_until")
+        return float(v) if v else 0
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+# ── the frame ─────────────────────────────────────────────────────────────────────────────────────────────────
+def frame(now=None, proc="/proc", width=120):
+    now = now or time.time()
+    bds = boards()
+    live, table = procs(proc)
+    B, D, R = ("\033[1m", "\033[2m", "\033[0m") if os.environ.get("CC_LIVE_PLAIN") != "1" else ("", "", "")
+    out = [f"{B}{os.uname().nodename}{R}  {time.strftime('%H:%M:%S %Z', time.localtime(now))}"
+           f"  load {open('/proc/loadavg').read().split()[0] if os.path.exists('/proc/loadavg') else '?'}"]
+    lu = limit_until()
+    if lu > now:
+        out.append(f"⏳ usage limit holds work until {time.strftime('%H:%M', time.localtime(lu))}")
+
+    out.append(f"\n{B}HANDED OFF{R} {D}(last 24 h, newest first){R}")
+    ho = handoffs(bds, now)
+    for when, word, repo, name, row in ho[:SHOW_HANDOFFS]:
+        mark = "NEW " if now - when < NEW else "    "
+        out.append(f"  {mark}{ago(now - when):>4} ago  {word:<10} {repo}/{name}  "
+                   f"{D}[{row.get('status', '?')}]{R} {row.get('title') or ''}")
+    if not ho:
+        out.append("  (nothing in the last day)")
+
+    out.append(f"\n{B}RUNNING{R} {D}(board rows marked running){R}")
+    n, held = 0, []
+    for repo, tracks in sorted(bds.items()):
+        for name, row in sorted(tracks.items()):
+            if not isinstance(row, dict) or row.get("status") != "running" or row.get("kind") == "session":
+                continue
+            key = f"{repo}/{name}"
+            if key in live:
+                d = f"{state_dir()}/{repo}/{name}"
+                last = max(mtime(f"{d}/loop.log"), mtime(f"{d}/progress.md"))
+                st = f"live, moved {ago(now - last)} ago" if last else "live"
+            elif str(row.get("agent") or "").rpartition(":")[2] in table:   # `agent me`: a live session works it itself
+                st = "worked by a session (agent mark)"
+            elif row.get("held"):          # a person parked it on purpose: named on one line, not an alarm
+                held.append(key)
+                continue
+            else:
+                st = "OFFLINE: marked running, no process"
+            n += 1
+            out.append(f"  {key}  {D}{st}{R}")
+    if held:
+        out.append(f"  {D}held on purpose, no process: {', '.join(held)}{R}")
+    if not n and not held:
+        out.append("  (nothing)")
+
+    out.append(f"\n{B}SEATS, ORCHS AND SESSIONS{R} {D}(tmux; idle = nothing printed for {IDLE // 60} min){R}")
+    ws = windows()
+    if ws is None:
+        out.append("  tmux has no session — every seat is offline")
+    else:
+        cells, left = [], 0
+        for name, act, pid in sorted(ws, key=lambda w: ("/" in w[0], "@" not in w[0], w[0])):
+            if name.startswith("_"):       # a selftest's throwaway window, like the `_` boards
+                continue
+            st = seat_state(name, act, pid, table, now)
+            if st == "offline" and "/" in name:   # a track window left open after its session ended
+                left += 1
+                continue
+            cells.append(f"{shown(name)[:30]:<30} {st:<9}")
+        cols = max(1, width // 44)
+        rows = -(-len(cells) // cols)
+        for i in range(rows):
+            out.append("  " + "   ".join(cells[i::rows]).rstrip())
+        if left:
+            out.append(f"  {D}and {left} track window(s) whose session has ended{R}")
+
+    out.append(f"\n{B}LANDING{R}")
+    ld, bulk = landings(), {}
+    for m, j in ld:
+        stage = j.get("stage") or j.get("state") or "?"
+        if stage in ("queued", "install"):   # waiting its turn, or merged and waiting to deploy: one line each
+            bulk.setdefault(stage, []).append(f"{j['repo']}#{j['pr']}")
+            continue
+        out.append(f"  {j['repo']}#{j['pr']}  {stage:<9} {D}{ago(now - m)}{R} {j.get('title') or ''}")
+    for stage, prs in sorted(bulk.items(), reverse=True):
+        word = "queued" if stage == "queued" else "merged, waiting to deploy"
+        out.append(f"  {word} ({len(prs)}): {' '.join(prs)}")
+    if not ld:
+        out.append("  (queue empty)")
+
+    out.append(f"\n{B}LAPTOP{R}")
+    out.append(f"  {laptop_line()}")
+    sp = spilled(proc)
+    out.append(f"  running there now ({len(sp)}): {', '.join(sp)}" if sp else "  nothing spilled there now")
+    return out
+
+
+def draw(every):
+    w, h = shutil.get_terminal_size((120, 50))
+    lines = frame(width=w)
+    foot = f"\033[2m(refreshes every {every}s · Ctrl-C to quit)\033[0m"
+    if len(lines) > h - 1:                 # the footer always shows, and says when the window cut the rest off
+        lines, foot = lines[: h - 2], f"\033[2m(… {len(lines) - h + 2} more lines: make the window taller · every {every}s · Ctrl-C quits)\033[0m"
+    lines = [ln if len(ln) <= w + 12 else ln[:w + 8] + "\033[0m" for ln in lines + [foot]]   # colour codes do not print
+    sys.stdout.write("\033[H\033[2J" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.split("\n\n")[-1].rstrip())
+        return 0
+    if argv[:1] == ["--once"]:
+        os.environ.setdefault("CC_LIVE_PLAIN", "0" if sys.stdout.isatty() else "1")
+        print("\n".join(frame(width=shutil.get_terminal_size((120, 50))[0])))
+        return 0
+    every = 10
+    if argv[:1] == ["--every"] and len(argv) > 1 and argv[1].isdigit() and int(argv[1]) > 0:
+        every = int(argv[1])
+    elif argv:
+        print(__doc__.split("\n\n")[-1].rstrip(), file=sys.stderr)
+        return 2
+    try:
+        while True:
+            draw(every)
+            time.sleep(every)
+    except KeyboardInterrupt:
+        return 0
+
+
+# ── selfcheck ─────────────────────────────────────────────────────────────────────────────────────────────────
+def selfcheck():
+    ok = bad = 0
+
+    def case(name, cond):
+        nonlocal ok, bad
+        if cond:
+            ok += 1
+        else:
+            bad += 1
+            print(f"FAIL {name}")
+
+    tmp = tempfile.mkdtemp(prefix="cc-live-")
+    now = 1_790_000_000
+    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    for k, v in {"CC_BOARDS": f"{tmp}/boards", "CC_STATE": f"{tmp}/state", "CC_LANDER_STATE": f"{tmp}/land",
+                 "CC_WORKTREES": f"{tmp}/wt", "CC_TMUX_SESSION": "cc-live-selfcheck-none", "CC_LIVE_PLAIN": "1"}.items():
+        os.environ[k] = v
+    for d in ("boards", "state/r/w1", "land", "proc", "wt/r/w1", "bin"):
+        os.makedirs(f"{tmp}/{d}")
+    # a tmux of its own, so the box's own server is never asked: no session until a case writes the windows file
+    open(f"{tmp}/bin/tmux", "w").write(f"#!/bin/sh\n[ -f {tmp}/windows ] || exit 1\ncat {tmp}/windows\n")
+    os.chmod(f"{tmp}/bin/tmux", 0o755)
+    open(f"{tmp}/bin/suites", "w").write("#!/bin/sh\necho 'cc-suites: runner lap answers: free 3 cores=8 slots=4 maxload=6 load=0.10 ac=1'\n")
+    open(f"{tmp}/bin/suites-hang", "w").write("#!/bin/sh\nexec sleep 30\n")
+    for n in ("suites", "suites-hang"):
+        os.chmod(f"{tmp}/bin/{n}", 0o755)
+    os.environ["CC_LIVE_SUITES"] = f"{tmp}/bin/suites"
+    os.environ["PATH"] = f"{tmp}/bin:{os.environ.get('PATH', '')}"
+    board = {"tracks": {
+        "fresh": {"title": "just added", "status": "queued", "created": iso(now - 60)},
+        "sent": {"title": "worker out", "status": "running", "created": iso(now - 7200),
+                 "notes": [{"ts": iso(now - 900), "msg": "dispatched headless worker (loop 2)"}]},
+        "w1": {"title": "live one", "status": "running", "created": iso(now - 90000)},
+        "gone": {"title": "dead one", "status": "running", "created": iso(now - 90000), "held": "waits on #9"},
+        "lost": {"title": "lost one", "status": "running", "created": iso(now - 90000)},
+        "mine": {"title": "held by a seat", "status": "running", "created": iso(now - 90000), "agent": "@1:10"},
+        "stale": {"title": "mark of a dead seat", "status": "running", "created": iso(now - 90000), "agent": "@1:999"},
+        "sess": {"title": "a session", "status": "running", "kind": "session", "created": iso(now - 90000)},
+        "old": {"title": "last week", "status": "merged", "created": iso(now - 7 * 86400)},
+        "bad": "not a row"}}
+    json.dump(board, open(f"{tmp}/boards/r.json", "w"))
+    json.dump({"tracks": {"x": {"title": "test board", "created": iso(now)}}}, open(f"{tmp}/boards/_t.json", "w"))
+    json.dump({"repo": "r", "pr": 7, "stage": "gates", "title": "a landing"}, open(f"{tmp}/land/r-7.json", "w"))
+    for pr in (8, 9):
+        json.dump({"repo": "r", "pr": pr, "stage": "queued"}, open(f"{tmp}/land/r-{pr}.json", "w"))
+    open(f"{tmp}/state/r/w1/loop.log", "w").close()
+    os.utime(f"{tmp}/state/r/w1/loop.log", (now - 120, now - 120))
+
+    def fake(pid, ppid, comm, argv, cwd=None):
+        p = f"{tmp}/proc/{pid}"
+        os.makedirs(p)
+        open(f"{p}/comm", "w").write(comm + "\n")
+        open(f"{p}/status", "w").write(f"Name:\t{comm}\nPPid:\t{ppid}\n")
+        open(f"{p}/cmdline", "wb").write("\0".join(argv).encode() + b"\0")
+        if cwd:
+            os.symlink(cwd, f"{p}/cwd")
+    fake(10, 1, "bash", ["bash"])                                   # seat pane with a claude two levels down
+    fake(11, 10, "node", ["node"])
+    fake(12, 11, "claude", ["claude"], cwd="/somewhere")
+    fake(20, 1, "bash", ["bash"])                                   # a pane with nothing in it
+    fake(30, 1, "claude", ["claude", "-p"], cwd=f"{tmp}/wt/r/w1")    # a headless worker in its worktree
+    fake(40, 1, "bash", ["bash", "/x/cc-loop", "r", "sent"])        # a worker loop between turns
+    fake(50, 1, "claude", ["claude"], cwd="/somewhere")             # a pane whose own process is claude
+    fake(60, 1, "ssh", ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "lap", "job", "lint", "a" * 40, "300", "Zm9v", "-"])
+
+    bds = boards()
+    case("a `_` test board is skipped", list(bds) == ["r"])
+    ho = handoffs(bds, now)
+    names = [(e[3], e[1]) for e in ho]
+    case("hand-offs newest first", names[:2] == [("fresh", "added"), ("sent", "dispatched")])
+    case("a dispatch note outranks the older created stamp", ("sent", "dispatched") in names and ("sent", "added") not in names)
+    case("a row older than a day is not a hand-off", "old" not in [e[3] for e in ho])
+    case("a non-dict row is skipped, not a crash", "bad" not in [e[3] for e in ho])
+    live, table = procs(f"{tmp}/proc")
+    case("a claude in a worktree makes its track live", "r/w1" in live)
+    case("a cc-loop argv makes its track live", "r/sent" in live)
+    case("a claude outside the worktrees is no track", not any("somewhere" in k for k in live))
+    case("a claude under a pane is found through its children", has_claude("10", table))
+    case("an empty pane has no claude", not has_claude("20", table))
+    case("a pane that is claude itself has one", has_claude("50", table))
+    case("an empty pane is offline", seat_state("s", now, "20", table, now) == "offline")
+    case("a quiet pane with claude is idle", seat_state("s", now - IDLE, "10", table, now) == "idle 10m")
+    case("a pane that just printed is working", seat_state("s", now - IDLE + 1, "10", table, now) == "working")
+    case("an orch window is shown alias@repo", shown("r@bench") == "bench@r" and shown("r/t") == "r/t" and shown("r") == "r")
+    txt = "\n".join(frame(now, f"{tmp}/proc"))
+    case("the frame marks a fresh hand-off NEW", "NEW   1m ago  added      r/fresh" in txt)
+    case("a hand-off 10 min old is not NEW", "NEW" not in [ln for ln in txt.splitlines() if "r/sent" in ln][0])
+    case("a live worker shows its last move", "r/w1  live, moved 2m ago" in txt)
+    case("a running row with no process and no hold is OFFLINE", "r/lost  OFFLINE" in txt)
+    case("a row whose agent mark names a live pid is worked, not offline", "r/mine  worked by a session" in txt)
+    case("an agent mark whose pid is gone is still OFFLINE", "r/stale  OFFLINE" in txt)
+    case("a held row with no process is named on the held line, not as offline", "no process: r/gone" in txt and "r/gone  OFFLINE" not in txt)
+    case("a session row is not counted as running", "r/sess" not in txt)
+    case("an active landing gets a line of its own", "r#7  gates" in txt)
+    case("queued landings share one line", "queued (2): r#9 r#8" in txt or "queued (2): r#8 r#9" in txt)
+    case("no tmux session: seats are marked offline", "every seat is offline" in txt)
+    rows = [("seat", now, 10), ("gone", now, 20), ("r@orch", now - IDLE, 50), ("r/dead", now, 20),
+            ("r/on", now, 10), ("_cctest1", now, 20)]
+    open(f"{tmp}/windows", "w").write("".join(f"{n}\t{a}\t{p}\n" for n, a, p in rows))
+    txt = "\n".join(frame(now, f"{tmp}/proc", width=40))
+    case("a seat with claude that just printed is working", "seat" + " " * 27 + "working" in txt)
+    case("a seat with no claude is offline", "gone" + " " * 27 + "offline" in txt)
+    case("an orch is shown alias@repo, and idle", "orch@r" + " " * 25 + "idle 10m" in txt)
+    case("a live track window is listed", "r/on " in txt)
+    case("a dead track window is only counted", "r/dead" not in txt and "and 1 track window(s)" in txt)
+    case("a selftest window is not listed", "_cctest1" not in txt)
+    case("the LAPTOP section shows the runner's state line", "LAPTOP" in txt and "answers: free 3 cores=8 slots=4" in txt)
+    case("a check spilled to the laptop is listed", "running there now (1): lint aaaaaaaa" in txt)
+    os.environ["CC_LIVE_SUITES"] = f"{tmp}/bin/suites-hang"
+    t0 = time.monotonic()
+    case("a runner that hangs is one line, in bounded time",
+         laptop_line() == "the laptop runner did not answer in 6 s" and time.monotonic() - t0 < 9)
+    os.environ["CC_LIVE_SUITES"] = f"{tmp}/bin/suites"
+    json.dump({"limit_until": now + 3600}, open(f"{tmp}/state/reconcile.json", "w"))
+    case("a usage limit ahead is shown", "usage limit holds work" in "\n".join(frame(now, f"{tmp}/proc")))
+    json.dump({"limit_until": now - 1}, open(f"{tmp}/state/reconcile.json", "w"))
+    case("a usage limit behind is not", "usage limit" not in "\n".join(frame(now, f"{tmp}/proc")))
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"cc-live selfcheck: {ok} passed, {bad} failed")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

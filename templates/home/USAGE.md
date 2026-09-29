@@ -127,6 +127,7 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc-land myapp 71 [72 …]              land it: gates, merge, card, board, ledger, install, units, restarts
                                          (your 👍 on the #approvals card runs the same thing)
     ccbox experiment                     unrestricted, boxed    box-status       health
+    ssh -t <box> ~/bin/cc-live           the box live: hand-offs, running, landings, idle/offline seats
     cc slack setup | on | status         Slack ↔ sessions       #<repo> in Slack talk to that session
     cc-scope list myapp                  asks still open        cc-scope unverified myapp  landed, nothing checked
     cc-graphs serve | stop | status      tokens + vitals in a browser, on 127.0.0.1:5190 (loopback)
