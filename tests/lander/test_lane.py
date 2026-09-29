@@ -748,6 +748,91 @@ class Lanes(Fixture):
         self.assertNotIn("stage demo#1 lane", self.log())   # a held job is not timed
 
 
+class ReleaseSwitch(Fixture):
+    """A promote reaches a running lane between jobs: the job in flight ends on its release, the next one does not
+    start there."""
+
+    def setUp(self):
+        super().setUp()
+        self.rels = {}
+        for n in ("aaaa", "bbbb"):
+            d = self.rels[n] = os.path.realpath(os.path.join(self.home, ".cc", "lander", "releases", n))
+            os.makedirs(os.path.join(d, "core", "lander"))
+            open(os.path.join(d, "core", "lander", "cli.py"), "w").close()
+        self.point("aaaa")
+        self.mine = self.rels["aaaa"]
+        p = mock.patch.object(J, "running_release", lambda: self.mine)
+        p.start()
+        self.addCleanup(p.stop)
+        self.spawned = []
+        p = mock.patch.object(L, "spawn_lane", lambda repo, rel: (self.spawned.append((repo, rel, J.running(repo))),
+                                                                  (True, "test"))[1])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def point(self, n):
+        cur = os.path.join(self.home, ".cc", "lander", "current")
+        with contextlib.suppress(OSError):
+            os.unlink(cur)
+        os.symlink(self.rels[n], cur)
+
+    def test_a_promote_between_jobs_switches_before_the_next_job(self):
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        runner = Runner(hook=lambda name, n: self.point("bbbb") if n == 1 else None)   # promoted mid-check of #1
+        u, lines = self.land(runner=runner, reviewer=Reviewer(V("LAND"), V("LAND")))
+        # the job in flight finished on the release it started on
+        self.assertEqual(self.job(1).state, T.DEPLOY_PENDING)
+        self.assertEqual([c[0] for c in runner.calls], ["a"])
+        # the next job was not taken up here; a lane from the new release was started, after the lock was let go
+        self.assertEqual(self.job(2).state, T.QUEUED)
+        self.assertEqual(self.spawned, [("demo", self.rels["bbbb"], 0)])
+        self.assertIn("this lane takes no new job", lines[-1])
+        self.assertIn("lane-switch demo", self.log())
+        self.assertFalse(os.path.exists(J.lane_file("demo", "running")))
+        # the lane on the new release takes #2
+        self.mine = self.rels["bbbb"]
+        self.land(runner=runner, reviewer=Reviewer(V("LAND")))
+        self.assertEqual(self.job(2).state, T.DEPLOY_PENDING)
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_a_switch_whose_new_lane_will_not_start_leaves_the_job_for_the_next_tick(self):
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.point("bbbb")
+        with mock.patch.object(L, "spawn_lane", lambda repo, rel: (False, "no bus")):
+            u, lines = self.land(runner=Runner(), reviewer=Reviewer(V("LAND")))
+        self.assertIsNone(self.job(1))   # nothing taken on the old release: the request still waits to be drained
+        self.assertTrue(J.requests("demo"))
+        self.assertIn("the next tick starts it", lines[-1])
+        self.assertIn("no lane: no bus", self.log())
+        self.assertFalse(os.path.exists(J.lane_file("demo", "running")))
+
+    def test_a_lane_started_on_an_old_release_takes_nothing(self):
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.point("bbbb")
+        u, _ = self.land()
+        self.assertEqual(u["runner"].calls, [])
+        self.assertEqual(len(J.requests("demo")), 1)   # not even drained
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_the_running_marker_names_the_release_and_a_checkout_never_switches(self):
+        with J.lane_lock("demo"):
+            self.assertEqual(J.read_json(J.lane_file("demo", "running"))["release"], self.mine)
+        self.assertEqual(J.stale_release(), "")
+        self.point("bbbb")
+        self.assertEqual(J.stale_release(), self.rels["bbbb"])
+        self.mine = self.work                    # a checkout: whatever current says, it is not switched
+        self.assertEqual(J.stale_release(), "")
+        os.unlink(os.path.join(self.home, ".cc", "lander", "current"))
+        os.symlink(self.tmp, os.path.join(self.home, ".cc", "lander", "current"))   # outside releases/
+        self.mine = self.rels["aaaa"]
+        self.assertEqual(J.stale_release(), "")
+
+
 class Merge(Fixture):
     def test_merge_argv_pins_and_deletes(self):
         head = self.pr(1, {"a/x": "n\n"})
@@ -1412,6 +1497,42 @@ class SmallFirst(Fixture):
         # #2 is planned (that is how the lane learns it is heavy), then hands back before running any check
         self.assertIn("[demo] PR #2 steps aside for PR #1 (0 of 2 checks done)", lines)
         self.assertEqual([c[0] for c in u["runner"].calls][:2], ["a", "b"])   # #1's whole suite first
+
+
+class SpawnLaneTest(unittest.TestCase):
+    def test_the_new_lane_is_its_own_unit_not_a_child_of_the_tick(self):
+        # a child left in the tick's unit would be killed with it when the tick ends, mid-job
+        with tempfile.TemporaryDirectory() as t:
+            fake, got = os.path.join(t, "systemd-run"), os.path.join(t, "argv")
+            with open(fake, "w") as f:
+                f.write(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {got}\n")
+            os.chmod(fake, 0o755)
+            with mock.patch.dict(os.environ, {"LANDER_SYSTEMD_RUN": fake}):
+                ok, how = L.spawn_lane("demo", "/rel/bbbb")
+            argv = open(got).read().split("\n")
+        self.assertTrue(ok)
+        self.assertTrue(how.startswith("unit lander-lane-demo-"), how)
+        self.assertIn("--user", argv)
+        self.assertEqual(argv[-4:-1], ["/rel/bbbb/core/lander/cli.py", "lane", "demo"])
+
+    def fallback(self, env):
+        popen = mock.MagicMock(return_value=mock.MagicMock(pid=4242))
+        with mock.patch.dict(os.environ, env), mock.patch.object(L, "run", lambda *a, **k: (1, "", "no bus")), \
+                mock.patch.object(L.subprocess, "Popen", popen):
+            if "INVOCATION_ID" not in env:
+                os.environ.pop("INVOCATION_ID", None)
+            return L.spawn_lane("demo", "/rel/bbbb"), popen
+
+    def test_inside_a_unit_a_failed_systemd_run_starts_no_child(self):
+        (ok, how), popen = self.fallback({"INVOCATION_ID": "x"})
+        self.assertFalse(ok)
+        self.assertIn("inside a unit", how)
+        popen.assert_not_called()
+
+    def test_outside_a_unit_a_failed_systemd_run_falls_back_to_a_detached_child(self):
+        (ok, how), popen = self.fallback({})
+        self.assertEqual((ok, how), (True, "pid 4242"))
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
 
 if __name__ == "__main__":

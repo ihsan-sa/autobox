@@ -32,7 +32,9 @@ A planning seat runs it by hand; the lander never installs itself.
         switch PR's head before it merges: `--pr N` allows a REV that is not on main only when it is exactly the
         head GitHub names for OPEN PR #N, and only for a caller that is not a worker or a member session (CC_ROLE,
         or a .cc/track or .cc/member-facing marker above the cwd). Clears a legacy rollback. Promote never kills a
-        lane: each lane re-execs `current` between jobs, so the next job runs the new release.
+        lane: before its next job each lane sees `current` moved, takes nothing new and starts a lane from the new
+        release, so the job in flight ends on the old one and the next job runs the new one. It names the lanes
+        running when it moves `current`.
     lander-self rollback [--legacy]
         Point `current` back at `previous` (and `previous` at what current was). --legacy instead sends every
         `cc-land` call to the release pinned by `lander-self legacy` (the old lander, before the switch), and first
@@ -50,6 +52,8 @@ A planning seat runs it by hand; the lander never installs itself.
         names no head (the old lander's files do not) takes its head from GitHub and its base from origin/main.
         Exit 1 when the candidate cannot plan a job it was given a head for, 0 otherwise, 3 when it could not run.
     lander-self status
+        The links, then each running lane: its repo, pid, the release it runs from, and `current` or `STALE` (a
+        stale lane switches before its next job; one still stale after its job ended predates that switch).
     lander-self selfcheck
 
 Layout under ~/.cc/lander: releases/<sha>/core (+ tests/landing-repos), current -> releases/<sha>,
@@ -495,6 +499,10 @@ def cmd_promote(args, opts):
     unlink("legacy-on")
     print(f"lander-self: promoted {sha[:12]} (was {os.path.basename(cur)[:12] or 'none'}); "
           f"`lander-self rollback` puts it back")
+    busy = running_lanes(landq())
+    if busy:
+        print(f"lander-self: lanes running for {', '.join(busy)}: each finishes its job and switches to {sha[:12]} "
+              f"before the next (`lander-self status` shows them)")
     return 0
 
 
@@ -633,10 +641,33 @@ def cmd_legacy(args, opts):
     return 0
 
 
+def lane_release(q, repo):
+    """(pid, release dir) of the live lane for `repo`: the release its running marker names, else the releases/<sha>
+    on its command line (a lane from before the marker carried one), else ''."""
+    try:
+        pid = json.load(open(os.path.join(q, "lanes", f"{repo}.running")))
+    except (OSError, ValueError):
+        return 0, ""
+    pid, rel = (pid.get("pid"), pid.get("release") or "") if isinstance(pid, dict) else (0, "")
+    if not rel:
+        try:
+            argv = open(f"/proc/{int(pid)}/cmdline", "rb").read().decode(errors="replace").split("\0")
+        except (OSError, ValueError, TypeError):
+            argv = []
+        rels = os.path.join(ROOT, "releases") + "/"
+        rel = next((rels + a[len(rels):].split("/")[0] for a in argv if a.startswith(rels)), "")
+    return pid, rel
+
+
 def cmd_status(args, opts):
     for name in ("current", "previous", "legacy-on", os.path.join("self", "current")):
         t = link_target(name)
         print(f"{name:13} {os.path.basename(t)[:12] if t else '-'}")
+    q, cur = landq(), link_target("current")
+    for repo in running_lanes(q):
+        pid, rel = lane_release(q, repo)
+        mark = "unknown" if not rel else "current" if os.path.realpath(rel) == cur else "STALE"
+        print(f"lane {repo:18} pid {pid} on {os.path.basename(rel)[:12] or '?'} {mark}")
     return 0
 
 
@@ -1138,6 +1169,7 @@ def selfcheck():
             if role is not None:
                 os.environ["CC_ROLE"] = role
         rollback_legacy_cases(case, t)
+        status_lane_cases(case, t)
     # shadow: a job that already names a head, or has no checkout, is left as it is (GitHub is never asked);
     # a second REV is a usage refusal before anything is read
     with tempfile.TemporaryDirectory() as dev:
@@ -1206,6 +1238,31 @@ def rollback_legacy_cases(case, t):
     case("…and puts back the old jobs and watches the new lander never took up",
          os.path.isfile(os.path.join(q, "u-5.json")) and not os.path.exists(os.path.join(q, "r-1.json"))
          and os.path.isfile(os.path.join(q, "handed", "v-6.json")))
+
+
+def status_lane_cases(case, t):
+    """status names each running lane's release and whether it is current."""
+    q, old = os.path.join(t, "sq"), os.environ.get("CC_LANDER_STATE")
+    os.environ["CC_LANDER_STATE"] = q
+    os.makedirs(os.path.join(q, "lanes"))
+    cur = link_target("current")
+    for repo, rel in (("fresh", cur), ("old", os.path.join(ROOT, "releases", "0ld"))):
+        with open(os.path.join(q, "lanes", f"{repo}.running"), "w") as f:
+            json.dump({"pid": os.getpid(), "release": rel}, f)
+    keep, buf = sys.stdout, tempfile.TemporaryFile("w+")
+    sys.stdout = buf
+    try:
+        cmd_status([], {})
+    finally:
+        sys.stdout = keep
+        if old is None:
+            os.environ.pop("CC_LANDER_STATE", None)
+        else:
+            os.environ["CC_LANDER_STATE"] = old
+    buf.seek(0)
+    out = buf.read()
+    case("status marks a lane on current", re.search(r"^lane fresh .* current$", out, re.M) and cur)
+    case("status marks a lane on an old release STALE", re.search(r"^lane old .* on 0ld STALE$", out, re.M))
 
 
 def _raises(f):

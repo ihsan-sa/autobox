@@ -61,6 +61,13 @@ installed"); a board unit that is absent is BoardRules below: the row carrying t
 gets a note only), each `Closes <row>` of the same board -> done unless held or live without an agent mark, that
 mark cleared, an unknown row named; a symlinked board file is refused.
 
+A PROMOTE REACHES A RUNNING LANE between jobs. Before it drains or takes up a job, the lane compares the release
+it runs from with what ~/.cc/lander/current names now (jobs.stale_release; a lander run from a checkout never
+switches). When they differ it takes nothing new, lets the lane lock go, starts `lander lane <repo>` detached from
+the new release, logs `lane-switch` and returns. A job in flight finishes on the release it started on; a heavy job
+that stepped aside keeps its results and goes on in the new lane. It starts the new lane rather than exec'ing
+itself because a lane may be running inside a `tick`, and an exec would drop that tick's tip and deploy pass.
+
 The git lock is never held across a check or a review; the lane lock is held for the whole run.
 """
 from __future__ import annotations
@@ -341,6 +348,7 @@ class Lane:
     # -- the loop --
     def run(self):
         while True:
+            moved = ""
             with J.lane_lock(self.repo) as got:
                 if not got:
                     self.say("a lane is already running; it re-reads the queue itself")
@@ -349,6 +357,9 @@ class Lane:
                     REC.new_nonce(self.repo, J.landq())
                 tried = self.tried = set()
                 while True:
+                    moved = J.stale_release()   # a promote since the last job: take nothing new on this release
+                    if moved:
+                        break
                     for ln in J.drain(self.repo):
                         self.say(ln)
                     todo = [j for j in J.lane_jobs(self.repo) if j.key not in tried and self.due(j)]
@@ -364,6 +375,15 @@ class Lane:
                     self.advance(job)
                     if self.stepped_aside:     # it goes on once the job it stepped aside for has rested
                         tried.discard(job.key)
+            if moved:   # the lock is let go first, so the lane started from `current` can take it
+                mine = os.path.basename(J.running_release())[:12]
+                ok, how = spawn_lane(self.repo, moved)
+                E.log("lane-switch", self.repo, None, f"{mine}->{os.path.basename(moved)[:12]}: "
+                                                      f"{'lane started, ' + how if ok else 'no lane: ' + how}")
+                self.say(f"`current` moved from {mine} to {os.path.basename(moved)[:12]}: this lane takes no new "
+                         f"job; " + (f"a lane on the new release started ({how})" if ok
+                                     else f"the new lane would not start ({how}); the next tick starts it"))
+                return self.lines
             if not J.requests(self.repo):   # a request that met the held lock after its last drain: once more
                 return self.lines
 
@@ -767,6 +787,27 @@ def split_opts(argv, *names):
         else:
             pos.append(a)
     return pos, opts
+
+
+def spawn_lane(repo, release):
+    """Start `lander lane <repo>` detached from `release` (what `current` named a moment ago). -> (ok, how).
+    As its own transient unit, like a tick: this lane may be running inside a tick's unit, and a child left in that
+    unit's cgroup is killed when the tick ends, mid-job. A plain detached child only when systemd-run fails."""
+    argv = [sys.executable, "-P", os.path.join(release, "core", "lander", "cli.py"), "lane", repo]
+    sysrun = os.environ.get("LANDER_SYSTEMD_RUN") or "systemd-run"
+    unit = f"lander-lane-{repo}-{int(time.time())}"
+    rc, out, err = run([sysrun, "--user", "--collect", "--quiet", f"--unit={unit}",
+                        "--setenv=PYTHONDONTWRITEBYTECODE=1", *argv], timeout=30)
+    if rc == 0:
+        return True, f"unit {unit}"
+    if os.environ.get("INVOCATION_ID"):   # inside a unit: a child would die with it; the next tick starts the lane
+        return False, f"systemd-run failed ({GH.last(err or out) or rc}) inside a unit"
+    try:
+        p = subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        return True, f"pid {p.pid}"
+    except OSError as e:
+        return False, str(e)
 
 
 def spawn_tick(repo):

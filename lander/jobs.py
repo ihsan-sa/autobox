@@ -66,6 +66,27 @@ def landq() -> str:
     return os.environ.get("CC_LANDER_STATE") or f"{_home()}/.cc/state/land"
 
 
+def running_release() -> str:
+    """The tree this code runs from: releases/<sha> for a pinned lander, a checkout's root in development."""
+    return os.path.dirname(CORE)
+
+
+def current_release() -> str:
+    """What ~/.cc/lander/current resolves to now, or '' when it is missing or points outside releases/."""
+    root = f"{_home()}/.cc/lander"
+    cur, rels = os.path.realpath(f"{root}/current"), os.path.realpath(f"{root}/releases")
+    return cur if os.path.islink(f"{root}/current") and cur.startswith(rels + "/") and os.path.isfile(
+        f"{cur}/core/lander/cli.py") else ""
+
+
+def stale_release() -> str:
+    """The release `current` names when it is not the one this code runs from, else ''. A lander run from a
+    checkout (development, the tests) is never stale: only a pinned release is switched."""
+    mine, cur = running_release(), current_release()
+    rels = os.path.realpath(f"{_home()}/.cc/lander/releases")
+    return cur if cur and mine.startswith(rels + "/") and cur != mine else ""
+
+
 def state_dir() -> str:
     """The directory LANDQ sits in (~/.cc/state by default): member-spend.json lives there, as cc's member_gate reads it."""
     return os.path.dirname(landq().rstrip("/"))
@@ -435,7 +456,8 @@ def lane_lock(repo: str, wait: bool = False):
         except BlockingIOError:
             yield False
             return
-        write_atomic(lane_file(repo, "running"), {"pid": os.getpid(), "since": E.stamp()})
+        write_atomic(lane_file(repo, "running"), {"pid": os.getpid(), "since": E.stamp(),
+                                                  "release": running_release()})
         _HELD[repo] = fd
         try:
             yield True
