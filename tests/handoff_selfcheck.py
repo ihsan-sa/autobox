@@ -1716,6 +1716,20 @@ def run_selfcheck():
         else:
             ok("tmux is installed — the handoff-survival case runs on a real scratch server", False)
 
+        # THE PERMISSION SEAT IS NEVER HANDED OFF HERE: "cc-handoff refuses the perms window outright with a plain
+        # message and a non-zero exit (fail closed)" — from the seat's own call and from the rotation alike. Its own
+        # window, and a normal target beside it to show the refusal is the target's, not the fixture's.
+        wins[PERMS] = "@90"
+        wins.pop(PERMS + NEXT, None)
+        clear(PERMS)
+        for box9 in (False, True):
+            n0 = len(tcalls)
+            rc9 = start(PERMS, "caller-sid", "rotate: 81%" if box9 else "", box=box9)
+            ok(f"perms: cc-handoff refuses the permission seat outright ({'the rotation' if box9 else 'its own call'})"
+               " — non-zero, no window opened, no record",
+               rc9 == 1 and not [a for a in tcalls[n0:] if a[0] == "new-window"] and not read(PERMS))
+        wins.pop(PERMS, None)
+
         # INDEX-AT-WRITE: the line journal() appends is in the library's index when it returns — `cc-lib ask` finds
         # it as a checkpoint under the target's own journal, and had nothing to re-read itself (re-read absent from
         # COVERAGE: the hook did it, not the ask). Its own HOME with one registered board, and the baseline pass

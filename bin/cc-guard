@@ -2471,6 +2471,122 @@ W64
   unset GERR
   ok "a write after a pattern kill that passes the gate still reaches the write fence, so \`cd ~/bin && pkill -0 -f x; cp /dev/null cc-guard\` is refused while the kill alone passes the gate" $r
 
+  # 68. THE PERMISSION SEAT'S STATE IS FENCED LIKE ~/.cc/state/arch, WITH ONE EXCEPTION: the live bypass seat
+  #     itself may still write it. Everybody else — a plain shell with no role, a worker, a member — is refused
+  #     through the Bash write scan (a redirect, cp, rm of the file, rm -rf of the directory ABOVE it, and the
+  #     glob form) and through the Write tool. The seat is recognised by CC_GUARD_ROOT_PID pointing at a detached
+  #     process named claude that carries --dangerously-skip-permissions and has no live claude of its own above
+  #     it — a setsid orphan reparented off this fixture's own ancestry, the same shape the owner's
+  #     launch from a tmux pane leaves, so the check that refuses a claude spawned FROM another claude (forging the flag)
+  #     is exercised honestly rather than skipped.
+  mkdir -p "$H/.cc/state/demo68/perms"; printf 'brief' > "$H/.cc/state/demo68/perms/brief.md"
+  # setsid -f (always fork): plain `setsid cmd` execs cmd IN PLACE only when it can, and when it cannot (this
+  # shell is already a process group leader) it forks and its own wrapper process sits waiting on the child for
+  # as long as the child lives — a second match for the pgrep below, still parented to this very shell, which
+  # is exactly the false "second claude above it" pseat is right to refuse. -f always forks and the wrapper
+  # exits at once, so only the exec'd, now-orphaned claude remains.
+  # …started IN the seat's directory, because pseat also requires the claude's cwd to be ~/.cc/state/<repo>/perms
+  (cd "$H/.cc/state/demo68/perms" && setsid -f "$T/claude" --dangerously-skip-permissions >/dev/null 2>&1 </dev/null & disown)
+  sleep 0.3; seat68=""
+  for cand in $(pgrep -f -- "$T/claude --dangerously-skip-permissions"); do
+    [ "$(cat "/proc/$cand/comm" 2>/dev/null)" = claude ] && [ "$(readlink "/proc/$cand/cwd")" = "$H/.cc/state/demo68/perms" ] && { seat68=$cand; break; }
+  done
+  r=0; GERR=$T/gerr68
+  w1=$(g Bash "$(J "echo x > $H/.cc/state/demo68/perms/brief.md")" "$T")
+  w2=$(g Bash "$(J "cp /dev/null $H/.cc/state/demo68/perms/brief.md")" "$T")
+  w3=$(g Bash "$(J "rm $H/.cc/state/demo68/perms/brief.md")" "$T")
+  w4=$(g Bash "$(J "rm -rf $H/.cc/state/demo68")" "$T")   # a directory ABOVE the state, taken with it (pabove)
+  w5=$(g Bash "$(J "cp /dev/null $H/.cc/state/demo68/perms/*.md")" "$T")   # the glob form
+  we=skip
+  if [ -n "$T2" ]; then
+    # the Write tool's own /tmp exemption (rule: "/tmp/*) ;; # scratch: fine", above) waves through anything
+    # under $T, and $H is under $T — so this ONE sub-case needs the fixture home OUTSIDE /tmp (T2/H2, as case
+    # 60's improve-proposals check already does) or it would pass by that shortcut and test nothing (found
+    # live: case 68 first went red here, not on the fence — the state path itself was never reached).
+    H2=$T2/home; mkdir -p "$H2/.cc/state/demo68/perms" "$H2/dev/_cctest1"
+    printf 'brief' > "$H2/.cc/state/demo68/perms/brief.md"
+    we=$(GH=$H2 g Write "$(jq -n --arg f "$H2/.cc/state/demo68/perms/brief.md" '{file_path:$f,new_string:"x"}')" "$H2/dev/_cctest1")
+  fi
+  [ "$w1$w2$w3$w4$w5$we" = "222222" ] || { r=1; echo "      a non-seat write to perms state was not all refused: $w1 $w2 $w3 $w4 $w5 $we"; }
+  [ -e "$H/.cc/state/demo68/perms/brief.md" ] || { r=1; echo "      the fixture's brief.md is gone — a refusal above did not actually hold"; }
+  if [ -n "$seat68" ]; then
+    s1=$(g Bash "$(J "echo x > $H/.cc/state/demo68/perms/brief.md")" "$T" CC_GUARD_ROOT_PID=$seat68)
+    se=0
+    if [ -n "$T2" ]; then   # the seat of THAT home: pseat wants the claude's cwd to be $HOME/.cc/state/<repo>/perms
+      (cd "$H2/.cc/state/demo68/perms" && setsid -f "$T/claude" --dangerously-skip-permissions >/dev/null 2>&1 </dev/null & disown)
+      sleep 0.3; seat68b=""
+      for cand in $(pgrep -f -- "$T/claude --dangerously-skip-permissions"); do
+        [ "$(readlink "/proc/$cand/cwd")" = "$H2/.cc/state/demo68/perms" ] && { seat68b=$cand; break; }
+      done
+      se=2; [ -n "$seat68b" ] && se=$(GH=$H2 g Write "$(jq -n --arg f "$H2/.cc/state/demo68/perms/brief.md" '{file_path:$f,new_string:"x"}')" "$H2/dev/_cctest1" CC_GUARD_ROOT_PID=$seat68b)
+      [ -n "$seat68b" ] && kill "$seat68b" 2>/dev/null
+    fi
+    [ "$s1$se" = "00" ] || { r=1; echo "      the seat's own write to its own state was refused: $s1 $se"; }
+  else r=1; echo "      no detached fixture claude to test the seat's own write against"; fi
+  # …AND THE FENCE IS ALL THE UNGATED TIER MEETS (pfonly): it passed the rest of this file untouched before the fence,
+  # and must still. A planning shell's write into ~/dev, a relative write after a cd nobody can resolve, the Write
+  # tool into ~/dev and the box's own ledger door all pass with no role — while the same write as a worker is refused.
+  mkdir -p "$H/dev/other68"
+  # from a dir with no marker that does not hold ~/dev: $T does ($H is under it), and $WT's .cc/track makes a worker
+  mkdir -p "$H/plain68"
+  u1=$(g Bash "$(J "echo x > $H/dev/other68/f")" "$H/plain68"); u1w=$(g Bash "$(J "echo x > $H/dev/other68/f")" "$H/plain68" CC_ROLE=worker)
+  u2=$(g Bash "$(J 'cd "$X" && echo x > f')" "$T"); u3=$(g Bash "$(J "cc-broker ledger --once beta 'x'")" "$T")
+  u4=0; u4w=2; if [ -n "$T2" ]; then mkdir -p "$H2/dev/other68"
+    u4=$(GH=$H2 g Write "$(jq -n --arg f "$H2/dev/other68/f" '{file_path:$f,new_string:"x"}')" "$H2/dev/_cctest1")
+    u4w=$(GH=$H2 g Write "$(jq -n --arg f "$H2/dev/other68/f" '{file_path:$f,new_string:"x"}')" "$H2/dev/_cctest1" CC_ROLE=worker); fi
+  [ "$u1$u2$u3$u4" = "0000" ] && [ "$u1w$u4w" = "22" ] || { r=1; echo "      the ungated tier met more than the perms fence, or a worker less: $u1 $u2 $u3 $u4 / worker $u1w $u4w"; }
+  # …AND THE SHAPES THE SECURITY REVIEW WALKED AROUND IT WITH, each refused: the handoff record and its brief, a
+  # worker (a gated tier) by Bash and by the Write tool from a root that covers ~/.cc/state, an mv of the dir above,
+  # a hard link (ln, cp -l) that makes brief.md writable by another name, and an unresolvable cd onto the state
+  # from the ungated tier. A flagged claude that has a claude above it is not the seat (a child forging the flag).
+  mkdir -p "$H/.cc/state/handoff"
+  x1=$(g Bash "$(J "echo x > $H/.cc/state/handoff/perms.json")" "$T"); x2=$(g Bash "$(J "echo x > $H/.cc/state/handoff/perms.brief")" "$T")
+  x3=$(g Bash "$(J "echo x > $H/.cc/state/demo68/perms/brief.md")" "$H/plain68" CC_ROLE=worker)
+  x4=2; [ -n "$T2" ] && x4=$(GH=$H2 g Write "$(jq -n --arg f "$H2/.cc/state/demo68/perms/brief.md" '{file_path:$f,new_string:"x"}')" "$H2" CC_ROLE=worker)
+  x5=$(g Bash "$(J "mv $H/.cc/state/demo68 $H/.cc/state/moved68")" "$T")
+  x6=$(g Bash "$(J "ln $H/.cc/state/demo68/perms/brief.md $T/hl68")" "$T"); x7=$(g Bash "$(J "cp -al $H/.cc/state/demo68/perms/brief.md $T/hl68")" "$T")
+  x8=$(g Bash "$(J "cd \"\$(printf %s $H/.cc/state/demo68/perms)\" && echo x > brief.md")" "$H/plain68")
+  x9=$(g Bash "$(J "ln -s $H/.cc/state/demo68/perms/brief.md $T/sl68")" "$T")   # names the state and is no plain read
+  [ "$x1$x2$x3$x4$x5$x6$x7$x8$x9" = "222222222" ] || { r=1; echo "      a way around the fence was not refused: $x1 $x2 $x3 $x4 $x5 $x6 $x7 $x8 $x9"; }
+  # …AND THE SECOND REVIEW'S: a command that NAMES the state and is not a plain read is refused however it writes
+  # (a variable, python, touch, link), while a plain read of the ledger passes; the ungated tier's unresolved cd is
+  # refused when the name could be the state, glob and all, and passes when it cannot; a gated shell may not start
+  # a claude that skips permissions but may grep for the words; a tab does not hide cc __runperms.
+  y1=$(g Bash "$(J "D=$H/.cc/state/demo68/perms; echo x > \$D/brief.md")" "$H/plain68" CC_ROLE=worker)
+  y2=$(g Bash "$(J "python3 -c \"open('$H/.cc/state/demo68/perms/brief.md','w')\"")" "$H/plain68")
+  y3=$(g Bash "$(J "touch $H/.cc/state/demo68/perms/brief.md")" "$H/plain68" CC_ROLE=worker)
+  y4=$(g Bash "$(J "link $H/.cc/state/demo68/perms/brief.md $T/hl68b")" "$H/plain68")
+  y5=$(g Bash "$(J 'cd "$(cat /tmp/d)" && cat /tmp/n >> l?dger.md')" "$H/plain68")
+  y6=$(g Bash "$(J "setsid -f claude --dangerously-skip-permissions -p hi")" "$H/plain68" CC_ROLE=worker)
+  y7=$(g Bash "$(J "$(printf 'cc\t__runperms 0123456789ab x')")" "$H/plain68")
+  y8=$(g Bash "$(J "rg x $H/.cc/state/demo68/perms/ledger.md --pre rm")" "$H/plain68" CC_ROLE=worker)   # rg --pre runs a command
+  k1=$(g Bash "$(J "cat $H/.cc/state/demo68/perms/ledger.md | grep -c x 2>/dev/null")" "$H/plain68" CC_ROLE=worker)
+  k2=$(g Bash "$(J 'cd "$(git rev-parse --show-toplevel)" && echo x > docs/perms-notes.md')" "$H/plain68")
+  k3=$(g Bash "$(J "grep -n dangerously-skip-permissions $T/f68")" "$H/plain68" CC_ROLE=worker)
+  [ "$y1$y2$y3$y4$y5$y6$y7$y8" = "22222222" ] && [ "$k1$k2$k3" = "000" ] || { r=1; echo "      the second review's shapes: refused $y1 $y2 $y3 $y4 $y5 $y6 $y7 $y8 (want 2s) / kept $k1 $k2 $k3 (want 0s)"; }
+  # a flagged claude with no claude above it, but started OUTSIDE the seat's directory, is not the seat
+  (cd "$T" && setsid -f "$T/claude" --dangerously-skip-permissions >/dev/null 2>&1 </dev/null & disown)
+  sleep 0.3; away68=""
+  for cand in $(pgrep -f -- "$T/claude --dangerously-skip-permissions"); do
+    [ "$cand" != "$seat68" ] && [ "$(readlink "/proc/$cand/cwd")" = "$T" ] && { away68=$cand; break; }
+  done
+  if [ -n "$away68" ]; then a1=$(g Bash "$(J "echo x > $H/.cc/state/demo68/perms/brief.md")" "$T" CC_GUARD_ROOT_PID=$away68)
+    [ "$a1" = 2 ] || { r=1; echo "      a flagged claude outside the seat's directory was taken for the seat: rc $a1"; }
+    kill "$away68" 2>/dev/null
+  else r=1; echo "      no away-from-home fixture claude to test the seat's directory against"; fi
+  mkdir -p "$T/nest68"; printf '#!/bin/sh\n"%s" --dangerously-skip-permissions\n:\n' "$T/claude" > "$T/nest68/claude"   # ':' after: no exec-in-place
+  chmod +x "$T/nest68/claude"; (cd "$H/.cc/state/demo68/perms" && setsid -f "$T/nest68/claude" >/dev/null 2>&1 </dev/null & disown)
+  sleep 0.3; kid68=""
+  for cand in $(pgrep -f -- "$T/claude --dangerously-skip-permissions"); do
+    [ "$cand" != "$seat68" ] && [ "$(cat "/proc/$(awk '{print $4}' "/proc/$cand/stat" 2>/dev/null)/comm" 2>/dev/null)" = claude ] && { kid68=$cand; break; }
+  done
+  if [ -n "$kid68" ]; then n1=$(g Bash "$(J "echo x > $H/.cc/state/demo68/perms/brief.md")" "$T" CC_GUARD_ROOT_PID=$kid68)
+    [ "$n1" = 2 ] || { r=1; echo "      a flagged claude under another claude was taken for the seat: rc $n1"; }
+  else r=1; echo "      no nested fixture claude to test the forged-flag refusal against"; fi
+  pkill -f -- "$T/nest68/claude" 2>/dev/null; [ -n "$kid68" ] && kill "$kid68" 2>/dev/null
+  unset GERR; kill "$seat68" 2>/dev/null
+  ok "the permission seat's state is fenced like ~/.cc/state/arch — a redirect, cp, rm, a glob, an rm of the directory above it and the Write tool are all refused from anywhere but the live seat, which may still write its own" $r
+
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
   exit 0
@@ -3328,6 +3444,13 @@ if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones a
   u=${uk//$'\001'/}   # every rule but the cd walk reads a NAME at ^, so the mark comes off here, not in a second pass
   { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
+  # THE PERMISSION SEAT'S LAUNCH IS NOBODY'S TO TYPE — universal, every tier, the seat itself included. `cc
+  # __runperms <id> <sid>` starts a claude with --dangerously-skip-permissions on the seat's brief.md, and `cc-handoff
+  # --perms-dir` is the question it asks first; the only caller of either is the tmux window cc-handoff --overlap perms
+  # opens, and that window's command is not a tool call. Read from the haystack, so a grep for the words, a quoted
+  # mention and a heredoc body that is only text all pass; a statement that RUNS one is refused.
+  grep -qE "$AT"'([^ ]*/)?cc[[:space:]]+__runperms([^A-Za-z0-9_.-]|$)|'"$AT"'([^ ]*/)?cc-handoff[[:space:]]+([^;&|]*[[:space:]])?--perms-dir([^A-Za-z0-9_.-]|$)' <<<"$u" \
+    && { echo "cc-guard: blocked — cc __runperms and cc-handoff --perms-dir start the permission-skipping seat, and only the tmux window cc-handoff --overlap perms opens runs them; hand the seat off with cc-handoff --overlap perms instead" >&2; exit 2; }
   # A PATTERN KILL NEVER REACHES A SESSION — universal too, every role, a subagent of an ungated seat included.
   # 2026-09-26 02:34Z a review subagent of a planning seat cleaned up after a selfcheck with `pkill -KILL -f 'print
   # "| "'`: pkill reads that as a regex, `print "` OR ` "`, which every claude argv carries, and it SIGKILLed about
@@ -3615,7 +3738,11 @@ if [ -n "${CC_HANDOFF:-}" ] || [ -d "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}"
   fi
 fi
 [ -n "$handoff_gated" ] && [ "$role" != member ] && role=worker   # the four owner gates below, at least
-case "$role" in worker|member) ;; *) exit 0;; esac
+# THE UNGATED TIER STILL MEETS ONE FENCE: the permission seat's state (pfence below). A planning session, an orch and
+# every other session with no role go on past this line with $pfonly set, and every rule after it that is not that
+# fence is skipped for them — Bash reaches the write walk alone, Edit/Write the one path check, and nothing else.
+pfonly=""
+case "$role" in worker|member) ;; *) pfonly=1;; esac
 [ -n "$root" ] || root=$cwd   # nothing to anchor on (an env-only role, a handoff-gated session): the cwd, as before
 in_root(){ case "$1" in "$root"|"$root"/*) return 0;; esac; [ -n "$mdir" ] && case "$1" in "$mdir"|"$mdir"/*) return 0;; esac
   [ -n "$awt" ] && case "$1" in "$awt"|"$awt"/*) return 0;; esac; return 1; }   # $awt: the agent worktree this call stands in — see above
@@ -3898,10 +4025,89 @@ secret_all(){
 # not read the copy either. Same tier as the original, not a stricter one: the whole subtree, because a copy that
 # is a secret under one name is a secret under any name a future launch gives it.
 secret_path(){ secret_all "$1" && return 0; case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json|"$HOME"/.cc/sandbox|"$HOME"/.cc/sandbox/*) return 0;; esac; return 1; }
+# THE PERMISSION SEAT'S STATE IS WRITTEN BY THAT SEAT ALONE, AT EVERY TIER — the planning session included. The seat
+# is the one session the box runs with --dangerously-skip-permissions, in ~/.cc/state/<repo>/perms (brief.md,
+# ledger.md, .claude/), and the owner relaunches it on that same brief.md (cc-handoff refuses to hand it off; the
+# handoff dir's perms.json and perms.brief stay fenced too, so none can be planted for a later reader). So whoever
+# writes one of those files chooses what the next permission-skipping session does. Reading them is anybody's.
+# WHO THE SEAT IS COMES FROM THE PROCESS, never from anything a model can type: the nearest `claude` above this hook,
+# its own argv carrying --dangerously-skip-permissions, and no second `claude` above it — a session that launches a
+# child claude with the flag (the one way a gated tier could forge the yes) has its own claude over the child.
+# $CC_GUARD_ROOT_PID is the test hook, as for the kill fence, and here it is honoured only in a HOME that is not the
+# account's own: the selfcheck runs in a fixture HOME, and a session that starts a child with a fake HOME has already
+# left every path fence in this file (they are all spelled from $HOME) and holds no credentials to run it with.
+psk=""
+pseat(){   # rc 0 = this call comes from the permission seat
+  [ -n "$psk" ] && { [ "$psk" = 1 ]; return; }
+  local p="" n=0 home
+  psk=0
+  if [ -n "${CC_GUARD_ROOT_PID:-}" ]; then
+    home=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+    [ -n "$home" ] && [ "$home" != "$HOME" ] && p=$CC_GUARD_ROOT_PID
+  fi
+  if [ -z "$p" ]; then p=$PPID
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 64 ]; do
+      [ "$(cat "/proc/$p/comm" 2>/dev/null)" = claude ] && break
+      p=$(kppid "$p"); n=$((n+1)); done
+    [ "$(cat "/proc/${p:-0}/comm" 2>/dev/null)" = claude ] || return 1
+  fi
+  tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qxF -- --dangerously-skip-permissions || return 1
+  # …and it runs IN the seat's directory: a flagged claude started anywhere
+  # else is not the seat, however it was launched (security re-review: `setsid -f claude --dangerously-…` passed).
+  local d; d=$(readlink "/proc/$p/cwd" 2>/dev/null)
+  case "$d" in "$HOME"/.cc/state/?*/perms) case "${d#"$HOME"/.cc/state/}" in */*/*) return 1;; esac;; *) return 1;; esac
+  n=0; local q; q=$(kppid "$p")
+  while [ -n "$q" ] && [ "$q" != 0 ] && [ "$q" != 1 ] && [ "$n" -lt 64 ]; do
+    [ "$(cat "/proc/$q/comm" 2>/dev/null)" = claude ] && return 1
+    q=$(kppid "$q"); n=$((n+1)); done
+  psk=1; return 0; }
+pstate(){   # rc 0 = the absolute, resolved path $1 is the seat's state: ~/.cc/state/<one name>/perms[/…] or its handoff files
+  local r
+  case "$1" in "$HOME"/.cc/state/handoff/perms.json|"$HOME"/.cc/state/handoff/perms.json.tmp|"$HOME"/.cc/state/handoff/perms.brief) return 0;; esac
+  case "$1" in "$HOME"/.cc/state/?*/perms|"$HOME"/.cc/state/?*/perms/*) r=${1#"$HOME"/.cc/state/}; r=${r#*/}
+    case "$r" in perms|perms/*) return 0;; esac;; esac
+  return 1; }
+pabove(){   # rc 0 = $1 is a directory with the seat's state INSIDE it: removing or moving it takes the state with it
+  local s
+  for s in "$HOME"/.cc/state/*/perms "$HOME"/.cc/state/handoff/perms.json "$HOME"/.cc/state/handoff/perms.brief; do
+    [ -e "$s" ] || continue; case "$s" in "$1"/*) return 0;; esac; done
+  return 1; }
+# pstate/pseat/pabove above are the primitives; wtgt and rmtgt below fold them into the same write/remove scan
+# that already fences ~/dev, ~/bin and ~/.cc/state/arch, so every shape those two already catch (a redirect, a
+# cp/mv/tee/sed/dd/git target, an rm/rmdir/unlink/find -delete, and the glob form of each) reaches the perms fence
+# too, rather than a third parallel scanner a future edit to wtgt/rmtgt could silently stop matching.
+pdeny(){ never "writing the permission seat's state ($phit) — only that seat writes ~/.cc/state/<repo>/perms and its handoff record, because whoever writes its brief.md controls the next permission-skipping session; reading it is fine"; }
+# A COMMAND THAT NAMES THE SEAT'S STATE AND IS NOT A PLAIN READ IS REFUSED, whatever writes it. The scan in wtgt
+# judges targets it can resolve, and a `$D/brief.md`, a python open(), os.link, touch or link names the file in a way
+# it cannot (security re-review: each passed). pmention reads the command as typed; pread passes only statements
+# whose first word is on a read-only list (not rg: its --pre runs a command), with no redirect into a file and no substitution to run something else.
+pmention(){ grep -qE '\.cc/state/[^/[:space:]]+/perms([/'\''"[:space:];&|)]|$)|\.cc/state/handoff/perms\.(json|brief)|\.cc/state.*[^[:alnum:]_.-]perms/(brief\.md|ledger\.md|\.claude)' <<<"$1"; }
+pread(){
+  local s w
+  case "$1" in *'$('*|*'`'*|*'<('*|*'>('*) return 1;; esac
+  s=$(sed -E 's/[0-9]*>&[0-9-]//g; s/[0-9&]*>>? *\/dev\/null//g' <<<"$1")
+  case "$s" in *'>'*) return 1;; esac
+  while IFS= read -r w; do
+    w=${w#"${w%%[![:space:]]*}"}; [ -n "$w" ] || continue
+    [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$ ]] && continue   # a bare assignment runs nothing
+    w=${w%%[[:space:]]*}; w=${w##*/}
+    case "$w" in cat|head|tail|grep|egrep|ls|stat|wc|jq|diff|cmp|realpath|readlink|test|'['|cd|pwd|md5sum|sha256sum|file|du|echo|true|cc-lib) ;; *) return 1;; esac
+  done < <(sed -E 's/\|\||&&|[;|&]/\n/g' <<<"$s")
+  return 0; }
+if [ "$tool" = Bash ] && grep -qF 'perms' <<<"$inp"; then
+  praw=$(jq -r '.tool_input.command // ""' <<<"$inp")
+  pmention "$praw" && ! pread "$praw" && ! pseat && { phit="a command naming it that is not a plain read"; pdeny; }
+fi
+[ -n "$pfonly" ] && case "$tool" in Bash|Edit|Write|MultiEdit|NotebookEdit) ;; *) exit 0;; esac   # nothing else reaches the seat's state
 case "$tool" in
   Bash)
     cmd=$u   # the universal block above already built it: one jq and at most one awk per call, not two
     cmdn=$(tr '\t' ' ' <<<"$cmd" | tr -s ' ')   # …and the same line blank-squeezed, which is what rxn, the gh api door and the Slack ones below read (see the note there)
+    if [ -z "$pfonly" ]; then   # every rule up to the write walk is a gated tier's; the ungated one meets the walk alone
+    # A GATED SHELL NEVER STARTS A SESSION THAT SKIPS PERMISSIONS: that is the owner's alone (his card, or by hand), and a
+    # flagged claude a worker starts could otherwise sit in the seat's directory and pass pseat.
+    { grep -qE 'dangerously-skip-permissions|bypassPermissions|permission-mode[[:space:]=]+bypass' <<<"$cmd" && ! pread "$cmd"; } \
+      && never "starting a session with permissions skipped — only the owner does that, by hand or with his approval card"
     if [ -n "$handoff_gated" ]; then   # on top of the four gates below: what only the LIVE session may do
       rx 'git +push\b' && denyh "pushing while the other session is the live one (a retired session must not push a stale branch)"
       rx "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' && { board_only "$qcmd" && RX="" || denyh "dispatching a worker (cc --go)"; }
@@ -4228,6 +4434,7 @@ case "$tool" in
     RD='(cat|tac|less|more|head|tail|nl|cut|grep|egrep|fgrep|rg|sed|awk|xxd|od|base64|strings|sort|uniq|jq|python[0-9.]* +-c|source|\.)'
     rx "$AT$RD"' +[^;&|]*(ccbox/env|\.credentials\.json)($|[^A-Za-z0-9_.-])' \
       && never "reading the box's credentials (~/.claude/.credentials.json is the Claude account and its spend, ~/ccbox/env is a GitHub PAT and a deploy token)"
+    fi   # end of the rules the ungated tier skips (pfonly): the write walk below is the one it meets
     # 5. THE WORKTREE IS THE ONLY TREE A TRACK WRITES. ~/dev/<repo> is the checkout the box RUNS and ~/bin symlinks into
     #    it, so a write there is an unreviewed change to a live binary. 2026-09-01: a review agent's `cp x $S/bin/y` landed
     #    in the live checkout's core/bin because $S/bin was a symlink farm into it — so every target is REALPATH'd and judged by
@@ -4248,6 +4455,13 @@ case "$tool" in
     # one: does a fenced path begin with it. An exact path is unchanged — it means itself and nothing else.
     wspan(){ local t=$1 p; shift          # rc 0 = the cut prefix $t spans one of the fenced roots $@; $hit says which
       for p; do case "$p" in "$t"*) hit=$p; return 0;; esac; done; return 1; }
+    # THE UNGATED TIER'S RELATIVE WRITE AFTER A `cd` THIS CANNOT RESOLVE: refused only when some part of the name, glob
+    # and all, could be the seat's state or climb out of where it landed. That tier can edit this file in ~/dev, so
+    # its fence guards against a mistake, not an adversary, and a planning seat's `cd "$(git rev-parse …)"` stays free.
+    prel(){ local c n; local -a parts; IFS=/ read -ra parts <<<"$1"
+      for c in "${parts[@]}"; do for n in perms brief.md ledger.md .claude perms.json perms.brief ..; do
+        # shellcheck disable=SC2053  # $c unquoted on purpose: a glob in the name is matched as a glob
+        [[ $n == $c ]] && return 0; done; done; return 1; }
     wtgt(){ local t=${1%\`} g=""   # rc 0 = $1 lands in ~/dev/* or ~/bin, outside this session's own tree; $hit says where
       # A GLOB IS NOT AN UNRESOLVABLE NAME. It is a name with a tail this cannot see, and the head of it says
       # where the write LANDS: `cp /dev/null ~/bin/cc-guar?` truncated a live binary while this waved it
@@ -4260,7 +4474,7 @@ case "$tool" in
       case "$t" in '~') t=$HOME;; '~/'*) t=$HOME/${t#\~/};; '$HOME'|'${HOME}') t=$HOME;; '$HOME/'*) t=$HOME/${t#\$HOME/};; '${HOME}/'*) t=$HOME/${t#\$\{HOME\}/};; esac
       case "$t" in *['*?[']*) g=1; t=${t%%[*?[]*};; esac   # …so the glob is cut off and its prefix judged, both ways (wspan)
       case "$t" in ''|-*|*['$`']*) return 1;; /*) ;;
-        *) [ -n "$wbase" ] || never "writing to a relative path after a \`cd\` this cannot resolve — where it would land is unknown, so it is refused rather than guessed"
+        *) [ -n "$wbase" ] || { [ -n "$pfonly" ] && ! prel "${1%\`}" && return 1; never "writing to a relative path after a \`cd\` this cannot resolve — where it would land is unknown, so it is refused rather than guessed"; }
            t=$wbase/$t;; esac
       t=$(realpath -m -- "$t" 2>/dev/null) || return 1
       # ~/.cc/state is a track's own scratch and stays writable — with ONE carve-out. ~/.cc/state/arch is where
@@ -4272,8 +4486,13 @@ case "$tool" in
       # worker that appends to current/core/lander/*.py, repoints `current` or plants `legacy-on` chooses what
       # merges, and one that writes a job, an approval or an inbox request there forges a landing. Both are
       # fenced like ~/bin; the lander's own processes write them, never a gated shell.
-      case "$t" in "$HOME"/dev/*|"$HOME"/bin|"$HOME"/bin/*|"$HOME"/.cc/state/arch|"$HOME"/.cc/state/arch/*|"$HOME"/.cc/lander|"$HOME"/.cc/lander/*|"$HOME"/.cc/state/land|"$HOME"/.cc/state/land/*) in_root "$t" && return 1; hit=$t; return 0;; esac
-      [ -n "$g" ] && wspan "$t" "$HOME/dev/" "$HOME/bin" "$HOME/.cc/state/arch" "$HOME/.cc/lander" "$HOME/.cc/state/land" && return 0
+      case "$t" in "$HOME"/dev/*|"$HOME"/bin|"$HOME"/bin/*|"$HOME"/.cc/state/arch|"$HOME"/.cc/state/arch/*|"$HOME"/.cc/lander|"$HOME"/.cc/lander/*|"$HOME"/.cc/state/land|"$HOME"/.cc/state/land/*) { [ -n "$pfonly" ] || in_root "$t"; } && return 1; hit=$t; return 0;; esac   # pfonly: not the ungated tier's fence
+      # THE PERMISSION SEAT'S STATE IS THE SAME KIND OF FENCE AS ~/.cc/state/arch — writable by the one process it
+      # belongs to and nobody else — except the "one process" here is the live bypass seat (pseat), not a fixed
+      # in_root check, because the seat is not launched as a normal track. See pstate/pseat, defined above.
+      pstate "$t" && { pseat && return 1; phit=$t; pdeny; }
+      [ -n "$g" ] && { [ -z "$pfonly" ] && wspan "$t" "$HOME/dev/" "$HOME/bin" "$HOME/.cc/state/arch" "$HOME/.cc/lander" "$HOME/.cc/state/land" && return 0
+        if ! pseat; then local pd; for pd in "$HOME"/.cc/state/*/perms; do [ -e "$pd" ] || continue; wspan "$t" "$pd" && { phit=$hit; pdeny; }; done; fi; }
       return 1; }
     wdeny(){ never "writing into the box's live tree ($hit): ~/dev/<repo> is the checkout the box runs, ~/bin symlinks into it, ~/.cc/lander is the lander release every landing runs, ~/.cc/state/land is its queue and ~/.cc/state/arch is the ledger for what has already been sent outward — a track writes its worktree, /tmp and the rest of its own ~/.cc/state dir, and the rest arrives as a PR"; }
     # DELETING THE RECORD IS THE OTHER HALF OF WRITING IT, and the fence above only covered writing. cc-arch reads
@@ -4290,8 +4509,11 @@ case "$tool" in
       case "$t" in *['*?[']*) g=1; t=${t%%[*?[]*};; esac  # a glob is a name with a tail this cannot see; wspan judges it both ways
       case "$t" in ''|-*|*['$`']*) return 1;; /*) ;; *) [ -n "$wbase" ] || return 1; t=$wbase/$t;; esac
       t=$(realpath -m -- "$t" 2>/dev/null) || return 1
-      case "$t" in "$HOME"/.cc/state/arch|"$HOME"/.cc/state/arch/*) hit=$t; return 0;; esac
-      [ -n "$g" ] && wspan "$t" "$HOME/.cc/state/arch" && return 0
+      [ -z "$pfonly" ] && case "$t" in "$HOME"/.cc/state/arch|"$HOME"/.cc/state/arch/*) hit=$t; return 0;; esac
+      pstate "$t" && { pseat && return 1; phit=$t; pdeny; }
+      if ! pseat && pabove "$t"; then phit=$t; pdeny; fi
+      [ -n "$g" ] && { [ -z "$pfonly" ] && wspan "$t" "$HOME/.cc/state/arch" && return 0
+        if ! pseat; then local pd; for pd in "$HOME"/.cc/state/*/perms; do [ -e "$pd" ] || continue; wspan "$t" "$pd" && { phit=$hit; pdeny; }; done; fi; }
       return 1; }
     rmdeny(){ never "removing the record of what has already been sent outward ($hit): ~/.cc/state/arch holds cc-arch's cursor and its ledger, and a shell that deletes either one makes the box re-pin to the branch head and drop a declared architecture revision without saying so. The rest of ~/.cc/state is a track's own, to write and to delete"; }
     wcd(){   # where a `cd`/`pushd` leaves the rest of the line; rc 1 = it cannot be resolved, so $wbase is emptied
@@ -4301,7 +4523,7 @@ case "$tool" in
       case "$t" in '') t=$HOME;; '~-'|+[0-9]*|-*|*['$`*?[']*) return 1;; /*) ;; *) [ -n "$wbase" ] || return 1; t=$wbase/$t;; esac
       realpath -m -- "$t" 2>/dev/null || return 1; }
     wscan(){   # the three write shapes over one piece of the haystack, every relative target against $wbase
-      local txt=$1 t inv v x dst skip ef n verb; local -a a files dirs
+      local txt=$1 t inv v x dst skip ef n verb hl; local -a a files dirs
       while IFS= read -r t; do wtgt "$t" && wdeny; done < <(grep -oE '(&>>?|[0-9]*>>?[|]?)[[:space:]]*[^[:space:];&|<>()]+' <<<"$txt" | sed -E 's/^[^[:space:]]*>[|]?[[:space:]]*//')
       while IFS= read -r inv; do
         [[ $inv =~ (^|[^A-Za-z0-9_.-])(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+(.*)$ ]] || continue
@@ -4313,11 +4535,17 @@ case "$tool" in
           # EVERY bare word after the first is judged. Only the first is a source and safe to skip; a `-t` names
           # the destination outright and the bare words are then all sources. The cost is a false refusal on
           # `cp a ~/dev/other/b sub/`, where a middle SOURCE is judged as a target: over-strict, the safe way.
-          cp|mv|ln|install|rsync) for x in "${a[@]}"; do
+          # A HARD LINK MAKES ITS SOURCE WRITABLE BY ANOTHER NAME: `ln ~/.cc/state/<r>/perms/brief.md ~/.cc/tmp/b`
+          # then `echo x >> ~/.cc/tmp/b` rewrote the seat's brief (security review of perms-seat-hands-off-itself). So
+          # for `ln` without -s and `cp -l`, the first word is judged as a target too.
+          cp|mv|ln|install|rsync) hl=""
+            case "$v" in ln) hl=1; for x in "${a[@]}"; do case "$x" in -s|--symbolic|-[!-]*s*) hl="";; esac; done;;
+              cp) for x in "${a[@]}"; do case "$x" in -l|--link|-[!-]*l*) hl=1;; esac; done;; esac
+            for x in "${a[@]}"; do
               if [ -n "$skip" ]; then dst=$x; skip=""; continue; fi
               case "$x" in -t|--target-directory) skip=1;; --target-directory=*) dst=${x#*=};;
-                -*) ;; *) n=$((n+1)); [ "$n" -gt 1 ] && files+=("$x");; esac; done
-            [ -z "$dst" ] || files=("$dst");;
+                -*) ;; *) n=$((n+1)); { [ "$n" -gt 1 ] || [ -n "$hl" ]; } && files+=("$x");; esac; done
+            [ -z "$dst" ] || { [ -n "$hl" ] && files+=("$dst") || files=("$dst"); };;
           tee) for x in "${a[@]}"; do case "$x" in -*) ;; *) files+=("$x");; esac; done;;
           sed) case " ${a[*]} " in *" -i"*|*" --in-place"*) ;; *) continue;; esac   # without -i sed writes nothing
             for x in "${a[@]}"; do case "$x" in -e|-f|--expression|--file) ef=1;; esac; done
@@ -4528,6 +4756,7 @@ case "$tool" in
       done <<<"$uk"
       wbase=$cwd
     else wscan "$cmd"; fi
+    [ -n "$pfonly" ] && exit 0   # the ungated tier: the write walk above was the one rule it meets (pfonly)
     # 4. member-facing only: a member must not be able to make the box SPEND or LEAK. Be honest about the ceiling —
     #    a Bash blocklist is not a sandbox: it stops accidents and casual prompt-injection, not a determined attacker
     #    (a redirection, a copied binary, a script it writes first). Real containment is ccbox. cc-notify stays
@@ -4589,6 +4818,8 @@ case "$tool" in
   Edit|Write|MultiEdit|NotebookEdit)
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")
     fp=$(realpath -m -- "${fp:-/}" 2>/dev/null || echo "$fp")   # ../ AND a symlink resolve before the match: ~/bin/x IS ~/dev/<repo>/core/bin/x, and so is a symlink farm in /tmp
+    if pstate "$fp" && ! pseat; then phit=$fp; pdeny; fi   # every tier, and before in_root: a root that covers ~/.cc/state is no exemption
+    [ -n "$pfonly" ] && exit 0   # the ungated tier meets this one path check and nothing else
     if ! in_root "$fp"; then case "$fp" in    # inside the worktree (rule 5: the marker root, not the cwd) / the member's own dir: fine
       /tmp/*) ;;                                   # scratch: fine
       "$HOME"/.cc/tmp/*) ;;                        # scratch on disk: the TMPDIR cc and the units hand every session, Claude Code's scratchpad under it
