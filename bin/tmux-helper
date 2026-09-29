@@ -20,7 +20,9 @@ well, you get the numbered question below. With -ai, the model answers one JSON 
 terminal with numbered options (the model's candidates, or the most recently active windows when it gave none);
 a number opens that window, and free text is taken as more words for one more pick, which then opens or stops.
 
-OPENING. Inside tmux: select-window, then switch-client. Outside: select-window, then attach. --dry-run prints the
+OPENING. Inside tmux: select-window, then switch-client. Outside: a new session grouped with the window's session
+(`new-session -t`, destroy-unattached on, so it goes when the tab closes) gets the window selected, and that one is
+attached, so terminal tabs stay independent. --dry-run prints the
 pick (id, session, name) and changes nothing, and prints the options instead of asking.
 
 ENV. TMUX_HELPER_CLAUDE (default `claude`) is the model command; TMUX_HELPER_MODEL (default `haiku`).
@@ -114,11 +116,16 @@ def open_window(w, dry):
     print("-> %s  %s:%s  (%s)" % (w["id"], w["session"], w["name"], w["cwd"]))
     if dry:
         return 0
-    tgt = "%s:%s" % (w["session"], w["id"])
-    run(["tmux", "select-window", "-t", tgt])
     if os.environ.get("TMUX"):
+        run(["tmux", "select-window", "-t", "%s:%s" % (w["session"], w["id"])])
         return subprocess.call(["tmux", "switch-client", "-t", w["session"]])
-    return subprocess.call(["tmux", "attach", "-t", w["session"]])
+    r = run(["tmux", "new-session", "-d", "-P", "-F", "#{session_name}", "-t", w["session"]])
+    mine = r.stdout.strip() if r.returncode == 0 else ""
+    if not mine:
+        sys.exit("tmux-helper: could not open a session grouped with %s: %s" % (w["session"], r.stderr.strip()))
+    run(["tmux", "select-window", "-t", "%s:%s" % (mine, w["id"])])
+    # set only once attached: on a detached session tmux destroys it at once
+    return subprocess.call(["tmux", "attach", "-t", mine, ";", "set-option", "-t", mine, "destroy-unattached", "on"])
 
 
 def toks(t):
@@ -234,7 +241,7 @@ def selfcheck():
                  "printf '@1\\talpha\\tshop\\tbash\\t/w/shop\\t1000\\t%d\\n@1\\tbeta\\tshop\\tbash\\t/w/shop\\t1000\\t%d\\n"
                  "@2\\talpha\\tshop\\tbash\\t/w/shop2\\t900\\t%d\\n@2\\tbeta\\tshop\\tbash\\t/w/shop2\\t900\\t%d\\n"
                  "@3\\tgamma\\tnotes\\tvim\\t/w/notes\\t800\\t%d\\n'\n"
-                 "fi\n" % (log, os.getpid(), os.getpid(), os.getpid(), os.getpid(), os.getpid()))
+                 "elif [ \"$1\" = new-session ]; then echo grp-new; fi\n" % (log, os.getpid(), os.getpid(), os.getpid(), os.getpid(), os.getpid()))
     with open(os.path.join(bindir, "claude"), "w") as fh:
         fh.write('#!/bin/sh\ncat > "%s"\ncat "%s"\n' % (prm, ans))
     for x in ("tmux", "claude"):
@@ -260,22 +267,25 @@ def selfcheck():
     t("old words reach the model", "Words: shop old" in open(prm).read())
     os.path.exists(prm) and os.remove(prm)
     r, lg = go('{"match":"none"}', ["ntoes", "window"])
-    t("typo and extra word match locally, no model", "attach -t gamma" in lg and not os.path.exists(prm))
+    t("typo and extra word match locally, no model", "attach -t grp-new" in lg and not os.path.exists(prm))
     r, lg = go('{"match":"none"}', ["shop"])
-    t("same name: newest opens", "select-window -t alpha:@1" in lg and not os.path.exists(prm))
+    t("same name: newest opens", "select-window -t grp-new:@1" in lg and not os.path.exists(prm))
     r, lg = go('{"match":"none"}', ["shop", "old"])
-    t("same name + old: the older one", "select-window -t alpha:@2" in lg)
+    t("same name + old: the older one", "select-window -t grp-new:@2" in lg)
     r, lg = go('{"match":"none"}', ["qqqqzz"], "")
     t("nothing close asks, no model", "Which one" in r.stdout and not os.path.exists(prm))
     r, lg = go('{"match":"none"}', ["Notes"])
-    t("exact name opens without the model", "attach -t gamma" in lg and not os.path.exists(prm))
+    t("exact name opens without the model", "attach -t grp-new" in lg and not os.path.exists(prm))
     r, lg = go('{"match":"one","id":"@3"}', ["-ai", "notes"])
-    t("outside tmux attaches", "attach -t gamma" in lg and "switch-client" not in lg)
+    t("outside tmux attaches", "attach -t grp-new" in lg and "switch-client" not in lg)
+    t("outside tmux: own grouped session", "new-session -d -P -F #{session_name} -t gamma" in lg
+      and "set-option -t grp-new destroy-unattached on" in lg and "select-window -t grp-new:@3" in lg
+      and "select-window -t gamma" not in lg and "attach -t gamma" not in lg)
     r, lg = go('{"match":"several","question":"Which shop?","candidates":["@1","@2"]}', ["-ai", "shop"], "2\n")
     t("several asks numbered", "Which shop?" in r.stdout and "1) @1" in r.stdout and "2) @2" in r.stdout)
-    t("number opens the pick", "attach -t alpha" in lg and "select-window -t alpha:@2" in lg)
+    t("number opens the pick", "attach -t grp-new" in lg and "select-window -t grp-new:@2" in lg)
     r, lg = go('{"match":"none"}', ["-ai", "zzz"], "3\n")
-    t("none falls back to recent windows", "1) @1" in r.stdout and "3) @3" in r.stdout and "attach -t gamma" in lg)
+    t("none falls back to recent windows", "1) @1" in r.stdout and "3) @3" in r.stdout and "attach -t grp-new" in lg)
     r, lg = go('{"match":"none"}', ["-ai", "zzz"], "")
     t("no answer opens nothing", r.returncode == 1 and "attach" not in lg)
     r, lg = go('{"match":"none"}', ["-ai", "zzz"], "the vim one\n")
