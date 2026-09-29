@@ -485,10 +485,13 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
 
 
 def choose_where(check: T.Check, member: str = "") -> str:
-    """member:<h> for a member's landing; the laptop when the box is loaded and the check may go; else box."""
+    """member:<h> for a member's landing; the laptop when the box is busy enough for the check's class; else box."""
     if member:
         return f"member:{member}"
-    if "laptop" in check.where and check.klass in (T.STATIC, T.HERMETIC) and A.loaded() and laptop_dest():
+    # a static check goes when the box is busy; a hermetic one runs the PR's code, unsandboxed on the laptop, so it
+    # goes only when the box is saturated. A laptop pass stands even where the box's newer linters might say red.
+    spill = A.busy() if check.klass == T.STATIC else A.loaded() if check.klass == T.HERMETIC else False
+    if "laptop" in check.where and spill and laptop_dest():
         return "laptop"
     return "box"
 

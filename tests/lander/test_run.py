@@ -257,7 +257,7 @@ exec bash {RUN.BIN}/cc-suites runner
             RUN.laptop_argv(chk(), self.tree, "")
         os.remove(os.path.join(d, "known_hosts"))
         self.assertEqual(RUN.laptop_dest(), "")
-        with mock.patch.object(A, "loaded", return_value=True):
+        with mock.patch.object(A, "busy", return_value=True):
             self.assertEqual(RUN.choose_where(chk(where=["box", "laptop"])), "box")
 
     def test_the_laptop_round_trip_gives_every_job_a_fresh_home(self):
@@ -649,21 +649,21 @@ class Judge(unittest.TestCase):
             self.assertEqual(outs["c"].status, T.FAILED)             # the change touches the check
 
     def test_after_one_laptop_no_answer_the_rest_of_the_plan_goes_to_the_box(self):
-        m = M.Manifest(checks={n: chk(name=n, where=["box", "laptop"]) for n in ("a", "b")}, cwd={"a": "", "b": ""})
+        m = M.Manifest(checks={n: chk(name=n, klass=T.STATIC, where=["box", "laptop"]) for n in ("a", "b")}, cwd={"a": "", "b": ""})
         seen = []
 
         def run(check, tree, where, alone=False, **kw):
             seen.append(where)
             st = T.UNRUNNABLE if where == "laptop" else T.PASSED
             return T.Result(check=check.name, tree=tree, status=st, extra={"why": "no answer"})
-        with mock.patch.object(A, "loaded", return_value=True), \
+        with mock.patch.object(A, "busy", return_value=True), \
                 mock.patch.object(RUN, "laptop_dest", return_value="ccsuite@r"):
             outs = RUN.run_plan(".", m, T.Plan(checks=["a", "b"]), ["README.md"], self.H, "", runner=run)
         self.assertEqual(seen, ["laptop", "box", "box"])
         self.assertEqual([outs[n].status for n in ("a", "b")], [T.PASSED, T.PASSED])
 
     def test_member_and_laptop_routing(self):
-        c = chk(where=["box", "laptop"])
+        c = chk(klass=T.STATIC, where=["box", "laptop"])
         self.assertEqual(RUN.choose_where(c, "ann"), "member:ann")
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
@@ -671,11 +671,27 @@ class Judge(unittest.TestCase):
         p = mock.patch.dict(os.environ, {"CC_SUITES_DIR": d.name})
         p.start()
         self.addCleanup(p.stop)
-        with mock.patch.object(A, "loaded", return_value=True):
+        with mock.patch.object(A, "busy", return_value=True):
             self.assertEqual(RUN.choose_where(c), "laptop")
             self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "box")
-        with mock.patch.object(A, "loaded", return_value=False):
+        with mock.patch.object(A, "busy", return_value=False):
             self.assertEqual(RUN.choose_where(c), "box")
+        h = chk(klass=T.HERMETIC, where=["box", "laptop"])
+        with mock.patch.object(A, "busy", return_value=True), mock.patch.object(A, "loaded", return_value=False):
+            self.assertEqual(RUN.choose_where(h), "box")       # busy is not enough to send the PR's code out
+        with mock.patch.object(A, "busy", return_value=True), mock.patch.object(A, "loaded", return_value=True):
+            self.assertEqual(RUN.choose_where(h), "laptop")
+
+    def test_a_busy_box_that_is_not_saturated_sends_to_the_laptop_and_keeps_its_slots(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write(d.name, {"cpu": "some avg10=90.00 avg60=90.00 avg300=90.00 total=1\n",
+                       "memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"})
+        self.assertTrue(A.busy(d.name))
+        self.assertFalse(A.loaded(d.name))
+        self.assertEqual(A.slots_now(d.name, k=3), 3)
+        write(d.name, {"cpu": "some avg10=20.00 avg60=20.00 avg300=20.00 total=1\n"})
+        self.assertFalse(A.busy(d.name))
 
 
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")

@@ -6,6 +6,9 @@ mostly not the lander's, so a load average would give one slot nearly always; pr
 (default 99.5 — this box idles near 98, so only a saturated one counts), only slot 1 admits. Never 0: a check always
 gets to run, only later. A diagnostic rerun takes every slot at once (alone=True), so it runs by itself.
 
+LAPTOP. busy() is a static check's lower bar for the laptop: cpu `some avg10` at PSI_LAPTOP (default 50) or memory
+at PSI_MEM. A box under loaded()'s near-saturation mark all day is still slow. Hermetic checks keep loaded().
+
 SCOPES. Each run goes into a transient `systemd-run --user --scope` on slice `lander.slice` (no unit file) with a low
 CPUWeight, a MemoryMax and no swap (a box already deep in swap is what this guards against), so the kernel,
 not the lander, stops a check that eats the box — and one killed there is unrunnable, never red. Hermetic and
@@ -29,6 +32,7 @@ from lander import types as T
 SLOTS = int(os.environ.get("LANDER_SLOTS", "3") or 3)
 PSI_MEM = float(os.environ.get("LANDER_PSI_MEM", "20"))
 PSI_CPU = float(os.environ.get("LANDER_PSI_CPU", "99.5"))
+PSI_LAPTOP = float(os.environ.get("LANDER_PSI_LAPTOP", "50"))
 MEM_MAX = os.environ.get("LANDER_MEM_MAX", "6G")
 SWAP_MAX = os.environ.get("LANDER_SWAP_MAX", "0")
 CPU_WEIGHT = "20"
@@ -49,6 +53,11 @@ def psi(kind: str, root: str = PSI_DIR) -> float:
 
 def loaded(root: str = PSI_DIR) -> bool:
     return psi("memory", root) >= PSI_MEM or psi("cpu", root) >= PSI_CPU
+
+
+def busy(root: str = PSI_DIR) -> bool:
+    """Busy enough that a static check goes to the laptop; lower than loaded(), and slots ignore it."""
+    return psi("memory", root) >= PSI_MEM or psi("cpu", root) >= PSI_LAPTOP
 
 
 def slots_now(root: str = PSI_DIR, k: int | None = None) -> int:
