@@ -134,5 +134,7 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc-lib ask --object '#71' --need current "…"   read the record before you claim: a PR's landing tally, a row and its
                                          journal, a rule — capped, cited, with COVERAGE and a ticket; `cc-lib --help`
     cc-docs file <pdf> --project P --title T   number, stamp and file a finished PDF (PPP-NNNN-R); `cc-docs find 001-0004`
-                                         or words prints the current revision's file; `cc-docs --help`
+                                         or words prints the current revision's file; `--attach F` (repeatable) or
+                                         `cc-docs attach PPP-NNNN F…` keeps supporting files beside it (Gerbers, BOM,
+                                         a zip), downloadable from its page; `cc-docs --help`
     cc-unfiled [--hours 24] [--to F]     PDFs built lately that look finished but are not filed; a daily timer runs it

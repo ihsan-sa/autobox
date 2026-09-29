@@ -9,7 +9,7 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
 
     cc-docs file <pdf> --project <name|PPP> --title <t> [--source <path>] [--latex <main.tex>] [--no-stamp]
                  [--kind work|course|member] [--member <handle>] [--date YYYY-MM-DD]
-                 [--describes PCB-NNNN-R] [--note <text>] [--cost <step>=<usd>]…
+                 [--describes PCB-NNNN-R] [--note <text>] [--cost <step>=<usd>]… [--attach <file>]…
         Called by a maker at the end of a finished build. The same source path, or else the same title in the same
         project, is the same document. Content unchanged since the current revision files nothing and prints that
         revision; otherwise the next letter is filed. A PDF whose text carries no number gets a small grey stamp
@@ -49,9 +49,22 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         lone --source), or any source while DOCS_SOURCE_CHECK is unset, is kept unchecked. With DOCS_CHECK_CHANNEL
         set, a filing that files a revision starts `cc-docs check --post` detached. It records WHO FILED it
         (filer: repo, session, cc-slack target, Slack channel and thread) from the track worktree, orch alias or
-        ~/dev/<repo> the filing ran under. A new revision marks its document's open feedback (feedback.json, written
+        ~/dev/<repo> the filing ran under. --attach, once per file, adds SUPPORTING FILES (below) to the revision
+        it files, or to the current one when the content is unchanged; one that `attach` would refuse refuses the
+        whole call before anything is filed. A new revision marks its document's open feedback (feedback.json, written
         by the box's library poller) done, "answered by rev X", for the poller to tell the site.
-    cc-docs backfill-sources [--from <tsv>]
+    cc-docs attach <PPP-NNNN | PPP-NNNN-R> [<file>…] [--replace] [--remove <name>]…
+        SUPPORTING FILES: files kept beside a revision's PDF (a board's Gerbers, drill files, BOM, a zip), shown on
+        its document page to whoever can open that revision, each downloadable and all of them as one zip. Each is
+        kept once by content as attachments/<sha256[:2]>/<sha256>, read-only, and listed on the revision (PPP-NNNN
+        names the current one) as {name, blob, bytes, sha256, crc32, added}; the name is the file's own (letters,
+        digits, space, ._+()-). A name already there with the same bytes is left as it is, and with other bytes it
+        is refused unless --replace; --remove takes a name off the revision. Refused, saying which cap and with
+        nothing attached: a directory (name its files), a file over 25 MiB (what Cloudflare Pages serves), over 100
+        on one revision, or every supporting file in the register, counted once each, past 1 GiB (the mirror's GitHub
+        repo). A NEW REVISION CARRIES the one before's files (each marked carried_from), except a name its own
+        --attach gives, and carries none when it --describes a different board revision than the one before did;
+        stderr says which it carried or left. Prints `<number>\t<name>\tattached|unchanged|replaced|removed`.
         For each document's current revision that keeps no source, or keeps a LaTeX one with no .source.json, or one
         that fails DOCS_SOURCE_CHECK (a pass cached in checks.json is not compiled again), keeps what its recorded
         --source finds now, by the same rules and the same check as `file`; an existing tarball that fails again is
@@ -141,14 +154,14 @@ a PDF or --source outside the workspace's own trees (~/dev/<h>, its track worktr
 is not a PDF, and one over 64 MiB; reads the PDF from one fd so it cannot be swapped between the check and the
 read; and ignores --kind. A project an owner's maker names that is not the member's files under the member's own
 instead, so a build that sets DOC_PROJECT still files. `project`, `star`, `public`, `token`, `fold`, `retire`,
-`move`, `backfill-sources` and `check` are refused inside.
+`move`, `attach`, `backfill-sources` and `check` are refused inside, and so is `file --attach`.
 
 THE REGISTER is one JSON file, $CC_DOCS_ROOT/register.json (default ~/.cc/documents), with the filed copies under
 files/PPP/ beside it: private state, in no repo, and outside cc-lib's own tree (cc-lib indexes the register). Per
 project it holds the name, the parent group (`group`, null for none: the site groups projects by it), kind, member
 and workspace. Per document it holds number, title, project, source, visibility (the owner, or the owner and one member), who starred
 it (starred_by, viewer ids), and per revision the letter, file, date, the PDF it was filed from, a content
-fingerprint, and when given the note, board revision, cost, public token, filer and its kept source (sources/,
+fingerprint, and when given the note, board revision, cost, public token, filer, supporting files (attachments) and its kept source (sources/,
 source_files, and for LaTeX source_main, source_engine and, once checked, source_checked). A member view carries neither the token nor the filer. The
 fingerprint hashes the PDF's text with any document stamp taken out together with every page rendered small and grey
 with its bottom strip (stamp, footer) cut off, so a rebuild that changes only a figure is a new revision and one that
@@ -159,7 +172,7 @@ VISIBILITY is keyed by workspace id, the one cc-lib keys its indexes by (~/.cc/m
 by cc-sandbox or cc-lib, never here): a member project records its member's id, and each of its documents is visible
 to ["owner", <id>]. The owner sees the whole register. A member workspace gets a VIEW, ws/<id>/ under the root, and
 never the register itself: a register of the same shape holding only the documents that name its id, with their
-filed copies hard-linked beside it, so `CC_DOCS_ROOT=<the view> cc-docs find …` works inside it unchanged. `file`
+filed copies and supporting files hard-linked beside it (a supporting file it no longer names is unlinked), so `CC_DOCS_ROOT=<the view> cc-docs find …` works inside it unchanged. `file`
 rewrites the views its document reaches after every filing, in place (a bind mount of the directory keeps seeing
 them), so the directory can be mounted read-only into that member's sandbox the way cc-lib mounts ws/<id>/. A
 star or a public switch rewrites them too. A view never carries a public token.
@@ -354,12 +367,20 @@ def write_views(reg, ids):
         docs = {n: dict(d, revisions=[{k: v for k, v in r.items() if k not in ("public_token", "filer")}
                                       for r in d["revisions"]])
                 for n, d in reg["documents"].items() if wid in d.get("visibility", ())}
+        blobs = set()
         for d in docs.values():
             for r in d["revisions"]:
-                dst = os.path.join(v, r["file"])
-                if not os.path.exists(dst):
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    os.link(os.path.join(ROOT, r["file"]), dst)
+                blobs.update(x["blob"] for x in r.get("attachments") or ())
+                for rel in [r["file"]] + sorted(x["blob"] for x in r.get("attachments") or ()):
+                    dst = os.path.join(v, rel)
+                    if not os.path.exists(dst):
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        os.link(os.path.join(ROOT, rel), dst)
+        # a supporting file no document in the view names any more (removed, retired, moved away) leaves it
+        for top, _, names in os.walk(os.path.join(v, "attachments")):
+            for fn in names:
+                if os.path.relpath(os.path.join(top, fn), v) not in blobs:
+                    os.unlink(os.path.join(top, fn))
         view = {"version": reg["version"], "documents": docs,
                 "projects": {p: reg["projects"][p] for p in sorted({d["project"] for d in docs.values()})}}
         fd, tmp = tempfile.mkstemp(dir=v, prefix=".register.")
@@ -1365,14 +1386,18 @@ def cmd_file(a):
                               f"be filed as {num}-{rev}; rebuild it with `cc-docs number`")
     # the check compiles for up to minutes, so it runs outside the register's lock, on a tarball not yet in place
     staged = stage_sources(sources, full, getattr(a, "trees", None))[0] if sources and want else None
+    # a supporting file that is missing or over a cap refuses the whole call before anything is filed
+    extra = StagedFiles()
     try:
-        return file_locked(a, src, shown, date, describes, cost, text, fp, staged)
+        extra = stage_attachments(getattr(a, "attach", None))
+        return file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra)
     finally:
+        extra.close()
         if staged:
             staged.close()
 
 
-def file_locked(a, src, shown, date, describes, cost, text, fp, staged):
+def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()):
     with Lock():
         reg = load()
         proj, num, d, rev = plan(reg, a)
@@ -1380,6 +1405,10 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged):
         # a revision filed before page images were hashed carries a text-only print: that still counts as unchanged
         if d and current(d) and current(d)["fingerprint"] in (fp, textprint(text)):
             cur = current(d)
+            # an unchanged build's supporting files go on the revision it matches, the same way `attach` puts them
+            lst, said = merge_attachments(cur.get("attachments") or [], extra, False, f"{num}-{cur['rev']}")
+            if extra:
+                check_attachments(reg, num, cur["rev"], lst)
             print(f"{num}-{cur['rev']}\t{os.path.join(ROOT, cur['file'])}\tunchanged, nothing filed")
             # brief: "a --source on an unchanged rebuild is how a session attaches a .tex found after filing"
             recorded = []
@@ -1392,8 +1421,13 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged):
                     if got:
                         cur.update(got)
                         recorded.append(f"sources {got['sources']}")
+            if any(w != "unchanged" for _, w in said):
+                extra.commit()
+                cur["attachments"] = lst
+                recorded.append("supporting files " + ", ".join(n for n, w in said if w != "unchanged"))
             if recorded:
                 save(reg)
+                write_views(reg, set(d["visibility"]) - {"owner"})
                 print(f"cc-docs: {num}-{cur['rev']}: recorded {' and '.join(recorded)}", file=sys.stderr)
             return 0
         full = f"{num}-{rev}"
@@ -1401,6 +1435,10 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged):
         if carried - {full}:
             raise Refused(f"{shown} already carries {', '.join(sorted(carried - {full}))}, but it would be filed as "
                           f"{full}; rebuild it with `cc-docs number`")
+        # brief: "A later revision doesn't silently drop a revision's files"
+        lst = merge_attachments(carry_attachments(current(d) if d else None, describes, extra, full), extra, False,
+                                full)[0]
+        check_attachments(reg, num, rev, lst)
         nostamp = a.no_stamp or bool(d and d.get("stamp") is False)
         rel = os.path.join("files", proj, f"{full}_{slugify(a.title)}.pdf")
         dst = os.path.join(ROOT, rel)
@@ -1439,6 +1477,9 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged):
                      ("filer", who)):
             if v:
                 d["revisions"][-1][k] = v
+        if lst:
+            extra.commit()
+            d["revisions"][-1]["attachments"] = lst
         if staged:
             try:
                 d["revisions"][-1].update(staged.commit(proj, full))
@@ -1453,6 +1494,170 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged):
         print(f"cc-docs: {full} answers {answered} feedback item(s) on {num}; the library poller tells the site",
               file=sys.stderr)
     spawn_check()
+    return 0
+
+
+# ── supporting files ─────────────────────────────────────────────────────────────────────────────────────────
+ATTACH_FILE_CAP = 25 << 20      # Cloudflare Pages serves no file over 25 MiB, and the site is served from Pages
+ATTACH_REV_CAP = 100            # files on one revision
+ATTACH_TOTAL_CAP = 1 << 30      # every supporting file the register names, once each: the mirror's GitHub repo
+ATTACH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,119}$")
+
+
+class StagedFiles(list):
+    """Supporting files read once, each copied aside under attachments/ while it is hashed, so what is recorded is
+    what was read. commit() moves each into its blob; close() drops what was never committed."""
+
+    def commit(self):
+        for x in self:
+            dst = os.path.join(ROOT, x["blob"])
+            if os.path.exists(dst):
+                os.unlink(x.pop("tmp"))
+            else:
+                os.replace(x.pop("tmp"), dst)
+
+    def close(self):
+        for x in self:
+            if x.get("tmp") and os.path.exists(x["tmp"]):
+                os.unlink(x["tmp"])
+
+
+def stage_attachments(paths):
+    """-> StagedFiles of the supporting files named, or Refused saying which one and why, nothing kept."""
+    staged = StagedFiles()
+    try:
+        for p in paths or ():
+            name = os.path.basename(p.rstrip("/"))
+            if os.path.isdir(p):
+                raise Refused(f"{p} is a directory: name its files (`{p.rstrip('/')}/*`) or zip it")
+            if not os.path.isfile(p):
+                raise Refused(f"{p}: no such file")
+            if not ATTACH_NAME.match(name):
+                raise Refused(f"{p}: a supporting file's name is letters, digits, space and ._+()- (at most 120, "
+                              "not starting with a dot); rename it")
+            if any(x["name"] == name for x in staged):
+                raise Refused(f"two supporting files are named {name}")
+            os.makedirs(os.path.join(ROOT, "attachments"), mode=0o700, exist_ok=True)
+            h, crc, size = hashlib.sha256(), 0, 0
+            fd, tmp = tempfile.mkstemp(dir=os.path.join(ROOT, "attachments"), prefix=".part.")
+            staged.append({"name": name, "tmp": tmp})
+            with open(p, "rb") as f, os.fdopen(fd, "wb") as out:
+                while True:
+                    b = f.read(1 << 20)
+                    if not b:
+                        break
+                    size += len(b)
+                    if size > ATTACH_FILE_CAP:
+                        # brief: "refuse over a cap and say why, rather than truncating"
+                        raise Refused(f"{p} is over {ATTACH_FILE_CAP >> 20} MiB, the largest file the library's host "
+                                      "(Cloudflare Pages) serves; split it or leave it out")
+                    h.update(b)
+                    crc = zlib.crc32(b, crc)
+                    out.write(b)
+            os.chmod(tmp, 0o444)
+            sha = h.hexdigest()
+            os.makedirs(os.path.join(ROOT, "attachments", sha[:2]), mode=0o700, exist_ok=True)
+            staged[-1].update({"blob": f"attachments/{sha[:2]}/{sha}", "bytes": size, "sha256": sha, "crc32": crc,
+                               "added": utcnow()})
+    except BaseException:
+        staged.close()
+        raise
+    return staged
+
+
+def merge_attachments(have, new, replace, full):
+    """have with new added: a name already there with the same bytes stays as it is; with other bytes it is refused
+    unless replace. -> (list, [(name, attached|unchanged|replaced)])."""
+    out, said = [dict(x) for x in have], []
+    for x in new:
+        e = {k: v for k, v in x.items() if k != "tmp"}
+        i = next((k for k, y in enumerate(out) if y["name"] == x["name"]), None)
+        if i is None:
+            out.append(e)
+            said.append((x["name"], "attached"))
+        elif out[i]["sha256"] == x["sha256"]:
+            said.append((x["name"], "unchanged"))
+        elif replace:
+            out[i] = e
+            said.append((x["name"], "replaced"))
+        else:
+            raise Refused(f"{full} already has a supporting file {x['name']} with other bytes; "
+                          f"`cc-docs attach {full} <file> --replace` swaps it")
+    return out, said
+
+
+def check_attachments(reg, num, rev, lst):
+    """Refuse a revision's list that would pass a hosting cap, with the cap it passes."""
+    if len(lst) > ATTACH_REV_CAP:
+        raise Refused(f"{num}-{rev} would carry {len(lst)} supporting files, over {ATTACH_REV_CAP} a revision; zip some")
+    blobs = {x["sha256"]: x["bytes"] for x in lst}
+    for n, d in reg["documents"].items():
+        for r in d["revisions"]:
+            if (n, r["rev"]) != (num, rev):
+                blobs.update((x["sha256"], x["bytes"]) for x in r.get("attachments") or ())
+    total = sum(blobs.values())
+    if total > ATTACH_TOTAL_CAP:
+        raise Refused(f"the library's supporting files would come to {total >> 20} MiB, over the "
+                      f"{ATTACH_TOTAL_CAP >> 20} MiB the mirror's GitHub repo is kept under; nothing attached")
+
+
+def carry_attachments(prev, describes, new, full):
+    """What a new revision starts from: the one before's supporting files, the names this filing attaches taken
+    out, and none when the two describe different board revisions. Says on stderr what it carried or dropped."""
+    have = (prev or {}).get("attachments") or []
+    if not have:
+        return []
+    if describes and prev.get("describes") and describes != prev["describes"]:
+        print(f"cc-docs: {full} describes {describes}, and {prev['rev']} described {prev['describes']}, so "
+              f"{prev['rev']}'s {len(have)} supporting file(s) stay on {prev['rev']} and are not carried",
+              file=sys.stderr)
+        return []
+    names = {x["name"] for x in new}
+    kept = [dict(x, carried_from=x.get("carried_from") or prev["rev"]) for x in have if x["name"] not in names]
+    if kept:
+        print(f"cc-docs: {full} carries {len(kept)} supporting file(s) from {prev['rev']}: "
+              f"{', '.join(x['name'] for x in kept)}", file=sys.stderr)
+    return kept
+
+
+def rev_of(reg, number):
+    """(document, revision) for PPP-NNNN-R, or for PPP-NNNN its current revision."""
+    m = NUM.match(number or "")
+    if m and not m.group(3):
+        d = get_doc(reg, number)
+        return d, current(d)
+    return get_rev(reg, number)
+
+
+def cmd_attach(a):
+    if not a.files and not a.remove:
+        raise Refused("name a file to attach, or --remove <name>")
+    staged = stage_attachments(a.files)
+    try:
+        with Lock():
+            reg = load()
+            d, r = rev_of(reg, a.number)
+            full = f"{d['number']}-{r['rev']}"
+            lst, said = list(r.get("attachments") or []), []
+            for name in a.remove or ():
+                if not any(x["name"] == name for x in lst):
+                    raise Refused(f"{full} has no supporting file {name!r}")
+                lst = [x for x in lst if x["name"] != name]
+                said.append((name, "removed"))
+            lst, got = merge_attachments(lst, staged, a.replace, full)
+            said += got
+            check_attachments(reg, d["number"], r["rev"], lst)
+            staged.commit()
+            if lst:
+                r["attachments"] = lst
+            else:
+                r.pop("attachments", None)
+            save(reg)
+            write_views(reg, set(d["visibility"]) - {"owner"})
+    finally:
+        staged.close()
+    for name, what in said:
+        print(f"{full}\t{name}\t{what}")
     return 0
 
 
@@ -2330,7 +2535,7 @@ def selfcheck():
 
 
 def _selfcheck():
-    global ROOT, MEMBERS, HOME, IN_SANDBOX, SLACKSOCK, MEMBER_CAP
+    global ROOT, MEMBERS, HOME, IN_SANDBOX, SLACKSOCK, MEMBER_CAP, ATTACH_FILE_CAP, ATTACH_TOTAL_CAP, ATTACH_REV_CAP
     n = [0, 0]
 
     def ok(name, cond):
@@ -3356,6 +3561,163 @@ def _selfcheck():
                 os.environ.pop("CC_SLACK_DIR", None)
             else:
                 os.environ["CC_SLACK_DIR"] = old_env
+    # SUPPORTING FILES: each case files into a register of its own
+    with tempfile.TemporaryDirectory(prefix="cc-docs-att-") as t:
+        src = os.path.join(t, "src")
+        os.makedirs(src)
+        MEMBERS = os.path.join(t, "members")
+        wid = "fedcba9876543210"
+        os.makedirs(os.path.join(MEMBERS, "kid2"))
+        with open(os.path.join(MEMBERS, "kid2", "workspace-id"), "w") as f:
+            f.write(wid + "\n")
+
+        def blob(name, body):
+            p = os.path.join(t, "out", name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(body)
+            return p
+
+        pa, pb, pc = (mkpdf(src, nm, body) for nm, body in (("pa", "Board one"), ("pb", "Board two"), ("pc", "Board three")))
+        g1, d1 = blob("board-F_Cu.gbr", b"G04 top*\n"), blob("board.drl", b"M48\n")
+        ROOT = os.path.join(t, "a1")
+        rc, o = run("file", pa, "--project", "Boards", "--kind", "work", "--title", "Board", "--attach", g1, "--attach", d1)
+        reg = load()
+        r = reg["documents"]["001-0001"]["revisions"][0]
+        att = {x["name"]: x for x in r.get("attachments", [])}
+        ok("file --attach keeps each file once by content, read-only, with its size, sha256 and crc32",
+           rc == 0 and sorted(att) == ["board-F_Cu.gbr", "board.drl"]
+           and att["board.drl"]["blob"] == "attachments/" + att["board.drl"]["sha256"][:2] + "/" + att["board.drl"]["sha256"]
+           and open(os.path.join(ROOT, att["board.drl"]["blob"]), "rb").read() == b"M48\n"
+           and not os.stat(os.path.join(ROOT, att["board.drl"]["blob"])).st_mode & 0o222
+           and att["board.drl"]["crc32"] == zlib.crc32(b"M48\n") and att["board.drl"]["bytes"] == 4
+           and not [f for f in os.listdir(os.path.join(ROOT, "attachments")) if f.startswith(".part")])
+        def board(root, *attach):
+            """A register of its own at root, holding 001-0001-A filed from pa with `attach` on it."""
+            global ROOT
+            ROOT = os.path.join(t, root)
+            run("file", pa, "--project", "Boards", "--kind", "work", "--title", "Board",
+                *[x for f in attach for x in ("--attach", f)])
+
+        board("a1b", g1, d1)
+        rc, o = run("file", pb, "--project", "Boards", "--title", "Board")
+        b = load()["documents"]["001-0001"]["revisions"][1]
+        ok("a new revision filed without --attach carries the one before's files, marked, and says so",
+           rc == 0 and [x["name"] for x in b.get("attachments", [])] == ["board-F_Cu.gbr", "board.drl"]
+           and all(x.get("carried_from") == "A" for x in b["attachments"])
+           and "001-0001-B carries 2 supporting file(s) from A" in o)
+        g2 = blob("v2/board-F_Cu.gbr", b"G04 top v2*\n")
+        board("a1c", g1, d1)
+        run("file", pb, "--project", "Boards", "--title", "Board")
+        rc, o = run("file", pc, "--project", "Boards", "--title", "Board", "--attach", g2)
+        reg = load()
+        c = {x["name"]: x for x in reg["documents"]["001-0001"]["revisions"][2]["attachments"]}
+        ok("a new revision's own --attach replaces that name; the rest are carried from where they were first attached; "
+           "the revision before keeps its own",
+           rc == 0 and open(os.path.join(ROOT, c["board-F_Cu.gbr"]["blob"]), "rb").read() == b"G04 top v2*\n"
+           and "carried_from" not in c["board-F_Cu.gbr"] and c["board.drl"].get("carried_from") == "A"
+           and reg["documents"]["001-0001"]["revisions"][1]["attachments"][0]["sha256"] == att["board-F_Cu.gbr"]["sha256"])
+        board("a1d", d1)
+        reg = load()
+        rc, o = run("file", pa, "--project", "Boards", "--title", "Board", "--attach", d1)
+        rc2, o2 = run("file", pa, "--project", "Boards", "--title", "Board", "--attach", g1)
+        cur = load()["documents"]["001-0001"]["revisions"]
+        ok("an unchanged build's --attach with bytes the revision already has changes nothing; with a new file it "
+           "puts it on the current revision and files no revision",
+           rc == 0 and "unchanged, nothing filed" in o and load() != reg and len(cur) == 1
+           and [x["name"] for x in cur[0]["attachments"]] == ["board.drl", "board-F_Cu.gbr"]
+           and rc2 == 0 and "recorded supporting files board-F_Cu.gbr" in o2)
+        board("a1e", d1)
+        reg = load()
+        run("file", pa, "--project", "Boards", "--title", "Board", "--attach", d1)
+        ok("…and the same bytes alone leave the register exactly as it was", load() == reg)
+        # a different board revision carries nothing
+        ROOT = os.path.join(t, "a2")
+        run("file", pa, "--project", "Boards", "--kind", "work", "--title", "Board", "--describes", "PCB-0001-A",
+            "--attach", g1)
+        rc, o = run("file", pb, "--project", "Boards", "--title", "Board", "--describes", "PCB-0001-B")
+        rc2, o2 = run("file", pc, "--project", "Boards", "--title", "Board", "--describes", "PCB-0001-B", "--attach", d1)
+        rc3, o3 = run("file", mkpdf(src, "pd", "Board four"), "--project", "Boards", "--title", "Board",
+                      "--describes", "PCB-0001-B")
+        revs = load()["documents"]["001-0001"]["revisions"]
+        ok("a revision describing another board revision carries none of the one before's files and says so; the same "
+           "board revision carries",
+           rc == 0 and "attachments" not in revs[1] and "B's 1 supporting file(s)" not in o
+           and "A's 1 supporting file(s) stay on A and are not carried" in o
+           and [x["name"] for x in revs[3]["attachments"]] == ["board.drl"] and revs[3]["attachments"][0]["carried_from"] == "C")
+        # attach: add, same bytes, other bytes refused, --replace, --remove, a named revision
+        ROOT = os.path.join(t, "a3")
+        run("file", pa, "--project", "Boards", "--kind", "work", "--title", "Board")
+        run("file", pb, "--project", "Boards", "--title", "Board")
+        rc, o = run("attach", "001-0001", g1, d1)
+        rc2, o2 = run("attach", "001-0001", g1)
+        before = load()
+        rc3, o3 = run("attach", "001-0001", g2)
+        ok("attach puts files on the current revision; the same bytes again are unchanged; other bytes under the same "
+           "name are refused and change nothing",
+           rc == 0 and "001-0001-B\tboard-F_Cu.gbr\tattached" in o and "001-0001-B\tboard.drl\tattached" in o
+           and rc2 == 0 and "001-0001-B\tboard-F_Cu.gbr\tunchanged" in o2
+           and rc3 == 2 and "--replace" in o3 and load() == before
+           and not [f for f in os.listdir(os.path.join(ROOT, "attachments")) if f.startswith(".part")])
+        ROOT = os.path.join(t, "a3b")
+        run("file", pa, "--project", "Boards", "--kind", "work", "--title", "Board")
+        run("file", pb, "--project", "Boards", "--title", "Board")
+        run("attach", "001-0001", g1, d1)
+        rc, o = run("attach", "001-0001", g2, "--replace")
+        rc2, o2 = run("attach", "001-0001-B", "--remove", "board.drl")
+        rc3, o3 = run("attach", "001-0001-A", d1)
+        rc4, o4 = run("attach", "001-0001", "--remove", "nothing.txt")
+        revs = load()["documents"]["001-0001"]["revisions"]
+        ok("--replace swaps the bytes, --remove takes a name off, a named older revision gets its own, a name not there "
+           "is refused",
+           rc == 0 and "\treplaced" in o and rc2 == 0 and "board.drl\tremoved" in o2
+           and [x["name"] for x in revs[1]["attachments"]] == ["board-F_Cu.gbr"]
+           and revs[1]["attachments"][0]["bytes"] == len(b"G04 top v2*\n")
+           and rc3 == 0 and [x["name"] for x in revs[0]["attachments"]] == ["board.drl"] and rc4 == 2)
+        # caps and bad input: refused, saying why, nothing filed and nothing attached
+        board("a3c", g1)
+        before = load()
+        os.makedirs(os.path.join(t, "outdir"), exist_ok=True)
+        rcs = [run("attach", "001-0001", os.path.join(t, "outdir"))[1], run("attach", "001-0001", os.path.join(t, "nope"))[1],
+               run("attach", "001-0001", blob(".hidden", b"x"))[1]]
+        caps = ATTACH_FILE_CAP, ATTACH_TOTAL_CAP, ATTACH_REV_CAP
+        try:
+            ATTACH_FILE_CAP = 10
+            rc, o = run("file", pc, "--project", "Boards", "--title", "Board", "--attach", blob("big.zip", b"0" * 11))
+            ATTACH_FILE_CAP = caps[0]
+            ATTACH_TOTAL_CAP = 20
+            rc2, o2 = run("attach", "001-0001", blob("more.bom", b"1" * 15))
+            ATTACH_TOTAL_CAP = caps[1]
+            ATTACH_REV_CAP = 1
+            rc3, o3 = run("attach", "001-0001", d1)
+        finally:
+            ATTACH_FILE_CAP, ATTACH_TOTAL_CAP, ATTACH_REV_CAP = caps
+        ok("a directory, a missing file and a dot-name are refused; a file over the size cap refuses the whole filing; "
+           "the total and per-revision caps refuse; each says which, and the register is as it was",
+           "is a directory" in rcs[0] and "no such file" in rcs[1] and "rename it" in rcs[2]
+           and rc == 2 and "Cloudflare Pages" in o and rc2 == 2 and "GitHub" in o2 and rc3 == 2 and "over 1 a revision" in o3
+           and load() == before and not [f for f in os.listdir(os.path.join(ROOT, "attachments")) if f.startswith(".part")])
+        # member views: a member's document's files are linked into its view, and leave it when removed
+        ROOT = os.path.join(t, "a4")
+        run("file", pa, "--project", "Kid2", "--member", "kid2", "--title", "Kid board", "--attach", g1)
+        run("file", pb, "--project", "Own", "--kind", "work", "--title", "Own board", "--attach", d1)
+        reg = load()
+        kb = reg["documents"]["901-0001"]["revisions"][0]["attachments"][0]["blob"]
+        ob = reg["documents"]["001-0001"]["revisions"][0]["attachments"][0]["blob"]
+        v = os.path.join(ROOT, "ws", wid)
+        linked = os.path.exists(os.path.join(v, kb)) and os.path.samefile(os.path.join(v, kb), os.path.join(ROOT, kb))
+        run("attach", "901-0001", "--remove", "board-F_Cu.gbr")
+        ok("a member's view links its own document's supporting files and not the owner's, and drops one removed",
+           linked and not os.path.exists(os.path.join(v, ob)) and not os.path.exists(os.path.join(v, kb))
+           and os.path.exists(os.path.join(ROOT, kb)))
+        IN_SANDBOX = True
+        try:
+            rc, o = run("attach", "901-0001", g1)
+            rc2, o2 = run("file", pa, "--title", "Kid board", "--attach", g1)
+        finally:
+            IN_SANDBOX = False
+        ok("inside a workspace attach and file --attach are refused", rc == 2 and "host's" in o and rc2 == 2
+           and "attached on the host" in o2)
     print(f"cc-docs selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
 
@@ -3373,6 +3735,7 @@ def main(argv):
             p.add_argument("--note")
             p.add_argument("--cost", action="append")
             p.add_argument("--latex")
+            p.add_argument("--attach", action="append")
         else:
             p.add_argument("--tex", action="store_true")
         p.add_argument("--project", required=not IN_SANDBOX)   # inside a workspace the host picks the member's own
@@ -3387,6 +3750,11 @@ def main(argv):
     p.add_argument("--kind", choices=sorted(RANGES))
     p.add_argument("--member")
     p.add_argument("--rename")
+    p = sub.add_parser("attach")
+    p.add_argument("number")
+    p.add_argument("files", nargs="*")
+    p.add_argument("--replace", action="store_true")
+    p.add_argument("--remove", action="append")
     p = sub.add_parser("find")
     p.add_argument("query", nargs="+")
     p = sub.add_parser("list")
@@ -3423,10 +3791,13 @@ def main(argv):
     a = ap.parse_args(argv)
     if a.cmd == "selfcheck":
         return selfcheck()
+    if IN_SANDBOX and a.cmd == "file" and a.attach:
+        print("cc-docs: supporting files are attached on the host: file the PDF alone from a workspace", file=sys.stderr)
+        return 2
     if IN_SANDBOX and a.cmd in ("file", "number"):
         return across(a)
     try:
-        if IN_SANDBOX and a.cmd in ("project", "star", "public", "token", "member", "fold", "retire", "move",
+        if IN_SANDBOX and a.cmd in ("project", "star", "public", "token", "member", "fold", "retire", "move", "attach",
                                     "backfill-sources", "check"):
             # brief: "A member can't … make anything public, star for someone else, or read the owner's register"
             raise Refused(f"{a.cmd} is the host's: a workspace can file, number, find and list its own documents")
@@ -3434,7 +3805,7 @@ def main(argv):
             return cmd_member(a)
         return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list,
                 "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library,
-                "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move,
+                "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move, "attach": cmd_attach,
                 "backfill-sources": cmd_backfill, "check": cmd_check}[a.cmd](a)
     except Refused as e:
         print(f"cc-docs: {e}", file=sys.stderr)
