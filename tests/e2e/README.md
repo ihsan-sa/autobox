@@ -16,7 +16,9 @@ reaches instead of the whole suite.
 selfcheck, and one `e2e-<slug>` per file here. The class says where and when a check runs:
 
 - `static` reads files only, with no process state, no `~/.cc` and no tmux, so it runs on every change it owns.
-- `host` is today's run: on the host, with the environment scrubbed, serially per repo, before the merge.
+- `host` is today's run: on the host, with the environment scrubbed, serially per repo, before the merge. While
+  the box is busy, a host check whose `where` names the laptop runs there instead, with a tmux `main` of its own;
+  every e2e file and `check-sh` do. One that needs this box itself (its kernel, a working bwrap) keeps `["box"]`.
 - `hermetic` is for checks proven to pass in the lander's sandbox. None is yet, so every selfcheck and every
   e2e file starts as `host` and moves only after that proof.
 

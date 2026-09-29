@@ -270,11 +270,25 @@ exec bash {RUN.BIN}/cc-suites runner
             b = self.run_(chk(run=once, where=["box", "laptop"]), where="laptop")
             red = self.run_(chk(run="echo FAIL x; exit 1", where=["laptop"]), where="laptop")
             capped = self.run_(chk(run="sleep 30", where=["laptop"], cap=1), where="laptop")
-            host = self.run_(chk(run="true", klass=T.HOST, where=["laptop"]), where="laptop")
+            # a host check gets a tmux `main` of the job's own and a waiting claude, as a suite on the runner does
+            # (the e2e suites and check.sh lean on both); its own `exit` is still its verdict
+            main = ('tmux has-session -t main && test -x "$HOME/.local/bin/claude" && echo "tmux=$TMUX_TMPDIR" '
+                    '&& echo "0 failed"')
+            host = self.run_(chk(run=main, klass=T.HOST, where=["laptop"]), where="laptop")
+            host_red = self.run_(chk(run="exit 3", klass=T.HOST, where=["laptop"]), where="laptop")
+            bare = self.run_(chk(run='test -x "$HOME/.local/bin/claude"', where=["laptop"]), where="laptop")
+            box = self.run_(chk(run="true", klass=T.BOX, where=["laptop"]), where="laptop")
         self.assertEqual((a.status, b.status), (T.PASSED, T.PASSED), (a.extra, b.extra))
         self.assertEqual(red.status, T.FAILED, red.extra)
         self.assertEqual(capped.status, T.UNRUNNABLE, capped.extra)
-        self.assertEqual(host.status, T.UNRUNNABLE)
+        self.assertEqual(host.status, T.PASSED, host.extra)
+        self.assertTrue(host.runner.startswith("laptop:"), host.runner)
+        # its tmux server is the job's own, never this machine's `main`, and it went with the job's directory
+        self.assertIn(f"tmux={self.tmp}/runner/job.", "\n".join(host.extra["tail"]))
+        self.assertEqual((host_red.status, host_red.extra["rc"]), (T.FAILED, 3))
+        self.assertEqual(bare.status, T.FAILED, bare.extra)          # only a host check's line brings the prep
+        self.assertEqual(box.status, T.UNRUNNABLE)                   # a box check never leaves the box
+        self.assertIn("does not leave the box", box.extra["why"])
         self.assertEqual([f for f in os.listdir(os.path.join(self.tmp, "runner")) if f.startswith("job.")], [])
         os.remove(os.path.join(self.tmp, "suites", "remote"))
         self.assertEqual(self.run_(chk(where=["laptop"]), where="laptop").status, T.UNRUNNABLE)
@@ -735,16 +749,35 @@ class Judge(unittest.TestCase):
         p = mock.patch.dict(os.environ, {"CC_SUITES_DIR": d.name})
         p.start()
         self.addCleanup(p.stop)
-        with mock.patch.object(A, "busy", return_value=True):
+        with mock.patch.object(A, "busy", return_value=True), mock.patch.object(A, "loaded", return_value=False):
             self.assertEqual(RUN.choose_where(c), "laptop")
-            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "box")
+            # busy, not saturated, is enough for the PR's code: hermetic and host go too
+            self.assertEqual(RUN.choose_where(chk(klass=T.HERMETIC, where=["box", "laptop"])), "laptop")
+            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "laptop")
+            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box"])), "box")     # needs this host
+            for k in (T.BOX, T.TIMING):
+                self.assertEqual(RUN.choose_where(chk(klass=k, where=["box", "laptop"])), "box")
         with mock.patch.object(A, "busy", return_value=False):
             self.assertEqual(RUN.choose_where(c), "box")
-        h = chk(klass=T.HERMETIC, where=["box", "laptop"])
-        with mock.patch.object(A, "busy", return_value=True), mock.patch.object(A, "loaded", return_value=False):
-            self.assertEqual(RUN.choose_where(h), "box")       # busy is not enough to send the PR's code out
-        with mock.patch.object(A, "busy", return_value=True), mock.patch.object(A, "loaded", return_value=True):
-            self.assertEqual(RUN.choose_where(h), "laptop")
+            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "box")
+
+    def test_a_busy_box_sends_check_sh_and_the_e2e_suites_and_keeps_what_needs_it(self):
+        # the shipped manifests, as the lane reads them: the heavy host checks go, the ones bound to this host stay
+        with open(os.path.join(CORE, "tests", "LANDING.toml")) as f:
+            checks, faults = M.parse_checks(f.read())
+        self.assertEqual(faults, [])
+        by = {c.name: c for c in checks}
+        e2e = [n for n in by if n.startswith("e2e-")]
+        self.assertGreater(len(e2e), 10)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        write(d.name, {"id_ed25519": "k\n", "remote": "ccsuite@r\n", "known_hosts": "r ssh-ed25519 AAAA\n"})
+        with mock.patch.dict(os.environ, {"CC_SUITES_DIR": d.name}), \
+                mock.patch.object(A, "busy", return_value=True), mock.patch.object(A, "loaded", return_value=False):
+            for n in ["check-sh"] + e2e:
+                self.assertEqual((n, RUN.choose_where(by[n])), (n, "laptop"))
+            for n in ("selfcheck-cc-fence", "selfcheck-cc-sandbox", "selfcheck-lander"):
+                self.assertEqual((n, RUN.choose_where(by[n])), (n, "box"))
 
     def test_a_busy_box_that_is_not_saturated_sends_to_the_laptop_and_keeps_its_slots(self):
         d = tempfile.TemporaryDirectory()
@@ -755,7 +788,15 @@ class Judge(unittest.TestCase):
         self.assertFalse(A.loaded(d.name))
         self.assertEqual(A.slots_now(d.name, k=3, loadavg="/nonexistent"), 3)
         write(d.name, {"cpu": "some avg10=20.00 avg60=20.00 avg300=20.00 total=1\n"})
-        self.assertFalse(A.busy(d.name))
+        self.assertFalse(A.busy(d.name, "/nonexistent"))
+        # the box of 2026-09-29: cpu PSI near 38, load 9-27 on 6 cores, and 1 check of 200 went out
+        write(d.name, {"cpu": "some avg10=38.00 avg60=38.00 avg300=38.00 total=1\n"})
+        self.assertTrue(A.busy(d.name, "/nonexistent"))
+        write(d.name, {"cpu": "some avg10=10.00 avg60=10.00 avg300=10.00 total=1\n"})
+        n = os.cpu_count() or 1
+        write(d.name, {"la": f"{n:.2f} 0 0 1/1 1\n", "la2": f"{n - 0.5:.2f} 0 0 1/1 1\n"})
+        self.assertTrue(A.busy(d.name, os.path.join(d.name, "la")))      # a load of one per core is busy
+        self.assertFalse(A.busy(d.name, os.path.join(d.name, "la2")))
 
 
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")

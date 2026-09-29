@@ -10,13 +10,16 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
            the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set).
            Every one inside an admission slot and a transient scope (admission.py). Timing runs only while the box
            is not loaded. No bwrap on this machine makes a sandboxed class unrunnable, never a host run.
-  laptop   static and hermetic only, over cc-suites' own transport: its key, the destination and the pinned host key
-           in ~/.cc/suites (CC_SUITES_DIR: id_ed25519, remote, known_hosts, StrictHostKeyChecking=yes), so the laptop
-           is configured exactly when cc-suites' runner is, and a destination known_hosts does not name is refused
+  laptop   static, hermetic and host (never box or timing), over cc-suites' own transport: its key, the
+           destination and the pinned host key in ~/.cc/suites (CC_SUITES_DIR: id_ed25519, remote, known_hosts,
+           StrictHostKeyChecking=yes), so the laptop is configured exactly when cc-suites' runner is, and a destination known_hosts does not name is refused
            before ssh starts. The tree goes to the runner's `job` form (`cc-suites runner`, the key's forced command),
            which unpacks it into a fresh directory with a fresh HOME per job, proves it by write-tree, runs it and
            removes both; `lander job-serve` is the same end in Python. Busy, on battery, unfit or not answering is
-           unrunnable there, never red, and judge() then runs the check on the box.
+           unrunnable there, never red, and judge() then runs the check on the box. A host check's line goes with
+           HOST_PREP in front: what a box has and a fresh account does not (a tmux session `main`, of a server of
+           the job's own, and a waiting ~/.local/bin/claude), as `cc-suites runner` gives a whole suite, so the
+           e2e suites and check.sh can run there. A check that needs this box's own host keeps `where = ["box"]`.
   member   `cc-sandbox member <h> <t> --tree <head> -- env … /bin/sh -c <run>`, the workspace's own boundary (B5).
 
 THE STATUS. passed: exit 0 and no `N failed` with N > 0 in the output (a suite that says "1 failed" failed whatever
@@ -252,11 +255,24 @@ def laptop_dest() -> str:
     return dest if ok and re.fullmatch(r"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+", dest) else ""
 
 
+# A host check's box on the laptop: a tmux server under the job's TMPDIR (so it is gone with the job, and never
+# some other server's `main`), killed when the check ends, and a claude that only waits (every model call a suite
+# makes is stubbed by the suite itself), and the user runtime dir systemd-analyze --user needs (check.sh units),
+# which an `env -i` job drops. The check runs in a subshell, so its own `exit` still reaches the trap.
+HOST_PREP = ('unset TMUX; TMUX_TMPDIR="${TMPDIR:-/tmp}/tmux"; export TMUX_TMPDIR; '
+             '[ -n "${XDG_RUNTIME_DIR:-}" ] || { XDG_RUNTIME_DIR="/run/user/$(id -u)"; [ -d "$XDG_RUNTIME_DIR" ] '
+             '&& export XDG_RUNTIME_DIR || unset XDG_RUNTIME_DIR; }; '
+             'mkdir -p "$TMUX_TMPDIR" "$HOME/.local/bin" && chmod 700 "$TMUX_TMPDIR"; '
+             '[ -e "$HOME/.local/bin/claude" ] || { printf \'#!/bin/sh\\nexec sleep 3600\\n\' >"$HOME/.local/bin/claude" '
+             '&& chmod +x "$HOME/.local/bin/claude"; }; '
+             "trap 'tmux kill-server 2>/dev/null' EXIT; tmux new-session -d -s main -x 200 -y 50 2>/dev/null\n")
+
+
 def laptop_argv(check, tree, cwd):
     dest = laptop_dest()
     if not dest:
         raise Unrunnable(f"no laptop is configured (cc-suites: {_suites_dir()})")
-    if check.klass not in (T.STATIC, T.HERMETIC):
+    if check.klass not in (T.STATIC, T.HERMETIC, T.HOST):
         raise Unrunnable(f"a {check.klass} check does not leave the box")
     d = _suites_dir()
     kh, host = os.path.join(d, "known_hosts"), dest.split("@", 1)[1]
@@ -271,7 +287,8 @@ def laptop_argv(check, tree, cwd):
             "-o", "ServerAliveCountMax=4", "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={kh}",
             "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ClearAllForwardings=yes",
             "-o", "KexAlgorithms=curve25519-sha256", "-a", "-x", "-T", "-C", dest, "--",
-            "job", check.name, tree, str(check.cap), b(check.run), b(cwd)]
+            "job", check.name, tree, str(check.cap), b(HOST_PREP + f"(\n{check.run}\n)" if check.klass == T.HOST
+                                                      else check.run), b(cwd)]
 
 
 def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = ".", cwd: str = "",
@@ -487,12 +504,15 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
 
 
 def choose_where(check: T.Check, member: str = "") -> str:
-    """member:<h> for a member's landing; the laptop when the box is busy enough for the check's class; else box."""
+    """member:<h> for a member's landing; the laptop when the box is busy and the check may leave it; else box."""
     if member:
         return f"member:{member}"
-    # a static check goes when the box is busy; a hermetic one runs the PR's code, unsandboxed on the laptop, so it
-    # goes only when the box is saturated. A laptop pass stands even where the box's newer linters might say red.
-    spill = A.busy() if check.klass == T.STATIC else A.loaded() if check.klass == T.HERMETIC else False
+    # the brief: "a loaded box sends at least check.sh and the e2e suites that can run off-box to the laptop … and a
+    # check that truly needs the box host stays on the box". A static, hermetic or host check whose `where` names the
+    # laptop goes whenever the box is busy(): the PR's code already runs unsandboxed there as the whole suite
+    # (cc-suites spill, first, owner 2026-09-25). Box and timing never go. A laptop pass stands; a red is said again
+    # on the box (judge).
+    spill = check.klass in (T.STATIC, T.HERMETIC, T.HOST) and A.busy()
     if "laptop" in check.where and spill and laptop_dest():
         return "laptop"
     return "box"

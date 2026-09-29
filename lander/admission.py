@@ -14,8 +14,10 @@ the one signal for "the box is overloaded": the lander serializes on it and give
 `cc-room` queues new `--go` workers on the same call until it clears, so the landing queue keeps moving while the
 load that is already there drains. Nothing is stopped or paused; only starts wait.
 
-LAPTOP. busy() is a static check's lower bar for the laptop: cpu `some avg10` at PSI_LAPTOP (default 50) or memory
-at PSI_MEM. A box under loaded()'s near-saturation mark all day is still slow. Hermetic checks keep loaded(). busy() is not overloaded(): slots and cc-room ignore it.
+LAPTOP. busy() is the bar for sending a check to the laptop: cpu `some avg10` at PSI_LAPTOP (default 25), memory at
+PSI_MEM, or a 1-minute load average at LANDER_LAPTOP_LOAD (default 1) times the cores. A box under loaded()'s
+near-saturation mark all day is still slow: on 2026-09-29 it sat at load 9-27 on 6 cores with cpu PSI near 38, and
+sent 1 check of 200 out. busy() is not overloaded(): slots and cc-room ignore it.
 
 SCOPES. Each run goes into a transient `systemd-run --user --scope` on slice `lander.slice` (no unit file) with a low
 CPUWeight, a MemoryMax and no swap (a box already deep in swap is what this guards against), so the kernel,
@@ -44,7 +46,8 @@ from lander import types as T
 SLOTS = int(os.environ.get("LANDER_SLOTS", "3") or 3)
 PSI_MEM = float(os.environ.get("LANDER_PSI_MEM", "20"))
 PSI_CPU = float(os.environ.get("LANDER_PSI_CPU", "99.5"))
-PSI_LAPTOP = float(os.environ.get("LANDER_PSI_LAPTOP", "50"))
+PSI_LAPTOP = float(os.environ.get("LANDER_PSI_LAPTOP", "25"))
+LAPTOP_LOAD = float(os.environ.get("LANDER_LAPTOP_LOAD", "1") or 1)
 MEM_MAX = os.environ.get("LANDER_MEM_MAX", "6G")
 SWAP_MAX = os.environ.get("LANDER_SWAP_MAX", "0")
 CPU_WEIGHT = "20"
@@ -69,9 +72,22 @@ def loaded(root: str = PSI_DIR) -> bool:
     return psi("memory", root) >= PSI_MEM or psi("cpu", root) >= PSI_CPU
 
 
-def busy(root: str = PSI_DIR) -> bool:
-    """Busy enough that a static check goes to the laptop; lower than loaded(), and slots ignore it."""
-    return psi("memory", root) >= PSI_MEM or psi("cpu", root) >= PSI_LAPTOP
+def load1(loadavg: str | None = None) -> float | None:
+    """The 1-minute load average, or None when it cannot be read."""
+    try:
+        with open(loadavg or LOADAVG) as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def busy(root: str = PSI_DIR, loadavg: str | None = None) -> bool:
+    """Busy enough that a check goes to the laptop; lower than loaded(), and slots ignore it. An unreadable load
+    average counts as calm."""
+    if psi("memory", root) >= PSI_MEM or psi("cpu", root) >= PSI_LAPTOP:
+        return True
+    l1 = load1(loadavg)
+    return l1 is not None and l1 >= LAPTOP_LOAD * (os.cpu_count() or 1)
 
 
 def overloaded(root: str = PSI_DIR, loadavg: str | None = None) -> str:
@@ -79,11 +95,8 @@ def overloaded(root: str = PSI_DIR, loadavg: str | None = None) -> str:
     above LOAD_FACTOR x cores. An unreadable load average counts as calm."""
     if loaded(root):
         return f"memory or cpu pressure (PSI) at {psi('memory', root):.0f}/{psi('cpu', root):.1f}"
-    n = os.cpu_count() or 1
-    try:
-        with open(loadavg or LOADAVG) as f:
-            l1 = float(f.read().split()[0])
-    except (OSError, ValueError, IndexError):
+    n, l1 = os.cpu_count() or 1, load1(loadavg)
+    if l1 is None:
         return ""
     return f"load {l1:.1f} on {n} cores (at least {LOAD_FACTOR:g}x)" if l1 >= LOAD_FACTOR * n else ""
 
