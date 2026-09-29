@@ -389,6 +389,26 @@ class Admission(unittest.TestCase):
         with A.slot(st, alone=True, psi_root=calm, k=2) as held:
             self.assertEqual(held, [1, 2])
 
+    def test_alone_takes_slots_in_order_and_holds_none_past_a_busy_one(self):
+        # one lane runs several checks at once: two alone runs each holding a slot would wait on each other forever
+        import threading
+        import time
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        calm = self.psi_dir(0, 0)
+        with A.slot(st, psi_root=calm, k=2) as one:   # slot 1 is busy
+            self.assertEqual(one, [1])
+            waiting = threading.Thread(target=lambda: self.assertRaises(
+                TimeoutError, lambda: A.slot(st, alone=True, psi_root=calm, k=2, poll=0.05, deadline=0.6).__enter__()))
+            waiting.start()
+            time.sleep(0.2)   # the alone run is polling now
+            with open(os.path.join(st, "slots", "slot.2"), "a") as f:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises if the waiting alone run sat on slot 2
+                fcntl.flock(f, fcntl.LOCK_UN)
+            waiting.join()
+        with A.slot(st, alone=True, psi_root=calm, k=2) as held:   # both free: it takes both, in order
+            self.assertEqual(held, [1, 2])
+
     def test_under_pressure_only_slot_one_admits(self):
         st = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(st))

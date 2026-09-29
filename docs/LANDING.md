@@ -21,9 +21,10 @@ checkout. `bin/cc-land` is the old name kept as a thin shim, so every caller tha
    blame. Box-class checks (the ones that need tmux, systemd or live state) run on main's tip after the merge.
    Under high load the box serializes rather than stalls: `core/lander/admission.py` (`overloaded()`) drops to one check
    at a time, not niced down, and `cc-room` holds new `--go` worker starts on the same signal so the queue that is
-   already there keeps draining instead of growing. Small PRs go first: a PR whose plan has more than five checks
-   steps aside between its checks for a smaller one, so a leaf or docs PR waits for one check, not a whole suite
-   (`core/lander/lane.py`, SMALL FIRST).
+   already there keeps draining instead of growing. The lane checks PRs side by side, as many checks at once as
+   the box has slots (three, or one while it is overloaded), and merges them one at a time; a PR that changes a
+   file another PR in flight also changes waits for that one to merge first. A free slot goes to the small PR
+   first, so a leaf or docs PR never waits for a whole suite (`core/lander/lane.py`, CHECKS RUN IN PARALLEL).
 4. **Review.** A paid-review path with no recorded read at the change's digest gets one read. The verdict is
    `LAND` or `HANDBACK`, and a handback leaves the queue with the findings on the row.
 5. **Merge.** One merge lane per repo, `--squash --match-head-commit`. The board row closes and the approval card

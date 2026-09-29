@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 
 from lander import types as T
 
@@ -46,7 +47,7 @@ def release() -> str:
 
 def _write(path: str, data: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"   # the lane's checks write from several threads
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1, sort_keys=True)
     os.replace(tmp, path)

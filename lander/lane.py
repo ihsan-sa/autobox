@@ -1,4 +1,5 @@
-"""One serial lane per repo: intake, the job machine, Δ revalidation, the merge and its tree proof.
+"""One lane per repo: intake, the job machine (checks side by side), Δ revalidation, the merge (one at a time) and
+its tree proof.
 
     lander queue <repo|h--t> <pr> [--chat C --ts T --who W --approved-by UID --no-start]
     lander queue --task <repo> <row>
@@ -18,20 +19,31 @@ exit 1 "queued, but…". `queue --task` is the old queue_task unchanged: `cc don
 0 queue / 1 approval / 2 refused, anything else failed; the receipt (with `landing`) is the one line on stdout.
 
 THE LANE (Lane.run) takes <repo>.lock (busy: return — the running lane re-reads), drains the inbox, and steps each
-job until it rests (held until not_before, query, done, deploy-pending, handed back), re-reading the list after each.
-SMALL FIRST (owner, 2026-09-28: a one-line PR waited behind ~20 full-suite PRs): the next job is the oldest one
+job until it rests (held until not_before, query, done, deploy-pending, handed back) or waits on a check, re-reading
+the list after each. CHECKS RUN IN PARALLEL, MERGES ONE AT A TIME (lander-redesign.tex, "Changes that don't overlap
+land side by side"; 2026-09-29 a three-file PR waited 7 h behind ~11 half-hour PRs on a box at load 4.8 of 6 cores):
+a checking job hands its next check to the lane's pool and the lane goes on to other jobs; everything else — the gh
+facts, planning, the review, the Δ re-plan and the merge — happens on the lane's own thread, so merges stay serial
+and pinned. The lane keeps at most A.slots_now() checks in flight (LANDER_SLOTS, default 3; 1 while the box is
+overloaded()), and each run still takes its box-wide admission slot, so another repo's lane can hold this one's
+check at the door. A job holds one check in flight at a time, so a red still stops its suite at the first red. A
+finished check is recorded on the lane's thread; one whose job left checking, or its head or base, meanwhile is not.
+SMALL FIRST (owner, 2026-09-28: a one-line PR waited behind ~20 full-suite PRs): a free slot goes to the oldest job
 that is not heavy — a plan of more than LANDER_SMALL_CHECKS (default 5) checks, or one with a full-suite check
-(LANDER_FULL_CHECKS, default check-sh) — and only then the oldest heavy one;
-a job not planned yet counts as small. A heavy job steps aside before each of its checks (results kept, state
-`checking`) when a request is in the inbox or a job the lane has not tried this run is small or ahead of it, and
-goes on after that one rests. So a small PR waits for at most one check of a full suite, never for the suite. BOX HOLDS come first and leave the file untouched and the job untimed:
+(LANDER_FULL_CHECKS, default check-sh) — and only then to the oldest heavy one; a job not planned yet counts as small.
+So a small PR waits for at most one check when the box allows one slot, and for none when a slot is free.
+OVERLAP FROM THE START: a queued job whose files meet those of a job already planned, checking or mergeable is not
+planned yet (`waits for PR #N`, said once): it is planned from main once that one has merged or left, so two changes
+that overlap don't both burn CPU. Overlap found later is the Δ re-plan's (mergeable, below). BOX HOLDS come first and
+leave the file untouched and the job untimed:
 `cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds jobs before the merge.
   queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a draft or a conflict -> held 15 min. Under
              the git lock fetch base and head; base_sha, files (merge-base..head), digest. A member PR meets its
              walls (-> handback). THE PROTECTED DOOR, asked again at every head, reads the approval record
              (jobs.approval, never the request): the owner's uid, and the head he 👍'd — or a later head whose
              protected files are byte-identical, which carries approved_head to it (`approval … carried`); else
-             -> query, route "owner". plan(); klass lander -> query "lander-self".
+             -> query, route "owner". A job overlapping one in flight waits here (OVERLAP above). plan(); klass
+             lander -> query "lander-self".
   checking   the plan's checks on merge-tree(base_sha, head), each through runner.run_plan (run.judge: the red-vs-
              base rule, the rerun alone under load, quarantine, the lane's records.Store under its lock, and the
              failures-ledger record of a red that is the diff's) against the manifest at base widened by the head's —
@@ -63,10 +75,11 @@ mark cleared, an unknown row named; a symlinked board file is refused.
 
 A PROMOTE REACHES A RUNNING LANE between jobs. Before it drains or takes up a job, the lane compares the release
 it runs from with what ~/.cc/lander/current names now (jobs.stale_release; a lander run from a checkout never
-switches). When they differ it takes nothing new, lets the lane lock go, starts `lander lane <repo>` detached from
-the new release, logs `lane-switch` and returns. A job in flight finishes on the release it started on; a heavy job
-that stepped aside keeps its results and goes on in the new lane. It starts the new lane rather than exec'ing
-itself because a lane may be running inside a `tick`, and an exec would drop that tick's tip and deploy pass.
+switches). When they differ it starts nothing new — no job and no check — waits for the checks in flight and records
+them, lets the lane lock go, starts `lander lane <repo>` detached from the new release, logs `lane-switch` and
+returns. A check in flight finishes on the release it started on; a job partway through its checks keeps its results
+and goes on in the new lane. It starts the new lane rather than exec'ing itself because a lane may be running inside
+a `tick`, and an exec would drop that tick's tip and deploy pass.
 
 The git lock is never held across a check or a review; the lane lock is held for the whole run.
 """
@@ -80,7 +93,9 @@ import re
 import subprocess
 import sys
 import time
+from concurrent import futures
 
+from lander import admission as A
 from lander import events as E
 from lander import gh as GH
 from lander import git as G
@@ -100,11 +115,20 @@ MOVES_BEFORE_HOLD = 5    # main moving under the merge this many times in one st
 GH_PR_FILES = 100        # gh lists at most this many files; at or over it git names them all
 FIELDS = "state,isDraft,mergeable,headRefOid,headRefName,baseRefName,title,body"
 PRE_MERGE = (T.QUEUED, T.PLANNED, T.CHECKING)
+ACTIVE = (T.PLANNED, T.CHECKING, T.MERGEABLE)   # planned from a base and not merged yet: what a new job may overlap
 SMALL_CHECKS = int(os.environ.get("LANDER_SMALL_CHECKS") or 5)   # a plan with more checks than this is heavy
 # …and so is a plan with one of these, however few its checks: a count is not a cost, and check-sh is the whole suite
 FULL_CHECKS = tuple((os.environ.get("LANDER_FULL_CHECKS") or "check-sh").split())
+POLL = 5                 # seconds the lane waits on its checks before it looks at the inbox again
 MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": "cards", "board": "board",
              "deploy": "deploy", "tip": "tip"}
+
+
+class Flight:
+    """One check a job has in the lane's pool, and the head, base and merge tree it was started on."""
+
+    def __init__(self, future, pr, name, head, base, tree):
+        self.future, self.pr, self.name, self.head, self.base, self.tree = future, pr, name, head, base, tree
 
 
 class UnitFault(Exception):
@@ -328,8 +352,11 @@ class Lane:
         self.fallback = MF.host_fallback(repo)   # the release's landing-repos/<repo>.toml; "" when the repo has none
         self.lines = []
         self.tried = set()
-        self.stepped_aside = False
-        self.asked = set()
+        self.waiting = set()     # tried and waiting on a slot or an overlapping job: tried again when either moves
+        self.inflight = {}       # job key -> Flight: the one check each job has in the pool
+        self.said = set()        # (job, job it waits for): said once
+        self.parked = set()      # queued jobs waiting on an overlapping one
+        self.pool = None
 
     def say(self, text):
         self.lines.append(f"[{self.repo}] {text}")
@@ -356,25 +383,10 @@ class Lane:
                 with contextlib.suppress(OSError, ValueError):   # base runs an earlier lane shared are not reused
                     REC.new_nonce(self.repo, J.landq())
                 tried = self.tried = set()
-                while True:
-                    moved = J.stale_release()   # a promote since the last job: take nothing new on this release
-                    if moved:
-                        break
-                    for ln in J.drain(self.repo):
-                        self.say(ln)
-                    todo = [j for j in J.lane_jobs(self.repo) if j.key not in tried and self.due(j)]
-                    if not todo:
-                        break
-                    job = min(todo, key=self.heavy)   # the oldest small job, else the oldest heavy one
-                    tried.add(job.key)
-                    why = self.box_hold(job)
-                    if why:
-                        self.say(f"PR #{job.pr}: {why}")
-                        continue
-                    self.stepped_aside = False
-                    self.advance(job)
-                    if self.stepped_aside:     # it goes on once the job it stepped aside for has rested
-                        tried.discard(job.key)
+                self.waiting, self.inflight = set(), {}
+                with futures.ThreadPoolExecutor(max_workers=max(1, A.SLOTS), thread_name_prefix="check") as pool:
+                    self.pool = pool
+                    moved = self.loop(tried)
             if moved:   # the lock is let go first, so the lane started from `current` can take it
                 mine = os.path.basename(J.running_release())[:12]
                 ok, how = spawn_lane(self.repo, moved)
@@ -387,6 +399,66 @@ class Lane:
             if not J.requests(self.repo):   # a request that met the held lock after its last drain: once more
                 return self.lines
 
+    def loop(self, tried) -> str:
+        """Step jobs until none is due and no check is in flight. -> the release `current` moved to, or ''."""
+        while True:
+            moved = J.stale_release()   # a promote since the last job: take nothing new on this release
+            if moved:
+                while self.inflight:     # the checks in flight finish here and are recorded before the switch
+                    self.reap(POLL)
+                return moved
+            for ln in J.drain(self.repo):
+                self.say(ln)
+            todo = [j for j in J.lane_jobs(self.repo)
+                    if j.key not in tried and j.key not in self.inflight and self.due(j)]
+            if not todo:   # every due job has had its turn: record what finished (a freed slot), or wait for it
+                if not self.inflight:
+                    return ""
+                self.reap(POLL)   # the timeout lets a new request in while every check still runs
+                continue
+            job = min(todo, key=self.heavy)   # the oldest small job, else the oldest heavy one
+            tried.add(job.key)
+            why = self.box_hold(job)
+            if why:
+                self.say(f"PR #{job.pr}: {why}")
+                continue
+            before = (job.state, len(job.history), len(self.inflight))
+            self.advance(job)
+            if (job.state, len(job.history), len(self.inflight)) != before:
+                self.wake(but=job.key)   # a job moved or took a slot: whatever waited on it looks again
+
+    def wake(self, but=""):
+        self.tried -= self.waiting - {but}
+        self.waiting &= {but}
+
+    def width(self) -> int:
+        """How many checks this lane keeps in flight: the admission slots the box allows now."""
+        return A.slots_now()
+
+    def reap(self, wait):
+        """Record each check the pool has finished (waiting up to `wait` seconds for the first) on the lane's thread;
+        the job then goes on at its next turn."""
+        if not self.inflight:
+            return
+        done, _ = futures.wait([f.future for f in self.inflight.values()], timeout=wait,
+                               return_when=futures.FIRST_COMPLETED)
+        for key, f in list(self.inflight.items()):
+            if f.future not in done:
+                continue
+            del self.inflight[key]
+            self.tried.discard(key)
+            job = J.load(self.repo, f.pr)
+            if (job is None or job.state != T.CHECKING or (job.head, job.base_sha) != (f.head, f.base)
+                    or f.name in job.results):
+                self.say(f"PR #{f.pr}: check {f.name} finished for a head or base the job has left; not recorded")
+                continue
+            try:
+                self.took(job, f, f.future.result())
+            except (UnitFault, G.GitError) as e:
+                self.hold(job, str(e), kind="box")
+        if done:
+            self.wake()
+
     def due(self, job):
         return job.state not in J.RESTING and not (job.state == T.HELD and J.not_before_left(job))
 
@@ -397,22 +469,11 @@ class Lane:
         return bool(job.plan and (len(job.plan.checks) > SMALL_CHECKS
                                   or any(n in FULL_CHECKS for n in job.plan.checks)))
 
-    def step_aside_for(self, job) -> str:
-        """What a heavy job steps aside for before its next check, or '': a request in the inbox, or a due job
-        not tried this run that is small or ahead of it in the queue."""
-        if not self.heavy(job):
-            return ""
-        new = [p for p, _ in J.requests(self.repo) if p not in self.asked]
-        if new:
-            self.asked.update(new)     # once per request: one drain cannot unlink would otherwise loop the lane
-            return "a new request"
-        ahead = True
-        for j in J.lane_jobs(self.repo):
-            if j.key == job.key:
-                ahead = False
-            elif j.key not in self.tried and self.due(j) and (ahead or not self.heavy(j)):
-                return f"PR #{j.pr}"
-        return ""
+    def overlapping(self, job):
+        """A job already planned, checking or mergeable that changes one of this job's files, or None."""
+        mine = set(job.files)
+        return next((j for j in J.lane_jobs(self.repo) if j.key != job.key and j.state in ACTIVE
+                     and mine & set(j.files)), None)
 
     def box_hold(self, job):
         target = self.member or self.repo
@@ -424,7 +485,7 @@ class Lane:
         return ""
 
     def advance(self, job):
-        if job.state == T.QUEUED:
+        if job.state == T.QUEUED and job.key not in self.parked:   # a job waiting on an overlap is staged once
             E.stage(job.repo, job.pr, "lane")
         for _ in range(MAX_STEPS):
             if not self.due(job):
@@ -528,6 +589,16 @@ class Lane:
         why = self.door(job)
         if why:
             return self.query(job, why, "owner")
+        other = self.overlapping(job)
+        if other:   # design: "Two changes that overlap from the start don't both burn CPU; the later one waits"
+            self.waiting.add(job.key)
+            self.parked.add(job.key)
+            if (job.key, other.key) not in self.said:
+                self.said.add((job.key, other.key))
+                self.say(f"PR #{job.pr} waits for PR #{other.pr}: both change "
+                         f"{sorted(set(job.files) & set(other.files))[0]}")
+            return None
+        self.parked.discard(job.key)
         if not self.unit("planner"):
             return self.hold(job, "planner is not installed", kind="box")
         job.plan = self.call("planner", "plan", self.root, job.base_sha, job.head, job.files, fallback=self.fallback)
@@ -567,55 +638,63 @@ class Lane:
             raise UnitFault(f"the manifest at {job.base_sha[:12]} does not parse: {e}") from None
 
     def checking(self, job):
+        """Hand the job's next check to the pool (when the lane has a slot for it), or, when the plan is paid, go on
+        to the review and the merge. The check's outcome is recorded by took(), on the lane's thread."""
         if not self.unit("runner"):
             return self.hold(job, "runner is not installed", kind="box")
-        names = list(job.plan.checks if job.plan else [])
-        todo = [n for n in names if n not in job.results]
-        base_ref = job.extra.get("base_ref") or "main"
+        todo = [n for n in (job.plan.checks if job.plan else []) if n not in job.results]
         if todo:
+            if len(self.inflight) >= self.width():
+                self.waiting.add(job.key)    # it goes on when a check finishes and frees a slot
+                return None
             m = self.manifest(job)
             with self.lock():
                 tree, conflicts = G.merge_tree(self.root, job.base_sha, job.head, env=self.genv)
             if tree is None:
-                return self.hold(job, f"PR #{job.pr} conflicts with {base_ref}: {', '.join(conflicts[:5])}")
+                return self.hold(job, f"PR #{job.pr} conflicts with {job.extra.get('base_ref') or 'main'}: "
+                                      f"{', '.join(conflicts[:5])}")
             base_tree = G.tree_of(self.root, job.base_sha, env=self.genv)
-            job.extra["tree"] = tree
+            if job.extra.get("tree") != tree:
+                job.extra["tree"] = tree
+                J.save(job)
             store = REC.Store(self.repo, J.lane_fd(self.repo), J.landq()) if J.lane_fd(self.repo) is not None else None
             quarantine = RUN.quarantine_text(self.root, job.base_sha)
-        for n in todo:
-            other = self.step_aside_for(job)
-            if other:
-                self.stepped_aside = True
-                return self.say(f"PR #{job.pr} steps aside for {other} ({len(job.results)} of {len(names)} "
-                                f"checks done)")
-            outs = self.call("runner", "run_plan", self.root, m, job.plan, job.files, tree, base_tree,
-                             member=self.member, store=store, job_key=job.key, scope=self.member or self.repo,
-                             pr=job.pr, quarantine_text=quarantine, only=[n], fallback=self.fallback)
-            o = outs.get(n) or RUN.Outcome(n, T.UNRUNNABLE, "the runner gave no outcome")
-            secs = int(sum(r.secs for r in o.results))
-            word = {T.PASSED: "yes", RUN.BLOCKED: "main-red"}.get(o.status, "no")
-            E.stage(job.repo, job.pr, "gate", gate=n, ok=word, secs=secs, note=o.note if o.status == T.PASSED else "")
-            if o.status == T.FAILED:
-                return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]})"
-                                          + (f": {o.note}" if o.note else ""))
-            if o.status == RUN.BLOCKED:
-                # design §0: base red too -> blocked-by-main, not blamed; it is planned again from main after the hold
-                return self.hold(job, f"{o.note}: check {n} is red on {base_ref} ({job.base_sha[:12]}) too, so it "
-                                      f"is main's, not this PR's — tried again from {base_ref} later",
-                                 kind="box", then=T.QUEUED)
-            if o.status == T.UNRUNNABLE and o.note == "not in the manifest":
-                return self.query(job, f"the plan names checks the manifest at base lacks: {n}", "planning")
-            if o.status == T.UNRUNNABLE:
-                job.extra["attempts"] = int(job.extra.get("attempts") or 0) + 1
-                if job.extra["attempts"] >= UNRUNNABLE_TRIES:
-                    return self.query(job, f"check {n} could not run {UNRUNNABLE_TRIES} times", "planning")
-                return self.hold(job, f"check {n} could not run (try {job.extra['attempts']} of "
-                                      f"{UNRUNNABLE_TRIES}): {o.note}", kind="box")
-            job.results[n] = o.results[0].key if o.results else ""
-            J.save(job)
+            n = todo[0]
+            fut = self.pool.submit(self.call, "runner", "run_plan", self.root, m, job.plan, job.files, tree, base_tree,
+                                   member=self.member, store=store, job_key=job.key, scope=self.member or self.repo,
+                                   pr=job.pr, quarantine_text=quarantine, only=[n], fallback=self.fallback)
+            self.inflight[job.key] = Flight(fut, job.pr, n, job.head, job.base_sha, tree)
+            return None
         if job.plan and job.plan.paid and not self.review(job):
-            return
+            return None
         J.move(job, T.MERGEABLE)
+
+    def took(self, job, f, outs):
+        """Record one finished check of `job` (f: its Flight): red hands back, main-red holds, else it is kept."""
+        n, tree, base_ref = f.name, f.tree, job.extra.get("base_ref") or "main"
+        o = outs.get(n) or RUN.Outcome(n, T.UNRUNNABLE, "the runner gave no outcome")
+        secs = int(sum(r.secs for r in o.results))
+        word = {T.PASSED: "yes", RUN.BLOCKED: "main-red"}.get(o.status, "no")
+        E.stage(job.repo, job.pr, "gate", gate=n, ok=word, secs=secs, note=o.note if o.status == T.PASSED else "")
+        if o.status == T.FAILED:
+            return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]})"
+                                      + (f": {o.note}" if o.note else ""))
+        if o.status == RUN.BLOCKED:
+            # design §0: base red too -> blocked-by-main, not blamed; it is planned again from main after the hold
+            return self.hold(job, f"{o.note}: check {n} is red on {base_ref} ({job.base_sha[:12]}) too, so it "
+                                  f"is main's, not this PR's — tried again from {base_ref} later",
+                             kind="box", then=T.QUEUED)
+        if o.status == T.UNRUNNABLE and o.note == "not in the manifest":
+            return self.query(job, f"the plan names checks the manifest at base lacks: {n}", "planning")
+        if o.status == T.UNRUNNABLE:
+            job.extra["attempts"] = int(job.extra.get("attempts") or 0) + 1
+            if job.extra["attempts"] >= UNRUNNABLE_TRIES:
+                return self.query(job, f"check {n} could not run {UNRUNNABLE_TRIES} times", "planning")
+            return self.hold(job, f"check {n} could not run (try {job.extra['attempts']} of "
+                                  f"{UNRUNNABLE_TRIES}): {o.note}", kind="box")
+        job.results[n] = o.results[0].key if o.results else ""
+        J.save(job)
+        return None
 
     def review(self, job):
         """True when the job may go on to the merge; otherwise it has been held, handed back or queried."""

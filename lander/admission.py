@@ -6,7 +6,8 @@ mostly not the lander's, so a load average would give one slot nearly always; pr
 (default 99.5 — this box idles near 98, so only a saturated one counts), the box is loaded(). It is overloaded() when it is
 loaded() or its 1-minute load average reaches LANDER_LOAD_FACTOR (default 2) times its cores. While overloaded only slot 1
 admits, so checks run one at a time. Never 0: a check always gets to run, only later. A diagnostic rerun takes every
-slot at once (alone=True), so it runs by itself.
+slot at once (alone=True), so it runs by itself; it takes them in order and never past a busy one, because one
+lane now runs several checks at once and two alone runs each holding a slot would wait on each other forever.
 
 HIGH LOAD (2026-09-28: load 31-80 on 12 cores and 12 GB swapped, checks went from under 5 min to 11-17). overloaded() is
 the one signal for "the box is overloaded": the lander serializes on it and gives its one run priority (below), and
@@ -116,6 +117,8 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                         break
                 except OSError:
                     f.close()
+                    if alone:   # in order, never past a busy one: two alone runs holding a slot each would wait forever
+                        break
             if held and (not alone or len(held) == total):
                 break
             if deadline is not None and time.monotonic() - t0 > deadline:
