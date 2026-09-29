@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""tmux-helper — find the tmux window you mean from a few words, and open it.
+
+    tmux-helper                                   tmux's tree view of every session and window
+    tmux-helper [-ai] [--dry-run] <words...>     e.g.  tmux-helper shop      tmux-helper shop old      tmux-helper notes
+    tmux-helper selfcheck
+
+WHY. With a few dozen windows nobody finds the right one by eye. This lists every window once, matches your words
+to it and opens the best fit. The match is local and fuzzy, so typos, extra words and word order still find it. With
+-ai, the list and your words go to `claude -p --model haiku` instead, for a description the names don't carry.
+
+THE LIST. `tmux list-windows -a` prints a window once per session that shares it (grouped sessions), so windows are
+de-duplicated by window id; the first session that lists one is the one named. Each line carries the id, session,
+window name, the pane's running command, its cwd, its age (the pane process's elapsed time) and the time since the
+window last had output. "old" in the words means an OLDER window of that name, not the newest one.
+
+THE PICK. Locally, the best-scoring window opens; when windows of different names score alike, or nothing scores
+well, you get the numbered question below. With -ai, the model answers one JSON object: {"match": "one", "id": "@N"}, or {"match": "several"|"none",
+"question": "…", "candidates": ["@N", …]}. One match opens at once. Otherwise ONE follow-up question is asked on the
+terminal with numbered options (the model's candidates, or the most recently active windows when it gave none);
+a number opens that window, and free text is taken as more words for one more pick, which then opens or stops.
+
+OPENING. Inside tmux: select-window, then switch-client. Outside: select-window, then attach. --dry-run prints the
+pick (id, session, name) and changes nothing, and prints the options instead of asking.
+
+ENV. TMUX_HELPER_CLAUDE (default `claude`) is the model command; TMUX_HELPER_MODEL (default `haiku`).
+"""
+import difflib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+FMT = "#{window_id}\t#{session_name}\t#{window_name}\t#{pane_current_command}\t#{pane_current_path}\t#{window_activity}\t#{pane_pid}"
+
+
+def run(cmd, inp=None):
+    return subprocess.run(cmd, input=inp, capture_output=True, text=True)
+
+
+def human(sec):
+    sec = max(0, int(sec))
+    for n, u in ((86400, "d"), (3600, "h"), (60, "m")):
+        if sec >= n:
+            return "%d%s" % (sec // n, u)
+    return "%ds" % sec
+
+
+def windows(now=None):
+    """Every window once, most recently active first."""
+    now = now or time.time()
+    r = run(["tmux", "list-windows", "-a", "-F", FMT])
+    if r.returncode != 0:
+        sys.exit("tmux-helper: tmux list-windows failed: " + r.stderr.strip())
+    seen, out = set(), []
+    for line in r.stdout.splitlines():
+        f = line.split("\t")
+        if len(f) < 7 or f[0] in seen:
+            continue
+        seen.add(f[0])
+        act = int(f[5]) if f[5].isdigit() else 0
+        out.append({"id": f[0], "session": f[1], "name": f[2], "cmd": f[3], "cwd": f[4],
+                    "idle": human(now - act) if act else "?", "act": act, "pid": f[6], "age": "?", "age_s": 0})
+    pids = [w["pid"] for w in out if w["pid"].isdigit()]
+    if pids:
+        p = run(["ps", "-o", "pid=,etimes=", "-p", ",".join(pids)])
+        et = dict(l.split() for l in p.stdout.splitlines() if len(l.split()) == 2)
+        for w in out:
+            if w["pid"] in et and et[w["pid"]].isdigit():
+                w["age"] = human(int(et[w["pid"]]))
+                w["age_s"] = int(et[w["pid"]])
+    out.sort(key=lambda w: -w["act"])
+    return out
+
+
+def table(ws):
+    return "\n".join("%s | session %s | name %s | running %s | cwd %s | age %s | idle %s" %
+                     (w["id"], w["session"], w["name"], w["cmd"], w["cwd"], w["age"], w["idle"]) for w in ws)
+
+
+def ask(ws, words, extra=""):
+    prompt = ("You pick one tmux window from a list, for a person describing it in a few words.\n"
+              "Words: %s\n%s\nWindows (one per line):\n%s\n\n"
+              "Rules: match the words against name, session, cwd and command. The word \"old\" means an OLDER window "
+              "of that name (larger age), not the newest. Answer with ONE JSON object and nothing else: "
+              '{"match":"one","id":"@N"} when exactly one window fits; otherwise '
+              '{"match":"several" or "none","question":"one short question for the person","candidates":["@N",...]} '
+              "with at most 6 candidate ids taken from the list." % (words, extra, table(ws)))
+    cmd = shlex.split(os.environ.get("TMUX_HELPER_CLAUDE", "claude")) + \
+        ["-p", "--model", os.environ.get("TMUX_HELPER_MODEL", "haiku"),
+         "--no-session-persistence", "--strict-mcp-config", "--tools", ""]
+    r = run(cmd, prompt)
+    if r.returncode != 0:
+        sys.exit("tmux-helper: the model command failed: " + (r.stderr.strip() or "exit %d" % r.returncode))
+    m = re.search(r"\{.*\}", r.stdout, re.S)
+    try:
+        d = json.loads(m.group(0)) if m else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        sys.exit("tmux-helper: could not read the model's answer: " + r.stdout.strip()[:200])
+    return d
+
+
+def opens(ws, wid):
+    return next((w for w in ws if w["id"] == wid), None)
+
+
+def open_window(w, dry):
+    print("-> %s  %s:%s  (%s)" % (w["id"], w["session"], w["name"], w["cwd"]))
+    if dry:
+        return 0
+    tgt = "%s:%s" % (w["session"], w["id"])
+    run(["tmux", "select-window", "-t", tgt])
+    if os.environ.get("TMUX"):
+        return subprocess.call(["tmux", "switch-client", "-t", w["session"]])
+    return subprocess.call(["tmux", "attach", "-t", w["session"]])
+
+
+def toks(t):
+    return [x for x in re.split(r"[^a-z0-9]+", t.lower()) if x]
+
+
+def score(w, q):
+    """How well the words fit a window, 0..1: each word's best fuzzy match among the window's name, session and
+    cwd parts (so a typo or an extra word still scores), plus how close the whole name is to the words."""
+    hay = toks(w["name"]) + toks(w["session"]) + toks(os.path.basename(w["cwd"]))
+    if not q or not hay:
+        return 0.0
+    best = [max(1.0 if t in h else difflib.SequenceMatcher(None, t, h).ratio() for h in hay) for t in q]
+    whole = difflib.SequenceMatcher(None, " ".join(q), " ".join(toks(w["name"]))).ratio()
+    return 0.8 * sum(best) / len(best) + 0.2 * whole
+
+
+def local(ws, words):
+    """Pick without a model: ("one", window) or ("several", candidates)."""
+    q = toks(words)
+    old = "old" in q and len(q) > 1
+    if old:
+        q = [t for t in q if t != "old"]
+    ranked = sorted(ws, key=lambda w: -score(w, q))
+    top = score(ranked[0], q)
+    if top < 0.5:
+        return "several", ranked[:6]
+    group = [w for w in ranked if score(w, q) >= top - 0.05]
+    names = {w["name"] for w in group}
+    if len(names) > 1:
+        return "several", group[:6]
+    group.sort(key=lambda w: w["age_s"])  # same window name: newest seat first
+    if old:
+        group = group[1:]
+        if not group:  # no older window of that name: offer the next-best ones
+            return "several", [w for w in ranked if score(w, q) >= 0.5][1:7] or ranked[1:7]
+        return ("one", group[0]) if len(group) == 1 else ("several", group[:6])
+    return "one", group[0]
+
+
+def choose(ws, words, dry, ai=False, again=True):
+    exact = [w for w in ws if w["name"].lower() == words.lower()]
+    if len(exact) == 1:  # a window's exact name needs no match at all
+        return open_window(exact[0], dry)
+    if ai:
+        d = ask(ws, words)
+        if d.get("match") == "one" and opens(ws, d.get("id")):
+            return open_window(opens(ws, d["id"]), dry)
+        cands = [opens(ws, c) for c in d.get("candidates") or []]
+        cands = [c for c in cands if c][:6] or ws[:6]
+        q = d.get("question") or ("Several windows fit." if d.get("match") == "several" else "Nothing matched.")
+    else:
+        kind, got = local(ws, words)
+        if kind == "one":
+            return open_window(got, dry)
+        cands, q = got, "Several windows fit."
+    print(q + " Which one, or describe it another way?")
+    for i, w in enumerate(cands, 1):
+        print("  %d) %s  %s:%s  %s  age %s  idle %s" % (i, w["id"], w["session"], w["name"], w["cwd"], w["age"], w["idle"]))
+    if dry:
+        return 0
+    try:
+        a = input("> ").strip()
+    except EOFError:
+        return 1
+    if a.isdigit() and 1 <= int(a) <= len(cands):
+        return open_window(cands[int(a) - 1], dry)
+    if a and again:
+        return choose(ws, words + " " + a, dry, ai, False)
+    print("tmux-helper: no window opened")
+    return 1
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    dry = "--dry-run" in argv
+    ai = "-ai" in argv or "--ai" in argv
+    words = " ".join(a for a in argv if a not in ("--dry-run", "-ai", "--ai")).strip()
+    if not words:  # no words: tmux's own tree of every session and window
+        cmd = ["tmux", "choose-tree", "-Zw"] if os.environ.get("TMUX") else ["tmux", "attach", ";", "choose-tree", "-Zw"]
+        if dry:
+            print("-> " + " ".join(cmd))
+            return 0
+        return subprocess.call(cmd)
+    ws = windows()
+    if not ws:
+        sys.exit("tmux-helper: no tmux windows")
+    return choose(ws, words, dry, ai)
+
+
+def selfcheck():
+    n = f = 0
+
+    def t(name, ok):
+        nonlocal n, f
+        n += 1
+        if not ok:
+            f += 1
+            print("FAIL", name)
+
+    d = tempfile.mkdtemp(prefix="tmux-helper-sc-")
+    bindir = os.path.join(d, "bin")
+    os.makedirs(bindir)
+    log = os.path.join(d, "tmux.log")
+    ans = os.path.join(d, "answer")
+    prm = os.path.join(d, "prompt")
+    # fake tmux: window ids @1 and @2 appear under two sessions each (grouped), @3 once
+    with open(os.path.join(bindir, "tmux"), "w") as fh:
+        fh.write('#!/bin/sh\necho "$*" >> "%s"\n'
+                 'if [ "$1" = list-windows ]; then\n'
+                 "printf '@1\\talpha\\tshop\\tbash\\t/w/shop\\t1000\\t%d\\n@1\\tbeta\\tshop\\tbash\\t/w/shop\\t1000\\t%d\\n"
+                 "@2\\talpha\\tshop\\tbash\\t/w/shop2\\t900\\t%d\\n@2\\tbeta\\tshop\\tbash\\t/w/shop2\\t900\\t%d\\n"
+                 "@3\\tgamma\\tnotes\\tvim\\t/w/notes\\t800\\t%d\\n'\n"
+                 "fi\n" % (log, os.getpid(), os.getpid(), os.getpid(), os.getpid(), os.getpid()))
+    with open(os.path.join(bindir, "claude"), "w") as fh:
+        fh.write('#!/bin/sh\ncat > "%s"\ncat "%s"\n' % (prm, ans))
+    for x in ("tmux", "claude"):
+        os.chmod(os.path.join(bindir, x), 0o755)
+    env = dict(os.environ, PATH=bindir + ":" + os.environ["PATH"])
+    env.pop("TMUX", None)
+    me = os.path.realpath(__file__)
+
+    def go(answer, args, stdin="", tmux=False):
+        open(ans, "w").write(answer)
+        open(log, "w").close()
+        e = dict(env, TMUX="x") if tmux else env
+        r = subprocess.run([sys.executable, me] + args, input=stdin, capture_output=True, text=True, env=e)
+        return r, open(log).read()
+
+    r, lg = go('{"match":"one","id":"@3"}', ["-ai", "--dry-run", "the", "notes", "one"])
+    t("dry-run prints pick", "@3" in r.stdout and "gamma:notes" in r.stdout)
+    t("dry-run switches nothing", "select-window" not in lg and "attach" not in lg and "switch-client" not in lg)
+    t("window listed once", open(prm).read().count("@1 |") == 1 and open(prm).read().count("@2 |") == 1)
+    t("prompt has words and old rule", "Words: the notes one" in open(prm).read() and "OLDER" in open(prm).read())
+    r, lg = go('noise {"match":"one","id":"@2"} noise', ["-ai", "shop", "old"], tmux=True)
+    t("inside tmux switches", "switch-client -t alpha" in lg and "select-window -t alpha:@2" in lg and "attach" not in lg)
+    t("old words reach the model", "Words: shop old" in open(prm).read())
+    os.path.exists(prm) and os.remove(prm)
+    r, lg = go('{"match":"none"}', ["ntoes", "window"])
+    t("typo and extra word match locally, no model", "attach -t gamma" in lg and not os.path.exists(prm))
+    r, lg = go('{"match":"none"}', ["shop"])
+    t("same name: newest opens", "select-window -t alpha:@1" in lg and not os.path.exists(prm))
+    r, lg = go('{"match":"none"}', ["shop", "old"])
+    t("same name + old: the older one", "select-window -t alpha:@2" in lg)
+    r, lg = go('{"match":"none"}', ["qqqqzz"], "")
+    t("nothing close asks, no model", "Which one" in r.stdout and not os.path.exists(prm))
+    r, lg = go('{"match":"none"}', ["Notes"])
+    t("exact name opens without the model", "attach -t gamma" in lg and not os.path.exists(prm))
+    r, lg = go('{"match":"one","id":"@3"}', ["-ai", "notes"])
+    t("outside tmux attaches", "attach -t gamma" in lg and "switch-client" not in lg)
+    r, lg = go('{"match":"several","question":"Which shop?","candidates":["@1","@2"]}', ["-ai", "shop"], "2\n")
+    t("several asks numbered", "Which shop?" in r.stdout and "1) @1" in r.stdout and "2) @2" in r.stdout)
+    t("number opens the pick", "attach -t alpha" in lg and "select-window -t alpha:@2" in lg)
+    r, lg = go('{"match":"none"}', ["-ai", "zzz"], "3\n")
+    t("none falls back to recent windows", "1) @1" in r.stdout and "3) @3" in r.stdout and "attach -t gamma" in lg)
+    r, lg = go('{"match":"none"}', ["-ai", "zzz"], "")
+    t("no answer opens nothing", r.returncode == 1 and "attach" not in lg)
+    r, lg = go('{"match":"none"}', ["-ai", "zzz"], "the vim one\n")
+    t("free text asks once more, then stops", "Words: zzz the vim one" in open(prm).read() and r.returncode == 1)
+    r, lg = go("not json", ["-ai", "x"])
+    t("unreadable answer fails", r.returncode != 0 and "could not read" in r.stderr)
+    r, lg = go("{}", [])
+    t("no words opens the tree (attach outside tmux)", "attach ; choose-tree -Zw" in lg)
+    r, lg = go("{}", [], tmux=True)
+    t("no words inside tmux: tree only", lg.strip() == "choose-tree -Zw")
+    print("tmux-helper selfcheck: %d passed, %d failed" % (n - f, f))
+    return 1 if f else 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["selfcheck"]:
+        sys.exit(selfcheck())
+    sys.exit(main(sys.argv[1:]))
