@@ -312,11 +312,13 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
             argv, wd, env, how = _member_argv(check, head, cwd, where, env_extra)
         else:
             argv, wd, env, how = _box_argv(check, head, cwd, run_dir, env_extra)
-        argv, scope = A.wrap(check, argv, f"{check.name}-{tree_sha[:8]}") if kind == "box" else (argv, "-")
+        scope = "-"
         # the laptop's work is the laptop's: it takes no slot of the box's
         held = contextlib.nullcontext() if kind == "laptop" else A.slot(state or REC.state_dir(), alone=alone)
         with held:
             loaded = A.loaded()
+            if kind == "box":   # wrapped once the slot is held, so the priority answers for the load it starts under
+                argv, scope = A.wrap(check, argv, f"{check.name}-{tree_sha[:8]}", busy=bool(A.overloaded()))
             rc, secs, cpu, capped = execute(argv, wd, env, check.cap, log, stdin)
             loaded = loaded or A.loaded()   # under load at either end of the run
         if tar is not None:

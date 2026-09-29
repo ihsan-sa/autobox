@@ -10,6 +10,9 @@
 #   cc <repo> <track> --go "instruction" [--loop N] [--budget USD] [--model M]
 #                             autonomous headless worker (ralph loop via cc-loop) on that track; ends with a PR
 #                             --go "" re-dispatches the task.md already there (e.g. after answering a BLOCKED)
+#                             without room (`cc-room check`: CC_WORKER_CAP loops running, five-hour usage ahead of its
+#                             clock, or the box overloaded) the launch is QUEUED, not refused: it says why in one line and
+#                             starts by itself later; a cc-room that crashes is skipped with one line (fail open)
 #                             the instruction is a covering note ADDED ABOVE any existing brief, never over it
 #                             a note that prescribes the STEPS is refused here, by cc-brief's arithmetic over its
 #                             shape. CC_BRIEF_FORCE=1 sends it as typed and records that. What other live tracks
@@ -1663,7 +1666,7 @@ case "$mode" in
          "${CC_SLACK:-$BIN/cc-slack}" track-thread "$repo/$track" --title "$("$BOARD" get "$repo" "$track" title 2>/dev/null)" >/dev/null 2>&1 || true; fi
        xq=""; [ ${#XTRA[@]} -gt 0 ] && xq=$(printf ' %q' "${XTRA[@]}")   # printf %q with no argument emits '' — cc-loop would see an empty arg
        lock "$st/.lock"; [ -n "$(win_id "$win")" ] && tmux kill-window -t "$(win_id "$win")"
-       pre=""; for v in CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_FAILURES CC_WORKER_SANDBOX CC_WORKER_MODEL CC_LOOP_TRIM CC_SPEND_TIER CC_SLACK_ALIAS; do   # CC_SLACK_ALIAS: the orch dispatching this, which cc-loop records for its stop notice and unsets before the worker runs   # tests: the new tmux window has the server's env, not ours — carry the log-only flag (or the worker's DONE notice really posts) and the run's own log/stamp/ledger (or a fixture loop's stop is recorded as the box's own)
+       pre=""; for v in CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_FAILURES CC_WORKER_SANDBOX CC_WORKER_MODEL CC_LOOP_TRIM CC_SPEND_TIER CC_ROOM_DIR CC_WORKER_CAP CC_WORKER_PACE_MARGIN LANDER_LOADAVG LANDER_PSI_DIR CC_SLACK_ALIAS; do   # CC_ROOM_DIR, the two room keys and the load it reads (LANDER_*): `cc-room admit` in the window asks them again; CC_SLACK_ALIAS: the orch dispatching this, which cc-loop records for its stop notice and unsets before the worker runs   # tests: the new tmux window has the server's env, not ours — carry the log-only flag (or the worker's DONE notice really posts) and the run's own log/stamp/ledger (or a fixture loop's stop is recorded as the box's own)
          # …and every knob a person sets in FRONT of the dispatch (CC_WORKER_MODEL, CC_LOOP_TRIM): off this list the
          # variable never reaches the window, cc-config silently reads ~/.cc/config instead, and the run is the
          # opposite of what was asked for — in both directions, which is what would corrupt a shadow-week A/B.
@@ -1671,14 +1674,36 @@ case "$mode" in
          # every iteration, and off this list the loop asked the box's ~/.cc/config while the dispatcher had answered
          # from its environment — a fixture loop under the box's `stop` died at its door with no log line (2026-09-16..18).
          [ -n "${!v:-}" ] && pre="$pre$(printf '%s=%q ' "$v" "${!v}")"; done
+       # ROOM FOR ONE MORE (cc-room): fewer than CC_WORKER_CAP loops running, and the five-hour window not ahead of
+       # its clock by more than CC_WORKER_PACE_MARGIN. Without it the launch is QUEUED, not refused: the window opens
+       # with the loop behind `cc-room admit`, which waits (no claude, no model call) and starts it by itself once
+       # there is room — the pid it execs keeps the slot for the loop's whole life. On 2026-09-27 ~30 workers started
+       # in an hour and the box ran out of memory. Interactive seats and landings never come through here.
+       # FAIL OPEN: a check that crashes (any exit but 0 or 1, cc-room missing included) is not "no room" and not
+       # "room" either — the loop starts WITHOUT the admit wrapper, which would crash the same way in the window and
+       # leave a track nobody runs and nobody hears about; one line here and in loop.log says admission was skipped.
+       # `admit` fails open by itself as well (cc-room: any error before the exec runs the command anyway).
+       # CC_ROOM names another cc-room, for a suite's crash fixture only.
+       roombin="${CC_ROOM:-$BIN/cc-room}"
+       full=$("$roombin" check 2>/dev/null); rrc=$?
+       case $rrc in
+         0) full=""; room=$(printf '%q admit %q --log %q -- ' "$roombin" "$repo/$track" "$st/loop.log") ;;
+         1) room=$(printf '%q admit %q --log %q -- ' "$roombin" "$repo/$track" "$st/loop.log") ;;
+         *) full=""; room=""
+            echo "cc: worker admission failed (cc-room check exit $rrc); starting $repo/$track without it" | tee -a "$st/loop.log" >&2 ;;
+       esac
        if member_workspace "$repo"; then   # the loop itself runs INSIDE the boundary; cc-loop's own cc-sandbox call is then a no-op (CC_WORKER_SANDBOX unset) — one wall, not two
-         tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%s%q member %q %q -- cc-loop %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$BIN/cc-sandbox" "$repo" "$track" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
+         tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%s%q member %q %q -- cc-loop %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre$room" "$BIN/cc-sandbox" "$repo" "$track" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
        else
-         tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%sCC_CLAUDE=%q %q %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$CLAUDE" "$BIN/cc-loop" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
+         tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%sCC_CLAUDE=%q %s%q %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$CLAUDE" "$room" "$BIN/cc-loop" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
        fi
        [ -n "$CLAIM" ] && claim_end "worker launched"   # the window is up: the loop owns the row from here, not this process
        wm=""; k=0; while [ "$k" -lt "${#XTRA[@]}" ]; do [ "${XTRA[$k]}" = --model ] && wm="${XTRA[$((k+1))]:-}"; k=$((k+1)); done
-       unlock; echo "worker started on $(worker_model "$wm") in tmux main:$win — watch: cc $repo $track ; log: $st/loop.log"; exit 0 ;;
+       unlock
+       if [ -n "$full" ]; then
+         "$BOARD" note "$repo" "$track" "worker queued: $full" >/dev/null
+         echo "worker queued, not started: $full — it starts on its own when there is room, on $(worker_model "$wm") in tmux main:$win; log: $st/loop.log"; exit 0; fi
+       echo "worker started on $(worker_model "$wm") in tmux main:$win — watch: cc $repo $track ; log: $st/loop.log"; exit 0 ;;
 esac
 lock "$st/.lock"
 if have_window "$win" && ! pane_live "$win"; then tmux kill-window -t "$(win_id "$win")"; fi   # dead window (claude exited, `exec bash`): recreate instead of attaching to a shell

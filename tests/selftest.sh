@@ -375,6 +375,12 @@ prefetch(){
 RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"; : > "$T/born"   # born: what "modified during this run" means below
 export CC_SELF_LAND_EXCEPT=$REPO         # every project lands itself by default, and the box's own config never decides a fixture: a case that means the grant sets this itself
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
+export CC_ROOM_DIR="$T/room" CC_WORKER_CAP=1000 CC_WORKER_PACE_MARGIN=100   # cc-room: a fixture --go never queues behind the box's real loops or its five-hour pace, and never takes one of its slots
+# …nor behind the box's LOAD: cc-room also asks the lander's overloaded(), and at a load of twice the cores (common
+# here) every fixture --go would sit in `cc-room admit`. A calm load average and calm PSI of the run's own.
+mkdir -p "$T/psi"; echo "0.00 0.00 0.00 1/1 1" > "$T/loadavg"
+for k in cpu memory io; do echo "some avg10=0.00 avg60=0.00 avg300=0.00 total=0" > "$T/psi/$k"; done
+export LANDER_LOADAVG="$T/loadavg" LANDER_PSI_DIR="$T/psi"
 export CC_LIMIT_STAMP="$T/claude-limit"   # not the box's live stamp: a test limit must never make a real loop wait
 export CC_FAILURES="$T/failures"          # not ~/.cc/failures: the loop stops and red gates below are fixtures, and the
                                           # ledger counts what it holds (cc-loop stop_record, cc-green red)
@@ -1719,6 +1725,34 @@ w1out=$(env SLACK_BOT_TOKEN= CC_SLACK="$T/ghw1/slack" PATH="$T/ghw1:$PATH" "$B/c
   && ok "…and cc done is safe to run again: once GitHub answers, the retry opens the PR, settles both projections and moves the row to review" \
   || bad "w1 retry: rc=$w1rc receipt=$w1out err=$(tail -2 "$T/w1.err" | tr '\n' ' ')"
 
+fi
+if stanza "--go waits for room, and a room check that crashes fails open"; then
+# NO ROOM (cc-room check exit 1) QUEUES THE LAUNCH: the window opens with the loop behind `cc-room admit`, the
+# dispatcher hears "queued" and why, and no iteration runs while the cap holds. A cap of 0 is "no room" by count.
+"$B/cc-board" add $REPO rq1 "rq1" "Do the rq1 thing." >/dev/null 2>&1
+CC_WORKER_CAP=0 "$B/cc-room" check >/dev/null 2>&1; rq0=$?
+CC_WORKER_CAP=0 "$B/cc" $REPO rq1 --go "" >"$T/rq1.out" 2>&1; rq1=$?
+for _ in $(seq 1 20); do grep -q 'cc-room: '"$REPO"'/rq1 queued' ~/.cc/state/$REPO/rq1/loop.log 2>/dev/null && break; sleep 0.5; done
+{ [ "$rq0" = 1 ] && [ "$rq1" = 0 ] && grep -q 'worker queued, not started: 0 worker loops are running and the cap is 0' "$T/rq1.out" \
+  && ! grep -q 'worker started' "$T/rq1.out" && [ -n "$(wins "$REPO/rq1")" ] \
+  && grep -q "cc-room: $REPO/rq1 queued" ~/.cc/state/$REPO/rq1/loop.log \
+  && ! ls ~/.cc/state/$REPO/rq1/runs/*.json >/dev/null 2>&1; } \
+  && ok "no room: --go says 'worker queued' and why, its window waits in cc-room admit, and no iteration runs" \
+  || bad "queued --go: check rc=$rq0 go rc=$rq1 '$(cat "$T/rq1.out")' log: $(tail -2 ~/.cc/state/$REPO/rq1/loop.log 2>/dev/null | tr '\n' ' ')"
+for id in $(wins "$REPO/rq1"); do tmux kill-window -t "$id"; done
+# A ROOM CHECK THAT CRASHES (any exit but 0 or 1) FAILS OPEN: before, `full` came out empty, cc said "worker
+# started", and `admit` crashed the same way in the window — nothing ran and nothing said so. Now the loop starts
+# without the wrapper, and one line (terminal and loop.log) says admission failed.
+mkdir -p "$T/roomcrash"; printf '#!/bin/sh\nexit 3\n' > "$T/roomcrash/cc-room"; chmod +x "$T/roomcrash/cc-room"
+"$B/cc-board" add $REPO rq2 "rq2" "Do the rq2 thing." >/dev/null 2>&1
+CC_ROOM="$T/roomcrash/cc-room" "$B/cc" $REPO rq2 --go "" >"$T/rq2.out" 2>&1; rq2=$?
+for _ in $(seq 1 60); do ls ~/.cc/state/$REPO/rq2/runs/*.json >/dev/null 2>&1 && break; sleep 0.5; done
+{ [ "$rq2" = 0 ] && grep -q 'worker admission failed (cc-room check exit 3)' "$T/rq2.out" && grep -q 'worker started' "$T/rq2.out" \
+  && grep -q 'worker admission failed' ~/.cc/state/$REPO/rq2/loop.log && ls ~/.cc/state/$REPO/rq2/runs/*.json >/dev/null 2>&1; } \
+  && ok "a room check that crashes fails open: the loop runs without admission, and one line says so" \
+  || bad "crashed room check: go rc=$rq2 '$(cat "$T/rq2.out")' log: $(tail -2 ~/.cc/state/$REPO/rq2/loop.log 2>/dev/null | tr '\n' ' ')"
+for id in $(wins "$REPO/rq2"); do tmux kill-window -t "$id"; done
+for r in rq1 rq2; do for _ in $(seq 1 30); do pgrep -f "cc-loop $REPO $r " >/dev/null || break; sleep 0.5; done; done
 fi
 if stanza "--go is a covering note, never a replacement for the brief (#71)"; then
 # #71 stopped `--go "text"` overwriting task.md — but it then synced the BOARD from that file, so a brief that

@@ -18,8 +18,13 @@ exit 1 "queued, but…". `queue --task` is the old queue_task unchanged: `cc don
 0 queue / 1 approval / 2 refused, anything else failed; the receipt (with `landing`) is the one line on stdout.
 
 THE LANE (Lane.run) takes <repo>.lock (busy: return — the running lane re-reads), drains the inbox, and steps each
-job, oldest queued_at first, until it rests (held until not_before, query, done, deploy-pending, handed back),
-re-reading the list after each. BOX HOLDS come first and leave the file untouched and the job untimed:
+job until it rests (held until not_before, query, done, deploy-pending, handed back), re-reading the list after each.
+SMALL FIRST (owner, 2026-09-28: a one-line PR waited behind ~20 full-suite PRs): the next job is the oldest one
+that is not heavy — a plan of more than LANDER_SMALL_CHECKS (default 5) checks, or one with a full-suite check
+(LANDER_FULL_CHECKS, default check-sh) — and only then the oldest heavy one;
+a job not planned yet counts as small. A heavy job steps aside before each of its checks (results kept, state
+`checking`) when a request is in the inbox or a job the lane has not tried this run is small or ahead of it, and
+goes on after that one rests. So a small PR waits for at most one check of a full suite, never for the suite. BOX HOLDS come first and leave the file untouched and the job untimed:
 `cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds jobs before the merge.
   queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a draft or a conflict -> held 15 min. Under
              the git lock fetch base and head; base_sha, files (merge-base..head), digest. A member PR meets its
@@ -88,6 +93,9 @@ MOVES_BEFORE_HOLD = 5    # main moving under the merge this many times in one st
 GH_PR_FILES = 100        # gh lists at most this many files; at or over it git names them all
 FIELDS = "state,isDraft,mergeable,headRefOid,headRefName,baseRefName,title,body"
 PRE_MERGE = (T.QUEUED, T.PLANNED, T.CHECKING)
+SMALL_CHECKS = int(os.environ.get("LANDER_SMALL_CHECKS") or 5)   # a plan with more checks than this is heavy
+# …and so is a plan with one of these, however few its checks: a count is not a cost, and check-sh is the whole suite
+FULL_CHECKS = tuple((os.environ.get("LANDER_FULL_CHECKS") or "check-sh").split())
 MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": "cards", "board": "board",
              "deploy": "deploy", "tip": "tip"}
 
@@ -312,6 +320,9 @@ class Lane:
         self.token = (self.genv or {}).get("GH_TOKEN")
         self.fallback = MF.host_fallback(repo)   # the release's landing-repos/<repo>.toml; "" when the repo has none
         self.lines = []
+        self.tried = set()
+        self.stepped_aside = False
+        self.asked = set()
 
     def say(self, text):
         self.lines.append(f"[{self.repo}] {text}")
@@ -336,25 +347,52 @@ class Lane:
                     return self.lines
                 with contextlib.suppress(OSError, ValueError):   # base runs an earlier lane shared are not reused
                     REC.new_nonce(self.repo, J.landq())
-                tried = set()
+                tried = self.tried = set()
                 while True:
                     for ln in J.drain(self.repo):
                         self.say(ln)
                     todo = [j for j in J.lane_jobs(self.repo) if j.key not in tried and self.due(j)]
                     if not todo:
                         break
-                    job = todo[0]
+                    job = min(todo, key=self.heavy)   # the oldest small job, else the oldest heavy one
                     tried.add(job.key)
                     why = self.box_hold(job)
                     if why:
                         self.say(f"PR #{job.pr}: {why}")
                         continue
+                    self.stepped_aside = False
                     self.advance(job)
+                    if self.stepped_aside:     # it goes on once the job it stepped aside for has rested
+                        tried.discard(job.key)
             if not J.requests(self.repo):   # a request that met the held lock after its last drain: once more
                 return self.lines
 
     def due(self, job):
         return job.state not in J.RESTING and not (job.state == T.HELD and J.not_before_left(job))
+
+    @staticmethod
+    def heavy(job) -> bool:
+        """A plan of more than SMALL_CHECKS checks, or one holding a full-suite check (FULL_CHECKS). Not planned
+        yet is small: planning is cheap and says which."""
+        return bool(job.plan and (len(job.plan.checks) > SMALL_CHECKS
+                                  or any(n in FULL_CHECKS for n in job.plan.checks)))
+
+    def step_aside_for(self, job) -> str:
+        """What a heavy job steps aside for before its next check, or '': a request in the inbox, or a due job
+        not tried this run that is small or ahead of it in the queue."""
+        if not self.heavy(job):
+            return ""
+        new = [p for p, _ in J.requests(self.repo) if p not in self.asked]
+        if new:
+            self.asked.update(new)     # once per request: one drain cannot unlink would otherwise loop the lane
+            return "a new request"
+        ahead = True
+        for j in J.lane_jobs(self.repo):
+            if j.key == job.key:
+                ahead = False
+            elif j.key not in self.tried and self.due(j) and (ahead or not self.heavy(j)):
+                return f"PR #{j.pr}"
+        return ""
 
     def box_hold(self, job):
         target = self.member or self.repo
@@ -525,6 +563,11 @@ class Lane:
             store = REC.Store(self.repo, J.lane_fd(self.repo), J.landq()) if J.lane_fd(self.repo) is not None else None
             quarantine = RUN.quarantine_text(self.root, job.base_sha)
         for n in todo:
+            other = self.step_aside_for(job)
+            if other:
+                self.stepped_aside = True
+                return self.say(f"PR #{job.pr} steps aside for {other} ({len(job.results)} of {len(names)} "
+                                f"checks done)")
             outs = self.call("runner", "run_plan", self.root, m, job.plan, job.files, tree, base_tree,
                              member=self.member, store=store, job_key=job.key, scope=self.member or self.repo,
                              pr=job.pr, quarantine_text=quarantine, only=[n], fallback=self.fallback)

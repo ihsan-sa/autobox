@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""cc-room — does the box have room for one more headless worker, and a queue for the launch when it has not.
+
+  cc-room check                     exit 0 there is room · 1 there is not, and the one line on stdout says why
+  cc-room admit <repo/track> [--log FILE] -- CMD…
+                                    wait until there is room and this launch is the oldest one waiting, take a
+                                    slot, then exec CMD — the same pid, so the slot is held exactly as long as
+                                    CMD runs and frees itself when it exits. Nobody retypes a queued launch.
+  cc-room status                    the slots held and the launches queued
+  cc-room selfcheck
+
+ROOM MEANS ALL THREE; the first two are cc-config keys (the environment wins, as it does for every key):
+  CC_WORKER_CAP (12)          fewer than this many worker loops hold a slot;
+  CC_WORKER_PACE_MARGIN (10)  the account's five-hour usage is not ahead of the window's elapsed time by more than
+                              this many points: used% <= elapsed% + margin. It reads the freshest statusline file
+                              (~/.cc/state/statusline/*.json, CC_STATUSLINE_DIR) whose window has not reset yet.
+                              No such file, or a window already over, is room — a reading nobody has is never
+                              the reason a worker waits.
+  the box is not busy       the lander's own overloaded() (core/lander/admission.py): memory or cpu pressure, or a
+                              1-minute load average at LANDER_LOAD_FACTOR (2) times the cores or more. It is the
+                              same call the lander serializes on, so while the box is overloaded new workers wait
+                              and the landing queue gets the room the load frees as it drains.
+Nothing here reads the weekly limit, and nothing here stops or kills a thing that is already running.
+
+WHY (2026-09-27): about 30 workers started inside an hour; load sat at 130-185 on 6 cores with swap full, the OOM
+killer ran 7 times and timed units failed one after another, while the five-hour window ran ahead of its clock.
+
+Only `cc <repo> <track> --go` calls `admit` (it wraps the loop's tmux window in it). Interactive seats and landings
+never pass through here, so they are never counted and never capped. A slot is a file under ~/.cc/state/room/slots
+(CC_ROOM_DIR) naming a pid and its start time; a waiting launch is a file under queue/. Both are cleared as soon as
+their process is gone. A loop started before this tool existed holds no slot, so it is not counted.
+A paused project never gets here (`cc` refuses --go first), and a launch that waited through a pause is still
+refused by cc-loop's own `cc-pause is` check the moment it starts.
+"""
+# recurring-defect-ok: pause-hold-missing — cc refuses --go on a paused repo before admit, and cc-loop checks cc-pause as its first act
+import fcntl
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(BIN))   # core/, for the lander package — not core/lander, whose types.py would shadow
+try:
+    from lander import admission  # noqa: E402
+except Exception as e:   # a broken lander is a crash (2), never "queued" (1): cc fails open on anything but 0 and 1
+    print(f"cc-room: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(2)
+WINDOW = 5 * 3600
+
+
+def room_dir():
+    return os.environ.get("CC_ROOM_DIR") or f"{HOME}/.cc/state/room"
+
+
+def cfg(key, default):
+    try:
+        out = subprocess.run([f"{BIN}/cc-config", "get", key, str(default)], capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        out = os.environ.get(key, "")
+    try:
+        return int(out)
+    except ValueError:
+        return default
+
+
+def starttime(pid):
+    """The kernel's start time of pid, or None when it is gone — a pid alone can be reused."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def live(sub):
+    """{path: (pid, what)} of the entries in sub/ whose process is still the one that wrote them; the rest go."""
+    out = {}
+    for p in sorted(glob.glob(f"{room_dir()}/{sub}/*")):
+        if p.endswith(".tmp"):   # another process's entry, half written
+            continue
+        try:
+            pid, st, what = open(p).read().split(" ", 2)
+        except (OSError, ValueError):
+            pid, st, what = "", "", ""
+        if pid and starttime(pid) == st:
+            out[p] = (int(pid), what.strip())
+        else:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+    return out
+
+
+def five_hour(now):
+    """(used%, resets_at) from the freshest statusline file whose five-hour window is still open, else None."""
+    d = os.environ.get("CC_STATUSLINE_DIR") or f"{HOME}/.cc/state/statusline"
+    files = sorted(glob.glob(f"{d}/*.json"), key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+                   reverse=True)
+    for p in files[:200]:
+        try:
+            fh = json.load(open(p))["raw"]["rate_limits"]["five_hour"]
+            used, resets = float(fh["used_percentage"]), float(fh["resets_at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if resets > now:
+            return used, resets
+    return None
+
+
+def why_not(now=None):
+    """"" when there is room for one more worker, else the one-line reason."""
+    now = now or time.time()
+    cap = cfg("CC_WORKER_CAP", 12)
+    held = len(live("slots"))
+    if held >= cap:
+        return f"{held} worker loops are running and the cap is {cap} (CC_WORKER_CAP)"
+    fh = five_hour(now)
+    if fh:
+        used, resets = fh
+        margin = cfg("CC_WORKER_PACE_MARGIN", 10)
+        elapsed = max(0.0, min(100.0, 100.0 * (WINDOW - (resets - now)) / WINDOW))
+        # the brief: "five-hour usage not running ahead of the window's elapsed time, beyond a margin"
+        if used > elapsed + margin:
+            return (f"five-hour usage is at {used:.0f}% with {elapsed:.0f}% of the window gone, more than "
+                    f"{margin} points ahead (CC_WORKER_PACE_MARGIN); it resets at "
+                    f"{time.strftime('%H:%M', time.localtime(resets))}")
+    busy = admission.overloaded()
+    if busy:
+        return f"the box is busy: {busy}; landings go first"
+    return ""
+
+
+def write_entry(sub, name, what):
+    os.makedirs(f"{room_dir()}/{sub}", exist_ok=True)
+    p = f"{room_dir()}/{sub}/{name}"
+    tmp = f"{p}.tmp"
+    with open(tmp, "w") as f:
+        f.write(f"{os.getpid()} {starttime(os.getpid())} {what}\n")
+    os.replace(tmp, p)
+    return p
+
+
+def logline(path, msg):
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {msg}\n"
+    sys.stderr.write(line)
+    if path:
+        try:
+            with open(path, "a") as f:
+                f.write(line)
+        except OSError:
+            pass
+
+
+def admit(what, cmd, log):
+    """Wait for room, then exec cmd. FAIL OPEN: any error on the way (a room dir it cannot write, a lock, a bad
+    reading) runs cmd anyway with one line saying admission failed — a crash here would otherwise leave a queued
+    track that never runs and a window nobody reads."""
+    try:
+        wait_for_room(what, log)
+    except Exception as e:   # noqa: BLE001 — every failure here is the same one: no admission, so start anyway
+        logline(log, f"cc-room: admission failed for {what} ({type(e).__name__}: {e}); starting it anyway")
+    os.execvp(cmd[0], cmd)
+
+
+def wait_for_room(what, log):
+    os.makedirs(room_dir(), exist_ok=True)
+    me = write_entry("queue", f"{time.time_ns()}-{os.getpid()}", what)
+    poll = float(os.environ.get("CC_ROOM_POLL") or 60)
+    said, last = None, 0.0
+    while True:
+        with open(f"{room_dir()}/.lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            waiting = live("queue")
+            first = next(iter(waiting), me) == me   # FIFO: the oldest launch still waiting goes first
+            why = why_not() if first else ""
+            if first and not why:
+                write_entry("slots", str(os.getpid()), what)
+                os.unlink(me)
+                if said is not None:
+                    logline(log, f"cc-room: room now — {what} starts")
+                break
+        if not first:
+            ahead = list(waiting).index(me) if me in waiting else 0
+            why = f"{ahead} launch(es) queued ahead of it"
+        # one line when the reason changes, and one an hour while it holds, so a long wait is seen and not re-logged
+        if why != said or time.time() - last >= 3600:
+            logline(log, f"cc-room: {what} queued — {why}")
+            said, last = why, time.time()
+        time.sleep(poll)
+
+
+def status():
+    for p, (pid, what) in live("slots").items():
+        print(f"running {what} (pid {pid})")
+    for p, (pid, what) in live("queue").items():
+        print(f"queued  {what} (pid {pid})")
+    w = why_not()
+    print("room: yes" if not w else f"room: no — {w}")
+
+
+def selfcheck():
+    import shutil
+    import tempfile
+    n = bad = 0
+
+    def t(name, got, want):
+        nonlocal n, bad
+        n += 1
+        if got != want:
+            bad += 1
+            print(f"FAIL {name}: got {got!r}, want {want!r}")
+
+    base = tempfile.mkdtemp(prefix="cc-room-sc.")
+    keep = {k: os.environ.get(k) for k in ("CC_ROOM_DIR", "CC_STATUSLINE_DIR", "CC_WORKER_CAP",
+                                          "CC_WORKER_PACE_MARGIN", "CC_ROOM_POLL", "CC_CONFIG", "LANDER_LOADAVG")}
+    procs = []
+
+    # the box's own /proc/loadavg must never decide a case — give every fixture a calm one of its own,
+    # in-process and in the subprocesses admit() and check spawn (LANDER_LOADAVG, read at import)
+    calm = f"{base}/loadavg.calm"
+    open(calm, "w").write("0.0 0.0 0.0 1/1 1\n")
+    os.environ["LANDER_LOADAVG"] = calm
+    old_loadavg = admission.LOADAVG
+    admission.LOADAVG = calm
+
+    def fixture(name, cap=2, margin=10):
+        """a room and a statusline dir of this case's own, nothing held, nothing queued"""
+        d = f"{base}/{name}"
+        os.makedirs(f"{d}/sl")
+        os.environ.update(CC_ROOM_DIR=f"{d}/room", CC_STATUSLINE_DIR=f"{d}/sl", CC_WORKER_CAP=str(cap),
+                          CC_WORKER_PACE_MARGIN=str(margin), CC_ROOM_POLL="0.2", CC_CONFIG=f"{d}/config")
+        return d
+
+    def usage(d, used, left_s, name="s.json"):
+        json.dump({"raw": {"rate_limits": {"five_hour": {"used_percentage": used,
+                                                         "resets_at": int(time.time() + left_s)}}}},
+                  open(f"{d}/sl/{name}", "w"))
+
+    def holder(what):
+        """a live process holding a slot, as an admitted loop does"""
+        p = subprocess.Popen([sys.executable, __file__, "admit", what, "--", "sleep", "60"],
+                             stderr=subprocess.DEVNULL)
+        procs.append(p)
+        for _ in range(50):
+            if any(w == what for _, w in live("slots").values()):
+                return p
+            time.sleep(0.1)
+        return p
+
+    try:
+        # room means it runs: nothing held, usage behind its clock
+        d = fixture("room")
+        usage(d, 20, 3 * 3600)   # 40% of the window gone, 20% used
+        t("room: nothing held and usage behind the clock", why_not(), "")
+        mark = f"{d}/ran"
+        r = subprocess.run([sys.executable, __file__, "admit", "r/room", "--", "touch", mark], timeout=20,
+                           capture_output=True)
+        t("room: admit runs the launch at once", (r.returncode, os.path.exists(mark)), (0, True))
+
+        # a simulated high load queues a new start, same as the lander's own overloaded() serializes on
+        d = fixture("busy")
+        hot = f"{base}/loadavg.hot"
+        n = os.cpu_count() or 1
+        open(hot, "w").write(f"{2.0 * n} 0.00 0.00 1/1 1\n")
+        admission.LOADAVG = hot
+        os.environ["LANDER_LOADAVG"] = hot
+        t("busy: a high load average queues a new start", "the box is busy" in why_not(), True)
+        t("busy: check exits 1 while the box is busy",
+          subprocess.run([sys.executable, __file__, "check"], capture_output=True, text=True).returncode, 1)
+        admission.LOADAVG = calm
+        os.environ["LANDER_LOADAVG"] = calm
+        t("busy: a calm load average is room again", why_not(), "")
+
+        # cap reached means queued, and one under it is not
+        d = fixture("cap", cap=2)
+        holder("r/a")
+        t("cap: one slot held of two is room", why_not(), "")
+        holder("r/b")
+        t("cap: two slots held of two is queued", why_not().startswith("2 worker loops are running and the cap is 2"),
+          True)
+        t("cap: check exits 1 with the reason",
+          subprocess.run([sys.executable, __file__, "check"], capture_output=True, text=True).returncode, 1)
+
+        # pace ahead means queued; at the margin exactly is room
+        d = fixture("pace", margin=10)
+        usage(d, 57, 3 * 3600)   # 2 h into 5 h = 40% gone; 57 > 40 + 10
+        t("pace: 57% used with 40% of the window gone is queued", "57%" in why_not(), True)
+        usage(d, 50, 3 * 3600)
+        t("pace: 50% used at 40% gone and a margin of 10 is room", why_not(), "")
+        usage(d, 90, -60)
+        t("pace: a window that has already reset is room", why_not(), "")
+        usage(d, 90, 3 * 3600, "old.json")
+        os.utime(f"{d}/sl/old.json", (1, 1))
+        usage(d, 10, 3 * 3600, "new.json")
+        t("pace: the freshest file decides, not an older one", why_not(), "")
+        os.unlink(f"{d}/sl/new.json")
+        t("pace: …and with only the older one left it is queued", "90%" in why_not(), True)
+
+        # the queued launch runs on its own once room frees, and not before
+        d = fixture("frees", cap=1)
+        h = holder("r/held")
+        mark = f"{d}/ran"
+        w = subprocess.Popen([sys.executable, __file__, "admit", "r/queued", "--log", f"{d}/loop.log", "--",
+                              "touch", mark], stderr=subprocess.DEVNULL)
+        procs.append(w)
+        time.sleep(1)
+        t("frees: the queued launch has not run while the cap is held", os.path.exists(mark), False)
+        t("frees: its log says it was queued and why",
+          "r/queued queued — 1 worker loops are running" in open(f"{d}/loop.log").read(), True)
+        h.kill()
+        h.wait()
+        w.wait(timeout=20)
+        t("frees: it runs by itself once the slot is freed", os.path.exists(mark), True)
+        t("frees: a finished launch holds no slot", live("slots"), {})
+
+        # admit fails open: a room it cannot even create still runs the launch, and says so once
+        d = fixture("crash")
+        open(f"{d}/notadir", "w").close()
+        os.environ["CC_ROOM_DIR"] = f"{d}/notadir/room"   # under a file: makedirs raises
+        mark = f"{d}/ran"
+        r = subprocess.run([sys.executable, __file__, "admit", "r/crash", "--log", f"{d}/loop.log", "--",
+                            "touch", mark], timeout=20, capture_output=True)
+        t("crash: admit that cannot make its room still runs the launch", (r.returncode, os.path.exists(mark)),
+          (0, True))
+        t("crash: …and its log says admission failed",
+          "admission failed for r/crash" in open(f"{d}/loop.log").read(), True)
+    finally:
+        admission.LOADAVG = old_loadavg
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        for k, v in keep.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(base, ignore_errors=True)
+    print(f"cc-room selfcheck: {n - bad} passed, {bad} failed")
+    return 1 if bad else 0
+
+
+def main(a):
+    if a[:1] == ["check"]:
+        w = why_not()
+        if w:
+            print(w)
+        return 1 if w else 0
+    if a[:1] == ["status"]:
+        status()
+        return 0
+    if a[:1] == ["selfcheck"]:
+        return selfcheck()
+    if a[:1] == ["admit"] and "--" in a:
+        i = a.index("--")
+        head, cmd = a[1:i], a[i + 1:]
+        log = None
+        if "--log" in head:
+            j = head.index("--log")
+            log = head[j + 1] if j + 1 < len(head) else None
+            head = head[:j] + head[j + 2:]
+        if len(head) == 1 and cmd:
+            admit(head[0], cmd, log)
+    print(__doc__.split("\n\n")[0], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception as e:   # a crash is 2, never 1: cc reads 1 as "queued" and only fails open on anything else
+        print(f"cc-room: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(2)

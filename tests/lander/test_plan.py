@@ -358,6 +358,30 @@ class Select(unittest.TestCase):
         self.assertEqual((p.checks, p.unowned, p.klass), (["check-sh"], ["home/CLAUDE.md"], T.WIDE))
         self.assertEqual(self.sel("core/bin/c").unowned, [])
 
+    def test_an_add_only_change_is_leaf_and_does_not_widen(self):
+        # owner 2026-09-28: a brand-new file that touches nothing existing is leaf, not the default set
+        p = P.select(self.m, ["library/new-tool"], added=["library/new-tool"])
+        self.assertEqual((p.checks, p.klass, p.extra["add_only"]), ([], T.LEAF, ["library/new-tool"]))
+        self.assertEqual(p.unowned, ["library/new-tool"])   # still named for the card
+        # under core/ the identity check owns it, so it still runs
+        p = P.select(self.m, ["core/bin/new-tool"], added=["core/bin/new-tool"])
+        self.assertEqual((p.checks, p.klass), (["identity"], T.LEAF))
+        # one modified file beside it: not add-only, so the unowned new path widens as before
+        p = P.select(self.m, ["library/new-tool", "core/bin/a"], added=["library/new-tool"])
+        self.assertEqual(p.klass, T.WIDE)
+        self.assertIn("check-sh", p.checks)
+        # a new file somewhere loaded by glob (a hook, a unit, a template, an agent) widens even when add-only
+        # (under core/ the identity check owns every path, so nothing there is unowned to begin with)
+        for f in ("home/new.md", "config/systemd-user/x.service", ".githooks/post-merge", ".github/workflows/x.yml",
+                  "skills/x/run.sh", "agents/x.md", "tests/new-case.sh",
+                  # read by name, not by place: every top-level file and every dotfile or dot-directory widens
+                  ".mcp.json", ".gitattributes", ".gitmodules", ".envrc", "Makefile", "library/.env", "library/.x/y"):
+            p = P.select(self.m, [f], added=[f])
+            self.assertIn("check-sh", p.checks, f)
+            self.assertNotIn("add_only", p.extra, f)
+        # the class lists still decide: an added file on the gate-first list is gate-first
+        self.assertEqual(P.select(self.m, ["core/bin/guard"], added=["core/bin/guard"]).klass, T.GATE_FIRST)
+
     def test_the_class_order_protected_lander_gate_first(self):
         self.assertEqual(self.sel("core/lander/plan.py", "core/bin/guard").klass, T.LANDER)
         self.assertEqual(self.sel("core/lander/plan.py", protected=["core/lander/**"]).klass, T.PROTECTED)
@@ -396,6 +420,19 @@ class PlanOnGit(unittest.TestCase):
         head = r.commit("rm")
         p = P.plan(r.root, r.base, head, P.changed(r.root, r.base, head))
         self.assertEqual(p.klass, T.LANDER)
+
+    def test_plan_sees_an_added_file_as_added_and_a_modified_one_as_not(self):
+        r = Repo(self)
+        head = r.commit("add", {"library/new-tool": "#!/bin/sh\n"})
+        p = P.plan(r.root, r.base, head, P.changed(r.root, r.base, head))
+        self.assertEqual((p.checks, p.klass), ([], T.LEAF))
+        head2 = r.commit("modify too", {"core/bin/c": "#!/bin/sh\necho\n"})
+        p = P.plan(r.root, r.base, head2, P.changed(r.root, r.base, head2))
+        self.assertEqual(p.klass, T.WIDE)
+        self.assertIn("check-sh", p.checks)
+        os.unlink(os.path.join(r.root, "core/bin/c"))
+        head3 = r.commit("delete")
+        self.assertEqual(P.added_files(r.root, head2, head3, ["core/bin/c"]), set())
 
     def test_plan_is_pure(self):
         r = Repo(self)

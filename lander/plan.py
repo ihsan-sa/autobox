@@ -12,12 +12,21 @@ SELECTION, per changed file:
   - a changed tool (a file under bin/, bin-private/ or core/bin/) also selects the non-static checks that own each
     of its direct callers in reach.tsv — one hop, never further.
   - a change to a manifest, policy or reach file selects the built-in manifest-widen check.
+  - ADD-ONLY (owner, 2026-09-28: "a brand-new standalone tool that nothing calls should be live in minutes"): a change
+    that only adds files, and modifies or deletes none, does not widen to default_checks for an unowned path, and is
+    leaf rather than wide — nothing that exists can break by a file appearing next to it. Every check that OWNS an
+    added path still runs, so under core/ the identity check (it owns core/**) runs as before, and the gate-first,
+    lander and protected lists still decide the class. Except a path in GLOB_LOADED: something picks a file up there
+    by its directory alone (a test runner, a hook, CI, units and environment.d, templates and instruction files,
+    agents, skills, settings), so a new file there runs or configures something, and it widens as before.
+    Plan.unowned still names every unowned path for the card; extra["add_only"] lists those that did not widen.
 Plan.checks holds what runs BEFORE the merge. Box-class checks run on main's tip after it and are listed in
 Plan.extra["tip"] instead — except for a gate-first change, which keeps them before the merge (owner, 2026-09-24).
 
 KLASS, first match wins: protected (a policy protected glob, or the caller's `protected` list — CC_PROTECTED_PATHS
 lives in the box's config, never in a tree) > lander (a policy lander glob, or the policy file itself) > gate-first
-> docs (every file prose) > wide (some path unowned) > leaf. paid: some file matches paid_review.
+> docs (every file prose) > wide (some path unowned, bar an add-only change's quiet ones) > leaf.
+paid: some file matches paid_review.
 
     lander plan [--repo DIR] [--manifest FILE] BASE [HEAD]    (no HEAD: the working copy; prints the Plan as JSON)
 """
@@ -37,6 +46,18 @@ NOT_PROSE = ("core/templates/**", "templates/**", "home/**", "core/config/**", "
              "**/REVIEW.md")
 
 
+GLOB_LOADED = ("tests/**", "core/tests/**", ".githooks/**", "core/.githooks/**", ".github/**", "core/.github/**",
+               "config/**", "core/config/**", "templates/**", "core/templates/**", "home/**", "**/agents/**",
+               "**/skills/**", "**/.claude/**", "slack/**", "core/slack/**")
+
+
+def loads_by_nothing(path: str) -> bool:
+    """A new file only stays quiet where nothing picks it up by place or by name. A top-level file (.mcp.json,
+    .gitattributes, .envrc) or any dotfile or dot-directory is read by a tool by name, so it widens like GLOB_LOADED."""
+    parts = path.split("/")
+    return len(parts) > 1 and not any(x.startswith(".") for x in parts) and not M.match(GLOB_LOADED, path)
+
+
 def is_prose(path: str) -> bool:
     """S10. Instruction files outrank the extension and the docs/ rule."""
     if M.match(NOT_PROSE, path):
@@ -51,8 +72,9 @@ def tool_name(path: str) -> str:
     return ""
 
 
-def select(m: M.Manifest, files: list, protected=()) -> T.Plan:
-    """The pure core of plan(), on an already-loaded manifest. Tests call this."""
+def select(m: M.Manifest, files: list, protected=(), added=()) -> T.Plan:
+    """The pure core of plan(), on an already-loaded manifest. Tests call this. added: the files in `files` that do
+    not exist at the base (plan() works it out); when every file is one, the change is add-only."""
     pol = m.policy
     names, tip, owned, unowned, reached = set(), set(), [], [], {}
     builtin = M.builtin_check()
@@ -86,7 +108,10 @@ def select(m: M.Manifest, files: list, protected=()) -> T.Plan:
                         reached.setdefault(n, f)
     names.update(reached)
     faults = list(m.faults)
-    if unowned:
+    add_only = bool(files) and set(files) <= set(added)
+    quiet = [f for f in unowned if add_only and loads_by_nothing(f)]
+    widening = [f for f in unowned if f not in quiet]
+    if widening:
         for n in pol.default:
             if n in m.checks or n == M.BUILTIN:
                 names.add(n)
@@ -102,7 +127,7 @@ def select(m: M.Manifest, files: list, protected=()) -> T.Plan:
         klass = T.GATE_FIRST
     elif files and all(is_prose(f) for f in files):
         klass = T.DOCS
-    elif unowned:
+    elif widening:
         klass = T.WIDE
     else:
         klass = T.LEAF
@@ -111,6 +136,8 @@ def select(m: M.Manifest, files: list, protected=()) -> T.Plan:
         tip = {n for n in names if n in m.checks and m.checks[n].klass == T.BOX}
         names -= tip
     extra = {"tip": sorted(tip), "reached": dict(sorted(reached.items()))}
+    if quiet:
+        extra["add_only"] = quiet
     if faults:
         extra["faults"] = faults
     return T.Plan(checks=sorted(names), owned=owned, unowned=unowned, klass=klass,
@@ -123,7 +150,31 @@ def plan(repo_root: str, base_sha: str, head_sha: str, files: list, protected=()
     for a repo that ships none."""
     base = M.load(repo_root, base_sha, fallback=fallback)
     head = M.load(repo_root, head_sha, fallback=fallback, strict=False)
-    return select(M.widen(base, head), list(files), protected)
+    return select(M.widen(base, head), list(files), protected, added_files(repo_root, base_sha, head_sha, files))
+
+
+def added_files(repo_root: str, base: str, head: str, files: list) -> set:
+    """The files that are not in base's tree and are in head's (head "" = the working copy). Git failing is the
+    empty set: a change is add-only only when git says so."""
+    import subprocess
+    files = list(files)
+    if not files:
+        return set()
+
+    def tree(rev):
+        p = subprocess.run(["git", "-C", repo_root, "ls-tree", "-r", "--name-only", rev, "--", *files],
+                           capture_output=True, text=True)
+        return set(p.stdout.splitlines()) if p.returncode == 0 else None
+    at_base = tree(base)
+    if at_base is None:
+        return set()
+    if head:
+        at_head = tree(head)
+        if at_head is None:
+            return set()
+    else:
+        at_head = {f for f in files if os.path.lexists(os.path.join(repo_root, f))}
+    return {f for f in files if f not in at_base and f in at_head}
 
 
 def changed(repo_root: str, base: str, head: str) -> list:

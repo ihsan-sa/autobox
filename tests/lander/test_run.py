@@ -351,11 +351,26 @@ class Admission(unittest.TestCase):
                 f.write(f"some avg10={v} avg60=0 avg300=0 total=1\nfull avg10=0 avg60=0 avg300=0 total=0\n")
         return d
 
+    def setUp(self):
+        # a calm load average of the case's own: the box's real one must never decide a case
+        self.calm_load = self.loadavg(0.0)
+        p = mock.patch.object(A, "LOADAVG", self.calm_load)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def loadavg(self, l1):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{l1} 0.00 0.00 1/1 1\n")
+        self.addCleanup(os.unlink, path)
+        return path
+
     def test_pressure_throttles_to_one_and_never_zero(self):
-        self.assertEqual(A.slots_now(self.psi_dir(1.0, 50.0), 3), 3)
-        self.assertEqual(A.slots_now(self.psi_dir(40.0, 50.0), 3), 1)
-        self.assertEqual(A.slots_now(self.psi_dir(1.0, 99.9), 3), 1)
-        self.assertEqual(A.slots_now(self.psi_dir(1.0, 1.0), 0), 1)
+        calm = self.calm_load
+        self.assertEqual(A.slots_now(self.psi_dir(1.0, 50.0), 3, calm), 3)
+        self.assertEqual(A.slots_now(self.psi_dir(40.0, 50.0), 3, calm), 1)
+        self.assertEqual(A.slots_now(self.psi_dir(1.0, 99.9), 3, calm), 1)
+        self.assertEqual(A.slots_now(self.psi_dir(1.0, 1.0), 0, calm), 1)
         self.assertEqual(A.psi("memory", "/nonexistent"), 0.0)
 
     def test_slots_admit_k_then_wait_and_alone_takes_them_all(self):
@@ -383,6 +398,35 @@ class Admission(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 with A.slot(st, psi_root=hot, k=3, poll=0.05, deadline=0.2):
                     pass
+
+    def test_high_load_serializes_and_the_one_slot_still_admits(self):
+        # the brief: "under a simulated high load a queued landing still starts" — one at a time, never none
+        n = os.cpu_count() or 1
+        calm_psi = self.psi_dir(0, 0)
+        hot, calm = self.loadavg(2.0 * n), self.loadavg(2.0 * n - 0.5)
+        self.assertIn(f"on {n} cores", A.overloaded(calm_psi, hot))
+        self.assertEqual(A.overloaded(calm_psi, calm), "")
+        self.assertEqual(A.slots_now(calm_psi, 3, hot), 1)
+        self.assertEqual(A.slots_now(calm_psi, 3, calm), 3)
+        self.assertEqual(A.overloaded(calm_psi, "/nonexistent"), "")
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        with A.slot(st, psi_root=calm_psi, k=3, loadavg=hot, deadline=1) as a:
+            self.assertEqual(a, [1])
+            with self.assertRaises(TimeoutError):
+                with A.slot(st, psi_root=calm_psi, k=3, loadavg=hot, poll=0.05, deadline=0.2):
+                    pass
+            with A.slot(st, psi_root=calm_psi, k=3, loadavg=calm, deadline=1) as b:
+                self.assertEqual(b, [2])
+
+    def test_a_busy_run_is_not_niced_down(self):
+        with mock.patch.object(A, "scope_available", return_value=True), \
+                mock.patch.object(A.shutil, "which", return_value="/usr/bin/ionice"):
+            argv, _ = A.wrap(chk(klass=T.HERMETIC), ["x"], busy=True)
+            self.assertNotIn("nice", argv)
+            self.assertEqual(argv[-4:], ["ionice", "-c2", "-n0", "x"])
+            argv, _ = A.wrap(chk(klass=T.HERMETIC), ["x"], busy=False)
+            self.assertEqual(argv[-4:], ["nice", "-n", "10", "x"])
 
     def test_wrap_puts_the_run_in_a_scope_and_nices_only_the_sandboxed(self):
         with mock.patch.object(A, "scope_available", return_value=True):
@@ -689,7 +733,7 @@ class Judge(unittest.TestCase):
                        "memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"})
         self.assertTrue(A.busy(d.name))
         self.assertFalse(A.loaded(d.name))
-        self.assertEqual(A.slots_now(d.name, k=3), 3)
+        self.assertEqual(A.slots_now(d.name, k=3, loadavg="/nonexistent"), 3)
         write(d.name, {"cpu": "some avg10=20.00 avg60=20.00 avg300=20.00 total=1\n"})
         self.assertFalse(A.busy(d.name))
 

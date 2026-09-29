@@ -1333,5 +1333,86 @@ class Branches(Fixture):
         self.assertEqual(J.repo_root("demo"), self.root)
 
 
+class SmallFirst(Fixture):
+    """A small PR waits for at most one check of a full suite, never the suite (owner, 2026-09-28: #779, one line
+    and a minute of checks, waited behind ~20 full-suite PRs). Here a plan of more than one check is heavy."""
+
+    def merged_order(self):
+        return [int(argv[2]) for argv in self.box()["merges"]]
+
+    def test_a_small_pr_queued_behind_a_full_suite_merges_first(self):
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})   # three checks: heavy
+        self.pr(2, {"docs/r.md": "n\n", "a/x2": "n\n"})           # one check: small
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        with mock.patch.object(L, "SMALL_CHECKS", 1):
+            _, lines = self.land()
+        self.assertEqual(self.merged_order(), [2, 1])
+        self.assertIn("[demo] PR #1 steps aside for PR #2 (0 of 3 checks done)", lines)
+        self.assertEqual((self.job(1).state, self.job(2).state), (T.DEPLOY_PENDING, T.DEPLOY_PENDING))
+
+    def test_with_no_heavy_plan_the_queue_keeps_its_order(self):
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
+        self.pr(2, {"docs/r.md": "n\n", "a/x2": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        with mock.patch.object(L, "SMALL_CHECKS", 3):              # three checks is still small: nobody steps aside
+            _, lines = self.land()
+        self.assertEqual(self.merged_order(), [1, 2])
+        self.assertFalse([ln for ln in lines if "steps aside" in ln])
+
+    def test_a_small_pr_queued_mid_suite_goes_in_after_the_running_check(self):
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
+        self.pr(2, {"a/x2": "n\n"})
+        J.submit("demo", 1)
+        hook = lambda name, n: J.submit("demo", 2) if n == 1 else None  # noqa: E731
+        with mock.patch.object(L, "SMALL_CHECKS", 1):
+            u, lines = self.land(runner=Runner(hook=hook))
+        self.assertEqual(self.merged_order(), [2, 1])
+        self.assertIn("[demo] PR #1 steps aside for a new request (1 of 3 checks done)", lines)
+        self.assertEqual([c[0] for c in u["runner"].calls][:2], ["a", "a"])   # #1's first check, then #2's only one
+        self.assertEqual(self.job(1).state, T.DEPLOY_PENDING)
+
+    def test_a_plan_with_the_full_suite_is_heavy_however_few_its_checks(self):
+        # one check, but it is check-sh (the whole suite): a count is not a cost
+        planner = Planner(owners={"check-sh": "a/", "b": "b/"})
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        _, lines = self.land(planner=planner)   # SMALL_CHECKS stays at its default of 5
+        self.assertEqual(self.merged_order(), [2, 1])
+        self.assertIn("[demo] PR #1 steps aside for PR #2 (0 of 1 checks done)", lines)
+        self.assertTrue(L.Lane.heavy(self.job(1)))
+        self.assertFalse(L.Lane.heavy(self.job(2)))
+
+    def test_a_heavy_pr_steps_aside_for_a_heavy_request_in_the_inbox_and_goes_first_after(self):
+        # the request lands in the inbox mid-suite: #1 steps aside once so it is drained and planned; #2 is heavy
+        # and behind, so it hands straight back and #1 finishes its suite first — the lane does not ping-pong
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
+        self.pr(2, {"b/y2": "n\n", "c/z2": "n\n"})
+        J.submit("demo", 1)
+        hook = lambda name, n: J.submit("demo", 2) if n == 1 else None  # noqa: E731
+        with mock.patch.object(L, "SMALL_CHECKS", 1):
+            u, lines = self.land(runner=Runner(hook=hook))
+        self.assertIn("[demo] PR #1 steps aside for a new request (1 of 3 checks done)", lines)
+        self.assertIn("[demo] PR #2 steps aside for PR #1 (0 of 2 checks done)", lines)
+        self.assertEqual(len([ln for ln in lines if "PR #1 steps aside" in ln]), 1)
+        self.assertEqual(self.merged_order(), [1, 2])
+        self.assertEqual([c[0] for c in u["runner"].calls][:3], ["a", "b", "c"])   # #1's whole suite, unbroken
+
+    def test_two_heavy_prs_keep_their_order(self):
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
+        self.pr(2, {"b/y2": "n\n", "c/z": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        with mock.patch.object(L, "SMALL_CHECKS", 1):
+            u, lines = self.land()
+        self.assertEqual(self.merged_order(), [1, 2])
+        # #2 is planned (that is how the lane learns it is heavy), then hands back before running any check
+        self.assertIn("[demo] PR #2 steps aside for PR #1 (0 of 2 checks done)", lines)
+        self.assertEqual([c[0] for c in u["runner"].calls][:2], ["a", "b"])   # #1's whole suite first
+
+
 if __name__ == "__main__":
     unittest.main()

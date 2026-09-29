@@ -19,6 +19,11 @@ checkout. `bin/cc-land` is the old name kept as a thin shim, so every caller tha
 3. **Run.** Hermetic checks run in bwrap on the merge tree, with no network and no tokens. A red check is compared
    with the same check on the base: red there too means main is red, and the PR waits as `blocked-by-main` without
    blame. Box-class checks (the ones that need tmux, systemd or live state) run on main's tip after the merge.
+   Under high load the box serializes rather than stalls: `core/lander/admission.py` (`overloaded()`) drops to one check
+   at a time, not niced down, and `cc-room` holds new `--go` worker starts on the same signal so the queue that is
+   already there keeps draining instead of growing. Small PRs go first: a PR whose plan has more than five checks
+   steps aside between its checks for a smaller one, so a leaf or docs PR waits for one check, not a whole suite
+   (`core/lander/lane.py`, SMALL FIRST).
 4. **Review.** A paid-review path with no recorded read at the change's digest gets one read. The verdict is
    `LAND` or `HANDBACK`, and a handback leaves the queue with the findings on the row.
 5. **Merge.** One merge lane per repo, `--squash --match-head-commit`. The board row closes and the approval card
