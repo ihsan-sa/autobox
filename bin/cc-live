@@ -19,6 +19,7 @@ WHAT IT READS, every refresh, and nothing else — each is a record the box alre
            OFFLINE; one whose pane printed nothing for 10 min is IDLE; otherwise working. `repo@alias` is an orch
            and is shown `alias@repo`, the name `cc` takes back; a name with `/` is a track or session, the rest seats.
            An offline track window (its session ended, the window left open) is only counted; `_` windows are skipped.
+  finished $CC_LANDER_STATE/jobs/*/results/*/*.json with a "runner" starting laptop: the last 5, by file mtime, shown in LAPTOP.
   laptop   `cc-suites status` (capped at 6 s; one line saying so if it does not answer) and the checks the lander has
            spilled there now: an `ssh … job CHECK TREE CAP RUN CWD` in /proc (run.laptop_argv), the lander keeps no file.
   limit    ~/.cc/state/reconcile.json `limit_until`, when it is still ahead: the usage limit is holding work.
@@ -174,6 +175,29 @@ def spilled(proc="/proc"):
         if len(argv) > 6 and os.path.basename(argv[0]) == "ssh" and argv[-6] == "job" and "BatchMode=yes" in argv:
             out.append(f"{argv[-5]} {argv[-4][:8]}")
     return sorted(out)
+
+
+def laptop_done(n=5, scan=300):
+    """The last n checks the laptop finished, newest first: (mtime, check, job dir, status). Stats every result file
+    (cheap), opens only the newest `scan` of them and stops at n laptop ones."""
+    files = []
+    for p in glob.glob(f"{land_dir()}/jobs/*/results/*/*.json"):
+        m = mtime(p)
+        if m:
+            files.append((m, p))
+    out = []
+    for m, p in sorted(files, reverse=True)[:scan]:
+        try:
+            d = json.load(open(p))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict) or not str(d.get("runner", "")).startswith("laptop"):
+            continue
+        parts = p.split("/")
+        out.append((m, str(d.get("check") or parts[-2]), parts[-4], str(d.get("status", "?"))))
+        if len(out) >= n:
+            break
+    return out
 
 
 def has_claude(pane_pid, table):
@@ -336,6 +360,11 @@ def frame(now=None, proc="/proc", width=120):
     out.append(f"  {laptop_line()}")
     sp = spilled(proc)
     out.append(f"  running there now ({len(sp)}): {', '.join(sp)}" if sp else "  nothing spilled there now")
+    done = laptop_done()
+    if done:
+        out.append("  last finished there:")
+        for m, chk, job, st in done:
+            out.append(f"    {time.strftime('%H:%M', time.localtime(m))}  {chk}  {job}  {st}")
     return out
 
 
@@ -483,6 +512,18 @@ def selfcheck():
     case("a selftest window is not listed", "_cctest1" not in txt)
     case("the LAPTOP section shows the runner's state line", "LAPTOP" in txt and "answers: free 3 cores=8 slots=4" in txt)
     case("a check spilled to the laptop is listed", "running there now (1): lint aaaaaaaa" in txt)
+    for i, (job, chk, runner, st) in enumerate([("r-1", "lint", "laptop:x", "passed"), ("r-2", "check", "box:h", "passed"),
+                                                ("r-3", "check", "laptop:x", "failed"), ("r-4", "lint", "laptop:x", "passed")]):
+        d = f"{tmp}/land/jobs/{job}/results/{chk}"
+        os.makedirs(d, exist_ok=True)
+        json.dump({"runner": runner, "status": st, "check": chk}, open(f"{d}/h{i}.json", "w"))
+        os.utime(f"{d}/h{i}.json", (now - 100 + i * 10, now - 100 + i * 10))
+    dn = laptop_done()
+    case("finished laptop checks: newest first, box ones skipped",
+         [(c, j, s_) for _, c, j, s_ in dn] == [("lint", "r-4", "passed"), ("check", "r-3", "failed"), ("lint", "r-1", "passed")])
+    case("laptop_done stops at n", len(laptop_done(2)) == 2)
+    case("the LAPTOP block lists them with time and result",
+         "    " + time.strftime("%H:%M", time.localtime(now - 70)) + "  lint  r-4  passed" in "\n".join(frame(now, f"{tmp}/proc")))
     os.environ["CC_LIVE_SUITES"] = f"{tmp}/bin/suites-hang"
     t0 = time.monotonic()
     case("a runner that hangs is one line, in bounded time",
