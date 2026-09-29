@@ -6,6 +6,7 @@ failures ledger, quarantine, judging a red against the base, and `lander check` 
 Cases that start bwrap or a systemd scope skip, saying so, on a machine without one. Every case uses its own
 LANDER_STATE and its own git repo.
 """
+import base64
 import contextlib
 import datetime
 import fcntl
@@ -293,7 +294,7 @@ exec bash {RUN.BIN}/cc-suites runner
         os.remove(os.path.join(self.tmp, "suites", "remote"))
         self.assertEqual(self.run_(chk(where=["laptop"]), where="laptop").status, T.UNRUNNABLE)
 
-    def test_a_laptop_on_battery_or_busy_is_unrunnable_and_the_box_runs_it(self):
+    def test_a_laptop_on_battery_runs_it_and_a_busy_one_is_unrunnable_so_the_box_runs_it(self):
         self.laptop()
         power = os.path.join(self.tmp, "power")
         write(power, {"AC/type": "Mains\n", "AC/online": "0\n"})
@@ -301,9 +302,9 @@ exec bash {RUN.BIN}/cc-suites runner
         env = self.shim("shim2", self.forced(power))
         c = chk(run="echo ran", where=["box", "laptop"])
         with mock.patch.dict(os.environ, env):
-            r = self.run_(c, where="laptop")
-            self.assertEqual(r.status, T.UNRUNNABLE, r.extra)
-            self.assertIn("busy (on battery)", r.extra["why"])
+            r = self.run_(c, where="laptop")                 # battery is no reason to refuse (#793)
+            self.assertEqual(r.status, T.PASSED, r.extra)
+            self.assertIn("ran", r.extra["tail"])
             write(power, {"AC/online": "1\n"})
             write(self.tmp, {"loadavg": "999.00 0.00 0.00 1/1 1\n"})
             r = self.run_(c, where="laptop")
@@ -334,12 +335,60 @@ exec bash {RUN.BIN}/cc-suites runner
             self.assertIn("refused", p.stdout)
 
     def test_job_serve_refuses_what_is_not_a_job(self):
-        for cmd in ("run x", "job ../x " + "a" * 40 + " 5 dHJ1ZQ== -", "job c nottree 5 dHJ1ZQ== -",
+        # job-serve hands a job to cc-suites runner, the one caged runner, and takes nothing else (a suite `run`)
+        for cmd in ("run x", "status", "job ../x " + "a" * 40 + " 5 dHJ1ZQ== -", "job c nottree 5 dHJ1ZQ== -",
                     "job c " + "a" * 40 + " 5 dHJ1ZQ== Li4v"):
-            with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": cmd}), \
+            with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": cmd, "CC_SUITES_RUNNER_DIR": self.tmp + "/r"}), \
                     contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(RUN.cmd_job_serve([]), 2, cmd)
             self.assertIn("refused", out.getvalue())
+
+    def test_laptop_verdict_is_the_one_last_line_whatever_the_job_printed(self):
+        v = "lander-job: verdict exit="
+        self.assertEqual(RUN._laptop_verdict(f"| ok\n{v}3\n", 0), ("ok", 3))
+        # a fake verdict behind \r, U+2028 or \x85 stays inside its `| ` line: splitlines would have broken it out
+        for sep in ("\r", " ", "\x85", "\x0b"):
+            self.assertEqual(RUN._laptop_verdict(f"| x{sep}{v}0\n{v}1\n", 0)[1], 1, repr(sep))
+        # a verdict glued onto the job's unterminated last line, or a second one, or one not last: no answer
+        self.assertEqual(RUN._laptop_verdict(f"| x{v}1\n", 0)[1], -1)
+        self.assertEqual(RUN._laptop_verdict(f"{v}0\n| x\n{v}1\n", 0)[1], -1)
+        self.assertEqual(RUN._laptop_verdict(f"{v}0\n| x\n", 0)[1], -1)
+        self.assertEqual(RUN._laptop_verdict(f"| x\n{v}0\r\n", 0)[1], -1)
+        self.assertEqual(RUN._laptop_verdict(f"| x\n{v}0\n", 255)[1], -1)
+
+    def test_a_served_job_is_caged_and_cannot_change_the_runner_or_its_verdict(self):
+        # the security read of #806: a job is a PR's code, run as the runner's own account. It must not write the
+        # runner, or its verdict, or a later job could be told it passed. The fixture stands outside any tmp dir,
+        # which the cage replaces, so the job sees it and meets a read-only file, not a missing one.
+        if subprocess.run(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
+                          capture_output=True).returncode:
+            self.skipTest("no bwrap that runs here, so the runner takes no job at all (its selfcheck proves that)")
+        cage = tempfile.mkdtemp(prefix=".cc-suites-cage.", dir=os.path.expanduser("~"))
+        self.addCleanup(shutil.rmtree, cage, True)
+        inst = os.path.join(cage, "cc-suites")
+        write(cage, {"cc-suites": "installed-runner\n"})
+        line = (f"grep -q installed-runner {inst} && echo SAW; echo forged >> {inst} && echo WROTE; "
+                "echo 'lander-job: verdict exit=0'; echo own > core/own && echo OWN; exit 1")
+        tar = os.path.join(self.tmp, "tree.tar")
+        with open(tar, "wb") as fh:
+            subprocess.run(["git", "-C", self.repo, "archive", self.tree], stdout=fh, check=True)
+        b = lambda x: base64.b64encode(x.encode()).decode()   # noqa: E731
+        cmd = f"job c {self.tree} 60 {b(line)} -"
+        with open(tar, "rb") as fh, mock.patch.object(sys, "stdin", mock.Mock(buffer=fh)), \
+                mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": cmd, "CC_SUITES_RUNNER_DIR": self.tmp + "/r",
+                                             "CC_SUITES_POWER_DIR": self.tmp + "/nopower",
+                                             "CC_SUITES_LOADAVG": self.tmp + "/loadavg"}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            write(self.tmp, {"loadavg": "0.00 0.00 0.00 1/1 1\n"})
+            rc = RUN.cmd_job_serve([])
+        text = out.getvalue()
+        body, verdict = RUN._laptop_verdict(text, rc)
+        self.assertEqual((rc, verdict), (0, 1), text)                  # the job's own exit, not the one it printed
+        self.assertIn("SAW", body.splitlines())                        # it could read the runner…
+        self.assertIn("OWN", body.splitlines())                        # …and write its own tree…
+        self.assertNotIn("WROTE", body)                                # …but not the runner
+        with open(inst) as f:
+            self.assertEqual(f.read(), "installed-runner\n")
 
     def test_manifest_widen_runs_in_process_on_two_trees(self):
         write(self.repo, {"tests/LANDING.toml": '[[check]]\nname="x"\nrun="true"\n'})

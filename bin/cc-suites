@@ -79,7 +79,9 @@
 # THE LAPTOP (laptop-setup). A WSL distro of its own (cc-suites), so its settings touch nothing the owner uses:
 # systemd on, Windows interop and the C: mount OFF (a process there cannot start a Windows program or read the
 # owner's files), its own Tailscale node, sshd taking only the key above, only from the tailnet, only as ccsuite.
-# A logon task keeps the distro running while the owner is logged in. Closed or asleep, the node drops off the
+# ccsuite owns nothing that decides what it runs or says: the runner, its home, .ssh and authorized_keys are root's,
+# its shell reads no rc file, and whatever it runs is caged (THE CAGE, below), so a PR's code cannot change a later
+# verdict. Each run of the script wipes and remakes that home, keeping its slots and maxload. A logon task keeps the distro running while the owner is logged in. Closed or asleep, the node drops off the
 # tailnet, `spill` answers 75 inside its connect timeout, and the box queues exactly as it did before.
 set -uo pipefail
 SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
@@ -268,6 +270,24 @@ runner_missing(){   # the needs this machine lacks, space-separated, or nothing
   done
   echo "${m# }"
 }
+# THE CAGE. What the runner runs is a PR's code, and it runs as the runner's own account, which also owns the
+# runner's state and whose next login reads its home. So every suite and job runs in bwrap: the whole machine
+# read-only, writable only in the directories named (its own scratch tree and HOME), with fresh /tmp, /var/tmp and
+# /run/user (no reaching this account's systemd --user or tmux, which would start things outside), RUNNER_DIR
+# (slots, maxload, other runs) hidden, and a pid namespace of its own that dies with the runner, so nothing it starts
+# outlives it, sees the runner, or signals it. It cannot write /usr/local/bin/cc-suites, the account's home or
+# authorized_keys, or any other run's tree, so it cannot change what a later run is told (2026-09-29, the security
+# read of #806). No bwrap that runs is `unfit`: nothing runs uncaged.
+# cage_argv DIR… sets CG to the bwrap prefix; the command follows it.
+cage_argv(){
+  CG=(bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /var/tmp)
+  [ ! -d /run/user ] || CG+=(--tmpfs /run/user)
+  CG+=(--tmpfs "$RUNNER_DIR")
+  local d; for d in "$@"; do CG+=(--bind "$d" "$d"); done
+  CG+=(--unshare-pid --unshare-ipc --die-with-parent --new-session --)
+}
+# the needs this machine lacks, the cage first: no override of the needs (CC_SUITES_*_NEEDS) drops bwrap
+needs_missing(){ local m; m=$(CC_SUITES_RUNNER_NEEDS=bwrap runner_missing); echo "$m${m:+ }$(CC_SUITES_RUNNER_NEEDS=$1 runner_missing)" | sed 's/ *$//'; }
 # Whether the machine is on battery (a Mains supply offline, or a Battery discharging; no power_supply info at all
 # counts as on AC, as in a WSL with none). Only status reports it; it never stops a run.
 # CC_SUITES_POWER_DIR: the selfcheck.
@@ -306,7 +326,7 @@ runner(){
   mkdir -p "$RUNNER_DIR"
   case ${a[0]:-} in
     status)
-      why=$(runner_missing); [ -z "$why" ] || { echo "unfit (missing: $why) $(runner_facts)"; return 0; }
+      why=$(needs_missing "${CC_SUITES_RUNNER_NEEDS:-$RUNNER_NEEDS}"); [ -z "$why" ] || { echo "unfit (missing: $why) $(runner_facts)"; return 0; }
       why=$(runner_unfit); [ -z "$why" ] || { echo "busy ($why) $(runner_facts)"; return 0; }
       i=0; for slot in $(seq 1 "$(runner_slots)"); do
         ( flock -n 9 ) 9>>"$RUNNER_DIR/slot.$slot" && i=$((i + 1)); done
@@ -327,29 +347,28 @@ runner(){
   done
   [ -n "${LK:-}" ] || { echo "cc-suite-runner: busy"; return 75; }
   why=$(runner_unfit); [ -z "$why" ] || { echo "cc-suite-runner: busy ($why)"; return 75; }   # changed since status
-  why=$(runner_missing); [ -z "$why" ] || { echo "cc-suite-runner: unfit (missing: $why)"; return 75; }
+  why=$(needs_missing "${CC_SUITES_RUNNER_NEEDS:-$RUNNER_NEEDS}"); [ -z "$why" ] || { echo "cc-suite-runner: unfit (missing: $why)"; return 75; }
   w=$(mktemp -d "$RUNNER_DIR/run.XXXXXX") || return 1
-  trap 'rc=$?; [ -z "$pg" ] || kill -TERM -- -"$pg" 2>/dev/null; sleep 1; [ -z "$pg" ] || kill -KILL -- -"$pg" 2>/dev/null; [ -z "$w" ] || rm -rf "$w" "$w.relay"; exit $rc' EXIT
+  trap 'rc=$?; [ -z "$pg" ] || kill -TERM -- -"$pg" 2>/dev/null; sleep 1; [ -z "$pg" ] || kill -KILL -- -"$pg" 2>/dev/null; [ -z "$w" ] || rm -rf "$w" "$w.home" "$w.relay"; exit $rc' EXIT
   trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
-  tar -x -C "$w" -f - --no-same-owner 2>/dev/null || { echo "cc-suite-runner: the tree did not unpack"; return 1; }
-  t=$(cd "$w" && git init -q && git add -A -f && git write-tree 2>/dev/null) || t=""
+  # nothing but this shell holds the slot's lock ($LK): every child below closes it, so none can outlive the run holding it
+  tar -x -C "$w" -f - --no-same-owner {LK}>&- 2>/dev/null || { echo "cc-suite-runner: the tree did not unpack"; return 1; }
+  t=$(exec {LK}>&-; cd "$w" && git init -q && git add -A -f && git write-tree 2>/dev/null) || t=""
   [ "$t" = "$tree" ] || { echo "cc-suite-runner: unpacked tree ${t:-none} is not $tree — refused"; return 1; }
-  ( cd "$w" && git -c user.name=cc-suites -c user.email=cc-suites@localhost commit -qm "tree $tree" --no-verify ) \
+  ( exec {LK}>&-; cd "$w" && git -c user.name=cc-suites -c user.email=cc-suites@localhost commit -qm "tree $tree" --no-verify ) \
     || { echo "cc-suite-runner: could not commit the tree"; return 1; }
   # WHAT A BOX HAS THAT A FRESH ACCOUNT DOES NOT, and the box half of the suite leans on: a tmux session `main` to
   # open windows in, and a ~/.local/bin/claude for the one window (`cc <repo>`) that starts it and must stay up.
-  # Every model call in the suite is stubbed by the suite itself (CC_CLAUDE); this stub only waits. Never on a
-  # machine that has a real one — the runner's account is its own. CC_SUITES_RUNNER_PREP=0 skips it (selfcheck).
-  if [ "${CC_SUITES_RUNNER_PREP:-1}" != 0 ]; then
-    [ -e "$HOME/.local/bin/claude" ] || { mkdir -p "$HOME/.local/bin" &&
-      printf '#!/bin/sh\n# cc-suites runner stub: the suite stubs every model call; this only keeps a window up\nexec sleep 3600\n' \
-        > "$HOME/.local/bin/claude" && chmod +x "$HOME/.local/bin/claude"; }
-  fi
-  # …on a tmux server of the runner's own (TMUX_TMPDIR, and no inherited $TMUX, which would beat it), so a window
-  # the suite opens carries this account's HOME and never lands in some other server's `main`.
-  unset TMUX; export TMUX_TMPDIR="$RUNNER_DIR/tmux"; mkdir -p "$TMUX_TMPDIR" && chmod 700 "$TMUX_TMPDIR"
-  [ "${CC_SUITES_RUNNER_PREP:-1}" = 0 ] || tmux has-session -t main 2>/dev/null ||
-    tmux new-session -d -s main -x 200 -y 50 2>/dev/null || true
+  # Every model call in the suite is stubbed by the suite itself (CC_CLAUDE); this stub only waits. Both are made
+  # INSIDE the cage, in a HOME of the run's own ($w.home) on a tmux server of its own, so a window the suite opens is
+  # caged too and goes with it. CC_SUITES_RUNNER_PREP=0 skips them (selfcheck).
+  local prep=""
+  mkdir -m 700 "$w.home" || return 1
+  [ "${CC_SUITES_RUNNER_PREP:-1}" = 0 ] || prep='mkdir -p "$HOME/.local/bin" "$TMUX_TMPDIR" && chmod 700 "$TMUX_TMPDIR"
+printf "#!/bin/sh\n# cc-suites runner stub: the suite stubs every model call; this only keeps a window up\nexec sleep 3600\n" >"$HOME/.local/bin/claude" && chmod +x "$HOME/.local/bin/claude"
+tmux new-session -d -s main -x 200 -y 50 2>/dev/null
+'
+  unset TMUX
   # A clean environment: nothing of this shell's, and CC_SELFTEST_HELD set so the suite takes no slot of its own —
   # this runner's slot is the one it runs in, and it dies with this runner. Lowest CPU and I/O priority, so the
   # owner's own work always goes first, and a wall-clock bound a little inside the box's, so it stops first.
@@ -359,11 +378,13 @@ runner(){
   # The suite writes into a fifo and nowhere else; the relay prefixes each of its lines `| `, so nothing the suite
   # prints can pass for a line of this runner's (the verdict).
   mkfifo -m 600 "$w.relay" || { echo "cc-suite-runner: no relay"; return 1; }
-  awk '{ print "| " $0; fflush() }' <"$w.relay" & rp=$!
-  ( cd "$w" && exec setsid env -i HOME="$HOME" USER="${USER:-$(id -un)}" LOGNAME="${USER:-$(id -un)}" \
-      PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TERM=dumb SHELL=/bin/bash TMUX_TMPDIR="$TMUX_TMPDIR" \
+  awk '{ print "| " $0; fflush() }' <"$w.relay" {LK}>&- & rp=$!
+  cage_argv "$w" "$w.home"
+  ( cd "$w" && exec setsid env -i HOME="$w.home" USER="${USER:-$(id -un)}" LOGNAME="${USER:-$(id -un)}" \
+      PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TERM=dumb SHELL=/bin/bash TMUX_TMPDIR="$w.home/tmux" \
       CC_SELFTEST_HELD=$$ CC_SUITE_PART="$([ "$part" = all ] || echo "$part")" CC_LAND_CHANGED="$changed" \
-      "${pre[@]}" bash "$w/$rel" ) </dev/null {LK}>&- >"$w.relay" 2>&1 & gp=$!; pg=$gp   # setsid: its pid is its group
+      "${pre[@]}" "${CG[@]}" bash -c "${prep}"'exec bash "$0"' "$w/$rel" ) </dev/null {LK}>&- >"$w.relay" 2>&1 &
+  gp=$!; pg=$gp   # setsid: its pid is its group
   rc=0; wait "$gp" || rc=$?; gp=""
   # The suite is done: whatever it left in its group goes now, before a verdict is printed (a child it left could
   # otherwise hold the stream open, or print after it). The relay gets 5 s to drain what is left of it, then goes too.
@@ -380,8 +401,8 @@ runner(){
 # The same refusals as a run — no slot or loaded is `cc-suite-runner: busy (…)`, exit 75, and the lander
 # reads any exit but 0 as no answer (unrunnable, never red) and runs the check on the box. Each job gets a directory
 # and a HOME of its own, proves the tree by write-tree, and both go when it ends. Its lines come back `| `-prefixed,
-# then `lander-job: verdict exit=N` (124 past CAP). It needs no bwrap of its own; a host check brings its own tmux
-# `main` in its line (run.py HOST_PREP).
+# then `lander-job: verdict exit=N` (124 past CAP). It runs in the cage (above), writable only in its own directory;
+# a host check brings its own tmux `main` in its line (run.py HOST_PREP), inside the cage.
 JOB_NEEDS="git tar timeout setsid nice"
 runner_job(){
   local name=${1:-} tree=${2:-} cap=${3:-} rb=${4:-} cb=${5:-} line cwd why slot j t rc
@@ -396,27 +417,31 @@ runner_job(){
   done
   [ -n "${LK:-}" ] || { echo "cc-suite-runner: busy"; return 75; }
   why=$(runner_unfit); [ -z "$why" ] || { echo "cc-suite-runner: busy ($why)"; return 75; }
-  why=$(CC_SUITES_RUNNER_NEEDS=${CC_SUITES_JOB_NEEDS:-$JOB_NEEDS} runner_missing)
+  why=$(needs_missing "${CC_SUITES_JOB_NEEDS:-$JOB_NEEDS}")
   [ -z "$why" ] || { echo "cc-suite-runner: unfit (missing: $why)"; return 75; }
   j=$(mktemp -d "$RUNNER_DIR/job.XXXXXX") || return 1; w=$j   # w: the EXIT trap removes it
-  trap 'rc=$?; [ -z "$pg" ] || kill -KILL -- -"$pg" 2>/dev/null; [ -z "$w" ] || rm -rf "$w"; exit $rc' EXIT
+  trap 'rc=$?; [ -z "$pg" ] || kill -KILL -- -"$pg" 2>/dev/null; [ -z "$w" ] || rm -rf "$w" "$w.log"; exit $rc' EXIT
   trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
   mkdir "$j/tree" "$j/home"
-  tar -x -C "$j/tree" -f - --no-same-owner 2>/dev/null || { echo "cc-suite-runner: the tree did not unpack"; return 1; }
+  tar -x -C "$j/tree" -f - --no-same-owner {LK}>&- 2>/dev/null || { echo "cc-suite-runner: the tree did not unpack"; return 1; }
   # the tar carries the box's one-commit repo; the tree is proved from the files, not from what it says
   rm -rf "$j/tree/.git"
-  t=$(cd "$j/tree" && git init -q && git add -A -f && git write-tree 2>/dev/null) || t=""
+  t=$(exec {LK}>&-; cd "$j/tree" && git init -q && git add -A -f && git write-tree 2>/dev/null) || t=""
   [ "$t" = "$tree" ] || { echo "cc-suite-runner: unpacked tree ${t:-none} is not $tree — refused"; return 1; }
-  ( cd "$j/tree" && git -c user.name=lander -c user.email=lander@localhost commit -qm tree --no-verify ) >/dev/null 2>&1
+  ( exec {LK}>&-; cd "$j/tree" && git -c user.name=lander -c user.email=lander@localhost commit -qm tree --no-verify ) >/dev/null 2>&1
   [ -d "$j/tree/$cwd" ] || { echo "cc-suite-runner: no $cwd in the tree"; return 1; }
   local -a pre=(timeout -k 10 "$cap" nice -n 19)
   command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
+  # the log is the runner's, outside the cage: the job reaches it only through the stdout it was handed
+  cage_argv "$j"
   ( cd "$j/tree/$cwd" && exec setsid env -i HOME="$j/home" USER="${USER:-$(id -un)}" PATH=/usr/local/bin:/usr/bin:/bin \
-      LANG=C.UTF-8 TERM=dumb TMPDIR="$j" CC_SELFTEST_SPILL=0 "${pre[@]}" /bin/sh -c "$line" ) \
-    </dev/null {LK}>&- >"$j/log" 2>&1 & gp=$!; pg=$gp
+      LANG=C.UTF-8 TERM=dumb TMPDIR="$j" CC_SELFTEST_SPILL=0 "${pre[@]}" "${CG[@]}" /bin/sh -c "$line" ) \
+    </dev/null {LK}>&- >"$j.log" 2>&1 & gp=$!; pg=$gp
   rc=0; wait "$gp" || rc=$?; gp=""
   kill -KILL -- -"$pg" 2>/dev/null; pg=""
-  sed 's/^/| /' "$j/log"
+  # every job line, an unterminated last one too, goes out prefixed and newline-ended, so no byte the job writes
+  # (a \r, a fake verdict, a missing final newline) can start a line of its own or glue onto the verdict below
+  LC_ALL=C awk '{ print "| " $0 }' "$j.log" {LK}>&-
   case $rc in 124|137) rc=124;; esac
   echo "lander-job: verdict exit=$rc"
   return 0
@@ -469,14 +494,35 @@ apt-get update -qq </dev/null   # nothing below may read stdin: it is this scrip
 apt-get install -y -qq git jq tmux python3 curl ca-certificates openssh-server util-linux bsdutils procps psmisc \\
   gawk bc sqlite3 file lsof shellcheck bubblewrap </dev/null >/dev/null
 command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
-id ccsuite >/dev/null 2>&1 || useradd -m -s /bin/bash ccsuite
+# The runner account can write nothing that decides what it runs or says: the runner, its home, its dotfiles and
+# authorized_keys are root's, its shell reads no rc file, and a suite or job it runs is caged (cc-suites, THE CAGE).
+# A runner set up before the cage ran PR code as this account, so its home is wiped and made again on every run,
+# keeping only its slots and maxload, and anything it left running or scheduled goes.
+id ccsuite >/dev/null 2>&1 || useradd -M -d /home/ccsuite -s /bin/sh ccsuite
+usermod -s /bin/sh ccsuite
+pkill -KILL -u ccsuite 2>/dev/null || true
+crontab -r -u ccsuite 2>/dev/null || true
+loginctl disable-linger ccsuite 2>/dev/null || true
+# slots and maxload are read as numbers, never copied: the old account could have made either (or the directory) a link
+# or a FIFO, and root following it would hand the account a root-only file or hang here.
+keep_slots=; keep_maxload=; r=/home/ccsuite/.cc-suite-runner
+if [ ! -L /home/ccsuite ] && [ ! -L "\$r" ] && [ -d "\$r" ]; then
+  for f in slots maxload; do
+    [ -f "\$r/\$f" ] && [ ! -L "\$r/\$f" ] || continue
+    v=\$(head -c 16 "\$r/\$f" 2>/dev/null | tr -d '[:space:]')
+    [[ \$v =~ ^[0-9]+(\.[0-9]+)?\$ ]] && printf -v "keep_\$f" %s "\$v"
+  done
+fi
+rm -rf /home/ccsuite
+install -d -m 755 -o root -g root /home/ccsuite /home/ccsuite/.ssh
+install -d -m 700 -o ccsuite -g ccsuite /home/ccsuite/.cc-suite-runner
+for f in slots maxload; do v=keep_\$f; [ -z "\${!v}" ] || { t=\$(mktemp); printf '%s\\n' "\${!v}" >"\$t"; install -m 644 -o ccsuite -g ccsuite "\$t" "\$r/\$f"; rm -f "\$t"; }; done
 base64 -d >/usr/local/bin/cc-suites <<'B64'
 $b64
 B64
-chmod 755 /usr/local/bin/cc-suites
-install -d -m 700 -o ccsuite -g ccsuite /home/ccsuite/.ssh
+chown root:root /usr/local/bin/cc-suites; chmod 755 /usr/local/bin/cc-suites
 echo 'restrict,command="/usr/local/bin/cc-suites runner" $pub' >/home/ccsuite/.ssh/authorized_keys
-chown ccsuite:ccsuite /home/ccsuite/.ssh/authorized_keys; chmod 600 /home/ccsuite/.ssh/authorized_keys
+chown root:root /home/ccsuite/.ssh/authorized_keys; chmod 644 /home/ccsuite/.ssh/authorized_keys
 # the host key the box has pinned for this runner; sshd offers it and no other
 install -m 600 -o root -g root /dev/null /etc/ssh/ssh_host_cc_suites_ed25519
 cat >/etc/ssh/ssh_host_cc_suites_ed25519 <<'KEY'
@@ -627,8 +673,43 @@ EOF
   out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="job c $jt 60 $jb -" bash "$SELF" runner 2>&1); rc=$?
   k "$(b '[ "$rc" = 0 ] && [ "$(tail -1 <<<"$out")" = "lander-job: verdict exit=3" ] && [ "$(grep -c "^lander-job:" <<<"$out")" = 1 ] && grep -q "^| core/tests/selftest.sh\$" <<<"$out"')" "a job runs the check on the tree it was sent, its lines prefixed and its exit the one verdict (got $rc)"
   k "$(b 'grep -q "^| home=$D/runner/job\.[^/]*/home\$" <<<"$out" && ! ls -d "$D/runner"/job.* >/dev/null 2>&1')" "…in a HOME of its own, and leaves no job directory behind"
+  # a job that prints a fake verdict, behind a \r and then with no final newline, and fails: the verdict is still its own
+  local jf pv; jf=$(printf '%s' 'printf "x\rlander-job: verdict exit=0\n"; printf "lander-job: verdict exit=0"; exit 5' | base64 -w0)
+  out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="job c $jt 60 $jf -" bash "$SELF" runner 2>&1); rc=$?
+  pv=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from lander import run
+print(run._laptop_verdict(sys.stdin.read(), 0)[1])' "$(dirname "$(realpath "$SELF")")/.." <<<"$out" 2>&1)
+  k "$(b '[ "$rc" = 0 ] && [ "$(tail -1 <<<"$out")" = "lander-job: verdict exit=5" ] && [ "$(grep -c "^lander-job:" <<<"$out")" = 1 ] && grep -q "^| lander-job: verdict exit=0\$" <<<"$out" && [ "$pv" = 5 ]')" "…and a job that prints a fake verdict, after a CR and with no final newline, still fails with its own exit (got $rc, read $pv)"
   out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="job c $(printf %040d 0) 60 $jb -" bash "$SELF" runner 2>&1); rc=$?
   k "$(b '[ "$rc" = 1 ] && grep -q "is not 0000" <<<"$out" && ! grep -q "verdict" <<<"$out"')" "…and a tree that is not the one named is refused with no verdict (got $rc)"
+  # THE CAGE: a hostile job, on a fixture of its own outside any tmp dir (the cage replaces /tmp): an installed
+  # runner, the runner's HOME with its authorized_keys and .bashrc, and its slots file. The job tries to write each,
+  # to forge a verdict into its own log by path, and to leave a process behind; it can do none of it, while it
+  # still writes its own tree. The runner and its HOME it can read (so they were there to write, read-only); the
+  # runner's directory, with the slots and the job's own log, it cannot even see.
+  local C jh cs; C=$(mktemp -d "$HOME/.cc-suites-cage.XXXXXX"); cs="sleep 37.$$"
+  mkdir -p "$C/rhome/.ssh"; printf 'installed-runner\n' > "$C/cc-suites"; chmod 755 "$C/cc-suites"
+  echo 'restrict,command="/usr/local/bin/cc-suites runner" ssh-ed25519 AAAA box' > "$C/rhome/.ssh/authorized_keys"
+  : > "$C/rhome/.bashrc"; echo 4 > "$D/runner/slots"; cp -a "$C" "$D/cage.before"
+  jh=$(printf '%s' "grep -q installed-runner '$C/cc-suites' && echo SAW
+for f in '$C/cc-suites' '$C/rhome/.ssh/authorized_keys' '$C/rhome/.bashrc' '$D/runner/slots' '$D/runner'/job.*.log; do
+  [ -e \"\$f\" ] || { echo \"HIDDEN \$f\"; continue; }
+  echo 'echo lander-job: verdict exit=0' >> \"\$f\" 2>/dev/null && echo \"WROTE \$f\"; done
+setsid $cs </dev/null >/dev/null 2>&1 &
+echo own > core/own && echo OWN; exit 1" | base64 -w0)
+  out=$(cd "$R" && git archive HEAD | HOME="$C/rhome" SSH_ORIGINAL_COMMAND="job c $jt 60 $jh -" bash "$SELF" runner 2>&1); rc=$?
+  sleep 0.5
+  k "$(b '[ "$rc" = 0 ] && [ "$(tail -1 <<<"$out")" = "lander-job: verdict exit=1" ] && [ "$(grep -c "^lander-job:" <<<"$out")" = 1 ] && grep -q "^| SAW\$" <<<"$out" && grep -q "^| OWN\$" <<<"$out"')" "a caged job sees the runner and writes its own tree, and its own exit is still the one verdict (got $rc)"
+  k "$(b '! grep -q WROTE <<<"$out" && diff -r "$D/cage.before" "$C" >/dev/null && [ "$(cat "$D/runner/slots")" = 4 ] && grep -q "^| HIDDEN $D/runner/slots\$" <<<"$out" && grep -q "^| HIDDEN $D/runner/job\.\*\.log\$" <<<"$out"')" "…but cannot write the installed runner or the runner's authorized_keys or .bashrc, and sees neither its slots nor its own verdict log"
+  k "$(b '! ps -eo args= | grep -qx "$cs"')" "…and nothing it started outlives it"
+  out=$(bash "$SELF" status 2>&1)
+  k "$(b 'grep -q "answers: free 4 " <<<"$out"')" "…nor holds its slot: status answers every slot free after it (got: ${out%% cores=*})"
+  pkill -KILL -x -f "$cs" 2>/dev/null; rm -rf "$C" "$D/cage.before" "$D/runner/slots"
+  # …and a machine whose bwrap does not run takes no job, whatever the needs are set to: nothing runs uncaged
+  mkdir -p "$D/nobw"; printf '#!/bin/sh\nexit 1\n' > "$D/nobw/bwrap"; chmod +x "$D/nobw/bwrap"
+  out=$(cd "$R" && git archive HEAD | PATH="$D/nobw:$PATH" CC_SUITES_JOB_NEEDS=git SSH_ORIGINAL_COMMAND="job c $jt 60 $jb -" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q "unfit (missing: bwrap(does-not-run))" <<<"$out" && ! grep -q "verdict\|home=" <<<"$out"')" "a runner whose bwrap does not run answers unfit to a job, 75, and runs nothing (got $rc)"
+  out=$(cd "$R" && git archive HEAD | PATH="$D/nobw:$PATH" SSH_ORIGINAL_COMMAND="run core/tests/selftest.sh $tree all -" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q "unfit (missing: bwrap(does-not-run))" <<<"$out" && ! grep -q "suite ran" <<<"$out"')" "…and to a suite, though the needs this selfcheck sets leave bwrap out (got $rc)"
   pw AC Mains online 0
   out=$(bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
   k "$(b '[ "$rc" != 75 ] && grep -q '\''suite ran'\'' <<<"$out"')" "on battery (the Mains supply offline): spill still runs (got $rc)"
@@ -752,6 +833,9 @@ EOF
   k "$(b 'grep -qF "restrict,command=\"/usr/local/bin/cc-suites runner\" $(cat "$D/sd/id_ed25519.pub")" <<<"$out"')" "…and its script pins that key to the runner, restricted"
   k "$(b 'awk "/^base64 -d/{f=1;next} /^B64\$/{f=0} f" <<<"$out" | base64 -d | cmp -s - "$SELF"')" "…and carries this file byte for byte"
   k "$(b 'grep -q "bubblewrap" <<<"$out"')" "…installs bwrap, which the suite's sandbox cases run"
+  # …and leaves the runner account nothing of its own to rewrite: the runner, the home, .ssh and authorized_keys root's
+  k "$(b 'grep -qx "chown root:root /usr/local/bin/cc-suites; chmod 755 /usr/local/bin/cc-suites" <<<"$out" && grep -qx "install -d -m 755 -o root -g root /home/ccsuite /home/ccsuite/.ssh" <<<"$out" && grep -qx "chown root:root /home/ccsuite/.ssh/authorized_keys; chmod 644 /home/ccsuite/.ssh/authorized_keys" <<<"$out" && ! grep -q "chown ccsuite\|-o ccsuite -g ccsuite /home/ccsuite/.ssh\|useradd -m" <<<"$out"')" "…makes the runner, the runner account's home, .ssh and authorized_keys root's, never the account's"
+  k "$(b 'grep -qx "usermod -s /bin/sh ccsuite" <<<"$out" && grep -qx "pkill -KILL -u ccsuite 2>/dev/null || true" <<<"$out" && grep -qx "rm -rf /home/ccsuite" <<<"$out" && grep -qx "keep_slots=; keep_maxload=; r=/home/ccsuite/.cc-suite-runner" <<<"$out" && ! grep -q "cp /home/ccsuite" <<<"$out"')" "…and wipes what an uncaged run could have left there (its processes, its home) but keeps its slots and maxload"
   k "$(b 'grep -q '\''^enabled=false'\'' <<<"$out" && grep -q '\''AllowUsers ccsuite@100.64.0.0/10'\'' <<<"$out"')" "…with interop and the C: mount off, and sshd for ccsuite from the tailnet only"
   awk "/^cat >\/etc\/ssh\/ssh_host_cc_suites_ed25519/{f=1;next} /^KEY\$/{f=0} f" <<<"$out" > "$D/hk"; chmod 600 "$D/hk"
   k "$(b '[ "$(cat "$D/sd/known_hosts")" = "my-node $(ssh-keygen -y -f "$D/hk" | cut -d" " -f1,2)" ] && grep -q "^HostKey /etc/ssh/ssh_host_cc_suites_ed25519" <<<"$out"')" "…and pins a host key of its own making: known here for my-node, installed there as sshd's only one"

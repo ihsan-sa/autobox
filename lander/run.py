@@ -14,8 +14,9 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
            destination and the pinned host key in ~/.cc/suites (CC_SUITES_DIR: id_ed25519, remote, known_hosts,
            StrictHostKeyChecking=yes), so the laptop is configured exactly when cc-suites' runner is, and a destination known_hosts does not name is refused
            before ssh starts. The tree goes to the runner's `job` form (`cc-suites runner`, the key's forced command),
-           which unpacks it into a fresh directory with a fresh HOME per job, proves it by write-tree, runs it and
-           removes both; `lander job-serve` is the same end in Python. Busy, on battery, unfit or not answering is
+           which unpacks it into a fresh directory with a fresh HOME per job, proves it by write-tree, runs it caged
+           (writable only in that directory; cc-suites, THE CAGE) and removes both; `lander job-serve` hands
+           the same job to it. Busy, unfit or not answering is
            unrunnable there, never red, and judge() then runs the check on the box. A host check's line goes with
            HOST_PREP in front: what a box has and a fresh account does not (a tmux session `main`, of a server of
            the job's own, and a waiting ~/.local/bin/claude), as `cc-suites runner` gives a whole suite, so the
@@ -361,62 +362,33 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
 
 def _laptop_verdict(text: str, rc: int) -> tuple:
     """job-serve relays the check's lines as `| …` and ends `lander-job: verdict exit=N`; anything else is no
-    answer (-1: unrunnable)."""
-    lines = text.splitlines()
-    got = [ln for ln in lines if ln.startswith("lander-job: verdict exit=")]
+    answer (-1: unrunnable). The runner ends every relayed line with a newline, so the split is on "\n" alone (not
+    splitlines, which also breaks on \r, \x0b, \x85, \u2028…), and the verdict is the one such line and the last."""
+    lines = text.split("\n")
     body = "\n".join(ln[2:] for ln in lines if ln.startswith("| "))
-    if rc != 0 or len(got) != 1:
-        refused = next((ln for ln in lines if not ln.startswith("| ")), "no answer")
+    got = [ln for ln in lines if "lander-job: verdict" in ln and not ln.startswith("| ")]
+    last = next((ln for ln in reversed(lines) if ln.strip()), "")
+    m = re.fullmatch(r"lander-job: verdict exit=([0-9]{1,3})", last)
+    if rc != 0 or len(got) != 1 or not m:
+        refused = next((ln for ln in lines if ln.strip() and not ln.startswith("| ")), "no answer")
         return f"laptop refused or did not answer: {refused[:200]}\n{body}", -1
-    return body, int(got[0].rsplit("=", 1)[1])
+    return body, int(m.group(1))
 
 
 # --- the laptop's end ----------------------------------------------------------------------------------------------
 
 def cmd_job_serve(argv):
-    """The laptop's forced command: `job CHECK TREE CAP RUN_B64 CWD_B64` from SSH_ORIGINAL_COMMAND (or argv), the
-    tree as a tar on stdin. Every job gets a fresh directory and a fresh HOME, both removed after."""
-    a = (os.environ.get("SSH_ORIGINAL_COMMAND") or " ".join(argv)).split()
-    if len(a) != 6 or a[0] != "job" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", a[1]) \
-            or not re.fullmatch(r"[0-9a-f]{40}", a[2]) or not a[3].isdigit():
+    """The laptop's forced command in Python: `job CHECK TREE CAP RUN_B64 CWD_B64` from SSH_ORIGINAL_COMMAND (or
+    argv), the tree as a tar on stdin. It hands the job to `cc-suites runner` and takes nothing else, so a job has one
+    runner and one cage: its own directory writable, the runner and its account read-only (cc-suites, THE CAGE)."""
+    cmd = os.environ.get("SSH_ORIGINAL_COMMAND") or " ".join(argv)
+    if cmd.split()[:1] != ["job"]:
         print("lander-job: refused: job CHECK TREE CAP RUN_B64 CWD_B64")
         return 2
-    try:
-        run_line = base64.b64decode(a[4], validate=True).decode()
-        cwd = base64.b64decode(a[5], validate=True).decode() if a[5] != "-" else ""
-    except (ValueError, UnicodeDecodeError):
-        print("lander-job: refused: bad encoding")
-        return 2
-    if cwd.startswith("/") or ".." in cwd.split("/"):
-        print("lander-job: refused: cwd leaves the tree")
-        return 2
-    job = tempfile.mkdtemp(prefix="lander-job.")
-    try:
-        work, home = os.path.join(job, "tree"), os.path.join(job, "home")
-        os.mkdir(work)
-        os.mkdir(home)
-        if subprocess.run(["tar", "-x", "-C", work, "-f", "-", "--no-same-owner"], stdin=sys.stdin.buffer).returncode:
-            print("lander-job: refused: the tree did not unpack")
-            return 1
-        g = ["git", "-C", work, "-c", "user.name=lander", "-c", "user.email=lander@localhost"]
-        # the tar carries the box's one-commit repo; the tree is proved from the files, not from what it says
-        shutil.rmtree(os.path.join(work, ".git"), ignore_errors=True)
-        subprocess.run(g + ["init", "-q"], capture_output=True)
-        subprocess.run(g + ["add", "-A", "-f"], capture_output=True)
-        if subprocess.run(g + ["write-tree"], capture_output=True, text=True).stdout.strip() != a[2]:
-            print("lander-job: refused: the unpacked tree is not the one named")
-            return 1
-        subprocess.run(g + ["commit", "-qm", "tree", "--no-verify"], capture_output=True)
-        env = {"HOME": home, "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "TERM": "dumb",
-               "TMPDIR": job, "USER": os.environ.get("USER", "lander"), "CC_SELFTEST_SPILL": "0"}
-        log = os.path.join(job, "log")
-        rc, _, _, capped = execute(["/bin/sh", "-c", run_line], os.path.join(work, cwd), env, int(a[3]), log)
-        for ln in read_log(log).splitlines():
-            print("| " + ln)
-        print(f"lander-job: verdict exit={124 if capped else rc}")
-        return 0
-    finally:
-        shutil.rmtree(job, ignore_errors=True)
+    p = subprocess.run(["bash", os.path.join(BIN, "cc-suites"), "runner"], stdin=sys.stdin.buffer,
+                       stdout=subprocess.PIPE, env={**os.environ, "SSH_ORIGINAL_COMMAND": cmd})
+    sys.stdout.write(p.stdout.decode(errors="replace"))
+    return p.returncode
 
 
 # --- judging a red -------------------------------------------------------------------------------------------------
@@ -445,7 +417,7 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
         # must never overturn a box red
         nonlocal where
         r = runner(check, tree, where, alone=alone, **kw)
-        # a laptop that cannot take it (busy, on battery, gone) is no answer: the box runs it, as cc-suites spill did
+        # a laptop that cannot take it (busy, gone) is no answer: the box runs it, as cc-suites spill did
         if where == "laptop" and r.status == T.UNRUNNABLE and "box" in check.where:
             why = r.extra.get("why", "")
             r = runner(check, tree, "box", alone=alone, **kw)
@@ -563,4 +535,4 @@ def quarantine_text(repo_root: str, rev: str) -> str:
     return "\n".join(t for t in (M.read_at(repo_root, rev, p + REC.QUARANTINE) for p in M.PREFIXES) if t)
 
 
-COMMANDS = {"job-serve": (cmd_job_serve, "the laptop's end of a spilled check: one job, fresh HOME, removed after")}
+COMMANDS = {"job-serve": (cmd_job_serve, "the laptop's end of a spilled check: hands one job to cc-suites runner, caged")}
