@@ -318,7 +318,7 @@ def ask(text, repo, pr, digest, model=None):
     why starting 'wall' is the read's own budget cap; any other None is a read that answered nothing."""
     model = model or C.conf("CC_LAND_REVIEW_MODEL", MODEL)
     # The prompt goes on stdin: one argv over 128 KiB is refused by the kernel (E2BIG), and most diffs pass that.
-    argv = [C.conf("CC_CLAUDE", os.path.expanduser("~/.local/bin/claude")), "-p", "--model", model,
+    argv = [C.conf("CC_CLAUDE", os.path.join(C.PASSWD_HOME, ".local", "bin", "claude")), "-p", "--model", model,
             "--effort", "medium", "--max-budget-usd", C.conf("CC_LAND_REVIEW_BUDGET", "3"),
             "--output-format", "json", "--json-schema", json.dumps(SCHEMA),
             "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands", "--tools", ""]

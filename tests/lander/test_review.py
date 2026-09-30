@@ -85,9 +85,14 @@ class Case(unittest.TestCase):
             os.environ[k] = os.path.join(self.tmp, sub)
         os.environ["CC_CONFIG"] = os.path.join(self.tmp, "config")
         self.real_sh = C.sh
+        # the reviewer keys come from the passwd home's config, never the box's real one in a test
+        self.real_reviewer = (C.REVIEWER_CONFIG, C.PASSWD_HOME)
+        C.PASSWD_HOME = os.path.join(self.tmp, "home")
+        C.REVIEWER_CONFIG = os.path.join(C.PASSWD_HOME, ".cc", "config")
 
     def tearDown(self):
         C.sh = self.real_sh
+        C.REVIEWER_CONFIG, C.PASSWD_HOME = self.real_reviewer
         for k, v in self.env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -205,6 +210,45 @@ class TestReview(Case):
         posted = box.called("gh pr comment")[0]["input"]
         self.assertIn(f"change={j.digest}", posted)
         self.assertEqual(R.saved(j.digest).advisory, ["x.py — name it better"])
+
+    def test_the_reviewer_is_the_passwd_homes_config_not_the_callers_env(self):
+        # `CC_CLAUDE=<fake> lander tick` from a worker's script, or a HOME / CC_CONFIG of its own, chooses nothing
+        own = os.path.join(self.tmp, "own")
+        os.makedirs(os.path.join(own, ".cc"))
+        with open(os.path.join(own, ".cc", "config"), "w") as f:
+            f.write("CC_CLAUDE=/tmp/own-claude\nCC_LAND_REVIEW_MODEL=haiku\nCC_LAND_REVIEW_BUDGET=0.01\n")
+        with open(os.environ["CC_CONFIG"], "w") as f:
+            f.write("CC_CLAUDE=/tmp/cfg-claude\nCC_LAND_REVIEW_MODEL=haiku\nCC_DEV=/tmp/kept\n")
+        chosen = {"CC_CLAUDE": "/tmp/fake-claude", "CC_LAND_REVIEW_MODEL": "haiku", "CC_LAND_REVIEW_BUDGET": "0.01",
+                  "CC_CODEX": "/tmp/fake-codex", "HOME": own}
+        old = {k: os.environ.get(k) for k in chosen}
+        os.environ.update(chosen)
+        try:
+            box = self.box(claude=claude_says("LAND"))
+            R.review(self.job(), comments=[])
+            argv = box.called("claude")[0]["argv"]
+            # nothing in the reviewer config: the defaults, and claude under the passwd home, not $HOME
+            self.assertEqual(argv[0], os.path.join(C.PASSWD_HOME, ".local", "bin", "claude"))
+            self.assertEqual(argv[argv.index("--model") + 1], R.MODEL)
+            self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "3")
+            self.assertEqual(C.conf("CC_CODEX", "codex"), "codex")
+            # a key that picks no reviewer still reads the environment and CC_CONFIG as before
+            self.assertEqual(C.conf("CC_DEV"), "/tmp/kept")
+            # the reviewer config at the passwd home is what speaks
+            os.makedirs(os.path.dirname(C.REVIEWER_CONFIG))
+            with open(C.REVIEWER_CONFIG, "w") as f:
+                f.write("CC_CLAUDE=/opt/claude\nexport CC_LAND_REVIEW_MODEL='opus'\nCC_LAND_REVIEW_BUDGET=5\n")
+            box = self.box(claude=claude_says("LAND"))
+            R.ask("text", "demo", 7, "d" * 64)
+            argv = box.called("claude")[0]["argv"]
+            self.assertEqual((argv[0], argv[argv.index("--model") + 1], argv[argv.index("--max-budget-usd") + 1]),
+                             ("/opt/claude", "opus", "5"))
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def test_a_big_diff_goes_on_stdin_cut_never_into_argv(self):
         big = DIFF + "+x\n" * 200_000

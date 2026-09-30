@@ -28,6 +28,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import pwd
 import re
 import subprocess
 import time
@@ -58,11 +59,34 @@ def state(*parts):
     return os.path.join(root, *parts)
 
 
+def _passwd_home():
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:   # no passwd entry: no config and no default claude, never one a caller's HOME names
+        return "/nonexistent"
+
+
+# WHO REVIEWS A LANDING IS THE CONFIG FILE'S, NOT THE CALLER'S (security read of #849). The keys that pick the
+# review's model, budget, effort, reviewers and binary are read from the config at the passwd home and nowhere else:
+# not the environment, not HOME, not CC_CONFIG, so `CC_CLAUDE=<a fake that writes LAND> lander tick` from a worker's
+# script chooses nothing. Tests patch REVIEWER_CONFIG (and PASSWD_HOME); no env var moves either.
+PASSWD_HOME = _passwd_home()
+REVIEWER_CONFIG = os.path.join(PASSWD_HOME, ".cc", "config")
+
+
+def reviewer_key(key):
+    return key.startswith("CC_LAND_REVIEW") or key in ("CC_CLAUDE", "CC_CODEX")
+
+
 def conf(key, default=""):
-    """A box setting: the environment first, then ~/.cc/config (KEY=value lines), then the default."""
-    if key in os.environ:
+    """A box setting: the environment first, then ~/.cc/config (KEY=value lines), then the default. A reviewer_key
+    comes from REVIEWER_CONFIG only."""
+    if reviewer_key(key):
+        path = REVIEWER_CONFIG
+    elif key in os.environ:
         return os.environ[key]
-    path = os.environ.get("CC_CONFIG") or os.path.expanduser("~/.cc/config")
+    else:
+        path = os.environ.get("CC_CONFIG") or os.path.expanduser("~/.cc/config")
     try:
         with open(path) as f:
             for ln in f:

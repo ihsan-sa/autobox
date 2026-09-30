@@ -1451,6 +1451,21 @@ class Branches(Fixture):
         self.assertEqual(started[0][0][-3:], ["tick", "--repo", "demo"])
         self.assertTrue(started[0][0][2].endswith(os.path.join("lander", "cli.py")))
 
+    def test_spawn_tick_drops_the_reviewer_keys(self):
+        # a worker's `CC_CLAUDE=<fake> cc done` must not reach the review the tick runs (security read of #847)
+        started = []
+        fake = mock.Mock(side_effect=lambda argv, **kw: started.append((argv, kw)) or mock.Mock(pid=9))
+        chosen = {"CC_CLAUDE": "/tmp/fake-claude", "CC_CODEX": "/tmp/fake-codex", "CC_CONFIG": "/tmp/own-config",
+                  "CC_LAND_REVIEW_MODEL": "haiku", "CC_LAND_REVIEW_BUDGET": "0.01", "CC_LAND_REVIEW_EFFORT": "low",
+                  "CC_LAND_REVIEWERS": "none"}
+        with mock.patch.dict(os.environ, dict(chosen, CC_CLAUDE_HOME="/tmp/kept", CC_STATE="/tmp/kept-state")), \
+                mock.patch.object(L.subprocess, "Popen", fake):
+            self.assertEqual(REAL_SPAWN_TICK("demo"), (True, "pid 9"))
+        env = started[0][1]["env"]
+        self.assertEqual([k for k in chosen if k in env], [])
+        self.assertEqual((env.get("CC_CLAUDE_HOME"), env.get("CC_STATE")), ("/tmp/kept", "/tmp/kept-state"))
+        self.assertEqual(env.get("PYTHONDONTWRITEBYTECODE"), "1")
+
     def test_usage_refusals(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(TK.cmd_tick(["--bogus"]), 2)

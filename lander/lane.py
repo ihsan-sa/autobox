@@ -14,7 +14,8 @@ is the owner's own uid (SLACK_OWNER_ID): `refused <repo>#<pr> protected:<file>`,
 head gh cannot name refuses); the inbox request carries no approval, because anyone may write the inbox and drain
 takes only chat/ts/who from it. The request goes to the inbox (jobs.submit); `queued` is logged only for a PR
 with no job yet (drain logs `again` or `requeued` for the rest, so `times` is not restarted). A paused project keeps the request and says so (exit 0); --no-start
-says where it waits (exit 0); otherwise `lander tick --repo <repo>` is started detached, and a start that fails is
+says where it waits (exit 0); otherwise `lander tick --repo <repo>` is started detached (without the caller's
+CC_LAND_REVIEW*, CC_CLAUDE, CC_CODEX or CC_CONFIG: tick_env), and a start that fails is
 exit 1 "queued, but…". `queue --task` is the old queue_task unchanged: `cc done <repo> <row> --json`, `cc lands`
 0 queue / 1 approval / 2 refused, anything else failed; the receipt (with `landing`) is the one line on stdout.
 
@@ -988,12 +989,24 @@ def spawn_lane(repo, release):
         return False, str(e)
 
 
+# WHO REVIEWS A LANDING IS NOT THE QUEUER'S TO CHOOSE (security read of #847). `cc done` in a worker's shell
+# queues, and queue starts the tick below, which runs the lane and its review inline, so a worker's
+# `CC_CLAUDE=<a fake that writes LAND> cc done` once chose its own reviewer. cards.conf now reads these keys from the
+# passwd home's config alone (cards.REVIEWER_CONFIG); the tick still gets none of them from its caller, belt and braces.
+REVIEWER_ENV = ("CC_CLAUDE", "CC_CODEX", "CC_CONFIG")
+
+
+def tick_env(env):
+    """The environment a queued tick starts with: the caller's, less every key that picks the landing reviewer."""
+    return {k: v for k, v in env.items() if k not in REVIEWER_ENV and not k.startswith("CC_LAND_REVIEW")}
+
+
 def spawn_tick(repo):
-    """Start `lander tick --repo <repo>` detached, from this same release. -> (ok, how)."""
+    """Start `lander tick --repo <repo>` detached, from this same release, with tick_env. -> (ok, how)."""
     argv = [sys.executable, "-P", os.path.join(J.CORE, "lander", "cli.py"), "tick", "--repo", repo]
     try:
         p = subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                             stderr=subprocess.DEVNULL, env=dict(tick_env(os.environ), PYTHONDONTWRITEBYTECODE="1"))
         return True, f"pid {p.pid}"
     except OSError as e:
         return False, str(e)
