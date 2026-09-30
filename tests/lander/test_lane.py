@@ -1136,6 +1136,127 @@ class Review(Fixture):
         self.assertIn("gate=a ok=no", self.log())
 
 
+class HeldRereads(Fixture):
+    """A held job re-reads the PR's state and head when it is looked at again (2026-09-30: a PR sat closed for days,
+    held <-> checking at a head it no longer had). Each case holds its own job from checking, then releases it."""
+
+    def held(self):
+        head = self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.land(planner=Planner(paid=True), reviewer=Reviewer(V(T.INCOMPLETE, tokens=0)))
+        j = self.job()
+        self.assertEqual((j.state, j.extra["held_from"], j.head), (T.HELD, T.CHECKING, head))
+        j.extra["not_before"] = E.stamp(time.time() - 1)
+        J.save(j)
+        return head
+
+    def after_hold(self, j):
+        states = [h["state"] for h in j.history]
+        return states[len(states) - states[::-1].index(T.HELD):]
+
+    def test_unchanged_goes_back_to_checking(self):
+        self.held()
+        rv = Reviewer(V(T.LAND))
+        self.land(planner=Planner(paid=True), reviewer=rv)
+        j = self.job()
+        self.assertEqual(j.state, T.DEPLOY_PENDING)
+        self.assertEqual(self.after_hold(j)[0], T.CHECKING)       # no fresh start: its results are kept
+        self.assertEqual([c[0] for c in rv.calls], ["review"])
+
+    def test_closed_while_held_leaves_with_one_line(self):
+        self.held()
+        self.set_box(prs={"1": {**self.box()["prs"]["1"], "state": "CLOSED", "headRefOid": "e" * 40}})
+        rv = Reviewer(V(T.LAND))
+        u, _ = self.land(planner=Planner(paid=True), reviewer=rv)
+        j = self.job()
+        self.assertEqual(j.state, T.DONE)
+        self.assertEqual(self.after_hold(j), [T.QUEUED, T.DONE])
+        self.assertIn("the PR is closed", j.history[-2]["why"])
+        self.assertEqual(self.log().count("\tdone demo#1 rc=1"), 1)
+        self.assertEqual((rv.calls, u["deploy"].calls), ([], []))
+        self.assertFalse(os.path.exists(J.job_path("demo", 1)))   # off the queue, at rest
+
+    def test_merged_while_held_is_merged_before(self):
+        head = self.held()
+        self.set_box(prs={"1": {**self.box()["prs"]["1"], "state": "MERGED", "headRefOid": head}})
+        rv = Reviewer(V(T.LAND))
+        self.land(planner=Planner(paid=True), reviewer=rv)
+        j = self.job()
+        self.assertEqual(self.after_hold(j)[:2], [T.QUEUED, T.MERGED])
+        self.assertEqual(rv.calls, [])
+
+    def test_a_new_head_is_a_fresh_job(self):
+        old = self.held()
+        new = self.push("track/row-1", {"a/y": "m\n"}, fresh=False)
+        pl, rv = Planner(paid=True), Reviewer(V(T.LAND))
+        self.land(planner=pl, reviewer=rv)
+        j = self.job()
+        self.assertNotEqual(old, new)
+        self.assertEqual((j.state, j.head), (T.DEPLOY_PENDING, new))
+        self.assertEqual(self.after_hold(j)[:2], [T.QUEUED, T.PLANNED])
+        self.assertIn(f"the head moved to {new[:12]}", [h for h in j.history if h["state"] == T.QUEUED][-1]["why"])
+
+    def test_gh_unreadable_stays_held(self):
+        self.held()
+        self.set_box(down=True)
+        rv = Reviewer(V(T.LAND))
+        self.land(planner=Planner(paid=True), reviewer=rv)
+        j = self.job()
+        self.assertEqual((j.state, j.extra["held_from"]), (T.HELD, T.CHECKING))
+        self.assertTrue(J.not_before_left(j) > 0)
+        self.assertEqual(rv.calls, [])
+
+    def pr_views(self):
+        return [c for c in self.box().get("calls", []) if c[:3] == ["gh", "pr", "view"]]
+
+    def test_backoff_stays_held_without_asking_gh(self):
+        self.held()
+        J.write_atomic(GH.backoff_path(), {"until": time.time() + 600, "fails": 1})
+        before = len(self.pr_views())
+        rv = Reviewer(V(T.LAND))
+        self.land(planner=Planner(paid=True), reviewer=rv)
+        j = self.job()
+        self.assertEqual((j.state, j.extra["held_from"]), (T.HELD, T.CHECKING))
+        self.assertEqual(len(self.pr_views()), before)     # gh is not called during a backoff
+        self.assertEqual(rv.calls, [])
+
+    def test_pending_merge_attempt_skips_the_reread(self):
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.set_box(merge_then_timeout=True)
+        self.land()
+        j = self.job()
+        self.assertEqual((j.state, j.extra["held_from"]), (T.HELD, T.MERGEABLE))
+        self.assertIn("merge_attempt", j.extra)
+        self.set_box(down=False)
+        j.extra["not_before"] = E.stamp(time.time() - 1)
+        J.save(j)
+        os.unlink(GH.backoff_path())
+        real, seen = GH.pr_facts, []
+
+        def rec(root, pr, fields, *a, **kw):
+            seen.append(fields)
+            return real(root, pr, fields, *a, **kw)
+        with mock.patch.object(GH, "pr_facts", rec):
+            u, _ = self.land()
+        j = self.job()
+        self.assertNotIn("state,headRefOid,baseRefName", seen)   # mergeable() proves the attempt, not the re-read
+        self.assertEqual(self.after_hold(j)[0], T.MERGEABLE)
+        self.assertEqual(j.state, T.DEPLOY_PENDING)
+        self.assertEqual(len(self.box()["merges"]), 1)
+
+    def test_a_retargeted_base_requeues(self):
+        self.held()
+        self.push("release", {"r/z": "r\n"})
+        self.set_box(prs={"1": {**self.box()["prs"]["1"], "baseRefName": "release"}})
+        self.land(planner=Planner(paid=True), reviewer=Reviewer(V(T.LAND)))
+        j = self.job()
+        self.assertEqual(self.after_hold(j)[:2], [T.QUEUED, T.PLANNED])
+        self.assertIn("the base moved from main to release",
+                      [h for h in j.history if h["state"] == T.QUEUED][-1]["why"])
+        self.assertEqual((j.extra["base_ref"], j.base_sha), ("release", self.origin_rev("release")))
+
+
 class Door(Fixture):
     def setUp(self):
         super().setUp()

@@ -72,6 +72,10 @@ leave the file untouched and the job untimed:
              the squash commit GitHub names; unreadable holds again, attempt kept; any other state drops it.
   merged     board.close, cards.landed, tip.kick, deploy.request(repo, tip) — each once (job.post flags) —
              then deploy-pending; done (rc=0) for a member or an unvalidated tip. Members never deploy.
+  held       past not_before, back to the state it was held from. One held from planned, checking or mergeable
+             (no merge_attempt) reads the PR's state, head and base first: not OPEN, a head that is not job.head
+             or a base that is not the base_ref it was read on -> queued instead, which ends a closed PR (done rc=1)
+             or a merged one (merged, by=before) and starts a new head or base afresh; gh unreadable -> stays held another HOLD_SECS; a GitHub backoff -> waits for it.
 HANDBACK writes handed/<repo>-<pr>.json (7 days) and REMOVES the job file (N12); cards.stopped routes it to
 "#<h>" or "seat". DONE and QUERY move the job file to rest/ (jobs.py): off the readers' queue, as the old lander's
 unlink was, but still loaded by a re-queue. A unit that is not installed holds the job ("<unit> is not
@@ -570,10 +574,30 @@ class Lane:
         self.say(f"PR #{job.pr} held: {why}")
 
     def unhold(self, job):
-        target = job.extra.pop("held_from", T.QUEUED)
-        for k in ("hold", "not_before", "deferred"):
+        target, why = job.extra.get("held_from", T.QUEUED), "retry after hold"
+        # "every time a held or handed-back job is looked at again, it re-reads the PR's state and head. Closed or
+        # merged means it leaves the queue with one line. A new head means a fresh job" (2026-09-30: a PR sat closed
+        # for days, held <-> checking at a head it no longer had). queued() reads GitHub itself; a merge_attempt is
+        # mergeable()'s to prove; a deploy-pending job is past the PR.
+        if target in (T.PLANNED, T.CHECKING, T.MERGEABLE) and not job.extra.get("merge_attempt"):
+            if GH.backoff():
+                return self.say(f"PR #{job.pr}: GitHub backoff, {GH.backoff()}s left — tried again after it")
+            facts, err = GH.pr_facts(self.root, job.pr, "state,headRefOid,baseRefName", self.token)
+            if facts is None:   # unknown is not "unchanged": stay held, and the timer brings it back
+                job.extra["not_before"] = E.stamp(time.time() + HOLD_SECS)
+                J.save(job)
+                return self.say(f"PR #{job.pr} stays held: gh could not read it: {err}")
+            state, head = facts.get("state") or "", facts.get("headRefOid") or ""
+            base, was = facts.get("baseRefName") or "", job.extra.get("base_ref") or ""
+            if state != "OPEN":   # queued() ends it: closed -> done rc=1, merged -> merged by=before
+                target, why = T.QUEUED, f"retry after hold: the PR is {state.lower() or 'not open'}"
+            elif head and head != job.head:
+                target, why = T.QUEUED, f"retry after hold: the head moved to {head[:12]}"
+            elif base and was and base != was:   # retargeted: its base_sha, files and results were read on `was`
+                target, why = T.QUEUED, f"retry after hold: the base moved from {was} to {base}"
+        for k in ("held_from", "hold", "not_before", "deferred"):
             job.extra.pop(k, None)
-        J.move(job, target if target in J.NEXT[T.HELD] else T.QUEUED, why="retry after hold")
+        J.move(job, target if target in J.NEXT[T.HELD] else T.QUEUED, why=why)
 
     def stopped(self, job, why, route):
         if self.unit("cards"):
