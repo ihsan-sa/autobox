@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""cc-improve-batch — once a day, read cc-collect's snapshot the way the owner reads the box, and write a short,
+ranked list of its biggest problems for the improve seat to turn into work.
+
+WHY. The owner finds the box's problems by noticing what he has to chase, what keeps failing, and whether the fixes
+already built are still running (he found the laptop runner idle after the lander swap that way). This does the same
+over one day's snapshot so he doesn't have to. It makes no board rows and posts nothing: the improve seat reads the
+report and decides what becomes a row.
+
+THE PASSES, each given only the slice of the snapshot it needs:
+  1 nudges    the owner's messages (slack.jsonl, owner rows, 260 chars each plus the box post before) labelled with
+              the nudge classes of the newest ~/.cc/state/*/improve/nudges/*-classes.md, by that folder's method.md.
+              Each class is counted, and the day's counts go into nudge-counts.jsonl so the report shows a trend.
+              A message that fits no class is `other`; three or more `other`s under one proposed name are a finding.
+  2 failures  failures.jsonl (already folded per kind), the red or slow landings in landings.jsonl and the loops
+              with failed iterations, grouped by kind here and merged into patterns by the model. A pattern also
+              seen in an earlier report of the last seven says on how many days it recurred.
+  3 fixes     the owner's own move: the worst few measures from passes 1-2, the landed fixes meant to move each
+              (~/.cc/state/improve/fixes.jsonl, which the improve seat may keep, plus the last 30 days of commit
+              subjects in ~/dev/<repo> for the repos IMPROVE_BATCH_REPOS names and those the measures touch, three at
+              most), what trace each fix leaves when it runs,
+              that trace counted in the snapshot, and a judge on whether a fix with no trace went quiet or simply had
+              nothing to do. A quiet fix outranks every other finding.
+  4 ideas     from what 1-3 found, a few improvements that no landed fix covers yet.
+A pass whose model call fails is reported as failed and the others still run; pass 2 then keeps one finding per
+group with no model at all.
+
+MODELS, cheapest that holds: pass 1 and the fix picking of pass 3 on IMPROVE_BATCH_MODEL (sonnet), pass 2 on
+IMPROVE_BATCH_SMALL_MODEL (haiku), the quiet-fix judge and pass 4 on IMPROVE_BATCH_JUDGE_MODEL (opus). Every call is
+`claude -p` with no tools and one turn. The day stops calling models once IMPROVE_BATCH_BUDGET dollars (default 3)
+are spent, and the report and stdout say what the day cost, per pass. Under a spend tier that holds `goals`
+(cc-tier), it spends nothing and exits 0.
+
+OUTPUT, in ~/.cc/state/improve/reports/ (or --out DIR): <day>.md, the ranked report, and <day>.jsonl, one finding per
+line: {day, id, pass, class, title, evidence, cost, freq, score, tier}. `cost` is what one occurrence costs the owner
+(1-3), `freq` how often it happened that day, `score` their product; findings rank by tier (0 a quiet fix, 1 nudges
+and failures, 2 ideas), then by score. <day> is the snapshot's own name, and a second run replaces that day's files
+and counts.
+
+  cc-improve-batch [SNAPSHOT] [--out DIR]   SNAPSHOT is a snapshot's name or path; default the `latest` one.
+                                            Prints where it wrote and what the day cost
+  cc-improve-batch selfcheck                a stubbed model in a HOME of its own, never this box's
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+# recurring-defect-ok: pause-hold-missing — box-wide daily read under cc-tier's `goals`; it launches no worker, writes no board and belongs to no one project
+SOURCES = ("slack", "outbox", "landings", "board", "failures", "loops", "journals", "handoffs", "spend")
+NUDGE_CHUNK = 120            # owner messages per nudge call
+SLOW_LANDING = 3600          # seconds from queue to done that count as a slow landing
+WORST = 4                    # measures pass 3 checks fixes for
+TIER = {"fixes": 0, "nudges": 1, "failures": 1, "ideas": 2}
+PASS_MODEL = {"nudges": ("IMPROVE_BATCH_MODEL", "sonnet"), "failures": ("IMPROVE_BATCH_SMALL_MODEL", "haiku"),
+              "fixes-pick": ("IMPROVE_BATCH_MODEL", "sonnet"), "fixes-judge": ("IMPROVE_BATCH_JUDGE_MODEL", "opus"),
+              "ideas": ("IMPROVE_BATCH_JUDGE_MODEL", "opus")}
+
+
+def home(*p):
+    return os.path.join(os.path.expanduser("~"), *p)
+
+
+def conf(key, default):
+    if os.environ.get(key):
+        return os.environ[key]
+    try:
+        with open(os.environ.get("CC_CONFIG") or home(".cc", "config")) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k == key and v:
+                    return v.strip().strip('"')
+    except OSError:
+        pass
+    return default
+
+
+def jlines(path):
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        yield json.loads(line)
+                    except ValueError:
+                        pass
+    except OSError:
+        return
+
+
+def cut(s, n):
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+class ModelFailed(Exception):
+    pass
+
+
+class Models:
+    """Every model call goes through here, so the day's cost is counted in one place and the budget holds."""
+
+    def __init__(self, budget, workdir):
+        self.budget, self.workdir, self.cost = budget, workdir, {}
+
+    def spent(self):
+        return sum(self.cost.values())
+
+    def ask(self, pass_name, prompt):
+        key, default = PASS_MODEL[pass_name]
+        model = conf(key, default)
+        left = self.budget - self.spent()
+        if left < 0.05:
+            raise ModelFailed(f"the day's budget of ${self.budget:.2f} is spent")
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDECODE", "CLAUDE_CODE_"))}
+        env["CC_ROLE"] = "improve-batch"
+        claude = os.environ.get("CC_CLAUDE") or home(".local", "bin", "claude")
+        try:
+            p = subprocess.run([claude, "-p", "--model", model, "--tools", "", "--strict-mcp-config",
+                                "--setting-sources", "", "--disable-slash-commands", "--max-turns", "1",
+                                "--no-session-persistence", "--output-format", "json",
+                                "--max-budget-usd", f"{left:.2f}"],
+                               input=prompt, capture_output=True, text=True, timeout=900, env=env, cwd=self.workdir)
+            d = json.loads(p.stdout)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            raise ModelFailed(f"{model}: {cut(e, 160)}")
+        self.cost[pass_name] = self.cost.get(pass_name, 0.0) + float(d.get("total_cost_usd") or 0)
+        r = d.get("result")
+        if d.get("is_error") or not isinstance(r, str):
+            raise ModelFailed(f"{model}: {cut(r or d.get('subtype') or 'no result', 160)}")
+        return parse_json(r, model)
+
+
+def parse_json(text, model="model"):
+    """The first JSON array or object in a reply, fences and prose around it ignored."""
+    for m in re.finditer(r"[\[{]", text):
+        try:
+            return json.JSONDecoder().raw_decode(text[m.start():])[0]
+        except ValueError:
+            continue
+    raise ModelFailed(f"{model}: no JSON in the reply: {cut(text, 120)}")
+
+
+# ---------------------------------------------------------------------------------------------------- inputs
+
+def nudge_method():
+    """(method text, {class: {avoid, definition, automation}}) from the newest classes file any repo keeps."""
+    files = sorted(glob.glob(home(".cc", "state", "*", "improve", "nudges", "*-classes.md")), key=os.path.basename)
+    if not files:
+        return "", {}
+    path = files[-1]
+    with open(path) as f:
+        text = f.read()
+    classes = {}
+    for m in re.finditer(r"^\|\s*\d+\s*\|\s*([a-z0-9-]+)\s*\|[^|]*\|[^|]*\|\s*(\d)\s*\|[^|]*\|\s*([^|]*)\|", text, re.M):
+        classes[m.group(1)] = {"avoid": int(m.group(2)), "automation": m.group(3).strip(), "definition": ""}
+    for m in re.finditer(r"^## \d+\. ([a-z0-9-]+)[^\n]*\n+([^\n]+)", text, re.M):
+        if m.group(1) in classes:
+            classes[m.group(1)]["definition"] = cut(m.group(2), 240)
+    method = ""
+    mp = os.path.join(os.path.dirname(path), "method.md")
+    if os.path.exists(mp):
+        with open(mp) as f:
+            method = f.read()
+    return method, classes
+
+
+def landing_total(r):
+    m = re.search(r"total=(\d+)s", r.get("last_event") or "")
+    return int(m.group(1)) if m else None
+
+
+def landing_red(r):
+    """What made a landing red, or '' — a verdict other than LAND, a rerun, a failed deploy or a non-zero exit."""
+    ev, last = r.get("events") or {}, r.get("last_event") or ""
+    for k in ("deploy-failed", "again", "requeued", "fix-pushed"):
+        if ev.get(k):
+            return k
+    bad = [v for v in r.get("verdicts") or [] if v != "LAND"]
+    if bad:
+        return "verdict-" + bad[0].lower()
+    m = re.match(r"done rc=(\d+)", last)
+    if m and m.group(1) != "0":
+        return "exit-nonzero"
+    return ""
+
+
+def past_reports(out, day, n=7):
+    """The finding rows of the last n reports before `day`, oldest first."""
+    days = sorted(os.path.basename(p)[:-6] for p in glob.glob(os.path.join(out, "*.jsonl"))
+                  if not os.path.basename(p).startswith("nudge-counts"))
+    return {d: list(jlines(os.path.join(out, d + ".jsonl"))) for d in [d for d in days if d < day][-n:]}
+
+
+# ---------------------------------------------------------------------------------------------------- passes
+
+def pass_nudges(snap, models, out, day, notes):
+    method, classes = nudge_method()
+    msgs = [r for r in jlines(os.path.join(snap, "slack.jsonl")) if r.get("role") == "owner" and (r.get("text") or "").strip()]
+    if not classes:
+        notes["nudges"] = "no nudge classes found (~/.cc/state/*/improve/nudges/*-classes.md), so nothing was labelled"
+        return []
+    rows = [{"i": i, "at": (r.get("at") or "")[5:16], "ch": r.get("channel") or r.get("chat"), "text": cut(r.get("text"), 260),
+             "box_before": cut((r.get("prev_box") or {}).get("text"), 160)} for i, r in enumerate(msgs)]
+    cls = "\n".join(f"- {c}: {v['definition']}" for c, v in classes.items())
+    labels = {}
+    for k in range(0, len(rows), NUDGE_CHUNK):
+        chunk = rows[k:k + NUDGE_CHUNK]
+        prompt = ("PASS: nudges\nYou label the owner's Slack messages from one day. Follow this method's Filter and Cluster "
+                  f"sections (the Build and Score steps are done for you):\n\n{method}\n\nTHE CLASSES:\n{cls}\n\n"
+                  "Reply with only a JSON array holding one object per message that IS a nudge, and nothing for the rest: "
+                  '{"i": <its i>, "class": "<one class above>"}, or {"i": .., "class": "other", "name": "<proposed-class>"} '
+                  "when it is a nudge that fits none.\n\nTHE MESSAGES (one JSON per line):\n"
+                  + "\n".join(json.dumps(r, ensure_ascii=False) for r in chunk))
+        got = models.ask("nudges", prompt)
+        for x in got if isinstance(got, list) else []:
+            if isinstance(x, dict) and isinstance(x.get("i"), int) and 0 <= x["i"] < len(msgs):
+                c = x.get("class")
+                labels[x["i"]] = c if c in classes else "other:" + re.sub(r"[^a-z0-9-]", "", str(x.get("name") or "unnamed").lower())[:40]
+    by = {}
+    for i, c in sorted(labels.items()):
+        by.setdefault(c, []).append(msgs[i])
+    counts_path = os.path.join(out, "nudge-counts.jsonl")
+    hist = [r for r in jlines(counts_path) if r.get("day") != day]
+    today = [{"day": day, "class": c, "n": len(v)} for c, v in sorted(by.items()) if not c.startswith("other:")]
+    with open(counts_path + ".tmp", "w") as f:
+        for r in sorted(hist + today, key=lambda r: (r["day"], r["class"])):
+            f.write(json.dumps(r) + "\n")
+    os.replace(counts_path + ".tmp", counts_path)
+    prev_days = sorted({r["day"] for r in hist if r["day"] < day})[-6:]
+    findings = []
+    for c, ms in by.items():
+        if c.startswith("other:"):
+            if len(ms) < 3:
+                continue
+            avoid, auto, title = 2, "", f"a new nudge class, {c[6:]}: {len(ms)} messages fit none of the classes"
+        else:
+            avoid, auto, title = classes[c]["avoid"], classes[c]["automation"], f"{c}: the owner chased this {len(ms)} time{'s' if len(ms) > 1 else ''}"
+        trend = [sum(r["n"] for r in hist if r["day"] == d and r["class"] == c) for d in prev_days] + [len(ms)]
+        findings.append({"id": "nudge:" + c, "pass": "nudges", "class": c, "title": title, "cost": avoid, "freq": len(ms),
+                         "trend": trend, "automation": auto, "repos": sorted({m.get("repo") for m in ms if m.get("repo")}),
+                         "evidence": [f"{(m.get('at') or '')[5:16]} {m.get('channel')}: \"{cut(m.get('text'), 140)}\"" for m in ms[:3]]})
+    notes["nudges"] = f"{len(labels)} of {len(msgs)} owner messages were nudges; trend is over {len(prev_days) + 1} day(s)"
+    return findings
+
+
+def failure_groups(snap):
+    groups = {}
+
+    def add(key, n, repo, example):
+        g = groups.setdefault(key, {"key": key, "n": 0, "repos": [], "example": ""})
+        g["n"] += n
+        if repo and repo not in g["repos"]:
+            g["repos"].append(repo)
+        g["example"] = g["example"] or cut(example, 200)
+
+    for r in jlines(os.path.join(snap, "failures.jsonl")):
+        add("failure:" + (r.get("kind") or "?"), int(r.get("n") or 1), r.get("repo"), (r.get("examples") or [""])[0])
+    slow = []
+    for r in jlines(os.path.join(snap, "landings.jsonl")):
+        red = landing_red(r)
+        if red:
+            add("landing:" + red, 1, r.get("repo"), f"{r.get('pr')}: {r.get('last_event')}")
+        t = landing_total(r)
+        if t is not None:
+            slow.append(t)
+            if t > SLOW_LANDING:
+                add("landing:slow", 1, r.get("repo"), f"{r.get('pr')} took {t // 60} min from queue to merge")
+    for r in jlines(os.path.join(snap, "loops.jsonl")):
+        if r.get("iter_errors"):
+            add("loop:iteration-failed", int(r["iter_errors"]), r.get("repo"), f"{r.get('repo')}/{r.get('track')}: {r.get('last_line')}")
+        if r.get("blocked"):
+            add("loop:blocked", int(r["blocked"]), r.get("repo"), f"{r.get('repo')}/{r.get('track')}: {r.get('last_line')}")
+    return sorted(groups.values(), key=lambda g: -g["n"]), slow
+
+
+def pass_failures(snap, models, out, day, notes, errors):
+    groups, slow = failure_groups(snap)
+    seen = {}
+    for d, rows in past_reports(out, day).items():
+        for r in rows:
+            for k in r.get("keys") or []:
+                seen.setdefault(k, set()).add(d)
+    for g in groups:
+        g["days_seen_before"] = len(seen.get(g["key"], ()))
+    merged = None
+    if groups:
+        prompt = ("PASS: failures\nThese are one day's failure groups on a self-running server: failures-ledger kinds, red or "
+                  "slow landings, failed worker iterations. Merge the groups that are one underlying problem, and say in one "
+                  "plain sentence what recurs. Give each pattern a cost to the owner per occurrence: 3 he has to act or is "
+                  "misled, 2 it delays his work, 1 it wastes the box's own time.\nReply with only a JSON array: "
+                  '[{"keys": ["<group key>", ...], "pattern": "<one sentence>", "cost": 1|2|3}]. Every key belongs to '
+                  "exactly one pattern.\n\nTHE GROUPS:\n" + "\n".join(json.dumps(g, ensure_ascii=False) for g in groups))
+        try:
+            got = models.ask("failures", prompt)
+            merged = [p for p in got if isinstance(p, dict) and p.get("keys")] if isinstance(got, list) else None
+        except ModelFailed as e:
+            errors["failures"] = str(e)
+    by = {g["key"]: g for g in groups}
+    if merged is None:
+        merged = [{"keys": [g["key"]], "pattern": g["key"], "cost": 1} for g in groups]
+    done, findings = set(), []
+    for p in merged + [{"keys": [k], "pattern": k, "cost": 1} for k in by]:
+        keys = [k for k in p["keys"] if k in by and k not in done]
+        if not keys:
+            continue
+        done.update(keys)
+        gs = [by[k] for k in keys]
+        cost = p.get("cost") if p.get("cost") in (1, 2, 3) else 1
+        findings.append({"id": "failure:" + keys[0].split(":", 1)[1], "pass": "failures", "class": keys[0].split(":")[0],
+                         "title": cut(p.get("pattern") or keys[0], 200), "cost": cost, "freq": sum(g["n"] for g in gs),
+                         "keys": keys, "recurred_days": max(g["days_seen_before"] for g in gs),
+                         "repos": sorted({r for g in gs for r in g["repos"]}),
+                         "evidence": [f"{g['key']} ×{g['n']}: {g['example']}" for g in gs[:3]]})
+    if slow:
+        notes["landing_minutes"] = (f"{len(slow)} landings timed: median {statistics.median(slow) // 60:.0f} min, "
+                                    f"slowest {max(slow) // 60} min, {sum(t > SLOW_LANDING for t in slow)} over {SLOW_LANDING // 60}")
+    notes["failures"] = f"{len(groups)} groups merged into {len(findings)} patterns"
+    return findings
+
+
+def commit_subjects(repos, day):
+    """The last 30 days of first-parent subjects up to the end of `day`, so a backfilled day never credits a later fix."""
+    rng = ["--since=30.days"]
+    if re.match(r"\d{4}-\d\d-\d\d$", day):
+        d0 = datetime.strptime(day, "%Y-%m-%d")
+        rng = [f"--since={(d0 - timedelta(days=30)):%Y-%m-%d}", f"--until={(d0 + timedelta(days=1)):%Y-%m-%d}T00:00:00Z"]
+    out = []
+    for repo in repos[:3]:
+        d = home("dev", repo)
+        if not os.path.isdir(d):
+            continue
+        p = subprocess.run(["git", "-C", d, "log", "--first-parent", *rng, "--format=%h %cs %s", "-150", "HEAD"],
+                           capture_output=True, text=True)
+        out += [f"{repo} {line}" for line in p.stdout.splitlines()]
+    return out
+
+
+def vocabulary(snap):
+    """What each source actually prints: two sample rows, and for landings and failures the words a trace can match."""
+    out = []
+    for src in SOURCES:
+        rows = list(jlines(os.path.join(snap, src + ".jsonl")))
+        if not rows:
+            continue
+        out.append(f"{src}: {len(rows)} rows; e.g. " + " | ".join(cut(json.dumps(r, ensure_ascii=False), 240) for r in rows[:2]))
+        if src == "landings":
+            ev = sorted({k for r in rows for k in r.get("events") or {}})
+            st = sorted({x for r in rows for x in r.get("stages") or []})
+            out.append(f"  landings event names: {' '.join(ev)}; stage names: {' '.join(st)}")
+        if src == "failures":
+            out.append("  failure kinds: " + " ".join(sorted({r.get("kind") or "?" for r in rows})))
+    return "\n".join(out)
+
+
+def trace_hits(snap, source, regex):
+    try:
+        rx = re.compile(regex, re.I)
+    except (re.error, TypeError):
+        return None, []
+    n, samples = 0, []
+    try:
+        with open(os.path.join(snap, source + ".jsonl")) as f:
+            for line in f:
+                if rx.search(line):
+                    n += 1
+                    if len(samples) < 2:
+                        samples.append(cut(line, 200))
+    except OSError:
+        return 0, []
+    return n, samples
+
+
+def pass_fixes(snap, models, day, found, notes, errors):
+    worst = sorted([f for f in found if f["pass"] in ("nudges", "failures")], key=lambda f: -f["cost"] * f["freq"])[:WORST]
+    if not worst:
+        notes["fixes"] = "no measure was bad enough to check"
+        return [], []
+    measures = [{"measure": f["id"], "what": f["title"], "today": f["freq"], "trend": f.get("trend"), "repos": f.get("repos")} for f in worst]
+    registry = [r for r in jlines(home(".cc", "state", "improve", "fixes.jsonl")) if r.get("measure") in {m["measure"] for m in measures}]
+    repos = []
+    for f in worst:
+        for r in f.get("repos") or []:
+            if r not in repos:
+                repos.append(r)
+    for r in [x.strip() for x in conf("IMPROVE_BATCH_REPOS", "").split() if x.strip()]:
+        if r not in repos:
+            repos.insert(0, r)
+    subjects = commit_subjects(repos, day)
+    picks = [dict(r, origin="registry") for r in registry]
+    try:
+        prompt = ("PASS: fixes-pick\nFor each measure below, name the landed changes (from the commit subjects) that were meant "
+                  "to move it, at most four each, and for each the trace it leaves in the day's snapshot when it runs: which "
+                  f"source ({', '.join(SOURCES)}) and a Python regex that matches a line only when the fix did its job. "
+                  "Snapshot rows are JSON lines: slack = owner messages, outbox = the box's own posts, landings = the "
+                  "landing queue per PR, board = row status changes and notes, failures = the failures ledger by kind, loops = "
+                  "worker loop logs, journals = worker journals, handoffs = session handoffs, spend = token spend. The regex "
+                  "must match wording the source really prints (below); if you can't name a trace in that wording, leave "
+                  "the fix out rather than guess one.\n"
+                  'Reply with only a JSON array: [{"measure": "<id>", "fix": "<what it does>", "ref": "<repo sha>", '
+                  '"source": "<source>", "regex": "<regex>"}]. Skip a measure nothing aims at.\n\nMEASURES:\n'
+                  + "\n".join(json.dumps(m, ensure_ascii=False) for m in measures)
+                  + "\n\nWHAT THE SNAPSHOT PRINTS:\n" + vocabulary(snap)
+                  + "\n\nCOMMITS (repo sha date subject), last 30 days:\n" + "\n".join(subjects))
+        got = models.ask("fixes-pick", prompt) if subjects else []
+        picks += [dict(p, origin="commits") for p in got if isinstance(p, dict) and p.get("measure") and p.get("source") in SOURCES] if isinstance(got, list) else []
+    except ModelFailed as e:
+        errors["fixes"] = str(e)
+    checks = []
+    for p in picks:
+        hits, samples = trace_hits(snap, p.get("source"), p.get("regex"))
+        if hits is None:
+            continue
+        checks.append({"measure": p["measure"], "fix": cut(p.get("fix"), 160), "ref": p.get("ref", ""), "source": p["source"],
+                       "regex": p["regex"], "hits": hits, "samples": samples, "origin": p["origin"], "verdict": "firing" if hits else "?"})
+    silent = [c for c in checks if not c["hits"]]
+    if silent:
+        try:
+            m_by = {m["measure"]: m for m in measures}
+            prompt = ("PASS: fixes-judge\nEach fix below was built to move a measure on a self-running server, and left no trace "
+                      "in today's snapshot. Decide for each: `quiet` if it should have acted today given the measure (the fix "
+                      "went quiet, the owner's own finding), or `idle` if today gave it nothing to do or the trace is simply the "
+                      "wrong one to look for. Be strict: `quiet` only when the measure shows the very problem this fix handles happened, "
+                      "and the trace is wording the source really prints (below); a trace in invented wording is `idle`.\n"
+                      'Reply with only a JSON array: [{"n": <index>, "verdict": "quiet"|"idle", "why": "<one sentence>"}].\n\n'
+                      + "\n".join(json.dumps({"n": i, **c, "measure_today": m_by.get(c["measure"])}, ensure_ascii=False)
+                                  for i, c in enumerate(silent))
+                      + "\n\nWHAT THE SNAPSHOT PRINTS:\n" + vocabulary(snap))
+            got = models.ask("fixes-judge", prompt)
+            for v in got if isinstance(got, list) else []:
+                if isinstance(v, dict) and isinstance(v.get("n"), int) and 0 <= v["n"] < len(silent) and v.get("verdict") in ("quiet", "idle"):
+                    silent[v["n"]]["verdict"], silent[v["n"]]["why"] = v["verdict"], cut(v.get("why"), 200)
+        except ModelFailed as e:
+            errors["fixes"] = str(e)
+    f_by = {f["id"]: f for f in worst}
+    findings = []
+    for c in checks:
+        if c["verdict"] != "quiet":
+            continue
+        m = f_by.get(c["measure"], {})
+        findings.append({"id": f"fix-quiet:{c['ref'] or c['fix'][:30]}", "pass": "fixes", "class": "fix-quiet",
+                         "title": f"a fix went quiet: {c['fix']} ({c['ref']}) left no trace while {c['measure']} happened {m.get('freq', 0)} times",
+                         "cost": m.get("cost", 2), "freq": m.get("freq", 1), "measure": c["measure"],
+                         "evidence": [f"no line in {c['source']} matched /{c['regex']}/", c.get("why", "")]})
+    unaimed = [m["measure"] for m in measures if not any(c["measure"] == m["measure"] for c in checks)]
+    notes["fixes"] = (f"{len(measures)} worst measures, {len(checks)} fixes checked, {len(checks) - len(silent)} firing, "
+                      f"{len(findings)} quiet" + (f"; nothing landed aims at {', '.join(unaimed)}" if unaimed else ""))
+    return findings, checks
+
+
+def pass_ideas(models, found, checks, notes, errors):
+    top = sorted(found, key=lambda f: (TIER[f["pass"]], -f["cost"] * f["freq"]))[:10]
+    if not top:
+        return []
+    covered = [f"{c['measure']}: {c['fix']} ({c['verdict']})" for c in checks]
+    prompt = ("PASS: ideas\nThese are today's worst findings on a self-running server that an owner steers from his phone, and "
+              "the fixes already built for them. Suggest at most four improvements that nothing covers yet, each one a thing "
+              "the box would do unasked. Do not repeat a covered fix; if a covered fix went quiet, the answer is to repair it, "
+              "not to suggest it again.\nReply with only a JSON array: "
+              '[{"title": "<what the box would do>", "addresses": ["<finding id>"], "why": "<one sentence>", "cost": 1|2|3, '
+              '"freq": <occurrences a day it would remove>}].\n\nFINDINGS:\n'
+              + "\n".join(json.dumps({k: f.get(k) for k in ("id", "title", "cost", "freq", "evidence")}, ensure_ascii=False) for f in top)
+              + "\n\nFIXES ALREADY BUILT:\n" + ("\n".join(covered) or "(none found)"))
+    try:
+        got = models.ask("ideas", prompt)
+    except ModelFailed as e:
+        errors["ideas"] = str(e)
+        return []
+    findings = []
+    for i, x in enumerate(got if isinstance(got, list) else []):
+        if not isinstance(x, dict) or not x.get("title"):
+            continue
+        freq = x.get("freq") if isinstance(x.get("freq"), int) and x["freq"] > 0 else 1
+        findings.append({"id": f"idea:{i + 1}", "pass": "ideas", "class": "idea", "title": cut(x["title"], 200),
+                         "cost": x.get("cost") if x.get("cost") in (1, 2, 3) else 1, "freq": freq,
+                         "evidence": [cut(x.get("why"), 240), "addresses " + ", ".join(map(str, x.get("addresses") or []))]})
+    notes["ideas"] = f"{len(findings)} ideas"
+    return findings[:4]
+
+
+# ---------------------------------------------------------------------------------------------------- report
+
+def write_report(out, day, snap, findings, checks, notes, errors, models):
+    for f in findings:
+        f["day"], f["tier"], f["score"] = day, TIER[f["pass"]], f["cost"] * f["freq"]
+    findings.sort(key=lambda f: (f["tier"], -f["score"]))
+    cost = models.spent()
+    per = ", ".join(f"{k} ${v:.2f}" for k, v in sorted(models.cost.items())) or "no model call"
+    md = [f"# Improve batch, {day}", "",
+          f"**{len(findings)} findings from the snapshot {os.path.basename(snap)}. Today's run cost ${cost:.2f}** ({per}).", "",
+          "| # | Pass | Finding | Cost | Freq | Score |", "|---|---|---|---|---|---|"]
+    for i, f in enumerate(findings, 1):
+        md.append(f"| {i} | {f['pass']} | {f['title'].replace('|', '/')} | {f['cost']} | {f['freq']} | {f['score']} |")
+    for name, title in (("nudges", "1. Nudges"), ("failures", "2. Failure patterns"), ("fixes", "3. Fixes still firing"), ("ideas", "4. Ideas")):
+        md += ["", f"## {title}", ""]
+        if errors.get(name):
+            md.append(f"The pass failed: {errors[name]}.")
+        if notes.get(name):
+            md.append(notes[name] + ".")
+        if name == "failures" and notes.get("landing_minutes"):
+            md.append("Landings: " + notes["landing_minutes"] + ".")
+        if name == "fixes" and checks:
+            md += ["", "| Measure | Fix | Trace | Hits | Verdict |", "|---|---|---|---|---|"]
+            for c in checks:
+                md.append(f"| {c['measure']} | {c['fix'].replace('|', '/')} {c['ref']} | {c['source']} `{c['regex'].replace('|', '/')}` "
+                          f"| {c['hits']} | {c['verdict']}{' — ' + c['why'] if c.get('why') else ''} |")
+        for f in [f for f in findings if f["pass"] == name]:
+            md += ["", f"- **{f['title']}** (score {f['score']}" + (f", trend {f['trend']}" if f.get("trend") else "")
+                   + (f", seen on {f['recurred_days']} earlier day(s)" if f.get("recurred_days") else "") + ")"]
+            md += [f"  - {e}" for e in f.get("evidence") or [] if e]
+            if f.get("automation"):
+                md.append(f"  - proposed: {f['automation']}")
+    os.makedirs(out, exist_ok=True)
+    for ext, text in (("md", "\n".join(md) + "\n"),
+                      ("jsonl", "".join(json.dumps(f, ensure_ascii=False) + "\n" for f in findings))):
+        with open(os.path.join(out, f"{day}.{ext}.tmp"), "w") as fh:
+            fh.write(text)
+        os.replace(os.path.join(out, f"{day}.{ext}.tmp"), os.path.join(out, f"{day}.{ext}"))
+    return cost, per
+
+
+def run(snapshot, out):
+    snap = snapshot if os.sep in snapshot else home(".cc", "state", "improve", "snapshots", snapshot)
+    snap = os.path.realpath(snap)
+    if not os.path.isfile(os.path.join(snap, "index.json")):
+        print(f"cc-improve-batch: no snapshot at {snap} (run cc-collect first)", file=sys.stderr)
+        return 2
+    tier = subprocess.run([os.path.join(BIN, "cc-tier"), "allows", "goals"], capture_output=True, text=True)
+    if tier.returncode == 1:
+        print(f"cc-improve-batch: the spend tier holds it, nothing spent ({cut(tier.stderr, 120)})")
+        return 0
+    day = os.path.basename(snap)
+    os.makedirs(out, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="cc-improve-batch.")
+    models = Models(float(conf("IMPROVE_BATCH_BUDGET", "3")), work)
+    notes, errors, findings = {}, {}, []
+    try:
+        try:
+            findings += pass_nudges(snap, models, out, day, notes)
+        except ModelFailed as e:
+            errors["nudges"] = str(e)
+        findings += pass_failures(snap, models, out, day, notes, errors)
+        quiet, checks = pass_fixes(snap, models, day, findings, notes, errors)
+        findings += quiet
+        findings += pass_ideas(models, findings, checks, notes, errors)
+        cost, per = write_report(out, day, snap, findings, checks, notes, errors, models)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print(f"cc-improve-batch: {day}: {len(findings)} findings, cost ${cost:.2f} ({per}) -> {os.path.join(out, day)}.md"
+          + (f"; failed: {', '.join(sorted(errors))}" if errors else ""))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------- selfcheck
+
+STUB = r'''#!/usr/bin/env python3
+import json, os, sys
+p = sys.stdin.read()
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write(json.dumps({"argv": sys.argv[1:], "len": len(p), "head": p.split("\n", 1)[0], "prompt": p}) + "\n")
+if os.environ.get("STUB_FAIL") and os.environ["STUB_FAIL"] in p.split("\n", 1)[0]:
+    print(json.dumps({"is_error": True, "result": "stub failure", "total_cost_usd": 0.01})); sys.exit(1)
+pass_ = p.split("\n", 1)[0].split(": ", 1)[1]
+r = {"nudges": [{"i": 0, "class": "status-not-pushed"}, {"i": 1, "class": "status-not-pushed"},
+                {"i": 3, "class": "landing-chase"}, {"i": 4, "class": "other", "name": "Odd One"}],
+     "failures": [{"keys": ["failure:spend/context-over-band", "loop:iteration-failed"], "pattern": "sessions run long", "cost": 2}],
+     "fixes-pick": [{"measure": "nudge:status-not-pushed", "fix": "progress push", "ref": "r abc1234", "source": "outbox", "regex": "progress:"},
+                    {"measure": "nudge:status-not-pushed", "fix": "status digest", "ref": "r def5678", "source": "outbox", "regex": "digest-line"},
+                    {"measure": "nudge:landing-chase", "fix": "bad", "ref": "r 0", "source": "nowhere", "regex": "x"}],
+     "fixes-judge": [{"n": 0, "verdict": "quiet", "why": "the owner asked twice and no digest went out"}],
+     "ideas": [{"title": "tell the owner when a PR lands", "addresses": ["nudge:landing-chase"], "why": "he asked", "cost": 2, "freq": 1}]}[pass_]
+print(json.dumps({"is_error": False, "result": "Here:\n```json\n" + json.dumps(r) + "\n```", "total_cost_usd": 0.02}))
+'''
+
+
+def selfcheck():
+    results = []
+
+    def case(label, ok):
+        results.append(bool(ok))
+        print(f"  {'ok' if ok else 'FAIL'}  {label}")
+
+    real_home = os.environ.get("HOME")
+    keep = {k: os.environ.get(k) for k in ("HOME", "CC_CLAUDE", "CC_CONFIG", "STUB_LOG", "STUB_FAIL", "IMPROVE_BATCH_BUDGET", "IMPROVE_BATCH_REPOS")}
+
+    def fixture():
+        h = tempfile.mkdtemp(prefix="cc-improve-batch-sc.")
+        os.environ.update({"HOME": h, "CC_CLAUDE": os.path.join(h, "claude"), "CC_CONFIG": os.path.join(h, "config"),
+                           "STUB_LOG": os.path.join(h, "calls.jsonl")})
+        for k in ("STUB_FAIL", "IMPROVE_BATCH_BUDGET", "IMPROVE_BATCH_REPOS"):
+            os.environ.pop(k, None)
+        open(os.environ["CC_CONFIG"], "w").close()
+        with open(os.environ["CC_CLAUDE"], "w") as f:
+            f.write(STUB)
+        os.chmod(os.environ["CC_CLAUDE"], 0o755)
+        nd = os.path.join(h, ".cc", "state", "somerepo", "improve", "nudges")
+        os.makedirs(nd)
+        with open(os.path.join(nd, "method.md"), "w") as f:
+            f.write("# method\n## Filter\nkeep status checks\n")
+        with open(os.path.join(nd, "2026-01-01-classes.md"), "w") as f:
+            f.write("| Rank | Class | Count | Span | Avoid | Score | Proposed automation (short) |\n|---|---|---|---|---|---|---|\n"
+                    "| 1 | status-not-pushed | 9 | x | 3 | 27 | progress push |\n| 2 | landing-chase | 5 | x | 2 | 10 | lander posts |\n\n"
+                    "## 1. status-not-pushed — 9\n\nStatus check: where are we.\n\n## 2. landing-chase — 5\n\nLanding chase.\n")
+        snap = os.path.join(h, ".cc", "state", "improve", "snapshots", "2026-01-10")
+        os.makedirs(snap)
+        owner = [{"role": "owner", "at": f"2026-01-10T0{i}:00:00Z", "channel": "#r", "text": t, "prev_box": {"text": "queued"}}
+                 for i, t in enumerate(["where are we", "status?", "please build a thing", "did it land", "hmm", ""])]
+        rows = {"slack": owner + [{"role": "member", "text": "hi"}],
+                "outbox": [{"text": "progress: 3 of 4 done"}],
+                "failures": [{"kind": "spend/context-over-band", "n": 5, "repo": "r", "examples": ["read 160k"]},
+                             {"kind": "notification/false-action-needed", "n": 2, "repo": "r", "examples": ["nagged"]}],
+                "landings": [{"pr": "r#1", "repo": "r", "events": {"again": 1}, "last_event": "stages path=serial ok=yes total=4000s", "verdicts": ["LAND"]},
+                             {"pr": "r#2", "repo": "r", "events": {}, "last_event": "done rc=0", "verdicts": ["LAND"]}],
+                "loops": [{"repo": "r", "track": "t", "iter_errors": 1, "last_line": "exit 3"}]}
+        for n, rs in rows.items():
+            with open(os.path.join(snap, n + ".jsonl"), "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rs)
+        with open(os.path.join(snap, "index.json"), "w") as f:
+            f.write("{}")
+        # a repo with commits for the fix picker
+        d = os.path.join(h, "dev", "r")
+        os.makedirs(d)
+        g = ["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(["git", "init", "-q", d], check=True)
+        for when, msg in (("2026-01-09T12:00:00Z", "progress push on row change"), ("2026-01-15T12:00:00Z", "a later fix")):
+            subprocess.run(g + ["commit", "-q", "--allow-empty", "-m", msg], check=True,
+                           env=dict(os.environ, GIT_COMMITTER_DATE=when, GIT_AUTHOR_DATE=when))
+        return h, snap
+
+    def calls():
+        return list(jlines(os.environ["STUB_LOG"]))
+
+    def main_(*argv):
+        p = subprocess.run([sys.executable, os.path.realpath(__file__), *argv], capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout + p.stderr
+
+    homes = []
+    try:
+        # 1. the full run with a stubbed model: all four passes, the report, the jsonl, and the cost
+        h, snap = fixture()
+        homes.append(h)
+        rc, out = main_()
+        rep = os.path.join(h, ".cc", "state", "improve", "reports")
+        fs = list(jlines(os.path.join(rep, "2026-01-10.jsonl")))
+        md = open(os.path.join(rep, "2026-01-10.md")).read() if os.path.exists(os.path.join(rep, "2026-01-10.md")) else ""
+        heads = [c["head"] for c in calls()]
+        case("with no `latest` snapshot it exits 2 and says so", rc == 2 and "no snapshot" in out and not calls())
+        os.symlink("2026-01-10", os.path.join(h, ".cc", "state", "improve", "snapshots", "latest"))
+        open(os.environ["STUB_LOG"], "w").close()
+        rc, out = main_()
+        fs = list(jlines(os.path.join(rep, "2026-01-10.jsonl")))
+        md = open(os.path.join(rep, "2026-01-10.md")).read() if os.path.exists(os.path.join(rep, "2026-01-10.md")) else ""
+        heads = [c["head"] for c in calls()]
+        case("with `latest` set, it exits 0 and prints the day's cost", rc == 0 and "cost $0.10" in out and "2026-01-10.md" in out)
+        case("each of the five model calls ran once, in pass order",
+             heads == ["PASS: nudges", "PASS: failures", "PASS: fixes-pick", "PASS: fixes-judge", "PASS: ideas"])
+        case("all four passes have a section, and the cost line is in the report",
+             all(s in md for s in ("## 1. Nudges", "## 2. Failure patterns", "## 3. Fixes still firing", "## 4. Ideas")) and "cost $0.10" in md)
+        by = {f["id"]: f for f in fs}
+        case("every finding has class, evidence and score = cost x freq",
+             fs and all({"class", "evidence", "cost", "freq", "score"} <= set(f) and f["score"] == f["cost"] * f["freq"] for f in fs))
+        case("nudges: status-not-pushed counted 2 at its classes-file avoidability 3; landing-chase 1 at 2",
+             by.get("nudge:status-not-pushed", {}).get("score") == 6 and by.get("nudge:landing-chase", {}).get("score") == 2)
+        case("an `other` nudge under three messages is not a finding", not any(i.startswith("nudge:other") for i in by))
+        nud = calls()[0]["prompt"]
+        case("the nudge pass got owner messages only, blanks dropped, no member and no other source",
+             "where are we" in nud and '"hi"' not in nud and "context-over-band" not in nud and "keep status checks" in nud)
+        case("failures: two groups merged into one pattern at cost 2, the rest kept one per group",
+             by.get("failure:spend/context-over-band", {}).get("freq") == 6 and by["failure:spend/context-over-band"]["cost"] == 2
+             and "failure:notification/false-action-needed" in by and "failure:again" in by and "failure:slow" in by)
+        pick = calls()[2]["prompt"]
+        case("the fix picker saw the day's commit subjects, not a later one's, and what the snapshot prints",
+             "progress push on row change" in pick and "a later fix" not in pick and "landings event names: again" in pick)
+        judge = calls()[3]["prompt"]
+        case("a fix whose trace is in the snapshot is firing and not judged; a silent one is; a bad source is dropped",
+             "digest-line" in judge and '"regex": "progress:"' not in judge and "nowhere" not in md)
+        case("the fix the judge called quiet is a finding and ranks first", fs[0]["pass"] == "fixes" and "status digest" in fs[0]["title"])
+        case("an idea is a finding, ranked last", fs[-1]["pass"] == "ideas" and fs[-1]["title"].startswith("tell the owner"))
+        cnt = list(jlines(os.path.join(rep, "nudge-counts.jsonl")))
+        case("the day's nudge counts are written for the trend", {(r["class"], r["n"]) for r in cnt} == {("status-not-pushed", 2), ("landing-chase", 1)})
+
+        # 2. a second day reads the first for trend and recurrence; a rerun replaces, never doubles, its counts
+        snap2 = snap.replace("2026-01-10", "2026-01-11")
+        shutil.copytree(snap, snap2)
+        rc, out = main_(snap2)
+        f2 = {f["id"]: f for f in jlines(os.path.join(rep, "2026-01-11.jsonl"))}
+        rc, out = main_(snap2)
+        cnt = list(jlines(os.path.join(rep, "nudge-counts.jsonl")))
+        case("day two shows the trend [2, 2] and that the failure pattern recurred on one earlier day",
+             f2.get("nudge:status-not-pushed", {}).get("trend") == [2, 2] and f2["failure:spend/context-over-band"]["recurred_days"] == 1)
+        case("a rerun of a day replaces its counts", len(cnt) == 4)
+
+        # 3. a failed pass is reported and the rest still run; pass 2 falls back to one finding per group
+        h, snap = fixture()
+        homes.append(h)
+        os.environ["STUB_FAIL"] = "failures"
+        out_dir = os.path.join(h, "out")
+        rc, out = main_(snap, "--out", out_dir)
+        md = open(os.path.join(out_dir, "2026-01-10.md")).read()
+        f3 = {f["id"]: f for f in jlines(os.path.join(out_dir, "2026-01-10.jsonl"))}
+        case("a failed failures call: exit 0, named as failed, each group kept at cost 1",
+             rc == 0 and "failed: failures" in out and "The pass failed" in md and f3.get("failure:spend/context-over-band", {}).get("cost") == 1
+             and "ideas" in {f["pass"] for f in f3.values()})
+        case("--out writes there, and not to the default reports folder",
+             not os.path.exists(os.path.join(h, ".cc", "state", "improve", "reports")))
+
+        # 4. the budget: once spent, no more calls
+        h, snap = fixture()
+        homes.append(h)
+        os.environ["IMPROVE_BATCH_BUDGET"] = "0.06"
+        rc, out = main_(snap)
+        case("a budget of $0.06 buys the first call and stops the rest", rc == 0 and len(calls()) == 1 and "budget" in out + open(
+            os.path.join(h, ".cc", "state", "improve", "reports", "2026-01-10.md")).read())
+
+        # 5. the spend tier: a tier that holds `goals` spends nothing; one that allows it runs
+        h, snap = fixture()
+        homes.append(h)
+        with open(os.environ["CC_CONFIG"], "w") as f:
+            f.write("CC_SPEND_TIER=essential\n")
+        rc, out = main_(snap)
+        case("under the essential tier: exit 0, no model call, no report", rc == 0 and not calls() and "tier holds" in out
+             and not os.path.exists(os.path.join(h, ".cc", "state", "improve", "reports")))
+        with open(os.environ["CC_CONFIG"], "w") as f:
+            f.write("CC_SPEND_TIER=moderate\n")
+        rc, out = main_(snap)
+        case("under the moderate tier it runs", rc == 0 and len(calls()) == 5)
+    finally:
+        for k, v in keep.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        os.environ["HOME"] = real_home or ""
+        for h in homes:
+            shutil.rmtree(h, ignore_errors=True)
+    bad = results.count(False)
+    print(f"cc-improve-batch selfcheck: {len(results) - bad} passed, {bad} failed")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    snapshot, out = "latest", home(".cc", "state", "improve", "reports")
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--out" and i + 1 < len(argv):
+            out, i = argv[i + 1], i + 2
+        elif not argv[i].startswith("-"):
+            snapshot, i = argv[i], i + 1
+        else:
+            print(__doc__.split("\n\n")[-1], file=sys.stderr)
+            return 2
+    return run(snapshot, os.path.realpath(out))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
