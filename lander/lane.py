@@ -49,8 +49,8 @@ leave the file untouched and the job untimed:
              protected files are byte-identical, which carries approved_head to it (`approval … carried`); else
              -> query, route "owner". A job overlapping one in flight waits here (OVERLAP above). plan(); klass
              lander -> query "lander-self".
-  checking   the plan's checks on merge-tree(base_sha, head), each through runner.run_plan (run.judge: the red-vs-
-             base rule, the rerun alone under load, quarantine, the lane's records.Store under its lock, and the
+  checking   the plan's checks on merge-tree(base_sha, head), made once per base and head (extra tree_of), each
+             through runner.run_plan (run.judge: the red-vs-base rule, the rerun alone under load, quarantine, the lane's records.Store under its lock, and the
              failures-ledger record of a red that is the diff's) against the manifest at base widened by the head's —
              a member's on "member:<h>" — skipping those already in results. FAILED -> handback;
              blocked-by-main (red on the base tree too) -> held 15 min and planned again from main then, not blamed;
@@ -650,6 +650,7 @@ class Lane:
             if self.unit("reviewer") else ""
         job.results, job.plan = {}, None
         job.extra.pop("tree", None)
+        job.extra.pop("tree_of", None)
         if self.member:
             why = M.walls(self.root, job.base_sha, job.head, job.files, self.genv)
             if why:
@@ -738,14 +739,20 @@ class Lane:
                 self.waiting.add(job.key)    # it goes on when a check finishes and frees a slot
                 return None
             m = self.manifest(job)
-            with self.lock():
-                tree, conflicts = G.merge_tree(self.root, job.base_sha, job.head, env=self.genv)
+            pair = [job.base_sha, job.head]
+            if job.extra.get("tree") and job.extra.get("tree_of") == pair:
+                # the merge this job already made of this very base and head: merge_tree builds a sealed copy under
+                # the git lock (seconds), and run.materialise proves the tree by write-tree whatever the checkout holds
+                tree, conflicts = job.extra["tree"], []
+            else:
+                with self.lock():
+                    tree, conflicts = G.merge_tree(self.root, job.base_sha, job.head, env=self.genv)
             if tree is None:
                 return self.hold(job, f"PR #{job.pr} conflicts with {job.extra.get('base_ref') or 'main'}: "
                                       f"{', '.join(conflicts[:5])}")
             base_tree = G.tree_of(self.root, job.base_sha, env=self.genv)
-            if job.extra.get("tree") != tree:
-                job.extra["tree"] = tree
+            if job.extra.get("tree") != tree or job.extra.get("tree_of") != pair:
+                job.extra.update(tree=tree, tree_of=pair)
                 J.save(job)
             store = REC.Store(self.repo, J.lane_fd(self.repo), J.landq()) if J.lane_fd(self.repo) is not None else None
             quarantine = RUN.quarantine_text(self.root, job.base_sha)

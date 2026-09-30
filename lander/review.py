@@ -979,7 +979,8 @@ def _job_of(repo, pr):
     with D.git_lock(root):   # base from the lander's own URL, checked against ls-remote; never the checkout's origin
         job.base_sha = D.verified_tip(root, base)
         if G.remote_url(root):
-            git(root, "fetch", "-q", G.remote_url(root), f"refs/pull/{pr}/head", timeout=300)
+            with contextlib.suppress(G.GitError):   # borrowed: no config or hook of the checkout's runs or steers it
+                G.fetch_ids(root, f"refs/pull/{pr}/head")
     job.extra.update(base=base, head_ref=facts.get("headRefName") or "")
     job.files = [f.get("path", "") for f in facts.get("files") or []]
     job.head = facts.get("headRefOid") or ""

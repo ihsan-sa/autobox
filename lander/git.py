@@ -5,10 +5,12 @@ because cc-publish and the old lander take the same one; git_lock_path and git_l
 held across a fetch or the merge's critical section, never across a check or a review.
 
     git(root, *args, check=False, env=None)  -> R(rc, out, err); check=True raises GitError on rc != 0
-    fetch(root, *branches)  -> {b: sha}     origin's branches into refs/remotes/origin/<b>, from remote_url(root);
-                                             each sha is the one origin sent, never read back from that ref
+    fetch(root, *branches)  -> {b: sha}     origin's branches from remote_url(root), fetched BORROWED; each sha is
+                                             the one origin sent, never read back from refs/remotes/origin/<b>
+    fetch_ids(root, *revs)                   origin's objects for ids or refs (refs/pull/<n>/head), fetched BORROWED
     remote_url(root)                         the URL the lander holds for the checkout (see ORIGIN below)
-    rev(root, ref) · remote_head(root, branch)
+    rev(root, ref) · remote_head(root, branch) · ls_remote(root, url, branch)   (ls-remote run BORROWED)
+    borrowed(root)                           a scratch repo reading only the checkout's objects (see BORROWED)
     tree_of(root, commit)                    the commit's tree, read VERIFIED
     merge_tree(root, base, head)  -> (tree, [])  or (None, [conflicted paths])   (`merge-tree --write-tree`, sealed;
                                              the merged tree's new objects are copied into the checkout for the run)
@@ -31,6 +33,14 @@ replacement.
 VERIFIED is the cheap read for one object or one path, where sealed() would copy the whole history: each object is
 read by id from the checkout with `cat-file --batch` (no replace refs) and hashed again here, commit to tree to the
 path, so a swapped or replaced object anywhere on the way raises GitError. A caller never takes that for "absent".
+
+BORROWED is how git that must touch the checkout's objects runs without the rest of its .git: a fetch or ls-remote
+in the checkout reads its config (core.hooksPath and a reference-transaction hook ran on a --porcelain fetch;
+http.proxy or http.sslVerify=false could forge what origin sent), and read-tree/checkout-index there run a filter its
+attributes and config name. borrowed() is an empty bare repo whose objects/info/alternates points at the checkout's
+objects; git runs there with GIT_DIR set to it. A fetch keeps the user's global config (remote_env: the credential
+helper answers with gh's or a member's GH_TOKEN) and copies the packs it received into the checkout's objects/pack as
+files (adopt); run.materialise writes a tree out there under blind_env().
 
 ORIGIN is never the name "origin" in the checkout's shared .git/config: a worker can repoint that, unset its
 fetch refspec or plant refs/remotes/origin/<b>. Every fetch, ls-remote and push goes to the URL `lander-self
@@ -128,19 +138,106 @@ def remote(root) -> str:
 
 
 def fetch(root, *branches, env=None) -> dict:
-    """{branch: the commit origin sent for it}, from the fetch's own --porcelain report: refs/remotes/origin/<b> is
-    in the shared .git, so a worker can move it between the fetch and any read of it."""
+    """{branch: the commit origin sent for it}, from the fetch's own --porcelain report. Fetched BORROWED (below):
+    refs/remotes/origin/<b> is in the shared .git, so a worker can move it between the fetch and any read of it, and
+    it is written afterwards for people and worktrees, never read back; the objects origin sent go into the checkout's
+    objects as files."""
     dest = {f"refs/remotes/origin/{b}": b for b in branches if b}
-    r = git(root, "fetch", "--porcelain", "-v", remote(root), *(f"+refs/heads/{b}:{d}" for d, b in dest.items()),
-            check=True, env=env)   # -v: an unchanged ref is reported too; -q would report none
-    got = {}
-    for row in r.out.split("\n"):
-        old_new_ref = row[2:].split(" ")   # "<flag> <old> <new> <ref>", the flag one character or a space
-        if len(old_new_ref) == 3 and old_new_ref[2] in dest and SHA_RE.fullmatch(old_new_ref[1]):
-            got[dest[old_new_ref[2]]] = old_new_ref[1]
-    if len(got) != len(dest):
-        raise GitError(f"git fetch did not report {', '.join(b for b in dest.values() if b not in got)}")
+    with borrowed(root) as d:
+        # fetch.unpackLimit=1: what came is kept as the pack index-pack wrote (hashing every object), never loose;
+        # -v: an unchanged ref is reported too, where -q would report none
+        p = _bytes(["git", "-c", "fetch.unpackLimit=1", "fetch", "--porcelain", "-v", "--no-tags",
+                    "--no-write-fetch-head", "--no-recurse-submodules", "--no-auto-gc", remote(root),
+                    *(f"+refs/heads/{b}:{d_}" for d_, b in dest.items())], remote_env(d, env), timeout=300)
+        if p.returncode:
+            raise GitError(f"git fetch: {p.stderr.decode(errors='replace').strip()[-300:]}")
+        got = {}
+        for row in p.stdout.decode(errors="replace").split("\n"):
+            old_new_ref = row[2:].split(" ")   # "<flag> <old> <new> <ref>", the flag one character or a space
+            if len(old_new_ref) == 3 and old_new_ref[2] in dest and SHA_RE.fullmatch(old_new_ref[1]):
+                got[dest[old_new_ref[2]]] = old_new_ref[1]
+        if len(got) != len(dest):
+            raise GitError(f"git fetch did not report {', '.join(b for b in dest.values() if b not in got)}")
+        adopt(d, root)
+    for b, sha in got.items():   # for people and worktrees only; hooks off, as a -c outranks the checkout's config
+        _sh(["git", "-c", "core.hooksPath=/dev/null", "update-ref", f"refs/remotes/origin/{b}", sha], cwd=root,
+            env=dict(blind_env(), GIT_NO_REPLACE_OBJECTS="1"), timeout=60)
     return got
+
+
+def fetch_ids(root, *revs, env=None) -> None:
+    """Origin's objects for `revs` (commit ids or refs on origin, e.g. refs/pull/<n>/head) into the checkout's
+    objects, fetched BORROWED; raises GitError when origin would not send them."""
+    with borrowed(root) as d:
+        p = _bytes(["git", "-c", "fetch.unpackLimit=1", "fetch", "-q", "--no-tags", "--no-write-fetch-head",
+                    "--no-recurse-submodules", "--no-auto-gc", remote(root), *revs], remote_env(d, env), timeout=300)
+        if p.returncode:
+            raise GitError(f"git fetch {' '.join(r[:12] for r in revs)}: "
+                           f"{p.stderr.decode(errors='replace').strip()[-300:]}")
+        adopt(d, root)
+
+
+def objects_dir(root) -> str:
+    """The checkout's shared objects directory, named by git with no config of anyone's but the checkout's own."""
+    rc, out = _sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=root, env=blind_env(),
+                  timeout=60)
+    d = os.path.join(out.strip(), "objects") if rc == 0 and len(out.splitlines()) == 1 else ""
+    if not (d and os.path.isabs(d) and os.path.isdir(os.path.join(d, "pack"))):
+        raise GitError(f"git names no objects directory for {root}: {out.strip()[-300:]}")
+    return d
+
+
+@contextlib.contextmanager
+def borrowed(root):
+    """BORROWED: a scratch bare repo, gone on exit, whose one tie to the checkout is objects/info/alternates pointing
+    at its objects. Git run there with GIT_DIR set to it reads none of the checkout's config, hooks (core.hooksPath,
+    a reference-transaction hook), attributes, refs or replace refs. -> its git dir."""
+    objects = objects_dir(root)
+    d = tempfile.mkdtemp(prefix="cc-land.git.")
+    try:
+        rc, err = _sh(["git", "init", "-q", "--bare", "--template=", d], cwd=d, env=blind_env(), timeout=60)
+        if rc:
+            raise GitError(f"git init {d}: {err.strip()[-300:]}")
+        os.makedirs(os.path.join(d, "objects", "info"), exist_ok=True)
+        with open(os.path.join(d, "objects", "info", "alternates"), "w") as f:
+            f.write(objects + "\n")
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def remote_env(git_dir, env=None) -> dict:
+    """The environment for git that talks to origin from a borrowed() repo: the lander's own with no GIT_* of the
+    caller's, so the user's global config (the credential helper that answers with gh's or a member's GH_TOKEN)
+    still applies, and the checkout's config (http.proxy, http.sslVerify, credential.helper) does not."""
+    e = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    e.update(env or {})
+    e.update(GIT_DIR=git_dir, GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0")
+    return e
+
+
+def adopt(git_dir, root) -> None:
+    """Every pack the borrowed repo received, copied as files into the checkout's objects/pack: no git runs in the
+    checkout. The .idx goes last, since git finds a pack by its index."""
+    src, dst = os.path.join(git_dir, "objects", "pack"), os.path.join(objects_dir(root), "pack")
+    for name in sorted(os.listdir(src)):
+        if not (name.startswith("pack-") and name.endswith(".pack")):
+            continue
+        stem = name[:-5]
+        for ext in (".pack", ".rev", ".idx"):
+            f = os.path.join(src, stem + ext)
+            if not os.path.exists(f) or os.path.exists(os.path.join(dst, stem + ext)):
+                continue
+            tmp = tempfile.NamedTemporaryFile(dir=dst, prefix="tmp_cc_land_", delete=False)
+            try:
+                with tmp, open(f, "rb") as r:
+                    shutil.copyfileobj(r, tmp)
+                os.chmod(tmp.name, 0o444)
+                os.replace(tmp.name, os.path.join(dst, stem + ext))
+            except OSError as x:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp.name)
+                raise GitError(f"could not copy {stem + ext} into {root}: {x}") from None
 
 
 def rev(root, ref, env=None) -> str:
@@ -162,8 +259,17 @@ def remote_head(root, branch, env=None) -> str:
     url = remote_url(root)
     if not url:
         return ""
-    r = git(root, "ls-remote", url, f"refs/heads/{branch}", env=env, timeout=120)
-    for row in r.out.splitlines() if r.rc == 0 else []:
+    return ls_remote(root, url, branch, env=env)
+
+
+def ls_remote(root, url, branch, env=None) -> str:
+    """origin's refs/heads/<branch> as `git ls-remote` run BORROWED says it, or '' on any doubt."""
+    try:
+        with borrowed(root) as d:
+            p = _bytes(["git", "ls-remote", url, f"refs/heads/{branch}"], remote_env(d, env), timeout=120)
+    except GitError:
+        return ""
+    for row in p.stdout.decode(errors="replace").splitlines() if p.returncode == 0 else []:
         sha, _, ref = row.partition("\t")
         if ref == f"refs/heads/{branch}" and SHA_RE.fullmatch(sha):
             return sha
@@ -331,18 +437,23 @@ def sealed(root, *revs, sh=None):
     with blind_env() (run.git_dir is the scratch repo, for a caller that pipes bytes); else run is None and (rc, out)
     says why. `sh(argv, cwd=, env=, timeout=) -> (rc, out)` runs
     each git (review.py passes its own, which its tests answer). Any doubt (a rev git will not name, an object whose
-    bytes are not its name, a fetch that fails) is the else."""
+    bytes are not its name, a fetch that fails, an id that is not a commit's) is the else."""
     env, sh = blind_env(), sh or _sh
-    # the ids are named in the checkout with no replace refs; a forged object there is caught by the fetch below
     if any(r.startswith("-") for r in revs):   # rev-parse echoes --end-of-options, so an option is refused
         yield (1, f"not a revision: {revs}"), None
         return
+    # A rev that is already an id is never peeled in the checkout: its rev-parse reads a worker's objects, and an id
+    # that names a tag would come back as the commit the tag points to, so a sealed read would diff another commit.
+    # Only a name (a ref) is resolved there, with no replace refs; every id is proved a commit after the fetch below.
+    names = [r for r in revs if not SHA_RE.fullmatch(r.lower())]
     rc, out = sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir",
-                  *(f"{r}^{{commit}}" for r in revs)], cwd=root, env=dict(env, GIT_NO_REPLACE_OBJECTS="1"), timeout=60)
+                  *(f"{r}^{{commit}}" for r in names)], cwd=root, env=dict(env, GIT_NO_REPLACE_OBJECTS="1"), timeout=60)
     lines = out.splitlines()
-    if rc or len(lines) != 1 + len(revs) or not all(SHA_RE.fullmatch(x) for x in lines[1:]):
+    if rc or len(lines) != 1 + len(names) or not all(SHA_RE.fullmatch(x) for x in lines[1:]):
         yield (rc or 1, out), None   # the scratch repo has no refs, so every rev goes to it as a commit id
         return
+    named = iter(lines[1:])
+    ids = [r.lower() if SHA_RE.fullmatch(r.lower()) else next(named) for r in revs]
     scratch = tempfile.mkdtemp(prefix="cc-land.git.")
     try:
         rc, err = sh(["git", "init", "-q", "--bare", "--template=", scratch], cwd=scratch, env=env, timeout=60)
@@ -355,11 +466,16 @@ def sealed(root, *revs, sh=None):
             return sh(["git", *args], cwd=scratch, env=env, timeout=timeout)
         run.git_dir = scratch
         rc, err = run("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", lines[0],
-                      *dict.fromkeys(lines[1:]), timeout=600)
+                      *dict.fromkeys(ids), timeout=600)
         if rc:
             yield (rc, err), None
             return
-        yield (0, lines[1:]), run
+        # the fetch re-hashed every object, so here an id peels to itself only when it is a commit: a tag's id fails
+        rc, got = run("rev-parse", *(f"{i}^{{commit}}" for i in ids), timeout=60)
+        if rc or got.splitlines() != ids:
+            yield (rc or 1, f"not every id is a commit: {' '.join(ids)}: {got.strip()[-300:]}"), None
+            return
+        yield (0, ids), run
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -412,7 +528,10 @@ def protected_same(root, rules, approved, head, env=None) -> bool:
         url = remote_url(root)
         if not url:
             return False
-        git(root, "fetch", "-q", url, approved, head, env=env, timeout=120)
+        try:
+            fetch_ids(root, approved, head, env=env)
+        except GitError:
+            return False
         if not named():
             return False
     with sealed(root, approved, head) as ((rc, out), run):

@@ -3,7 +3,9 @@
 THE TREE. A run never touches a checkout. materialise() writes the tree's files out of git into
 `$TMPDIR/cc-land.run.<pid>.<rand>/cc-land.gates.<repo>.<pr>.<rand>/head` (the shape cc-tmp-reap and `cc-sandbox member
 --tree` accept), makes it a git repo with one commit and proves `git write-tree` there equals the tree asked for
-(B1: the identity check greps a real work tree). Everything under the run directory goes when the run ends.
+(B1: the identity check greps a real work tree). The files are read out of the checkout's objects in a borrowed repo
+(git.borrowed) and every git there runs with git.blind_env(), so no config, attributes, filter or replace ref of the
+checkout's runs or shapes them. Everything under the run directory goes when the run ends.
 
 THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` for a member's landing):
   box      by class — static, hermetic and timing in the bwrap profile (sandbox.py); host and box on the host with
@@ -51,6 +53,7 @@ import time
 from dataclasses import dataclass, field
 
 from lander import admission as A
+from lander import git as G
 from lander import manifest as M
 from lander import records as REC
 from lander import sandbox as S
@@ -86,40 +89,49 @@ def materialise(repo_root: str, tree: str, label: str = "lander.0") -> tuple:
         gates = tempfile.mkdtemp(prefix=f"cc-land.gates.{label}.", dir=run_dir)
         head = os.path.join(gates, "head")
         os.mkdir(head)
-        genv = {**os.environ, "GIT_INDEX_FILE": os.path.join(run_dir, "index")}
-        for argv in (["git", "-C", repo_root, "read-tree", tree],
-                     ["git", "-C", repo_root, "checkout-index", "-a", "-f", f"--prefix={head}/"]):
-            p = subprocess.run(argv, env=genv, capture_output=True, text=True)
-            if p.returncode:
-                raise Unrunnable(f"could not write the tree out: {p.stderr.strip()[-300:]}")
-        g = ["git", "-C", head, "-c", "user.name=lander", "-c", "user.email=lander@localhost"]
-        subprocess.run(g + ["init", "-q"], check=True, capture_output=True)
-        subprocess.run(g + ["add", "-A", "-f"], check=True, capture_output=True)
-        # a submodule (gitlink) is written out as an empty directory, which add cannot turn back into the link; it
-        # has no files to prove, so it is taken from the tree itself (a repo with a submodule was never runnable)
-        ls = subprocess.run(["git", "-C", repo_root, "ls-tree", "-r", "-z", tree], capture_output=True, text=True)
+        with G.borrowed(repo_root) as scratch:
+            # borrowed: the checkout's attributes, config (a filter's smudge, run as the lander) and replace refs
+            # are not read; its objects are, through alternates, and write-tree below proves what came out of them
+            genv = dict(G.blind_env(), GIT_DIR=scratch, GIT_INDEX_FILE=os.path.join(run_dir, "index"),
+                        GIT_WORK_TREE=head, GIT_NO_REPLACE_OBJECTS="1")
+            for argv in (["git", "read-tree", tree], ["git", "checkout-index", "-a", "-f", f"--prefix={head}/"]):
+                p = subprocess.run(argv, env=genv, cwd=scratch, capture_output=True, text=True)
+                if p.returncode:
+                    raise Unrunnable(f"could not write the tree out: {p.stderr.strip()[-300:]}")
+            # a submodule (gitlink) is written out as an empty directory, which add cannot turn back into the link;
+            # it has no files to prove, so it is taken from the tree itself (a repo with a submodule was never
+            # runnable)
+            ls = subprocess.run(["git", "ls-tree", "-r", "-z", tree], env=genv, cwd=scratch, capture_output=True,
+                                text=True)
         if ls.returncode:
             raise Unrunnable(f"could not list the tree: {ls.stderr.strip()[-300:]}")
+        # the new repo's own git reads no config but these two, and no attributes of anyone's
+        g = ["git", "-C", head, "-c", "user.name=lander", "-c", "user.email=lander@localhost"]
+        henv = G.blind_env()
+        subprocess.run(g + ["init", "-q", "--template="], env=henv, check=True, capture_output=True)
+        subprocess.run(g + ["add", "-A", "-f"], env=henv, check=True, capture_output=True)
         for ent in ls.stdout.split("\0"):
             meta, _, path = ent.partition("\t")
             if meta.startswith("160000 commit "):
                 subprocess.run(g + ["update-index", "--add", "--cacheinfo", f"160000,{meta.split()[2]},{path}"],
-                               check=True, capture_output=True)
-        got = subprocess.run(g + ["write-tree"], capture_output=True, text=True).stdout.strip()
+                               env=henv, check=True, capture_output=True)
+        got = subprocess.run(g + ["write-tree"], env=henv, capture_output=True, text=True).stdout.strip()
         if got != tree:
             raise Unrunnable(f"the tree written out is {got or 'none'}, not {tree}")
-        subprocess.run(g + ["commit", "-qm", f"tree {tree}", "--no-verify"], check=True, capture_output=True)
+        subprocess.run(g + ["commit", "-qm", f"tree {tree}", "--no-verify"], env=henv, check=True, capture_output=True)
         return run_dir, head
-    except (Unrunnable, OSError, subprocess.CalledProcessError) as e:
+    except (Unrunnable, OSError, subprocess.CalledProcessError, G.GitError) as e:
         shutil.rmtree(run_dir, ignore_errors=True)
         raise e if isinstance(e, Unrunnable) else Unrunnable(f"could not write the tree out: {e}") from None
 
 
 def tree_of(repo_root: str, rev: str) -> str:
     """The tree id of a commit or tree; rev "" is the working copy (tracked and untracked, not ignored)."""
-    if rev:
-        p = subprocess.run(["git", "-C", repo_root, "rev-parse", f"{rev}^{{tree}}"], capture_output=True, text=True)
-        return p.stdout.strip() if p.returncode == 0 else ""
+    if rev:   # read VERIFIED (git.tree_of): a replace ref in the checkout would name another commit's tree
+        try:
+            return G.tree_of(repo_root, rev)
+        except G.GitError:
+            return ""
     with tempfile.TemporaryDirectory() as d:
         env = {**os.environ, "GIT_INDEX_FILE": os.path.join(d, "index")}
         top = subprocess.run(["git", "-C", repo_root, "rev-parse", "--show-toplevel"], capture_output=True, text=True)

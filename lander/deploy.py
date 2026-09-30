@@ -191,20 +191,17 @@ def git_lock(root):
 
 
 def verified_tip(root, base):
-    """origin's <base> as the lander may trust it, or '' on any doubt: fetched from the lander's own URL with a
-    forced refspec, and refs/remotes/origin/<base> is then the very sha ls-remote names. The caller holds git_lock."""
+    """origin's <base> as the lander may trust it, or '' on any doubt: the sha git.fetch reports origin sent from the
+    lander's own URL (fetched borrowed, so no config or hook of the checkout's runs or steers it), and ls-remote names
+    the same sha. The caller holds git_lock."""
     url = G.remote_url(root)
     if not url or not re.fullmatch(r"[A-Za-z0-9._/-]+", base or ""):
         return ""
-    rc, _ = git(root, "fetch", "-q", url, f"+refs/heads/{base}:refs/remotes/origin/{base}", timeout=120)
-    if rc:
+    try:
+        sha = G.fetch(root, base)[base]
+    except G.GitError:
         return ""
-    rc, sha = git(root, "rev-parse", f"refs/remotes/origin/{base}")
-    if rc or not re.fullmatch(r"[0-9a-f]{40}", sha):
-        return ""
-    rc, ls = git(root, "ls-remote", url, f"refs/heads/{base}", timeout=120)
-    named = [ln.split("\t")[0] for ln in ls.splitlines() if ln.endswith(f"\trefs/heads/{base}")] if rc == 0 else []
-    return sha if named == [sha] else ""
+    return sha if G.ls_remote(root, url, base) == sha else ""
 
 
 # --- the steps -----------------------------------------------------------------------------------------------------

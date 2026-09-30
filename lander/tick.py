@@ -208,8 +208,9 @@ def due_catchup(repo) -> bool:
 
 def tip_plan(root, base, head, files, fallback=""):
     """The tip run's plan: the box-class checks the merged range reaches, from the tip's own manifest (or the host
-    fallback, manifest.host_fallback, for a repo that ships none). It never raises: a tree with no manifest, or a
-    broken one, reaches no box check. A gate-first change ran its box checks before the merge, on its own base; the
+    fallback, manifest.host_fallback, for a repo that ships none). A tree with no manifest, or a broken one, reaches
+    no box check; a manifest that cannot be read VERIFIED raises GitError, which ends the tip run, and the deploy
+    with it, in tip_and_deploy. A gate-first change ran its box checks before the merge, on its own base; the
     tip runs them again, because the tip is what deploys."""
     from lander import manifest as MF
     from lander import plan as P

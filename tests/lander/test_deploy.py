@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -49,6 +50,22 @@ class Box(Case):
         self.real_running = D.running
         G.REMOTES = os.path.join(self.tmp, "remotes.json")   # what `lander-self promote` pins
         C.write_json(G.REMOTES, {os.path.realpath(self.root): "https://github.com/o/demo.git"})
+        # git.fetch and git.ls_remote run real git in a borrowed repo; the fake box answers them instead, as it answers
+        # rev-parse refs/remotes/origin/<b> and ls-remote
+        def fetch(root, *branches, env=None):
+            got = {b: C.sh(["git", "rev-parse", f"refs/remotes/origin/{b}"], cwd=root)[1].strip() for b in branches}
+            if not all(G.SHA_RE.fullmatch(v) for v in got.values()):
+                raise G.GitError("fetch failed")
+            return got
+
+        def ls_remote(root, url, branch, env=None):
+            rc, out = C.sh(["git", "ls-remote", url, f"refs/heads/{branch}"], cwd=root)
+            rows = [r.split("\t")[0] for r in out.splitlines() if r.endswith(f"\trefs/heads/{branch}")] if rc == 0 else []
+            return rows[0] if rows else ""
+        for name, fn in (("fetch", fetch), ("ls_remote", ls_remote)):
+            p = mock.patch.object(G, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
 
     def tearDown(self):
         for k in ("CC_DEV", "CC_UNITS_DIR"):

@@ -798,6 +798,124 @@ class RealUnits(TL.Fixture):
         self.assertEqual(G.merge_tree(self.work, base, other), (None, ["f"]))   # a conflict is still one
         self.assertFalse(os.path.exists(mark))
 
+    def plant(self, root, hook="", attributes="", **config):
+        """What a worker can write into a checkout's shared .git: a hook under a core.hooksPath of its own, a line of
+        info/attributes, config keys. -> the file the planted program touches when it runs."""
+        mark = os.path.join(self.tmp, "ran")
+        common = self.git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if hook:
+            hooks = os.path.join(self.tmp, "hooks")
+            os.makedirs(hooks, exist_ok=True)
+            with open(os.path.join(hooks, hook), "w") as f:
+                f.write(f"#!/bin/sh\ntouch {mark}\ncat >/dev/null\n")
+            os.chmod(os.path.join(hooks, hook), 0o755)
+            self.git(root, "config", "core.hooksPath", hooks)
+        if attributes:
+            os.makedirs(os.path.join(common, "info"), exist_ok=True)
+            with open(os.path.join(common, "info", "attributes"), "w") as f:
+                f.write(attributes)
+        for k, v in config.items():
+            self.git(root, "config", k.replace("_", "."), v.format(mark=mark))
+        return mark
+
+    def test_a_filter_planted_in_the_checkout_never_runs_when_a_tree_is_written_out(self):
+        """`* filter=evil` in .git/info/attributes and filter.evil.smudge in the shared config: read-tree and
+        checkout-index in the checkout ran the worker's program as the lander, and a pass-through filter still matched
+        write-tree. materialise writes the tree out in a borrowed repo, which reads neither."""
+        self.main({"f": "one\n"})
+        tree = self.git(self.work, "rev-parse", "origin/main^{tree}")
+        mark = self.plant(self.work, attributes="* filter=evil\n", filter_evil_smudge="touch {mark}; cat",
+                          filter_evil_clean="cat")
+        self.git(self.work, "checkout-index", "-f", "--prefix=" + os.path.join(self.tmp, "bite") + "/", "f")
+        self.assertTrue(os.path.exists(mark))   # it bites the checkout's git
+        os.unlink(mark)
+        run_dir, head = RUN.materialise(self.work, tree)
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        self.assertFalse(os.path.exists(mark))
+        with open(os.path.join(head, "f")) as f:
+            self.assertEqual(f.read(), "one\n")
+
+    def test_a_hook_planted_in_the_checkout_never_runs_on_a_fetch(self):
+        """core.hooksPath with a reference-transaction hook: `git fetch --porcelain` in the checkout ran it as the
+        lander. Every fetch and ls-remote goes borrowed now: the hook never runs, what origin sent is what is reported,
+        and its objects are in the checkout for the reads after it."""
+        head = self.push("track/row-1", {"new": "n\n"})
+        tip = self.git(self.origin, "rev-parse", "refs/heads/main")
+        mark = self.plant(self.root, hook="reference-transaction")
+        self.git(self.root, "fetch", "-q", "origin")
+        self.assertTrue(os.path.exists(mark))   # it bites the checkout's git
+        os.unlink(mark)
+        self.assertEqual(G.fetch(self.root, "main", "track/row-1"), {"main": tip, "track/row-1": head})
+        self.assertFalse(os.path.exists(mark))
+        self.assertEqual(self.git(self.root, "cat-file", "-t", head), "commit")
+        self.assertEqual(G.remote_head(self.root, "track/row-1"), head)
+        D = __import__("lander.deploy", fromlist=["deploy"])
+        self.assertEqual(D.verified_tip(self.root, "main"), tip)
+        other = self.push("track/row-2", {"other": "o\n"})
+        G.fetch_ids(self.root, "refs/heads/track/row-2")
+        self.assertEqual(self.git(self.root, "cat-file", "-t", other), "commit")
+        self.assertFalse(os.path.exists(mark))
+        with self.assertRaises(G.GitError):   # a branch origin does not have is not reported, so it raises
+            G.fetch(self.root, "no-such-branch")
+
+    def test_a_replace_ref_in_the_checkout_cannot_choose_the_tree_the_tip_runs(self):
+        """run.tree_of, which the tip's checks run on (tick.make_check), took rev-parse's answer, and rev-parse
+        follows refs/replace: a replaced commit ran the tip's checks on another tree. It reads VERIFIED now."""
+        self.main({"f": "one\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        real = self.git(self.work, "rev-parse", f"{base}^{{tree}}")
+        head = self.push("track/row-1", {"new": "n\n"})
+        alt = self.git(self.work, "commit-tree", "-m", "alt", self.git(self.work, "rev-parse", f"{head}^{{tree}}"))
+        self.git(self.work, "replace", base, alt)
+        self.assertNotEqual(self.git(self.work, "rev-parse", f"{base}^{{tree}}"), real)   # it bites
+        self.assertEqual(RUN.tree_of(self.work, base), real)
+        self.assertEqual(RUN.tree_of(self.work, "0" * 40), "")   # an object it cannot read is no tree, never a guess
+
+    def test_an_id_that_is_not_a_commit_is_never_read_as_another_commit(self):
+        """sealed() peeled every rev with the checkout's `rev-parse <rev>^{commit}`, so an id naming a tag object came
+        back as the commit the tag points to and the sealed read diffed that one. A worker writes the checkout's
+        objects: an annotated tag, or a loose object filed under a real commit's id. Every id is read as itself now or
+        not at all."""
+        self.main({"f": "one\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        head = self.push("track/row-1", {"new": "n\n"})
+        tag = subprocess.run(["git", "hash-object", "-t", "tag", "-w", "--stdin"], cwd=self.work, check=True,
+                             capture_output=True, text=True, input=f"object {head}\ntype commit\ntag t\n"
+                             "tagger a <a@b> 0 +0000\n\nt\n").stdout.strip()
+        self.assertEqual(self.git(self.work, "rev-parse", f"{tag}^{{commit}}"), head)   # it bites the checkout's git
+        with self.assertRaises(G.GitError):
+            G.changed(self.work, base, tag)
+        with self.assertRaises(G.GitError):
+            G.changed(self.work, tag.upper(), base)
+        with G.sealed(self.work, tag) as ((rc, out), run):
+            self.assertIsNone(run, out)
+        # the same tag's bytes filed under a commit's id; git refuses to peel it, and it must stay refused
+        forged = self.git(self.work, "commit-tree", "-m", "x", self.git(self.work, "rev-parse", f"{base}^{{tree}}"))
+        common = self.git(self.work, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        loose = os.path.join(common, "objects", forged[:2], forged[2:])
+        os.chmod(loose, 0o644)
+        shutil.copyfile(os.path.join(common, "objects", tag[:2], tag[2:]), loose)
+        with self.assertRaises(G.GitError):
+            G.changed(self.work, base, forged)
+        self.assertEqual(G.changed(self.work, base, head), ["new"])   # a commit id and a name still read as before
+        self.assertEqual(G.changed(self.work, "origin/main", head), ["new"])
+
+    def test_the_merge_is_made_once_per_base_and_head(self):
+        """merge_tree builds a sealed copy under the git lock, seconds each: the job's recorded tree is reused while
+        its base and head are the ones it was made from, so the two checks a change dispatches share one merge."""
+        self.pr(1, {"a/x": "good\n", "b/gate": "good\n"})
+        J.submit("demo", 1)
+        calls = []
+        real = G.merge_tree
+        with mock.patch.object(G, "merge_tree", lambda *a, **kw: calls.append(sys._getframe(1).f_code.co_name)
+                               or real(*a, **kw)):
+            u, lines = self.land()
+        j = self.job()
+        self.assertEqual(j.state, T.DEPLOY_PENDING, lines)
+        self.assertEqual(sorted(j.results), ["a", "b"])
+        self.assertEqual(calls.count("checking"), 1, calls)   # two checks dispatched, one merge made for them
+        self.assertEqual(j.extra["tree_of"], [j.base_sha, j.head])
+
     def test_a_replace_ref_in_the_checkout_cannot_choose_the_manifest(self):
         """`git replace` on main's manifest blob makes the checkout's `git show` return a forged manifest, so a worker
         picked which checks run; a replaced base commit forges its tree, and with it tree_of and which files a change
