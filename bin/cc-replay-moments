@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""cc-replay-moments — before a fix is built, count the past owner nudges and recorded failures it would have prevented.
+
+  cc-replay-moments extract --labels FILE [--snapshots DIR] [--slack DIR] --out FILE
+      Rebuild the moment behind every labelled nudge and every recorded failure, and write them one JSON line each.
+  cc-replay-moments score --new PATH [--old PATH] (--moments FILE | --labels FILE [--snapshots DIR] [--slack DIR])
+                          [--verbose]
+      Run every moment through the OLD and the NEW version of a rule and print, per class, how many moments could be
+      replayed and how many each version would have prevented. --verbose lists each moment either version fired on.
+  cc-replay-moments selfcheck
+
+A MOMENT is what the box had in front of it just before a nudge: the owner message (time, chat, thread, text) and the
+box post before it — the last post in the same thread, else the last in the same chat, with reactions and failed posts
+skipped (the nudge pass's own rule). It is read from the collector's snapshots first (their slack.jsonl carries the
+box post already), then from the Slack archive and the outbox log for the days no snapshot covers. A labelled nudge
+whose message or box post cannot be found is UNREPLAYABLE: it stays in the table as a count and is never dropped.
+A failure is a moment too: each cluster in the snapshots' failures.jsonl stands for `n` records, the examples it
+quotes are the text the writer saw and are replayable, and the rest of its `n` are counted unreplayable.
+The owner messages in the labels' own time span that were NOT labelled are CONTROL moments: nothing is prevented
+there, and a version that fires on many of them is firing on ordinary traffic, not on the fault.
+
+A VERSION is a file. A Python file (`.py`, or any file that defines `judge`) is imported and `judge(moment)` is
+called; anything else is executed once per moment with the moment as JSON on stdin and read from the first word of
+stdout. Either way it answers one of: `pass` (or nothing) — the moment goes as it went — or `refused`, `rewritten`,
+`status` (a push reached the owner) or `flagged`. A Python judge may return `(verdict, after_s)`, and an executable
+may print `<verdict> <after_s>`: the version acts `after_s` seconds after the box post, and a moment where that falls
+after the owner's message is LATE — the nudge had already happened, so it counts as not prevented. `--old` defaults to
+a version that never fires, which is what the box did in history by definition: every nudge in the labels happened.
+A replayed old version that claims to prevent some is the replay's own error bar, read it before the new column.
+
+No model, no network, no clock: the same inputs print the same bytes. It reads the labels, the snapshots, the archive
+and the outbox log and writes only --out. It posts nothing and records nothing. Stdlib only; no box's repo names,
+channels or people are in this file — the labels and snapshots are data and live outside the repo.
+"""
+import calendar, collections, glob, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+SNAPSHOTS = os.environ.get("CC_REPLAY_SNAPSHOTS") or f"{HOME}/.cc/state/improve/snapshots"
+SLACK = os.environ.get("CC_REPLAY_SLACK") or f"{HOME}/.cc/slack"
+VERDICTS = ("refused", "rewritten", "status", "flagged")
+SKIP_KINDS = ("post-failed",)          # and every react*: a reaction is not a post the owner read as the box's answer
+USAGE = ("usage: cc-replay-moments extract --labels FILE [--snapshots DIR] [--slack DIR] --out FILE\n"
+         "       cc-replay-moments score --new PATH [--old PATH] (--moments FILE | --labels FILE [--snapshots DIR] "
+         "[--slack DIR]) [--verbose]\n"
+         "       cc-replay-moments selfcheck")
+
+
+def die(msg, rc=2):
+    print(f"cc-replay-moments: {msg}", file=sys.stderr)
+    sys.exit(rc)
+
+
+def secs(stamp):
+    """ISO UTC (…Z, seconds optional) -> epoch seconds; None stays None."""
+    if not stamp:
+        return None
+    s = stamp.rstrip("Z")
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return calendar.timegm(time.strptime(s[:19] if fmt.endswith("%S") else s[:16], fmt))
+        except ValueError:
+            continue
+    return None
+
+
+def jsonl(path):
+    out = []
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def day_dirs(root):
+    """A snapshot root (its day dirs, oldest first, the `latest` link skipped) or one day dir itself."""
+    if not root or not os.path.isdir(root):
+        return []
+    if os.path.exists(os.path.join(root, "index.json")) or os.path.exists(os.path.join(root, "slack.jsonl")):
+        return [root]
+    return [d for d in sorted(glob.glob(os.path.join(root, "*")))
+            if os.path.isdir(d) and not os.path.islink(d) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", os.path.basename(d))]
+
+
+# ── extract ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def load_sources(snapshots, slack):
+    """Owner messages keyed (chat, ts) with the source each came from, and the outbox posts by thread and by chat."""
+    msgs = {}
+    for d in day_dirs(snapshots):
+        for r in jsonl(os.path.join(d, "slack.jsonl")):
+            if r.get("role") == "owner" and r.get("chat") and r.get("ts"):
+                msgs[(r["chat"], r["ts"])] = dict(r, src="snapshot")
+    for f in sorted(glob.glob(os.path.join(slack, "archive", "**", "*.jsonl"), recursive=True)):
+        for r in jsonl(f):
+            if r.get("role") == "owner" and r.get("chat") and r.get("ts"):
+                msgs.setdefault((r["chat"], r["ts"]), dict(r, src="archive"))
+    by_thread, by_chat = collections.defaultdict(list), collections.defaultdict(list)
+    try:
+        with open(os.path.join(slack, "outbox.log"), errors="replace") as fh:
+            for line in fh:
+                p = line.rstrip("\n").split("\t")
+                if len(p) < 5 or p[1].startswith("react") or p[1] in SKIP_KINDS:
+                    continue
+                post = {"at": p[0], "kind": p[1], "text": "\t".join(p[4:])}
+                by_thread[(p[2], p[3])].append(post)
+                by_chat[p[2]].append(post)
+    except OSError:
+        pass
+    for lst in list(by_thread.values()) + list(by_chat.values()):
+        lst.sort(key=lambda x: x["at"])
+    return msgs, by_thread, by_chat
+
+
+def box_before(m, by_thread, by_chat):
+    """The box post the owner saw last before message m: the snapshot's own when it has one, else the outbox's."""
+    if m.get("prev_box"):
+        return m["prev_box"]
+    th, at = m.get("thread_ts") or m["ts"], m.get("at") or ""
+    cands = []
+    if th != m["ts"]:
+        cands = [x for x in by_thread.get((m["chat"], th), []) if x["at"] < at]
+    if not cands:
+        cands = [x for x in by_chat.get(m["chat"], []) if x["at"] < at]
+    return cands[-1] if cands else None
+
+
+def moment_of(m, cls, source, by_thread, by_chat):
+    prev = box_before(m, by_thread, by_chat)
+    a, b = secs(m.get("at")), secs(prev.get("at")) if prev else None
+    mo = {"id": f"{source[0]}:{m['chat']}:{m['ts']}", "source": source, "class": cls, "at": m.get("at"),
+          "chat": m["chat"], "thread_ts": m.get("thread_ts") or m["ts"], "in_thread": (m.get("thread_ts") or m["ts"]) != m["ts"],
+          "text": m.get("text") or "", "prev_box": prev, "gap_s": (a - b) if a is not None and b is not None else None,
+          "src": m.get("src"), "replayable": prev is not None}
+    if prev is None:
+        mo["why"] = "no box post before it"
+    return mo
+
+
+def extract(labels, snapshots, slack):
+    lab = jsonl(labels)
+    if not lab:
+        die(f"no labelled nudges in {labels}")
+    msgs, by_thread, by_chat = load_sources(snapshots, slack)
+    out, labelled = [], set()
+    for r in lab:
+        key = (r.get("chat"), r.get("ts"))
+        labelled.add(key)
+        m = msgs.get(key)
+        if m is None:
+            out.append({"id": f"n:{key[0]}:{key[1]}", "source": "nudge", "class": r.get("class") or "?", "at": None,
+                        "replayable": False, "why": "message not in the snapshots or the archive"})
+        else:
+            out.append(moment_of(m, r.get("class") or "?", "nudge", by_thread, by_chat))
+    found = sorted(x["at"] for x in out if x.get("at"))
+    if found:                           # CONTROL: the owner's other messages over the span the labels were read over
+        lo, hi = found[0], found[-1]
+        for key, m in msgs.items():
+            if key not in labelled and lo <= (m.get("at") or "") <= hi:
+                mo = moment_of(m, "-", "control", by_thread, by_chat)
+                mo["id"] = f"c:{key[0]}:{key[1]}"
+                out.append(mo)
+    for d in day_dirs(snapshots):
+        day = os.path.basename(os.path.normpath(d))
+        for c in jsonl(os.path.join(d, "failures.jsonl")):
+            kind, ex = c.get("kind") or "?", [e for e in (c.get("examples") or []) if isinstance(e, str) and e.strip()]
+            cid, n = (c.get("clusters") or ["?"])[0], max(int(c.get("n") or 0), len(ex))
+            for i in range(n):
+                mo = {"id": f"f:{day}:{cid}:{i}", "source": "failure", "class": kind, "at": c.get("last"),
+                      "repo": c.get("repo"), "writers": c.get("writers") or [], "expected": c.get("expected") or "",
+                      "text": ex[i] if i < len(ex) else "", "prev_box": None, "gap_s": None, "replayable": i < len(ex)}
+                if i >= len(ex):
+                    mo["why"] = "the snapshot quotes no text for this record"
+                out.append(mo)
+    out.sort(key=lambda x: (x["source"], x.get("at") or "", x["id"]))
+    return out
+
+
+# ── versions ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def never(_moment):
+    return "pass"
+
+
+def load_version(path):
+    """A callable moment -> (verdict, after_s). None is the version that never fires."""
+    if not path or path == "none":
+        return "none", never
+    if not os.path.isfile(path):
+        die(f"no version at {path}")
+    name = os.path.basename(path)
+    with open(path, errors="replace") as fh:
+        src = fh.read()
+    if path.endswith(".py") or re.search(r"^def judge\(", src, re.M):
+        spec = importlib.util.spec_from_loader(f"ccrm_{abs(hash(path))}", loader=None, origin=path)
+        mod = importlib.util.module_from_spec(spec)
+        mod.__file__ = path
+        exec(compile(src, path, "exec"), mod.__dict__)
+        if not callable(getattr(mod, "judge", None)):
+            die(f"{path} defines no judge(moment)")
+        return name, mod.judge
+    if not os.access(path, os.X_OK):
+        die(f"{path} is neither a Python judge nor executable")
+
+    def run(moment):
+        p = subprocess.run([path], input=json.dumps(moment), capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            raise RuntimeError(f"exit {p.returncode}: {p.stderr.strip()[:200]}")
+        w = p.stdout.split()
+        return (w[0], float(w[1])) if len(w) > 1 else (w[0] if w else "pass")
+    return name, run
+
+
+def verdict(fn, moment, label):
+    """-> 'pass' | a VERDICT | 'late'. A version that raises or answers another word stops the run: a count built on
+    a judge that failed half the time is not a count."""
+    try:
+        v = fn(dict(moment))
+    except Exception as e:                      # noqa: BLE001 — the candidate's own fault, named with its moment
+        die(f"{label} failed on {moment['id']}: {e}", 1)
+    after = None
+    if isinstance(v, (tuple, list)):
+        v, after = (v[0], v[1]) if len(v) > 1 else (v[0], None)
+    v = (v or "pass").strip().lower() if isinstance(v, str) else ("pass" if v is None else v)
+    if v != "pass" and v not in VERDICTS:
+        die(f"{label} answered {v!r} on {moment['id']}: want pass or one of {', '.join(VERDICTS)}", 1)
+    if v != "pass" and after is not None and moment.get("gap_s") is not None and float(after) > moment["gap_s"]:
+        return "late"
+    return v
+
+
+# ── score ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def score(moments, old, new, verbose=False):
+    (on, of), (nn, nf) = old, new
+    rows = {"nudge": collections.OrderedDict(), "failure": collections.OrderedDict()}
+    ctl = {"n": 0, "old": 0, "new": 0}
+    why = collections.Counter()
+    lines = []
+    for mo in moments:
+        src = mo.get("source")
+        if src == "control":
+            if not mo.get("replayable"):
+                continue
+            ctl["n"] += 1
+            ctl["old"] += verdict(of, mo, on) in VERDICTS
+            ctl["new"] += verdict(nf, mo, nn) in VERDICTS
+            continue
+        if src not in rows:
+            continue
+        r = rows[src].setdefault(mo.get("class") or "?", collections.Counter())
+        r["total"] += 1
+        if not mo.get("replayable"):
+            r["unrep"] += 1
+            why[f"{src}: {mo.get('why') or 'unknown'}"] += 1
+            continue
+        r["rep"] += 1
+        vo, vn = verdict(of, mo, on), verdict(nf, mo, nn)
+        po, pn = vo in VERDICTS, vn in VERDICTS
+        r["old"] += po
+        r["new"] += pn
+        r["gained"] += pn and not po
+        r["lost"] += po and not pn
+        r["late"] += vn == "late"
+        if pn:
+            r[f"v:{vn}"] += 1
+        if verbose and (po or pn or "late" in (vo, vn)):
+            lines.append(f"  {mo['id']}  {mo.get('class')}  old={vo} new={vn}")
+    out = [f"cc-replay-moments: old={on} new={nn}"]
+    for src, title in (("nudge", "NUDGES by class"), ("failure", "FAILURES by kind")):
+        if not rows[src]:
+            continue
+        tab = sorted(rows[src].items(), key=lambda kv: (-kv[1]["total"], kv[0]))
+        w = max(12, max(len(k) for k, _ in tab))
+        out += ["", title, f"{'class':<{w}}  {'total':>5}  {'replay':>6}  {'unrep':>5}  {'old':>4}  {'new':>4}  "
+                            f"{'gained':>6}  {'lost':>4}  {'late':>4}  new verdicts"]
+        tot = collections.Counter()
+        for k, r in tab:
+            tot.update(r)
+            vs = ", ".join(f"{v} {r[f'v:{v}']}" for v in VERDICTS if r[f"v:{v}"])
+            out.append(f"{k:<{w}}  {r['total']:>5}  {r['rep']:>6}  {r['unrep']:>5}  {r['old']:>4}  {r['new']:>4}  "
+                       f"{r['gained']:>6}  {r['lost']:>4}  {r['late']:>4}  {vs}")
+        out.append(f"{'total':<{w}}  {tot['total']:>5}  {tot['rep']:>6}  {tot['unrep']:>5}  {tot['old']:>4}  "
+                   f"{tot['new']:>4}  {tot['gained']:>6}  {tot['lost']:>4}  {tot['late']:>4}")
+    out += ["", f"control: {ctl['n']} other owner messages in the labels' span; old fires before {ctl['old']}, "
+                f"new before {ctl['new']}"]
+    if why:
+        out.append("unreplayable: " + "; ".join(f"{k} {v}" for k, v in sorted(why.items())))
+    if verbose and lines:
+        print("\n".join(lines), file=sys.stderr)
+    return "\n".join(out)
+
+
+# ── cli ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def opts(argv, flags, valued):
+    o, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in flags:
+            o[a] = True
+        elif a in valued and i + 1 < len(argv):
+            o[a] = argv[i + 1]
+            i += 1
+        else:
+            die(f"unknown or incomplete argument {a!r}\n{USAGE}")
+        i += 1
+    return o
+
+
+def moments_from(o):
+    if o.get("--moments"):
+        ms = jsonl(o["--moments"])
+        if not ms:
+            die(f"no moments in {o['--moments']}")
+        return ms
+    if not o.get("--labels"):
+        die(f"need --moments or --labels\n{USAGE}")
+    return extract(o["--labels"], o.get("--snapshots") or SNAPSHOTS, o.get("--slack") or SLACK)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__ if argv else USAGE)
+        return 0 if argv else 2
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "selfcheck":
+        return selfcheck()
+    if cmd == "extract":
+        o = opts(rest, (), ("--labels", "--snapshots", "--slack", "--out"))
+        if not o.get("--labels") or not o.get("--out"):
+            die(USAGE)
+        ms = moments_from(o)
+        tmp = o["--out"] + ".tmp"
+        with open(tmp, "w") as fh:
+            for m in ms:
+                fh.write(json.dumps(m, sort_keys=True) + "\n")
+        os.replace(tmp, o["--out"])
+        c = collections.Counter((m["source"], bool(m.get("replayable"))) for m in ms)
+        print(f"cc-replay-moments: wrote {len(ms)} moments to {o['--out']}: "
+              + ", ".join(f"{s} {c[(s, True)]} replayable / {c[(s, True)] + c[(s, False)]}"
+                          for s in ("nudge", "failure", "control")))
+        return 0
+    if cmd == "score":
+        o = opts(rest, ("--verbose",), ("--new", "--old", "--moments", "--labels", "--snapshots", "--slack"))
+        if not o.get("--new"):
+            die(USAGE)
+        print(score(moments_from(o), load_version(o.get("--old")), load_version(o["--new"]), o.get("--verbose", False)))
+        return 0
+    die(USAGE)
+
+
+# ── selfcheck ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def selfcheck():
+    fails, passed = [], [0]
+
+    def ok(name, cond):
+        if cond:
+            passed[0] += 1
+        else:
+            fails.append(name)
+            print(f"FAIL {name}")
+
+    root = tempfile.mkdtemp(prefix="cc-replay-moments-selfcheck-")
+    try:
+        snaps, slack = os.path.join(root, "snaps"), os.path.join(root, "slack")
+        day = os.path.join(snaps, "2026-01-05")
+        os.makedirs(day)
+        os.makedirs(os.path.join(slack, "archive", "p", "CA"))
+        os.symlink("2026-01-05", os.path.join(snaps, "latest"))
+
+        def w(path, rows):
+            with open(path, "w") as fh:
+                for r in rows:
+                    fh.write((r if isinstance(r, str) else json.dumps(r)) + "\n")
+
+        def own(ts, at, text, chat="CA", th=None):
+            return {"ts": ts, "thread_ts": th or ts, "chat": chat, "role": "owner", "text": text, "at": at}
+        # archive: n1 in a thread with a box post in it; n2 top-level (falls back to the chat's last post); n3 in a
+        # chat with no box post at all; c1 an unlabelled message (control); c9 outside the labels' span
+        w(os.path.join(slack, "archive", "p", "CA", "2026-01.jsonl"), [
+            own("100.1", "2026-01-04T10:00:00Z", "where are we", th="90.0"),
+            own("200.1", "2026-01-04T12:00:00Z", "status?"),
+            own("300.1", "2026-01-04T13:00:00Z", "hello?", chat="CB"),
+            own("250.1", "2026-01-04T12:20:00Z", "thanks"),
+            own("900.1", "2026-01-06T00:00:00Z", "later"),
+            {"ts": "260.1", "chat": "CA", "role": "member", "text": "not the owner", "at": "2026-01-04T12:40:00Z"}])
+        w(os.path.join(slack, "outbox.log"), [
+            "2026-01-04T09:00:00Z\tpost\tCA\t90.0\tIt's queued to land, no thumbs needed.",
+            "2026-01-04T09:30:00Z\tpost\tCA\t\ta top-level post",
+            "2026-01-04T09:59:00Z\treact\tCA\t90.0\teyes",
+            "2026-01-04T09:59:30Z\tpost-failed\tCA\t90.0\tnever reached anyone",
+            "2026-01-04T11:50:00Z\tpost\tCA\t\tI've started building it.",
+            "2026-01-04T12:29:00Z\tpost\tCA\t\tDone: it landed."])
+        # snapshot: n4 carries its own prev_box (the archive does not have n4 at all); a failure cluster of n=3 quoting 2
+        w(os.path.join(day, "slack.jsonl"), [dict(own("400.1", "2026-01-05T08:00:00Z", "done yet?", chat="CC"),
+                                                  prev_box={"at": "2026-01-05T06:00:00Z", "kind": "post",
+                                                            "text": "Running now: the fix."}, src="x")])
+        w(os.path.join(day, "failures.jsonl"), [{"clusters": ["c-1"], "kind": "notification/false-action-needed",
+                                                 "examples": ["the watchdog said land it while it was landing", "again"],
+                                                 "n": 3, "last": "2026-01-05T07:00:00Z", "writers": ["w"]}])
+        labels = os.path.join(root, "labels.jsonl")
+        w(labels, [{"ts": "100.1", "chat": "CA", "class": "landing-chase"},
+                   {"ts": "200.1", "chat": "CA", "class": "status-not-pushed"},
+                   {"ts": "300.1", "chat": "CB", "class": "message-unseen"},
+                   {"ts": "400.1", "chat": "CC", "class": "status-not-pushed"},
+                   {"ts": "500.1", "chat": "CA", "class": "status-not-pushed"}])
+        before = sorted(os.path.relpath(os.path.join(d, f), root) for d, _, fs in os.walk(root) for f in fs)
+        ms = extract(labels, snaps, slack)
+        by = {m["id"]: m for m in ms}
+        n1, n2, n3, n4 = by.get("n:CA:100.1"), by.get("n:CA:200.1"), by.get("n:CB:300.1"), by.get("n:CC:400.1")
+        ok("a nudge in a thread takes the thread's last box post, skipping reactions and failed posts",
+           n1 and n1["prev_box"]["text"].startswith("It's queued") and n1["gap_s"] == 3600 and n1["in_thread"])
+        ok("a top-level nudge takes the chat's last box post before it", n2 and n2["prev_box"]["text"] == "I've started building it."
+           and n2["gap_s"] == 600)
+        ok("a nudge with no box post before it is kept and counted unreplayable",
+           n3 and not n3["replayable"] and n3["why"] == "no box post before it")
+        ok("a snapshot's own box post is used first", n4 and n4["src"] == "snapshot" and n4["gap_s"] == 7200)
+        ok("a labelled nudge found nowhere is kept, unreplayable",
+           by.get("n:CA:500.1", {}).get("replayable") is False and "not in" in by["n:CA:500.1"]["why"])
+        ctl = [m for m in ms if m["source"] == "control"]
+        ok("control is the owner's unlabelled messages inside the labels' span only (no member, nothing after)",
+           [m["id"] for m in ctl] == ["c:CA:250.1"] and ctl[0]["prev_box"]["text"] == "I've started building it.")
+        fl = [m for m in ms if m["source"] == "failure"]
+        ok("a failure cluster of n=3 quoting 2 examples is 2 replayable moments and 1 unreplayable",
+           len(fl) == 3 and sum(m["replayable"] for m in fl) == 2 and fl[0]["class"] == "notification/false-action-needed")
+
+        cand = os.path.join(root, "new.py")
+        with open(cand, "w") as fh:
+            fh.write("import re\n"
+                     "def judge(m):\n"
+                     "    if m['source'] == 'failure':\n"
+                     "        return 'flagged' if 'landing' in m['text'] else None\n"
+                     "    t = (m.get('prev_box') or {}).get('text', '')\n"
+                     "    return ('status', 1800) if re.search(r'queued|started|running', t, re.I) else 'pass'\n")
+        old = os.path.join(root, "old.py")
+        with open(old, "w") as fh:
+            fh.write("def judge(m):\n    return 'status' if 'queued' in ((m.get('prev_box') or {}).get('text') or '') else None\n")
+        exe = os.path.join(root, "new.sh")
+        with open(exe, "w") as fh:
+            fh.write("#!/usr/bin/env python3\nimport json, re, sys\nm = json.load(sys.stdin)\n"
+                     "t = (m.get('prev_box') or {}).get('text', '') if m['source'] != 'failure' else ''\n"
+                     "if m['source'] == 'failure': print('flagged' if 'landing' in m['text'] else 'pass')\n"
+                     "elif re.search(r'queued|started|running', t, re.I): print('status 1800')\n"
+                     "else: print('pass')\n")
+        os.chmod(exe, 0o755)
+        rep = score(ms, load_version(old), load_version(cand))
+
+        def row(title, cls):
+            sect = rep.split(title, 1)[1] if title in rep else ""
+            for ln in sect.splitlines():
+                if ln.startswith(cls + " "):
+                    return ln.split()
+            return []
+        s = row("NUDGES", "status-not-pushed")
+        # status-not-pushed: n2 (started, 10 min gap < 30 min: late), n4 (running, 2 h gap: status), 500.1 unreplayable
+        ok("per class: total, replayable, unreplayable, old, new, gained, lost, late",
+           s[1:9] == ["3", "2", "1", "0", "1", "1", "0", "1"])
+        lc = row("NUDGES", "landing-chase")
+        ok("a moment both versions prevent is neither gained nor lost", lc[1:8] == ["1", "1", "0", "1", "1", "0", "0"])
+        mu = row("NUDGES", "message-unseen")
+        ok("an unreplayable nudge stays in its class's total", mu[1:4] == ["1", "0", "1"])
+        fk = row("FAILURES", "notification/false-action-needed")
+        ok("failures are scored by kind, unreplayable ones counted", fk[1:6] == ["3", "2", "1", "0", "1"])
+        ok("control counts what each version fires on outside the nudges",
+           "old fires before 0, new before 1" in rep)
+        ok("the unreplayable reasons are listed", "nudge: no box post before it 1" in rep
+           and "failure: the snapshot quotes no text for this record 1" in rep)
+        ok("an executable version scores the same as the Python one",
+           score(ms, load_version(old), load_version(exe)).split("\n", 1)[1] == rep.split("\n", 1)[1])
+        dflt = [r.split() for r in score(ms, load_version(None), load_version(cand)).splitlines()]
+        ok("--old defaults to never firing: every old column is 0",
+           all(r[4] == "0" for r in dflt if len(r) > 8 and r[1].isdigit() and r[0] != "control:")
+           and "old=none" in dflt[0][1])
+        ok("the same input prints the same bytes", score(ms, load_version(old), load_version(cand)) == rep)
+        after = sorted(os.path.relpath(os.path.join(d, f), root) for d, _, fs in os.walk(root) for f in fs)
+        ok("extract and score write nothing beside the sources", set(after) - set(before) <= {"new.py", "old.py", "new.sh"})
+
+        bad = os.path.join(root, "bad.py")
+        with open(bad, "w") as fh:
+            fh.write("def judge(m):\n    return 'maybe'\n")
+        boom = os.path.join(root, "boom.py")
+        with open(boom, "w") as fh:
+            fh.write("def judge(m):\n    raise ValueError('no')\n")
+        me = os.path.realpath(__file__)
+        for name, path, want in (("a verdict outside the list stops the run", bad, "answered 'maybe'"),
+                                 ("a judge that raises stops the run and names the moment", boom, "failed on ")):
+            p = subprocess.run([sys.executable, me, "score", "--new", path, "--labels", labels, "--snapshots", snaps,
+                                "--slack", slack], capture_output=True, text=True)
+            ok(name, p.returncode == 1 and want in p.stderr)
+        mf = os.path.join(root, "m.jsonl")
+        p = subprocess.run([sys.executable, me, "extract", "--labels", labels, "--snapshots", day, "--slack", slack,
+                            "--out", mf], capture_output=True, text=True)
+        ok("extract writes the moments and says how many replay; a day dir works as --snapshots",
+           p.returncode == 0 and "nudge 3 replayable / 5" in p.stdout and len(jsonl(mf)) == len(ms))
+        p = subprocess.run([sys.executable, me, "score", "--new", cand, "--old", old, "--moments", mf],
+                           capture_output=True, text=True)
+        ok("score over a written moments file prints the same table", p.returncode == 0 and p.stdout.strip() == rep)
+        p = subprocess.run([sys.executable, me, "score", "--labels", labels], capture_output=True, text=True)
+        ok("score with no --new is refused with the usage", p.returncode == 2 and "usage" in p.stderr)
+        p = subprocess.run([sys.executable, me, "extract", "--labels", os.path.join(root, "none.jsonl"), "--out", mf],
+                           capture_output=True, text=True)
+        ok("an empty or missing labels file is refused, not scored as zero", p.returncode == 2 and "no labelled" in p.stderr)
+
+        # the example candidates shipped beside the tests, when this file sits in its tree
+        ex = os.path.join(os.path.dirname(os.path.dirname(me)), "tests", "replay-moments")
+        sp, lw = os.path.join(ex, "status-push-45m.py"), os.path.join(ex, "landing-wait-4h.py")
+        if os.path.isfile(sp) and os.path.isfile(lw):
+            _, spj = load_version(sp)
+            _, lwj = load_version(lw)
+
+            def mk(text, gap):
+                return {"id": "x", "source": "nudge", "prev_box": {"text": text}, "gap_s": gap}
+            q = "It's queued to land, no thumbs needed."
+            ok("status-push fires 45 min after an in-flight post, and is late before that",
+               verdict(spj, mk(q, 3000), "sp") == "status" and verdict(spj, mk(q, 600), "sp") == "late")
+            ok("status-push stays quiet after a post that says the work is done or asks a question",
+               verdict(spj, mk("Done: it landed.", 9000), "sp") == "pass"
+               and verdict(spj, mk("Decision needed: which one? It is queued.", 9000), "sp") == "pass")
+            ok("landing-wait fires only on a queued-to-land post, four hours on",
+               verdict(lwj, mk(q, 15000), "lw") == "flagged" and verdict(lwj, mk(q, 3000), "lw") == "late"
+               and verdict(lwj, mk("I've started building it.", 15000), "lw") == "pass")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print(f"cc-replay-moments selfcheck: {passed[0]} passed, {len(fails)} failed")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
