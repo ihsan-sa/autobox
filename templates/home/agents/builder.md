@@ -12,6 +12,7 @@ That worktree is already prepared. Work there; the end hook commits, and the pla
 delivers it. Without that header, the legacy worktree and the no-commit rule below stay in effect.
 
 - Edit only inside that worktree. Nothing outside it is yours: no other checkout, no `~/.cc`, no service, no config, no file in the home directory.
+- Reach that worktree with `cd` and absolute paths. Never call EnterWorktree: on a path outside `.claude/worktrees` it raises a permission dialog that nobody is watching, and you would sit on it until someone notices.
 - Do not commit, push, merge or post anywhere. The session that spawned you lands the work.
 - The generic tree (`core/`, published as its own public repo) must never name this box — its user, its host, its control repo. Box facts belong in the private overlay outside `core/`.
 - A baseline copy of `bin/` to run an old selfcheck against comes from `cc-bin-at <ref> [dir]` and from nowhere else: a scratch bin/ built with `ln -s` into a checkout has twice let a later `cp` follow a link and overwrite a live tool.
