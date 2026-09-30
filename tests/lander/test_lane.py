@@ -635,6 +635,8 @@ class Machine(Fixture):
         head = self.pr(1, {"a/x": "n\n"})
         real = self.origin_rev("main")
         planted = self.forge_origin()
+        self.assertEqual(G.fetch(self.root, "main"), {"main": real})   # what origin sent, not what the ref says
+        self.git(self.root, "update-ref", "refs/remotes/origin/main", planted)
         self.assertEqual(TP.origin_tip(self.root, "main"), real)                                    # tip
         self.assertEqual(self.git(self.root, "rev-parse", "refs/remotes/origin/main"), real)
         self.git(self.root, "update-ref", "refs/remotes/origin/main", planted)

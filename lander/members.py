@@ -141,7 +141,7 @@ def walls(root, base, head, files, genv=None) -> str:
     if rc:
         return f"git could not show the diff to check it for tokens ({str(out).strip()[-120:]})"
     where = ""
-    for ln in out.splitlines():
+    for ln in out.split("\n"):   # splitlines() also breaks at \r, \x0b, \x85 and U+2028: "+ok\rghp_…" hid its token
         if ln.startswith("+++ "):
             where = ln[6:] if ln.startswith("+++ b/") else ln[4:]
         elif ln.startswith("+") and TOKEN_SHAPES.search(ln):

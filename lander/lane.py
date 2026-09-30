@@ -223,8 +223,8 @@ def git_pr_files(root, pr, token=None, genv=None):
         return None
     try:
         with G.git_lock(root):
-            G.fetch(root, base, branch, env=genv)
-        return G.pr_changed(root, f"refs/remotes/origin/{base}", f"refs/remotes/origin/{branch}", env=genv) or None
+            got = G.fetch(root, base, branch, env=genv)
+        return G.pr_changed(root, got[base], got[branch], env=genv) or None
     except G.GitError:
         return None
 
@@ -367,6 +367,7 @@ class Lane:
         self.inflight = {}       # (job key, check) -> Flight: every check the lane has in the pool
         self.laptop_down = 0.0   # when the laptop last gave no answer: the box takes its checks for LAPTOP_REST
         self.tips = {}           # {"sha", "m"}: the base branch tip's manifest, for where a check may run
+        self.origin = {}         # {branch: sha}: what origin last sent for each branch this lane fetched
         self.said = set()        # (job, job it waits for): said once
         self.parked = set()      # queued jobs waiting on an overlapping one
         self.pool = None
@@ -603,6 +604,12 @@ class Lane:
     def lock(self):
         return G.git_lock(self.root)
 
+    def fetch(self, *branches):
+        """G.fetch's {branch: sha}, kept for tip_manifest: never refs/remotes/origin/<b>, which a worker can move."""
+        got = G.fetch(self.root, *branches, env=self.genv)
+        self.origin.update(got)
+        return got
+
     def queued(self, job):
         park = job.extra.get("parked")
         if isinstance(park, dict) and job.files and time.time() - float(park.get("at") or 0) < PARK_FRESH:
@@ -626,9 +633,8 @@ class Lane:
         if facts.get("mergeable") == "CONFLICTING":
             return self.hold(job, f"PR #{job.pr} conflicts with {base} — rebase it")
         with self.lock():
-            G.fetch(self.root, base, branch, env=self.genv)
-            job.base_sha = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
-            job.head = G.rev(self.root, f"refs/remotes/origin/{branch}", env=self.genv)
+            got = self.fetch(base, branch)
+            job.base_sha, job.head = got[base], got[branch]
         mr = job.extra.get("main_red")
         if isinstance(mr, dict) and (mr.get("base"), mr.get("head")) == (job.base_sha, job.head) \
                 and int(mr.get("waits") or 0) < MAIN_RED_WAITS:
@@ -699,16 +705,15 @@ class Lane:
         return MF.placed(m, tip) if tip is not None else m
 
     def tip_manifest(self, base: str):
-        """The manifest at the tip of origin/<base>, read once per tip; None when it cannot be read (m keeps its own
-        `where`, as before)."""
-        try:
-            sha = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
-        except G.GitError:
+        """The manifest at the tip origin last sent for <base>, read once per tip; None when there is none yet or it
+        cannot be read (m keeps its own `where`, as before)."""
+        sha = self.origin.get(base)
+        if not sha:
             return None
         if self.tips.get("sha") != sha:
             try:
                 self.tips = {"sha": sha, "m": MF.load(self.root, sha, fallback=self.fallback)}
-            except MF.ManifestError:
+            except (MF.ManifestError, G.GitError):
                 self.tips = {"sha": sha, "m": None}
         return self.tips["m"]
 
@@ -842,17 +847,16 @@ class Lane:
             if state == "MERGED":
                 base = job.extra.get("base_ref") or ""
                 with self.lock():
-                    G.fetch(self.root, base, env=self.genv)
-                    tip = oid or G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
+                    got = self.fetch(base)   # oid too needs its objects here, for the proof
+                    tip = oid or got[base]
                 return self.proved(job, ma.get("expected") or "", tip, ma.get("pin") or job.head)
             job.extra.pop("merge_attempt", None)
             J.save(job)
         base, branch = job.extra.get("base_ref") or "", job.extra.get("branch") or ""
         for _ in range(MOVES_BEFORE_HOLD):
             with self.lock():
-                G.fetch(self.root, base, branch, env=self.genv)
-                head_now = G.rev(self.root, f"refs/remotes/origin/{branch}", env=self.genv)
-                main_now = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
+                got = self.fetch(base, branch)
+                head_now, main_now = got[branch], got[base]
             if head_now != job.head:
                 return J.move(job, T.QUEUED, why=f"the head moved to {head_now[:12]}")
             if main_now != job.base_sha:
@@ -887,8 +891,7 @@ class Lane:
         pin = job.head   # door() made approved_head equal it when a protected path is hit; else it is stale
         base = job.extra.get("base_ref") or ""
         with self.lock():
-            G.fetch(self.root, base, env=self.genv)
-            main_before = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
+            main_before = self.fetch(base)[base]
             if main_before != job.base_sha:
                 return "moved"
             expected, conflicts = G.merge_tree(self.root, main_before, job.head, env=self.genv)
@@ -909,8 +912,7 @@ class Lane:
                 else:
                     self.hold(job, text, kind="box" if GH.backoff() else "pr")
                 return "held"
-            G.fetch(self.root, base, env=self.genv)
-            tip = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
+            tip = self.fetch(base)[base]
         self.proved(job, expected, tip, pin)
         return "merged"
 
@@ -948,8 +950,7 @@ class Lane:
         if not job.extra.get("tip_sha"):
             base = job.extra.get("base_ref") or ""
             with self.lock():
-                G.fetch(self.root, base, env=self.genv)
-                job.extra["tip_sha"] = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
+                job.extra["tip_sha"] = self.fetch(base)[base]
         once("deploy", "deploy", "request", job.repo, job.extra["tip_sha"], [])
         J.move(job, T.DEPLOY_PENDING)
 

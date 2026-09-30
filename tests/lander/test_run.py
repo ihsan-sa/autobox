@@ -785,7 +785,9 @@ class Judge(unittest.TestCase):
         plan = T.Plan(checks=["c", "guard", "gone"])
         run, _ = self.runner({self.H: T.FAILED, self.B: T.PASSED})
         q = "guard\tflaky text\tw\to\t2099-01-01\nc\tflaky text\tw\to\t2099-01-01\n"
-        with mock.patch.object(REC, "quarantine_rows", return_value=[("guard", "flaky text"), ("c", "flaky text")]):
+        # self.B names no tree: a base whose objects git cannot read now raises, so its manifest is the empty one
+        with mock.patch.object(REC, "quarantine_rows", return_value=[("guard", "flaky text"), ("c", "flaky text")]), \
+                mock.patch.object(M, "load", return_value=M.Manifest()):
             outs = RUN.run_plan(".", m, plan, ["README.md"], self.H, self.B, runner=run, quarantine_text=q)
             self.assertEqual(outs["c"].note, "quarantined")
             self.assertEqual(outs["guard"].status, T.FAILED)         # guards a gate-first path

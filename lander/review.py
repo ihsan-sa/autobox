@@ -619,8 +619,7 @@ def whole_paths(diff, paths):
     exactly one section headed `diff --git a/<path> b/<path>`, with a hunk and no binary line. Every changed line of
     such a path is in the diff, so a cut of its file in the files block hides none of them. A rename, a quoted name,
     a type change (two sections) or a mode-only change matches nothing here and so keeps its flag. A cut diff names
-    none: its sections are found by line, and a changed line can forge a header (git's text output turns a lone \r
-    into a line break), so past the cap no section can be trusted to be the path's own."""
+    none: its sections are found by line, and past the cap no section can be trusted to be the path's own."""
     if len(diff) > DIFF_CAP:
         return []
     starts = [m.start() for m in re.finditer(r"(?m)^diff --git ", diff)]

@@ -28,6 +28,7 @@ from lander import events as E  # noqa: E402
 from lander import git as G  # noqa: E402
 from lander import jobs as J  # noqa: E402
 from lander import lane as L  # noqa: E402
+from lander import manifest as MF  # noqa: E402
 from lander import members as M  # noqa: E402
 from lander import plan as PLAN  # noqa: E402
 from lander import records as REC  # noqa: E402
@@ -758,6 +759,82 @@ class RealUnits(TL.Fixture):
         self.assertNotIn(token, self.git(self.work, "diff", f"{base}...{head}"))   # it bites the checkout's git
         self.assertEqual(M.walls(self.work, base, head, ["c/k.txt"]), "an added line in c/k.txt is shaped like a token")
         self.assertEqual(M.walls(self.work, base, clean, ["c/k.txt"]), "")
+
+    def test_a_line_break_python_sees_cannot_split_a_token_off_its_added_line(self):
+        """splitlines() also breaks at \r, \x0b, \x85 and U+2028, so `+ok\rghp_…` became `+ok` and a line with no
+        `+` in front of the token, and the scan passed it. The diff is split at \n only, as git writes it."""
+        token = "ghp_" + "A" * 36
+        base = self.git(self.work, "rev-parse", "origin/main")
+        for n, sep in enumerate(("\r", "\x0b", "\x85", "\u2028")):
+            head = self.push(f"track/row-{n}", {"c/k.txt": f"ok{sep}{token}\n"})
+            self.assertEqual(M.walls(self.work, base, head, ["c/k.txt"]),
+                             "an added line in c/k.txt is shaped like a token", repr(sep))
+        clean = self.push("track/row-9", {"c/k.txt": "ok\rnothing here\n"})
+        self.assertEqual(M.walls(self.work, base, clean, ["c/k.txt"]), "")
+
+    def test_a_merge_driver_planted_in_the_checkout_never_runs(self):
+        """`* merge=evil` in .git/info/attributes and merge.evil.driver in the shared config: the checkout's own
+        merge-tree runs the worker's program on a file both sides changed, as the lander. G.merge_tree merges sealed,
+        where no config or attributes of the checkout's are read: the program never runs, the merge is git's own,
+        and the merged tree's objects are in the checkout for the run to write out."""
+        self.main({"f": "one\ntwo\nthree\nfour\nfive\n"})
+        head = self.push("track/row-1", {"f": "ONE\ntwo\nthree\nfour\nfive\n"})
+        self.main({"f": "one\ntwo\nthree\nfour\nFIVE\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        mark = os.path.join(self.tmp, "ran")
+        info = os.path.join(self.git(self.work, "rev-parse", "--path-format=absolute", "--git-common-dir"), "info")
+        os.makedirs(info, exist_ok=True)
+        with open(os.path.join(info, "attributes"), "w") as f:
+            f.write("* merge=evil\n")
+        self.git(self.work, "config", "merge.evil.driver", f"touch {mark}; cp %B %A")
+        self.git(self.work, "merge-tree", "--write-tree", base, head)
+        self.assertTrue(os.path.exists(mark))   # it bites the checkout's git
+        os.unlink(mark)
+        tree, conflicts = G.merge_tree(self.work, base, head)
+        self.assertFalse(os.path.exists(mark))
+        self.assertEqual(conflicts, [])
+        self.assertEqual(self.git(self.work, "show", f"{tree}:f"), "ONE\ntwo\nthree\nfour\nFIVE")
+        other = self.push("track/row-1", {"f": "ONE\ntwo\nthree\nfour\nfive?\n"}, fresh=False)
+        self.assertEqual(G.merge_tree(self.work, base, other), (None, ["f"]))   # a conflict is still one
+        self.assertFalse(os.path.exists(mark))
+
+    def test_a_replace_ref_in_the_checkout_cannot_choose_the_manifest(self):
+        """`git replace` on main's manifest blob makes the checkout's `git show` return a forged manifest, so a worker
+        picked which checks run; a replaced base commit forges its tree, and with it tree_of and which files a change
+        adds. Those reads are VERIFIED now, with no replace ref: they see main's own objects."""
+        self.main({MF.MANIFEST: "real\n", "f": "one\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        head = self.push("track/row-1", {"new": "n\n"})
+        blob = self.git(self.work, "rev-parse", f"{base}:{MF.MANIFEST}")
+        with open(os.path.join(self.tmp, "forged"), "w") as f:
+            f.write("forged\n")
+        forged = self.git(self.work, "hash-object", "-w", os.path.join(self.tmp, "forged"))
+        self.git(self.work, "replace", blob, forged)
+        self.assertEqual(self.git(self.work, "show", f"{base}:{MF.MANIFEST}"), "forged")   # it bites
+        self.assertEqual(MF.read_at(self.work, base, MF.MANIFEST), "real\n")
+        self.assertIsNone(MF.read_at(self.work, base, "tests/none"))
+        self.git(self.work, "replace", "-d", blob)
+        real_tree = self.git(self.work, "rev-parse", f"{base}^{{tree}}")
+        alt = self.git(self.work, "commit-tree", "-m", "alt", self.git(self.work, "rev-parse", f"{head}^{{tree}}"))
+        self.git(self.work, "replace", base, alt)
+        self.assertNotEqual(self.git(self.work, "rev-parse", f"{base}^{{tree}}"), real_tree)   # it bites
+        self.assertEqual(G.tree_of(self.work, base), real_tree)
+        self.assertEqual(MF.read_at(self.work, base, MF.MANIFEST), "real\n")
+        self.assertEqual(MF.read_at(self.work, real_tree, MF.MANIFEST), "real\n")
+        self.assertEqual(PLAN.added_files(self.work, base, head, ["new", "f"]), {"new"})
+
+    def test_a_swapped_manifest_blob_raises_rather_than_reads_as_absent(self):
+        """A loose object overwritten with other bytes: the checkout shows them, and a read that took the failure
+        for "no manifest" would run no checks. read_at re-hashes the blob and raises."""
+        self.main({MF.MANIFEST: "real\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        with open(os.path.join(self.tmp, "lenient"), "w") as f:
+            f.write("lenient\n")
+        lenient = self.git(self.work, "hash-object", "-w", os.path.join(self.tmp, "lenient"))
+        self.swap(self.git(self.work, "rev-parse", f"{base}:{MF.MANIFEST}"), lenient)
+        self.assertEqual(self.git(self.work, "show", f"{base}:{MF.MANIFEST}"), "lenient")   # it bites
+        with self.assertRaises(G.GitError):
+            MF.read_at(self.work, base, MF.MANIFEST)
 
     def test_ended_jobs_leave_the_readers_directory(self):
         self.pr(1, {"a/x": "n\n"}, state="CLOSED", headRefOid="e" * 40)

@@ -34,7 +34,6 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
-import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -110,15 +109,17 @@ def match(globs, path: str) -> bool:
 # --- reading a tree ------------------------------------------------------------------------------------------------
 
 def read_at(repo_root: str, rev: str, path: str):
-    """The file's text at rev (a commit or tree sha), or None when it is not there. rev "" reads the working copy."""
+    """The file's text at rev (a commit or tree sha), or None when it is not there. rev "" reads the working copy.
+    A rev is read VERIFIED (git.py): a replace ref or a swapped object in the checkout raises GitError, never None."""
     if not rev:
         try:
             with open(os.path.join(repo_root, path), encoding="utf-8") as f:
                 return f.read()
         except OSError:
             return None
-    p = subprocess.run(["git", "-C", repo_root, "show", f"{rev}:{path}"], capture_output=True)
-    return p.stdout.decode("utf-8", "replace") if p.returncode == 0 else None
+    from lander import git as G
+    body = G.read_verified(repo_root, rev, path)
+    return body.decode("utf-8", "replace") if body is not None else None
 
 
 # --- the manifest --------------------------------------------------------------------------------------------------

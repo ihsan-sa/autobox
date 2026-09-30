@@ -191,25 +191,17 @@ def generated_reach(repo_root: str, base: str, head: str, files: list) -> set:
 
 def added_files(repo_root: str, base: str, head: str, files: list) -> set:
     """The files that are not in base's tree and are in head's (head "" = the working copy). Git failing is the
-    empty set: a change is add-only only when git says so."""
-    import subprocess
+    empty set: a change is add-only only when git says so. Each tree is read VERIFIED (git.py)."""
+    from lander import git as G
     files = list(files)
     if not files:
         return set()
-
-    def tree(rev):
-        p = subprocess.run(["git", "-C", repo_root, "--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", rev,
-                            "--", *files], capture_output=True, text=True)
-        return {f for f in p.stdout.split("\0") if f} if p.returncode == 0 else None
-    at_base = tree(base)
-    if at_base is None:
+    try:
+        at_base = G.paths_in(repo_root, base, files)
+        at_head = G.paths_in(repo_root, head, files) if head else \
+            {f for f in files if os.path.lexists(os.path.join(repo_root, f))}
+    except G.GitError:
         return set()
-    if head:
-        at_head = tree(head)
-        if at_head is None:
-            return set()
-    else:
-        at_head = {f for f in files if os.path.lexists(os.path.join(repo_root, f))}
     return {f for f in files if f not in at_base and f in at_head}
 
 
