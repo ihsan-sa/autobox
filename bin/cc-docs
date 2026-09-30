@@ -22,8 +22,9 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         that member's workspace and the owner) or a project created first with `project`. Prints `<number>\t<path>` and whether
         it filed or found the content unchanged. The rest is recorded on the revision it files, and nothing is recorded
         when nothing is filed: --describes the board revision a document is about (a board's part number, PCB-0001-B),
-        which the stamp then carries too, as `002-0012-A · PCB-0001-B · 24 Sep 2026`; --note a line on what changed;
-        --cost, once per step, what the maker spent generating it in US dollars (`--cost draft=0.80 --cost review=0.43`).
+        which the stamp then carries too, as `002-0012-A · PCB-0001-B · 24 Sep 2026`; --note what changed, in the
+        filer's own words (the message it would post about this revision; the library shows it to the owner once, in a
+        pop-up, when they next open the document); --cost, once per step, what the maker spent generating it in US dollars (`--cost draft=0.80 --cost review=0.43`).
         A filed revision also keeps its SOURCE, as sources/PPP/PPP-NNNN-R.tar.gz beside files/: for a LaTeX build (the
         --latex file, else a --source ending .tex, else a .tex of the PDF's own name beside it) the .tex and every
         local file it pulls in (\\input, \\include, figures, .bib, .bst and a .sty/.cls beside it, a file outside
@@ -118,8 +119,9 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
     cc-docs library --viewer owner|<workspace id>
         Everything that viewer may see, as JSON: projects (and the group of each that has one), documents,
         per-viewer star, and per revision its date, note, file, pages, bytes, board revision and cost. The owner
-        sees the whole register and each public revision's token; a member sees only documents visible to its
-        workspace, its own stars, and no tokens.
+        sees the whole register, each public revision's token and, on a revision a workspace filed, filed_by (its
+        handle); a member sees only documents visible to its workspace, its own stars, and no tokens. A workspace's
+        note is at most 2000 characters.
         Any other viewer is refused.
     cc-docs member <handle> [--files <dir>]
         The host's half of filing from inside a member workspace, run by the Slack daemon for its member verb `docs`
@@ -1919,6 +1921,9 @@ def library(reg, viewer):
                    "public": owner and bool(r.get("public_token"))}
             if owner and r.get("public_token"):
                 out["token"] = r["public_token"]
+            # a workspace's filing is its own words, not the box's: the owner is told whose they are
+            if owner and isinstance(r.get("filer"), dict) and r["filer"].get("member"):
+                out["filed_by"] = r["filer"]["member"]
             revs.append(out)
         src = d.get("source")
         if src and src.startswith(home + "/"):
@@ -2333,6 +2338,7 @@ HOME = os.path.expanduser("~")
 SLACKSOCK = os.path.join(os.environ.get("CC_SLACK_DIR") or os.path.join(HOME, ".cc", "slack"), "sock")
 IN_SANDBOX = os.environ.get("CC_MEMBER_SANDBOX") == "1"
 MEMBER_CAP = 64 << 20     # the largest PDF a workspace may file, in bytes
+NOTE_CAP = 2000           # the longest note a workspace may file with a revision, in characters
 MEMBER_WAIT = 300         # seconds the workspace waits on the host: stamping and printing a long PDF takes a while
 HANDLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 ASK = {"op", "pdf", "title", "project", "source", "kind", "member", "describes", "note", "date", "cost", "no_stamp", "tex"}
@@ -2476,6 +2482,8 @@ def member_ask(handle, ask, files=""):
             raise Refused(f"{k} must be a string")
     if ask.get("member") and ask["member"] != handle:
         raise Refused(f"a workspace files only for itself, not for {ask['member'][:40]!r}")
+    if len(ask.get("note") or "") > NOTE_CAP:
+        raise Refused(f"a note is at most {NOTE_CAP} characters")
     inside = os.path.join(HOME, ".cc", "slack", "files") + "/"
     here = lambda q: os.path.join(files, q[len(inside):]) if files and q.startswith(inside) else q   # the boundary's ~/.cc/slack is the member dir
     trees = member_trees(handle, files)
@@ -2997,6 +3005,16 @@ def _selfcheck():
         o, e = ask("kid1", pdf=m1, title="Other")
         MEMBER_CAP = cap
         ok("a PDF over the cap is refused", o is None and "at most" in e and len(load()["documents"]) == 1)
+        o, e = ask("kid1", pdf=m1, title="Other", note="x" * (NOTE_CAP + 1))
+        o2, e2 = ask("kid1", pdf=mkpdf(ws, "m1b", "Member physics one, again"), title="Physics", note="y" * NOTE_CAP)
+        rv = load()["documents"][f"{k1[0]}-0001"]["revisions"]
+        lo = [x for d in library(load(), "owner")["documents"] for x in d["revisions"] if x["rev"] == rv[-1]["rev"]
+              and d["number"] == f"{k1[0]}-0001"]
+        lm = [x for d in library(load(), wid)["documents"] for x in d["revisions"]]
+        ok("a note over the cap is refused and files nothing; one at the cap files, and the owner is told who filed it",
+           o is None and "at most 2000" in e and len(load()["documents"]) == 1 and o2 and len(rv) == 2
+           and rv[-1].get("note") == "y" * NOTE_CAP and lo and lo[0].get("filed_by") == "kid1"
+           and lm and not any("filed_by" in x for x in lm))
         o, e = ask("kid1", op="public")
         o2, e2 = ask("kid1", op="star")
         ok("public and star are not ops a workspace can ask for", o is None and o2 is None and "not 'public'" in e
