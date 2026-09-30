@@ -151,6 +151,56 @@ class RealUnits(TL.Fixture):
         u, lines = self.land()
         self.assertEqual(self.job().state, T.DEPLOY_PENDING, lines)
 
+    def release(self):
+        j = self.job()
+        j.extra["not_before"] = E.stamp(time.time() - 1)
+        J.save(j)
+
+    def gates(self, since=0):
+        return [ln.split("gate=")[1].split()[0] for ln in self.log()[since:].splitlines() if " gate gate=" in ln]
+
+    def test_a_main_red_hold_waits_without_checks_until_main_moves_then_gives_up(self):
+        self.main({"b/gate": "bad\n"})
+        self.pr(1, {"b/y": "a change b owns\n"})
+        J.submit("demo", 1)
+        self.land()
+        j = self.job()
+        self.assertEqual(j.extra["main_red"]["check"], "b")
+        self.assertEqual(j.extra["main_red"]["waits"], 0)
+        for w in range(1, L.MAIN_RED_WAITS + 1):   # main and the head stay put: held again, no check run
+            self.release()
+            at = len(self.log())
+            u, lines = self.land()
+            j = self.job()
+            self.assertEqual((j.state, j.extra["main_red"]["waits"]), (T.HELD, w), lines)   # the count is saved
+            self.assertIn("main-red: main has not moved", j.extra["why"])
+            self.assertEqual(self.gates(at), [])
+        self.release()   # the 5th pass tries anyway, and main is still red on b: held as main's again, count reset
+        at = len(self.log())
+        u, lines = self.land()
+        j = self.job()
+        self.assertEqual(self.gates(at), ["b"], lines)
+        self.assertIn("blocked-by-main:b", j.extra["why"])
+        self.assertEqual(j.extra["main_red"]["waits"], 0)
+
+    def test_the_check_red_on_main_runs_first_once_main_moves(self):
+        self.main({"b/gate": "bad\n"})
+        self.pr(1, {"a/x": "good\n", "b/y": "a change b owns\n"})
+        J.submit("demo", 1)
+        u, lines = self.land()
+        j = self.job()
+        self.assertEqual((j.state, j.extra["main_red"]["check"]), (T.HELD, "b"), lines)
+        self.assertEqual(j.plan.checks, ["a", "b"])
+        self.main({"b/gate": "fine\n"})   # main moves (mended): planned again, and b goes before a
+        self.release()
+        at = len(self.log())
+        with mock.patch.object(L.Lane, "width", lambda self: 1):   # one at a time, so the order shows
+            u, lines = self.land()
+        j = self.job()
+        self.assertEqual(self.gates(at), ["b", "a"], lines)
+        self.assertEqual(j.state, T.DEPLOY_PENDING, lines)
+        self.assertNotIn("main_red", j.extra)   # cleared when b passed
+
     def test_a_limit_deferred_review_waits_for_the_reset(self):
         self.pr(1, {"c/w": "paid\n"})
         J.submit("demo", 1)

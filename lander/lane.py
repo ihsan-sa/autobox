@@ -24,8 +24,8 @@ the list after each. CHECKS RUN IN PARALLEL, MERGES ONE AT A TIME (lander-redesi
 land side by side"; 2026-09-29 a three-file PR waited 7 h behind ~11 half-hour PRs on a box at load 4.8 of 6 cores):
 a checking job hands its next check to the lane's pool and the lane goes on to other jobs; everything else — the gh
 facts, planning, the review, the Δ re-plan and the merge — happens on the lane's own thread, so merges stay serial
-and pinned. The lane keeps at most A.slots_now() checks in flight (LANDER_SLOTS, default 3; 1 while the box is
-overloaded()) on the box, and up to A.LAPTOP_SLOTS more on the laptop; each box run still takes its box-wide
+and pinned. The lane keeps at most A.slots_now() checks in flight (LANDER_SLOTS, default 3; 2 while the box is
+overloaded(), 1 under memory pressure) on the box, and up to A.LAPTOP_SLOTS more on the laptop; each box run still takes its box-wide
 admission slot, so another repo's lane can hold this one's check at the door. A job holds one check at a time on the
 box, but its checks that may leave the box run on the laptop side by side, so a red stops the rest of the suite only
 once it is recorded (the ones already in flight finish). A member's lane never sends a check to the laptop. A laptop
@@ -115,6 +115,7 @@ UNRUNNABLE_TRIES = 3     # the 3rd unrunnable check (or refused merge) is a quer
 READS_CAP = 2            # reads per change family; the 2nd handback is a query to the planning seat
 HANDED_DAYS = 7
 MAX_STEPS = 40
+MAIN_RED_WAITS = 4       # holds a main-red job sits out while main and its head stay put, before it tries anyway
 MOVES_BEFORE_HOLD = 5    # main moving under the merge this many times in one step holds the job
 GH_PR_FILES = 100        # gh lists at most this many files; at or over it git names them all
 FIELDS = "state,isDraft,mergeable,headRefOid,headRefName,baseRefName,title,body"
@@ -627,6 +628,14 @@ class Lane:
             G.fetch(self.root, base, branch, env=self.genv)
             job.base_sha = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
             job.head = G.rev(self.root, f"refs/remotes/origin/{branch}", env=self.genv)
+        mr = job.extra.get("main_red")
+        if isinstance(mr, dict) and (mr.get("base"), mr.get("head")) == (job.base_sha, job.head) \
+                and int(mr.get("waits") or 0) < MAIN_RED_WAITS:
+            # main was red on a check and neither main nor the head has moved: no checks, held again (hold() saves
+            # job.extra, so the count carries to the next pass)
+            mr["waits"] = int(mr.get("waits") or 0) + 1
+            return self.hold(job, f"main-red: {base} has not moved since check {mr.get('check')} was red on it "
+                                  f"(wait {mr['waits']} of {MAIN_RED_WAITS})", kind="box")
         mb = G.merge_base(self.root, job.base_sha, job.head, env=self.genv)
         job.files = G.changed(self.root, mb, job.head, env=self.genv)
         # the reviewer's digest_of, the key `record` and `will-review` use: a LAND recorded at a head is the verdict
@@ -709,6 +718,10 @@ class Lane:
         if not self.unit("runner"):
             return self.hold(job, "runner is not installed", kind="box")
         todo = [n for n in (job.plan.checks if job.plan else []) if n not in job.results]
+        red = (job.extra.get("main_red") or {}).get("check")
+        if red in todo:   # the check main was red on goes first: while main is still red, one check says so
+            todo.remove(red)
+            todo.insert(0, red)
         if todo:
             # the laptop's slots first (every check of the plan that may leave the box, several PRs' at once), the
             # box's beside them (one check per job there); a check waits only for a place of its own kind
@@ -763,6 +776,7 @@ class Lane:
             return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]})"
                                       + (f": {o.note}" if o.note else ""))
         if o.status == RUN.BLOCKED:
+            job.extra["main_red"] = {"check": n, "base": job.base_sha, "head": job.head, "waits": 0}
             # design §0: base red too -> blocked-by-main, not blamed; it is planned again from main after the hold
             return self.hold(job, f"{o.note}: check {n} is red on {base_ref} ({job.base_sha[:12]}) too, so it "
                                   f"is main's, not this PR's — tried again from {base_ref} later",
@@ -775,6 +789,8 @@ class Lane:
                 return self.query(job, f"check {n} could not run {UNRUNNABLE_TRIES} times", "planning")
             return self.hold(job, f"check {n} could not run (try {job.extra['attempts']} of "
                                   f"{UNRUNNABLE_TRIES}): {o.note}", kind="box")
+        if (job.extra.get("main_red") or {}).get("check") == n:
+            job.extra.pop("main_red", None)   # the check main was red on passes: main is green on it again
         job.results[n] = o.results[0].key if o.results else ""
         J.save(job)
         return None

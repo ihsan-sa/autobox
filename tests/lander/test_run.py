@@ -430,12 +430,27 @@ class Admission(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         return path
 
-    def test_pressure_throttles_to_one_and_never_zero(self):
+    def test_pressure_throttles_and_never_to_zero(self):
         calm = self.calm_load
         self.assertEqual(A.slots_now(self.psi_dir(1.0, 50.0), 3, calm), 3)
-        self.assertEqual(A.slots_now(self.psi_dir(40.0, 50.0), 3, calm), 1)
-        self.assertEqual(A.slots_now(self.psi_dir(1.0, 99.9), 3, calm), 1)
         self.assertEqual(A.slots_now(self.psi_dir(1.0, 1.0), 0, calm), 1)
+
+    def test_cpu_pressure_or_load_leaves_two_slots(self):
+        calm, n = self.calm_load, os.cpu_count() or 1
+        hot = self.loadavg(2.0 * n)
+        cpu = self.psi_dir(1.0, 99.9)
+        self.assertIn("pressure", A.overloaded(cpu, calm))           # the reason line its callers print is kept
+        self.assertEqual(A.slots_now(cpu, 3, calm), 2)
+        self.assertEqual(A.slots_now(self.psi_dir(0, 0), 3, hot), 2)
+        self.assertEqual(A.slots_now(cpu, 1, hot), 1)                # never more than k
+
+    def test_memory_pressure_keeps_one_slot(self):
+        # the memory limit is there because parallel checks ran the box out of memory: one at a time, cpu or not
+        calm, n = self.calm_load, os.cpu_count() or 1
+        hot = self.loadavg(2.0 * n)
+        self.assertEqual(A.slots_now(self.psi_dir(40.0, 50.0), 3, calm), 1)
+        self.assertEqual(A.slots_now(self.psi_dir(40.0, 99.9), 3, hot), 1)
+        self.assertIn("pressure", A.overloaded(self.psi_dir(40.0, 0), calm))
         self.assertEqual(A.psi("memory", "/nonexistent"), 0.0)
 
     def test_slots_admit_k_then_wait_and_alone_takes_them_all(self):
@@ -484,25 +499,26 @@ class Admission(unittest.TestCase):
                 with A.slot(st, psi_root=hot, k=3, poll=0.05, deadline=0.2):
                     pass
 
-    def test_high_load_serializes_and_the_one_slot_still_admits(self):
-        # the brief: "under a simulated high load a queued landing still starts" — one at a time, never none
+    def test_high_load_narrows_to_two_and_a_slot_still_admits(self):
+        # the brief: "under a simulated high load a queued landing still starts" — two at a time, never none
         n = os.cpu_count() or 1
         calm_psi = self.psi_dir(0, 0)
         hot, calm = self.loadavg(2.0 * n), self.loadavg(2.0 * n - 0.5)
         self.assertIn(f"on {n} cores", A.overloaded(calm_psi, hot))
         self.assertEqual(A.overloaded(calm_psi, calm), "")
-        self.assertEqual(A.slots_now(calm_psi, 3, hot), 1)
+        self.assertEqual(A.slots_now(calm_psi, 3, hot), 2)
         self.assertEqual(A.slots_now(calm_psi, 3, calm), 3)
         self.assertEqual(A.overloaded(calm_psi, "/nonexistent"), "")
         st = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(st))
-        with A.slot(st, psi_root=calm_psi, k=3, loadavg=hot, deadline=1) as a:
-            self.assertEqual(a, [1])
+        with A.slot(st, psi_root=calm_psi, k=3, loadavg=hot, deadline=1) as a, \
+                A.slot(st, psi_root=calm_psi, k=3, loadavg=hot, deadline=1) as b:
+            self.assertEqual((a, b), ([1], [2]))
             with self.assertRaises(TimeoutError):
                 with A.slot(st, psi_root=calm_psi, k=3, loadavg=hot, poll=0.05, deadline=0.2):
                     pass
-            with A.slot(st, psi_root=calm_psi, k=3, loadavg=calm, deadline=1) as b:
-                self.assertEqual(b, [2])
+            with A.slot(st, psi_root=calm_psi, k=3, loadavg=calm, deadline=1) as c:
+                self.assertEqual(c, [3])
 
     def test_a_busy_run_is_not_niced_down(self):
         with mock.patch.object(A, "scope_available", return_value=True), \

@@ -4,8 +4,9 @@ SLOTS. K = LANDER_SLOTS (default 3) box-wide slots, each a flock on `<state>/slo
 mostly not the lander's, so a load average would give one slot nearly always; pressure is the signal instead. When
 /proc/pressure/memory `some avg10` reaches PSI_MEM (default 20) or /proc/pressure/cpu `some avg10` reaches PSI_CPU
 (default 99.5 — this box idles near 98, so only a saturated one counts), the box is loaded(). It is overloaded() when it is
-loaded() or its 1-minute load average reaches LANDER_LOAD_FACTOR (default 2) times its cores. While overloaded only slot 1
-admits, so checks run one at a time. Never 0: a check always gets to run, only later. A diagnostic rerun takes every
+loaded() or its 1-minute load average reaches LANDER_LOAD_FACTOR (default 2) times its cores. While overloaded by cpu
+PSI or the load average only slots 1-2 admit; under memory pressure only slot 1, because parallel checks have run the
+box out of memory. Never 0: a check always gets to run, only later. A diagnostic rerun takes every
 slot at once (alone=True), so it runs by itself; it takes them in order and never past a busy one, because one
 lane now runs several checks at once and two alone runs each holding a slot would wait on each other forever.
 
@@ -71,8 +72,12 @@ def psi(kind: str, root: str = PSI_DIR) -> float:
     return 0.0
 
 
+def mem_loaded(root: str = PSI_DIR) -> bool:
+    return psi("memory", root) >= PSI_MEM
+
+
 def loaded(root: str = PSI_DIR) -> bool:
-    return psi("memory", root) >= PSI_MEM or psi("cpu", root) >= PSI_CPU
+    return mem_loaded(root) or psi("cpu", root) >= PSI_CPU
 
 
 def load1(loadavg: str | None = None) -> float | None:
@@ -106,7 +111,11 @@ def overloaded(root: str = PSI_DIR, loadavg: str | None = None) -> str:
 
 def slots_now(root: str = PSI_DIR, k: int | None = None, loadavg: str | None = None) -> int:
     k = max(1, SLOTS if k is None else k)
-    return 1 if overloaded(root, loadavg) else k
+    if not overloaded(root, loadavg):
+        return k
+    # cpu PSI or the load average: two still run. Memory pressure: one, because parallel checks have run the box
+    # out of memory before
+    return 1 if mem_loaded(root) else min(k, 2)
 
 
 @contextlib.contextmanager
