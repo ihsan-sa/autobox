@@ -28,11 +28,26 @@ read: LAND with model "" and extra read=none. Otherwise the lander buys one:
     `until` (limit_until) says when to ask again, and the lane holds the job till then.
   - two reads already spent on this PR (the family: repo + PR number, so a push or a reopen does not reset it) ->
     HANDBACK with extra cap=True and no read bought; the lane sends a query card to the planning seat.
-  - else one `claude -p` call, no tools, the prompt core/config/lander/review.md from THIS release (not the PR's
+  - else one read by EACH model on CC_LAND_REVIEWERS (the passwd home's ~/.cc/config only, cards.REVIEWER_CONFIG;
+    default READERS: Fable 5.1 and Astra 6 — owner, 2026-09-24: "a review goes to Fable 5.1 and Astra 6
+    together"), at CC_LAND_REVIEW_EFFORT (default high; one of EFFORTS, checked before any read). A `claude-*`
+    model or a claude alias (CLAUDE_ALIASES) is one `claude -p` call, no tools; any other is one `codex exec`
+    call with every tool feature on CODEX_OFF disabled and the user config ignored, and before it `codex features
+    list` must show nothing on outside CODEX_ON_OK. Every read runs on READ_PATH, and codex is codex_bin() with
+    CODEX_HOME and HOME at the passwd home, so the caller's PATH, HOME or CODEX_HOME picks nothing. Both get the prompt
+    core/config/lander/review.md from THIS release (not the PR's
     head) with the diff, the merged text of the changed files, the brief's done-criteria and docs/REVIEW.md
     read from the BASE commit, each between `<<<name` / `name>>>` markers (a marker inside the data is broken
     up, so the data cannot close its own block). The answer is JSON (verdict, blocking[], advisory[]).
-    A run that hit the limit (`cc-limit check`) is INCOMPLETE and refunded, as if it never ran.
+    A change lands only on EVERY reader's verdict (owner: both models read every change). A reader that hits the
+    limit (`cc-limit check`), or answers nothing the first time at a head, makes the whole read INCOMPLETE and
+    refunded, as if it never ran; the readers that did answer are kept at this digest (partial()), so the retry
+    asks only the silent one. A reader that CANNOT answer — a bad model id or effort, a missing binary, a flag
+    error, a tool feature codex will not turn off — or answers nothing twice at one head is a HANDBACK stop naming
+    the reader and the cause (extra fault=True), never a silent retry.
+    The verdict is HANDBACK when any reader's is; the findings are all readers', each row naming its reader; the
+    marker lists every reader's own verdict. Together they count as ONE read against the cap.
+    CC_LAND_REVIEW_MODEL, when set, is the only reader (the old single-read setting).
 The read runs with its cwd in `$TMPDIR/cc-land.run.<pid>.<rand>/cc-land.review.<repo>.<pr>.<rand>`: that name is
 how cc-spend puts its cost on `<repo>/review`, and every read's cost is also added to the PR's spend file
 (root/<repo>-<pr>.json, `review_usd`, `reads`) that the old lander kept.
@@ -47,6 +62,7 @@ here runs for a paused project. recurring-defect-ok: pause-hold-missing — the 
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import sys
@@ -61,7 +77,7 @@ from lander import types as T
 
 MARK = "cc-land-review"
 MAX_READS = 2
-MODEL = "claude-opus-5-5"
+READERS = "claude-fable-5-1 gpt-6-astra"   # the default of CC_LAND_REVIEWERS
 READ_TIMEOUT = 1200
 PROMPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "lander")
 OLD_VERDICTS = ("LAND-AFTER-FIX", "DO-NOT-LAND", "LAND", "HANDBACK")
@@ -133,8 +149,9 @@ def marker(v: T.Verdict, base, head, by):
     rows += [f"{i}. [other] {a}" for i, a in enumerate(v.advisory, len(rows) + 1)]
     by = re.sub(r"[^A-Za-z0-9._@-]+", "-", by or "lander")
     head_ = f"<!-- {MARK} v2 change={v.digest} base={base[:12]} head={head[:12]} verdict={v.verdict} by={by} -->"
+    said = [f"- `{r['model']}`: {r['verdict']}" for r in (v.extra or {}).get("readers") or []]
     return "\n".join([head_, f"**lander review** — `{head[:12]}`, read by `{v.model or by}`", "",
-                      f"**VERDICT: {v.verdict}**", ""] + (rows or ["No findings."]))
+                      f"**VERDICT: {v.verdict}**", ""] + (said + [""] if said else []) + (rows or ["No findings."]))
 
 
 def imported(body):
@@ -292,6 +309,8 @@ SECRET_TAIL = ("_TOKEN", "_KEY", "_SECRET", "_CREDS", "_WEBHOOK", "_PASSWORD")
 LIMIT_SAID = re.compile(r"\b(session|usage|rate)[ _-]?limit", re.I)
 WALLS = ("error_max_budget_usd", "error_max_turns")
 BIN = C.BIN
+# The PATH every read runs on: root-owned directories only, never the caller's (security read of #847).
+READ_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 
 def clean_env():
@@ -299,6 +318,7 @@ def clean_env():
            if k != "CLAUDECODE" and not k.startswith("CLAUDE_") and k not in SECRET_ENV and not k.endswith(SECRET_TAIL)}
     cfg = os.path.expanduser("~/.cc/config")
     env["CC_CONFIG_DENY"] = os.path.realpath(cfg)
+    env["PATH"] = READ_PATH   # the caller's PATH would pick the node a `#!/usr/bin/env node` codex runs on
     return env
 
 
@@ -312,13 +332,172 @@ def scratch(repo, pr):
     return run, tempfile.mkdtemp(prefix=f"cc-land.review.{tag}.{pr}.", dir=run)
 
 
+def readers():
+    """The models that read a change, first one first (see the module doc)."""
+    one = C.conf("CC_LAND_REVIEW_MODEL", "").strip()
+    return [one] if one else (C.conf("CC_LAND_REVIEWERS", READERS).split() or READERS.split())
+
+
+def effort():
+    return C.conf("CC_LAND_REVIEW_EFFORT", "high")
+
+
+# The efforts both readers take: `claude --effort` says low..max, codex's model_reasoning_effort adds none and minimal.
+# claude IGNORES a value outside its list and reads at its default (probed 2026-09-30), so a typo would pass unseen.
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# An answer that says the read cannot run as asked, so waiting will not mend it: a 4xx other than 429 from either
+# API (a model that does not exist or is not allowed, a bad parameter), a flag the CLI does not know.
+FAULT_SAID = re.compile(r'"(?:api_error_status|status)"\s*:\s*4(?!29)\d\d|unrecognized_model|may not exist'
+                        r'|is not supported when|Unknown feature flag|unexpected argument|unknown option', re.I)
+
+
+def fault(rc, out):
+    """'' when a silent read may just be retried; else what in its output says it cannot run as asked."""
+    if rc in (126, 127):   # C.sh: a missing or non-executable binary
+        return " ".join((out or "").split())[-200:] or f"rc={rc}"
+    m = [*FAULT_SAID.finditer(out or "")][-1:]   # the last one: an API's own sentence comes after its status
+    return " ".join(out[max(0, m[0].start() - 100):m[0].end() + 160].split()) if m else ""
+
+def strict(schema):
+    """SCHEMA as codex's --output-schema takes it: every object closed, every one of its properties required."""
+    if isinstance(schema, list):
+        return [strict(x) for x in schema]
+    if not isinstance(schema, dict):
+        return schema
+    s = {k: strict(v) for k, v in schema.items()}
+    if s.get("type") == "object" and "properties" in s:
+        s.update(additionalProperties=False, required=list(s["properties"]))
+    return s
+
+
+# Every codex feature that is a tool or reaches past the prompt (codex-cli 0.153.4, `codex features list`): with
+# them off the read has no shell, browser, plugin, skill, hook, image or sub-agent, so a diff that asks it to read
+# a file cannot get that file into the PR comment the verdict is posted as.
+CODEX_OFF = ("apps", "auth_elicitation", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
+             "code_mode_host", "collaboration_modes", "computer_use", "goals", "hooks", "image_generation",
+             "in_app_browser", "in_app_chat", "in_app_dictation", "in_app_local_automation", "mentions_v2",
+             "multi_agent", "plugin_sharing", "plugins", "remote_plugin", "shell_snapshot", "shell_tool",
+             "skill_mcp_dependency_install", "skill_search", "sleep_tool", "tool_call_mcp_elicitation",
+             "tool_suggest", "unified_exec", "unified_exec_zsh_fork",
+             "view_image", "workspace_dependencies")
+# The ALLOWLIST: the features that may stay on in a read, none of them a tool. Anything else on — a feature a new
+# codex adds on by default — holds the read with a stop naming it, until someone puts it on one of these lists.
+CODEX_ON_OK = ("compaction_image_budget", "content_item_kinds", "enable_request_compression", "fast_mode",
+               "guardian_approval", "in_app_updates", "item_ids", "personality", "remote_compaction_v2",
+               "resize_all_images", "sqlite", "steer", "terminal_resize_reflow", "tui_app_server",
+               "unbounded_connection_retries",
+               "tool_search_always_defer_mcp_tools")   # removed in 0.153.4 and --disable does not take; the read has
+                                                       # no MCP server to defer (the user config is ignored)
+# A feature that is only another's back end, allowed on while the one it serves is off. `--disable unified_exec`
+# does not take in 0.153.4 (it still lists true); it is how shell_tool runs, and shell_tool is off.
+CODEX_BACKEND = {"unified_exec": "shell_tool"}
+
+
+# The native codex the npm package vendors, run directly: /usr/local/bin/codex is a `#!/usr/bin/env node` script,
+# so running it lets PATH pick the node. {prefix}, {arch} and {triple} are filled per install root and machine.
+CODEX_NATIVE = "{prefix}/node_modules/@openai/codex/node_modules/@openai/codex-linux-{arch}/vendor/{triple}/bin/codex"
+CODEX_PREFIXES = ("/usr/local/lib", "/usr/lib")
+CODEX_ARCH = {"x86_64": ("x64", "x86_64-unknown-linux-musl"), "aarch64": ("arm64", "aarch64-unknown-linux-musl")}
+CODEX_SCRIPT = "/usr/local/bin/codex"   # the fallback, absolute; its node then comes from READ_PATH
+
+
+def codex_bin():
+    """The codex a read runs: CC_CODEX from the reviewer config, else the vendored native binary, else CODEX_SCRIPT.
+    Always a path, never a bare name resolved on a caller's PATH."""
+    set_ = C.conf("CC_CODEX", "")
+    if set_:
+        return set_
+    arch, triple = CODEX_ARCH.get(os.uname().machine, ("", ""))
+    for prefix in CODEX_PREFIXES if arch else ():
+        path = CODEX_NATIVE.format(prefix=prefix, arch=arch, triple=triple)
+        if os.access(path, os.X_OK):
+            return path
+    return CODEX_SCRIPT
+
+
+def codex_env():
+    """clean_env() with CODEX_HOME and HOME at the passwd home: a worker's CODEX_HOME holding an AGENTS.md, or a HOME
+    of its own, must not reach the read (security read of #847)."""
+    return dict(clean_env(), CODEX_HOME=os.path.join(C.PASSWD_HOME, ".codex"), HOME=C.PASSWD_HOME)
+
+
+def codex_argv(*argv):
+    out = [codex_bin(), *argv]
+    for feature in CODEX_OFF:
+        out += ["--disable", feature]
+    return out
+
+
+def codex_tools_left(run):
+    """'' when `codex features list`, under the read's own --disable flags, shows nothing on outside CODEX_ON_OK;
+    else why not: the features on, or why the list could not be read. It runs under the read's own CODEX_HOME
+    (codex_env()); the list takes no flag to ignore that home's config, so a feature it turns on stops the read."""
+    rc, out = C.sh(codex_argv("features", "list"), cwd=run, timeout=60, env=codex_env())
+    if rc:
+        return f"`codex features list` failed (rc={rc}): " + " ".join((out or "").split())[-200:]
+    on = {}
+    for ln in (out or "").splitlines():
+        words = ln.split()
+        if len(words) >= 3 and words[-1] in ("true", "false"):
+            on[words[0]] = words[-1] == "true"
+    if not on:
+        return "`codex features list` printed no feature the lander could read"
+    left = sorted(f for f, v in on.items() if v and f not in CODEX_ON_OK
+                  and not (f in CODEX_BACKEND and on.get(CODEX_BACKEND[f]) is False))
+    return f"codex has feature(s) on that the review does not allow: {', '.join(left)}" if left else ""
+
+
+def ask_codex(text, repo, pr, digest, model):
+    """One tool-less `codex exec` read. -> (Verdict | None, 0.0, why), as ask(); codex reports no dollar cost."""
+    run, cwd = scratch(repo, pr)
+    schema, answer = os.path.join(run, "schema.json"), os.path.join(run, "answer.json")
+    argv = codex_argv("exec", "-m", model, "-c", f'model_reasoning_effort="{effort()}"', "-c", 'web_search="disabled"',
+                      "-s", "read-only", "--ignore-user-config", "--ignore-rules", "--ephemeral",
+                      "--skip-git-repo-check", "--color", "never", "--output-schema", schema, "-o", answer, "-C", cwd)
+    said, rc, out = "", 1, ""
+    try:
+        left = codex_tools_left(run)
+        if left:
+            return None, 0.0, f"fault: {left}"
+        with open(schema, "w") as f:
+            json.dump(strict(SCHEMA), f)
+        rc, out = C.sh(argv + ["-"], cwd=cwd, input=text, timeout=READ_TIMEOUT, env=codex_env())
+        try:
+            with open(answer) as f:
+                said = f.read()
+        except OSError:
+            pass
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+    v = parse(said, digest, model=model)
+    if v:
+        return v, 0.0, ""
+    tail = " ".join((out or "").split())[-200:]
+    if LIMIT_SAID.search(out or ""):
+        return None, 0.0, f"limit: rc={rc} {tail}"
+    bad = fault(rc, out)
+    return None, 0.0, f"fault: rc={rc} {bad}" if bad else f"no answer: rc={rc} {tail}"
+
+
+# The names `claude --model` takes that do not start with `claude`: a reader named so is claude's, not codex's.
+CLAUDE_ALIASES = ("opus", "sonnet", "haiku", "fable", "opusplan")
+
+
+def is_claude(model):
+    return model.startswith("claude") or model.split("[")[0] in CLAUDE_ALIASES
+
+
 def ask(text, repo, pr, digest, model=None):
     """One tool-less read. -> (Verdict | None, usd, why). Verdict None and why starting 'limit' is a usage limit;
-    why starting 'wall' is the read's own budget cap; any other None is a read that answered nothing."""
-    model = model or C.conf("CC_LAND_REVIEW_MODEL", MODEL)
+    'wall' is the read's own budget cap; 'fault' is a read that cannot run as asked (fault()); any other None is a
+    read that answered nothing."""
+    model = model or readers()[0]
+    if not is_claude(model):
+        return ask_codex(text, repo, pr, digest, model)
     # The prompt goes on stdin: one argv over 128 KiB is refused by the kernel (E2BIG), and most diffs pass that.
     argv = [C.conf("CC_CLAUDE", os.path.join(C.PASSWD_HOME, ".local", "bin", "claude")), "-p", "--model", model,
-            "--effort", "medium", "--max-budget-usd", C.conf("CC_LAND_REVIEW_BUDGET", "3"),
+            "--effort", effort(), "--max-budget-usd", C.conf("CC_LAND_REVIEW_BUDGET", "3"),
             "--output-format", "json", "--json-schema", json.dumps(SCHEMA),
             "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands", "--tools", ""]
     run, cwd = scratch(repo, pr)
@@ -347,7 +526,8 @@ def ask(text, repo, pr, digest, model=None):
         os.unlink(f.name)
     if lrc == 0:
         return None, usd, "limit: cc-limit check says the run hit a usage limit"
-    return None, usd, f"no answer: rc={rc} {said[-200:]}"
+    bad = fault(rc, out)
+    return None, usd, f"fault: rc={rc} {bad}" if bad else f"no answer: rc={rc} {said[-200:]}"
 
 
 # --- the repo side of a read ---------------------------------------------------------------------------------------
@@ -677,6 +857,52 @@ def limit_until(text, now=None):
     return at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def combined(reads):
+    """[(model, Verdict)], every reader's -> the one Verdict the landing acts on: HANDBACK when any reader's is, every
+    reader's findings tagged with its model, and extra `readers` naming each reader's own verdict. A single reader's
+    Verdict is returned as it is."""
+    if len(reads) == 1:
+        return reads[0][1]
+    tag = lambda attr: [f"{r} (read by {m})" for m, x in reads for r in getattr(x, attr)]  # noqa: E731
+    unresolved = sorted({u for _, x in reads for u in x.unresolved})
+    first = reads[0][1]
+    v = T.Verdict(verdict=T.HANDBACK_VERDICT if any(x.verdict == T.HANDBACK_VERDICT for _, x in reads) else T.LAND,
+                  digest=first.digest, blocking=tag("blocking"), advisory=tag("advisory"),
+                  model="+".join(m for m, _ in reads), tokens=sum(x.tokens for _, x in reads),
+                  resolved=[r for r in first.resolved if r not in unresolved], unresolved=unresolved)
+    v.extra["readers"] = [{"model": m, "verdict": x.verdict} for m, x in reads]
+    return v
+
+
+def partial(digest, template):
+    """Where the readers that answered wait while another is silent: {model: verdict}, one file per digest and
+    prompt, so a retry does not buy their read again. It goes when the read is complete. It lives under the passwd
+    home, never C.state(): $CC_LAND_STATE is the caller's, and a worker that queues with it pointing at its own dir
+    could plant a LAND for every reader there and have no read bought (security read of #847)."""
+    return os.path.join(C.PASSWD_HOME, ".cc", "state", "land", "reviews",
+                        f"{digest}.{os.path.splitext(template)[0]}.partial.json")
+
+
+def _silent(job, j, model, why):
+    """A reader answered nothing: INCOMPLETE (refunded, held, asked again), or a stop naming it when waiting will not
+    mend it (a fault, or a second silence or wall at the same head)."""
+    repo, pr, head = job.repo, job.pr, job.head
+    if why.startswith("fault"):
+        return _stop(job, f"review reader {model} cannot run: {why[len('fault: '):]}", fault=True, reader=model)
+    if why.startswith("wall"):
+        if (j.get("wall") or {}).get("head") == head:
+            return _stop(job, f"the read hit its own cap twice at {head[:12]} ({model}: {why})", cap=True)
+        charge(repo, pr, wall={"head": head, "why": why, "at": C.now()})
+    elif not why.startswith("limit"):
+        was = j.get("silent") or {}
+        if (was.get("head"), was.get("reader")) == (head, model):
+            return _stop(job, f"review reader {model} answered nothing twice at {head[:12]}: {why}",
+                         fault=True, reader=model)
+        charge(repo, pr, silent={"head": head, "reader": model, "why": why, "at": C.now()})
+    return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest,
+                     extra={"why": f"{model}: {why}", "until": limit_until(why), "reader": model})
+
+
 def _buy(job, template, diff, more):
     repo, pr = job.repo, job.pr
     lim_rc, lim = C.sh([os.path.join(BIN, "cc-limit"), "status"], timeout=60)
@@ -686,7 +912,9 @@ def _buy(job, template, diff, more):
     j = spent(repo, pr)
     if int(j.get("reviews") or 0) >= MAX_READS:
         return _stop(job, f"two reads already spent on PR #{pr}; the planning seat decides", cap=True)
-    wall = j.get("wall") or {}
+    if effort() not in EFFORTS:
+        return _stop(job, f"the review cannot run: CC_LAND_REVIEW_EFFORT={effort()!r} is not one of "
+                          f"{', '.join(EFFORTS)}", fault=True)
     root = root_of(job)
     facts = pr_view(root, pr, "title") or {}
     # the union: job.files is the lane's list, which a job queued by an older lane may have made in the checkout's
@@ -700,16 +928,25 @@ def _buy(job, template, diff, more):
                   BRIEF=brief_of(job) or
                   "No brief was found for this PR. Judge the change against its title and its own diff.",
                   RULES=rules_of(root, job.base_sha) or "This repo ships no docs/REVIEW.md.", **more)
-    v, usd, why = ask(text, repo, pr, job.digest)
-    if usd:
-        charge(repo, pr, review_usd=usd)
-    if v is None and why.startswith("wall"):
-        if wall.get("head") == job.head:
-            return _stop(job, f"the read hit its own cap twice at {job.head[:12]} ({why})", cap=True)
-        charge(repo, pr, wall={"head": job.head, "why": why, "at": C.now()})
-    if v is None:
-        return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest, extra={"why": why, "until": limit_until(why)})
-    charge(repo, pr, reviews=1)
+    kept = C.read_json(partial(job.digest, template), {}) or {}
+    reads, usd = [], 0.0
+    for model in readers():
+        if isinstance(kept.get(model), dict):
+            reads.append((model, T.Verdict.from_dict(kept[model])))
+            continue
+        v, cost, why = ask(text, repo, pr, job.digest, model)
+        if cost:
+            charge(repo, pr, review_usd=cost)
+            usd += cost
+        if v is None:
+            return _silent(job, j, model, why)
+        reads.append((model, v))
+        kept[model] = v.to_dict()
+        C.write_json(partial(job.digest, template), kept)
+    v = combined(reads)
+    charge(repo, pr, reviews=1, silent=None)
+    with contextlib.suppress(OSError):
+        os.unlink(partial(job.digest, template))
     v.extra["head"] = job.head
     posted = post(root, pr, marker(v, job.base_sha, job.head, v.model))
     C.write_json(C.state("reviews", f"{job.digest}.json"), dict(v.to_dict(), repo=repo, pr=pr, posted=posted))

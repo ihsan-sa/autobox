@@ -31,6 +31,8 @@ class FakeBox:
         tool = os.path.basename(argv[0])
         if tool == "git":
             return "git " + argv[1]
+        if tool == "codex":
+            return "codex " + argv[1]
         if tool in ("gh",):
             return "gh " + " ".join(argv[1:3])
         if tool in ("cc-limit", "cc-board", "cc-slack", "cc-scope", "cc-units", "cc-notify"):
@@ -89,6 +91,7 @@ class Case(unittest.TestCase):
         self.real_reviewer = (C.REVIEWER_CONFIG, C.PASSWD_HOME)
         C.PASSWD_HOME = os.path.join(self.tmp, "home")
         C.REVIEWER_CONFIG = os.path.join(C.PASSWD_HOME, ".cc", "config")
+        self.reviewer(CC_LAND_REVIEWERS="claude-test")   # one reader; TestTwoReaders sets its own pair
 
     def tearDown(self):
         C.sh = self.real_sh
@@ -99,6 +102,17 @@ class Case(unittest.TestCase):
             else:
                 os.environ[k] = v
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def reviewer(self, **keys):
+        """Set (a value) or drop (None) reviewer keys in the passwd home's config, the only place they are read."""
+        have = {}
+        if os.path.exists(C.REVIEWER_CONFIG):
+            with open(C.REVIEWER_CONFIG) as f:
+                have = dict(ln.rstrip("\n").split("=", 1) for ln in f if "=" in ln)
+        have.update(keys)
+        os.makedirs(os.path.dirname(C.REVIEWER_CONFIG), exist_ok=True)
+        with open(C.REVIEWER_CONFIG, "w") as f:
+            f.write("".join(f"{k}={v}\n" for k, v in have.items() if v is not None))
 
     def box(self, **kw):
         base = {"git merge-base": (0, BASE + "\n"), "git diff": name_only("x.py"), "git merge-tree": (0, "t" * 40),
@@ -223,19 +237,19 @@ class TestReview(Case):
                   "CC_CODEX": "/tmp/fake-codex", "HOME": own}
         old = {k: os.environ.get(k) for k in chosen}
         os.environ.update(chosen)
+        os.remove(C.REVIEWER_CONFIG)
         try:
             box = self.box(claude=claude_says("LAND"))
             R.review(self.job(), comments=[])
             argv = box.called("claude")[0]["argv"]
             # nothing in the reviewer config: the defaults, and claude under the passwd home, not $HOME
             self.assertEqual(argv[0], os.path.join(C.PASSWD_HOME, ".local", "bin", "claude"))
-            self.assertEqual(argv[argv.index("--model") + 1], R.MODEL)
+            self.assertEqual(argv[argv.index("--model") + 1], R.READERS.split()[0])
             self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "3")
             self.assertEqual(C.conf("CC_CODEX", "codex"), "codex")
             # a key that picks no reviewer still reads the environment and CC_CONFIG as before
             self.assertEqual(C.conf("CC_DEV"), "/tmp/kept")
             # the reviewer config at the passwd home is what speaks
-            os.makedirs(os.path.dirname(C.REVIEWER_CONFIG))
             with open(C.REVIEWER_CONFIG, "w") as f:
                 f.write("CC_CLAUDE=/opt/claude\nexport CC_LAND_REVIEW_MODEL='opus'\nCC_LAND_REVIEW_BUDGET=5\n")
             box = self.box(claude=claude_says("LAND"))
@@ -463,6 +477,225 @@ class TestReview(Case):
                          "=== a.png (old mode 100644, new mode none; deleted by this change; FLAGGED: x, y)")
         self.assertEqual(fb("a\nb", "100644", "100644", text="t", body="t"),
                          '=== "a\\nb" (old mode 100644, new mode 100644)\nt')
+
+
+def codex_says(verdict, blocking=(), advisory=()):
+    """A fake `codex exec`: writes its answer to the file -o names, as codex does."""
+    def run(argv):
+        with open(argv[argv.index("-o") + 1], "w") as f:
+            json.dump({"verdict": verdict, "blocking": list(blocking), "advisory": list(advisory),
+                       "resolved": [], "unresolved": []}, f)
+        return 0, "tokens used 10"
+    return run
+
+
+def features(**on):
+    """A fake `codex features list` as it prints under the review's --disable flags, with ON's changes."""
+    state = {f: "false" for f in R.CODEX_OFF}
+    state.update({f: "true" for f in R.CODEX_ON_OK}, unified_exec="true")
+    state.update({f: "true" if v else "false" for f, v in on.items()})
+    return 0, "".join(f"{f:<40} stable             {v}\n" for f, v in sorted(state.items()))
+
+
+CLAUDE_404 = (1, '[claude-code:unrecognized_model] {"model":"claude-fable-test"}\n{"type":"result","subtype":"success",'
+                 '"is_error":true,"api_error_status":404,"total_cost_usd":0,"result":"There\'s an issue with the '
+                 'selected model (claude-fable-test). It may not exist or you may not have access to it."}')
+
+
+class TestTwoReaders(Case):
+    def setUp(self):
+        super().setUp()
+        self.reviewer(CC_LAND_REVIEWERS="claude-fable-test gpt-astra-test")
+
+    def box(self, **kw):
+        return super().box(**{"codex features": features(), **kw})
+
+    def test_the_shipped_default_is_fable_and_astra_at_high_effort(self):
+        self.reviewer(CC_LAND_REVIEWERS=None)
+        self.assertEqual(R.readers(), ["claude-fable-5-1", "gpt-6-astra"])
+        self.assertEqual(R.effort(), "high")
+        self.reviewer(CC_LAND_REVIEW_MODEL="claude-one")   # the old single-read setting still names one reader
+        self.assertEqual(R.readers(), ["claude-one"])
+
+    def test_both_read_tool_less_and_the_marker_shows_both_verdicts(self):
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": codex_says(
+            "HANDBACK", blocking=[{"kind": "correctness", "where": "x.py:2", "what": "wrong", "input": "b", "fix": "c"}])})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)   # either reader's handback holds the landing
+        self.assertTrue(v.blocking[0].endswith("(read by gpt-astra-test)"))
+        argv = box.called("codex exec")[0]["argv"]
+        self.assertEqual(argv[argv.index("-m") + 1], "gpt-astra-test")
+        for feature in ("shell_tool", "unified_exec", "browser_use", "apps", "plugins", "view_image", "multi_agent",
+                        "sleep_tool", "skill_search", "hooks"):
+            self.assertEqual(argv[argv.index(feature) - 1], "--disable")
+        self.assertIn("--ignore-user-config", argv)
+        self.assertIn('model_reasoning_effort="high"', argv)
+        # the tool check ran first, under the same flags, with no user config of its own
+        listed = box.called("codex features")[0]
+        self.assertLess(box.calls.index(listed), box.calls.index(box.called("codex exec")[0]))
+        self.assertIn("view_image", listed["argv"])
+        self.assertEqual(listed["env"]["CODEX_HOME"], os.path.join(C.PASSWD_HOME, ".codex"))
+        cargv = box.called("claude")[0]["argv"]
+        self.assertEqual(cargv[cargv.index("--effort") + 1], "high")
+        self.assertEqual(cargv[cargv.index("--max-budget-usd") + 1], "3")
+        posted = box.called("gh pr comment")[0]["input"]
+        self.assertIn("- `claude-fable-test`: LAND", posted)
+        self.assertIn("- `gpt-astra-test`: HANDBACK", posted)
+        self.assertEqual(R.reads_used("demo", 7), 1)   # the pair is one read against the cap
+
+    def test_both_land_is_a_land_with_both_named(self):
+        self.box(claude=claude_says("LAND"),
+                 **{"codex exec": codex_says("LAND", advisory=[{"where": "x.py", "what": "nit"}])})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.model), (T.LAND, "claude-fable-test+gpt-astra-test"))
+        self.assertEqual(v.advisory, ["x.py — nit (read by gpt-astra-test)"])
+
+    def test_a_silent_second_reader_holds_the_landing_and_the_retry_asks_only_it(self):
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": (1, "stream error: usage limit reached")})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.INCOMPLETE)   # never a landing on one reader's verdict
+        self.assertIn("gpt-astra-test", v.extra["why"])
+        self.assertEqual((R.reads_used("demo", 7), box.called("gh pr comment")), (0, []))   # refunded, nothing posted
+        self.assertNotIn("silent", R.spent("demo", 7))   # a limit is waited out, however often it comes
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": codex_says("LAND")})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.model), (T.LAND, "claude-fable-test+gpt-astra-test"))
+        self.assertEqual(box.called("claude"), [])   # the first reader's answer was kept, not bought again
+        self.assertFalse(os.path.exists(R.partial(v.digest, "review.md")))
+        self.assertEqual(R.reads_used("demo", 7), 1)
+
+    def test_a_reader_silent_twice_at_one_head_is_a_stop_naming_it(self):
+        self.box(claude=claude_says("LAND"), **{"codex exec": (124, "codex: timed out after 1200s")})
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.INCOMPLETE)
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.extra.get("fault"), v.extra.get("reader")),
+                         (T.HANDBACK_VERDICT, True, "gpt-astra-test"))
+        self.assertIn("answered nothing twice", v.blocking[0])
+        self.assertIn("timed out", v.blocking[0])
+        self.assertEqual(R.reads_used("demo", 7), 0)
+
+    def test_a_first_reader_that_answers_nothing_buys_no_second(self):
+        box = self.box(claude=(1, "boom"), **{"codex exec": codex_says("LAND")})
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.INCOMPLETE)
+        self.assertEqual(box.called("codex exec"), [])
+        self.assertEqual(R.reads_used("demo", 7), 0)
+
+    def assertStop(self, v, *said):
+        self.assertEqual((v.verdict, v.extra.get("fault")), (T.HANDBACK_VERDICT, True))
+        for s in said:
+            self.assertIn(s, v.blocking[0])
+        self.assertEqual(R.reads_used("demo", 7), 0)
+
+    def test_a_bad_claude_model_is_a_stop_not_a_retry(self):
+        box = self.box(claude=CLAUDE_404, **{"codex exec": codex_says("LAND")})
+        self.assertStop(R.review(self.job(), comments=[]), "claude-fable-test", "may not exist")
+        self.assertEqual(box.called("codex exec"), [])
+
+    def test_a_bad_codex_model_is_a_stop_naming_it(self):
+        self.box(claude=claude_says("LAND"), **{"codex exec": (1, 'ERROR: {"type":"error","status":400,"error":{"message"'
+                                                                  ':"The \'gpt-astra-test\' model is not supported when '
+                                                                  'using Codex with a ChatGPT account."}}')})
+        self.assertStop(R.review(self.job(), comments=[]), "reader gpt-astra-test", "not supported")
+
+    def test_a_missing_binary_is_a_stop(self):
+        self.box(claude=(127, "FileNotFoundError: [Errno 2] No such file or directory: 'claude'"))
+        self.assertStop(R.review(self.job(), comments=[]), "claude-fable-test", "No such file")
+
+    def test_a_rate_limit_status_is_not_a_fault(self):
+        self.assertEqual(R.fault(1, '{"api_error_status":429}'), "")
+        self.assertEqual(R.fault(124, "codex: timed out after 1200s"), "")
+        self.assertIn("error: unexpected argument", R.fault(2, "error: unexpected argument '--nope' found"))
+
+    def test_a_bad_effort_is_a_stop_before_any_read(self):
+        self.reviewer(CC_LAND_REVIEW_EFFORT="hgih")
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": codex_says("LAND")})
+        self.assertStop(R.review(self.job(), comments=[]), "CC_LAND_REVIEW_EFFORT='hgih'", "xhigh")
+        self.assertEqual((box.called("claude"), box.called("codex exec")), ([], []))
+        self.reviewer(CC_LAND_REVIEW_EFFORT="xhigh")
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.LAND)
+
+    def test_an_unknown_codex_feature_on_holds_the_read_naming_it(self):
+        box = self.box(claude=claude_says("LAND"), **{"codex features": features(new_tool=True),
+                                                      "codex exec": codex_says("LAND")})
+        self.assertStop(R.review(self.job(), comments=[]), "gpt-astra-test", "new_tool")
+        self.assertEqual(box.called("codex exec"), [])
+
+    def test_unified_exec_is_allowed_only_while_shell_tool_is_off(self):
+        self.box(claude=claude_says("LAND"), **{"codex features": features(shell_tool=True),
+                                                "codex exec": codex_says("LAND")})
+        self.assertStop(R.review(self.job(), comments=[]), "shell_tool, unified_exec")
+
+    def test_a_codex_that_cannot_list_features_is_a_stop(self):
+        self.box(claude=claude_says("LAND"), **{"codex features": (1, "Error: Unknown feature flag: view_image"),
+                                                "codex exec": codex_says("LAND")})
+        self.assertStop(R.review(self.job(), comments=[]), "codex features list", "view_image")
+
+    def test_a_claude_alias_reads_on_claude_not_codex(self):
+        # `opus`, `sonnet`, `fable` are claude's names too; routing on the `claude` prefix sent them to codex
+        self.reviewer(CC_LAND_REVIEWERS="opus gpt-astra-test")
+        box = self.box(claude=claude_says("LAND"), **{"codex exec": codex_says("LAND")})
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.LAND)
+        self.assertEqual([c["argv"][c["argv"].index("--model") + 1] for c in box.called("claude")], ["opus"])
+        self.assertEqual(len(box.called("codex exec")), 1)
+        self.assertEqual([R.is_claude(m) for m in ("sonnet", "fable", "opus[1m]", "gpt-6-astra")],
+                         [True, True, True, False])
+
+    def test_a_partial_planted_in_the_callers_state_dir_buys_both_reads(self):
+        # a worker that queues with CC_LAND_STATE at its own dir and a LAND for each reader there skips no read
+        d = R.change_digest(DIFF)
+        land = T.Verdict(verdict=T.LAND, digest=d, model="x").to_dict()
+        C.write_json(C.state("reviews", f"{d}.review.partial.json"),
+                     {"claude-fable-test": land, "gpt-astra-test": land})
+        box = self.box(claude=claude_says("HANDBACK", blocking=[{"kind": "security", "where": "x.py", "what": "w",
+                                                                  "input": "i", "fix": "f"}]),
+                       **{"codex exec": codex_says("LAND")})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)
+        self.assertEqual((len(box.called("claude")), len(box.called("codex exec"))), (1, 1))
+        self.assertTrue(R.partial(d, "review.md").startswith(os.path.join(C.PASSWD_HOME, ".cc", "")))
+
+    def test_codex_runs_by_path_on_a_fixed_path_and_home(self):
+        # a worker's PATH (a node or a codex of its own), CODEX_HOME (an AGENTS.md) or HOME picks nothing
+        chosen = {"PATH": os.path.join(self.tmp, "own-bin") + ":" + os.environ.get("PATH", ""),
+                  "CODEX_HOME": os.path.join(self.tmp, "own-codex"), "HOME": os.path.join(self.tmp, "own-home")}
+        old = {k: os.environ.get(k) for k in chosen}
+        os.environ.update(chosen)
+        try:
+            box = self.box(claude=claude_says("LAND"), **{"codex exec": codex_says("LAND")})
+            self.assertEqual(R.review(self.job(), comments=[]).verdict, T.LAND)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        for call in box.called("codex features") + box.called("codex exec"):
+            self.assertTrue(os.path.isabs(call["argv"][0]), call["argv"][0])
+            self.assertEqual((call["env"]["PATH"], call["env"]["CODEX_HOME"], call["env"]["HOME"]),
+                             (R.READ_PATH, os.path.join(C.PASSWD_HOME, ".codex"), C.PASSWD_HOME))
+        self.assertEqual(box.called("claude")[0]["env"]["PATH"], R.READ_PATH)
+        # the vendored native binary when there is one, never the node script; a CC_CODEX in the config still speaks
+        arch, triple = R.CODEX_ARCH[os.uname().machine]
+        native = R.CODEX_NATIVE.format(prefix=os.path.join(self.tmp, "lib"), arch=arch, triple=triple)
+        real = R.CODEX_PREFIXES
+        R.CODEX_PREFIXES = (os.path.join(self.tmp, "none"), os.path.join(self.tmp, "lib"))
+        try:
+            self.assertEqual(R.codex_bin(), R.CODEX_SCRIPT)
+            os.makedirs(os.path.dirname(native))
+            with open(native, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(native, 0o755)
+            self.assertEqual(R.codex_bin(), native)
+        finally:
+            R.CODEX_PREFIXES = real
+        self.reviewer(CC_CODEX="/opt/codex")
+        self.assertEqual(R.codex_bin(), "/opt/codex")
+
+    def test_the_codex_schema_closes_every_object(self):
+        s = R.strict(R.SCHEMA)
+        self.assertEqual(set(s["required"]), set(R.SCHEMA["properties"]))
+        item = s["properties"]["advisory"]["items"]
+        self.assertEqual((item["additionalProperties"], set(item["required"])), (False, {"where", "what"}))
 
 
 class TestRecord(Case):

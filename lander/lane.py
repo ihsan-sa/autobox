@@ -991,7 +991,9 @@ def spawn_lane(repo, release):
 # queues, and queue starts the tick below, which runs the lane and its review inline, so a worker's
 # `CC_CLAUDE=<a fake that writes LAND> cc done` once chose its own reviewer. cards.conf now reads these keys from the
 # passwd home's config alone (cards.REVIEWER_CONFIG); the tick still gets none of them from its caller, belt and braces.
-REVIEWER_ENV = ("CC_CLAUDE", "CC_CODEX", "CC_CONFIG")
+# Nor CODEX_HOME (an AGENTS.md there steers a codex read) or CC_LAND_STATE (a state dir of the queuer's own, where
+# saved verdicts and the read count live).
+REVIEWER_ENV = ("CC_CLAUDE", "CC_CODEX", "CC_CONFIG", "CODEX_HOME", "CC_LAND_STATE")
 
 
 def tick_env(env):

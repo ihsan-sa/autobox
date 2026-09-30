@@ -1457,7 +1457,7 @@ class Branches(Fixture):
         fake = mock.Mock(side_effect=lambda argv, **kw: started.append((argv, kw)) or mock.Mock(pid=9))
         chosen = {"CC_CLAUDE": "/tmp/fake-claude", "CC_CODEX": "/tmp/fake-codex", "CC_CONFIG": "/tmp/own-config",
                   "CC_LAND_REVIEW_MODEL": "haiku", "CC_LAND_REVIEW_BUDGET": "0.01", "CC_LAND_REVIEW_EFFORT": "low",
-                  "CC_LAND_REVIEWERS": "none"}
+                  "CC_LAND_REVIEWERS": "none", "CODEX_HOME": "/tmp/own-codex", "CC_LAND_STATE": "/tmp/own-state"}
         with mock.patch.dict(os.environ, dict(chosen, CC_CLAUDE_HOME="/tmp/kept", CC_STATE="/tmp/kept-state")), \
                 mock.patch.object(L.subprocess, "Popen", fake):
             self.assertEqual(REAL_SPAWN_TICK("demo"), (True, "pid 9"))
