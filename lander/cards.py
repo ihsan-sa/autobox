@@ -43,7 +43,8 @@ BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
 def sh(argv, cwd=None, input=None, timeout=300, env=None):
     """Run argv; -> (rc, stdout+stderr). A missing tool, an argv too long or a timeout is rc 127 / 124 with the reason, never a raise."""
     try:
-        p = subprocess.run(argv, cwd=cwd, input=input, capture_output=True, text=True, timeout=timeout, env=env)
+        p = subprocess.run(argv, cwd=cwd, input=input, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, env=env)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except OSError as e:   # a missing tool, or an argv the kernel refuses (E2BIG)
         return 127, f"{type(e).__name__}: {e}"

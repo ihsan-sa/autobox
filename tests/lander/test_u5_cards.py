@@ -94,6 +94,15 @@ class Stubbed(unittest.TestCase):
         return T.Job(repo=repo, pr=7, member=member, extra={"queued_at": Q, **extra})
 
 
+class Sh(unittest.TestCase):
+    def test_output_that_is_not_utf8_is_replaced_not_raised(self):
+        """git show of a binary blob prints bytes that are not UTF-8; sh() returns them replaced, never raises."""
+        rc, out = C.sh(["printf", "\\377\\376ok\\000"])
+        self.assertEqual(rc, 0)
+        self.assertIn("\ufffd", out)
+        self.assertIn("ok", out)
+
+
 class Door(Stubbed):
     """Fix 1: the door's refusal and the lane's re-ask are the 🔐 card in #approvals, from ~ with no role."""
 

@@ -7,7 +7,11 @@ WHAT YOU GET, each block between `<<<name` and `name>>>`:
 - `prior` — the earlier read's blockers, numbered.
 - `interdiff` — what changed between the head that read saw and this head.
 - `diff` — the whole change against its base now, for context.
-- `files` — the files the change touches as they will be once it merges.
+- `files` — the files the change touches as they will be once it merges. Each starts with a header giving its
+  path and old and new mode. A header says `FLAGGED:` and why whenever you do not see that path's whole new
+  content as text, here and in the diff: the diff is cut before its change, the file is cut at 60 kB or left out
+  because the block is full, a binary change that is not a known binary type or is executable, a symlink or
+  submodule (gitlink) change, and a file git could not show.
 - `brief` — what the change was asked to do.
 - `rules` — this repository's own review rules, read from the base branch.
 
@@ -18,6 +22,8 @@ WHAT TO DO:
    block is settled; do not raise it now.
 3. Apply the same bar as the first read. A blocker is concrete: correctness with an input and the wrong outcome,
    security with the exact leak or bypass, or scope with the brief's own line quoted. Everything else is advisory.
+4. A `files` header that says `FLAGGED:` is always a new security blocker, even where step 2 would call it
+   settled: one NUL byte, a symlink, a submodule or a cut can put a change where nobody reads it.
 
 ANSWER with the JSON object the schema asks for and nothing else:
 - `verdict` — `LAND` when every prior blocker is resolved and there is no new one, else `HANDBACK`.

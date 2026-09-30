@@ -229,9 +229,9 @@ def pull(root, base, sha, since=""):
         rc, out = git(root, "merge", "--ff-only", "-q", sha)
     if rc:
         raise Failed("pull", f"git merge --ff-only {sha[:12]} in {root}: {last(out)}")
-    rc, out = git(root, "diff", "--name-status", "--no-renames", before, sha)
-    changes = [ln.split("\t", 1) for ln in out.splitlines() if "\t" in ln] if rc == 0 else []
-    return [(s[:1], p) for s, p in changes]
+    rc, out = git(root, "diff", "--name-status", "--no-renames", "-z", before, sha)
+    parts = out.split("\0") if rc == 0 else []   # -z: status, path, status, path, ... each path as it is
+    return [(s[:1], p) for s, p in zip(parts[0::2], parts[1::2]) if s and p]
 
 
 def install(root, repo, sha):

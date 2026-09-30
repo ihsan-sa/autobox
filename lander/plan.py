@@ -162,9 +162,9 @@ def added_files(repo_root: str, base: str, head: str, files: list) -> set:
         return set()
 
     def tree(rev):
-        p = subprocess.run(["git", "-C", repo_root, "ls-tree", "-r", "--name-only", rev, "--", *files],
-                           capture_output=True, text=True)
-        return set(p.stdout.splitlines()) if p.returncode == 0 else None
+        p = subprocess.run(["git", "-C", repo_root, "--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", rev,
+                            "--", *files], capture_output=True, text=True)
+        return {f for f in p.stdout.split("\0") if f} if p.returncode == 0 else None
     at_base = tree(base)
     if at_base is None:
         return set()
@@ -179,13 +179,14 @@ def added_files(repo_root: str, base: str, head: str, files: list) -> set:
 
 def changed(repo_root: str, base: str, head: str) -> list:
     import subprocess
-    argv = ["git", "-C", repo_root, "diff", "--name-only", "--no-renames", base] + ([head] if head else [])
+    # -z: every path as it is, whatever it holds (a space, a newline, a name git would quote)
+    argv = ["git", "-C", repo_root, "diff", "--name-only", "--no-renames", "-z", base] + ([head] if head else [])
     p = subprocess.run(argv, capture_output=True, text=True)
-    files = p.stdout.split() if p.returncode == 0 else []
+    files = [f for f in p.stdout.split("\0") if f] if p.returncode == 0 else []
     if not head:   # untracked files are part of a working copy's change too
-        q = subprocess.run(["git", "-C", repo_root, "ls-files", "--others", "--exclude-standard"],
+        q = subprocess.run(["git", "-C", repo_root, "ls-files", "--others", "--exclude-standard", "-z"],
                            capture_output=True, text=True)
-        files += [f for f in q.stdout.split() if f not in files]
+        files += [f for f in q.stdout.split("\0") if f and f not in files]
     return files
 
 

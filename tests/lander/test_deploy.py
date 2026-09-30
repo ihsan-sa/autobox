@@ -27,6 +27,11 @@ from lander import types as T  # noqa: E402
 OLD, NEW = "a" * 40, "c" * 40
 
 
+
+def nul(argv, text):
+    """A path list as git prints it under -z: every tab and newline a NUL."""
+    return text.replace("\t", "\0").replace("\n", "\0") if "-z" in argv else text
+
 class Box(Case):
     def setUp(self):
         super().setUp()
@@ -70,7 +75,7 @@ class Box(Case):
             if sub[:1] == ["ls-remote"]:
                 return 0, NEW + "\trefs/heads/main\n"
             if sub[:1] == ["diff"]:
-                return 0, changes + "\n"
+                return 0, nul(argv, changes + "\n")
             if sub[:1] == ["log"]:
                 return 0, "a change (#7)\n"
             return 0, ""
@@ -164,7 +169,7 @@ class TestDeploy(Box):
             if sub[:2] == ["rev-parse", "HEAD"]:
                 return 0, at["head"] + "\n"
             if sub[:1] == ["diff"]:
-                return (0, "M\tbin/daemon\n") if sub[-2] == OLD else (0, "")
+                return (0, nul(argv, "M\tbin/daemon\n")) if sub[-2] == OLD else (0, "")
             return git(argv)
         box.answers.update({"git " + k: moved for k in ("rev-parse", "diff", "merge")})
         D.request("demo", NEW)
@@ -184,7 +189,7 @@ class TestDeploy(Box):
         tries = []
 
         def diff(argv):   # only a diff from OLD sees bin/daemon; MID..NEW changes docs alone
-            return (0, "M\tbin/daemon\nM\tdocs/x.md\n") if argv[-2] == OLD else (0, "M\tdocs/x.md\n")
+            return 0, nul(argv, "M\tbin/daemon\nM\tdocs/x.md\n" if argv[-2] == OLD else "M\tdocs/x.md\n")
 
         def systemctl(argv):   # the first restart leaves the pid where it was
             if argv[2] == "restart":
@@ -296,7 +301,7 @@ class Tip(Box):
             if sub[:1] == ["rev-list"]:
                 return 0, "\n".join(commits) + "\n"
             if sub[:1] == ["diff"]:
-                return 0, "x.py\n"
+                return 0, nul(argv, "x.py\n")
             if sub[:1] == ["log"]:
                 return 0, "the change (#7)\n"
             if sub[:1] == ["rev-parse"] and sub[1:2] == ["HEAD"]:

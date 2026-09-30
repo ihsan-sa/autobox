@@ -5,6 +5,7 @@ or Slack. Run: python3 -m unittest discover -s core/tests/lander -p 'test_review
 """
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -45,6 +46,29 @@ class FakeBox:
         return [c for c in self.calls if self.key(c["argv"]) == key]
 
 
+def rev_parse(argv):
+    """git rev-parse as the lander asks it: the common dir, then one id per rev (a commit id stays itself, a ref is
+    BASE, `<tree>:<path>` a blob id)."""
+    out = []
+    for a in argv[2:]:
+        if a == "--git-common-dir":
+            out.append("/nonexistent/.git")
+        elif not a.startswith("-"):
+            a = a.replace("^{commit}", "")
+            out.append("f" * 40 if ":" in a else a if re.fullmatch(r"[0-9a-f]{40}", a) else BASE)
+    return 0, "".join(ln + "\n" for ln in out)
+
+
+def ls_tree(mode="100644"):
+    """git ls-tree -z <tree> -- <path>: one entry for the path it was asked."""
+    return lambda argv: (0, f"{mode} blob {'f' * 40}\t{argv[-1]}\0")
+
+
+def name_only(*paths, diff=DIFF):
+    """git diff: the paths for --name-only -z (files_of), else the diff."""
+    return lambda argv: (0, "".join(p + "\0" for p in paths) if "--name-only" in argv else diff)
+
+
 def claude_says(verdict, blocking=(), advisory=(), usd=0.42):
     return (0, json.dumps({"type": "result", "subtype": "success", "total_cost_usd": usd,
                            "structured_output": {"verdict": verdict, "blocking": list(blocking),
@@ -72,9 +96,11 @@ class Case(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def box(self, **kw):
-        base = {"git merge-base": (0, BASE + "\n"), "git diff": (0, DIFF), "git merge-tree": (0, "t" * 40),
+        base = {"git merge-base": (0, BASE + "\n"), "git diff": name_only("x.py"), "git merge-tree": (0, "t" * 40),
                 "git show": (0, "text\n"), "gh pr view": (0, json.dumps({"comments": [], "title": "a change"})),
-                "gh pr comment": (0, ""), "cc-limit status": (1, "no limit"), "cc-limit check": (1, "")}
+                "gh pr comment": (0, ""), "git rev-parse": rev_parse, "git init": (0, ""),
+                "git ls-tree": ls_tree(),
+                "cc-limit status": (1, "no limit"), "cc-limit check": (1, "")}
         base.update(kw)
         C.sh = FakeBox(**base)
         return C.sh
@@ -182,11 +208,14 @@ class TestReview(Case):
 
     def test_a_big_diff_goes_on_stdin_cut_never_into_argv(self):
         big = DIFF + "+x\n" * 200_000
-        box = self.box(claude=claude_says("LAND"), **{"git diff": (0, big)})
+        box = self.box(claude=claude_says("LAND"), **{"git diff": name_only("x.py", diff=big)})
         R.review(self.job(), comments=[])
         call = box.called("claude")[0]
         self.assertLess(max(len(a) for a in call["argv"]), 128 * 1024)
         self.assertIn("the diff is cut here", call["input"])
+        self.assertIn("the change to these paths is cut or missing: x.py)", call["input"])
+        self.assertIn("=== x.py (old mode 100644, new mode 100644; FLAGGED: the diff is cut before its change)",
+                      call["input"])
         self.assertLess(len(call["input"]), R.DIFF_CAP + 100_000)
         self.assertNotIn("the diff is cut here", R.capped(DIFF))
 
@@ -263,16 +292,17 @@ class TestReview(Case):
         self.assertEqual(R.reads_used("demo", 7), 0)
 
     def test_a_handback_at_another_digest_gets_the_delta_read(self):
-        box = self.box(claude=claude_says("LAND"), **{"git rev-parse": (0, "c" * 40 + "\n")})
+        box = self.box(claude=claude_says("LAND"))
         prior = self.comment("HANDBACK", "0dd", ["1. [correctness] x.py — the old bug"], head="c" * 40)
         R.review(self.job(), comments=[prior])
         text = box.called("claude")[0]["input"]
         self.assertIn("the old bug", text)
         self.assertIn("You are the second review read", text)
+        self.assertNotIn("no longer in this repository", text)   # the interdiff was made, not taken for gone
 
 
     def test_a_recorded_handback_at_this_digest_stands_in_the_delta_read(self):
-        box = self.box(claude=claude_says("LAND"), **{"git rev-parse": (0, "c" * 40 + "\n")})
+        box = self.box(claude=claude_says("LAND"))
         j = self.job()
         prior = self.comment("HANDBACK", "0dd", ["1. [correctness] x.py — the old bug"], head="c" * 40)
         here = self.comment("HANDBACK", j.digest, ["1. [security] x.py — still open"])
@@ -281,7 +311,7 @@ class TestReview(Case):
         self.assertEqual(box.called("claude"), [])
 
     def test_a_land_recorded_after_the_prior_handback_is_used_without_a_read(self):
-        box = self.box(claude=claude_says("HANDBACK"), **{"git rev-parse": (0, "c" * 40 + "\n")})
+        box = self.box(claude=claude_says("HANDBACK"))
         j = self.job()
         prior = self.comment("HANDBACK", "0dd", ["1. [correctness] x.py — the old bug"], head="c" * 40)
         v = R.review(j, comments=[prior, self.comment("LAND", j.digest)])
@@ -290,6 +320,81 @@ class TestReview(Case):
         self.assertEqual(v.verdict, T.LAND)
         self.assertEqual(box.called("claude"), [])
         self.assertEqual(R.reads_used("demo", 7), 0)
+
+    def test_a_binary_change_is_flagged_unless_it_is_a_known_binary_type(self):
+        """One NUL byte makes git call a script, a unit file or a web page binary, and each still runs, so its change
+        would show as one line nobody reads. The files block gives both blob ids and flags every binary change but
+        a known binary type that is not executable; review.md hands a flagged one back."""
+        for path, mode, why in (("run.sh", "100644", "not a known binary type: .sh"),
+                                ("page.html", "100644", "not a known binary type: .html"),
+                                ("x.service", "100644", "not a known binary type: .service"),
+                                ("tool", "100644", "not a known binary type: no extension"),
+                                ("a.png", "100755", "executable"), ("a.png", "100644", ""), ("a.pdf", "100644", "")):
+            with self.subTest(path=path, mode=mode):
+                text = "#!/bin/sh\n#\0\nrm -rf ~\n"
+                box = self.box(claude=claude_says("LAND"), **{"git show": (0, text), "git ls-tree": ls_tree(mode),
+                                                              "git diff": name_only(path)})
+                j = self.job()
+                j.files = [path]
+                R.review(j, comments=[])
+                sent = box.called("claude")[0]["input"]
+                sent = sent[sent.index("<<<files"):sent.index("files>>>")]
+                self.assertIn(f"=== {path} (old mode {mode}, new mode {mode}; binary, not shown: old blob {'f' * 40}, "
+                              f"new blob {'f' * 40}", sent)
+                self.assertEqual("FLAGGED" in sent, bool(why))
+                if why:
+                    self.assertIn(f"; FLAGGED: binary, {why})", sent)
+                self.assertNotIn("rm -rf", sent)
+                shutil.rmtree(os.environ["CC_LAND_STATE"], ignore_errors=True)
+        for name in ("review.md", "delta.md"):   # the read is told what to do with that line
+            self.assertIn("`FLAGGED:`", R.load_prompt(name))
+
+    def test_a_file_git_cannot_show_is_flagged_and_only_a_missing_entry_is_deleted(self):
+        self.box(**{"git show": (128, "fatal: path does not exist")})
+        self.assertEqual(R.merged_files(self.tmp, BASE, HEAD, ["x.py"]), "=== x.py (old mode 100644, new mode 100644; "
+                         f"FLAGGED: git could not show this file, blob {'f' * 40})")
+        self.box(**{"git show": (128, "fatal"), "git ls-tree": (0, "")})
+        self.assertEqual(R.merged_files(self.tmp, BASE, HEAD, ["x.py"]),
+                         "=== x.py (old mode none, new mode none; deleted by this change)")
+
+    def test_merged_files_reads_nothing_when_git_cannot_resolve_the_change(self):
+        self.box(**{"git rev-parse": (128, "fatal: bad revision")})
+        self.assertEqual(R.merged_files(self.tmp, BASE, HEAD, ["x.py"]),
+                         "=== x.py (old mode ?, new mode ?; FLAGGED: git could not read this change)")
+
+    def test_cut_paths_names_every_path_whose_change_ends_past_the_cap(self):
+        """A section that ends past DIFF_CAP is cut or dropped; one that ends before it is whole. When the sections
+        cannot be matched one to one with the paths (a rename is one section for two paths), every path is cut."""
+        sec = lambda p, n: f"diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1 +1 @@\n" + "+x\n" * n
+        self.assertEqual(R.cut_paths(sec("a", 10) + sec("b", 10), ["a", "b"]), [])   # under the cap: nothing
+        whole, cut = sec("a", 10), sec("b", R.DIFF_CAP // 3)
+        self.assertEqual(R.cut_paths(whole + cut + sec("c", 5), ["a", "b", "c"]), ["b", "c"])
+        self.assertEqual(R.cut_paths(whole + cut, ["a", "b", "extra"]), ["a", "b", "extra"])
+        self.assertEqual(R.cut_paths(cut, []), [])
+        # the count agrees but a section is not the path's own (a rename beside a type change): every path is cut
+        renamed = whole.replace("diff --git a/a b/a", "diff --git a/a b/z")
+        self.assertEqual(R.cut_paths(renamed + cut, ["a", "b"]), ["a", "b"])
+        self.assertEqual(R.cut_paths(whole + cut, ["b", "a"]), ["b", "a"])
+        # a line of content that reads "diff --git" is a "+" line in the diff, so it starts no section
+        self.assertEqual(R.cut_paths(whole + sec("b", 3).replace("+x", "+diff --git a/z b/z", 1) + sec("c", R.DIFF_CAP // 3),
+                                     ["a", "b", "c"]), ["c"])
+
+    def test_file_block_flags_whatever_it_does_not_show_whole(self):
+        """The one rule: a path whose whole new content is not shown is FLAGGED, even with no reason given, and only
+        an exempt path (a deletion, a known binary type) passes unshown and unflagged."""
+        fb = R.file_block
+        self.assertEqual(fb("a.py", "100644", "100644", text="t\n", body="t\n"),
+                         "=== a.py (old mode 100644, new mode 100644)\nt\n")
+        self.assertEqual(fb("a.py", "100644", "100644", text="t\nu\n", body="t\n"),
+                         "=== a.py (old mode 100644, new mode 100644; FLAGGED: its content is not shown in full)\nt\n")
+        self.assertEqual(fb("a.py", "", "100644"),
+                         "=== a.py (old mode none, new mode 100644; FLAGGED: its content is not shown in full)")
+        self.assertEqual(fb("a.png", "", "100644", ["binary, not shown"], exempt=True),
+                         "=== a.png (old mode none, new mode 100644; binary, not shown)")
+        self.assertEqual(fb("a.png", "100644", "", ["deleted by this change"], ["x", "y"], exempt=True),
+                         "=== a.png (old mode 100644, new mode none; deleted by this change; FLAGGED: x, y)")
+        self.assertEqual(fb("a\nb", "100644", "100644", text="t", body="t"),
+                         '=== "a\\nb" (old mode 100644, new mode 100644)\nt')
 
 
 class TestRecord(Case):
@@ -307,20 +412,19 @@ class TestRecord(Case):
             C.conf = old
 
     def test_record_refuses_a_head_that_moved(self):
-        box = self.box(**{"gh pr view": self.facts(), "git rev-parse": (0, BASE)})
+        box = self.box(**{"gh pr view": self.facts()})
         self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat", "--head", "abcdef1"), 1)
         self.assertEqual(box.called("gh pr comment"), [])
 
     def test_record_at_the_head_posts_the_marker(self):
-        box = self.box(**{"gh pr view": self.facts(), "git rev-parse": (0, BASE)})
+        box = self.box(**{"gh pr view": self.facts()})
         self.assertEqual(self.run_record("demo", "7", "LAND-AFTER-FIX", "--by", "seat", "--head", HEAD[:12],
                                          "--findings", "[correctness] x breaks"), 0)
         self.assertIn("verdict=HANDBACK", box.called("gh pr comment")[0]["input"])
 
     def test_record_refuses_land_over_a_standing_handback(self):
         d = R.change_digest(DIFF)
-        box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. [correctness] x"])]),
-                          "git rev-parse": (0, BASE)})
+        box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. [correctness] x"])])})
         self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 1)
         self.assertEqual(box.called("gh pr comment"), [])
 

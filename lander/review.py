@@ -5,12 +5,12 @@
                                      or if it is looser than a HANDBACK already standing (old words map as below)
     lander will-review <repo> <pr>   exit 0 when the lander would buy a read for this PR at its head, else 1
 
-ONE READ PER CHANGE DIGEST. The digest is digest_of(): change_digest() of `git diff base...head`, the hunk headers
-and `index` lines dropped (a binary file's full blob ids kept) and the rest hashed, so a rebase that does not change
-the change keeps its key. It is the
-one key: the lane names its job by it, and `record` and `will-review` by it too. A read recorded at that digest (or
-the legacy one, keys()) — by this lander, by a seat through `record`, or by the old lander — is reused, never
-bought again, by review() and delta_review() alike.
+ONE READ PER CHANGE DIGEST. The digest is digest_of(): change_digest() of `git diff base...head` as plain_diff()
+makes it (blind to the checkout's config and attributes, so binary means binary bytes), the hunk headers and `index`
+lines dropped (a binary file's full blob ids kept) and the rest hashed, so a rebase that does not change the change
+keeps its key. It is the one key: the lane names its job by it, and `record` and `will-review` by it too. A read
+recorded at that digest (or the legacy one, keys()) — by this lander, by a seat through `record`, or by the old
+lander — is reused, never bought again, by review() and delta_review() alike.
 
 WHERE VERDICTS LIVE. On the PR, as marker comments. Today's shape is kept so every reader still parses it:
 
@@ -47,6 +47,7 @@ here runs for a paused project. recurring-defect-ok: pause-hold-missing — the 
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import sys
@@ -364,53 +365,202 @@ PLAIN_DIFF = ("--no-ext-diff", "--no-textconv", "--no-color")
 
 
 def git(root, *args, timeout=120):
-    return C.sh(["git", *args], cwd=root, timeout=timeout)
+    """git in the checkout, with no replace refs: a worker can write refs/replace/ there and swap one object for
+    another under every read that follows."""
+    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+    return C.sh(["git", *args], cwd=root, timeout=timeout, env=env)
+
+
+@contextlib.contextmanager
+def blind(root, *revs):
+    """A scratch bare repo that borrows the checkout's objects and reads no config, attributes or template of anyone's
+    -> ((rc, out), run). On success rc is 0, out the revs as commit ids, and run(*git_args, timeout=) runs git there;
+    else run is None and (rc, out) says why.
+
+    A worker can write the checkout's shared .git: its config (diff.external, a textconv, a merge driver, color) and
+    its info/attributes, where `*.py -diff` turns a text change into one "Binary files … differ" line and `* merge=x`
+    runs the program merge.x.driver names. Git run here sees none of it: binary is decided by a file's bytes, and a
+    merge uses git's own text merge."""
+    rc, out = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir", *(f"{r}^{{commit}}" for r in revs))
+    lines = out.splitlines()
+    if rc or len(lines) != 1 + len(revs):   # the scratch repo has no refs, so every rev goes to it as a commit id
+        yield (rc or 1, out), None
+        return
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # core.attributesFile unset still reads ~/.config/git/attributes, so it is pointed at nothing
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1", GIT_CONFIG_COUNT="1",
+               GIT_CONFIG_KEY_0="core.attributesFile", GIT_CONFIG_VALUE_0=os.devnull, GIT_LITERAL_PATHSPECS="1")
+    scratch = tempfile.mkdtemp(prefix="cc-land.git.")
+    try:
+        rc, err = C.sh(["git", "init", "-q", "--bare", "--template=", scratch], env=env, timeout=60)
+        if rc:
+            yield (rc, err), None
+            return
+        os.makedirs(os.path.join(scratch, "objects", "info"), exist_ok=True)
+        with open(os.path.join(scratch, "objects", "info", "alternates"), "w") as f:
+            f.write(os.path.join(lines[0], "objects") + "\n")
+        env["GIT_DIR"] = scratch
+
+        def run(*args, timeout=120):
+            return C.sh(["git", *args], cwd=scratch, env=env, timeout=timeout)
+        yield (0, lines[1:]), run
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def plain_diff(root, a, b, *opts, timeout=300):
+    """`git diff <opts> a b` as git's own text, whatever the checkout's config or attributes say -> (rc, text).
+    It runs in blind(): a real binary still shows as one line rather than its bytes in the prompt."""
+    with blind(root, a, b) as (got, run):
+        if run is None:
+            return got
+        return run("diff", *PLAIN_DIFF, *opts, *got[1], timeout=timeout)
+
+
+def change_diff(root, base, head, *opts, timeout=300):
+    """`git diff <opts> <merge-base> head`, the merge-base found in blind() too -> (rc, text). In the checkout a
+    replace ref or a graft can move the merge-base onto the branch, and every path before it drops out of the diff."""
+    with blind(root, base, head) as (got, run):
+        if run is None:
+            return got
+        rc, mb = run("merge-base", *got[1])
+        if rc:
+            return rc, mb
+        return run("diff", *PLAIN_DIFF, *opts, mb.strip(), got[1][1], timeout=timeout)
 
 
 def diff_of(root, base, head):
-    rc, mb = git(root, "merge-base", base, head)
-    if rc:
-        return ""
-    # a worker can write the checkout's shared .git/config: no diff.external, no textconv, no color from it, so the
-    # digest is git's own text and the lander never runs a program the worker named
-    rc, d = git(root, "diff", *PLAIN_DIFF, "-U3", "--full-index", mb.strip(), head, timeout=300)
+    rc, d = change_diff(root, base, head, "-U3", "--full-index")
     return "" if rc else d
+
+
+def files_of(root, base, head):
+    """The paths the change touches, each as it is (-z: no quoting, a newline stays in its name)."""
+    rc, out = change_diff(root, base, head, "--name-only", "--no-renames", "-z")
+    return [] if rc else [p for p in out.split("\0") if p]
 
 
 DIFF_CAP = 400_000
 
 
-def capped(diff):
-    """The diff as the prompt carries it: whole up to DIFF_CAP, else cut there with a line saying so (the digest is
-    always taken over the whole diff)."""
+def cut_paths(diff, paths):
+    """The paths whose change capped() cuts or drops, `paths` in the diff's own order (files_of()). A cut diff whose
+    sections cannot be matched one to one with `paths`, each headed `diff --git a/<path> b/<path>`, drops them all,
+    the safe failure: a rename is one section for two paths, a type change two for one, and a quoted name matches
+    nothing, so no count that happens to agree can shift a cut path onto a whole section."""
+    if len(diff) <= DIFF_CAP:
+        return []
+    starts = [m.start() for m in re.finditer(r"(?m)^diff --git ", diff)]
+    if len(starts) != len(paths) or any(not diff.startswith(f"diff --git a/{p} b/{p}\n", at)
+                                        for p, at in zip(paths, starts)):
+        return list(paths)
+    ends = starts[1:] + [len(diff)]
+    return [p for p, end in zip(paths, ends) if end > DIFF_CAP]
+
+
+def capped(diff, dropped=()):
+    """The diff as the prompt carries it: whole up to DIFF_CAP, else cut there with a line saying so and naming the
+    paths whose change the cut takes (the digest is always taken over the whole diff)."""
     if len(diff) <= DIFF_CAP:
         return diff
-    return diff[:DIFF_CAP] + f"\n(the diff is cut here: it is {len(diff)} characters and the read takes {DIFF_CAP})\n"
+    lost = f"; the change to these paths is cut or missing: {', '.join(shown(p) for p in dropped)}" if dropped else ""
+    return diff[:DIFF_CAP] + f"\n(the diff is cut here: it is {len(diff)} characters and the read takes {DIFF_CAP}{lost})\n"
 
 
 FILE_CAP, FILES_CAP = 60_000, 400_000
 
 
-def merged_files(root, base, head, files):
-    """The changed files as they will be after the merge, capped (a cut file says so)."""
-    rc, tree = git(root, "merge-tree", "--write-tree", base, head)
-    tree = tree.split()[0] if not rc and tree.strip() else head
-    out, total = [], 0
-    for p in files:
-        rc, text = git(root, "show", f"{tree}:{p}")
-        if rc:
-            out.append(f"=== {p} (deleted by this change)")
-            continue
-        if "\0" in text[:4000]:
-            out.append(f"=== {p} (binary, not shown)")
-            continue
-        if total + len(text) > FILES_CAP:
-            out.append(f"=== {p} (not shown: the files block is full)")
-            continue
-        cut = text[:FILE_CAP]
-        total += len(cut)
-        out.append(f"=== {p}" + (" (cut at 60 kB)" if len(text) > FILE_CAP else "") + "\n" + cut)
-    return "\n".join(out)
+BINARY_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".otf", ".ttf", ".woff", ".woff2", ".gpg",
+                ".zip", ".gz", ".tar", ".xz", ".mp4", ".mp3", ".wav"}
+
+
+def unread_binary(path, mode):
+    """Why a change git calls binary must not pass unread, or "" when it may: every path is flagged unless its
+    extension is a known binary type, and an executable one always is. One NUL byte makes git call a script, a unit
+    file or an HTML page binary, and each still runs past it."""
+    if mode == "100755":
+        return "executable"
+    ext = os.path.splitext(os.path.basename(path))[1].lower()
+    return "" if ext in BINARY_TYPES else f"not a known binary type: {ext or 'no extension'}"
+
+
+def entry(run, tree, path):
+    """(mode, blob id) of `path` in `tree`, or ("", "none") when the tree has no entry for it (blind() makes the
+    path literal, so `*` or `:` in a name matches only that name)."""
+    rc, out = run("ls-tree", "-z", tree, "--", path)
+    for ent in out.split("\0") if not rc else ():
+        meta, _, name = ent.partition("\t")
+        parts = meta.split()
+        if name == path and len(parts) == 3:
+            return parts[0], parts[2]
+    return "", "none"
+
+
+def shown(path):
+    """The path as a files header prints it: as it is, or JSON-quoted when it holds a control character (a newline in
+    a name must not start a header of its own)."""
+    return json.dumps(path, ensure_ascii=False) if any(ord(c) < 32 or ord(c) == 127 for c in path) else path
+
+
+def file_block(path, old_mode, new_mode, notes=(), unseen=(), text=None, body=None, exempt=False):
+    """One path's entry in the files block, and the one place its rule is kept: a path whose whole new content the
+    read does not see as text, here and in the diff, is FLAGGED with the reasons in `unseen`. `text` is the whole
+    new content, `body` what is shown of it; if they differ and no reason was given the path is still FLAGGED.
+    `exempt` is only for what needs no reading: a deletion, or a known binary type that is not executable."""
+    unseen = list(unseen)
+    if not exempt and not unseen and (text is None or body != text):
+        unseen.append("its content is not shown in full")
+    head = "; ".join([f"old mode {old_mode or 'none'}, new mode {new_mode or 'none'}", *notes]
+                     + ([f"FLAGGED: {', '.join(unseen)}"] if unseen else []))
+    return f"=== {shown(path)} ({head})" + ("\n" + body if body is not None else "")
+
+
+def merged_files(root, base, head, files, dropped=()):
+    """The changed files as they will be after the merge, each through file_block(). The merge and every read of it
+    run in blind(), so no merge driver or attribute the checkout names can run or change what the read sees.
+
+    FLAGGED, and so handed back by review.md: a path whose change the diff cut drops (`dropped`, from cut_paths()),
+    a file cut at FILE_CAP or left out when the block is full, a binary change unread_binary() names, a symlink or a
+    submodule (gitlink) added, changed or removed, and a file git cannot show. A file is "deleted" only when the
+    merged tree has no entry for it."""
+    with blind(root, base, head) as (got, run):
+        if run is None:
+            return "\n".join(file_block(p, "?", "?", unseen=["git could not read this change"]) for p in files)
+        base, head = got[1]
+        rc, tree = run("merge-tree", "--write-tree", "-z", base, head)
+        tree = tree.split("\0")[0].strip() if not rc and tree.strip() else head
+        out, total = [], 0
+        for p in files:
+            (old_mode, old_id), (new_mode, new_id) = entry(run, base, p), entry(run, tree, p)
+            modes = (old_mode, new_mode)
+            unseen = ["the diff is cut before its change"] if p in dropped else []
+            if "120000" in modes:
+                unseen.append("a symlink change" + (", its target below" if new_mode == "120000" else ""))
+            if "160000" in modes:
+                unseen.append("a submodule (gitlink) change: git shows a commit id, not the files it brings")
+                out.append(file_block(p, *modes, [f"old commit {old_id}, new commit {new_id}"], unseen))
+                continue
+            if not new_mode:
+                out.append(file_block(p, *modes, ["deleted by this change"], unseen, exempt=True))
+                continue
+            rc, text = run("show", f"{tree}:{p}")
+            if rc:
+                out.append(file_block(p, *modes, unseen=unseen + [f"git could not show this file, blob {new_id}"]))
+                continue
+            if "\0" in text[:8000]:
+                why = unread_binary(p, new_mode)
+                out.append(file_block(p, *modes, [f"binary, not shown: old blob {old_id}, new blob {new_id}"],
+                                      unseen + ([f"binary, {why}"] if why else []), exempt=not why))
+                continue
+            if total + len(text) > FILES_CAP:
+                out.append(file_block(p, *modes, unseen=unseen + ["not shown: the files block is full"], text=text))
+                continue
+            body = text[:FILE_CAP]
+            total += len(body)
+            if len(body) < len(text):
+                unseen.append(f"cut at {FILE_CAP // 1000} kB of {len(text)} characters")
+            out.append(file_block(p, *modes, unseen=unseen, text=text, body=body))
+        return "\n".join(out)
 
 
 def brief_of(job):
@@ -487,7 +637,7 @@ def delta_review(job, prior, comments=None, diff=None):
         return have
     was = prior.extra.get("head", "")
     rc, full = git(root, "rev-parse", "--verify", "-q", f"{was}^{{commit}}") if was else (1, "")
-    rc2, inter = git(root, "diff", *PLAIN_DIFF, full.strip(), job.head, timeout=300) if not rc else (1, "")
+    rc2, inter = plain_diff(root, full.strip(), job.head) if not rc else (1, "")
     if rc or rc2:   # the head that read saw is gone (a force-push): read it whole, against the prior findings
         inter = "(the head the earlier read saw is no longer in this repository; read the whole diff)"
     numbered = "\n".join(f"{i}. {b}" for i, b in enumerate(prior.blocking, 1)) or "(none)"
@@ -527,9 +677,14 @@ def _buy(job, template, diff, more):
     root = root_of(job)
     base_ref = f"refs/remotes/origin/{job.extra.get('base', 'main')}"
     facts = pr_view(root, pr, "title") or {}
-    files = [f for f in job.files] or [ln[6:] for ln in diff.splitlines() if ln.startswith("+++ b/")]
+    # the union: job.files comes from the checkout's own git (lane: G.changed), which a .gitmodules `ignore = all`
+    # can make skip a gitlink; files_of() runs blind and sees every path
+    blind_files = files_of(root, job.base_sha, job.head)
+    files = list(dict.fromkeys([*job.files, *blind_files]))
+    dropped = cut_paths(diff, blind_files) if len(diff) > DIFF_CAP else []
     text = prompt(load_prompt(template), PR=pr, REPO=repo, TITLE=facts.get("title") or "(untitled)",
-                  DIFF=capped(diff), FILES=merged_files(root, job.base_sha, job.head, files), BRIEF=brief_of(job) or
+                  DIFF=capped(diff, dropped), FILES=merged_files(root, job.base_sha, job.head, files, dropped),
+                  BRIEF=brief_of(job) or
                   "No brief was found for this PR. Judge the change against its title and its own diff.",
                   RULES=rules_of(root, base_ref) or "This repo ships no docs/REVIEW.md.", **more)
     v, usd, why = ask(text, repo, pr, job.digest)

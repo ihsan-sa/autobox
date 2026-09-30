@@ -140,10 +140,10 @@ def run(repo, plan, check, targets=None):
     if last == tip:
         os.unlink(want_path(repo))
         return "green"
-    rc, out = git(root, "diff", "--name-only", "--no-renames", last, tip)
+    rc, out = git(root, "diff", "--name-only", "--no-renames", "-z", last, tip)
     if rc:
         return "retry"
-    p = plan(root, last, tip, [f for f in out.splitlines() if f])
+    p = plan(root, last, tip, [f for f in out.split("\0") if f])
     results = {name: check(name, tip) for name in p.checks}
     if any(r.status == T.UNRUNNABLE for r in results.values()):
         C.log("tip-retry", repo, "tip", tip=tip[:12], why="a check could not run; not red")

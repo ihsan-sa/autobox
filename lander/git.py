@@ -9,7 +9,7 @@ held across a fetch or the merge's critical section, never across a check or a r
     remote_url(root)                         the URL the lander holds for the checkout (see ORIGIN below)
     rev(root, ref) · tree_of(root, commit) · merge_base(root, a, b) · remote_head(root, branch)
     merge_tree(root, base, head)  -> (tree, [])  or (None, [conflicted paths])   (`merge-tree --write-tree`)
-    changed(root, a, b)           `diff --name-only --no-renames a b`
+    changed(root, a, b)           `diff --name-only --no-renames -z a b`, each path as it is
     protected_same(root, rules, approved, head)  every file under `rules` is byte-identical at both heads
 
 ORIGIN is never the name "origin" in the checkout's shared .git/config: a worker can repoint that, unset its
@@ -140,18 +140,22 @@ def remote_head(root, branch, env=None) -> str:
 
 def merge_tree(root, base, head, env=None):
     """(tree, []) for a clean merge of head into base, (None, paths) for a conflict. Any other failure raises."""
-    r = git(root, "merge-tree", "--write-tree", "--name-only", "--no-messages", base, head, env=env)
-    lines = r.out.splitlines()
+    # -z: a path git would quote ("run\303\251.sh") or that holds a newline comes back as it is
+    r = git(root, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", base, head, env=env)
+    lines = r.out.split("\0")
     if r.rc == 0 and lines and SHA_RE.fullmatch(lines[0].strip()):
         return lines[0].strip(), []
     if r.rc == 1 and lines:
-        return None, sorted({l.strip() for l in lines[1:] if l.strip()})
+        return None, sorted({p for p in lines[1:] if p})
     raise GitError(f"git merge-tree {base[:12]} {head[:12]}: {(r.err or r.out).strip()[-300:]}")
 
 
 def changed(root, a, b, env=None) -> list:
-    out = git(root, "diff", "--name-only", "--no-renames", a, b, check=True, env=env).out
-    return sorted({l.strip() for l in out.splitlines() if l.strip()})
+    """Every path between a and b; --ignore-submodules=none so a .gitmodules `ignore = all` or diff.ignoreSubmodules
+    cannot hide a gitlink from the plan, the walls and the protected paths."""
+    out = git(root, "diff", "--name-only", "--no-renames", "--ignore-submodules=none", "-z", a, b, check=True,
+              env=env).out
+    return sorted({p for p in out.split("\0") if p})
 
 
 def protected_same(root, rules, approved, head, env=None) -> bool:
