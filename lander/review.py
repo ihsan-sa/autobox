@@ -47,7 +47,6 @@ here runs for a paused project. recurring-defect-ok: pause-hold-missing — the 
 """
 from __future__ import annotations
 
-import contextlib
 import datetime
 import hashlib
 import sys
@@ -371,41 +370,16 @@ def git(root, *args, timeout=120):
     return C.sh(["git", *args], cwd=root, timeout=timeout, env=env)
 
 
-@contextlib.contextmanager
 def blind(root, *revs):
-    """A scratch bare repo that borrows the checkout's objects and reads no config, attributes or template of anyone's
-    -> ((rc, out), run). On success rc is 0, out the revs as commit ids, and run(*git_args, timeout=) runs git there;
-    else run is None and (rc, out) says why.
+    """git.sealed(): a scratch bare repo holding only the revs, fetched from the checkout, that reads no config,
+    attributes or template of anyone's -> ((rc, out), run).
 
-    A worker can write the checkout's shared .git: its config (diff.external, a textconv, a merge driver, color) and
-    its info/attributes, where `*.py -diff` turns a text change into one "Binary files … differ" line and `* merge=x`
-    runs the program merge.x.driver names. Git run here sees none of it: binary is decided by a file's bytes, and a
-    merge uses git's own text merge."""
-    rc, out = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir", *(f"{r}^{{commit}}" for r in revs))
-    lines = out.splitlines()
-    if rc or len(lines) != 1 + len(revs):   # the scratch repo has no refs, so every rev goes to it as a commit id
-        yield (rc or 1, out), None
-        return
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    # core.attributesFile unset still reads ~/.config/git/attributes, so it is pointed at nothing
-    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1", GIT_CONFIG_COUNT="1",
-               GIT_CONFIG_KEY_0="core.attributesFile", GIT_CONFIG_VALUE_0=os.devnull, GIT_LITERAL_PATHSPECS="1")
-    scratch = tempfile.mkdtemp(prefix="cc-land.git.")
-    try:
-        rc, err = C.sh(["git", "init", "-q", "--bare", "--template=", scratch], env=env, timeout=60)
-        if rc:
-            yield (rc, err), None
-            return
-        os.makedirs(os.path.join(scratch, "objects", "info"), exist_ok=True)
-        with open(os.path.join(scratch, "objects", "info", "alternates"), "w") as f:
-            f.write(os.path.join(lines[0], "objects") + "\n")
-        env["GIT_DIR"] = scratch
-
-        def run(*args, timeout=120):
-            return C.sh(["git", *args], cwd=scratch, env=env, timeout=timeout)
-        yield (0, lines[1:]), run
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+    A worker can write the checkout's shared .git: its objects, its replace refs, its config (diff.external, a
+    textconv, a merge driver, color) and its info/attributes, where `*.py -diff` turns a text change into one "Binary
+    files … differ" line and `* merge=x` runs the program merge.x.driver names. Git run here sees none of it: every
+    object is re-hashed on the way in, binary is decided by a file's bytes, and a merge uses git's own text merge."""
+    from lander import git as G
+    return G.sealed(root, *revs, sh=C.sh)
 
 
 def plain_diff(root, a, b, *opts, timeout=300):
@@ -430,7 +404,9 @@ def change_diff(root, base, head, *opts, timeout=300):
 
 
 def diff_of(root, base, head):
-    rc, d = change_diff(root, base, head, "-U3", "--full-index")
+    """The change as the review reads it. --no-renames as files_of() runs, so each section is one path: a rename
+    section heads two names, and cut_paths() could pair a forged header with a decoy file."""
+    rc, d = change_diff(root, base, head, "-U3", "--full-index", "--no-renames")
     return "" if rc else d
 
 
@@ -607,9 +583,13 @@ def brief_of(job):
         return ""
 
 
-def rules_of(root, base_ref):
-    rc, text = git(root, "show", f"{base_ref}:docs/REVIEW.md", timeout=60)
-    return "" if rc else text
+def rules_of(root, base):
+    """docs/REVIEW.md at `base`, read in blind(): the checkout's ref and its object are both a worker's to write."""
+    with blind(root, base) as (got, run):
+        if run is None:
+            return ""
+        rc, text = run("show", f"{got[1][0]}:docs/REVIEW.md", timeout=60)
+        return "" if rc else text
 
 
 def pr_view(root, pr, fields="comments"):
@@ -708,10 +688,9 @@ def _buy(job, template, diff, more):
         return _stop(job, f"two reads already spent on PR #{pr}; the planning seat decides", cap=True)
     wall = j.get("wall") or {}
     root = root_of(job)
-    base_ref = f"refs/remotes/origin/{job.extra.get('base', 'main')}"
     facts = pr_view(root, pr, "title") or {}
-    # the union: job.files comes from the checkout's own git (lane: G.changed), which a .gitmodules `ignore = all`
-    # can make skip a gitlink; files_of() runs blind and sees every path
+    # the union: job.files is the lane's list, which a job queued by an older lane may have made in the checkout's
+    # own git; files_of() runs blind and sees every path
     blind_files = files_of(root, job.base_sha, job.head)
     files = list(dict.fromkeys([*job.files, *blind_files]))
     dropped = cut_paths(diff, blind_files) if len(diff) > DIFF_CAP else []
@@ -720,7 +699,7 @@ def _buy(job, template, diff, more):
                   FILES=merged_files(root, job.base_sha, job.head, files, dropped, whole_paths(diff, blind_files)),
                   BRIEF=brief_of(job) or
                   "No brief was found for this PR. Judge the change against its title and its own diff.",
-                  RULES=rules_of(root, base_ref) or "This repo ships no docs/REVIEW.md.", **more)
+                  RULES=rules_of(root, job.base_sha) or "This repo ships no docs/REVIEW.md.", **more)
     v, usd, why = ask(text, repo, pr, job.digest)
     if usd:
         charge(repo, pr, review_usd=usd)

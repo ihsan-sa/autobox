@@ -103,7 +103,7 @@ class Case(unittest.TestCase):
     def box(self, **kw):
         base = {"git merge-base": (0, BASE + "\n"), "git diff": name_only("x.py"), "git merge-tree": (0, "t" * 40),
                 "git show": (0, "text\n"), "gh pr view": (0, json.dumps({"comments": [], "title": "a change"})),
-                "gh pr comment": (0, ""), "git rev-parse": rev_parse, "git init": (0, ""),
+                "gh pr comment": (0, ""), "git rev-parse": rev_parse, "git init": (0, ""), "git fetch": (0, ""),
                 "git ls-tree": ls_tree(),
                 "cc-limit status": (1, "no limit"), "cc-limit check": (1, "")}
         base.update(kw)

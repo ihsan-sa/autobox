@@ -223,8 +223,7 @@ def git_pr_files(root, pr, token=None, genv=None):
     try:
         with G.git_lock(root):
             G.fetch(root, base, branch, env=genv)
-        mb = G.merge_base(root, f"refs/remotes/origin/{base}", f"refs/remotes/origin/{branch}", env=genv)
-        return G.changed(root, mb, f"refs/remotes/origin/{branch}", env=genv) or None
+        return G.pr_changed(root, f"refs/remotes/origin/{base}", f"refs/remotes/origin/{branch}", env=genv) or None
     except G.GitError:
         return None
 
@@ -637,8 +636,7 @@ class Lane:
             mr["waits"] = int(mr.get("waits") or 0) + 1
             return self.hold(job, f"main-red: {base} has not moved since check {mr.get('check')} was red on it "
                                   f"(wait {mr['waits']} of {MAIN_RED_WAITS})", kind="box")
-        mb = G.merge_base(self.root, job.base_sha, job.head, env=self.genv)
-        job.files = G.changed(self.root, mb, job.head, env=self.genv)
+        job.files = G.pr_changed(self.root, job.base_sha, job.head, env=self.genv)
         # the reviewer's digest_of, the key `record` and `will-review` use: a LAND recorded at a head is the verdict
         # the lane finds at that head (#739 was handed back at the read cap under a patch-id key of the lane's own)
         job.digest = self.call("reviewer", "digest_of", self.root, job.base_sha, job.head) \

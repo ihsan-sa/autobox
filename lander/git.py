@@ -7,10 +7,21 @@ held across a fetch or the merge's critical section, never across a check or a r
     git(root, *args, check=False, env=None)  -> R(rc, out, err); check=True raises GitError on rc != 0
     fetch(root, *branches)                   origin's branches into refs/remotes/origin/<b>, from remote_url(root)
     remote_url(root)                         the URL the lander holds for the checkout (see ORIGIN below)
-    rev(root, ref) · tree_of(root, commit) · merge_base(root, a, b) · remote_head(root, branch)
+    rev(root, ref) · tree_of(root, commit) · remote_head(root, branch)
     merge_tree(root, base, head)  -> (tree, [])  or (None, [conflicted paths])   (`merge-tree --write-tree`)
-    changed(root, a, b)           `diff --name-only --no-renames -z a b`, each path as it is
-    protected_same(root, rules, approved, head)  every file under `rules` is byte-identical at both heads
+    sealed(root, *revs)           a scratch repo holding only the revs, fetched from the checkout (see SEALED)
+    changed(root, a, b)           `diff --name-only --no-renames -z a b`, each path as it is, read sealed
+    pr_changed(root, base, head)  changed() from the merge-base of base and head, both found sealed
+    protected_same(root, rules, approved, head)  every file under `rules` is byte-identical at both heads, sealed
+
+SEALED is how every read that decides a gate or feeds the review sees a change. A worker can write the checkout's
+shared .git: its objects (a loose object file is the worker's own, so a chmod lets it put the base tree's bytes under
+the head tree's name and the diff lists no paths), refs/replace and grafts (a swapped commit or a moved merge-base),
+a commit-graph, its config (core.worktree with diff.relative empties a diff; diff.external, textconv, a merge driver)
+and its attributes (`* -diff`). sealed() fetches the revs by id from the checkout into an empty bare repo that reads
+no config, attributes or template of anyone's: index-pack re-hashes every object it receives, so an object whose bytes
+do not match its name fails the fetch and the read fails closed, and upload-pack sends the real objects, never a
+replacement.
 
 ORIGIN is never the name "origin" in the checkout's shared .git/config: a worker can repoint that, unset its
 fetch refspec or plant refs/remotes/origin/<b>. Every fetch, ls-remote and push goes to the URL `lander-self
@@ -24,11 +35,14 @@ exception: the lander made it and set its URL from the member's board row (membe
 from __future__ import annotations
 
 import collections
+import contextlib
 import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 
 R = collections.namedtuple("R", "rc out err")
@@ -119,10 +133,6 @@ def tree_of(root, commit, env=None) -> str:
     return git(root, "rev-parse", "--verify", f"{commit}^{{tree}}", check=True, env=env).out.strip()
 
 
-def merge_base(root, a, b, env=None) -> str:
-    return git(root, "merge-base", a, b, check=True, env=env).out.strip()
-
-
 def remote_head(root, branch, env=None) -> str:
     """What origin itself says refs/heads/<branch> is, or '' on any doubt (the PR object's headRefOid lags it)."""
     if not branch:
@@ -150,17 +160,98 @@ def merge_tree(root, base, head, env=None):
     raise GitError(f"git merge-tree {base[:12]} {head[:12]}: {(r.err or r.out).strip()[-300:]}")
 
 
-def changed(root, a, b, env=None) -> list:
-    """Every path between a and b; --ignore-submodules=none so a .gitmodules `ignore = all` or diff.ignoreSubmodules
-    cannot hide a gitlink from the plan, the walls and the protected paths."""
-    out = git(root, "diff", "--name-only", "--no-renames", "--ignore-submodules=none", "-z", a, b, check=True,
-              env=env).out
+def blind_env() -> dict:
+    """os.environ with no GIT_* of the caller's and no system, global or user config or attributes."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # core.attributesFile unset still reads ~/.config/git/attributes, so it is pointed at nothing
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1", GIT_CONFIG_COUNT="1",
+               GIT_CONFIG_KEY_0="core.attributesFile", GIT_CONFIG_VALUE_0=os.devnull, GIT_LITERAL_PATHSPECS="1")
+    return env
+
+
+def _sh(argv, cwd=None, env=None, timeout=120):
+    try:
+        # bytes, decoded with no newline translation: text=True would read a \r in a path or a line as \n
+        p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        out, err = p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
+        return p.returncode, out if p.returncode == 0 else (err or out)
+    except (OSError, subprocess.TimeoutExpired) as x:
+        return 125, str(x)
+
+
+@contextlib.contextmanager
+def sealed(root, *revs, sh=None):
+    """A scratch bare repo holding the revs and what they reach, fetched from the checkout (SEALED above) ->
+    ((rc, out), run). On success rc is 0, out the revs as commit ids, and run(*git_args, timeout=) runs git there
+    with blind_env(); else run is None and (rc, out) says why. `sh(argv, cwd=, env=, timeout=) -> (rc, out)` runs
+    each git (review.py passes its own, which its tests answer). Any doubt (a rev git will not name, an object whose
+    bytes are not its name, a fetch that fails) is the else."""
+    env, sh = blind_env(), sh or _sh
+    # the ids are named in the checkout with no replace refs; a forged object there is caught by the fetch below
+    if any(r.startswith("-") for r in revs):   # rev-parse echoes --end-of-options, so an option is refused
+        yield (1, f"not a revision: {revs}"), None
+        return
+    rc, out = sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+                  *(f"{r}^{{commit}}" for r in revs)], cwd=root, env=dict(env, GIT_NO_REPLACE_OBJECTS="1"), timeout=60)
+    lines = out.splitlines()
+    if rc or len(lines) != 1 + len(revs) or not all(SHA_RE.fullmatch(x) for x in lines[1:]):
+        yield (rc or 1, out), None   # the scratch repo has no refs, so every rev goes to it as a commit id
+        return
+    scratch = tempfile.mkdtemp(prefix="cc-land.git.")
+    try:
+        rc, err = sh(["git", "init", "-q", "--bare", "--template=", scratch], cwd=scratch, env=env, timeout=60)
+        if rc:
+            yield (rc, err), None
+            return
+        env["GIT_DIR"] = scratch
+
+        def run(*args, timeout=120):
+            return sh(["git", *args], cwd=scratch, env=env, timeout=timeout)
+        rc, err = run("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", lines[0],
+                      *dict.fromkeys(lines[1:]), timeout=600)
+        if rc:
+            yield (rc, err), None
+            return
+        yield (0, lines[1:]), run
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+NAMES = ("diff", "--name-only", "--no-renames", "--no-relative", "--ignore-submodules=none", "-z")
+
+
+def _names(run, a, b) -> list:
+    rc, out = run(*NAMES, a, b)
+    if rc:
+        raise GitError(f"git diff --name-only {a[:12]} {b[:12]}: {out.strip()[-300:]}")
     return sorted({p for p in out.split("\0") if p})
 
 
+def changed(root, a, b, env=None) -> list:
+    """Every path between a and b, read sealed(); --ignore-submodules=none so a .gitmodules `ignore = all` cannot hide
+    a gitlink from the plan, the walls and the protected paths. `env` is taken for the callers' sake: the fetch is
+    local and needs no token."""
+    with sealed(root, a, b) as ((rc, out), run):
+        if run is None:
+            raise GitError(f"git could not read {a[:12]}..{b[:12]} sealed: {str(out).strip()[-300:]}")
+        return _names(run, *out)
+
+
+def pr_changed(root, base, head, env=None) -> list:
+    """Every path the change touches: changed() from the merge-base of base and head, found in the same sealed repo,
+    so no replace ref, graft or commit-graph of the checkout's can move it onto the branch."""
+    with sealed(root, base, head) as ((rc, out), run):
+        if run is None:
+            raise GitError(f"git could not read {base[:12]}...{head[:12]} sealed: {str(out).strip()[-300:]}")
+        rc, mb = run("merge-base", *out)
+        if rc:
+            raise GitError(f"git merge-base {base[:12]} {head[:12]}: {mb.strip()[-300:]}")
+        return _names(run, mb.strip(), out[1])
+
+
 def protected_same(root, rules, approved, head, env=None) -> bool:
-    """True only when git SHOWS every file under `rules` is the same at `head` as at `approved`; every doubt (no
-    rules, a head git will not name after one fetch, a diff that fails) is False, and the caller re-asks."""
+    """True only when git SHOWS every file under `rules` is the same at `head` as at `approved`, read sealed(); every
+    doubt (no rules, a head git will not name after one fetch, a diff that fails) is False, and the caller re-asks."""
     if not rules or not approved or not head:
         return False
 
@@ -177,7 +268,10 @@ def protected_same(root, rules, approved, head, env=None) -> bool:
         git(root, "fetch", "-q", url, approved, head, env=env, timeout=120)
         if not named():
             return False
-    return git(root, "diff", "--quiet", approved, head, "--", *rules, env=env, timeout=60).rc == 0
+    with sealed(root, approved, head) as ((rc, out), run):
+        return run is not None and out == [approved, head] and \
+            run("diff", "--quiet", "--no-relative", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv",
+                *out, "--", *rules, timeout=60)[0] == 0
 
 
 # --- the repo lock (ported unchanged) ------------------------------------------------------------------------------

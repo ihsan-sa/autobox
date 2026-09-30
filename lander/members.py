@@ -10,7 +10,8 @@
   member_clone(repo, url) (root, "") or ("", why): the host-only clone <LANDQ>/clones/<h>--<t>, no checkout, its
                           credential gh's helper answering with GH_TOKEN, never the box's login.
   walls(root, base, head, files)  why or "": a boundary path (BOUNDARY_PATHS: .cc/** and the secret stores), or a
-                          token shape (TOKEN_SHAPES) on an ADDED line of the diff. Checked before any check runs.
+                          token shape (TOKEN_SHAPES) on an ADDED line of the diff, read in git.sealed() with --text so
+                          no attribute of the member's hides a line. Checked before any check runs.
   spent(h) -> (usd, cap) · charge(h, usd) -> None | (spent_before, cap)   the day's ledger cc's member_gate keeps,
                           <state>/member-spend.json, cap MEMBER_DAILY_USD (cc-config, else 20).
   route(job)              "#<h>" for a member job, else "" — where its stop is said.
@@ -130,11 +131,17 @@ def walls(root, base, head, files, genv=None) -> str:
     if bad:
         return f"it touches {bad[0]}, which a member PR may not (the boundary or a secret's place)"
     from lander import git as G
-    r = G.git(root, "diff", "--no-color", "--no-ext-diff", "-U0", f"{base}...{head}", env=genv)
-    if r.rc:
-        return f"git could not show the diff to check it for tokens ({r.err.strip()[-120:]})"
+    # read sealed: a member's own `* -diff` in .gitattributes (or the clone's config) would turn an added line
+    # into "Binary files differ" and hide a token from this scan
+    with G.sealed(root, base, head) as ((rc, out), run):
+        if run is not None:
+            rc, mb = run("merge-base", *out)
+            rc, out = (rc, mb) if rc else run("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
+                                              "--no-relative", "-U0", mb.strip(), out[1])
+    if rc:
+        return f"git could not show the diff to check it for tokens ({str(out).strip()[-120:]})"
     where = ""
-    for ln in r.out.splitlines():
+    for ln in out.splitlines():
         if ln.startswith("+++ "):
             where = ln[6:] if ln.startswith("+++ b/") else ln[4:]
         elif ln.startswith("+") and TOKEN_SHAPES.search(ln):
