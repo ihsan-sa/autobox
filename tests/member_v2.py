@@ -403,6 +403,97 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                           "a pid part-way through exit is told from a live one by its flags")
                 finally:
                     gone.wait()
+                # A LIVE PROCESS THAT WILL NOT BE READ IS NOT SKIPPED. A process that joins a sandbox's namespaces
+                # (nsenter -U -m) and calls prctl(PR_SET_DUMPABLE, 0) answers EACCES on ns/mnt and fd/ while its
+                # mountinfo still reads, and the walk used to take that for a gone pid. A thread-group leader that
+                # exits leaves its other threads live, holding the descriptors, behind a zombie /proc/<pid>. Each
+                # case builds its own sandbox and holds an inherited descriptor on V unless it says otherwise.
+                hold = ("import ctypes,os,sys,threading\nlibc=ctypes.CDLL(None)\n"
+                        "for ns in ('user','mnt') if len(sys.argv)>2 else ():\n"
+                        " libc.setns(os.open('/proc/%s/ns/%s'%(sys.argv[2],ns),os.O_RDONLY),0) == 0 or sys.exit(ns)\n"
+                        "if sys.argv[1]=='nodump': libc.prctl(4,0,0,0,0)\n"
+                        "def hold():\n sys.stdout.write('ready\\n'); sys.stdout.flush(); sys.stdin.readline()\n"
+                        "if sys.argv[1]=='leaderless':\n threading.Thread(target=hold).start(); libc.pthread_exit(None)\n"
+                        "hold()\n")
+
+                def descendants(pid):
+                    kids = []
+                    for t in Path(f"/proc/{pid}/task").iterdir():
+                        for kid in (t / "children").read_text().split():
+                            kids += [int(kid), *descendants(kid)]
+                    return kids
+
+                def hidden(mode, bind=(), fd_on_v=True):
+                    # Returns (shape seen from outside, refusal naming this case's process or ""); the shape
+                    # proves the walk met the case.
+                    vfd = os.open(v, os.O_RDONLY | os.O_DIRECTORY)
+                    procs = []
+                    try:
+                        def start(argv, holds):
+                            procs.append(sp.Popen([str(x) for x in argv], stdin=sp.PIPE, stdout=sp.PIPE,
+                                                  stderr=sp.PIPE, pass_fds=(vfd,) if holds else ()))
+                            m.require(procs[-1].stdout.readline() == b"ready\n", f"{mode} case did not start")
+                            return procs[-1]
+                        if mode == "nodump":
+                            # The sandbox holds nothing of V but what bind names, and it stops once joined, so the
+                            # namespace's only member is the process that joined it — and that one cannot be read.
+                            box = start(minimal + list(bind) + ["--", "/usr/bin/python3", "-c", hold, "hold"], False)
+                            target = start(["/usr/bin/python3", "-c", hold, mode, descendants(box.pid)[-1]], fd_on_v).pid
+                            procs.remove(box)
+                            box.communicate(b"stop\n", timeout=GUARD)
+                        else:
+                            box = start(minimal + list(bind) + ["--", "/usr/bin/python3", "-c", hold, mode], fd_on_v)
+                            target = descendants(box.pid)[-1]
+                        proc, shape, until = Path(f"/proc/{target}"), "", time.monotonic() + GUARD
+                        while not shape and time.monotonic() < until:
+                            try:
+                                os.readlink(proc / "ns/mnt")
+                            except PermissionError:
+                                shape = "ns/mnt EACCES" if mode == "nodump" else ""
+                            except OSError:
+                                pass
+                            if mode == "leaderless" and m.exiting(proc) and not any(
+                                    m.exiting(t) for t in (proc / "task").iterdir() if t.name != str(target)):
+                                shape = "leader exited, thread live"
+                            time.sleep(0.01)
+                        # A refusal counts only if it names one of this case's own tasks, not another sandbox's.
+                        tids = [t.name for t in (proc / "task").iterdir()]
+                        try:
+                            m.inventory(v)
+                            return shape, ""
+                        except ValueError as exc:
+                            return shape, str(exc) if any(f"namespace {t} " in str(exc) for t in tids) else ""
+                    finally:
+                        for proc in reversed(procs):
+                            proc.communicate(b"stop\n", timeout=GUARD)
+                        os.close(vfd)
+                shape, refused = hidden("nodump")
+                check(shape == "ns/mnt EACCES" and "cannot be inspected" in refused,
+                      "a live non-dumpable process in a sandbox's namespace, holding a descriptor on V, refuses",
+                      f"{shape}; {refused or 'allowed'}")
+                shape, refused = hidden("nodump", bind=("--bind", v, "/exposed"), fd_on_v=False)
+                check(shape == "ns/mnt EACCES" and "exposes V" in refused,
+                      "a non-dumpable process in a namespace binding V has its mount table checked without ns/mnt",
+                      f"{shape}; {refused or 'allowed'}")
+                shape, refused = hidden("leaderless")
+                control_shape, control = hidden("leaderless", fd_on_v=False)
+                check(shape == control_shape == "leader exited, thread live"
+                      and "descriptor reaching V" in refused and not control,
+                      "a live thread whose leader exited is walked: its descriptor on V refuses, one without passes",
+                      f"{shape}; {refused or 'allowed'}; control: {control_shape}; {control or 'allowed'}")
+                # The suppressed side: a non-dumpable process outside any sandbox (ssh-agent, gpg-agent) sees V
+                # as this launcher does and is not inspected, so it must not refuse the box.
+                with sp.Popen(["/usr/bin/python3", "-c", hold, "nodump"], stdin=sp.PIPE, stdout=sp.PIPE) as agent:
+                    try:
+                        m.require(agent.stdout.readline() == b"ready\n", "host control did not start")
+                        try:
+                            m.inventory(v)
+                            refused = ""
+                        except ValueError as exc:
+                            refused = str(exc)
+                        check(not refused, "a non-dumpable host process does not refuse the inventory", refused)
+                    finally:
+                        agent.communicate(b"stop\n", timeout=GUARD)
             finally:
                 os.environ.clear(); os.environ.update(oldenv)
     print(f"cc-member-v2 selfcheck: {passed} passed, {failed} failed")

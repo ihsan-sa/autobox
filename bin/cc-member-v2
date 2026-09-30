@@ -89,6 +89,14 @@ def exiting(proc):
     return bool(int((proc / "stat").read_text().rsplit(")", 1)[1].split()[6]) & 0x4)
 
 
+def gone(task):
+    # Not evidence: a task whose stat no longer reads has gone, and one with PF_EXITING is part-way out.
+    try:
+        return exiting(task)
+    except OSError:
+        return True
+
+
 def inventory(v):
     # WHAT IS INSPECTED: every same-UID process whose mount namespace is not this one AND whose root
     # mount is a tmpfs — the shape every sandbox on this box has, because bwrap always builds its root
@@ -100,9 +108,9 @@ def inventory(v):
     # to a non-tmpfs root and leave this walk. The residue is a same-UID mount namespace made OUTSIDE
     # that sandboxing (an operator's `unshare -m`) whose root is not a tmpfs: it is skipped, and it is
     # not a member's to make. Modes and ownership establish neither trust nor isolation. An unreadable inventory fails.
-    def mounts(pid):
+    def mounts(proc):
         rows = []
-        for line in Path(f"/proc/{pid}/mountinfo").read_text().splitlines():
+        for line in (proc / "mountinfo").read_text().splitlines():
             fields = line.split()
             unescape = lambda s: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), s)
             rows.append((fields[2], Path(unescape(fields[3])), Path(unescape(fields[4])), fields[fields.index("-") + 1]))
@@ -110,19 +118,35 @@ def inventory(v):
     own = os.readlink("/proc/self/ns/mnt")
     ancestors = {(s.st_dev, s.st_ino) for p in (v, *v.parents) for s in (p.stat(),)}
     vdev = v.stat().st_dev
-    dev, root, at, _ = max((m for m in mounts("self") if within(v, m[2])), key=lambda m: len(str(m[2])))
+    dev, root, at, _ = max((m for m in mounts(Path("/proc/self")) if within(v, m[2])), key=lambda m: len(str(m[2])))
     backing = root / v.relative_to(at)
+    # EVERY THREAD, not only each thread-group leader. A leader that exits leaves a zombie /proc/<pid> with no
+    # mountinfo and no descriptors while its other threads live on, holding the same namespace and descriptors;
+    # a thread may also have unshared its descriptor table. /proc/<pid>/task/<tid> reads each one.
+    tasks = []
     for p in Path("/proc").iterdir():
         if not p.name.isdecimal():
             continue
         try:
+            tasks.extend((p / "task").iterdir())
+        except OSError:
+            if not gone(p):
+                raise ValueError(f"live namespace {p.name} cannot be inspected") from None
+    for p in tasks:
+        try:
             if p.stat().st_uid != os.getuid():
                 continue
-            rows = mounts(p.name)
+            rows = mounts(p)
             if not any(at == Path("/") and fs == "tmpfs" for _, _, at, fs in rows):
                 continue
-            if os.readlink(p / "ns/mnt") == own:
-                continue
+            # A NON-DUMPABLE PROCESS (prctl PR_SET_DUMPABLE 0) answers EACCES on ns/mnt and fd/ while its
+            # mountinfo still reads. It is live, so it is not skipped: without ns/mnt it counts as another
+            # namespace, its mount table is checked, and the descriptor listing below refuses it.
+            try:
+                if os.readlink(p / "ns/mnt") == own:
+                    continue
+            except PermissionError:
+                pass
             # ANYWHERE UNDER V, not only V and above. A namespace binding V/registry, V/state/<task>
             # or a task's data directory holds the records the broker re-reads under its lock, and
             # that used to pass here because its source is BELOW V. The same-filesystem test stays:
@@ -144,18 +168,14 @@ def inventory(v):
             # /proc GOES WITH THE PROCESS, and this walk is over a whole box. A pid that exits under
             # it answers ENOENT, ESRCH or, once it is a zombie, EINVAL — measured on a busy box, where
             # `mountinfo` of an exiting process refused every launch. A process that is gone is not
-            # evidence, and the link below says which it is: exit drops the namespace, so a zombie has
-            # no ns/mnt to read. One that is still live and will not be read IS evidence, and an
-            # unreadable inventory fails rather than guesses. A refusal is a ValueError, not caught here.
+            # evidence. One that is still live and will not be read IS evidence, and an unreadable
+            # inventory fails rather than guesses. A refusal is a ValueError, not caught here.
             # A process part-way through exit is not live either. The kernel drops its root (so `mountinfo`
             # answers ENOENT) a moment BEFORE it drops the namespace, and on a loaded box a walk lands in that
-            # window: ns/mnt still reads while mountinfo does not. PF_EXITING is set before either goes and
-            # never cleared, so it tells that pid from one that is live and will not be read.
-            try:
-                os.readlink(p / "ns/mnt")
-                if exiting(p):
-                    continue
-            except OSError:
+            # window. PF_EXITING is set before either goes and never cleared, and a zombie carries it too, so
+            # gone() tells an exiting task from one that is live and will not be read — EACCES from a
+            # non-dumpable process is live, and refuses.
+            if gone(p):
                 continue
             raise ValueError(f"live namespace {p.name} cannot be inspected") from None
         for fd in entries:
@@ -164,8 +184,12 @@ def inventory(v):
                 if not target.is_absolute():
                     continue
                 st = fd.stat()
-            except OSError:
+            except FileNotFoundError:
                 continue   # one descriptor closed under the walk; every other one is still counted
+            except OSError:
+                if gone(p):
+                    continue
+                raise ValueError(f"live namespace {p.name} has a descriptor that cannot be inspected") from None
             # TWO TESTS, AND THE SECOND IS ONLY MEANINGFUL ON V'S OWN FILESYSTEM. The inode pair is
             # namespace-independent and catches a descriptor on V or on any parent of it, which is the
             # real exposure. The path is TEXT READ FROM THE OTHER NAMESPACE, where the same spelling
