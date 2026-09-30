@@ -249,6 +249,34 @@ class RealUnits(TL.Fixture):
         comments = self.box()["prs"]["1"]["comments"]
         self.assertEqual(RV.would_read(j, comments)[0], False)
 
+    def test_a_plan_that_turns_lander_class_when_main_moves_goes_to_lander_self(self):
+        """A reach.tsv the first base generated need not be what the moved base generates: the Δ re-plan's class
+        decides, and a lander one is not merged. The same PR whose re-plan stays leaf merges (the kept case)."""
+        for klass, want in ((T.LANDER, T.QUERY), (T.LEAF, T.DEPLOY_PENDING)):
+            with self.subTest(klass=klass):
+                self.setUp()
+                self.pr(1, {"a/x": "good\n"})
+                J.submit("demo", 1)
+                fixture, calls = self, []
+
+                class Moving:
+                    @staticmethod
+                    def plan(root, base, head, files, **kw):
+                        calls.append(base)
+                        p = PLAN.plan(root, base, head, files, **kw)
+                        if len(calls) == 1:   # the first plan: main moves on while its checks run
+                            fixture.main({"b/y": f"main moved on {klass}\n"})
+                            return p
+                        p.klass = klass
+                        return p
+                u, lines = self.land(planner=Moving)
+                j = self.job()
+                self.assertEqual(j.state, want, lines)
+                self.assertGreater(len(calls), 1, "the move was not re-planned")
+                if klass == T.LANDER:
+                    self.assertEqual(u["cards"].calls[0][3], "lander-self")
+                    self.assertEqual(u["deploy"].calls, [])
+
     def test_a_land_recorded_at_an_older_head_is_not_used(self):
         head = self.pr(1, {"c/w": "paid\n"})
         self.recorded_land(1, head)

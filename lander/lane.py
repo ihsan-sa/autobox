@@ -61,7 +61,8 @@ leave the file untouched and the job untimed:
              reads_used+1, handback, or query "planning" at the 2nd; LAND counts a read only when it was bought.
              A member over its day's cap is held; a bought read is charged to it.
   mergeable  the head moved -> queued. main moved -> Δ re-plan (S2): rerun = (new − old) ∪ (new ∩ checks Δ
-             reaches); non-empty -> checking with only those; empty -> base_sha = main and merge. THE MERGE (S1),
+             reaches); a new plan that is lander-class (a reach file the new base does not generate) -> query
+             "lander-self"; non-empty -> checking with only those; empty -> base_sha = main and merge. THE MERGE (S1),
              all under the git lock: fetch; main_before must be base_sha (else back to Δ); expected =
              merge-tree(main_before, head); merge_attempt {main_before, expected, pin} written BEFORE gh; the squash
              pinned to head (the door made the approved head equal it), --delete-branch, --subject "<title> (#N)";
@@ -854,8 +855,13 @@ class Lane:
                 main_now = G.rev(self.root, f"refs/remotes/origin/{base}", env=self.genv)
             if head_now != job.head:
                 return J.move(job, T.QUEUED, why=f"the head moved to {head_now[:12]}")
-            if main_now != job.base_sha and self.revalidate(job, main_now):
-                return J.move(job, T.CHECKING, why="main moved: rerun " + ", ".join(job.extra.get("rerun") or []))
+            if main_now != job.base_sha:
+                rerun = self.revalidate(job, main_now)
+                # a reach.tsv the old base's merge tree generated need not be what the new one generates
+                if job.plan.klass == T.LANDER:
+                    return self.query(job, "it changes the lander itself — lander-self lands it", "lander-self")
+                if rerun:
+                    return J.move(job, T.CHECKING, why="main moved: rerun " + ", ".join(job.extra.get("rerun") or []))
             if self.merge(job) != "moved":
                 return
         self.hold(job, f"{base} kept moving under the merge", kind="box")

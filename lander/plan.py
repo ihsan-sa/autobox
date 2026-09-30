@@ -1,7 +1,8 @@
 """plan(): which checks a change reaches, and what kind of landing it is (design §0 Selection, §4; review S2, S3, S10).
 
 PURE. It reads the manifest, policy and reach graph out of git at base_sha (and the head's, which may only widen:
-manifest.widen) and returns a Plan. It writes nothing, runs nothing and asks no network.
+manifest.widen) and returns a Plan. It writes nothing (a reach file's merge is written into a scratch repo that
+git.sealed() removes), runs nothing and asks no network.
 
 SELECTION, per changed file:
   - PROSE (is_prose, S10) reaches only the static checks that own it: docs/**, core/docs/**, *.pdf, images, and
@@ -24,7 +25,10 @@ Plan.checks holds what runs BEFORE the merge. Box-class checks run on main's tip
 Plan.extra["tip"] instead — except for a gate-first change, which keeps them before the merge (owner, 2026-09-24).
 
 KLASS, first match wins: protected (a policy protected glob, or the caller's `protected` list — CC_PROTECTED_PATHS
-lives in the box's config, never in a tree) > lander (a policy lander glob, or the policy file itself) > gate-first
+lives in the box's config, never in a tree) > lander (a policy lander glob, or the policy file itself — bar a
+GENERATED reach file: one where every edge the change adds is one `lander reach` writes on merge-tree(base, head)
+and every edge it drops is one it does not, so the change follows from the code and lands with it; an edge the code
+does not make, or a change git cannot prove, stays lander, and a working copy proves nothing) > gate-first
 > docs (every file prose) > wide (some path unowned, bar an add-only change's quiet ones) > leaf.
 paid: some file matches paid_review.
 
@@ -72,9 +76,11 @@ def tool_name(path: str) -> str:
     return ""
 
 
-def select(m: M.Manifest, files: list, protected=(), added=()) -> T.Plan:
+def select(m: M.Manifest, files: list, protected=(), added=(), generated=()) -> T.Plan:
     """The pure core of plan(), on an already-loaded manifest. Tests call this. added: the files in `files` that do
-    not exist at the base (plan() works it out); when every file is one, the change is add-only."""
+    not exist at the base (plan() works it out); when every file is one, the change is add-only. generated: the reach
+    files in `files` whose change agrees with the generator on the merge tree (plan() works it out); they do not
+    make the change lander-class."""
     pol = m.policy
     names, tip, owned, unowned, reached = set(), set(), [], [], {}
     builtin = M.builtin_check()
@@ -121,7 +127,11 @@ def select(m: M.Manifest, files: list, protected=(), added=()) -> T.Plan:
     lander = list(pol.lander) + [p + M.POLICY for p in M.PREFIXES]
     if any(M.match(prot, f) for f in files):
         klass = T.PROTECTED
-    elif any(M.match(lander, f) for f in files):
+    # brief: "a reach.tsv change that exactly matches what the generator writes on the PR's merge tree follows from
+    # the code, so it's not a policy edit"; "a reach.tsv edit that doesn't match the generator still goes to
+    # lander-self".
+    # Matched edge by edge (generated_change), so drift main already carries does not stop a PR that adds its own.
+    elif any(M.match(lander, f) for f in files if f not in generated):
         klass = T.LANDER
     elif any(M.match(pol.gate_first, f) for f in files):
         klass = T.GATE_FIRST
@@ -150,7 +160,33 @@ def plan(repo_root: str, base_sha: str, head_sha: str, files: list, protected=()
     for a repo that ships none."""
     base = M.load(repo_root, base_sha, fallback=fallback)
     head = M.load(repo_root, head_sha, fallback=fallback, strict=False)
-    return select(M.widen(base, head), list(files), protected, added_files(repo_root, base_sha, head_sha, files))
+    return select(M.widen(base, head), list(files), protected, added_files(repo_root, base_sha, head_sha, files),
+                  generated_reach(repo_root, base_sha, head_sha, files))
+
+
+def generated_reach(repo_root: str, base: str, head: str, files: list) -> set:
+    """The reach files among `files` whose change from base to merge-tree(base, head) agrees with the generator on
+    that tree (reach.generated_change), all of it read in git.sealed(). A working copy (head ""), a sealed repo git
+    cannot make, a merge that conflicts or git failing is the empty set: a reach file is generated only when git
+    proves it."""
+    wanted = [p for p in M.PREFIXES if p + M.REACH in files]
+    if not wanted or not head:
+        return set()
+    from lander import git as G
+    try:
+        # every read, the merge included, in a sealed repo: a replace ref, graft or merge driver of the checkout's
+        # could otherwise show the generator code the PR does not carry
+        with G.sealed(repo_root, base, head) as ((rc, out), run):
+            if run is None:
+                return set()
+            b, h = out
+            rc, merged = run("merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", b, h, timeout=300)
+            tree = merged.split("\0")[0].strip() if rc == 0 else ""
+            if not G.SHA_RE.fullmatch(tree):
+                return set()   # a conflict, or git failing: nothing is proven
+            return {p + M.REACH for p in wanted if R.generated_change(run, b, tree, p)}
+    except Exception:  # noqa: BLE001 — git missing, a timeout, anything: nothing is proven
+        return set()
 
 
 def added_files(repo_root: str, base: str, head: str, files: list) -> set:

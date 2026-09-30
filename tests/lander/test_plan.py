@@ -441,6 +441,193 @@ class PlanOnGit(unittest.TestCase):
         self.assertEqual(git(r.root, "status", "--porcelain"), before)
 
 
+class GeneratedReach(unittest.TestCase):
+    """brief: a reach.tsv change that matches what the generator writes on the PR's merge tree is not a lander edit;
+    one that does not still goes to lander-self. Each case builds its own repo."""
+    LANDER_POLICY = POLICY.replace('lander = ["core/lander/**"]',
+                                   'lander = ["core/lander/**", "core/tests/reach.tsv", "tests/reach.tsv"]')
+    CALLS = {"core/bin/b": '#!/bin/sh\n"$BIN/a"\n', "core/bin/c": '#!/bin/sh\n"$BIN/b"\n'}
+
+    def repo(self):
+        r = Repo(self, {"tests/LANDING-policy.toml": self.LANDER_POLICY, **self.CALLS})
+        self.assertEqual(R.generate_at(r.root, r.base, "core/"), [("b", "a"), ("c", "b")])
+        return r
+
+    def plan(self, r, head):
+        return P.plan(r.root, r.base, head, P.changed(r.root, r.base, head))
+
+    def test_a_new_tool_with_its_callers_and_regenerated_reach_is_not_lander_class(self):
+        r = self.repo()
+        head = r.commit("new tool d, c calls it", {
+            "core/bin/d": "#!/bin/sh\n", "core/bin/c": '#!/bin/sh\n"$BIN/b"\n"$BIN/d"\n',
+            "core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("c", "d")])})
+        p = self.plan(r, head)
+        self.assertNotEqual(p.klass, T.LANDER)
+        self.assertIn(M.BUILTIN, p.checks)   # the reach file still selects manifest-widen
+
+    def test_an_authored_edge_the_code_does_not_make_is_lander_class(self):
+        r = self.repo()
+        head = r.commit("hand edge", {"core/bin/d": "#!/bin/sh\n",
+                                      "core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("a", "d")])})
+        self.assertEqual(self.plan(r, head).klass, T.LANDER)
+
+    def test_a_dropped_edge_the_code_still_makes_is_lander_class(self):
+        r = self.repo()
+        head = r.commit("drop b->a", {"core/bin/c": '#!/bin/sh\n"$BIN/b"\necho\n',
+                                      "core/tests/reach.tsv": R.render([("c", "b")])})
+        self.assertEqual(self.plan(r, head).klass, T.LANDER)
+
+    def test_the_match_is_on_the_merge_tree_not_the_head(self):
+        r = self.repo()
+        git(r.root, "checkout", "-qb", "pr")
+        head = r.commit("e calls a", {"core/bin/e": '#!/bin/sh\n"$BIN/a"\n',
+                                      "core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("e", "a")])})
+        self.assertNotEqual(self.plan(r, head).klass, T.LANDER)
+        git(r.root, "checkout", "-q", "-")
+        # main moves on and deletes a: on the merge tree nothing generates e -> a, so the PR's edge is authored there
+        os.unlink(os.path.join(r.root, "core/bin/a"))
+        main = r.commit("rm a", {"core/tests/reach.tsv": R.render([("c", "b")])})
+        p = P.plan(r.root, main, head, P.changed(r.root, main, head))
+        self.assertEqual(p.klass, T.LANDER)
+
+    def test_drift_already_on_the_base_does_not_stop_a_pr_that_adds_its_own_edge(self):
+        """main's reach.tsv lacks b -> a, which its code makes (an earlier PR never added it). A PR that adds only
+        its own generated edge is not lander-class; one that adds the same edge plus an authored one is."""
+        r = Repo(self, {"tests/LANDING-policy.toml": self.LANDER_POLICY, **self.CALLS,
+                        "core/tests/reach.tsv": R.render([("c", "b")])})
+        files = {"core/bin/d": "#!/bin/sh\n", "core/bin/c": '#!/bin/sh\n"$BIN/b"\n"$BIN/d"\n'}
+        git(r.root, "checkout", "-qb", "ok")
+        ok = r.commit("own edge", {**files, "core/tests/reach.tsv": R.render([("c", "b"), ("c", "d")])})
+        self.assertNotEqual(self.plan(r, ok).klass, T.LANDER)
+        git(r.root, "checkout", "-q", r.base)
+        bad = r.commit("own edge and a made one",
+                       {**files, "core/tests/reach.tsv": R.render([("a", "c"), ("c", "b"), ("c", "d")])})
+        self.assertEqual(self.plan(r, bad).klass, T.LANDER)
+
+    def test_a_deleted_reach_file_is_lander_class(self):
+        r = self.repo()
+        os.unlink(os.path.join(r.root, "core/tests/reach.tsv"))
+        self.assertEqual(self.plan(r, r.commit("rm reach")).klass, T.LANDER)
+
+    def test_a_working_copy_proves_nothing(self):
+        r = self.repo()
+        write(r.root, {"core/bin/d": "#!/bin/sh\n", "core/bin/c": '#!/bin/sh\n"$BIN/b"\n"$BIN/d"\n',
+                       "core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("c", "d")])})
+        self.assertEqual(P.plan(r.root, r.base, "", P.changed(r.root, r.base, "")).klass, T.LANDER)
+
+    def test_other_lander_files_still_route_to_lander_self(self):
+        r = self.repo()
+        head = r.commit("reach and a lander file", {
+            "core/bin/d": "#!/bin/sh\n", "core/bin/c": '#!/bin/sh\n"$BIN/b"\n"$BIN/d"\n',
+            "core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("c", "d")]),
+            "core/lander/x.py": "x = 1\n"})
+        self.assertEqual(self.plan(r, head).klass, T.LANDER)
+        self.assertEqual(P.select(M.load(r.root, r.base), ["core/tests/reach.tsv"]).klass, T.LANDER)
+
+    def test_a_replace_ref_in_the_checkout_cannot_make_an_authored_edge_match(self):
+        """review (security, Opus): the check read the checkout's git, so a planted refs/replace swapped the head for
+        a commit whose code makes the authored edge. It reads sealed now: the swap is invisible and the PR stays
+        lander-class."""
+        r = self.repo()
+        reach = R.render([("a", "d"), ("b", "a"), ("c", "b")])
+        git(r.root, "checkout", "-qb", "pr")
+        head = r.commit("hand edge a -> d", {"core/bin/d": "#!/bin/sh\n", "core/tests/reach.tsv": reach})
+        git(r.root, "checkout", "-q", r.base)
+        fake = r.commit("a calls d", {"core/bin/d": "#!/bin/sh\n", "core/bin/a": '#!/bin/sh\n"$BIN/d"\n',
+                                      "core/tests/reach.tsv": reach})
+        git(r.root, "replace", head, fake)
+        # the plant is live: the checkout's own merge of the head shows a calling d
+        tree = git(r.root, "merge-tree", "--write-tree", r.base, head).split("\n")[0]
+        self.assertIn("$BIN/d", git(r.root, "cat-file", "blob", f"{tree}:core/bin/a"))
+        files = ["core/bin/d", "core/tests/reach.tsv"]
+        self.assertEqual(P.generated_reach(r.root, r.base, head, files), set())
+        self.assertEqual(P.plan(r.root, r.base, head, files).klass, T.LANDER)
+        self.assertNotIn(("a", "d"), R.generate_at(r.root, head, "core/"))
+
+    def test_a_tool_name_with_a_control_character_proves_nothing(self):
+        """review (security): a name holding a newline shifted which text `cat-file --batch` handed to which file.
+        Blobs are read by id now, and any tool name with a control character leaves the change lander-class."""
+        r = self.repo()
+        change = {"core/bin/d": "#!/bin/sh\n", "core/bin/c": '#!/bin/sh\n"$BIN/b"\n"$BIN/d"\n',
+                  "core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("c", "d")])}
+        git(r.root, "checkout", "-qb", "ok")
+        self.assertNotEqual(self.plan(r, r.commit("generated", change)).klass, T.LANDER)
+        for name in ("x\ny", "x\ty", "x\x7fy"):
+            git(r.root, "checkout", "-q", r.base)
+            head = r.commit(f"generated and {name!r}", {**change, f"core/bin/{name}": "#!/bin/sh\n"})
+            self.assertEqual(self.plan(r, head).klass, T.LANDER, repr(name))
+            with self.assertRaises(OSError):
+                R.generate_at(r.root, head, "core/")
+
+    def test_a_sealed_read_git_cannot_make_or_a_conflicting_merge_proves_nothing(self):
+        r = self.repo()
+        files = ["core/tests/reach.tsv"]
+        for bad in ("0" * 40, "--output=x"):
+            self.assertEqual(P.generated_reach(r.root, r.base, bad, files), set(), bad)
+        git(r.root, "checkout", "-qb", "pr")
+        head = r.commit("c calls d", {"core/bin/d": "#!/bin/sh\n", "core/bin/c": '#!/bin/sh\n"$BIN/b"\n"$BIN/d"\n',
+                                      "core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("c", "d")])})
+        self.assertEqual(P.generated_reach(r.root, r.base, head, files), set(files))
+        git(r.root, "checkout", "-q", r.base)
+        main = r.commit("c changes too", {"core/bin/c": '#!/bin/sh\n"$BIN/b"\necho\n'})
+        self.assertEqual(P.generated_reach(r.root, main, head, files), set())
+
+    def test_a_pr_cannot_pick_the_recipe_by_adding_a_directory(self):
+        """review (security): the tree generator chose its recipe from which directories existed, so a PR that added
+        a top-level bin/README made the overlay's generator read bin/ alone, want no edges, and pass a reach file
+        emptied by hand. The recipe is pinned per prefix now, and a tree laid out otherwise proves nothing."""
+        overlay = {"bin-private/p": '"$BIN/c"\n', "bin-private/q": '"$BIN/p"\n',
+                   "tests/reach.tsv": R.render([("p", "c"), ("q", "p")])}
+        r = Repo(self, {"tests/LANDING-policy.toml": self.LANDER_POLICY, **self.CALLS, **overlay})
+        self.assertEqual(R.generate_at(r.root, r.base, ""), [("p", "c"), ("q", "p")])
+        git(r.root, "checkout", "-qb", "ok")
+        ok = r.commit("r calls q", {"bin-private/r": '"$BIN/q"\n',
+                                    "tests/reach.tsv": R.render([("p", "c"), ("q", "p"), ("r", "q")])})
+        self.assertNotEqual(self.plan(r, ok).klass, T.LANDER)
+        git(r.root, "checkout", "-q", r.base)
+        bad = r.commit("steer", {"bin/README": "x\n", "tests/reach.tsv": R.render([])})
+        self.assertEqual(self.plan(r, bad).klass, T.LANDER)
+        with self.assertRaises(OSError):
+            R.generate_at(r.root, bad, "")
+
+    def test_a_symlinked_tool_proves_something_only_when_it_links_to_a_regular_file(self):
+        """review (security): a link was followed one hop, so a link to a dangling link whose target string reads
+        `$BIN/a` made the generator write an edge a checkout never makes. A link to a link, a broken link and a link
+        to a directory now prove nothing; a link to a regular file still does."""
+        r = self.repo()
+        git(r.root, "checkout", "-qb", "ok")
+        write(r.root, {"lib/real.py": '"$BIN/a"\n'})
+        os.symlink("../../lib/real.py", os.path.join(r.root, "core/bin/e"))
+        ok = r.commit("e links to real.py", {"core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("e", "a")])})
+        self.assertNotEqual(self.plan(r, ok).klass, T.LANDER)
+        for name, how in (("chain", ["g", "$BIN/a"]), ("broken", ["nowhere"]), ("dir", ["../../lib"])):
+            git(r.root, "checkout", "-q", r.base)
+            write(r.root, {"lib/real.py": '"$BIN/a"\n'})
+            os.symlink(how[0], os.path.join(r.root, "core/bin/e"))
+            if len(how) > 1:
+                os.symlink(how[1], os.path.join(r.root, "core/bin/g"))
+            head = r.commit(f"e is a {name} link",
+                            {"core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("e", "a")])})
+            self.assertNotIn(("e", "a"), R.generate(os.path.join(r.root, "core")), name)
+            self.assertEqual(self.plan(r, head).klass, T.LANDER, name)
+            with self.assertRaises(OSError, msg=name):
+                R.generate_at(r.root, head, "core/")
+
+    def test_the_tree_generator_agrees_with_the_checkout_generator(self):
+        """Core's layout and the overlay's (callers bin-private/, callees it and core/bin/), a symlinked tool read at
+        its target, and a dotfile skipped, on both generators."""
+        r = self.repo()
+        head = r.commit("overlay", {"bin-private/p": '"$BIN/c"\n', "bin-private/q": '"$BIN/p"\n',
+                                    "lib/real.py": 'BIN / "a"\n', "core/bin/.hidden": '"$BIN/a"\n'})
+        os.symlink("../../lib/real.py", os.path.join(r.root, "core/bin/e"))
+        head = r.commit("symlink")
+        self.assertEqual(R.generate_at(r.root, head, "core/"), R.generate(os.path.join(r.root, "core")))
+        self.assertIn(("e", "a"), R.generate_at(r.root, head, "core/"))
+        self.assertEqual(R.generate_at(r.root, head, ""),
+                         R.generate(r.root, ["bin-private"], ["bin-private", "core/bin"], []))
+        self.assertEqual(R.generate_at(r.root, head, ""), [("p", "c"), ("q", "p")])
+
+
 class Reach(unittest.TestCase):
     def test_the_generator_finds_the_four_spellings_and_no_self_or_cc_edges(self):
         with tempfile.TemporaryDirectory() as d:
