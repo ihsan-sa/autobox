@@ -17,7 +17,8 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
            StrictHostKeyChecking=yes), so the laptop is configured exactly when cc-suites' runner is, and a destination known_hosts does not name is refused
            before ssh starts. The tree goes to the runner's `job` form (`cc-suites runner`, the key's forced command),
            which unpacks it into a fresh directory with a fresh HOME per job, proves it by write-tree, runs it caged
-           (writable only in that directory; cc-suites, THE CAGE) and removes both; `lander job-serve` hands
+           (writable only in that directory, and with no network unless the check says net = true, which goes as
+           the job's trailing `net`; cc-suites, THE CAGE) and removes both; `lander job-serve` hands
            the same job to it. Busy, unfit or not answering is
            unrunnable there, never red, and judge() then runs the check on the box. A host check's line goes with
            HOST_PREP in front: what a box has and a fresh account does not (a tmux session `main`, of a server of
@@ -287,6 +288,12 @@ def laptop_argv(check, tree, cwd):
         raise Unrunnable(f"no laptop is configured (cc-suites: {_suites_dir()})")
     if check.klass not in (T.STATIC, T.HERMETIC, T.HOST):
         raise Unrunnable(f"a {check.klass} check does not leave the box")
+    # ssh joins argv with spaces and the runner reads one line, so a name carrying a newline could hand the laptop
+    # a job of its own making (`net` included): the name must be one the runner and the records accept
+    try:
+        REC._safe(check.name)
+    except ValueError:
+        raise Unrunnable(f"not a check name the laptop takes: {check.name!r}") from None
     d = _suites_dir()
     kh, host = os.path.join(d, "known_hosts"), dest.split("@", 1)[1]
     with open(kh) as f:
@@ -295,13 +302,18 @@ def laptop_argv(check, tree, cwd):
         raise Unrunnable(f"the laptop {host} has no pinned host key in {kh}")
     b = lambda s: base64.b64encode(s.encode()).decode() or "-"   # noqa: E731
     # cc-suites xport_argv's options, so this is the path the owner approved and no other
-    return ["ssh", "-F", "/dev/null", "-i", os.path.join(d, "id_ed25519"), "-o", "IdentitiesOnly=yes",
+    argv = ["ssh", "-F", "/dev/null", "-i", os.path.join(d, "id_ed25519"), "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=4", "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={kh}",
             "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ClearAllForwardings=yes",
             "-o", "KexAlgorithms=curve25519-sha256", "-a", "-x", "-T", "-C", dest, "--",
             "job", check.name, tree, str(check.cap), b(HOST_PREP + f"(\n{check.run}\n)" if check.klass == T.HOST
-                                                      else check.run), b(cwd)]
+                                                      else check.run), b(cwd)] + (["net"] if check.net else [])
+    # a word with whitespace in it would split or add a line on the far side: it goes as it is or not at all
+    bad = next((w for w in argv if re.search(r"\s", w)), None)
+    if bad is not None:
+        raise Unrunnable(f"a laptop argv word carries whitespace: {bad!r}")
+    return argv
 
 
 def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = ".", cwd: str = "",
@@ -390,12 +402,13 @@ def _laptop_verdict(text: str, rc: int) -> tuple:
 # --- the laptop's end ----------------------------------------------------------------------------------------------
 
 def cmd_job_serve(argv):
-    """The laptop's forced command in Python: `job CHECK TREE CAP RUN_B64 CWD_B64` from SSH_ORIGINAL_COMMAND (or
+    """The laptop's forced command in Python: `job CHECK TREE CAP RUN_B64 CWD_B64 [net]` from SSH_ORIGINAL_COMMAND (or
     argv), the tree as a tar on stdin. It hands the job to `cc-suites runner` and takes nothing else, so a job has one
     runner and one cage: its own directory writable, the runner and its account read-only (cc-suites, THE CAGE)."""
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND") or " ".join(argv)
-    if cmd.split()[:1] != ["job"]:
-        print("lander-job: refused: job CHECK TREE CAP RUN_B64 CWD_B64")
+    # the runner reads one line: a job is one line, or it is refused whole
+    if "\n" in cmd or "\r" in cmd or cmd.split()[:1] != ["job"]:
+        print("lander-job: refused: job CHECK TREE CAP RUN_B64 CWD_B64 [net]")
         return 2
     p = subprocess.run(["bash", os.path.join(BIN, "cc-suites"), "runner"], stdin=sys.stdin.buffer,
                        stdout=subprocess.PIPE, env={**os.environ, "SSH_ORIGINAL_COMMAND": cmd})

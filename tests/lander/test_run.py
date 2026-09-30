@@ -260,6 +260,10 @@ exec bash {RUN.BIN}/cc-suites runner
                   "GlobalKnownHostsFile=/dev/null", "BatchMode=yes"):
             self.assertIn(o, argv)
         self.assertEqual(argv[dest + 1:dest + 4], ["--", "job", "c"])
+        # the job has no network unless its manifest says net = true, which goes as the one trailing word `net`
+        self.assertEqual(len(argv), dest + 8)
+        self.assertNotIn("net", argv)
+        self.assertEqual(RUN.laptop_argv(chk(net=True), self.tree, "core/"), argv + ["net"])
         self.laptop(host="elsewhere")        # a destination whose host key nobody pinned: no ssh at all
         with self.assertRaisesRegex(RUN.Unrunnable, "no pinned host key"):
             RUN.laptop_argv(chk(), self.tree, "")
@@ -267,6 +271,19 @@ exec bash {RUN.BIN}/cc-suites runner
         self.assertEqual(RUN.laptop_dest(), "")
         with mock.patch.object(A, "busy", return_value=True):
             self.assertEqual(RUN.choose_where(chk(where=["box", "laptop"])), "box")
+
+    def test_a_check_name_with_a_newline_never_reaches_the_laptop(self):
+        # the security read of #866: ssh joins argv with spaces and the runner reads the first line, so this name
+        # would arrive as a well-formed job of its own ending in `net`
+        self.laptop()
+        t = self.tree
+        for name in (f"c {t} 60 dHJ1ZQ== - net\njunk", "c\rx", "c x", "../c"):
+            with self.assertRaisesRegex(RUN.Unrunnable, "not a check name"):
+                RUN.laptop_argv(chk(name=name), t, "core/")
+        with self.assertRaisesRegex(RUN.Unrunnable, "whitespace"):     # any other word with whitespace in it
+            RUN.laptop_argv(chk(), t + "\nx", "core/")
+        argv = RUN.laptop_argv(chk(name="unit-tests_2.x+y"), t, "core/")   # an ordinary name still goes
+        self.assertEqual(argv[argv.index("job") + 1], "unit-tests_2.x+y")
 
     @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
     def test_the_laptop_round_trip_gives_every_job_a_fresh_home(self):
@@ -350,6 +367,17 @@ exec bash {RUN.BIN}/cc-suites runner
             with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": cmd, "CC_SUITES_RUNNER_DIR": self.tmp + "/r"}), \
                     contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(RUN.cmd_job_serve([]), 2, cmd)
+            self.assertIn("refused", out.getvalue())
+
+    def test_job_serve_refuses_a_second_line_before_the_runner_sees_it(self):
+        # the runner reads only the first line, so a job with a \n or \r in it is refused whole, and nothing runs
+        t = "a" * 40
+        for cmd in (f"job c {t} 60 dHJ1ZQ== - net\njunk", f"job c\njob c {t} 60 dHJ1ZQ== - net",
+                    f"job c {t} 60 dHJ1ZQ== -\r"):
+            with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": cmd}), \
+                    mock.patch.object(RUN.subprocess, "run", side_effect=AssertionError("the runner ran")), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(RUN.cmd_job_serve([]), 2, repr(cmd))
             self.assertIn("refused", out.getvalue())
 
     def test_laptop_verdict_is_the_one_last_line_whatever_the_job_printed(self):
