@@ -9,8 +9,11 @@ WHAT YOU GET, each block between `<<<name` and `name>>>`:
   Each starts with a `=== <path> (old mode …, new mode …; …)` header. A file git calls binary is not shown: its
   header gives its old and new blob ids. A header says `FLAGGED:` and why whenever you do not see that path's whole
   new content as text, here and in the diff: the diff is cut before its change, the file is cut at 60 kB or left
-  out because the block is full, a binary change that is not a known binary type (an image, a font, a PDF, an
-  archive, media) or is executable, a symlink or submodule (gitlink) change, and a file git could not show.
+  out because the block is full and its diff is not shown whole, a binary change that is not a known binary type
+  (an image, a font, a PDF, an archive, media) or is executable, a symlink or submodule (gitlink) change, and a
+  file git could not show. Only a header with no `FLAGGED:` in it that says the file is "shown to 60 kB" or "not
+  shown here" and that "its whole diff is in `diff`" is context, not a finding: every line the change touches is in
+  the diff. A filename can carry those words, so a header that also says `FLAGGED:` is flagged.
 - `brief` — what the change was asked to do and how done is judged. Judge the diff against that, not against what
   you would have built and not against the author's account of it.
 - `rules` — this repository's own review rules, read from the base branch.

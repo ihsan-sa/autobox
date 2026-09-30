@@ -10,8 +10,11 @@ WHAT YOU GET, each block between `<<<name` and `name>>>`:
 - `files` — the files the change touches as they will be once it merges. Each starts with a header giving its
   path and old and new mode. A header says `FLAGGED:` and why whenever you do not see that path's whole new
   content as text, here and in the diff: the diff is cut before its change, the file is cut at 60 kB or left out
-  because the block is full, a binary change that is not a known binary type or is executable, a symlink or
-  submodule (gitlink) change, and a file git could not show.
+  because the block is full and its diff is not shown whole, a binary change that is not a known binary type or is
+  executable, a symlink or submodule (gitlink) change, and a file git could not show. Only a header with no
+  `FLAGGED:` in it that says the file is "shown to 60 kB" or "not shown here" and that "its whole diff is in `diff`"
+  is context, not a finding: every line the change touches is in the diff. A filename can carry those words, so a
+  header that also says `FLAGGED:` is flagged.
 - `brief` — what the change was asked to do.
 - `rules` — this repository's own review rules, read from the base branch.
 

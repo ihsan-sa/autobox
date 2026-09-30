@@ -458,6 +458,28 @@ def cut_paths(diff, paths):
     return [p for p, end in zip(paths, ends) if end > DIFF_CAP]
 
 
+def whole_paths(diff, paths):
+    """The paths whose change the prompt's diff shows whole as text: the diff is not cut at all, and the path has
+    exactly one section headed `diff --git a/<path> b/<path>`, with a hunk and no binary line. Every changed line of
+    such a path is in the diff, so a cut of its file in the files block hides none of them. A rename, a quoted name,
+    a type change (two sections) or a mode-only change matches nothing here and so keeps its flag. A cut diff names
+    none: its sections are found by line, and a changed line can forge a header (git's text output turns a lone \r
+    into a line break), so past the cap no section can be trusted to be the path's own."""
+    if len(diff) > DIFF_CAP:
+        return []
+    starts = [m.start() for m in re.finditer(r"(?m)^diff --git ", diff)]
+    ends = starts[1:] + [len(diff)]
+    whole = []
+    for p in paths:
+        own = [(at, end) for at, end in zip(starts, ends) if diff.startswith(f"diff --git a/{p} b/{p}\n", at)]
+        if len(own) != 1:
+            continue
+        sec = diff[own[0][0]:own[0][1]]
+        if re.search(r"(?m)^@@ ", sec) and not re.search(r"(?m)^(Binary files |GIT binary patch)", sec):
+            whole.append(p)
+    return whole
+
+
 def capped(diff, dropped=()):
     """The diff as the prompt carries it: whole up to DIFF_CAP, else cut there with a line saying so and naming the
     paths whose change the cut takes (the digest is always taken over the whole diff)."""
@@ -502,27 +524,30 @@ def shown(path):
     return json.dumps(path, ensure_ascii=False) if any(ord(c) < 32 or ord(c) == 127 for c in path) else path
 
 
-def file_block(path, old_mode, new_mode, notes=(), unseen=(), text=None, body=None, exempt=False):
+def file_block(path, old_mode, new_mode, notes=(), unseen=(), text=None, body=None, exempt=False, diffed=False):
     """One path's entry in the files block, and the one place its rule is kept: a path whose whole new content the
     read does not see as text, here and in the diff, is FLAGGED with the reasons in `unseen`. `text` is the whole
     new content, `body` what is shown of it; if they differ and no reason was given the path is still FLAGGED.
-    `exempt` is only for what needs no reading: a deletion, or a known binary type that is not executable."""
+    `diffed` (whole_paths()) says every changed line is in the diff, so a body short of the text is context, not a
+    hidden change; a reason in `unseen` still flags. `exempt` is only for what needs no reading: a deletion, or a
+    known binary type that is not executable."""
     unseen = list(unseen)
-    if not exempt and not unseen and (text is None or body != text):
+    if not exempt and not unseen and not diffed and (text is None or body != text):
         unseen.append("its content is not shown in full")
     head = "; ".join([f"old mode {old_mode or 'none'}, new mode {new_mode or 'none'}", *notes]
                      + ([f"FLAGGED: {', '.join(unseen)}"] if unseen else []))
     return f"=== {shown(path)} ({head})" + ("\n" + body if body is not None else "")
 
 
-def merged_files(root, base, head, files, dropped=()):
+def merged_files(root, base, head, files, dropped=(), whole=()):
     """The changed files as they will be after the merge, each through file_block(). The merge and every read of it
     run in blind(), so no merge driver or attribute the checkout names can run or change what the read sees.
 
     FLAGGED, and so handed back by review.md: a path whose change the diff cut drops (`dropped`, from cut_paths()),
-    a file cut at FILE_CAP or left out when the block is full, a binary change unread_binary() names, a symlink or a
-    submodule (gitlink) added, changed or removed, and a file git cannot show. A file is "deleted" only when the
-    merged tree has no entry for it."""
+    a file cut at FILE_CAP or left out when the block is full unless its whole diff is shown (`whole`, from
+    whole_paths(): then the cut is a note), a binary change unread_binary() names, a symlink or a submodule (gitlink)
+    added, changed or removed, and a file git cannot show. A file is "deleted" only when the merged tree has no entry
+    for it."""
     with blind(root, base, head) as (got, run):
         if run is None:
             return "\n".join(file_block(p, "?", "?", unseen=["git could not read this change"]) for p in files)
@@ -552,14 +577,22 @@ def merged_files(root, base, head, files, dropped=()):
                 out.append(file_block(p, *modes, [f"binary, not shown: old blob {old_id}, new blob {new_id}"],
                                       unseen + ([f"binary, {why}"] if why else []), exempt=not why))
                 continue
-            if total + len(text) > FILES_CAP:
-                out.append(file_block(p, *modes, unseen=unseen + ["not shown: the files block is full"], text=text))
-                continue
+            diffed = p in whole and not unseen
             body = text[:FILE_CAP]
+            if total + len(body) > FILES_CAP:
+                if diffed:
+                    out.append(file_block(p, *modes, ["not shown here, the files block is full; its whole diff is in "
+                                                      "`diff`"], text=text, diffed=True))
+                else:
+                    out.append(file_block(p, *modes, unseen=unseen + ["not shown: the files block is full"], text=text))
+                continue
             total += len(body)
-            if len(body) < len(text):
+            notes = []
+            if len(body) < len(text) and diffed:
+                notes.append(f"shown to {FILE_CAP // 1000} kB of {len(text)} characters; its whole diff is in `diff`")
+            elif len(body) < len(text):
                 unseen.append(f"cut at {FILE_CAP // 1000} kB of {len(text)} characters")
-            out.append(file_block(p, *modes, unseen=unseen, text=text, body=body))
+            out.append(file_block(p, *modes, notes, unseen, text=text, body=body, diffed=diffed))
         return "\n".join(out)
 
 
@@ -683,7 +716,8 @@ def _buy(job, template, diff, more):
     files = list(dict.fromkeys([*job.files, *blind_files]))
     dropped = cut_paths(diff, blind_files) if len(diff) > DIFF_CAP else []
     text = prompt(load_prompt(template), PR=pr, REPO=repo, TITLE=facts.get("title") or "(untitled)",
-                  DIFF=capped(diff, dropped), FILES=merged_files(root, job.base_sha, job.head, files, dropped),
+                  DIFF=capped(diff, dropped),
+                  FILES=merged_files(root, job.base_sha, job.head, files, dropped, whole_paths(diff, blind_files)),
                   BRIEF=brief_of(job) or
                   "No brief was found for this PR. Judge the change against its title and its own diff.",
                   RULES=rules_of(root, base_ref) or "This repo ships no docs/REVIEW.md.", **more)

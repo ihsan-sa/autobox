@@ -379,6 +379,30 @@ class TestReview(Case):
         self.assertEqual(R.cut_paths(whole + sec("b", 3).replace("+x", "+diff --git a/z b/z", 1) + sec("c", R.DIFF_CAP // 3),
                                      ["a", "b", "c"]), ["c"])
 
+    def test_whole_paths_names_only_a_path_whose_own_text_section_is_in_an_uncut_diff(self):
+        """A path's change is whole when the diff is not cut and the path has exactly one section of its own, with a
+        hunk and no binary line. A cut diff names none, and a missing section, a binary line, a rename, two sections or no hunk
+        is not whole."""
+        sec = lambda p, n: f"diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1 +1 @@\n" + "+x\n" * n
+        self.assertEqual(R.whole_paths(sec("a", 10) + sec("b", 10), ["a", "b", "gone"]), ["a", "b"])
+        self.assertEqual(R.whole_paths(sec("a", 10) + sec("b", R.DIFF_CAP // 3), ["a", "b"]), [])
+        binary = "diff --git a/c b/c\nindex 1..2 100644\nBinary files a/c and b/c differ\n"
+        self.assertEqual(R.whole_paths(binary + sec("a", 1).replace("+x", "+Binary files x", 1), ["c", "a"]), ["a"])
+        self.assertEqual(R.whole_paths(sec("a", 1).replace("b/a\n", "b/z\n", 1), ["a", "z"]), [])
+        self.assertEqual(R.whole_paths(sec("a", 1) + sec("a", 1), ["a"]), [])
+        self.assertEqual(R.whole_paths("diff --git a/m b/m\nold mode 100644\nnew mode 100755\n", ["m"]), [])
+        self.assertEqual(R.whole_paths(sec("a", 1).replace("+x", "+diff --git a/q b/q", 1), ["q"]), [])
+
+    def test_a_cut_file_is_not_flagged_when_its_whole_diff_is_shown_but_a_reason_still_flags(self):
+        fb = R.file_block
+        self.assertEqual(fb("a.py", "100644", "100644", ["shown to 60 kB"], text="t\nu\n", body="t\n", diffed=True),
+                         "=== a.py (old mode 100644, new mode 100644; shown to 60 kB)\nt\n")
+        self.assertEqual(fb("a.py", "100644", "100644", text="t\nu\n", diffed=True),
+                         "=== a.py (old mode 100644, new mode 100644)")
+        self.assertEqual(fb("a.py", "100644", "100644", unseen=["the diff is cut before its change"], text="t\nu\n",
+                            body="t\n", diffed=True),
+                         "=== a.py (old mode 100644, new mode 100644; FLAGGED: the diff is cut before its change)\nt\n")
+
     def test_file_block_flags_whatever_it_does_not_show_whole(self):
         """The one rule: a path whose whole new content is not shown is FLAGGED, even with no reason given, and only
         an exempt path (a deletion, a known binary type) passes unshown and unflagged."""
