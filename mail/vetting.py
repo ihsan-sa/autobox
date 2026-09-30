@@ -36,6 +36,18 @@ stranger. The verdict says both halves, so neither answers the other: "the sende
 the mail fits where it is going" / "…, but it does not fit the channel it is going to". A sender NOT on that
 list — none reach this file today, since the receiver's list is the same one — takes the path below.
 
+A COURSE DIGEST THE OWNER FORWARDS IS NOT READ AT ALL (owner, 2026-09-30, of Piazza, Crowdmark, Mobius and
+LEARN digests he forwards to his course channels: "always allow these kinds of email"). The read held them as
+not fitting the channel or as asking the box to break its rules, since a digest is full of other people's asks.
+digest() passes one when ALL of these hold: the sender is on the list, the router placed it as the owner's own
+(workspace `owner`, and not the unplaced-mail rule), it carries no attachment, and the FIRST forwarded block in
+its body — a forward marker line, then a `From:` line — names an address MAIL_DIGEST_SENDERS lists: an entry
+with an `@` is that address, one without is that domain and its subdomains. Unset, nothing is a digest. The
+shape is keyed on the forwarded header and not on the mail's own From, and the forwarded header is text the
+sender typed, so it is trusted only as far as the sender is: a stranger's forward, a member's, and a `From:`
+line with no forward marker above it all take the read as before. It changes the verdict and nothing else —
+the mail is still delivered as mail, never with the owner's authority, and costs no read of the budget.
+
 WHAT A STRANGER IS WEIGHED AGAINST. What this sender has asked for before (the subjects of their earlier mail to THIS
 workspace that was delivered, out of ~/.cc/mail/conv) and what the workspace it is going to is for (the
 target's goals, board and journal, under ~/.cc/state and ~/.cc/boards). A mail from a stranger to a workspace
@@ -148,6 +160,7 @@ REASONS = {
     "scam":        ("refused", "it asks for money, credentials or access"),
     "phish":       ("refused", "it is dressed up as somebody else's mail"),
     "junk":        ("refused", "it is bulk mail, not a message to this box"),
+    "digest":      ("clean", "the mail is a course digest forwarded from the owner's own address"),   # ours: digest()
 }
 TEXT_REASONS = ["fits", "off-goals", "instruction", "unlike", "scam", "phish", "junk"]
 SEC_REASONS = ["fits", "link", "attachment", "scam", "phish"]
@@ -189,7 +202,8 @@ class Verdict:
             self.why = "%s (%s)" % (self.why, self.cause)
         self.known = bool(known)
         if self.known:
-            self.why = KNOWN + (", and the mail fits where it is going" if self.clean else ", but " + self.why)
+            self.why = KNOWN + (", but " + self.why if not self.clean
+                                else ", and " + (self.why if self.reason == "digest" else "the mail fits where it is going"))
         self.cost = cost
 
     @property
@@ -229,6 +243,52 @@ def trusted(sender, cfg):
     envelope. No list, or a cfg without one, trusts nobody: the stranger path is the safe default. router.py
     may read this if it ever needs the answer; it is the one place the answer is given."""
     return bool((sender or "").strip()) and (sender or "").strip().lower() in allow_list(cfg)
+
+
+# ---------------------------------------------------------------- a digest the owner forwarded
+
+# The line a mail client puts above a forwarded mail's headers: Gmail's and Thunderbird's dashes, Apple Mail's
+# sentence, and Outlook's rule of underscores (what the owner's university account sends).
+FORWARD = re.compile(r"^\s*(?:-{3,}\s*(?:forwarded message|original message)\s*-{3,}|begin forwarded message:?"
+                     r"|_{10,})\s*$", re.I)
+FROM_LINE = re.compile(r"^[\s>*]*from:\s*(?P<v>.*)$", re.I)
+ADDR = re.compile(r"[\w.+-]+@(?P<d>[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")
+
+
+def digest_senders(cfg):
+    """MAIL_DIGEST_SENDERS, lowercased: `no-reply@piazza.com` is that address, `crowdmark.com` that domain."""
+    raw = (cfg or {}).get("MAIL_DIGEST_SENDERS") or ""
+    return {a.strip().lower() for a in re.split(r"[,\s]+", raw) if a.strip()}
+
+
+def forwarded_from(body):
+    """The address in the `From:` line that opens the FIRST forwarded block of `body`, or "". Only the first
+    marker counts, and its From must be the first line after it that is not blank, which is where every client
+    above puts it; a `From:` line anywhere else is somebody's sentence."""
+    lines = (body or "").split("\n")
+    for i, line in enumerate(lines):
+        if not FORWARD.match(line):
+            continue
+        rest = [l for l in lines[i + 1:i + 6] if l.strip()]
+        m = FROM_LINE.match(rest[0]) if rest else None
+        a = ADDR.search(m.group("v")) if m else None
+        return a.group(0).lower() if a else ""
+    return ""
+
+
+def digest(msg, dec, cfg):
+    """Whether this mail is a course digest the owner forwarded (see the docstring's paragraph on it): the
+    sender listed AND the owner's own, no attachment, and the first forwarded block from a MAIL_DIGEST_SENDERS
+    entry. `dec.workspace == "owner"` is the owner's-own test because the router gives it only to his own
+    addresses — MAIL_WORKSPACE's `=owner` rows and his Slack profile's — and never to an unplaced sender."""
+    want = digest_senders(cfg)
+    if not want or msg.get("attachments") or not trusted(msg.get("from"), cfg):
+        return False
+    if dec.workspace != "owner" or dec.rule == _router().UNMAPPED:
+        return False
+    a = forwarded_from(_router().body_text(msg))
+    dom = a.partition("@")[2]
+    return bool(a) and (a in want or any(dom == w or dom.endswith("." + w) for w in want if "@" not in w))
 
 
 # ---------------------------------------------------------------- the day's budget
@@ -587,6 +647,8 @@ def vet(msg, dec, cfg=None):
     sender = (msg.get("from") or "").lower()
     ws = dec.workspace or ""
     known = trusted(sender, cfg)
+    if digest(msg, dec, cfg):
+        return Verdict("digest", known=True)   # no read, so nothing charged to the day's budget
     if spent(sender) >= max(1, int(cfg.get("MAIL_VET_DAY_MAX") or 20)):
         return Verdict("budget", known=known)
     cost = cfg.get("MAIL_VET_COST") or "0.05"
