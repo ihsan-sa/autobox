@@ -80,10 +80,11 @@ def claude_says(verdict, blocking=(), advisory=(), usd=0.42):
 class Case(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="lander-review-test.")
-        self.env = {k: os.environ.get(k) for k in ("CC_LAND_STATE", "CC_LAND_SCRATCH", "CC_STATE", "CC_BOARDS",
-                                                     "CC_CONFIG", "CC_SLACK_DIR")}
-        for k, sub in (("CC_LAND_STATE", "land"), ("CC_LAND_SCRATCH", "tmp"), ("CC_STATE", "state"),
-                       ("CC_BOARDS", "boards"), ("CC_SLACK_DIR", "slack")):
+        self.env = {k: os.environ.get(k) for k in ("CC_LAND_STATE", "CC_LANDER_STATE", "CC_LAND_SCRATCH", "CC_STATE",
+                                                     "CC_BOARDS", "CC_CONFIG", "CC_SLACK_DIR")}
+        # CC_LANDER_STATE too: the queue log and git locks (jobs.landq) would otherwise be the box's live ones
+        for k, sub in (("CC_LAND_STATE", "land"), ("CC_LANDER_STATE", "land"), ("CC_LAND_SCRATCH", "tmp"),
+                       ("CC_STATE", "state"), ("CC_BOARDS", "boards"), ("CC_SLACK_DIR", "slack")):
             os.environ[k] = os.path.join(self.tmp, sub)
         os.environ["CC_CONFIG"] = os.path.join(self.tmp, "config")
         self.real_sh = C.sh
@@ -91,6 +92,9 @@ class Case(unittest.TestCase):
         self.real_reviewer = (C.REVIEWER_CONFIG, C.PASSWD_HOME)
         C.PASSWD_HOME = os.path.join(self.tmp, "home")
         C.REVIEWER_CONFIG = os.path.join(C.PASSWD_HOME, ".cc", "config")
+        self.claude = self.install_claude("1.0")
+        os.makedirs(os.path.join(C.PASSWD_HOME, ".local", "bin"))
+        os.symlink(self.claude, os.path.join(C.PASSWD_HOME, ".local", "bin", "claude"))
         self.reviewer(CC_LAND_REVIEWERS="claude-test")   # one reader; TestTwoReaders sets its own pair
 
     def tearDown(self):
@@ -113,6 +117,16 @@ class Case(unittest.TestCase):
         os.makedirs(os.path.dirname(C.REVIEWER_CONFIG), exist_ok=True)
         with open(C.REVIEWER_CONFIG, "w") as f:
             f.write("".join(f"{k}={v}\n" for k, v in have.items() if v is not None))
+
+    def install_claude(self, version):
+        """An executable `claude` where the native installer puts one, under the test's passwd home."""
+        d = os.path.join(C.PASSWD_HOME, ".local", "share", "claude", "versions", version)
+        os.makedirs(d)
+        path = os.path.join(d, "claude")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(path, 0o755)
+        return path
 
     def box(self, **kw):
         base = {"git merge-base": (0, BASE + "\n"), "git diff": name_only("x.py"), "git merge-tree": (0, "t" * 40),
@@ -225,6 +239,63 @@ class TestReview(Case):
         self.assertIn(f"change={j.digest}", posted)
         self.assertEqual(R.saved(j.digest).advisory, ["x.py — name it better"])
 
+    def test_the_claude_read_gets_no_variable_of_the_callers_but_the_locale(self):
+        # `ANTHROPIC_BASE_URL=http://127.0.0.1:N cc done` once pointed the real reviewer at a server that answers LAND
+        # (#849 Opus read); a HOME of the caller's moved CC_CONFIG_DENY and the ~/.claude the read loads (#847 delta)
+        chosen = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "ANTHROPIC_MODEL": "haiku",
+                  "NODE_OPTIONS": "--require /tmp/x.js", "HTTPS_PROXY": "http://127.0.0.1:9",
+                  "NODE_EXTRA_CA_CERTS": "/tmp/ca.pem", "HOME": os.path.join(self.tmp, "own-home"),
+                  "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+        old = {k: os.environ.get(k) for k in chosen}
+        os.environ.update(chosen)
+        try:
+            box = self.box(claude=claude_says("LAND"))
+            R.ask("text", "demo", 7, "d" * 64)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        env = box.called("claude")[0]["env"]
+        self.assertEqual([k for k in env if k.startswith(("ANTHROPIC_", "NODE_", "HTTPS_"))], [])
+        self.assertEqual((env["HOME"], env["CC_CONFIG_DENY"], env["PATH"]),
+                         (C.PASSWD_HOME, os.path.realpath(C.REVIEWER_CONFIG), R.READ_PATH))
+        self.assertEqual((env["LANG"], env["LC_ALL"]), ("C.UTF-8", "C.UTF-8"))   # the locale still passes
+
+    def test_the_landing_state_dir_falls_back_to_the_passwd_home_not_home(self):
+        # the read count, spend and saved reads live there; a HOME of the caller's moved them (#847 delta read)
+        old = {k: os.environ.get(k) for k in ("CC_LAND_STATE", "HOME")}
+        os.environ.pop("CC_LAND_STATE")
+        os.environ["HOME"] = os.path.join(self.tmp, "own-home")
+        try:
+            self.assertEqual(C.state("x"), os.path.join(C.PASSWD_HOME, ".cc", "state", "land", "x"))
+        finally:
+            os.environ.update({k: v for k, v in old.items() if v is not None})
+
+    def test_a_claude_swapped_for_a_file_outside_an_install_root_never_runs(self):
+        # `ln -sf /tmp/fake ~/.local/bin/claude` from a worker's shell (security read of #849)
+        fake = os.path.join(self.tmp, "fake-claude")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\necho LAND\n")
+        os.chmod(fake, 0o755)
+        link = os.path.join(C.PASSWD_HOME, ".local", "bin", "claude")
+        os.remove(link)
+        os.symlink(fake, link)
+        box = self.box(claude=claude_says("LAND"))
+        v, usd, why = R.ask("text", "demo", 7, "d" * 64)
+        self.assertEqual((v, usd, box.called("claude"), box.called("fake-claude")), (None, 0.0, [], []))
+        self.assertTrue(why.startswith("fault: ") and fake in why, why)
+        # one under the installer's versions dir runs, by its resolved path
+        os.remove(link)
+        os.symlink(self.claude, link)
+        box = self.box(claude=claude_says("LAND"))
+        self.assertEqual(R.ask("text", "demo", 7, "d" * 64)[0].verdict, T.LAND)
+        self.assertEqual(box.called("claude")[0]["argv"][0], self.claude)
+        # a path under a root that is not an executable file is refused too
+        os.chmod(self.claude, 0o644)
+        self.assertTrue(R.ask("text", "demo", 7, "d" * 64)[2].startswith("fault: "))
+
     def test_the_reviewer_is_the_passwd_homes_config_not_the_callers_env(self):
         # `CC_CLAUDE=<fake> lander tick` from a worker's script, or a HOME / CC_CONFIG of its own, chooses nothing
         own = os.path.join(self.tmp, "own")
@@ -243,7 +314,7 @@ class TestReview(Case):
             R.review(self.job(), comments=[])
             argv = box.called("claude")[0]["argv"]
             # nothing in the reviewer config: the defaults, and claude under the passwd home, not $HOME
-            self.assertEqual(argv[0], os.path.join(C.PASSWD_HOME, ".local", "bin", "claude"))
+            self.assertEqual(argv[0], self.claude)   # ~/.local/bin/claude at the passwd home, run resolved
             self.assertEqual(argv[argv.index("--model") + 1], R.READERS.split()[0])
             self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "3")
             self.assertEqual(C.conf("CC_CODEX", "codex"), "codex")
@@ -251,12 +322,12 @@ class TestReview(Case):
             self.assertEqual(C.conf("CC_DEV"), "/tmp/kept")
             # the reviewer config at the passwd home is what speaks
             with open(C.REVIEWER_CONFIG, "w") as f:
-                f.write("CC_CLAUDE=/opt/claude\nexport CC_LAND_REVIEW_MODEL='opus'\nCC_LAND_REVIEW_BUDGET=5\n")
+                f.write(f"CC_CLAUDE={self.install_claude('2.0')}\nexport CC_LAND_REVIEW_MODEL='opus'\nCC_LAND_REVIEW_BUDGET=5\n")
             box = self.box(claude=claude_says("LAND"))
             R.ask("text", "demo", 7, "d" * 64)
             argv = box.called("claude")[0]["argv"]
             self.assertEqual((argv[0], argv[argv.index("--model") + 1], argv[argv.index("--max-budget-usd") + 1]),
-                             ("/opt/claude", "opus", "5"))
+                             (os.path.join(os.path.dirname(os.path.dirname(self.claude)), "2.0", "claude"), "opus", "5"))
         finally:
             for k, v in old.items():
                 if v is None:

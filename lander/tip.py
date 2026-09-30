@@ -18,9 +18,10 @@ kept wanted and the next tick retries it.
 
 RED: the repo's deploy targets are held (deploy.hold), so nothing red is installed, and <repo>.tip-red says why. Then
 each failing check alone is bisected over the first-parent commits since the last green tip. A breaker is PROVEN
-when it fails that check twice and its parent passed it; then, and only then, it is reverted: a throwaway worktree
-at the tip, `git revert`, a push to the base branch, a comment on its PR, a card to its thread and the repo's seat
-told. Anything short of proof (an unrunnable step, a flaky second run) reverts nothing and says the tip is red.
+when it fails that check twice and its parent passed it; then, and only then, it is reverted: the revert commit is
+made on the tip in a borrowed repo (no hook, merge driver or config of the checkout's runs) and pushed to the base
+branch, then a comment on its PR, a card to its thread and the repo's seat told. Anything short of proof (an
+unrunnable step, a flaky second run) reverts nothing and says the tip is red.
 A revert moves the tip, so the run kicks itself; the next tick checks the reverted tip. A kick for a tip already
 found red (<repo>.tip-red names it) runs nothing again: it answers "red" until the tip moves.
 """
@@ -30,8 +31,6 @@ import contextlib
 import fcntl
 import os
 import re
-import shutil
-import tempfile
 
 from lander import cards as C
 from lander import deploy as D
@@ -84,8 +83,8 @@ def green(repo, sha):
     return bool(sha) and (C.read_json(green_path(repo), {}) or {}).get("sha") == sha
 
 
-def git(root, *args, timeout=300):
-    rc, out = C.sh(["git", *args], cwd=root, timeout=timeout)
+def git(root, *args, timeout=300, env=None):
+    rc, out = C.sh(["git", *args], cwd=root, timeout=timeout, env=env)
     return rc, out.strip()
 
 
@@ -205,48 +204,26 @@ def bisect(commits, name, check):
 
 
 def revert(repo, root, base, sha, why):
-    """Revert a proven breaker on the base branch. -> the revert's sha, or "" (and it says why)."""
-    rc, subject = git(root, "log", "-1", "--format=%s", sha)
-    m = PR_RE.search(subject)
-    pr = int(m.group(1)) if m else 0
+    """Revert a proven breaker on the base branch. -> the revert's sha, or "" (and it says why).
+
+    Nothing of the checkout's own runs: a worker can write its shared .git, so a merge driver there would decide what
+    the revert commit holds and a hook would run as the lander. The revert is made in a borrowed() repo, which reads
+    only the checkout's objects: the tree is `merge-tree --write-tree --merge-base=<sha> <tip> <sha>^` (what `git
+    revert` merges), the commit git's own revert message on the tip, and the push goes from there to the lander's own
+    URL. A merge commit is refused, as `git revert` without -m refuses it."""
     done = C.state("tip", f"{repo}.reverted")
     seen = C.read_json(done, []) or []
     if sha in seen:
         return ""
     tip = origin_tip(root, base)
-    made, said = "", ""
-    rc, _ = git(root, "merge-base", "--is-ancestor", sha, tip) if tip else (1, "")
-    if not tip:
-        said = f"origin/{base} could not be read"
-    elif rc:
-        said = f"{sha[:12]} is not on origin/{base}"
-    else:
-        top = os.path.realpath(os.path.expanduser(C.conf("CC_LAND_SCRATCH", "~/.cc/tmp")))
-        os.makedirs(top, exist_ok=True)
-        tag = re.sub(r"[^A-Za-z0-9_-]+", "-", repo) or "repo"
-        tmp = tempfile.mkdtemp(prefix=f"cc-land.revert.{tag}.{pr or 'base'}.", dir=top)
-        tree = os.path.join(tmp, "head")
-        try:
-            with D.git_lock(root):
-                rc, out = git(root, "worktree", "add", "-q", "--detach", tree, tip)
-            if rc:
-                said = f"no worktree: {D.last(out)}"
-            else:
-                rc, out = git(tree, "revert", "--no-edit", sha)
-                if rc:
-                    said = f"git revert: {D.last(out)}"
-                else:
-                    url = G.remote_url(root)
-                    rc, out = (git(tree, "push", "-q", url, f"HEAD:refs/heads/{base}") if url
-                               else (1, "the lander holds no remote URL for this checkout"))
-                    if rc:
-                        said = f"git push: {D.last(out)}"
-                    else:
-                        made = git(tree, "rev-parse", "HEAD")[1]
-        finally:
-            with D.git_lock(root):
-                git(root, "worktree", "remove", "--force", tree)
-            shutil.rmtree(tmp, ignore_errors=True)
+    made, subject = "", ""
+    try:
+        with G.borrowed(root) as gd:
+            made, said, subject = _revert(root, base, sha, tip, gd)
+    except G.GitError as x:
+        said = f"no scratch repo: {D.last(x)}"
+    m = PR_RE.search(subject)
+    pr = int(m.group(1)) if m else 0
     what = f"PR #{pr}" if pr else f"commit {sha[:12]}"
     if made:
         text = (f"[{repo}] {what}: REVERTED ❌ — the tip check on {base} went red and the bisect proves this change "
@@ -267,3 +244,48 @@ def revert(repo, root, base, sha, why):
                     f"[{repo}] PR #{pr} stopped", "--id", pid, text], repo, pr)
     C.sh([os.path.join(C.BIN, "cc-slack"), "inject", repo, text[:400]], timeout=120)
     return made
+
+
+def _revert(root, base, sha, tip, gd):
+    """revert()'s git, all in the borrowed repo `gd`. -> (the pushed revert's sha or "", why not, sha's subject)."""
+    env = G.hookless_env(GIT_DIR=gd)
+    rc, subject = git(root, "log", "-1", "--format=%s", sha, env=env)
+    subject = subject if rc == 0 else ""
+    if not tip:
+        return "", f"origin/{base} could not be read", subject
+    if git(root, "merge-base", "--is-ancestor", sha, tip, env=env)[0]:
+        return "", f"{sha[:12]} is not on origin/{base}", subject
+    rc, parents = git(root, "rev-list", "--parents", "-n", "1", sha, env=env)
+    parents = parents.split()[1:] if rc == 0 else []
+    if len(parents) != 1:
+        return "", f"{sha[:12]} has {len(parents)} parents; only a one-parent commit is reverted", subject
+    rc, out = git(root, "merge-tree", "--write-tree", "--no-messages", f"--merge-base={sha}", tip, parents[0],
+                  env=env)
+    tree = out.splitlines()[0].strip() if out else ""
+    if rc or not G.SHA_RE.fullmatch(tree):
+        return "", f"git revert: {'it conflicts with ' + base if rc == 1 else D.last(out)}", subject
+    name, email = identity()
+    who = {f"GIT_{role}_{k}": v for role in ("AUTHOR", "COMMITTER") for k, v in (("NAME", name), ("EMAIL", email))}
+    rc, new = git(root, "commit-tree", tree, "-p", tip, "-m", f'Revert "{subject}"\n\nThis reverts commit {sha}.',
+                  env=dict(env, **who))
+    if rc or not G.SHA_RE.fullmatch(new):
+        return "", f"git commit-tree: {D.last(new)}", subject
+    url = G.remote_url(root)
+    if not url:
+        return "", "git push: the lander holds no remote URL for this checkout", subject
+    rc, out = C.sh(["git", "push", "-q", url, f"{new}:refs/heads/{base}"], cwd=gd, env=G.remote_env(gd),
+                   timeout=300)
+    if rc:
+        return "", f"git push: {D.last(out)}", subject
+    return new, "", subject
+
+
+def identity():
+    """The lander's own user.name and user.email from the passwd home's global config (never the checkout's, nor a
+    caller's HOME or XDG_CONFIG_HOME: cards.kept_env), or lander's own."""
+    got = []
+    env = C.kept_env(os.environ)
+    for key, dflt in (("user.name", "lander"), ("user.email", "lander@localhost")):
+        rc, out = C.sh(["git", "config", "--global", "--get", key], cwd=C.PASSWD_HOME, env=env, timeout=30)
+        got.append(out.strip() if rc == 0 and out.strip() and "\n" not in out.strip() else dflt)
+    return tuple(got)

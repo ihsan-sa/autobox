@@ -62,7 +62,10 @@ class Box(Case):
             rc, out = C.sh(["git", "ls-remote", url, f"refs/heads/{branch}"], cwd=root)
             rows = [r.split("\t")[0] for r in out.splitlines() if r.endswith(f"\trefs/heads/{branch}")] if rc == 0 else []
             return rows[0] if rows else ""
-        for name, fn in (("fetch", fetch), ("ls_remote", ls_remote)):
+        # a borrowed repo needs the checkout's real objects; the fake box answers the git run there instead
+        def borrowed(root):
+            return contextlib.nullcontext(os.path.join(self.tmp, "borrowed.git"))
+        for name, fn in (("fetch", fetch), ("ls_remote", ls_remote), ("borrowed", borrowed)):
             p = mock.patch.object(G, name, fn)
             p.start()
             self.addCleanup(p.stop)
@@ -85,12 +88,16 @@ class Box(Case):
             sub = argv[1:]
             if sub[:2] == ["rev-parse", "--abbrev-ref"]:
                 return 0, branch + "\n"
+            if sub[-1:] == ["--git-dir"]:
+                return 0, os.path.join(self.root, ".git") + "\n"
             if sub[:2] == ["rev-parse", "HEAD"]:
                 return 0, OLD + "\n"
             if sub[:2] == ["rev-parse", "refs/remotes/origin/main"]:
                 return 0, NEW + "\n"
             if sub[:1] == ["ls-remote"]:
                 return 0, NEW + "\trefs/heads/main\n"
+            if sub[:2] == ["merge-base", "--is-ancestor"]:   # OLD comes before NEW, not after it
+                return (1, "") if sub[2:4] == [NEW, OLD] else (0, "")
             if sub[:1] == ["diff"]:
                 return 0, nul(argv, changes + "\n")
             if sub[:1] == ["log"]:
@@ -109,7 +116,8 @@ class Box(Case):
                 pids[u] = pids.get(u, 100) + (0 if u.startswith("stuck") else 1)
             return 0, ""
 
-        answers = {"git " + k: git for k in ("rev-parse", "diff", "log", "fetch", "merge", "ls-remote", "merge-base")}
+        answers = {"git " + k: git for k in ("rev-parse", "diff", "log", "fetch", "merge", "ls-remote", "merge-base",
+                                             "update-index", "read-tree", "update-ref")}
         answers.update({"systemctl": systemctl, "install.sh": (0, "linked\n"), "cc-units restart-for": (0, ""),
                         "cc-units daemons-for": (0, ""), "cc-units policy": (0, "box\n"),
                         "cc-scope list": (0, "[]"), "cc-slack post": (0, ""), "cc-slack inject": (0, ""),
@@ -125,14 +133,16 @@ class TestDeploy(Box):
         D.request("demo", NEW)
         req = D.run("demo", green=lambda r, s: False)
         self.assertEqual(req["targets"]["demo"]["state"], "requested")
-        self.assertEqual(box.called("git merge"), [])
+        self.assertEqual(box.called("git read-tree"), [])
 
     def test_green_deploys_ff_only_installs_and_records_applied(self):
         box = self.fake()
         D.request("demo", NEW)
         req = D.run("demo", green=lambda r, s: s == NEW)
         self.assertEqual(req["targets"]["demo"]["state"], "verified")
-        self.assertEqual(box.called("git merge")[0]["argv"][1:], ["merge", "--ff-only", "-q", NEW])
+        self.assertEqual(box.called("git read-tree")[0]["argv"][1:], ["read-tree", "-m", "-u", OLD, NEW])
+        self.assertEqual(box.called("git update-ref")[0]["argv"][-3:], ["refs/heads/main", NEW, OLD])
+        self.assertEqual(box.called("git merge"), [])        # no merge in the checkout: its hooks would run
         self.assertEqual(len(box.called("install.sh")), 1)
         self.assertIn(["systemctl", "--user", "daemon-reload"], [c["argv"] for c in box.calls])
         self.assertEqual(D.applied("demo"), NEW)
@@ -144,7 +154,7 @@ class TestDeploy(Box):
         st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
         self.assertEqual(st["state"], "failed")
         self.assertIn("branch", st["why"])
-        self.assertEqual(box.called("git merge"), [])
+        self.assertEqual(box.called("git read-tree"), [])
         # the owner heard "merged", so a failed deploy is said on #<repo> (--major), once per target and sha
         D.run("demo", green=lambda r, s: True)
         said = box.called("cc-slack post")
@@ -181,14 +191,14 @@ class TestDeploy(Box):
 
         def moved(argv):   # the checkout keeps its fast-forward; a diff from its HEAD is empty
             sub = argv[1:]
-            if sub[:1] == ["merge"]:
+            if sub[:1] == ["update-ref"]:
                 at["head"] = NEW
             if sub[:2] == ["rev-parse", "HEAD"]:
                 return 0, at["head"] + "\n"
             if sub[:1] == ["diff"]:
                 return (0, nul(argv, "M\tbin/daemon\n")) if sub[-2] == OLD else (0, "")
             return git(argv)
-        box.answers.update({"git " + k: moved for k in ("rev-parse", "diff", "merge")})
+        box.answers.update({"git " + k: moved for k in ("rev-parse", "diff", "update-ref")})
         D.request("demo", NEW)
         self.assertEqual(D.run("demo", green=lambda r, s: True)["targets"]["demo"]["state"], "failed")
         self.assertEqual(at["head"], NEW)
@@ -196,6 +206,25 @@ class TestDeploy(Box):
         st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
         self.assertEqual(st["state"], "verified")
         self.assertIn("demo-daemon.service (pid 100 -> 101)", st["why"])
+
+    def test_a_checkout_already_past_the_sha_deploys_and_moves_nothing(self):
+        # `merge --ff-only <sha>` on a checkout already ahead of it was a no-op that succeeded; fast_forward must be too
+        ahead = "e" * 40
+        box = self.fake()
+        git = box.answers["git rev-parse"]
+
+        def past(argv):
+            sub = argv[1:]
+            if sub[:2] == ["rev-parse", "HEAD"]:
+                return 0, ahead + "\n"
+            if sub[:2] == ["merge-base", "--is-ancestor"]:
+                return (0, "") if sub[2:4] == [NEW, ahead] else (1, "")
+            return git(argv)
+        box.answers.update({"git " + k: past for k in ("rev-parse", "merge-base")})
+        D.request("demo", NEW)
+        st = D.run("demo", green=lambda r, s: s == NEW)["targets"]["demo"]
+        self.assertEqual(st["state"], "verified", st.get("why"))
+        self.assertEqual(box.called("git read-tree") + box.called("git update-ref"), [])
 
     def test_a_new_request_keeps_the_base_a_failed_restart_still_owes(self):
         self.unit("demo-daemon.service")
@@ -304,7 +333,7 @@ class TestDeploy(Box):
         box = self.fake()
         D.request("h--t", NEW)
         self.assertIsNone(D.run("h--t", green=lambda r, s: True))
-        self.assertEqual(box.called("git merge"), [])
+        self.assertEqual(box.called("git read-tree"), [])
 
 
 class Tip(Box):
@@ -315,25 +344,42 @@ class Tip(Box):
                 return 0, tip + "\n"
             if sub[:1] == ["ls-remote"]:
                 return 0, tip + "\trefs/heads/main\n"
+            if sub[:2] == ["rev-list", "--parents"]:
+                return 0, f"{sub[-1]} {'0' * 40}\n"
             if sub[:1] == ["rev-list"]:
                 return 0, "\n".join(commits) + "\n"
+            if sub[:1] == ["merge-tree"]:
+                return 0, "e" * 40 + "\n"
+            if sub[:1] == ["commit-tree"]:
+                return 0, "d" * 40 + "\n"
             if sub[:1] == ["diff"]:
                 return 0, nul(argv, "x.py\n")
             if sub[:1] == ["log"]:
                 return 0, "the change (#7)\n"
             if sub[:1] == ["rev-parse"] and sub[1:2] == ["HEAD"]:
                 return 0, "f" * 40 + "\n"
+            if sub[-1:] == ["--git-dir"]:
+                return 0, os.path.join(self.root, ".git") + "\n"
             if sub[:1] == ["rev-parse"]:
                 return 0, "main\n"
             return 0, ""
         box = self.fake()
         box.answers.update({"git " + k: git for k in ("rev-parse", "rev-list", "diff", "log", "fetch", "merge",
-                                                      "worktree", "revert", "push", "merge-base", "ls-remote")})
+                                                      "merge-tree", "commit-tree", "push", "merge-base", "ls-remote")})
         box.answers["gh pr comment"] = (0, "")
         return box
 
     def result(self, status):
         return T.Result(check="c", tree="t", status=status)
+
+    def test_the_revert_author_is_not_the_callers(self):
+        # XDG_CONFIG_HOME/git/config is read by `git config --global`: a worker's would name the revert's author
+        xdg = os.path.join(self.tmp, "xdg")
+        os.makedirs(os.path.join(xdg, "git"))
+        with open(os.path.join(xdg, "git", "config"), "w") as f:
+            f.write("[user]\n\tname = evil\n\temail = evil@example.com\n")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg, "GIT_CONFIG_GLOBAL": os.path.join(xdg, "git", "config")}):
+            self.assertEqual(TP.identity(), ("lander", "lander@localhost"))
 
     def test_kick_is_idempotent_and_merges_coalesce(self):
         TP.kick("demo")
@@ -383,8 +429,10 @@ class Tip(Box):
         self.assertEqual(out, "red")
         self.assertIn("unit failed", D.held("demo")["why"])
         self.assertTrue(all(n == "unit" for n, s in asked[2:]), "only the failing check is bisected")
-        self.assertEqual(box.called("git revert")[0]["argv"][-1], "3" * 40)
-        self.assertIn("HEAD:refs/heads/main", box.called("git push")[0]["argv"])
+        self.assertIn(f"--merge-base={'3' * 40}", box.called("git merge-tree")[0]["argv"])
+        self.assertEqual(box.called("git push")[0]["argv"][-1], f"{'d' * 40}:refs/heads/main")
+        self.assertEqual(box.called("git push")[0]["cwd"], os.path.join(self.tmp, "borrowed.git"))
+        self.assertEqual([c for c in box.calls if c["argv"][1:2] in (["worktree"], ["revert"])], [])
         self.assertTrue(os.path.exists(TP.want_path("demo")), "a revert kicks the next tip run")
         self.assertIn("REVERTED", box.called("gh pr comment")[0]["argv"][-1])
 
@@ -399,7 +447,7 @@ class Tip(Box):
             seen.append(sha)
             return self.result(T.FAILED if len(seen) == 1 else T.PASSED)
         self.assertEqual(TP.run("demo", plan=lambda *a: T.Plan(checks=["unit"]), check=check), "red")
-        self.assertEqual(box.called("git revert"), [])
+        self.assertEqual(box.called("git push"), [])
         self.assertTrue(D.held("demo"))
 
     def test_catchup_kicks_when_origin_moved_and_not_when_it_is_red_there(self):

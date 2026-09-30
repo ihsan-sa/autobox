@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -57,6 +58,11 @@ class Stubbed(unittest.TestCase):
                           CC_LAND_STATE=os.path.join(self.tmp, "land"), CC_BOARDS=os.path.join(self.tmp, "boards"),
                           CC_SLACK_DIR=os.path.join(self.tmp, "slack"), CC_CONFIG=os.path.join(self.tmp, "config"),
                           CC_LANDER_STATE=os.path.join(self.tmp, "land"), CC_ROLE="track")
+        # nothing reads the box's own ~/.cc/state/land or config: every state root falls back to the passwd home
+        for name, val in (("PASSWD_HOME", self.home), ("REVIEWER_CONFIG", os.path.join(self.home, ".cc", "config"))):
+            p = mock.patch.object(C, name, val)
+            p.start()
+            self.addCleanup(p.stop)
         self.answer({})
 
     def tearDown(self):

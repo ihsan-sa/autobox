@@ -26,6 +26,7 @@ CORE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__
 if CORE not in sys.path:
     sys.path.insert(0, CORE)
 
+from lander import cards as C  # noqa: E402
 from lander import events as E  # noqa: E402
 from lander import gh as GH  # noqa: E402
 from lander import git as G  # noqa: E402
@@ -278,7 +279,8 @@ class Fixture(unittest.TestCase):
         self.origin = os.path.join(self.tmp, "origin.git")
         self.work = os.path.join(self.tmp, "work")
         self.box_path = os.path.join(self.tmp, "box.json")
-        env = {"HOME": self.home, "CC_LANDER_STATE": f"{self.home}/.cc/state/land", "CC_BIN": self.bindir,
+        env = {"HOME": self.home, "CC_LANDER_STATE": f"{self.home}/.cc/state/land",
+               "CC_LAND_STATE": f"{self.home}/.cc/state/land", "CC_BIN": self.bindir,
                "CC_DEV": f"{self.home}/dev", "CC_BOARDS": f"{self.home}/.cc/boards",
                "CC_MEMBERS": f"{self.home}/.cc/members", "PATH": self.bindir + os.pathsep + os.environ["PATH"],
                "FAKE_BOX": self.box_path, **GIT_ENV, "LANDER_TMUX": f"{self.bindir}/tmux",
@@ -288,6 +290,11 @@ class Fixture(unittest.TestCase):
         self.addCleanup(p.stop)
         for k in ("GH_TOKEN", "CC_SLACK_ALIAS"):
             os.environ.pop(k, None)
+        # nothing reads the box's own ~/.cc/state/land or config: every state root falls back to the passwd home
+        for name, val in (("PASSWD_HOME", self.home), ("REVIEWER_CONFIG", os.path.join(self.home, ".cc", "config"))):
+            p = mock.patch.object(C, name, val)
+            p.start()
+            self.addCleanup(p.stop)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         os.makedirs(os.environ["CC_BOARDS"])
         tpl = SHARED["tpl"]
@@ -1460,13 +1467,69 @@ class Branches(Fixture):
         chosen = {"CC_CLAUDE": "/tmp/fake-claude", "CC_CODEX": "/tmp/fake-codex", "CC_CONFIG": "/tmp/own-config",
                   "CC_LAND_REVIEW_MODEL": "haiku", "CC_LAND_REVIEW_BUDGET": "0.01", "CC_LAND_REVIEW_EFFORT": "low",
                   "CC_LAND_REVIEWERS": "none", "CODEX_HOME": "/tmp/own-codex", "CC_LAND_STATE": "/tmp/own-state"}
-        with mock.patch.dict(os.environ, dict(chosen, CC_CLAUDE_HOME="/tmp/kept", CC_STATE="/tmp/kept-state")), \
+        with mock.patch.dict(os.environ, dict(chosen, LANG="C.UTF-8", LC_ALL="C.UTF-8")), \
                 mock.patch.object(L.subprocess, "Popen", fake):
             self.assertEqual(REAL_SPAWN_TICK("demo"), (True, "pid 9"))
         env = started[0][1]["env"]
         self.assertEqual([k for k in chosen if k in env], [])
-        self.assertEqual((env.get("CC_CLAUDE_HOME"), env.get("CC_STATE")), ("/tmp/kept", "/tmp/kept-state"))
+        self.assertEqual((env.get("LANG"), env.get("LC_ALL")), ("C.UTF-8", "C.UTF-8"))
         self.assertEqual(env.get("PYTHONDONTWRITEBYTECODE"), "1")
+
+    def test_spawn_tick_gives_the_tick_the_passwd_home_and_none_of_the_queuers_roots(self):
+        # `ANTHROPIC_BASE_URL=… cc done` pointed the reviewer at a fake server (#849 Opus read); a HOME or state root of
+        # the queuer's moved the job queue, the read count and the brief (#847 delta reads); a PATH of its own picked
+        # git, gh and claude (security read of #849); GIT_CONFIG_PARAMETERS named hooks for every git the tick ran
+        started = []
+        fake = mock.Mock(side_effect=lambda argv, **kw: started.append((argv, kw)) or mock.Mock(pid=9))
+        chosen = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "ANTHROPIC_AUTH_TOKEN": "x", "HOME": "/tmp/own-home",
+                  "PATH": "/tmp/own-bin:/usr/bin", "CC_LANDER_STATE": "/tmp/q", "LANDER_STATE": "/tmp/q",
+                  "CC_STATE": "/tmp/s", "CC_DEV": "/tmp/d", "CC_BOARDS": "/tmp/b", "CC_MEMBERS": "/tmp/m",
+                  "CC_BIN": "/tmp/bin", "CC_LAND_SCRATCH": "/tmp/t", "GH_CONFIG_DIR": "/tmp/gh",
+                  "GIT_CONFIG_PARAMETERS": "'core.hookspath'='/tmp/h'", "HTTPS_PROXY": "http://127.0.0.1:9",
+                  "https_proxy": "http://127.0.0.1:9", "SSL_CERT_FILE": "/tmp/ca", "NODE_OPTIONS": "--require /tmp/x",
+                  "LD_PRELOAD": "/tmp/x.so", "PYTHONPATH": "/tmp/py"}
+        with mock.patch.dict(os.environ, chosen), mock.patch.object(L.subprocess, "Popen", fake), \
+                mock.patch("lander.cards.PASSWD_HOME", "/home/owner"):
+            self.assertEqual(REAL_SPAWN_TICK("demo"), (True, "pid 9"))
+        env = started[0][1]["env"]
+        self.assertEqual([k for k in chosen if k in env and k not in ("HOME", "PATH")], [])
+        self.assertEqual((env["HOME"], env["PATH"]),
+                         ("/home/owner", "/usr/local/bin:/usr/bin:/bin:/home/owner/bin:/home/owner/.local/bin"))
+        self.assertEqual(env.get("PYTHONDONTWRITEBYTECODE"), "1")
+
+    def test_tick_env_is_an_allow_list(self):
+        # a filter misses what nobody listed (#862 review reads): XDG_CONFIG_HOME names a git config whose
+        # url.insteadOf redirects the fetch and a gh config whose http_unix_socket redirects every gh call, GH_REPO
+        # points pr_facts at a decoy PR, and BASH_ENV / ENV run a file of the worker's in every script the tick calls
+        hostile = {"XDG_CONFIG_HOME": "/tmp/own-xdg", "GH_REPO": "evil/decoy", "BASH_ENV": "/tmp/x.sh",
+                   "ENV": "/tmp/x.sh", "XDG_RUNTIME_DIR": "/tmp/own-run", "LANDER_SYSTEMD_RUN": "/tmp/fake",
+                   "SOMETHING_NEW": "1"}
+        with mock.patch("lander.cards.PASSWD_HOME", "/home/owner"):
+            env = L.tick_env(dict(hostile, LANG="C.UTF-8", LC_CTYPE="C.UTF-8", USER="owner", HOME="/tmp/h"))
+        self.assertEqual([k for k in hostile if k in env and k != "XDG_RUNTIME_DIR"], [])
+        self.assertNotEqual(env.get("XDG_RUNTIME_DIR"), "/tmp/own-run")
+        self.assertEqual((env["LANG"], env["LC_CTYPE"], env["USER"], env["HOME"]),
+                         ("C.UTF-8", "C.UTF-8", "owner", "/home/owner"))
+
+    def test_tick_path_puts_the_system_dirs_first(self):
+        # a gh, git or claude a worker drops in ~/bin or ~/.local/bin must not shadow the system's (#862 review reads)
+        with mock.patch("lander.cards.PASSWD_HOME", "/home/owner"):
+            dirs = L.tick_path().split(":")
+        self.assertEqual(dirs[:3], ["/usr/local/bin", "/usr/bin", "/bin"])
+        self.assertEqual(sorted(dirs[3:]), ["/home/owner/.local/bin", "/home/owner/bin"])
+
+    def test_pr_facts_names_the_repo(self):
+        # a GH_REPO of the caller's would point gh pr view at a decoy PR: -R names the lander's own slug
+        seen = []
+        ran = mock.Mock(side_effect=lambda argv, **kw: seen.append(argv) or mock.Mock(returncode=0, stdout="{}",
+                                                                                     stderr=""))
+        with mock.patch.object(GH, "slug", lambda root: "o/demo"), mock.patch.object(GH.subprocess, "run", ran):
+            GH.pr_facts(self.root, 5, "state")
+            GH.pr_files(self.root, 5)
+        self.assertEqual([a[a.index("-R") + 1] if "-R" in a else "" for a in seen], ["o/demo", "o/demo"])
+        with mock.patch.object(GH, "slug", lambda root: ""), mock.patch.object(GH.subprocess, "run", ran):
+            GH.pr_facts(self.root, 5, "state")
+        self.assertNotIn("-R", seen[-1])
 
     def test_usage_refusals(self):
         with contextlib.redirect_stderr(io.StringIO()):

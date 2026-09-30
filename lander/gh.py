@@ -3,7 +3,7 @@
     gh(argv, root, token=None, timeout=120)  -> (rc, stdout, stderr). A member landing passes its workspace token:
         it goes in GH_TOKEN (GH_CONFIG_DIR at an empty dir, so the box's own login is never used) and is printed
         nowhere.
-    pr_facts(root, pr, fields) -> (dict, "") | (None, why)     one `gh pr view --json <fields>`
+    pr_facts(root, pr, fields) -> (dict, "") | (None, why)     one `gh pr view --json <fields> [-R <slug>]`
     pr_files(root, pr) -> [paths] | None · slug(root) -> "owner/name" | ""
     merge_state(root, pr) -> (state, merge_oid): GitHub's "MERGED"/"OPEN"/"CLOSED" and the squash commit's oid, or
         ("", "") when gh would not answer — which is never read as "not merged".
@@ -82,7 +82,8 @@ def last(text, n=200) -> str:
 
 
 def pr_facts(root, pr, fields, token=None, timeout=120):
-    rc, out, err = gh(["pr", "view", str(pr), "--json", fields], root, token, timeout)
+    s = slug(root)   # named, so a GH_REPO of the caller's cannot point the read at another repository's PR
+    rc, out, err = gh(["pr", "view", str(pr), "--json", fields] + (["-R", s] if s else []), root, token, timeout)
     if rc:
         return None, last(err or out) or f"gh exit {rc}"
     try:

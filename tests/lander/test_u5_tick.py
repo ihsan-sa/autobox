@@ -59,6 +59,11 @@ class Tick(unittest.TestCase):
         self.addCleanup(p.stop)
         for k in ("GH_TOKEN", "CC_SLACK_ALIAS", "CC_ROLE"):
             os.environ.pop(k, None)
+        # nothing reads the box's own ~/.cc/state/land or config: every state root falls back to the passwd home
+        for name, val in (("PASSWD_HOME", self.tmp), ("REVIEWER_CONFIG", os.path.join(self.tmp, ".cc", "config"))):
+            p = mock.patch.object(C, name, val)
+            p.start()
+            self.addCleanup(p.stop)
         p = mock.patch.object(G, "ALLOW_LOCAL", True)   # the pinned URL is this bare repo, not GitHub
         p.start()
         self.addCleanup(p.stop)
@@ -317,6 +322,116 @@ class Tick(unittest.TestCase):
             self.assertIsNone(J.load("demo", 8))
         t.join(10)
         self.assertEqual(out, ["demo#8 queued"])
+
+
+    # --- a worker can write the checkout's shared .git: nothing it plants there runs as the lander ---
+    def plant(self):
+        """Hooks, a merge driver and a smudge filter in the checkout, each leaving its name in `ran` if it runs."""
+        ran = os.path.join(self.tmp, "ran")
+        gd = os.path.join(self.root, ".git")
+        for hook in ("post-checkout", "post-merge", "pre-push", "reference-transaction", "post-commit",
+                     "pre-commit", "prepare-commit-msg", "commit-msg"):
+            path = os.path.join(gd, "hooks", hook)
+            with open(path, "w") as f:
+                f.write(f'#!/bin/sh\necho {hook} >> "{ran}"\ncat >/dev/null\nexit 0\n')
+            os.chmod(path, 0o755)
+        self.git(self.root, "config", "merge.evil.driver", f'sh -c \'echo driver >> "{ran}"; echo pwned > "$0"\' %A')
+        self.git(self.root, "config", "filter.x.smudge", f'sh -c \'echo smudge >> "{ran}"; echo pwned\'')
+        with open(os.path.join(gd, "info", "attributes"), "w") as f:
+            f.write("* merge=evil filter=x\n")
+        with open(os.path.join(self.root, ".gitattributes"), "w") as f:
+            f.write("* merge=evil filter=x\n")
+        return ran
+
+    def ran(self, path):
+        try:
+            with open(path) as f:
+                return f.read().split()
+        except OSError:
+            return []
+
+    def test_a_revert_runs_no_hook_or_merge_driver_of_the_checkouts(self):
+        lines = [f"{i}\n" for i in range(1, 9)]
+        self.put({"app/x": "".join(lines)}, "eight lines")
+        bad = self.put({"app/x": "".join(["one\n"] + lines[1:])}, "breaks line one (#7)")
+        tip = self.put({"app/x": "".join(["one\n"] + lines[1:7] + ["eight\n"])}, "touches line eight")
+        ran = self.plant()
+        made = TP.revert("demo", self.root, "main", bad, "smoke failed")
+        self.assertEqual(self.ran(ran), [])                                       # no hook, no driver
+        self.assertTrue(made)
+        self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "rev-parse", "main"), made)
+        self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "rev-parse", f"{made}^"), tip)
+        self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "show", f"{made}:app/x"),
+                         "".join(lines[:7] + ["eight\n"]).strip())               # the change undone, the rest kept
+        self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "log", "-1", "--format=%B", made),
+                         f'Revert "breaks line one (#7)"\n\nThis reverts commit {bad}.')
+        self.assertEqual(self.git(self.root, "worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertIn(bad, C.read_json(C.state("tip", "demo.reverted")))
+
+    def test_a_revert_that_conflicts_pushes_nothing(self):
+        self.put({"app/x": "a\n"}, "one line")
+        bad = self.put({"app/x": "2\n"}, "breaks it (#7)")
+        tip = self.put({"app/x": "3\n"}, "rewrites the same line")
+        self.assertEqual(TP.revert("demo", self.root, "main", bad, "smoke failed"), "")
+        self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "rev-parse", "main"), tip)
+        self.assertTrue(self.said("the revert did not happen"))
+
+    def test_a_merge_commit_is_not_reverted(self):
+        self.git(self.work, "checkout", "-q", "-b", "side")
+        with open(os.path.join(self.work, "app", "y"), "w") as f:
+            f.write("y\n")
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-qm", "side")
+        self.git(self.work, "checkout", "-q", "main")
+        self.put({"app/z": "z\n"}, "main side")
+        self.git(self.work, "merge", "-q", "--no-edit", "side")
+        self.git(self.work, "push", "-q", "origin", "HEAD:main")
+        merge = self.git(self.work, "rev-parse", "HEAD")
+        self.assertEqual(TP.revert("demo", self.root, "main", merge, "smoke failed"), "")
+        self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "rev-parse", "main"), merge)
+        self.assertTrue(self.said("the revert did not happen"))
+
+    def test_a_pull_runs_no_hook_or_filter_of_the_checkouts(self):
+        self.put({"app/y": "y\n"}, "adds y")
+        sha = self.put({"app/x": "2\n"}, "a change", rm=["app/y"])
+        before = self.git(self.root, "rev-parse", "HEAD")
+        with open(os.path.join(self.root, "app", "untracked"), "w") as f:
+            f.write("mine\n")
+        ran = self.plant()
+        changes = D.pull(self.root, "main", sha)
+        self.assertEqual(self.ran(ran), [])                                       # no hook, no smudge
+        self.assertEqual(sorted(changes), [("M", "app/x")])
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), sha)
+        self.assertEqual(self.git(self.root, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+        with open(os.path.join(self.root, "app", "x")) as f:
+            self.assertEqual(f.read(), "2\n")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "app", "y")))
+        with open(os.path.join(self.root, "app", "untracked")) as f:
+            self.assertEqual(f.read(), "mine\n")
+        self.assertEqual(self.git(self.root, "reflog", "-1", "--format=%H", "main"), sha)
+        self.assertNotEqual(before, sha)
+        self.assertEqual(self.git(self.root, "status", "--porcelain", "--untracked-files=no"), "")   # the index too
+
+    def test_a_pull_that_is_not_a_fast_forward_moves_nothing(self):
+        self.git(self.root, "commit", "-q", "--allow-empty", "-m", "local only")
+        here = self.git(self.root, "rev-parse", "HEAD")
+        sha = self.put({"app/x": "2\n"}, "a change")
+        with self.assertRaises(D.Failed) as got:
+            D.pull(self.root, "main", sha)
+        self.assertEqual(got.exception.step, "pull")
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), here)
+        with open(os.path.join(self.root, "app", "x")) as f:
+            self.assertEqual(f.read(), "1\n")
+
+    def test_a_pull_over_a_changed_file_moves_nothing(self):
+        sha = self.put({"app/x": "2\n"}, "a change")
+        with open(os.path.join(self.root, "app", "x"), "w") as f:
+            f.write("edited\n")
+        with self.assertRaises(D.Failed):
+            D.pull(self.root, "main", sha)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), self.first)
+        with open(os.path.join(self.root, "app", "x")) as f:
+            self.assertEqual(f.read(), "edited\n")
 
 
 if __name__ == "__main__":

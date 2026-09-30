@@ -33,8 +33,9 @@ read: LAND with model "" and extra read=none. Otherwise the lander buys one:
     together"), at CC_LAND_REVIEW_EFFORT (default high; one of EFFORTS, checked before any read). A `claude-*`
     model or a claude alias (CLAUDE_ALIASES) is one `claude -p` call, no tools; any other is one `codex exec`
     call with every tool feature on CODEX_OFF disabled and the user config ignored, and before it `codex features
-    list` must show nothing on outside CODEX_ON_OK. Every read runs on READ_PATH, and codex is codex_bin() with
-    CODEX_HOME and HOME at the passwd home, so the caller's PATH, HOME or CODEX_HOME picks nothing. Both get the prompt
+    list` must show nothing on outside CODEX_ON_OK. Every read runs on READ_PATH with HOME at the passwd home and no
+    variable of the caller's but READ_ENV_KEEP (clean_env), claude is claude_bin() and codex is codex_bin() with
+    CODEX_HOME at the passwd home, so the caller's PATH, HOME, ANTHROPIC_* or CODEX_HOME picks nothing. Both get the prompt
     core/config/lander/review.md from THIS release (not the PR's
     head) with the diff, the merged text of the changed files, the brief's done-criteria and docs/REVIEW.md
     read from the BASE commit, each between `<<<name` / `name>>>` markers (a marker inside the data is broken
@@ -313,11 +314,18 @@ BIN = C.BIN
 READ_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 
+# THE READ'S ENVIRONMENT IS BUILT, NOT FILTERED (#849 Opus read, #847 delta reads). Every other variable of the
+# caller's could steer the reader: ANTHROPIC_BASE_URL points claude at a server that answers LAND, HTTPS_PROXY with
+# NODE_EXTRA_CA_CERTS reads and rewrites the answer, NODE_OPTIONS runs code in claude's node, and a HOME of the
+# caller's picks the ~/.claude a read loads. Only these names pass, HOME is the passwd home, and CC_CONFIG_DENY
+# names the passwd home's config (expanduser would follow the caller's HOME).
+READ_ENV_KEEP = C.ENV_KEEP
+
+
 def clean_env():
-    env = {k: v for k, v in os.environ.items()
-           if k != "CLAUDECODE" and not k.startswith("CLAUDE_") and k not in SECRET_ENV and not k.endswith(SECRET_TAIL)}
-    cfg = os.path.expanduser("~/.cc/config")
-    env["CC_CONFIG_DENY"] = os.path.realpath(cfg)
+    env = {k: v for k, v in os.environ.items() if k in READ_ENV_KEEP or k.startswith("LC_")}
+    env["HOME"] = C.PASSWD_HOME
+    env["CC_CONFIG_DENY"] = os.path.realpath(C.REVIEWER_CONFIG)
     env["PATH"] = READ_PATH   # the caller's PATH would pick the node a `#!/usr/bin/env node` codex runs on
     return env
 
@@ -484,6 +492,27 @@ def ask_codex(text, repo, pr, digest, model):
 CLAUDE_ALIASES = ("opus", "sonnet", "haiku", "fable", "opusplan")
 
 
+# WHERE THE CLAUDE A READ RUNS MAY LIVE. `ln -sf /tmp/fake ~/.local/bin/claude` from a worker's shell once swapped the
+# reviewer (security read of #849): the path is the reviewer config's CC_CLAUDE or ~/.local/bin/claude at the passwd
+# home, and what it resolves to must be an executable file under one of these roots, or the read is a fault and
+# nothing runs. The file is run by its resolved path. This narrows the swap; it does not close a same-uid write into
+# the native installer's own versions dir, which only a boundary the worker cannot write does (see the PR of #849's
+# follow-up: a separate lander uid, or workers under CC_WORKER_SANDBOX).
+def claude_roots():
+    return (os.path.join(C.PASSWD_HOME, ".local", "share", "claude", "versions"), "/usr/local/lib", "/usr/lib", "/opt")
+
+
+def claude_bin():
+    """-> (path to run, "") or ("", why not)."""
+    named = C.conf("CC_CLAUDE", os.path.join(C.PASSWD_HOME, ".local", "bin", "claude"))
+    real = os.path.realpath(named)
+    if not any(real.startswith(os.path.realpath(r) + os.sep) for r in claude_roots()):
+        return "", f"the reviewer's claude {named} resolves to {real}, outside {', '.join(claude_roots())}"
+    if not (os.path.isfile(real) and os.access(real, os.X_OK)):
+        return "", f"the reviewer's claude {named} resolves to {real}, which is not an executable file"
+    return real, ""
+
+
 def is_claude(model):
     return model.startswith("claude") or model.split("[")[0] in CLAUDE_ALIASES
 
@@ -496,7 +525,10 @@ def ask(text, repo, pr, digest, model=None):
     if not is_claude(model):
         return ask_codex(text, repo, pr, digest, model)
     # The prompt goes on stdin: one argv over 128 KiB is refused by the kernel (E2BIG), and most diffs pass that.
-    argv = [C.conf("CC_CLAUDE", os.path.join(C.PASSWD_HOME, ".local", "bin", "claude")), "-p", "--model", model,
+    exe, bad = claude_bin()
+    if bad:
+        return None, 0.0, f"fault: {bad}"
+    argv = [exe, "-p", "--model", model,
             "--effort", effort(), "--max-budget-usd", C.conf("CC_LAND_REVIEW_BUDGET", "3"),
             "--output-format", "json", "--json-schema", json.dumps(SCHEMA),
             "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands", "--tools", ""]

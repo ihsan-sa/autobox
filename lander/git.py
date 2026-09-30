@@ -11,6 +11,7 @@ held across a fetch or the merge's critical section, never across a check or a r
     remote_url(root)                         the URL the lander holds for the checkout (see ORIGIN below)
     rev(root, ref) · remote_head(root, branch) · ls_remote(root, url, branch)   (ls-remote run BORROWED)
     borrowed(root)                           a scratch repo reading only the checkout's objects (see BORROWED)
+    hookless_env(**extra)                    blind_env() with hooks, replace objects and commit-graphs off
     tree_of(root, commit)                    the commit's tree, read VERIFIED
     merge_tree(root, base, head)  -> (tree, [])  or (None, [conflicted paths])   (`merge-tree --write-tree`, sealed;
                                              the merged tree's new objects are copied into the checkout for the run)
@@ -417,6 +418,19 @@ def blind_env() -> dict:
     # core.attributesFile unset still reads ~/.config/git/attributes, so it is pointed at nothing
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1", GIT_CONFIG_COUNT="1",
                GIT_CONFIG_KEY_0="core.attributesFile", GIT_CONFIG_VALUE_0=os.devnull, GIT_LITERAL_PATHSPECS="1")
+    return env
+
+
+def hookless_env(**extra) -> dict:
+    """blind_env() with no hook (core.hooksPath at /dev/null), no replace objects and no commit-graph, plus `extra`
+    (GIT_DIR of a borrowed() repo, say). A GIT_CONFIG_* entry is command-line scope, so it outranks the checkout's
+    own config when git runs there (update-ref's reference-transaction hook)."""
+    env = dict(blind_env(), GIT_NO_REPLACE_OBJECTS="1")
+    n = int(env["GIT_CONFIG_COUNT"])
+    for k, v in (("core.hooksPath", os.devnull), ("core.commitGraph", "false")):
+        env[f"GIT_CONFIG_KEY_{n}"], env[f"GIT_CONFIG_VALUE_{n}"], n = k, v, n + 1
+    env["GIT_CONFIG_COUNT"] = str(n)
+    env.update(extra)
     return env
 
 

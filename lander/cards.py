@@ -56,8 +56,9 @@ def sh(argv, cwd=None, input=None, timeout=300, env=None):
 
 
 def state(*parts):
-    """A path under the landing state dir (~/.cc/state/land, or $CC_LAND_STATE for tests)."""
-    root = os.environ.get("CC_LAND_STATE") or os.path.expanduser("~/.cc/state/land")
+    """A path under the landing state dir (~/.cc/state/land at the passwd home, or $CC_LAND_STATE for tests; a queued
+    tick never gets the queuer's CC_LAND_STATE, lane.tick_env)."""
+    root = os.environ.get("CC_LAND_STATE") or os.path.join(PASSWD_HOME, ".cc", "state", "land")
     return os.path.join(root, *parts)
 
 
@@ -74,6 +75,20 @@ def _passwd_home():
 # script chooses nothing. Tests patch REVIEWER_CONFIG (and PASSWD_HOME); no env var moves either.
 PASSWD_HOME = _passwd_home()
 REVIEWER_CONFIG = os.path.join(PASSWD_HOME, ".cc", "config")
+
+# AN ENVIRONMENT THE LANDER BUILDS FOR ITSELF IS BUILT, NOT FILTERED (#862 review reads). A filter misses what nobody
+# listed: XDG_CONFIG_HOME names a git config (url.insteadOf redirects a fetch) and a gh config (http_unix_socket
+# redirects every call), GH_REPO points gh at another PR, BASH_ENV / ENV run a file in every script. Only these names
+# (and LC_*) pass; HOME is the passwd home and PATH the root-owned dirs unless the caller names its own.
+ENV_KEEP = ("LANG", "LANGUAGE", "TZ", "TERM", "USER", "LOGNAME")
+SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+
+def kept_env(env, **fixed):
+    out = {k: v for k, v in env.items() if k in ENV_KEEP or k.startswith("LC_")}
+    out.update(HOME=PASSWD_HOME, PATH=SYSTEM_PATH)
+    out.update(fixed)
+    return out
 
 
 def reviewer_key(key):

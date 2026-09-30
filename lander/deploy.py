@@ -13,8 +13,9 @@ THE STEPS, per target, in order; the first that fails stops that target and says
   1. branch   the checkout is on its base branch (board `default_branch`, else main)
   2. pull     under the repo's git lock (U1's, shared with cc-publish): verified_tip fetches <base> from the URL the
               lander holds (git.remote_url, never the checkout's "origin") and checks it against ls-remote; a sha
-              that is not that tip or an ancestor of it is refused; then `git merge --ff-only <sha>`, so a
-              checkout a person moved is refused, never reset
+              that is not that tip or an ancestor of it is refused; then fast_forward: what `git merge --ff-only
+              <sha>` did, with no hook, filter or config of the checkout's run, so a checkout a person moved is
+              refused, never reset
   3. install  the first executable of core/install.sh, install.sh, with no flags; then `systemctl --user
               daemon-reload`; then <repo>.applied records the sha
   4. units    a systemd-user unit this change ADDED is enabled with `enable --now`, unless its .timer does it, it
@@ -123,8 +124,8 @@ def base_of(repo):
     return (d or {}).get("default_branch") or "main"
 
 
-def git(root, *args, timeout=300):
-    rc, out = C.sh(["git", *args], cwd=root, timeout=timeout)
+def git(root, *args, timeout=300, env=None):
+    rc, out = C.sh(["git", *args], cwd=root, timeout=timeout, env=env)
     return rc, out.strip()
 
 
@@ -210,25 +211,61 @@ def pull(root, base, sha, since=""):
     """Fast-forward to `sha`; -> the (status, path) changes from `since` (what was deployed before this request) to
     `sha`. Not from the checkout's HEAD: on a retry after a failed install or restart the checkout is already at `sha`,
     and a diff from there would be empty, so the retry would skip every unit and restart."""
-    rc, cur = git(root, "rev-parse", "--abbrev-ref", "HEAD")
-    if rc or cur != base:
-        raise Failed("branch", f"{root} is on '{cur}', not '{base}' — deploy from the default-branch checkout")
-    _, before = git(root, "rev-parse", "HEAD")
-    if since and git(root, "cat-file", "-e", f"{since}^{{commit}}")[0] == 0:
-        before = since
-    with git_lock(root):
+    with git_lock(root):   # HEAD is read under the lock, so no one else's merge moves it between here and the move
+        rc, cur = git(root, "rev-parse", "--abbrev-ref", "HEAD")
+        if rc or cur != base:
+            raise Failed("branch", f"{root} is on '{cur}', not '{base}' — deploy from the default-branch checkout")
+        _, head = git(root, "rev-parse", "HEAD")
+        before = head
+        if since and git(root, "cat-file", "-e", f"{since}^{{commit}}")[0] == 0:
+            before = since
         tip = verified_tip(root, base)
         if not tip:
             raise Failed("pull", f"origin/{base} could not be fetched from the lander's own remote and checked "
                                  f"against it; nothing merged in {root}")
         if sha != tip and git(root, "merge-base", "--is-ancestor", sha, tip)[0] != 0:
             raise Failed("pull", f"{sha[:12]} is not on origin/{base} ({tip[:12]}); nothing merged in {root}")
-        rc, out = git(root, "merge", "--ff-only", "-q", sha)
-    if rc:
-        raise Failed("pull", f"git merge --ff-only {sha[:12]} in {root}: {last(out)}")
-    rc, out = git(root, "diff", "--name-status", "--no-renames", "-z", before, sha)
+        try:
+            fast_forward(root, base, head, sha)
+        except G.GitError as x:
+            raise Failed("pull", f"no scratch repo for {root}: {last(x)}; nothing merged") from None
+    try:
+        with G.borrowed(root) as gd:
+            rc, out = git(root, "diff", "--name-status", "--no-renames", "-z", before, sha,
+                          env=G.hookless_env(GIT_DIR=gd))
+    except G.GitError as x:
+        rc, out = 1, str(x)
     parts = out.split("\0") if rc == 0 else []   # -z: status, path, status, path, ... each path as it is
     return [(s[:1], p) for s, p in zip(parts[0::2], parts[1::2]) if s and p]
+
+
+def fast_forward(root, base, head, sha):
+    """Move the checkout from `head` to `sha` the way `git merge --ff-only` would, with nothing of the checkout's own
+    run: a worker can write its shared .git, so a post-merge, post-checkout or reference-transaction hook, or a smudge
+    filter its config names, would run as the lander. read-tree -m -u runs in a borrowed() repo (no config, so no
+    filter; read-tree runs no hook) on the checkout's own index and files, and refuses as merge does when a changed or
+    untracked file is in the way; then update-ref moves the branch, hooks off. A checkout already at `sha` or past it
+    is left as it is, as `merge --ff-only` leaves it ("Already up to date"). Raises Failed, or GitError when no
+    borrowed repo could be made."""
+    if head == sha:
+        return
+    with G.borrowed(root) as gd:
+        if git(root, "merge-base", "--is-ancestor", sha, head, env=G.hookless_env(GIT_DIR=gd))[0] == 0:
+            return
+        if git(root, "merge-base", "--is-ancestor", head, sha, env=G.hookless_env(GIT_DIR=gd))[0] != 0:
+            raise Failed("pull", f"{sha[:12]} is not a fast-forward of {head[:12]} in {root}; nothing merged")
+        rc, gitdir = git(root, "rev-parse", "--path-format=absolute", "--git-dir", env=G.hookless_env())
+        if rc or not os.path.isabs(gitdir) or "\n" in gitdir:
+            raise Failed("pull", f"git names no git dir for {root}: {last(gitdir)}")
+        env = G.hookless_env(GIT_DIR=gd, GIT_WORK_TREE=root, GIT_INDEX_FILE=os.path.join(gitdir, "index"))
+        git(root, "update-index", "-q", "--refresh", env=env)   # rc 1 = a file differs; read-tree says which
+        rc, out = git(root, "read-tree", "-m", "-u", head, sha, env=env)
+    if rc:
+        raise Failed("pull", f"git read-tree -m -u {head[:12]} {sha[:12]} in {root}: {last(out)}")
+    rc, out = git(root, "update-ref", "-m", f"lander: fast-forward to {sha[:12]}", f"refs/heads/{base}", sha, head,
+                  env=G.hookless_env())
+    if rc:
+        raise Failed("pull", f"git update-ref refs/heads/{base} {sha[:12]} in {root}: {last(out)}")
 
 
 def install(root, repo, sha):

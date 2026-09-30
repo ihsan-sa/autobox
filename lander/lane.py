@@ -14,8 +14,8 @@ is the owner's own uid (SLACK_OWNER_ID): `refused <repo>#<pr> protected:<file>`,
 head gh cannot name refuses); the inbox request carries no approval, because anyone may write the inbox and drain
 takes only chat/ts/who from it. The request goes to the inbox (jobs.submit); `queued` is logged only for a PR
 with no job yet (drain logs `again` or `requeued` for the rest, so `times` is not restarted). A paused project keeps the request and says so (exit 0); --no-start
-says where it waits (exit 0); otherwise `lander tick --repo <repo>` is started detached (without the caller's
-CC_LAND_REVIEW*, CC_CLAUDE, CC_CODEX or CC_CONFIG: tick_env), and a start that fails is
+says where it waits (exit 0); otherwise `lander tick --repo <repo>` is started detached (with only an allow-list of
+the caller's environment: tick_env), and a start that fails is
 exit 1 "queued, but…". `queue --task` is the old queue_task unchanged: `cc done <repo> <row> --json`, `cc lands`
 0 queue / 1 approval / 2 refused, anything else failed; the receipt (with `landing`) is the one line on stdout.
 
@@ -102,6 +102,7 @@ import time
 from concurrent import futures
 
 from lander import admission as A
+from lander import cards as C
 from lander import events as E
 from lander import gh as GH
 from lander import git as G
@@ -1003,16 +1004,32 @@ def spawn_lane(repo, release):
 
 # WHO REVIEWS A LANDING IS NOT THE QUEUER'S TO CHOOSE (security read of #847). `cc done` in a worker's shell
 # queues, and queue starts the tick below, which runs the lane and its review inline, so a worker's
-# `CC_CLAUDE=<a fake that writes LAND> cc done` once chose its own reviewer. cards.conf now reads these keys from the
-# passwd home's config alone (cards.REVIEWER_CONFIG); the tick still gets none of them from its caller, belt and braces.
-# Nor CODEX_HOME (an AGENTS.md there steers a codex read) or CC_LAND_STATE (a state dir of the queuer's own, where
-# saved verdicts and the read count live).
-REVIEWER_ENV = ("CC_CLAUDE", "CC_CODEX", "CC_CONFIG", "CODEX_HOME", "CC_LAND_STATE")
+# `CC_CLAUDE=<a fake that writes LAND> cc done` once chose its own reviewer. cards.conf reads the reviewer keys from
+# the passwd home's config alone (cards.REVIEWER_CONFIG), and the tick gets its caller's environment only through
+# cards.kept_env's allow-list (#862 review reads: a list of names to strip let XDG_CONFIG_HOME, GH_REPO and BASH_ENV
+# through). HOME is the passwd home, since every state root falls back to it, and PATH is tick_path(). Two more are
+# the tick's own, never the caller's: XDG_RUNTIME_DIR at /run/user/<uid>, where `systemd-run --user` finds the
+# manager (a caller's could name a socket of its own), and INVOCATION_ID, which only tells spawn_lane that this tick
+# runs inside a unit and a plain child would die with it.
+
+
+def tick_path():
+    """The root-owned dirs first, so a gh, git or claude in ~/bin or ~/.local/bin (a worker can write both) shadows
+    nothing; the home dirs after them for the box's own tools."""
+    home = C.PASSWD_HOME
+    return f"{C.SYSTEM_PATH}:{home}/bin:{home}/.local/bin"
 
 
 def tick_env(env):
-    """The environment a queued tick starts with: the caller's, less every key that picks the landing reviewer."""
-    return {k: v for k, v in env.items() if k not in REVIEWER_ENV and not k.startswith("CC_LAND_REVIEW")}
+    """The environment a queued tick starts with: kept_env's allow-list of the caller's, HOME at the passwd home,
+    PATH at tick_path(), and XDG_RUNTIME_DIR / INVOCATION_ID as above."""
+    out = C.kept_env(env, PATH=tick_path())
+    run = f"/run/user/{os.getuid()}"
+    if os.path.isdir(run):
+        out["XDG_RUNTIME_DIR"] = run
+    if env.get("INVOCATION_ID"):
+        out["INVOCATION_ID"] = env["INVOCATION_ID"]
+    return out
 
 
 def spawn_tick(repo):

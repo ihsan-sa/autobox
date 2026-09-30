@@ -28,6 +28,7 @@ for p in (CORE, HERE):
         sys.path.insert(0, p)
 
 from lander import admission as A  # noqa: E402
+from lander import cards as C  # noqa: E402
 from lander import check as CK  # noqa: E402
 from lander import manifest as M  # noqa: E402
 from lander import records as REC  # noqa: E402
@@ -59,10 +60,16 @@ class Env(unittest.TestCase):
         tmpdir = os.path.join(self.tmp, "t")
         os.mkdir(tmpdir)
         # CC_SUITES_DIR: no laptop unless a case makes one (this box's own ~/.cc/suites would route a loaded run there)
-        p = mock.patch.dict(os.environ, {"LANDER_STATE": self.state, "LANDER_SCOPE": "0", "TMPDIR": tmpdir,
+        p = mock.patch.dict(os.environ, {"LANDER_STATE": self.state, "CC_LAND_STATE": os.path.join(self.tmp, "land"),
+                                         "LANDER_SCOPE": "0", "TMPDIR": tmpdir,
                                          "CC_SUITES_DIR": os.path.join(self.tmp, "suites")})
         p.start()
         self.addCleanup(p.stop)
+        # nothing reads the box's own ~/.cc/state/land or config: every state root falls back to the passwd home
+        for name, val in (("PASSWD_HOME", os.path.join(self.tmp, "home")), ("REVIEWER_CONFIG", os.path.join(os.path.join(self.tmp, "home"), ".cc", "config"))):
+            p = mock.patch.object(C, name, val)
+            p.start()
+            self.addCleanup(p.stop)
         self.repo = os.path.join(self.tmp, "repo")
         os.mkdir(self.repo)
         git(self.repo, "init", "-q")
