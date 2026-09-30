@@ -10,8 +10,6 @@ held across a fetch or the merge's critical section, never across a check or a r
     rev(root, ref) · tree_of(root, commit) · merge_base(root, a, b) · remote_head(root, branch)
     merge_tree(root, base, head)  -> (tree, [])  or (None, [conflicted paths])   (`merge-tree --write-tree`)
     changed(root, a, b)           `diff --name-only --no-renames a b`
-    patch_digest(root, base, head) sha256 over `git patch-id --stable` of the diff merge-base..head: a rebase
-                                   that changes nothing of the diff keeps the digest
     protected_same(root, rules, approved, head)  every file under `rules` is byte-identical at both heads
 
 ORIGIN is never the name "origin" in the checkout's shared .git/config: a worker can repoint that, unset its
@@ -27,7 +25,6 @@ from __future__ import annotations
 
 import collections
 import fcntl
-import hashlib
 import json
 import os
 import re
@@ -155,13 +152,6 @@ def merge_tree(root, base, head, env=None):
 def changed(root, a, b, env=None) -> list:
     out = git(root, "diff", "--name-only", "--no-renames", a, b, check=True, env=env).out
     return sorted({l.strip() for l in out.splitlines() if l.strip()})
-
-
-def patch_digest(root, base, head, env=None) -> str:
-    mb = merge_base(root, base, head, env=env)
-    diff = git(root, "diff", "--no-color", "--no-ext-diff", mb, head, check=True, env=env).out
-    pid = git(root, "patch-id", "--stable", input=diff, env=env).out.split()
-    return hashlib.sha256((pid[0] if pid else "").encode()).hexdigest()
 
 
 def protected_same(root, rules, approved, head, env=None) -> bool:

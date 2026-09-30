@@ -194,6 +194,9 @@ class Reviewer:
     def __init__(self, *verdicts):
         self.verdicts, self.calls = list(verdicts), []
 
+    def digest_of(self, root, base, head):
+        return "f" * 40
+
     def review(self, job):
         self.calls.append(("review", job.digest))
         return self.verdicts.pop(0)

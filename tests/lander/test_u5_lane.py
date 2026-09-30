@@ -169,6 +169,79 @@ class RealUnits(TL.Fixture):
             self.land()
         self.assertEqual(self.job().state, T.HELD)
 
+    def recorded_land(self, num, head):
+        """What `record` posts: a LAND marker at `head`, keyed by the reviewer's digest_of against today's main."""
+        self.git(self.work, "fetch", "-q", "origin")
+        d = RV.digest_of(self.work, "origin/main", head)
+        body = RV.marker(T.Verdict(verdict=T.LAND, digest=d), self.origin_rev("main"), head, "seat")
+        b = self.box()
+        b["prs"][str(num)]["comments"] = [{"body": body, "viewerDidAuthor": True}]
+        self.set_box(prs=b["prs"])
+        return d
+
+    def test_a_land_recorded_at_the_head_is_the_verdict_the_lane_uses(self):
+        """#739: a LAND recorded at a head, main moved on since, the lane at that same head lands it with no read."""
+        head = self.pr(1, {"c/w": "paid\n"})
+        d = self.recorded_land(1, head)
+        self.main({"b/y": "main moved on\n"})
+        J.submit("demo", 1)
+        with mock.patch.object(RV, "_buy", side_effect=AssertionError("a read was asked for")):
+            u, lines = self.land()
+        j = self.job()
+        self.assertEqual((j.state, j.digest, j.reads_used), (T.DEPLOY_PENDING, d, 0), lines)
+        self.assertTrue(j.plan.paid)
+        # and will-review says what the lane did: no read
+        comments = self.box()["prs"]["1"]["comments"]
+        self.assertEqual(RV.would_read(j, comments)[0], False)
+
+    def test_a_land_recorded_at_an_older_head_is_not_used(self):
+        head = self.pr(1, {"c/w": "paid\n"})
+        self.recorded_land(1, head)
+        self.push("track/row-1", {"c/w": "paid, then changed\n"}, fresh=False)
+        J.submit("demo", 1)
+        u, lines = self.land()
+        j = self.job()
+        # the change is not the one read, so the lane asks for a read (here held by the usage limit)
+        self.assertEqual((j.state, j.extra["hold"]), (T.HELD, "box"), lines)
+        self.assertIn("usage limit", j.extra["why"])
+        self.assertEqual(RV.would_read(j, self.box()["prs"]["1"]["comments"])[0], True)
+
+    def test_a_land_recorded_for_one_binary_is_not_used_for_other_bytes_at_that_path(self):
+        """A binary hunk says only "Binary files … differ": the digest keeps the blob ids, so a second head adding the
+        same binary path with other bytes has another key and the LAND recorded on the first is not carried to it."""
+        first = self.pr(1, {"c/blob.bin": "\x00one\x00"})
+        d1 = self.recorded_land(1, first)
+        second = self.push("track/row-1", {"c/blob.bin": "\x00two\x00"})
+        self.assertIn("Binary files", RV.diff_of(self.work, "origin/main", second))
+        self.assertNotEqual(d1, RV.digest_of(self.work, "origin/main", second))
+        J.submit("demo", 1)
+        u, lines = self.land()
+        j = self.job()
+        self.assertEqual((j.state, j.extra["hold"]), (T.HELD, "box"), lines)
+        self.assertIn("usage limit", j.extra["why"])
+
+    def test_the_digest_ignores_a_diff_program_or_textconv_named_in_the_repo_config(self):
+        """A worker can write the shared .git/config. diff.external or a textconv driver must neither run as the
+        lander nor flatten two binaries to one text, and so one key."""
+        first = self.pr(1, {"c/blob.bin": "\x00one\x00"})
+        second = self.push("track/row-2", {"c/blob.bin": "\x00two\x00"})
+        ran = os.path.join(self.tmp, "ran")
+        prog = os.path.join(self.tmp, "prog")
+        with open(prog, "w") as f:
+            f.write(f"#!/bin/sh\necho x >> {ran}\necho same\n")
+        os.chmod(prog, 0o755)
+        with open(os.path.join(self.work, ".gitattributes"), "w") as f:
+            f.write("*.bin diff=conv\n")
+        self.git(self.work, "config", "diff.external", prog)
+        self.git(self.work, "config", "diff.conv.textconv", prog)
+        self.git(self.work, "config", "color.ui", "always")
+        self.assertIn("same", self.git(self.work, "diff", "origin/main", second))   # the config does bite plain git
+        os.remove(ran)
+        self.assertNotEqual(RV.digest_of(self.work, "origin/main", first),
+                            RV.digest_of(self.work, "origin/main", second))
+        self.assertIn("Binary files", RV.diff_of(self.work, "origin/main", second))
+        self.assertFalse(os.path.exists(ran), "the lander ran a program the repo config named")
+
     def test_ended_jobs_leave_the_readers_directory(self):
         self.pr(1, {"a/x": "n\n"}, state="CLOSED", headRefOid="e" * 40)
         J.submit("demo", 1)

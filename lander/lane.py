@@ -41,7 +41,8 @@ that overlap don't both burn CPU. Overlap found later is the Δ re-plan's (merge
 leave the file untouched and the job untimed:
 `cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds jobs before the merge.
   queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a draft or a conflict -> held 15 min. Under
-             the git lock fetch base and head; base_sha, files (merge-base..head), digest. A member PR meets its
+             the git lock fetch base and head; base_sha, files (merge-base..head), digest (the
+             reviewer's digest_of, the key `record` and `will-review` use). A member PR meets its
              walls (-> handback). THE PROTECTED DOOR, asked again at every head, reads the approval record
              (jobs.approval, never the request): the owner's uid, and the head he 👍'd — or a later head whose
              protected files are byte-identical, which carries approved_head to it (`approval … carried`); else
@@ -628,7 +629,10 @@ class Lane:
             job.head = G.rev(self.root, f"refs/remotes/origin/{branch}", env=self.genv)
         mb = G.merge_base(self.root, job.base_sha, job.head, env=self.genv)
         job.files = G.changed(self.root, mb, job.head, env=self.genv)
-        job.digest = G.patch_digest(self.root, job.base_sha, job.head, env=self.genv)
+        # the reviewer's digest_of, the key `record` and `will-review` use: a LAND recorded at a head is the verdict
+        # the lane finds at that head (#739 was handed back at the read cap under a patch-id key of the lane's own)
+        job.digest = self.call("reviewer", "digest_of", self.root, job.base_sha, job.head) \
+            if self.unit("reviewer") else ""
         job.results, job.plan = {}, None
         job.extra.pop("tree", None)
         if self.member:

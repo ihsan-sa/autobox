@@ -5,9 +5,12 @@
                                      or if it is looser than a HANDBACK already standing (old words map as below)
     lander will-review <repo> <pr>   exit 0 when the lander would buy a read for this PR at its head, else 1
 
-ONE READ PER CHANGE DIGEST. The digest is change_digest() of `git diff base...head`: the hunk headers and `index`
-lines are dropped and the rest hashed, so a rebase that does not change the change keeps its key. A read recorded
-at that digest — by this lander, by a seat through `record`, or by the old lander — is reused, never bought again.
+ONE READ PER CHANGE DIGEST. The digest is digest_of(): change_digest() of `git diff base...head`, the hunk headers
+and `index` lines dropped (a binary file's full blob ids kept) and the rest hashed, so a rebase that does not change
+the change keeps its key. It is the
+one key: the lane names its job by it, and `record` and `will-review` by it too. A read recorded at that digest (or
+the legacy one, keys()) — by this lander, by a seat through `record`, or by the old lander — is reused, never
+bought again, by review() and delta_review() alike.
 
 WHERE VERDICTS LIVE. On the PR, as marker comments. Today's shape is kept so every reader still parses it:
 
@@ -93,14 +96,33 @@ HUNK_LEGACY = re.compile(r"^@@ -[0-9,]+ \+[0-9,]+ @@")
 def change_digest(diff, legacy=False):
     """A `git diff` text -> 40 hex naming the change, '' for no diff. The same algorithm as the old lander, so its
     recorded verdicts keep their keys: `index` lines and hunk headers (numbers and, unless legacy, the function tail)
-    dropped, everything else hashed verbatim."""
-    keep = []
+    dropped, everything else hashed verbatim. One exception, in both modes: a binary file keeps its blob ids, because
+    its hunk says only "Binary files … differ" (an old binary-only record so needs a new read, the safe failure)."""
+    keep, index = [], ""
     for ln in (diff or "").splitlines():
+        if ln.startswith("diff --git "):
+            index = ""
         if ln.startswith("index "):
+            index = ln.split()[1] if len(ln.split()) > 1 else ""
             continue
+        if ln.startswith("Binary files ") and ln.endswith(" differ"):
+            # a binary hunk is only this line, so the blob ids are the bytes: two heads adding the same path with
+            # different contents must not share a key (diff_of asks --full-index, so an id is not a short prefix)
+            keep.append(f"blob {index}")
         keep.append((HUNK_LEGACY if legacy else HUNK).sub("@@", ln) if ln.startswith("@@ ") else ln)
     body = "\n".join(keep).strip()
     return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:40] if body else ""
+
+
+def digest_of(root, base, head):
+    """THE digest of a PR at `head`, the one the lane keys its job by and `record`/`will-review` key theirs by. The
+    lane once used a patch-id hash of its own, so a LAND recorded at a head was never found at that head (#739)."""
+    return change_digest(diff_of(root, base, head))
+
+
+def keys(job, diff):
+    """The digests a recorded verdict for this job may carry: its own, and the legacy one old markers used."""
+    return {job.digest or change_digest(diff), change_digest(diff, legacy=True)} - {""}
 
 
 # --- the markers ---------------------------------------------------------------------------------------------------
@@ -338,6 +360,9 @@ def root_of(job):
     return os.path.join(os.path.expanduser(C.conf("CC_DEV", "~/dev")), job.repo)
 
 
+PLAIN_DIFF = ("--no-ext-diff", "--no-textconv", "--no-color")
+
+
 def git(root, *args, timeout=120):
     return C.sh(["git", *args], cwd=root, timeout=timeout)
 
@@ -346,7 +371,9 @@ def diff_of(root, base, head):
     rc, mb = git(root, "merge-base", base, head)
     if rc:
         return ""
-    rc, d = git(root, "diff", "-U3", mb.strip(), head, timeout=300)
+    # a worker can write the checkout's shared .git/config: no diff.external, no textconv, no color from it, so the
+    # digest is git's own text and the lander never runs a program the worker named
+    rc, d = git(root, "diff", *PLAIN_DIFF, "-U3", "--full-index", mb.strip(), head, timeout=300)
     return "" if rc else d
 
 
@@ -437,8 +464,7 @@ def review(job, comments=None):
     diff = diff_of(root, job.base_sha, job.head)
     if not diff and job.files:
         return _no_diff(job)
-    digests = {job.digest or change_digest(diff), change_digest(diff, legacy=True)} - {""}
-    have = recorded(comments, digests)
+    have = recorded(comments, keys(job, diff))
     if have:
         return have
     if not (job.plan and job.plan.paid):
@@ -451,12 +477,17 @@ def review(job, comments=None):
 
 def delta_review(job, prior, comments=None, diff=None):
     root = root_of(job)
+    if comments is None:
+        comments = (pr_view(root, job.pr) or {}).get("comments") or []
     diff = diff if diff is not None else diff_of(root, job.base_sha, job.head)
     if not diff and job.files:
         return _no_diff(job)
+    have = recorded(comments, keys(job, diff))
+    if have:   # a verdict recorded at this digest after the prior one (a seat's `record`) is the one that stands
+        return have
     was = prior.extra.get("head", "")
     rc, full = git(root, "rev-parse", "--verify", "-q", f"{was}^{{commit}}") if was else (1, "")
-    rc2, inter = git(root, "diff", full.strip(), job.head, timeout=300) if not rc else (1, "")
+    rc2, inter = git(root, "diff", *PLAIN_DIFF, full.strip(), job.head, timeout=300) if not rc else (1, "")
     if rc or rc2:   # the head that read saw is gone (a force-push): read it whole, against the prior findings
         inter = "(the head the earlier read saw is no longer in this repository; read the whole diff)"
     numbered = "\n".join(f"{i}. {b}" for i, b in enumerate(prior.blocking, 1)) or "(none)"
@@ -548,7 +579,7 @@ def _job_of(repo, pr):
     job.extra.update(base=base, head_ref=facts.get("headRefName") or "")
     job.files = [f.get("path", "") for f in facts.get("files") or []]
     job.head = facts.get("headRefOid") or ""
-    job.digest = change_digest(diff_of(root, job.base_sha, job.head))
+    job.digest = digest_of(root, job.base_sha, job.head)
     return job, facts
 
 
@@ -606,8 +637,8 @@ def cmd_record(argv):
 
 
 def would_read(job, comments):
-    """-> (bool, why): whether review() would buy a read for this job now."""
-    if recorded(comments, {job.digest}):
+    """-> (bool, why): whether review() would buy a read for this job now; it matches the same keys() review() does."""
+    if recorded(comments, keys(job, diff_of(root_of(job), job.base_sha, job.head))):
         return False, "a verdict is already recorded for this change, and the landing reads that"
     if not (job.plan and job.plan.paid):
         return False, "it touches no paid-review path, so nothing reads it"

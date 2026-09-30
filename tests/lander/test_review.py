@@ -95,6 +95,15 @@ class TestDigestAndMarkers(Case):
         self.assertEqual(R.change_digest(DIFF), R.change_digest(moved))
         self.assertNotEqual(R.change_digest(DIFF), R.change_digest(DIFF.replace("+b", "+c")))
 
+    def test_a_binary_hunk_keeps_its_blob_ids_in_the_digest(self):
+        one = ("diff --git a/b.bin b/b.bin\nnew file mode 100644\nindex " + "0" * 40 + ".." + "1" * 40 + "\n"
+               "Binary files /dev/null and b/b.bin differ\n")
+        two = one.replace("1" * 40, "2" * 40)
+        for legacy in (False, True):
+            self.assertNotEqual(R.change_digest(one, legacy), R.change_digest(two, legacy))
+        # a text file's index line is still dropped, and the ids of one file never leak into the next file's hunk
+        self.assertEqual(R.change_digest(DIFF + one), R.change_digest(DIFF.replace("index 1..2", "index 3..4") + one))
+
     def test_old_land_after_fix_of_other_rows_imports_as_land(self):
         v = R.imported(self.comment("LAND-AFTER-FIX", "ab", ["1. [other] a nit"])["body"])
         self.assertEqual((v.verdict, v.blocking, v.advisory), (T.LAND, [], ["a nit"]))
@@ -260,6 +269,27 @@ class TestReview(Case):
         text = box.called("claude")[0]["input"]
         self.assertIn("the old bug", text)
         self.assertIn("You are the second review read", text)
+
+
+    def test_a_recorded_handback_at_this_digest_stands_in_the_delta_read(self):
+        box = self.box(claude=claude_says("LAND"), **{"git rev-parse": (0, "c" * 40 + "\n")})
+        j = self.job()
+        prior = self.comment("HANDBACK", "0dd", ["1. [correctness] x.py — the old bug"], head="c" * 40)
+        here = self.comment("HANDBACK", j.digest, ["1. [security] x.py — still open"])
+        v = R.delta_review(j, R.imported(prior["body"]), comments=[prior, here])
+        self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, ["[security] x.py — still open"]))
+        self.assertEqual(box.called("claude"), [])
+
+    def test_a_land_recorded_after_the_prior_handback_is_used_without_a_read(self):
+        box = self.box(claude=claude_says("HANDBACK"), **{"git rev-parse": (0, "c" * 40 + "\n")})
+        j = self.job()
+        prior = self.comment("HANDBACK", "0dd", ["1. [correctness] x.py — the old bug"], head="c" * 40)
+        v = R.review(j, comments=[prior, self.comment("LAND", j.digest)])
+        self.assertEqual(v.verdict, T.LAND)
+        v = R.delta_review(j, R.imported(prior["body"]), comments=[prior, self.comment("LAND", j.digest)])
+        self.assertEqual(v.verdict, T.LAND)
+        self.assertEqual(box.called("claude"), [])
+        self.assertEqual(R.reads_used("demo", 7), 0)
 
 
 class TestRecord(Case):
