@@ -1,6 +1,30 @@
 #!/usr/bin/env python3
-"""cc-replay — score a CANDIDATE cc-land against a recorded set of past landings, offline, in one number.
+"""cc-replay — score a CANDIDATE lander against a recorded set of past landings, offline, in one number.
 
+TODAY'S LANDER (the core/lander package):
+  cc-replay extract --lander [--repo R]... [--since STAMP] [--until STAMP] --out FILE
+      A v3 trace from the lander's queue.log (`stage` lines and the requests) and its job files (live, or rest/):
+      each PR first queued in the window, its requests and when history's lane first acted on each, its heads,
+      every check it ran (head, secs, yes/no/main-red) and every verdict, its plan, files, conflicts and a
+      branch gone, plus history's 1-minute load (sysstat) and its slot waits: each time a check started 1-60 min
+      after the lane's `checking` line (or the check before it). A PR already in flight when the window opened is
+      left out.
+  cc-replay score --candidate DIR --trace V3 [--slots N] [--pickup history|arrival] [--verbose] [--keep]
+      DIR is a tree holding core/lander (a checkout at a ref, a worktree, a release) or the package's directory.
+      Its own Lane runs each repo's arrivals on a virtual clock, one repo at a time. The world stands in for git,
+      GitHub, the manifest, the runner, the reviewer, the laptop (never reachable), the cards, the board, the tip
+      and the deploy: a check returns the k-th result history recorded for it on that head after its recorded
+      secs (main-red while history had that check red on main, anywhere); a check waits for a box-wide slot, as
+      the runner's flock does, until fewer than the candidate's own slots_now() are busy — history's checks of the
+      other repos and the replay's own, plus, during one of history's slot waits, the slots history's own checks
+      left to work it never saw (a worker's own check run) — where slots_now() reads history's load; a review
+      returns the verdict history recorded for that head; a conflict or a gone branch comes when history found
+      it. --pickup history delivers each request when history's lane first acted on it (older releases left some
+      untouched for hours); `arrival` delivers it when it was made. --slots sets the candidate's LANDER_SLOTS.
+      Prints queued→merged p50 and p95 and the lane-minutes full-suite PRs held, history's same numbers beside
+      them over the PRs both merged, then a per-PR table. The replay's own queue.log is read by the same parser.
+
+THE OLD SINGLE-FILE LANDING TOOL (before the lander cut over):
   cc-replay extract [--repo R]... [--since STAMP] [--until STAMP] --out FILE
       Build the trace: which PRs were queued when, what their gates and reviews answered, how long they took,
       what a repair round pushed and when. Read from the landing queue's own ledger (queue.log), the sweeps'
@@ -20,9 +44,10 @@
       input prints the same bytes every time. --verbose writes the world's log and the candidate's own output to
       stderr; --keep leaves the temp root in place to read afterwards.
   cc-replay selfcheck
-      The virtual clock, the conflict model, the trace loader, determinism and the three v2 event classes, on fixtures of its own.
+      The virtual clock, the conflict model, the trace loader, determinism, the three v2 event classes, and a v3
+      extract and score driving this checkout's own core/lander, on fixtures of its own.
 
-THE SCORE is the median minutes from a PR's first `queued` to its merge in the replay, over the PRs that merged;
+THE OLD TOOL'S SCORE is the median minutes from a PR's first `queued` to its merge in the replay, over the PRs that merged;
 suites run, paid reviews bought, repair rounds dispatched and PRs left unmerged are the secondary columns. A
 `history` line gives history's median over the PRs both merged, for calibration. The per-PR table's last column
 says how history merged each PR: `queue` (the landing queue did) or `hand` (a person did, outside it — on a v1
@@ -64,7 +89,7 @@ what is re-run, what is refused — on the same PRs, for two cc-lands.
 Stdlib only. The code holds no repo names, PR numbers or paths of any one box; the trace is data and lives
 outside the repo (~/.cc/state/<repo>/replay/ is the suggested home).
 """
-import calendar, glob, hashlib, heapq, importlib.machinery, importlib.util, inspect, io, json, os, re, shutil, statistics
+import calendar, contextlib, glob, hashlib, heapq, importlib.machinery, importlib.util, inspect, io, json, os, re, shutil, statistics
 import subprocess, sys, tempfile, threading, time
 
 HOME = os.path.expanduser("~")
@@ -600,11 +625,13 @@ def print_counts(out, trace):
 
 
 def cmd_extract(argv):
-    repos, since, until, out, old = [], 0, int(time.time()), "", ""
+    repos, since, until, out, old, lander = [], 0, int(time.time()), "", "", False
     rest = list(argv)
     while rest:
         a = rest.pop(0)
-        if a == "--from" and rest:
+        if a == "--lander":
+            lander = True
+        elif a == "--from" and rest:
             old = rest.pop(0)
         elif a == "--repo" and rest:
             repos.append(rest.pop(0))
@@ -620,6 +647,21 @@ def cmd_extract(argv):
     if not out:
         print("cc-replay extract: --out FILE is required", file=sys.stderr)
         return 2
+    if lander:
+        landq = os.environ.get("CC_LANDER_STATE") or LANDQ
+        trace = lander_trace(f"{landq}/queue.log", landq, since or until - 86400, until, repos)
+        if not trace["prs"]:
+            print("cc-replay extract: no PR first queued in that window", file=sys.stderr)
+            return 1
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        with open(out, "w") as f:
+            json.dump(trace, f, indent=1, sort_keys=True)
+        n = len(trace["prs"])
+        print(f"{out}: {n} PR(s), {sum(len(p['arrivals']) for p in trace['prs'])} arrivals, "
+              f"{sum(len(r) for p in trace['prs'] for r in p['gates'].values())} checks, "
+              f"{sum(len(p['verdicts']) for p in trace['prs'])} reads, {sum(1 for p in trace['prs'] if p['merged'])} merged; "
+              f"{len(trace['left_out'])} PR(s) first queued before the window left out")
+        return 0
     if old:     # the v1 half is kept as it was read then: its gate spans and transcripts may be gone since
         trace = load_trace(old)
         upgrade(trace, journal_lines(epoch(trace["since"])))
@@ -716,6 +758,8 @@ def cmd_extract(argv):
 
 def load_trace(path):
     t = read_json(path)
+    if isinstance(t, dict) and t.get("version") == 3 and t.get("kind") == "lander" and isinstance(t.get("prs"), list):
+        return t
     if not isinstance(t, dict) or t.get("version") not in (1, 2) or not isinstance(t.get("landings"), list):
         raise SystemExit(f"cc-replay: {path} is not a v1 or v2 trace")
     for l in t["landings"]:
@@ -1640,6 +1684,13 @@ def report(trace, world, clock, sweeps):
 def cmd_score(argv):
     candidate, trace, conflicts, verbose, keep = "", "", "history", False, False
     rest = list(argv)
+    for i, a in enumerate(rest[:-1]):
+        if a == "--candidate" and os.path.isdir(rest[i + 1]):
+            others = rest[:i] + rest[i + 2:]
+            if "--trace" not in others[:-1]:
+                break
+            j = others.index("--trace")
+            return cmd_lander_score(others[:j] + others[j + 2:], rest[i + 1], others[j + 1])
     while rest:
         a = rest.pop(0)
         if a == "--candidate" and rest:
@@ -1664,6 +1715,822 @@ def cmd_score(argv):
     if verbose:
         sys.stderr.write(log + "\n")
         sys.stderr.write("--- candidate output ---\n" + chatter)
+    return 0
+
+
+# ── the lander path: trace v3, today's core/lander driven on a virtual clock ────────────────────────────────
+ARRIVE = ("queued", "again", "requeued", "handed-pushed")   # a request reached the lander's inbox
+FULL_SUITE = ("check-sh",)       # a plan holding one of these is a full-suite PR (the lane's own FULL_CHECKS default)
+REVIEW_CAP = 3600                # a verdict line further than this from the PR's last line is not one read's length
+DEFAULT_REVIEW = 480
+BLOCKED_MIN, BLOCKED_MAX = 60, 3600   # a gap in this range between a PR's last line and its check starting is a
+                                      # slot wait; a longer one is a stalled lane (an older release), not a slot
+HIST_SLOTS, HIST_LOAD_FACTOR = 3, 2   # the live admission's defaults, which history's box ran under
+
+
+def kv_of(words):
+    return dict(w.split("=", 1) for w in words if "=" in w)
+
+
+def lander_events(path, until=0):
+    """[(epoch, kind, 'repo#N', words)] from a lander queue.log: `stage` lines as 'stage:<name>', and the arrivals."""
+    out = []
+    try:
+        f = open(path, errors="replace")
+    except OSError:
+        return out
+    with f:
+        for line in f:
+            t, _, msg = line.rstrip("\n").partition("\t")
+            e = epoch(t)
+            w = msg.split()
+            if not e or (until and e > until) or len(w) < 2 or not re.fullmatch(r"[A-Za-z0-9_.-]+#\d+", w[1]):
+                continue
+            if w[0] == "stage" and len(w) >= 3:
+                out.append((e, "stage:" + w[2], w[1], w[3:]))
+            elif w[0] in ARRIVE:
+                out.append((e, w[0], w[1], w[2:]))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def job_record(landq, repo, pr):
+    """The job file the lander keeps for (repo, pr): live, or rest/ once it ended; {} when neither is there."""
+    for p in (f"{landq}/{repo}-{pr}.json", f"{landq}/rest/{repo}-{pr}.json"):
+        j = read_json(p)
+        if isinstance(j, dict):
+            return j
+    return {}
+
+
+def lander_trace(log, landq, since, until, repos=()):
+    """A v3 trace from the lander's queue.log and job files. A PR is in it when its first `queued` falls inside
+    [since, until]. arrivals: every request after that; seen: when history's lane first acted on each (its first
+    stage line after it, the pick-up). A new head starts at each `requeued`, `handed-pushed` or later `queued`
+    (someone pushed or asked again after a stop) and at each "the head moved" in the job file. Gates and verdicts
+    are recorded against the head they ran on, in order. From the job file's holds: conflicts (head, when history
+    first found it conflicting with main) and gone (when its branch could no longer be fetched)."""
+    ev = lander_events(log, until)
+    first, prs, left_out, blocked = {}, {}, set(), []
+    for e, k, key, w in ev:
+        if k == "queued":
+            first.setdefault(key, e)
+    for e, k, key, w in ev:
+        repo, _, n = key.rpartition("#")
+        if repos and repo not in repos:
+            continue
+        if key not in first or first[key] < since:
+            if key in first and e >= since:   # in flight when the window opened: its lead time began before it
+                left_out.add(key)
+            continue
+        p = prs.setdefault(key, {"repo": repo, "pr": int(n), "arrivals": [], "seen": [], "bumps": [], "_gates": [],
+                                 "_verdicts": [], "merged": None, "_last": e, "_ended": False})
+        kv = kv_of(w)
+        if k in ARRIVE:
+            if k in ("requeued", "handed-pushed") or (k == "queued" and p["_ended"]):
+                p["bumps"].append(e)
+            p["arrivals"].append(e)
+            p["seen"].append(0)
+            p["_ended"] = False
+        else:
+            p["seen"] = [s or e for s in p["seen"]]   # every request still unseen was seen by this line
+            p["_ended"] = k in ("stage:handback", "stage:query", "stage:done")
+            if k == "stage:gate" and kv.get("gate"):
+                p["_gates"].append((e, kv["gate"], int(kv.get("secs") or 0), kv.get("ok") or "no"))
+                began = e - int(kv.get("secs") or 0)
+                # after the lane's own `checking` (or a check before it) it sat waiting for a slot: all were busy
+                if p.get("_lastk") in ("stage:checking", "stage:gate") and BLOCKED_MIN <= began - p["_last"] <= BLOCKED_MAX:
+                    blocked.append([p["_last"], began])
+            elif k == "stage:verdict" and kv.get("verdict"):
+                p["_verdicts"].append((e, kv["verdict"], max(0, min(REVIEW_CAP, e - p["_last"]))))
+            elif k == "stage:merged" and not p["merged"]:
+                p["merged"] = {"at": e, "by": "person" if kv.get("by") == "before" else "lane"}
+        p["_last"], p["_lastk"] = e, k
+    gsecs, rsecs = {}, []
+    for p in prs.values():
+        p.pop("_last"), p.pop("_ended"), p.pop("_lastk")
+        p["seen"] = [s or a for a, s in zip(p["arrivals"], p["seen"])]
+        j = job_record(landq, p["repo"], p["pr"])
+        holds = []
+        for h in j.get("history") or []:
+            at, why = epoch(h.get("at")), str(h.get("why") or "")
+            if not at or at < p["arrivals"][0]:
+                continue
+            if why.startswith("the head moved"):
+                p["bumps"].append(at)
+            elif h.get("state") == "held":
+                holds.append((at, why))
+        p["bumps"] = sorted(set(p["bumps"]))
+        idx = lambda t: sum(1 for b in p["bumps"] if b <= t)  # noqa: E731
+        p["gates"] = {}
+        for e, g, secs, ok in p.pop("_gates"):
+            p["gates"].setdefault(g, []).append([idx(e), secs, ok, e])
+        p["verdicts"] = [[idx(e), v, secs] for e, v, secs in p.pop("_verdicts")]
+        p["conflicts"] = [list(c) for c in sorted({idx(at): at for at, why in reversed(holds) if " conflicts with " in why}.items())]
+        p["gone"] = next((at for at, why in holds if "couldn't find remote ref" in why), 0)
+        plan = j.get("plan") if isinstance(j.get("plan"), dict) else {}
+        p["checks"] = list(plan.get("checks") or p["gates"])
+        p["paid"] = bool(plan.get("paid")) if plan else bool(p["verdicts"])
+        p["klass"] = plan.get("klass") or "leaf"
+        p["files"] = list(j.get("files") or [])
+        p["title"] = str(j.get("title") or "")
+        p["opaque"] = not j and not p["gates"]   # history's lane never planned it: nothing says what it would run
+        for g, runs in p["gates"].items():
+            gsecs.setdefault(g, []).extend(r[1] for r in runs if r[2] == "yes")
+        rsecs.extend(s for _, _, s in p["verdicts"])
+    return {"version": 3, "kind": "lander", "since": stamp(since), "until": stamp(until), "extracted_at": stamp(time.time()),
+            "left_out": sorted(left_out - set(prs)), "cores": os.cpu_count() or 1,
+            "load": load_history(since, until), "blocked": blocked,
+            "medians": {"gate": {g: int(median(v, 60)) for g, v in sorted(gsecs.items())},
+                        "review": int(median(rsecs, DEFAULT_REVIEW))},
+            "prs": sorted(prs.values(), key=lambda p: (p["arrivals"][0], p["repo"], p["pr"]))}
+
+
+def main_red_spans(trace):
+    """{check: [(from, to)]}: main is red on a check from the first main-red history recorded for it, on any PR, to
+    the next time that check passed anywhere (the window's end when it never did). Red on main is the box's fact,
+    not the PR's, so the replay asks the clock rather than the PR."""
+    runs = {}
+    for p in trace["prs"]:
+        for g, rs in p["gates"].items():
+            runs.setdefault(g, []).extend((r[3], r[2]) for r in rs if len(r) > 3)
+    spans = {}
+    for g, rs in runs.items():
+        start = None
+        for at, ok in sorted(rs):
+            if ok == "main-red" and start is None:
+                start = at
+            elif ok == "yes" and start is not None:
+                spans.setdefault(g, []).append((start, at))
+                start = None
+        if start is not None:
+            spans.setdefault(g, []).append((start, epoch(trace["until"]) + 1))
+    return spans
+
+
+def load_history(since, until, where=""):
+    """[[epoch, 1-minute load]] from sysstat's daily files (`sadf -d -- -q`), oldest first; [] when there are none.
+    The lander halves its own slots on this number, so a replay without it runs a calmer box than history had."""
+    where = where or os.environ.get("CC_REPLAY_SYSSTAT") or "/var/log/sysstat"
+    out = []
+    for f in sorted(glob.glob(f"{where}/sa[0-9][0-9]")):
+        try:
+            if os.path.getmtime(f) < since - 86400:
+                continue
+        except OSError:
+            continue
+        rc, text = sh(["sadf", "-d", f, "--", "-q"], timeout=60)
+        for line in text.splitlines() if rc == 0 else []:
+            c = line.split(";")
+            if len(c) >= 6 and c[2].endswith(" UTC"):
+                at = epoch(c[2][:-4].replace(" ", "T") + "Z")
+                try:
+                    if at and since - 900 <= at <= until:
+                        out.append([at, float(c[5])])
+                except ValueError:
+                    pass
+    return sorted(out)
+
+
+def pctl(xs, q):
+    """The nearest-rank q-quantile of xs (None when empty)."""
+    xs = sorted(xs)
+    return xs[max(0, min(len(xs) - 1, -int(-len(xs) * q // 1) - 1))] if xs else None
+
+
+def full_suite(p):
+    return any(c in FULL_SUITE for c in p.get("checks") or [])
+
+
+def history_numbers(trace):
+    """{key: queued→merged seconds} and the full-suite lane-seconds, as history recorded them."""
+    lead, lane = {}, 0
+    for p in trace["prs"]:
+        if p["merged"]:
+            lead[f"{p['repo']}#{p['pr']}"] = p["merged"]["at"] - p["arrivals"][0]
+        if full_suite(p):
+            lane += sum(r[1] for runs in p["gates"].values() for r in runs)
+    return lead, lane
+
+
+def replay_numbers(trace, log):
+    """The same two numbers from the replay's own queue.log, read by the same parser as history's."""
+    starts = {f"{p['repo']}#{p['pr']}": p["arrivals"][0] for p in trace["prs"]}
+    full = {f"{p['repo']}#{p['pr']}" for p in trace["prs"] if full_suite(p)}
+    lead, lane, gates, reads = {}, 0, 0, 0
+    for e, k, key, w in lander_events(log):
+        if k == "stage:merged" and key in starts and key not in lead:
+            lead[key] = e - starts[key]
+        elif k == "stage:gate":
+            gates += 1
+            if key in full:
+                lane += int(kv_of(w).get("secs") or 0)
+        elif k == "stage:verdict":
+            reads += 1
+    return lead, lane, gates, reads
+
+
+def candidate_core(path):
+    """The directory holding the candidate's `lander` package: PATH itself, PATH/core, or PATH's parent."""
+    path = os.path.abspath(path)
+    for d in (path, f"{path}/core", os.path.dirname(path)):
+        if os.path.isfile(f"{d}/lander/lane.py"):
+            return d
+    raise SystemExit(f"cc-replay: {path} holds no lander package (core/lander/lane.py)")
+
+
+def sha(*parts):
+    return hashlib.sha1("\0".join(map(str, parts)).encode()).hexdigest()
+
+
+class WindowEnd(BaseException):
+    """The clock passed the trace's end: the repo's replay stops there. A BaseException, so no `except Exception`
+    of the candidate's takes it for a fault of its own."""
+
+
+class VClock:
+    """The one clock of a single-threaded replay: it moves forward only, every move delivers the arrivals due, and
+    a move past `until` ends the repo's replay."""
+
+    def __init__(self, now, until=0):
+        self.now, self.hook, self.until = now, None, until
+
+    def to(self, t):
+        self.now = max(self.now, int(t))
+        if self.until and self.now > self.until:
+            raise WindowEnd()
+        if self.hook:
+            self.hook()
+
+
+class VTime:
+    """The `time` module a candidate module sees: wall clock, monotonic and sleep are the virtual clock's."""
+
+    def __init__(self, clock):
+        self._c = clock
+
+    def time(self):
+        return float(self._c.now)
+
+    monotonic = time
+
+    def sleep(self, s):
+        self._c.to(self._c.now + max(0, s))
+
+    def gmtime(self, s=None):
+        return time.gmtime(self._c.now if s is None else s)
+
+    def localtime(self, s=None):
+        return time.localtime(self._c.now if s is None else s)
+
+    def strftime(self, fmt, t=None):
+        return time.strftime(fmt, self.localtime() if t is None else t)
+
+    def __getattr__(self, n):
+        return getattr(time, n)
+
+
+class VFuture:
+    def __init__(self, clock, at, value=None, exc=None):
+        self.clock, self.at, self.value, self.exc = clock, at, value, exc
+
+    def done(self):
+        return self.at <= self.clock.now
+
+    def result(self, timeout=None):
+        if self.exc:
+            raise self.exc
+        return self.value
+
+
+class VPool:
+    """The lane's check pool: a submitted check is answered at once, waits for a box-wide slot as the real runner's
+    flock does (LanderWorld.slot_start), and its future is done at that start + its secs."""
+
+    def __init__(self, world):
+        self.world = world
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def submit(self, fn, *a, **kw):
+        self.world.secs = 0
+        try:
+            v, x = fn(*a, **kw), None
+        except Exception as e:  # noqa: BLE001 — the lane reads it from the future, as from a real one
+            v, x = None, e
+        return VFuture(self.world.clock, self.world.slot_start(self.world.secs) + self.world.secs, v, x)
+
+
+class VFutures:
+    """The `concurrent.futures` lane.py sees. wait() moves the clock to the first finished check; with a timeout,
+    to the first poll at or after the next thing a real lane would notice there (an arrival, a hold running out)."""
+    FIRST_COMPLETED, ALL_COMPLETED, FIRST_EXCEPTION = "FIRST_COMPLETED", "ALL_COMPLETED", "FIRST_EXCEPTION"
+
+    def __init__(self, world):
+        self.world = world
+
+    def ThreadPoolExecutor(self, *a, **kw):  # noqa: N802 — the name lane.py calls
+        return VPool(self.world)
+
+    def wait(self, fs, timeout=None, return_when=None):
+        fs, clock = list(fs), self.world.clock
+        done = {f for f in fs if f.done()}
+        if not done and fs:
+            t = min(f.at for f in fs)
+            nxt = self.world.next_wake()
+            if timeout and nxt is not None and nxt < t:
+                t = min(t, clock.now + timeout * max(1, -(-(nxt - clock.now) // timeout)))
+            clock.to(t)
+            done = {f for f in fs if f.done()}
+        return done, set(fs) - done
+
+
+class Unit:
+    """A lander unit made of plain functions (a module is what the lane expects; any attribute bag will do). A
+    function it lacks is a ReplayLeak naming it: an AttributeError would be the lane's UnitFault, a held job and a
+    quietly wrong score (#841's digest_of)."""
+
+    def __init__(self, name, **fns):
+        self.__dict__.update(fns, _name=name)
+
+    def __getattr__(self, fn):
+        if fn.startswith("__"):
+            raise AttributeError(fn)
+        raise ReplayLeak(f"cc-replay: the lane called {self._name}.{fn}, which LanderWorld.units does not answer")
+
+
+class LanderWorld:
+    """Everything outside the candidate's lane, answered from a v3 trace: GitHub, git, the manifest, the runner,
+    the reviewer, the box's load, and the units after the merge. It makes no real call."""
+
+    def __init__(self, trace, mods, clock, slots, root):
+        self.trace, self.clock, self.slots, self.root = trace, clock, slots, root
+        self.L, self.T, self.RUN, self.J = mods["lane"], mods["types"], mods["run"], mods["jobs"]
+        self.GitError = mods["git"].GitError
+        self.prs = {(p["repo"], p["pr"]): p for p in trace["prs"]}
+        self.med = trace["medians"]
+        self.main = {}        # repo -> [(sha, files, checks)] oldest first
+        self.trees = {}       # main sha -> its tree
+        self.merged = {}      # (repo, pr) -> the replay's merge time
+        self.asks = {}        # (repo, pr, head, check or "review") -> times asked
+        self.secs = 0
+        self.lane = None
+        self.repo = ""
+        self.arrivals = []    # this repo's [(at, pr)] not yet delivered
+        self.bought = 0
+        self.red = main_red_spans(trace)
+        self.A, self.at, self.own = mods["admission"], None, []
+        self.held = sorted((r[3] - r[1], r[3], p["repo"]) for p in trace["prs"] for runs in p["gates"].values()
+                           for r in runs if len(r) > 3 and r[1] > 0)   # history's box checks: (start, end, repo)
+
+    # -- time and arrivals --
+    def deliver(self):
+        while self.arrivals and self.arrivals[0][0] <= self.clock.now:
+            _, pr = self.arrivals.pop(0)
+            self.J.submit(self.repo, pr, who="replay")
+
+    def next_wake(self):
+        """The next moment a lane polling this repo would find work: an arrival, or a hold running out on a job
+        the running lane has not tried in this run."""
+        ts = [self.arrivals[0][0]] if self.arrivals else []
+        tried = self.lane.tried if self.lane else set()
+        for j in self.J.lane_jobs(self.repo):
+            if j.state == self.T.HELD and j.key not in tried:
+                left = self.J.not_before_left(j, self.clock.now)
+                ts.append(self.clock.now + max(1, left))
+        return min(ts) if ts else None
+
+    def slot_start(self, secs):
+        """When a check asked for now gets its box-wide slot, as the runner's flock would give it: the first moment
+        the checks in flight (history's in the other repos, the replay's own in this one) are fewer than the
+        candidate's own slots_now() then, which reads history's load. The check holds its slot for its secs."""
+        now = self.clock.now
+        busy = [iv for iv in self.own if iv[1] > now]
+        busy += [(a, b) for a, b, r in self.held if b > now and a <= now + 86400 and r != self.repo]
+        loads = [at for at, _ in self.trace.get("load") or [] if at > now][:48]
+        ends = [b for a, b in self.trace.get("blocked") or [] if b > now and a <= now + 86400]
+        start = max([b for _, b in busy] + ends or [now])
+        for t in sorted({now, *(b for _, b in busy), *loads, *ends}):
+            if sum(1 for a, b in busy if a <= t < b) + self.phantom(t) < self.cap(t):
+                start = t
+                break
+        if secs > 0:
+            self.own.append((start, start + secs))
+        return start
+
+    def phantom(self, t):
+        """Slots busy at t with work the trace never saw (a worker's own check run holds the same flocks): while a
+        history check sat waiting, every one of history's slots was taken, so those its own checks did not fill
+        were someone else's. 0 outside such a wait. The replay's lane asks a moment sooner than history's did (no real
+        planning time), so a wait counts from BLOCKED_MIN before history's `checking` line."""
+        if not any(a - BLOCKED_MIN <= t < b for a, b in self.trace.get("blocked") or []):
+            return 0
+        l1 = None
+        for at, v in self.trace.get("load") or []:
+            if at > t:
+                break
+            l1 = v
+        cap = 1 if l1 is not None and l1 >= HIST_LOAD_FACTOR * (self.trace.get("cores") or 1) else HIST_SLOTS
+        return max(0, cap - sum(1 for a, b, _ in self.held if a <= t < b))
+
+    def cap(self, t):
+        self.at = t
+        try:
+            return self.A.slots_now()
+        finally:
+            self.at = None
+
+    # -- git and GitHub --
+    def repo_of(self, root):
+        return os.path.basename(root.rstrip("/"))
+
+    def head_idx(self, p):
+        return sum(1 for b in p["bumps"] if b <= self.clock.now)
+
+    def head(self, repo, pr):
+        p = self.prs.get((repo, pr))
+        return sha(repo, pr, "head", self.head_idx(p) if p else 0)
+
+    def pr_of_head(self, repo, h):
+        for (r, n), p in self.prs.items():
+            if r == repo and h == sha(r, n, "head", self.head_idx(p)):
+                return p
+        for (r, n), p in self.prs.items():
+            if r == repo and any(h == sha(r, n, "head", i) for i in range(len(p["bumps"]) + 1)):
+                return p
+        return None
+
+    def tip(self, repo):
+        m = self.main.setdefault(repo, [(sha(repo, "main", 0), [], [])])
+        return m[-1][0]
+
+    def rev(self, root, ref, env=None):
+        repo = self.repo_of(root)
+        name = ref.rsplit("/", 1)[-1]
+        m = re.fullmatch(r"pr-(\d+)", name)
+        return self.head(repo, int(m.group(1))) if m else self.tip(repo)
+
+    def between(self, repo, a, b):
+        """The main entries after a, up to and including b."""
+        m = self.main.get(repo) or []
+        shas = [x[0] for x in m]
+        ia = shas.index(a) if a in shas else -1
+        ib = shas.index(b) if b in shas else len(m) - 1
+        return m[ia + 1:ib + 1]
+
+    def changed(self, root, a, b, env=None):
+        repo = self.repo_of(root)
+        p = self.pr_of_head(repo, b)
+        if p:
+            return list(p["files"]) or [f"?{p['pr']}"]
+        return sorted({f for _, files, _ in self.between(repo, a, b) for f in files})
+
+    def merge_tree(self, root, base, head, env=None):
+        """Conflicting from the moment history first found this head conflicting until a new head: the rebase is a
+        person's, so it comes when it came."""
+        p = self.pr_of_head(self.repo_of(root), head)
+        if p and any(i == self.head_idx(p) and at <= self.clock.now for i, at in p.get("conflicts") or []):
+            return None, list(p["files"][:1]) or ["?"]
+        return sha("tree", base, head), []
+
+    def fetch(self, root, *branches, env=None):
+        """{branch: sha} as G.fetch reports what origin sent (a lander that reads origin/<b> afterwards ignores it)."""
+        repo = self.repo_of(root)
+        for b in branches:
+            m = re.fullmatch(r"pr-(\d+)", b or "")
+            p = self.prs.get((repo, int(m.group(1)))) if m else None
+            if p and p.get("gone") and p["gone"] <= self.clock.now:
+                raise self.GitError(f"couldn't find remote ref refs/heads/{b}")
+        return {b: self.rev(root, b) for b in branches if b}
+
+    def tree_of(self, root, commit, env=None):
+        return self.trees.get(commit) or sha("tree", commit)
+
+    def pr_facts(self, root, pr, fields, token=None, timeout=120):
+        repo = self.repo_of(root)
+        p = self.prs.get((repo, int(pr))) or {}
+        person = (p.get("merged") or {}).get("by") == "person" and p["merged"]["at"] <= self.clock.now
+        state = "MERGED" if (repo, int(pr)) in self.merged or person else "OPEN"
+        return {"state": state, "isDraft": bool(p.get("opaque")) and state == "OPEN", "mergeable": "MERGEABLE", "headRefOid": self.head(repo, int(pr)),
+                "headRefName": f"pr-{pr}", "baseRefName": "main", "title": p.get("title") or f"PR {pr}",
+                "body": ""}, ""
+
+    def merge_state(self, root, pr, token=None):
+        repo = self.repo_of(root)
+        return ("MERGED", self.tip(repo)) if (repo, int(pr)) in self.merged else ("OPEN", "")
+
+    def merge(self, root, pr, pin, title, token=None):
+        repo = self.repo_of(root)
+        before = self.tip(repo)
+        p = self.prs.get((repo, int(pr))) or {"files": [], "checks": [], "pr": pr}
+        new = sha(repo, "main", len(self.main[repo]), pr)
+        self.main[repo].append((new, list(p["files"]) or [f"?{pr}"], list(p.get("checks") or [])))
+        self.trees[new] = sha("tree", before, pin)
+        self.merged[(repo, int(pr))] = self.clock.now
+        return True, "merged"
+
+    # -- the units --
+    def plan(self, root, base, head, files, fallback=""):
+        repo = self.repo_of(root)
+        p = self.pr_of_head(repo, head)
+        if p:
+            return self.T.Plan(checks=list(p["checks"]), paid=bool(p["paid"]), klass=p.get("klass") or "leaf",
+                               owned=list(files))
+        seen = []   # a range of main: the checks the PRs merged in it planned
+        for _, _, checks in self.between(repo, base, head):
+            seen += [c for c in checks if c not in seen]
+        return self.T.Plan(checks=seen, owned=list(files))
+
+    def load1(self, *a, **k):
+        """History's 1-minute load at this moment (the last sample before it), scaled to this machine's cores so the
+        candidate's own overloaded() reads it as history's box did; None (calm) when history recorded none."""
+        got, now = None, self.clock.now if self.at is None else self.at
+        for at, l1 in self.trace.get("load") or []:
+            if at > now:
+                break
+            got = l1
+        return None if got is None else got * (os.cpu_count() or 1) / (self.trace.get("cores") or 1)
+
+    def ask(self, *key):
+        self.asks[key] = self.asks.get(key, 0) + 1
+        return self.asks[key] - 1
+
+    def run_plan(self, root, m, plan, files, tree, base_tree="", *, only=(), **kw):
+        repo, T, RUN = self.repo_of(root), self.T, self.RUN
+        out = {}
+        p = self.prs.get((repo, kw.get("pr"))) or {}
+        for n in only or plan.checks:
+            idx = self.head_idx(p) if p else 0
+            runs = [r for r in (p.get("gates") or {}).get(n, []) if r[0] == idx and r[2] != "main-red"]
+            red = next((r for r in (p.get("gates") or {}).get(n, []) if r[2] == "main-red"), None)
+            if any(a <= self.clock.now < b for a, b in self.red.get(n, [])):
+                secs, ok = (red[1] if red else self.med["gate"].get(n, 60)), "main-red"
+            elif runs:
+                _, secs, ok = runs[min(self.ask(repo, p.get("pr"), idx, n), len(runs) - 1)][:3]
+            else:
+                secs, ok = self.med["gate"].get(n, 60), "yes"
+            status = {"yes": T.PASSED, "main-red": RUN.BLOCKED}.get(ok, T.FAILED)
+            res = T.Result(check=n, tree=tree, status=T.PASSED if ok == "yes" else T.FAILED, secs=float(secs))
+            out[n] = RUN.Outcome(n, status, "main-red" if ok == "main-red" else "", [res])
+            self.secs += secs
+        return out
+
+    def review(self, job, prior=None):
+        T = self.T
+        p = self.prs.get((job.repo, job.pr)) or {}
+        idx = self.head_idx(p) if p else 0
+        mine = [v for v in p.get("verdicts") or [] if v[0] == idx]
+        k = self.ask(job.repo, job.pr, idx, "review")
+        if mine:
+            _, word, secs = mine[min(k, len(mine) - 1)]
+        else:   # no read recorded at this head: the PR's last word, LAND when history merged it
+            word = "LAND" if p.get("merged") or not p.get("verdicts") else p["verdicts"][-1][1]
+            secs = self.med["review"]
+        self.clock.to(self.clock.now + secs)
+        word = word if word in (T.LAND, T.HANDBACK_VERDICT, T.INCOMPLETE) else T.HANDBACK_VERDICT
+        self.bought += 1
+        return T.Verdict(verdict=word, digest=job.digest, model="replay", tokens=1,
+                         blocking=["the review history recorded"] if word == T.HANDBACK_VERDICT else [])
+
+    def units(self):
+        none = lambda *a, **k: None  # noqa: E731
+        fns = {"planner": dict(plan=self.plan), "runner": dict(run_plan=self.run_plan),
+               "reviewer": dict(review=self.review, delta_review=self.review,
+                                digest_of=lambda root, base, head: sha("digest", head)),   # review.digest_of runs git
+               "cards": dict(stopped=none, landed=none), "board": dict(close=none),
+               "deploy": dict(request=none), "tip": dict(kick=none)}
+        return {k: Unit(k, **v) for k, v in fns.items()}
+
+
+def cached_reader(read):
+    """read(path), answered from memory while the file is the same one (inode, size, mtime): a lane re-reads every
+    job file for each job it tries, which is most of a replay's time and none of its answer."""
+    memo = {}
+
+    def cached(path):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return read(path)
+        key = (st.st_ino, st.st_size, st.st_mtime_ns)
+        hit = memo.get(path)
+        if hit and hit[0] == key:
+            return json.loads(hit[1])
+        v = read(path)
+        memo[path] = (key, json.dumps(v))
+        return v
+    return cached
+
+
+def _digest_unit(core):
+    """The reviewer unit a replay hands the lane, built the way lander_score builds it (selfcheck only)."""
+    sys.path.insert(0, core)
+    import importlib
+    mods = {n: importlib.import_module(f"lander.{n}") for n in ("types", "events", "jobs", "git", "gh", "manifest",
+                                                                 "run", "admission", "members", "records", "lane")}
+    return LanderWorld({"prs": [], "medians": {"review": 1}, "until": "1970-01-01T00:00:00Z"}, mods, VClock(0, 1), 0,
+                       tempfile.mkdtemp(prefix="cc-replay-digest-")).units()["reviewer"]
+
+
+def stand_in(mods, world, clock):
+    """Point the candidate's own module attributes at the world: what it calls outside itself, and its clock."""
+    L, G, GH, MF, RUN, A, J, M = (mods[k] for k in ("lane", "git", "gh", "manifest", "run", "admission", "jobs", "members"))
+    vt = VTime(clock)
+    for m in mods.values():
+        if getattr(m, "time", None) is time:
+            m.time = vt
+    L.futures = VFutures(world)
+    G.fetch = world.fetch
+    G.rev, G.tree_of, G.changed, G.merge_tree = world.rev, world.tree_of, world.changed, world.merge_tree
+    G.pr_changed = world.changed   # a PR head's files are the PR's own, whatever the base
+    G.merge_base = lambda root, a, b, env=None: a
+    G.patch_digest = lambda root, base, head, env=None: sha("digest", head)
+    G.remote_head = lambda root, branch, env=None: world.rev(root, branch)
+    G.protected_same = lambda *a, **k: True
+    G.git_lock = lambda root: contextlib.nullcontext()
+    GH.pr_facts, GH.merge_state, GH.merge = world.pr_facts, world.merge_state, world.merge
+    GH.backoff = lambda: 0
+    MF.load = lambda *a, **k: MF.Manifest()
+    MF.widen = lambda base, head: base
+    MF.placed = lambda m, tip: m
+    MF.host_fallback = lambda repo: ""
+    RUN.laptop_dest, RUN.quarantine_text = (lambda: ""), (lambda root, rev: "")
+    RUN.may_leave, RUN.laptop_gone = (lambda c: False), (lambda outs: False)
+    A.load1, A.loaded = world.load1, (lambda *a, **k: False)
+    if world.slots:
+        A.SLOTS = world.slots
+    J.stale_release = lambda: ""
+    J.read_json = cached_reader(J.read_json)
+    J.repo_root = lambda repo: f"{world.root}/dev/{repo}"
+    M.route = lambda job: ""
+    L.paused = lambda target: False
+    L.tier_stop = lambda: False
+    L.protected_rules = lambda repo: []
+    L.Lane.unit = answering(L.Lane.unit)
+
+
+def answering(unit):
+    """Lane.unit, but a unit the world has none of is a ReplayLeak naming it, not the lane's UnitFault."""
+    def answered(lane, name):
+        u = unit(lane, name)
+        if u is None:
+            raise ReplayLeak(f"cc-replay: the lane asked for its {name} unit, which LanderWorld.units has none of")
+        return u
+    return answered
+
+
+class ReplayLeak(BaseException):
+    """A candidate lander call the replay does not answer: a unit function, a unit, or a real process. A
+    BaseException, so the lane's `except Exception` cannot turn it into a held job and a quietly wrong score."""
+
+
+SPAWNERS = ("run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput")
+
+
+@contextlib.contextmanager
+def tripwire(core):
+    """Refuse every process the candidate's lander starts while the block runs, naming the lander frames that led to
+    it (outermost first) and the argv. The stand-ins are one function at a time, so a lander change that reaches git
+    some new way would otherwise run real git against a directory that is no repo, and fail somewhere quieter."""
+    here, real, seen = os.path.realpath(core) + "/lander/", {n: getattr(subprocess, n) for n in SPAWNERS}, {}
+
+    def lander(fr):
+        f = fr.f_code.co_filename
+        if f not in seen:
+            seen[f] = os.path.realpath(f).startswith(here)
+        return seen[f]
+
+    def guard(name):
+        def spawn(*a, **k):
+            chain, fr = [], sys._getframe(1)
+            while fr is not None:
+                if lander(fr):
+                    chain.append(f"{os.path.basename(fr.f_code.co_filename)[:-3]}.{fr.f_code.co_name}:{fr.f_lineno}")
+                fr = fr.f_back
+            if not chain:
+                return real[name](*a, **k)
+            argv = a[0] if a else k.get("args", k.get("cmd", "?"))
+            argv = " ".join(map(str, argv)) if isinstance(argv, (list, tuple)) else str(argv)
+            raise ReplayLeak(f"cc-replay: an unstubbed lander call ran `{argv[:120]}`: {' > '.join(reversed(chain))}"
+                             " — answer it in stand_in or LanderWorld.units")
+        return spawn
+    for n in SPAWNERS:
+        setattr(subprocess, n, guard(n))
+    try:
+        yield
+    finally:
+        for n, f in real.items():
+            setattr(subprocess, n, f)
+
+
+def lander_score(candidate, trace, slots=0, keep_root=False, pickup="history"):
+    """Drive the candidate lander tree through the trace, one repo at a time, and return (report, log)."""
+    core = candidate_core(candidate)
+    root = tempfile.mkdtemp(prefix="cc-replay-lander-")
+    os.environ.update(CC_LANDER_STATE=f"{root}/land", HOME=root, CC_DEV=f"{root}/dev", CC_BOARDS=f"{root}/boards",
+                      CC_MEMBERS=f"{root}/members", CC_BIN=f"{root}/bin", TMPDIR=root)
+    for d in ("land", "dev", "boards", "members", "bin"):
+        os.makedirs(f"{root}/{d}", exist_ok=True)
+    sys.path.insert(0, core)
+    import importlib
+    names = ("types", "events", "jobs", "git", "gh", "manifest", "run", "admission", "members", "records", "lane")
+    mods = {n: importlib.import_module(f"lander.{n}") for n in names}
+    if not os.path.realpath(mods["lane"].__file__).startswith(os.path.realpath(core) + "/"):
+        raise SystemExit(f"cc-replay: `lander` imported from {mods['lane'].__file__}, not the candidate {core}")
+    until = epoch(trace["until"])
+    clock = VClock(0, until)
+    world = LanderWorld(trace, mods, clock, slots, root)
+    stand_in(mods, world, clock)
+    os.fsync = lambda fd: None   # the replay's own temp files: durability buys nothing and costs most of the run
+    try:
+        with tripwire(core):
+            log = drive(trace, mods, world, clock, root, pickup)
+        lead, lane, gates, reads = replay_numbers(trace, f"{root}/land/queue.log")
+        return lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads), "\n".join(log)
+    except ReplayLeak as e:
+        raise SystemExit(str(e)) from None
+    finally:
+        if keep_root:
+            print(f"cc-replay: kept {root}", file=sys.stderr)
+        else:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+def drive(trace, mods, world, clock, root, pickup):
+    """Run the candidate's lane over each repo in the trace until the window ends; the lane's log lines."""
+    log = []
+    for repo in sorted({p["repo"] for p in trace["prs"]}):
+        os.makedirs(f"{root}/dev/{repo}", exist_ok=True)
+        world.repo, world.lane, world.own = repo, None, []
+        world.arrivals = sorted((a, p["pr"]) for p in trace["prs"] if p["repo"] == repo
+                                for a in (p["seen"] if pickup == "history" else p["arrivals"]))
+        clock.now, clock.hook = world.arrivals[0][0], world.deliver
+        try:
+            while True:
+                world.deliver()
+                world.lane = mods["lane"].Lane(repo, world.units())
+                log += world.lane.run()
+                world.lane = None
+                nxt = world.next_wake()
+                if nxt is None:
+                    break
+                clock.to(nxt)
+        except WindowEnd:
+            log += world.lane.lines if world.lane else []
+    return log
+
+
+def mins(s):
+    return "-" if s is None else f"{s / 60:.1f}"
+
+
+def lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads):
+    hist, hlane = history_numbers(trace)
+    both = sorted(set(hist) & set(lead))
+    rp = [lead[k] for k in both]
+    hp = [hist[k] for k in both]
+    hgates = sum(len(r) for p in trace["prs"] for r in p["gates"].values())
+    hreads = sum(len(p["verdicts"]) for p in trace["prs"])
+    out = [f"score p50 {mins(pctl(rp, .5))} min  p95 {mins(pctl(rp, .95))} min  full-suite lane-min {lane / 60:.0f}"
+           f"  (queued→merged over {len(both)} PRs both merged; slots {slots or 'the candidate\'s'}, pick-up {pickup})",
+           f"history p50 {mins(pctl(hp, .5))} min  p95 {mins(pctl(hp, .95))} min  full-suite lane-min {hlane / 60:.0f}",
+           f"merged: replay {len(lead)}, history {len(hist)} of {len(trace['prs'])} PRs; checks run: replay {gates}, "
+           f"history {hgates}; reads: replay {reads}, history {hreads}; trace {trace['since']} → {trace['until']}",
+           "", f"{'PR':<22} {'history':>8} {'replay':>8}"]
+    for p in trace["prs"]:
+        k = f"{p['repo']}#{p['pr']}"
+        out.append(f"{k:<22} {mins(hist.get(k)):>8} {mins(lead.get(k)):>8}")
+    return "\n".join(out) + "\n"
+
+
+def cmd_lander_score(argv, candidate, trace_path):
+    slots, verbose, keep, pickup = 0, False, False, "history"
+    rest = list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a == "--slots" and rest and rest[0].isdigit():
+            slots = max(1, int(rest.pop(0)))
+        elif a == "--pickup" and rest and rest[0] in ("history", "arrival"):
+            pickup = rest.pop(0)
+        elif a == "--verbose":
+            verbose = True
+        elif a == "--keep":
+            keep = True
+        else:
+            print(f"cc-replay score: unexpected '{a}' for a lander tree", file=sys.stderr)
+            return 2
+    t = load_trace(trace_path)
+    if t.get("kind") != "lander":
+        print("cc-replay score: a lander tree scores a v3 trace (`cc-replay extract --lander`)", file=sys.stderr)
+        return 2
+    out, log = lander_score(candidate, t, slots, keep, pickup)
+    sys.stdout.write(out)
+    if verbose:
+        sys.stderr.write(log + "\n")
     return 0
 
 
@@ -1988,6 +2855,159 @@ def cmd_selfcheck():
                       (change_digest(d2), change_digest(d2), change_digest(d2, True)))
           and not same_change((change_digest(d1, True), change_digest(d1), change_digest(d1, True)),
                               (change_digest(d3), change_digest(d3), change_digest(d3, True))))
+    # the lander path (v3): a fixture queue.log and job files -> a trace; the trace -> this checkout's own lander,
+    # driven in a child process (a candidate is imported as the `lander` package, once per process).
+    t0 = 1_800_000_000
+    lroot = tempfile.mkdtemp(prefix="cc-replay-lander-fx-")
+    try:
+        lq = f"{lroot}/land"
+        os.makedirs(f"{lq}/rest")
+        L = lambda at, text: f"{stamp(t0 + at)}\t{text}\n"  # noqa: E731
+        log = "".join([
+            L(-100, "queued r#9 who=x"), L(5, "stage r#9 merged sha=aa"),
+            L(10, "queued r#1 who=x"), L(11, "stage r#1 lane"), L(611, "stage r#1 gate gate=a ok=yes secs=600"),
+            L(620, "stage r#1 merged sha=bb"), L(700, "stage r#1 done"),
+            L(20, "queued r#2 who=x"), L(21, "stage r#2 lane"), L(621, "stage r#2 gate gate=b ok=yes secs=600"),
+            L(700, "stage r#2 verdict verdict=LAND"), L(710, "stage r#2 merged sha=cc"),
+            L(30, "queued r#3 who=x"), L(31, "stage r#3 lane"), L(1230, "stage r#3 gate gate=a ok=no secs=600"),
+            L(1231, "stage r#3 handback"), L(2000, "requeued r#3 who=x"), L(2001, "stage r#3 lane"),
+            L(2601, "stage r#3 gate gate=a ok=yes secs=600"), L(2700, "stage r#3 merged sha=dd"),
+            L(40, "queued r#4 who=x"), L(3000, "stage r#4 merged by=before"),
+            L(50, "stage demo#7 verdict=LAND digest=x"),
+        ])
+        with open(f"{lq}/queue.log", "w") as f:
+            f.write("".join(sorted(log.splitlines(True))))
+        for n, files, checks, paid, hist in ((1, ["x.py"], ["a"], False, []), (2, ["y.py"], ["b"], True, []),
+                                              (3, ["x.py", "z.py"], ["a"], False,
+                                               [{"at": stamp(t0 + 800), "state": "held", "why": "PR #3 conflicts with main: x.py"}])):
+            with open(f"{lq}/rest/r-{n}.json", "w") as f:
+                json.dump({"repo": "r", "pr": n, "files": files, "plan": {"checks": checks, "paid": paid}, "history": hist}, f)
+        os.environ["CC_REPLAY_SYSSTAT"] = f"{lroot}/no-sysstat"
+        tr = lander_trace(f"{lq}/queue.log", lq, t0, t0 + 4000)
+        by = {p["pr"]: p for p in tr["prs"]}
+        check("v3 extract: a PR first queued in the window is in, one queued before it is left out, a demo line is not a PR",
+              sorted(by) == [1, 2, 3, 4] and tr["left_out"] == ["r#9"])
+        check("…a request after a handback is a new head; the gates before it are head 0, after it head 1",
+              by[3]["bumps"] == [t0 + 2000] and [r[:3] for r in by[3]["gates"]["a"]] == [[0, 600, "no"], [1, 600, "yes"]]
+              and by[1]["bumps"] == [])
+        check("…the pick-up is history's first stage line after each request; a verdict's secs run from the line before it",
+              by[3]["seen"] == [t0 + 31, t0 + 2001] and by[4]["seen"] == [t0 + 3000] and by[2]["verdicts"] == [[0, "LAND", 79]])
+        check("…a conflict hold from the job file is kept at its head; a PR the lane never planned is opaque, one it planned not",
+              by[3]["conflicts"] == [[0, t0 + 800]] and by[4]["opaque"] and not by[1]["opaque"]
+              and by[4]["merged"] == {"at": t0 + 3000, "by": "person"} and by[1]["merged"]["by"] == "lane")
+        spans = main_red_spans({"until": stamp(1000), "prs": [{"gates": {"g": [[0, 5, "main-red", 100], [0, 5, "yes", 200]]}},
+                                                                {"gates": {"g": [[0, 5, "main-red", 300]], "h": [[0, 5, "yes", 50]]}}]})
+        check("main red is a span of time on any PR: to the next pass anywhere, or past the window's end; a pass alone is none",
+              spans == {"g": [(100, 200), (300, 1001)]})
+        calm = f"{lroot}/calm.json"
+        with open(calm, "w") as f:
+            json.dump(tr, f)
+        me = os.path.realpath(__file__)
+
+        def run(trace, *extra):
+            r = subprocess.run([sys.executable, me, "score", "--candidate", core, "--trace", trace, *extra],
+                               capture_output=True, text=True, timeout=120)
+            rows = {ln.split()[0]: ln.split()[1:] for ln in r.stdout.splitlines()[5:] if ln.strip()}
+            return r, rows
+        a, arows = run(calm)
+        b, _ = run(calm)
+        num = lambda rows, k, i=1: float(rows[k][i]) if k in rows and rows[k][i] != "-" else None  # noqa: E731
+        check("v3 score: a checkout's own core/lander is driven, and prints the score and history's line beside it",
+              a.returncode == 0 and a.stdout.startswith("score p50 ") and "\nhistory p50 " in a.stdout)
+        check("…the same trace scores to the same bytes", a.stdout == b.stdout and a.stdout)
+        check("…a calm box runs #1's and #2's checks side by side: #2 merges ~11 min in, as history's recorded times say",
+              num(arows, "r#2") is not None and 10.5 <= num(arows, "r#2") <= 12.0)
+        check("…#3 shares x.py with #1, is handed back on its recorded red and merges on the head pushed after it",
+              num(arows, "r#3") is not None and 42 <= num(arows, "r#3") <= 46)
+        check("…a PR the lane never planned merges when the person merged it, not before",
+              num(arows, "r#4") is not None and abs(num(arows, "r#4") - 49.3) < 0.2)
+        check("…the reviewer's digest_of is answered from the trace (a stable stand-in per head), never by running git",
+              (lambda u: u.digest_of("/nonexistent", "a", "h1") == u.digest_of("/nonexistent", "b", "h1")
+               != u.digest_of("/nonexistent", "a", "h2"))(_digest_unit(core)))
+        real_run, leak = subprocess.run, ""
+        try:
+            with tripwire(core):
+                land.digest_of("/nonexistent", "a", "h1")
+        except ReplayLeak as e:
+            leak = str(e)
+        check("…a lander call no stand-in answers is refused by name, not run: review.digest_of's git is a ReplayLeak",
+              "review.digest_of:" in leak and "`git " in leak and subprocess.run is real_run)
+        if a.returncode:
+            print("    " + (a.stderr.strip().splitlines() or ["(no stderr)"])[-1])
+        def leak_of(fn):
+            try:
+                fn()
+            except ReplayLeak as e:
+                return str(e)
+            return ""
+        check("…a unit function or a whole unit the world lacks is a ReplayLeak naming it, not a held job",
+              "reviewer.nothing," in leak_of(lambda: _digest_unit(core).nothing)
+              and "its tip unit" in leak_of(lambda: answering(lambda lane, name: None)(None, "tip")))
+        check("…and a replay of this checkout's lander called nothing the world does not answer (the line above names it)",
+              a.returncode == 0)
+        # history's load reaches the candidate's own admission: three PRs side by side on a calm box, and on a box
+        # at 2x its cores as many as the candidate's slots_now() admits at that load, the rest a check later
+        tq = f"{lroot}/land-load"
+        os.makedirs(f"{tq}/rest")
+        with open(f"{tq}/queue.log", "w") as f:
+            f.write("".join(sorted(L(at, f"{w} t#{n}{x}") for n in (1, 2, 3) for at, w, x in (
+                (10, "queued", " who=x"), (11, "stage", " lane"), (611, "stage", f" gate gate=c{n} ok=yes secs=600"),
+                (620, "stage", f" merged sha=t{n}")))))
+        for n in (1, 2, 3):
+            with open(f"{tq}/rest/t-{n}.json", "w") as f:
+                json.dump({"repo": "t", "pr": n, "files": [f"t{n}.py"], "plan": {"checks": [f"c{n}"], "paid": False}}, f)
+        lt = lander_trace(f"{tq}/queue.log", tq, t0, t0 + 4000)
+        tcalm, tload = f"{lroot}/t-calm.json", f"{lroot}/t-load.json"
+        with open(tcalm, "w") as f:
+            json.dump(lt, f)
+        with open(tload, "w") as f:
+            json.dump(dict(lt, load=[[t0 - 900, 10_000.0]]), f)
+        adm = importlib.import_module("lander.admission")
+        with open(f"{lroot}/loadavg", "w") as f:
+            f.write(f"{2 * (os.cpu_count() or 1) + 1} 1 1 1/1 1\n")
+        want = adm.slots_now(f"{lroot}/no-psi", 3, f"{lroot}/loadavg")
+        fast = lambda rows: sum(1 for n in (1, 2, 3) if (num(rows, f"t#{n}") or 99) < 12)  # noqa: E731
+        (_, trows), (_, lrows) = run(tcalm, "--slots", "3"), run(tload, "--slots", "3")
+        check(f"…history's load at 2x the cores reaches the candidate's slots_now() ({want} of 3): that many of three "
+              "PRs merge in one check's time, the rest a check later; all three on a calm box",
+              want < 3 and fast(trows) == 3 and fast(lrows) == want
+              and all((num(lrows, f"t#{n}") or 0) >= 19 for n in range(want + 1, 4)))
+        d, _ = run(calm, "--slots", "1")
+        check("…--slots is the candidate's own SLOTS: one slot on a calm box is history's pace for #2 again",
+              d.returncode == 0 and "slots 1," in d.stdout)
+        # slot waits on work the trace never saw: its own fixture
+        bq = f"{lroot}/land-blocked"
+        os.makedirs(f"{bq}/rest")
+        with open(f"{bq}/queue.log", "w") as f:
+            f.write("".join(sorted([
+                L(10, "queued s#5 who=x"), L(11, "stage s#5 lane"), L(12, "stage s#5 checking"),
+                L(1212, "stage s#5 gate gate=a ok=yes secs=10"), L(1220, "stage s#5 merged sha=ee"),
+                L(10, "queued s#6 who=x"), L(11, "stage s#6 lane"), L(1211, "stage s#6 gate gate=a ok=yes secs=10"),
+                L(1300, "stage s#6 merged sha=ff"),
+                L(10, "queued s#7 who=x"), L(12, "stage s#7 checking"), L(9212, "stage s#7 gate gate=a ok=yes secs=10"),
+                L(9300, "stage s#7 merged sha=gg"),
+            ])))
+        for n in (5, 6, 7):
+            with open(f"{bq}/rest/s-{n}.json", "w") as f:
+                json.dump({"repo": "s", "pr": n, "files": [f"f{n}.py"], "plan": {"checks": ["a"], "paid": False}}, f)
+        bt = lander_trace(f"{bq}/queue.log", bq, t0, t0 + 10000)
+        check("v3 extract: a check that started 20 min after the lane's `checking` sat on a slot; one after a bare "
+              "`lane` line, or 2.5 h later (a stalled lane), is no slot wait",
+              bt["blocked"] == [[t0 + 12, t0 + 1202]])
+        waits, free = f"{lroot}/waits.json", f"{lroot}/free.json"
+        only5 = dict(bt, prs=[p for p in bt["prs"] if p["pr"] == 5])
+        with open(waits, "w") as f:
+            json.dump(only5, f)
+        with open(free, "w") as f:
+            json.dump(dict(only5, blocked=[]), f)
+        (e, erows), (g, grows) = run(waits), run(free)
+        check("v3 score: while history's check sat on a slot someone else held, the replay's waits it out too; "
+              "without that wait it runs at once",
+              num(erows, "s#5") is not None and num(erows, "s#5") >= 19.8 and num(grows, "s#5") is not None
+              and num(grows, "s#5") < 2)
+    finally:
+        os.environ.pop("CC_REPLAY_SYSSTAT", None)
+        shutil.rmtree(lroot, ignore_errors=True)
     print(f"cc-replay selfcheck: {len(fails)} failed")
     return 1 if fails else 0
 
@@ -2004,7 +3024,7 @@ def ledger_events_from_text(text, since, until):
 
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__.strip().split("\n\n")[0] + "\n\n" + "\n".join(l for l in __doc__.splitlines()[2:24] if l.startswith("  ")))
+        print(__doc__.strip().split("\n\n")[0] + "\n\n" + "\n".join(l for l in __doc__.splitlines() if l.startswith("  cc-replay ")))
         return 0 if argv else 2
     cmd, rest = argv[0], argv[1:]
     if cmd == "extract":

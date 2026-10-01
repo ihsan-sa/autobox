@@ -19,7 +19,7 @@
 #   cc-suites status              the runner this box would use, and what it answers. exit 0 reachable, 75 not
 #   cc-suites runner              the runner's side, on the other machine: the forced command of the key, reading
 #                                 SSH_ORIGINAL_COMMAND (`status`, `run SUITE TREE PART CHANGED-B64`, or the lander's
-#                                 one check, `job CHECK TREE CAP RUN-B64 CWD-B64`) and a tar on stdin
+#                                 one check, `job CHECK TREE CAP RUN-B64 CWD-B64 [net]`) and a tar on stdin
 #   cc-suites laptop-setup [NODE] print the PowerShell script the owner runs once on a Windows laptop (below), and on
 #                                 this box make the key and point ~/.cc/suites/remote at ccsuite@NODE
 #                                 (default cc-suites-runner, the tailnet name the script gives the runner)
@@ -290,8 +290,9 @@ runner_missing(){   # the needs this machine lacks, space-separated, or nothing
   local c m=""
   for c in ${CC_SUITES_RUNNER_NEEDS:-$RUNNER_NEEDS}; do
     command -v "$c" >/dev/null 2>&1 || { m="$m $c"; continue; }
-    # bwrap present is not bwrap usable (user namespaces off, or an AppArmor rule against it): cc-sandbox needs it to run
-    [ "$c" != bwrap ] || bwrap --ro-bind / / --dev /dev --proc /proc true >/dev/null 2>&1 || m="$m bwrap(does-not-run)"
+    # bwrap present is not bwrap usable (user namespaces off, or an AppArmor rule against it): cc-sandbox needs it to
+    # run, and the cage needs a network namespace of its own, so a bwrap that cannot cut the network does not run either
+    [ "$c" != bwrap ] || bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net true >/dev/null 2>&1 || m="$m bwrap(does-not-run)"
   done
   echo "${m# }"
 }
@@ -303,10 +304,20 @@ runner_missing(){   # the needs this machine lacks, space-separated, or nothing
 # outlives it, sees the runner, or signals it. It cannot write /usr/local/bin/cc-suites, the account's home or
 # authorized_keys, or any other run's tree, so it cannot change what a later run is told (2026-09-29, the security
 # read of #806). No bwrap that runs is `unfit`: nothing runs uncaged.
-# cage_argv DIR… sets CG to the bwrap prefix; the command follows it.
+# NO NETWORK by default: a network namespace of its own with only a loopback, so PR code cannot reach the tailnet,
+# the box's services or anything else (2026-09-29, the security read of #807), and a fresh empty /run, since a
+# read-only bind still lets a job connect to a Unix socket: a caged job read the tailnet's peers from the VPN
+# daemon's socket there (2026-09-30, the security read of #866). A job the lander sends with a
+# trailing `net` (its manifest's net = true, which a PR cannot grant itself: manifest.py self_widening) keeps the
+# machine's network; a whole suite never does. A check that needed the network and was not given it goes red here,
+# and a laptop red is said again on the box (run.py), so a missing opt-in costs box time, never a wrong verdict.
+# cage_argv [--net] DIR… sets CG to the bwrap prefix; the command follows it.
 cage_argv(){
+  local net=""; [ "${1:-}" != --net ] || { net=1; shift; }
   CG=(bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /var/tmp)
-  [ ! -d /run/user ] || CG+=(--tmpfs /run/user)
+  # the network cut, /run goes too: a socket there (a VPN daemon's, the system bus) is still reached through the
+  # read-only root, and no job without the network needs one; nothing under it is bound back
+  if [ -n "$net" ]; then [ ! -d /run/user ] || CG+=(--tmpfs /run/user); else CG+=(--unshare-net --tmpfs /run); fi
   CG+=(--tmpfs "$RUNNER_DIR")
   local d; for d in "$@"; do CG+=(--bind "$d" "$d"); done
   CG+=(--unshare-pid --unshare-ipc --die-with-parent --new-session --)
@@ -350,6 +361,9 @@ runner_facts(){
 runner(){
   local -a a pre; local rel tree part changed i slot t rc why lim rp
   w=""; gp=""; pg=""   # global, not local: the EXIT trap reads them after this function has returned
+  # read takes the first line and drops the rest, so a second line (a check name carrying one) could make a job of
+  # its own, `net` and all: a command is one line, or it is refused whole before anything runs
+  case ${SSH_ORIGINAL_COMMAND:-} in *$'\n'*|*$'\r'*) echo "cc-suite-runner: refused: a command is one line"; return 2;; esac
   read -r -a a <<<"${SSH_ORIGINAL_COMMAND:-}"
   mkdir -p "$RUNNER_DIR"
   case ${a[0]:-} in
@@ -425,7 +439,8 @@ tmux new-session -d -s main -x 200 -y 50 2>/dev/null
   echo "cc-suite-runner: verdict exit=$rc tree=$tree"
   return 0
 }
-# The lander's one check (run.py laptop_argv): `job CHECK TREE CAP RUN_B64 CWD_B64` and the tree as a tar on stdin.
+# The lander's one check (run.py laptop_argv): `job CHECK TREE CAP RUN_B64 CWD_B64 [net]` and the tree as a tar on
+# stdin. `net` is the only sixth word taken: the check keeps the network (THE CAGE); without it the job has none.
 # The same refusals as a run — no slot or loaded is `cc-suite-runner: busy (…)`, exit 75, and the lander
 # reads any exit but 0 as no answer (unrunnable, never red) and runs the check on the box. Each job gets a directory
 # and a HOME of its own, proves the tree by write-tree, and both go when it ends. Its lines come back `| `-prefixed,
@@ -433,10 +448,10 @@ tmux new-session -d -s main -x 200 -y 50 2>/dev/null
 # a host check brings its own tmux `main` in its line (run.py HOST_PREP), inside the cage.
 JOB_NEEDS="git tar timeout setsid nice"
 runner_job(){
-  local name=${1:-} tree=${2:-} cap=${3:-} rb=${4:-} cb=${5:-} line cwd why slot j t rc
-  { [ "$#" = 5 ] && [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] && [[ $tree =~ ^[0-9a-f]{40}$ ]] && [[ $cap =~ ^[0-9]+$ ]] \
+  local name=${1:-} tree=${2:-} cap=${3:-} rb=${4:-} cb=${5:-} net=${6:-} line cwd why slot j t rc
+  { { [ "$#" = 5 ] || { [ "$#" = 6 ] && [ "$net" = net ]; }; } && [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] && [[ $tree =~ ^[0-9a-f]{40}$ ]] && [[ $cap =~ ^[0-9]+$ ]] \
     && [[ $rb =~ ^[A-Za-z0-9+/=]+$ ]] && [[ $cb =~ ^[A-Za-z0-9+/=]+$|^-$ ]]; } \
-    || { echo "cc-suite-runner: refused: job CHECK TREE CAP RUN_B64 CWD_B64"; return 2; }
+    || { echo "cc-suite-runner: refused: job CHECK TREE CAP RUN_B64 CWD_B64 [net]"; return 2; }
   line=$(printf '%s' "$rb" | base64 -d 2>/dev/null) && [ -n "$line" ] || { echo "cc-suite-runner: refused: bad encoding"; return 2; }
   if [ "$cb" = - ]; then cwd=""; else cwd=$(printf '%s' "$cb" | base64 -d 2>/dev/null) || { echo "cc-suite-runner: refused: bad encoding"; return 2; }; fi
   case "/$cwd/" in //*|*/../*) [ -z "$cwd" ] || { echo "cc-suite-runner: refused: cwd leaves the tree"; return 2; };; esac
@@ -461,7 +476,7 @@ runner_job(){
   local -a pre=(timeout -k 10 "$cap" nice -n 19)
   command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
   # the log is the runner's, outside the cage: the job reaches it only through the stdout it was handed
-  cage_argv "$j"
+  if [ -n "$net" ]; then cage_argv --net "$j"; else cage_argv "$j"; fi
   ( cd "$j/tree/$cwd" && exec setsid env -i HOME="$j/home" USER="${USER:-$(id -un)}" PATH=/usr/local/bin:/usr/bin:/bin \
       LANG=C.UTF-8 TERM=dumb TMPDIR="$j" CC_SELFTEST_SPILL=0 "${pre[@]}" "${CG[@]}" /bin/sh -c "$line" ) \
     </dev/null {LK}>&- >"$j.log" 2>&1 & gp=$!; pg=$gp
@@ -756,6 +771,51 @@ echo own > core/own && echo OWN; exit 1" | base64 -w0)
   out=$(bash "$SELF" status 2>&1)
   k "$(b 'grep -q "answers: free 4 " <<<"$out"')" "…nor holds its slot: status answers every slot free after it (got: ${out%% cores=*})"
   pkill -KILL -x -f "$cs" 2>/dev/null; rm -rf "$C" "$D/cage.before" "$D/runner/slots"
+  # NO NETWORK: a listener of this selfcheck's own on this machine's loopback stands in for the box's services (it
+  # is bound to loopback only, so the selfcheck opens nothing to the outside). A caged job cannot open a socket to
+  # it, and has no interface but its own lo, so no tailnet either; the same job sent with `net` (a manifest's
+  # net = true) reaches it; any other sixth word is refused before anything runs.
+  local lp lpid ln jn; ln="$D/listen.port"; rm -f "$ln"
+  python3 -c 'import socket, sys
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(8); open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+while True: s.accept()[0].close()' "$ln" & lpid=$!
+  for _ in $(seq 1 50); do [ -s "$ln" ] && break; sleep 0.1; done; lp=$(cat "$ln" 2>/dev/null)
+  jn=$(printf '%s' "echo IF \$(awk -F: \"NR > 2 { print \\\$1 }\" /proc/net/dev); python3 -c 'import socket, sys
+try: socket.create_connection((\"127.0.0.1\", int(sys.argv[1])), timeout=3); print(\"REACHED\")
+except OSError: print(\"CUT\")' $lp" | base64 -w0)
+  out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="job c $jt 60 $jn -" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ -n "$lp" ] && [ "$rc" = 0 ] && grep -qx "| CUT" <<<"$out" && grep -qx "| IF lo" <<<"$out" && ! grep -q "REACHED" <<<"$out"')" "a caged job cannot open a socket to a service on this machine, and has no interface but lo (got $rc)"
+  out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="job c $jt 60 $jn - net" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -qx "| REACHED" <<<"$out"')" "…and the same job sent with net reaches it (got $rc)"
+  out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="job c $jt 60 $jn - share" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 2 ] && grep -q "refused: job CHECK TREE CAP RUN_B64 CWD_B64 \[net\]" <<<"$out" && ! grep -q "REACHED\|CUT\|IF \|verdict" <<<"$out"')" "…and any sixth word but net is refused and runs nothing (got $rc)"
+  # a check name with a newline in it arrives as two lines, the first a well-formed job ending in net: refused whole
+  out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="job c $jt 60 $jn - net"$'\n'"junk" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 2 ] && grep -q "refused: a command is one line" <<<"$out" && ! grep -q "REACHED\|CUT\|IF \|verdict" <<<"$out"')" "…and a command with a second line in it is refused and runs nothing (got $rc)"
+  out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="job c $jt 60 $jn - net"$'\r' bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 2 ] && grep -q "refused: a command is one line" <<<"$out" && ! grep -q "REACHED\|CUT\|IF \|verdict" <<<"$out"')" "…and so is one with a carriage return in it (got $rc)"
+  kill "$lpid" 2>/dev/null; wait "$lpid" 2>/dev/null
+  # …NOR A SOCKET UNDER /run: a Unix socket of this selfcheck's own, planted in the first world-writable directory
+  # under /run (the stand-in for a daemon's socket there), answers outside the cage and is not there inside it
+  local rd rs rpid; rd=""; for rs in /run/lock /run/screen; do [ -d "$rs" ] && [ -w "$rs" ] && { rd=$rs; break; }; done
+  if [ -n "$rd" ] && rd=$(mktemp -d "$rd/cc-suites-selfcheck.XXXXXX"); then
+    rs="$rd/s.sock"; python3 -c 'import os, socket, sys
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(8)
+while True: s.accept()[0].close()' "$rs" & rpid=$!
+    for _ in $(seq 1 50); do [ -S "$rs" ] && break; sleep 0.1; done
+    jn=$(printf '%s' "python3 -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(3)
+try: s.connect(sys.argv[1]); print(\"REACHED\")
+except OSError: print(\"CUT\")' $rs" | base64 -w0)
+    p1=$(python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1]); print("up")' "$rs" 2>&1)
+    out=$(cd "$R" && git archive HEAD | CC_SUITES_RUNNER_PREP=0 SSH_ORIGINAL_COMMAND="job c $jt 60 $jn -" bash "$SELF" runner 2>&1); rc=$?
+    k "$(b '[ "$p1" = up ] && [ "$rc" = 0 ] && grep -qx "| CUT" <<<"$out" && ! grep -q "REACHED" <<<"$out"')" "…nor connect to a Unix socket planted under /run, which answers outside the cage (got $rc, outside: $p1)"
+    kill "$rpid" 2>/dev/null; wait "$rpid" 2>/dev/null; rm -rf "$rd"
+  else echo "  - no writable directory under /run here: the /run socket case is skipped"; fi
+  # a bwrap that runs but cannot cut the network is no cage: unfit, and nothing runs
+  mkdir -p "$D/nonet"; printf '#!/bin/sh\nfor a; do [ "$a" != --unshare-net ] || exit 1; done\nexec %s "$@"\n' "$(command -v bwrap)" > "$D/nonet/bwrap"; chmod +x "$D/nonet/bwrap"
+  out=$(cd "$R" && git archive HEAD | PATH="$D/nonet:$PATH" CC_SUITES_JOB_NEEDS=git SSH_ORIGINAL_COMMAND="job c $jt 60 $jb -" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q "unfit (missing: bwrap(does-not-run))" <<<"$out" && ! grep -q "verdict\|home=" <<<"$out"')" "a runner whose bwrap cannot cut the network answers unfit to a job, 75, and runs nothing (got $rc)"
   # …and a machine whose bwrap does not run takes no job, whatever the needs are set to: nothing runs uncaged
   mkdir -p "$D/nobw"; printf '#!/bin/sh\nexit 1\n' > "$D/nobw/bwrap"; chmod +x "$D/nobw/bwrap"
   out=$(cd "$R" && git archive HEAD | PATH="$D/nobw:$PATH" CC_SUITES_JOB_NEEDS=git SSH_ORIGINAL_COMMAND="job c $jt 60 $jb -" bash "$SELF" runner 2>&1); rc=$?
