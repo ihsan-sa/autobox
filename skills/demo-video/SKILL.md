@@ -71,10 +71,14 @@ cursor moves on every frame. Nothing real may be in frame: every beat checks the
   `pieces(React)` so no bundler is needed to check them: `Ripple` (a touch: ring and press dot, never a cursor or a
   hand), `MessageIn` (a list item that opens its height and
   rises in, its blur gone before the still tail so it never pops), `Typed`, `Camera` (with `depth` for parallax and `driftAmp`), `MotionBlur` (n samples across a
-  180-degree shutter; give n = 1 when the move is slow) and `Crossfade`. `render.mjs` renders it: `renderFilm`
+  180-degree shutter; give n = 1 when the move is slow) and `Crossfade` (each side its own stacking context, so a
+  z-index inside the outgoing shot never paints over the incoming one). `render.mjs` renders it: `renderFilm`
   (lossless PNG frames, one H.264 yuv420p encode, faststart), `renderStills`, and `frameCost`, which times a
   stretch so you can pick 30 or 60 fps from what the box can do now. `measure.mjs` makes "no stutter" a number:
-  `frameDiffs(mp4)` and `stutters(diffs)`, the frames that froze in the middle of a move. Remotion and React are
+  `frameDiffs(mp4)` and `stutters(diffs)`, the frames that froze in the middle of a move. `sound.mjs` is the film's
+  sound effects, synthesized, so no recording and no licence: `mix(cues, {dur})` places its voices (a tap, a key,
+  typing, a message, a whoosh for a camera move, a rise into a 3D shot, a chord for the end) on their times, and
+  `master` brings the mix to -16 LUFS under -1.5 dBTP and muxes it in as AAC, copying the video. Remotion and React are
   `MOTION_PINS` in `deps.mjs`, installed into the same cache on first use.
 
 ## How to make one

@@ -2,7 +2,7 @@
 /* selfcheck.mjs (the demo-video skill) — the kit's own checks.
 
     node selfcheck.mjs          # no browser: the director's frames, the camera, the encode, the joins, the limits, the recorder,
-                                #   and motion/: its maths, its stutter measure and its React pieces (rendered to markup)
+                                #   and motion/: its maths, its stutter measure, its React pieces (rendered to markup) and its sound
     node selfcheck.mjs --film   # also films a moving page and a tiny sandboxed terminal in Chromium and checks the MP4s
 
 Each case builds what it needs in its own temp dir and prints one line; the exit code is the number that failed. */
@@ -396,6 +396,68 @@ await check('pieces: render to markup, each a function of t: a ripple only in it
   eq(html(h(P.MotionBlur, { t: 1, n: 1, render: () => h('i', null, 'x') })), '<i>x</i>', 'one sample is the sharp frame');
   const typedNow = html(h(P.Typed, { t: 0.5, t0: 0, t1: 1, text: 'abcd', caret: false }));
   eq(typedNow, 'ab', 'typed half way');
+  /* a crossfade keeps a z-index inside its side: both sides isolated mid-fade, only `from` before it starts */
+  const sides = (t) => html(h(P.Crossfade, { t, t0: 1, dur: 0.4, from: () => h('i', { style: { position: 'absolute', zIndex: 70 } }, 'a'),
+    to: () => h('b', null, 'b') }));
+  eq([(sides(1.2).match(/isolation:isolate/g) || []).length, sides(1.2).includes('<b>b</b>')], [2, true], 'crossfade mid-fade');
+  eq([(sides(0.5).match(/isolation:isolate/g) || []).length, sides(0.5).includes('<b>')], [1, false], 'crossfade before it starts');
+});
+
+// ── motion/sound.mjs: the synthesized sound effects, their mix, the limiter and the master ──
+const S = await import('./motion/sound.mjs');
+const peakOf = (a) => a.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+
+await check('sound: every voice is finite, starts and ends silent, and is the same for the same cue; noise differs at another time', () => {
+  for (const kind of Object.keys(S.VOICES)) {
+    const [a, b] = S.voice({ at: 1.234, kind }), [a2] = S.voice({ at: 1.234, kind });
+    const p = Math.max(peakOf(a), peakOf(b));
+    if (!(p > 0) || !a.every(Number.isFinite) || !b.every(Number.isFinite)) throw new Error(`${kind}: silent or not finite`);
+    if (Math.abs(a[0]) > 0.01 * p || Math.abs(a[a.length - 1]) > 0.01 * p) throw new Error(`${kind}: does not start and end silent`);
+    eq([a2.length, a2.every((x, i) => x === a[i])], [a.length, true], `${kind}: the same cue twice`);
+  }
+  const w1 = S.voice({ at: 1, kind: 'whoosh' })[0], w2 = S.voice({ at: 2, kind: 'whoosh' })[0];
+  if (w1.every((x, i) => x === w2[i])) throw new Error('a whoosh at another time has the same noise');
+});
+
+await check('sound: LEVEL is what levels() measures, so every voice peaks alike at gain 0 and a gain is the mix\'s alone', () => {
+  const got = S.levels();
+  for (const k of Object.keys(S.VOICES)) near(S.LEVEL[k], got[k], 0.3, `LEVEL.${k} (levels() measures it now)`);
+});
+
+await check('sound: a cue lands on its own sample and pans where it says; an unknown kind is refused', async () => {
+  const left = S.mix([{ at: 0.5, kind: 'tap', pan: -1 }], { dur: 1 }), right = S.mix([{ at: 0.5, kind: 'tap', pan: 1 }], { dur: 1 });
+  const first = left.L.findIndex((x) => x !== 0);
+  if (first < S.RATE * 0.5 || first > S.RATE * 0.5 + 2) throw new Error(`the tap starts at sample ${first}, not ${S.RATE * 0.5}`);
+  if (peakOf(left.R) > 1e-6 * peakOf(left.L) || peakOf(right.L) > 1e-6 * peakOf(right.R)) throw new Error('a hard pan leaks into the other side');
+  eq(S.mix([{ at: 0.95, kind: 'pad', dur: 3 }], { dur: 1 }).L.length, S.RATE, 'a cue past the end is cut there');
+  await throws(() => S.mix([{ at: 0, kind: 'trumpet' }], { dur: 1 }), /no voice "trumpet"/, 'unknown kind');
+});
+
+await check('sound: the limiter holds a spike at its ceiling and leaves audio under it untouched', () => {
+  const n = S.RATE, k = n / 4, quiet = Float32Array.from({ length: n }, (_, i) => 0.3 * Math.sin(i / 7));
+  const loud = quiet.map((x, i) => (i === k ? 2 : x));
+  const [q] = S.limit(quiet, quiet, 0.5), [l] = S.limit(loud, loud, 0.5);
+  if (!q.every((x, i) => x === quiet[i])) throw new Error('audio under the ceiling was changed');
+  if (peakOf(l) > 0.5 + 1e-6) throw new Error(`a spike came out at ${peakOf(l)}, over the 0.5 ceiling`);
+  /* 4 ms before it is past the 2 ms look-ahead; 0.4 s after, the 60 ms release has let go */
+  const after = k + S.RATE * 0.4;
+  if (l[k - 200] !== loud[k - 200] || !(Math.abs(l[after] - loud[after]) < 1e-3)) throw new Error('the limiter reached far from the spike');
+});
+
+await check('sound: master brings a mix to -16 LUFS under -1.5 dBTP, as AAC beside the copied video; a silent mix is refused', async () => {
+  const dir = tmp();
+  try {
+    const video = join(dir, 'v.mp4');
+    execFileSync(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=black:s=320x180:r=30:d=3',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', video]);
+    const cues = [0.2, 0.9, 1.6, 2.3].flatMap((t) => [{ at: t, kind: 'message' }, { at: t + 0.3, kind: 'tap' }, { at: t, kind: 'whoosh', dur: 0.6 }]);
+    const got = S.master(S.mix(cues, { dur: 3 }), { video, out: join(dir, 'out.mp4') });
+    near(got.I, -16, 0.5, 'integrated loudness of the AAC');
+    if (!(got.TP <= -1.5)) throw new Error(`true peak ${got.TP} dBTP, over -1.5`);
+    const streams = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', join(dir, 'out.mp4')], { encoding: 'utf8' });
+    eq(streams.trim().split('\n'), ['h264', 'aac'], 'streams');
+    await throws(() => S.master(S.mix([], { dur: 3 }), { video, out: join(dir, 'silent.mp4') }), /silent/, 'a silent mix');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 if (process.argv.includes('--film')) {

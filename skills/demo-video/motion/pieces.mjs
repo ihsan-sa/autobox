@@ -73,11 +73,12 @@ export function pieces(React) {
   }
 
   /** `from` until t0, `to` after t0 + dur, and a crossfade between: the one dissolve a film keeps for its end card. */
+  /* each side is its own stacking context, so a z-index inside `from` stays there and `to` always paints over it */
   function Crossfade({ t, t0, dur = 0.5, from, to }) {
     const x = tween(t, t0, t0 + dur, 0, 1, EASE.inOut);
     return h('div', { style: abs({ inset: 0 }) },
-      x < 1 && h('div', { style: abs({ inset: 0 }) }, from()),
-      x > 0 && h('div', { style: abs({ inset: 0, opacity: x }) }, to()));
+      x < 1 && h('div', { style: abs({ inset: 0, isolation: 'isolate' }) }, from()),
+      x > 0 && h('div', { style: abs({ inset: 0, opacity: x, isolation: 'isolate' }) }, to()));
   }
 
   return { Ripple, MessageIn, Typed, Camera, MotionBlur, Crossfade };
