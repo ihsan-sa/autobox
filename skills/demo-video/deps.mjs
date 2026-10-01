@@ -1,8 +1,8 @@
 /* deps.mjs (the demo-video skill) — the node modules and the browser every film needs, found or installed once.
 
 Modules come from DEMO_NODE_MODULES when it is set, else from ~/.cache/demo-video, where the first run installs the
-versions in PINS with npm: Playwright's driver and xterm.js to film, Remotion and React to render the camera. The
-browser is the newest Chromium in ~/.cache/ms-playwright (CHROME to name another); Remotion renders in the same one. */
+versions in PINS with npm: Playwright's driver and xterm.js. The browser is the newest Chromium in
+~/.cache/ms-playwright (CHROME to name another); it films the page and composites the frames. */
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -11,7 +11,6 @@ import { dirname, join } from 'node:path';
 
 export const PINS = {
   'playwright-core': '1.62.1', '@xterm/xterm': '6.0.0',
-  remotion: '4.0.530', '@remotion/bundler': '4.0.530', '@remotion/renderer': '4.0.530', react: '19.3.0', 'react-dom': '19.3.0',
 };
 const CACHE = join(homedir(), '.cache', 'demo-video');
 
@@ -30,7 +29,7 @@ export function modules() {
 /** A path inside one of the modules, e.g. mod('@xterm/xterm', 'lib/xterm.js'). */
 export const mod = (name, ...rest) => join(modules(), name, ...rest);
 
-/** A module from the film's node_modules, e.g. need('@remotion/renderer'). */
+/** A module from the film's node_modules, e.g. need('playwright-core'). */
 export const need = (name) => createRequire(join(dirname(modules()), 'x.js'))(name);
 
 /** The Chromium to use: CHROME, else the newest in the Playwright cache, else undefined (Playwright's own). */

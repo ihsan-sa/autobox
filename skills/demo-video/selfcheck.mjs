@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /* selfcheck.mjs (the demo-video skill) — the kit's own checks.
 
-    node selfcheck.mjs          # no browser: the timeline, the joins, the length limit, the denied words, the recorder
-    node selfcheck.mjs --film   # also records a tiny terminal in the sandbox, films it and checks the MP4
+    node selfcheck.mjs          # no browser: the director's frames, the camera, the encode, the joins, the limits, the recorder
+    node selfcheck.mjs --film   # also films a moving page and a tiny sandboxed terminal in Chromium and checks the MP4s
 
 Each case builds what it needs in its own temp dir and prints one line; the exit code is the number that failed. */
 import { execFileSync } from 'node:child_process';
@@ -10,8 +10,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { timeline, fadeOffsets, firstDenied, captionFilter, encodeFrames, stitch, checkLength, lengthOf, contactSheet,
-  director, encodeClip, camerawork, FFMPEG, RESULT_MS, MAX_FILM_S } from './film.mjs';
+import { fadeOffsets, firstDenied, captionFilter, encodeFrames, stitch, checkLength, lengthOf, contactSheet,
+  director, encodeClip, handEase, reachMs, sleep, FFMPEG, RESULT_MS, MAX_FILM_S } from './film.mjs';
 import { cameraAt, viewFor, transformOf, rest } from './camera.mjs';
 
 process.env.DEMO_VIDEO_CHECKED = '1';  // a check, not a render: director() skips the preflight
@@ -34,17 +34,6 @@ const clip = (dir, name, secs, color = 'navy') => {
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', f]);
   return f;
 };
-
-await check('timeline: a frame lasts until the next, and the last until the end', () => {
-  const t = timeline([{ file: 'a', t: 10 }, { file: 'b', t: 10.5 }, { file: 'c', t: 11 }], [], 12);
-  eq(t.map((f) => f.dur), [0.5, 0.5, 1], 'durations');
-});
-
-await check('timeline: a cut stretch is taken out, the frames around it keep their length', () => {
-  const shots = [{ file: 'a', t: 0 }, { file: 'b', t: 1 }, { file: 'c', t: 4 }];
-  eq(timeline(shots, [[1.2, 3.8]], 5).map((f) => +f.dur.toFixed(3)), [1, 0.4, 1], 'with the cut');
-  eq(timeline(shots, [], 5).map((f) => f.dur), [1, 3, 1], 'without it');
-});
 
 await check('camera: at rest before a move, moving on every frame of it, and at rest again after the way back', () => {
   const size = { w: 1920, h: 1080 }, box = { x: 100, y: 100, w: 600, h: 300 };
@@ -75,35 +64,107 @@ await check('camera: a move that starts mid-flight starts where the camera had g
   if (!(swoop.s < Math.sqrt(2) * 0.81)) throw new Error('no pull-back at the middle: ' + swoop.s);
 });
 
-await check('director: a camera move is a cue in the clip\'s time, the page is never moved, and the next beat opens where it left off', async () => {
-  let onFrame = null, evals = 0;
-  const cdp = { on: (ev, fn) => { if (ev === 'Page.screencastFrame') onFrame = fn; }, send: async () => {} };
-  const page = { addInitScript: async () => {}, context: () => ({ newCDPSession: async () => cdp }), viewportSize: () => ({ width: 1920, height: 1080 }),
-    evaluate: async () => { evals++; return ''; }, url: () => 'about:blank' };
-  const dir = tmp();
+/** A page that is not a browser: its clock counts the ms it is moved on (and fires `at` hooks), a capture is an empty
+ *  PNG, and the mouse moves it is sent are kept. */
+const fakePage = () => {
+  const log = { ran: 0, moves: [], hooks: [] };
+  return {
+    log,
+    addInitScript: async () => {},
+    clock: { install: async () => {}, pauseAt: async () => {}, resume: async () => {},
+      runFor: async (ms) => { log.ran += ms; log.hooks = log.hooks.filter(([at, fn]) => (log.ran >= at ? (fn(), false) : true)); } },
+    context: () => ({ newCDPSession: async () => ({ send: async (m) => (m === 'Page.captureScreenshot' ? { data: '' } : {}) }) }),
+    viewportSize: () => ({ width: 1920, height: 1080 }),
+    evaluate: async () => '',
+    frames: () => [{ evaluate: async () => {} }],
+    mouse: { move: async (x, y) => { log.moves.push([x, y]); }, down: async () => {}, up: async () => {} },
+    keyboard: { type: async () => {}, press: async () => {} },
+    url: () => 'about:blank',
+  };
+};
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+await check('director: a beat takes frames only in its own calls, one per 1/fps of film, and the page clock moves exactly that', async () => {
+  for (const fps of [30, 60]) {
+    const page = fakePage(), dir = tmp();
+    try {
+      const d = await director(page, { frames: dir, fps });
+      await d.beat('one', '');
+      await page.evaluate(() => 1);
+      eq(page.log.ran, 0, `${fps} fps: no frame before the first call that takes time`);
+      await d.hold(1000);
+      await d.hold(500);
+      await d.stop();
+      await d.hold(300);   // after the beat: real time, no frame
+      eq([d.beats()[0].frames.length, page.log.ran], [fps * 1.5, 1500], `${fps} fps: frames and page ms for 1.5 s of film`);
+      eq(d.beats()[0].frames.every((f) => f.dur === 1 / fps), true, `${fps} fps: every frame lasts 1/fps`);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+await check('director: a camera cue right after beat() is in force on its first frame (no pop), and a move changes the view every frame', async () => {
+  const page = fakePage(), dir = tmp(), box = { x: 1200, y: 600, w: 480, h: 270 };
   try {
     const d = await director(page, { frames: dir });
-    const shot = () => onFrame({ data: '', metadata: { timestamp: Date.now() / 1000 }, sessionId: 1 });
-    await d.beat('one', '');
-    shot();
+    await d.beat('wide', '');
     await d.hold(200);
-    const before = evals;
-    await d.camera({ x: 0, y: 0, w: 960, h: 540 }, { ms: 100 });
-    if (evals !== before) throw new Error('camera() ran code in the page');
-    shot();
-    await d.beat('two', '');
-    shot();
-    await d.hold(50);
-    shot();
+    await d.beat('close', '');
+    await d.camera(box, { ms: 0 });
+    await d.hold(200);
+    await d.camera('all', { ms: 500 });
+    await d.beat('after', '');
+    await d.hold(100);
     await d.stop();
-    const [one, two] = d.beats();
-    eq(one.camera.cues.length, 1, 'one cue in the first beat');
-    near(one.camera.cues[0].t, 200, 60, 'the cue\'s time from the clip\'s first frame');
-    eq(one.camera.cues[0].box, { x: 0, y: 0, w: 960, h: 540 }, 'the box, in rest pixels');
-    eq([camerawork(one.camera), camerawork(two.camera)], [true, true], 'both beats need the camera rendered');
-    eq(two.camera.cues, [], 'no cue in the second beat');
-    near(two.camera.from.s, 1.84, 0.01, 'the second beat opens zoomed in');
-    eq(camerawork({ size: { w: 10, h: 10 }, from: rest({ w: 10, h: 10 }), cues: [] }), false, 'a still camera is plain ffmpeg');
+    const [wide, close, after] = d.beats();
+    const v = viewFor(box, { w: 1920, h: 1080 });
+    eq(wide.frames.map((f) => f.view.s), wide.frames.map(() => 1), 'the beat before stays wide to its last frame');
+    eq(close.frames[0].view, v, 'the first frame of the beat is already on the box');
+    const move = close.frames.slice(6);
+    eq(move.length, 15, 'the move takes its 500 ms of frames');
+    move.forEach((f, i) => { if (i && same(f.view, move[i - 1].view)) throw new Error(`frame ${i} of the move repeats the one before`); });
+    eq(after.frames[0].view, rest({ w: 1920, h: 1080 }), 'a beat with no cue opens where the last one left the camera');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+await check('director: the cursor moves on every frame of a move like a hand, and a far reach takes longer than a near one', async () => {
+  const page = fakePage(), dir = tmp();
+  try {
+    const d = await director(page, { frames: dir });
+    await d.moveTo(100, 100, 0);
+    await d.beat('reach', '');
+    await d.moveTo(1500, 800);
+    await d.page.mouse.down(); await d.hold(100); await d.page.mouse.up();
+    await d.stop();
+    const f = d.beats()[0].frames, n = Math.round((reachMs(Math.hypot(1400, 700)) * 30) / 1000);
+    eq(f.length, n + 3, 'the reach takes reachMs of frames, then the press');
+    const pts = [{ x: 100, y: 100 }, ...f.slice(0, n).map((x) => x.cursor)];
+    const stepAt = (i) => Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+    for (let i = 0; i < n; i++) if (!(stepAt(i) > 0.01)) throw new Error(`the cursor stood still on frame ${i}`);
+    const mid = stepAt(Math.floor(n / 2));
+    if (!(stepAt(0) < mid / 3 && stepAt(n - 1) < mid / 3)) throw new Error(`not eased: ${stepAt(0)}, ${mid}, ${stepAt(n - 1)}`);
+    eq(f[n - 1].cursor, { x: 1500, y: 800 }, 'it arrives');
+    eq(page.log.moves.length, n + 1, 'the page is told where the mouse is on each frame it moves');
+    eq(f.slice(n).map((x) => Math.round(x.click.age * 30)), [0, 1, 2], 'the ring ages a frame a frame from the press');
+    if (!(reachMs(1400) > reachMs(100) && reachMs(100) > 0 && reachMs(5000) <= 900)) throw new Error('reachMs does not grow with distance');
+    near(handEase(0.5), 0.5, 1e-9, 'handEase is symmetric');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+await check('director: wait() films until the page call settles, and sleep() is the film\'s clock inside a beat and real time outside', async () => {
+  const page = fakePage(), dir = tmp();
+  try {
+    const d = await director(page, { frames: dir });
+    await d.beat('one', '');
+    const done = new Promise((r) => page.log.hooks.push([400, () => r('typed')]));
+    eq(await d.wait(done), 'typed', 'wait() gives back what the call gave');
+    eq(d.beats()[0].frames.length, 12, 'frames until it settled');
+    await sleep(100);
+    eq(d.beats()[0].frames.length, 15, 'sleep() in a beat is frames');
+    await d.stop();
+    const t0 = Date.now();
+    await sleep(120);
+    if (Date.now() - t0 < 100) throw new Error('sleep() outside a beat did not wait');
+    eq([d.beats()[0].frames.length, page.log.ran], [15, 500], 'no frames and no page time outside the beat');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -126,18 +187,40 @@ await check('captionFilter: the strip goes below the page by default and above i
 
 await check('the pace limits are the documented ones', () => { eq([RESULT_MS, MAX_FILM_S], [800, 30], 'RESULT_MS, MAX_FILM_S'); });
 
-await check('encodeFrames: frames play at their own timing, and a zero-length frame is dropped', () => {
+/** The frames of a video: each one's time (s, from ffprobe) and a hash of its picture (framemd5). */
+const probeFrames = (mp4) => {
+  const times = execFileSync(FFMPEG.replace(/ffmpeg$/, 'ffprobe'), ['-v', 'error', '-select_streams', 'v', '-show_entries', 'frame=pts_time',
+    '-of', 'csv=p=0', mp4], { encoding: 'utf8' }).trim().split('\n').map(Number);
+  const md5 = execFileSync(FFMPEG, ['-v', 'error', '-i', mp4, '-f', 'framemd5', '-'], { encoding: 'utf8' })
+    .split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(',').pop().trim());
+  return { times, md5 };
+};
+/** Every time an exact 1/fps step from the first (to the microsecond ffprobe prints). */
+const exact = (times, fps, what) => times.forEach((t, i) => near(t, i / fps, 1e-6, `${what}: frame ${i}'s time`));
+
+await check('encodeFrames: one image sequence at -framerate, every timestamp an exact 1/fps step and every frame kept', () => {
   const dir = tmp();
   try {
-    const a = join(dir, 'a.jpg'), b = join(dir, 'b.jpg');
-    for (const [f, c] of [[a, 'red'], [b, 'blue']]) execFileSync(FFMPEG, ['-loglevel', 'error', '-y', '-f', 'lavfi', '-i', `color=c=${c}:s=640x360`, '-frames:v', '1', f]);
-    const secs = encodeFrames([{ file: a, dur: 0.6 }, { file: b, dur: 0 }, { file: b, dur: 0.9 }], { mp4: join(dir, 'x.mp4'), list: join(dir, 'l.txt') });
-    near(secs, 1.5, 0.001, 'returned length');
-    near(lengthOf(join(dir, 'x.mp4')), 1.5, 0.05, 'file length');
+    const files = ['red', 'lime', 'blue', 'white'].map((c) => {
+      const f = join(dir, `${c}.png`);
+      execFileSync(FFMPEG, ['-loglevel', 'error', '-y', '-f', 'lavfi', '-i', `color=c=${c}:s=640x360`, '-frames:v', '1', f]);
+      return f;
+    });
+    for (const fps of [30, 60]) {
+      const mp4 = join(dir, `x${fps}.mp4`);
+      near(encodeFrames(files.map((file) => ({ file, dur: 1 / fps })), { mp4, list: join(dir, 'l'), fps }), 4 / fps, 1e-9, 'returned length');
+      const { times, md5 } = probeFrames(mp4);
+      exact(times, fps, `${fps} fps`);
+      eq(new Set(md5).size, 4, `${fps} fps: four frames in, four different frames out`);
+    }
+    const mp4 = join(dir, 'held.mp4');
+    near(encodeFrames([{ file: files[0], dur: 0.1 }, { file: files[1], dur: 0 }, { file: files[2], dur: 0.2 }], { mp4, list: join(dir, 'l') }), 0.3, 1e-9, 'held length');
+    const { times, md5 } = probeFrames(mp4);
+    exact(times, 30, 'held');
+    eq([md5.length, new Set(md5.slice(0, 3)).size, new Set(md5.slice(3)).size, md5[0] !== md5[3]], [9, 1, 1, true], 'a held frame repeats for its length; a zero-length one is dropped');
     const fmt = execFileSync(FFMPEG.replace(/ffmpeg$/, 'ffprobe'), ['-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=pix_fmt',
-      '-of', 'csv=p=0', join(dir, 'x.mp4')], { encoding: 'utf8' }).trim();
-    eq(fmt, 'yuv420p', 'pixel format of JPEG frames');
-    if (/duration 0\.0000/.test(readFileSync(join(dir, 'l.txt'), 'utf8'))) throw new Error('a zero-length frame was listed');
+      '-of', 'csv=p=0', mp4], { encoding: 'utf8' }).trim();
+    eq(fmt, 'yuv420p', 'pixel format');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -147,6 +230,7 @@ await check('stitch: hard cuts add up the clips, a crossfade overlaps them', () 
     const c = [clip(dir, 'a', 1.2), clip(dir, 'b', 1, 'teal'), clip(dir, 'c', 0.8, 'olive')];
     stitch(c, { mp4: join(dir, 'cut.mp4') });
     near(lengthOf(join(dir, 'cut.mp4')), 3.0, 0.07, 'hard cuts');
+    exact(probeFrames(join(dir, 'cut.mp4')).times, 30, 'across the cuts');
     stitch(c, { mp4: join(dir, 'fade.mp4'), fade: 0.3 });
     near(lengthOf(join(dir, 'fade.mp4')), 2.4, 0.07, 'crossfades');
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -180,8 +264,12 @@ await check('record.py: records what a command prints, with the marks the driver
   try {
     const marks = join(dir, 'marks'), stop = join(dir, 'stop'), cast = join(dir, 'c.cast');
     writeFileSync(marks, '');
-    const script = `echo one; sleep 0.4; echo two; sleep 0.4; touch ${stop}; sleep 5; echo never`;
-    execFileSync('bash', ['-c', `(sleep 0.2; printf 'mid\\t{"panes":[]}\\n' >> ${marks}) & python3 ${join(HERE, 'record.py')} --out ${cast} --cols 40 --rows 5 --marks ${marks} --stop ${stop} -- bash -c '${script}'; wait`]);
+    // each side waits on the other, not on the clock, so a loaded box only makes it slower: 'one' is printed before
+    // the mark is dropped, and 'two' half a second after (record.py reads the marks every 20 ms)
+    const said = join(dir, 'said'), marked = join(dir, 'marked');
+    const script = `echo one; touch ${said}; until [ -f ${marked} ]; do sleep 0.02; done; echo two; touch ${stop}; sleep 5; echo never`;
+    const driver = `until [ -f ${said} ]; do sleep 0.02; done; printf 'mid\\t{"panes":[]}\\n' >> ${marks}; sleep 0.5; touch ${marked}`;
+    execFileSync('bash', ['-c', `(${driver}) & python3 ${join(HERE, 'record.py')} --out ${cast} --cols 40 --rows 5 --marks ${marks} --stop ${stop} -- bash -c '${script}'; wait`]);
     const [head, ...ev] = readFileSync(cast, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     eq([head.version, head.width, head.height], [2, 40, 5], 'header');
     const out = ev.filter((e) => e[1] === 'o').map((e) => e[2]).join('');
@@ -197,6 +285,59 @@ await check('record.py: records what a command prints, with the marks the driver
 if (process.argv.includes('--film')) {
   const { recordTerminal, terminalPage } = await import('./term.mjs');
   const { launch } = await import('./deps.mjs');
+  /** Rows `y`..`y+h` of every frame of `mp4`, full width, as RGB: [{w, h, px}] one per frame. */
+  const band = (mp4, y, h) => {
+    const buf = execFileSync(FFMPEG, ['-v', 'error', '-i', mp4, '-vf', `crop=iw:${h}:0:${y},format=rgb24`, '-f', 'rawvideo', '-'], { maxBuffer: 1 << 30 });
+    const w = 1920, size = w * h * 3, out = [];
+    for (let o = 0; o + size <= buf.length; o += size) out.push({ w, h, px: buf.subarray(o, o + size) });
+    return out;
+  };
+  /** The mean x of the pixels in a frame's band that `hit(r, g, b)` picks, weighted by how strongly; none: NaN. */
+  const centroid = ({ w, h, px }, hit) => {
+    let sx = 0, sw = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = (y * w + x) * 3, k = hit(px[i], px[i + 1], px[i + 2]); sx += x * k; sw += k; }
+    return sw ? sx / sw : NaN;
+  };
+  await check('--film: a moving element and the cursor advance on every output frame, timestamps are exact, and a zoom has no pop', async () => {
+    const dir = tmp();
+    try {
+      const browser = await launch();
+      let beats;
+      try {
+        const p = await (await browser.newContext({ viewport: { width: 1920, height: 1080 } })).newPage();
+        const d = await director(p, { frames: join(dir, 'frames'), deny: ['nosuchword'] });
+        await p.setContent(`<body style="margin:0;background:#fff">
+          <div id="lime" style="position:absolute;left:0;top:0;width:300px;height:300px;background:#0f0"></div>
+          <div id="red" style="position:absolute;left:0;top:400px;width:60px;height:60px;background:#f00"></div>
+          <style>.go{animation:mv 1.2s linear forwards}@keyframes mv{from{left:0}to{left:1500px}}</style></body>`);
+        await d.moveTo(100, 800, 0);
+        await d.beat('move', '');
+        await p.evaluate(() => document.getElementById('red').classList.add('go'));
+        await d.moveTo(1700, 800, 1000);
+        await d.beat('zoom', '');
+        await d.camera({ x: 1400, y: 700, w: 480, h: 270 }, { ms: 0 });
+        await d.hold(300);
+        await d.stop();
+        beats = d.beats();
+      } finally { await browser.close(); }
+      const move = join(dir, 'move.mp4'), zoom = join(dir, 'zoom.mp4'), both = join(dir, 'both.mp4');
+      await encodeClip(beats[0], { mp4: move, work: dir });
+      await encodeClip(beats[1], { mp4: zoom, work: dir });
+      stitch([move, zoom], { mp4: both });
+      for (const f of [move, zoom, both]) exact(probeFrames(f).times, 30, f.split('/').pop());
+      const red = band(move, 420, 20).map((f) => centroid(f, (r, g, b) => (r > 180 && g < 90 && b < 90 ? 1 : 0)));
+      const arrow = band(move, 740, 100).map((f) => centroid(f, (r, g, b) => Math.max(0, 200 - (r + g + b) / 3)));
+      eq(red.length, 30, 'frames in the move beat');
+      for (let i = 1; i < 30; i++) {
+        near(red[i] - red[i - 1], 1500 / 36, 3, `the element's step into frame ${i}`);
+        if (!(arrow[i] > arrow[i - 1])) throw new Error(`the cursor did not advance into frame ${i}: ${arrow[i - 1].toFixed(2)} -> ${arrow[i].toFixed(2)}`);
+      }
+      const lime = band(zoom, 0, 1080).map((f) => centroid(f, (r, g, b) => (g > 180 && r < 90 && b < 90 ? 1 : 0)));
+      eq(lime.length, 9, 'frames in the zoom beat');
+      eq(lime.map(Number.isNaN), lime.map(() => true), 'the zoomed beat never shows the corner it zoomed away from, frame 0 included');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   await check('--film: a real sandboxed terminal is recorded, refuses a denied word, and films to a 1080p MP4', async () => {
     const dir = tmp(), home = join(dir, 'home'), cast = join(dir, 't.cast');
     execFileSync('mkdir', ['-p', join(home, 'dev', 'demo')]);
@@ -223,7 +364,7 @@ if (process.argv.includes('--film')) {
         await p.waitForFunction(() => window.player && window.player.ready);
         await p.evaluate(() => window.player.seek('start'));
         await d.beat('say', '');
-        await p.evaluate(() => window.player.play('start', 'said', { speed: 2, idle: 0.2 }));
+        await d.wait(p.evaluate(() => window.player.play('start', 'said', { speed: 2, idle: 0.2 })));
         await throws(() => d.show(RESULT_MS - 100), /floor/, 'a result held under the floor');
         await d.camera({ x: 0, y: 0, w: 960, h: 540 }, { ms: 300 });
         await d.show();

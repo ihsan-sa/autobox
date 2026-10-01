@@ -1,10 +1,10 @@
-/* camera.mjs (the demo-video skill) — the camera's maths, one pure module that node (the director, the selfcheck) and
-the Remotion composition both import, so the film is framed by the same numbers that were recorded.
+/* camera.mjs (the demo-video skill) — the camera's maths, one pure module: the director works out every frame's view
+with it, and encodeClip's compositor puts the frame there (transformOf).
 
 A page is filmed with the camera at rest. Each `d.camera(view)` becomes a cue {t, ms, box, fill, max, dip}: t is ms
-since the clip's first frame, `box` is a box in the rest camera's pixels (null for the whole page). At render time
+on the film's clock, `box` is a box in the rest camera's pixels (null for the whole page). At render time
 every output frame asks cameraAt(t) where the camera is and moves the captured frame there, so a move changes on
-every frame of the film even when the page under it was captured at 10 fps. A view is {x, y, s}: the point of the
+every frame of the film. A view is {x, y, s}: the point of the
 rest frame at the centre, and the scale. */
 
 /** Ease in and out (cubic), the pace of every move in the kit. */
