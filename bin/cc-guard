@@ -120,7 +120,9 @@ FSTUB
     #  …and the REASON too, for a case that sets $GERR: rc 2 alone cannot say WHICH rule refused (case 11).
     #  …and the TRANSCRIPT PATH for a case that sets $GTP: the walk falls back to it when the cwd holds no marker,
     #  and a subagent's cwd never does — without it case 57 would anchor on the cwd and reproduce nothing.
-    pl=$(printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"%s}' "$t" "$i" "$c" "${GTP:+,\"transcript_path\":\"$GTP\"}")
+    #  …and the SESSION and AGENT ids for a case that sets $GSID / $GAID: the handoff gate keys on both (case 69).
+    pl=$(printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"%s%s%s}' "$t" "$i" "$c" "${GTP:+,\"transcript_path\":\"$GTP\"}" \
+      "${GSID:+,\"session_id\":\"$GSID\"}" "${GAID:+,\"agent_id\":\"$GAID\"}")
     # A PAYLOAD THAT IS NOT JSON IS NOT A TEST. jq fails, the guard sees no tool at all and exits 0, so a row
     # asserting "still allowed" goes GREEN having gated nothing — one did, for a whole review round (#193).
     # rc 99 is neither 0 nor 2, so it fails whichever side the case is asserting.
@@ -2625,6 +2627,39 @@ W64
   unset GERR; kill "$seat68" 2>/dev/null
   ok "the permission seat's state is fenced like ~/.cc/state/arch — a redirect, cp, rm, a glob, an rm of the directory above it and the Write tool are all refused from anywhere but the live seat, which may still write its own" $r
 
+  # 69. A BUILDER THE NON-LIVE SEAT STARTED BEFORE THE CUTOVER STILL PUSHES (row raised-a-nonlive-seats-builder-
+  #     strands-its-fix). 2026-09-30: during a planning handoff the old seat's builder finished a gated fix, and its
+  #     commit-and-push was refused because its calls carry the parent's session id; the live successor's retry
+  #     was then denied as a bypass, and the fix sat uncommitted. The record's `scoped` (cc-handoff --ready) names
+  #     the subagents still out at cutover; a call whose agent_id is in it may push, and nothing more.
+  #     Its own fixture: a record dir per shape, nothing read that an earlier case left behind.
+  GERR=$T/err69; r=0; mkdir -p "$T/hd69" "$T/hd69b" "$T/hd69c" "$T/hd69d"
+  rec69(){ jq -n --arg id "$1" --arg live "$2" --argjson sc "$3" '{id:$id, target:"demo/t1", phase:"cutover", live:$live,
+    predecessor:{session_id:"sid69", tmux:"@69", window:"demo/t1"}, successor:{session_id:"suc69", tmux:"@70", window:"demo/t1~next"},
+    scoped:$sc, held:[]}'; }
+  rec69 h69 successor '["abuild69"]' > "$T/hd69/demo-t1.json"
+  push69="cd $WT && git add f && git commit -q -m 'the fixture fix' && git push -q origin HEAD:track/t1"
+  hg69(){ local d=$1 a=$2; shift 2; : > "$GERR"; GSID=sid69 GAID=$a g Bash "$(J "$1")" "$WT" CC_HANDOFF_DIR="$T/$d" "${@:2}"; }
+  p1=$(hg69 hd69 abuild69 "$push69")
+  p2=$(hg69 hd69 "" "$push69"); grep -qF "pushing while the other session is the live one" "$GERR" || p2="$p2(wrong rule)"
+  p3=$(hg69 hd69 anew69 "$push69")                                           # started after the cutover: not in scoped
+  p4=$(hg69 hd69 abuild69 "cc demo t2 --go 'x'")   # recurring-defect-ok: pause-hold-missing — a fixture payload the guard must refuse, never run
+  p5=$(hg69 hd69 abuild69 "cc done")
+  p6=$(hg69 hd69 abuild69 "cc-loop demo t2")
+  [ "$p1" = 0 ] && [ "$p2$p3$p4$p5$p6" = 22222 ] || { r=1; echo "      scoped builder: push rc $p1 (want 0); the seat itself $p2, a later agent $p3, --go $p4, cc done $p5, cc-loop $p6 (want 2s)"; }
+  # every record that gates the call must scope it: a second handoff that does not keeps the push refused
+  cp "$T/hd69/demo-t1.json" "$T/hd69b/"; rec69 h69b successor '[]' > "$T/hd69b/demo-t1b.json"
+  q1=$(hg69 hd69b abuild69 "$push69")
+  # a list that is not a list scopes nobody, and never lifts the gate itself (a jq error would empty the verdict)
+  rec69 h69c successor '"abuild69"' > "$T/hd69c/demo-t1.json"
+  q2=$(hg69 hd69c abuild69 "$push69"); q3=$(hg69 hd69c abuild69 "cc done")
+  # the successor before its cutover is not a predecessor with scoped work, whatever its agent id
+  rec69 h69d predecessor '["abuild69"]' > "$T/hd69d/demo-t1.json"
+  q4=$(GSID=suc69 GAID=abuild69 g Bash "$(J "$push69")" "$WT" CC_HANDOFF=h69d CC_HANDOFF_DIR="$T/hd69d")
+  [ "$q1$q2$q3$q4" = 2222 ] || { r=1; echo "      a second unscoped record $q1, a string for a list $q2 / cc done $q3, the successor before cutover $q4 (want 2s)"; }
+  unset GERR
+  ok "a builder the non-live seat started before the cutover still commits and pushes; the seat itself, a later subagent, a second record that does not scope it, a corrupt list and the pre-cutover successor are refused, and the builder still may not dispatch, open a PR or run a loop" $r
+
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
   exit 0
@@ -3740,24 +3775,36 @@ case "$mws" in *[!a-z0-9-]*) mws="";; esac   # the handle goes into a regex belo
 # SYMMETRIC ON PURPOSE: after cutover the PREDECESSOR is the non-live one, and a retired session that lingers
 # must not push a stale branch. Every unreadable case falls the same way — the successor is gated, the
 # predecessor is not — so a broken record can never leave the channel ownerless.
-handoff_gated=""
+# WORK SCOPED BEFORE THE CUTOVER STILL PUSHES. A subagent's tool calls carry its parent's session_id and pane, so
+# the predecessor's builders are gated with it — and on 2026-09-30 a builder that had finished and gated its fix
+# was refused its push, the live successor's retry was denied as a bypass, and the fix sat uncommitted. The
+# harness puts agent_id on a subagent's own calls (the model cannot set it), and `cc-handoff --ready` records in
+# `scoped` every subagent of the predecessor's still out then (not yet reported, however quiet). A call whose
+# agent_id is in `scoped` (or `held`) of EVERY record that gates it is $handoff_scoped: its `git push` passes;
+# dispatch, cc done and cc-loop do not, and the worker gates below still apply. A subagent started after the cutover, a record with no list, or any
+# other reason to gate (the successor's own $CC_HANDOFF) leaves the push refused as before.
+handoff_gated=""; handoff_scoped=""; hplain=""
 if [ -n "${CC_HANDOFF:-}" ] || [ -d "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}" ]; then
   sid=$(jq -r '.session_id // ""' <<<"$inp"); seen=""; wid=""
+  aid=$(jq -r '.agent_id // ""' <<<"$inp"); case "$aid" in *[!A-Za-z0-9_-]*) aid="";; esac
   for rec in "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}"/*.json; do
     [ -f "$rec" ] || continue
     # the pane's window too: a planning predecessor's session_id is EMPTY on the record (unknown at --overlap time)
     [ -n "$wid" ] || [ -z "${TMUX_PANE:-}" ] || wid=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null || true)
-    v=$(jq -r --arg sid "$sid" --arg wid "$wid" --arg hid "${CC_HANDOFF:-}" '
+    v=$(jq -r --arg sid "$sid" --arg wid "$wid" --arg hid "${CC_HANDOFF:-}" --arg aid "$aid" '
       if ((.id // "") == "" or (.target // "") == "") then "" else
         (if .live == "successor" then "successor" else "predecessor" end) as $l |
         (if $l == "successor" then "predecessor" else "successor" end) as $o |
+        # scoped only on the PREDECESSOR side after cutover: the successor before it has no pre-cutover work. A list
+        # that is not an array counts as absent, never as an error: an error here empties $v and lifts the whole gate
+        ($aid != "" and $o == "predecessor" and ([.scoped, .held] | map(arrays) | add // [] | any(.[]; . == $aid))) as $sc |
         if ($hid != "" and .id == $hid) then (if $l == "successor" then "mine" else "mine gate" end)
-        elif ($sid != "" and ((.[$o].session_id // "") == $sid)) then "gate"
-        elif ($wid != "" and ((.[$o].tmux // "") == $wid)) then "gate"
+        elif ($sid != "" and ((.[$o].session_id // "") == $sid)) then (if $sc then "gate-scoped" else "gate" end)
+        elif ($wid != "" and ((.[$o].tmux // "") == $wid)) then (if $sc then "gate-scoped" else "gate" end)
         else "" end
       end' "$rec" 2>/dev/null) || v=""
     case " $v " in *" mine "*) seen=1;; esac
-    case " $v " in *" gate "*) handoff_gated=1;; esac
+    case " $v " in *" gate "*) handoff_gated=1; hplain=1;; *" gate-scoped "*) handoff_gated=1;; esac
   done
   # $CC_HANDOFF with no record to justify it (missing, corrupt, unreadable) = the successor stays gated —
   # UNLESS the handoff FINISHED. `cc-handoff --retire` ends with clear(), so a record that is gone because
@@ -3772,8 +3819,9 @@ if [ -n "${CC_HANDOFF:-}" ] || [ -d "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}"
       ""|*[!A-Za-z0-9_-]*) ;;   # not a record id, so never a path we build: a corrupt env gates like a corrupt record
       *) [ -f "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}/$CC_HANDOFF.done" ] && retired=1;;
     esac
-    [ -n "$retired" ] || handoff_gated=1
+    [ -n "$retired" ] || { handoff_gated=1; hplain=1; }
   fi
+  [ -n "$handoff_gated" ] && [ -z "$hplain" ] && handoff_scoped=1
 fi
 [ -n "$handoff_gated" ] && [ "$role" != member ] && role=worker   # the four owner gates below, at least
 # THE UNGATED TIER STILL MEETS ONE FENCE: the permission seat's state (pfence below). A planning session, an orch and
@@ -4147,7 +4195,9 @@ case "$tool" in
     { grep -qE 'dangerously-skip-permissions|bypassPermissions|permission-mode[[:space:]=]+bypass' <<<"$cmd" && ! pread "$cmd"; } \
       && never "starting a session with permissions skipped — only the owner does that, by hand or with his approval card"
     if [ -n "$handoff_gated" ]; then   # on top of the four gates below: what only the LIVE session may do
-      rx 'git +push\b' && denyh "pushing while the other session is the live one (a retired session must not push a stale branch)"
+      # "their commit and push either still go through (the work was scoped before the handoff)" — the brief;
+      # $handoff_scoped is a subagent of the predecessor's still out at cutover, so its push is NOT refused here
+      [ -z "$handoff_scoped" ] && rx 'git +push\b' && denyh "pushing while the other session is the live one (a retired session must not push a stale branch)"
       rx "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' && { board_only "$qcmd" && RX="" || denyh "dispatching a worker (cc --go)"; }
       rx "$AT"'([^ ]*/)?cc-loop\b' && denyh "dispatching a worker (cc-loop)"
       rx "$AT"'([^ ]*/)?cc +done\b' && denyh "opening a PR (cc done)"

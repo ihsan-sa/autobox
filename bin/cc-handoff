@@ -47,6 +47,8 @@ loops whose cc-loop `orch` file names this seat), by the same words (out_line).
 
 THE INVARIANT. One record, ~/.cc/state/handoff/<target>.json, names the LIVE session. The live one owns the
 channel and may act on the world; the other is muted and gated (cc-guard and cc-slack read the same record).
+One carve-out: the record's `scoped` lists the predecessor's subagents still out at cutover, and cc-guard
+still lets those push the branch they were building — never dispatch, open a PR or run a loop.
 Cutover is ONE os.replace() of that record; everything after it is derived, idempotent and retried, never
 rolled back. Ownership only moves forward on an explicit successful act, so a missing, corrupt or unreadable
 record means the predecessor keeps the channel and the successor stays gated. A message is never handed to the
@@ -715,6 +717,17 @@ def subagents(sid, idle=None):
     return [n for _, n in sorted(live, reverse=True)]
 
 
+def spawned(sid):
+    """Session `sid`'s subagents that have not handed in their report — subagents() with no idle filter, because a
+    builder sitting inside one long gate run writes nothing for longer than CC_HANDOFF_AGENT_IDLE and still has a
+    push to make. The id is the subagent's agent_id (the link points at subagents/agent-<id>.jsonl), which the
+    harness puts on each of that subagent's own tool calls. Recorded at cutover as the record's `scoped`: work the
+    predecessor scoped while it was live, whose push cc-guard still lets through. One that had already reported is
+    left out, so a finished builder resumed after the cutover cannot push for the non-live seat."""
+    return sorted({os.path.basename(f)[:-len(".output")] for d in tasks_dirs(sid)
+                   for f in glob.glob(os.path.join(d, "*.output")) if os.path.islink(f) and os.path.exists(f) and not reported(f)})
+
+
 def tasks_sid(pid):
     """The session id of claude process `pid`, off the task directory it holds open: every live interactive
     claude keeps an fd on its own `<root>/<project>/<session id>/tasks` (probed 2026-09-22, ten seats, one fd
@@ -1180,6 +1193,10 @@ def ready(target=None, forced=False):
         if sid:
             rec["predecessor"]["session_id"] = sid     # stay() reads its subagents by this id, in another process
         rec["held"] = subagents(sid) if sid else []
+        # …and every subagent still out, however quiet: a builder that commits and pushes after this
+        # line did work scoped while this seat was live, and cc-guard lets that push through (and nothing else) —
+        # without it, 2026-09-30, the builder's push was refused and the successor's retry was denied as a bypass.
+        rec["scoped"] = spawned(sid) if sid else []
     held = rec.get("held") or []
     wk = dispatched(target)
     rec["live"] = "successor"                      # ---- THE COMMIT POINT ----

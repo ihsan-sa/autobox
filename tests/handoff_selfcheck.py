@@ -930,6 +930,13 @@ def run_selfcheck():
            and "retiring" not in said("r20~old")[-1][2])
         ok("...the record names what holds it, so --retire acts on that one answer from its own process",
            read("r20").get("held") == ["a-live"])
+        # …and what cc-guard lets push: every subagent still out, the quiet one too (a builder inside one long gate
+        # run writes nothing), but not one that already reported, a dangling link or a background command.
+        sc20 = read("r20").get("scoped") or []
+        ok("...and `scoped` names every subagent still out at cutover, however quiet, for cc-guard to let push — "
+           "never one that already reported, a dangling link or a background command",
+           "a-live" in sc20 and "a-quiet" in sc20 and "a-done" not in sc20 and "a-gone" not in sc20
+           and "b-background" not in sc20)
         ok("...and the journal says the successor is live and this session is staying",
            "stays for the 1 subagent" in open(jp20).read())
         ok("...and nothing goes to #alerts for it — a debugging engineer reads the journal line above, not "
