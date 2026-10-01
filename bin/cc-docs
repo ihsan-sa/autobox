@@ -113,7 +113,10 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
     cc-docs public <PPP-NNNN-R> on|off
         On gives that one revision a public link: an unguessable token, printed, kept while it stays public (on
         again prints the same one). Off deletes the token for good, so the old link never works again and on
-        afterwards mints a different one. The register's owner runs this; nobody else may.
+        afterwards mints a different one. The register's owner runs this; nobody else may. With DOCS_PUBLIC_HOOK
+        set, on also hands the token to it and prints the address it answers on a second line (exit 1, token
+        kept, when it fails: on again retries), and off stops the served link first and refuses, changing
+        nothing, when it can't.
     cc-docs token <token> <PPP-NNNN-R>
         The filed copy a public link serves: printed only when the token is that revision's, exit 1 otherwise.
     cc-docs library --viewer owner|<workspace id>
@@ -185,7 +188,10 @@ it prints one JSON {ok, engine, main, errors: [{path, line, message}], missing: 
 compiled, 1 when it did not, anything else when it could not run; it has 120 s. Unset, a source is kept unchecked
 and `check` refuses. DOCS_TEX_TREES, the house styles, space-separated ROOT:SUB entries (a maker puts ROOT/SUB on
 TEXINPUTS recursively). DOCS_CHECK_CHANNEL, where `check --post` posts; unset, it posts nothing and a filing starts
-no check.
+no check. DOCS_PUBLIC_HOOK, where public links are served, a command split like a shell line and run as
+`<cmd> on|off <token> <PPP-NNNN-R>` with 30 s: `public` calls it both ways; `fold` calls it off for each token it drops
+and refuses, folding nothing, when that fails (a letter it frees goes to another revision); `move` and `retire` call it
+off after and say on stderr how to finish by hand when it fails. Unset, a token is only the register's.
 
 RETIRED numbers (`fold`, `retire`, `move`) are kept in the register's `retired`, and a retired revision's letter in its
 document's `retired_revs`, so neither is handed out again. What either verb takes out of the register is kept as
@@ -1856,20 +1862,60 @@ def cmd_star(a):
     return 0
 
 
+def public_hook(state, token, full):
+    """Tell DOCS_PUBLIC_HOOK, where public links are served, that a token is on or off: `<cmd> on|off <token>
+    <PPP-NNNN-R>`, 30 s. (True, its last stdout line) when it exits 0, else (False, why); unset, (True, "")."""
+    cmd = conf("DOCS_PUBLIC_HOOK")
+    if not cmd:
+        return True, ""
+    try:
+        r = subprocess.run(shlex.split(cmd) + [state, token, full], capture_output=True, text=True, timeout=30)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    lines = (r.stdout if r.returncode == 0 else (r.stderr.strip() or r.stdout)).strip().splitlines()
+    return r.returncode == 0, (lines[-1] if lines else f"exit {r.returncode}")
+
+
+def revoke_dropped(dropped):
+    """Stop, where they are served, the public links a move or retire took out of the register (their old number is
+    never handed out again, so a link left on answers 404 once the site's register moves on)."""
+    for full, token in dropped:
+        ok, why = public_hook("off", token, full)
+        if not ok:
+            print(f"{full}\tits public link still answers where it is served ({why}): "
+                  f"run `{conf('DOCS_PUBLIC_HOOK')} off {token} {full}`", file=sys.stderr)
+
+
 def cmd_public(a):
     with Lock():
         reg = load()
         d, r = get_rev(reg, a.number)
+        full = f"{d['number']}-{r['rev']}"
         if a.state == "on":
             # brief: "going public mints an unguessable token for exactly one revision"
             r.setdefault("public_token", secrets.token_urlsafe(24))
-        else:
+        elif r.get("public_token"):
+            # brief: "a revoked link stops working at once": the served link goes first, and if it can't, nothing changes
+            ok, why = public_hook("off", r["public_token"], full)
+            if not ok:
+                raise Refused(f"{full} is still public: DOCS_PUBLIC_HOOK could not stop its link ({why})")
             # brief: "going private deletes it for good"
-            r.pop("public_token", None)
+            r.pop("public_token")
         d.pop("public", None)
         save(reg)
         write_views(reg, set(d["visibility"]) - {"owner"})
-    print(r.get("public_token") or "private")
+    token = r.get("public_token")
+    if not token:
+        print("private")
+        return 0
+    print(token)
+    ok, url = public_hook("on", token, full)
+    if not ok:
+        print(f"{full}: DOCS_PUBLIC_HOOK could not serve its link yet ({url}); `public {full} on` again retries",
+              file=sys.stderr)
+        return 1
+    if url:
+        print(url)
     return 0
 
 
@@ -1997,11 +2043,11 @@ def cmd_fold(a):
             raise Refused(f"{', '.join(late)} is dated after {keep['number']}-{last['rev']}, which must stay the newest")
         order = [(d, r) for *_, d, r in rest] + [(keep, last)]
         slug = slugify(keep["title"])
-        moves, revs = [], []
+        moves, revs, dropped = [], [], []
         for i, (d, r) in enumerate(order):
             new = dict(r, rev=letter(i), file=os.path.join("files", keep["project"], f"{keep['number']}-{letter(i)}_{slug}.pdf"))
-            if (d is not keep or r["rev"] != new["rev"]) and new.pop("public_token", None):
-                print(f"{d['number']}-{r['rev']}\tits public link stops working", file=sys.stderr)
+            if (d is not keep or r["rev"] != new["rev"]) and new.get("public_token"):
+                dropped.append((f"{d['number']}-{r['rev']}", new.pop("public_token")))
             if d is not keep:
                 new["folded_from"] = f"{d['number']}-{r['rev']}"
             moves.append((f"{d['number']}-{r['rev']}", r["file"], new["file"]))
@@ -2011,6 +2057,13 @@ def cmd_fold(a):
         clash = [n for *_, n in moves if n not in old and os.path.lexists(os.path.join(ROOT, n))]
         if missing or clash:
             raise Refused(f"{(missing + clash)[0]} is {'missing' if missing else 'in the way'}; nothing changed")
+        # the site pins a link to (number, letter), and fold hands a dropped token's letter to another revision, so the
+        # served link must be off before the letters move: else it would serve a revision nobody made public
+        for full, token in dropped:
+            ok, why = public_hook("off", token, full)
+            if not ok:
+                raise Refused(f"{full}'s public link could not be stopped where it is served ({why}); nothing was folded")
+            print(f"{full}\tits public link stops working", file=sys.stderr)
         for d in others:
             retire_record(reg, d["number"], d, {"folded_into": keep["number"]})
         # every copy steps aside to a temporary name first, since a new name may be an old one still in place
@@ -2272,6 +2325,7 @@ def cmd_retire(a):
         wids = set(d.get("visibility", ())) - {"owner"}
         prune_views(wids, [x["file"] for x in gone])
         write_views(reg, wids)
+    revoke_dropped([(f"{d['number']}-{x['rev']}", x["public_token"]) for x in gone if x.get("public_token")])
     for x in gone:
         print(f"{d['number']}-{x['rev']}\tretired\t{os.path.join(ROOT, 'retired', x['file'])}")
     return 0
@@ -2312,9 +2366,10 @@ def cmd_move(a):
         for r, n in srcs:
             os.rename(os.path.join(ROOT, r["sources"]), os.path.join(ROOT, n))
             r["sources"] = n
-        gone = [r["file"] for r, _ in moves]
+        gone, dropped = [r["file"] for r, _ in moves], []
         for r, n in moves:
-            if r.pop("public_token", None):
+            if r.get("public_token"):
+                dropped.append((f"{old}-{r['rev']}", r.pop("public_token")))
                 print(f"{old}-{r['rev']}\tits public link stops working", file=sys.stderr)
             r["file"] = n
         del reg["documents"][old]
@@ -2324,6 +2379,7 @@ def cmd_move(a):
         wids = set(d.get("visibility", ())) - {"owner"}
         prune_views(wids, gone)
         write_views(reg, wids)
+    revoke_dropped(dropped)
     for r, n in moves:
         print(f"{old}-{r['rev']}\t{new}-{r['rev']}\t{os.path.join(ROOT, n)}")
     return 0
@@ -2529,7 +2585,8 @@ def cmd_member(a):
 def selfcheck():
     """The cases, in a config of their own: no key of the box's ~/.cc/config (a live DOCS_SOURCE_CHECK or
     DOCS_CHECK_CHANNEL) reaches them, and each case sets the keys it tests in the environment, which wins."""
-    keys = ("CC_CONFIG", "DOCS_SOURCE_CHECK", "DOCS_TEX_TREES", "DOCS_CHECK_CHANNEL", "CC_SLACK_BIN", "TEXINPUTS")
+    keys = ("CC_CONFIG", "DOCS_SOURCE_CHECK", "DOCS_TEX_TREES", "DOCS_CHECK_CHANNEL", "DOCS_PUBLIC_HOOK", "CC_SLACK_BIN",
+            "TEXINPUTS")
     saved = {k: os.environ.pop(k, None) for k in keys}
     os.environ["CC_CONFIG"] = "/nonexistent/cc-docs-selfcheck-config"
     try:
@@ -2700,6 +2757,34 @@ def _selfcheck():
         rc3, o3 = run("token", tok, "901-0001-A")
         ok("private deletes the token for good: the old one never serves again, and public again is a new one",
            rc == 1 and rc2 == 0 and tok2.strip() != tok and rc3 == 1 and run("token", tok2.strip(), "901-0001-A")[0] == 0)
+        # DOCS_PUBLIC_HOOK: where the link is served hears on and off; off that can't reach it changes nothing
+        hook, hlog = os.path.join(t, "hook.py"), os.path.join(t, "hook.log")
+        with open(hook, "w") as fh:
+            fh.write("import os, sys\nopen(sys.argv[1], 'a').write(' '.join(sys.argv[2:]) + '\\n')\n"
+                     "if os.path.exists(sys.argv[1] + '.fail'): sys.exit('site unreachable')\n"
+                     "print('https://lib.example/p/' + sys.argv[3])\n")
+        os.environ["DOCS_PUBLIC_HOOK"] = f"{sys.executable} {hook} {hlog}"
+        tok2 = tok2.strip()
+        rc, o = run("public", "901-0001-A", "on")
+        ok("with a hook, on hands it the token and prints the address it answers under the token",
+           rc == 0 and o.splitlines() == [tok2, f"https://lib.example/p/{tok2}"]
+           and open(hlog).read().splitlines() == [f"on {tok2} 901-0001-A"])
+        open(hlog + ".fail", "w").close()
+        rc, o = run("public", "901-0001-A", "off")
+        ok("off whose hook fails refuses and keeps the token, so the link is never half revoked",
+           rc == 2 and "still public" in o and run("token", tok2, "901-0001-A")[0] == 0)
+        rc, o = run("public", "901-0001-A", "on")
+        ok("on whose hook fails prints the token, exits 1 and keeps it for a retry",
+           rc == 1 and o.splitlines()[0] == tok2 and "again retries" in o and run("token", tok2, "901-0001-A")[0] == 0)
+        os.remove(hlog + ".fail")
+        rc, o = run("public", "901-0001-A", "off")
+        ok("off whose hook answers tells it the token first, then deletes it",
+           rc == 0 and open(hlog).read().splitlines()[-1] == f"off {tok2} 901-0001-A"
+           and run("token", tok2, "901-0001-A")[0] == 1)
+        calls = len(open(hlog).read().splitlines())
+        run("public", "901-0001-A", "off")
+        ok("off on a revision with no token calls no hook", len(open(hlog).read().splitlines()) == calls)
+        os.environ.pop("DOCS_PUBLIC_HOOK")
         # revisions: a register of its own
         ROOT = os.path.join(t, "r2")
         v1 = mkpdf(src, "v1", "Gamma first version")
@@ -2842,7 +2927,14 @@ def _selfcheck():
         rc2, o2 = run("fold", "001-0003", "001-0001")
         ok("fold refuses a document named twice, and a keeper whose current revision is not the newest",
            rc == 2 and rc2 == 2 and "must stay the newest" in o2 and json.dumps(load(), sort_keys=True) == before)
+        os.environ["DOCS_PUBLIC_HOOK"] = f"{sys.executable} {hook} {hlog}.fold"
+        open(hlog + ".fold.fail", "w").close()
         rc, o = run("fold", "001-0001", "001-0003", "001-0002")
+        ok("fold whose hook can't stop a dropped link refuses and folds nothing, so no letter serves another revision",
+           rc == 2 and "nothing was folded" in o and json.dumps(load(), sort_keys=True) == before)
+        os.remove(hlog + ".fold.fail")
+        rc, o = run("fold", "001-0001", "001-0003", "001-0002")
+        os.environ.pop("DOCS_PUBLIC_HOOK")
         reg = load()
         d = reg["documents"]["001-0001"]
         files = [os.path.join(ROOT, r["file"]) for r in d["revisions"]]
@@ -2861,6 +2953,8 @@ def _selfcheck():
         ok("a folded revision's public link stops working, under its old number and its new one",
            run("token", tok, "001-0002-A")[0] == 1 and run("token", tok, "001-0001-A")[0] == 1
            and tok not in json.dumps(load()))
+        ok("fold tells the hook to stop the dropped token where it is served, and nothing else",
+           open(hlog + ".fold").read().splitlines() == [f"off {tok} 001-0002-A"] * 2)
         ok("the folded numbers are retired, their entries kept under retired/",
            sorted(reg["retired"]) == ["001-0002", "001-0003"]
            and json.load(open(os.path.join(ROOT, "retired", "001-0002.json")))["entry"]["title"] == "Eps (v1)")
@@ -2876,7 +2970,9 @@ def _selfcheck():
         junk = os.path.join(ROOT, load()["documents"]["901-0001"]["revisions"][0]["file"])
         vjunk = os.path.join(ROOT, "ws", wid, os.path.relpath(junk, ROOT))
         ok("before the retire, the member's view links the document", os.path.exists(vjunk))
+        os.environ["DOCS_PUBLIC_HOOK"] = f"{sys.executable} {hook} {hlog}.retire"
         rc, o = run("retire", "901-0001")
+        os.environ.pop("DOCS_PUBLIC_HOOK")
         with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:
             view = json.load(fh)
         ok("retire takes the document out of the register and its member view, and its files move under retired/",
@@ -2884,7 +2980,8 @@ def _selfcheck():
            and list(view["documents"]) == ["901-0002"]
            and os.path.isfile(os.path.join(ROOT, "retired", os.path.relpath(junk, ROOT)))
            and os.path.isfile(os.path.join(ROOT, "retired", "901-0001.json")))
-        ok("a retired document's public link stops working", run("token", tok, "901-0001-A")[0] == 1)
+        ok("a retired document's public link stops working, and the hook is told to stop serving it",
+           run("token", tok, "901-0001-A")[0] == 1 and open(hlog + ".retire").read().splitlines() == [f"off {tok} 901-0001-A"])
         rc, o = run("file", e1, "--project", "Kid", "--title", "Junk")
         ok("a retired number is never handed out again: the same title files as a new number",
            rc == 0 and o.startswith("901-0003-A") and "901-0001" not in load()["documents"])
@@ -2923,7 +3020,13 @@ def _selfcheck():
            rc == 0 and o.splitlines() == ["001\tCareer/Resume\twork", "002\tCareer/Cover letter\twork"]
            and rc2 == 2 and "is a group" in o2 and "Loose" not in json.dumps(load()))
         old = load()["documents"]["001-0002"]["revisions"][0]["file"]
+        open(hlog + ".move.fail", "w").close()
+        os.environ["DOCS_PUBLIC_HOOK"] = f"{sys.executable} {hook} {hlog}.move"
         rc, o = run("move", "001-0002", "Career/Cover letter")
+        os.environ.pop("DOCS_PUBLIC_HOOK")
+        ok("a move whose hook can't stop the dropped link still moves, and says how to stop it by hand",
+           rc == 0 and open(hlog + ".move").read().splitlines() == [f"off {tok} 001-0002-A"]
+           and f"off {tok} 001-0002-A`" in o and "still answers" in o)
         reg = load()
         d = reg["documents"].get("002-0002", {})
         nf = os.path.join(ROOT, "files", "002", "002-0002-A_cover-letter-acme.pdf")
