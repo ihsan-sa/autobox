@@ -19,17 +19,33 @@ WHAT IT READS, every refresh, and nothing else — each is a record the box alre
            OFFLINE; one whose pane printed nothing for 10 min is IDLE; otherwise working. `repo@alias` is an orch
            and is shown `alias@repo`, the name `cc` takes back; a name with `/` is a track or session, the rest seats.
            An offline track window (its session ended, the window left open) is only counted; `_` windows are skipped.
+           A seat's own view adds `tmux capture-pane -p` of that window: the last lines it printed.
   finished $CC_LANDER_STATE/jobs/*/results/*/*.json with a "runner" starting laptop: the last 5, by file mtime, shown in LAPTOP.
   laptop   `cc-suites status` (capped at 6 s; one line saying so if it does not answer) and the checks the lander has
            spilled there now: an `ssh … job CHECK TREE CAP RUN CWD` in /proc (run.laptop_argv), the lander keeps no file.
   limit    ~/.cc/state/reconcile.json `limit_until`, when it is still ahead: the usage limit is holding work.
+  landed   $CC_LANDER_STATE/queue.log: a `stage R#N merged` line (a `notify R#N landed` line in older logs) is when
+           that PR landed, the earliest of the two; its title comes from $CC_LANDER_STATE/{,rest/}R-N.json. The log is
+           read on from where the last refresh stopped, so a refresh does not re-read it.
+  workers  each loop.log's stamped lines: `iter 1/N start` is a worker starting; `DONE`, `exit …` or `timed out …` stopping.
 Times are shown in the box's own timezone.
 
-  cc-live [--every SEC]   redraw every SEC seconds (default 10) until Ctrl-C
+NAVIGATING. On a terminal the dashboard is the home screen and a cursor moves over it, as in Claude Code: ↑/↓ (or j/k,
+←/→ across the seat grid) move it, Enter opens what it is on, Esc, Backspace or ← goes back, q quits from home and
+Ctrl-C quits anywhere. The first line opens three views of their own: every PR that landed and when, a graph of
+landings per hour (+/- widen or narrow it, 6 h to a week) and a timeline of hand-offs, landings and worker starts and
+stops over the last 24 h. A hand-off or running line opens its board row, notes and the worker's last log lines; a
+landing opens its job and history; a seat opens its state and the last lines its tmux pane printed. In a view
+↑/↓ and PgUp/PgDn scroll. Nothing is written anywhere: every view reads the records above.
+
+  cc-live [--every SEC]   the navigable view on a terminal, refreshed every SEC seconds (default 10), until Ctrl-C;
+                          with no terminal on both ends it redraws the plain dashboard instead
   cc-live --once          print one frame and exit
-  cc-live selfcheck       cases over fixtures and a stub tmux in a temp dir; no board, process or tmux of the box's
+  cc-live selfcheck       cases over fixtures, a stub tmux and a fake screen in a temp dir; no board, process, tmux
+                          or terminal of the box's
 """
 import calendar
+import curses
 import glob
 import json
 import os
@@ -276,27 +292,43 @@ def limit_until():
 
 
 # ── the frame ─────────────────────────────────────────────────────────────────────────────────────────────────
-def frame(now=None, proc="/proc", width=120):
+MENU = (("PRs landed", ("prs",)), ("landings graph", ("graph",)), ("timeline", ("timeline",)))
+
+
+def frame(now=None, proc="/proc", width=120, items=None):
+    """The dashboard's lines. With a list for `items`, it also opens with the menu line and collects what the cursor
+    can land on there, as (line, first column, end column, view) in screen order."""
     now = now or time.time()
+    sel = items if items is not None else []
     bds = boards()
     live, table = procs(proc)
     B, D, R = ("\033[1m", "\033[2m", "\033[0m") if os.environ.get("CC_LIVE_PLAIN") != "1" else ("", "", "")
     out = [f"{B}{os.uname().nodename}{R}  {time.strftime('%H:%M:%S %Z', time.localtime(now))}"
            f"  load {open('/proc/loadavg').read().split()[0] if os.path.exists('/proc/loadavg') else '?'}"]
+    if items is not None:
+        cells = [f"[ {name} ]" for name, _ in MENU]
+        col = 2
+        for c, (_, view) in zip(cells, MENU):
+            sel.append((len(out), col, col + len(c), view))
+            col += len(c) + 2
+        out.append("  " + "  ".join(cells))
     lu = limit_until()
     if lu > now:
         out.append(f"⏳ usage limit holds work until {time.strftime('%H:%M', time.localtime(lu))}")
 
-    out.append(f"\n{B}HANDED OFF{R} {D}(last 24 h, newest first){R}")
+    out.append("")
+    out.append(f"{B}HANDED OFF{R} {D}(last 24 h, newest first){R}")
     ho = handoffs(bds, now)
     for when, word, repo, name, row in ho[:SHOW_HANDOFFS]:
         mark = "NEW " if now - when < NEW else "    "
+        sel.append((len(out), 2, width, ("worker", repo, name)))
         out.append(f"  {mark}{ago(now - when):>4} ago  {word:<10} {repo}/{name}  "
                    f"{D}[{row.get('status', '?')}]{R} {row.get('title') or ''}")
     if not ho:
         out.append("  (nothing in the last day)")
 
-    out.append(f"\n{B}RUNNING{R} {D}(board rows marked running){R}")
+    out.append("")
+    out.append(f"{B}RUNNING{R} {D}(board rows marked running){R}")
     n, held = 0, []
     for repo, tracks in sorted(bds.items()):
         for name, row in sorted(tracks.items()):
@@ -315,13 +347,15 @@ def frame(now=None, proc="/proc", width=120):
             else:
                 st = "OFFLINE: marked running, no process"
             n += 1
+            sel.append((len(out), 2, width, ("worker", repo, name)))
             out.append(f"  {key}  {D}{st}{R}")
     if held:
         out.append(f"  {D}held on purpose, no process: {', '.join(held)}{R}")
     if not n and not held:
         out.append("  (nothing)")
 
-    out.append(f"\n{B}SEATS, ORCHS AND SESSIONS{R} {D}(tmux; idle = nothing printed for {IDLE // 60} min){R}")
+    out.append("")
+    out.append(f"{B}SEATS, ORCHS AND SESSIONS{R} {D}(tmux; idle = nothing printed for {IDLE // 60} min){R}")
     ws = windows()
     if ws is None:
         out.append("  tmux has no session — every seat is offline")
@@ -334,21 +368,27 @@ def frame(now=None, proc="/proc", width=120):
             if st == "offline" and "/" in name:   # a track window left open after its session ended
                 left += 1
                 continue
-            cells.append(f"{shown(name)[:30]:<30} {st:<9}")
+            cells.append((f"{shown(name)[:30]:<30} {st:<9}", name))
         cols = max(1, width // 44)
         rows = -(-len(cells) // cols)
         for i in range(rows):
-            out.append("  " + "   ".join(cells[i::rows]).rstrip())
+            col = 2
+            for c, name in cells[i::rows]:
+                sel.append((len(out), col, col + len(c), ("seat", name)))
+                col += len(c) + 3
+            out.append("  " + "   ".join(c for c, _ in cells[i::rows]).rstrip())
         if left:
             out.append(f"  {D}and {left} track window(s) whose session has ended{R}")
 
-    out.append(f"\n{B}LANDING{R}")
+    out.append("")
+    out.append(f"{B}LANDING{R}")
     ld, bulk = landings(), {}
     for m, j in ld:
         stage = j.get("stage") or j.get("state") or "?"
         if stage in ("queued", "install"):   # waiting its turn, or merged and waiting to deploy: one line each
             bulk.setdefault(stage, []).append(f"{j['repo']}#{j['pr']}")
             continue
+        sel.append((len(out), 2, width, ("landing", j["repo"], str(j["pr"]))))
         out.append(f"  {j['repo']}#{j['pr']}  {stage:<9} {D}{ago(now - m)}{R} {j.get('title') or ''}")
     for stage, prs in sorted(bulk.items(), reverse=True):
         word = "queued" if stage == "queued" else "merged, waiting to deploy"
@@ -356,7 +396,8 @@ def frame(now=None, proc="/proc", width=120):
     if not ld:
         out.append("  (queue empty)")
 
-    out.append(f"\n{B}LAPTOP{R}")
+    out.append("")
+    out.append(f"{B}LAPTOP{R}")
     out.append(f"  {laptop_line()}")
     sp = spilled(proc)
     out.append(f"  running there now ({len(sp)}): {', '.join(sp)}" if sp else "  nothing spilled there now")
@@ -366,6 +407,344 @@ def frame(now=None, proc="/proc", width=120):
         for m, chk, job, st in done:
             out.append(f"    {time.strftime('%H:%M', time.localtime(m))}  {chk}  {job}  {st}")
     return out
+
+
+# ── the views Enter opens ─────────────────────────────────────────────────────────────────────────────────────
+_LOG = {"ino": None, "off": 0, "landed": {}}
+_TITLES = {}
+
+
+def landed():
+    """[(epoch, repo, pr)] of every PR the queue log says landed, newest first. The log is read on from the offset the
+    last call stopped at; a log that was replaced or cut short is read again from the top."""
+    path = f"{land_dir()}/queue.log"
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    if st.st_ino != _LOG["ino"] or st.st_size < _LOG["off"]:
+        _LOG.update(ino=st.st_ino, off=0, landed={})
+    if st.st_size > _LOG["off"]:
+        with open(path, "rb") as f:
+            f.seek(_LOG["off"])
+            data = f.read()
+        cut = data.rfind(b"\n") + 1            # a half-written last line is read whole next time
+        _LOG["off"] += cut
+        for ln in data[:cut].decode("utf-8", "replace").splitlines():
+            stamp, _, rest = ln.partition("\t")
+            w = rest.split()
+            if len(w) < 3 or (w[0], w[2]) not in (("stage", "merged"), ("notify", "landed")):
+                continue
+            repo, _, pr = w[1].rpartition("#")
+            when = ts(stamp)
+            if repo and not repo.startswith("_") and pr.isdigit() and when:
+                k = (repo, pr)
+                _LOG["landed"][k] = min(when, _LOG["landed"].get(k, when))
+    return sorted(((t, r, p) for (r, p), t in _LOG["landed"].items()), reverse=True)
+
+
+def job(repo, pr):
+    """The lander's record of repo#pr, in flight or ended, or {}."""
+    for path in (f"{land_dir()}/{repo}-{pr}.json", f"{land_dir()}/rest/{repo}-{pr}.json"):
+        try:
+            j = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        if isinstance(j, dict):
+            return j
+    return {}
+
+
+def title(repo, pr):
+    k = (repo, pr)
+    if not _TITLES.get(k):                 # a PR with no record yet is looked up again next time
+        _TITLES[k] = str(job(repo, pr).get("title") or "")
+    return _TITLES[k]
+
+
+def local(t, fmt="%m-%d %H:%M"):
+    return time.strftime(fmt, time.localtime(t))
+
+
+def view_prs(now, width):
+    ls = landed()
+    out = [f"PRs LANDED ({len(ls)}, newest first; from the lander's queue log)", ""]
+    for t, repo, pr in ls:
+        out.append(f"  {local(t)}  {ago(now - t):>4} ago  {repo}#{pr}  {title(repo, pr)}")
+    return out if ls else out + ["  (the queue log records no landing)"]
+
+
+def view_graph(now, width, hours):
+    """Landings per hour over the last `hours`, one bar per clock hour, the current hour last."""
+    top = int(now // 3600) * 3600
+    first = top - (hours - 1) * 3600      # the oldest bar's hour starts here, and a landing on that second is in it
+    counts = {}
+    for t, _, _ in landed():
+        h = int(t // 3600) * 3600
+        if first <= h <= top:
+            counts[h] = counts.get(h, 0) + 1
+    peak = max(counts.values(), default=0)
+    bar = "█" if (sys.stdout.encoding or "").lower().startswith("utf") else "#"
+    room = max(10, width - 20)
+    out = [f"LANDINGS PER HOUR, last {hours} h: {sum(counts.values())} in all  (+ / - widen or narrow)", ""]
+    for h in range(first, top + 1, 3600):
+        n = counts.get(h, 0)
+        out.append(f"  {local(h, '%a %H:00')}  {bar * (-(-n * room // peak) if n else 0)}{' ' + str(n) if n else ''}")
+    return out
+
+
+_LOOPS = {}
+
+
+def loop_events(path):
+    """[(epoch, word, text)] from one loop.log: a first iteration starting, a loop ending. Re-read when its mtime moves."""
+    m = mtime(path)
+    if _LOOPS.get(path, (None,))[0] != m:
+        ev = []
+        try:
+            lines = open(path, errors="replace").read().splitlines()
+        except OSError:
+            lines = []
+        for ln in lines:
+            stamp, _, msg = ln.partition(" ")
+            when = ts(stamp)
+            if not when:
+                continue
+            if msg.startswith("iter 1/") and " start" in msg:
+                ev.append((when, "started", ""))
+            elif msg == "DONE" or msg.startswith(("exit ", "timed out")):
+                ev.append((when, "stopped", "" if msg == "DONE" else msg[:60]))
+        _LOOPS[path] = (m, ev)
+    return _LOOPS[path][1]
+
+
+def timeline(now, span=RECENT):
+    """[(epoch, word, text)] newest first: hand-offs, landings, and worker loops starting and stopping."""
+    ev = []
+    for repo, tracks in boards().items():
+        for name, row in tracks.items():
+            if not isinstance(row, dict):
+                continue
+            ev.append((ts(row.get("created")), "added", f"{repo}/{name}  {row.get('title') or ''}"))
+            for n in row.get("notes") or []:
+                if isinstance(n, dict) and str(n.get("msg", "")).startswith("dispatched"):
+                    ev.append((ts(n.get("ts")), "dispatched", f"{repo}/{name}"))
+            ev.append((ts(row.get("agent_at")), "taken", f"{repo}/{name}"))
+    for t, repo, pr in landed():
+        ev.append((t, "landed", f"{repo}#{pr}  {title(repo, pr)}"))
+    for path in glob.glob(f"{state_dir()}/*/*/loop.log"):
+        if now - mtime(path) > span:
+            continue
+        key = "/".join(path.split("/")[-3:-1])
+        for t, word, why in loop_events(path):
+            ev.append((t, f"worker {word}", f"{key}  {why}".rstrip()))
+    return sorted((e for e in ev if e[0] and 0 <= now - e[0] <= span), key=lambda e: e[0], reverse=True)
+
+
+def view_timeline(now, width):
+    ev = timeline(now)
+    out = [f"TIMELINE, last {RECENT // 3600} h ({len(ev)} events, newest first)", ""]
+    return out + ([f"  {local(t, '%H:%M')}  {word:<15} {text}" for t, word, text in ev] or ["  (nothing)"])
+
+
+def tail(path, n):
+    try:
+        return open(path, errors="replace").read().splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def view_worker(now, width, repo, name):
+    row = boards().get(repo, {}).get(name)
+    if not isinstance(row, dict):
+        return [f"{repo}/{name}", "", "  (no such row on the board now)"]
+    out = [f"{repo}/{name}  [{row.get('status', '?')}]  {row.get('title') or ''}", ""]
+    for k in ("kind", "created", "agent", "agent_at", "held", "pr"):
+        if row.get(k):
+            out.append(f"  {k + ':':<10} {row[k]}")
+    notes = [n for n in row.get("notes") or [] if isinstance(n, dict)]
+    if notes:
+        out += ["", f"NOTES (last {min(8, len(notes))} of {len(notes)})"]
+        out += [f"  {str(n.get('ts', ''))[:16]}  {n.get('msg', '')}" for n in notes[-8:]]
+    d = f"{state_dir()}/{repo}/{name}"
+    for f, n in (("progress.md", 15), ("loop.log", 10)):
+        ls = tail(f"{d}/{f}", n)
+        if ls:
+            out += ["", f"{f.upper()} (last {len(ls)} lines, moved {ago(now - mtime(f'{d}/{f}'))} ago)"]
+            out += [f"  {ln}" for ln in ls]
+    return out
+
+
+def view_landing(now, width, repo, pr):
+    j = job(repo, pr)
+    if not j:
+        return [f"{repo}#{pr}", "", "  (the lander has no record of it now)"]
+    out = [f"{repo}#{pr}  {j.get('title') or ''}", ""]
+    for k in ("stage", "state", "branch", "who", "queued_at", "attempts", "why"):
+        if j.get(k) not in (None, ""):
+            out.append(f"  {k + ':':<10} {j[k]}")
+    hist = [h for h in j.get("history") or [] if isinstance(h, dict)]
+    if hist:
+        out += ["", "HISTORY"]
+        out += [f"  {str(h.get('at', ''))[:16]}  {h.get('state', '')}  {h.get('why', '')}".rstrip() for h in hist]
+    return out
+
+
+def view_seat(now, width, name, proc="/proc"):
+    _, table = procs(proc)
+    w = [x for x in windows() or [] if x[0] == name]
+    if not w:
+        return [shown(name), "", "  (no such window now)"]
+    out = [f"{shown(name)}  {seat_state(name, w[0][1], w[0][2], table, now)}", "",
+           "WHAT ITS PANE SHOWS (last lines)"]
+    sess = os.environ.get("CC_TMUX_SESSION") or "main"
+    try:
+        r = subprocess.run(["tmux", "capture-pane", "-p", "-t", f"{sess}:={name}"],
+                           capture_output=True, text=True, timeout=10)
+        pane = [ln.rstrip() for ln in r.stdout.splitlines()] if not r.returncode else []
+    except (OSError, subprocess.TimeoutExpired):
+        pane = []
+    while pane and not pane[-1]:
+        pane.pop()
+    return out + ([f"  {ln}" for ln in pane[-40:]] or ["  (tmux gave nothing back)"])
+
+
+def render(view, now, proc, width, hours):
+    """(lines, items) for one view; only the home view has items."""
+    if view[0] == "home":
+        items = []
+        return frame(now, proc, width, items), items
+    lines = {"prs": lambda: view_prs(now, width),
+             "graph": lambda: view_graph(now, width, hours),
+             "timeline": lambda: view_timeline(now, width),
+             "worker": lambda: view_worker(now, width, *view[1:]),
+             "landing": lambda: view_landing(now, width, *view[1:]),
+             "seat": lambda: view_seat(now, width, view[1], proc)}[view[0]]()
+    return lines, []
+
+
+# ── the cursor ────────────────────────────────────────────────────────────────────────────────────────────────
+ENTER = (10, 13, curses.KEY_ENTER)
+BACK = (27, 8, 127, curses.KEY_BACKSPACE, curses.KEY_LEFT)
+
+
+class Nav:
+    """Where the owner is: a stack of views (home at the bottom), the cursor on home, and each view's scroll. key()
+    changes that and says 'quit', 'open' (the view changed: render again) or None; it draws nothing, so the selfcheck
+    drives it with key codes and no terminal."""
+
+    def __init__(self):
+        self.stack, self.saved, self.cur, self.top, self.hours = [("home",)], [], 0, 0, 24
+        self.pin = None                    # (cursor, its line, rows) when top last followed the cursor
+
+    @property
+    def view(self):
+        return self.stack[-1]
+
+    def key(self, k, items, nlines, rows):
+        if len(self.stack) == 1:
+            return self.home_key(k, items, nlines, rows)
+        if k in BACK + (ord("q"), ord("Q")):          # "Esc or Backspace goes back": from any view, to the one below
+            self.stack.pop()
+            self.cur, self.top = self.saved.pop()
+            return "open"
+        step = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1,
+                curses.KEY_PPAGE: -rows, curses.KEY_NPAGE: rows, curses.KEY_HOME: -nlines}.get(k)
+        if step:
+            self.top = max(0, min(max(0, nlines - rows), self.top + step))
+        elif self.view[0] == "graph" and k in (ord("+"), ord("="), ord("-")):
+            self.hours = max(6, min(168, self.hours // 2 if k == ord("-") else self.hours * 2))
+            return "open"
+        return None
+
+    def home_key(self, k, items, nlines, rows):
+        if k in (ord("q"), ord("Q")):
+            return "quit"
+        step = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_LEFT: -1, curses.KEY_DOWN: 1, ord("j"): 1,
+                curses.KEY_RIGHT: 1, curses.KEY_PPAGE: -rows, curses.KEY_NPAGE: rows}.get(k)
+        if step and items:
+            last, line = len(items) - 1, items[self.cur][0]
+            far = max(0, nlines - rows)
+            if step > 0 and self.cur == last and line < nlines - 1 and self.top < far:
+                self.top = min(far, self.top + step)      # the last item: the sections below scroll into view
+            elif step < 0 and self.cur == last and self.top > max(0, line - rows + 1):
+                self.top = max(max(0, line - rows + 1), self.top + step)    # ...and scroll back before it moves
+            else:
+                self.cur = max(0, min(last, self.cur + step))
+        elif k == curses.KEY_HOME:
+            self.cur, self.top = 0, 0
+        elif k in ENTER and items:                    # "click enter to see more details"
+            self.saved.append((self.cur, self.top))
+            self.stack.append(items[self.cur][3])
+            self.top = 0
+            return "open"
+        return None
+
+    def fit(self, items, nlines, rows):
+        """Keep the cursor on an item and its line on screen, after a refresh or a resize moved things."""
+        if len(self.stack) > 1:
+            self.top = max(0, min(self.top, nlines - rows))
+            return
+        self.cur = max(0, min(self.cur, len(items) - 1))
+        if items and self.pin != (self.cur, items[self.cur][0], rows):      # moved, resized or its line moved
+            line = items[self.cur][0]
+            self.pin = (self.cur, line, rows)
+            if line < self.top + 1:
+                self.top = max(0, line - 1)
+            elif line >= self.top + rows:
+                self.top = line - rows + 1
+        self.top = max(0, min(self.top, max(0, nlines - rows)))
+
+
+def paint(scr, nav, lines, items, every):
+    h, w = scr.getmaxyx()
+    rows = max(1, h - 1)
+    scr.erase()
+    hi = items[nav.cur] if items and len(nav.stack) == 1 else None
+    for y, ln in enumerate(lines[nav.top:nav.top + rows]):
+        i = nav.top + y
+        attr = curses.A_BOLD if ln and not ln.startswith(" ") else curses.A_NORMAL
+        put(scr, y, 0, ln[:w - 1], attr)
+        if hi and hi[0] == i:
+            put(scr, y, hi[1], ln[hi[1]:min(hi[2], w - 1)], curses.A_REVERSE)
+    more = f"{nav.top + rows}/{len(lines)} lines · " if len(lines) > nav.top + rows or nav.top else ""
+    keys = ("↑↓ move · Enter open · q or Ctrl-C quit" if len(nav.stack) == 1
+            else "↑↓ PgUp PgDn scroll · Esc/Backspace back" + (" · +/- hours" if nav.view[0] == "graph" else ""))
+    put(scr, h - 1, 0, f"{more}{keys} · refreshes every {every}s"[:w - 1], curses.A_DIM)
+    scr.refresh()
+
+
+def put(scr, y, x, text, attr):
+    try:
+        scr.addstr(y, x, text, attr)
+    except curses.error:                   # the bottom-right cell, or a terminal narrower than the line
+        pass
+
+
+def ui(scr, every, proc="/proc", clock=time.time):
+    """The navigable view on any screen that has curses' window methods: getch, addstr, getmaxyx, erase, refresh."""
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    scr.keypad(True)
+    scr.timeout(500)
+    nav, got, built = Nav(), None, 0
+    while True:
+        h, w = scr.getmaxyx()
+        if got is None or time.monotonic() - built >= every:
+            got, built = render(nav.view, clock(), proc, w, nav.hours), time.monotonic()
+        lines, items = got
+        nav.fit(items, len(lines), max(1, h - 1))
+        paint(scr, nav, lines, items, every)
+        k = scr.getch()
+        if k == -1:
+            continue
+        act = nav.key(k, items, len(lines), max(1, h - 1))
+        if act == "quit":
+            return 0
+        if act == "open" or k == curses.KEY_RESIZE:
+            got = None
 
 
 def draw(every):
@@ -396,6 +775,12 @@ def main(argv):
         print(__doc__.split("\n\n")[-1].rstrip(), file=sys.stderr)
         return 2
     try:
+        if sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb":
+            import locale
+            locale.setlocale(locale.LC_ALL, "")
+            os.environ.setdefault("ESCDELAY", "25")   # Esc goes back at once, not after curses' default second
+            os.environ["CC_LIVE_PLAIN"] = "1"         # curses draws the bold and the cursor itself
+            return curses.wrapper(ui, every)
         while True:
             draw(every)
             time.sleep(every)
@@ -424,7 +809,9 @@ def selfcheck():
     for d in ("boards", "state/r/w1", "land", "proc", "wt/r/w1", "bin"):
         os.makedirs(f"{tmp}/{d}")
     # a tmux of its own, so the box's own server is never asked: no session until a case writes the windows file
-    open(f"{tmp}/bin/tmux", "w").write(f"#!/bin/sh\n[ -f {tmp}/windows ] || exit 1\ncat {tmp}/windows\n")
+    open(f"{tmp}/bin/tmux", "w").write(f"#!/bin/sh\n[ -f {tmp}/windows ] || exit 1\n"
+                                       f"[ \"$1\" = capture-pane ] && {{ echo \"pane of $4\"; printf '\\n\\n'; exit 0; }}\n"
+                                       f"cat {tmp}/windows\n")
     os.chmod(f"{tmp}/bin/tmux", 0o755)
     open(f"{tmp}/bin/suites", "w").write("#!/bin/sh\necho 'cc-suites: runner lap answers: free 3 cores=8 slots=4 maxload=6 load=0.10 ac=1'\n")
     open(f"{tmp}/bin/suites-hang", "w").write("#!/bin/sh\nexec sleep 30\n")
@@ -533,6 +920,145 @@ def selfcheck():
     case("a usage limit ahead is shown", "usage limit holds work" in "\n".join(frame(now, f"{tmp}/proc")))
     json.dump({"limit_until": now - 1}, open(f"{tmp}/state/reconcile.json", "w"))
     case("a usage limit behind is not", "usage limit" not in "\n".join(frame(now, f"{tmp}/proc")))
+
+    # the views Enter opens, each over its own fixture
+    os.makedirs(f"{tmp}/land/rest")
+    json.dump({"repo": "r", "pr": "5", "title": "the fifth"}, open(f"{tmp}/land/rest/r-5.json", "w"))
+    log = [(now - 7200, "stage r#5 merged sha=abc"), (now - 7100, "notify r#5 landed → thread"),
+           (now - 30 * 3600, "notify r#3 landed → thread"), (now - 600, "stage r#6 merged sha=def"),
+           (now - 500, "stage _t#1 merged sha=x"), (now - 400, "stage r#8 gate"), (now - 300, "not a line")]
+    open(f"{tmp}/land/queue.log", "w").write("".join(f"{iso(t)}\t{m}\n" for t, m in log) + f"{iso(now)}\tstage r#9 mer")
+    ld = landed()
+    case("landed: newest first, the earliest of merged and notify, no test repo, no other stage",
+         ld == [(now - 600, "r", "6"), (now - 7200, "r", "5"), (now - 30 * 3600, "r", "3")])
+    open(f"{tmp}/land/queue.log", "a").write(f"ged sha=1\n")
+    case("a half-written last line is read whole on the next refresh", landed()[0] == (now, "r", "9"))
+    open(f"{tmp}/land/queue.log", "w").write(f"{iso(now - 60)}\tstage r#4 merged sha=2\n")
+    case("a log that was cut short is read again from the top", landed() == [(now - 60, "r", "4")])
+    open(f"{tmp}/land/queue.log", "w").write("".join(f"{iso(t)}\t{m}\n" for t, m in log))
+    _LOG.update(ino=None)
+    prs = "\n".join(view_prs(now, 120))
+    case("the PR list says when each landed, with its title",
+         f"  {local(now - 7200)}    2h ago  r#5  the fifth" in prs and "r#3" in prs and "r#8" not in prs)
+    g = view_graph(now, 60, 6)
+    case("the graph has one bar per hour, oldest first, the current hour last",
+         len(g) == 8 and g[-1].startswith(f"  {local(int(now // 3600) * 3600, '%a %H:00')}"))
+    case("the graph counts a landing in its hour and leaves out one older than its span",
+         g[-1].endswith(" 1") and "2 in all" in g[0] and "3 in all" in view_graph(now, 60, 48)[0])
+    open(f"{tmp}/land/queue.log", "a").write(f"{iso(int(now // 3600) * 3600 - 5 * 3600)}\tstage r#2 merged sha=3\n"
+                                              f"{iso(int(now // 3600) * 3600 - 5 * 3600 - 1)}\tstage r#1 merged sha=4\n")
+    case("a landing on the first second of the oldest hour is counted, one a second earlier is not",
+         "3 in all" in view_graph(now, 60, 6)[0])
+    case("an hour with no landing has no bar", sum(1 for ln in g[2:] if ln.rstrip().endswith(":00")) == 4)
+    open(f"{tmp}/state/r/w1/loop.log", "w").write(f"{iso(now - 3000)} iter 1/2 start (budget $5)\n{iso(now - 2000)} iter 2/2 start\n"
+                                                  f"{iso(now - 1000)} DONE\n{iso(now - 900)} exit 1: gave up\n")
+    tl = "\n".join(view_timeline(now, 120))
+    for word, what in (("added", "r/fresh  just added"), ("dispatched", "r/sent"), ("landed", "r#5  the fifth"),
+                       ("worker started", "r/w1"), ("worker stopped", "r/w1"), ("worker stopped", "r/w1  exit 1: gave up")):
+        case(f"the timeline shows {word} {what}", f"{word:<15} {what}" in tl)
+    case("the timeline leaves out a second iteration and what is older than a day",
+         tl.count("worker started") == 1 and "r#3" not in tl and "r/old" not in tl)
+    w = "\n".join(view_worker(now, 120, "r", "sent"))
+    case("a worker view shows its row and its notes", "r/sent  [running]  worker out" in w and "dispatched headless" in w)
+    w = "\n".join(view_worker(now, 120, "r", "w1"))
+    case("a worker view shows its loop log's last lines", "LOOP.LOG (last 4 lines" in w and "exit 1: gave up" in w)
+    case("a row gone from the board says so", "no such row" in view_worker(now, 120, "r", "nope")[-1])
+    json.dump({"repo": "r", "pr": 7, "stage": "gates", "title": "a landing",
+               "history": [{"at": iso(now - 60), "state": "queued"}]}, open(f"{tmp}/land/r-7.json", "w"))
+    lv = "\n".join(view_landing(now, 120, "r", "7"))
+    case("a landing view shows its stage and history", "stage:     gates" in lv and "queued" in lv)
+    case("an ended landing is read from rest/", view_landing(now, 120, "r", "5")[0] == "r#5  the fifth")
+    sv = view_seat(now, 120, "seat", f"{tmp}/proc")
+    case("a seat view shows its state and what its pane printed, blank tail cut",
+         sv[0] == "seat  working" and sv[-1] == "  pane of cc-live-selfcheck-none:=seat")
+    case("a seat that went away says so", view_seat(now, 120, "nope", f"{tmp}/proc")[-1] == "  (no such window now)")
+
+    # the cursor: what the home screen offers, and what each key does
+    items = []
+    home = frame(now, f"{tmp}/proc", 120, items)
+    case("the home screen opens with the three views", [i[3] for i in items[:3]] == [("prs",), ("graph",), ("timeline",)]
+         and home[1] == "  [ PRs landed ]  [ landings graph ]  [ timeline ]" and home[1][items[1][1]:items[1][2]] == "[ landings graph ]")
+    kinds = [i[3][0] for i in items]
+    case("hand-offs, running rows, seats and landings are items, in screen order",
+         {"worker", "seat", "landing"} <= set(kinds) and [i[0] for i in items] == sorted(i[0] for i in items))
+    seat = next(i for i in items if i[3] == ("seat", "r@orch"))
+    case("a seat item spans its own cell", home[seat[0]][seat[1]:seat[2]].startswith("orch@r "))
+    case("the plain frame has no menu line and --once keeps its shape", "[ PRs landed ]" not in "\n".join(frame(now, f"{tmp}/proc")))
+    K = curses
+    nav = Nav()
+    case("q quits from home", nav.key(ord("q"), items, 50, 20) == "quit")
+    nav.key(K.KEY_DOWN, items, 50, 20)
+    nav.key(K.KEY_DOWN, items, 50, 20)
+    case("↓ moves the cursor", nav.cur == 2)
+    nav.key(K.KEY_LEFT, items, 50, 20)
+    case("← on home moves the cursor back, and does not leave home", nav.cur == 1 and nav.view == ("home",))
+    nav.key(K.KEY_UP, items, 50, 20), nav.key(K.KEY_UP, items, 50, 20)
+    case("↑ stops at the first item", nav.cur == 0)
+    case("Enter opens the item under the cursor", nav.key(10, items, 50, 20) == "open" and nav.view == ("prs",))
+    nav.key(K.KEY_NPAGE, [], 50, 20)
+    case("PgDn scrolls a view, no further than its end", nav.top == 20 and (nav.key(K.KEY_NPAGE, [], 50, 20), nav.top)[1] == 30)
+    case("Esc goes back home", nav.key(27, [], 50, 20) == "open" and nav.view == ("home",) and nav.top == 0)
+    nav.key(K.KEY_DOWN, items, 50, 20)
+    nav.key(K.KEY_ENTER, items, 50, 20)
+    case("the graph starts at 24 h; + doubles it and - halves it, within 6 h and a week",
+         nav.hours == 24 and nav.key(ord("+"), [], 9, 20) == "open" and nav.hours == 48
+         and [nav.key(ord("-"), [], 9, 20) for _ in range(4)] and nav.hours == 6)
+    case("+ does nothing outside the graph", (nav.key(K.KEY_BACKSPACE, [], 9, 20), nav.key(ord("+"), items, 9, 20))[1] is None)
+    case("Backspace went back to the cursor it left", nav.view == ("home",) and nav.cur == 1)
+    case("Esc on home stays home", nav.key(27, items, 50, 20) is None and nav.view == ("home",))
+    nav.cur = len(items) - 1
+    nav.fit(items, len(home), 10)
+    case("the cursor's line is kept on screen", nav.top <= items[-1][0] < nav.top + 10)
+    n = items[-1][0] + 25
+    for _ in range(40):
+        nav.key(K.KEY_DOWN, items, n, 10), nav.fit(items, n, 10)
+    case("↓ past the last item scrolls home to its end, and fit leaves it there",
+         nav.cur == len(items) - 1 and nav.top == n - 10)
+    nav.key(K.KEY_UP, items, n, 10), nav.fit(items, n, 10)
+    case("↑ scrolls back before the cursor moves", nav.cur == len(items) - 1 and nav.top == n - 11)
+
+    class Screen:            # curses' window methods, over a dict: the whole navigable loop with no terminal
+        def __init__(self, keys):
+            self.keys, self.rows, self.hi, self.shots = list(keys), {}, [], []
+
+        def keypad(self, on):
+            pass
+
+        def timeout(self, ms):
+            pass
+
+        def getmaxyx(self):
+            return 40, 120
+
+        def erase(self):
+            self.rows, self.hi = {}, []
+
+        def addstr(self, y, x, text, attr=0):
+            ln = self.rows.get(y, "").ljust(x)
+            self.rows[y] = ln[:x] + text + ln[x + len(text):]
+            if attr == curses.A_REVERSE:
+                self.hi.append(text)
+
+        def refresh(self):
+            self.shots.append(("\n".join(self.rows.get(y, "") for y in range(40)), self.hi))
+
+        def getch(self):
+            if not self.keys:
+                raise KeyboardInterrupt
+            return self.keys.pop(0)
+    scr = Screen([K.KEY_RIGHT, K.KEY_RIGHT, 10, -1, 27, ord("q")])
+    rc = ui(scr, 10, f"{tmp}/proc", clock=lambda: now)
+    shots = [t for t, _ in scr.shots]
+    case("the loop draws home with the cursor on the first view", scr.shots[0][1] == ["[ PRs landed ]"] and "HANDED OFF" in shots[0])
+    case("→ → Enter opens the timeline, and its footer says how to go back",
+         shots[3].startswith("TIMELINE") and "Esc/Backspace back" in shots[3] and scr.shots[3][1] == [])
+    case("Esc brings home back with the cursor where it was, and q ends the loop with 0",
+         scr.shots[-1][1] == ["[ timeline ]"] and "HANDED OFF" in shots[-1] and rc == 0)
+    try:
+        ui(Screen([K.KEY_DOWN]), 10, f"{tmp}/proc", clock=lambda: now)
+        case("Ctrl-C leaves the loop", False)
+    except KeyboardInterrupt:
+        case("Ctrl-C leaves the loop", True)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"cc-live selfcheck: {ok} passed, {bad} failed")
     return 1 if bad else 0
