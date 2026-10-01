@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /* selfcheck.mjs (the demo-video skill) — the kit's own checks.
 
-    node selfcheck.mjs          # no browser: the director's frames, the camera, the encode, the joins, the limits, the recorder
+    node selfcheck.mjs          # no browser: the director's frames, the camera, the encode, the joins, the limits, the recorder,
+                                #   and motion/: its maths, its stutter measure and its React pieces (rendered to markup)
     node selfcheck.mjs --film   # also films a moving page and a tiny sandboxed terminal in Chromium and checks the MP4s
 
 Each case builds what it needs in its own temp dir and prints one line; the exit code is the number that failed. */
@@ -10,6 +11,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 import { fadeOffsets, firstDenied, captionFilter, encodeFrames, stitch, checkLength, lengthOf, contactSheet,
   director, encodeClip, handEase, reachMs, sleep, FFMPEG, RESULT_MS, MAX_FILM_S } from './film.mjs';
 import { cameraAt, viewFor, transformOf, rest } from './camera.mjs';
@@ -280,6 +282,120 @@ await check('record.py: records what a command prints, with the marks the driver
     const tOne = ev.find((e) => e[1] === 'o' && /one/.test(e[2]))[0], tTwo = ev.find((e) => e[1] === 'o' && /two/.test(e[2]))[0];
     if (!(m[0] > tOne && m[0] < tTwo)) throw new Error(`mark at ${m[0]} is not between ${tOne} and ${tTwo}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── motion/: the drawn-film kit (pure maths, the React pieces, the stutter measure) ──
+const M = await import('./motion/motion.mjs');
+const { frameDiffs, stutters } = await import('./motion/measure.mjs');
+
+await check('motion: every easing runs 0 to 1 without going back, and bezier() matches CSS where CSS is known', () => {
+  for (const [name, e] of Object.entries(M.EASE)) {
+    near(e(0), 0, 1e-6, `${name}(0)`); near(e(1), 1, 1e-6, `${name}(1)`);
+    for (let i = 1; i <= 100; i++) if (e(i / 100) < e((i - 1) / 100) - 1e-9) throw new Error(`${name} goes back at ${i / 100}`);
+  }
+  near(M.bezier(0, 0, 1, 1)(0.3), 0.3, 1e-6, 'linear bezier');
+  near(M.bezier(0.42, 0, 0.58, 1)(0.5), 0.5, 1e-4, 'ease-in-out at half way');
+  near(M.tween(5, 1, 2, 10, 20), 20, 0, 'tween holds its end'); near(M.tween(0, 1, 2, 10, 20), 10, 0, 'tween holds its start');
+});
+
+await check('motion: a critically damped spring never overshoots and settles when settle() says; an underdamped one does overshoot', () => {
+  eq(M.spring(0.5, 1), 0, 'before release');
+  const s = M.settle({ freq: 1.6 });
+  for (let ms = 0; ms <= 3000; ms++) if (M.spring(ms / 1000, 0, { freq: 1.6 }) > 1 + 1e-9) throw new Error(`overshoots at ${ms} ms`);
+  if (Math.abs(1 - M.spring(s, 0, { freq: 1.6 })) > 0.005 || Math.abs(1 - M.spring(s - 0.05, 0, { freq: 1.6 })) <= 0.005) throw new Error(`settle ${s} is not the edge`);
+  let peak = 0;
+  for (let ms = 0; ms <= 3000; ms++) peak = Math.max(peak, M.spring(ms / 1000, 0, { freq: 1.6, damping: 0.4 }));
+  if (peak < 1.2) throw new Error(`damping 0.4 peaked at ${peak}, no bounce`);
+});
+
+await check('motion: a ripple exists only for its own span, its ring grows every frame while fading, and the press dot is gone by half way', () => {
+  eq([M.ripple(0.99, 1), M.ripple(1 + 0.55, 1)], [null, null], 'outside its span');
+  let last = null;
+  for (let f = 0; f < 16; f++) {
+    const r = M.ripple(1 + f / 30, 1);
+    if (!r) throw new Error(`frame ${f} has no ripple`);
+    if (last && !(r.r > last.r && r.ring < last.ring)) throw new Error(`frame ${f}: ring did not grow and fade`);
+    if (f / 30 >= 0.55 / 2 && r.dot !== 0) throw new Error(`frame ${f}: dot still there`);
+    last = r;
+  }
+});
+
+await check('motion: drift is the same for the same seed, different for another, and moves under 0.2 px a frame', () => {
+  eq(M.drift(7.3, { seed: 2 }), M.drift(7.3, { seed: 2 }), 'same seed');
+  if (same(M.drift(7.3, { seed: 2 }), M.drift(7.3, { seed: 3 }))) throw new Error('two seeds drift alike');
+  for (let f = 1; f < 1800; f++) {
+    const a = M.drift((f - 1) / 30), b = M.drift(f / 30);
+    if (Math.hypot(b.x - a.x, b.y - a.y) > 0.2) throw new Error(`frame ${f} jumps`);
+  }
+});
+
+await check('motion: camera keys hold before the first and after the last, move on every frame between, and never pop at a key', () => {
+  const keys = [{ t: 1, s: 1, fx: 640, fy: 360 }, { t: 2, s: 1.5, fx: 500, fy: 300 }, { t: 3, s: 1.2, fx: 700, fy: 400, ease: M.EASE.out }];
+  eq(M.cameraKeys(keys, 0), { s: 1, fx: 640, fy: 360 }, 'before'); eq(M.cameraKeys(keys, 9), { s: 1.2, fx: 700, fy: 400 }, 'after');
+  for (let f = 31; f < 90; f++) if (same(M.cameraKeys(keys, (f - 1) / 30), M.cameraKeys(keys, f / 30))) throw new Error(`frame ${f} still`);
+  for (const k of keys) { const a = M.cameraKeys(keys, k.t - 1e-6), b = M.cameraKeys(keys, k.t); near(a.fx, b.fx, 1e-3, `fx at ${k.t}`); near(a.s, b.s, 1e-5, `s at ${k.t}`); }
+});
+
+await check('motion: blur samples sit centred on the frame across the shutter, and one sample is the sharp frame', () => {
+  eq(M.blurTimes(2, 30, 1), [2], 'one sample');
+  const ts = M.blurTimes(2, 30, 5, 0.5);
+  eq(ts.length, 5, 'count'); near(ts[2], 2, 1e-9, 'centre'); near(ts[4] - ts[0], 0.5 / 30, 1e-9, 'span');
+  near(M.frameTravel((t) => ({ x: 300 * t, y: 0 }), 1, 30), 10, 1e-9, 'travel of 300 px/s at 30 fps');
+  eq(M.typed('hello', 0.5, 0, 1), 'hel', 'typed');
+});
+
+await check('measure: stutters() flags a frame frozen inside a move, and passes a hold and a smooth move', () => {
+  const smooth = Array.from({ length: 40 }, (_, i) => (i ? 2 : 0));
+  eq(stutters(smooth), [], 'smooth');
+  const hold = [0, 2, 2, 2, ...Array(20).fill(0), 2, 2];
+  eq(stutters(hold), [], 'a hold');
+  const jank = smooth.map((v, i) => (i % 6 === 5 ? 0 : v));
+  eq(stutters(jank), [5, 11, 17, 23, 29, 35], 'every 6th frozen');
+});
+
+await check('measure: frameDiffs finds the 25-to-30 fps repeat in a real encode and none in a native 30 fps one', () => {
+  const dir = tmp();
+  try {
+    const enc = (name, vf) => {
+      const f = join(dir, name);
+      execFileSync(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=25:d=2', '-vf', vf,
+        '-c:v', 'libx264', '-crf', '12', '-pix_fmt', 'yuv420p', f]);
+      return f;
+    };
+    const bad = stutters(frameDiffs(enc('jank.mp4', 'fps=30')));
+    if (bad.length < 8) throw new Error(`found ${bad.length} stutters in a 25->30 resample`);
+    execFileSync(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=2',
+      '-c:v', 'libx264', '-crf', '12', '-pix_fmt', 'yuv420p', join(dir, 'ok.mp4')]);
+    eq(stutters(frameDiffs(join(dir, 'ok.mp4'))), [], 'native 30 fps');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+await check('pieces: render to markup, each a function of t: a ripple only in its span, a message only once in, n blur samples', async () => {
+  const { modules, MOTION_PINS } = await import('./deps.mjs');
+  const req = createRequire(join(dirname(modules(MOTION_PINS)), 'x.js'));
+  const React = req('react'), { renderToStaticMarkup: html } = req('react-dom/server');
+  const P = (await import('./motion/pieces.mjs')).pieces(React);
+  const h = React.createElement;
+  eq([html(h(P.Ripple, { t: 0.9, at: 1 })), html(h(P.Ripple, { t: 2, at: 1 }))], ['', ''], 'ripple outside its span');
+  const r = html(h(P.Ripple, { t: 1.05, at: 1 }));
+  if (!r.includes('data-piece="ring"') || !r.includes('data-piece="dot"')) throw new Error('ripple without ring or dot: ' + r);
+  eq(html(h(P.MessageIn, { t: 0.9, at: 1 }, 'hi')), '', 'message before it lands');
+  if (!html(h(P.MessageIn, { t: 3, at: 1 }, 'hi')).includes('hi')) throw new Error('message after it lands');
+  /* the entrance blur is gone before the rise's still tail (q 0.85, about 0.27 s in at freq 2.4), and on while it moves fast */
+  if (!html(h(P.MessageIn, { t: 1.1, at: 1 }, 'hi')).includes('blur(')) throw new Error('no blur early in the rise');
+  if (html(h(P.MessageIn, { t: 1.4, at: 1 }, 'hi')).includes('blur(')) throw new Error('blur still on in the tail');
+  /* the height opens as a fraction of the real one (a grid row of p fr) and clips only while it opens; once open the row
+     stays (dropping it re-rasters the text), and an item that was always there has no row at all */
+  const opening = html(h(P.MessageIn, { t: 1.2, at: 1 }, 'hi')), open = html(h(P.MessageIn, { t: 3, at: 1 }, 'hi'));
+  if (!/grid-template-rows:0\.\d+fr/.test(opening) || !opening.includes('overflow:hidden')) throw new Error('no clipped p fr row while opening');
+  if (!open.includes('grid-template-rows') || open.includes('overflow:hidden')) throw new Error('row dropped or clip kept after opening');
+  if (html(h(P.MessageIn, { t: 3 }, 'hi')).includes('grid-template-rows')) throw new Error('a row on an item that was always there');
+  const b = html(h(P.MotionBlur, { t: 1, fps: 30, n: 5, render: (t) => h('i', null, t.toFixed(4)) }));
+  eq((b.match(/data-sample/g) || []).length, 5, 'blur samples');
+  if (!b.includes('opacity:0.2')) throw new Error('the 5th sample is not at 1/5: ' + b);
+  eq(html(h(P.MotionBlur, { t: 1, n: 1, render: () => h('i', null, 'x') })), '<i>x</i>', 'one sample is the sharp frame');
+  const typedNow = html(h(P.Typed, { t: 0.5, t0: 0, t1: 1, text: 'abcd', caret: false }));
+  eq(typedNow, 'ab', 'typed half way');
 });
 
 if (process.argv.includes('--film')) {

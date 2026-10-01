@@ -57,10 +57,25 @@ cursor moves on every frame. Nothing real may be in frame: every beat checks the
 - `deps.mjs`: playwright-core and @xterm/xterm (`PINS`), installed once into ~/.cache/demo-video
   (`DEMO_NODE_MODULES` to use another node_modules), and the Chromium in ~/.cache/ms-playwright (`CHROME` to name
   another), which films the page and composites the frames.
-- `selfcheck.mjs`: `node selfcheck.mjs` checks the kit without a browser; `--film` also films a moving page (a
+- `selfcheck.mjs`: `node selfcheck.mjs` checks the kit without a browser, `motion/` included (its pieces are
+  rendered to markup with react-dom/server); `--film` also films a moving page (a
   moving element and the cursor must advance on every output frame, timestamps must be exact, a zoom must not pop)
   and a tiny sandboxed terminal. `director()` runs the plain selfcheck first, once per render, and refuses to film
   if it fails; nothing in it depends on the box's load.
+- `motion/`: the kit for a drawn film, where the UI is drawn rather than filmed (a chat window, an app rebuilt in its own
+  look, a product shot). Each frame is a pure function of its time, rendered by Remotion, so it is
+  frame-exact like a filmed beat. `motion.mjs` is the maths: one easing family (`EASE.out` for entrances, `inOut`
+  for moves, `snap` for a hard return), `spring` (critically damped by default, so nothing bounces),
+  `typed`, `ripple`, `drift` (a hand-held sway under 0.2 px a frame), `cameraKeys`, `blurTimes` and `frameTravel`
+  for motion blur, `rng` for seeded randomness. `pieces.mjs` is the React pieces built on it, made with
+  `pieces(React)` so no bundler is needed to check them: `Ripple` (a touch: ring and press dot, never a cursor or a
+  hand), `MessageIn` (a list item that opens its height and
+  rises in, its blur gone before the still tail so it never pops), `Typed`, `Camera` (with `depth` for parallax and `driftAmp`), `MotionBlur` (n samples across a
+  180-degree shutter; give n = 1 when the move is slow) and `Crossfade`. `render.mjs` renders it: `renderFilm`
+  (lossless PNG frames, one H.264 yuv420p encode, faststart), `renderStills`, and `frameCost`, which times a
+  stretch so you can pick 30 or 60 fps from what the box can do now. `measure.mjs` makes "no stutter" a number:
+  `frameDiffs(mp4)` and `stutters(diffs)`, the frames that froze in the middle of a move. Remotion and React are
+  `MOTION_PINS` in `deps.mjs`, installed into the same cache on first use.
 
 ## How to make one
 
