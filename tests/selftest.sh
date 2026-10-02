@@ -380,7 +380,7 @@ export CC_ROOM_DIR="$T/room" CC_WORKER_CAP=1000 CC_WORKER_PACE_MARGIN=100   # cc
 # here) every fixture --go would sit in `cc-room admit`. A calm load average and calm PSI of the run's own.
 mkdir -p "$T/psi"; echo "0.00 0.00 0.00 1/1 1" > "$T/loadavg"
 for k in cpu memory io; do echo "some avg10=0.00 avg60=0.00 avg300=0.00 total=0" > "$T/psi/$k"; done
-export LANDER_LOADAVG="$T/loadavg" LANDER_PSI_DIR="$T/psi"
+export LANDER_LOADAVG="$T/loadavg" LANDER_PSI_DIR="$T/psi" LANDER_LOAD_FACTOR=2   # the factor too: a caller's tiny one would call even a 0.00 load busy
 export CC_LIMIT_STAMP="$T/claude-limit"   # not the box's live stamp: a test limit must never make a real loop wait
 export CC_FAILURES="$T/failures"          # not ~/.cc/failures: the loop stops and red gates below are fixtures, and the
                                           # ledger counts what it holds (cc-loop stop_record, cc-green red)
@@ -1694,6 +1694,10 @@ for w in m8 m9; do tmux kill-window -t "$(tmux list-windows -t main -F '#{window
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w1$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
 ll0=$(wc -l < ~/.cc/state/$REPO/w1/loop.log 2>/dev/null || echo 0)
+# THE FIXTURE --go MUST GET A ROOM. Queued by cc-room it never starts, and the cases below read that as `loop DONE`
+# + `iteration count: 0` (#752, #788, 09-29: the box's load, which the e2e preamble did not isolate). Say it here.
+rw=$("$B/cc-room" check 2>&1) && ok "cc-room admits the fixture --go: the box's load, PSI, loops and pace never queue it" \
+  || bad "cc-room would queue the fixture --go: $rw"
 CC_CLAUDE="$T/fakeclaude" "$B/cc" $REPO w1 --go "build the thing" --loop 3 >/dev/null 2>&1
 # WAIT ON THE LOOP'S OWN END, NOT THE CLOCK. A fixed 40 s here went red on a loaded box (#670, #699, #722, 09-25..27:
 # `loop DONE` + `loop iteration count: 1`, while the notify and board cases below passed — the loop DID finish, a
@@ -1728,12 +1732,13 @@ w1out=$(env SLACK_BOT_TOKEN= CC_SLACK="$T/ghw1/slack" PATH="$T/ghw1:$PATH" "$B/c
 fi
 if stanza "--go waits for room, and a room check that crashes fails open"; then
 # NO ROOM (cc-room check exit 1) QUEUES THE LAUNCH: the window opens with the loop behind `cc-room admit`, the
-# dispatcher hears "queued" and why, and no iteration runs while the cap holds. A cap of 0 is "no room" by count.
+# dispatcher hears "queued" and why, and no iteration runs while the cap holds. A cap of 0 is "no room" whatever the
+# count, and cc-room counts every worker loop on the machine, so the case takes any count.
 "$B/cc-board" add $REPO rq1 "rq1" "Do the rq1 thing." >/dev/null 2>&1
 CC_WORKER_CAP=0 "$B/cc-room" check >/dev/null 2>&1; rq0=$?
 CC_WORKER_CAP=0 "$B/cc" $REPO rq1 --go "" >"$T/rq1.out" 2>&1; rq1=$?
 for _ in $(seq 1 20); do grep -q 'cc-room: '"$REPO"'/rq1 queued' ~/.cc/state/$REPO/rq1/loop.log 2>/dev/null && break; sleep 0.5; done
-{ [ "$rq0" = 1 ] && [ "$rq1" = 0 ] && grep -q 'worker queued, not started: 0 worker loops are running and the cap is 0' "$T/rq1.out" \
+{ [ "$rq0" = 1 ] && [ "$rq1" = 0 ] && grep -q 'worker queued, not started: [0-9]* worker loops are running and the cap is 0' "$T/rq1.out" \
   && ! grep -q 'worker started' "$T/rq1.out" && [ -n "$(wins "$REPO/rq1")" ] \
   && grep -q "cc-room: $REPO/rq1 queued" ~/.cc/state/$REPO/rq1/loop.log \
   && ! ls ~/.cc/state/$REPO/rq1/runs/*.json >/dev/null 2>&1; } \
@@ -2511,14 +2516,19 @@ export CC_CONFIG="$D/config" CC_SELF_LAND_EXCEPT= CC_SLACK="$D/bin/cc-slack" CC_
 unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST GH_REPO TMUX TMUX_PANE CC_MEMBER_SANDBOX CC_WORKER_SANDBOX
 printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"; : > "$D/config"
 cp "$B/cc" "$B/cc-task" "$B/cc-loop" "$B/cc-land" "$B/lander" "$B/cc-checkpoint" "$B/cc-config" "$D/bin/"
-# cc-land is a shim over `lander`, which runs only a pinned release: this HOME gets one, the lander beside $B.
-mkdir -p "$HOME/.cc/lander/current/core"; cp -r "$B/../lander" "$HOME/.cc/lander/current/core/"
+# cc-land is a shim over `lander`, which runs only a pinned release under releases/<sha>: `current` is a symlink
+# to it, never the tree itself (#771) — a `current` that resolves outside releases/ is refused.
+rel="$HOME/.cc/lander/releases/fixture"; mkdir -p "$rel/core"; cp -r "$B/../lander" "$rel/core/"
+ln -s "$rel" "$HOME/.cc/lander/current"
+# A release is a whole tree, and `queue --task` runs <release>/core/bin/cc (jobs.bin_dir): with no bin there it got
+# rc 125 and refused every receipt, P9c-P9h with it. The release's bin is this fixture's, so its stubs still answer.
+ln -s "$D/bin" "$rel/core/bin"
 # `lander queue` writes a request into the inbox, and the job file appears when a lane folds it in. No lane runs
 # here (systemd-run is a stub), so fold_r does that fold, as the next lane would, before a job file is read.
 fold_r(){ python3 -P -c 'import sys; sys.path.insert(0, sys.argv[1])
 from lander import jobs as J
 with J.lane_lock("r", wait=True):
-    J.drain("r")' "$HOME/.cc/lander/current/core"; }
+    J.drain("r")' "$rel/core"; }
 cat > "$D/bin/cc-board" <<'SH'
 #!/bin/bash
 case "$*" in 'status r row review') [ ! -e "$D/board.fail" ] || exit 1;; esac
@@ -2613,7 +2623,8 @@ for projection in board card; do
   jq -e '.pending == {} and .errors == []' "$D/receipt" >/dev/null \
     && ok "P9f $projection control: retry settles the same delivery without a new PR" || bad "P9f retry: $(cat "$D/receipt")"
 done
-rm "$q"; mv "$st/delivery.json" "$D/saved-record"
+# Fold the P9f retries' requests first: one left in the inbox would bring the job back at P9g's fold.
+fold_r; rm -f "$q"; mv "$st/delivery.json" "$D/saved-record"
 "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
 fold_r
 { [ "$rc" != 0 ] && [ ! -e "$q" ] && grep -q 'needs a task record' "$D/err"; } \
@@ -3591,27 +3602,18 @@ r5(){ ( CC_LAND_CHANGED="$1" land_scope "$SR/$2/bin"; want cc-leaf cc-caller && 
   && [ "$(r5 'lessons/a.py' flat)" = "||runs" ]; } \
   && ok "a diff only outside core/ reaches no tool and keeps its scope for the record; beside a core tool it adds nothing; a non-tool inside core/, or any path where bin/ is at the top, still runs everything" \
   || bad "outside-the-tree reach: [$(r5 'bin-private/x lessons/a.py' core)] [$(r5 'core/bin/cc-leaf lessons/a.py' core)] [$(r5 'core/templates/x lessons/a.py' core)] [$(r5 'lessons/a.py' flat)]"
-# …and the SCOPE it hands back is the LANDING'S OWN STRING, byte for byte. cc-land sorts the paths in python's byte
-# order and spends a green record only on a scope equal to that; sorting them again here runs in the box's locale,
-# where GNU sort ignores the `-` on its first pass and hands `core/bin/cc-graphs core/bin/ccbox` back swapped —
-# after which no scoped run's record is ever spendable and the suite runs twice on every landing of that shape.
-SB3="$T/scopebin3"; GR3="$T/green3"; mkdir -p "$SB3"
+# …and the SCOPE it hands back is the LANDING'S OWN STRING, byte for byte. The landing writes the paths in python's
+# byte order; sorting them again here runs in the box's locale, where GNU sort ignores the `-` on its first pass and
+# hands `core/bin/cc-graphs core/bin/ccbox` back swapped. (The old lander's green_run, which spent a record only on an
+# equal scope, went with #771; the order is still the landing's to set, so the case checks the string alone.)
+SB3="$T/scopebin3"; mkdir -p "$SB3"
 printf '#!/bin/sh\n' > "$SB3/cc-graphs"; printf '#!/bin/sh\n' > "$SB3/ccbox"
 U8=$(locale -a 2>/dev/null | grep -ix 'en_US.utf-\?8' | head -1); U8=${U8:-C.UTF-8}
-told="core/bin/cc-graphs core/bin/ccbox"   # exactly as cc-land writes it: " ".join(sorted(paths))
+told="core/bin/cc-graphs core/bin/ccbox"   # exactly as the landing writes it: " ".join(sorted(paths))
 got=$( export LC_ALL=$U8 LANG=$U8; CC_LAND_CHANGED="$told" land_scope "$SB3"; printf '%s' "$SCOPE" )
-( SUITE_PART=all; CC_GREEN_DIR="$GR3" green_record "$GD/tests/check.sh" "$got" )
-spendable(){ CC_GREEN_DIR="$GR3" python3 - "$B/cc-land" "$1" <<'PY'
-import glob, importlib.machinery as M, importlib.util as U, json, os, sys
-sp = U.spec_from_file_location("l", sys.argv[1], loader=M.SourceFileLoader("l", sys.argv[1]))
-mod = U.module_from_spec(sp); sp.loader.exec_module(mod)
-rec = json.load(open(glob.glob(f"{os.environ['CC_GREEN_DIR']}/check.sh-*.json")[0]))
-print("spent" if mod.green_run(rec["tree"], "tests/check.sh", sys.argv[2]) else "runs again")
-PY
-}
-{ [ "$got" = "$told" ] && [ "$(spendable "$told")" = spent ] && [ "$(spendable 'core/bin/ccbox core/bin/cc-graphs')" = "runs again" ]; } \
-  && ok "the scope is handed back as the landing wrote it, not re-sorted: under $U8, a diff of core/bin/cc-graphs + core/bin/ccbox leaves a record cc-land actually spends" \
-  || bad "scope round-trip under $U8: got [$got] wanted [$told], cc-land says [$(spendable "$told")]"
+[ "$got" = "$told" ] \
+  && ok "the scope is handed back as the landing wrote it, not re-sorted: under $U8, a diff of core/bin/cc-graphs + core/bin/ccbox keeps its order" \
+  || bad "scope round-trip under $U8: got [$got] wanted [$told]"
 ( REACH=" cc-leaf "; want cc-leaf && ! want cc-talker && REACH="" && want cc-talker ) \
   && ok "want: a reached tool, not an unreached one, and everything when nothing was narrowed" || bad "want"
 # Every fixture stanza below declares THIS run's half, so these cases are about the reach and nothing else; the

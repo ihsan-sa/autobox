@@ -55,6 +55,13 @@ chk(){   # `chk cc-foo`: that tool's own selfcheck as one case. Red once is run 
 RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"; : > "$T/born"   # born: what "modified during this run" means below
 export CC_SELF_LAND_EXCEPT=$REPO         # every project lands itself by default, and the box's own config never decides a fixture: a case that means the grant sets this itself
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
+export CC_ROOM_DIR="$T/room" CC_WORKER_CAP=1000 CC_WORKER_PACE_MARGIN=100   # cc-room: a fixture --go never queues behind the box's real loops or its five-hour pace, and never takes one of its slots
+# …nor behind the box's LOAD: cc-room also asks the lander's overloaded(), and at a load of twice the cores every
+# fixture --go sat in `cc-room admit` and never ran (say-go-loop red at two unrelated landings, 09-29, load 14-17 on
+# 6 cores). A calm load average and calm PSI of the run's own, and the default factor whatever the caller carried.
+mkdir -p "$T/psi"; echo "0.00 0.00 0.00 1/1 1" > "$T/loadavg"
+for k in cpu memory io; do echo "some avg10=0.00 avg60=0.00 avg300=0.00 total=0" > "$T/psi/$k"; done
+export LANDER_LOADAVG="$T/loadavg" LANDER_PSI_DIR="$T/psi" LANDER_LOAD_FACTOR=2
 export CC_LIMIT_STAMP="$T/claude-limit"   # not the box's live stamp: a test limit must never make a real loop wait
 export CC_FAILURES="$T/failures"          # not ~/.cc/failures: the loop stops and red gates below are fixtures, and the
                                           # ledger counts what it holds (cc-loop stop_record, cc-green red)

@@ -31,6 +31,7 @@ SLUGS = {
     "cc-notify: an escalation reaches the PLANNING SEAT, not the owner and not the channel it came from": "cc-notify-escalation",
     "--say / --go / cc-loop": "say-go-loop",
     "--go is a covering note, never a replacement for the brief (#71)": "go-covering-note",
+    "--go waits for room, and a room check that crashes fails open": "go-waits-for-room",  # recurring-defect-ok: pause-hold-missing — a slug table entry; split.py launches nothing and writes no board
     "a finished track leaves the default board view (a13)": "finished-track-board",
     "the step limit carries on, and a runaway does not (cc-loop)": "step-limit",
     "usage limits (cc-limit + cc-loop)": "usage-limits",

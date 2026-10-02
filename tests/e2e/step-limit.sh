@@ -75,6 +75,13 @@ rm -rf "$wt"; "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/null 2>&1
 [ $? != 0 ] && [ -d ~/.cc/state/${REPO}_canary ] && ok "cc rm refuses a traversing track name" || bad "cc rm traversal!"
 rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
+# …but a row name over 64 characters, on the board before its add refused one, is still removable: the janitor's
+# `cc rm` failed 77 times on 8 such worktrees (2026-09-14..27). Its own fixture; a 256-character name stays refused.
+LONG=r-$(printf 'x%.0s' $(seq 1 70)); mkdir -p ~/.cc/worktrees/$REPO/$LONG ~/.cc/state/$REPO/$LONG
+"$B/cc" rm $REPO $LONG >/dev/null 2>&1; lrc=$?
+[ $lrc = 0 ] && [ ! -d ~/.cc/worktrees/$REPO/$LONG ] && [ ! -d ~/.cc/state/$REPO/$LONG ] && ok "cc rm removes a worktree whose row name is over 64 characters" || bad "cc rm refused a long row name (rc=$lrc)"
+TOOLONG=r-$(printf 'x%.0s' $(seq 1 254)); "$B/cc" rm $REPO $TOOLONG >/dev/null 2>&1
+[ $? != 0 ] && ok "…while a 256-character track name is still refused" || bad "cc rm took a 256-character name"
 "$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
 fi
 # ── top level, between stanzas
@@ -290,14 +297,19 @@ export CC_CONFIG="$D/config" CC_SELF_LAND_EXCEPT= CC_SLACK="$D/bin/cc-slack" CC_
 unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST GH_REPO TMUX TMUX_PANE CC_MEMBER_SANDBOX CC_WORKER_SANDBOX
 printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"; : > "$D/config"
 cp "$B/cc" "$B/cc-task" "$B/cc-loop" "$B/cc-land" "$B/lander" "$B/cc-checkpoint" "$B/cc-config" "$D/bin/"
-# cc-land is a shim over `lander`, which runs only a pinned release: this HOME gets one, the lander beside $B.
-mkdir -p "$HOME/.cc/lander/current/core"; cp -r "$B/../lander" "$HOME/.cc/lander/current/core/"
+# cc-land is a shim over `lander`, which runs only a pinned release under releases/<sha>: `current` is a symlink
+# to it, never the tree itself (#771) — a `current` that resolves outside releases/ is refused.
+rel="$HOME/.cc/lander/releases/fixture"; mkdir -p "$rel/core"; cp -r "$B/../lander" "$rel/core/"
+ln -s "$rel" "$HOME/.cc/lander/current"
+# A release is a whole tree, and `queue --task` runs <release>/core/bin/cc (jobs.bin_dir): with no bin there it got
+# rc 125 and refused every receipt, P9c-P9h with it. The release's bin is this fixture's, so its stubs still answer.
+ln -s "$D/bin" "$rel/core/bin"
 # `lander queue` writes a request into the inbox, and the job file appears when a lane folds it in. No lane runs
 # here (systemd-run is a stub), so fold_r does that fold, as the next lane would, before a job file is read.
 fold_r(){ python3 -P -c 'import sys; sys.path.insert(0, sys.argv[1])
 from lander import jobs as J
 with J.lane_lock("r", wait=True):
-    J.drain("r")' "$HOME/.cc/lander/current/core"; }
+    J.drain("r")' "$rel/core"; }
 cat > "$D/bin/cc-board" <<'SH'
 #!/bin/bash
 case "$*" in 'status r row review') [ ! -e "$D/board.fail" ] || exit 1;; esac
@@ -392,7 +404,8 @@ for projection in board card; do
   jq -e '.pending == {} and .errors == []' "$D/receipt" >/dev/null \
     && ok "P9f $projection control: retry settles the same delivery without a new PR" || bad "P9f retry: $(cat "$D/receipt")"
 done
-rm "$q"; mv "$st/delivery.json" "$D/saved-record"
+# Fold the P9f retries' requests first: one left in the inbox would bring the job back at P9g's fold.
+fold_r; rm -f "$q"; mv "$st/delivery.json" "$D/saved-record"
 "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
 fold_r
 { [ "$rc" != 0 ] && [ ! -e "$q" ] && grep -q 'needs a task record' "$D/err"; } \

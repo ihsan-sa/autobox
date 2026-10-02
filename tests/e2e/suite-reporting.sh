@@ -208,6 +208,13 @@ rm -rf "$wt"; "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/null 2>&1
 [ $? != 0 ] && [ -d ~/.cc/state/${REPO}_canary ] && ok "cc rm refuses a traversing track name" || bad "cc rm traversal!"
 rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
+# …but a row name over 64 characters, on the board before its add refused one, is still removable: the janitor's
+# `cc rm` failed 77 times on 8 such worktrees (2026-09-14..27). Its own fixture; a 256-character name stays refused.
+LONG=r-$(printf 'x%.0s' $(seq 1 70)); mkdir -p ~/.cc/worktrees/$REPO/$LONG ~/.cc/state/$REPO/$LONG
+"$B/cc" rm $REPO $LONG >/dev/null 2>&1; lrc=$?
+[ $lrc = 0 ] && [ ! -d ~/.cc/worktrees/$REPO/$LONG ] && [ ! -d ~/.cc/state/$REPO/$LONG ] && ok "cc rm removes a worktree whose row name is over 64 characters" || bad "cc rm refused a long row name (rc=$lrc)"
+TOOLONG=r-$(printf 'x%.0s' $(seq 1 254)); "$B/cc" rm $REPO $TOOLONG >/dev/null 2>&1
+[ $? != 0 ] && ok "…while a 256-character track name is still refused" || bad "cc rm took a 256-character name"
 "$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
 fi
 # ── top level, between stanzas
@@ -388,27 +395,18 @@ r5(){ ( CC_LAND_CHANGED="$1" land_scope "$SR/$2/bin"; want cc-leaf cc-caller && 
   && [ "$(r5 'lessons/a.py' flat)" = "||runs" ]; } \
   && ok "a diff only outside core/ reaches no tool and keeps its scope for the record; beside a core tool it adds nothing; a non-tool inside core/, or any path where bin/ is at the top, still runs everything" \
   || bad "outside-the-tree reach: [$(r5 'bin-private/x lessons/a.py' core)] [$(r5 'core/bin/cc-leaf lessons/a.py' core)] [$(r5 'core/templates/x lessons/a.py' core)] [$(r5 'lessons/a.py' flat)]"
-# …and the SCOPE it hands back is the LANDING'S OWN STRING, byte for byte. cc-land sorts the paths in python's byte
-# order and spends a green record only on a scope equal to that; sorting them again here runs in the box's locale,
-# where GNU sort ignores the `-` on its first pass and hands `core/bin/cc-graphs core/bin/ccbox` back swapped —
-# after which no scoped run's record is ever spendable and the suite runs twice on every landing of that shape.
-SB3="$T/scopebin3"; GR3="$T/green3"; mkdir -p "$SB3"
+# …and the SCOPE it hands back is the LANDING'S OWN STRING, byte for byte. The landing writes the paths in python's
+# byte order; sorting them again here runs in the box's locale, where GNU sort ignores the `-` on its first pass and
+# hands `core/bin/cc-graphs core/bin/ccbox` back swapped. (The old lander's green_run, which spent a record only on an
+# equal scope, went with #771; the order is still the landing's to set, so the case checks the string alone.)
+SB3="$T/scopebin3"; mkdir -p "$SB3"
 printf '#!/bin/sh\n' > "$SB3/cc-graphs"; printf '#!/bin/sh\n' > "$SB3/ccbox"
 U8=$(locale -a 2>/dev/null | grep -ix 'en_US.utf-\?8' | head -1); U8=${U8:-C.UTF-8}
-told="core/bin/cc-graphs core/bin/ccbox"   # exactly as cc-land writes it: " ".join(sorted(paths))
+told="core/bin/cc-graphs core/bin/ccbox"   # exactly as the landing writes it: " ".join(sorted(paths))
 got=$( export LC_ALL=$U8 LANG=$U8; CC_LAND_CHANGED="$told" land_scope "$SB3"; printf '%s' "$SCOPE" )
-( SUITE_PART=all; CC_GREEN_DIR="$GR3" green_record "$GD/tests/check.sh" "$got" )
-spendable(){ CC_GREEN_DIR="$GR3" python3 - "$B/cc-land" "$1" <<'PY'
-import glob, importlib.machinery as M, importlib.util as U, json, os, sys
-sp = U.spec_from_file_location("l", sys.argv[1], loader=M.SourceFileLoader("l", sys.argv[1]))
-mod = U.module_from_spec(sp); sp.loader.exec_module(mod)
-rec = json.load(open(glob.glob(f"{os.environ['CC_GREEN_DIR']}/check.sh-*.json")[0]))
-print("spent" if mod.green_run(rec["tree"], "tests/check.sh", sys.argv[2]) else "runs again")
-PY
-}
-{ [ "$got" = "$told" ] && [ "$(spendable "$told")" = spent ] && [ "$(spendable 'core/bin/ccbox core/bin/cc-graphs')" = "runs again" ]; } \
-  && ok "the scope is handed back as the landing wrote it, not re-sorted: under $U8, a diff of core/bin/cc-graphs + core/bin/ccbox leaves a record cc-land actually spends" \
-  || bad "scope round-trip under $U8: got [$got] wanted [$told], cc-land says [$(spendable "$told")]"
+[ "$got" = "$told" ] \
+  && ok "the scope is handed back as the landing wrote it, not re-sorted: under $U8, a diff of core/bin/cc-graphs + core/bin/ccbox keeps its order" \
+  || bad "scope round-trip under $U8: got [$got] wanted [$told]"
 ( REACH=" cc-leaf "; want cc-leaf && ! want cc-talker && REACH="" && want cc-talker ) \
   && ok "want: a reached tool, not an unreached one, and everything when nothing was narrowed" || bad "want"
 # Every fixture stanza below declares THIS run's half, so these cases are about the reach and nothing else; the

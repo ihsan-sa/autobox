@@ -72,10 +72,14 @@ for id in $(wins "$REPO/c1"); do tmux kill-window -t "$id"; done
 # the very worktree the subagent built, and a subagent that never reached `cc done` must not block it for the
 # life of its session (review of #279). A live WORKER's claim is taken by nothing.
 mkdir -p ~/.cc/state/$REPO/c5; printf 'Do the c5 thing.\n' > ~/.cc/state/$REPO/c5/task.md
-hold(){ ( "$B/cc" claim $REPO c5 --executor "$1" >/dev/null 2>&1; while [ ! -f "$T/c5.stop" ]; do sleep 0.2; done ) & }
+# The holder says when its claim has RETURNED, and the case waits for that, not for delivery.json to appear: under
+# load (45 on 2026-09-27) one `cc claim` outran a 10 s wait on the file, so the task id was read before the record
+# existed (the repair case red with rc=0 on #741 and #752) or the second subagent below claimed first (#735).
+hold(){ ( "$B/cc" claim $REPO c5 --executor "$1" >/dev/null 2>&1; : > "$T/c5.held"; while [ ! -f "$T/c5.stop" ]; do sleep 0.2; done ) & }
+held(){ for _ in $(seq 1 1500); do [ -f "$T/c5.held" ] && return 0; sleep 0.2; done; return 1; }   # 5 min: a bound, not a pace
 d5=~/.cc/state/$REPO/c5/delivery.json
-rm -f "$T/c5.stop"; hold subagent; holder=$!; KIDS="$KIDS $holder"
-for _ in $(seq 1 100); do [ -f "$d5" ] && break; sleep 0.1; done
+rm -f "$T/c5.stop" "$T/c5.held"; hold subagent; holder=$!; KIDS="$KIDS $holder"
+held
 c5tid=$(jq -r .task_id < "$d5" 2>/dev/null)
 "$B/cc" claim $REPO c5 --executor subagent >"$T/c5.out" 2>&1; h1=$?
 { [ "$h1" != 0 ] && grep -q 'live owner' "$T/c5.out" \
@@ -90,8 +94,8 @@ c5tid=$(jq -r .task_id < "$d5" 2>/dev/null)
   || qbad cc "a repair dispatch was refused a row a subagent still holds: rc=$h2 $(cat "$T/c5go.out")"
 for id in $(wins "$REPO/c5"); do tmux kill-window -t "$id"; done
 touch "$T/c5.stop"; wait $holder 2>/dev/null; KIDS="${KIDS% $holder}"
-rm -f "$T/c5.stop" "$d5"; hold worker; holder=$!; KIDS="$KIDS $holder"
-for _ in $(seq 1 100); do [ -f "$d5" ] && break; sleep 0.1; done
+rm -f "$T/c5.stop" "$T/c5.held" "$d5"; hold worker; holder=$!; KIDS="$KIDS $holder"
+held
 "$B/cc" claim $REPO c5 --executor subagent >"$T/c5w1.out" 2>&1; h3=$?
 "$B/cc" $REPO c5 --go "" >"$T/c5w2.out" 2>&1; h4=$?
 { [ "$h3" != 0 ] && [ "$h4" != 0 ] && [ -z "$(wins "$REPO/c5")" ] \

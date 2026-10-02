@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # generated from selftest.sh by split.py; edit selftest.sh and re-run split.py.
-# snapshot-readers.sh — the stanza "what the snapshot's four readers do with it (waiting vs the clock, and without it)", run alone on the fixtures it stands on.
+# go-waits-for-room.sh — the stanza "--go waits for room, and a room check that crashes fails open", run alone on the fixtures it stands on.
 . "$(dirname "$0")/lib.sh"
 # ── fixture: cc main + track creation
 if stanza "cc main + track creation" always; then
@@ -93,44 +93,34 @@ printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_t
 # ── top level, between stanzas
 export CC_HANDOFF_DIR="$T/handoff" CC_CTX_RECORDS="$T/ctx" CC_HANDOFF_RETIRE_GRACE=1 CC_HANDOFF_DRAIN=1   # never the box's own records — CC_CTX_RECORDS is
 # ── the stanza
-if stanza "what the snapshot's four readers do with it (waiting vs the clock, and without it)"; then
-# cc-reconcile's own selfcheck covers PRODUCING the snapshot; this covers the two things that only break in the
-# readers. Its own HOME, because ~/.cc/state/reconcile.json is a fixed path and this box's live one must not move.
-SH=$T/snaphome; mkdir -p "$SH/.cc/state" "$SH/dev/sr"
-sb(){ HOME=$SH "$B/cc-board" "$@"; }
-sb init sr "$SH/dev/sr" main >/dev/null; for t in s_ask s_clock s_stop; do sb add sr $t "title $t" "" >/dev/null; done
-sb status sr s_ask waiting >/dev/null; sb status sr s_clock running >/dev/null; sb status sr s_stop blocked >/dev/null
-# NO snapshot yet: every key a reader looks up is unset. `cc ls` runs under `set -u`, and a missing default there
-# killed the whole listing rather than one column — a stale timer must never cost the owner his board.
-lsn=$(HOME=$SH "$B/cc" ls 2>&1); lsrc=$?
-[ $lsrc = 0 ] && grep -q 's_ask' <<<"$lsn" && ok "no snapshot: \`cc ls\` still prints every track (a missing key must not kill the listing)" || bad "cc ls without a snapshot: rc=$lsrc"
-grep -q '❓' <<<"$lsn" && ok "no snapshot: a waiting track is still marked, with no question to show" || bad "cc ls dropped the waiting mark"
-dgn=$(HOME=$SH "$B/cc-reconcile" digest 2>/dev/null)
-dga=$(sed -n '/^\*Waiting on you\*/,/^$/p' <<<"$dgn")   # the digest marks him needed by the SECTION a row is filed under
-grep -q 'title s_ask' <<<"$dga" && ! grep -qE ': *$' <<<"$dga" && ok "no snapshot: the digest still says he is needed, with no colon trailing a question it does not have" || bad "digest fallback wording: $dga"
-# an EMPTY or non-JSON snapshot must read as stale, not kill the reader: jq on empty input exits 0 with no
-# output at all, and `$(( now - ))` is a bash abort — this guard exists precisely for the file the writer got wrong.
-: > "$SH/.cc/state/reconcile.json"
-lse=$(HOME=$SH "$B/cc" ls 2>&1); lserc=$?
-[ $lserc = 0 ] && grep -q 's_ask' <<<"$lse" && ok "empty snapshot: \`cc ls\` treats it as stale and still prints the board" || bad "empty snapshot killed cc ls: rc=$lserc — $lse"
-printf 'not json' > "$SH/.cc/state/reconcile.json"
-dge=$(HOME=$SH "$B/cc-reconcile" digest 2>/dev/null); dgerc=$?
-[ $dgerc = 0 ] && grep -q 's_ask' <<<"$dge" && ok "corrupt snapshot: the digest falls back to the board" || bad "corrupt snapshot broke the digest: rc=$dgerc"
-# the snapshot cc-reconcile leaves behind — a question a PERSON must answer, and a loop waiting on the CLOCK while
-# its board word is still `running` (it hit the limit mid-run). The clock is never "needs you".
-cat > "$SH/.cc/state/reconcile.json" <<JSON
-{"at":"now","epoch":$(date -u +%s),"limit_until":0,"tracks":{
- "sr/s_ask":{"state":"waiting","board":"waiting","live":true,"waiting_on":"person","why":"which syllabus?"},
- "sr/s_clock":{"state":"running","board":"running","live":true,"waiting_on":"clock","why":"a Claude usage limit"},
- "sr/s_stop":{"state":"blocked","board":"blocked","live":false,"waiting_on":"","why":""}}}
-JSON
-lss=$(HOME=$SH "$B/cc" ls 2>&1); dgs=$(HOME=$SH "$B/cc-reconcile" digest 2>/dev/null)
-grep -q 'which syllabus?' <<<"$lss" && grep -q 'which syllabus?' <<<"$dgs" && ok "snapshot: \`cc ls\` and the digest print the same question, from the one file" || bad "the question did not reach both readers"
-grep -q '⏳ held by the usage limit' <<<"$(grep s_clock <<<"$lss")" && grep -q '^⏳ Held by the usage limit:.*title s_clock' <<<"$dgs" && ! grep -q 'title s_clock' <<<"$(sed -n '/^\*Waiting on you\*/,/^$/p;/^\*Stopped\*/,/^$/p' <<<"$dgs")" && ok "snapshot: a loop held by the limit says so in both — whatever word it wears (\`running\` here, not \`blocked\`) — and the digest NAMES it without filing it as his" || bad "clock row invisible while the board says running"
-dgh=$(head -1 <<<"$dgs"); grep -q '1 waiting on you' <<<"$dgh" && grep -q '1 held' <<<"$dgh" && ok "snapshot: the clock is counted as held, NOT as one more thing waiting on him — the tally he reads first" || bad "a usage limit was reported as needing the owner: $dgh"
-grep -q 'title s_stop' <<<"$(sed -n '/^\*Stopped\*/,/^$/p' <<<"$dgs")" && ! grep -q 'title s_stop' <<<"$(sed -n '/^\*Waiting on you\*/,/^$/p' <<<"$dgs")" && ok "snapshot: a track that merely stopped reads as stopped, not as a question" || bad "a stopped track was filed as needing him"
-rm -rf "$SH"
-
+if stanza "--go waits for room, and a room check that crashes fails open"; then
+# NO ROOM (cc-room check exit 1) QUEUES THE LAUNCH: the window opens with the loop behind `cc-room admit`, the
+# dispatcher hears "queued" and why, and no iteration runs while the cap holds. A cap of 0 is "no room" whatever the
+# count, and cc-room counts every worker loop on the machine, so the case takes any count.
+"$B/cc-board" add $REPO rq1 "rq1" "Do the rq1 thing." >/dev/null 2>&1
+CC_WORKER_CAP=0 "$B/cc-room" check >/dev/null 2>&1; rq0=$?
+CC_WORKER_CAP=0 "$B/cc" $REPO rq1 --go "" >"$T/rq1.out" 2>&1; rq1=$?
+for _ in $(seq 1 20); do grep -q 'cc-room: '"$REPO"'/rq1 queued' ~/.cc/state/$REPO/rq1/loop.log 2>/dev/null && break; sleep 0.5; done
+{ [ "$rq0" = 1 ] && [ "$rq1" = 0 ] && grep -q 'worker queued, not started: [0-9]* worker loops are running and the cap is 0' "$T/rq1.out" \
+  && ! grep -q 'worker started' "$T/rq1.out" && [ -n "$(wins "$REPO/rq1")" ] \
+  && grep -q "cc-room: $REPO/rq1 queued" ~/.cc/state/$REPO/rq1/loop.log \
+  && ! ls ~/.cc/state/$REPO/rq1/runs/*.json >/dev/null 2>&1; } \
+  && ok "no room: --go says 'worker queued' and why, its window waits in cc-room admit, and no iteration runs" \
+  || bad "queued --go: check rc=$rq0 go rc=$rq1 '$(cat "$T/rq1.out")' log: $(tail -2 ~/.cc/state/$REPO/rq1/loop.log 2>/dev/null | tr '\n' ' ')"
+for id in $(wins "$REPO/rq1"); do tmux kill-window -t "$id"; done
+# A ROOM CHECK THAT CRASHES (any exit but 0 or 1) FAILS OPEN: before, `full` came out empty, cc said "worker
+# started", and `admit` crashed the same way in the window — nothing ran and nothing said so. Now the loop starts
+# without the wrapper, and one line (terminal and loop.log) says admission failed.
+mkdir -p "$T/roomcrash"; printf '#!/bin/sh\nexit 3\n' > "$T/roomcrash/cc-room"; chmod +x "$T/roomcrash/cc-room"
+"$B/cc-board" add $REPO rq2 "rq2" "Do the rq2 thing." >/dev/null 2>&1
+CC_ROOM="$T/roomcrash/cc-room" "$B/cc" $REPO rq2 --go "" >"$T/rq2.out" 2>&1; rq2=$?
+for _ in $(seq 1 60); do ls ~/.cc/state/$REPO/rq2/runs/*.json >/dev/null 2>&1 && break; sleep 0.5; done
+{ [ "$rq2" = 0 ] && grep -q 'worker admission failed (cc-room check exit 3)' "$T/rq2.out" && grep -q 'worker started' "$T/rq2.out" \
+  && grep -q 'worker admission failed' ~/.cc/state/$REPO/rq2/loop.log && ls ~/.cc/state/$REPO/rq2/runs/*.json >/dev/null 2>&1; } \
+  && ok "a room check that crashes fails open: the loop runs without admission, and one line says so" \
+  || bad "crashed room check: go rc=$rq2 '$(cat "$T/rq2.out")' log: $(tail -2 ~/.cc/state/$REPO/rq2/loop.log 2>/dev/null | tr '\n' ' ')"
+for id in $(wins "$REPO/rq2"); do tmux kill-window -t "$id"; done
+for r in rq1 rq2; do for _ in $(seq 1 30); do pgrep -f "cc-loop $REPO $r " >/dev/null || break; sleep 0.5; done; done
 fi
 e2e_end
 # recurring-defect-ok: pause-hold-missing — a test of cc on a fixture repo; the pause check is the tool's, not the stanza's

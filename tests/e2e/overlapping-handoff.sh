@@ -75,6 +75,13 @@ rm -rf "$wt"; "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/null 2>&1
 [ $? != 0 ] && [ -d ~/.cc/state/${REPO}_canary ] && ok "cc rm refuses a traversing track name" || bad "cc rm traversal!"
 rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
+# …but a row name over 64 characters, on the board before its add refused one, is still removable: the janitor's
+# `cc rm` failed 77 times on 8 such worktrees (2026-09-14..27). Its own fixture; a 256-character name stays refused.
+LONG=r-$(printf 'x%.0s' $(seq 1 70)); mkdir -p ~/.cc/worktrees/$REPO/$LONG ~/.cc/state/$REPO/$LONG
+"$B/cc" rm $REPO $LONG >/dev/null 2>&1; lrc=$?
+[ $lrc = 0 ] && [ ! -d ~/.cc/worktrees/$REPO/$LONG ] && [ ! -d ~/.cc/state/$REPO/$LONG ] && ok "cc rm removes a worktree whose row name is over 64 characters" || bad "cc rm refused a long row name (rc=$lrc)"
+TOOLONG=r-$(printf 'x%.0s' $(seq 1 254)); "$B/cc" rm $REPO $TOOLONG >/dev/null 2>&1
+[ $? != 0 ] && ok "…while a 256-character track name is still refused" || bad "cc rm took a 256-character name"
 "$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
 fi
 # ── top level, between stanzas
@@ -101,8 +108,10 @@ tmux list-windows -t main -F '#W' | grep -qx "$REPO/hx~next" && ok "the successo
 # THE SUCCESSOR MUST ACCEPT ITS OWN STARTUP DIALOG. Its window is "<target>~next"; `cc __runnext` knew only
 # the target, so it accepted in the PREDECESSOR's window and its own sat on the --dangerously-load-development-
 # channels confirmation until a human noticed (2026-09-01 02:10Z; the 2026-08-28 incident, again).
-tmux display-message -p -t "$REPO/hx~next" '#{pane_start_command}' 2>/dev/null | grep -q "CC_HANDOFF_WINDOW='$REPO/hx~next'" \
-  && ok "the successor is started knowing its OWN window, so it accepts its own dialog and does not park on it" || bad "no CC_HANDOFF_WINDOW on the successor: $(tmux display-message -p -t "$REPO/hx~next" '#{pane_start_command}' 2>&1)"
+# `main:` — a bare window name resolves in whichever session was active last, and a session outside main's group
+# (one was on 2026-09-27) finds no such window and prints an empty line, exit 0: this case went red that way on #736.
+tmux display-message -p -t "main:$REPO/hx~next" '#{pane_start_command}' 2>/dev/null | grep -q "CC_HANDOFF_WINDOW='$REPO/hx~next'" \
+  && ok "the successor is started knowing its OWN window, so it accepts its own dialog and does not park on it" || bad "no CC_HANDOFF_WINDOW on the successor: $(tmux display-message -p -t "main:$REPO/hx~next" '#{pane_start_command}' 2>&1)"
 "$B/cc" handoff --overlap "$REPO/hx" >/dev/null 2>&1 && bad "a second overlap was allowed for one target" || ok "an overlap is refused while one is open — one successor at a time"
 # the guard, from BOTH sides of the record. cwd is $T: no marker, so only the record can gate.
 h(){ printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s","session_id":"%s"}' "$1" "$T" "${3:-}" | env CC_HANDOFF="${2:-}" "$B/cc-guard" >/dev/null 2>&1; echo $?; }

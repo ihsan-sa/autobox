@@ -76,6 +76,13 @@ rm -rf "$wt"; "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/null 2>&1
 [ $? != 0 ] && [ -d ~/.cc/state/${REPO}_canary ] && ok "cc rm refuses a traversing track name" || bad "cc rm traversal!"
 rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
+# …but a row name over 64 characters, on the board before its add refused one, is still removable: the janitor's
+# `cc rm` failed 77 times on 8 such worktrees (2026-09-14..27). Its own fixture; a 256-character name stays refused.
+LONG=r-$(printf 'x%.0s' $(seq 1 70)); mkdir -p ~/.cc/worktrees/$REPO/$LONG ~/.cc/state/$REPO/$LONG
+"$B/cc" rm $REPO $LONG >/dev/null 2>&1; lrc=$?
+[ $lrc = 0 ] && [ ! -d ~/.cc/worktrees/$REPO/$LONG ] && [ ! -d ~/.cc/state/$REPO/$LONG ] && ok "cc rm removes a worktree whose row name is over 64 characters" || bad "cc rm refused a long row name (rc=$lrc)"
+TOOLONG=r-$(printf 'x%.0s' $(seq 1 254)); "$B/cc" rm $REPO $TOOLONG >/dev/null 2>&1
+[ $? != 0 ] && ok "…while a 256-character track name is still refused" || bad "cc rm took a 256-character name"
 "$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
 fi
 # ── top level, between stanzas
@@ -122,6 +129,10 @@ for w in m8 m9; do tmux kill-window -t "$(tmux list-windows -t main -F '#{window
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w1$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
 ll0=$(wc -l < ~/.cc/state/$REPO/w1/loop.log 2>/dev/null || echo 0)
+# THE FIXTURE --go MUST GET A ROOM. Queued by cc-room it never starts, and the cases below read that as `loop DONE`
+# + `iteration count: 0` (#752, #788, 09-29: the box's load, which the e2e preamble did not isolate). Say it here.
+rw=$("$B/cc-room" check 2>&1) && ok "cc-room admits the fixture --go: the box's load, PSI, loops and pace never queue it" \
+  || bad "cc-room would queue the fixture --go: $rw"
 CC_CLAUDE="$T/fakeclaude" "$B/cc" $REPO w1 --go "build the thing" --loop 3 >/dev/null 2>&1
 # WAIT ON THE LOOP'S OWN END, NOT THE CLOCK. A fixed 40 s here went red on a loaded box (#670, #699, #722, 09-25..27:
 # `loop DONE` + `loop iteration count: 1`, while the notify and board cases below passed — the loop DID finish, a
