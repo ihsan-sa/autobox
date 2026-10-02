@@ -38,6 +38,11 @@ rerun alone (every slot held), and only a base run that stands is shared; green 
 a red whose every red line matches a live quarantine row passes with a `quarantined` note — never for a check that
 guards a gate-first path, and never when the change touches the check itself; what is left is `failed`, and goes to
 the failures ledger once (records.record_red).
+
+A RED KEEPS ITS LOG. A failed run's output (read_log's bound) is copied to <state>/logs/ (records.state_dir, never
+/tmp) before run_dir goes, at most LOG_KEEP files and none older than LOG_DAYS; the result's extra carries `log` (the
+path) and `cause` (cause_of: pytest's FAILED line, an INTERNALERROR with the file that went F, the first red line, or
+"no failing line" with the last line said), and its `why` ends with the cause.
 """
 from __future__ import annotations
 
@@ -72,6 +77,7 @@ SECRET_ENV = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", 
 SECRET_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_CREDS", "_WEBHOOK", "_PASSWORD")
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin")
 TAIL = 40
+LOG_KEEP, LOG_DAYS = 200, 7   # a red's kept log (keep_log): at most this many, none older than this many days
 BLOCKED = "blocked-by-main"
 
 
@@ -224,6 +230,66 @@ def red_lines(text: str) -> list:
     return [ln.strip() for ln in text.splitlines() if RED_RE.search(ln) and not PASS_RE.search(ln)]
 
 
+# pytest's own words for what failed: its short summary, pytest itself falling over, and a file whose progress has F/E
+SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR) \S+.*$", re.M)
+INTERNAL_RE = re.compile(r"^INTERNALERROR> .*\b\w+(?:Error|Exception)\b.*$", re.M)
+PROGRESS_RE = re.compile(r"^(\S+\.py) [.sxX]*[FE][.sxXFE]*(?:\s+\[\s*\d+%\])?$", re.M)
+
+
+def cause_of(text: str, rc: int) -> str:
+    """One line naming why a run is red, read from its WHOLE output, not the tail (2026-09/10: an INTERNALERROR, a
+    failing check.sh line above the tail and an all-pass tail each left a red nobody could name)."""
+    def more(got, what="more"):
+        return f" (+{len(got) - 1} {what})" if len(got) > 1 else ""
+    summary, internal, progress = SUMMARY_RE.findall(text), INTERNAL_RE.findall(text), PROGRESS_RE.findall(text)
+    if summary:
+        return summary[0].strip()[:300] + more(summary)
+    if internal:   # the innermost frame is the last; the file whose progress went F is where it happened
+        return (internal[-1].strip()[:300]
+                + (f", after a failure in {progress[0]}" + more(progress, "more files") if progress else ""))
+    if progress:
+        return f"a failure in {progress[0]}" + more(progress, "more files")
+    red = red_lines(text)
+    if red:
+        return red[0][:300] + more(red, "more red lines")
+    last = next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip()), "")
+    return (f"exit {rc} with no failing line in the output — it ends: {last[:200]!r}" if last
+            else f"exit {rc} with no output at all")
+
+
+def logs_dir(state: str | None = None) -> str:
+    return os.path.join(state or REC.state_dir(), "logs")
+
+
+def keep_log(text: str, check: str, tree: str, state: str | None = None) -> str:
+    """A red's output (already bounded: read_log's limit) under the lander's state, then the old ones pruned: none
+    older than LOG_DAYS, at most LOG_KEEP. -> the path, '' when it could not be written."""
+    d = logs_dir(state)
+    try:
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{re.sub(r'[^\w.-]', '_', check)}"
+                               f"-{tree[:12]}-{os.getpid()}.log")
+        with open(path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+    except OSError:
+        return ""
+    prune_logs(d)
+    return path
+
+
+def prune_logs(d: str, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    try:
+        logs = sorted((e for e in os.scandir(d) if e.name.endswith(".log") and e.is_file()),
+                      key=lambda e: e.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for i, e in enumerate(logs):
+        with contextlib.suppress(OSError):
+            if i >= LOG_KEEP or now - e.stat().st_mtime > LOG_DAYS * 86400:
+                os.unlink(e.path)
+
+
 # --- the runners ---------------------------------------------------------------------------------------------------
 
 def _box_argv(check, head, cwd, run_dir, env_extra):
@@ -372,12 +438,16 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         st, why = status_of(rc, text, capped)
         if kind == "laptop" and rc == -1:
             why = text.splitlines()[0] if text else "the laptop did not answer"
+        kept = {}
+        if st == T.FAILED:   # the log outlives run_dir, and the result names the line that failed
+            kept = {"cause": cause_of(text, rc), "log": keep_log(text, check.name, tree_sha, state)}
+            why = f"{why}: {kept['cause']}"
         return T.Result(check=check.name, tree=tree_sha, status=st, secs=round(secs, 2), cpu_secs=round(cpu, 2),
                         load=os.getloadavg()[0], runner=f"{where}:{how}:{scope}",
                         cases=[{"name": ln[:200], "status": T.FAILED} for ln in red_lines(text)[:50]]
                         if st == T.FAILED else [],
                         extra={"why": why, "rc": rc, "loaded": loaded, "alone": alone,
-                               "tail": text.splitlines()[-TAIL:]})
+                               "tail": text.splitlines()[-TAIL:], **kept})
     except Unrunnable as e:
         return res(T.UNRUNNABLE, str(e))
     finally:

@@ -17,6 +17,7 @@ held across a fetch or the merge's critical section, never across a check or a r
                                              the merged tree's new objects are copied into the checkout for the run)
     read_verified(root, rev, path)           a file's bytes at a commit or tree, or None; read VERIFIED
     paths_in(root, rev, paths)               which of the paths are in rev's tree; read VERIFIED
+    has_workflows(root, rev)                 rev's tree has a GitHub Actions workflow; read VERIFIED
     sealed(root, *revs)           a scratch repo holding only the revs, fetched from the checkout (see SEALED)
     changed(root, a, b)           `diff --name-only --no-renames -z a b`, each path as it is, read sealed
     pr_changed(root, base, head)  changed() from the merge-base of base and head, both found sealed
@@ -410,6 +411,15 @@ def paths_in(root, rev, paths) -> set:
     with Objects(root) as o:
         tree = o.tree(rev)
         return {p for p in paths if (o.entry(tree, p) or (b"40000",))[0] != b"40000"}
+
+
+def has_workflows(root, rev) -> bool:
+    """rev's tree has a GitHub Actions workflow (a .yml or .yaml file in .github/workflows); read VERIFIED."""
+    with Objects(root) as o:
+        e = o.entry(o.tree(rev), ".github/workflows")
+        if e is None or e[0] != b"40000":
+            return False
+        return any(n.endswith((b".yml", b".yaml")) and m != b"40000" for n, (m, _) in o.entries(e[1]).items())
 
 
 def blind_env() -> dict:

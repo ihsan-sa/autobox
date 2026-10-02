@@ -7,7 +7,8 @@ check once, the nightly full run and the sandbox acceptance table (B2d).
         way the lane will: same runner, same sandbox, same red-vs-base rule. Box-class checks are listed, not run:
         they run on main's tip after the merge. Nothing is stored and nothing goes to the failures ledger: a
         worker's own red is its work. Exit 0 green (a check red on the base too is main's, and is said, not held
-        against the change), 1 some check red, 3 no verdict (a check could not run), 2 usage. A repo that ships no
+        against the change), 1 some check red — each red with its tail, the line that names its cause and the path
+        of its full log, which outlives the run (run.keep_log) — 3 no verdict (a check could not run), 2 usage. A repo that ships no
         manifest is checked by the release's tests/landing-repos/<repo>.toml (manifest.host_fallback), as the lane
         does; --manifest FILE names another.
 
@@ -128,8 +129,13 @@ def report(outs: dict) -> int:
         print(f"  {word:<8} {name} {secs}" + (f" — {o.note}" if o.note else ""))
         if o.status == T.FAILED:
             worst = EXIT_RED
-            for ln in (o.results[-1].extra.get("tail") or [])[-12:]:
+            last = o.results[-1].extra
+            for ln in (last.get("tail") or [])[-12:]:
                 print(f"           | {ln}")
+            if last.get("cause"):
+                print(f"           cause: {last['cause']}")
+            if last.get("log"):
+                print(f"           full log: {last['log']}")
         elif o.status == T.UNRUNNABLE and worst == EXIT_GREEN:
             worst = EXIT_NONE
     print(f"lander check: {sum(o.status == T.PASSED for o in outs.values())} passed, "

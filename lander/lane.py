@@ -62,7 +62,11 @@ leave the file untouched and the job untimed:
              A member over its day's cap is held; a bought read is charged to it.
   mergeable  the head moved -> queued. main moved -> Δ re-plan (S2): rerun = (new − old) ∪ (new ∩ checks Δ
              reaches); a new plan that is lander-class (a reach file the new base does not generate) -> query
-             "lander-self"; non-empty -> checking with only those; empty -> base_sha = main and merge. THE MERGE (S1),
+             "lander-self"; non-empty -> checking with only those; empty -> base_sha = main and merge. GITHUB CI comes
+             next (gh.ci_state at the head): red -> handback naming each failed check; queued or running -> held
+             CI_WAIT_SECS, the CI_WAITS+1th wait at one head a query "planning"; an empty rollup on a base with
+             .github/workflows -> held the same way CI_REGISTER_WAITS times, then on as no CI; unreadable -> held,
+             the CI_UNREADS+1th at one head a query "planning"; green or no CI at all -> on. THE MERGE (S1),
              all under the git lock: fetch; main_before must be base_sha (else back to Δ); expected =
              merge-tree(main_before, head); merge_attempt {main_before, expected, pin} written BEFORE gh; the squash
              pinned to head (the door made the approved head equal it), --delete-branch, --subject "<title> (#N)";
@@ -135,6 +139,10 @@ FULL_CHECKS = tuple((os.environ.get("LANDER_FULL_CHECKS") or "check-sh").split()
 # checked against the files that read gave, with no new call (a head moved meanwhile is read once this runs out)
 PARK_FRESH = float(os.environ.get("LANDER_PARK_FRESH") or 300)
 LAPTOP_REST = 300       # seconds the box takes the laptop's checks after the laptop gave no answer
+CI_WAIT_SECS = 120       # a head whose GitHub CI is still running is looked at again this often…
+CI_WAITS = 30            # …this many times (an hour) before it is a query
+CI_REGISTER_WAITS = 2    # waits on a base with workflows but no check yet, before it lands as a repo with no CI
+CI_UNREADS = 4           # holds (HOLD_SECS each: an hour) at one head whose CI GitHub would not show, then a query
 POLL = 5                 # seconds the lane waits on its checks before it looks at the inbox again
 MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": "cards", "board": "board",
              "deploy": "deploy", "tip": "tip"}
@@ -898,9 +906,59 @@ class Lane:
                     return self.query(job, "it changes the lander itself — lander-self lands it", "lander-self")
                 if rerun:
                     return J.move(job, T.CHECKING, why="main moved: rerun " + ", ".join(job.extra.get("rerun") or []))
+            if not self.ci_green(job):   # after the head check: a moved head is queued again, not waited on
+                return
             if self.merge(job) != "moved":
                 return
         self.hold(job, f"{base} kept moving under the merge", kind="box")
+
+    def ci_green(self, job) -> bool:
+        """True when GitHub's CI lets the merge go: green, or no CI at all ("a repo with no CI configured lands as it
+        does today"). "the lander never merges a head whose GitHub CI is red or still running" (2026-10-02: website
+        #27-29 and #64-68 merged and deployed on a red build): red hands it back, running holds it. An empty check
+        list on a base with workflows waits CI_REGISTER_WAITS for GitHub to register the runs, then lands as no CI
+        (workflows that never run on a PR). Unreadable holds, and the CI_UNREADS+1th at one head is a query: a token
+        that reads the PR but not its checks would otherwise hold it every sweep, silently."""
+        try:
+            workflows = G.has_workflows(self.root, job.base_sha)
+        except G.GitError:
+            workflows = True   # a base that cannot be read is not evidence of no CI: wait for checks to show
+        state, detail = GH.ci_state(self.root, job.pr, job.head, self.token, workflows=workflows)
+        if state:
+            job.extra.pop("ci_unread", None)
+        if state in ("pending", "unregistered"):
+            n = self.count(job, "ci_wait")
+            if state == "unregistered" and n > CI_REGISTER_WAITS:
+                self.say(f"PR #{job.pr}: no GitHub check registered at {job.head[:12]} after {CI_REGISTER_WAITS} "
+                         f"waits — its workflows do not run on a PR, so it lands as a repo with no CI")
+                state = "none"
+            elif n > CI_WAITS:
+                self.query(job, f"GitHub CI has not finished at {job.head[:12]} after {CI_WAITS} waits: {detail}",
+                           "planning")
+                return False
+            else:
+                self.hold(job, f"GitHub CI is not done at {job.head[:12]}: {detail}", kind="box", secs=CI_WAIT_SECS)
+                return False
+        if state in ("green", "none"):
+            job.extra.pop("ci_wait", None)
+            return True
+        if state == "red":
+            self.handback(job, f"GitHub CI is red at {job.head[:12]}: {detail} — fix it, or re-run it on GitHub, "
+                               f"and queue it again")
+        elif self.count(job, "ci_unread") > CI_UNREADS:
+            self.query(job, f"GitHub CI could not be read at {job.head[:12]} {CI_UNREADS + 1} times running: "
+                            f"{detail or 'no answer'} — can the lander's token read this repo's checks?", "planning")
+        else:
+            self.hold(job, f"GitHub CI could not be read: {detail or 'no answer'}", kind="box")
+        return False
+
+    @staticmethod
+    def count(job, key) -> int:
+        """One more look at this head under job.extra[key]; a new head starts again at 1."""
+        w = job.extra.get(key) if isinstance(job.extra.get(key), dict) else {}
+        n = int(w.get("n") or 0) + 1 if w.get("head") == job.head else 1
+        job.extra[key] = {"head": job.head, "n": n}
+        return n
 
     def revalidate(self, job, main_now):
         """Δ re-plan (S2). True when something must run again (only those checks' results are dropped)."""

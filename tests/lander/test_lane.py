@@ -64,6 +64,8 @@ if me == "gh":
         if pr is None:
             out(1, "", "no pull requests found")
         fields = a[a.index("--json") + 1].split(",")
+        if "statusCheckRollup" in fields and box.get("checks_denied"):   # a token that reads the PR, not its checks
+            out(1, "", box["checks_denied"])
         d = {"state": "OPEN", "isDraft": False, "mergeable": "MERGEABLE", "baseRefName": "main",
              "title": "PR %s" % a[2], "body": ""}
         d.update(pr)

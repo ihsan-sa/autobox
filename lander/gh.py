@@ -7,6 +7,9 @@
     pr_files(root, pr) -> [paths] | None · slug(root) -> "owner/name" | ""
     merge_state(root, pr) -> (state, merge_oid): GitHub's "MERGED"/"OPEN"/"CLOSED" and the squash commit's oid, or
         ("", "") when gh would not answer — which is never read as "not merged".
+    ci_state(root, pr, pin, workflows=False) -> (state, detail): the PR's GitHub checks at head `pin` — "green",
+        "red", "pending", "unregistered" (no check yet, though the base has workflows), "none" (no CI at all) or ""
+        (unreadable). The lane merges on green or none only.
     merge(root, pr, pin, title) -> (ok, text), ok True | False | None
         `gh pr merge <pr> --squash --delete-branch --match-head-commit <pin> [-R <slug>] --subject "<title> (#<pr>)"`.
         "already merged" is merged; "is closed" and any other failure are merged only when GitHub then reports the
@@ -108,6 +111,46 @@ def merge_state(root, pr, token=None):
         return "", ""
     mc = j.get("mergeCommit")
     return str(j["state"]), (str(mc.get("oid") or "") if isinstance(mc, dict) else "")
+
+
+CI_GREEN = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+def ci_state(root, pr, pin, token=None, workflows=False):
+    """GitHub CI at the head the merge will pin. -> (state, detail):
+    "green" every check and status passed · "red" one failed (detail names each, with its link) · "pending" one is
+    queued or running, or GitHub reports another head than `pin` (its checks are not this head's) · "unregistered"
+    no check or status yet while `workflows` (the base has .github/workflows): right after a push GitHub takes a
+    while to register the runs, so an empty list there is not "no CI" · "none" no check or status at all and no
+    workflows — a repo with no CI, which lands as before · "" GitHub could not be read (detail why)."""
+    j, why = pr_facts(root, pr, "headRefOid,statusCheckRollup", token, 60)
+    if j is None:
+        return "", why
+    if (j.get("headRefOid") or "") != pin:
+        return "pending", f"GitHub reports head {(j.get('headRefOid') or '?')[:12]}, not {pin[:12]}"
+    rows = [r for r in j.get("statusCheckRollup") or [] if isinstance(r, dict)]
+    if not rows:
+        return ("unregistered", "no check has registered yet, though the base has workflows") if workflows \
+            else ("none", "")
+    red, pending = [], []
+    for r in rows:
+        name = r.get("name") or r.get("context") or "?"
+        link = r.get("detailsUrl") or r.get("targetUrl") or ""
+        if r.get("__typename") == "StatusContext" or "context" in r:
+            word = (r.get("state") or "").upper()
+            done = word not in ("PENDING", "EXPECTED", "")
+        else:
+            word = (r.get("conclusion") or "").upper()
+            done = (r.get("status") or "").upper() == "COMPLETED"
+        if not done:
+            pending.append(name)
+        elif word not in CI_GREEN:
+            red.append(f"{name} {word.lower() or 'failed'}" + (f" ({link})" if link else ""))
+    if red:
+        return "red", "; ".join(red)
+    if pending:
+        return "pending", "still running: " + ", ".join(pending)
+    return "green", f"{len(rows)} check(s) passed"
 
 
 def slug(root) -> str:
