@@ -195,3 +195,4 @@ run on their own. It owns only the paths no narrower check covers.
 | `e2e-suite-reporting` | host | drives tools end to end (tmux, git, a HOME); not yet proven in the sandbox |
 | `e2e-suite-slots` | host | drives tools end to end (tmux, git, a HOME); not yet proven in the sandbox |
 | `e2e-in-sync` | static | split.py compares text it would write with the files; it runs nothing |
+| `selfcheck-demo-video-web-encode` | hermetic | ffmpeg on a test pattern in a temp dir; no HOME, no network |

@@ -80,6 +80,9 @@ cursor moves on every frame. Nothing real may be in frame: every beat checks the
   typing, a message, a whoosh for a camera move, a rise into a 3D shot, a chord for the end) on their times, and
   `master` brings the mix to -16 LUFS under -1.5 dBTP and muxes it in as AAC, copying the video. Remotion and React are
   `MOTION_PINS` in `deps.mjs`, installed into the same cache on first use.
+- `web-encode.sh`: the web copies of a finished film. `web-encode.sh mp4 IN OUT [CRF]` is a small H.264 for a page's
+  video (CRF 24 by default, faststart), and `web-encode.sh gif IN OUT WIDTH FPS COLOURS [SS T]` a GIF with one palette
+  and no dithering, which keeps a UI's flat colours clean; `web-encode.sh selfcheck` checks both.
 
 ## How to make one
 
