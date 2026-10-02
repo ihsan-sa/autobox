@@ -446,12 +446,17 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                             target = descendants(box.pid)[-1]
                         proc, shape, until = Path(f"/proc/{target}"), "", time.monotonic() + GUARD
                         while not shape and time.monotonic() < until:
+                            # Unreadable has two spellings: EACCES (kernel 7.0.0-30) or an empty link
+                            # (7.0.0-34). Waiting for EACCES alone sat out GUARD twice on -34 and ran the
+                            # landing check past its cap. The inventory reads both as "not this namespace".
                             try:
-                                os.readlink(proc / "ns/mnt")
+                                unreadable = os.readlink(proc / "ns/mnt") == ""
                             except PermissionError:
-                                shape = "ns/mnt EACCES" if mode == "nodump" else ""
+                                unreadable = True
                             except OSError:
-                                pass
+                                unreadable = False
+                            if unreadable and mode == "nodump":
+                                shape = "ns/mnt unreadable"
                             if mode == "leaderless" and m.exiting(proc) and not any(
                                     m.exiting(t) for t in (proc / "task").iterdir() if t.name != str(target)):
                                 shape = "leader exited, thread live"
@@ -468,11 +473,11 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                             proc.communicate(b"stop\n", timeout=GUARD)
                         os.close(vfd)
                 shape, refused = hidden("nodump")
-                check(shape == "ns/mnt EACCES" and "cannot be inspected" in refused,
+                check(shape == "ns/mnt unreadable" and "cannot be inspected" in refused,
                       "a live non-dumpable process in a sandbox's namespace, holding a descriptor on V, refuses",
                       f"{shape}; {refused or 'allowed'}")
                 shape, refused = hidden("nodump", bind=("--bind", v, "/exposed"), fd_on_v=False)
-                check(shape == "ns/mnt EACCES" and "exposes V" in refused,
+                check(shape == "ns/mnt unreadable" and "exposes V" in refused,
                       "a non-dumpable process in a namespace binding V has its mount table checked without ns/mnt",
                       f"{shape}; {refused or 'allowed'}")
                 shape, refused = hidden("leaderless")
