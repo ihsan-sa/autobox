@@ -65,6 +65,9 @@
 # Env: CC_GUARD_ASKS, CC_GUARD_ASK_TTL (where a member-facing query is de-duplicated, and for how long) ·
 # CC_GUARD_ROOT_PID (test hook: the session process the worker kill fence measures its subtree from).
 # Env: CC_GUARD_RECORD_TIMEOUT (seconds the failure-ledger write in note_refusal may take; default 5; case 50c lowers it).
+# Env: CC_GUARD_BUDGET (seconds a call may be read for before it is REFUSED; default 30, may only be lowered, never to 0).
+# EVERY CALL IS READ INSIDE A BUDGET AND A BASH COMMAND PAST 128 KB IS REFUSED UNREAD: a hook that times out lets
+# the call through, so running out of time refuses rather than racing the hook (see "the time budget").
 set -uo pipefail
 # No jq = no cwd, so no marker walk either: fail CLOSED on every role we can know from the env alone — `cc` sets it
 # for a worker and a member. A gated role missing from this list is a role whose gates are silently OFF on a broken
@@ -74,6 +77,35 @@ set -uo pipefail
 # itself (security read of #574). Nothing else here may take a missing tool for a clean command.
 for _dep in jq sed; do command -v "$_dep" >/dev/null 2>&1 && continue
   case "${CC_ROLE:-}${CC_HANDOFF:+ handoff}" in *worker*|*member*|*handoff*) echo "cc-guard: $_dep is missing (broken PATH?) — the gates cannot be evaluated, so the call is refused" >&2; exit 2;; esac; exit 0; done
+# ---- the time budget ---------------------------------------------------------------------------------------
+# A HOOK THAT TIMES OUT LETS THE CALL THROUGH. Tried live on claude 2.1.288 (2026-10-03): a PreToolUse hook that
+# exits 2 after sleeping past its `timeout` did not stop the Bash call it was gating, and the same hook exiting 2 at
+# once did. So a guard that reads slowly is a guard that can be talked past with a long enough command (the security
+# read of #815 timed main at 160 s on a 40 KB single-quoted string, against the default 60 s timeout). Every call is
+# therefore read under a budget of its own, well inside that timeout, and running out of it REFUSES — every role,
+# because the gates for every session (the tmux server, pattern kills, the GitHub deny list) are inside the same
+# read. timeout(1) signals its whole process group, so the awk and sed under the guard go with it. CC_GUARD_BUDGET
+# (seconds) may only lower it, and never to 0, which is no timeout at all. The selfcheck lowers it to prove the
+# refusal. The child is known by its env mark AND by timeout being its parent, so the mark alone in a session's env
+# turns nothing off. ANY exit of 124 or more refuses: timeout's own failures (125-127) and a child killed by any
+# signal are not a verdict. With no timeout on the PATH a gated role is refused, and any other session is read
+# unbudgeted rather than not at all — the tmux, pattern-kill and GitHub gates are every session's. The second half
+# of the bound is the size cap below.
+if [ "${1:-}" != selfcheck ] \
+   && ! { [ -n "${_CC_GUARD_TIMED:-}" ] && [ "$(cat "/proc/$PPID/comm" 2>/dev/null)" = timeout ]; }; then
+  if command -v timeout >/dev/null 2>&1; then
+    _b=${CC_GUARD_BUDGET:-30}
+    [[ $_b =~ ^([0-9]{1,3})(\.[0-9]+)?$ ]] && (( 10#${BASH_REMATCH[1]} < 30 )) && [[ $_b =~ [1-9] ]] || _b=30
+    _CC_GUARD_TIMED=1 timeout -k 2 "$_b" "$BASH" "$0" "$@"; _rc=$?
+    [ "$_rc" -ge 124 ] && { echo "cc-guard: the gates did not finish reading this call inside ${_b}s, so it is" \
+      "refused — a hook that runs out of time would let it through. Put long text in a file (Write tool) and pass" \
+      "the file instead." >&2; exit 2; }
+    exit "$_rc"
+  fi
+  case "${CC_ROLE:-}${CC_HANDOFF:+ handoff}" in *worker*|*member*|*handoff*)
+    echo "cc-guard: timeout is missing (broken PATH?) — the gates cannot be read inside a budget, so the call is" \
+      "refused" >&2; exit 2;; esac
+fi
 # ---- selfcheck -------------------------------------------------------------------------------------------
 # It sits ABOVE the read of stdin because that read is where every other path here begins, and a hook has no
 # other door. Each case builds its own fixture — its own HOME, its own asks dir, its own stub binaries — and
@@ -2660,6 +2692,83 @@ W64
   unset GERR
   ok "a builder the non-live seat started before the cutover still commits and pushes; the seat itself, a later subagent, a second record that does not scope it, a corrupt list and the pre-cutover successor are refused, and the builder still may not dispatch, open a PR or run a loop" $r
 
+  # 70. A LONG QUOTED STRING IS READ IN TIME, OR REFUSED (row raised-guard-slow-on-long-quoted-input). A hook that
+  #     times out lets its call through, and main took 160 s on a 40 KB single-quoted string of short lines because
+  #     the join rescanned the whole quote for every line. 40 KB is now read, both ways, well inside the budget; past
+  #     128 KB is refused unread; and a read that outlives CC_GUARD_BUDGET is refused, never let through. Each
+  #     payload is built here and goes in on stdin (jq -Rs), because 320 KB is past what one argv word may carry.
+  GERR=$T/err70; r=0
+  body70(){ awk -v n="$1" 'BEGIN { for (i = 0; i < n; i++) printf "l%d %s\n", i, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }'; }
+  J70(){ printf '%s' "$1" | jq -Rs '{command:.}'; }
+  t70(){ local a=${EPOCHREALTIME/./} rc; : > "$GERR"; rc=$(g Bash "$1" "$WT" CC_ROLE=worker "${@:2}"); echo "$rc $(( (${EPOCHREALTIME/./} - a) / 1000 ))"; }
+  b40=$(body70 1000); b320=$(body70 8000)                                             # ~40 KB and ~320 KB
+  read -r k1 m1 < <(t70 "$(J70 "echo '$b40' > $T/o70")")                               # kept: data, read and passed
+  read -r k2 m2 < <(t70 "$(J70 "echo '$b40' > $T/o70; tmux kill-server")")             # the gate past it still holds
+  grep -qF 'shared tmux server' "$GERR" || k2="$k2(wrong rule)"
+  read -r k3 m3 < <(t70 "$(J70 "echo '$b320' > $T/o70")")                              # past the cap: refused unread
+  grep -qF 'past the 131072' "$GERR" || k3="$k3(wrong rule)"
+  read -r k4 m4 < <(t70 "$(J70 "echo '$b40' > $T/o70")" CC_GUARD_BUDGET=0.05)          # out of time: refused, not passed
+  grep -qF 'did not finish reading this call' "$GERR" || k4="$k4(wrong rule)"
+  # the budget a call is given, read off a stub timeout first on the PATH that keeps its duration argument (-k 2 <s>
+  # …): one above 30 s, 0 (no timeout at all) and junk are all held to 30, and a lower one is taken as it is
+  mkdir -p "$T/to70"; printf '#!/bin/sh\necho "$3" >> "%s"\n' "$T/args70" > "$T/to70/timeout"; chmod +x "$T/to70/timeout"
+  for b in 900 0 junk 5; do g Bash "$(J70 true)" "$WT" CC_ROLE=worker CC_GUARD_BUDGET="$b" PATH="$T/to70:$PATH" >/dev/null; done
+  k5=$(tr '\n' ' ' < "$T/args70" 2>/dev/null)
+  k6=$(g Bash "$(J70 "echo '$b40' > $T/o70")" "$WT" CC_ROLE=worker CC_GUARD_BUDGET=0.05 _CC_GUARD_TIMED=1)  # the mark alone skips no budget
+  # the scan RESUMES after a quote join and after a backslash continuation: a gate on the line it resumed into holds
+  c1=$(g Bash "$(J70 "echo 'a
+b' && \
+tmux kill-server")" "$WT" CC_ROLE=worker)
+  c2=$(g Bash "$(J70 "echo 'a
+b' && \
+true")" "$WT" CC_ROLE=worker)
+  [ "$c1$c2" = 20 ] || { r=1; echo "      a continuation after a joined quote: tmux kill-server $c1 (want 2), true $c2 (want 0)"; }
+  [ "$k1" = 0 ] && [ "$k2$k3$k4" = 222 ] && [ "$k5" = "30 30 30 5 " ] && [ "$k6" = 2 ] || { r=1; echo "      40 KB data rc $k1 (want 0), with tmux kill-server after it $k2, 320 KB $k3, a 0.05 s budget $k4 (want 2s); budgets 900, 0, junk, 5 gave timeout '$k5' (want '30 30 30 5 '); the mark from the env $k6 (want 2)"; }
+  for m in "$m1" "$m2" "$m3"; do [ "$m" -lt 15000 ] || { r=1; echo "      a read took ${m} ms (want under 15000 — main took 160 s; the hook gives up at 60 s and lets the call through)"; }; done
+  [ "$m4" -lt 5000 ] || { r=1; echo "      the 0.05 s budget took ${m4} ms to refuse (want under 5000)"; }
+  unset GERR
+  ok "a 40 KB quoted string is read in time both ways (data passes, a tmux kill-server after it is refused); 320 KB is refused unread; a read past its budget is refused, not let through; a budget above 30 s, 0 or junk is held to 30; and a mark in the env skips no budget" "$r"
+
+  # 70b. NO timeout ON THE PATH: a gated role is refused outright, and any other session is still read, only without a
+  #      budget — a plain command passes and a tmux kill-server is refused. The PATH is the caller's, with each dir that
+  #      holds a timeout swapped for a dir of links to everything in it but that. Nothing here writes through a link.
+  GERR=$T/err70b; r=0; ntp=""; nd=0
+  IFS=: read -ra pd70 <<<"$PATH"
+  for d in "${pd70[@]}"; do
+    if [ -x "$d/timeout" ]; then nd=$((nd + 1)); mkdir -p "$T/nt70.$nd"; ln -s "$d"/* "$T/nt70.$nd/" 2>/dev/null
+      rm -f "$T/nt70.$nd/timeout"; d=$T/nt70.$nd; fi
+    ntp=${ntp:+$ntp:}$d; done
+  PATH=$ntp command -v timeout >/dev/null 2>&1 && { r=1; echo "      the fixture PATH still finds a timeout: this case tests nothing"; }
+  : > "$GERR"; n1=$(g Bash "$(J70 true)" "$WT" CC_ROLE=worker PATH="$ntp")
+  grep -qF 'timeout is missing' "$GERR" || n1="$n1(wrong rule)"
+  n2=$(g Bash "$(J70 true)" "$T" PATH="$ntp")
+  : > "$GERR"; n3=$(g Bash "$(J70 "tmux kill-server")" "$T" PATH="$ntp")
+  grep -qF 'shared tmux server' "$GERR" || n3="$n3(wrong rule)"
+  [ "$n1$n2$n3" = 202 ] || { r=1; echo "      no timeout: a worker's true $n1 (want 2), a plain session's true $n2 (want 0), its tmux kill-server $n3 (want 2)"; }
+  unset GERR
+  ok "with no timeout on the PATH a worker is refused, and a plain session is still read without a budget (true passes, tmux kill-server is refused)" "$r"
+
+  # 70c. WHERE THE SCAN RESUMES AND WHERE IT STARTS OVER. A `<` before a line-ending backslash makes `<\` + `<'EOF'`
+  #      a `<<` that a resumed scan would never see, so that line is scanned again from its start: the heredoc in
+  #      the `"$(` is found and its body is the argument it is, as it is with `<<` on one line. And a comment that
+  #      ends in a backslash takes the next line with it, but no quote opened there is joined on: the line after is
+  #      read as the shell reads it, and its gate holds.
+  r=0
+  s1=$(g Bash "$(J70 "echo \"\$(cat <\\
+<'EOF'
+tmux kill-server
+EOF
+)\"")" "$WT" CC_ROLE=worker)
+  s2=$(g Bash "$(J70 "echo \"\$(cat <<'EOF'
+tmux kill-server
+EOF
+)\"")" "$WT" CC_ROLE=worker)
+  s3=$(g Bash "$(J70 "true # note \\
+echo 'a
+b'; tmux kill-server")" "$WT" CC_ROLE=worker)
+  [ "$s1$s2$s3" = 002 ] || { r=1; echo "      a heredoc opener split at <\\ $s1 (want 0, as on one line: $s2); a quote after a continued comment hid tmux kill-server: $s3 (want 2)"; }
+  ok "a heredoc opener split by a backslash after its first < is rescanned and read as on one line, and a quote on the line a comment's backslash pulls in hides no gate after it" "$r"
+
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
   exit 0
@@ -2667,6 +2776,12 @@ fi
 
 inp=$(cat); tool=$(jq -r '.tool_name // ""' <<<"$inp"); cwd=$(jq -r '.cwd // ""' <<<"$inp"); cwd=$(realpath -m -- "${cwd:-/}" 2>/dev/null || echo "$cwd")
 qcmd=$(jq -r '.tool_input.command // .tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")   # what a member refusal records as "the command"
+# THE SIZE CAP: the other half of the bound. The reading below is linear now, but its slope is not small and it
+# depends on the shape: 128 KB of short quoted lines took 3 s here, 260 KB of two-byte lines took 19 s on an idle
+# box, and a loaded box is slower. So a Bash command past 131072 characters (128 KB) is refused before any rule
+# reads it, rather than left to race the budget. Nothing a session types is that long; a file it wrote is.
+if [ "$tool" = Bash ] && [ "${#qcmd}" -gt 131072 ]; then
+  echo "cc-guard: this command is ${#qcmd} characters, past the 131072 the gates will read, so it is refused. Write the long text to a file (Write tool) and pass the file instead." >&2; exit 2; fi
 # A command position: start, after a separator/substitution, or after wrapper words that hide the real command
 # (then/xargs/env/nohup/bash -c/VAR=…). Quotes are stripped from the haystack first, so "gh pr merge" is seen too.
 # THIS LIST IS NO LONGER WHAT CLOSES THE RULES — cmdpos() below is. Every word it does not know used to hide
@@ -3236,30 +3351,40 @@ hay(){   # the text the rules match: heredoc bodies out, quotes stripped, every 
         f = t; sub(/^[ \t]+/, "", f); sub(/[ \t].*/, "", f); sub(/.*\//, "", f)
         if (f ~ /^(if|then|else|elif|do|while|until|for|case|select|function|coproc|time|nohup|command|builtin|timeout|nice|ionice|setsid|stdbuf|chrt|taskset|unbuffer|doas|export|declare|typeset|local|readonly|alias|set|let|printf|read|mapfile|readarray|trap)$/) return 0
         return t !~ /(^|[ \t])-(exec|execdir|ok|okdir)([ \t]|$)/ }
-      function qend(s,   p, n, c, q, ds, dp, hd, nh, k, j, r, w, qs, sst, ab, bad, hb) {   # the quote a line ends inside, or nothing; a comment ends the line
-        n = length(s); q = ""; ds = 0; hd = 0; nh = 0; HQS = ""; sst[0] = 1; bad = 0; hb = 0
-        for (p = 1; p <= n; p++) { c = substr(s, p, 1)
-          if (q != "") { if (q == "\"" && c == "\\") p++
-                         else if (q == "\"" && c == "$" && substr(s, p + 1, 1) == "(") {
-                           ab[ds + 1] = !argq(substr(s, sst[ds], qs - sst[ds])); ds++; bad += ab[ds]
-                           dp[ds] = 1; sst[ds] = p + 2; q = ""; p++ }
-                         else if (c == q) q = ""; continue }
+      # THE SCAN RESUMES, IT IS NEVER REDONE. A quote that stays open is joined on to the next line and asked
+      # again, and asking meant scanning the joined line from its first byte: a 40 KB single-quoted string of
+      # short lines took minutes, past the timeout of the hook, and a hook that times out lets the call through
+      # (raised-guard-slow-on-long-quoted-input). qend starts a scan, qmore carries its state (qq_*) on from
+      # where it stopped over what was appended since — the same answer, character for character, in one pass.
+      function qend(s) { qq_q = ""; qq_ds = 0; qq_hd = 0; qq_nh = 0; qq_bad = 0; qq_hb = 0; qq_cm = 0; qq_r = 0; qq_qs = 0
+        delete qq_dp; delete qq_sst; delete qq_ab; qq_sst[0] = 1; return qmore(s, 1) }
+      function qmore(s, from,   p, n, c, k, j, w) {   # the quote a line ends inside, or nothing; a comment ends the line
+        HQS = ""; if (qq_cm) return ""                # a comment runs to the end of all that is appended to it
+        n = length(s)
+        for (p = from; p <= n; p++) { c = substr(s, p, 1)
+          if (qq_q != "") { if (qq_q == "\"" && c == "\\") p++
+                         else if (qq_q == "\"" && c == "$" && substr(s, p + 1, 1) == "(") {
+                           qq_ab[qq_ds + 1] = !argq(substr(s, qq_sst[qq_ds], qq_qs - qq_sst[qq_ds])); qq_ds++; qq_bad += qq_ab[qq_ds]
+                           qq_dp[qq_ds] = 1; qq_sst[qq_ds] = p + 2; qq_q = ""; p++ }
+                         else if (c == qq_q) qq_q = ""; continue }
           if (c == "\\") { p++; continue }
-          if (ds && c == "(") dp[ds]++
-          if (ds && c == ")" && --dp[ds] == 0) { bad -= ab[ds]; ds--; q = "\""; if (hd > ds) hd = 0; continue }
-          if (index(";&|(", c) > 0) sst[ds] = p + 1                 # a new statement starts after it
-          if (c == "\"" || c == SQ) { q = c; qs = p; continue }
-          if (c == "<" && substr(s, p + 1, 1) == "<") { nh++; if (ds) { hd = ds; r = p; hb = bad } }
-          if (!ds && c == "#" && (p == 1 || index(" \t;&|(", substr(s, p - 1, 1)) > 0)) return "" }
-        if (hd && !hb && q == "" && nh == 1 && substr(s, 1, r - 1) !~ X && s !~ CP \
-            && match(substr(s, r + 2), "^-?[ \t]*[\"\047]?[A-Za-z_][A-Za-z0-9_]*")) {
-          w = substr(s, r + 2 + RSTART - 1, RLENGTH); sub("^-?[ \t]*[\"\047]?", "", w)
+          if (qq_ds && c == "(") qq_dp[qq_ds]++
+          if (qq_ds && c == ")" && --qq_dp[qq_ds] == 0) { qq_bad -= qq_ab[qq_ds]; qq_ds--; qq_q = "\""; if (qq_hd > qq_ds) qq_hd = 0; continue }
+          if (index(";&|(", c) > 0) qq_sst[qq_ds] = p + 1                 # a new statement starts after it
+          if (c == "\"" || c == SQ) { qq_q = c; qq_qs = p; continue }
+          if (c == "<" && substr(s, p + 1, 1) == "<") { qq_nh++; if (qq_ds) { qq_hd = qq_ds; qq_r = p; qq_hb = qq_bad } }
+          if (!qq_ds && c == "#" && (p == 1 || index(" \t;&|(", substr(s, p - 1, 1)) > 0)) { qq_cm = 1; return "" } }
+        qq_p = p                                       # where the next qmore picks up: past an escape that ran off the end
+        if (qq_hd && !qq_hb && qq_q == "" && qq_nh == 1 && substr(s, 1, qq_r - 1) !~ X && s !~ CP \
+            && match(substr(s, qq_r + 2), "^-?[ \t]*[\"\047]?[A-Za-z_][A-Za-z0-9_]*")) {
+          w = substr(s, qq_r + 2 + RSTART - 1, RLENGTH); sub("^-?[ \t]*[\"\047]?", "", w)
           for (k = i + 1; k <= NR; k++) if (L[k] ~ ("^[ \t]*" w "[ \t]*$")) break   # i is the END loop line
           for (j = k + 1; j <= NR; j++) if (L[j] ~ Q || L[j] ~ CP) k = NR + 1   # the text may yet be handed to a runner, or run as a word: see above
-          if (k <= NR && s !~ Q) { for (k = 1; k <= ds; k++) { HQS = HQS "\"$("; for (j = 1; j < dp[k]; j++) HQS = HQS "(" }
+          if (k <= NR && s !~ Q) { for (k = 1; k <= qq_ds; k++) { HQS = HQS "\"$("; for (j = 1; j < qq_dp[k]; j++) HQS = HQS "(" }
                          return "" } }
-        return q
+        return qq_q
       }
+      function oddbs(s,   n) { n = length(s); while (n > 0 && substr(s, n, 1) == "\\") n--; return (length(s) - n) % 2 }
       # A KEPT BODY LINE IS ITS SUBSTITUTIONS, NOT THE PROSE AROUND THEM. `$(date -u) cc-land refused the merge`
       # in a journal heredoc stayed in the haystack whole, and the `)` put the landing tool in command position;
       # what the shell RUNS there is the interior of the $( ), the backtick and the ${ }, so that is what stays.
@@ -3382,9 +3507,13 @@ hay(){   # the text the rules match: heredoc bodies out, quotes stripped, every 
           # its own and the call passed as a GET (security read of #574). Outside a quote only, and only an ODD
           # run of backslashes — a doubled one is a literal backslash, and the line ends there. The backslash
           # goes with no space in its place, which is what the shell does to a word split across two lines.
+          qf = 0                                            # 0: scan cur from its start; else where qmore resumes
           while (i < NR) {
-            if (qend(cur) != "") { i++; cur = cur ";" L[i]; continue }   # an open quote runs on: one logical line
-            if (cur !~ /(^|[^\\])(\\\\)*\\$/) break
+            if ((qf ? qmore(cur, qf) : qend(cur)) != "") { qf = qq_p; i++; cur = cur ";" L[i]; continue }   # an open quote runs on: one logical line
+            if (!oddbs(cur)) break
+            # the escape that ran off the end is the backslash going now: resume ON it, which is where the next line lands
+            # …unless a `<` stands before it: `<\` + `<EOF` is a `<<` the resumed scan would never see, so rescan
+            qf = (qq_cm || (qq_p == length(cur) + 2 && substr(cur, length(cur) - 1, 1) != "<")) ? length(cur) : 0
             sub(/\\$/, "", cur); i++; cur = cur L[i] }
           print cur                                         # the line that OPENS a heredoc is still a command
           n = hdpos(cur); if (n == 0) continue

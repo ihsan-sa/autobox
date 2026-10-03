@@ -4,7 +4,8 @@
 #   ./install.sh --etc            also (re)install the /etc reference configs with sudo
 #   ./install.sh --no-services    link only — no systemctl/sudo (tests run this in a throwaway HOME)
 # A box may keep this tree as `core/` inside a private repo — the "overlay" — and then the installer also links
-# the overlay's home/*.md and bin-private/*, and uses its config/etc. A bare clone of autobox has no overlay.
+# the overlay's home/*.md and bin-private/*, uses its config/etc, and lays its config/claude-settings.json over
+# the default when it writes a first ~/.claude/settings.json. A bare clone of autobox has no overlay.
 set -euo pipefail
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 O=""; [ "$(basename "$R")" = core ] && O="$(cd "$R/.." && pwd)"   # R = this tree, O = the private overlay or ""
@@ -130,7 +131,13 @@ done
 if [ -f ~/.claude/settings.json ]; then
   "$R/bin/cc-settings" check || true   # a drifted subset must never abort the install: it is a report, not a gate
 else
-  mkdir -p ~/.claude; cp "$R/config/claude-settings.json" ~/.claude/settings.json; echo "installed default ~/.claude/settings.json"
+  # The overlay's config/claude-settings.json holds only the box's own keys (its autoMode entries, say) and wins
+  # key by key over the default; a list in it replaces the default's whole list rather than appending to it.
+  mkdir -p ~/.claude
+  if [ -n "$O" ] && [ -f "$O/config/claude-settings.json" ]; then
+    jq -s '.[0] * .[1]' "$R/config/claude-settings.json" "$O/config/claude-settings.json" > ~/.claude/settings.json.new
+    mv ~/.claude/settings.json.new ~/.claude/settings.json; echo "installed default ~/.claude/settings.json, with the overlay's keys"
+  else cp "$R/config/claude-settings.json" ~/.claude/settings.json; echo "installed default ~/.claude/settings.json"; fi
 fi
 [ -f "$R/ccbox/env" ] || { cp "$R/ccbox/env.example" "$R/ccbox/env"; chmod 600 "$R/ccbox/env"; echo "created ccbox/env from example (add tokens)"; }
 grep -qF 'PATH="$HOME/bin:$PATH"' ~/.bashrc 2>/dev/null || cat >> ~/.bashrc <<'B'
