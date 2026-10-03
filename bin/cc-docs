@@ -100,6 +100,10 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
     cc-docs project <name|PPP> --rename <Group/Name | name>
         Rename a project or put it in a group (`project 006 --rename Career/Resume`). Its number, documents and
         files stay as they are.
+    cc-docs pdf <PPP-NNNN-R> <pdf>
+        A TEXT REVISION'S PDF: gives a revision filed without a PDF (a Markdown one, whose PDF a renderer makes after
+        it is filed) that PDF, stamped and kept as `file` keeps one, and records its print, pages and bytes on that
+        revision. A revision that has its PDF is refused. A host command, never a workspace's.
     cc-docs find <PPP-NNNN | PPP-NNNN-R | words…>
         The file of a document's current revision (or of the exact revision named), found by number, title or
         words in the title, project name or source path. Several equally good matches are listed to stderr, exit 3;
@@ -379,7 +383,8 @@ def write_views(reg, ids):
         for d in docs.values():
             for r in d["revisions"]:
                 blobs.update(x["blob"] for x in r.get("attachments") or ())
-                for rel in [r["file"]] + sorted(x["blob"] for x in r.get("attachments") or ()):
+                # a text revision filed before its PDF (`pdf`, below) has no file yet
+                for rel in ([r["file"]] if r.get("file") else []) + sorted(x["blob"] for x in r.get("attachments") or ()):
                     dst = os.path.join(v, rel)
                     if not os.path.exists(dst):
                         os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -1669,6 +1674,56 @@ def cmd_attach(a):
     return 0
 
 
+# ── a text revision's PDF ────────────────────────────────────────────────────────────────────────────────────
+def cmd_pdf(a):
+    """The PDF of a revision filed without one (a Markdown revision whose PDF a renderer makes after filing), filed the
+    way `file` files one: stamped unless its text carries its own number or the document is --no-stamp, read-only,
+    recorded on that revision with its print, pages and bytes. A revision that has its PDF is refused: a filed copy
+    is never rewritten. Another number quoted in its text is not refused: it is the owner's Markdown, which may name
+    other documents."""
+    src = os.path.abspath(a.pdf)
+    if not os.path.isfile(src):
+        raise Refused(f"{a.pdf}: no such file")
+    text = pdftext(src)
+    fp = fingerprint(src, text)
+    with Lock():
+        reg = load()
+        d, r = get_rev(reg, a.number)
+        full = f"{d['number']}-{r['rev']}"
+        if r.get("file"):
+            raise Refused(f"{full} has its PDF already; a filed revision is never rewritten")
+        rel = os.path.join("files", d["project"], f"{full}_{slugify(d['title'])}.pdf")
+        dst = os.path.join(ROOT, rel)
+        if os.path.exists(dst):
+            raise Refused(f"{dst} exists; a filed revision is never rewritten")
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".part"
+        carried = set(m.group(0).split()[0] for m in STAMP.finditer(text))
+        if d.get("stamp") is False:
+            how = "none"
+            shutil.copy(src, tmp)
+        elif full in carried:
+            how = "carried"
+            shutil.copy(src, tmp)
+        else:
+            how = "overlay"
+            try:
+                date = datetime.date.fromisoformat(r.get("date") or "")
+            except ValueError:
+                date = datetime.date.today()
+            stamp(src, tmp, " · ".join([full] + ([r["describes"]] if r.get("describes") else []) + [stampdate(date)]))
+        os.chmod(tmp, 0o444)
+        os.replace(tmp, dst)
+        with open(dst, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        r.update(file=rel, fingerprint=fp, sha256=sha, stamped=how, pages=pages(dst), bytes=os.path.getsize(dst),
+                 pdf_at=utcnow())
+        save(reg)
+        write_views(reg, set(d.get("visibility", ())) - {"owner"})
+    print(f"{full}\t{dst}\tfiled", flush=True)
+    return 0
+
+
 def spawn_check():
     """With DOCS_CHECK_CHANNEL set, `cc-docs check --post` detached, so the maker that filed is not held up."""
     if not conf("DOCS_CHECK_CHANNEL"):
@@ -1960,9 +2015,9 @@ def library(reg, viewer):
             continue
         revs = []
         for r in d["revisions"]:
-            f = os.path.join(ROOT, r["file"])
-            out = {"rev": r["rev"], "date": r["date"], "note": r.get("note"), "file": f"/files/{n}-{r['rev']}.pdf",
-                   "pages": r.get("pages") or _pages(f), "bytes": r.get("bytes") or (os.path.getsize(f) if os.path.exists(f) else 0),
+            f = os.path.join(ROOT, r["file"]) if r.get("file") else None    # None: a text revision not rendered yet
+            out = {"rev": r["rev"], "date": r["date"], "note": r.get("note"), "file": f and f"/files/{n}-{r['rev']}.pdf",
+                   "pages": r.get("pages") or (f and _pages(f)), "bytes": r.get("bytes") or (os.path.getsize(f) if f and os.path.exists(f) else 0),
                    "describes": r.get("describes"), "cost": r.get("cost"),
                    "public": owner and bool(r.get("public_token"))}
             if owner and r.get("public_token"):
@@ -3713,6 +3768,34 @@ def _selfcheck():
            and not os.stat(os.path.join(ROOT, att["board.drl"]["blob"])).st_mode & 0o222
            and att["board.drl"]["crc32"] == zlib.crc32(b"M48\n") and att["board.drl"]["bytes"] == 4
            and not [f for f in os.listdir(os.path.join(ROOT, "attachments")) if f.startswith(".part")])
+        # pdf: a text revision filed with no PDF gets its rendered one; one that has a PDF is never rewritten
+        ROOT = os.path.join(t, "p1")
+        run("file", pa, "--project", "Boards", "--kind", "work", "--title", "Board")
+        reg = load()
+        dd = reg["documents"]["001-0001"]
+        dd["visibility"] = ["owner", wid]
+        dd["revisions"] += [{"rev": "B", "date": "2026-10-01", "file": None, "source_files": ["plan.md"]},
+                            {"rev": "C", "date": "2026-10-02", "file": None, "source_files": ["plan.md"]}]
+        save(reg)
+        write_views(reg, {wid})
+        rcl, ol = run("library", "--viewer", "owner")
+        rc, o = run("pdf", "001-0001-B", pb)
+        rc2, o2 = run("pdf", "001-0001-B", pc)
+        rc3, o3 = run("pdf", "001-0001-Z", pb)
+        rc4, o4 = run("pdf", "001-0001-C", mkpdf(src, "pn", "001-0001-C rendered with its own number"))
+        rb, rcc = load()["documents"]["001-0001"]["revisions"][1:]
+        bf = os.path.join(ROOT, rb.get("file") or "none")
+        with open(os.path.join(ROOT, "ws", wid, "register.json")) as fh:
+            vb = json.load(fh)["documents"]["001-0001"]["revisions"][1]
+        ok("pdf files a text revision's PDF onto it, stamped and read-only, linked into a workspace's view; a second "
+           "PDF, an unknown revision and a PDF carrying its own number (kept as it is) each do what file does",
+           rcl == 0 and '"file": null' in ol and rc == 0 and o.startswith("001-0001-B\t")
+           and rb["file"] == "files/001/001-0001-B_board.pdf" and rb["stamped"] == "overlay" and rb["pages"] == 1
+           and "001-0001-B" in pdftext(bf) and not os.stat(bf).st_mode & 0o222
+           and os.path.exists(os.path.join(ROOT, "ws", wid, rb["file"])) and vb["file"] == rb["file"]
+           and rc2 == 2 and "has its PDF already" in o2 and rc3 == 2
+           and rc4 == 0 and rcc["stamped"] == "carried")
+
         def board(root, *attach):
             """A register of its own at root, holding 001-0001-A filed from pa with `attach` on it."""
             global ROOT
@@ -3876,6 +3959,9 @@ def main(argv):
     p.add_argument("files", nargs="*")
     p.add_argument("--replace", action="store_true")
     p.add_argument("--remove", action="append")
+    p = sub.add_parser("pdf")
+    p.add_argument("number")
+    p.add_argument("pdf")
     p = sub.add_parser("find")
     p.add_argument("query", nargs="+")
     p = sub.add_parser("list")
@@ -3919,14 +4005,14 @@ def main(argv):
         return across(a)
     try:
         if IN_SANDBOX and a.cmd in ("project", "star", "public", "token", "member", "fold", "retire", "move", "attach",
-                                    "backfill-sources", "check"):
+                                    "backfill-sources", "check", "pdf"):
             # brief: "A member can't … make anything public, star for someone else, or read the owner's register"
             raise Refused(f"{a.cmd} is the host's: a workspace can file, number, find and list its own documents")
         if a.cmd == "member":
             return cmd_member(a)
         return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list,
                 "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library,
-                "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move, "attach": cmd_attach,
+                "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move, "attach": cmd_attach, "pdf": cmd_pdf,
                 "backfill-sources": cmd_backfill, "check": cmd_check}[a.cmd](a)
     except Refused as e:
         print(f"cc-docs: {e}", file=sys.stderr)
