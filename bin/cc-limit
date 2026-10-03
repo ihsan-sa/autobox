@@ -7,7 +7,8 @@
 #                      per episode what lifts it (see USAGE CREDITS below). <asked-model> is the model the run was
 #                      dispatched on, for a message that names none (the cap line does) — cc-loop passes it.
 #   cc-limit status    "usage limit until HH:MMZ (Nm left)" + exit 0 when the stamp binds THIS caller, else
-#                      "clear" + exit 1 (with a note on stderr when a stamp exists that does not bind it)
+#                      "clear" + exit 1 (with a note on stderr when a stamp exists that does not bind it, or when
+#                      `cc-model status` answers within CC_LIMIT_MODEL_WAIT s, default 5, that a model is unavailable)
 #   cc-limit wait      sleep until the stamp expires (exit 0); exit 1 if the wait would exceed CC_LIMIT_MAX_WAIT;
 #                      exit 0 at once when the stamp does not bind this caller — there is nothing to wait for
 #   cc-limit clear     forget it (every caller does this after a run that reached the API)
@@ -482,6 +483,9 @@ EOF
   cat > "$d/bin/cc-model" <<'EOF'
 #!/usr/bin/env bash
 set -u; printf 'model %s\n' "$*" >> "$CC_FAKE_CALLS"
+[ "${1:-}" = status ] && [ -n "${CC_FAKE_MODEL_SAY:-}" ] && printf '%s\n' "$CC_FAKE_MODEL_SAY"
+[ "${1:-}" = status ] && [ -n "${CC_FAKE_MODEL_HANG:-}" ] && { sleep 30 & sleep 30; }
+exit 0
 EOF
   cat > "$d/bin/cc-notify" <<'EOF'
 #!/usr/bin/env bash
@@ -1022,6 +1026,21 @@ EOF
   t '…while the one that WAS mid-turn then and is mid-turn now is still ended and typed at' \
     "$(grep -c '^keys %7 :: .*Escape' "$d/calls")$(calls '^msg beta ')" 11
 
+  # `status` ASKS cc-model FOR ITS NOTE, BOUNDED (48 copies piled up behind a cc-model that did not return in 400 s).
+  # Its own clear HOME: a cc-model that answers is heard on stderr, one that hangs — and leaves a child holding its
+  # output — is given up on inside the bound, and either way stdout says "clear" and the exit is 1.
+  d2=$(mktemp -d); mkdir -p "$d2/.cc/state"
+  sm(){ HOME="$d2" PATH="$d/bin:$PATH" CC_LIMIT_BIN="$d/bin" CC_LIMIT_STAMP="$d2/.cc/state/claude-limit" \
+    CC_LIMIT_RECORD="$d2/.cc/state/limit-interrupted" CC_LIMIT_SEEN="$d2/.cc/state/limit-seen" CC_FAKE_CALLS="$d2/calls" \
+    CC_LIMIT_OBSERVER=x CC_LIMIT_MODEL_WAIT=1 "$@" bash "$SELF" status; }
+  out=$(sm env CC_FAKE_MODEL_SAY='claude-x: not available to this account' 2>&1); rc=$?
+  t 'status, clear: cc-model saying a model is unavailable is a note on stderr, and stdout still reads clear' \
+    "$rc $(grep -c '^note: claude-x: not available' <<<"$out") $(grep -cx clear <<<"$out")" '1 1 1'
+  s0=$SECONDS; out=$(sm env CC_FAKE_MODEL_HANG=1 CC_FAKE_MODEL_SAY='claude-x: not available to this account' 2>&1); rc=$?
+  t 'status, clear: a cc-model that hangs (a child holding its output) is given up on inside the bound — no note, still clear' \
+    "$rc $(( SECONDS - s0 < 10 )) $(grep -c '^note:' <<<"$out") $(grep -cx clear <<<"$out")" '1 1 0 1'
+  rm -rf "$d2"
+
   rm -rf "$d"; printf 'cc-limit selfcheck: %d passed, %d failed\n' $((n - bad)) "$bad"; [ "$bad" = 0 ]; }
 
 case "${1:-}" in
@@ -1029,8 +1048,14 @@ case "${1:-}" in
   status) if ! believe; then echo clear
       # …and a model the account cannot run right now (usage credits, the spend cap) is not a limit and holds nobody,
       # but a person reading `status` should still hear it — stderr, so a caller's "clear" is unchanged.
-      case "$([ -x "$BIN/cc-model" ] && "$BIN/cc-model" status 2>/dev/null)" in *'not available to this account'*)
-        printf 'note: %s — not a limit: nothing waits; work bound to it runs on the next model and returns when it answers again.\n' "$("$BIN/cc-model" status 2>/dev/null)" >&2;; esac
+      # Asked ONCE and for at most CC_LIMIT_MODEL_WAIT s (default 5): under load a bare `cc-model status` did not
+      # return in 400 s and 48 `cc-limit status` piled up behind a note. Its answer goes to a file, not a pipe, so a
+      # child it leaves behind cannot hold this open after `timeout` has ended it; no answer in time is no note.
+      mst=$(mktemp) || mst=/dev/null
+      mrc=1; [ -x "$BIN/cc-model" ] && { timeout -k 1 "${CC_LIMIT_MODEL_WAIT:-5}" "$BIN/cc-model" status >"$mst" 2>/dev/null; mrc=$?; }
+      ms=""; case "$mrc" in 124|137) ;; *) ms=$(cat "$mst" 2>/dev/null);; esac; [ "$mst" = /dev/null ] || rm -f "$mst"
+      case "$ms" in *'not available to this account'*)
+        printf 'note: %s — not a limit: nothing waits; work bound to it runs on the next model and returns when it answers again.\n' "$ms" >&2;; esac
       # A stamp that does not bind this caller is still worth SAYING — on stderr, where a person reading `cc-limit
       # status` sees it and a caller capturing stdout does not have its answer changed. NOT in the words "usage
       # limit until HH:MMZ": cc-land captures stdout and stderr together and reads that phrase out of the text as a

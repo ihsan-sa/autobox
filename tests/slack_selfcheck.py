@@ -7790,6 +7790,65 @@ def run_selfcheck():
                                                "--ask", "--from", "alice", "--", "the owner must decide this"]]
           and "planning seat" in r_esc.get("text", "") and "owner was told" not in r_esc.get("text", "")
           and r_esc_empty.get("ok") is False and "something to say" in r_esc_empty.get("error", ""))
+    # A cc-notify that TIMES OUT after filing the request is not a failed escalation (a member was told it failed after
+    # the seat answered in 39 s): its own requests dir, one ask that files and then hangs, one that hangs having filed
+    # nothing, and one whose only file of that title is from before the ask.
+    reqD, was_reqs, was_impl = tempfile.mkdtemp(prefix="cc-slack-selfcheck-req-"), globals()["REQUESTS"], EFFECTS.run_impl
+    def hang(write=None):
+        def impl(cmd, **kw):
+            if write:
+                os.makedirs(os.path.dirname(f"{reqD}/{write[0]}"), exist_ok=True)
+                json.dump(write[1], open(f"{reqD}/{write[0]}", "w"))
+            raise subprocess.TimeoutExpired(cmd, 60)
+        return impl
+    now_s = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    globals()["REQUESTS"] = reqD
+    try:
+        EFFECTS.run_impl = hang(("closed/req-a@x.json", {"id": "req-a", "from": "alice", "title": "alice: stuck", "at": now_s,
+                                                        "answered_at": now_s}))
+        r_filed = dmMS.member_verb("alice", {"escalate": "stuck", "text": "help"}, "escalate")
+        shutil.rmtree(reqD); os.makedirs(reqD)
+        EFFECTS.run_impl = hang()
+        r_lost = dmMS.member_verb("alice", {"escalate": "stuck", "text": "help"}, "escalate")
+        EFFECTS.run_impl = hang(("req-old.json", {"id": "req-old", "from": "alice", "title": "alice: stuck",
+                                                 "at": "2026-01-01T00:00:00Z"}))
+        r_old = dmMS.member_verb("alice", {"escalate": "stuck", "text": "help"}, "escalate")
+    finally:
+        globals()["REQUESTS"], EFFECTS.run_impl = was_reqs, was_impl
+        shutil.rmtree(reqD, ignore_errors=True)
+    check("MEMBER socket: an escalation whose cc-notify timed out AFTER filing the request (answered already, moved to "
+          "closed/) is reported as the seat's, naming the request; one that filed nothing, or whose only file is older "
+          "than the ask, is still reported as failed",
+          r_filed.get("ok") is True and "req-a" in r_filed.get("text", "")
+          and r_lost.get("ok") is False and "did not return" in r_lost.get("error", "")
+          and r_old.get("ok") is False)
+    # A FAILED DOCS CALL SAYS WHY in the log (it said a bare "ok=False"); a filed one adds nothing. run_docs stubbed.
+    was_rd, dlog = globals()["run_docs"], io.StringIO()
+    try:
+        with contextlib.redirect_stderr(dlog):
+            globals()["run_docs"] = lambda h, ask: {"ok": False, "error": "nothing filed — the register did not answer (boom)"}
+            dmMS.member_docs("alice", {"op": "file"})
+            globals()["run_docs"] = lambda h, ask: {"ok": True, "id": "D-1"}
+            dmMS.member_docs("alice", {"op": "file"})
+    finally:
+        globals()["run_docs"] = was_rd
+    dl = dlog.getvalue().splitlines()
+    check("docs: a failed member docs call logs its reason beside ok=False, and a filed one logs ok=True with no reason",
+          len(dl) == 2 and dl[0].endswith("ok=False — nothing filed — the register did not answer (boom)")
+          and dl[1].endswith("docs alice: file ok=True"))
+    ttl_line = next((l for l in open(SELF).read().splitlines() if l.startswith("QUEUE_TTL =")), "")
+    check("QUEUE_TTL's own comment names the time it holds (it said 15 min while the value was 4 h)",
+          QUEUE_TTL == 4 * 3600 and "after 4 h" in ttl_line and "15 min" not in ttl_line)
+    # A REFUSED HELLO IS LOGGED ONCE PER PROCESS: a dead session's channel server re-sends it every 3 s. Its own daemon.
+    dmH = Daemon(use_slack=False)
+    wh = "hello hb-1 from a process that is not that session"
+    hn = [dmH.refusal_news("hello", (4242, 1000, "/x"), wh) for _ in range(3)]
+    check("socket: a refused hello is logged the first time a process sends it and not on its repeats, while another "
+          "process, another reason, a peer the kernel would not name and any other verb's refusal are each logged",
+          hn == [True, False, False] and dmH.refusal_news("hello", (4243, 1000, "/x"), wh)
+          and dmH.refusal_news("hello", (4242, 1000, "/x"), wh + " (other)")
+          and dmH.refusal_news("hello", None, wh) and dmH.refusal_news("hello", None, wh)
+          and dmH.refusal_news("reply", (4242, 1000, "/x"), wh) and dmH.refusal_news("reply", (4242, 1000, "/x"), wh))
     esc_title, esc_text = (ran_esc[1][2], ran_esc[1][7]) if len(ran_esc) > 1 and len(ran_esc[1]) > 7 else ("", "")
     check("MEMBER socket: an escalation's title and text reach cc-notify the way a 🔐 field does — the mrkdwn entities "
           "escaped so `<!channel>` and `<@U…>` are words and not a broadcast or a ping, an @handle unhooked from the "
@@ -8249,6 +8308,18 @@ def run_selfcheck():
           rc_go(c) is None and not c["ran"] and "zero-width" in rc_log(c))
     c = rc_case(cmd="echo a\tb\necho done")
     check("run card: …while a command with a tab and a newline in it runs", rc_go(c) == 0 and len(c["ran"]) == 1)
+    # THE CARD AS SLACK HANDS IT BACK (raised-an-approved-run-card-is-not-the-bots-own): conversations.history gives the
+    # emoji as :name:, and the text below is card 1790490707.296819's own shape as read from #approvals on 09-27.
+    def colon_card(cmd):
+        return ("<#CAPPR> :question: <@UOWNER> :closed_lock_with_key: *Approval needed:* restart it"
+                + run_card_tail(cmd, hashlib.sha256(cmd.encode()).hexdigest()).replace("👍", ":+1:"))
+    c = rc_case(text=colon_card("echo hi"), author={"bot_id": "BBOT", "username": "demo-box · planning"})
+    check("run card: the owner's 👍 on a signed card whose text is Slack's stored :closed_lock_with_key: / :+1: form runs "
+          "its command once", rc_go(c) == 0 and c["ran"] == [["bash", "-c", "echo hi"]] and "not run" not in rc_log(c))
+    c = rc_case(text=colon_card("echo other"), author={"bot_id": "BBOT", "username": "demo-box · planning"})
+    check("run card: …while the same stored form ending with another command runs nothing, and the thread says why",
+          rc_go(c) is None and not c["ran"] and "does not end with this command" in rc_log(c)
+          and len(c["posts"]) == 1 and c["posts"][0][1].startswith("Not run:"))
     # Two copies of one test, perl's in cc-notify and run_hidden here: held to the same verdict on every sample.
     mP = re.search(r"perl -CA -e '(exit\(\$ARGV\[0\] =~ /[^/]*/ \? 0 : 1\))' \"\$run", notify_src)
     differ = []

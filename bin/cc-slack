@@ -105,6 +105,10 @@ RUN_TS_RE = re.compile(r"^[0-9]{6,12}\.[0-9]{1,9}$")           # a card ts, and 
 RUN_TIMEOUT = 900                                              # seconds an approved command may run before it is killed and reported as exit 124
 RUN_TAIL = 1500                                                # characters of its output the owner's DM shows (never #approvals: members read it)
 RUN_LINE = "Your 👍 runs this once on the box; the exit code comes back here and the output in your DM"   # cc-notify --run writes these words; the selfcheck holds the two to each other
+# Slack stores a posted emoji as its :name:, so conversations.history hands a run card back as ":closed_lock_with_key:
+# *Approval needed:* … Your :+1: runs this …" and never with the glyphs cc-notify sent: 0 of 7 approved cards ran
+# (09-25..27). run_card_refusal reads the card and the tail it expects through this one table, both sides alike.
+SLACK_STORED_EMOJI = {":closed_lock_with_key:": "🔐", ":+1:": "👍", ":thumbsup:": "👍", ":question:": "❓"}
 RUN_CLAIM = "hourglass_flowing_sand"                            # the bot's own reaction on a run card, placed before its command starts: Slack's record that it ran
 # NAME=value, NAME: value and "NAME":"value" (credentials JSON), masked in what a run reports; NTFY_TOPIC is a secret too.
 # The value may be quoted either way (API_KEY='…', YAML password: '…') and is masked whole, spaces and all; an
@@ -149,7 +153,7 @@ PR_RE = re.compile(r"^\[([a-z0-9_-]+)\] PR #([0-9]+):")
 # only one an authorization can be read off.
 APPROVAL_RE = re.compile(r"🔐 \*Approval needed:\* \[([a-z0-9_-]+)\] PR #([0-9]+)\b")
 RETURN_RE = re.compile(r"^(?:<#[A-Z0-9]+(?:\|[^>]*)?>\s+)?\[return\] (\S+):")   # cc-model's card (its card_text): a 👍 on it runs `cc-model return <window>`
-QUEUE_TTL = 4 * 3600                                                # a message queued for a session that never came up is dropped (and the owner told) after 15 min
+QUEUE_TTL = 4 * 3600                                                # a message queued for a session that never came up is dropped (and the owner told) after 4 h
 SECRET_RE = re.compile(r"(xox[abpsr]-[A-Za-z0-9-]+|Authorization:\s*\S+(?:\s+\S+)?|Bearer\s+[A-Za-z0-9._~+/=-]{8,}"
                         r"|AKIA[0-9A-Z]{12,}|gh[pousr]_[A-Za-z0-9]{20,})")   # what a tool preview relayed to Slack must never carry
 BROADCAST = ("here", "channel", "everyone", "group")          # left as literal text: the box does not notify a whole channel
@@ -3460,6 +3464,20 @@ def mail_outbound():
 
 DOCS_WAIT = 280   # under cc-docs' own MEMBER_WAIT, so the workspace hears this answer rather than its own timeout
 
+REQUESTS = f"{HOME}/.cc/requests"   # cc-notify's planner requests, one JSON file each; an answered one may move to closed/
+
+def request_on_file(frm, title, since):
+    """The id of a planner request cc-notify filed from `frm` under `title` at or after `since` (its own
+    %Y-%m-%dT%H:%M:%SZ stamp, compared at that resolution, the same second included), open or answered; else None."""
+    for f in glob.glob(f"{REQUESTS}/*.json") + glob.glob(f"{REQUESTS}/closed/*.json"):
+        try:
+            rec = json.load(open(f))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("from") == frm and rec.get("title") == title and str(rec.get("at") or "") >= since:
+            return str(rec.get("id") or os.path.basename(f)[:-5])
+    return None
+
 def run_docs(h, ask):
     """`cc-docs member <h>` beside this script, the ask on stdin, its JSON answer back — or why there was none."""
     exe = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-docs")
@@ -3469,7 +3487,8 @@ def run_docs(h, ask):
         res = json.loads((p.stdout.strip().splitlines() or ["null"])[-1])
     except Exception as e:
         return {"ok": False, "error": f"nothing filed — the register did not answer ({str(e)[:160]})"}
-    return res if isinstance(res, dict) else {"ok": False, "error": "nothing filed — the register gave no answer"}
+    return res if isinstance(res, dict) else {"ok": False, "error": "nothing filed — the register gave no answer "
+                                              f"(exit {p.returncode}: {(p.stderr or '').strip()[-160:]})"}
 
 def mail_tap(cfg, chat, thread, text="", path="", ts=None):
     """Offers one already-sent Slack post to milestone 4 (outbound). A top-level post (empty `thread`) is
@@ -3658,6 +3677,7 @@ class Daemon:
         self.grant_posts = {}                               # target -> [t, …] of its recent grant cards (relay_grant's window)
         self.grant_judging = set()                          # ids handed to the approver, not yet applied or carded (new_rid skips them)
         self.proj_said = set()                              # (ws, dir) already logged as refused by projects_sweep, so a bad folder name doesn't log every 15 min
+        self.hello_said = set()                             # (peer pid, why) of a refused hello already logged: a dead session's channel server re-sends it every 3 s (156k of 158k journal lines in 41 h)
         self.bot_user = None
         self.pair_wakes = {}                                # frozenset of two seats -> [(t, sender seat), …] (pingpong)
         self.bot_id = None                                  # our own B… id: bot-authored posts carry bot_id and no user
@@ -3744,6 +3764,19 @@ class Daemon:
                 threading.Thread(target=self.handle_conn, args=(c, h), daemon=True).start()
             except Exception as e:
                 log(f"accept_member {h}: {e!r}"); time.sleep(1)
+
+    def refusal_news(self, what, peer, why):
+        """Should this socket refusal be logged? A refused hello once per calling process and reason (hello_said);
+        every other refusal, and a hello from a peer the kernel would not name, every time."""
+        if what != "hello" or not peer:
+            return True
+        if len(self.hello_said) > 4096:
+            self.hello_said.clear()
+        key = (peer[0], why)
+        if key in self.hello_said:
+            return False
+        self.hello_said.add(key)
+        return True
 
     def peer_of(self, c):
         """(pid, uid, cwd) of whoever connected, from the kernel — never from what they sent. cwd is None when unreadable."""
@@ -4147,9 +4180,20 @@ class Daemon:
             if not text:
                 return {"ok": False, "error": "an escalation needs something to say"}
             # no priority crosses the boundary: what the words buy is decided out here.
-            r = EFFECTS.run([f"{BIN}/cc-notify", "-t", f"{h}: {title}", "--ask", "--from", h, "--", text],
-                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)   # --from: the socket's workspace names the asker, so the answer finds #<h>
-            log(f"escalate {h}: {title} rc={r.returncode}")
+            since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())   # cc-notify stamps `at` to the second, so this compares as seconds
+            try:
+                r = EFFECTS.run([f"{BIN}/cc-notify", "-t", f"{h}: {title}", "--ask", "--from", h, "--", text],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)   # --from: the socket's workspace names the asker, so the answer finds #<h>
+            except subprocess.TimeoutExpired:
+                r = types.SimpleNamespace(returncode=124, stdout="", stderr="cc-notify did not return in 60 s")
+            # THE FILE IS THE REQUEST (cc-notify writes it before the broker hands it on): a cc-notify that timed out or
+            # whose broker did not take it may still have filed it — once one had been answered in 39 s while its
+            # member was told the escalation failed. So a failure is reported only when no file of this ask exists.
+            filed = request_on_file(h, f"{h}: {title}", since) if r.returncode != 0 else None
+            log(f"escalate {h}: {title} rc={r.returncode}{f' but on file as {filed}' if filed else ''}")
+            if filed:
+                return {"ok": True, "text": f"the box's planning seat has it (request {filed}, on file although cc-notify "
+                                            f"exited {r.returncode}); it answers in #{h}, or asks the owner itself"}
             if r.returncode != 0:
                 return {"ok": False, "error": ((r.stderr or r.stdout or "").strip()[-300:]) or "cc-notify reached nobody"}
             return {"ok": True, "text": f"the box's planning seat has it (request {(r.stdout or '').strip()[-60:] or '?'}); it answers in #{h}, or asks the owner itself"}
@@ -4314,7 +4358,8 @@ class Daemon:
         """A workspace's `cc-docs file` or `number`, made out here, where the register is writable. `cc-docs member`
         decides all of it (its member_ask); this hands it the handle read off the socket, never one from the ask."""
         res = run_docs(h, ask)
-        log(f"docs {h}: {str((ask or {}).get('op') if isinstance(ask, dict) else '?')[:10]} ok={res.get('ok')}")
+        why = "" if res.get("ok") else f" — {str(res.get('error') or 'no reason given')[:200]}"   # a bare ok=False told nobody why
+        log(f"docs {h}: {str((ask or {}).get('op') if isinstance(ask, dict) else '?')[:10]} ok={res.get('ok')}{why}")
         return res
 
     def handle_conn(self, c, member=None):
@@ -4322,10 +4367,12 @@ class Daemon:
         conn = None
         try:
             first = json.loads(f.readline() or b"{}")
-            why = self.refuse_reason(first, member, self.peer_of(c))
+            peer = self.peer_of(c)
+            why = self.refuse_reason(first, member, peer)
             if why:
                 what = next(iter(first), "?") if isinstance(first, dict) else type(first).__name__
-                log(f"socket{'/' + member if member else ''}: refused {what} — {why}")
+                if self.refusal_news(what, peer, why):
+                    log(f"socket{'/' + member if member else ''}: refused {what} — {why}")
                 c.sendall((json.dumps({"ok": False, "error": why}) + "\n").encode()); return
             verb = self.verbs_of(first)[0]   # refuse_reason let exactly one through: THAT is what runs, not whatever key comes first below
             if member and verb in self.MEMBER_VERBS:
@@ -8748,10 +8795,15 @@ def run_approved_argv(chat, ts):
 
 def run_card_tail(cmd, sha):
     """The exact end of a run card, as cc-notify --run builds it: the command, escaped as Slack keeps it, in a code block,
-    then RUN_LINE and the stamp. A card is run only if its text ENDS with this, so a stamp or a code block that
+    then RUN_LINE and the stamp. A card is run only if its text ENDS with this (both read through run_card_glyphs,
+    since Slack hands the card back with :+1: for 👍), so a stamp or a code block that
     somebody else's words carry in the middle of a card (a PR title on a merge card) matches nothing."""
     shown = cmd.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return f"\n```\n{shown}\n```\n{RUN_LINE} · `run:{sha[:16]}`"
+
+def run_card_glyphs(text):
+    """text with each :name: Slack stores for an emoji (SLACK_STORED_EMOJI) put back as the glyph it was sent as."""
+    return re.sub("|".join(map(re.escape, SLACK_STORED_EMOJI)), lambda m: SLACK_STORED_EMOJI[m.group(0)], text)
 
 RUN_CFG_KEYS = ("SLACK_BOT_TOKEN", "SLACK_OWNER_ID", "SLACK_APPROVALS")
 
@@ -8842,7 +8894,7 @@ def run_card_refusal(cfg, chat, ts):
         return "the command on file was changed after the card went out (its sha256 no longer matches)", None, True
     if msg.get("edited"):
         return "the card was edited after it went out", None, True
-    text, tail = msg.get("text") or "", run_card_tail(cmd, sha)
+    text, tail = run_card_glyphs(msg.get("text") or ""), run_card_glyphs(run_card_tail(cmd, sha))
     if "🔐 *Approval needed:*" not in text or not text.endswith(tail):
         return "the card does not end with this command and its run: stamp", None, True
     # cc-notify refuses both before it posts; they are asked again here because a card need not have come from it
