@@ -13,10 +13,11 @@ THE PASSES, each given only the slice of the snapshot it needs:
               Each class is counted, and the day's counts go into nudge-counts.jsonl so the report shows a trend.
               A message that fits no class is `other`; three or more `other`s under one proposed name are a finding.
   2 failures  failures.jsonl (already folded per kind), the red or slow landings in landings.jsonl and the loops
-              with failed iterations, grouped by kind here and merged into patterns by the model. A pattern also
+              with failed iterations, grouped by kind here and merged into patterns by the model. A pattern's id is
+              failure:<ledger kind>, or failure:landing:<what> / failure:loop:<what> for the other two. A pattern also
               seen in an earlier report of the last seven says on how many days it recurred.
   3 fixes     the owner's own move: the worst few measures from passes 1-2, the landed fixes meant to move each
-              (~/.cc/state/improve/fixes.jsonl, which the improve seat may keep, plus the last 30 days of commit
+              (~/.cc/state/improve/fixes.jsonl, which the improve seat may keep, rows naming a source above only, plus the last 30 days of commit
               subjects in ~/dev/<repo> for the repos IMPROVE_BATCH_REPOS names and those the measures touch, three at
               most), what trace each fix leaves when it runs,
               that trace counted in the snapshot, and a judge on whether a fix with no trace went quiet or simply had
@@ -37,10 +38,12 @@ line: {day, id, pass, class, title, evidence, cost, freq, score, tier}. `cost` i
 and failures, 2 ideas), then by score. <day> is the snapshot's own name, and a second run replaces that day's files
 and counts.
 
-  cc-improve-batch [SNAPSHOT] [--out DIR]   SNAPSHOT is a snapshot's name or path; default the `latest` one.
+  cc-improve-batch [SNAPSHOT] [--out DIR]   SNAPSHOT is a snapshot's name or path; default the `latest` one, refused
+                                            (exit 2) when over 26 h old, as cc-collect then hasn't run.
                                             Prints where it wrote and what the day cost
   cc-improve-batch selfcheck                a stubbed model in a HOME of its own, never this box's
 """
+import calendar
 import glob
 import json
 import os
@@ -50,6 +53,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta
 
 BIN = os.path.dirname(os.path.realpath(__file__))
@@ -58,6 +62,8 @@ SOURCES = ("slack", "outbox", "landings", "board", "failures", "loops", "journal
 NUDGE_CHUNK = 120            # owner messages per nudge call
 SLOW_LANDING = 3600          # seconds from queue to done that count as a slow landing
 WORST = 4                    # measures pass 3 checks fixes for
+STALE = 26 * 3600            # a `latest` snapshot older than this is yesterday's run left over: cc-collect didn't run
+CALL_TIMEOUT = 900           # seconds one model call may take
 TIER = {"fixes": 0, "nudges": 1, "failures": 1, "ideas": 2}
 PASS_MODEL = {"nudges": ("IMPROVE_BATCH_MODEL", "sonnet"), "failures": ("IMPROVE_BATCH_SMALL_MODEL", "haiku"),
               "fixes-pick": ("IMPROVE_BATCH_MODEL", "sonnet"), "fixes-judge": ("IMPROVE_BATCH_JUDGE_MODEL", "opus"),
@@ -128,7 +134,7 @@ class Models:
                                 "--setting-sources", "", "--disable-slash-commands", "--max-turns", "1",
                                 "--no-session-persistence", "--output-format", "json",
                                 "--max-budget-usd", f"{left:.2f}"],
-                               input=prompt, capture_output=True, text=True, timeout=900, env=env, cwd=self.workdir)
+                               input=prompt, capture_output=True, text=True, timeout=CALL_TIMEOUT, env=env, cwd=self.workdir)
             d = json.loads(p.stdout)
         except (OSError, ValueError, subprocess.TimeoutExpired) as e:
             raise ModelFailed(f"{model}: {cut(e, 160)}")
@@ -315,7 +321,9 @@ def pass_failures(snap, models, out, day, notes, errors):
         done.update(keys)
         gs = [by[k] for k in keys]
         cost = p.get("cost") if p.get("cost") in (1, 2, 3) else 1
-        findings.append({"id": "failure:" + keys[0].split(":", 1)[1], "pass": "failures", "class": keys[0].split(":")[0],
+        # a ledger kind keeps its own name; a landing or loop group keeps its prefix, so `again` and `landing:again` differ
+        fid = keys[0] if keys[0].startswith("failure:") else "failure:" + keys[0]
+        findings.append({"id": fid, "pass": "failures", "class": keys[0].split(":")[0],
                          "title": cut(p.get("pattern") or keys[0], 200), "cost": cost, "freq": sum(g["n"] for g in gs),
                          "keys": keys, "recurred_days": max(g["days_seen_before"] for g in gs),
                          "repos": sorted({r for g in gs for r in g["repos"]}),
@@ -362,6 +370,8 @@ def vocabulary(snap):
 
 
 def trace_hits(snap, source, regex):
+    if source not in SOURCES:
+        return None, []
     try:
         rx = re.compile(regex, re.I)
     except (re.error, TypeError):
@@ -395,7 +405,8 @@ def pass_fixes(snap, models, day, found, notes, errors):
         if r not in repos:
             repos.insert(0, r)
     subjects = commit_subjects(repos, day)
-    picks = [dict(r, origin="registry") for r in registry]
+    # a registry row is the improve seat's hand-kept file, so it is held to what a model pick is: a known source
+    picks = [dict(r, origin="registry") for r in registry if r.get("source") in SOURCES]
     try:
         prompt = ("PASS: fixes-pick\nFor each measure below, name the landed changes (from the commit subjects) that were meant "
                   "to move it, at most four each, and for each the trace it leaves in the day's snapshot when it runs: which "
@@ -482,7 +493,7 @@ def pass_ideas(models, found, checks, notes, errors):
         findings.append({"id": f"idea:{i + 1}", "pass": "ideas", "class": "idea", "title": cut(x["title"], 200),
                          "cost": x.get("cost") if x.get("cost") in (1, 2, 3) else 1, "freq": freq,
                          "evidence": [cut(x.get("why"), 240), "addresses " + ", ".join(map(str, x.get("addresses") or []))]})
-    notes["ideas"] = f"{len(findings)} ideas"
+    notes["ideas"] = f"{min(len(findings), 4)} ideas kept of {len(findings)} returned"
     return findings[:4]
 
 
@@ -533,6 +544,16 @@ def run(snapshot, out):
     if not os.path.isfile(os.path.join(snap, "index.json")):
         print(f"cc-improve-batch: no snapshot at {snap} (run cc-collect first)", file=sys.stderr)
         return 2
+    if snapshot == "latest":
+        try:
+            with open(os.path.join(snap, "index.json")) as f:
+                gen = calendar.timegm(time.strptime(json.load(f)["generated"], "%Y-%m-%dT%H:%M:%SZ"))
+        except (OSError, ValueError, KeyError, TypeError):
+            gen = os.path.getmtime(os.path.join(snap, "index.json"))
+        if time.time() - gen > STALE:
+            print(f"cc-improve-batch: the latest snapshot {os.path.basename(snap)} is over {STALE // 3600} h old, so cc-collect "
+                  "has not run since; nothing spent", file=sys.stderr)
+            return 2
     tier = subprocess.run([os.path.join(BIN, "cc-tier"), "allows", "goals"], capture_output=True, text=True)
     if tier.returncode == 1:
         print(f"cc-improve-batch: the spend tier holds it, nothing spent ({cut(tier.stderr, 120)})")
@@ -675,7 +696,7 @@ def selfcheck():
              "where are we" in nud and '"hi"' not in nud and "context-over-band" not in nud and "keep status checks" in nud)
         case("failures: two groups merged into one pattern at cost 2, the rest kept one per group",
              by.get("failure:spend/context-over-band", {}).get("freq") == 6 and by["failure:spend/context-over-band"]["cost"] == 2
-             and "failure:notification/false-action-needed" in by and "failure:again" in by and "failure:slow" in by)
+             and "failure:notification/false-action-needed" in by and "failure:landing:again" in by and "failure:landing:slow" in by)
         pick = calls()[2]["prompt"]
         case("the fix picker saw the day's commit subjects, not a later one's, and what the snapshot prints",
              "progress push on row change" in pick and "a later fix" not in pick and "landings event names: again" in pick)
@@ -732,6 +753,76 @@ def selfcheck():
             f.write("CC_SPEND_TIER=moderate\n")
         rc, out = main_(snap)
         case("under the moderate tier it runs", rc == 0 and len(calls()) == 5)
+
+        # 6. a `latest` snapshot cc-collect left yesterday is refused; the same snapshot named outright still runs
+        h, snap = fixture()
+        homes.append(h)
+        os.symlink("2026-01-10", os.path.join(h, ".cc", "state", "improve", "snapshots", "latest"))
+        with open(os.path.join(snap, "index.json"), "w") as f:
+            json.dump({"generated": "2026-01-10T23:50:00Z"}, f)
+        rc, out = main_()
+        case("a `latest` over 26 h old: exit 2, says cc-collect hasn't run, no model call",
+             rc == 2 and "has not run" in out and not calls())
+        rc, out = main_("2026-01-10")
+        case("the same old snapshot named outright still runs", rc == 0 and len(calls()) == 5)
+        with open(os.path.join(snap, "index.json"), "w") as f:
+            json.dump({"generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, f)
+        open(os.environ["STUB_LOG"], "w").close()
+        rc, out = main_()
+        case("a `latest` generated now runs", rc == 0 and len(calls()) == 5)
+
+        # 7. in-process, with a fake model: registry rows, failure ids, the ideas note
+        class Fake:
+            def __init__(self, replies):
+                self.replies, self.asked = replies, []
+
+            def ask(self, pass_name, prompt):
+                self.asked.append(pass_name)
+                return self.replies.get(pass_name, [])
+
+        h, snap = fixture()
+        homes.append(h)
+        with open(os.path.join(os.path.dirname(snap), "x.jsonl"), "w") as f:
+            f.write('{"text": "progress: outside the snapshot"}\n')
+        with open(os.path.join(h, ".cc", "state", "improve", "fixes.jsonl"), "w") as f:
+            for row in ({"measure": "m:a", "fix": "kept", "source": "outbox", "regex": "progress:"},
+                        {"measure": "m:a", "fix": "no source", "regex": "progress:"},
+                        {"measure": "m:a", "fix": "escapes", "source": "../x", "regex": "progress:"},
+                        {"measure": "m:a", "fix": "not a source", "source": "index", "regex": "."}):
+                f.write(json.dumps(row) + "\n")
+        found = [{"id": "m:a", "pass": "nudges", "title": "a", "cost": 2, "freq": 3}]
+        try:
+            q, ch = pass_fixes(snap, Fake({}), "2026-01-10", found, {}, {})
+            fixes = [c["fix"] for c in ch]
+        except Exception as e:  # noqa: BLE001 - the crash is what this case looks for
+            fixes = [f"crashed: {e!r}"]
+        case("registry rows: one with a known source is checked; no source, ../x and a non-source are dropped", fixes == ["kept"])
+        case("trace_hits refuses a source outside SOURCES", trace_hits(snap, "../x", "progress")[0] is None
+             and trace_hits(snap, "outbox", "progress")[0] == 1)
+
+        with open(os.path.join(snap, "failures.jsonl"), "w") as f:
+            f.write(json.dumps({"kind": "again", "n": 1, "repo": "r"}) + "\n")
+        fs7 = pass_failures(snap, Fake({}), os.path.join(h, "out7"), "2026-01-10", {}, {})
+        ids = [f["id"] for f in fs7]
+        case("ledger kind `again` and landing `again` stay two findings: failure:again and failure:landing:again",
+             "failure:again" in ids and "failure:landing:again" in ids and len(ids) == len(set(ids)))
+
+        notes = {}
+        six = [{"title": f"idea {i}", "cost": 1, "freq": 1} for i in range(6)]
+        got = pass_ideas(Fake({"ideas": six}), found, [], notes, {})
+        case("ideas: six returned, four kept, and the note says both", len(got) == 4 and notes["ideas"] == "4 ideas kept of 6 returned")
+        notes = {}
+        got = pass_ideas(Fake({"ideas": six[:2]}), found, [], notes, {})
+        case("ideas: two returned, both kept", len(got) == 2 and notes["ideas"] == "2 ideas kept of 2 returned")
+
+        # 8. the service's start timeout covers the worst case the code can make
+        unit = os.path.join(os.path.dirname(BIN), "config", "systemd-user", "cc-improve-batch.service")
+        if os.path.exists(unit):
+            m = re.search(r"^TimeoutStartSec=(\d+)$", open(unit).read(), re.M)
+            worst = (4 + -(-600 // NUDGE_CHUNK)) * CALL_TIMEOUT
+            case(f"TimeoutStartSec covers 4 calls plus nudge chunks for 600 owner messages ({worst} s)",
+                 m and int(m.group(1)) >= worst)
+            case("the service orders itself after cc-collect", re.search(r"^After=cc-collect\.service$", open(unit).read(), re.M))
     finally:
         for k, v in keep.items():
             if v is None:
