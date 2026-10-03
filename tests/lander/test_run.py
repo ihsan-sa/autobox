@@ -495,11 +495,11 @@ class Admission(unittest.TestCase):
         with A.slot(st, psi_root=calm, k=2) as a, A.slot(st, psi_root=calm, k=2) as b:
             self.assertEqual(sorted(a + b), [1, 2])
             with self.assertRaises(TimeoutError):
-                with A.slot(st, psi_root=calm, k=2, poll=0.05, deadline=0.2):
+                with A.slot(st, psi_root=calm, k=2, poll=0.05, deadline=0.2, say=lambda _: None):
                     pass
         with A.slot(st, psi_root=calm, k=2) as a:
             with self.assertRaises(TimeoutError):
-                with A.slot(st, alone=True, psi_root=calm, k=2, poll=0.05, deadline=0.2):
+                with A.slot(st, alone=True, psi_root=calm, k=2, poll=0.05, deadline=0.2, say=lambda _: None):
                     pass
         with A.slot(st, alone=True, psi_root=calm, k=2) as held:
             self.assertEqual(held, [1, 2])
@@ -514,7 +514,8 @@ class Admission(unittest.TestCase):
         with A.slot(st, psi_root=calm, k=2) as one:   # slot 1 is busy
             self.assertEqual(one, [1])
             waiting = threading.Thread(target=lambda: self.assertRaises(
-                TimeoutError, lambda: A.slot(st, alone=True, psi_root=calm, k=2, poll=0.05, deadline=0.6).__enter__()))
+                TimeoutError, lambda: A.slot(st, alone=True, psi_root=calm, k=2, poll=0.05, deadline=0.6,
+                                             say=lambda _: None).__enter__()))
             waiting.start()
             time.sleep(0.2)   # the alone run is polling now
             with open(os.path.join(st, "slots", "slot.2"), "a") as f:
@@ -524,6 +525,253 @@ class Admission(unittest.TestCase):
         with A.slot(st, alone=True, psi_root=calm, k=2) as held:   # both free: it takes both, in order
             self.assertEqual(held, [1, 2])
 
+    def _waiter(self, st, said, got, **kw):
+        """A check waiting in another thread, as a worker's green run does beside the lane: it holds what it gets
+        until `got` is set back."""
+        import threading
+
+        def go():
+            with A.slot(st, poll=0.02, deadline=5, say=said.append, **kw) as held:
+                got["held"] = held
+                got["in"].set()
+                got["out"].wait(5)
+        got.update({"in": threading.Event(), "out": threading.Event()})
+        t = threading.Thread(target=go)
+        t.start()
+        return t
+
+    def _until(self, cond, secs=3.0):
+        import time
+        end = time.monotonic() + secs
+        while not cond() and time.monotonic() < end:
+            time.sleep(0.01)
+        return cond()
+
+    def test_a_waiting_run_gets_the_slot_before_the_lane_takes_it_back(self):
+        # brief: "a waiting green run getting a slot while a lane holds one", and "a log line written while it waits"
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        hot = self.psi_dir(90, 0)   # memory pressure: slot 1 alone admits
+        said, got = [], {}
+        lane = A.slot(st, psi_root=hot, k=3)
+        self.assertEqual(lane.__enter__(), [1])
+        t = self._waiter(st, said, got, psi_root=hot, k=3, who="green@abc")
+        self.assertTrue(self._until(lambda: said))   # it says so while it waits, not after
+        self.assertRegex(said[0], r"green@abc waiting since \d\d:\d\dZ \(0 min\) for one of slots 1-1 \(load admits 1 of 3\); 0 waiting")
+        self.assertFalse(got["in"].is_set())
+        lane.__exit__(None, None, None)
+        # the lane comes straight back for a slot: it waits behind the green run instead of taking slot 1 again
+        with self.assertRaises(TimeoutError):
+            with A.slot(st, psi_root=hot, k=3, poll=0.02, deadline=0.3, say=lambda _: None):
+                pass
+        self.assertTrue(got["in"].wait(3))
+        self.assertEqual(got["held"], [1])
+        got["out"].set()
+        t.join()
+        with A.slot(st, psi_root=hot, k=3, deadline=1) as again:   # and once it is done, the lane's turn comes
+            self.assertEqual(again, [1])
+        self.assertEqual([n for n in os.listdir(os.path.join(st, "slots", "queue"))], [])   # no ticket left behind
+
+    def test_an_alone_wait_is_not_starved_by_checks_that_keep_taking_slots(self):
+        # brief: "an alone=True wait that isn't blocked forever by in-order slots"
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        calm = self.psi_dir(0, 0)
+        one, two = A.slot(st, psi_root=calm, k=2), A.slot(st, psi_root=calm, k=2)
+        self.assertEqual(one.__enter__() + two.__enter__(), [1, 2])
+        said, got = [], {}
+        t = self._waiter(st, said, got, alone=True, psi_root=calm, k=2)
+        self.assertTrue(self._until(lambda: said))
+        self.assertIn("for all 2 slots (alone)", said[0])
+        one.__exit__(None, None, None)
+        # slot 1 freed: a check that came later does not get it, so the alone run is not passed over
+        with self.assertRaises(TimeoutError):
+            with A.slot(st, psi_root=calm, k=2, poll=0.02, deadline=0.3, say=lambda _: None):
+                pass
+        self.assertFalse(got["in"].is_set())   # still waiting for slot 2, and holding slot 1 meanwhile
+        two.__exit__(None, None, None)
+        with self.assertRaises(TimeoutError):   # slot 2 freed: still nobody else's
+            with A.slot(st, psi_root=calm, k=2, poll=0.02, deadline=0.3, say=lambda _: None):
+                pass
+        self.assertTrue(got["in"].wait(3))
+        self.assertEqual(got["held"], [1, 2])
+        got["out"].set()
+        t.join()
+
+    def test_a_dead_waiters_ticket_holds_nobody_up(self):
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        q = os.path.join(st, "slots", "queue")
+        os.makedirs(q)
+        dead = os.path.join(q, f"{1:020d}-1-0000dead")   # older than any live wait, and nobody holds its lock
+        open(dead, "a").close()
+        with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=lambda _: None) as held:
+            self.assertEqual(held, [1])
+        self.assertFalse(os.path.exists(dead))
+        import time
+        live = open(os.path.join(q, f"{time.time_ns() - 120 * 10**9:020d}-4242-0000beef"), "a")   # a live waiter ahead
+        fcntl.flock(live, fcntl.LOCK_EX)
+        self.addCleanup(live.close)
+        said = []
+
+        def say(line):
+            said.append(line)
+            raise BrokenPipeError("stderr is gone")   # and a gone stderr does not take the wait down
+        with self.assertRaises(TimeoutError):
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=0.2, say=say):
+                pass
+        self.assertTrue(os.path.exists(live.name))   # kept, and it goes first
+        self.assertIn("1 waiting ahead of it, the oldest pid 4242, 2 min", said[0])
+
+    def test_a_stopped_waiter_is_passed_after_the_cap_and_said(self):
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        q = os.path.join(st, "slots", "queue")
+        os.makedirs(q)
+        stuck = open(os.path.join(q, f"{10**9:020d}-77-5e1f5e1f"), "a")   # locked since 1970: a SIGSTOPped waiter
+        fcntl.flock(stuck, fcntl.LOCK_EX)
+        self.addCleanup(stuck.close)
+        said = []
+        with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=said.append) as held:
+            self.assertEqual(held, [1])
+        self.assertEqual(len(said), 1)
+        self.assertRegex(said[0], r"no longer waits on ticket \d+-77-5e1f5e1f \(pid 77, \d+ min\): older than 12 h")
+
+    def test_a_stuck_ticket_is_said_once_however_long_the_wait(self):
+        # slot 1 stays busy across many polls: the stuck ticket is passed each time but said only the first; and a
+        # closed stderr (ValueError, not OSError) does not take the wait down
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        q = os.path.join(st, "slots", "queue")
+        os.makedirs(q)
+        stuck = open(os.path.join(q, f"{10**9:020d}-77-5e1f5e1f"), "a")
+        fcntl.flock(stuck, fcntl.LOCK_EX)
+        self.addCleanup(stuck.close)
+        hot = self.psi_dir(90, 0)   # memory pressure: slot 1 alone admits
+        lane = A.slot(st, psi_root=hot, k=3, deadline=1, say=lambda _: None)
+        self.assertEqual(lane.__enter__(), [1])
+        self.addCleanup(lane.__exit__, None, None, None)
+        said = []
+
+        def say(line):
+            said.append(line)
+            raise ValueError("I/O operation on closed file")
+        with self.assertRaises(TimeoutError):
+            with A.slot(st, psi_root=hot, k=3, poll=0.02, deadline=0.3, say=say):
+                pass
+        self.assertEqual(len([s for s in said if "no longer waits" in s]), 1)
+        self.assertEqual(len([s for s in said if "waiting since" in s]), 1)   # WAIT_SAY is 600 s: said once too
+
+    def test_a_name_no_ticket_has_holds_nobody_up_and_is_never_said(self):
+        # a locked '!hold' sorts before every real ticket; taken for one, it blocked every waiter with no cap
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        q = os.path.join(st, "slots", "queue")
+        os.makedirs(q)
+        for name in ("!hold", f"{1:020d}-1-nothex!!", f"{1:020d}-1-0000beef\nforged", f".new-{1:020d}-x-00000001"):
+            f = open(os.path.join(q, name), "a")
+            fcntl.flock(f, fcntl.LOCK_EX)
+            self.addCleanup(f.close)
+        said = []
+        with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=0.3, say=said.append) as held:
+            self.assertEqual(held, [1])
+        self.assertEqual(said, [])
+
+    def test_out_of_fds_a_ticket_ahead_keeps_its_place(self):
+        # EMFILE, ENFILE or ENOMEM opening a live ticket says nothing about the ticket: it is counted, never removed
+        import errno
+        import time
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        q = os.path.join(st, "slots", "queue")
+        os.makedirs(q)
+        ahead = f"{time.time_ns() - 60 * 10**9:020d}-4242-0000beef"
+        live = open(os.path.join(q, ahead), "a")
+        fcntl.flock(live, fcntl.LOCK_EX)
+        self.addCleanup(live.close)
+        real = os.open
+        for e in (errno.EMFILE, errno.ENFILE, errno.ENOMEM):
+            def fake(p, *a, e=e):
+                if os.path.basename(p) == ahead:
+                    raise OSError(e, os.strerror(e))
+                return real(p, *a)
+            with mock.patch.object(A.os, "open", side_effect=fake):
+                n, oldest, stale = A._ahead(q, f"{time.time_ns():020d}-1-00000001")
+            self.assertEqual((n, oldest, stale), (1, ahead, []), errno.errorcode[e])
+            self.assertTrue(os.path.exists(live.name))
+        real_flock = fcntl.flock
+
+        def no_locks(fd, op):   # flock fails for want of a lock, not because the ticket is held
+            raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+        dead = os.path.join(q, f"{time.time_ns() - 90 * 10**9:020d}-4343-0000dead")   # unlocked, but unknowable
+        open(dead, "a").close()
+        with mock.patch.object(A.fcntl, "flock", side_effect=no_locks):
+            n, oldest, stale = A._ahead(q, f"{time.time_ns():020d}-1-00000001")
+        self.assertEqual((n, oldest), (2, os.path.basename(dead)))
+        self.assertTrue(os.path.exists(dead) and os.path.exists(live.name))
+        self.assertIs(fcntl.flock, real_flock)
+
+    def test_junk_in_the_queue_is_removed_never_waited_on_or_followed(self):
+        import time
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        q = os.path.join(st, "slots", "queue")
+        os.makedirs(q)
+        old = f"{1:020d}"
+        os.mkdir(os.path.join(q, f"{old}-1-00000001"))
+        os.mkfifo(os.path.join(q, f"{old}-2-00000002"))   # open(p, "a") on this blocked in the kernel
+        target = os.path.join(st, "planted")
+        os.symlink(target, os.path.join(q, f"{old}-3-00000003"))   # followed, it made its target
+        loop = os.path.join(q, f"{old}-4-00000004")
+        os.symlink(loop, loop)
+        shut = os.path.join(q, f"{old}-5-00000005")
+        open(shut, "w").close()
+        os.chmod(shut, 0)
+        crashed = os.path.join(q, f".new-{old}-6-00000006")   # a crash between _ticket's open and its rename
+        open(crashed, "w").close()
+        os.utime(crashed, (time.time() - 600,) * 2)
+        fresh = os.path.join(q, f".new-{time.time_ns():020d}-7-00000007")   # may be mid-rename: left alone
+        open(fresh, "w").close()
+        with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=lambda _: None) as held:
+            self.assertEqual(held, [1])
+        self.assertEqual(os.listdir(q), [os.path.basename(fresh)])
+        self.assertFalse(os.path.lexists(target))
+
+    def test_an_alone_waiter_lets_go_when_an_older_ticket_turns_up(self):
+        # _ticket names a ticket before it is listed, so one can land older than the head: an alone waiter holding
+        # slot 1 then waits on a waiter that needs slot 1, forever, unless it lets go
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        calm = self.psi_dir(0, 0)
+        os.makedirs(os.path.join(st, "slots"))
+        two = open(os.path.join(st, "slots", "slot.2"), "a")
+        fcntl.flock(two, fcntl.LOCK_EX)   # slot 2 is busy
+        self.addCleanup(two.close)
+        said, got = [], {}
+        t = self._waiter(st, said, got, alone=True, psi_root=calm, k=2)
+        self.addCleanup(lambda: (got["out"].set(), t.join()))
+        slot1 = os.path.join(st, "slots", "slot.1")
+
+        def free(path):
+            with open(path, "a") as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return True
+                except BlockingIOError:
+                    return False
+        self.assertTrue(self._until(lambda: not free(slot1)))   # it took slot 1 and waits for slot 2
+        q = os.path.join(st, "slots", "queue")
+        (head,) = os.listdir(q)
+        older_name = os.path.join(q, f"{int(head.split('-')[0]) - 1:020d}-1-00000001")   # just older than the head
+        older = open(older_name, "a")
+        fcntl.flock(older, fcntl.LOCK_EX)
+        self.assertTrue(self._until(lambda: free(slot1)))   # it let slot 1 go to the older ticket
+        older.close()
+        os.unlink(older_name)
+        two.close()
+        self.assertTrue(got["in"].wait(3))
+        self.assertEqual(got["held"], [1, 2])
+
     def test_under_pressure_only_slot_one_admits(self):
         st = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(st))
@@ -531,7 +779,7 @@ class Admission(unittest.TestCase):
         with A.slot(st, psi_root=hot, k=3) as a:
             self.assertEqual(a, [1])
             with self.assertRaises(TimeoutError):
-                with A.slot(st, psi_root=hot, k=3, poll=0.05, deadline=0.2):
+                with A.slot(st, psi_root=hot, k=3, poll=0.05, deadline=0.2, say=lambda _: None):
                     pass
 
     def test_high_load_narrows_to_two_and_a_slot_still_admits(self):
@@ -550,7 +798,7 @@ class Admission(unittest.TestCase):
                 A.slot(st, psi_root=calm_psi, k=3, loadavg=hot, deadline=1) as b:
             self.assertEqual((a, b), ([1], [2]))
             with self.assertRaises(TimeoutError):
-                with A.slot(st, psi_root=calm_psi, k=3, loadavg=hot, poll=0.05, deadline=0.2):
+                with A.slot(st, psi_root=calm_psi, k=3, loadavg=hot, poll=0.05, deadline=0.2, say=lambda _: None):
                     pass
             with A.slot(st, psi_root=calm_psi, k=3, loadavg=calm, deadline=1) as c:
                 self.assertEqual(c, [3])

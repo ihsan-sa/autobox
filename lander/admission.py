@@ -10,6 +10,21 @@ box out of memory. Never 0: a check always gets to run, only later. A diagnostic
 slot at once (alone=True), so it runs by itself; it takes them in order and never past a busy one, because one
 lane now runs several checks at once and two alone runs each holding a slot would wait on each other forever.
 
+FAIR WAIT (2026-10-01/02: worker green runs sat 2-8 h in the poll loop while a lane re-took slot.1 the moment it
+let go). Every wait takes a ticket, a flocked file in `<state>/slots/queue/` named by when it began, and only the
+oldest live ticket may take a slot; it drops the ticket once it holds what it wants. So a waiter is served before
+anyone who came later, the lane included, and an alone run at the head of the queue gets each slot as its holder
+lets go instead of losing it to the next check. Nobody gets more slots than slots_now() allows; the order changes,
+not the count. A ticket whose holder died is unlocked, and the next waiter removes it, as it does anything in the
+queue that is not a regular file. A name _ticket would not have given is ignored, never waited on and never said,
+so a planted `!hold` that sorts first holds nobody up. A ticket it cannot open or lock for want of a file
+descriptor, memory or a lock still counts as live: only a bad entry is removed. A waiter behind another holds no slot,
+or an older ticket that needs it would wait forever. A ticket still locked after TICKET_CAP seconds
+(LANDER_TICKET_CAP, default 12 h, about twice the longest wait a fair queue should see) is taken for a stopped
+waiter and no longer counts, and the waiter that passes it says so. While it waits, slot() writes one line to
+stderr (the run's log) saying what it waits for, since when and whose ticket is oldest, then again every WAIT_SAY
+seconds (LANDER_WAIT_SAY, default 600).
+
 HIGH LOAD (2026-09-28: load 31-80 on 12 cores and 12 GB swapped, checks went from under 5 min to 11-17). overloaded() is
 the one signal for "the box is overloaded": the lander serializes on it and gives its one run priority (below), and
 `cc-room` queues new `--go` workers on the same call until it clears, so the landing queue keeps moving while the
@@ -38,9 +53,13 @@ unrunnable ("box busy") and the lane tries again.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import os
+import re
 import shutil
+import stat
+import sys
 import time
 import uuid
 
@@ -58,6 +77,8 @@ CPU_WEIGHT = "20"
 LOAD_FACTOR = float(os.environ.get("LANDER_LOAD_FACTOR", "2") or 2)
 PSI_DIR = os.environ.get("LANDER_PSI_DIR") or "/proc/pressure"
 LOADAVG = os.environ.get("LANDER_LOADAVG") or "/proc/loadavg"
+WAIT_SAY = float(os.environ.get("LANDER_WAIT_SAY", "600") or 600)
+TICKET_CAP = float(os.environ.get("LANDER_TICKET_CAP", "43200") or 43200)
 
 
 def psi(kind: str, root: str = PSI_DIR) -> float:
@@ -118,20 +139,119 @@ def slots_now(root: str = PSI_DIR, k: int | None = None, loadavg: str | None = N
     return 1 if mem_loaded(root) else min(k, 2)
 
 
+TICKET = re.compile(r"[0-9]{20}-[0-9]+-[0-9a-f]{8}")   # _ticket's names: time_ns-pid-rand
+BAD = (errno.ELOOP, errno.ENXIO, errno.EACCES, errno.EPERM)   # a symlink, a socket, an unreadable file: not a ticket
+
+
+def _ticket(qdir: str):
+    """Join the queue: a file named by when the wait began, flocked for as long as this process waits. It is locked
+    before it is given its listed name, so nobody sees it unlocked and takes it for a dead one."""
+    name = f"{time.time_ns():020d}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    tmp = os.path.join(qdir, f".new-{name}")
+    f = open(tmp, "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    os.rename(tmp, os.path.join(qdir, name))
+    return name, f
+
+
+def _drop(p: str) -> None:
+    with contextlib.suppress(OSError):
+        os.unlink(p)
+    with contextlib.suppress(OSError):
+        os.rmdir(p)
+
+
+def _ahead(qdir: str, mine: str, cap: float | None = None) -> tuple:
+    """-> (n, oldest, stale): how many live tickets are older than mine, the oldest of those, and the live ones past
+    cap seconds, which no longer count. A dead ticket (its flock free) is removed on the way, and so is a ticket-named
+    entry that is not a regular file, or a `.new-` ticket a crash left before its rename. A name _ticket would not
+    have given is skipped."""
+    cap = TICKET_CAP if cap is None else cap
+    n, oldest, stale = 0, None, []
+    for name in sorted(os.listdir(qdir)):
+        if name >= mine:
+            break
+        born = _born(name)
+        if born is None:   # not a ticket's name: never waited on, never said
+            continue
+        p = os.path.join(qdir, name)
+        live = False
+        try:   # never follow a link, never block on a FIFO
+            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            if e.errno in BAD:
+                _drop(p)
+                continue
+            fd, live = None, True   # out of fds or memory: the ticket may well be live, so it keeps its place
+        try:
+            if fd is not None:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    _drop(p)
+                    continue
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:   # locked: a live waiter ahead of this one
+                    live = True
+                except OSError:   # ENOLCK and the like say nothing about the ticket, so it keeps its place
+                    live = True
+            if live:
+                if name.startswith("."):
+                    continue
+                if time.time() - born > cap:
+                    stale.append(name)
+                    continue
+                n += 1
+                oldest = oldest or name
+                continue
+            if not name.startswith(".") or time.time() - st.st_mtime > 60:
+                _drop(p)   # its waiter is gone
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return n, oldest, stale
+
+
+def _born(name: str) -> float | None:
+    """When a ticket's wait began, from its name (time_ns-pid-rand, maybe `.new-` before it), or None when the name
+    is not one _ticket gives."""
+    base = name.removeprefix(".new-")
+    return int(base.split("-")[0]) / 1e9 if TICKET.fullmatch(base) else None
+
+
+def _whose(name: str) -> str:
+    """'pid P, A min' for the wait line; name is one _ahead passed, so a ticket's."""
+    return f"pid {name.split('-')[1]}, {(time.time() - (_born(name) or time.time())) / 60:.0f} min"
+
+
 @contextlib.contextmanager
 def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | None = None, psi_root: str = PSI_DIR,
-         k: int | None = None, loadavg: str | None = None):
-    """Hold one slot (or all of them, alone=True) for the with-block; yields the slot numbers held. Waits, polling,
-    until one admits; deadline (seconds) raises TimeoutError instead of waiting on."""
+         k: int | None = None, loadavg: str | None = None, who: str = "", say=None):
+    """Hold one slot (or all of them, alone=True) for the with-block; yields the slot numbers held. Waits its turn
+    in the queue (FAIR WAIT), polling, until one admits; deadline (seconds) raises TimeoutError instead of waiting
+    on. say(line) is told while it waits; stderr by default."""
     d = os.path.join(state, "slots")
-    os.makedirs(d, exist_ok=True)
+    q = os.path.join(d, "queue")
+    os.makedirs(q, exist_ok=True)
     total = max(1, SLOTS if k is None else k)
-    t0 = time.monotonic()
+    say = say or (lambda line: print(line, file=sys.stderr, flush=True))
+    t0, said, since = time.monotonic(), None, time.strftime("%H:%MZ", time.gmtime())
     held: list = []
+    told: set = set()
+    mine, tf = _ticket(q)
     try:
         while True:
             want = range(1, total + 1) if alone else range(1, slots_now(psi_root, total, loadavg) + 1)
-            for n in want:
+            ahead, oldest, stale = _ahead(q, mine)
+            for name in set(stale) - told:
+                told.add(name)
+                line = (f"lander: {who or 'a check'} no longer waits on ticket {name} ({_whose(name)}): "
+                        f"older than {TICKET_CAP / 3600:g} h, so its waiter is taken for stuck")
+                with contextlib.suppress(OSError, ValueError):   # only say(): a gone or closed stderr
+                    say(line)
+            for n in want if not ahead else ():   # only the oldest waiter takes a slot
                 if n in [h for h, _ in held]:
                     continue
                 f = open(os.path.join(d, f"slot.{n}"), "a")
@@ -148,13 +268,30 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                 break
             if deadline is not None and time.monotonic() - t0 > deadline:
                 raise TimeoutError(f"no lander slot free after {deadline:.0f}s")
-            if not alone:
+            if said is None or time.monotonic() - said >= WAIT_SAY:
+                said = time.monotonic()
+                what = (f"all {total} slots (alone)" if alone
+                        else f"one of slots 1-{len(want)} (load admits {len(want)} of {total})")
+                line = (f"lander: {who or 'a check'} waiting since {since} ({(said - t0) / 60:.0f} min) for {what}; "
+                        f"{ahead} waiting ahead of it" + (f", the oldest {_whose(oldest)}" if oldest else "")
+                        + (f", holding {[h for h, _ in held]}" if held else ""))
+                with contextlib.suppress(OSError, ValueError):   # only say(): a gone or closed stderr
+                    say(line)
+            if not alone or ahead:   # behind someone: hold nothing, or an older ticket needing our slot waits forever
                 for _, f in held:
                     f.close()
                 held = []
             time.sleep(poll)
+        with contextlib.suppress(OSError):
+            os.unlink(os.path.join(q, mine))
+        tf.close()
+        tf = None
         yield [n for n, _ in held]
     finally:
+        if tf is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(q, mine))
+            tf.close()
         for _, f in held:
             f.close()
 

@@ -422,7 +422,8 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
             argv, wd, env, how = _box_argv(check, head, cwd, run_dir, env_extra)
         scope = "-"
         # the laptop's work is the laptop's: it takes no slot of the box's
-        held = contextlib.nullcontext() if kind == "laptop" else A.slot(state or REC.state_dir(), alone=alone)
+        held = contextlib.nullcontext() if kind == "laptop" else A.slot(state or REC.state_dir(), alone=alone,
+                                                                            who=f"{check.name}@{tree_sha[:8]}")
         with held:
             loaded = A.loaded()
             if kind == "box":   # wrapped once the slot is held, so the priority answers for the load it starts under
