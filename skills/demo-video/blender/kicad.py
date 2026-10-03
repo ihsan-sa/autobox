@@ -10,7 +10,8 @@ metal, verts, faces] per VRML shape]}, 'parts': [{'ref', 'model', 'x', 'y', 'rot
 'scale'}]}. The images are mask over copper (zones, tracks, vias a shade lighter), bare pads in gold, holes and
 silkscreen (lines, shapes and text). A footprint's model is found by its file name in --models (default: the
 board's lib/*.3dshapes beside kicad/), .wrl first, since VRML is what this reads; a model it cannot find is
-reported on stderr and left out. Board edge and holes come from Edge.Cuts and the footprints' NPTH pads.
+reported on stderr and left out. Board edge and holes come from Edge.Cuts and the footprints' NPTH pads; a slotted
+(oval) drill is drawn as its slot, and an NPTH slot goes into 'holes' as a round hole as wide as the slot.
 Needs Pillow for the images; the parsing is plain Python."""
 import glob
 import json
@@ -191,11 +192,21 @@ class Canvas:
         self.img.alpha_composite(im, (int(cx - im.width / 2), int(cy - im.height / 2)))
 
 
-def _pad_poly(pad, at):
-    """a pad's outline on the board, as points (rect, roundrect, trapezoid and custom drawn as their bounding rect)"""
+def _drill(pad):
+    """a pad's drill as (w, h) in mm: KiCad writes (drill D) for a round hole and (drill oval W H) for a slot"""
+    d = kid(pad, 'drill')
+    if d[1] == 'oval':
+        w = float(d[2])
+        return w, float(d[3]) if len(d) > 3 and not isinstance(d[3], list) else w
+    return float(d[1]), float(d[1])
+
+
+def _pad_poly(pad, at, size=None, shape=None):
+    """a pad's outline on the board, as points (rect, roundrect, trapezoid and custom drawn as their bounding rect);
+    size and shape stand in for the pad's own, so its slot is drawn turned and placed the same way"""
     p = nums(pad, 'at')
-    w, h = nums(pad, 'size', [0, 0])[:2]
-    shape = pad[3] if len(pad) > 3 else 'rect'
+    w, h = size or nums(pad, 'size', [0, 0])[:2]
+    shape = shape or (pad[3] if len(pad) > 3 else 'rect')
     cx, cy = place(at, p[0], p[1])
     r = math.radians(p[2] if len(p) > 2 else 0)
     if shape in ('circle', 'oval'):
@@ -276,7 +287,7 @@ def board(path, models=None, ppm=32):
         for pad in kids(fp, 'pad'):
             if pad[2] == 'np_thru_hole':
                 q = place(at, *nums(pad, 'at')[:2])
-                holes.append([round(q[0] - x0, 4), round(q[1] - y0, 4), float(kid(pad, 'drill')[1])])
+                holes.append([round(q[0] - x0, 4), round(q[1] - y0, 4), min(_drill(pad))])
         for m in kids(fp, 'model'):
             if hidden(m):
                 continue
@@ -321,8 +332,12 @@ def board(path, models=None, ppm=32):
                 if pad[2] != 'np_thru_hole' and (cu in ls or '*.Cu' in ls):
                     c.poly(_pad_poly(pad, at), PAD)
                 if pad[2] in ('thru_hole', 'np_thru_hole') and kid(pad, 'drill'):
-                    q = place(at, *nums(pad, 'at')[:2])
-                    c.disc(q[0], q[1], float(kid(pad, 'drill')[1]), HOLE)
+                    w, h = _drill(pad)
+                    if w == h:
+                        q = place(at, *nums(pad, 'at')[:2])
+                        c.disc(q[0], q[1], w, HOLE)
+                    else:
+                        c.poly(_pad_poly(pad, at, (w, h), 'oval'), HOLE)
             _graphics(c, fp, side, at)
             _texts(c, fp, side, at)
         _graphics(c, pcb, side)

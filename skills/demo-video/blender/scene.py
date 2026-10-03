@@ -14,6 +14,7 @@ here; track() writes where each labelled thing lands on screen, frame by frame, 
     board_from_images(top, bottom, size_mm, holes, ...)
                                         a PCB slab: the top and bottom renders as its faces, real drilled holes
     board_parts(parts, board)           its components as 3D bodies, from kicad.py's parts.json (KiCad's VRML models)
+                                        (both take finish='gloss', the default, or 'satin': see FINISH)
     mount(pitch, ...)                   an aluminium plate with four standoffs on a pitch x pitch square
     gds_extrude(doc, stack, colors)     one mesh per GDS layer, every polygon a prism, from gds2json's JSON
     ui_plane(image, rect, cam, res)     an unlit plane showing a UI frame (or a numbered sequence), placed so it
@@ -39,6 +40,47 @@ QUALITY = {  # samples, resolution percentage
     'preview': (16, 50),
     'final': (256, 100),
 }
+
+# How a board and its parts take the light. 'gloss' is a lacquered look: a clear coat on the mask, shiny plastic.
+# 'satin' is a PCB as a studio photographs it: a satin mask with no coat, matte epoxy and ceramic, and only metal
+# (pads, pins, shields, plated holes) metallic, so a highlight spreads soft instead of sitting on the board as glare.
+# The pads are found in the board image by colour (kicad.py draws them gold: red well above blue, which mask, copper
+# and silkscreen never are). spec is the dielectric's Specular IOR Level (Blender's default 0.5).
+FINISH = {
+    'gloss': dict(mask_rough=0.32, coat=0.25, coat_rough=0.08, pads=False, spec=0.5,
+                  plating_rough=0.25, metal_rough=0.28, light_rough=0.42, dark_rough=0.55, part_coat=0.15),
+    'satin': dict(mask_rough=0.55, coat=0.0, coat_rough=0.3, pads=True, pad_rough=0.38, spec=0.35,
+                  plating_rough=0.4, metal_rough=0.4, light_rough=0.58, dark_rough=0.68, part_coat=0.0),
+}
+
+
+def _finish(finish):
+    if finish not in FINISH:
+        raise ValueError('finish is %s, not %r' % (' or '.join(FINISH), finish))
+    return FINISH[finish]
+
+
+def _pads_metal(m, f):
+    """the pads in m's board image turn metal: metallic where red stands well above blue, its own roughness there"""
+    nt = m.node_tree
+    p = nt.nodes['Principled BSDF']
+    t = next(n for n in nt.nodes if n.type == 'TEX_IMAGE')
+    sep = nt.nodes.new('ShaderNodeSeparateColor')
+    nt.links.new(t.outputs['Color'], sep.inputs['Color'])
+    d = nt.nodes.new('ShaderNodeMath')
+    d.operation = 'SUBTRACT'
+    nt.links.new(sep.outputs['Red'], d.inputs[0])
+    nt.links.new(sep.outputs['Blue'], d.inputs[1])
+    r = nt.nodes.new('ShaderNodeMapRange')               # linear red - blue: pads 0.56, silkscreen 0.06, mask about 0
+    r.clamp = True
+    r.inputs['From Min'].default_value, r.inputs['From Max'].default_value = 0.15, 0.40
+    nt.links.new(d.outputs['Value'], r.inputs['Value'])
+    nt.links.new(r.outputs['Result'], p.inputs['Metallic'])
+    rr = nt.nodes.new('ShaderNodeMapRange')
+    rr.clamp = True
+    rr.inputs['To Min'].default_value, rr.inputs['To Max'].default_value = f['mask_rough'], f['pad_rough']
+    nt.links.new(r.outputs['Result'], rr.inputs['Value'])
+    nt.links.new(rr.outputs['Result'], p.inputs['Roughness'])
 
 
 def reset(res=(1920, 1080), fps=30, frames=(1, 90)):
@@ -230,18 +272,21 @@ def _img_mat(name, path, alpha=True, rough=0.32, coat=0.5):
 
 
 def board_from_images(top, bottom, size_mm=(78.0, 78.0), holes=(), drill=3.2, thick=1.6, scale=0.01, name='board',
-                      crop=None, edge=(0.035, 0.09, 0.04, 1)):
+                      crop=None, edge=(0.035, 0.09, 0.04, 1), finish='gloss'):
     """A PCB slab whose top and bottom faces are the board's own renders. crop is the board's (x0, y0, x1, y1) in the
     top image, found from its non-black pixels when not given; the bottom image is taken as seen from below (mirrored
-    left to right). holes are (x, y) in mm from the board's top-left corner, as KiCad gives them, drilled through."""
+    left to right). holes are (x, y) in mm from the board's top-left corner, as KiCad gives them, drilled through
+    `drill` wide, or (x, y, d) each with its own drill, as kicad.py's parts.json lists them. finish is a FINISH."""
+    f = _finish(finish)
     W, H = size_mm
+    holes = [(h[0], h[1], h[2] if len(h) > 2 else drill) for h in holes]
     bpy.ops.mesh.primitive_cube_add(size=1)
     o = bpy.context.object
     o.name = name
     o.scale = (W * scale, H * scale, thick * scale)
     bpy.ops.object.transform_apply(scale=True)
-    for i, (hx, hy) in enumerate(holes):
-        bpy.ops.mesh.primitive_cylinder_add(vertices=48, radius=drill / 2 * scale, depth=thick * scale * 4,
+    for i, (hx, hy, hd) in enumerate(holes):
+        bpy.ops.mesh.primitive_cylinder_add(vertices=48, radius=hd / 2 * scale, depth=thick * scale * 4,
                                             location=((hx - W / 2) * scale, (H / 2 - hy) * scale, 0))
         c = bpy.context.object
         b = o.modifiers.new('hole%d' % i, 'BOOLEAN')
@@ -249,16 +294,19 @@ def board_from_images(top, bottom, size_mm=(78.0, 78.0), holes=(), drill=3.2, th
         _apply(o, b)
         bpy.data.objects.remove(c)
     # opaque solder mask: the images' alpha stays unlinked and nothing transmits, so the far side never shows through,
-    # and a rough, thin coat keeps the key light from sitting on the mask as one hot patch
-    mt, img_t = _img_mat(name + '-top', top, alpha=False, coat=0.25)
-    mb, img_b = _img_mat(name + '-bottom', bottom, alpha=False, coat=0.25)
+    # and the finish says how much the mask shines and whether its pads are metal
+    mt, img_t = _img_mat(name + '-top', top, alpha=False, rough=f['mask_rough'], coat=f['coat'])
+    mb, img_b = _img_mat(name + '-bottom', bottom, alpha=False, rough=f['mask_rough'], coat=f['coat'])
     for m in (mt, mb):
         p = m.node_tree.nodes['Principled BSDF']
-        p.inputs['Coat Roughness'].default_value = 0.08
+        p.inputs['Coat Roughness'].default_value = f['coat_rough']
+        p.inputs['Specular IOR Level'].default_value = f['spec']
         p.inputs['Transmission Weight'].default_value = 0.0
         p.inputs['Subsurface Weight'].default_value = 0.0
+        if f['pads']:
+            _pads_metal(m, f)
     me_edge = _mat(name + '-edge', edge, rough=0.6)
-    plated = _mat(name + '-plating', (0.9, 0.72, 0.45, 1), metallic=1.0, rough=0.25)
+    plated = _mat(name + '-plating', (0.9, 0.72, 0.45, 1), metallic=1.0, rough=f['plating_rough'])
     o.data.materials.clear()  # Blender 5.2's boolean leaves the cutter's empty slot, which would shift every index
     for m in (mt, mb, me_edge, plated):
         o.data.materials.append(m)
@@ -273,7 +321,7 @@ def board_from_images(top, bottom, size_mm=(78.0, 78.0), holes=(), drill=3.2, th
     for p in o.data.polygons:
         n = p.normal
         on_hole = any(math.hypot(o.data.vertices[v].co.x - (hx - W / 2) * scale, o.data.vertices[v].co.y - (H / 2 - hy) * scale)
-                      < drill * scale * 0.51 for v in p.vertices for hx, hy in holes)
+                      < hd * scale * 0.51 for v in p.vertices for hx, hy, hd in holes)
         p.material_index = 0 if n.z > 0.5 else 1 if n.z < -0.5 else 3 if on_hole else 2
         for li in p.loop_indices:
             co = o.data.vertices[o.data.loops[li].vertex_index].co
@@ -290,13 +338,14 @@ def _srgb(c):
     return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
 
-def board_parts(parts, board, thick=1.6, scale=0.01, name='parts'):
+def board_parts(parts, board, thick=1.6, scale=0.01, name='parts', finish='gloss'):
     """The board's components as real bodies: parts is kicad.py's parts.json (a dict or its path), board the slab
     board_from_images built from the same board (centred, its top face at +thick/2). One mesh per model and model
     transform, a material per VRML colour (grey with a bright highlight = metal pins), and a linked copy per part
     parented to board where its footprint puts it, turned by the footprint's angle; back-side parts hang under it.
     The model transform is KiCad's: scale, then rotate by minus the angles (x, then y, then z applied last), then
-    offset in mm. Returns the part objects."""
+    offset in mm. finish is a FINISH. Returns the part objects."""
+    f = _finish(finish)
     if isinstance(parts, str):
         with open(parts) as f:
             parts = json.load(f)
@@ -308,9 +357,11 @@ def board_parts(parts, board, thick=1.6, scale=0.01, name='parts'):
         if key not in mats:
             c = tuple(_srgb(v) for v in rgba[:3]) + (1.0,)
             if metal:
-                mats[key] = _mat('%s-metal%d' % (name, len(mats)), (0.86, 0.85, 0.82, 1), metallic=1.0, rough=0.28)
+                mats[key] = _mat('%s-metal%d' % (name, len(mats)), (0.86, 0.85, 0.82, 1), metallic=1.0, rough=f['metal_rough'])
             else:
-                mats[key] = _mat('%s-mat%d' % (name, len(mats)), c, rough=0.42 if max(rgba[:3]) > 0.5 else 0.55, coat=0.15)
+                mats[key] = _mat('%s-mat%d' % (name, len(mats)), c, rough=f['light_rough'] if max(rgba[:3]) > 0.5 else f['dark_rough'],
+                                 coat=f['part_coat'])
+                mats[key].node_tree.nodes['Principled BSDF'].inputs['Specular IOR Level'].default_value = f['spec']
         return mats[key]
 
     for p in parts['parts']:

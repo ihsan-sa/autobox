@@ -117,6 +117,33 @@ def kicad_cases():
                   (top.size, px(30, 31), px(40, 45), px(30, 28)))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    slot_case()
+
+
+SLOT = '''(kicad_pcb (version 20240108)
+  (gr_rect (start 0 0) (end 20 10) (layer "Edge.Cuts"))
+  (footprint "x:USB" (layer "F.Cu") (at 10 5 90)
+    (pad "S1" thru_hole oval (at 0 0 90) (size 1.2 2.4) (drill oval 0.6 1.8) (layers "*.Cu" "*.Mask"))
+    (pad "" np_thru_hole oval (at 0 3 90) (size 1 2) (drill oval 1 2) (layers "*.Cu" "*.Mask")))
+)'''
+
+
+def slot_case():
+    import kicad
+    tmp = tempfile.mkdtemp(prefix='dv-slot-')
+    try:
+        with open(os.path.join(tmp, 's.kicad_pcb'), 'w') as f:
+            f.write(SLOT)
+        imgs, d = kicad.board(os.path.join(tmp, 's.kicad_pcb'), os.path.join(tmp, 'none'), ppm=10)
+        check('K9e an NPTH slot is drilled as a round hole as wide as the slot, where its footprint puts it',
+              d['holes'] == [[13.0, 5.0, 1.0]], d['holes'])
+        if imgs is not None:   # the slot runs along the pad's turned long side: hole at its end, pad beside it
+            px = lambda x, y: imgs['top'].getpixel((int(x * 10), int(y * 10)))[:3]  # noqa: E731
+            check('K9f a plated slot is drawn turned with its pad: black along the long side, gold across it',
+                  px(10.7, 5) == kicad.HOLE[:3] and px(10, 5.45) == kicad.PAD[:3] and px(11.1, 5) == kicad.PAD[:3],
+                  (px(10.7, 5), px(10, 5.45), px(11.1, 5)))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 SCENE_CASES = r'''
@@ -164,6 +191,28 @@ bp = [b2.data.materials[i].node_tree.nodes['Principled BSDF'] for i in (0, 1)]
 out('B1c a board face is opaque: no alpha link, no transmission, no subsurface',
     all(not p.inputs['Alpha'].is_linked and p.inputs['Transmission Weight'].default_value == 0
         and p.inputs['Subsurface Weight'].default_value == 0 for p in bp))
+scene.reset(res=(64, 36))
+b3 = scene.board_from_images(top, bot, size_mm=(40, 30), holes=[(10, 15, 2.0), (30, 15)], drill=4.0, scale=0.01)
+def bore(hx, hy):
+    c = ((hx - 20) * 0.01, (15 - hy) * 0.01)
+    r = [math.hypot(b3.data.vertices[v].co.x - c[0], b3.data.vertices[v].co.y - c[1])
+         for p in b3.data.polygons if p.material_index == 3 for v in p.vertices]
+    return max(d for d in r if d < 0.05)
+out('B1d a hole given as (x, y, d) is drilled d wide, one given as (x, y) takes drill',
+    abs(bore(10, 15) - 0.01) < 1e-4 and abs(bore(30, 15) - 0.02) < 1e-4, (bore(10, 15), bore(30, 15)))
+scene.reset(res=(64, 36))
+bs = scene.board_from_images(top, bot, size_mm=(40, 30), holes=[(10, 15)], scale=0.01, finish='satin')
+sp = bs.data.materials[0].node_tree.nodes['Principled BSDF']
+gp = scene.board_from_images(top, bot, size_mm=(40, 30), scale=0.01, name='gloss').data.materials[0].node_tree.nodes['Principled BSDF']
+out('B1e a satin board has no coat and takes its metal from the image (the pads); a gloss one keeps its coat and no metal',
+    sp.inputs['Coat Weight'].default_value == 0 and sp.inputs['Metallic'].is_linked and sp.inputs['Roughness'].is_linked
+    and bs.data.materials[3].node_tree.nodes['Principled BSDF'].inputs['Roughness'].default_value >= 0.35
+    and gp.inputs['Coat Weight'].default_value > 0 and not gp.inputs['Metallic'].is_linked,
+    (sp.inputs['Coat Weight'].default_value, sp.inputs['Metallic'].is_linked, gp.inputs['Coat Weight'].default_value))
+try:
+    scene.board_from_images(top, bot, size_mm=(40, 30), scale=0.01, finish='matte'); out('B1f an unknown finish is refused', False)
+except ValueError:
+    out('B1f an unknown finish is refused', True)
 
 scene.reset(res=(64, 36))
 plate, so = scene.mount(pitch=60, scale=0.01)
@@ -259,6 +308,13 @@ out('B7 board_parts: one shared mesh per model, a part sits on its footprint tur
     and abs(ps[0].location.x + 0.10) < 1e-6 and abs(ps[0].location.y - 0.10) < 1e-6 and abs(ps[0].location.z - 0.008) < 1e-6
     and ps[2].location.z < 0 and abs(v1.x + 0.08) < 1e-6 and abs(v1.y - 0.10) < 1e-6,
     (len(ps), tuple(ps[0].location), tuple(v1)))
+ss = scene.board_parts(pj, bd, scale=0.01, name='satin', finish='satin')
+sm = {m.name: m.node_tree.nodes['Principled BSDF'].inputs for m in ss[0].data.materials}
+gm = {m.name: m.node_tree.nodes['Principled BSDF'].inputs for m in ps[0].data.materials}
+out('B7b satin parts: matte, uncoated plastic and metal that stays metal; gloss parts keep their coat',
+    sm['satin-metal0']['Metallic'].default_value == 1 and sm['satin-mat1']['Coat Weight'].default_value == 0
+    and sm['satin-mat1']['Roughness'].default_value >= 0.6 and gm['parts-mat1']['Coat Weight'].default_value > 0,
+    sorted(sm))
 
 '''
 
