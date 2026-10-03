@@ -27,6 +27,14 @@ Every post says who sent it without the reader opening it: `cc-slack` signs it `
 its alias, a headless loop by its track's display name), and a post into another session's channel opens with that
 channel's `<#C…>` mention, so it reads as addressed to it. `CC_SLACK_PLAIN_NAME=1` drops the name, not the mention.
 
+**Two marks say who a post is for.** 🔒 and the owner's mention open a post that needs the owner, and nothing
+else carries either. Only the control seat posts one: once per question, in `#<repo>` or `#approvals`, after it has
+checked it can't settle it itself. An ask that a seat or a queries session is still handling never reaches the owner
+as well. 🤖 opens a post one session makes for another and keeps in Slack to be seen. It goes in that session's
+channel, a `-threads` lane or `-updates`, never top level in `#<repo>`, and it never mentions the owner. The owner then
+watches three places: their DM with the bot, each `#<repo>`, and `#approvals`. Today the code still opens an owner post
+with ❓ (`decision_head`) and adds no 🤖, so both marks wait on that change.
+
 An answer to "what is running" is one bold line with the counts, then bullets nested by project and then by kind,
 one item per line, each named by what it does for a person. A compressed slug is still a slug.
 
@@ -100,6 +108,8 @@ Handle technical choices yourself within your authority.
 Send requests beyond a session's authority to the planning seat (cc-notify --ask).
 Only the planning/control session escalates a verified owner-only decision.
 Mark owner choices ❓ plus a mention; use #approvals for actual authorization.
+Open a post meant for another session with 🤖, and keep it out of #<repo>'s top level.
+Do not tell the owner you handed something to the seat; say the outcome once.
 Ask one clear question and explain the consequence; preserve permission reply tokens.
 Do not ask the owner to relay messages, edit state files or run routine commands.
 Verify before claiming something works; distinguish an idea from an available fix.
