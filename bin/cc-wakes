@@ -24,8 +24,14 @@ tokens estimated as bytes / BYTES_PER_TOKEN, and a read is split in this order:
   handoff  a handoff prompt, and every journal read by anyone: `cc-handoff --brief`, cc-lib, *-handoff.md, progress.md
   reread   a Read, or a cat/head/tail/sed -n/nl, of files all already read in this context, any slice of them
   pulse, person   those wake-ups' prompt text, and the same kinds of message queued mid-turn
-  work     own output and every other tool result, filled LAST: an estimate that runs long comes out of work
-  unattr   what is left: harness reminders, dropped thinking, images, estimate error. Printed, never hidden.
+  harness  the harness's attachments after the first request: reminders, tool, agent and skill listings, edited-file
+           notes. A prompt snapshot is the harness's own copy, never sent, so not counted
+  work     own output and every other tool result, filled LAST: an estimate that runs long comes out of work. Own
+           output is its text and tool calls by bytes, since the transcript's output_tokens is the stream's first
+           chunk; and a response's thinking, stored redacted, is MEASURED: what the next request's input grew by
+           past every piece above, when that response carried a thinking block
+  unattr   what is left: growth past the pieces after a response that did not think (message framing), images,
+           estimate error. Printed, never hidden.
 A compact boundary resets the context to base.
 
 THE TRACE is rebuilt whole each run into ~/.cc/state/<repo>/replay/wakes-<from>..<to>.tsv, one sorted row per
@@ -55,13 +61,16 @@ _s.loader.exec_module(S)
 # Fitted 2026-09-15 on this box: median bytes per token of 82 lone tool results of 4 kB or more, against how much
 # the next request's input grew less the output between (p25 2.15, p75 2.45).
 BYTES_PER_TOKEN = 2.3
-CLASSES = ("base", "handoff", "reread", "pulse", "person", "work")
+CLASSES = ("base", "handoff", "reread", "pulse", "person", "harness", "work")
 COLS = (["ts", "session", "kind", "cause", "requests", "cache_read", "usd", "rd_usd"]
         + ["rd_" + c for c in CLASSES] + ["rd_unattr", "handoff_bytes", "rereads", "ctx_base"])
 MACHINE = re.compile(r"\s*(\[cc-|\[Cross-session|pulse:|<task-notification>|Stop hook|Another Claude session"
                      r"|usage limit|<scheduled)")
 ORCH = re.compile(r"(?:SUCCESSOR|engineer) for [\w.-]+@[\w-]+")
 JOURNAL = re.compile(r"cc-handoff\s+--brief|cc-lib\s+(?:ask|view|get)\b|[\w.-]-handoff\.md|progress\.md")
+# Attachment records the model never sees: the harness's own copy of the system prompt, and a queued prompt, which
+# is read as the message it carries.
+UNSENT = ("prompt_snapshot", "queued_command")
 READ_SEG = re.compile(r"\s*(?:cat|head|tail|nl|sed\s+-n)\s(?=.*\s[~\w.-]*[/.]\w)")
 
 
@@ -108,6 +117,26 @@ def cause_of(txt, first, fired):
     return "start" if first else "person"
 
 
+def leaf_bytes(v):
+    """Bytes of the text an attachment carries: its string leaves, less its type tag."""
+    if isinstance(v, str):
+        return len(v.encode())
+    if isinstance(v, list):
+        return sum(leaf_bytes(x) for x in v)
+    return sum(leaf_bytes(x) for k, x in v.items() if k != "type") if isinstance(v, dict) else 0
+
+
+def out_bytes(content):
+    """(bytes of a response's text and tool calls, whether it carried a thinking block)."""
+    n, thought = 0, False
+    for b in content or []:
+        if isinstance(b, dict):
+            n += len((b.get("text") or "").encode()) if b.get("type") == "text" else \
+                len(json.dumps(b.get("input")).encode()) + len(b.get("name") or "") if b.get("type") == "tool_use" else 0
+            thought = thought or b.get("type") == "thinking"
+    return n, thought
+
+
 def class_of_use(block, cwd, keys, wake):
     """The class a tool call's RESULT is carried under, noting a re-read on the wake-up that made it."""
     inp, name = block.get("input") or {}, block.get("name")
@@ -145,7 +174,7 @@ def walk(path, seen):
                          for r in recs[:400] if r.get("type") == "user") if t][:3]
     kind, stem = kind_of(path, cwd, texts), os.path.basename(path)[:-len(".jsonl")][:14]
     ctx, pend, keys, uses, wakes = dict.fromkeys(CLASSES, 0.0), dict.fromkeys(CLASSES, 0.0), set(), {}, []
-    wake, base, fired = None, None, False
+    wake, base, fired, last, thought = None, None, False, None, False
 
     def new_wake(cause):
         w = dict.fromkeys(COLS, 0)
@@ -164,6 +193,7 @@ def walk(path, seen):
             if r.get("subtype") == "compact_boundary":
                 ctx, pend, keys = dict.fromkeys(CLASSES, 0.0), dict.fromkeys(CLASSES, 0.0), set()
                 ctx["base"] = base or 0.0
+                last = None
             fired = fired or r.get("subtype") == "scheduled_task_fire"
             continue
         if r.get("isSidechain") and not sub:
@@ -185,6 +215,8 @@ def walk(path, seen):
             if a.get("type") == "queued_command" and isinstance(a.get("prompt"), str):
                 c = cause_of(a["prompt"], False, False)
                 add(c if c in CLASSES else "work", len(a["prompt"].encode()))
+            elif a.get("type") not in UNSENT and base is not None:
+                add("harness", leaf_bytes(a))      # before the first request it is part of the measured base
         elif t == "assistant":
             wake = wake or new_wake("start")
             for b in msg.get("content") or []:
@@ -192,14 +224,22 @@ def walk(path, seen):
                     uses[b.get("id")] = class_of_use(b, r.get("cwd") or cwd, keys, wake)
             rid, u = r.get("requestId") or msg.get("id"), msg.get("usage") or {}
             key = (r.get("sessionId") or stem, rid)
+            vis, th = out_bytes(msg.get("content"))
             if not rid or not u or key in seen:
+                add("work", vis)           # the rest of a response already counted: its own output
+                thought = thought or th
                 continue
             seen.add(key)
             rd = int(u.get("cache_read_input_tokens") or 0)
+            total = rd + int(u.get("cache_creation_input_tokens") or 0) + int(u.get("input_tokens") or 0)
             if base is None:
-                total = rd + int(u.get("cache_creation_input_tokens") or 0) + int(u.get("input_tokens") or 0)
                 base = ctx["base"] = max(total - sum(pend.values()), 0.0)
                 wake["ctx_base"] = base
+            elif thought and last is not None and total - last > sum(pend.values()):
+                # The context grew by more than its pieces after a response that thought: that is the thinking, kept
+                # in context but stored redacted, so it is measured off the growth and filed as own output.
+                pend["work"] += total - last - sum(pend.values())
+            last, thought = total, th
             left = float(rd)
             for c in CLASSES:
                 part = min(ctx[c], left)
@@ -209,7 +249,7 @@ def walk(path, seen):
             for c in CLASSES:
                 ctx[c] += pend[c]
             pend = dict.fromkeys(CLASSES, 0.0)
-            pend["work"] += int(u.get("output_tokens") or 0)
+            pend["work"] += max(int(u.get("output_tokens") or 0), vis / BYTES_PER_TOKEN)
             model, rate = msg.get("model") or "-", S.rate(msg.get("model"))
             wake["ts"] = wake["ts"] or S.parse_ts(r.get("timestamp"))
             wake["requests"] += 1
@@ -282,11 +322,13 @@ def selfcheck():
         return dict(type=t, cwd=cwd, sessionId="sid", timestamp=f"{d}T10:{n[0] % 60:02d}:00Z", **kw)
     def user(content, cwd=dev, **kw):
         return rec("user", cwd, message={"role": "user", "content": content}, **kw)
-    def asst(rid, rd, cwd=dev, cw=0, out=0, uses=(), **kw):
-        blocks = [{"type": "tool_use", "id": i, "name": nm, "input": inp} for i, nm, inp in uses]
+    def asst(rid, rd, cwd=dev, cw=0, out=0, uses=(), lead=(), **kw):
+        blocks = list(lead) + [{"type": "tool_use", "id": i, "name": nm, "input": inp} for i, nm, inp in uses]
         return rec("assistant", cwd, requestId=rid, message={"model": "claude-opus-5", "content": blocks, "usage": {
             "input_tokens": 0, "output_tokens": out, "cache_read_input_tokens": rd, "cache_creation_input_tokens": cw}},
             **kw)
+    attach = lambda a: rec("attachment", dev, attachment=a)
+    think = {"type": "thinking", "thinking": "", "signature": "s" * 800}
     result = lambda i, size: user([{"type": "tool_result", "tool_use_id": i, "content": "x" * size}])
     def put(rel, recs):                   # one JSON line per record; a one-record list is a .meta.json too
         p = os.path.join(proj, rel)
@@ -318,6 +360,15 @@ def selfcheck():
     put("-p/s7.jsonl", [user("hello"), asst("h1", 10), user("<task-notification> done"), asst("h2", 10),
                         rec("system", dev, subtype="scheduled_task_fire"), user("Re-mark the row"), asst("h3", 10),
                         user("what now"), asst("h4", 10)])
+    put("-p/s8.jsonl", [user("go"), attach({"type": "skill_listing", "content": "s" * 230}), asst("i1", 0, cw=1000),
+                        attach({"type": "total_tokens_reminder", "text": "r" * 2300}),
+                        attach({"type": "prompt_snapshot", "systemPrompt": ["p" * 23000]}),
+                        asst("i2", 1000, cw=1000), asst("i3", 2000)])
+    put("-p/s9.jsonl", [user("go"), asst("j1", 0, cw=1000, lead=[{"type": "text", "text": "y" * 2300}]),
+                        user("more"), asst("j2", 1000, cw=1000), asst("j3", 2000)])
+    for sid, lead in (("s10", [think]), ("s10n", [])):
+        put(f"-p/{sid}.jsonl", [user("go"), asst(sid + "1", 0, cw=1000, lead=lead, uses=[("k", "Read", {"file_path": "/x/z"})]),
+                                result("k", 230), asst(sid + "2", 1000, cw=600), asst(sid + "3", 1600)])
 
     def run():
         env = dict(os.environ, HOME=home, TZ="UTC")
@@ -331,6 +382,7 @@ def selfcheck():
     rows = [dict(zip(COLS, line.split("\t"))) for line in tsv1.splitlines()[1:]]
     of = lambda s: [r for r in rows if r["session"] == s]
     s1, s3 = of("s1"), of("s3")
+    near = lambda rs, c, v: len(rs) == 1 and abs(float(rs[0][c]) - v) < 3
     cases = [
         ("a successor's kick is a handoff wake-up, its brief is carried as handoff, a split response counts once",
          [(r["kind"], r["cause"]) for r in s1][:1] == [("planning", "handoff")] and s1[0]["requests"] == "2"
@@ -351,6 +403,16 @@ def selfcheck():
          [(r["cause"], r["cache_read"]) for r in of("s6")] == [("person", "400")]),
         ("a task notification and a cron fire are pulses; later text with no marker is a person",
          [r["cause"] for r in of("s7")] == ["start", "pulse", "pulse", "person"]),
+        ("a harness reminder after the first request is harness; one before it stays in base; a prompt snapshot is "
+         "never sent, so is not counted", near(of("s8"), "rd_harness", 1000) and near(of("s8"), "ctx_base", 999)
+         and near(of("s8"), "rd_unattr", 0)),
+        ("a response's own text is carried as work, though the transcript's output_tokens says 0",
+         [r["cause"] for r in of("s9")] == ["start", "person"] and abs(float(of("s9")[1]["rd_work"]) - 1000) < 3
+         and float(of("s9")[1]["rd_unattr"]) < 3),
+        ("growth past a thinking response's pieces is its redacted thinking, carried as work; the same growth after a "
+         "response that did not think stays unattributed",
+         near(of("s10"), "rd_work", 600) and near(of("s10"), "rd_unattr", 0)
+         and near(of("s10n"), "rd_work", 113) and near(of("s10n"), "rd_unattr", 489)),
         ("the same records give the same bytes, table and trace", out1 == out2 and tsv1 == tsv2 and "handoff" in out1),
     ]
     bad = [name for name, ok in cases if not ok]
