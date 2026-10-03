@@ -1024,6 +1024,44 @@ def run_selfcheck():
         dm5.on_event({"type": "message", "channel": "C3", "ts": "5.2", "thread_ts": "5.1", "user": "UOWNER", "text": "any update?"})
     check("route: alias with no live conn → not-running reply naming `cc <repo> --orch <alias>`, nothing delivered or queued",
           said5 and "@ai-dev is not running here" in said5[-1] and "cc r --orch ai-dev" in said5[-1] and not delivered5 and not dm5.queues["r"])
+    # A stale orch alias that names a project of its own (#examplebox-widget-* after ~/dev/widget got its seat) is
+    # handed to that project, once told per thread; a leading @project that is no orch too; a bot's prose never bounces.
+    _devP = globals()["DEV"]
+    with tempfile.TemporaryDirectory(prefix="_selfcheck_hop") as devP:
+        try:
+            globals()["DEV"] = devP
+            os.makedirs(f"{devP}/r/.git"); os.makedirs(f"{devP}/chip/.git"); os.makedirs(f"{devP}/memb/.git"); os.makedirs(os.path.dirname(f"{devP}/memb/{MEMBER_MARKER}"), exist_ok=True); open(f"{devP}/memb/{MEMBER_MARKER}", "w").close()
+            dm5.known_aliases["r"].add("chip"); said5.clear(); delivered5.clear()
+            with offline_slack():
+                dm5.on_event({"type": "message", "channel": "C3", "ts": "6.1", "user": "UOWNER", "text": "@chip where are we?"})
+                dm5.on_event({"type": "message", "channel": "C3", "ts": "6.2", "thread_ts": "6.1", "user": "UOWNER", "text": "and now?"})
+            check("route: a stale orch alias naming its own project → handed to that project's seat (no alias), the sender told "
+                  "where it went once per thread, never the not-running bounce",
+                  [(a[0], k.get("alias")) for a, k in delivered5] == [("chip", None), ("chip", None)]
+                  and len(said5) == 1 and "@chip is its own project" in said5[0] and not any("not running" in s for s in said5))
+            said5.clear(); delivered5.clear()
+            with offline_slack():
+                dm5.on_event({"type": "message", "channel": "C3", "ts": "6.3", "user": "UOWNER", "text": "@memb hi"})
+                dm5.on_event({"type": "message", "channel": "C3", "ts": "6.4", "user": "UOWNER", "text": "@nosuch hi"})
+                dm5.on_event({"type": "message", "channel": "C3", "ts": "6.5", "user": "UMEMBER", "text": "@chip hi"})
+            check("route: a leading @name that is neither an orch nor a project (or is a member's workspace, or a member typed "
+                  "it) stays with this target's main session",
+                  [(a[0], k.get("alias")) for a, k in delivered5] == [("r", None)] * 3 and not said5)
+            said5.clear(); delivered5.clear()
+            with offline_slack():
+                dm5.on_event({"type": "message", "channel": "C3", "ts": "6.6", "user": "UBOT", "text": "I told @ai-dev and @chip about it"})
+                dm5.on_event({"type": "message", "channel": "C3", "ts": "6.7", "user": "UBOT", "text": "@ai-dev status?"})
+            check("route: a box post naming @alias or @project, in prose or leading, never bounces and is never delivered",
+                  not said5 and not delivered5)
+            mdel = []; dm5.deliver = lambda *a, **k: mdel.append((a[0], k.get("alias"))) or "delivered"
+            dm5.pingpong = lambda *a: None; dm5.permalink = lambda *a: None
+            with offline_slack():
+                ms = dm5.route_mentions("C3", "6.8", "6.8", "ask @chip and @ai-dev", ("r", None))
+            check("route_mentions: a stale orch alias naming a project reaches that project; a live-less orch alias still its orch",
+                  ("chip", None) in mdel and ("r", "ai-dev") in mdel and [m["target"] for m in ms] == ["chip", "r"])
+        finally:
+            globals()["DEV"] = _devP
+            dm5.known_aliases["r"].discard("chip")
     # THE INBOUND ARCHIVE, on a daemon of its own: three human messages in one channel (an owner root, an owner reply in
     # its thread, a member's root) are three lines of archive/<target>/<chat>/<month>.jsonl, in order, each carrying
     # ts, thread_ts, chat, channel, user, role, target and the words; a bot message and a stranger's DM leave nothing.

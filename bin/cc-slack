@@ -3845,6 +3845,8 @@ class Daemon:
         for tok in toks:
             if tok in ("main", repo):
                 dest, alias, name = repo, None, repo
+            elif tok in self.aliases_for(repo) and self.project_seat(repo, tok):   # a stale orch alias: its project
+                dest, alias, name = tok, None, tok
             elif tok in self.aliases_for(repo):
                 dest, alias = repo, tok
                 name = (orchs.get(orch_lookup(orchs, repo, tok)) or {}).get("name")
@@ -4947,6 +4949,18 @@ class Daemon:
         return set(self.known_aliases.get(target, ())) | {e["alias"] for e in load_orchs().values()
                                                           if e.get("alias") and not e.get("archived") and e.get("target") == target}
 
+    def project_seat(self, repo, tok):
+        """The project an @token names when no live orch of <repo> wears it, else None. An orch channel can outlive its
+        orch once the work moved to a project of its own name (#examplebox-widget-* after ~/dev/widget got its seat):
+        its alias then names that project, not a session to start. A member's workspace is never one of these."""
+        if not tok or tok in ("main", repo) or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", tok):
+            return None
+        if any(c.info.get("alias") == tok for c in self.subs.get(repo, [])):
+            return None
+        if not os.path.isdir(f"{DEV}/{tok}/.git") or os.path.isfile(f"{DEV}/{tok}/{MEMBER_MARKER}"):
+            return None
+        return tok
+
     def update_owner(self, target, chat, thread, in_thread, text):
         """@token ownership bookkeeping, run for every author before the owner gate; returns the delivery alias (None = main, else an orch channel's own alias unless a token overrides it)."""
         base = self.chan_alias(chat)
@@ -5209,7 +5223,16 @@ class Daemon:
                     self.say(chat, why, thread)
                 return
             self.say(chat, f"starting a session for #{self.chan_name(chat)} — its dir is `~/dev/{target}`", thread)
-        if route_alias and not any(c.info.get("alias") == route_alias for c in self.subs.get(target, [])):
+        # an @name (or an orch channel's own alias) with no live orch here, that names a project of its own: hand it to
+        # that project's seat, in this thread, and say so once per thread. Neither an orch nor a project: the bounce.
+        lead = at_token(text, self.bot_user) if may_own and not tracked and ctype != "im" and "/" not in target else None
+        hop = self.project_seat(target, route_alias or lead) if route_alias or lead else None
+        if hop:
+            if time.time() - self.told.get((chat, thread, "hop"), 0) > 3600:
+                self.told[(chat, thread, "hop")] = time.time()
+                self.say(chat, f"@{hop} is its own project, not an orch of {target}, so I handed this to its seat.", thread)
+            target, route_alias, ws = hop, None, workspace_of(hop)
+        elif route_alias and not any(c.info.get("alias") == route_alias for c in self.subs.get(target, [])):
             self.say(chat, f"@{route_alias} is not running here — start it on the box: cc {target} --orch {route_alias}", thread)
             return
         meta = {"chat_id": chat, "thread_ts": thread, "ts": ts, "user": self.user_name(user),
