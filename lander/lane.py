@@ -291,8 +291,8 @@ def orch_mark(repo, mark):
 class BoardRules:
     """board.close(job) through the cc-board CLI, as the old lander's close_board. Returns its one line."""
 
-    def board(self, project):
-        return J.board(project)
+    def board(self, project):   # a member's board is the link J.board refuses: read its target, no link followed
+        return M.member_board(project) if M.member_of(project)[0] else J.board(project)
 
     def cc_board(self, *args):
         return run([f"{J.bin_dir()}/cc-board", *args])

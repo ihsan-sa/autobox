@@ -173,7 +173,8 @@ def write_atomic(path: str, obj) -> None:
 
 def board(repo: str) -> dict:
     """The board JSON for `repo`, or {}. A symlinked board file is refused ({}): a member's board could be a link
-    into a directory the member writes."""
+    into a directory the member writes, and repo_root() trusts the `path` this returns. A member workspace's own
+    row is read through members.member_board(), which opens the link's target without following anything."""
     p = f"{boards()}/{repo}.json"
     if os.path.islink(p):
         return {}

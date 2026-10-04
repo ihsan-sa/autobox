@@ -122,8 +122,9 @@ if me == "cc-pause":
     out(0 if a[1] in box.get("paused", []) else 1)
 if me == "cc-tier":
     out(1 if box.get("tier_stop") else 0)
-if me == "cc-gh-token":
-    out(0, "\n".join(box.get("member_repos", [])))
+if me == "cc-gh-token":   # member_repos: a list for any owner, or {owner: [names]} so the owner asked for counts
+    r = box.get("member_repos", [])
+    out(0, "\n".join(r.get(a[2] if len(a) > 2 else "", []) if isinstance(r, dict) else r))
 if me == "cc":
     if a[0] == "done":
         out(0, json.dumps(box["receipt"]))
@@ -516,6 +517,124 @@ class Members(Fixture):
             rc, _, err = self.queue("alice--proj", "2", "--no-start")   # the board row carries #1, not #2
         self.assertEqual(rc, 1)
         self.assertIn("refused alice--proj#2 not-its-repository", self.log())
+
+    def converted(self):
+        """The layout a converted workspace has: BOARDS/alice.json is a link into MEMBERS/alice/board/."""
+        d = f"{self.home}/.cc/members/alice/board"
+        os.makedirs(d)
+        os.replace(f"{os.environ['CC_BOARDS']}/alice.json", f"{d}/alice.json")
+        os.symlink(f"{d}/alice.json", f"{os.environ['CC_BOARDS']}/alice.json")
+        return f"{d}/alice.json"
+
+    def test_a_converted_workspace_row_is_read_through_its_link(self):
+        self.make_member()
+        self.converted()
+        self.assertEqual(J.board("alice"), {})   # the box's own reader still refuses the link
+        self.assertEqual(M.member_board("alice")["tracks"]["proj"]["pr"], "https://github.com/own/proj/pull/1")
+        self.assertIn("proj", L.BoardRules().board("alice")["tracks"])   # …so a merge can mark the row merged
+        self.pr(1, {"docs/r.md": "n\n"})
+        with mock.patch.object(M, "member_clone", lambda repo, url: (f"{J.clones_dir()}/{repo}", "")):
+            rc, _, err = self.queue("alice--proj", "1", "--no-start")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("queued alice--proj#1", self.log())
+
+    def test_a_link_or_fifo_at_the_members_board_is_not_followed(self):
+        self.make_member()
+        p = self.converted()
+        elsewhere = f"{self.tmp}/elsewhere.json"
+        os.replace(p, elsewhere)
+        os.symlink(elsewhere, p)   # what a member could leave at that name from inside
+        self.assertEqual(M.member_board("alice"), {})
+        rc, _, err = self.queue("alice--proj", "1", "--no-start")
+        self.assertEqual(rc, 1)
+        self.assertIn("does not carry PR #1", err)
+        os.unlink(p)
+        os.mkfifo(p)   # opened without O_NONBLOCK this would hang the door
+        self.assertEqual(M.member_board("alice"), {})
+        self.assertEqual(M.member_board("bob"), {})   # no marker: no member, no board
+
+    def test_a_malformed_or_oversized_members_board_reads_as_no_row(self):
+        self.make_member()
+        p = self.converted()
+        for body in ("[" * 200000, '{"tracks": [1]}', '{"tracks": {"proj": "x"}}'):
+            with open(p, "w") as f:
+                f.write(body)
+            self.assertEqual(M.member_board("alice").get("tracks") or {}, {}, body[:20])
+            rc, _, err = self.queue("alice--proj", "1", "--no-start")
+            self.assertEqual(rc, 1, body[:20])
+            self.assertIn("does not carry PR #1", err)
+        with open(p, "w") as f:
+            json.dump({"tracks": {"proj": {"pr": "https://github.com/own/proj/pull/1"}}}, f)
+        self.assertIn("proj", M.member_board("alice")["tracks"])   # control: the same file, well formed, is read
+        with mock.patch.object(M, "BOARD_MAX", 10):
+            self.assertEqual(M.member_board("alice"), {})
+
+    def org_grant(self, target, org_repos=("proj",)):
+        """The grant `cc-sandbox github alice <file>` makes: MEMBERS/alice/github-token, a link to `target`."""
+        os.makedirs(f"{self.home}/.cc/secrets", exist_ok=True)
+        full = os.path.normpath(os.path.join(f"{self.home}/.cc/members/alice", target))
+        if os.path.dirname(full) == f"{self.home}/.cc/secrets":
+            with open(full, "w") as f:
+                f.write("org-token\n")
+            os.chmod(full, 0o600)
+        g = f"{self.home}/.cc/members/alice/github-token"
+        os.unlink(g)
+        os.symlink(target, g)
+        self.set_box(member_repos={"own": ["proj"], "acme": list(org_repos)})
+
+    def row_pr(self, url):
+        with open(f"{os.environ['CC_BOARDS']}/alice.json", "w") as f:
+            json.dump({"tracks": {"proj": {"pr": url}}}, f)
+
+    def test_granted_orgs_come_from_the_links_name_alone(self):
+        self.make_member()
+        sec = f"{self.home}/.cc/secrets"
+        self.assertEqual(M.granted_orgs("alice"), set())   # a link outside ~/.cc/secrets grants no org
+        self.org_grant(f"{sec}/github-alice-acme.token")
+        self.assertEqual(M.granted_orgs("alice"), {"acme"})
+        self.org_grant("../../secrets/github-alice-acme.token")   # relative, as ln -s may write it
+        self.assertEqual(M.granted_orgs("alice"), {"acme"})
+        for bad in (f"{sec}/alice-github.token", f"{sec}/github-personal.token", f"{sec}/github-bob-acme.token",
+                    f"{sec}/github-alice-.token", f"{sec}/github-alice-a_b.token", f"{sec}/sub/github-alice-acme.token",
+                    f"{self.tmp}/github-alice-acme.token", f"{sec}/../github-alice-acme.token"):
+            self.org_grant(bad)
+            self.assertEqual(M.granted_orgs("alice"), set(), bad)
+        self.assertEqual(M.granted_orgs("../alice"), set())
+
+    def test_a_granted_orgs_row_reaches_a_queued_job_and_an_ungranted_one_is_refused(self):
+        # board row → member_project_url → queued job, for a repository in the org the host granted the token for
+        self.make_member()
+        self.org_grant(f"{self.home}/.cc/secrets/github-alice-acme.token")
+        self.row_pr("https://github.com/ACME/proj/pull/1")
+        self.pr(1, {"docs/r.md": "n\n"})
+        urls = []
+
+        def clone(repo, url):
+            urls.append(url)
+            return f"{J.clones_dir()}/{repo}", ""
+        with mock.patch.object(M, "member_clone", clone):
+            rc, _, err = self.queue("alice--proj", "1", "--no-start")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("queued alice--proj#1", self.log())
+        self.assertEqual(urls, ["https://github.com/acme/proj.git"])   # the host's spelling of the owner, not the row's
+        self.assertIn(["cc-gh-token", "repos", "alice", "acme"], self.box()["calls"])
+        self.assertEqual([(r["repo"], r["pr"]) for _, r in J.requests()], [("alice--proj", 1)])   # the queued job
+        # an org the host granted nothing for: refused before any token or clone, whatever the row says
+        self.row_pr("https://github.com/evil-org/proj/pull/2")
+        self.set_box(calls=[])
+        with mock.patch.object(M, "member_clone", clone):
+            rc, _, err = self.queue("alice--proj", "2", "--no-start")
+        self.assertEqual(rc, 1)
+        self.assertIn("refused alice--proj#2 not-its-repository", self.log())
+        self.assertIn("evil-org/proj is not under an account this workspace was granted (acme, own)", err)
+        self.assertFalse([c for c in self.box()["calls"] if c[0] == "cc-gh-token"])
+        self.assertEqual(urls, ["https://github.com/acme/proj.git"])
+        self.assertEqual(len(J.requests()), 1)
+        # the granted org, but a repository the workspace does not own there: still refused
+        self.row_pr("https://github.com/acme/other/pull/3")
+        rc, _, err = self.queue("alice--proj", "3", "--no-start")
+        self.assertEqual(rc, 1)
+        self.assertIn("acme/other is not a repository of workspace alice", err)
 
     def test_walls(self):
         self.make_member()

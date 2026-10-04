@@ -4,9 +4,20 @@
                           own — decided by the marker DEV/<h>/.cc/member-workspace, never by the name.
   member_token(h)         the granted token: MEMBERS/<h>/github-token must be a LINK to a mode-600 file; else "".
                           Printed nowhere.
-  member_project_url(h, t, pr)  (url, "") or ("", why): the board row's `pr` is checked, not trusted — the owner
-                          must be CC_GH_PERSONAL_OWNER (cc-config) and the name one `cc-gh-token repos <h> <owner>`
-                          lists; anything else is refused before the token is read.
+  member_board(h)         the workspace's own board, read where it lives: MEMBERS/<h>/board/<h>.json, which the
+                          box's BOARDS/<h>.json links to and J.board() refuses as a link. Opened with O_NOFOLLOW
+                          (and O_NONBLOCK, a regular file only, under a size cap) so a link or FIFO the member leaves
+                          at that name reaches nothing of the host's; {} when it cannot be read, and `tracks` always a dict of dict rows. The content is the
+                          member's own: each caller checks what it takes from it. A workspace never converted, with
+                          a plain (unlinked) BOARDS/<h>.json and no MEMBERS copy, reads that as before.
+  granted_orgs(h)         the GitHub orgs the host granted workspace h a token for, read off the NAME of the link
+                          MEMBERS/<h>/github-token alone: its target must be SECRETS/github-<h>-<org>.token. The
+                          link is read with readlink (never followed, never opened); a target anywhere else, or of
+                          any other name, grants nothing. A set, because a workspace may come to hold one per org.
+  member_project_url(h, t, pr)  (url, "") or ("", why): the board row's `pr` (member_board) is checked, not trusted — its
+                          owner must be one the HOST chose, CC_GH_PERSONAL_OWNER (cc-config) or a granted_orgs(h)
+                          org, and the name one `cc-gh-token repos <h> <owner>` lists; anything else is refused
+                          before the token is read. Neither the row nor the URL decides which owners are accepted.
   member_clone(repo, url) (root, "") or ("", why): the host-only clone <LANDQ>/clones/<h>--<t>, no checkout, its
                           credential gh's helper answering with GH_TOKEN, never the box's login.
   walls(root, base, head, files)  why or "": a boundary path (BOUNDARY_PATHS: .cc/** and the secret stores), or a
@@ -22,9 +33,11 @@ from __future__ import annotations
 
 import fcntl
 import fnmatch
+import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 
@@ -89,20 +102,85 @@ def env(handle):
     return {"GH_TOKEN": tok} if tok else None
 
 
+BOARD_MAX = 8 << 20
+
+
+def member_board(handle) -> dict:
+    if not member_of(handle)[0]:
+        return {}
+    d = f"{J.members_dir()}/{handle}/board"
+    p = f"{d}/{handle}.json"
+    if not os.path.lexists(p) and not os.path.lexists(d):
+        return J.board(handle)   # never converted: the board is a plain file under BOARDS (J.board refuses a link)
+    if os.path.islink(f"{J.members_dir()}/{handle}") or os.path.islink(d):
+        return {}
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return {}
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > BOARD_MAX:
+            return {}
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            j = json.loads(f.read(BOARD_MAX + 1))
+    except (OSError, ValueError, RecursionError):   # RecursionError: a deep `[[[[…` is not a ValueError
+        return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not isinstance(j, dict):
+        return {}
+    rows = j.get("tracks")   # its callers index rows as dicts: anything else in a member's file is no row
+    j["tracks"] = {k: v for k, v in rows.items() if isinstance(v, dict)} if isinstance(rows, dict) else {}
+    return j
+
+
+ORG_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+
+
+def granted_orgs(handle) -> set:
+    # Most member workspaces' repositories sit in an org of the member's own, not the owner's account, so
+    # the owner's own account alone refused the sweep's every queue (review of #965). Which orgs is the HOST's word:
+    # `cc-sandbox github` names the link's target after the org it granted, and only that name is read here.
+    if not HANDLE_RE.fullmatch(handle or ""):
+        return set()
+    d = f"{J.members_dir()}/{handle}"
+    g = f"{d}/github-token"
+    try:
+        if os.path.islink(d) or not os.path.islink(g):
+            return set()
+        target = os.readlink(g)
+    except OSError:
+        return set()
+    secrets = os.path.normpath(f"{J._home()}/.cc/secrets")
+    full = os.path.normpath(os.path.join(d, target))
+    base = os.path.basename(full)
+    if os.path.dirname(full) != secrets or not base.startswith(f"github-{handle}-") or not base.endswith(".token"):
+        return set()
+    org = base[len(f"github-{handle}-"):-len(".token")]
+    return {org} if ORG_RE.fullmatch(org) else set()
+
+
 def member_project_url(handle, track, pr):
-    row = (J.board(handle).get("tracks") or {}).get(track) or {}
+    row = (member_board(handle).get("tracks") or {}).get(track) or {}
     m = re.fullmatch(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/([0-9]+)", row.get("pr") or "")
     if not m or m.group(3) != str(pr):
         return "", f"the {handle} board row for {track} does not carry PR #{pr} (pr='{row.get('pr') or ''}')"
     owner, name = m.group(1), m.group(2)
     powner = config("CC_GH_PERSONAL_OWNER")
-    if not powner or owner.lower() != powner.lower():
-        return "", (f"{owner}/{name} is not under the owner's own account "
-                    f"({powner or 'CC_GH_PERSONAL_OWNER is not set'}) — a granted token opens nothing else")
-    rc, out, _ = run([f"{J.bin_dir()}/cc-gh-token", "repos", handle, powner], timeout=60)
+    accepted = ({powner} if powner else set()) | granted_orgs(handle)
+    # the owner handed on below is the HOST's spelling of it, taken from `accepted`, never the URL's
+    hit = next((a for a in sorted(accepted) if a.lower() == owner.lower()), "")
+    if not hit:
+        return "", (f"{owner}/{name} is not under an account this workspace was granted "
+                    f"({', '.join(sorted(accepted)) or 'none: no CC_GH_PERSONAL_OWNER and no org token'})"
+                    f" — a granted token opens nothing else")
+    rc, out, _ = run([f"{J.bin_dir()}/cc-gh-token", "repos", handle, hit], timeout=60)
     if rc or name.lower() not in {x.strip().lower() for x in out.splitlines() if x.strip()}:
-        return "", f"{owner}/{name} is not a repository of workspace {handle} (cc-gh-token repos {handle} {powner})"
-    return f"https://github.com/{owner}/{name}.git", ""
+        return "", f"{owner}/{name} is not a repository of workspace {handle} (cc-gh-token repos {handle} {hit})"
+    return f"https://github.com/{hit}/{name}.git", ""
 
 
 def member_clone(repo, url):
@@ -194,5 +272,5 @@ def route(job) -> str:
     return f"#{job.member}" if getattr(job, "member", None) else ""
 
 
-__all__ = ["member_of", "boundary_path", "member_token", "member_project_url", "member_clone", "walls", "spent",
+__all__ = ["member_of", "boundary_path", "member_token", "member_board", "granted_orgs", "member_project_url", "member_clone", "walls", "spent",
            "charge", "route", "env", "BOUNDARY_PATHS", "TOKEN_SHAPES", "MEMBER_DAILY_USD"]

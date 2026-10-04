@@ -296,10 +296,12 @@ mkdir -p "$GH/.cc/members/alice"; echo '{"claudeAiOauth": {"accessToken": "not-a
 # The --go half runs on `t9` and not on `todo`: `todo` above is a plain directory with a lying marker in it, made
 # to test exactly that, and a dispatch now claims the row first — which refuses a name that is not really a
 # worktree on this row's branch (bin/cc-task). A member workspace's own track is what this case is about.
+# recurring-defect-ok: pause-hold-missing — a fixture HOME with tmux stubbed to a log; no real worker starts and no real board is written
 : > "$T/tmux.log"; sout "$B/cc" alice; sout "$B/cc" other; sout "$B/cc" alice t9 --go 'do a thing'
 grep -q '__runmember alice' "$T/tmux.log" && grep -q 'cc-sandbox member alice t9 -- cc-loop' "$T/tmux.log" \
+  && grep -q 'cc-loop member-stop alice t9 \$?' "$T/tmux.log" \
   && ! grep -q 'runmember other' "$T/tmux.log" && ! grep -q 'cc-sandbox member other' "$T/tmux.log" \
-  && ok "...and the window cc opens for a member target IS the boundary: the session runs \`cc __runmember\` (which execs cc-sandbox member) and a --go loop runs \`cc-sandbox member <handle> <track> -- cc-loop\`, one wall not two, while an ordinary repo gets neither" \
+  && ok "...and the window cc opens for a member target IS the boundary: the session runs \`cc __runmember\` (which execs cc-sandbox member) and a --go loop runs \`cc-sandbox member <handle> <track> -- cc-loop\`, one wall not two, then \`cc-loop member-stop\` on the host with its exit, while an ordinary repo gets neither" \
   || bad "member launch is not inside the boundary: $(tr '\n' '|' < "$T/tmux.log")"
 # A REPO THE BOX ALREADY HAD BECOMES ONE THE SAME WAY. The four that exist came from cc-slack's join flow; `cc-sandbox
 # convert` is the path for a repo already on the box, and it writes the same markers — so every layer that reads them off
@@ -437,7 +439,7 @@ git -C "$GH/dev/alice" worktree remove --force "$w6" >/dev/null 2>&1; git -C "$G
 git init -q --bare "$T/t9.git"
 git -C "$GH/dev/alice" worktree add -q -b track/t9 "$GH/.cc/worktrees/alice/t9" 2>/dev/null
 w9="$GH/.cc/worktrees/alice/t9"; mkdir -p "$w9/.cc"; printf 'alice\nt9\n' > "$w9/.cc/track"
-git -C "$w9" remote add t9 "$T/t9.git"
+git -C "$w9" remote add origin "$T/t9.git"   # in the boundary only origin is pushed to (cc-checkpoint pick_remote)
 git -C "$w9" -c user.email=t@t -c user.name=t commit -q --allow-empty -m t9
 echo dirty > "$w9/work.txt"   # the same shape as t6: a dirty worktree is what makes the plain checkpoint commit, and then push
 env HOME="$GH" "$B/cc-board" add alice t9 "a living project" >/dev/null; env HOME="$GH" "$B/cc-board" set alice t9 kind session

@@ -12,6 +12,8 @@
 #                                           and `blocked` where it has none. Only a bound reached with nothing
 #                                           committed is exit 6 / `blocked` / "paused".
 #   cc-loop worker-model [M]  the model a worker runs on, and why (worker_model below) — cc names it on its dispatch line
+#   cc-loop member-stop <handle> <track> <rc>  ON THE HOST, after `cc-sandbox member … -- cc-loop` exits: the failures-ledger
+#                                            record the loop inside could not write (member_stop below)
 #   cc-loop context-report <session.jsonl>…  what a turn of a past iteration actually carried, and what the context
 #                                            trim below would have left of it — the shadow week's one command
 # THE STEP LIMIT IS A CHECKPOINT, NOT A VERDICT: reaching --max-iter with work COMMITTED in that iteration buys
@@ -368,6 +370,21 @@ round_end(){   # $1 did the last iteration commit? · $2 the track's PR, if it h
   [ "${1:-no}" = yes ] || { printf 'paused|blocked\n'; return 0; }
   [ -n "${2:-}" ] && printf 'over|review\n' || printf 'over|blocked\n'; }
 
+inside_boundary(){ [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; }   # set by `cc-sandbox member`: this loop runs inside a workspace's boundary
+complete_task(){   # → the completion receipt on stdout (the JSON delivery_end reads); the rest goes to $LOG
+  # INSIDE A MEMBER WORKSPACE'S BOUNDARY there is no lander: ~/.cc/lander is not bound, so `cc-land queue --task`
+  # refused with "no pinned release" and printed no receipt, and every finished member task stopped at exit 12 with
+  # its PR unqueued (2026-09-28 to 10-03, ten loops). The boundary's own completion is `cc done --json` — it commits,
+  # pushes on the workspace's token and opens the PR in the project's repository — and the HOST queues the landing:
+  # cc-checkpoint --sweep, within five minutes, as <h>--<track> (docs/design-member-workspaces.md, Landing). So in
+  # there the receipt is cc done's own, with a landing line that says who queues it; nothing in here can.
+  if inside_boundary; then
+    local r; r=$(env "${HG[@]}" "${CC_DONE:-$BIN/cc}" done "$repo" "$track" --json 2>>"$LOG")   # CC_DONE: test hook
+    # the landing line only on a receipt that names a PR: a failed one has nothing for the sweep to pick up
+    jq -ce 'if type == "object" and (.pr_url // "") != "" then .landing = {status: "host", message: "The box picks it up from here: if this workspace lands its own PRs, its sweep queues the PR within five minutes."} else . end' <<<"$r" 2>/dev/null || printf '%s\n' "$r"
+  else
+    env "${HG[@]}" "${CC_LAND:-$BIN/cc-land}" queue --task "$repo" "$track" 2>>"$LOG"   # CC_LAND: test hook
+  fi; }
 delivery_end(){   # $1 host receipt → outcome. A real PR survives a failed board/card projection.
   jq -er '
     if type != "object" or (.task_id | type) != "string" or (.errors | type) != "array" then "unknown"
@@ -444,8 +461,32 @@ stop_kind(){ case "$1" in 5|6|9|10) echo worker-loop/barren-stop;; 4|12) echo wo
 stop_record(){   # $1 exit code, $2 title, $3 message → one failures-ledger record for a stop that is a failure (stop_kind), none for the rest.
                  # Prints what the ledger said; exit 0 always — "a writer that fails must never fail" the stop it is in.
   local k r; k=$(stop_kind "$1"); [ -n "$k" ] || { echo "not a failure (exit $1)"; return 0; }
+  # INSIDE A MEMBER'S BOUNDARY neither the catalogue (core/config) nor the ledger (~/.cc/failures) is bound, so a
+  # record made here went nowhere. The host writes it when the boundary exits (member_stop below), from the exit code.
+  inside_boundary && { echo "left to the host: it records exit $1 when the boundary exits"; return 0; }
   r=$("$BIN/cc-green" red "$repo" "$k" "loop:$repo/$track:$1:$$" --observed "cc-loop exit $1 ($2): $3"         --expected "a worker loop ends in a PR, a DONE or a question" --log "${LOG:-}" --writer cc-loop         --link "track=$track" --link "exit=$1" --cost "iterations=${i:-0}" --cost "usd=${spent:-0}" 2>&1 | tail -1) || r="not recorded: cc-green red failed"
   echo "${r:-not recorded: cc-green red said nothing}"; return 0; }
+member_stop(){   # $1 handle, $2 track, $3 the exit code `cc-sandbox member … -- cc-loop` returned → one failures-ledger
+  # record ON THE HOST for a member loop's stop ("after cc-sandbox member exits, the host records the stop from the exit
+  # code and the host-bound loop.log" — the brief). cc runs this after the boundary, in the same tmux window.
+  # NOTHING THE MEMBER WROTE IS COPIED IN: the exit code picks one of stop_kind's fixed kinds and the observed text is
+  # the host's own. The log is a link only, never an excerpt (cc-green red --log would copy member text into the
+  # ledger the planning seat reads), and nothing is written into the member's state dir (a planted link there would
+  # take a host append anywhere). Always exit 0, as stop_record: a writer that fails never fails the stop it is in.
+  # THE LINK IS NAMED member-log, NOT log: that path is the member's to write, so it can be a link to anything of the
+  # host's. Nothing in the box opens a record's links today (cc-failures prints them as text); whatever comes to read
+  # this one opens it O_NOFOLLOW as a regular file, the way members.member_board reads a member's board (review of #965).
+  local h=${1:-} t=${2:-} rc=${3:-} k r
+  inside_boundary && { echo "cc-loop member-stop: the host side of the boundary only" >&2; return 0; }
+  [[ "$h" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$rc" =~ ^[0-9]+$ ]] \
+    || { echo "cc-loop member-stop: usage: member-stop <handle> <track> <exit code>" >&2; return 0; }
+  k=$(stop_kind "$rc"); [ -n "$k" ] || { echo "failures ledger ($h): not a failure (exit $rc)"; return 0; }
+  r=$("$BIN/cc-green" red "$h" "$k" "loop:$h/$t:$rc:host:$(date -u +%Y%m%dT%H%MZ)" \
+        --observed "a member workspace's cc-loop exited $rc inside its boundary" \
+        --expected "a worker loop ends in a PR, a DONE or a question" --writer cc-loop \
+        --link "track=$t" --link "exit=$rc" --link "boundary=member" --link "member-log=$HOME/.cc/state/$h/$t/loop.log" 2>&1 | tail -1) \
+    || r="not recorded: cc-green red failed"
+  echo "failures ledger ($h, recorded by the host): ${r:-not recorded: cc-green red said nothing}"; return 0; }
 tier_hold(){   # $1 start|continue · $2 repo/track -> 0 the spend tier says this must WAIT, 1 it may go. cc-tier owns the
                # table (`cc-tier allows`); this reads its exit alone: 1 is "wait", 0 is "go", and anything else — no
                # cc-tier on this box, a crash — is "go", the same leniency `cc-pause is` gets: a tier that cannot be
@@ -907,6 +948,59 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
     "$(grep -E '^[^#]*"\$BIN/cc-notify" ' "$0" | grep -oE 'done_card|--id "done:|--ask|blocked:' | tr '\n' ' ')" '--id "done: --ask blocked: '
   t '…into the track thread, by its title, once per PR, with no count and no dollar figure' \
     "$(cut -d'|' -f1-4 "$d/lb.n")|$(grep -c '\$' "$d/lb.n")" "--id|done:lp/dn:pr9|-t|lp/dn done|0"
+  # ── A MEMBER'S DONE, INSIDE ITS BOUNDARY ── no lander is bound in there, so the receipt is `cc done --json`'s own and
+  # the host's sweep queues the landing. Its own fixture: a cc-land that answers as the unbound lander did (exit 3, no
+  # receipt) and a cc that records its argv. Inside: exit 0, one card naming cc done's PR, the lander never asked.
+  # Control, the same fixture on the host: the lander is asked, and its missing receipt is still exit 12.
+  printf '#!/bin/sh\necho called >> "%s"\necho "lander: no pinned release at $HOME/.cc/lander/current" >&2\nexit 3\n' "$d/mi.land" > "$lb/landnone"
+  printf '#!/bin/sh\nfor a in "$@"; do printf "%%s|" "$a"; done >> "%s"\nprintf "%%s\\n" "{\\"task_id\\":\\"x\\",\\"committed_sha\\":\\"abc\\",\\"pending\\":{},\\"errors\\":[],\\"pr_url\\":\\"https://x/pull/5\\"}"\n' "$d/mi.done" > "$lb/ccdone"
+  chmod +x "$lb/landnone" "$lb/ccdone"
+  mrun(){ c=$1; mkdir -p "$lh/.cc/state/lp/$c" "$lh/.cc/worktrees/lp/$c"; echo "the task" > "$lh/.cc/state/lp/$c/task.md"; echo '{}' > "$lh/.cc/state/lp/$c/delivery.json"
+    git -C "$lh/.cc/worktrees/lp/$c" init -q; git -C "$lh/.cc/worktrees/lp/$c" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    : > "$d/lb.n"; : > "$d/mi.land"; : > "$d/mi.done"
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/landnone" CC_DONE="$lb/ccdone" CC_FAILURES="$d/lb.fl" \
+        FK_ST="$lh/.cc/state/lp/$c" FK_LINE='STATUS: DONE' FK_COMMIT=0 ${2:+CC_MEMBER_SANDBOX=1} "$lb/cc-loop" lp "$c" --max-iter 1 ) >/dev/null 2>&1; echo $?; }
+  t "inside a member's boundary a DONE completes through cc done --json and exits 0, never asking the lander it cannot see" \
+    "$(mrun mi in)|$(cat "$d/mi.done")|$(grep -c . "$d/mi.land")" "0|done|lp|mi|--json||0"
+  t '…its one card names the PR cc done opened' "$(cut -d'|' -f1-2 "$d/lb.n")" "--id|done:lp/mi:pr5"
+  t '…and its receipt, which names a PR, carries the line saying the host queues the landing' \
+    "$(grep '^{' "$lh/.cc/state/lp/mi/loop.log" | jq -r 'select(has("errors")) | .landing.status // "none"' 2>/dev/null | tail -1)" host
+  t 'control, on the host: the lander is asked, cc done is not, and no receipt is still exit 12' \
+    "$(mrun mh)|$(grep -c . "$d/mi.done")|$(grep -c . "$d/mi.land")" "12|0|1"
+  # ── THE REAL `cc done`, INSIDE A MEMBER'S BOUNDARY, WITH NOWHERE TO PUSH ── the case above stubs cc done, and that
+  # hid the ending this one pins (review of #965): with no remote the real one took "no remote, no PR", marked the row
+  # done, said delivered and exited 0, so the loop exited 0 and nothing reached the queue or the ledger. Its own
+  # fixture: real copies of cc, cc-task, cc-checkpoint and cc-board on a scratch HOME; a member workspace with no
+  # origin, its track's worktree, a claimed task. Run twice: no remote at all, then one named after the track.
+  # Both must stop at exit 4 (a push-stage error), name `cc done` on the host, leave the row undone, open no PR and
+  # push nothing to the track-named remote. (`queued` is the status `cc-board add` gives a row; done would be `done`.)
+  local rb="$d/rb" rw="$lh/dev/mw" x
+  mkdir -p "$rb"; cp "$BIN/cc" "$BIN/cc-task" "$BIN/cc-checkpoint" "$BIN/cc-board" "$rb/"
+  for x in cc-config cc-scope cc-trust cc-slack cc-notify cc-room cc-lib tmux cc-gh-token; do printf '#!/bin/sh\nexit 1\n' > "$rb/$x"; done
+  printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$d/rd.gh" > "$rb/gh"; chmod +x "$rb"/*; : > "$d/rd.gh"
+  mkdir -p "$rw/.cc"; : > "$rw/.cc/member-workspace"; printf '/.cc/\n' > "$rw/.gitignore"
+  git -C "$rw" init -q -b main; git -C "$rw" add -A; git -C "$rw" -c user.name=t -c user.email=t@t commit -q -m base
+  git init -q --bare "$d/rd-track.git"
+  rrun(){ c=$1; local w="$lh/.cc/worktrees/mw/$c" s="$lh/.cc/state/mw/$c"
+    mkdir -p "$lh/.cc/worktrees/mw" "$s"; git -C "$rw" worktree add -q -b "track/$c" "$w"; echo "the task" > "$s/task.md"
+    [ -z "${2:-}" ] || git -C "$rw" remote add "$c" "$d/rd-track.git"
+    ( export HOME="$lh" PATH=/usr/bin:/bin; "$rb/cc-board" init mw "$rw" main; "$rb/cc-board" add mw "$c" "$c title" brief
+      [ -n "${3:-}" ] || "$rb/cc-task" claim mw "$c" --executor worker ) >/dev/null 2>&1
+    : > "$d/lb.n"
+    [ -z "${3:-}" ] || { ( cd "$w" && env -i PATH=/usr/bin:/bin HOME="$lh" CC_MEMBER_SANDBOX=1 "$rb/cc" done mw "$c" ) > "$d/rd.out" 2>&1; echo $?; return; }
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/landnone" CC_DONE="$rb/cc" CC_FAILURES="$d/lb.fl" \
+        FK_ST="$s" FK_LINE='STATUS: DONE' FK_COMMIT=0 CC_MEMBER_SANDBOX=1 "$lb/cc-loop" mw "$c" --max-iter 1 ) >/dev/null 2>&1; echo $?; }
+  rcheck(){ local s="$lh/.cc/state/mw/$1"
+    printf '%s|%s|%s|%s|%s|%s' "$(grep '^{' "$s/loop.log" | jq -c 'select(type == "object" and has("errors")) | [.pr_url, ([.errors[].stage] | index("push") != null), (.landing == null)]' 2>/dev/null | tail -1)" \
+      "$(HOME="$lh" "$rb/cc-board" get mw "$1" status 2>/dev/null)" "$(grep -c 'pr create' "$d/rd.gh")" \
+      "$(git --git-dir="$d/rd-track.git" for-each-ref | grep -c .)" "$(grep -c "cc done mw $1 on the host" "$s/loop.log")" "$(grep -c 'no remote, so no PR' "$s/loop.log")"; }
+  t "inside a member's boundary the REAL cc done with no remote is undelivered: the loop stops at exit 4, never 0" "$(rrun nr)" 4
+  t '…its receipt has no PR, a push-stage error and no landing line, the row is not done, no PR is asked for, and the stop names cc done on the host' \
+    "$(rcheck nr)" "[null,true,true]|queued|0|0|1|0"
+  t 'the same with only a remote named after the track: exit 4, and nothing is pushed to that remote' "$(rrun tn track)" 4
+  t '…the same receipt, the row not done, and the track-named remote untouched' "$(rcheck tn)" "[null,true,true]|queued|0|0|1|0"
+  t 'a hand-run cc done inside (no task record) says undelivered and exits 1, and leaves the row as it was' \
+    "$(rrun hd '' hand)|$(grep -c 'undelivered, needs the host' "$d/rd.out")|$(HOME="$lh" "$rb/cc-board" get mw hd status 2>/dev/null)" "1|1|queued"
   # ── A STOP'S BOLD LINE IS A SENTENCE ── the row's title and what happened to it, with no colon between two
   # fragments; the four titles that do not read as a verb phrase after a title are said in words instead.
   sh_(){ ( repo=titled track=t1 BOARD="$BIN/cc-board" HOME="$d/bh"; stop_headline "$1" ); }
@@ -1056,6 +1150,19 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
   t 'exit 8 (the limit outlasted the wait) is worker-loop/limit-outlasted-wait' "$(sr c 8 waiting 'x' >/dev/null; CC_FAILURES="$d/fl/c" "$BIN/cc-failures" show --json --scope lp | jq -r '.[0].kind')" worker-loop/limit-outlasted-wait
   t 'exit 3 (the worker asked) is not a failure and writes nothing' "$(sr e 3 waiting 'a question')|$(ls "$d/fl/e" 2>/dev/null | wc -l)" "not a failure (exit 3)|0"
   t 'exit 11 (parked) and 13 (tier) write nothing either' "$(sr f 11 parked x | cut -c1-13),$(sr f 13 tier x | cut -c1-13)|$(ls "$d/fl/f" 2>/dev/null | wc -l)" "not a failure,not a failure|0"
+  # A MEMBER LOOP'S STOP: inside the boundary nothing is written (the ledger is not there); the host writes it after.
+  t 'inside a member boundary stop_record leaves the stop to the host and writes nothing' \
+    "$(CC_MEMBER_SANDBOX=1 sr g 12 'no receipt' x | cut -c1-13)|$(ls "$d/fl/g" 2>/dev/null | wc -l)" "left to the h|0"
+  mkdir -p "$d/fl/mh/mem/t2"; printf 'MEMBERTEXT error (2): planted\n' > "$d/fl/mh/mem/t2/loop.log"
+  ms(){ ( export CC_FAILURES="$d/fl/$1" HOME="$d/fl/mh"; unset CC_MEMBER_SANDBOX; member_stop "${@:2}" ); }
+  t 'member-stop on the host records exit 12 under the handle, as done-undelivered' "$(ms h mem t2 12 | cut -c1-53)" \
+    "failures ledger (mem, recorded by the host): recorded"
+  t '…one record, keyed to the host, linking the log and copying none of the member text into it' \
+    "$(CC_FAILURES="$d/fl/h" "$BIN/cc-failures" show --json --scope mem | jq -r '"\(length) \(.[0].kind) \(.[0].links.exit) \(.[0].links.track) \(.[0].links["member-log"] | endswith("/mem/t2/loop.log")) \(.[0].links.log == null) \([.[0].evidence[]? | select(startswith("excerpt:"))] | length)"')|$(grep -rc MEMBERTEXT "$d/fl/h" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')" \
+    "1 worker-loop/done-undelivered 12 t2 true true 0|0"
+  t 'member-stop: exit 3 (asked) writes nothing; a bad handle or code is refused; inside it does nothing' \
+    "$(ms i mem t2 3 | sed 's/.*: //')|$(ms i '../x' t2 12 2>&1 | cut -c1-26)|$(ms i mem t2 x 2>&1 | cut -c1-26)|$(CC_MEMBER_SANDBOX=1 member_stop mem t2 12 2>&1 | cut -c1-27)|$(ls "$d/fl/i" 2>/dev/null | wc -l)" \
+    "not a failure (exit 3)|cc-loop member-stop: usage|cc-loop member-stop: usage|cc-loop member-stop: the ho|0"
   mkdir -p "$d/fl/ro"; chmod 500 "$d/fl/ro"
   t 'a ledger that cannot be written is one line, exit 0, and the stop goes on' "$(o=$(sr ro/x 9 runaway x); echo "${o:0:12} rc=$?")" "not recorded rc=0"
   chmod 700 "$d/fl/ro"
@@ -1065,6 +1172,7 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
 [ "${1:-}" = selfcheck ] && { selfcheck; exit $?; }
 [ "${1:-}" = worker-model ] && { worker_model "${2:-}"; exit 0; }   # cc asks this to name the model on its dispatch line
 [ "${1:-}" = context-report ] && { context_report "${@:2}"; exit $?; }
+[ "${1:-}" = member-stop ] && { member_stop "${@:2}"; exit 0; }   # cc runs it on the host after a member's boundary exits
 repo="${1:?repo}"; track="${2:?track}"; shift 2
 MAXI=10; BUDGET=8; TURNS=80; MODEL=""; EFFORT="${CC_WORKER_EFFORT:-medium}"; QUIET=0; RESUME=0   # an opus-class worker spends ~$2/iteration: a $2 cap truncated real work mid-turn
 while [ $# -gt 0 ]; do case "$1" in
@@ -1220,7 +1328,8 @@ while [ $i -lt "$MAXI" ]; do
   newprog=$(this_iteration "$SNAP" "$ST/progress.md")   # only THIS iteration's lines count, by position — see the function (a re-dispatched track must not "finish" on an old STATUS line, and must not MISS a new one that reads the same)
   if grep -qE '^STATUS: DONE' <<<"$newprog"; then
     "$BOARD" note "$repo" "$track" "loop: DONE after $i iteration(s), \$$spent" >/dev/null 2>&1
-    # A ROW WITH A TASK RECORD GOES THROUGH THE ONE HOST COMMAND. `cc-land queue --task` completes the task and,
+    # A ROW WITH A TASK RECORD GOES THROUGH THE ONE HOST COMMAND (complete_task; inside a member workspace's boundary,
+    # where there is no lander, it is that boundary's `cc done --json` instead). `cc-land queue --task` completes the task and,
     # where the standing grant holds, puts the PR on the same numeric queue a 👍 uses; the loop decides from the
     # RECEIPT it prints, never from an exit code — a board or card projection that could not be written used to
     # turn a real PR into "finished, but opened no PR". The branch below is the legacy one, for a row that has no
@@ -1228,13 +1337,16 @@ while [ $i -lt "$MAXI" ]; do
     deliver_post   # the worker's Slack deliverable, if the brief asked for one: posted here, once, before the PR
     if [ -e "$ST/delivery.json" ] || [ -L "$ST/delivery.json" ]; then
       log "DONE"
-      rec=$(env "${HG[@]}" "${CC_LAND:-$BIN/cc-land}" queue --task "$repo" "$track" 2>>"$LOG")   # CC_LAND: test hook
+      # the command that finishes it by hand. Inside a member's boundary there is no lander and nothing to push to
+      # but the workspace's origin, so it is the HOST's `cc done` (review of #965), never one typed in there.
+      rec=$(complete_task); retry="cc-land queue --task $repo $track"; redo="cc done $repo $track"
+      inside_boundary && { retry="cc done $repo $track on the host"; redo=$retry; }
       printf '%s\n' "$rec" >> "$LOG"
       case "$(delivery_end "$rec")" in
         failed) why=$(jq -r '[.errors[] | select(.stage == "commit" or .stage == "push" or .stage == "pr") | .message] | join("; ")' <<<"$rec")
-          stop 4 "finished, but opened no PR" "the worker wrote STATUS: DONE, but cc done failed: $why. Fix the cause, then: cc done $repo $track";;
-        unknown) stop 12 "delivery unconfirmed" "completion returned no usable receipt; inspect $LOG, then: cc-land queue --task $repo $track";;
-        pending) note="delivery projection pending: $(jq -r '.pending | keys | join(", ")' <<<"$rec"); retry: cc-land queue --task $repo $track"
+          stop 4 "finished, but opened no PR" "the worker wrote STATUS: DONE, but cc done failed: $why. Fix the cause, then: $redo";;
+        unknown) stop 12 "delivery unconfirmed" "completion returned no usable receipt; inspect $LOG, then: $retry";;
+        pending) note="delivery projection pending: $(jq -r '.pending | keys | join(", ")' <<<"$rec"); retry: $retry"
           log "$note"; "$BOARD" note "$repo" "$track" "$note" >/dev/null 2>&1;;   # the PR is real: a note, not a page
       esac
       # WHAT FINISHED, not how many turns it took to finish it: the iteration count and the dollar figure are the
