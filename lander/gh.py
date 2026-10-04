@@ -1,8 +1,8 @@
 """GitHub, through the `gh` on PATH — the one place the lander asks it anything or merges.
 
     gh(argv, root, token=None, timeout=120)  -> (rc, stdout, stderr). A member landing passes its workspace token:
-        it goes in GH_TOKEN (GH_CONFIG_DIR at an empty dir, so the box's own login is never used) and is printed
-        nowhere.
+        it goes in GH_TOKEN (GH_CONFIG_DIR at an empty dir outside the clone, members.gh_config_dir, so the box's
+        own login is never used) and is printed nowhere.
     pr_facts(root, pr, fields) -> (dict, "") | (None, why)     one `gh pr view --json <fields> [-R <slug>]`
     pr_files(root, pr) -> [paths] | None · slug(root) -> "owner/name" | ""
     merge_state(root, pr) -> (state, merge_oid): GitHub's "MERGED"/"OPEN"/"CLOSED" and the squash commit's oid, or
@@ -67,7 +67,12 @@ def _note(rc: int, out: str, err: str) -> None:
 def gh(argv, root, token=None, timeout=120):
     env = dict(os.environ)
     if token:
-        env.update(GH_TOKEN=token, GH_CONFIG_DIR=os.path.join(root, ".gh-none"))
+        from lander import members as M   # members imports nothing of this module
+        try:
+            ghc = M.gh_config_dir(root)
+        except OSError as e:
+            return 1, "", f"cannot make an empty GH_CONFIG_DIR for {root}: {e}"
+        env.update(GH_TOKEN=token, GH_CONFIG_DIR=ghc)
     try:
         p = subprocess.run(["gh", *argv], cwd=root, capture_output=True, text=True, timeout=timeout, env=env,
                            stdin=subprocess.DEVNULL)

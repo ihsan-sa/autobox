@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -517,6 +518,37 @@ class Members(Fixture):
             rc, _, err = self.queue("alice--proj", "2", "--no-start")   # the board row carries #1, not #2
         self.assertEqual(rc, 1)
         self.assertIn("refused alice--proj#2 not-its-repository", self.log())
+
+    def test_a_first_member_clone_really_clones_with_gh_config_outside_it(self):
+        # git itself, not a stub: a GH_CONFIG_DIR made inside the clone dir left it non-empty and `git clone … .`
+        # refused every first clone ("destination path '.' already exists and is not an empty directory")
+        self.make_member()
+        shutil.rmtree(J.clones_dir())   # a fresh box: no clones dir at all yet
+        seen, real_run = [], M.run
+        def spy(argv, cwd=None, timeout=60, env=None):
+            seen.append((argv, cwd, dict(env or {})))
+            return real_run(argv, cwd=cwd, timeout=timeout, env=env)
+        with mock.patch.object(M, "run", spy):
+            root, why = M.member_clone("alice--proj", self.origin)
+        self.assertEqual((root, why), (f"{J.clones_dir()}/alice--proj", ""))
+        self.assertTrue(os.path.isdir(f"{root}/.git"))
+        self.assertEqual(self.git(root, "rev-parse", "origin/main"), self.git(self.origin, "rev-parse", "main"))
+        clone = [e for a, _, e in seen if a[:2] == ["git", "clone"]]
+        self.assertEqual(len(clone), 1)
+        ghc = clone[0]["GH_CONFIG_DIR"]
+        self.assertEqual(clone[0]["GH_TOKEN"], "tok-value")
+        self.assertFalse(os.path.realpath(ghc).startswith(os.path.realpath(root) + os.sep), ghc)
+        self.assertEqual(os.listdir(ghc), [])
+        self.assertEqual(stat.S_IMODE(os.stat(ghc).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(ghc)).st_mode), 0o700)
+        self.assertFalse(os.path.exists(f"{root}/.gh-none"))
+        # gh with a member's token uses that same dir, never one inside the clone
+        with mock.patch.object(GH.subprocess, "run", side_effect=OSError("no gh")) as r:
+            GH.gh(["pr", "view", "1"], root, token="tok-value")
+        self.assertEqual(r.call_args.kwargs["env"]["GH_CONFIG_DIR"], ghc)
+        self.assertFalse(os.path.exists(f"{root}/.gh-none"))
+        # the existing-clone branch keeps the clone and only re-points origin
+        self.assertEqual(M.member_clone("alice--proj", self.origin), (root, ""))
 
     def converted(self):
         """The layout a converted workspace has: BOARDS/alice.json is a link into MEMBERS/alice/board/."""

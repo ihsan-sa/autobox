@@ -20,6 +20,8 @@
                           before the token is read. Neither the row nor the URL decides which owners are accepted.
   member_clone(repo, url) (root, "") or ("", why): the host-only clone <LANDQ>/clones/<h>--<t>, no checkout, its
                           credential gh's helper answering with GH_TOKEN, never the box's login.
+  gh_config_dir(root)     the empty GH_CONFIG_DIR for gh on that clone, <LANDQ>/clones/.gh-none/<h>--<t>: outside
+                          the clone, since git will not clone into a directory that holds anything.
   walls(root, base, head, files)  why or "": a boundary path (BOUNDARY_PATHS: .cc/** and the secret stores), or a
                           token shape (TOKEN_SHAPES) on an ADDED line of the diff, read in git.sealed() with --text so
                           no attribute of the member's hides a line. Checked before any check runs.
@@ -183,6 +185,15 @@ def member_project_url(handle, track, pr):
     return f"https://github.com/{hit}/{name}.git", ""
 
 
+def gh_config_dir(root) -> str:
+    """The empty GH_CONFIG_DIR gh runs with for the clone `root` (mode 0700, made here): <clones>/.gh-none/<name>,
+    beside the clone and never inside it, since `git clone … .` refuses a directory that already holds anything."""
+    d = f"{J.clones_dir()}/.gh-none"
+    for x in (J.clones_dir(), d, f"{d}/{os.path.basename(os.path.normpath(root))}"):
+        os.makedirs(x, mode=0o700, exist_ok=True)
+    return x
+
+
 def member_clone(repo, url):
     root = f"{J.clones_dir()}/{repo}"
     h = member_of(repo)[0]
@@ -191,13 +202,14 @@ def member_clone(repo, url):
             run(["git", "remote", "set-url", "origin", url], cwd=root)
         return root, ""
     try:
-        for d in (J.clones_dir(), root, f"{root}/.gh-none"):
+        for d in (J.clones_dir(), root):
             os.makedirs(d, mode=0o700, exist_ok=True)
+        ghc = gh_config_dir(root)
     except OSError as e:
         return "", f"cannot make {root}: {e}"
     rc, out, err = run(["git", "clone", "-q", "--no-checkout", "-c", "credential.helper=",
                         "-c", "credential.helper=!gh auth git-credential", url, "."], cwd=root, timeout=900,
-                       env=dict(env(h) or {}, GH_CONFIG_DIR=f"{root}/.gh-none"))
+                       env=dict(env(h) or {}, GH_CONFIG_DIR=ghc))
     if rc:
         shutil.rmtree(root, ignore_errors=True)
         return "", f"cannot clone {url}: {(err or out).strip()[-200:]}"
@@ -272,5 +284,5 @@ def route(job) -> str:
     return f"#{job.member}" if getattr(job, "member", None) else ""
 
 
-__all__ = ["member_of", "boundary_path", "member_token", "member_board", "granted_orgs", "member_project_url", "member_clone", "walls", "spent",
+__all__ = ["member_of", "boundary_path", "member_token", "member_board", "granted_orgs", "member_project_url", "member_clone", "gh_config_dir", "walls", "spent",
            "charge", "route", "env", "BOUNDARY_PATHS", "TOKEN_SHAPES", "MEMBER_DAILY_USD"]
