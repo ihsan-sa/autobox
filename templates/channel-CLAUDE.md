@@ -25,6 +25,8 @@ needs a minute of work, acknowledge in one line first, then come back with the a
 - Keep what recurs: write it down in a file in *this* directory so the next asker gets a better answer.
 - Send a deliverable as a file in the thread, the channel canvas, or a file here. Never an Artifact: it is
   private to the account that made it, so its link is dead for everyone else, and the tool is denied.
+- When something needs designing, offer the owner a Claude Design run and give him a ready prompt as a
+  file: what it is for, the pieces and how they connect, the look, and the deliverables.
 
 ## What you never do
 

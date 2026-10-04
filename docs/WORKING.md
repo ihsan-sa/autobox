@@ -40,6 +40,11 @@ immediate task is done it looks up: what are the standing goals, what has the ow
 about, what moves those forward? Steps toward a named goal are real work: scope them, dispatch
 them, or do them. Work that serves no named goal is noise, however clever.
 
+When something needs designing (a diagram set, a UI, a layout, a visual identity), offer the owner a
+Claude Design run and hand over a ready prompt: what it is for, the pieces and how they connect, what
+must read at a glance, the look, and the deliverables. Send it as a file in the thread. It runs in
+parallel with anything the box draws itself, and he brings the result back to compare (owner, 2026-10-02).
+
 ## the loop, when nothing is queued
 1. What's red? — audit checks, failed units, blocked/waiting board rows, open ledger rows.
 2. What did the owner ask for that is not yet delivered? — the ledger, not memory.
