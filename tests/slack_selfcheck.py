@@ -849,6 +849,47 @@ def run_selfcheck():
     dm2.on_edit({"type": "message", "subtype": "message_changed", "channel": "CX", "message": {"ts": "200.4", "user": "UOWNER", "text": "updated"}})
     check("on_edit: edit after delivery emits an update notice with the new text", bool(delivered) and "edited" in delivered[-1]["content"] and "updated" in delivered[-1]["content"])
     # -- alias routing (peer orchestrators) ---------------------------------------------------
+    # a SIGKILLed orch's channel brought back (2026-09-26): unarchive reopens it, and when a newer live channel took
+    # over, the old one is history — lookup still finds the live one, and the old one gets one pinned pointer line
+    check("orch_lookup skips a superseded channel and finds the live one, whatever the table's order",
+          orch_lookup({"COLD": {"target": "r", "alias": "a", "superseded_by": "CNEW"}, "CNEW": {"target": "r", "alias": "a"}}, "r", "a") == "CNEW")
+    was_api, was_cfg = globals()["api"], globals()["load_cfg"]
+    calls = []
+    def fake_ua(method, token, **kw):
+        calls.append(method); return {"ts": "1.2"} if method == "chat.postMessage" else {}
+    globals()["api"], globals()["load_cfg"] = fake_ua, (lambda: {"SLACK_BOT_TOKEN": "x"})
+    try:
+        with orchs_locked():
+            save_orchs({"COLD": {"target": "r", "alias": "a", "name": "r-a-old", "archived": True},
+                        "CNEW": {"target": "r", "alias": "a", "name": "r-a-new"},
+                        "CSOLO": {"target": "r", "alias": "b", "name": "r-b-old", "archived": True}})
+        with contextlib.redirect_stdout(io.StringIO()):
+            r1, r2 = cmd_unarchive(["COLD", "--superseded-by", "CNEW"]), cmd_unarchive(["CSOLO"])
+        t = load_orchs()
+        check("unarchive: the old channel is open again, points at the live one with one pinned line, and the live one is untouched",
+              r1 == 0 and t["COLD"].get("archived") is False and t["COLD"].get("superseded_by") == "CNEW" and t["COLD"].get("pinned") == "1.2"
+              and "archived" not in t["CNEW"] and calls.count("pins.add") == 1 and "conversations.archive" not in calls)
+        check("unarchive: an alias with no live channel gets its old one back as home",
+              r2 == 0 and t["CSOLO"].get("archived") is False and orch_lookup(t, "r", "b") == "CSOLO" and orch_lookup(t, "r", "a") == "CNEW")
+        # --superseded-by must name the same orch's live channel; each refusal leaves the table alone and calls no Slack
+        with orchs_locked():
+            save_orchs({"CA": {"target": "r", "alias": "a", "name": "r-a-1", "archived": True},
+                        "CDEADA": {"target": "r", "alias": "a", "name": "r-a-2", "archived": True},
+                        "CSUPA": {"target": "r", "alias": "a", "name": "r-a-3", "superseded_by": "CA"},
+                        "COTHER": {"target": "r", "alias": "b", "name": "r-b-1"},
+                        "CREPO": {"target": "q", "alias": "a", "name": "q-a-1"}})
+        before = load_orchs(); calls.clear(); err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            refused = [cmd_unarchive(["CA", "--superseded-by", s_]) for s_ in ("CA", "CDEADA", "CSUPA", "COTHER", "CREPO")]
+            notorch = [cmd_unarchive(["CNOPE"]), cmd_unarchive(["CA", "--superseded-by", "CNOPE"])]
+        check("unarchive: --superseded-by refuses itself, an archived channel, a superseded one, another alias's and another repo's",
+              refused == [1] * 5 and load_orchs() == before and not calls and err.getvalue().count("must be the same orch's live channel") == 5)
+        check("unarchive: a channel the table doesn't know, as either side, is refused as not a sub-orch channel",
+              notorch == [1, 1] and load_orchs() == before and not calls and err.getvalue().count("is not a sub-orch channel") == 2)
+        with orchs_locked():
+            save_orchs({})
+    finally:
+        globals()["api"], globals()["load_cfg"] = was_api, was_cfg
     check("alias regex: cc's ^[a-z0-9-]{2,20}$ — valid vs upper/short/long/underscore",
           re.match(r"^[a-z0-9-]{2,20}$", "ai-dev") and re.match(r"^[a-z0-9-]{2,20}$", "ab") and not re.match(r"^[a-z0-9-]{2,20}$", "A")
           and not re.match(r"^[a-z0-9-]{2,20}$", "a") and not re.match(r"^[a-z0-9-]{2,20}$", "a" * 21) and not re.match(r"^[a-z0-9-]{2,20}$", "ai_dev"))
@@ -5723,13 +5764,23 @@ def run_selfcheck():
                                                 "created": 100, "seen": time.time() - ORCH_IDLE - 60, "archived": False}
             o8b["CSTALE"] = {"target": r8, "alias": "old", "parent": "CPAR", "name": f"{r8}-old-dddd",
                              "created": 100, "seen": time.time() - ORCH_KEEP - 60, "archived": True}
+            o8b["CKILL"] = {"target": r8, "alias": "killkid", "parent": "CPAR", "name": f"{r8}-killkid-eeee",
+                            "created": 100, "seen": time.time() - ORCH_IDLE - 60, "archived": False}
             save_orchs(o8b)
-            globals()["home_windows"] = lambda: {f"{r8}@deadkid": "bash"}   # window still there, pane back to a shell
+            os.makedirs(f"{DIR}/orch-crashed", exist_ok=True)
+            open(f"{DIR}/orch-crashed/{r8}@killkid", "w").write("137 2026-09-26T00:00:00Z\n")   # what cc's __runorch leaves on a kill
+            globals()["home_windows"] = lambda: {f"{r8}@deadkid": "bash", f"{r8}@killkid": "bash"}   # windows still there, panes back to a shell
             arch8.clear(); dm8.orch_sweep(); aft8b = load_orchs()
-            globals()["home_windows"] = lambda: {}
             check("orch janitor: a window whose pane fell back to a shell is a finished orch (its channel is archived), and an "
                   "archived entry is forgotten after a week so the table stays a routing table",
                   aft8b["CDEAD"]["archived"] and "CSTALE" not in aft8b)
+            check("orch janitor: a KILLED orch (crash marker) idle past ORCH_IDLE with its pane back to a shell keeps its channel",
+                  not aft8b["CKILL"]["archived"] and ("conversations.archive", "CKILL") not in arch8 and dm8.route("CKILL", None) == r8)
+            os.remove(f"{DIR}/orch-crashed/{r8}@killkid")   # restarted (marker cleared), then ended cleanly: back to the old rule
+            arch8.clear(); dm8.orch_sweep(); aft8c = load_orchs()
+            globals()["home_windows"] = lambda: {}
+            check("orch janitor: once the crash marker is gone (the orch was restarted and ended cleanly), idle past ORCH_IDLE archives it",
+                  aft8c["CKILL"]["archived"] and arch8 == [("conversations.archive", "CKILL")])
             dm9 = Daemon(use_slack=False); dm9.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
             dm9.last_chat[r8] = ("CPAR", "77.7")      # the thread that asked for it: the one line goes there
             said9, api9 = [], []

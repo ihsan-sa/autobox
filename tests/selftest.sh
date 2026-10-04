@@ -1451,6 +1451,19 @@ amiss=""
 : > "$T/am.argv"; am __runmember other "";        grep -qE -- '^member other .*-- .*--permission-mode auto' "$T/am.argv" || amiss="$amiss __runmember"
 [ -z "$amiss" ] && ok "cc opens every session in auto mode — planning, track, orch, plain, handoff successor, and the member one inside the boundary" \
   || bad "these launchers still start in manual mode:$amiss"
+# A KILLED ORCH KEEPS ITS CHANNEL (2026-09-26: a SIGKILL archived two live orchs' channels). Only a clean exit —
+# the session or the owner ending it — archives; each case builds its own claude and asserts what cc-slack was asked.
+mkdir -p "$GH/.cc/slack"; slk_was=0; [ -f "$GH/.cc/slack/enabled" ] && slk_was=1; : > "$GH/.cc/slack/enabled"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$T/ko.slack" > "$T/ko-slack"; chmod +x "$T/ko-slack"
+ko(){ printf '#!/usr/bin/env bash\n%s\n' "$1" > "$T/ko-claude"; chmod +x "$T/ko-claude"; : > "$T/ko.slack"
+      env -u CC_SLACK_DIR HOME="$GH" PATH="$B:$PATH" CC_CLAUDE="$T/ko-claude" CC_SLACK="$T/ko-slack" "$AM/cc" __runorch other a1 </dev/null >/dev/null 2>&1; }
+kom="$GH/.cc/slack/orch-crashed/other@a1"   # the marker that keeps cc-slack's janitor off a killed orch's channel
+ko 'kill -KILL $$';  grep -q 'archive' "$T/ko.slack" && bad "a SIGKILLed orch archived its channel: $(cat "$T/ko.slack")" || ok "a SIGKILLed orch (OOM) leaves its channel alone"
+grep -q '^137 ' "$kom" 2>/dev/null && ok "…and leaves the crash marker, so the janitor never archives it a day later either" || bad "a SIGKILLed orch left no crash marker at $kom"
+ko 'exit 1';         grep -q 'archive' "$T/ko.slack" && bad "a crashed orch archived its channel: $(cat "$T/ko.slack")" || ok "…and so does one that crashes (non-zero exit)"
+ko 'exit 0';         grep -qx 'archive --orch other a1' "$T/ko.slack" && ok "…while a clean finish still archives it" || bad "a clean orch exit no longer archives: $(cat "$T/ko.slack")"
+[ -e "$kom" ] && bad "a restarted orch kept the earlier crash marker: $(cat "$kom")" || ok "…and a restart clears the crash marker, so a clean finish is a finish again"
+[ "$slk_was" = 1 ] || rm -f "$GH/.cc/slack/enabled"; rm -f "$T/ko-claude" "$T/ko-slack" "$T/ko.slack"; rm -rf "$GH/.cc/slack/orch-crashed"
 # The box's own always-on Remote-Control session is the seventh and cannot be run from here (it waits for the
 # internet and never returns), so its launch line is read instead.
 grep -q -- '"\$CLAUDE" --permission-mode auto --remote-control' "$B/cc-rc" \

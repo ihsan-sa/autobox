@@ -29,6 +29,7 @@
   cc-slack updates-sweep [--dry-run]  give every repo channel that predates the split its -updates lane (idempotent; skips a bot-only channel).
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]     give a sub-orchestrator its own channel, recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it).
   cc-slack archive <#chan|C…> | archive --orch <target> <alias>      archive a sub-orch channel; it stops routing and leaves home.json's channel list.
+  cc-slack unarchive <C…> [--superseded-by <C…>]   bring an archived sub-orch channel back and route it again; with --superseded-by a newer live channel stays the orch's home, and the old one keeps its history with one pinned line pointing there.
   cc-slack run-approved <chat> <ts>   run the command a `cc-notify --approval --run` card carries, once, as this user, and
                                       reply in the card's thread with the exit code only; the output tail goes to the owner's
                                       DM, since members read #approvals. The daemon starts it
@@ -137,7 +138,7 @@ ORCHS = "orchs.json"                                           # {"<chat>": {tar
 TRACKS = "track-threads.json"                                  # {"<repo>/<track>": {chat, ts, at}}: the ONE thread a --go track lives in, in #<repo> — a track has no channel of its own
 ORCH_ID_RE = re.compile(r"-[a-z0-9]{4}$")                      # the 4-char tail an orch channel name ends with (stripped when it spawns its own)
 ORCH_KEEP = 7 * 86400                                          # how long an archived orch stays in the table before it is forgotten
-ORCH_IDLE = 24 * 3600                                          # an orch channel whose orch window has been gone this long is archived (daily janitor)
+ORCH_IDLE = 24 * 3600                                          # an orch channel whose orch window has been gone this long is archived (daily janitor), unless the orch crashed (orch_crashed)
 CHAN_MAX = 80                                                  # Slack's cap on a channel name
 B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 CANVASES = "canvases.json"                                     # {"<chat>": {canvas_id, title, updated}}: the canvas WE keep for a channel (see canvas_of)
@@ -2043,9 +2044,14 @@ def save_orchs(orchs):
     except Exception as e:
         log(f"orchs: save failed: {e!r}")
 
+def orch_crashed(target, alias):
+    """True when <target>@<alias>'s last run ended on a kill or a crash: cc's __runorch writes this marker on a non-zero
+    exit and clears it when the orch starts again. The janitor never archives such an orch's channel."""
+    return bool(target and alias) and os.path.exists(os.path.join(DIR, "orch-crashed", f"{target}@{alias}"))
+
 def orch_lookup(orchs, target, alias):
     """The live (non-archived) channel of <target>@<alias>, or None."""
-    return next((c for c, e in orchs.items() if not e.get("archived") and e.get("target") == target
+    return next((c for c, e in orchs.items() if not e.get("archived") and not e.get("superseded_by") and e.get("target") == target
                  and e.get("alias") == alias), None)
 
 def load_track_threads():
@@ -4871,6 +4877,8 @@ class Daemon:
                 if alias in subbed.get(target, ()) or wins.get(f"{target}@{alias}", "bash") not in ("bash", "sh", "zsh", ""):
                     if now - float(e.get("seen") or 0) > 300:
                         e["seen"] = now; dirty = True
+                elif orch_crashed(target, alias):
+                    continue   # killed or crashed, not finished (cc's __runorch left the marker): the channel is kept for a restart
                 elif now - float(e.get("seen") or e.get("created") or now) >= ORCH_IDLE and archive_channel(self.cfg, cid, orchs):
                     log(f"orch janitor: #{e.get('name')} archived — {orch_shown(target, alias)} gone for {ORCH_IDLE // 3600} h")
                     dirty = True
@@ -8660,6 +8668,67 @@ def cmd_archive(argv):
     print(f"{'archived' if ok else 'could NOT archive'} {cid}" + (f" (#{orchs[cid].get('name')})" if cid in orchs else ""))
     return 0 if ok else 1
 
+def cmd_unarchive(argv):
+    """unarchive <C…> [--superseded-by <C…>] — undo an archive the box should not have made (2026-09-26: a SIGKILLed orch
+    archived its live channel). conversations.unarchive, then the routing table says open again. With --superseded-by
+    the orch already has a newer live channel: that one stays its home (orch_lookup skips a superseded entry), and the
+    old one stays open for its history with one pinned line pointing at the live one. Archives nothing else."""
+    sup = None
+    if len(argv) == 3 and argv[1] == "--superseded-by":
+        sup = argv[2]
+    elif len(argv) != 1:
+        print("cc-slack unarchive <C…> [--superseded-by <C…>]", file=sys.stderr); return 2
+    cid = argv[0]
+    cfg = load_cfg()
+    if not cfg.get("SLACK_BOT_TOKEN"):
+        print("cc-slack unarchive: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
+    orchs = load_orchs()
+    if cid not in orchs or (sup and sup not in orchs):   # like archive: only a sub-orch channel the table knows
+        print(f"cc-slack unarchive: {cid if cid not in orchs else sup} is not a sub-orch channel", file=sys.stderr); return 1
+    if sup:   # the pointer must name the same orch's live home, or the orch is left with none (or someone else's)
+        o, n = orchs[cid], orchs[sup]
+        why = ("is the channel being brought back" if sup == cid else
+               "is archived" if n.get("archived") else
+               f"is itself superseded by {n.get('superseded_by')}" if n.get("superseded_by") else
+               f"belongs to {orch_shown(n.get('target'), n.get('alias'))}, not {orch_shown(o.get('target'), o.get('alias'))}"
+               if (n.get("target"), n.get("alias")) != (o.get("target"), o.get("alias")) else "")
+        if why:
+            print(f"cc-slack unarchive: --superseded-by {sup} {why}; it must be the same orch's live channel", file=sys.stderr); return 1
+    try:
+        api("conversations.unarchive", cfg["SLACK_BOT_TOKEN"], channel=cid)
+    except Exception as e:
+        if "not_archived" not in str(e):
+            print(f"cc-slack unarchive: could NOT unarchive {cid}: {e}", file=sys.stderr); return 1
+    try:
+        api("conversations.join", cfg["SLACK_BOT_TOKEN"], channel=cid)   # an archive drops every member, the bot too
+    except Exception as e:
+        if "method_not_supported_for_channel_type" not in str(e):   # a private channel keeps its members through an archive
+            log(f"unarchive {cid}: join {e!r}")
+    with orchs_locked():
+        orchs = load_orchs()
+        e = orchs.get(cid, {})
+        e["archived"], e["seen"] = False, time.time()
+        if sup:
+            e["superseded_by"] = sup
+        else:
+            e.pop("superseded_by", None)
+        orchs[cid] = e
+        save_orchs(orchs)
+    if sup and not e.get("pinned"):
+        try:
+            r = api("chat.postMessage", cfg["SLACK_BOT_TOKEN"], channel=cid,
+                    text=f"This channel is kept open for its history. {orch_shown(e.get('target'), e.get('alias'))} now lives in <#{sup}>, so talk to it there.")
+            api("pins.add", cfg["SLACK_BOT_TOKEN"], channel=cid, timestamp=r["ts"])
+            with orchs_locked():
+                orchs = load_orchs()
+                if cid in orchs:
+                    orchs[cid]["pinned"] = r["ts"]
+                    save_orchs(orchs)
+        except Exception as x:
+            print(f"cc-slack unarchive: {cid} is open, but the pointer line failed: {x}", file=sys.stderr); return 1
+    print(f"unarchived {cid} (#{e.get('name')})" + (f", pointing at {sup}" if sup else ""))
+    return 0
+
 LANDED_RE = re.compile(r"  ·  (?:landed ✓|closed ✗) \d\d:\d\dZ?$")    # a card no longer pending (Z optional, so an old-format card still matches and isn't edited twice)
 PENDING_TAIL = re.compile(r"\s+·\s+(?::\+1:|lands itself).*$", re.S)       # "  ·  :+1: from the owner merges (squash)" / "  ·  lands itself (squash)"
 PENDING_RE = re.compile(r"  ·  (?::\+1: .*merges|lands itself)")              # a card still waiting on its landing
@@ -9625,6 +9694,8 @@ def main(argv):
         return cmd_orch_channel(rest)
     elif cmd == "archive":
         return cmd_archive(rest)
+    elif cmd == "unarchive":
+        return cmd_unarchive(rest)
     elif cmd == "manifest":
         return cmd_manifest(rest)
     elif cmd == "selfcheck":
