@@ -15,7 +15,11 @@ THE STEPS, per target, in order; the first that fails stops that target and says
               lander holds (git.remote_url, never the checkout's "origin") and checks it against ls-remote; a sha
               that is not that tip or an ancestor of it is refused; then fast_forward: what `git merge --ff-only
               <sha>` did, with no hook, filter or config of the checkout's run, so a checkout a person moved is
-              refused, never reset
+              refused, never reset. An untracked file or symlink standing where <sha> adds a tracked one (a draft
+              of a doc that later got committed) is moved to the lander's state dir, deploy-aside/<checkout>/, and
+              the move is tried once more; the deploy's line names what moved. If it still refuses, the files go
+              back, and the line names any that could not. An untracked directory there is never moved: the deploy
+              fails and names it
   3. install  the first executable of core/install.sh, install.sh, with no flags; then `systemctl --user
               daemon-reload`; then <repo>.applied records the sha
   4. units    a systemd-user unit this change ADDED is enabled with `enable --now`, unless its .timer does it, it
@@ -42,6 +46,10 @@ import fcntl
 import os
 import re
 import shlex
+import shutil
+import stat
+import tempfile
+import time
 
 from lander import cards as C
 from lander import git as G
@@ -95,6 +103,7 @@ def held(target):
 
 
 WAITING = ("requested", "held")
+MOVED = "untracked file(s) that stood where the merge adds tracked ones"   # deploy_one's line; run() says it
 TRIES = 3   # a failed target is deployed again by this many calls of run(), then waits for a new request
 
 
@@ -207,9 +216,9 @@ def verified_tip(root, base):
 
 # --- the steps -----------------------------------------------------------------------------------------------------
 
-def pull(root, base, sha, since=""):
+def pull(root, base, sha, since="", said=None):
     """Fast-forward to `sha`; -> the (status, path) changes from `since` (what was deployed before this request) to
-    `sha`. Not from the checkout's HEAD: on a retry after a failed install or restart the checkout is already at `sha`,
+    `sha`. A line about untracked files moved out of the way is appended to `said`. Not from the checkout's HEAD: on a retry after a failed install or restart the checkout is already at `sha`,
     and a diff from there would be empty, so the retry would skip every unit and restart."""
     with git_lock(root):   # HEAD is read under the lock, so no one else's merge moves it between here and the move
         rc, cur = git(root, "rev-parse", "--abbrev-ref", "HEAD")
@@ -226,7 +235,9 @@ def pull(root, base, sha, since=""):
         if sha != tip and git(root, "merge-base", "--is-ancestor", sha, tip)[0] != 0:
             raise Failed("pull", f"{sha[:12]} is not on origin/{base} ({tip[:12]}); nothing merged in {root}")
         try:
-            fast_forward(root, base, head, sha)
+            moved = fast_forward(root, base, head, sha)
+            if moved and said is not None:
+                said.append(moved)
         except G.GitError as x:
             raise Failed("pull", f"no scratch repo for {root}: {last(x)}; nothing merged") from None
     try:
@@ -244,14 +255,15 @@ def fast_forward(root, base, head, sha):
     run: a worker can write its shared .git, so a post-merge, post-checkout or reference-transaction hook, or a smudge
     filter its config names, would run as the lander. read-tree -m -u runs in a borrowed() repo (no config, so no
     filter; read-tree runs no hook) on the checkout's own index and files, and refuses as merge does when a changed or
-    untracked file is in the way; then update-ref moves the branch, hooks off. A checkout already at `sha` or past it
-    is left as it is, as `merge --ff-only` leaves it ("Already up to date"). Raises Failed, or GitError when no
-    borrowed repo could be made."""
+    untracked file is in the way; then update-ref moves the branch, hooks off. When it refuses, the untracked files at
+    paths `sha` adds are moved aside (aside()) and read-tree runs once more; if that also refuses, they are put back.
+    A checkout already at `sha` or past it is left as it is, as `merge --ff-only` leaves it ("Already up to date").
+    -> a line naming what was moved aside, or "". Raises Failed, or GitError when no borrowed repo could be made."""
     if head == sha:
-        return
+        return ""
     with G.borrowed(root) as gd:
         if git(root, "merge-base", "--is-ancestor", sha, head, env=G.hookless_env(GIT_DIR=gd))[0] == 0:
-            return
+            return ""
         if git(root, "merge-base", "--is-ancestor", head, sha, env=G.hookless_env(GIT_DIR=gd))[0] != 0:
             raise Failed("pull", f"{sha[:12]} is not a fast-forward of {head[:12]} in {root}; nothing merged")
         rc, gitdir = git(root, "rev-parse", "--path-format=absolute", "--git-dir", env=G.hookless_env())
@@ -260,12 +272,125 @@ def fast_forward(root, base, head, sha):
         env = G.hookless_env(GIT_DIR=gd, GIT_WORK_TREE=root, GIT_INDEX_FILE=os.path.join(gitdir, "index"))
         git(root, "update-index", "-q", "--refresh", env=env)   # rc 1 = a file differs; read-tree says which
         rc, out = git(root, "read-tree", "-m", "-u", head, sha, env=env)
+        said = ""
+        # the brief (2026-10-03): "an older untracked draft of it (09-27) sat in the checkout, so the deploy's git
+        # read-tree refused 3 times" — an untracked file where `sha` adds a tracked one is moved aside, not left to
+        # stop every deploy after it
+        if rc:
+            files, dirs = in_the_way(root, head, sha, env)
+            moved, dest, why = aside(root, files)
+            if moved:
+                rc, out = git(root, "read-tree", "-m", "-u", head, sha, env=env)
+                if rc:
+                    left = put_back(root, moved, dest)
+                    out += (f" (it still refused with {len(moved)} untracked file(s) moved aside; "
+                            + (f"{len(moved) - len(left)} went back and {len(left)} could not, so they stay in "
+                               "deploy-aside: " + ", ".join(os.path.join(dest, p) for p in left) if left
+                               else "they are back") + ")")
+                else:
+                    said = (f"moved {len(moved)} {MOVED} to {dest}: "
+                            + ", ".join(moved[:5]) + (", ..." if len(moved) > 5 else ""))
+            elif why:
+                out += f" ({why})"
+            if rc and dirs:   # a directory is a person's work, a mail queue or a build: it is never moved
+                out += (f" ({len(dirs)} untracked dir(s) stand where the merge adds a file and are left for a person: "
+                        + ", ".join(dirs[:5]) + ")")
     if rc:
-        raise Failed("pull", f"git read-tree -m -u {head[:12]} {sha[:12]} in {root}: {last(out)}")
+        raise Failed("pull", f"git read-tree -m -u {head[:12]} {sha[:12]} in {root}: {last(out, 600)}")
     rc, out = git(root, "update-ref", "-m", f"lander: fast-forward to {sha[:12]}", f"refs/heads/{base}", sha, head,
                   env=G.hookless_env())
     if rc:
-        raise Failed("pull", f"git update-ref refs/heads/{base} {sha[:12]} in {root}: {last(out)}")
+        raise Failed("pull", f"git update-ref refs/heads/{base} {sha[:12]} in {root}: {last(out)}"
+                     + (f"; {said}" if said else ""))
+    return said
+
+
+def unsafe(p):
+    """A path git should never have handed us: an empty, `.` or `..` part, or a `.git` in any case."""
+    return any(x in ("", ".", "..") or x.lower() == ".git" for x in p.split("/"))
+
+
+def in_the_way(root, head, sha, env):
+    """-> (files, dirs): the untracked paths in `root` that stop read-tree adding what `sha` adds over `head`. Files
+    are the added path itself, or the first part of it that is not a directory, when that is a regular file or a
+    symlink (never followed); only they are moved aside. Dirs are untracked directories standing where `sha` adds a
+    file: never moved (a PR that adds a file `.mail-out` must not move the mail queue), so read-tree's refusal stands
+    and names them. A tracked path is never either; read-tree's refusal for a changed tracked file stands. A path with
+    a `..`, `.` or `.git` part, or whose parent resolves outside `root`, is skipped: a crafted tree entry moves
+    nothing outside the checkout."""
+    rc, out = git(root, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", head, sha, env=env)
+    rc2, idx = git(root, "ls-files", "-z", env=env)
+    if rc or rc2:
+        return [], []
+    tracked = {p for p in idx.split("\0") if p}
+    top = os.path.realpath(root)
+    files, dirs = [], []
+    for p in (p for p in out.split("\0") if p):
+        if unsafe(p):
+            continue
+        parts = p.split("/")
+        for i in range(1, len(parts) + 1):
+            q = "/".join(parts[:i])
+            full = os.path.join(root, q)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                break
+            if i < len(parts) and stat.S_ISDIR(st.st_mode):
+                continue
+            # the parent, not q itself: a symlink in the way is moved as a link wherever it points
+            up = os.path.realpath(os.path.dirname(full))
+            if (up == top or up.startswith(top + os.sep)) and q not in tracked \
+                    and not any(t.startswith(q + "/") for t in tracked):
+                if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+                    files += [q] if q not in files else []
+                elif stat.S_ISDIR(st.st_mode):
+                    dirs += [q] if q not in dirs else []
+            break
+    return files, dirs
+
+
+def aside(root, paths):
+    """Move `paths` (relative to `root`) under a fresh dir in the lander's state, deploy-aside/<checkout>/. ->
+    (the paths moved, that dir, why nothing moved). A state dir that cannot be made, or a move that fails, puts back
+    the ones already moved and moves nothing, so read-tree's refusal stands and the deploy fails, counted."""
+    if not paths:
+        return [], "", ""
+    try:
+        base = C.state("deploy-aside", os.path.basename(os.path.normpath(root)))
+        os.makedirs(base, exist_ok=True)
+        dest = tempfile.mkdtemp(prefix=time.strftime("%Y%m%dT%H%M%SZ-", time.gmtime()), dir=base)
+    except OSError as x:
+        return [], "", f"no untracked file was moved aside: {x}"
+    moved = []
+    for p in paths:
+        try:
+            os.makedirs(os.path.dirname(os.path.join(dest, p)), exist_ok=True)
+            shutil.move(os.path.join(root, p), os.path.join(dest, p))
+        except OSError as x:
+            left = put_back(root, moved, dest)
+            return [], "", (f"moving {p} aside failed ({x}), so nothing was moved"
+                            + (f"; {len(left)} could not go back and stay in deploy-aside: "
+                               + ", ".join(os.path.join(dest, q) for q in left) if left else ""))
+        moved.append(p)
+    return moved, dest, ""
+
+
+def put_back(root, moved, dest):
+    """Move `moved` back from `dest` into `root`; never over something now there. -> the paths still in `dest`."""
+    left = []
+    for p in moved:
+        try:
+            if os.path.lexists(os.path.join(root, p)):
+                raise FileExistsError(p)
+            shutil.move(os.path.join(dest, p), os.path.join(root, p))
+        except OSError:
+            left.append(p)
+    if not left:
+        for d, _, _ in os.walk(dest, topdown=False):   # what is left is the empty dirs
+            with contextlib.suppress(OSError):
+                os.rmdir(d)
+    return left
 
 
 def install(root, repo, sha):
@@ -451,13 +576,14 @@ def deploy_one(repo, target, sha, since=None):
     root = root_of(target)
     before = applied(repo) if since is None else since
     try:
-        changes = pull(root, base_of(repo), sha, before)
-        said = [install(root, repo, sha)]
+        said = []
+        changes = pull(root, base_of(repo), sha, before, said)
+        said.append(install(root, repo, sha))
         on, notes = enable_units(changes, repo, sha)
         restarted, asks, n2 = restart_units(root, changes, repo, f"deploy of {repo} at {sha[:12]}")
         started, n3 = daemons(root, changes)
-    except Failed as e:
-        return "failed", f"{e.step}: {e.why}", []
+    except Failed as e:   # files moved aside before an install or restart failed are still said: a retry moves none
+        return "failed", "; ".join([f"{e.step}: {e.why}"] + said), []
     said += [f"enabled {', '.join(on)}"] if on else []
     said += [f"restarted {', '.join(restarted + started)}"] if restarted or started else []
     said += notes + n2 + n3
@@ -518,9 +644,16 @@ def run(repo, green=None):
         if asks:
             text += (f" ⚠️ Please restart {', '.join(asks)}. Until then the box runs the old code for "
                      f"{'it' if len(asks) == 1 else 'them'}.")
+        # a person's draft moved out of their checkout: they hear where it went, with a mention only if one is due
+        moved = next((x for x in line.split("; ") if MOVED in x), "")
+        if moved and moved not in text:
+            text += f" — {moved}"
         if state == "unverified" or asks:
             C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] deploy", "--mention", "--id",
                         pid, text], repo, 0)
+        elif moved:
+            C.say(pid, [os.path.join(C.BIN, "cc-slack"), "post", "--route", f"[{repo}] deploy", "--id", pid, text],
+                  repo, 0)
     C.write_json(req_path(repo), req)
     return req
 

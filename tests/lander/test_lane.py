@@ -664,6 +664,183 @@ class Machine(Fixture):
         self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), merged)
         self.assertEqual(G.remote_head(self.root, "main"), merged)
 
+    def test_an_untracked_file_where_main_adds_one_is_moved_aside(self):
+        """#930 (2026-10-03): an untracked draft at a path main then committed made read-tree refuse every try. It is
+        moved to deploy-aside/ and the deploy goes on; an untracked file the merge does not touch stays where it is."""
+        from lander import deploy as D
+        self.write(self.root, {"docs/draft.md": "old draft\n", "a/b": "a file where main makes a dir\n",
+                               "docs/mine.md": "not in the merge\n"})
+        merged = self.push("main", {"docs/draft.md": "committed\n", "a/b/c": "x\n"})
+        said = []
+        D.pull(self.root, "main", merged, said=said)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), merged)
+        self.assertEqual(open(os.path.join(self.root, "docs/draft.md")).read(), "committed\n")
+        self.assertEqual(open(os.path.join(self.root, "docs/mine.md")).read(), "not in the merge\n")
+        self.assertEqual(len(said), 1)
+        self.assertIn(D.MOVED, said[0])
+        dest = said[0].split(" to ", 1)[1].split(": ", 1)[0]
+        self.assertTrue(dest.startswith(C.state("deploy-aside", "demo")), dest)
+        self.assertEqual(open(os.path.join(dest, "docs/draft.md")).read(), "old draft\n")
+        self.assertEqual(open(os.path.join(dest, "a/b")).read(), "a file where main makes a dir\n")
+        self.assertFalse(os.path.exists(os.path.join(dest, "docs/mine.md")))
+        self.assertEqual(self.git(self.root, "status", "--porcelain"), "?? docs/mine.md")
+
+    def test_a_refusal_that_moving_aside_cannot_cure_puts_the_files_back(self):
+        """A changed tracked file is a person's edit: read-tree still refuses, nothing merges and the untracked file
+        moved for the retry is back where it was."""
+        from lander import deploy as D
+        first = self.push("main", {"keep.txt": "v1\n"})
+        D.pull(self.root, "main", first)
+        self.write(self.root, {"keep.txt": "a local edit\n", "docs/draft.md": "old draft\n"})
+        merged = self.push("main", {"keep.txt": "v2\n", "docs/draft.md": "committed\n"})
+        said = []
+        with self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged, said=said)
+        self.assertIn("they are back", e.exception.why)
+        self.assertEqual((self.git(self.root, "rev-parse", "HEAD"), said), (first, []))
+        self.assertEqual(open(os.path.join(self.root, "docs/draft.md")).read(), "old draft\n")
+        self.assertEqual(open(os.path.join(self.root, "keep.txt")).read(), "a local edit\n")
+
+    def test_an_update_ref_failure_after_a_move_still_names_the_moved_file(self):
+        """read-tree succeeds once the draft is aside, then update-ref fails: the move is in the error, not lost."""
+        from lander import deploy as D
+        self.write(self.root, {"docs/draft.md": "old draft\n"})
+        merged = self.push("main", {"docs/draft.md": "committed\n"})
+        real = D.git
+
+        def git(root, *argv, **kw):
+            return (1, "cannot lock ref") if argv[:1] == ("update-ref",) else real(root, *argv, **kw)
+        with mock.patch.object(D, "git", git), self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged)
+        self.assertIn("cannot lock ref", e.exception.why)
+        self.assertIn(f"{D.MOVED} to ", e.exception.why)
+        self.assertIn("docs/draft.md", e.exception.why)
+
+    def aside_root(self):
+        return C.state("deploy-aside", "demo")
+
+    def test_an_untracked_symlink_where_main_adds_a_file_is_moved_as_a_link(self):
+        """A symlink in the way is moved as itself; what it points at, outside the checkout, is not touched."""
+        from lander import deploy as D
+        outside = os.path.join(self.tmp, "outside.txt")
+        self.write(self.tmp, {"outside.txt": "not the checkout's\n"})
+        os.makedirs(os.path.join(self.root, "docs"), exist_ok=True)
+        os.symlink(outside, os.path.join(self.root, "docs/link"))
+        merged = self.push("main", {"docs/link": "committed\n"})
+        said = []
+        D.pull(self.root, "main", merged, said=said)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), merged)
+        dest = said[0].split(" to ", 1)[1].split(": ", 1)[0]
+        self.assertEqual(os.readlink(os.path.join(dest, "docs/link")), outside)
+        self.assertEqual(open(outside).read(), "not the checkout's\n")
+
+    def test_a_directory_where_main_adds_a_file_is_refused_and_never_moved(self):
+        """A PR adding a file `.mail-out` must not move the mail queue: read-tree's refusal stands and names the dir."""
+        from lander import deploy as D
+        self.write(self.root, {".mail-out/queued.eml": "a queued message\n", "docs/draft.md": "old draft\n"})
+        merged = self.push("main", {".mail-out": "a file now\n", "docs/draft.md": "committed\n"})
+        head = self.git(self.root, "rev-parse", "HEAD")
+        said = []
+        with self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged, said=said)
+        self.assertIn("1 untracked dir(s) stand where the merge adds a file and are left for a person: .mail-out",
+                      e.exception.why)
+        self.assertIn("they are back", e.exception.why)     # the draft went aside for the retry and came back
+        self.assertEqual((self.git(self.root, "rev-parse", "HEAD"), said), (head, []))
+        self.assertEqual(open(os.path.join(self.root, ".mail-out/queued.eml")).read(), "a queued message\n")
+        self.assertEqual(open(os.path.join(self.root, "docs/draft.md")).read(), "old draft\n")
+        self.assertEqual(os.listdir(self.aside_root()), [])   # the emptied aside dir is gone too
+
+    def test_a_move_that_fails_puts_back_what_moved_and_moves_nothing(self):
+        from lander import deploy as D
+        self.write(self.root, {"docs/one.md": "one\n", "docs/two.md": "two\n"})
+        merged = self.push("main", {"docs/one.md": "committed\n", "docs/two.md": "committed\n"})
+        head = self.git(self.root, "rev-parse", "HEAD")
+        real = D.shutil.move
+
+        def move(src, dst):
+            if src == os.path.join(self.root, "docs/two.md"):
+                raise OSError(28, "No space left on device")
+            return real(src, dst)
+        with mock.patch.object(D.shutil, "move", move), self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged)
+        self.assertIn("moving docs/two.md aside failed", e.exception.why)
+        self.assertIn("nothing was moved", e.exception.why)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), head)
+        self.assertEqual(open(os.path.join(self.root, "docs/one.md")).read(), "one\n")
+        self.assertEqual(open(os.path.join(self.root, "docs/two.md")).read(), "two\n")
+        self.assertEqual(os.listdir(self.aside_root()), [])
+
+    def test_a_file_that_cannot_go_back_is_named_with_its_aside_path(self):
+        """When the retry still refuses and a file cannot be put back, the deploy says where it is, never "back"."""
+        from lander import deploy as D
+        first = self.push("main", {"keep.txt": "v1\n"})
+        D.pull(self.root, "main", first)
+        self.write(self.root, {"keep.txt": "a local edit\n", "docs/draft.md": "old draft\n"})
+        merged = self.push("main", {"keep.txt": "v2\n", "docs/draft.md": "committed\n"})
+        real = D.shutil.move
+
+        def move(src, dst):
+            if dst == os.path.join(self.root, "docs/draft.md"):
+                raise OSError(13, "Permission denied")
+            return real(src, dst)
+        with mock.patch.object(D.shutil, "move", move), self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged)
+        self.assertNotIn("they are back", e.exception.why)
+        [dest] = os.listdir(self.aside_root())
+        stuck = os.path.join(self.aside_root(), dest, "docs/draft.md")
+        self.assertIn(f"0 went back and 1 could not, so they stay in deploy-aside: {stuck}", e.exception.why)
+        self.assertEqual(open(stuck).read(), "old draft\n")
+
+    def test_a_dotdot_tree_entry_moves_nothing_outside_the_checkout(self):
+        """A crafted tree with a `..` entry: git diff names `../canary`, and nothing outside the root is touched."""
+        from lander import deploy as D
+        canary = os.path.join(os.path.dirname(self.root), "canary")
+        self.write(os.path.dirname(self.root), {"canary": "outside\n"})
+        before = os.lstat(canary)
+        self.git(self.work, "fetch", "-q", "origin")
+        base = self.git(self.work, "rev-parse", "origin/main")
+        blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=self.work, input="x\n", text=True,
+                              check=True, capture_output=True).stdout.strip()
+        sub = subprocess.run(["git", "mktree"], cwd=self.work, input=f"100644 blob {blob}\tcanary\n", text=True,
+                             check=True, capture_output=True).stdout.strip()
+        rows = self.git(self.work, "ls-tree", f"{base}^{{tree}}") + f"\n040000 tree {sub}\t..\n"
+        tree = subprocess.run(["git", "mktree"], cwd=self.work, input=rows, text=True, check=True,
+                              capture_output=True).stdout.strip()
+        bad = self.git(self.work, "commit-tree", tree, "-p", base, "-m", "a crafted tree")
+        self.git(self.work, "push", "-q", "-f", "origin", f"{bad}:refs/heads/main")
+        head = self.git(self.root, "rev-parse", "HEAD")
+        with self.assertRaises(D.Failed):
+            D.pull(self.root, "main", bad)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), head)
+        after = os.lstat(canary)
+        self.assertEqual((after.st_ino, after.st_ctime_ns), (before.st_ino, before.st_ctime_ns))
+        self.assertEqual(open(canary).read(), "outside\n")
+        self.assertFalse(os.path.exists(self.aside_root()))
+        self.assertTrue(D.unsafe("../canary") and D.unsafe("a/./b") and D.unsafe("a//b") and D.unsafe(".GIT/x"))
+        self.assertFalse(D.unsafe("docs/.gitignore"))
+
+    def test_a_state_dir_that_cannot_be_made_fails_the_deploy_cleanly_and_counts(self):
+        """A file where deploy-aside/ goes: no OSError escapes; read-tree's refusal stands, the target is failed and
+        its tries count, so the deploy-stopped card goes and it stops after TRIES."""
+        from lander import deploy as D
+        os.makedirs(C.state(), exist_ok=True)
+        self.write(C.state(), {"deploy-aside": "a file, not a dir\n"})
+        self.write(self.root, {"docs/draft.md": "old draft\n"})
+        merged = self.push("main", {"docs/draft.md": "committed\n"})
+        head = self.git(self.root, "rev-parse", "HEAD")
+        with self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged)
+        self.assertIn("no untracked file was moved aside", e.exception.why)
+        D.request("demo", merged)
+        with mock.patch.object(C, "say") as say:
+            st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+        self.assertEqual((st["state"], st["tries"]), ("failed", 1))
+        self.assertIn("no untracked file was moved aside", st["why"])
+        self.assertIn("[demo] deploy stopped", say.call_args[0][1])
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), head)
+        self.assertEqual(open(os.path.join(self.root, "docs/draft.md")).read(), "old draft\n")
+
     def test_a_config_rewrite_of_the_pinned_url_is_refused(self):
         """url.<x>.insteadOf in the shared .git/config would redirect even the pinned URL: the lander refuses."""
         from lander import deploy as D

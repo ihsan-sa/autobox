@@ -148,6 +148,48 @@ class TestDeploy(Box):
         self.assertEqual(D.applied("demo"), NEW)
         self.assertEqual(box.called("cc-slack post"), [])      # a clean deploy says nothing: the landed line already went
 
+    def test_a_moved_aside_draft_is_said_without_a_mention_and_a_clean_deploy_says_nothing(self):
+        self.fake()
+        with mock.patch.object(D, "fast_forward", lambda *a: f"moved 1 {D.MOVED} to /x/deploy-aside: docs/d.md"):
+            D.request("demo", NEW)
+            st = D.run("demo", green=lambda r, s: s == NEW)["targets"]["demo"]
+        self.assertEqual(st["state"], "verified")
+        said = C.sh.called("cc-slack post")
+        self.assertEqual(len(said), 1)
+        self.assertNotIn("--mention", said[0]["argv"])
+        self.assertIn("docs/d.md", said[0]["argv"][-1])
+        box = self.fake()
+        with mock.patch.object(D, "fast_forward", lambda *a: ""):
+            D.request("demo", "d" * 40)
+            st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+        self.assertEqual((st["state"], box.called("cc-slack post")), ("verified", []))
+
+    def test_a_moved_aside_draft_is_still_said_when_the_install_then_fails(self):
+        box = self.fake(**{"install.sh": (1, "install broke\n")})
+        with mock.patch.object(D, "fast_forward", lambda *a: f"moved 1 {D.MOVED} to /x/deploy-aside: docs/d.md"):
+            D.request("demo", NEW)
+            st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+        self.assertEqual((st["state"], st["tries"]), ("failed", 1))
+        self.assertTrue(st["why"].startswith("install: install.sh: install broke"), st["why"])
+        self.assertIn("docs/d.md", st["why"])
+        card = box.called("cc-slack post")
+        self.assertEqual(len(card), 1)
+        self.assertIn("did not deploy", card[0]["argv"][-1])
+        self.assertIn(f"{D.MOVED} to /x/deploy-aside: docs/d.md", card[0]["argv"][-1])
+
+    def test_a_moved_aside_draft_rides_on_the_restart_mention(self):
+        self.unit("demo-daemon.service")
+        box = self.fake(**{"cc-units restart-for": (0, "demo-daemon.service\towner\n"), "cc-scope add": (0, "")})
+        with mock.patch.object(D, "fast_forward", lambda *a: f"moved 1 {D.MOVED} to /x/deploy-aside: docs/d.md"):
+            D.request("demo", NEW)
+            st = D.run("demo", green=lambda r, s: True)["targets"]["demo"]
+        self.assertEqual(st["state"], "verified")
+        said = box.called("cc-slack post")
+        self.assertEqual(len(said), 1)                     # one post: the mention carries the move, no second line
+        self.assertIn("--mention", said[0]["argv"])
+        self.assertIn("Please restart demo-daemon.service", said[0]["argv"][-1])
+        self.assertIn(f"{D.MOVED} to /x/deploy-aside: docs/d.md", said[0]["argv"][-1])
+
     def test_a_checkout_off_its_branch_is_refused_not_reset(self):
         box = self.fake(branch="feature")
         D.request("demo", NEW)
