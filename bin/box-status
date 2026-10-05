@@ -1,5 +1,153 @@
 #!/usr/bin/env bash
 # box-status — one-screen health summary of this box. Read-only; safe anytime.
+#   box-status             the summary: host, network, services, tmux, seats, slack, disk, time, ssd, docker
+#   box-status seats       just the seats section
+#   box-status selfcheck   the seats section against fake tmux and ps output
+#
+# SEATS answer "which claude sessions are live, on which model and effort, and doing what" from a probe made now:
+# one line per claude process running in a tmux pane (the topmost claude under the pane's shell, so a claude that a
+# session starts itself is not a second seat), one per pane however many grouped sessions repeat it (keyed on the
+# pane id). Each column says where it came from, and none comes from ~/.cc/state or cc-model's log, because those
+# proxies are what misled before (a stale model-unavailable row, a launch argv read after /effort, a row's name):
+#   MODEL, EFFORT  an interactive seat: its pane's status line as drawn now; a `claude -p` run: its own argv, which
+#                  it cannot change mid-run. SRC says which. A value neither shows is "?", never a guess. Today's
+#                  status line shows the model but not the effort, so an interactive seat's effort reads "?".
+#   STATE          the pane: "working" while it shows "esc to interrupt", "idle" at a bare prompt, "-p" for a
+#                  print run, else "?"; "+N agents" when it lists N background agents under its status line.
+#   ACTIVE         tmux #{window_activity}, as an age.
+# Only those parsed fields are printed, never pane text. Env: BOX_STATUS_NOW (epoch seconds, for the selfcheck).
+# recurring-defect-ok: pause-hold-missing — this reads running `claude -p` processes; it never starts one or writes the board
+seats(){ python3 - <<'PY'
+import concurrent.futures as cf, os, re, subprocess, sys, time
+
+def run(*a):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+
+panes = {}
+for ln in run("tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}\t#{window_activity}\t#{window_name}").splitlines():
+    f = ln.split("\t", 3)
+    if len(f) == 4 and f[0].startswith("%") and f[1].isdigit() and f[0] not in panes:   # grouped sessions repeat it
+        panes[f[0]] = (int(f[1]), f[2], f[3])
+kids, args = {}, {}
+for ln in run("ps", "-eo", "pid=,ppid=,args=").splitlines():
+    f = ln.split(None, 2)
+    if len(f) >= 2 and f[0].isdigit() and f[1].isdigit():
+        args[int(f[0])] = f[2] if len(f) == 3 else ""
+        kids.setdefault(int(f[1]), []).append(int(f[0]))
+
+def is_claude(pid):
+    return os.path.basename(args.get(pid, "").split(" ", 1)[0]) == "claude"
+
+def top_claudes(root):          # the claude processes nearest the pane's shell; never one that a claude started
+    out, todo = [], [root]
+    while todo:
+        p = todo.pop()
+        if is_claude(p):
+            out.append(p)
+        else:
+            todo += kids.get(p, [])
+    return sorted(out)
+
+def is_print(pid):
+    return re.search(r"(?:^| )(?:-p|--print)(?= |$)", args.get(pid, "")) is not None
+
+def from_pane(pane):            # -> (model, effort, state), read off the last lines the pane shows now
+    tail = [l.rstrip() for l in run("tmux", "capture-pane", "-p", "-t", pane).splitlines() if l.strip()][-24:]
+    model = effort = state = "?"
+    for l in tail:
+        m = re.match(r"\s*(\S.*?)\s{2,}(?:\d+% ctx|ctx \?)", l)
+        if m and re.fullmatch(r"[\w .()\[\]-]{1,40}", m.group(1)):
+            model = m.group(1)
+            e = re.search(r"\s(low|medium|high|xhigh|max) effort\b", l)
+            effort = e.group(1) if e else "?"
+    if any("esc to interrupt" in l for l in tail):
+        state = "working"
+    elif any(re.match(r"\s*❯", l) for l in tail):
+        state = "idle"
+    n = sum(1 for l in tail if re.match(r"\s*◯ \S", l))   # one line per background agent, below the status line
+    if n and state != "?":
+        state += f" +{n} agents"
+    return model, effort, state
+
+def flag(a, name):
+    m = re.search(r"(?:^| )--" + name + r"[ =]([\w.\[\]-]{1,40})(?= |$)", a)
+    return m.group(1) if m else "?"
+
+rows = [(pane, pid, act, name) for pane, (root, act, name) in panes.items() for pid in top_claudes(root)]
+if not rows:
+    print("  no claude in any tmux pane")
+    sys.exit(0)
+# A pane with one interactive claude is captured once; a pane with two cannot say which one its status line is.
+inter = {}
+for pane, pid, _, _ in rows:
+    if not is_print(pid):
+        inter.setdefault(pane, []).append(pid)
+one = sorted(p for p, pids in inter.items() if len(pids) == 1)
+with cf.ThreadPoolExecutor(8) as ex:
+    seen = dict(zip(one, ex.map(from_pane, one)))
+now = int(os.environ.get("BOX_STATUS_NOW") or time.time())
+
+def age(t):
+    if not t.isdigit():
+        return "?"
+    s = max(0, now - int(t))
+    return f"{s}s" if s < 60 else f"{s // 60}m" if s < 3600 else f"{s // 3600}h" if s < 86400 else f"{s // 86400}d"
+
+print("  MODEL, EFFORT from SRC (pane = its status line now, argv = a -p run's own flags); STATE from the pane; ? = not readable")
+print(f"  {'WINDOW':<34} {'PID':>8}  {'MODEL':<24} {'EFFORT':<7} {'SRC':<5} {'STATE':<16} ACTIVE")
+for pane, pid, act, name in sorted(rows, key=lambda r: (r[3], r[1])):
+    if is_print(pid):
+        model, effort, state, src = flag(args[pid], "model"), flag(args[pid], "effort"), "-p", "argv"
+    elif pane in seen:
+        (model, effort, state), src = seen[pane], "pane"
+    else:
+        model, effort, state, src = "?", "?", "?", "-"
+    print(f"  {name[:34]:<34} {pid:>8}  {model[:24]:<24} {effort:<7} {src:<5} {state:<16} {age(act)} ago")
+PY
+}
+seats_selfcheck(){
+  local d pass=0 fail=0 out; d=$(mktemp -d) || return 1
+  # The fixture: a grouped session repeats every pane (%1 and %2 are listed twice). %1 is an interactive seat whose
+  # status line names its model and effort and which is mid-turn, launched with other flags; %2 a cc-room loop
+  # running `claude -p` (a grandchild of the pane's shell) that starts a claude of its own, which is not a second
+  # seat; %3 an idle seat whose status line has not drawn yet; %4 a pane whose process only mentions claude.
+  printf '%s\n' '%1	100	1791099955	demo@landing' '%2	200	1791096400	demo/some-track' \
+    '%1	100	1791099955	demo@landing' '%3	300	1791013600	fwe' '%4	400	1791099999	box' \
+    '%2	200	1791096400	demo/some-track' >"$d/panes"
+  printf '%s\n' '100 1 bash' '101 100 /home/u/.local/bin/claude --model claude-fable-5-1 --effort low' \
+    '200 1 bash' '201 200 cc-room x' '202 201 /usr/bin/claude -p --model claude-opus-5-5 --effort medium hi' \
+    '203 202 claude -p --model claude-haiku-4-5 judge' '300 1 bash' '301 300 claude' '400 1 bash' \
+    '401 400 vim claude' >"$d/ps"
+  printf '%s\n' 'SECRET-PANE-TEXT' '✻ Thinking… (12s · esc to interrupt)' '────' '❯ ' '────' \
+    '  Opus 5.5 (1M context)  14% ctx (138k/1M)  $5.90  max effort' '  ⏵⏵ auto mode on' >"$d/pane-%1"
+  printf '%s\n' 'SECRET-PANE-TEXT' '────' '❯ Try "how does it work?"' '────' '  ⏵⏵ auto mode on' '  ◯ builder  SECRET-AGENT-TASK' '  ◯ reviewer  x' >"$d/pane-%3"
+  mkdir "$d/bin"
+  printf '#!/bin/sh\nD=%s\ncase "$1" in list-panes) cat "$D/panes";; capture-pane) echo "$4" >>"$D/captured"; cat "$D/pane-$4" 2>/dev/null;; esac\n' "$d" >"$d/bin/tmux"
+  printf '#!/bin/sh\ncat %s/ps\n' "$d" >"$d/bin/ps"; chmod +x "$d/bin/tmux" "$d/bin/ps"
+  out=$(PATH="$d/bin:$PATH" BOX_STATUS_NOW=1791100000 seats)
+  t(){ if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL $1"; printf '%s\n' "$out"; fi; }
+  t "one line per live seat: three, the grouped session's repeats folded" '[ "$(grep -c " ago$" <<<"$out")" = 3 ]'
+  t "an interactive seat reads model, effort and mid-turn off its pane, not its launch argv" \
+    'grep -qE "demo@landing +101  Opus 5.5 \(1M context\) +max +pane +working +45s ago" <<<"$out"'
+  t "a -p run reads its own argv, and the claude it started is not a second seat" \
+    'grep -qE "demo/some-track +202  claude-opus-5-5 +medium +argv +-p +1h ago" <<<"$out" && ! grep -q " 203 " <<<"$out"'
+  t "a pane with no readable model prints ? for model and effort, and still says idle with its agents" \
+    'grep -qE "fwe +301  \? +\? +pane +idle \+2 agents +1d ago" <<<"$out"'
+  t "a process that only mentions claude is not a seat" '! grep -q "^  box " <<<"$out"'
+  t "no pane text is printed" '! grep -q SECRET <<<"$out"'
+  t "a -p pane is never captured, and each interactive pane once" '[ "$(sort "$d/captured" | tr "\n" " ")" = "%1 %3 " ]'
+  t "the header names each column's source" 'grep -q "MODEL, EFFORT from SRC" <<<"$out" && grep -q "STATE from the pane" <<<"$out"'
+  : >"$d/panes"; out=$(PATH="$d/bin:$PATH" seats)
+  t "with no pane it says so" '[ "$out" = "  no claude in any tmux pane" ]'
+  rm -rf "$d"
+  echo "box-status selfcheck: $pass passed, $fail failed"; [ "$fail" = 0 ]; }
+case "${1:-}" in
+  selfcheck) seats_selfcheck; exit;;
+  seats) seats; exit;;
+esac
 h(){ printf '\n\033[1m%s\033[0m\n' "$1"; }
 h "host"; echo "$(hostname)  up $(uptime -p | sed 's/^up //')  load $(cut -d' ' -f1-3 /proc/loadavg)  kernel $(uname -r)$([ -f /run/reboot-required ] && echo '  ** REBOOT REQUIRED **')"
 h "network"; ip -br addr | grep -v '^lo'; ip route | grep '^default' || echo "no default route"
@@ -8,7 +156,7 @@ h "wifi"; for w in $(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'); do  
 h "services"; for u in ssh.socket tailscaled cloudflared chrony unattended-upgrades docker; do printf '  %-20s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null)"; done
 if command -v tailscale >/dev/null; then h "tailscale"; tailscale ip -4 2>/dev/null; tailscale status --self=true --peers=false 2>/dev/null | head -2; fi
 h "tmux"; tmux list-windows -t main -F '  main:#I #W  #{pane_current_path}  [#{pane_current_command}]' 2>/dev/null || echo "  no tmux session 'main'"
-h "claude processes"; pgrep -a -f '(^|/)claude( |$)' | grep -v pgrep | cut -c1-110 || echo "  none"
+h "seats"; seats
 h "slack"; printf '  cc-slackd: %s\n' "$(systemctl --user is-active cc-slackd.service 2>/dev/null)"; "$HOME/bin/cc-slack" status 2>/dev/null | tail -n 2 | sed 's/^/  /'
 h "disk / memory"; df -h / | awk 'NR==2{print "  / : "$3" used of "$2" ("$5")"}'; free -h | awk '/Mem:/{print "  mem: "$3" used of "$2", "$7" available"}'
 h "time"; echo "  ntp synced: $(timedatectl show -p NTPSynchronized --value)   $(date -u)"
