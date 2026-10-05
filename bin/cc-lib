@@ -71,6 +71,11 @@ boundary reads one file, its own workspace's, and can reach no other.
         records of closed bodies — a board row in merged|done|dropped|closed: its journal, its task, its notes, and
         every landing record — stamped before <days> (30) ago, per source with record and byte counts, `cut 0`
         always. cc-janitor library reads this into its report. No form of this tool cuts.
+  cc-lib quarantine [<handle>]
+        Mark a member workspace QUARANTINED (below): writes the host-side marker ~/.cc/members/<handle>/quarantined and
+        says so; with no handle, lists the marked ones. Refused inside a member's boundary, for a handle that is not a
+        member workspace (no ~/dev/<h>/.cc/member-workspace) and where a link sits at the marker's name. The next
+        `index` drops every record the workspace already had. Lifting it is a person's act: delete the marker.
   cc-lib bench [--n <N>]      FTS and exact-id latency (p50/p95/max) on this index; RSS.
   cc-lib selfcheck            fixtures of its own under a HOME of its own (check.sh runs it), the workspace cases launched
                               through the real cc-sandbox beside this file (bwrap; CC_LIB_SELFCHECK_BIN=<dir> runs them
@@ -99,6 +104,19 @@ own directory. registry.json (id → handle) is a cache for a person to read.
   the boundary's own cc-checkpoint already skips); tickets go to the session's tmpfs and end with it. A member-facing
   session WITHOUT the boundary (.cc/member-facing, no bwrap) is unchanged by this: it reads what the host reads, and
   closing that is the boundary project's (docs/design-member-git-boundary-2026-09-06.md), not the library's.
+
+QUARANTINE (owner, 2026-10-03: an experiment's output must never shape another session). A member workspace whose
+host-side marker ~/.cc/members/<h>/quarantined is a regular file — beside workspace-id, under no bind of its boundary,
+so nothing inside can lift it — is indexed NOWHERE: not in the owner's aggregate, not in its own workspace file (which
+is built empty), so neither an owner session nor its own next session reads it back through here. Decided by WHERE a
+path is: its board (~/.cc/boards/<h>.json), ~/.cc/state/<h>/**, ~/dev/<h>/**, ~/.cc/worktrees/<h>/**, ~/.cc/members/<h>/**,
+its Slack archive, its landing records and failures ledger, the memory dirs under ~/.claude/projects whose name encodes
+~/dev/<h>, a worktree of <h> or a landing review of <h> (the longest board name wins, so ai-lab-x is not ai-lab's),
+its documents in cc-docs' register and its lines in the landing queue. `--touch` on such a path is skipped, not a miss.
+ONE FILE CROSSES OUT: ~/.cc/state/<h>/results.json, indexed (one record, kind finding, owner-only) only when it is
+NUMBERS-ONLY — a JSON object whose leaves are finite numbers (no strings, booleans or nulls), nested in objects and
+lists, every key a plain name (^[a-z][a-z0-9_]{0,31}$), at most 500 numbers; anything else is unreadable, named in
+COVERAGE as `not numbers-only` and never read further. Every other workspace is indexed exactly as before.
 
 SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), indexed in place at record grain:
   journals    ~/.cc/state/<repo>/<track>/progress.md, <repo>/<alias>-handoff.md | -handover.md — one record per
@@ -304,6 +322,60 @@ def ws_of(skind, repo):
     return ""
 
 
+QUAR_MARK = "quarantined"   # ~/.cc/members/<h>/quarantined — the host-side marker (QUARANTINE in the docstring)
+RESULTS = "results.json"     # ~/.cc/state/<h>/results.json — the one file of a quarantined workspace that crosses out
+RESULT_KEY = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+RESULT_CAP = 500
+QUAR = set()   # quarantined handles, set by registry()
+REPOS = ()     # board names, longest first, set by registry(): which repo a ~/.claude/projects dir belongs to
+
+
+def quarantined():
+    """The workspaces marked quarantined: a REGULAR FILE at ~/.cc/members/<h>/quarantined (a link is not a mark).
+    A `_`-prefixed handle is a fixture, as a `_`-board is."""
+    out = set()
+    for p in glob.glob(os.path.join(H, ".cc", "members", "*", QUAR_MARK)):
+        h = os.path.basename(os.path.dirname(p))
+        if not h.startswith("_") and os.path.isfile(p) and not os.path.islink(p):
+            out.add(h)
+    return out
+
+
+def enc_dir(p):
+    """A path as the harness names its ~/.claude/projects dir: every character not a letter or digit is a '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", p)
+
+
+def quarantine_of(path):
+    """The quarantined handle a path belongs to, by WHERE it is and nothing it says, or ''. QUAR and REPOS are
+    registry()'s; the one exception, the workspace's numbers-only results file, is registry()'s to admit."""
+    if not QUAR:
+        return ""
+    p = os.path.abspath(path)
+    for base in ((".cc", "state"), ("dev",), (".cc", "worktrees"), (".cc", "members"), (".cc", "slack", "archive")):
+        b = os.path.join(H, *base) + "/"
+        if p.startswith(b) and p[len(b):].split("/")[0] in QUAR:
+            return p[len(b):].split("/")[0]
+    d, b = os.path.dirname(p), os.path.basename(p)
+    for base, cut in (((".cc", "boards"), lambda x: x[:-5]), ((".cc", "failures"), lambda x: x[:-6]),
+                      ((".cc", "state", "land"), lambda x: x[:-5].rsplit("-", 1)[0]),
+                      ((".cc", "state", "land", "root"), lambda x: x[:-5].rsplit("-", 1)[0])):
+        if d == os.path.join(H, *base) and cut(b) in QUAR:
+            return cut(b)
+    projs = os.path.join(H, ".claude", "projects") + "/"
+    if p.startswith(projs):
+        name = p[len(projs):].split("/")[0]
+        for r in REPOS:   # longest first: a dir is the repo whose encoded path is its longest prefix
+            for root in (os.path.join(H, "dev", r), os.path.join(H, ".cc", "worktrees", r)):
+                e = enc_dir(root)
+                if name == e or name.startswith(e + "-"):
+                    return r if r in QUAR else ""
+        for h in QUAR:   # a landing's review session of a quarantined workspace's PR runs under /tmp
+            if f"-cc-land-review-{enc_dir(h)}-" in name:
+                return h
+    return ""
+
+
 def misseslog():
     return os.path.join(libdir(), "misses.log")
 
@@ -387,15 +459,23 @@ def registry():
 
     def add(p, skind, repo="", track=""):
         p = os.path.abspath(p)
-        if p in seen or not os.path.isfile(p):
+        if p in seen or not os.path.isfile(p) or quarantine_of(p):   # QUARANTINE: indexed nowhere
             return
         seen.add(p)
         srcs.append((p, skind, repo, track))
 
-    global WS
+    global WS, QUAR, REPOS
     B = boards()
     WS = {h: i for h, i in workspaces().items() if i}
+    QUAR = quarantined()
+    REPOS = tuple(sorted(set(B) | QUAR, key=len, reverse=True))
     for repo, (bp, proj) in B.items():
+        if repo in QUAR:   # QUARANTINE: nothing of it is a source but its numbers-only results file
+            rp = os.path.join(H, ".cc", "state", repo, RESULTS)
+            if os.path.isfile(rp) and not os.path.islink(rp):
+                seen.add(rp)
+                srcs.append((rp, "results", repo, ""))
+            continue
         if repo in WS:   # a member's board is the member's to write: its `path` names nothing here — the workspace IS ~/dev/<h>
             proj = os.path.join(H, "dev", repo)
         add(bp, "board", repo)
@@ -599,10 +679,11 @@ def parse_docs(path, text):
     d = json.loads(text)
     projects = d.get("projects") or {}
     recs = []
+    q = quarantined()
     for num, doc in sorted((d.get("documents") or {}).items()):
         revs = [r for r in doc.get("revisions") or [] if isinstance(r, dict)] if isinstance(doc, dict) else []
-        if not revs:
-            continue
+        if not revs or (q and (doc.get("member") in q or (projects.get(doc.get("project")) or {}).get("member") in q)):
+            continue   # QUARANTINE: a quarantined workspace's documents are not records
         cur = revs[-1]
         proj = projects.get(doc.get("project"), {}).get("name", "")
         full = f"{num}-{cur.get('rev', '')}"
@@ -616,6 +697,37 @@ def parse_docs(path, text):
                          text="\n".join(lines), span=f"documents/{num}", part=0, track="",
                          extra_ids={num} | {f"{num}-{r.get('rev', '')}" for r in revs}))
     return recs
+
+
+def parse_results(path, text, repo):
+    """A quarantined workspace's results.json, the one file that crosses out: NUMBERS-ONLY or nothing. One record
+    whose text is `<key path> <number>` per leaf. The error names no key and quotes nothing, so a refused file's
+    words reach no packet either."""
+    d = json.loads(text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError("not numbers-only (a non-finite number)")))
+    if not isinstance(d, dict):
+        raise ValueError("not numbers-only (the top is not an object)")
+    lines = []
+
+    def walk(v, k):
+        if isinstance(v, bool) or not isinstance(v, (int, float, dict, list)):
+            raise ValueError("not numbers-only (a value that is not a number)")
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                if not RESULT_KEY.match(kk):
+                    raise ValueError("not numbers-only (a key that is not a plain name)")
+                walk(vv, f"{k}.{kk}" if k else kk)
+        elif isinstance(v, list):
+            for i, vv in enumerate(v):
+                walk(vv, f"{k}[{i}]")
+        else:
+            if not math.isfinite(v):
+                raise ValueError("not numbers-only (a non-finite number)")
+            if len(lines) >= RESULT_CAP:
+                raise ValueError(f"not numbers-only (over {RESULT_CAP} numbers)")
+            lines.append(f"{k} {v}")
+    walk(d, "")
+    ts = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(os.stat(path).st_mtime))
+    return [dict(kind="finding", title=f"results {repo}", ts=ts, text="\n".join(lines), span="results", part=0, track="")]
 
 
 def parse_land(path, text, skind, repo):
@@ -650,11 +762,14 @@ def parse_land(path, text, skind, repo):
 
 def parse_queue(path, text):
     recs = []
+    q = quarantined()
     for i, l in enumerate(text.split("\n")):
         if "\t" not in l:
             continue
         ts, msg = l.split("\t", 1)
         m = re.search(r"\b([A-Za-z0-9_.-]+)#(\d+)\b", msg)
+        if m and m.group(1) in q:   # QUARANTINE: a quarantined workspace's landing lines are not records
+            continue
         ids = {f"#{m.group(2)}", f"{m.group(1)}#{m.group(2)}"} if m else set()
         recs.append(dict(kind="event", title=f"landing {m.group(0) if m else ''}".strip(), ts=ts.strip(), text=l[:2000],
                          span=f"L{i + 1}", part=0, track="", extra_ids=ids, repo=m.group(1) if m else ""))
@@ -831,6 +946,8 @@ def parse(path, skind, repo, track, rows):
         return parse_slack(path, text)
     if skind == "docs":
         return parse_docs(path, text)
+    if skind == "results":
+        return parse_results(path, text, repo)
     return []
 
 
@@ -1036,6 +1153,9 @@ def index_source(c, path, skind, repo, track, rows):
         c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status, ws) VALUES (?,?,?,?,?,?,?,?,?) "
                   "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, indexed_at=excluded.indexed_at, "
                   "status=excluded.status, ws=excluded.ws", (path, skind, repo, track, st.st_size, st.st_mtime_ns, now_iso(), f"unreadable: {e}", ws_of(skind, repo)))
+        if skind == "results":   # QUARANTINE: a results file that is no longer numbers-only keeps not even its old numbers
+            c.execute("DELETE FROM rids WHERE record_id IN (SELECT r.id FROM records r JOIN sources s ON s.id=r.source_id WHERE s.path=?)", (path,))
+            c.execute("DELETE FROM records WHERE source_id=(SELECT id FROM sources WHERE path=?)", (path,))
         c.commit()
         return 0
     c.execute("BEGIN")
@@ -1122,6 +1242,11 @@ def reconcile(c, deadline=None, prefer=(), reg=None):
                 pass
     out = dict(indexed=0, pending=[], unreadable=[], excluded=[], removed=0, refused=0)
     todo = []
+    # QUARANTINE: the register and the queue are shared files a mark changes the reading of, not the bytes of —
+    # when the marked set moved since the last pass, both are re-read even though their cursor did not move
+    qnow = ",".join(sorted(quarantined()))
+    qprev = c.execute("SELECT v FROM meta WHERE k='quarantined'").fetchone()
+    qmoved = (qprev[0] if qprev else "") != qnow
     for p, skind, repo, track in reg:
         if excluded(p):
             out["excluded"].append(p)
@@ -1130,7 +1255,7 @@ def reconcile(c, deadline=None, prefer=(), reg=None):
             st = os.stat(p)
         except OSError:
             continue
-        if known.get(p) != (st.st_size, st.st_mtime_ns):
+        if known.get(p) != (st.st_size, st.st_mtime_ns) or (qmoved and skind in ("docs", "land-queue")):
             todo.append((p, skind, repo, track))
     live = set(p for p, *_ in reg) - set(out["excluded"])
     for p in set(known) - live:
@@ -1154,6 +1279,9 @@ def reconcile(c, deadline=None, prefer=(), reg=None):
             out["pending"].append(s[0])
             continue
         out["indexed"] += 1
+    if qmoved and not any(s[1] in ("docs", "land-queue") and s[0] in out["pending"] for s in todo):
+        c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('quarantined', ?)", (qnow,))
+        c.commit()
     for p, status, refused in c.execute("SELECT path, status, refused FROM sources"):
         if status != "ok":
             out["unreadable"].append(f"{tilde(p)} ({status})")
@@ -1713,6 +1841,8 @@ def touch(paths):
                         todo.append(src)
         elif ap in by_path and not excluded(ap):
             todo.append(by_path[ap])      # named outright: re-read, the record grain keeps that cheap
+        elif quarantine_of(ap):
+            continue                      # QUARANTINE: never read, and not a miss — nothing is broken
         else:
             miss(ap, "not a registered source" if os.path.exists(ap) else "no such file")
             rc = 1
@@ -1777,7 +1907,7 @@ def index(argv):
               seconds=round(time.monotonic() - t0, 2), peak_rss_mib=round(rss_mib(), 1), indexed_now=cov["indexed"],
               removed=cov["removed"], unreadable=cov["unreadable"], excluded=[tilde(p) for p in cov["excluded"]],
               refused=cov["refused"], rebuild=rebuild, hook_misses=hm, misses_cleared=bool(hm and not cov["pending"]),
-              workspaces=[dict(w, file=tilde(w["file"])) for w in wss])
+              workspaces=[dict(w, file=tilde(w["file"])) for w in wss], quarantined=sorted(QUAR))
     if as_json:
         print(json.dumps(st, indent=1))
     else:
@@ -1794,6 +1924,33 @@ def index(argv):
         for w in wss:
             if w["refused"]:
                 print(f"  refused: {w['handle']}: {w['refused']}")
+        if QUAR:
+            print(f"  quarantined {len(QUAR)}: {', '.join(sorted(QUAR))} — indexed nowhere but a numbers-only results.json")
+    return 0
+
+
+def quarantine(argv):
+    """cc-lib quarantine [<handle>]: mark a member workspace quarantined (the marker beside its workspace-id), or list."""
+    if member_mode():
+        print("cc-lib quarantine: inside a member's boundary nothing is marked — the mark is the host's", file=sys.stderr)
+        return 2
+    if not argv:
+        q = sorted(quarantined())
+        print("quarantined: " + (", ".join(q) if q else "none"))
+        return 0
+    h = argv[0]
+    if not re.match(r"^[a-z0-9][a-z0-9-]{0,63}$", h) or not os.path.isfile(os.path.join(H, "dev", h, ".cc", "member-workspace")):
+        print(f"cc-lib quarantine: {h[:64]!r} is not a member workspace (no ~/dev/<h>/.cc/member-workspace) — nothing marked", file=sys.stderr)
+        return 2
+    m = os.path.join(H, ".cc", "members", h, QUAR_MARK)
+    if os.path.islink(m) or (os.path.lexists(m) and not os.path.isfile(m)):
+        print(f"cc-lib quarantine: {tilde(m)} is a link or not a file — not written through, nothing marked", file=sys.stderr)
+        return 2
+    if not os.path.isfile(m):
+        os.makedirs(os.path.dirname(m), mode=0o700, exist_ok=True)
+        with open(m, "x") as f:
+            f.write(f"{now_iso()} marked by cc-lib quarantine\n")
+    print(f"cc-lib quarantine: {h} is quarantined ({tilde(m)}); the next `cc-lib index` drops what it already had")
     return 0
 
 
@@ -2462,6 +2619,7 @@ def selfcheck():
         selfcheck_lessons(th, ok, run, w)
         selfcheck_docs(th, ok, run, w)
         selfcheck_perms(th, ok, run, w)
+        selfcheck_quarantine(ok, run)
     finally:
         H = H0
         shutil.rmtree(th, ignore_errors=True)
@@ -2919,6 +3077,121 @@ def selfcheck_docs(th, ok, run, w):
     ok("docs: a document with no filed revision is not a record", "001-0005" not in o)
 
 
+def selfcheck_quarantine(ok, run):
+    """QUARANTINE, on a HOME of its own (no earlier case's state): a quarantined workspace qx, a workspace wsk and a
+    repo qx-two whose memory dir shares qx's prefix. A probe word in each of qx's journal, task, doc, board note, memory
+    (its ~/dev dir and a worktree's), Slack archive, landing record, queue line and register document is found before
+    the mark and absent after it; wsk's and qx-two's stay found; only a numbers-only results.json crosses out."""
+    import shutil
+    import tempfile
+    global H
+    H0, th = H, tempfile.mkdtemp(prefix="cclib-q-")
+    H = th
+    try:
+        def w(rel, text):
+            p = os.path.join(th, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(text)
+            return p
+        P = "zq" + os.urandom(4).hex()
+        for h in ("qx", "wsk"):
+            w(f"dev/{h}/.cc/member-workspace", "")
+            w(f".cc/boards/{h}.json", json.dumps({"repo": h, "path": os.path.join(th, "dev", h), "tracks": {
+                "t1": {"title": f"{h} row", "kind": "track", "status": "running",
+                       "notes": [{"ts": "2026-10-03T00:00:00Z", "msg": f"{P}{h}note"}]}}, "log": []}))
+            w(f".cc/state/{h}/t1/progress.md", f"## 2026-10-03T01:00Z first\n{P}{h}journal line.\n")
+            w(f".cc/state/{h}/t1/task.md", f"# task\n\n## brief\n{P}{h}task.\n")
+            w(f"dev/{h}/docs/d.md", f"# doc\n\n## sec\n{P}{h}doc.\n")
+            w(f".cc/slack/archive/{h}/C0AAAAAAAA/2026-10.jsonl",
+              json.dumps({"ts": "1791010630.554129", "user": "U1", "role": "owner", "channel": h, "text": f"{P}{h}slack"}) + "\n")
+            w(f".cc/state/land/{h}-7.json", json.dumps({"repo": h, "pr": 7, "stage": "landed", "track": f"{P}{h}land"}))
+        w(".cc/boards/qx-two.json", json.dumps({"repo": "qx-two", "path": os.path.join(th, "dev", "qx-two"), "tracks": {}, "log": []}))
+
+        def mem(root, name):
+            w(f".claude/projects/{enc_dir(os.path.join(th, root))}/memory/{name}.md",
+              f"---\nname: {name}\ndescription: a rule\nmetadata:\n  type: feedback\n---\n{P}{name}mem\n")
+        mem("dev/qx", "qxdev")
+        mem(".cc/worktrees/qx/t1", "qxwt")
+        mem("dev/wsk", "wskdev")
+        mem("dev/qx-two", "qxtwodev")
+        w(".cc/state/land/queue.log", f"2026-10-03T00:00:00Z\tlanded qx#7 {P}qxqueue\n2026-10-03T00:00:01Z\tlanded wsk#7 {P}wskqueue\n")
+        w(".cc/documents/register.json", json.dumps({"version": 1, "projects": {
+            "901": {"name": "qx", "kind": "member", "member": "qx"}, "902": {"name": "wsk", "kind": "member", "member": "wsk"}},
+            "documents": {
+                "901-0001": {"number": "901-0001", "project": "901", "member": "qx", "title": f"{P}qxdocument",
+                             "revisions": [{"rev": "A", "file": "f.pdf", "date": "2026-10-03"}]},
+                "902-0001": {"number": "902-0001", "project": "902", "member": "wsk", "title": f"{P}wskdocument",
+                             "revisions": [{"rev": "A", "file": "g.pdf", "date": "2026-10-03"}]}}}))
+        qx_words = ["qxnote", "qxjournal", "qxtask", "qxdoc", "qxslack", "qxland", "qxdevmem", "qxwtmem", "qxqueue", "qxdocument"]
+        kept = ["wsknote", "wskjournal", "wskdoc", "wskdevmem", "wskqueue", "wskdocument", "qxtwodevmem"]
+
+        def found(word):
+            return P + word in run("ask", "--need", "history", P + word)[1]
+        run("index")
+        before = [x for x in qx_words if not found(x)]
+        ok("quarantine: before the mark, every one of qx's ten probes is found (the fixture is read)"
+           + (f" — missing {before}" if before else ""), not before)
+        rc, o = run("quarantine", "nosuch")
+        ok("quarantine: a handle that is not a member workspace is refused and nothing is marked",
+           rc == 2 and not os.path.exists(os.path.join(th, ".cc", "members", "nosuch", QUAR_MARK)))
+        os.makedirs(os.path.join(th, ".cc", "members", "wsk"), exist_ok=True)
+        os.symlink(os.path.join(th, "elsewhere"), os.path.join(th, ".cc", "members", "wsk", QUAR_MARK))
+        rc, o = run("quarantine", "wsk")
+        ok("quarantine: a link at the marker's name is refused and not written through",
+           rc == 2 and not os.path.exists(os.path.join(th, "elsewhere")))
+        os.remove(os.path.join(th, ".cc", "members", "wsk", QUAR_MARK))
+        rc, o = run("quarantine", "qx")
+        rc2, o2 = run("quarantine")
+        ok("quarantine: `quarantine qx` writes the host-side marker and the bare form lists it",
+           rc == 0 and os.path.isfile(os.path.join(th, ".cc", "members", "qx", QUAR_MARK)) and "quarantined: qx" in o2)
+        rc, o = run("index")
+        ok("quarantine: `index` names the quarantined workspace", rc == 0 and "quarantined 1: qx" in o)
+        leaked = [x for x in qx_words if found(x)]
+        ok("quarantine: after the mark and one index, none of qx's ten probes is found by an owner ask"
+           + (f" — leaked {leaked}" if leaked else ""), not leaked)
+        lost = [x for x in kept if not found(x)]
+        ok("quarantine: wsk's probes and qx-two's memory (a dir sharing qx's prefix) are still found"
+           + (f" — lost {lost}" if lost else ""), not lost)
+
+        def nrec(h):
+            c = sqlite3.connect(os.path.join(libroot(), "ws", ws_id(h), "index.sqlite"))
+            try:
+                return c.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+            finally:
+                c.close()
+        ok("quarantine: qx's own workspace file holds no record, wsk's still holds its own", nrec("qx") == 0 and nrec("wsk") > 0)
+        ml = os.path.join(libroot(), "owner", "misses.log")
+        jp = w(".cc/state/qx/t1/progress.md", f"## 2026-10-03T02:00Z second\n{P}qxlater line.\n")
+        rc, o = run("index", "--touch", jp)
+        logged = os.path.exists(ml) and jp in open(ml).read()
+        ok("quarantine: --touch on a quarantined journal reads nothing and logs no miss", rc == 0 and not logged and not found("qxlater"))
+        stray = w(".cc/state/r9-not-a-board.txt", "x")
+        rc, o = run("index", "--touch", stray)
+        ok("quarantine: --touch on an unregistered path outside the quarantine is still a miss",
+           rc == 1 and os.path.exists(ml) and stray in open(ml).read())
+        w(".cc/state/qx/results.json", json.dumps({"accuracy": 0.875, "runs": [3, 4], "arm": {"loss_ab": 12}}))
+        run("index")
+        rc, o = run("ask", "--need", "history", "results qx accuracy")
+        ok("quarantine: a numbers-only results.json crosses out, its numbers in one record", "accuracy 0.875" in o and "arm.loss_ab 12" in o)
+        w(".cc/state/qx/results.json", json.dumps({"accuracy": 0.875, "note": f"{P}qxprose"}))
+        rc, o = run("index")
+        rc2, o2 = run("ask", "--need", "history", "results qx accuracy")
+        ok("quarantine: a results.json carrying a string is unreadable (`not numbers-only`), and neither its words nor its old "
+           "numbers are found", "not numbers-only" in o and P + "qxprose" not in o + o2 and not found("qxprose") and "accuracy 0.875" not in o2)
+        w(".cc/state/qx/results.json", json.dumps({"Hello world": 1}))
+        rc, o = run("index")
+        ok("quarantine: a key that is not a plain name is refused, and the refusal quotes no key",
+           "not numbers-only (a key" in o and "Hello world" not in o)
+        os.remove(os.path.join(th, ".cc", "members", "qx", QUAR_MARK))
+        run("index")
+        ok("quarantine: deleting the marker lifts it — the next index finds qx's journal and register document again",
+           found("qxlater") and found("qxdocument"))
+    finally:
+        H = H0
+        shutil.rmtree(th, ignore_errors=True)
+
+
 def selfcheck_perms(th, ok, run, w):
     """A repo's permission session keeps its brief and ledger in ~/.cc/state/<repo>/perms/: each .md there is a doc
     source, and nothing else in that directory is."""
@@ -3060,7 +3333,9 @@ def main(argv):
         return memory(rest)
     if cmd == "bench":
         return bench(rest)
-    print("usage: cc-lib ask|get|view|memory|index [--touch <path>...|--cold [days]]|bench|selfcheck (cc-lib --help for the contract)", file=sys.stderr)
+    if cmd == "quarantine":
+        return quarantine(rest)
+    print("usage: cc-lib ask|get|view|memory|quarantine|index [--touch <path>...|--cold [days]]|bench|selfcheck (cc-lib --help for the contract)", file=sys.stderr)
     return 2
 
 
