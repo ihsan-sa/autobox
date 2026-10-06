@@ -2650,6 +2650,9 @@ def run():
             k("#nosuch is not a channel I could deliver to" in dec.question and "could not tell" in dec.question
               and "#nosuch" in dec.offer and "move #<channel>" in dec.offer,
               "…the session is told which address was not honoured, and the person is offered the `move`")
+            k(not any(c in dec.offer for c in ("#mem--site", "#mem--api", "other places")),
+              "…without the list of the sender's places: a dropped name's thread offers the move and no more "
+              "(owner, 2026-10-02)")
             k(dec.note == "#nosuch is not a channel I could deliver to.",
               "…and the sender hears the same one sentence, before where it went")
             # (b') …and when the classifier CAN place it, it goes there, and the rule still says a name was dropped
@@ -2662,6 +2665,17 @@ def run():
             dec = router.route(to("nosuch"), Dir(), "box.example")
             k([p.name for p in dec.to] == ["mem"] and dec.rule == "no-channel:unsure",
               "…and the classifier is fenced to the sender's own places on this path too")
+            # (b'') the owner's forward to a name no channel has (2026-10-02, a co-op mail to a course word): the
+            # classifier picks one of HIS places, the sender hears the one sentence, and nobody is asked to sort it
+            os.environ["CC_MAIL_ROUTE_FAKE"] = "dashboard"
+            dec = router.route(to("study", OWNER, body="Submit your rankings for the cycle 1 match"),
+                               Dir(), "box.example")
+            k([p.name for p in dec.to] == ["dashboard"] and dec.rule == "no-channel:classified"
+              and dec.note == "#study is not a channel I could deliver to." and not dec.question and not dec.offer
+              and dec.workspace == "owner",
+              "the owner's mail to a name no channel has goes where the classifier puts it among his places, "
+              "with the one sentence and no question or channel list")
+
             os.environ["CC_MAIL_ROUTE_FAKE"] = ""
 
             # (c) the boundary: a name that IS a channel but not the sender's reads exactly like one that is not

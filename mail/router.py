@@ -33,7 +33,9 @@ the box, so it may name a channel that is not there, or one that is another work
 sender stands those are the same thing, a name the box will not deliver to, and telling them which would map
 out the box's channels for anyone on the allow-list. Such a name is dropped and the mail is placed the way a
 home@ mail is: the classifier over the sender's OWN places, and unsure lands in their main session with the
-question naming the address that was not honoured, so a person can `move` it. MAIL_UNPLACED=bounce turns that
+question naming the address that was not honoured, so a person can `move` it. The thread offers the `move` and
+does not list the places (owner, 2026-10-02, on a forward to a name with no channel parked in his DM under a
+list of every channel he has: "Fix"). MAIL_UNPLACED=bounce turns that
 last step into a one-line answer to the sender instead — reachable by configuration, not the default, because
 a mail in a channel is one a person can point to and a bounce is one they must write again. Every Decision
 carries the `rule` that placed it, and take_mail writes it to the log, the conversation and the seen line.
@@ -875,8 +877,14 @@ def route(msg, d, domain, table=None, unplaced_to="main", quiet="", explain=""):
     here = ("%s I could not tell which project it is for, so it is here." % note if note
             else "I could not tell which project this mail is for, so it is here.")
     others = ", ".join("#" + p.name for p in ws_places if p != main)
-    offer = ("%s Its other places: %s. Reply `move #<channel>` in this thread to send it there."
-             % (here, others)) if others else ""
+    if unplaced:
+        # A name that was dropped: the note already says which, and the move is offered without the list of
+        # places. The owner read that list under a forward to a name with no channel as the box asking him to
+        # sort his own mail (2026-10-02); the person who wrote the address knows where it was meant to go.
+        offer = ("%s Reply `move #<channel>` in this thread to send it to one of yours." % here) if others else ""
+    else:
+        offer = ("%s Its other places: %s. Reply `move #<channel>` in this thread to send it there."
+                 % (here, others)) if others else ""
     # A classifier that could not RUN reads in this thread exactly like one that ran and was unsure, so the
     # cause goes where the person looking at the mail is — the mirror thread, not only the log.
     if why:
