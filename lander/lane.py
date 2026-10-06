@@ -52,7 +52,12 @@ leave the file untouched and the job untimed:
   checking   the plan's checks on merge-tree(base_sha, head), made once per base and head (extra tree_of), each
              through runner.run_plan (run.judge: the red-vs-base rule, the rerun alone under load, quarantine, the lane's records.Store under its lock, and the
              failures-ledger record of a red that is the diff's) against the manifest at base widened by the head's —
-             a member's on "member:<h>" — skipping those already in results. FAILED -> handback;
+             a member's on "member:<h>" — skipping those already in results. RE-READ: every RECHECK_SECS while it
+             checks, and at its next turn after an `again` request, the job reads the PR's state and head; not OPEN or
+             a new head -> its checks in flight are stopped (run.execute kills their process groups) and it goes
+             back to queued, which ends a merged PR as merged (by=before) and a closed one as done, so nothing parked
+             on it waits on checks for a PR that already left (10-04: #794 merged at 16:47Z and held 57 jobs behind
+             it, still checking, for 40+ min; ai-ee #99 checked a stale head for 50 min). FAILED -> handback;
              blocked-by-main (red on the base tree too) -> held 15 min and planned again from main then, not blamed;
              a check the manifest lacks -> query "planning"; UNRUNNABLE -> held 15 min, the 3rd -> query. Then,
              when the plan is paid, one read (a delta read when a prior verdict exists; none when a LAND is already
@@ -63,7 +68,9 @@ leave the file untouched and the job untimed:
   mergeable  the head moved -> queued. main moved -> Δ re-plan (S2): rerun = (new − old) ∪ (new ∩ checks Δ
              reaches); a new plan that is lander-class (a reach file the new base does not generate) -> query
              "lander-self"; non-empty -> checking with only those; empty -> base_sha = main and merge. GITHUB CI comes
-             next (gh.ci_state at the head): red -> handback naming each failed check; queued or running -> held
+             next (gh.ci_state at the head): red -> handback naming each failed check; "starved" (every red is a
+             job GitHub cancelled because no hosted runner took it) -> gh.rerun of those runs and held CI_WAIT_SECS,
+             at most STARVED_RERUNS times at one head, then handback as red; queued or running -> held
              CI_WAIT_SECS, the CI_WAITS+1th wait at one head a query "planning"; an empty rollup on a base with
              .github/workflows -> held the same way CI_REGISTER_WAITS times, then on as no CI; unreadable -> held,
              the CI_UNREADS+1th at one head a query "planning"; green or no CI at all -> on. THE MERGE (S1),
@@ -106,6 +113,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from concurrent import futures
 
@@ -142,6 +150,8 @@ LAPTOP_REST = 300       # seconds the box takes the laptop's checks after the la
 CI_WAIT_SECS = 120       # a head whose GitHub CI is still running is looked at again this often…
 CI_WAITS = 30            # …this many times (an hour) before it is a query
 CI_REGISTER_WAITS = 2    # waits on a base with workflows but no check yet, before it lands as a repo with no CI
+STARVED_RERUNS = 2       # reruns of runs GitHub cancelled for want of a hosted runner, at one head, before red
+RECHECK_SECS = float(os.environ.get("LANDER_RECHECK_SECS") or 300)   # a checking job re-reads its PR this often
 CI_UNREADS = 4           # holds (HOLD_SECS each: an hour) at one head whose CI GitHub would not show, then a query
 POLL = 5                 # seconds the lane waits on its checks before it looks at the inbox again
 MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": "cards", "board": "board",
@@ -151,9 +161,10 @@ MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": 
 class Flight:
     """One check a job has in the lane's pool, and the head, base and merge tree it was started on."""
 
-    def __init__(self, future, pr, name, head, base, tree, laptop=False):
+    def __init__(self, future, pr, name, head, base, tree, laptop, stop):
         self.future, self.pr, self.name, self.head, self.base, self.tree = future, pr, name, head, base, tree
         self.laptop = laptop   # sent to the laptop: it counts against LAPTOP_SLOTS, not the box's slots
+        self.stop = stop   # a threading.Event; set: run.execute kills the check (the job left this head)
 
 
 class UnitFault(Exception):
@@ -437,8 +448,12 @@ class Lane:
                 return moved
             for ln in J.drain(self.repo):
                 self.say(ln)
-            todo = [j for j in J.lane_jobs(self.repo)
-                    if j.key not in tried and self.due(j)]
+            jobs = J.lane_jobs(self.repo)
+            for j in jobs:   # a checking job due a re-read of its PR has a turn, waiting or not, unless the box
+                # holds it (paused, a tier stop): re-admitted, it would be refused before it read, every pass, unslept
+                if j.key in tried and self.reread_due(j) and not self.box_hold(j):
+                    tried.discard(j.key)
+            todo = [j for j in jobs if j.key not in tried and self.due(j)]
             if not todo:   # every due job has had its turn: record what finished (a freed slot), or wait for it
                 if not self.inflight:
                     return ""
@@ -497,6 +512,40 @@ class Lane:
                 self.hold(job, str(e), kind="box")
         if done:
             self.wake()
+
+    @staticmethod
+    def reread_due(job) -> bool:
+        """A checking job that has not read its PR in RECHECK_SECS, or that an `again` request named since."""
+        return job.state == T.CHECKING and (bool(job.extra.get("reread"))
+                                            or time.time() - E.epoch_of(job.extra.get("read_at")) >= RECHECK_SECS)
+
+    def reread(self, job) -> bool:
+        """Read a checking job's PR state and head. True when the job has left checking: the PR merged, closed or
+        has a new head, so its checks in flight are stopped and it is queued again (queued() ends or restarts it).
+        An unreadable PR, or a GitHub backoff, leaves it checking and reads again in RECHECK_SECS."""
+        # "A job whose PR already merged must finish as done and unpark its chain. A new head pushed mid-check must
+        # cancel the old check." (brief, 2026-10-06)
+        job.extra.pop("reread", None)
+        job.extra["read_at"] = E.stamp()
+        facts = None if GH.backoff() else GH.pr_facts(self.root, job.pr, "state,headRefOid", self.token)[0]
+        if facts is None:
+            J.save(job)
+            return False
+        state, head = facts.get("state") or "", facts.get("headRefOid") or ""
+        if state == "OPEN" and (not head or head == job.head):
+            J.save(job)
+            return False
+        self.stop_checks(job)
+        why = f"the PR is {state.lower() or 'not open'}" if state != "OPEN" else f"the head moved to {head[:12]}"
+        J.move(job, T.QUEUED, why=why + " while it was checking")
+        self.say(f"PR #{job.pr}: {why}; its checks in flight are stopped")
+        return True
+
+    def stop_checks(self, job):
+        """Stop every check `job` has in flight; each is reaped (not recorded) once its process group is gone."""
+        for (key, _), f in self.inflight.items():
+            if key == job.key:
+                f.stop.set()
 
     def due(self, job):
         return job.state not in J.RESTING and not (job.state == T.HELD and J.not_before_left(job))
@@ -654,6 +703,8 @@ class Lane:
             return self.hold(job, f"gh could not read PR #{job.pr}: {why}", kind="box")
         base, branch = facts.get("baseRefName") or "", facts.get("headRefName") or ""
         job.extra.update(title=facts.get("title") or "", body=facts.get("body") or "", branch=branch, base_ref=base)
+        job.extra["read_at"] = E.stamp()   # what a checking job's re-read counts RECHECK_SECS from
+        job.extra.pop("reread", None)
         state = facts.get("state") or ""
         if state == "MERGED":
             job.head = facts.get("headRefOid") or job.head
@@ -756,6 +807,8 @@ class Lane:
         to the review and the merge. The check's outcome is recorded by took(), on the lane's thread."""
         if not self.unit("runner"):
             return self.hold(job, "runner is not installed", kind="box")
+        if self.reread_due(job) and self.reread(job):
+            return None
         todo = [n for n in (job.plan.checks if job.plan else []) if n not in job.results]
         red = (job.extra.get("main_red") or {}).get("check")
         if red in todo:   # the check main was red on goes first: while main is still red, one check says so
@@ -799,11 +852,12 @@ class Lane:
                     laptop = False
                 else:
                     continue   # no place of either kind for it now: tried again when a check finishes
+                stop = threading.Event()
                 fut = self.pool.submit(self.call, "runner", "run_plan", self.root, m, job.plan, job.files, tree,
                                        base_tree, member=self.member, store=store, job_key=job.key,
                                        scope=self.member or self.repo, pr=job.pr, quarantine_text=quarantine,
-                                       only=[n], fallback=self.fallback, **({} if laptop else kw))
-                self.inflight[(job.key, n)] = Flight(fut, job.pr, n, job.head, job.base_sha, tree, laptop)
+                                       only=[n], fallback=self.fallback, cancel=stop, **({} if laptop else kw))
+                self.inflight[(job.key, n)] = Flight(fut, job.pr, n, job.head, job.base_sha, tree, laptop, stop)
             self.waiting.add(job.key)   # submitted or not, it goes on when a check finishes and frees a slot
             return None
         if job.plan and job.plan.paid and not self.review(job):
@@ -923,7 +977,8 @@ class Lane:
             workflows = G.has_workflows(self.root, job.base_sha)
         except G.GitError:
             workflows = True   # a base that cannot be read is not evidence of no CI: wait for checks to show
-        state, detail = GH.ci_state(self.root, job.pr, job.head, self.token, workflows=workflows)
+        runs = []   # the starved cancels' run ids, as ci_state verified them; never read back out of detail
+        state, detail = GH.ci_state(self.root, job.pr, job.head, self.token, workflows=workflows, runs=runs)
         if state:
             job.extra.pop("ci_unread", None)
         if state in ("pending", "unregistered"):
@@ -942,7 +997,16 @@ class Lane:
         if state in ("green", "none"):
             job.extra.pop("ci_wait", None)
             return True
-        if state == "red":
+        if state == "starved" and self.count(job, "ci_starved") <= STARVED_RERUNS:
+            # "A GitHub runner-not-acquired cancel must rerun, not hand back" (2026-10-05: #80, #93-95 handed back
+            # with nothing in their code failing): each cancelled run again, and the job waits for it like running CI
+            got = [GH.rerun(self.root, r, self.token) for r in runs]
+            self.hold(job, f"GitHub cancelled CI at {job.head[:12]} for want of a hosted runner ({detail}); "
+                           + ("rerun " + ", ".join(runs) if got and all(ok for ok, _ in got)
+                              else "the rerun was refused: " + "; ".join(t for ok, t in got if not ok)),
+                      kind="box", secs=CI_WAIT_SECS)
+            return False
+        if state in ("red", "starved"):
             self.handback(job, f"GitHub CI is red at {job.head[:12]}: {detail} — fix it, or re-run it on GitHub, "
                                f"and queue it again")
         elif self.count(job, "ci_unread") > CI_UNREADS:

@@ -55,6 +55,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -164,9 +165,21 @@ def clean_env(extra: dict | None = None) -> dict:
     return env
 
 
+_STOP = threading.local()   # .event: run_plan's `cancel`, for every execute() on the thread that runs the plan
+
+
+def stopped() -> bool:
+    ev = getattr(_STOP, "event", None)
+    return bool(ev is not None and ev.is_set())
+
+
 def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None) -> tuple:
-    """-> (rc, secs, cpu_secs, capped). Its own session, so the cap kills the whole group; rc < 0 is a signal."""
+    """-> (rc, secs, cpu_secs, capped). Its own session, so the cap kills the whole group; rc < 0 is a signal.
+    A plan's `cancel` set (the lane: the job's PR merged, closed or moved on) kills the group the same way, and a
+    stopped plan starts nothing more: rc -SIGTERM, which status_of calls unrunnable, never red."""
     t0 = time.monotonic()
+    if stopped():
+        return -signal.SIGTERM, 0.0, 0.0, False
     with open(log, "wb") as out:
         p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if stdin is not None else subprocess.DEVNULL,
                              stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
@@ -177,8 +190,8 @@ def execute(argv: list, cwd: str, env: dict, cap: int, log: str, stdin=None) -> 
         if pid:
             rc = os.waitstatus_to_exitcode(status)
             break
-        if time.monotonic() - t0 > cap:
-            capped = True
+        if time.monotonic() - t0 > cap or stopped():
+            capped = not stopped()
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
                     os.killpg(p.pid, sig)
@@ -600,10 +613,22 @@ def laptop_gone(outs: dict) -> bool:
 def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree: str, base_tree: str = "", *,
              member: str = "", store=None, job_key: str = "", scope: str = "", pr: int | None = None,
              quarantine_text: str = "", runner=None, only=None, record_reds: bool = True,
-             fallback: str = "", box_only: bool = False) -> dict:
+             fallback: str = "", box_only: bool = False, cancel=None) -> dict:
     """Every check in plan.checks through judge(), one after another; -> {name: Outcome}. The lane calls it with
     its store; `lander check` with none (a worker's own red is its work, and is not recorded). fallback: the host
-    manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks."""
+    manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks. cancel: a
+    threading.Event the lane sets to stop the plan; every execute() on this thread polls it."""
+    _STOP.event = cancel
+    try:
+        return _run_plan(repo_root, m, plan, files, head_tree, base_tree, member=member, store=store,
+                         job_key=job_key, scope=scope, pr=pr, quarantine_text=quarantine_text, runner=runner,
+                         only=only, record_reds=record_reds, fallback=fallback, box_only=box_only)
+    finally:
+        _STOP.event = None
+
+
+def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store, job_key, scope, pr,
+              quarantine_text, runner, only, record_reds, fallback, box_only):
     rows = REC.quarantine_rows(quarantine_text)
     record = (lambda r, text: REC.record_red(scope, r, text, pr)) if (record_reds and scope) else None
     base_m = M.load(repo_root, base_tree, fallback=fallback, strict=False) if base_tree else None

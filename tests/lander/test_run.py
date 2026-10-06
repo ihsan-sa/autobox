@@ -18,6 +18,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -99,6 +100,37 @@ class Status(unittest.TestCase):
     def test_red_lines_leave_out_pass_lines(self):
         self.assertEqual(RUN.red_lines("ok 1 fine\n✗ broke here\nFAIL two\n✓ FAIL-looking pass"),
                          ["✗ broke here", "FAIL two"])
+
+
+class Cancel(unittest.TestCase):
+    """run_plan's cancel stops the check the lane no longer wants: its PR merged, closed or moved on mid-check."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="lander-cancel-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.ev = threading.Event()
+        RUN._STOP.event = self.ev
+        self.addCleanup(setattr, RUN._STOP, "event", None)
+
+    def execute(self, argv):
+        return RUN.execute(argv, self.tmp, dict(os.environ), 120, os.path.join(self.tmp, "log"))
+
+    def test_a_cancel_kills_the_running_check_and_starts_no_more(self):
+        threading.Timer(0.3, self.ev.set).start()
+        t0 = time.monotonic()
+        rc, _, _, capped = self.execute(["sleep", "60"])
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertLess(rc, 0)
+        self.assertFalse(capped)   # stopped, not timed out: status_of calls it unrunnable, never red
+        marker = os.path.join(self.tmp, "ran")
+        rc, _, _, _ = self.execute(["touch", marker])
+        self.assertLess(rc, 0)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_no_cancel_runs_the_check_to_its_end(self):
+        marker = os.path.join(self.tmp, "ran")
+        self.assertEqual(self.execute(["touch", marker])[0], 0)
+        self.assertTrue(os.path.exists(marker))
 
 
 class Tree(Env):

@@ -30,8 +30,10 @@ dashboard do not count as running), and the record is validated (T.Job.to_dict) 
 
 DRAIN (the lane only, under the lane lock, then rest_lock): a request with no job makes a queued job; one for a job
 at rest (done, query, handback, or held for a reason a push mends) is a fresh start that keeps reads_used and the prior
-verdict (`requeued`); one for an active job fills chat/ts/who where empty (`again`). A job held by the box itself
-(hold="box": a usage wall, a cap, an unrunnable check) is active: a fresh start would not mend it.
+verdict (`requeued`); one for an active job fills chat/ts/who where empty (`again`), and on a checking job sets
+extra.reread so it reads its PR's state and head at its next turn (a push mid-check re-queues it, which says `again`).
+A job held by the box itself (hold="box": a usage wall, a cap, an unrunnable check) is active: a fresh start would
+not mend it.
 A REQUEST IS UNTRUSTED. Anyone may write the inbox, so drain takes only chat, ts and who from it (repo and pr route
 it). An approval, a verdict or a reads count in a request is dropped: the owner's 👍 is the approval record
 `lander queue` writes after it checked the uid itself (approvals/<repo>-<pr>.json, read by the lane's door), and a
@@ -396,6 +398,8 @@ def _drain(repo: str) -> list:
             for k in CARRY:
                 if req.get(k) and not job.extra.get(k):
                     job.extra[k] = req[k]
+            if job.state == T.CHECKING:   # lane.reread: a push mid-check is the commonest `again`
+                job.extra["reread"] = True   # only a checking job reads it; any other `again` leaves the job as it was
             save(job)
             E.log("again", repo, pr)
             lines.append(f"{repo}#{pr} again")

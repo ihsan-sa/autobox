@@ -7,9 +7,12 @@
     pr_files(root, pr) -> [paths] | None · slug(root) -> "owner/name" | ""
     merge_state(root, pr) -> (state, merge_oid): GitHub's "MERGED"/"OPEN"/"CLOSED" and the squash commit's oid, or
         ("", "") when gh would not answer — which is never read as "not merged".
-    ci_state(root, pr, pin, workflows=False) -> (state, detail): the PR's GitHub checks at head `pin` — "green",
-        "red", "pending", "unregistered" (no check yet, though the base has workflows), "none" (no CI at all) or ""
+    ci_state(root, pr, pin, workflows=False, runs=None) -> (state, detail): the PR's GitHub checks at head `pin` —
+        "green", "red", "pending", "starved" (every red is an Actions job GitHub cancelled because no hosted runner
+        took it, and none is still running; their run ids go into the caller's `runs` list, never parsed from
+        detail), "unregistered" (no check yet, though the base has workflows), "none" (no CI at all) or ""
         (unreadable). The lane merges on green or none only.
+    rerun(root, run_id) -> (ok, text): `gh run rerun <run_id> --failed [-R <slug>]`, which reruns the cancelled jobs.
     merge(root, pr, pin, title) -> (ok, text), ok True | False | None
         `gh pr merge <pr> --squash --delete-branch --match-head-commit <pin> [-R <slug>] --subject "<title> (#<pr>)"`.
         "already merged" is merged; "is closed" and any other failure are merged only when GitHub then reports the
@@ -121,13 +124,14 @@ def merge_state(root, pr, token=None):
 CI_GREEN = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 
-def ci_state(root, pr, pin, token=None, workflows=False):
+def ci_state(root, pr, pin, token=None, workflows=False, runs=None):
     """GitHub CI at the head the merge will pin. -> (state, detail):
     "green" every check and status passed · "red" one failed (detail names each, with its link) · "pending" one is
     queued or running, or GitHub reports another head than `pin` (its checks are not this head's) · "unregistered"
     no check or status yet while `workflows` (the base has .github/workflows): right after a push GitHub takes a
     while to register the runs, so an empty list there is not "no CI" · "none" no check or status at all and no
-    workflows — a repo with no CI, which lands as before · "" GitHub could not be read (detail why)."""
+    workflows — a repo with no CI, which lands as before · "" GitHub could not be read (detail why) · "starved"
+    every red is a cancel starved_run() vouches for and nothing is pending: their run ids are appended to `runs`."""
     j, why = pr_facts(root, pr, "headRefOid,statusCheckRollup", token, 60)
     if j is None:
         return "", why
@@ -137,7 +141,7 @@ def ci_state(root, pr, pin, token=None, workflows=False):
     if not rows:
         return ("unregistered", "no check has registered yet, though the base has workflows") if workflows \
             else ("none", "")
-    red, pending = [], []
+    red, pending, cancelled = [], [], []
     for r in rows:
         name = r.get("name") or r.get("context") or "?"
         link = r.get("detailsUrl") or r.get("targetUrl") or ""
@@ -151,11 +155,63 @@ def ci_state(root, pr, pin, token=None, workflows=False):
             pending.append(name)
         elif word not in CI_GREEN:
             red.append(f"{name} {word.lower() or 'failed'}" + (f" ({link})" if link else ""))
+            if word == "CANCELLED":
+                cancelled.append((name, r))
+    starved = [(name, starved_run(root, r, pin, token)) for name, r in cancelled] \
+        if red and len(cancelled) == len(red) else []
+    if starved and all(run for _, run in starved):
+        if pending:   # `gh run rerun --failed` refuses a run whose other jobs still run: wait for them first
+            return "pending", "still running: " + ", ".join(pending)
+        if runs is not None:
+            runs.extend(dict.fromkeys(run for _, run in starved))
+        return "starved", "; ".join(f"{name} cancelled: no hosted runner took it" for name, _ in starved)
     if red:
         return "red", "; ".join(red)
     if pending:
         return "pending", "still running: " + ", ".join(pending)
     return "green", f"{len(rows)} check(s) passed"
+
+
+STARVED_RE = re.compile(r"not acquired by Runner", re.I)
+JOB_URL_RE = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
+
+
+def api_json(root, path, token=None):
+    """GET `path` through gh api -> the parsed answer, or None when gh failed or answered no JSON."""
+    rc, out, _ = gh(["api", path], root, token, 60)
+    try:
+        return json.loads(out) if not rc else None
+    except ValueError:
+        return None
+
+
+def starved_run(root, row, pin, token=None) -> str:
+    """The Actions run id of a CANCELLED check run whose annotations say no hosted runner took it ("The job was not
+    acquired by Runner of type hosted even after multiple attempts"), else "" (2026-10-05: four PRs handed back as red
+    CI for it, with nothing in their code failing). A PR's workflow with checks: write sets any details_url, name and
+    annotations it likes, so the URL's job is read back from GitHub: it must be a github-actions check run whose job
+    belongs to the URL's run at head `pin`, or the cancel stays red and nothing is rerun. Unreadable is ""."""
+    m = JOB_URL_RE.search(row.get("detailsUrl") or "")
+    s = slug(root)
+    if not m or not s:
+        return ""
+    run, job = m.group(1), m.group(2)
+    notes = api_json(root, f"repos/{s}/check-runs/{job}/annotations", token)
+    if not any(isinstance(n, dict) and STARVED_RE.search(str(n.get("message") or ""))
+               for n in (notes if isinstance(notes, list) else [])):
+        return ""
+    aj = api_json(root, f"repos/{s}/actions/jobs/{job}", token)
+    if not isinstance(aj, dict) or str(aj.get("run_id") or "") != run or (aj.get("head_sha") or "") != pin:
+        return ""
+    cr = api_json(root, f"repos/{s}/check-runs/{job}", token)
+    app = cr.get("app") if isinstance(cr, dict) else None
+    return run if isinstance(app, dict) and app.get("slug") == "github-actions" else ""
+
+
+def rerun(root, run_id, token=None):
+    s = slug(root)
+    rc, out, err = gh(["run", "rerun", str(run_id), "--failed"] + (["-R", s] if s else []), root, token, 60)
+    return not rc, last(err or out) or ("rerun" if not rc else f"gh exit {rc}")
 
 
 def slug(root) -> str:

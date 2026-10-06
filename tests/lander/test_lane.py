@@ -113,6 +113,17 @@ if me == "gh":
             box["down"] = True
             out(124, "", "gh timed out")
         out(0, "merged")
+    if a[:1] == ["api"] and a[1].endswith("/annotations"):   # repos/<slug>/check-runs/<id>/annotations
+        out(0, json.dumps(box.get("annotations", {}).get(a[1].split("/")[-2], [])))
+    if a[:1] == ["api"] and ("/actions/jobs/" in a[1] or "/check-runs/" in a[1]):   # one job, one check run
+        got = box.get("jobs" if "/actions/jobs/" in a[1] else "check_runs", {}).get(a[1].split("/")[-1])
+        out(0, json.dumps(got)) if got is not None else out(1, "", "gh: Not Found (HTTP 404)")
+    if a[:2] == ["run", "rerun"]:   # a rerun GitHub accepts; after_rerun is every PR's rollup from then on
+        box.setdefault("reruns", []).append(a[2])
+        for pr in prs.values():
+            if "after_rerun" in box:
+                pr["statusCheckRollup"] = box["after_rerun"]
+        out(0)
     out(1, "", "fake gh: unknown call")
 if me == "cc-config":
     v = box.get("config", {}).get(a[1])
@@ -2466,6 +2477,129 @@ class SpawnLaneTest(unittest.TestCase):
         (ok, how), popen = self.fallback({})
         self.assertEqual((ok, how), (True, "pid 4242"))
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+
+
+class Stoppable(Runner):
+    """A runner whose first plan calls then() and waits (at most `wait` s) for the lane to stop it through run_plan's
+    cancel; a plan that was stopped gives nothing back, one that was not runs as Runner's does."""
+
+    def __init__(self, then, wait=20, **kw):
+        super().__init__(**kw)
+        self.then, self.wait, self.first, self.stopped = then, wait, None, None
+
+    def run_plan(self, root, m, plan, files, head_tree, base_tree="", *, cancel=None, **kw):
+        if self.first is None:
+            self.first = head_tree
+            self.then()
+            self.stopped = bool(cancel is not None and cancel.wait(self.wait))
+            if self.stopped:
+                return {}
+        return super().run_plan(root, m, plan, files, head_tree, base_tree, **kw)
+
+
+class Rereads(Fixture):
+    """A checking job re-reads its PR's state and head every RECHECK_SECS and after an `again`, and stops its checks
+    when the PR merged, closed or moved on (10-04: #794 merged at 16:47Z while still checking and held 57 parked jobs
+    for 40+ min; ai-ee #99 checked a stale head for 50 min after a push). Each case queues its own PRs."""
+
+    def setUp(self):
+        super().setUp()
+        for p in (mock.patch.object(L.Lane, "width", lambda self: 3), mock.patch.object(L, "POLL", 0.05)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.reads, self.merged_on_github = [], threading.Event()
+        real = GH.pr_facts
+
+        def facts(root, pr, fields, *a, **k):   # GitHub as the lane sees it: #1 merged once the flag is set
+            got, why = real(root, pr, fields, *a, **k)
+            if fields == "state,headRefOid":
+                self.reads.append(pr)
+            if got is not None and int(pr) == 1 and self.merged_on_github.is_set() and "state" in got:
+                got = {**got, "state": "MERGED"}
+            return got, why
+        p = mock.patch.object(GH, "pr_facts", facts)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_pr_merged_mid_check_stops_its_checks_ends_merged_and_unparks_the_next(self):
+        self.pr(1, {"a/x": "one\n"})
+        self.pr(2, {"a/x": "two\n"})   # shares a/x with #1, so it parks on it
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        def merge_once_two_parks():   # GitHub merges #1 only after #2 has parked on it
+            end = time.time() + 10
+            while not (self.job(2).extra or {}).get("parked") and time.time() < end:
+                time.sleep(0.02)
+            self.merged_on_github.set()
+        runner = Stoppable(merge_once_two_parks)
+        with mock.patch.object(L, "RECHECK_SECS", 1):
+            _, lines = self.land(runner=runner)
+        self.assertTrue(runner.stopped, "#1's check ran on after its PR merged")
+        j1, j2 = self.job(1), self.job(2)
+        self.assertEqual((j1.state, j2.state), (T.DEPLOY_PENDING, T.DEPLOY_PENDING))
+        self.assertEqual([h["state"] for h in j1.history][-4:], [T.CHECKING, T.QUEUED, T.MERGED, T.DEPLOY_PENDING])
+        self.assertIn("the PR is merged while it was checking", j1.history[-3]["why"])
+        self.assertEqual(j1.history[-2].get("by"), "before")
+        self.assertEqual([int(a[2]) for a in self.box()["merges"]], [2])   # the lane never merged #1 itself
+        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
+        self.assertIn("[demo] PR #1: check a finished for a head or base the job has left; not recorded", lines)
+        self.assertEqual(sorted(j2.results), ["a"])   # #2's check was not stopped: it ran and was recorded
+
+    def test_a_push_mid_check_says_again_and_the_old_heads_check_is_stopped(self):
+        old = self.pr(1, {"a/x": "one\n"})
+        heads = []
+
+        def push():
+            heads.append(self.push("track/row-1", {"a/x": "two\n"}, fresh=False))
+            J.submit("demo", 1)   # what the push's re-queue writes: `again` for a job in flight
+        runner = Stoppable(push)
+        J.submit("demo", 1)
+        with mock.patch.object(L, "RECHECK_SECS", 3600):   # the `again`, not the timer, makes it read
+            self.land(runner=runner)
+        self.assertTrue(runner.stopped, "the old head's check ran on after the push")
+        j = self.job()
+        self.assertEqual((j.state, j.head), (T.DEPLOY_PENDING, heads[0]))
+        self.assertNotEqual(old, heads[0])
+        self.assertIn(f"the head moved to {heads[0][:12]} while it was checking",
+                      [h for h in j.history if h["state"] == T.QUEUED][-1]["why"])
+        self.assertIn("\tagain demo#1", self.log())
+        merge = self.box()["merges"][0]
+        self.assertEqual(merge[merge.index("--match-head-commit") + 1], heads[0])
+        self.assertEqual(len(runner.calls), 1)   # the new head's check; the stopped one gave nothing
+
+    def test_an_again_at_the_same_head_reads_github_and_lets_the_check_run(self):
+        self.pr(1, {"a/x": "one\n"})
+        runner = Stoppable(lambda: J.submit("demo", 1), wait=1.5)
+        J.submit("demo", 1)
+        with mock.patch.object(L, "RECHECK_SECS", 3600):
+            self.land(runner=runner)
+        self.assertFalse(runner.stopped)
+        self.assertEqual(self.reads, [1])   # one re-read, for the `again`; the timer never came due
+        j = self.job()
+        self.assertEqual((j.state, sorted(j.results)), (T.DEPLOY_PENDING, ["a"]))
+        self.assertNotIn("while it was checking", json.dumps(j.history))
+
+    def test_a_lane_paused_while_a_job_checks_sleeps_on_it_rather_than_spinning(self):
+        # seat Opus read: a re-read due on a job the box holds re-admitted it every pass, refused before it read,
+        # with no sleep, under the lane lock
+        self.pr(1, {"a/x": "one\n"})
+        held, calls = threading.Event(), [0]
+
+        def paused(target):
+            calls[0] += 1
+            if calls[0] > 500:   # the spin never ends on its own: stop it here, so the case fails, not hangs
+                raise AssertionError("the lane spun on the held job")
+            return held.is_set()
+        runner = Stoppable(held.set, wait=1.0)   # the lane is paused once its check is in flight, for a second
+        J.submit("demo", 1)
+        with mock.patch.object(L, "paused", paused), mock.patch.object(L, "RECHECK_SECS", 0):
+            _, lines = self.land(runner=runner)
+        self.assertFalse(runner.stopped)
+        self.assertEqual(self.reads, [1])   # the read before its check; none while the box held it
+        self.assertLess(calls[0], 100, "the lane spun on the held job")   # ~20 passes at POLL 0.05; the spin made 1000s
+        self.assertLessEqual(sum("is paused" in ln for ln in lines), 1, lines[-3:])
+        self.assertEqual(self.job().state, T.CHECKING)
 
 
 if __name__ == "__main__":
