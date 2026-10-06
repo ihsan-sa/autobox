@@ -10,7 +10,12 @@ checkout. `bin/cc-land` is the old name kept as a thin shim, so every caller tha
 1. **Queue.** `lander queue <repo> <pr>` (or the owner's 👍 on a card, or `cc-loop` at a worker's end) drops a
    request into the inbox, `~/.cc/state/land/jobs/new/`, and starts a tick. The job file,
    `~/.cc/state/land/<repo>-<pr>.json`, appears once the tick takes it in. It keeps a `stage` key in the old
-   lander's words, so the tools that only read it keep working.
+   lander's words, so the tools that only read it keep working. A seat's own PR opened with a bare `gh pr create`
+   is queued by the tick itself within about 15 minutes, once it is 10 minutes old, unless it is a draft or the
+   repo does not land its own PRs (`lander tick`'s strays sweep). The sweep skips `track/*` branches (`cc-loop`
+   queues those) and PRs older than 48 hours. Because it lists `--author @me`, it also sweeps a non-draft PR the
+   owner opens by hand on a self-landing repo. That is intended: the landing checks and the protected-path door
+   still apply.
 2. **Plan.** The repo's manifest, `tests/LANDING.toml` read from the *base*, says which check owns which paths.
    The plan is the static checks, every check whose paths the change touches, and a changed tool's direct
    callers. A path no check owns widens to the manifest's `default` set, and the card names it. The path policy
