@@ -95,6 +95,10 @@ for f in templates/home/agents/*.md; do
   # config/library-prompt.md to. A type without it is a spawn that answers from memory with the record on disk.
   grep -q 'cc-lib ask' "$f" && grep -q 'the reading procedure' "$f" \
     || { echo "$f: the type does not carry the reading rule (cc-lib ask + the WORKING.md page 'the reading procedure')"; exit 1; }
+  # THE RM RULE, same route: an rm on an unguarded $VAR or $(...), or a shell -c script Claude Code cannot parse, raises
+  # a dialog no permission rule or bypass mode approves, and a subagent sat on one for four hours. Each type says so.
+  grep -qF '"${DIR:?}/name"' "$f" && grep -qF "bash <file>" "$f" \
+    || { echo "$f: the type does not carry the rm rule (guarded \${DIR:?} targets, long probes as 'bash <file>')"; exit 1; }
 done
 else echo "check.sh: · $PART_WHY"; fi
 # THE UNITS ARE THIS BOX'S HALF, and not because systemd-analyze happens to be missing elsewhere — because where

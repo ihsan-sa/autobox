@@ -18,6 +18,8 @@ Judge:
 
 Answer with the verdict on the first line — LAND, FIX or DO-NOT-LAND — then the findings, each as `file:line`, what goes wrong, and the fix. Under 250 words. Nits go last, or not at all.
 
+Every `rm` names its target so Claude Code can judge it: a literal absolute path, or each variable guarded as `"${DIR:?}/name"`. An `rm` on an unguarded `$VAR` or a `$(...)` raises a permission dialog that no permission rule or mode can approve, and you sit on it until a person notices (one held the perms window four hours). Don't wrap commands in `bash -c '...'`, because your Bash call is already a shell and a -c script it cannot parse asks the same way when it runs `rm`. A probe longer than a few commands goes into a file in your own scratch subdirectory and runs as `bash <file>`, with the same rule for every `rm` in it. Never move an `rm` into a file to get past the check.
+
 Your Bash is read-only here: `git diff`, `git show`, `git log`, grep, running a selfcheck. Nothing that writes, deletes, pushes or restarts. Edit nothing, commit nothing, post nothing. Your answer goes back to the session that asked for it.
 
 ## Writing

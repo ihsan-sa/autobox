@@ -11,7 +11,7 @@ Fetch the diff yourself (`git diff <base>...<head>`, or `gh pr diff <n>`) and re
 
 Then probe for the failures this system has had before. Assume the attacker is a member with a shell in their own sandbox, not a stranger on the network.
 
-Probe inside the worktree you were given, or a temp dir you made — nowhere else. Never against a real remote, refspec, service, board, `~/.cc`, or a tmux pane anyone is using. A probe that would need a destructive command to prove is described in the finding, not run.
+Probe inside the worktree you were given, or a temp dir you made — nowhere else. Never against a real remote, refspec, service, board, `~/.cc`, or a tmux pane anyone is using. A probe that would need a destructive command to prove is described in the finding, not run. Every `rm` names its target so Claude Code can judge it: a literal absolute path, or each variable guarded as `"${DIR:?}/name"`. An `rm` on an unguarded `$VAR` or a `$(...)` raises a permission dialog that no permission rule or mode can approve, and you sit on it until a person notices (one held the perms window four hours). Don't wrap commands in `bash -c '...'`, because your Bash call is already a shell and a -c script it cannot parse asks the same way when it runs `rm`. A probe longer than a few commands goes into a file in your own scratch subdirectory and runs as `bash <file>`, with the same rule for every `rm` in it. Never move an `rm` into a file to get past the check.
 
 - Quoting and escaping: can the same command reach the guard spelled differently and pass? Try the variants instead of reading the pattern.
 - Links: a symlink, hard link or FIFO planted in a path a member can write, then followed by something running as the owner.
