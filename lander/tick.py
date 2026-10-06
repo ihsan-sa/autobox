@@ -7,6 +7,13 @@
             member) -> the reads it used go to carry/ and a request (chat/ts/who only) to the inbox, `handed-pushed`,
             removed. The prior verdict is not carried: the reviewer finds it among the box's own PR markers.
             A job for the PR already on the queue ends the watch.
+  strays    for each repo the box knows that lands its own PRs (`cc lands` 0; members skipped) and has a GitHub
+            origin, at most every $LANDER_STRAY_SECS (900): the box's own open PRs (`gh pr list --author @me`) are
+            read, and one that nothing ever queued is queued here (`queue … --who tick --no-start`, so the protected-
+            path door still decides). Left alone: a draft, a head on track/* (cc-loop queues a track's PR), one
+            opened under 10 min ago (its seat may queue it itself) or over 48 h ago, and any PR with a job, a rest
+            file, a handed watch, an inbox request or a single queue.log line — the lander saw it once, so a stop or
+            a refusal is not undone by a sweep.
   deploy    for each repo with a deploy-pending job, under its rest lock (jobs.rest_lock): tip.kick(repo) and a
             deploy.request not yet made — only when those units are installed.
   tip       for each repo the box knows (boards, <repo>.applied, jobs; members and paused repos skipped), under the
@@ -32,6 +39,8 @@ from __future__ import annotations
 import contextlib
 import glob
 import inspect
+import io
+import json
 import os
 import re
 import subprocess
@@ -51,6 +60,8 @@ from lander import tip as TP
 from lander import types as T
 
 TICK_SECS = 120   # how soon a wanted tip run, a requested deploy or an unsettled job is looked at again
+STRAY_GRACE = 600            # a seat that queues its own PR in the same turn gets there first
+STRAY_MAX_AGE = 48 * 3600    # an older PR that nothing queued was left open on purpose
 
 
 def sweep_handed() -> list:
@@ -91,6 +102,75 @@ def sweep_handed() -> list:
             with contextlib.suppress(OSError):
                 os.unlink(p)
             lines.append(f"[{repo}] PR #{pr}: pushed after it was handed back ({head[:12]}) — re-queued")
+    return lines
+
+
+def self_lands(repo) -> bool:
+    """`cc lands <repo>` answers 0: the one reader of the standing grant (CC_SELF_LAND_EXCEPT, member-facing)."""
+    try:
+        return subprocess.call([os.path.join(J.bin_dir(), "cc"), "lands", repo], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30) == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def logged_prs(repo) -> set:
+    """Every PR number of `repo` that queue.log names at all: one the lander has ever seen, whatever became of it."""
+    pat = re.compile(r"^\S+\t\S+ " + re.escape(repo) + r"#([0-9]+)(?:\s|$)")
+    seen = set()
+    with contextlib.suppress(OSError), open(E.log_path(), errors="replace") as f:
+        for ln in f:
+            m = pat.match(ln)
+            if m:
+                seen.add(int(m.group(1)))
+    return seen
+
+
+def has_record(repo, pr) -> bool:
+    """A job, a rest file, a handed watch or an inbox request for (repo, pr): the lander holds it already."""
+    return (J.load(repo, pr) is not None or os.path.exists(J.rest_path(repo, pr))
+            or os.path.exists(J.handed_path(repo, pr)) or any(r["pr"] == pr for _, r in J.requests(repo)))
+
+
+def sweep_strays(repos) -> list:
+    """Queue the box's own open PRs that nothing queued (raised-seat-pr-never-reaches-the-lane, 2026-10-03: a seat's
+    `gh pr create` wrote no lane entry, and the PR sat 2.5 h unqueued while the owner had been told it was queued).
+    cc-loop queues a track's PR, so a head on track/* is left to it; a draft is a PR its author keeps back."""
+    lines = []
+    for repo in repos:
+        root = J.repo_root(repo)
+        if "--" in repo or not os.path.exists(os.path.join(root, ".git")):
+            continue
+        s = GH.slug(root)
+        if not s or not due_every(C.state("tip", f"{repo}.strays"), "LANDER_STRAY_SECS") or not self_lands(repo):
+            continue
+        rc, out, err = GH.gh(["pr", "list", "--state", "open", "--author", "@me", "--limit", "100",
+                              "--json", "number,isDraft,headRefName,createdAt", "-R", s], root)
+        try:
+            prs = json.loads(out) if not rc else None
+        except ValueError:
+            prs = None
+        if not isinstance(prs, list):
+            lines.append(f"[{repo}] strays: gh could not list the open PRs — {GH.last(err or out) or f'exit {rc}'}")
+            continue
+        now, seen = time.time(), None
+        for p in prs:
+            if not isinstance(p, dict) or not isinstance(p.get("number"), int) or p.get("isDraft"):
+                continue
+            n = p["number"]
+            if str(p.get("headRefName") or "").startswith("track/"):
+                continue
+            if not STRAY_GRACE <= now - E.epoch_of(p.get("createdAt")) <= STRAY_MAX_AGE or has_record(repo, n):
+                continue
+            seen = logged_prs(repo) if seen is None else seen
+            if n in seen:   # landed, refused, stopped or handed back once: what happens next is a person's call
+                continue
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                qrc = L.cmd_queue([repo, str(n), "--who", "tick", "--no-start"])
+            said = GH.last(buf.getvalue()) or f"exit {qrc}"
+            lines.append(f"[{repo}] PR #{n} was open with no landing record — " +
+                         (f"queued it ({said})" if qrc == 0 else f"queueing it failed: {said}"))
     return lines
 
 
@@ -190,9 +270,13 @@ def known_repos(repo="") -> list:
 
 def due_catchup(repo) -> bool:
     """True at most once every LANDER_CATCHUP_SECS per repo (a stamp on disk), so origin is not fetched every tick."""
-    f = C.state("tip", f"{repo}.catchup")
+    return due_every(C.state("tip", f"{repo}.catchup"), "LANDER_CATCHUP_SECS")
+
+
+def due_every(f, key) -> bool:
+    """True when the stamp file `f` is older than the config's `key` seconds (900), and touches it."""
     try:
-        every = int(C.conf("LANDER_CATCHUP_SECS", "900") or 900)
+        every = int(C.conf(key, "900") or 900)
     except ValueError:
         every = 900
     try:
@@ -334,7 +418,8 @@ def cmd_tick(argv) -> int:
         lines.append(f"lander: GitHub backoff — {wait}s left; lanes and handed watches wait for it")
     else:
         lines += sweep_handed()
-        repos = [repo] if repo else J.all_repos()   # a push may have queued a new repo
+        lines += sweep_strays(known_repos(repo))
+        repos = [repo] if repo else J.all_repos()   # a push or a stray may have queued a new repo
         for r in repos:
             if J.running(r):
                 continue

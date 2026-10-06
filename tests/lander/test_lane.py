@@ -1909,7 +1909,8 @@ class Branches(Fixture):
         fake = mock.Mock(side_effect=lambda argv, **kw: started.append((argv, kw)) or mock.Mock(pid=7))
         J.submit("demo", 2)
         with mock.patch.object(TK.subprocess, "Popen", fake), mock.patch.object(TK, "rearm", lambda r: []), \
-                mock.patch.object(TK, "tip_and_deploy", lambda r, u: []), contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(TK, "tip_and_deploy", lambda r, u: []), \
+                mock.patch.object(TK, "sweep_strays", lambda r: []), contextlib.redirect_stdout(io.StringIO()):
             TK.cmd_tick(["--detach"])
         self.assertEqual(started[0][0][-2:], ["lane", "demo"])
         self.assertTrue(started[0][1]["start_new_session"])
