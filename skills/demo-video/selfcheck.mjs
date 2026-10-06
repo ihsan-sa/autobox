@@ -460,6 +460,104 @@ await check('sound: master brings a mix to -16 LUFS under -1.5 dBTP, as AAC besi
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+await check('sound: master judges the AAC: a true peak over tp is limited again with more room (refused after its tries), a loudness off target re-aimed', async () => {
+  const dir = tmp();
+  try {
+    const video = join(dir, 'v.mp4');
+    execFileSync(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=black:s=320x180:r=30:d=2',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', video]);
+    /* a beat's kick, clap and hat at -12 LUFS, held right at the ceiling (room 0): their transients overshoot in the AAC */
+    const beat = [0, 0.5, 1, 1.5].flatMap((t) => [{ at: t, inst: 'kick', note: 'C2', dur: 0.3, vel: 1 },
+      { at: t + 0.25, inst: 'clap', note: 'C4', dur: 0.2, vel: 1 }, { at: t + 0.125, inst: 'hat', note: 'C6', dur: 0.05, vel: 1 }]);
+    const drums = (await import('./motion/score.mjs')).renderScore(beat, { dur: 2 });
+    const got = S.master(drums, { video, out: join(dir, 'out.mp4'), lufs: -12, tp: -3, room: 0 });
+    if (!(got.TP <= -3)) throw new Error(`true peak ${got.TP} dBTP on the AAC, over -3`);
+    if (!(got.room > 0)) throw new Error(`it never encoded again (room ${got.room})`);
+    near(got.I, -12, 0.5, 'integrated loudness of the AAC');
+    await throws(() => S.master(drums, { video, out: join(dir, 'once.mp4'), lufs: -12, tp: -3, room: 0, tries: 1 }), /true peak/, 'one try, over');
+    /* half the mix over the AAC's cutoff (a 21 kHz tone beside a 1 kHz one): the WAV is at -18 but the AAC reads about
+       5 LU under it, so it is mastered again aiming higher; with one try it stays where the WAV put it */
+    const n = S.RATE * 2, L = new Float32Array(n);
+    for (let i = 0; i < n; i++) L[i] = 0.1 * Math.sin(2 * Math.PI * 1000 * i / S.RATE) + 0.1 * Math.sin(2 * Math.PI * 21000 * i / S.RATE);
+    const hi = S.master({ L, R: L.slice() }, { video, out: join(dir, 'hi.mp4'), lufs: -18 });
+    near(hi.I, -18, 0.3, 'the AAC re-aimed onto the target');
+    const once = S.master({ L, R: L.slice() }, { video, out: join(dir, 'hi1.mp4'), lufs: -18, tries: 1 });
+    if (!(once.I < -20)) throw new Error(`one try read ${once.I} LUFS on the AAC; the fixture no longer loses its top in the encode`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── motion/score.mjs: the score's instruments, the room, the sidechain and the bus tools ──
+const Sc = await import('./motion/score.mjs'), { rng: seeded } = await import('./motion/motion.mjs');
+const energy = (a, t0, t1) => a.slice(Math.round(t0 * S.RATE), Math.round(t1 * S.RATE)).reduce((e, x) => e + x * x, 0);
+
+await check('score: each instrument\'s note lands on its sample, sounds, dies away and is the same twice; bad notes are refused', async () => {
+  eq([Sc.midi('C4'), Sc.midi('A4'), Sc.midi('F#3'), Sc.midi('Bb2')], [60, 69, 54, 46], 'note names');
+  for (const inst of Object.keys(Sc.INSTRUMENTS)) {
+    const notes = [{ at: 0.5, inst, note: 'A3', dur: 0.6 }], a = Sc.renderScore(notes, { dur: 4 }), b = Sc.renderScore(notes, { dur: 4 });
+    const first = a.L.findIndex((x) => x !== 0);
+    if (first < S.RATE * 0.5 || first > S.RATE * 0.5 + 2) throw new Error(`${inst}: starts at sample ${first}, not ${S.RATE * 0.5}`);
+    if (!(energy(a.L, 0.5, 1.2) > 0) || !a.L.every(Number.isFinite)) throw new Error(`${inst}: silent or not finite`);
+    if (!(energy(a.L, 3.5, 4) < 1e-3 * energy(a.L, 0.5, 1.2))) throw new Error(`${inst}: still sounding 3 s after its key went up`);
+    eq(a.L.every((x, i) => x === b.L[i]), true, `${inst}: the same note twice`);
+  }
+  await throws(() => Sc.renderScore([{ at: 0, inst: 'kazoo', note: 'C4' }], { dur: 1 }), /no instrument "kazoo"/, 'unknown instrument');
+  await throws(() => Sc.midi('H2'), /not a note name/, 'bad note name');
+});
+
+await check('score: convolve is direct convolution; reverb keeps the dry and adds a tail that falls about 60 dB over its decay', () => {
+  const r = seeded(5), x = Float32Array.from({ length: 300 }, () => r() - 0.5), h = Float32Array.from({ length: 70 }, () => r() - 0.5);
+  const got = Sc.convolve(x, h);
+  eq(got.length, 369, 'length');
+  for (let i = 0; i < got.length; i++) {
+    let s = 0;
+    for (let k = 0; k < h.length; k++) if (i - k >= 0 && i - k < x.length) s += x[i - k] * h[k];
+    if (Math.abs(got[i] - s) > 1e-5) throw new Error(`convolve: sample ${i} is ${got[i]}, not ${s}`);
+  }
+  const n = S.RATE * 3, imp = new Float32Array(n);
+  imp[0] = 1;
+  const out = Sc.reverb({ L: imp, R: imp }, { decay: 1, predelay: 0.01, wet: 0.5 }), dry = Sc.reverb({ L: imp, R: imp }, { decay: 1, wet: 0 });
+  eq([out.L[0], dry.L.slice(1).every((v) => v === 0)], [1, true], 'the dry sample is kept, and wet 0 adds nothing');
+  if (out.L.slice(1, Math.round(0.01 * S.RATE)).some((v) => v !== 0)) throw new Error('the tail came before its pre-delay');
+  const fall = 10 * Math.log10(energy(out.L, 0.9, 1.0) / energy(out.L, 0.02, 0.12));
+  if (!(fall < -45 && fall > -75)) throw new Error(`the tail fell ${fall.toFixed(1)} dB over its decay, not about 60`);
+  if (out.L.every((v, i) => v === out.R[i])) throw new Error('the two sides of the room are the same');
+});
+
+await check('score: duck takes a bus down under its key by depth and gives it back after the release; no key, no change', () => {
+  const n = S.RATE * 3, tone = Float32Array.from({ length: n }, (_, i) => 0.3 * Math.sin(i / 9)), bus = { L: tone, R: tone };
+  const key = new Float32Array(n);
+  for (let i = S.RATE; i < S.RATE * 1.1; i++) key[i] = 0.5;
+  const ducked = Sc.duck(bus, { L: key, R: key }, { depth: 6, release: 0.2 }), quiet = Sc.duck(bus, { L: new Float32Array(n), R: new Float32Array(n) });
+  const lvl = (a, t) => 20 * Math.log10(Math.sqrt(energy(a, t, t + 0.02) / energy(tone, t, t + 0.02)));
+  near(lvl(ducked.L, 1.05), -6, 0.5, 'under the key');
+  near(lvl(ducked.L, 0.5), 0, 0.01, 'before the key');
+  near(lvl(ducked.L, 2.6), 0, 0.2, 'after the release');
+  eq(quiet.L.every((x, i) => x === tone[i]), true, 'a silent key leaves the bus alone');
+});
+
+await check('score: pump dips a bus by depth on each beat and gives it back after the release; before the first beat it is untouched', () => {
+  const n = S.RATE * 2, one = new Float32Array(n).fill(1), p = Sc.pump({ L: one, R: one }, [1.0, 0.5], { depth: 6, attack: 0.004, release: 0.2 });
+  const at = (t) => 20 * Math.log10(p.L[Math.round(t * S.RATE)]);
+  near(at(0.4), 0, 1e-9, 'before the first beat');
+  near(at(0.504), -6, 0.05, 'at the beat, after the attack');
+  near(at(0.604), -3, 0.05, 'halfway through the release');
+  near(at(0.75), 0, 1e-9, 'after the release');
+  near(at(1.004), -6, 0.05, 'the next beat (the beats need not be sorted)');
+  eq(p.L.every((x, i) => x === p.R[i]), true, 'both sides alike');
+});
+
+await check('score: fade starts and ends silent; toLoudness sets a bus to its target, as ebur128 reads it', () => {
+  const n = S.RATE * 4, tone = Float32Array.from({ length: n }, (_, i) => 0.2 * Math.sin((2 * Math.PI * 440 * i) / S.RATE));
+  const f = Sc.fade({ L: tone, R: tone }, { inS: 0.5, outS: 0.5 });
+  eq([f.L[0], f.L[n - 1]], [0, 0], 'the first and last samples');
+  near(f.L[S.RATE * 2], tone[S.RATE * 2], 1e-6, 'the middle is untouched');
+  const { bus, I } = Sc.toLoudness({ L: tone, R: tone }, -23), dir = tmp(), w = join(dir, 'b.wav');
+  try {
+    S.writeWav(w, bus.L, bus.R);
+    near(S.loudness(w).I, -23, 0.3, `the bus (read ${I} LUFS before)`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 if (process.argv.includes('--film')) {
   const { recordTerminal, terminalPage } = await import('./term.mjs');
   const { launch } = await import('./deps.mjs');

@@ -78,7 +78,11 @@ cursor moves on every frame. Nothing real may be in frame: every beat checks the
   `frameDiffs(mp4)` and `stutters(diffs)`, the frames that froze in the middle of a move. `sound.mjs` is the film's
   sound effects, synthesized, so no recording and no licence: `mix(cues, {dur})` places its voices (a tap, a key,
   typing, a message, a whoosh for a camera move, a rise into a 3D shot, a chord for the end) on their times, and
-  `master` brings the mix to -16 LUFS under -1.5 dBTP and muxes it in as AAC, copying the video. Remotion and React are
+  `master` brings the mix to -16 LUFS under -1.5 dBTP (`lufs`, `tp`) and muxes it in as AAC, copying the video, then
+  measures the AAC and encodes again until the AAC itself is in range. `score.mjs` is the
+  background score and the mixing tools: notes rendered by a synthesized felt piano, pad and sub, a convolution room
+  (`reverb`), a sidechain (`duck`), EQ, fades and `toLoudness`. `AUDIO.md` says how to score a film (the music carries
+  it, a few soft touches under it) and how to mix and master it. Remotion and React are
   `MOTION_PINS` in `deps.mjs`, installed into the same cache on first use.
 - `web-encode.sh`: the web copies of a finished film. `web-encode.sh mp4 IN OUT [CRF]` is a small H.264 for a page's
   video (CRF 24 by default, faststart), and `web-encode.sh gif IN OUT WIDTH FPS COLOURS [SS T]` a GIF with one palette

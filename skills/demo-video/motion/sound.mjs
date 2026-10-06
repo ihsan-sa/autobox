@@ -6,14 +6,15 @@
     const stats = master(fx, { video: 'film.mp4', out: 'film.mp4' });   // { I, LRA, TP } of the film's own AAC track
 
 A cue is { at (s), kind, gain (dB, default 0), pan (-1 left to 1 right), pitch (a ratio, default 1), dur (s, for the
-kinds that last), to (the pan a whoosh ends on) }. `VOICES` holds the kinds: tap, key, typing, send, message, pop,
-chime, blip, done, soft-no, whoosh, rise, pad. Each is level-matched, so a gain is a mix decision, and each is a pure
+kinds that last), to (the pan a whoosh or air ends on) }. `VOICES` holds the kinds: tap, key, typing, send, message, pop,
+chime, blip, done, soft-no, whoosh, rise, pad, and the two quiet ones a film under a score wants, tick and air
+(AUDIO.md). Each is level-matched, so a gain is a mix decision, and each is a pure
 function of its cue (its noise is seeded from the cue's time), so the same cues make the same samples.
 
 `master` takes the stereo mix to the target loudness (-16 LUFS integrated by default) with a look-ahead limiter
 holding the sample peaks 1.5 dB under the true-peak target (-1.5 dBTP), room for the AAC encode, measuring each pass with ffmpeg's ebur128 until
 it is within 0.2 LU, then muxes it into the video as AAC, copying the video stream, and returns ffmpeg's reading of
-the result as played. */
+the result as played. An AAC whose true peak still reads over the target is limited and encoded again with more room. */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -29,9 +30,9 @@ export const dB = (g) => 10 ** (g / 20);
 
 /* ---------- the parts every voice is made of ---------- */
 
-const len = (s) => Math.max(1, Math.round(s * RATE));
+export const len = (s) => Math.max(1, Math.round(s * RATE));
 /** a hit: up over `a` s, then an exponential fall with time constant `tau`, faded to nothing over its last 5 ms of `end` */
-const hit = (a, tau, end) => (t) => (t < a ? t / a : Math.exp(-(t - a) / tau)) * Math.min(1, Math.max(0, (end - t) / 0.005));
+export const hit = (a, tau, end) => (t) => (t < a ? t / a : Math.exp(-(t - a) / tau)) * Math.min(1, Math.max(0, (end - t) / 0.005));
 /** a swell over `end` s: sin² up to its top at `top` of the way, then down, so it starts and ends silent */
 const swell = (end, top = 0.5) => (t) => {
   const u = t / end, v = u < top ? u / top : (1 - u) / (1 - top);
@@ -54,14 +55,14 @@ function tone(n, f, partials, env, g = 1) {
 }
 
 /** RBJ biquad coefficients: 'lp', 'hp' or 'bp' (band-pass, 0 dB at its centre) */
-function biquad(type, f, q) {
+export function biquad(type, f, q) {
   const w = (TAU * Math.min(f, RATE * 0.45)) / RATE, c = Math.cos(w), al = Math.sin(w) / (2 * q), a0 = 1 + al;
   const b = type === 'lp' ? [(1 - c) / 2, 1 - c, (1 - c) / 2] : type === 'hp' ? [(1 + c) / 2, -(1 + c), (1 + c) / 2] : [al, 0, -al];
   return [b[0] / a0, b[1] / a0, b[2] / a0, (-2 * c) / a0, (1 - al) / a0];
 }
 
 /** seeded white noise through a filter whose cut-off follows fc(t) (new coefficients every 32 samples), shaped by env */
-function noise(n, seed, type, fc, q, env, g = 1) {
+export function noise(n, seed, type, fc, q, env, g = 1) {
   const r = rng(seed), out = new Float32Array(n);
   let x1 = 0, x2 = 0, y1 = 0, y2 = 0, co;
   for (let i = 0; i < n; i++) {
@@ -83,7 +84,7 @@ function sum(...parts) {
 }
 
 /** constant-power pan of a mono buffer; p from -1 (left) to 1 (right), or p(t) for a pan that moves */
-function pan(m, p) {
+export function pan(m, p) {
   const L = new Float32Array(m.length), R = new Float32Array(m.length);
   for (let i = 0; i < m.length; i++) {
     const a = ((Math.min(1, Math.max(-1, typeof p === 'function' ? p(i / RATE) : p)) + 1) * Math.PI) / 4;
@@ -148,6 +149,16 @@ export const VOICES = {
     return sum(...chord.map(([f, dt]) => [tone(n, f * dt, [[1, 0.12], [2, 0.02]], env)]),
       [noise(n, c.seed, 'bp', (t) => 400 * 12.5 ** Math.min(1, t / d), 2, env, 0.25)]);
   },
+  /* a fingertip on glass, felt rather than heard: a soft band of noise and a little low body, no pitch to it */
+  tick: (c) => sum([noise(len(0.03), c.seed, 'bp', 2000 * c.pitch, 0.9, hit(0.0008, 0.004, 0.03), 0.9)],
+    [tone(len(0.04), 320 * c.pitch, [[1, 0.35]], hit(0.0015, 0.008, 0.04))]),
+  /* a breath of air for a camera move of dur s: dark noise that swells and goes, panning from pan to `to`, no sweep */
+  air: (c) => {
+    const d = c.dur || 1, env = (t) => swell(d, 0.45)(t) ** 1.5;
+    const body = sum([noise(len(d), c.seed, 'lp', 900 * c.pitch, 0.5, env, 0.8)], [noise(len(d), c.seed + 3, 'bp', 1800 * c.pitch, 0.7, env, 0.15)]);
+    const p0 = c.pan || 0, p1 = c.to ?? p0;
+    return pan(body, (t) => p0 + (p1 - p0) * Math.min(1, t / d));
+  },
   /* a warm chord for the end: slow in, held, slow out over dur s */
   pad: (c) => {
     const d = c.dur || 3, n = len(d), env = (t) => Math.min(1, t / 0.5) * Math.min(1, Math.max(0, (d - t) / (d * 0.6)));
@@ -159,7 +170,7 @@ export const VOICES = {
 /* each voice's gain at cue gain 0, from levels(): they then peak at the same short-term loudness, so a cue's gain is the
    mix's choice alone. A voice that lasts (typing, whoosh, rise, pad) is measured at its default dur. */
 export const LEVEL = { tap: -7.1, key: -2.3, typing: -4.9, send: -9.1, message: -14.2, pop: -8.9, chime: -16.6, blip: -11.5, done: -17.4,
-  'soft-no': -13.6, whoosh: -12.3, rise: -9.4, pad: -9.9 };
+  'soft-no': -13.6, whoosh: -12.3, rise: -9.4, tick: 1.1, air: -1.4, pad: -9.9 };
 
 /** One cue's samples as [L, R], at its level and gain, before it is placed. */
 export function voice(c) {
@@ -263,28 +274,39 @@ export function loudness(file) {
     TP: num(/Peak:\s+(-inf|-?[\d.]+) dBFS/, 'true peak') };
 }
 
-/** The mix at `lufs` (integrated) with its peaks held AAC_ROOM dB under `tp`, muxed into `video` as AAC at `kbps` (the video
+/** The mix at `lufs` (integrated) with its peaks held `room` dB under `tp`, muxed into `video` as AAC at `kbps` (the video
  *  stream copied, faststart) and written to `out`, which may be `video` itself. `wav` keeps the mastered track there.
- *  Returns ffmpeg's ebur128 reading of out's audio and the gain it took. */
-export function master({ L, R }, { video, out, lufs = -16, tp = -1.5, kbps = 192, wav } = {}) {
+ *  Both are judged on the AAC as played, up to `tries` encodes: one whose true peak reads over `tp` (a punchy beat's
+ *  transients overshoot more than `room`) is limited again with the room widened by the overshoot, and one whose
+ *  loudness reads more than 0.2 LU off `lufs` (the encode drops what is over its cutoff) is mastered again aiming off by
+ *  the difference. A true peak still over after the last is refused. Returns ffmpeg's ebur128 reading of out's audio,
+ *  the gain it took and the room it ended with. */
+export function master({ L, R }, { video, out, lufs = -16, tp = -1.5, kbps = 192, wav, room = AAC_ROOM, tries = 4 } = {}) {
   if (!L.some((x) => x !== 0) && !R.some((x) => x !== 0)) throw new Error('master: the mix is silent');
-  const dir = mkdtempSync(join(tmpdir(), 'dv-sound-')), track = join(dir, 'fx.wav');
+  const dir = mkdtempSync(join(tmpdir(), 'dv-sound-')), track = join(dir, 'fx.wav'), tmp = join(dir, 'out.mp4');
   try {
-    let gain = 0, got;
-    for (let pass = 0; pass < 5; pass++) {
-      const g = dB(gain), [a, b] = limit(L.map((x) => x * g), R.map((x) => x * g), dB(tp - AAC_ROOM));
-      writeWav(track, a, b);
-      got = loudness(track);
-      if (Math.abs(got.I - lufs) <= 0.2) break;
-      gain += lufs - got.I;
+    let gain = 0, aim = lufs, got, played;
+    for (let enc = 0; enc < tries; enc++) {
+      for (let pass = 0; pass < 5; pass++) {
+        const g = dB(gain), [a, b] = limit(L.map((x) => x * g), R.map((x) => x * g), dB(tp - room));
+        writeWav(track, a, b);
+        got = loudness(track);
+        if (Math.abs(got.I - aim) <= 0.2) break;
+        gain += aim - got.I;
+      }
+      if (Math.abs(got.I - aim) > 0.2) throw new Error(`master: the mix reached ${got.I} LUFS, not ${aim}`);
+      execFileSync(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-i', video, '-i', track, '-map', '0:v:0', '-map', '1:a:0',
+        '-c:v', 'copy', '-c:a', 'aac', '-b:a', `${kbps}k`, '-ar', String(RATE), '-movflags', '+faststart', tmp]);
+      played = loudness(tmp);
+      const over = played.TP > tp, off = Math.abs(played.I - lufs) > 0.2;
+      if (!over && !off) break;
+      if (over) room += played.TP - tp + 0.2;
+      if (off) aim += lufs - played.I;
     }
-    if (Math.abs(got.I - lufs) > 0.2) throw new Error(`master: the mix reached ${got.I} LUFS, not ${lufs}`);
+    if (played.TP > tp) throw new Error(`master: the AAC's true peak is ${played.TP} dBTP after ${tries} encodes, over ${tp}`);
     if (wav) copyFileSync(track, wav);
-    const tmp = join(dir, 'out.mp4');
-    execFileSync(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-i', video, '-i', track, '-map', '0:v:0', '-map', '1:a:0',
-      '-c:v', 'copy', '-c:a', 'aac', '-b:a', `${kbps}k`, '-ar', String(RATE), '-movflags', '+faststart', tmp]);
     copyFileSync(tmp, out);
-    return { ...loudness(out), gain };
+    return { ...played, gain, room };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
