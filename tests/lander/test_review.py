@@ -71,10 +71,50 @@ def name_only(*paths, diff=DIFF):
     return lambda argv: (0, "".join(p + "\0" for p in paths) if "--name-only" in argv else diff)
 
 
+# recurring-defect-ok: pause-hold-missing — a test fixture that builds stream text and launches nothing
+def stream(*events, stderr=""):
+    """claude -p --output-format stream-json --verbose: one JSON event a line, stderr after the result."""
+    return "".join(json.dumps(e) + "\n" for e in events) + stderr
+
+
+def so_call(answer, stop="tool_use", uid="toolu_1", text=""):
+    """The assistant event a read's turn ends with: optional text, then its StructuredOutput call."""
+    content = [{"type": "thinking", "thinking": ""}] + ([{"type": "text", "text": text}] if text else [])
+    return {"type": "assistant", "message": {"stop_reason": stop, "content": content + [
+        {"type": "tool_use", "id": uid, "name": "StructuredOutput", "input": answer}]}}
+
+
+def so_result(said="Structured output provided successfully", error=False, uid="toolu_1"):
+    r = {"type": "tool_result", "tool_use_id": uid, "content": said}
+    return {"type": "user", "message": {"content": [dict(r, is_error=True) if error else r]}}
+
+
+def cli_event(text, error="rate_limit"):
+    """The assistant event the CLI writes for its own error (a limit, a bad model), in the shape a real transcript
+    holds: model "<synthetic>", isApiErrorMessage, a top-level error and no usage. No turn of the model's made it."""
+    return {"type": "assistant", "error": error, "isApiErrorMessage": True,
+            "message": {"id": "00000000-0000-4000-8000-000000000001", "container": None, "model": "<synthetic>",
+                        "role": "assistant", "stop_details": None, "stop_reason": "stop_sequence", "stop_sequence": "",
+                        "type": "message", "usage": {"input_tokens": 0, "output_tokens": 0,
+                                                     "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                        "content": [{"type": "text", "text": text}]}}
+
+
+def cli_result(text, usd=0.0, subtype="success"):
+    """The error result that follows the CLI's own event: its `result` is that event's text."""
+    return {"type": "result", "subtype": subtype, "is_error": True, "num_turns": 1, "result": text,
+            "total_cost_usd": usd, "permission_denials": [], "stop_reason": "stop_sequence",
+            "terminal_reason": "api_error"}
+
+
+SESSION_LIMIT = "You've hit your session limit · resets 5pm (UTC)"
+
+
 def claude_says(verdict, blocking=(), advisory=(), usd=0.42):
-    return (0, json.dumps({"type": "result", "subtype": "success", "total_cost_usd": usd,
-                           "structured_output": {"verdict": verdict, "blocking": list(blocking),
-                                                 "advisory": list(advisory)}}))
+    answer = {"verdict": verdict, "blocking": list(blocking), "advisory": list(advisory)}
+    return (0, stream({"type": "system", "subtype": "init", "model": "claude-test"}, so_call(answer), so_result(),
+                      {"type": "result", "subtype": "success", "total_cost_usd": usd, "structured_output": answer,
+                       "usage": {"input_tokens": 10, "output_tokens": 5}}))
 
 
 class Case(unittest.TestCase):
@@ -420,6 +460,257 @@ class TestReview(Case):
         self.assertEqual((second.verdict, second.extra.get("cap")), (T.HANDBACK_VERDICT, True))
         self.assertEqual(R.reads_used("demo", 7), 0)
 
+    def test_a_wall_after_the_answer_is_that_answer(self):
+        # #635 at 11:22Z on 10-04: the one turn called StructuredOutput, crossed the cap, and the CLI's result said
+        # error_max_budget_usd with no structured_output; the stream still carries the call
+        answer = {"verdict": "HANDBACK", "advisory": [], "blocking": [
+            {"kind": "correctness", "where": "x.py:2", "what": "bad", "input": "b", "fix": "c"}]}
+        wall = {"type": "result", "subtype": "error_max_budget_usd", "stop_reason": "tool_use", "total_cost_usd": 7.74}
+        box = self.box(claude=(1, stream({"type": "system", "subtype": "init"}, so_call(answer), so_result(), wall,
+                                         stderr="some stderr line\n")))
+        v = R.review(self.job(), comments=[])
+        argv = box.called("claude")[0]["argv"]
+        at = argv.index("--output-format")
+        self.assertEqual(argv[at + 1:at + 3], ["stream-json", "--verbose"])
+        self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, ["[correctness] x.py:2 — bad (input: b) → c"]))
+        self.assertEqual(R.reads_used("demo", 7), 1)
+        self.assertNotIn("wall", R.spent("demo", 7))
+
+    def test_a_land_at_the_wall_counts_when_the_cli_never_answered_the_call(self):
+        # #772: the turn ended on the call and the stream ends before any tool_result; the call is whole and fits
+        # the schema, so it is the read
+        answer = {"verdict": "LAND", "blocking": [], "advisory": [{"where": "x.py", "what": "nit"}],
+                  "resolved": [], "unresolved": []}
+        wall = {"type": "result", "subtype": "error_max_budget_usd", "total_cost_usd": 6.10}
+        self.box(claude=(1, stream(so_call(answer), wall)))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.blocking, v.advisory), (T.LAND, [], ["x.py — nit"]))
+        self.assertEqual(R.reads_used("demo", 7), 1)
+        self.assertNotIn("wall", R.spent("demo", 7))
+
+    def assert_wall(self, *events):
+        self.box(claude=(1, stream(*events, {"type": "result", "subtype": "error_max_budget_usd",
+                                             "total_cost_usd": 7.00})))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.INCOMPLETE)
+        self.assertIn("wall: error_max_budget_usd at $7.00", v.extra["why"])
+        self.assertEqual(R.reads_used("demo", 7), 0)
+        self.assertIn("wall", R.spent("demo", 7))
+
+    def test_a_land_cut_off_at_max_tokens_stays_a_wall(self):
+        # the turn stopped on max_tokens: the call's input may be cut short, and a cut LAND would land
+        self.assert_wall(so_call({"verdict": "LAND", "blocking": [], "advisory": []}, stop="max_tokens"))
+
+    def test_a_land_the_cli_rejected_stays_a_wall(self):
+        # the CLI checked the call against the schema and said no; the call is not an answer however it reads
+        self.assert_wall(so_call({"verdict": "LAND", "blocking": [], "advisory": []}),
+                         so_result("Output does not match required schema", error=True))
+
+    def test_a_land_missing_blocking_stays_a_wall(self):
+        # parse() reads a missing `blocking` as none, so the shape is checked before parse() sees it
+        self.assert_wall(so_call({"verdict": "LAND", "advisory": []}))
+
+    def test_a_land_whose_blocking_is_not_a_list_stays_a_wall(self):
+        self.assert_wall(so_call({"verdict": "LAND", "blocking": "none", "advisory": []}))
+
+    def test_a_handback_whose_finding_lacks_its_keys_stays_a_wall(self):
+        self.assert_wall(so_call({"verdict": "HANDBACK", "blocking": [{"kind": "correctness", "where": "x.py"}],
+                                  "advisory": []}))
+
+    def test_a_rejected_call_then_a_good_one_is_the_good_one(self):
+        good = {"verdict": "HANDBACK", "advisory": [], "blocking": [
+            {"kind": "scope", "where": "y.py", "what": "out of scope", "input": "", "fix": "drop it"}]}
+        wall = {"type": "result", "subtype": "error_max_budget_usd", "total_cost_usd": 7.20}
+        self.box(claude=(1, stream(so_call({"verdict": "LAND"}, uid="toolu_a"), so_result(error=True, uid="toolu_a"),
+                                   so_call(good, uid="toolu_b"), so_result(uid="toolu_b"), wall)))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, ["[scope] y.py — out of scope → drop it"]))
+
+    def test_a_diff_that_says_usage_limit_does_not_make_a_failed_read_a_limit(self):
+        # no result event: only the CLI's own lines are scanned for a limit, never the model's text, which quotes
+        # the diff
+        seen = []
+        def check(argv):
+            with open(argv[2]) as f:
+                seen.append(f.read())
+            return 1, ""
+        box = self.box(claude=(1, stream(
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"stop_reason": "end_turn", "content": [
+                {"type": "text", "text": "the diff adds: Claude AI usage limit reached"}]}},
+            stderr='{"type": "assistant", "message": {"content": [{"type": "text", "text": "usage limit reach')),
+            **{"cc-limit check": check})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.INCOMPLETE)
+        self.assertTrue(v.extra["why"].split(": ", 1)[1].startswith("no answer"), v.extra["why"])
+        self.assertIn("silent", R.spent("demo", 7))
+        self.assertEqual(len(box.called("cc-limit check")), 1)
+        self.assertNotIn("usage limit", seen[0])
+        self.assertIn("init", seen[0])
+
+    def test_a_wall_with_no_answer_in_the_stream_is_still_a_wall(self):
+        # #776 on 10-03: the turn ended in a refusal and called nothing, so there is no verdict to keep; a verdict
+        # shape in another tool's input or in text is not an answer
+        said = {"type": "assistant", "message": {"content": [{"type": "text", "text": '{"verdict": "LAND"}'}, {
+            "type": "tool_use", "name": "Read", "input": {"verdict": "LAND"}}]}}
+        wall = {"type": "result", "subtype": "error_max_budget_usd", "stop_reason": "refusal", "total_cost_usd": 7.59}
+        self.box(claude=(1, json.dumps(said) + "\n" + json.dumps(wall) + "\n"))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.INCOMPLETE)
+        self.assertIn("wall: error_max_budget_usd at $7.59", v.extra["why"])
+        self.assertEqual(R.reads_used("demo", 7), 0)
+        self.assertIn("wall", R.spent("demo", 7))
+
+    def test_a_finding_quoting_a_line_separator_keeps_its_answer_and_is_no_limit(self):
+        # Node's JSON.stringify leaves U+2028 raw; str.splitlines() broke the event there, lost the result and the
+        # call, and the model's "usage limit reached" read as the CLI's own limit (security read of #1034)
+        answer = {"verdict": "HANDBACK", "advisory": [], "blocking": [
+            {"kind": "correctness", "where": "x.py:2", "what": "logs  Claude usage limit reached", "input": "b",
+             "fix": "c"}]}
+        node = "".join(json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n" for e in (
+            {"type": "system", "subtype": "init"}, so_call(answer), so_result(),
+            {"type": "result", "subtype": "success", "total_cost_usd": 0, "structured_output": answer}))
+        self.assertIn(" ", node)
+        j, got, cli = R.streamed(node)
+        self.assertEqual((got, j.get("structured_output")), (answer, answer))
+        self.assertEqual([json.loads(ln)["type"] for ln in cli.split("\n")], ["system", "result"])   # no fragment
+        self.box(claude=(0, node))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT, v.extra.get("why"))
+        self.assertNotIn("limit", v.extra.get("why") or "")
+        self.assertEqual(R.reads_used("demo", 7), 1)
+
+    def test_a_finding_that_says_unknown_option_is_no_fault(self):
+        # only the CLI's own lines are scanned for a fault, never the model's text, which quotes the diff
+        self.box(claude=(1, stream(
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"stop_reason": "end_turn", "content": [
+                {"type": "text", "text": "the diff prints: error: unknown option '--nope'"}]}})))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.INCOMPLETE)
+        self.assertFalse(v.extra.get("fault"))
+        self.assertTrue(v.extra["why"].split(": ", 1)[1].startswith("no answer"), v.extra["why"])
+
+    def test_a_result_event_quoting_unknown_option_is_no_fault(self):
+        # the result event's `result` is the model's last text, not the CLI's (security read of #1034)
+        said = "the diff prints: error: unknown option '--nope'"
+        self.box(claude=(1, stream(
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": said}]}},
+            {"type": "result", "subtype": "success", "is_error": False, "result": said, "total_cost_usd": 0.31})))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.INCOMPLETE)
+        self.assertFalse(v.extra.get("fault"))
+        self.assertTrue(v.extra["why"].split(": ", 1)[1].startswith("no answer"), v.extra["why"])
+
+    def test_a_result_event_quoting_a_usage_limit_holds_nothing(self):
+        # an error result after the model spoke, with no event of the CLI's own after it: its `result` and
+        # `structured_output` are the model's, so neither the limit check nor the file cc-limit reads may see them,
+        # even when the model's text is a whole CLI limit event (the model sets content, never the event's fields)
+        seen = []
+        def check(argv):
+            with open(argv[2]) as f:
+                seen.append(f.read())
+            return 1, ""
+        said = "logs: Claude usage limit reached · You've hit your monthly spend limit " + json.dumps(cli_event("x"))
+        box = self.box(claude=(1, stream(
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"model": "claude-test", "stop_reason": "end_turn", "content": [
+                {"type": "text", "text": said}]}},
+            {"type": "result", "subtype": "success", "is_error": True, "result": said, "total_cost_usd": 0,
+             "structured_output": {"note": said}})), **{"cc-limit check": check})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.INCOMPLETE)
+        self.assertTrue(v.extra["why"].split(": ", 1)[1].startswith("no answer"), v.extra["why"])
+        self.assertEqual(len(box.called("cc-limit check")), 1)
+        self.assertFalse(re.search(r"limit|spend|synthetic", seen[0], re.I), seen[0])
+        self.assertEqual(json.loads(seen[0])["is_error"], True)
+
+    def test_a_limit_before_the_first_turn_is_the_clis_own(self):
+        # the CLI says a limit as its own assistant event, then an error result; that event is not the model
+        # speaking, so the result's text stays and reads as the limit it is
+        init = {"type": "system", "subtype": "init"}
+        j, got, cli = R.streamed(stream(init, cli_event(SESSION_LIMIT), cli_result(SESSION_LIMIT)))
+        self.assertEqual((j.get("result"), got), (SESSION_LIMIT, None))
+        self.assertIn("rate_limit: " + SESSION_LIMIT, cli)
+        # an error result with no assistant event at all is the CLI's too
+        bare = {"type": "result", "subtype": "success", "is_error": True, "total_cost_usd": 0,
+                "result": "Claude AI usage limit reached|1790000000"}
+        self.assertEqual(R.streamed(stream(init, bare))[0].get("result"), bare["result"])
+        for out in (stream(init, cli_event(SESSION_LIMIT), cli_result(SESSION_LIMIT)), stream(init, bare)):
+            self.box(claude=(1, out))
+            v = R.review(self.job(), comments=[])
+            self.assertEqual(v.verdict, T.INCOMPLETE)
+            self.assertTrue(v.extra["why"].split(": ", 1)[1].startswith("limit"), v.extra["why"])
+            self.assertEqual(R.reads_used("demo", 7), 0)
+            self.assertNotIn("silent", R.spent("demo", 7))
+
+    def test_a_limit_hit_mid_read_reaches_cc_limit_and_the_models_text_does_not(self):
+        # turns that cost money, then the CLI's limit event and its error result: the read is a limit, and the file
+        # cc-limit reads holds the CLI's line, never the model's text before it
+        seen = []
+        def check(argv):
+            with open(argv[2]) as f:
+                seen.append(json.loads(f.read()))
+            return 0, "LIMIT 1790000000"
+        mine = "the diff logs: Claude usage limit reached"
+        box = self.box(claude=(1, stream(
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"model": "claude-test", "stop_reason": "end_turn", "content": [
+                {"type": "text", "text": mine}]}},
+            cli_event(SESSION_LIMIT), cli_result(SESSION_LIMIT, usd=3.64))), **{"cc-limit check": check})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual(v.verdict, T.INCOMPLETE)
+        self.assertTrue(v.extra["why"].split(": ", 1)[1].startswith("limit"), v.extra["why"])
+        self.assertEqual(len(box.called("cc-limit check")), 1)
+        self.assertEqual((seen[0]["result"], seen[0]["is_error"]), (SESSION_LIMIT, True))
+        self.assertNotIn(mine, json.dumps(seen[0]))
+        self.assertEqual(R.reads_used("demo", 7), 0)
+        self.assertNotIn("silent", R.spent("demo", 7))
+
+    def test_the_models_text_after_a_cli_event_is_the_models_again(self):
+        # a 529 the CLI retried past, then the model's own last text: the result's `result` is the model's again
+        said = "the diff logs: Claude usage limit reached"
+        j, _, cli = R.streamed(stream(
+            cli_event("API Error: 529 Overloaded", error="server_error"),
+            {"type": "assistant", "message": {"model": "claude-test", "content": [{"type": "text", "text": said}]}},
+            cli_result(said)))
+        self.assertNotIn("result", j)
+        self.assertNotIn(said, cli)
+        self.assertIn("server_error: API Error: 529", cli)
+
+    def test_a_handback_then_a_land_in_one_walled_turn_hands_back(self):
+        back = {"verdict": "HANDBACK", "advisory": [], "blocking": [
+            {"kind": "correctness", "where": "x.py:2", "what": "bad", "input": "b", "fix": "c"}]}
+        land = {"verdict": "LAND", "blocking": [], "advisory": []}
+        wall = {"type": "result", "subtype": "error_max_budget_usd", "total_cost_usd": 7.20}
+        self.box(claude=(1, stream(so_call(back, uid="toolu_a"), so_result(uid="toolu_a"), so_call(land, uid="toolu_b"),
+                                   wall)))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, ["[correctness] x.py:2 — bad (input: b) → c"]))
+
+    def test_a_handback_the_stream_carried_outweighs_the_results_land(self):
+        back = {"verdict": "HANDBACK", "advisory": [], "blocking": [
+            {"kind": "scope", "where": "y.py", "what": "out of scope", "input": "", "fix": "drop it"}]}
+        land = {"verdict": "LAND", "blocking": [], "advisory": []}
+        self.box(claude=(0, stream(so_call(back, uid="toolu_a"), so_result(uid="toolu_a"), so_call(land, uid="toolu_b"),
+                                   so_result(uid="toolu_b"), {"type": "result", "subtype": "success",
+                                                              "total_cost_usd": 0.5, "structured_output": land})))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, ["[scope] y.py — out of scope → drop it"]))
+
+    def test_a_malformed_handback_then_a_land_stays_a_wall(self):
+        # a HANDBACK too broken to read still holds the LAND after it: neither is the answer
+        self.assert_wall(so_call({"verdict": "HANDBACK", "blocking": "yes"}, uid="toolu_a"), so_result(uid="toolu_a"),
+                         so_call({"verdict": "LAND", "blocking": [], "advisory": []}, uid="toolu_b"))
+
+    def test_a_handback_whose_kind_is_off_the_list_stays_a_wall(self):
+        bad = {"verdict": "HANDBACK", "advisory": [], "blocking": [
+            {"kind": "style", "where": "x.py", "what": "w", "input": "", "fix": "f"}]}
+        self.assertFalse(R.fits(bad, R.SCHEMA))
+        self.assertFalse(R.fits(dict(bad, verdict="MAYBE", blocking=[]), R.SCHEMA))
+        self.assert_wall(so_call(bad))
+
     def test_a_handback_at_another_digest_gets_the_delta_read(self):
         box = self.box(claude=claude_says("LAND"))
         prior = self.comment("HANDBACK", "0dd", ["1. [correctness] x.py — the old bug"], head="c" * 40)
@@ -659,6 +950,14 @@ class TestTwoReaders(Case):
 
     def test_a_bad_claude_model_is_a_stop_not_a_retry(self):
         box = self.box(claude=CLAUDE_404, **{"codex exec": codex_says("LAND")})
+        self.assertStop(R.review(self.job(), comments=[]), "claude-fable-test", "may not exist")
+        self.assertEqual(box.called("codex exec"), [])
+
+    def test_a_bad_claude_model_said_as_the_clis_own_event_is_a_stop(self):
+        bad = ("There's an issue with the selected model (claude-fable-test). It may not exist or you may not have "
+               "access to it. Run --model to pick a different model.")
+        box = self.box(claude=(1, stream({"type": "system", "subtype": "init"}, cli_event(bad, error="model_not_found"),
+                                         cli_result(bad))), **{"codex exec": codex_says("LAND")})
         self.assertStop(R.review(self.job(), comments=[]), "claude-fable-test", "may not exist")
         self.assertEqual(box.called("codex exec"), [])
 

@@ -46,6 +46,12 @@ read: LAND with model "" and extra read=none. Otherwise the lander buys one:
     asks only the silent one. A reader that CANNOT answer — a bad model id or effort, a missing binary, a flag
     error, a tool feature codex will not turn off — or answers nothing twice at one head is a HANDBACK stop naming
     the reader and the cause (extra fault=True), never a silent retry.
+    A claude read runs with `--output-format stream-json`, because its `--max-budget-usd` is checked only after a
+    turn: a read's one turn (the prompt alone is 150k-370k tokens) spends past the cap, the CLI then reports
+    error_max_budget_usd and its result carries no structured_output, though the turn already called
+    StructuredOutput. The stream carries that call, so a wall with an answer in it is that answer (streamed());
+    only a wall without one (a refusal, a text-only turn) counts as a wall. A call counts as an answer only when
+    it is whole (its turn stopped on tool_use, not max_tokens), the CLI did not reject it, and it fits SCHEMA.
     The verdict is HANDBACK when any reader's is; the findings are all readers', each row naming its reader; the
     marker lists every reader's own verdict. Together they count as ONE read against the cap.
     CC_LAND_REVIEW_MODEL, when set, is the only reader (the old single-read setting).
@@ -517,6 +523,111 @@ def is_claude(model):
     return model.startswith("claude") or model.split("[")[0] in CLAUDE_ALIASES
 
 
+def fits(value, schema):
+    """value against the subset of JSON Schema SCHEMA uses: type, enum, required, properties, additionalProperties,
+    items, maxItems."""
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    kind = schema.get("type")
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "array":
+        if not isinstance(value, list) or len(value) > schema.get("maxItems", len(value)):
+            return False
+        return all(fits(x, schema.get("items") or {}) for x in value)
+    if kind == "object":
+        props = schema.get("properties") or {}
+        if not isinstance(value, dict) or any(k not in value for k in schema.get("required") or []):
+            return False
+        if schema.get("additionalProperties") is False and any(k not in props for k in value):
+            return False
+        return all(fits(v, props[k]) for k, v in value.items() if k in props)
+    return True
+
+
+# The keys of a result event that carry the model's words: its answer, and the inputs of any tool call it was denied.
+MODEL_KEYS = ("structured_output", "permission_denials")
+
+
+def cli_own(result):
+    """A result event as streamed() left it, less the keys that carry the model's words."""
+    return {k: v for k, v in result.items() if k not in MODEL_KEYS}
+
+
+def cli_spoke(e):
+    """True when an assistant event is the CLI's own (a limit, an API error, a bad model): fields the model cannot
+    set say so. Its text is the CLI's words, and it is not the model speaking."""
+    msg = e.get("message")
+    return bool((isinstance(msg, dict) and msg.get("model") == "<synthetic>") or e.get("isApiErrorMessage") is True
+                or e.get("error"))
+
+
+def streamed(out):
+    """claude -p --output-format stream-json --verbose: one JSON event a line, the result last, stderr after it ->
+    (the result event, or {}, its `result` the CLI's own words or none | the input of the StructuredOutput call that
+    is the read's answer, or None | what the CLI itself said: its result event less the model's keys, its own
+    assistant events' text, system events and stderr, never the model's text). A single `--output-format json`
+    object is its own result.
+    The result event's `result` is the last assistant event's text and its `structured_output` the model's answer, so
+    a finding quoting "unknown option" or "usage limit reached" would read as the CLI's fault or limit (security read
+    of #1034). The CLI reports a limit, an API error or a bad model as an assistant event of its own, which the model
+    cannot forge: message.model "<synthetic>", isApiErrorMessage, or a top-level `error` (cli_spoke()). That event is
+    not the model speaking; its text is the CLI's. So `result` is kept as it came when no model event came before
+    it (a bad model, a limit hit before the first turn), and is the CLI's own last text when one came after the
+    model's last event (a limit hit mid-read, after turns that cost money); otherwise it is dropped.
+    A call is an answer only when its turn ended to make it (stop_reason tool_use: a max_tokens stop may have cut the
+    input short), the CLI did not reject it (a tool_result with is_error), and it is SCHEMA's object (#824, #772:
+    on a wall the CLI may never have checked it, and parse() reads a missing `blocking` as none). Any accepted call
+    that says HANDBACK outweighs a LAND in the same stream: the answer is the last whole HANDBACK, or none."""
+    result, calls, rejected, said, spoke, last = {}, [], set(), [], False, None
+    # "\n" only: splitlines() also breaks at U+2028, U+2029 and U+0085, which JSON.stringify leaves raw in a string,
+    # so a finding quoting one would cut its event in two and put the model's words among the CLI's
+    for line in (out or "").split("\n"):
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            if not line.lstrip().startswith("{"):   # a cut-off event line is the model's as much as a whole one
+                said.append(line)
+            continue
+        if not isinstance(e, dict):
+            continue
+        kind, msg = e.get("type"), e.get("message") or {}
+        if kind == "result":
+            keep = e.get("is_error") is True and not spoke
+            result = {k: v for k, v in e.items() if keep or k != "result"}
+            if not keep and last is not None:
+                result["result"] = last
+            said.append(json.dumps(cli_own(result)))
+            continue
+        if kind not in ("assistant", "user"):
+            said.append(line)
+            continue
+        if kind == "assistant" and cli_spoke(e):
+            parts = (msg.get("content") or []) if isinstance(msg, dict) else []
+            last = " ".join(c["text"] for c in parts if isinstance(c, dict) and isinstance(c.get("text"), str))
+            said.append(f"{e.get('error') or 'cli'}: {last}")
+            continue
+        if kind == "assistant":
+            spoke, last = True, None
+        for c in (msg.get("content") or []) if isinstance(msg, dict) else []:
+            if not isinstance(c, dict):
+                continue
+            if kind == "assistant" and c.get("type") == "tool_use" and c.get("name") == "StructuredOutput":
+                calls.append((c.get("id"), msg.get("stop_reason"), c.get("input")))
+            elif kind == "user" and c.get("type") == "tool_result" and c.get("is_error"):
+                rejected.add(c.get("tool_use_id"))
+    calls = [c for c in calls if c[0] is None or c[0] not in rejected]
+    whole = [c[2] for c in calls if c[1] == "tool_use" and fits(c[2], SCHEMA)]
+    answer = None
+    if any(isinstance(c[2], dict) and c[2].get("verdict") == "HANDBACK" for c in calls):
+        answer = ([a for a in whole if a["verdict"] == "HANDBACK"] or [None])[-1]
+    elif calls and calls[-1][1] == "tool_use" and fits(calls[-1][2], SCHEMA):
+        answer = calls[-1][2]
+    return result, answer, "\n".join(said)
+
+
 def ask(text, repo, pr, digest, model=None):
     """One tool-less read. -> (Verdict | None, usd, why). Verdict None and why starting 'limit' is a usage limit;
     'wall' is the read's own budget cap; 'fault' is a read that cannot run as asked (fault()); any other None is a
@@ -530,35 +641,39 @@ def ask(text, repo, pr, digest, model=None):
         return None, 0.0, f"fault: {bad}"
     argv = [exe, "-p", "--model", model,
             "--effort", effort(), "--max-budget-usd", C.conf("CC_LAND_REVIEW_BUDGET", "3"),
-            "--output-format", "json", "--json-schema", json.dumps(SCHEMA),
+            "--output-format", "stream-json", "--verbose", "--json-schema", json.dumps(SCHEMA),
             "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands", "--tools", ""]
     run, cwd = scratch(repo, pr)
     try:
         rc, out = C.sh(argv, cwd=cwd, input=text, timeout=READ_TIMEOUT, env=clean_env())
     finally:
         shutil.rmtree(run, ignore_errors=True)
-    try:
-        j = json.loads(out)
-    except ValueError:
-        j = {}
-    usd = float(j.get("total_cost_usd") or 0) if isinstance(j, dict) else 0.0
-    v = parse(out, digest, model=model)
+    j, answer, cli = streamed(out)
+    usd = float(j.get("total_cost_usd") or 0)
+    if answer and answer["verdict"] == "HANDBACK" and "structured_output" in j:   # a HANDBACK the stream carried
+        j = dict(j, structured_output=answer)                                    # outweighs the result's LAND
+    v = parse(json.dumps(j), digest, model=model)
     if v:
         return v, usd, ""
-    if isinstance(j, dict) and j.get("subtype") in WALLS:
+    if j.get("subtype") in WALLS:
+        # the turn that crossed the cap had already answered: that answer is the read, not a wall
+        v = parse(json.dumps({"structured_output": answer, "usage": j.get("usage")}), digest, model=model)
+        if v:
+            return v, usd, ""
         return None, usd, f"wall: {j['subtype']} at ${usd:.2f}"
-    said = json.dumps(j)[-400:] if j else out[-400:]
+    own = json.dumps(cli_own(j)) if j else ""   # the CLI's words only: a diff can say "usage limit" too
+    said = own[-400:] if j else cli[-400:]
     if usd == 0 and LIMIT_SAID.search(said):
         return None, usd, f"limit: {said[-160:]}"
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        f.write(out or "{}")
+        f.write(own or cli or "{}")
     try:
         lrc, _ = C.sh([os.path.join(BIN, "cc-limit"), "check", f.name], timeout=60)
     finally:
         os.unlink(f.name)
     if lrc == 0:
         return None, usd, "limit: cc-limit check says the run hit a usage limit"
-    bad = fault(rc, out)
+    bad = fault(rc, cli)   # the CLI's words only: a finding can quote "unknown option" too
     return None, usd, f"fault: rc={rc} {bad}" if bad else f"no answer: rc={rc} {said[-200:]}"
 
 
