@@ -63,9 +63,10 @@
 # would have settled in a minute crossed three shifts on a phone, and was false to begin with (comms audit). So stop()
 # hands cc-broker one line for `<repo>`'s session — which classifies it, waking that session NOW for a line asking it
 # to choose and digesting the rest. A broker that is DOWN loses nothing either: the stop is filed as a planner request
-# (cc-notify --ask), kept and retried. SLACK HEARS TWO THINGS FROM A LOOP, each once, in the track's own thread: the
-# DONE card, and a worker's BLOCKED question (the question alone). Iteration totals, spend, a round that is over, a
-# limit wait and the command to resume stay in loop.log, the board note and the journal.
+# (cc-notify --ask), kept and retried. SLACK HEARS TWO THINGS FROM A LOOP, each once: the DONE card in the track's
+# own thread, and a worker's BLOCKED question (the question alone) on #<repo> — but only when no session took the stop.
+# A question the seat heard is the seat's to settle, or to take to the owner itself as a --decision card. Iteration
+# totals, spend, a round that is over, a limit wait and the command to resume stay in loop.log, the board note and the journal.
 # Exit: 0 done | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (the session hears it)
 #     | 5 errors | 6 step limit with nothing committed | 7 capped twice with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
 #     | 11 the whole project is paused (`cc-pause on <repo>`), board `queued`, nobody notified — the owner parked it himself
@@ -937,10 +938,18 @@ TO
   lrun ro '- committed a step' 1 --max-iter 1 --no-extend
   t 'a round that is over posts nothing at all' "$(grep -c . "$d/lb.n")" 0
   t '…and the board note and loop.log carry it' "$(grep -c 'round over at its step limit' "$lh/.cc/state/lp/ro/loop.log")" 1
+  # ── A WORKER'S QUESTION GOES TO THE SEAT FIRST ── two fixtures: no broker on this copy (no session hears it) and a
+  # broker that takes the line (a cc-broker stub that records its argv and exits 0, removed again after its run).
   lrun bk 'STATUS: BLOCKED: which port do I use?' 0 --max-iter 3
-  t 'a BLOCKED question is posted once' "$(slackn)" 1
+  t 'a BLOCKED question no session took is posted once' "$(slackn)" 1
   t '…on #<repo> itself (--major), titled for the track, the question alone — no STATUS line, no resume recipe' \
     "$(grep -v '^--ask|' "$d/lb.n" | cut -d'|' -f1,4,5,8)" "--major|-t|lp/bk needs you|which port do I use?"
+  printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s"; echo >> "%s"\n' "$d/lb.b" "$d/lb.b" > "$lb/cc-broker"; chmod +x "$lb/cc-broker"; : > "$d/lb.b"
+  lrun bh 'STATUS: BLOCKED: may the two checks move from host to hermetic?' 0 --max-iter 3
+  rm -f "$lb/cc-broker"
+  t 'a BLOCKED question the seat heard posts nothing to Slack and files no request — it is the seat'"'"'s to settle' "$(grep -c . "$d/lb.n")" 0
+  t '…the seat gets the question, told to settle it or ask the owner itself' \
+    "$(grep -c '^inject|--no-start|--source|loop|lp|loop: lp/bh needs you — STATUS: BLOCKED: may the two checks move from host to hermetic?  Settle it yourself if you can; only if it is the owner.s to decide, ask him with cc-notify --decision' "$d/lb.b")" 1
   lrun dn 'STATUS: DONE' 0 --max-iter 3
   t 'a DONE posts exactly one card' "$(slackn)" 1
   t 'the loop calls cc-notify in three places only — the DONE card, the BLOCKED question, the planner intake — so a \
@@ -1221,11 +1230,14 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" hea
   tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose=" $(stop_target)'s session has been told."; }
   log "the stop went to $(stop_target)'s session: $heard"
   [ "$heard" = yes ] || stop_unheard "$title" "$msg"
-  # ONLY A QUESTION A PERSON IS WAITING ON IS POSTED ($5: the worker's question, nothing else): once, on #<repo> itself
-  # (--major: the track's thread sits in the -updates lane the owner does not read, and "waiting on him" is a status he
-  # wants pushed — comms audit 2026-09-28), under an id so a relaunch that stops on the same question at the same
-  # commit does not ask it twice. Every other stop went to the planner above, and only there.
-  [ -z "$said" ] || "$BIN/cc-notify" --major --id "blocked:$repo/$track:$(git -C "${WT:-.}" rev-parse --short HEAD 2>/dev/null):$(printf '%s' "$said" | cksum | cut -d' ' -f1)" \
+  # A WORKER'S QUESTION IS THE SEAT'S FIRST. "A blocked worker's question, after the seat can't settle it, goes out as
+  # the seat's 🔒 card. It isn't posted unmentioned on #<repo>" (comms audit 2026-10-01, change 6): demo-video-skill's
+  # "may the two checks move from host to hermetic?" reached the owner as "needs you" on 09-30, a question the seat had
+  # settled within minutes. So a stop a session heard posts nothing here; the planner line tells that seat to answer
+  # it, or to ask the owner itself with a --decision card. ONLY WHEN NO SESSION TOOK IT ($heard=no) is the question
+  # ($5, nothing else) posted: once, on #<repo> itself (--major: the track's thread sits in the -updates lane the owner
+  # does not read), under an id so a relaunch that stops on the same question at the same commit does not ask it twice.
+  [ -z "$said" ] || [ "$heard" = yes ] || "$BIN/cc-notify" --major --id "blocked:$repo/$track:$(git -C "${WT:-.}" rev-parse --short HEAD 2>/dev/null):$(printf '%s' "$said" | cksum | cut -d' ' -f1)" \
     -t "$repo/$track $title" --heading "$(stop_headline "$title")" "$said$whose"   # a person reads the row's title; the title routes
   exit "$code"; }
 # THE PROJECT PAUSE. `cc-pause on <repo>` parks a whole project; what it does to a loop that is ALREADY RUNNING is
@@ -1391,7 +1403,7 @@ while [ $i -lt "$MAXI" ]; do
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
     # The question, then how to answer it, as sentences rather than an aside in brackets. The two paths stay: whoever
     # answers has to type them, and the planning session this goes to has no other way to find the worker's files.
-    stop 3 "needs you" "$q  To answer it, put the answer at the end of $ST/task.md, take the STATUS line out of $ST/progress.md, then run: cc $repo $track --go \"\"" waiting \
+    stop 3 "needs you" "$q  Settle it yourself if you can; only if it is the owner's to decide, ask him with cc-notify --decision. To answer it, put the answer at the end of $ST/task.md, take the STATUS line out of $ST/progress.md, then run: cc $repo $track --go \"\"" waiting \
       "$(sed 's/^STATUS: BLOCKED:[[:space:]]*//' <<<"$q")"; fi
   rn=$(refusal_next "$out" "$out.err" "$m"); rnrc=$?; rwhy=${rn#*$'\t'}; nx=""; [ "$rnrc" = 0 ] && nx=${rn%%$'\t'*}
   case "$(refusal_step "$rnrc" "$moved")" in
