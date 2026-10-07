@@ -35,11 +35,17 @@ tip of the PR's base branch's word on it (manifest.placed), not the PR's base. A
 SMALL FIRST (owner, 2026-09-28: a one-line PR waited behind ~20 full-suite PRs): a free slot goes to the oldest job
 that is not heavy — a plan of more than LANDER_SMALL_CHECKS (default 5) checks, or one with a full-suite check
 (LANDER_FULL_CHECKS, default check-sh) — and only then to the oldest heavy one; a job not planned yet counts as small.
-So a small PR waits for at most one check when the box allows one slot, and for none when a slot is free.
-OVERLAP FROM THE START: a queued job whose files meet those of a job already planned, checking or mergeable is not
-planned yet (`waits for PR #N`, said once): it is planned from main once that one has merged or left, so two changes
-that overlap don't both burn CPU. Overlap found later is the Δ re-plan's (mergeable, below). BOX HOLDS come first and
-leave the file untouched and the job untimed:
+So a small PR waits for at most one check when the box allows one slot, and for none when a slot is free. NO PR
+WAITS MORE THAN A DAY (idea panel, 2026-10-04: #746 sat ~20 h re-queued, unplanned and unexplained): a job queued
+LANDER_WAIT_CAP seconds ago or more (default 86400) takes its turn before every younger one, small or heavy.
+OVERLAP FROM THE START: a queued job whose files meet those of a job already planned, checking or mergeable, or of an
+older job parked itself, is not planned yet (`waits for PR #N`, said once; its first park stamps parked_since and
+logs `stage <repo>#<pr> parked on=<n>`, once): it is planned from main once that one has merged or left, so two
+changes that overlap don't both burn CPU. A job parked LANDER_WAIT_CAP or longer is planned anyway, since the chain
+of parks is transitive (10-04: ~40 jobs behind one 55-check PR, most sharing no file with it). Overlap found later is
+the Δ re-plan's (mergeable, below). Each turn of the loop first records the checks that finished, so a freed slot
+is seen while parked jobs keep the turn list full, and a job held during the pass has a turn again once its
+not_before has passed. BOX HOLDS come first and leave the file untouched and the job untimed:
 `cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds jobs before the merge.
   queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a draft or a conflict -> held 15 min. Under
              the git lock fetch base and head; base_sha, files (merge-base..head), digest (the
@@ -146,6 +152,9 @@ FULL_CHECKS = tuple((os.environ.get("LANDER_FULL_CHECKS") or "check-sh").split()
 # a job parked on an overlap is retried at every wake; within this many seconds of its last read of GitHub it is
 # checked against the files that read gave, with no new call (a head moved meanwhile is read once this runs out)
 PARK_FRESH = float(os.environ.get("LANDER_PARK_FRESH") or 300)
+# idea panel, 10-04: "no PR waits more than 24 h in a lane without a landing attempt". A job parked this long is planned
+# despite its overlap (the Δ re-plan at mergeable catches a real one), and one queued this long takes a slot first
+WAIT_CAP = float(os.environ.get("LANDER_WAIT_CAP") or 86400)
 LAPTOP_REST = 300       # seconds the box takes the laptop's checks after the laptop gave no answer
 CI_WAIT_SECS = 120       # a head whose GitHub CI is still running is looked at again this often…
 CI_WAITS = 30            # …this many times (an hour) before it is a query
@@ -394,6 +403,7 @@ class Lane:
         self.origin = {}         # {branch: sha}: what origin last sent for each branch this lane fetched
         self.said = set()        # (job, job it waits for): said once
         self.parked = set()      # queued jobs waiting on an overlapping one
+        self.tried_nb = {}       # job key -> its not_before when it last had its turn: a later one has fallen due
         self.pool = None
 
     def say(self, text):
@@ -446,12 +456,19 @@ class Lane:
                 while self.inflight:     # the checks in flight finish here and are recorded before the switch
                     self.reap(POLL)
                 return moved
+            if any(f.future.done() for f in self.inflight.values()):   # only a look at what has finished, never a wait
+                self.reap(0)   # a finished check is recorded (its slot freed) even while parked jobs keep todo full
+                continue       # and a promote that came while it ran is seen before any job moves on
             for ln in J.drain(self.repo):
                 self.say(ln)
             jobs = J.lane_jobs(self.repo)
-            for j in jobs:   # a checking job due a re-read of its PR has a turn, waiting or not, unless the box
-                # holds it (paused, a tier stop): re-admitted, it would be refused before it read, every pass, unslept
-                if j.key in tried and self.reread_due(j) and not self.box_hold(j):
+            for j in jobs:   # a job that has had its turn gets another when (a) it was held since and that hold has
+                # run out, or (b) it is checking and due a re-read of its PR, waiting or not, unless the box holds it
+                # (paused, a tier stop): re-admitted, it would be refused before it read, every pass, unslept
+                if j.key not in tried:
+                    continue
+                if (j.state == T.HELD and self.due(j) and self.tried_nb.get(j.key) != j.extra.get("not_before")) \
+                        or (self.reread_due(j) and not self.box_hold(j)):
                     tried.discard(j.key)
             todo = [j for j in jobs if j.key not in tried and self.due(j)]
             if not todo:   # every due job has had its turn: record what finished (a freed slot), or wait for it
@@ -459,8 +476,10 @@ class Lane:
                     return ""
                 self.reap(POLL)   # the timeout lets a new request in while every check still runs
                 continue
-            job = min(todo, key=self.heavy)   # the oldest small job, else the oldest heavy one
+            # a job in the lane WAIT_CAP or longer first, then the oldest small job, else the oldest heavy one
+            job = min(todo, key=lambda j: (not self.overdue(j, "queued_at"), self.heavy(j)))
             tried.add(job.key)
+            self.tried_nb[job.key] = job.extra.get("not_before")
             why = self.box_hold(job)
             if why:
                 self.say(f"PR #{job.pr}: {why}")
@@ -557,10 +576,19 @@ class Lane:
         return bool(job.plan and (len(job.plan.checks) > SMALL_CHECKS
                                   or any(n in FULL_CHECKS for n in job.plan.checks)))
 
+    @staticmethod
+    def overdue(job, field) -> bool:
+        """The stamp in job.extra[field] (queued_at: in the lane; parked_since: parked) is WAIT_CAP or more ago."""
+        at = E.epoch_of(job.extra.get(field) or "")
+        return bool(at) and time.time() - at >= WAIT_CAP
+
     def overlapping(self, job):
         """A job that changes one of this job's files and goes first, or None: one already planned, checking or
         mergeable, or an older one parked on an overlap itself — so a newer PR never jumps an older one it shares a
-        file with, and overlapping PRs keep their arrival order."""
+        file with, and overlapping PRs keep their arrival order. None for a job parked WAIT_CAP or longer: it is
+        planned anyway, and the Δ re-plan at mergeable reruns what a real overlap reaches."""
+        if self.overdue(job, "parked_since"):
+            return None
         mine, older = set(job.files), True
         for j in J.lane_jobs(self.repo):
             if j.key == job.key:
@@ -573,12 +601,19 @@ class Lane:
 
     def park(self, job, other, read):
         """`job` waits for `other`. read: its facts were just read from GitHub, so the files are kept (saved) with
-        the time, and later wakes check them without a new call until PARK_FRESH runs out."""
+        the time, and later wakes check them without a new call until PARK_FRESH runs out. The first park stamps
+        parked_since (never refreshed until it is planned) and writes the one queue.log line that says it waits."""
         self.waiting.add(job.key)
         self.parked.add(job.key)
+        first = not job.extra.get("parked_since")
+        if first:
+            job.extra["parked_since"] = E.stamp()
         if read:
             job.extra["parked"] = {"at": time.time(), "head": job.head, "on": other.pr}
+        if read or first:
             J.save(job)
+        if first:
+            E.stage(job.repo, job.pr, "parked", on=other.pr)
         if (job.key, other.key) not in self.said:
             self.said.add((job.key, other.key))
             self.say(f"PR #{job.pr} waits for PR #{other.pr}: both change "
@@ -746,7 +781,8 @@ class Lane:
         if other:   # design: "Two changes that overlap from the start don't both burn CPU; the later one waits"
             return self.park(job, other, read=True)
         self.parked.discard(job.key)
-        job.extra.pop("parked", None)
+        for k in ("parked", "parked_since"):
+            job.extra.pop(k, None)
         if not self.unit("planner"):
             return self.hold(job, "planner is not installed", kind="box")
         job.plan = self.call("planner", "plan", self.root, job.base_sha, job.head, job.files, fallback=self.fallback)
