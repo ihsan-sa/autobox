@@ -488,9 +488,52 @@ class TestReview(Case):
         self.assertEqual(R.reads_used("demo", 7), 1)
         self.assertNotIn("wall", R.spent("demo", 7))
 
-    def assert_wall(self, *events):
+    def test_a_land_with_a_null_stop_the_cli_accepted_is_the_answer_at_the_wall(self):
+        # #960 at 3447d443 on 10-07: stream-json wrote stop_reason null on the call's event, the CLI answered it
+        # "provided successfully", and only the result event said tool_use; the LAND was dropped as a wall
+        answer = {"verdict": "LAND", "blocking": [], "advisory": [{"where": "x.py", "what": "nit"}]}
+        wall = {"type": "result", "subtype": "error_max_budget_usd", "stop_reason": "tool_use", "is_error": True,
+                "total_cost_usd": 3.49}
+        box = self.box(claude=(1, stream({"type": "system", "subtype": "init"}, so_call(answer, stop=None),
+                                         so_result(), wall)))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.advisory), (T.LAND, ["x.py — nit"]))
+        self.assertEqual(R.reads_used("demo", 7), 1)
+        self.assertNotIn("wall", R.spent("demo", 7))
+        self.assertEqual(box.called("claude")[0]["env"].get("DISABLE_PROMPT_CACHING"), "1")
+
+    def test_a_land_with_a_null_stop_the_cli_never_answered_stays_a_wall(self):
+        # nothing says the turn ended on the call: no tool_use stop and no tool_result accepting it
+        self.assert_wall(so_call({"verdict": "LAND", "blocking": [], "advisory": []}, stop=None))
+
+    def test_a_land_with_a_null_stop_the_cli_rejected_stays_a_wall(self):
+        self.assert_wall(so_call({"verdict": "LAND", "blocking": [], "advisory": []}, stop=None),
+                         so_result("Output does not match required schema", error=True))
+
+    def test_an_accepted_land_cut_off_at_max_tokens_stays_a_wall(self):
+        # a max_tokens stop is never whole, whatever the CLI said back
+        self.assert_wall(so_call({"verdict": "LAND", "blocking": [], "advisory": []}, stop="max_tokens"), so_result())
+
+    def test_an_accepted_null_stop_land_the_result_says_hit_max_tokens_stays_a_wall(self):
+        # stream-json writes stop_reason null on the call's event; only the result event says the turn hit
+        # max_tokens. The CLI accepted the cut object and it fits SCHEMA, but its optional `unresolved` list may have
+        # been lost off the end, which parse() would have made a HANDBACK
+        self.assert_wall(so_call({"verdict": "LAND", "blocking": [], "advisory": []}, stop=None), so_result(),
+                         stop="max_tokens")
+
+    def test_a_max_tokens_stop_on_a_later_turn_leaves_an_earlier_accepted_call_whole(self):
+        # the result's stop is the last turn's: the call's turn ended, the CLI accepted it, and a later turn was cut
+        answer = {"verdict": "LAND", "blocking": [], "advisory": [{"where": "x.py", "what": "nit"}]}
+        later = {"type": "assistant", "message": {"stop_reason": None, "content": [{"type": "text", "text": "and"}]}}
+        wall = {"type": "result", "subtype": "error_max_budget_usd", "stop_reason": "max_tokens",
+                "total_cost_usd": 7.00}
+        self.box(claude=(1, stream(so_call(answer, stop=None), so_result(), later, wall)))
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.advisory), (T.LAND, ["x.py — nit"]))
+
+    def assert_wall(self, *events, stop=None):
         self.box(claude=(1, stream(*events, {"type": "result", "subtype": "error_max_budget_usd",
-                                             "total_cost_usd": 7.00})))
+                                             "stop_reason": stop, "total_cost_usd": 7.00})))
         v = R.review(self.job(), comments=[])
         self.assertEqual(v.verdict, T.INCOMPLETE)
         self.assertIn("wall: error_max_budget_usd at $7.00", v.extra["why"])
@@ -822,6 +865,53 @@ class TestReview(Case):
         self.assertEqual(fb("a.py", "100644", "100644", unseen=["the diff is cut before its change"], text="t\nu\n",
                             body="t\n", diffed=True),
                          "=== a.py (old mode 100644, new mode 100644; FLAGGED: the diff is cut before its change)\nt\n")
+
+    def test_around_keeps_each_change_and_its_neighbours_within_lines_and_characters(self):
+        text = "".join(f"l{i}\n" for i in range(1, 101))
+        self.assertIsNone(R.around(text, []))
+        self.assertEqual(R.around(text, [(50, 50)], width=2),
+                         "(… lines 1-47 of 100 not shown …)\nl48\nl49\nl50\nl51\nl52\n"
+                         "(… lines 53-100 of 100 not shown …)\n")
+        # two windows that meet are one; a window at either end has no gap line there
+        self.assertEqual(R.around(text, [(2, 2), (5, 5), (99, 100)], width=1),
+                         "l1\nl2\nl3\nl4\nl5\nl6\n(… lines 7-97 of 100 not shown …)\nl98\nl99\nl100\n")
+        # a long neighbour stops the window on its side; the changed line itself is always shown
+        long = "a\n" + "x" * 50 + "\nchanged\nb\n"
+        self.assertEqual(R.around(long, [(3, 3)], width=5, chars=10),
+                         "(… lines 1-2 of 4 not shown …)\nchanged\nb\n")
+        # a \r or U+2028 inside a line is not a line break to git, so it moves no window
+        self.assertEqual(R.around("a\rb\nc\u2028d\nchanged\ne\n", [(3, 3)], width=0),
+                         "(… lines 1-2 of 4 not shown …)\nchanged\n(… lines 4-4 of 4 not shown …)\n")
+        self.assertEqual(R.around("a\nb", [(2, 2)], width=0), "(… lines 1-1 of 2 not shown …)\nb\n")
+        self.assertEqual(R.spans_of("@@ -3,2 +3,4 @@ f\n@@ -9 +11,0 @@\n@@ -20 +22 @@\n"), [(3, 6), (11, 11), (22, 22)])
+
+    def test_a_large_file_whose_whole_change_is_in_the_diff_is_shown_around_it(self):
+        big = "".join(f"line {i}\n" for i in range(1, 8001))   # over WHOLE_UNDER and FILE_CAP
+        self.assertGreater(len(big), R.FILE_CAP)
+        diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -2500 +2500 @@\n-old\n+line 2500\n"
+        self.box(**{"git show": (0, big), "git diff": lambda argv: (0, diff)})
+        out = R.merged_files(self.tmp, BASE, HEAD, ["x.py"], whole=["x.py"])
+        self.assertTrue(out.startswith("=== x.py (old mode 100644, new mode 100644; shown around its changes, "), out)
+        self.assertIn("its whole diff is in `diff`)", out.splitlines()[0])
+        self.assertNotIn("FLAGGED", out)
+        self.assertIn("\nline 2500\n", out)
+        self.assertIn("(… lines 1-2439 of 8000 not shown …)", out)
+        self.assertLess(len(out), len(big) // 10)
+        # the same file whose change the diff does not show whole is cut at FILE_CAP and flagged, as before
+        out = R.merged_files(self.tmp, BASE, HEAD, ["x.py"], whole=[])
+        self.assertIn("FLAGGED: cut at 60 kB", out.splitlines()[0])
+        self.assertNotIn("shown around", out)
+        # a file under WHOLE_UNDER is shown whole even when its change is in the diff
+        self.box(**{"git show": (0, "a\nb\n"), "git diff": lambda argv: (0, diff)})
+        self.assertEqual(R.merged_files(self.tmp, BASE, HEAD, ["x.py"], whole=["x.py"]),
+                         "=== x.py (old mode 100644, new mode 100644)\na\nb\n")
+
+    def test_a_large_diffed_file_with_no_hunk_from_git_is_shown_as_before(self):
+        big = "".join(f"line {i}\n" for i in range(1, 5001))
+        self.box(**{"git show": (0, big), "git diff": (128, "fatal")})
+        out = R.merged_files(self.tmp, BASE, HEAD, ["x.py"], whole=["x.py"])
+        self.assertTrue(out.startswith(f"=== x.py (old mode 100644, new mode 100644)\nline 1\n"), out[:200])
+        self.assertEqual(out.split("\n", 1)[1], big)
 
     def test_file_block_flags_whatever_it_does_not_show_whole(self):
         """The one rule: a path whose whole new content is not shown is FLAGGED, even with no reason given, and only

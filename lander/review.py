@@ -37,7 +37,8 @@ read: LAND with model "" and extra read=none. Otherwise the lander buys one:
     variable of the caller's but READ_ENV_KEEP (clean_env), claude is claude_bin() and codex is codex_bin() with
     CODEX_HOME at the passwd home, so the caller's PATH, HOME, ANTHROPIC_* or CODEX_HOME picks nothing. Both get the prompt
     core/config/lander/review.md from THIS release (not the PR's
-    head) with the diff, the merged text of the changed files, the brief's done-criteria and docs/REVIEW.md
+    head) with the diff, the merged text of the changed files (a file over WHOLE_UNDER whose whole change is in the
+    diff only around its changes), the brief's done-criteria and docs/REVIEW.md
     read from the BASE commit, each between `<<<name` / `name>>>` markers (a marker inside the data is broken
     up, so the data cannot close its own block). The answer is JSON (verdict, blocking[], advisory[]).
     A change lands only on EVERY reader's verdict (owner: both models read every change). A reader that hits the
@@ -47,11 +48,14 @@ read: LAND with model "" and extra read=none. Otherwise the lander buys one:
     error, a tool feature codex will not turn off — or answers nothing twice at one head is a HANDBACK stop naming
     the reader and the cause (extra fault=True), never a silent retry.
     A claude read runs with `--output-format stream-json`, because its `--max-budget-usd` is checked only after a
-    turn: a read's one turn (the prompt alone is 150k-370k tokens) spends past the cap, the CLI then reports
-    error_max_budget_usd and its result carries no structured_output, though the turn already called
-    StructuredOutput. The stream carries that call, so a wall with an answer in it is that answer (streamed());
-    only a wall without one (a refusal, a text-only turn) counts as a wall. A call counts as an answer only when
-    it is whole (its turn stopped on tool_use, not max_tokens), the CLI did not reject it, and it fits SCHEMA.
+    turn: a read's one turn can spend past the cap, the CLI then reports error_max_budget_usd and its result
+    carries no structured_output, though the turn already called StructuredOutput. The stream carries that call,
+    so a wall with an answer in it is that answer (streamed()); only a wall without one (a refusal, a text-only
+    turn) counts as a wall. A call counts as an answer only when it is whole (its turn stopped on tool_use, or the
+    CLI accepted it; never max_tokens), the CLI did not reject it, and it fits SCHEMA.
+    A claude read runs with DISABLE_PROMPT_CACHING=1: the read is one API call, and the CLI otherwise writes the
+    whole prompt to a one-hour cache at twice the input price for a read nothing makes again (#960 at 3447d443,
+    10-07: $3.02 of a $3.49 wall was that write).
     The verdict is HANDBACK when any reader's is; the findings are all readers', each row naming its reader; the
     marker lists every reader's own verdict. Together they count as ONE read against the cap.
     CC_LAND_REVIEW_MODEL, when set, is the only reader (the old single-read setting).
@@ -575,11 +579,18 @@ def streamed(out):
     not the model speaking; its text is the CLI's. So `result` is kept as it came when no model event came before
     it (a bad model, a limit hit before the first turn), and is the CLI's own last text when one came after the
     model's last event (a limit hit mid-read, after turns that cost money); otherwise it is dropped.
-    A call is an answer only when its turn ended to make it (stop_reason tool_use: a max_tokens stop may have cut the
-    input short), the CLI did not reject it (a tool_result with is_error), and it is SCHEMA's object (#824, #772:
-    on a wall the CLI may never have checked it, and parse() reads a missing `blocking` as none). Any accepted call
-    that says HANDBACK outweighs a LAND in the same stream: the answer is the last whole HANDBACK, or none."""
-    result, calls, rejected, said, spoke, last = {}, [], set(), [], False, None
+    A call is an answer only when its turn ended to make it (stop_reason tool_use, or null with a tool_result from
+    the CLI accepting it, since stream-json leaves every assistant event's stop_reason null: a max_tokens stop may
+    have cut the input short), no stop for its turn said max_tokens (the result event's stop_reason is the last
+    turn's, and the CLI may accept a cut object that still fits), the CLI did not reject it (a tool_result with
+    is_error), and it is SCHEMA's object (#824, #772: on a wall the CLI may never have checked it, and parse() reads
+    a missing `blocking` as none). Any
+    accepted call that says HANDBACK outweighs a LAND in the same stream: the answer is the last whole HANDBACK, or
+    none."""
+    result, calls, rejected, accepted, said, spoke, last = {}, [], set(), set(), [], False, None
+    # a turn is the model's assistant events between two user events, one message id: each content block is its
+    # own event, and a stop that comes later for the turn (the result event's, for the last) speaks for all of it
+    turn, cut, prev = 0, set(), False
     # "\n" only: splitlines() also breaks at U+2028, U+2029 and U+0085, which JSON.stringify leaves raw in a string,
     # so a finding quoting one would cut its event in two and put the model's words among the CLI's
     for line in (out or "").split("\n"):
@@ -595,6 +606,8 @@ def streamed(out):
             continue
         kind, msg = e.get("type"), e.get("message") or {}
         if kind == "result":
+            if e.get("stop_reason") == "max_tokens" and turn:
+                cut.add(turn)
             keep = e.get("is_error") is True and not spoke
             result = {k: v for k, v in e.items() if keep or k != "result"}
             if not keep and last is not None:
@@ -611,19 +624,33 @@ def streamed(out):
             continue
         if kind == "assistant":
             spoke, last = True, None
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            if prev is False or prev != mid:
+                turn += 1
+            prev = mid
+            if isinstance(msg, dict) and msg.get("stop_reason") == "max_tokens":
+                cut.add(turn)
+        else:
+            prev = False
         for c in (msg.get("content") or []) if isinstance(msg, dict) else []:
             if not isinstance(c, dict):
                 continue
             if kind == "assistant" and c.get("type") == "tool_use" and c.get("name") == "StructuredOutput":
-                calls.append((c.get("id"), msg.get("stop_reason"), c.get("input")))
-            elif kind == "user" and c.get("type") == "tool_result" and c.get("is_error"):
-                rejected.add(c.get("tool_use_id"))
+                calls.append((c.get("id"), msg.get("stop_reason"), c.get("input"), turn))
+            elif kind == "user" and c.get("type") == "tool_result":
+                (rejected if c.get("is_error") else accepted).add(c.get("tool_use_id"))
     calls = [c for c in calls if c[0] is None or c[0] not in rejected]
-    whole = [c[2] for c in calls if c[1] == "tool_use" and fits(c[2], SCHEMA)]
+    # stream-json writes stop_reason null on every assistant event (probed on #960 at 3447d443, 10-07: the call
+    # carried null, the CLI answered it "provided successfully" and only the result event said tool_use), so a
+    # null stop is whole when the CLI accepted the call and no later stop cut its turn: it parsed the input whole to
+    # say so, but an object cut at max_tokens can still fit SCHEMA with an optional `unresolved` list lost off its end
+    done = lambda c: c[3] not in cut and (  # noqa: E731
+        c[1] == "tool_use" or (c[1] is None and c[0] is not None and c[0] in accepted))
+    whole = [c[2] for c in calls if done(c) and fits(c[2], SCHEMA)]
     answer = None
     if any(isinstance(c[2], dict) and c[2].get("verdict") == "HANDBACK" for c in calls):
         answer = ([a for a in whole if a["verdict"] == "HANDBACK"] or [None])[-1]
-    elif calls and calls[-1][1] == "tool_use" and fits(calls[-1][2], SCHEMA):
+    elif calls and done(calls[-1]) and fits(calls[-1][2], SCHEMA):
         answer = calls[-1][2]
     return result, answer, "\n".join(said)
 
@@ -644,8 +671,9 @@ def ask(text, repo, pr, digest, model=None):
             "--output-format", "stream-json", "--verbose", "--json-schema", json.dumps(SCHEMA),
             "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands", "--tools", ""]
     run, cwd = scratch(repo, pr)
+    env = dict(clean_env(), DISABLE_PROMPT_CACHING="1")   # one call: a cache write is paid and never read
     try:
-        rc, out = C.sh(argv, cwd=cwd, input=text, timeout=READ_TIMEOUT, env=clean_env())
+        rc, out = C.sh(argv, cwd=cwd, input=text, timeout=READ_TIMEOUT, env=env)
     finally:
         shutil.rmtree(run, ignore_errors=True)
     j, answer, cli = streamed(out)
@@ -792,6 +820,58 @@ def capped(diff, dropped=()):
 
 
 FILE_CAP, FILES_CAP = 60_000, 400_000
+# A file whose whole change is in `diff` and that is longer than WHOLE_UNDER characters is shown around its changes,
+# AROUND lines either side and no more than AROUND_CHARS characters of them (one markdown line can be 15k), not
+# whole: #960 (+142/-51) carried 300k characters of files (cc-msg, selftest.sh and DESIGN.md at 60k each), 151k
+# tokens a read, and walled twice at $3.49 with no verdict kept.
+WHOLE_UNDER, AROUND, AROUND_CHARS = 20_000, 60, 6_000
+SPAN = re.compile(r"^@@ -[0-9,]+ \+(\d+)(?:,(\d+))? @@", re.M)
+
+
+def spans_of(udiff):
+    """`git diff -U0` of one path -> [(first, last)], the 1-based lines of the new side each hunk touches; a hunk
+    that only deletes touches the line it follows."""
+    out = []
+    for m in SPAN.finditer(udiff or ""):
+        start, count = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+        out.append((max(start, 1), max(start + count - 1, start, 1)))
+    return out
+
+
+def around(text, spans, width=AROUND, chars=AROUND_CHARS):
+    """`text` cut to each span and the lines next to it, up to `width` lines and `chars` characters either side, each
+    gap one line naming the lines it leaves out, or None when no span is given (then nothing says where the change
+    is, and the caller shows the file as before)."""
+    if not spans:
+        return None
+    # "\n" only, as git counts lines: splitlines() also breaks at \r and U+2028, and every window after one would
+    # drift off the change it is meant to show
+    parts = text.split("\n")
+    lines = [x + "\n" for x in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+    keep = []
+    for first, last in sorted(spans):
+        lo, hi = max(min(first, len(lines)), 1), min(last, len(lines))
+        took = 0
+        while lo > 1 and first - lo < width and took + len(lines[lo - 2]) <= chars:
+            lo, took = lo - 1, took + len(lines[lo - 2])
+        took = 0
+        while hi < len(lines) and hi - last < width and took + len(lines[hi]) <= chars:
+            hi, took = hi + 1, took + len(lines[hi])
+        if keep and lo <= keep[-1][1] + 1:
+            keep[-1] = (keep[-1][0], max(keep[-1][1], hi))
+        elif lo <= hi:
+            keep.append((lo, hi))
+    out, at = [], 1
+    for lo, hi in keep:
+        if lo > at:
+            out.append(f"(… lines {at}-{lo - 1} of {len(lines)} not shown …)\n")
+        out.append("".join(lines[lo - 1:hi]))
+        if out[-1] and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        at = hi + 1
+    if at <= len(lines):
+        out.append(f"(… lines {at}-{len(lines)} of {len(lines)} not shown …)\n")
+    return "".join(out)
 
 
 BINARY_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".otf", ".ttf", ".woff", ".woff2", ".gpg",
@@ -849,13 +929,19 @@ def merged_files(root, base, head, files, dropped=(), whole=()):
     a file cut at FILE_CAP or left out when the block is full unless its whole diff is shown (`whole`, from
     whole_paths(): then the cut is a note), a binary change unread_binary() names, a symlink or a submodule (gitlink)
     added, changed or removed, and a file git cannot show. A file is "deleted" only when the merged tree has no entry
-    for it."""
+    for it.
+    A file whose whole change is in the diff (`whole`) and that is over WHOLE_UNDER characters is shown around its
+    changes (around(): up to AROUND lines and AROUND_CHARS characters either side of each hunk of `git diff -U0
+    <merge-base> <merged tree>`), with a note saying so; every line the change touches is in the diff, so this is
+    context, not a flag. If git gives no hunk for it, it is shown as before."""
     with blind(root, base, head) as (got, run):
         if run is None:
             return "\n".join(file_block(p, "?", "?", unseen=["git could not read this change"]) for p in files)
         base, head = got[1]
         rc, tree = run("merge-tree", "--write-tree", "-z", base, head)
         tree = tree.split("\0")[0].strip() if not rc and tree.strip() else head
+        rc, mb = run("merge-base", base, head)
+        mb = "" if rc else mb.strip()
         out, total = [], 0
         for p in files:
             (old_mode, old_id), (new_mode, new_id) = entry(run, base, p), entry(run, tree, p)
@@ -880,7 +966,11 @@ def merged_files(root, base, head, files, dropped=(), whole=()):
                                       unseen + ([f"binary, {why}"] if why else []), exempt=not why))
                 continue
             diffed = p in whole and not unseen
-            body = text[:FILE_CAP]
+            near = None
+            if diffed and mb and len(text) > WHOLE_UNDER:
+                rc, u = run("diff", *PLAIN_DIFF, "-U0", mb, tree, "--", p)
+                near = None if rc else around(text, spans_of(u))
+            body = (near if near is not None else text)[:FILE_CAP]
             if total + len(body) > FILES_CAP:
                 if diffed:
                     out.append(file_block(p, *modes, ["not shown here, the files block is full; its whole diff is in "
@@ -890,7 +980,10 @@ def merged_files(root, base, head, files, dropped=(), whole=()):
                 continue
             total += len(body)
             notes = []
-            if len(body) < len(text) and diffed:
+            if near is not None:
+                notes.append(f"shown around its changes, {len(body)} of {len(text)} characters; its whole diff is in "
+                             "`diff`")
+            elif len(body) < len(text) and diffed:
                 notes.append(f"shown to {FILE_CAP // 1000} kB of {len(text)} characters; its whole diff is in `diff`")
             elif len(body) < len(text):
                 unseen.append(f"cut at {FILE_CAP // 1000} kB of {len(text)} characters")

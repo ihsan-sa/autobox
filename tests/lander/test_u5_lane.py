@@ -517,8 +517,8 @@ class RealUnits(TL.Fixture):
 
     def test_a_big_file_changed_in_one_small_hunk_is_flagged_only_when_its_diff_is_cut(self):
         """A 560 kB file on main changes one line past the 60 kB cut. Its diff section is whole, so the files block
-        shows it to 60 kB with a note, not a flag; the changed line is in the diff. With the diff cut before that
-        section, the path is FLAGGED for both cuts."""
+        shows it around that line with a note, not a flag; the changed line is in the diff too. With the diff cut
+        before that section, the path is FLAGGED for both cuts."""
         lines = [f"line {i}\n" for i in range(56_000)]
         self.main({"c/big.py": "".join(lines)})
         lines[40_000] = "line 40000 CHANGED\n"
@@ -530,10 +530,11 @@ class RealUnits(TL.Fixture):
         self.assertIn("+line 40000 CHANGED\n", diff)
         self.assertEqual((RV.cut_paths(diff, files), RV.whole_paths(diff, files)), ([], ["c/big.py"]))
         block = RV.merged_files(self.work, base, head, files, [], RV.whole_paths(diff, files))
-        header = block.split("\n", 1)[0]
-        self.assertEqual(header, f"=== c/big.py (old mode 100644, new mode 100644; shown to 60 kB of "
-                                 f"{len(''.join(lines))} characters; its whole diff is in `diff`)")
-        self.assertNotIn("CHANGED", block)
+        header, body = block.split("\n", 1)
+        self.assertEqual(header, f"=== c/big.py (old mode 100644, new mode 100644; shown around its changes, "
+                                 f"{len(body)} of {len(''.join(lines))} characters; its whole diff is in `diff`)")
+        self.assertEqual(body, "(… lines 1-39940 of 56000 not shown …)\n" + "".join(lines[39_940:40_061])
+                         + "(… lines 40062-56000 of 56000 not shown …)\n")
         with mock.patch.object(RV, "DIFF_CAP", 200):
             dropped, whole = RV.cut_paths(diff, files), RV.whole_paths(diff, files)
             self.assertEqual((dropped, whole), (["c/big.py"], []))
