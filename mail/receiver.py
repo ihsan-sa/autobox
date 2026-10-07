@@ -74,7 +74,13 @@ held mail the only word its sender gets until a person decides — and it is wri
                                             sent copy keeps it (SENT MAIL, below). `html` makes the mail multipart/alternative with the
                                             body as its plain-text fallback, and each of `images` is shown in
                                             the HTML as cid:<its file name> (.png/.jpg/.gif), under the same
-                                            rules and cap as an attachment. Without html the mail is text. Every file named is attached, or the mail is not sent
+                                            rules and cap as an attachment. Without html the mail is text. A .pdf is never attached: it goes
+                                            as a line at the end of the body (and the html) linking to its
+                                            library document — private to every recipient who is not the owner
+                                            (MAIL_WORKSPACE `addr=owner` rows), signed-in when the owner is all
+                                            of them — and a PDF not yet filed (`cc-docs file`), or one outside
+                                            the trees a file may attach from, stops the mail.
+                                            Every other file named is attached, or the mail is not sent
                                             and the line names the file and why (a file attaches only from
                                             under MAIL_OUT_ROOTS or ~/.cc/slack/files, and under the byte
                                             cap). `thread` is the Slack thread the mail is started from —
@@ -1185,7 +1191,8 @@ def cmd_show(opt):
 # secret in memory for the life of a process that answers a public tunnel. `send` reads them per run instead,
 # which costs a few forks in a command a person typed and means an owner's edit is live on the next one.
 SEND_KEYS = ("MAIL_SEND_URL", "MAIL_SEND_SECRET", "MAIL_DOMAIN", "MAIL_SEND_FROM", "MAIL_SEND_ALLOW",
-             "MAIL_ALLOW", "MAIL_OUT_PER_HOUR", "MAIL_OUT_PER_DAY", "MAIL_OUT_ROOTS", "MAIL_OUT_MAX_ATTACH_BYTES")
+             "MAIL_ALLOW", "MAIL_OUT_PER_HOUR", "MAIL_OUT_PER_DAY", "MAIL_OUT_ROOTS", "MAIL_OUT_MAX_ATTACH_BYTES",
+             "MAIL_WORKSPACE")   # MAIL_WORKSPACE: its `addr=owner` rows say who gets a signed-in PDF link (outbound.pdf_links)
 SEND_JSON_KEYS = ("to", "bcc", "subject", "body", "attachments", "thread", "html", "images")
 SEND_USAGE = ("usage: cc-mail send --json FILE   (FILE or `-`: {\"to\", \"subject\", \"body\", \"attachments\": [...], "
               "\"thread\": \"<chat_id>/<thread_ts>\"})\n"
@@ -1313,7 +1320,9 @@ def cmd_send(opt):
     stdin, which is told so rather than left waiting on a tty. Exit 1 is the mail's own refusal, from send_to().
 
     Inside a member workspace the ask is read the same and then crosses the member socket (send_across): the
-    host runs send_to for the workspace and this prints its line, exit 0/1 by the host's answer."""
+    host runs send_to for the workspace and this prints its line, exit 0/1 by the host's answer. There a PDF
+    still attaches — a member's own file is not in the owner's library — and on the host it goes as a link
+    (outbound.pdf_links)."""
     ask = send_ask(opt)
     if isinstance(ask, str):
         print(ask, file=sys.stderr)
@@ -1330,8 +1339,20 @@ def cmd_send(opt):
     # `mirrored` runs once the mail is away, for a session with a channel and for a mail that names the thread
     # it is started from: the line in that channel (under that thread) and the conversation its answer threads
     # under (the daemon's `mailed` verb). home@ with no thread gets neither, as before.
-    ok, line = outbound.send_to({k: cfg(k, "") for k in SEND_KEYS}, to, subject, body, attachments=attachments,
-                                channel=outbound.session_channel(), mirror=mirrored, thread=thread,
+    keys = {k: cfg(k, "") for k in SEND_KEYS}
+    # A PDF IS SENT AS ITS LIBRARY LINK (owner, 2026-09-28): each .pdf attachment becomes a line at the end of the
+    # body and the html, private to the recipients who are not the owner; an unfiled one stops the mail here.
+    # A blind copy is a recipient too, so the link names it, or it would get a link it cannot open. pdf_links
+    # runs send_to's recipient gate, a look at the caps and the attachment roots first: a refused mail mints nothing.
+    channel = outbound.session_channel()
+    linked = outbound.pdf_links(keys, to, attachments, bcc=bcc, channel=channel)
+    if isinstance(linked, str):
+        print(linked, file=sys.stderr)
+        return 1
+    attachments, lines = linked
+    body, html = outbound.with_links(body, html, lines)
+    ok, line = outbound.send_to(keys, to, subject, body, attachments=attachments,
+                                channel=channel, mirror=mirrored, thread=thread,
                                 html=html, images=images, bcc=bcc)
     print(line, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1

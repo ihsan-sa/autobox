@@ -1363,7 +1363,8 @@ def run():
                 c.sendall(json.dumps({"ok": True, "routed": True,
                                       "reply": "Received. It is in #mem--site."}).encode() + b"\n")
                 c.close()
-        threading.Thread(target=fake_daemon, daemon=True).start()
+        fake_t = threading.Thread(target=fake_daemon, daemon=True)
+        fake_t.start()
         code, ans = b.post(eml())
         k(code == 200 and ans["reply"] == "Received. It is in #mem--site.",
           "the daemon's line is what the worker relays to the sender")
@@ -1386,6 +1387,8 @@ def run():
         k(len(lines) == 1 and " route=yes " in lines[0],
           "the routing outcome rides in the request's ONE log line, so a mail is still one line: %r"
           % (lines[:2],))
+        srv.shutdown(socket.SHUT_RDWR)   # the thread leaves before its fd can be reused (see the quiet daemon below)
+        fake_t.join(5)
         srv.close()
         os.unlink(r.SLACKSOCK)
 
@@ -2848,7 +2851,8 @@ def run():
                            else {"ok": True, "routed": True, "reply": "Received. It is in #mem--site."})
                     c.sendall(json.dumps(ans).encode() + b"\n")
                     c.close()
-            threading.Thread(target=quiet_daemon, daemon=True).start()
+            quiet_t = threading.Thread(target=quiet_daemon, daemon=True)
+            quiet_t.start()
             b.clear()
             code, ans = b.post(eml(to="study@box.example"), rcpt="study@box.example")
             lines = b.lines()
@@ -2869,6 +2873,10 @@ def run():
               "ack line at all: nothing was sent, so nothing is on record as sent: %r" % (acks,))
             k(asked == [{"mail": ans["id"]}, {"mail": ans2["id"]}],
               "…and what crossed the socket was the id alone: MAIL_QUIET is the daemon's to read, not this process's")
+            # shut down before close, and wait for the thread: an accept() still blocked on a closed fd takes
+            # the connections of whatever socket reuses its number next (a later case's fake worker)
+            srv.shutdown(socket.SHUT_RDWR)
+            quiet_t.join(5)
             srv.close()
             os.unlink(r.SLACKSOCK)
         finally:
@@ -3426,13 +3434,13 @@ def run():
                 # (d) A FILE WITH IT is counted in the hand-over, so the channel's line can say `1 attachment`.
                 dev23 = os.path.join(b.tmp, "dev23")
                 os.makedirs(dev23)
-                pdf = os.path.join(dev23, "plan.pdf")
+                pdf = os.path.join(dev23, "plan.png")
                 with open(pdf, "wb") as f:
-                    f.write(b"%PDF plan")
+                    f.write(b"PNG plan")
                 os.environ["MAIL_OUT_ROOTS"] = dev23
                 with FakeDaemon({"ok": True, "name": "abox--fix-the-door"}) as d:
                     rc, said = send23(wt, {"to": ALLOWED, "subject": "plan", "body": "attached", "attachments": [pdf]})
-                k(rc == 0 and d.asked[0]["mailed"]["attachments"] == ["plan.pdf"],
+                k(rc == 0 and d.asked[0]["mailed"]["attachments"] == ["plan.png"],
                   "…and a file that went is named in the hand-over by its name, not its path")
                 # (e) TWO WORKSPACES, NO THREAD. One record holds one workspace, so the daemon refuses a mail
                 # written to people in two of them and the sender's line says so. What that buys is the second
@@ -4004,6 +4012,127 @@ def run():
           "`cc-mail send` inside a member boundary hands its bcc across the socket as the ask's `bcc`")
         k(rc26_ref == 1 and ("bcc %s" % STRANGER) in erred26_ref,
           "…and the host's refusal of an unverified blind copy is the line, on stderr, exit 1")
+
+    # ------------------------------- 27. a PDF goes out as its library link, never attached (owner, 2026-09-28)
+    # cc-docs is a fake named by CC_DOCS_BIN: it logs its argv, prints one URL for a filed path and refuses a path
+    # with "unfiled" in it. The owner is whoever MAIL_WORKSPACE writes as `addr=owner`.
+    BOSS = "boss@owner.example"
+    with Box(allow=ALLOWED + "," + BOSS) as b:
+        fake_docs, argv27 = os.path.join(b.tmp, "cc-docs"), os.path.join(b.tmp, "argv27")
+        with open(fake_docs, "w") as f:
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argv27 + "\n"
+                    "case \"$2\" in *unfiled*) echo \"cc-docs: $2 is not filed; file it first with \\`cc-docs file\\`\" >&2; exit 1;; esac\n"
+                    "echo https://lib.test/d/001-0003\n")
+        os.chmod(fake_docs, 0o755)
+        filed27, unfiled27, png27 = (os.path.join(b.tmp, n) for n in ("pitch.pdf", "unfiled.pdf", "chart.png"))
+        outdir27 = tempfile.mkdtemp(prefix="cc-mail-27-outside-")    # a filed PDF outside MAIL_OUT_ROOTS
+        outside27 = os.path.join(outdir27, "filed.pdf")
+        for p27 in (filed27, unfiled27, png27, outside27):
+            with open(p27, "wb") as f:
+                f.write(b"bytes")
+
+        real27 = os.path.realpath(filed27)     # cc-docs is asked with the real path the root check read off the fd
+
+        def argvs27():
+            if not os.path.exists(argv27):
+                return []
+            with open(argv27) as f:
+                out = f.read().splitlines()
+            os.remove(argv27)
+            return out
+
+        env27 = {k: "" for k in r.SEND_KEYS if k not in Box.KEYS}
+        env27.update({"MAIL_SEND_ALLOW": ALLOWED + "," + BOSS, "MAIL_SEND_SECRET": "s3cret",
+                      "MAIL_OUT_ROOTS": b.tmp, "MAIL_WORKSPACE": BOSS + "=owner", "CC_DOCS_BIN": fake_docs})
+        saved27 = {k27: os.environ.get(k27) for k27 in env27}
+        here27, out27 = os.getcwd(), sys.stdout
+
+        def send27(doc):
+            ask = os.path.join(b.tmp, "ask27.json")
+            with open(ask, "w") as f:
+                json.dump(doc, f)
+            sys.stdout = io.StringIO()
+            try:
+                return r.cmd_send({"--json": ask})
+            finally:
+                sys.stdout = out27
+
+        def files27(msg):
+            return [p.get_filename() for p in msg.iter_attachments()]
+
+        def part27(msg, ctype):
+            return next((p.get_content() for p in msg.walk() if p.get_content_type() == ctype), "")
+
+        try:
+            os.environ.update(env27)
+            os.chdir(b.tmp)
+            with FakeWorker() as w:
+                os.environ["MAIL_SEND_URL"] = w.url
+                rc1 = send27({"to": [ALLOWED, BOSS], "subject": "s", "body": "here it is", "html": "<html><body><p>hi</p></body></html>",
+                              "attachments": [filed27, png27]})
+                m1, a1 = w.calls[-1]["msg"] if w.calls else None, argvs27()
+                rc2 = send27({"to": BOSS, "subject": "s", "body": "yours", "attachments": [filed27]})
+                m2, a2 = w.calls[-1]["msg"] if len(w.calls) > 1 else None, argvs27()
+                n_before = len(w.calls)
+                rc3 = send27({"to": ALLOWED, "subject": "s", "body": "draft", "attachments": [unfiled27]})
+                n3, a3 = len(w.calls), argvs27()
+                os.environ["CC_DOCS_BIN"] = os.path.join(b.tmp, "absent")
+                rc4 = send27({"to": ALLOWED, "subject": "s", "body": "no library", "attachments": [filed27]})
+                m4 = w.calls[-1]["msg"] if len(w.calls) > n3 else None
+                os.environ["CC_DOCS_BIN"] = fake_docs
+                rc5 = send27({"to": BOSS, "bcc": ALLOWED, "subject": "s", "body": "blind", "attachments": [filed27]})
+                a5 = argvs27()
+                # A REFUSED MAIL MINTS NOTHING: a private link grants its people the document whether or not the
+                # mail goes, so the recipient gate, the caps and the attachment roots all come before cc-docs.
+                n6 = len(w.calls)
+                rc6 = send27({"to": STRANGER, "subject": "s", "body": "for you", "attachments": [filed27]})
+                rc6b = send27({"to": ALLOWED, "bcc": STRANGER, "subject": "s", "body": "for you", "attachments": [filed27]})
+                a6, n6b = argvs27(), len(w.calls)
+                rc7 = send27({"to": ALLOWED, "subject": "s", "body": "filed elsewhere", "attachments": [outside27]})
+                a7, n7 = argvs27(), len(w.calls)
+                os.environ["MAIL_OUT_PER_HOUR"] = "1"     # this box has sent several cold mails this hour already
+                rc8 = send27({"to": ALLOWED, "subject": "s", "body": "one too many", "attachments": [filed27]})
+                a8, n8 = argvs27(), len(w.calls)
+        finally:
+            sys.stdout = out27
+            os.chdir(here27)
+            shutil.rmtree(outdir27, ignore_errors=True)
+            for k27, v in saved27.items():
+                if v is None:
+                    os.environ.pop(k27, None)
+                else:
+                    os.environ[k27] = v
+        k(rc1 == 0 and m1 is not None and files27(m1) == ["chart.png"]
+          and a1 == ["link %s --kind private --to %s" % (real27, ALLOWED)]
+          and "pitch.pdf: https://lib.test/d/001-0003" in part27(m1, "text/plain")
+          and '<a href="https://lib.test/d/001-0003">pitch.pdf</a></p></body>' in part27(m1, "text/html"),
+          "`cc-mail send`: a filed PDF is not attached — a private link naming every recipient who is not the owner "
+          "ends the body and the html, and a .png beside it still attaches")
+        k(rc2 == 0 and m2 is not None and files27(m2) == [] and a2 == ["link %s --kind signed-in" % real27]
+          and "pitch.pdf: https://lib.test/d/001-0003" in part27(m2, "text/plain"),
+          "…a mail to the owner alone gets the signed-in link")
+        k(rc3 == 1 and n3 == n_before and a3 == ["link %s --kind private --to %s" % (os.path.realpath(unfiled27), ALLOWED)]
+          and "not sent — cc-docs: %s is not filed; file it first with `cc-docs file`" % os.path.realpath(unfiled27)
+          in b.err.getvalue().splitlines(),
+          "…an unfiled PDF stops the mail: nothing reaches the worker, exit 1, and the one line says to file it first")
+        k(rc4 == 0 and m4 is not None and files27(m4) == ["pitch.pdf"],
+          "…and with no cc-docs to ask, a PDF attaches as before")
+        k(rc5 == 0 and a5 == ["link %s --kind private --to %s" % (real27, ALLOWED)],
+          "…and a blind copy is a recipient the private link names, so the owner's mail with a bcc is not signed-in")
+        errs27 = b.err.getvalue().splitlines()
+        k(rc6 == 1 and rc6b == 1 and a6 == [] and n6b == n6
+          and ("%s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW when it is unset)"
+               % STRANGER) in errs27
+          and ("bcc %s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW when it is unset)"
+               % STRANGER) in errs27,
+          "…a recipient (or a blind copy) off the verified list stops the mail BEFORE cc-docs is asked: no link is "
+          "minted for somebody the mail may not reach, and the line is send_to's own")
+        k(rc7 == 1 and a7 == [] and n7 == n6
+          and any(e.startswith("filed.pdf cannot be attached — not a readable regular file under ") and e.endswith("nothing sent")
+                  for e in errs27),
+          "…a filed PDF outside MAIL_OUT_ROOTS is refused with the attachment's own line, and no link is minted")
+        k(rc8 == 1 and a8 == [] and n8 == n6 and any("MAIL_OUT_PER_HOUR=1" in e for e in errs27),
+          "…and a mail the caps would stop mints no link either")
 
     print("cc-mail selfcheck: %d passed, %d failed" % (n[0] - len(fails), len(fails)))
     return 1 if fails else 0

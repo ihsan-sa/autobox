@@ -232,10 +232,11 @@ def _prune(stamps, now, window):
     return [t for t in stamps if isinstance(t, (int, float)) and now - t < window]
 
 
-def caps(cfg, key, rcpts, now=None):
+def caps(cfg, key, rcpts, now=None, charge=True):
     """The two clocks, checked and CHARGED together. Returns "" when the mail may go, or the one line saying
     which cap stopped it. Charging inside the same lock is what stops two sessions replying at once from both
-    reading "5 of 6" and both sending.
+    reading "5 of 6" and both sending. `charge=False` only looks: pdf_links asks it before it mints a link, so
+    a mail the caps would stop mints nothing, and send_to charges the slot when the mail goes.
 
     THE THREAD'S CAP IS CHECKED FIRST because it is the one a runaway session hits: a loop posting in one
     thread is many mails to the same few people, and stopping it at the thread costs one line, where stopping
@@ -254,6 +255,8 @@ def caps(cfg, key, rcpts, now=None):
         over = [(a, n) for a, n in over if n >= pd]
         if over:
             return "%s already had %d mails today (MAIL_OUT_PER_DAY=%d)" % (over[0][0], over[0][1], pd)
+        if not charge:
+            return ""
         threads[key] = mine + [now]
         for a in rcpts:
             people[a] = _prune(people.get(a) or [], now, 86400) + [now]
@@ -471,6 +474,25 @@ NOT_OURS = "not in a tree a mail may attach from"
 TOO_BIG = "too large to attach"
 
 
+def _open_ours(path, rec, cfg):
+    """(fd, fstat, real path) of `path` opened ONCE, when it is a regular file whose real place is inside the
+    workspace's own trees (in_workspace) — else (None, None, ""). The caller closes the fd. This is the whole of
+    the root and workspace check: attach_bytes() reads its bytes off the fd, real_if_ours() wants only where it is."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None, None, ""          # missing, unreadable, a symlink, a directory — none of them travel
+    try:
+        st = os.fstat(fd)
+        real = os.readlink("/proc/self/fd/%d" % fd) if stat.S_ISREG(st.st_mode) else ""
+        if real and not real.endswith(" (deleted)") and in_workspace(real, rec, cfg):
+            return fd, st, real
+    except OSError:
+        pass                           # no /proc, no proof of where this fd is: it does not leave
+    os.close(fd)
+    return None, None, ""
+
+
 def attach_bytes(path, rec, cfg, cap):
     """The bytes to attach, read from ONE open file descriptor, or (None, why) when the file does not travel.
 
@@ -482,20 +504,10 @@ def attach_bytes(path, rec, cfg, cap):
     was, /proc/self/fd/<n> says where that fd actually is (which catches a symlinked DIRECTORY on the way,
     which O_NOFOLLOW does not), and the read stops at cap+1 bytes so a file that grew after the fstat is
     still capped. The bytes handed back are the ones the checks were made against."""
+    fd, st, _real = _open_ours(path, rec, cfg)
+    if fd is None:
+        return None, NOT_OURS
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
-    except OSError:
-        return None, NOT_OURS          # missing, unreadable, a symlink, a directory — none of them travel
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            return None, NOT_OURS
-        try:
-            real = os.readlink("/proc/self/fd/%d" % fd)
-        except OSError:
-            return None, NOT_OURS      # no /proc, no proof of where this fd is: it does not leave
-        if real.endswith(" (deleted)") or not in_workspace(real, rec, cfg):
-            return None, NOT_OURS
         if st.st_size > cap:
             return None, TOO_BIG       # the common case, and no byte of it is read
         data = b""
@@ -511,6 +523,27 @@ def attach_bytes(path, rec, cfg, cap):
         return None, NOT_OURS
     finally:
         os.close(fd)
+
+
+def real_if_ours(path, rec, cfg):
+    """The real path of a file that may leave in this workspace's mail, by attach_bytes()'s own check, or "".
+    A PDF that goes as a library link passes this first (pdf_links, cc-slack's pdf_link_post): a link carries
+    the document as surely as an attachment does, so a file no mail may attach gets no link either. No byte
+    is read and there is no size cap, because a link has no size."""
+    fd, _st, real = _open_ours(path, rec, cfg)
+    if fd is None:
+        return ""
+    os.close(fd)
+    return real
+
+
+def link_refusal(path, rec, cfg):
+    """"" when a PDF answering the mail `rec` may go as its link, else the thread's 📎 line, the one attach_check
+    gives a file out of tree."""
+    if real_if_ours(path, rec, cfg):
+        return ""
+    log("%s: refused before the link — %s: %s" % (rec.get("id"), clip(os.path.basename(path)), NOT_OURS))
+    return not_attached(path, rec, cfg, NOT_OURS, 0) + ". Nothing was sent, to Slack or by mail"
 
 
 def link_for(path, cfg):
@@ -889,6 +922,120 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
 COLD_KEY = "cold"       # every cold mail shares one per-hour bucket: see send_to()
 
 
+def docs_bin():
+    """The cc-docs a PDF's library link comes from: CC_DOCS_BIN when set, else core/bin/cc-docs beside this tree."""
+    return os.environ.get("CC_DOCS_BIN") or os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                                                         "bin", "cc-docs")
+
+
+def owner_addrs(cfg):
+    """The owner's own addresses: the MAIL_WORKSPACE rows the owner wrote as `addr=owner`. The only local record of
+    who the owner is by mail — the router's other test is a Slack lookup — so an address with no such row counts as
+    somebody else's, and the library drops an owner named on a private link by itself."""
+    return {a for a, ws in _router().overrides(cfg.get("MAIL_WORKSPACE") or "").items() if ws == "owner"}
+
+
+def cold_refused(line):
+    """A cold mail's refusal: logged, and handed back as the caller's one line."""
+    log("%s: not sent — %s" % (COLD_KEY, line))
+    return line
+
+
+def cold_not_ours(path, rec, cfg):
+    return "%s cannot be attached — not a readable regular file under %s — nothing sent" % (
+        clip(os.path.basename(path)), trees(rec, cfg))
+
+
+def cold_gate(cfg, to, bcc, channel):
+    """send_to's checks on WHO a cold mail goes to, before anything else is looked at -> (to addresses, blind
+    addresses, From, "") or ([], [], "", the refusal line). pdf_links runs the same gate before it mints a link,
+    so a mail this refuses never leaves a link behind for somebody it was not allowed to reach."""
+    rcpts, blind, allowed = [], [], verified(cfg)
+    for piece in (to if isinstance(to, (list, tuple)) else re.split(r"[,\s]+", str(to or ""))):
+        a = _norm(piece)
+        if a and a not in rcpts:
+            rcpts.append(a)
+    for piece in (bcc if isinstance(bcc, (list, tuple)) else re.split(r"[,\s]+", str(bcc or ""))):
+        a = _norm(piece)
+        if a and a not in rcpts and a not in blind:
+            blind.append(a)
+    if not rcpts:
+        return [], [], "", "no recipient"
+    if not configured(cfg):
+        return [], [], "", "sending is off — MAIL_SEND_URL or MAIL_SEND_SECRET is unset"
+    from_a = cold_from(cfg, channel)
+    if not from_a:
+        return [], [], "", "no address of ours to send from — set MAIL_DOMAIN, or MAIL_SEND_FROM on that domain"
+    unknown = [a for a in rcpts if a not in allowed]
+    if unknown:
+        return [], [], "", ("%s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW when "
+                            "it is unset)" % clip(unknown[0]))
+    # "every bcc address passes the same verified-list check as to ... a refused bcc refuses the whole send"
+    unknown = [a for a in blind if a not in allowed]
+    if unknown:
+        return [], [], "", ("bcc %s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW "
+                            "when it is unset)" % clip(unknown[0]))
+    return rcpts, blind, from_a, ""
+
+
+def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace="", now=None):
+    """A PDF goes out as a link to its library document, never attached (owner, 2026-09-28). Returns (the attachments
+    left to attach, the link lines) or a str saying why nothing may be sent. Each .pdf is asked of
+    `cc-docs link <path>`: private `--to` every recipient (blind copies too) that is not the owner's, signed-in
+    when the owner is all of them. A PDF nobody filed is cc-docs' own refusal, which says to file it first. With
+    no cc-docs beside this tree the PDFs stay attachments, as before.
+
+    NOTHING IS MINTED FOR A MAIL THAT WILL NOT GO. A private link grants its people the document on the site
+    whether or not the mail carrying it is sent, so before cc-docs is asked anything the mail passes send_to's
+    own gate on its recipients (cold_gate) and a look at the caps that does not charge them, and every PDF passes
+    the root and workspace check an attachment does (real_if_ours), refused with the line an attachment gets.
+    cc-docs is handed the real path that check read off the open file."""
+    pdfs = [a for a in attachments or [] if str(a).lower().endswith(".pdf")]
+    exe = docs_bin()
+    if not pdfs or not os.access(exe, os.X_OK):
+        return list(attachments or []), []
+    rcpts, blind, _from, why = cold_gate(cfg, to, bcc, channel)
+    why = why or caps(cfg, COLD_KEY, rcpts + blind, now=now, charge=False)
+    if why:
+        return cold_refused(why)
+    rec = {"workspace": (workspace or "").strip()}
+    reals = []
+    for a in pdfs:
+        real = real_if_ours(os.path.expanduser(str(a).strip()), rec, cfg)
+        if not real:
+            return cold_refused(cold_not_ours(a, rec, cfg))
+        reals.append((a, real))
+    mine = owner_addrs(cfg)
+    others = [a for a in rcpts + blind if a not in mine]
+    kind = ["--kind", "private"] + [x for a in others for x in ("--to", a)] if others else ["--kind", "signed-in"]
+    run = run or __import__("subprocess").run
+    lines = []
+    for a, real in reals:
+        try:
+            r = run([exe, "link", real] + kind, capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            return "not sent — the library did not answer for %s's link (%s)" % (os.path.basename(a), clip(str(e)))
+        out = (r.stdout or "").strip().splitlines()
+        if r.returncode != 0 or len(out) != 1 or not re.fullmatch(r"https?://\S+", out[0].strip()):
+            why = ((r.stderr or "").strip().splitlines() or ["cc-docs link exit %d" % r.returncode])[-1]
+            return "not sent — %s" % why
+        lines.append((os.path.basename(a), out[0].strip()))
+    return [a for a in attachments if a not in pdfs], lines
+
+
+def with_links(body, html, lines):
+    """body and html with one `name: url` line per PDF link at the end — the html's before its </body>."""
+    if not lines:
+        return body, html
+    body = (body or "").rstrip("\n") + "\n\n" + "\n".join("%s: %s" % l for l in lines) + "\n"
+    if html:
+        import html as H_
+        block = "".join('<p><a href="%s">%s</a></p>' % (H_.escape(u, quote=True), H_.escape(n)) for n, u in lines)
+        i = html.lower().rfind("</body>")
+        html = html[:i] + block + html[i:] if i >= 0 else html + block
+    return body, html
+
+
 def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace="",
             html="", images=None, bcc=None):
     """A MAIL WITH NO MAIL BEHIND IT — the box writing to somebody first. Returns (sent?, one line).
@@ -966,37 +1113,14 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     record is never the one a reply names — see build()). A session with no channel gets the same through
     `thread`. An answer to a mail from a channel-less session that named no thread (home@) still arrives at
     the door as a new mail and is routed like one."""
-    rcpts, blind, allowed = [], [], verified(cfg)
-    for piece in (to if isinstance(to, (list, tuple)) else re.split(r"[,\s]+", str(to or ""))):
-        a = _norm(piece)
-        if a and a not in rcpts:
-            rcpts.append(a)
-    for piece in (bcc if isinstance(bcc, (list, tuple)) else re.split(r"[,\s]+", str(bcc or ""))):
-        a = _norm(piece)
-        if a and a not in rcpts and a not in blind:
-            blind.append(a)
     subject, body = str(subject or "").strip() or "(no subject)", plain(text)
 
     def refuse(line):
-        log("%s: not sent — %s" % (COLD_KEY, line))
-        return False, line
+        return False, cold_refused(line)
 
-    if not rcpts:
-        return refuse("no recipient")
-    if not configured(cfg):
-        return refuse("sending is off — MAIL_SEND_URL or MAIL_SEND_SECRET is unset")
-    from_a = cold_from(cfg, channel)
-    if not from_a:
-        return refuse("no address of ours to send from — set MAIL_DOMAIN, or MAIL_SEND_FROM on that domain")
-    unknown = [a for a in rcpts if a not in allowed]
-    if unknown:
-        return refuse("%s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW when "
-                      "it is unset)" % clip(unknown[0]))
-    # "every bcc address passes the same verified-list check as to ... a refused bcc refuses the whole send"
-    unknown = [a for a in blind if a not in allowed]
-    if unknown:
-        return refuse("bcc %s is not one of the box's verified destinations (MAIL_SEND_ALLOW, or MAIL_ALLOW when "
-                      "it is unset)" % clip(unknown[0]))
+    rcpts, blind, from_a, why = cold_gate(cfg, to, bcc, channel)
+    if why:
+        return refuse(why)
     paths = [str(p).strip() for p in (attachments or []) if str(p or "").strip()]
     html = str(html or "")
     pics = [str(p).strip() for p in (images or []) if str(p or "").strip()]
@@ -1029,8 +1153,7 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
                           % (clip(os.path.basename(path)),
                              "%d MiB" % (cap // (1024 * 1024)) if cap >= 1024 * 1024 else "%d-byte" % cap))
         if why:
-            return refuse("%s cannot be attached — not a readable regular file under %s — nothing sent"
-                          % (clip(os.path.basename(path)), trees(rec, cfg)))
+            return refuse(cold_not_ours(path, rec, cfg))
         attach.append((path, data))
     inline = []
     for path in pics:

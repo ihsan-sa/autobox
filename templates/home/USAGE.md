@@ -115,7 +115,7 @@ How the conversation itself works — channels, threads, marks, who may do what,
 - **Both graphs in a browser (`cc-graphs`).** `cc-graphs serve` puts token spend over time and the same cc-vitals series on `http://127.0.0.1:5190/`, interactive: pick the window, the metric (tokens, output tokens, or the dollar estimate) and what a line is — lane, track, repo, model or kind. Also `cc-graphs stop|status`, `--port`, `--foreground`, and `cc-graphs tokens --by track` for the same series as JSON. It binds loopback and answers GET only, and it never exposes itself: one `tailscale serve` line does that and it is the owner's to run. What a line on the token graph means, and what it leaves out, is the header of `core/bin/cc-graphs`.
 
 ## E-mail (`cc-mail`)
-- The box has a mail address of its own. A mail it receives gets a mirror thread in Slack, and a reply there goes back as mail by itself; a mail the box starts is one JSON file (`to`, `subject`, `body`, `attachments`) handed to `cc-mail send --json FILE`, only to an address you have verified (`MAIL_SEND_ALLOW`); a `bcc` key (or `--bcc A,B`) sends blind copies, each checked against the same list, named in no header and kept in the sent record; a named file is attached or the mail is not sent and the line says which and why. Every session kind is told this at start (`config/mail-prompt.md`), so any channel can be asked for a mail. Setup and the wire: `cc-mail --help`.
+- The box has a mail address of its own. A mail it receives gets a mirror thread in Slack, and a reply there goes back as mail by itself; a mail the box starts is one JSON file (`to`, `subject`, `body`, `attachments`) handed to `cc-mail send --json FILE`, only to an address you have verified (`MAIL_SEND_ALLOW`); a `bcc` key (or `--bcc A,B`) sends blind copies, each checked against the same list, named in no header and kept in the sent record; a named file is attached or the mail is not sent and the line says which and why, except a PDF, which goes as a link to its library document. Every session kind is told this at start (`config/mail-prompt.md`), so any channel can be asked for a mail. Setup and the wire: `cc-mail --help`.
 
 ## Check in from Claude.ai / Claude Desktop
 - Through the Slack connector: claude.ai posts as you into your channels — no extra server on the box.
@@ -144,4 +144,6 @@ How the conversation itself works — channels, threads, marks, who may do what,
                                          or words prints the current revision's file; `--attach F` (repeatable) or
                                          `cc-docs attach PPP-NNNN F…` keeps supporting files beside it (Gerbers, BOM,
                                          a zip), downloadable from its page; `cc-docs --help`
+    cc-docs link <number> [--kind private --to A | --kind public]   the link a PDF goes out as (signed-in by default);
+                                         `file` and `cc-mail send` turn a filed PDF into it and refuse an unfiled one
     cc-unfiled [--hours 24] [--to F]     PDFs built lately that look finished but are not filed; a daily timer runs it

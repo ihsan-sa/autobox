@@ -165,6 +165,22 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         under the new one, each public link stops working, and the old number is retired. A move that would
         change who can see the document (to or from a member's project) is refused. Prints
         `<old number>\t<new number>\t<path>` per revision.
+    cc-docs link <PPP-NNNN | PPP-NNNN-R | path of a filed PDF> [--kind signed-in|private|public] [--to <email>]…
+                 [--name <n>] [--pin]
+        Mints a link to a filed document on the library site and prints exactly its url, one line, exit 0: hand that
+        out instead of the PDF. PPP-NNNN follows the newest revision; PPP-NNNN-R is pinned to that revision. A path
+        is the document its filed copy is (by real path under files/, else by the sha256 of a filed copy, else by
+        the fingerprint of the PDF it was filed from, which leaves the stamp out), and the link follows the newest
+        revision unless --pin pins it to the one the path is (--pin on a bare number pins the current one). --kind signed-in (the default) opens for whoever may see the document on the site;
+        private opens for the people named by --to (repeatable, `Name <addr>` accepted, required with private and
+        refused with any other kind); public opens for anyone. --name labels the link on the site. The site reuses
+        an identical link it already has, so the box keeps no link state and a second call prints the same url.
+        A PDF that is not filed, an unknown or retired number, or an unknown revision exits 1. When the site cannot
+        mint (no service token, no network, refused, or it has not seen the document yet), signed-in prints
+        <LIBRARY_URL>/d/<PPP-NNNN> instead, the document's page, which opens for the same people, with a line on
+        stderr saying why, exit 0; private and public exit 1 with the reason. LIBRARY_URL unset exits 1 for every
+        kind. It POSTs {target: {number, rev|null}, kind, people?, name?} to <LIBRARY_URL>/api/links with the box's
+        own Access service token, and waits 20 s.
     cc-docs selfcheck
 
 INSIDE A MEMBER WORKSPACE (CC_MEMBER_SANDBOX=1) the register is that member's read-only view, so `file` and `number`
@@ -176,7 +192,7 @@ a PDF or --source outside the workspace's own trees (~/dev/<h>, its track worktr
 is not a PDF, and one over 64 MiB; reads the PDF from one fd so it cannot be swapped between the check and the
 read; and ignores --kind. A project an owner's maker names that is not the member's files under the member's own
 instead, so a build that sets DOC_PROJECT still files. `project`, `star`, `public`, `token`, `fold`, `retire`,
-`move`, `attach`, `backfill-sources`, `check`, `pdf` and `gone` are refused inside, and so is `file --attach`.
+`move`, `attach`, `backfill-sources`, `check`, `link`, `pdf` and `gone` are refused inside, and so is `file --attach`.
 
 QUARANTINE: a workspace marked quarantined (~/.cc/members/<h>/quarantined, a regular file; `cc-lib quarantine <h>`)
 files nothing. `file` is refused when the project is its member project, --member names it, the asking workspace is it,
@@ -211,7 +227,9 @@ it prints one JSON {ok, engine, main, errors: [{path, line, message}], missing: 
 compiled, 1 when it did not, anything else when it could not run; it has 120 s. Unset, a source is kept unchecked
 and `check` refuses. DOCS_TEX_TREES, the house styles, space-separated ROOT:SUB entries (a maker puts ROOT/SUB on
 TEXINPUTS recursively). DOCS_CHECK_CHANNEL, where `check --post` posts; unset, it posts nothing and a filing starts
-no check. DOCS_PUBLIC_HOOK, where public links are served, a command split like a shell line and run as
+no check. LIBRARY_URL, the library site's origin, for `link`, which authenticates with LIBRARY_LINK_CLIENT_ID and
+LIBRARY_LINK_CLIENT_SECRET when both are set, else LIBRARY_FEEDBACK_CLIENT_ID and LIBRARY_FEEDBACK_CLIENT_SECRET; the
+secret is never printed. DOCS_PUBLIC_HOOK, where public links are served, a command split like a shell line and run as
 `<cmd> on|off <token> <PPP-NNNN-R>` with 30 s: `public` calls it both ways; `fold` calls it off for each token it drops
 and refuses, folding nothing, when that fails (a letter it frees goes to another revision); `move` and `retire` call it
 off after and say on stderr how to finish by hand when it fails. Unset, a token is only the register's.
@@ -2596,6 +2614,131 @@ def cmd_move(a):
     return 0
 
 
+# ── links on the library site ────────────────────────────────────────────────────────────────────────────────
+LINK_KINDS = ("signed-in", "private", "public")
+LINK_WAIT = 20            # seconds the site has to mint a link
+
+
+def link_target(reg, what, pin):
+    """-> (PPP-NNNN, rev or None): a number as given (--pin pins a bare one to its current revision), or the
+    document a filed PDF is, found by its real path under the register, else by its bytes, else by its fingerprint
+    (the PDF it was filed from, before the stamp), one filed from this same path first."""
+    m = NUM.match(what)
+    if m:
+        num = f"{m.group(1)}-{m.group(2)}"
+        d = reg["documents"].get(num)
+        if not d or not d["revisions"]:
+            raise Refused(f"no document {num}" + (" (it was retired)" if num in reg.get("retired", {}) else ""))
+        rev = m.group(3)
+        if rev and not any(r["rev"] == rev for r in d["revisions"]):
+            raise Refused(f"{num} has no revision {rev}")
+        return num, rev or (current(d)["rev"] if pin else None)
+    if not os.path.isfile(what):
+        raise Refused(f"{what}: no such file, and not a number like PPP-NNNN or PPP-NNNN-R")
+    real = os.path.realpath(what)
+    with open(real, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    hits = [(n, r) for n, d in reg["documents"].items() for r in d["revisions"]
+            if os.path.realpath(os.path.join(ROOT, r["file"])) == real]
+    hits = hits or [(n, r) for n, d in reg["documents"].items() for r in d["revisions"] if r.get("sha256") == sha]
+    if not hits:
+        # the PDF a session built and then filed: the filed copy carries a stamp its build does not, so neither the
+        # path nor the bytes match, but the fingerprint (which leaves the stamp out) does. The FULL print only: the
+        # text-only one `file` still accepts as unchanged would hand a different drawing with the same words the
+        # link to somebody else's document
+        fp = fingerprint(real, pdftext(real))
+        hits = [(n, r) for n, d in reg["documents"].items() for r in d["revisions"] if r.get("fingerprint") == fp]
+        hits = sorted(hits, key=lambda h: os.path.realpath(h[1].get("from") or "") != real)
+    if not hits:
+        raise Refused(f"{what} is not filed; file it first with `cc-docs file`")
+    n, r = hits[0]
+    return n, r["rev"] if pin else None
+
+
+def link_people(kind, to):
+    if to and kind != "private":
+        raise Refused("--to is only for --kind private")
+    if kind == "private" and not to:
+        raise Refused("--kind private needs at least one --to <email>")
+    import email.utils
+    people = []
+    for t in to or ():
+        addr = email.utils.parseaddr(t)[1].strip()
+        if not re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", addr):
+            raise Refused(f"--to {t!r} is not an email address")
+        if addr.lower() not in (p.lower() for p in people):
+            people.append(addr)
+    return people
+
+
+def link_credentials():
+    """The box's own service token: LIBRARY_LINK_* when both are set, else LIBRARY_FEEDBACK_*. Nothing else."""
+    for pre in ("LIBRARY_LINK_", "LIBRARY_FEEDBACK_"):
+        cid, secret = conf(pre + "CLIENT_ID"), conf(pre + "CLIENT_SECRET")
+        if cid and secret:
+            return cid, secret
+    return None
+
+
+def mint_link(site, cred, body):
+    """POST the site's /api/links -> its url. Raises Refused with a one-line reason; never names the secret."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(site + "/api/links", data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "cc-docs",
+                                          "Cf-Access-Client-Id": cred[0], "Cf-Access-Client-Secret": cred[1]})
+    try:
+        with urllib.request.urlopen(req, timeout=LINK_WAIT) as r:
+            got = json.loads(r.read(1 << 20) or b"null")
+    except urllib.error.HTTPError as e:
+        why = {403: "the site refused the service token", 404: "the site does not know that document yet",
+               400: "the site called the request malformed"}.get(e.code, f"the site answered {e.code}")
+        try:
+            detail = json.loads(e.read(4096)).get("error")
+        except Exception:
+            detail = None
+        raise Refused(why + (f" ({str(detail)[:200]})" if detail else ""))
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise Refused(f"the site could not be reached ({getattr(e, 'reason', e)})")
+    url = got.get("url") if isinstance(got, dict) else None
+    if not isinstance(url, str) or not re.match(r"https?://\S+$", url):
+        raise Refused("the site's answer carried no url")
+    return url
+
+
+def cmd_link(a):
+    """Print a link to a filed document; every refusal exits 1 (the contract callers code against)."""
+    site = conf("LIBRARY_URL").strip().rstrip("/")
+    try:
+        if not site:
+            raise Refused("no library site: set it with `cc-config set LIBRARY_URL <site>`")
+        people = link_people(a.kind, a.to)
+        num, rev = link_target(load(), a.target, a.pin)
+    except Refused as e:
+        print(f"cc-docs: {e}", file=sys.stderr)
+        return 1
+    body = {"target": {"number": num, "rev": rev}, "kind": a.kind}
+    if people:
+        body["people"] = people
+    if a.name:
+        body["name"] = a.name
+    cred = link_credentials()
+    try:
+        if not cred:
+            raise Refused("no service token (LIBRARY_LINK_CLIENT_ID/SECRET or LIBRARY_FEEDBACK_CLIENT_ID/SECRET)")
+        url = mint_link(site, cred, body)
+    except Refused as e:
+        if a.kind != "signed-in":
+            print(f"cc-docs: no {a.kind} link to {num}: {e}", file=sys.stderr)
+            return 1
+        # the document's own page opens for the same people a signed-in link does
+        url = f"{site}/d/{num}"
+        print(f"cc-docs: no link minted ({e}); giving the document's page instead"
+              + (f", which shows its newest revision, not {rev}" if rev else ""), file=sys.stderr)
+    print(url)
+    return 0
+
+
 # ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
 # ── a member workspace files across its socket ───────────────────────────────────────────────────────────────
 # Inside a member's sandbox ~/.cc/documents is that member's read-only view, so `file` and `number` there cannot
@@ -2799,7 +2942,8 @@ def selfcheck():
     """The cases, in a config of their own: no key of the box's ~/.cc/config (a live DOCS_SOURCE_CHECK or
     DOCS_CHECK_CHANNEL) reaches them, and each case sets the keys it tests in the environment, which wins."""
     keys = ("CC_CONFIG", "DOCS_SOURCE_CHECK", "DOCS_TEX_TREES", "DOCS_CHECK_CHANNEL", "DOCS_PUBLIC_HOOK", "CC_SLACK_BIN",
-            "TEXINPUTS")
+            "TEXINPUTS", "LIBRARY_URL", "LIBRARY_LINK_CLIENT_ID", "LIBRARY_LINK_CLIENT_SECRET",
+            "LIBRARY_FEEDBACK_CLIENT_ID", "LIBRARY_FEEDBACK_CLIENT_SECRET")
     saved = {k: os.environ.pop(k, None) for k in keys}
     os.environ["CC_CONFIG"] = "/nonexistent/cc-docs-selfcheck-config"
     try:
@@ -3376,7 +3520,10 @@ def _selfcheck():
             rct, ot = run("token", "x", f"{k1[0]}-0001-A")
             rcr, orr = run("retire", f"{k1[0]}-0001")
             rcf, of = run("fold", f"{k1[0]}-0001", f"{k1[0]}-0002")
+            os.environ["LIBRARY_URL"] = "http://127.0.0.1:1"
+            rcl, ol = run("link", f"{k1[0]}-0001", "--kind", "public")
         finally:
+            os.environ.pop("LIBRARY_URL", None)
             IN_SANDBOX = False
             srv.close()
         reg = load()
@@ -3393,6 +3540,8 @@ def _selfcheck():
         ok("inside a workspace retire and fold are refused, and both documents stay",
            rcr == 2 and rcf == 2 and "the host's" in orr + of
            and f"{k1[0]}-0001" in reg["documents"] and d2)
+        ok("inside a workspace link is refused: a member mints no link on the box's token",
+           rcl == 2 and "the host's" in ol and "http" not in ol)
         ok("no incoming copy is left behind", not [x for x in os.listdir(ROOT) if x.startswith(".incoming.")])
         # sources, filer and feedback: a register of their own, a scratch Slack dir, a fixed chain of cwds
         import tarfile
@@ -4179,6 +4328,181 @@ def _selfcheck():
             IN_SANDBOX = False
         ok("inside a workspace attach and file --attach are refused", rc == 2 and "host's" in o and rc2 == 2
            and "attached on the host" in o2)
+    # link: a fake library site on 127.0.0.1 mints links, reuses an identical one, and answers what each case sets
+    import http.server
+    import threading
+
+    class Site(http.server.BaseHTTPRequestHandler):
+        seen, links, answer = [], {}, [200]
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"null")
+            Site.seen.append((self.path, self.headers.get("Cf-Access-Client-Id"),
+                              self.headers.get("Cf-Access-Client-Secret"), body))
+            code = Site.answer[0]
+            if code == 200:
+                key = json.dumps(body, sort_keys=True)
+                reused = key in Site.links
+                lid = Site.links.setdefault(key, f"L{len(Site.links) + 1}")
+                out = {"id": lid, "name": body.get("name"), "kind": body["kind"], "state": "live",
+                       "url": f"http://site.test/l/{lid}", "target": body["target"], "people": body.get("people", []),
+                       "reused": reused}
+            else:
+                out = {"error": "nope"}
+            raw = json.dumps(out).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    site = f"http://127.0.0.1:{srv.server_address[1]}"
+    lkeys = ("LIBRARY_URL", "LIBRARY_LINK_CLIENT_ID", "LIBRARY_LINK_CLIENT_SECRET", "LIBRARY_FEEDBACK_CLIENT_ID",
+             "LIBRARY_FEEDBACK_CLIENT_SECRET")
+
+    def lenv(**kv):
+        for k in lkeys:
+            os.environ.pop(k, None)
+        os.environ.update({k: v for k, v in kv.items()})
+        Site.seen.clear()
+        Site.answer[0] = 200
+
+    def last():
+        return Site.seen[-1] if Site.seen else (None, None, None, None)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="cc-docs-link-") as t:
+            ROOT = os.path.join(t, "r")
+            lsrc = os.path.join(t, "src")
+            os.makedirs(lsrc)
+            built = mkpdf(lsrc, "l1", "Link one")
+            run("file", built, "--project", "Links", "--kind", "work", "--title", "Linked")
+            run("file", mkpdf(lsrc, "l2", "Link two"), "--project", "Links", "--title", "Linked")
+            reg = load()
+            revs = reg["documents"]["001-0001"]["revisions"]
+            fa = os.path.join(ROOT, revs[0]["file"])
+            base = dict(LIBRARY_URL=site + "/", LIBRARY_FEEDBACK_CLIENT_ID="fid", LIBRARY_FEEDBACK_CLIENT_SECRET="fsec")
+
+            lenv(**base)
+            rc, o = run("link", "001-0001")
+            p, cid, sec, body = last()
+            ok("link: signed-in by default, the site's url alone on stdout, a bare number follows the newest",
+               rc == 0 and o == "http://site.test/l/L1\n" and p == "/api/links"
+               and body == {"target": {"number": "001-0001", "rev": None}, "kind": "signed-in"})
+            ok("link: the request carries the feedback service token as Access headers, and no output names it",
+               (cid, sec) == ("fid", "fsec") and "fsec" not in o)
+            rc, o2 = run("link", "001-0001")
+            ok("link: a second identical call prints the url the site reused", rc == 0 and o2 == o and len(Site.seen) == 2)
+
+            rc, o = run("link", "001-0001-A", "--kind", "public", "--name", "for the class")
+            p, cid, sec, body = last()
+            ok("link: public with a revision is pinned and carries its name",
+               rc == 0 and o.startswith("http://site.test/l/") and o.count("\n") == 1
+               and body == {"target": {"number": "001-0001", "rev": "A"}, "kind": "public", "name": "for the class"})
+
+            rc, o = run("link", "001-0001", "--kind", "private", "--to", "Ann Lee <ann@example.org>", "--to", "bob@example.org")
+            body = last()[3]
+            ok("link: private sends the people, `Name <addr>` reduced to its address",
+               rc == 0 and o.startswith("http://site.test/l/")
+               and body["kind"] == "private" and body["people"] == ["ann@example.org", "bob@example.org"])
+            n0 = len(Site.seen)
+            rc1, o1 = run("link", "001-0001", "--kind", "private")
+            rc2, o2 = run("link", "001-0001", "--to", "ann@example.org")
+            rc3, o3 = run("link", "001-0001", "--kind", "private", "--to", "not an address")
+            ok("link: private without --to, --to without private and a bad address are refused, nothing sent",
+               rc1 == 1 and "needs at least one --to" in o1 and rc2 == 1 and "only for --kind private" in o2
+               and rc3 == 1 and len(Site.seen) == n0)
+
+            lenv(**base, LIBRARY_LINK_CLIENT_ID="lid", LIBRARY_LINK_CLIENT_SECRET="lsec")
+            run("link", "001-0001")
+            ok("link: LIBRARY_LINK_* win over LIBRARY_FEEDBACK_*", last()[1:3] == ("lid", "lsec"))
+            lenv(**base, LIBRARY_LINK_CLIENT_ID="lid")
+            run("link", "001-0001")
+            ok("link: a half-set LIBRARY_LINK_* pair falls back to the feedback pair", last()[1:3] == ("fid", "fsec"))
+
+            lenv(**base)
+            rc, o = run("link", fa)
+            body = last()[3]
+            ok("link: a filed PDF's path resolves to its document and follows the newest",
+               rc == 0 and body["target"] == {"number": "001-0001", "rev": None})
+            rc, o = run("link", fa, "--pin")
+            ok("link: --pin on a path pins the revision the path is", rc == 0 and last()[3]["target"]["rev"] == "A")
+            rc, o = run("link", "001-0001", "--pin")
+            ok("link: --pin on a bare number pins its current revision",
+               rc == 0 and last()[3]["target"] == {"number": "001-0001", "rev": revs[-1]["rev"]} and revs[-1]["rev"] == "B")
+            cp = os.path.join(t, "copy.pdf")
+            shutil.copy(fa, cp)
+            rc, o = run("link", cp, "--pin")
+            ok("link: a copy of a filed PDF elsewhere resolves by its bytes",
+               rc == 0 and last()[3]["target"] == {"number": "001-0001", "rev": "A"})
+            with open(built, "rb") as f1, open(fa, "rb") as f2:
+                stamped = f1.read() != f2.read()
+            rc, o = run("link", built, "--pin")
+            ok("link: the PDF a session built and filed with a stamp resolves by its fingerprint from its build path",
+               stamped and rc == 0 and last()[3]["target"] == {"number": "001-0001", "rev": "A"})
+            n0 = len(Site.seen)
+            # a revision filed with the old text-only print: a different drawing with the same words is not it
+            twin = mkpdf(lsrc, "twin", "Link one\\par\\rule{6cm}{3cm}")
+            reg = load()
+            kept_fp = reg["documents"]["001-0001"]["revisions"][0]["fingerprint"]
+            reg["documents"]["001-0001"]["revisions"][0]["fingerprint"] = textprint(pdftext(built))
+            save(reg)
+            rc, o = run("link", twin)
+            reg = load()
+            reg["documents"]["001-0001"]["revisions"][0]["fingerprint"] = kept_fp
+            save(reg)
+            ok("link: a different PDF with the same text as a text-only-print revision is not that document — "
+               "refused, nothing sent",
+               textprint(pdftext(twin)) == textprint(pdftext(built))
+               and fingerprint(twin, pdftext(twin)) != fingerprint(built, pdftext(built))
+               and rc == 1 and "is not filed" in o and len(Site.seen) == n0)
+            loose = mkpdf(lsrc, "loose", "Never filed")
+            rc, o = run("link", loose)
+            ok("link: an unfiled PDF is refused, exit 1, nothing sent",
+               rc == 1 and f"cc-docs: {loose} is not filed; file it first with `cc-docs file`" in o and len(Site.seen) == n0)
+            rc1, o1 = run("link", "001-0009")
+            rc2, o2 = run("link", "001-0001-C")
+            ok("link: an unknown number or revision exits 1, nothing sent",
+               rc1 == 1 and "no document 001-0009" in o1 and rc2 == 1 and "no revision C" in o2 and len(Site.seen) == n0)
+
+            lenv(**base)
+            Site.answer[0] = 404
+            rc, o = run("link", "001-0001")
+            ok("link: signed-in falls back to the document's page on a 404, with the reason, exit 0",
+               rc == 0 and o.startswith(site + "/d/001-0001\n") and "does not know that document" in o)
+            rc1, o1 = run("link", "001-0001", "--kind", "public")
+            rc2, o2 = run("link", "001-0001", "--kind", "private", "--to", "ann@example.org")
+            ok("link: public and private exit 1 on a 404, with no url",
+               rc1 == 1 and rc2 == 1 and "/d/" not in o1 + o2 and "does not know that document" in o1)
+            Site.answer[0] = 403
+            rc, o = run("link", "001-0001-A", "--kind", "public")
+            ok("link: a refused token exits 1 for public", rc == 1 and "refused the service token" in o)
+
+            lenv(LIBRARY_URL=site)
+            rc1, o1 = run("link", "001-0001")
+            rc2, o2 = run("link", "001-0001", "--kind", "public")
+            ok("link: with no service token signed-in gives the page, public exits 1, nothing sent",
+               rc1 == 0 and o1.startswith(site + "/d/001-0001\n") and "no service token" in o1
+               and rc2 == 1 and "no service token" in o2 and not Site.seen)
+            lenv(LIBRARY_URL="http://127.0.0.1:1", LIBRARY_FEEDBACK_CLIENT_ID="fid", LIBRARY_FEEDBACK_CLIENT_SECRET="fsec")
+            rc, o = run("link", "001-0001")
+            ok("link: an unreachable site falls back for signed-in and never prints the secret",
+               rc == 0 and o.startswith("http://127.0.0.1:1/d/001-0001\n") and "could not be reached" in o
+               and "fsec" not in o)
+            lenv(LIBRARY_FEEDBACK_CLIENT_ID="fid", LIBRARY_FEEDBACK_CLIENT_SECRET="fsec")
+            rc1, o1 = run("link", "001-0001")
+            rc2, o2 = run("link", "001-0001", "--kind", "public")
+            ok("link: LIBRARY_URL unset exits 1 for every kind and says how to set it",
+               rc1 == 1 and rc2 == 1 and "cc-config set LIBRARY_URL" in o1 and not Site.seen)
+    finally:
+        srv.shutdown()
+        for k in lkeys:
+            os.environ.pop(k, None)
     print(f"cc-docs selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
 
@@ -4254,6 +4578,12 @@ def main(argv):
     p.add_argument("number")
     p.add_argument("project")
     p.add_argument("--kind", choices=sorted(RANGES))
+    p = sub.add_parser("link")
+    p.add_argument("target")
+    p.add_argument("--kind", choices=LINK_KINDS, default="signed-in")
+    p.add_argument("--to", action="append")
+    p.add_argument("--name")
+    p.add_argument("--pin", action="store_true")
     sub.add_parser("selfcheck")
     a = ap.parse_args(argv)
     if a.cmd == "selfcheck":
@@ -4265,7 +4595,7 @@ def main(argv):
         return across(a)
     try:
         if IN_SANDBOX and a.cmd in ("project", "star", "public", "token", "member", "fold", "retire", "move", "attach",
-                                    "backfill-sources", "check", "pdf", "gone"):
+                                    "backfill-sources", "check", "link", "pdf", "gone"):
             # brief: "A member can't … make anything public, star for someone else, or read the owner's register"
             raise Refused(f"{a.cmd} is the host's: a workspace can file, number, find and list its own documents")
         if a.cmd == "member":
@@ -4273,7 +4603,7 @@ def main(argv):
         return {"file": cmd_file, "number": cmd_number, "project": cmd_project, "find": cmd_find, "list": cmd_list,
                 "star": cmd_star, "public": cmd_public, "token": cmd_token, "library": cmd_library,
                 "fold": cmd_fold, "retire": cmd_retire, "move": cmd_move, "attach": cmd_attach, "pdf": cmd_pdf,
-                "backfill-sources": cmd_backfill, "check": cmd_check, "gone": cmd_gone}[a.cmd](a)
+                "backfill-sources": cmd_backfill, "check": cmd_check, "link": cmd_link, "gone": cmd_gone}[a.cmd](a)
     except Refused as e:
         print(f"cc-docs: {e}", file=sys.stderr)
         return 2

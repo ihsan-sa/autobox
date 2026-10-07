@@ -9604,9 +9604,9 @@ def run_selfcheck():
             globals()["mail_outbound"] = lambda: fake_out
 
             taps.clear(); sent.clear()
-            tapfile = f"{mdir}/lesson.pdf"
+            tapfile = f"{mdir}/lesson.png"
             with open(tapfile, "w") as fh:
-                fh.write("%PDF-1.4 the finished lesson")
+                fh.write("PNG the finished lesson")
             upload_file(tapcfg, tapfile, "C-MEM", "9.0", comment="here is the **finished** lesson")
             upload_file(tapcfg, tapfile, "C-MEM", "9.0", comment="a note for the channel", mail=False)
             check("mail out: a FILE posted in the thread is offered with its PATH and the comment AS WRITTEN — "
@@ -9631,7 +9631,7 @@ def run_selfcheck():
             # 2026-09-19: Slack got the file, the door mailed without it, and the tool said `sent` — the session
             # told the owner a file was attached that the sender received as "[… - not attached]".
             taps.clear(); sent.clear(); answered.clear(); checked.clear()
-            fake_out.refuse = "📎 lesson.pdf is not in a tree a mail may attach from — put it under ~/dev/mem. Nothing was sent, to Slack or by mail"
+            fake_out.refuse = "📎 lesson.png is not in a tree a mail may attach from — put it under ~/dev/mem. Nothing was sent, to Slack or by mail"
             try:
                 upload_file(tapcfg, tapfile, "C-MEM", "9.0", comment="the file, answering the mail", ts="9.0")
                 refused = ""
@@ -9641,7 +9641,7 @@ def run_selfcheck():
             check("mail out: a file the door says would not travel is REFUSED before the upload — the door is asked "
                   "with the thread and the answered ts, nothing reaches Slack, nothing is tapped, and the caller "
                   "gets the door's own line (UploadRefused), so `sent` is never said of it",
-                  refused.startswith("📎 lesson.pdf is not in a tree") and "Nothing was sent" in refused
+                  refused.startswith("📎 lesson.png is not in a tree") and "Nothing was sent" in refused
                   and checked == [("C-MEM", "9.0", "9.0", tapfile)] and sent == [] and taps == [])
             checked.clear()
             upload_file(tapcfg, tapfile, "C-MEM", "9.0", comment="the file, answering the mail", ts="9.0")
@@ -9651,6 +9651,136 @@ def run_selfcheck():
                   "mail=False file are not even asked about — a check that fires on every upload would refuse "
                   "the box its own posts",
                   checked == [("C-MEM", "9.0", "9.0", tapfile)] and len(sent) == 3 and len(taps) == 1)
+
+            # A PDF GOES OUT AS ITS LIBRARY LINK, NEVER AS BYTES (owner, 2026-09-28). cc-docs is a fake named by
+            # CC_DOCS_BIN: it logs its argv, prints one URL for a filed path, and refuses a path with "unfiled" in it.
+            pdfD = tempfile.mkdtemp(prefix="cc-slack-pdflink-")
+            fake_docs, docs_argv = f"{pdfD}/cc-docs", f"{pdfD}/argv"
+            with open(fake_docs, "w") as fh:
+                fh.write("#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + docs_argv + "\n"
+                         "case \"$2\" in *unfiled*) echo \"cc-docs: $2 is not filed; file it first with \\`cc-docs file\\`\" >&2; exit 1;; esac\n"
+                         "echo https://lib.test/d/001-0003\n")
+            os.chmod(fake_docs, 0o755)
+            filedP, unfiledP, pngP = f"{pdfD}/pitch.pdf", f"{pdfD}/unfiled.pdf", f"{pdfD}/chart.png"
+            for f in (filedP, unfiledP, pngP):
+                open(f, "w").write("x")
+            def argv_log():
+                return open(docs_argv).read().splitlines() if os.path.exists(docs_argv) else []
+            class MailOut(FakeOut):
+                rcpts = None
+                def mail_bound(self, cfg, chat, thread, ts):
+                    return {"id": "c1"} if self.rcpts else None
+                def recipients(self, rec, domain):
+                    return self.rcpts
+                def owner_addrs(self, cfg):
+                    return {"me@own.test"}
+                @staticmethod
+                def _norm(addr):
+                    return str(addr).strip().lower()
+                @staticmethod
+                def link_refusal(path, rec, cfg):    # the real door's check: MAIL_OUT_ROOTS is tapcfg's, pdfD below
+                    return real_ob.link_refusal(path, rec, cfg)
+            real_ob = real_out()
+            was_ob_log = real_ob.LOGFILE
+            real_ob.LOGFILE = f"{pdfD}/out.log"
+            tapcfg["MAIL_OUT_ROOTS"] = pdfD
+            outD = tempfile.mkdtemp(prefix="cc-slack-pdflink-outside-")
+            outsideP = f"{outD}/filed.pdf"
+            open(outsideP, "w").write("x")
+            mail_out = MailOut()
+            globals()["mail_outbound"] = lambda: mail_out
+            was_env_docs = os.environ.get("CC_DOCS_BIN")
+            os.environ["CC_DOCS_BIN"] = fake_docs
+            was_eff_pdf = Effects("pdflink", run=subprocess.run, dev=DEV).install()
+            try:
+                taps.clear(); sent.clear(); checked.clear()
+                got_s = upload_file(tapcfg, filedP, "C-MEM", "9.0", comment="the pitch", ts="9.0")
+                check("pdf link: a filed PDF in Slack is posted as its signed-in library link with the comment, and "
+                      "nothing is uploaded; the post's ts comes back as the id",
+                      got_s == ("9.9", "C-MEM") and sent == [("C-MEM", "9.0", "the pitch\npitch.pdf: https://lib.test/d/001-0003")]
+                      and argv_log() == [f"link {filedP} --kind signed-in"] and checked == []
+                      and taps == [("C-MEM", "9.0", "the pitch\npitch.pdf: https://lib.test/d/001-0003", "")])
+                taps.clear(); sent.clear(); os.remove(docs_argv)
+                mail_out.rcpts = (["a@x.test"], ["b@x.test"])
+                upload_file(tapcfg, filedP, "C-MEM", "9.0", comment="your answer", ts="9.0", title="Explainer")
+                check("pdf link: answering a mail it is a PRIVATE link naming every address the mail goes to, and the "
+                      "door gets the link in the text and no file",
+                      argv_log() == [f"link {filedP} --kind private --to a@x.test --to b@x.test"]
+                      and taps == [("C-MEM", "9.0", "your answer\nExplainer: https://lib.test/d/001-0003", "")])
+                taps.clear(); sent.clear(); os.remove(docs_argv)
+                mail_out.rcpts = (["Me@own.test"], ["b@x.test"])
+                upload_file(tapcfg, filedP, "C-MEM", "9.0", comment="to both", ts="9.0")
+                private_kept = argv_log() == [f"link {filedP} --kind private --to b@x.test"]
+                taps.clear(); sent.clear(); os.remove(docs_argv)
+                mail_out.rcpts = (["Me@own.test"], [])
+                upload_file(tapcfg, filedP, "C-MEM", "9.0", comment="to the owner", ts="9.0")
+                check("pdf link: the owner's own address is left off the private link, and a mail to the owner alone "
+                      "gets the signed-in link (the site refuses a private link naming only the owner)",
+                      private_kept and argv_log() == [f"link {filedP} --kind signed-in"]
+                      and taps == [("C-MEM", "9.0", "to the owner\npitch.pdf: https://lib.test/d/001-0003", "")])
+                taps.clear(); sent.clear(); os.remove(docs_argv)
+                mail_out.rcpts = (["a@x.test"], [])
+                try:
+                    upload_file(tapcfg, outsideP, "C-MEM", "9.0", comment="from elsewhere", ts="9.0"); why_o = ""
+                except UploadRefused as e:
+                    why_o = str(e)
+                mail_out.rcpts = None
+                upload_file(tapcfg, outsideP, "C-MEM", "9.0", comment="just Slack", ts="9.0")
+                check("pdf link: answering a mail, a filed PDF outside MAIL_OUT_ROOTS is refused with the door's own 📎 "
+                      "line before any link is minted, and nothing reaches Slack or the door; the same PDF in a post "
+                      "no mail carries still goes as its signed-in link",
+                      why_o.startswith("📎 filed.pdf is not in a tree a mail may attach from")
+                      and why_o.endswith("Nothing was sent, to Slack or by mail")
+                      and argv_log() == [f"link {outsideP} --kind signed-in"]
+                      and [s_[2] for s_ in sent] == ["just Slack\nfiled.pdf: https://lib.test/d/001-0003"])
+                taps.clear(); sent.clear(); os.remove(docs_argv)
+                try:
+                    upload_file(tapcfg, unfiledP, "C-MEM", "9.0", comment="draft", ts="9.0"); why_u = ""
+                except UploadRefused as e:
+                    why_u = str(e)
+                check("pdf link: an unfiled PDF is refused with cc-docs' line saying to file it first, and nothing "
+                      "reaches Slack or the mail door",
+                      "is not filed; file it first with `cc-docs file`" in why_u and sent == [] and taps == [])
+                taps.clear(); sent.clear(); os.remove(docs_argv)
+                upload_file(tapcfg, pngP, "C-MEM", "9.0", comment="a chart")
+                upload_file(tapcfg, filedP, "C-MEM", "9.0", comment="a member's own", mail=False, library=False)
+                check("pdf link: a non-PDF, and a PDF with library=False (the member workspace's own files), upload as "
+                      "before — cc-docs is never asked",
+                      not os.path.exists(docs_argv) and [s[2] for s in sent] == ["a chart", "a member's own"])
+                sent.clear()
+                os.environ["CC_DOCS_BIN"] = f"{pdfD}/absent"
+                upload_file(tapcfg, filedP, "C-MEM", "9.0", comment="no library here", mail=False)
+                check("pdf link: with no cc-docs to ask, a PDF uploads as any file does",
+                      [s[2] for s in sent] == ["no library here"])
+                os.environ["CC_DOCS_BIN"] = fake_docs
+                import inspect
+                check("pdf link: the member workspace's file verb and its notices keep the upload (library=False), so "
+                      "what members see does not change",
+                      "library=False" in inspect.getsource(Daemon.member_verb)
+                      and "library=False" in inspect.getsource(Daemon.member_notice))
+                was_lc = globals()["load_cfg"]
+                globals()["load_cfg"] = lambda: tapcfg
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()) as pl_out, contextlib.redirect_stderr(io.StringIO()) as pl_err:
+                        rc_pl = cmd_post_file(["--file", filedP, "--to", "C-MEM", "-m", "the pitch"])
+                        rc_pu = cmd_post_file(["--file", unfiledP, "--to", "C-MEM"])
+                finally:
+                    globals()["load_cfg"] = was_lc
+                check("pdf link: `post --file` prints `ok link=` for a filed PDF and refuses an unfiled one (exit 2) "
+                      "with the file-it-first line",
+                      rc_pl == 0 and "ok link=9.9 channel=C-MEM" in pl_out.getvalue()
+                      and rc_pu == 2 and "file it first" in pl_err.getvalue())
+            finally:
+                was_eff_pdf.install()
+                real_ob.LOGFILE = was_ob_log
+                tapcfg.pop("MAIL_OUT_ROOTS", None)
+                shutil.rmtree(outD, ignore_errors=True)
+                globals()["mail_outbound"] = lambda: fake_out
+                if was_env_docs is None:
+                    os.environ.pop("CC_DOCS_BIN", None)
+                else:
+                    os.environ["CC_DOCS_BIN"] = was_env_docs
+                shutil.rmtree(pdfD, ignore_errors=True)
 
             # A DECISION ASK'S HEAD STAYS IN SLACK. reply(needs_owner=true) answering a mail opens the Slack post
             # with ❓ and his mention; the door is handed the text as the session typed it, because ❓ is a

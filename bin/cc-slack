@@ -6,7 +6,7 @@
   cc-slack inject [--no-start] <target> "text"      push a message into a session as if from Slack (tests/scripts); `<repo>@<alias>` is that orch's own session, never started for it; a repo with no channel and no live session that CC_PROJECT_CHILDREN puts under a parent reaches the parent's session instead, the text opening `[<repo>]`.
   cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] [--route TITLE] [--id PRODUCER-ID] [--mention] [--major] "text" post as the bot (cc-notify uses --route; a channel-less child's title goes to its CC_PROJECT_CHILDREN parent's channel, the text opening `[<child>]` unless it names it; --route with --major stays on the title's main lane, #<repo>, never a track's thread or the -updates lane). --id posts an event once, ever: a replay or retry returns the same ts, never a second post (~/.cc/slack/sent/). --ts is the message this answers. -c into another session's channel ('#name', a bare name or its id) hands it to that session (Daemon.wake) — from a process no session owns, a service or a shell, as role=bot, and never into the -updates lane or back to a track's own loop — --route never does, and two seats that keep waking each other are held after 8 wakes in 10 minutes (Daemon.pingpong); one that wakes nobody (queued, no-session, live-no-channel, no-track — not a paused or unminted target, which has no session by design) is written to the failures ledger by the daemon (channel-wake/nobody-woken) and the stderr line names the record: `cc-slack: woke nobody on <target> (<verdict>) — recorded f-…`. --mention opens with ❓ and an @-mention of the owner — the only post allowed to page him (a typed @handle of his is sent as code). -c '#<repo>' wants a question, a decision, or --major (alias --main); anything else goes to #<repo>-updates, one stderr line says so.
   cc-slack sent <PRODUCER-ID>         did Slack accept that id? prints its ts (exit 0), or exit 1 if not yet; an unknown flag is always exit 2, never text.
-  cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m "text"] upload a file as the bot; --thread lands it in that thread (default target: DM the owner); --ts as above; Web API only.
+  cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m "text"] upload a file as the bot (a PDF goes as its library link, and one not yet filed is refused); --thread lands it in that thread (default target: DM the owner); --ts as above; Web API only.
   cc-slack post-approval [--force|--landed] [--print-chat] <repo> <pr-number|url> "[repo] PR #n: title — url" into #approvals, where the owner's :+1: squash-merges it — or, for a repo that lands itself (any not in CC_SELF_LAND_EXCEPT), into #<repo>-updates (a channel-less child's: its parent's, per CC_PROJECT_CHILDREN) as a landing record nobody taps. One card per PR — a repeat call finds the first and does nothing (--force re-posts); a merged/closed PR's card is edited to "landed ✓" instead (--landed: on the caller's word).
   cc-slack approvals-sweep [--dry-run] [--now]      edit every card whose PR is in (or closed) but still reads pending.
   cc-slack history <#chan|C…|D…> [n] | thread <#chan|C…> <ts> [n]      read a channel or a full thread, newest first, cursor-paged.
@@ -50,7 +50,7 @@
 
 Routing: #<repo> → its planning session, a reply in a track's 🧵 thread in #<repo> → that track's session (a legacy #<repo>--<track> channel routes the same), DMs and #box → the box's own Remote-Control session.
 Two lanes per project: #<repo> is for the owner (questions, decisions), #<repo>-updates carries what is automated or long; a reply stays on the lane it was asked on.
-A third name is not a session: #<repo>-ask is the question lane — what is typed there goes to `cc-ask <repo>` (one small-model read of the docs and the knowledge library, the source named in the reply) and comes back in the thread; no session is woken, started or provisioned for it, and a reaction there reaches nobody. The owner's ask there for a filed document ("001-0004", "the pitch") comes back as its PDF from the document register.
+A third name is not a session: #<repo>-ask is the question lane — what is typed there goes to `cc-ask <repo>` (one small-model read of the docs and the knowledge library, the source named in the reply) and comes back in the thread; no session is woken, started or provisioned for it, and a reaction there reaches nobody. The owner's ask there for a filed document ("001-0004", "the pitch") comes back as a signed-in link to it in the library, never the PDF itself.
 #approvals and #alerts keep their own jobs; a sub-orch or track channel isn't split, it inherits its parent's lanes.
 A sub-orchestrator gets its own channel (~/.cc/slack/orchs.json): "@alias" in the repo channel reaches it, "@main"/"@other" hands the thread back.
 Override routing in ~/.cc/slack/routes.json.
@@ -1103,17 +1103,88 @@ def open_member_file(path, roots):
         raise
     return fd
 
-def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True, ts=None, name=None):
+def docs_bin():
+    """The cc-docs a PDF's library link comes from: CC_DOCS_BIN when set (the selfcheck's fake), else the one beside this
+    script. Read per call, so a case can point it somewhere and put it back."""
+    return os.environ.get("CC_DOCS_BIN") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-docs")
+
+def is_pdf(path, name=None):
+    return str(name or path or "").lower().endswith(".pdf")
+
+def docs_link(path, kind="signed-in", to=()):
+    """`cc-docs link <path> --kind <kind> [--to <addr>]…` → the one URL it prints. Raises UploadRefused with cc-docs'
+    own last stderr line when there is none — for a PDF nobody filed that line says to file it first."""
+    cmd = [docs_bin(), "link", path, "--kind", kind] + [x for a in to for x in ("--to", a)]
+    try:
+        r = EFFECTS.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise UploadRefused(f"{os.path.basename(path)} was not sent — the library did not answer for its link ({e})")
+    out = (r.stdout or "").strip().splitlines()
+    if r.returncode == 0 and len(out) == 1 and re.fullmatch(r"https?://\S+", out[0].strip()):
+        return out[0].strip()
+    why = ((r.stderr or "").strip().splitlines() or [f"cc-docs link exit {r.returncode}"])[-1]
+    raise UploadRefused(f"{why} — nothing was sent")
+
+def mail_rcpts(cfg, to, thread, ts, path):
+    """The addresses other than the owner's own (outbound.owner_addrs) that a post at (to, thread) answering `ts`
+    would be mailed to, or [] when it would not be mailed or goes to the owner alone — the site refuses a private
+    link naming only the owner, so pdf_link_post gives the owner a signed-in one, as outbound.pdf_links does.
+    A post that would be mailed carries the PDF out of the box as surely as an attachment, so `path` passes the
+    mail door's attachment roots first (outbound.link_refusal) and one outside them raises UploadRefused with the
+    door's own 📎 line, before any link is minted."""
+    if not (to and thread and ts):
+        return []
+    try:
+        ob = mail_outbound()
+        rec = ob.mail_bound(cfg, to, thread, ts)
+        if not rec:
+            return []
+        why = ob.link_refusal(path, rec, cfg)
+        if why:
+            raise UploadRefused(why)
+        a, c = ob.recipients(rec, cfg.get("MAIL_DOMAIN") or "")
+        mine = ob.owner_addrs(cfg)
+        return [x for x in a + c if ob._norm(x) not in mine]
+    except UploadRefused:
+        raise
+    except Exception as e:
+        log(f"mail out: {e!r}")
+        return []
+
+def pdf_link_post(cfg, path, to, thread=None, comment=None, title=None, mail=True, ts=None, name=None):
+    """A PDF goes out as its library link, never as bytes (owner, 2026-09-28). Signed-in for Slack, which the owner
+    and the library's readers open; answering a mail, private to the addresses the mail goes to other than the
+    owner's, signed-in when the owner is all of them. Posted with
+    post(), so the mail door gets the link in the text and no file. Returns (ts, chat) as upload_file does."""
+    rcpts = mail_rcpts(cfg, to, thread, ts, path) if mail else []
+    url = docs_link(path, "private", rcpts) if rcpts else docs_link(path)
+    label = title or name or os.path.basename(path)
+    text = (f"{comment}\n" if comment else "") + f"{label}: {url}"
+    if to and to.startswith("#") and cfg.get("SLACK_BOT_TOKEN"):
+        to = resolve_channel(cfg, to[1:]) or to
+    if (not to or to.startswith("U")) and cfg.get("SLACK_BOT_TOKEN"):
+        to = api("conversations.open", cfg["SLACK_BOT_TOKEN"], users=to or cfg.get("SLACK_OWNER_ID"))["channel"]["id"]
+    _n, first = post(cfg, to or "dm", text, thread, mail=mail, ts=ts)
+    return first, to
+
+def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True, ts=None, name=None, library=True):
     """Upload one file to `to` (a chat id, #name, user id, or None for the owner's DM), into `thread`. Same
     contract as post(): no token, or local, means outbox log only, never a false claim of sending. Returns
     (file_id, chat); file_id None means nothing reached Slack. `mail` is post()'s tap for a file: answering a
     mail, the file either goes as an attachment (or a MAIL_OUT_LINKS link) or the call is refused before the
     upload — UploadRefused names why — so `sent` is never said of a file the sender did not get. `name` is the
-    file's name in Slack when `path` does not carry it (an open fd's /proc/self/fd/<n>, open_member_file)."""
+    file's name in Slack when `path` does not carry it (an open fd's /proc/self/fd/<n>, open_member_file).
+    A PDF IS NEVER UPLOADED (owner, 2026-09-28: a PDF handed to a person is a link to its library document): a filed
+    one is posted as its link (pdf_link_post) and the returned id is that post's ts; one nobody filed is refused
+    with cc-docs' line saying to file it first, and nothing is sent. With no cc-docs beside this script the PDF
+    uploads as any file does. `library=False` keeps the upload: the member workspace's `file` verb and its notices
+    pass it, since a member's own PDF is not in the owner's library and what members see must not change."""
     if os.path.isdir(path):
         raise UploadRefused(f"{path} is a directory — send one file, not a folder")
     if not os.path.isfile(path):
         raise UploadRefused(f"no such file: {path}")
+    if library and is_pdf(path, name) and os.access(docs_bin(), os.X_OK):
+        return pdf_link_post(cfg, path, to, thread, comment=comment, title=title, mail=mail, ts=ts, name=name)
     size = os.path.getsize(path)
     if size > MAX_UPLOAD:
         raise UploadRefused(f"{path} is {size / (1024 * 1024):.1f} MB — the limit is {MAX_UPLOAD // (1024 * 1024)} MB")
@@ -4148,7 +4219,7 @@ class Daemon:
             if not any(path.startswith(r + "/") for r in roots):
                 return {"ok": False, "error": f"{first.get('path')} is not visible outside the boundary — put it under ~/dev/{h} first"}
             fid, _ = upload_file(self.cfg, path, chat, first.get("thread_ts") or None, comment=first.get("text") or None, title=first.get("title") or None,
-                                 ts=str(first.get("ts") or "") or None)
+                                 ts=str(first.get("ts") or "") or None, library=False)   # a member's PDF uploads as before
             if first.get("ts"):
                 react(self.cfg, chat, str(first["ts"]), "eyes", remove=True)
             if not fid:
@@ -4272,7 +4343,7 @@ class Daemon:
                 return {"ok": False, "error": f"{first.get('attach')} is not a regular file the box can read under the workspace — nothing sent"}
             try:
                 fid, fchat = upload_file(self.cfg, f"/proc/self/fd/{fd}", tt[0], tt[1], comment=text, name=os.path.basename(path),
-                                         mail=False)   # a track's thread is no mail's, and the mail door would reopen by name
+                                         mail=False, library=False)   # a track's thread is no mail's, and the mail door would reopen by name
             except Exception as e:
                 log(f"notice {h}: {target} file {path} not uploaded: {e!r}")
                 return {"ok": False, "error": f"the file {os.path.basename(path)} did not reach the thread ({e}) — nothing sent"[:300]}
@@ -7606,7 +7677,9 @@ TOOLS = [
                                                            "A question you are not waiting on is false."}},
          "required": ["chat_id", "text"]}},
     {"name": "file",
-     "description": "Attach a file — an image, a render, a chart, a screenshot, a PDF, a log — to the thread you are answering. "
+     "description": "Attach a file — an image, a render, a chart, a screenshot, a log — to the thread you are answering. A PDF is "
+                     "never attached: a filed one goes as its library link (private to the sender when it answers a mail), "
+                     "and one not yet filed is refused until you `cc-docs file` it (inside a member workspace a PDF uploads as any file does). "
                      "When the answer IS the picture, send it: describing it is not sending it, and this is the only tool that moves "
                      "bytes to Slack. Reads only from this session's own folder, /tmp, or ~/.cc/slack/files; 25 MB max. "
                      "Put what it shows in `text` — that is the message the file arrives with.",
@@ -8285,7 +8358,7 @@ def file_wake(chat, thread, text):
     return f" (handed to {r['target']}: {r.get('result')})" if r.get("target") else ""
 
 def cmd_post_file(argv):
-    """post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m TEXT] — same upload_file() helper as the channel server's `file` tool. Default target: the owner's DM. Exit 2 usage/refused, 3 no token, 1 API error."""
+    """post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m TEXT] — same upload_file() helper as the channel server's `file` tool, so a PDF goes as its library link (`ok link=<ts>`) and an unfiled one is refused (exit 2). Default target: the owner's DM. Exit 2 usage/refused, 3 no token, 1 API error."""
     usage = "cc-slack post --file <path> [--to <channel-or-user-id|#name>] [--thread <ts>] [--ts <ts>] [--title <t>] [-m|--text <msg>]"
     cfg = load_cfg(); opt = {"--file": None, "--to": None, "--thread": None, "--ts": None, "--title": None, "-m": None}
     i = 0
@@ -8307,7 +8380,7 @@ def cmd_post_file(argv):
                 "channel_not_found": f"no channel {tgt}: give a C…/D… id, a U… user id, or #name of a channel the bot is in"}
         err = str(e)
         print(f"cc-slack post --file failed: {err}. {next((h for k, h in hint.items() if k in err), '')}".strip(), file=sys.stderr); return 1
-    print(f"ok file={fid} channel={to}")
+    print(f"ok {'link' if is_pdf(path) and fid else 'file'}={fid} channel={to}")
     woke = file_wake(to, opt["--thread"], opt["-m"] or os.path.basename(path)) if fid else ""
     if woke:
         print("cc-slack:" + woke, file=sys.stderr)
