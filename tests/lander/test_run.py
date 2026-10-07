@@ -536,6 +536,45 @@ class Admission(unittest.TestCase):
         with A.slot(st, alone=True, psi_root=calm, k=2) as held:
             self.assertEqual(held, [1, 2])
 
+    def test_a_long_slot_wait_writes_one_line_to_the_run_status(self):
+        # a cc-green run sat 2-3 h on slots with only its header in its log, five times: past WAIT_SAY its status says so, once
+        st, note = tempfile.mkdtemp(), tempfile.mktemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        calm = self.psi_dir(0, 0)
+        with mock.patch.object(A, "WAIT_SAY", 0.1), mock.patch.object(A, "_noted", False), \
+                mock.patch.dict(os.environ, {"LANDER_WAIT_NOTE": note}), contextlib.redirect_stderr(io.StringIO()):
+            with A.slot(st, psi_root=calm, k=1):
+                for _ in range(2):   # two checks of one run wait: still one line
+                    with self.assertRaises(TimeoutError):
+                        with A.slot(st, psi_root=calm, k=1, poll=0.05, deadline=0.4):
+                            pass
+        with open(note) as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("waiting="), lines)
+        self.assertIn("waiting since", lines[0])
+        self.assertIn("cc-green stop", lines[0])
+        # …and a waiter with no note (the landing lane) writes no status line, however long it waits
+        env = {k: v for k, v in os.environ.items() if k != "LANDER_WAIT_NOTE"}
+        with mock.patch.object(A, "WAIT_SAY", 0.1), mock.patch.object(A, "_noted", False), \
+                mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stderr(io.StringIO()):
+            with A.slot(st, psi_root=calm, k=1):
+                with self.assertRaises(TimeoutError):
+                    with A.slot(st, psi_root=calm, k=1, poll=0.05, deadline=0.4):
+                        pass
+            self.assertFalse(A._noted)
+
+    def test_a_wait_note_cannot_plant_a_status_field(self):
+        # a check name comes from the tree's TOML; a newline in it must not add an exit= line cc-green reads first
+        note = tempfile.mktemp()
+        self.addCleanup(lambda: os.path.exists(note) and os.unlink(note))
+        with mock.patch.object(A, "_noted", False), mock.patch.dict(os.environ, {"LANDER_WAIT_NOTE": note}):
+            A._note("x\nexit=0")
+        with open(note) as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertFalse(any(l.startswith("exit=") for l in lines), lines)
+
     def test_alone_takes_slots_in_order_and_holds_none_past_a_busy_one(self):
         # one lane runs several checks at once: two alone runs each holding a slot would wait on each other forever
         import threading

@@ -23,7 +23,10 @@ or an older ticket that needs it would wait forever. A ticket still locked after
 (LANDER_TICKET_CAP, default 12 h, about twice the longest wait a fair queue should see) is taken for a stopped
 waiter and no longer counts, and the waiter that passes it says so. While it waits, slot() writes one line to
 stderr (the run's log) saying what it waits for, since when and whose ticket is oldest, then again every WAIT_SAY
-seconds (LANDER_WAIT_SAY, default 600).
+seconds (LANDER_WAIT_SAY, default 600). In a cc-green run, which names its status file in LANDER_WAIT_NOTE, the first line said
+past WAIT_SAY is also appended there ONCE as `waiting=`, so `cc-green wait` says the run is on slots, not hung, and
+what to do about it: such runs sat 2-3 h with only a header in their log five times between 09-29 and 10-01, each read
+as hung. The landing lane sets no note.
 
 HIGH LOAD (2026-09-28: load 31-80 on 12 cores and 12 GB swapped, checks went from under 5 min to 11-17). overloaded() is
 the one signal for "the box is overloaded": the lander serializes on it and gives its one run priority (below), and
@@ -154,6 +157,24 @@ def _ticket(qdir: str):
     return name, f
 
 
+_noted = False   # one waiting= line per process, however many of its checks wait
+
+
+def _note(line: str) -> None:
+    """Append ONE `waiting=` line to the status file LANDER_WAIT_NOTE names (cc-green's run); nothing without one."""
+    global _noted
+    p = os.environ.get("LANDER_WAIT_NOTE")
+    if _noted or not p:
+        return
+    _noted = True
+    line = re.sub(r"[\x00-\x1f\x7f]", " ", line)[:300]   # a check name from the tree's TOML must not plant an exit= line
+    with contextlib.suppress(OSError, ValueError):   # ValueError: a NUL in the path
+        with open(p, "a") as f:
+            f.write(f"waiting={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {line} — a wait for a free slot, "
+                    "not a hang. Way forward: keep waiting, or `cc-green stop` and hand over without this run; the "
+                    "landing runs the same checks in its own place in the queue.\n")
+
+
 def _drop(p: str) -> None:
     with contextlib.suppress(OSError):
         os.unlink(p)
@@ -277,6 +298,8 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                         + (f", holding {[h for h, _ in held]}" if held else ""))
                 with contextlib.suppress(OSError, ValueError):   # only say(): a gone or closed stderr
                     say(line)
+                if said - t0 >= WAIT_SAY:   # past the bound: the run's status gets its one line
+                    _note(line)
             if not alone or ahead:   # behind someone: hold nothing, or an older ticket needing our slot waits forever
                 for _, f in held:
                     f.close()
