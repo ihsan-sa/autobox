@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import pathlib
 import re
 import shutil
 import stat
@@ -693,6 +694,84 @@ class Members(Fixture):
         self.git(self.root, "fetch", "-q", "origin")
         self.assertEqual(M.walls(self.root, tok, gone, ["b/y"]), "")
         self.assertTrue(M.boundary_path(".ssh/id_rsa") and not M.boundary_path("src/ssh.py"))
+
+    def test_walls_let_the_design_system_through(self):
+        # apply-design-system has a workspace commit .cc/design-tokens.json and .cc/design-fonts/; the rest of .cc/ stays walled
+        self.make_member()
+        base = self.origin_rev("main")
+        toks, font = ".cc/design-tokens.json", ".cc/design-fonts/plex-400.ttf"
+        ds = self.push("t-ds", {toks: '{"colors": {}}\n', font: "\0font\n", ".cc/design-fonts/Plex-600.OTF": "f\n"})
+        track = self.push("t-track", {".cc/track": "x\n"})
+        conf = self.push("t-conf", {".cc/LANDING.toml": "x\n"})
+        woff = self.push("t-woff", {".cc/design-fonts/plex.woff2": "f\n"})
+        tok = self.push("t-dstok", {toks: '{"k": "ghp_' + "A" * 36 + '"}\n'})
+        self.git(self.work, "checkout", "-q", "-B", "t-link", "origin/main")
+        os.makedirs(f"{self.work}/.cc/design-fonts", exist_ok=True)
+        os.symlink("/etc/passwd", f"{self.work}/.cc/design-fonts/x.ttf")
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-qm", "link")
+        self.git(self.work, "push", "-q", "-f", "origin", "t-link:refs/heads/t-link")
+        link = self.git(self.work, "rev-parse", "HEAD")
+        self.git(self.root, "fetch", "-q", "origin")
+        self.assertEqual(M.walls(self.root, base, ds, [toks, font, ".cc/design-fonts/Plex-600.OTF"]), "")
+        self.assertIn(".cc/track", M.walls(self.root, base, track, [".cc/track"]))
+        self.assertIn(".cc/LANDING.toml", M.walls(self.root, base, conf, [".cc/LANDING.toml"]))
+        self.assertIn(".ttf or .otf", M.walls(self.root, base, woff, [".cc/design-fonts/plex.woff2"]))
+        self.assertIn("not a regular file (git mode 120000)", M.walls(self.root, base, link, [".cc/design-fonts/x.ttf"]))
+        self.assertIn("shaped like a token", M.walls(self.root, base, tok, [toks]))   # the token scan still reads it
+        self.git(self.work, "checkout", "-q", "-B", "t-ds", ds)
+        self.git(self.work, "rm", "-q", font)
+        self.git(self.work, "commit", "-qm", "rm font")
+        self.git(self.work, "push", "-q", "-f", "origin", "t-ds:refs/heads/t-ds")
+        gone = self.git(self.work, "rev-parse", "HEAD")
+        self.git(self.root, "fetch", "-q", "origin")
+        self.assertEqual(M.walls(self.root, ds, gone, [font]), "")   # a font deleted is no wall
+        # a secret's place or a near name is never carved out
+        self.assertFalse(M.design_path(".cc/design-fonts/") or M.design_path(".cc/design-tokens.json.bak")
+                         or M.design_path(".cc/design-fontsx/a.ttf") or M.design_path("x/.cc/design-tokens.json"))
+        self.assertTrue(M.design_path(toks) and M.design_path(font))
+
+    def test_design_walls_read_the_tree_as_bytes(self):
+        # a name git.py decodes with errors="replace" (\xff -> U+FFFD) once dodged the mode check: ls-tree found no
+        # entry for the decoded name. Every case is walled with the file list the lane really hands walls()
+        self.make_member()
+        base = self.origin_rev("main")
+        fonts = f"{self.work}/.cc/design-fonts"
+
+        def commit(branch, make, start="origin/main", add=True):
+            self.git(self.work, "checkout", "-q", "-B", branch, start)
+            os.makedirs(fonts, exist_ok=True)
+            make()
+            if add:   # a gitlink lives in the index only: add -A would stage its removal
+                self.git(self.work, "add", "-A")
+            self.git(self.work, "commit", "-qm", branch)
+            self.git(self.work, "push", "-q", "-f", "origin", f"{branch}:refs/heads/{branch}")
+            self.git(self.root, "fetch", "-q", "origin")
+            return self.git(self.work, "rev-parse", "HEAD")
+
+        def walled(head, frm=base, files=None):
+            return M.walls(self.root, frm, head, G.pr_changed(self.root, frm, head) if files is None else files)
+
+        ok = commit("t-ok", lambda: pathlib.Path(f"{fonts}/plex.ttf").write_text("f\n"))
+        self.assertEqual(walled(ok), "")   # the allowed case still passes
+        ff = commit("t-ff", lambda: os.symlink(os.path.expanduser("~/.cc/config"), fonts.encode() + b"/\xff.ttf"))
+        self.assertIn("must be a UTF-8 name", walled(ff))
+        # named past the U+FFFD check, the tree read still sees the raw name
+        self.assertIn("must be a UTF-8 name", walled(ff, files=[".cc/design-fonts/plex.ttf"]))
+        gone = commit("t-ff", lambda: os.unlink(fonts.encode() + b"/\xff.ttf"), start=ff)
+        self.assertIn("must be a UTF-8 name", walled(gone, frm=ff, files=[".cc/design-fonts/plex.ttf"]))
+        sub = self.git(self.work, "rev-parse", "origin/main")
+        gl = commit("t-gl", lambda: self.git(self.work, "update-index", "--add", "--cacheinfo",
+                                             f"160000,{sub},.cc/design-fonts/sub.ttf"), add=False)
+        self.assertIn("not a regular file (git mode 160000)", walled(gl))
+        ln = commit("t-ln", lambda: os.symlink("/etc/passwd", f"{self.work}/.cc/design-tokens.json"))
+        self.assertIn("not a regular file (git mode 120000)", walled(ln))
+        dr = self.push("t-dir", {".cc/design-tokens.json/x": "{}\n", ".cc/design-fonts/a.ttf": "f\n"})
+        self.git(self.root, "fetch", "-q", "origin")
+        self.assertIn(".cc/design-tokens.json/x", walled(dr))
+        self.assertIn("must be one regular file", walled(dr, files=[".cc/design-fonts/a.ttf"]))
+        # a design path the list names that the head neither holds nor deletes: fail closed
+        self.assertIn("neither held by its head nor deleted", walled(ok, files=[".cc/design-fonts/ghost.ttf"]))
 
     def test_a_member_lane_keeps_its_checks_on_the_box_with_a_laptop_configured(self):
         # a member's PR never runs on the owner's laptop: no laptop flight, no box_only, the member's own runner

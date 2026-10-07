@@ -24,7 +24,11 @@
                           the clone, since git will not clone into a directory that holds anything.
   walls(root, base, head, files)  why or "": a boundary path (BOUNDARY_PATHS: .cc/** and the secret stores), or a
                           token shape (TOKEN_SHAPES) on an ADDED line of the diff, read in git.sealed() with --text so
-                          no attribute of the member's hides a line. Checked before any check runs.
+                          no attribute of the member's hides a line. Checked before any check runs. The design system
+                          apply-design-system has a workspace commit (design_path: .cc/design-tokens.json and
+                          .cc/design-fonts/**) is carved out of the .cc/** wall, never out of SECRET_PATHS or the token
+                          scan: each such path the head still holds must be a regular file (git mode 100644 or 100755,
+                          so no link and no gitlink), and a font must end .ttf or .otf.
   spent(h) -> (usd, cap) · charge(h, usd) -> None | (spent_before, cap)   the day's ledger cc's member_gate keeps,
                           <state>/member-spend.json, cap MEMBER_DAILY_USD (cc-config, else 20).
   route(job)              "#<h>" for a member job, else "" — where its stop is said.
@@ -50,6 +54,8 @@ MEMBER_DAILY_USD = 20
 SECRET_PATHS = (".cc/config", ".cc/secrets/**", ".cc/members/**", "ccbox/env", ".ssh/**",
                 ".claude/.credentials.json", ".claude.json", ".config/gh/**")
 BOUNDARY_PATHS = (".cc/**",) + SECRET_PATHS
+# What apply-design-system (pdf-material-builder) tells a workspace to commit; every generator reads it from there.
+DESIGN_TOKENS, DESIGN_FONTS, FONT_EXTS = ".cc/design-tokens.json", ".cc/design-fonts/", (".ttf", ".otf")
 TOKEN_SHAPES = re.compile(r"github_pat_[A-Za-z0-9_]{20,}|\bgh[pousr]_[A-Za-z0-9]{30,}|\bsk-ant-[A-Za-z0-9_-]{20,}"
                           r"|\bxox[abpr]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----")
 HANDLE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
@@ -76,14 +82,24 @@ def member_of(repo):
     return "", ""
 
 
-def boundary_path(path) -> bool:
-    for g in BOUNDARY_PATHS:
+def _under(path, globs) -> bool:
+    for g in globs:
         if g.endswith("/**"):
             if path == g[:-3] or path.startswith(g[:-2]):
                 return True
         elif fnmatch.fnmatchcase(path, g) or path.endswith("/" + g):
             return True
     return False
+
+
+def boundary_path(path) -> bool:
+    return _under(path, BOUNDARY_PATHS)
+
+
+def design_path(path) -> bool:
+    """A path of the design system a member PR may commit under .cc/; a secret's place is never one."""
+    return (path == DESIGN_TOKENS or (path.startswith(DESIGN_FONTS) and len(path) > len(DESIGN_FONTS))) \
+        and not _under(path, SECRET_PATHS)
 
 
 def member_token(handle) -> str:
@@ -216,16 +232,75 @@ def member_clone(repo, url):
     return root, ""
 
 
+def _utf8(raw):
+    """A path git printed as bytes, as text; None when it is not strict UTF-8 or holds U+FFFD."""
+    try:
+        path = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return None if "\ufffd" in path else path
+
+
+def design_walls(run, mb, head, design) -> str:
+    """Why the design files of a member change (mb..head, in the sealed repo `run` reads) are refused, or "".
+    Read as bytes, so no name is decoded with errors="replace" and no entry slips past the mode check: every entry
+    the head holds under the allowance must be a regular file with a UTF-8 name (a symlink is 120000, a gitlink
+    160000, a tokens file turned directory leaves `.cc/design-tokens.json/x`), and every design path the change
+    names must be in the head or deleted by it."""
+    from lander import git as G
+    senv, spec = dict(G.blind_env(), GIT_DIR=run.git_dir), (DESIGN_TOKENS, DESIGN_FONTS.rstrip("/"))
+
+    def raw(*args):   # literal pathspecs, so no glob
+        p = G._bytes(["git", "--literal-pathspecs", *args, "--", *spec], senv, timeout=120)
+        return p.returncode, p.stdout if p.returncode == 0 else p.stderr.decode(errors="replace").strip()[-120:]
+    rc, tree = raw("ls-tree", "-r", "-z", "--full-tree", head)
+    if rc:
+        return f"git could not list the design files to check them ({tree})"
+    held = set()
+    for ent in filter(None, tree.split(b"\0")):
+        meta, _, name = ent.partition(b"\t")
+        path, mode = _utf8(name), meta.split(b" ")[0].decode("ascii", "replace")
+        if path is None:
+            return f"the head holds {name!r} under the design files, and a member PR's design path must be a UTF-8 name"
+        if path != DESIGN_TOKENS and not path.startswith(DESIGN_FONTS):
+            return f"the head holds {path}, and {DESIGN_TOKENS} must be one regular file"
+        if mode not in ("100644", "100755"):   # brief: "Font files must be regular files: refuse symlinks"
+            return f"{path} is not a regular file (git mode {mode}), which a member PR's design system must be"
+        held.add(path)
+    rc, names = raw("diff", "--name-status", "-z", "--no-renames", "--no-relative", "--ignore-submodules=none", mb, head)
+    if rc:
+        return f"git could not list the design files the change deletes ({names})"
+    parts, gone = names.split(b"\0"), set()
+    for st, name in zip(parts[0::2], parts[1::2]):
+        if _utf8(name) is None:
+            return f"the change touches {name!r} under the design files, and a member PR's design path must be a UTF-8 name"
+        if st == b"D":
+            gone.add(_utf8(name))
+    lost = next((f for f in design if f not in held and f not in gone), "")
+    return f"{lost} is named by the change but neither held by its head nor deleted, so its mode cannot be read" \
+        if lost else ""
+
+
 def walls(root, base, head, files, genv=None) -> str:
-    bad = [f for f in files if boundary_path(f)]
+    bad = [f for f in files if boundary_path(f) and not design_path(f)]
     if bad:
         return f"it touches {bad[0]}, which a member PR may not (the boundary or a secret's place)"
+    design = [f for f in files if design_path(f)]
+    font = [f for f in design if f != DESIGN_TOKENS and not f.lower().endswith(FONT_EXTS)]
+    if font:
+        return f"it touches {font[0]}, and a member PR's design font must be a .ttf or .otf file"
+    odd = next((f for f in design if "\ufffd" in f), "")
+    if odd:   # git.py decodes with errors="replace": a name that is not UTF-8 reaches here as U+FFFD and is no name
+        return f"it touches {odd!r}, and a member PR's design path must be a UTF-8 name"
     from lander import git as G
     # read sealed: a member's own `* -diff` in .gitattributes (or the clone's config) would turn an added line
     # into "Binary files differ" and hide a token from this scan
     with G.sealed(root, base, head) as ((rc, out), run):
         if run is not None:
             rc, mb = run("merge-base", *out)
+            why = design_walls(run, mb.strip(), out[1], design) if design and not rc else ""
+            if why:
+                return why
             rc, out = (rc, mb) if rc else run("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
                                               "--no-relative", "-U0", mb.strip(), out[1])
     if rc:
@@ -284,5 +359,5 @@ def route(job) -> str:
     return f"#{job.member}" if getattr(job, "member", None) else ""
 
 
-__all__ = ["member_of", "boundary_path", "member_token", "member_board", "granted_orgs", "member_project_url", "member_clone", "gh_config_dir", "walls", "spent",
+__all__ = ["member_of", "boundary_path", "design_path", "member_token", "member_board", "granted_orgs", "member_project_url", "member_clone", "gh_config_dir", "walls", "spent",
            "charge", "route", "env", "BOUNDARY_PATHS", "TOKEN_SHAPES", "MEMBER_DAILY_USD"]
