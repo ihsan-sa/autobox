@@ -97,6 +97,9 @@ def span_words(secs) -> str:
 
 LOG_EVENT_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\t(?:(queued|requeued|fix-pushed|done) ([\w.-]+)#(\d+)(?: rc=(\d+))?"
                           r"|stage ([\w.-]+)#(\d+) (\w+)(.*))")
+# A green `gate` line's fields, in the order stage() writes them, each one whole: only `note=` (free text) may follow
+# secs, so a name or note that spells `ok=yes secs=1` cannot pass for a green run or lend a red one its length
+GATE_RE = re.compile(r" gate=([\w.-]+) ok=yes secs=(\d+)(?: note=.*)?$")
 
 
 def lead_times(lines, since=0.0, repo=""):
@@ -123,9 +126,9 @@ def lead_times(lines, since=0.0, repo=""):
         elif kind == "lane":
             lane_at.setdefault(key, at)
         elif kind == "gate" and at >= since:
-            g, s = re.search(r"\bgate=(\S+)", rest), re.search(r"\bok=yes\b.*\bsecs=(\d+)", rest)
-            if g and s:   # a green run's own length: a red or stopped one ended early and would flatter the figure
-                got["gates"].setdefault(g.group(1), []).append(int(s.group(1)))
+            g = GATE_RE.match(rest)
+            if g:   # a green run's own length: a red or stopped one ended early and would flatter the figure
+                got["gates"].setdefault(g.group(1), []).append(int(g.group(2)))
         elif (kind == "merged" or (kind == "done" and rc in ("0", "3", "4"))) and key in last:
             if at >= since:
                 got["first"].append(at - first[key])

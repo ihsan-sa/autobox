@@ -243,6 +243,21 @@ class HostAndRunners(Env):
             r = self.run_(chk(run=probe, klass=T.HOST))
         self.assertEqual((r.status, r.runner.split(":")[1]), (T.PASSED, "host"), r.extra)
 
+    def test_an_express_run_takes_no_slot_and_a_lone_one_takes_them_all(self):
+        # the lane's EXPRESS bounds its own runs; a diagnostic rerun alone still runs by itself
+        calls, real = [], A.slot
+
+        def slot(state, alone=False, **kw):
+            calls.append(alone)
+            return real(state, alone=alone, **kw)
+        with mock.patch.object(A, "slot", slot):
+            r = self.run_(chk(klass=T.HOST), express=True)
+            self.assertEqual((r.status, calls), (T.PASSED, []))
+            r = self.run_(chk(klass=T.HOST), express=True, alone=True)
+            self.assertEqual((r.status, calls), (T.PASSED, [True]))
+            r = self.run_(chk(klass=T.HOST))
+            self.assertEqual((r.status, calls), (T.PASSED, [True, False]))
+
     def test_a_runner_the_check_does_not_list_is_refused(self):
         r = self.run_(chk(run="true", where=["box"]), where="laptop")
         self.assertEqual(r.status, T.UNRUNNABLE)

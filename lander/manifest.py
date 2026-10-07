@@ -52,6 +52,9 @@ CLASS_RANK = {T.STATIC: 0, T.HERMETIC: 1, T.TIMING: 1, T.BOX: 2, T.HOST: 3}
 UNSANDBOXED = (T.BOX, T.HOST)
 NEW_DEFAULT = T.HERMETIC
 BUILTIN = "manifest-widen"
+# A check's name goes into the queue log as `gate=<name>` and keys its recorded run times (events.lead_times): a name
+# with a space or `=` in it could write fields of its own there (2026-10-07, #969's security read)
+NAME_RE = re.compile(r"[\w.-]+")
 
 
 class ManifestError(ValueError):
@@ -149,6 +152,13 @@ def run_file(run: str) -> str:
     return w if "/" in w and not w.startswith(("/", "-", "$", "~")) else ""
 
 
+def run_files(run: str) -> list:
+    """Every word of a run line that names a file or directory relative to the tree (`bin/x selfcheck`, `-s
+    tests/lander`), without a trailing slash: what the check runs, beside the paths it owns."""
+    return [w.rstrip("/") for w in run.replace("'", " ").replace('"', " ").split()
+            if "/" in w and not w.startswith(("/", "-", "$", "~"))]
+
+
 def parse_checks(text: str, prefix: str = "", source: str = "", unclassed: set | None = None) -> tuple:
     """-> ([Check], [fault]). Paths and fixtures come back prefixed. unclassed: gets the name of each check that
     names no class (it keeps T.Check's default here; head_check() decides what a new one gets)."""
@@ -165,6 +175,9 @@ def parse_checks(text: str, prefix: str = "", source: str = "", unclassed: set |
             c = T.Check.from_dict(d)
         except ValueError as e:
             faults.append(f"{source}: check #{i + 1}: {e}")
+            continue
+        if not NAME_RE.fullmatch(c.name):
+            faults.append(f"{source}: check #{i + 1}: name {c.name!r} is not letters, digits, '_', '.' and '-'")
             continue
         c.paths = [prefix + p for p in c.paths]
         c.fixtures = [prefix + p for p in c.fixtures]

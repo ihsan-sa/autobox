@@ -73,11 +73,15 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              A member over its day's cap is held; a bought read is charged to it.
   mergeable  the head moved -> queued. main moved -> Δ re-plan (S2): rerun = (new − old) ∪ (new ∩ checks Δ
              reaches); a new plan that is lander-class (a reach file the new base does not generate) -> query
-             "lander-self"; non-empty -> checking with only those; empty -> base_sha = main and merge. GITHUB CI comes
-             next (gh.ci_state at the head): red -> handback naming each failed check; "starved" (every red is a
-             job GitHub cancelled because no hosted runner took it) -> gh.rerun of those runs and held CI_WAIT_SECS,
-             at most STARVED_RERUNS times at one head, then handback as red; queued or running -> held
-             CI_WAIT_SECS, the CI_WAITS+1th wait at one head a query "planning"; an empty rollup on a base with
+             "lander-self"; non-empty -> checking with only those, each one not in FULL_CHECKS, defined at the head
+             as on main, with no file of its run line in the PR, and whose green runs in the queue log all took at
+             most EXPRESS_SECS run EXPRESS (EXPRESS_SLOTS lane-wide beside width(), no admission slot, so a
+             seconds-long rerun does not queue behind suites; none while A.mem_loaded());
+             empty -> base_sha = main and merge. GITHUB CI comes next (gh.ci_state at the head):
+             red -> handback naming each failed check; "starved" (every red is a job GitHub cancelled because no
+             hosted runner took it) -> gh.rerun of those runs and held CI_WAIT_SECS, at most STARVED_RERUNS times
+             at one head, then handback as red; queued or running -> held CI_WAIT_SECS, the CI_WAITS+1th wait at
+             one head a query "planning"; an empty rollup on a base with
              .github/workflows -> held the same way CI_REGISTER_WAITS times, then on as no CI; unreadable -> held,
              the CI_UNREADS+1th at one head a query "planning"; green or no CI at all -> on. THE MERGE (S1),
              all under the git lock: fetch; main_before must be base_sha (else back to Δ); expected =
@@ -149,6 +153,14 @@ ACTIVE = (T.PLANNED, T.CHECKING, T.MERGEABLE)   # planned from a base and not me
 SMALL_CHECKS = int(os.environ.get("LANDER_SMALL_CHECKS") or 5)   # a plan with more checks than this is heavy
 # …and so is a plan with one of these, however few its checks: a count is not a cost, and check-sh is the whole suite
 FULL_CHECKS = tuple((os.environ.get("LANDER_FULL_CHECKS") or "check-sh").split())
+# EXPRESS: a check a mergeable job reruns only because main moved (revalidate) and that is not one of FULL_CHECKS runs
+# at once, beside the box's width() and with no admission slot, at most this many lane-wide (2026-10-02/03: #905 was
+# sent back four times for a 0 s core-identity rerun that waited hours behind half-hour suites, while main moved again)
+EXPRESS_SLOTS = int(os.environ.get("LANDER_EXPRESS_SLOTS") or 1)
+# …and only a check whose every green run in the queue log's last EXPRESS_TAIL bytes took at most this many seconds:
+# one with no green run there (a new or renamed check) waits for a slot like any other
+EXPRESS_SECS = float(os.environ.get("LANDER_EXPRESS_SECS") or 120)
+EXPRESS_TAIL = 1 << 20
 # a job parked on an overlap is retried at every wake; within this many seconds of its last read of GitHub it is
 # checked against the files that read gave, with no new call (a head moved meanwhile is read once this runs out)
 PARK_FRESH = float(os.environ.get("LANDER_PARK_FRESH") or 300)
@@ -170,10 +182,11 @@ MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": 
 class Flight:
     """One check a job has in the lane's pool, and the head, base and merge tree it was started on."""
 
-    def __init__(self, future, pr, name, head, base, tree, laptop, stop):
+    def __init__(self, future, pr, name, head, base, tree, laptop, stop, express=False):
         self.future, self.pr, self.name, self.head, self.base, self.tree = future, pr, name, head, base, tree
         self.laptop = laptop   # sent to the laptop: it counts against LAPTOP_SLOTS, not the box's slots
         self.stop = stop   # a threading.Event; set: run.execute kills the check (the job left this head)
+        self.express = express   # a Δ rerun's (EXPRESS): it counts against EXPRESS_SLOTS, not the box's slots
 
 
 class UnitFault(Exception):
@@ -432,7 +445,7 @@ class Lane:
                     REC.new_nonce(self.repo, J.landq())
                 tried = self.tried = set()
                 self.waiting, self.inflight = set(), {}
-                with futures.ThreadPoolExecutor(max_workers=max(1, A.SLOTS) + A.LAPTOP_SLOTS,
+                with futures.ThreadPoolExecutor(max_workers=max(1, A.SLOTS) + A.LAPTOP_SLOTS + EXPRESS_SLOTS,
                                                 thread_name_prefix="check") as pool:
                     self.pool = pool
                     moved = self.loop(tried)
@@ -499,8 +512,53 @@ class Lane:
 
     def room(self, laptop: bool) -> bool:
         """A free place for one more check: on the laptop (LAPTOP_SLOTS), else among the box's width()."""
-        n = sum(1 for f in self.inflight.values() if f.laptop == laptop)
+        n = sum(1 for f in self.inflight.values() if f.laptop == laptop and not f.express)
         return n < (A.LAPTOP_SLOTS if laptop else self.width())
+
+    def express(self, job) -> list:
+        """The checks of `job` still to run that go EXPRESS: the ones revalidate named at this very base and head,
+        and none while the box is under memory pressure (admission is down to one slot then: parallel checks have
+        run it out of memory), so those wait for a slot like any other check."""
+        x = job.extra.get("express") or {}
+        if x.get("on") != [job.base_sha, job.head] or A.mem_loaded():
+            return []
+        return list(x.get("checks") or [])
+
+    @staticmethod
+    def quick(repo, names) -> list:
+        """Of `names`, the checks whose green runs of `repo` in the queue log's tail all took at most EXPRESS_SECS."""
+        try:
+            with open(E.log_path(), "rb") as f:
+                at = max(0, f.seek(0, os.SEEK_END) - EXPRESS_TAIL)
+                f.seek(at)
+                lines = f.read().decode(errors="replace").splitlines()[1 if at else 0:]   # a cut first line
+        except OSError:
+            return []
+        took = E.lead_times(lines, repo=repo)["gates"]
+        return [n for n in names if took.get(n) and max(took[n]) <= EXPRESS_SECS]
+
+    def unchanged(self, job, main_now, names) -> list:
+        """Of `names`, the checks `job` runs as main has them: defined the same, in the same manifest, at its head as
+        at main_now, and with no file of their run line (MF.run_files) among the PR's own. The times quick() reads are
+        kept by name across every PR, so they say nothing of a check this PR redefines or whose script it edits."""
+        try:
+            base = MF.load(self.root, main_now, fallback=self.fallback)
+            head = MF.load(self.root, job.head, fallback=self.fallback, strict=False)
+        except (MF.ManifestError, G.GitError):
+            return []
+        mine = set(job.files or [])
+        out = []
+        for n in names:
+            b, pre = base.checks.get(n), base.cwd.get(n, "")
+            if b is None or head.checks.get(n) != b or head.cwd.get(n, "") != pre:
+                continue
+            ran = [pre + w for w in MF.run_files(b.run)]
+            if not any(f == w or f.startswith(w + "/") for f in mine for w in ran):
+                out.append(n)
+        return out
+
+    def express_room(self) -> bool:
+        return sum(1 for f in self.inflight.values() if f.express) < EXPRESS_SLOTS
 
     def laptop_up(self) -> bool:
         return time.time() - self.laptop_down >= LAPTOP_REST
@@ -857,7 +915,8 @@ class Lane:
             dest = bool(RUN.laptop_dest()) and not self.member
             up = dest and self.laptop_up()
             kw = {"box_only": True} if dest else {}   # a box slot's check stays on the box, not a wait on ssh
-            if not todo or not (self.room(False) or (up and self.room(True))):
+            fast = [n for n in todo if n in self.express(job)]
+            if not todo or not (self.room(False) or (up and self.room(True)) or (fast and self.express_room())):
                 self.waiting.add(job.key)    # it goes on when a check finishes and frees a slot
                 return None
             m = self.manifest(job)
@@ -880,7 +939,10 @@ class Lane:
             quarantine = RUN.quarantine_text(self.root, job.base_sha)
             for n in todo:
                 c = MF.builtin_check() if n == MF.BUILTIN else m.checks.get(n)
-                if up and c is not None and RUN.may_leave(c) and self.room(True):
+                express = n in fast and self.express_room()
+                if express:   # EXPRESS: on the box (or the member's sandbox) now, no slot, no ssh to wait out
+                    laptop = False
+                elif up and c is not None and RUN.may_leave(c) and self.room(True):
                     laptop = True
                 elif self.room(False) and not any(k[0] == job.key and not f.laptop for k, f in self.inflight.items()):
                     # the box, one check per job at a time (so an older heavy PR does not take every box slot); a
@@ -892,8 +954,10 @@ class Lane:
                 fut = self.pool.submit(self.call, "runner", "run_plan", self.root, m, job.plan, job.files, tree,
                                        base_tree, member=self.member, store=store, job_key=job.key,
                                        scope=self.member or self.repo, pr=job.pr, quarantine_text=quarantine,
-                                       only=[n], fallback=self.fallback, cancel=stop, **({} if laptop else kw))
-                self.inflight[(job.key, n)] = Flight(fut, job.pr, n, job.head, job.base_sha, tree, laptop, stop)
+                                       only=[n], fallback=self.fallback, cancel=stop,
+                                       **({} if laptop else kw), **({"express": True} if express else {}))
+                self.inflight[(job.key, n)] = Flight(fut, job.pr, n, job.head, job.base_sha, tree, laptop, stop,
+                                                     express)
             self.waiting.add(job.key)   # submitted or not, it goes on when a check finishes and frees a slot
             return None
         if job.plan and job.plan.paid and not self.review(job):
@@ -1067,6 +1131,11 @@ class Lane:
         own = self.call("planner", "plan", self.root, job.base_sha, main_now, delta, fallback=self.fallback).checks
         old = set(job.plan.checks if job.plan else [])
         rerun = sorted((set(new.checks) - old) | (set(new.checks) & set(own)))
+        # EXPRESS: only what this re-plan sends back, at this base and head, never a whole suite, only a short check
+        job.extra["express"] = {"on": [main_now, job.head],
+                                "checks": self.quick(job.repo, self.unchanged(job, main_now,
+                                                                              [n for n in rerun
+                                                                               if n not in FULL_CHECKS]))}
         # a plan that became paid with no LAND at this digest must go through the review too
         pv = job.extra.get("verdict") or {}
         needs_read = new.paid and not (pv.get("verdict") == T.LAND and pv.get("digest") == job.digest)

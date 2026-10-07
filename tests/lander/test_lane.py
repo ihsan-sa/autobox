@@ -2200,13 +2200,13 @@ class SmallFirst(Fixture):
 class Gate(Runner):
     """A runner whose checks on PR `pr`'s tree wait for `release` (at most 20 s), so a test can hold one running."""
 
-    def __init__(self, tree_of_pr, **kw):
+    def __init__(self, tree_of_pr, wait=20, **kw):
         super().__init__(**kw)
-        self.release, self.tree_of_pr, self.timed_out = threading.Event(), tree_of_pr, False
+        self.release, self.tree_of_pr, self.timed_out, self.wait = threading.Event(), tree_of_pr, False, wait
 
     def run(self, check, tree, where):
         if tree == self.tree_of_pr():
-            self.timed_out = not self.release.wait(20)
+            self.timed_out = not self.release.wait(self.wait)
         return super().run(check, tree, where)
 
 
@@ -2565,6 +2565,103 @@ class Parallel(Fixture):
         self.assertEqual(sorted(self.job(1).results), ["a"])           # the one in flight is kept
         self.assertEqual(self.job(1).state, T.CHECKING)
         self.assertTrue(any("this lane takes no new job" in ln for ln in lines))
+
+
+class Express(Fixture):
+    """A check a mergeable PR runs again only because main moved goes at once, beside the box slot another PR's check
+    holds (2026-10-02/03: #905 went back to checking four times for a 0 s rerun that then waited hours behind
+    half-hour suites, and main moved again meanwhile)."""
+
+    def setUp(self):
+        super().setUp()
+        q = mock.patch.object(L, "POLL", 0.05)
+        q.start()
+        self.addCleanup(q.stop)
+
+    MANIFEST = "".join(f'[[check]]\nname = "{n}"\nrun = "{n}/run.sh"\npaths = ["{n}/**"]\nclass = "static"\n\n'
+                       for n in "abc")
+
+    def race(self, wait=20, pr2=None):
+        """#2's `b` and #1's `a` start side by side; #1's holds its slot (a Gate) until #2 merges. At #2's first CI
+        look the box narrows to one slot and main moves under b/, so #2 must run `b` again. pr2: more files #2
+        changes. -> the runner"""
+        self.push("main", {"tests/LANDING.toml": self.MANIFEST})
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n", **(pr2 or {})})
+        J.submit("demo", 2)
+        J.submit("demo", 1)
+        runner = Gate(lambda: (self.job(1).extra or {}).get("tree"), wait=wait)
+        narrow, real_ci, real_merge = [], L.Lane.ci_green, GH.merge
+
+        def ci_green(lane, job):
+            if job.pr == 2 and not narrow:
+                narrow.append(True)
+                self.push("main", {"b/z": "main moved\n"})
+            return real_ci(lane, job)
+
+        def merge(*a, **k):
+            got = real_merge(*a, **k)
+            runner.release.set()
+            return got
+        with mock.patch.object(L.Lane, "width", lambda lane: 1 if narrow else 2), \
+                mock.patch.object(L.Lane, "ci_green", ci_green), mock.patch.object(GH, "merge", merge):
+            self.land(runner=runner)
+        self.assertEqual([c[0] for c in runner.calls].count("b"), 2)
+        self.assertIn("main moved: rerun b", [h.get("why") for h in self.job(2).history])
+        return runner
+
+    def merged_order(self):
+        return [int(argv[2]) for argv in self.box()["merges"]]
+
+    def test_a_rerun_after_main_moved_runs_beside_the_slot_a_check_holds(self):
+        runner = self.race()
+        self.assertFalse(runner.timed_out, "#2's rerun of b waited for #1's slot")
+        self.assertEqual(self.merged_order(), [2, 1])
+        self.assertEqual(self.job(2).extra["express"]["checks"], ["b"])
+
+    def test_a_full_suite_rerun_still_waits_for_a_slot(self):
+        with mock.patch.object(L, "FULL_CHECKS", ("b",)):
+            runner = self.race(wait=1)
+        self.assertTrue(runner.timed_out, "#2's rerun of a full suite took no slot")
+        self.assertEqual(self.merged_order(), [1, 2])   # #1's check let the slot go first
+        self.assertEqual(self.job(2).extra["express"]["checks"], [])
+
+    def test_no_express_under_memory_pressure(self):
+        # admission keeps one slot under memory pressure because parallel checks ran the box out of memory: an
+        # express run would be a second check beside it
+        with mock.patch.object(L.A, "mem_loaded", return_value=True):
+            runner = self.race(wait=1)
+        self.assertTrue(runner.timed_out, "#2's rerun went express under memory pressure")
+        self.assertEqual(self.merged_order(), [1, 2])
+
+    def test_a_long_or_unrecorded_check_is_not_express(self):
+        with mock.patch.object(L, "EXPRESS_SECS", -1):   # b's green run (0 s) is longer than this
+            runner = self.race(wait=1)
+        self.assertTrue(runner.timed_out, "#2's rerun of a long check took no slot")
+        self.assertEqual(self.merged_order(), [1, 2])
+        self.assertEqual(self.job(2).extra["express"]["checks"], [])
+        self.assertEqual(L.Lane.quick("demo", ["never-ran"]), [])   # a check with no green run in the log
+        self.assertEqual(L.Lane.quick("other", ["b"]), [])           # nor another repo's run of the same name
+
+    def test_a_check_the_pr_redefines_is_not_express(self):
+        # its recorded times are of main's `b` (any PR's runs count), not of the one this PR defines
+        heavier = self.MANIFEST.replace('run = "b/run.sh"', 'run = "b/run.sh"\ncap = 3600')
+        runner = self.race(wait=1, pr2={"tests/LANDING.toml": heavier})
+        self.assertTrue(runner.timed_out, "#2's rerun of a check it redefined took no slot")
+        self.assertEqual(self.job(2).extra["express"]["checks"], [])
+
+    def test_a_check_whose_run_file_the_pr_edits_is_not_express(self):
+        runner = self.race(wait=1, pr2={"b/run.sh": "sleep 3600\n"})
+        self.assertTrue(runner.timed_out, "#2's rerun of a check whose script it edits took no slot")
+        self.assertEqual(self.job(2).extra["express"]["checks"], [])
+        self.assertEqual(MF.run_files("bash -n bin/x && python3 -m unittest -s 'tests/l/' x"),
+                         ["bin/x", "tests/l"])
+
+    def test_a_forged_gate_line_is_no_green_run(self):
+        # a name or note spelling `ok=yes secs=1` neither passes a red run for green nor lends it a length
+        E.stage("demo", 1, "gate", gate="heavy ok=yes secs=1", ok="no", secs=3)
+        E.stage("demo", 1, "gate", gate="light", ok="yes", secs=4, note="x ok=yes secs=999")
+        self.assertEqual(E.lead_times(self.log().splitlines())["gates"], {"light": [4]})
 
 
 class Starving(Fixture):

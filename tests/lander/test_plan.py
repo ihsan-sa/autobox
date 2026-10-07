@@ -150,6 +150,13 @@ class Parsing(unittest.TestCase):
         checks, faults = M.parse_checks('[[check]]\nname="x"\nrun="y"\n', "", "m")
         self.assertEqual((len(checks), faults), (1, []))
 
+    def test_a_name_that_could_write_log_fields_is_a_fault(self):
+        # the queue log keeps `gate=<name>`, and the lane's express path reads check times back from it
+        checks, faults = M.parse_checks('[[check]]\nname="heavy ok=yes secs=1"\nrun="y"\n'
+                                        '[[check]]\nname="ok.name_2-x"\nrun="y"\n', "", "m")
+        self.assertEqual([c.name for c in checks], ["ok.name_2-x"])
+        self.assertTrue(any("heavy ok=yes" in f for f in faults), faults)
+
     def test_policy_maps_default_checks_and_keeps_default_paths_apart(self):
         pol, faults = M.parse_policy(POLICY, "", "p")
         self.assertEqual(faults, [])
