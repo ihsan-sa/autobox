@@ -286,7 +286,7 @@ await check('record.py: records what a command prints, with the marks the driver
 
 // ── motion/: the drawn-film kit (pure maths, the React pieces, the stutter measure) ──
 const M = await import('./motion/motion.mjs');
-const { frameDiffs, stutters } = await import('./motion/measure.mjs');
+const { frameDiffs, jerkSpans, jerks, stutters } = await import('./motion/measure.mjs');
 
 await check('motion: every easing runs 0 to 1 without going back, and bezier() matches CSS where CSS is known', () => {
   for (const [name, e] of Object.entries(M.EASE)) {
@@ -353,6 +353,22 @@ await check('measure: stutters() flags a frame frozen inside a move, and passes 
   eq(stutters(jank), [5, 11, 17, 23, 29, 35], 'every 6th frozen');
 });
 
+await check('measure: jerks() flags a hitch, a too-fast move and a camera pop, and passes a smooth move, a lone cut and a let-through fade', () => {
+  const smooth = Array.from({ length: 40 }, (_, i) => (i ? 2 : 0));
+  eq(jerks(smooth), [], 'smooth');
+  const cut = smooth.map((v, i) => (i === 20 ? 60 : v));
+  eq(jerks(cut), [], 'a lone hard cut');
+  const hitch = smooth.map((v, i) => (i % 6 === 5 ? 4.5 : v));
+  eq(jerks(hitch).map((j) => j.kind + j.i), ['jump5', 'jump11', 'jump17', 'jump23', 'jump29', 'jump35'], 'a 5 Hz hitch');
+  const lurch = smooth.map((v, i) => (i >= 10 && i < 16 ? 14 : v));
+  eq(jerks(lurch).filter((j) => j.kind === 'fast').map((j) => j.i), [10, 11, 12, 13, 14, 15], 'a push-in too fast to read');
+  eq(jerkSpans(jerks(lurch).filter((j) => j.kind === 'fast')), ['0.33-0.50 s fast'], 'as a span');
+  eq(jerks(smooth.map((v, i) => (i === 12 ? 14 : v))).filter((j) => j.kind === 'fast'), [], 'one fast frame is not a run');
+  const pop = smooth.map((v, i) => (i === 20 || i === 22 ? 60 : v));
+  eq(jerks(pop).map((j) => j.kind + j.i), ['pop22'], 'an old view leaking for a frame');
+  eq(jerks(lurch, { allow: [[9, 16]] }), [], 'a crossfade let through');
+});
+
 await check('measure: frameDiffs finds the 25-to-30 fps repeat in a real encode and none in a native 30 fps one', () => {
   const dir = tmp();
   try {
@@ -390,6 +406,11 @@ await check('pieces: render to markup, each a function of t: a ripple only in it
   if (!/grid-template-rows:0\.\d+fr/.test(opening) || !opening.includes('overflow:hidden')) throw new Error('no clipped p fr row while opening');
   if (!open.includes('grid-template-rows') || open.includes('overflow:hidden')) throw new Error('row dropped or clip kept after opening');
   if (html(h(P.MessageIn, { t: 3 }, 'hi')).includes('grid-template-rows')) throw new Error('a row on an item that was always there');
+  /* dur opens it on a smoothstep: half open at half of dur, and done (no row, no clip) at dur exactly */
+  const rows = (o) => Number(/grid-template-rows:([\d.]+)fr/.exec(html(h(P.MessageIn, { at: 1, ...o }, 'hi')))[1]);
+  eq(rows({ t: 1.6, dur: 1.2 }).toFixed(6), '0.500000', 'dur 1.2: half open at 0.6 s');
+  if (!(rows({ t: 1.1, dur: 1.2 }) < rows({ t: 1.1 }))) throw new Error('dur 1.2 opens no slower than the spring');
+  if (html(h(P.MessageIn, { t: 2.2, at: 1, dur: 1.2 }, 'hi')).includes('overflow:hidden')) throw new Error('dur 1.2 still clipped at 1.2 s');
   const b = html(h(P.MotionBlur, { t: 1, fps: 30, n: 5, render: (t) => h('i', null, t.toFixed(4)) }));
   eq((b.match(/data-sample/g) || []).length, 5, 'blur samples');
   if (!b.includes('opacity:0.2')) throw new Error('the 5th sample is not at 1/5: ' + b);

@@ -31,12 +31,15 @@ export function pieces(React) {
    *  needed: an estimate over the real height stopped the slide dead before the spring had settled (a held frame), and one
    *  under it made the item jump when it finished. The row stays on after it has opened (only the clip goes): dropping it
    *  moved the text a fraction of a pixel and re-rastered it, a one-frame pop on a still frame. The blur drops while the rise still moves fast (q 0.85): Chrome rasters a
-   *  filtered layer differently, so a blur ending on the spring's still tail pops a frame after a held one. */
+   *  filtered layer differently, so a blur ending on the spring's still tail pops a frame after a held one. `dur` opens a
+   *  tall item on a smoothstep over that many s instead of the spring: its peak speed is 1.5x its mean (the spring starts at
+   *  its fastest), and it comes to rest at `dur` exactly, so what it pushes up neither lurches nor creeps a pixel late. */
   const BLUR_END = 0.85;
-  function MessageIn({ t, at, rise = 18, children }) {
+  const smooth = (x) => x * x * (3 - 2 * x);
+  function MessageIn({ t, at, rise = 18, dur, children }) {
     if (at != null && t < at) return null;
-    const p = at == null ? 1 : spring(t, at, { freq: 2.0 });
-    const q = at == null ? 1 : spring(t, at + 0.04, { freq: 2.4 });
+    const p = at == null ? 1 : dur ? smooth(clamp((t - at) / dur)) : spring(t, at, { freq: 2.0 });
+    const q = at == null ? 1 : dur ? smooth(clamp((t - at) / (0.8 * dur))) : spring(t, at + 0.04, { freq: 2.4 });
     const done = p > 0.999;
     return h('div', { 'data-piece': 'message', style: at == null ? { flex: 'none' } : { flex: 'none', display: 'grid', gridTemplateRows: `${p}fr` } },
       h('div', { style: { minHeight: 0, overflow: done ? 'visible' : 'hidden' } },
