@@ -587,14 +587,15 @@ for id in $(wins "$REPO/c7"); do tmux kill-window -t "$id"; done
   || bad "--go did not open the track thread as expected: $(cat "$T/tt.args" | tr '\n' '|') :: $(tail -3 "$T/c7on.out" | tr '\n' ' ')"
 # …AND FROM THAT PR ON, THE ROW IS THE LANDING QUEUE'S. A plain dispatch — this process's or any other's — is
 # refused before it writes a brief or buys a turn, because the remainder of a track kept running inside a change
-# already delivered and landed it twice (arch review 2026-09-08 rec 6). The queue's own reservation for that PR
-# and head is the one way back in, and the dispatch it then runs adopts that repair rather than claiming afresh.
+# already delivered and landed it twice (arch review 2026-09-08 rec 6). A reservation for that PR and head
+# (`cc … --go --repair` makes one) is the one way back in, and the dispatch then adopts it rather than claiming afresh.
 cp "$d6" "$T/c6before.json"
+# recurring-defect-ok: pause-hold-missing — this case drives a refused --go; cc checks cc-pause before it reserves or launches anything
 ( "$B/cc" $REPO c6 --go "" >"$T/c6go.out" 2>&1; echo $? > "$T/c6go.rc" )   # a subshell of its own: a different owner
 { [ "$(cat "$T/c6go.rc")" != 0 ] && grep -q 'delivery-pending' "$T/c6go.out" \
-  && grep -q 'fixture/repo/pull/1' "$T/c6go.out" \
+  && grep -q 'fixture/repo/pull/1' "$T/c6go.out" && grep -q -- "cc $REPO c6 --go .* --repair" "$T/c6go.out" \
   && cmp -s "$d6" "$T/c6before.json" && [ -z "$(wins "$REPO/c6")" ]; } \
-  && ok "…and a delivered row is not dispatched again: the refusal names the PR, and no window, brief or record write was spent" \
+  && ok "…and a delivered row is not dispatched again: the refusal names the PR and the --repair door, and no window, brief or record write was spent" \
   || bad "a delivered row dispatched anyway: rc=$(cat "$T/c6go.rc") $(cat "$T/c6go.out")"
 # The queue's two steps, in one process the way cc-land runs them: the reservation, then its own dispatch. Both
 # plain commands here — a $(…) or a subshell would be a second owner, which is what D5 of cc-task refuses.
@@ -611,6 +612,24 @@ e6=$(jq -r .execution_id < "$T/c6res.out")   # the reservation's own execution: 
   && ok "…so the queue's repair round is what dispatches it afterwards — the same task, its reservation adopted instead of a claim of its own" \
   || bad "the repair round would not dispatch a delivered row: reserve rc=$r6 go rc=$g6 $(cat "$T/c6res.out" "$T/c6go2.out")"
 for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
+# --repair IS THAT DOOR FROM `cc` ITSELF (raised-member-pr-has-no-repair-door, 2026-10-03): nothing in the landing
+# reserved a repair, so a PR sent back for fixes reached no worker. The dispatch reserves at the worktree's HEAD and
+# adopts it, as above; a second --repair at the same head is refused, because one worker is already on that head.
+c6head=$(git -C ~/.cc/worktrees/$REPO/c6 rev-parse HEAD)
+"$B/cc" $REPO c6 --go "" --repair >"$T/c6rp.out" 2>&1; p6=$?
+{ [ "$p6" = 0 ] && [ -n "$(wins "$REPO/c6")" ] && [ "$(jq -r .task_id < "$d6")" = "$c6tid" ] \
+  && [ "$(jq -r .claim.generation < "$d6")" = 3 ] && [ "$(jq -r '.executions[-1].phase' < "$d6")" = repair ] \
+  && [ "$(jq -r '.executions[-1].repair.head' < "$d6")" = "$c6head" ] \
+  && [ "$(jq -r '.executions[-1].outcome' < "$d6")" = "released: worker launched" ]; } \
+  && ok "cc … --go --repair reserves a repair of the delivered PR at the worktree's HEAD and launches it on the same task" \
+  || bad "--repair did not dispatch the delivered row: rc=$p6 $(cat "$T/c6rp.out")"
+for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
+cp "$d6" "$T/c6before.json"
+"$B/cc" $REPO c6 --go "" --repair >"$T/c6rp2.out" 2>&1; p6=$?
+{ [ "$p6" != 0 ] && grep -q 'already dispatched' "$T/c6rp2.out" && cmp -s "$d6" "$T/c6before.json" \
+  && [ -z "$(wins "$REPO/c6")" ]; } \
+  && ok "…and a second --repair at that same head is refused, with no window and no record write" \
+  || bad "a second repair at one head launched or wrote: rc=$p6 $(cat "$T/c6rp2.out")"
 # NOTHING THE HOST OPENS IN A TRACK'S OWN DIRECTORIES IS WRITTEN THROUGH A PLANTED NAME. $wt/.cc and $st are
 # bound read-write into that track's worker sandbox and into a member workspace, so a link left at a name the
 # DISPATCH path opens would have the next `--go` — cc-land's repair round, which needs no person — truncate any

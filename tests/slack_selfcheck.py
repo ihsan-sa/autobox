@@ -7067,7 +7067,8 @@ def run_selfcheck():
         r_hist = ms_req({"history": "CAL", "n": 5}); r_hist_bob = ms_req({"history": "CBOB"}); r_thr = ms_req({"thread": "CALT", "ts": "1.0"})
         r_file_out = ms_req({"file": "CAL", "path": "/tmp/x.png"}); r_file_bob = ms_req({"file": "CBOB", "path": f"{DEV}/alice/x.png"})
         # dispatch: `cc <h> <track> --go ""` on the host, this workspace only, options vetted
-        r_disp = ms_req({"dispatch": "alice/todo", "opts": ["--loop", "2", "--budget", "5"]})
+        r_disp = ms_req({"dispatch": "alice/todo", "opts": ["--loop", "2", "--repair", "--budget", "5"]})
+        r_disp_rep_bad = ms_req({"dispatch": "alice/todo", "opts": ["--repair", "--loop"]})   # --repair takes no value; --loop still needs one
         r_disp_bob = ms_req({"dispatch": "bob/todo"}); r_disp_main = ms_req({"dispatch": "alice"}); r_disp_bad = ms_req({"dispatch": "alice/todo", "opts": ["--budget", "1e9"]})
         r_disp_inj = ms_req({"dispatch": "alice/todo", "opts": ["--model", "x; rm -rf /"]})
         ran_disp = ranMS[len(ran_rep_n) + n_ran_rep:]   # from after the reply above: what the DISPATCH verb ran
@@ -7755,11 +7756,12 @@ def run_selfcheck():
           and r_react_th.get("ok") and ("CAL", "1.7", "+1", False, "1.1") in reactedMS
           and r_hist.get("ok") and r_hist_bob.get("ok") is False and r_thr.get("ok")
           and r_file_out.get("ok") is False and "not visible outside the boundary" in r_file_out.get("error", "") and r_file_bob.get("ok") is False)
-    check("MEMBER socket: dispatch runs `cc alice todo --go \"\" --loop 2 --budget 5` on the HOST (where the daily budget is "
-          "charged and the loop is put inside the boundary); another workspace, the main session, a budget that is not a "
-          "number and an option carrying shell text are refused before anything runs",
-          r_disp.get("ok") and ran_disp == [[f"{BIN}/cc", "alice", "todo", "--go", "", "--loop", "2", "--budget", "5"]]
-          and all(r.get("ok") is False for r in (r_disp_bob, r_disp_main, r_disp_bad, r_disp_inj)))
+    check("MEMBER socket: dispatch runs `cc alice todo --go \"\" --loop 2 --budget 5 --repair` on the HOST (where the daily "
+          "budget is charged and the loop is put inside the boundary; --repair, the one flag with no value, goes last); "
+          "another workspace, the main session, a budget that is not a number, an option carrying shell text and an "
+          "option left without its value are refused before anything runs",
+          r_disp.get("ok") and ran_disp == [[f"{BIN}/cc", "alice", "todo", "--go", "", "--loop", "2", "--budget", "5", "--repair"]]
+          and all(r.get("ok") is False for r in (r_disp_bob, r_disp_main, r_disp_bad, r_disp_inj, r_disp_rep_bad)))
     check("SOCKET: exactly ONE recognised verb per request, on both sockets — a payload was authorised on the verb the "
           "scope check found and then executed on a second key beside it ({hello: alice, reply: D0…} posted into a DM, "
           "{hello: alice, dispatch: bob/todo} ran a worker in another workspace). Two verbs, or none, is refused whole "

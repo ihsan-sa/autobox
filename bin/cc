@@ -21,6 +21,9 @@
 #                             the dispatcher's call for that one task (fable[1m] only where Opus 5.5 at xhigh visibly falls short)
 #                             --resume-last: the first iteration continues this track's last session instead of
 #                             a cold one — for a repair round, where re-deriving what it already found is the cost
+#                             --repair: the one way back into a row whose PR is out for landing (delivery-pending) —
+#                             cc-task reserves a repair of that PR at the worktree's HEAD, once per head, and the worker
+#                             pushes its fix onto the same branch and PR. A row with no open PR dispatches as usual
 #   cc <repo> <track> --say "text"           type text into that track's running interactive session
 #   A MEMBER WORKSPACE'S SESSION (cc __runmember, and its handoff successor) runs on CC_MEMBER_MODEL (claude-sonnet-5): it routes
 #   and answers, and its tracks are --go workers on CC_WORKER_MODEL; before 2026-09-18 it inherited the interactive primary (Fable[1m]).
@@ -508,7 +511,7 @@ nolink(){   # A TRACK'S STATE DIR AND ITS WORKTREE'S .cc ARE BOUND READ-WRITE in
   local p; for p; do [ -L "$p" ] && { echo "cc: $p is a symlink — refused (nothing here writes through a planted name)"; return 1; }; done; return 0; }
 lock(){ mkdir -p "$(dirname "$1")"; nolink "$1" || exit 1; exec 9>>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
-usage(){ sed -n '2,58p' "$0"; }   # the whole header block, down to the `cc selfcheck` line — bump it when a line is added
+usage(){ sed -n '2,61p' "$0"; }   # the whole header block, down to the `cc selfcheck` line — bump it when a line is added
 
 # THE CLAIM. A row has one writer at a time, and which one is not a matter of who typed first: cc-task records the
 # owner off the running process and refuses a second live one (bin/cc-task says how it decides). Two steps, and
@@ -552,6 +555,27 @@ claim_delivered(){   # …and for a SUBAGENT the thing that ends it is delivery:
   # `cc done` is where its turn on the row finishes. Only once the delivery really settled — a push that failed
   # opened nothing, the work is still the claimer's, and the claim stands so a repair does not land on top of it.
   case "$("$BOARD" get "$repo" "$track" status 2>/dev/null)" in review|merged|done) claim_end delivered ;; esac
+}
+
+# A REPAIR (--repair) is the one way back into a delivery-pending row (raised-member-pr-has-no-repair-door,
+# 2026-10-03): cc-task's refusal named "the queue's repair round", but no landing ever reserved one, so a PR sent
+# back for fixes — a member's especially, whose seat cannot write the canonical worktree — had no route to a worker.
+# The reservation is cc-task's, keyed on the PR and the HEAD the worker starts from, so the same head is launched
+# once; claim_track then adopts it (cc-task adopts_repair: same owner, since cc-task never counts `cc` as one).
+repair_pr(){ "$BIN/cc-task" show "$repo" "$track" 2>/dev/null | jq -r 'select(.closed == null) | .pr.url // empty' 2>/dev/null; }
+repair_reserve(){
+  local rec pr gen head res
+  rec=$("$BIN/cc-task" show "$repo" "$track") || exit 1
+  pr=$(jq -r '.pr.url // empty' <<<"$rec"); gen=$(jq -r '.claim.generation // empty' <<<"$rec")
+  head=$(git "${GITNH[@]}" -C "$wt" rev-parse HEAD 2>/dev/null) || { echo "cc: $wt has no HEAD to repair from"; exit 1; }
+  res=$("$BIN/cc-task" reserve-repair "$repo" "$track" --generation "$gen" --branch "track/$track" --pr "$pr" --head "$head") || exit 1
+  [ "$(jq -r .launch <<<"$res")" = true ] && return 0
+  # launch=false: this PR and head were reserved before. A reservation no launch has ended yet (a door after it
+  # failed) is still open, and claim_track adopts it or refuses its live owner; one a launch ended is a repair
+  # already dispatched at this head, and a second worker on the same head would only race it.
+  [ "$(jq -r '.claim.phase + " " + (.claim.ended_at // "")' <<<"$("$BIN/cc-task" show "$repo" "$track")")" = "repair " ] && return 0
+  echo "cc: a repair of $pr at ${head:0:12} was already dispatched — its worker pushes a new head, and the next --repair starts from that"
+  exit 1
 }
 
 done_write(){ "$BIN/cc-task" "$1" "$repo" "$track" --generation "$done_generation" "${@:2}" >/dev/null || exit 1; }
@@ -1633,11 +1657,14 @@ if [ -z "$track" ]; then
   unlock; [ -t 0 ] && tmux select-window -t "$(win_id "$repo")"; attach_main; exit 0
 fi
 ensure_track "$repo" "$track"; win="$repo/$track"; wt="$WTBASE/$repo/$track"; st="$STBASE/$repo/$track"
-mode=""; text=""; LOOPN=1; XTRA=(); SESS=""
-while [ $# -gt 0 ]; do case "$1" in --go|--say) mode="${1#--}"; text="${2:-}"; shift;; --loop) LOOPN="$2"; shift;; --budget|--model|--effort|--turns) XTRA+=("$1" "$2"); shift;; --resume-last|--no-extend) XTRA+=("$1");; --session) SESS=1;; *) echo "cc: unknown option $1"; exit 1;; esac; shift; done
+mode=""; text=""; LOOPN=1; XTRA=(); SESS=""; REPAIR=""
+while [ $# -gt 0 ]; do case "$1" in --go|--say) mode="${1#--}"; text="${2:-}"; shift;; --loop) LOOPN="$2"; shift;; --budget|--model|--effort|--turns) XTRA+=("$1" "$2"); shift;; --resume-last|--no-extend) XTRA+=("$1");; --session) SESS=1;; --repair) REPAIR=1;; *) echo "cc: unknown option $1"; exit 1;; esac; shift; done
 CLAIM=""   # a headless worker is one of the two executors, so it claims the row the same way
 if [ "$mode" = go ] && [ -z "$SESS" ] && ! inside && [ "$("$BOARD" get "$repo" "$track" kind 2>/dev/null)" != session ]; then
-  CLAIM=1; claim_check worker   # asked BEFORE the brief is written and the live window is killed; taken below, once
+  CLAIM=1
+  # A REPAIR IS ASKED AT ITS RESERVATION, not here: the plain check refuses every delivery-pending row, and that
+  # refusal is exactly what --repair is the door through (repair_reserve, before the brief).
+  [ -n "$REPAIR" ] && [ -n "$(repair_pr)" ] || claim_check worker   # asked BEFORE the brief is written and the live window is killed; taken below, once
 fi
 # --session marks the row's KIND (cc-board KINDS): a channel-like session with no task to finish — cc-reconcile leaves
 # its status alone and the Home tab groups it under its repo instead of counting it as running. Idempotent; a row that
@@ -1648,7 +1675,7 @@ case "$mode" in
        have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
   go)  if inside; then   # INSIDE the boundary: no tmux, no ledger. The brief is written here (this state dir is the workspace's own);
          # the launch is brokered — the daemon runs `cc <h> <track> --go ""` on the host: budget gate, window and boundary included.
-         write_brief || exit 1; exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}"; fi
+         write_brief || exit 1; exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}" ${REPAIR:+--repair}; fi
        if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
        if member_workspace "$repo"; then member_credential "$repo" "$track" || exit 1; fi   # before the cap: nothing is charged for a launch that cannot happen
        member_gate "$repo" || exit 1
@@ -1669,6 +1696,7 @@ case "$mode" in
        # writes the file, and dispatching only ever ADDS to it — one atomic write, the note on top so the worker
        # reads it first. Replacing a brief stays an explicit act (`cc board set … instructions`), never a side
        # effect of dispatching. Regression tests: "the #71 case" in selftest.sh, and `cc-board selfcheck`.
+       [ -n "$CLAIM" ] && [ -n "$REPAIR" ] && [ -n "$(repair_pr)" ] && repair_reserve   # after every door above: a held launch reserves nothing
        write_brief || exit 1
        [ -n "$CLAIM" ] && claim_track worker   # the claim exists before the worker can write a line
        for pid in $(pgrep -f -- '--max-budget-usd' 2>/dev/null); do   # a previous loop killed by hand can leave claude re-parented to systemd, still writing this worktree
