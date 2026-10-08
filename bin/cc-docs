@@ -10,6 +10,7 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
     cc-docs file <pdf> --project <name|PPP> --title <t> [--source <path>] [--latex <main.tex>] [--no-stamp]
                  [--kind work|course|member] [--member <handle>] [--date YYYY-MM-DD]
                  [--describes PCB-NNNN-R] [--note <text>] [--cost <step>=<usd>]… [--attach <file>]…
+                 [--filer-editor <email>]
         Called by a maker at the end of a finished build. The same source path, or else the same title in the same
         project, is the same document. Content unchanged since the current revision files nothing and prints that
         revision; otherwise the next letter is filed. A PDF whose text carries no number gets a small grey stamp
@@ -56,6 +57,15 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         it files, or to the current one when the content is unchanged; one that `attach` would refuse refuses the
         whole call before anything is filed. A new revision marks its document's open feedback (feedback.json, written
         by the box's library poller) done, "answered by rev X", for the poller to tell the site.
+        --filer-editor <email> is the library editor filing a draft written in the site's editor by someone the site
+        let edit that document (the site decides who may; no session sees the draft): the revision's filer is
+        {"editor": the address lower-cased}, with no session in it, so the library never hands questions on it to one
+        of the owner's sessions. It files only the next revision of a document that already exists, under its own
+        project and exact title, and never a new document; it needs --latex and an email address, refuses a Markdown
+        file, answers none of the document's open feedback, and leaves the document's project, title and visibility
+        as they are (a document filed --no-stamp stays unstamped). The
+        source is then read only from the --latex file's own folder (and the box's style trees), and kpsewhich is not
+        asked.
         A MARKDOWN FILE (.md or .markdown, at most 2 MiB) in place of the PDF files a TEXT REVISION: no PDF (file
         null), the .md kept as its source (source_main, and source_sha256 of its bytes), the .md itself the
         document's --source unless one is given. The site shows it rendering and hands it to the box's renderer,
@@ -140,8 +150,8 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         Everything that viewer may see, as JSON: projects (and the group of each that has one), documents,
         per-viewer star, and per revision its date, note, file, pages, bytes, board revision and cost. The owner
         sees the whole register, each public revision's token and, on a revision a workspace filed, filed_by (its
-        handle); a member sees only documents visible to its workspace, its own stars, and no tokens. A workspace's
-        note is at most 2000 characters.
+        handle, or the address of the member whose library draft it was); a member sees only documents visible to
+        its workspace, its own stars, and no tokens. A workspace's note is at most 2000 characters.
         Any other viewer is refused.
     cc-docs member <handle> [--files <dir>]
         The host's half of filing from inside a member workspace, run by the Slack daemon for its member verb `docs`
@@ -1457,7 +1467,41 @@ def refuse_quarantined(reg, a):
         raise Refused(f"{q[0]} is quarantined: nothing of it is filed (cc-lib --help, QUARANTINE)")
 
 
+EMAIL = re.compile(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
+
+
+def filer_editor(a):
+    """--filer-editor <email>: the library editor filing a draft the site let that address write. The filer is
+    {"editor": email lower-cased} and the source is read from the --latex file's folder alone (and the box's style
+    trees)."""
+    fe = getattr(a, "filer_editor", None)
+    if fe is None:
+        return
+    e = fe.strip().lower()
+    if len(e) > 254 or not EMAIL.match(e):
+        raise Refused(f"--filer-editor: {fe[:80]!r} is not an email address")
+    if not getattr(a, "latex", None):
+        raise Refused("--filer-editor files a LaTeX draft: it needs --latex")
+    a.filer = {"editor": e}
+    a.trees = [os.path.realpath(os.path.dirname(os.path.abspath(a.latex)))]
+
+
+def check_filer_editor(proj, d, a):
+    """--filer-editor files the next revision of a document that exists, under its exact title, and nothing else."""
+    if getattr(a, "filer_editor", None) is None:
+        return
+    if not d:
+        raise Refused(f"--filer-editor files into an existing document only: project {proj} has no {a.title!r}")
+    if d["title"] != a.title:
+        raise Refused(f"--filer-editor keeps the document's title: {d['number']} is {d['title']!r}, not {a.title!r}")
+
+
 def cmd_file(a):
+    # the editor files a member's LaTeX draft as the next revision of a document; a Markdown file would make or
+    # extend a text revision with no check_filer_editor, so it is refused outright
+    if getattr(a, "filer_editor", None) is not None and MD_SRC.search(a.pdf):
+        raise Refused(f"--filer-editor files a compiled LaTeX draft, never Markdown: {a.pdf} is refused")
+    filer_editor(a)
     if MD_SRC.search(a.pdf) and not getattr(a, "origin", None):
         return file_markdown(a)
     src = os.path.abspath(a.pdf)
@@ -1473,6 +1517,7 @@ def cmd_file(a):
         reg = load()
         refuse_quarantined(reg, a)
         proj, num, d, rev = plan(reg, a)
+        check_filer_editor(proj, d, a)
         fresh = not (d and current(d) and current(d).get("fingerprint") in (fp, textprint(text)))
         # an unchanged rebuild with --source keeps a source for the current revision when it has none
         full = f"{num}-{rev}" if fresh else f"{num}-{current(d)['rev']}"
@@ -1499,6 +1544,7 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()
     with Lock():
         reg = load()
         proj, num, d, rev = plan(reg, a)
+        check_filer_editor(proj, d, a)
         # brief: "a changed finished version = next letter, unchanged content = no new letter"
         # a revision filed before page images were hashed carries a text-only print: that still counts as unchanged
         if d and current(d) and current(d).get("fingerprint") in (fp, textprint(text)):
@@ -1585,8 +1631,9 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()
                 print(f"cc-docs: the source of {full} was not kept: {e}", file=sys.stderr)
         save(reg)
         write_views(reg, set(d["visibility"]) - {"owner"})
-        # brief: "When cc-docs files a new revision of a document with open feedback, mark those done"
-        answered = answer_feedback(num, rev, d.get("moved_from", ()))
+        # brief: "When cc-docs files a new revision of a document with open feedback, mark those done"; a member's
+        # kept edit (--filer-editor) answers none of the owner's feedback, which no session has read yet
+        answered = 0 if (who or {}).get("editor") else answer_feedback(num, rev, d.get("moved_from", ()))
     print(f"{full}\t{dst}\tfiled", flush=True)   # first: a maker that folds stderr in reads its first line
     if answered:
         print(f"cc-docs: {full} answers {answered} feedback item(s) on {num}; the library poller tells the site",
@@ -2174,8 +2221,8 @@ def library(reg, viewer):
             if owner and r.get("public_token"):
                 out["token"] = r["public_token"]
             # a workspace's filing is its own words, not the box's: the owner is told whose they are
-            if owner and isinstance(r.get("filer"), dict) and r["filer"].get("member"):
-                out["filed_by"] = r["filer"]["member"]
+            if owner and isinstance(r.get("filer"), dict) and (r["filer"].get("member") or r["filer"].get("editor")):
+                out["filed_by"] = r["filer"].get("member") or r["filer"]["editor"]
             revs.append(out)
         src = d.get("source")
         if src and src.startswith(home + "/"):
@@ -3418,6 +3465,91 @@ def _selfcheck():
         ok("a bare name two groups share is refused; a group lists its projects' documents",
            rc == 2 and "name its group" in o and rc2 == 0
            and [x.split("\t")[0] for x in o2.splitlines()] == ["001-0001-A", "001-0003-A", "002-0002-A", "003-0001-A"])
+        # the library editor files a draft the site let an address write (--filer-editor): each case on a register of
+        # its own, holding one work document and one member document (the latter --no-stamp when asked)
+        def ed_fixture(name, nostamp=False):
+            global ROOT
+            ROOT = os.path.join(t, "r-ed-" + name)
+            src = os.path.join(t, "ed-src-" + name)
+            os.makedirs(src)
+            run("file", mkpdf(src, "w", "Owner notes first"), "--project", "Owner stuff", "--kind", "work",
+                "--title", "Owner notes")
+            run("file", mkpdf(src, "k", "Kid one notes first"), "--project", "Kid1 docs", "--member", "kid1",
+                "--title", "Kid notes", *(["--no-stamp"] if nostamp else []))
+            dr = os.path.join(t, "ed-draft-" + name)
+            os.makedirs(dr)
+            return mkpdf(dr, "main", "Notes second, edited on the library"), os.path.join(dr, "main.tex")
+        revs = lambda n: load()["documents"][n]["revisions"]
+        dp, dt = ed_fixture("next")
+        rc, o = run("file", dp, "--project", "Owner stuff", "--title", "Owner notes", "--latex", dt,
+                    "--filer-editor", " Kid1@Example.COM ")
+        ok("--filer-editor files the draft as the document's next revision, filer the address lower-cased, on any "
+           "project the site allows", rc == 0 and o.startswith("001-0001-B\t") and [r["rev"] for r in revs("001-0001")] == ["A", "B"]
+           and revs("001-0001")[-1].get("filer") == {"editor": "kid1@example.com"})
+        lo = {x["rev"]: x.get("filed_by") for d in library(load(), "owner")["documents"] if d["number"] == "001-0001"
+              for x in d["revisions"]}
+        ok("the owner is told which address filed an editor's revision, and nothing for the box's own",
+           lo == {"A": None, "B": "kid1@example.com"})
+        dp, dt = ed_fixture("new")
+        rc, o = run("file", dp, "--project", "Owner stuff", "--title", "Fresh notes", "--latex", dt,
+                    "--filer-editor", "kid1@example.com")
+        rc2, o2 = run("file", dp, "--project", "Brand new", "--kind", "work", "--title", "Fresh notes", "--latex", dt,
+                      "--filer-editor", "kid1@example.com")
+        ok("--filer-editor never files a new document, nor makes a project",
+           rc == 2 and "existing document only" in o and rc2 == 2 and "existing document only" in o2
+           and sorted(load()["documents"]) == ["001-0001", "901-0001"] and not find_project(load(), "Brand new"))
+        dp, dt = ed_fixture("nolatex")
+        rc, o = run("file", dp, "--project", "Owner stuff", "--title", "Owner notes", "--filer-editor", "kid1@example.com")
+        ok("--filer-editor without --latex is refused, and files nothing",
+           rc == 2 and "needs --latex" in o and len(revs("001-0001")) == 1)
+        dp, dt = ed_fixture("bademail")
+        rc, o = run("file", dp, "--project", "Owner stuff", "--title", "Owner notes", "--latex", dt,
+                    "--filer-editor", "kid1")
+        ok("--filer-editor with no email address is refused, and files nothing",
+           rc == 2 and "not an email address" in o and len(revs("001-0001")) == 1)
+        dp, dt = ed_fixture("title")
+        rc, o = run("file", dp, "--project", "Owner stuff", "--title", "OWNER NOTES", "--latex", dt,
+                    "--filer-editor", "kid1@example.com")
+        ok("--filer-editor naming the document under another title is refused, and the title stays",
+           rc == 2 and "keeps the document's title" in o and len(revs("001-0001")) == 1
+           and load()["documents"]["001-0001"]["title"] == "Owner notes")
+        dp, dt = ed_fixture("nostamp", nostamp=True)
+        rc, o = run("file", dp, "--project", "Kid1 docs", "--title", "Kid notes", "--latex", dt,
+                    "--filer-editor", "kid1@example.com")
+        rv = revs("901-0001")
+        ok("a document filed --no-stamp stays unstamped when the editor files its draft with --filer-editor",
+           rc == 0 and [r["stamped"] for r in rv] == ["none", "none"]
+           and "901-0001" not in pdftext(os.path.join(ROOT, rv[1]["file"])))
+        dp, dt = ed_fixture("keep")
+        before = json.loads(json.dumps(load()))
+        rc, o = run("file", dp, "--project", "Kid1 docs", "--member", "kid2", "--kind", "work", "--title", "Kid notes",
+                    "--latex", dt, "--filer-editor", "kid1@example.com")
+        after = load()
+        ok("--filer-editor leaves the document's project, title and visibility, and the project, as they were",
+           rc == 0 and len(revs("901-0001")) == 2 and after["projects"] == before["projects"]
+           and all(after["documents"]["901-0001"][k] == before["documents"]["901-0001"][k]
+                   for k in ("project", "title", "visibility", "member", "stamp"))
+           and after["documents"]["901-0001"]["visibility"] == ["owner", wid])
+        dp, dt = ed_fixture("md")
+        md = os.path.join(os.path.dirname(dt), "notes.md")
+        with open(md, "w") as f:
+            f.write("# Fresh\n\nA member's Markdown.\n")
+        before = json.loads(json.dumps(load()))
+        rc, o = run("file", md, "--project", "Owner stuff", "--title", "Fresh md", "--filer-editor", "kid1@example.com")
+        rc2, o2 = run("file", md, "--project", "Owner stuff", "--title", "Owner notes", "--latex", dt,
+                      "--filer-editor", "kid1@example.com")
+        ok("--filer-editor on a Markdown file is refused outright, new document or old, and files nothing",
+           rc == 2 and "never Markdown" in o and rc2 == 2 and "never Markdown" in o2 and load() == before)
+        dp, dt = ed_fixture("fb")
+        fbi = {"items": {"1": {"id": "1", "number": "001-0001", "rev": "A", "status": "delivered"},
+                         "2": {"id": "2", "number": "001-0001-A", "status": "new"}}}
+        with open(feedback_path(), "w") as f:
+            json.dump(fbi, f)
+        rc, o = run("file", dp, "--project", "Owner stuff", "--title", "Owner notes", "--latex", dt,
+                    "--filer-editor", "kid1@example.com")
+        ok("a revision --filer-editor files answers none of the owner's open feedback on the document",
+           rc == 0 and o.startswith("001-0001-B\t") and "answers" not in o
+           and json.load(open(feedback_path())) == fbi)
         # a member workspace files across its socket: each case on a register and a HOME of its own
         HOME, ROOT = os.path.join(t, "home"), os.path.join(t, "r6")
         for h, i in (("kid1", wid), ("kid2", "fedcba9876543210")):
@@ -4521,6 +4653,7 @@ def main(argv):
             p.add_argument("--cost", action="append")
             p.add_argument("--latex")
             p.add_argument("--attach", action="append")
+            p.add_argument("--filer-editor")
         else:
             p.add_argument("--tex", action="store_true")
         p.add_argument("--project", required=not IN_SANDBOX)   # inside a workspace the host picks the member's own
