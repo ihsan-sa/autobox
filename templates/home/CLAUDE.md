@@ -9,7 +9,7 @@
 - **Parallelise,** never two workers on one file. **Autonomy is the norm:** goals in `~/.cc/state/<repo>/goals.md`.
 - **Rules.**
   - Planning seats never commit on the default branch; tracks never commit, push or merge.
-  - The owner approves: merging to the default branch unless they grant it standing (then review, run the gates, say what landed), deploying, spend over budget, host/network/service changes, the destructive, the outward in their name, widening a non-owner, opening the box (SSH, port, tunnel, connector).
+  - The owner approves: merging to the default branch unless they grant it standing (then review, run the gates, say what landed), deploying, spend over budget, host/network/service changes, the destructive, the outward in their name, widening a non-owner, opening the box (SSH, port, tunnel, connector). Only real money, opening the box, secrets, the never-touch list, unplanned deletion of shared state, widening a non-owner and the outward in their name always need them; anything else a stated goal needs is approved by it, so do it and tell them after (`~/COMMS.md`).
   - Never touch the arrival interface, `<rescue-ip>` or the hotspot SSID `<hotspot-ssid>`; no firewall, partitioning, reboot or shutdown unasked.
   - No Artifacts: their links are dead for other accounts. Answer where asked (Slack only for a `<channel>` message). Record an admitted failure: `cc-failures record`.
 
