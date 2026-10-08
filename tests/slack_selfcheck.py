@@ -4442,6 +4442,157 @@ def run_selfcheck():
           home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": dict(hpr, owed=True)}]}) == ["❓ [r] *PR #9* · awaiting review"]
           and home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": dict(hpr, owed=False)}]}) == []
           and home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": hpr}]}) == [])
+    # ── THE OWNER'S OPEN ASKS (owner_asked … owner_ask_rows): `!needs` and Home's NEEDS YOU read one table, fed by
+    #    post() as a page goes out and emptied by his answer. Each case below builds its own table and its own fake Slack.
+    real_apiOA = globals()["api"]
+    def oa_fake(chan_of=None, on_link=None, start=100):
+        n = [start]
+        def fake(method, token, **kw):
+            if method == "chat.postMessage":
+                n[0] += 1
+                return {"ok": True, "ts": f"{n[0]}.000100", "channel": (chan_of or {}).get(kw.get("channel"), kw.get("channel"))}
+            if method == "chat.getPermalink":
+                if on_link:                 # what the daemon does while the CLI still waits on this call
+                    on_link(kw.get("channel"), kw.get("message_ts"))
+                return {"ok": True, "permalink": f"https://x.slack.com/archives/{kw.get('channel')}/p{kw.get('message_ts')}"}
+            return {"ok": True}
+        return fake
+    def oa_open():                          # the open asks, without the answers kept for the race
+        return sorted(k for k in load_table(OWNER_ASKS) if not k.startswith("_"))
+    oa_cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWN"}
+    def oa_reset():
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f"{DIR}/{OWNER_ASKS}")
+    try:
+        oa_reset(); globals()["api"] = oa_fake({"UOWN": "DOWN"})
+        _, card = post(oa_cfg, "CAPPR", "🔐 *Approval needed:* restart the landing lane", mail=False, decision=True)
+        post(oa_cfg, "CAPPR", "an ordinary update nobody has to answer", mail=False)
+        _, dm = post(oa_cfg, "UOWN", "*disk* the disk is filling up", mail=False, ask=True)   # cc-notify --owner (post --ask)
+        _, ask = post(oa_cfg, "CREPO", "which syllabus do you want?", "50.000100", mail=False, decision=True)
+        post(oa_cfg, "UOWN", "✅ The command on your #approvals card exited 0:\n```ok```", mail=False)   # run-approved's tail
+        post(oa_cfg, "CALERT", "*bx test* Notifications work.", mail=False, decision=True, ask=False)  # cc-notify test (--no-ask)
+        t = load_table(OWNER_ASKS)
+        check("owner asks: an APPROVAL CARD, a --owner DM and a THREAD ASK are each recorded as they go out, with "
+              "their permalink — the DM under its D… id, the thread ask with its thread — and a post that pages "
+              "nobody is not",
+              sorted(t) == sorted([f"CAPPR:{card}", f"DOWN:{dm}", f"CREPO:{ask}"])
+              and t[f"CAPPR:{card}"]["link"].endswith(f"/CAPPR/p{card}")
+              and t[f"CAPPR:{card}"]["text"].startswith("🔐 *Approval needed:*")    # the ❓ head is not the ask
+              and t[f"CREPO:{ask}"]["thread"] == "50.000100")
+        check("owner asks: ONLY A --owner ESCALATION counts among his DMs — run-approved's output tail to his user id "
+              "is no ask, a `cc-notify test` page (--no-ask) is none either, and owner_asked no longer reads the "
+              "chat at all",
+              not any(k.startswith("CALERT:") for k in t) and sum(k.startswith("DOWN:") for k in t) == 1
+              and not owner_asked(oa_cfg, "UOWN", "anything at all") and owner_asked(oa_cfg, "C1", "❓ <@UOWN> pick one"))
+        st = {"asks": owner_ask_rows(t, {"CAPPR": "approvals", "CREPO": "repo"}), "tracks": [
+              {"state": "waiting", "name": "r/w", "reason": "ship it?"}]}
+        rows, home = home_needs(st), home_text(home_parts(dict(st, box="bx", now="12:00"))).get("needs", "")
+        check("owner asks: Home's NEEDS YOU and `!needs` list the SAME items — both are home_needs — each ask "
+              "linked to the message he answers, with its channel, and `!needs` fits the 800-char reply cap",
+              len(rows) == 4 and all(r in home for r in rows) and all(r in needs_text(st) for r in rows)
+              and f"🔐 *<https://x.slack.com/archives/CAPPR/p{card}|restart the landing lane>* · #approvals" in rows
+              and any("#repo" in r and "which syllabus" in r for r in rows)
+              and len(needs_text(st)) <= 800 and needs_text({}) == "Nothing is waiting on you.")
+        oa_reset()                                    # its own table: a card, a DM ask, a thread ask
+        card, dm, ask = "101.000100", "102.000100", "103.000100"
+        save_table(OWNER_ASKS, {f"CAPPR:{card}": {"chat": "CAPPR", "ts": card, "thread": "", "at": 1},
+                                f"DOWN:{dm}": {"chat": "DOWN", "ts": dm, "thread": "", "at": 1},
+                                f"CREPO:{ask}": {"chat": "CREPO", "ts": ask, "thread": "50.000100", "at": 1}})
+        owner_ask_settle("CREPO", thread="50.000100", after="100.000000")
+        early = sorted(load_table(OWNER_ASKS))
+        owner_ask_settle("CREPO", thread="50.000100", after="999.000100")
+        owner_ask_settle("CAPPR", ts="999.000000")
+        mid = sorted(load_table(OWNER_ASKS))
+        owner_ask_settle("CAPPR", ts=card)
+        owner_ask_settle("DOWN", after="999.000100", dm=True)
+        check("owner asks: HIS ANSWER SETTLES IT — a reply in the ask's thread after it, a reaction on the card, a "
+              "later word in the DM — and a reply from before the ask, or a reaction on another message, does not",
+              f"CREPO:{ask}" in [k for k in early if not k.startswith("_")]
+              and [k for k in mid if not k.startswith("_")] == sorted([f"CAPPR:{card}", f"DOWN:{dm}"])
+              and oa_open() == [])
+        # HIS ANSWER ARRIVES BEFORE THE ASK IS REGISTERED: the CLI post is still on chat.getPermalink when the daemon
+        # sees his reaction, his thread reply or his DM word. The fake Slack settles at exactly that moment.
+        oa_reset()
+        globals()["api"] = oa_fake({"UOWN": "DOWN"}, on_link=lambda ch, mts: owner_ask_settle(ch, ts=mts))
+        _, raced = post(oa_cfg, "CAPPR", "🔐 *Approval needed:* the reaction came first", mail=False, decision=True)
+        globals()["api"] = oa_fake({"UOWN": "DOWN"}, on_link=lambda ch, mts: owner_ask_settle(
+            ch, thread="60.000100", after=f"{float(mts) + 1:.6f}"))
+        post(oa_cfg, "CREPO", "the thread reply came first?", "60.000100", mail=False, decision=True)
+        globals()["api"] = oa_fake({"UOWN": "DOWN"}, on_link=lambda ch, mts: owner_ask_settle(
+            ch, after=f"{float(mts) + 1:.6f}", dm=True))
+        post(oa_cfg, "UOWN", "*disk* the DM word came first", mail=False, ask=True)
+        racedE = oa_open()
+        globals()["api"] = oa_fake({"UOWN": "DOWN"}, start=200)
+        owner_ask_settle("DOWN", after="150.000000", dm=True)         # an answer from BEFORE the next ask…
+        _, later = post(oa_cfg, "UOWN", "*disk* a new question", mail=False, ask=True)
+        settled = [k for k in load_table(OWNER_ASKS) if k.startswith("_")]
+        owner_ask_settle("DOWN", ts="1.000000", now=time.time() + OWNER_ASK_RACE + 60)
+        check("owner asks: AN ANSWER THAT BEATS THE REGISTRATION still settles the ask — a reaction, a thread reply "
+              "and a DM word that land while the CLI waits on the permalink each leave nothing in NEEDS YOU; an "
+              "answer from before a later ask does not settle it; kept answers expire after OWNER_ASK_RACE",
+              racedE == [] and raced and oa_open() == [f"DOWN:{later}"] and len(settled) == 4
+              and [k for k in load_table(OWNER_ASKS) if k.startswith("_")] == ["_DOWN::1.000000::0"])
+        check("owner asks: a week-old ask leaves the list, a fresh one stays",
+              [r["text"] for r in owner_ask_rows({"a": {"text": "old", "at": 0}, "b": {"text": "new", "at": 9e5}},
+                                                 now=9e5 + 60)] == ["new"])
+    finally:
+        globals()["api"] = real_apiOA
+        oa_reset()
+    # `!status` and `!needs` in the daemon: answered from home_state, owner only.
+    dmS, saidS, toS = Daemon(use_slack=False), [], []
+    dmS.say = lambda chat, text, thread=None, mail=False: toS.append(chat) or saidS.append(text) or "1.0"
+    stS = {"box": "bx", "now": "12:00", "tracks": [{"state": "running", "name": "r/run", "detail": "PR #3"},
+                                                   {"state": "idle", "name": "r/nap", "detail": "4m"}],
+           "landings": [{"repo": "r", "pr": "7", "stage": "gates"}],
+           "asks": [{"text": "may I restart it?", "link": "https://x/p1", "channel": "approvals", "age": "5m"}]}
+    dmS.home_state = lambda: stS
+    dmS.command("!status", "C1", None, "1.0", "oaown", "channel")
+    dmS.command("!needs", "C1", None, "1.0", "oaown", "channel")
+    dmS.command("!needs", "C1", None, "1.0", "oaown", "channel", is_owner=False)
+    check("!status says what runs, lands and idles, as Home does; !needs reads NEEDS YOU; a member gets neither",
+          len(saidS) == 3 and "RUNNING 2" in saidS[0] and "*run* · PR #3" in saidS[0]
+          and "PR #7" in saidS[0] and "nap" in saidS[0]
+          and len(saidS[0]) <= 800 and saidS[1] == needs_text(stS) and "<https://x/p1|may I restart it>" in saidS[1]
+          and saidS[2] == "`!needs` is the owner's" and toS == ["C1"] * 3)
+    # …typed where members read: a member workspace or a .cc/member-facing repo. His DM asks and the box's state go
+    # to his DM, never into that channel.
+    os.makedirs(f"{DEV}/oamf/.cc", exist_ok=True)
+    open(f"{DEV}/oamf/.cc/member-facing", "a").close()
+    del saidS[:], toS[:]
+    dmS.cfg = dict(dmS.cfg, SLACK_OWNER_ID="UOWN")
+    dmS.command("!needs", "CMF", "9.0", "1.0", "oamf", "channel")
+    dmS.command("!status", "CNONE", None, "1.0", None, "channel")
+    dmS.command("!needs", "DOWN", None, "1.0", "box", "im")
+    check("!status and !needs typed in a MEMBER-FACING channel (or one no project maps) answer in the owner's DM, "
+          "and the channel gets one line that carries neither; a DM is answered in place",
+          toS == ["UOWN", "CMF", "UOWN", "CNONE", "DOWN"] and saidS[0] == needs_text(stS)
+          and saidS[1] == "`!needs` answered in your DM" and "may I restart" not in saidS[1]
+          and saidS[3] == "`!status` answered in your DM" and saidS[4] == needs_text(stS))
+    # …and through the REAL home_state, not a stub: the method `!needs` calls exists under that name and carries
+    # the owner-asks table as "asks". Every costly input is pre-cached, so nothing outside the fixture runs.
+    del dmS.home_state
+    del saidS[:], toS[:]
+    try:
+        oa_reset()
+        save_table(OWNER_ASKS, {"CAPPR:7.000100": {"chat": "CAPPR", "ts": "7.000100", "thread": "", "at": time.time(),
+                                                  "text": "🔐 the real table's ask", "link": "https://x/p7"}})
+        nowC = time.time()
+        for k, v in {"wins": {}, "orchs": {}, "audit": ("", "", ""), "tracks": ([], "", 0), "tier": ("", ""),
+                     "units": [], "limit": "", "quick": [], "suborchs": [], "subagents": [], "landings": [],
+                     "graphs": [], "handoffs": {}, "spend": {}}.items():
+            _CACHE[k] = (nowC + 3600, v)
+        dmS.home_slow_at = nowC + 3600
+        stR = dmS.home_state()
+        dmS.command("!needs", "DOWN", None, "1.0", "box", "im")
+        check("!needs through the real Daemon.home_state: its dict carries 'asks' from the owner-asks table, and the "
+              "reply lists that ask",
+              isinstance(stR, dict) and [a["text"] for a in stR.get("asks") or []] == ["🔐 the real table's ask"]
+              and len(saidS) == 1 and "the real table's ask" in saidS[0])
+    finally:
+        for k in ("wins", "orchs", "audit", "tracks", "tier", "units", "limit", "quick", "suborchs", "subagents",
+                  "landings", "graphs", "handoffs", "spend"):
+            _CACHE.pop(k, None)
+        oa_reset()
     check("home_needs: a blocked track with no live reason is not an ask — the board's word alone never puts a row on "
           "the owner's list",
           home_needs({"tracks": [{"state": "blocked", "name": "r/t", "reason": ""}]}) == []
