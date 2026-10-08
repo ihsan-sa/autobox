@@ -382,6 +382,17 @@ tid2=$(jq -r .task_id < "$st/delivery.json")
   && [ "$(jq -r .task_id < "$D/claim2")" = "$tid2" ]; } \
   && ok "P21 dispatch: a delivery with no PR leaves the row claimable, so the next dispatch runs — on the next generation of the same task" \
   || bad "P21 dispatch: rc=$c2 $(cat "$D/claim2")"
+# P23: A HOST REPO WITH NO REMOTE ends the same way (raised-done-no-remote): a benchmark's hb-N is local git, and
+# `cc done` used to stop it at done_fail "no remote — no PR opened", leaving the row blocked for the pulse to wake a
+# seat over. Its committed branch is the delivery. The workspace marker goes first, so this is the host's own path.
+rm -f "$HOME/dev/r/.cc/member-workspace"; newdone hostlocal; rundone
+{ [ "$rc" = 0 ] && hasreceipt '.closed == null and .pending == {} and .pr_url == null and .pushed_sha == null and .committed_sha != null and .errors == []' \
+  && [ ! -s "$D/gh.calls" ] && [ ! -s "$D/cards" ] && [ ! -s "$D/creates" ] && [ "$("$B/cc-board" get r "$row" status)" = done ] \
+  && [ "$(git -C "$HOME/dev/r" rev-parse "track/$row")" = "$(jq -r .committed_sha "$D/out")" ]; } \
+  && ok "P23: a host repo with no remote finishes done on its committed branch — no PR, no card, no error" || bad "P23: rc=$rc $(cat "$D/out" "$D/err")"
+git -C "$HOME/dev/r" remote add origin "$D/no-such-remote.git"; newdone hostpush; rundone   # a remote that is there and cannot take the push
+{ [ "$rc" != 0 ] && hasreceipt '.errors[0].stage == "push"' && [ "$("$B/cc-board" get r "$row" status)" != done ]; } \
+  && ok "P23 control: the same host repo WITH a remote whose push fails still fails, and is not called done" || bad "P23 control: rc=$rc $(cat "$D/out" "$D/err")"
 printf '%s %s\n' "$pass" "$fail" > "$D/counts"
 )
 read -r m2pass m2fail < "$T/done-fixture/counts"; pass=$((pass+m2pass)); fail=$((fail+m2fail))

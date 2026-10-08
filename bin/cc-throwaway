@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# cc-throwaway — a repo the box makes only to throw away (a harness benchmark's ~/dev/hb-N), and the one command that
+# removes it again with everything the box kept for it. A throwaway repo is local git with no remote, worked by
+# `cc <name> <track> --go` workers; it gets no planning seat (`cc <name>` refuses), its workers stop and finish
+# without paging anyone or writing the failures ledger (cc-loop), and the tick's pulse, digest and watchdog skip its
+# board (cc-reconcile). Its branch is the delivery: `cc done` ends a repo with no remote on `done`, no PR.
+#
+#   cc-throwaway new <name>     make ~/dev/<name> — an empty git repo on `main`, no remote — and mark it throwaway.
+#                               Refuses a name that already exists, so it can never mark a real project: the box only
+#                               ever deletes what it made. Fill the repo after this (copy files in, commit).
+#   cc-throwaway is <name>      exit 0 when <name> is a throwaway repo this box made (or one whose repo is already
+#                               gone and whose leftovers `clean` still owes) — what cc, cc-loop and cc-reconcile ask
+#   cc-throwaway clean <name>   remove it and everything the box keeps for it: its tmux windows in `main` (a seat
+#                               `<name>`, `<name>@*`, workers `<name>/*`), ~/dev/<name>, ~/.cc/worktrees/<name>,
+#                               ~/.cc/state/<name>, ~/.cc/push-state/<name>, its board, and the mark. Refuses a
+#                               name that is not marked, a repo whose mark does not match, and a repo with a remote.
+#   cc-throwaway selfcheck      new, is and clean against fixtures in a HOME of their own, with tmux stubbed
+#
+# THE MARK is two halves that must agree: ~/.cc/throwaway/<name> (the box's registry) and ~/dev/<name>/.git/cc-throwaway
+# (inside the repo, so it goes when the repo goes), both holding the same random token `new` wrote. `clean` deletes
+# only when they match, so a registry file written by hand for a real project, or a real repo that later took a
+# throwaway's name, is refused and nothing is removed. WHY A COMMAND AND NOT `rm -rf` IN THE BENCH: cc-guard refuses
+# a session's delete outside its own worktree, which is why `bench clean` could only name the dirs it left; this
+# tool is the box deleting what it made, so the guard is not asked to widen for anyone.
+set -u
+# recurring-defect-ok: pause-hold-missing — it launches no worker and writes no board row; the header only names --go
+# recurring-defect-ok: held-files-unchecked — it dispatches and groups no rows
+NAME_RE='^[a-z0-9][a-z0-9_-]{0,62}$'
+DEV="$HOME/dev"; REG="$HOME/.cc/throwaway"; SESSION=main
+say(){ printf 'cc-throwaway: %s\n' "$*"; }
+die(){ say "$*" >&2; exit 1; }
+valid(){ [[ "${1:-}" =~ $NAME_RE ]] || die "'${1:-}' is not a repo name (lower-case letters, digits, - and _)"; }
+token_of_repo(){ [ -f "$DEV/$1/.git/cc-throwaway" ] && [ ! -L "$DEV/$1/.git/cc-throwaway" ] && head -c 64 "$DEV/$1/.git/cc-throwaway"; }
+token_of_reg(){ [ -f "$REG/$1" ] && [ ! -L "$REG/$1" ] && head -c 64 "$REG/$1"; }
+# 0 = marked: the registry names it, and either the repo is gone or its own half of the mark matches
+marked(){ local r; r=$(token_of_reg "$1") && [ -n "$r" ] || return 1
+  [ -e "$DEV/$1" ] || [ -L "$DEV/$1" ] || return 0
+  [ "$(token_of_repo "$1" 2>/dev/null)" = "$r" ]; }
+
+cmd_new(){ local n="$1" t; valid "$n"
+  mkdir "$DEV/$n" 2>/dev/null || die "$DEV/$n exists (or $DEV is missing) — new only makes a repo that is not there, so nothing was marked"
+  t=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
+  git init -q -b main "$DEV/$n" || { rmdir "$DEV/$n"; die "git init failed in ~/dev/$n"; }
+  mkdir -p "$REG" && printf '%s\n' "$t" > "$DEV/$n/.git/cc-throwaway" && printf '%s\n' "$t" > "$REG/$n" \
+    || die "could not write the mark for ~/dev/$n"
+  echo "$DEV/$n"; }
+
+cmd_clean(){ local n="$1" w p gone=(); valid "$n"
+  token_of_reg "$n" >/dev/null || die "$n is not a throwaway repo (no mark in ~/.cc/throwaway) — nothing removed"
+  if [ -e "$DEV/$n" ] || [ -L "$DEV/$n" ]; then
+    [ -d "$DEV/$n" ] && [ ! -L "$DEV/$n" ] && [ -d "$DEV/$n/.git" ] && [ ! -L "$DEV/$n/.git" ] \
+      || die "$DEV/$n is not a plain git repo — nothing removed"
+    marked "$n" || die "$DEV/$n does not carry the mark new wrote — nothing removed"
+    [ -z "$(git -C "$DEV/$n" remote 2>/dev/null)" ] || die "$DEV/$n has a remote, and a throwaway repo never does — nothing removed"
+  fi
+  # the seat and the workers first, so nothing is still writing into what goes next; a worker's window holds its loop
+  while IFS=$'\t' read -r w p; do
+    case "$p" in "$n"|"$n"/*|"$n"@*) tmux kill-window -t "$w" 2>/dev/null && gone+=("window $p");; esac
+  done < <(tmux list-windows -t "$SESSION" -F $'#{window_id}\t#{window_name}' 2>/dev/null | sort -u)
+  for p in "$DEV/$n" "$HOME/.cc/worktrees/$n" "$HOME/.cc/state/$n" "$HOME/.cc/push-state/$n" \
+           "$HOME/.cc/boards/$n.json" "$HOME/.cc/boards/$n.lock"; do
+    { [ -e "$p" ] || [ -L "$p" ]; } || continue
+    rm -rf --one-file-system -- "$p" && gone+=("${p/#$HOME/\~}")
+  done
+  rm -f -- "$REG/$n"
+  for p in ${gone[@]+"${gone[@]}"}; do say "removed $p"; done
+  say "$n is gone"; }
+
+selfcheck(){ local T pass=0 fail=0 o
+  T=$(mktemp -d); trap 'rm -rf "$T"' RETURN
+  t(){ if [ "$2" = "$3" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1 — got '$2', want '$3'"; fi; }
+  mkdir -p "$T/h/dev" "$T/bin"
+  # tmux, stubbed: three windows of the throwaway, and two of other repos that share its prefix or nothing
+  printf '#!/bin/sh\ncase "$1" in list-windows) printf "@1\\thb-1\\n@2\\thb-1/fix\\n@3\\thb-1@o\\n@4\\thb-10\\n@5\\tother\\n";; kill-window) echo "$3" >> "%s/killed";; esac\n' "$T" > "$T/bin/tmux"
+  chmod +x "$T/bin/tmux"; : > "$T/killed"
+  run(){ env HOME="$T/h" PATH="$T/bin:$PATH" "$0" "$@"; }
+  o=$(run new hb-1); t "new makes the repo and prints its path" "$o" "$T/h/dev/hb-1"
+  t "…an empty git repo on main with no remote" "$(git -C "$T/h/dev/hb-1" symbolic-ref --short HEAD):$(git -C "$T/h/dev/hb-1" remote)" "main:"
+  run is hb-1; t "is: a repo new made is throwaway" "$?" 0
+  mkdir -p "$T/h/dev/real"; git init -q "$T/h/dev/real"
+  run new real >/dev/null 2>&1; t "new refuses a name that exists, and marks nothing" "$?:$([ -e "$T/h/.cc/throwaway/real" ] && echo marked)" "1:"
+  run is real; t "is: a real repo is not throwaway" "$?" 1
+  run new ../x >/dev/null 2>&1; t "new refuses a name that is a path" "$?" 1
+  # a registry file written by hand for a real project is refused: its repo half does not match
+  printf 'forged\n' > "$T/h/.cc/throwaway/real"
+  run is real; t "is: a hand-written registry file does not make a real repo throwaway" "$?" 1
+  run clean real >/dev/null 2>&1; t "clean refuses it, and the repo is still there" "$?:$([ -d "$T/h/dev/real/.git" ] && echo kept)" "1:kept"
+  rm -f "$T/h/.cc/throwaway/real"
+  run clean nothere >/dev/null 2>&1; t "clean refuses a name with no mark" "$?" 1
+  # a marked repo that grew a remote is refused
+  run new hb-2 >/dev/null; git -C "$T/h/dev/hb-2" remote add origin https://example.invalid/x.git
+  run clean hb-2 >/dev/null 2>&1; t "clean refuses a marked repo with a remote" "$?:$([ -d "$T/h/dev/hb-2" ] && echo kept)" "1:kept"
+  # the whole footprint of one worker run, and a neighbour whose name shares the prefix
+  mkdir -p "$T/h/.cc/worktrees/hb-1/fix" "$T/h/.cc/state/hb-1/fix" "$T/h/.cc/push-state/hb-1" "$T/h/.cc/boards" \
+           "$T/h/.cc/state/hb-10" "$T/h/.cc/worktrees/hb-10"
+  echo '{}' > "$T/h/.cc/boards/hb-1.json"; : > "$T/h/.cc/boards/hb-1.lock"; echo '{}' > "$T/h/.cc/boards/hb-10.json"
+  o=$(run clean hb-1); t "clean exits 0" "$?" 0
+  t "…the repo, its worktrees, state, push state, board and mark are gone" \
+    "$(ls -d "$T/h/dev/hb-1" "$T/h/.cc/worktrees/hb-1" "$T/h/.cc/state/hb-1" "$T/h/.cc/push-state/hb-1" "$T/h/.cc/boards/hb-1".* "$T/h/.cc/throwaway/hb-1" 2>/dev/null)" ""
+  t "…its seat, worker and orch windows are killed, and no other repo's" "$(tr '\n' ' ' < "$T/killed")" "@1 @2 @3 "
+  t "…and a neighbour whose name shares the prefix keeps its state, worktree and board" \
+    "$(ls -d "$T/h/.cc/state/hb-10" "$T/h/.cc/worktrees/hb-10" "$T/h/.cc/boards/hb-10.json" 2>/dev/null | wc -l)" 3
+  grep -q 'removed window hb-1/fix' <<<"$o"; t "…and it says what it removed" "$?" 0
+  run is hb-1; t "is: a cleaned name is no longer throwaway" "$?" 1
+  # the repo deleted by hand first: its mark still lets clean take the rest
+  run new hb-3 >/dev/null; rm -rf "$T/h/dev/hb-3"; mkdir -p "$T/h/.cc/state/hb-3/fix"
+  run is hb-3; t "is: a marked name whose repo is already gone still counts (its leftovers are owed)" "$?" 0
+  run clean hb-3 >/dev/null; t "clean takes the leftovers of a repo already deleted" "$?:$(ls -d "$T/h/.cc/state/hb-3" "$T/h/.cc/throwaway/hb-3" 2>/dev/null)" "0:"
+  echo "cc-throwaway selfcheck: $pass passed, $fail failed"; [ "$fail" = 0 ]; }
+
+case "${1:-}" in
+  new)   [ $# = 2 ] || die "usage: cc-throwaway new <name>"; cmd_new "$2" ;;
+  is)    [ $# = 2 ] && [[ "$2" =~ $NAME_RE ]] && marked "$2" ;;
+  clean) [ $# = 2 ] || die "usage: cc-throwaway clean <name>"; cmd_clean "$2" ;;
+  selfcheck) selfcheck ;;
+  *) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 2 ;;
+esac

@@ -78,7 +78,8 @@ held by any live process → reported. Rule 9: a `.claude/worktrees/*` subagent 
 (CC_JANITOR_AGENT_HOURS) with nothing live in it and no commit its merged PR lacks → removed; else reported.
 Anything uncertain is reported, never removed. Log: ~/.cc/state/janitor.log. Repos: CC_JANITOR_REPOS (~/.cc/config).
 
-WAKE (in the tick, CC_WAKE=on only; unset, each repo logs a skip): for each repo whose board is not all `session` rows, that `cc-pause` has not parked and that
+WAKE (in the tick, CC_WAKE=on only; unset, each repo logs a skip): for each repo whose board is not all `session` rows, that is not a throwaway repo
+(`cc-throwaway`: no pass of the tick reads its board, boards()), that `cc-pause` has not parked and that
 has no ~/.cc/state/<repo>/pulse.off (cc-handoff's overlap mark; a person may touch it too), the seat is woken when a queued row could start now (`cc-brief ready`, the one network call, skipped under --no-net)
 or a row is `blocked`, and that same state was not already sent inside 24 h — one look string per half, so a queued
 row's verdict changing does not re-announce a row that has been blocked all along
@@ -997,11 +998,28 @@ def spoken_hours(sec):
     return "an hour" if h == 1 else f"{h} hours" if h < 48 else f"{round(h / 24)} days"
 
 
+def throwaway(repo):
+    """A repo cc-throwaway made (a harness benchmark's hb-N): no seat, and nobody is owed a line about it. The
+    registry file is read first so the common case costs no process; cc-throwaway `is` decides the rest."""
+    home = os.path.dirname(os.path.dirname(STATE))
+    if not os.path.isfile(f"{home}/.cc/throwaway/{repo}"):
+        return False
+    try:
+        return subprocess.run([f"{BIN}/cc-throwaway", "is", repo], env={**os.environ, "HOME": home},
+                              capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
 def boards():
     """Every real board, sorted: (path, board or None if unreadable). A `_cc<suite><pid>` board is a board only to
-    a process under <pid> (cc-board `reals`)."""
+    a process under <pid> (cc-board `reals`). A throwaway repo's board is none of the tick's business: the pulse
+    started a planning seat for each benchmark hb-N repo with a stopped row, and five sat live 9 h after their
+    repos were deleted (raised-throwaway-projects-leave-live-planning-seats) — so no pass here reads one."""
     out = []
     for n in ccboard().reals(sorted(os.path.basename(fn) for fn in glob.glob(f"{BOARDS}/*.json"))):
+        if throwaway(n[:-len(".json")]):
+            continue
         fn = f"{BOARDS}/{n}"
         try:
             out.append((fn, board_read(fn)))
@@ -1077,6 +1095,8 @@ def orphans(repos, net=True, grace=GRACE, busy=None):
     for p in sorted(glob.glob(f"{WTS}/*/*")):
         repo, track = p.split(os.sep)[-2:]
         if not ccboard().real(repo) or not os.path.isdir(p) or f"{repo}/{track}" in known or (repos and repo not in repos):
+            continue
+        if throwaway(repo):   # boards() skips its board, so its tracks are unknown here: no seat to ask, nobody to page
             continue
         if os.path.realpath(p) in claimed:
             continue
@@ -3840,6 +3860,28 @@ def selfcheck():
            bounded(lambda: [(os.path.basename(fn), d) for fn, d in boards()]) == [("pipe.json", None), ("real.json", {"repo": "real", "tracks": {}})])
     finally:
         shutil.rmtree(BOARDS, ignore_errors=True); BOARDS = _b
+    _b, _s, th9 = BOARDS, STATE, tempfile.mkdtemp(prefix="cc-reconcile-tw-")
+    globals().update(BOARDS=f"{th9}/.cc/boards", STATE=f"{th9}/.cc/state")
+    try:
+        os.makedirs(BOARDS); os.makedirs(f"{th9}/dev")
+        subprocess.run([f"{BIN}/cc-throwaway", "new", "hb-9"], env={**os.environ, "HOME": th9}, capture_output=True, check=True)
+        os.makedirs(f"{th9}/dev/real"); open(f"{th9}/.cc/throwaway/real", "w").write("forged\n")   # a mark nobody made with `new`
+        for r in ("hb-9", "real", "other"):
+            json.dump({"repo": r, "tracks": {}}, open(f"{BOARDS}/{r}.json", "w"))
+        ok("boards(): a throwaway repo's board is skipped, so no pulse, digest or watchdog reads it — while a real one, "
+           "even one with a forged registry file, and an unmarked one beside it still read",
+           [os.path.basename(fn) for fn, _ in boards()] == ["other.json", "real.json"])
+        _w = WTS; globals().update(WTS=f"{th9}/.cc/worktrees")
+        try:
+            for r in ("hb-9", "other"):
+                os.makedirs(f"{WTS}/{r}/fix"); os.utime(f"{WTS}/{r}/fix", (0, 0))
+            ok("orphans(): a throwaway repo's old worktree is no orphan, so nobody is asked or paged about it — while an "
+               "unmarked repo's beside it still is",
+               [(r, t) for r, t, _ in orphans(None, net=False, grace=GRACE)] == [("other", "fix")])
+        finally:
+            globals().update(WTS=_w)
+    finally:
+        shutil.rmtree(th9, ignore_errors=True); globals().update(BOARDS=_b, STATE=_s)
     # ── the tick's parts: reconcile, wake, sweep, digest — each in a HOME of its own ──
     import contextlib, io
     _g = {k: globals()[k] for k in ("BOARDS", "WTS", "STATE", "DEV", "PULSE_LOG", "JANITOR_LOG", "procs", "tmux_live",

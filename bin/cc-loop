@@ -438,6 +438,10 @@ stop_target(){   # the broker key a stop goes to: "a track dispatched by an orch
                  # the repo seat only when none is recorded" (the brief). cc's own alias grammar; a file holding anything else is the repo seat.
   local a; a=$(head -1 "${ST:-/nonexistent}/orch" 2>/dev/null | tr -d '[:space:]')
   if [[ "$a" =~ ^[a-z0-9-]{2,20}$ ]]; then printf '%s@%s\n' "$repo" "$a"; else printf '%s\n' "$repo"; fi; }
+# A THROWAWAY REPO (cc-throwaway: a harness benchmark's hb-N) HAS NOBODY TO TELL. It has no seat, and its stops and
+# DONEs are the benchmark's to read off the board and loop.log: five hb-N runs each left a done-undelivered record
+# (one false recurring cluster) and the pulse started a seat for each, live 9 h after the repos were deleted.
+throwaway(){ "$BIN/cc-throwaway" is "$repo" >/dev/null 2>&1; }
 tell_planner(){   # $1 the line -> 0 the broker has it and owns the escalation from here, 1 nobody does
   case "$repo" in _cc*) return 1;; esac   # a suite's scratch namespace (`_cc<suite><pid>`, cc-board `real`) has no session, and a
                                           # fixture must not reach the box's own broker state — the reason cc-notify refuses to push one
@@ -445,6 +449,7 @@ tell_planner(){   # $1 the line -> 0 the broker has it and owns the escalation f
   # out is the workspace's own socket, which cc-notify already takes (`cc-slack escalate`). A broker that answered
   # `delivered` on a daemon that never heard it would swallow that tier's one escalation, so it is not asked at all.
   [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && return 1
+  throwaway && return 0                   # nobody is owed the line, so it is not a line nobody took either
   [ -x "$BIN/cc-broker" ] || return 1     # no broker on this copy: the owner is the fallback, exactly as before
   # 30 s is what cc-reconcile allows its own inject. Being killed past it loses nothing: cc-broker
   # writes the event down BEFORE it sends anything, so its own 60 s flush delivers what this gave up waiting for.
@@ -829,6 +834,29 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   t 'and a copy with no broker beside it does not pretend either' "$?" 1
   t '…having called nothing at all' "$(wc -c < "$brec")" 0
   BIN="$realbin"
+  # A THROWAWAY REPO (cc-throwaway) HAS NOBODY TO TELL, and an ordinary repo beside it under the same HOME still
+  # does. Each on a HOME of its own with the broker stubbed: a stop of the throwaway writes no ledger record, asks no
+  # broker and files no request, and still leaves the board and loop.log.
+  mkdir -p "$d/tw/dev" "$d/twbin"; cp "$bd/cc-broker" "$d/twbin/cc-broker"
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$realbin/cc-throwaway" > "$d/twbin/cc-throwaway"
+  printf '#!/bin/sh\necho "$*" >> "%s"\n' "$d/tw/board.calls" > "$d/twbin/board"
+  chmod +x "$d/twbin/cc-throwaway" "$d/twbin/board"; HOME="$d/tw" "$realbin/cc-throwaway" new tw1 >/dev/null
+  : > "$brec"; ( repo=tw1 HOME="$d/tw" BIN="$d/twbin"; tell_planner "$bl" )
+  t 'a throwaway repo: its line is not a stop nobody took, so no request is filed for it' "$?" 0
+  t '…and the broker is never asked' "$(wc -c < "$brec")" 0
+  ( repo=tw2 HOME="$d/tw" BIN="$d/twbin"; tell_planner "$bl" )
+  t 'control: an ordinary repo under the same HOME still reaches the broker' "$(cat "$brec")" "inject --no-start --source loop tw2 $bl"
+  : > "$brec"; : > "$d/tw/board.calls"
+  lstop='/^log(){/p; /^stop(){/,/^  exit "\$code"; }$/p'   # both are defined below the selfcheck dispatch, so read in from this file
+  ( repo=tw1 track=fix HOME="$d/tw" BIN="$d/twbin" BOARD="$d/twbin/board" LOG="$d/tw/loop.log" CC_FAILURES="$d/tw/fl"
+    eval "$(sed -n "$lstop" "$0")"; stop 4 "finished, but opened no PR" "cc done failed" ) 2>/dev/null
+  t "a throwaway repo's stop keeps its exit code" "$?" 4
+  t '…writes no ledger record, asks no broker' "$(ls "$d/tw/fl" 2>/dev/null | wc -l)|$(wc -c < "$brec")" "0|0"
+  t '…and still leaves the board and loop.log' \
+    "$(grep -c '^status tw1 fix blocked' "$d/tw/board.calls")|$(grep -c 'throwaway repo: no ledger record' "$d/tw/loop.log")" "1|1"
+  ( repo=tw2 track=fix HOME="$d/tw" BIN="$d/twbin" BOARD="$d/twbin/board" LOG="$d/tw/loop.log" CC_FAILURES="$d/tw/fl"
+    eval "$(sed -n "$lstop" "$0")"; stop 4 "finished, but opened no PR" "cc done failed" ) 2>/dev/null
+  t "control: an ordinary repo's stop still tells its seat" "$(cat "$brec")" "inject --no-start --source loop tw2 loop: tw2/fix finished, but opened no PR — cc done failed"
   grep -qF '[ "$heard" = yes ] || stop_unheard "$title" "$msg"' "$0"
   t 'a stop nobody took is filed as a planner request (cc-notify --ask), preserved and retried' "$?" 0
   grep -qF 'tell_planner "$(planner_line "$title" "$msg")"' "$0"
@@ -1225,6 +1253,7 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" hea
   # the very journal line this exit came from, already says `waiting`, and the tab prints the two of them as drift.
   "$BOARD" status "$repo" "$track" "$st" >/dev/null 2>&1; "$BOARD" note "$repo" "$track" "loop exit $code: $msg" >/dev/null 2>&1
   log "exit $code: $msg"
+  if throwaway; then log "throwaway repo: no ledger record, no seat, nothing posted"; exit "$code"; fi   # see throwaway()
   log "failures ledger ($repo): $(stop_record "$code" "$title" "$msg")"   # the tool that saw it writes it down; the exit is decided already
   # THE BOARD IS WRITTEN FIRST, whatever the broker does after it: a stop that reached nobody is filed as a request.
   tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose=" $(stop_target)'s session has been told."; }
@@ -1340,6 +1369,10 @@ while [ $i -lt "$MAXI" ]; do
   newprog=$(this_iteration "$SNAP" "$ST/progress.md")   # only THIS iteration's lines count, by position — see the function (a re-dispatched track must not "finish" on an old STATUS line, and must not MISS a new one that reads the same)
   if grep -qE '^STATUS: DONE' <<<"$newprog"; then
     "$BOARD" note "$repo" "$track" "loop: DONE after $i iteration(s), \$$spent" >/dev/null 2>&1
+    if throwaway; then   # its branch is the delivery (`cc done`: no remote, no PR): no deliverable post, no card, nobody told
+      log "DONE"; dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?; printf '%s\n' "$dout" >> "$LOG"
+      [ "$drc" = 0 ] || stop 4 "finished, but cc done failed" "the worker wrote STATUS: DONE, but cc done failed (rc $drc) — see $LOG"
+      log "exit 0: throwaway repo, done on track/$track"; exit 0; fi
     # A ROW WITH A TASK RECORD GOES THROUGH THE ONE HOST COMMAND (complete_task; inside a member workspace's boundary,
     # where there is no lander, it is that boundary's `cc done --json` instead). `cc-land queue --task` completes the task and,
     # where the standing grant holds, puts the PR on the same numeric queue a 👍 uses; the loop decides from the
