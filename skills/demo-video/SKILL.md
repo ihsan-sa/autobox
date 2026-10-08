@@ -99,6 +99,19 @@ cursor moves on every frame. Nothing real may be in frame: every beat checks the
 5. Encode, stitch, `checkLength`, and make a `contactSheet`. Look at the sheet before you call it done: it shows
    the pace, the framing and anything in frame that should not be.
 
+## Blender shots
+
+A shot that is modelled rather than filmed (a product turning, a logo, a 3D scene) is a Blender scene script: Python
+that builds the whole scene from an empty file at render time, so it needs no .blend and renders the same under any
+Blender version. `cc-suites render SCENE.py OUT [START END]` renders it with Cycles on the owner's laptop GPU and
+brings the frames back into OUT; when the laptop is asleep, busy or has no GPU, the box renders it on its own CPU at
+nice 19, slowly. Blender's log goes to OUT.log (and the laptop's to OUT.laptop.log when it fell back). Everything
+in the scene's directory travels with it, so keep the scene in a directory of its own with only what it reads; a
+scene in HOME or /tmp, or next to a .ssh or .cc, is refused. On the laptop it runs caged with no network; the box's
+CPU fallback runs as you, with your environment and network, so render only a scene you wrote. Set the engine,
+samples, resolution and file format in the script; cc-suites sets the output path, the frames and the device. Try it with
+`cc-suites render blender/test-scene.py /tmp/frames` from this directory: two 320x180 frames in a few seconds.
+
 ## Needs
 
 Node 18+, ffmpeg, python3, and for terminals tmux and bwrap. The first run installs the node modules (network once).

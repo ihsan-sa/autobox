@@ -16,10 +16,16 @@
 #                                 itself and does not offer it again. A red there is never a red here on its own: the
 #                                 laptop is not the box (2026-09-25, a live run came back 481 passed, 7 failed, every
 #                                 red a gap in the runner's environment), so only this box's own run can fail a landing.
-#   cc-suites status              the runner this box would use, and what it answers. exit 0 reachable, 75 not
+#   cc-suites status              the runner this box would use, what it answers, and the GPU its Blender renders
+#                                 with. exit 0 reachable, 75 not
+#   cc-suites render SCENE.py OUT [START END] [--here]
+#                                 render a Blender scene script (Cycles) into OUT on the runner's GPU, or on this box's
+#                                 CPU at nice 19 when the runner is asleep, busy or unfit (the render section below); --here
+#                                 skips the runner. OUT.log is Blender's log. exit 0 frames in OUT, 1 failed, 2 usage
 #   cc-suites runner              the runner's side, on the other machine: the forced command of the key, reading
-#                                 SSH_ORIGINAL_COMMAND (`status`, `run SUITE TREE PART CHANGED-B64`, or the lander's
-#                                 one check, `job CHECK TREE CAP RUN-B64 CWD-B64 [net]`) and a tar on stdin
+#                                 SSH_ORIGINAL_COMMAND (`status`, `run SUITE TREE PART CHANGED-B64`, the lander's
+#                                 one check, `job CHECK TREE CAP RUN-B64 CWD-B64 [net]`, `render TREE CAP START END SCENE`
+#                                 or `gpu`) and a tar on stdin
 #   cc-suites laptop-setup [NODE] print the PowerShell script the owner runs once on a Windows laptop (below), and on
 #                                 this box make the key and point ~/.cc/suites/remote at ccsuite@NODE
 #                                 (default cc-suites-runner, the tailnet name the script gives the runner)
@@ -92,7 +98,7 @@ set -uo pipefail
 SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
 SD="${CC_SUITES_DIR:-$HOME/.cc/suites}"            # remote (user@host), id_ed25519, known_hosts
 RUNNER_DIR="${CC_SUITES_RUNNER_DIR:-$HOME/.cc-suite-runner}"   # the runner's slots and scratch trees, on its machine
-USAGE="usage: cc-suites [reap [--dry]|spill SUITE [ARG…]|status|runner|laptop-setup [NODE]|selfcheck]"
+USAGE="usage: cc-suites [reap [--dry]|spill SUITE [ARG…]|status|render SCENE.py OUT [START END] [--here]|runner|laptop-setup [NODE]|selfcheck]"
 ALLOWED_SUITES="core/tests/selftest.sh tests/selftest.sh"
 SUITE_RE='(^|/)tests/selftest\.sh$'
 
@@ -141,16 +147,31 @@ xport_argv(){   # sets XP to the transport command. CC_SUITES_SSH replaces ssh f
 }
 xport(){ xport_argv || return 75; "${XP[@]}" "$@"; }   # $@ = the remote command; stdin goes with it
 configured(){ [ -n "${CC_SUITES_SSH:-}" ] || { [ -n "$(remote)" ] && [ -s "$SD/id_ed25519" ] && [ -s "$SD/known_hosts" ]; }; }
+# xp_kept FILE CMD…: CMD with its stdout as it is and the last 4 KB of its stderr in FILE. A laptop's refusal comes on
+# stderr (an older runner's `refused: render`), and it is the reason a person reads, so it is kept, never dropped.
+# err_of FILE: that stderr's last line that says something, printable and at most 200 bytes.
+xp_kept(){ local f=$1; shift; { "$@" 2>&1 1>&3 3>&- | tail -c 4096 >"$f"; } 3>&1; }
+err_of(){ LC_ALL=C tr -c ' -~\n' '?' <"$1" 2>/dev/null | grep -a -v '^ *$' | tail -1 | cut -c1-200; }
+printable(){ printf %s "$1" | sed 's/—/-/g' | LC_ALL=C tr -c ' -~' '?' | cut -c1-200; }   # a line a laptop said
 # A wall-clock bound in timeout(1)'s form (90m, 2s); anything else is the default.
 limit(){ local v=${1:-}; [[ $v =~ ^[0-9]+[smh]?$ ]] && [ "${v%[smh]}" != 0 ] && echo "$v" || echo "$2"; }
 
 status(){
   configured || { echo "cc-suites: no runner set ($SD/remote) — every suite runs here"; return 75; }
-  local a; local -a XP; xport_argv || return 75
-  a=$(timeout "$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)" "${XP[@]}" status </dev/null 2>/dev/null | tail -1)
-  case $a in "free "*) echo "cc-suites: runner $(remote) answers: $a"; return 0;;
-                      "busy"*|"unfit"*) echo "cc-suites: runner $(remote) answers: $a — every suite runs here for now"; return 75;;
-             *) echo "cc-suites: runner $(remote) does not answer${a:+ ($a)}"; return 75;; esac
+  local a g rc ef; local -a XP; xport_argv || return 75
+  ef=$(mktemp "${TMPDIR:-/tmp}/cc-suites-err.XXXXXX") || return 75
+  a=$(xp_kept "$ef" timeout "$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)" "${XP[@]}" status </dev/null | tail -1)
+  a=$(printable "$a"); [ -n "$a" ] || a=$(err_of "$ef")
+  case $a in "free "*|"busy"*|"unfit"*)
+    # the GPU a render there would use, asked of its Blender (a few seconds): `gpu OPTIX <name>, Blender 5.2.2`
+    g=$(xp_kept "$ef" timeout 120s "${XP[@]}" gpu </dev/null | tail -1); g=${g#gpu }
+    g=$(printable "$g"); [ -n "$g" ] || g="no answer ($(err_of "$ef"))"
+    case $a in "free "*) echo "cc-suites: runner $(remote) answers: $a"; rc=0;;
+                      *) echo "cc-suites: runner $(remote) answers: $a — every suite runs here for now"; rc=75;; esac
+    echo "cc-suites: its Blender renders with: ${g% ()}";;
+    *) echo "cc-suites: runner $(remote) does not answer${a:+ ($a)}"; rc=75;; esac
+  rm -f "${ef:?}"
+  return $rc
 }
 
 # ---- spill --------------------------------------------------------------------------------------------------------
@@ -375,6 +396,8 @@ runner(){
       echo "free $i $(runner_facts)"; return 0;;
     run) ;;
     job) runner_job "${a[@]:1}"; return;;
+    render) runner_render "${a[@]:1}"; return;;
+    gpu) runner_gpu "${a[@]:1}"; return;;
     *) echo "cc-suite-runner: refused: ${a[0]:-nothing}" >&2; return 2;;
   esac
   [ "${#a[@]}" = 5 ] || { echo "cc-suite-runner: refused: run takes SUITE TREE PART CHANGED" >&2; return 2; }
@@ -490,6 +513,250 @@ runner_job(){
   return 0
 }
 
+# ---- render -------------------------------------------------------------------------------------------------------
+# A Blender scene rendered on the laptop's GPU, its frames brought back as files; the box's own CPU when the laptop
+# cannot. A scene is a Python script that builds the scene at render time (no .blend travels, so the box's Blender
+# and the laptop's need not match). What goes is the scene's DIRECTORY (every file under it but .git, so a scene can
+# read its neighbours), as a tar the runner proves by write-tree, exactly as a `job`'s tree.
+# The runner takes `render TREE CAP START END SCENE` and nothing freer: SCENE is a file name at the top of that tree,
+# START END a frame range or `- -` for the scene's own, CAP seconds (at most a day). It runs Blender and nothing
+# else, `blender -b --factory-startup --python SCENE --python-expr RENDER_PY`, in the cage, with no network and no
+# /run (render_cage), and only /dev/dxg added: WSL's GPU device, whose driver libraries are already under the
+# read-only /usr/lib/wsl. RENDER_PY is this file's, not the scene's: it sends the frames into the job's own out/, sets
+# the range, and picks the GPU (OptiX, CUDA, HIP, oneAPI, first found); with none it exits 3, which the runner answers
+# as unfit, so the box renders instead (Blender may say 3 as 1 under --python-exit-code; the device line decides).
+# Its lines come back `| `-prefixed (the last RENDER_LOG_LINES of them, each cut to RENDER_LOG_WIDTH bytes), then the
+# frames as one tar in base64, one `@` line each, then the one verdict, last:
+# `cc-render: verdict exit=0 tree=T files=N bytes=B`. Frames go back only when every entry under out/ is a regular
+# file or a directory, there is at least one, they come to at most RENDER_MAX_BYTES and their tar to at most
+# render_tar_max; else `cc-render: verdict none — …`. So the whole stream has a bound (render_stream_max), and the box
+# cuts what comes at it: no stream a runner may send is cut, and no stream at all fills the box's disk past it.
+BLENDER_VERSION=5.2.2   # laptop-setup installs this official build: Ubuntu's blender has no CUDA or OptiX kernels
+BLENDER_SHA256=84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168   # blender-5.2.2-linux-x64.tar.xz
+RENDER_NEEDS="git tar timeout setsid nice base64"
+RENDER_MAX_BYTES=${CC_SUITES_RENDER_MAX_BYTES:-2147483648}   # the frames one render may bring back, both sides, and
+# on the runner the most any one file it writes may hold (ulimit -f), so a scene cannot fill the laptop's disk
+RENDER_TREE_MAX=${CC_SUITES_RENDER_TREE_MAX:-268435456}      # the scene directory the box will ship
+RENDER_LOG_LINES=60; RENDER_LOG_WIDTH=400   # the log a render sends back: its last lines, each cut to this many bytes
+RENDER_TAR_SLACK=${CC_SUITES_RENDER_TAR_SLACK:-16777216}   # what the frames' tar may add to them: headers, padding
+render_tar_max(){ echo $((RENDER_MAX_BYTES + RENDER_TAR_SLACK)); }
+# $1 bytes in the wire form, base64 in `@` lines of 76 characters: the characters, plus an `@` and a newline a line
+render_wire(){ local c=$(( ($1 + 2) / 3 * 4 )); echo $(( c + (c + 75) / 76 * 2 )); }
+# the most a render stream may come to: the log lines (`| `, the line, a newline), the tar at its most in the wire
+# form, and 64 KB for the runner's own lines and the verdict
+render_stream_max(){ echo $(( RENDER_LOG_LINES * (RENDER_LOG_WIDTH + 3) + $(render_wire "$(render_tar_max)") + 65536 )); }
+RENDER_PY=$(cat <<'PY'
+import os, sys, bpy
+e = os.environ
+dev = e.get("CC_RENDER_DEVICE", "CPU")
+got = "CPU"
+if dev == "GPU":
+    got = ""
+    p = bpy.context.preferences.addons["cycles"].preferences if "cycles" in bpy.context.preferences.addons else None
+    for t in ("OPTIX", "CUDA", "HIP", "ONEAPI"):
+        if p is None:
+            break
+        try:
+            p.compute_device_type = t
+        except TypeError:
+            continue
+        p.refresh_devices()
+        gpus = [d for d in p.devices if d.type == t]
+        if gpus:
+            for d in p.devices:
+                d.use = d.type == t
+            got = t + " " + gpus[0].name
+            break
+print("cc-render: device %s, Blender %s" % (got or "none", bpy.app.version_string), flush=True)
+if not got:
+    sys.exit(3)
+if e.get("CC_RENDER_PROBE") == "1":
+    sys.exit(0)
+s = bpy.context.scene
+if s.render.engine == "CYCLES":
+    s.cycles.device = "GPU" if dev == "GPU" else "CPU"
+if e.get("CC_RENDER_START"):
+    s.frame_start = int(e["CC_RENDER_START"])
+    s.frame_end = int(e["CC_RENDER_END"])
+s.render.filepath = os.path.join(e["CC_RENDER_OUT"], "frame_####")
+bpy.ops.render.render(animation=True)
+PY
+)
+blender_bin(){ command -v "${CC_SUITES_BLENDER:-blender}" 2>/dev/null; }   # CC_SUITES_BLENDER: the selfcheck's fake
+# THE CAGE for Blender: cage_argv's without --net (so no network, only lo, and an empty /run), and WSL's GPU device
+# node, the one thing added. The NVIDIA libraries it needs are under /usr/lib/wsl, already read-only.
+render_cage(){
+  cage_argv "$@"
+  [ ! -e /dev/dxg ] || CG=("${CG[@]:0:${#CG[@]}-1}" --dev-bind /dev/dxg /dev/dxg --)
+}
+runner_render(){
+  local tree=${1:-} cap=${2:-} s=${3:-} e=${4:-} scene=${5:-} why slot j t rc bl n bytes tsz
+  { [ "$#" = 5 ] && [[ $tree =~ ^[0-9a-f]{40}$ ]] && [[ $cap =~ ^[1-9][0-9]{0,4}$ ]] && [ "$cap" -le 86400 ] \
+    && [[ $scene =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*\.py$ ]] \
+    && { { [ "$s" = - ] && [ "$e" = - ]; } || { [[ $s =~ ^(0|[1-9][0-9]{0,6})$ ]] && [[ $e =~ ^(0|[1-9][0-9]{0,6})$ ]] && [ "$s" -le "$e" ]; }; }; } \
+    || { echo "cc-suite-runner: refused: render TREE CAP START END SCENE"; return 2; }
+  for slot in $(seq 1 "$(runner_slots)"); do
+    exec {LK}>>"$RUNNER_DIR/slot.$slot"; flock -n $LK && break; exec {LK}>&-; LK=
+  done
+  [ -n "${LK:-}" ] || { echo "cc-suite-runner: busy"; return 75; }
+  why=$(runner_unfit); [ -z "$why" ] || { echo "cc-suite-runner: busy ($why)"; return 75; }
+  why=$(needs_missing "${CC_SUITES_RENDER_NEEDS:-$RENDER_NEEDS}"); bl=$(blender_bin) || why="${why:+$why }blender"
+  [ -z "$why" ] || { echo "cc-suite-runner: unfit (missing: $why)"; return 75; }
+  j=$(mktemp -d "$RUNNER_DIR/render.XXXXXX") || return 1; w=$j   # w: the EXIT trap removes it
+  trap 'rc=$?; [ -z "$pg" ] || kill -KILL -- -"$pg" 2>/dev/null; [ -z "$w" ] || rm -rf "$w" "$w.log"; exit $rc' EXIT
+  trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+  mkdir "$j/tree" "$j/home" "$j/out"
+  tar -x -C "$j/tree" -f - --no-same-owner {LK}>&- 2>/dev/null || { echo "cc-suite-runner: the tree did not unpack"; return 1; }
+  rm -rf "$j/tree/.git"
+  t=$(exec {LK}>&-; cd "$j/tree" && git init -q && git add -A -f && git write-tree 2>/dev/null) || t=""
+  [ "$t" = "$tree" ] || { echo "cc-suite-runner: unpacked tree ${t:-none} is not $tree — refused"; return 1; }
+  rm -rf "$j/tree/.git"
+  [ -f "$j/tree/$scene" ] && [ ! -L "$j/tree/$scene" ] || { echo "cc-suite-runner: no scene $scene in the tree — refused"; return 1; }
+  local -a pre=(timeout -k 10 "$cap" nice -n 19)
+  command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
+  render_cage "$j"
+  ( cd "$j/tree" && ulimit -f $((RENDER_MAX_BYTES / 1024 + 1)) && exec setsid env -i HOME="$j/home" USER="${USER:-$(id -un)}" PATH=/usr/local/bin:/usr/bin:/bin \
+      LANG=C.UTF-8 TERM=dumb TMPDIR="$j" CC_RENDER_OUT="$j/out" CC_RENDER_START="${s#-}" CC_RENDER_END="${e#-}" \
+      CC_RENDER_DEVICE=GPU "${pre[@]}" "${CG[@]}" "$bl" -b --factory-startup -noaudio --python-exit-code 1 \
+      --python "$j/tree/$scene" --python-expr "$RENDER_PY" ) </dev/null {LK}>&- >"$j.log" 2>&1 & gp=$!; pg=$gp
+  rc=0; wait "$gp" || rc=$?; gp=""
+  kill -KILL -- -"$pg" 2>/dev/null; pg=""
+  tail -n "$RENDER_LOG_LINES" "$j.log" | cut -b "1-$RENDER_LOG_WIDTH" | LC_ALL=C awk '{ print "| " $0 }'
+  if { [ "$rc" = 3 ] || [ "$rc" = 1 ]; } && grep -aqx 'cc-render: device none, Blender .*' "$j.log"; then
+    echo "cc-suite-runner: unfit (Blender sees no GPU)"; return 75
+  fi
+  case $rc in 124|137) echo "cc-render: verdict exit=124 tree=$tree"; return 0;; 0) ;;
+    *) echo "cc-render: verdict exit=$rc tree=$tree"; return 0;; esac
+  [ -z "$(find "$j/out" -mindepth 1 ! -type f ! -type d -print -quit)" ] \
+    || { echo "cc-render: verdict none — out/ holds something that is not a file"; return 0; }
+  n=$(find "$j/out" -type f | wc -l); bytes=$(find "$j/out" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')
+  [ "$n" -gt 0 ] || { echo "cc-render: verdict none — Blender wrote no frames"; return 0; }
+  [ "$bytes" -le "$RENDER_MAX_BYTES" ] || { echo "cc-render: verdict none — the frames are $bytes bytes, over $RENDER_MAX_BYTES"; return 0; }
+  tsz=$(tar -C "$j/out" --owner=0 --group=0 --numeric-owner -cf - . {LK}>&- | wc -c)
+  [ "$tsz" -le "$(render_tar_max)" ] || { echo "cc-render: verdict none — the frames' tar is $tsz bytes, over $(render_tar_max)"; return 0; }
+  tar -C "$j/out" --owner=0 --group=0 --numeric-owner -cf - . {LK}>&- | base64 -w 76 | sed 's/^/@/'
+  echo "cc-render: verdict exit=0 tree=$tree files=$n bytes=$bytes"
+  return 0
+}
+# `gpu`: what Blender on this machine renders with, from the same RENDER_PY in the same cage, and no scene:
+# `gpu OPTIX <name>, Blender 5.2.2`, or `gpu none (…)`. It takes no slot and starts nothing that outlives it, and
+# like a render it starts nothing while the machine is loaded (`gpu not asked (busy: …)`), and then at nice 19.
+runner_gpu(){
+  local bl j why dev
+  [ "$#" = 0 ] || { echo "cc-suite-runner: refused: gpu takes nothing"; return 2; }
+  why=$(runner_unfit); [ -z "$why" ] || { echo "gpu not asked (busy: $why)"; return 0; }
+  why=$(needs_missing "timeout setsid nice"); bl=$(blender_bin) || why="${why:+$why }blender"
+  [ -z "$why" ] || { echo "gpu none (missing: $why)"; return 0; }
+  j=$(mktemp -d "$RUNNER_DIR/gpu.XXXXXX") || return 1; w=$j
+  trap 'rc=$?; [ -z "$w" ] || rm -rf "$w"; exit $rc' EXIT
+  local -a pre=(timeout -k 5 90 nice -n 19)
+  command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
+  render_cage "$j"
+  dev=$(cd "$j" && setsid env -i HOME="$j" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TERM=dumb TMPDIR="$j" \
+    CC_RENDER_DEVICE=GPU CC_RENDER_PROBE=1 "${pre[@]}" "${CG[@]}" "$bl" -b --factory-startup -noaudio \
+    --python-expr "$RENDER_PY" </dev/null 2>&1 | sed -n 's/^cc-render: device //p' | head -1 | LC_ALL=C tr -c ' -~\n' '?')
+  echo "gpu ${dev:-none (Blender gave no answer)}"
+}
+
+# ---- render (the box's side) --------------------------------------------------------------------------------------
+# `cc-suites render SCENE.py OUT [START END] [--here]`: the frames in OUT (made, and empty), Blender's log beside it
+# in OUT.log. On the laptop's GPU when it answers free and fit, else on this box's CPU at nice 19 and idle I/O, with
+# the same RENDER_PY (so the same frames, only slower); --here skips the laptop. Anything but a clean laptop
+# verdict for the exact tree shipped, with frames that pass render_unpack, falls back to the box: busy, asleep, no
+# GPU, a red there, out of time; the laptop's log is then kept as OUT.laptop.log, with what it said on stderr.
+# CC_SUITES_RENDER_CAP (seconds, default 4 h) bounds a render on either side. What travels is the scene's directory,
+# so the box refuses one that is HOME, /, /tmp or /var/tmp, or holds a .ssh or .cc (keys, config): a scene lives in a
+# directory of its own. It measures the directory (du) before it tars a byte of it.
+# The box's own render is NOT caged: it runs as the caller, with the caller's environment and network, like any
+# script the caller runs, so render only a scene of the caller's own (a scene can always make the laptop fail and
+# land here). The laptop's cage protects the laptop, whose owner never saw the scene.
+render_unpack(){   # $1 = the laptop's stream, $2 = the tree shipped, $3 = OUT: 0 when its frames are in OUT
+  local vs last p n tm sz
+  vs=$(grep -a -v '^| \|^@' "$1" | grep -a '^cc-render: verdict'); last=$(tail -n 1 "$1")
+  [ -n "$vs" ] && [ "$(printf '%s\n' "$vs" | wc -l)" = 1 ] && [ "$vs" = "$last" ] || return 1
+  [[ $vs =~ ^cc-render:\ verdict\ exit=0\ tree=([0-9a-f]{40})\ files=([0-9]+)\ bytes=[0-9]+$ ]] && [ "${BASH_REMATCH[1]}" = "$2" ] || return 1
+  n=${BASH_REMATCH[2]}; p="$1.tar"; tm=$(render_tar_max)
+  # capped while it is written: what a laptop sends can fill nothing here past the cap
+  grep -a '^@' "$1" | cut -c2- | base64 -d 2>/dev/null | head -c $((tm + 1)) >"$p"
+  [ "$(stat -c %s "$p")" -le "$tm" ] || return 1
+  # only regular files and directories, none of them above OUT, and as many files as the verdict says
+  [ -z "$(tar -tvf "$p" 2>/dev/null | cut -c1 | grep -v '^[-d]$')" ] || return 1
+  ! tar -tf "$p" 2>/dev/null | grep -qE '^/|(^|/)\.\.(/|$)' || return 1
+  [ "$(tar -tvf "$p" 2>/dev/null | grep -c '^-')" = "$n" ] || return 1
+  # what the files come to once written, whatever the verdict says: tar lists a member's logical size, a sparse one's
+  # too (a few KB of archive can be gigabytes on disk). Over the cap, nothing is written.
+  sz=$(tar -tvf "$p" --numeric-owner 2>/dev/null | awk '/^-/ { s += $3 } END { printf "%.0f\n", s + 0 }')
+  [[ $sz =~ ^[0-9]+$ ]] && [ "$sz" -le "$RENDER_MAX_BYTES" ] || return 1
+  # and the extract cannot write one file past the cap whatever the listing said
+  ( ulimit -f $((RENDER_MAX_BYTES / 1024 + 1)) && exec tar -x --no-same-owner --no-same-permissions -C "$3" -f "$p" ) 2>/dev/null
+}
+render(){
+  local here="" s=- e=- scene dir rel out log cap rc n bl a1 a2 hm
+  local -a a
+  while [ "$#" -gt 0 ]; do case $1 in --here) here=1;; *) a+=("$1");; esac; shift; done
+  case ${#a[@]} in 2) ;; 4) s=${a[2]}; e=${a[3]};; *) echo "usage: cc-suites render SCENE.py OUT [START END] [--here]" >&2; return 2;; esac
+  [ "$s" = - ] || { [[ $s =~ ^(0|[1-9][0-9]{0,6})$ ]] && [[ $e =~ ^(0|[1-9][0-9]{0,6})$ ]] && [ "$s" -le "$e" ]; } \
+    || { echo "cc-suites render: START END are frame numbers, START <= END" >&2; return 2; }
+  scene=$(readlink -f "${a[0]}" 2>/dev/null); rel=${scene##*/}; dir=${scene%/*}
+  [ -f "$scene" ] && [[ $rel =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*\.py$ ]] || { echo "cc-suites render: ${a[0]} is not a scene script (NAME.py)" >&2; return 2; }
+  mkdir -p "${a[1]}" && [ -z "$(ls -A "${a[1]}")" ] || { echo "cc-suites render: ${a[1]} must be a new or empty directory" >&2; return 2; }
+  hm=$(readlink -f "$HOME" 2>/dev/null)
+  case $dir in "$hm"|""|/tmp|/var/tmp) dir="";; esac
+  [ -n "$dir" ] && [ -z "$(find "$dir" -name .git -prune -o \( -name .ssh -o -name .cc \) -print -quit 2>/dev/null)" ] \
+    || { echo "cc-suites render: the scene's directory travels with it, so it cannot be HOME, /, /tmp or one holding .ssh or .cc: put ${a[0]} in a directory of its own" >&2; return 2; }
+  out=$(cd "${a[1]}" && pwd); log="$out.log"; rm -f "$out.laptop.log"
+  cap=${CC_SUITES_RENDER_CAP:-14400}; [[ $cap =~ ^[1-9][0-9]{0,4}$ ]] && [ "$cap" -le 86400 ] || cap=14400
+  SECONDS=0
+  if [ -n "$here" ]; then :
+  elif ! configured; then echo "== no laptop is set up: rendering on this box's CPU =="
+  else
+    local -a XP; local tmp tree ans why dsz
+    xport_argv
+    # on disk, never /tmp (a tmpfs, so RAM): the stream and the frames it carries may come to gigabytes
+    mkdir -p "$HOME/.cc/tmp" && tmp=$(mktemp -d "$HOME/.cc/tmp/cc-render.XXXXXX") && mkdir "$tmp/w" || return 1
+    ans=$(xp_kept "$tmp/err" timeout 20s "${XP[@]}" status </dev/null | tail -1); ans=$(printable "$ans")
+    [ -n "$ans" ] || { ans=$(err_of "$tmp/err"); ans="nothing${ans:+ ($ans)}"; }
+    if [[ $ans != "free "[1-9]* ]]; then echo "== the laptop answers $ans: rendering on this box's CPU =="
+    elif dsz=$(du -sb --exclude=.git "$dir" 2>/dev/null | cut -f1); ! [[ $dsz =~ ^[0-9]+$ ]] || [ "$dsz" -gt "$RENDER_TREE_MAX" ]; then
+      echo "== $dir is ${dsz:-unreadable} bytes, over the $RENDER_TREE_MAX the laptop takes: rendering on this box's CPU =="
+    else
+      tar -C "$dir" --exclude=.git -cf "$tmp/t.tar" . 2>/dev/null && tar -x -C "$tmp/w" -f "$tmp/t.tar" \
+        && tree=$(cd "$tmp/w" && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 sh -c 'git init -q && git add -A -f && git write-tree') || tree=""
+      if [ -z "$tree" ] || [ "$(stat -c %s "$tmp/t.tar")" -gt "$RENDER_TREE_MAX" ]; then
+        echo "== $dir is not a tree the laptop can take (over $RENDER_TREE_MAX bytes, or unreadable): rendering on this box's CPU =="
+      else
+        echo "== rendering $rel on the laptop's GPU (tree ${tree:0:12}) =="
+        xp_kept "$tmp/err" timeout -k 10 $((cap + 600)) "${XP[@]}" render "$tree" "$cap" "$s" "$e" "$rel" <"$tmp/t.tar" \
+          | head -c "$(render_stream_max)" >"$tmp/stream"
+        grep -a '^| ' "$tmp/stream" | cut -c3- >"$log"
+        if render_unpack "$tmp/stream" "$tree" "$out"; then
+          n=$(find "$out" -type f | wc -l); rm -rf "$tmp"
+          echo "cc-suites render: $n file(s) in $out, rendered on the laptop ($(sed -n 's/^cc-render: device //p' "$log" | head -1 | LC_ALL=C tr -c ' -~\n' '?' | cut -c1-120)) in ${SECONDS}s; log $log"
+          return 0
+        fi
+        find "$out" -mindepth 1 -delete 2>/dev/null
+        # why: the runner's last line of its own, else what the laptop said on stderr (an older runner refuses there)
+        why=$(printable "$(grep -a -v '^| \|^@' "$tmp/stream" | tail -1)"); [ -n "$why" ] || why=$(err_of "$tmp/err")
+        { [ -z "$why" ] || echo "cc-suites: the laptop said: $why"; } >>"$log"
+        mv -f "$log" "$out.laptop.log"
+        echo "== the laptop brought back no frames after ${SECONDS}s (${why:0:160}): rendering on this box's CPU; its log is $out.laptop.log =="
+      fi
+    fi
+    rm -rf "$tmp"
+  fi
+  bl=$(blender_bin) || { echo "cc-suites render: no blender on this box" >&2; return 1; }
+  local -a pre=(nice -n 19); command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
+  a1=${s#-}; a2=${e#-}
+  ( cd "$dir" && exec env CC_RENDER_OUT="$out" CC_RENDER_START="$a1" CC_RENDER_END="$a2" CC_RENDER_DEVICE=CPU \
+      "${pre[@]}" timeout -k 10 "$cap" "$bl" -b --factory-startup -noaudio --python-exit-code 1 \
+      --python "$scene" --python-expr "$RENDER_PY" ) </dev/null >"$log" 2>&1
+  rc=$?; n=$(find "$out" -type f | wc -l)
+  if [ "$rc" != 0 ] || [ "$n" = 0 ]; then
+    tail -n 15 "$log"; echo "cc-suites render: Blender failed on this box (exit $rc, $n file(s)); log $log" >&2; return 1
+  fi
+  echo "cc-suites render: $n file(s) in $out, rendered on this box's CPU (nice 19) in ${SECONDS}s; log $log"
+}
+
 # ---- laptop-setup -------------------------------------------------------------------------------------------------
 laptop_setup(){
   local node=${1:-cc-suites-runner} pub b64 hk pymm scv scsum=""
@@ -558,6 +825,19 @@ if [ -n "$scsum" ] && older "\$(shellcheck --version 2>/dev/null | awk '/^versio
   tar -xJf "\$t/sc.tar.xz" -C "\$t"
   install -m 755 -o root -g root "\$t/shellcheck-v$scv/shellcheck" /usr/local/bin/shellcheck; rm -rf "\$t"
 fi
+# Blender for the box's renders (cc-suites render): the official build, pinned by version and sha256 (Ubuntu's has no
+# CUDA or OptiX kernels), with the libraries it loads even headless. WSL's GPU driver comes from Windows.
+apt-get install -y -qq xz-utils libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxext6 libxkbcommon0 libsm6 \\
+  libice6 libgl1 libegl1 </dev/null >/dev/null
+if [ "\$(readlink /usr/local/bin/blender)" != /opt/blender-$BLENDER_VERSION/blender ] || [ ! -x /opt/blender-$BLENDER_VERSION/blender ]; then
+  t=\$(mktemp -d)
+  curl -fsSL -o "\$t/b.tar.xz" https://download.blender.org/release/Blender${BLENDER_VERSION%.*}/blender-$BLENDER_VERSION-linux-x64.tar.xz
+  echo "$BLENDER_SHA256  \$t/b.tar.xz" | sha256sum -c --quiet
+  mkdir "\$t/b"; tar -xJf "\$t/b.tar.xz" -C "\$t/b" --strip-components=1 --no-same-owner
+  rm -rf /opt/blender-$BLENDER_VERSION; mv "\$t/b" /opt/blender-$BLENDER_VERSION; rm -rf "\$t"
+  chown -R root:root /opt/blender-$BLENDER_VERSION; chmod 755 /opt/blender-$BLENDER_VERSION
+  ln -sfn /opt/blender-$BLENDER_VERSION/blender /usr/local/bin/blender
+fi
 install -d -m 755 -o root -g root /etc/cc-suites
 printf 'python3 %s\\nshellcheck %s\\n' $pymm $scv >/etc/cc-suites/floor; chmod 644 /etc/cc-suites/floor
 # The runner account can write nothing that decides what it runs or says: the runner, its home, its dotfiles and
@@ -617,6 +897,8 @@ Write-Host "Last step: open the link below and log this runner into your tailnet
 wsl.exe -d \$Distro -u root -- tailscale up --hostname=$node --accept-dns=false
 \$ready = wsl.exe -d \$Distro -u ccsuite -- env SSH_ORIGINAL_COMMAND=status /usr/local/bin/cc-suites runner
 Write-Host "The runner answers: \$ready  ('free N' is ready; 'unfit (missing: ...)' names what this laptop still lacks)"
+\$gpu = wsl.exe -d \$Distro -u ccsuite -- env SSH_ORIGINAL_COMMAND=gpu /usr/local/bin/cc-suites runner
+Write-Host "Blender renders with: \$gpu  ('gpu OPTIX ...' or 'gpu CUDA ...' is ready; 'gpu none' means the box renders on its own CPU)"
 Write-Host "Done. The box will send suites and the lander's quick checks here while this laptop is open and not busy (on battery too)."
 PS1
 }
@@ -948,12 +1230,165 @@ except OSError: print(\"CUT\")' $rs" | base64 -w0)
   k "$(b '[ "$rc" = 2 ]')" "…and any command but status and run"
   out=$(cd "$R" && git archive HEAD | SSH_ORIGINAL_COMMAND="run core/tests/selftest.sh $(printf %040d 0) all -" bash "$SELF" runner 2>&1); rc=$?
   k "$(b 'grep -q '\''refused'\'' <<<"$out" && ! grep -q '\''suite ran'\'' <<<"$out"')" "…and a tar that is not the tree it was told, before running a line of it"
+  # --- RENDER: a fake Blender that keeps RENDER_PY's contract by hand (the device line, exit 3 with no GPU while
+  # $FB/nogpu exists, or the code it holds; a GPU named by $FB/gpuname with its niceness; a frame file per frame into
+  # CC_RENDER_OUT saying the device and its niceness), and runs the
+  # scene script with bash, so a scene of a case's own can try things inside the cage. It lives under HOME, which
+  # the cage shows read-only (its /tmp is fresh). Each case has its own scene directory and OUT.
+  local FB SC rt ro; FB=$(mktemp -d "$HOME/.cc-suites-blender.XXXXXX"); SC="$D/scenes"
+  cat > "$FB/blender" <<'EOF'
+#!/usr/bin/env bash
+sc=""; while [ "$#" -gt 0 ]; do [ "$1" = --python ] && sc=$2; shift; done
+d=${CC_RENDER_DEVICE:-CPU}; [ "$d" = GPU ] && d="OPTIX Fake GPU"; fb=$(dirname "$0")
+[ "$d" = CPU ] || [ ! -e "$fb/gpuname" ] || d="OPTIX $(cat "$fb/gpuname") nice=$(nice)"
+if [ "$CC_RENDER_DEVICE" = GPU ] && [ -e "$fb/nogpu" ]; then echo "cc-render: device none, Blender 9.9"; c=$(cat "$fb/nogpu"); exit "${c:-3}"; fi
+echo "cc-render: device $d, Blender 9.9"
+[ "${CC_RENDER_PROBE:-}" = 1 ] && exit 0
+[ -z "$sc" ] || . "$sc"
+for f in $(seq "${CC_RENDER_START:-1}" "${CC_RENDER_END:-2}"); do
+  printf 'frame %s %s nice=%s\n' "$f" "$CC_RENDER_DEVICE" "$(nice)" > "$CC_RENDER_OUT/frame_$(printf %04d "$f").png"; done
+EOF
+  chmod +x "$FB/blender"; export CC_SUITES_BLENDER="$FB/blender"
+  printf '#!/usr/bin/env bash\necho "$*" >> "%s/render.calls"\nexec env HOME="%s/rhome" SSH_ORIGINAL_COMMAND="$*" CC_SUITES_RUNNER_DIR="%s/runner" bash "%s" runner\n' "$D" "$D" "$D" "$SELF" > "$D/xport-render"
+  chmod +x "$D/xport-render"; echo "0.00 0.00 0.00 1/1 1" > "$D/loadavg"; rm -f "$D/runner/slots" "$D/runner/maxload"
+  sc(){ mkdir -p "$SC/$1" && printf '%s\n' "${2:-true}" > "$SC/$1/scene.py"; }   # a scene directory of a case's own
+  sc gpu; echo "a neighbour" > "$SC/gpu/texture.txt"
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/gpu/scene.py" "$D/o-gpu" 3 4 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "rendered on the laptop (OPTIX Fake GPU, Blender 9.9)" <<<"$out" && [ "$(ls "$D/o-gpu" | tr "\n" " ")" = "frame_0003.png frame_0004.png " ] && grep -qx "frame 4 GPU nice=19" "$D/o-gpu/frame_0004.png"')" "render: a free laptop renders the frames asked on its GPU at nice 19, and they come back as files (got $rc)"
+  k "$(b 'grep -q "^cc-render: device OPTIX Fake GPU" "$D/o-gpu.log" && [ -z "$(ls -d "$D/runner"/render.* 2>/dev/null)" ]')" "…with Blender's log beside OUT, and nothing left in the runner's directory"
+  touch "$FB/nogpu"; sc nogpu
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/nogpu/scene.py" "$D/o-nogpu" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "unfit (Blender sees no GPU)" <<<"$out" && grep -q "rendered on this box.s CPU (nice 19)" <<<"$out" && grep -qx "frame 2 CPU nice=19" "$D/o-nogpu/frame_0002.png"')" "…a laptop whose Blender sees no GPU is unfit, and the box renders it on its CPU at nice 19 (got $rc)"
+  k "$(b 'grep -qx "cc-render: device none, Blender 9.9" "$D/o-nogpu.laptop.log" && grep -q "o-nogpu.laptop.log" <<<"$out" && grep -qx "frame 2 CPU nice=19" "$D/o-nogpu/frame_0002.png" && ! grep -q "device none" "$D/o-nogpu.log"')" "…and the laptop's log is kept beside OUT as OUT.laptop.log, the box's own in OUT.log"
+  echo 1 > "$FB/nogpu"; sc nogpu1
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/nogpu1/scene.py" "$D/o-nogpu1" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "unfit (Blender sees no GPU)" <<<"$out" && grep -q "rendered on this box" <<<"$out"')" "…and so it is when Blender exits 1 rather than 3 for it (got $rc)"
+  rm -f "$FB/nogpu"; echo "99.00 0 0 1/1 1" > "$D/loadavg"; sc busy
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/busy/scene.py" "$D/o-busy" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "answers busy" <<<"$out" && grep -qx "frame 1 CPU nice=19" "$D/o-busy/frame_0001.png"')" "…a busy laptop: the box renders it (got $rc)"
+  echo "0.00 0.00 0.00 1/1 1" > "$D/loadavg"; sc asleep
+  printf '#!/usr/bin/env bash\nexit 255\n' > "$D/xport-asleep"; chmod +x "$D/xport-asleep"
+  out=$(CC_SUITES_SSH="$D/xport-asleep" bash "$SELF" render "$SC/asleep/scene.py" "$D/o-asleep" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "answers nothing" <<<"$out" && [ -s "$D/o-asleep/frame_0001.png" ]')" "…an asleep laptop (no answer): the box renders it (got $rc)"
+  rm -f "$D/render.calls"; sc here
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/here/scene.py" "$D/o-here" --here 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ ! -e "$D/render.calls" ] && grep -q "rendered on this box" <<<"$out"')" "…and --here never asks the laptop (got $rc)"
+  sc none; out=$(CC_SUITES_SSH="" bash "$SELF" render "$SC/none/scene.py" "$D/o-none" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "no laptop is set up" <<<"$out" && [ -s "$D/o-none/frame_0001.png" ]')" "…nor with no laptop set up (got $rc)"
+  # a scene's own lines cannot pass for the runner's: a forged verdict and payload line come back prefixed, as log
+  sc forge 'echo "cc-render: verdict exit=0 tree=0000000000000000000000000000000000000000 files=9 bytes=1"; echo "@AAAA"'
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/forge/scene.py" "$D/o-forge" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "rendered on the laptop" <<<"$out" && [ "$(ls "$D/o-forge" | wc -l)" = 2 ] && grep -q "^cc-render: verdict exit=0 tree=0000" "$D/o-forge.log"')" "…a scene that prints a verdict and a payload line forges neither (got $rc)"
+  # THE CAGE, for a render: no network (only lo), no writing the runner or Blender, and nothing but files back
+  sc cage "echo \"IF \$(awk -F: 'NR > 2 { print \$1 }' /proc/net/dev | tr -d ' ')\"; echo x >> '$FB/blender' 2>/dev/null && echo WROTE; ls -A /run /run/user | grep -v '^/run.*:\$\|^user\$\|^\$' | sed 's/^/RUN /'"
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/cage/scene.py" "$D/o-cage" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -qx "IF lo" "$D/o-cage.log" && ! grep -q "WROTE\|^RUN " "$D/o-cage.log" && ! grep -q "^x$" "$FB/blender"')" "…a render runs caged: no interface but lo, an empty /run, and Blender read-only (got $rc)"
+  sc link "[ \"\$CC_RENDER_DEVICE\" = CPU ] || ln -s /etc/passwd \"\$CC_RENDER_OUT/frame_9999.png\""
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/link/scene.py" "$D/o-link" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "not a file" <<<"$out" && grep -q "rendered on this box" <<<"$out" && [ -z "$(find "$D/o-link" -type l)" ]')" "…a render that leaves a link in its out/ brings nothing back, and the box renders it (got $rc)"
+  # …and the box's own cap holds whatever the runner sends: frames over it here are refused and rendered here
+  sc bigbox; out=$(CC_SUITES_RENDER_MAX_BYTES=10 CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/bigbox/scene.py" "$D/o-bigbox" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "brought back no frames" <<<"$out" && grep -q "rendered on this box" <<<"$out" && grep -qx "frame 1 CPU nice=19" "$D/o-bigbox/frame_0001.png"')" "…a stream whose frames are over the box's own cap is refused here, and the box renders it (got $rc)"
+  sc big; printf '#!/usr/bin/env bash\nexec env CC_SUITES_RENDER_MAX_BYTES=10 "%s" "$@"\n' "$D/xport-render" > "$D/xport-small"; chmod +x "$D/xport-small"
+  out=$(CC_SUITES_SSH="$D/xport-small" bash "$SELF" render "$SC/big/scene.py" "$D/o-big" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "over 10" <<<"$out" && grep -q "rendered on this box" <<<"$out"')" "…frames over the size cap stay there, and the box renders them (got $rc)"
+  # the box takes back only regular files, for the tree it shipped: a runner that sends a link, or names another tree
+  sc evil; mkdir -p "$D/evil"; ln -s /etc/passwd "$D/evil/frame_0001.png"; tar -C "$D/evil" -cf "$D/evil.tar" .
+  printf '#!/usr/bin/env bash\n[ "$1" = status ] && { echo "free 1"; exit 0; }\ncat >/dev/null; base64 -w76 "%s" | sed "s/^/@/"; echo "cc-render: verdict exit=0 tree=$2 files=1 bytes=1"\n' "$D/evil.tar" > "$D/xport-evil"; chmod +x "$D/xport-evil"
+  out=$(CC_SUITES_SSH="$D/xport-evil" bash "$SELF" render "$SC/evil/scene.py" "$D/o-evil" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "rendered on this box" <<<"$out" && [ -z "$(find "$D/o-evil" -type l)" ] && grep -qx "frame 1 CPU nice=19" "$D/o-evil/frame_0001.png"')" "…the box refuses a payload holding a link and renders it itself (got $rc)"
+  sed -i 's/tree=\$2/tree=%040d/; s/%040d/0000000000000000000000000000000000000000/' "$D/xport-evil"; sc other
+  rm -rf "$D/evil"; mkdir -p "$D/evil"; echo x > "$D/evil/frame_0001.png"; tar -C "$D/evil" -cf "$D/evil.tar" .
+  out=$(CC_SUITES_SSH="$D/xport-evil" bash "$SELF" render "$SC/other/scene.py" "$D/o-other" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "rendered on this box" <<<"$out" && grep -qx "frame 1 CPU nice=19" "$D/o-other/frame_0001.png"')" "…and frames for another tree (got $rc)"
+  # the box counts the files' own size, whatever the verdict says: a 20-byte file over a 10-byte cap, and a sparse
+  # file whose few KB of archive are 50 MB once written, are refused before a byte is extracted
+  sc logical; rm -rf "$D/evil"; mkdir -p "$D/evil"; printf '%020d' 0 > "$D/evil/frame_0001.png"; tar -C "$D/evil" -cf "$D/evil.tar" .
+  sed -i 's/tree=0\{40\} files=1 bytes=1/tree=$2 files=1 bytes=20/' "$D/xport-evil"
+  out=$(CC_SUITES_RENDER_MAX_BYTES=10 CC_SUITES_SSH="$D/xport-evil" bash "$SELF" render "$SC/logical/scene.py" "$D/o-logical" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "brought back no frames" <<<"$out" && grep -qx "frame 1 CPU nice=19" "$D/o-logical/frame_0001.png"')" "…a payload whose files are over the box's cap, though its verdict owns to it (got $rc)"
+  sc sparse; rm -rf "$D/evil"; mkdir -p "$D/evil"; truncate -s 50M "$D/evil/frame_0001.png"; tar -S -C "$D/evil" -cf "$D/evil.tar" .
+  out=$(CC_SUITES_RENDER_MAX_BYTES=1048576 CC_SUITES_SSH="$D/xport-evil" bash "$SELF" render "$SC/sparse/scene.py" "$D/o-sparse" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ "$(stat -c %s "$D/evil.tar")" -lt 1048576 ] && grep -q "brought back no frames" <<<"$out" && grep -qx "frame 1 CPU nice=19" "$D/o-sparse/frame_0001.png"')" "…and a sparse file whose small archive is over the cap once written (got $rc)"
+  rm -rf "$D/evil" "$D/evil.tar"
+  # THE STREAM BOUND: render_wire is the `@` lines' exact size, and a render at the very cap, with a log of long
+  # lines, comes back whole under render_stream_max (log lines cut to RENDER_LOG_WIDTH)
+  local ws=""; for ro in 0 1 2 3 56 57 58 59 1000 10240 99999; do
+    [ "$(head -c "$ro" /dev/zero | base64 -w 76 | sed 's/^/@/' | wc -c)" = "$(render_wire "$ro")" ] || ws="$ws $ro"; done
+  k "$(b '[ -z "$ws" ]')" "render_wire is the size of a payload's \`@\` lines, byte for byte (off at:${ws:- none})"
+  sc atcap "for i in \$(seq 70); do head -c 1000 /dev/zero | tr '\\0' L; echo; done; head -c 199960 /dev/zero > \"\$CC_RENDER_OUT/big.bin\""
+  rt=$(cd "$SC/atcap" && tar -cf - . | { mkdir -p "$D/rt-atcap" && tar -x -C "$D/rt-atcap" && cd "$D/rt-atcap" && git init -q && git add -A && git write-tree; })
+  (cd "$SC/atcap" && tar -cf - . | CC_SUITES_RENDER_MAX_BYTES=200000 CC_SUITES_RENDER_TAR_SLACK=20480 SSH_ORIGINAL_COMMAND="render $rt 60 - - scene.py" bash "$SELF" runner >"$D/atcap.stream" 2>&1)
+  ro=$(RENDER_MAX_BYTES=200000; RENDER_TAR_SLACK=20480; render_stream_max)
+  k "$(b 'tail -1 "$D/atcap.stream" | grep -q "^cc-render: verdict exit=0 .* bytes=200000$" && [ "$(wc -c <"$D/atcap.stream")" -le "$ro" ] && ! grep -a "^| " "$D/atcap.stream" | awk "length > $RENDER_LOG_WIDTH + 2 { f = 1 } END { exit !f }"')" "a render at the cap, with 70 log lines of 1000 bytes, is under its stream bound ($(wc -c <"$D/atcap.stream") <= $ro)"
+  out=$(CC_SUITES_RENDER_MAX_BYTES=200000 CC_SUITES_RENDER_TAR_SLACK=20480 CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/atcap/scene.py" "$D/o-atcap" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "rendered on the laptop" <<<"$out" && [ "$(stat -c %s "$D/o-atcap/big.bin")" = 199960 ]')" "…and the box takes it whole (got $rc)"
+  out=$(CC_SUITES_RENDER_MAX_BYTES=200000 CC_SUITES_RENDER_TAR_SLACK=1 CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/atcap/scene.py" "$D/o-tarcap" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "the frames.* tar is [0-9]* bytes, over 200001" <<<"$out" && grep -q "rendered on this box" <<<"$out"')" "…while frames whose tar is over render_tar_max stay there, and the box renders them (got $rc)"
+  # THE SCENE'S DIRECTORY: measured before a byte of it is tarred, and never HOME, /tmp or one holding .ssh or .cc
+  sc sshdir; mkdir -p "$SC/sshdir/sub/.ssh"; rm -f "$D/render.calls"
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/sshdir/scene.py" "$D/o-sshdir" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 2 ] && grep -q "directory of its own" <<<"$out" && [ ! -e "$D/render.calls" ]')" "render refuses a scene whose directory holds a .ssh, and asks the laptop nothing (got $rc)"
+  sc ccdir; mkdir -p "$SC/ccdir/.cc"
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/ccdir/scene.py" "$D/o-ccdir" --here 2>&1); rc=$?
+  k "$(b '[ "$rc" = 2 ] && grep -q "directory of its own" <<<"$out"')" "…or a .cc (got $rc)"
+  sc homedir; out=$(HOME="$SC/homedir" CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/homedir/scene.py" "$D/o-homedir" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 2 ] && grep -q "directory of its own" <<<"$out" && [ ! -e "$D/render.calls" ]')" "…or one that is HOME (got $rc)"
+  sc bigdir; head -c 1000 /dev/zero > "$SC/bigdir/texture.bin"
+  out=$(CC_SUITES_RENDER_TREE_MAX=500 CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/bigdir/scene.py" "$D/o-bigdir" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "is [0-9]* bytes, over the 500 the laptop takes" <<<"$out" && ! grep -q "^render" "$D/render.calls" && grep -qx "frame 1 CPU nice=19" "$D/o-bigdir/frame_0001.png"')" "…and a directory du says is over RENDER_TREE_MAX is never tarred or sent: the box renders it (got $rc)"
+  # WHAT THE LAPTOP SAYS ON STDERR is the reason (an older runner refuses render there), bounded and printable
+  printf '#!/usr/bin/env bash
+case $1 in status) echo "free 1";; gpu) printf "cc-suite-runner: refused: gpu\\033[2J\\n" >&2; exit 2;; *) cat >/dev/null; head -c 9000 /dev/zero | tr "\\0" x >&2; printf "\\ncc-suite-runner: refused: render\\n" >&2; exit 2;; esac
+' > "$D/xport-old"; chmod +x "$D/xport-old"
+  sc oldrunner; out=$(CC_SUITES_SSH="$D/xport-old" bash "$SELF" render "$SC/oldrunner/scene.py" "$D/o-oldrunner" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "brought back no frames after [0-9]*s (cc-suite-runner: refused: render)" <<<"$out" && grep -qx "cc-suites: the laptop said: cc-suite-runner: refused: render" "$D/o-oldrunner.laptop.log" && grep -q "rendered on this box" <<<"$out"')" "a render the laptop refuses on stderr names the refusal as the reason, and keeps it in OUT.laptop.log (got $rc)"
+  out=$(CC_SUITES_SSH="$D/xport-old" bash "$SELF" status 2>&1)
+  k "$(b 'grep -qx "cc-suites: its Blender renders with: no answer (cc-suite-runner: refused: gpu?\[2J)" <<<"$out"')" "…and status names a gpu refusal, its control bytes made printable"
+  printf '#!/usr/bin/env bash
+echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
+' > "$D/xport-gone"; chmod +x "$D/xport-gone"
+  out=$(CC_SUITES_SSH="$D/xport-gone" bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -qx "cc-suites: runner .* does not answer (ssh: connect to host x port 22: No route to host)" <<<"$out"')" "…and a status nobody answers says what ssh said (got $rc)"
+  sc gone; out=$(CC_SUITES_SSH="$D/xport-gone" bash "$SELF" render "$SC/gone/scene.py" "$D/o-gone" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "the laptop answers nothing (ssh: connect to host x port 22: No route to host)" <<<"$out"')" "…and so does a render (got $rc)"
+  # the runner's refusals: nothing freer than its one form, and nothing of a tree it cannot prove; Blender never starts
+  rt=$(cd "$SC/gpu" && tar -cf - . | { mkdir -p "$D/rt" && tar -x -C "$D/rt" && cd "$D/rt" && git init -q && git add -A && git write-tree; })
+  for ro in "render $rt 60 - - ../scene.py" "render $rt 60 - - /etc/scene.py" "render $rt 60 5 3 scene.py" "render $rt 60 08 9 scene.py" \
+            "render $rt 0 - - scene.py" "render $rt 90000 - - scene.py" "render $rt 60 - - scene.py x" "render $rt 60 - 3 scene.py" "render $rt 60 - - scene.sh"; do
+    out=$(cd "$SC/gpu" && tar -cf - . | SSH_ORIGINAL_COMMAND="$ro" bash "$SELF" runner 2>&1); rc=$?
+    k "$(b '[ "$rc" = 2 ] && grep -q "refused: render TREE CAP START END SCENE" <<<"$out" && ! grep -q "cc-render: device" <<<"$out"')" "the runner refuses '${ro#render $rt }' and runs nothing (got $rc)"
+  done
+  out=$(cd "$SC/gpu" && tar -cf - . | SSH_ORIGINAL_COMMAND="render $(printf %040d 0) 60 - - scene.py" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 1 ] && grep -q "is not 0000" <<<"$out" && ! grep -q "cc-render: device" <<<"$out"')" "…a tar that is not the tree it was told (got $rc)"
+  out=$(cd "$SC/gpu" && tar -cf - . | SSH_ORIGINAL_COMMAND="render $rt 60 - - other.py" bash "$SELF" runner 2>&1); rc=$?
+  k "$(b '[ "$rc" = 1 ] && grep -q "no scene other.py" <<<"$out" && ! grep -q "cc-render: device" <<<"$out"')" "…and a scene the tree does not hold (got $rc)"
+  out=$(SSH_ORIGINAL_COMMAND="gpu" bash "$SELF" runner 2>&1 </dev/null); rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ "$out" = "gpu OPTIX Fake GPU, Blender 9.9" ]')" "gpu names what Blender renders with (got: $out)"
+  touch "$FB/nogpu"; out=$(SSH_ORIGINAL_COMMAND="gpu" bash "$SELF" runner 2>&1 </dev/null); rm -f "$FB/nogpu"
+  k "$(b '[ "$out" = "gpu none, Blender 9.9" ]')" "…and none when it sees no GPU (got: $out)"
+  printf 'G' > "$FB/gpuname"; out=$(SSH_ORIGINAL_COMMAND="gpu" bash "$SELF" runner 2>&1 </dev/null)
+  k "$(b '[ "$out" = "gpu OPTIX G nice=19, Blender 9.9" ]')" "…asked at nice 19, like a render (got: $out)"
+  echo "99.00 0 0 1/1 1" > "$D/loadavg"; touch "$FB/nogpu"
+  out=$(SSH_ORIGINAL_COMMAND="gpu" bash "$SELF" runner 2>&1 </dev/null); echo "0.00 0.00 0.00 1/1 1" > "$D/loadavg"; rm -f "$FB/nogpu"
+  k "$(b '[[ $out == "gpu not asked (busy: load 99.00 on "* ]]')" "…and never while the machine is loaded: Blender does not start (got: $out)"
+  printf 'E\033[31mX' > "$FB/gpuname"; sc escname
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/escname/scene.py" "$D/o-escname" 2>&1); rc=$?; rm -f "$FB/gpuname"
+  k "$(b '[ "$rc" = 0 ] && grep -qF "rendered on the laptop (OPTIX E?[31mX nice=19, Blender 9.9)" <<<"$out" && ! grep -q $'"'"'\033'"'"' <<<"$out"')" "a render's success line prints the laptop's device name printable (got $rc)"
+  out=$(SSH_ORIGINAL_COMMAND="gpu now" bash "$SELF" runner 2>&1 </dev/null); rc=$?
+  k "$(b '[ "$rc" = 2 ]')" "…and takes no argument (got $rc)"
+  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" status 2>&1)
+  k "$(b 'grep -qx "cc-suites: its Blender renders with: OPTIX Fake GPU, Blender 9.9" <<<"$out"')" "status says the GPU the runner's Blender renders with"
+  mkdir -p "$D/o-full"; : > "$D/o-full/x"
+  k "$(b '[ "$(t bash "$SELF" render "$SC/gpu/scene.py" "$D/o-full")" = 2 ] && [ "$(t bash "$SELF" render "$SC/gpu/scene.py" "$D/o-rev" 4 3)" = 2 ] && [ "$(t bash "$SELF" render "$SC/gpu/texture.txt" "$D/o-txt")" = 2 ]')" "render refuses an OUT that is not empty, a range backwards, and a scene that is not NAME.py"
+  unset CC_SUITES_BLENDER; rm -f "$FB/blender"; rmdir "$FB"
   # laptop-setup: the key, the remote, and a script that carries this very file and the key's public half
   out=$(bash "$SELF" laptop-setup my-node 2>&1); rc=$?
   k "$(b '[ "$rc" = 0 ] && [ "$(cat "$D/sd/remote")" = ccsuite@my-node ] && [ -s "$D/sd/id_ed25519" ]')" "laptop-setup makes the key and points the remote at ccsuite@my-node"
   k "$(b 'grep -qF "restrict,command=\"/usr/local/bin/cc-suites runner\" $(cat "$D/sd/id_ed25519.pub")" <<<"$out"')" "…and its script pins that key to the runner, restricted"
   k "$(b 'awk "/^base64 -d/{f=1;next} /^B64\$/{f=0} f" <<<"$out" | base64 -d | cmp -s - "$SELF"')" "…and carries this file byte for byte"
   k "$(b 'grep -q "bubblewrap" <<<"$out"')" "…installs bwrap, which the suite's sandbox cases run"
+  k "$(b 'grep -qF "https://download.blender.org/release/Blender5.2/blender-$BLENDER_VERSION-linux-x64.tar.xz" <<<"$out" && grep -qF "echo \"$BLENDER_SHA256  \$t/b.tar.xz\" | sha256sum -c --quiet" <<<"$out" && grep -qx "  ln -sfn /opt/blender-$BLENDER_VERSION/blender /usr/local/bin/blender" <<<"$out" && grep -q "SSH_ORIGINAL_COMMAND=gpu" <<<"$out"')" "…installs the official Blender $BLENDER_VERSION, checked by sha256, as /usr/local/bin/blender, and says what GPU it sees"
   k "$(b 'grep -qx "printf '\''python3 %s\\\\nshellcheck %s\\\\n'\'' $(tool_version python3 | cut -d. -f1,2) $(tool_version shellcheck) >/etc/cc-suites/floor; chmod 644 /etc/cc-suites/floor" <<<"$out" && grep -q "sha256sum -c" <<<"$out"')" "…writes this box's python3 and shellcheck as the floor, and checks the shellcheck it fetches"
   # …and leaves the runner account nothing of its own to rewrite: the runner, the home, .ssh and authorized_keys root's
   k "$(b 'grep -qx "chown root:root /usr/local/bin/cc-suites; chmod 755 /usr/local/bin/cc-suites" <<<"$out" && grep -qx "install -d -m 755 -o root -g root /home/ccsuite /home/ccsuite/.ssh" <<<"$out" && grep -qx "chown root:root /home/ccsuite/.ssh/authorized_keys; chmod 644 /home/ccsuite/.ssh/authorized_keys" <<<"$out" && ! grep -q "chown ccsuite\|-o ccsuite -g ccsuite /home/ccsuite/.ssh\|useradd -m" <<<"$out"')" "…makes the runner, the runner account's home, .ssh and authorized_keys root's, never the account's"
@@ -975,6 +1410,7 @@ case "${1:-}" in
   reap) shift; reap "${1:-}";;
   spill) shift; spill "$@";;
   status) status;;
+  render) shift; render "$@";;
   runner) runner;;
   laptop-setup) shift; laptop_setup "$@";;
   selfcheck) selfcheck;;
