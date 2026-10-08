@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""cc-replay-moments — before a fix is built, count the past owner nudges and recorded failures it would have prevented.
+"""cc-replay-moments — before a fix is built, count the past owner nudges, recorded failures and stalls it would have prevented.
 
-  cc-replay-moments extract --labels FILE [--snapshots DIR] [--slack DIR] --out FILE
-      Rebuild the moment behind every labelled nudge and every recorded failure, and write them one JSON line each.
-  cc-replay-moments score --new PATH [--old PATH] (--moments FILE | --labels FILE [--snapshots DIR] [--slack DIR])
-                          [--verbose]
+  cc-replay-moments extract [--labels FILE] [--snapshots DIR] [--slack DIR] [--stalls FILE] [--held-out] --out FILE
+      Rebuild the moment behind every labelled nudge, every recorded failure and every stall, and write them one JSON
+      line each. Held-out stall moments are left out of the file; --held-out writes only them.
+  cc-replay-moments score --new PATH [--old PATH] (--moments FILE | [--labels FILE] [--snapshots DIR] [--slack DIR]
+                          [--stalls FILE]) [--held-out] [--verbose]
       Run every moment through the OLD and the NEW version of a rule and print, per class, how many moments could be
-      replayed and how many each version would have prevented. --verbose lists each moment either version fired on.
+      replayed and how many each version would have prevented, and for stalls the minutes of waiting each would have
+      saved. --verbose lists each moment either version fired on. --held-out scores the held-out stall moments and
+      nothing else.
   cc-replay-moments selfcheck
 
 A MOMENT is what the box had in front of it just before a nudge: the owner message (time, chat, thread, text) and the
@@ -19,6 +22,26 @@ quotes are the text the writer saw and are replayable, and the rest of its `n` a
 The owner messages in the labels' own time span that were NOT labelled are CONTROL moments: nothing is prevented
 there, and a version that fires on many of them is firing on ordinary traffic, not on the fault.
 
+A STALL is a stretch where a session stood without progress until a person or a sweep ended it. It is read from
+cc-stall's log (--stalls, default ~/.cc/state/stall.log): each `raised <row>` line is one stall, and it began
+"stood N min" before the line (minute-floored, as the log prints it). It ended at the first sign on its board row, in
+any snapshot day's board.jsonl, that someone dealt with it: a status of done, merged, dropped or closed, or a note that
+starts "Closed" or "Dropped". `stood_s` is that stretch, and it is the moment's `gap_s` too. A raised stall whose row
+has no such sign in the snapshots, a stall whose row the board refused and that was never raised after, and a dialog
+the sweep pressed itself (the log does not say how long it stood) are UNREPLAYABLE, counted and never dropped. Stall
+moments carry `window`, `class` (the stall's kind), `row`, `raised_at`, `text` (the log's own words), `stood_s`,
+`ended_at` and `ended_by`. A version that fires on a stall `after_s` seconds after it began saves `stood_s - after_s`
+of waiting (all of it when it names no after_s), and is LATE when after_s is past stood_s.
+Loops, handoffs, landings and idle wake-ups are not stall sources here: landings are cc-replay's, and the others
+record no start and end of a wait that a person or a sweep ended.
+
+HELD OUT. One in four stall moments, chosen by sha256 of a salt and the moment's id, is held out, and so is every
+stall raised at or after the stamp in `replay-heldout.from` (minute resolution; the word `lifted` there lifts it).
+Both files sit in ~/.cc/state/<control repo>/architect/ (CC_REPLAY_HELDOUT_DIR overrides), and a run with stall
+moments and no salt or stamp there is refused. extract and score leave held-out moments out and say how many;
+only --held-out scores them, and then only them. The split is made on every run from the ids, never read from a
+moments file.
+
 A VERSION is a file. A Python file (`.py`, or any file that defines `judge`) is imported and `judge(moment)` is
 called; anything else is executed once per moment with the moment as JSON on stdin and read from the first word of
 stdout. Either way it answers one of: `pass` (or nothing) — the moment goes as it went — or `refused`, `rewritten`,
@@ -28,20 +51,27 @@ after the owner's message is LATE — the nudge had already happened, so it coun
 a version that never fires, which is what the box did in history by definition: every nudge in the labels happened.
 A replayed old version that claims to prevent some is the replay's own error bar, read it before the new column.
 
-No model, no network, no clock: the same inputs print the same bytes. It reads the labels, the snapshots, the archive
-and the outbox log and writes only --out. It posts nothing and records nothing. Stdlib only; no box's repo names,
+No model, no network, no clock: the same inputs print the same bytes. It reads the labels, the snapshots, the archive,
+the outbox log, the stall log and the held-out files and writes only --out. It posts nothing and records nothing. Stdlib only; no box's repo names,
 channels or people are in this file — the labels and snapshots are data and live outside the repo.
 """
-import calendar, collections, glob, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
+import calendar, collections, glob, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 SNAPSHOTS = os.environ.get("CC_REPLAY_SNAPSHOTS") or f"{HOME}/.cc/state/improve/snapshots"
 SLACK = os.environ.get("CC_REPLAY_SLACK") or f"{HOME}/.cc/slack"
+STALLS = os.environ.get("CC_REPLAY_STALLS") or f"{HOME}/.cc/state/stall.log"
+BIN = os.path.dirname(os.path.realpath(__file__))
+STALL_ENDS = ("done", "merged", "dropped", "closed")      # a status on a stall's row that says someone dealt with it
+STALL_END_NOTE = re.compile(r"(closed|dropped)\b", re.I)  # …or a note that starts so
+REFUSED_WINDOW_S = 900                                    # a refused row raised again within this is the same stall
+HELD_EVERY = 4                                            # one in this many stall moments is held out
 VERDICTS = ("refused", "rewritten", "status", "flagged")
 SKIP_KINDS = ("post-failed",)          # and every react*: a reaction is not a post the owner read as the box's answer
-USAGE = ("usage: cc-replay-moments extract --labels FILE [--snapshots DIR] [--slack DIR] --out FILE\n"
-         "       cc-replay-moments score --new PATH [--old PATH] (--moments FILE | --labels FILE [--snapshots DIR] "
-         "[--slack DIR]) [--verbose]\n"
+USAGE = ("usage: cc-replay-moments extract [--labels FILE] [--snapshots DIR] [--slack DIR] [--stalls FILE] [--held-out] "
+         "--out FILE\n"
+         "       cc-replay-moments score --new PATH [--old PATH] (--moments FILE | [--labels FILE] [--snapshots DIR] "
+         "[--slack DIR] [--stalls FILE]) [--held-out] [--verbose]\n"
          "       cc-replay-moments selfcheck")
 
 
@@ -142,11 +172,79 @@ def moment_of(m, cls, source, by_thread, by_chat):
     return mo
 
 
-def extract(labels, snapshots, slack):
-    lab = jsonl(labels)
-    if not lab:
+def stall_ends(snapshots):
+    """Row ("repo/track") -> (epoch, ISO, by): the first sign in any snapshot day's board.jsonl that someone ended it.
+    The board's stamps are "MM-DDTHH:MM"; the year is the snapshot day's."""
+    ends = {}
+    for d in day_dirs(snapshots):
+        year = os.path.basename(os.path.normpath(d))[:4]
+        for r in jsonl(os.path.join(d, "board.jsonl")):
+            row = f"{r.get('repo')}/{r.get('track')}"
+            for entry, is_note in [(x, False) for x in r.get("statuses") or []] + [(x, True) for x in r.get("notes") or []]:
+                if not isinstance(entry, str) or " " not in entry:
+                    continue
+                stamp, word = entry.split(" ", 1)
+                if is_note and not STALL_END_NOTE.match(word):
+                    continue
+                if not is_note and word.strip() not in STALL_ENDS:
+                    continue
+                at = secs(f"{year}-{stamp}")
+                by = STALL_END_NOTE.match(word).group(1).lower() if is_note else word.strip()
+                if at is not None and (row not in ends or at < ends[row][0]):
+                    ends[row] = (at, f"{year}-{stamp}:00Z", f"{by} note" if is_note else by)
+    return ends
+
+
+def stall_moments(stalls, snapshots):
+    """One moment per stall in cc-stall's log; see STALL in the docstring for what replays and what does not."""
+    lines = []
+    try:
+        with open(stalls, errors="replace") as fh:
+            for line in fh:
+                p = line.rstrip("\n").split("\t")
+                if len(p) >= 4 and secs(p[0]) is not None:
+                    lines.append((p[0], p[1], p[2], p[3], "\t".join(p[4:])))
+    except OSError:
+        return []
+    ends, out, seen = stall_ends(snapshots), [], set()
+    for i, (at, window, kind, action, detail) in enumerate(lines):
+        base = {"source": "stall", "class": kind, "window": window, "raised_at": at, "text": detail, "prev_box": None,
+                "stood_s": None, "gap_s": None, "replayable": False}
+        if action.startswith("raised "):
+            row = action.split()[1]
+            m = re.search(r"stood (\d+) min", detail)
+            start = secs(at) - int(m.group(1)) * 60 if m else None
+            mo = dict(base, id=f"s:{row}", row=row,
+                      at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start)) if start is not None else at)
+            end = ends.get(row)
+            if start is None:
+                mo["why"] = "the log does not say how long it had stood"
+            elif end is None or end[0] < secs(at):
+                mo["why"] = "no board snapshot records how its row ended"
+            else:
+                mo.update(stood_s=end[0] - start, gap_s=end[0] - start, ended_at=end[1], ended_by=end[2], replayable=True)
+        elif action.startswith("board refused "):
+            row = action.split()[2]
+            later = any(k == kind and w == window and a.startswith("raised ") and 0 <= secs(t) - secs(at) <= REFUSED_WINDOW_S
+                        for t, w, k, a, _ in lines[i + 1:])
+            if later or f"s:{row}" in seen:   # the same stall, raised on a later pass or already counted as refused
+                continue
+            mo = dict(base, id=f"s:{row}", row=row, at=at, why="the board refused its row and it was never raised")
+        elif action.startswith("pressed "):
+            mo = dict(base, id=f"s:{window}:{kind}:{at}", at=at,
+                      why="the sweep pressed it; the log does not say how long it stood")
+        else:
+            continue
+        seen.add(mo["id"])
+        out.append(mo)
+    return out
+
+
+def extract(labels, snapshots, slack, stalls=None):
+    lab = jsonl(labels) if labels else []
+    if labels and not lab:
         die(f"no labelled nudges in {labels}")
-    msgs, by_thread, by_chat = load_sources(snapshots, slack)
+    msgs, by_thread, by_chat = load_sources(snapshots, slack) if lab else ({}, {}, {})
     out, labelled = [], set()
     for r in lab:
         key = (r.get("chat"), r.get("ts"))
@@ -177,8 +275,61 @@ def extract(labels, snapshots, slack):
                 if i >= len(ex):
                     mo["why"] = "the snapshot quotes no text for this record"
                 out.append(mo)
+    if stalls:
+        out += stall_moments(stalls, snapshots)
     out.sort(key=lambda x: (x["source"], x.get("at") or "", x["id"]))
     return out
+
+
+# ── held out ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def ctl():
+    """The control repo: the one this bin/ is checked out under in ~/dev or ~/.cc/worktrees (cc-stall's ctl())."""
+    for root in (f"{HOME}/dev", f"{HOME}/.cc/worktrees"):
+        rel = os.path.relpath(BIN, root)
+        if not rel.startswith(".."):
+            return rel.split(os.sep)[0]
+    return "box"
+
+
+def heldout_files(d=None):
+    """(salt, from): the salt that picks one in HELD_EVERY stall moments, and the stamp from which every stall is held
+    out ('lifted' when the architect has lifted it). Refused when either is missing or not what it should be."""
+    d = d or os.environ.get("CC_REPLAY_HELDOUT_DIR") or f"{HOME}/.cc/state/{ctl()}/architect"
+    try:
+        with open(os.path.join(d, "replay-heldout.salt")) as fh:
+            salt = fh.read().strip()
+        with open(os.path.join(d, "replay-heldout.from")) as fh:
+            frm = fh.read().strip()
+    except OSError as e:
+        die(f"stall moments need the held-out files in {d}: {e.strerror}: {e.filename}")
+    if not re.fullmatch(r"[0-9a-f]{32}", salt):
+        die(f"{d}/replay-heldout.salt is not 32 hex characters")
+    if frm != "lifted" and secs(frm) is None:
+        die(f"{d}/replay-heldout.from holds neither an ISO stamp nor 'lifted'")
+    return salt, frm
+
+
+def is_held_out(mo, salt, frm):
+    """A stall moment is held out by its id's hash, or by being raised at or after the stamp (both minute-floored,
+    so a stall raised in the stamp's own minute is held out)."""
+    if mo.get("source") != "stall":
+        return False
+    if int(hashlib.sha256(f"{salt}\0{mo['id']}".encode()).hexdigest()[:8], 16) % HELD_EVERY == 0:
+        return True
+    return frm != "lifted" and (mo.get("raised_at") or mo.get("at") or "")[:16] >= frm[:16]
+
+
+def split_held(moments, held, files=None):
+    """-> (the moments this run scores, how many held-out stall moments it left out or kept).
+    held=False: every moment but the held-out stalls. held=True: the held-out stalls and nothing else."""
+    if not held and not any(m.get("source") == "stall" for m in moments):
+        return moments, None
+    salt, frm = files or heldout_files()
+    # brief: "score leaves held-out moments out by default ... only an explicit --held-out flag scores them, and only them"
+    keep = [m for m in moments if (m.get("source") == "stall" and is_held_out(m, salt, frm)) == held]
+    n = sum(1 for m in moments if m.get("source") == "stall" and is_held_out(m, salt, frm))
+    return keep, n
 
 
 # ── versions ──────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -219,6 +370,11 @@ def load_version(path):
 def verdict(fn, moment, label):
     """-> 'pass' | a VERDICT | 'late'. A version that raises or answers another word stops the run: a count built on
     a judge that failed half the time is not a count."""
+    return judged(fn, moment, label)[0]
+
+
+def judged(fn, moment, label):
+    """-> (verdict, after_s or None), the verdict as verdict() gives it."""
     try:
         v = fn(dict(moment))
     except Exception as e:                      # noqa: BLE001 — the candidate's own fault, named with its moment
@@ -230,15 +386,23 @@ def verdict(fn, moment, label):
     if v != "pass" and v not in VERDICTS:
         die(f"{label} answered {v!r} on {moment['id']}: want pass or one of {', '.join(VERDICTS)}", 1)
     if v != "pass" and after is not None and moment.get("gap_s") is not None and float(after) > moment["gap_s"]:
-        return "late"
-    return v
+        return "late", float(after)
+    return v, (float(after) if after is not None else None)
+
+
+def saved(v, after, mo):
+    """Seconds of a stall's stand a verdict would have cut: from after_s (the stall's start when none) to its end."""
+    if v not in VERDICTS or mo.get("stood_s") is None:
+        return 0
+    return max(0, int(mo["stood_s"] - (after or 0)))
 
 
 # ── score ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-def score(moments, old, new, verbose=False):
+def score(moments, old, new, verbose=False, held=None, held_only=False):
+    """held: how many held-out stall moments split_held left out (or, held_only, kept); None when there were none."""
     (on, of), (nn, nf) = old, new
-    rows = {"nudge": collections.OrderedDict(), "failure": collections.OrderedDict()}
+    rows = {"nudge": collections.OrderedDict(), "failure": collections.OrderedDict(), "stall": collections.OrderedDict()}
     ctl = {"n": 0, "old": 0, "new": 0}
     why = collections.Counter()
     lines = []
@@ -260,7 +424,11 @@ def score(moments, old, new, verbose=False):
             why[f"{src}: {mo.get('why') or 'unknown'}"] += 1
             continue
         r["rep"] += 1
-        vo, vn = verdict(of, mo, on), verdict(nf, mo, nn)
+        (vo, ao), (vn, an) = judged(of, mo, on), judged(nf, mo, nn)
+        if src == "stall":
+            r["stood"] += mo.get("stood_s") or 0
+            r["s_old"] += saved(vo, ao, mo)
+            r["s_new"] += saved(vn, an, mo)
         po, pn = vo in VERDICTS, vn in VERDICTS
         r["old"] += po
         r["new"] += pn
@@ -272,23 +440,34 @@ def score(moments, old, new, verbose=False):
         if verbose and (po or pn or "late" in (vo, vn)):
             lines.append(f"  {mo['id']}  {mo.get('class')}  old={vo} new={vn}")
     out = [f"cc-replay-moments: old={on} new={nn}"]
-    for src, title in (("nudge", "NUDGES by class"), ("failure", "FAILURES by kind")):
+    for src, title in (("nudge", "NUDGES by class"), ("failure", "FAILURES by kind"), ("stall", "STALLS by kind")):
         if not rows[src]:
             continue
         tab = sorted(rows[src].items(), key=lambda kv: (-kv[1]["total"], kv[0]))
         w = max(12, max(len(k) for k, _ in tab))
+        mins = src == "stall"           # minutes, floored: waited (replayable stalls), cut by old, cut by new
+        hd = f"  {'waited':>6}  {'cut_old':>7}  {'cut_new':>7}" if mins else ""
         out += ["", title, f"{'class':<{w}}  {'total':>5}  {'replay':>6}  {'unrep':>5}  {'old':>4}  {'new':>4}  "
-                            f"{'gained':>6}  {'lost':>4}  {'late':>4}  new verdicts"]
+                            f"{'gained':>6}  {'lost':>4}  {'late':>4}{hd}  new verdicts"]
         tot = collections.Counter()
+
+        def mn(r):
+            return f"  {r['stood'] // 60:>6}  {r['s_old'] // 60:>7}  {r['s_new'] // 60:>7}" if mins else ""
         for k, r in tab:
             tot.update(r)
             vs = ", ".join(f"{v} {r[f'v:{v}']}" for v in VERDICTS if r[f"v:{v}"])
             out.append(f"{k:<{w}}  {r['total']:>5}  {r['rep']:>6}  {r['unrep']:>5}  {r['old']:>4}  {r['new']:>4}  "
-                       f"{r['gained']:>6}  {r['lost']:>4}  {r['late']:>4}  {vs}")
+                       f"{r['gained']:>6}  {r['lost']:>4}  {r['late']:>4}{mn(r)}  {vs}")
         out.append(f"{'total':<{w}}  {tot['total']:>5}  {tot['rep']:>6}  {tot['unrep']:>5}  {tot['old']:>4}  "
-                   f"{tot['new']:>4}  {tot['gained']:>6}  {tot['lost']:>4}  {tot['late']:>4}")
+                   f"{tot['new']:>4}  {tot['gained']:>6}  {tot['lost']:>4}  {tot['late']:>4}{mn(tot)}")
+        if mins:
+            out.append("minutes: waited is how long the replayable stalls stood; cut_old and cut_new are the minutes of "
+                       "it each version would have cut")
     out += ["", f"control: {ctl['n']} other owner messages in the labels' span; old fires before {ctl['old']}, "
                 f"new before {ctl['new']}"]
+    if held is not None:
+        out.append(f"held out: scored only the {held} held-out stall moments" if held_only else
+                   f"held out: {held} stall moments left out; only --held-out scores them")
     if why:
         out.append("unreplayable: " + "; ".join(f"{k} {v}" for k, v in sorted(why.items())))
     if verbose and lines:
@@ -314,14 +493,17 @@ def opts(argv, flags, valued):
 
 
 def moments_from(o):
+    """-> (moments, held count): the moments this run may see, the held-out stalls split off on every run."""
     if o.get("--moments"):
         ms = jsonl(o["--moments"])
         if not ms:
             die(f"no moments in {o['--moments']}")
-        return ms
-    if not o.get("--labels"):
-        die(f"need --moments or --labels\n{USAGE}")
-    return extract(o["--labels"], o.get("--snapshots") or SNAPSHOTS, o.get("--slack") or SLACK)
+    else:
+        if not o.get("--labels") and not o.get("--stalls"):
+            die(f"need --moments, --labels or --stalls\n{USAGE}")
+        ms = extract(o.get("--labels"), o.get("--snapshots") or SNAPSHOTS, o.get("--slack") or SLACK,
+                     o.get("--stalls") or STALLS)
+    return split_held(ms, bool(o.get("--held-out")))
 
 
 def main(argv):
@@ -332,10 +514,10 @@ def main(argv):
     if cmd == "selfcheck":
         return selfcheck()
     if cmd == "extract":
-        o = opts(rest, (), ("--labels", "--snapshots", "--slack", "--out"))
-        if not o.get("--labels") or not o.get("--out"):
+        o = opts(rest, ("--held-out",), ("--labels", "--snapshots", "--slack", "--stalls", "--out"))
+        if not (o.get("--labels") or o.get("--stalls")) or not o.get("--out"):
             die(USAGE)
-        ms = moments_from(o)
+        ms, held = moments_from(o)
         tmp = o["--out"] + ".tmp"
         with open(tmp, "w") as fh:
             for m in ms:
@@ -344,13 +526,18 @@ def main(argv):
         c = collections.Counter((m["source"], bool(m.get("replayable"))) for m in ms)
         print(f"cc-replay-moments: wrote {len(ms)} moments to {o['--out']}: "
               + ", ".join(f"{s} {c[(s, True)]} replayable / {c[(s, True)] + c[(s, False)]}"
-                          for s in ("nudge", "failure", "control")))
+                          for s in ("nudge", "failure", "control", "stall"))
+              + ("" if held is None else f"; {held} held-out stall moments "
+                 + ("only" if o.get("--held-out") else "left out")))
         return 0
     if cmd == "score":
-        o = opts(rest, ("--verbose",), ("--new", "--old", "--moments", "--labels", "--snapshots", "--slack"))
+        o = opts(rest, ("--verbose", "--held-out"), ("--new", "--old", "--moments", "--labels", "--snapshots", "--slack",
+                                                     "--stalls"))
         if not o.get("--new"):
             die(USAGE)
-        print(score(moments_from(o), load_version(o.get("--old")), load_version(o["--new"]), o.get("--verbose", False)))
+        ms, held = moments_from(o)
+        print(score(ms, load_version(o.get("--old")), load_version(o["--new"]), o.get("--verbose", False), held,
+                    bool(o.get("--held-out"))))
         return 0
     die(USAGE)
 
@@ -368,6 +555,10 @@ def selfcheck():
             print(f"FAIL {name}")
 
     root = tempfile.mkdtemp(prefix="cc-replay-moments-selfcheck-")
+    # the box's own stall log and held-out files never reach a case: the nudge cases run with no stall log at all, and
+    # an empty held-out dir proves a run with no stall moments needs no salt
+    os.environ["CC_REPLAY_STALLS"] = os.path.join(root, "no-stall.log")
+    os.environ["CC_REPLAY_HELDOUT_DIR"] = os.path.join(root, "no-heldout")
     try:
         snaps, slack = os.path.join(root, "snaps"), os.path.join(root, "slack")
         day = os.path.join(snaps, "2026-01-05")
@@ -452,8 +643,9 @@ def selfcheck():
         os.chmod(exe, 0o755)
         rep = score(ms, load_version(old), load_version(cand))
 
-        def row(title, cls):
-            sect = rep.split(title, 1)[1] if title in rep else ""
+        def row(title, cls, report=None):
+            report = report or rep
+            sect = report.split(title, 1)[1] if title in report else ""
             for ln in sect.splitlines():
                 if ln.startswith(cls + " "):
                     return ln.split()
@@ -507,6 +699,124 @@ def selfcheck():
         p = subprocess.run([sys.executable, me, "extract", "--labels", os.path.join(root, "none.jsonl"), "--out", mf],
                            capture_output=True, text=True)
         ok("an empty or missing labels file is refused, not scored as zero", p.returncode == 2 and "no labelled" in p.stderr)
+
+        # STALLS, on their own fixture: a stall log and two snapshot days whose board rows say how each stall ended
+        sroot = os.path.join(root, "stall")
+        sd1, sd2 = os.path.join(sroot, "snaps", "2026-01-05"), os.path.join(sroot, "snaps", "2026-01-06")
+        os.makedirs(sd1)
+        os.makedirs(sd2)
+        slog = os.path.join(sroot, "stall.log")
+        w(slog, ["2026-01-05T10:04:00Z\tw1\tdialog\traised r/raised-stall-w1-dialog-01051004\ta dialog has stood 4 min",
+                 "2026-01-05T12:03:00Z\tw2\tdialog\traised r/raised-stall-w2-dialog-01051203\ta dialog has stood 3 min",
+                 "2026-01-05T13:04:00Z\tw3\tdialog\traised r/raised-stall-w3-dialog-01051304\ta dialog has stood 4 min",
+                 "2026-01-05T14:00:00Z\tw4\tdialog\tboard refused r/raised-stall-w4-dialog-01051400 (try 1)",
+                 "2026-01-05T14:02:00Z\tw4\tdialog\traised r/raised-stall-w4-dialog-01051402\ta dialog has stood 6 min",
+                 "2026-01-05T15:00:00Z\tw5\tdialog\tboard refused r/raised-stall-w5-dialog-01051500 (try 1)",
+                 "2026-01-05T15:02:00Z\tw5\tdialog\tboard refused r/raised-stall-w5-dialog-01051500 (try 2)",
+                 "2026-01-05T16:00:00Z\tw6\tdev-channels\tpressed '1'",
+                 "not a line"])
+        w(os.path.join(sd1, "board.jsonl"), [
+            {"repo": "r", "track": "raised-stall-w1-dialog-01051004", "statuses": [],
+             "notes": ["01-05T10:04 added: w1 is stuck: a dialog has stood 4 min"]},
+            {"repo": "r", "track": "raised-stall-w2-dialog-01051203", "statuses": ["01-05T12:30 running", "01-05T12:40 done"],
+             "notes": ["01-05T12:35 Dropped: a duplicate"]},
+            {"repo": "r", "track": "raised-stall-w4-dialog-01051402", "statuses": ["01-05T14:56 merged"], "notes": []}])
+        w(os.path.join(sd2, "board.jsonl"), [
+            {"repo": "r", "track": "raised-stall-w1-dialog-01051004", "statuses": [],
+             "notes": ["01-06T10:00 Closed in triage: stale"]}])
+        sm = extract(None, os.path.join(sroot, "snaps"), slack, slog)
+        sb = {m["id"]: m for m in sm}
+        s1, s2 = sb.get("s:r/raised-stall-w1-dialog-01051004", {}), sb.get("s:r/raised-stall-w2-dialog-01051203", {})
+        s4 = sb.get("s:r/raised-stall-w4-dialog-01051402", {})
+        ok("a stall begins 'stood N min' before its log line and ends at a close note on a later snapshot day",
+           s1.get("at") == "2026-01-05T10:00:00Z" and s1.get("stood_s") == 86400 and s1.get("gap_s") == 86400
+           and s1.get("ended_by") == "closed note" and s1.get("replayable") is True)
+        ok("a stall ends at the earliest sign on its row: a Dropped note before done, never a running status",
+           s2.get("stood_s") == 2100 and s2.get("ended_by") == "dropped note")
+        ok("a refused row raised again on a later pass is one stall, the raised one",
+           s4.get("stood_s") == 3600 and s4.get("ended_by") == "merged"
+           and "s:r/raised-stall-w4-dialog-01051400" not in sb)
+        un = {m["id"]: m.get("why") for m in sm if not m["replayable"]}
+        ok("a stall with no recorded end, a row the board never took and a sweep's press are kept, unreplayable",
+           un == {"s:r/raised-stall-w3-dialog-01051304": "no board snapshot records how its row ended",
+                  "s:r/raised-stall-w5-dialog-01051500": "the board refused its row and it was never raised",
+                  "s:w6:dev-channels:2026-01-05T16:00:00Z": "the sweep pressed it; the log does not say how long it stood"})
+        ok("a stall log with no labels makes only stall moments", len(sm) == 6 and {m["source"] for m in sm} == {"stall"})
+
+        snew, sold = os.path.join(sroot, "new.py"), os.path.join(sroot, "old.py")
+        with open(snew, "w") as fh:     # clears a dialog 30 min in, 50 min in for w2 (whose stall stood 35): late there
+            fh.write("def judge(m):\n"
+                     "    if m['source'] != 'stall' or m['class'] != 'dialog':\n        return 'pass'\n"
+                     "    return ('flagged', 3000 if m['window'] == 'w2' else 1800)\n")
+        with open(sold, "w") as fh:     # fires on w4 only, with no after_s: it saves the whole stand
+            fh.write("def judge(m):\n    return 'flagged' if m.get('window') == 'w4' else 'pass'\n")
+        srep = score(sm, load_version(sold), load_version(snew))
+        d = row("STALLS", "dialog", srep)
+        # dialog: 5 stalls, 3 replay (86400 + 2100 + 3600 s = 1535 min); old cuts w4's 60; new cuts 1410 + 30, w2 late
+        ok("stalls are scored per kind with the minutes they stood and the minutes each version cuts",
+           d[1:12] == ["5", "3", "2", "1", "2", "1", "0", "1", "1535", "60", "1440"])
+        dc = row("STALLS", "dev-channels", srep)
+        ok("a kind with only unreplayable stalls stays in the table at zero minutes",
+           dc[1:4] == ["1", "0", "1"] and dc[9:12] == ["0", "0", "0"])
+        ok("the stall unreplayable reasons are listed", "stall: no board snapshot records how its row ended 1" in srep)
+        ok("stall scoring prints the same bytes twice", score(sm, load_version(sold), load_version(snew)) == srep)
+
+        # HELD OUT: one in four by the salted hash, and everything raised from the stamp on
+        salt = "0123456789abcdef0123456789abcdef"
+        many = [{"id": f"s:r/raised-stall-x-{i}", "source": "stall", "raised_at": "2026-01-05T10:00:00Z"} for i in range(200)]
+        mix = many + [{"id": "n:CA:1", "source": "nudge"}, {"id": "f:x:0", "source": "failure"}]
+        kept, nh = split_held(mix, False, (salt, "lifted"))
+        only, nh2 = split_held(mix, True, (salt, "lifted"))
+        ok("about one stall moment in four is held out, and default and --held-out split them exactly",
+           30 <= nh <= 70 and nh == nh2 == len(only) and len(kept) + len(only) == len(mix)
+           and not {m["id"] for m in kept} & {m["id"] for m in only})
+        ok("the default keeps the nudges and failures; --held-out scores the held-out stalls and nothing else",
+           {"n:CA:1", "f:x:0"} <= {m["id"] for m in kept} and {m["source"] for m in only} == {"stall"})
+        ok("the split is stable for one salt and moves with another",
+           split_held(mix, True, (salt, "lifted"))[0] == only
+           and split_held(mix, True, ("f" * 32, "lifted"))[0] != only)
+        free = next(m for m in many if not is_held_out(m, salt, "lifted"))
+        edge = dict(free, raised_at="2026-01-05T10:04:59Z")
+        ok("a stall raised in the stamp's own minute or after is held out; one the minute before is not",
+           is_held_out(edge, salt, "2026-01-05T10:04Z") and is_held_out(edge, salt, "2026-01-05T09:00Z")
+           and not is_held_out(edge, salt, "2026-01-05T10:05Z") and not is_held_out(edge, salt, "lifted"))
+        ok("nudges, failures and controls are never held out",
+           not any(is_held_out(m, salt, "2000-01-01T00:00Z") for m in mix if m["source"] != "stall"))
+
+        hd = os.path.join(sroot, "heldout")
+        os.makedirs(hd)
+        w(os.path.join(hd, "replay-heldout.salt"), [salt])
+        w(os.path.join(hd, "replay-heldout.from"), ["2026-01-05T15:30Z"])
+        env = dict(os.environ, CC_REPLAY_HELDOUT_DIR=hd)
+        want = sum(is_held_out(m, salt, "2026-01-05T15:30Z") for m in sm)
+        base = [sys.executable, me, "score", "--new", snew, "--stalls", slog, "--snapshots", os.path.join(sroot, "snaps")]
+        p = subprocess.run(base, capture_output=True, text=True)
+        ok("stall moments with no held-out files are refused, not scored in full",
+           p.returncode == 2 and "held-out files" in p.stderr)
+        os.makedirs(os.path.join(sroot, "bad"))
+        w(os.path.join(sroot, "bad", "replay-heldout.salt"), ["short"])
+        w(os.path.join(sroot, "bad", "replay-heldout.from"), ["lifted"])
+        p = subprocess.run(base, capture_output=True, text=True, env=dict(os.environ, CC_REPLAY_HELDOUT_DIR=os.path.join(sroot, "bad")))
+        ok("a salt that is not 32 hex characters is refused", p.returncode == 2 and "32 hex" in p.stderr)
+        p = subprocess.run(base, capture_output=True, text=True, env=env)
+        ok("score leaves the held-out stalls out and says how many (the 16:00 press is past the stamp)",
+           p.returncode == 0 and f"held out: {want} stall moments left out" in p.stdout and want >= 1
+           and is_held_out(sb["s:w6:dev-channels:2026-01-05T16:00:00Z"], salt, "2026-01-05T15:30Z"))
+        p = subprocess.run(base + ["--held-out", "--labels", labels, "--slack", slack], capture_output=True, text=True, env=env)
+        ok("score --held-out scores only the held-out stalls: no nudges, no control",
+           p.returncode == 0 and f"scored only the {want} held-out" in p.stdout and "NUDGES" not in p.stdout
+           and "control: 0 " in p.stdout)
+        allm = os.path.join(sroot, "all.jsonl")
+        w(allm, [json.dumps(dict(m, held_out=False), sort_keys=True) for m in sm])
+        p = subprocess.run([sys.executable, me, "score", "--new", snew, "--moments", allm], capture_output=True, text=True,
+                           env=env)
+        ok("a moments file cannot unhold a moment: the split is made again from the ids",
+           p.returncode == 0 and f"held out: {want} stall moments left out" in p.stdout)
+        p = subprocess.run([sys.executable, me, "extract", "--stalls", slog, "--snapshots", os.path.join(sroot, "snaps"),
+                            "--out", os.path.join(sroot, "x.jsonl")], capture_output=True, text=True, env=env)
+        ok("extract writes no held-out stall and says how many it left out",
+           p.returncode == 0 and f"{want} held-out stall moments left out" in p.stdout
+           and len(jsonl(os.path.join(sroot, "x.jsonl"))) == len(sm) - want)
 
         # the example candidates shipped beside the tests, when this file sits in its tree
         ex = os.path.join(os.path.dirname(os.path.dirname(me)), "tests", "replay-moments")
