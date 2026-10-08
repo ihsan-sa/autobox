@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""cc-autoresearch — point a measured keep-or-discard loop at something you want to improve.
+
+  cc-autoresearch run   --target PATH [--target PATH ...] --metric "CMD" --direction min|max --goal "TEXT"
+                        (--max-trials N | --max-usd X) [--trial-timeout S] [--metric-timeout S] [--repeat N]
+                        [--min-delta D] [--ruler PATH ...] [--model M] [--trial-usd X] [--max-minutes M]
+                        [--out DIR] [--notify WINDOW] [--dir WORKTREE]
+      Run trials in the worktree (default: the current directory) until a cap is reached, then print the best score
+      against the baseline. exit 0 when the run finished (kept or not), 2 when it refused to start or stopped early.
+  cc-autoresearch start ...the same arguments
+      The same run, detached: it returns once the run has started and prints the results directory. The run outlives
+      the caller's tool call, so no setsid, nohup or & is needed (or wanted) from the caller.
+  cc-autoresearch report DIR
+      The results of a run so far: the baseline, every trial, the best score and whether the run has ended.
+  cc-autoresearch selfcheck
+
+THE LOOP (after Karpathy's autoresearch). The metric is run on the worktree as it stands: that is the baseline, and a
+baseline that fails stops the run before any trial. Each trial hands one agent the goal, the target paths, the best
+score so far and every earlier trial's one-line summary, and asks for ONE change. Then the metric runs (median of
+--repeat runs) and the change is KEPT if the score beat the best by more than --min-delta in --direction, and put back
+as it was otherwise. Every trial, kept or not, is one line in DIR/results.tsv:
+  trial  at  status  score  best  usd  seconds  summary
+status is one of: baseline, keep, discard, no-change, out-of-bounds, agent-failed, metric-failed, metric-timeout,
+ruler-moved, and the recheck's two below.
+
+A TRIAL MAY ONLY CHANGE THE TARGET. After the agent returns, anything it changed in the worktree outside the target
+paths is put back (out-of-bounds) and the trial is not scored. The target is snapshotted after every keep and restored
+from that snapshot on every discard, so a kept change survives the trials that follow and a discarded one leaves
+nothing. Paths outside the target that were already dirty when the run started are not this tool's to restore, so
+the run refuses to start while any are.
+
+THE RULER STAYS OUT OF REACH OF THE CHANGE IT SCORES (docs/improve-loop.md). The metric command is fixed by the
+caller and never shown to the agent as something to edit. Its files are named with --ruler (the metric command's own
+first word is added when it is a file) and must lie outside every target. They are hashed before the first trial and
+after each one: a ruler that changed stops the run (exit 2), because every score after that point means nothing. The
+agent runs with Read, Edit, Write, Glob and Grep only (no shell, no web, no MCP), edits accepted inside its working
+directory alone, and with no settings sources, so it cannot run the metric, the box's tools or anything else.
+
+IT NEVER TOUCHES THE DEFAULT BRANCH. A worktree on the default branch (origin/HEAD, else main or master) or on a
+detached HEAD is refused. The tool commits nothing: the kept result is left as uncommitted changes in the worktree,
+where the track's own hook commits it and it lands as an ordinary PR through the lane.
+
+A KEEP IS MEASURED AGAIN AT THE END. When anything was kept, the baseline and the best are each measured once more,
+back to back, as two lines with trial `end` (recheck-baseline, recheck-best), and the summary says whether the
+second look confirms the win. A metric that moves more between runs than --min-delta keeps luck; this says so.
+
+IT STOPS ON ITS OWN at --max-trials, --max-usd (the agents' summed cost as claude reports it) or --max-minutes,
+whichever comes first, and at no other point except the ruler check above and a pause: `cc-pause is <project>` is
+asked before every trial (the project is the main checkout's directory name), and a paused project gets no more. At the end it writes DIR/summary.txt and,
+with --notify WINDOW, wakes that window ONCE with the same line through cc-msg. A headless caller reads summary.txt,
+or watches for it: it is written last and only once.
+
+DIR defaults to ~/.cc/state/autoresearch/<worktree name>-<UTC stamp>/. The agent is `claude -p` on --model (default
+sonnet) with --trial-usd (default 1.00) as its own budget and --trial-timeout (default 900 s) as its wall clock.
+The metric gets --metric-timeout (default 300 s) per run and prints its number on the last non-empty line of stdout.
+CC_AUTORESEARCH_AGENT replaces the agent with an executable (the prompt on stdin, cwd the worktree; it prints the JSON
+claude would, or plain text) and CC_AUTORESEARCH_MSG replaces cc-msg: both exist for the selfcheck. Stdlib only, and
+no box's names are in this file.
+"""
+import argparse, datetime, hashlib, json, os, shlex, shutil, statistics, subprocess, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+HERE = os.path.dirname(os.path.realpath(__file__))
+CLAUDE = os.environ.get("CC_CLAUDE") or f"{HOME}/.local/bin/claude"
+TOOLS = "Read,Edit,Write,Glob,Grep"
+DENY_TOOLS = ("Bash,BashOutput,KillShell,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,Workflow,Skill,ToolSearch,"
+              "CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,PushNotification,DesignSync,"
+              "ListAgents,EnterWorktree,ExitWorktree")
+COLUMNS = ("trial", "at", "status", "score", "best", "usd", "seconds", "summary")
+
+PROMPT = """You are one trial in an automatic improvement loop. Make ONE focused change that you expect to improve the score.
+
+GOAL: {goal}
+
+THE SCORE: a fixed metric the loop runs after you finish; {better} is better. Best so far: {best} (baseline {base}).
+You cannot run it and must not try to: you have no shell. You only change files.
+
+YOU MAY CHANGE ONLY these paths (relative to your working directory): {targets}
+A change anywhere else is undone and the trial is thrown away.
+
+EARLIER TRIALS (oldest first; a discarded idea did not help, so do not repeat it — build on the kept ones):
+{history}
+
+Read what you need, make the one change, keep the code working, and end your reply with exactly one line:
+CHANGE: <what you changed, in under 15 words>"""
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def git(wt, *args, check=True):
+    p = subprocess.run(["git", "-C", wt, *args], capture_output=True, text=True)
+    if check and p.returncode:
+        raise RuntimeError(f"git {' '.join(args)}: {p.stderr.strip()}")
+    return p.stdout
+
+
+def default_branch(wt):
+    ref = git(wt, "symbolic-ref", "-q", "refs/remotes/origin/HEAD", check=False).strip()
+    if ref:
+        return ref.rsplit("/", 1)[-1]
+    for b in ("main", "master"):
+        if git(wt, "rev-parse", "-q", "--verify", f"refs/heads/{b}", check=False).strip():
+            return b
+    return "main"
+
+
+def dirty(wt):
+    """Paths git sees as changed or untracked (ignored files are not listed), relative to the worktree root."""
+    out = set()
+    for ln in git(wt, "status", "--porcelain", "--untracked-files=all", "-z").split("\0"):
+        if len(ln) > 3:
+            out.add(ln[3:])
+    # -z puts a rename's source as its own entry after the destination; both are in the set, which is what we want
+    return out
+
+
+def inside(path, roots):
+    return any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def snapshot(wt, targets, into):
+    shutil.rmtree(into, ignore_errors=True)
+    os.makedirs(into)
+    for t in targets:
+        src, dst = os.path.join(wt, t), os.path.join(into, t)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, symlinks=True)
+        elif os.path.lexists(src):
+            shutil.copy2(src, dst, follow_symlinks=False)
+
+
+def restore(wt, targets, frm):
+    for t in targets:
+        cur, kept = os.path.join(wt, t), os.path.join(frm, t)
+        if os.path.isdir(cur) and not os.path.islink(cur):
+            shutil.rmtree(cur)
+        elif os.path.lexists(cur):
+            os.remove(cur)
+        if os.path.isdir(kept) and not os.path.islink(kept):
+            shutil.copytree(kept, cur, symlinks=True)
+        elif os.path.lexists(kept):
+            os.makedirs(os.path.dirname(cur), exist_ok=True)
+            shutil.copy2(kept, cur, follow_symlinks=False)
+
+
+def put_back(wt, paths):
+    """Return paths outside the target to HEAD: tracked ones checked out, untracked ones removed. Each was clean when
+    the run started (the run refuses otherwise), so HEAD is what they were."""
+    for p in paths:
+        if subprocess.run(["git", "-C", wt, "cat-file", "-e", f"HEAD:{p}"], capture_output=True).returncode == 0:
+            git(wt, "checkout", "HEAD", "--", p)
+        else:
+            full = os.path.join(wt, p)
+            if os.path.isdir(full) and not os.path.islink(full):
+                shutil.rmtree(full)
+            elif os.path.lexists(full):
+                os.remove(full)
+
+
+def tree_hash(base, rels):
+    """One hash over the files under each relative path in base: paths and bytes, so a rename or a new file counts."""
+    h = hashlib.sha256()
+    for r in sorted(rels):
+        top = os.path.join(base, r)
+        files = sorted(os.path.join(d, f) for d, _, fs in os.walk(top) for f in fs) if os.path.isdir(top) else [top]
+        for f in files:
+            h.update(os.path.relpath(f, base).encode() + b"\0")
+            try:
+                with open(f, "rb") as fh:
+                    h.update(hashlib.sha256(fh.read()).digest())
+            except OSError:
+                h.update(b"<missing>")
+    return h.hexdigest()
+
+
+def ruler_hash(paths):
+    return tree_hash("/", [p.lstrip("/") for p in paths])
+
+
+def measure(wt, cmd, timeout, repeat):
+    """(score, error). The number is the last non-empty stdout line; repeat>1 takes the median."""
+    scores = []
+    for _ in range(repeat):
+        try:
+            p = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=timeout,
+                               stdin=subprocess.DEVNULL, start_new_session=True)
+        except subprocess.TimeoutExpired:
+            return None, "metric-timeout"
+        lines = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+        if p.returncode:
+            return None, "metric-failed"
+        try:
+            scores.append(float(lines[-1].split()[0]))
+        except (IndexError, ValueError):
+            return None, "metric-failed"
+    return statistics.median(scores), None
+
+
+def agent(wt, text, a):
+    """(summary or None, usd, error). The summary is the CHANGE: line, else the reply's last line."""
+    fake = os.environ.get("CC_AUTORESEARCH_AGENT")
+    cmd = [fake] if fake else [CLAUDE, "-p", "--model", a.model, "--allowedTools", TOOLS, "--disallowedTools", DENY_TOOLS,
+                               "--permission-mode", "acceptEdits", "--strict-mcp-config", "--setting-sources", "",
+                               "--disable-slash-commands", "--no-session-persistence", "--output-format", "json",
+                               "--max-budget-usd", f"{a.trial_usd:.2f}"]
+    try:
+        p = subprocess.run(cmd, input=text, cwd=wt, capture_output=True, text=True, timeout=a.trial_timeout,
+                           start_new_session=True)
+    except subprocess.TimeoutExpired:
+        return None, 0.0, "timed out"
+    except OSError as e:
+        return None, 0.0, e.__class__.__name__
+    try:
+        d = json.loads(p.stdout)
+        reply, usd, err = d.get("result") or "", float(d.get("total_cost_usd") or 0), d.get("is_error")
+    except (ValueError, AttributeError):
+        reply, usd, err = p.stdout, 0.0, False
+    if p.returncode or err:
+        return None, usd, f"rc={p.returncode}"
+    lines = [ln.strip() for ln in reply.splitlines() if ln.strip()]
+    said = [ln[len("CHANGE:"):].strip() for ln in lines if ln.startswith("CHANGE:")]
+    return (said[-1] if said else (lines[-1] if lines else "(no summary)"))[:200], usd, None
+
+
+def better(score, best, a):
+    return score < best - a.min_delta if a.direction == "min" else score > best + a.min_delta
+
+
+def fmt(x):
+    return "" if x is None else f"{x:.6g}"
+
+
+def run(a):
+    wt = os.path.realpath(a.dir)
+    try:
+        top = git(wt, "rev-parse", "--show-toplevel").strip()
+    except RuntimeError as e:
+        print(f"cc-autoresearch: not a git worktree: {e}", file=sys.stderr)
+        return 2
+    wt = top
+    branch = git(wt, "symbolic-ref", "-q", "--short", "HEAD", check=False).strip()
+    if not branch or branch == default_branch(wt):
+        print(f"cc-autoresearch: refused: {wt} is on {branch or 'a detached HEAD'}; run it on a branch of its own "
+              "(a track or planning worktree) — this never touches the default branch", file=sys.stderr)
+        return 2
+    targets = []
+    for t in a.target:
+        full = os.path.realpath(os.path.join(wt, t))
+        if not full.startswith(wt + "/"):
+            print(f"cc-autoresearch: refused: target {t} is not a path inside the worktree", file=sys.stderr)
+            return 2
+        if not os.path.lexists(full):
+            print(f"cc-autoresearch: refused: target {t} does not exist", file=sys.stderr)
+            return 2
+        targets.append(os.path.relpath(full, wt))
+    rulers = [os.path.realpath(os.path.join(wt, r)) for r in a.ruler]
+    try:
+        first = shlex.split(a.metric)[0]
+        if os.path.isfile(os.path.join(wt, first)):
+            rulers.append(os.path.realpath(os.path.join(wt, first)))
+    except (ValueError, IndexError):
+        pass
+    for r in rulers:
+        if inside(os.path.relpath(r, wt), targets) and r.startswith(wt + "/"):
+            print(f"cc-autoresearch: refused: the ruler {r} lies inside a target — the change it scores could move it",
+                  file=sys.stderr)
+            return 2
+    start_dirty = dirty(wt)
+    outside = sorted(p for p in start_dirty if not inside(p, targets))
+    if outside:
+        print(f"cc-autoresearch: refused: uncommitted changes outside the target ({', '.join(outside[:5])}); commit or "
+              "move them first, because a trial that strays there is put back to HEAD", file=sys.stderr)
+        return 2
+    out = os.path.realpath(a.out or os.path.join(HOME, ".cc", "state", "autoresearch",
+                                                 f"{os.path.basename(wt)}-{datetime.datetime.now(datetime.timezone.utc):%Y%m%dT%H%M%SZ}"))
+    if out == wt or out.startswith(wt + "/"):
+        print("cc-autoresearch: refused: --out lies inside the worktree, where every trial's clean-up would remove it",
+              file=sys.stderr)
+        return 2
+    os.makedirs(out, exist_ok=True)
+    results, kept = os.path.join(out, "results.tsv"), os.path.join(out, "kept")
+    with open(os.path.join(out, "run.json"), "w") as fh:
+        json.dump({"worktree": wt, "branch": branch, "targets": targets, "metric": a.metric, "direction": a.direction,
+                   "goal": a.goal, "rulers": rulers, "max_trials": a.max_trials, "max_usd": a.max_usd,
+                   "max_minutes": a.max_minutes, "started": now(), "pid": os.getpid()}, fh, indent=1)
+    with open(results, "w") as fh:
+        fh.write("\t".join(COLUMNS) + "\n")
+
+    def line(**kw):
+        row = {"at": now(), **kw}
+        with open(results, "a") as fh:
+            fh.write("\t".join(str(row.get(c, "")).replace("\t", " ").replace("\n", " ") for c in COLUMNS) + "\n")
+
+    def finish(text, rc):
+        with open(os.path.join(out, "summary.txt"), "w") as fh:
+            fh.write(text + "\n")
+        print(text)
+        if a.notify:
+            msg = os.environ.get("CC_AUTORESEARCH_MSG") or os.path.join(HERE, "cc-msg")
+            subprocess.run([msg, a.notify, text], capture_output=True, text=True)
+        return rc
+
+    t0 = time.time()
+    base, err = measure(wt, a.metric, a.metric_timeout, a.repeat)
+    if err:
+        line(trial=0, status=err, summary="baseline")
+        return finish(f"autoresearch {os.path.basename(wt)}: stopped before any trial — the baseline metric "
+                      f"failed ({err}). Results: {results}", 2)
+    line(trial=0, status="baseline", score=fmt(base), best=fmt(base), seconds=int(time.time() - t0), summary="as found")
+    snapshot(wt, targets, kept)
+    snapshot(wt, targets, os.path.join(out, "baseline"))
+    ruler0 = ruler_hash(rulers)
+    best, spent, history, n, kept_n, why = base, 0.0, [], 0, 0, "the trial cap"
+    project = os.path.basename(os.path.dirname(os.path.realpath(git(wt, "rev-parse", "--path-format=absolute",
+                                                                    "--git-common-dir").strip())))
+    pause = os.environ.get("CC_AUTORESEARCH_PAUSE") or os.path.join(HERE, "cc-pause")
+    while True:
+        # a paused project spends no tokens: asked before every trial, because each one starts an agent
+        if subprocess.run([pause, "is", project], capture_output=True).returncode == 0:
+            why = f"a pause on {project} (cc-pause)"
+            break
+        if a.max_trials is not None and n >= a.max_trials:
+            why = f"the trial cap ({a.max_trials})"
+            break
+        if a.max_usd is not None and spent >= a.max_usd:
+            why = f"the spend cap (${a.max_usd:.2f})"
+            break
+        if a.max_minutes is not None and time.time() - t0 >= a.max_minutes * 60:
+            why = f"the time cap ({a.max_minutes:g} min)"
+            break
+        n += 1
+        t1 = time.time()
+        text = PROMPT.format(goal=a.goal, better="lower" if a.direction == "min" else "higher", best=fmt(best),
+                             base=fmt(base), targets=", ".join(targets),
+                             history="\n".join(history[-40:]) or "(none yet — this is the first)")
+        summary, usd, aerr = agent(wt, text, a)
+        spent += usd
+        changed = dirty(wt)
+        stray = sorted(p for p in changed if not inside(p, targets))
+        if ruler_hash(rulers) != ruler0:
+            put_back(wt, stray)
+            restore(wt, targets, kept)
+            line(trial=n, status="ruler-moved", best=fmt(best), usd=f"{usd:.2f}", seconds=int(time.time() - t1),
+                 summary=summary or aerr or "")
+            return finish(f"autoresearch {os.path.basename(wt)}: STOPPED at trial {n} — a ruler file changed under "
+                          f"the run, so no score after that can be trusted. Best before it: {fmt(best)} against "
+                          f"baseline {fmt(base)}. Results: {results}", 2)
+        status, score = None, None
+        if aerr:
+            status = "agent-failed"
+            summary = aerr
+        elif stray:
+            status = "out-of-bounds"
+            summary = f"{summary} [touched {', '.join(stray[:3])}]"
+        elif tree_hash(wt, targets) == tree_hash(kept, targets):
+            status = "no-change"
+        if status is None:
+            score, merr = measure(wt, a.metric, a.metric_timeout, a.repeat)
+            after = sorted(p for p in dirty(wt) if not inside(p, targets))
+            put_back(wt, after)                     # what the metric itself left outside the target
+            if merr:
+                status = merr
+            elif better(score, best, a):
+                status, best, kept_n = "keep", score, kept_n + 1
+                snapshot(wt, targets, kept)
+            else:
+                status = "discard"
+        if status != "keep":
+            put_back(wt, sorted(p for p in dirty(wt) if not inside(p, targets)))
+            restore(wt, targets, kept)
+        history.append(f"#{n} {status}{' ' + fmt(score) if score is not None else ''}: {summary}")
+        line(trial=n, status=status, score=fmt(score), best=fmt(best), usd=f"{usd:.2f}", seconds=int(time.time() - t1),
+             summary=summary)
+    delta = best - base
+    pct = f" ({delta / base * 100:+.1f}%)" if base else ""
+    verdict = (f"best {fmt(best)} against baseline {fmt(base)}{pct}, {kept_n} kept; the kept change is uncommitted in "
+               f"{wt}" if kept_n else f"nothing beat the baseline {fmt(base)}; the worktree is as it was")
+    if kept_n:
+        # THE RECHECK: a keep is one measurement that happened to beat the best, and a noisy metric keeps luck. Both
+        # ends are measured again, back to back, so the summary says whether the win survives a second look.
+        again = {}
+        for name, frm in (("baseline", os.path.join(out, "baseline")), ("best", kept)):
+            restore(wt, targets, frm)
+            t1 = time.time()
+            again[name], merr = measure(wt, a.metric, a.metric_timeout, a.repeat)
+            put_back(wt, sorted(p for p in dirty(wt) if not inside(p, targets)))
+            line(trial="end", status=merr or f"recheck-{name}", score=fmt(again[name]), best=fmt(best),
+                 seconds=int(time.time() - t1), summary=f"the {name} measured again")
+        rb, rk = again["baseline"], again["best"]
+        verdict += (f"; measured again, {fmt(rk)} against {fmt(rb)}" + ("" if rb is not None and rk is not None and
+                    better(rk, rb, a) else ", which does NOT confirm it: the metric moves more than --min-delta "
+                    "between runs, so read the trials before landing this"))
+    return finish(f"autoresearch {os.path.basename(wt)}: {n} trials, stopped at {why}, ${spent:.2f} spent — "
+                  f"{verdict}. Results: {results}", 0)
+
+
+def report(d):
+    results = os.path.join(d, "results.tsv")
+    if not os.path.isfile(results):
+        print(f"cc-autoresearch: no results.tsv in {d}", file=sys.stderr)
+        return 2
+    with open(results) as fh:
+        sys.stdout.write(fh.read())
+    s = os.path.join(d, "summary.txt")
+    print(open(s).read().strip() if os.path.isfile(s) else "(still running: no summary.txt yet)")
+    return 0
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="cc-autoresearch", add_help=True)
+    p.add_argument("--dir", default=".")
+    p.add_argument("--target", action="append", required=True)
+    p.add_argument("--metric", required=True)
+    p.add_argument("--direction", choices=("min", "max"), required=True)
+    p.add_argument("--goal", required=True)
+    p.add_argument("--max-trials", type=int)
+    p.add_argument("--max-usd", type=float)
+    p.add_argument("--max-minutes", type=float)
+    p.add_argument("--trial-timeout", type=float, default=900)
+    p.add_argument("--metric-timeout", type=float, default=300)
+    p.add_argument("--repeat", type=int, default=1)
+    p.add_argument("--min-delta", type=float, default=0.0)
+    p.add_argument("--ruler", action="append", default=[])
+    p.add_argument("--model", default="sonnet")
+    p.add_argument("--trial-usd", type=float, default=1.0)
+    p.add_argument("--out")
+    p.add_argument("--notify")
+    return p
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] == ["report"] and len(argv) == 2:
+        return report(argv[1])
+    if argv[:1] not in (["run"], ["start"]):
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    a = parser().parse_args(argv[1:])
+    if a.max_trials is None and a.max_usd is None:
+        print("cc-autoresearch: refused: give a cap, --max-trials N or --max-usd X", file=sys.stderr)
+        return 2
+    if a.repeat < 1:
+        print("cc-autoresearch: --repeat must be at least 1", file=sys.stderr)
+        return 2
+    if argv[0] == "start":
+        if not a.out:
+            a.out = os.path.join(HOME, ".cc", "state", "autoresearch", f"{os.path.basename(os.path.realpath(a.dir))}-"
+                                 f"{datetime.datetime.now(datetime.timezone.utc):%Y%m%dT%H%M%SZ}")
+        os.makedirs(a.out, exist_ok=True)
+        rest = [x for x in argv[1:]]
+        if "--out" not in rest:
+            rest += ["--out", a.out]
+        with open(os.path.join(a.out, "run.log"), "a") as log:
+            subprocess.Popen([os.path.realpath(__file__), "run", *rest], stdin=subprocess.DEVNULL, stdout=log,
+                             stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+        print(f"started; results in {a.out} (cc-autoresearch report {a.out})")
+        return 0
+    return run(a)
+
+
+# ---------------------------------------------------------------------------------------------------- selfcheck
+def selfcheck():
+    passed, failed = [0], []
+
+    def ok(name, cond):
+        if cond:
+            passed[0] += 1
+        else:
+            failed.append(name)
+            print(f"FAIL {name}")
+
+    import contextlib, io
+    root = tempfile.mkdtemp(prefix="cc-autoresearch-selfcheck-")
+    env0 = dict(os.environ)
+    try:
+        def repo(name, branch="work"):
+            """A fresh repo per case: main with one commit, then `branch` checked out; target dir t/ holds n.txt (=5),
+            the metric m.sh prints the number in t/n.txt."""
+            r = os.path.join(root, name)
+            os.makedirs(os.path.join(r, "t"))
+            with open(os.path.join(r, "t", "n.txt"), "w") as fh:
+                fh.write("5\n")
+            with open(os.path.join(r, "m.sh"), "w") as fh:
+                fh.write("#!/bin/sh\necho measuring\ncat t/n.txt\n")
+            os.chmod(os.path.join(r, "m.sh"), 0o755)
+            with open(os.path.join(r, "other.txt"), "w") as fh:
+                fh.write("keep me\n")
+            for c in (["init", "-q", "-b", "main"], ["add", "-A"],
+                      ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]):
+                subprocess.run(["git", "-C", r, *c], check=True, capture_output=True)
+            if branch != "main":
+                subprocess.run(["git", "-C", r, "checkout", "-qb", branch], check=True, capture_output=True)
+            return r
+
+        def fake_agent(name, script):
+            """An agent that runs `script` (sh) with $N = the trial number, counted in a file beside it."""
+            f = os.path.join(root, f"agent-{name}")
+            with open(f, "w") as fh:
+                fh.write("#!/bin/sh\ncat >/dev/null\nc=$(cat \"$0.n\" 2>/dev/null || echo 0); N=$((c+1)); "
+                         "echo $N > \"$0.n\"\n" + script + "\n")
+            os.chmod(f, 0o755)
+            return f
+
+        def go(r, agent_script, *extra, name=None):
+            name = name or os.path.basename(r)
+            out = os.path.join(root, f"out-{name}")
+            os.environ.clear()
+            os.environ.update(env0, CC_AUTORESEARCH_AGENT=fake_agent(name, agent_script), CC_AUTORESEARCH_PAUSE="/bin/false",
+                              CC_AUTORESEARCH_MSG=os.path.join(root, "msg"))
+            args = ["run", "--dir", r, "--target", "t", "--metric", "./m.sh", "--direction", "min", "--goal", "lower n",
+                    "--out", out, "--metric-timeout", "5", "--notify", "win", *extra]
+            if "--max-usd" not in extra and "--max-trials" not in extra:
+                args += ["--max-trials", "3"]
+            buf, ebuf = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(ebuf):
+                rc = main(args)
+            rows = []
+            if os.path.isfile(os.path.join(out, "results.tsv")):
+                rows = [ln.split("\t") for ln in open(os.path.join(out, "results.tsv")).read().splitlines()[1:]]
+            return rc, rows, buf.getvalue() + ebuf.getvalue(), out
+
+        with open(os.path.join(root, "msg"), "w") as fh:
+            fh.write(f"#!/bin/sh\necho \"$1|$2\" >> {root}/msg.log\n")
+        os.chmod(os.path.join(root, "msg"), 0o755)
+
+        def msgs():
+            p = os.path.join(root, "msg.log")
+            n = open(p).read().splitlines() if os.path.isfile(p) else []
+            os.remove(p) if os.path.isfile(p) else None
+            return n
+
+        def read(r, p):
+            return open(os.path.join(r, p)).read().strip()
+
+        # 1 KEEP and DISCARD: trial 1 lowers n to 3 (keep), trial 2 raises it to 9 (discard → back to 3), trial 3 to 2
+        r = repo("keep")
+        rc, rows, txt, out = go(r, 'case $N in 1) echo 3 > t/n.txt;; 2) echo 9 > t/n.txt;; 3) echo 2 > t/n.txt;; esac\n'
+                                   'printf "%s\\n" \'{"result":"did a thing\\nCHANGE: set n","total_cost_usd":0.1}\'')
+        st = [x[2] for x in rows[:4]]
+        ok("keep/discard: statuses baseline, keep, discard, keep", st == ["baseline", "keep", "discard", "keep"])
+        ok("keep/discard: the best column follows the kept scores", [x[4] for x in rows[:4]] == ["5", "3", "3", "2"])
+        ok("keep/discard: the discarded 9 is not in the tree, the last kept 2 is", read(r, "t/n.txt") == "2")
+        ok("keep/discard: the summary is the CHANGE: line", rows[1][7] == "set n")
+        ok("recheck: baseline and best measured again at the end, the best left in place",
+           [(x[0], x[2], x[3]) for x in rows[4:]] == [("end", "recheck-baseline", "5"), ("end", "recheck-best", "2")]
+           and "measured again, 2 against 5" in txt and "NOT confirm" not in txt)
+        ok("keep/discard: exit 0, summary names best and baseline", rc == 0 and "best 2 against baseline 5" in txt)
+        ok("keep/discard: the caller is woken once, with the summary", len(m := msgs()) == 1 and m[0].startswith("win|")
+           and "best 2" in m[0])
+        ok("keep/discard: summary.txt written", "best 2" in read(out, "summary.txt"))
+        ok("keep/discard: nothing committed — main and the branch still at one commit",
+           git(r, "rev-list", "--count", "HEAD").strip() == "1")
+
+        # 1b A LUCKY KEEP: the metric reads 5, 3 (kept), then 2 for the baseline and 4 for the best on the recheck
+        r = repo("lucky")
+        seq = os.path.join(root, "lucky-seq")
+        with open(seq, "w") as fh:
+            fh.write("5\n3\n2\n4\n")
+        with open(os.path.join(r, "m.sh"), "w") as fh:
+            fh.write(f"#!/bin/sh\nhead -1 {seq}; sed -i 1d {seq}\n")
+        subprocess.run(["git", "-C", r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "m"], check=True)
+        rc, rows, txt, _ = go(r, 'echo 1 > t/n.txt; echo "CHANGE: x"', "--max-trials", "1")
+        ok("recheck: a win the second look does not confirm is said to be unconfirmed",
+           [x[2] for x in rows] == ["baseline", "keep", "recheck-baseline", "recheck-best"]
+           and "measured again, 4 against 2, which does NOT confirm it" in txt and rc == 0)
+        msgs()
+
+        # 1c A PAUSED PROJECT: the baseline is measured (it spends nothing), then no trial starts an agent. Every
+        # other case runs with cc-pause answering "not paused", which is the kept half of this rule.
+        r = repo("paused")
+        os.environ.update(CC_AUTORESEARCH_AGENT=fake_agent("paused", 'echo 1 > t/n.txt; echo "CHANGE: x"'),
+                          CC_AUTORESEARCH_PAUSE="/bin/true")
+        with contextlib.redirect_stdout(io.StringIO()) as o:
+            rc = main(["run", "--dir", r, "--target", "t", "--metric", "./m.sh", "--direction", "min", "--goal", "g",
+                       "--max-trials", "2", "--out", os.path.join(root, "out-paused")])
+        rows = open(os.path.join(root, "out-paused", "results.tsv")).read().splitlines()[1:]
+        ok("pause: a paused project starts no agent and says why", rc == 0 and len(rows) == 1
+           and "a pause on paused" in o.getvalue() and not os.path.exists(os.path.join(root, "agent-paused.n")))
+
+        # 2 ONLY DISCARDS: nothing improves → tree as found, said so
+        r = repo("discard")
+        rc, rows, txt, _ = go(r, 'echo $((5+N)) > t/n.txt; echo "CHANGE: worse"')
+        ok("discard: every trial discarded", [x[2] for x in rows][1:] == ["discard"] * 3)
+        ok("discard: tree back to the baseline", read(r, "t/n.txt") == "5" and not dirty(r))
+        ok("discard: summary says nothing beat the baseline", "nothing beat the baseline 5" in txt and rc == 0)
+        msgs()
+
+        # 3 METRIC FAILS / TIMES OUT on a trial → not kept, run goes on; a bad baseline stops before any trial
+        r = repo("metricfail")
+        with open(os.path.join(r, "m.sh"), "w") as fh:
+            fh.write("#!/bin/sh\nv=$(cat t/n.txt)\n[ \"$v\" = boom ] && exit 1\n[ \"$v\" = word ] && { echo nan-ish; "
+                     "exit 0; }\n[ \"$v\" = slow ] && sleep 30\necho $v\n")
+        subprocess.run(["git", "-C", r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "m"], check=True)
+        rc, rows, txt, _ = go(r, 'case $N in 1) echo boom;; 2) echo word;; 3) echo slow;; esac > t/n.txt; echo ok',
+                              "--metric-timeout", "1")
+        ok("metric: non-zero exit is metric-failed", rows[1][2] == "metric-failed")
+        ok("metric: no number on the last line is metric-failed", rows[2][2] == "metric-failed")
+        ok("metric: a run past --metric-timeout is metric-timeout", rows[3][2] == "metric-timeout")
+        ok("metric: none of them kept, tree as found", read(r, "t/n.txt") == "5" and rc == 0)
+        msgs()
+        r = repo("badbase")
+        with open(os.path.join(r, "t", "n.txt"), "w") as fh:
+            fh.write("boom\n")
+        with open(os.path.join(r, "m.sh"), "w") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")
+        subprocess.run(["git", "-C", r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "m"], check=True)
+        rc, rows, txt, _ = go(r, 'echo 1 > t/n.txt; echo "CHANGE: x"')
+        ok("baseline: a failing baseline stops with exit 2 and no trial",
+           rc == 2 and [x[0] for x in rows] == ["0"] and "baseline metric failed" in txt)
+        ok("baseline: the agent never ran", not os.path.exists(os.path.join(root, "agent-badbase.n")))
+        ok("baseline: the caller is still woken once", len(msgs()) == 1)
+
+        # 4 CAPS: the trial cap stops at N; the spend cap stops when the agents' cost reaches it
+        r = repo("captrials")
+        rc, rows, txt, _ = go(r, 'echo "CHANGE: nothing"', "--max-trials", "2")
+        ok("cap: --max-trials 2 runs exactly two trials", len(rows) == 3 and "stopped at the trial cap (2)" in txt)
+        ok("cap: an agent that changed nothing is no-change", [x[2] for x in rows][1:] == ["no-change"] * 2)
+        msgs()
+        r = repo("capusd")
+        rc, rows, txt, _ = go(r, 'echo $((5+N)) > t/n.txt; echo \'{"result":"CHANGE: c","total_cost_usd":0.4}\'',
+                              "--max-usd", "1")
+        ok("cap: --max-usd 1 at $0.40 a trial stops after three", len(rows) == 4 and "the spend cap ($1.00)" in txt)
+        ok("cap: woken once at the cap", len(msgs()) == 1)
+
+        # 5 OUT OF BOUNDS: an edit outside the target is put back and not scored, even when the target improved
+        r = repo("bounds")
+        rc, rows, txt, _ = go(r, 'echo 1 > t/n.txt; echo hacked > other.txt; echo new > stray.txt; echo "CHANGE: x"',
+                              "--max-trials", "1")
+        ok("bounds: status out-of-bounds, not scored", rows[1][2] == "out-of-bounds" and rows[1][3] == "")
+        ok("bounds: other.txt back to HEAD, stray.txt gone, target restored",
+           read(r, "other.txt") == "keep me" and not os.path.exists(os.path.join(r, "stray.txt"))
+           and read(r, "t/n.txt") == "5")
+        msgs()
+
+        # 6 THE RULER: editing the metric stops the run; a ruler inside the target is refused up front
+        r = repo("ruler")
+        rlr = os.path.join(root, "ruler-input.txt")
+        with open(rlr, "w") as fh:
+            fh.write("held out\n")
+        rc, rows, txt, _ = go(r, f'echo 4 > t/n.txt; echo moved > {rlr}; echo "CHANGE: x"', "--ruler", rlr)
+        ok("ruler: a moved ruler stops the run, exit 2", rc == 2 and rows[-1][2] == "ruler-moved" and len(rows) == 2)
+        ok("ruler: the target is put back when it stops", read(r, "t/n.txt") == "5")
+        msgs()
+        r = repo("rulerin")
+        rc, rows, txt, _ = go(r, 'echo "CHANGE: x"', "--ruler", "t/n.txt")
+        ok("ruler: a ruler inside the target is refused before anything runs", rc == 2 and not rows
+           and "lies inside a target" in txt)
+        rc, _, txt, _ = go(r, 'echo "CHANGE: x"', "--out", os.path.join(r, "res"))
+        ok("out: a results directory inside the worktree is refused", rc == 2 and "--out lies inside" in txt
+           and not os.path.exists(os.path.join(r, "res")))
+
+        # 7 THE DEFAULT BRANCH and a detached HEAD are refused; dirt outside the target is refused
+        r = repo("onmain", branch="main")
+        rc, rows, txt, _ = go(r, 'echo 1 > t/n.txt')
+        ok("branch: the default branch is refused", rc == 2 and not rows and "never touches the default branch" in txt)
+        r = repo("detached")
+        subprocess.run(["git", "-C", r, "checkout", "-q", "--detach"], check=True)
+        rc, rows, txt, _ = go(r, 'echo 1 > t/n.txt')
+        ok("branch: a detached HEAD is refused", rc == 2 and not rows)
+        r = repo("dirty")
+        with open(os.path.join(r, "other.txt"), "a") as fh:
+            fh.write("wip\n")
+        rc, rows, txt, _ = go(r, 'echo 1 > t/n.txt')
+        ok("dirty: uncommitted work outside the target is refused", rc == 2 and "other.txt" in txt and not rows)
+        ok("dirty: and left alone", "wip" in read(r, "other.txt"))
+        r = repo("nocap")
+        os.environ.update(CC_AUTORESEARCH_AGENT="/bin/false")
+        with contextlib.redirect_stderr(io.StringIO()) as e:
+            rc = main(["run", "--dir", r, "--target", "t", "--metric", "./m.sh", "--direction", "min", "--goal", "g"])
+        ok("cap: a run with no cap is refused", rc == 2 and "give a cap" in e.getvalue())
+
+        # 8 AGENT FAILS: a non-zero agent is agent-failed and its half-edit is put back
+        r = repo("agentfail")
+        rc, rows, txt, _ = go(r, 'echo 1 > t/n.txt; exit 3', "--max-trials", "1")
+        ok("agent: a failing agent is agent-failed, its edit put back", rows[1][2] == "agent-failed"
+           and read(r, "t/n.txt") == "5")
+        msgs()
+
+        # 9 START returns at once; the detached run still finishes, writes summary.txt and wakes the caller once
+        r = repo("start")
+        os.environ.update(CC_AUTORESEARCH_AGENT=fake_agent("start", 'sleep 1; echo 2 > t/n.txt; echo "CHANGE: x"'))
+        out = os.path.join(root, "out-start")
+        t = time.time()
+        with contextlib.redirect_stdout(io.StringIO()) as o:
+            rc = main(["start", "--dir", r, "--target", "t", "--metric", "./m.sh", "--direction", "min", "--goal", "g",
+                       "--max-trials", "1", "--out", out, "--notify", "win"])
+        ok("start: returns before the run ends, naming the results", rc == 0 and time.time() - t < 1 and out in o.getvalue()
+           and not os.path.exists(os.path.join(out, "summary.txt")))
+        while time.time() - t < 20 and not os.path.exists(os.path.join(out, "summary.txt")):
+            time.sleep(0.2)
+        ok("start: the detached run kept the change and wrote its summary", read(r, "t/n.txt") == "2"
+           and "best 2" in read(out, "summary.txt"))
+        time.sleep(0.3)
+        ok("start: and woke the caller once", len(msgs()) == 1)
+        with contextlib.redirect_stdout(io.StringIO()) as o:
+            report(out)
+        ok("report: prints the trials and the summary", "\tkeep\t" in o.getvalue() and "best 2" in o.getvalue())
+    finally:
+        os.environ.clear()
+        os.environ.update(env0)
+        shutil.rmtree(root, ignore_errors=True)
+    print(f"cc-autoresearch selfcheck: {passed[0]} passed, {len(failed)} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
