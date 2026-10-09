@@ -140,12 +140,13 @@ PY
 [ "$(blockn "$IR/templates/home/CLAUDE.md")" = "0 1" ] && ok "…and its template keeps the placeholder, never a copy of the text" || bad "templates/home/CLAUDE.md holds a copy of the block: $(blockn "$IR/templates/home/CLAUDE.md") (want 0 1)"
 { [ "$(readlink -f "$IH/WRITING.md")" = "$IR/docs/WRITING.md" ] && [ -s "$IH/WRITING.md" ] && grep -qF '~/WRITING.md' "$IR/config/writing-prompt.md"; } && ok "~/WRITING.md, the guide the block names, links to the tree's docs/WRITING.md" || bad "~/WRITING.md not linked, empty, or not the path the block names"
 [ -f "$IH/.claude/settings.json" ] && env HOME="$IH" CC_SETTINGS_FILE="$IH/.claude/settings.json" "$IR/bin/cc-settings" check >/dev/null 2>&1 && ok "default ~/.claude/settings.json installed and satisfies the managed subset" || bad "settings.json missing or drifted from claude-managed.json"
-# M4-2: the installed native hooks reach both dispatch/bootstrap and end. Missing registrations are the control.
-jq '(.hooks.PreToolUse[] | .hooks) |= map(select(.command != "$HOME/bin/cc-native")) | del(.hooks.SubagentStop)' \
+# M4-2: the installed managed hooks pass check. Missing registrations are the control (cc-native is retired, so a
+# PreToolUse hook and the Stop hook stand in for it).
+jq '(.hooks.PreToolUse[] | .hooks) |= map(select(.command != "$HOME/bin/cc-subagent-bound hook")) | del(.hooks.Stop)' \
   "$IH/.claude/settings.json" > "$T/unapplied-native.json"
 out=$(env HOME="$IH" CC_SETTINGS_FILE="$T/unapplied-native.json" "$IR/bin/cc-settings" check); rc=$?
-[ "$rc" != 0 ] && grep -q 'UNAPPLIED: hook PreToolUse SubagentStop' <<<"$out" \
-  && ok "M4-2: the installed subset passes; missing native hooks are reported UNAPPLIED without apply" \
+[ "$rc" != 0 ] && grep -q 'UNAPPLIED: hook PreToolUse Stop' <<<"$out" \
+  && ok "M4-2: the installed subset passes; missing managed hooks are reported UNAPPLIED without apply" \
   || bad "M4-2: native registration control: $out"
 # the agent types, at ~/.claude/agents/ where the harness reads them. Copies, so the owner can tune one on the box —
 # which is exactly why they need a stamp: an untouched copy still follows its template, an edited one is never

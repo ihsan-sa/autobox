@@ -66,7 +66,9 @@ nothing here waits to be asked.
 
 ## taking a board row
 The native managed path is opt-in: `cc-config get CC_NATIVE_ADAPTER 0` must return `1`, and the owner must
-have registered the hooks with `cc-settings apply` at a terminal before starting the session. Put
+have registered `$HOME/bin/cc-native` by hand in `~/.claude/settings.json` (PreToolUse with matcher
+`Agent|Task|Bash`, and SubagentStop) before starting the session. `cc-settings apply` never adds it; while the
+flag is `1` it leaves it alone, and once the flag is back to `0` it removes it. Put
 `CC-Row: <repo>/<row>` on the first prompt line; omit Agent worktree isolation. Dispatch claims and prepares
 the canonical track and supplies a token. The builder runs `cc-task begin <claim-token>` first, then works
 in the returned worktree using its `task.md` and `progress.md`. The end hook commits and releases the claim.

@@ -2,11 +2,14 @@
 # cc-settings — reconcile ~/.claude/settings.json against the MANAGED subset in config/claude-managed.json:
 # the hook registrations the box's mechanical gates are made of, plus the deny rules that must never go missing.
 # Everything else in that file belongs to whoever uses the box: never touched, never reported as drift.
-#   cc-settings check     one line naming exactly what is unapplied; exit 1 when anything is. install + audit use this.
-#                         A hook that already runs for some tool types is named with only the rest: PreToolUse(Agent|Task).
+#   cc-settings check     one line naming exactly what is unapplied or stale; exit 1 when anything is. install + audit
+#                         use this. A hook that already runs for some tool types is named with only the rest:
+#                         PreToolUse(Agent|Task). STALE is a hook the manifest has retired, or a second spelling of a
+#                         managed command whose own spelling already covers every tool it names.
 #   cc-settings show      one line per managed entry, with why each one exists; a partly registered hook reads
-#                         PARTIAL with its gap, not MISSING with the whole hook's why
-#   cc-settings apply     OWNER ONLY, at a terminal: back up, then add the missing HOOKS. Never `permissions`.
+#                         PARTIAL with its gap, not MISSING with the whole hook's why; one STALE line per stale hook
+#   cc-settings apply     OWNER ONLY, at a terminal: back up, then add the missing HOOKS and remove the stale ones.
+#                         Never `permissions`.
 #   cc-settings grant allow '<rule>' --by <who> [--card <id>]     THE cc-slack DAEMON ONLY, carrying the owner's
 #                         `yes <id> fix` on a 🔐 grant card or the approver's apply (--by approver): back up, add that ONE rule to permissions.allow,
 #                         prove the rest of the file identical, log it (~/.cc/state/grants.log)
@@ -46,6 +49,13 @@ US=$'\x1f'
 norm(){ local c=$1; c=${c//\$\{HOME\}/$HOME}; c=${c//\$HOME/$HOME}; case $c in \~/*) c="$HOME/${c#\~/}";; esac
         printf '%s' "$c" | tr -s ' \t' ' ' | sed 's/^ *//; s/ *$//'; }
 want_hooks(){ jq -r '.hooks[] | [.event, (.matcher // ""), .command, (.why // "")] | join("\u001f")' "$M"; }
+# A retired row with kept_while KEY is skipped while `cc-config get KEY 0` prints 1: the box has opted back in to
+# that hook (cc-native under CC_NATIVE_ADAPTER=1), so its hand registration is neither stale nor removed.
+want_retired(){ local ev cmd why key
+  while IFS=$US read -r ev cmd why key; do
+    [ -n "$key" ] && [ "$("$R/bin/cc-config" get "$key" 0 2>/dev/null)" = 1 ] && continue
+    printf '%s\n' "$ev$US$cmd$US$why"
+  done < <(jq -r '(.retired // [])[] | [.event, .command, (.why // ""), (.kept_while // "")] | join("\u001f")' "$M"); }
 want_deny(){ jq -r '.deny[]' "$M"; }
 want_statusline(){ jq -r '.statusLine.command // empty' "$M"; }         # one line, or none: a scalar, not an array
 want_statusline_why(){ jq -r '.statusLine.why // empty' "$M"; }
@@ -54,8 +64,9 @@ live_hooks(){ jq -r '(.hooks // {}) | to_entries[] as $e | $e.value[]? | (.match
 live_deny(){ jq -r '(.permissions.deny // [])[]' "$S" 2>/dev/null; }
 live_statusline(){ jq -r '.statusLine.command // empty' "$S" 2>/dev/null; }
 
-# add_hook <file> <event> <matcher> <command> — the ONE mutation this command can make, on stdout. It only ever
-# assigns under `.hooks`: no path in it names `.permissions`, and apply proves that against its own output too.
+# add_hook <file> <event> <matcher> <command> — one of the mutations apply() can make, on stdout. Like
+# remove_hook it only ever assigns under `.hooks`: no path in it names `.permissions`, and apply proves that
+# against its own output too.
 add_hook(){ jq --arg ev "$2" --arg m "$3" --arg c "$4" '
       .hooks //= {} | .hooks[$ev] //= []
     | if ([.hooks[$ev][] | select((.matcher // "") == $m)] | length) > 0
@@ -63,7 +74,16 @@ add_hook(){ jq --arg ev "$2" --arg m "$3" --arg c "$4" '
       else .hooks[$ev] += [ (if $m == "" then {hooks:[{type:"command", command:$c}]}
                                          else {matcher:$m, hooks:[{type:"command", command:$c}]} end) ] end
   ' "$1"; }
-# set_statusline <file> <command> — the OTHER mutation apply() can make. Runs only when scan() found
+# remove_hook <file> <event> <matcher> <command> — drop that one command, spelled exactly so, from the entries
+# with exactly that matcher; an entry it leaves with no hooks goes, and so does an event it leaves empty.
+remove_hook(){ jq --arg ev "$2" --arg m "$3" --arg c "$4" '
+      if ((.hooks // {}) | has($ev)) | not then . else
+        .hooks[$ev] |= ( map(if (.matcher // "") == $m
+                             then .hooks = ((.hooks // []) | map(select(.type != "command" or .command != $c))) else . end)
+                       | map(select((.matcher // "") != $m or ((.hooks // []) | length) > 0)) )
+      | if (.hooks[$ev] | length) == 0 then del(.hooks[$ev]) else . end end
+  ' "$1"; }
+# set_statusline <file> <command> — the third mutation apply() can make. Runs only when scan() found
 # .statusLine absent: an owner's own different command is never overwritten — scan() reports it as SL_CUSTOM
 # instead of MISSING, so this never runs against one.
 set_statusline(){ jq --arg c "$2" '.statusLine = {type:"command", command:$c}' "$1"; }
@@ -80,7 +100,8 @@ set_statusline(){ jq --arg c "$2" '.statusLine = {type:"command", command:$c}' "
 # (PROVEN 2026-09-21: cc-guard split live across two matchers covering Bash..Glob and flagged as fully
 # "MISSING", the same alarm as zero coverage, though merge/deploy — Bash — already ran; row
 # raised-settings-check-says-the-guard-hook-is-missing).
-MISSING=""; UNRELATED=0; SL_CUSTOM=""
+# STALE holds one row per live registration to remove: "event<US>matcher<US>command-as-spelled<US>why".
+MISSING=""; UNRELATED=0; SL_CUSTOM=""; STALE=""
 # gap_for <event> <command> <want-matcher> <live-rows> — the want-matcher's pipe-separated tool types not
 # named by any live row's matcher for the same event+command; "" (with success) means fully covered.
 gap_for(){
@@ -99,9 +120,33 @@ gap_for(){
   done
   printf '%s' "$out"
 }
+# plain_alts <matcher> — the tool types a matcher PROVABLY runs for, one per line: "*" for every tool when it is
+# "" or "*", else each name of a plain Name|Name|Name list. Claude Code reads a matcher as a list of exact names
+# when it holds nothing but letters, digits, _ and |, so "Bash|" is the names "Bash" and "" and runs for Bash only.
+# This parser still fails on an empty name, as on an anchor, a class, a group, a dot or a hyphen: it proves only
+# what it can read, and a matcher it cannot read is never removed.
+PLAIN_RE='^[A-Za-z0-9_]+(\|[A-Za-z0-9_]+)*$'
+plain_alts(){ case $1 in ""|"*") echo '*'; return 0 ;; esac
+  [[ $1 =~ $PLAIN_RE ]] || return 1
+  tr '|' '\n' <<<"$1"; }
+# covers <event> <command> <matcher> <kept-rows> — true only when the kept rows for that event+command PROVABLY run
+# for every tool <matcher> runs for. This decides what apply() deletes from the guard's own registrations, so any
+# doubt answers false and the registration stays: a <matcher> that is not plain is never covered (it may match
+# more than its names), and a kept row whose matcher is not plain lends no coverage (it may match less).
+covers(){ local want have="" lev lm lcmd a
+  want=$(plain_alts "$3") || return 1
+  while IFS=$US read -r lev lm lcmd; do
+    [ "$lev" = "$1" ] && [ "$(norm "$lcmd")" = "$(norm "$2")" ] || continue
+    a=$(plain_alts "$lm") || continue
+    [ "$a" = '*' ] && return 0
+    have+="$a"$'\n'
+  done <<<"$4"
+  [ "$want" = '*' ] && return 1
+  while IFS= read -r a; do grep -qxF -- "$a" <<<"$have" || return 1; done <<<"$want"
+  return 0; }
 scan(){
-  MISSING=""; UNRELATED=0; SL_CUSTOM=""
-  local ev m cmd why rule found lev lm lcmd live ld n sl_want sl_live gap
+  MISSING=""; UNRELATED=0; SL_CUSTOM=""; STALE=""
+  local ev m cmd why rule found lev lm lcmd live ld n sl_want sl_live gap own
   [ -f "$S" ] || { MISSING="absent$US$S"; return; }
   live=$(live_hooks)
   while IFS=$US read -r ev m cmd why; do
@@ -117,6 +162,25 @@ scan(){
       [ -n "$gap" ] && MISSING+="hook$US$ev$US$gap$US$cmd$US$why"$'\n'
     fi
   done < <(want_hooks)
+  # retired: any live registration of the command, under any matcher (a kept_while row the box opted into is skipped)
+  while IFS=$US read -r ev cmd why; do
+    [ -n "$ev" ] || continue
+    while IFS=$US read -r lev lm lcmd; do
+      [ "$lev" = "$ev" ] && [ "$(norm "$lcmd")" = "$(norm "$cmd")" ] && STALE+="$lev$US$lm$US$lcmd$US$why"$'\n'
+    done <<<"$live"
+  done < <(want_retired)
+  # a second spelling of a managed command: stale only where the manifest's own spelling already covers its tools
+  while IFS=$US read -r ev m cmd why; do
+    [ -n "$ev" ] || continue
+    own=$(while IFS=$US read -r lev lm lcmd; do [ "$lev" = "$ev" ] && [ "$lcmd" = "$cmd" ] && printf '%s\n' "$lev$US$lm$US$lcmd"; done <<<"$live")
+    [ -n "$own" ] || continue
+    while IFS=$US read -r lev lm lcmd; do
+      [ "$lev" = "$ev" ] && [ "$lcmd" != "$cmd" ] && [ "$(norm "$lcmd")" = "$(norm "$cmd")" ] && covers "$ev" "$cmd" "$lm" "$own" \
+        && STALE+="$lev$US$lm$US$lcmd${US}a second spelling of $cmd, which already runs for every tool it names, so the hook ran twice"$'\n'
+    done <<<"$live"
+  done < <(want_hooks)
+  # one row per registration: two byte-identical copies are one removal (remove_hook drops both), so count it once
+  [ -n "$STALE" ] && STALE=$(awk -F"$US" '!seen[$1 FS $2 FS $3]++' <<<"$STALE")$'\n'
   ld=$(live_deny)
   while IFS= read -r rule; do
     [ -n "$rule" ] || continue
@@ -140,22 +204,26 @@ partial_gap(){ [ -n "$3" ] && [ "$3" != "$(jq -r --arg e "$1" --arg c "$2" \
 
 # one line the owner can act on, and an exit code the caller can gate on
 check(){
-  local kind a g c hooks="" denies="" sl=""
+  local kind a g c hooks="" denies="" sl="" stale="" ev lm lcmd
   scan
   if miss_of absent >/dev/null; then echo "settings — $S does not exist (run install.sh once)"; return 1; fi
+  while IFS=$US read -r ev lm lcmd _; do [ -n "$ev" ] && stale="$stale $ev($(basename "${lcmd%% *}"))"; done <<<"$STALE"
   while IFS=$US read -r kind a g c _; do
     case "$kind" in
       hook) if partial_gap "$a" "$c" "$g"; then hooks="$hooks $a($g)"; else hooks="$hooks $a"; fi ;;
       deny) denies="$denies $a" ;; statusline) sl=1 ;;
     esac
   done <<<"$MISSING"
-  if [ -z "$hooks$denies$sl" ]; then
+  if [ -z "$hooks$denies$sl$stale" ]; then
     echo "settings — all $( { want_hooks; want_deny; want_statusline; } | grep -c .) managed entries applied ($UNRELATED unrelated line(s) differ, not managed)"
     return 0
   fi
-  printf 'settings — UNAPPLIED:%s%s%s — cc-settings show, then %s\n' \
-    "${hooks:+ hook$hooks}" "${denies:+ deny$denies}" "${sl:+ statusLine}" \
-    "$([ -n "$hooks$sl" ] && echo 'cc-settings apply (owner, at a terminal)' || echo 'add the deny rule(s) by hand')"
+  local msg=""
+  [ -n "$hooks$denies$sl" ] && msg="UNAPPLIED:${hooks:+ hook$hooks}${denies:+ deny$denies}${sl:+ statusLine}"
+  [ -n "$stale" ] && msg="${msg:+$msg; }STALE: hook$stale"
+  printf 'settings — %s — cc-settings show, then %s\n' "$msg" \
+    "$(if [ -n "$hooks$sl$stale" ]; then printf 'cc-settings apply (owner, at a terminal)%s' "${denies:+, and add the deny rule(s) by hand}"
+       else echo 'add the deny rule(s) by hand'; fi)"
   return 1
 }
 
@@ -200,8 +268,12 @@ show(){
       printf '  kept     statusLine %s  (your own — cc-settings never overwrites a statusLine you set)\n' "$(norm "$SL_CUSTOM")"
     else printf '  ok       statusLine %s\n' "$(norm "$sl_want")"; fi
   fi
+  local lev lm lcmd lwhy
+  while IFS=$US read -r lev lm lcmd lwhy; do
+    [ -n "$lev" ] && printf '  STALE    hook %-16s %s%s\n           remove: %s\n' "$lev" "$lcmd" "${lm:+   (matcher: $lm)}" "$lwhy"
+  done <<<"$STALE"
   printf '\n%s line(s) outside the managed subset differ from %s — not managed, not drift.\n' "$UNRELATED" "${DEF#"$R"/}"
-  [ -z "$MISSING" ]
+  [ -z "$MISSING$STALE" ]
 }
 
 # ---- apply: the owner's own hand, at a terminal. Never a session, never `permissions`. ----
@@ -218,7 +290,7 @@ apply(){
   [ -f "$S" ] || { echo "cc-settings: no $S — run install.sh once first" >&2; exit 2; }
 
   scan
-  if ! miss_of hook >/dev/null && ! miss_of statusline >/dev/null; then
+  if ! miss_of hook >/dev/null && ! miss_of statusline >/dev/null && [ -z "$STALE" ]; then
     echo "cc-settings: every managed hook and the statusLine are already applied — nothing to write."
     { miss_of deny >/dev/null || [ -n "$SL_CUSTOM" ]; } && { echo; show; }
     exit 0
@@ -226,6 +298,10 @@ apply(){
   if miss_of hook >/dev/null; then
     echo "About to add these hook registrations to $S:"
     while IFS=$US read -r _ ev m cmd _; do printf '  %-16s %s%s\n' "$ev" "$(norm "$cmd")" "${m:+   (matcher: $m)}"; done < <(miss_of hook)
+  fi
+  if [ -n "$STALE" ]; then
+    echo "About to remove these stale hook registrations from $S:"
+    while IFS=$US read -r ev m cmd _; do [ -n "$ev" ] && printf '  %-16s %s%s\n' "$ev" "$cmd" "${m:+   (matcher: $m)}"; done <<<"$STALE"
   fi
   if miss_of statusline >/dev/null; then
     echo "About to set the statusLine command in $S:"
@@ -252,6 +328,13 @@ apply(){
     else rm -f "$tmp" "$tmp.j"; echo "cc-settings: jq failed on $ev — nothing changed ($bak holds the backup)" >&2; exit 1; fi
     n=$((n+1))
   done < <(miss_of hook)
+  while IFS=$US read -r ev m cmd _; do
+    [ -n "$ev" ] || continue
+    if remove_hook "$tmp" "$ev" "$m" "$cmd" > "$tmp.j"
+    then mv -f "$tmp.j" "$tmp"
+    else rm -f "$tmp" "$tmp.j"; echo "cc-settings: jq failed removing $ev $cmd — nothing changed ($bak holds the backup)" >&2; exit 1; fi
+    n=$((n+1))
+  done <<<"$STALE"
   if miss_of statusline >/dev/null; then
     sl_cmd=$(miss_of statusline | cut -d"$US" -f2)
     if set_statusline "$tmp" "$sl_cmd" > "$tmp.j"
@@ -263,7 +346,7 @@ apply(){
   new_perm=$(jq -S -c '.permissions // null' "$tmp")   # the promise, checked rather than asserted
   [ "$new_perm" = "$orig_perm" ] || { rm -f "$tmp"; echo "cc-settings: that rewrite would have changed \`permissions\` — refused, nothing changed" >&2; exit 1; }
   mv -f "$tmp" "$S" || { echo "cc-settings: could not replace $S — $bak holds the backup" >&2; exit 1; }
-  echo "applied $n managed entrie(s). Backup: $bak"
+  echo "applied $n managed change(s). Backup: $bak"
   echo "Claude Code reads settings at session start: restart any session that has to be gated by them."
 }
 
@@ -343,22 +426,25 @@ grant(){
 }
 
 selfcheck(){
-  local d n=0 f=0 S M DEF CL out rc sl_cmd self sha g_found
+  local d n=0 f=0 S M DEF CL out rc sl_cmd self sha g_found ev m cmd before bad
   d=$(mktemp -d "${TMPDIR:-/tmp}/cc-settings-sc.XXXXXX") || return 1   # S/M/DEF are local: every case runs against fixtures
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a case that PRINTS (jq -e) must not leak into the verdict
   M="$R/config/claude-managed.json"; DEF="$R/config/claude-settings.json"
+  local -x CC_NATIVE_ADAPTER=0   # the environment outranks ~/.cc/config: an adapter box's own flag never reaches a case
   k "$(t jq -e . "$M")" "the managed manifest is valid json"
-  k "$(t test "$(jq '.hooks | length' "$M")" -eq 6)" "the manifest names six hook registrations"
+  k "$(t test "$(jq '.hooks | length' "$M")" -eq 4)" "the manifest names four hook registrations"
+  k "$(t test "$(jq '.retired | length' "$M")" -eq 3)" "…and retires three: cc-native on PreToolUse and SubagentStop, cc-scope on UserPromptSubmit"
   k "$(t test -n "$(jq -r '.statusLine.command // empty' "$M")")" "the manifest names a statusLine command"
   # the shipped default must satisfy the subset itself, or a fresh box installs a file that is already wrong
   S="$DEF"; scan
   k "$(t test -z "$MISSING")" "config/claude-settings.json satisfies its own managed subset${MISSING:+ — missing: $(tr '\n' ' ' <<<"$MISSING")}"
-  jq '(.hooks.PreToolUse[] | .hooks) |= map(select(.command != "$HOME/bin/cc-native"))
-      | del(.hooks.SubagentStop)' "$DEF" > "$d/no-native.json"; S="$d/no-native.json"
+  k "$(t test -z "$STALE")" "…and registers no retired hook${STALE:+ — stale: $(tr '\n' ' ' <<<"$STALE")}"
+  jq '(.hooks.PreToolUse[] | .hooks) |= map(select(.command != "$HOME/bin/cc-subagent-bound hook"))
+      | del(.hooks.PermissionDenied)' "$DEF" > "$d/no-two.json"; S="$d/no-two.json"
   out=$(check); rc=$?
-  k "$(t test "$rc" -ne 0)" "native registrations missing is a request that must be refused by check; the shipped subset is its control"
-  k "$(t grep -q 'UNAPPLIED: hook PreToolUse SubagentStop' <<<"$out")" "check names both unapplied native hooks without applying them"
+  k "$(t test "$rc" -ne 0)" "two registrations missing make check exit non-zero; the shipped subset is its control"
+  k "$(t grep -q 'UNAPPLIED: hook PreToolUse PermissionDenied' <<<"$out")" "check names both unapplied hooks without applying them"
   # Every command in the manifest runs unattended, on tool calls nobody watches, so a change to one must buy the
   # paid read at the landing (tests/control-layer, cc-land's gate tier). cc-native was added to the manifest
   # without it and would have landed on the cheap gates alone.
@@ -367,8 +453,8 @@ selfcheck(){
     for c in $(jq -r '.hooks[].command' "$M" | awk '{print $1}' | sed 's|^\$HOME/||' | sort -u); do
       grep -qxF "$c" "$CL" || m="$m $c"; done; printf '%s' "$m"; }
   k "$(t test -z "$(ctl_miss)")" "every managed hook command is on tests/control-layer$(ctl_miss | sed 's/^ / — missing: /')"
-  grep -vxF 'bin/cc-native' "$CL" > "$d/thin-control-layer"; CL="$d/thin-control-layer"
-  k "$(t grep -q 'bin/cc-native' <<<"$(ctl_miss)")" "…and a hook missing from that list is named; the shipped list is its control"
+  grep -vxF 'bin/cc-subagent-bound' "$CL" > "$d/thin-control-layer"; CL="$d/thin-control-layer"
+  k "$(t grep -q 'bin/cc-subagent-bound' <<<"$(ctl_miss)")" "…and a hook missing from that list is named; the shipped list is its control"
   CL="$R/tests/control-layer"
   # THE PROVEN CASE: canonical in config/, absent from the live file. It must be NAMED, not counted.
   jq 'del(.hooks.Stop)' "$DEF" > "$d/no-stop.json"; S="$d/no-stop.json"
@@ -383,7 +469,7 @@ selfcheck(){
   k "$(t test "$UNRELATED" -gt 0)" "…while the unrelated lines are still counted as context ($UNRELATED)"
   # $HOME / ${HOME} / ~ / the literal path are one registration — two of the original 27 "differing lines"
   jq --arg h "$HOME" '.hooks.PreToolUse[0].hooks[0].command = $h + "/bin/cc-guard"
-                      | .hooks.PreToolUse[1].hooks[0].command = "~/bin/cc-native"
+                      | .hooks.PreToolUse[1].hooks[0].command = "~/bin/cc-subagent-bound hook"
                       | .hooks.Stop[0].hooks[0].command = "${HOME}/bin/cc-checkpoint  "' "$DEF" > "$d/expanded.json"
   S="$d/expanded.json"; scan
   k "$(t test -z "$MISSING")" "\$HOME, \${HOME}, ~ and the literal path are all the same registration"
@@ -403,7 +489,7 @@ selfcheck(){
   jq '.hooks.PreToolUse = [
         {matcher:"Bash|Edit|Write|MultiEdit|NotebookEdit", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
         {matcher:"Read|NotebookRead|Grep|Glob|Agent|Task", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
-        .hooks.PreToolUse[1], .hooks.PreToolUse[2]
+        .hooks.PreToolUse[1]
       ]' "$DEF" > "$d/split-full.json"
   S="$d/split-full.json"; scan
   k "$(t test -z "$MISSING")" "a command split across two matcher entries whose union covers the manifest's is applied, not MISSING"
@@ -412,7 +498,7 @@ selfcheck(){
   jq '.hooks.PreToolUse = [
         {matcher:"Bash|Edit|Write|MultiEdit|NotebookEdit", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
         {matcher:"Read|NotebookRead|Grep|Glob", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
-        .hooks.PreToolUse[1], .hooks.PreToolUse[2]
+        .hooks.PreToolUse[1]
       ]' "$DEF" > "$d/split-gap.json"
   S="$d/split-gap.json"; scan
   if hook_gap PreToolUse '$HOME/bin/cc-guard'; then g_found=0; else g_found=1; fi
@@ -441,6 +527,100 @@ selfcheck(){
   jq '.hooks.PreToolUse[0].hooks += [{type:"command", command:"$HOME/bin/mine"}]' "$DEF" > "$d/extra-hook.json"
   S="$d/extra-hook.json"; scan
   k "$(t test -z "$MISSING")" "a user's own extra hook alongside a managed one is preserved, not drift"
+  # STALE (row hooks-drop-dead-entries): the live file as it stood on 2026-10-03 — cc-guard three times, once under
+  # the literal path, plus cc-native twice and cc-scope's no-op. Claude Code collapses only byte-identical commands,
+  # so the literal-path guard ran a second time on every Bash/Edit/Write call.
+  jq --arg h "$HOME" '.permissions.allow += ["Bash(cowsay:*)"]
+      | .hooks.PreToolUse = [
+          {matcher:"Bash|Edit|Write|MultiEdit|NotebookEdit", hooks:[{type:"command", command:($h + "/bin/cc-guard")}]},
+          {matcher:"Bash|Edit|Write|MultiEdit|NotebookEdit|Read|NotebookRead|Grep|Glob", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
+          {matcher:"Agent|Task|Bash", hooks:[{type:"command", command:"$HOME/bin/cc-native"}]},
+          {matcher:"Agent|Task", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}, {type:"command", command:"$HOME/bin/mine"}]},
+          .hooks.PreToolUse[1] ]
+      | .hooks.SubagentStop = [{hooks:[{type:"command", command:"$HOME/bin/cc-native"}]}]
+      | .hooks.UserPromptSubmit = [{hooks:[{type:"command", command:"$HOME/bin/cc-scope hook"}]}]' "$DEF" > "$d/stale.json"
+  S="$d/stale.json"; scan
+  k "$(t test -z "$MISSING")" "the 10-03 live file has every managed hook applied"
+  k "$(t test "$(grep -c . <<<"$STALE")" -eq 4)" "…and four stale registrations: $(cut -d"$US" -f1,3 <<<"$STALE" | tr "$US\n" ': ')"
+  k "$(t grep -qF "PreToolUse${US}Bash|Edit|Write|MultiEdit|NotebookEdit${US}$HOME/bin/cc-guard${US}" <<<"$STALE")" "…the literal-path guard among them"
+  k "$(t test "$(grep -cF "$US\$HOME/bin/cc-guard$US" <<<"$STALE")" -eq 0)" "…and neither \$HOME-spelled guard registration"
+  out=$(check); rc=$?
+  k "$(t test "$rc" -ne 0)" "check exits non-zero on stale hooks alone"
+  k "$(t grep -qF 'STALE: hook PreToolUse(cc-native) SubagentStop(cc-native) UserPromptSubmit(cc-scope) PreToolUse(cc-guard)' <<<"$out")" "…and names each one: $out"
+  k "$(t grep -q 'STALE    hook UserPromptSubmit' <<<"$(show)")" "show lists each stale registration with why it goes"
+  # a box that opted into the native adapter registered cc-native by hand: check must not call it stale, and the
+  # removals apply would make must leave both registrations in place
+  CC_NATIVE_ADAPTER=1 scan
+  k "$(t test "$(grep -c . <<<"$STALE")" -eq 2)" "with CC_NATIVE_ADAPTER=1 the same file has two stale rows, not four: $(cut -d"$US" -f1,3 <<<"$STALE" | tr "$US\n" ': ')"
+  k "$(t test "$(grep -cF "$US\$HOME/bin/cc-native$US" <<<"$STALE")" -eq 0)" "…and neither is cc-native"
+  out=$(CC_NATIVE_ADAPTER=1 check)
+  k "$(t test "$(grep -c 'cc-native' <<<"$out")" -eq 0)" "…and check does not name it: $out"
+  cp "$d/stale.json" "$d/adapter.json"
+  while IFS=$US read -r ev m cmd _; do
+    [ -n "$ev" ] && remove_hook "$d/adapter.json" "$ev" "$m" "$cmd" > "$d/u.j" && mv -f "$d/u.j" "$d/adapter.json"
+  done <<<"$STALE"
+  k "$(t test "$(jq '[.hooks[][] | .hooks[] | select(.command == "$HOME/bin/cc-native")] | length' "$d/adapter.json")" -eq 2)" \
+     "…so apply leaves both hand registrations of cc-native, PreToolUse and SubagentStop"
+  S="$d/stale.json"; scan
+  # remove_hook is the mutation apply() makes for each STALE row; do exactly that and read what is left
+  cp "$d/stale.json" "$d/unstaled.json"
+  while IFS=$US read -r ev m cmd _; do
+    [ -n "$ev" ] && remove_hook "$d/unstaled.json" "$ev" "$m" "$cmd" > "$d/u.j" && mv -f "$d/u.j" "$d/unstaled.json"
+  done <<<"$STALE"
+  S="$d/unstaled.json"; scan
+  k "$(t test -z "$MISSING$STALE")" "removing them leaves nothing missing and nothing stale"
+  k "$(t test "$(jq '[.hooks[][] | .hooks[] | select(.command | test("cc-native|cc-scope"))] | length' "$d/unstaled.json")" -eq 0)" "…no cc-native or cc-scope hook at all"
+  k "$(t test "$(jq -r '.hooks | has("SubagentStop"), has("UserPromptSubmit")' "$d/unstaled.json" | sort -u)" = false)" "…and the events it emptied are gone"
+  k "$(t test "$(jq -r '[.hooks[][] | .hooks[] | select(.command | endswith("/cc-guard")) | .command] | unique | join(" ")' "$d/unstaled.json")" = '$HOME/bin/cc-guard')" \
+     "…one spelling of cc-guard left, the \$HOME one"
+  k "$(t jq -e '[.hooks.PreToolUse[] | select(.matcher == "Agent|Task") | .hooks[].command] == ["$HOME/bin/cc-guard", "$HOME/bin/mine"]' "$d/unstaled.json")" \
+     "…and the user's own hook sharing an entry survives"
+  k "$(t diff <(jq -S 'del(.hooks)' "$d/stale.json") <(jq -S 'del(.hooks)' "$d/unstaled.json"))" "…and everything outside .hooks, permissions included, is identical"
+  # THE GATE STILL FIRES: every tool the guard ran for before (any spelling) it still runs for, and a guarded call
+  # through the real cc-guard is still refused — the approval gate in a track, the member gate in a member dir
+  before=$(jq -r --arg h "$HOME" '.hooks.PreToolUse[] | select(any(.hooks[]; .command == "$HOME/bin/cc-guard" or .command == ($h + "/bin/cc-guard"))) | .matcher' "$d/stale.json" | tr '\n' '|')
+  k "$(t test -z "$(gap_for PreToolUse '$HOME/bin/cc-guard' "$before" "$(S="$d/unstaled.json" live_hooks)")")" "the guard still runs for every tool it ran for before: ${before%|}"
+  mkdir -p "$d/wt/.cc" "$d/gh/bin" "$d/mf/.cc"; : > "$d/wt/.cc/track"; : > "$d/mf/.cc/member-facing"
+  gd(){ printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s"}' "$1" "$2" | env HOME="$d/gh" CC_GUARD_ASKS="$d/asks" "${@:3}" "$R/bin/cc-guard" >/dev/null 2>&1; echo $?; }
+  k "$(t test "$(gd 'gh pr merge 1' "$d/wt" CC_ROLE=worker)" -eq 2)" "a merge from a track is still refused by cc-guard"
+  k "$(t test "$(gd 'git log -1' "$d/wt" CC_ROLE=worker)" -eq 0)" "…while a plain call from the same track passes"
+  k "$(t test "$(gd "cp x $d/gh/bin/cc-guard" "$d/mf")" -eq 2)" "a member-facing session writing ~/bin is still refused by cc-guard"
+  k "$(t test "$(gd "echo hi > $d/mf/notes.md" "$d/mf")" -eq 0)" "…while it writes its own dir"
+  # its control: a second spelling that covers a tool the manifest's spelling does not is kept, not stale
+  jq --arg h "$HOME" '.hooks.PreToolUse = [
+        {matcher:"Bash", hooks:[{type:"command", command:"$HOME/bin/cc-guard"}]},
+        {matcher:"Bash|Edit|Write|MultiEdit|NotebookEdit|Read|NotebookRead|Grep|Glob|Agent|Task", hooks:[{type:"command", command:($h + "/bin/cc-guard")}]},
+        .hooks.PreToolUse[1] ]' "$DEF" > "$d/needed-spelling.json"
+  S="$d/needed-spelling.json"; scan
+  k "$(t test -z "$MISSING$STALE")" "a second spelling the manifest's spelling does not cover is kept, not stale"
+  # "Bash|" is a list of exact names to Claude Code (Bash, and an empty name), but plain_alts does not read an
+  # empty name, so the registration is not proven covered and stays. What this parser cannot read, apply keeps.
+  jq --arg h "$HOME" '.hooks.PreToolUse += [{matcher:"Bash|", hooks:[{type:"command", command:($h + "/bin/cc-guard")}]}]' "$DEF" > "$d/empty-alt.json"
+  S="$d/empty-alt.json"; scan
+  k "$(t test -z "$STALE")" "a second spelling under matcher \"Bash|\" (an empty name this parser does not prove) is kept, not stale${STALE:+ — stale: $(tr "$US\n" ': ' <<<"$STALE")}"
+  bad=""
+  for m in '^Bash$' 'Ba.h' '(Bash|Edit)' 'Bash||Edit' '|Bash' 'Bas[h]' 'Bash|Edit.*'; do
+    covers PreToolUse '$HOME/bin/cc-guard' "$m" "$(S="$DEF" live_hooks)" && bad="$bad $m"
+  done
+  k "$(t test -z "$bad")" "covers proves no regex matcher covered: anchors, a dot, a group, an empty alternative, a class, .*${bad:+ — proved:$bad}"
+  k "$(t test "$(covers PreToolUse X 'Bash|Edit' "PreToolUse$US^Bash|Edit${US}X" && echo y)" != y)" "…and a kept row with a regex matcher lends no coverage"
+  k "$(t covers PreToolUse X 'Bash|Edit' "PreToolUse$US*${US}X")" "…while a kept \"*\" covers every tool"
+  k "$(t test "$(covers PreToolUse X 'mcp__a-b' "PreToolUse$US*${US}X" && echo y)" != y)" "…and a hyphenated matcher is a regex, not a name list, so it is never proven covered"
+  # its control: a plain list the manifest's spelling covers is still removed, and removing it ungates nothing
+  jq --arg h "$HOME" '.hooks.PreToolUse += [{matcher:"Grep|Bash", hooks:[{type:"command", command:($h + "/bin/cc-guard")}]}]' "$DEF" > "$d/plain-alt.json"
+  S="$d/plain-alt.json"; scan
+  k "$(t test "$(grep -c . <<<"$STALE")" -eq 1)" "a second spelling under the plain list \"Grep|Bash\" the manifest's covers is one stale row"
+  k "$(t grep -qF "PreToolUse${US}Grep|Bash${US}$HOME/bin/cc-guard${US}" <<<"$STALE")" "…naming that literal-path registration"
+  # byte-identical copies of a retired registration are one removal: one row, named once, counted once
+  jq '.hooks.UserPromptSubmit = [{hooks:[{type:"command", command:"$HOME/bin/cc-scope hook"}, {type:"command", command:"$HOME/bin/cc-scope hook"}]}]' "$DEF" > "$d/twice.json"
+  S="$d/twice.json"; scan
+  k "$(t test "$(grep -c . <<<"$STALE")" -eq 1)" "two byte-identical registrations of a retired hook are one stale row, not two"
+  out=$(check)
+  k "$(t grep -qF 'STALE: hook UserPromptSubmit(cc-scope) —' <<<"$out")" "…and check names it once: $out"
+  # a stale hook AND a missing deny rule: the tail names both halves, since apply never writes a deny rule
+  jq '.permissions.deny -= ["Artifact"]' "$d/twice.json" > "$d/twice-nodeny.json"; S="$d/twice-nodeny.json"
+  out=$(check)
+  k "$(t grep -qF 'cc-settings apply (owner, at a terminal), and add the deny rule(s) by hand' <<<"$out")" "a stale hook with a missing deny rule says apply AND add the rule by hand: $out"
   # a settings file that does not exist at all is its own answer, not a crash
   S="$d/nope.json"; scan; k "$(t grep -q '^absent' <<<"$MISSING")" "an absent settings file is reported as absent"
   # statusLine: absent -> reported by name and unapplied; a DIFFERENT command is the owner's own — satisfied,
@@ -463,7 +643,7 @@ selfcheck(){
   k "$(t grep -q 'CC_ROLE=worker' <<<"$out")" "apply refuses for a worker or member session"
   out=$(env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT -u CC_ROLE "$0" apply </dev/null 2>&1)
   k "$(t grep -q 'no terminal' <<<"$out")" "apply refuses with no terminal"
-  # THE WRITE ITSELF. add_hook is the only mutation apply can make, so run it — no terminal needed — over a file
+  # THE WRITE ITSELF. add_hook is the mutation apply makes most, so run it — no terminal needed — over a file
   # carrying the owner's own permissions, hooks and keys, and check what came out the other side.
   jq --arg h "$HOME" '.theme="dark" | .customKey={a:1}
       | .permissions.allow += ["Bash(cowsay:*)"] | .permissions.deny += ["Bash(git push --force:*)"]
@@ -480,13 +660,13 @@ selfcheck(){
   k "$(t test -z "$MISSING")" "…and the file it wrote now satisfies the managed subset"
   # scoped to .hooks: a top-level key can carry the same {type:"command", command:…} shape (statusLine does)
   # without being a hook registration at all, and counting the whole file would count that key too.
-  k "$(t test "$(jq '[.hooks | .. | objects | select(.type? == "command") | .command] | length' "$d/applied.json")" -eq 7)" \
-     "…with exactly one registration added, not a duplicate of the six that were there"
+  k "$(t test "$(jq '[.hooks | .. | objects | select(.type? == "command") | .command] | length' "$d/applied.json")" -eq 5)" \
+     "…with exactly one registration added, not a duplicate of the four that were there"
   # a second run is a no-op: apply must never stack the same registration twice
   add_hook "$d/applied.json" Stop "" '$HOME/bin/cc-checkpoint' > "$d/twice.json"
   S="$d/twice.json"; scan
   k "$(t test -z "$MISSING")" "applying twice still satisfies the subset (scan matches on content, not count)"
-  # set_statusline is the OTHER mutation apply() can make: it sets a missing statusLine and touches nothing else
+  # set_statusline is the third mutation apply() can make: it sets a missing statusLine and touches nothing else
   jq 'del(.statusLine)' "$d/live.json" > "$d/sl-live.json"; S="$d/sl-live.json"; scan
   sl_cmd=$(miss_of statusline | cut -d"$US" -f2)
   set_statusline "$d/sl-live.json" "$sl_cmd" > "$d/sl-applied.json"
