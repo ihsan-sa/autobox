@@ -824,15 +824,25 @@ drain(){   # $1 = one window, or nothing = every window with a spool
 # no mtime to carry, and the start wall's plain `credential:<h>` is already spent for a workspace it told before
 # the first mint, so that event is named after the moment it was first found missing (credential-missing). The
 # session is not touched: it works until its token runs out, and a member's session is theirs to stop.
+# WHY IT WAS CLEARED (owner, 2026-10-03: the notice said 'a refused refresh' for a copy perms had cleared on purpose).
+# `cc-sandbox signout <h> <why>` leaves its reason in credential-cleared beside the file; with it the notice says a
+# deliberate stop and that reason, without it a refused refresh, which usually means another holder of the same refresh
+# token refreshed first; a note older than the file is from an earlier blanking and is not read. Either way the next step is the login walk, `cc-sandbox mint <h>`, never --from the box's login.
 cred_ok(){ [ -s "$1" ] && jq -e '.claudeAiOauth.accessToken | type == "string" and length > 0' "$1" >/dev/null 2>&1; }  # cc-sandbox's cred_usable, word for word
 member_signed_out(){   # $1 window name → said once when the workspace behind a MEMBER window has lost its credential
-  local h own stamp miss cid m when=""
+  local h own stamp miss cid m when="" why="" mwhy owhy lk gone=0
   h=${1%%/*}; h=${h%%@*}; h=${h%%~*}
   [ -f "$HOME/dev/$h/.cc/member-workspace" ] || return 0        # cc's member_workspace(): only a member's window
   own="$HOME/.cc/members/$h/credentials.json"; stamp="$HOME/.cc/members/$h/credential-gone"
   miss="$HOME/.cc/members/$h/credential-missing"
   cred_ok "$own" && { rm -f "$stamp" "$miss"; return 0; }
   mkdir -p "$(dirname "$stamp")" 2>/dev/null                    # the stamps' dir, when the whole dir went with the file
+  # THE BLANK AND ITS REASON ARE READ TOGETHER, under the lock `cc-sandbox signout` writes both under. A sweep that read
+  # between signout's two writes saw a blank with no reason, called it a refused refresh, stamped the event, and never read
+  # the reason that came a moment later (review of #977). Held only for this snapshot, never across a post; busy → next tick.
+  exec {lk}>>"$HOME/.cc/members/$h/credential.lock" || return 0
+  flock -w 10 "$lk" || { exec {lk}>&-; return 0; }
+  cred_ok "$own" && { exec {lk}>&-; rm -f "$stamp" "$miss"; return 0; }   # minted again while this waited
   if [ -e "$own" ]; then rm -f "$miss"   # there is a file again: a later deletion is a later moment, not this one
     m=$(stat -c %Y "$own" 2>/dev/null || echo 0); cid="credential:$h:blank@$m"; when=" at $(date -d "@$m" +'%b %-d %H:%M' 2>/dev/null)"
   else
@@ -843,17 +853,33 @@ member_signed_out(){   # $1 window name → said once when the workspace behind 
     # reads the same id (one deletion is one post, and a page nobody got still retries under it), and the re-mint
     # above clears it with the stamp, so the next deletion is a later moment and is said again.
     [ -s "$miss" ] || date -u +%s > "$miss"
-    m=$(cat "$miss" 2>/dev/null); cid="credential:$h:gone@${m:-0}"
+    m=$(cat "$miss" 2>/dev/null); cid="credential:$h:gone@${m:-0}"; gone=1
   fi
+  # the note names THIS blanking only when nothing rewrote the file after signout wrote it: a session that refreshed
+  # itself back in and was later refused leaves a file newer than the note, and that one is a refused refresh. A file
+  # that is GONE was never blanked, by signout or by a refresh, so no note speaks for it.
+  [ "$gone" = 0 ] && [ "$(stat -c %Y "$HOME/.cc/members/$h/credential-cleared" 2>/dev/null || echo 0)" -ge "$m" ] \
+    && why=$(head -c 300 "$HOME/.cc/members/$h/credential-cleared" 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/ *$//')
+  exec {lk}>&-
   [ "$(cat "$stamp" 2>/dev/null)" = "$cid" ] && return 0
+  if [ "$gone" = 1 ]; then
+    mwhy="its credential file is missing, so nothing signs it in. The owner has been asked to sign it in again."
+    owhy="is missing: the file is gone, not blanked by a refresh. Sign it in again with the login walk:"
+  elif [ -n "$why" ]; then
+    mwhy="it was signed out on purpose${when}: $why. It comes back when the owner signs it in again."
+    owhy="was signed out on purpose${when} (\`cc-sandbox signout\`: $why). Nothing went wrong. When you want it back, sign it in with the login walk:"
+  else
+    mwhy="its credential was cleared${when} by a refused refresh, which usually means another copy of the same login refreshed first. The owner has been asked to sign it in again."
+    owhy="was blanked${when} by a refused refresh, which usually means another copy of the same refresh token refreshed first (a --from mint off another login). Sign it in again with the login walk, not --from:"
+  fi
   # #<h> only when it resolves: post() falls back to #alerts and exits 0 otherwise (cc's member_credential, same wall)
   if grep -q "^#${h}[[:space:]]" <<<"$("$BIN/cc-slack" channels 2>/dev/null)"; then
     "$BIN/cc-slack" post -c "#$h" --major --id "$cid" \
-      "*this workspace is signed out* — its credential was cleared${when} (a refused refresh); the running session stops answering once its token runs out. The owner has been asked to mint it again." >/dev/null 2>&1 \
+      "*this workspace is signed out* — $mwhy The running session stops answering once its token runs out." >/dev/null 2>&1 \
       && { [ -e "$HOME/.cc/members/$h/credential-told" ] || date -u +%FT%TZ > "$HOME/.cc/members/$h/credential-told"; }
   fi          # credential-told is cc's stamp for "#<h> has the bad news": `cc-sandbox mint` posts 'ready' where it stands, and clears it
   "$BIN/cc-notify" -t "$h" --owner --id "$cid:owner" -- \
-    "\`$h\` is signed out under a running session: $own was blanked${when} (a refused refresh). Its sessions run until their token expires, then stand on /login. Mint it again on the box: \`cc-sandbox mint $h\`." >/dev/null 2>&1 \
+    "\`$h\` is signed out under a running session: $own $owhy \`cc-sandbox mint $h\`. Its sessions run until their token expires, then stand on /login." >/dev/null 2>&1 \
     && printf '%s\n' "$cid" > "$stamp"                           # a page nobody got is retried next tick, not stamped
   return 0
 }
@@ -1943,6 +1969,31 @@ $BUSY"; "$T/bin/cc-msg" --sweep
   : > "$T/calls"; blank; touch -m -d '@2000000000' "$CRED"; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
   k "$(t grep -q '^post post -c #mem --major --id credential:mem:blank@2000000000 ' "$T/calls")" "blanked again later is a new event, said again — the id carries the file's own mtime"
   k "$(t grep -q 'cleared at May 18 12:33' "$T/calls")" "…naming when, in the box's own clock, no Z"
+  k "$(t grep -q '^post .*by a refused refresh' "$T/calls")" "…and, with no sign-out note beside the file, calling it a refused refresh"
+  k "$(nt grep -q 'on purpose' "$T/calls")" "…never a deliberate stop"
+  # A DELIBERATE STOP (owner, 2026-10-03): cc-sandbox signout leaves its reason in credential-cleared, and the notice
+  # says so instead of blaming a refused refresh.
+  : > "$T/calls"; blank; touch -m -d '@2000000100' "$CRED"; echo "moving it to its own login" > "$MEM/credential-cleared"; touch -m -d '@2000000100' "$MEM/credential-cleared"
+  CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
+  k "$(t grep -q '^post .*signed out on purpose.*moving it to its own login' "$T/calls")" "a sign-out with a note: #mem is told it was deliberate, and why"
+  k "$(t grep -q '^notify -t mem --owner .*on purpose.*moving it to its own login.*cc-sandbox mint mem' "$T/calls")" "…and the owner's page says so and names the login walk"
+  k "$(nt grep -q 'refused refresh' "$T/calls")" "…and neither calls it a refused refresh"
+  # …but a note OLDER than the file is an earlier blanking's: the session refreshed back in and was refused later
+  : > "$T/calls"; blank; touch -m -d '@2000000200' "$CRED"; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
+  k "$(t grep -q '^post .*by a refused refresh' "$T/calls")" "a blanking after an old sign-out note is a refused refresh"
+  k "$(nt grep -q 'on purpose' "$T/calls")" "…and is not called deliberate"
+  # SIGNOUT PAUSED BETWEEN ITS TWO WRITES (review of #977): the blank is down and its reason not yet, with no note beside
+  # the file. A sweep then must wait on the lock signout holds (cc-sandbox signout), or it says 'refused refresh', stamps
+  # the event, and never reads the reason. The holder below is signout's order exactly: lock, blank, pause, reason.
+  rm -f "$MEM/credential-cleared" "$T/held"; : > "$T/calls"
+  ( exec 9>>"$MEM/credential.lock"; flock 9; blank; touch -m -d '@2000000300' "$CRED"; : > "$T/held"; sleep 1
+    echo "paused mid-signout" > "$MEM/credential-cleared"; touch -m -d '@2000000300' "$MEM/credential-cleared" ) &
+  local hp=$! hi=0; while [ ! -e "$T/held" ] && [ "$hi" -lt 100 ]; do hi=$((hi + 1)); sleep 0.05; done
+  CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep; wait "$hp"
+  k "$(t grep -q '^post .*signed out on purpose.*paused mid-signout' "$T/calls")" "a sweep run while signout is between its blank and its reason waits for both, and says deliberate"
+  k "$(nt grep -q 'refused refresh' "$T/calls")" "…never 'refused refresh'"
+  k "$(t test "$(cat "$MEM/credential-gone" 2>/dev/null)" = "credential:mem:blank@2000000300")" "…and stamps the event only after reading the reason"
+  rm -f "$MEM/credential-cleared" "$T/held"
   # THE FILE GONE, with the start wall's ids ALREADY SPENT — cc's member_credential posts `credential:mem` and pages
   # `credential:mem:owner` for a workspace it told before its first mint, and the stubs above keep cc-slack's ledger,
   # so a replay of either reaches nobody and still exits 0. Under those ids this event is the silence the row was
@@ -1953,6 +2004,9 @@ $BUSY"; "$T/bin/cc-msg" --sweep
   : > "$T/calls"; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
   k "$(t grep -q '^post post -c #mem --major --id credential:mem:gone@[0-9][0-9]* ' "$T/calls")" "a credential file gone from under a running session is said too, under an id the start wall cannot have spent"
   k "$(t grep -q '^notify -t mem --owner --id credential:mem:gone@[0-9][0-9]*:owner .*cc-sandbox mint mem' "$T/calls")" "…and the owner's page gets through: under the start wall's plain id cc-slack's ledger swallows it and nobody is told"
+  k "$(t grep -q '^post .*credential file is missing' "$T/calls")" "…saying the file is missing"
+  k "$(t grep -q '^notify -t mem --owner .*is missing: the file is gone' "$T/calls")" "…to the owner as well"
+  k "$(nt grep -q 'refused refresh' "$T/calls")" "…and not calling a deleted file a refused refresh"
   : > "$T/calls"; CC_FAKE_WIN=mem CC_FAKE_CHANNELS=mem "$T/bin/cc-msg" --sweep
   k "$(nt grep -q -e '^post ' -e '^notify ' "$T/calls")" "…and the next tick is silent: one deletion is one post, however long the file stays gone"
   : > "$T/calls"; blank; CC_FAKE_WIN=mem CC_FAKE_CHANNELS='' "$T/bin/cc-msg" --sweep

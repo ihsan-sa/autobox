@@ -78,10 +78,19 @@
 #     (/exit) no longer takes mint down between the login and the copy: INT, TERM and HUP are caught and what that login
 #     already wrote is installed anyway. Any end that installs nothing NAMES the throwaway home it left and prints the
 #     `--from` line that finishes from it, so nobody logs in twice; the throwaway home is deleted only once the credential
-#     is installed, or when the login produced none. A credential that turns out to be the OWNER'S — his file, his access
-#     or refresh token, or a login signed in as his account — is INSTALLED, and mint SAYS SO in plain words (owner, 2026-09-02: "These are trusted people
+#     is installed, or when the login produced none. A credential that turns out to be the OWNER'S — his access token, or a
+#     login signed in as his account — is INSTALLED, and mint SAYS SO in plain words (owner, 2026-09-02: "These are trusted people
 #     just treat minting my account like any other account"). Inside the boundary a member can print whatever is there, so
 #     that person can use the account anywhere: mint his account only for someone trusted with the account itself.
+#     `--from` REFUSES, exit 2, the box's own ~/.claude/.credentials.json and any file whose refresh token another live
+#     credential holds (the box's login, a ~/.claude-*/ one, another workspace's): two holders of one refresh token race,
+#     and whichever refreshes second is signed out. The refusal names the holder and the login walk; it never prints a token.
+#   cc-sandbox signout <workspace> <why>   SIGNS A WORKSPACE OUT ON PURPOSE: its credentials.json is blanked to the shape
+#     a refused refresh leaves (so nothing launches on it), and <why> goes beside it in credential-cleared. The sweep that
+#     tells #<workspace> and the owner a workspace is signed out reads that file, so the notice says it was a deliberate stop
+#     and why, not "a refused refresh" (owner, 2026-10-03). IT DOES NOT REVOKE THE LOGIN: a running session still holds the
+#     refresh token in memory and can write a live token back at its next refresh, so stop the workspace's sessions too.
+#     `cc-sandbox mint <workspace>`, the login walk, signs it back in and removes the note.
 #   cc-sandbox convert <repo>   ~/dev/<repo>, an ordinary repo already on this box, BECOMES a member workspace: the two
 #     markers, `.cc/` excluded from commits, `git init` and a first commit if it has neither, a board of its own, and the
 #     member instructions in its README (appended if it already has one) — the same workspace cc-slack's join flow makes,
@@ -957,15 +966,14 @@ owners_own(){   # $1 candidate credentials file · $2 the .claude.json that logi
   # whatever sits at ~/.claude/.credentials.json, so his credential in there is a working key to his account. The owner has
   # since decided otherwise, three times and plainly — "These are trusted people just treat minting my account like any other
   # account" — so 0 (true) HERE no longer stops anything; it is what lets mint NAME what is being installed. The detection is
-  # kept whole for that: it is his file, it carries his token, or the login signed in as his account (a fresh token for the
-  # same account is still his). Do not restore the refusal, and do not add a flag or a confirmation he did not ask for.
+  # kept for that: it carries his access token, or the login signed in as his account (a fresh token for the same account is
+  # still his). Do not restore the refusal of his ACCOUNT, and do not add a flag or a confirmation he did not ask for.
+  # His FILE, or a copy carrying his refresh token, never gets this far: shared_refresh refuses it first, because a copy
+  # signs one of the two holders out (2026-10-03). What is left to name here is his account under a token of its own.
   local cand="$1" cj="${2:-}" oc="$H/.claude/.credentials.json" oj="$H/.claude.json" a b
   if [ -e "$oc" ]; then
-    [ "$(readlink -f "$cand")" = "$(readlink -f "$oc")" ] && { echo "that file IS ~/.claude/.credentials.json — the owner's own"; return 0; }
     a=$(jq -r '.claudeAiOauth.accessToken // empty' "$cand" 2>/dev/null); b=$(jq -r '.claudeAiOauth.accessToken // empty' "$oc" 2>/dev/null)
     [ -n "$a" ] && [ "$a" = "$b" ] && { echo "it carries the owner's own access token"; return 0; }
-    a=$(jq -r '.claudeAiOauth.refreshToken // empty' "$cand" 2>/dev/null); b=$(jq -r '.claudeAiOauth.refreshToken // empty' "$oc" 2>/dev/null)
-    [ -n "$a" ] && [ "$a" = "$b" ] && { echo "it carries the owner's own refresh token"; return 0; }
   fi
   if [ -n "$cj" ] && [ -f "$cj" ] && [ -f "$oj" ]; then
     a=$(jq -r '.oauthAccount.accountUuid // empty' "$cj" 2>/dev/null); b=$(jq -r '.oauthAccount.accountUuid // empty' "$oj" 2>/dev/null)
@@ -973,6 +981,26 @@ owners_own(){   # $1 candidate credentials file · $2 the .claude.json that logi
     a=$(jq -r '(.oauthAccount.emailAddress // empty) | ascii_downcase' "$cj" 2>/dev/null); b=$(jq -r '(.oauthAccount.emailAddress // empty) | ascii_downcase' "$oj" 2>/dev/null)
     [ -n "$a" ] && [ "$a" = "$b" ] && { echo "that login signed in as the owner (same email address)"; return 0; }
   fi
+  return 1; }
+shared_refresh(){   # $1 candidate credentials file · $2 the dest it would replace → prints what it IS ("is the box's own
+  # login, …") or WHICH live credential it shares a refresh token with ("holds the same refresh token as …"), a path and
+  # never a token, exit 0; exit 1 when it shares none.
+  # ONE REFRESH TOKEN, TWO HOLDERS, ONE OF THEM SIGNED OUT. The server rotates a refresh token when it is used, and the
+  # refresh lock only serialises sessions within one config dir. So a member file copied from the box's own login races
+  # the box: whichever refreshes second is refused, and claude blanks both tokens in place (two member workspaces,
+  # 2026-10-03, minutes after the box's 09:47 refresh). A login walk makes a token of its own and never trips this.
+  # Compared by equality only: no token is printed, logged or written anywhere by this function.
+  local cand="$1" self="${2:-}" r f
+  [ "$(readlink -f "$cand")" = "$(readlink -f "$H/.claude/.credentials.json")" ] && { echo "is the box's own login, ~/.claude/.credentials.json"; return 0; }
+  r=$(jq -r '.claudeAiOauth.refreshToken // empty' "$cand" 2>/dev/null)
+  for f in "$H/.claude/.credentials.json" "$H"/.claude-*/.credentials.json "$H"/.cc/members/*/credentials.json; do
+    [ -f "$f" ] || continue
+    [ -n "$self" ] && [ "$(readlink -f "$f")" = "$(readlink -f "$self")" ] && continue   # the file this mint replaces is not a second holder
+    [ "$(readlink -f "$f")" = "$(readlink -f "$cand")" ] && { echo "is the live credential ~${f#"$H"}"; return 0; }
+    if [ -n "$r" ] && [ "$(jq -r '.claudeAiOauth.refreshToken // empty' "$f" 2>/dev/null)" = "$r" ]; then
+      [ "$f" = "$H/.claude/.credentials.json" ] && { echo "holds the same refresh token as the box's own login, ~/.claude/.credentials.json"; return 0; }
+      echo "holds the same refresh token as the live credential ~${f#"$H"}"; return 0; fi
+  done
   return 1; }
 cred_usable(){   # $1 a credentials file — THE test of "this credential can authenticate", and the only one.
   # mint asked it with jq and the trap that keeps a scratch asked it with -s, so a truncated or wrong-shaped file was
@@ -1040,6 +1068,13 @@ mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and 
     why=$(cred_why "$src")
     echo "cc-sandbox: that login produced no credential ($src: $why) — nothing was written to $dest." >&2
     return 2; fi   # the EXIT trap deletes the scratch: there is no credential in it to leave anyone
+  # "make cc-sandbox mint --from refuse … when the source is the box's own credential or any file whose refreshToken
+  # equals another live credential's" (brief, 2026-10-03). A login walk's token is new, so only --from is asked.
+  if [ -z "$scratch" ] && why=$(shared_refresh "$src" "$dest"); then
+    echo "cc-sandbox: refused — $src $why, so nothing was written to $dest." >&2
+    echo "  Two copies of one refresh token race: whichever refreshes second is refused and signed out, both tokens blanked." >&2
+    echo "  Give $h a login of its own instead: cc-sandbox mint $h" >&2
+    return 2; fi
   if why=$(owners_own "$src" "$cj"); then
     echo "cc-sandbox: this is the OWNER'S OWN credential — $why. Installing it, because that is what you asked for."
     echo "  Once, so it is never a surprise: $h can print this from inside their workspace and use that account anywhere, not just on this box."; fi
@@ -1063,7 +1098,7 @@ mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and 
   # --major: this line is routine text, and without it post() files it in the #<h>-updates twin, not the channel the
   # member is waiting in.
   [ -e "$H/.cc/members/$h/credential-told" ] && told=1
-  rm -f "$H/.cc/members/$h/credential-told" "$H/.cc/members/$h/credential-asked"
+  rm -f "$H/.cc/members/$h/credential-told" "$H/.cc/members/$h/credential-asked" "$H/.cc/members/$h/credential-cleared"   # signout's note goes with the blanking it explained
   [ "$told" = 1 ] && { "$(dirname "$SELF")/cc-slack" post -c "#$h" --major "\`$h\` is ready — message this channel and it answers." >/dev/null 2>&1 || true; }
   echo "cc-sandbox: minted $h's credential at $dest, mode 600$old — that is the one file the boundary reads, and the only credential inside it."
   echo "  Start the workspace: cc $h"; }
@@ -1114,6 +1149,26 @@ convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, 
   echo "cc-sandbox: ~/dev/$r is a member workspace now. Changed:"
   for x in ${did[@]+"${did[@]}"}; do echo "  - $x"; done
   echo "Next: cc-sandbox mint $r — it starts on nothing else. Its Slack channel pair and members.json record are the daemon's: cc-slack member add <@user>."; }
+signout(){   # $1 workspace · $2 why — a deliberate sign-out, said as one: blank the credential and keep the reason beside it,
+  # so cc-msg's signed-out notice names a stop somebody chose instead of calling it a refused refresh (owner, 2026-10-03).
+  local r="${1:-}" why="${2:-}" m rc
+  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  [ -n "$why" ] || { echo "usage: cc-sandbox signout <workspace> <why> — the why is what #$r and the owner are told" >&2; return 2; }
+  [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — nothing was changed" >&2; return 2; }
+  m="$H/.cc/members/$r"; mkdir -p "$m" || return 2
+  # BOTH WRITES UNDER ONE LOCK, the one cc-msg's sweep reads the pair under (member_signed_out). Without it a sweep between
+  # them saw a blank with no reason, said 'a refused refresh', stamped the event and never read the reason (review of #977).
+  # Inside it, the blank first and the note after: a note left by a blank that failed would call a later refused refresh
+  # deliberate. The blank is written in place, not renamed: a running session's bind holds this file's inode.
+  ( exec 9>>"$m/credential.lock" && flock -w 10 9 || exit 3
+    ( umask 077; jq -n '{claudeAiOauth: {accessToken: "", refreshToken: "", expiresAt: 0}}' > "$m/credentials.json" ) || exit 4
+    printf '%s\n' "$why" > "$m/credential-cleared" || exit 5 ); rc=$?
+  case "$rc" in
+    0) ;;
+    3) echo "cc-sandbox: $m/credential.lock is held (a sweep reading it, or another signout) — nothing was signed out; run it again" >&2; return 2;;
+    4) echo "cc-sandbox: could not blank $m/credentials.json — nothing was signed out" >&2; return 2;;
+    *) echo "cc-sandbox: blanked $m/credentials.json but could not keep the reason beside it" >&2; return 2;; esac
+  echo "cc-sandbox: signed $r out ($why). It does not revoke the login, and a running session can refresh itself back in, so stop the workspace's sessions too. #$r and the owner are told it was deliberate. Sign it back in with the login walk: cc-sandbox mint $r"; }
 own(){   # $1 repo — a member workspace the owner made for HIMSELF is marked as his own, or the refusal says why. The mark
   # is one host-side file, ~/.cc/members/<repo>/owner-workspace: the host decides, and it is written where no session
   # inside can (build_member). It changes ONE thing, the ask baseline (settings_copy); it is not a wider boundary.
@@ -1650,9 +1705,29 @@ EOS
   # trusted people just treat minting my account like any other account". So each case below now asserts the opposite of what
   # it used to: the mint SUCCEEDS, the file really changes from what the case above minted ($d1), and the output says whose
   # credential it is, because the one thing that must never happen is installing his account silently.
+  # …EXCEPT A COPY OF A LIVE ONE (2026-10-03). His account is still his to mint, by a login of its own; what is refused is
+  # the box's FILE, or any file whose refresh token another live credential holds, because two holders of one refresh token
+  # race and the second to refresh is signed out. Each case builds its own source and workspace, and asserts both sides.
+  for x in frank gina; do mkdir -p "$fh/dev/$x"; HOME="$fh" "$SELF" convert "$x" >/dev/null 2>&1; done
   out=$(env HOME="$fh" "$SELF" mint alice --from "$fh/.claude/.credentials.json" 2>&1); rc=$?
-  t 'mint: --from the owner'"'"'s own credential file installs it, and says whose it is' \
-    "$rc/$(grep -c "OWNER'S OWN" <<<"$out")/$([ "$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)" = "$d1" ] && echo unchanged || echo replaced)" "0/1/replaced"
+  t 'mint: --from the box'"'"'s own credential file is REFUSED, says it IS the box'"'"'s login (not a second holder of its token), names the login walk, and leaves the workspace'"'"'s file alone' \
+    "$rc/$(grep -c "is the box's own login" <<<"$out")/$(grep -c 'same refresh token' <<<"$out")/$(grep -cF 'cc-sandbox mint alice' <<<"$out")/$([ "$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)" = "$d1" ] && echo unchanged || echo replaced)" 2/1/0/1/unchanged
+  mkdir -p "$fh/elsewhere/.claude"
+  jq -n '{claudeAiOauth: {accessToken: "frank-access", refreshToken: "frank-refresh", expiresAt: 99999999999999}}' > "$fh/elsewhere/.claude/.credentials.json"
+  out=$(env HOME="$fh" "$SELF" mint frank --from "$fh/elsewhere/.claude/.credentials.json" 2>&1); rc=$?
+  t 'mint: --from a member'"'"'s own fresh login, held by nobody else, installs' \
+    "$rc/$(jq -r '.claudeAiOauth.accessToken' "$fh/.cc/members/frank/credentials.json" 2>/dev/null)" 0/frank-access
+  out=$(env HOME="$fh" "$SELF" mint frank --from "$fh/.cc/members/frank/credentials.json" 2>&1); rc=$?
+  t 'mint: …and --from the very file it replaces is no second holder, so it installs again — through a temp file and a rename, so its own source is never truncated' \
+    "$rc/$(jq -r '.claudeAiOauth.accessToken + "/" + .claudeAiOauth.refreshToken' "$fh/.cc/members/frank/credentials.json" 2>/dev/null)/$(find "$fh/.cc/members/frank" -name '*.tmp.*' | wc -l)" 0/frank-access/frank-refresh/0
+  cp "$fh/.cc/members/frank/credentials.json" "$fh/elsewhere/copy.json"
+  out=$(env HOME="$fh" "$SELF" mint gina --from "$fh/elsewhere/copy.json" 2>&1); rc=$?
+  t 'mint: --from a copy whose refresh token another workspace holds is REFUSED, names that holder, and installs nothing' \
+    "$rc/$(grep -cF 'live credential ~/.cc/members/frank/credentials.json' <<<"$out")/$([ -e "$fh/.cc/members/gina/credentials.json" ] && echo file || echo none)" 2/1/none
+  jq '.claudeAiOauth.accessToken = "box-copy-access"' "$fh/.claude/.credentials.json" > "$fh/elsewhere/boxcopy.json"
+  out=$(env HOME="$fh" "$SELF" mint gina --from "$fh/elsewhere/boxcopy.json" 2>&1); rc=$?
+  t 'mint: …and so is a copy elsewhere carrying the box'"'"'s refresh token, and no token value is printed by any refusal' \
+    "$rc/$(grep -c "same refresh token as the box's own login" <<<"$out")/$([ -e "$fh/.cc/members/gina/credentials.json" ] && echo file || echo none)/$(grep -c 'owner-refresh\|box-copy-access' <<<"$out")" 2/1/none/0
   out=$(env HOME="$fh" CC_CLAUDE="$fh/login" LOGIN_ACCESS=owner-access LOGIN_REFRESH=owner-refresh LOGIN_UUID=owner-uuid LOGIN_EMAIL=owner@example.invalid "$SELF" mint alice 2>&1); rc=$?
   t 'mint: a login that signed in as the owner himself installs, and names the account as his' \
     "$rc/$(grep -c "OWNER'S OWN" <<<"$out")/$(jq -r '.claudeAiOauth.accessToken' "$dest" 2>/dev/null)" "0/1/owner-access"
@@ -1719,7 +1794,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   # neither read nor written by anything here, and the last case hashes it to say so. Every case asserts BOTH sides —
   # what the boundary contains is silent AND what crosses it still asks — because a baseline that only ever says yes
   # is the wholesale switch this was not allowed to be.
-  local fh h dev out probe real0 real1 w ho devo rc
+  local fh h dev out probe real0 real1 w ho devo rc hs lp li sp
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxperm-XXXXXX") || return 1; chmod 700 "$fh"
   real0=$(md5sum "$H/.claude/settings.json" 2>/dev/null | cut -d' ' -f1); real0="${real0:-absent}"
   h="_ccsbxp$$"; dev="$fh/dev/$h"; w="_ccsbxpw$$"
@@ -1788,6 +1863,29 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
     "$(g crosses)/$(g askn)" false,false,false,false/1
   t 'own: …and everything else is the member copy — the allow baseline, his own rules in his order, his hook, read-only' \
     "$(g silent)/$(g his)/$(g ro)" 'true,true,true,true/Bash(hisown *)|Bash(tmux kill-server:*)|Bash(sudo tee *)|ownr-theme|$HOME/bin/cc-guard/ro'
+  # SIGNOUT: a deliberate stop leaves its reason where cc-msg's signed-out notice reads it, and blanks the file
+  hs="ccsbxso$$"; mkdir -p "$fh/dev/$hs/.cc" "$fh/.cc/members/$hs" && : > "$fh/dev/$hs/.cc/member-workspace"
+  cp "$fh/.cc/members/$h/credentials.json" "$fh/.cc/members/$hs/credentials.json"
+  out=$(env HOME="$fh" "$SELF" signout bob "testing" 2>&1); rc=$?
+  t 'signout: a repo that is not a member workspace is refused, and no note is written' \
+    "$rc/$([ -e "$fh/.cc/members/bob/credential-cleared" ] && echo noted || echo none)" 2/none
+  out=$(env HOME="$fh" "$SELF" signout "$hs" 2>&1); rc=$?
+  t 'signout: no reason, no sign-out — the credential is left as it was' \
+    "$rc/$(jq -r '.claudeAiOauth.accessToken | length > 0' "$fh/.cc/members/$hs/credentials.json")" 2/true
+  out=$(env HOME="$fh" "$SELF" signout "$hs" "moving it to its own login" 2>&1); rc=$?
+  t 'signout: the credential is blanked, the reason is kept beside it, and the line names the login walk' \
+    "$rc/$(jq -r '.claudeAiOauth.accessToken + .claudeAiOauth.refreshToken | length' "$fh/.cc/members/$hs/credentials.json")/$(cat "$fh/.cc/members/$hs/credential-cleared")/$(grep -c "cc-sandbox mint $hs" <<<"$out")" \
+    "0/0/moving it to its own login/1"
+  # …and both writes happen under the lock cc-msg's sweep reads them under: while it is held, signout writes neither
+  cp "$fh/.cc/members/$h/credentials.json" "$fh/.cc/members/$hs/credentials.json"; rm -f "$fh/.cc/members/$hs/credential-cleared" "$fh/held"
+  ( exec 9>>"$fh/.cc/members/$hs/credential.lock"; flock 9; : > "$fh/held"; sleep 2 ) &
+  lp=$!; li=0; while [ ! -e "$fh/held" ] && [ "$li" -lt 100 ]; do li=$((li + 1)); sleep 0.05; done
+  env HOME="$fh" "$SELF" signout "$hs" "held by a sweep" >/dev/null 2>&1 & sp=$!; sleep 1
+  out="$(jq -r '.claudeAiOauth.accessToken | length > 0' "$fh/.cc/members/$hs/credentials.json")/$([ -e "$fh/.cc/members/$hs/credential-cleared" ] && echo noted || echo none)"
+  wait "$sp"; rc=$?; wait "$lp"
+  t 'signout: while the sweep'"'"'s lock is held it writes neither the blank nor the reason, then both once it is free' \
+    "$out/$rc/$(jq -r '.claudeAiOauth.accessToken | length' "$fh/.cc/members/$hs/credentials.json")/$(cat "$fh/.cc/members/$hs/credential-cleared")" \
+    "true/none/0/0/held by a sweep"
   # ── NOTHING INSIDE PROMOTES ITSELF. The marker's directory is under no bind, so from a MEMBER session a mkdir and a
   #    write at its path land on the tmpfs HOME and the host's ~/.cc/members/<h> is as it was; from the OWNER'S session
   #    an rm at the same path reaches nothing either. Both are read on the HOST after the session, and each is followed
@@ -2508,6 +2606,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
        launch_vet "$@";;   # no CC_WORKER_SANDBOX door below: this profile is bwrap or nothing
   convert) shift; convert "${1:-}"; exit $?;;
   own) shift; own "${1:-}"; exit $?;;
+  signout) shift; signout "${1:-}" "${2:-}"; exit $?;;
   web) shift; web "${1:-}"; exit $?;;
   github) shift; github "${1:-}" "${2:-}"; exit $?;;
   member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ] && [ "${1:-}" != --tree ]; then tr="${1:-}"; shift; fi   # <handle> [<track>|""] [--tree <dir>] [--] cmd
