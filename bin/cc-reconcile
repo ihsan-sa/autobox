@@ -81,8 +81,9 @@ Anything uncertain is reported, never removed. Log: ~/.cc/state/janitor.log. Rep
 WAKE (in the tick, CC_WAKE=on only; unset, each repo logs a skip): for each repo whose board is not all `session` rows, that is not a throwaway repo
 (`cc-throwaway`: no pass of the tick reads its board, boards()), that `cc-pause` has not parked and that
 has no ~/.cc/state/<repo>/pulse.off (cc-handoff's overlap mark; a person may touch it too), the seat is woken when a queued row could start now (`cc-brief ready`, the one network call, skipped under --no-net)
-or a row is `blocked`, and that same state was not already sent inside 24 h — one look string per half, so a queued
-row's verdict changing does not re-announce a row that has been blocked all along
+or a row is `blocked`, and the wake would carry a row the last one inside 24 h did not — the look is one line per stopped
+row and per row `cc-brief ready` names as startable, so a new queued row that cannot start, or a set that only shrank,
+wakes nobody
 (a queued row inside a live bundle — cc-bundle's `bundle: <row>` mark, the bundle row live — is in flight and never offered)
 (~/.cc/state/<repo>/pulse.look). `cc-tier allows pulse` / `start` gate it. Waking is `cc <repo>` when tmux
 session main has no live `<repo>` window, else one `cc-msg` line — never while the pane shows a turn in progress
@@ -800,24 +801,43 @@ ORPHAN_WHY = "a worktree with no board entry"   # orphans()'s one finding, and t
 FALSE_NAG = "notification/false-action-needed"   # the catalogue kind: "a wake or a nag names something a person or a seat must do"
 
 
-def land_windows(repo, pr):
-    """[(start, end)] epochs during which cc-land had <repo>#<pr> in hand, from its queue log — `queued` opens a
-    window, the next `done` closes it, one still open runs to now. The log is kept after the job file and the work
-    record are gone (cc-land: queue.log is KEPT after the job file is drained), which is why it is the source here
-    and not landing(): by the pass that finds a nag cleared, the landing that cleared it has taken its files."""
-    out, start, tag = [], None, f" {repo}#{pr} "
+LAND_OPENS = ("queued", "requeued", "again")             # queue.log words that put a PR in cc-land's hands
+LAND_ENDS = ("done", "handed", "dropped")                # …and that take it out: finished, handed back, closed
+
+
+def land_events(repo, pr):
+    """[(epoch, opened)] off cc-land's queue log for <repo>#<pr>: True where a landing took it up, False where one
+    ended. The lander since #771 writes no `done` line for most landings: it ends one with `stage <pr> handback`,
+    `query`, `done` or `merged`, and takes it up again with any other stage word. Read as one open window, every nag
+    after its first `queued` looked answered (32 of the 51 window records by 10-02)."""
+    out, tag = [], f"{repo}#{pr}"
     try:
         for ln in open(f"{HOME}/.cc/state/land/queue.log"):
-            if tag not in ln + " ":
-                continue
             ts, _, ev = ln.rstrip("\n").partition("\t")
-            word = ev.split(" ", 1)[0]
-            if word == "queued" and start is None:
-                start = epoch(ts)
-            elif word == "done" and start is not None:
-                out.append((start, epoch(ts))); start = None
+            w = ev.split(" ")
+            if tag not in w:                       # the repo#pr token exactly, wherever the line ends
+                continue
+            if w[0] == "stage" and len(w) > 2 and w[1] == f"{repo}#{pr}":
+                out.append((epoch(ts), w[2] not in LAND_IDLE + ("merged",)))
+            elif len(w) > 1 and w[1] == f"{repo}#{pr}" and w[0] in LAND_OPENS + LAND_ENDS:
+                out.append((epoch(ts), w[0] in LAND_OPENS))
     except OSError:
-        return out
+        pass
+    return out
+
+
+def land_windows(repo, pr):
+    """[(start, end)] epochs during which cc-land had <repo>#<pr> in hand, from its queue log (land_events) — a
+    window opens where a landing takes it up and closes where one ends; one still open runs to now. The log is kept
+    after the job file and the work record are gone (cc-land: queue.log is KEPT after the job file is drained), which
+    is why it is the source here and not landing(): by the pass that finds a nag cleared, the landing that cleared it
+    has taken its files."""
+    out, start = [], None
+    for t, opened in land_events(repo, pr):
+        if opened and start is None:
+            start = t
+        elif not opened and start is not None:
+            out.append((start, t)); start = None
     if start is not None:
         out.append((start, now()))
     return out
@@ -874,7 +894,9 @@ def false_nags(gone, prs, net=True):
     when it nagged, and only those are written:
       · `offered <repo>/<track> <pr>` and `alerted <repo>/<track>` — "review and land it", to the session or the
         owner. Disproved when a landing already had the PR: cc-land's queue log shows a `queued`..`done` window
-        around the nag (land_windows), its work record's `first` predates the nag, or the PR had merged before it.
+        around the nag (land_windows), its work record's `first` predates the nag — touched inside BETWEEN_ROUNDS
+        of it, with no landing ended in between, so a PR cc-land had already failed is not read as handled — or the
+        PR had merged before it.
       · `<repo>/<track>: a worktree with no board entry` — disproved when a PR from that branch was already open at
         the nag: created before it and not merged more than BETWEEN_ROUNDS before it, the same forgiveness orphans()
         itself gives, or a landing window around it.
@@ -901,11 +923,16 @@ def false_nags(gone, prs, net=True):
                 if any(a <= at <= b for a, b in land_windows(repo, n)):
                     why = "cc-land's queue log shows a landing of it in flight across that minute"
                 else:
+                    # The work record's `first` only while that landing was live at the nag: touched inside
+                    # BETWEEN_ROUNDS of it, and no landing ended between `first` and the nag. Unbounded, 39 of its 40
+                    # records by 10-02 were nags sent after cc-land had failed the PR (`done rc=1`): right, not false.
                     try:
-                        first = epoch(json.load(open(f"{HOME}/.cc/state/land/root/{repo}-{n}.json")).get("first"))
+                        rec = json.load(open(f"{HOME}/.cc/state/land/root/{repo}-{n}.json"))
+                        first, touched = epoch(rec.get("first")), epoch(rec.get("at") or rec.get("first"))
                     except Exception:
-                        first = 0.0
-                    if first and first <= at:
+                        first = touched = 0.0
+                    if first and first <= at and touched >= at - BETWEEN_ROUNDS \
+                            and not any(first <= t <= at and not opened for t, opened in land_events(repo, n)):
                         why = f"cc-land's work record says it had the PR since {when(first)}"
                     else:
                         t = pr_times(repo, url, net)
@@ -1698,7 +1725,7 @@ def wake_repo(repo, rows, snap, net, on):
     due = sorted(k for k, (w, a, h) in words.items() if w in BOARD_DUE and not a and not h and not bundled(k))
     due = [k for k in due if tier_allows("start", f"{repo}/{k}")]
     stopped = [k for k in due if words[k][0] == "blocked"]
-    start, could = "none", ""
+    start, could, free = "none", "", []
     if due and net:                                     # the one network call: cc-brief's room arithmetic
         lim = sh(sib("cc-limit"), "status", timeout=30)
         if lim is not None and lim.returncode == 0 and "(this run only)" not in (lim.stdout or ""):
@@ -1708,22 +1735,26 @@ def wake_repo(repo, rows, snap, net, on):
             if out is None or out.returncode != 0:
                 start, could = "unread", "cc-brief ready could not say which rows could start"
             else:
-                head = ((out.stdout or "").strip().splitlines() or [""])[0]
-                could = head.split(": ", 1)[1] if ": " in head else ""
+                lines = (out.stdout or "").strip().splitlines() or [""]
+                could = lines[0].split(": ", 1)[1] if ": " in lines[0] else ""
                 start = "free" if "could start now" in could else "withheld" if could else "none"
+                # the rows themselves: "  one builder for <files>: a, b" and "  a builder each: a, b"
+                free = sorted({k.strip() for ln in lines[1:] if ln.startswith("  ") and "builder" in ln and ": " in ln
+                               for k in ln.rsplit(": ", 1)[1].split(",") if k.strip()})
     if not stopped and start not in ("free", "withheld", "unread"):
         return pulse_log(repo, "skip", "nothing a seat can act on")
-    # ONE LOOK PER HALF OF THE NOTE, not one per repo. The note below has two halves — which rows have STOPPED, and
-    # what `cc-brief ready` said about the QUEUED ones — and each is in the look only when it is in the note. Keyed
-    # together, a queued row's verdict flipping tick to tick changed the key and made a long-blocked row read as newly
-    # stopped: four wakes of the same seat in three hours for a row that changed nothing (2026-09-20). A wake now needs
-    # a half that actually moved; set_look writes both, so a wake for either half re-dates both.
-    look = "\n".join(x for x in (f"stopped={','.join(stopped)}" if stopped else "",
-                                 f"start={start} due={','.join(f'{k} {words[k][0]}' for k in due)}" if could else "") if x)
+    # ONE LINE PER ROW, and a wake only for a line the last wake did not carry. The look is each stopped row and each
+    # row `cc-brief ready` says could start (its verdict line when it names none). Keyed on the whole due list, every
+    # new queued row re-sent the same stopped set: the seat was woken every ~20 min to reply nothing (09-27, 10-02).
+    # A row leaving the set is not news either, so a set that shrank, or flickered back, wakes nobody.
+    look = "\n".join([f"stopped {k}" for k in stopped]
+                      + ([f"start {k}" for k in free] or ([f"start {start}: {could}"] if start != "none" else [])))
     seen, when = last_look(repo)
-    if when and now() - when < QUIET_H * 3600 and all(ln in seen.splitlines() for ln in look.splitlines()):
+    new = [ln for ln in look.splitlines() if ln not in seen.splitlines()]
+    if when and now() - when < QUIET_H * 3600 and not new:
         return pulse_log(repo, "skip", f"woken {int((now() - when) // 60)}m ago for this same state")
-    note = " · ".join(x for x in (f"{len(stopped)} row(s) stopped ({', '.join(stopped[:3])})" if stopped else "",
+    shown = [k for k in stopped if f"stopped {k}" in new] + [k for k in stopped if f"stopped {k}" not in new]
+    note = " · ".join(x for x in (f"{len(stopped)} row(s) stopped ({', '.join(shown[:3])})" if stopped else "",
                                   could + (f" (cc-brief ready {repo})" if start != "none" else "")) if x)
     h = sh(sib("cc-handoff"), "--status", repo, timeout=60)     # 0 = a handoff is open, 1 = none, else unknown
     # Only until the cutover: from then `<repo>` is the successor's name and it is live, and a drain of up to ten
@@ -1751,7 +1782,7 @@ def wake_repo(repo, rows, snap, net, on):
     lim = sh(sib("cc-limit"), "record", w[0], repo, timeout=30)
     if lim is not None and lim.returncode in (0, 2):
         return pulse_log(repo, "skip", "the usage limit stopped it — a line now would only meet the same limit")
-    p = sh(sib("cc-msg"), repo, f"wake: {repo} — {note}. Work the board; nothing to act on, reply nothing.", timeout=60)
+    p = sh(sib("cc-msg"), repo, f"wake: {repo} — {note}. Work the board; if none of it is yours to act on, reply nothing.", timeout=60)
     if p is None or p.returncode != 0:
         return pulse_log(repo, "report", "wake failed")
     set_look(repo, look)
@@ -3990,7 +4021,8 @@ def selfcheck():
     # (b) the tick wakes an idle seat once for a startable row, not again for the same state, never for a channel repo
     tb = tempfile.mkdtemp(prefix="cc-reconcile-wake-")
     try:
-        scratch(tb, dict(NOOP, **{"cc-brief": 'echo "$2: 1 of 1 queued rows could start now: q1"',
+        scratch(tb, dict(NOOP, **{"cc-brief": 'r=$2; shift 2; IFS=,; echo "$r: $# of $# queued rows could start now"; '
+                                              'echo "  a builder each: $*"',
                                   "cc": f'echo "start $1" >> {tb}/cc.log', "cc-msg": f'echo "msg $1" >> {tb}/cc.log'}))
         os.makedirs(f"{tb}/dev/wr"); os.makedirs(f"{tb}/dev/chan")
         json.dump({"repo": "wr", "tracks": {"q1": {"status": "queued", "updated": old}}}, open(f"{tb}/.cc/boards/wr.json", "w"))
@@ -4025,12 +4057,14 @@ def selfcheck():
         ok("…and a paused project is not woken however startable its rows are", woke() == ["start wr", "start wr"]
            and "paused" in open(f"{tb}/.cc/state/pulse.log").read())
         os.remove(f"{tb}/.cc/state/wr/paused"); open(f"{tb}/.cc/state/wr/pulse.off", "w").close()
+        json.dump({"repo": "wr", "tracks": {"q1": {"status": "queued", "updated": old},
+                                            "q3": {"status": "blocked", "updated": old}}}, open(f"{tb}/.cc/boards/wr.json", "w"))
         quietly(tick, {}, True)
         ok("…nor one whose pulse.off is set (cc-handoff's overlap mark): a new state, still no wake",
            woke() == ["start wr", "start wr"] and "pulse.off" in open(f"{tb}/.cc/state/pulse.log").read())
         os.remove(f"{tb}/.cc/state/wr/pulse.off")
         quietly(tick, {}, True)
-        ok("…and with the mark gone the same state wakes it", woke() == ["start wr", "start wr", "start wr"])
+        ok("…and with the mark gone that new state wakes it", woke() == ["start wr", "start wr", "start wr"])
         json.dump({"repo": "wr", "tracks": {"q2": {"status": "queued", "updated": old, "bundle": "bundle-x-0000"},
                                             "bundle-x-0000": {"status": "running", "updated": old}}}, open(f"{tb}/.cc/boards/wr.json", "w"))
         quietly(tick, {}, True)
@@ -4105,7 +4139,7 @@ def selfcheck():
         def woke():
             return open(f"{tc}/cc.log").read().splitlines() if os.path.exists(f"{tc}/cc.log") else []
         rows(b1="blocked", q1="queued")
-        open(f"{tc}/ready", "w").write("wr: 1 of 1 queued rows could start now: q1\n")
+        open(f"{tc}/ready", "w").write("wr: 1 of 1 queued rows could start now\n  a builder each: q1\n")
         quietly(tick, {}, True)
         ok("WAKE, ONE LOOK PER HALF: a blocked row beside a startable queued one wakes the seat", woke() == ["start wr"])
         open(f"{tc}/ready", "w").write("")              # cc-brief ready prints nothing when no queued row is free
@@ -4118,8 +4152,71 @@ def selfcheck():
         rows(b1="blocked", q1="running", b2="blocked")
         quietly(tick, {}, True)
         ok("…while a second row stopping IS a new state, and wakes the seat once more", woke() == ["start wr"] * 2)
+        rows(b1="blocked", q1="running", b2="blocked", q5="queued", q6="queued")
+        quietly(tick, {}, True)                         # 09-27: the due list grew by a row each tick, nothing could start
+        ok("…an UNCHANGED stopped set beside new queued rows that cannot start is not a wake (09-27: four in an hour)",
+           woke() == ["start wr"] * 2 and "for this same state" in open(f"{tc}/.cc/state/pulse.log").read().splitlines()[-1])
+        rows(b2="blocked", q5="queued", q6="queued")
+        quietly(tick, {}, True)
+        rows(b1="blocked", b2="blocked", q5="queued", q6="queued")
+        quietly(tick, {}, True)
+        ok("…nor is the set shrinking, or flickering back to the set the seat was last woken for", woke() == ["start wr"] * 2)
+        open(f"{tc}/ready", "w").write("wr: 1 of 2 queued rows could start now — 1 group shares a file\n"
+                                       "  one builder for a.txt, b.txt: q5\n")
+        quietly(tick, {}, True)
+        ok("…while a queued row cc-brief now names as startable IS news, and wakes it", woke() == ["start wr"] * 3)
+        quietly(tick, {}, True)
+        ok("…once", woke() == ["start wr"] * 3)
     finally:
         restore(); shutil.rmtree(tc, ignore_errors=True)
+    # (b5) A FALSE NAG IS ONE A LANDING WAS LIVE AT. Each PR stands on its own work record and queue-log lines: 39 of
+    # the 40 work-record records by 10-02 were nags sent after cc-land had already failed the PR, and 32 of the 51
+    # window records sat in a window the lander since #771 never closes with a `done` line.
+    tn = tempfile.mkdtemp(prefix="cc-reconcile-falsenag-")
+    _home, _rf = HOME, record_failure
+    try:
+        os.makedirs(f"{tn}/.cc/state/land/root")
+        got, nag = [], now() - 3600
+
+        def iso(t):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+        def nagged(n, first=None, touched=None, log=()):
+            if first:
+                json.dump({"repo": "fr", "pr": n, "first": iso(first), "at": iso(touched or first)},
+                          open(f"{tn}/.cc/state/land/root/fr-{n}.json", "w"))
+            with open(f"{tn}/.cc/state/land/queue.log", "a") as f:
+                f.writelines(f"{iso(t)}\t{ev.replace('PR', f'fr#{n}')}\n" for t, ev in log)
+            del got[:]
+            false_nags({f"offered fr/t{n} https://example.invalid/pr/{n}": nag}, {}, net=False)
+            return [o for o in got if f"PR #{n} " in o]
+        globals().update(HOME=tn, record_failure=lambda scope, kind, observed, ts, **k: got.append(observed))
+        live = nagged(1, first=nag - 600, touched=nag - 300)
+        ok("FALSE NAGS: a work record from a landing live at the nag — first before it, touched minutes before it — "
+           "makes the nag false: one record", len(live) == 1 and "work record says it had the PR" in live[0])
+        ok("…while a STALE touch, last written more than BETWEEN_ROUNDS before the nag, is history: nothing written",
+           nagged(2, first=nag - 3 * 3600, touched=nag - BETWEEN_ROUNDS - 60) == [])
+        ok("…and a landing that ended in a TERMINAL failure before the nag (`done rc=1`) leaves the nag right: nothing "
+           "written, however fresh the record's touch",
+           nagged(3, first=nag - 7200, touched=nag - 600,
+                  log=[(nag - 7200, "queued PR who=-"), (nag - 900, "done PR rc=1 [fr] PR #3: NOT merged")]) == [])
+        ok("…nor does the new lander's own end of one (`stage PR handback`, no `done` line) leave its window open to now",
+           nagged(4, first=nag - 7200, touched=nag - 600,
+                  log=[(nag - 7200, "queued PR who=-"), (nag - 5400, "stage PR gate gate=x ok=no"),
+                       (nag - 5400, "stage PR handback")]) == [])
+        back = nagged(5, log=[(nag - 7200, "queued PR who=-"), (nag - 5400, "stage PR handback"),
+                              (nag - 600, "stage PR lane")])
+        ok("…while a PR the lander took up again after a handback IS in its hands at the nag: one record, from the window",
+           len(back) == 1 and "queue log shows a landing" in back[0])
+        for i, w in enumerate(LAND_ENDS):               # a terminal word that ends the line: no trailing metadata
+            ok(f"…and a bare `{w} PR` with nothing after the PR token closes its window too: a later nag is right",
+               nagged(10 + i, first=nag - 7200, touched=nag - 600,
+                      log=[(nag - 7200, "queued PR who=-"), (nag - 1800, f"{w} PR")]) == [])
+        ok("…the reviewer's input — `queued fr#7 who=-` then `handed fr#7`, the nag ten minutes after — is not a landing",
+           nagged(7, first=nag - 1200, touched=nag - 600,
+                  log=[(nag - 1200, "queued PR who=-"), (nag - 600, "handed PR")]) == [])
+    finally:
+        globals().update(HOME=_home, record_failure=_rf); shutil.rmtree(tn, ignore_errors=True)
     # (b4) the daily line's hour and date are LA's, whatever zone the host is in
     tz = tempfile.mkdtemp(prefix="cc-reconcile-digest-at-")
     try:

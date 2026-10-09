@@ -184,6 +184,27 @@ def run_selfcheck():
            held_in(["202"], PS) is True and held_in(["203"], PS) is True)
         clear("r1/w1")
         wins.pop("r1/w1", None); wins.pop("r1/w1" + NEXT, None)    # this case's fixture windows, not the suite's
+        # TWO TRIGGERS IN THE SAME WINDOW (2026-10-02, an orch seat: cc-model's "is back" and "planning was
+        # parked" paths 4 s apart): both callers are inside start() at once, the seat's id lookup slowed so each has
+        # passed the "no record" check before either could write — and still ONE successor window comes up, and the
+        # record's id is the one that window was started with. Its own target, so nothing above or below is moved.
+        import threading
+        wins["rc"] = "@77"
+        _sid = seat_sid
+        globals()["seat_sid"] = lambda wid: time.sleep(0.3) or ""
+        n0, got = len(tcalls), []
+        both = [threading.Thread(target=lambda: got.append(start("rc"))) for _ in range(2)]
+        [t.start() for t in both]
+        [t.join() for t in both]
+        globals()["seat_sid"] = _sid
+        made = [a for a in tcalls[n0:] if a[0] == "new-window" and "rc" + NEXT in a]
+        rc_rec = read("rc")
+        ok("two overlap starts for one seat in the same window: exactly one succeeds and ONE successor window comes "
+           "up — the other is refused on the first's record", sorted(got) == [0, 1] and len(made) == 1)
+        ok("…and the record's id is the id that window was started with, so its CC_HANDOFF matches the open record",
+           rc_rec and f" {rc_rec['id']} " in made[0][-1] and rc_rec["successor"]["session_id"] in made[0][-1])
+        clear("rc")
+        wins.pop("rc", None); wins.pop("rc" + NEXT, None)
         ov = os.environ.get("CC_HANDOFF_OVERLAP")
         os.environ["CC_HANDOFF_OVERLAP"] = "0"           # unread: the overlap is the only handoff, no switch gates it
         ok("an overlap starts on a live window — and no config switch gates it (CC_HANDOFF_OVERLAP is unread)",
@@ -648,7 +669,8 @@ def run_selfcheck():
             fcntl.flock = _fl
         ok("...holding cc-msg's own .inbox.lock, taken before a byte is written and released after the ~next dir "
            "is gone — outside it the drain's mv wins and the moved prompt is deleted with the dir it came from",
-           held[:1] == [(os.path.join(STATE, "r14", ".inbox.lock"), fcntl.LOCK_EX, False)]
+           [h for h in held if h[0].endswith(".inbox.lock")][:1]   # (start()'s own .start.lock comes first)
+           == [(os.path.join(STATE, "r14", ".inbox.lock"), fcntl.LOCK_EX, False)]
            and open(os.path.join(STATE, "r14", "inbox.spool")).read() == '{"text":"opening prompt"}\n'
            and not os.path.exists(os.path.join(STATE, "r14~next")))
 
