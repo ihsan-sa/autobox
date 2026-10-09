@@ -17,8 +17,10 @@ let go). Every wait takes a ticket, a flocked file in `<state>/slots/queue/` nam
 oldest live ticket may take a slot; it drops the ticket once it holds what it wants. So a waiter is served before
 anyone who came later, the lane included, and an alone run at the head of the queue gets each slot as its holder
 lets go instead of losing it to the next check. Nobody gets more slots than slots_now() allows; the order changes,
-not the count. A ticket whose holder died is unlocked, and the next waiter removes it, as it does anything in the
-queue that is not a regular file. A name _ticket would not have given is ignored, never waited on and never said,
+not the count. LANES FIRST (planning seat, 2026-10-06: a lane sat 6h45m behind workers' green runs): a landing
+lane's ticket is named `+` then 19 digits instead of 20, so it sorts before every worker's and waits only behind
+an older lane's; a worker's wait is unchanged otherwise. A ticket whose holder died is unlocked, and the next
+waiter removes it, as it does anything in the queue that is not a regular file. A name _ticket would not have given is ignored, never waited on and never said,
 so a planted `!hold` that sorts first holds nobody up. A ticket it cannot open or lock for want of a file
 descriptor, memory or a lock still counts as live: only a bad entry is removed. A waiter behind another holds no slot,
 or an older ticket that needs it would wait forever. A ticket still locked after TICKET_CAP seconds
@@ -144,14 +146,15 @@ def slots_now(root: str = PSI_DIR, k: int | None = None, loadavg: str | None = N
     return 1 if mem_loaded(root) else min(k, 2)
 
 
-TICKET = re.compile(r"[0-9]{20}-[0-9]+-[0-9a-f]{8}")   # _ticket's names: time_ns-pid-rand
+TICKET = re.compile(r"[0-9+][0-9]{19}-[0-9]+-[0-9a-f]{8}")   # _ticket's names: time_ns-pid-rand, a lane's `+`-led
 BAD = (errno.ELOOP, errno.ENXIO, errno.EACCES, errno.EPERM)   # a symlink, a socket, an unreadable file: not a ticket
 
 
-def _ticket(qdir: str):
+def _ticket(qdir: str, lane: bool = False):
     """Join the queue: a file named by when the wait began, flocked for as long as this process waits. It is locked
-    before it is given its listed name, so nobody sees it unlocked and takes it for a dead one."""
-    name = f"{time.time_ns():020d}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    before it is given its listed name, so nobody sees it unlocked and takes it for a dead one. A lane's name starts
+    `+` (LANES FIRST), which sorts before a digit and still reads as the same number."""
+    name = f"{'+' if lane else '0'}{time.time_ns():019d}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     tmp = os.path.join(qdir, f".new-{name}")
     f = open(tmp, "a")
     fcntl.flock(f, fcntl.LOCK_EX)
@@ -251,10 +254,10 @@ def _whose(name: str) -> str:
 
 @contextlib.contextmanager
 def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | None = None, psi_root: str = PSI_DIR,
-         k: int | None = None, loadavg: str | None = None, who: str = "", say=None):
+         k: int | None = None, loadavg: str | None = None, who: str = "", say=None, lane: bool = False):
     """Hold one slot (or all of them, alone=True) for the with-block; yields the slot numbers held. Waits its turn
     in the queue (FAIR WAIT), polling, until one admits; deadline (seconds) raises TimeoutError instead of waiting
-    on. say(line) is told while it waits; stderr by default."""
+    on. say(line) is told while it waits; stderr by default. lane=True: a landing lane's wait (LANES FIRST)."""
     d = os.path.join(state, "slots")
     q = os.path.join(d, "queue")
     os.makedirs(q, exist_ok=True)
@@ -263,7 +266,7 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
     t0, said, since = time.monotonic(), None, time.strftime("%H:%MZ", time.gmtime())
     held: list = []
     told: set = set()
-    mine, tf = _ticket(q)
+    mine, tf = _ticket(q, lane)
     try:
         while True:
             want = range(1, total + 1) if alone else range(1, slots_now(psi_root, total, loadavg) + 1)

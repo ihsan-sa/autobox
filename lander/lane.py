@@ -38,6 +38,8 @@ that is not heavy — a plan of more than LANDER_SMALL_CHECKS (default 5) checks
 So a small PR waits for at most one check when the box allows one slot, and for none when a slot is free. NO PR
 WAITS MORE THAN A DAY (idea panel, 2026-10-04: #746 sat ~20 h re-queued, unplanned and unexplained): a job queued
 LANDER_WAIT_CAP seconds ago or more (default 86400) takes its turn before every younger one, small or heavy.
+PUT FIRST: a job `queue --first` stamped (jobs.first) goes before all of these, overdue, heavy or not, oldest stamp
+first; place() says who put it there. An older job sharing its files still goes first (OVERLAP below).
 OVERLAP FROM THE START: a queued job whose files meet those of a job already planned, checking or mergeable, or of an
 older job parked itself, is not planned yet (`waits for PR #N`, said once; its first park stamps parked_since and
 logs `stage <repo>#<pr> parked on=<n>`, once): it is planned from main once that one has merged or left, so two
@@ -489,8 +491,10 @@ class Lane:
                     return ""
                 self.reap(POLL)   # the timeout lets a new request in while every check still runs
                 continue
-            # a job in the lane WAIT_CAP or longer first, then the oldest small job, else the oldest heavy one
-            job = min(todo, key=lambda j: (not self.overdue(j, "queued_at"), self.heavy(j)))
+            # one put first (queue --first), then a job in the lane WAIT_CAP or longer, then the oldest small job,
+            # else the oldest heavy one
+            job = min(todo, key=lambda j: (not J.first(j.repo, j.pr), not self.overdue(j, "queued_at"),
+                                           self.heavy(j)))
             tried.add(job.key)
             self.tried_nb[job.key] = job.extra.get("not_before")
             why = self.box_hold(job)
@@ -647,13 +651,12 @@ class Lane:
         planned anyway, and the Δ re-plan at mergeable reruns what a real overlap reaches."""
         if self.overdue(job, "parked_since"):
             return None
-        mine, older = set(job.files), True
-        for j in J.lane_jobs(self.repo):
+        mine, since = set(job.files), J.arrival(job)
+        for j in J.lane_jobs(self.repo):   # "older" by arrival, not lane order: a job put first still waits (PUT FIRST)
             if j.key == job.key:
-                older = False
                 continue
             if mine & set(j.files) and (j.state in ACTIVE
-                                        or (older and j.state == T.QUEUED and j.extra.get("parked"))):
+                                        or (J.arrival(j) < since and j.state == T.QUEUED and j.extra.get("parked"))):
                 return j
         return None
 
@@ -954,7 +957,7 @@ class Lane:
                 fut = self.pool.submit(self.call, "runner", "run_plan", self.root, m, job.plan, job.files, tree,
                                        base_tree, member=self.member, store=store, job_key=job.key,
                                        scope=self.member or self.repo, pr=job.pr, quarantine_text=quarantine,
-                                       only=[n], fallback=self.fallback, cancel=stop,
+                                       only=[n], fallback=self.fallback, cancel=stop, lane=True,
                                        **({} if laptop else kw), **({"express": True} if express else {}))
                 self.inflight[(job.key, n)] = Flight(fut, job.pr, n, job.head, job.base_sha, tree, laptop, stop,
                                                      express)
@@ -1295,16 +1298,24 @@ def spawn_tick(repo):
 
 
 def place(repo, pr):
-    ahead = [j for j in J.lane_jobs(repo) if j.pr != int(pr) and j.state not in J.RESTING]
-    return f"PR #{pr} waits behind {len(ahead)} job(s) in the {repo} lane" if ahead else ""
+    """Where PR `pr` stands in its lane, and who put it first if someone did; '' when nothing is ahead of it."""
+    jobs = [j for j in J.lane_jobs(repo) if j.state not in J.RESTING]
+    put, keys = J.first(repo, pr), [j.pr for j in jobs]
+    mine = E.epoch_of(put.get("at", ""))
+    # not drained yet: behind every job, or, put first, behind those put first before it
+    ahead = (jobs[:keys.index(int(pr))] if int(pr) in keys
+             else [j for j in jobs if not put or 0 < E.epoch_of(J.first(repo, j.pr).get("at", "")) < mine])
+    by = f"PR #{pr} was put first by {put['by']}; " if put else ""
+    return (f"{by}it waits behind {len(ahead)} job(s) in the {repo} lane" if ahead
+            else f"{by}nothing is ahead of it" if put else "")
 
 
 def cmd_queue(argv):
     if argv and argv[0] == "--task":
         return queue_task(argv[1:])
     pos, opts = split_opts(argv, "--chat", "--ts", "--who", "--approved-by")
-    start = "--no-start" not in pos
-    pos = [a for a in pos if a != "--no-start"]
+    start, put_first = "--no-start" not in pos, "--first" in pos
+    pos = [a for a in pos if a not in ("--no-start", "--first")]
     if len(pos) > 2:
         return refuse(f"queue: unexpected '{pos[2]}'")
     repo, pr = (pos + ["", ""])[:2]
@@ -1349,11 +1360,15 @@ def cmd_queue(argv):
     try:
         if approved_head:
             J.approve(repo, pr, approved_by, approved_head)
+        if put_first:   # a planning seat's or the owner's call: cc-guard refuses every lander command to a worker
+            J.put_first(repo, pr, who or os.environ.get("CC_SLACK_ALIAS") or os.environ.get("USER") or "-")
         J.submit(repo, pr, chat=chat, ts=ts, who=who)
     except OSError as e:
         return refuse(f"cannot write the request: {e} — nothing merged", 1)
     if fresh:   # a PR with a job already gets `again` or `requeued` from drain; a second `queued` restarts `times`
         E.log("queued", repo, pr, who=who or "-", chat=chat or "-")
+    if put_first:
+        E.log("first", repo, pr, who=J.first(repo, pr).get("by") or "-")
     print(f"[{repo}] PR #{pr} queued — its checks run first, then the merge, then the deploy")
     if paused(handle or repo):
         print(f"lander: {handle or repo} is paused — nothing lands until `cc-pause off {handle or repo}`, "
@@ -1429,7 +1444,8 @@ def cmd_lane(argv):
 
 
 COMMANDS = {
-    "queue": (cmd_queue, "put a PR on its repo's lane: <repo|h--t> <pr> [--chat --ts --who --approved-by --no-start]"
+    "queue": (cmd_queue, "put a PR on its repo's lane: <repo|h--t> <pr> [--chat --ts --who --approved-by --no-start"
+                         " --first (to the front of the lane; a planning seat or the owner)]"
                          " | --task <repo> <row>"),
     "lane": (cmd_lane, "run one repo's lane in the foreground: <repo>"),
 }

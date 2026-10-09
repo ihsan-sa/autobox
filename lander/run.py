@@ -397,11 +397,12 @@ def laptop_argv(check, tree, cwd):
 
 def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = ".", cwd: str = "",
         label: str = "lander.0", changed: list | None = None, alone: bool = False, base_tree: str = "",
-        state: str | None = None, express: bool = False) -> T.Result:
+        state: str | None = None, express: bool = False, lane: bool = False) -> T.Result:
     """Runner.run. Runs `check` on `tree_sha` (read from repo_root's git) at `where`, holding an admission slot
     (every slot, alone=True; none for an express run that is not alone: the lane's EXPRESS bounds those). Stores
     nothing: the lane stores what it wants (records.Store). cwd: the check's manifest prefix. changed: the change's
-    files, handed in as CC_LAND_CHANGED. base_tree: the other side, for the built-in manifest-widen."""
+    files, handed in as CC_LAND_CHANGED. base_tree: the other side, for the built-in manifest-widen. lane: a landing
+    lane's run, whose slot ticket goes before a worker's (admission)."""
     t0 = time.monotonic()
 
     def res(st, why, **kw):
@@ -437,7 +438,7 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         # the laptop's work is the laptop's: it takes no slot of the box's; nor does an express run (lane EXPRESS)
         free = kind == "laptop" or (express and not alone)
         held = contextlib.nullcontext() if free else A.slot(state or REC.state_dir(), alone=alone,
-                                                            who=f"{check.name}@{tree_sha[:8]}")
+                                                            who=f"{check.name}@{tree_sha[:8]}", lane=lane)
         with held:
             loaded = A.loaded()
             if kind == "box":   # wrapped once the slot is held, so the priority answers for the load it starts under
@@ -614,23 +615,26 @@ def laptop_gone(outs: dict) -> bool:
 def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree: str, base_tree: str = "", *,
              member: str = "", store=None, job_key: str = "", scope: str = "", pr: int | None = None,
              quarantine_text: str = "", runner=None, only=None, record_reds: bool = True,
-             fallback: str = "", box_only: bool = False, cancel=None, express: bool = False) -> dict:
+             fallback: str = "", box_only: bool = False, cancel=None, express: bool = False,
+             lane: bool = False) -> dict:
     """Every check in plan.checks through judge(), one after another; -> {name: Outcome}. The lane calls it with
     its store; `lander check` with none (a worker's own red is its work, and is not recorded). fallback: the host
     manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks. cancel: a
     threading.Event the lane sets to stop the plan; every execute() on this thread polls it. express: the lane's
-    EXPRESS (a Δ rerun's check), whose runs take no admission slot; a diagnostic rerun alone still takes them all."""
+    EXPRESS (a Δ rerun's check), whose runs take no admission slot; a diagnostic rerun alone still takes them all.
+    lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`)."""
     _STOP.event = cancel
     try:
         return _run_plan(repo_root, m, plan, files, head_tree, base_tree, member=member, store=store,
                          job_key=job_key, scope=scope, pr=pr, quarantine_text=quarantine_text, runner=runner,
-                         only=only, record_reds=record_reds, fallback=fallback, box_only=box_only, express=express)
+                         only=only, record_reds=record_reds, fallback=fallback, box_only=box_only, express=express,
+                         lane=lane)
     finally:
         _STOP.event = None
 
 
 def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store, job_key, scope, pr,
-              quarantine_text, runner, only, record_reds, fallback, box_only, express):
+              quarantine_text, runner, only, record_reds, fallback, box_only, express, lane):
     rows = REC.quarantine_rows(quarantine_text)
     record = (lambda r, text: REC.record_red(scope, r, text, pr)) if (record_reds and scope) else None
     base_m = M.load(repo_root, base_tree, fallback=fallback, strict=False) if base_tree else None
@@ -653,7 +657,7 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
                           on_base=name == M.BUILTIN or runs_on_base(repo_root, base_tree, base_m, name),
                           repo_root=repo_root, cwd=m.cwd.get(name, ""), changed=files,
                           label=".".join(job_key.rsplit("-", 1)) if job_key else "lander.0",
-                          **({"express": True} if express else {}))
+                          **({"express": True} if express else {}), **({"lane": True} if lane else {}))
         gone = gone or laptop_gone({name: out[name]})
     return out
 

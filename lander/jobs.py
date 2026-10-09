@@ -41,6 +41,11 @@ verdict comes only from the lane's own review or from PR markers the box's login
   approvals <LANDQ>/approvals/<repo>-<pr>.json {approved_by, approved_head, at} — approve()/approval().
   carry     <LANDQ>/carry/<repo>-<pr>.json {reads_used} — a handed-back job's spent reads, written by the tick
             when a push re-queues it and taken by drain, so the reads cap still holds across the handback.
+  first     <LANDQ>/first/<repo>-<pr>.json {by, at} — `lander queue --first` put the PR at the front of its lane
+            (put_first/first). Never a request field, for the same reason as an approval. lane_jobs lists a job
+            with one before every other, oldest `at` first. It is good for one landing: the job's move to a resting
+            state (merged, closed, handed back, a query) and its removal take it away (drop_first), so a PR closed
+            unmerged and queued again later waits its turn unless someone puts it first again.
 """
 from __future__ import annotations
 
@@ -260,6 +265,7 @@ def remove(job: T.Job) -> None:
     for p in (job_path(job.repo, job.pr), rest_path(job.repo, job.pr)):
         with contextlib.suppress(FileNotFoundError):
             os.unlink(p)
+    drop_first(job.repo, job.pr)
 
 
 def move(job: T.Job, state: str, why: str = "", **kv) -> T.Job:
@@ -273,6 +279,8 @@ def move(job: T.Job, state: str, why: str = "", **kv) -> T.Job:
     job.history.append(entry)
     job.state = state
     save(job)
+    if state in RESTING:   # a put-first is good for one landing (jobs.first)
+        drop_first(job.repo, job.pr)
     E.stage(job.repo, job.pr, state, **kv)
     return job
 
@@ -487,14 +495,46 @@ def job_files() -> list:
     return [p for p in glob.glob(f"{landq()}/*.json") if re.fullmatch(r".+-\d+\.json", os.path.basename(p))]
 
 
+def first_path(repo: str, pr) -> str:
+    return f"{landq()}/first/{safe(repo)}-{int(pr)}.json"
+
+
+def put_first(repo: str, pr, by: str) -> None:
+    """Put (repo, pr) at the front of its lane. Only `lander queue --first` calls this; cc-guard keeps that from
+    workers, as it does every other lane-moving command."""
+    os.makedirs(os.path.dirname(first_path(repo, pr)), exist_ok=True)
+    write_atomic(first_path(repo, pr), {"by": by, "at": E.stamp()})
+
+
+def drop_first(repo: str, pr) -> None:
+    """Take (repo, pr)'s put-first record away: its job came to rest or was removed."""
+    with contextlib.suppress(OSError):
+        os.unlink(first_path(repo, pr))
+
+
+def first(repo: str, pr) -> dict:
+    """{by, at} when (repo, pr) was put first, else {}."""
+    r = read_json(first_path(repo, pr))
+    ok = isinstance(r, dict) and isinstance(r.get("by"), str) and E.epoch_of(r.get("at") or "")
+    return {"by": r["by"], "at": r["at"]} if ok else {}
+
+
+def arrival(job: T.Job) -> tuple:
+    """The job's place in arrival order, put-first aside: oldest queued_at first, an unstamped one after every
+    stamped one, a tie by path. lane.overlapping() reads "older" from it, so putting a job first never lets it pass
+    an older job that shares its files."""
+    at = E.epoch_of(job.extra.get("queued_at", ""))
+    return (0, at, job_path(job.repo, job.pr)) if at else (1, 0, job_path(job.repo, job.pr))
+
+
 def lane_jobs(repo: str) -> list:
-    """`repo`'s jobs, oldest queued_at first (an unstamped one after every stamped one, then by path)."""
+    """`repo`'s jobs: those put first (oldest stamp first), then in arrival order."""
     got = []
     for p in job_files():
         j = load_path(p)
         if j is not None and j.repo == repo and os.path.basename(p) == f"{j.key}.json":
-            at = E.epoch_of(j.extra.get("queued_at", ""))
-            got.append(((0, at, p) if at else (1, 0, p), j))
+            put = E.epoch_of(first(repo, j.pr).get("at", ""))
+            got.append(((0, put, p) if put else (1,) + arrival(j), j))
     return [j for _, j in sorted(got, key=lambda x: x[0])]
 
 

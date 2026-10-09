@@ -258,6 +258,19 @@ class HostAndRunners(Env):
             r = self.run_(chk(klass=T.HOST))
             self.assertEqual((r.status, calls), (T.PASSED, [True, False]))
 
+    def test_a_lanes_express_run_takes_no_slot_and_its_other_runs_wait_as_a_lane(self):
+        # lane=True only moves the run's ticket ahead of a worker's: an express run still takes no slot at all
+        calls, real = [], A.slot
+
+        def slot(state, alone=False, lane=False, **kw):
+            calls.append((alone, lane))
+            return real(state, alone=alone, lane=lane, **kw)
+        with mock.patch.object(A, "slot", slot):
+            r = self.run_(chk(klass=T.HOST), express=True, lane=True)
+            self.assertEqual((r.status, calls), (T.PASSED, []))
+            r = self.run_(chk(klass=T.HOST), lane=True)
+            self.assertEqual((r.status, calls), (T.PASSED, [(False, True)]))
+
     def test_a_runner_the_check_does_not_list_is_refused(self):
         r = self.run_(chk(run="true", where=["box"]), where="laptop")
         self.assertEqual(r.status, T.UNRUNNABLE)
@@ -708,6 +721,40 @@ class Admission(unittest.TestCase):
                 pass
         self.assertTrue(os.path.exists(live.name))   # kept, and it goes first
         self.assertIn("1 waiting ahead of it, the oldest pid 4242, 2 min", said[0])
+
+    def lanes_first_queue(self, name):
+        """A slots dir whose queue holds one live (locked) ticket, `name`."""
+        st = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(st))
+        q = os.path.join(st, "slots", "queue")
+        os.makedirs(q)
+        f = open(os.path.join(q, name), "a")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        self.addCleanup(f.close)
+        return st
+
+    def test_a_lanes_wait_goes_before_an_older_workers(self):
+        import time
+        st = self.lanes_first_queue(f"{time.time_ns() - 120 * 10**9:020d}-4242-0000beef")   # a worker, 2 min in
+        with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=lambda _: None, lane=True) as held:
+            self.assertEqual(held, [1])
+        said = []   # and a worker's wait still goes behind it
+        with self.assertRaises(TimeoutError):
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=0.2, say=said.append):
+                pass
+        self.assertIn("1 waiting ahead of it, the oldest pid 4242, 2 min", said[0])
+
+    def test_a_workers_wait_goes_behind_a_newer_lanes(self):
+        import time
+        st = self.lanes_first_queue(f"+{time.time_ns() + 60 * 10**9:019d}-4343-0000cafe")   # a lane, newer than us
+        said = []
+        with self.assertRaises(TimeoutError):
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=0.2, say=said.append):
+                pass
+        self.assertIn("1 waiting ahead of it, the oldest pid 4343", said[0])
+        # between two lanes the older goes first, as before
+        with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=lambda _: None, lane=True) as held:
+            self.assertEqual(held, [1])
 
     def test_a_stopped_waiter_is_passed_after_the_cap_and_said(self):
         st = tempfile.mkdtemp()
@@ -1177,6 +1224,17 @@ class Judge(unittest.TestCase):
             outs = RUN.run_plan(".", m, T.Plan(checks=["a", "b"]), ["README.md"], self.H, "", runner=run)
         self.assertEqual(seen, ["laptop", "box", "box"])
         self.assertEqual([outs[n].status for n in ("a", "b")], [T.PASSED, T.PASSED])
+
+    def test_run_plan_hands_lane_to_the_runner_only_when_asked(self):
+        m = M.Manifest(checks={"a": chk(name="a", klass=T.STATIC, where=["box"])}, cwd={"a": ""})
+        seen = []
+
+        def run(check, tree, where, alone=False, **kw):
+            seen.append(kw.get("lane"))
+            return T.Result(check=check.name, tree=tree, status=T.PASSED)
+        RUN.run_plan(".", m, T.Plan(checks=["a"]), ["README.md"], self.H, "", runner=run, lane=True)
+        RUN.run_plan(".", m, T.Plan(checks=["a"]), ["README.md"], self.H, "", runner=run)
+        self.assertEqual(seen, [True, None])
 
     def test_member_and_laptop_routing(self):
         c = chk(klass=T.STATIC, where=["box", "laptop"])

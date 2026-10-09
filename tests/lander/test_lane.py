@@ -186,10 +186,12 @@ class Planner:
 class Runner:
     def __init__(self, status=None, hook=None, missing=()):
         self.status, self.hook, self.calls, self.missing = dict(status or {}), hook, [], set(missing)
+        self.plan_kw = []   # (only, express, lane) of each run_plan call
 
     def run_plan(self, root, m, plan, files, head_tree, base_tree="", *, member="", only=None, **kw):
         """lander.run.run_plan's shape: {name: Outcome}; a name in `missing` is one the manifest lacks."""
         from lander import run as RUN
+        self.plan_kw.append((tuple(only or ()), kw.get("express", False), kw.get("lane", False)))
         out = {}
         for n in plan.checks:
             if only and n not in only:
@@ -423,6 +425,53 @@ class Intake(Fixture):
         d = J.read_json(J.job_path("demo", 1))
         self.assertEqual((d["state"], d["stage"], d["chat"], d["who"]), ("queued", "queued", "C1", "w"))
         self.assertEqual(J.requests("demo"), [])
+
+    def test_queue_first_puts_a_queued_pr_at_the_front_and_says_who(self):
+        for n in (1, 2, 3):
+            self.pr(n, {f"docs/r{n}.md": "new\n"})
+            self.assertEqual(self.queue("demo", str(n), "--no-start")[0], 0)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        self.assertEqual([j.pr for j in J.lane_jobs("demo")], [1, 2, 3])   # no stamp: queued order
+        self.assertEqual(L.place("demo", 3), "it waits behind 2 job(s) in the demo lane")
+        rc, out, err = self.queue("demo", "3", "--no-start", "--first", "--who", "seat-x")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([j.pr for j in J.lane_jobs("demo")], [3, 1, 2])
+        self.assertEqual(J.first("demo", 3)["by"], "seat-x")
+        self.assertEqual(J.first("demo", 1), {})
+        self.assertIn("\tfirst demo#3 who=seat-x", self.log())
+        self.assertEqual(L.place("demo", 3), "PR #3 was put first by seat-x; nothing is ahead of it")
+        self.assertIn("put first by seat-x; nothing is ahead", out)
+
+    def test_two_prs_put_first_go_oldest_stamp_first(self):
+        for n in (1, 2, 3):
+            self.pr(n, {f"docs/r{n}.md": "new\n"})
+            J.submit("demo", n)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        os.makedirs(os.path.dirname(J.first_path("demo", 2)))
+        J.write_atomic(J.first_path("demo", 2), {"by": "owner", "at": E.stamp(time.time() + 60)})
+        J.write_atomic(J.first_path("demo", 3), {"by": "seat", "at": E.stamp(time.time())})
+        J.write_atomic(J.first_path("demo", 1), {"by": 7, "at": "not a stamp"})   # not a record: not first
+        self.assertEqual([j.pr for j in J.lane_jobs("demo")], [3, 2, 1])
+        self.assertEqual(L.place("demo", 2), "PR #2 was put first by owner; it waits behind 1 job(s) in the demo lane")
+
+    def test_place_of_a_pr_put_first_before_its_request_is_drained(self):
+        for n in (1, 2, 3):
+            self.pr(n, {f"docs/r{n}.md": "new\n"})
+            J.submit("demo", n)
+        self.pr(4, {"docs/r4.md": "new\n"})
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        os.makedirs(os.path.dirname(J.first_path("demo", 2)))
+        J.write_atomic(J.first_path("demo", 2), {"by": "owner", "at": E.stamp(time.time() - 60)})   # before #4
+        J.write_atomic(J.first_path("demo", 3), {"by": "owner", "at": E.stamp(time.time() + 60)})   # after it
+        J.write_atomic(J.first_path("demo", 1), {"by": "x", "at": "~"})   # not a stamp: not put first
+        self.assertEqual(L.place("demo", 4), "it waits behind 3 job(s) in the demo lane")   # not put first: behind all
+        rc, out, err = self.queue("demo", "4", "--no-start", "--first", "--who", "seat-x")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(J.requests("demo")), 1)   # not drained yet
+        self.assertIn("PR #4 was put first by seat-x; it waits behind 1 job(s) in the demo lane", out)
 
     def test_a_second_queue_of_a_live_job_writes_no_queued_line(self):
         self.pr(1, {"docs/r.md": "new\n"})
@@ -2148,6 +2197,39 @@ class SmallFirst(Fixture):
         self.assertEqual([c[0] for c in u["runner"].calls], ["a", "a", "b", "c", "a"])
         self.assertEqual((self.job(1).state, self.job(2).state), (T.DEPLOY_PENDING, T.DEPLOY_PENDING))
 
+    def test_a_heavy_pr_put_first_goes_before_a_small_one(self):
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})   # three checks: heavy, but put first
+        self.pr(2, {"docs/r.md": "n\n", "a/x2": "n\n"})           # one check: small
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        J.put_first("demo", 1, "seat")
+        with mock.patch.object(L, "SMALL_CHECKS", 1), one_slot():
+            u, _ = self.land()
+        self.assertEqual(self.merged_order(), [1, 2])
+        self.assertEqual([c[0] for c in u["runner"].calls][:3], ["a", "b", "c"])   # #1's suite before #2's check
+
+    def test_a_put_first_is_good_for_one_landing(self):
+        # merged or closed, the record goes: a PR closed unmerged and queued again later waits its turn
+        self.pr(3, {"a/x": "n\n"}, state="CLOSED", headRefOid="e" * 40)
+        self.pr(2, {"b/y": "n\n"})
+        self.pr(1, {"c/z": "n\n"})
+        for n in (3, 2):
+            J.submit("demo", n)
+            J.put_first("demo", n, "seat")
+        self.land()
+        self.assertEqual((self.job(3).state, self.job(2).state), (T.DONE, T.DEPLOY_PENDING))
+        self.assertEqual((J.first("demo", 3), J.first("demo", 2)), ({}, {}))
+        self.assertFalse(os.path.exists(J.first_path("demo", 3)))
+        self.set_box(prs={**self.box()["prs"], "3": {**self.box()["prs"]["3"], "state": "OPEN"}})
+        J.submit("demo", 1)
+        J.submit("demo", 3)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        self.assertEqual([j.pr for j in J.lane_jobs("demo") if j.state == T.QUEUED], [1, 3])
+        J.put_first("demo", 1, "seat")   # and a removed job's record goes with it
+        J.remove(self.job(1))
+        self.assertFalse(os.path.exists(J.first_path("demo", 1)))
+
     def test_with_no_heavy_plan_the_queue_keeps_its_order(self):
         self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
         self.pr(2, {"docs/r.md": "n\n", "a/x2": "n\n"})
@@ -2581,15 +2663,17 @@ class Express(Fixture):
     MANIFEST = "".join(f'[[check]]\nname = "{n}"\nrun = "{n}/run.sh"\npaths = ["{n}/**"]\nclass = "static"\n\n'
                        for n in "abc")
 
-    def race(self, wait=20, pr2=None):
+    def race(self, wait=20, pr2=None, first=False):
         """#2's `b` and #1's `a` start side by side; #1's holds its slot (a Gate) until #2 merges. At #2's first CI
         look the box narrows to one slot and main moves under b/, so #2 must run `b` again. pr2: more files #2
-        changes. -> the runner"""
+        changes. first: #2 is put first (queue --first). -> the runner"""
         self.push("main", {"tests/LANDING.toml": self.MANIFEST})
         self.pr(1, {"a/x": "n\n"})
         self.pr(2, {"b/y": "n\n", **(pr2 or {})})
         J.submit("demo", 2)
         J.submit("demo", 1)
+        if first:
+            J.put_first("demo", 2, "seat")
         runner = Gate(lambda: (self.job(1).extra or {}).get("tree"), wait=wait)
         narrow, real_ci, real_merge = [], L.Lane.ci_green, GH.merge
 
@@ -2618,6 +2702,14 @@ class Express(Fixture):
         self.assertFalse(runner.timed_out, "#2's rerun of b waited for #1's slot")
         self.assertEqual(self.merged_order(), [2, 1])
         self.assertEqual(self.job(2).extra["express"]["checks"], ["b"])
+
+    def test_a_rerun_of_a_pr_put_first_still_goes_express(self):
+        runner = self.race(first=True)
+        self.assertFalse(runner.timed_out, "#2's rerun of b waited for #1's slot")
+        self.assertEqual(self.merged_order(), [2, 1])
+        self.assertEqual(self.job(2).extra["express"]["checks"], ["b"])
+        self.assertIn((("b",), True, True), runner.plan_kw)   # the rerun: express, and the lane's
+        self.assertEqual(J.first("demo", 2), {})              # merged: the record is gone
 
     def test_a_full_suite_rerun_still_waits_for_a_slot(self):
         with mock.patch.object(L, "FULL_CHECKS", ("b",)):
@@ -2772,6 +2864,45 @@ class Starving(Fixture):
             u, _ = self.land(planner=planner)
         self.assertEqual(self.merged_order(), [2, 1, 3])
         self.assertEqual([c[0] for c in u["runner"].calls][:2], ["a", "b"])
+
+    def test_a_pr_put_first_goes_before_one_past_the_cap(self):
+        planner = Planner(owners={"a": "a/", "b": "b/", "c": "c/"})
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})   # heavy, a day in the lane
+        self.pr(2, {"c/z": "n\n"})                 # small, young, put first
+        for n in (1, 2):
+            J.submit("demo", n)
+        self.seed(L.WAIT_CAP + 60, "queued_at", 1)
+        J.put_first("demo", 2, "seat")
+        with mock.patch.object(L, "SMALL_CHECKS", 1), one_slot():
+            u, _ = self.land(planner=planner)
+        self.assertEqual(self.merged_order(), [2, 1])
+        self.assertEqual([c[0] for c in u["runner"].calls][0], "c")
+
+    def test_a_pr_put_first_still_waits_for_an_older_parked_one_that_shares_its_files(self):
+        # #2 parks on #1 (a/x); #3 is put first and shares b/y with #2: it waits for #2, not past it
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"a/x": "n\n", "b/y": "n\n"})
+        self.pr(3, {"b/y": "n\n"})
+        for n in (1, 2):
+            J.submit("demo", n)
+
+        def parked(n, or_moved=False):
+            j = self.job(n)
+            return j is not None and bool(j.extra.get("parked_since") or (or_moved and j.state != T.QUEUED))
+
+        def hook(name, n):   # #1's check runs until #2 has parked and #3, put first meanwhile, has had its turn
+            if n != 1:
+                return
+            end = time.time() + 10
+            while not parked(2) and time.time() < end:
+                time.sleep(0.02)
+            J.submit("demo", 3)
+            J.put_first("demo", 3, "seat")
+            while not parked(3, or_moved=True) and time.time() < end:
+                time.sleep(0.02)
+        _, lines = self.land(runner=Runner(hook=hook))
+        self.assertIn("[demo] PR #3 waits for PR #2: both change b/y", lines)
+        self.assertEqual(self.merged_order(), [1, 2, 3])
 
     def test_the_first_park_writes_one_queue_log_line(self):
         self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})   # three checks: several wakes while #2 waits
