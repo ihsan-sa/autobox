@@ -18,6 +18,7 @@ import base64
 import email
 import email.message
 import email.policy
+import fcntl
 import io
 import json
 import os
@@ -1984,6 +1985,88 @@ def run():
               "…and from the owner, a From line with no forward marker above it, a lookalike domain, a digest "
               "forwarded inside somebody else's forward, and a digest with a file are all read and held%s"
               % ("" if all(held) else " — failed: %r" % held))
+
+            # (f) A SHAPE THE OWNER LET THROUGH IS NOT HELD AGAIN (owner, 2026-10-06: "it should be flexible and
+            # learn"). Its own STATE, and no digest list, so only learned() can pass a mail here. Every read
+            # answers `misplaced`, the word that held his forwards: clean proves the read never ran.
+            shutil.rmtree(vetting.STATE, ignore_errors=True)
+            grade = fwd.replace("Piazza Team <no-reply@piazza.com>", "Crowdmark <no-reply@crowdmark.com>")
+            msg, v = vetted("misplaced", OWNER, body=grade)
+            dec = router.route(msg, d, "box.example")
+            first_held = not v.clean and v.reason == "misplaced"
+            taught = vetting.learn(msg, dec, known, "released")       # what cc-slack calls on his `deliver it`
+            _, v = vetted("misplaced", OWNER, body=grade)
+            k(first_held and taught and v.clean and v.reason == "learned" and v.known and not asked_with
+              and v.why == vetting.KNOWN + ", and the owner has let a mail of this shape through before",
+              "the owner's forward, held as misplaced and released by him, passes next time with no read")
+            _, v = vetted("misplaced", OWNER, body=fwd)
+            k(not v.clean and v.reason == "misplaced" and len(asked_with) == 1,
+              "…while a forward from another domain to the same channel is a different shape, read and held")
+            _, v = vetted("misplaced", OWNER, body=grade, attach=pdf)
+            k(not v.clean and v.reason == "misplaced",
+              "…and the learned shape with a file attached is read as before")
+            gone = vetting.forget("crowdmark.com")
+            _, v = vetted("misplaced", OWNER, body=grade)
+            k(len(gone) == 1 and not v.clean and v.reason == "misplaced",
+              "…and `forget` undoes it: the same mail is read and held again")
+            # A forget that runs while the daemon's learn is between its read and its write stays done. The load
+            # is swapped for one that, inside learn, reads the file, checks that the lock is held, and starts the
+            # owner's forget on a thread: with the lock the forget waits for the learn and removes A after it;
+            # without it the stale copy learn wrote put A back (review of PR #1040).
+            vetting.learn(msg, dec, known, "released")                  # shape A, the crowdmark forward
+            key_a = vetting.shape(msg, dec)
+            msg_b, _ = vetted("misplaced", OWNER, body=fwd)
+            dec_b = router.route(msg_b, d, "box.example")
+            key_b = vetting.shape(msg_b, dec_b)
+            real_shapes, lock_seen, undone, racer = vetting._shapes, [], [], []
+
+            def racing_load():
+                vetting._shapes = real_shapes
+                stale = real_shapes()
+                with open(os.path.join(vetting.STATE, "shapes.lock"), "a") as lf:
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                        lock_seen.append("free")
+                    except BlockingIOError:
+                        lock_seen.append("held")
+                racer.append(threading.Thread(target=lambda: undone.extend(vetting.forget("crowdmark.com"))))
+                racer[0].start()
+                return stale
+            vetting._shapes = racing_load
+            try:
+                taught_b = vetting.learn(msg_b, dec_b, known, "released")
+            finally:
+                vetting._shapes = real_shapes
+            for t in racer:
+                t.join(30)
+            after = vetting._shapes()
+            k(taught_b and lock_seen == ["held"] and undone == [key_a] and set(after) == {key_b}
+              and not any(t.is_alive() for t in racer),
+              "…and a forget that runs while a learn is between its read and its write is not undone by it%s"
+              % ("" if set(after) == {key_b} else " — left %r, lock %r" % (sorted(after), lock_seen)))
+            with open(os.path.join(vetting.STATE, "shapes.json"), "w") as f:
+                json.dump({key_a: "released", key_b: None}, f)
+            try:
+                junk_learned = vetting.learned(msg, dec, known)
+                taught_b = vetting.learn(msg_b, dec_b, known, "released")
+                err = ""
+            except Exception as e:      # noqa: BLE001 - the failure this case is about is an AttributeError
+                junk_learned, taught_b, err = None, False, repr(e)
+            after = vetting._shapes()
+            k(not err and junk_learned is False and taught_b and set(after) == {key_b}
+              and isinstance(after[key_b], dict),
+              "a shapes.json entry whose value is not a dict is dropped: it passes nothing and learn still works%s"
+              % (" — " + err if err else ""))
+            shutil.rmtree(vetting.STATE, ignore_errors=True)
+            msg, v = vetted("misplaced", ALLOWED, body=grade)
+            taught = vetting.learn(msg, router.route(msg, d, "box.example"), known, "released")
+            _, v = vetted("misplaced", ALLOWED, body=grade)
+            msg, _ = vetted("misplaced", STRANGER, body=grade)
+            taught_stranger = vetting.learn(msg, router.route(msg, d, "box.example"), known, "released")
+            k(not taught and not taught_stranger and not v.clean and v.reason == "misplaced"
+              and not os.path.exists(os.path.join(vetting.STATE, "shapes.json")),
+              "a member's released mail, and a stranger's, teach nothing: the member's next one is read and held")
         finally:
             vetting._ask = real_ask
             os.environ.pop("CC_MAIL_ROUTE_FAKE", None)

@@ -48,6 +48,20 @@ sender typed, so it is trusted only as far as the sender is: a stranger's forwar
 line with no forward marker above it all take the read as before. It changes the verdict and nothing else —
 the mail is still delivered as mail, never with the owner's authority, and costs no read of the budget.
 
+A SHAPE THE OWNER HAS LET THROUGH IS NOT HELD AGAIN (owner, 2026-10-06: "too much stuff gets stopped by the
+email vetter… it should be flexible and learn"). A mail's shape is three things: its sender, the domain of the
+address its first forwarded block is from ("" for a mail that is not a forward), and the channel it is going
+to — shape(). learn() records one in STATE/shapes.json when the owner says `deliver it` to a held mail, or when
+a mail the read called `fits` is delivered, and learned() then passes the next mail of that shape as `learned`
+with no read and no charge to the day. Both ends are the OWNER'S OWN only — owners_own(): a sender on the list
+whom the router placed in the owner's workspace and not by the unplaced-mail rule, the digest pass's test. So
+a member's mail, a stranger's and an unplaced address's teach nothing, and a member saying `deliver it` to
+their own held mail teaches nothing either (cc-slack calls learn() only on the owner's word). A mail with an
+attachment is never passed this way: the file is read in the sandbox as before. UNDOING ONE: `python3
+core/mail/vetting.py shapes` lists what was learned, and `python3 core/mail/vetting.py forget <text>` removes
+every shape whose key contains <text> (a channel name, a domain or a sender); deleting shapes.json forgets all
+of them. Nothing else reads the file, so a forgotten shape is simply read again next time.
+
 WHAT A STRANGER IS WEIGHED AGAINST. What this sender has asked for before (the subjects of their earlier mail to THIS
 workspace that was delivered, out of ~/.cc/mail/conv) and what the workspace it is going to is for (the
 target's goals, board and journal, under ~/.cc/state and ~/.cc/boards). A mail from a stranger to a workspace
@@ -93,12 +107,14 @@ thread shows, since "nobody has read this" on its own told nobody that cc-slackd
 is the tests' door: `<text read>|<security read>`, each an entry of REASONS, and an empty one is a model that is
 not there.
 """
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 
 H = os.path.expanduser("~")
 MAILDIR = os.environ.get("CC_MAIL_DIR") or os.path.join(H, ".cc", "mail")
@@ -161,6 +177,7 @@ REASONS = {
     "phish":       ("refused", "it is dressed up as somebody else's mail"),
     "junk":        ("refused", "it is bulk mail, not a message to this box"),
     "digest":      ("clean", "the mail is a course digest forwarded from the owner's own address"),   # ours: digest()
+    "learned":     ("clean", "the owner has let a mail of this shape through before"),   # ours: learned()
 }
 TEXT_REASONS = ["fits", "off-goals", "instruction", "unlike", "scam", "phish", "junk"]
 SEC_REASONS = ["fits", "link", "attachment", "scam", "phish"]
@@ -203,7 +220,7 @@ class Verdict:
         self.known = bool(known)
         if self.known:
             self.why = KNOWN + (", but " + self.why if not self.clean
-                                else ", and " + (self.why if self.reason == "digest" else "the mail fits where it is going"))
+                                else ", and " + (self.why if self.reason in ("digest", "learned") else "the mail fits where it is going"))
         self.cost = cost
 
     @property
@@ -289,6 +306,99 @@ def digest(msg, dec, cfg):
     a = forwarded_from(_router().body_text(msg))
     dom = a.partition("@")[2]
     return bool(a) and (a in want or any(dom == w or dom.endswith("." + w) for w in want if "@" not in w))
+
+
+# ---------------------------------------------------------------- a shape the owner let through
+
+SHAPES_MAX = 500        # learned shapes kept; the oldest go first
+
+
+def owners_own(msg, dec, cfg):
+    """A mail from one of the owner's own addresses: on the list, and placed in the owner's workspace by a rule
+    other than the unplaced-mail one — the router gives `owner` only to his own addresses (see digest())."""
+    return (trusted(msg.get("from"), cfg) and dec.workspace == "owner"
+            and (dec.rule or "") != _router().UNMAPPED)
+
+
+def shape(msg, dec):
+    """`sender|forwarded-from domain|channel`, or "" when the mail is going to no channel."""
+    target = (dec.to or dec.cc or [None])[0]
+    if not target:
+        return ""
+    fwd = forwarded_from(_router().body_text(msg)).partition("@")[2]
+    return "%s|%s|%s" % ((msg.get("from") or "").strip().lower(), fwd, target.name)
+
+
+def _shapes():
+    try:
+        with open(os.path.join(STATE, "shapes.json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    # A value that is not a dict is a hand-edited or damaged entry: dropped, so learn's oldest-first sort and the
+    # `shapes` listing never call .get on a string, and such a key is not a shape the owner let through.
+    return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+
+
+@contextmanager
+def _shapes_locked():
+    """One writer at a time over shapes.json, across threads and processes (router._locked's idiom). learn()
+    runs in the daemon and forget() from the command line, and each is a read-modify-write: without this a learn
+    that had read the file before a forget finished wrote its stale copy back and restored the shape the owner
+    had just undone. The lock is a file of its own, because the rename in _save_shapes replaces shapes.json."""
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, "shapes.lock"), "a") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _save_shapes(d):
+    path = os.path.join(STATE, "shapes.json")
+    os.makedirs(STATE, exist_ok=True)
+    tmp = path + ".%d.tmp" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(d, f, sort_keys=True, indent=1)
+    os.replace(tmp, path)
+
+
+def learn(msg, dec, cfg, how):
+    """Record this mail's shape as one the owner lets through, and say whether it was recorded. `how` is
+    `released` (the owner's `deliver it` — the caller passes it only on his word) or `delivered` (a read said
+    `fits`). Not the owner's own mail, or a mail going nowhere, records nothing."""
+    key = shape(msg, dec)
+    if not key or not owners_own(msg, dec, cfg):
+        return False
+    try:
+        with _shapes_locked():
+            d = _shapes()
+            d[key] = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "how": how}
+            for k in sorted(d, key=lambda k: d[k].get("at") or "")[:max(0, len(d) - SHAPES_MAX)]:
+                del d[k]
+            _save_shapes(d)
+    except OSError:
+        return False
+    return True
+
+
+def learned(msg, dec, cfg):
+    """Whether this mail is the owner's own, carries no attachment, and has a shape learn() recorded."""
+    if msg.get("attachments") or not owners_own(msg, dec, cfg):
+        return False
+    key = shape(msg, dec)
+    return bool(key) and key in _shapes()
+
+
+def forget(text):
+    """Remove every learned shape whose key contains `text`, and return the keys removed."""
+    with _shapes_locked():
+        d = _shapes()
+        gone = sorted(k for k in d if text and text.lower() in k)
+        if gone:
+            _save_shapes({k: v for k, v in d.items() if k not in gone})
+    return gone
 
 
 # ---------------------------------------------------------------- the day's budget
@@ -637,7 +747,8 @@ def vet(msg, dec, cfg=None):
     """ONE MAIL, ONE VERDICT. `dec` is router.route()'s Decision — its workspace and its first To channel are
     what the mail is weighed against — and `cfg` is the daemon's configuration.
 
-    The order is the cost. The day's budget is checked before any model runs. A KNOWN SENDER — trusted(), off the
+    The order is the cost. The owner's forwarded digest and a shape he has let through before (digest(),
+    learned()) pass with no read at all, and the day's budget is checked before any model runs. A KNOWN SENDER — trusted(), off the
     box's one list — then gets one read and no other: the destination question, with the mail's links and the
     sandbox's report on its files in front of it, and `fits` unless the mail does not belong in that channel or
     asks the box to break its rules. A stranger gets the cheap read next; the security read only happens when
@@ -649,6 +760,8 @@ def vet(msg, dec, cfg=None):
     known = trusted(sender, cfg)
     if digest(msg, dec, cfg):
         return Verdict("digest", known=True)   # no read, so nothing charged to the day's budget
+    if learned(msg, dec, cfg):
+        return Verdict("learned", known=True)  # nor here
     if spent(sender) >= max(1, int(cfg.get("MAIL_VET_DAY_MAX") or 20)):
         return Verdict("budget", known=known)
     cost = cfg.get("MAIL_VET_COST") or "0.05"
@@ -714,3 +827,14 @@ def decided(text):
     everything else said in there is an ordinary message and is left alone."""
     m = DECIDE.match((text or "").strip())
     return m.group("word").lower() if m else None
+
+
+if __name__ == "__main__":
+    # `shapes` lists what the owner's releases taught the vetter; `forget <text>` undoes the ones matching it.
+    if sys.argv[1:2] == ["shapes"]:
+        for k, v in sorted(_shapes().items()):
+            print(k, v.get("how", ""), v.get("at", ""))
+    elif sys.argv[1:2] == ["forget"] and len(sys.argv) == 3:
+        print("\n".join(forget(sys.argv[2])) or "nothing matched")
+    else:
+        sys.exit("usage: vetting.py shapes | vetting.py forget <text>")
