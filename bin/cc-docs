@@ -95,8 +95,8 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
     cc-docs check [--post]
         Compiles every document's kept source (current revision) with DOCS_SOURCE_CHECK, which must be set, and lists
         each problem as `<number>\t<kind>\t<detail>`: `no source`, `no .tex` (kept, but nothing to compile), `fails`
-        (its first error) or `cannot check` (the check did not run), then each source marked with `gone` as
-        `<number>\tgone\t<why>`, which is not a problem; a Markdown revision has nothing to compile and is skipped; then `missing TeX packages: …` from the
+        (its first error) or `cannot check` (the check did not run), then each revision marked with `gone` (no source,
+        or a kept one that fails) as `<number>\tgone\t<why>`, which is not a problem and is not counted below; a Markdown revision has nothing to compile and is skipped; then `missing TeX packages: …` from the
         failures, and `N of M kept sources compile` over those with a .tex. Exit 1 when there is any problem. A pass
         is cached by the tarball's sha256 in checks.json beside the register, and a failure is compiled again each
         time. Two checks never run together: the second says so and exits 0. --post sends a summary under 800
@@ -106,8 +106,10 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         DOCS_CHECK_CHANNEL unset nothing is posted.
     cc-docs gone <PPP-NNNN-R> --why <text>
         Marks a revision that keeps no source as having none left to keep (looked for, not found anywhere), with
-        why, so `check` names it as gone instead of failing on it. Refused for a revision that keeps its source; a
-        source `backfill-sources` keeps later clears the mark. Prints `<number>\tgone\t<why>`.
+        why, so `check` names it as gone instead of failing on it. A revision that keeps a LaTeX source which does
+        not compile (DOCS_SOURCE_CHECK is run on it now; a cached pass does not count) is marked too, with
+        "partial": the source is kept but incomplete, its files being gone for good. Refused for one whose kept
+        source compiles; a source `backfill-sources` keeps later clears the mark. Prints `<number>\tgone\t<why>`.
     cc-docs number --project <name|PPP> --title <t> [--source <path>] [--describes PCB-NNNN-R] [--tex]
         The number `file` would give a changed build of this document now, for a build that prints its own footer:
         plain, or with --tex as `\\def\\docnumber{…}\\def\\docstamp{… · 24 Sep 2026}` to \\input before compiling.
@@ -2455,17 +2457,37 @@ def cmd_backfill(a):
 
 
 def cmd_gone(a):
-    """Marks a revision that keeps no source as having none to keep, and why, so `check` names it and passes."""
+    """Marks a revision that keeps no source, or a kept one that does not compile, as having none to keep, and
+    why, so `check` names it and passes."""
     why = " ".join((a.why or "").split())
     if not why:
         raise Refused("--why says what was looked for and where, for whoever reads the check")
     with Lock():
+        d, r = get_rev(load(), a.number)
+        full = f"{d['number']}-{r['rev']}"
+        rel = r.get("sources")
+        tar = os.path.join(ROOT, rel) if rel else None
+        kept = bool(tar and os.path.isfile(tar))
+        if kept and not any(n.endswith(".tex") for n in r.get("source_files") or ()):
+            raise Refused(f"{full} keeps its source; nothing is gone")
+    if kept:
+        cmd = conf("DOCS_SOURCE_CHECK")
+        if not cmd:
+            raise Refused("DOCS_SOURCE_CHECK is not set, so there is no telling whether the kept source compiles "
+                          "(cc-config set DOCS_SOURCE_CHECK <command>)")
+        v, ran = run_check(cmd, tar)        # compiled now, whatever checks.json holds
+        if v["ok"]:
+            raise Refused(f"{full} keeps a source that compiles; nothing is gone")
+        if not ran:
+            raise Refused(f"{full}: the check did not run ({first_error(v, False)}), so the source is not known to fail")
+    with Lock():
         reg = load()
         d, r = get_rev(reg, a.number)
-        full = f"{d['number']}-{r['rev']}"
-        if r.get("sources") and os.path.isfile(os.path.join(ROOT, r["sources"])):
-            raise Refused(f"{full} keeps its source; nothing is gone")
+        if r.get("sources") != rel:
+            raise Refused(f"{full} changed while its source was checked")
         r["source_gone"] = {"why": why, "at": utcnow()}
+        if kept:
+            r["source_gone"]["partial"] = True   # a source is kept, but it is incomplete
         save(reg)
     print(f"{full}\tgone\t{why}")
     return 0
@@ -2530,6 +2552,10 @@ def cmd_check(a):
             if v["ok"]:
                 n_ok += 1
                 passes[sha] = {"at": utcnow(), "engine": v.get("engine")}
+                continue
+            if ran and (r.get("source_gone") or {}).get("why"):     # kept but incomplete, marked by `gone`
+                gone.append((full, "gone", r["source_gone"]["why"]))
+                n_all -= 1
                 continue
             problems.append((full, "fails" if ran else "cannot check", first_error(v, ran)))
             missing |= {str(x) for x in v.get("missing") or [] if x}
@@ -4080,6 +4106,25 @@ def _selfcheck():
                and rcm == 2 and "keeps its source" in om
                and rc2 == 0 and o2.splitlines() == ["001-0001-A\tgone\tbuilt in a scratch dir since deleted",
                                                     "0 of 0 kept sources compile"])
+            # gone on a kept source: only one that fails now (a cached pass is no help), and check then says gone
+            ROOT = os.path.join(t, "r-partial")
+            checker = os.environ.pop("DOCS_SOURCE_CHECK")          # filed unchecked, so a failing source is kept
+            run("file", mkpdf(src, "pt1", "Partial one"), "--project", "Part", "--kind", "work", "--title", "Broken", "--latex", c3)
+            run("file", mkpdf(src, "pt2", "Partial two"), "--project", "Part", "--title", "Fine", "--latex", g1)
+            os.environ["DOCS_SOURCE_CHECK"] = checker
+            run("check")                                           # caches the pass of the second
+            rcn, on = run("gone", "001-0002-A", "--why", "needs nothing")
+            rcp, op = run("gone", "001-0001-A", "--why", "figures lost  with the old scratch dir")
+            with open(os.path.join(ROOT, "register.json")) as fh:
+                gone_rec = json.load(fh)["documents"]["001-0001"]["revisions"][0].get("source_gone", {})
+            rc2, o2 = run("check")
+            ok("gone accepts a kept source that fails and refuses one that compiles; check then lists it as gone, "
+               "not a problem",
+               rcn == 2 and "compiles" in on and rcp == 0
+               and op.strip() == "001-0001-A\tgone\tfigures lost with the old scratch dir"
+               and gone_rec.get("partial") is True and gone_rec.get("why") == "figures lost with the old scratch dir"
+               and rc2 == 0 and o2.splitlines() == ["001-0001-A\tgone\tfigures lost with the old scratch dir",
+                                                    "1 of 1 kept sources compile"])
             ROOT = os.path.join(t, "r-chk")
             # a check that could not run: its own first message when it printed a verdict, else its exit code
             vt = {}
