@@ -3766,7 +3766,20 @@ class MailPlaces:
 
     def _place(self, name, chat):
         t = self.dm.route(chat, "channel")
-        return mail_router().Place(name, chat, t, self.dm.chan_alias(chat)) if t else None
+        return mail_router().Place(name, chat, t, self.dm.chan_alias(chat), about=self._about().get(name, "")) if t else None
+
+    def _about(self):
+        """{name: purpose or topic} out of channels-about.json, which resolve_channel writes in the same rebuild
+        as channels.json — so it is as fresh as the table _known() keeps fresh. Read once per mail; a missing or
+        unreadable file is no descriptions, and the classifier sees bare names as before."""
+        if not hasattr(self, "_ab"):
+            try:
+                with open(f"{DIR}/channels-about.json") as f:
+                    a = json.load(f)
+                self._ab = {k: v for k, v in a.items() if k != "_t" and isinstance(v, str)} if isinstance(a, dict) else {}
+            except (OSError, ValueError):
+                self._ab = {}
+        return self._ab
 
     def name_of(self, chat):
         """The channel name behind a channel ID, or "" — for `<#C0123>`, the link Slack sends when it
@@ -9447,7 +9460,11 @@ def cmd_manifest(argv):
     return 0
 
 def resolve_channel(cfg, name):
-    """#name → channel id (only channels the bot is a member of); cached on disk for an hour."""
+    """#name → channel id (only channels the bot is a member of); cached on disk for an hour.
+
+    The same rebuild writes channels-about.json beside it: each channel's purpose, or its topic when it has no
+    purpose, as conversations.list already returns them. The mail classifier reads that to know what a channel
+    is for (MailPlaces._about), so describing a channel costs no call of its own."""
     path = f"{DIR}/channels.json"
     try:
         c = json.load(open(path))
@@ -9455,22 +9472,35 @@ def resolve_channel(cfg, name):
             return c[name]
     except Exception:
         c = {}
-    cur, found = None, {}
+    cur, found, about = None, {}, {}
     try:
         while True:
             r = api("conversations.list", cfg["SLACK_BOT_TOKEN"], types="public_channel,private_channel", exclude_archived="true", limit="200", cursor=cur)
             for ch in r["channels"]:
                 if ch.get("is_member"):
                     found[ch["name"]] = ch["id"]
+                    said = channel_about(ch)
+                    if said:
+                        about[ch["name"]] = said
             cur = r.get("response_metadata", {}).get("next_cursor") or None
             if not cur:
                 break
-        found["_t"] = time.time()
+        found["_t"] = about["_t"] = time.time()
         os.makedirs(DIR, exist_ok=True)
         json.dump(found, open(path, "w"))
+        json.dump(about, open(f"{DIR}/channels-about.json", "w"))
     except Exception:
         pass
     return found.get(name)
+
+def channel_about(ch):
+    """One conversations.list entry's purpose, else its topic, else "" — raw; whoever shows it folds it."""
+    for k in ("purpose", "topic"):
+        v = ch.get(k)
+        v = v.get("value") if isinstance(v, dict) else ""
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
 
 def resolve_chat(cfg, s):
     """#name → channel id via resolve_channel; a bare C…/D…/U… id passes through unchanged."""

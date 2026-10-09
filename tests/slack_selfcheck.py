@@ -8794,6 +8794,9 @@ def run_selfcheck():
     # An address Slack does not know is a KeyError here, which is exactly what a lookup miss is out there: a
     # sender with no workspace. Every case below leans on that — a stranger must not become somebody.
     mail_uids = {"friend@allowed.example": "UMEM", "boss@allowed.example": "UOWNER"}
+    # what conversations.list says a channel is for: a purpose, a topic only, both (purpose wins), or blank
+    mabout = {"mem--site": {"purpose": {"value": "The member's website"}, "topic": {"value": "ignored"}},
+              "mem--api": {"purpose": {"value": "  "}, "topic": {"value": "The API and its rate limits"}}}
 
     def mail_api(method, token, **kw):
         if method == "users.lookupByEmail":
@@ -8801,7 +8804,7 @@ def run_selfcheck():
         if method == "chat.getPermalink":     # what the receiver channel's reply links a name to
             return {"permalink": "https://slack.test/%s/p%s" % (kw["channel"], kw["message_ts"])}
         if method == "conversations.list":     # what resolve_channel rebuilds the name→id table out of
-            return {"channels": [{"name": k, "id": v, "is_member": True}
+            return {"channels": [dict({"name": k, "id": v, "is_member": True}, **mabout.get(k, {}))
                                  for k, v in mchans.items() if k != "_t"]}
         return {"channel": {"id": "C-DM"}}
 
@@ -9197,6 +9200,17 @@ def run_selfcheck():
               resK2["ok"] and resK2["routed"] and resK2["to"] == ["#mem--site"]
               and [h[0] for h in mhanded] == ["mem/site"]
               and json.load(open(f"{DIR}/channels.json")).get("mem--site") == "C-SITE")
+        # The same rebuild keeps what each channel says it is for, so the mail classifier can be shown it without
+        # a Slack call per mail: purpose first, topic when the purpose is blank, nothing for a channel with neither.
+        aboutK = json.load(open(f"{DIR}/channels-about.json"))
+        mpK = MailPlaces(dmA)
+        check("mail: the channel-table rebuild writes each channel's purpose (else its topic) beside it, and a "
+              "place carries it for the classifier; a channel with neither carries nothing",
+              aboutK.get("mem--site") == "The member's website" and aboutK.get("mem--api") == "The API and its rate limits"
+              and "mem" not in aboutK and isinstance(aboutK.get("_t"), float)
+              and mpK.place("mem--site").about == "The member's website"
+              and {p.name: p.about for p in mpK.places("mem")}.get("mem--api") == "The API and its rate limits"
+              and mpK.place("mem").about == "")
 
         # (k) A CHANNEL THE MIRROR LINE CANNOT BE POSTED IN. Nothing is delivered there, and the one line the
         # sender gets back says that. It used to say "I stored it but could not put it in any channel — the
