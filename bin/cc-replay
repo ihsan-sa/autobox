@@ -2,14 +2,19 @@
 """cc-replay — score a CANDIDATE lander against a recorded set of past landings, offline, in one number.
 
 TODAY'S LANDER (the core/lander package):
-  cc-replay extract --lander [--repo R]... [--since STAMP] [--until STAMP] --out FILE
+  cc-replay extract --lander [--repo R]... [--since STAMP] [--until STAMP] [--ready FILE] --out FILE
       A v3 trace from the lander's queue.log (`stage` lines and the requests) and its job files (live, or rest/):
       each PR first queued in the window, its requests and when history's lane first acted on each, its heads,
       every check it ran (head, secs, yes/no/main-red) and every verdict, its plan, files, conflicts and a
       branch gone, plus history's 1-minute load (sysstat) and its slot waits: each time a check started 1-60 min
       after the lane's `checking` line (or the check before it). A PR already in flight when the window opened is
       kept and marked inflight: the score replays it, because it held slots and parked PRs on its files, but
-      never counts it. One that merged or ended before the window is left out.
+      never counts it. One that merged or ended before the window is left out. Each PR also carries when and how
+      history's lane first let it go (left: a query, a handback or a merge). A `refused` ask (a member's token,
+      repository or clone, a protected path) never reached the inbox, so it is a blocked arrival: a PR refused
+      before its first `queued` keeps those refusals and its ready time, the earliest refusal or the stamp FILE
+      gives for it ({"repo#N": STAMP}), so its wait at the door counts. One refused in the window and never
+      queued is listed as waiting, from its first refusal even when that came before the window; a refusal line whose stamp can't be read is counted unreplayable, not dropped.
   cc-replay score --candidate DIR --trace V3 [--slots N] [--pickup history|arrival] [--verbose] [--keep]
       DIR is a tree holding core/lander (a checkout at a ref, a worktree, a release) or the package's directory.
       Its own Lane runs each repo's arrivals on a virtual clock, one repo at a time. The world stands in for git,
@@ -23,7 +28,11 @@ TODAY'S LANDER (the core/lander package):
       it. --pickup history delivers each request when history's lane first acted on it (older releases left some
       untouched for hours); `arrival` delivers it when it was made. --slots sets the candidate's LANDER_SLOTS.
       Prints queued→merged p50 and p95 and the lane-minutes full-suite PRs held, history's same numbers beside
-      them over the PRs both merged, then a per-PR table. The replay's own queue.log is read by the same parser.
+      them over the PRs both merged; then ready→left p50 and p95, from the PR's ready time (its first `queued`
+      unless it was refused first) to its first query, handback or merge, over the PRs both let go, and what the
+      door held; then a per-PR table (both columns, and how each left) and a per-repo one of ready→left. The
+      refusals are history's in both columns, since the replay drives the lane and not its door. The replay's
+      own queue.log is read by the same parser.
 
 THE OLD SINGLE-FILE LANDING TOOL (before the lander cut over):
   cc-replay extract [--repo R]... [--since STAMP] [--until STAMP] --out FILE
@@ -626,7 +635,7 @@ def print_counts(out, trace):
 
 
 def cmd_extract(argv):
-    repos, since, until, out, old, lander = [], 0, int(time.time()), "", "", False
+    repos, since, until, out, old, lander, ready = [], 0, int(time.time()), "", "", False, ""
     rest = list(argv)
     while rest:
         a = rest.pop(0)
@@ -634,6 +643,8 @@ def cmd_extract(argv):
             lander = True
         elif a == "--from" and rest:
             old = rest.pop(0)
+        elif a == "--ready" and rest:
+            ready = rest.pop(0)
         elif a == "--repo" and rest:
             repos.append(rest.pop(0))
         elif a == "--since" and rest:
@@ -650,7 +661,11 @@ def cmd_extract(argv):
         return 2
     if lander:
         landq = os.environ.get("CC_LANDER_STATE") or LANDQ
-        trace = lander_trace(f"{landq}/queue.log", landq, since or until - 86400, until, repos)
+        rmap = read_json(ready) if ready else {}
+        if ready and not isinstance(rmap, dict):
+            print(f"cc-replay extract: --ready {ready} is not a JSON object of 'repo#N': stamp", file=sys.stderr)
+            return 2
+        trace = lander_trace(f"{landq}/queue.log", landq, since or until - 86400, until, repos, ready=rmap)
         if not trace["prs"]:
             print("cc-replay extract: no PR first queued in that window", file=sys.stderr)
             return 1
@@ -662,7 +677,9 @@ def cmd_extract(argv):
               f"{sum(len(r) for p in trace['prs'] for r in p['gates'].values())} checks, "
               f"{sum(len(p['verdicts']) for p in trace['prs'])} reads, {sum(1 for p in trace['prs'] if p['merged'])} merged; "
               f"{sum(1 for p in trace['prs'] if p.get('inflight'))} of them first queued before the window (replayed, "
-              f"not scored); {len(trace['left_out'])} more ended or merged before it, left out")
+              f"not scored); {len(trace['left_out'])} more ended or merged before it, left out; "
+              f"{sum(1 for p in trace['prs'] if p.get('refusals'))} refused before their first queued, "
+              f"{len(trace['waiting'])} refused and never queued, {len(trace['undated'])} refusal(s) undated")
         return 0
     if old:     # the v1 half is kept as it was read then: its gate spans and transcripts may be gone since
         trace = load_trace(old)
@@ -1723,6 +1740,8 @@ def cmd_score(argv):
 # ── the lander path: trace v3, today's core/lander driven on a virtual clock ────────────────────────────────
 ARRIVE = ("queued", "again", "requeued", "handed-pushed")   # a request reached the lander's inbox
 ENDED = ("stage:handback", "stage:query", "stage:done")     # the job left the lane; only a new request brings it back
+LEFT = ("stage:query", "stage:handback", "stage:merged")    # "leaving means a query, a handback or a merge, whichever came first"
+REFUSED_RE = re.compile(r"^refused ([A-Za-z0-9_.-]+#\d+)(?: (\S+))?")
 FULL_SUITE = ("check-sh",)       # a plan holding one of these is a full-suite PR (the lane's own FULL_CHECKS default)
 REVIEW_CAP = 3600                # a verdict line further than this from the PR's last line is not one read's length
 DEFAULT_REVIEW = 480
@@ -1759,6 +1778,31 @@ def lander_events(path, until=0):
     return out
 
 
+def refusal_events(path, until=0):
+    """({'repo#N': [[epoch, why]]}, ['repo#N' of each refused line whose stamp can't be read]) from a queue.log.
+    A refusal is an ask the lane turned away at its door (a member's clone, token or repository; a protected path),
+    so it never reached the inbox and lander_events() has no line for it."""
+    dated, undated = {}, []
+    try:
+        f = open(path, errors="replace")
+    except OSError:
+        return dated, undated
+    with f:
+        for line in f:
+            t, _, msg = line.rstrip("\n").partition("\t")
+            m = REFUSED_RE.match(msg)
+            if not m:
+                continue
+            e = epoch(t)
+            if not e:
+                undated.append(m.group(1))
+            elif not until or e <= until:
+                dated.setdefault(m.group(1), []).append([e, m.group(2) or "-"])
+    for v in dated.values():
+        v.sort()
+    return dated, undated
+
+
 def job_record(landq, repo, pr):
     """The job file the lander keeps for (repo, pr): live, or rest/ once it ended; {} when neither is there."""
     for p in (f"{landq}/{repo}-{pr}.json", f"{landq}/rest/{repo}-{pr}.json"):
@@ -1768,13 +1812,18 @@ def job_record(landq, repo, pr):
     return {}
 
 
-def lander_trace(log, landq, since, until, repos=(), rels=""):
+def lander_trace(log, landq, since, until, repos=(), rels="", ready=None):
     """A v3 trace from the lander's queue.log and job files. A PR is in it when its first `queued` falls inside
     [since, until]. arrivals: every request after that; seen: when history's lane first acted on each (its first
     stage line after it, the pick-up). A new head starts at each `requeued`, `handed-pushed` or later `queued`
     (someone pushed or asked again after a stop) and at each "the head moved" in the job file. Gates and verdicts
     are recorded against the head they ran on, in order. From the job file's holds: conflicts (head, when history
-    first found it conflicting with main) and gone (when its branch could no longer be fetched)."""
+    first found it conflicting with main) and gone (when its branch could no longer be fetched). left: when and how
+    history's lane first let it go after its first request (a query, a handback or a merge). Refused asks before its
+    first `queued` are its `refusals`, and its `ready` is the earliest of them or of ready[key] (a stamp), so the
+    wait at the door counts. A PR refused in the window (first refused there or before) and never queued by its
+    end is in `waiting`; a refusal
+    whose stamp can't be read is in `undated`, counted as unreplayable."""
     ev = lander_events(log, until)
     first, prs, left_out, blocked, before = {}, {}, set(), [], {}
     for e, k, key, w in ev:
@@ -1823,9 +1872,25 @@ def lander_trace(log, landq, since, until, repos=(), rels=""):
                 p["_verdicts"].append((e, kv["verdict"], max(0, min(REVIEW_CAP, e - p["_last"]))))
             elif k == "stage:merged" and not p["merged"]:
                 p["merged"] = {"at": e, "by": "person" if kv.get("by") == "before" else "lane"}
+            if k in LEFT and not p.get("left"):
+                p["left"] = {"at": e, "by": k[6:]}
         p["_last"], p["_lastk"] = e, k
     gsecs, rsecs = {}, []
     prs = {k: p for k, p in prs.items() if p["arrivals"]}   # an in-flight PR nobody asked for again in the window
+    refused, undated = refusal_events(log, until)
+    ready, waiting = ready or {}, []
+    for key, refs in sorted(refused.items()):
+        if repos and key.rpartition("#")[0] not in repos:
+            continue
+        p = prs.get(key)
+        if p and not p.get("inflight"):
+            before = [r for r in refs if r[0] <= p["arrivals"][0]]
+            if before:
+                p["refusals"] = before
+                p["ready"] = min(before[0][0], epoch(ready.get(key)) or before[0][0])
+        elif key not in first and any(since <= r[0] <= until for r in refs):   # still being asked in the window
+            waiting.append({"key": key, "refusals": refs,
+                            "ready": min(refs[0][0], epoch(ready.get(key)) or refs[0][0])})
     for p in prs.values():
         p.pop("_last"), p.pop("_ended"), p.pop("_lastk")
         p["seen"] = [s or a for a, s in zip(p["arrivals"], p["seen"])]
@@ -1858,7 +1923,8 @@ def lander_trace(log, landq, since, until, repos=(), rels=""):
             gsecs.setdefault(g, []).extend(r[1] for r in runs if r[2] == "yes")
         rsecs.extend(s for _, _, s in p["verdicts"])
     return {"version": 3, "kind": "lander", "since": stamp(since), "until": stamp(until), "extracted_at": stamp(time.time()),
-            "left_out": sorted(left_out - set(prs)), "cores": os.cpu_count() or 1,
+            "left_out": sorted(left_out - set(prs)), "cores": os.cpu_count() or 1, "waiting": waiting,
+            "undated": sorted(k for k in undated if not repos or k.rpartition("#")[0] in repos),
             "load": load_history(since, until), "blocked": blocked,
             "admission": hist_admission(log, since, until, rels),
             "medians": {"gate": {g: int(median(v, 60)) for g, v in sorted(gsecs.items())},
@@ -1983,25 +2049,36 @@ def scored(trace):
     return [p for p in trace["prs"] if not p.get("inflight")]
 
 
+def asked(p):
+    """When the PR's wait began: its ready time when the lane refused it first, else its first `queued`."""
+    return min(p.get("ready") or p["arrivals"][0], p["arrivals"][0])
+
+
 def history_numbers(trace):
-    """{key: queued→merged seconds} and the full-suite lane-seconds, as history recorded them."""
-    lead, lane = {}, 0
+    """{key: queued→merged seconds}, the full-suite lane-seconds and {key: (ready→left seconds, how)}, as history
+    recorded them."""
+    lead, lane, left = {}, 0, {}
     for p in scored(trace):
         if p["merged"]:
             lead[f"{p['repo']}#{p['pr']}"] = p["merged"]["at"] - p["arrivals"][0]
+        if p.get("left"):
+            left[f"{p['repo']}#{p['pr']}"] = (p["left"]["at"] - asked(p), p["left"]["by"])
         if full_suite(p):
             lane += sum(r[1] for runs in p["gates"].values() for r in runs)
-    return lead, lane
+    return lead, lane, left
 
 
 def replay_numbers(trace, log):
     """The same two numbers from the replay's own queue.log, read by the same parser as history's."""
     starts = {f"{p['repo']}#{p['pr']}": p["arrivals"][0] for p in scored(trace)}
+    asks = {f"{p['repo']}#{p['pr']}": asked(p) for p in scored(trace)}
     full = {f"{p['repo']}#{p['pr']}" for p in scored(trace) if full_suite(p)}
-    lead, lane, gates, reads = {}, 0, 0, 0
+    lead, lane, gates, reads, left = {}, 0, 0, 0, {}
     for e, k, key, w in lander_events(log):
         if key not in starts:
             continue
+        if k in LEFT and key not in left:
+            left[key] = (e - asks[key], k[6:])
         if k == "stage:merged" and key not in lead:
             lead[key] = e - starts[key]
         elif k == "stage:gate":
@@ -2010,7 +2087,7 @@ def replay_numbers(trace, log):
                 lane += int(kv_of(w).get("secs") or 0)
         elif k == "stage:verdict":
             reads += 1
-    return lead, lane, gates, reads
+    return lead, lane, gates, reads, left
 
 
 def candidate_core(path):
@@ -2110,7 +2187,8 @@ class VPool:
 
 class VFutures:
     """The `concurrent.futures` lane.py sees. wait() moves the clock to the first finished check; with a timeout,
-    to the first poll at or after the next thing a real lane would notice there (an arrival, a hold running out)."""
+    to the first poll at or after the next thing a real lane would notice there (an arrival, a hold running out);
+    with timeout=0, not at all."""
     FIRST_COMPLETED, ALL_COMPLETED, FIRST_EXCEPTION = "FIRST_COMPLETED", "ALL_COMPLETED", "FIRST_EXCEPTION"
 
     def __init__(self, world):
@@ -2122,7 +2200,7 @@ class VFutures:
     def wait(self, fs, timeout=None, return_when=None):
         fs, clock = list(fs), self.world.clock
         done = {f for f in fs if f.done()}
-        if not done and fs:
+        if not done and fs and timeout != 0:   # timeout=0 is a look, as in concurrent.futures: the clock stays
             t = min(f.at for f in fs)
             nxt = self.world.next_wake()
             if timeout and nxt is not None and nxt < t:
@@ -2568,8 +2646,8 @@ def lander_score(candidate, trace, slots=0, keep_root=False, pickup="history"):
     try:
         with tripwire(core):
             log = drive(trace, mods, world, clock, root, pickup)
-        lead, lane, gates, reads = replay_numbers(trace, f"{root}/land/queue.log")
-        return lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads), "\n".join(log)
+        lead, lane, gates, reads, left = replay_numbers(trace, f"{root}/land/queue.log")
+        return lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads, left), "\n".join(log)
     except ReplayLeak as e:
         raise SystemExit(str(e)) from None
     finally:
@@ -2607,8 +2685,16 @@ def mins(s):
     return "-" if s is None else f"{s / 60:.1f}"
 
 
-def lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads):
-    hist, hlane = history_numbers(trace)
+def leave_line(who, secs):
+    return f"{who} p50 {mins(pctl(secs, .5))} min  p95 {mins(pctl(secs, .95))} min"
+
+
+def lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads, left):
+    hist, hlane, hleft = history_numbers(trace)
+    lboth = sorted(set(hleft) & set(left))
+    door = [p for p in scored(trace) if p.get("refusals")]
+    waiting, undated = trace.get("waiting") or [], trace.get("undated") or []
+    until = epoch(trace["until"])
     both = sorted(set(hist) & set(lead))
     rp = [lead[k] for k in both]
     hp = [hist[k] for k in both]
@@ -2619,10 +2705,28 @@ def lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads):
            f"history p50 {mins(pctl(hp, .5))} min  p95 {mins(pctl(hp, .95))} min  full-suite lane-min {hlane / 60:.0f}",
            f"merged: replay {len(lead)}, history {len(hist)} of {len(scored(trace))} PRs; checks run: replay {gates}, "
            f"history {hgates}; reads: replay {reads}, history {hreads}; trace {trace['since']} → {trace['until']}",
-           "", f"{'PR':<22} {'history':>8} {'replay':>8}"]
+           f"left the lane (ready→query, handback or merge, whichever first) over {len(lboth)} PRs both let go: "
+           f"{leave_line('replay', [left[k][0] for k in lboth])};  {leave_line('history', [hleft[k][0] for k in lboth])}"
+           f"  (let go: replay {len(left)}, history {len(hleft)} of {len(scored(trace))})",
+           f"at the door: {len(door)} PR(s) refused before their first queued (counted from their ready time), "
+           f"{len(waiting)} refused and never queued by the window's end (waited {mins(pctl([until - w['ready'] for w in waiting], .5))}"
+           f" min p50), {len(undated)} refusal(s) undated, unreplayable",
+           "", f"{'PR':<36} {'history':>8} {'replay':>8} {'h-left':>8} {'r-left':>8}  how (history/replay)"]
     for p in scored(trace):
         k = f"{p['repo']}#{p['pr']}"
-        out.append(f"{k:<22} {mins(hist.get(k)):>8} {mins(lead.get(k)):>8}")
+        hl, rl = hleft.get(k, (None, "-")), left.get(k, (None, "-"))
+        out.append(f"{k:<36} {mins(hist.get(k)):>8} {mins(lead.get(k)):>8} {mins(hl[0]):>8} {mins(rl[0]):>8}  "
+                   f"{hl[1]}/{rl[1]}" + (f"  refused {','.join(sorted({r[1] for r in p['refusals']}))}" if p.get("refusals") else ""))
+    out += ["", f"{'repo':<36} {'PRs':>4} {'h-left50':>8} {'h-left95':>8} {'r-left50':>8} {'r-left95':>8}"]
+    for repo in sorted({k.rpartition("#")[0] for k in lboth}):
+        ks = [k for k in lboth if k.rpartition("#")[0] == repo]
+        h, r = [hleft[k][0] for k in ks], [left[k][0] for k in ks]
+        out.append(f"{repo:<36} {len(ks):>4} {mins(pctl(h, .5)):>8} {mins(pctl(h, .95)):>8} {mins(pctl(r, .5)):>8} "
+                   f"{mins(pctl(r, .95)):>8}")
+    for w in waiting:
+        out.append(f"waiting {w['key']}: ready {stamp(w['ready'])}, refused {','.join(sorted({r[1] for r in w['refusals']}))}")
+    for k in undated:
+        out.append(f"unreplayable {k}: a refusal whose stamp can't be read")
     return "\n".join(out) + "\n"
 
 
@@ -3036,7 +3140,9 @@ def cmd_selfcheck():
         def run(trace, *extra):
             r = subprocess.run([sys.executable, me, "score", "--candidate", core, "--trace", trace, *extra],
                                capture_output=True, text=True, timeout=120)
-            rows = {ln.split()[0]: ln.split()[1:] for ln in r.stdout.splitlines()[5:] if ln.strip()}
+            lines = r.stdout.splitlines()
+            head = next((i for i, ln in enumerate(lines) if ln.startswith("PR ")), len(lines))
+            rows = {ln.split()[0]: ln.split()[1:] for ln in lines[head + 1:] if ln.strip()}
             return r, rows
         a, arows = run(calm)
         b, _ = run(calm)
@@ -3191,6 +3297,63 @@ def cmd_selfcheck():
         check("…a conflict history met at its first look at a head holds that head from its start until the next one: "
               "it merges after the push, as in history, not at once",
               num(hrows, "u#3") is not None and 29 <= num(hrows, "u#3") <= 31.5)
+        # leaving the lane, each way, and a member PR the door refused before it was queued
+        vq = f"{lroot}/land-leave"
+        os.makedirs(f"{vq}/rest")
+        with open(f"{vq}/queue.log", "w") as f:
+            f.write("".join(sorted([
+                L(10, "queued v#1 who=x"), L(11, "stage v#1 lane"), L(12, "stage v#1 checking"),
+                L(72, "stage v#1 gate gate=a ok=no secs=60"), L(73, "stage v#1 handback"),
+                L(10, "queued v#2 who=x"), L(11, "stage v#2 lane"), L(20, "stage v#2 merged sha=v2"),
+                L(30, "refused v#2 protected:core/x"),
+                L(10, "queued v#3 who=x"), L(11, "stage v#3 lane"), L(40, "stage v#3 query"),
+                L(900, "requeued v#3 who=x"), L(901, "stage v#3 lane"), L(950, "stage v#3 merged sha=v3"),
+                L(0, "refused m--t#4 no-clone"), L(100, "refused m--t#4 no-clone"),
+                L(1000, "queued m--t#4 who=x"), L(1001, "stage m--t#4 lane"), L(1010, "stage m--t#4 merged sha=m4"),
+                L(200, "refused m--u#5 not-its-repository"), L(-5000, "refused m--w#7 no-token"),
+                L(-5000, "refused m--x#8 no-clone"), L(300, "refused m--x#8 no-clone"),
+            ])) + "garbage\trefused m--v#6 no-token\n")
+        for n, checks in ((1, ["a"]), (2, []), (3, []), (4, [])):
+            key = "m--t" if n == 4 else "v"
+            with open(f"{vq}/rest/{key}-{n}.json", "w") as f:
+                json.dump({"repo": key, "pr": n, "files": [f"v{n}.py"], "plan": {"checks": checks, "paid": False}}, f)
+        vt = lander_trace(f"{vq}/queue.log", vq, t0, t0 + 4000)
+        vby = {f"{p['repo']}#{p['pr']}": p for p in vt["prs"]}
+        check("v3 extract: a PR leaves history's lane at its first handback, query or merge, whichever came first; "
+              "a request after a query does not move it",
+              vby["v#1"]["left"] == {"at": t0 + 73, "by": "handback"} and vby["v#2"]["left"] == {"at": t0 + 20, "by": "merged"}
+              and vby["v#3"]["left"] == {"at": t0 + 40, "by": "query"})
+        check("…a member PR refused before its first queued keeps its refusals and is ready at the first; one refused "
+              "after it was queued keeps none",
+              vby["m--t#4"]["refusals"] == [[t0, "no-clone"], [t0 + 100, "no-clone"]] and vby["m--t#4"]["ready"] == t0
+              and "refusals" not in vby["v#2"] and "ready" not in vby["v#1"])
+        check("…refused in the window and never queued is waiting, from its first refusal even before the window; one "
+              "refused only before the window is not; an undated refusal is counted unreplayable",
+              [(w["key"], w["ready"]) for w in vt["waiting"]] == [("m--u#5", t0 + 200), ("m--x#8", t0 - 5000)]
+              and vt["undated"] == ["m--v#6"])
+        rt = lander_trace(f"{vq}/queue.log", vq, t0, t0 + 4000, ready={"m--t#4": stamp(t0 - 500), "v#1": stamp(t0 - 900)})
+        rby = {f"{p['repo']}#{p['pr']}": p for p in rt["prs"]}
+        check("…a ready stamp given for a refused PR moves its ready time earlier; one for a PR never refused is unused",
+              rby["m--t#4"]["ready"] == t0 - 500 and "ready" not in rby["v#1"])
+        with open(f"{vq}/replay.log", "w") as f:
+            f.write("".join(sorted([L(15, "stage v#1 query"), L(90, "stage v#1 merged sha=a"), L(50, "stage v#2 handback"),
+                                    L(60, "stage v#3 merged sha=b"), L(2000, "stage m--t#4 merged sha=c")])))
+        rleft = replay_numbers(rt, f"{vq}/replay.log")[4]
+        check("v3 score: the replay's own log is read the same way: each leave kind, the first one only, and a refused "
+              "PR's wait counted from its ready time",
+              rleft == {"v#1": (5, "query"), "v#2": (40, "handback"), "v#3": (50, "merged"), "m--t#4": (2500, "merged")})
+        leave = f"{lroot}/leave.json"
+        with open(leave, "w") as f:
+            json.dump(rt, f)
+        v, vrows = run(leave)
+        check("…and the report prints ready→left beside queued→merged: the refused PR waited from its ready stamp "
+              "(25 min) in both, the handback left as one",
+              v.returncode == 0 and "left the lane (ready→" in v.stdout and "2 refused and never queued" in v.stdout
+              and "1 refusal(s) undated" in v.stdout and vrows.get("m--t#4", [""] * 5)[2] == "25.2"
+              and num(vrows, "m--t#4", 3) is not None and num(vrows, "m--t#4", 3) >= 25.0
+              and vrows.get("v#1", [""] * 5)[4] == "handback/handback" and "waiting" in vrows and "unreplayable" in vrows)
+        if v.returncode:
+            print("    " + (v.stderr.strip().splitlines() or ["(no stderr)"])[-1])
     finally:
         os.environ.pop("CC_REPLAY_SYSSTAT", None)
         shutil.rmtree(lroot, ignore_errors=True)
