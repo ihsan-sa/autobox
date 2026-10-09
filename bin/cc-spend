@@ -43,12 +43,15 @@ show it without re-deriving the rule from tmux, the boards and the loops — and
 one `cc-spend phantoms` gives, because `grew` only changes at a tick anyway.
 
 CONTEXT COST, INTO THE FAILURES LEDGER. A turn is one API response, and its cache read is the context the session
-re-read to take it. When the tick reads a turn whose cache read is at or over the band (CC_SPEND_CONTEXT_BAND, env
-then ~/.cc/config, default 150k tokens: the context a session hands off at), it writes one `spend/context-over-band`
-record (`cc-failures record --once`) under the session's repo, at the turn's time. Once per session per UTC day
-(links.source spend-context:<session>:<day>), so a session that stays over the band is one record a day, not one a
-tick. Only turns inside GREW_WINDOW count, so a first tick's backfill writes no history; a session with no repo
-(`-`) has no ledger to go to and is skipped. The failure detector clusters and investigates those records like any
+re-read to take it. Only a session's OWN transcript sets its peak: a subagent's file carries the parent's sessionId
+too, but its turns re-read the subagent's context, not the parent's, so they are counted as spend and never as the
+parent's peak (2026-10-03: five of the first six records were a subagent's turn filed against its parent). The tick
+keeps each session's largest turn per UTC day in offsets.json (`peaks`) and settles it at the first tick after that
+day ends, because a session that goes quiet can resume and climb the same day. A settled peak at or over the band
+(CC_SPEND_CONTEXT_BAND, env then ~/.cc/config, default 150k tokens: the context a session hands off at) is one `spend/context-over-band` record (`cc-failures record --once`) under the session's repo, at the peak
+turn's time and carrying the day's real peak, not the first turn that crossed. Once per session per UTC day
+(links.source spend-context:<session>:<day>). Only sessions that grew inside GREW_WINDOW are tracked, so a first
+tick's backfill writes no history; a session with no repo (`-`) has no ledger to go to and is skipped. The failure detector clusters and investigates those records like any
 other kind; a writer that fails is one stderr line and never fails the tick. Tutor rows are skipped too: the
 advice that record carries — hand off before a turn re-reads the band — is a thing a session can do and a
 student's chat cannot.
@@ -516,7 +519,10 @@ def scan_file(path, prev, seen_rids=None, sub_rids=None, since=None):
         a = agg.setdefault(key, {"ts": ts, "cwd": cwd, "kind": kind_of(rec, cwd), "tok": [0, 0, 0, 0], "usd": 0.0,
                                  "turn_cr": 0, "turn_ts": ts})
         a["ts"] = max(a["ts"], ts)
-        if tok[2] > a["turn_cr"]:              # the largest cache read on one turn: the context carried, for the band
+        # The largest cache read on one OWN turn: the context carried, for the band. A sidechain turn is a
+        # subagent's, so it re-read the subagent's context: spend above, never the parent's peak — even when no
+        # subagent file holds its requestId and it is counted here rather than there.
+        if tok[2] > a["turn_cr"] and not rec.get("isSidechain"):
             a["turn_cr"], a["turn_ts"] = tok[2], ts
         a["cwd"], a["kind"] = cwd, kind_of(rec, cwd)
         for i in range(4):
@@ -577,7 +583,8 @@ def tick():
     off = load_offsets()
     files = off.get("files") or {}
     sub_rids = {sid: set(rids) for sid, rids in (off.get("sub_rids") or {}).items()}   # {session: {requestId}}
-    rows, grew, seen_files, peaks = [], {}, set(), {}
+    rows, grew, seen_files = [], {}, set()
+    peaks = off.get("peaks") or {}             # {"<session> <day>": that day's largest own turn} — see record_context
     seen_rids = set()                          # (session, requestId) across every file this tick reads
     # Recursive: a SUBAGENT writes its own transcript one level deeper, <project>/<session>/subagents/*.jsonl.
     # A one-level glob missed those, and most of a busy hour's spend now runs in subagents.
@@ -626,12 +633,12 @@ def tick():
                 g["tok"] += i + o + cr + cw
                 g["ts"] = max(g["ts"], iso(a["ts"]))
             # A tutor row has a repo now, but record_context's advice is for a session that can hand off, so
-            # the band is not a failure of a student's chat — see CONTEXT COST above.
-            if repo != "-" and track != "tutor" and (stamp - a["turn_ts"]).total_seconds() <= GREW_WINDOW:
-                pk = (sid, iso(a["turn_ts"])[:10])
-                if a["turn_cr"] > peaks.get(pk, {}).get("cr", -1):
-                    peaks[pk] = {"cr": a["turn_cr"], "ts": a["turn_ts"], "repo": repo, "track": track,
-                                 "model": model, "path": path}
+            # the band is not a failure of a student's chat — see CONTEXT COST above. A subagent's file is not the
+            # parent's context: its turns are spend above, never the parent's peak.
+            if is_parent and repo != "-" and track != "tutor" and (stamp - a["ts"]).total_seconds() <= GREW_WINDOW:
+                p = peaks.setdefault(f"{sid} {_day}", {"cr": -1})
+                if a["turn_cr"] > p["cr"]:
+                    p.update(cr=a["turn_cr"], ts=iso(a["turn_ts"]), repo=repo, track=track, model=model, path=path)
     for gone in set(files) - seen_files:       # a transcript that vanished takes its offset with it
         del files[gone]
     for done in set(sub_rids) - live_sub_sessions:   # its subagents/ files are gone from this walk too — a
@@ -641,10 +648,10 @@ def tick():
     # order would lose them outright. Over-counting once is visible and fixable; a hole in the ledger is not.
     append_rows(rows)
     # Records after the rows and before the offsets: a crash between re-reads the bytes, and --once writes nothing twice.
-    recorded = record_context(peaks)
+    recorded = record_context(peaks, stamp)
     procs = proc_snapshot()
     save_tsv(PROCS, PCOLS, [[iso(stamp)] + [p[c] for c in PCOLS[1:]] for p in procs])
-    save_json(OFF, {"tick": iso(stamp), "files": files, "grew": grew,
+    save_json(OFF, {"tick": iso(stamp), "files": files, "grew": grew, "peaks": peaks,
                     "sub_rids": {sid: sorted(rids) for sid, rids in sub_rids.items()}})
     # …and the phantom list, last: it reads procs.tsv and the rows this tick just appended, so it must run after
     # both are on disk. A reader of the file gets the same answer `cc-spend phantoms` would give.
@@ -660,31 +667,55 @@ CONTEXT_KIND = "spend/context-over-band"
 CONTEXT_BAND = 150_000            # cache-read tokens on one turn; CC_SPEND_CONTEXT_BAND overrides it
 
 
-def record_context(peaks):
-    """The tick's peaks — {(session, UTC day): the largest fresh turn} — over the band, each written to the failures
-    ledger once. Returns how many sessions were over it. Never raises: the tick's own work is already on disk."""
+def conf_int(bin_, key, default):
+    import subprocess
+    try:
+        r = subprocess.run([os.path.join(bin_, "cc-config"), "get", key], capture_output=True,
+                           text=True, stdin=subprocess.DEVNULL, timeout=10)
+        return int(float(r.stdout.strip())) if r.returncode == 0 and r.stdout.strip() else default
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return default
+
+
+def record_context(peaks, stamp):
+    """`peaks` — {"<session> <UTC day>": that day's largest own turn so far}, kept across ticks in offsets.json — is
+    settled here, and only once its UTC day is over: a session that went quiet can resume and climb the same day,
+    and the record is written once per day, so any earlier cut would freeze it below the day's real peak. A final
+    peak over the band goes to the failures ledger once; every final entry then leaves `peaks`, except a record
+    that failed to write, which is tried again next tick until its day is two days gone. A peak re-made for a day
+    already recorded (a late line stamped before midnight) meets `--once`, which exits 0 on "already", so it
+    leaves too. Mutates `peaks`. Returns how many sessions were recorded over the band. Never raises: the tick's
+    own work is already on disk. CC_SPEND_CONTEXT_AT (an ISO time, read from the environment only) moves the
+    clock this uses, so the selfcheck can end a day without waiting for midnight."""
     import subprocess
     if not peaks:
         return 0
     bin_ = os.path.dirname(os.path.realpath(__file__))
-    try:
-        r = subprocess.run([os.path.join(bin_, "cc-config"), "get", "CC_SPEND_CONTEXT_BAND"], capture_output=True,
-                           text=True, stdin=subprocess.DEVNULL, timeout=10)
-        band = int(float(r.stdout.strip())) if r.returncode == 0 and r.stdout.strip() else CONTEXT_BAND
-    except (OSError, subprocess.SubprocessError, ValueError):
-        band = CONTEXT_BAND
-    over = {k: p for k, p in peaks.items() if p["cr"] >= band}   # "crosses a band": at the band is over it
+    band = conf_int(bin_, "CC_SPEND_CONTEXT_BAND", CONTEXT_BAND)
+    stamp = parse_ts(os.environ.get("CC_SPEND_CONTEXT_AT")) or stamp
+    today = iso(stamp)[:10]
+    over = {}
+    for key, p in list(peaks.items()):
+        sid, day = key.split(" ", 1)
+        if day >= today:
+            continue                           # the day is still on: its peak can still rise
+        if p.get("cr", -1) >= band:            # "crosses a band": at the band is over it
+            over[(sid, day)] = p
+        if p.get("cr", -1) < band or day < iso(stamp - timedelta(days=2))[:10]:
+            del peaks[key]
     for (sid, day), p in sorted(over.items()):
         cmd = [os.path.join(bin_, "cc-failures"), "record", "--once", "--scope", p["repo"], "--kind", CONTEXT_KIND,
                "--writer", "cc-spend", "--detector", "box", "--detector-evidence", "cc-spend tick read the transcript",
                "--observed", f"session {sid[:8]} ({p['repo']}/{p['track']}, {p['model']}) read {p['cr']:,} cache "
-                             f"tokens on one turn, over the {band:,} band: every later turn re-reads that context",
+                             f"tokens on its largest turn of {day}, over the {band:,} band: every later turn re-reads that context",
                "--expected", f"the session hands off before one turn re-reads {band:,} tokens of context",
-               "--ts", iso(p["ts"]), "--cost", f"cache_read_one_turn={p['cr']}", "--evidence", f"transcript:{p['path']}",
+               "--ts", p["ts"], "--cost", f"cache_read_one_turn={p['cr']}", "--evidence", f"transcript:{p['path']}",
                "--link", f"source=spend-context:{sid}:{day}", "--link", f"session={sid}"]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10)
-            if r.returncode != 0:
+            if r.returncode == 0:
+                peaks.pop(f"{sid} {day}", None)
+            else:
                 print(f"cc-spend: {sid[:8]} over the context band, not recorded: "
                       f"{((r.stderr or r.stdout).strip().splitlines() or ['cc-failures record failed'])[-1]}",
                       file=sys.stderr)
@@ -1408,7 +1439,11 @@ def selfcheck():
             fl = os.path.join(thc, "failures")
             envc = {k: v for k, v in os.environ.items() if k not in ("CC_CONFIG", "CC_SPEND_CONTEXT_BAND")}
             envc.update(HOME=thc, CC_FAILURES=fl)
-            fresh = iso(now() - timedelta(minutes=2))
+            # Every fixture turn is today's and two minutes old (never before today's midnight, so a run just after
+            # 00:00 UTC stays on one day); `nextday` is the clock a tick is handed to end that day.
+            t0 = now()
+            fresh = iso(max(t0 - timedelta(minutes=2), t0.replace(hour=0, minute=0, second=0, microsecond=0)))
+            nextday = iso(t0 + timedelta(days=1))
 
             def recc(sid, rid, cr, ts=fresh, repo="rc", cwd=None):
                 return json.dumps({"type": "assistant", "requestId": rid, "timestamp": ts, "sessionId": sid,
@@ -1422,6 +1457,27 @@ def selfcheck():
                 f = os.path.join(fl, f"{scope}.jsonl")
                 return [json.loads(ln) for ln in open(f)] if os.path.isfile(f) else []
 
+            def tick_c(**extra):
+                return subprocess.run([sys.executable, me, "tick"], env=dict(envc, **extra), capture_output=True,
+                                      text=True)
+
+            def peak_c(sid):
+                return ((json.load(open(os.path.join(thc, ".cc", "state", "spend", "offsets.json"))).get("peaks")
+                         or {}).get(f"{sid} {fresh[:10]}") or {}).get("cr")
+
+            def spent_cr(sid):
+                return sum(int(ln.split("\t")[9]) for ln in open(os.path.join(thc, ".cc", "state", "spend",
+                                                                             f"{fresh[:10]}.tsv"))
+                           if not ln.startswith("#") and ln.split("\t")[1] == sid)
+
+            def side(line):
+                return line.replace('"type": "assistant"', '"type": "assistant", "isSidechain": true', 1)
+
+            def sub(sid, name, *lines):
+                d = os.path.join(projc, sid, "subagents")
+                os.makedirs(d, exist_ok=True)
+                open(os.path.join(d, name), "w").write("".join(side(ln) for ln in lines))
+
             hot = os.path.join(projc, "hot.jsonl")
             open(hot, "w").write(recc("hot", "h1", 120_000) + recc("hot", "h2", CONTEXT_BAND))
             open(os.path.join(projc, "cool.jsonl"), "w").write(recc("cool", "c1", CONTEXT_BAND - 1, repo="rcool"))
@@ -1430,24 +1486,77 @@ def selfcheck():
             tutc = os.path.join(thc, ".cc", "state", "rtut", "i1", "chat", "abc", ".claude", "projects", "-home-tutor")
             os.makedirs(tutc)
             open(os.path.join(tutc, "chat.jsonl"), "w").write(recc("tut", "t1", 400_000, cwd="/home/tutor"))
-            rc1 = subprocess.run([sys.executable, me, "tick"], env=envc, capture_output=True, text=True)
+            # The 2026-10-03 audit's shape: a subagent's 170k turn under a parent that never crossed (kid), and a
+            # parent that did cross with a subagent bigger still (both) — its record must carry the parent's own peak.
+            par_kid = os.path.join(projc, "kid.jsonl")
+            open(par_kid, "w").write(recc("kid", "k1", 100_000, repo="rkid"))
+            sub("kid", "agent-a.jsonl", recc("kid", "k2", 170_000, repo="rkid"))
+            par_both = os.path.join(projc, "both.jsonl")
+            open(par_both, "w").write(recc("both", "b1", 160_000, repo="rboth"))
+            sub("both", "agent-b.jsonl", recc("both", "b2", 200_000, repo="rboth"))
+            # …and an ORPHAN sidechain turn: written in the parent's own file, with no subagent file holding its
+            # requestId, so it is counted there — as spend, never as the parent's peak.
+            open(os.path.join(projc, "orph.jsonl"), "w").write(
+                recc("orph", "p1", 100_000, repo="rorph") + side(recc("orph", "p2", 170_000, repo="rorph")))
+            rc0 = tick_c()
+            ok("while the day is on, nothing is recorded and each session's own peak is kept for the next tick",
+               rc0.returncode == 0 and ledger_c("rc") == [] and ledger_c("rboth") == []
+               and peak_c("hot") == CONTEXT_BAND and peak_c("both") == 160_000)
+            ok("an orphan sidechain turn in the parent's own file is the parent's spend but never its peak",
+               peak_c("orph") == 100_000 and spent_cr("orph") == 270_000)
+            rc1 = tick_c(CC_SPEND_CONTEXT_AT=nextday)
             l1 = ledger_c("rc")
-            ok("a turn at the context band writes exactly one spend/context-over-band record, under the session's repo",
+            ok("once the day is over, a turn at the context band writes exactly one spend/context-over-band record, "
+               "under the session's repo",
                rc1.returncode == 0 and len(l1) == 1 and l1[0]["kind"] == CONTEXT_KIND and l1[0]["writer"] == "cc-spend"
-               and l1[0]["links"]["source"] == f"spend-context:hot:{fresh[:10]}" and "1 over the context band" in rc1.stdout)
+               and l1[0]["links"]["source"] == f"spend-context:hot:{fresh[:10]}" and "2 over the context band" in rc1.stdout)
             ok("…a turn one token below the band writes none, and neither does an over-band turn older than GREW_WINDOW",
                ledger_c("rcool") == [] and ledger_c("rold") == [])
-            tsv_c = os.path.join(thc, ".cc", "state", "spend", f"{fresh[:10]}.tsv")
-            tut_c = [ln.rstrip("\n").split("\t") for ln in open(tsv_c)
+            tut_c = [ln.rstrip("\n").split("\t") for ln in open(os.path.join(thc, ".cc", "state", "spend",
+                                                                              f"{fresh[:10]}.tsv"))
                      if not ln.startswith("#") and ln.split("\t")[1] == "tut"]
             ok("…and a tutor turn over the band is counted as spend but files no record: handing off before the "
                "band is something a session can do and a student's chat cannot",
                len(tut_c) == 1 and tut_c[0][4] == "tutor" and ledger_c("rtut") == [])
-            subprocess.run([sys.executable, me, "tick"], env=envc, capture_output=True, text=True)
-            open(hot, "a").write(recc("hot", "h3", 300_000))
-            rc3 = subprocess.run([sys.executable, me, "tick"], env=envc, capture_output=True, text=True)
-            ok("…a second tick writes none, and nor does a third over a new over-band turn the same day",
-               rc3.returncode == 0 and len(ledger_c("rc")) == 1 and "1 over the context band" in rc3.stdout)
+            ok("a subagent's over-band turn files no record against its parent, yet its tokens are still the "
+               "parent session's spend", ledger_c("rkid") == [] and spent_cr("kid") == 270_000)
+            ok("…nor does an orphan sidechain turn: the parent's own 100k peak is under the band", ledger_c("rorph") == [])
+            lb = ledger_c("rboth")
+            ok("…and a parent that crossed on its own turn is recorded at its own peak, with its own transcript as "
+               "the evidence, never the bigger subagent turn or the subagent's file",
+               len(lb) == 1 and "cache_read_one_turn=160000" in json.dumps(lb[0]["cost"])
+               and f"transcript:{par_both}" in json.dumps(lb[0]["evidence"]) and "subagents" not in json.dumps(lb[0]))
+            # The reviewer's case: a session crosses at 160k, goes quiet, then resumes and climbs to 230k the same
+            # day. Nothing is written while the day is on, so the one record carries 230k, not the first crossing.
+            # The 2026-10-02 record froze at its first crossing.
+            rise = os.path.join(projc, "rise.jsonl")
+            open(rise, "w").write(recc("rise", "r1", 160_000, repo="rrise"))
+            rr1 = tick_c()
+            ok("a session over the band writes nothing yet, and its day peak is kept for the next tick",
+               rr1.returncode == 0 and ledger_c("rrise") == [] and peak_c("rise") == 160_000)
+            open(rise, "a").write(recc("rise", "r2", 230_000, repo="rrise"))
+            rr2 = tick_c()
+            held = (ledger_c("rrise"), peak_c("rise"))
+            rr3 = tick_c(CC_SPEND_CONTEXT_AT=nextday)
+            lr = ledger_c("rrise")
+            ok("…and when it resumes and climbs the same day, the one record written after the day ends carries "
+               "the day's real peak",
+               rr2.returncode == 0 and held == ([], 230_000) and rr3.returncode == 0 and len(lr) == 1
+               and "cache_read_one_turn=230000" in json.dumps(lr[0]["cost"]) and "1 over the context band" in rr3.stdout)
+            # A late line stamped before midnight re-makes a peak for a day already recorded: --once answers
+            # "already" with exit 0, so the entry leaves `peaks` and is not retried every tick.
+            open(rise, "a").write(recc("rise", "r3", 200_000, repo="rrise"))
+            open(hot, "a").write(recc("hot", "h3", 200_000))
+            rr4a = tick_c()
+            remade = (peak_c("rise"), peak_c("hot"))
+            rr4 = tick_c(CC_SPEND_CONTEXT_AT=nextday)
+            lr4 = ledger_c("rrise")
+            ok("…a peak re-made for a day already recorded writes no second record, the ledger keeps the final "
+               "230k, and the entry leaves `peaks`",
+               rr4a.returncode == 0 and remade == (200_000, 200_000) and rr4.returncode == 0
+               and len(lr4) == 1 and "cache_read_one_turn=230000" in json.dumps(lr4[0]["cost"])
+               and len(ledger_c("rc")) == 1 and "not recorded" not in rr4.stderr
+               and (peak_c("rise"), peak_c("hot")) == (None, None))
             shown = subprocess.run([os.path.join(os.path.dirname(me), "cc-failures"), "show", "--scope", "rc"],
                                    env=envc, capture_output=True, text=True).stdout
             ok("…and cc-failures shows it in its cluster", f"{l1[0]['cluster']}  {CONTEXT_KIND}  1 record(s)" in shown
