@@ -6,7 +6,8 @@
                                                                a unit names itself with CC_BROKER_SOURCE instead)
   cc-broker ledger [--once] <target> "text"                    record it and wake NOBODY; `--once` skips a line
                                                                already sitting unread in the file (THE LEDGER DOOR)
-  cc-broker --flush [<target>]                                 deliver what is due (cc-broker.timer, 60 s)
+  cc-broker --flush [<target>]                                 deliver what is due (cc-broker.timer, 60 s); a bare
+                                                               --flush also runs the riders (THE ONE TIMER, below)
   cc-broker report [--days N]                                  turns woken vs events submitted — the saving, in turns
   cc-broker selfcheck
 
@@ -52,6 +53,15 @@ retried, never dumped on him (the brief comms-requests-reach-who-decides). A pla
 rides this file (source `request`, class `now`) and is on file at ~/.cc/requests besides.
 WHAT HOLDS ONE. The flush asks `cc-tier allows pulse` as it asks `cc-pause is` — under tier stop, whose whole
 meaning is that nobody is woken, an injected event bought the seat a turn all the same. Held, never dropped.
+
+THE ONE TIMER. cc-broker.timer is the box's only delivery tick, so a bare `--flush` carries the two passes that used
+to have timers of their own (the owner's audit of 2026-10-03: cc-msg.timer and cc-broker.timer each ran 1,173 times
+a day for about 95 deliveries). Every tick, `cc-msg --drain` runs beside the flush, started first and waited for
+last, so a message spooled behind a busy pane or a dialog is typed within the same 60 s it always was and a slow
+inject here does not hold it up. Every SWEEP_S, after the flush, `cc-stall --apply` and then `cc-msg --sweep` run
+(they were cc-sweep.timer, 2 min). A rider that fails is a line on stderr, in the unit's journal, and never stops
+the flush or the other rider; what the drain could not deliver it keeps and reports itself, as it always did.
+A flush aimed at one target runs no rider: that is a caller's door, not the tick.
 """
 import sys, os, re, json, time, calendar, socket, subprocess, fcntl, contextlib
 
@@ -72,6 +82,10 @@ TOOK = ("delivered", "typed")           # cc-slack's two words for "a session ha
 # a live-again session and tells the owner itself if one never comes (cc-slack:163). Treating it as a miss cost a
 # turn per target per tick, which is the exact thing this file exists to save (review of #190, F7).
 HELD = ("queued", "spooled")
+MSG = os.environ.get("CC_BROKER_MSG") or f"{BIN}/cc-msg"          # the riders (THE ONE TIMER, above)
+STALL = os.environ.get("CC_BROKER_STALL") or f"{BIN}/cc-stall"
+SWEEP_S = int(os.environ.get("CC_BROKER_SWEEP_S", "120"))          # the sweep's own cadence, as cc-sweep.timer had it
+SWEEP_STAMP = f"{BROKER}/sweep.stamp"
 
 # What a source's events are when the text does not say otherwise. Anything unlisted is `digest`, because an event
 # we cannot name must still wake someone — just not alone.
@@ -294,6 +308,47 @@ def flush(target=None):
     return sum(flush_one(t) for t in targets)
 
 
+def rider(argv, wait=True):
+    """Start one rider. A failure to start is said on stderr and is never the flush's failure."""
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"cc-broker: could not run {' '.join(argv)}: {e}", file=sys.stderr)
+        return None
+    if wait:
+        p.wait()
+        if p.returncode:
+            print(f"cc-broker: {' '.join(argv)} exited {p.returncode}", file=sys.stderr)
+    return p
+
+
+def sweep_due():
+    """Due when the last sweep started SWEEP_S ago or more, less half a tick: the timer's 60 s arrive a few ms either
+    side, and a stamp read at 119.99 s must not push a 120 s sweep out to 180."""
+    try:
+        age = time.time() - os.stat(SWEEP_STAMP).st_mtime
+    except OSError:
+        return True
+    return age >= SWEEP_S - 30
+
+
+def tick():
+    """The bare --flush: the drain beside the flush, then the sweep when it is due (THE ONE TIMER, above)."""
+    drain = rider([MSG, "--drain"], wait=False)
+    try:
+        flush()
+    finally:
+        if sweep_due():
+            os.makedirs(BROKER, exist_ok=True)
+            open(SWEEP_STAMP, "a").close(); os.utime(SWEEP_STAMP)    # stamped at the START: a sweep that dies
+            rider([STALL, "--apply"])                                 # is not retried every tick
+            rider([MSG, "--sweep"])
+        if drain:
+            drain.wait()
+            if drain.returncode:
+                print(f"cc-broker: {MSG} --drain exited {drain.returncode}", file=sys.stderr)
+
+
 def paused(target):
     """`cc-pause on <repo>` parks a whole project and nothing the box does on its own may spend on it until
     `cc-pause off`. cc-pause owns that state; asking it is the only reading of it there is. It cannot run: behave
@@ -475,7 +530,10 @@ def main(argv):
     if argv[0] == "report":
         return report(int(argv[2]) if len(argv) > 2 and argv[1] == "--days" else 1)
     if argv[0] == "--flush":
-        flush(argv[1] if len(argv) > 1 else None)
+        if len(argv) > 1:
+            flush(argv[1])
+        else:
+            tick()
         return 0
     if argv[0] == "ledger":
         rest, once = argv[1:], False
@@ -549,10 +607,17 @@ def selfcheck():
         os.chmod(stub, 0o755)
     daemon("delivered")
     open(slow, "w").close()
+    riders = f"{th}/riders"           # the riders' stubs: a bare --flush must never reach the real cc-msg, whose
+    with open(f"{th}/rider-stub", "w") as f:   # sweep presses keys at every pane of this box's tmux
+        f.write('#!/usr/bin/env bash\necho "${0##*/} $*" >> "$CC_SC_RIDERS"\nexit "${CC_SC_RIDER_RC:-0}"\n')
+    os.chmod(f"{th}/rider-stub", 0o755)
+    for name in ("cc-msg", "cc-stall"):
+        os.symlink(f"{th}/rider-stub", f"{th}/{name}")
 
     def env(**extra):
         return {**os.environ, "HOME": th, "CC_BROKER_INJECT": stub, "CC_SC_REC": rec, "CC_SC_SLOW": slow,
-                "CC_BOX": "abox", "CC_NOTIFY_LOG_ONLY": "1", "CC_NOTIFY_LOG": f"{th}/notify.log",
+                "CC_BOX": "abox", "CC_NOTIFY_LOG_ONLY": "1",
+                "CC_BROKER_MSG": f"{th}/cc-msg", "CC_BROKER_STALL": f"{th}/cc-stall", "CC_SC_RIDERS": riders, "CC_NOTIFY_LOG": f"{th}/notify.log",
                 "CC_SPEND_TIER": "autonomous",     # the tier the box is on right now is nobody's fixture
                 **extra}
 
@@ -784,6 +849,34 @@ def selfcheck():
         ok("a unit naming itself with CC_BROKER_SOURCE groups exactly as --source does, and a caller that names "
            "itself nothing gets its own group instead of joining that one",
            by_flag == 1 and by_env == 1 and unnamed == 2)
+        os.truncate(rec, 0)
+
+        # THE ONE TIMER. Its own fixture: an empty riders file, the stamp gone, one event due.
+        open(riders, "w").close(); os.truncate(rec, 0)
+        with contextlib.suppress(OSError):
+            os.remove(f"{th}/.cc/broker/sweep.stamp")
+        run("inject", "--source", "reconcile", "r12", "idle: r12/t — quiet")
+        run("--flush", CC_BROKER_DEBOUNCE_S="0", CC_SC_RIDER_RC="1")
+        got = open(riders).read().splitlines()
+        ok("a bare --flush runs cc-msg --drain, and the first tick runs cc-stall --apply then cc-msg --sweep",
+           "cc-msg --drain" in got and got.count("cc-msg --sweep") == 1
+           and got.index("cc-stall --apply") < got.index("cc-msg --sweep"))
+        ok("…and riders that fail cost the flush nothing: the held event is still delivered",
+           "r12" in said() and not pending("r12"))
+        open(riders, "w").close()
+        run("--flush")
+        got = open(riders).read().splitlines()
+        ok("the next tick drains again but does not sweep: the sweep keeps its own 2 min",
+           got == ["cc-msg --drain"])
+        open(riders, "w").close()
+        old = time.time() - 100
+        os.utime(f"{th}/.cc/broker/sweep.stamp", (old, old))
+        run("--flush")
+        ok("…and once a tick is within half a tick of SWEEP_S, it sweeps again",
+           open(riders).read().splitlines().count("cc-msg --sweep") == 1)
+        open(riders, "w").close()
+        run("--flush", "r12")
+        ok("a flush aimed at one target runs no rider", open(riders).read() == "")
         os.truncate(rec, 0)
 
         out = run("report").stdout

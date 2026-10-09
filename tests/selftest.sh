@@ -3390,6 +3390,16 @@ inst
 rm -f "$IH/.config/systemd/user/timers.target.wants/gone-by-hand.timer"
 { [ ! -e "$IH/.config/systemd/user/retired.timer" ] && [ -L "$IH/.config/systemd/user/foreign.timer" ]; } && ok "a unit's dangling link is pruned once its source file is gone — a foreign dangling link is left alone" || bad "systemd-user prune scope: retired link $([ -e "$IH/.config/systemd/user/retired.timer" ] && echo kept || echo gone), foreign link $([ -L "$IH/.config/systemd/user/foreign.timer" ] && echo kept || echo gone)"
 rm -f "$IH/.config/systemd/user/foreign.timer"
+# …and with services on, a pruned unit is STOPPED as well as unlinked: a retired timer stays loaded and armed after
+# the reload otherwise, firing a not-found service every tick (cc-msg.timer and cc-sweep.timer, retired 2026-10-03).
+# Its own fixture: a recording systemctl, a retired link and a foreign one; no privileges, no real unit touched.
+FS="$T/fakesys"; mkdir -p "$FS" "$IH/.cc/slack/venv/bin"; : > "$T/systemctl.log"
+printf '#!/bin/sh\necho "$*" >> "%s"\n' "$T/systemctl.log" > "$FS/systemctl"; printf '#!/bin/sh\nexit 1\n' > "$FS/sudo"
+printf '#!/bin/sh\n' > "$IH/.cc/slack/venv/bin/python"; chmod +x "$FS/systemctl" "$FS/sudo" "$IH/.cc/slack/venv/bin/python"
+ln -s "$IR/config/systemd-user/retired.timer" "$IH/.config/systemd/user/retired.timer"; ln -s "$T/never-ours" "$IH/.config/systemd/user/foreign.timer"
+( cd "$IH" && env PATH="$FS:$PATH" HOME="$IH" XDG_CONFIG_HOME="$IH/.config" USER=tester CC_BOX=testbox GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" ) >"$T/install.log" 2>&1
+{ grep -qx -- '--user stop retired.timer' "$T/systemctl.log" && ! grep -q -- '--user stop .*foreign' "$T/systemctl.log" && ! grep -q -- '--user stop .*cc-broker' "$T/systemctl.log"; } && ok "a pruned unit is stopped on install, not just unlinked — a foreign or kept unit is not stopped" || bad "install stop of pruned units: $(grep -- ' stop ' "$T/systemctl.log" | tr '\n' ';')"
+rm -f "$IH/.config/systemd/user/foreign.timer"
 { [ -f "$IH/CLAUDE.md" ] && [ ! -L "$IH/CLAUDE.md" ] && grep -q '^# testbox — ' "$IH/CLAUDE.md" && grep -q 'Autonomy is the norm' "$IH/CLAUDE.md" && grep -q 'The owner approves' "$IH/CLAUDE.md" && grep -q '~/WORKING.md' "$IH/CLAUDE.md" && ! grep -q '<user>' "$IH/CLAUDE.md"; } && ok "~/CLAUDE.md seeded as a copy of the contract, <box>/<user> filled in, the rest left to the owner" || bad "~/CLAUDE.md not seeded as the box contract"
 miss=""; for g in USAGE COMMS RUNBOOK; do [ -f "$IH/$g.md" ] || miss="$miss $g"; done
 [ -z "$miss" ] && ok "the guides the contract points at exist at ~ (USAGE COMMS RUNBOOK; SLACK folded into COMMS)" || bad "guides missing:$miss"

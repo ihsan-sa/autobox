@@ -150,8 +150,13 @@ B
 if [ "$services" = 1 ]; then
   sudo -n loginctl enable-linger "$USER" 2>/dev/null || true
   systemctl --user daemon-reload
-  # a pruned unit that was already in failed state stays listed in --failed until reset, even after the reload
+  # A pruned unit is STOPPED too: a timer whose file left the tree is still loaded and armed after the reload, and
+  # it fires its service (now not-found) every tick until somebody stops it — cc-msg.timer and cc-sweep.timer, retired
+  # into cc-broker.timer on 2026-10-03, would have. Then a pruned unit that was in failed state stays listed in
+  # --failed until reset, even after the reload.
   # shellcheck disable=SC2086  # $pruned splits into unit names on purpose
+  [ -z "$pruned" ] || systemctl --user stop $pruned 2>/dev/null || true
+  # shellcheck disable=SC2086
   [ -z "$pruned" ] || systemctl --user reset-failed $pruned 2>/dev/null || true
   # Which units come on, and how, is `enable`/`start` in config/units.json — with the reason on each row. The two
   # the installer deliberately leaves off (cc-slackd, cc-vitals) are marked enable=owner there, not omitted here.
