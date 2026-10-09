@@ -23,13 +23,13 @@ Run `cc-green`. It takes the tree your working copy would commit and says whethe
 passed on it: the checks the landing's own plan selects for your change, not the whole suite, so a red there is the
 red the landing would stop on. `cc-green run` runs it when it has not, one run per worktree, into a log it names.
 A check can outlive a foreground tool call, so start it with `cc-green start`,
-which detaches the run itself and returns, then `cc-green wait` until its exit is not 3 (still going), and read the
-log it names. One of your repo's own suites the plan does not select goes the same way, `cc-green start --
+which detaches the run itself and returns. **Then end your iteration: do not sit in `cc-green wait`.** Journal first
+that the run is going, and leave `STATUS: DONE` for the iteration that has read a green log. The loop waits on the run
+with no model call and journals its exit and log, and your next iteration reads that log and finishes. A worker that
+waited in its own turn instead was killed at the hour cap 15 times out of 16 on 2026-09-30. One of your repo's own suites the plan does not select goes the same way, `cc-green start --
 tests/check-slow.sh` or `cc-green start -- bin/<tool> selfcheck`; it takes a committed suite and nothing else. Never add `setsid`, `nohup` or `&` yourself, because the auto-mode classifier
 refuses those as a bypass, and a `run_in_background` job dies with your iteration. If you edit while it runs, its
-verdict no longer answers for your tree: `cc-green stop` ends your own run (never `kill` it), then `start` again. The run outlives the
-iteration: if yours ends while the run is going, the loop waits on it (no model call) and journals its exit and
-log for your next context, which reads that log and finishes.
+verdict no longer answers for your tree: `cc-green stop` ends your own run (never `kill` it), then `start` again.
 
 `cc-green` also reads your diff for each defect class the landing review has stopped two or more PRs for, and names
 the line; a class it names holds the hand-over like a check that has not run. The classes come from the recorded

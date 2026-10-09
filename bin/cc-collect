@@ -350,11 +350,13 @@ def g_loops(w, repos, outbox, missing):
                 r = rows.setdefault((repo, track), {"repo": repo, "track": track, "first": ts, "iters": 0,
                                                     "iter_errors": 0, "done": 0, "blocked": 0, "exits": []})
                 r["last"], r["last_line"] = ts, cut(rest, TEXT["loop"])
-                if re.match(r"iter \d+ end", rest):
+                if re.match(r"iter \d+ end ", rest):   # the space: "iter N ended with its own cc-green run still going" is the same iteration, not another
                     r["iters"] += 1
                     r["iter_errors"] += not re.search(r" rc=0 err=false", rest)
                 elif re.match(r"(STATUS: )?DONE\b|DONE$", rest):
                     r["done"] += 1
+                elif re.match(r"iter \d+ ended with ", rest):
+                    pass   # the loop waiting on the iteration's own cc-green run: not an exit, and must not push a real one out of the three
                 elif "BLOCKED" in rest:
                     r["blocked"] += 1
                 elif len(r["exits"]) < 3:
@@ -735,6 +737,15 @@ def selfcheck():
         case("loops fold a track's exits in the window: iterations, failed ones, DONE and exit lines; starts and older lines not",
              len(Lp) == 1 and (Lp[0]["iters"], Lp[0]["iter_errors"], Lp[0]["done"], Lp[0]["blocked"]) == (2, 1, 1, 0)
              and Lp[0]["exits"] == ["01-10T12:00 exit 1: 3 consecutive failures"] and Lp[0]["last_line"] == "DONE")
+        _, _, got = run({"state/r/t/loop.log": f"{IN} iter 1 end rc=124 err=/ turns=\n"
+                                                f"{IN} iter 1 ended with its own cc-green run still going — waiting on it, no model call: x\n"})
+        case("an iteration whose cc-green run outlived it counts once: its 'iter N ended with…' line is not another iteration",
+             got["loops"][0]["iters"] == 1)
+        _, _, got = run({"state/r/t/loop.log": "".join(
+            f"{IN} iter {k} ended with its own cc-green run still going — waiting on it, no model call: x\n" for k in (1, 2, 3))
+            + f"{IN} exit 6: step limit\n"})
+        case("…and three such waits do not push the track's real exit line out of the snapshot",
+             [e.split(" ", 1)[1] for e in got["loops"][0]["exits"]] == ["exit 6: step limit"])
 
         # journals: touched in the window kept, an older one not
         h = fx({"state/r/t/progress.md": "## entry\nSTATUS: DONE\n", "state/r/u/progress.md": "old\n",

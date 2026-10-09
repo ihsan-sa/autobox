@@ -83,10 +83,12 @@
 # still editing the worktree. A stop file that predates the dispatch is stale and cleared: re-dispatching overrides it.
 # AN ITERATION THAT ENDS WITH ITS OWN cc-green RUN STILL GOING WAS NOT IDLE. The worker is told to start its green
 # (`cc-green start`, which runs `lander check` detached — a worker typing `setsid nohup` is refused by the classifier)
-# and wait on it; a long check outlives an iteration, and until 2026-09-19 ten
+# and then to END ITS ITERATION, not wait on it: on 2026-09-30, 15 of the 16 iterations killed at the hour cap had
+# started their run and then sat in `cc-green wait` in the model. A long check outlives an iteration, and until 2026-09-19 ten
 # tracks whose last iteration had only started that run were stopped as "committed nothing", each costing a relaunch
 # and a planning wake. So after every iteration the loop asks `cc-green wait` on the worktree (green_wait): a run
-# still going is waited out HERE, with no model call, its result is one journal line for the next fresh context, the
+# still going is waited out HERE, with no model call, for up to 6 h (one still queued then is journaled and handed on
+# as progress, not dropped), its result is one journal line for the next fresh context, the
 # iteration is not the journal-untouched or repeated-outcome runaway signal (the run explains both; the spend rule
 # still counts it), and at the step limit it buys ONE more iteration to read that result — once per round (gext:
 # the grant is not repeated until a commit starts a new round, or a worker re-running a red suite every iteration
@@ -345,7 +347,7 @@ selfrev_block(){   # $1 the base branch → the self-review paragraph the worker
     "$1" "$(cat "$CHECKLIST")"; }
 sp_worker(){   # $1 the base branch → the whole system prompt a headless worker is given. A function, like the
                # three in `cc`, so `cc-loop selfcheck` can read the prompt a worker really gets, not a copy of it.
-  printf %s "You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$1' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Be concise in the journal. Write the PR's description in $ST/pr-body.md before you finish: what changed, why, and how it was tested, with anything the lander must do after the merge (a restart, a migration). ~/WRITING.md has a worked example. cc done makes it the PR body and links the brief under it, so do not paste the brief; a line 'Closes <row>' there (several: 'Closes a, b and c') closes those board rows when the PR lands, and the brief's own Closes sentence counts. A Slack post the brief names as the deliverable goes in $ST/slack-post.md: first line the word thread (the row's own thread, where whoever dispatched you reads — a track has no channel of its own, never invent one) or a #channel the brief named; an optional second line 'file: <path under the worktree>' goes up with it; then the text. The loop posts it once at DONE, since you cannot.$(dispatch_block)$(writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(selfrev_block "$1")"; }
+  printf %s "You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$1' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Be concise in the journal. Write the PR's description in $ST/pr-body.md before you finish: what changed, why, and how it was tested, with anything the lander must do after the merge (a restart, a migration). ~/WRITING.md has a worked example. cc done makes it the PR body and links the brief under it, so do not paste the brief; a line 'Closes <row>' there (several: 'Closes a, b and c') closes those board rows when the PR lands, and the brief's own Closes sentence counts. A Slack post the brief names as the deliverable goes in $ST/slack-post.md: first line the word thread (the row's own thread, where whoever dispatched you reads — a track has no channel of its own, never invent one) or a #channel the brief named; an optional second line 'file: <path under the worktree>' goes up with it; then the text. The loop posts it once at DONE, since you cannot. Once you have started your green run with 'cc-green start', end the iteration: never wait on it in your turn. The loop waits on it with no model call and journals its exit and log, and your next iteration reads that log.$(dispatch_block)$(writing_block)$(raise_block)$(spend_block)$(mail_block)$(library_block)$(selfrev_block "$1")"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
   # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
   # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
@@ -500,14 +502,21 @@ tier_hold(){   # $1 start|continue · $2 repo/track -> 0 the spend tier says thi
   "$BIN/cc-tier" allows "$1" "$2" >/dev/null 2>&1; [ $? = 1 ]; }
 green_wait(){   # a cc-green run on THIS worktree still going when the iteration ended → wait it out here, journal its result, return 0; none → 1
   # "a live cc-green run of its own = not idle" (the brief). `cc-green wait` answers 3 while a run holds the root's lock,
-  # else the tree's report (0/1) or 2 for no checkout at all; only a 3 on the FIRST ask means a run was live. The wait is
-  # bounded at 8 × 540 s, past the hour an iteration itself gets, and costs no model call: the planning seat used to run
-  # this same wait by hand after the loop had stopped the track for it.
-  local o rc n=0 lg
-  while :; do o=$(cd "$WT" && "${CC_GREEN:-$BIN/cc-green}" wait 540 2>&1); rc=$?; [ "$rc" = 3 ] || break   # CC_GREEN: test hook
-    [ "$n" = 0 ] && log "iter $i ended with its own cc-green run still going — waiting on it, no model call: ${o##*$'\n'}"
-    n=$((n+1)); [ "$n" -ge 8 ] && { log "…still going after $n waits — going on without it"; return 1; }; done
-  [ "$n" -gt 0 ] || return 1
+  # else the tree's report (0/1) or 2 for no checkout at all. WHETHER A RUN IS LIVE is asked first, with `wait 0` (the
+  # lock tried once, after cc-green's 1 s grace), and kept: a run that ends 60 s into the first `wait 540` answers 0 there,
+  # the same as no run at all, and read that way its result was never journaled (review of PR #923). The wait
+  # costs no model call: the planning seat used to run this same wait by hand after the loop had stopped the track for it.
+  # "The wait has to outlast slot starvation, or hand the run to something that does" (the brief, 10-02): a run queued
+  # for a check slot sat 2 h+ and an 8-wait bound gave up on it, so the iteration read as "committed nothing" and the
+  # track paused. The bound is 40 × 540 s (6 h), and a run still live at it is journaled and handed to the next
+  # iteration as progress (return 0), never as an empty one; the spend-since-commit rule still bounds a runaway.
+  local o rc n=0 lg g="${CC_GREEN:-$BIN/cc-green}"   # CC_GREEN: test hook
+  o=$(cd "$WT" && "$g" wait 0 2>&1); [ $? = 3 ] || return 1   # no run live as the iteration ended: nothing to wait on
+  log "iter $i ended with its own cc-green run still going — waiting on it, no model call: ${o##*$'\n'}"
+  while :; do o=$(cd "$WT" && "$g" wait 540 2>&1); rc=$?; [ "$rc" = 3 ] || break
+    n=$((n+1)); [ "$n" -ge 40 ] && { log "…still going after $n waits — handing it to the next iteration"
+      printf -- '- cc-loop: the cc-green run iteration %s started is still going after %s waits (%s) — do not start another; end your turn and the loop waits again\n' \
+        "$i" "$n" "${o##*$'\n'}" >> "$ST/progress.md"; return 0; }; done
   lg=$(grep -oE -- '— log [^ ]+' <<<"$o" | head -1 | sed 's/^— log //')
   log "the cc-green run ended: exit $rc — ${o##*$'\n'}"
   printf -- '- cc-loop: the cc-green run iteration %s started ended while the loop waited on it (exit %s%s) — read that log before you run another\n' \
@@ -701,6 +710,31 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
   CHECKLIST="$realcl"
   t 'the shipped checklist is where the prompt says it is' "$(test -r "$CHECKLIST" && echo readable)" readable
   grep -q '^6\. ' "$CHECKLIST" 2>/dev/null;                    t 'and still carries all six entries' "$?" 0
+  # AN ITERATION THAT ENDS WITH ITS OWN cc-green RUN GOING: the worker is told to end its turn there, and the loop, not
+  # the model, waits the run out and journals it for the next iteration. Each case on a fixture of its own: a run still
+  # going on the first ask (kept: waited, journaled), one that ends inside the first long wait (kept: journaled, not read
+  # as "no run"), and none going (suppressed: nothing waited, nothing journaled).
+  grep -q 'do not sit in `cc-green wait`' "$CHECKLIST";  t 'the checklist tells the worker to end its iteration after cc-green start' "$?" 0
+  grep -q "end the iteration: never wait on it in your turn" <<<"$(repo=r track=t ST="$d/st"; sp_worker trunk)"; t 'and so does the prompt cc-loop builds' "$?" 0
+  # The fake models the run: $3 = live as the iteration ended (1/0); `wait 0` answers from that alone, and each long
+  # wait is one more 540 s, still going for the first $2 of them, ended on the next. `calls` counts every ask.
+  gw(){ ( mkdir -p "$d/gw/$1/wt" "$d/gw/$1/st"; : > "$d/gw/$1/st/progress.md"; : > "$d/gw/$1/calls"; : > "$d/gw/$1/longs"
+          printf '#!/bin/sh\n[ "$1" = wait ] || exit 9\necho x >> "%s"\nrun="cc-green: still running (pid 1, since 00:00)"\nif [ "$2" = 0 ]; then [ %s = 1 ] && { echo "$run"; exit 3; }; echo "cc-green: no run — red"; exit 1; fi\necho x >> "%s"\nn=$(wc -l < "%s")\nif [ "$n" -le %s ]; then echo "$run"; exit 3; fi\necho "cc-green: green — log /x/green.log"; exit 0\n' \
+            "$d/gw/$1/calls" "$3" "$d/gw/$1/longs" "$d/gw/$1/longs" "$2" > "$d/gw/$1/fake"; chmod +x "$d/gw/$1/fake"
+          k="$1"; log(){ printf '%s\n' "$*" >> "$d/gw/$k/loop.log"; }   # $1 inside log is the line, not the case
+          WT="$d/gw/$1/wt" ST="$d/gw/$1/st" CC_GREEN="$d/gw/$1/fake" i=4; green_wait; echo "rc=$? asks=$(wc -l < "$d/gw/$1/calls")" ); }
+  t 'a run still going when the iteration ended is waited out by the loop, no model call' "$(gw going 1 1)" "rc=0 asks=3"
+  t '…its result is journaled for the next iteration, log and all' \
+    "$(grep -c '^- cc-loop: the cc-green run iteration 4 started ended while the loop waited on it (exit 0, log /x/green.log)' "$d/gw/going/st/progress.md")" 1
+  t '…and loop.log says the iteration ended with it going, once' "$(grep -c '^iter 4 ended with its own cc-green run still going' "$d/gw/going/loop.log")" 1
+  t 'a run that ends inside the first long wait still counts as a live run, not as none' "$(gw early 0 1)" "rc=0 asks=2"
+  t '…and its result is journaled for the next iteration, log and all' \
+    "$(grep -c '^- cc-loop: the cc-green run iteration 4 started ended while the loop waited on it (exit 0, log /x/green.log)' "$d/gw/early/st/progress.md")" 1
+  t 'a run starved of a check slot past the bound still counts as progress, not an empty iteration' "$(gw starved 99 1)" "rc=0 asks=41"
+  t '…and is handed to the next iteration in the journal, not dropped' \
+    "$(grep -c '^- cc-loop: the cc-green run iteration 4 started is still going after 40 waits' "$d/gw/starved/st/progress.md")" 1
+  t 'no run going: nothing waited on' "$(gw none 0 0)" "rc=1 asks=1"
+  t '…and nothing journaled' "$(wc -c < "$d/gw/none/st/progress.md")" 0
   # ── the context trim: what a worker's environment gets, and what a trimmed turn still carries ──
   # OFF IS THE DEFAULT, and off means nothing at all — no context edit in the request, so the API drops
   # nothing and the run is the one this loop has always done. The config is a scratch file, never the box's.
