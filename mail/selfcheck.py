@@ -4258,6 +4258,128 @@ def run():
         k(rc8 == 1 and a8 == [] and n8 == n6 and any("MAIL_OUT_PER_HOUR=1" in e for e in errs27),
           "…and a mail the caps would stop mints no link either")
 
+    # ------------------------------- 28. `cc-mail doc`: a library document by mail, laid out by a swappable template
+    # "one command sends a library document to a verified address, with a test that proves an unverified address is
+    # refused and a template file is picked up" (the brief, 2026-09-29). Its own register, templates and fake cc-docs.
+    with Box(allow=ALLOWED) as b:
+        docs28, tpl28, argv28 = (os.path.join(b.tmp, n) for n in ("documents", "templates", "argv28"))
+        os.makedirs(docs28)
+        os.makedirs(tpl28)
+        with open(os.path.join(docs28, "register.json"), "w") as f:
+            json.dump({"projects": {"001": {"name": "Pitch"}}, "documents": {"001-0003": {
+                "project": "001", "title": "Q3 <plan>", "revisions": [{"rev": "A", "date": "2026-09-01"},
+                                                                      {"rev": "B", "date": "2026-09-07"}]},
+                "001-0004": {"project": "001", "title": "odd dates", "revisions": [{"rev": "A", "date": "2026-13-01"},
+                                                                                  {"rev": "B", "date": "2026-00-05"}]}}}, f)
+        fake28 = os.path.join(b.tmp, "cc-docs")
+        with open(fake28, "w") as f:
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + argv28 + "\necho https://lib.test/l/abc\n")
+        os.chmod(fake28, 0o755)
+
+        def argvs28():
+            if not os.path.exists(argv28):
+                return []
+            with open(argv28) as f:
+                out = f.read().splitlines()
+            os.remove(argv28)
+            return out
+
+        def part28(msg, ctype):
+            return next((p.get_content() for p in msg.walk() if p.get_content_type() == ctype), "") if msg else ""
+
+        env28 = {k: "" for k in r.SEND_KEYS if k not in Box.KEYS}
+        env28.update({"MAIL_SEND_ALLOW": ALLOWED, "MAIL_SEND_SECRET": "s3cret", "CC_DOCS_BIN": fake28,
+                      "CC_DOCS_ROOT": docs28, "MAIL_DOC_TEMPLATES": tpl28})
+        saved28 = {k28: os.environ.get(k28) for k28 in env28}
+        here28, out28, said28 = os.getcwd(), sys.stdout, [""]
+
+        def doc28(*argv):
+            sys.stdout = io.StringIO()
+            try:
+                return r.cmd_doc(r.flags(list(argv)))
+            finally:
+                said28[0] = sys.stdout.getvalue()
+                sys.stdout = out28
+
+        try:
+            os.environ.update(env28)
+            os.chdir(b.tmp)
+            with FakeWorker() as w:
+                os.environ["MAIL_SEND_URL"] = w.url
+                rc1 = doc28("001-0003", "--to", STRANGER)
+                n1, a1 = len(w.calls), argvs28()
+                rc2 = doc28("001-0003", "--to", ALLOWED, "--note", "As promised.")
+                m2, a2 = (w.calls[-1]["msg"] if len(w.calls) > n1 else None), argvs28()
+                with open(os.path.join(tpl28, "library-document.html"), "w") as f:
+                    f.write("<html><body><h1>OWNER LOOK</h1><a href='{{link}}'>{{ title }}</a> {{project}}</body></html>")
+                n3 = len(w.calls)
+                rc3 = doc28("001-0003-A", "--to", ALLOWED, "--subject", "the plan")
+                m3, a3 = (w.calls[-1]["msg"] if len(w.calls) > n3 else None), argvs28()
+                rcD = doc28("001-0003", "--to", ALLOWED, "--dry-run")
+                nD, aD, sD = len(w.calls), argvs28(), said28[0]
+                with open(os.path.join(tpl28, "library-document.html"), "w") as f:
+                    f.write("<p>{{titel}}</p>")
+                n4 = len(w.calls)
+                rc4 = doc28("001-0003", "--to", ALLOWED)
+                n4b, a4 = len(w.calls), argvs28()
+                with open(os.path.join(tpl28, "library-document.html"), "wb") as f:
+                    f.write(b"<p>{{title}} \xff\xfe</p>")
+                rc4c = doc28("001-0003", "--to", ALLOWED)
+                n4c, a4c = len(w.calls), argvs28()
+                import docmail                    # noqa: E402
+                dC, wC = docmail.document("001-0004-A", docs28)
+                dD, wD = docmail.document("001-0004-B", docs28)
+                os.remove(os.path.join(tpl28, "library-document.html"))
+                defaults28, docmail.DEFAULTS = docmail.DEFAULTS, os.path.join(b.tmp, "no-defaults")
+                try:
+                    rc4d = doc28("001-0003", "--to", ALLOWED)
+                    n4d, a4d = len(w.calls), argvs28()
+                finally:
+                    docmail.DEFAULTS = defaults28
+                os.environ["MAIL_OUT_PER_HOUR"] = "1"     # two cold mails went out above: the caps would stop this one
+                rc5 = doc28("001-0003", "--to", ALLOWED)
+                n5, a5 = len(w.calls), argvs28()
+        finally:
+            sys.stdout = out28
+            os.chdir(here28)
+            for k28, v in saved28.items():
+                if v is None:
+                    os.environ.pop(k28, None)
+                else:
+                    os.environ[k28] = v
+        err28 = b.err.getvalue()
+        k(rc1 == 1 and n1 == 0 and a1 == [] and ("not sent — %s is not one of the box's verified destinations" % STRANGER)
+          in err28, "`cc-mail doc` to an address off the verified list is refused by name, exit 1: nothing reaches "
+          "the worker and no library link is minted for it")
+        k(rc2 == 0 and m2 is not None and m2["Subject"] == "Q3 <plan>" and a2 == ["link 001-0003 --kind private --to %s" % ALLOWED]
+          and "https://lib.test/l/abc" in part28(m2, "text/plain") and "As promised." in part28(m2, "text/plain")
+          and "Q3 &lt;plan&gt;</a>" in part28(m2, "text/html") and "001-0003-B" in part28(m2, "text/html")
+          and "7 Sep 2026" in part28(m2, "text/html") and not list(m2.iter_attachments()),
+          "…to a verified one it goes with the default template: the document's private link and its title, current "
+          "revision, date and note, escaped in the HTML, and no file attached")
+        k(rc3 == 0 and m3 is not None and m3["Subject"] == "the plan" and a3 == ["link 001-0003-A --kind private --to %s" % ALLOWED]
+          and "<h1>OWNER LOOK</h1><a href='https://lib.test/l/abc'>Q3 &lt;plan&gt;</a> Pitch" in part28(m3, "text/html")
+          and "001-0003-A" in part28(m3, "text/plain"),
+          "…a library-document.html dropped into MAIL_DOC_TEMPLATES is the HTML from the next mail on, with no code "
+          "change, while the text falls back to the default; a revision links that revision")
+        k(rcD == 0 and nD == n3 + 1 and aD == ["link 001-0003 --kind private --to %s" % ALLOWED]
+          and sD.startswith("To: %s\nSubject: Q3 <plan>\n" % ALLOWED) and "https://lib.test/l/abc" in sD
+          and "<h1>OWNER LOOK</h1>" in sD,
+          "…--dry-run prints the mail it would send, link and template included, and sends nothing; the link is "
+          "minted all the same, as its help says")
+        k(rc4 == 1 and n4b == n4 and a4 == [] and "{{titel}}" in err28,
+          "…and a template naming a field that does not exist refuses the mail by that name before cc-docs is asked: "
+          "nothing sent and no link minted")
+        k(rc4c == 1 and n4c == n4 and a4c == [] and "not sent — cannot read the template " in err28
+          and "Traceback" not in err28,
+          "…a template that is not UTF-8 is a one-line refusal before cc-docs is asked, not a traceback")
+        k(rc4d == 1 and n4d == n4 and a4d == [] and "not sent — no template library-document.html in " in err28,
+          "…and with no template in either place the mail is refused by that line before cc-docs is asked")
+        k(wC is None and wD is None and dC["date"] == "2026-13-01" and dD["date"] == "2026-00-05",
+          "…and a register date whose month is outside 1-12 stands as written instead of crashing or naming Dec")
+        k(rc5 == 1 and n5 == n4b and a5 == [] and "not sent — " in err28 and "MAIL_OUT_PER_HOUR=1" in err28,
+          "…and a mail the caps would stop is refused before cc-docs is asked, so no link is minted for it")
+
     print("cc-mail selfcheck: %d passed, %d failed" % (n[0] - len(fails), len(fails)))
     return 1 if fails else 0
 

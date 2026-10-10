@@ -978,6 +978,15 @@ def cold_gate(cfg, to, bcc, channel):
     return rcpts, blind, from_a, ""
 
 
+def link_kind(cfg, rcpts):
+    """The `cc-docs link` flags for a mail to the normalised addresses `rcpts` (blind copies included): private
+    `--to` every one that is not the owner's, signed-in when the owner is all of them. pdf_links and `cc-mail doc`
+    (docmail) both ask by it."""
+    mine = owner_addrs(cfg)
+    others = [a for a in rcpts if a not in mine]
+    return ["--kind", "private"] + [x for a in others for x in ("--to", a)] if others else ["--kind", "signed-in"]
+
+
 def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace="", now=None):
     """A PDF goes out as a link to its library document, never attached (owner, 2026-09-28). Returns (the attachments
     left to attach, the link lines) or a str saying why nothing may be sent. Each .pdf is asked of
@@ -1005,9 +1014,7 @@ def pdf_links(cfg, to, attachments, run=None, bcc=None, channel="", workspace=""
         if not real:
             return cold_refused(cold_not_ours(a, rec, cfg))
         reals.append((a, real))
-    mine = owner_addrs(cfg)
-    others = [a for a in rcpts + blind if a not in mine]
-    kind = ["--kind", "private"] + [x for a in others for x in ("--to", a)] if others else ["--kind", "signed-in"]
+    kind = link_kind(cfg, rcpts + blind)
     run = run or __import__("subprocess").run
     lines = []
     for a, real in reals:

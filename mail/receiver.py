@@ -91,9 +91,20 @@ held mail the only word its sender gets until a person decides — and it is wri
                                             thread, the line ends with where the mail's thread is
   cc-mail send --to A[,B] [--bcc C[,D]] --subject S [--body TEXT] [--thread <chat_id>/<thread_ts>]
                                             the same with no files: the body is --body, or stdin without it
+  cc-mail doc <PPP-NNNN[-R]> --to A[,B] [--subject S] [--note TEXT] [--thread <chat_id>/<thread_ts>] [--dry-run]
+                                            mail one library document as its library link, laid out by the
+                                            template in MAIL_DOC_TEMPLATES (default ~/.cc/mail/templates,
+                                            library-document.html and .txt, else core/templates/mail's plain
+                                            one; core/mail/docmail.py has the rules). The mail passes send's
+                                            recipient gate (the verified list) and a look at the caps before
+                                            a link is minted; then it goes out exactly as `send` would.
+                                            --dry-run prints the mail instead (the link is minted all the
+                                            same; the site reuses it).
+                                            Host only: inside a member workspace it is refused
 
 SENDING IS THE ONLY THING HERE THAT IS NOT THE SERVER'S. `send` runs in the terminal it was typed in, talks to
-the Cloudflare Worker and not to this server, and is the only way into core/mail/outbound.py's cold path — no
+the Cloudflare Worker and not to this server, and is the only way into core/mail/outbound.py's cold path (`doc`
+is `send` with its mail composed from a library document, and goes the same way) — no
 mail's body and no Slack message can start a mail. INSIDE A MEMBER WORKSPACE (CC_MEMBER_SANDBOX=1) the same
 command has no config, no secret and no worker URL, and must not — a member can print anything in there — so
 it reads the ask exactly as here and hands it across the member socket (`~/.cc/slack/sock` inside, which is
@@ -1358,9 +1369,43 @@ def cmd_send(opt):
     return 0 if ok else 1
 
 
+def cmd_doc(opt):
+    """`cc-mail doc` — one library document by mail (core/mail/docmail.py composes it, send_to sends it as cmd_send
+    does). Exit 2 for a malformed ask, 1 for a refusal, 0 when it went or --dry-run printed it."""
+    num, to = (opt.get("_") or [""])[0], arg(opt, "--to")
+    if not num or not to:
+        print("usage: cc-mail doc <PPP-NNNN[-R]> --to A[,B] [--subject S] [--note TEXT] [--thread <chat_id>/<ts>] "
+              "[--dry-run]", file=sys.stderr)
+        return 2
+    thread = thread_of(arg(opt, "--thread"))
+    if isinstance(thread, str):
+        print(thread, file=sys.stderr)
+        return 2
+    if os.environ.get("CC_MEMBER_SANDBOX") == "1":   # the register and the link's credentials are the host's
+        print("cc-mail doc: not sent — it runs on the host; inside a workspace use cc-mail send", file=sys.stderr)
+        return 1
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import outbound                          # noqa: E402
+    import docmail                           # noqa: E402
+    conf = {k: cfg(k, "") for k in SEND_KEYS + ("MAIL_DOC_TEMPLATES",)}
+    channel = outbound.session_channel()
+    mail = docmail.compose(conf, num, to, arg(opt, "--subject"), arg(opt, "--note"), channel=channel)
+    if isinstance(mail, str):
+        outbound.cold_refused(mail)
+        print("not sent — " + mail, file=sys.stderr)
+        return 1
+    subject, text, html = mail
+    if "--dry-run" in opt:
+        print("To: %s\nSubject: %s\n\n%s\n%s" % (to, subject, text, html))
+        return 0
+    ok, line = outbound.send_to(conf, to, subject, text, channel=channel, mirror=mirrored, thread=thread, html=html)
+    print(line, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
 def main(argv):
     cmds = {"serve": serve, "stop": stop, "status": status, "list": cmd_list, "show": cmd_show,
-            "send": cmd_send}
+            "send": cmd_send, "doc": cmd_doc}
     cmd = argv[0] if argv else ""
     if cmd == "selfcheck":
         sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))

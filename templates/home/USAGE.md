@@ -119,6 +119,7 @@ How the conversation itself works — channels, threads, marks, who may do what,
 
 ## E-mail (`cc-mail`)
 - The box has a mail address of its own. A mail it receives gets a mirror thread in Slack, and a reply there goes back as mail by itself; a mail the box starts is one JSON file (`to`, `subject`, `body`, `attachments`) handed to `cc-mail send --json FILE`, only to an address you have verified (`MAIL_SEND_ALLOW`); a `bcc` key (or `--bcc A,B`) sends blind copies, each checked against the same list, named in no header and kept in the sent record; a named file is attached or the mail is not sent and the line says which and why, except a PDF, which goes as a link to its library document. Every session kind is told this at start (`config/mail-prompt.md`), so any channel can be asked for a mail. Setup and the wire: `cc-mail --help`.
+- `cc-mail doc <PPP-NNNN[-R]> --to A [--note TEXT] [--subject S] [--dry-run]` mails one library document as its link, only to a verified address; its look is `~/.cc/mail/templates/library-document.html` (and `.txt`) when you put one there, else a plain default.
 
 ## Check in from Claude.ai / Claude Desktop
 - Through the Slack connector: claude.ai posts as you into your channels — no extra server on the box.
