@@ -52,6 +52,8 @@
 #   cc-model return <target>          the owner's 👍 on a too-old card (cc-slack runs it), or a person by hand:
 #                                     `cc-handoff --overlap` for that window, unless it is on the primary already or has an overlap open
 #   cc-model tick                     what cc-model.timer runs every 60 s (see below)
+#                                     It reads its ~/.cc/config keys once, at its start, and each listing of live
+#                                     sessions takes one ps snapshot, not a pgrep per pane: the unit's 120 s has to hold at load 20.
 #   cc-model selfcheck                the classifier and the chain, on fixtures
 # tick: (1) normal — switch when cc-limit's stamp says the primary model is limited AND a second run has hit that
 #   same limit (one run's limit is not the box's — see cc-limit; a session cc-limit recorded as INDEPENDENTLY
@@ -204,7 +206,12 @@ PRIMARY="${CC_MODEL_PRIMARY:-claude-opus-5-5[1m]}"; FALLBACK="${CC_MODEL_FALLBAC
 PROBEM="${CC_MODEL_PROBE:-$PRIMARY}"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 SESSION="${CC_TMUX_SESSION:-main}"; PROC="${CC_MODEL_PROC:-claude}"
 now=$(date -u +%s); mkdir -p "$ST"
-fam(){ local f; f=$(grep -oiE 'fable|opus|sonnet|haiku' <<<"${1:-}" | head -1 | tr 'A-Z' 'a-z'); echo "${f:-${1:-}}"; }
+fam(){ fam_v "${1:-}"; printf '%s\n' "$REPLY"; }
+fam_v(){   # fam() without a fork: the family into REPLY. A tick calls it hundreds of times, and three forks a call cost
+           # seconds at load 15 (the 10-02 audit: 137 of 380 ticks ran past the unit's 120 s).
+           # After (stubbed copy of state, SIGPIPE ignored): 13-22 s at load 12-14, 23-26 s at load 24, 0 broken-pipe lines
+           # (before 55-67 s at load 12-14, 47 lines).
+  local l="${1:-}"; l="${l,,}"; if [[ "$l" =~ (fable|opus|sonnet|haiku) ]]; then REPLY="${BASH_REMATCH[1]}"; else REPLY="${1:-}"; fi; }
 idname(){   # a model id → the name the CLI prints for it: claude-fable-5-1 → "Fable 5.1", claude-opus-5 → "Opus 5".
             # fam() answers a DIFFERENT question — which rung of the chain a model is — and `claude-fable-5` and
             # `claude-fable-5-1` are one rung, one family, and two very different bills: cc-spend prices the old id's
@@ -281,31 +288,38 @@ label(){ idname "$(rung_id "$(fam "${1:-}")")" 2>/dev/null && return 0   # the r
   case "$(fam "${1:-}")" in fable) echo "Fable 5.1";; opus) echo "Opus 5";; sonnet) echo "Sonnet 5";; haiku) echo "Haiku";; *) echo "${1:-}";; esac; }
 CHAIN="${CC_MODEL_CHAIN:-claude-opus-5-5}"   # the one copy of the order (see above). NO FABLE RUNG: a rung above the
                                                               # primary would have reconcile type a Fable seat down and bank it as an outage move
-chain_all(){   # the canonical order: ONE RUNG PER FAMILY, first mention wins. A CC_MODEL_CHAIN that names a family twice
-               # would otherwise walk in a circle, and a caller that reruns on each rung would never stop (F7).
-  local m f; local -a ms; local -A seen=(); read -r -a ms <<<"$CHAIN"
-  for m in "${ms[@]}"; do f=$(fam "$m"); [ -n "$f" ] || continue
-    [ -n "${seen[$f]:-}" ] && continue; seen[$f]=1; printf '%s\n' "$m"; done; }
+rungs(){   # the canonical order into RUNGS: ONE RUNG PER FAMILY, first mention wins. A CC_MODEL_CHAIN that names a family
+           # twice would otherwise walk in a circle, and a caller that reruns on each rung would never stop (F7). Built
+           # again only when CHAIN changes. Callers walk RUNGS in their own shell, never a pipe: a reader that stopped at
+           # its match closed the pipe under the old chain_all's printf, and the journal took ~1,900 "write error: Broken pipe"
+           # lines an hour (10-02).
+  [ "${RUNGS_OF-$'\x01'}" = "$CHAIN" ] && return 0
+  local m; local -a ms; local -A seen=(); RUNGS=(); read -r -a ms <<<"$CHAIN"
+  for m in "${ms[@]}"; do fam_v "$m"; [ -n "$REPLY" ] || continue
+    [ -n "${seen[$REPLY]:-}" ] && continue; seen[$REPLY]=1; RUNGS+=("$m"); done; RUNGS_OF="$CHAIN"; }
 # THE FALLBACK IS THE CHAIN'S, NEVER A MODEL OF ITS OWN: the rung after the primary, its [1m] carried along, or nothing
 # when the primary is the last rung. A named default here (Sonnet until 2026-09-29) outlived a one-rung CC_MODEL_CHAIN,
 # and every Opus limit still typed the box down to Sonnet. Static: a rung recorded out is chain_next's business.
-chain_fallback(){ chain_all | awk -v w="$(fam "$PRIMARY")" -v s="$(grep -oE '\[[^][]*\]$' <<<"$PRIMARY")" \
-  'hit { if ($0 ~ /\]$/) print; else print $0 s; exit } index(tolower($0), w) { hit = 1 }'; }
+chain_fallback(){ local w sfx="" m hit=0   # walks RUNGS in this shell: no pipe, so nothing writes into a closed one
+  fam_v "$PRIMARY"; w="$REPLY"; [ -n "$w" ] || return 0; [[ "$PRIMARY" =~ (\[[^][]*\])$ ]] && sfx="${BASH_REMATCH[1]}"
+  rungs; for m in "${RUNGS[@]}"; do
+    if [ "$hit" = 1 ]; then case "$m" in *']') printf '%s\n' "$m";; *) printf '%s%s\n' "$m" "$sfx";; esac; return 0; fi
+    [[ "${m,,}" == *"$w"* ]] && hit=1; done; return 0; }
 [ -n "$FALLBACK" ] || FALLBACK=$(chain_fallback)
 chain(){   # …minus the rungs this account cannot run: a caller walking it must never be handed one of those
-  local m; while read -r m; do unavail "$(fam "$m")" || printf '%s\n' "$m"; done < <(chain_all); }
+  local m; rungs; for m in "${RUNGS[@]}"; do fam_v "$m"; unavail "$REPLY" || printf '%s\n' "$m"; done; }
 chain_next(){   # the model AFTER $1 on the chain, by family: "opus", "claude-opus-5" and "claude-opus-5[1m]" are one rung.
                 # A trailing [suffix] rides along: falling from fable[1m] to a bare opus silently drops the 1M context
                 # the caller was running with, and the rerun then fails for a reason nobody asked for (F7).
                 # A rung the account cannot run is stepped over — and $1 itself may be one (the primary, most days).
-  local src="${1:-}" w sfx m hit=0
-  [ -n "$(fam "$src")" ] || src="$PRIMARY"   # named nothing: start from where the box actually is
-  w=$(fam "$src"); sfx=$(grep -oE '\[[^][]*\]$' <<<"$src")
-  while read -r m; do
-    if [ "$hit" = 1 ]; then unavail "$(fam "$m")" && continue
+  local src="${1:-}" w sfx="" m hit=0
+  [ -n "$src" ] || src="$PRIMARY"   # named nothing: start from where the box actually is
+  fam_v "$src"; w="$REPLY"; [[ "$src" =~ (\[[^][]*\])$ ]] && sfx="${BASH_REMATCH[1]}"
+  rungs; for m in "${RUNGS[@]}"; do fam_v "$m"
+    if [ "$hit" = 1 ]; then unavail "$REPLY" && continue
       case "$m" in *']') printf '%s\n' "$m";; *) printf '%s%s\n' "$m" "$sfx";; esac; return 0; fi
-    [ "$(fam "$m")" = "$w" ] && hit=1
-  done < <(chain_all); return 1; }   # off the end of the chain (or a model that was never on it): nothing left to fall back to
+    [ "$REPLY" = "$w" ] && hit=1
+  done; return 1; }   # off the end of the chain (or a model that was never on it): nothing left to fall back to
 forced(){   # the model the box was MOVED to: the override, else the next rung when the primary is not this account's to
             # run, else NOTHING — the box is on its primary and nothing is forcing it off. `current` was this until
             # 2026-09-07; cc-loop still wants this question, because a worker dispatched with no --model runs on
@@ -338,7 +352,7 @@ resolve(){   # $1 model → the model to run NOW for a caller that asked for $1:
   local m="${1:-}" f r; f=$(fam "$m"); [ -n "$f" ] || { printf '%s\n' "$m"; return 0; }
   out_why "$m" >/dev/null || { printf '%s\n' "$m"; return 0; }
   chain_next "$m" && return 0
-  if ! chain_all | while read -r r; do [ "$(fam "$r")" = "$f" ] && exit 0; done; then r=$(chain | head -n1)
+  if ! ( rungs; for r in "${RUNGS[@]}"; do fam_v "$r"; [ "$REPLY" = "$f" ] && exit 0; done; exit 1 ); then r=$(chain | sed -n 1p)
     if [ -n "$r" ]; then case "$r" in *']') printf '%s\n' "$r";; *) printf '%s%s\n' "$r" "$(grep -oE '\[[^][]*\]$' <<<"$m")";; esac; return 0; fi; fi
   printf '%s\n' "$m"; }
 status_line(){   # "fable" | "opus until 11:40Z" | "opus until probe", and " — fable is not available to this account" when it is
@@ -435,12 +449,15 @@ rate_ok(){ local l s; l=$(awk -F'\t' '$3=="switch"{t=$2} END{print t+0}' "$LOG" 
 sessions(){   # "<pane-id> <window-name>" per live INTERACTIVE session: a pane whose DIRECT child is claude (pane id, so a split
               # window's non-claude active pane is never typed into)
               # (a headless --go worker runs cc-loop in its pane and its claude is a grandchild — never a session)
-  local id pp name
+              # ONE ps snapshot per call, not two pgreps per pane: a pgrep walks all of /proc, and 886 of them cost a
+              # loaded tick tens of seconds (10-02)
+  local id pp name; local -A sess=()
   [ -n "${CC_MODEL_SESSIONS:-}" ] && { cat "$CC_MODEL_SESSIONS" 2>/dev/null; return 0; }   # test hook: a fixture's list
+  while read -r pp; do sess[$pp]=1; done < <(ps -e -o ppid= -o comm= -o args= 2>/dev/null |
+    awk -v p="$PROC" '{k=$1; c[k]+=($2==p); $1=""; if(index($0,"cc-loop")) l[k]=1}   # a direct claude child, and no cc-loop one
+                      END{for(k in c) if(c[k] && !(k in l)) print k}')
   while read -r id pp name; do
-    [ -n "${pp:-}" ] || continue
-    pgrep -P "$pp" -x "$PROC" >/dev/null 2>&1 || continue
-    pgrep -P "$pp" -f cc-loop >/dev/null 2>&1 && continue
+    [ -n "${pp:-}" ] && [ -n "${sess[$pp]:-}" ] || continue
     printf '%s %s\n' "$id" "$name"
   done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id} #{pane_pid} #{window_name}' 2>/dev/null)
 }
@@ -699,17 +716,17 @@ reconcile(){   # EVERY TICK, NO EVENT NEEDED (owner, 2026-09-21): each live sess
 # ~/.cc/config IS READ ONCE PER RUN. `cc-config get` is a script of its own (~0.3 s under load), and planning, major and
 # primary_windows asked it on every call — several times per pane per pass. With ~50 panes every tick from 2026-09-28
 # 19:00Z ran into the unit's 120 s timeout and was killed: the lift stopped after five handoffs and nothing ran after it.
-declare -A CFG=()
-cfg(){   # $1 key → its env value when set, else ~/.cc/config's, read once and kept for the run (cfg_prime fills the
-         # parent shell, so the $(…) subshells the passes run in inherit it rather than each asking again)
-  local k="$1"; [ -n "${!k:-}" ] && { printf '%s\n' "${!k}"; return 0; }
+declare -A CFG=()   # the keys read so far; tick empties it after its pass
+cfg_v(){   # $1 key → its value into REPLY, no fork: the env when set, else this run's copy, else ~/.cc/config, read now
+           # and kept. A subshell's read dies with it, which is why cfg_prime fills the parent shell before a pass.
+  local k="$1"; if [ -n "${!k:-}" ]; then REPLY="${!k}"; return 0; fi
   [ -n "${CFG[$k]+x}" ] || CFG[$k]=$("$BIN/cc-config" get "$k" 2>/dev/null)
-  printf '%s\n' "${CFG[$k]}"; }
-cfg_prime(){ local k; for k in CC_MODEL_MAJOR CC_MODEL_PLANNING CC_MODEL_PRIMARY_WINDOWS; do cfg "$k" >/dev/null; done; }
+  REPLY="${CFG[$k]}"; }
+cfg_prime(){ local k; for k in CC_MODEL_MAJOR CC_MODEL_PLANNING CC_MODEL_PRIMARY_WINDOWS; do cfg_v "$k"; done; }
 major(){   # $1 window → 0 = handed back unasked. CC_MODEL_MAJOR (env, else ~/.cc/config; windows, space- or comma-
            # separated) is the whole list when set; else the default rule above. `~next`/`~old` is mid-handoff: never.
   local w="${1:-}" list; case "$w" in ''|*~*) return 1;; esac
-  list=$(cfg CC_MODEL_MAJOR)
+  cfg_v CC_MODEL_MAJOR; list="$REPLY"
   if [ -n "$list" ]; then tr ' ,' '\n\n' <<<"$list" | grep -qxF -- "$w"; return; fi
   case "$w" in */*) return 1;; *@*) return 0;; esac
   [ ! -d "${CC_MODEL_MEMBERS:-$HOME/.cc/members}/$w" ]; }
@@ -727,13 +744,14 @@ planning(){   # $1 window → 0 = a planning session. CC_MODEL_PLANNING (env, el
               # seat (`<repo>` with no workspace under ~/.cc/members). `~next`/`~old` is mid-handoff: the successor's own.
   local w="${1:-}" g gs=(); case "$w" in ''|*~*) return 1;; esac
   member_win "$w" && return 1
-  IFS=', ' read -ra gs <<<"$(cfg CC_MODEL_PLANNING)"   # read, not $(…): no pathname expansion
+  cfg_v CC_MODEL_PLANNING; IFS=', ' read -ra gs <<<"$REPLY"   # read, not $(…): no pathname expansion
   # shellcheck disable=SC2254   # $g unquoted on purpose: a glob
   for g in "${gs[@]}"; do case "$w" in $g) return 0;; esac; done
   case "$w" in */*) return 1;; *@*) return 0;; esac; return 0; }
 floor_fam(){ local f="${CC_MODEL_FLOOR:-}"   # unset: Opus when it is on the chain (the owner's word), else the fallback
-  [ -n "$f" ] || { [ -n "$(chain_all | grep -i opus)" ] && f=opus || f="$FALLBACK"; }; fam "$f"; }   # no -q: pipefail + SIGPIPE
-rung_of(){ [ -n "$(fam "${1:-}")" ] || return 0; chain_all | awk -v f="$(fam "${1:-}")" '{m=tolower($0)} index(m, f){print NR; exit}'; }   # $1 model → its place on the chain (1 = the primary), or nothing
+  [ -n "$f" ] || { rungs; [[ "${RUNGS[*],,}" == *opus* ]] && f=opus || f="$FALLBACK"; }; fam "$f"; }
+rung_of(){ local f m n=0; fam_v "${1:-}"; f="$REPLY"; [ -n "$f" ] || return 0   # $1 model → its place on the chain (1 = the primary), or nothing
+  rungs; for m in "${RUNGS[@]}"; do n=$((n + 1)); [[ "${m,,}" == *"$f"* ]] && { printf '%s\n' "$n"; return 0; }; done; }
 below_floor(){ local r fl; r=$(rung_of "${1:-}"); fl=$(rung_of "$(floor_fam)"); [ -n "$r" ] && [ -n "$fl" ] && [ "$r" -gt "$fl" ]; }   # $1 model → 0 = a lower rung than the floor
 floor_rung(){ if [ "$(fam "$FALLBACK")" = "$(floor_fam)" ]; then printf '%s\n' "$FALLBACK"; else rung_id "$(floor_fam)"; fi; }
 # ── ONLY LISTED WINDOWS BELONG ON THE PRIMARY (the owner names the seats that stay on the primary, 2026-09-22, and
@@ -748,7 +766,7 @@ floor_rung(){ if [ "$(fam "$FALLBACK")" = "$(floor_fam)" ]; then printf '%s\n' "
 # row would have want_of ask for the primary again on the next tick and loop a handoff. THE OUTAGE PATH IS UNTOUCHED —
 # a pane with a row belongs on what that row says, listed or not, and still returns by handoff at the lift. Workers,
 # tracks and member windows have no band here at all and stay where their dispatcher put them.
-primary_windows(){ cfg CC_MODEL_PRIMARY_WINDOWS; }
+primary_windows(){ cfg_v CC_MODEL_PRIMARY_WINDOWS; printf '%s\n' "$REPLY"; }
 listed_primary(){   # $1 window → 0 = named on CC_MODEL_PRIMARY_WINDOWS. An empty list names nobody; `~next`/`~old` is
                     # mid-handoff and is nobody's here, as it is for planning() and major().
   local w="${1:-}" g gs=(); case "$w" in ''|*~*) return 1;; esac
@@ -1444,7 +1462,7 @@ settings_guard(){
   done; }
 rung_id(){   # $1 family → the id the chain (or the primary) spells it as: what a restore types back
   local f="${1:-}" m; [ "$f" = "$(fam "$PRIMARY")" ] && { printf '%s\n' "$PRIMARY"; return 0; }
-  while read -r m; do [ "$(fam "$m")" = "$f" ] && { printf '%s\n' "$m"; return 0; }; done < <(chain_all); printf '%s\n' "$f"; }
+  rungs; for m in "${RUNGS[@]}"; do fam_v "$m"; [ "$REPLY" = "$f" ] && { printf '%s\n' "$m"; return 0; }; done; printf '%s\n' "$f"; }
 credits_panes(){   # (1c): every live session showing the line is moved off the model it names, in EVERY state — the
                    # box may already be off it (the 2026-09-15 00:5xZ stall: the override on Opus, two orchs launched
                    # on Fable by their dispatcher, refused on their next turn, and read as `mismatch` for hours).
@@ -1646,9 +1664,9 @@ probe_unavailable(){   # EVERY family on record as one the account cannot run is
     esac
   done <<<"$fs"
   return 0; }
-tick(){
+tick(){ local rc; cfg_prime; tick_pass; rc=$?; CFG=(); return "$rc"; }   # the config keys every pass asks for, read once (cfg_v), for this pass only
+tick_pass(){
   local id name cap line h m rc nx pp pf pe pw ptill why k pout lm
-  cfg_prime
   drop_stale_rows   # rows from an episode cleared by hand are gone before (1c) reads them
   settings_guard    # (0) the two harness keys that stop a pause: reported to the owner when off, never written
   flag_panes        # (1d) the safeguards dialog, in every state
@@ -2029,6 +2047,21 @@ TXT
   t 'a repeated family is one rung'       "$(chain | wc -l)"             2
   got=$(chain_next "$c2"); t 'so the walk still ends' "$got:$?" ":1"
   CHAIN="$oldchain"
+  # THE 10-02 JOURNAL: ~1,900 "printf: write error: Broken pipe" lines an hour, the old chain_all's printf into a reader
+  # that stopped at its match. systemd starts the unit with SIGPIPE ignored, so the write failed loudly instead of quietly.
+  got=$( ( trap '' PIPE; for _ in $(seq 40); do rung_of "$c2"; rung_id "$(fam "$c2")"; chain_next "$c1"; floor_fam; resolve "$c2"; chain_fallback; done ) 2>&1 >/dev/null )
+  t 'with SIGPIPE ignored, as under systemd, walking the chain writes nothing to stderr' "$got" ""
+  t '…and still finds each rung, and nothing for a family off the chain' "$(rung_of "$c1"):$(rung_of "${c2}[1m]"):$(rung_of gpt)" "1:2:"
+  # A LOADED TICK (10-02, load 16-22): 137 of 380 ticks ran past the unit's 120 s, and 128 cc-config calls a tick were
+  # ~45 s of it. tick reads each key once and forgets them after; the env still wins, and outside a tick nothing is kept.
+  local cfgbin="$BIN"; mkdir -p "$d/cfgbin"; BIN="$d/cfgbin"
+  printf '#!/bin/sh\necho "$2" >> "%s/cfgcalls"\n[ "$2" = CC_MODEL_PLANNING ] && echo "lab/*"\nexit 0\n' "$d" > "$BIN/cc-config"; chmod +x "$BIN/cc-config"
+  local oldtp; oldtp=$(declare -f tick_pass); local cfgpl="${CC_MODEL_PLANNING-}"; unset CC_MODEL_PLANNING
+  tick_pass(){ planning lab/a && planning lab/b && ! planning other/c && echo "$(planning lab/c && echo y)" > "$d/cfgseen"; CC_MODEL_PLANNING='solo/*' planning solo/x && echo env >> "$d/cfgseen"; }
+  : > "$d/cfgcalls"; tick
+  t 'a tick reads each config key once, however often its passes ask' "$(wc -l < "$d/cfgcalls"):$(paste -sd, "$d/cfgseen")" "3:y,env"
+  t '…and keeps nothing after it: the next read outside a tick asks again' "${#CFG[@]}:$(planning lab/z && echo y):$(wc -l < "$d/cfgcalls")" "0:y:4"
+  eval "$oldtp"; BIN="$cfgbin"; [ -n "$cfgpl" ] && CC_MODEL_PLANNING="$cfgpl"
   # ── A MODEL THIS ACCOUNT CANNOT RUN (2026-09-03): recorded, left out of the chain, and the box moved off it ──────
   # Own state under $d, no tmux at all (no live session is listed here, let alone typed into), a stub cc-notify.
   local oldlog="$LOG" oldbin="$BIN" oldproc="$PROC" oldchain2=""
@@ -2647,6 +2680,7 @@ TXT
   # and an Opus limit parks the planning seats and moves the track as before. The rest of this block runs on it.
   CHAIN="$CHAIN claude-sonnet-5"; FALLBACK=$(chain_fallback)
   t '(o) a two-rung CC_MODEL_CHAIN still has its fallback: the rung after the primary, [1m] carried' "$FALLBACK" 'claude-sonnet-5[1m]'
+  t '(o) …and a rung with a [suffix] of its own keeps that one' "$(CHAIN="${CHAIN% *} claude-sonnet-5[200k]"; chain_fallback)" 'claude-sonnet-5[200k]'
   rm -f "$UNAV"; note_unavailable fable 'Fable 5.1 requires usage credits'
   t '(o) shipped: a worker asking for Fable, off the chain and out, runs on the primary, not refused as fable[1m]' \
     "$(resolve 'fable[1m]'):$(resolve claude-fable-5-1)" "$PRIMARY:$(sed 's/\[1m\]$//' <<<"$PRIMARY")"
@@ -2795,7 +2829,7 @@ TXT
   t '(r) another login'"'"'s refusal: recorded under its name, nothing moved, the owner not told' \
     "$([ -s "$d/model-unavailable.member" ] && echo own):$([ -e "$d/model-unavailable" ] && echo box):$([ -e "$OV" ] && echo ov):$(wc -l < "$d/typed"):$(grep -c '^notify' "$d/calls")" "own:::0:0"
   CRED=""; UNAV="$d/model-unavailable"
-  t '(r) …and the box'"'"'s own record does not have it: its chain is whole' "$(chain | grep -c .)" "$(chain_all | grep -c .)"
+  t '(r) …and the box'"'"'s own record does not have it: its chain is whole' "$(chain | grep -c .)" "$(rungs; echo "${#RUNGS[@]}")"
   rm -f "$d/model-unavailable.member"; unset CC_MODEL_PLANNING CC_MODEL_PRIMARY_WINDOWS; unset -f pl
   forget_unavailable "$(fam "$PRIMARY")"; rm -f "$MOVED" "$OV" "$UNAV" "$d/typed"; unset -f typed
   if [ -n "$oldsess" ]; then CC_MODEL_SESSIONS="$oldsess"; else unset CC_MODEL_SESSIONS; fi
