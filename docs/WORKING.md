@@ -127,6 +127,8 @@ finish them or abandon them first. A retired session is gated as a worker — it
 so anything left running is the successor's to pick up, worktrees and landing both.
 
 ## the reading procedure
+The knowledge base is what `cc-lib` serves: the journals, boards, landing records and memory the box indexes as
+sessions write them. The library is something else, the document library `cc-docs` files finished PDFs into.
 The rule, one line in every session's standing text (`config/library-prompt.md`): an owner-facing claim about a
 permission, a process, merged code, a live service, a PR's review or what a track did is preceded by `cc-lib ask`
 or a probe of the object, and the ticket it prints is the receipt. Of fifteen recorded misses

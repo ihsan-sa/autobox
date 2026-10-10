@@ -142,7 +142,7 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc-wakes [--from D --to D]           cache reads per wake-up: kind × cause, and what they re-read (handoff, re-read, base)
     cc-collect [--since D --until D]     the day's snapshot of the box's own workings for improvement passes, no model (~/.cc/state/improve/snapshots/latest)
     cc-improve-batch [<day>]             the day's ranked problems from that snapshot, and what it cost (~/.cc/state/improve/reports/<day>.md)
-    cc-lib ask --object '#71' --need current "…"   read the record before you claim: a PR's landing tally, a row and its
+    cc-lib ask --object '#71' --need current "…"   ask the knowledge base before you claim: a PR's landing tally, a row and its
                                          journal, a rule — capped, cited, with COVERAGE and a ticket; `cc-lib --help`
     cc-docs file <pdf> --project P --title T   number, stamp and file a finished PDF (PPP-NNNN-R); `cc-docs find 001-0004`
                                          or words prints the current revision's file; `--attach F` (repeatable) or

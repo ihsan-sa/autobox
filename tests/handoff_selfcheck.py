@@ -1759,7 +1759,7 @@ def run_selfcheck():
                rc9 == 1 and not [a for a in tcalls[n0:] if a[0] == "new-window"] and not read(PERMS))
         wins.pop(PERMS, None)
 
-        # INDEX-AT-WRITE: the line journal() appends is in the library's index when it returns — `cc-lib ask` finds
+        # INDEX-AT-WRITE: the line journal() appends is in the knowledge base's index when it returns — `cc-lib ask` finds
         # it as a checkpoint under the target's own journal, and had nothing to re-read itself (re-read absent from
         # COVERAGE: the hook did it, not the ask). Its own HOME with one registered board, and the baseline pass
         # first, so the only stale source a lazy ask could catch up on is the entry.
