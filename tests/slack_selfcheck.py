@@ -7240,6 +7240,12 @@ def run_selfcheck():
         r_esc_hot = ms_req({"escalate": "<!channel> @owner ```pwned",
                             "text": "click [here](https://evil.example) <@U123> & tell @owner\n```\n" + "x" * 2000})
         ran_esc = ranMS[len(ran_two) + len(ran_rep_n) + n_ran_rep:]
+        # …and one titled with a track: cc-loop's stop from inside the boundary, where its own broker call is shut
+        n_esc_trk = len(ranMS)
+        r_esc_trk = ms_req({"escalate": "alice/pna was refused", "text": "every model refused\non the spend limit"})
+        ran_esc_trk = ranMS[n_esc_trk:]; n_esc_trk = len(ranMS)
+        r_esc_bob = ms_req({"escalate": "bob/pna was refused", "text": "not alice's track"})
+        ran_esc_bob = ranMS[n_esc_trk:]
         # escalate + notice: A TRACK'S OWN END LINE (a-finished-worker-reaches-its-thread). A member's DONE crossed as an
         # escalation on 2026-09-20 and reached the owner's DM, the project thread nothing. Its own fixture: alice/pna has a
         # thread (TRACKS), the upload is stubbed, and the file lives under the workspace's tree.
@@ -8032,6 +8038,15 @@ def run_selfcheck():
                                                "--ask", "--from", "alice", "--", "the owner must decide this"]]
           and "planning seat" in r_esc.get("text", "") and "owner was told" not in r_esc.get("text", "")
           and r_esc_empty.get("ok") is False and "something to say" in r_esc_empty.get("error", ""))
+    check("MEMBER socket: an escalation titled with one of the workspace's OWN tracks (cc-loop's stop from inside) is the "
+          "request above AND one `loop:` line to that workspace's own seat, the one that dispatched the track "
+          "(raised-a-spend-limit-stop-reaches-no-one); a title naming another workspace's track is the request alone",
+          r_esc_trk.get("ok") and ran_esc_trk == [
+              [f"{BIN}/cc-notify", "-t", "alice: alice/pna was refused", "--ask", "--from", "alice", "--", "every model refused\non the spend limit"],
+              [f"{BIN}/cc-broker", "inject", "--no-start", "--source", "loop", "alice", "loop: alice/pna was refused — every model refused on the spend limit"]]
+          and "alice's own seat has the line" in r_esc_trk.get("text", "")
+          and r_esc_bob.get("ok") and len(ran_esc_bob) == 1 and ran_esc_bob[0][:3] == [f"{BIN}/cc-notify", "-t", "alice: bob/pna was refused"]
+          and "own seat" not in r_esc_bob.get("text", ""))
     # A cc-notify that TIMES OUT after filing the request is not a failed escalation (a member was told it failed after
     # the seat answered in 39 s): its own requests dir, one ask that files and then hangs, one that hangs having filed
     # nothing, and one whose only file of that title is from before the ask.
@@ -8055,6 +8070,31 @@ def run_selfcheck():
         EFFECTS.run_impl = hang(("req-old.json", {"id": "req-old", "from": "alice", "title": "alice: stuck",
                                                  "at": "2026-01-01T00:00:00Z"}))
         r_old = dmMS.member_verb("alice", {"escalate": "stuck", "text": "help"}, "escalate")
+        # …and cc-loop's stop (titled with an own track) recovered the same way still reaches the workspace's own seat;
+        # a broker that raises is that line's failure only. `notify`/`broker` are what each one does: an exit code or
+        # an exception to raise; a filing cc-notify writes the request first.
+        def two(notify, broker, seen, write=None):
+            def impl(cmd, **kw):
+                seen.append(list(cmd))
+                if cmd[0].endswith("/cc-notify") and write:
+                    json.dump(dict(write, at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())), open(f"{reqD}/{write['id']}.json", "w"))
+                rc = notify if cmd[0].endswith("/cc-notify") else broker
+                if isinstance(rc, BaseException):
+                    raise rc
+                return types.SimpleNamespace(returncode=rc, stdout="req-ok", stderr="the broker did not take it")
+            return impl
+        stop = {"escalate": "alice/pna was refused", "text": "every model refused"}
+        filed_stop = lambda i: {"id": i, "from": "alice", "title": "alice: alice/pna was refused"}   # stamped when it files
+        ran_rc1, ran_to, ran_braise, ran_bos = [], [], [], []
+        EFFECTS.run_impl = two(1, 0, ran_rc1, filed_stop("req-rc1"))
+        r_stop_rc1 = dmMS.member_verb("alice", dict(stop), "escalate")
+        shutil.rmtree(reqD); os.makedirs(reqD)   # so the timeout's reply can only name its own request
+        EFFECTS.run_impl = two(subprocess.TimeoutExpired("cc-notify", 60), 0, ran_to, filed_stop("req-to"))
+        r_stop_to = dmMS.member_verb("alice", dict(stop), "escalate")
+        EFFECTS.run_impl = two(0, subprocess.TimeoutExpired("cc-broker", 30), ran_braise)
+        r_stop_braise = dmMS.member_verb("alice", dict(stop), "escalate")
+        EFFECTS.run_impl = two(0, OSError("no such file: cc-broker"), ran_bos)
+        r_stop_bos = dmMS.member_verb("alice", dict(stop), "escalate")
     finally:
         globals()["REQUESTS"], EFFECTS.run_impl = was_reqs, was_impl
         shutil.rmtree(reqD, ignore_errors=True)
@@ -8064,6 +8104,17 @@ def run_selfcheck():
           r_filed.get("ok") is True and "req-a" in r_filed.get("text", "")
           and r_lost.get("ok") is False and "did not return" in r_lost.get("error", "")
           and r_old.get("ok") is False)
+    seat_call = [f"{BIN}/cc-broker", "inject", "--no-start", "--source", "loop", "alice", "loop: alice/pna was refused — every model refused"]
+    check("MEMBER socket: cc-loop's stop whose cc-notify exited nonzero or timed out AFTER filing the request still hands "
+          "the workspace's own seat its `loop:` line, and the reply names the request and that seat; a broker inject "
+          "that raises (a timeout, an OSError) leaves the request reported filed, with that seat named as not reached "
+          "(raised-a-spend-limit-stop-reaches-no-one)",
+          all(r.get("ok") is True and len(ran) == 2 and ran[1] == seat_call
+              for r, ran in ((r_stop_rc1, ran_rc1), (r_stop_to, ran_to), (r_stop_braise, ran_braise), (r_stop_bos, ran_bos)))
+          and "req-rc1" in r_stop_rc1.get("text", "") and "alice's own seat has the line" in r_stop_rc1.get("text", "")
+          and "req-to" in r_stop_to.get("text", "") and "alice's own seat has the line" in r_stop_to.get("text", "")
+          and all("planning seat has it" in r.get("text", "") and "alice's own seat was not reached" in r.get("text", "")
+                  for r in (r_stop_braise, r_stop_bos)))
     # A FAILED DOCS CALL SAYS WHY in the log (it said a bare "ok=False"); a filed one adds nothing. run_docs stubbed.
     was_rd, dlog = globals()["run_docs"], io.StringIO()
     try:

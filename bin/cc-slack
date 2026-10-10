@@ -21,7 +21,7 @@
   cc-slack track-thread <repo>/<track> [--title T]   the ONE thread a --go track lives in, in #<repo>-updates when the repo has that lane, else #<repo> (a member workspace: its own #<handle>): opened by `cc … --go`, idempotent, prints `<chat> <ts>`; a track gets no channel of its own, and a repo with none of its own that CC_PROJECT_CHILDREN puts under a parent gets its threads — and its --route lines and PR cards — in the parent's channels. Its worker's lines (post --route "<repo>/<track> …") and its landing line go there, and a reply there reaches the track's session — or, for a headless or finished track, the repo's session with the track named; no notice line is posted.
   cc-slack mkchannel <name>… [--public]     create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the topic; a #<repo>--<sub> name inherits #<repo>'s people; comes paired with #<name>-updates.
   cc-slack project <name>             from a member workspace's session, ask the daemon for the project's board row and its one thread in #<this workspace> (no channel); at most 3 an hour; the human way is `new project <name>` typed in the channel.
-  cc-slack escalate --notice [--file P] [--id ID] -t "<h>/<track> <kind>" "text"   from inside a member boundary: a worker's END LINE or its Slack deliverable — posted by the host into the track's thread (the file with it, under the text) and one `loop:` line to the control seat; never a request or a page. --id posts it once (the ledger keeps it under the workspace's name); the seat's line goes every time. cc-notify (a plain call titled with the track) and cc-loop use it. Without --notice, `escalate` is cc-notify's --ask relay.
+  cc-slack escalate --notice [--file P] [--id ID] -t "<h>/<track> <kind>" "text"   from inside a member boundary: a worker's END LINE or its Slack deliverable — posted by the host into the track's thread (the file with it, under the text) and one `loop:` line to the control seat; never a request or a page. --id posts it once (the ledger keeps it under the workspace's name); the seat's line goes every time. cc-notify (a plain call titled with the track) and cc-loop use it. Without --notice, `escalate` is cc-notify's --ask relay, and one titled `<h>/<track> …` (cc-loop's stop) also hands that workspace's own seat a `loop:` line.
   cc-slack ask [-t "title"] "text"      from a member workspace's session, ask the box's planning seat (a repo, a host-side push, a question): the daemon posts a 🙋 card in the control repo's #<repo>-threads lane on the workspace's behalf, hands it to the planning session, and carries every reply in the card's thread (the seat's or the owner's) back to #<workspace>, handed to its session; at most 5 an hour. Never ask the owner to relay.
   cc-slack seat                          the seat the daemon says owns this process (`<repo>`, `<repo>/<track>`, `<repo>@<alias>`), from the socket's pid chain and the live subscriptions; empty and exit 1 when none does, exit 2 when the daemon could not be reached at all. cc-notify reads it to decide who may ask the owner, and a caller it cannot identify (exit 2) is not the box's own hand.
   cc-slack grant allow '<rule>' [-t "why"]   from a box session (planning or a track) that a permission layer refused: the daemon posts a 🔐 grant card in the control repo's #<repo>-threads lane naming that ONE allow line; the owner's `yes <id> fix` there has the daemon write it into ~/.claude/settings.json (cc-settings grant), `no <id>` declines; the card shows ⚙️ or ❌. `cc-slack grant config KEY VALUE` is the same for one ~/.cc/config key (never a credential's). An allow or config ask goes to the box's approver first (cc-approve, APPROVER=off skips it): what the owner's merged grants cover, asked by a planning seat, the daemon writes with no card and a ⚙️ line in that lane; the rest is the card. Never a member workspace's verb, never answerable by a session; at most 5 an hour. `cc-slack grant unit <file.service|.timer>` is the same card for a user unit install (file, sha256 and the enable both named). `cc-slack grant confirm '<command>' -w <window>` is the same card for a seat parked on the auto-mode confirm dialog behind a command that is not read-only (cc-model's tick raises it): the owner's `yes <id>` / `no <id>` is written to ~/.cc/state/confirm-answers/<id>, and cc-model's next tick presses that answer into the dialog — this once, never for good. Design: docs/design-seat-grant-from-slack.md.
@@ -4408,12 +4408,29 @@ class Daemon:
             # member was told the escalation failed. So a failure is reported only when no file of this ask exists.
             filed = request_on_file(h, f"{h}: {title}", since) if r.returncode != 0 else None
             log(f"escalate {h}: {title} rc={r.returncode}{f' but on file as {filed}' if filed else ''}")
+            if r.returncode != 0 and not filed:
+                return {"ok": False, "error": ((r.stderr or r.stdout or "").strip()[-300:]) or "cc-notify reached nobody"}
+            # A REQUEST TITLED WITH ONE OF THIS WORKSPACE'S TRACKS (cc-loop's stop: `<h>/<track> <title>`) is also the
+            # workspace's own seat's news: that seat dispatched the track and cc-loop's broker call is the one thing the
+            # boundary shuts. A spend-limit stop reached the planning seat only, and the track sat idle 83 min with the
+            # seat that owned it unaware (2026-09-27, raised-a-spend-limit-stop-reaches-no-one). One `loop:` line, the
+            # shape member_notice sends. It goes for EVERY filed request, the recovered ones above included (a stop whose
+            # cc-notify timed out after filing is still a stop), and a broker that raises is only this line's failure:
+            # the request is on file either way, so it is never reported as not filed.
+            m = re.fullmatch(r"([a-z0-9][a-z0-9-]{0,39}/[A-Za-z0-9_][A-Za-z0-9._-]{0,63}) .+", title)
+            own = ""
+            if m and workspace_of(m.group(1)) == h:
+                try:
+                    rc = EFFECTS.run([f"{BIN}/cc-broker", "inject", "--no-start", "--source", "loop", h,
+                                      f"loop: {title} — {text.replace(chr(10), ' ')[:600]}"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30).returncode
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    rc = f"{type(e).__name__}: {e}"[:120]
+                log(f"escalate {h}: {title} → {h}'s seat rc={rc}")
+                own = f"; {h}'s own seat has the line" if rc == 0 else f"; {h}'s own seat was not reached (cc-broker's log)"
             if filed:
                 return {"ok": True, "text": f"the box's planning seat has it (request {filed}, on file although cc-notify "
-                                            f"exited {r.returncode}); it answers in #{h}, or asks the owner itself"}
-            if r.returncode != 0:
-                return {"ok": False, "error": ((r.stderr or r.stdout or "").strip()[-300:]) or "cc-notify reached nobody"}
-            return {"ok": True, "text": f"the box's planning seat has it (request {(r.stdout or '').strip()[-60:] or '?'}); it answers in #{h}, or asks the owner itself"}
+                                            f"exited {r.returncode}); it answers in #{h}, or asks the owner itself{own}"}
+            return {"ok": True, "text": f"the box's planning seat has it (request {(r.stdout or '').strip()[-60:] or '?'}); it answers in #{h}, or asks the owner itself{own}"}
         return {"ok": False, "error": "unknown verb"}
 
     OWNER_KINDS = ("decision", "approval", "escalation", "notify-test")   # cc-notify's rung 1 rows, the ones a title's second word must not reach from a notice

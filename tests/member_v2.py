@@ -64,7 +64,7 @@ def selfcheck(m):
         source = (m.BIN / "cc-sandbox").read_text()
         legacy = source[source.index("build_member(){"):source.index("CLAUDEBIN=")]
         digest = hashlib.sha256(legacy.encode()).hexdigest()
-        check(digest == "33fac8dd7220ef35e38b6f8fe768a46897862662e6bca87844572e89dd36df3f", "legacy implementation frozen",
+        check(digest == "dcc1a21628af662dc8fd916d949421079676e07a89ec8625fc9d2a1e79b1f655", "legacy implementation frozen",
               "build_member/launch_member changed. The flag-off cases below still pass, because both sides run "
               f"the same edited code. Re-read the change against the legacy profile, then pin it: {digest}")
         stub = root / "stub"

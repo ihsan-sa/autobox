@@ -464,7 +464,15 @@ stop_unheard(){   # a stop NO session took: "a request that reached no seat is p
                   # It stays time-based although `cc-notify requests answer` now closes a request (and an answered id
                   # asked again is a new request): a seat usually answers a stop by relaunching the track, which closes
                   # nothing, so a stable id would leave the first stop open and swallow every later one as its dedup.
-  "$BIN/cc-notify" --ask --id "stop:$repo/$track:$(date -u +%Y%m%dT%H%MZ)" -t "$repo/$track $1" "$2" >/dev/null 2>&1 || true; }
+  "$BIN/cc-notify" --ask --id "stop:$repo/$track:$(date -u +%Y%m%dT%H%MZ)" -t "$repo/$track $1" "$2" >/dev/null 2>&1; }   # its exit: 0 filed, else nobody has it
+stop_route(){   # $1 heard (yes|no) · $2 title · $3 message → the log line saying where the stop went, filing the request when no session took it.
+                # Inside a member boundary the broker is never asked, so it read "session: no" while the request reached the planning
+                # seat within a minute and the workspace's own seat heard nothing (a member track, 2026-09-27): the line says both now,
+                # and the host's escalate relay hands that seat the line (cc-slack, raised-a-spend-limit-stop-reaches-no-one).
+  [ "$1" = yes ] && { printf "the stop went to %s's session: yes\n" "$(stop_target)"; return 0; }
+  local r=no; stop_unheard "$2" "$3" && r=yes
+  printf "the stop went to %s's session: no — filed as a request for the planning seat%s: %s\n" "$(stop_target)" \
+    "$([ "${CC_MEMBER_SANDBOX:-}" = 1 ] && printf ", whose relay hands %s's own seat the line" "$repo")" "$r"; }
 stop_kind(){ case "$1" in 5|6|9|10) echo worker-loop/barren-stop;; 4|12) echo worker-loop/done-undelivered;; 8) echo worker-loop/limit-outlasted-wait;; *) :;; esac; }
 stop_record(){   # $1 exit code, $2 title, $3 message → one failures-ledger record for a stop that is a failure (stop_kind), none for the rest.
                  # Prints what the ledger said; exit 0 always — "a writer that fails must never fail" the stop it is in.
@@ -891,8 +899,24 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   ( repo=tw2 track=fix HOME="$d/tw" BIN="$d/twbin" BOARD="$d/twbin/board" LOG="$d/tw/loop.log" CC_FAILURES="$d/tw/fl"
     eval "$(sed -n "$lstop" "$0")"; stop 4 "finished, but opened no PR" "cc done failed" ) 2>/dev/null
   t "control: an ordinary repo's stop still tells its seat" "$(cat "$brec")" "inject --no-start --source loop tw2 loop: tw2/fix finished, but opened no PR — cc done failed"
-  grep -qF '[ "$heard" = yes ] || stop_unheard "$title" "$msg"' "$0"
+  grep -qF 'log "$(stop_route "$heard" "$title" "$msg")"' "$0"
   t 'a stop nobody took is filed as a planner request (cc-notify --ask), preserved and retried' "$?" 0
+  # WHERE A STOP WENT, said as it happened (raised-a-spend-limit-stop-reaches-no-one): each case its own cc-notify fake
+  mkdir -p "$d/sr-ok" "$d/sr-no"; : > "$d/sr-calls"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "$d/sr-calls" > "$d/sr-ok/cc-notify"
+  printf '#!/bin/sh\nexit 1\n' > "$d/sr-no/cc-notify"; chmod +x "$d/sr-ok/cc-notify" "$d/sr-no/cc-notify"
+  t 'a stop a session took says so and files no request' \
+    "$(BIN="$d/sr-ok" repo=mw track=t1 ST="$d/sr-st" stop_route yes 'was refused' 'spend limit')|$(wc -c < "$d/sr-calls")" "the stop went to mw's session: yes|0"
+  t 'on the host, a stop no session took is filed as a request, and the line says it was' \
+    "$(BIN="$d/sr-ok" repo=mw track=t1 ST="$d/sr-st" stop_route no 'was refused' 'spend limit')" \
+    "the stop went to mw's session: no — filed as a request for the planning seat: yes"
+  t '…titled with the track, which is what lets the host relay find the workspace seat' "$(grep -c -- '-t mw/t1 was refused spend limit' "$d/sr-calls")" 1
+  t 'inside a member boundary the line names the workspace seat the relay hands it to' \
+    "$(CC_MEMBER_SANDBOX=1 BIN="$d/sr-ok" repo=mw track=t1 ST="$d/sr-st" stop_route no 'was refused' 'spend limit')" \
+    "the stop went to mw's session: no — filed as a request for the planning seat, whose relay hands mw's own seat the line: yes"
+  t 'a request that could not be filed says no, not yes' \
+    "$(CC_MEMBER_SANDBOX=1 BIN="$d/sr-no" repo=mw track=t1 ST="$d/sr-st" stop_route no 'was refused' 'spend limit')" \
+    "the stop went to mw's session: no — filed as a request for the planning seat, whose relay hands mw's own seat the line: no"
   grep -qF 'tell_planner "$(planner_line "$title" "$msg")"' "$0"
   t 'and stop() really tells the session, rather than this being two files agreeing on paper' "$?" 0
   t 'the board is written BEFORE the broker is asked and a question is posted AFTER it — so a broker that is \
@@ -1291,8 +1315,7 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" hea
   log "failures ledger ($repo): $(stop_record "$code" "$title" "$msg")"   # the tool that saw it writes it down; the exit is decided already
   # THE BOARD IS WRITTEN FIRST, whatever the broker does after it: a stop that reached nobody is filed as a request.
   tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose=" $(stop_target)'s session has been told."; }
-  log "the stop went to $(stop_target)'s session: $heard"
-  [ "$heard" = yes ] || stop_unheard "$title" "$msg"
+  log "$(stop_route "$heard" "$title" "$msg")"
   # A WORKER'S QUESTION IS THE SEAT'S FIRST. "A blocked worker's question, after the seat can't settle it, goes out as
   # the seat's 🔒 card. It isn't posted unmentioned on #<repo>" (comms audit 2026-10-01, change 6): demo-video-skill's
   # "may the two checks move from host to hermetic?" reached the owner as "needs you" on 09-30, a question the seat had
