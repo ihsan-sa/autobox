@@ -84,6 +84,12 @@ SLACKON="$HOME/.cc/slack/enabled"   # `cc slack on` creates it: sessions load th
 chan_args(){ [ -f "$SLACKON" ] || return 0; printf '%s\n' --dangerously-load-development-channels "server:cc-slack"; }   # the server itself is registered in user scope by `cc slack on`; it finds its target from the cwd
 model_args(){ local m; m=$("$BIN/cc-model" current 2>/dev/null) && [ -n "$m" ] && printf '%s\n%s\n' --model "$m"; return 0; }   # while the box's primary model is limited, new sessions start on the fallback
 member_model_args(){ local m; m=$("$BIN/cc-config" get CC_MEMBER_MODEL claude-sonnet-5 2>/dev/null); [ -n "$m" ] || m=claude-sonnet-5; printf '%s\n%s\n' --model "$m"; }
+orch_effort_args(){ local kv; for kv in $("$BIN/cc-config" get CC_ORCH_EFFORT 2>/dev/null); do [ "${kv%%=*}" = "$1" ] || continue
+  case "${kv#*=}" in low|medium|high|xhigh|max) printf '%s\n%s\n' --effort "${kv#*=}";; *) echo "cc: CC_ORCH_EFFORT: '${kv#*=}' for $1 is not an effort level (low|medium|high|xhigh|max); starting on settings.json's" >&2;; esac; return 0; done; return 0; }
+                # AN ORCH CAN BE PINNED TO AN EFFORT (owner, 2026-10-04: the architect always on max). CC_ORCH_EFFORT in
+                # ~/.cc/config lists alias=level pairs, e.g. 'architect=max'; __runorch and an orch's __runnext pass it as
+                # --effort, so a handoff keeps it where a typed /effort was lost. An alias it does not list gets no --effort
+                # and keeps ~/.claude/settings.json's effortLevel, as does every other kind of session.
                 # A MEMBER WORKSPACE'S SESSION ROUTES AND ANSWERS; its work is done by --go workers. It ran on the box's
                 # interactive primary until 2026-09-18, when one member workspace's main session had spent $131 of the workspace's
                 # $190 idle on Fable[1m]. CC_MEMBER_MODEL (~/.cc/config) names the model, not cc-model: a limit on the
@@ -1011,6 +1017,26 @@ $(sed 's/Say fewer things/Say less/' "$ROOT/config/writing-prompt.md")"; rc=$?; 
   xs xs5 __runorch r1 a1
   rc=0; grep -qF -- crossSessionInbound "$T/xs5" 2>/dev/null && rc=1; [ -s "$T/xs5" ] || rc=1
   t "control: …and so does a fresh orch there" "$rc"
+  # AN ORCH CC_ORCH_EFFORT NAMES STARTS ON THAT EFFORT, fresh and as a handoff successor; one it does not name, or names
+  # with a word the CLI has no level for, starts with no --effort at all and keeps settings.json's. Each its own config.
+  printf 'CC_ORCH_EFFORT=other=high a1=max\n' > "$T/ef-a1"; printf 'CC_ORCH_EFFORT=a1=huge\n' > "$T/ef-bad"; mkdir -p "$T/dev/r1"
+  ef(){ local out="$1" cfg="$2"; shift 2; HOME="$T" PATH="$T/bin:$PATH" CC_CLAUDE="$T/bin/claude" CC_ARGV="$T/$out" CC_CONFIG="$T/$cfg" \
+          CC_HANDOFF_DIR="$T/no-handoff" bash "$S" "$@" </dev/null >/dev/null 2>&1; }
+  ef ef1 ef-a1 __runorch r1 a1
+  rc=0; grep -A1 -xF -- --effort "$T/ef1" 2>/dev/null | grep -qxF max || rc=1
+  t "an orch CC_ORCH_EFFORT lists (a1=max) starts with --effort max" "$rc"
+  ef ef2 ef-a1 __runnext r1@a1 h4 s4
+  rc=0; grep -A1 -xF -- --effort "$T/ef2" 2>/dev/null | grep -qxF max && grep -qxF -- s4 "$T/ef2" || rc=1
+  t "…and so does its handoff successor" "$rc"
+  ef ef3 ef-a1 __runorch r1 a2
+  rc=0; grep -qxF -- --effort "$T/ef3" 2>/dev/null && rc=1; [ -s "$T/ef3" ] || rc=1
+  t "control: an orch the key does not list starts with no --effort" "$rc"
+  ef ef4 ef-a1 __runmain r1
+  rc=0; grep -qxF -- --effort "$T/ef4" 2>/dev/null && rc=1; [ -s "$T/ef4" ] || rc=1
+  t "control: …and so does a planning seat, whatever the key lists" "$rc"
+  ef ef5 ef-bad __runorch r1 a1
+  rc=0; grep -qxF -- --effort "$T/ef5" 2>/dev/null && rc=1; [ -s "$T/ef5" ] || rc=1
+  t "control: a level the CLI has not got (a1=huge) passes no --effort" "$rc"
   mkdir -p "$T/dev/r1/.cc"; : > "$T/dev/r1/.cc/member-facing"; xs xs6 __runmain r1; rm -f "$T/dev/r1/.cc/member-facing"
   rc=0; grep -qF -- crossSessionInbound "$T/xs6" 2>/dev/null && rc=1; [ -s "$T/xs6" ] || rc=1
   t "control: a named planning seat that is member-facing starts without it" "$rc"
@@ -1588,7 +1614,8 @@ PY
       "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --session-id "$sid" "${CH[@]}" "${MO[@]}"
     else
       IN=(); [ -z "$track$alias" ] && mapfile -t IN < <(inbound_args "$repo")   # the planning seat's successor only, as __runmain
-      "$CLAUDE" "${AUTO[@]}" "${IN[@]}" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}"
+      EF=(); [ -n "$alias" ] && [ -z "$track" ] && mapfile -t EF < <(orch_effort_args "$alias")   # an orch's successor keeps its pinned effort, as __runorch
+      "$CLAUDE" "${AUTO[@]}" "${IN[@]}" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}" "${EF[@]}"
     fi
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runmain)  # internal: planning session in the primary worktree
@@ -1602,10 +1629,10 @@ PY
     repo="$2"; alias="$3"; brief="${4:-}"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp=$(sp_orch "$repo" "$alias" "$base")
     export CC_SLACK_ALIAS="$alias"
-    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo@$alias"; start_check "$repo@$alias"
+    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); mapfile -t EF < <(orch_effort_args "$alias"); chan_accept "$repo@$alias"; start_check "$repo@$alias"
     ft=$(sp_first "$repo" "$alias" "$brief")   # the purpose, as the session's own first turn — see sp_first
     crashed="${CC_SLACK_DIR:-$HOME/.cc/slack}/orch-crashed/$repo@$alias"; rm -f "$crashed"   # a restarted orch is live again
-    "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}" ${ft:+"$ft"}; orc=$?
+    "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}" "${EF[@]}" ${ft:+"$ft"}; orc=$?
     # ONLY A DELIBERATE FINISH ARCHIVES THE CHANNEL: claude exits 0 when the session or the owner ends it (/exit).
     # A signal (137 = SIGKILL, the OOM killer under load; 143 = SIGTERM) or a crash exit is not a finish — on
     # 2026-09-26 a SIGKILL archived two orch channels with both windows still up.
