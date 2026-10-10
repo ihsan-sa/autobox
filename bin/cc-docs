@@ -72,6 +72,25 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         which files its PDF with `cc-docs pdf`; it prints `<number>\t<the path that PDF will have>\tfiled, rendering
         on the box`. The same bytes as the current revision's Markdown file nothing. --attach and --latex are
         refused with it, and a workspace files PDFs only.
+        CONTENT A REPO DECLARES: a repo opts a document in with library.json at its top,
+        {"documents": [{"project": P, "title": T, "content": "<a .md path in the repo>", "rebuild": [argv]}]}.
+        A filing run in that repo (the first git repo among its cwd and its ancestors' cwds) whose --project and
+        --title are P and T exactly is a text revision, so the library keeps the Markdown, which the owner edits.
+        A .md it is given, as the file or as --source (a text draft's send: `file draft.pdf --source draft.md`),
+        is filed as given and carried back; any other file it is given, with no .md --source, is swapped for the
+        content .md, which is filed instead (it says so on stderr). --latex is dropped and --attach is refused, as
+        on any Markdown filing. Each text revision of it then CARRIES BACK when its bytes differ from the content
+        file on origin's default branch (the HEAD origin advertises): on a branch library/<PPP-NNNN-R> made from
+        that branch, the .md is written to `content`, `rebuild` is run in the checkout's root (the repo's command
+        that turns the .md into the real thing's sources), everything it changed is committed and pushed to that
+        branch alone, and `gh pr create` opens a PR (CC_DOCS_GH names another binary) for the filing session to
+        queue, so the repo's own landing rebuilds the real thing. When the branch is on origin already nothing is
+        pushed, and a PR is opened only if `gh pr list` finds none for it; filing the same Markdown again retries a
+        carry that failed. A local library/ branch that exists is left alone and nothing is carried. A step that
+        fails or runs out of time says so on stderr, pushes nothing after it, and leaves the revision filed. An
+        entry naming the document whose content is not a .md in the repo, is or goes through a symlink, or whose
+        rebuild is not a list of strings refuses the filing, and a default branch whose content path is a symlink
+        is not carried; a repo that declares nothing, a member's filing and --filer-editor are not affected.
     cc-docs attach <PPP-NNNN | PPP-NNNN-R> [<file>…] [--replace] [--remove <name>]…
         SUPPORTING FILES: files kept beside a revision's PDF (a board's Gerbers, drill files, BOM, a zip), shown on
         its document page to whoever can open that revision, each downloadable and all of them as one zip. Each is
@@ -1504,8 +1523,18 @@ def cmd_file(a):
     if getattr(a, "filer_editor", None) is not None and MD_SRC.search(a.pdf):
         raise Refused(f"--filer-editor files a compiled LaTeX draft, never Markdown: {a.pdf} is refused")
     filer_editor(a)
+    decl = declared(a)
+    if decl and not MD_SRC.search(a.pdf):
+        # brief: "cc-docs file picks that up so the Markdown is the kept source by default". A text draft's send
+        # files its render with --source <the .md he sent> (docs/library-editor.md, "Text drafts"): that .md is
+        # his words, so it is filed and carried as given, and the repo's content file stands in only without one
+        given = a.source if a.source and MD_SRC.search(a.source) and os.path.isfile(a.source) else None
+        md = given or os.path.join(decl["root"], decl["content"])
+        print(f"cc-docs: {a.title!r} is declared in {decl['root']}/{DECL_FILE}: filing the Markdown "
+              f"{a.source if given else decl['content']}, not {a.pdf}", file=sys.stderr)
+        a.pdf, a.source, a.latex = md, md, None
     if MD_SRC.search(a.pdf) and not getattr(a, "origin", None):
-        return file_markdown(a)
+        return file_markdown(a, decl)
     src = os.path.abspath(a.pdf)
     shown = getattr(a, "origin", None) or a.pdf   # a member's PDF is filed from the host's copy; its own path is the one named
     if not os.path.isfile(src):
@@ -1648,10 +1677,11 @@ MD_SRC = re.compile(r"\.(md|markdown)$", re.I)
 MD_CAP = 2 << 20     # bytes of Markdown the box's renderer takes
 
 
-def file_markdown(a):
+def file_markdown(a, decl=None):
     """`file` given Markdown and no PDF: a TEXT REVISION with file null, its .md kept as its source (source_main,
     source_sha256) for the box's renderer to print and `cc-docs pdf` to file. Bytes the same as the current
-    revision's Markdown file nothing."""
+    revision's Markdown file nothing. A document its repo declares (`decl`) is then carried back into that repo,
+    the current revision when nothing was filed, so a carry that failed is tried again by filing the same bytes."""
     src = os.path.abspath(a.pdf)
     if not os.path.isfile(src):
         raise Refused(f"{a.pdf}: no such file")
@@ -1672,7 +1702,20 @@ def file_markdown(a):
         cur = current(d) if d else None
         if cur and cur.get("source_sha256") == sha:
             print(f"{num}-{cur['rev']}\t{os.path.join(ROOT, cur['file']) if cur.get('file') else '-'}"
-                  "\tunchanged, nothing filed")
+                  "\tunchanged, nothing filed", flush=True)
+            unchanged = (f"{num}-{cur['rev']}", cur.get("note"))
+        else:
+            unchanged = None
+    if unchanged:     # outside the register's lock: a fetch and a push take seconds
+        if decl:
+            carry_back(decl, unchanged[0], data, a.title, unchanged[1])
+        return 0
+    with Lock():
+        reg = load()
+        proj, num, d, rev = plan(reg, a)
+        cur = current(d) if d else None
+        if cur and cur.get("source_sha256") == sha:   # filed by another call meanwhile
+            print(f"{num}-{cur['rev']}\t-\tunchanged, nothing filed")
             return 0
         full = f"{num}-{rev}"
         st = Staged()
@@ -1706,8 +1749,179 @@ def file_markdown(a):
     if answered:
         print(f"cc-docs: {full} answers {answered} feedback item(s) on {num}; the library poller tells the site",
               file=sys.stderr)
+    if decl:
+        carry_back(decl, full, data, a.title, a.note)
     spawn_check()
     return 0
+
+
+# ── content a repo declares: library.json ────────────────────────────────────────────────────────────────────
+DECL_FILE = "library.json"
+
+
+def declared(a):
+    """The entry of library.json, at the top of the git repo this filing runs in, whose project and title are this
+    filing's --project and --title exactly, as {root, repo, content, rebuild}; None when there is no such entry or
+    file, or the filing is a member's, the editor's or inside a workspace. The repo is the first of this process's
+    and its ancestors' cwds that is in a git repo. An entry naming this document that is malformed refuses the
+    filing: the repo opted in, so a typo must not quietly file the PDF instead."""
+    if IN_SANDBOX or getattr(a, "filer", None) is not None or getattr(a, "origin", None) \
+            or getattr(a, "filer_editor", None) is not None:
+        return None
+    for c in _cwds():
+        r = subprocess.run(["git", "-C", c, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            root = r.stdout.strip()
+            break
+    else:
+        return None
+    path = os.path.join(root, DECL_FILE)
+    try:
+        with open(path) as f:
+            docs = json.load(f).get("documents")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, AttributeError) as e:
+        print(f"cc-docs: {path} was not read, so nothing in it applies: {e}", file=sys.stderr)
+        return None
+    for e in docs if isinstance(docs, list) else []:
+        if not (isinstance(e, dict) and e.get("project") == a.project and e.get("title") == a.title):
+            continue
+        content, rebuild = e.get("content"), e.get("rebuild")
+        if not (isinstance(content, str) and MD_SRC.search(content) and not os.path.isabs(content)
+                and ".." not in content.split("/")):
+            raise Refused(f"{path}: {a.title!r} needs \"content\", the path of a .md inside the repo")
+        if not (isinstance(rebuild, list) and rebuild and all(isinstance(x, str) and x for x in rebuild)):
+            raise Refused(f"{path}: {a.title!r} needs \"rebuild\", its command as a list of strings")
+        if not os.path.isfile(os.path.join(root, content)):
+            raise Refused(f"{path}: {a.title!r} names {content}, which is not in {root}")
+        why = linked(root, content)
+        if why:
+            raise Refused(f"{path}: {a.title!r}: {why}")
+        try:     # a track worktree names its repo in .cc/track; ~/dev/<repo> is named by its folder
+            repo = open(os.path.join(root, ".cc", "track")).read().split()[0]
+        except (OSError, IndexError):
+            repo = os.path.basename(root)
+        return {"root": root, "repo": repo, "content": content, "rebuild": rebuild}
+    return None
+
+
+def linked(root, rel):
+    """Why root/rel may not be read or written as a declared content file, or None: it, or a folder between it and
+    root, is a symlink, or it resolves outside root. A repo's link could otherwise file a file it does not hold, or
+    have the carry write the owner's words over one."""
+    cur = root
+    for part in rel.split("/"):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return f"{rel} goes through a symlink, {os.path.relpath(cur, root)}"
+    top = os.path.realpath(root)
+    if os.path.commonpath([os.path.realpath(os.path.join(root, rel)), top]) != top:
+        return f"{rel} resolves outside {root}"
+    return None
+
+
+GIT_WAIT, GH_WAIT = 300, 120     # seconds a carry's git step and gh step may take; the selfcheck shortens GH_WAIT
+
+
+def carry_back(decl, full, data, title, note=None):
+    """Revision `full` of a declared document, its Markdown `data`, carries back into its repo: on a branch
+    library/<full> made from origin's default branch (the HEAD origin advertises) the Markdown is written to
+    `content`, `rebuild` is run there, all it changed is committed and pushed, and a PR opened (CC_DOCS_GH, else gh),
+    whose landing rebuilds the real thing. Nothing is carried when origin's file has these bytes; when the branch is
+    on origin already, only a PR it lacks is opened. It never pushes to the default branch. A step that fails or
+    runs out of time says so on stderr and stops there; the revision stays filed."""
+    def say(what):
+        print(f"cc-docs: {full}: {what}", file=sys.stderr)
+    try:
+        _carry(decl, full, data, title, note, say)
+    except subprocess.TimeoutExpired as e:     # git() and gh are given GIT_WAIT and GH_WAIT; the filing stands
+        cmd = e.cmd if isinstance(e.cmd, str) else " ".join(map(str, e.cmd[:3]))
+        say(f"not carried back: {cmd} took over {e.timeout:g}s, so it was stopped there")
+
+
+def _carry(decl, full, data, title, note, say):
+    root, rel = decl["root"], decl["content"]
+    gh = os.environ.get("CC_DOCS_GH") or "gh"
+
+    def git(*args, cwd=root, text=True):
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=text, timeout=GIT_WAIT)
+
+    def open_pr(cwd):
+        body = (f"The owner's revision {full} of the library document {title!r}, carried back into {rel} and rebuilt "
+                f"with `{' '.join(decl['rebuild'])}`.\n" + (f"\nWhat changed: {note.strip()}\n" if note else ""))
+        r = subprocess.run([gh, "pr", "create", "--base", base, "--head", branch,
+                            "--title", f"{title}: library revision {full}", "--body", body],
+                           cwd=cwd, capture_output=True, text=True, timeout=GH_WAIT)
+        url = (r.stdout.strip().splitlines() or [""])[-1]
+        pr = re.search(r"/pull/(\d+)$", url)
+        if r.returncode or not pr:
+            return say(f"pushed {branch}, but no PR was opened: {(r.stdout + r.stderr).strip()[-300:]}")
+        # the PR is queued by the session that filed, as any PR of its repo is: a tool that lands is not cc-docs's
+        say(f"carried back into {decl['repo']} as {url}; queue PR {pr.group(1)} on {decl['repo']}'s lane to land it")
+
+    # the default branch is the HEAD origin advertises; a clone whose refs/remotes/origin/HEAD is unset or stale
+    # would otherwise branch from, and open the PR against, a branch that is not it
+    r = git("ls-remote", "--symref", "origin", "HEAD")
+    m = re.search(r"^ref: refs/heads/(\S+)\tHEAD$", r.stdout, re.M) if r.returncode == 0 else None
+    if m:
+        base = m.group(1)
+    else:
+        head = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+        base = head.stdout.strip().split("/", 1)[1] if head.returncode == 0 and "/" in head.stdout else "main"
+    branch = f"library/{full}"
+    if git("fetch", "origin", base).returncode:
+        return say(f"not carried back: git fetch origin {base} failed in {root}")
+    have = git("show", f"origin/{base}:{rel}", text=False)
+    if have.returncode == 0 and have.stdout == data:
+        return say(f"{rel} on {base} already says this, nothing carried back")
+    if git("ls-remote", "--exit-code", "--heads", "origin", branch).returncode == 0:
+        # pushed before: a push whose `gh pr create` failed is finished here, with its PR, and is never pushed again
+        r = subprocess.run([gh, "pr", "list", "--head", branch, "--state", "all", "--json", "url", "--jq", ".[].url"],
+                           cwd=root, capture_output=True, text=True, timeout=GH_WAIT)
+        if r.returncode:
+            return say(f"{branch} is on origin, but whether it has a PR is not known, so none was opened: "
+                       f"{(r.stdout + r.stderr).strip()[-300:]}")
+        if r.stdout.strip():
+            return say(f"already carried back on {branch} ({r.stdout.split()[0]}), nothing new pushed")
+        return open_pr(root)
+    tmp = tempfile.mkdtemp(prefix="cc-docs-carry-")
+    wt = os.path.join(tmp, "wt")
+    made = False     # this call made the branch and worktree, so only then are they removed: a library/ branch that
+    try:             # was there already is someone's, and `worktree add -b` refused it
+        r = git("worktree", "add", "-b", branch, wt, f"origin/{base}")
+        if r.returncode:
+            return say(f"not carried back: no branch {branch}: {r.stderr.strip()[-300:]}")
+        made = True
+        why = linked(wt, rel)     # the default branch's tree, not the checkout declared() read, is what is written
+        if why:
+            return say(f"not carried back: on {base}, {why}")
+        dst = os.path.join(wt, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        try:
+            r = subprocess.run(decl["rebuild"], cwd=wt, capture_output=True, text=True, timeout=600)
+            why = "" if r.returncode == 0 else f"exit {r.returncode}: {(r.stdout + r.stderr).strip()[-600:]}"
+        except (OSError, subprocess.TimeoutExpired) as e:
+            why = str(e)
+        if why:
+            return say(f"not carried back: {' '.join(decl['rebuild'])} failed, so no PR: {why}")
+        git("add", "-A", cwd=wt)
+        r = git("commit", "-m", f"{title}: the library's revision {full}", cwd=wt)
+        if r.returncode:
+            return say(f"not carried back: git commit failed: {(r.stdout + r.stderr).strip()[-300:]}")
+        # brief: "never write to another repo's default branch" — the refspec names the library/ branch alone
+        r = git("push", "origin", f"refs/heads/{branch}:refs/heads/{branch}", cwd=wt)
+        if r.returncode:
+            return say(f"not carried back: git push of {branch} failed: {r.stderr.strip()[-300:]}")
+        open_pr(wt)
+    finally:
+        if made:
+            git("worktree", "remove", "--force", wt)
+            git("branch", "-D", branch)      # the local branch alone: what was pushed stays on origin
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── supporting files ─────────────────────────────────────────────────────────────────────────────────────────
@@ -3014,6 +3228,7 @@ def selfcheck():
     """The cases, in a config of their own: no key of the box's ~/.cc/config (a live DOCS_SOURCE_CHECK or
     DOCS_CHECK_CHANNEL) reaches them, and each case sets the keys it tests in the environment, which wins."""
     keys = ("CC_CONFIG", "DOCS_SOURCE_CHECK", "DOCS_TEX_TREES", "DOCS_CHECK_CHANNEL", "DOCS_PUBLIC_HOOK", "CC_SLACK_BIN",
+            "CC_DOCS_GH",
             "TEXINPUTS", "LIBRARY_URL", "LIBRARY_LINK_CLIENT_ID", "LIBRARY_LINK_CLIENT_SECRET",
             "LIBRARY_FEEDBACK_CLIENT_ID", "LIBRARY_FEEDBACK_CLIENT_SECRET")
     saved = {k: os.environ.pop(k, None) for k in keys}
@@ -4359,6 +4574,197 @@ def _selfcheck():
         rcx, ox = run("file", md, "--project", "Notes", "--title", "Plan", "--attach", md)
         ok("a Markdown filing refuses --attach, nothing filed", rcx == 2 and "--attach" in ox
            and len(load()["documents"]["001-0001"]["revisions"]) == 3)
+        # brief: "a saved revision produces a branch and PR in the source repo and an undeclared project is unchanged"
+        ROOT = os.path.join(t, "p-decl")
+        bare, site, ghlog = os.path.join(t, "origin.git"), os.path.join(t, "site"), os.path.join(t, "gh.log")
+
+        def g(*x, cwd=site):
+            return subprocess.run(["git", *x], cwd=cwd, capture_output=True, text=True)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", bare], capture_output=True)
+        subprocess.run(["git", "clone", "-q", bare, site], capture_output=True)
+        g("config", "user.email", "sc@example.invalid")
+        g("config", "user.name", "selfcheck")
+        os.makedirs(os.path.join(site, "content"))
+        for rel, txt in (("content/text.md", "# Site\n\nOld words.\n"), ("content/broken.md", "# Broken\n"),
+                         ("library.json", json.dumps({"documents": [
+                             {"project": "Site", "title": "Site text", "content": "content/text.md",
+                              "rebuild": ["sh", "-c", "tr a-z A-Z < content/text.md > built.txt"]},
+                             {"project": "Site", "title": "Broken", "content": "content/broken.md",
+                              "rebuild": ["sh", "-c", "echo bad field >&2; exit 3"]},
+                             {"project": "Site", "title": "Bad", "content": "content/text.md", "rebuild": "make"},
+                             {"project": "Site", "title": "Linked", "content": "content/link.md", "rebuild": ["true"]},
+                             {"project": "Site", "title": "Via dir", "content": "lnk/x.md", "rebuild": ["true"]}]}))):
+            with open(os.path.join(site, rel), "w") as fh:
+                fh.write(txt)
+        outdir, victim = os.path.join(t, "outdir"), os.path.join(t, "victim.md")
+        os.makedirs(outdir)
+        for f in (os.path.join(outdir, "x.md"), victim):
+            with open(f, "w") as fh:
+                fh.write("victim\n")
+        os.symlink(victim, os.path.join(site, "content", "link.md"))     # a file outside the repo, by a link
+        os.symlink(outdir, os.path.join(site, "lnk"))                     # a folder outside it, by a link
+        g("add", "-A")
+        g("commit", "-q", "-m", "start")
+        g("push", "-q", "origin", "main")
+        g("remote", "set-head", "origin", "main")
+        fakegh = os.path.join(t, "fake-gh")
+        with open(fakegh, "w") as fh:
+            # a stub gh: `pr create` logs its argv, records the head it opened a PR for, and prints the PR's url
+            # (with gh-slow present it hangs instead); `pr list --head H` prints the urls recorded for H, or fails
+            # while gh-listfail is present
+            fh.write(f"""#!/bin/sh
+h=; prev=
+for x in "$@"; do [ "$prev" = --head ] && h=$x; prev=$x; done
+if [ "$1 $2" = "pr list" ]; then
+  [ -e {t}/gh-listfail ] && {{ echo list broke >&2; exit 1; }}
+  [ -e {t}/gh-prs ] && awk -v h="$h" '$2 == h {{print $1}}' {t}/gh-prs
+  exit 0
+fi
+printf '%s\\n' "$@" > {ghlog}
+[ -e {t}/gh-slow ] && exec sleep 3
+echo "https://github.com/o/site/pull/7 $h" >> {t}/gh-prs
+echo https://github.com/o/site/pull/7
+""")
+        os.chmod(fakegh, 0o755)
+        os.environ["CC_DOCS_GH"] = fakegh
+        sitepdf = mkpdf(src, "site-pdf", "Site text as a PDF")
+        edit = os.path.join(t, "edit.md")
+        with open(edit, "w") as fh:
+            fh.write("# Site\n\nNew words.\n")
+        here = os.getcwd()
+        os.chdir(site)
+        try:
+            rc1, o1 = run("file", sitepdf, "--project", "Site", "--kind", "work", "--title", "Site text",
+                          "--latex", os.path.join(src, "site-pdf.tex"))
+            r1 = load()["documents"]["001-0001"]["revisions"][0]
+            gh1 = os.path.exists(ghlog)
+            rc2, o2 = run("file", edit, "--project", "Site", "--title", "Site text", "--note", "new words")
+            with open(ghlog) if os.path.exists(ghlog) else contextlib.nullcontext() as fh:
+                ghargs = fh.read().split("\n") if fh else []
+            os.unlink(ghlog) if os.path.exists(ghlog) else None
+            rc3, o3 = run("file", edit, "--project", "Site", "--title", "Site text")
+            gh3 = os.path.exists(ghlog)
+            rc4, o4 = run("file", sitepdf, "--project", "Site", "--title", "Other")
+            gh4 = os.path.exists(ghlog)
+            rc5, o5 = run("file", edit, "--project", "Site", "--title", "Broken")
+            gh5 = os.path.exists(ghlog)
+            rc6, o6 = run("file", edit, "--project", "Site", "--title", "Bad")
+        finally:
+            os.chdir(here)
+            os.environ.pop("CC_DOCS_GH", None)
+        docs = load()["documents"]
+        on = lambda ref: g("show", ref, cwd=bare).stdout     # noqa: E731
+        heads = g("for-each-ref", "--format=%(refname)", "refs/heads", cwd=bare).stdout.split()
+        ok("a document its repo declares in library.json is filed as its Markdown, whatever file the maker gave, and "
+           "nothing is carried back while the repo's file already says it",
+           rc1 == 0 and o1.startswith("001-0001-A\t") and "is declared in" in o1 and r1["file"] is None
+           and r1["source_main"] == "text.md" and "already says this" in o1 and not gh1)
+        ok("a changed revision of it lands on a branch library/<rev> in the repo, rebuilt there, with a PR opened "
+           "from it; origin's default branch and the local branches are untouched",
+           rc2 == 0 and o2.startswith("001-0001-B\t") and "carried back into site as https://github.com/o/site/pull/7"
+           in o2 and on("library/001-0001-B:content/text.md") == "# Site\n\nNew words.\n"
+           and on("library/001-0001-B:built.txt") == "# SITE\n\nNEW WORDS.\n"
+           and on("main:content/text.md") == "# Site\n\nOld words.\n"
+           and ghargs[:7] == ["pr", "create", "--base", "main", "--head", "library/001-0001-B", "--title"]
+           and "What changed: new words" in "\n".join(ghargs)
+           and not g("branch", "--list", "library/*").stdout.strip()
+           and len(g("worktree", "list").stdout.strip().splitlines()) == 1)
+        ok("the same Markdown again files nothing and pushes nothing, since its branch is on origin already",
+           rc3 == 0 and "001-0001-B\t-\tunchanged" in o3 and "already carried back" in o3 and not gh3)
+        ok("a document the repo does not declare files its PDF as before and carries nothing back",
+           rc4 == 0 and docs["001-0002"]["revisions"][0]["file"] and "declared" not in o4 and "carried" not in o4
+           and not gh4 and heads == ["refs/heads/library/001-0001-B", "refs/heads/main"])
+        ok("a rebuild that fails leaves the revision filed and pushes no branch and opens no PR; an entry whose "
+           "rebuild is not a list refuses the filing",
+           rc5 == 0 and docs["001-0003"]["title"] == "Broken" and "failed, so no PR" in o5 and "bad field" in o5
+           and not gh5 and "refs/heads/library/001-0003-A" not in heads
+           and rc6 == 2 and 'needs "rebuild"' in o6 and not any(d["title"] == "Bad" for d in docs.values()))
+        # the review's cases of a declared document: an explicit --source .md wins over the content file; a
+        # library/ branch that was there already is left alone; a symlinked content path is refused, in the checkout
+        # and on the default branch; a pushed branch with no PR gets one without a second push; a step that runs out
+        # of time says so; and the base is the HEAD origin advertises, not a stale refs/remotes/origin/HEAD
+        def mdf(name, words):
+            f = os.path.join(t, name)
+            with open(f, "w") as fh:
+                fh.write(f"# Site\n\n{words}\n")
+            return f
+        draft, fourth, fifth, sixth = (mdf(n + ".md", w) for n, w in (("draft", "Draft words."), (
+            "fourth", "Fourth words."), ("fifth", "Fifth words."), ("sixth", "Sixth words.")))
+        flag = lambda n, on=True: open(os.path.join(t, n), "w").close() if on else os.unlink(os.path.join(t, n))  # noqa: E731
+        gone = lambda f: os.unlink(f) if os.path.exists(f) else None     # noqa: E731
+        os.environ["CC_DOCS_GH"] = fakegh
+        os.chdir(site)
+        wait = GH_WAIT
+        try:
+            gone(ghlog)
+            rc7, o7 = run("file", sitepdf, "--source", draft, "--project", "Site", "--title", "Site text")
+            gh7 = open(ghlog).read() if os.path.exists(ghlog) else ""
+            rc8, o8 = run("file", sitepdf, "--project", "Site", "--title", "Site text", "--attach", draft)
+            gone(ghlog)
+            flag("gh-slow")
+            globals()["GH_WAIT"] = 1
+            rc9, o9 = run("file", fourth, "--project", "Site", "--title", "Site text")
+            globals()["GH_WAIT"] = wait
+            flag("gh-slow", False)
+            sha_d = g("rev-parse", "library/001-0001-D", cwd=bare).stdout
+            gone(ghlog)
+            flag("gh-listfail")
+            rc10, o10 = run("file", fourth, "--project", "Site", "--title", "Site text")
+            gh10 = os.path.exists(ghlog)
+            flag("gh-listfail", False)
+            rc11, o11 = run("file", fourth, "--project", "Site", "--title", "Site text")
+            gh11 = open(ghlog).read().split("\n") if os.path.exists(ghlog) else []
+            sha_d2 = g("rev-parse", "library/001-0001-D", cwd=bare).stdout
+            g("branch", "library/001-0001-E", "main")      # the owner's branch, by the name revision E would take
+            sha_e = g("rev-parse", "library/001-0001-E").stdout
+            rc12, o12 = run("file", fifth, "--project", "Site", "--title", "Site text")
+            rc13, o13 = run("file", edit, "--project", "Site", "--title", "Linked")
+            rc14, o14 = run("file", edit, "--project", "Site", "--title", "Via dir")
+            # origin's default becomes trunk, whose content/text.md is a link out of the repo; this clone's
+            # refs/remotes/origin/HEAD still says main, where the file is plain
+            other = os.path.join(t, "other")
+            subprocess.run(["git", "clone", "-q", bare, other], capture_output=True)
+            g("checkout", "-q", "-b", "trunk", cwd=other)
+            os.unlink(os.path.join(other, "content", "text.md"))
+            os.symlink(victim, os.path.join(other, "content", "text.md"))
+            g("add", "-A", cwd=other)
+            g("-c", "user.email=sc@example.invalid", "-c", "user.name=sc", "commit", "-q", "-m", "link", cwd=other)
+            g("push", "-q", "origin", "trunk", cwd=other)
+            g("symbolic-ref", "HEAD", "refs/heads/trunk", cwd=bare)
+            rc15, o15 = run("file", sixth, "--project", "Site", "--title", "Site text")
+        finally:
+            globals()["GH_WAIT"] = wait
+            os.chdir(here)
+            os.environ.pop("CC_DOCS_GH", None)
+        revs = load()["documents"]["001-0001"]["revisions"]
+        heads = g("for-each-ref", "--format=%(refname)", "refs/heads", cwd=bare).stdout.split()
+        ok("a declared document given a PDF and --source <a .md> files that .md's words, not the repo's content "
+           "file, and carries them back; --attach on it is refused",
+           rc7 == 0 and o7.startswith("001-0001-C\t") and f"filing the Markdown {draft}" in o7
+           and revs[2]["source_sha256"] == hashlib.sha256(b"# Site\n\nDraft words.\n").hexdigest()
+           and on("library/001-0001-C:content/text.md") == "# Site\n\nDraft words.\n" and "library/001-0001-C" in gh7
+           and rc8 == 2 and "--attach" in o8 and len(revs) == 6)
+        ok("a gh that runs out of time is said, and the revision stays filed with its branch pushed",
+           rc9 == 0 and o9.startswith("001-0001-D\t") and "took over 1s" in o9 and revs[3]["rev"] == "D"
+           and sha_d.strip())
+        ok("filing it again with the branch on origin and no PR found opens one, and pushes nothing; a gh pr list "
+           "that fails opens none",
+           rc10 == 0 and "unchanged" in o10 and "whether it has a PR is not known" in o10 and "list broke" in o10
+           and not gh10 and rc11 == 0 and "carried back into site as https://github.com/o/site/pull/7" in o11
+           and "--head" in gh11 and gh11[gh11.index("--head") + 1] == "library/001-0001-D" and sha_d2 == sha_d)
+        ok("a local library/ branch that was there already is left where it was, and nothing is carried",
+           rc12 == 0 and o12.startswith("001-0001-E\t") and "not carried back: no branch library/001-0001-E" in o12
+           and g("rev-parse", "library/001-0001-E").stdout == sha_e and "refs/heads/library/001-0001-E" not in heads)
+        ok("a declared content path that is a symlink, or under a symlinked folder, refuses the filing",
+           rc13 == 2 and "content/link.md goes through a symlink" in o13
+           and rc14 == 2 and "goes through a symlink, lnk" in o14
+           and not any(d["title"] in ("Linked", "Via dir") for d in load()["documents"].values()))
+        ok("the base is the HEAD origin advertises (trunk), and a content path that is a symlink there is not "
+           "written through: nothing pushed, the file it points at untouched, the local branch removed",
+           rc15 == 0 and o15.startswith("001-0001-F\t") and "not carried back: on trunk, content/text.md goes "
+           "through a symlink" in o15 and open(victim).read() == "victim\n"
+           and "refs/heads/library/001-0001-F" not in heads and not g("branch", "--list", "library/001-0001-F").stdout
+           and len(g("worktree", "list").stdout.strip().splitlines()) == 1)
         # a --source directory: its own files are kept, so the folder can vanish after filing
         ROOT = os.path.join(t, "p-dir")
         sdir = os.path.join(t, "built-here")
