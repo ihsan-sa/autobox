@@ -13,16 +13,18 @@ A reply comes back in the lane you asked on. `#alerts` and `#approvals` keep the
 ## How loudly you hear about it
 The ladder — cheapest rung that does the job; the agent picks, you never filter:
 
-1. **`cc-notify --decision` / `--approval`** — *you, now*, and only from the planning seat: a choice only you can make lands in `#<repo>` as `❓ @you *Decision needed:* <one question>`; an authorization (a protected path, a restart, spend beyond its authority) lands in `#approvals` as `❓ @you 🔐 *Approval needed:* <action and consequence>`. One live card per decision; your answer in its thread resolves that card. Everything below the seat — a worker, a member session, an orch, a unit — asks the seat instead (`cc-notify --ask`, behind the scenes: a file and the broker, no channel), and the seat asks you only once it has verified it cannot settle it. A mention that could have waited is a bug.
-2. **`needs_owner`** — *a question stalling one track*, and only from the planning seat: the reply opens with ❓ and your mention — that is the whole signal. Declared by any other session — a track, an orch, a member workspace, another repo's seat — it is rung 1's request to the seat instead: the reply goes into its thread carrying no mention of you.
+1. **`cc-notify --decision` / `--approval`** — *you, now*, and only from the planning seat: a choice only you can make lands in `#<repo>` as `🔒 @you *Decision needed:* <one question>`; an authorization (a protected path, a restart, spend beyond its authority) lands in `#approvals` as `🔒 @you 🔐 *Approval needed:* <action and consequence>`. One live card per decision; your answer in its thread resolves that card. Everything below the seat — a worker, a member session, an orch, a unit — asks the seat instead (`cc-notify --ask`, behind the scenes: a file and the broker, no channel), and the seat asks you only once it has verified it cannot settle it. A mention that could have waited is a bug.
+2. **`needs_owner`** — *a question stalling one track*, and only from the planning seat: the reply opens with 🔒 and your mention — that is the whole signal. Declared by any other session — a track, an orch, a member workspace, another repo's seat — it is rung 1's request to the seat instead: the reply goes into its thread carrying no mention of you.
 3. **`#approvals` card** — *one tap when convenient*.
 4. **`#alerts`** — *notable, nothing to do*: handovers, watchdog fallbacks, unit failures.
 5. **`#<repo>-updates`** — *ambient*.
 6. **The digest** — anything that can wait for 11:00 waits for it.
 
-**A message that needs your decision opens with ❓ and @-mentions you; an update, or one session posting into another's channel, carries neither — and nothing else can mention you** (rungs 1 and 2, and a mail the box holds for your verdict, are the only doors; a typed handle of yours goes out as code).
+**A message that needs your decision opens with 🔒 and @-mentions you; an update carries neither, and a post one session makes for another opens with 🤖 and never goes top level in a channel you watch — and nothing else can mention you** (rungs 1 and 2, and a mail the box holds for your verdict, are the only doors; a typed handle of yours goes out as code).
 
-Litmus: needs a decision → ❓ + mention · needs a tap → approvals · notable only → alerts · else updates or the digest.
+Litmus: needs a decision → 🔒 + mention · needs a tap → approvals · notable only → alerts · else updates or the digest.
+
+**How much you hear from a project follows how much you've been in it.** Your messages and reactions in its channels over the last three days decide it. Where you've been talking, you get everything. Where you've been around a little, its `-updates` lane waits for the digest, and where you haven't been at all its main lane does too. Nothing that's yours to move is ever held back: a decision or approval, a failure or stop only you can shift, a blocked question, or a reply in a thread. `cc digest` lists what waited under *Held back*.
 
 ## The six ways in
 1. **Slack `#<repo>`** — ask or instruct; that repo's planning session answers in a thread, started for you if it isn't up. Phone-first, and the one to reach for. `#<repo>-updates` reaches the same session and carries what is automated. **Speak it if that is easier** — a voice memo in the channel arrives as a message: the box transcribes it locally, replies under your recording with the words as spoken and the condensed text in italics beneath, and the session answers the condensed text. Needs `cc-voice install` once (USAGE); a parked project stays parked — nothing is transcribed, so the recording queues as an attachment and the session reads it with `cc-voice text <path>` at `!resume`.
@@ -57,7 +59,7 @@ Split by **kind**, not by the surface the text appeared on. Answering is `~/CLAU
 - `cc <repo> --orch <alias>` starts a peer orchestrator — named `<alias>@<repo>` everywhere you read it — in its own `#<repo>-<alias>-<id>` channel (the brief becomes the purpose, the link lands in the thread that asked); `@<alias>` / `@main` hand a thread over. Archived when it exits, or after 24 h gone.
 
 ## Marks — whose turn it is
-- Nothing marks a thread root or nudges you: a reply that needs your decision opens with ❓ and mentions you, and that is the whole signal. `!restart <target>` if a session looks wedged.
+- Nothing marks a thread root or nudges you: a reply that needs your decision opens with 🔒 and mentions you, and that is the whole signal. `!restart <target>` if a session looks wedged.
 - On your message: 👀 it has it · a reaction back is its answer (👍 yes, or done with nothing to say · 👎 no · ✅ done · ❌ can't · 🤔 unclear) · "⏳ starting…" queued until the session is up.
 - A reaction on a session's message reaches it as `👍 on your 07:12 reply: "…"` — 👍 act, don't ask again · 👎 no.
 - Your 📌 on any message marks the thread "revisit": not an ask, nothing nags, nothing counts it as owed — it is kept until you take the 📌 off, shown on the dashboard (TO REVISIT), in the daily digest and by `cc-slack revisit`.

@@ -6,7 +6,7 @@ One Linux box, one tmux, one Slack app. Every project gets a planning session in
 headless workers that end in PRs, which gate, get reviewed and land themselves — a 👍 in `#approvals` is only for the
 project's own approval list.
 Deterministic hooks keep agents inside their lane; a Docker
-sandbox runs the unrestricted ones. A reply that needs you opens with ❓ and mentions you; nothing else does.
+sandbox runs the unrestricted ones. A reply that needs you opens with 🔒 and mentions you; nothing else does. A post one session makes for another opens with 🤖.
 
 New to it? [docs/TOUR.md](docs/TOUR.md) is a five-minute tour in diagrams.
 

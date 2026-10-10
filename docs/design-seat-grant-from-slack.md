@@ -23,7 +23,9 @@ is checked the way `yes <id>` already is (`SLACK_OWNER_ID`). A session may only 
    `cc-slack grant unit <path/to/name.service> [-t why]`. The daemon takes the verb only from a session of this user
    on the main socket (never a member workspace — a member has `ask`), validates the shape (one `Tool(pattern)`
    rule, never a bare `*`; a unit file under `~/dev` or `~/.cc/worktrees`, small, `.service`/`.timer`), stamps a
-   five-letter id, and posts a 🔐 card in `#<ctl>-threads` with the owner's mention. The card names the exact allow
+   five-letter id, and posts a 🔐 card in `#<ctl>-threads`. There a seat reads it first, so it opens with 🤖 and
+   carries no 🔒 and no mention; only a card that falls back to `#<ctl>` is the owner's 🔒 card with his mention.
+   The card names the exact allow
    line — or the unit file, its sha256 and the enable command — so what he approves is what gets written. Open
    grants are on disk (`grants.json`), so a card survives the daemon restart a landing causes.
 2. **The owner answers on his phone.** `yes <id> fix` (a bare `yes <id>` counts the same: a grant is for good by
@@ -112,8 +114,8 @@ before any card:
   `why` echoed back. Anything else, including no answer, is a refer.
 - **Apply.** The daemon writes it (cc-settings' grant verb with `--by approver`, or `cc-config set` plus a
   `grants.log` line), posts a ⚙️ line in `#<ctl>-threads` naming what, for whom and under which grant, and tells the
-  seat. The line carries no ❓ and no mention, because nothing waits on him. A write that fails becomes his card.
-- **Refer.** His ❓ card as before, carrying the approver's reason. His `yes <id> fix` on a config card has the
+  seat. The line carries no 🔒 and no mention, because nothing waits on him. A write that fails becomes his card.
+- **Refer.** His 🔒 card as before, carrying the approver's reason. His `yes <id> fix` on a config card has the
   daemon run `cc-config set`.
 
 Nobody gets a new power from this. The approver runs nothing and cannot write, a seat that runs `cc-approve` itself

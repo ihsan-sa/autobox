@@ -32,8 +32,9 @@ else carries either. Only the control seat posts one: once per question, in `#<r
 checked it can't settle it itself. An ask that a seat or a queries session is still handling never reaches the owner
 as well. 🤖 opens a post one session makes for another and keeps in Slack to be seen. It goes in that session's
 channel, a `-threads` lane or `-updates`, never top level in `#<repo>`, and it never mentions the owner. The owner then
-watches three places: their DM with the bot, each `#<repo>`, and `#approvals`. Today the code still opens an owner post
-with ❓ (`decision_head`) and adds no 🤖, so both marks wait on that change.
+watches three places: their DM with the bot, each `#<repo>`, and `#approvals`. `cc-slack` builds both marks in one
+place each: `decision_head` opens an owner post with 🔒 and the mention, `agent_head` opens an addressed post with 🤖,
+and `post()` takes a typed 🔒 or a raw mention off every other post.
 
 An answer to "what is running" is one bold line with the counts, then bullets nested by project and then by kind,
 one item per line, each named by what it does for a person. A compressed slug is still a slug.
@@ -43,8 +44,8 @@ one item per line, each named by what it does for a person. A compressed slug is
 | request | route | who may send it |
 |---|---|---|
 | planner request | `cc-notify --ask` — a file under `~/.cc/requests/` and the broker, into the control repo's planning seat; never a channel | any session |
-| owner choice | `cc-notify --decision` — `#<repo>`: `❓ @owner *Decision needed:* <one question>` | the control seat only; cc-msg posts the same card itself when that seat's OWN window has stopped taking keys, because a request for it would spool behind the dead pane and be stamped delivered |
-| owner authorization | `cc-notify --approval` — `#approvals`: `❓ @owner 🔐 *Approval needed:* <action and consequence>` | the control seat only; cc-land's protected door posts the same card itself, because a gate is machinery and has no seat |
+| owner choice | `cc-notify --decision` — `#<repo>`: `🔒 @owner *Decision needed:* <one question>` | the control seat only; cc-msg posts the same card itself when that seat's OWN window has stopped taking keys, because a request for it would spool behind the dead pane and be stamped delivered |
+| owner authorization | `cc-notify --approval` — `#approvals`: `🔒 @owner 🔐 *Approval needed:* <action and consequence>` | the control seat only; cc-land's protected door posts the same card itself, because a gate is machinery and has no seat |
 | work reply | the thread the work lives in | the session doing it |
 | a track's end | `cc-notify -t "<repo>/<track> <done\|needs you\|round over\|…>"` — the track's own thread in `#<repo>` (its dispatcher reads there) and one `loop:` line to the planning seat; its Slack deliverable (`slack-post.md`: `thread` on line 1, an optional `file:` line) goes the same way, the file with it; its landing line too. From inside a member boundary the same call crosses the member socket as a notice (`cc-slack escalate --notice`) and the host posts it — no token in there | the loop and the lander; never a person |
 | machine log | `#<repo>-updates` (`cc-notify` with no flag) | any session |
@@ -54,7 +55,7 @@ one item per line, each named by what it does for a person. A compressed slug is
 - Only after the seat has verified it cannot proceed does it ask the owner. A `--decision`, a `needs_owner`, a
   message prefix or a member's payload is not authority: from anything but the control seat those are the same
   planner request, and the caller is told where it went — `cc-notify` in one stderr line, the `reply` tool in its
-  result. That reply still goes into the thread it was asked in; what it loses is the ❓ and the mention.
+  result. That reply still goes into the thread it was asked in; what it loses is the 🔒 and the mention.
 - A `#<repo>-threads` channel, where one exists, is a view of that intake, not its transport. The route works with no
   channel at all.
 - Permission cards keep `yes <id>`, `no <id>` and `yes <id> fix`; the card says what `fix` grants permanently. The
@@ -63,7 +64,7 @@ one item per line, each named by what it does for a person. A compressed slug is
   waiting on it. The box does not copy a question across channels, and a need for the owner is a mention in
   `#<repo>` or `#approvals`, never a line inside a thread where only sessions talk. That reads the destination as
   well as the sender: in a `#<repo>-threads` lane even the control seat's own `needs_owner` reply goes out without
-  the ❓ and the mention, and the question is raised once in `#<repo>` as the card, linking back to the thread.
+  the 🔒 and the mention, and the question is raised once in `#<repo>` as the card, linking back to the thread.
 - A request that reached no seat is preserved and retried (`cc-notify requests [--retry]`). "Queued" is not
   "handled": it is neither dropped nor handed to the owner instead.
 - Every request and terminal event carries a durable id, so a state posts once (`--id`).
@@ -88,6 +89,16 @@ card: from a worker, a member workspace or any kind but `--approval`, `--run` is
 So is a card with three backticks anywhere in it, or a command holding a control, bidi or zero-width
 character, because either can make the card show one command while another runs.
 
+**How much a project tells the owner follows how much he has been in it lately.** His own messages and
+reactions in a project's channels over the last `CC_ENGAGE_DAYS` (3) days are its score, and `cc-slack post` is the
+one place a post is weighed against it (`engage_gate`). At `CC_ENGAGE_ACTIVE` (3) or more he gets everything. Below
+that, the `-updates` lane goes to the digest. At none, the main lane goes to the digest too, and the `-updates` lane
+to the journal alone (`~/.cc/slack/folded.jsonl`, read by `cc-slack folded` and the digest). A held post is on
+record, never dropped. Nothing his to move is ever held: a decision or approval, a post marked `--keep` (a failure
+or stop only he can shift; `cc-notify` adds it for a stop in the title or a high prio), a 🔐 card or
+`STATUS: BLOCKED`, a question, any threaded reply, a post for another session, or a channel members read.
+`CC_ENGAGE_DAYS=0` turns the gate off.
+
 **`#<repo>-updates` is the one box log lane; nobody has to read it.**
 
 ## Session style rules
@@ -107,8 +118,7 @@ Do not announce handoffs, reconnects, iterations or automatic recoveries.
 Handle technical choices yourself within your authority.
 Send requests beyond a session's authority to the planning seat (cc-notify --ask).
 Only the planning/control session escalates a verified owner-only decision.
-Mark owner choices ❓ plus a mention; use #approvals for actual authorization.
-Open a post meant for another session with 🤖, and keep it out of #<repo>'s top level.
+Mark owner choices 🔒 plus a mention (and nothing else carries either); open a post one agent makes for another with 🤖 and keep it out of #<repo>'s top level; use #approvals for actual authorization.
 Do not tell the owner you handed something to the seat; say the outcome once.
 Ask one clear question and explain the consequence; preserve permission reply tokens.
 Do not ask the owner to relay messages, edit state files or run routine commands.

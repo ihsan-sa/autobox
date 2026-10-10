@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # cc-notify — the one door a request or a notice leaves a session by. Always logs to ~/.cc/notify.log.
-#   cc-notify [-t title] [--heading <text>] [--kind <kind>] [--ask|--decision|--approval|--owner] [--id <id>] [--from <seat>]
+#   cc-notify [-t title] [--heading <text>] [--kind <kind>] [--ask|--decision|--approval|--owner] [--id <id>|--live <subject>] [--from <seat>] [--major] [--keep]
 #                                                                                      [-p …] "message"   (or message on stdin)
 #     --ask       A PLANNER REQUEST: what a session cannot settle itself (a block, a refusal, a fault, a member's
 #                 escalation). Written to ~/.cc/requests/<id>.json and handed to the control repo's planning seat
 #                 through cc-broker — durable, retried every 60 s, and never a Slack post. Prints the request id.
 #                 --from names the asker when the caller relays for one (the daemon, for a member socket); a caller
 #                 that is not control cannot choose it — its marker or its seat is the name.
-#     --decision  A CHOICE ONLY THE OWNER CAN MAKE: #<repo>, `❓ @owner *Decision needed:* <one question>`.
+#     --decision  A CHOICE ONLY THE OWNER CAN MAKE: #<repo>, `🔒 @owner *Decision needed:* <one question>`.
 #     --approval  AN AUTHORIZATION (a protected path, a restart, spend beyond authority): #approvals,
-#                 `❓ @owner 🔐 *Approval needed:* <action and consequence>`. One live card per --id.
+#                 `🔒 @owner 🔐 *Approval needed:* <action and consequence>`. One live card per --id.
 #     --run '<cmd>'  with --approval only: the card carries the exact command and a `run:<sha>` stamp, and the command
 #                 is stored on the host beside it (~/.cc/approvals/run/<card ts>.json, 0600). The owner's own 👍 on that
 #                 card runs it once, as the box's user: the exit code comes back in the card's thread, the output in his DM
@@ -17,6 +17,9 @@
 #                 a caller that is not the control seat, a member workspace, or a box with no bot token.
 #     --owner     the owner's DM. Same authority as --decision.
 #     --heading   the bold line a person sees in place of the title. The title still routes, dedups and names the kind.
+#     --keep      a plain notice that is HIS TO MOVE (a failure or stop only he can shift): cc-slack's engagement gate
+#                 never holds it back. Implied by a high/urgent prio and by a title whose second word is blocked,
+#                 stopped, failed, failing, red, needs or stuck.
 #     --major     a plain notice the owner is waiting on (a track's question): the title's main lane, #<repo>, top-level,
 #                 never the track's thread (which sits in the -updates lane) and never a mention. Ignored by the other doors.
 #     AUTHORITY: only the CONTROL SEAT reaches the owner — the control repo's planning session, or the box's own hand
@@ -29,6 +32,10 @@
 #     a replay of an id Slack already accepted is logged `dedup` and reaches no door, phone included (rec 4, 2026-09-08);
 #     a request under an id that is already on file and still open is the same request, not a second one; once
 #     answered, the same id asked again is a new request (the answered file moves to ~/.cc/requests/closed/).
+#     --live names the SUBJECT instead (cf-perm, one card per token): one live ask about it, however it is worded.
+#     cc-slack live-id turns it into <subject>@<stamp>, the same id while the newest is under 12 h old (a reworded
+#     ask is then a ledger dedup), a fresh one after that — so a later question still gets through, which an --id
+#     keyed on the subject alone would refuse for good.
 #   cc-notify requests [--retry]           the requests still open (the broker's untaken ones marked) / hand the untaken to it again
 #   cc-notify requests answer <id> "text"  CLOSE a request: post the answer once where it came from (a track's thread,
 #                 a workspace's channel; under --id answer:<id>@<asked-at>, so a retry never posts twice), then mark the file
@@ -42,8 +49,8 @@
 #   cc-notify -h | --help   this block, wherever it sits among the arguments — no post, no push, no log line
 # THE ROUTES, in one line each (core/docs/comms-contract.md is the contract this implements):
 #   planner request  --ask        ~/.cc/requests + cc-broker inject <control repo>      never Slack, never dropped
-#   owner choice     --decision   #<repo>   ❓ @owner *Decision needed:* …               control seat only
-#   authorization    --approval   #approvals ❓ @owner 🔐 *Approval needed:* …           control seat only
+#   owner choice     --decision   #<repo>   🔒 @owner *Decision needed:* …               control seat only
+#   authorization    --approval   #approvals 🔒 @owner 🔐 *Approval needed:* …           control seat only
 #   work reply       (the session's own reply tool / cc-slack post --thread)             not this script
 #   machine log      a plain call: the table below, #<repo>-updates or #alerts           ambient
 # HOW IT MUST READ. He sees a title and a line or two on a phone, so the point goes FIRST and in bold, and anything
@@ -61,7 +68,7 @@
 # caller now says only WHAT happened — its `--kind`, or the second word of its title — and this table says how loud
 # that is. Same shape as cc-broker's rules: a whitelist a person can read, and anything not in it is ambient.
 #   RUNG   is ~/COMMS.md's ladder, and it decides the destination:
-#          1 = the main channel, opening with ❓ and a real @-mention (a decision ask), or the owner's DM ("you, now"),
+#          1 = the main channel, opening with 🔒 and a real @-mention (a decision ask), or the owner's DM ("you, now"),
 #              or #approvals for an --approval — reachable from the control seat alone (see AUTHORITY above)
 #          4 = #alerts ("notable, nothing to do")            5 = the #<repo>-updates lane ("ambient")
 #          P = a planner request (--ask): not a Slack rung at all — the broker, and the request file
@@ -433,7 +440,7 @@ PY
   k "$(yes_ pushed)" "…and the push really arrived on the wire, not just claimed"
   k "$(yes_ test "$(prio_)" = high)" "…at the prio the TABLE gives a decision, which is what the phone reads as a buzz"
   k "$(yes_ grep -q -- '--mention' <<<"$(args)")" "…and it @-mentions the owner in the main channel"
-  k "$(yes_ grep -q -- '--route demorepo blocked --mention \*Decision needed:\* which database do I restore?' <<<"$(args)")" "…as the contract's card: ❓ @owner *Decision needed:* <the one question> — the title routes it and is not the message"
+  k "$(yes_ grep -q -- '--route demorepo blocked --mention \*Decision needed:\* which database do I restore?' <<<"$(args)")" "…as the contract's card: 🔒 @owner *Decision needed:* <the one question> — the title routes it and is not the message"
   N --decision -t "demorepo blocked" "which database do I restore?"
   k "$(yes_ grep -q 'send=dedup$' <<<"$(last)")" "…and asking him the SAME question again inside the window does not ring him twice"
   N --decision -t "demorepo blocked" "should I drop the old branches?"
@@ -498,7 +505,7 @@ PY
   # AN AUTHORIZATION goes to #approvals as a 🔐 card, from the control seat, and rings the phone like a decision.
   N --approval -t "demorepo approval" "PR #7 touches core/bin/cc-slack: land it, which restarts the daemon"
   k "$(yes_ grep -q 'rung=1 kind=approval send=ntfy+slack$' <<<"$(last)")" "--approval is rung 1, its own kind, and rings the phone"
-  k "$(yes_ grep -q -- '-c #approvals --mention 🔐 \*Approval needed:\* PR #7 touches' <<<"$(args)")" "…posted in #approvals as ❓ @owner 🔐 *Approval needed:* <action and consequence>"
+  k "$(yes_ grep -q -- '-c #approvals --mention 🔐 \*Approval needed:\* PR #7 touches' <<<"$(args)")" "…posted in #approvals as 🔒 @owner 🔐 *Approval needed:* <action and consequence>"
   k "$(no_ grep -q -- '--route' <<<"$(args)")" "…and never routed by title into the main lane: an authorization is not a decision"
 
   # A CARD THAT CARRIES A COMMAND (--run): the command and its stamp are on the card, and the command is stored on the
@@ -616,6 +623,7 @@ PY
   seatstub "abox@improve"
   N --decision -t "demorepo blocked" "may I drop the older branch?"
   k "$(yes_ grep -q 'rung=P kind=request' <<<"$(last)")" "…and an orch of the control repo (<repo>@<alias>) is not: it asks the planning seat"
+  k "$(no_ grep -q -- "--mention" <<<"$(args)")" "…and that orch's --decision posts no --mention card anywhere: the owner is reached in #<repo> or #approvals by the control seat alone"
   # THE DAEMON CAN BE DOWN, and then `seat` cannot say who is calling: it exits 2 (could not ask), which is not
   # exit 1's "the daemon says none". Reading the failure as "no seat" made every unmarked caller the box's own
   # hand for as long as a restart lasted, and the owner's door with it. This fails closed.
@@ -753,7 +761,7 @@ PY
   how=$(sed -n "s/.*(answer: \(cc-slack post -c '#[a-z]*'\) .*/\1/p" "$T/broker.args" | head -1)   # the way back, as the seat was told it (N clears the file)
   # hop 3: the seat cannot settle it and asks the owner — one card, in #<repo>, an @-mention; the request is still hers
   N --decision -t "abox blocked" -- "alice needs the owner: restore her staging DB from Friday's snapshot?"
-  k "$(yes_ grep -q -- "--route abox blocked --mention \*Decision needed:\* alice needs the owner" <<<"$(args)")" "round trip 3/4: the seat's --decision is the one ❓ @owner card in #<repo>"
+  k "$(yes_ grep -q -- "--route abox blocked --mention \*Decision needed:\* alice needs the owner" <<<"$(args)")" "round trip 3/4: the seat's --decision is the one 🔒 @owner card in #<repo>"
   k "$(yes_ grep -q 'rung=1 kind=decision send=ntfy+slack$' <<<"$(last)")" "…rung 1, phone rung — the first thing of hers that reaches him, and it is the seat's word"
   k "$(yes_ test "$(reqs)" = 1)" "…and no second request came of it: the seat asking the owner is not another ask"
   # hop 4: his answer comes back to #alice by the command the request line itself named — read off the broker's line
@@ -889,6 +897,16 @@ PY
   k "$(yes_ grep -q -- '^post --route demorepo/w1 needs you --major ' <<<"$a_maj")" "--major rides with the route, so the notice stays on #<repo>"
   k "$(no_ grep -q -- '--major' <<<"$a_plain")" "…and a notice without it carries no --major"
   k "$(no_ grep -q -- '--mention' <<<"$a_maj$a_plain")" "…and neither pages the owner"
+  # HIS TO MOVE: cc-slack's engagement gate never holds a --keep post. A stop in the title, an explicit --keep and a
+  # high prio carry it; a routine notice and a rung 1 card (never weighed at all) do not.
+  k "$(yes_ grep -q -- ' --keep' <<<"$a_maj$a_plain")" "a 'needs you' notice carries --keep, so a project he has been away from still shows it"
+  N -t "demorepo deploy" "the deploy went out"; a_rout=$(args)
+  N -t "demorepo deploy" --keep "the deploy stopped: token expired"; a_kept=$(args)
+  N -t "demorepo stopped" "PR #4 gate red"; a_stop=$(args)
+  N --decision -t "demorepo blocked" "which database?"; a_dec=$(args)
+  k "$(no_ grep -q -- '--keep' <<<"$a_rout$a_dec")" "…while a routine notice carries none, and neither does a decision card (rung 1 is never weighed)"
+  k "$(yes_ grep -q -- '^post --route demorepo deploy --keep ' <<<"$a_kept")" "…an explicit --keep rides with the route"
+  k "$(yes_ grep -q -- '^post --route demorepo stopped --keep ' <<<"$a_stop")" "…and so does a title whose second word says it stopped"
   idstub 1 0
   N --owner -t alice --id credential:alice "alice needs a credential minted"
   k "$(yes_ grep -q -- '^sent credential:alice$' <<<"$(args)")" "an --id is asked of cc-slack's ledger first (cc-slack sent <id>)"
@@ -901,6 +919,18 @@ PY
   k "$(no_ grep -q -- '^post' <<<"$(args)")" "…and nothing is posted — permanent, not a window: the ledger, not this script, remembers"
   N --owner -t bob "bob needs a credential minted"
   k "$(no_ grep -q -- '^sent' <<<"$(args)")" "…while a call without --id never asks the ledger: the window dedup is its only memory, as before"
+  # --live <subject>: the id is cc-slack live-id's, so a reworded ask while the card stands is the same id (its dedup is
+  # cc-slack's and has its own cases); a cc-slack that cannot say falls back to <subject>@<today>, never to no id.
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\ncase "$1" in live-id) echo "cf-perm@20261002T000000Z";; sent) exit 1;; esac\nexit 0\n' "$T/slack.args" > "$NH/bin/cc-slack"
+  chmod +x "$NH/bin/cc-slack"
+  N --decision --live cf-perm -t "demorepo blocked" "the token is missing a scope"
+  k "$(yes_ grep -q -- '^live-id cf-perm$' <<<"$(args)")" "--live asks cc-slack live-id for the subject's id"
+  k "$(yes_ grep -q -- '^post .* --id cf-perm@20261002T000000Z ' <<<"$(args)")" "…and the card is posted under that id, so cc-slack sends it once while it stands"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\ncase "$1" in live-id) exit 2;; sent) exit 1;; esac\nexit 0\n' "$T/slack.args" > "$NH/bin/cc-slack"
+  N --decision --live cf-perm -t "demorepo blocked" "the token is missing another scope"
+  k "$(yes_ grep -q -- "^post .* --id cf-perm@$(date -u +%Y%m%d) " <<<"$(args)")" "…and a cc-slack with no live-id still gets an id: <subject>@<today>"
+  N --decision --live cf-perm --id fixed:1 -t "demorepo blocked" "a third"
+  k "$(yes_ grep -q -- '^post .* --id fixed:1 ' <<<"$(args)")" "…and an --id given too wins over --live"
   slackstub 0
 
   # HOW IT READS ON HIS PHONE. The rule he has asked for three times, said at the moment a session is writing to him
@@ -931,7 +961,7 @@ PY
 }
 
 BOX="$(cfg CC_BOX)"; BOX="${BOX:-$(hostname -s)}"   # this box's name (override with CC_BOX in ~/.cc/config): default title + ntfy topic prefix
-title="$BOX"; prio="default"; decision=0; want=""; pid=""; heading=""; major=""
+title="$BOX"; prio="default"; decision=0; want=""; pid=""; live=""; heading=""; major=""; keep=""
 case "${1:-}" in
   setup)
     NTFY_TOPIC="$(cfg NTFY_TOPIC)"
@@ -957,7 +987,7 @@ d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
 asked=0   # a door the CALLER named (--ask/--decision/--approval/--owner), as against one the marker or the role implies
 while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; --heading) heading="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; asked=1; shift;;
   --kind) want="$2"; shift 2;;
-  --id) pid="$2"; shift 2;; --major) major=1; shift;;
+  --id) pid="$2"; shift 2;; --live) live="$2"; shift 2;; --major) major=1; shift;; --keep) keep=1; shift;;
   --ask) ask=1; asked=1; shift;; --approval) approval=1; asked=1; shift;; --from) from_arg="$2"; shift 2;; --run) run="$2"; shift 2;;
   --decision) decision=1; asked=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
 msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
@@ -980,7 +1010,7 @@ if [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
   rung=P; kind=request; door=(escalate)
   # …AND ONLY A LINE THE TABLE READS AS AMBIENT. The daemon re-enters a notice plain, as the box's own hand, and
   # kind_of reads a title's second word (review of #558): `<h>/<track> decision` crossing as a notice would buy the
-  # ❓ @owner card from inside the boundary that #558 shut on the host. A rung 1 kind, by title or --kind, stays a request.
+  # 🔒 @owner card from inside the boundary that #558 shut on the host. A rung 1 kind, by title or --kind, stays a request.
   if [ "$asked" = 0 ] && [[ "$title" =~ ^[a-z0-9][a-z0-9-]{0,39}/[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\  ]]; then
     read -r nrung _ <<<"${RUNGS[$(kind_of "${want:-}" "$title")]}"
     # a notice carries its id (cc-loop's done card: one card per PR); the daemon files it under the workspace
@@ -991,6 +1021,9 @@ if [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
   printf '%s\t%s\t%s\trung=%s kind=%s send=%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n\t' '  ')" "$rung" "$kind" none >> "$LOG"
   echo "cc-notify: the workspace's Slack link did not take this — it is in $LOG and nowhere else" >&2; exit 1
 fi
+
+# --live <subject>: the ledger's id for the one live ask about it (cc-slack live-id). An --id given too wins.
+[ -n "$live" ] && [ -z "$pid" ] && { pid=$("$HOME/bin/cc-slack" live-id "$live" 2>/dev/null) || pid=""; pid="${pid:-$live@$(date -u +%Y%m%d)}"; }
 
 # THE TABLE DECIDES WHAT THIS IS, AND IT DECIDES BEFORE AUTHORITY, because the kind is what authority is about. The
 # rung is also what the log records, so `cc-notify report` can answer how much reached him yesterday and how loudly.
@@ -1006,7 +1039,7 @@ read -r rung phone window prio <<<"${RUNGS[$kind]}"   # the caller's -p is read 
 # WHAT COUNTS AS THAT DOOR IS THE RESOLVED KIND, NOT THE FOUR FLAGS. A flag is only one of three ways a rung 1 kind
 # is picked: `--kind decision|approval|escalation` names a row outright, and kind_of reads a title's second word, so
 # `-t "demorepo approval"` reaches the same row. Gating on the flags alone left both open, and a track could buy an
-# ❓ @owner card, a 🔐 #approvals card and a phone push by its title (review of #558). Rung 1 however it was reached
+# 🔒 @owner card, a 🔐 #approvals card and a phone push by its title (review of #558). Rung 1 however it was reached
 # is the gate, and the three owner kinds by name as well, so a table edit that lowered one of their rungs could not
 # quietly reopen it.
 ownerdoor=0; [ "$rung" = 1 ] && ownerdoor=1
@@ -1166,7 +1199,7 @@ if [ "$to_slack" = 1 ]; then   # one channel: the bot, else the webhook
   # falls that back to SLACK_CHANNEL). Rung 4 names #alerts here rather than hoping the title's second word happens to
   # be in cc-slack's ALERT_KINDS — that mismatch is what put the secretary's siren in the ambient lane. Rung 5 keeps
   # --route: cc-slack already turns a title into that repo's -updates lane, which is what ambient means.
-  # THE CARD READS AS THE CONTRACT SAYS (core/docs/comms-contract.md): cc-slack's --mention opens it with ❓ and his
+  # THE CARD READS AS THE CONTRACT SAYS (core/docs/comms-contract.md): cc-slack's --mention opens it with 🔒 and his
   # mention; what follows names the kind of answer wanted — a choice, or an authorization — and then the one question.
   body="$(printf '*%s*%s\n%s' "${heading:-$title}" "$bang" "$msg")"
   # --ask/--no-ask: whether it waits on his answer (cc-slack's owner-asks ledger, `!needs`). His DM is an ask; the
@@ -1176,6 +1209,11 @@ if [ "$to_slack" = 1 ]; then   # one channel: the bot, else the webhook
   elif [ "$kind" = decision ]; then dest=(--route "$title" --mention); body="*Decision needed:* $msg"
   elif [ "$rung" = 4 ]; then dest=(-c "#${SLACK_ALERTS:-alerts}")
   else dest=(--route "$title"); if [ "$rung" = 1 ]; then dest+=(--mention --no-ask); elif [ "${major:-}" = 1 ]; then dest+=(--major); fi; fi   # rung 1: the main channel, @-mentioned; --major: the main channel, quietly
+  # HIS TO MOVE: a failure or stop only he can shift is never held back by cc-slack's engagement gate, however long
+  # he has been away from the project — --keep, a :rotating_light: prio, or a title whose second word says it stopped.
+  case "$(printf '%s' "$title" | awk '{print tolower($2)}')" in blocked|stopped|failed|failing|red|needs|stuck) keep=1;; esac
+  # (Rung 1 — a decision, an approval, his DM — is never weighed at all, so it carries no flag.)
+  [ "$rung" != 1 ] && [ "$owner" != 1 ] && { [ "${keep:-}" = 1 ] || [ -n "$bang" ]; } && dest+=(--keep)
   [ -n "$pid" ] && dest+=(--id "$pid")   # the event's name: cc-slack posts it once and answers a replay with the ts it has
   if [ -n "${SLACK_BOT_TOKEN:-}" ] && cardts=$("$HOME/bin/cc-slack" post "${dest[@]}" "$body" 2>/dev/null); then
     took slack   # posted by the bot (owner DM, project channel or SLACK_CHANNEL)

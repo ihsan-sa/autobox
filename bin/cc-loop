@@ -64,7 +64,7 @@
 # hands cc-broker one line for `<repo>`'s session — which classifies it, waking that session NOW for a line asking it
 # to choose and digesting the rest. A broker that is DOWN loses nothing either: the stop is filed as a planner request
 # (cc-notify --ask), kept and retried. SLACK HEARS TWO THINGS FROM A LOOP, each once: the DONE card in the track's
-# own thread, and a worker's BLOCKED question (the question alone) on #<repo> — but only when no session took the stop.
+# thread, and a worker's BLOCKED question that no seat took, as the owner's decision card (cc-notify --decision).
 # A question the seat heard is the seat's to settle, or to take to the owner itself as a --decision card. Iteration
 # totals, spend, a round that is over, a limit wait and the command to resume stay in loop.log, the board note and the journal.
 # Exit: 0 done | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (the session hears it)
@@ -917,12 +917,12 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   t 'a request that could not be filed says no, not yes' \
     "$(CC_MEMBER_SANDBOX=1 BIN="$d/sr-no" repo=mw track=t1 ST="$d/sr-st" stop_route no 'was refused' 'spend limit')" \
     "the stop went to mw's session: no — filed as a request for the planning seat, whose relay hands mw's own seat the line: no"
-  grep -qF 'tell_planner "$(planner_line "$title" "$msg")"' "$0"
+  grep -qF 'tell_planner "$(planner_line "$title" "$msg$esc")"' "$0"
   t 'and stop() really tells the session, rather than this being two files agreeing on paper' "$?" 0
   t 'the board is written BEFORE the broker is asked and a question is posted AFTER it — so a broker that is \
 down still leaves the board write, which is the half of this that must never be lost' \
-    "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0" | grep -oE 'BOARD" status|tell_planner|cc-notify' | tr '\n' ' ')" \
-    'BOARD" status tell_planner cc-notify '
+    "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0" | grep -oE 'BOARD" status|tell_planner|BIN/cc-notify' | tr '\n' ' ')" \
+    'BOARD" status tell_planner BIN/cc-notify '
   # ── the done line says WHAT finished, not how many turns it took ──
   HOME="$d/bh" "$BIN/cc-board" init titled /tmp/titled main >/dev/null
   HOME="$d/bh" "$BIN/cc-board" add titled t1 "worker stop reaches the planner" >/dev/null
@@ -1027,9 +1027,24 @@ TO
   # ── A WORKER'S QUESTION GOES TO THE SEAT FIRST ── two fixtures: no broker on this copy (no session hears it) and a
   # broker that takes the line (a cc-broker stub that records its argv and exits 0, removed again after its run).
   lrun bk 'STATUS: BLOCKED: which port do I use?' 0 --max-iter 3
-  t 'a BLOCKED question no session took is posted once' "$(slackn)" 1
-  t '…on #<repo> itself (--major), titled for the track, the question alone — no STATUS line, no resume recipe' \
-    "$(grep -v '^--ask|' "$d/lb.n" | cut -d'|' -f1,4,5,8)" "--major|-t|lp/bk needs you|which port do I use?"
+  t 'a BLOCKED question no seat took is posted once, and not also filed as a request' "$(slackn)/$(grep -c '^--ask|' "$d/lb.n")" 1/0
+  t '…and loop.log says where it went: no session, a decision card' \
+    "$(grep -c "the stop went to lp's session: no — its question went out as a decision card: yes" "$lh/.cc/state/lp/bk/loop.log")" 1
+  t '…as the owner\047s decision card under a stable blocked: id, routed by the track, the row and the question alone — no STATUS line, no resume recipe' \
+    "$(grep -v '^--ask|' "$d/lb.n" | sed -E 's/(blocked:lp\/bk:)[0-9a-f]+:[0-9]+/\1H:C/')" "--decision|--id|blocked:lp/bk:H:C|-t|lp/bk needs you|bk: which port do I use?|"
+  t '…and no unmentioned --major post of it on #<repo>' "$(grep -c -- '--major' "$d/lb.n")" 0
+  # THE SEAT TAKES IT: the same run beside a broker that answers, on its own bin copy. Nothing is posted, and the
+  # seat's one line carries the decision card it would raise, under the same id.
+  local sb="$d/lbs"; mkdir -p "$sb"; cp -p "$lb"/* "$sb/"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "$d/lbs.br" > "$sb/cc-broker"; chmod +x "$sb/cc-broker"; : > "$d/lbs.br"
+  lb="$sb" lrun bks 'STATUS: BLOCKED: which port do I use?' 0 --max-iter 3
+  t 'a BLOCKED question the seat took posts nothing and files no request' "$(grep -c . "$d/lb.n")" 0
+  t '…the seat got it once, with the escalation it may run: cc-notify --decision under the blocked: id' \
+    "$(grep -c '^inject --no-start --source loop lp loop: lp/bks needs you — STATUS: BLOCKED: which port do I use?.* — only the owner can settle it? cc-notify --decision --id blocked:lp/bks:[0-9a-f]*:[0-9]* -t "lp/bks needs you" "<the question>"$' "$d/lbs.br")" 1
+  : > "$d/lbs.br"; lb="$sb" lrun its '- did one step, more to do' 0 --max-iter 1
+  t 'a stop with no question the seat took: nothing posted, nothing filed, and its line offers no decision card' \
+    "$(grep -c . "$d/lb.n")/$(grep -c 'cc-notify --decision' "$d/lbs.br")" 0/0
+  lb="$d/lb"
   printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s"; echo >> "%s"\n' "$d/lb.b" "$d/lb.b" > "$lb/cc-broker"; chmod +x "$lb/cc-broker"; : > "$d/lb.b"
   lrun bh 'STATUS: BLOCKED: may the two checks move from host to hermetic?' 0 --max-iter 3
   rm -f "$lb/cc-broker"
@@ -1040,7 +1055,7 @@ TO
   t 'a DONE posts exactly one card' "$(slackn)" 1
   t 'the loop calls cc-notify in three places only — the DONE card, the BLOCKED question, the planner intake — so a \
 limit wait, a model fallback or restore, or a reminder has no post of its own' \
-    "$(grep -E '^[^#]*"\$BIN/cc-notify" ' "$0" | grep -oE 'done_card|--id "done:|--ask|blocked:' | tr '\n' ' ')" '--id "done: --ask blocked: '
+    "$(grep -E '^[^#]*"\$BIN/cc-notify" ' "$0" | grep -oE 'done_card|--id "done:|--ask|--decision' | tr '\n' ' ')" '--id "done: --ask --decision '
   t '…into the track thread, by its title, once per PR, with no count and no dollar figure' \
     "$(cut -d'|' -f1-4 "$d/lb.n")|$(grep -c '\$' "$d/lb.n")" "--id|done:lp/dn:pr9|-t|lp/dn done|0"
   # ── A MEMBER'S DONE, INSIDE ITS BOUNDARY ── no lander is bound in there, so the receipt is `cc done --json`'s own and
@@ -1305,7 +1320,7 @@ kill_child(){ [ -n "$child" ] || return 0   # only ever signal a group we own: i
   if [ "$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ')" = "$child" ]; then kill -TERM -- -"$child" 2>/dev/null; sleep 2; kill -KILL -- -"$child" 2>/dev/null
   else kill -TERM "$child" 2>/dev/null; fi; }
 trap 'kill_child; parked; log "signalled — iteration aborted and its claude killed"; exit 130' HUP INT TERM   # tmux kill-window would otherwise re-parent claude to systemd, still editing this worktree
-stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" heard=no whose=""   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
+stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" heard=no esc="" bid=""   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
   # …and `waiting` when it stopped to ASK, which is not the same thing as stopping. The loop is the first to know, so it
   # writes the same word cc-reconcile would 20 min later — otherwise the board says `blocked` while the Home tab, reading
   # the very journal line this exit came from, already says `waiting`, and the tab prints the two of them as drift.
@@ -1313,18 +1328,22 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" hea
   log "exit $code: $msg"
   if throwaway; then log "throwaway repo: no ledger record, no seat, nothing posted"; exit "$code"; fi   # see throwaway()
   log "failures ledger ($repo): $(stop_record "$code" "$title" "$msg")"   # the tool that saw it writes it down; the exit is decided already
+  # A WORKER'S QUESTION ($5) is asked ONCE, under an id stable for that question at that commit, so a relaunch that stops
+  # on it again does not ask twice. The seat tries first: its line carries the exact card to raise if only the owner can
+  # settle it. Until 2026-10 the loop posted the question itself, unmentioned on #<repo>, and most went unanswered.
+  [ -z "$said" ] || { bid="blocked:$repo/$track:$(git -C "${WT:-.}" rev-parse --short HEAD 2>/dev/null):$(printf '%s' "$said" | cksum | cut -d' ' -f1)"
+    esc=" — only the owner can settle it? cc-notify --decision --id $bid -t \"$repo/$track $title\" \"<the question>\""; }
   # THE BOARD IS WRITTEN FIRST, whatever the broker does after it: a stop that reached nobody is filed as a request.
-  tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose=" $(stop_target)'s session has been told."; }
-  log "$(stop_route "$heard" "$title" "$msg")"
-  # A WORKER'S QUESTION IS THE SEAT'S FIRST. "A blocked worker's question, after the seat can't settle it, goes out as
-  # the seat's 🔒 card. It isn't posted unmentioned on #<repo>" (comms audit 2026-10-01, change 6): demo-video-skill's
-  # "may the two checks move from host to hermetic?" reached the owner as "needs you" on 09-30, a question the seat had
-  # settled within minutes. So a stop a session heard posts nothing here; the planner line tells that seat to answer
-  # it, or to ask the owner itself with a --decision card. ONLY WHEN NO SESSION TOOK IT ($heard=no) is the question
-  # ($5, nothing else) posted: once, on #<repo> itself (--major: the track's thread sits in the -updates lane the owner
-  # does not read), under an id so a relaunch that stops on the same question at the same commit does not ask it twice.
-  [ -z "$said" ] || [ "$heard" = yes ] || "$BIN/cc-notify" --major --id "blocked:$repo/$track:$(git -C "${WT:-.}" rev-parse --short HEAD 2>/dev/null):$(printf '%s' "$said" | cksum | cut -d' ' -f1)" \
-    -t "$repo/$track $title" --heading "$(stop_headline "$title")" "$said$whose"   # a person reads the row's title; the title routes
+  tell_planner "$(planner_line "$title" "$msg$esc")" && heard=yes
+  # A seat that took it owns it, and nothing is posted: its line tells it to settle the question, or to ask the owner
+  # itself with the --decision card it carries (comms audit 2026-10-01, change 6: demo-video-skill's "may the two
+  # checks move from host to hermetic?" reached the owner as "needs you" on 09-30, a question the seat had settled
+  # within minutes). Nobody took it: a question becomes the owner's decision card (cc-notify --decision: 🔒 @owner on
+  # #<repo>, or a control-seat request when this caller lacks that authority); any other stop is filed as a planner
+  # request, and the log line says where it went (stop_route).
+  if [ "$heard" = yes ] || [ -z "$said" ]; then log "$(stop_route "$heard" "$title" "$msg")"
+  else local r=no; "$BIN/cc-notify" --decision --id "$bid" -t "$repo/$track $title" "$(row_title): $said" && r=yes
+    log "the stop went to $(stop_target)'s session: no — its question went out as a decision card: $r"; fi
   exit "$code"; }
 # THE PROJECT PAUSE. `cc-pause on <repo>` parks a whole project; what it does to a loop that is ALREADY RUNNING is
 # signal it, so this is read from the TERM trap and again at the top of every iteration — the flag can appear at any

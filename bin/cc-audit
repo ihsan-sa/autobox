@@ -39,16 +39,19 @@
 # Same vocabulary as a usage-limited review in cc-land (`attempts - 1`, stage deferred): a run that never
 # happened costs the work nothing and comes back.
 # The report goes to ~/.cc/failures/reports/<claim>.md (CC_FAILURES moves the dir)
-# and is delivered as ONE message with the file (cc-slack post --file), to the control repo's channel (CC_AUDIT_FAILURE_TO
-# names another, a test chat) — no mention, no canvas, no cc-notify, no board row: a finding cannot make work. The
-# tier is the launcher's check, not this file's: run by hand it runs.
+# and is delivered as ONE message with the file (cc-slack post --file), to the control repo's -updates lane
+# (CC_AUDIT_FAILURE_TO names another, a test chat) — never top level in #<control repo>, which is the owner's, and
+# with no "Decision:" head that reads like his card (the narrow pass's first line is re-headed "Review:"). No
+# mention, no canvas, no board row: a finding cannot make work. Only when that post fails does it go to the seat
+# instead, as one `cc-notify --ask` (--id failure-report:<claim>) naming the report. The tier is the launcher's
+# check, not this file's: run by hand it runs.
 # THE FAILURE LEDGER IS WRITTEN RULE-BASED, NO MODEL (docs/design-failure-noticing-2026-09-11.md).
 # THE PIPELINE CHECKS ITSELF in `## failures` under checks: the ledger's door writes (a probe record into a scratch
 # ledger), every producer the design names still calls cc-failures (a writer refactored away records nothing, and
 # nothing else would notice), and an eligible cluster unclaimed for two reconcile passes while the investigation is on
 # and the tier allows it is the pipeline stalled, not a quiet day. See pipeline_check.
 # Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE (stub the model) · CC_AUDIT_BUDGET_FAILURE_BROAD (the broad pass's
-# share) · CC_AUDIT_FAILURE_TO (where the failure report is posted; default #<control repo>).
+# share) · CC_AUDIT_FAILURE_TO (where the failure report is posted; default #<control repo>-updates).
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # systemd-started: no ~/bin
 R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"; cd "$R" || exit 1   # run the INSTALLED ~/bin/cc-audit: a worktree copy fails the suites (they assert against the live install)
@@ -339,7 +342,7 @@ short(){ local s=$1; [ ${#s} -le 160 ] || { s="${s:0:160}"; s="${s% *}…"; }; p
 failure_prompt(){ sed -e "s|@BOX@|$BOX|g" -e "s|@EVIDENCE@|$EV|g" -e "s|@ID@|$FID|g" "$R/config/audit-failure-$1-prompt.md"; }
 failure_run(){
   local FDIR="${CC_FAILURES:-$HOME/.cc/failures}" packet="$EV/01-packet.md" hand="$EV/02-handoff.md" narrow="$EV/03-narrow.md"
-  local rep band test model eff cap bud t0 secs cost_b cost_n why_b defer_b until_b msg msg_why kind ok=1 to="${CC_AUDIT_FAILURE_TO:-#$CTL}"
+  local rep band test model eff cap bud t0 secs cost_b cost_n why_b defer_b until_b msg msg_why kind ok=1 to="${CC_AUDIT_FAILURE_TO:-#$CTL-updates}"
   local outcome="" owhy="" oagain=""   # what the report IS, for cc-failures to read off its first line (THREE STATES, top of file)
   log "start mode=failure id=$FID dry=$dry post=$post ev=$EV"
   # the packet is the whole evidence; an id the ledger does not hold ends here, before any model runs
@@ -384,14 +387,20 @@ failure_run(){
     printf '_investigation %s · %s · band %s (%s) · Sonnet $%.2f + $%.2f · ran %s · %s_\n\n' "$FID" "$kind" "$band" "$model" "$cost_b" "$cost_n" "$(dur "$secs")" "$STAMP"
     printf '## broad pass (claude-sonnet-5)\n\n'; cat "$hand"; printf '\n---\n\n## narrow pass (%s)\n\n' "$model"; cat "$narrow"; } > "$rep"
   # the five lines the owner reads; a report with none gets one line and the file, never nothing
-  msg=$(sed -n '/^## message/,$p' "$narrow" | sed '1d' | grep -v '^[[:space:]]*$' | head -5)
+  # the narrow prompt opens them "**Decision:**"; in the -updates lane that head would read like the owner's card
+  msg=$(sed -n '/^## message/,$p' "$narrow" | sed '1d' | grep -v '^[[:space:]]*$' | head -5 \
+    | sed -E '1s/^(\*\*)?Decision:(\*\*)?/\1Review:\2/')
   if [ -n "$outcome" ]; then msg_why="not investigated ($outcome), $( [ "$outcome" = deferred ] && echo "the pass was refused or postponed" || echo "the model run ended without a result" ) — $owhy. It is offered again after $oagain"
   elif [ "$ok" = 1 ]; then msg_why="no five-line message came back"
   else msg_why="the model run ended without a result — ${LLM_WHY:-${POSTPONED:-postponed}}"; fi   # the broad pass handed off; the narrow one did not answer
   [ -n "$msg" ] || msg="**Investigation $FID** ($kind): $msg_why — the report is attached."
   if [ "$dry" = 1 ]; then cat "$rep"; else echo "$rep"; fi
-  # ONE message, the file with it, where the box's reports go — and nothing else: no canvas, no cc-notify, no board row
-  [ "$post" = 0 ] || cc-slack post --file "$rep" --to "$to" -m "$msg" >/dev/null 2>>"$LOG" || log "failure $FID: post to $to failed"
+  # ONE message, the file with it, in the -updates lane — and nothing else: no canvas, no board row. A post that fails
+  # (a box with no such lane) goes to the seat as one planner request instead, never top level in #<control repo>
+  [ "$post" = 0 ] || cc-slack post --file "$rep" --to "$to" -m "$msg" >/dev/null 2>>"$LOG" || {
+    log "failure $FID: post to $to failed; asking the seat"
+    cc-notify --ask --id "failure-report:$FID" -t "$CTL investigation" "$msg — report: $rep" >/dev/null 2>>"$LOG" ||
+      log "failure $FID: cc-notify --ask failed"; }
   log "done mode=failure id=$FID band=$band model=$model cost=$cost_b+$cost_n secs=$secs ok=$ok outcome=${outcome:-investigated} test=${test:-?} out=$rep"
   exit 0
 }
@@ -587,7 +596,8 @@ S
   sck "$(ntf grep -q -- '^--effort$' "$CC_SC_ARGV")" "…and neither pass names an effort: both run at their model's own default"
   sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.60 1.95')" "failure: the strong cap is \$2 for the job — the narrow pass gets what the broad pass left"
   sck "$(tf test "$(grep -c '^post$' "$fh/slack.log")" = 1)" "failure: ONE message — no canvas, no second post"
-  sck "$(tf grep -qx -- '--to' "$fh/slack.log" && grep -qx '#sc-test' "$fh/slack.log" && grep -q '^\*\*Decision:\*\* review the guard\.' "$fh/slack.log" && grep -qx -- "$fh/.cc/failures/reports/$cl.md" "$fh/slack.log")" "…to the chat named, the five lines opening with the decision, the report as its file"
+  sck "$(tf grep -qx -- '--to' "$fh/slack.log" && grep -qx '#sc-test' "$fh/slack.log" && grep -q '^\*\*Review:\*\* review the guard\.' "$fh/slack.log" && grep -qx -- "$fh/.cc/failures/reports/$cl.md" "$fh/slack.log")" "…to the chat named, the five lines opening with what to review, the report as its file"
+  sck "$(ntf grep -q 'Decision:' "$fh/slack.log")" "…and no \"Decision:\" head that reads like the owner's card"
   sck "$(ntf grep -q -- '--mention' "$fh/slack.log")" "…and no mention"
   sck "$(ntf test -s "$fh/board.log")" "failure: no board row — a finding cannot make work"
   sck "$(ntf test -s "$fh/notify.log")" "failure: no cc-notify — the one message is the whole delivery"
@@ -596,6 +606,18 @@ S
   out=$(fb CC_SC_BAND=authority 2>&1)
   sck "$(tf test "$(grep -A1 -- '^--model$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = 'claude-sonnet-5 claude-opus-5-5')" "failure: BAND: authority sends the narrow pass to Opus 5.5…"
   sck "$(tf test "$(grep -A1 -- '^--effort$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = xhigh)" "…at xhigh, and the broad pass names no effort"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
+  # WHERE IT GOES BY DEFAULT, on its own fixture (no CC_AUDIT_FAILURE_TO): #<control repo>-updates, never top level
+  # in #<control repo>. A post that fails there is ONE planner request to the seat, still no Slack card of his
+  # (the child's control repo is $BOX: its HOME is the fixture's, so this copy is under no ~/dev/<repo>)
+  out=$(fb CC_AUDIT_FAILURE_TO= 2>&1)
+  sck "$(tf grep -qxF -- "#$BOX-updates" "$fh/slack.log" && ! grep -qxF -- "#$BOX" "$fh/slack.log" && ! test -s "$fh/notify.log")" "failure: by default the report goes to #<control repo>-updates, never top level in #<control repo>, and the seat is not asked"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
+  local okslack; okslack=$(cat "$fh/bin/cc-slack")
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" >> "$HOME/slack.log"; exit 1\n' > "$fh/bin/cc-slack"
+  out=$(fb CC_AUDIT_FAILURE_TO= 2>&1)
+  sck "$(tf test "$(grep -c -- '^--ask$' "$fh/notify.log")" = 1 && grep -qx "failure-report:$cl" "$fh/notify.log" && grep -q '^\*\*Review:\*\* review the guard\.' "$fh/notify.log" && grep -q " — report: $fh/.cc/failures/reports/$cl.md$" "$fh/notify.log" && ! grep -q -- '--decision' "$fh/notify.log")" "failure: a post the -updates lane refuses goes to the seat as ONE cc-notify --ask (stable --id), naming the report — never a decision card"
+  printf '%s\n' "$okslack" > "$fh/bin/cc-slack"; rm -f "$fh/notify.log"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
   out=$(fb CC_SC_BAND=routine 2>&1)
   sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.60 0.95')" "failure: BAND: routine — Sonnet both passes, \$1 for the job"
