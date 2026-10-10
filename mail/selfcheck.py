@@ -364,6 +364,15 @@ class Box:
         # makes one (fake_daemon below), and no socket is the "daemon is down" path — which is what the M1
         # cases, all of which are about storing, want anyway.
         r.SLACKSOCK = os.path.join(self.tmp, "sock")
+        # THE OWNER LINE TOO: an auth drop from an allow-listed address runs cc-notify, and the default is the
+        # box's own, which would post a fixture into the owner's updates lane. The stub records its argv instead.
+        self.saved_notify = r.NOTIFY
+        r.NOTIFY = os.path.join(self.tmp, "notify-bin", "cc-notify")
+        self.notified = os.path.join(self.tmp, "notify.args")
+        os.makedirs(os.path.dirname(r.NOTIFY))
+        with open(r.NOTIFY, "w") as f:
+            f.write("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\n" % self.notified)
+        os.chmod(r.NOTIFY, 0o755)
         os.makedirs(r.INBOX)
         os.makedirs(r.STATE)
         if self.use_env:
@@ -414,6 +423,7 @@ class Box:
         self.srv.server_close()
         sys.stderr = self.saved_err
         r.MAILDIR, r.INBOX, r.RATEFILE, r.STATE, r.SLACKSOCK = self.saved
+        r.NOTIFY = self.saved_notify
         r.CONF = self.saved_conf
         router.MAILDIR, router.CONVDIR, router.INDEX = self.saved_conv
         (vetting.MAILDIR, vetting.CONVDIR, vetting.STATE, vetting.DEV, vetting.WORKTREES,
@@ -481,6 +491,20 @@ class Box:
         """Start this request's log at zero, so "exactly one line" is a claim about one request."""
         self.err.seek(0)
         self.err.truncate(0)
+
+    def owner_lines(self, want=0, wait=3.0):
+        """What the stub cc-notify was called with, one line per call. The call is detached, so this waits up to
+        `wait` seconds for `want` lines to appear — and with want=0 it waits the whole time, so "none" means none."""
+        deadline = time.time() + wait
+        while True:
+            try:
+                with open(self.notified) as f:
+                    got = [ln for ln in f.read().splitlines() if ln.strip()]
+            except OSError:
+                got = []
+            if (want and len(got) >= want) or time.time() >= deadline:
+                return got
+            time.sleep(0.05)
 
     def ids(self):
         return sorted(d for d in os.listdir(r.INBOX) if not d.startswith("."))
@@ -775,6 +799,63 @@ def run():
     k(r.verdict(email.message_from_string(
         "Authentication-Results: mx; spf=pass\nAuthentication-Results: mx2; dkim=fail\n\nhi"))["verdict"] == "fail",
       "every Authentication-Results header is read, not only the first")
+
+    # ------------------------------------------- 6a. an auth drop says what was signed, and an allowed one is told
+    # 2026-10-05 and 10-09: a sender on MAIL_ALLOW was dropped as unauthenticated-sender because their
+    # domain publishes no SPF or DMARC, and nobody saw it for days. The drop line now carries every DKIM signature
+    # (so the log says whether an aligned-DKIM rule would have helped), and the owner hears once a day per sender.
+    gmail = ("spf=none smtp.mailfrom=allowed.example; dkim=pass header.i=@allowed-example.20230601.gappssmtp.com"
+             " header.s=20230601; dmarc=none header.from=allowed.example")
+    with Box() as b:
+        sig = {"DKIM-Signature": "v=1; a=rsa-sha256; d=allowed-example.20230601.gappssmtp.com; s=20230601; b=x"}
+        b.clear()
+        code, ans = b.post(eml(auth=gmail, headers=sig), sender=ALLOWED)
+        k(code == 403 and ans.get("reply") is None, "an allow-listed sender with spf=none dmarc=none is still dropped")
+        line = (b.lines() or [""])[0]
+        k(len(b.lines()) == 1 and "drop unauthenticated-sender" in line
+          and "dkim_sigs='allowed-example.20230601.gappssmtp.com:pass'" in line,
+          "…and its one drop line names each DKIM signature's d= and result: %r" % line[:200])
+        k(" owner=told from=" in line, "…and says the owner was told")
+        got = b.owner_lines(want=1)
+        k(len(got) == 1 and got[0].startswith("-t ") and " mail-auth-drop -- " in got[0]
+          and ALLOWED in got[0] and RCPT in got[0] and "spf=none dmarc=none" in got[0],
+          "the owner gets one updates-lane line naming the sender, the box address and the reason: %r" % got[:1])
+        with open(os.path.join(r.STATE, "auth-drops.json")) as f:
+            stamps = json.load(f)
+        k(stamps == {ALLOWED: time.strftime("%Y-%m-%d", time.gmtime())}, "…stamped with today's UTC date")
+        b.clear()
+        code, _ = b.post(eml(auth=gmail, headers=sig), sender=ALLOWED)
+        k(code == 403 and "owner=told" not in b.lines()[0], "a second drop the same day is logged…")
+        k(len(b.owner_lines(want=2, wait=1.0)) == 1, "…and the owner is NOT told again that day")
+        with open(os.path.join(r.STATE, "auth-drops.json"), "w") as f:
+            json.dump({ALLOWED: "2000-01-01"}, f)
+        b.clear()
+        b.post(eml(auth=gmail, headers=sig), sender=ALLOWED)
+        k(" owner=told " in b.lines()[0] and len(b.owner_lines(want=2)) == 2,
+          "a stamp from an earlier day does not hold the next day's line back")
+    with Box() as b:
+        b.clear()
+        b.post(eml(frm=STRANGER, auth=gmail), sender=STRANGER)
+        line = (b.lines() or [""])[0]
+        k("drop unauthenticated-sender" in line and "owner=told" not in line,
+          "a sender NOT on the allow-list is dropped the same way…")
+        k(b.owner_lines() == [] and not os.path.exists(os.path.join(r.STATE, "auth-drops.json")),
+          "…and the owner hears nothing and nothing is stamped")
+        b.clear()
+        b.post(eml(frm=OTHER, auth="spf=pass; dkim=fail header.d=allowed.example; dmarc=pass"), sender=STRANGER)
+        k("drop auth-" in b.lines()[0] and "dkim_sigs='allowed.example:fail'" in b.lines()[0]
+          and " owner=told " in b.lines()[0],
+          "a verdict drop whose From header claims an allowed address is told too, with its DKIM: %r"
+          % b.lines()[0][:200])
+        k(OTHER in (b.owner_lines(want=1) or [""])[0], "…naming the allowed address the mail claimed")
+    k(r.dkim_sigs(email.message_from_string("Authentication-Results: mx; dkim=none; spf=pass\n\nhi"),
+                  r.verdict(email.message_from_string("Authentication-Results: mx; dkim=none\n\nhi"))) == "-:none",
+      "a mail with no signature is logged as -:none")
+    two = email.message_from_string(
+        "Authentication-Results: mx; dkim=pass header.d=a.example; x-dkim=fail header.d=evil\n"
+        "DKIM-Signature: v=1; d=b.example; s=s\nDKIM-Signature: v=1; d=a.example; s=s\n\nhi")
+    k(r.dkim_sigs(two, r.verdict(two)) == "a.example:pass,b.example:unchecked",
+      "every signature is listed once, a DKIM-Signature no result names as unchecked, and x-dkim= is not one")
 
     # ------------------------------------------- 6b. WHICH address the allow-list is matched against
     # The hole this replaces: Email Routing rejects a mail only when SPF and DKIM BOTH fail, so an envelope of

@@ -147,7 +147,16 @@ sender with message.reply(), or null meaning the worker says nothing:
                                                   nothing delivered)
   401 {"status":"unauthorized","reply":null}      no secret, or the wrong one
   403 {"status":"dropped","reply":null}           the verdict says fail, no authenticated identity, or an
-                                                  identity that is not on the allow-list
+                                                  identity that is not on the allow-list. A drop for the
+                                                  VERDICT or for no authenticated identity logs every DKIM
+                                                  signature as `dkim_sigs=<d>:<result>,…` (`-:none` when
+                                                  there is none), and when the From header or the envelope
+                                                  names an address on the allow-list the owner gets ONE
+                                                  line in the box's updates lane (cc-notify, ambient) naming
+                                                  it, the box address and the reason — at most once per
+                                                  sender per UTC day, stamped in CC_MAIL_STATE/auth-drops.json.
+                                                  The drop line then carries `owner=told`. The sender still
+                                                  hears nothing: the address is claimed, not proven
   413 {"status":"refused","reason":…,"reply":…}   over MAIL_MAX_BYTES, MAIL_MAX_PARTS or MAIL_MAX_ATTACH_BYTES
   429 {"status":"refused","reason":…,"reply":…}   over MAIL_RATE in MAIL_RATE_WINDOW, for this sender
   400 {"status":"refused","reason":…,"reply":null} the call itself was malformed: no X-Mail-From, a
@@ -301,6 +310,7 @@ BUSY_WAIT = 1.0         # seconds a connection waits for one of those slots befo
 HEADER_BYTES = 65536    # how much of an OVER-cap mail is still read, so its headers can say who sent it
 RATE = 10
 RATE_WINDOW = 3600
+NOTIFY = os.path.join(H, "bin", "cc-notify")   # the owner line for an allow-listed sender's auth drop
 
 # The daemon's own socket (cc-slack). It is how a stored mail reaches the session it is for without a second
 # Slack connection: this process holds no token and makes no Slack call of its own — it hands over an id.
@@ -491,6 +501,82 @@ def identity(msg, auth, envelope_from):
     if auth.get("spf") == "pass" and envelope_from:
         return envelope_from, "envelope"
     return "", ""
+
+
+def dkim_sigs(msg, auth):
+    """Every DKIM signature on the mail with its result, as `d:result,…` for the drop line — a record, never a rule.
+
+    Read off the Authentication-Results clauses (`dkim=pass header.d=x`, or header.i's domain when there is no
+    header.d) and then off each DKIM-Signature header's own `d=`, which is added as `unchecked` when no result
+    names it. "-:none" is a mail that says it carries none. Only domain characters survive the regexes, so a
+    sender cannot write anything else into the log through this. It is here so the log can say whether an
+    ALIGNED-DKIM rule would ever have let a dropped mail in (Google's default d=*.gappssmtp.com is not aligned);
+    identity() does not read it.
+    """
+    seen = []
+    for line in auth.get("results") or []:
+        for clause in line.lower().split(";"):
+            m = re.match(r"\s*dkim\s*=\s*([a-z]+)", clause)
+            if not m:
+                continue
+            d = (re.search(r"(?<![-\w])header\.d\s*=\s*([a-z0-9.-]+)", clause)
+                 or re.search(r"(?<![-\w])header\.i\s*=\s*[^\s;@]*@([a-z0-9.-]+)", clause))
+            seen.append((d.group(1) if d else "-", m.group(1)))
+    try:
+        signed = [" ".join(str(v).split()).lower() for v in msg.get_all("DKIM-Signature", [])]
+    except Exception:
+        signed = []
+    for sig in signed:
+        m = re.search(r"(?:^|;)\s*d\s*=\s*([a-z0-9.-]+)", sig)
+        if m and m.group(1) not in {d for d, _ in seen}:
+            seen.append((m.group(1), "unchecked"))
+    return ",".join("%s:%s" % p for p in seen) or "-:none"
+
+
+AUTH_DROP_LOCK = threading.Lock()
+
+
+def tell_owner_once(who, rcpt, why):
+    """One line to the owner that a message claiming to be from `who`, an allow-listed address, was dropped for auth.
+
+    At most once per sender per UTC day: the day is stamped in STATE/auth-drops.json BEFORE cc-notify runs, and
+    only today's stamps are kept, so the file stays as small as the allow-list. Every argument is ours or
+    already bounded — `who` is off the allow-list, `why` is method results and DKIM domains (letters, digits,
+    dots and dashes only), `rcpt` is named only when it is a plain address — so nothing a stranger wrote
+    reaches the owner's channel. The call is detached and never waited on, because a
+    drop is answered in the worker's event. True when the line was handed to cc-notify.
+    """
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    path = os.path.join(STATE, "auth-drops.json")
+    with AUTH_DROP_LOCK:
+        try:
+            with open(path) as f:
+                seen = json.load(f)
+        except (OSError, ValueError):
+            seen = {}
+        if not isinstance(seen, dict):
+            seen = {}
+        if seen.get(who) == day:
+            return False
+        seen = {k: v for k, v in seen.items() if v == day}
+        seen[who] = day
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(path + ".tmp", "w") as f:
+                json.dump(seen, f)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass                    # cc-notify's own day-long dedup still holds the same line back
+    box = os.environ.get("CC_BOX") or socket.gethostname().split(".")[0]
+    rcpt = rcpt if re.fullmatch(r"[a-z0-9._+-]{1,64}@[a-z0-9.-]{1,253}", rcpt or "") else "the box"
+    text = "Mail from %s to %s was dropped because it did not authenticate (%s). They got no bounce." % (
+        who, rcpt, why)
+    try:
+        subprocess.Popen([NOTIFY, "-t", "%s mail-auth-drop" % box, "--", text], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return False
+    return True
 
 
 LOG_LOCK = threading.Lock()
@@ -830,6 +916,18 @@ class Handler(BaseHTTPRequestHandler):
         self.say("drop %s from=%s" % (why, clip(sender)))
         self._json(403, {"status": "dropped", "reply": None})
 
+    def auth_dropped(self, why, msg, auth, sender, rcpt):
+        """A drop for authentication: dropped() with the DKIM signatures on the line, and the owner told once a
+        day when the From header or the envelope claims an address on the allow-list (tell_owner_once)."""
+        sigs = dkim_sigs(msg, auth)
+        # The brief: "When a sender on MAIL_ALLOW is dropped for auth, the owner gets one line in the updates
+        # lane, at most once per sender per day" — and only then: a stranger's drop tells nobody.
+        allowed = allow_list()
+        claimed = [a for a in addrs(msg, "From")[:1] + [sender] if a in allowed]
+        told = bool(claimed) and tell_owner_once(claimed[0], rcpt, "spf=%s dmarc=%s, DKIM %s" % (
+            auth["spf"] or "none", auth["dmarc"] or "none", sigs))
+        self.dropped("%s dkim_sigs=%s%s" % (why, clip(sigs), " owner=told" if told else ""), sender)
+
     def refused(self, code, reason, sender):
         """A refusal is only ever sent to somebody already on the allow-list, which is why it may carry a
         reason at all: the checks that answer a stranger have all run before any of these."""
@@ -903,15 +1001,16 @@ class Handler(BaseHTTPRequestHandler):
 
         # 3. THE VERDICT, a DROP, so it comes before anything that carries a reason.
         if auth["verdict"] == "fail":
-            return self.dropped("auth-%s" % clip("spf=%s dkim=%s dmarc=%s"
-                                                 % (auth["spf"], auth["dkim"], auth["dmarc"])), sender)
+            return self.auth_dropped("auth-%s" % clip("spf=%s dkim=%s dmarc=%s"
+                                                      % (auth["spf"], auth["dkim"], auth["dmarc"])),
+                                     msg, auth, sender, rcpt)
 
         # 4. THE SENDER: who the mail is authenticated as, then whether that address is on the list. Never the
         # envelope on its own — see identity(). Both outcomes are drops, so a stranger still learns nothing.
         who, how = identity(msg, auth, sender)
         if not who:
-            return self.dropped("unauthenticated-sender spf=%s dmarc=%s" % (clip(auth["spf"]), clip(auth["dmarc"])),
-                                sender)
+            return self.auth_dropped("unauthenticated-sender spf=%s dmarc=%s"
+                                     % (clip(auth["spf"]), clip(auth["dmarc"])), msg, auth, sender, rcpt)
         auth["envelope_from"], auth["identity"] = sender, how
         if who not in allow_list():
             return self.dropped("unknown-sender", who)

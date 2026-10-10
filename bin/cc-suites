@@ -26,9 +26,14 @@
 #                                 SSH_ORIGINAL_COMMAND (`status`, `run SUITE TREE PART CHANGED-B64`, the lander's
 #                                 one check, `job CHECK TREE CAP RUN-B64 CWD-B64 [net]`, `render TREE CAP START END SCENE`
 #                                 or `gpu`) and a tar on stdin
-#   cc-suites laptop-setup [NODE] print the PowerShell script the owner runs once on a Windows laptop (below), and on
-#                                 this box make the key and point ~/.cc/suites/remote at ccsuite@NODE
-#                                 (default cc-suites-runner, the tailnet name the script gives the runner)
+#   cc-suites laptop-setup [NODE] write the PowerShell script the owner runs once on a Windows laptop (below) to
+#                                 ~/.cc/suites/laptop-setup.ps1 (mode 600), and print the one command that fetches
+#                                 it over ssh from this box (its tailnet name, read at run time; CC_SUITES_BOX
+#                                 overrides it), runs it only once that fetch worked, and deletes the laptop's copy.
+#                                 On this box make the key and point ~/.cc/suites/remote at ccsuite@NODE (default
+#                                 cc-suites-runner, the tailnet name the script gives the runner). The box's copy is
+#                                 removed by the next
+#                                 laptop-setup, or by the first `status` or `spill` the runner answers
 #   cc-suites selfcheck           fixtures of its own: a scratch runner reached through a stub transport, fake runs
 #                                 in a temp dir. It never reads this box's processes outside that dir, nor its keys
 #
@@ -83,7 +88,8 @@
 # landing can fail on is still only ever this box's own run of the whole suite.
 # Every line spill ends on says how long the runner had the run, so the runner's seconds can be set beside the box's.
 # The runner's host key is made here by laptop-setup, pinned in ~/.cc/suites/known_hosts (StrictHostKeyChecking=yes)
-# and its private half handed over in the script only, never kept on this box.
+# and its private half handed over in the script only: it stays on this box only in that mode-600 file, until the
+# runner first answers `status` or `spill`, or laptop-setup runs again, and is never printed.
 #
 # THE LAPTOP (laptop-setup). A WSL distro of its own (cc-suites), so its settings touch nothing the owner uses:
 # systemd on, Windows interop and the C: mount OFF (a process there cannot start a Windows program or read the
@@ -163,6 +169,8 @@ status(){
   a=$(xp_kept "$ef" timeout "$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)" "${XP[@]}" status </dev/null | tail -1)
   a=$(printable "$a"); [ -n "$a" ] || a=$(err_of "$ef")
   case $a in "free "*|"busy"*|"unfit"*)
+    # the runner answered, so the setup script (and the host key in it) has done its work: drop the box's copy
+    rm -f "$SD/laptop-setup.ps1"
     # the GPU a render there would use, asked of its Blender (a few seconds): `gpu OPTIX <name>, Blender 5.2.2`
     g=$(xp_kept "$ef" timeout 120s "${XP[@]}" gpu </dev/null | tail -1); g=${g#gpu }
     g=$(printable "$g"); [ -n "$g" ] || g="no answer ($(err_of "$ef"))"
@@ -226,6 +234,7 @@ spill(){
   [ "$#" = 0 ] || return 75          # the runner takes no arguments for the suite; a run that has some stays here
   xport_argv || return 75
   a=$(timeout "$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)" "${XP[@]}" status </dev/null 2>/dev/null | tail -1)   # a runner that answers nothing in 20 s is none
+  case $a in "free "*|"busy"*|"unfit"*) rm -f "$SD/laptop-setup.ps1";; esac   # it answered: drop the setup script, as status does
   case $a in "free "[1-9]*) ;; *) return 75;; esac
   # green.sh's start tree is taken HERE, as it is sourced, and names the suite: the tree shipped is that tree, and
   # green_record below refuses to file anything if the checkout moved while the runner ran it.
@@ -758,8 +767,14 @@ render(){
 }
 
 # ---- laptop-setup -------------------------------------------------------------------------------------------------
+# This box's name on the tailnet, read at run time (core names no box): MagicDNS's name for it, else its own.
+box_name(){
+  local n=${CC_SUITES_BOX:-}
+  [ -n "$n" ] || n=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null)
+  n=${n%.}; echo "${n:-$(hostname -f 2>/dev/null || hostname)}"
+}
 laptop_setup(){
-  local node=${1:-cc-suites-runner} pub b64 hk pymm scv scsum=""
+  local node=${1:-cc-suites-runner} pub b64 hk f pymm scv scsum=""
   [[ $node =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "cc-suites: NODE is a tailnet host name ([a-z0-9-])" >&2; return 2; }
   pymm=$(tool_version python3 | cut -d. -f1,2); scv=$(tool_version shellcheck)
   [[ $pymm =~ ^[0-9]+\.[0-9]+$ ]] && [[ $scv =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
@@ -767,6 +782,7 @@ laptop_setup(){
   local e; for e in $SHELLCHECK_SUMS; do [ "${e%%=*}" != "$scv" ] || scsum=${e#*=}; done
   [ -n "$scsum" ] || echo "cc-suites: no pinned sum for shellcheck $scv (SHELLCHECK_SUMS): the laptop keeps its own, and answers unfit while it is older" >&2
   mkdir -p "$SD" && chmod 700 "$SD"
+  f="$SD/laptop-setup.ps1"; rm -f "$f"   # a script from an earlier run carries a host key no longer pinned
   [ -s "$SD/id_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -C "cc-suites@$(hostname -s)" -f "$SD/id_ed25519" >/dev/null || return 1
   # The runner's host key is made HERE and pinned before the laptop is ever reached: the box trusts that key for
   # NODE and no other (StrictHostKeyChecking=yes), so a tailnet name that answers with another key is no runner.
@@ -778,8 +794,10 @@ laptop_setup(){
   hk=$(cat "$kd/k"); rm -rf "$kd"
   echo "ccsuite@$node" > "$SD/remote"
   pub=$(cat "$SD/id_ed25519.pub"); b64=$(base64 -w76 "$SELF")
-  echo "cc-suites: the script below is SECRET — it carries the runner's private host key. Run it on the laptop and delete it; never paste it into Slack, a doc or a shared file." >&2
-  cat <<PS1
+  # The script carries that private key, so it is never printed: it goes to a file only this user can read, and
+  # the laptop fetches it over ssh (pasting an 89 kB script by hand failed, 2026-09-29).
+  ( umask 077 && : > "$f" ) || return 1
+  cat > "$f" <<PS1
 # SECRET: this script carries the runner's private SSH host key. Run it, then delete it; do not share or paste it.
 # cc-suites runner for this laptop. Run once in an ADMINISTRATOR PowerShell; running it again is safe.
 # It makes a WSL distro of its own (cc-suites) that runs the box's test suites while this laptop is open, and
@@ -901,6 +919,13 @@ Write-Host "The runner answers: \$ready  ('free N' is ready; 'unfit (missing: ..
 Write-Host "Blender renders with: \$gpu  ('gpu OPTIX ...' or 'gpu CUDA ...' is ready; 'gpu none' means the box renders on its own CPU)"
 Write-Host "Done. The box will send suites and the lander's quick checks here while this laptop is open and not busy (on battery too)."
 PS1
+  local src; src="$(id -un)@$(box_name):$f"
+  echo "cc-suites: the setup script is in $f (mode 600; removed once the runner first answers status or spill). In an ADMINISTRATOR PowerShell on the laptop, run:" >&2
+  echo "cc-suites: (it assumes the laptop can already ssh to this box as ${src%%:*})" >&2
+  # PowerShell's ; never checks a native command's exit code, so the run is gated on scp's own, and the copy has a
+  # name no earlier, interrupted setup can have left behind; it is deleted whatever happens.
+  # shellcheck disable=SC2016  # the $ are PowerShell's
+  printf '$ps1 = Join-Path $env:TEMP "cc-suites-$([guid]::NewGuid()).ps1"; try { scp %s $ps1; if ($LASTEXITCODE -eq 0 -and (Test-Path $ps1)) { powershell -ExecutionPolicy Bypass -File $ps1 } else { Write-Host "The copy from the box failed, so nothing ran." } } finally { Remove-Item -Force -ErrorAction SilentlyContinue $ps1 }\n' "$src"
 }
 
 # ---- selfcheck ----------------------------------------------------------------------------------------------------
@@ -1383,8 +1408,23 @@ echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
   k "$(b '[ "$(t bash "$SELF" render "$SC/gpu/scene.py" "$D/o-full")" = 2 ] && [ "$(t bash "$SELF" render "$SC/gpu/scene.py" "$D/o-rev" 4 3)" = 2 ] && [ "$(t bash "$SELF" render "$SC/gpu/texture.txt" "$D/o-txt")" = 2 ]')" "render refuses an OUT that is not empty, a range backwards, and a scene that is not NAME.py"
   unset CC_SUITES_BLENDER; rm -f "$FB/blender"; rmdir "$FB"
   # laptop-setup: the key, the remote, and a script that carries this very file and the key's public half
-  out=$(bash "$SELF" laptop-setup my-node 2>&1); rc=$?
+  local cmd re f="$D/sd/laptop-setup.ps1"
+  mkdir -p "$D/sd" && echo stale > "$f"
+  # cmd is read inside the single-quoted b '…' strings below, where shellcheck cannot see it
+  # shellcheck disable=SC2034
+  cmd=$(CC_SUITES_BOX=my-box bash "$SELF" laptop-setup my-node 2>/dev/null); rc=$?
   k "$(b '[ "$rc" = 0 ] && [ "$(cat "$D/sd/remote")" = ccsuite@my-node ] && [ -s "$D/sd/id_ed25519" ]')" "laptop-setup makes the key and points the remote at ccsuite@my-node"
+  k "$(b '[ "$(stat -c %a "$f")" = 600 ] && ! grep -qx stale "$f" && grep -q "^# SECRET" "$f"')" "…writes a fresh script over the last one's, to a file only this user can read (mode 600)"
+  # A failed fetch must run nothing. No PowerShell here, so the command's shape is what is checked: the copy's name
+  # is made fresh on the laptop (no leftover of an interrupted setup can be the file run), the one `powershell` sits
+  # in the branch taken only when scp's own exit code is 0 and the file is there, and a finally deletes the copy.
+  # shellcheck disable=SC2034
+  re='^\$ps1 = Join-Path \$env:TEMP "cc-suites-\$\(\[guid\]::NewGuid\(\)\)\.ps1"; try \{ scp [^ ;]+ \$ps1; if \(\$LASTEXITCODE -eq 0 -and \(Test-Path \$ps1\)\) \{ powershell -ExecutionPolicy Bypass -File \$ps1 \} else \{ [^{}]* \} \} finally \{ Remove-Item -Force -ErrorAction SilentlyContinue \$ps1 \}$'
+  k "$(b '[ "$(wc -l <<<"$cmd")" = 1 ] && [[ $cmd =~ $re ]] && [ "$(grep -o powershell <<<"$cmd" | wc -l)" = 1 ] && ! grep -q "cc-suites\.ps1" <<<"$cmd"')" "…and prints one command that runs the laptop's copy only when this scp worked, under a fresh name, and deletes it in a finally"
+  k "$(b 'grep -qF "scp $(id -un)@my-box:$f \$ps1;" <<<"$cmd"')" "…fetching the script from this box as this account"
+  # the same pattern must refuse the old shape, where ; ran a leftover copy whatever scp did
+  k "$(b '! [[ "scp u@b:/x \$env:TEMP\\cc-suites.ps1; powershell -ExecutionPolicy Bypass -File \$env:TEMP\\cc-suites.ps1; del \$env:TEMP\\cc-suites.ps1" =~ $re ]]')" "…a check that refuses a command running the copy whatever scp did"
+  out=$(cat "$f")
   k "$(b 'grep -qF "restrict,command=\"/usr/local/bin/cc-suites runner\" $(cat "$D/sd/id_ed25519.pub")" <<<"$out"')" "…and its script pins that key to the runner, restricted"
   k "$(b 'awk "/^base64 -d/{f=1;next} /^B64\$/{f=0} f" <<<"$out" | base64 -d | cmp -s - "$SELF"')" "…and carries this file byte for byte"
   k "$(b 'grep -q "bubblewrap" <<<"$out"')" "…installs bwrap, which the suite's sandbox cases run"
@@ -1396,7 +1436,17 @@ echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
   k "$(b 'grep -q '\''^enabled=false'\'' <<<"$out" && grep -q '\''AllowUsers ccsuite@100.64.0.0/10'\'' <<<"$out"')" "…with interop and the C: mount off, and sshd for ccsuite from the tailnet only"
   awk "/^cat >\/etc\/ssh\/ssh_host_cc_suites_ed25519/{f=1;next} /^KEY\$/{f=0} f" <<<"$out" > "$D/hk"; chmod 600 "$D/hk"
   k "$(b '[ "$(cat "$D/sd/known_hosts")" = "my-node $(ssh-keygen -y -f "$D/hk" | cut -d" " -f1,2)" ] && grep -q "^HostKey /etc/ssh/ssh_host_cc_suites_ed25519" <<<"$out"')" "…and pins a host key of its own making: known here for my-node, installed there as sshd's only one"
-  k "$(b '[ -z "$(ls "$D/sd" | grep -v "^id_ed25519\|^known_hosts\$\|^remote\$")" ] && grep -q "SECRET" <<<"$out"')" "…keeps no copy of that private key here, and says the script is secret"
+  k "$(b '[ -z "$(ls "$D/sd" | grep -v "^id_ed25519\|^known_hosts\$\|^remote\$\|^laptop-setup.ps1\$")" ] && grep -q "PRIVATE KEY" "$f" && ! grep -q "PRIVATE KEY" <<<"$cmd"')" "…keeps that private key here only in the script's file, and never prints it"
+  CC_SUITES_SSH="$D/xport-mute" CC_SUITES_STATUS_TIMEOUT=2s bash "$SELF" status >/dev/null 2>&1
+  k "$(b '[ -s "$f" ]')" "a status the runner does not answer keeps the box's copy of the script…"
+  # xport-old answers both status and the gpu question status now asks, so this waits on neither
+  CC_SUITES_SSH="$D/xport-old" bash "$SELF" status >/dev/null 2>&1
+  k "$(b '[ ! -e "$f" ]')" "…and the first status it answers removes it"
+  echo again > "$f"; printf '#!/usr/bin/env bash\n[ "$1" = status ] && echo busy\n' > "$D/xport-busy"; chmod +x "$D/xport-busy"
+  CC_SUITES_SSH="$D/xport-mute" CC_SUITES_STATUS_TIMEOUT=2s bash "$SELF" spill "$R/core/tests/selftest.sh" >/dev/null 2>&1
+  k "$(b '[ -s "$f" ]')" "a spill the runner does not answer keeps it too…"
+  CC_SUITES_SSH="$D/xport-busy" bash "$SELF" spill "$R/core/tests/selftest.sh" >/dev/null 2>&1; rc=$?
+  k "$(b '[ "$rc" = 75 ] && [ ! -e "$f" ]')" "…and one it answers, even busy, removes it and runs nothing (got $rc)"
   unset CC_SUITES_SSH; local -a XP
   k "$(b 'xport_argv && printf "%s\n" "${XP[@]}" | grep -qx StrictHostKeyChecking=yes && ! printf "%s\n" "${XP[@]}" | grep -q accept-new')" "the transport takes that key and no other (StrictHostKeyChecking=yes)"
   rm -f "$D/sd/known_hosts"
