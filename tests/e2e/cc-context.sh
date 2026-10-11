@@ -95,6 +95,8 @@ if stanza "cc-context (the real number, and what refuses to run without it)"; th
 chk cc-context
 chk cc-statusline   # the harness's own per-turn file cc-context prefers over its transcript estimate
 chk cc-sandbox   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
+chk cc-egress   # the worker's only way out: listed hosts tunnel, the rest 403, and the in-sandbox forwarder
+chk cc-harness-codex   # Codex's tools through cc-guard: the patch parser, the session-log reads, guard check
 "$B/cc-context" $REPO w1 2>&1 | grep -q '^10%  20k/200k' && ok "a track's number is read off the session the board names" || bad "cc-context $REPO w1: $("$B/cc-context" $REPO w1 2>&1) (fixture sid $sid, board sid $("$B/cc-board" get $REPO w1 session_id))"
 "$B/cc-context" $REPO w1 --over 90 >/dev/null 2>&1; rc=$?; [ $rc = 1 ] && ok "--over N at 10% says under, exit 1" || bad "--over 90 at 10%: rc=$rc"
 "$B/cc-context" $REPO w1 --over >/dev/null 2>&1; rc=$?; [ $rc = 1 ] && ok "a bare --over reads the hand-off line: 20k is under it" || bad "bare --over: rc=$rc"

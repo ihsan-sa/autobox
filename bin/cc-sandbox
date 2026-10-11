@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # cc-sandbox — a worker's `claude -p` inside bwrap: the box's secrets, the container and tmux sockets, the other tracks and
 # the control plane's source are ABSENT from the process's world, not denied by a regex (docs: design-worker-sandbox, stage 1a).
-#   cc-sandbox <repo> <track> -- <cmd...>   CC_WORKER_SANDBOX=1 → bwrap around <cmd>; anything else → exec <cmd> untouched
+#   cc-sandbox <repo> <track> -- <cmd...>   bwrap around <cmd>, ON FOR EVERY WORKER, whatever its harness. Two ways it is not:
+#                                           CC_WORKER_SANDBOX=0 (the owner's switch, set where the dispatch starts) execs
+#                                           <cmd> untouched, and so does a launch already inside a member workspace's
+#                                           boundary, where a nested bwrap is refused: one wall, not two. That is known from
+#                                           what the member boundary makes and the host cannot (in_member), never from
+#                                           CC_MEMBER_SANDBOX=1 alone, which any host shell can plant. With
+#                                           no bwrap, or none that starts, it runs NOTHING and says why (no host fallback).
+#   cc-sandbox probe                        the same decision, run first: exit 0 when a launch would get the fence (or is one
+#                                           of the two above), else exit 2 and the reason. cc-loop asks it before iteration 1
+#                                           and does not start a worker it refuses.
 #   cc-sandbox vet -- <cmd...>              THE BOX'S OWN BOUNDARY, the one that needs no workspace: the distribution and
 #                                           NOTHING OF THIS BOX — no home, no ~/.cc, no credential, no repo, no network, not
 #                                           even the hostname. The mail door reads a stranger's attachment in here
@@ -165,14 +174,27 @@
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
 #   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
 #   groups become nobody).
+# OTHER HARNESSES' LOGINS ARE ABSENT, not stripped: $HOME inside is a tmpfs and only the binds above are in it, so
+#   ~/.codex (auth.json, config.toml), ~/.cursor and ~/.config/cursor do not exist in a worker's world at all. The
+#   selfcheck plants each one in a fixture HOME and reads for it from inside. A harness that needs its own credential
+#   inside gets it the way claude does below — one stripped copy on a descriptor — in that harness's own phase.
 # AUTH (a WORKER; a member workspace's is the `cc-sandbox member` paragraph above): claude reads a STRIPPED copy of
 #   ~/.claude/.credentials.json at its normal path — the current access token and its
 #   expiry, no refresh token — so the read claude needs is the one cc-guard's credential rule denies the worker, and nothing
 #   goes in the environment (CLAUDE_CODE_OAUTH_TOKEN is unset inside: `env` is not gated, that path is). An iteration is ≤1 h
 #   and whichever session next needs the token refreshes the real file, so a launch with <65 min left is logged: if it
 #   expires mid-run that iteration errors and the next one starts on a fresh copy.
-# NETWORK: untouched (--unshare-net is all-or-nothing, and "none" kills claude). Own pid namespace; same process group and
-#   --die-with-parent, so cc-loop's kill of the group and the `timeout` inside both end everything.
+# NETWORK (a worker; the member and vet profiles are their own paragraphs): an ALLOW-LIST, not the host's network. The
+#   sandbox has its own network namespace (--unshare-net: loopback and nothing else, no resolver either — the host's
+#   /run/systemd/resolve is not bound, so a DNS query is not a way out). Its one way off the box is cc-egress: a proxy
+#   this launch starts ON THE HOST, as the user, on a unix socket in ~/.cc/sandbox/.egress/<hash of repo/track>/ (bound ro at ~/.cc/egress:
+#   the socket and its log are readable inside, the directory is not writable), which opens a CONNECT tunnel only to the
+#   hosts on the list and refuses the rest with a 403 that names why. `cc-egress inside` forwards 127.0.0.1:3128 to
+#   it and sets HTTPS_PROXY and friends for the command. The list is `cc-config get CC_EGRESS_ALLOW`, or cc-egress's
+#   own DEFAULT when that is unset (its header has the syntax and the default). No firewall, no system service, no
+#   host change: the proxy dies with this launch (--parent). What it does not bound is what goes to an ALLOWED host.
+#   Own pid namespace; same process group and --die-with-parent, so cc-loop's kill of the group and the `timeout`
+#   inside both end everything.
 # BREAKS INSIDE, BY DESIGN: git push and gh (no credential — cc-loop pushes and opens the PR from outside), cc-notify (no
 #   ~/.cc/config — `STATUS: BLOCKED` in the journal is the escalation), cc --go (no tmux). And, since the ref store went
 #   read-only: `git tag` and `git stash`, neither of which a worker is launched to do. Commit, rebase, amend, reset,
@@ -193,7 +215,8 @@
 #   push never run a hook a worker wrote — but `cc done` typed by hand on that worktree still merges with the
 #   worktree's. Review the branch before running it.
 set -uo pipefail
-H="$HOME"; SELF=$(readlink -f "$0")
+H="$HOME"; SELF=$(readlink -f "$0"); BIN=$(dirname "$SELF"); EGRESS="$BIN/cc-egress"
+MEMBER_MARK=/.cc-member-boundary   # at the root, where the host user cannot make a file; the member bwrap binds it
 TREE=""   # `member … --tree <dir>`: one host tree bound into the boundary as the working directory (a landing's gates)
 slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.claude/projects: every / and . becomes -
 # ── THE PERMISSION BASELINE OF A SEALED SESSION ───────────────────────────────────────────────────────────────────
@@ -205,8 +228,8 @@ slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.cla
 # starts it empty. Compound commands are the visible symptom — the harness rates `chmod +x X && python3 -m py_compile
 # X && ./X --check` by its least-approved clause, so the whole line prompts for `./X`.
 # ASK, because it leaves the sealed world and the boundary does not stop it:
-#   the outward network — --unshare-net is all-or-nothing and "none" kills claude, so the net is UNTOUCHED in here
-#   (see NETWORK above) and a client is the ordinary way data gets out. `ask` outranks `allow`, so these prompt even
+#   the outward network — a member's session has the host's network (a worker's has its own namespace and only
+#   cc-egress's list, NETWORK above) and a client is the ordinary way data gets out. `ask` outranks `allow`, so these prompt even
 #   though ~/.claude/settings.json allows `curl` box-wide: inside the boundary the box is STRICTER than outside it.
 #   EXCEPT IN A WORKSPACE THE OWNER MADE FOR HIMSELF (`cc-sandbox own`, the header): there this list is not appended
 #   at all, because the only person who can answer the dialog is the one it interrupts (settings_copy, build_member).
@@ -506,10 +529,14 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
   [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
   [ -f "$(dirname "$cb")/docs/WRITING.md" ] && B+=(--ro-bind "$(dirname "$cb")/docs/WRITING.md" "$H/WRITING.md")   # the guide the worker's prompt tells it to open: one published file, ro
-  [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)   # /etc/resolv.conf points here
+  # NO RESOLVER: /etc/resolv.conf points at /run/systemd/resolve, which is not bound. The network namespace has no route
+  # off the box anyway, and a resolver socket reached from in here would be a DNS channel out of it; names are resolved
+  # by cc-egress, on the host, against its list (NETWORK in the header).
+  B+=(--unshare-net)
   # …and the GitHub orgs the box may not touch: the list and the git include cc-github-deny writes from it, ro, so the
   # gh shim, the credential helper, git's url.insteadOf and cc-guard's rule hold inside exactly as they do here
   for f in .local/share/claude .config/git .claude/plugins .gitconfig .npmrc .cc/github-deny .cc/github-deny.gitconfig; do [ -e "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done; :; }
+egress_dir(){ printf '%s/.cc/sandbox/.egress/%s' "$H" "$(printf '%s/%s' "$1" "$2" | sha256sum | cut -c1-16)"; }   # $1 repo · $2 track → the proxy's socket and log, a fixed length past $H
 launch(){   # $1 repo · $2 track · the rest is the command
   local wt="$H/.cc/worktrees/$1/$2" cred="$H/.claude/.credentials.json" tok="" exp left
   # AHEAD OF build, not after it: build pins the worktree now, and a track that was never created is a plain mistake
@@ -527,7 +554,20 @@ launch(){   # $1 repo · $2 track · the rest is the command
   # a race case that has to hit a microsecond is a case that passes by luck, and one that passes by luck cannot go red.
   # A NUMBER, never a command, and only ever set on the host — build --unsetenv's it, so nothing inside carries it on.
   case "${CC_SANDBOX_TEST_DELAY:-}" in ''|*[!0-9.]*) ;; *) sleep "$CC_SANDBOX_TEST_DELAY";; esac
-  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$@" \
+  # THE WAY OUT (NETWORK in the header): the proxy starts here, as a child of this shell, and --parent $$ ends it when the
+  # bwrap exec'd below (same pid) exits. The directory is under ~/.cc/sandbox, which no bind reaches, and its name is a
+  # fixed-length hash of repo/track (egress_dir): a socket path has 108 bytes, and a long track name used to overflow them.
+  local eg al ep; eg=$(egress_dir "$repo" "$track")
+  mkdir -p "$eg" && chmod 700 "$eg" && rm -f "$eg/sock"
+  al=$("$BIN/cc-config" get CC_EGRESS_ALLOW 2>/dev/null)
+  "$EGRESS" serve --socket "$eg/sock" --log "$eg/log" --parent $$ ${al:+--allow "$al"} </dev/null >/dev/null 2>>"$eg/log" & ep=$!
+  # 15 s, as long as the selfcheck gives a python start at load 100+; a proxy that has already died ends the wait at once
+  local k=0; while [ ! -S "$eg/sock" ] && [ $k -lt 150 ] && kill -0 "$ep" 2>/dev/null; do sleep 0.1; k=$((k + 1)); done
+  [ -S "$eg/sock" ] || { echo "cc-sandbox: the egress proxy for $repo/$track did not start (see $eg/log) — nothing was started, because the worker's only network is through it." >&2; exit 2; }
+  # Inside it is ~/.cc/egress, not its host path: a bind under ~/.cc/sandbox would make that directory exist in here,
+  # and the namespace case holds that it does not.
+  B+=(--ro-bind "$eg" "$H/.cc/egress" --ro-bind "$EGRESS" "$EGRESS")
+  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$EGRESS" inside --socket "$H/.cc/egress/sock" -- "$@" \
     3< <(jq --arg wt "$wt" '{projects: ((.projects // {}) | with_entries(select(.key == $wt))), mcpServers: {}}' "$H/.claude.json" 2>/dev/null || printf '{}') \
     4< <(jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
 launch_vet(){   # cc-sandbox vet -- <cmd...> — THE BOUNDARY THE BOX PROVIDES FOR ITSELF, and the only one that needs
@@ -536,8 +576,8 @@ launch_vet(){   # cc-sandbox vet -- <cmd...> — THE BOUNDARY THE BOX PROVIDES F
   # boundary()). So the world in here is the distribution and NOTHING OF THIS BOX — no home, no ~/.cc, no credential,
   # no repo, no board, no socket, no network, not even the hostname. There is nothing in here to read, which is the
   # point: whatever a hostile file could make `file` do, it does it somewhere with nothing in it.
-  # NO OPT-IN AND NO FALLBACK, unlike `<repo> <track>`, which execs the command untouched when CC_WORKER_SANDBOX is not
-  # 1. The caller's whole rule is "inside a boundary or not at all", so a boundary that will not start must be a read
+  # NO OFF SWITCH AND NO FALLBACK, unlike `<repo> <track>`, which execs the command untouched when CC_WORKER_SANDBOX
+  # is 0. The caller's whole rule is "inside a boundary or not at all", so a boundary that will not start must be a read
   # that did not happen rather than one that happened on the host: with no bwrap this refuses, non-zero and saying so,
   # and vetting reads that as `unreadable`, which holds the mail for a person.
   command -v bwrap >/dev/null 2>&1 || { echo "cc-sandbox: bwrap is not installed, so there is no boundary to read this inside — nothing was run." >&2; exit 2; }
@@ -769,7 +809,8 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   board_dir "$h"
   B=(--die-with-parent --unshare-pid --clearenv
      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
-     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H")
+     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H"
+     --ro-bind /dev/null "$MEMBER_MARK")   # in_member: the worker fence reads this, not the env var, to stand aside
   # THE WORKSPACE IS THE MEMBER'S; ITS GIT DIRECTORY IS NOT. The HOST runs git in this very repo — `cc <h> <track>`
   # fetches and adds a worktree here — so a hook the member drops in, a core.hooksPath they point at their own tree, or
   # an `ext::sh -c …` remote would execute as the OWNER outside the boundary, where ~/.ssh, ~/.cc/config and the
@@ -1942,7 +1983,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
     "$(g silent)/$(g crosses)/$(g ro)/$(g his)" 'true,true,true,true/true,true,true,true/ro/Bash(hisown *)|Bash(tmux kill-server:*)|Bash(sudo tee *)|ownr-theme|$HOME/bin/cc-guard'
   # …and with the sandbox OFF there is no boundary, so there is no baseline either: the command runs untouched and
   # reads whatever settings.json the host session already had.
-  out=$(env HOME="$fh" CC_WORKER_SANDBOX='' "$SELF" "$w" t -- sh -c 'echo off=$(jq -r "(.permissions.allow|index(\"Bash(*)\"))==null" $HOME/.claude/settings.json)' 2>&1)
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=0 "$SELF" "$w" t -- sh -c 'echo off=$(jq -r "(.permissions.allow|index(\"Bash(*)\"))==null" $HOME/.claude/settings.json)' 2>&1)
   t 'baseline: with the sandbox off nothing is applied — no boundary, no baseline' "$(g off)" true
   git -C "$fh/dev/$w" worktree remove --force "$fh/.cc/worktrees/$w/t" >/dev/null 2>&1
   # ── HIS FILE DOES NOT PARSE. Dropping to the baseline alone would silently drop the box's hook gates with it, so
@@ -2228,17 +2269,17 @@ selfcheck_toolchains(){   # ~/.cc/toolchains (toolchains_bind), in a HOME of its
   git -C "$fh/dev/r" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
 selfcheck_vet(){   # THE BOX'S OWN BOUNDARY, driven for real: what is inside it, what cannot be reached from it, and that
   # there is no way of being outside it. The last one is the case with a history — every other profile here has an
-  # opt-in (`<repo> <track>` execs the command untouched unless CC_WORKER_SANDBOX=1), and the mail door's rule is that
-  # a stranger's file is opened inside a boundary or not at all, so this one is run with that variable EMPTY.
+  # off switch (`<repo> <track>` execs the command untouched when CC_WORKER_SANDBOX=0), and the mail door's rule is that
+  # a stranger's file is opened inside a boundary or not at all, so this one is run with that switch OFF.
   local out
-  out=$(printf '%%PDF-1.4\ntrailer\n' | CC_WORKER_SANDBOX='' TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak \
+  out=$(printf '%%PDF-1.4\ntrailer\n' | CC_WORKER_SANDBOX=0 TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak \
         "$SELF" vet -- sh -c '
     e(){ [ -e "$1" ] && echo present || echo absent; }
     echo home=$(e '"$H"'); echo cc=$(e '"$H"'/.cc); echo dev=$(e '"$H"'/dev); echo etc=$(e /etc/hostname)
     echo tok=${CLAUDE_CODE_OAUTH_TOKEN:-unset}; echo tmux=${TMUX:-unset}
     echo nics=$(sed -n "s/^ *\([^:]*\):.*/\1/p" /proc/net/dev | grep -vc "^lo$")
     f=$(mktemp) && head -c 4096 > "$f" && echo kind=$(file -b --mime-type "$f")' 2>&1)
-  t 'the vet profile is bwrap with CC_WORKER_SANDBOX empty: it has no opt-in, because its caller has no host path' \
+  t 'the vet profile is bwrap with CC_WORKER_SANDBOX=0: it has no off switch, because its caller has no host path' \
     "$(g home)/$(g dev)" absent/absent
   t 'and nothing of this box is inside it: no ~/.cc, no hostname, no token, no tmux socket' \
     "$(g cc)/$(g etc)/$(g tok)/$(g tmux)" 'absent/absent/unset/unset'
@@ -2248,6 +2289,108 @@ selfcheck_vet(){   # THE BOX'S OWN BOUNDARY, driven for real: what is inside it,
   # finds this box's home. If that ever reads `absent` the cases above are testing nothing.
   out=$(sh -c 'e(){ [ -e "$1" ] && echo present || echo absent; }; echo home=$(e '"$H"')' 2>&1)
   t 'control: the same test outside a boundary DOES find this box' "$(g home)" present; }
+selfcheck_fence(){   # PHASE 0, THE FENCE ATTACKED FROM INSIDE, in a HOME of its own: every harness's login planted on the host
+  # side, the switch UNSET (default-on), the network through the list and nowhere else, no sandbox inside the sandbox.
+  # Each attack is paired with its control — the same read on the host, or the same launch with the switch at 0 — so a
+  # case cannot pass by the command having quietly not run.
+  local fh w wt out rc up upp nobin f
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxfence-XXXXXX") || return 1; chmod 700 "$fh"; w="_ccsbxf$$"; wt="$fh/.cc/worktrees/$w/t"
+  mkdir -p "$fh/bin" "$fh/.local/bin" "$fh/.npm" "$fh/.cache" "$fh/.cc/boards" "$fh/.claude" "$fh/dev/$w" "$fh/.cc/state/$w/t" \
+    "$fh/.cc/worktrees/$w" "$fh/.codex" "$fh/.cursor" "$fh/.config/cursor" || return 1
+  git -C "$fh/dev/$w" init -q -b main >/dev/null 2>&1 \
+    && git -C "$fh/dev/$w" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init >/dev/null 2>&1 \
+    && git -C "$fh/dev/$w" worktree add -q -b track/t "$wt" >/dev/null 2>&1 || return 1
+  jq -n '{claudeAiOauth: {accessToken: "fx-access", refreshToken: "fx-refresh", expiresAt: 99999999999999}}' > "$fh/.claude/.credentials.json"
+  printf '{}' > "$fh/.claude.json"
+  # Every harness's login, where each keeps it: Codex's auth.json and config.toml, Cursor's two.
+  for f in .codex/auth.json .codex/config.toml .cursor/cli-config.json .config/cursor/auth.json; do printf 'fx-login-secret %s\n' "$f" > "$fh/$f"; done
+  # An upstream ON THE HOST that the list may or may not name: it answers one line, so "reached" is a fact, not a guess.
+  up=$(mktemp "$fh/up.XXXXXX"); python3 -IS -c 'import socket,sys
+s=socket.socket();s.bind(("127.0.0.1",0));s.listen(8);print(s.getsockname()[1],flush=True)
+while True:
+  c,_=s.accept();c.sendall(b"reached\n");c.close()' > "$up" & upp=$!
+  for f in $(seq 150); do [ -s "$up" ] && break; sleep 0.1; done; up=$(head -1 "$up")   # 15 s: a python start at load 100+
+  local probe='e(){ [ -e "$1" ] && echo present || echo absent; }
+    echo logins=$(e ~/.codex/auth.json)/$(e ~/.codex/config.toml)/$(e ~/.cursor/cli-config.json)/$(e ~/.config/cursor/auth.json)
+    echo leak=$(grep -rl fx-login-secret $HOME /tmp 2>/dev/null | wc -l)
+    echo nics=$(tail -n +3 /proc/net/dev | wc -l)
+    python3 -IS -c "import os,socket
+def via(t):
+  try:
+    h,p=os.environ[\"HTTPS_PROXY\"][7:].split(\":\");c=socket.create_connection((h,int(p)),timeout=5)
+    c.sendall((\"CONNECT %s HTTP/1.1\r\n\r\n\"%t).encode());b=b\"\"
+    while b\"\n\" not in b.partition(b\"\r\n\r\n\")[2]:
+      d=c.recv(4096)
+      if not d: break
+      b+=d
+    h,_,rest=b.partition(b\"\r\n\r\n\");r=h.split(b\" \")[1].decode()
+    return r+(\"+\"+rest.decode().strip() if r==\"200\" else \"\")
+  except Exception as e: return \"err\"
+def direct(h,p):
+  try: socket.create_connection((h,p),timeout=3); return \"open\"
+  except OSError: return \"refused\"
+def dns():
+  try: socket.getaddrinfo(\"github.com\",443); return \"resolved\"
+  except OSError: return \"none\"
+print(\"listed=\"+via(\"127.0.0.1:'"$up"'\"))
+print(\"unlisted=\"+via(\"example.com:443\"))
+print(\"direct_out=\"+direct(\"1.1.1.1\",443))
+print(\"direct_host=\"+direct(\"127.0.0.1\",'"$up"'))
+print(\"dns=\"+dns())"
+    echo nested_bwrap=$(bwrap --ro-bind / / /usr/bin/true >/dev/null 2>&1 && echo ran || echo refused)
+    echo nested_unshare=$(unshare -Urn /usr/bin/true >/dev/null 2>&1 && echo ran || echo refused)'
+  out=$(env -u CC_WORKER_SANDBOX -u CC_MEMBER_SANDBOX HOME="$fh" CC_EGRESS_ALLOW="127.0.0.1:$up" "$SELF" "$w" t -- sh -c "$probe" 2>&1)
+  t 'fence: with the switch unset a worker IS fenced — its own network namespace, loopback alone' "$(g nics)" 1
+  t 'fence: no harness login is in a worker'"'"'s world — Codex'"'"'s auth.json and config.toml, Cursor'"'"'s two' "$(g logins)" absent/absent/absent/absent
+  t 'fence: …and no byte of any of them, under any name' "$(g leak)" 0
+  t 'fence: a host the list names is reached, through the proxy' "$(g listed)" 200+reached
+  t 'fence: a host the list does not name is refused by the proxy' "$(g unlisted)" 403
+  t 'fence: a direct connection out of the box has no route' "$(g direct_out)" refused
+  t 'fence: nor does one to the host'"'"'s own loopback — the upstream the list admits is not reachable around the proxy' "$(g direct_host)" refused
+  t 'fence: there is no resolver inside — a DNS query is not a way out' "$(g dns)" none
+  t 'fence: a sandbox inside the sandbox is refused — bwrap and unshare both' "$(g nested_bwrap)/$(g nested_unshare)" refused/refused
+  [ -n "$(g nics)" ] || sed -n '1,6s/^/      /p' <<<"$out"   # a launch that never started says why here
+  t 'fence: the proxy logged the refusal where the worker can read it' "$(grep -c '^refused example.com:443' "$(H=$fh egress_dir "$w" t)/log" 2>/dev/null)" 1
+  # A TRACK NAME OF 80 CHARACTERS: the socket's path is not built from it, so the 108-byte sun_path holds and the worker
+  # reaches the listed host. When the path was ~/.cc/sandbox/<repo>/<track>/egress/sock, this launch did not start.
+  local lt; lt=$(printf 'long%.0s' $(seq 20)); git -C "$fh/dev/$w" worktree add -q -b "track/$lt" "$fh/.cc/worktrees/$w/$lt" >/dev/null 2>&1
+  out=$(env -u CC_WORKER_SANDBOX -u CC_MEMBER_SANDBOX HOME="$fh" CC_EGRESS_ALLOW="127.0.0.1:$up" "$SELF" "$w" "$lt" -- sh -c "$probe" 2>&1)
+  t 'fence: a worker on an 80-character track name still gets its proxy, and reaches the listed host' "${#lt}/$(g listed)" 80/200+reached
+  git -C "$fh/dev/$w" worktree remove --force "$fh/.cc/worktrees/$w/$lt" >/dev/null 2>&1
+  # CONTROLS: the same files are there on the host, the upstream answers on the host, and the switch at 0 is the host's world
+  t 'fence control: the logins ARE on the host, so absent inside is the fence and not the fixture' \
+    "$(for f in .codex/auth.json .codex/config.toml .cursor/cli-config.json .config/cursor/auth.json; do [ -e "$fh/$f" ] && printf p; done)" pppp
+  t 'fence control: the upstream answers a direct connection on the host' "$(python3 -IS -c 'import socket,sys;print(socket.create_connection(("127.0.0.1",int(sys.argv[1])),timeout=3).recv(64).decode().strip())' "$up" 2>&1)" reached
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=0 "$SELF" "$w" t -- sh -c 'echo nics=$(tail -n +3 /proc/net/dev | wc -l); echo logins=$([ -e ~/.codex/auth.json ] && echo present)' 2>&1)
+  t 'fence control: CC_WORKER_SANDBOX=0 is the host — its interfaces, and the login on disk' "$([ "$(g nics)" -gt 1 ] && echo host)/$(g logins)" host/present
+  nobin="$fh/nobin"; mkdir -p "$nobin"; for f in dirname readlink; do ln -s "$(command -v "$f")" "$nobin/$f"; done
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=0 PATH="$nobin" /usr/bin/bash "$SELF" probe 2>&1); rc=$?
+  t 'fence control: the probe passes under the owner'"'"'s switch at 0, even with no bwrap' "$rc/$out" 0/
+  # ATTACK: CC_MEMBER_SANDBOX=1 planted in a host shell (tmux setenv -g does it for every window) does not lift the fence
+  out=$(env -u CC_WORKER_SANDBOX HOME="$fh" CC_MEMBER_SANDBOX=1 "$SELF" "$w" t -- sh -c 'echo nics=$(tail -n +3 /proc/net/dev | wc -l)' 2>&1)
+  t 'fence attack: CC_MEMBER_SANDBOX=1 planted on the host still gets the fence — loopback alone' "$(g nics)" 1
+  out=$(env -u CC_WORKER_SANDBOX HOME="$fh" CC_MEMBER_SANDBOX=1 PATH="$nobin" /usr/bin/bash "$SELF" probe 2>&1); rc=$?
+  t 'fence attack: …and with no bwrap the planted claim does not make the probe pass' "$rc/$(grep -c 'bwrap is not installed' <<<"$out")" 2/1
+  # CONTROL: inside a real member-shaped boundary (the marker at / and a user namespace of its own) it is one wall, not two
+  out=$(env -u CC_WORKER_SANDBOX HOME="$fh" bwrap --die-with-parent --unshare-user --unshare-pid --ro-bind /usr /usr --symlink usr/bin /bin \
+    --symlink usr/lib /lib --symlink usr/lib64 /lib64 --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --bind "$fh" "$fh" \
+    --ro-bind "$BIN" "$BIN" --ro-bind /dev/null /.cc-member-boundary --setenv CC_MEMBER_SANDBOX 1 \
+    -- "$SELF" "$w" t -- sh -c 'echo nics=$(tail -n +3 /proc/net/dev | wc -l)' 2>&1)
+  t 'fence control: behind a real member boundary no second bwrap is attempted' "$([ "$(g nics)" -gt 1 ] && echo passthrough)" passthrough
+  # NO FENCE, NO LAUNCH: with no bwrap on PATH the probe refuses and says why, and the launch runs nothing.
+  out=$(env -u CC_WORKER_SANDBOX -u CC_MEMBER_SANDBOX HOME="$fh" PATH="$nobin" /usr/bin/bash "$SELF" probe 2>&1); rc=$?
+  t 'fence: no bwrap → probe exits 2 and names it' "$rc/$(grep -c 'bwrap is not installed' <<<"$out")" 2/1
+  out=$(env -u CC_WORKER_SANDBOX -u CC_MEMBER_SANDBOX HOME="$fh" PATH="$nobin" /usr/bin/bash "$SELF" "$w" t -- /usr/bin/sh -c 'echo RAN' 2>&1); rc=$?
+  t 'fence: …and a launch without one does not start — nothing ran, and the line says why' "$rc/$(grep -c RAN <<<"$out")/$(grep -c 'does not start: bwrap is not installed' <<<"$out")" 2/0/1
+  out=$(env -u CC_WORKER_SANDBOX -u CC_MEMBER_SANDBOX HOME="$fh" "$SELF" probe 2>&1); rc=$?
+  t 'fence: …and with bwrap the probe passes, so the refusal above is the missing bwrap' "$rc/$out" 0/
+  # NO PROXY, NO LAUNCH: a cc-egress that never opens its socket stops the launch before bwrap, and nothing runs
+  local deadeg="$fh/deadeg"; mkdir -p "$deadeg"; cp "$SELF" "$BIN/cc-config" "$deadeg/"
+  printf '#!/bin/sh\necho proxy-failed-on-purpose >&2\nexit 1\n' > "$deadeg/cc-egress"; chmod +x "$deadeg/cc-egress"
+  out=$(env -u CC_WORKER_SANDBOX -u CC_MEMBER_SANDBOX HOME="$fh" "$deadeg/cc-sandbox" "$w" t -- sh -c 'echo RAN' 2>&1); rc=$?
+  t 'fence: an egress proxy that does not start → the launch runs nothing and says why' "$rc/$(grep -c RAN <<<"$out")/$(grep -c 'did not start' <<<"$out")" 2/0/1
+  kill "$upp" 2>/dev/null; wait "$upp" 2>/dev/null
+  git -C "$fh/dev/$w" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
   local sw lp of sname pw
   local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out out2 want rc c m0 t0 u0 hd held rsd rsd2 sec
@@ -2346,11 +2489,11 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   t 'credentials: a stripped copy, mode 600' "$(g cred)" "${want}600";  t 'config/gh absent' "$(g gh)" absent;  t 'ccbox absent' "$(g ccbox)" absent;  t '.git/hooks is ro' "$(g hooks)" ro
   t 'cc/config absent' "$(g ccconfig)" absent;  t 'ssh absent' "$(g ssh)" absent;  t 'the container socket absent' "$(g sock)" absentabsent
   t 'TMUX unset' "$(g tmux)" unset;  t 'not in the docker group' "$(g dockergrp)" 0;  t 'own pid namespace' "$(g pid1)" few
-  # A CONTROL, so those two can fail: `<repo> <track>` execs the command untouched unless CC_WORKER_SANDBOX=1, and a
-  # probe that lost the opt-in would run on the host. The same lines with it removed must read the host; if they ever
-  # read unset/few, `TMUX unset` and `own pid namespace` pass with no boundary and are testing nothing.
-  out2=$(env -u CC_WORKER_SANDBOX TMUX=/tmp/tmux-0/x "$SELF" "$r" t -- sh -c "$held" 2>&1)
-  t 'control: the same lines with the opt-in removed read the host — TMUX set, the host pid namespace' \
+  # A CONTROL, so those two can fail: `<repo> <track>` execs the command untouched when CC_WORKER_SANDBOX=0. The same
+  # lines with the switch at 0 must read the host; if they ever read unset/few, `TMUX unset` and `own pid namespace`
+  # pass with no boundary and are testing nothing.
+  out2=$(CC_WORKER_SANDBOX=0 TMUX=/tmp/tmux-0/x "$SELF" "$r" t -- sh -c "$held" 2>&1)
+  t 'control: the same lines with the switch at 0 read the host — TMUX set, the host pid namespace' \
     "$(sed -n 's/^tmux=//p' <<<"$out2")/$(sed -n 's/^pid1=//p' <<<"$out2")" /tmp/tmux-0/x/many
   t 'cwd is the worktree' "$(g cwd)" "$wt";  t 'git status works' "$(g status)" ok;  t 'the parent .git resolves' "$(g common)" "$dev/.git"
   t 'a commit works' "$(g commit)" ok;  t '.git/config is ro' "$(g gitconfig)" ro;  t 'bin is ro' "$(g bin)" ro
@@ -2589,25 +2732,55 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
       "$(g RAN)/$(grep -c decoy-swapped <<<"$out")/$sw" yes/0/swapped
     [ -n "$(g RAN)" ] || sed -n '1,4s/^/      /p' <<<"$out"   # a launch that never started says why here
   done
-  # OFF: nothing changes — argv byte for byte, the environment untouched
-  out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
+  # OFF (CC_WORKER_SANDBOX=0, the owner's switch): nothing changes — argv byte for byte, the environment untouched. Unset
+  # is ON now, and selfcheck_fence drives that side.
+  out=$(CC_WORKER_SANDBOX=0 TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
   t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
-  out=$(CC_WORKER_SANDBOX=0 "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off' "$out" unset
+  out=$(CC_WORKER_SANDBOX=0 CLAUDE_CODE_OAUTH_TOKEN=kept "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off — the host environment reaches the command untouched' "$out" kept
   # --help prints the header and exits 0 — it used to reach the positional parse and die with `line 2079: 2: track`
   out=$("$SELF" --help 2>&1); rc=$?; t '--help exits 0 and prints the usage header' "$rc/$(head -1 <<<"$out" | cut -c1-10)/$(grep -c 'track$' <<<"$out")" '0/cc-sandbox/0'
   out=$("$SELF" -h 2>&1 | grep -c 'cc-sandbox member <handle>'); t '-h is the same header' "$([ "${out:-0}" -ge 1 ] && echo yes)" yes
-  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_vet
+  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
   "$BIN/cc-member-v2" selfcheck; t 'v2 cases' "$?" 0
   for c in "$wt" "$H/.cc/worktrees/$r/u" "$H/.cc/worktrees/$r/v"; do git -C "$dev" worktree remove --force "$c" >/dev/null 2>&1; done
   rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.cc/sandbox/$r" "$H/.claude/projects/$(slug "$wt")" \
          "$H/.claude/projects/$(slug "$H/.cc/worktrees/$r/v")" "$H/.claude/projects/$(slug "$dev")" \
-         "$H/.cc/members/$mb" "$H/.cc/boards/$mb.json" "$H/.cc/boards/$mb.lock"
+         "$H/.cc/members/$mb" "$H/.cc/boards/$mb.json" "$H/.cc/boards/$mb.lock" \
+         "$(egress_dir "$r" t)" "$(egress_dir "$r" u)" "$(egress_dir "$r" v)"   # the proxy's socket and log for each track launched above
+  t 'the selfcheck leaves no proxy directory behind for its throwaway tracks' \
+    "$(for c in t u v; do [ -e "$(egress_dir "$r" "$c")" ] && echo "$c"; done | tr -d '\n')" ""
   printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
+# ALREADY BEHIND A MEMBER BOUNDARY — decided from what that boundary makes and the host cannot fake, not from
+# CC_MEMBER_SANDBOX=1, which `tmux setenv -g` or any host shell can plant to launch every worker unfenced (review of
+# #751). Both must hold: the marker at the root (the host user cannot create a file in /), and a user namespace that
+# is not the host's (its uid_map is not the identity map over every uid).
+# KNOWN GAP, NAMED (review of #751): a worker launched behind a member boundary keeps that boundary's network, which is
+# the host's, not cc-egress's list. It cannot be routed through cc-egress from in here without a second sandbox: the
+# proxy only bounds a process that has no other route out, and that takes a network namespace of its own, which is the
+# nested bwrap this declines. What the member boundary (build_member) already restricts for that worker: a tmpfs home
+# holding only that member's workspace, its tracks and their state, so no box secret, no other member, no ~/.cc config
+# and no docker or tmux socket; its own pid namespace and a cleared environment; cc-guard at CC_ROLE=member; and the
+# network clients on `ask` in its settings (the ASK paragraph in the header), which, as its CEILING there says, a
+# reworded command gets past. So what such a worker can reach off the box is bounded by what it can read, not by a list.
+# Only that legacy profile carries workers: cc-member-v2 has no tmux and no ~/.cc/worktrees, so no worker runs in it,
+# and it binds no marker.
+in_member(){ [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && [ -e "$MEMBER_MARK" ] || return 1
+  local a b c; read -r a b c < /proc/self/uid_map 2>/dev/null || return 1
+  [ "$a $b $c" != "0 0 4294967295" ]; }
+fence_off(){ [ "${CC_WORKER_SANDBOX:-}" = 0 ] || in_member; }   # the owner's switch, or already behind a member boundary
+fence_why(){   # → exit 0, or exit 1 and why a worker launch here would get no fence. A bwrap that is installed but will
+  # not make a network and pid namespace (a kernel that restricts user namespaces, a nested bwrap) is the same refusal.
+  command -v bwrap >/dev/null 2>&1 || { echo "bwrap is not installed"; return 1; }
+  [ -x "$EGRESS" ] || { echo "$EGRESS, the worker's only network, is missing"; return 1; }
+  local e; e=$(bwrap --die-with-parent --unshare-net --unshare-pid --ro-bind /usr /usr --symlink usr/bin /bin \
+    --symlink usr/lib /lib --symlink usr/lib64 /lib64 --proc /proc --dev /dev -- /usr/bin/true 2>&1) \
+    || { echo "bwrap will not make a network and pid namespace here: ${e:-no reason given}"; return 1; }; }
 case "${1:-}" in selfcheck) selfcheck; exit $?;;
   -h|--help|help) sed -n '2,/^set -/p' "$SELF" | sed '$d; s/^# \{0,1\}//'; exit 0;;   # the header above IS the usage; before this line `--help` fell through to the positional parse and died on `2: track` (a member workspace, 2026-09-18)
   __settings-copy) settings_copy; exit $?;;   # private host-side reuse of the exact legacy merge — the MEMBER shape: the v2 profile (cc-member-v2) has no owner marker yet
+  probe) fence_off && exit 0; why=$(fence_why) || { echo "$why" >&2; exit 2; }; exit 0;;   # cc-loop, before iteration 1
   reconcile) [ $# -eq 3 ] || { echo "usage: cc-sandbox reconcile <repo> <track>" >&2; exit 2; }
              rs_fold "$2" "$3"; exit $?;;   # cc-loop, after every iteration — a no-op when the sandbox was off or the branch did not move
   mint) shift; mint "$@"; exit $?;;
@@ -2630,6 +2803,9 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [<token file>]   |   cc-sandbox selfcheck" >&2; exit 2; }
-[ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [<token file>]   |   cc-sandbox selfcheck" >&2; exit 2; }
+# ON BY DEFAULT (owner's design, phase 0; planning decided 2026-09-27: "yes, default-on"). "The fence goes on by default
+# for every worker, on every harness" — so the test is for the two ways OFF, never for a way on.
+fence_off && exec "$@"   # off means the command runs exactly as given, nothing added
+why=$(fence_why) || { echo "cc-sandbox: $repo/$track gets no fence, so it does not start: $why" >&2; exit 2; }
 launch "$repo" "$track" "$@"

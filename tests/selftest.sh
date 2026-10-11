@@ -374,6 +374,7 @@ prefetch(){
 # — a global `pkill` here once failed 4 tests in a run that was, on its own, green.
 RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"; : > "$T/born"   # born: what "modified during this run" means below
 export CC_SELF_LAND_EXCEPT=$REPO         # every project lands itself by default, and the box's own config never decides a fixture: a case that means the grant sets this itself
+export CC_WORKER_SANDBOX=0   # the fence is on for every worker now, and a fixture loop's stub claude lives under $T, which the fence does not bind ("timeout: failed to execute process", #751); cc-sandbox's selfcheck tests the fence itself
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
 export CC_ROOM_DIR="$T/room" CC_WORKER_CAP=1000 CC_WORKER_PACE_MARGIN=100   # cc-room: a fixture --go never queues behind the box's real loops or its five-hour pace, and never takes one of its slots
 # …nor behind the box's LOAD: cc-room also asks the lander's overloaded(), and at a load of twice the cores (common
@@ -777,6 +778,8 @@ if stanza "cc-context (the real number, and what refuses to run without it)"; th
 chk cc-context
 chk cc-statusline   # the harness's own per-turn file cc-context prefers over its transcript estimate
 chk cc-sandbox   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
+chk cc-egress   # the worker's only way out: listed hosts tunnel, the rest 403, and the in-sandbox forwarder
+chk cc-harness-codex   # Codex's tools through cc-guard: the patch parser, the session-log reads, guard check
 "$B/cc-context" $REPO w1 2>&1 | grep -q '^10%  20k/200k' && ok "a track's number is read off the session the board names" || bad "cc-context $REPO w1: $("$B/cc-context" $REPO w1 2>&1) (fixture sid $sid, board sid $("$B/cc-board" get $REPO w1 session_id))"
 "$B/cc-context" $REPO w1 --over 90 >/dev/null 2>&1; rc=$?; [ $rc = 1 ] && ok "--over N at 10% says under, exit 1" || bad "--over 90 at 10%: rc=$rc"
 "$B/cc-context" $REPO w1 --over >/dev/null 2>&1; rc=$?; [ $rc = 1 ] && ok "a bare --over reads the hand-off line: 20k is under it" || bad "bare --over: rc=$rc"
@@ -2607,17 +2610,18 @@ exec "$D/bin/cc-land" "$@"
 SH
 printf '#!/bin/sh\necho "$*" >> "$D/starts"\nexit 0\n' > "$D/bin/systemd-run"
 printf '#!/bin/sh\necho "$*" >> "$D/notices"\n' > "$D/bin/cc-notify"
-printf '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n' > "$D/bin/cc-sandbox"
+printf '#!/bin/sh\n[ "$1" = probe ] && exit 0\nwhile [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n' > "$D/bin/cc-sandbox"
 for tool in cc-pause tmux; do printf '#!/bin/sh\nexit 1\n' > "$D/bin/$tool"; done
 for tool in cc-model cc-limit cc-scope cc-trust cc-gh-token; do printf '#!/bin/sh\nexit 1\n' > "$D/bin/$tool"; done
 chmod +x "$D/bin/"*
 # THAT cc-sandbox STANDS IN FOR A BOUNDARY, SO IT HAS TO BE ABLE TO FAIL. Everything up to `--` is the profile —
 # `<repo> <track> --`, `member <h> --` and `vet --` — and the command after it runs whole. The fixed `shift 3` it
 # replaced ate a `vet` profile's first command word (core/mail/selfcheck.py); that stub, and no stub, read red here.
-sbx_runs(){ for p in 'r row' 'member h' vet; do [ "$("$1" $p -- printf '%s|' timeout 'a b' 2>/dev/null)" = 'timeout|a b|' ] || return 1; done; }
+# `probe` has no `--`: cc-loop asks it before iteration 1, and the fence is off in a fixture (lib.sh), so it passes.
+sbx_runs(){ "$1" probe >/dev/null 2>&1 || return 1; for p in 'r row' 'member h' vet; do [ "$("$1" $p -- printf '%s|' timeout 'a b' 2>/dev/null)" = 'timeout|a b|' ] || return 1; done; }
 printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$D/shift3-sandbox"; chmod +x "$D/shift3-sandbox"
 { sbx_runs "$D/bin/cc-sandbox" && ! sbx_runs "$D/shift3-sandbox" && ! sbx_runs "$D/no-such-sandbox"; } \
-  && ok "P9s: the fixture's cc-sandbox runs the command whole after every profile; a shift-3 stub and a missing one read red" \
+  && ok "P9s: the fixture's cc-sandbox passes probe and runs the command whole after every profile; a shift-3 stub and a missing one read red" \
   || bad "P9s: the fixture's cc-sandbox mis-reads a profile, or the control stubs pass"
 export CC_LAND="$D/bin/host-queue"
 git init -q -b main "$HOME/dev/r"; git init -q --bare "$D/remote.git"

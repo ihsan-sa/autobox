@@ -1,0 +1,861 @@
+#!/usr/bin/python3 -IS
+# cc-harness-codex — the Codex adapter's guard part: puts cc-guard in front of every tool call a Codex worker makes.
+#   cc-harness-codex guard install <codex-home>   register the hook in <codex-home>/config.toml and trust it
+#   cc-harness-codex guard check [--cwd DIR] [<codex-home>]   run one or two cases per never-rule through the shim,
+#                                                 and check that <codex-home> (default $CODEX_HOME, else ~/.codex)
+#                                                 runs it, trusted. Bash reaches cc-guard unchanged, so cc-guard's own
+#                                                 selfcheck covers the rest of its rules
+#   cc-harness-codex guard hook                   the shim itself: Codex runs it as the PreToolUse hook
+#   cc-harness-codex selfcheck                    guard check on a scratch codex-home, plus the parser's cases
+# THE CONTRACT, as Codex 0.153.4 keeps it (learn.chatgpt.com/docs/hooks, and every point below also measured live
+# against the real binary driven by a local mock of the model API, no login, no network):
+#   registration: [[hooks.PreToolUse]] matcher + [[hooks.PreToolUse.hooks]] type="command" command=… timeout=…, in
+#   config.toml (or hooks.json). A user hook runs only once TRUSTED: [hooks.state."<key>"] trusted_hash = the
+#   "currentHash" app-server's hooks/list reports for it. install writes that pin itself, from hooks/list, which is
+#   what /hooks does when a person trusts it; the hook changes and the pin stops matching, and check says so. So
+#   --dangerously-bypass-hook-trust is never needed. An untrusted hook is SKIPPED, not refused: check is what stops
+#   a launch whose hook would not run.
+#   payload on stdin: session_id turn_id transcript_path cwd hook_event_name model permission_mode tool_name
+#   tool_input tool_use_id. exec_command arrives as tool_name "Bash", tool_input {"command": cmd} ONLY — its workdir,
+#   tty and shell are dropped. apply_patch arrives as "apply_patch" {"command": <patch text>}. spawn_agent as
+#   "spawn_agent"; a namespaced tool as namespace+name glued ("multi_agent_v1send_input"); others by their own name.
+#   write_stdin never reaches the hook; an unknown tool is refused by Codex before any hook runs.
+#   block: exit 2 with the reason on stderr (or JSON permissionDecision "deny"). Exit 1, any other code, a timeout
+#   and garbage on stdout all let the call RUN — so this file turns every failure of its own into exit 2, and says
+#   nothing on stdout.
+# WHAT THE SHIM SENDS cc-guard (next to this file, CC_ROLE=worker): {"tool_name","tool_input","cwd"} as Claude Code
+# would. Bash stays Bash; a patch is one Write per file it touches (Add, Update, Delete, and both ends of a Move),
+# resolved against cwd with every symlink followed (realpath), refused if ANY is, and refused outright when a path
+# has a `..` component: hop/../x, with hop a link out of the worktree, is not where it reads. A patch is split into lines
+# as Codex splits it, at \n only with one trailing \r dropped; one holding any other break Python's splitlines() knows
+# (\r mid-line, \v, \f, \x1c-\x1e, \x85, U+2028/9) is refused, and so is a header line holding a control character,
+# because `x\f/../../y` read at those breaks names a file in the worktree while Codex writes outside it (review of #751);
+# a patch inside a shell command (`apply_patch <<EOF`, which Codex also
+# applies) is checked the same way on top of the command, and refused if it names any relative path; a spawned agent or a message to one is "Agent";
+# view_image is a Read of its path; mcp__* and a short list of tools that touch no file pass under their own name.
+# Any other name, write_stdin, a payload that is not the shape above, and cc-guard failing in any way: refused.
+# THE HIDDEN ARGUMENTS ARE READ FROM THE SESSION LOG. At hook time Codex has already written the call to the
+# rollout at transcript_path (measured), so the shim finds the function_call with this tool_use_id there and reads
+# what the payload leaves out: tty=true is refused (a terminal the model types into after the hook never runs
+# again — no config key turns write_stdin off: features.unified_exec=false, experimental_use_unified_exec_tool=false
+# and a model catalog with shell_type=shell_command were each measured and change nothing; features.shell_tool=false
+# removes the shell entirely), workdir becomes a `cd` in front of the command, a shell that is not a POSIX shell is
+# refused, and a call the log does not hold, or holds with a different command, is refused.
+# Fixtures: core/tests/fixtures/codex-hooks/captured-*.json were all captured live from 0.153.4; none is reconstructed.
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from concurrent.futures import ThreadPoolExecutor
+
+SELF = os.path.realpath(__file__)
+GUARD = os.path.join(os.path.dirname(SELF), "cc-guard")
+HOOK_CMD = shlex.quote(SELF) + " guard hook"
+HOOK_TIMEOUT = 120       # seconds Codex gives the hook; past it the call RUNS, so the shim stops itself well before
+BUDGET = 90              # the shim's own deadline for all of its cc-guard calls (one takes ~2 s on a loaded box)
+ROLLOUT_TAIL = 16 << 20  # bytes of the session log read back from its end
+MARK_BEGIN = "# >>> cc-harness-codex guard (managed block: `cc-harness-codex guard install` rewrites it) >>>"
+MARK_END = "# <<< cc-harness-codex guard <<<"
+USAGE = "usage: cc-harness-codex guard install <codex-home> | guard check [--cwd DIR] [<codex-home>] | guard hook | selfcheck"
+
+SHELL_TOOLS = {"Bash", "exec_command", "shell", "shell_command", "local_shell", "container.exec"}
+POSIX_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+AGENT_TOOLS = {"spawn_agent", "Agent", "Task", "send_input", "send_message", "followup_task", "resume_agent"}
+READ_TOOLS = {"view_image"}
+INERT_TOOLS = {"update_plan", "request_user_input", "get_goal", "create_goal", "update_goal", "tool_search",
+               "web_search", "sleep", "wait", "wait_agent", "close_agent", "list_agents", "interrupt_agent"}
+NAMESPACES = ("multi_agent_v1", "multi_agent_v2", "multi_agent")
+PATCH_LINE = re.compile(r"^\s*\*\*\*\s*(add file|update file|delete file|move to)\s*:\s*(.*?)\s*$", re.I)
+# Codex 0.153.4 splits a patch at \n only (Rust's str::lines, which also drops one \r before it); these are the other
+# breaks str.splitlines() makes, so a patch holding one would be read here as lines Codex never sees.
+LINE_BREAKS = re.compile("[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# a control character in a patch header: C0 but tab, DEL, C1, and the two Unicode separators
+HEADER_CONTROL = re.compile("[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+class Refused(Exception):
+    pass
+
+
+def bare_name(name):
+    for ns in NAMESPACES:
+        if name.startswith(ns) and name != ns:
+            rest = name[len(ns):].lstrip("._/:")
+            if rest:
+                return rest
+    return name
+
+
+def absolute(path, base):
+    """path against base, symlinks resolved one component at a time, so a `..` after a link climbs from where the link
+    points, as the kernel does, never from where it sits (os.path.normpath got that wrong: review of #751)."""
+    return os.path.realpath(os.path.join(base, path))
+
+
+def patch_path(path, base):
+    """A file a patch writes: refused when any component is `..`, and resolved like absolute() otherwise."""
+    if ".." in path.split("/"):
+        raise Refused("a patch path with a `..` component (%s): name the file without one" % path[:80])
+    return absolute(path, base)
+
+
+def patch_lines(text):
+    """A patch's lines as Codex reads them: split at \n only, one trailing \r dropped. Any other line break is refused,
+    since splitlines() would cut there and Codex does not, and the two would read different files."""
+    lines = [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+    for l in lines:
+        m = LINE_BREAKS.search(l)
+        if m:
+            raise Refused("a patch holding a line break Codex does not split at (%r): use plain \\n line ends" % m.group())
+    return lines
+
+
+def patch_files(text, base):
+    """Every path a patch touches, absolute. A `~` path is checked both as written and as the home it names."""
+    out = []
+    for line in patch_lines(text):
+        m = PATCH_LINE.match(line)
+        if not m:
+            continue
+        p = m.group(2)
+        c = HEADER_CONTROL.search(line)   # a tab is fine around the header, as both trim it, but not in the path
+        c = c.group() if c else ("\t" if "\t" in p else "")
+        if c:
+            raise Refused("a patch path holding a control character (%r): name the file without one" % c)
+        # Codex takes the path from after the exact "*** Add File: " and keeps any further leading space, where
+        # PATCH_LINE trims it: "Add File:  /tmp/x" is judged as /tmp/x and written to "<wt>/ /tmp/x".
+        raw = line.split(":", 1)[1]
+        if raw[1:2].isspace() or (raw[:1].isspace() and raw[:1] != " "):
+            raise Refused("a patch path starting with whitespace: name the file without it")
+        if not p:
+            raise Refused("a patch line names no file: " + line.strip()[:80])
+        out.append(patch_path(p, base))
+        if p.startswith("~"):
+            out.append(patch_path(os.path.expanduser(p), base))
+    return out
+
+
+def argv_text(argv):
+    if len(argv) == 3 and os.path.basename(argv[0]) in POSIX_SHELLS and re.fullmatch(r"-[a-z]*c", argv[1]):
+        return argv[2]
+    return shlex.join(argv)
+
+
+def rollout_call(payload):
+    """The function_call this hook is about, as Codex logged it: its arguments hold what the payload drops."""
+    tp, cid = payload.get("transcript_path"), payload.get("tool_use_id")
+    if not isinstance(tp, str) or not os.path.isabs(tp) or not isinstance(cid, str) or not cid:
+        raise Refused("the payload names no session log or no call id, so the shell call's workdir and tty are unknown")
+    try:
+        with open(tp, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - ROLLOUT_TAIL))
+            data = f.read()
+    except OSError as e:
+        raise Refused("the session log cannot be read (%s), so the shell call's workdir and tty are unknown" % e.strerror)
+    found = None
+    for line in data.decode("utf-8", "replace").split("\n"):   # JSONL: a record ends at \n, and U+2028 or \x85 inside one is not an end
+        if cid not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        p = rec.get("payload") if isinstance(rec, dict) else None
+        if isinstance(p, dict) and p.get("type") == "function_call" and p.get("call_id") == cid:
+            found = p
+    if found is None:
+        raise Refused("call %s is not in the session log, so its workdir and tty are unknown" % cid[:40])
+    try:
+        args = json.loads(found.get("arguments") or "{}")
+    except ValueError:
+        raise Refused("the logged arguments of call %s are not JSON" % cid[:40])
+    if not isinstance(args, dict):
+        raise Refused("the logged arguments of call %s are not an object" % cid[:40])
+    return found.get("name", ""), args
+
+
+def shell_payloads(payload, ti, cwd):
+    cmd = ti.get("command", ti.get("cmd"))
+    if isinstance(cmd, list) and cmd and all(isinstance(a, str) for a in cmd):
+        cmd = argv_text(cmd)
+    if not isinstance(cmd, str) or not cmd.strip():
+        raise Refused("a shell call with no command string")
+    name, args = rollout_call(payload)
+    logged = args.get("cmd", args.get("command"))
+    if isinstance(logged, list) and logged and all(isinstance(a, str) for a in logged):
+        logged = argv_text(logged)
+    if logged != cmd:
+        raise Refused("the command in the hook payload is not the one in the session log (%s)" % name)
+    if args.get("tty"):
+        raise Refused("a shell with a terminal (tty=true): what is typed into it later never reaches the guard. "
+                      "Run it without tty")
+    sh = args.get("shell")
+    if sh not in (None, "") and (not isinstance(sh, str) or os.path.basename(sh) not in POSIX_SHELLS):
+        raise Refused("a command run by %r, which is not a POSIX shell the guard can read" % (sh,))
+    base = cwd
+    wd = args.get("workdir")
+    if wd not in (None, ""):
+        if not isinstance(wd, str):
+            raise Refused("a workdir that is not a path")
+        base = absolute(wd, cwd)
+    out = [{"tool_name": "Bash", "tool_input": {"command": cmd if base == cwd else "cd " + shlex.quote(base) + " && " + cmd}}]
+    # Codex applies `apply_patch <<EOF` typed into a shell as a patch, and cc-guard reads a heredoc body as data,
+    # so every file such a body names is judged as a write here as well.
+    # A header seen at ANY splitlines() break makes it a patch, and patch_lines then refuses the breaks Codex does not make.
+    named = []
+    if any(map(PATCH_LINE.match, cmd.splitlines())):
+        named = [m.group(2) for m in map(PATCH_LINE.match, patch_lines(cmd)) if m]
+    if named:
+        # A shell can change directory in ways no reading of the text will catch (sh -c 'cd …', env -C, a
+        # variable), so a relative path in a shell-carried patch has no known home: refused outright.
+        if not all(os.path.isabs(p) for p in named):
+            raise Refused("a patch inside a shell command names a relative path; where it lands depends on a directory "
+                          "the shell may have changed. Use absolute paths, or the apply_patch tool")
+        out += [{"tool_name": "Write", "tool_input": {"file_path": f, "content": ""}} for f in patch_files(cmd, base)]
+    return out
+
+
+def translate(payload):
+    """A Codex PreToolUse payload -> the list of cc-guard payloads that must ALL pass."""
+    if not isinstance(payload, dict):
+        raise Refused("the hook payload is not a JSON object")
+    name, ti, cwd = payload.get("tool_name"), payload.get("tool_input"), payload.get("cwd")
+    if not isinstance(name, str) or not name:
+        raise Refused("the hook payload names no tool")
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        raise Refused("the hook payload has no absolute cwd")
+    if "tool_input" not in payload:
+        raise Refused("the hook payload has no tool_input")
+    cwd = os.path.normpath(cwd)
+    bare = bare_name(name)
+    if bare == "write_stdin":
+        raise Refused("typing into a running shell (write_stdin) is not something the guard can read")
+    if bare in SHELL_TOOLS:
+        if not isinstance(ti, dict):
+            raise Refused("a shell call whose input is not an object")
+        out = shell_payloads(payload, ti, cwd)
+    elif bare == "apply_patch":
+        text = ti if isinstance(ti, str) else (ti.get("command", ti.get("input", ti.get("patch"))) if isinstance(ti, dict) else None)
+        if not isinstance(text, str):
+            raise Refused("an apply_patch call with no patch text")
+        files = patch_files(text, cwd)
+        if not files:
+            raise Refused("an apply_patch call that names no file")
+        out = [{"tool_name": "Write", "tool_input": {"file_path": f, "content": ""}} for f in files]
+    elif bare in AGENT_TOOLS:
+        out = [{"tool_name": "Agent", "tool_input": ti if isinstance(ti, dict) else {"prompt": ti}}]
+    elif bare in READ_TOOLS:
+        p = ti.get("path") if isinstance(ti, dict) else None
+        if not isinstance(p, str) or not p:
+            raise Refused("%s with no path" % bare)
+        out = [{"tool_name": "Read", "tool_input": {"file_path": absolute(os.path.expanduser(p) if p.startswith("~") else p, cwd)}}]
+    elif bare in INERT_TOOLS or re.fullmatch(r"mcp__[^\s]+", name):
+        out = [{"tool_name": name, "tool_input": ti}]
+    else:
+        raise Refused("tool %r is not one this shim knows how to put through the guard" % name[:80])
+    for o in out:
+        o["cwd"] = cwd
+    return out
+
+
+def run_guard(p, deadline, env=None):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise Refused("the guard ran out of time before it had judged every file")
+    e = dict(os.environ if env is None else env)
+    e["CC_ROLE"] = "worker"
+    try:
+        r = subprocess.run([GUARD], input=json.dumps(p).encode(), capture_output=True, env=e, timeout=left)
+    except subprocess.TimeoutExpired:
+        raise Refused("cc-guard did not answer in time")
+    except OSError as err:
+        raise Refused("cc-guard could not run (%s)" % err.strerror)
+    if r.returncode == 0:
+        return
+    why = r.stderr.decode("utf-8", "replace").strip() or "cc-guard refused (rc %d) and said nothing" % r.returncode
+    if r.returncode != 2:
+        why = "cc-guard failed (rc %d): %s" % (r.returncode, why)
+    raise Refused(why)
+
+
+def hook():
+    try:
+        raw = sys.stdin.buffer.read()
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            raise Refused("the hook payload is not JSON")
+        deadline = time.monotonic() + BUDGET
+        todo = translate(payload)
+        with ThreadPoolExecutor(min(4, len(todo))) as pool:   # a patch's files are judged side by side
+            for fut in [pool.submit(run_guard, p, deadline) for p in todo]:
+                fut.result()   # the first refusal, in the order the patch names its files
+        return 0
+    except Refused as e:
+        msg = str(e)
+        sys.stderr.write(msg if msg.startswith("cc-guard:") else "cc-guard (codex shim): blocked — " + msg)
+        sys.stderr.write("\n")
+    except BaseException as e:   # the shim's own crash must refuse: anything but exit 2 lets the call run
+        sys.stderr.write("cc-guard (codex shim): blocked — the shim failed (%s)\n" % type(e).__name__)
+    return 2
+
+
+# ---- install / check -------------------------------------------------------------------------------------------
+def block(trust=None):
+    lines = [MARK_BEGIN, "[[hooks.PreToolUse]]", 'matcher = "*"', "[[hooks.PreToolUse.hooks]]",
+             'type = "command"', "command = " + json.dumps(HOOK_CMD), "timeout = %d" % HOOK_TIMEOUT]
+    if trust:
+        lines += ["[hooks.state.%s]" % json.dumps(trust[0]), "trusted_hash = " + json.dumps(trust[1])]
+    return "\n".join(lines + [MARK_END]) + "\n"
+
+
+def strip_block(text):
+    out, skip = [], False
+    for line in text.splitlines(keepends=True):
+        if line.rstrip("\n") == MARK_BEGIN:
+            skip = True
+        elif line.rstrip("\n") == MARK_END and skip:
+            skip = False
+        elif not skip:
+            out.append(line)
+    return "".join(out).rstrip("\n") + ("\n" if out else "")
+
+
+def hooks_list(home):
+    """app-server's hooks/list for <home>: local only, no model, no login."""
+    codex = shutil.which("codex")
+    if not codex:
+        raise Refused("codex is not on PATH, so the hook's trust cannot be read")
+    env = dict(os.environ, CODEX_HOME=home)
+    p = subprocess.Popen([codex, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, env=env, cwd=home, text=True)
+    try:
+        msgs = [{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "cc-harness-codex", "version": "1"}}},
+                {"method": "initialized"}, {"id": 2, "method": "hooks/list", "params": {"cwds": [home]}}]
+        p.stdin.write("".join(json.dumps(m) + "\n" for m in msgs))
+        p.stdin.flush()
+        end = time.monotonic() + 30
+        while time.monotonic() < end:
+            line = p.stdout.readline()
+            if not line:
+                break
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if m.get("id") == 2:
+                if "error" in m:
+                    raise Refused("hooks/list failed: %s" % m["error"])
+                return [h for e in m["result"]["data"] for h in e.get("hooks", [])]
+        raise Refused("codex app-server gave no hooks/list answer")
+    finally:
+        p.kill()
+        p.wait()
+
+
+def our_hook(home):
+    cfg = os.path.realpath(os.path.join(home, "config.toml"))
+    mine = [h for h in hooks_list(home) if h.get("eventName") == "preToolUse" and h.get("command") == HOOK_CMD
+            and os.path.realpath(h.get("sourcePath", "")) == cfg]
+    if len(mine) != 1:
+        raise Refused("codex lists %d PreToolUse hooks running this shim from %s, not 1" % (len(mine), cfg))
+    return mine[0]
+
+
+def install(home):
+    home = os.path.abspath(home)
+    os.makedirs(home, exist_ok=True)
+    cfg = os.path.join(home, "config.toml")
+    existed = os.path.exists(cfg)
+    old = open(cfg).read() if existed else ""
+    base = strip_block(old)
+
+    def write(text):
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError as e:
+            raise Refused("config.toml would not parse with the hook in it (%s); nothing was changed" % e)
+        tmp = cfg + ".cc-harness.tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, cfg)
+
+    write(base + ("\n" if base else "") + block())
+    try:
+        h = our_hook(home)
+        write(base + ("\n" if base else "") + block((h["key"], h["currentHash"])))
+        if our_hook(home).get("trustStatus") != "trusted":
+            raise Refused("codex does not report the hook trusted after install")
+    except BaseException:
+        if existed:
+            with open(cfg, "w") as f:
+                f.write(old)
+        else:
+            os.unlink(cfg)
+        raise
+    print("cc-harness-codex: hook registered and trusted in %s" % cfg)
+    return 0
+
+
+def codex_home(rest, env=None):
+    """The codex-home `guard check` verifies: the one named, else the one Codex itself would use."""
+    env = os.environ if env is None else env
+    return rest[0] if rest else (env.get("CODEX_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".codex"))
+
+
+def verify_home(home):
+    """The registration in <home> points at this shim, matches every tool, is enabled and trusted."""
+    cfg = os.path.join(home, "config.toml")
+    try:
+        conf = tomllib.load(open(cfg, "rb"))
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise Refused("%s cannot be read as TOML (%s)" % (cfg, e))
+    if conf.get("features", {}).get("hooks") is False:
+        raise Refused("hooks are turned off in %s (features.hooks = false)" % cfg)
+    groups = conf.get("hooks", {}).get("PreToolUse", [])
+    ok = [g for g in groups if g.get("matcher") in (None, "", "*")
+          and any(h.get("type") == "command" and h.get("command") == HOOK_CMD for h in g.get("hooks", []))]
+    if not ok:
+        raise Refused("%s registers no PreToolUse hook for every tool that runs %s" % (cfg, HOOK_CMD))
+    h = our_hook(home)
+    if not h.get("enabled") or h.get("trustStatus") not in ("trusted", "managed"):
+        raise Refused("the hook in %s is %s (enabled=%s): Codex would skip it and run every tool unguarded"
+                      % (cfg, h.get("trustStatus"), h.get("enabled")))
+
+
+def cases(cwd, home):
+    """(name, (tool, tool_input), want): want 2 = must refuse, 0 = must pass, "agent" = must arrive as Agent,
+    "report" = said either way (cc-guard has no such rule, and the fence is what stops it). ~ paths are $HOME's.
+    A SAMPLE, one or two per never-rule, not cc-guard's whole table: what this proves is the shim's part. A Bash call
+    reaches cc-guard byte-identical (only a logged workdir adds a `cd` in front), so every other row of cc-guard's own
+    selfcheck holds through the shim as it does without it; a patch is the shim's own translation, so it gets more."""
+    H = lambda p: os.path.join(home, p)
+    patch = lambda *ls: "*** Begin Patch\n" + "".join(l + "\n" for l in ls) + "*** End Patch\n"
+    ap = lambda t: ("apply_patch", {"command": t})
+    sh = lambda c: ("Bash", {"command": c})
+    return [
+        ("patch to ~/.claude/settings.json", ap(patch("*** Update File: " + H(".claude/settings.json"), "@@", "-a", "+b")), 2),
+        ("patch adding ~/bin/cc-guard", ap(patch("*** Add File: " + H("bin/cc-guard"), "+x")), 2),
+        ("patch outside the worktree (~/.cc/config)", ap(patch("*** Add File: " + H(".cc/config"), "+x")), 2),
+        ("patch deleting ~/.ssh/authorized_keys", ap(patch("*** Delete File: " + H(".ssh/authorized_keys"))), 2),
+        ("shell reads ~/.claude/.credentials.json", sh("cat ~/.claude/.credentials.json"), 2),
+        ("shell reads ~/.codex/auth.json", sh("cat ~/.codex/auth.json"), 2),
+        ("shell reads ~/.config/cursor/auth.json", sh("cat ~/.config/cursor/auth.json"), 2),
+        ("view_image of ~/.codex/auth.json", ("view_image", {"path": H(".codex/auth.json")}), 2),
+        ("gh pr merge", sh("gh pr merge 1 --squash"), 2),
+        ("sudo", sh("sudo id"), 2),
+        ("a container runtime (docker)", sh("docker run --rm -v /:/host alpine true"), 2),
+        ("a container runtime (podman)", sh("podman run --rm alpine true"), 2),
+        ("a host service change", sh("systemctl restart nginx"), 2),
+        ("git push to main", sh("git push origin HEAD:main"), 2),
+        ("an unknown tool", ("js_repl", {"code": "1"}), 2),
+        ("write_stdin", ("write_stdin", {"session_id": 1, "chars": "x"}), 2),
+        ("a spawned agent arrives as Agent", ("spawn_agent", {"message": "x"}), "agent"),
+        ("nested bwrap", sh("bwrap --ro-bind / / --unshare-all true"), "report"),
+        ("nested unshare", sh("unshare -r -n true"), "report"),
+        ("allowed: a patch inside the worktree", ap(patch("*** Add File: cc-harness-probe.txt", "+x")), 0),
+        ("allowed: ls", sh("ls"), 0),
+    ]
+
+
+def rollout_for(tmp, calls):
+    """A session log of its own holding the calls, in the shape Codex writes (fixture captured-rollout-*)."""
+    fd, path = tempfile.mkstemp(dir=tmp, prefix="rollout.", suffix=".jsonl")
+    with os.fdopen(fd, "w") as f:
+        for cid, args in calls:
+            f.write(json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                                "arguments": json.dumps(args), "call_id": cid}}) + "\n")
+    return path
+
+
+def through_shim(payload, env, shim=SELF):
+    data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+    r = subprocess.run([shim, "guard", "hook"], input=data, capture_output=True, env=env, timeout=HOOK_TIMEOUT + 30)
+    return r.returncode, r.stderr.decode("utf-8", "replace").strip(), r.stdout
+
+
+def quiet_env(tmp, base=None):
+    """cc-guard's refusals from a check leave no mark: asks in scratch, a no-op cc-failures first on PATH."""
+    stub = os.path.join(tmp, "stub-bin")
+    os.makedirs(stub, exist_ok=True)
+    with open(os.path.join(stub, "cc-failures"), "w") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(os.path.join(stub, "cc-failures"), 0o755)
+    env = dict(os.environ if base is None else base)
+    env.update(CC_GUARD_ASKS=os.path.join(tmp, "asks"), PATH=stub + ":" + env.get("PATH", "/usr/bin:/bin"))
+    return env
+
+
+def check(cwd, home, codex_home=None, base_env=None, say=print):
+    """-> (cases, wrong). Every expected refusal refused, every control passed, the registration (if asked) right."""
+    tmp = tempfile.mkdtemp(prefix="cc-harness-check.")
+    try:
+        env = quiet_env(tmp, base_env)
+
+        def one(i, name, tool, ti, want):
+            p = {"tool_name": tool, "tool_input": ti, "cwd": cwd, "tool_use_id": "check-%d" % i,
+                 "hook_event_name": "PreToolUse"}
+            p["transcript_path"] = rollout_for(tmp, [(p["tool_use_id"], {"cmd": ti["command"]})] if tool == "Bash" else [])
+            rc, why, out = through_shim(p, env)
+            if want == "report":
+                return None, "  - %s: cc-guard %s" % (name, "refuses it" if rc == 2 else "allows it; only the fence stops it")
+            if want == "agent":
+                try:
+                    fine = [g["tool_name"] for g in translate(p)] == ["Agent"]
+                except Refused:
+                    fine = False
+                return fine, "  %s %s (cc-guard %s it)" % ("✓" if fine else "✗", name, "refuses" if rc == 2 else "allows")
+            fine = rc == want and not out
+            return fine, "  %s %s: rc %d%s" % ("✓" if fine else "✗", name, rc, "" if fine else " — " + why[:160])
+
+        with ThreadPoolExecutor(4) as pool:
+            res = list(pool.map(lambda a: one(a[0], a[1][0], a[1][1][0], a[1][1][1], a[1][2]), enumerate(cases(cwd, home))))
+        n = bad = 0
+        for fine, line in res:
+            say(line)
+            if fine is not None:
+                n += 1
+                bad += not fine
+        if codex_home:
+            n += 1
+            try:
+                verify_home(os.path.abspath(codex_home))
+                say("  ✓ %s runs this shim for every tool, enabled and trusted" % codex_home)
+            except Refused as e:
+                bad += 1
+                say("  ✗ registration: %s" % e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return n, bad
+
+
+# ---- selfcheck -------------------------------------------------------------------------------------------------
+def selfcheck():
+    # NOT under /tmp: cc-guard lets a worker write anywhere in /tmp, so a scratch HOME there would make every
+    # protected path in it writable and the never-rules would pass for the wrong reason.
+    root = "/var/tmp" if os.access("/var/tmp", os.W_OK) else None
+    tmp = tempfile.mkdtemp(prefix="cc-harness-selfcheck.", dir=root)
+    try:
+        return _selfcheck(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _selfcheck(tmp):
+    home = os.path.join(tmp, "home")
+    wt = os.path.join(home, ".cc", "worktrees", "demo", "t1")   # a track worktree where cc-guard looks for one
+    os.makedirs(os.path.join(wt, ".cc"))
+    open(os.path.join(wt, ".cc", "track"), "w").write("demo\nt1\n")
+    base = {k: v for k, v in os.environ.items() if not k.startswith("CC_")}
+    base["HOME"] = home
+    env = quiet_env(tmp, base)
+    P = lambda *ls: "*** Begin Patch\n" + "".join(l + "\n" for l in ls) + "*** End Patch\n"
+    prot = os.path.join(home, ".claude", "settings.json")
+
+    def pl(tool, ti, **kw):
+        d = {"tool_name": tool, "tool_input": ti, "cwd": wt, "tool_use_id": "u1", "hook_event_name": "PreToolUse"}
+        d.update(kw)
+        return d
+
+    def shim(p, calls=(), shim_path=SELF):   # a session log of its own per call: the cases run side by side
+        if isinstance(p, dict) and "transcript_path" not in p:
+            p = dict(p, transcript_path=rollout_for(tmp, list(calls)))
+        return through_shim(p, env, shim_path)
+
+    def refused(p, calls=(), says=""):
+        rc, why, out = shim(p, calls)
+        return rc == 2 and says in why and not out
+
+    def passed(p, calls=()):
+        rc, _, out = shim(p, calls)
+        return rc == 0 and out == b""
+
+    def tr(p, calls=()):
+        return translate(dict(p, transcript_path=rollout_for(tmp, list(calls))))
+
+    def tr_refused(p, calls, says):
+        try:
+            tr(p, calls)
+        except Refused as e:
+            return says in str(e)
+        return False
+
+    alone = os.path.join(tmp, "alone")          # a COPY of the shim, so what sits next to it is the test's to choose
+    os.makedirs(alone)
+    lone = os.path.join(alone, "cc-harness-codex")
+    shutil.copy(SELF, lone)
+    failing = os.path.join(tmp, "failing")
+    os.makedirs(failing)
+    shutil.copy(SELF, os.path.join(failing, "cc-harness-codex"))
+    with open(os.path.join(failing, "cc-guard"), "w") as f:
+        f.write("#!/bin/sh\nexit 1\n")
+    os.chmod(os.path.join(failing, "cc-guard"), 0o755)
+    hd = "apply_patch <<'EOF'\n" + P("*** Add File: ok.txt", "+x", "*** Update File: " + prot) + "EOF\n"
+    hd2 = "cd ~/.claude && apply_patch <<'EOF'\n" + P("*** Update File: settings.json") + "EOF\n"
+    # the directory change hidden from any text scan (review of the first cut): each is refused for its relative path
+    hidden = ["sh -c 'cd ~/.claude && apply_patch \"$0\"' \"" + P("*** Update File: settings.json") + "\"",
+              "bash -c \"cd ~/.claude; apply_patch <<'EOF'\n" + P("*** Update File: settings.json") + "EOF\n\"",
+              "env -C ~/.claude apply_patch <<'EOF'\n" + P("*** Update File: settings.json") + "EOF\n"]
+    hd_abs = "apply_patch <<'EOF'\n" + P("*** Add File: " + wt + "/ok.txt", "+x") + "EOF\n"
+    hd_dots = "apply_patch <<'EOF'\n" + P("*** Add File: " + wt + "/hop/../config", "+x") + "EOF\n"
+    # THE LINE-BREAK ATTACK (review of #751): x<break>/../../../../../.claude/settings.json is <wt>/x to splitlines() and
+    # ~/.claude/settings.json to Codex, which splits at \n only. Each break is driven through both doors, and must be
+    # refused for the break itself: with splitlines() back, every one of these passes as a write to <wt>/x.
+    esc = "/../../../../../.claude/settings.json"   # from <wt>/x, five levels up is the scratch home
+    breaks = [("\\f", "\x0c"), ("\\v", "\x0b"), ("\\r mid-line", "\r"), ("\\x1c", "\x1c"), ("\\x85", "\x85"), ("U+2028", " ")]
+    hd_break = lambda b: "apply_patch <<'EOF'\n" + P("*** Update File: " + wt + "/x" + b + esc, "@@", "-a", "+b") + "EOF\n"
+    crlf = "*** Begin Patch\r\n*** Add File: crlf.txt\r\n+x\r\n*** End Patch\r\n"
+    hd_crlf = "apply_patch <<'EOF'\r\n" + crlf.replace("crlf.txt", wt + "/crlf.txt") + "EOF\r\n"
+    sep_cmd = "echo 'a b\x85c'"   # Codex logs these raw (serde_json does not escape them); the record is one line
+
+    def raw_rollout(cid, args):
+        fd, path = tempfile.mkstemp(dir=tmp, prefix="rollout.", suffix=".jsonl")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+                                "arguments": json.dumps(args, ensure_ascii=False), "call_id": cid}}, ensure_ascii=False) + "\n")
+        return path
+    rwt = os.path.realpath(wt)
+    state = os.path.join(home, ".cc", "state")
+    os.makedirs(state, exist_ok=True)
+    os.symlink(state, os.path.join(wt, "hop"))   # a directory link out of the worktree
+    os.symlink(prot, os.path.join(wt, "last"))   # a file link onto a protected path
+    tests = [
+        # the parser: every file a patch touches is judged, and one refused file refuses the whole patch
+        ("a two-file patch whose second file is protected is refused",
+         lambda: refused(pl("apply_patch", {"command": P("*** Add File: a.txt", "+x", "*** Update File: " + prot, "@@", "-a", "+b")}), says="settings.json")),
+        ("a patch moving a file onto a protected path is refused",
+         lambda: refused(pl("apply_patch", {"command": P("*** Update File: a.txt", "*** Move to: " + prot, "@@", "-a", "+b")}))),
+        ("a patch moving a protected file away is refused (the source is a write too)",
+         lambda: refused(pl("apply_patch", {"command": P("*** Update File: " + prot, "*** Move to: b.txt", "@@", "-a", "+b")}))),
+        ("patch paths resolve against cwd, both ends of a move included",
+         lambda: [g["tool_input"]["file_path"] for g in tr(pl("apply_patch", {"command": P(
+             "*** Add File: n.txt", "+x", "*** Update File: sub/./a.txt", "*** Move to: d/b.txt", "*** Delete File: /abs/g.txt")}))]
+         == [rwt + "/n.txt", rwt + "/sub/a.txt", rwt + "/d/b.txt", "/abs/g.txt"]),
+        ("a ~ path in a patch is judged as written and as the home it names",
+         lambda: [g["tool_input"]["file_path"] for g in tr(pl("apply_patch", {"command": P("*** Add File: ~/x")}))]
+         == [rwt + "/~/x", os.path.realpath(os.path.expanduser("~/x"))]),
+        # the review's attack: hop -> ~/.cc/state, so hop/../config is ~/.cc/config, not <worktree>/config
+        ("attack: hop/../config through a link out of the worktree is refused, in every patch op",
+         lambda: all(refused(pl("apply_patch", {"command": P(*op)}), says="`..`") for op in (
+             ["*** Add File: hop/../config", "+x"], ["*** Update File: hop/../config", "@@", "-a", "+b"],
+             ["*** Delete File: hop/../config"], ["*** Update File: a.txt", "*** Move to: hop/../config", "@@", "-a", "+b"],
+             ["*** Add File: " + wt + "/hop/../config", "+x"]))),
+        ("attack: …and the same `..` in a shell heredoc patch is refused",
+         lambda: refused(pl("Bash", {"command": hd_dots}), [("u1", {"cmd": hd_dots})], says="`..`")),
+        *[("attack: a %s in a patch path is refused through apply_patch" % n,
+           lambda b=b: refused(pl("apply_patch", {"command": P("*** Update File: x" + b + esc, "@@", "-a", "+b")}), says="line break"))
+          for n, b in breaks],
+        *[("attack: …and a %s in a shell heredoc patch is refused" % n,
+           lambda b=b: refused(pl("Bash", {"command": hd_break(b)}), [("u1", {"cmd": hd_break(b)})], says="line break"))
+          for n, b in breaks],
+        ("a patch path holding a control character (C0, DEL, C1, a tab) is refused",
+         lambda: all(refused(pl("apply_patch", {"command": P("*** Add File: a" + c + "b.txt", "+x")}), says="control character")
+                     for c in ("\x01", "\x1f", "\x7f", "\x9b", "a\tb"))),
+        ("attack: a patch path after a second space or a no-break space is refused, in every header",
+         lambda: all(refused(pl("apply_patch", {"command": P(h + lead + "/tmp/settings.json", *rest)}), says="whitespace")
+                     for lead in ("  ", "  ")
+                     for h, rest in (("*** Add File:", ("+x",)), ("*** Update File:", ("@@", "-a", "+b")),
+                                     ("*** Delete File:", ()), ("*** Update File: x\n*** Move to:", ("@@", "-a", "+b"))))),
+        ("attack: …and through a shell heredoc patch",
+         lambda: refused(pl("Bash", {"command": "apply_patch <<'EOF'\n" + P("*** Add File:  /tmp/settings.json", "+x") + "EOF\n"}),
+                         [("u1", {"cmd": "apply_patch <<'EOF'\n" + P("*** Add File:  /tmp/settings.json", "+x") + "EOF\n"})],
+                         says="whitespace")),
+        ("a plain CRLF patch passes, each \\r dropped as Codex drops it",
+         lambda: [g["tool_input"]["file_path"] for g in tr(pl("apply_patch", {"command": crlf}))] == [rwt + "/crlf.txt"]
+         and passed(pl("apply_patch", {"command": crlf}))),
+        ("…and so does a CRLF heredoc patch naming an absolute worktree path",
+         lambda: passed(pl("Bash", {"command": hd_crlf}), [("u1", {"cmd": hd_crlf})])),
+        ("a session log record holding a raw U+2028 or \\x85 is still one record, so its call is found and passes",
+         lambda: passed(pl("Bash", {"command": sep_cmd}, transcript_path=raw_rollout("u1", {"cmd": sep_cmd})))),
+        ("a path through a directory link is judged where the link points", lambda: [g["tool_input"]["file_path"] for g in
+         tr(pl("apply_patch", {"command": P("*** Add File: hop/config", "+x")}))] == [os.path.realpath(state) + "/config"]),
+        ("attack: a link as the last component is judged as its target, and refused",
+         lambda: [g["tool_input"]["file_path"] for g in tr(pl("apply_patch", {"command": P("*** Update File: last")}))]
+         == [os.path.realpath(prot)] and refused(pl("apply_patch", {"command": P("*** Update File: last", "@@", "-a", "+b")}),
+                                                  says="settings.json")),
+        ("guard check verifies the codex-home named, else $CODEX_HOME, else ~/.codex",
+         lambda: (codex_home(["/x"], {"CODEX_HOME": "/c", "HOME": "/h"}), codex_home([], {"CODEX_HOME": "/c", "HOME": "/h"}),
+                  codex_home([], {"HOME": "/h"})) == ("/x", "/c", "/h/.codex")),
+        ("a patch that names no file is refused", lambda: refused(pl("apply_patch", {"command": "*** Begin Patch\n*** End Patch\n"}))),
+        ("a patch line with an empty name is refused", lambda: refused(pl("apply_patch", {"command": P("*** Add File: ")}))),
+        ("a patch that is not text is refused", lambda: refused(pl("apply_patch", {"command": 7}))),
+        ("an ordinary patch in the worktree passes, and stdout stays empty",
+         lambda: passed(pl("apply_patch", {"command": P("*** Add File: fine.txt", "+x")}))),
+        # the payload's shape
+        ("a payload that is not JSON is refused", lambda: refused(b"{not json", says="not JSON")),
+        ("a payload that is not an object is refused", lambda: refused(b"[1,2]", says="not a JSON object")),
+        ("a payload with a relative cwd is refused", lambda: refused(pl("apply_patch", {"command": P("*** Add File: x")}, cwd="rel/dir"))),
+        ("a payload with no tool name is refused", lambda: refused({"tool_input": {}, "cwd": wt}, says="names no tool")),
+        ("a payload with no tool_input is refused", lambda: refused({"tool_name": "apply_patch", "cwd": wt}, says="no tool_input")),
+        ("an unknown tool is refused", lambda: refused(pl("frobnicate", {}), says="frobnicate")),
+        ("write_stdin is refused, namespaced or not", lambda: refused(pl("write_stdin", {"session_id": 1, "chars": "ls\n"}))
+         and refused(pl("unified_exec.write_stdin", {"session_id": 1}))),
+        ("a namespaced tool loses its namespace", lambda: bare_name("multi_agent_v1send_input") == "send_input"
+         and tr(pl("multi_agent_v1send_input", {"target": "a", "message": "m"}))[0]["tool_name"] == "Agent"),
+        ("spawn_agent becomes Agent", lambda: tr(pl("spawn_agent", {"message": "m"}))[0]["tool_name"] == "Agent"),
+        ("view_image becomes a Read of its path", lambda: tr(pl("view_image", {"path": "i.png"}))[0]
+         == {"tool_name": "Read", "tool_input": {"file_path": rwt + "/i.png"}, "cwd": wt}),
+        ("view_image with no path is refused", lambda: refused(pl("view_image", {}))),
+        ("a tool that touches no file passes under its own name", lambda: passed(pl("update_goal", {"status": "complete"}))),
+        ("an mcp__ tool passes under its own name", lambda: tr(pl("mcp__fs__read", {"a": 1}))[0]["tool_name"] == "mcp__fs__read"),
+        # the shell: the session log supplies what the payload drops
+        ("argv `bash -lc X` is X", lambda: argv_text(["/bin/bash", "-lc", "echo a b"]) == "echo a b"),
+        ("argv with positional args after -c stays whole",
+         lambda: argv_text(["bash", "-c", 'eval "$1"', "_", "x"]) == "bash -c 'eval \"$1\"' _ x"),
+        ("an argv command in the payload is matched against the log", lambda: passed(pl("Bash", {"command": ["bash", "-lc", "ls"]}), [("u1", {"cmd": "ls"})])),
+        ("ls passes", lambda: passed(pl("Bash", {"command": "ls"}), [("u1", {"cmd": "ls"})])),
+        ("a shell call with no command is refused", lambda: refused(pl("Bash", {"command": ""}), [("u1", {"cmd": ""})])),
+        ("a shell call the session log does not hold is refused",
+         lambda: refused(pl("Bash", {"command": "ls"}), [], says="not in the session log")),
+        ("a shell call with no session log is refused", lambda: refused(pl("Bash", {"command": "ls"}, transcript_path=None))),
+        ("a session log that cannot be read is refused",
+         lambda: refused(pl("Bash", {"command": "ls"}, transcript_path=os.path.join(tmp, "absent.jsonl")), says="cannot be read")),
+        ("a payload command that differs from the logged one is refused",
+         lambda: refused(pl("Bash", {"command": "ls"}), [("u1", {"cmd": "ls -la"})], says="not the one")),
+        ("a shell with a terminal (tty=true) is refused", lambda: refused(pl("Bash", {"command": "vi"}), [("u1", {"cmd": "vi", "tty": True})], says="tty")),
+        ("a command run by a non-shell interpreter is refused",
+         lambda: refused(pl("Bash", {"command": "print(1)"}), [("u1", {"cmd": "print(1)", "shell": "/usr/bin/python3"})], says="POSIX shell")),
+        ("a relative write in a workdir the payload hides is judged in that workdir, and refused",
+         lambda: refused(pl("Bash", {"command": "cp /dev/null cc-guard"}), [("u1", {"cmd": "cp /dev/null cc-guard", "workdir": os.path.join(home, "bin")})])
+         and passed(pl("Bash", {"command": "cp /dev/null cc-guard"}), [("u1", {"cmd": "cp /dev/null cc-guard"})])),
+        ("a relative workdir resolves against cwd and becomes a cd",
+         lambda: tr(pl("Bash", {"command": "true"}), [("u1", {"cmd": "true", "workdir": "sub"})])[0]["tool_input"]["command"]
+         == "cd " + shlex.quote(rwt + "/sub") + " && true"),
+        ("a workdir that is not a path is refused",
+         lambda: tr_refused(pl("Bash", {"command": "true"}), [("u1", {"cmd": "true", "workdir": 5})], "workdir")),
+        ("a patch inside a shell heredoc is judged file by file, and refused", lambda: refused(pl("Bash", {"command": hd}), [("u1", {"cmd": hd})])),
+        ("a heredoc patch after a cd, with relative paths, is refused",
+         lambda: refused(pl("Bash", {"command": hd2}), [("u1", {"cmd": hd2})], says="relative path")),
+        ("attack: a cd hidden in sh -c, bash -c or env -C before a shell patch is refused",
+         lambda: all(refused(pl("Bash", {"command": c}), [("u1", {"cmd": c})], says="relative path") for c in hidden)),
+        ("a heredoc patch naming only absolute worktree paths passes",
+         lambda: passed(pl("Bash", {"command": hd_abs}), [("u1", {"cmd": hd_abs})])),
+        # fail closed when the guard is not there, or fails
+        ("no cc-guard next to the shim: refused", lambda: shim(pl("update_goal", {}), shim_path=lone)[0] == 2),
+        ("cc-guard failing with rc 1: refused, not let through",
+         lambda: (lambda r: r[0] == 2 and "rc 1" in r[1])(shim(pl("update_goal", {}), shim_path=os.path.join(failing, "cc-harness-codex")))),
+        ("the usage", lambda: subprocess.run([SELF, "--help"], capture_output=True).returncode == 0
+         and subprocess.run([SELF, "guard"], capture_output=True).returncode == 2),
+    ]
+    # the fixtures captured live from Codex translate as the header says
+    fx = os.path.join(os.path.dirname(os.path.dirname(SELF)), "tests", "fixtures", "codex-hooks")
+    if os.path.isdir(fx):
+        want = {"captured-apply-patch.json": ["Write"] * 4, "captured-spawn-agent.json": ["Agent"],
+                "captured-namespaced-send-input.json": ["Agent"], "captured-update-goal.json": ["update_goal"],
+                "captured-view-image.json": ["Read"]}
+        for f, names in sorted(want.items()):
+            def fixture(f=f, names=names):
+                p = dict(json.load(open(os.path.join(fx, f))), cwd=wt)
+                return [g["tool_name"] for g in translate(p)] == names
+            tests.append(("fixture %s -> %s" % (f, "/".join(sorted(set(names)))), fixture))
+
+        def live_tty():
+            p = json.load(open(os.path.join(fx, "captured-exec-command-workdir-tty.json")))
+            p["transcript_path"] = os.path.join(fx, "captured-rollout-exec-command-workdir-tty.jsonl")
+            try:
+                translate(p)
+            except Refused as e:
+                return "tty" in str(e)
+            return False
+        tests.append(("fixture: the live tty=true call is refused from its captured session log", live_tty))
+
+    def run(t):
+        try:
+            return t[0], bool(t[1]())
+        except Exception as e:
+            return "%s (raised %s: %s)" % (t[0], type(e).__name__, e), False
+
+    with ThreadPoolExecutor(4) as pool:
+        res = list(pool.map(run, tests))
+    n, bad = len(res), 0
+    for name, fine in res:
+        bad += not fine
+        print("  %s %s" % ("✓" if fine else "✗", name))
+    # guard check against the scratch home, as a launch would run it
+    m, b = check(wt, home, base_env=base, say=lambda s: print("  " + s))
+    n += 1
+    bad += b != 0
+    print("  %s guard check: %d cases, %d wrong" % ("✓" if b == 0 else "✗", m, b))
+    # install + registration on a scratch codex-home: needs codex itself, for hooks/list
+    if not shutil.which("codex"):
+        print("  - codex is not on PATH: install and trust are not checked here")
+    else:
+        def verdict(h):
+            try:
+                verify_home(h)
+            except Refused as e:
+                return str(e)
+            return ""
+        ch = os.path.join(tmp, "codex-home")
+        os.makedirs(ch)
+        open(os.path.join(ch, "config.toml"), "w").write('model = "x"\n\n[projects."/tmp"]\ntrust_level = "trusted"\n')
+        cenv = dict(base)
+        r0 = verdict(ch)
+        r1 = subprocess.run([SELF, "guard", "install", ch], capture_output=True, env=cenv)
+        r2 = subprocess.run([SELF, "guard", "install", ch], capture_output=True, env=cenv)
+        text = open(os.path.join(ch, "config.toml")).read()
+        v = verdict(ch)
+        with open(os.path.join(ch, "config.toml"), "w") as f:
+            f.write(text.replace("timeout = %d" % HOOK_TIMEOUT, "timeout = %d" % (HOOK_TIMEOUT + 1)))
+        v2 = verdict(ch)
+        with open(os.path.join(ch, "config.toml"), "w") as f:
+            f.write("[features]\nhooks = false\n\n" + text)
+        v3 = verdict(ch)
+        bh = os.path.join(tmp, "codex-bad")
+        os.makedirs(bh)
+        open(os.path.join(bh, "config.toml"), "w").write("[hooks]\nPreToolUse = 3\n")
+        r3 = subprocess.run([SELF, "guard", "install", bh], capture_output=True, env=cenv)
+        for name, fine in [
+            ("a codex-home with no hook fails the registration check", "registers no PreToolUse hook" in r0),
+            ("install twice: one block, the other keys kept", r1.returncode == 0 and r2.returncode == 0
+             and text.count(MARK_BEGIN) == 1 and 'model = "x"' in text and '[projects."/tmp"]' in text),
+            ("the installed hook is registered, enabled and trusted" + (": " + v if v else ""), not v),
+            ("a hook changed after install is no longer trusted, and check says so", "modified" in v2 or "untrusted" in v2),
+            ("hooks turned off in the config fail the check", "features.hooks = false" in v3),
+            ("install refuses a config it cannot add to, and leaves it as it was",
+             r3.returncode != 0 and open(os.path.join(bh, "config.toml")).read() == "[hooks]\nPreToolUse = 3\n")]:
+            n += 1
+            bad += not fine
+            print("  %s %s" % ("✓" if fine else "✗", name))
+    print("cc-harness-codex selfcheck: %d passed, %d failed" % (n - bad, bad))
+    return 1 if bad else 0
+
+
+def main(argv):
+    if argv[:2] == ["guard", "hook"] and len(argv) == 2:
+        return hook()
+    try:
+        if argv == ["selfcheck"]:
+            return selfcheck()
+        if argv[:2] == ["guard", "install"] and len(argv) == 3:
+            return install(argv[2])
+        if argv[:2] == ["guard", "check"]:
+            rest, cwd = argv[2:], os.getcwd()
+            if rest[:1] == ["--cwd"] and len(rest) >= 2:
+                cwd, rest = os.path.abspath(rest[1]), rest[2:]
+            if len(rest) > 1:
+                print(USAGE, file=sys.stderr)
+                return 2
+            n, bad = check(cwd, os.path.expanduser("~"), codex_home(rest))
+            print("cc-harness-codex guard check: %d passed, %d failed" % (n - bad, bad))
+            return 1 if bad else 0
+    except Refused as e:
+        print("cc-harness-codex: %s" % e, file=sys.stderr)
+        return 1
+    if argv in ([], ["-h"], ["--help"], ["help"]):
+        print(USAGE)
+        return 0 if argv else 2
+    print(USAGE, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

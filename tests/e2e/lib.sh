@@ -54,6 +54,7 @@ chk(){   # `chk cc-foo`: that tool's own selfcheck as one case. Red once is run 
   return 0; }
 RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"; : > "$T/born"   # born: what "modified during this run" means below
 export CC_SELF_LAND_EXCEPT=$REPO         # every project lands itself by default, and the box's own config never decides a fixture: a case that means the grant sets this itself
+export CC_WORKER_SANDBOX=0   # the fence is on for every worker now, and a fixture loop's stub claude lives under $T, which the fence does not bind ("timeout: failed to execute process", #751); cc-sandbox's selfcheck tests the fence itself
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
 export CC_ROOM_DIR="$T/room" CC_WORKER_CAP=1000 CC_WORKER_PACE_MARGIN=100   # cc-room: a fixture --go never queues behind the box's real loops or its five-hour pace, and never takes one of its slots
 # …nor behind the box's LOAD: cc-room also asks the lander's overloaded(), and at a load of twice the cores every

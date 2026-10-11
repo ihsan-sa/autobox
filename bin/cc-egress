@@ -1,0 +1,408 @@
+#!/usr/bin/python3 -IS
+# cc-egress — a worker's only way off the box: an allow-list HTTPS proxy on a unix socket, run by the user, no root.
+#   cc-egress serve --socket <path> [--allow <list>] [--log <file>] [--parent <pid>]
+#       HOST SIDE. Listens on <path> (mode 600) for HTTP CONNECT and opens the tunnel only to a host on <list>, else
+#       answers 403 and logs one line "refused <host>:<port> <why>" to <file> (stderr when none; past 1 MiB the file
+#       moves to <file>.1, so a worker hammering refused hosts cannot fill the disk). --parent: exit with
+#       that process (PR_SET_PDEATHSIG), and refuse to start once it is gone — cc-sandbox passes its own pid and then
+#       execs bwrap in it, so the proxy lives exactly as long as the sandbox does.
+#   cc-egress inside --socket <path> [--port <n>] -- <command...>
+#       IN THE SANDBOX, which has no network of its own (bwrap --unshare-net: loopback only). Forks a forwarder from
+#       127.0.0.1:<n> (default 3128; 0 takes a free port) to <path>, waits until it listens, sets HTTPS_PROXY/HTTP_PROXY/ALL_PROXY (both
+#       cases) to it and NO_PROXY to loopback, and execs <command>. The forwarder decides nothing: killing it or
+#       talking to <path> directly reaches the same host-side list.
+#   cc-egress selfcheck     a scratch proxy and a local upstream: each kept and each refused case, driven
+# THE LIST: comma- or space-separated. `host` is that name on port 443; `.suffix` is every name under it, not the
+# bare suffix (so `.example.com` does not admit `evilexample.com`); `host:port` or `.suffix:port` names another port.
+# An IP literal is refused unless the list names that literal, and a NAME that resolves to a loopback, private,
+# link-local or otherwise non-global address is refused whatever the list says — no listed name reaches the host's
+# own services. With no --allow, DEFAULT below: the model APIs the harnesses call, GitHub, and the npm and PyPI
+# indexes. The box's own list is `cc-config set CC_EGRESS_ALLOW "<list>"` (cc-sandbox reads it and passes it here).
+# ONLY CONNECT: a plain-HTTP request (`GET http://…`) is refused. What CONNECT opens is a TCP tunnel to the named
+# host and port, and nothing more: the proxy does not check that TLS runs inside it, so it restricts the DESTINATION,
+# not the protocol (a client may speak clear text to an allowed host:port). Nor does it inspect what goes through an
+# allowed tunnel. A worker can still post to anything an allowed host accepts (a gist on github.com, say); the list
+# bounds WHERE, not WHAT. DNS is resolved here, on the host, so the sandbox needs no resolver and gets none.
+import ctypes
+import ipaddress
+import os
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+
+DEFAULT = ("api.anthropic.com statsig.anthropic.com api.openai.com chatgpt.com "
+           "github.com api.github.com codeload.github.com .githubusercontent.com "
+           "registry.npmjs.org pypi.org files.pythonhosted.org")
+USAGE = ("usage: cc-egress serve --socket <path> [--allow <list>] [--log <file>] [--parent <pid>]"
+         " | inside --socket <path> [--port <n>] -- <command...> | selfcheck")
+HEAD_MAX = 8192
+
+
+def parse_list(text):
+    """→ list of (name, is_suffix, port)."""
+    rules = []
+    for item in text.replace(",", " ").split():
+        item = item.strip().lower()
+        host, port = item, 443
+        if item.startswith("[") or item.count(":") > 1:           # an IPv6 literal, [addr]:port or bare
+            if item.startswith("[") and "]:" in item:
+                host, port = item[1:item.index("]")], int(item.rsplit(":", 1)[1])
+            else:
+                host = item.strip("[]")
+        elif ":" in item:
+            host, p = item.rsplit(":", 1)
+            port = int(p)
+        rules.append((host.lstrip("."), host.startswith("."), port))
+    return rules
+
+
+def is_ip(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def allowed(rules, host, port):
+    """→ None when the list admits host:port, else the reason."""
+    host = host.lower().rstrip(".")
+    for name, suffix, p in rules:
+        if p != port:
+            continue
+        if (suffix and host.endswith("." + name)) or (not suffix and host == name):
+            return None
+    return "not on the list"
+
+
+def resolve(host, port, rules):
+    """→ (address list, None) or (None, reason). A literal passes only when listed verbatim (checked by allowed)."""
+    if is_ip(host):
+        return [(host, port)], None
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return None, f"does not resolve ({exc.strerror or exc})"
+    out = []
+    for fam, _, _, _, sa in infos:
+        if not ipaddress.ip_address(sa[0]).is_global:
+            return None, f"resolves to {sa[0]}, which is not a global address"
+        out.append(sa[:2])
+    return out, None
+
+
+def pump(a, b):
+    try:
+        while True:
+            data = a.recv(65536)
+            if not data:
+                break
+            b.sendall(data)
+    except OSError:
+        pass
+    for s, how in ((b, socket.SHUT_WR), (a, socket.SHUT_RD)):
+        try:
+            s.shutdown(how)
+        except OSError:
+            pass
+
+
+def splice(a, b):
+    t = threading.Thread(target=pump, args=(b, a), daemon=True)
+    t.start()
+    pump(a, b)
+    t.join()
+    a.close()
+    b.close()
+
+
+def read_head(conn):
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = conn.recv(1024)
+        if not chunk:
+            return None, b""
+        buf += chunk
+        if len(buf) > HEAD_MAX:
+            return None, b""
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    return head.decode("latin-1"), rest
+
+
+def handle(conn, rules, log):
+    conn.settimeout(15)
+    target = "?"
+    try:
+        head, rest = read_head(conn)
+        if head is None:
+            return
+        parts = head.split("\r\n", 1)[0].split()
+        if len(parts) != 3 or parts[0] != "CONNECT":
+            target = parts[1] if len(parts) > 1 else "?"
+            why = "only CONNECT (TLS) is proxied"
+        else:
+            target = parts[1]
+            host, _, p = target.rpartition(":")
+            host = host.strip("[]")
+            try:
+                port = int(p)
+            except ValueError:
+                port, host = -1, target
+            why = allowed(rules, host, port) if port > 0 else "no port"
+            addrs = None
+            if why is None:
+                addrs, why = resolve(host, port, rules)
+            if why is None:
+                up, err = None, None
+                for sa in addrs:
+                    try:
+                        up = socket.create_connection(sa, timeout=15)
+                        break
+                    except OSError as exc:
+                        err = exc
+                if up is None:
+                    conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    log(f"failed {target} {err}")
+                    return
+                conn.settimeout(None)
+                up.settimeout(None)
+                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                if rest:
+                    up.sendall(rest)
+                splice(conn, up)
+                return
+        log(f"refused {target} {why}")
+        conn.sendall(f"HTTP/1.1 403 Forbidden\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\n"
+                     f"cc-egress: {target} refused: {why}\n".encode())
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def die_with(pid):
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.prctl(1, signal.SIGTERM, 0, 0, 0)     # PR_SET_PDEATHSIG
+    if os.getppid() != pid:                    # the parent went before the signal was armed
+        sys.exit(0)
+
+
+LOG_CAP = 1 << 20   # a worker hammering unlisted hosts fills this, not the disk: past it the log moves to <file>.1
+
+
+def append_capped(path, line, cap=LOG_CAP):
+    """Append one line; a file already at `cap` bytes is first moved to <path>.1 (the one before it is dropped)."""
+    try:
+        if os.path.getsize(path) >= cap:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    with open(path, "a") as fh:
+        fh.write(line + "\n")
+
+
+def serve(sock, allow_text, logfile, parent):
+    if parent:
+        die_with(parent)
+    rules = parse_list(allow_text if allow_text is not None else DEFAULT)
+    lock = threading.Lock()
+
+    def log(line):
+        with lock:
+            if logfile:
+                append_capped(logfile, line)
+            else:
+                print("cc-egress: " + line, file=sys.stderr, flush=True)
+    try:
+        os.unlink(sock)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o177)
+    srv.bind(sock)
+    os.umask(old)
+    srv.listen(64)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn, rules, log), daemon=True).start()
+
+
+def forward(sock, port, ready_fd):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(64)
+    os.write(ready_fd, b"%d\n" % srv.getsockname()[1])   # the port it got: --port 0 asks the kernel for a free one
+    os.close(ready_fd)
+
+    def one(c):
+        u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            u.connect(sock)
+        except OSError:
+            c.close()
+            return
+        splice(c, u)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=one, args=(c,), daemon=True).start()
+
+
+def inside(sock, port, cmd):
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        ctypes.CDLL(None).prctl(1, signal.SIGTERM, 0, 0, 0)
+        try:
+            forward(sock, port, w)
+        finally:
+            os._exit(1)
+    os.close(w)
+    got = b""
+    while not got.endswith(b"\n"):
+        chunk = os.read(r, 16)
+        if not chunk:
+            break
+        got += chunk
+    if not got.strip().isdigit():
+        print(f"cc-egress: the forwarder to {sock} did not start — nothing was run", file=sys.stderr)
+        sys.exit(2)
+    os.close(r)
+    port = int(got)
+    url = f"http://127.0.0.1:{port}"
+    for k in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+        os.environ[k] = os.environ[k.lower()] = url
+    os.environ["NO_PROXY"] = os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as exc:
+        print(f"cc-egress: cannot run {cmd[0]}: {exc.strerror}", file=sys.stderr)
+        sys.exit(127)
+
+
+def selfcheck():
+    n = bad = 0
+
+    def t(name, got, want):
+        nonlocal n, bad
+        n += 1
+        if got != want:
+            bad += 1
+            print(f"  FAIL {name}: got {got!r} want {want!r}")
+        else:
+            print(f"  ok   {name}")
+    d = tempfile.mkdtemp(prefix="cc-egress.")
+    up = socket.socket()
+    up.bind(("127.0.0.1", 0))
+    up.listen(8)
+    uport = up.getsockname()[1]
+
+    def echo():
+        while True:
+            c, _ = up.accept()
+            c.sendall(b"upstream:" + c.recv(64))
+            c.close()
+    threading.Thread(target=echo, daemon=True).start()
+    sock, logf = os.path.join(d, "s"), os.path.join(d, "log")
+    lst = f"127.0.0.1:{uport} .example.com localhost:{uport}"
+    threading.Thread(target=serve, args=(sock, lst, logf, 0), daemon=True).start()
+    for _ in range(100):
+        if os.path.exists(sock):
+            break
+        threading.Event().wait(0.02)
+
+    def ask(line):
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(sock)
+        c.sendall(line.encode() + b"\r\n\r\n")
+        first = c.recv(4096).split(b"\r\n", 1)[0].decode()
+        body = b""
+        if " 200 " in first + " ":
+            c.sendall(b"ping")
+            body = c.recv(64)
+        c.close()
+        return first.split(" ")[1] if " " in first else first, body
+    t("a listed literal and port opens the tunnel", ask(f"CONNECT 127.0.0.1:{uport} HTTP/1.1"), ("200", b"upstream:ping"))
+    t("the listed literal on another port is refused", ask("CONNECT 127.0.0.1:443 HTTP/1.1")[0], "403")
+    t("an unlisted literal is refused", ask(f"CONNECT 127.0.0.2:{uport} HTTP/1.1")[0], "403")
+    t("a listed NAME resolving to loopback is refused", ask(f"CONNECT localhost:{uport} HTTP/1.1")[0], "403")
+    t("plain HTTP is refused", ask(f"GET http://127.0.0.1:{uport}/ HTTP/1.1")[0], "403")
+    t("garbage is refused", ask("HELLO")[0], "403")
+    r = parse_list(".example.com api.x.org:8443")
+    t(".suffix admits a name under it", allowed(r, "a.example.com", 443), None)
+    t(".suffix does not admit a name that merely ends in it", allowed(r, "evilexample.com", 443), "not on the list")
+    t(".suffix does not admit the bare suffix", allowed(r, "example.com", 443), "not on the list")
+    t("host:port admits that port", allowed(r, "api.x.org", 8443), None)
+    t("host:port refuses 443", allowed(r, "api.x.org", 443), "not on the list")
+    t("the default list names no IP literal", [h for h, _, _ in parse_list(DEFAULT) if is_ip(h)], [])
+    with open(logf) as fh:
+        t("every refusal is logged with its reason", sum(1 for ln in fh if ln.startswith("refused ")), 5)
+    capf = os.path.join(d, "capped")
+    for i in range(50):
+        append_capped(capf, "refused x%02d:443 not on the list" % i, cap=200)
+    t("the refusal log is capped: it and its one rotation stay near the cap, and the newest line is kept",
+      (os.path.getsize(capf) < 240, os.path.getsize(capf + ".1") < 240, open(capf).read().splitlines()[-1].split()[1]),
+      (True, True, "x49:443"))
+    # inside: a real forwarder in front of the same socket, in a process of its own
+    probe = ("import os,socket;u=os.environ['HTTPS_PROXY'];h,p=u[7:].split(':');c=socket.create_connection((h,int(p)));"
+             f"c.sendall(b'CONNECT 127.0.0.1:{uport} HTTP/1.1\\r\\n\\r\\n');r=c.recv(64);c.sendall(b'x');"
+             "print(r.split(b' ')[1].decode(), c.recv(64).decode(), os.environ['no_proxy'])")
+    out = subprocess.run([sys.executable, "-IS", os.path.realpath(__file__), "inside", "--socket", sock, "--port", "0",
+                          "--", sys.executable, "-IS", "-c", probe], capture_output=True, text=True, timeout=30)
+    t("inside: the command ran behind the forwarder, through the proxy, with loopback exempt",
+      out.stdout.strip(), "200 upstream:x localhost,127.0.0.1,::1")
+    held = socket.socket()
+    held.bind(("127.0.0.1", 0))
+    held.listen(1)
+    out = subprocess.run([sys.executable, "-IS", os.path.realpath(__file__), "inside", "--socket", sock, "--port",
+                          str(held.getsockname()[1]), "--", "true"], capture_output=True, text=True, timeout=30)
+    held.close()
+    t("inside: a port already taken stops the launch, and nothing runs", (out.returncode, "did not start" in out.stderr), (2, True))
+    print(f"cc-egress selfcheck: {n - bad} passed, {bad} failed")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        with open(os.path.realpath(__file__)) as fh:
+            for line in fh.readlines()[1:]:
+                if not line.startswith("#"):
+                    break
+                print(line[2:].rstrip())
+        return 0 if argv else 2
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "selfcheck":
+        return selfcheck()
+    opts, tail = {}, []
+    while rest:
+        a = rest.pop(0)
+        if a == "--":
+            tail = rest
+            break
+        if a in ("--socket", "--allow", "--log", "--parent", "--port") and rest:
+            opts[a] = rest.pop(0)
+        else:
+            print(USAGE, file=sys.stderr)
+            return 2
+    if "--socket" not in opts:
+        print(USAGE, file=sys.stderr)
+        return 2
+    if cmd == "serve" and not tail:
+        serve(opts["--socket"], opts.get("--allow"), opts.get("--log"), int(opts.get("--parent", 0)))
+    elif cmd == "inside" and tail:
+        inside(opts["--socket"], int(opts.get("--port", 3128)), tail)
+    else:
+        print(USAGE, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
