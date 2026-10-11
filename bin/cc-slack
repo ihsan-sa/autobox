@@ -9468,7 +9468,8 @@ def run_approved_argv(chat, ts):
 def run_card_tail(cmd, sha):
     """The exact end of a run card, as cc-notify --run builds it: the command, escaped as Slack keeps it, in a code block,
     then RUN_LINE and the stamp. A card is run only if its text ENDS with this (both read through run_card_glyphs,
-    since Slack hands the card back with :+1: for 👍), so a stamp or a code block that
+    since Slack hands the card back with :+1: for 👍, and the card through run_card_unlink, since it hands a hostname
+    back as a link), so a stamp or a code block that
     somebody else's words carry in the middle of a card (a PR title on a merge card) matches nothing."""
     shown = cmd.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return f"\n```\n{shown}\n```\n{RUN_LINE} · `run:{sha[:16]}`"
@@ -9476,6 +9477,25 @@ def run_card_tail(cmd, sha):
 def run_card_glyphs(text):
     """text with each :name: Slack stores for an emoji (SLACK_STORED_EMOJI) put back as the glyph it was sent as."""
     return re.sub("|".join(map(re.escape, SLACK_STORED_EMOJI)), lambda m: SLACK_STORED_EMOJI[m.group(0)], text)
+
+RUN_CARD_LINK_RE = re.compile(r"<((https?://|mailto:)([^|<>\s`]+))(?:\|([^<>]*))?>")
+
+def run_card_unlink(text):
+    """text with each link Slack made on its own put back as the words that were sent. Slack stores a hostname, URL or
+    address in a card, even inside its code block, as <http://host|host> or <mailto:a@b|a@b> (a DNS card,
+    2026-10-06), so the card no longer ended with the command. A link is undone only when its label is exactly the
+    URL minus its scheme (minus mailto: for an address), or it is an http(s) link with no label and shows the URL
+    itself, so what is put back is what the owner saw. A link whose label says anything else is left as it is, so the
+    card does not match and nothing runs: a card may not show one target and carry another. A link holding a backtick
+    is never undone, because <http://```|```> would put back the code fence that a link had stood in for, and the
+    command between two such links shows as formatted text (security read of this change). A literal < in a command is &lt; on the
+    card (run_card_tail), so a link here was made by Slack, never sent."""
+    def put_back(m):
+        url, scheme, rest, label = m.groups()
+        if label is None:
+            return url if scheme != "mailto:" else m.group(0)
+        return label if label == rest else m.group(0)
+    return RUN_CARD_LINK_RE.sub(put_back, text)
 
 RUN_CFG_KEYS = ("SLACK_BOT_TOKEN", "SLACK_OWNER_ID", "SLACK_APPROVALS")
 
@@ -9566,7 +9586,7 @@ def run_card_refusal(cfg, chat, ts):
         return "the command on file was changed after the card went out (its sha256 no longer matches)", None, True
     if msg.get("edited"):
         return "the card was edited after it went out", None, True
-    text, tail = run_card_glyphs(msg.get("text") or ""), run_card_glyphs(run_card_tail(cmd, sha))
+    text, tail = run_card_unlink(run_card_glyphs(msg.get("text") or "")), run_card_glyphs(run_card_tail(cmd, sha))
     if "🔐 *Approval needed:*" not in text or not text.endswith(tail):
         return "the card does not end with this command and its run: stamp", None, True
     # cc-notify refuses both before it posts; they are asked again here because a card need not have come from it

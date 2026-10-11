@@ -8813,6 +8813,44 @@ def run_selfcheck():
                                               "sha256": hashlib.sha256(b"rm -rf ~/dev").hexdigest()})
     check("run card: …and one rewritten WITH a fresh sha256 runs nothing either — the card's run: stamp no longer matches it",
           rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))
+    # A HOSTNAME IN THE COMMAND (run-card-survives-autolinked-domains): Slack stores a domain, URL or address in a card,
+    # code block and all, as a link, so a DNS card (2026-10-06) did not end with its command and his 👍 ran nothing.
+    def rc_linked(cmd, links):
+        sha = hashlib.sha256(cmd.encode()).hexdigest()
+        tail = run_card_tail(cmd, sha)
+        for plain, stored in links:
+            tail = tail.replace(plain, stored)
+        return rc_case(cmd=cmd, text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* add the record" + tail)
+    dns = "dns-tool create CNAME www site.example.net"
+    c = rc_linked(dns, [("site.example.net", "<http://site.example.net|site.example.net>")])
+    check("run card: a card whose command holds a hostname runs on the owner's 👍, though Slack stores the hostname as "
+          "<http://host|host> inside the code block — a link whose label is its URL minus the scheme is the words he saw",
+          rc_go(c) == 0 and c["ran"] == [["bash", "-c", dns]])
+    both = "notify a@b.example about https://x.example/p?q=1"
+    c = rc_linked(both, [("a@b.example", "<mailto:a@b.example|a@b.example>"),
+                         ("https://x.example/p?q=1", "<https://x.example/p?q=1>")])
+    check("run card: …and so does one with an address (<mailto:a|a>) and a full URL (<url>, no label)",
+          rc_go(c) == 0 and c["ran"] == [["bash", "-c", both]])
+    c = rc_linked(dns, [("site.example.net", "<http://evil.example|site.example.net>")])
+    check("run card: a link whose label is not its own URL (it shows site.example.net and carries evil.example) "
+          "is left as a link, so the card does not end with the command and nothing runs",
+          rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))
+    amp = "curl -s https://x.example/p?a=1&b=2"
+    c = rc_linked(amp, [("https://x.example/p?a=1&amp;b=2", "<https://x.example/p?a=1&amp;b=2>")])
+    check("run card: a URL holding & (escaped &amp; on the card and in the link alike) runs once undone",
+          "&amp;" in run_card_tail(amp, hashlib.sha256(amp.encode()).hexdigest())
+          and rc_go(c) == 0 and c["ran"] == [["bash", "-c", amp]])
+    c = rc_linked(both, [("a@b.example", "<mailto:a@b.example>")])
+    check("run card: a bare <mailto:…> link (no label) is left as a link — Slack would show the address, but nothing "
+          "undoes it, so the card does not match and nothing runs",
+          rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))
+    fcmd = "echo *a* ~b~"
+    fsha = hashlib.sha256(fcmd.encode()).hexdigest()
+    c = rc_case(cmd=fcmd, text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* x"
+                + run_card_tail(fcmd, fsha).replace("```", "<http://```|```>"))
+    check("run card: a code fence sent as a link (<http://```|```>, label = URL minus scheme) is NOT undone, since the "
+          "command between two such links shows as bold and struck text — nothing runs",
+          rc_go(c) is None and not c["ran"] and "run: stamp" in rc_log(c))
     c = rc_case(mode=0o620)
     check("run card: a record other users could write runs nothing, and nothing is posted",
           rc_go(c) is None and not c["ran"] and not c["posts"] and "unshared file" in rc_log(c))
