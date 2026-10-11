@@ -125,8 +125,8 @@ land_scope(){   # $1 = this tree's bin/. Sets SCOPE ("" = everything) and REACH 
     case "$p" in "$pre"*) ;; *) continue;; esac   # outside that tree: no case here can read it (above)
     t=${p##*/}
     # A CHANGED TEST reaches what it tests, not everything (brief: "a PR that edits a selftest case runs that case
-    # and its component, not everything"). A tool's own selfcheck file — tests/cc-foo-selfcheck.py, or
-    # tests/foo_selfcheck.py for cc-foo — stands for that tool. selftest.sh is marked, and the suite itself maps the
+    # and its component, not everything"). A tool's own selfcheck file — tests/selfcheck/cc-foo.py,
+    # tests/cc-foo-selfcheck.py, or tests/foo_selfcheck.py for cc-foo — stands for that tool. selftest.sh is marked, and the suite itself maps the
     # hunks to the stanzas they sit in (selftest.sh, after STANZA_TOOLS); every other suite reads the mark as nothing
     # of its own. Any other test file — green.sh, check.sh, a fixture — still reaches everything.
     case "$p" in
@@ -135,6 +135,8 @@ land_scope(){   # $1 = this tree's bin/. Sets SCOPE ("" = everything) and REACH 
       */tests/*-selfcheck.py|tests/*-selfcheck.py|*/tests/*_selfcheck.py|tests/*_selfcheck.py)
         t=${t%-selfcheck.py}; t=${t%_selfcheck.py}
         if [ -f "$b/$t" ] && [ ${#t} -ge 3 ]; then :; elif [ -f "$b/cc-$t" ]; then t=cc-$t; else return 0; fi;;
+      */tests/selfcheck/*.py|tests/selfcheck/*.py)
+        t=${t%.py}; [ -f "$b/$t" ] && [ ${#t} -ge 3 ] || return 0;;
       *) return 0;;
     esac
     tools="$tools $t"

@@ -102,6 +102,7 @@ run on their own. It owns only the paths no narrower check covers.
 | `py-compile-cc-voice` | static | reads the file only: python compiles it |
 | `py-compile-cc-wakes` | static | reads the file only: python compiles it |
 | `py-compile-lander-self` | static | reads the file only: python compiles it |
+| `py-compile-selfcheck-cases` | static | reads the files only: python compiles them |
 | `py-compile-tests` | static | reads the file only: python compiles it |
 | `json-manifests` | static | jq over files, nothing else |
 | `landing-data` | static | parses this manifest and the reach graph, nothing else |

@@ -3621,6 +3621,11 @@ case "$edge" in *" cc-member-import "*) ok "a change to cc-checkpoint alone reac
   && [ "$(CC_LAND_CHANGED=core/tests/selftest.sh land_scope "$SB"; printf '%s|%s' "$REACH" "$SELFTEST_EDITED")" = " |1" ] \
   && ok "a tool's selfcheck file reaches that tool, selftest.sh is marked for the suite to place, and a selfcheck of no tool or any other test file reaches everything" \
   || bad "case-file reach: [$(reach core/tests/cc-leaf-selfcheck.py)] [$(reach core/tests/leaf_selfcheck.py)] [$(reach core/tests/nobody_selfcheck.py)] [$(reach core/tests/check.sh)]"
+# …and the home most cases live in now, tests/selfcheck/<tool>.py, which its tool execs: the same rule, both ways.
+[ "$(reach core/tests/selfcheck/cc-leaf.py)" = " cc-caller cc-leaf |core/tests/selfcheck/cc-leaf.py" ] \
+  && [ "$(reach core/tests/selfcheck/cc-nobody.py)" = "|" ] \
+  && ok "tests/selfcheck/<tool>.py reaches that tool and its callers, and one named for no tool reaches everything" \
+  || bad "tests/selfcheck reach: [$(reach core/tests/selfcheck/cc-leaf.py)] [$(reach core/tests/selfcheck/cc-nobody.py)]"
 SR6="$T/stanzareach"; mkdir -p "$SR6"; git -C "$SR6" init -q
 printf '%s\n' '# prelude' 'if stanza "one"; then' '  "$B/cc-leaf" x' 'fi' 'if stanza "base" always; then' '  echo base' 'fi' \
   'if stanza "bare"; then' '  echo nothing' 'fi' > "$SR6/st.sh"
