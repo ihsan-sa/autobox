@@ -1,477 +1,158 @@
 #!/usr/bin/env python3
-"""cc-live — the box on one screen, redrawn on its own: what was just handed off, what is running, what is landing,
-and which seats are idle or offline. Read-only; makes no model call and starts no collector.
+"""cc-live — the box on one screen: who needs the owner, every session and every worker, and one key to each other
+section. Read-only; makes no model call.
 
-WHY. The owner steers from a laptop and a phone and had to ask in Slack to learn what the box was doing. He asked for
-"some sort of terminal display to show a new task handed off, whats running etc? or if it's offline or idle". So this
-is a box command he runs over the SSH login he already has (`ssh -t <box> ~/bin/cc-live`): it opens no port, tunnel or key.
+WHY. The owner steers from a laptop and a phone and had to ask in Slack to learn what the box was doing, so this is a
+box command he runs over the SSH login he already has (`ssh -t <box> ~/bin/cc-live`): it opens no port, tunnel or key.
+On 2026-10-04 he found it slow ("kinda slow to navigate ... more info than fits in one screen") and asked for "super
+low latency" with the main screen showing only sessions and workers. So it no longer collects anything itself: it
+draws from cc-pulse's snapshot, held in memory, and a key redraws from that with no I/O.
 
-WHAT IT READS, every refresh, and nothing else — each is a record the box already keeps:
-  boards   $CC_BOARDS or ~/.cc/boards/<repo>.json   rows (`_`-named test boards skipped); a file is re-parsed only when
-           its mtime moves. A HAND-OFF is a row's newest of: `created` (added), a note starting "dispatched"
-           (a worker went out), `agent_at` (a session or subagent took it). Newest first, last 24 h; under 10 min is NEW.
-  procs    /proc, one pass: a `cc-loop <repo> <track>` argv, or a `claude` whose cwd is under the worktrees root,
-           makes that track LIVE. A `running` row with neither is OFFLINE, unless it carries a `held` reason: a
-           row parked on purpose is named on one line instead.
-  activity $CC_STATE or ~/.cc/state/<repo>/<track>/{loop.log,progress.md}: a live worker's last move is their newest mtime.
-  landings $CC_LANDER_STATE or ~/.cc/state/land/*.json, the lander's in-flight jobs (ended ones live in rest/, not here).
-  tmux     `tmux list-windows -t $CC_TMUX_SESSION` (default main): a window whose pane has no `claude` under it is
-           OFFLINE; one whose pane printed nothing for 10 min is IDLE; otherwise working. `repo@alias` is an orch
-           and is shown `alias@repo`, the name `cc` takes back; a name with `/` is a track or session, the rest seats.
-           An offline track window (its session ended, the window left open) is only counted; `_` windows are skipped.
-           A seat's own view adds `tmux capture-pane -p` of that window: the last lines it printed.
-  finished $CC_LANDER_STATE/jobs/*/results/*/*.json with a "runner" starting laptop: the last 5, by file mtime, shown in LAPTOP.
-  laptop   `cc-suites status` (capped at 6 s; one line saying so if it does not answer) and the checks the lander has
-           spilled there now: an `ssh … job CHECK TREE CAP RUN CWD` in /proc (run.laptop_argv), the lander keeps no file.
-  limit    ~/.cc/state/reconcile.json `limit_until`, when it is still ahead: the usage limit is holding work.
-  landed   $CC_LANDER_STATE/queue.log: a `stage R#N merged` line (a `notify R#N landed` line in older logs) is when
-           that PR landed, the earliest of the two; its title comes from $CC_LANDER_STATE/{,rest/}R-N.json. The log is
-           read on from where the last refresh stopped, so a refresh does not re-read it.
-  workers  each loop.log's stamped lines: `iter 1/N start` is a worker starting; `DONE`, `exit …` or `timed out …` stopping.
-Times are shown in the box's own timezone.
+WHERE THE DATA COMES FROM. cc-pulse (beside this file) is the one collector; its docstring says what it reads.
+$CC_STATE/pulse.json is followed with inotify while something keeps it current (it is under 30 s old); otherwise
+cc-live runs cc-pulse's feed in a thread of its own, and that redraws within ~50 ms of a board, session or landing
+file changing. The header shows the pulse's age: amber from 30 s, STALE past 90 s. The deeper views (a board row's
+notes and journal, a seat's pane, the failure board, PRs landed, models and spend) are read when opened, in a
+thread, so no key waits on them; each says "reading…" until it has its lines.
 
-NAVIGATING. On a terminal the dashboard is the home screen and a cursor moves over it, as in Claude Code: ↑/↓ (or j/k,
-←/→ across the seat grid) move it, Enter opens what it is on, Esc, Backspace or ← goes back, q quits from home and
-Ctrl-C quits anywhere. The first line opens three views of their own: every PR that landed and when, a graph of
-landings per hour (+/- widen or narrow it, 6 h to a week) and a timeline of hand-offs, landings and worker starts and
-stops over the last 24 h. A hand-off or running line opens its board row, notes and the worker's last log lines; a
-landing opens its job and history; a seat opens its state and the last lines its tmux pane printed. In a view
-↑/↓ and PgUp/PgDn scroll. Nothing is written anywhere: every view reads the records above.
+KEYS. ↑/↓ or j/k move the cursor (or scroll a view with no rows to pick), PgUp/PgDn page (the cursor goes with the page), Enter opens the row under
+the cursor, Esc, Backspace or ← goes back, h goes home, q quits from home and Ctrl-C anywhere. One key to each section:
+  s sessions   w workers   n needs you   l landing   r recent (r again: T)   p projects   x box and laptop
+  b board      f failures  m models and spend      P PRs landed   g landings graph (+/- widen)   T timeline
+  t  switch this tmux client to the selected session's window (when cc-live runs inside tmux)
+  :  or /  a command line: type a section or a project's name (board, fail, fund, …) and Enter jumps there
+A project's drill-in shows the panel that project writes (cc-pulse's docstring has the format), its workers and
+sessions; b from there opens its board rows.
 
-  cc-live [--every SEC]   the navigable view on a terminal, refreshed every SEC seconds (default 10), until Ctrl-C;
-                          with no terminal on both ends it redraws the plain dashboard instead
-  cc-live --once          print one frame and exit
-  cc-live selfcheck       cases over fixtures, a stub tmux and a fake screen in a temp dir; no board, process, tmux
-                          or terminal of the box's
+  cc-live              the navigable view on a terminal, until q or Ctrl-C; with no terminal on both ends it
+                       prints the main screen as text whenever the pulse changes
+  cc-live --once       print the main screen once and exit (cc-pulse --once --text)
+  cc-live selfcheck    cases over fixtures and a fake screen in a temp dir; no board, process, tmux or terminal of
+                       the box's. A key must redraw in 16 ms (the brief's target; it takes about 1 ms). Under load
+                       (CC_LOADED=1 set, or the 1-minute load at or above the core count) the limit is 48 ms, and the
+                       line it prints says which limit it held to.
 """
-import calendar
 import curses
 import glob
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 
-HOME = os.path.expanduser("~")
-IDLE = 600          # a seat whose pane printed nothing for this long is idle
-NEW = 600           # a hand-off this recent is marked NEW
-RECENT = 86400      # hand-offs shown from this far back
-SHOW_HANDOFFS = 8
+
+def _load():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-pulse")
+    loader = importlib.machinery.SourceFileLoader("cc_pulse", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("cc_pulse", loader))
+    loader.exec_module(mod)
+    return mod
 
 
-def boards_dir():
-    return os.environ.get("CC_BOARDS") or f"{HOME}/.cc/boards"
+P = _load()
+ago, ts, mtime, state_dir, land_dir = P.ago, P.ts, P.mtime, P.state_dir, P.land_dir
+RECENT = P.RECENT
+SECTIONS = {ord("s"): ("section", "sessions"), ord("w"): ("section", "workers"), ord("n"): ("section", "needs"),
+            ord("l"): ("section", "landing"), ord("r"): ("section", "recent"), ord("p"): ("section", "projects"),
+            ord("x"): ("section", "box"), ord("b"): ("board", ""), ord("f"): ("failures",), ord("m"): ("models",),
+            ord("$"): ("models",), ord("P"): ("prs",), ord("g"): ("graph",), ord("T"): ("timeline",)}
+WORDS = {"sessions": ("section", "sessions"), "workers": ("section", "workers"), "needs": ("section", "needs"),
+         "landing": ("section", "landing"), "recent": ("section", "recent"), "projects": ("section", "projects"),
+         "board": ("board", ""), "box": ("section", "box"), "laptop": ("section", "box"), "failures": ("failures",),
+         "models": ("models",), "spend": ("models",), "prs": ("prs",), "graph": ("graph",), "timeline": ("timeline",),
+         "home": ("home",)}
 
 
-def state_dir():
-    return os.environ.get("CC_STATE") or f"{HOME}/.cc/state"
-
-
-def land_dir():
-    return os.environ.get("CC_LANDER_STATE") or f"{state_dir()}/land"
-
-
-def wt_root():
-    return os.environ.get("CC_WORKTREES") or f"{HOME}/.cc/worktrees"
-
-
-def ts(s):
-    """An ISO stamp the board writes (2026-09-28T19:31:30Z) as epoch seconds, or 0."""
-    try:
-        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
-    except (TypeError, ValueError):
-        return 0
-
-
-def mtime(p):
-    try:
-        return os.stat(p).st_mtime
-    except OSError:
-        return 0
-
-
-def ago(sec):
-    sec = max(0, int(sec))
-    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
-        if sec >= div:
-            return f"{sec // div}{unit}"
-    return f"{sec}s"
-
-
-# ── the records ───────────────────────────────────────────────────────────────────────────────────────────────
-_CACHE = {}
-
-
-def boards():
-    """{repo: tracks} for every real board; a file is parsed again only when its mtime moved."""
-    out = {}
-    for path in sorted(glob.glob(f"{boards_dir()}/*.json")):
-        repo = os.path.basename(path)[:-5]
-        if repo.startswith("_"):
-            continue
-        m = mtime(path)
-        if _CACHE.get(path, (None,))[0] != m:
-            try:
-                t = json.load(open(path)).get("tracks")
-            except (OSError, ValueError, AttributeError):
-                t = None
-            _CACHE[path] = (m, t if isinstance(t, dict) else {})
-        out[repo] = _CACHE[path][1]
-    return out
-
-
-def handoffs(bds, now):
-    """[(when, word, repo, track, row)] newest first, within RECENT."""
-    out = []
-    for repo, tracks in bds.items():
-        for name, row in tracks.items():
-            if not isinstance(row, dict):
-                continue
-            ev = [(ts(row.get("created")), "added")]
-            for n in row.get("notes") or []:
-                if isinstance(n, dict) and str(n.get("msg", "")).startswith("dispatched"):
-                    ev.append((ts(n.get("ts")), "dispatched"))
-            if row.get("agent_at"):
-                ev.append((ts(row.get("agent_at")), "taken"))
-            when, word = max(ev)
-            if when and now - when <= RECENT:
-                out.append((when, word, repo, name, row))
-    return sorted(out, key=lambda e: e[0], reverse=True)
-
-
-def procs(proc="/proc"):
-    """(live tracks {repo/track}, {pid: (ppid, comm)}) from one pass over /proc."""
-    live, table, root = set(), {}, wt_root().rstrip("/") + "/"
-    for pid in os.listdir(proc):
-        if not pid.isdigit():
-            continue
-        try:
-            comm = open(f"{proc}/{pid}/comm").read().strip()
-            ppid = next(ln.split()[1] for ln in open(f"{proc}/{pid}/status") if ln.startswith("PPid:"))
-            argv = open(f"{proc}/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
-        except (OSError, StopIteration):
-            continue
-        table[pid] = (ppid, comm)
-        for i, a in enumerate(argv):
-            if os.path.basename(a) == "cc-loop" and len(argv) > i + 2 and argv[i + 1] and argv[i + 2]:
-                live.add(f"{argv[i + 1]}/{argv[i + 2]}")
-                break
-        if comm == "claude":
-            try:
-                cwd = os.readlink(f"{proc}/{pid}/cwd")
-            except OSError:
-                continue
-            if cwd.startswith(root):
-                live.add("/".join(cwd[len(root):].split("/")[:2]))
-    return live, table
-
-
-def laptop_line():
-    """cc-suites status's one line, or one saying the runner gave none; never waits more than 6 s."""
-    exe = os.environ.get("CC_LIVE_SUITES") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-suites")
-    try:
-        r = subprocess.run([exe, "status"], capture_output=True, text=True, timeout=6, stdin=subprocess.DEVNULL,
-                           env={**os.environ, "CC_SUITES_STATUS_TIMEOUT": "5s"})
-        return (r.stdout.strip().splitlines() or ["cc-suites status printed nothing"])[-1]
-    except (OSError, subprocess.SubprocessError):
-        return "the laptop runner did not answer in 6 s"
-
-
-def spilled(proc="/proc"):
-    """Names of the checks the lander has out on the laptop: the argv of run.laptop_argv, `ssh … job NAME TREE CAP RUN CWD`."""
-    out = []
-    for pid in os.listdir(proc):
-        try:
-            argv = open(f"{proc}/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")[:-1]
-        except OSError:
-            continue
-        if len(argv) > 6 and os.path.basename(argv[0]) == "ssh" and argv[-6] == "job" and "BatchMode=yes" in argv:
-            out.append(f"{argv[-5]} {argv[-4][:8]}")
-    return sorted(out)
-
-
-def laptop_done(n=5, scan=300):
-    """The last n checks the laptop finished, newest first: (mtime, check, job dir, status). Stats every result file
-    (cheap), opens only the newest `scan` of them and stops at n laptop ones."""
-    files = []
-    for p in glob.glob(f"{land_dir()}/jobs/*/results/*/*.json"):
-        m = mtime(p)
-        if m:
-            files.append((m, p))
-    out = []
-    for m, p in sorted(files, reverse=True)[:scan]:
-        try:
-            d = json.load(open(p))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(d, dict) or not str(d.get("runner", "")).startswith("laptop"):
-            continue
-        parts = p.split("/")
-        out.append((m, str(d.get("check") or parts[-2]), parts[-4], str(d.get("status", "?"))))
-        if len(out) >= n:
-            break
-    return out
-
-
-def has_claude(pane_pid, table):
-    """Whether a `claude` is that pane's own process or runs anywhere under it."""
-    if table.get(str(pane_pid), ("", ""))[1] == "claude":
-        return True
-    kids = {}
-    for pid, (ppid, _) in table.items():
-        kids.setdefault(ppid, []).append(pid)
-    todo, seen = [str(pane_pid)], set()
-    while todo:
-        p = todo.pop()
-        if p in seen:
-            continue
-        seen.add(p)
-        for k in kids.get(p, []):
-            if table[k][1] == "claude":
-                return True
-            todo.append(k)
-    return False
-
-
-def windows():
-    """[(name, activity epoch, pane pid)] of the tmux session, or None when there is no such session."""
-    sess = os.environ.get("CC_TMUX_SESSION") or "main"
-    try:
-        r = subprocess.run(["tmux", "list-windows", "-t", sess, "-F", "#W\t#{window_activity}\t#{pane_pid}"],
-                           capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
+def resolve(word, p):
+    """A typed word as a view: a project's name first (exact), then a section whose name it starts, then a project
+    whose name it starts; None when nothing matches."""
+    w = word.strip().lower()
+    repos = [r["repo"] for r in (p or {}).get("projects") or []]
+    if not w:
         return None
-    if r.returncode:
-        return None
-    out = []
-    for ln in r.stdout.splitlines():
-        p = ln.split("\t")
-        if len(p) == 3 and p[1].isdigit():
-            out.append((p[0], int(p[1]), p[2]))
-    return out
+    if w in repos:
+        return ("section", "project", w)
+    for name, view in WORDS.items():
+        if name.startswith(w):
+            return view
+    for r in repos:
+        if r.startswith(w):
+            return ("section", "project", r)
+    return None
 
 
-def seat_state(name, activity, pane_pid, table, now):
-    """'offline' | 'idle 12m' | 'working' for one window."""
-    if not has_claude(pane_pid, table):
-        return "offline"
-    if now - activity >= IDLE:
-        return f"idle {ago(now - activity)}"
-    return "working"
+# ── the feed: the pulse, in memory ────────────────────────────────────────────────────────────────────────────
+class Feed:
+    """The latest pulse and a version that moves with it. follow() keeps them current from pulse.json while that is
+    fresh, and otherwise runs cc-pulse's own feed here."""
 
+    def __init__(self, proc="/proc"):
+        self.p, self.version, self.done, self.proc, self.local, self.err = None, 0, False, proc, False, None
 
-def shown(name):
-    """An orch window `repo@alias` is typed `alias@repo`; everything else as tmux names it."""
-    if "@" in name and "/" not in name:
-        repo, alias = name.split("@", 1)
-        return f"{alias}@{repo}"
-    return name
+    def put(self, p):
+        self.p = p
+        self.version += 1
 
-
-def landings():
-    out = []
-    for path in glob.glob(f"{land_dir()}/*.json"):
+    def follow(self):
+        """Follow pulse.json, or collect here; if either raises, the error goes on screen instead of a silent stop."""
         try:
-            j = json.load(open(path))
-        except (OSError, ValueError):
-            continue
-        if isinstance(j, dict) and j.get("repo") and j.get("pr"):
-            out.append((mtime(path), j))
-    return sorted(out, key=lambda e: e[0], reverse=True)
+            self._follow()
+        except Exception as e:
+            self.err = f"{type(e).__name__}: {e}"[:100]
+            self.version += 1
 
-
-def limit_until():
-    try:
-        v = json.load(open(f"{state_dir()}/reconcile.json")).get("limit_until")
-        return float(v) if v else 0
-    except (OSError, ValueError, TypeError, AttributeError):
-        return 0
-
-
-# ── the frame ─────────────────────────────────────────────────────────────────────────────────────────────────
-MENU = (("PRs landed", ("prs",)), ("landings graph", ("graph",)), ("timeline", ("timeline",)))
-
-
-def frame(now=None, proc="/proc", width=120, items=None):
-    """The dashboard's lines. With a list for `items`, it also opens with the menu line and collects what the cursor
-    can land on there, as (line, first column, end column, view) in screen order."""
-    now = now or time.time()
-    sel = items if items is not None else []
-    bds = boards()
-    live, table = procs(proc)
-    B, D, R = ("\033[1m", "\033[2m", "\033[0m") if os.environ.get("CC_LIVE_PLAIN") != "1" else ("", "", "")
-    out = [f"{B}{os.uname().nodename}{R}  {time.strftime('%H:%M:%S %Z', time.localtime(now))}"
-           f"  load {open('/proc/loadavg').read().split()[0] if os.path.exists('/proc/loadavg') else '?'}"]
-    if items is not None:
-        cells = [f"[ {name} ]" for name, _ in MENU]
-        col = 2
-        for c, (_, view) in zip(cells, MENU):
-            sel.append((len(out), col, col + len(c), view))
-            col += len(c) + 2
-        out.append("  " + "  ".join(cells))
-    lu = limit_until()
-    if lu > now:
-        out.append(f"⏳ usage limit holds work until {time.strftime('%H:%M', time.localtime(lu))}")
-
-    out.append("")
-    out.append(f"{B}HANDED OFF{R} {D}(last 24 h, newest first){R}")
-    ho = handoffs(bds, now)
-    for when, word, repo, name, row in ho[:SHOW_HANDOFFS]:
-        mark = "NEW " if now - when < NEW else "    "
-        sel.append((len(out), 2, width, ("worker", repo, name)))
-        out.append(f"  {mark}{ago(now - when):>4} ago  {word:<10} {repo}/{name}  "
-                   f"{D}[{row.get('status', '?')}]{R} {row.get('title') or ''}")
-    if not ho:
-        out.append("  (nothing in the last day)")
-
-    out.append("")
-    out.append(f"{B}RUNNING{R} {D}(board rows marked running){R}")
-    n, held = 0, []
-    for repo, tracks in sorted(bds.items()):
-        for name, row in sorted(tracks.items()):
-            if not isinstance(row, dict) or row.get("status") != "running" or row.get("kind") == "session":
-                continue
-            key = f"{repo}/{name}"
-            if key in live:
-                d = f"{state_dir()}/{repo}/{name}"
-                last = max(mtime(f"{d}/loop.log"), mtime(f"{d}/progress.md"))
-                st = f"live, moved {ago(now - last)} ago" if last else "live"
-            elif str(row.get("agent") or "").rpartition(":")[2] in table:   # `agent me`: a live session works it itself
-                st = "worked by a session (agent mark)"
-            elif row.get("held"):          # a person parked it on purpose: named on one line, not an alarm
-                held.append(key)
-                continue
+    def _follow(self):
+        path = P.out_path()
+        w = P.Watch()
+        try:
+            w.add(os.path.dirname(path))
+            while not self.done:
+                try:
+                    with open(path) as f:
+                        p = json.load(f)
+                except (OSError, ValueError):
+                    p = None
+                if not isinstance(p, dict) or time.time() - (p.get("at") or 0) >= P.AMBER:
+                    break                          # nobody keeps the file current: collect here
+                self.put(p)
+                w.wait(1.0)
             else:
-                st = "OFFLINE: marked running, no process"
-            n += 1
-            sel.append((len(out), 2, width, ("worker", repo, name)))
-            out.append(f"  {key}  {D}{st}{R}")
-    if held:
-        out.append(f"  {D}held on purpose, no process: {', '.join(held)}{R}")
-    if not n and not held:
-        out.append("  (nothing)")
+                return
+        finally:
+            w.close()
+        self.local = True
+        P.feed(self.put, lambda: self.done, self.proc)
 
-    out.append("")
-    out.append(f"{B}SEATS, ORCHS AND SESSIONS{R} {D}(tmux; idle = nothing printed for {IDLE // 60} min){R}")
-    ws = windows()
-    if ws is None:
-        out.append("  tmux has no session — every seat is offline")
-    else:
-        cells, left = [], 0
-        for name, act, pid in sorted(ws, key=lambda w: ("/" in w[0], "@" not in w[0], w[0])):
-            if name.startswith("_"):       # a selftest's throwaway window, like the `_` boards
-                continue
-            st = seat_state(name, act, pid, table, now)
-            if st == "offline" and "/" in name:   # a track window left open after its session ended
-                left += 1
-                continue
-            cells.append((f"{shown(name)[:30]:<30} {st:<9}", name))
-        cols = max(1, width // 44)
-        rows = -(-len(cells) // cols)
-        for i in range(rows):
-            col = 2
-            for c, name in cells[i::rows]:
-                sel.append((len(out), col, col + len(c), ("seat", name)))
-                col += len(c) + 3
-            out.append("  " + "   ".join(c for c, _ in cells[i::rows]).rstrip())
-        if left:
-            out.append(f"  {D}and {left} track window(s) whose session has ended{R}")
-
-    out.append("")
-    out.append(f"{B}LANDING{R}")
-    ld, bulk = landings(), {}
-    for m, j in ld:
-        stage = j.get("stage") or j.get("state") or "?"
-        if stage in ("queued", "install"):   # waiting its turn, or merged and waiting to deploy: one line each
-            bulk.setdefault(stage, []).append(f"{j['repo']}#{j['pr']}")
-            continue
-        sel.append((len(out), 2, width, ("landing", j["repo"], str(j["pr"]))))
-        out.append(f"  {j['repo']}#{j['pr']}  {stage:<9} {D}{ago(now - m)}{R} {j.get('title') or ''}")
-    for stage, prs in sorted(bulk.items(), reverse=True):
-        word = "queued" if stage == "queued" else "merged, waiting to deploy"
-        out.append(f"  {word} ({len(prs)}): {' '.join(prs)}")
-    if not ld:
-        out.append("  (queue empty)")
-
-    out.append("")
-    out.append(f"{B}LAPTOP{R}")
-    out.append(f"  {laptop_line()}")
-    sp = spilled(proc)
-    out.append(f"  running there now ({len(sp)}): {', '.join(sp)}" if sp else "  nothing spilled there now")
-    done = laptop_done()
-    if done:
-        out.append("  last finished there:")
-        for m, chk, job, st in done:
-            out.append(f"    {time.strftime('%H:%M', time.localtime(m))}  {chk}  {job}  {st}")
-    return out
+    def start(self):
+        threading.Thread(target=self.follow, daemon=True).start()
+        return self
 
 
-# ── the views Enter opens ─────────────────────────────────────────────────────────────────────────────────────
-_LOG = {"ino": None, "off": 0, "landed": {}}
-_TITLES = {}
-
-
-def landed():
-    """[(epoch, repo, pr)] of every PR the queue log says landed, newest first. The log is read on from the offset the
-    last call stopped at; a log that was replaced or cut short is read again from the top."""
-    path = f"{land_dir()}/queue.log"
-    try:
-        st = os.stat(path)
-    except OSError:
-        return []
-    if st.st_ino != _LOG["ino"] or st.st_size < _LOG["off"]:
-        _LOG.update(ino=st.st_ino, off=0, landed={})
-    if st.st_size > _LOG["off"]:
-        with open(path, "rb") as f:
-            f.seek(_LOG["off"])
-            data = f.read()
-        cut = data.rfind(b"\n") + 1            # a half-written last line is read whole next time
-        _LOG["off"] += cut
-        for ln in data[:cut].decode("utf-8", "replace").splitlines():
-            stamp, _, rest = ln.partition("\t")
-            w = rest.split()
-            if len(w) < 3 or (w[0], w[2]) not in (("stage", "merged"), ("notify", "landed")):
-                continue
-            repo, _, pr = w[1].rpartition("#")
-            when = ts(stamp)
-            if repo and not repo.startswith("_") and pr.isdigit() and when:
-                k = (repo, pr)
-                _LOG["landed"][k] = min(when, _LOG["landed"].get(k, when))
-    return sorted(((t, r, p) for (r, p), t in _LOG["landed"].items()), reverse=True)
-
-
-def job(repo, pr):
-    """The lander's record of repo#pr, in flight or ended, or {}."""
-    for path in (f"{land_dir()}/{repo}-{pr}.json", f"{land_dir()}/rest/{repo}-{pr}.json"):
-        try:
-            j = json.load(open(path))
-        except (OSError, ValueError):
-            continue
-        if isinstance(j, dict):
-            return j
-    return {}
-
-
-def title(repo, pr):
-    k = (repo, pr)
-    if not _TITLES.get(k):                 # a PR with no record yet is looked up again next time
-        _TITLES[k] = str(job(repo, pr).get("title") or "")
-    return _TITLES[k]
+# ── the deeper views, read when opened ────────────────────────────────────────────────────────────────────────
+def tail(path, n):
+    b = P.read_capped(path)                # a regular file only, and capped: never a FIFO or /dev/zero
+    return b.decode("utf-8", "replace").splitlines()[-n:] if b is not None else []
 
 
 def local(t, fmt="%m-%d %H:%M"):
     return time.strftime(fmt, time.localtime(t))
 
 
+def plain(lines):
+    return [(ln, "bold" if ln and not ln.startswith(" ") else "") for ln in lines], []
+
+
 def view_prs(now, width):
-    ls = landed()
+    ls = P.landed()
     out = [f"PRs LANDED ({len(ls)}, newest first; from the lander's queue log)", ""]
     for t, repo, pr in ls:
-        out.append(f"  {local(t)}  {ago(now - t):>4} ago  {repo}#{pr}  {title(repo, pr)}")
-    return out if ls else out + ["  (the queue log records no landing)"]
+        if not P.is_member(repo):
+            out.append(f"  {local(t)}  {ago(now - t):>4} ago  {repo}#{pr}  {P.job(repo, pr).get('title') or ''}")
+    return plain(out if ls else out + ["  (the queue log records no landing)"])
 
 
 def view_graph(now, width, hours):
@@ -479,7 +160,7 @@ def view_graph(now, width, hours):
     top = int(now // 3600) * 3600
     first = top - (hours - 1) * 3600      # the oldest bar's hour starts here, and a landing on that second is in it
     counts = {}
-    for t, _, _ in landed():
+    for t, _, _ in P.landed():
         h = int(t // 3600) * 3600
         if first <= h <= top:
             counts[h] = counts.get(h, 0) + 1
@@ -490,7 +171,7 @@ def view_graph(now, width, hours):
     for h in range(first, top + 1, 3600):
         n = counts.get(h, 0)
         out.append(f"  {local(h, '%a %H:00')}  {bar * (-(-n * room // peak) if n else 0)}{' ' + str(n) if n else ''}")
-    return out
+    return plain(out)
 
 
 _LOOPS = {}
@@ -501,11 +182,7 @@ def loop_events(path):
     m = mtime(path)
     if _LOOPS.get(path, (None,))[0] != m:
         ev = []
-        try:
-            lines = open(path, errors="replace").read().splitlines()
-        except OSError:
-            lines = []
-        for ln in lines:
+        for ln in tail(path, 100000):
             stamp, _, msg = ln.partition(" ")
             when = ts(stamp)
             if not when:
@@ -521,21 +198,22 @@ def loop_events(path):
 def timeline(now, span=RECENT):
     """[(epoch, word, text)] newest first: hand-offs, landings, and worker loops starting and stopping."""
     ev = []
-    for repo, tracks in boards().items():
+    for repo, tracks in P.boards().items():
+        if P.is_member(repo):
+            continue
         for name, row in tracks.items():
-            if not isinstance(row, dict):
-                continue
             ev.append((ts(row.get("created")), "added", f"{repo}/{name}  {row.get('title') or ''}"))
             for n in row.get("notes") or []:
                 if isinstance(n, dict) and str(n.get("msg", "")).startswith("dispatched"):
                     ev.append((ts(n.get("ts")), "dispatched", f"{repo}/{name}"))
             ev.append((ts(row.get("agent_at")), "taken", f"{repo}/{name}"))
-    for t, repo, pr in landed():
-        ev.append((t, "landed", f"{repo}#{pr}  {title(repo, pr)}"))
+    for t, repo, pr in P.landed():
+        if not P.is_member(repo):
+            ev.append((t, "landed", f"{repo}#{pr}  {P.job(repo, pr).get('title') or ''}"))
     for path in glob.glob(f"{state_dir()}/*/*/loop.log"):
-        if now - mtime(path) > span:
-            continue
         key = "/".join(path.split("/")[-3:-1])
+        if now - mtime(path) > span or P.is_member(key.split("/")[0]):
+            continue
         for t, word, why in loop_events(path):
             ev.append((t, f"worker {word}", f"{key}  {why}".rstrip()))
     return sorted((e for e in ev if e[0] and 0 <= now - e[0] <= span), key=lambda e: e[0], reverse=True)
@@ -544,20 +222,13 @@ def timeline(now, span=RECENT):
 def view_timeline(now, width):
     ev = timeline(now)
     out = [f"TIMELINE, last {RECENT // 3600} h ({len(ev)} events, newest first)", ""]
-    return out + ([f"  {local(t, '%H:%M')}  {word:<15} {text}" for t, word, text in ev] or ["  (nothing)"])
-
-
-def tail(path, n):
-    try:
-        return open(path, errors="replace").read().splitlines()[-n:]
-    except OSError:
-        return []
+    return plain(out + ([f"  {local(t, '%H:%M')}  {word:<15} {text}" for t, word, text in ev] or ["  (nothing)"]))
 
 
 def view_worker(now, width, repo, name):
-    row = boards().get(repo, {}).get(name)
-    if not isinstance(row, dict):
-        return [f"{repo}/{name}", "", "  (no such row on the board now)"]
+    row = P.boards().get(repo, {}).get(name)
+    if not isinstance(row, dict) or P.is_member(repo):
+        return plain([f"{repo}/{name}", "", "  (no such row on the board now)"])
     out = [f"{repo}/{name}  [{row.get('status', '?')}]  {row.get('title') or ''}", ""]
     for k in ("kind", "created", "agent", "agent_at", "held", "pr"):
         if row.get(k):
@@ -572,13 +243,13 @@ def view_worker(now, width, repo, name):
         if ls:
             out += ["", f"{f.upper()} (last {len(ls)} lines, moved {ago(now - mtime(f'{d}/{f}'))} ago)"]
             out += [f"  {ln}" for ln in ls]
-    return out
+    return plain(out)
 
 
 def view_landing(now, width, repo, pr):
-    j = job(repo, pr)
-    if not j:
-        return [f"{repo}#{pr}", "", "  (the lander has no record of it now)"]
+    j = P.job(repo, pr)
+    if not j or P.is_member(repo):
+        return plain([f"{repo}#{pr}", "", "  (the lander has no record of it now)"])
     out = [f"{repo}#{pr}  {j.get('title') or ''}", ""]
     for k in ("stage", "state", "branch", "who", "queued_at", "attempts", "why"):
         if j.get(k) not in (None, ""):
@@ -587,40 +258,123 @@ def view_landing(now, width, repo, pr):
     if hist:
         out += ["", "HISTORY"]
         out += [f"  {str(h.get('at', ''))[:16]}  {h.get('state', '')}  {h.get('why', '')}".rstrip() for h in hist]
-    return out
+    return plain(out)
 
 
-def view_seat(now, width, name, proc="/proc"):
-    _, table = procs(proc)
-    w = [x for x in windows() or [] if x[0] == name]
-    if not w:
-        return [shown(name), "", "  (no such window now)"]
-    out = [f"{shown(name)}  {seat_state(name, w[0][1], w[0][2], table, now)}", "",
-           "WHAT ITS PANE SHOWS (last lines)"]
-    sess = os.environ.get("CC_TMUX_SESSION") or "main"
-    try:
-        r = subprocess.run(["tmux", "capture-pane", "-p", "-t", f"{sess}:={name}"],
-                           capture_output=True, text=True, timeout=10)
-        pane = [ln.rstrip() for ln in r.stdout.splitlines()] if not r.returncode else []
-    except (OSError, subprocess.TimeoutExpired):
-        pane = []
+def view_session(now, width, sid, p):
+    s = next((x for x in (p or {}).get("sessions") or [] if x["id"] == sid), None)
+    if not s:
+        return plain([f"session {sid}", "", "  (it is not on the pulse now: ended, or a member's)"])
+    out = [f"{s['name']}  {s['state']} {ago(s['since_s']) if s['since_s'] is not None else ''}  "
+           f"{s['repo']}{'/' + s['track'] if s['track'] else ''}  ctx {s['ctx_pct'] if s['ctx_pct'] is not None else '?'}%",
+           "", "WHAT ITS PANE SHOWS (last lines; t switches to it)"]
+    pane = []
+    if s.get("win"):
+        try:
+            r = subprocess.run(["tmux", "capture-pane", "-p", "-t", s["win"]], capture_output=True, text=True, timeout=5)
+            pane = [ln.rstrip() for ln in r.stdout.splitlines()] if not r.returncode else []
+        except (OSError, subprocess.TimeoutExpired):
+            pane = []
     while pane and not pane[-1]:
         pane.pop()
-    return out + ([f"  {ln}" for ln in pane[-40:]] or ["  (tmux gave nothing back)"])
+    return plain(out + ([f"  {ln}" for ln in pane[-40:]] or ["  (tmux gave nothing back)"]))
 
 
-def render(view, now, proc, width, hours):
-    """(lines, items) for one view; only the home view has items."""
+def view_board(now, width, repo):
+    """No repo: each project's rows by status, one line each (Enter opens it). A repo: its open rows."""
+    bds = {r: t for r, t in P.boards().items() if not P.is_member(r)}
+    if not repo:
+        lines, items = [("BOARD (open rows by status; Enter opens a project's rows)", "bold")], []
+        for r, tracks in sorted(bds.items()):
+            st = [x.get("status") for x in tracks.values()]
+            n = {s: st.count(s) for s in P.OPEN if st.count(s)}
+            if n:
+                items.append((len(lines), ("board", r)))
+                lines.append((f"  {r:<22} " + "  ".join(f"{s} {c}" for s, c in n.items()), ""))
+        return lines, items
+    order = ("running", "blocked", "waiting", "review", "queued", "held")     # what moves, then what is stuck
+    rows = sorted(((x.get("status"), k, x) for k, x in bds.get(repo, {}).items() if x.get("status") in order),
+                  key=lambda e: (order.index(e[0]), e[1]))
+    lines, items = [(f"BOARD {repo}: {len(rows)} open rows (Enter opens one)", "bold")], []
+    for st, k, x in rows:
+        items.append((len(lines), ("worker", repo, k)))
+        lines.append((P.cut(f"  {st:<8} {k:<34} {x.get('title') or ''}", width), "bad" if st == "blocked" else ""))
+    return lines, items
+
+
+def run_lines(argv, timeout=15):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return (r.stdout + r.stderr).rstrip().splitlines() or ["(it printed nothing)"]
+    except (OSError, subprocess.SubprocessError) as e:
+        return [f"(could not run {os.path.basename(argv[0])}: {type(e).__name__})"]
+
+
+def view_failures(now, width):
+    exe = os.environ.get("CC_LIVE_FAILURES") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-failures")
+    return plain(["FAILURES (cc-failures show)", ""] + [f"  {ln}" for ln in run_lines([exe, "show"])])
+
+
+def view_models(now, width):
+    hs = P.home_state()
+    out = [f"MODEL  {P.model(now)}  (cc-model's override; 'default' when none holds)", ""]
+    out += ["MODEL LOG (last 8 lines)"] + [f"  {ln}" for ln in tail(f"{state_dir()}/model.log", 8)]
+    sp = hs.get("spend") if isinstance(hs.get("spend"), dict) else {}
+    out += ["", f"SPEND  today ${sp.get('today') or 0:.2f} · this week ${sp.get('week') or 0:.2f}"]
+    for r in (sp.get("rows") or [])[:15]:
+        if isinstance(r, dict) and not P.is_member(str(r.get("who")).partition("/")[0]):
+            out.append(f"  {str(r.get('who'))[:30]:<30} ${r.get('usd') or 0:>8.2f}  {r.get('tok') or ''}")
+    return plain(out)
+
+
+DEEP = {"prs": lambda v, now, w, h, p: view_prs(now, w), "graph": lambda v, now, w, h, p: view_graph(now, w, h),
+        "timeline": lambda v, now, w, h, p: view_timeline(now, w),
+        "worker": lambda v, now, w, h, p: view_worker(now, w, v[1], v[2]),
+        "landing": lambda v, now, w, h, p: view_landing(now, w, v[1], v[2]),
+        "session": lambda v, now, w, h, p: view_session(now, w, v[1], p),
+        "board": lambda v, now, w, h, p: view_board(now, w, v[1]),
+        "failures": lambda v, now, w, h, p: view_failures(now, w),
+        "models": lambda v, now, w, h, p: view_models(now, w)}
+
+
+class Deep:
+    """The deeper views, each built in a thread when opened and kept until it is opened again; get() never waits."""
+
+    def __init__(self):
+        self.got, self.busy, self.version = {}, set(), 0
+
+    def get(self, view, width, hours, p, fresh=False):
+        key = view + ((hours,) if view[0] == "graph" else ())
+        if (fresh or key not in self.got) and key not in self.busy:
+            self.busy.add(key)
+
+            def go():
+                try:
+                    self.got[key] = DEEP[view[0]](view, time.time(), width, hours, p)
+                except Exception as e:      # a view that fails says so; it never takes the screen down
+                    self.got[key] = plain([f"{view[0]}: {type(e).__name__}: {e}"])
+                self.busy.discard(key)
+                self.version += 1
+            threading.Thread(target=go, daemon=True).start()
+        return self.got.get(key) or ([("reading…", "dim")], [])
+
+
+def render(view, p, deep, width, rows, hours, err=None):
+    """(lines, items) of a view: home and the sections straight from the pulse, the rest from Deep. `err` is the
+    feed's error once it has stopped: it heads every view, since nothing on screen will move again."""
+    if err:
+        stop = (P.cut(f"PULSE STOPPED ({err}); restart cc-live", width), "bad")
+        if p is None:
+            return [stop], []
+        lines, items = render(view, p, deep, width, rows - 1, hours)
+        return [stop] + lines, [(i + 1, t) for i, t in items]
+    if p is None:
+        return [("waiting for the first pulse…", "dim")], []
     if view[0] == "home":
-        items = []
-        return frame(now, proc, width, items), items
-    lines = {"prs": lambda: view_prs(now, width),
-             "graph": lambda: view_graph(now, width, hours),
-             "timeline": lambda: view_timeline(now, width),
-             "worker": lambda: view_worker(now, width, *view[1:]),
-             "landing": lambda: view_landing(now, width, *view[1:]),
-             "seat": lambda: view_seat(now, width, view[1], proc)}[view[0]]()
-    return lines, []
+        return P.home(p, width, rows + 1)     # rows is the screen less its footer; home counts the footer in
+    if view[0] == "section":
+        return P.section(p, view[1], width, view[2] if len(view) > 2 else None)
+    return deep.get(view, width, hours, p)
 
 
 # ── the cursor ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -629,93 +383,118 @@ BACK = (27, 8, 127, curses.KEY_BACKSPACE, curses.KEY_LEFT)
 
 
 class Nav:
-    """Where the owner is: a stack of views (home at the bottom), the cursor on home, and each view's scroll. key()
-    changes that and says 'quit', 'open' (the view changed: render again) or None; it draws nothing, so the selfcheck
-    drives it with key codes and no terminal."""
+    """Where the owner is: a stack of views (home at the bottom), each with its cursor and scroll, and the command
+    line when it is open. key() changes that and says 'quit', 'open' (a view was opened), 'tmux' (switch to the
+    selected session) or None; it draws nothing, so the selfcheck drives it with key codes and no terminal."""
 
     def __init__(self):
-        self.stack, self.saved, self.cur, self.top, self.hours = [("home",)], [], 0, 0, 24
-        self.pin = None                    # (cursor, its line, rows) when top last followed the cursor
+        self.stack, self.cur, self.top, self.hours, self.cmd = [("home",)], [0], [0], 24, None
 
     @property
     def view(self):
         return self.stack[-1]
 
-    def key(self, k, items, nlines, rows):
-        if len(self.stack) == 1:
-            return self.home_key(k, items, nlines, rows)
-        if k in BACK + (ord("q"), ord("Q")):          # "Esc or Backspace goes back": from any view, to the one below
-            self.stack.pop()
-            self.cur, self.top = self.saved.pop()
-            return "open"
-        step = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1,
-                curses.KEY_PPAGE: -rows, curses.KEY_NPAGE: rows, curses.KEY_HOME: -nlines}.get(k)
-        if step:
-            self.top = max(0, min(max(0, nlines - rows), self.top + step))
-        elif self.view[0] == "graph" and k in (ord("+"), ord("="), ord("-")):
+    def go(self, view):
+        if view == ("home",):
+            del self.stack[1:], self.cur[1:], self.top[1:]
+        elif view != self.view:
+            self.stack.append(view), self.cur.append(0), self.top.append(0)
+        return "open"
+
+    def key(self, k, items, nlines, rows, p=None):
+        if self.cmd is not None:                       # the command line takes every key until Enter or Esc
+            if k in ENTER:
+                v, self.cmd = resolve(self.cmd, p), None
+                return self.go(v) if v else None
+            if k == 27:
+                self.cmd = None
+            elif k in (8, 127, curses.KEY_BACKSPACE):
+                self.cmd = self.cmd[:-1]
+            elif 32 <= k < 127:
+                self.cmd += chr(k)
+            return None
+        if k in (ord(":"), ord("/")):
+            self.cmd = ""
+            return None
+        if k in (ord("q"), ord("Q")) and len(self.stack) == 1:
+            return "quit"
+        if k in BACK + (ord("q"), ord("Q")):           # "Esc or Backspace goes back": from any view, to the one below
+            if len(self.stack) > 1:
+                self.stack.pop(), self.cur.pop(), self.top.pop()
+                return "open"
+            return None
+        if k == ord("h"):
+            return self.go(("home",))
+        if self.view[0] == "graph" and k in (ord("+"), ord("="), ord("-")):
             self.hours = max(6, min(168, self.hours // 2 if k == ord("-") else self.hours * 2))
             return "open"
-        return None
-
-    def home_key(self, k, items, nlines, rows):
-        if k in (ord("q"), ord("Q")):
-            return "quit"
-        step = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_LEFT: -1, curses.KEY_DOWN: 1, ord("j"): 1,
-                curses.KEY_RIGHT: 1, curses.KEY_PPAGE: -rows, curses.KEY_NPAGE: rows}.get(k)
+        if k == ord("r") and self.view == ("section", "recent"):
+            return self.go(("timeline",))              # what the recent heading says: r again, the full timeline
+        if k in SECTIONS:
+            v = SECTIONS[k]
+            if v == ("board", "") and self.view[:2] == ("section", "project"):
+                v = ("board", self.view[2])            # b in a project opens that project's rows
+            return self.go(v)
+        sel = items[self.cur[-1]][1] if items and self.cur[-1] < len(items) else None
+        if k == ord("t"):
+            return "tmux" if sel and sel[0] == "session" or self.view[0] == "session" else None
+        step = {curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1}.get(k)
+        page = {curses.KEY_PPAGE: -rows, curses.KEY_NPAGE: rows}.get(k)
         if step and items:
-            last, line = len(items) - 1, items[self.cur][0]
-            far = max(0, nlines - rows)
-            if step > 0 and self.cur == last and line < nlines - 1 and self.top < far:
-                self.top = min(far, self.top + step)      # the last item: the sections below scroll into view
-            elif step < 0 and self.cur == last and line < self.top:
-                self.top = max(max(0, line - rows + 1), self.top + step)    # ...and scroll back until it shows
+            self.cur[-1] = max(0, min(len(items) - 1, self.cur[-1] + step))
+        elif page and items:                           # the page moves and the cursor goes with it, so fit() keeps it
+            old, top = self.top[-1], max(0, min(max(0, nlines - rows), self.top[-1] + page))
+            lo = top + 1 if top else 0                 # fit() keeps one line above the cursor
+            on = [i for i, (ln, _) in enumerate(items) if lo <= ln < top + rows]
+            if top == old:                             # already at the end (or the start): to the last (first) row
+                self.cur[-1] = len(items) - 1 if page > 0 else 0
+            elif on:
+                self.cur[-1] = on[0]
+            elif page > 0:
+                self.cur[-1] = next((i for i, (ln, _) in enumerate(items) if ln >= lo), len(items) - 1)
             else:
-                self.cur = max(0, min(last, self.cur + step))
+                self.cur[-1] = max((i for i, (ln, _) in enumerate(items) if ln < top + rows), default=0)
+            self.top[-1] = top
+        elif step or page:
+            self.top[-1] = max(0, min(max(0, nlines - rows), self.top[-1] + (step or page)))
         elif k == curses.KEY_HOME:
-            self.cur, self.top = 0, 0
-        elif k in ENTER and items and not self.top <= items[self.cur][0] < self.top + rows:
-            line = items[self.cur][0]                 # never open what is off screen: bring it back into view first
-            self.top = max(0, line - rows + 1)
-        elif k in ENTER and items:                    # "click enter to see more details"
-            self.saved.append((self.cur, self.top))
-            self.stack.append(items[self.cur][3])
-            self.top = 0
-            return "open"
+            self.cur[-1], self.top[-1] = 0, 0
+        elif k in ENTER and sel:
+            return self.go(sel)
         return None
 
     def fit(self, items, nlines, rows):
-        """Keep the cursor on an item and its line on screen, after a refresh or a resize moved things."""
-        if len(self.stack) > 1:
-            self.top = max(0, min(self.top, nlines - rows))
-            return
-        self.cur = max(0, min(self.cur, len(items) - 1))
-        if items and self.pin != (self.cur, items[self.cur][0], rows):      # moved, resized or its line moved
-            line, was = items[self.cur][0], self.pin
-            self.pin = (self.cur, line, rows)
-            if was and was[0::2] == (self.cur, rows) and was[1] < self.top + 1:
-                self.top += line - was[1]         # scrolled past it and only its line moved: keep the offset
-            elif line < self.top + 1:
-                self.top = max(0, line - 1)
-            elif line >= self.top + rows:
-                self.top = line - rows + 1
-        self.top = max(0, min(self.top, max(0, nlines - rows)))
+        """Keep the cursor on an item and its line on screen, after a change or a resize moved things."""
+        if items:
+            self.cur[-1] = max(0, min(self.cur[-1], len(items) - 1))
+            line = items[self.cur[-1]][0]
+            if line < self.top[-1] + 1:
+                self.top[-1] = max(0, line - 1)
+            elif line >= self.top[-1] + rows:
+                self.top[-1] = line - rows + 1
+        self.top[-1] = max(0, min(self.top[-1], max(0, nlines - rows)))
 
 
-def paint(scr, nav, lines, items, every):
+# Each footer fits 79 columns, so an 80-column terminal shows all of it; the docstring's KEYS list every key, and
+# home names the ones used most, the rest a view deep names only by letter.
+FOOT = "s sess w work n needs l land r recent p proj b board x box : jump q quit"
+FOOT_IN = "Esc back · h home · s w n l r p b f m x P g T · : jump"
+
+
+def paint(scr, nav, lines, items, tones, flash=""):
     h, w = scr.getmaxyx()
     rows = max(1, h - 1)
     scr.erase()
-    hi = items[nav.cur] if items and len(nav.stack) == 1 else None
-    for y, ln in enumerate(lines[nav.top:nav.top + rows]):
-        i = nav.top + y
-        attr = curses.A_BOLD if ln and not ln.startswith(" ") else curses.A_NORMAL
+    hi = items[nav.cur[-1]][0] if items else None
+    for y, (ln, tone) in enumerate(lines[nav.top[-1]:nav.top[-1] + rows]):
+        attr = tones.get(tone, 0) | (curses.A_REVERSE if nav.top[-1] + y == hi else 0)
         put(scr, y, 0, ln[:w - 1], attr)
-        if hi and hi[0] == i:
-            put(scr, y, hi[1], ln[hi[1]:min(hi[2], w - 1)], curses.A_REVERSE)
-    more = f"{nav.top + rows}/{len(lines)} lines · " if len(lines) > nav.top + rows or nav.top else ""
-    keys = ("↑↓ move · Enter open · q or Ctrl-C quit" if len(nav.stack) == 1
-            else "↑↓ PgUp PgDn scroll · Esc/Backspace back" + (" · +/- hours" if nav.view[0] == "graph" else ""))
-    put(scr, h - 1, 0, f"{more}{keys} · refreshes every {every}s"[:w - 1], curses.A_DIM)
+    if nav.cmd is not None:
+        foot = f":{nav.cmd}_   (a section or a project; Enter jumps, Esc cancels)"
+    else:
+        more = f"{nav.top[-1] + rows}/{len(lines)} · " if len(lines) > nav.top[-1] + rows or nav.top[-1] else ""
+        foot = flash or more + (FOOT if len(nav.stack) == 1 else FOOT_IN)
+    put(scr, h - 1, 0, foot[:w - 1], curses.A_DIM)
     scr.refresh()
 
 
@@ -726,41 +505,84 @@ def put(scr, y, x, text, attr):
         pass
 
 
-def ui(scr, every, proc="/proc", clock=time.time):
-    """The navigable view on any screen that has curses' window methods: getch, addstr, getmaxyx, erase, refresh."""
+def colours():
+    """Tone → attribute: at most three colours (red for what needs him or failed, yellow for waiting or stale), and
+    each tone still reads in monochrome because the words carry it."""
+    t = {"": 0, "bold": curses.A_BOLD, "dim": curses.A_DIM, "warn": curses.A_BOLD, "bad": curses.A_BOLD}
+    try:
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_RED, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+            t["bad"], t["warn"] = curses.color_pair(1) | curses.A_BOLD, curses.color_pair(2)
+    except curses.error:
+        pass
+    return t
+
+
+def switch_later(win, flash):
+    """Run switch() in a thread, so a keypress does no I/O; its answer reaches the footer through `flash`, a list
+    [text, until (monotonic), version] the loop redraws on."""
+    flash[:] = ["switching to the session's window…", time.monotonic() + 3, flash[2] + 1]
+
+    def go():
+        why = switch(win)
+        flash[:] = [why, time.monotonic() + (3 if why else 0), flash[2] + 1]
+    threading.Thread(target=go, daemon=True).start()
+
+
+def switch(win):
+    """Point this tmux client at a window; a line saying why not when it cannot."""
+    if not os.environ.get("TMUX"):
+        return "t needs cc-live running inside tmux"
+    try:
+        r = subprocess.run(["tmux", "switch-client", "-t", win], capture_output=True, text=True, timeout=3)
+        return "" if not r.returncode else f"tmux: {r.stderr.strip()[:60]}"
+    except (OSError, subprocess.TimeoutExpired):
+        return "tmux did not answer"
+
+
+def ui(scr, feed, deep=None, clock=time.time, tones=None, timing=None):
+    """The navigable view on any screen that has curses' window methods: getch, addstr, getmaxyx, erase, refresh.
+    It draws when the pulse or a deeper view changes, when a key is pressed, and once a second for the clock."""
     try:
         curses.curs_set(0)
     except curses.error:
         pass
     scr.keypad(True)
-    scr.timeout(500)
-    nav, got, built = Nav(), None, 0
+    scr.timeout(20)
+    tones = tones if tones is not None else colours()
+    nav, deep, seen, flash, drawn = Nav(), deep or Deep(), None, ["", 0, 0], 0
     while True:
         h, w = scr.getmaxyx()
-        if got is None or time.monotonic() - built >= every:
-            got, built = render(nav.view, clock(), proc, w, nav.hours), time.monotonic()
-        lines, items = got
-        nav.fit(items, len(lines), max(1, h - 1))
-        paint(scr, nav, lines, items, every)
+        rows = max(1, h - 1)
+        state = (feed.version, deep.version, len(nav.stack), nav.view, nav.cmd, int(clock()), flash[2])
+        if state != seen:
+            lines, items = render(nav.view, feed.p, deep, w, rows, nav.hours, feed.err)
+            nav.fit(items, len(lines), rows)
+            paint(scr, nav, lines, items, tones, flash[0] if time.monotonic() < flash[1] else "")
+            seen = state
+            if timing is not None and drawn:
+                timing.append(time.perf_counter() - drawn)
+                drawn = 0
         k = scr.getch()
         if k == -1:
             continue
-        act = nav.key(k, items, len(lines), max(1, h - 1))
+        drawn = time.perf_counter()
+        act = nav.key(k, items, len(lines), rows, feed.p)
         if act == "quit":
             return 0
-        if act == "open" or k == curses.KEY_RESIZE:
-            got = None
-
-
-def draw(every):
-    w, h = shutil.get_terminal_size((120, 50))
-    lines = frame(width=w)
-    foot = f"\033[2m(refreshes every {every}s · Ctrl-C to quit)\033[0m"
-    if len(lines) > h - 1:                 # the footer always shows, and says when the window cut the rest off
-        lines, foot = lines[: h - 2], f"\033[2m(… {len(lines) - h + 2} more lines: make the window taller · every {every}s · Ctrl-C quits)\033[0m"
-    lines = [ln if len(ln) <= w + 12 else ln[:w + 8] + "\033[0m" for ln in lines + [foot]]   # colour codes do not print
-    sys.stdout.write("\033[H\033[2J" + "\n".join(lines) + "\n")
-    sys.stdout.flush()
+        if act == "tmux":
+            sel = nav.view if nav.view[0] == "session" else items[nav.cur[-1]][1]
+            s = next((x for x in (feed.p or {}).get("sessions") or [] if x["id"] == sel[1]), None)
+            if s and s.get("win"):
+                switch_later(s["win"], flash)
+            else:
+                flash[:] = ["that session has no tmux window", time.monotonic() + 3, flash[2] + 1]
+        if act == "open" and nav.view[0] in DEEP:
+            deep.get(nav.view, w, nav.hours, feed.p, fresh=True)
+        seen = None                                  # a key always redraws, from memory
 
 
 def main(argv):
@@ -770,25 +592,24 @@ def main(argv):
         print(__doc__.split("\n\n")[-1].rstrip())
         return 0
     if argv[:1] == ["--once"]:
-        os.environ.setdefault("CC_LIVE_PLAIN", "0" if sys.stdout.isatty() else "1")
-        print("\n".join(frame(width=shutil.get_terminal_size((120, 50))[0])))
+        print(P.text(P.Pulse().step(laptop=False)))
         return 0
-    every = 10
-    if argv[:1] == ["--every"] and len(argv) > 1 and argv[1].isdigit() and int(argv[1]) > 0:
-        every = int(argv[1])
-    elif argv:
+    if argv:
         print(__doc__.split("\n\n")[-1].rstrip(), file=sys.stderr)
         return 2
+    feed = Feed().start()
     try:
         if sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb":
             import locale
             locale.setlocale(locale.LC_ALL, "")
-            os.environ.setdefault("ESCDELAY", "25")   # Esc goes back at once, not after curses' default second
-            os.environ["CC_LIVE_PLAIN"] = "1"         # curses draws the bold and the cursor itself
-            return curses.wrapper(ui, every)
-        while True:
-            draw(every)
-            time.sleep(every)
+            os.environ.setdefault("ESCDELAY", "10")   # Esc goes back at once, not after curses' default second
+            return curses.wrapper(ui, feed)
+        seen = 0
+        while True:                                  # no terminal: the main screen as text, on each change
+            if feed.version != seen and feed.p:
+                seen = feed.version
+                print(P.text(feed.p) + "\n", flush=True)
+            time.sleep(0.05)
     except KeyboardInterrupt:
         return 0
 

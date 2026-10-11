@@ -1,0 +1,1088 @@
+#!/usr/bin/env python3
+"""cc-pulse — the box's one status feed: one small JSON that every dashboard reads instead of collecting for itself.
+
+WHY. cc-live, the web dashboard and the VR scene each walked /proc, parsed the boards and asked the laptop on their
+own, and cc-live did it inside its key loop, so a keypress froze for 2-4 s behind a laptop ssh. Here one producer
+keeps the status in memory, re-reads an input only when its mtime moves, and the views draw from that. The owner
+asked for it on 2026-10-04 ("on main screen just see session and worker status", "maximally fast"); the design is
+the planning seat's dashboard-design-2026-10-04.md.
+
+  cc-pulse --once --json   print one snapshot as JSON (the shape below); --once never asks the laptop
+  cc-pulse --once --text   print the main screen as text, 80x24 (what `cc-live --once` prints)
+  cc-pulse run [--out F]   keep F (default $CC_STATE/pulse.json) current: written atomically (tmp file, then
+                           rename) within ~50 ms of a change to a file it reads (inotify; a log written beside
+                           one sets nothing off), and once a second anyway for /proc and the load; nothing else
+                           polls. No unit runs it yet.
+  cc-pulse selfcheck       cases over fixtures in a temp dir; reads nothing of the box's
+
+THE SHAPE (`v` is 1; PR 2's /api/pulse and PR 3's VR read it, so a change here is a change to them):
+  {v, at, zone, host,
+   glance: {needs:{n}, sessions:{busy, waiting, idle, shell}, workers:{live, offline, held},
+            landing:{active, queued, landed_1h}, box:{load1, cores, mem_pct, disk_pct, temp_c, units_down},
+            limit_until, model, laptop, spend_today, members:{workspaces, sessions, rows, needs}},
+   sessions: [{id, name, repo, track, state, since_s, ctx_pct, win}],     attention first: waiting, busy, shell, idle
+   workers:  [{repo, track, title, status, live, moved_s, held}],          board rows marked running
+   landing:  [{repo, pr, stage, title, age_s}],
+   needs:    [{kind, repo, name, ask}],                                    kind pr | waiting | blocked | ask
+   recent:   [{at, what, repo, name, title}],                              24 h of hand-offs and landings, cap 20
+   projects: [{repo, live, running, open, needs, landed_at, usd, panel}],  one per board the box runs
+   panels:   {repo: {title, at, rows:[{label, value, state}], stale, err}},
+   sections: {name: {at, err, stale}}}
+  Ages are seconds at `at`; times are epoch seconds. A section that raised keeps its last value and names the error
+  under sections: `at` stays the time of its last good pass and `stale` is true, and the text views head that block
+  STALE with that time (UNAVAILABLE when it never collected), so a retained row never reads as current. It holds no pane text, notes or mail, and a member's workspace only as the counts in
+  glance.members, because PR 2 serves it on the internet behind the owner's gate.
+
+WHAT IT READS — records the box already keeps, each re-parsed only when its mtime moves:
+  sessions  ~/.claude/sessions/<pid>.json ($CC_SESSIONS), only when that pid is alive with the same start time
+            (procStart; a record with none only when the pid is a claude started before the record was written);
+            context % from $CC_STATE/statusline/<sessionId>.json, read on the 1 s tick and not watched (a busy
+            session writes it several times a second).
+  workers   boards ($CC_BOARDS or ~/.cc/boards/<repo>.json, `_` boards skipped): rows marked running, not
+            kind=session. One /proc pass a second: a `cc-loop <repo> <track>` argv, or a `claude` whose cwd is under
+            the worktrees root ($CC_WORKTREES), makes that track LIVE; a row whose `agent` mark names a live pid is
+            worked by a SESSION; a `held` row is HELD; any other is OFFLINE (marked running, nothing alive), so the
+            pulse shows no phantom work. A live worker's last move is the newer mtime of its loop.log or progress.md.
+  landing   $CC_LANDER_STATE (default $CC_STATE/land)/*.json, the in-flight jobs; queue.log, read on from where the
+            last pass stopped, says when each PR landed (a `stage R#N merged` or `notify R#N landed` line).
+  needs     $CC_STATE/home.json, cc-slack's own rule (home_needs): owed PR reviews, waiting or blocked tracks that
+            carry a reason, and a session's declared ask. units_down and spend come from there too.
+  box       /proc/loadavg, /proc/meminfo and the home disk each second; temp from $CC_STATE/vitals/current.json.
+  slow      $CC_STATE/reconcile.json limit_until; $CC_STATE/model-override's model (never `cc-model status`);
+            `cc-suites status`'s line for the laptop, once a minute in a thread of its own so nothing waits on it.
+  members   ~/.cc/members/<repo> ($CC_MEMBERS) or ~/dev/<repo>/.cc/member-facing ($CC_DEV) makes <repo> a
+            member's: counted, never named.
+
+A PROJECT'S OWN PANEL. Any project can show its own numbers (the fund: paper P&L, positions, data freshness) by
+writing $CC_STATE/<repo>/panel.json, at most 4096 bytes (aim for 2 KB):
+    {"title": "fund", "at": "2026-10-05T08:00:00Z", "stale_after": 600,
+     "rows": [{"label": "paper P&L", "value": "+$212 (1.4%)", "state": "ok"}, ...]}
+  `state` is ok, warn or bad (anything else shows plain); at most 20 rows; a label is cut to 24 characters, a
+  value to 40, the title to 40. `stale_after` defaults to 600 s. cc-pulse owns the frame and the project owns only
+  its panel: a panel that is too big, not JSON or the wrong shape carries `err` and no rows, one older than
+  stale_after is marked stale, and neither touches anything else. A member's workspace gets no panel. Write it
+  atomically (tmp file, then rename), so a reader never sees half of it.
+"""
+import calendar
+import ctypes
+import ctypes.util
+import glob
+import json
+import os
+import select
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+HOME = os.path.expanduser("~")
+V = 1
+RECENT = 86400            # hand-offs and landings in `recent` go back this far ...
+RECENT_CAP = 20           # ... at most this many
+AMBER = 30                # a pulse older than this shows its age in amber ...
+STALE = 90                # ... and older than this says STALE: the producer is down
+SLOW = 60                 # the laptop is asked this often
+PANEL_MAX = 4096
+READ_MAX = 64 << 20     # no input is read past this (the biggest board is ~3.4 MB)
+# recurring-defect-ok: pause-hold-missing — cc-pulse only reads state and writes its own pulse file; it launches no worker and writes no board
+BOARD_MAX = 4 << 20     # a board is read to this size at most
+OPEN = ("queued", "running", "review", "blocked", "waiting", "held")
+ORDER = {"waiting": 0, "busy": 1, "shell": 2, "idle": 3}
+
+
+def env(k, default):
+    return os.environ.get(k) or default
+
+
+def boards_dir():
+    return env("CC_BOARDS", f"{HOME}/.cc/boards")
+
+
+def state_dir():
+    return env("CC_STATE", f"{HOME}/.cc/state")
+
+
+def land_dir():
+    return env("CC_LANDER_STATE", f"{state_dir()}/land")
+
+
+def wt_root():
+    return env("CC_WORKTREES", f"{HOME}/.cc/worktrees")
+
+
+def sessions_dir():
+    return env("CC_SESSIONS", f"{HOME}/.claude/sessions")
+
+
+def out_path():
+    return env("CC_PULSE", f"{state_dir()}/pulse.json")
+
+
+def ts(s):
+    """An ISO stamp the board writes (2026-09-28T19:31:30Z) as epoch seconds, or 0."""
+    if not isinstance(s, str):  # a project's panel can put anything here
+        return 0
+    try:                       # sliced, not strptime: a cold start reads thousands of these
+        if len(s) == 20 and s[4] == s[7] == "-" and s[10] == "T" and s[19] == "Z":
+            return calendar.timegm((int(s[:4]), int(s[5:7]), int(s[8:10]), int(s[11:13]), int(s[14:16]),
+                                    int(s[17:19]), 0, 0, 0))
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
+def mtime(p):
+    try:
+        return os.stat(p).st_mtime
+    except OSError:
+        return 0
+
+
+def ago(sec):
+    sec = max(0, int(sec or 0))
+    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
+        if sec >= div:
+            return f"{sec // div}{unit}"
+    return f"{sec}s"
+
+
+_C = {}
+
+
+def read_capped(path, cap=READ_MAX):
+    """A regular file's bytes, or None when it is missing, not a regular file or over `cap` bytes. A member's board
+    is a symlink into a directory its sandbox writes, so it may point at a FIFO (open would block the collector) or
+    /dev/zero (read would never end): the open never blocks and fstat refuses both."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            b = f.read(cap + 1)
+        return b if len(b) <= cap else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def cached(path, parse=None, cap=READ_MAX):
+    """The parsed file, parsed again only when its mtime moves; None when it is missing, not a regular file, over
+    cap bytes or does not parse (too deeply nested counts as not parsing)."""
+    m = mtime(path)
+    hit = _C.get(path)
+    if hit and hit[0] == m:
+        return hit[1]
+    v = None
+    if m:
+        b = read_capped(path, cap)
+        try:
+            v = (parse or json.loads)(b) if b is not None else None
+        except (ValueError, RecursionError, MemoryError):
+            v = None
+    _C[path] = (m, v)
+    return v
+
+
+_MEMBER = {"at": 0, "is": {}}
+
+
+def is_member(repo):
+    """Whether <repo> is a member's workspace; each answer is kept for 10 s, so a pass stats each repo once."""
+    if time.monotonic() - _MEMBER["at"] > 10:
+        _MEMBER.update(at=time.monotonic(), **{"is": {}})
+    if repo not in _MEMBER["is"]:
+        _MEMBER["is"][repo] = bool(repo) and (
+            os.path.isdir(f"{env('CC_MEMBERS', HOME + '/.cc/members')}/{repo}")
+            or os.path.isfile(f"{env('CC_DEV', HOME + '/dev')}/{repo}/.cc/member-facing"))
+    return _MEMBER["is"][repo]
+
+
+def boards():
+    """{repo: tracks} for every real board, members' included (callers count those and name none)."""
+    out = {}
+    for path in sorted(glob.glob(f"{boards_dir()}/*.json")):
+        repo = os.path.basename(path)[:-5]
+        if repo.startswith("_"):
+            continue
+        d = cached(path, cap=BOARD_MAX)
+        t = d.get("tracks") if isinstance(d, dict) else None
+        out[repo] = {k: r for k, r in t.items() if isinstance(r, dict)} if isinstance(t, dict) else {}
+    return out
+
+
+# The commands whose argv can carry `cc-loop <repo> <track>`. cc-loop is a bash script, so the loop itself is `bash`
+# (its tmux window's shell is bash or sh); `cc … --go` starts it as `cc-room admit <repo/track> … -- cc-loop <repo>
+# <track>`, and cc-room is a python3 script, so python3 is read too or a loop waiting for its room shows OFFLINE.
+WORKER_COMMS = ("bash", "sh", "cc-loop", "claude", "python3")
+
+
+def procs(proc="/proc"):
+    """(live tracks {repo/track}, live pids) from one pass over /proc; argv is read only for the few commands that
+    can be a worker, and cwd only for claude."""
+    live, pids, root = set(), set(), wt_root().rstrip("/") + "/"
+    for pid in os.listdir(proc):
+        if not pid.isdigit():
+            continue
+        pids.add(pid)
+        try:
+            comm = open(f"{proc}/{pid}/comm").read().strip()
+            if comm not in WORKER_COMMS:
+                continue
+            argv = open(f"{proc}/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        for i, a in enumerate(argv):
+            if os.path.basename(a) == "cc-loop" and len(argv) > i + 2 and argv[i + 1] and argv[i + 2]:
+                live.add(f"{argv[i + 1]}/{argv[i + 2]}")
+                break
+        if comm == "claude":
+            try:
+                cwd = os.readlink(f"{proc}/{pid}/cwd")
+            except OSError:
+                continue
+            if cwd.startswith(root):
+                live.add("/".join(cwd[len(root):].split("/")[:2]))
+    return live, pids
+
+
+def where(cwd):
+    """(repo, track) a session works in, from its cwd: a worktree is both, ~/dev/<repo> is the repo's seat."""
+    cwd = str(cwd or "")
+    for root, n in ((wt_root().rstrip("/") + "/", 2), (env("CC_DEV", HOME + "/dev").rstrip("/") + "/", 1)):
+        if cwd.startswith(root):
+            parts = cwd[len(root):].split("/")[:n] + [""]
+            return parts[0], parts[1] if n == 2 else ""
+    return "", ""
+
+
+def started(proc, pid):
+    """The pid's start time in clock ticks (/proc/<pid>/stat field 22), or None when it is gone."""
+    try:
+        return open(f"{proc}/{pid}/stat").read().rpartition(")")[2].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def booted(proc):
+    """The boot time in epoch seconds (/proc/stat's btime), or None."""
+    try:
+        for ln in open(f"{proc}/stat"):
+            if ln.startswith("btime "):
+                return int(ln.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def same_process(proc, pid, d):
+    """Whether pid is still the process that wrote session record d. Claude Code writes procStart as /proc/<pid>/stat
+    field 22 in a decimal string ("69115728" on 2.1.296, read off a live file on 2026-10-10); it is compared as a
+    number, so 69115728, "69115728" and "69115728.0" are one value. A record with no usable procStart (an older
+    Claude Code) is believed only when the pid is a `claude` process that started no later than the record's own
+    first stamp, so a pid reused by anything else, or by a later claude, is not a live session."""
+    st = started(proc, pid)
+    if st is None:
+        return False
+    try:
+        want = int(float(str(d.get("procStart")).strip()))
+    except (TypeError, ValueError, OverflowError):
+        want = None
+    if want is not None:
+        return str(want) == st
+    try:
+        if open(f"{proc}/{pid}/comm").read().strip() != "claude":
+            return False
+    except OSError:
+        return False
+    stamps = [v for v in (d.get(k) for k in ("startedAt", "updatedAt", "statusUpdatedAt"))
+              if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0]
+    boot = booted(proc)
+    if not stamps or boot is None:
+        return False
+    try:
+        born = boot + int(st) / (os.sysconf("SC_CLK_TCK") or 100)
+    except ValueError:
+        return False
+    return born <= min(stamps) / 1000 + 2       # 2 s for the clock tick and btime's rounding
+
+
+def sessions(now, proc="/proc"):
+    """([session], member sessions) of every Claude session whose process is still the one that wrote its file."""
+    out, members = [], 0
+    for path in glob.glob(f"{sessions_dir()}/*.json"):
+        pid = os.path.basename(path)[:-5]
+        d = cached(path)
+        if not pid.isdigit() or not isinstance(d, dict):
+            continue
+        if not same_process(proc, pid, d):
+            continue
+        repo, track = where(d.get("cwd"))
+        if is_member(repo):
+            members += 1
+            continue
+        sl = cached(f"{state_dir()}/statusline/{d.get('sessionId')}.json") if d.get("sessionId") else None
+        since = (d.get("statusUpdatedAt") or d.get("updatedAt") or 0) / 1000
+        win = str(d.get("tmux") or "").partition(":")[2].partition(".")[0]
+        out.append({"id": pid, "name": str(d.get("name") or pid)[:40], "repo": repo, "track": track,
+                    "state": str(d.get("status") or "?"), "since_s": int(now - since) if since else None,
+                    "ctx_pct": sl.get("pct") if isinstance(sl, dict) else None, "win": win})
+    out.sort(key=lambda s: (ORDER.get(s["state"], 2), s["since_s"] if s["since_s"] is not None else 1e12))
+    return out, members
+
+
+def workers(bds, live, pids, now):
+    """([worker], member rows running) of the board rows marked running."""
+    out, members = [], 0
+    for repo, tracks in sorted(bds.items()):
+        for name, row in sorted(tracks.items()):
+            if row.get("status") != "running" or row.get("kind") == "session":
+                continue
+            if is_member(repo):
+                members += 1
+                continue
+            key, moved = f"{repo}/{name}", None
+            if key in live:
+                d = f"{state_dir()}/{repo}/{name}"
+                last = max(mtime(f"{d}/loop.log"), mtime(f"{d}/progress.md"))
+                word, moved = "live", int(now - last) if last else None
+            elif str(row.get("agent") or "").rpartition(":")[2] in pids:   # `agent me`: a live session works it itself
+                word = "session"
+            elif row.get("held"):          # a person parked it on purpose: not an alarm
+                word = "held"
+            else:
+                word = "offline"
+            out.append({"repo": repo, "track": name, "title": str(row.get("title") or "")[:80], "status": "running",
+                        "live": word, "moved_s": moved, "held": bool(row.get("held"))})
+    out.sort(key=lambda w: ("offline", "live", "session", "held").index(w["live"]))    # attention first
+    return out, members
+
+
+_LOG = {"ino": None, "off": 0, "landed": {}, "sorted": []}
+_LOG_LOCK = threading.Lock()   # the feed thread and cc-live's deeper views both call landed()
+
+
+def landed():
+    """[(epoch, repo, pr)] of every PR the queue log says landed, newest first. The log is read on from the offset the
+    last call stopped at; a log that was replaced or cut short is read again from the top."""
+    with _LOG_LOCK:
+        return _landed()
+
+
+def _landed():
+    path = f"{land_dir()}/queue.log"
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    if st.st_ino != _LOG["ino"] or st.st_size < _LOG["off"]:
+        _LOG.update(ino=st.st_ino, off=0, landed={}, sorted=[])
+    if st.st_size > _LOG["off"]:
+        with open(path, "rb") as f:
+            f.seek(_LOG["off"])
+            data = f.read()
+        cut = data.rfind(b"\n") + 1            # a half-written last line is read whole next time
+        _LOG["off"] += cut
+        for ln in data[:cut].decode("utf-8", "replace").splitlines():
+            if " merged" not in ln and " landed" not in ln:
+                continue
+            stamp, _, rest = ln.partition("\t")
+            w = rest.split()
+            if len(w) < 3 or (w[0], w[2]) not in (("stage", "merged"), ("notify", "landed")):
+                continue
+            repo, _, pr = w[1].rpartition("#")
+            when = ts(stamp)
+            if repo and not repo.startswith("_") and pr.isdigit() and when:
+                k = (repo, pr)
+                _LOG["landed"][k] = min(when, _LOG["landed"].get(k, when))
+        _LOG["sorted"] = sorted(((t, r, p) for (r, p), t in _LOG["landed"].items()), reverse=True)
+    return _LOG["sorted"]
+
+
+def job(repo, pr):
+    """The lander's record of repo#pr, in flight or ended, or {}."""
+    for path in (f"{land_dir()}/{repo}-{pr}.json", f"{land_dir()}/rest/{repo}-{pr}.json"):
+        j = cached(path)
+        if isinstance(j, dict):
+            return j
+    return {}
+
+
+def landing(now):
+    """[landing] in flight, newest first, members' left out."""
+    out = []
+    for path in glob.glob(f"{land_dir()}/*.json"):
+        j = cached(path)
+        if isinstance(j, dict) and j.get("repo") and j.get("pr") and not is_member(j["repo"]):
+            out.append({"repo": j["repo"], "pr": j["pr"], "stage": str(j.get("stage") or j.get("state") or "?"),
+                        "title": str(j.get("title") or "")[:80], "age_s": int(now - mtime(path))})
+    return sorted(out, key=lambda e: e["age_s"])
+
+
+def home_state():
+    d = cached(f"{state_dir()}/home.json")
+    s = d.get("state") if isinstance(d, dict) else None
+    return s if isinstance(s, dict) else {}
+
+
+def needs(hs):
+    """([need], member needs) by cc-slack's home_needs rule, from the home.json it already writes."""
+    out, members = [], 0
+
+    def add(rank, kind, repo, name, ask):
+        nonlocal members
+        if is_member(repo):
+            members += 1
+        else:
+            out.append((rank, {"kind": kind, "repo": repo, "name": str(name or "")[:40], "ask": str(ask or "")[:80]}))
+    for t in hs.get("tracks") or ():
+        if not isinstance(t, dict):
+            continue
+        repo, _, name = str(t.get("name") or "").partition("/")
+        pr = t.get("pr") if isinstance(t.get("pr"), dict) else {}
+        owed = bool(pr.get("num") and pr.get("owed") and t.get("state") in ("review", "done"))
+        asks = t.get("state") in ("waiting", "blocked") and bool(t.get("reason"))
+        # Whose track it is comes from the track's own name, the way workers() and recent() decide, and is settled
+        # before anything of its PR is read: a member's track is a count, whatever repo its PR record claims.
+        if is_member(repo) or (owed and is_member(str(pr.get("repo") or "").rpartition("/")[2])):
+            members += owed + asks
+            continue
+        if owed:
+            add(1, "pr", str(pr.get("repo") or repo), f"PR #{pr['num']}", "awaiting review")
+        if asks:
+            add(2 if t["state"] == "waiting" else 3, t["state"], repo, name, t.get("reason"))
+    for s in hs.get("sessions") or ():
+        if isinstance(s, dict) and s.get("ask"):
+            add(2, "ask", s.get("repo") or "", s.get("name"), s.get("ask"))
+    return [n for _, n in sorted(out, key=lambda e: e[0])], members
+
+
+def handoff(row):
+    """(when, word) of a row's newest hand-off: added, dispatched (a worker went out) or taken (an agent mark)."""
+    ev = [(ts(row.get("created")), "added")]
+    for n in row.get("notes") or []:
+        if isinstance(n, dict) and str(n.get("msg", "")).startswith("dispatched"):
+            ev.append((ts(n.get("ts")), "dispatched"))
+    if row.get("agent_at"):
+        ev.append((ts(row.get("agent_at")), "taken"))
+    return max(ev)
+
+
+def recent(bds, ld, now):
+    out = []
+    for repo, tracks in bds.items():
+        if is_member(repo):
+            continue
+        for name, row in tracks.items():
+            when, word = handoff(row)
+            if when and 0 <= now - when <= RECENT:
+                out.append({"at": when, "what": word, "repo": repo, "name": name,
+                            "title": str(row.get("title") or "")[:80]})
+    for when, repo, pr in ld:
+        if now - when > RECENT:
+            break
+        if not is_member(repo):
+            out.append({"at": when, "what": "landed", "repo": repo, "name": f"#{pr}",
+                        "title": str(job(repo, pr).get("title") or "")[:80]})
+    return sorted(out, key=lambda e: -e["at"])[:RECENT_CAP]
+
+
+def box(hs):
+    """The load, memory and disk now, the temperature off cc-vitals' last minute and the units home.json saw down."""
+    out = {"load1": None, "cores": os.cpu_count(), "mem_pct": None, "disk_pct": None, "temp_c": None,
+           "units_down": sum(1 for u in hs.get("units") or () if isinstance(u, list) and len(u) > 1 and not u[1])}
+    try:
+        out["load1"] = float(open("/proc/loadavg").read().split()[0])
+        mi = {ln.split(":")[0]: int(ln.split()[1]) for ln in open("/proc/meminfo") if ln.split()[1:2]}
+        out["mem_pct"] = round(100 * (1 - mi["MemAvailable"] / mi["MemTotal"]))
+    except (OSError, ValueError, KeyError, ZeroDivisionError):
+        pass
+    try:
+        du = shutil.disk_usage(HOME)
+        out["disk_pct"] = round(100 * du.used / du.total)
+    except OSError:
+        pass
+    vit = cached(f"{state_dir()}/vitals/current.json")
+    for s in (vit or {}).get("series") or () if isinstance(vit, dict) else ():
+        if isinstance(s, dict) and s.get("key") == "temp" and isinstance(s.get("now"), dict):
+            out["temp_c"] = num(s["now"].get("real"))
+    return out
+
+
+def num(v):
+    """v as a float, or None when it is not a number (a reading another tool wrote can be anything)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if f == f and abs(f) != float("inf") else None
+
+
+def limit_until(now):
+    d = cached(f"{state_dir()}/reconcile.json")
+    try:
+        v = float(d.get("limit_until") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return v if v > now else None
+
+
+def model(now):
+    """The model the box was moved to (cc-model's override file: model, since, until, …), or "default"."""
+    ov = cached(f"{state_dir()}/model-override", lambda b: b.decode("utf-8", "replace"))
+    f = (ov or "").strip().split("\t")
+    try:
+        until = float(f[2]) if len(f) > 2 and f[2] else 0
+    except ValueError:
+        until = 0
+    return f[0] if f[0] and (not until or until > now) else "default"
+
+
+def laptop_line():
+    """cc-suites status's one line, or one saying the runner gave none; never waits more than 6 s."""
+    exe = env("CC_PULSE_SUITES", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-suites"))
+    try:
+        r = subprocess.run([exe, "status"], capture_output=True, text=True, timeout=6, stdin=subprocess.DEVNULL,
+                           env={**os.environ, "CC_SUITES_STATUS_TIMEOUT": "5s"})
+        return (r.stdout.strip().splitlines() or ["cc-suites status printed nothing"])[-1][:120]
+    except (OSError, subprocess.SubprocessError):
+        return "the laptop runner did not answer in 6 s"
+
+
+def panel(path, now):
+    """One project's panel.json, checked: the panel, or one carrying `err` and no rows."""
+    if os.path.getsize(path) > PANEL_MAX:
+        return {"title": "", "at": None, "rows": [], "stale": False, "err": f"over {PANEL_MAX} bytes"}
+    d = cached(path)
+    if not isinstance(d, dict) or not isinstance(d.get("rows"), list):
+        return {"title": "", "at": None, "rows": [], "stale": False, "err": "not a panel: no rows list"}
+    if d.get("at") is not None and not isinstance(d["at"], str):
+        return {"title": "", "at": None, "rows": [], "stale": False, "err": "not a panel: at is not a time string"}
+    at = ts(d.get("at"))
+    try:
+        after = float(d.get("stale_after") or 600)
+    except (TypeError, ValueError, OverflowError):
+        after = 600
+    rows = [{"label": str(r.get("label") or "")[:24], "value": str(r.get("value") if r.get("value") is not None else "")[:40],
+             "state": r.get("state") if r.get("state") in ("ok", "warn", "bad") else ""}
+            for r in d["rows"][:20] if isinstance(r, dict)]
+    return {"title": str(d.get("title") or "")[:40], "at": at or None, "rows": rows,
+            "stale": not at or now - at > after, "err": None}
+
+
+def panels(now):
+    """{repo: panel}; one panel that fails carries its own err, and every other panel is still read."""
+    out = {}
+    for path in sorted(glob.glob(f"{state_dir()}/*/panel.json")):
+        repo = path.split("/")[-2]
+        if not repo.startswith("_") and not is_member(repo):
+            try:
+                out[repo] = panel(path, now)
+            except OSError:
+                continue
+            except Exception as e:     # a project's own file never takes the other panels down
+                out[repo] = {"title": "", "at": None, "rows": [], "stale": False,
+                             "err": f"unreadable: {type(e).__name__}"[:60]}
+    return out
+
+
+def projects(bds, wk, nd, ld, hs, pn):
+    """One row per board the box runs (members' counted in glance.members instead)."""
+    spend = {}
+    for r in ((hs.get("spend") or {}).get("rows") or ()) if isinstance(hs.get("spend"), dict) else ():
+        if isinstance(r, dict) and "/" in str(r.get("who")) and isinstance(r.get("usd"), (int, float)):
+            k = str(r["who"]).partition("/")[0]
+            spend[k] = spend.get(k, 0) + r["usd"]
+    last = {}
+    for when, repo, _ in ld:
+        last.setdefault(repo, when)
+    out = []
+    for repo, tracks in sorted(bds.items()):
+        if is_member(repo):
+            continue
+        st = [r.get("status") for r in tracks.values()]
+        out.append({"repo": repo, "live": sum(1 for w in wk if w["repo"] == repo and w["live"] in ("live", "session")),
+                    "running": st.count("running"), "open": sum(1 for s in st if s in OPEN),
+                    "needs": sum(1 for n in nd if n["repo"] == repo), "landed_at": last.get(repo),
+                    "usd": round(spend[repo], 2) if repo in spend else None, "panel": repo in pn})
+    return out
+
+
+class Pulse:
+    """The snapshot, kept in memory. step() re-collects; each section runs on its own, and one that raises keeps its
+    last value with its error under sections. /proc is walked only when `walk` is set (the 1 s tick)."""
+
+    def __init__(self, proc="/proc"):
+        self.proc, self.p, self.live, self.pids = proc, {}, set(), set()
+        self.laptop, self.laptop_at, self.asking = None, 0, False
+        self.sec, self.last = {}, {}
+
+    def run_sec(self, name, fn, default):
+        try:
+            v = self.last[name] = fn()
+            self.sec[name] = {"at": int(time.time()), "err": None, "stale": False}
+            return v
+        except Exception as e:     # one bad input greys out its own section, never the rest
+            # what it shows is the last pass that worked: `at` says when that was, and `stale` that it is not now
+            self.sec[name] = {"at": (self.sec.get(name) or {}).get("at"), "err": f"{type(e).__name__}: {e}"[:120],
+                              "stale": name in self.last}
+            return self.last.get(name, default)
+
+    def ask_laptop(self):
+        """Ask the laptop in a thread of its own, at most once a minute; the pulse never waits on the answer."""
+        if self.asking or time.time() - self.laptop_at < SLOW:
+            return
+        self.asking = True
+
+        def go():
+            try:
+                self.laptop = laptop_line()
+            finally:
+                self.laptop_at, self.asking = time.time(), False
+        threading.Thread(target=go, daemon=True).start()
+
+    def step(self, now=None, walk=True, laptop=True, quick=False):
+        """The snapshot now. `quick` leaves the landing history, recent, projects and panels at their last value (none,
+        on a first step) so a view can draw sessions and workers first; the next step fills them in."""
+        now = now or time.time()
+        slow = (lambda name, fn, default: self.last.get(name, default)) if quick else self.run_sec
+        if walk or not self.pids:
+            self.live, self.pids = self.run_sec("procs", lambda: procs(self.proc), (set(), set()))
+        if laptop:
+            self.ask_laptop()
+        bds = self.run_sec("boards", boards, {})
+        hs = self.run_sec("home", home_state, {})
+        ss, s_mem = self.run_sec("sessions", lambda: sessions(now, self.proc), ([], 0))
+        wk, _ = self.run_sec("workers", lambda: workers(bds, self.live, self.pids, now), ([], 0))
+        ld = slow("landed", landed, [])
+        lg = slow("landing", lambda: landing(now), [])
+        nd, n_mem = self.run_sec("needs", lambda: needs(hs), ([], 0))
+        pn = slow("panels", lambda: panels(now), {})
+        members = [r for r in bds if is_member(r)]
+        spend = hs.get("spend") if isinstance(hs.get("spend"), dict) else {}
+        count = lambda xs, k, v: sum(1 for x in xs if x[k] == v)
+        self.p = {
+            "v": V, "at": int(now), "zone": time.strftime("%Z"), "host": os.uname().nodename,
+            "glance": {
+                "needs": {"n": len(nd)},
+                "sessions": {w: count(ss, "state", w) for w in ("busy", "waiting", "idle", "shell")},
+                "workers": {"live": sum(1 for w in wk if w["live"] in ("live", "session")),
+                            "offline": count(wk, "live", "offline"), "held": count(wk, "live", "held")},
+                "landing": {"active": sum(1 for x in lg if x["stage"] not in ("queued", "install")),
+                            "queued": count(lg, "stage", "queued"),
+                            "landed_1h": sum(1 for t, _, _ in ld if now - t <= 3600)},
+                "box": self.run_sec("box", lambda: box(hs), {}),
+                "limit_until": self.run_sec("limit", lambda: limit_until(now), None),
+                "model": self.run_sec("model", lambda: model(now), None),
+                "laptop": self.laptop,
+                "spend_today": round(spend["today"], 2) if isinstance(spend.get("today"), (int, float)) else None,
+                "members": {"workspaces": len(members), "sessions": s_mem, "needs": n_mem,
+                            "rows": sum(1 for r in members for x in bds[r].values() if x.get("status") in OPEN)}},
+            "sessions": ss, "workers": wk, "landing": lg, "needs": nd,
+            "recent": slow("recent", lambda: recent(bds, ld, now), []),
+            "projects": slow("projects", lambda: projects(bds, wk, nd, ld, hs, pn), []),
+            "panels": pn, "sections": dict(self.sec)}
+        return self.p
+
+
+# ── watching: inotify through libc, no package ─────────────────────────────────────────────────────────────────
+IN_MODIFY, IN_CLOSE_WRITE, IN_MOVED_FROM, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x2, 0x8, 0x40, 0x80, 0x100, 0x200
+WATCH = IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_MODIFY
+
+
+class Watch:
+    """inotify on a set of directories. wait(t) returns the names that changed within t seconds (empty on timeout).
+    With no inotify (another OS, or the watch limit reached) it only sleeps, and callers fall back to their tick."""
+
+    def __init__(self):
+        self.fd, self.dirs = -1, {}
+        try:
+            self.libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+            self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        except (OSError, AttributeError):
+            self.fd = -1
+
+    def add(self, path):
+        if self.fd < 0 or path in self.dirs.values() or not os.path.isdir(path):
+            return
+        wd = self.libc.inotify_add_watch(self.fd, os.fsencode(path), WATCH)
+        if wd >= 0:
+            self.dirs[wd] = path
+
+    def close(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+        self.fd, self.dirs = -1, {}
+
+    def wait(self, timeout):
+        if self.fd < 0:
+            time.sleep(max(0, timeout))
+            return set()
+        if not select.select([self.fd], [], [], max(0, timeout))[0]:
+            return set()
+        got = set()
+        while True:
+            try:
+                buf = os.read(self.fd, 65536)
+            except BlockingIOError:
+                return got
+            i = 0
+            while i + 16 <= len(buf):
+                wd, _, _, n = struct.unpack_from("iIII", buf, i)
+                name = buf[i + 16:i + 16 + n].rstrip(b"\0").decode("utf-8", "replace")
+                got.add(os.path.join(self.dirs.get(wd, ""), name))
+                i += 16 + n
+
+
+QUIET = ("statusline",)   # written every few hundred ms by a busy session; the 1 s tick picks up its context %
+
+
+def inputs():
+    """The directories whose files the pulse reads: a write in any of them re-collects at once."""
+    st = state_dir()
+    return [boards_dir(), sessions_dir(), land_dir(), f"{st}/vitals", st] + \
+        sorted(d for d in glob.glob(f"{st}/*/") if not os.path.basename(d.rstrip("/")).startswith("_")
+               and os.path.basename(d.rstrip("/")) not in QUIET)
+
+
+TOP = ("home.json", "reconcile.json", "model-override")     # the files the pulse reads straight under $CC_STATE
+
+
+def wanted(path):
+    """Whether a write to `path` changes what the pulse shows. The watched directories also hold logs that grow all
+    day ($CC_STATE's pulse.log, model.log and reconcile.log, a repo's loop.log); a write to one of those re-collects
+    nothing, and a worker's last move is read on the 1 s tick instead."""
+    d, n, st = os.path.dirname(path).rstrip("/"), os.path.basename(path), state_dir().rstrip("/")
+    if d in (boards_dir().rstrip("/"), sessions_dir().rstrip("/")):
+        return n.endswith(".json")
+    if d == land_dir().rstrip("/"):
+        return n.endswith(".json") or n == "queue.log"
+    if d == f"{st}/vitals":
+        return n == "current.json"
+    if d == st:
+        return n in TOP or (os.path.isdir(path) and not n.startswith("_") and n not in QUIET)
+    return os.path.dirname(d) == st and n == "panel.json"
+
+
+def feed(emit, stop=None, proc="/proc", settle=0.03, out=None):
+    """Keep a Pulse current and hand each new snapshot to emit(p): within `settle` s of a write to a watched input
+    (more writes in that window are taken together), and every second for /proc and the load. `out` is the file
+    emit writes, if any (default the pulse file): a write to it or its tmp file is our own and re-collects nothing.
+    Returns when stop() is true."""
+    pulse, w = Pulse(proc), Watch()
+    own = {os.path.realpath(x) for x in (out or out_path(), (out or out_path()) + ".tmp")}
+    try:
+        for d in inputs():
+            w.add(d)
+        emit(pulse.step(quick=True))          # sessions and workers on screen first ...
+        emit(pulse.step(walk=False))          # ... and the landing history a moment later
+        tick = time.monotonic()
+        while not (stop and stop()):
+            due = tick + 1 - time.monotonic()
+            changed = w.wait(due)
+            walk = time.monotonic() - tick >= 1
+            if changed:
+                time.sleep(settle)
+                changed |= w.wait(0)
+                for p in changed:
+                    if os.path.dirname(p) == state_dir().rstrip("/") and os.path.isdir(p) \
+                            and os.path.basename(p) not in QUIET:
+                        w.add(p)       # a new project's state dir: its panel.json is watched from now on
+                if not walk and not any(wanted(p) and os.path.realpath(p) not in own for p in changed):
+                    continue           # our own write, or a log the pulse does not read
+            elif not walk:
+                continue
+            if walk:
+                tick = time.monotonic()
+            emit(pulse.step(walk=walk))
+    finally:
+        w.close()
+
+
+def write(p, path=None):
+    path = path or out_path()
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(p, f, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+# ── the text: the main screen, and the sections the pulse carries ─────────────────────────────────────────────
+def age_line(p, now=None):
+    a = int((now or time.time()) - (p.get("at") or 0))
+    return (f"STALE {ago(a)}", "bad") if a > STALE else (f"pulse {ago(a)}", "warn" if a >= AMBER else "")
+
+
+def header(p, now=None, width=80):
+    g, now = p.get("glance") or {}, now or time.time()
+    b = g.get("box") or {}
+    f = lambda v, fmt: fmt.format(v) if v is not None else "?"
+    bits = [p.get("host", "?"), time.strftime("%H:%M:%S", time.localtime(now)),
+            f"ld {f(b.get('load1'), '{:.1f}')}/{b.get('cores') or '?'}", f"mem {f(b.get('mem_pct'), '{}%')}",
+            f"disk {f(b.get('disk_pct'), '{}%')}"]
+    if num(b.get("temp_c")) is not None:        # a pulse.json another writer made can carry anything here
+        bits.append(f"{num(b['temp_c']):.0f}°C")
+    if b.get("units_down"):
+        bits.append(f"{b['units_down']} unit(s) DOWN")
+    if g.get("spend_today") is not None:
+        bits.append(f"${g['spend_today']:.0f} today")
+    if g.get("model") and g["model"] != "default":
+        bits.append(f"model {g['model']}")
+    if g.get("limit_until"):
+        bits.append(f"LIMIT to {time.strftime('%H:%M', time.localtime(g['limit_until']))}")
+    word, tone = age_line(p, now)
+    return [(cut("  ".join(bits), width - len(word) - 2) + "  " + word, tone or ("bad" if b.get("units_down") else ""))]
+
+
+# The sections each block of the screen is drawn from: when one of them failed, the block shows a retained value.
+FEEDS = {"sessions": ("sessions",), "workers": ("workers", "procs", "boards"), "needs": ("needs", "home"),
+         "landing": ("landing",)}
+
+
+def stale_note(p, block):
+    """'' while every section a block is drawn from collected on the last pass; else what the owner must know: that
+    the rows are the last good pass's (and when it was), or that there is none."""
+    sec = p.get("sections") or {}
+    for name in FEEDS.get(block, (block,)):
+        s = sec.get(name) or {}
+        if s.get("err"):
+            at = s.get("at")
+            return (f"STALE: as of {time.strftime('%H:%M:%S', time.localtime(at))}, {name} failed (x: why)" if at
+                    else f"UNAVAILABLE: {name} failed (x: why)")
+    return ""
+
+
+def block_head(p, block, head, rest, width):
+    """A block's heading as (text, tone): `head` (its name and count), then its stale note when it has one, so the
+    note is never the part an 80-column cut drops, then `rest`."""
+    note = stale_note(p, block)
+    return (cut("  ".join(w for w in (head, note, rest) if w), width), "warn" if note else "bold")
+
+
+def cut(s, n):
+    s = str(s)
+    return s if len(s) <= n else s[:max(0, n - 1)] + "…"
+
+
+def session_line(s, width):
+    ctx = f"{s['ctx_pct']}%" if s.get("ctx_pct") is not None else ""
+    since = ago(s["since_s"]) if s.get("since_s") is not None else ""
+    where = f"{s['repo']}/{s['track']}" if s.get("track") else s.get("repo") or ""
+    tone = {"waiting": "warn", "idle": "dim"}.get(s["state"], "")
+    return (f"  {cut(s['name'], 24):<24} {cut(where, 28):<28} {s['state']:<8}{since:>5} {ctx:>4}"[:width], tone)
+
+
+def worker_line(w, width):
+    st = {"live": f"live {ago(w['moved_s'])}" if w.get("moved_s") is not None else "live",
+          "session": "session", "held": "held", "offline": "OFFLINE"}[w["live"]]
+    tone = {"offline": "bad", "held": "dim"}.get(w["live"], "")
+    return (f"  {cut(w['repo'] + '/' + w['track'], 34):<34} {st:<10} {w['title']}"[:width], tone)
+
+
+def home(p, width=80, rows=24):
+    """(lines, items) of the main screen: the header, NEEDS YOU, sessions and workers, the landing lane, in `rows`
+    lines (the caller's footer is the last of them). lines are (text, tone), tone one of "", dim, warn, bad; items
+    are (line, target) for the cursor, target ("session", id) or ("worker", repo, track); a section's items may
+    also be ("landing", repo, pr) or ("section", "project", repo)."""
+    g = p.get("glance") or {}
+    out, items = header(p, width=width), []
+    nd, note = p.get("needs") or [], stale_note(p, "needs")
+    if nd:
+        n = nd[0]
+        out.append((cut(f"NEEDS YOU {len(nd)} · " + (f"{note} · " if note else "") + f"{n['repo']} {n['name']}: {n['ask']}",
+                        width), "bad"))
+    else:
+        out.append((cut(f"needs you: nothing  {note}", width) if note else "needs you: nothing", "warn" if note else "dim"))
+    ss, wk = p.get("sessions") or [], p.get("workers") or []
+    gs, gw, gl = g.get("sessions") or {}, g.get("workers") or {}, g.get("landing") or {}
+    room = max(2, rows - len(out) - 4 - (not wk))  # two block headers, the landing line, the footer, and the
+                                                   # "(no row marked running)" line when there are no workers
+    want_w = len(wk)
+    kw = min(want_w, max(room // 2, room - len(ss)))
+    ks = room - kw
+    if len(ss) > ks:
+        ks -= 1                                    # the "+N more" line
+    if len(wk) > kw:
+        kw -= 1
+    out.append(block_head(p, "sessions", f"SESSIONS {len(ss)}",
+                          " · ".join(f"{gs.get(w, 0)} {w}" for w in ("waiting", "busy", "idle") if gs.get(w)), width))
+    for s in ss[:max(0, ks)]:
+        items.append((len(out), ("session", s["id"])))
+        out.append(session_line(s, width))
+    if len(ss) > max(0, ks):
+        rest = ss[max(0, ks):]
+        idle = sum(1 for s in rest if s["state"] == "idle")
+        out.append((f"  +{len(rest)} more ({idle} idle)   s lists them", "dim"))
+    out.append(block_head(p, "workers", f"WORKERS {len(wk)}",
+                          " · ".join(f"{gw.get(w, 0)} {w}" for w in ("live", "offline", "held") if gw.get(w)), width))
+    for w in wk[:max(0, kw)]:
+        items.append((len(out), ("worker", w["repo"], w["track"])))
+        out.append(worker_line(w, width))
+    if len(wk) > max(0, kw):
+        out.append((f"  +{len(wk) - max(0, kw)} more   w lists them", "dim"))
+    if not wk:
+        out.append(("  (no row marked running)", "dim"))
+    if "landing" not in (p.get("sections") or {}):
+        out.append(("LANDING reading…", "dim"))
+    else:
+        head = block_head(p, "landing", "LANDING", f"{gl.get('active', 0)} active · {gl.get('queued', 0)} queued · "
+                          f"{gl.get('landed_1h', 0)} landed in 1 h", width)
+        out.append((head[0], head[1] if head[1] == "warn" else ""))
+    return out[:max(1, rows - 1)], [i for i in items if i[0] < rows - 1]
+
+
+def section(p, name, width=80, arg=None, now=None):
+    """(lines, items) of one tier-2 section, from the pulse alone: sessions, workers, landing, needs, recent,
+    projects, box, or project (arg: the repo)."""
+    now, out, items = now or time.time(), [], []
+    if name == "sessions":
+        out.append(block_head(p, "sessions", f"SESSIONS {len(p.get('sessions') or [])}, waiting first", "", width))
+        for s in p.get("sessions") or []:
+            items.append((len(out), ("session", s["id"])))
+            out.append(session_line(s, width))
+        if (p["glance"].get("members") or {}).get("sessions"):
+            out.append((f"  and {p['glance']['members']['sessions']} in members' workspaces", "dim"))
+    elif name == "workers":
+        out.append(block_head(p, "workers", f"WORKERS {len(p.get('workers') or [])}", "(board rows marked running)",
+                              width))
+        for w in p.get("workers") or []:
+            items.append((len(out), ("worker", w["repo"], w["track"])))
+            out.append(worker_line(w, width))
+    elif name == "landing":
+        out.append(block_head(p, "landing", "LANDING (in flight, newest first)",
+                              " Enter opens a job · P lists what landed · g graphs it", width))
+        for x in p.get("landing") or []:
+            items.append((len(out), ("landing", x["repo"], str(x["pr"]))))
+            out.append((cut(f"  {x['repo']}#{x['pr']:<6} {x['stage']:<9} {ago(x['age_s']):>4}  {x['title']}", width),
+                        "bad" if "fail" in x["stage"] else ""))
+        if not p.get("landing"):
+            out.append(("  (queue empty)", "dim"))
+    elif name == "needs":
+        out.append(block_head(p, "needs", f"NEEDS YOU {len(p.get('needs') or [])}", "", width))
+        for n in p.get("needs") or []:
+            out.append((cut(f"  {n['kind']:<8} {n['repo']} {n['name']}: {n['ask']}", width), "warn"))
+        if (p["glance"].get("members") or {}).get("needs"):
+            out.append((f"  and {p['glance']['members']['needs']} in members' workspaces", "dim"))
+    elif name == "recent":
+        out.append(("RECENT (24 h of hand-offs and landings, newest first)   r again: the full timeline (T)", "bold"))
+        for e in p.get("recent") or []:
+            out.append((cut(f"  {time.strftime('%H:%M', time.localtime(e['at']))}  {e['what']:<10} "
+                            f"{e['repo']}/{e['name']}  {e['title']}", width), ""))
+    elif name == "projects":
+        out.append((f"{'PROJECT':<22} {'live':>4} {'run':>4} {'open':>5} {'needs':>5} {'landed':>7} {'$ today':>8}  panel",
+                    "bold"))
+        for r in p.get("projects") or []:
+            items.append((len(out), ("section", "project", r["repo"])))
+            out.append((f"  {cut(r['repo'], 20):<20} {r['live']:>4} {r['running']:>4} {r['open']:>5} {r['needs']:>5} "
+                        f"{ago(now - r['landed_at']) if r['landed_at'] else '-':>7} "
+                        f"{'%.0f' % r['usd'] if r['usd'] is not None else '-':>8}  {'yes' if r['panel'] else ''}",
+                        "warn" if r["needs"] else ""))
+        m = p["glance"].get("members") or {}
+        out.append((f"  members: {m.get('workspaces', 0)} workspaces, {m.get('sessions', 0)} sessions, "
+                    f"{m.get('rows', 0)} open rows (counts only)", "dim"))
+    elif name == "project":
+        r = next((x for x in p.get("projects") or [] if x["repo"] == arg), None)
+        if not r:
+            return [(f"{arg}: no such project on the pulse", "warn")], []
+        out.append((f"{arg}  {r['live']} live · {r['running']} running · {r['open']} open · {r['needs']} need you", "bold"))
+        pn = (p.get("panels") or {}).get(arg)
+        if pn:
+            age = f"{ago(now - pn['at'])} old" if pn.get("at") else "no time"
+            out.append((f"PANEL {pn['title']}  ({age}{', STALE' if pn['stale'] else ''})" if not pn["err"]
+                        else f"PANEL: {pn['err']}", "warn" if pn["err"] or pn["stale"] else "bold"))
+            for row in pn["rows"]:
+                out.append((f"  {row['label']:<24} {row['value']}",
+                             "dim" if pn["stale"] else {"bad": "bad", "warn": "warn"}.get(row["state"], "")))
+        for w in p.get("workers") or []:
+            if w["repo"] == arg:
+                items.append((len(out), ("worker", w["repo"], w["track"])))
+                out.append(worker_line(w, width))
+        for s in p.get("sessions") or []:
+            if s["repo"] == arg:
+                items.append((len(out), ("session", s["id"])))
+                out.append(session_line(s, width))
+        out.append(("  b opens its board rows", "dim"))
+    elif name == "box":
+        b = p["glance"].get("box") or {}
+        out.append(("BOX", "bold"))
+        out += [(f"  {k:<11} {b.get(k)}", "") for k in ("load1", "cores", "mem_pct", "disk_pct", "temp_c", "units_down")]
+        out.append((f"  laptop      {p['glance'].get('laptop') or '(not asked yet)'}", ""))
+        out.append(("SECTIONS (when each last collected, and its error)", "bold"))
+        for k, v in sorted((p.get("sections") or {}).items()):
+            out.append((f"  {k:<10} {ago(now - v['at']) + ' ago' if v.get('at') else 'never':<10} {v.get('err') or ''}",
+                        "bad" if v.get("err") else ""))
+    return out, items
+
+
+def text(p, width=80, rows=24):
+    lines, _ = home(p, width, rows)
+    return "\n".join(t for t, _ in lines)
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] == ["--once"] and argv[1:] in (["--json"], ["--text"]):
+        p = Pulse().step(laptop=False)
+        if argv[1] == "--json":
+            print(json.dumps(p, indent=1))
+        else:
+            print(text(p))
+        return 0
+    if argv[:1] == ["run"]:
+        out = argv[2] if argv[1:2] == ["--out"] and len(argv) > 2 else None
+        try:
+            feed(lambda p: write(p, out), out=out)
+        except KeyboardInterrupt:
+            pass
+        return 0
+    print(__doc__.split("\n\n")[2], file=sys.stderr)
+    return 2
+
+
+# ── selfcheck ─────────────────────────────────────────────────────────────────────────────────────────────────
+SHAPE = {"v": int, "at": int, "zone": str, "host": str, "glance": dict, "sessions": list, "workers": list,
+         "landing": list, "needs": list, "recent": list, "projects": list, "panels": dict, "sections": dict}
+GLANCE = {"needs": ("n",), "sessions": ("busy", "waiting", "idle", "shell"),
+          "workers": ("live", "offline", "held"), "landing": ("active", "queued", "landed_1h"),
+          "box": ("load1", "cores", "mem_pct", "disk_pct", "temp_c", "units_down"),
+          "members": ("workspaces", "sessions", "rows", "needs")}
+ROWS = {"sessions": ("id", "name", "repo", "track", "state", "since_s", "ctx_pct", "win"),
+        "workers": ("repo", "track", "title", "status", "live", "moved_s", "held"),
+        "landing": ("repo", "pr", "stage", "title", "age_s"), "needs": ("kind", "repo", "name", "ask"),
+        "recent": ("at", "what", "repo", "name", "title"),
+        "projects": ("repo", "live", "running", "open", "needs", "landed_at", "usd", "panel")}
+
+
+def valid(p):
+    """[problem] where p departs from THE SHAPE; empty when it matches."""
+    bad = [f"{k} missing or not {t.__name__}" for k, t in SHAPE.items() if not isinstance(p.get(k), t)]
+    g = p.get("glance") or {}
+    for k, fields in GLANCE.items():
+        bad += [f"glance.{k}.{f} missing" for f in fields if f not in (g.get(k) or {})]
+    bad += [f"glance.{k} missing" for k in ("limit_until", "model", "laptop", "spend_today") if k not in g]
+    for k, fields in ROWS.items():
+        for i, r in enumerate(p.get(k) or []):
+            bad += [f"{k}[{i}].{f} missing" for f in fields if f not in r]
+    for repo, pn in (p.get("panels") or {}).items():
+        bad += [f"panels.{repo}.{f} missing" for f in ("title", "at", "rows", "stale", "err") if f not in pn]
+    return bad
+
+
+def selfcheck(*a, **k):
+    """The cases are core/tests/selfcheck/cc-pulse.py, run in THIS namespace so their stubs and `global`
+    rebinds land on the tool as they did when the body was here. Defining them replaces this selfcheck()."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tests", "selfcheck", "cc-pulse.py")
+    with open(path, encoding="utf-8") as fh:
+        exec(compile(fh.read(), path, "exec"), globals())
+    return globals()["selfcheck"](*a, **k)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

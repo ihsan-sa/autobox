@@ -131,9 +131,10 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc-land myapp 71 [72 …]              land it: gates, merge, card, board, ledger, install, units, restarts
                                          (your 👍 on the #approvals card runs the same thing)
     ccbox experiment                     unrestricted, boxed    box-status       health
-    ssh -t <box> ~/bin/cc-live           the box live: hand-offs, running, landings, idle/offline seats;
-                                         ↑↓ move, Enter opens (PRs landed, landings graph, timeline, a row,
-                                         a landing, a seat), Esc or Backspace back, q or Ctrl-C quits
+    ssh -t <box> ~/bin/cc-live           the box live: needs you, sessions and workers on one screen; one key
+                                         per section (s w n l r p b f m x), : jumps by name, ↑↓ move,
+                                         Enter opens, Esc back, t switches tmux, q quits
+    cc-pulse --once --json|--text        the status feed every dashboard reads, as JSON or as that screen
     cc slack setup | on | status         Slack ↔ sessions       #<repo> in Slack talk to that session
     cc-scope list myapp                  asks still open        cc-scope unverified myapp  landed, nothing checked
     cc-graphs serve | stop | status      tokens + vitals in a browser, on 127.0.0.1:5190 (loopback)
