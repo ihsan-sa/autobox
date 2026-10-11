@@ -357,7 +357,7 @@ class TestDeploy(Box):
         self.assertEqual(D.run("demo", green=lambda r, s: True)["targets"]["demo"]["state"], "failed")
 
     def test_verify_runs_last_and_an_unchecked_ask_is_unverified(self):
-        os.makedirs(os.environ["CC_BOARDS"])
+        os.makedirs(os.environ["CC_BOARDS"], exist_ok=True)   # Case made it: its review root is a board path
         with open(os.path.join(os.environ["CC_BOARDS"], "demo.json"), "w") as f:
             json.dump({"tracks": {"row-a": {"pr": "https://x/pull/7", "status": "review"}}}, f)
         D.record_applied("demo", OLD)

@@ -8,6 +8,7 @@ LANDER_STATE and its own git repo.
 """
 import base64
 import contextlib
+import dataclasses
 import datetime
 import fcntl
 import io
@@ -63,7 +64,9 @@ class Env(unittest.TestCase):
         # CC_SUITES_DIR: no laptop unless a case makes one (this box's own ~/.cc/suites would route a loaded run there)
         p = mock.patch.dict(os.environ, {"LANDER_STATE": self.state, "CC_LAND_STATE": os.path.join(self.tmp, "land"),
                                          "LANDER_SCOPE": "0", "TMPDIR": tmpdir,
-                                         "CC_SUITES_DIR": os.path.join(self.tmp, "suites")})
+                                         "CC_SUITES_DIR": os.path.join(self.tmp, "suites"),
+                                         # the host's checkouts are $CC_DEV/<repo> and the boards' paths (git.host_tree)
+                                         "CC_DEV": self.tmp, "CC_BOARDS": os.path.join(self.tmp, "boards")})
         p.start()
         self.addCleanup(p.stop)
         # nothing reads the box's own ~/.cc/state/land or config: every state root falls back to the passwd home
@@ -166,6 +169,558 @@ class Tree(Env):
         self.assertNotEqual(wt, self.tree)
         self.assertIn("new.txt", git(self.repo, "ls-tree", "--name-only", wt))
         self.assertEqual(git(self.repo, "status", "--porcelain"), "?? new.txt")   # the real index is untouched
+
+    def test_tree_of_the_working_copy_runs_none_of_its_hooks(self):
+        # cc-green's pinned host run for a fenced worker takes the worker's tree this way, as the owner. A relative
+        # core.hooksPath (core/.githooks here) is a directory the worker writes, and read-tree and add fire
+        # post-index-change; .git/hooks and a core.fsmonitor command are pinned off the same way.
+        marks = os.path.join(self.tmp, "marks")
+        os.mkdir(marks)
+        hook = f"#!/bin/sh\ntouch {marks}/\"$(basename \"$0\")\"\n"
+        for d in ("core/.githooks", ".git/hooks"):
+            for name in ("post-index-change", "reference-transaction", "fsmon"):
+                write(self.repo, {f"{d}/{name}": hook})
+                os.chmod(os.path.join(self.repo, d, name), 0o755)
+        write(self.repo, {"new.txt": "n"})
+        for cfg in ((), ("core.hooksPath", "core/.githooks")):
+            if cfg:
+                git(self.repo, "config", *cfg)
+            git(self.repo, "config", "core.fsmonitor", os.path.join(self.repo, "core/.githooks/fsmon"))
+            wt = RUN.tree_of(self.repo, "")
+            self.assertIn("new.txt", git(self.repo, "ls-tree", "--name-only", wt))
+            self.assertEqual(os.listdir(marks), [], cfg or "the default .git/hooks")
+        git(self.repo, "config", "--unset", "core.fsmonitor")
+        git(self.repo, "add", "new.txt")   # …and the hooks are real: a plain index write by git fires one
+        self.assertIn("post-index-change", os.listdir(marks))
+
+    def test_a_worktree_config_that_is_not_the_hosts_is_refused_and_runs_nothing(self):
+        # With extensions.worktreeConfig on, git reads <admin dir>/config.worktree, which a worker writes. A filter's
+        # clean command there plus `* filter=x` in .gitattributes ran on the host's `add -A` as the owner whatever
+        # NOHOOK pinned (#1078's security read), and an include.path in it reaches the same through another file.
+        from lander import plan as P
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        wt = os.path.join(self.tmp, "wt")
+        git(self.repo, "worktree", "add", "-q", wt, "-b", "track/x")
+        gd, base = git(wt, "rev-parse", "--absolute-git-dir"), git(self.repo, "rev-parse", "HEAD")
+        marks = os.path.join(self.tmp, "fmarks")
+        os.mkdir(marks)
+        inc = os.path.join(self.tmp, "inc.cfg")
+        filt = f'[filter "x"]\n\tclean = "touch {marks}/clean; cat"\n'
+        with open(inc, "w") as f:
+            f.write(filt)
+        write(wt, {".gitattributes": "* filter=x\n", "new.txt": "n"})
+        open(os.path.join(gd, "config.worktree"), "w").close()   # the box's own: empty, and the tree is taken
+        self.assertIn("new.txt", git(self.repo, "ls-tree", "--name-only", RUN.tree_of(wt, "")))
+        for name, body in (("filter", filt), ("include.path", f"[include]\n\tpath = {inc}\n")):
+            with open(os.path.join(gd, "config.worktree"), "w") as f:
+                f.write(body)
+            self.assertEqual(RUN.tree_of(wt, ""), "", name)
+            with self.assertRaises(RUN.G.GitError, msg=name):
+                P.changed(wt, base, "")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = CK.cmd_check([wt, "--base", base])
+            self.assertEqual(rc, CK.EXIT_NONE, name)
+            self.assertIn("config.worktree is not the host's", err.getvalue(), name)
+            self.assertEqual(os.listdir(marks), [], name)
+        os.remove(os.path.join(gd, "config.worktree"))   # …and a link to an empty file is refused too: not a plain file
+        os.symlink(os.devnull, os.path.join(gd, "config.worktree"))
+        self.assertEqual(RUN.tree_of(wt, ""), "")
+        os.remove(os.path.join(gd, "config.worktree"))
+        with open(os.path.join(gd, "config.worktree"), "w") as f:
+            f.write(filt)
+        git(wt, "add", "-A")   # …and the plant is real: a plain git add runs the filter
+        self.assertIn("clean", os.listdir(marks))
+
+    def test_a_fifo_worktree_config_is_refused_without_git_opening_it(self):
+        # git opens config.worktree to find the admin dir (rev-parse), so a FIFO planted there hung the lander before
+        # its lstat (#1078's security read). The admin dir comes from the worktree's .git gitfile instead, and only a
+        # regular file is ever opened. Run in a child with a timeout so the old code fails here and never hangs the suite.
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        wt = os.path.join(self.tmp, "wt")
+        git(self.repo, "worktree", "add", "-q", wt, "-b", "track/x")
+        gd, base = git(wt, "rev-parse", "--absolute-git-dir"), git(self.repo, "rev-parse", "HEAD")
+        os.mkfifo(os.path.join(gd, "config.worktree"))
+        os.mkdir(os.path.join(wt, "sub"))
+        probe = textwrap.dedent(f'''
+            import contextlib, io, sys
+            sys.path.insert(0, {CORE!r})
+            from lander import check as CK, git as G, plan as P, run as RUN
+            print(bool(G.foreign_config({wt!r})), bool(G.foreign_config({os.path.join(wt, "sub")!r})))
+            print(RUN.tree_of({wt!r}, "") == "")
+            try:
+                P.changed({wt!r}, {base!r}, "")
+                print("changed-ran")
+            except G.GitError:
+                print("changed-refused")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                print(CK.cmd_check([{wt!r}, "--base", {base!r}]) == CK.EXIT_NONE, "not the host's" in err.getvalue())
+        ''')
+        p = subprocess.Popen([sys.executable, "-c", probe], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             start_new_session=True)
+        try:
+            out, err = p.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, 9)   # the child and the git it is blocked in
+            p.communicate()
+            self.fail("the lander hung on a FIFO config.worktree")
+        self.assertEqual(out.split("\n"), ["True True", "True", "changed-refused", "True True", ""], err)
+        # …a gitfile that is not a regular file is refused the same way, and is never opened either
+        os.remove(os.path.join(gd, "config.worktree"))
+        os.rename(os.path.join(wt, ".git"), os.path.join(self.tmp, "gitfile"))
+        os.mkfifo(os.path.join(wt, ".git"))
+        p = subprocess.run([sys.executable, "-c", f"import sys; sys.path.insert(0, {CORE!r}); from lander import git; "
+                            f"print(git.foreign_config({wt!r}))"], capture_output=True, text=True, timeout=20)
+        self.assertEqual(p.stdout.strip(), os.path.join(wt, ".git"), p.stderr)
+        # …and with the gitfile back, a relative gitdir: line resolves against the worktree and finds the same admin dir
+        os.remove(os.path.join(wt, ".git"))
+        for end in ("\n", "\r\n"):   # git strips a CR as well as the LF
+            with open(os.path.join(wt, ".git"), "w", newline="") as f:
+                f.write(f"gitdir: {os.path.relpath(gd, wt)}{end}")
+            if os.path.lexists(os.path.join(gd, "config.worktree")):
+                os.remove(os.path.join(gd, "config.worktree"))
+            self.assertEqual(RUN.G.foreign_config(wt), "", repr(end))
+            with open(os.path.join(gd, "config.worktree"), "w") as f:
+                f.write("[core]\n")
+            self.assertEqual(RUN.G.foreign_config(wt), os.path.join(gd, "config.worktree"), repr(end))
+        self.assertEqual(RUN.G.foreign_config(self.repo), "")   # the main checkout's .git is a dir: never looked at
+
+    def test_a_subdirectory_is_refused_since_git_climbs_past_what_is_planted_there(self):
+        # foreign_config walked up to the first .git and took a directory there for a main checkout, but git skips a
+        # .git (or a bare repo) it does not take for one and climbs on to the worktree's gitfile, so `lander check sub`
+        # with an empty sub/.git ran a worker's filter (#1078's second security read). Only root's own .git counts.
+        from lander import plan as P
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        wt = os.path.join(self.tmp, "wt")
+        git(self.repo, "worktree", "add", "-q", wt, "-b", "track/x")
+        gd, base = git(wt, "rev-parse", "--absolute-git-dir"), git(self.repo, "rev-parse", "HEAD")
+        marks = os.path.join(self.tmp, "smarks")
+        os.mkdir(marks)
+        filt = f'[filter "x"]\n\tclean = "touch {marks}/clean; cat"\n'
+        sub = os.path.join(wt, "sub")
+        write(wt, {".gitattributes": "* filter=x\n", "sub/new.txt": "n"})
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        for plant in ("empty .git", "bare repo"):
+            if plant == "empty .git":   # the hostile file is the admin dir's config.worktree, which git reaches
+                os.mkdir(os.path.join(sub, ".git"))
+                with open(os.path.join(gd, "config.worktree"), "w") as f:
+                    f.write(filt)
+            else:                       # the hostile file is sub/config, which git reads as the repo's own
+                shutil.rmtree(os.path.join(sub, ".git"))
+                open(os.path.join(gd, "config.worktree"), "w").close()
+                for d in ("objects", "refs"):
+                    os.mkdir(os.path.join(sub, d))
+                write(sub, {"HEAD": "ref: refs/heads/main\n", "config": f"[core]\n\tbare = true\n{filt}"})
+            self.assertIn("touch", git(sub, "config", "filter.x.clean"), plant)   # the plant is real: git reads it
+            self.assertTrue(RUN.G.foreign_config(sub), plant)
+            self.assertEqual(RUN.tree_of(sub, ""), "", plant)
+            with self.assertRaises(RUN.G.GitError, msg=plant):
+                P.changed(sub, base, "")
+            for argv, at in (([sub, "--base", base], cwd), (["--base", base], sub)):   # named, and the default "."
+                os.chdir(at)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                    rc = CK.cmd_check(argv)
+                os.chdir(cwd)
+                self.assertIn(rc, (CK.EXIT_USAGE, CK.EXIT_NONE), (plant, argv, err.getvalue()))
+            self.assertEqual(os.listdir(marks), [], plant)
+        os.remove(os.path.join(sub, "config"))   # …and a plain subdirectory is refused by name, before any git call
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(CK.cmd_check([os.path.join(wt, "sub", "objects"), "--base", base]), CK.EXIT_USAGE)
+        self.assertIn("not a checkout's top directory", err.getvalue())
+
+    def test_only_a_tree_the_host_made_is_taken(self):
+        # foreign_config imitated git's discovery by the names inside root/.git, but git also reads HEAD and follows
+        # commondir, and takes a repo a worker built for a real one (#1078's third reads). Each plant below passed as
+        # clean while git climbed to the worktree's config.worktree or read a config the worker wrote. Only a linked
+        # worktree registered under a host repo's own .git/worktrees, or the host checkout itself, is taken now.
+        from lander import plan as P
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        wt = os.path.join(self.tmp, "wt")
+        git(self.repo, "worktree", "add", "-q", wt, "-b", "track/x")
+        gd, base = git(wt, "rev-parse", "--absolute-git-dir"), git(self.repo, "rev-parse", "HEAD")
+        marks = os.path.join(self.tmp, "hmarks")
+        os.mkdir(marks)
+        filt = f'[filter "x"]\n\tclean = "touch {marks}/clean; cat"\n'
+        sub, cfgwt = os.path.join(wt, "sub"), os.path.join(gd, "config.worktree")
+        write(wt, {".gitattributes": "* filter=x\n", "sub/new.txt": "n"})
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        ws = os.path.join(self.tmp, "scratch")   # where the worker writes its own repos: not a host checkout ($CC_DEV/<x>)
+
+        def repo_at(d, cfg=filt):   # what git takes for a repo: HEAD, objects, refs, and a config the worker wrote
+            write(d, {"HEAD": "ref: refs/heads/main\n", "config": cfg})
+            for n in ("objects", "refs"):
+                os.makedirs(os.path.join(d, n), exist_ok=True)
+
+        def fake_common():   # a whole repo of the worker's, with sub registered as its linked worktree
+            c = os.path.join(ws, "evilc", ".git")
+            repo_at(c, "[core]\n\trepositoryformatversion = 0\n" + filt)
+            write(os.path.join(c, "worktrees", "sub"), {"HEAD": "ref: refs/heads/main\n", "commondir": "../..\n",
+                                                        "gitdir": os.path.join(sub, ".git") + "\n"})
+            write(sub, {".git": f"gitdir: {os.path.join(c, 'worktrees', 'sub')}\n"})
+        plants = (   # (name, plant it, whether git then reads a filter the worker wrote)
+            ("junk HEAD", lambda: (write(gd, {"config.worktree": filt}), repo_at(os.path.join(sub, ".git")),
+                                   write(sub, {".git/HEAD": "junk\n"})), True),
+            ("commondir nowhere", lambda: (write(gd, {"config.worktree": filt}),
+                                           write(sub, {".git/HEAD": "ref: refs/heads/main\n",
+                                                       ".git/commondir": "/nonexistent\n"})), True),
+            ("fake repo", lambda: repo_at(os.path.join(sub, ".git")), True),
+            ("gitfile to a worker dir", lambda: (repo_at(os.path.join(ws, "evil")),
+                                                 write(sub, {".git": f"gitdir: {os.path.join(ws, 'evil')}\n"})),
+             True),
+            ("worktree of a worker repo", fake_common, True),
+            ("gitdir not pointing back", lambda: write(sub, {".git": f"gitdir: {gd}\n"}), False),
+        )
+        for name, plant, hostile in plants:
+            with self.subTest(name):
+                for p in (os.path.join(sub, ".git"), os.path.join(ws, "evil"), os.path.join(ws, "evilc")):
+                    if os.path.isdir(p):
+                        shutil.rmtree(p)
+                    elif os.path.lexists(p):
+                        os.remove(p)
+                open(cfgwt, "w").close()
+                plant()
+                if hostile:   # the plant is real: git in sub reads the worker's filter
+                    self.assertIn("touch", git(sub, "config", "filter.x.clean"))
+                self.assertTrue(RUN.G.foreign_config(sub))
+                self.assertEqual(RUN.tree_of(sub, ""), "")
+                with self.assertRaises(RUN.G.GitError):
+                    P.changed(sub, base, "")
+                for argv, at in (([sub, "--base", base], cwd), (["--base", base], sub)):   # named, and the default "."
+                    os.chdir(at)
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                        rc = CK.cmd_check(argv)
+                    os.chdir(cwd)
+                    self.assertIn(rc, (CK.EXIT_USAGE, CK.EXIT_NONE), (argv, err.getvalue()))
+                for argv, at in ((["--repo", sub, base], cwd), ([base], sub)):   # `lander plan`, named and from sub
+                    os.chdir(at)
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        rc = P.cmd_plan(argv)
+                    os.chdir(cwd)
+                    self.assertNotEqual(rc, 0, argv)
+                self.assertEqual(os.listdir(marks), [])
+        if os.path.lexists(os.path.join(sub, ".git")):
+            os.remove(os.path.join(sub, ".git"))
+        open(cfgwt, "w").close()
+        # …the admin dir's commondir pointed at a repo of the worker's: the root itself is refused
+        with open(os.path.join(gd, "commondir")) as f:
+            commondir = f.read()
+        repo_at(os.path.join(ws, "evilr"), "[extensions]\n\tworktreeConfig = true\n" + filt)
+        os.mkdir(os.path.join(ws, "evilr", "worktrees"))
+        write(gd, {"commondir": os.path.join(ws, "evilr") + "\n"})
+        self.assertIn("touch", git(wt, "config", "filter.x.clean"))
+        self.assertTrue(RUN.G.foreign_config(wt))
+        self.assertEqual(RUN.tree_of(wt, ""), "")
+        self.assertEqual(os.listdir(marks), [])
+        write(gd, {"commondir": commondir})
+        # …and what the host made is still taken: the worktree and the main checkout. A submodule is not: its git dir
+        # is one a worker can copy into its own admin dir (test_a_repo_in_the_admin_dirs_modules_is_refused)
+        self.assertEqual(RUN.G.foreign_config(wt), "")
+        self.assertIn("sub", git(self.repo, "ls-tree", "--name-only", RUN.tree_of(wt, "")))
+        self.assertEqual(sorted(P.changed(wt, base, "")), [".gitattributes", "sub/new.txt"])
+        self.assertEqual(RUN.G.foreign_config(self.repo), "")
+        self.assertTrue(RUN.tree_of(self.repo, ""))
+        src = os.path.join(self.tmp, "smsrc")
+        os.mkdir(src)
+        git(src, "init", "-q")
+        git(src, "commit", "-q", "--allow-empty", "-m", "s")
+        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", src, "mod")
+        mod = os.path.join(self.repo, "mod")
+        self.assertTrue(RUN.G.foreign_config(mod))
+        self.assertEqual(RUN.tree_of(mod, ""), "")
+        self.assertEqual(os.listdir(marks), [])
+
+    def hostile(self):
+        """A linked worktree the host registered, with worktreeConfig on, `* filter=x` in its .gitattributes and a
+        file for the filter to run on -> (wt, its admin dir, base, marks dir, a config that defines filter x)."""
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        wt = os.path.join(self.tmp, "wt")
+        git(self.repo, "worktree", "add", "-q", wt, "-b", "track/x")
+        gd, base = git(wt, "rev-parse", "--absolute-git-dir"), git(self.repo, "rev-parse", "HEAD")
+        marks = os.path.join(self.tmp, "fmarks")
+        os.mkdir(marks)
+        write(wt, {".gitattributes": "* filter=x\n", "new.txt": "n\n"})
+        return wt, gd, base, marks, f'[filter "x"]\n\tclean = "touch {marks}/clean; cat"\n'
+
+    def test_a_repo_in_the_admin_dirs_modules_is_refused(self):
+        # #1078's fourth read: the submodule arm took any git dir under <common>/worktrees/<id>/modules, and a worker
+        # writes its own admin dir, so a repo copied there with a filter in its config, named by sub/.git, ran it
+        from lander import plan as P
+        wt, gd, base, marks, filt = self.hostile()
+        evil, src = os.path.join(gd, "modules", "evil"), os.path.join(self.tmp, "tmpl")
+        os.mkdir(src)
+        git(src, "init", "-q")
+        git(src, "commit", "-q", "--allow-empty", "-m", "x")
+        shutil.copytree(os.path.join(src, ".git"), evil)
+        with open(os.path.join(evil, "config"), "a") as f:
+            f.write(filt)
+        write(wt, {"sub/new.txt": "n\n", "sub/.gitattributes": "* filter=x\n", "sub/.git": f"gitdir: {evil}\n"})
+        sub = os.path.join(wt, "sub")
+        self.assertIn("touch", git(sub, "config", "filter.x.clean"))   # the plant is real: git in sub reads it
+        self.assertTrue(RUN.G.foreign_config(sub))
+        self.assertEqual(RUN.tree_of(sub, ""), "")
+        with self.assertRaises(RUN.G.GitError):
+            P.changed(sub, base, "")
+        self.assertTrue(RUN.tree_of(wt, ""))   # the root is the host's: sub is a gitlink there, and nothing runs
+        self.assertEqual(os.listdir(marks), [])
+
+    def test_a_commondir_in_a_host_checkouts_git_dir_is_refused(self):
+        # the directory arm took $CC_DEV/<name>/.git without looking inside: a member's planted .git/commondir sent
+        # git to a common dir of the member's own, its config read and its filter run on `add -A`
+        alice, evilc, marks = (os.path.join(self.tmp, n) for n in ("alice", "evilc", "cmarks"))
+        os.mkdir(alice)
+        os.mkdir(marks)
+        git(alice, "init", "-q")
+        git(alice, "commit", "-q", "--allow-empty", "-m", "i")
+        self.assertEqual(RUN.G.foreign_config(alice), "")
+        write(alice, {".gitattributes": "* filter=x\n", "new.txt": "n\n"})
+        git(self.tmp, "init", "-q", "--bare", evilc)
+        shutil.copytree(os.path.join(alice, ".git", "objects"), os.path.join(evilc, "objects"), dirs_exist_ok=True)
+        shutil.copytree(os.path.join(alice, ".git", "refs"), os.path.join(evilc, "refs"), dirs_exist_ok=True)
+        with open(os.path.join(evilc, "config"), "a") as f:
+            f.write(f'[filter "x"]\n\tclean = "touch {marks}/clean; cat"\n')
+        write(alice, {".git/commondir": evilc + "\n"})
+        self.assertIn("touch", git(alice, "config", "filter.x.clean"))   # the plant is real
+        self.assertEqual(RUN.G.foreign_config(alice), os.path.join(alice, ".git", "commondir"))
+        self.assertEqual(RUN.tree_of(alice, ""), "")
+        with self.assertRaises(RUN.G.GitError):
+            RUN.G.at(alice)
+        self.assertEqual(os.listdir(marks), [])
+
+    def test_a_config_worktree_written_after_the_check_is_never_read(self):
+        # #1078's fourth read: config.worktree is the worker's own file while it runs, so whatever host_tree saw, a
+        # rewrite between its check and `add -A` ran the filter (11 times in 150 tree_of calls). Here the rewrite
+        # lands right after every host_tree call, which is the race won every time: git builds the tree FENCED, in a
+        # git dir of the lander's own, so the rewritten file is never read
+        from lander import plan as P
+        wt, gd, base, marks, filt = self.hostile()
+        inc = os.path.join(self.tmp, "inc.cfg")
+        write(self.tmp, {"inc.cfg": filt})
+        real = RUN.G.host_tree
+        for name, body in (("a filter", filt), ("an include", f"[include]\n\tpath = {inc}\n")):
+            with self.subTest(name):
+                open(os.path.join(gd, "config.worktree"), "w").close()
+
+                def racing(root, body=body):
+                    t = real(root)
+                    write(gd, {"config.worktree": body})
+                    return t
+                with mock.patch.object(RUN.G, "host_tree", racing):
+                    tree = RUN.tree_of(wt, "")
+                    self.assertIn("touch", git(wt, "config", "filter.x.clean"))   # the rewrite is real
+                    open(os.path.join(gd, "config.worktree"), "w").close()
+                    files = P.changed(wt, base, "")
+                    self.assertIn("touch", git(wt, "config", "filter.x.clean"))
+                open(os.path.join(gd, "config.worktree"), "w").close()   # before plain_tree, which would run it
+                self.assertTrue(tree)
+                self.assertEqual(sorted(files), [".gitattributes", "new.txt"])
+                self.assertEqual(os.listdir(marks), [])
+                # the tree is the one plain hashing names with no filter about (green_tree's three commands)
+                self.assertEqual(tree, self.plain_tree(wt))
+
+    def test_reads_after_host_tree_never_open_a_rewritten_config_worktree(self):
+        # #1078's fifth read: check's merge-base, the VERIFIED reads' cat-file and sealed()'s rev-parse still ran with
+        # GIT_DIR the worker's admin dir, so a config.worktree rewritten after host_tree to include a FIFO hung
+        # `lander check` for good, and an included filter could steer what they read. Refs are read as files now and
+        # git runs in a bare FENCED reader. A child with a timeout, so the old code fails here and never hangs the suite.
+        wt, gd, base, marks, filt = self.hostile()
+        fifo, inc = os.path.join(self.tmp, "inc.fifo"), os.path.join(self.tmp, "inc.cfg")
+        os.mkfifo(fifo)
+        write(self.tmp, {"inc.cfg": filt})
+        cfgwt = os.path.join(gd, "config.worktree")
+        base_tree = git(self.repo, "rev-parse", f"{base}^{{tree}}")
+        for name, path in (("a FIFO include", fifo), ("a filter include", inc)):
+            with self.subTest(name):
+                open(cfgwt, "w").close()
+                probe = textwrap.dedent(f'''
+                    import sys
+                    sys.path.insert(0, {CORE!r})
+                    from lander import check as CK, git as G, plan as P
+                    real = G.host_tree
+                    def racing(root):
+                        t = real(root)
+                        with open({cfgwt!r}, "w") as f:
+                            f.write("[include]\\n\\tpath = {path}\\n")
+                        return t
+                    def fresh():   # the host's empty file, and host_tree takes it again: the race won each call
+                        open({cfgwt!r}, "w").close()
+                        G._TREES.clear()
+                    G.host_tree = racing
+                    fresh()
+                    print(CK.default_base({wt!r}) == {base!r})
+                    fresh()
+                    print(G.tree_of({wt!r}, {base!r}) == {base_tree!r}, G.tree_of({wt!r}, "HEAD") == {base_tree!r})
+                    fresh()
+                    print(G.read_verified({wt!r}, "HEAD", "README.md") is not None)
+                    fresh()
+                    with G.sealed({wt!r}, {base!r}, "HEAD") as ((rc, out), run):
+                        print(rc, out == [{base!r}, {base!r}])
+                    fresh()
+                    print(sorted(P.changed({wt!r}, {base!r}, "")))
+                    print("include" in open({cfgwt!r}).read())
+                ''')
+                p = subprocess.Popen([sys.executable, "-c", probe], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     text=True, start_new_session=True)
+                try:
+                    out, err = p.communicate(timeout=60)
+                except subprocess.TimeoutExpired:
+                    os.killpg(p.pid, 9)   # the child and the git it is blocked in
+                    p.communicate()
+                    self.fail(f"a read hung on {name} in config.worktree")
+                self.assertEqual(out.split("\n"), ["True", "True True", "True", "0 True",
+                                                   "['.gitattributes', 'new.txt']", "True", ""], err)
+                self.assertEqual(os.listdir(marks), [])
+        open(cfgwt, "w").close()
+
+    def test_a_name_is_read_as_files_and_resolved_in_the_reader(self):
+        # _name: a ref by git's DWIM order read as files, then what follows it and an abbreviated id in the reader
+        wt, gd, base, marks, filt = self.hostile()
+        t = RUN.G.host_tree(wt)
+        tree = git(self.repo, "rev-parse", f"{base}^{{tree}}")
+        with RUN.G.fenced(t, bare=True) as env:
+            self.assertNotIn("GIT_WORK_TREE", env)
+            for rev, want in (("HEAD", base), ("track/x", base), ("refs/heads/track/x", base), ("HEAD^{tree}", tree),
+                              ("track/x:", tree), (base[:10], base), (f"{base}^{{commit}}", base)):
+                self.assertEqual(RUN.G._name(t, env, rev), (0, want), rev)
+            for rev in ("-x", "", "no/such/branch", "HEAD~9"):
+                self.assertNotEqual(RUN.G._name(t, env, rev)[0], 0, rev)
+        self.assertEqual(RUN.G.merge_base(t, "HEAD", "track/x"), base)
+        self.assertEqual(RUN.G.merge_base(t, "HEAD", "no/such/branch"), "")
+        self.assertEqual(RUN.G.merge_base(RUN.G.Tree("", "", wt), "HEAD", "HEAD"), "")
+        with RUN.G.sealed(wt, "no/such/branch") as ((rc, out), run):
+            self.assertIsNone(run)
+        self.assertEqual(RUN.G.objects_dir(wt), os.path.join(t.common, "objects"))
+        shutil.rmtree(os.path.join(t.common, "objects", "pack"))
+        with self.assertRaises(RUN.G.GitError):
+            RUN.G.objects_dir(wt)
+
+    def test_an_objects_session_that_outlives_its_timer_fails_closed(self):
+        wt, gd, base, marks, filt = self.hostile()
+        with mock.patch.object(RUN.G, "OBJECTS_SECS", 0.05):
+            with RUN.G.Objects(wt) as o:
+                o.p.wait(timeout=20)   # the timer killed cat-file
+                with self.assertRaises(RUN.G.GitError):
+                    o.read(base)
+
+    def plain_tree(self, top):
+        """tests/green.sh's green_tree: read-tree HEAD, add -A, write-tree in the checkout on an index of its own."""
+        idx = os.path.join(self.tmp, "plain.index")
+        env = dict(os.environ, GIT_INDEX_FILE=idx)
+        for a in (("read-tree", "HEAD"), ("add", "-A")):
+            subprocess.run(["git", "-C", top, *a], env=env, check=True, capture_output=True)
+        tree = subprocess.run(["git", "-C", top, "write-tree"], env=env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+        os.remove(idx)
+        return tree
+
+    def test_the_fenced_tree_is_the_tree_plain_hashing_names(self):
+        # landing verdicts compare the tree a worker's green named (green_tree, plain git in the checkout) with the
+        # one the lander takes; FENCED must name the same tree wherever no filter or eol rule is configured
+        wt = os.path.join(self.tmp, "wt")
+        write(self.repo, {".gitignore": "*.log\nbuild/\n", "kept.log": "tracked though ignored\n", "gone.txt": "g\n",
+                          "link-target": "t\n"})
+        os.symlink("link-target", os.path.join(self.repo, "link"))
+        git(self.repo, "add", "-A", "-f")
+        git(self.repo, "commit", "-qm", "more")
+        git(self.repo, "worktree", "add", "-q", wt, "-b", "track/eq")
+        write(wt, {"README.md": "changed\n", "untracked.txt": "u\n", "x.log": "ignored\n", "build/o": "ignored\n",
+                   "kept.log": "tracked, changed\n", "skipme": "by info/exclude\n", "deep/a/b.txt": "b\n"})
+        os.remove(os.path.join(wt, "gone.txt"))
+        os.chmod(os.path.join(wt, "core/bin/tool"), 0o644)
+        write(self.repo, {".git/info/exclude": "skipme\n"})
+        for top in (wt, self.repo):
+            with self.subTest(top):
+                got = RUN.tree_of(top, "")
+                self.assertTrue(got)
+                self.assertEqual(got, self.plain_tree(top))
+        names = git(self.repo, "ls-tree", "-r", "--name-only", RUN.tree_of(wt, "")).split("\n")
+        self.assertIn("untracked.txt", names)
+        self.assertIn("kept.log", names)
+        for gone in ("x.log", "build/o", "skipme", "gone.txt"):
+            self.assertNotIn(gone, names)
+
+    def test_a_refused_root_runs_no_git_and_its_cached_tree_is_dropped(self):
+        # at() on a root host_tree refuses gave git a ceiling and ran it anyway, and a refusal after an accept
+        # dropped the cached tree so the next object read fell back to that. It raises now, before any git runs
+        wt, gd, base, marks, filt = self.hostile()
+        outside = tempfile.mkdtemp(prefix="not-a-host-checkout.")
+        self.addCleanup(shutil.rmtree, outside, True)
+        git(outside, "init", "-q")
+        git(outside, "commit", "-q", "--allow-empty", "-m", "x")
+        head = git(outside, "rev-parse", "HEAD")
+        with self.assertRaises(RUN.G.GitError):
+            RUN.G.at(outside)
+        with self.assertRaises(RUN.G.GitError):
+            RUN.G.objects_dir(outside)
+        with self.assertRaises(RUN.G.GitError):
+            RUN.G.read_verified(outside, head, "x")
+        with RUN.G.sealed(outside, head) as ((rc, out), run):
+            self.assertIsNone(run)
+            self.assertIn("not a checkout the host made", out)
+        self.assertEqual(RUN.tree_of(outside, head), "")
+        # …and a tree taken once, then refused, is refused from then on, not read through the cache
+        self.assertEqual(RUN.G.at(wt)["GIT_DIR"], gd)
+        write(gd, {"config.worktree": filt})
+        self.assertTrue(RUN.G.foreign_config(wt))
+        with self.assertRaises(RUN.G.GitError):
+            RUN.G.at(wt)
+        with self.assertRaises(RUN.G.GitError):
+            RUN.G.read_verified(wt, base, "README.md")
+        self.assertEqual(os.listdir(marks), [])
+
+    def test_a_nul_in_a_gitfile_or_the_admin_gitdir_is_a_refusal_not_a_traceback(self):
+        wt, gd, base, marks, filt = self.hostile()
+        with open(os.path.join(gd, "gitdir")) as f:
+            back = f.read()
+        write(gd, {"gitdir": back.rstrip("\n") + "\0x\n"})
+        self.assertTrue(RUN.G.foreign_config(wt))
+        self.assertEqual(RUN.tree_of(wt, ""), "")
+        write(gd, {"gitdir": back})
+        self.assertEqual(RUN.G.foreign_config(wt), "")
+        write(wt, {".git": f"gitdir: {gd}\0junk\n"})
+        self.assertEqual(RUN.G.foreign_config(wt), os.path.join(wt, ".git"))
+        self.assertEqual(RUN.G.foreign_config(wt + "\0"), wt + "\0")
+
+    def test_a_board_path_outside_dev_and_a_member_clone_are_host_checkouts(self):
+        # the host lands into $CC_DEV/<repo>, a board's `path` (named after the repo or not) and a member's clone
+        # under the lander's clones dir (jobs.repo_root): each is taken, and the same tree outside them is not
+        import json
+        lq = os.path.join(self.tmp, "lq")
+        os.makedirs(os.environ["CC_BOARDS"])
+        os.makedirs(os.path.join(self.tmp, "bob", ".cc"))
+        write(self.tmp, {"bob/.cc/member-workspace": ""})
+        roots = {"board named after it": os.path.join(self.tmp, "srv", "proj"),
+                 "board under another name": os.path.join(self.tmp, "srv", "other-dir"),
+                 "member clone": os.path.join(lq, "clones", "bob--proj")}
+        for name, root in roots.items():
+            with self.subTest(name):
+                os.makedirs(root)
+                git(root, "init", "-q")
+                write(root, {"f": "1\n"})
+                git(root, "add", "-A")
+                git(root, "commit", "-qm", "x")
+                with mock.patch.dict(os.environ, {"CC_LANDER_STATE": os.path.join(self.tmp, "elsewhere")}):
+                    self.assertTrue(RUN.G.foreign_config(root))   # before its board or clones dir names it
+                    self.assertEqual(RUN.tree_of(root, ""), "")
+                if name.startswith("board"):
+                    with open(os.path.join(os.environ["CC_BOARDS"], ("proj" if "after" in name else "anyname")
+                                           + ".json"), "w") as f:
+                        json.dump({"path": root}, f)
+                with mock.patch.dict(os.environ, {"CC_LANDER_STATE": lq}):
+                    self.assertEqual(RUN.G.foreign_config(root), "")
+                    self.assertEqual(RUN.tree_of(root, ""), git(root, "rev-parse", "HEAD^{tree}"))
+
+    def test_sweep_climbs_from_a_subdirectory_to_the_host_checkout(self):
+        # `lander sweep --repo <subdir>` on the owner's own checkout: the top is found by host_tree, not git discovery
+        sub = os.path.join(self.repo, "core", "bin")
+        self.assertEqual(CK.host_top(sub).work_tree, self.repo)
+        self.assertEqual(CK.host_top(self.repo).work_tree, self.repo)
+        nowhere = tempfile.mkdtemp(prefix="in-no-checkout.")
+        self.addCleanup(shutil.rmtree, nowhere, True)
+        self.assertTrue(CK.host_top(nowhere).refused)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(CK.cmd_sweep(["--repo", nowhere]), CK.EXIT_USAGE)
+        self.assertIn("in no checkout the host made", err.getvalue())
 
 
 @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
@@ -1373,6 +1928,91 @@ class CheckCommand(Env):
         rc, out = self.check()
         self.assertEqual(rc, 0, out)                           # red on the base too: main's, said, not held
         self.assertIn("main-red", out)
+
+
+class CheckCaged(Env):
+    """`lander check --caged-only`, cc-green's run for a fenced worker: the tree is the worker's, so a host- or box-class
+    check, or one that needs the network, a mount or another runner, is deferred to the landing and never run or passed
+    (2026-10-11, #1078's Opus reads: a worker edited a host check's script, asked for green, and it ran as the owner)."""
+
+    def setUp(self):
+        super().setUp()
+        self.mark = os.path.join(self.tmp, "marks")
+        os.mkdir(self.mark)
+        man = textwrap.dedent(f'''
+            [[check]]
+            name = "on-host"
+            run = "touch {self.mark}/host"
+            paths = ["bin/tool"]
+            class = "host"
+
+            [[check]]
+            name = "on-box"
+            run = "touch {self.mark}/box"
+            paths = ["bin/tool"]
+            class = "box"
+
+            [[check]]
+            name = "caged"
+            run = "bin/tool | grep -q tool"
+            paths = ["bin/tool"]
+            class = "hermetic"
+        ''')
+        # gate-first, so the box-class check is planned before the merge and not only listed for the tip
+        write(self.repo, {"core/tests/LANDING.toml": man,
+                          "core/tests/LANDING-policy.toml": '[paths]\ngate_first = ["bin/**"]\n'})
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "manifest")
+        git(self.repo, "branch", "base")
+        write(self.repo, {"core/bin/tool": "#!/bin/sh\necho tool again\n"})
+
+    def check(self, *more):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = CK.cmd_check([self.repo, "--base", "base", *more])
+        return rc, out.getvalue()
+
+    @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
+    def test_caged_only_defers_host_and_box_checks_and_runs_none_of_them(self):
+        rc, out = self.check("--caged-only")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.listdir(self.mark), [], out)          # neither script ran
+        self.assertIn("deferred on-host", " ".join(out.split()))
+        self.assertIn("deferred on-box", " ".join(out.split()))
+        self.assertIn("runs at landing: host-class", out)
+        self.assertIn("passed   caged", out)                      # the caged one still runs
+        self.assertIn("1 passed, 0 failed, 2 deferred to the landing — caged checks only, NOT a full green", out)
+        self.assertNotIn("passed   on-", out)
+
+    @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
+    def test_without_it_both_run_as_before(self):
+        rc, out = self.check()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(sorted(os.listdir(self.mark)), ["box", "host"], out)
+        self.assertIn("3 passed, 0 failed\n", out)
+        self.assertNotIn("deferred", out)
+
+    def test_what_uncaged_names(self):
+        c = T.Check(name="x", run="true", klass=T.HERMETIC)
+        self.assertEqual(RUN.uncaged(c), "")
+        self.assertEqual(RUN.uncaged(dataclasses.replace(c, klass=T.STATIC)), "")
+        self.assertIn("host-class", RUN.uncaged(dataclasses.replace(c, klass=T.HOST)))
+        self.assertIn("box-class", RUN.uncaged(dataclasses.replace(c, klass=T.BOX)))
+        self.assertEqual(RUN.uncaged(dataclasses.replace(c, net=True)), "needs the network")
+        self.assertEqual(RUN.uncaged(dataclasses.replace(c, mounts=["~/x"])), "needs host mounts")
+        self.assertEqual(RUN.uncaged(dataclasses.replace(c, where=["laptop"])), "runs only on laptop")
+
+    def test_a_caged_plan_never_leaves_the_box(self):
+        seen = []
+
+        def runner(check, tree, where, **kw):
+            seen.append(where)
+            return T.Result(check=check.name, tree=tree, status=T.PASSED, secs=0)
+        c = T.Check(name="x", run="true", klass=T.HERMETIC, where=["laptop", "box"])
+        m = M.Manifest(checks={"x": c})
+        with mock.patch.object(RUN, "laptop_dest", return_value="u@h"):
+            RUN.run_plan(self.repo, m, T.Plan(checks=["x"]), [], "h", runner=runner, record_reds=False)
+            RUN.run_plan(self.repo, m, T.Plan(checks=["x"]), [], "h", runner=runner, record_reds=False, caged=True)
+        self.assertEqual(seen, ["laptop", "box"])
 
 
 class Sweep(unittest.TestCase):

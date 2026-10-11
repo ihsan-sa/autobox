@@ -11,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 CORE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 if CORE not in sys.path:
@@ -102,7 +103,11 @@ class Repo:
     def __init__(self, tc, extra=None):
         self.d = tempfile.TemporaryDirectory()
         tc.addCleanup(self.d.cleanup)
-        self.root = self.d.name
+        self.root = os.path.join(self.d.name, "repo")   # $CC_DEV/repo: a checkout the host made (git.host_tree)
+        os.mkdir(self.root)
+        p = mock.patch.dict(os.environ, {"CC_DEV": self.d.name})
+        p.start()
+        tc.addCleanup(p.stop)
         git(self.root, "init", "-q")
         write(self.root, {"core/tests/LANDING.toml": CORE_MANIFEST, "tests/LANDING.toml": OVERLAY_MANIFEST,
                           "tests/LANDING-policy.toml": POLICY, "core/tests/reach.tsv": REACH,
@@ -191,8 +196,9 @@ class Parsing(unittest.TestCase):
                 f.write('[[check]]\nname="check"\nrun="tests/check.sh"\npaths=["**"]\n')
             fb = f.name
             self.addCleanup(os.unlink, fb)
-            self.assertEqual(list(M.load(d, "HEAD", fallback=fb).checks), ["check"])
-            self.assertEqual(M.load(d, "HEAD").checks, {})
+            with mock.patch.dict(os.environ, {"CC_DEV": os.path.dirname(d)}):   # $CC_DEV/<d>: a host checkout
+                self.assertEqual(list(M.load(d, "HEAD", fallback=fb).checks), ["check"])
+                self.assertEqual(M.load(d, "HEAD").checks, {})
 
 
 class AddOnly(unittest.TestCase):

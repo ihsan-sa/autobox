@@ -127,6 +127,12 @@ class Case(unittest.TestCase):
                        ("CC_STATE", "state"), ("CC_BOARDS", "boards"), ("CC_SLACK_DIR", "slack")):
             os.environ[k] = os.path.join(self.tmp, sub)
         os.environ["CC_CONFIG"] = os.path.join(self.tmp, "config")
+        # the root the review reads is a checkout the host made (a board's path with a .git), or git.taken() refuses it
+        # before the fake git below is ever asked
+        os.mkdir(os.path.join(self.tmp, ".git"))
+        os.makedirs(os.environ["CC_BOARDS"])
+        with open(os.path.join(os.environ["CC_BOARDS"], "review-root.json"), "w") as f:
+            json.dump({"path": self.tmp}, f)
         self.real_sh = C.sh
         # the reviewer keys come from the passwd home's config, never the box's real one in a test
         self.real_reviewer = (C.REVIEWER_CONFIG, C.PASSWD_HOME)
@@ -1165,12 +1171,19 @@ class TestRecord(Case):
 
     def run_record(self, *argv):
         os.makedirs(os.path.join(os.environ["CC_STATE"]), exist_ok=True)
-        old = C.conf
-        C.conf = lambda k, d="": self.tmp if k == "CC_DEV" else old(k, d)
+        # $CC_DEV/demo, as root_of names it, is a checkout the host made (git.taken() takes nothing else)
+        os.makedirs(os.path.join(self.tmp, "demo", ".git"), exist_ok=True)
+        with open(os.path.join(os.environ["CC_BOARDS"], "record-root.json"), "w") as f:
+            json.dump({"path": os.path.join(self.tmp, "demo")}, f)
+        old = os.environ.get("CC_DEV")
+        os.environ["CC_DEV"] = self.tmp
         try:
             return R.cmd_record(list(argv))
         finally:
-            C.conf = old
+            if old is None:
+                os.environ.pop("CC_DEV", None)
+            else:
+                os.environ["CC_DEV"] = old
 
     def test_record_refuses_a_head_that_moved(self):
         box = self.box(**{"gh pr view": self.facts()})

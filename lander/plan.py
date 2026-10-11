@@ -206,16 +206,22 @@ def added_files(repo_root: str, base: str, head: str, files: list) -> set:
 
 
 def changed(repo_root: str, base: str, head: str) -> list:
-    import subprocess
-    # -z: every path as it is, whatever it holds (a space, a newline, a name git would quote)
-    argv = ["git", "-C", repo_root, "diff", "--name-only", "--no-renames", "-z", base] + ([head] if head else [])
-    p = subprocess.run(argv, capture_output=True, text=True)
-    files = [f for f in p.stdout.split("\0") if f] if p.returncode == 0 else []
-    if not head:   # untracked files are part of a working copy's change too
-        q = subprocess.run(["git", "-C", repo_root, "ls-files", "--others", "--exclude-standard", "-z"],
-                           capture_output=True, text=True)
-        files += [f for f in q.stdout.split("\0") if f and f not in files]
-    return files
+    """Every path between base and head (head "" is the working copy: tracked and untracked, not ignored), each as it
+    is. No git runs in the checkout with its config: the revs are read VERIFIED, the working copy is hashed and the
+    diff taken FENCED (git.worktree_tree, git.fenced_names), since `lander check` may be on a fenced worker's tree,
+    run as the owner, and a filter or include.path git read there would run whatever a -c core.hooksPath pins. A root that is not
+    a checkout the host made, or a tree that cannot be taken, RAISES: an empty list reads as "nothing changed,
+    nothing to check", which is a false green."""
+    from lander import git as G
+    t = G.host_tree(repo_root)
+    if t.refused:
+        raise G.GitError(f"{t.refused} is not a checkout the host made with the host's empty config.worktree — git "
+                         "there would run a filter or include it names as the owner")
+    a = G.tree_of(repo_root, base)
+    b = G.tree_of(repo_root, head) if head else G.worktree_tree(t)
+    if not b:
+        raise G.GitError(f"no tree could be taken of the working copy at {repo_root}")
+    return G.fenced_names(t, a, b)
 
 
 def cmd_plan(argv):
@@ -231,10 +237,14 @@ def cmd_plan(argv):
         print(__doc__.strip().splitlines()[-1].strip(), file=sys.stderr)
         return 2
     base, head = pos[0], (pos[1] if len(pos) == 2 else "")
+    from lander import git as G
     try:
         p = plan(repo, base, head, changed(repo, base, head), fallback=os.path.abspath(fb) if fb else "")
     except M.ManifestError as e:
         print(f"lander plan: the base's manifest does not parse: {e}", file=sys.stderr)
+        return 1
+    except G.GitError as e:
+        print(f"lander plan: refused: {e}", file=sys.stderr)
         return 1
     print(json.dumps(p.to_dict(), indent=1))
     return 0

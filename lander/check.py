@@ -1,7 +1,7 @@
 """`lander check`: a worker's own green, by the plan (review: cc-green's use of GATES moves here); `lander sweep`: every
 check once, the nightly full run and the sandbox acceptance table (B2d).
 
-    lander check [WORKTREE] [--base REV] [--manifest FILE] [--only NAME]…
+    lander check [WORKTREE] [--base REV] [--manifest FILE] [--only NAME]… [--caged-only]
         Plans the worktree's change against its base (default: the merge-base with origin/HEAD, origin/main or main)
         — the working copy as it stands, untracked files included — and runs each check the plan selects, the same
         way the lane will: same runner, same sandbox, same red-vs-base rule. Box-class checks are listed, not run:
@@ -10,7 +10,10 @@ check once, the nightly full run and the sandbox acceptance table (B2d).
         against the change), 1 some check red — each red with its tail, the line that names its cause and the path
         of its full log, which outlives the run (run.keep_log) — 3 no verdict (a check could not run), 2 usage. A repo that ships no
         manifest is checked by the release's tests/landing-repos/<repo>.toml (manifest.host_fallback), as the lane
-        does; --manifest FILE names another.
+        does; --manifest FILE names another. --caged-only runs only the checks that run whole in the bwrap profile on
+        this box: a host- or box-class check, or one that needs the network, a mount or another runner, is not run
+        and is said as `deferred — runs at landing`, never as passed, and the last line says the green is not a full
+        one. cc-green's run for a fenced worker always passes it (the tree is one the worker wrote).
 
     lander sweep [--repo DIR] [--rev REV] [--manifest FILE] [--only NAME]… [--sandbox] [--jobs N]
         Runs every check in the manifest at REV (default HEAD) once, each on its own class's runner, and prints a
@@ -25,9 +28,9 @@ import concurrent.futures
 import dataclasses
 import os
 import re
-import subprocess
 import sys
 
+from lander import git as G
 from lander import manifest as M
 from lander import plan as P
 from lander import run as RUN
@@ -59,25 +62,33 @@ def _opts(argv, flags, multi=("--only",), bools=()):
 
 
 def default_base(wt: str) -> str:
+    """The merge-base of the tree's HEAD and the first of origin's HEAD, origin/main, main and master it names, by
+    git.merge_base: every ref read as files and git run in a bare scratch git dir, so no git opens the worker's
+    config.worktree (an include.path FIFO there hung `merge-base` run in the tree) or lets it steer the base."""
+    t = G.host_tree(wt)
     for ref in ("refs/remotes/origin/HEAD", "refs/remotes/origin/main", "main", "master"):
-        p = subprocess.run(["git", "-C", wt, "merge-base", "HEAD", ref], capture_output=True, text=True)
-        if p.returncode == 0 and p.stdout.strip():
-            return p.stdout.strip()
+        b = G.merge_base(t, "HEAD", ref)
+        if b:
+            return b
     return ""
 
 
 def repo_name(wt: str) -> str:
     """The repo a worktree belongs to: the directory holding its main gitdir (~/dev/<repo>/.git -> <repo>), which is
-    the name the lane knows it by and host_fallback looks it up under."""
-    p = subprocess.run(["git", "-C", wt, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                       capture_output=True, text=True)
-    gd = p.stdout.strip() if p.returncode == 0 else ""
-    if not gd:
-        return ""
-    gd = os.path.realpath(gd)
-    if os.path.basename(gd) == ".git":
-        return os.path.basename(os.path.dirname(gd))
-    return os.path.basename(gd)[:-4] if gd.endswith(".git") else ""
+    the name the lane knows it by and host_fallback looks it up under. Read off git.host_tree, so no git runs."""
+    t = G.host_tree(wt)
+    return "" if t.refused else os.path.basename(os.path.dirname(t.common))
+
+
+def host_top(path: str):
+    """git.host_tree of path or the nearest directory above it that the host made, by host_tree alone (no git
+    discovery): `lander sweep --repo <subdir>` on the owner's own checkout still finds its top."""
+    p = os.path.realpath(path)
+    while True:
+        t = G.host_tree(p)
+        if not t.refused or os.path.dirname(p) == p:
+            return t
+        p = os.path.dirname(p)
 
 
 def usage(doc_part: int) -> int:
@@ -89,13 +100,28 @@ def cmd_check(argv):
     if hasattr(sys.stdout, "reconfigure"):   # a worker's log (cc-green) shows each line as it is said, not at exit
         sys.stdout.reconfigure(line_buffering=True)
     try:
-        a, pos = _opts(argv, ("--base", "--manifest", "--only"))
+        a, pos = _opts(argv, ("--base", "--manifest", "--only"), bools=("--caged-only",))
     except ValueError as e:
         print(f"lander check: {e}", file=sys.stderr)
         return usage(1)
+    caged = a["--caged-only"]
     if len(pos) > 1:
         return usage(1)
     wt = os.path.abspath(pos[0] if pos else ".")
+    # Before any git call on the tree, it must be one the host made (git.host_tree): git takes a sub/.git a worker
+    # planted for a repo (its config read) or climbs past it to the worktree, so a subdirectory's default "." is
+    # refused rather than resolved by a git call. A config.worktree that is not the host's runs its filters and
+    # includes on the first `add -A`, as the owner, whatever a -c core.hooksPath pins: refused with no verdict, never repaired.
+    t = G.host_tree(wt)
+    if t.refused and os.path.basename(t.refused) == "config.worktree":
+        print(f"lander check: refused — {t.refused} is not the host's empty file, so git here would run what it says "
+              "as the owner. No tree was taken and no check ran; take this to the owner.", file=sys.stderr)
+        return EXIT_NONE
+    if t.refused:
+        print(f"lander check: {wt} is not a checkout's top directory that the host made ({t.refused} is not one it "
+              "registered), so git there could read a config a worker wrote; run it on the root of your worktree "
+              "(`git rev-parse --show-toplevel`).", file=sys.stderr)
+        return EXIT_USAGE
     base = a["--base"] or default_base(wt)
     base_tree, head_tree = RUN.tree_of(wt, base), RUN.tree_of(wt, "")
     if not base_tree or not head_tree:
@@ -107,16 +133,23 @@ def cmd_check(argv):
     except M.ManifestError as e:
         print(f"lander check: the base's manifest does not parse: {e}", file=sys.stderr)
         return EXIT_NONE
-    files = P.changed(wt, base, "")
+    try:
+        files = P.changed(wt, base, "")
+    except G.GitError as e:
+        print(f"lander check: no change list could be taken of {wt}: {e}", file=sys.stderr)
+        return EXIT_NONE
     plan = P.select(m, files)
     print(f"lander check: {len(files)} file(s) changed, {len(plan.checks)} check(s), class {plan.klass}"
           + (f", unowned: {', '.join(plan.unowned)}" if plan.unowned else ""))
+    if caged:
+        print("lander check: caged only — host, box, network, mount and remote checks are deferred to the landing")
     for n in plan.extra.get("tip", []):
         print(f"  tip      {n} — runs on main's tip after the merge")
     for f in plan.extra.get("faults", []):
         print(f"  fault    {f}")
     outs = RUN.run_plan(wt, m, plan, files, head_tree, base_tree, only=a["--only"] or None, record_reds=False,
-                        quarantine_text=RUN.quarantine_text(wt, base), fallback=fb)
+                        quarantine_text=RUN.quarantine_text(wt, base), fallback=fb,
+                        **({"caged": True, "box_only": True} if caged else {}))
     return report(outs)
 
 
@@ -125,7 +158,8 @@ def report(outs: dict) -> int:
     for name, o in sorted(outs.items()):
         r = o.results[0] if o.results else None
         secs = f"{r.secs:.0f}s" if r else ""
-        word = {T.PASSED: "passed", T.FAILED: "RED", T.UNRUNNABLE: "no-run", RUN.BLOCKED: "main-red"}[o.status]
+        word = {T.PASSED: "passed", T.FAILED: "RED", T.UNRUNNABLE: "no-run", RUN.BLOCKED: "main-red",
+                RUN.DEFERRED: "deferred"}[o.status]
         print(f"  {word:<8} {name} {secs}" + (f" — {o.note}" if o.note else ""))
         if o.status == T.FAILED:
             worst = EXIT_RED
@@ -138,8 +172,10 @@ def report(outs: dict) -> int:
                 print(f"           full log: {last['log']}")
         elif o.status == T.UNRUNNABLE and worst == EXIT_GREEN:
             worst = EXIT_NONE
+    deferred = sum(o.status == RUN.DEFERRED for o in outs.values())
     print(f"lander check: {sum(o.status == T.PASSED for o in outs.values())} passed, "
-          f"{sum(o.status == T.FAILED for o in outs.values())} failed")
+          f"{sum(o.status == T.FAILED for o in outs.values())} failed"
+          + (f", {deferred} deferred to the landing — caged checks only, NOT a full green" if deferred else ""))
     return worst
 
 
@@ -189,7 +225,11 @@ def cmd_sweep(argv):
         return usage(2)
     if pos:
         return usage(2)
-    repo = os.path.abspath(a["--repo"] or ".")
+    t = host_top(a["--repo"] or ".")
+    if t.refused:
+        print(f"lander sweep: {os.path.abspath(a['--repo'] or '.')} is in no checkout the host made", file=sys.stderr)
+        return usage(2)
+    repo = t.work_tree
     rev = a["--rev"] or "HEAD"
     tree = RUN.tree_of(repo, rev)
     fb = os.path.abspath(a["--manifest"]) if a["--manifest"] else M.host_fallback(repo_name(repo))

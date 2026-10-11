@@ -708,11 +708,14 @@ def ask(text, repo, pr, digest, model=None):
 # --- the repo side of a read ---------------------------------------------------------------------------------------
 
 def root_of(job):
+    """The checkout a review reads. $CC_DEV and the clones dir come from jobs (jobs.dev, jobs.clones_dir), where
+    git.host_tree looks for the checkouts it takes, so the root named here is never one git.taken() refuses."""
+    from lander import jobs as J
     if job.extra.get("root"):
         return job.extra["root"]
     if job.member:
-        return C.state("clones", job.repo)
-    return os.path.join(os.path.expanduser(C.conf("CC_DEV", "~/dev")), job.repo)
+        return os.path.join(J.clones_dir(), job.repo)
+    return os.path.join(J.dev(), job.repo)
 
 
 PLAIN_DIFF = ("--no-ext-diff", "--no-textconv", "--no-color")

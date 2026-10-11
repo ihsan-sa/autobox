@@ -80,6 +80,9 @@ BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
 TAIL = 40
 LOG_KEEP, LOG_DAYS = 200, 7   # a red's kept log (keep_log): at most this many, none older than this many days
 BLOCKED = "blocked-by-main"
+# run_plan(caged=True), `lander check --caged-only`: a check that would run anywhere but the default bwrap on this box
+# is not run and says so. Never a pass: the landing runs it (uncaged).
+DEFERRED = "deferred"
 
 
 class Unrunnable(RuntimeError):
@@ -140,17 +143,11 @@ def tree_of(repo_root: str, rev: str) -> str:
             return G.tree_of(repo_root, rev)
         except G.GitError:
             return ""
-    with tempfile.TemporaryDirectory() as d:
-        env = {**os.environ, "GIT_INDEX_FILE": os.path.join(d, "index")}
-        top = subprocess.run(["git", "-C", repo_root, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-        if top.returncode:
-            return ""
-        for argv in (["git", "-C", top.stdout.strip(), "read-tree", "HEAD"],
-                     ["git", "-C", top.stdout.strip(), "add", "-A"]):
-            if subprocess.run(argv, env=env, capture_output=True).returncode:
-                return ""
-        return subprocess.run(["git", "-C", top.stdout.strip(), "write-tree"], env=env, capture_output=True,
-                              text=True).stdout.strip()
+    # `lander check` takes a fenced worker's tree here on the host, as the owner. Git builds it FENCED
+    # (git.worktree_tree): a scratch git dir with the lander's own config, so no filter, include, hook or fsmonitor
+    # the worker wrote anywhere is read. host_tree only says which host repo the tree is of; a root it does not
+    # take gets no tree, and the caller has nothing.
+    return G.worktree_tree(G.host_tree(repo_root))
 
 
 # --- executing -----------------------------------------------------------------------------------------------------
@@ -605,6 +602,21 @@ def choose_where(check: T.Check, member: str = "", box_only: bool = False) -> st
     return "box"
 
 
+def uncaged(check: T.Check) -> str:
+    """'' when `check` runs whole inside the default bwrap profile on this box; else why it does not. A fenced worker's
+    green (cc-green's pinned host run, `lander check --caged-only`) runs only the first kind: the tree it checks is one
+    the worker wrote, so a host or box check there would run the worker's code as the owner, outside every fence."""
+    if check.klass in M.UNSANDBOXED:
+        return f"{check.klass}-class, runs on the host outside the sandbox"
+    if check.net:
+        return "needs the network"
+    if check.mounts:
+        return "needs host mounts"
+    if "box" not in check.where:
+        return f"runs only on {', '.join(check.where) or 'no runner'}"
+    return ""
+
+
 def laptop_gone(outs: dict) -> bool:
     """A laptop run that fell back to the box because the laptop gave no answer (not because it answered busy: a
     full runner takes the next check when a slot frees, so only a silent one rests the laptop for LAPTOP_REST)."""
@@ -616,25 +628,26 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
              member: str = "", store=None, job_key: str = "", scope: str = "", pr: int | None = None,
              quarantine_text: str = "", runner=None, only=None, record_reds: bool = True,
              fallback: str = "", box_only: bool = False, cancel=None, express: bool = False,
-             lane: bool = False) -> dict:
+             lane: bool = False, caged: bool = False) -> dict:
     """Every check in plan.checks through judge(), one after another; -> {name: Outcome}. The lane calls it with
     its store; `lander check` with none (a worker's own red is its work, and is not recorded). fallback: the host
     manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks. cancel: a
     threading.Event the lane sets to stop the plan; every execute() on this thread polls it. express: the lane's
     EXPRESS (a Δ rerun's check), whose runs take no admission slot; a diagnostic rerun alone still takes them all.
-    lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`)."""
+    lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`). caged=True (`lander check
+    --caged-only`): a check uncaged() names is DEFERRED, never run and never a pass, and the rest run on the box only."""
     _STOP.event = cancel
     try:
         return _run_plan(repo_root, m, plan, files, head_tree, base_tree, member=member, store=store,
                          job_key=job_key, scope=scope, pr=pr, quarantine_text=quarantine_text, runner=runner,
                          only=only, record_reds=record_reds, fallback=fallback, box_only=box_only, express=express,
-                         lane=lane)
+                         lane=lane, caged=caged)
     finally:
         _STOP.event = None
 
 
 def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store, job_key, scope, pr,
-              quarantine_text, runner, only, record_reds, fallback, box_only, express, lane):
+              quarantine_text, runner, only, record_reds, fallback, box_only, express, lane, caged=False):
     rows = REC.quarantine_rows(quarantine_text)
     record = (lambda r, text: REC.record_red(scope, r, text, pr)) if (record_reds and scope) else None
     base_m = M.load(repo_root, base_tree, fallback=fallback, strict=False) if base_tree else None
@@ -646,10 +659,14 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
         if c is None:
             out[name] = Outcome(name, T.UNRUNNABLE, "not in the manifest")
             continue
+        why = uncaged(c) if caged else ""
+        if why:
+            out[name] = Outcome(name, DEFERRED, f"runs at landing: {why}")
+            continue
         own = [p for p in c.paths if "*" not in p] + [m.cwd.get(name, "") + M.run_file(c.run)]
         security = any(M.match(m.policy.gate_first, p) for p in own if p)
         touched = any(m.owns(name, f) for f in files) if name in m.checks else False
-        where = choose_where(c, member, box_only=box_only)
+        where = "box" if caged else choose_where(c, member, box_only=box_only)
         if gone and where == "laptop" and "box" in c.where:
             where = "box"   # the laptop gave no answer once in this plan: do not wait out its timeout per check
         out[name] = judge(c, head_tree, base_tree, where, runner=runner, store=store,

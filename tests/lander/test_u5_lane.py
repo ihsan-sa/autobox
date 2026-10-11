@@ -8,6 +8,7 @@ cards/board/deploy/tip units (they post to Slack and touch the box).
 Load-robust: no wall-clock deadline anywhere; the checks are `host` class (no bwrap, no scope), and whether the box
 is loaded only decides whether a red is rerun alone, which gives the same verdict here.
 """
+import json
 import os
 import re
 import shutil
@@ -77,6 +78,10 @@ def tearDownModule():
 class RealUnits(TL.Fixture):
     def setUp(self):
         super().setUp()
+        # self.work is a checkout the host made by its board's path, outside $CC_DEV (git.host_tree): every sealed and
+        # VERIFIED read below runs git there only on a root host_tree takes
+        with open(os.path.join(os.environ["CC_BOARDS"], "work.json"), "w") as f:
+            json.dump({"path": self.work}, f)
         env = {"LANDER_STATE": os.environ["CC_LANDER_STATE"], "LANDER_SCOPE": "0"}
         p = mock.patch.dict(os.environ, env)
         p.start()
