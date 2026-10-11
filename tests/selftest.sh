@@ -1183,7 +1183,9 @@ od=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 PATH="$B:$PATH" "$B/cc" done alice t9 2>
 { [ "$rd" = 0 ] && [ "$(cat "$w9/.cc/pushed" 2>/dev/null)" = "$(git -C "$w9" rev-parse HEAD)" ] && [ ! -e "$GH/.cc/push-state/alice/t9" ]; } \
   && ok "...while the same run INSIDE the boundary keeps it in the worktree — there is no ~/.cc/push-state in there, so a redirect would lock nothing and write the markers into a tmpfs that dies with the sandbox" \
   || bad "an in-boundary cc done put its state outside the worktree: rc=$rd $od"
-git -C "$GH/dev/alice" worktree remove --force "$w9" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t9 >/dev/null 2>&1; rm -rf "$T/t9.git" "$GH/.cc/push-state/alice/t9"
+git -C "$GH/dev/alice" worktree remove --force "$w9" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t9 >/dev/null 2>&1; git -C "$GH/dev/alice" remote remove origin 2>/dev/null; rm -rf "$T/t9.git" "$GH/.cc/push-state/alice/t9"
+# ↑ a worktree's remotes are its repository's, so the origin added for t9 stays on alice for every case below; t7's
+# remote named after it is then "not origin's repository" and cc done delivers to that dead origin instead (#1031).
 # …AND A MEMBER-WRITABLE <wt>/.cc/pushed IS NEVER THE HOST'S LEASE (round 9 of #225). An earlier cut copied its
 # CONTENTS into ~/.cc/push-state and handed them to --force-with-lease, so a member who wrote the sha currently on
 # the remote made cc done force-push over a commit this worktree never wrote. The migration is gone: a track whose

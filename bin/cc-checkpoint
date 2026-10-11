@@ -81,16 +81,13 @@
 # every run, so a remote refusing every checkpoint (a workflow file the token has no scope for) looked like any
 # flaky push for 3.6 days (2026-09-08). git's `[remote rejected]` line is kept in .cc/push.rejected until a push
 # succeeds, and goes to the row's board note and the track's journal once per distinct reason (push_rejected).
-# WHERE IT PUSHES: `origin`, except a member workspace's project, which pushes to its OWN repository — the
-# remote named after the track, or `origin` when origin is that repository (a workspace's first project is
-# wired up as origin). Each project has its own repository (owner, 2026-09-03), so a workspace project with no
-# remote at all gets one CREATED for it (cc-gh-token create) and pushed to, which is why work finished inside a
-# workspace no longer sits on a local branch nobody else can see. Naming a project's repository something else
-# is the owner's to do: bind it by adding a remote NAMED AFTER THE PROJECT, and nothing here reads the
-# repository's own name again.
-# AND NOWHERE ELSE. A workspace project whose repository could not be made has nowhere to push — never the
-# workspace's `origin`, which is another project's repository; the reason is in .cc/create.err and the next
-# turn tries again. After a push succeeds, the branch is REMOVED from any other repository the workspace
+# WHERE IT PUSHES: `origin`. A member workspace's track that is a project of its own pushes to its OWN repository,
+# the remote NAMED AFTER THE TRACK (binding one is the owner's to do, and nothing here reads the repository's own
+# name again); every other track of a workspace is a task on the workspace's project and pushes to its `origin`.
+# Only a workspace with no remote at all gets a repository CREATED for its track (cc-gh-token create), so work
+# finished there does not sit on a local branch nobody else can see — never one per task (2026-10-05).
+# Inside the member's boundary it is `origin` or nothing (pick_remote says when); a track-named remote pointing anywhere but origin's repository (its url or a push url) is never taken, in there or out here. A repository that could not be
+# made is nowhere to push; the reason is in .cc/create.err and the next turn tries again. After a push succeeds, the branch is REMOVED from any other repository the workspace
 # remotes name, so opening a project's repository shows that project and not its neighbours (owner,
 # 2026-09-04). Only a tip that is an ancestor of what was just pushed is removed; anything else is left and
 # named in .cc/evict.err — never push.err, which means the push failed (review of #217). Nothing is created, and nothing removed, for anything but a member workspace's project.
@@ -111,6 +108,7 @@
 # (cc-board base), never a track, whoever names it. Only a repository this file made is marked, so one the owner
 # bound by hand is never pushed to or repointed behind his back; and repositories made before this are not touched —
 # `cc-gh-token default <workspace> <project> <base>` fixes one, once.
+# (That base-seed path is reached only with a .cc/base-seed marker: a repository this file makes is the workspace's own `origin`, which seed_head skips.)
 # AND THAT BASE CARRIES THE PROJECT'S OWN README, because the retitle below runs on the track alone: without it
 # the front page of a project's repository is the workspace's until the project's first PR merges. Not on the
 # workspace's FIRST project, whose repository is the workspace's own `origin` — seed_head says why.
@@ -222,6 +220,25 @@ member_gitdir(){   # $1 handle · $2 worktree → 0 when that track really hangs
   gcd=$(git "${nh[@]}" -C "$2" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
   [ "$gcd" = "$main" ] && return 0
   echo "refusing to run git in $2 — its .git resolves to ${gcd:-nothing}, not $main: a member workspace's track hangs off ~/dev/$1/.git or nothing runs in it"; return 1; }
+push_keys(){   # $1 remote → the url_key of every place `git push $1` writes to, sorted: its pushurls, or its url when it has none
+  local u; git remote get-url --push --all "$1" 2>/dev/null | while IFS= read -r u; do url_key "$u"; done | LC_ALL=C sort -u; }
+own_remote_ok(){   # the remote named after the track may be pushed to only if it is origin's repository (url_key, so .git, a
+  # trailing / or the scp form do not make it another) or there is no origin to contradict it. Its fetch url AND every
+  # push destination must be origin's: a matching url with a pushurl elsewhere, or a second pushurl elsewhere, still
+  # sends the branch to another repository (review of #1031). A track-named remote that differs is not taken, host or
+  # sandbox: delivery goes to origin, and ONE stderr line names the remote and its destinations, once per distinct pair.
+  local ou tu tp op msg; tu=$(git remote get-url "$WSTRACK" 2>/dev/null) || return 0
+  ou=$(git remote get-url origin 2>/dev/null) || return 0
+  tp=$(push_keys "$WSTRACK"); op=$(push_keys origin)
+  [ "$(url_key "$tu")" = "$(url_key "$ou")" ] && [ "$tp" = "$op" ] && return 0
+  [ "${1:-}" = quiet ] && return 1
+  msg="cc-checkpoint: remote $WSTRACK ($(git remote get-url --push --all "$WSTRACK" 2>/dev/null | paste -sd' ')) is not origin's repository ($(git remote get-url --push --all origin 2>/dev/null | paste -sd' ')): delivering to origin"
+  # SAID ONCE, not every turn: this runs on the Stop hook and the five-minute sweep for as long as the remote exists,
+  # so the line is kept in .cc/own-remote.said and only a different remote or url says it again (as push_rejected).
+  [ -n "$ST" ] && [ "$(cat "$ST/own-remote.said" 2>/dev/null)" = "$msg" ] && return 1
+  [ -n "$ST" ] && printf '%s\n' "$msg" > "$ST/own-remote.said" 2>/dev/null
+  echo "$msg" >&2
+  return 1; }
 pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push · 1 there is not
   local url
   # A MEMBER WORKSPACE FIRST, and only then that workspace's own rules: the track-named remote below belongs
@@ -231,26 +248,27 @@ pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push ·
     workspace="$WSREPO"   # so the token is minted for this workspace and opens no other member's repository
     # INSIDE THE WORKSPACE'S BOUNDARY (CC_MEMBER_SANDBOX=1: the member's own `cc done`, run by its loop) nothing is
     # created and no remote named after the track is pushed to (a member's track name once chose another project's
-    # repository, review of #965). What is left is `origin`, and only where nothing contradicts it: origin's URL names
-    # this track, and a remote named after the track, if there is one, has origin's URL. A workspace's origin is its
-    # FIRST project's repository, so origin for any other project is the 2026-09-04 bug below (a project pushed into a
-    # sibling's repository): a project with its own remote, or with none yet, is ambiguous from in here. Ambiguous is
-    # "nowhere to push", which that `cc done` reports as undelivered, and the host's `cc done` finishes it by the rules
-    # below.
+    # repository, review of #965). What is left is `origin`. A remote named after the track that points anywhere
+    # else (its url or any push destination, own_remote_ok) is not taken here OR on the host: the track delivers to
+    # origin, the same answer both sides give. The one thing "nowhere to push" still means in here is a workspace
+    # with no origin, which that `cc done` reports as undelivered for the host to finish (it may create one).
+    # A TRACK IS USUALLY A TASK ON THE WORKSPACE'S ONE PROJECT, not a project of its own: the #965 cut also wanted
+    # origin's URL to END in the track's name, which no task track's does, so every finished track in two workspaces
+    # stopped undelivered and the host's `cc done` then made a repository for it (2026-10-05).
+    own_remote_ok || true   # says (stderr, once) when a track-named remote contradicts origin; host and sandbox both then use origin
     if [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
-      url=$(git remote get-url origin 2>/dev/null) || return 1
-      case "$url" in *"/$WSTRACK"|*"/$WSTRACK.git") ;; *) return 1 ;; esac
-      if git remote get-url "$WSTRACK" >/dev/null 2>&1; then [ "$(git remote get-url "$WSTRACK")" = "$url" ] || return 1; fi
+      git remote get-url origin >/dev/null 2>&1 || return 1
       remote=origin; return 0; fi
-    git remote get-url "$WSTRACK" >/dev/null 2>&1 && { remote="$WSTRACK"; return 0; }   # the project's own repository
-    # A workspace's FIRST repository is wired up as its `origin` (cc-gh-token create), so origin IS this
-    # project's repository when it carries this project's name, and there is nothing to create.
-    case "$(git remote get-url origin 2>/dev/null)" in
-      *"/$WSTRACK"|*"/$WSTRACK.git") remote=origin; return 0 ;;
-    esac
-    # "EACH PROJECT GETS ITS OWN GITHUB REPO" (owner, 2026-09-03) — so a member workspace's project that has
-    # none gets one made for it here, even where the workspace itself has an origin: that origin is the
-    # workspace's first project, not this one.
+    git remote get-url "$WSTRACK" >/dev/null 2>&1 && own_remote_ok quiet && { remote="$WSTRACK"; return 0; }   # the project's own repository
+    # A workspace's FIRST repository is wired up as its `origin` (cc-gh-token create), and ANY OTHER TRACK OF A
+    # WORKSPACE THAT HAS AN ORIGIN GOES THERE too. "Each project gets its own GitHub repo"
+    # (owner, 2026-09-03) once made one here for every track with no remote of its own, even where the workspace had
+    # an origin — but a track is mostly a task on the workspace's project, and that rule put a finished task's whole
+    # history into a new private repository named after the task, with its PR there and not on the project's
+    # (2026-10-05). A track that IS a separate project is bound by a remote named after it (above), which is how
+    # every such project is wired; nothing here guesses one from the name.
+    git remote get-url origin >/dev/null 2>&1 && { remote=origin; return 0; }
+    # A WORKSPACE WITH NO REMOTE AT ALL has nowhere else to go, so its first project gets a repository made for it.
     # A reason it could not REPLACES the last one, in a file of its own: this runs every turn until the project
     # has a repository, so appending would grow for ever on a box with no app — and push.err belongs to the push.
     # …BUT NEVER FROM A TIMER. `--sweep` sets CC_CHECKPOINT_NO_CREATE, because unattended this line would put a
@@ -267,11 +285,9 @@ pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push ·
       return 0
     fi
     mv -f "$ST/create.err.tmp" "$ST/create.err" 2>/dev/null
-    # Nothing could be created (no app, a name already someone else's, no network) — and for a workspace
-    # project there is NOWHERE ELSE. `origin` is the workspace's FIRST project's repository, so falling back to
-    # it pushes this project into another project's — which is how a project's branch came to be in a sibling
-    # project's repository (measured, 2026-09-04). Nowhere to push is the honest answer: `cc done` ends on it (the
-    # branch is the delivery), the reason is in .cc/create.err, and the next turn tries the creation again.
+    # Nothing could be created (no app, a name already someone else's, no network), and with no origin there is
+    # NOWHERE ELSE. Nowhere to push is the honest answer: `cc done` ends on it (the branch is the delivery), the
+    # reason is in .cc/create.err, and the next turn tries the creation again.
     return 1
   fi
   # Any other track on the box: origin is where it pushed yesterday, so the work reaches GitHub rather than nowhere.
@@ -298,6 +314,14 @@ project_readme(){   # cwd = worktree root.  Always 0: this is one file, and neve
   # The path, never .cc/track, for the reason the header gives: that file is the member's word.
   path_ids "$root" || return 0
   [ -f "$HOME/dev/$WSREPO/.cc/member-workspace" ] || return 0
+  # A TASK ON THE WORKSPACE'S PROJECT is not a project: it delivers to origin (pick_remote), so the README there is the
+  # project's, not one to retitle. WHERE THE TRACK DELIVERS decides it, never which remotes exist: with an origin,
+  # pick_remote takes the track-named remote only when it IS origin's repository, and one pointing elsewhere is
+  # passed over for origin, so its inherited README rides onto origin's PR and must stay the project's (review of
+  # #1031). So with an origin the track is a project only when origin is named after it; with none, it delivers to a
+  # repository of its own (bound or made) and is one.
+  local ou; ou=$(git remote get-url origin 2>/dev/null)
+  if [ -n "$ou" ]; then case "$ou" in *"/$WSTRACK"|*"/$WSTRACK.git") ;; *) return 0 ;; esac; fi
   git ls-files --error-unmatch README.md >/dev/null 2>&1 || return 0   # inherited from the branch, not a file this turn wrote
   git diff --quiet HEAD -- README.md 2>/dev/null || return 0            # and untouched this turn: words somebody wrote are theirs (review of #217)
   # A STUB THIS FILE WROTE is nobody's words whichever project it names, so where it came from is not asked. A
@@ -863,8 +887,41 @@ SH
   # A member workspace's project, with its own repository already wired up: that one, not the workspace's origin.
   d=$(mkwt ws1/proj1 origin https://example.test/org/first.git proj1 https://example.test/org/proj1.git)
   printf 'ws1\nproj1\n' > "$d/.cc/track"
-  eq "workspace project: its own remote wins over the workspace's origin" "$(run "$d")" proj1
+  eq "workspace project: its own remote is NOT taken when its url is not origin's: origin" "$(run "$d")" origin
   eq "workspace project: nothing is created when it has one" "$(cat "$CALLS")" ""
+  irun(){ : > "$CALLS"; ( cd "$1" && env CC_MEMBER_SANDBOX=1 "$bin/cc-checkpoint" --remote 2>/dev/null; echo "rc=$?" ); }
+  # origin=A and a track-named remote=B: origin, nothing created, and one stderr line naming the remote and its url —
+  # ONCE: this runs every Stop hook and every sweep tick, so the same remote and url are not said again (review of #1031).
+  said(){ ( cd "$1" && "$bin/cc-checkpoint" --remote 2>&1 >/dev/null | grep -c "remote $2 (.*) is not origin" ); }
+  rm -f "${d:?}/.cc/own-remote.said"
+  eq "workspace project: the contradicting remote is named on stderr" "$(said "$d" proj1)" 1
+  k "$(grep -q 'remote proj1 (https://example.test/org/proj1.git) is not origin' "$d/.cc/own-remote.said" && echo 0 || echo 1)" "…naming the remote and its url" "$(cat "$d/.cc/own-remote.said" 2>/dev/null)"
+  eq "…and not again on the next turn" "$(said "$d" proj1)" 0
+  git -C "$d" remote set-url proj1 https://example.test/org/proj1b.git
+  eq "…but a different url for it is said again" "$(said "$d" proj1)" 1
+  # THE PUSH DESTINATIONS, not the fetch url (review of #1031): a track-named remote with origin's url and a pushurl
+  # elsewhere, or a second pushurl elsewhere, still sends the branch to another repository. Origin, and said.
+  d=$(mkwt ws1/pu1 origin https://example.test/org/first.git pu1 https://example.test/org/first.git); printf 'ws1\npu1\n' > "$d/.cc/track"
+  git -C "$d" remote set-url --push pu1 https://example.test/other/pu1.git
+  eq "own remote with origin's url but a pushurl elsewhere: origin" "$(run "$d")" origin
+  rm -f "${d:?}/.cc/own-remote.said"; eq "…and it is said" "$(said "$d" pu1)" 1
+  eq "…and inside the boundary it is origin too" "$(irun "$d" | tr '\n' ' ')" "origin rc=0 "
+  d=$(mkwt ws1/pu2 origin https://example.test/org/first.git pu2 https://example.test/org/first.git); printf 'ws1\npu2\n' > "$d/.cc/track"
+  git -C "$d" remote set-url --add --push pu2 https://example.test/org/first.git
+  git -C "$d" remote set-url --add --push pu2 https://example.test/other/pu2.git
+  eq "own remote whose second pushurl is elsewhere: origin" "$(run "$d")" origin
+  rm -f "${d:?}/.cc/own-remote.said"; eq "…and it is said" "$(said "$d" pu2)" 1
+  d=$(mkwt ws1/pu3 origin https://example.test/org/first.git pu3 https://example.test/org/first.git); printf 'ws1\npu3\n' > "$d/.cc/track"
+  git -C "$d" remote set-url --push pu3 git@example.test:org/first.git
+  eq "own remote whose pushurl is origin's repository in another spelling: taken" "$(run "$d")" pu3
+  # …but a track-named remote that IS origin's repository in another spelling is taken.
+  n=0; for sp in https://example.test/org/first.git/ https://EXAMPLE.test/org/first git@example.test:org/first.git ssh://git@example.test/org/first.git; do
+    n=$((n+1)); d=$(mkwt ws1/sp$n origin https://example.test/org/first.git sp$n "$sp"); printf 'ws1\nsp%s\n' "$n" > "$d/.cc/track"
+    eq "workspace project: own remote spelled $sp is origin's repository: taken" "$(run "$d")" "sp$n"
+    rm -f "${d:?}/.cc/own-remote.said"
+    eq "…and inside the boundary it is origin, no complaint" \
+      "$( ( cd "$d" && env CC_MEMBER_SANDBOX=1 "$bin/cc-checkpoint" --remote 2>"$T/sp.err"; echo "rc=$?" ) | tr '\n' ' ')|$(grep -c 'is not origin' "$T/sp.err")" "origin rc=0 |0"
+  done
   # The workspace's FIRST project is wired up as `origin` (cc-gh-token create), so origin IS that project's
   # repository when it carries the project's name — and nothing is created a second time.
   d=$(mkwt ws1/proj2 origin https://example.test/org/proj2.git)
@@ -877,25 +934,26 @@ SH
   eq "workspace project with no remote: a repository is created for it" "$(run "$d")" origin
   eq "created for the workspace and project that own it" "$(cat "$CALLS")" "create ws2 proj3"
   k "$(grep -q 'github: created https://example.test/org/proj3' "$NOTES" && echo 0 || echo 1)" "the board is told which repository was made" "$(cat "$NOTES")"
-  # The same, for a workspace that already has an origin: that origin is its FIRST project, not this one, so
-  # this project still gets its own repository — under its own name.
+  # A workspace that already has an origin: a track with no remote of its own is a task on that project, so it goes
+  # to origin and NOTHING is created — a repository made here once took a finished task's whole history (2026-10-05).
   d=$(mkwt ws1/proj4 origin https://example.test/org/first.git); printf 'ws1\nproj4\n' > "$d/.cc/track"
-  eq "second project of a workspace: its own repository, not the workspace's origin" "$(run "$d")" proj4
-  eq "second project: created under the project's name" "$(cat "$CALLS")" "create ws1 proj4"
-  # INSIDE THE BOUNDARY (the member's own `cc done`): origin only where nothing contradicts it, never the track-named
-  # remote, never a repository created; anything else is nowhere to push, rc=1, which `cc done` reports as
-  # undelivered for the host (review of #965).
-  irun(){ : > "$CALLS"; ( cd "$1" && env CC_MEMBER_SANDBOX=1 "$bin/cc-checkpoint" --remote 2>/dev/null; echo "rc=$?" ); }
+  eq "a task track of a workspace with an origin: delivered to that origin" "$(run "$d")" origin
+  eq "…and no repository is created for it" "$(cat "$CALLS")" ""
+  # INSIDE THE BOUNDARY (the member's own `cc done`): origin, never the track-named remote, never a repository
+  # created. Only a workspace with no origin is nowhere to push, rc=1, which `cc done` reports as undelivered for
+  # the host (review of #965).
   d=$(mkwt ws1/proj6 origin https://example.test/org/first.git proj6 https://example.test/org/proj6.git); printf 'ws1\nproj6\n' > "$d/.cc/track"
-  eq "inside, a second project with its own remote: never origin (the first project's), never its remote: nowhere" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "rc=1 |"
+  eq "inside, a second project with its own remote elsewhere: origin, never its remote" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "origin rc=0 |"
   d=$(mkwt ws1/proj9 origin https://example.test/org/first.git); printf 'ws1\nproj9\n' > "$d/.cc/track"
-  eq "inside, a second project with no repository yet: not pushed into the first project's origin, nothing created" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "rc=1 |"
+  eq "inside, a task track with no remote of its own: origin, as the host would, and nothing created" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "origin rc=0 |"
+  d=$(mkwt ws1/proj13 origin https://example.test/org/first.git proj13 https://example.test/org/first.git); printf 'ws1\nproj13\n' > "$d/.cc/track"
+  eq "inside, a task track whose own remote is origin's repository (how they were bound by hand): origin" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "origin rc=0 |"
   d=$(mkwt ws1/proj10 origin https://example.test/org/proj10.git); printf 'ws1\nproj10\n' > "$d/.cc/track"
   eq "inside, the workspace's own project (origin named after it, nothing else): delivered to origin" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "origin rc=0 |"
   d=$(mkwt ws1/proj11 origin https://example.test/org/proj11.git proj11 https://example.test/org/proj11.git); printf 'ws1\nproj11\n' > "$d/.cc/track"
   eq "inside, a track-named remote that agrees with origin: origin" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "origin rc=0 |"
   d=$(mkwt ws1/proj12 origin https://example.test/org/proj12.git proj12 https://example.test/org/other.git); printf 'ws1\nproj12\n' > "$d/.cc/track"
-  eq "inside, origin named after the track but a track-named remote elsewhere: ambiguous, nowhere" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "rc=1 |"
+  eq "inside, a track-named remote elsewhere than origin: origin, never that remote" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "origin rc=0 |"
   d=$(mkwt ws1/proj7 proj7 https://example.test/org/proj7.git); printf 'ws1\nproj7\n' > "$d/.cc/track"
   eq "inside, a track-named remote and no origin: nowhere to push, and nothing created" "$(irun "$d" | tr '\n' ' ')|$(cat "$CALLS")" "rc=1 |"
   d=$(mkwt ws1/proj8); printf 'ws1\nproj8\n' > "$d/.cc/track"
@@ -912,16 +970,12 @@ SH
   out=$(run "$d"); rc=$?
   eq "a worktree outside ~/.cc/worktrees: nothing is created for it" "$(cat "$CALLS")" ""
   k "$([ "$rc" = 1 ] && [ -z "$out" ] && echo 0 || echo 1)" "and with no origin it answers that there is nowhere to push" "rc=$rc out='$out'"
-  # A creation that could not happen leaves its reason where the next turn replaces it, and does NOT fall back
-  # to the workspace's origin: that origin is the first project's repository, and pushing there is exactly the
-  # contamination this file is here to stop (owner, 2026-09-04).
-  d=$(mkwt ws2/proj6 origin https://example.test/org/first.git); printf 'ws2\nproj6\n' > "$d/.cc/track"
-  out=$(run "$d" 1); rc=$?
-  k "$([ "$rc" = 1 ] && [ -z "$out" ] && echo 0 || echo 1)" "a failed creation does not push into another project's repository" "rc=$rc out='$out'"
-  k "$(grep -q 'refused to create proj6' "$d/.cc/create.err" && echo 0 || echo 1)" "and leaves the reason in .cc/create.err" "$(cat "$d/.cc/create.err" 2>/dev/null)"
+  # A creation that could not happen leaves its reason where the next turn replaces it. With no origin there is
+  # nowhere else to push; a workspace with an origin never reaches the creation at all (proj4 above).
   d=$(mkwt ws2/proj7); printf 'ws2\nproj7\n' > "$d/.cc/track"
   out=$(run "$d" 1); rc=$?
   k "$([ "$rc" = 1 ] && [ -z "$out" ] && echo 0 || echo 1)" "a failed creation with no origin: nowhere to push, and it says so" "rc=$rc out='$out'"
+  k "$(grep -q 'refused to create proj7' "$d/.cc/create.err" && echo 0 || echo 1)" "and leaves the reason in .cc/create.err" "$(cat "$d/.cc/create.err" 2>/dev/null)"
   # ── the branch ends up in the project's repository and is taken out of the other projects' ──────────
   bare(){ git init -q --bare "$T/$1.git"; printf '%s\n' "$T/$1.git"; }
   mkproj(){   # $1 <ws>/<track>, then name/url pairs → a worktree on track/<track> carrying one commit of its own
@@ -949,14 +1003,14 @@ SH
   # A workspace's first repository holding a second project's branch — the shape measured on a real workspace
   # on 2026-09-04. The branch is pushed to the project's own repository and then removed from that one.
   oa=$(bare ownA); ta=$(bare otherA)
-  d=$(mkproj ws3/projA origin "$ta" projA "$oa"); git -C "$d" push -q origin track/projA
+  d=$(mkproj ws3/projA origin "$oa" stale "$ta"); git -C "$d" push -q stale track/projA
   runp "$d"
   k "$(has "$oa" track/projA && echo 0 || echo 1)" "the branch is in the project's own repository" "not on $oa"
   k "$(has "$ta" track/projA && echo 1 || echo 0)" "and is taken out of the other project's repository" "still on $ta"
   k "$(grep -q 'removed from' "$NOTES" && echo 0 || echo 1)" "the board is told what was removed" "$(cat "$NOTES")"
   # A tip over there that is NOT in this branch is somebody's work: it is left alone and named, never deleted.
   ob=$(bare ownB); tb=$(bare otherB)
-  d=$(mkproj ws3/projB origin "$tb" projB "$ob")
+  d=$(mkproj ws3/projB origin "$ob" stale "$tb")
   sb=$(mkwt "$T/strayB"); git -C "$sb" symbolic-ref HEAD refs/heads/track/projB
   echo stray > "$sb/stray.txt"; git -C "$sb" add -A; git -C "$sb" -c user.name=t -c user.email=t@t commit -q -m stray
   git -C "$sb" push -q "$tb" track/projB
@@ -978,7 +1032,7 @@ SH
   # …and under a spelling url_key CANNOT unify (a symlink here; ssh against https on GitHub): the delete goes
   # through, the project's own remote is asked, and the branch is put back (review of #217).
   oc2=$(bare ownC2); ln -s "$oc2" "$T/aliasC2.git"
-  d=$(mkproj ws3/projC2 origin "$T/aliasC2.git" projC2 "$oc2")
+  d=$(mkproj ws3/projC2 origin "$oc2" dup "$T/aliasC2.git")
   runp "$d"
   k "$(has "$oc2" track/projC2 && echo 0 || echo 1)" "a repository deleted from under itself gets its branch put back" "gone from $oc2"
   k "$(grep -q 'put back' "$d/.cc/evict.err" && echo 0 || echo 1)" "and evict.err names the duplicate remote" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
@@ -989,7 +1043,7 @@ SH
   k "$(has "$oc2" track/projC2 && echo 0 || echo 1)" "and the branch is still in the project's own repository" "gone from $oc2"
   # A delete the other repository REFUSES (GitHub: its default branch; here receive.denyDeletes) is said, once.
   oi=$(bare ownI); ti=$(bare otherI); git -C "$ti" config receive.denyDeletes true
-  d=$(mkproj ws3/projI origin "$ti" projI "$oi"); git -C "$d" push -q origin track/projI
+  d=$(mkproj ws3/projI origin "$oi" stale "$ti"); git -C "$d" push -q stale track/projI
   runp "$d"
   k "$(has "$ti" track/projI && echo 0 || echo 1)" "a refused delete leaves the branch where it was" "gone from $ti"
   k "$(grep -q 'refused' "$d/.cc/evict.err" && echo 0 || echo 1)" "and evict.err says the delete was refused" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
@@ -1006,7 +1060,7 @@ SH
   # own — never on its absence. Same self-alias shape as projC2, but with NO host lease: nothing is deleted, nothing
   # is put back, and the branch still reaches the project's own repository.
   oe1=$(bare ownE1); ln -s "$oe1" "$T/aliasE1.git"
-  d=$(mkproj ws3/projE1 origin "$T/aliasE1.git" projE1 "$oe1")
+  d=$(mkproj ws3/projE1 origin "$oe1" dup "$T/aliasE1.git")
   : > "$CALLS"; : > "$NOTES"; rm -f "$d/.cc/pushed"   # the absence case: the host holds no lease of its own for this track
   ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
   k "$(has "$oe1" track/projE1 && echo 0 || echo 1)" "no host lease: the branch still reaches the project's own repository" "not on $oe1"
@@ -1182,14 +1236,33 @@ SH
   hook "$d"
   eq "a repo that is not a member workspace keeps its README" "$(head -1 "$d/README.md")" "# myrepo3"
   k "$(grep -q 'not a workspace' "$d/README.md" && echo 0 || echo 1)" "and all of it" "$(cat "$d/README.md")"
+  # A TASK on the workspace's project delivers to origin, so the README it inherited is the project's and not retitled:
+  # with no remote of its own, and with one bound by hand to origin's repository. A project of its own still is.
+  tO=$(bare ws3task); d=$(mkproj_main ws3/taskA origin "$tO"); hook "$d"
+  eq "a task track of a workspace with an origin keeps the project's README" "$(head -1 "$d/README.md")" "# ws3"
+  d=$(mkproj_main ws3/taskB origin "$tO" taskB "$tO"); hook "$d"
+  eq "…and so does one whose own remote is origin's repository" "$(head -1 "$d/README.md")" "# ws3"
+  d=$(mkproj_main ws3/taskB2 origin "$tO" taskB2 "$tO/"); hook "$d"
+  eq "…and one whose own remote is origin's repository spelled with a trailing slash" "$(head -1 "$d/README.md")" "# ws3"
+  # THE DASHBOARD SHAPE (review of #1031): origin is the workspace's project, a remote named after the track points at
+  # another repository, and the README is still the inherited one. pick_remote passes that remote over for origin, so
+  # the README rides onto origin's PR and must stay the project's — not the track's stub.
+  d=$(mkproj_main ws3/dashA origin "$tO" dashA "$(bare dashA-elsewhere)"); hook "$d"
+  eq "a track whose own remote points elsewhere delivers to origin, so its inherited README is not retitled" "$(head -1 "$d/README.md")" "# ws3"
+  eq "…and no commit rewrote it: the branch carries main's README blob" "$(git -C "$d" rev-parse HEAD:README.md)" "$(git -C "$d" rev-parse main:README.md)"
+  d=$(mkproj_main ws3/taskC taskC "$(bare owntaskC)"); hook "$d"
+  eq "…while a project bound to a repository of its own, in a workspace with no origin, is retitled" "$(head -1 "$d/README.md")" "# taskC"
   # ── …and the base of the repository the box made opens on that same README ──────────────────────────
   # The base is the WORKSPACE's branch and carries the workspace's README, so a project's repository opened on a
   # page about the workspace even once its default branch was the base — until the project's first PR merged.
   stub(){ printf '# %s\n\nA project of the %s workspace, and the only project in this repository.\nIts work is the `track/%s` branch.\n' "$2" "$1" "$2"; }
   save(){ git -C "$1" add -A; git -C "$1" -c user.name=t -c user.email=t@t commit -q -m "${2:-x}"; }
   export BARE="$T/gh2"; mkdir -p "$BARE"
-  ws ws5; wsO=$(bare ws5own)   # ws5 HAS a remote of its own, so each project's repository is its own, not `origin`
-  d=$(mkproj_main ws5/projQ origin "$wsO"); mQ=$(git -C "$d" rev-parse main)
+  ws ws5   # ws5 has NO origin: a project bound to a repository of its own is only taken where origin does not contradict it (own_remote_ok)
+  # A workspace with an origin no longer has repositories made for its tracks (2026-10-05), so a separate project's
+  # fresh one is bound by hand here and marked the way a creation marks it.
+  fresh(){ git init -q --bare "$BARE/$1.git"; printf '%s\n' "$BARE/$1.git"; }
+  d=$(mkproj_main ws5/projQ projQ "$(fresh projQ)"); : > "$d/.cc/base-seed"; mQ=$(git -C "$d" rev-parse main)
   hook "$d"; rQ="$BARE/projQ.git"
   eq "the base pushed into the new repository names the project" "$(git -C "$rQ" show main:README.md 2>/dev/null | head -1)" "# projQ"
   eq "…the same file the project's own branch carries, so its first PR has nothing to merge there" \
@@ -1207,17 +1280,17 @@ SH
   eq "…and that repository still opens on the base" "$(git -C "$rU" symbolic-ref HEAD 2>/dev/null)" refs/heads/main
   eq "…while the project's own branch is retitled as ever" "$(head -1 "$d/README.md")" "# projU"
   # Somebody's own words are not put on a branch they did not write; they reach the base when their PR merges.
-  d=$(mkproj_main ws5/projT origin "$wsO"); printf '# my thing\n\nmine\n' > "$d/README.md"; save "$d" mine
+  d=$(mkproj_main ws5/projT projT "$(fresh projT)"); : > "$d/.cc/base-seed"; printf '# my thing\n\nmine\n' > "$d/README.md"; save "$d" mine
   echo t > "$d/more.txt"   # the turn that makes the repository is a later one: their README is committed already
   hook "$d"
   eq "a README somebody wrote is not pushed onto the base" "$(git -C "$BARE/projT.git" show main:README.md 2>/dev/null | head -1)" "# ws5"
   # A base already carrying this project's README, and a project with no README at all: nothing is added either way.
   mkbase(){   # $1 <ws>/<track>, $2 a command run on `main` before the track is cut from it
-    local p t; p=$(mkwt "${1}" origin "$wsO"); t=${1#*/}
+    local p t; t=${1#*/}; p=$(mkwt "${1}" "$t" "$(fresh "$t")")
     printf '%s\n%s\n' "${1%%/*}" "$t" > "$p/.cc/track"
     git -C "$p" symbolic-ref HEAD refs/heads/main; ( cd "$p" && eval "$2" )
     echo base > "$p/base.txt"; save "$p" base
-    git -C "$p" checkout -q -b "track/$t"; echo "$t" > "$p/work.txt"
+    git -C "$p" checkout -q -b "track/$t"; echo "$t" > "$p/work.txt"; : > "$p/.cc/base-seed"
     printf '%s\n' "$p"; }
   d=$(mkbase ws5/projZ 'stub ws5 projZ > README.md'); mZ=$(git -C "$d" rev-parse main); hook "$d"
   eq "a base whose README is already the project's is pushed unchanged" "$(git -C "$BARE/projZ.git" rev-parse main 2>/dev/null)" "$mZ"
@@ -1252,7 +1325,7 @@ SH
     PRC=$(mktemp -d "$T/pr.XXXXXX")
     { git clone -q "$1" "$PRC" >/dev/null 2>&1 && git -C "$PRC" checkout -q main 2>/dev/null; } || return 1
     git -C "$PRC" -c user.name=t -c user.email=t@t merge -q --no-edit "origin/$2" >/dev/null 2>&1; }
-  d=$(mkproj_main ws5/projW origin "$wsO"); hook "$d"; rW="$BARE/projW.git"; bW=$(git -C "$rW" rev-parse main)
+  d=$(mkproj_main ws5/projW projW "$(fresh projW)"); : > "$d/.cc/base-seed"; hook "$d"; rW="$BARE/projW.git"; bW=$(git -C "$rW" rev-parse main)
   k "$(git -C "$d" merge-base --is-ancestor "$bW" track/projW 2>/dev/null && echo 0 || echo 1)" \
     "the commit the base is seeded with is on the project's own branch" "$bW is not in track/projW"
   eq "…carried there by a merge that changes no file on that branch" \
@@ -1282,9 +1355,9 @@ SH
   # THE BASE MOVED ON after the track was cut — the workspace's branch is shared, and a sibling's PR lands on it.
   # The seed merge takes the track's tree entire, so seeding here would record that later commit as reverted and
   # it would leave the new repository's base as soon as the project's first PR merged (review round 2 of #238).
-  d=$(mkproj_main ws5/projV2 origin "$wsO")
+  d=$(mkproj_main ws5/projV2 projV2 "$(fresh projV2)")
   git -C "$d" checkout -q main; echo plan > "$d/plan.md"; save "$d" plan; mV2=$(git -C "$d" rev-parse main)
-  git -C "$d" checkout -q track/projV2
+  git -C "$d" checkout -q track/projV2; : > "$d/.cc/base-seed"
   hook "$d"; rV2="$BARE/projV2.git"
   eq "a base that moved on since the track was cut is pushed unseeded" "$(git -C "$rV2" rev-parse main 2>/dev/null)" "$mV2"
   k "$([ -n "$(git -C "$d" rev-parse -q --verify 'HEAD^2' 2>/dev/null)" ] && echo 1 || echo 0)" \
@@ -1472,6 +1545,7 @@ SH
   eq "…with no credential minted for it" "$(grep -c gitargs "$CALLS")" 0
   k "$(grep -q 'refusing to push with an unscoped one' "$HOME/dev/ws5/evilwt/.cc/push.err" 2>/dev/null && echo 0 || echo 1)" "…and the reason is left in the worktree" "$(cat "$HOME/dev/ws5/evilwt/.cc/push.err" 2>/dev/null)"
   rm -f "$HOME/.cc/worktrees/ws5/evilL"   # out of the way of the cases below, which sweep this workspace again
+  git -C "$HOME/dev/ws5" remote remove origin   # a worktree's remotes are the workspace's: the cases below run in a workspace with no origin
   # AND THE TIMER SEEDS THE BASE, BUT MOVES NO DEFAULT BRANCH. A repository created for a project whose push never
   # reached it is still empty, so the track landing there first from a timer is bug #218 again: the base is a plain
   # push and goes ahead of it here too. `cc-gh-token default` is the org-admin half, and that waits — which is why
