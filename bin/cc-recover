@@ -1,0 +1,1303 @@
+#!/usr/bin/env python3
+"""cc-recover — the box gets itself back after a failure, with nobody asking.
+
+  cc-recover tick             every 60 s (cc-recover.timer): save the live set, then run the detector
+  cc-recover save             save the live set once and print it
+  cc-recover restore [--boot] bring back every saved session that is not live: resumed on its own conversation,
+                              then handed a catch-up turn (cc-recover-restore.service runs it at every boot);
+                              a session whose project `cc-pause is <repo>` calls paused is left down and logged
+  cc-recover watch-manager    is the user systemd manager alive? Run from the SYSTEM timer
+                              config/systemd-system/cc-recover-manager@.timer, which the installer never enables
+  cc-recover status           the saved set, the detector's state and its last decisions
+  cc-recover selfcheck        every rule below against fixtures: a fake tmux and a fake /proc, never the live server
+
+THE SAVED SET is ~/.cc/recover/live.json: every session in tmux session "main" that runs under `cc __run…`
+or `cc-loop`, with its kind and what relaunches it.
+  seat    <repo>, `cc __runmain` (and `__runplain`): relaunched `cc <repo>` on a CC_CLAUDE wrapper that runs
+          `claude --resume <sid>`. The sid is read off the live claude's open <tmp>/claude-<uid>/<proj>/<sid>/tasks
+          fd; a seat whose sid cannot be read comes back cold.
+  orch    <repo>@<alias>, `cc __runorch`: the same, `cc <repo> --orch <alias> ""`.
+  member  <repo>, `cc __runmember`: `cc <repo>`, and it comes back COLD, on a new conversation. There is no supported
+          way to resume it: its claude runs inside `cc-sandbox member`, which links its own claude and takes no
+          CC_CLAUDE wrapper from the host, and the seat path of `cc __runmember` passes no --resume. Resuming one
+          needs a change to cc and cc-sandbox, not here.
+  track   <repo>/<track>, `cc __run`: `cc <repo> <track>`, which resumes on the board's own session id.
+  worker  <repo>/<track> running cc-loop: `cc <repo> <track> --go "" --loop N <its flags> --resume-last`.
+  Never saved: `box` (tmux-main starts it), `_*` test windows, `~next`/`~old` handoff windows, and the perms
+  session — a window named `perms` or a claude run with --dangerously-skip-permissions. Its relaunch is the
+  planning seat's alone.
+A healthy tick rewrites the file, so it is never older than a minute or two while the box runs. A tick does NOT
+rewrite it while a restore is running, when the tmux server is down, or on a mass loss: at least half the saved
+set, and at least CC_RECOVER_MASS_MIN (3), gone at once. After an OUTAGE — a tick that found the tmux server down,
+or a boot since the set was saved — any loss at all is a mass loss, so a box of one or two sessions comes back too.
+That held set is what a restore brings back. A smaller set that lasts CC_RECOVER_HOLD_MIN (30) is taken as
+deliberate and saved.
+
+THE DETECTOR (tick). Its every decision goes to ~/.cc/recover/decisions.log, one line each, on a change of
+state only, so a three-hour outage is a handful of lines, not 180.
+  network  down = no TCP connect to any of CC_RECOVER_PROBES within 3 s. A reboot is due only when ALL hold:
+           down on every tick for CC_RECOVER_NET_MIN (15) minutes · the default gateway does not answer either (a
+           gateway that answers is the ISP's outage, which no reboot here fixes) · up at least 20 min since boot ·
+           no automatic reboot in CC_RECOVER_GAP_H (6) hours · and none for the network since the network was
+           last seen up, so an outage costs at most one reboot however long it lasts. A tick that comes more than
+           3 min after the last one (suspend, a stopped timer) restarts the count: a streak is only what was seen.
+  tmux     server down for 3 min: `cc-boot` (what tmux-main's own Restart= would have done). Still down at 15 min:
+           a reboot is due, under the same uptime and gap rules.
+  sessions a mass loss still standing on the next tick starts cc-recover-restore.service, at most once in 30 min.
+           No reboot — a relaunch is the fix.
+  manager  watch-manager, from the system timer: `systemctl --user is-system-running` for the box user failing
+           or hanging for 10 min is a reboot due, under the same rules.
+A due reboot runs `sudo -n systemctl reboot` ONLY with CC_RECOVER_REBOOT=on (cc-config). It ships off: until the
+owner turns it on, the log says "would reboot" and nothing else happens. The key is read on every tick the reboot is
+due, so turning it on during an outage acts on the next tick. A reboot command that fails is logged as failed and
+records no reboot; it is tried again 10 min later, at most 3 times an episode. The network interface, the rescue
+address, the hotspot and the firewall are never touched — the detector only reads.
+
+RESTORE: it marks itself running before it reads the saved set, so no tick rewrites that set until it ends. Then
+the tmux server (cc-boot), then the network (up to 15 min by the wall clock: claude needs it), then each saved
+session in turn, seats → orchs → members → tracks → workers, 20 s apart. One already live is left alone. Each
+non-worker gets a catch-up message once its claude is up (cc-msg; a track by `cc <repo> <track> --say`); a worker
+keeps its own journal and gets none. The result goes to restore.log and one cc-notify line. The saved set is a file,
+so no record is trusted: one whose names are not from a safe charset, whose repo is not a directory under ~/dev, whose
+worker flags are not the ones a scan saves, or whose claude is not the box's own ~/.local/bin/claude is REFUSED, logged
+and not relaunched. ~/.cc/recover and its wrapper directory must be this user's alone, and each wrapper is a new file.
+
+KEYS (cc-config; the environment wins): CC_RECOVER_REBOOT off|on · CC_RECOVER_RESTORE on|off (off = the boot
+restore does nothing) · CC_RECOVER_NET_MIN · CC_RECOVER_GAP_H · CC_RECOVER_HOLD_MIN · CC_RECOVER_MASS_MIN · CC_RECOVER_PROBES
+("host:port …", default 1.1.1.1:443 8.8.8.8:53 9.9.9.9:443) · CC_RECOVER_STAGGER (20 s between launches) ·
+CC_RECOVER_SETTLE (15 s from a claude coming up to its catch-up). Fixtures only: CC_RECOVER_STATE (the state dir),
+CC_RECOVER_TMUX, CC_RECOVER_PROC, CC_RECOVER_BIN (where cc, cc-msg, cc-boot, cc-notify are), CC_RECOVER_REBOOT_CMD,
+CC_RECOVER_RESTORE_CMD, CC_RECOVER_MANAGER_CMD.
+"""
+import calendar, json, math, os, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+# Box-owned, like ~/.cc/lander and ~/.cc/steward: never under ~/.cc/state/<name>, because a member workspace binds
+# ~/.cc/state/<its handle> read-write, and a member whose handle were `recover` would own the set a restore runs.
+STATE_HOME = os.path.join(HOME, ".cc/recover")
+STATE = os.environ.get("CC_RECOVER_STATE") or STATE_HOME
+DEV = os.path.join(HOME, "dev")                        # a saved repo must be a directory here
+CLAUDE = os.path.join(HOME, ".local/bin/claude")       # the one claude a restore runs (cc's own default)
+PROC = os.environ.get("CC_RECOVER_PROC") or "/proc"
+TMUX = os.environ.get("CC_RECOVER_TMUX") or "tmux"
+BIN = os.environ.get("CC_RECOVER_BIN") or os.path.dirname(os.path.realpath(__file__))
+ORDER = ["seat", "orch", "member", "track", "worker"]
+SID_RE = re.compile(r"/claude-\d+/[^/]+/([A-Za-z0-9][A-Za-z0-9._-]*)/tasks$")
+TICK_GAP = 180          # a tick later than this after the last one restarts every streak
+MIN_UPTIME = 20 * 60    # never reboot a box that has been up less than this
+TMUX_BOOT_S, TMUX_REBOOT_S, MANAGER_S = 3 * 60, 15 * 60, 10 * 60
+RESTORE_GAP = 30 * 60
+NET_WAIT_S = 15 * 60    # the restore's wait for the network, by the wall clock
+REBOOT_TRIES, REBOOT_RETRY_S = 3, 10 * 60   # a reboot command that fails: this many tries an episode, this far apart
+SHELLS = ("sh", "bash", "dash", "zsh")
+LOOP_WORD = re.compile(r"(?:[^\s=]*/)?cc-loop")
+
+
+def now():
+    return time.time()
+
+
+def iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def cfg(key, default):
+    if key in os.environ:
+        return os.environ[key]
+    try:
+        r = subprocess.run([os.path.join(BIN, "cc-config"), "get", key, default], capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() or default
+    except (OSError, subprocess.SubprocessError):
+        return default
+
+
+def cfg_num(key, default):
+    try:
+        return float(cfg(key, str(default)))
+    except ValueError:
+        return float(default)
+
+
+def path(name):
+    return os.path.join(STATE, name)
+
+
+def own_dir(d):
+    """Make d (mode 0700) or take it as it is, but only if it is a real directory of this user that nobody else can
+    write: a link planted in its place, or a directory another can write to, is refused, never written through."""
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise RuntimeError(f"cc-recover: {d} is not a directory only this user can write — refusing to use it")
+    return d
+
+
+def load(name, default):
+    try:
+        with open(path(name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def store(name, obj):
+    own_dir(STATE)
+    fd, tmp = tempfile.mkstemp(dir=STATE, prefix="." + name)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path(name))
+
+
+def log(name, line):
+    own_dir(STATE)
+    with open(path(name), "a") as f:
+        f.write(f"{iso(now())} {line}\n")
+
+
+def decide(line):
+    log("decisions.log", line)
+
+
+# ---- reading the live set ----
+
+def tmux(*args):
+    try:
+        r = subprocess.run([TMUX, *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def tmux_up():
+    return tmux("has-session", "-t", "main") is not None
+
+
+def windows():
+    """[(name, pane_pid)] of session main, or None when the server is not answering."""
+    out = tmux("list-windows", "-t", "main", "-F", "#{window_name}\t#{pane_pid}")
+    if out is None:
+        return None
+    return [tuple(l.split("\t", 1)) for l in out.splitlines() if "\t" in l]
+
+
+def argv(pid):
+    try:
+        with open(f"{PROC}/{pid}/cmdline", "rb") as f:
+            return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def children(pid):
+    try:
+        with open(f"{PROC}/{pid}/task/{pid}/children") as f:
+            return f.read().split()
+    except OSError:
+        return []
+
+
+def env_of(pid):
+    try:
+        with open(f"{PROC}/{pid}/environ", "rb") as f:
+            return dict(e.decode(errors="replace").split("=", 1) for e in f.read().split(b"\0") if b"=" in e)
+    except OSError:
+        return {}
+
+
+def descendants(pid):
+    todo, seen = [str(pid)], []
+    while todo:
+        p = todo.pop(0)
+        if p not in seen:
+            seen.append(p)
+            todo += children(p)
+    return seen
+
+
+def is_claude(a):
+    return bool(a) and os.path.basename(a[0]) == "claude"
+
+
+def claude_under(pid):
+    """The interactive claude under a pane: the first `claude` that is not a `-p` worker iteration, or None."""
+    for p in descendants(pid):
+        a = argv(p)
+        if is_claude(a) and "-p" not in a and "--print" not in a:
+            return p
+    return None
+
+
+def sid_of(pid):
+    try:
+        fds = os.listdir(f"{PROC}/{pid}/fd")
+    except OSError:
+        return ""
+    for fd in sorted(fds):
+        try:
+            m = SID_RE.search(os.readlink(f"{PROC}/{pid}/fd/{fd}"))
+        except OSError:
+            continue
+        if m:
+            return m.group(1)
+    return ""
+
+
+def skipped_name(name):
+    return name in ("box", "perms") or name.startswith("_") or "~" in name
+
+
+def words(a):
+    """argv with a shell's -c string split into its words, so `sh -c "… cc-loop r t"` is read word by word."""
+    if a and os.path.basename(a[0]) in SHELLS and "-c" in a[1:]:
+        i = a.index("-c", 1)
+        if i + 1 < len(a):
+            try:
+                split = shlex.split(a[i + 1])
+            except ValueError:
+                split = a[i + 1].split()
+            return a[:i + 1] + split + a[i + 2:]
+    return a
+
+
+def loop_args(a):
+    """The words after cc-loop in one process's argv, or None. cc-loop must be a WORD of its own (a path whose last
+    part is cc-loop), never a substring: a claude whose prompt text mentions `cc-loop r1 x` is not a worker."""
+    if is_claude(a):
+        return None
+    w = words(a)
+    for i, t in enumerate(w):
+        if LOOP_WORD.fullmatch(t):
+            return w[i + 1:]
+    return None
+
+
+def worker(name, toks):
+    rec = {"kind": "worker", "window": name, "repo": toks[0] if toks else "",
+           "track": toks[1] if len(toks) > 1 else "", "loop": "1", "flags": []}
+    rest = toks[2:]
+    i = 0
+    while i < len(rest):
+        t = rest[i]
+        if t == "--max-iter" and i + 1 < len(rest):
+            rec["loop"] = rest[i + 1]; i += 2; continue
+        if t in ("--budget", "--model", "--effort", "--turns") and i + 1 < len(rest):
+            rec["flags"] += [t, rest[i + 1]]; i += 2; continue
+        if t in ("--resume-last", "--no-extend"):
+            rec["flags"].append(t)
+        i += 1
+    return rec if rec["repo"] and rec["track"] else None
+
+
+def classify(name, pane):
+    """The saved record for one window, or None when it is not one this tool brings back. The pane's own `cc __run…`
+    mode decides first; only a pane with none is looked at for a cc-loop worker."""
+    if skipped_name(name):
+        return None
+    tree = descendants(pane)
+    if any("--dangerously-skip-permissions" in argv(p) for p in tree):
+        return None   # the perms session, however it was named
+    mode = next((t for t in words(argv(pane)) if t.startswith("__run")), None)
+    kind = {"__runmain": "seat", "__runplain": "seat", "__runorch": "orch", "__runmember": "member", "__run": "track"}.get(mode)
+    if not kind:
+        for p in tree:
+            toks = loop_args(argv(p))
+            if toks is not None:
+                return worker(name, toks)
+        return None
+    head, _, track = name.partition("/")
+    repo, _, alias = head.partition("@")
+    rec = {"kind": kind, "window": name, "repo": repo}
+    if kind == "orch":
+        rec["alias"] = alias
+    if kind == "track":
+        rec["track"] = track
+    if kind in ("seat", "orch"):
+        c = claude_under(pane)
+        rec["sid"] = sid_of(c) if c else ""
+        rec["claude"] = (env_of(c).get("CC_CLAUDE") or argv(c)[0]) if c else ""
+    return rec
+
+
+def scan():
+    """The live set as {window: record}, or None when tmux is not answering."""
+    ws = windows()
+    if ws is None:
+        return None
+    out = {}
+    for name, pane in ws:
+        rec = classify(name, pane)
+        if rec:
+            out[name] = rec
+    return out
+
+
+# ---- save ----
+
+def save(st):
+    """Save the live set unless the tmux server is down or a mass loss is standing. Returns (status, lost).
+    st["outage"] marks a tmux server seen down, or a boot since the set was saved: from then until the set is next
+    written, any loss is a mass loss whatever its size, so it is held and restored rather than saved as deliberate."""
+    live = scan()
+    saved = load("live.json", {})
+    prev = saved.get("sessions", {})
+    if live is None:
+        st.setdefault("outage", now())
+        return "tmux-down", sorted(prev)
+    if restoring():
+        return "restoring", sorted(set(prev) - set(live))
+    if saved.get("boot_id") and saved["boot_id"] != boot_id():
+        st.setdefault("outage", now() - uptime())
+    lost = sorted(set(prev) - set(live))
+    floor = max(1, int(cfg_num("CC_RECOVER_MASS_MIN", 3)))
+    if prev and lost and (st.get("outage") or len(lost) >= max(floor, math.ceil(len(prev) / 2))):
+        st.setdefault("mass_since", now())
+        if now() - st["mass_since"] < cfg_num("CC_RECOVER_HOLD_MIN", 30) * 60:
+            return "mass-loss", lost
+        decide(f"accepted: {len(live)} sessions, {len(lost)} fewer than the held set, for {cfg('CC_RECOVER_HOLD_MIN', '30')} min — taken as deliberate")
+    st.pop("mass_since", None)
+    st.pop("outage", None)
+    store("live.json", {"saved": iso(now()), "boot_id": boot_id(), "sessions": live})
+    return "saved", lost
+
+
+def restoring():
+    """A restore is running: its guard names a live process of this boot. Until it ends the half-restored set is
+    not saved. A guard from another boot, of the old bare-pid format, or naming a pid since recycled (its start
+    time differs) is stale: no restore survives a restart, so it is removed and does not stop anything."""
+    if not os.path.exists(path("restoring")):
+        return False
+    g = load("restoring", None)
+    try:
+        pid, bid, start = int(g["pid"]), str(g["boot_id"]), str(g.get("start", ""))
+        if bid == boot_id():
+            os.kill(pid, 0)
+            now_start = proc_start(pid)
+            if not (start and now_start and start != now_start):
+                return True
+    except (TypeError, KeyError, ValueError, OSError):
+        pass
+    try:
+        if load("restoring", None) == g:   # another restore may have just put up its own guard: leave that one
+            os.remove(path("restoring"))
+    except OSError:
+        pass
+    return False
+
+
+def proc_start(pid):
+    """The process start time in clock ticks since boot (/proc/<pid>/stat field 22), or "" when unreadable."""
+    try:
+        return open(f"{PROC}/{pid}/stat").read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return ""
+
+
+# ---- the detector ----
+
+def boot_id():
+    try:
+        return open(f"{PROC}/sys/kernel/random/boot_id").read().strip()
+    except OSError:
+        return ""
+
+
+def uptime():
+    try:
+        return float(open(f"{PROC}/uptime").read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def gateway():
+    try:
+        for l in open(f"{PROC}/net/route").read().splitlines()[1:]:
+            f = l.split()
+            if len(f) > 2 and f[1] == "00000000":
+                return socket.inet_ntoa(int(f[2], 16).to_bytes(4, "little"))
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def net_probe():
+    """up · down-upstream (the gateway answers: the ISP's outage) · down-local (no route, or the gateway is silent too)."""
+    for t in cfg("CC_RECOVER_PROBES", "1.1.1.1:443 8.8.8.8:53 9.9.9.9:443").split():
+        h, _, p = t.rpartition(":")
+        try:
+            socket.create_connection((h, int(p)), 3).close()
+            return "up"
+        except (OSError, ValueError):
+            continue
+    gw = gateway()
+    if gw and subprocess.run(["ping", "-c1", "-W2", gw], capture_output=True).returncode == 0:
+        return "down-upstream"
+    return "down-local"
+
+
+def reboot_block(st, reason):
+    """(rule, why) a due reboot may not happen now, or ("", "")."""
+    if uptime() < MIN_UPTIME:
+        return "uptime", f"up only {int(uptime() // 60)} min"
+    last = load("reboot.json", {})   # shared by the tick and watch-manager: one gap rule for every reboot this tool makes
+    if last and now() - last.get("at", 0) < cfg_num("CC_RECOVER_GAP_H", 6) * 3600:
+        return "gap", f"the last automatic reboot was at {iso(last['at'])}"
+    if reason.startswith("network") and last.get("reason", "").startswith("network") and not last.get("net_up"):
+        return "unfixed", "the network has not been up since the last reboot for it"
+    return "", ""
+
+
+def reboot(st, reason, own="detector.json"):
+    """A due reboot: run it with CC_RECOVER_REBOOT=on, else log that it would have. Every rule and the key are read
+    again on every tick the reboot is due; only the LOG is once per state of an episode (held, off, on)."""
+    rule, block = reboot_block(st, reason)
+    # brief: "the automatic reboot is a host change, so it ships disabled behind a cc-config key" — anything but "on" is off
+    on = cfg("CC_RECOVER_REBOOT", "off") == "on"
+    episode = reason.split(" down")[0]
+    key = f"{episode}|{rule or ('on' if on else 'off')}"   # the episode, not its minute count: one line per state
+    fresh = st.get("reboot_said") != key
+    st["reboot_said"] = key
+    if block:
+        if fresh:
+            decide(f"reboot due ({reason}) but held: {block}")
+        return False
+    if not on:
+        if fresh:
+            decide(f"would reboot ({reason}) — CC_RECOVER_REBOOT is off")
+        return False
+    fails = st.setdefault("reboot_fail", {})
+    f = fails.get(episode, {"n": 0, "at": 0})
+    if f["n"] >= REBOOT_TRIES or (f["n"] and now() - f["at"] < REBOOT_RETRY_S):
+        return False
+    decide(f"REBOOT ({reason})")
+    before = load("reboot.json", None)
+    store("reboot.json", {"at": now(), "reason": reason, "net_up": False})   # written first: a reboot that works ends this process
+    store(own, st)
+    subprocess.run(["sync"])
+    cmd = os.environ.get("CC_RECOVER_REBOOT_CMD") or "sudo -n systemctl reboot"
+    try:
+        rc = subprocess.run(shlex.split(cmd)).returncode
+    except OSError:
+        rc = 127
+    if rc == 0:
+        return True
+    # it did not reboot: put the record back as it was, so neither the gap nor the one-per-outage rule counts it
+    if before is None:
+        try:
+            os.remove(path("reboot.json"))
+        except OSError:
+            pass
+    else:
+        store("reboot.json", before)
+    f = {"n": f["n"] + 1, "at": now()}
+    fails[episode] = f
+    decide(f"reboot FAILED rc={rc} ({reason}): try {f['n']} of {REBOOT_TRIES}"
+           + (", no more for this episode" if f["n"] >= REBOOT_TRIES else f", next in {REBOOT_RETRY_S // 60} min"))
+    return False
+
+
+def reboot_clear(st):
+    """The episode is over: its log state and its failed tries go."""
+    st.pop("reboot_said", None)
+    st.pop("reboot_fail", None)
+
+
+def start_restore():
+    if os.environ.get("CC_RECOVER_RESTORE_CMD"):
+        return subprocess.run(shlex.split(os.environ["CC_RECOVER_RESTORE_CMD"])).returncode == 0
+    return subprocess.run(["systemctl", "--user", "start", "--no-block", "cc-recover-restore.service"]).returncode == 0
+
+
+def tick():
+    st = load("detector.json", {})
+    t = now()
+    if t - st.get("last_tick", 0) > TICK_GAP:
+        for k in ("net_down_since", "tmux_down_since"):
+            st.pop(k, None)
+        reboot_clear(st)
+    st["last_tick"] = t
+    status, lost = save(st)
+    # sessions
+    if status == "mass-loss":
+        if st.get("mass_said") != st["mass_since"]:
+            st["mass_said"] = st["mass_since"]
+            decide(f"mass loss: {len(lost)} saved sessions gone ({', '.join(lost[:8])}{' …' if len(lost) > 8 else ''}) — set held")
+        elif t - st.get("last_restore", 0) >= RESTORE_GAP and t - st["mass_since"] >= 60:
+            st["last_restore"] = t
+            decide(f"restore started for {len(lost)} lost sessions" if start_restore() else "restore could not be started")
+    # tmux
+    if status == "tmux-down":
+        st.setdefault("tmux_down_since", t)
+        if st.get("tmux_said") != st["tmux_down_since"]:
+            st["tmux_said"] = st["tmux_down_since"]
+            decide("tmux server down — set held")
+        down = t - st["tmux_down_since"]
+        if down >= TMUX_BOOT_S and t - st.get("last_cc_boot", 0) >= TMUX_BOOT_S:
+            st["last_cc_boot"] = t
+            r = subprocess.run([os.path.join(BIN, "cc-boot")], capture_output=True)
+            decide(f"tmux down {int(down // 60)} min: cc-boot rc={r.returncode}")
+        if down >= TMUX_REBOOT_S and reboot(st, f"tmux server down {int(down // 60)} min"):
+            return
+    elif st.pop("tmux_down_since", None) is not None:
+        decide("tmux server back")
+    # network
+    net = net_probe()
+    if net == "up":
+        if "net_down_since" in st:
+            decide(f"network back after {int((t - st.pop('net_down_since')) // 60)} min")
+        rb = load("reboot.json", {})
+        if rb and not rb.get("net_up"):
+            rb["net_up"] = True
+            store("reboot.json", rb)
+        st.pop("net_said", None)
+    else:
+        st.setdefault("net_down_since", t)
+        down = t - st["net_down_since"]
+        if st.get("net_said") != net:
+            st["net_said"] = net
+            decide(f"network {net} (since {iso(st['net_down_since'])})")
+        # brief: "A detector must not reboot on a transient blip" — only a streak seen on every tick for NET_MIN counts
+        if down >= cfg_num("CC_RECOVER_NET_MIN", 15) * 60:
+            if net == "down-upstream":
+                if st.get("reboot_said") != "upstream":
+                    st["reboot_said"] = "upstream"
+                    decide(f"network down {int(down // 60)} min but the gateway answers — the ISP's outage, no reboot")
+            elif reboot(st, f"network down {int(down // 60)} min, gateway silent"):
+                return
+    if net == "up" and status != "tmux-down":
+        reboot_clear(st)
+    store("detector.json", st)
+
+
+def watch_manager():
+    st = load("manager.json", {})
+    t = now()
+    if t - st.get("last_tick", 0) > TICK_GAP:
+        st.pop("down_since", None)
+    st["last_tick"] = t
+    uid = os.getuid()
+    env = dict(os.environ, XDG_RUNTIME_DIR=os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}")
+    try:
+        cmd = shlex.split(os.environ.get("CC_RECOVER_MANAGER_CMD") or "systemctl --user is-system-running")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, env=env)
+        alive = r.stdout.strip() in ("running", "degraded", "starting", "initializing")
+    except subprocess.TimeoutExpired:
+        alive = False
+    if alive:
+        if st.pop("down_since", None) is not None:
+            decide("user systemd manager back")
+        reboot_clear(st)
+    else:
+        st.setdefault("down_since", t)
+        if st.get("said") != st["down_since"]:
+            st["said"] = st["down_since"]
+            decide("user systemd manager not answering")
+        if t - st["down_since"] >= MANAGER_S and reboot(st, f"user systemd manager down {int((t - st['down_since']) // 60)} min", "manager.json"):
+            return
+    store("manager.json", st)
+
+
+# ---- restore ----
+
+def wid_live(name):
+    ws = windows() or []
+    return any(n == name for n, _ in ws)
+
+
+def claude_pid(name):
+    for n, pane in windows() or []:
+        if n == name:
+            return claude_under(pane)
+    return None
+
+
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")          # a repo, track, alias or sid: no `/`, no leading `-` or `.`
+FLAG_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]*")   # --budget 8, --model claude-opus-5-5[1m], --effort high
+LOOP_FLAGS, LOOP_SWITCHES = ("--budget", "--model", "--effort", "--turns"), ("--resume-last", "--no-extend")
+
+
+def unsafe(rec):
+    """Why a saved record must not be relaunched, or "" when it may be. The saved set is a file, so a restore checks
+    every field it acts on rather than trusting whoever wrote it: names from a safe charset, never option-looking;
+    the window the one its kind is named; the repo a directory under ~/dev; a worker's loop a number and its flags
+    only the ones a scan saves; and a seat's claude the box's own, whatever path the record gives."""
+    if not isinstance(rec, dict):
+        return "not a record"
+    k = rec.get("kind")
+    if k not in ORDER:
+        return "unknown kind"
+    fields = ["repo"] + {"orch": ["alias"], "track": ["track"], "worker": ["track"]}.get(k, [])
+    for f in fields:
+        if not isinstance(rec.get(f), str) or not NAME.fullmatch(rec[f]):
+            return f"bad {f}"
+    if rec.get("sid") and not (isinstance(rec["sid"], str) and NAME.fullmatch(rec["sid"])):
+        return "bad sid"
+    repo, w = rec["repo"], rec.get("window")
+    want = {"orch": [f"{repo}@{rec.get('alias')}"], "track": [f"{repo}/{rec.get('track')}"],
+            "worker": [f"{repo}/{rec.get('track')}"]}.get(k, [repo])
+    if not (w in want or (k == "member" and isinstance(w, str) and w.startswith(repo + "/") and NAME.fullmatch(w[len(repo) + 1:]))):
+        return "window does not match its repo"
+    dev = os.path.realpath(DEV)
+    if not (os.path.isdir(os.path.join(DEV, repo)) and os.path.dirname(os.path.realpath(os.path.join(DEV, repo))) == dev):
+        return "repo is not a directory under ~/dev"
+    if k == "worker":
+        if not (isinstance(rec.get("loop", "1"), str) and rec.get("loop", "1").isdigit()):
+            return "bad loop"
+        fl, i = rec.get("flags", []), 0
+        if not isinstance(fl, list):
+            return "bad flags"
+        while i < len(fl):
+            if fl[i] in LOOP_SWITCHES:
+                i += 1
+            elif fl[i] in LOOP_FLAGS and i + 1 < len(fl) and isinstance(fl[i + 1], str) and FLAG_VALUE.fullmatch(fl[i + 1]):
+                i += 2
+            else:
+                return "bad flags"
+    if k in ("seat", "orch") and rec.get("claude"):
+        c = rec["claude"]
+        if not isinstance(c, str) or os.path.realpath(c) != os.path.realpath(CLAUDE):
+            return "claude is not the box's own"
+    return ""
+
+
+def wrapper(rec):
+    """A CC_CLAUDE wrapper that resumes the saved conversation; the wrapper puts the real claude back in CC_CLAUDE,
+    so a later handoff from that session starts a new one rather than resuming this one again. It runs the box's own
+    claude (never the record's path, which unsafe() has only checked resolves to it). The file is new every time,
+    made O_EXCL|O_NOFOLLOW in an owner-only directory: a planted link or file in its place is refused, not followed."""
+    d = own_dir(path("w"))
+    f = os.path.join(d, f"{re.sub(r'[^A-Za-z0-9._@-]', '_', rec['window'])}.{os.urandom(4).hex()}.sh")
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
+    with os.fdopen(fd, "w") as h:
+        h.write(f"#!/bin/sh\nexport CC_CLAUDE={shlex.quote(CLAUDE)}\nexec {shlex.quote(CLAUDE)} --resume {shlex.quote(rec['sid'])} \"$@\"\n")
+    return f
+
+
+def launch_argv(rec):
+    cc = os.path.join(BIN, "cc")
+    k = rec["kind"]
+    if k == "orch":
+        return [cc, rec["repo"], "--orch", rec["alias"], ""]
+    if k == "track":
+        return [cc, rec["repo"], rec["track"]]
+    if k == "worker":
+        flags = list(rec.get("flags", []))
+        if "--resume-last" not in flags:
+            flags.append("--resume-last")
+        return [cc, rec["repo"], rec["track"], "--go", "", "--loop", rec.get("loop", "1"), *flags]
+    return [cc, rec["repo"]]   # a seat (resumed by its CC_CLAUDE wrapper) or a member (cold: see the docstring)
+
+
+def catchup_text(saved_at):
+    last = load("reboot.json", {})
+    why = f"after an automatic reboot ({last['reason']})" if last and now() - last.get("at", 0) < 3 * 3600 else "after a failure or restart"
+    since = time.strftime("%H:%M %Z", time.localtime(saved_at)) if saved_at else "it went down"
+    return (f"The box came back {why}, and this session was relaunched on its own conversation. Before going on, "
+            f"check your Slack channel and threads, your board rows, your journal and any requests since about {since} "
+            f"for anything you were meant to be running or answering, and pick it back up. Once you've caught up, post "
+            f"one short update in your own Slack channel saying what you're working on and what comes next.")
+
+
+def run(argv_, env=None, timeout=120):
+    try:
+        r = subprocess.run(argv_, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, env=env)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+    except OSError as e:
+        return 127, str(e)
+
+
+def restore(boot=False):
+    if cfg("CC_RECOVER_RESTORE", "on") == "off":
+        log("restore.log", "CC_RECOVER_RESTORE is off — nothing restored")
+        return 0
+    # restoring() drops a guard left from before a restart (the --boot case after a power cut mid-restore), so
+    # only a restore running in this boot, on the very process the guard names, stops this one
+    if restoring():
+        log("restore.log", "a restore is already running — this one does nothing")
+        return 0
+    # the guard goes up BEFORE the saved set is read and held through every wait: until it comes down no tick
+    # rewrites live.json, so a tick during the network wait cannot replace the set this restore is bringing back
+    store("restoring", {"pid": os.getpid(), "boot_id": boot_id(), "start": proc_start(os.getpid())})
+    try:
+        return restore_held(boot)
+    finally:
+        try:
+            os.remove(path("restoring"))
+        except OSError:
+            pass
+
+
+def restore_held(boot):
+    saved = load("live.json", {})
+    ss = saved.get("sessions") if isinstance(saved, dict) else None
+    sessions = list(ss.values()) if isinstance(ss, dict) else []
+    if not sessions:
+        log("restore.log", "no saved set — nothing to restore")
+        return 0
+    run([os.path.join(BIN, "cc-boot")])
+    for _ in range(30):
+        if tmux_up():
+            break
+        time.sleep(2)
+    deadline = time.monotonic() + NET_WAIT_S   # by the wall clock: one probe can take ~11 s on its own
+    while net_probe() != "up" and time.monotonic() < deadline:
+        time.sleep(10)
+    try:
+        saved_at = calendar.timegm(time.strptime(saved.get("saved", ""), "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        saved_at = 0
+    msg = catchup_text(saved_at)
+    env = {k: v for k, v in os.environ.items() if k not in ("CC_SLACK_ALIAS", "CC_CLAUDE")}   # a cold launch is the plain claude
+    log("restore.log", f"restore{' at boot' if boot else ''}: {len(sessions)} saved at {saved.get('saved', '?')}")
+    return relaunch(sessions, msg, env)
+
+
+def paused(repo):
+    """`cc-pause is <repo>` exits 0 when paused; a cc-pause that cannot answer is "go", as it is for cc-loop."""
+    try:
+        return subprocess.run([os.path.join(BIN, "cc-pause"), "is", repo], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def relaunch(sessions, msg, env):
+    stagger = cfg_num("CC_RECOVER_STAGGER", 20)
+    settle = cfg_num("CC_RECOVER_SETTLE", 15)
+    back, failed, already, refused = [], [], [], []
+    sessions.sort(key=lambda r: (ORDER.index(r.get("kind")) if isinstance(r, dict) and r.get("kind") in ORDER else 9,
+                                 str(r.get("window", "")) if isinstance(r, dict) else ""))
+    for rec in sessions:
+        why = unsafe(rec)
+        if why:
+            refused.append(rec)
+            log("restore.log", f"{json.dumps(rec.get('window') if isinstance(rec, dict) else None)[:80]}: REFUSED, {why} — not relaunched")
+            continue
+        w = rec["window"]
+        if wid_live(w):
+            already.append(w)
+            log("restore.log", f"{w}: already live")
+            continue
+        if paused(rec["repo"]):   # a paused project spends nothing the box starts on its own (cc-pause)
+            already.append(w)
+            log("restore.log", f"{w}: {rec['repo']} is paused — left down")
+            continue
+        e = dict(env)
+        if rec["kind"] in ("seat", "orch") and rec.get("sid"):
+            try:
+                e["CC_CLAUDE"] = wrapper(rec)
+            except (OSError, RuntimeError) as x:
+                failed.append(w)
+                log("restore.log", f"{w}: no resume wrapper ({x}) — not relaunched")
+                continue
+        rc, out = run(launch_argv(rec), env=e, timeout=110 if rec["kind"] == "worker" else 90)
+        log("restore.log", f"{w}: {rec['kind']} launch rc={rc}{' sid=' + rec['sid'] if rec.get('sid') else ''} {out[-160:]}")
+        if rc != 0:
+            failed.append(w)
+            continue
+        if rec["kind"] == "worker":
+            back.append(w)
+        else:
+            cp = None
+            for _ in range(30):
+                cp = claude_pid(w)
+                if cp:
+                    break
+                time.sleep(3)
+            if not cp:
+                failed.append(w)
+                log("restore.log", f"{w}: no claude under the window after 90 s — no catch-up sent")
+            else:
+                time.sleep(settle)
+                if rec["kind"] == "track":
+                    mrc, mout = run([os.path.join(BIN, "cc"), rec["repo"], rec["track"], "--say", msg], env=env)
+                else:
+                    mrc, mout = run([os.path.join(BIN, "cc-msg"), w, msg], env=env)
+                log("restore.log", f"{w}: catch-up rc={mrc} {mout[:160]}")
+                back.append(w)
+        time.sleep(stagger)
+    summary = (f"Brought back {len(back)} of {len(sessions) - len(already) - len(refused)} sessions"
+               + (f"; these did not come up: {', '.join(failed)}" if failed else "")
+               + (f"; {len(refused)} saved record(s) refused as unsafe, see restore.log" if refused else ""))
+    log("restore.log", "done: " + summary)
+    if back or failed or refused:
+        run([os.path.join(BIN, "cc-notify"), "-t", "box recovered", summary + "."], env=env, timeout=60)
+    return 1 if failed or refused else 0
+
+
+def status():
+    s = load("live.json", {})
+    print(f"saved {s.get('saved', 'never')}: {len(s.get('sessions', {}))} sessions")
+    for r in sorted(s.get("sessions", {}).values(), key=lambda r: (ORDER.index(r["kind"]), r["window"])):
+        print(f"  {r['kind']:<7} {r['window']}{'  ' + r['sid'] if r.get('sid') else ''}")
+    print(f"reboot: {cfg('CC_RECOVER_REBOOT', 'off')} · last automatic: {json.dumps(load('reboot.json', {}))} · detector: {json.dumps(load('detector.json', {}))}")
+    try:
+        print("".join(open(path("decisions.log")).readlines()[-10:]), end="")
+    except OSError:
+        pass
+
+
+# ---- selftest ----
+
+def selfcheck():
+    global STATE, PROC, TMUX, BIN, DEV, CLAUDE
+    fails, passed, made = [], [0], []
+
+    def check(name, cond):
+        print(("ok   " if cond else "FAIL ") + name)
+        if cond:
+            passed[0] += 1
+        else:
+            fails.append(name)
+
+    def fixture():
+        """A fresh state dir, fake /proc, fake tmux and fake bin of its own: no case reads another's leftovers."""
+        global STATE, PROC, TMUX, BIN, DEV, CLAUDE
+        d = tempfile.mkdtemp(prefix="cc-recover-st.")
+        made.append(d)
+        STATE, PROC, BIN, DEV, CLAUDE = f"{d}/state", f"{d}/proc", f"{d}/bin", f"{d}/dev", "/c/claude"
+        for x in (PROC, BIN, f"{PROC}/sys/kernel/random", f"{PROC}/net", *(f"{DEV}/{r}" for r in ("r1", "r2", "r3", "m1"))):
+            os.makedirs(x, exist_ok=True)
+        open(f"{PROC}/sys/kernel/random/boot_id", "w").write("boot-1\n")
+        open(f"{PROC}/uptime", "w").write("86400.0 1.0\n")
+        open(f"{PROC}/net/route", "w").write("Iface\tDestination\tGateway\n")
+        open(f"{d}/windows.tsv", "w").close()
+        TMUX = f"{BIN}/tmux"
+        with open(TMUX, "w") as f:   # has-session/list-windows off windows.tsv; no file = the server is down
+            f.write(f"#!/bin/sh\n[ -f {d}/windows.tsv ] || exit 1\n[ \"$1\" = list-windows ] && cat {d}/windows.tsv\nexit 0\n")
+        for tool in ("cc", "cc-msg", "cc-boot", "cc-notify"):
+            with open(f"{BIN}/{tool}", "w") as f:
+                f.write(f"#!/bin/sh\nprintf '%s|' {tool} \"$@\" >> {d}/calls; echo >> {d}/calls\n")
+        with open(f"{BIN}/cc-config", "w") as f:
+            f.write("#!/bin/sh\necho \"$4\"\n")
+        with open(f"{BIN}/cc-pause", "w") as f:   # `is <repo>`: paused when the fixture made {d}/paused-<repo>
+            f.write(f"#!/bin/sh\n[ -f {d}/paused-$2 ]\n")
+        for x in os.listdir(BIN):
+            os.chmod(f"{BIN}/{x}", 0o755)
+        return d
+
+    def proc(pid, args, kids=(), env=None, sid=None):
+        os.makedirs(f"{PROC}/{pid}/task/{pid}", exist_ok=True)
+        os.makedirs(f"{PROC}/{pid}/fd", exist_ok=True)
+        open(f"{PROC}/{pid}/cmdline", "wb").write(b"\0".join(a.encode() for a in args) + b"\0")
+        open(f"{PROC}/{pid}/task/{pid}/children", "w").write(" ".join(map(str, kids)))
+        open(f"{PROC}/{pid}/environ", "wb").write(b"\0".join(f"{k}={v}".encode() for k, v in (env or {}).items()))
+        if sid:
+            os.symlink(f"/tmp/claude-1000/-home-x-dev-r1/{sid}/tasks", f"{PROC}/{pid}/fd/7")
+
+    def live_box(d):
+        """seat, orch, member, track, worker — plus perms, box, a test window and a handoff window that are never saved."""
+        rows = []
+        def win(name, pane):
+            rows.append(f"{name}\t{pane}")
+        proc(100, ["bash", "/b/cc", "__runmain", "r1"], [101]); proc(101, ["/c/claude", "--permission-mode", "auto"], env={"CC_CLAUDE": "/c/claude"}, sid="sid-seat"); win("r1", 100)
+        proc(110, ["bash", "/b/cc", "__runorch", "r1@ops"], [111]); proc(111, ["/c/claude", "--resume", "old"], env={"CC_CLAUDE": "/c/claude"}, sid="sid-orch"); win("r1@ops", 110)
+        proc(120, ["bash", "/b/cc", "__runmember", "m1"], [121]); proc(121, ["bwrap", "--", "claude"]); win("m1", 120)
+        proc(130, ["bash", "/b/cc", "__run", "r1/fix"], [131]); proc(131, ["/c/claude", "--resume", "t"]); win("r1/fix", 130)
+        proc(140, ["bash", "-c", "cc-room admit x -- cc-loop r1 job --max-iter 3 --budget 8"], [141]); proc(141, ["/c/claude", "-p", "go"]); win("r1/job", 140)
+        proc(150, ["-bash"], [151]); proc(151, ["/c/claude", "--continue", "--dangerously-skip-permissions"]); win("perms", 150)
+        proc(152, ["-bash"], [153]); proc(153, ["/c/claude", "--dangerously-skip-permissions"]); win("odd", 152)
+        proc(160, ["bash", "/b/cc-rc"]); win("box", 160)
+        proc(170, ["bash", "/b/cc", "__runmain", "r1"]); win("_cctest1/w", 170)
+        proc(180, ["bash", "/b/cc", "__runmain", "r1"]); win("r1~next", 180)
+        open(f"{d}/windows.tsv", "w").write("\n".join(rows) + "\n")
+
+    real = {"now": globals()["now"], "net_probe": globals()["net_probe"], "claude_pid": globals()["claude_pid"], "sleep": time.sleep}
+    clock = [1_000_000.0]
+    globals()["now"] = lambda: clock[0]
+    time.sleep = lambda s: None
+    env_keys = ("CC_RECOVER_MANAGER_CMD", "CC_RECOVER_REBOOT", "CC_RECOVER_REBOOT_CMD", "CC_RECOVER_RESTORE_CMD", "CC_RECOVER_NET_MIN", "CC_RECOVER_RESTORE", "CC_RECOVER_MASS_MIN")
+    env_saved = {k: os.environ.get(k) for k in env_keys}
+    try:
+        # 1. the scan: one record per session kind, and nothing for perms, box, tests or handoff windows
+        d = fixture(); live_box(d)
+        s = scan()
+        check("scan: saves seat, orch, member, track and worker", sorted(s) == ["m1", "r1", "r1/fix", "r1/job", "r1@ops"])
+        check("scan: a seat's sid is read off its tasks fd", s["r1"]["kind"] == "seat" and s["r1"]["sid"] == "sid-seat" and s["r1"]["claude"] == "/c/claude")
+        check("scan: an orch keeps its alias and sid", s["r1@ops"]["kind"] == "orch" and s["r1@ops"]["alias"] == "ops" and s["r1@ops"]["sid"] == "sid-orch")
+        check("scan: a worker keeps its loop and flags", s["r1/job"]["kind"] == "worker" and s["r1/job"]["loop"] == "3" and s["r1/job"]["flags"] == ["--budget", "8"])
+        check("scan: member and track", s["m1"]["kind"] == "member" and s["r1/fix"]["kind"] == "track" and s["r1/fix"]["track"] == "fix")
+        check("scan: perms and any --dangerously-skip-permissions session are never saved", "perms" not in s and "odd" not in s)
+        # a seat whose claude carries `cc-loop` in its prompt text is a seat, never a worker named by that text
+        proc(190, ["bash", "/b/cc", "__runmain", "r2"], [191])
+        proc(191, ["/c/claude", "--append-system-prompt", "dispatch with cc-loop r9 bogus --max-iter 2, or ~/bin/cc-loop r8 x"], [192])
+        proc(192, ["bash", "-c", "grep -n 'cc-loop r7 y' notes"])
+        proc(193, ["bash", "-c", "CC_CLAUDE=/c/claude /b/cc-loop r3 job2 --max-iter 2"])
+        proc(194, ["bash", "-c", "echo /b/cc-loop.log cc-loopy r4 z"])
+        proc(195, ["-bash"], [196]); proc(196, ["/c/claude", "--append-system-prompt", "x", "/b/cc-loop", "r5", "w"])
+        open(f"{d}/windows.tsv", "a").write("r2\t190\nr3/job2\t193\nr4/z\t194\nr5/w\t195\n")
+        s = scan()
+        check("scan: `cc-loop` inside a seat's argv text does not make it a worker", s["r2"]["kind"] == "seat" and s["r2"]["repo"] == "r2")
+        check("scan: a cc-loop word (a path) under a shell -c is a worker; a look-alike word is not",
+              s["r3/job2"]["kind"] == "worker" and s["r3/job2"]["repo"] == "r3" and s["r3/job2"]["loop"] == "2" and "r4/z" not in s and "r5/w" not in s)
+
+        # 2. save: a healthy tick writes; a mass loss holds the old set; a small loss is saved
+        d = fixture(); live_box(d)
+        st = {}
+        check("save: healthy tick writes the set", save(st)[0] == "saved" and len(load("live.json", {})["sessions"]) == 5)
+        lines = open(f"{d}/windows.tsv").read().splitlines()
+        open(f"{d}/windows.tsv", "w").write("\n".join(l for l in lines if not l.startswith(("r1\t", "r1@ops", "m1"))) + "\n")
+        r = save(st)
+        check("save: 3 of 5 gone at once is a mass loss and the old set is kept", r[0] == "mass-loss" and len(load("live.json", {})["sessions"]) == 5)
+        clock[0] += 31 * 60
+        r = save(st)
+        check("save: a smaller set standing 30 min is saved as deliberate", r[0] == "saved" and len(load("live.json", {})["sessions"]) == 2 and "mass_since" not in st)
+        d = fixture(); live_box(d); st = {}; save(st)
+        keep = [l for l in open(f"{d}/windows.tsv").read().splitlines() if not l.startswith("m1")]
+        open(f"{d}/windows.tsv", "w").write("\n".join(keep) + "\n")
+        check("save: one session gone is saved at once", save(st)[0] == "saved" and len(load("live.json", {})["sessions"]) == 4)
+
+        # 2b. an outage restores however few sessions there were: two saved, tmux seen down, back with box alone
+        d = fixture(); live_box(d)
+        open(f"{d}/windows.tsv", "w").write("box\t160\nr1\t100\nr1/fix\t130\n")
+        os.environ["CC_RECOVER_RESTORE_CMD"] = f"touch {d}/restore-started"
+        globals()["net_probe"] = lambda: "up"
+        tick(); clock[0] += 60
+        os.remove(f"{d}/windows.tsv"); tick(); clock[0] += 60
+        open(f"{d}/windows.tsv", "w").write("box\t160\n"); tick()
+        held = len(load("live.json", {})["sessions"]) == 2
+        clock[0] += 60; tick()
+        check("save: after tmux was seen down, 2 of 2 gone is held, not saved empty, and restored",
+              held and len(load("live.json", {})["sessions"]) == 2 and os.path.exists(f"{d}/restore-started"))
+        open(f"{d}/windows.tsv", "w").write("box\t160\nr1\t100\nr1/fix\t130\n"); clock[0] += 60; tick()
+        check("save: the outage ends once the set is back and saved", "outage" not in load("detector.json", {}))
+        d = fixture(); live_box(d)
+        open(f"{d}/windows.tsv", "w").write("box\t160\nr1\t100\nr1/fix\t130\n"); save({})
+        open(f"{PROC}/sys/kernel/random/boot_id", "w").write("boot-2\n")
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        check("save: a boot since the set was saved holds even a set of two", save({})[0] == "mass-loss" and len(load("live.json", {})["sessions"]) == 2)
+        d = fixture(); live_box(d)
+        open(f"{d}/windows.tsv", "w").write("box\t160\nr1\t100\nr1/fix\t130\n"); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        no_floor = save({})[0]
+        d = fixture(); live_box(d)
+        open(f"{d}/windows.tsv", "w").write("box\t160\nr1\t100\nr1/fix\t130\n"); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        os.environ["CC_RECOVER_MASS_MIN"] = "2"
+        check("save: with no outage the CC_RECOVER_MASS_MIN floor decides (3: saved; 2: held)", no_floor == "saved" and save({})[0] == "mass-loss")
+        os.environ.pop("CC_RECOVER_MASS_MIN", None)
+
+        # 3. save with the tmux server down writes nothing
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        store("restoring", {"pid": os.getpid(), "boot_id": "boot-1", "start": ""})
+        before = open(path("live.json")).read()
+        check("save: a running restore holds the set", save({})[0] == "restoring" and open(path("live.json")).read() == before)
+        store("restoring", {"pid": 999999999, "boot_id": "boot-1", "start": ""})
+        check("save: a restore pid that is gone does not", save({})[0] == "mass-loss")
+        store("restoring", {"pid": os.getpid(), "boot_id": "boot-0", "start": ""})
+        check("save: a guard from another boot naming a live pid does not hold the set, and is removed",
+              save({})[0] == "mass-loss" and not os.path.exists(path("restoring")))
+        open(path("restoring"), "w").write(str(os.getpid()))
+        check("save: an old-format guard (a bare pid) is stale and removed", not restoring() and not os.path.exists(path("restoring")))
+        os.makedirs(f"{PROC}/{os.getpid()}", exist_ok=True)
+        open(f"{PROC}/{os.getpid()}/stat", "w").write(f"{os.getpid()} (py thon) S " + " ".join(["0"] * 18) + " 4242 0 0\n")
+        store("restoring", {"pid": os.getpid(), "boot_id": "boot-1", "start": "4141"})
+        recycled = restoring()
+        store("restoring", {"pid": os.getpid(), "boot_id": "boot-1", "start": "4242"})
+        check("save: a guard whose pid was recycled in this boot (start time differs) is stale; the same start holds",
+              not recycled and restoring())
+        os.remove(path("restoring"))
+        d = fixture(); live_box(d); save({})
+        os.remove(f"{d}/windows.tsv")
+        before = open(path("live.json")).read()
+        check("save: tmux down holds the set", save({})[0] == "tmux-down" and open(path("live.json")).read() == before)
+
+        # 4. the network detector — every case its own fixture and clock
+        last = {}
+
+        def net_case(states, *, reboot_on, uptime_s=86400, gap_tick=60, pre=None, cmd=None):
+            d = fixture(); live_box(d); last["d"] = d
+            open(f"{PROC}/uptime", "w").write(f"{uptime_s} 1\n")
+            os.environ["CC_RECOVER_REBOOT"] = "on" if reboot_on else "off"
+            os.environ["CC_RECOVER_REBOOT_CMD"] = cmd.format(d=d) if cmd else f"touch {d}/rebooted"
+            os.environ["CC_RECOVER_NET_MIN"] = "15"
+            if pre:
+                store("reboot.json", pre)
+            seq = iter(states)
+            globals()["net_probe"] = lambda: next(seq)
+            for _ in states:
+                clock[0] += gap_tick
+                tick()
+            log_ = open(path("decisions.log")).read() if os.path.exists(path("decisions.log")) else ""
+            return os.path.exists(f"{d}/rebooted"), log_
+
+        rb, lg = net_case(["down-local"] * 10 + ["up"] * 3, reboot_on=True)
+        check("net: a 10-min blip reboots nothing and logs down and back", not rb and "network down-local" in lg and "network back after" in lg)
+        rb, lg = net_case(["down-local"] * 17, reboot_on=True)
+        check("net: 16 min down with the gateway silent reboots when on", rb and "REBOOT (network down" in lg)
+        rb, lg = net_case(["down-local"] * 17, reboot_on=False)
+        check("net: the same with CC_RECOVER_REBOOT off only logs 'would reboot', once", not rb and lg.count("would reboot") == 1)
+        rb, lg = net_case(["down-upstream"] * 20, reboot_on=True)
+        check("net: a gateway that answers is the ISP's outage — no reboot", not rb and "the ISP's outage" in lg)
+        rb, lg = net_case(["down-local"] * 17, reboot_on=True, uptime_s=600)
+        check("net: up under 20 min holds the reboot", not rb and "held: up only" in lg)
+        rb, lg = net_case(["down-local"] * 17, reboot_on=True, gap_tick=240)
+        check("net: ticks more than 3 min apart never build a streak", not rb)
+        rb, lg = net_case(["down-local"] * 17, reboot_on=True,
+                          pre={"at": clock[0] - 7 * 3600, "reason": "network down 15 min", "net_up": False})
+        check("net: no second reboot for an outage the last one did not fix", not rb and "has not been up since" in lg)
+        rb, lg = net_case(["down-local"] * 17, reboot_on=True,
+                          pre={"at": clock[0] - 3600, "reason": "tmux server down 15 min", "net_up": True})
+        check("net: no reboot within 6 h of the last", not rb and "the last automatic reboot" in lg)
+
+        rb, lg = net_case(["down-local"] * 17, reboot_on=True,
+                          pre={"at": clock[0] - 7 * 3600, "reason": "network down 15 min", "net_up": True})
+        check("net: an outage after the network came back since the last reboot may reboot again", rb)
+        rb, lg = net_case(["down-local"] * 3 + ["up"] + ["down-local"] * 3, reboot_on=True,
+                          pre={"at": clock[0] - 7 * 3600, "reason": "network down 15 min", "net_up": False})
+        check("net: a tick with the network up marks the last network reboot as fixed", load("reboot.json", {}).get("net_up") is True and not rb)
+
+        def more(n, state="down-local"):
+            globals()["net_probe"] = lambda: state
+            for _ in range(n):
+                clock[0] += 60
+                tick()
+            return os.path.exists(f"{last['d']}/rebooted"), open(path("decisions.log")).read()
+
+        net_case(["down-local"] * 17, reboot_on=False)
+        os.environ["CC_RECOVER_REBOOT"] = "on"
+        rb, lg = more(2)
+        check("net: CC_RECOVER_REBOOT turned on mid-outage reboots on the next tick", rb and lg.count("would reboot") == 1 and "REBOOT (network down" in lg)
+        fail_cmd = "sh -c 'echo x >> {d}/tries; exit 1'"
+        rb, lg = net_case(["down-local"] * 17, reboot_on=True, cmd=fail_cmd)
+        check("net: a failed reboot is logged as failed and records no reboot",
+              not rb and "reboot FAILED rc=1" in lg and "try 1 of 3" in lg and not os.path.exists(path("reboot.json")))
+        rb, lg = more(5)
+        tries5 = open(f"{last['d']}/tries").read().count("x")
+        rb, lg = more(60)
+        check("net: a failed reboot is retried 10 min later, and no more than 3 times an episode",
+              tries5 == 1 and open(f"{last['d']}/tries").read().count("x") == 3 and "no more for this episode" in lg)
+        rb, lg = net_case(["down-local"] * 17, reboot_on=True, cmd=fail_cmd,
+                          pre={"at": clock[0] - 7 * 3600, "reason": "tmux server down 15 min", "net_up": True})
+        check("net: a failed reboot leaves the last real reboot's record as it was", load("reboot.json", {}).get("reason") == "tmux server down 15 min")
+        os.environ["CC_RECOVER_REBOOT_CMD"] = f"touch {last['d']}/rebooted"
+        rb, lg = more(11)
+        check("net: the retry after a failed reboot can succeed", rb and load("reboot.json", {}).get("reason", "").startswith("network"))
+
+        # 4b. watch-manager: a manager silent 10 min is a reboot due; alive again is logged
+        d = fixture(); os.environ["CC_RECOVER_REBOOT"] = "off"
+        os.environ["CC_RECOVER_MANAGER_CMD"] = "false"
+        for _ in range(12):
+            clock[0] += 60; watch_manager()
+        os.environ["CC_RECOVER_MANAGER_CMD"] = "echo running"
+        clock[0] += 60; watch_manager()
+        lg = open(path("decisions.log")).read()
+        check("manager: down 10 min is a reboot due (off: logged once), and its return is logged",
+              lg.count("would reboot (user systemd manager down") == 1 and "manager back" in lg and not os.path.exists(path("detector.json")))
+
+        # 5. a mass loss standing on the next tick starts a restore, once
+        d = fixture(); live_box(d)
+        os.environ["CC_RECOVER_RESTORE_CMD"] = f"touch {d}/restore-started"
+        globals()["net_probe"] = lambda: "up"
+        tick(); clock[0] += 60
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        tick()
+        first = os.path.exists(f"{d}/restore-started")
+        clock[0] += 60; tick()
+        check("tick: a mass loss is logged first and restored on the next tick", not first and os.path.exists(f"{d}/restore-started"))
+        os.remove(f"{d}/restore-started"); clock[0] += 60; tick()
+        check("tick: no second restore within 30 min", not os.path.exists(f"{d}/restore-started"))
+
+        # 6. tmux down: cc-boot at 3 min, reboot due at 15
+        d = fixture(); live_box(d); os.environ["CC_RECOVER_REBOOT"] = "off"
+        tick(); os.remove(f"{d}/windows.tsv")
+        for _ in range(16):
+            clock[0] += 60; tick()
+        calls = open(f"{d}/calls").read() if os.path.exists(f"{d}/calls") else ""
+        lg = open(path("decisions.log")).read()
+        check("tmux: down 3 min runs cc-boot; 15 min is a reboot due (off: logged)", "cc-boot|" in calls and "would reboot (tmux server down" in lg)
+
+        # 7. restore after a boot: the saved set comes back on its own conversations, the live one is left alone
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\nr1/fix\t130\n")
+        globals()["claude_pid"] = lambda w: "999"
+        os.environ.pop("CC_RECOVER_RESTORE", None)
+        # the fake cc opens the window it was asked for, as the real one does
+        with open(f"{BIN}/cc", "w") as f:
+            f.write(f"#!/bin/sh\nprintf '%s|' cc \"$@\" >> {d}/calls; printf 'CC_CLAUDE=%s' \"$CC_CLAUDE\" >> {d}/calls; echo >> {d}/calls\n")
+        rc = restore(boot=True)
+        calls = open(f"{d}/calls").read().splitlines()
+        cc_calls = [c for c in calls if c.startswith("cc|")]
+        seat = next((c for c in cc_calls if c.startswith("cc|r1|CC_CLAUDE=")), "")
+        wrap = seat.split("CC_CLAUDE=", 1)[1] if seat else ""
+        check("restore: the seat comes back resumed on its sid", wrap and "--resume sid-seat" in open(wrap).read() and "export CC_CLAUDE=/c/claude" in open(wrap).read())
+        check("restore: the orch comes back through cc --orch on its own sid",
+              any(c.startswith("cc|r1|--orch|ops||CC_CLAUDE=") and "--resume sid-orch" in open(c.split("CC_CLAUDE=", 1)[1]).read() for c in cc_calls))
+        check("restore: the worker gets its loop, flags and --resume-last", "cc|r1|job|--go||--loop|3|--budget|8|--resume-last|CC_CLAUDE=" in cc_calls)
+        check("restore: the member is relaunched cold", "cc|m1|CC_CLAUDE=" in cc_calls)
+        check("restore: a session already live is left alone", not any(c.startswith("cc|r1|fix|") and "--say" not in c for c in cc_calls))
+        check("restore: seats, orchs and members get a catch-up; the worker none",
+              sum(c.startswith("cc-msg|") for c in calls) == 3 and not any(c.startswith("cc-msg|r1/job") for c in calls))
+        check("restore: perms is never relaunched", not any("perms" in c for c in calls))
+        check("restore: the restoring mark is gone once it ends", not os.path.exists(path("restoring")))
+        check("restore: one notify line with the count", sum(c.startswith("cc-notify|") for c in calls) == 1 and "Brought back 4 of 4" in open(path("restore.log")).read() and rc == 0)
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        open(f"{d}/paused-m1", "w").close()
+        restore(boot=True)
+        calls = open(f"{d}/calls").read().splitlines()
+        check("restore: a paused project stays down while the rest come back",
+              not any(c.startswith("cc|m1|") for c in calls) and any(c.startswith("cc|r1|") for c in calls)
+              and "m1 is paused" in open(path("restore.log")).read())
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        os.environ["CC_RECOVER_RESTORE"] = "off"
+        restore(boot=True)
+        check("restore: CC_RECOVER_RESTORE=off launches nothing", not os.path.exists(f"{d}/calls") or "cc|" not in open(f"{d}/calls").read())
+        os.environ.pop("CC_RECOVER_RESTORE", None)
+
+        # 8. the restore guard is up before the saved set is read and through the network wait
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        seen = []
+
+        def probe():
+            st = {}
+            seen.append((restoring(), save(st)[0], len(load("live.json", {})["sessions"])))
+            return "up" if len(seen) > 2 else "down-local"
+        globals()["net_probe"] = probe
+        restore(boot=True)
+        check("restore: a tick during the network wait sees the guard and leaves the saved set alone",
+              len(seen) == 3 and all(x == (True, "restoring", 5) for x in seen) and not os.path.exists(path("restoring")))
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        store("restoring", {"pid": os.getpid(), "boot_id": "boot-1", "start": ""})
+        globals()["net_probe"] = lambda: "up"
+        restore(boot=True)
+        check("restore: a second restore while one of this boot runs launches nothing and leaves the first one's guard",
+              (not os.path.exists(f"{d}/calls") or "cc|" not in open(f"{d}/calls").read()) and os.path.exists(path("restoring")))
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        store("restoring", {"pid": os.getpid(), "boot_id": "boot-0", "start": ""})   # power cut mid-restore; pid reused
+        rc = restore(boot=True)
+        check("restore --boot: a guard left from another boot naming a live pid does not stop it",
+              rc == 0 and os.path.exists(f"{d}/calls") and "cc|" in open(f"{d}/calls").read()
+              and not os.path.exists(path("restoring")) and "already running" not in open(path("restore.log")).read())
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        open(path("restoring"), "w").write(str(os.getpid()))
+        restore(boot=True)
+        check("restore --boot: an old-format guard naming a live pid does not stop it",
+              os.path.exists(f"{d}/calls") and "cc|" in open(f"{d}/calls").read())
+
+        # 9. the saved set is a file, so every record is checked before anything runs from it
+        check("state: the saved set lives outside ~/.cc/state/<name>, which a member handle can own",
+              not os.path.realpath(STATE_HOME).startswith(os.path.realpath(os.path.join(HOME, ".cc/state")) + os.sep))
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        s = load("live.json", {})
+        s["sessions"]["r1"]["claude"] = f"{d}/evil"                    # a forged claude path
+        os.symlink("/c/claude", f"{d}/claude-link")
+        s["sessions"]["r1@ops"]["claude"] = f"{d}/claude-link"        # a link to the box's own claude is that claude
+        store("live.json", s)
+        rc = restore(boot=True)
+        calls = open(f"{d}/calls").read().splitlines()
+        rlog = open(path("restore.log")).read()
+        check("restore: a seat whose saved claude is not the box's own is refused, and the rest still come back",
+              "cc|r1|" not in calls and '"r1": REFUSED, claude is not the box\'s own' in rlog
+              and "cc|r1|--orch|ops||" in calls and rc == 1 and "1 saved record(s) refused" in rlog)
+        wraps = os.listdir(path("w"))
+        check("restore: a wrapper runs the box's own claude, never the record's path",
+              wraps and all("/c/claude --resume" in open(os.path.join(path("w"), x)).read() and d not in open(os.path.join(path("w"), x)).read() for x in wraps))
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        s = load("live.json", {})
+        good = s["sessions"]
+        forged = {
+            "a": dict(good["r1/fix"], repo="../etc", window="../etc/fix"),
+            "b": dict(good["r1/fix"], repo="r1;id", window="r1;id/fix"),
+            "c": dict(good["r1/fix"], track="--go", window="r1/--go"),
+            "d": dict(good["r1"], window="-x"),
+            "e": dict(good["r1"], sid="-rf"),
+            "f": dict(good["r1/fix"], repo="r9", window="r9/fix"),
+            "g": dict(good["r1/job"], flags=["--dangerously-skip-permissions"]),
+            "h": dict(good["r1/job"], loop="3;id"),
+            "i": dict(good["r1"], kind="shell"),
+            "j": dict(good["r1/job"], flags=["--model", "-x"]),
+        }
+        s["sessions"] = forged
+        store("live.json", s)
+        restore(boot=True)
+        rlog = open(path("restore.log")).read()
+        launched = [c for c in open(f"{d}/calls").read().splitlines() if c.startswith("cc|")] if os.path.exists(f"{d}/calls") else []
+        check("restore: traversal, metacharacters, option-looking names, a repo not under ~/dev, forged loop flags and an "
+              "unknown kind are each refused and nothing is launched", not launched and rlog.count("REFUSED") == len(forged))
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        os.makedirs(f"{d}/elsewhere")
+        os.symlink(f"{d}/elsewhere", path("w"))
+        restore(boot=True)
+        calls = open(f"{d}/calls").read().splitlines()
+        check("restore: a link planted for the wrapper directory is refused, not written through",
+              not os.listdir(f"{d}/elsewhere") and "cc|r1|" not in calls and "cc|r1|fix|" in calls
+              and "no resume wrapper" in open(path("restore.log")).read())
+        d = fixture(); os.makedirs(path("w"), mode=0o700)
+        open(f"{d}/target", "w").write("keep\n")
+        real_urandom = os.urandom
+        os.urandom = lambda n: b"\0" * n
+        os.symlink(f"{d}/target", os.path.join(path("w"), "r1.00000000.sh"))
+        try:
+            wrapper({"window": "r1", "sid": "s"})
+            planted = "followed"
+        except OSError:
+            planted = "refused"
+        open(os.path.join(path("w"), "r1.00000000.sh.x"), "w").close()
+        os.rename(os.path.join(path("w"), "r1.00000000.sh.x"), os.path.join(path("w"), "r1.00000000.sh"))
+        try:
+            wrapper({"window": "r1", "sid": "s"})
+            existing = "overwritten"
+        except OSError:
+            existing = "refused"
+        os.urandom = real_urandom
+        check("wrapper: a planted link or an existing file at its name is refused (O_EXCL|O_NOFOLLOW)",
+              planted == "refused" and existing == "refused" and open(f"{d}/target").read() == "keep\n")
+        d = fixture(); os.makedirs(STATE, mode=0o700); os.chmod(STATE, 0o777)
+        try:
+            store("live.json", {})
+            loose = "written"
+        except RuntimeError:
+            loose = "refused"
+        check("state: a state directory others can write is refused", loose == "refused" and not os.path.exists(path("live.json")))
+    finally:
+        globals().update({k: v for k, v in real.items() if k != "sleep"})
+        time.sleep = real["sleep"]
+        for x in made:
+            shutil.rmtree(x, ignore_errors=True)
+        for k, v in env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print(f"cc-recover selfcheck: {passed[0]} passed, {len(fails)} failed")
+    return 1 if fails else 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "tick":
+        tick()
+    elif cmd == "save":
+        st = load("detector.json", {})
+        r = save(st)
+        store("detector.json", st)
+        print(r[0])
+        status()
+    elif cmd == "restore":
+        return restore(boot="--boot" in sys.argv)
+    elif cmd == "watch-manager":
+        watch_manager()
+    elif cmd == "status":
+        status()
+    elif cmd == "selfcheck":
+        return selfcheck()
+    else:
+        print(__doc__.split("\n\n")[0])
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
