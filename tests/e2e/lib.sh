@@ -144,7 +144,7 @@ cd ~ || exit 1
 BOX_PATHS="notify.log failures state/claude-limit state/handoff state/context state/statusline guard-asks scope state/limit-seen state/limit-interrupted state/limit-nudged state/limit-resumed slack"
 box_marked(){   # <root> → the files under it, changed since this run began, that name this run's fixtures
   find "$1" -path "$1/worktrees" -prune -o -path "$1/slack/files" -prune -o -path "$1/slack/member" -prune -o -path "$1/voice" -prune \
-       -o -path "$1/selftest-*" -prune -o -path "$1/state/$REPO" -prune \
+       -o -path "$1/toolchains" -prune -o -path "$1/tmp" -prune -o -path "$1/selftest-*" -prune -o -path "$1/state/$REPO" -prune \
        -o -type f -newer "$T/born" ! -name "$REPO.*" ! -name 'selftest.lock*' -print 2>/dev/null \
      | xargs -r grep -l -e "$REPO" -e "selftest-$RUN" 2>/dev/null; }
 box_split(){   # <root> <marked files…> → $leak: under a BOX_PATHS default of <root>; $seen: anywhere else
@@ -158,6 +158,15 @@ box_split "$C" $(box_marked "$C")
 [ "$leak" = " $C/state/context/handoffs.jsonl" ] && [ "$seen" = " $C/state/reconcile.log" ] \
   && ok "control: a marker in state/context reads as a leak, one in reconcile.log as a watcher; an old file, a sibling run's, a board file and a clean file are not found" \
   || bad "the leak/watcher walk is wrong: leak=[$leak] seen=[$seen]"
+# …and the walk still reaches every path it judges: a stray marker planted under each BOX_PATHS entry is a leak, and
+# one under toolchains/ or tmp/ is not found — the installed tools (~228k files) and the session temp dirs (~1.46M
+# files on the host, nearly all of this walk's cost on 10-11), neither a box path and neither written by name.
+C=$T/boxctl2; want=""; for b in $BOX_PATHS; do mkdir -p "$C/$b"; echo "$REPO" > "$C/$b/stray"; want="$want $C/$b/stray"; done
+mkdir -p "$C/toolchains/uv/bin" "$C/tmp/claude-1"; echo "$REPO" > "$C/toolchains/uv/bin/stray"; echo "$REPO" > "$C/tmp/claude-1/stray"
+box_split "$C" $(box_marked "$C"); want=$(tr ' ' '\n' <<<"$want" | sort | tr '\n' ' '); got=$(tr ' ' '\n' <<<"$leak" | sort | tr '\n' ' ')
+[ "$got" = "$want" ] && [ -z "$seen" ] \
+  && ok "control: a stray marker under each of the $(wc -w <<<"$BOX_PATHS") box paths is a leak, and one under toolchains/ or tmp/ is not walked" \
+  || bad "the leak walk missed a box path or walked toolchains/ or tmp/: leak=[$leak] seen=[$seen]"
 box_split ~/.cc $(box_marked ~/.cc)   # brief: "a run leaves ~/.cc byte-identical (checked)" — empty $leak is that, for the paths the block redirects
 [ -z "$leak" ] && ok "the run wrote nothing of its own into a box file: no $REPO in the box's copy of a path the export block redirects" \
   || bad "a box file carries this run's fixtures (a CC_* state path still points at ~/.cc — add it to the export block, and its default to BOX_PATHS):$leak"
