@@ -2,10 +2,12 @@
 # gh — a shim ahead of the real gh on PATH (~/bin comes first): a call that names a GitHub org this box may not touch —
 # in its arguments (a body, title, subject or notes is text, not a target), in GH_REPO, or as one of the cwd's
 # remotes — is refused with the org and the list named, and the
-# real gh never runs. Every other call IS the real gh, exec'd with the same arguments: nothing here reads its output or
-# changes its behaviour. The list, and what counts as naming an org, are cc-github-deny's (beside this file); with no
-# list, or no cc-github-deny to ask, every call passes. A caller that spells /usr/bin/gh walks past this shim — cc-guard
-# reads that line, and the git layers still stand behind it.
+# real gh never runs. Every other call IS the real gh, exec'd with the same arguments: nothing here reads its output,
+# and the one thing it may set is the gh config dir, with GH_PATH beside it (the last paragraph).
+# The list, and what counts as naming an org, are cc-github-deny's (beside this file); with no list,
+# or no cc-github-deny to ask, every call passes. A caller that spells /usr/bin/gh walks past this shim — cc-guard
+# reads that line, and the git layers still stand behind it. In a workspace holding one GitHub token per org, a call
+# naming one of those orgs runs with that org's gh config dir (cc-gh-org, below).
 me=$(readlink -f -- "$0"); d=${me%/*}
 real=""; IFS=:; for p in $PATH; do
   [ -x "$p/gh" ] && [ ! -d "$p/gh" ] || continue
@@ -13,28 +15,44 @@ real=""; IFS=:; for p in $PATH; do
   real=$p/gh; break
 done; unset IFS
 [ -n "$real" ] || { echo "gh: this is the deny-list shim and no real gh is behind it on PATH" >&2; exit 127; }
+# A FREE-TEXT VALUE IS NOT A TARGET. `cc done` passes the brief as `gh pr create --body`, and a brief that named a
+# listed org was refused as if it touched the org, so the PR never opened (2026-09-12). The value of a text flag —
+# the body, title, subject or notes of `pr|issue create|edit|comment|review|merge` and `release create|edit`, taken
+# the way gh itself takes it (`--body X`, `--body=X`, `-b X`, `-bX`) — is left out of the check; every other argument,
+# GH_REPO and the remotes are still read. Only there: `-b`, `-t` and `-n` mean other things under other commands.
+args=("$@")
+case "${1:-} ${2:-}" in
+  "pr create"|"pr edit"|"pr comment"|"pr review"|"pr merge"|"issue create"|"issue edit"|"issue comment"|"release create"|"release edit")
+    args=(); skip=""; rest=""
+    for a in "$@"; do
+      if [ -n "$rest" ]; then args+=("$a"); continue; fi
+      if [ -n "$skip" ]; then skip=""; continue; fi
+      case $a in
+        --) rest=1; args+=("$a");;                     # after `--` gh reads no flags, so nothing is text
+        --body|--title|--subject|--notes|-b|-t|-n) skip=1;;
+        --body=*|--title=*|--subject=*|--notes=*|-b?*|-t?*|-n?*) ;;
+        *) args+=("$a");;
+      esac
+    done;;
+esac
 if [ -x "$d/cc-github-deny" ]; then
-  # A FREE-TEXT VALUE IS NOT A TARGET. `cc done` passes the brief as `gh pr create --body`, and a brief that named a
-  # listed org was refused as if it touched the org, so the PR never opened (2026-09-12). The value of a text flag —
-  # the body, title, subject or notes of `pr|issue create|edit|comment|review|merge` and `release create|edit`, taken
-  # the way gh itself takes it (`--body X`, `--body=X`, `-b X`, `-bX`) — is left out of the check; every other argument,
-  # GH_REPO and the remotes are still read. Only there: `-b`, `-t` and `-n` mean other things under other commands.
-  args=("$@")
-  case "${1:-} ${2:-}" in
-    "pr create"|"pr edit"|"pr comment"|"pr review"|"pr merge"|"issue create"|"issue edit"|"issue comment"|"release create"|"release edit")
-      args=(); skip=""; rest=""
-      for a in "$@"; do
-        if [ -n "$rest" ]; then args+=("$a"); continue; fi
-        if [ -n "$skip" ]; then skip=""; continue; fi
-        case $a in
-          --) rest=1; args+=("$a");;                     # after `--` gh reads no flags, so nothing is text
-          --body|--title|--subject|--notes|-b|-t|-n) skip=1;;
-          --body=*|--title=*|--subject=*|--notes=*|-b?*|-t?*|-n?*) ;;
-          *) args+=("$a");;
-        esac
-      done;;
-  esac
   "$d/cc-github-deny" check "${args[@]}" "${GH_REPO:-}" "$(git config --get-regexp '^remote\..*\.url$' 2>/dev/null)"
   [ $? = 77 ] && exit 77   # any other answer — allowed, or the check itself failed — is the real gh, untouched
+fi
+# A WORKSPACE HOLDING ONE TOKEN PER ORG (`cc-sandbox github <workspace> --org <org>`): the call runs with the gh config
+# dir of the org it names (cc-gh-org dir), so gh answers with that org's token. Only the dir's path goes in the
+# environment, never a token; a call naming no granted org, or one given GH_CONFIG_DIR already, is left as it is.
+# THE GIT gh STARTS (clone, pr checkout, submodules) inherits that dir, and gh hands it one credential helper, itself:
+# left alone, `/usr/bin/gh auth git-credential` would answer ANY path that git asks about — a submodule in an ungranted
+# org — with the picked org's token. So the shim sets GH_PATH to itself, gh names that path as the helper, and
+# `gh auth git-credential` under an org dir (or none) comes back here and goes to cc-gh-org nested, which picks again by
+# the owner of the path git asks about. A GH_CONFIG_DIR the caller set elsewhere is theirs, and the real gh answers it.
+o=${CC_GH_ORGS:-$HOME/.config/gh-orgs}
+if [ -d "$o" ] && [ -x "$d/cc-gh-org" ]; then
+  if [ "${1:-} ${2:-}" = "auth git-credential" ]; then
+    case ${GH_CONFIG_DIR:-} in ''|"$o"/*) CC_GH_REAL="$real" exec "$d/cc-gh-org" nested "${3:-get}";; esac
+  elif [ -z "${GH_CONFIG_DIR:-}" ]; then
+    o=$("$d/cc-gh-org" dir "${args[@]}") && export GH_CONFIG_DIR="$o" GH_PATH="$me"
+  fi
 fi
 exec "$real" "$@"

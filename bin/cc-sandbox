@@ -120,7 +120,7 @@
 #     or WebSearch card. The marker is host-side beside owner-workspace — ~/.cc/members/<workspace>/web-grant — so a
 #     session can neither plant it nor remove it. It takes effect at the session's NEXT launch: the settings copy a running
 #     session holds is mounted by inode, and a new copy is a new file. `rm` the marker to take the asks back.
-#   cc-sandbox github <workspace> [<token file>]   ~/dev/<workspace>, a member workspace, is GRANTED A GITHUB TOKEN: a
+#   cc-sandbox github <workspace> [--org <org>] [<token file>|-]   ~/dev/<workspace>, a member workspace, is GRANTED A GITHUB TOKEN: a
 #     fine-grained PAT the owner made and scoped to the repositories that workspace may touch (docs/github-app.md; default
 #     ~/.cc/secrets/github-personal.token, mode 600). From its next launch the session inside holds it where gh and git read
 #     it — `gh`, `git push` and the API work from inside, with the token's own scope as the whole permission model, and
@@ -130,6 +130,12 @@
 #     the boundary is the member's, asks included, and no owner-workspace marker is involved. THE GRANT IS HOST-SIDE:
 #     ~/.cc/members/<workspace>/github-token, a link to the token file, in the directory no bind of the boundary reaches.
 #     `rm` it to take the token back; rotate or revoke the token in its file — every launch copies afresh.
+#     WITH --org <org> THE TOKEN IS THAT ORG'S: a fine-grained PAT covers one resource owner, so a workspace in two orgs
+#     holds two. The link is ~/.cc/members/<workspace>/github-tokens/<org> (default file ~/.cc/secrets/github-<org>.token);
+#     inside, each org's copy is a gh config dir at ~/.config/gh-orgs/<org>, ro, and cc-gh-org picks it by the org a
+#     git or gh call names. An org with no token of its own gets the any-org token above, or none. With --org and no
+#     file there yet, or `-` for the file, the owner pastes the token at a hidden prompt first; it is saved mode 600 and
+#     asked of GitHub, and one GitHub refuses or whose repositories belong to another owner is not saved (gh_read).
 # INSIDE rw: the track worktree · THREE PLACES IN the parent repo's .git (the worktree's .git is a pointer into it),
 #   which is otherwise A TMPFS holding mountpoints of the real one and nothing else: .git/objects apart from
 #   objects/pack, this track's own .git/worktrees/<n>, and — AT the fixed paths refs/heads/track and
@@ -686,25 +692,58 @@ gh_bind(){   # $1 handle — A WORKSPACE GRANTED A GITHUB TOKEN HOLDS IT INSIDE 
   # and the launch names the file. The copy is rewritten on every launch, so the token file on the host is the one place
   # it is set, rotated or revoked. The token is never printed: the file is read straight into the copy, and a launch that
   # cannot write the copy says so without it. Nothing else about the boundary changes: same binds, same asks, same cc-guard.
-  local d="$H/.cc/sandbox/$1/gh" grant="$H/.cc/members/$1/github-token" login tok
-  { [ -e "$grant" ] || [ -L "$grant" ]; } || { rm -rf "$d"; return 0; }   # no grant: a member workspace as before
+  # ONE TOKEN PER ORG as well, or instead (`cc-sandbox github <h> --org <org>`): a fine-grained PAT covers a single
+  # resource owner, so a workspace working in two orgs holds two. Each grant is a link ~/.cc/members/<h>/github-tokens/<org>
+  # → its token file; each gets a gh config dir of its own under the copy, orgs/<org>/, ro-bound at ~/.config/gh-orgs, and
+  # cc-gh-org picks one by the org a call names — git's credential lookup by the path git sends, gh by the shim in ~/bin.
+  # An org with no grant gets the any-org token above when there is one, and no credential when there is not.
+  local d="$H/.cc/sandbox/$1/gh" grant="$H/.cc/members/$1/github-token" og="$H/.cc/members/$1/github-tokens" login tok o l any="" orgs=""
+  for l in "$og"/*; do { [ -e "$l" ] || [ -L "$l" ]; } && any=1; done
+  { [ -e "$grant" ] || [ -L "$grant" ] || [ -n "$any" ]; } || { rm -rf "$d"; return 0; }   # no grant: a member workspace as before
   login=$("$(dirname "$SELF")/cc-config" get CC_GH_PERSONAL_OWNER 2>/dev/null)
-  if [ ! -f "$grant" ] || [ -z "$login" ]; then
-    rm -rf "$d"; tok=$(readlink "$grant" 2>/dev/null || echo "$grant")
-    echo "cc-sandbox: ~/dev/$1 is granted a GitHub token, but ${login:+$tok is missing}${login:-CC_GH_PERSONAL_OWNER is not set} — no GitHub token inside (docs/github-app.md says how to place it)" >&2
-    return 0; fi
+  [ -n "$login" ] || { rm -rf "$d"; echo "cc-sandbox: ~/dev/$1 is granted a GitHub token, but CC_GH_PERSONAL_OWNER is not set — no GitHub token inside (docs/github-app.md says how to place it)" >&2; return 0; }
   # gh 2.46 reads the `users:` + `user:` shape with a config.yml at schema version 1; the older shape starts a
   # "multi-account migration" that asks GitHub for the login and then WRITES hosts.yml, which fails on a read-only
   # mount (measured). The shape below is the one gh itself writes today.
-  { mkdir -p "$d" && chmod 700 "$d" && ( umask 077
-      { printf 'github.com:\n    users:\n        %s:\n            oauth_token: ' "$login"; tr -d '\n' < "$grant"
-        printf '\n    git_protocol: https\n    oauth_token: '; tr -d '\n' < "$grant"; printf '\n    user: %s\n' "$login"; } > "$d/hosts.yml.new" \
-      && mv -f "$d/hosts.yml.new" "$d/hosts.yml" \
-      && printf 'version: 1\ngit_protocol: https\n' > "$d/config.yml" \
-      && printf '[credential "https://github.com"]\n\thelper =\n\thelper = !%s/bin/cc-github-deny\n\thelper = !/usr/bin/gh auth git-credential\n[credential]\n\tuseHttpPath = true\n[include]\n\tpath = ~/.cc/github-deny.gitconfig\n' "$H" > "$d/gitconfig" ); } \
+  ghdir(){   # $1 dir $2 token file — a gh config dir holding that token; the token goes file to file, never printed
+    mkdir -p "$1" && chmod 700 "$1" && ( umask 077
+      { printf 'github.com:\n    users:\n        %s:\n            oauth_token: ' "$login"; tr -d '\n' < "$2"
+        printf '\n    git_protocol: https\n    oauth_token: '; tr -d '\n' < "$2"; printf '\n    user: %s\n' "$login"; } > "$1/hosts.yml.new" \
+      && mv -f "$1/hosts.yml.new" "$1/hosts.yml" && printf 'version: 1\ngit_protocol: https\n' > "$1/config.yml" ); }
+  # The copy is rewritten on each launch, not removed and remade: its dirs stay while any grant stands, what no grant
+  # names any more is pruned piece by piece, and the whole copy goes only when no grant is left. Each hosts.yml is a NEW
+  # FILE every launch, written aside and moved over the old one (mv -f), and a session already running sees that in two
+  # ways. The any-org hosts.yml and config.yml are bound as files, so it keeps the inode it launched with: the old token,
+  # rotated or revoked, until the session is reopened. The orgs dir is bound as a directory, so it sees each org's new
+  # hosts.yml at once: a rotated org token, or an org pruned, reaches a running session live.
+  mkdir -p "$d" && chmod 700 "$d" || { echo "cc-sandbox: could not write the token copy under $d — no GitHub token inside" >&2; return 0; }
+  [ -f "$grant" ] || rm -f "$d/hosts.yml" "$d/config.yml"
+  for l in "$d/orgs"/*; do [ -d "$l" ] && [ ! -f "$og/${l##*/}" ] && rm -rf "$l"; done
+  if { [ -e "$grant" ] || [ -L "$grant" ]; } && [ ! -f "$grant" ]; then
+    tok=$(readlink "$grant" 2>/dev/null || echo "$grant")
+    echo "cc-sandbox: ~/dev/$1 is granted a GitHub token, but $tok is missing — no any-org GitHub token inside (docs/github-app.md says how to place it)" >&2
+  elif [ -f "$grant" ]; then
+    ghdir "$d" "$grant" || { rm -f "$d/hosts.yml"; echo "cc-sandbox: could not write the token copy under $d — no GitHub token inside" >&2; return 0; }
+  fi
+  for l in "$og"/*; do
+    { [ -e "$l" ] || [ -L "$l" ]; } || continue; o=${l##*/}
+    case $o in ''|*[!a-z0-9-]*) echo "cc-sandbox: ~/.cc/members/$1/github-tokens/$o is not a lower-case org login — skipped" >&2; continue;; esac
+    if [ ! -f "$l" ]; then echo "cc-sandbox: ~/dev/$1 is granted a GitHub token for $o, but $(readlink "$l" 2>/dev/null || echo "$l") is missing — none for $o inside" >&2; continue; fi
+    { mkdir -p "$d/orgs" && chmod 700 "$d/orgs" && ghdir "$d/orgs/$o" "$l"; } || { rm -rf "$d/orgs/$o"; echo "cc-sandbox: could not write the $o token copy under $d — none for $o inside" >&2; continue; }
+    orgs=1
+  done
+  [ -f "$d/hosts.yml" ] || [ -n "$orgs" ] || { rm -rf "$d"; return 0; }
+  ( umask 077; { printf '[credential "https://github.com"]\n\thelper =\n\thelper = !%s/bin/cc-github-deny\n' "$H"
+      [ -n "$orgs" ] && printf '\thelper = !%s/bin/cc-gh-org\n' "$H"
+      # the any-org helper, with GH_CONFIG_DIR dropped: a git started by gh inherits the org dir the shim picked, and
+      # the real gh would answer an ungranted org's path, which cc-gh-org passed on, with that org's token
+      [ -f "$d/hosts.yml" ] && { [ -n "$orgs" ] && printf '\thelper = !env -u GH_CONFIG_DIR /usr/bin/gh auth git-credential\n' \
+                                                || printf '\thelper = !/usr/bin/gh auth git-credential\n'; }
+      printf '[credential]\n\tuseHttpPath = true\n[include]\n\tpath = ~/.cc/github-deny.gitconfig\n'; } > "$d/gitconfig" ) \
     || { rm -rf "$d"; echo "cc-sandbox: could not write the token copy under $d — no GitHub token inside" >&2; return 0; }
-  B+=(--ro-bind "$d/hosts.yml" "$H/.config/gh/hosts.yml" --ro-bind "$d/config.yml" "$H/.config/gh/config.yml"
-     --ro-bind "$d/gitconfig" "$H/.gitconfig"); }
+  [ -f "$d/hosts.yml" ] && B+=(--ro-bind "$d/hosts.yml" "$H/.config/gh/hosts.yml" --ro-bind "$d/config.yml" "$H/.config/gh/config.yml")
+  [ -n "$orgs" ] && B+=(--ro-bind "$d/orgs" "$H/.config/gh-orgs")
+  B+=(--ro-bind "$d/gitconfig" "$H/.gitconfig"); }
 skills_bind(){   # [$1 the host dir the member's ~/.claude/skills is, for a member; empty for a worker] — THE BOX'S SHARED SKILLS, RO.
   # cc-skills keeps each listed skill as a clone at ~/.claude/skills/<name> and fast-forwards it every tick. Each one
   # `cc-skills names` prints — listed, installed, a clone of its url — is bound READ-ONLY at the same path inside, one bind
@@ -1241,20 +1280,62 @@ web(){   # $1 workspace — a member workspace is granted WebFetch and WebSearch
                                      "# host-side on purpose — no session inside reaches this directory. rm this file to take the asks back." > "$m/web-grant" \
     || { echo "cc-sandbox: could not write $m/web-grant — nothing was changed" >&2; return 2; }
   echo "cc-sandbox: ~/dev/$r has the web now (~/.cc/members/$r/web-grant). WebFetch and WebSearch stop asking from each session's next launch, so a running session keeps asking until it is reopened. sudo and the network clients still ask. rm the marker to take it back."; }
-github(){   # $1 handle [$2 token file] — a member workspace is GRANTED a GitHub token, or the refusal says why. The grant is one
-  # host-side link, ~/.cc/members/<handle>/github-token → the token file (default ~/.cc/secrets/github-personal.token), written
-  # where no session inside can (build_member). From its next launch the workspace holds that token inside, where gh and git
-  # read it (gh_bind); nothing else about its boundary changes. `rm` the link to take it back.
-  local r="${1:-}" f="${2:-$H/.cc/secrets/github-personal.token}" m
+github(){   # $1 handle [--org <org>] [$2 token file] — a member workspace is GRANTED a GitHub token, or the refusal says why.
+  # The grant is one host-side link, written where no session inside can (build_member): ~/.cc/members/<handle>/github-token
+  # → the token file (default ~/.cc/secrets/github-personal.token), the any-org token; or, with --org, one per org,
+  # ~/.cc/members/<handle>/github-tokens/<org> → its file (default ~/.cc/secrets/github-<org>.token). From its next launch
+  # the workspace holds it inside, where gh and git read it (gh_bind); nothing else about its boundary changes. `rm` the
+  # link to take it back. With --org and no token file there yet, or `-` for the file, the token is read in first (gh_read).
+  local r="${1:-}" org="" f m l go=""
+  shift; [ "${1:-}" = --org ] && { go=1; org="${2:-}"; shift 2 2>/dev/null || shift; }
+  org=${org,,}; f="${1:-}"
   handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
   m="$H/.cc/members/$r"
   [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — make one first (cc-sandbox convert $r), then grant it" >&2; return 2; }
+  if [ -n "$go" ] || [ "${1:-}" = - ]; then   # an empty --org is refused below, never taken for the any-org grant
+    case $org in ''|-*|*-|*[!a-z0-9-]*) echo "cc-sandbox: '$org' is not a GitHub org login (letters, digits and -) — say which org the token is for: github $r --org <org>" >&2; return 2;; esac
+    "$(dirname "$SELF")/cc-github-deny" check "$org/x" >/dev/null 2>&1; [ $? = 77 ] && { echo "cc-sandbox: $org is on the box's GitHub deny list — nothing was granted" >&2; return 2; }
+    [ "$f" = - ] && f="" && l=1
+    f="${f:-$H/.cc/secrets/github-$org.token}"
+    { [ -n "${l:-}" ] || [ ! -e "$f" ]; } && { gh_read "$org" "$f" || return 2; }
+  fi
+  f="${f:-$H/.cc/secrets/github-personal.token}"
   [ -f "$f" ] || { echo "cc-sandbox: $f is not a file — place the token first (docs/github-app.md), then grant it" >&2; return 2; }
   f=$(readlink -f "$f")   # the link is absolute: a relative name would resolve against ~/.cc/members/<handle>/ and dangle
   [ "$(stat -c %a "$f" 2>/dev/null)" = 600 ] || { echo "cc-sandbox: $f is not mode 600 — a token file is readable by its owner alone; chmod 600 it, then grant it" >&2; return 2; }
-  mkdir -p "$m" && ln -sfn "$f" "$m/github-token" \
-    || { echo "cc-sandbox: could not write $m/github-token — nothing was changed" >&2; return 2; }
-  echo "cc-sandbox: ~/dev/$r holds $f from its next launch (~/.cc/members/$r/github-token) — git push, gh and the API answer with it, on the repositories that token is scoped to. Reopen any session that is running. rm the link to take it back."; }
+  l="$m/github-token"; [ -n "$org" ] && l="$m/github-tokens/$org"
+  mkdir -p "${l%/*}" && ln -sfn "$f" "$l" \
+    || { echo "cc-sandbox: could not write $l — nothing was changed" >&2; return 2; }
+  echo "cc-sandbox: ~/dev/$r holds $f ${org:+for the repositories of $org }from its next launch (${l#"$H/"}) — git push, gh and the API answer with it, on the repositories that token is scoped to. Reopen any session that is running. rm the link to take it back."; }
+gh_read(){   # $1 org $2 the file — THE OWNER'S READ-IN of a fine-grained PAT for one org: a hidden prompt (a line on stdin
+  # when it is not a terminal), saved mode 600, then asked of GitHub which owner's repositories it reaches. The token is
+  # never echoed or printed, and goes to curl as a config file on a descriptor (--config, not -H @file, which needs curl
+  # 7.55), never an argument or the environment. A token GitHub refuses, or one whose
+  # repositories all belong to another owner, is not saved; nor is one GitHub gave any other answer about (a 404, a 5xx),
+  # since that checked nothing. One that reaches none yet (a new org) is saved with a warning, and so is one when GitHub
+  # could not be reached at all (no connection, a timeout: curl's 000). CC_GH_API points the check elsewhere (the
+  # selfcheck: nowhere, and a local server answering 404 and 500).
+  local org=$1 f=$2 tok q code body own
+  [ -t 0 ] && printf 'Paste the fine-grained token for %s (it is not shown): ' "$org" >&2
+  IFS= read -rs tok; [ -t 0 ] && echo >&2
+  tok=${tok//[[:space:]]/}; [ -n "$tok" ] || { echo "cc-sandbox: no token was given — nothing was saved" >&2; return 1; }
+  body=$(mktemp) || return 1
+  q=${tok//\\/\\\\}; q=${q//\"/\\\"}   # the config's quoting: a backslash or a quote in the token is escaped
+  code=$(curl -sS -m 20 -o "$body" -w '%{http_code}' --config /dev/fd/3 \
+    "${CC_GH_API:-https://api.github.com}/user/repos?per_page=100" 2>/dev/null \
+    3< <(printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\n' "$q")) || code=000
+  own=$(jq -r '.[]?.owner.login | ascii_downcase' "$body" 2>/dev/null | sort -u); rm -f "$body"
+  case $code in
+    401|403) echo "cc-sandbox: GitHub refused this token ($code) — nothing was saved" >&2; return 1;;
+    200) if [ -n "$own" ] && ! grep -qxF "$org" <<<"$own"; then
+           echo "cc-sandbox: this token reaches repositories of $(paste -sd, <<<"$own"), not $org — nothing was saved; make it with $org as the resource owner" >&2; return 1; fi
+         [ -n "$own" ] || echo "cc-sandbox: this token reaches no repository yet, so I could not check it is $org's — saved anyway" >&2;;
+    000) echo "cc-sandbox: could not reach GitHub to check this token — saved unchecked" >&2;;
+    *) echo "cc-sandbox: GitHub answered $code, so this token was not checked — nothing was saved; try again" >&2; return 1;;
+  esac
+  { [ -d "${f%/*}" ] || mkdir -m 700 "${f%/*}"; } && ( umask 077; printf '%s\n' "$tok" > "$f.new" && chmod 600 "$f.new" && mv -f "$f.new" "$f" ) \
+    || { rm -f "$f.new"; echo "cc-sandbox: could not write $f — nothing was saved" >&2; return 1; }
+  echo "cc-sandbox: saved the token for $org in $f (mode 600)" >&2; }
 race_swap(){   # $1 a launch's pid · $2 the source it pins NEXT after the swapped name's last pin · $3 the swap → swapped | late | missed
   # THE SWAP CASES ARE ORDERED BY WHAT THE LAUNCH HAS DONE, NOT BY SLEEPS. A fixed 0.4 s head start guessed how fast the
   # box was, and at load ~50 the launch had not pinned yet when the racer moved the name, so it refused and every landing
@@ -2013,6 +2094,115 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   real1=$(md5sum "$H/.claude/settings.json" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
   t 'baseline: through all of that, the box'"'"'s real ~/.claude/settings.json is untouched — it is his, and this only reads it' "$real1" "$real0"
   rm -rf "${fh:?}"; }
+selfcheck_ghorgs(){   # A WORKSPACE HOLDING ONE GITHUB TOKEN PER ORG, in a HOME of its own: two org tokens granted with `github
+  # --org`, a third org granted nothing. git's credential lookup — the step `git push` asks — answers each org with its own
+  # token and the third with none; gh answers by the org of the cwd's remote or GH_REPO; an any-org token added later fills
+  # the third org only; a per-org grant removed leaves nothing of it. Every check prints a count, never a token.
+  local fh h dev out probe ta tb tc code port pid res rc
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxgo-XXXXXX") || return 1; chmod 700 "$fh"
+  h="ccsbxo$$"; dev="$fh/dev/$h"; ta="fixture-org-$$-a"; tb="fixture-org-$$-b"; tc="fixture-any-$$-c"
+  mkdir -p "$dev/.cc" "$fh/.claude" "$fh/.local/bin" "$fh/.cc/boards" "$fh/.cc/members/$h" "$fh/.cc/secrets" || return 1
+  chmod 700 "$fh/.cc/secrets"; : > "$dev/.cc/member-workspace"
+  { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  git -C "$dev" init -q -b main >/dev/null 2>&1
+  jq -n '{claudeAiOauth: {accessToken: "go-access", expiresAt: 99999999999999}}' > "$fh/.cc/members/$h/credentials.json"
+  printf 'CC_GH_PERSONAL_OWNER=someone\n' > "$fh/.cc/config"
+  ( umask 077; printf '%s\n' "$ta" > "$fh/.cc/secrets/a.token"; printf '%s\n' "$tb" > "$fh/.cc/secrets/b.token"; printf '%s\n' "$tc" > "$fh/.cc/secrets/c.token" )
+  env HOME="$fh" "$SELF" github "$h" --org FX-Alpha "$fh/.cc/secrets/a.token" >/dev/null 2>&1 \
+    && env HOME="$fh" "$SELF" github "$h" --org fx-beta "$fh/.cc/secrets/b.token" >/dev/null 2>&1 || { echo "FAIL gh-orgs: github --org did not grant"; bad=$((bad+1)); rm -rf "${fh:?}"; return 1; }
+  t 'gh-orgs: each org grant is one host-side link under github-tokens/, the org lower-cased, and no any-org link' \
+    "$(readlink "$fh/.cc/members/$h/github-tokens/fx-alpha")/$(readlink "$fh/.cc/members/$h/github-tokens/fx-beta")/$([ -e "$fh/.cc/members/$h/github-token" ] && echo any || echo none)" \
+    "$fh/.cc/secrets/a.token/$fh/.cc/secrets/b.token/none"
+  # inside: git's answer for a repo in each org (a count of each token), gh's answer from a repo whose origin is in that
+  # org and from GH_REPO, and the environment
+  probe='c(){ printf "protocol=https\nhost=github.com\npath=%s/x.git\n\n" "$1" | GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null; }
+    echo ga=$(c fx-alpha | grep -cxF "password=$1")/$(c fx-alpha | grep -cF "password=$2"); echo gb=$(c fx-beta | grep -cxF "password=$2")/$(c fx-beta | grep -cF "password=$1")
+    echo gc=$(c third-org | grep -c "^password=")/$(c third-org | grep -cxF "password=$3")
+    r=$(mktemp -d); git -C "$r" init -q; git -C "$r" remote add origin https://github.com/fx-alpha/x
+    echo ha=$(cd "$r" && gh auth token 2>/dev/null | grep -cxF -- "$1"); echo hb=$(cd "$r" && GH_REPO=fx-beta/y gh auth token 2>/dev/null | grep -cxF -- "$2")
+    git -C "$r" remote set-url origin https://github.com/third-org/z; echo hc=$(cd "$r" && gh auth token 2>/dev/null | grep -cxF -- "$3")
+    echo ro=$( (echo x >> ~/.config/gh-orgs/fx-alpha/hosts.yml) 2>/dev/null && echo rw || echo ro); echo env=$(env | grep -cF -e "$1" -e "$2")
+    n(){ printf "protocol=https\nhost=github.com\npath=third-org/z.git\n\n" | GH_CONFIG_DIR=$HOME/.config/gh-orgs/fx-alpha GIT_TERMINAL_PROMPT=0 "$@" 2>/dev/null; }
+    echo na=$(n gh auth git-credential get | grep -cxF "password=$1")/$(n gh auth git-credential get | grep -cxF "password=$3")
+    echo nb=$(n git credential fill | grep -cxF "password=$1")/$(n git credential fill | grep -cxF "password=$3")'
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$ta" "$tb" "$tc" 2>&1)
+  t 'gh-orgs: git answers a repo in each granted org with THAT org'"'"'s token and not the other'"'"'s' "$(g ga)/$(g gb)" '1/0/1/0'
+  t 'gh-orgs: …and a third org, granted nothing, gets no credential at all' "$(g gc)" '0/0'
+  t 'gh-orgs: gh answers with the org of GH_REPO, or of the cwd'"'"'s remote, and with nothing for the third org' "$(g ha)/$(g hb)/$(g hc)" '1/1/0'
+  t 'gh-orgs: …read-only, and no token in the environment' "$(g ro)/$(g env)" 'ro/0'
+  # THE GIT gh STARTS inherits the org dir gh was run with (review of #958): asked about a third org under fx-alpha's
+  # dir, gh's own helper (the shim, via GH_PATH) and git's chain both answer with no token, never fx-alpha's
+  # na/nb are the one case on the real gh, and the GH_PATH route rests on it: keep them as they are when gh is upgraded
+  t 'gh-orgs: under fx-alpha'"'"'s dir, a third org gets no token from gh auth git-credential or from git' "$(g na)/$(g nb)" '0/0/0/0'
+  t 'gh-orgs: the copies on the host are org dirs under ~/.cc/sandbox/<h>/gh/orgs, mode 600 in 700 dirs, orgs itself 700' \
+    "$(stat -c %a "$fh/.cc/sandbox/$h/gh" "$fh/.cc/sandbox/$h/gh/orgs" "$fh/.cc/sandbox/$h/gh/orgs/fx-alpha" "$fh/.cc/sandbox/$h/gh/orgs/fx-alpha/hosts.yml" 2>/dev/null | tr '\n' /)" '700/700/700/600/'
+  # an any-org token as well: the third org gets it, the granted orgs keep their own
+  env HOME="$fh" "$SELF" github "$h" "$fh/.cc/secrets/c.token" >/dev/null 2>&1
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$ta" "$tb" "$tc" 2>&1)
+  t 'gh-orgs: with an any-org token too, the third org gets that one and each granted org still its own' "$(g gc)/$(g ga)/$(g gb)" '1/1/1/0/1/0'
+  t 'gh-orgs: …and under fx-alpha'"'"'s dir the third org gets the any-org token, not fx-alpha'"'"'s, from gh and from git' "$(g na)/$(g nb)" '0/1/0/1'
+  # one org grant removed (rm the link): that org falls to the any-org token, and its copy on the host is gone
+  rm -f "$fh/.cc/members/$h/github-tokens/fx-alpha"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$ta" "$tb" "$tc" 2>&1)
+  t 'gh-orgs: an org grant removed — its token is gone inside and on the host, the other org keeps its own' \
+    "$(g ga)/$(g gb)/$([ -e "$fh/.cc/sandbox/$h/gh/orgs/fx-alpha" ] && echo copy || echo none)" '0/0/1/0/none'
+  # the read-in: a token on stdin for an org, checked against a GitHub that cannot be reached, is saved 600 and granted
+  printf '%s\n' "$ta" | env HOME="$fh" CC_GH_API=http://127.0.0.1:9 "$SELF" github "$h" --org new-org - >/dev/null 2>&1
+  t 'gh-orgs: the read-in saves the token to ~/.cc/secrets/github-<org>.token, mode 600, and grants it' \
+    "$(stat -c %a "$fh/.cc/secrets/github-new-org.token" 2>/dev/null)/$(grep -cxF "$ta" "$fh/.cc/secrets/github-new-org.token" 2>/dev/null)/$(readlink "$fh/.cc/members/$h/github-tokens/new-org")" \
+    "600/1/$fh/.cc/secrets/github-new-org.token"
+  # THE READ-IN AGAINST A LOCAL GITHUB, each case its own org: a server answers /user/repos once with a code and a body,
+  # and writes down the Authorization header it got. Kept: a 200 whose repositories are the org's own (any case). Not
+  # saved and not granted: GitHub refusing (401, 403), a 200 whose repositories all belong to another owner, and an
+  # answer that checked nothing (404, 500).
+  readin(){   # $1 code $2 body $3 org → "<code>:<rc>/<saved|none>/<granted|none> "
+    : > "$fh/port"
+    python3 -c 'import http.server,sys
+class H(http.server.BaseHTTPRequestHandler):
+  def do_GET(s):
+    open(sys.argv[2],"w").write(s.headers.get("Authorization","")+"\n"); s.send_response(int(sys.argv[1])); s.end_headers(); s.wfile.write(sys.argv[3].encode())
+  def log_message(s,*a): pass
+v=http.server.HTTPServer(("127.0.0.1",0),H); print(v.server_address[1],flush=True); v.handle_request()' "$1" "$fh/auth-$3" "$2" > "$fh/port" 2>/dev/null & pid=$!
+    for port in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$fh/port" ] && break; sleep 0.25; done
+    port=$(head -n1 "$fh/port")
+    printf '%s\n' "$ta" | env HOME="$fh" CC_GH_API="http://127.0.0.1:$port" "$SELF" github "$h" --org "$3" - >/dev/null 2>&1; rc=$?
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    printf '%s:%s/%s/%s ' "$1" "$rc" "$([ -e "$fh/.cc/secrets/github-$3.token" ] && echo saved || echo none)" "$([ -e "$fh/.cc/members/$h/github-tokens/$3" ] && echo granted || echo none)"; }
+  res="$(readin 404 '[]' org-404)$(readin 500 '[]' org-500)"
+  t 'gh-orgs: the read-in, GitHub answering 404 or 500 — nothing saved, nothing granted' "$res" '404:2/none/none 500:2/none/none '
+  res="$(readin 401 '{}' org-401)$(readin 403 '{}' org-403)"
+  t 'gh-orgs: the read-in, GitHub refusing the token (401, 403) — nothing saved, nothing granted' "$res" '401:2/none/none 403:2/none/none '
+  res="$(readin 200 '[{"owner":{"login":"Other-Org"}},{"owner":{"login":"someone"}}]' org-wrong)$(readin 200 '[{"owner":{"login":"Org-Right"}}]' org-right)"
+  t 'gh-orgs: the read-in, a 200 whose repositories are another owner'"'"'s is refused; one of the org'"'"'s own (any case) is saved and granted' \
+    "$res" '200:2/none/none 200:0/saved/granted '
+  t 'gh-orgs: …and the token reached GitHub as the Authorization header (curl --config from a descriptor)' \
+    "$(cat "$fh/auth-org-404" "$fh/auth-org-500" "$fh/auth-org-401" "$fh/auth-org-wrong" 2>/dev/null | grep -cxF "Bearer $ta")" 4
+  # A --org GITHUB WOULD NOT CALL A LOGIN, OR ONE ON THE BOX'S DENY LIST, grants nothing and saves nothing — beside a
+  # well-formed one in the same HOME that does (the kept case), each with a token file already in place
+  printf 'fx-denied\n' > "$fh/.cc/github-deny"
+  res=""
+  for o in fx-denied FX-DENIED -lead trail- 'under_score' 'sp ace' fx-fine; do
+    env -u CC_GITHUB_DENY HOME="$fh" "$SELF" github "$h" --org "$o" "$fh/.cc/secrets/b.token" >/dev/null 2>&1; rc=$?
+    res+="$rc$(shopt -s nullglob dotglob; for f in "$fh/.cc/members/$h/github-tokens"/*; do case "${f##*/}" in fx-beta|org-right|new-org) ;; *) echo +; break ;; esac; done)"
+    rm -f "$fh/.cc/members/$h/github-tokens/fx-fine"
+  done
+  env -u CC_GITHUB_DENY HOME="$fh" "$SELF" github "$h" --org '' "$fh/.cc/secrets/b.token" >/dev/null 2>&1; res+=":$?"
+  rm -f "$fh/.cc/github-deny"
+  t 'gh-orgs: --org deny-listed (either case), malformed, or empty grants nothing; a well-formed one grants' "$res" '2222220+:2'
+  # A LINK NAME THAT IS NOT A LOWER-CASE LOGIN, AND A LINK TO NO FILE, are skipped at launch with a line saying so: no
+  # copy on the host, no credential inside; the well-formed org beside them still answers with its own token
+  ln -sfn "$fh/.cc/secrets/a.token" "$fh/.cc/members/$h/github-tokens/Fx-Upper"
+  ln -sfn "$fh/.cc/secrets/gone.token" "$fh/.cc/members/$h/github-tokens/fx-gone"
+  probe='c(){ printf "protocol=https\nhost=github.com\npath=%s/x.git\n\n" "$1" | GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null; }
+    echo up=$(c Fx-Upper | grep -cxF "password=$1")/$(c fx-upper | grep -cxF "password=$1"); echo go=$(c fx-gone | grep -cxF "password=$1")
+    echo gb=$(c fx-beta | grep -cxF "password=$2")'
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$ta" "$tb" 2>&1)
+  t 'gh-orgs: a link named Fx-Upper and one to a missing file each get no credential; fx-beta keeps its own' \
+    "$(g up)/$(g go)/$(g gb)" '0/0/0/1'
+  t 'gh-orgs: …each said on stderr, and neither has a copy on the host' \
+    "$(grep -c 'github-tokens/Fx-Upper is not a lower-case org login' <<<"$out")/$(grep -c 'for fx-gone, but .*gone.token is missing' <<<"$out")/$(shopt -s nullglob nocasematch; n=0; for f in "$fh/.cc/sandbox/$h/gh/orgs"/*; do case "${f##*/}" in fx-upper|fx-gone) n=$((n+1)) ;; esac; done; echo "$n")" \
+    '1/1/0'
+  rm -rf "${fh:?}"; }
 selfcheck_ghtoken(){   # A WORKSPACE GRANTED A GITHUB TOKEN, in a HOME of its own: a token file and a config of the fixture's, one
   # member workspace, and the SAME workspace before and after `github`. Each side is asserted — an ungranted launch holds no
   # token anywhere the session can reach, a granted launch holds it where gh and git read it and nowhere else — and the token
@@ -2740,10 +2930,11 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # --help prints the header and exits 0 — it used to reach the positional parse and die with `line 2079: 2: track`
   out=$("$SELF" --help 2>&1); rc=$?; t '--help exits 0 and prints the usage header' "$rc/$(head -1 <<<"$out" | cut -c1-10)/$(grep -c 'track$' <<<"$out")" '0/cc-sandbox/0'
   out=$("$SELF" -h 2>&1 | grep -c 'cc-sandbox member <handle>'); t '-h is the same header' "$([ "${out:-0}" -ge 1 ] && echo yes)" yes
-  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_vet
+  selfcheck_fence; selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_ghorgs; selfcheck_docs; selfcheck_skills; selfcheck_toolchains; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
   "$BIN/cc-member-v2" selfcheck; t 'v2 cases' "$?" 0
+  "$BIN/cc-gh-org" selfcheck; t 'cc-gh-org cases (the per-org token pick and the gh shim)' "$?" 0
   for c in "$wt" "$H/.cc/worktrees/$r/u" "$H/.cc/worktrees/$r/v"; do git -C "$dev" worktree remove --force "$c" >/dev/null 2>&1; done
   rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.cc/sandbox/$r" "$H/.claude/projects/$(slug "$wt")" \
          "$H/.claude/projects/$(slug "$H/.cc/worktrees/$r/v")" "$H/.claude/projects/$(slug "$dev")" \
@@ -2791,7 +2982,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
   own) shift; own "${1:-}"; exit $?;;
   signout) shift; signout "${1:-}" "${2:-}"; exit $?;;
   web) shift; web "${1:-}"; exit $?;;
-  github) shift; github "${1:-}" "${2:-}"; exit $?;;
+  github) shift; github "$@"; exit $?;;
   member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ] && [ "${1:-}" != --tree ]; then tr="${1:-}"; shift; fi   # <handle> [<track>|""] [--tree <dir>] [--] cmd
           if [ "${1:-}" = --tree ]; then TREE="${2:-}"; shift 2; [ -n "$TREE" ] || { echo "cc-sandbox: --tree takes a directory" >&2; exit 2; }; fi
           [ "${1:-}" = -- ] && shift
@@ -2803,7 +2994,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [<token file>]   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox probe   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox web <workspace>   |   cc-sandbox github <workspace> [--org <org>] [<token file>|-]   |   cc-sandbox selfcheck" >&2; exit 2; }
 # ON BY DEFAULT (owner's design, phase 0; planning decided 2026-09-27: "yes, default-on"). "The fence goes on by default
 # for every worker, on every harness" — so the test is for the two ways OFF, never for a way on.
 fence_off && exec "$@"   # off means the command runs exactly as given, nothing added

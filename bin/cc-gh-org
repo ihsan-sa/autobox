@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# cc-gh-org — which of a workspace's GitHub tokens a call uses, when it holds one per org (`cc-sandbox github <workspace>
+# --org <org>`). A fine-grained PAT covers a single resource owner, so a workspace that works in two orgs holds two. Each
+# sits in a gh config dir of its own, ~/.config/gh-orgs/<org>/ (lower case; CC_GH_ORGS overrides the path), which
+# cc-sandbox writes at launch and binds read-only. This picks the dir by the org a call names. Nothing here reads a token:
+# gh reads it from the dir this names, and an org with no dir gets nothing from here.
+#   cc-gh-org get|store|erase   git's credential-helper protocol on stdin (credential.useHttpPath is on, so git sends
+#                               path=<owner>/<repo>). get, for github.com and an owner that has a dir: `gh auth
+#                               git-credential get` with that dir answers. Silent otherwise, so the next helper answers
+#                               (the workspace's any-org token, when it has one) or none does. store and erase do
+#                               nothing: the dirs are read-only, and the host is where a token changes.
+#   cc-gh-org nested <op>       the same question asked by a git that gh itself started (clone, pr checkout, submodules).
+#                               gh hands that git one helper, `$GH_PATH auth git-credential`, and the gh shim sets
+#                               GH_PATH to itself, so the request comes back here instead of to the real gh with the
+#                               org dir the outer call picked. The dir is picked again by the owner of the path git
+#                               asks about; an owner with no dir is answered from the default gh config (the any-org
+#                               token, or nothing), never from the dir the outer call was handed.
+#   cc-gh-org dir <gh args...>  the gh shim's question, rc 1 and nothing printed when the answer is no org dir. THE CALL'S
+#                               OWN TARGET DECIDES, and only when it names none are GH_REPO and the remotes read:
+#                                1. a repo flag (-R X, -RX, -R=X, --repo X, --repo=X), a github.com URL, an api path
+#                                   (repos|orgs|users/OWNER), the OWNER/REPO positional of `gh repo view|clone|fork|
+#                                   edit|delete|archive|unarchive|sync|set-default|create`: the owner they name, if they
+#                                   all name one. Two owners, or a repo flag or positional that names no owner, is no
+#                                   dir. Any other bare OWNER/REPO is not a target: an upload file, a label, a path.
+#                                2. else GH_REPO, when it is set; 3. else the cwd's remotes, origin first.
+#                               A target found at a step ends the pick there: its owner's dir, or none. An explicit
+#                               target with no grant never falls through to GH_REPO or a remote, which would hand it an
+#                               unrelated org's token (`gh api repos/third-org/x` in a clone of fx-alpha/y).
+#   cc-gh-org selfcheck         all three, and the gh shim beside this file, on dirs and fake ghs of its own; no network
+set -uo pipefail
+D=${CC_GH_ORGS:-$HOME/.config/gh-orgs}
+GH=${CC_GH_REAL:-/usr/bin/gh}
+ME=$(readlink -f -- "$0")
+
+has(){   # $1 owner → its dir on stdout, rc 0; rc 1 when the name is not an org login or has no dir
+  local o=${1,,}
+  case $o in ''|*[!a-z0-9-]*) return 1;; esac
+  [ -f "$D/$o/hosts.yml" ] && printf '%s\n' "$D/$o"; }
+strong_of(){   # $1 an argument → the owner a github.com URL or an api path in it names, rc 1 when it is neither
+  if [[ $1 =~ github\.com[/:]([A-Za-z0-9-]+)(/|$) ]]; then printf '%s\n' "${BASH_REMATCH[1]}"
+  elif [[ $1 =~ ^/?(repos|orgs|users)/([A-Za-z0-9-]+)(/|$) ]]; then printf '%s\n' "${BASH_REMATCH[2]}"
+  else return 1; fi; }
+owner_of(){   # $1 an argument, a remote URL, GH_REPO or a repo flag's value → the owner it names, rc 1 when it names none
+  local a=${1#--*=}
+  strong_of "$a" && return 0
+  [[ $a =~ ^([A-Za-z0-9-]+)/[A-Za-z0-9_.-]+$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"; }
+repo_pos(){   # gh args → the repository positional of `gh repo <sub>`, rc 1 when the call has none. Only there does gh
+  # read a bare OWNER/REPO as the repository; elsewhere it is a file, a label, a path or a clone's directory. The value of
+  # a flag that takes one is skipped, so `repo view -b feature/x o/r` names o/r; the first positional is the one.
+  local v a
+  [ "${1:-}" = repo ] || return 1
+  case ${2:-} in
+    view) v='-b|--branch|--json|-q|--jq|-t|--template';;
+    clone) v='-u|--upstream-remote-name';;
+    fork) v='--remote-name|--fork-name|--org';;
+    edit) v='-d|--description|-h|--homepage|--default-branch|--add-topic|--remove-topic|--visibility';;
+    sync) v='-b|--branch|-s|--source';;
+    create) v='-d|--description|-h|--homepage|-g|--gitignore|-l|--license|-p|--template|-s|--source|-r|--remote|-t|--team';;
+    delete|archive|unarchive|set-default) v='';;
+    *) return 1;;
+  esac
+  shift 2
+  while [ $# -gt 0 ]; do a=$1; shift
+    case $a in
+      --) [ $# -gt 0 ] && printf '%s\n' "$1"; return;;
+      -*=*) ;;
+      -?*) [[ "|$v|" == *"|$a|"* ]] && shift;;
+      *) printf '%s\n' "$a"; return 0;;
+    esac
+  done
+  return 1; }
+one(){   # owners, one per line → the single owner's dir; rc 1 when they name more than one owner, or it has no dir
+  local s; s=$(tr 'A-Z' 'a-z' | sort -u)
+  [ "$(wc -l <<<"$s")" = 1 ] && has "$s"; }
+
+selfcheck(){
+  local T n=0 f=0 out SHIM="${ME%/*}/gh"
+  T=$(mktemp -d "${TMPDIR:-/tmp}/ccghorg-XXXXXX") || return 1
+  ok(){ n=$((n+1)); if [ "$2" = "$3" ]; then echo "  ✓ $1"; else f=$((f+1)); echo "  ✗ $1 — got [$2], want [$3]"; fi; }
+  mkdir -p "$T/orgs/fx-alpha" "$T/orgs/fx-beta" "$T/orgs/no-hosts" "$T/repo" "$T/alpha" "$T/path"
+  : > "$T/orgs/fx-alpha/hosts.yml"; : > "$T/orgs/fx-beta/hosts.yml"
+  # the fake ghs say which config dir they were handed, never a token: $T/gh for this tool, $T/path/gh the real gh the
+  # shim finds on PATH, which says the GH_PATH it was handed as well
+  printf '#!/bin/sh\ncat >/dev/null; echo "dir=$GH_CONFIG_DIR args=$*"\n' > "$T/gh"; chmod +x "$T/gh"
+  printf '#!/bin/sh\ncat >/dev/null; echo "dir=$GH_CONFIG_DIR ghpath=${GH_PATH:-} args=$*"\n' > "$T/path/gh"; chmod +x "$T/path/gh"
+  run(){ env CC_GH_ORGS="$T/orgs" CC_GH_REAL="$T/gh" GH_REPO="${R:-}" GH_CONFIG_DIR="${G:-}" "$ME" "$@"; }
+  shim(){ env -u GH_PATH -u CC_GH_REAL CC_GH_ORGS="$T/orgs" CC_GITHUB_DENY="$T/no-list" PATH="$T/path:$PATH" GH_REPO="${R:-}" GH_CONFIG_DIR="${G:-}" "$SHIM" "$@"; }
+  cred(){ printf 'protocol=https\nhost=%s\npath=%s\n\n' "$1" "$2" | run "${3:-get}"; }
+  rc(){ "$@" </dev/null; echo "rc=$?"; }
+  echo "cc-gh-org selfcheck"
+  ok 'get: an org with a dir — gh git-credential answers with that dir' "$(cred github.com FX-Alpha/x.git)" "dir=$T/orgs/fx-alpha args=auth git-credential get"
+  ok 'get: the other org gets its own dir' "$(cred github.com fx-beta/y.git)" "dir=$T/orgs/fx-beta args=auth git-credential get"
+  ok 'get: a third org gets nothing from here' "$(cred github.com third-org/z.git)" ""
+  ok 'get: a dir with no hosts.yml is no token' "$(cred github.com no-hosts/z.git)" ""
+  ok 'get: another host, the same path, gets nothing' "$(cred gitlab.com fx-alpha/x.git)" ""
+  ok 'store and erase do nothing' "$(cred github.com fx-alpha/x.git store)$(cred github.com fx-alpha/x.git erase)" ""
+  ok 'dir: OWNER/REPO in the arguments' "$(run dir repo clone fx-beta/y)" "$T/orgs/fx-beta"
+  ok 'dir: --repo=OWNER/REPO and an api path' "$(run dir pr list --repo=fx-alpha/x)/$(run dir api repos/fx-beta/y/pulls)" "$T/orgs/fx-alpha/$T/orgs/fx-beta"
+  ok 'dir: a github.com URL, any case' "$(run dir repo view https://github.com/FX-Alpha/x)" "$T/orgs/fx-alpha"
+  ok 'dir: GH_REPO when the arguments name none' "$(cd "$T/repo" && R=fx-alpha/x run dir pr list)" "$T/orgs/fx-alpha"
+  git -C "$T/repo" init -q 2>/dev/null; git -C "$T/repo" remote add upstream https://github.com/fx-alpha/x 2>/dev/null
+  git -C "$T/repo" remote add origin git@github.com:fx-beta/y.git 2>/dev/null
+  ok 'dir: the cwd'"'"'s remotes, origin first' "$(cd "$T/repo" && run dir pr list)" "$T/orgs/fx-beta"
+  git -C "$T/repo" remote set-url origin https://github.com/third-org/z 2>/dev/null
+  ok 'dir: …and another remote when origin'"'"'s org has no dir' "$(cd "$T/repo" && run dir pr list)" "$T/orgs/fx-alpha"
+  out=$(cd "$T" && rc run dir api repos/third-org/z)
+  ok 'dir: nothing granted named — nothing printed, rc 1' "$out" "rc=1"
+  # THE CALL'S OWN TARGET FIRST (review of #958). In a clone of fx-alpha/x, a call naming an org with no grant was handed
+  # fx-alpha's dir from the remote — `gh api repos/third-org/private` went out with fx-alpha's token.
+  git -C "$T/alpha" init -q 2>/dev/null; git -C "$T/alpha" remote add origin https://github.com/fx-alpha/x 2>/dev/null
+  ok 'dir: an api path to an ungranted org, in a clone of a granted one — no dir, the remote is not read' \
+    "$(cd "$T/alpha" && rc run dir api repos/third-org/private)" "rc=1"
+  ok 'dir: …nor GH_REPO, when the call names its own target' "$(cd "$T/alpha" && R=fx-alpha/x rc run dir api repos/third-org/private)" "rc=1"
+  ok 'dir: …the same for -R, a URL and a bare OWNER/REPO' \
+    "$(cd "$T/alpha" && rc run dir pr list -R third-org/z)/$(cd "$T/alpha" && rc run dir repo view https://github.com/third-org/z)/$(cd "$T/alpha" && rc run dir repo clone third-org/z)" "rc=1/rc=1/rc=1"
+  ok 'dir: GH_REPO naming an ungranted org is the target too — the remote is not read' "$(cd "$T/alpha" && R=third-org/z rc run dir pr list)" "rc=1"
+  ok 'dir: two owners named — no dir, whichever has one' "$(rc run dir api repos/third-org/a repos/fx-beta/b)" "rc=1"
+  ok 'dir: a repo flag names the target over a label area/ui' \
+    "$(cd "$T/alpha" && run dir issue list --label area/ui -R fx-beta/y)" "$T/orgs/fx-beta"
+  # A BARE OWNER/REPO IS A TARGET ONLY AS gh repo'S POSITIONAL (review of #958): any bare one ended the pick, so an upload
+  # file dist/app.tar.gz or a label area/x named an owner with no dir, and the call in a granted clone ran with no token
+  ok 'dir: release upload v1 dist/app.tar.gz and issue create --label area/x in a clone of fx-alpha — fx-alpha'"'"'s dir' \
+    "$(cd "$T/alpha" && run dir release upload v1 dist/app.tar.gz)/$(cd "$T/alpha" && run dir issue create --label area/x)" "$T/orgs/fx-alpha/$T/orgs/fx-alpha"
+  ok 'dir: …but -R third-org/z beside the label is still no dir, not the remote'"'"'s' \
+    "$(cd "$T/alpha" && rc run dir issue create --label area/x -R third-org/z)" "rc=1"
+  ok 'dir: gh repo view fx-beta/y in a clone of fx-alpha — the positional is the target' "$(cd "$T/alpha" && run dir repo view fx-beta/y)" "$T/orgs/fx-beta"
+  ok 'dir: the positional past a flag'"'"'s value (-b feature/x), and only the first (clone into a dir called fx-alpha/d)' \
+    "$(cd "$T/alpha" && run dir repo view -b feature/x fx-beta/y)/$(cd "$T/alpha" && run dir repo clone fx-beta/y fx-alpha/d)/$(cd "$T/alpha" && run dir repo clone -- fx-beta/y)" \
+    "$T/orgs/fx-beta/$T/orgs/fx-beta/$T/orgs/fx-beta"
+  ok 'dir: a positional naming no owner (another host) is no dir; a bare name (the user'"'"'s own) names none, so the remote' \
+    "$(cd "$T/alpha" && rc run dir repo view ghe.example.com/o/r)/$(cd "$T/alpha" && run dir repo view x)" "rc=1/$T/orgs/fx-alpha"
+  ok 'dir: the shim — gh release upload v1 dist/app.tar.gz in a clone of fx-alpha runs with fx-alpha'"'"'s dir' \
+    "$(cd "$T/alpha" && shim release upload v1 dist/app.tar.gz </dev/null)" "dir=$T/orgs/fx-alpha ghpath=$(readlink -f "$SHIM") args=release upload v1 dist/app.tar.gz"
+  ok 'dir: a repo flag naming no owner (another host) — no dir, the remote is not read' "$(cd "$T/alpha" && rc run dir pr list -R ghe.example.com/o/r)" "rc=1"
+  ok 'dir: the shim — gh api repos/third-org/private in a clone of fx-alpha runs with no org dir' \
+    "$(cd "$T/alpha" && shim api repos/third-org/private </dev/null)" "dir= ghpath= args=api repos/third-org/private"
+  # EVERY REPO-FLAG SPELLING gh takes (review of #958): `-Rfx-beta/y` was not read, so the remote's org was picked
+  ok 'dir: -RX, -R=X, -R X, --repo X and --repo=X all name the target, over the remote' \
+    "$(cd "$T/alpha" && for s in -Rfx-beta/y -R=fx-beta/y '-R fx-beta/y' '--repo fx-beta/y' --repo=fx-beta/y; do run dir pr list $s; done | sort -u)" "$T/orgs/fx-beta"
+  ok 'dir: -RX naming an ungranted org — no dir, not the remote'"'"'s' "$(cd "$T/alpha" && rc run dir pr list -Rthird-org/z)" "rc=1"
+  ok 'dir: the shim — gh pr list -Rfx-beta/y in a clone of fx-alpha runs with fx-beta'"'"'s dir and GH_PATH at the shim' \
+    "$(cd "$T/alpha" && shim pr list -Rfx-beta/y </dev/null)" "dir=$T/orgs/fx-beta ghpath=$(readlink -f "$SHIM") args=pr list -Rfx-beta/y"
+  # THE GIT THAT gh STARTS (review of #958): it inherited the org dir the outer call picked, and gh's own credential
+  # helper answered a third org's path with that org's token. Through GH_PATH it comes back here and is picked again.
+  ncred(){ printf 'protocol=https\nhost=github.com\npath=%s\n\n' "$1" | G="$T/orgs/fx-alpha" "${@:2}"; }
+  ok 'nested: a third org asked under fx-alpha'"'"'s dir gets the default gh config, not fx-alpha'"'"'s' \
+    "$(ncred third-org/z.git run nested get)" "dir= args=auth git-credential get"
+  ok 'nested: a granted org asked under another'"'"'s dir gets its own' "$(ncred fx-beta/y.git run nested get)" "dir=$T/orgs/fx-beta args=auth git-credential get"
+  ok 'nested: no path sent — the default gh config, no org dir' \
+    "$(printf 'protocol=https\nhost=github.com\n\n' | G="$T/orgs/fx-alpha" run nested get)" "dir= args=auth git-credential get"
+  ok 'nested: store and erase do nothing' "$(ncred fx-alpha/x.git run nested store)" ""
+  ok 'nested: the shim routes gh auth git-credential under an org dir here — the third org gets no org dir' \
+    "$(ncred third-org/z.git shim auth git-credential get)" "dir= ghpath= args=auth git-credential get"
+  ok 'nested: …and a GH_CONFIG_DIR the caller set elsewhere is left to the real gh, untouched' \
+    "$(printf 'protocol=https\nhost=github.com\npath=third-org/z.git\n\n' | G="$T/own" shim auth git-credential get)" "dir=$T/own ghpath= args=auth git-credential get"
+  rm -rf "${T:?}"
+  echo "cc-gh-org selfcheck: $((n-f)) passed, $f failed"; [ "$f" = 0 ]; }
+
+case ${1:-} in
+  get|nested) mode=$1
+    if [ "$mode" = nested ] && [ "${2:-get}" != get ]; then cat >/dev/null; exit 0; fi
+    in=$(cat)
+    host=$(sed -n 's/^host=//p' <<<"$in" | head -n1); path=$(sed -n 's/^path=//p' <<<"$in" | head -n1)
+    if [ "${host,,}" = github.com ] && dir=$(has "${path%%/*}"); then
+      GH_CONFIG_DIR="$dir" exec "$GH" auth git-credential get <<<"$in"$'\n'; fi   # no pipe: exec in a pipe is a subshell, and this would go on below
+    [ "$mode" = get ] && exit 0   # git's next helper answers
+    # nested: gh gave its git no other helper, so the default config answers — the any-org token, or nothing
+    exec env -u GH_CONFIG_DIR "$GH" auth git-credential get <<<"$in"$'\n';;
+  store|erase) cat >/dev/null; exit 0;;
+  dir) shift
+    strong=() rest=""
+    if p=$(repo_pos "$@") && [[ $p == */* ]]; then   # a bare name (no owner) is the user's own: no target named
+      o=$(owner_of "$p") || o='?'; strong+=("$o"); fi   # HOST/OWNER/REPO names no owner here: no dir
+    while [ $# -gt 0 ]; do a=$1; shift
+      if [ -z "$rest" ]; then
+        case $a in
+          --) rest=1; continue;;
+          -R|--repo) [ $# -gt 0 ] || continue; a=$1; shift;;
+          --repo=*) a=${a#--repo=};;
+          -R?*) a=${a#-R}; a=${a#=};;
+          *) o=$(strong_of "$a") && strong+=("$o"); continue;;
+        esac
+        o=$(owner_of "$a") || o='?'; strong+=("$o"); continue   # a repo flag whose value names no owner: no dir
+      fi
+      o=$(strong_of "$a") && strong+=("$o")
+    done
+    [ ${#strong[@]} -gt 0 ] && { printf '%s\n' "${strong[@]}" | one; exit; }
+    [ -n "${GH_REPO:-}" ] && { o=$(owner_of "$GH_REPO") && has "$o"; exit; }
+    while IFS= read -r u; do o=$(owner_of "$u") && has "$o" && exit 0
+    done < <(git config --get remote.origin.url 2>/dev/null; git config --get-regexp '^remote\..*\.url$' 2>/dev/null | cut -d' ' -f2-)
+    exit 1;;
+  selfcheck) selfcheck;;
+  *) sed -n '2,/^set -uo/p' "$ME" | sed '$d; s/^# \{0,1\}//'; exit 2;;
+esac
