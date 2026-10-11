@@ -16,7 +16,7 @@ set -e; SELF=$(readlink -f "$0"); cd "$(dirname "$0")/.."   # $0 is resolved BEF
 # block that reports nothing and a gate that still ends "OK". These four are the ones whose absence would be silent.
 if [ "$SUITE_PART" = portable ]; then part_caps shellcheck jq python3 git || { echo "check.sh: not runnable here"; exit 1; }; fi
 sh=(); py=()
-for f in bin/* install.sh ccbox/*.sh; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
+for f in bin/* install.sh ccbox/*.sh tests/selfcheck/*.sh; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
 # HOW MANY OF THIS GATE'S OWN JOBS RUN AT ONCE. Concurrency, never coverage. CC_CHECK_JOBS (or CHECK_JOBS) sets it
 # outright. Otherwise it is the smallest of 4, the CPUs, and one job per 1.5 GiB of MemAvailable — halved when swap
 # is nearly full (SwapFree under an eighth of SwapTotal) — and never below 1. A box whose swap was full of dev

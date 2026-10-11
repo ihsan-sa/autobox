@@ -3628,6 +3628,11 @@ case "$edge" in *" cc-member-import "*) ok "a change to cc-checkpoint alone reac
   && [ "$(reach core/tests/selfcheck/cc-nobody.py)" = "|" ] \
   && ok "tests/selfcheck/<tool>.py reaches that tool and its callers, and one named for no tool reaches everything" \
   || bad "tests/selfcheck reach: [$(reach core/tests/selfcheck/cc-leaf.py)] [$(reach core/tests/selfcheck/cc-nobody.py)]"
+# …and a shell tool's cases, tests/selfcheck/<tool>.sh, which its tool sources: the same rule again.
+[ "$(reach core/tests/selfcheck/cc-leaf.sh)" = " cc-caller cc-leaf |core/tests/selfcheck/cc-leaf.sh" ] \
+  && [ "$(reach core/tests/selfcheck/cc-nobody.sh)" = "|" ] \
+  && ok "tests/selfcheck/<tool>.sh reaches that tool and its callers, and one named for no tool reaches everything" \
+  || bad "tests/selfcheck .sh reach: [$(reach core/tests/selfcheck/cc-leaf.sh)] [$(reach core/tests/selfcheck/cc-nobody.sh)]"
 SR6="$T/stanzareach"; mkdir -p "$SR6"; git -C "$SR6" init -q
 printf '%s\n' '# prelude' 'if stanza "one"; then' '  "$B/cc-leaf" x' 'fi' 'if stanza "base" always; then' '  echo base' 'fi' \
   'if stanza "bare"; then' '  echo nothing' 'fi' > "$SR6/st.sh"
