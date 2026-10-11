@@ -7880,6 +7880,14 @@ def run_selfcheck():
         r_docs = ms_req({"docs": {"op": "file", "title": "T", "pdf": f"{DEV}/alice/a.pdf", "member": "alice"}}, member="bob")
         r_docs_main = ms_req({"docs": {"op": "file", "title": "T"}}, member=None, peer=(999999, os.getuid(), f"{DEV}/myrepo"))
         globals()["run_docs"] = real_rd_ms
+        # ---- AN EXPERIMENT SUBJECT IS STARTED OUT HERE (member verb `subject`): cc-subject decides; the handle it is
+        # handed is the socket's, whatever the ask says.
+        subjMS = []
+        real_rs_ms = globals()["run_subject"]
+        globals()["run_subject"] = lambda h, ask: subjMS.append((h, ask)) or {"ok": True, "run": "r1", "text": "subject run r1 started"}
+        r_subj = ms_req({"subject": {"op": "run", "argv": ["true"], "handle": "alice"}}, member="bob")
+        r_subj_main = ms_req({"subject": {"op": "run", "argv": ["true"]}}, member=None, peer=(999999, os.getuid(), f"{DEV}/myrepo"))
+        globals()["run_subject"] = real_rs_ms
 
         # ---- A COURSE THAT APPEARS GETS ITS CHANNEL, WITH NOBODY TYPING ANYTHING (workspace_projects + projects_sweep)
         # Same door as the asks above, so what these prove is the SWEEP's own two decisions: which directories it
@@ -8314,6 +8322,10 @@ def run_selfcheck():
           "back as it is; on the main socket `docs` is refused as a member-socket verb and runs nothing",
           r_docs.get("ok") and r_docs.get("text", "").startswith("901-0001-A") and len(docsMS) == 1 and docsMS[0][0] == "bob"
           and r_docs_main.get("ok") is False and "member-socket verb" in r_docs_main.get("error", ""))
+    check("MEMBER socket: `subject` hands cc-subject the socket's workspace, not one the ask names, and the answer comes "
+          "back as it is; on the main socket `subject` is refused as a member-socket verb and starts nothing",
+          r_subj.get("ok") and r_subj.get("run") == "r1" and subjMS == [("bob", {"op": "run", "argv": ["true"], "handle": "alice"})]
+          and r_subj_main.get("ok") is False and "member-socket verb" in r_subj_main.get("error", ""))
     check("MEMBER socket: `send` hands an html body and its images to send_to — each image path mapped as an attachment's "
           "is — and refuses an html that is not a string before send_to; an ask without them hands html \"\" and no images",
           r_send_html.get("ok") and n_sent_html == len(sent_ms) + 1 and sent_html[-1]["html"] == "<p>hi</p>"

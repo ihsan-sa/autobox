@@ -1,0 +1,1823 @@
+#!/usr/bin/python3 -I
+"""cc-subject — an experiment's subject in a sandbox of its own, whose only way out is the model API.
+
+A member workspace runs experiments whose subjects are headless Claude sessions using Bash. Inside the workspace a
+subject would see the whole workspace and the whole network, and a command denylist is no wall: a raw socket walks past
+it. So the HOST starts each subject in its own bwrap, and the subject's world is:
+  /work           a tmpfs of SUBJECT_DISK_MB, rw: empty, or holding a copy of one directory of the workspace (--in).
+                  That directory is measured first (st_blocks of everything in it, through the descriptor it was opened
+                  with, no link followed) and refused if it takes more than SUBJECT_DISK_MB; then it is copied on the
+                  host, inside a second bwrap that sees only it, into the run's in/, which is measured while it fills
+                  and after, so a source that grows meanwhile is stopped too. in/ is bound read-only at /in, and the
+                  sandbox's own first process copies /in into /work, so an input too big for /work fails the run. The
+                  kernel counts every page, an unlinked file still open included, and a write past the size gets ENOSPC.
+  /home/subject   HOME, a 512 MB tmpfs (HOME_BYTES), holding no credential at all; it is not kept after the run
+  /usr, /etc      the distribution, ro; /etc is a tmpfs holding the loader cache, the CA certs and a generated passwd
+  the network     NONE of its own: an empty network namespace whose only interface is loopback. 127.0.0.1:3128 is a
+                  forwarder to a unix socket the host serves, and that is the model API as far as the subject knows:
+                  ANTHROPIC_BASE_URL names it, CLAUDE_CODE_OAUTH_TOKEN is a placeholder, and no proxy variable is set.
+                  A raw socket to anywhere has no route.
+  limits          a user systemd scope of its own, cc-subject-<run>.scope (MemoryMax, MemorySwapMax=0, TasksMax; the
+                  tmpfs pages count against MemoryMax), a size-capped /tmp and a per-file size limit
+Absent, not denied: the workspace and its tracks, ~/.cc, the host's home, every credential. No host firewall rule,
+interface or routing table is touched: the namespace is the subject's, and only bwrap makes it.
+
+THE END of a run, whatever ends it (the subject exits, stop, the hours, a cap, an error in the supervisor): the
+sandbox's first process does not exit with the subject but reports "exit N" on a pipe and waits, so /work is still
+there. The supervisor freezes the scope's cgroup and counts the entries in /work: past WORK_ENTRIES (100000) nothing
+is copied, because an empty file costs the tmpfs nothing but costs the host an inode. The count walks each dir
+from its parent's fd O_NOFOLLOW and enters no link; a dir it cannot open or list (EMFILE on a deep chain too)
+means nothing is copied, never a subtree skipped. The --in and kept-results size caps and the `status RUN` listing
+use the same walk, so a dir they cannot read refuses the cap and a link is listed as a link, never stat'd through
+(an absolute link in a live /work would resolve on the host). Otherwise it copies
+/proc/<sandbox>/root/work out to the run's work/ (a link is copied as a link, never followed), makes every copied dir 0700 and file 0600 (0700 if it was executable) with no
+set-id bit, then kills the cgroup. A scope that does not confirm it is frozen is killed with nothing copied. While a run
+is live, `status` reads its /work through /proc, after checking the process is still in the run's own scope.
+Ended runs older than SUBJECT_KEEP_DAYS (14) lose work/, in/ and home/ the next time the workspace starts a run, and
+ledger files older than that are deleted; status.json and the logs stay. The same sweep removes the in/ of every run
+that is not live, whatever its age, so a launcher killed in the middle of a copy leaves nothing behind for long. All a
+workspace keeps under subjects/<h> is capped at SUBJECT_KEPT_MB (8192), counted in st_blocks but at least ENTRY_BYTES
+(4 KB) an entry, with no link followed: past it no run starts, and that refusal is not one of the day's runs.
+
+THE PROXY is a reverse proxy, not a tunnel. It lets through POST /v1/messages (priced) and /v1/messages/count_tokens
+(free), with no query or `beta=true`, and answers 403 to everything else: CONNECT, GET, any other path, an absolute
+URL. A request needs a Content-Length (chunked is refused), a head under HEAD_MAX and a body under BODY_MAX that
+parses as a JSON object, with no key twice in any object, without mcp_servers, container or inference_geo and without server tools (a tool's type is
+custom or a client tool's). The proxy drops the subject's own auth, cookie, encoding and hop-by-hop headers, reads the
+workspace's access token from its credentials.json on every request (O_NOFOLLOW, so a refresh is picked up and a
+planted link gets a 503), and sends the request on over HTTPS to UPSTREAM with that token, one request a connection.
+
+CAPS, per workspace and per UTC day of a run's start: SUBJECT_DAILY_RUNS runs (20), SUBJECT_DAILY_USD dollars (10),
+SUBJECT_DAILY_NET_MB megabytes through the proxy (1024), SUBJECT_MAX_HOURS per run (6; a run that names none gets 2,
+or the cap if lower), SUBJECT_CONCURRENT at once (2), SUBJECT_KEPT_MB kept on disk (8192) — `cc-config set` changes
+them. A run whose --in copy fails, or whose --in is too big, still counts against the run cap. A run charges the
+ledger of the UTC day it started, however long it goes on. Dollars and bytes are both kept by the proxy, the
+subject's only way out, in ONE ledger per workspace and day (subjects/<h>/ledger/<day>.json, edited under a flock),
+which every run of that workspace shares, so two runs at once cannot each spend what is left:
+  dollars   before a priced request goes out the proxy asks the API's free count_tokens for its input (the body cut
+            to COUNT_KEYS, the same login) and holds its worst case R (hold_terms(): that count plus 2% and 1024, or,
+            if the count fails, every byte of the body a token and documents and URLs a full context; cache writes at
+            their dearest; all of max_tokens out; the model's dearest row, a model with no row at the dearest of all;
+            twice that past 200k input). It settles R from the usage the API sends back (cc-spend's rates). A stream
+            cut before message_stop, or a subject that hangs up before the answer, settles at R or what it saw,
+            if more; an error status settles at 0. A request
+            whose R fits once other requests settle waits up to WAIT_MAX seconds, then gets a 429. One that would not
+            fit even with nothing in flight goes out with max_tokens cut to the most that fits now (the body
+            re-encoded, its Content-Length with it), since the answer cannot run past max_tokens; if that cut would
+            reach its thinking budget it gets a 429 instead. Only when not even max_tokens 1 fits beside what is
+            settled is the day spent: a 403, and the run is killed. Holds a run leaves open are settled at R when it
+            ends.
+  bytes     every byte relayed, both ways, the proxy's own count_tokens calls included, taken from the day's ledger
+            in blocks before it is sent; the unused part of a block goes back when the run ends. Past the cap the run is killed. Bytes are a backstop for what
+            dollars do not see (free calls, error answers); dollars are the cap.
+A ledger that will not read is a refusal, never a zero.
+
+usage, INSIDE a member workspace (the request crosses the workspace's own Slack socket as the member verb `subject`):
+  cc-subject run [--in DIR] [--hours H] -- CMD [ARGS...]   start CMD in a new subject sandbox; prints the run id
+  cc-subject stop RUN                                       end a run of this workspace's
+  cc-subject status [RUN [PATH]]                            no RUN: this workspace's runs. RUN: its state, the tails of
+                                                            out.log and net.log, and what is under its /work. PATH: one
+                                                            regular file under that /work, up to READ_BYTES of it
+  The results stay on the host (~/.cc/members/<handle>/subjects/<run>/); the workspace reads them only through
+  `status`, so nothing the subject wrote is ever bound into the workspace. status.json records when the
+  workspace's login expires (login_expires), and `status RUN` says so, since calls made after that get a 401.
+  The proxy's socket sits in a short host-only dir ($XDG_RUNTIME_DIR/cc-subject/<hash>, else ~/.cc/s/<hash>), so a long handle cannot push its path
+  past the 107 bytes a unix socket allows.
+usage, on the host:
+  cc-subject launch <handle>          the daemon's door: one JSON ask on stdin ({"op": "run", "argv": [...],
+                                      "input": DIR, "hours": H}, {"op": "stop", "run": RUN} or {"op": "status",
+                                      "run": RUN, "path": PATH}, run and path optional), one JSON answer out
+  cc-subject list <handle>
+  cc-subject supervise <handle> <run> private: the detached runner launch starts
+  cc-subject selfcheck
+"""
+import calendar
+import contextlib
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import secrets
+import select
+import shutil
+import signal
+import socket
+import ssl
+import stat
+import subprocess as sp
+import sys
+import threading
+import time
+import traceback
+
+BIN = Path(__file__).resolve().parent
+REALHOME = Path(os.path.expanduser("~"))
+# Only the selfcheck moves this: it names where the member dirs and the workspace trees are read from, never the
+# boundary's shape. The daemon that calls `launch` runs with the host's own environment, which no member sets.
+HOME = Path(os.environ.get("CC_SUBJECT_HOME") or REALHOME)
+# (host, port, tls): where the proxy sends what it lets through. Only the selfcheck moves it, to a plain-HTTP fake.
+UPSTREAM = ("api.anthropic.com", 443, True)
+API_PATHS = {"/v1/messages": True, "/v1/messages/count_tokens": False}   # the only paths out, and whether priced
+API_QUERIES = ("", "beta=true")
+HEAD_MAX, BODY_MAX = 16 << 10, 32 << 20      # a request's head and body
+MAX_TOKENS = 1_000_000                       # a max_tokens past this is refused, not reserved
+TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]{1,4096}")   # what an access token may be before it goes into a header
+OAUTH_BETA = "oauth-2025-04-20"
+FORBID_KEYS = ("mcp_servers", "container", "inference_geo")
+TOOL_TYPE = re.compile(r"custom|(bash|text_editor|computer|memory)_\d{8}")   # client tools; server tools are refused
+DOC_TYPES = ("document", "container_upload", "url", "file")
+# What the proxy sends to count_tokens of a priced request's body, and the margin it adds to the count it gets back:
+# the API calls that count an estimate, and the hold must stay the worst case.
+COUNT_KEYS = ("model", "messages", "system", "tools", "tool_choice", "thinking")
+COUNT_TIMEOUT = 30
+WAIT_MAX, WAIT_STEP = 120.0, 0.5             # how long a request waits for in-flight ones to settle, then 429
+BYTES_BLOCK = 1 << 20                        # bytes are taken from the day's ledger this many at a time
+UP_TIMEOUT = 600
+SEARCH_USD = 0.01                            # per web search the usage reports
+PROXY_PORT = 3128
+TICK = 5.0
+COPY_WAIT = 300
+WORK_ENTRIES = 100_000         # a /work holding more entries than this is not copied out at all
+ENTRY_BYTES = 4096             # what every entry costs the kept cap at least: an empty file takes an inode, not a block
+CRED_MARGIN = 15 * 60          # a login closer than this to expiry cannot start a run
+HANDLE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+RUN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
+DEFAULTS = {"SUBJECT_DAILY_RUNS": 20, "SUBJECT_DAILY_USD": 10.0, "SUBJECT_MAX_HOURS": 6.0, "SUBJECT_CONCURRENT": 2,
+            "SUBJECT_DISK_MB": 1024, "SUBJECT_DAILY_NET_MB": 1024.0, "SUBJECT_KEEP_DAYS": 14, "SUBJECT_KEPT_MB": 8192}
+# Where the proxy's socket dir goes: short and host-only, whatever the handle. Only the selfcheck moves it.
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or None
+MEMORY, TASKS = "4G", 512      # the scope's MemoryMax (tmpfs pages count against it) and TasksMax
+SUPERVISOR_MEMORY = "2G"       # the supervisor's own scope: it parses request bodies, up to 16 at once
+TMP_BYTES = 512 << 20          # /tmp inside
+HOME_BYTES = 512 << 20         # /home/subject inside; with /work and /tmp it leaves ~2 GB of MEMORY to the processes
+FREEZE_WAIT = 10.0             # how long the end waits for the scope to report itself frozen
+INFO_WAIT = 60.0               # how long the supervisor waits for bwrap to name the sandbox's pid
+FILE_BYTES = 1 << 30           # RLIMIT_FSIZE: no single file, out.log included, past this
+NET_LOG_LINES = 5000           # net.log stops here, with one line saying so
+READ_BYTES = 256 << 10         # `status RUN PATH` hands back at most this much of one file
+TAIL_LINES, LIST_MAX = 40, 200 # `status RUN`: lines of each log, entries of /work
+LIVE = ("starting", "running")
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def today():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def member_dir(h):
+    return HOME / ".cc/members" / h
+
+
+def subjects(h):
+    return member_dir(h) / "subjects"
+
+
+def sock_dir(h, run):
+    """The run's own dir for the proxy's socket: <base>/<16 hex of handle and run>, where <base> is
+    $XDG_RUNTIME_DIR/cc-subject or else ~/.cc/s — a few dozen bytes whatever the handle, under the 107 a unix
+    socket path may hold. Nothing a member or subject writes is on either path."""
+    base = Path(RUNTIME) / "cc-subject" if RUNTIME else HOME / ".cc/s"
+    return base / hashlib.sha256(f"{h}/{run}".encode()).hexdigest()[:16]
+
+
+def make_sock_dir(d):
+    """Make `d` (and its base) 0700, refusing a base that is a link or not this user's."""
+    d.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(d.parent)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError(f"{d.parent} is not a directory of this user's")
+    os.chmod(d.parent, 0o700)
+    d.mkdir(mode=0o700)
+    return d
+
+
+def config(key):
+    d = DEFAULTS[key]
+    try:
+        v = sp.run([str(BIN / "cc-config"), "get", key, str(d)], capture_output=True, text=True, timeout=10).stdout.strip()
+        return type(d)(v)
+    except (OSError, ValueError, sp.SubprocessError):
+        return d
+
+
+def caps():
+    return {k: config(k) for k in DEFAULTS}
+
+
+def read_json(p, default=None):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, obj):
+    tmp = Path(f"{p}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(obj, indent=1) + "\n")
+    os.replace(tmp, p)
+
+
+def runs_of(h):
+    """(run id, status) for every run of a workspace, oldest first."""
+    root = subjects(h)
+    out = []
+    for d in sorted(root.iterdir()) if root.is_dir() else []:
+        if RUN.fullmatch(d.name):
+            st = read_json(d / "status.json")
+            if isinstance(st, dict):
+                out.append((d.name, st))
+    return out
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):   # gone, or a pid now another user's: not this run's supervisor
+        return False
+
+
+def state_of(st):
+    """A run's state, where one marked live whose supervisor process is gone is `failed`: nothing will ever end it,
+    and bwrap --die-with-parent took the subject down with that supervisor."""
+    s = st.get("state")
+    return "failed" if s in LIVE and not alive(st.get("supervisor")) else s
+
+
+def day_totals(h, day):
+    """Runs started on `day` (UTC, the YYYY-MM-DD of their start stamp), every one of them, a run whose input copy
+    failed included, and how many of the workspace's runs are live. Dollars and bytes are the ledger's."""
+    every = runs_of(h)
+    live = sum(1 for _, st in every if state_of(st) in LIVE)
+    return sum(1 for _, st in every if str(st.get("started", ""))[:10] == day), live
+
+
+# ------------------------------------------------------------------ the credential (host side only)
+
+def read_login(p):
+    """The `claudeAiOauth` dict of the credentials file `p`, or None. The file is opened O_NOFOLLOW and must be a
+    regular file: a link planted in its place is no login."""
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        raw = f.read(1 << 16)
+    try:
+        oauth = json.loads(raw).get("claudeAiOauth")
+    except (ValueError, RecursionError, AttributeError):
+        return None
+    return oauth if isinstance(oauth, dict) else None
+
+
+def read_token(p):
+    """The access token in `p`, read afresh (so a refresh the workspace made is used), or None if it is not one."""
+    oauth = read_login(p)
+    tok = oauth.get("accessToken") if oauth else None
+    return tok if isinstance(tok, str) and TOKEN.fullmatch(tok) else None
+
+
+def login_why(h):
+    """None if workspace `h` has a login a run can use, else why not. The subject never holds it: the proxy does."""
+    oauth = read_login(member_dir(h) / "credentials.json")
+    if not oauth or not isinstance(oauth.get("accessToken"), str) or not TOKEN.fullmatch(oauth["accessToken"]):
+        return f"workspace {h} has no login of its own, so a subject has nothing to call the API with"
+    exp = oauth.get("expiresAt")
+    if isinstance(exp, (int, float)) and exp / 1000 < time.time() + CRED_MARGIN:
+        return (f"workspace {h}'s login expires within {CRED_MARGIN // 60} minutes; any session in the workspace "
+                "renews it, so start one and ask again")
+    return None
+
+
+def login_expires(h):
+    """When workspace `h`'s access token expires (a UTC stamp), or None if its login does not say. The proxy reads the
+    token afresh on every call, so a renewal moves this; a run records it so the member can see why calls get a 401."""
+    oauth = read_login(member_dir(h) / "credentials.json")
+    exp = oauth.get("expiresAt") if oauth else None
+    if type(exp) not in (int, float):
+        return None
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(exp / 1000))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------ the day's ledger, shared by every run
+
+class LedgerError(Exception):
+    pass
+
+
+class Ledger:
+    """One workspace's dollars and proxy bytes for one UTC day: {"usd": settled, "held": {run/seq: R in flight},
+    "bytes": taken}. Every edit is made under a flock on subjects/<h>/.ledger.lock (taken after .lock when both are),
+    so the runs of a workspace — other processes, or threads of this one — share one figure. A file that is there but
+    will not read is a LedgerError, and every caller refuses on it: a broken ledger is never a zero."""
+
+    def __init__(self, h, day):
+        self.dir = subjects(h) / "ledger"
+        self.path = self.dir / f"{day}.json"
+        self.lock_path = subjects(h) / ".ledger.lock"
+
+    def load(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return {"usd": 0.0, "held": {}, "bytes": 0}
+        except OSError as e:
+            raise LedgerError(f"the day's ledger will not open: {e.strerror}") from None
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(4 << 20)
+        try:
+            d = json.loads(raw)
+        except (ValueError, RecursionError):
+            raise LedgerError("the day's ledger is not JSON") from None
+        ok = (isinstance(d, dict) and type(d.get("usd")) in (int, float) and d["usd"] >= 0
+              and type(d.get("bytes")) is int and d["bytes"] >= 0 and isinstance(d.get("held"), dict)
+              and all(type(v) in (int, float) and v >= 0 for v in d["held"].values()))
+        if not ok:
+            raise LedgerError("the day's ledger does not hold what a ledger holds")
+        return d
+
+    @contextlib.contextmanager
+    def edit(self):
+        self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with open(self.lock_path, "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            d = self.load()
+            before = json.dumps(d, sort_keys=True)
+            yield d
+            if json.dumps(d, sort_keys=True) != before:
+                write_json(self.path, d)
+
+    def read(self):
+        with self.edit() as d:
+            return {"usd": d["usd"], "held": dict(d["held"]), "bytes": d["bytes"]}
+
+    def hold(self, key, fixed, per_out, mt, floor, cap):
+        """Hold the worst case of request `key`, fixed + max_tokens * per_out, asked at max_tokens `mt`. Returns
+        (verdict, max_tokens held):
+          ("ok", mt)    it fits beside what is settled and what is in flight;
+          ("ok", m)     it does not fit even with nothing in flight, but at max_tokens m (floor <= m < mt) it fits now;
+          ("wait", 0)   it would fit whole (or at all, past `floor`) once what is in flight settles;
+          ("short", 0)  no max_tokens from `floor` up fits even then: a 429, the day is not spent;
+          ("over", 0)   not even max_tokens 1 fits beside what is settled: the day is spent."""
+        def fit(room):
+            if room < fixed + per_out:
+                return 0
+            m = min(mt, int((room - fixed) / per_out))
+            while m > 0 and fixed + m * per_out > room:
+                m -= 1
+            return m
+        floor = min(floor, mt)
+        with self.edit() as d:
+            room_set = cap - d["usd"]
+            room_all = room_set - sum(d["held"].values())
+            if fixed + per_out > room_set:
+                return "over", 0
+            fa, fs = fit(room_all), fit(room_set)
+            if fa < mt and fs >= mt:
+                return "wait", 0
+            if fa < floor:
+                return ("wait" if fs >= floor else "short"), 0
+            d["held"][key] = fixed + fa * per_out
+            return "ok", fa
+
+    def settle(self, key, usd):
+        """Replace the hold `key` with what the request cost; False, and nothing added, if the hold is gone."""
+        with self.edit() as d:
+            if d["held"].pop(key, None) is None:
+                return False
+            d["usd"] += usd
+            return True
+
+    def release_run(self, run):
+        """Settle every hold run `run` left open at its R, and return their sum."""
+        with self.edit() as d:
+            mine = [k for k in d["held"] if k.startswith(run + "/")]
+            got = sum(d["held"].pop(k) for k in mine)
+            d["usd"] += got
+            return got
+
+    def take_bytes(self, need, cap):
+        """Take a BYTES_BLOCK from the day's bytes (`need` if more), or just `need` if a block will not fit; how many
+        were taken, 0 when not even `need` fits."""
+        with self.edit() as d:
+            room = cap - d["bytes"]
+            got = max(need, BYTES_BLOCK)
+            got = got if got <= room else need if need <= room else 0
+            d["bytes"] += got
+            return got
+
+    def give_bytes(self, n):
+        if n:
+            with self.edit() as d:
+                d["bytes"] = max(0, d["bytes"] - n)
+
+
+# ------------------------------------------------------------------ prices
+
+_SPEND = None
+
+
+def spend():
+    global _SPEND
+    if _SPEND is None:
+        _SPEND = runpy.run_path(str(BIN / "cc-spend"))
+    return _SPEND
+
+
+def worst_rates(model):
+    """(input, output) $ per M tokens for a reservation: the dearer of the model's normal and fast rows; a model with
+    no row gets the dearest of every row."""
+    s = spend()
+    rows = [r for r in (s["rate"](model), s["rate"](model, True)) if r]
+    if not rows:
+        rows = list(s["RATES"].values()) + list(s["FAST"].values())
+    return max(r[0] for r in rows), max(r[1] for r in rows)
+
+
+def price(model, u):
+    """One usage block in dollars with cc-spend's rates. A model with no row is priced at the dearest row there is."""
+    s = spend()
+    fast = u.get("speed") == "fast"
+    v = s["usd"](model, u, fast)
+    if v is None:
+        v = max(s["usd"](m, u, f) for m in s["RATES"] for f in (False, True))
+    return v
+
+
+def cost(model, u):
+    """What a response's usage costs: its price (or the sum of its iterations', if more), twice that past 200k input
+    tokens, and SEARCH_USD a web search."""
+    v = price(model, u)
+    it = u.get("iterations")
+    if isinstance(it, list):
+        v = max(v, sum(price(model, x) for x in it if isinstance(x, dict)))
+    tin = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    if tin > 200_000:
+        v *= 2
+    stu = u.get("server_tool_use")
+    return v + SEARCH_USD * int((stu.get("web_search_requests") if isinstance(stu, dict) else 0) or 0)
+
+
+def count_margin(n):
+    """The input tokens a hold assumes for a request count_tokens put at `n`: 2% and 1024 more, since the API calls
+    that count an estimate and a hold must be the worst case."""
+    return n + n // 50 + 1024
+
+
+def hold_terms(ask, nbytes, counted=None):
+    """(fixed, per_out): the worst a request can cost before it is sent is fixed + max_tokens * per_out. Its input
+    tokens are count_margin(counted) when count_tokens answered, else the body's own estimate: every body byte a
+    token (plus a margin, and 10k a picture), a full context if it names a document, file or URL. Cache writes are at
+    their dearest multiple, every token out at the model's dearest row, and the whole twice past 200k input tokens."""
+    images, doc, cc, cc1h, stack = 0, False, False, False, [ask]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            ty = x.get("type")
+            images += ty == "image"
+            doc = doc or ty in DOC_TYPES or "file_id" in x
+            if "cache_control" in x:
+                cc = True
+                cc1h = cc1h or (isinstance(x["cache_control"], dict) and x["cache_control"].get("ttl") == "1h")
+            stack.extend(x.values())
+        elif isinstance(x, list):
+            stack.extend(x)
+    if counted is not None:
+        tin = count_margin(counted)
+    else:
+        tin = 1_000_000 if doc else min(1_000_000, nbytes + 8192 + 10000 * images)
+    mult = 2.0 if cc1h else 1.25 if cc else 1.0
+    rin, rout = worst_rates(ask["model"])
+    k = 2 if tin > 200_000 else 1
+    return k * tin * rin * mult / 1e6, k * rout / 1e6
+
+
+def reserve(ask, nbytes, counted=None):
+    """The hold R for a request as it is: hold_terms at its own max_tokens."""
+    fixed, per_out = hold_terms(ask, nbytes, counted)
+    return fixed + int(ask.get("max_tokens") or 0) * per_out
+
+
+def thinking_floor(ask):
+    """The least max_tokens a request may be cut to: one past its thinking budget (the API refuses a max_tokens at or
+    under it), else 1."""
+    th = ask.get("thinking")
+    b = th.get("budget_tokens") if isinstance(th, dict) and th.get("type") == "enabled" else None
+    return b + 1 if type(b) is int and b >= 0 else 1
+
+
+def vet(ask, priced):
+    """None if the request body may go out, else why not."""
+    if not isinstance(ask, dict):
+        return "the body is not a JSON object"
+    for k in FORBID_KEYS:
+        if k in ask:
+            return f"{k} does not go through this proxy"
+    if not isinstance(ask.get("model"), str):
+        return "the body names no model"
+    tools = ask.get("tools", [])
+    if not isinstance(tools, list):
+        return "tools is not a list"
+    for t in tools:
+        if not isinstance(t, dict):
+            return "a tool is not an object"
+        ty = t.get("type")
+        if ty is not None and not (isinstance(ty, str) and TOOL_TYPE.fullmatch(ty)):
+            return f"tool type {str(ty)[:60]!r} does not go through this proxy: server tools are refused"
+    mt = ask.get("max_tokens")
+    if priced and (type(mt) is not int or not 0 < mt <= MAX_TOKENS):
+        return f"max_tokens must be a whole number from 1 to {MAX_TOKENS}"
+    return None
+
+
+PARSE = threading.Lock()   # one body parsed at a time, so sixteen 32 MB bodies are never in the parser together
+
+
+def unique(pairs):
+    """An object with a key twice is no body: the proxy and the API could each read a different one of them."""
+    d = dict(pairs)
+    if len(d) != len(pairs):
+        raise ValueError("a key twice")
+    return d
+
+
+def parse(raw):
+    with PARSE:
+        try:
+            return json.loads(raw, object_pairs_hook=unique)
+        except (ValueError, RecursionError, MemoryError):
+            return None
+
+
+class Usage:
+    """The usage of one response, read as it is relayed: a JSON body whole, or an SSE stream's message_start usage
+    merged with its message_delta usage, complete only once message_stop has been seen."""
+    LINE_MAX = 1 << 20
+
+    def __init__(self, sse):
+        self.sse, self.buf, self.skip = sse, bytearray(), False
+        self.u, self.model, self.complete = None, None, False
+
+    def feed(self, d):
+        if not self.sse:
+            if self.buf is not None:
+                self.buf += d
+                if len(self.buf) > BODY_MAX:
+                    self.buf = None   # too big to read: opaque, so it settles at R
+            return
+        self.buf += d
+        while True:
+            i = self.buf.find(b"\n")
+            if i < 0:
+                if len(self.buf) > self.LINE_MAX:   # a line this long is no usage event: drop it to its end
+                    self.buf.clear()
+                    self.skip = True
+                return
+            line = bytes(self.buf[:i]).rstrip(b"\r")
+            del self.buf[:i + 1]
+            if self.skip:
+                self.skip = False
+            elif line.startswith(b"data:"):
+                self.event(parse(line[5:]))
+
+    def event(self, ev):
+        if not isinstance(ev, dict):
+            return
+        t = ev.get("type")
+        if t == "message_start" and isinstance(ev.get("message"), dict):
+            m = ev["message"]
+            self.model = m.get("model") if isinstance(m.get("model"), str) else None
+            if isinstance(m.get("usage"), dict):
+                self.u = {k: v for k, v in m["usage"].items() if v is not None}
+        elif t == "message_delta" and isinstance(ev.get("usage"), dict):
+            self.u = {**(self.u or {}), **{k: v for k, v in ev["usage"].items() if v is not None}}
+        elif t == "message_stop":
+            self.complete = self.u is not None
+
+    def finish(self):
+        if self.sse or not self.buf:
+            return
+        j = parse(bytes(self.buf))
+        if isinstance(j, dict) and isinstance(j.get("usage"), dict):
+            self.u, self.complete = j["usage"], True
+            self.model = j.get("model") if isinstance(j.get("model"), str) else None
+
+    def usd(self, model):
+        """(dollars, complete) — dollars None when there is no usage, or it will not price."""
+        if self.u is None:
+            return None, False
+        try:
+            return float(cost(self.model or model, self.u)), self.complete
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            return None, False
+
+
+# ------------------------------------------------------------------ the proxy (host side)
+
+STRIP = frozenset({"authorization", "x-api-key", "cookie", "accept-encoding", "expect", "host", "content-length",
+                   "connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate", "te",
+                   "trailer", "transfer-encoding", "upgrade"})
+RESP_STRIP = frozenset({"connection", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding",
+                        "upgrade", "content-length", "set-cookie"})
+HNAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,100}")
+HVALUE = re.compile(r"[\t\x20-\x7e\x80-\xff]*")
+REASONS = {400: "Bad Request", 403: "Forbidden", 411: "Length Required", 413: "Content Too Large",
+           429: "Too Many Requests", 431: "Request Header Fields Too Large", 502: "Bad Gateway",
+           503: "Service Unavailable"}
+
+
+class Proxy:
+    """The subject's model API, on a unix socket: see THE PROXY above. One request a connection; each is one line in
+    `log`. Every dollar and byte goes through `ledger`, the workspace's for the day; `usd` and `moved` are this run's
+    part of it. `fatal` is set, and every later request refused, once the run must end: the day's dollars or bytes are
+    gone, or the ledger will not read. The supervisor reads it each tick and kills the run."""
+    MAX = 16
+
+    def __init__(self, path, log, ledger, run, cap, cred):
+        self.log_path, self.ledger, self.run, self.cred = log, ledger, run, cred
+        self.cap_usd, self.cap_bytes = float(cap["SUBJECT_DAILY_USD"]), net_cap(cap)
+        self.cap_text = (f"${self.cap_usd:.2f}", f"{cap['SUBJECT_DAILY_NET_MB']:g} MB")
+        self.slots, self.lock, self.lines = threading.BoundedSemaphore(self.MAX), threading.Lock(), 0
+        self.usd, self.moved, self.left, self.seq = 0.0, 0, 0, 0
+        self.fatal, self.stopped = None, False
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(str(path))
+        self.srv.listen(16)
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def log(self, **kw):
+        with self.lock:
+            self.lines += 1
+            if self.lines > NET_LOG_LINES + 1:
+                return
+            if self.lines > NET_LOG_LINES:
+                kw = {"note": f"net.log is full at {NET_LOG_LINES} lines; later requests are not recorded"}
+            with open(self.log_path, "a") as f:
+                f.write(json.dumps({"at": now(), **kw}) + "\n")
+
+    def serve(self):
+        while not self.stopped:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            if not self.slots.acquire(blocking=False):
+                c.close()
+                continue
+            threading.Thread(target=self.conn, args=(c,), daemon=True).start()
+
+    def conn(self, c):
+        try:
+            c.settimeout(30)
+            self.handle(c)
+        except (OSError, ValueError, http.client.HTTPException):
+            pass
+        finally:
+            c.close()
+            self.slots.release()
+
+    def die(self, why):
+        with self.lock:
+            self.fatal = self.fatal or why
+
+    def ledger_broken(self, e):
+        self.die(f"killed: the workspace's subject ledger will not read ({e})")
+
+    def take(self, n):
+        """Count `n` bytes about to be relayed, taking more from the day's ledger when this run's share is spent;
+        False, and the run marked to end, once the day has none left."""
+        with self.lock:
+            if self.fatal or self.stopped:
+                return False
+            if self.left < n:
+                try:
+                    got = self.ledger.take_bytes(n - self.left, self.cap_bytes)
+                except LedgerError as e:
+                    self.fatal = f"killed: the workspace's subject ledger will not read ({e})"
+                    return False
+                if not got:
+                    self.fatal = f"killed: the workspace's subjects moved the day's {self.cap_text[1]} through the proxy"
+                    return False
+                self.left += got
+            self.left -= n
+            self.moved += n
+            return True
+
+    def admit(self, fixed, per_out, mt, floor):
+        """Hold a request's worst case in the day's ledger (Ledger.hold): (key, "ok", max_tokens held), or (None, v, 0)
+        with v "wait" (WAIT_MAX passed with in-flight requests still in the way), "short" or "over" (the run is marked
+        to end)."""
+        until = time.time() + WAIT_MAX
+        while True:
+            with self.lock:
+                if self.fatal or self.stopped:
+                    return None, "over", 0
+                self.seq += 1
+                key = f"{self.run}/{self.seq}"
+                try:
+                    v, got = self.ledger.hold(key, fixed, per_out, mt, floor, self.cap_usd)
+                except LedgerError as e:
+                    self.fatal = f"killed: the workspace's subject ledger will not read ({e})"
+                    return None, "over", 0
+                if v == "over":
+                    self.fatal = f"killed: the workspace's subjects reached the {self.cap_text[0]} daily cap"
+                if v == "ok":
+                    return key, v, got
+                if v != "wait":
+                    return None, v, 0
+            if time.time() >= until:
+                return None, "wait", 0
+            time.sleep(WAIT_STEP)
+
+    def settle(self, key, usd):
+        try:
+            done = self.ledger.settle(key, usd)
+        except LedgerError as e:
+            self.ledger_broken(e)
+            return
+        if done:
+            with self.lock:
+                self.usd += usd
+
+    def refuse(self, c, code, line, why):
+        self.log(request=line, allowed=False, status=code, why=why)
+        self.error(c, code, why)
+
+    @staticmethod
+    def error(c, code, why):
+        body = json.dumps({"type": "error", "error": {"type": "cc_subject", "message": why}}).encode()
+        c.sendall(f"HTTP/1.1 {code} {REASONS.get(code, 'Error')}\r\nContent-Type: application/json\r\n"
+                  f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+
+    def handle(self, c):
+        head = bytearray()
+        while b"\r\n\r\n" not in head:
+            if len(head) > HEAD_MAX:
+                return self.refuse(c, 431, "", f"a request head is at most {HEAD_MAX} bytes")
+            d = c.recv(65536)
+            if not d:
+                return
+            head += d
+        raw, _, rest = bytes(head).partition(b"\r\n\r\n")
+        lines = raw.decode("latin-1").split("\r\n")
+        line = lines[0][:300]
+        if len(raw) > HEAD_MAX:
+            return self.refuse(c, 431, line, f"a request head is at most {HEAD_MAX} bytes")
+        m = re.fullmatch(r"([A-Z]{1,20}) (\S{1,2000}) HTTP/1\.[01]", lines[0])
+        method, target = m.groups() if m else ("", "")
+        path, _, query = target.partition("?")
+        if method != "POST" or path not in API_PATHS or query not in API_QUERIES:
+            return self.refuse(c, 403, line, "only POST /v1/messages and /v1/messages/count_tokens go out")
+        hdrs = []
+        for h in lines[1:]:
+            k, sep, v = h.partition(":")
+            if not sep or not HNAME.fullmatch(k) or not HVALUE.fullmatch(v):
+                return self.refuse(c, 400, line, "a malformed header")
+            hdrs.append((k.lower(), v.strip()))
+        names = {k for k, _ in hdrs}
+        cls = {v for k, v in hdrs if k == "content-length"}
+        if "transfer-encoding" in names or len(cls) != 1 or not re.fullmatch(r"\d{1,12}", next(iter(cls))):
+            return self.refuse(c, 411, line, "a request needs one Content-Length, and no Transfer-Encoding")
+        n = int(next(iter(cls)))
+        if n > BODY_MAX:
+            return self.refuse(c, 413, line, f"a request body is at most {BODY_MAX} bytes")
+        body = bytearray(rest)
+        if len(body) > n:
+            return self.refuse(c, 400, line, "more bytes than the Content-Length")
+        while len(body) < n:
+            d = c.recv(min(1 << 20, n - len(body)))
+            if not d:
+                return
+            body += d
+        priced = API_PATHS[path]
+        ask = parse(bytes(body))
+        why = vet(ask, priced) if ask is not None else "the body is not JSON, or nests too deep"
+        if why:
+            return self.refuse(c, 400 if ask is None else 403, line, why)
+        token = read_token(self.cred)
+        if token is None:
+            return self.refuse(c, 503, line, "the workspace has no usable login")
+        if not self.take(len(raw) + 4 + n):
+            return self.refuse(c, 403, line, self.fatal or "the run is ending")
+        key, r, body, extra = None, 0.0, bytes(body), {}
+        if priced:
+            counted = self.count(query, hdrs, ask, token)
+            fixed, per_out = hold_terms(ask, n, counted)
+            mt = ask["max_tokens"]
+            key, v, got = self.admit(fixed, per_out, mt, thinking_floor(ask))
+            if v == "over":
+                return self.refuse(c, 403, line, self.fatal or "the run is ending")
+            if v == "wait":
+                return self.refuse(c, 429, line, f"the day's dollars are held by requests in flight; waited {WAIT_MAX:g}s")
+            if v == "short":
+                return self.refuse(c, 429, line, "what is left of the day's dollars will not cover this request at any "
+                                                 "max_tokens above its thinking budget")
+            r = fixed + got * per_out
+            extra = {"counted": counted}
+            if got != mt:   # cut to what the day has left: the answer stops at max_tokens, the cap holds
+                ask["max_tokens"] = got
+                with PARSE:
+                    body = json.dumps(ask, ensure_ascii=False, separators=(",", ":")).encode()
+                extra["max_tokens"] = [mt, got]
+                if len(body) > n and not self.take(len(body) - n):
+                    self.settle(key, 0.0)
+                    return self.refuse(c, 403, line, self.fatal or "the run is ending")
+        usd, status = r, None   # settled at R unless relay() says otherwise: whatever fails once it is sent was sent
+        try:
+            usd, status = self.relay(c, target, hdrs, body, ask, r, token)
+        finally:
+            if key:
+                self.settle(key, usd)
+            self.log(request=line, allowed=True, status=status, model=ask.get("model"), usd=round(usd, 6), **extra)
+
+    def upstream(self, hdrs, token, n, timeout=UP_TIMEOUT):
+        """A connection to UPSTREAM, not yet open, and the headers a request of `n` body bytes goes out with: the
+        subject's own less STRIP, the workspace's token, the oauth beta, identity encoding."""
+        host, port, tls = UPSTREAM
+        out = {k: v for k, v in hdrs if k not in STRIP}
+        beta = [b.strip() for b in out.get("anthropic-beta", "").split(",") if b.strip()]
+        out.update({"host": host, "authorization": f"Bearer {token}",
+                    "anthropic-beta": ",".join(beta + ([] if OAUTH_BETA in beta else [OAUTH_BETA])),
+                    "accept-encoding": "identity", "connection": "close", "content-length": str(n)})
+        up = (http.client.HTTPSConnection(host, port, timeout=timeout, context=ssl.create_default_context())
+              if tls else http.client.HTTPConnection(host, port, timeout=timeout))
+        return up, out
+
+    def count(self, query, hdrs, ask, token):
+        """The input tokens of a priced request, from the API's free count_tokens, asked with the body cut to
+        COUNT_KEYS and the same login; None on any failure, and the hold falls back to the body's estimate. Its bytes
+        count against the day like any other."""
+        cbody = json.dumps({k: ask[k] for k in COUNT_KEYS if k in ask}, ensure_ascii=False).encode()
+        if not self.take(len(cbody)):
+            return None
+        up, out = self.upstream(hdrs, token, len(cbody), COUNT_TIMEOUT)
+        try:
+            up.putrequest("POST", "/v1/messages/count_tokens" + (f"?{query}" if query else ""),
+                          skip_host=True, skip_accept_encoding=True)
+            for k, v in out.items():
+                up.putheader(k, v)
+            up.endheaders(cbody)
+            resp = up.getresponse()
+            data = resp.read(1 << 16)
+            if not self.take(len(data)) or resp.status != 200:
+                return None
+            j = parse(data)
+            v = j.get("input_tokens") if isinstance(j, dict) else None
+            return v if type(v) is int and 0 <= v <= MAX_TOKENS * 10 else None
+        except (OSError, http.client.HTTPException, ValueError):
+            return None
+        finally:
+            up.close()
+
+    def relay(self, c, target, hdrs, body, ask, r, token):
+        """Send the request upstream with the workspace's token and relay the answer. Returns (dollars, status):
+        0 if nothing was sent or the answer is an error; what the usage says if it came whole; else the most of R and
+        what was seen."""
+        up, out = self.upstream(hdrs, token, len(body))
+        try:
+            try:
+                up.connect()
+            except OSError as e:
+                try:
+                    self.error(c, 502, f"the API did not answer: {e}")
+                except OSError:
+                    pass
+                return 0.0, 502
+            try:
+                up.putrequest("POST", target, skip_host=True, skip_accept_encoding=True)
+                for k, v in out.items():
+                    up.putheader(k, v)
+                up.endheaders(body)
+                resp = up.getresponse()
+            except (OSError, http.client.HTTPException, ValueError) as e:
+                self.error(c, 502, f"the API dropped the request: {e}")
+                return r, 502
+            status = resp.status
+            meter = Usage("text/event-stream" in (resp.getheader("content-type") or ""))
+            rh = "".join(f"{k}: {v}\r\n" for k, v in resp.getheaders() if k.lower() not in RESP_STRIP)
+            head = f"HTTP/1.1 {status} {resp.reason}\r\n{rh}Connection: close\r\n\r\n".encode("latin-1", "replace")
+            gone = False
+            try:
+                if self.take(len(head)):
+                    c.sendall(head)
+                else:
+                    gone = True
+            except OSError:   # the subject hung up before the answer: the API has done the work all the same
+                gone = True
+            if not gone:
+                while True:
+                    try:
+                        d = resp.read1(65536)
+                    except (OSError, http.client.HTTPException):
+                        break
+                    if not d:
+                        meter.finish()
+                        break
+                    meter.feed(d)
+                    if not self.take(len(d)):
+                        break
+                    try:
+                        c.sendall(d)
+                    except OSError:
+                        break
+            if status >= 400:
+                return 0.0, status
+            seen, whole = meter.usd(ask.get("model"))
+            if whole and seen is not None:
+                return seen, status
+            return max(r, seen or 0.0), status
+        finally:
+            up.close()
+
+    def stop(self):
+        """No more requests; the unused part of this run's byte blocks goes back to the day."""
+        with self.lock:
+            self.stopped = True
+            left, self.left = self.left, 0
+        self.srv.close()
+        try:
+            self.ledger.give_bytes(left)
+        except LedgerError:
+            pass
+
+
+# The sandbox's first process (pid 2; bwrap's own init is 1). argv: the status fd, then the subject's command. It
+# copies /in into /work (a failure, ENOSPC above all, is an "input" line and nothing runs), binds the forwarder BEFORE
+# the subject starts, so its first call cannot race the listener, forks the forwarder (loopback to the host's proxy)
+# and the subject, and when the subject ends writes "exit N" and waits: the mount namespace, and /work with it, lasts
+# until the supervisor has frozen the scope and copied /work out. The status fd never reaches the subject.
+INIT = r'''
+import os, socket, subprocess, sys, threading, time
+st = int(sys.argv[1]); os.set_inheritable(st, False)
+def say(s):
+    os.write(st, (s.replace("\n", " ")[:400] + "\n").encode())
+def hold():
+    while True: time.sleep(3600)
+if os.path.isdir("/in"):
+    p = subprocess.run(["/usr/bin/cp", "-dR", "--preserve=mode,timestamps,links", "--sparse=always", "/in/.", "/work/"],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if p.returncode:
+        say("input " + p.stderr.decode(errors="replace").strip()[-300:]); hold()
+L = socket.socket(); L.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); L.bind(("127.0.0.1", %d)); L.listen(32)
+if os.fork() == 0:
+    os.close(st); os.setsid()
+    def pipe(a, b):
+        try:
+            while True:
+                d = a.recv(65536)
+                if not d: break
+                b.sendall(d)
+        except OSError: pass
+        for s in (a, b):
+            try: s.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+    def conn(c):
+        u = socket.socket(socket.AF_UNIX)
+        try: u.connect("/run/subject/proxy.sock")
+        except OSError: c.close(); return
+        threading.Thread(target=pipe, args=(c, u), daemon=True).start(); pipe(u, c)
+    while True:
+        c, _ = L.accept(); threading.Thread(target=conn, args=(c,), daemon=True).start()
+pid = os.fork()
+if pid == 0:
+    L.close()
+    try:
+        os.execvp(sys.argv[2], sys.argv[2:])
+    except OSError as e:
+        os.write(2, ("cc-subject: %%s: %%s\n" %% (sys.argv[2], e.strerror)).encode())
+    os._exit(127)
+L.close()
+_, ws = os.waitpid(pid, 0)
+say("exit %%d" %% os.waitstatus_to_exitcode(ws))
+hold()
+''' % PROXY_PORT
+
+
+def claude_binary():
+    p = os.path.realpath(os.environ.get("CC_CLAUDE") or REALHOME / ".local/bin/claude")
+    return p if os.path.isfile(p) else None
+
+
+def unit(run):
+    return f"cc-subject-{run}"
+
+
+def boundary(rd, cmd, net, disk_mb, status_fd, info_fd):
+    """The argv for the subject of run dir `rd` whose proxy socket is in `net`: a scope named for the run, and in it a
+    bwrap that writes its child's pid to `info_fd` and whose first process reports on `status_fd`. Also the
+    descriptors bwrap reads (passwd, group, hosts)."""
+    uid, gid = os.getuid(), os.getgid()
+    files = [f"subject:x:{uid}:{gid}:subject:/home/subject:/bin/bash\n", f"subject:x:{gid}:\n",
+             "127.0.0.1 localhost\n::1 localhost\n"]
+    fds = []
+    for text in files:
+        r, w = os.pipe()
+        os.write(w, text.encode())
+        os.close(w)
+        fds.append(r)
+    b = ["bwrap", "--die-with-parent", "--unshare-all", "--new-session", "--clearenv", "--hostname", "subject",
+         "--info-fd", str(info_fd), "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+         "--symlink", "usr/lib64", "/lib64", "--symlink", "usr/sbin", "/sbin",
+         "--tmpfs", "/etc"]
+    for e in ("ld.so.cache", "ssl/certs", "ssl/openssl.cnf", "ca-certificates", "alternatives", "localtime"):
+        b += ["--ro-bind-try", f"/etc/{e}", f"/etc/{e}"]
+    b += ["--file", str(fds[0]), "/etc/passwd", "--file", str(fds[1]), "/etc/group", "--file", str(fds[2]), "/etc/hosts",
+          "--proc", "/proc", "--dev", "/dev", "--size", str(TMP_BYTES), "--tmpfs", "/tmp", "--tmpfs", "/run",
+          "--ro-bind", str(net), "/run/subject",
+          "--size", str(HOME_BYTES), "--tmpfs", "/home/subject", "--size", str(int(disk_mb) << 20), "--tmpfs", "/work"]
+    if (rd / "in").is_dir():
+        b += ["--ro-bind", str(rd / "in"), "/in"]
+    b += ["--chdir", "/work"]
+    path = "/usr/local/bin:/usr/bin:/bin"
+    cb = claude_binary()
+    if cb:
+        b += ["--ro-bind", cb, "/opt/subject/bin/claude"]
+        path = "/opt/subject/bin:" + path
+    # No credential and no proxy variable: the API is at 127.0.0.1, and the proxy behind it puts the login on
+    env = {"HOME": "/home/subject", "USER": "subject", "PATH": path, "TMPDIR": "/tmp", "LANG": "C.UTF-8",
+           "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{PROXY_PORT}", "CLAUDE_CODE_OAUTH_TOKEN": "subject-placeholder",
+           "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "CC_SUBJECT_RUN": rd.name}
+    for k, v in env.items():
+        b += ["--setenv", k, v]
+    scope = ["systemd-run", "--user", "--scope", "--quiet", "--unit", unit(rd.name), "-p", f"MemoryMax={MEMORY}",
+             "-p", "MemorySwapMax=0", "-p", f"TasksMax={TASKS}", "--", "prlimit", f"--fsize={FILE_BYTES}:{FILE_BYTES}", "--"]
+    return scope + b + ["--", "/usr/bin/python3", "-I", "-c", INIT, str(status_fd)] + list(cmd), fds
+
+
+# ------------------------------------------------------------------ the sandbox's /work, live and kept
+
+def scope_of(pid, run):
+    """The cgroup path of process `pid` if it is in run `run`'s own scope, else None."""
+    try:
+        with open(f"/proc/{int(pid)}/cgroup") as f:
+            lines = f.read().splitlines()
+    except (OSError, ValueError, TypeError):
+        return None
+    cg = next((x[3:] for x in lines if x.startswith("0::")), "")
+    return cg if cg.endswith(f"/{unit(run)}.scope") and "/../" not in cg else None
+
+
+def cgroup_write(cg, name, value):
+    try:
+        with open(f"/sys/fs/cgroup{cg}/{name}", "w") as f:
+            f.write(value)
+        return True
+    except OSError:
+        return False
+
+
+def freeze(cg):
+    """Freeze the cgroup `cg`; True only once the kernel says it is frozen."""
+    if not cgroup_write(cg, "cgroup.freeze", "1"):
+        return False
+    until = time.time() + FREEZE_WAIT
+    while time.time() < until:
+        try:
+            with open(f"/sys/fs/cgroup{cg}/cgroup.events") as f:
+                if "frozen 1" in f.read().splitlines():
+                    return True
+        except OSError:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def live_work(pid, run):
+    """An fd on the live /work of run `run`'s sandbox, whose first pid is `pid`, or None. It is opened first and the
+    scope checked after, so a pid that was reused before the open is caught by the check."""
+    try:
+        fd = os.open(f"/proc/{int(pid)}/root/work", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except (OSError, ValueError, TypeError):
+        return None
+    if scope_of(pid, run) is None:
+        os.close(fd)
+        return None
+    return fd
+
+
+def normalise(root):
+    """Make every dir under `root` 0700 and every file 0600, or 0700 if it was executable, no set-id bit, before the
+    host reads, keeps or removes it. Nothing is followed: a link is left as it is, and only what lstat calls a dir is
+    entered. `root` is a tree only the host writes by now (a copy the subject cannot reach, or the run's in/)."""
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            return
+        os.chmod(root, 0o700)
+    except OSError:
+        return
+    for _top, dirs, names, dfd in os.fwalk(root, follow_symlinks=False):
+        for n in dirs + names:
+            try:
+                m = os.stat(n, dir_fd=dfd, follow_symlinks=False).st_mode
+                if stat.S_ISLNK(m):
+                    continue
+                os.chmod(n, 0o700 if stat.S_ISDIR(m) or (stat.S_ISREG(m) and m & 0o111) else 0o600, dir_fd=dfd)
+            except OSError:
+                pass
+
+
+def prune(p):
+    """Remove `p`, a dir of a run's: normalised first, so a dir the subject made unreadable cannot stop it."""
+    try:
+        if stat.S_ISDIR(os.lstat(p).st_mode):
+            normalise(p)
+            shutil.rmtree(p)
+        else:
+            os.unlink(p)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        traceback.print_exc()
+
+
+def walk(dfd, visit):
+    """Hand every entry of the tree under the dir open on `dfd` to visit(rel, entry), `rel` the path of the entry's dir
+    from the top ("" at the top) and `entry` its os.DirEntry; visit returns True to stop the walk there. Only what
+    scandir calls a dir without following is entered, each one opened from its parent's fd O_NOFOLLOW, so a link is
+    handed over as a link and never stat'd through or opened: in a live /work an absolute link would resolve against
+    the host's root. A dir that will not open or list raises its OSError, never skips its subtree, and that includes
+    the EMFILE a chain deeper than the fd limit hits, since the walk holds an fd a level. Every fd is closed after."""
+    fds, rels, todo, stop = [], [], [], False
+
+    def scan(fd, rel):
+        nonlocal stop
+        out = []
+        with os.scandir(fd) as it:
+            for e in it:
+                if visit(rel, e):
+                    stop = True
+                    break
+                if e.is_dir(follow_symlinks=False):
+                    out.append(e.name)
+        return out
+
+    try:
+        fds.append(os.dup(dfd))
+        rels.append("")
+        todo.append(scan(fds[-1], ""))
+        while todo and not stop:
+            if not todo[-1]:
+                todo.pop()
+                rels.pop()
+                os.close(fds.pop())
+                continue
+            name = todo[-1].pop()
+            fds.append(os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fds[-1]))
+            rels.append(f"{rels[-1]}/{name}" if rels[-1] else name)
+            todo.append(scan(fds[-1], rels[-1]))
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def count_entries(dfd, limit):
+    """True if the tree under the dir open on `dfd` holds `limit` entries or fewer, else a str saying why not. A link
+    is counted and never followed, and any dir walk() cannot open or list refuses the whole count."""
+    n = 0
+
+    def visit(_rel, _e):
+        nonlocal n
+        n += 1
+        return n > limit
+
+    try:
+        walk(dfd, visit)
+    except OSError as e:
+        return f"/work could not be counted ({e.strerror})"
+    return True if n <= limit else f"/work holds more than {limit} files and dirs"
+
+
+def copy_out(pid, run, dst):
+    """Copy the frozen sandbox's /work to `dst`, a new dir, then normalise it; a /work of more than WORK_ENTRIES
+    entries, or one count_entries cannot walk to the end, is not copied at all. cp works through /proc/self/fd of dir
+    fds opened O_NOFOLLOW on both sides and copies a link as a link (-d), so nothing it writes or reads is outside
+    the two trees. True, or a str saying what went wrong (what was copied stays)."""
+    src = live_work(pid, run)
+    if src is None:
+        return "the sandbox's /work could not be opened"
+    n = count_entries(src, WORK_ENTRIES)   # empty files cost the tmpfs nothing but each costs the host an inode
+    if n is not True:
+        os.close(src)
+        return f"{n}, so none of it was copied"
+    try:
+        os.mkdir(dst, 0o700)
+        out = os.open(dst, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        os.close(src)
+        return f"{dst} could not be made: {e.strerror}"
+    try:
+        p = sp.run(["/usr/bin/cp", "-dR", "--preserve=timestamps,links", "--sparse=always",
+                    f"/proc/self/fd/{src}/.", f"/proc/self/fd/{out}/"], pass_fds=(src, out), stdin=sp.DEVNULL,
+                   capture_output=True, text=True, timeout=COPY_WAIT)
+        return True if p.returncode == 0 else f"the copy out failed: {p.stderr.strip()[-200:]}"
+    except sp.TimeoutExpired:
+        return f"the copy out took longer than {COPY_WAIT}s"
+    finally:
+        os.close(src)
+        os.close(out)
+        normalise(dst)
+
+
+def end_sandbox(p, pid, cg, run, dst, keep):
+    """End the sandbox of `p`, whose first pid is `pid` and whose scope is the cgroup `cg`: freeze it, copy its /work to
+    `dst` if `keep`, kill the cgroup and the process group. A scope that will not confirm it is frozen is killed with
+    nothing copied. Returns None, or a note on why the results were not (all) kept."""
+    note = None
+    if p.poll() is None and cg:
+        if not freeze(cg):
+            note = "results not kept: the sandbox did not freeze"
+        elif keep and pid:
+            done = copy_out(pid, run, dst)
+            note = None if done is True else f"results not fully kept: {done}"
+        cgroup_write(cg, "cgroup.kill", "1")
+    elif keep:
+        note = "results not kept: the sandbox had already gone"
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    p.wait()
+    return note
+
+
+def read_info(fd, p):
+    """The pid bwrap names on its --info-fd, once it parses; an error if bwrap ends or INFO_WAIT passes first."""
+    buf, until = b"", time.time() + INFO_WAIT
+    while time.time() < until:
+        if select.select([fd], [], [], 0.5)[0]:
+            d = os.read(fd, 4096)
+            if not d:
+                break
+            buf += d
+            try:
+                return int(json.loads(buf)["child-pid"])
+            except (ValueError, KeyError, TypeError):
+                continue
+        elif p.poll() is not None:
+            break
+    raise RuntimeError("the sandbox did not start" + (f" (exit {p.poll()})" if p.poll() is not None else ""))
+
+
+def stamp_time(v):
+    try:
+        return calendar.timegm(time.strptime(str(v), "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+def sweep(h, keep_days):
+    """Prune what ended runs older than `keep_days` keep on disk (work/, in/, home/, cred/), and delete ledger files of
+    days older than that. A live run, or one whose stamps will not read, is left whole. The in/ of any run that is
+    not live goes whatever its age: a launcher killed in the middle of the copy leaves a partial one behind."""
+    cut = time.time() - float(keep_days) * 86400
+    for run, st in runs_of(h):
+        if state_of(st) in LIVE:
+            continue
+        prune(subjects(h) / run / "in")
+        t = stamp_time(st.get("ended") or st.get("started"))
+        if t is not None and t < cut:
+            for d in ("work", "in", "home", "cred"):
+                prune(subjects(h) / run / d)
+    led = subjects(h) / "ledger"
+    day = time.strftime("%Y-%m-%d", time.gmtime(cut))
+    for f in led.iterdir() if led.is_dir() else []:
+        m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.json", f.name)
+        if m and m.group(1) < day:
+            prune(f)
+
+
+# ------------------------------------------------------------------ launch (the daemon's door)
+
+def tree_ok(h, path):
+    """(the real directory `path` names, "") if it is inside one of this workspace's own trees, else (None, why)."""
+    if not isinstance(path, str) or not path.startswith("/") or "\0" in path:
+        return None, "--in takes an absolute path inside the workspace"
+    real = os.path.realpath(path)
+    if real != os.path.normpath(path):
+        return None, f"{path} passes through a link; name the directory itself"
+    roots = [os.path.realpath(HOME / "dev" / h), os.path.realpath(HOME / ".cc/worktrees" / h)]
+    if not any(real == r or real.startswith(r + "/") for r in roots):
+        return None, f"{path} is not inside workspace {h}'s own trees"
+    if not os.path.isdir(real):
+        return None, f"{path} is not a directory"
+    return real, ""
+
+
+def tree_bytes(top, dir_fd=None, limit=None):
+    """The disk a tree takes, in bytes of st_blocks but at least ENTRY_BYTES an entry, so a tree of empty files is
+    not free: `top` itself and everything under it, lstat'd and walked by walk(), so a link counts as a link and
+    nothing it names is reached. `top` is a path, or "." with `dir_fd` a descriptor on the dir; a `top` that is not
+    there takes 0. A dir under it that will not open or list raises its OSError, so a cap built on this refuses
+    rather than skipping what it could not see. With `limit`, the count stops once it is past it."""
+    try:
+        st = os.stat(top, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return 0
+    n = max(st.st_blocks * 512, ENTRY_BYTES)
+    if not stat.S_ISDIR(st.st_mode):
+        return n
+
+    def visit(_rel, e):
+        nonlocal n
+        try:
+            n += max(e.stat(follow_symlinks=False).st_blocks * 512, ENTRY_BYTES)
+        except FileNotFoundError:   # gone since it was listed: it takes nothing now
+            pass
+        return limit is not None and n > limit
+
+    fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        walk(fd, visit)
+    finally:
+        os.close(fd)
+    return n
+
+
+def copy_in(src, dst, limit):
+    """Copy the directory `src` into `dst` from inside a bwrap that sees only those two: the source is opened
+    here and handed over as a descriptor, so nothing resolves its name a second time, and a link in it is copied as
+    a link — it points into a world where there is nothing to reach. A source past `limit` bytes is refused before
+    anything is copied, counted through that descriptor; `dst` is measured while the copy runs and after, so a
+    source that grows meanwhile is stopped too. A tree with a dir that will not open or list cannot be measured, so
+    it is refused too. True, or a str saying what went wrong."""
+    try:
+        fd = os.open(src, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        return f"cannot open {src}: {e.strerror}"
+    too_big = f"{src} takes more than the {limit >> 20} MB a run's /work holds (SUBJECT_DISK_MB)"
+
+    def over(top, dir_fd=None):
+        try:
+            return too_big if tree_bytes(top, dir_fd, limit) > limit else None
+        except OSError as e:
+            return f"{src} could not be measured against SUBJECT_DISK_MB ({e.strerror}), so it is not copied"
+
+    try:
+        if os.readlink(f"/proc/self/fd/{fd}") != src:
+            return f"{src} moved while it was being opened"
+        why = over(".", fd)
+        if why:
+            return why
+        b = ["bwrap", "--die-with-parent", "--unshare-all", "--new-session", "--clearenv",
+             "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+             "--symlink", "usr/lib64", "/lib64", "--proc", "/proc", "--dev", "/dev",
+             "--ro-bind-fd", str(fd), "/src", "--bind", str(dst), "/dst", "--",
+             "/usr/bin/cp", "-a", "--no-preserve=ownership", "/src/.", "/dst/"]
+        p = sp.Popen(b, pass_fds=(fd,), stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.PIPE, text=True)
+        until, err = time.time() + COPY_WAIT, ""
+        while True:
+            try:
+                err = p.communicate(timeout=1)[1] or ""
+                break
+            except sp.TimeoutExpired:
+                why = over(dst) or (f"the copy took longer than {COPY_WAIT}s" if time.time() > until else None)
+                if why:
+                    p.kill()
+                    p.communicate()
+                    return why
+        why = over(dst)
+        if why:
+            return why
+        return True if p.returncode == 0 else f"the copy failed: {err.strip()[-200:]}"
+    finally:
+        os.close(fd)
+
+
+def start(h, ask, cap, spawn=True):
+    """Make a run for workspace `h` and start its supervisor. Returns the JSON answer."""
+    argv, src, hours = ask.get("argv"), ask.get("input") or "", ask.get("hours")
+    hours = min(2, cap["SUBJECT_MAX_HOURS"]) if hours is None else hours
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and "\0" not in a for a in argv):
+        return {"ok": False, "error": "a run needs a command"}
+    if not isinstance(hours, (int, float)) or not 0 < hours <= cap["SUBJECT_MAX_HOURS"]:
+        return {"ok": False, "error": f"--hours must be above 0 and at most {cap['SUBJECT_MAX_HOURS']:g}"}
+    for tool in ("bwrap", "systemd-run", "prlimit"):
+        if not shutil.which(tool):
+            return {"ok": False, "error": f"{tool} is not on the host, so there is no sandbox to run a subject in"}
+    if src:
+        src, why = tree_ok(h, src)
+        if why:
+            return {"ok": False, "error": why}
+    why = login_why(h)
+    if why:
+        return {"ok": False, "error": why}
+    root = subjects(h)
+    root.mkdir(mode=0o700, exist_ok=True)
+    with open(root / ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        sweep(h, cap["SUBJECT_KEEP_DAYS"])
+        most = int(cap["SUBJECT_KEPT_MB"]) << 20
+        try:
+            kept = tree_bytes(root, limit=most)
+        except OSError as e:   # what it cannot see might be past the cap, so no run starts
+            return {"ok": False, "error": f"workspace {h}'s kept subject results could not be measured against "
+                                          f"SUBJECT_KEPT_MB ({e.strerror}), so no run starts"}
+        if kept > most:   # refused before the run dir is made: it is not one of the day's
+            return {"ok": False, "error": f"workspace {h}'s kept subject results take more than the "
+                                          f"{cap['SUBJECT_KEPT_MB']:g} MB it may keep (SUBJECT_KEPT_MB); "
+                                          f"they go after {cap['SUBJECT_KEEP_DAYS']:g} days, so no run starts until then"}
+        n, live = day_totals(h, today())
+        try:
+            led = Ledger(h, today()).read()
+        except LedgerError as e:
+            return {"ok": False, "error": f"workspace {h}'s subject ledger for today will not read ({e}), so no run starts"}
+        usd, net = led["usd"] + sum(led["held"].values()), led["bytes"]
+        if n >= cap["SUBJECT_DAILY_RUNS"]:
+            return {"ok": False, "error": f"workspace {h} has started {n} subject runs today, the daily cap"}
+        if usd >= cap["SUBJECT_DAILY_USD"]:
+            return {"ok": False, "error": f"workspace {h}'s subjects have spent ${usd:.2f} today, the cap is ${cap['SUBJECT_DAILY_USD']:.2f}"}
+        if net >= net_cap(cap):
+            return {"ok": False, "error": f"workspace {h}'s subjects have moved {net / (1 << 20):.1f} MB through the "
+                                          f"proxy today, the cap is {cap['SUBJECT_DAILY_NET_MB']:g} MB"}
+        if live >= cap["SUBJECT_CONCURRENT"]:
+            return {"ok": False, "error": f"workspace {h} already has {live} subject runs going, the most at once"}
+        run = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + secrets.token_hex(3)
+        rd = root / run
+        rd.mkdir(mode=0o700)
+        if src:
+            (rd / "in").mkdir(mode=0o700)
+        # `supervisor` is the process that will end this run: this one while it copies, the supervisor once spawned
+        st = {"run": run, "argv": argv, "input": src, "hours": hours, "state": "starting", "started": now(), "usd": 0.0,
+              "supervisor": os.getpid()}
+        write_json(rd / "status.json", st)
+    if src:
+        ok = copy_in(src, rd / "in", int(cap["SUBJECT_DISK_MB"]) << 20)
+        if ok is not True:   # counted all the same, so a copy that fails cannot be retried without end
+            prune(rd / "in")
+            write_json(rd / "status.json", {**st, "state": "failed", "ended": now(), "why": ok})
+            return {"ok": False, "error": ok}
+    if spawn:
+        with open(rd / "supervise.log", "ab") as log, open(root / ".lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)   # the supervisor takes this lock to write its own pid: no lost update
+            try:
+                p = sp.Popen(supervisor_argv(h, run), stdin=sp.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
+            except OSError as e:
+                prune(rd / "in")
+                write_json(rd / "status.json", {**st, "state": "failed", "ended": now(), "why": f"failed: {e}"})
+                return {"ok": False, "error": f"the supervisor did not start: {e}"}
+            cur = read_json(rd / "status.json", {})
+            if cur.get("state") == "starting" and cur.get("supervisor") == os.getpid():
+                write_json(rd / "status.json", {**cur, "supervisor": p.pid})
+    return {"ok": True, "run": run, "text": f"subject run {run} started; `cc-subject status {run}` reads it"}
+
+
+def supervisor_argv(h, run):
+    """The supervisor in a scope of its own, so the request bodies it parses are bounded by its own memory cap. A
+    --scope systemd-run execs the command in place: the pid Popen sees is the supervisor's."""
+    return ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={SUPERVISOR_MEMORY}",
+            "-p", "MemorySwapMax=0", "--", sys.executable, "-I", str(Path(__file__).resolve()), "supervise", h, run]
+
+
+def net_cap(cap):
+    return int(float(cap["SUBJECT_DAILY_NET_MB"]) * (1 << 20))
+
+
+def stop(h, run):
+    if not isinstance(run, str) or not RUN.fullmatch(run) or not (subjects(h) / run).is_dir():
+        return {"ok": False, "error": f"workspace {h} has no subject run {run}"}
+    st = read_json(subjects(h) / run / "status.json", {})
+    if state_of(st) not in LIVE:
+        why = "; its supervisor ended without recording an end" if st.get("state") in LIVE else ""
+        return {"ok": False, "error": f"run {run} is not going ({state_of(st)}{why})"}
+    (subjects(h) / run / "stop").touch()
+    return {"ok": True, "text": f"run {run} will stop within {TICK:g}s"}
+
+
+def row(run, st):
+    return (f"{run}  {state_of(st) or '?':8}  ${float(st.get('usd') or 0):.2f}  {int(st.get('net_bytes') or 0) / (1 << 20):.1f}MB  "
+            f"{' '.join(map(str, st.get('argv') or []))[:80]}"
+            + (f"  ({st['why']})" if st.get("why") else ""))
+
+
+def tail(p, n=TAIL_LINES):
+    try:
+        with open(p, "rb") as f:
+            f.seek(max(0, os.fstat(f.fileno()).st_size - 64 * 1024))
+            return f.read().decode(errors="replace").splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def open_under(dfd, rel):
+    """An fd for the regular file `rel` under the dir fd `dfd`, every component opened with O_NOFOLLOW from the one
+    before, so a link the subject planted reaches nothing outside its own /work. None when any part is not there or
+    not plain, or the path will not do as one (a NUL byte in it)."""
+    parts = [x for x in rel.split("/") if x not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    fds = []
+    try:
+        cur = dfd
+        for x in parts[:-1]:
+            cur = os.open(x, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=cur)
+            fds.append(cur)
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=cur)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        return fd
+    except (OSError, ValueError):
+        return None
+    finally:
+        for d in fds:
+            os.close(d)
+
+
+def work_fd(rd, run, st):
+    """(fd on the run's /work, "live" or "kept"), or (None, why not): a live run's own /work through /proc, else the
+    copy the end left in the run dir."""
+    if state_of(st) in LIVE and st.get("sandbox"):
+        fd = live_work(st["sandbox"], run)
+        if fd is not None:
+            return fd, "live"
+    try:
+        return os.open(rd / "work", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC), "kept"
+    except OSError:
+        return None, ("not there yet" if state_of(st) in LIVE else "not kept")
+
+
+def login_line(st):
+    exp = st.get("login_expires")
+    if not isinstance(exp, str):
+        return []
+    if exp <= now():
+        return [f"workspace login: expired at {exp}; calls get 401 until a session in the workspace renews it"]
+    return [f"workspace login: expires at {exp}"]
+
+
+def status(h, run=None, path=None):
+    """The workspace's only view of its runs: they are never bound into it."""
+    if run is None:
+        return {"ok": True, "text": "\n".join(row(r, st) for r, st in runs_of(h)) or "no subject runs yet"}
+    if not isinstance(run, str) or not RUN.fullmatch(run) or not (subjects(h) / run).is_dir():
+        return {"ok": False, "error": f"workspace {h} has no subject run {run}"}
+    rd = subjects(h) / run
+    st = read_json(rd / "status.json", {})
+    st = st if isinstance(st, dict) else {}
+    wfd, how = work_fd(rd, run, st)
+    try:
+        if path is not None:
+            path = str(path)
+            path = path[len("/work/"):] if path.startswith("/work/") else path   # the form the usage text names
+            fd = open_under(wfd, path) if wfd is not None else None
+            if fd is None:
+                return {"ok": False, "error": f"run {run} has no regular file /work/{path.replace(chr(0), '?')}"}
+            with os.fdopen(fd, "rb") as f:
+                data = f.read(READ_BYTES + 1)
+            more = f"\n[cut at {READ_BYTES} bytes]" if len(data) > READ_BYTES else ""
+            return {"ok": True, "text": data[:READ_BYTES].decode(errors="replace") + more}
+        files, cut = [], ""
+
+        def visit(rel, e):   # a link is listed as one and never stat'd: in a live /work it would resolve on the host
+            if e.is_symlink():
+                files.append(f"{rel}/{e.name}".lstrip("/") + " (link)")
+            elif not e.is_dir(follow_symlinks=False):
+                files.append(f"{rel}/{e.name}".lstrip("/"))
+            return len(files) > LIST_MAX
+
+        try:
+            if wfd is not None:
+                walk(wfd, visit)
+        except OSError as e:
+            cut = f"; a dir would not open or list ({e.strerror}), so the list stops there"
+        files.sort()
+    finally:
+        if wfd is not None:
+            os.close(wfd)
+    out = [row(run, st), *login_line(st), "", "out.log (tail):", *tail(rd / "out.log"),
+           "", "net.log (tail):", *tail(rd / "net.log"), ""]
+    if st.get("results"):
+        out.append(st["results"])
+    out += [f"/work, {how} ({len(files[:LIST_MAX])} files" + (", list cut" if len(files) > LIST_MAX else "") + cut + "):",
+            *files[:LIST_MAX]]
+    return {"ok": True, "text": "\n".join(out)}
+
+
+def launch(h, ask):
+    if not isinstance(h, str) or not HANDLE.fullmatch(h) or not member_dir(h).is_dir():
+        return {"ok": False, "error": f"{h} is not a member workspace"}
+    if not isinstance(ask, dict):
+        return {"ok": False, "error": "an ask is a JSON object"}
+    if ask.get("op") == "run":
+        return start(h, ask, caps())
+    if ask.get("op") == "stop":
+        return stop(h, ask.get("run"))
+    if ask.get("op") == "status":
+        return status(h, ask.get("run"), ask.get("path"))
+    return {"ok": False, "error": "op is run, stop or status"}
+
+
+# ------------------------------------------------------------------ supervise
+
+def supervise(h, run, cap=None):
+    """Run the subject of `run` to its end. Whatever goes wrong in here — a command the kernel will not exec, a
+    socket that will not bind, an input too big for /work, a ledger that will not read — the finally ends the sandbox
+    (freeze, keep /work, kill: see THE END above), stops the proxy, settles what the run left in flight, removes the
+    socket and the run's in/, and writes a terminal state, so a run is never left marked live with nothing to end it."""
+    cap = cap or caps()
+    rd = subjects(h) / run
+    net, proxy, p, ledger, why, state, st = sock_dir(h, run), None, None, None, "", None, {"run": run}
+    pid, cg, rfd, code, keep = None, None, None, None, True
+    try:
+        with open(rd.parent / ".lock", "a") as lk:   # start() writes the spawned pid under this lock: take it over
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            st = read_json(rd / "status.json")
+            if not isinstance(st, dict):
+                st = {"run": run}
+                raise ValueError("status.json is unreadable")
+            st["supervisor"] = os.getpid()
+            write_json(rd / "status.json", st)
+        make_sock_dir(net)
+        ledger = Ledger(h, str(st["started"])[:10])   # the day the run started pays for all of it
+        proxy = Proxy(net / "proxy.sock", rd / "net.log", ledger, run, cap, member_dir(h) / "credentials.json")
+        rfd, wfd = os.pipe()
+        ifr, ifw = os.pipe()
+        os.set_blocking(rfd, False)
+        argv, fds = boundary(rd, st["argv"], net, cap["SUBJECT_DISK_MB"], wfd, ifw)
+        try:
+            with open(rd / "out.log", "ab") as out:
+                p = sp.Popen(argv, pass_fds=fds + [wfd, ifw], stdin=sp.DEVNULL, stdout=out, stderr=out,
+                             start_new_session=True)
+        finally:
+            for fd in fds + [wfd, ifw] + ([ifr] if p is None else []):
+                os.close(fd)
+        try:
+            pid = read_info(ifr, p)
+        finally:
+            os.close(ifr)
+        cg = scope_of(pid, run)
+        if cg is None:
+            raise RuntimeError(f"the sandbox is not in its own scope {unit(run)}")
+        deadline = time.time() + float(st["hours"]) * 3600
+        st.update(sandbox=pid, login_expires=login_expires(h))
+        write_json(rd / "status.json", {**st, "state": "running"})
+        buf = b""
+        while True:
+            try:
+                while True:
+                    d = os.read(rfd, 4096)
+                    if not d:
+                        break
+                    buf += d
+            except BlockingIOError:
+                pass
+            line = buf.split(b"\n", 1)[0].decode(errors="replace") if b"\n" in buf else ""
+            if line.startswith("exit "):
+                code = int(line[5:]) if re.fullmatch(r"-?\d{1,4}", line[5:]) else None
+                break
+            if line.startswith("input"):
+                why, keep = f"failed: the input did not copy into /work:{line[5:]}", False
+            elif line:
+                why = f"failed: the sandbox said {line[:100]!r}"
+            elif p.poll() is not None:
+                why = "failed: the sandbox ended before its subject did"
+            elif proxy.fatal:
+                why = proxy.fatal
+            elif time.time() > deadline:
+                why = f"killed: past its {float(st['hours']):g} hours"
+            elif (rd / "stop").exists():
+                why = "stopped on request"
+            if why:
+                break
+            time.sleep(TICK)
+            st.update(usd=round(proxy.usd, 6), net_bytes=proxy.moved, login_expires=login_expires(h))
+            write_json(rd / "status.json", {**st, "state": "running"})
+        if not why and proxy.fatal:   # the subject ended on its own after the proxy refused it for good
+            why = proxy.fatal
+        state = why.split(":")[0] if why.startswith(("killed", "failed")) else "stopped" if why else "done"
+    except BaseException as e:   # SystemExit too: main() turns SIGTERM into one
+        traceback.print_exc()
+        first = (str(e).strip().splitlines() or [""])[0][:200]
+        why, state = f"failed: {type(e).__name__}{': ' + first if first else ''}", "failed"
+    finally:
+        if p is not None:
+            try:
+                note = end_sandbox(p, pid, cg, run, rd / "work", keep)
+            except BaseException as e:   # still kill: the results are lost, the sandbox must not outlive this
+                traceback.print_exc()
+                note = f"results not kept: {type(e).__name__}"
+                if cg:
+                    cgroup_write(cg, "cgroup.kill", "1")
+                with contextlib.suppress(OSError):
+                    os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+            if note:
+                st["results"] = note
+        if rfd is not None:
+            os.close(rfd)
+        if proxy is not None:
+            proxy.stop()
+            try:
+                left = ledger.release_run(run)   # what is still in flight is spent at its worst case
+            except LedgerError:
+                traceback.print_exc()
+                left = 0.0
+            st["usd"], st["net_bytes"] = round(proxy.usd + left, 6), proxy.moved
+        try:
+            (net / "proxy.sock").unlink()   # a host-only path: nothing the subject wrote
+        except OSError:
+            pass
+        try:
+            net.rmdir()
+        except OSError:
+            pass
+        prune(rd / "in")
+        st.update(state=state or "failed", ended=now(), exit=code, why=why)
+        write_json(rd / "status.json", st)
+    return st
+
+
+# ------------------------------------------------------------------ inside a member workspace
+
+def ask_host(ask, timeout=360):
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(timeout)
+    try:
+        c.connect(str(REALHOME / ".cc/slack/sock"))
+        c.sendall((json.dumps({"subject": ask}) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            d = c.recv(65536)
+            if not d:
+                break
+            buf += d
+    finally:
+        c.close()
+    return json.loads(buf or b"{}")
+
+
+def inside(args):
+    if args[:1] == ["status"] and len(args) <= 3:
+        ask = {"op": "status", **dict(zip(("run", "path"), args[1:]))}
+    elif args[:1] == ["stop"] and len(args) == 2:
+        ask = {"op": "stop", "run": args[1]}
+    elif args[:1] == ["run"] and "--" in args:
+        opts, cmd = args[1:args.index("--")], args[args.index("--") + 1:]
+        ask = {"op": "run", "argv": cmd}
+        while opts:
+            if opts[0] == "--in" and len(opts) > 1:
+                ask["input"] = os.path.abspath(opts[1])
+            elif opts[0] == "--hours" and len(opts) > 1:
+                try:
+                    ask["hours"] = float(opts[1])
+                except ValueError:
+                    return usage()
+            else:
+                return usage()
+            opts = opts[2:]
+    else:
+        return usage()
+    try:
+        res = ask_host(ask)
+    except (OSError, ValueError) as e:
+        print(f"cc-subject: the host did not answer ({e})", file=sys.stderr)
+        return 1
+    print(res.get("text") or res.get("error") or res, file=sys.stdout if res.get("ok") else sys.stderr)
+    return 0 if res.get("ok") else 1
+
+
+def usage():
+    print(__doc__[__doc__.index("usage, INSIDE"):], file=sys.stderr)
+    return 2
+
+
+def main(args):
+    if args[:1] in (["--help"], ["-h"]):
+        print(__doc__)
+        return 0
+    if os.environ.get("CC_MEMBER_SANDBOX") == "1":
+        return inside(args)
+    if args == ["selfcheck"]:
+        return runpy.run_path(str(BIN.parent / "tests/subject.py"))["selfcheck"](sys.modules[__name__])
+    if len(args) == 2 and args[0] == "launch":
+        try:
+            ask = json.loads(sys.stdin.read(1 << 20) or "null")
+        except ValueError:
+            ask = None
+        print(json.dumps(launch(args[1], ask)))
+        return 0
+    if len(args) == 2 and args[0] == "list" and HANDLE.fullmatch(args[1]):
+        print(status(args[1])["text"])
+        return 0
+    if len(args) == 3 and args[0] == "supervise" and HANDLE.fullmatch(args[1]) and RUN.fullmatch(args[2]):
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit("terminated"))   # so the finally in supervise() runs
+        supervise(args[1], args[2])
+        return 0
+    return usage()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
