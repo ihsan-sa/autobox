@@ -343,12 +343,12 @@ mkdir -p "$GH/.cc/worktrees/boxr"; git -C "$GH/dev/boxr" worktree add -q -b trac
 env HOME="$GH" "$B/cc-board" init boxr "$GH/dev/boxr" main >/dev/null; env HOME="$GH" "$B/cc-board" add boxr t9 "hand-made" >/dev/null
 env HOME="$GH" "$B/cc-board" set boxr t9 kind session; echo work > "$GH/.cc/worktrees/boxr/t9/w.txt"
 od=$(env HOME="$GH" PATH="$B:$PATH" timeout 120 "$B/cc" done boxr t9 2>&1); rd=$?
-{ [ "$rd" = 0 ] && grep -q "wrote $GH/.cc/worktrees/boxr/t9/.cc/track (boxr, t9)" <<<"$od" && [ "$(cat "$GH/.cc/worktrees/boxr/t9/.cc/track")" = "$(printf 'boxr\nt9')" ] \
+{ [ "$rd" = 7 ] && grep -q "wrote $GH/.cc/worktrees/boxr/t9/.cc/track (boxr, t9)" <<<"$od" && [ "$(cat "$GH/.cc/worktrees/boxr/t9/.cc/track")" = "$(printf 'boxr\nt9')" ] \
     && ! grep -q "not 'track/'" <<<"$od" && git -C "$T/boxr.git" rev-parse -q --verify track/t9 >/dev/null && ! git -C "$T/boxr.git" ls-tree -r --name-only track/t9 | grep -q '^\.cc/'; } \
   && ok "cc done on a hand-made box worktree writes its .cc/track, says so, and the delivery goes on from there with .cc/ excluded — no line blaming the branch" \
   || bad "cc done on a hand-made worktree: rc=$rd track='$(cat "$GH/.cc/worktrees/boxr/t9/.cc/track" 2>/dev/null | tr '\n' '|')' $od"
 od=$(cd "$GH/.cc/worktrees/boxr/t9" && env HOME="$GH" PATH="$B:$PATH" timeout 120 "$B/cc" done 2>&1); rd=$?
-{ [ "$rd" = 0 ] && grep -q 'cc: done boxr t9 — read off this worktree' <<<"$od"; } \
+{ [ "$rd" = 7 ] && grep -q 'cc: done boxr t9 — read off this worktree' <<<"$od"; } \
   && ok "bare \`cc done\` inside a track's worktree takes both names off its path and says so" || bad "bare cc done inside a worktree: rc=$rd $od"
 od=$(cd "$T" && env HOME="$GH" PATH="$B:$PATH" timeout 60 "$B/cc" done 2>&1); rd=$?; od1=$(cd "$T" && env HOME="$GH" PATH="$B:$PATH" timeout 60 "$B/cc" done boxr 2>&1); rd1=$?
 { [ "$rd" = 2 ] && [ "$rd1" = 2 ] && grep -q '^usage: cc done <repo> <track>' <<<"$od" && grep -q '^usage: cc done <repo> <track>' <<<"$od1" && ! grep -q '2: repo' <<<"$od$od1"; } \
@@ -395,7 +395,8 @@ od=$(env HOME="$GH" PATH="$T/t3b-bin:$B:$PATH" timeout 60 "$B/cc" done alice t3b
 git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t3b" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t3b >/dev/null 2>&1; rm -rf "$T/t3b.git" "$T/t3b-bin"
 # A KIND=SESSION ROW IS A LIVING PROJECT, NOT A TASK: alive is its normal state, so `cc done` delivers and stops there.
 # Run against a member project in daily use it pushed and then ended the row as finished (2026-09-04). The two endings
-# above are a kind=track row's and are unchanged.
+# above are a kind=track row's and are unchanged. Its READY TO LAND note has no live planning turn in this fixture to
+# take it, so cc done says so and exits 7 (a-delivery-reaches-a-turn-or-says-why) — the session-row fixtures here expect 7.
 git init -q --bare "$T/t4.git"
 git -C "$GH/dev/alice" worktree add -q -b track/t4 "$GH/.cc/worktrees/alice/t4" 2>/dev/null
 mkdir -p "$GH/.cc/worktrees/alice/t4/.cc"; printf 'alice\nt4\n' > "$GH/.cc/worktrees/alice/t4/.cc/track"
@@ -406,7 +407,7 @@ env HOME="$GH" "$B/cc-board" add alice t4 "a living project" >/dev/null
 env HOME="$GH" "$B/cc-board" set alice t4 kind session; env HOME="$GH" "$B/cc-board" status alice t4 running >/dev/null
 od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t4 2>&1); rd=$?
 st=$(env HOME="$GH" "$B/cc-board" get alice t4 status)
-{ [ "$rd" = 0 ] && [ "$st" = running ] && git -C "$T/t4.git" rev-parse -q --verify track/t4 >/dev/null; } \
+{ [ "$rd" = 7 ] && grep -q 'no live planning turn in alice took it' <<<"$od" && [ "$st" = running ] && git -C "$T/t4.git" rev-parse -q --verify track/t4 >/dev/null; } \
   && ok "cc done on a kind=session row pushes the delivery and leaves the row alive — a living project is never 'done'" \
   || bad "cc done ended a session row: rc=$rd status=$st $od"
 git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t4" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t4 >/dev/null 2>&1; rm -rf "$T/t4.git"
@@ -444,7 +445,7 @@ git -C "$w9" -c user.email=t@t -c user.name=t commit -q --allow-empty -m t9
 echo dirty > "$w9/work.txt"   # the same shape as t6: a dirty worktree is what makes the plain checkpoint commit, and then push
 env HOME="$GH" "$B/cc-board" add alice t9 "a living project" >/dev/null; env HOME="$GH" "$B/cc-board" set alice t9 kind session
 od=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 PATH="$B:$PATH" "$B/cc" done alice t9 2>&1); rd=$?
-{ [ "$rd" = 0 ] && [ "$(cat "$w9/.cc/pushed" 2>/dev/null)" = "$(git -C "$w9" rev-parse HEAD)" ] && [ ! -e "$GH/.cc/push-state/alice/t9" ]; } \
+{ [ "$rd" = 7 ] && [ "$(cat "$w9/.cc/pushed" 2>/dev/null)" = "$(git -C "$w9" rev-parse HEAD)" ] && [ ! -e "$GH/.cc/push-state/alice/t9" ]; } \
   && ok "...while the same run INSIDE the boundary keeps it in the worktree — there is no ~/.cc/push-state in there, so a redirect would lock nothing and write the markers into a tmpfs that dies with the sandbox" \
   || bad "an in-boundary cc done put its state outside the worktree: rc=$rd $od"
 git -C "$GH/dev/alice" worktree remove --force "$w9" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t9 >/dev/null 2>&1; git -C "$GH/dev/alice" remote remove origin 2>/dev/null; rm -rf "$T/t9.git" "$GH/.cc/push-state/alice/t9"
@@ -465,7 +466,7 @@ printf '%s\n' "$a7" > "$w7/.cc/pushed"   # THE FORGERY: the member writes the re
 git -C "$w7" -c user.email=t@t -c user.name=t commit -q --amend --allow-empty -m "a7 rebased"   # local diverges; a force would discard a7
 env HOME="$GH" "$B/cc-board" add alice t7 "a living project" >/dev/null; env HOME="$GH" "$B/cc-board" set alice t7 kind session
 od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t7 2>&1); rd=$?
-{ [ "$(git -C "$T/t7.git" rev-parse track/t7)" = "$a7" ] && [ "$rd" != 0 ] && ! grep -qE 'push refused|something else wrote' <<<"$od"; } \
+{ [ "$(git -C "$T/t7.git" rev-parse track/t7)" = "$a7" ] && [ "$rd" != 0 ] && [ "$rd" != 7 ] && ! grep -qE 'push refused|something else wrote' <<<"$od"; } \
   && ok "cc done never force-pushes from a member-written .cc/pushed — a forged lease is not trusted, the remote stands, and it says so by name" \
   || bad "cc done forced from a member file or mis-reported: remote=$(git -C "$T/t7.git" rev-parse track/t7) a7=$a7 rc=$rd $od"
 # …AND THAT REFUSAL IS NOT A DEAD END. It used to point at a push that can never happen: the sweep said a session's
@@ -482,7 +483,7 @@ ad=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc-checkpoint" adopt alice t7 2>&1); ra=
   || bad "adopt's reading step recorded a lease or said nothing: rc=$ra $ad"
 ad=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc-checkpoint" adopt alice t7 "$a7" 2>&1); ra=$?
 od2=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t7 2>&1); rd2=$?
-{ [ "$ra" = 0 ] && [ "$rd2" = 0 ] && [ "$(git -C "$T/t7.git" rev-parse track/t7)" = "$(git -C "$w7" rev-parse HEAD)" ]; } \
+{ [ "$ra" = 0 ] && [ "$rd2" = 7 ] && [ "$(git -C "$T/t7.git" rev-parse track/t7)" = "$(git -C "$w7" rev-parse HEAD)" ]; } \
   && ok "...and the sha the operator read is the exit: cc done then pushes the rebased branch, with no member file trusted" \
   || bad "adopt did not unblock cc done: adopt rc=$ra $ad / done rc=$rd2 $od2"
 git -C "$GH/dev/alice" worktree remove --force "$w7" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t7 >/dev/null 2>&1; rm -rf "$T/t7.git"

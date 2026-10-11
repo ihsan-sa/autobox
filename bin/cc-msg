@@ -7,6 +7,8 @@
 # it was typed at never moved, which means nothing under it is reading the keyboard: the message is kept, and a
 # TRACK window is killed and reopened with `cc <repo> <track>`, which resumes its transcript (2026-09-04).
 #   cc-msg <window> "text"      window = tmux window name in session main (e.g. myapp, myapp/step1)
+#   cc-msg --turn <window> "text"  the same, and rc 0 only once a TURN started on it; 3 queued, 4 a model wall,
+#                               5 no turn — each with why on stderr (send_turn, below; `cc … --say` asks this way)
 #   cc-msg --drain [<window>]   deliver what is spooled, in order, while the pane is free (cc-broker.timer, 60 s); a
 #                               bare --drain also routes member-refusal queries to the box (see drain_queries below)
 #   cc-msg --ask <window> /cmd  type a bare /command at a FREE pane and print what it draws (never spooled)
@@ -927,20 +929,26 @@ sweep(){
   done < <(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null)
 }
 
+handoff_relay(){   # $1 window  $2 text → rc 0 and cc-slack's word (delivered|held) when an open handoff record for the
+  # window took the text to cc-slack for the live side; rc 1 when there is no record or cc-slack did not take it (type it)
+  local hr res
+  hr="${CC_HANDOFF_DIR:-$STATE/handoff}/${1//\//--}.json"
+  case "${CC_MSG_FROM:-}" in slack:*) return 1;; esac
+  [ -f "$hr" ] || return 1
+  res=$("$BIN/cc-slack" inject --no-start "$1" "$2" 2>/dev/null) || return 1
+  case "$res" in delivered|held) echo "$res"; return 0;; esac
+  return 1                                         # anything else (daemon down, paused): the keyboard, as before
+}
 send(){    # $1 window  $2 text — THE contract: delivered, or queued and reported as queued. Never dropped.
-  local id hr res
+  local id res
   # A NAME MID-HANDOFF IS TWO SESSIONS, and the keyboard of whichever holds it is the wrong door: on 2026-09-16 a
   # relay typed into the retiring `lessons` seat was never acted on, and its successor never saw it. With an open
   # overlap record for this name the text goes to cc-slack instead, which hands it to the live side and, at the
   # cutover, re-hands the successor what the predecessor never answered. cc-slack's own typing (CC_MSG_FROM
   # slack:…) never comes back through here: during an overlap it holds a message, it does not type it.
-  hr="${CC_HANDOFF_DIR:-$STATE/handoff}/${1//\//--}.json"
-  case "${CC_MSG_FROM:-}" in slack:*) hr="";; esac
-  if [ -n "$hr" ] && [ -f "$hr" ]; then
-    res=$("$BIN/cc-slack" inject --no-start "$1" "$2" 2>/dev/null) && case "$res" in
-      delivered) return 0;;
-      held) echo queued; return 0;;                # held for the live side: queued, in this file's own word
-    esac                                           # anything else (daemon down, paused): the keyboard, as before
+  if res=$(handoff_relay "$1" "$2"); then
+    [ "$res" = held ] && echo queued               # held for the live side: queued, in this file's own word
+    return 0
   fi
   id=$(win_id "$1") || true
   [ -n "$id" ] || { echo "cc-msg: no window main:$1" >&2; exit 1; }
@@ -951,6 +959,95 @@ send(){    # $1 window  $2 text — THE contract: delivered, or queued and repor
   sp="$(sdir "$1")/inbox.spool"
   if [ -f "$sp" ] && grep -qxF "$line" "$sp"; then echo queued; fi
   return 0
+}
+
+# ── --turn: typed is not heard. `send` stops at the keyboard: rc 0 and silence meant "the Enter took", and on
+# 2026-09-16 that was said of three sessions sitting at a spend-limit wall (their turns died in 1-3 s having done
+# nothing) and of a review round that never reached its seat, which is how a held PR nearly expired. So a caller
+# that must KNOW — `cc <repo> <track> --say` — asks with --turn, and rc 0 then means a turn started on the text:
+# "a message to a running track … reach[es] a live turn or exit[s] non-zero saying why. None exits 0 on nothing."
+#   0 a turn started (the working footer, or the session's answer, under the echo of the text)
+#   3 kept in the spool, not typed: why on stderr (mid-turn, a dialog, somebody scrolling, a frozen pane) — the drain
+#     types it when the pane frees, so the caller must not send it again, but nobody has heard it yet
+#   4 typed, and the session answered with a model wall (a spend or usage limit, a login): nothing will run it
+#   5 typed, and no turn started inside TURN_WAIT — or the text still sits unsent in the input box, or its echo is not
+#     on the pane, so nothing drawn there can be tied to this message (review of #635, finding 7)
+# A name mid-handoff is relayed through cc-slack exactly as send() does it, and that is rc 3: handed on, no turn seen.
+# The wall is read ONLY below the echo of this message: a transcript that quotes a limit is text, not a wall.
+TURN_WAIT="${CC_MSG_TURN_WAIT:-12}"          # --turn: seconds a typed message has to start a turn
+TURN_POLL="${CC_MSG_TURN_POLL:-0.5}"         # …read every this often; a wall ends a turn in 1-3 s, so it is read too
+WALL_MARKS=("You've hit your" "You've reached your" 'switch models to continue' 'Please run /login' 'Login expired'
+            'Credit balance is too low')     # the CLI's own sentences (2.1.25x panes, 2026-09-16), not words a reply may use
+below_echo(){   # $1 pane  $2 the text as typed → the lines under the LAST echo of it, the wrapped rest of it dropped;
+  # rc 1 and nothing when no echo of it is on the pane. The text goes in through ENVIRON, not `awk -v`, which reads
+  # backslash escapes: a message holding `\n` never matched its own echo and the read ran over the whole screen (finding 15).
+  local head; head=$(printf '%s' "$2" | sed 's/^[[:space:]]*//'); head=${head:0:24}
+  [ -n "$head" ] || return 1
+  printf '%s\n' "$1" | BE_H="$head" BE_T="$2" awk '
+    BEGIN { h = ENVIRON["BE_H"]; t = ENVIRON["BE_T"] }
+    index($0, h) { n = 0; delete a; e = 1; next }
+    { s = $0; sub(/^[[:space:]│>❯]*/, "", s); sub(/[[:space:]│]*$/, "", s)
+      if (s != "" && index(t, s)) next; a[++n] = $0 }
+    END { if (!e) exit 1; for (i = 1; i <= n; i++) print a[i] }'
+}
+turn_seen(){   # $1 window id  $2 the text as typed → the verdict on stdout; rc 0 a turn · 4 a wall · 5 no turn
+  local end scr tail m l ech now foot=0
+  end=$(( $(date +%s%N) / 1000000 + ${TURN_WAIT%.*} * 1000 ))
+  while :; do
+    scr=$(tmux capture-pane -p -t "$1" 2>/dev/null); tail=$(below_echo "$scr" "$2"); ech=$?
+    [ "$ech" = 0 ] && for m in "${WALL_MARKS[@]}"; do
+      has "$m" "$tail" && { l=$(printf '%s\n' "$tail" | grep -F -- "$m" | tail -1 | sed 's/^[^A-Za-z0-9]*//' | cut -c1-160)
+                            echo "at a model wall: $l"; return 4; }
+    done
+    now=$(( $(date +%s%N) / 1000000 ))
+    # TEXT STILL IN THE BOX IS NO TURN, whatever else the pane shows: read first, so an earlier answer on the pane is
+    # never taken for this message's (finding 7). A TURN IS THE WORKING FOOTER, or the session's own reply ('⏺') under
+    # the echo — a short answer can start and end between two reads. The footer alone is not enough to stop: a wall
+    # prints after it, so a poll with time left goes on; but a footer seen and then gone with no wall under the echo is
+    # a turn that ran — a tool-only turn, or one whose reply scrolled the echo away (finding 14).
+    if unsent "$1" "$2"; then
+      [ "$now" -ge "$end" ] && { echo "typed but still sitting in the input box after every Enter"; return 5; }
+    elif has "$WORKING_MARK" "$scr"; then
+      foot=1; [ "$now" -ge "$end" ] && { echo "a turn started"; return 0; }
+    elif [ "$ech" = 0 ] && has '⏺' "$tail"; then echo "a turn started"; return 0
+    elif [ "$foot" = 1 ]; then echo "a turn ran (its working footer came and went)"; return 0
+    elif [ "$now" -ge "$end" ]; then
+      [ "$ech" = 0 ] || { echo "typed, but its echo is not on the pane, so no turn can be tied to it — unconfirmed after ${TURN_WAIT}s"; return 5; }
+      echo "typed and submitted, but no turn started within ${TURN_WAIT}s"; return 5
+    fi
+    sleep "$TURN_POLL"
+  done
+}
+send_turn(){   # $1 window  $2 text — send(), then the verdict --turn promises (above)
+  local id out sp line why st rc res
+  # MID-HANDOFF, THE SAME DOOR AS send() (findings 8 and 9): typing would reach whichever pane holds the name. cc-slack
+  # hands it to the live side, but nothing here can see that side's turn, so it is 3, never 0.
+  if res=$(handoff_relay "$1" "$2"); then
+    echo "cc-msg: main:$1 is mid-handoff — handed to its live side through cc-slack ($res), no turn confirmed (do not send it again)" >&2
+    return 3
+  fi
+  id=$(win_id "$1") || true
+  [ -n "$id" ] || { echo "cc-msg: no window main:$1 — nothing was sent" >&2; return 1; }
+  live_claude "$id" || { echo "cc-msg: main:$1 runs no interactive claude — nothing was sent" >&2; return 1; }
+  line=$(spool_add "$1" "$2") || { echo "cc-msg: could not spool for main:$1" >&2; return 1; }
+  drain_window "$1"
+  sp="$(sdir "$1")/inbox.spool"
+  if [ -f "$sp" ] && grep -qxF "$line" "$sp"; then
+    st=$(state "$1")
+    if in_copy_mode "$id"; then why="somebody is scrolling the pane (copy mode)"
+    elif [ -f "$(sdir "$1")/inbox.hung" ]; then why="the pane stopped taking keys"
+    elif [ -s "$(sdir "$1")/inbox.sat" ]; then why="an earlier message still sits unsent in its input box"
+    else case "$st" in
+      busy)   why="the session is mid-turn";;
+      dialog) why="a dialog stands: $(dialog_line "$(tmux capture-pane -p -t "$id" 2>/dev/null)")";;
+      *)      why="the pane did not take it ($st)";;
+    esac; fi
+    echo "cc-msg: queued for main:$1, not yet heard — $why; the drain types it when the pane frees (do not send it again)" >&2
+    return 3
+  fi
+  out=$(turn_seen "$id" "$(printf '%s' "$2" | tr '\n' ' ')"); rc=$?
+  [ "$rc" = 0 ] && return 0
+  echo "cc-msg: main:$1 $out" >&2; return "$rc"
 }
 
 # ── the read-only probe, and the one slash command a caller may ask a pane ────────────────────────
@@ -1113,6 +1210,9 @@ case "$1" in
                   if [ "$left" -gt 0 ]; then printf '%s\n' "$((left - 1))" > "$CC_FAKE_SWALLOW_F"
                   elif tail -1 "$CC_FAKE_SCREEN" 2>/dev/null | grep -q '^> .'; then
                     sed -i '$ s/^> //' "$CC_FAKE_SCREEN"; printf '> \n' >> "$CC_FAKE_SCREEN"; fi;; esac
+                # --turn: what the session draws once a submitted text starts its turn (printf %b, so \n splits lines)
+                case "$*" in *' Enter') [ -n "${CC_FAKE_TURN:-}" ] && [ ! -s "$CC_FAKE_SWALLOW_F" -o "$(cat "$CC_FAKE_SWALLOW_F" 2>/dev/null)" = 0 ] &&
+                  printf '%b\n' "$CC_FAKE_TURN" >> "$CC_FAKE_SCREEN";; esac
                 case "$*" in *Escape*) [ -n "${CC_FAKE_ESC_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac
                 case "$*" in *' 3') [ -n "${CC_FAKE_3_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac   # a digit that confirms on its own
                 case "$*" in *' Enter') [ -n "${CC_FAKE_ENTER_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac
@@ -1264,6 +1364,51 @@ STUB
   k "$(t sh -c "! grep -q '^notify' '$T/calls' && jq -e '.text == \"second\"' < '$SP'")" "…nothing said again, and 'second' still waits"
   scr "$FREE"; rm -f "$T/swallow"; "$T/bin/cc-msg" --drain "$W"   # a person pressed Enter: the box is empty again
   k "$(t sh -c "grep -q -- '-l -- second$' '$T/keys' && ! test -f '$SP' && ! test -f '$T/.cc/state/$W/inbox.sat'")" "…and once the box lets it go, the drain types 'second' and the stamp is gone"
+
+  # (1d) --turn: TYPED IS NOT HEARD (2026-09-16: rc 0 and silence for three sessions at a spend-limit wall, and a
+  # review round that never reached its seat). rc 0 only for a turn; every other ending is non-zero and says why.
+  tm(){ "$T/bin/cc-msg" --turn "$W" "$1" 2>"$T/err"; echo "rc=$?"; }
+  reset; scr "$FREE"; out=$(CC_FAKE_TURN='⏺ On it.' tm "start a turn")
+  k "$(t test "$out" = rc=0)" "--turn: a pane that answers under the echo is a turn started — rc 0, and nothing on stderr"
+  reset; scr "$FREE"; out=$(CC_FAKE_TURN='  ✻ Working… (esc to interrupt)' CC_MSG_TURN_WAIT=1 CC_MSG_TURN_POLL=0.2 tm "a long turn")
+  k "$(t test "$out" = rc=0)" "--turn: the working footer held to the end of the window is a turn too"
+  reset; scr "$FREE"; out=$(CC_FAKE_TURN="⎿ You've hit your monthly spend limit · switch models to continue this chat" tm "kick off")
+  k "$(t sh -c "[ '$out' = rc=4 ] && grep -q 'at a model wall: You.ve hit your monthly spend limit' '$T/err'")" "--turn: a session that answers with the spend-limit wall is rc 4 and named as a wall, not reported delivered"
+  reset; scr "$FREE"; CC_MSG_TURN_WAIT=1 CC_MSG_TURN_POLL=0.2 msg "plain send at a wall" >/dev/null; out=$?   # the kept side: plain send's contract is unchanged
+  k "$(t test "$out" = 0)" "…while a plain send (no --turn) keeps its old contract: rc 0 once the Enter took"
+  reset; scr "$(printf '%s\n' "> quote: You've hit your monthly spend limit" '⏺ that was a quote' "$FREE")"
+  out=$(CC_FAKE_TURN='⏺ Done.' tm "go on")
+  k "$(t test "$out" = rc=0)" "--turn: a wall QUOTED above the echo is transcript, not a wall — only what is drawn under this message counts"
+  reset; scr "$FREE"; out=$(CC_MSG_TURN_WAIT=1 CC_MSG_TURN_POLL=0.2 tm "nothing happens")
+  k "$(t sh -c "[ '$out' = rc=5 ] && grep -q 'no turn started within 1s' '$T/err'")" "--turn: submitted and nothing drew a turn inside the window is rc 5, said"
+  reset; scr "$FREE"; out=$(CC_FAKE_SWALLOW=99 CC_MSG_SUBMIT_TRIES=1 CC_MSG_TURN_WAIT=1 CC_MSG_TURN_POLL=0.2 tm "stuck in the box")
+  k "$(t sh -c "[ '$out' = rc=5 ] && grep -q 'still sitting in the input box' '$T/err'")" "--turn: text still sitting in the input box after every Enter is rc 5, said"
+  reset; scr "$PERM"; out=$(tm "behind a dialog")
+  k "$(t sh -c "[ '$out' = rc=3 ] && grep -q 'queued for main:$W, not yet heard — a dialog stands' '$T/err' && test -s '$SP'")" "--turn: behind a permission dialog is rc 3 (kept, not heard), the dialog named, the spool still holds it"
+  reset; scr "$BUSY"; out=$(tm "while busy")
+  k "$(t sh -c "[ '$out' = rc=3 ] && grep -q 'mid-turn' '$T/err'")" "--turn: a session mid-turn is rc 3, 'mid-turn'"
+  reset; scr "$FREE"; out=$(CC_FAKE_WIN='' tm "to nobody")
+  k "$(t sh -c "[ '$out' = rc=1 ] && grep -q 'no window main:$W — nothing was sent' '$T/err' && ! test -e '$SP'")" "--turn: a dead target (no window) is rc 1, 'nothing was sent', and nothing is spooled"
+  reset; scr "$FREE"; out=$(CC_FAKE_PROC=bash tm "to a shell")
+  k "$(t sh -c "[ '$out' = rc=1 ] && grep -q 'runs no interactive claude' '$T/err' && ! grep -q . '$T/keys'")" "--turn: a window whose claude is gone is rc 1, and not one key reaches the shell"
+  # (1e) review of #635. after_enter: once the Enter lands, wait $1 s and redraw the whole pane as $2.
+  after_enter(){ ( i=0; until grep -q Enter "$T/keys" 2>/dev/null || [ "$i" -ge 80 ]; do sleep 0.1; i=$((i+1)); done; sleep "$1"; scr "$2" ) & }
+  reset; scr "$(printf '%s\n' '⏺ an earlier answer' "$FREE")"
+  out=$(CC_FAKE_SWALLOW=99 CC_FAKE_PASTE=1 CC_MSG_SUBMIT_TRIES=1 CC_MSG_TURN_WAIT=1 CC_MSG_TURN_POLL=0.2 tm "a long message pasted in")
+  k "$(t sh -c "[ '$out' = rc=5 ] && grep -q 'still sitting in the input box' '$T/err'")" "--turn: a paste left folded in the box with an earlier answer on the pane is rc 5 — the old answer is not this message's turn (finding 7)"
+  reset; scr "$FREE"; after_enter 0.3 "$(printf '%s\n' '⏺ an earlier answer' "$FREE")"
+  out=$(CC_MSG_TURN_WAIT=2 CC_MSG_TURN_POLL=0.2 tm "echo goes missing"); wait
+  k "$(t sh -c "[ '$out' = rc=5 ] && grep -q 'echo is not on the pane' '$T/err'")" "--turn: with its echo gone from the pane, an answer on it is no proof — rc 5, unconfirmed (finding 7)"
+  reset; scr "$(printf '%s\n' "> quote: You've hit your monthly spend limit" "$FREE")"
+  out=$(CC_FAKE_TURN='⏺ Done.' tm 'C:\new\table is the path')
+  k "$(t test "$out" = rc=0)" "--turn: a text with backslashes finds its own echo, so a wall quoted above it is not read as one (finding 15)"
+  reset; scr "$FREE"; after_enter 0.6 "$FREE"
+  out=$(CC_FAKE_TURN='  ✻ Working… (esc to interrupt)' CC_MSG_TURN_WAIT=4 CC_MSG_TURN_POLL=0.2 tm "a tool-only turn"); wait
+  k "$(t sh -c "[ '$out' = rc=0 ] && ! grep -q 'no turn' '$T/err'")" "--turn: a working footer that came and went with no wall is a turn that ran — rc 0, not 'no turn' (finding 14)"
+  reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; out=$(tm "say mid-handoff")
+  k "$(t sh -c "[ '$out' = rc=3 ] && grep -q 'mid-handoff — handed to its live side through cc-slack (delivered), no turn confirmed' '$T/err' && grep -qF 'inject --no-start $W say mid-handoff' '$T/calls' && ! grep -qF 'say mid-handoff' '$T/keys'")" "--turn mid-handoff: relayed through cc-slack like a plain send, nothing typed, and rc 3, not 0 (findings 8 and 9)"
+  reset; scr "$FREE"; mkdir -p "$T/.cc/state/handoff"; : > "$T/.cc/state/handoff/demo--t1.json"; out=$(CC_FAKE_INJECT_RC=1 CC_FAKE_TURN='⏺ On it.' tm "relay down")
+  k "$(t sh -c "[ '$out' = rc=0 ] && grep -qF -- '-l -- relay down' '$T/keys'")" "…and when cc-slack does not take it, the keyboard, as send() does"
 
   # (2)+(3) the two known-safe prompts are ANSWERED with Escape (= keep what the session has) and then delivered
   reset; scr "$LIMIT"; msg "hello limit" >/dev/null
@@ -2033,7 +2178,8 @@ case "${1:-}" in
   --drain)    shift; drain "${1:-}";;
   --ask)      shift; ask "${1:?cc-msg: --ask needs a window}" "${2:?cc-msg: --ask needs a /command}";;
   --sweep)    sweep;;
+  --turn)     shift; w=${1:?cc-msg: --turn needs a window}; shift; send_turn "$w" "${*:-$(cat)}"; exit $?;;
   selfcheck)  selfcheck;;
-  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --drain [<window>] | cc-msg --sweep | cc-msg --ask <window> /cmd | cc-msg selfcheck' >&2; exit 2;;
+  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --turn <window> "text" | cc-msg --drain [<window>] | cc-msg --sweep | cc-msg --ask <window> /cmd | cc-msg selfcheck' >&2; exit 2;;
   *)          w=$1; shift; send "$w" "${*:-$(cat)}";;
 esac

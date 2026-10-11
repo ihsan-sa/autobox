@@ -4,7 +4,8 @@
 #   cc                        attach tmux "main"
 #   cc <repo>                 MAIN/planning session for ~/dev/<repo> (primary worktree, default branch) — refused for a
 #                             throwaway repo (`cc-throwaway new`), which has workers and never a seat
-#   cc <repo> <track>         TRACK session: own worktree + branch track/<track>, own context (created on first use)
+#   cc <repo> <track>         TRACK session: own worktree + branch track/<track>, own context (created on first use);
+#                             refused (exit 1) on a row that has landed — merged/done, or cc-land's note is its last
 #   cc claim <repo> <row> --executor subagent|worker   prepare the track and claim it, without starting a session
 #   cc <repo> <track> --session   …as a long-lived SESSION (board kind=session): a channel, not a task — never reconciled,
 #                             never "done", never RUNNING on the Home tab (e.g. a course-builder's per-course sessions)
@@ -26,7 +27,12 @@
 #                             --repair: the one way back into a row whose PR is out for landing (delivery-pending) —
 #                             cc-task reserves a repair of that PR at the worktree's HEAD, once per head, and the worker
 #                             pushes its fix onto the same branch and PR. A row with no open PR dispatches as usual
-#   cc <repo> <track> --say "text"           type text into that track's running interactive session
+#   cc <repo> <track> --say "text"           reach that track's running turn: its interactive session (cc-msg --turn), or its
+#                                            headless --go worker after its next tool call (cc-loop say). Exit 0 only once a
+#                                            turn took it; 1 nothing runs there, nothing sent · 2 a live worker loop whose spool
+#                                            would not take it (its lock held, or a planted name), nothing sent and no pane typed at ·
+#                                            3 kept, not yet heard · 4 the session is at a model wall · 5 typed, no turn started —
+#                                            each says why on stderr
 #   A MEMBER WORKSPACE'S SESSION (cc __runmember, and its handoff successor) runs on CC_MEMBER_MODEL (claude-sonnet-5): it routes
 #   and answers, and its tracks are --go workers on CC_WORKER_MODEL; before 2026-09-18 it inherited the interactive primary (Fable[1m]).
 #   --go and --say are both REFUSED while the project is parked (`cc-pause on <repo>`, or `!pause` in its channel);
@@ -46,7 +52,8 @@
 #   cc quick [doing|done] "…"  log a small task done without a track (Slack Home shows the last 24 h)
 #   cc done <repo> <track>    push + open a PR into the base branch, and post its PR card (printing the
 #                             card's `card: <channel> <ts>`); on a kind=session row it pushes and stops there —
-#                             a living project has no PR and is never done. Nothing here merges: for a repo that
+#                             a living project has no PR and is never done — and types READY TO LAND at the repo's
+#                             planning seat (cc-msg --turn); no turn took it = a cc-notify --ask request and exit 7; no request filed either = exit 6. Nothing here merges: for a repo that
 #                             lands itself (any not in CC_SELF_LAND_EXCEPT) it is cc-loop that queues the landing
 #                             Run inside ~/.cc/worktrees/<repo>/<track> the two names may be left off; a worktree made
 #                             by hand (no .cc/track) has the marker written first, and it says so
@@ -519,7 +526,7 @@ nolink(){   # A TRACK'S STATE DIR AND ITS WORKTREE'S .cc ARE BOUND READ-WRITE in
   local p; for p; do [ -L "$p" ] && { echo "cc: $p is a symlink — refused (nothing here writes through a planted name)"; return 1; }; done; return 0; }
 lock(){ mkdir -p "$(dirname "$1")"; nolink "$1" || exit 1; exec 9>>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
-usage(){ sed -n '2,61p' "$0"; }   # the whole header block, down to the `cc selfcheck` line — bump it when a line is added
+usage(){ sed -n '2,/^set -uo pipefail$/p' "$0" | sed '$d'; }   # the whole header block, up to the first line of code — no line count to bump
 
 # THE CLAIM. A row has one writer at a time, and which one is not a matter of who typed first: cc-task records the
 # owner off the running process and refuses a second live one (bin/cc-task says how it decides). Two steps, and
@@ -699,6 +706,45 @@ ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry
 # `addr_parts` splits and `sp_for` boots as itself, or that kind can never be handed off. Each case has a control —
 # the text taken away, the splitter it replaced, the three prompts held apart — so a case that stopped
 # discriminating is caught here rather than trusted.
+say_to(){   # $1 repo $2 track $3 window $4 text → the exit code `cc --say` returns (a function so `cc selfcheck` drives each route)
+  local lo rc
+  lo=$("$BIN/cc-loop" say "$1" "$2" "$4" 2>&1); rc=$?   # rc 1 = no live loop: nothing spooled, try the pane
+  # rc 2 is a LIVE loop whose spool would not take it (lock held past its wait, or a planted name): passed on as 2 with
+  # cc-loop's reason, never read as "no loop", which typed at the worker's shell and lost the reason (review of #635, 16).
+  [ "$rc" = 1 ] || { if [ "$rc" = 0 ]; then echo "$lo"; else echo "$lo" >&2; fi; return "$rc"; }
+  have_window "$3" && pane_live "$3" || { echo "cc: no running session or worker loop in $3 — nothing was sent (open it with: cc $1 $2, or dispatch one with --go)" >&2; return 1; }
+  "$BIN/cc-msg" --turn "$3" "$4"
+}
+own_window(){ [ -n "${TMUX_PANE:-}" ] && tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null; }   # the window this runs in, if any
+ready_tell(){   # $1 repo $2 track $3 where $4 the push remote ("" = none) → 0 when the repo's planning seat's turn took
+  # "ready to land", or when that seat is the one running this; else a durable request (cc-notify --ask) and 7, saying on
+  # stderr that nobody live heard it; 6 when that request could not be filed either, so nobody has been told and cc-loop
+  # stops on it. 7, not 3: `cc done` already exits 3 elsewhere, and cc-loop must not read another refusal as "pushed,
+  # note filed" (review of #635, findings 1 and 6). A function so `cc selfcheck` drives each route.
+  local m="READY TO LAND: $1/$2 — track/$2 $3 (a session row, so cc done opened no PR). Open its PR and land it."
+  # NO REMOTE, NO PR (finding 13): the branch is in the repo's own checkout, so say what the seat can do there.
+  [ -n "${4:-}" ] || m="READY TO LAND: $1/$2 — track/$2 $3 (a session row with no remote, so there is no PR to open). Merge it into the base branch in ~/dev/$1, or add a remote and run cc done $1 $2 again to push it."
+  # THE SEAT ITSELF RAN IT (finding 11): a subagent of the planning seat finishing a row it claimed. Typing at its own
+  # busy pane spooled the note to come back at itself later and filed a request besides; it is the reader, so print it.
+  [ "$(own_window)" = "$1" ] && { echo "cc done: this is $1's planning seat, so the note is yours — $m"; return 0; }
+  "$BIN/cc-msg" --turn "$1" "$m" >/dev/null 2>&1 && { echo "cc done: $1's planning seat took the ready-to-land note"; return 0; }
+  "$BIN/cc-notify" --ask -t "$1 ready to land" "$m" >/dev/null 2>&1 \
+    && { echo "cc done: no live planning turn in $1 took it — filed as a request for the control seat instead" >&2; return 7; }
+  echo "cc done: no live planning turn in $1 took it, and the request could not be filed — nobody has been told" >&2
+  return 6
+}
+finished_row(){   # $1 repo $2 track → 0 when the row is merged/done, or its last note (or the one before a loop's own
+  # "loop: …" line) says cc-land landed it — the row cc-land landed under a live loop kept status running (2026-09-22).
+  # A kind=session row is a living project and never finished, whatever its notes say: the seat landing its branch
+  # through cc-land must not lock it against `cc <repo> <track> --session` (review of #635, finding 10).
+  [ "$("$BOARD" get "$1" "$2" kind 2>/dev/null)" = session ] && return 1
+  local st; st=$("$BOARD" get "$1" "$2" status 2>/dev/null); case "$st" in merged|done) return 0;; esac
+  "$BOARD" get "$1" "$2" notes 2>/dev/null | python3 -I -c 'import sys, ast
+try: n = [x.get("msg", "") for x in ast.literal_eval(sys.stdin.read().strip() or "[]")]
+except Exception: sys.exit(1)
+if n and n[-1].startswith("loop:"): n = n[:-1]
+sys.exit(0 if n and n[-1].startswith("landed by cc-land") else 1)'
+}
 selfcheck(){
   local n=0 bad=0 rc D W R P M S trk mn orch none_t none_m none_o ctlm othm w line ft dup=0 dupw=0 dupr=0 dupp=0 dupm=0 dupl=0 wpid
   t(){ n=$((n+1)); [ "$2" = 0 ] && return 0; bad=$((bad+1)); printf 'FAIL %s\n' "$1"; }
@@ -1150,6 +1196,33 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   t "…and the brief's text is not pasted under it" "$rc"
   rc=0; case "$(STBASE="$T/pb" pr_body BRIEF r t)" in "cc-slackd needs a restart after merge"$'\n\n'"---"$'\n'"Brief: ~/.cc/state/r/t/task.md"$'\n\n'"---"$'\n'"Opened by cc from track t."*) ;; *) rc=1;; esac
   t "…and a brief with no Closes line adds none" "$rc"
+  # DELIVERED OR SAYS WHY (a-delivery-reaches-a-turn-or-says-why). Stub helpers in $T/sb answer with the rc a file
+  # names, and log what they were asked, so each route is driven on its own fixture — the dead target included.
+  mkdir -p "$T/sb"; for w in cc-loop cc-msg cc-notify; do
+    printf '#!/bin/bash\necho "%s $*" >> "%s/sb.log"; echo "%s said"; exit "$(cat "%s/%s.rc" 2>/dev/null || echo 0)"\n' "$w" "$T" "$w" "$T" "$w" > "$T/sb/$w"; chmod +x "$T/sb/$w"; done
+  sayc(){ : > "$T/sb.log"; echo "$1" > "$T/cc-loop.rc"; echo "$2" > "$T/cc-msg.rc"
+    ( BIN="$T/sb"; SAYW="$3"; have_window(){ [ "$SAYW" = live ]; }; pane_live(){ [ "$SAYW" = live ]; }; say_to r t "$3" hi ) 2>"$T/err" >/dev/null; }
+  sayc 0 0 dead; rc=$?; [ "$rc" = 0 ] && ! grep -q '^cc-msg' "$T/sb.log"; t "cc --say: a running --go worker's loop takes it (exit 0) and no pane is typed at" $?
+  sayc 3 0 dead; [ "$?" = 3 ] && grep -q 'cc-loop said' "$T/err"; t "…a loop that kept it for its next tool call is 3, saying so on stderr" $?
+  sayc 1 0 live; [ "$?" = 0 ] && grep -q '^cc-msg --turn live hi' "$T/sb.log"; t "…no loop but a live pane: cc-msg --turn types it, exit 0 once a turn took it" $?
+  sayc 1 4 live; [ "$?" = 4 ]; t "…the pane's model wall (cc-msg 4) is passed on, not turned into 0" $?
+  sayc 1 0 dead; [ "$?" = 1 ] && grep -q 'nothing was sent' "$T/err" && ! grep -q '^cc-msg' "$T/sb.log"; t "…a dead target (no loop, no live pane) is 1, says nothing was sent, and types nothing" $?
+  sayc 2 0 live; [ "$?" = 2 ] && grep -q 'cc-loop said' "$T/err" && ! grep -q '^cc-msg' "$T/sb.log"; t "…a live loop whose spool would not take it (cc-loop 2) is 2 with its reason, and the pane is not typed at" $?
+  rdy(){ : > "$T/sb.log"; echo "$1" > "$T/cc-msg.rc"; echo "$2" > "$T/cc-notify.rc"
+    ( BIN="$T/sb"; OWNW="${3:-}"; own_window(){ echo "$OWNW"; }; ready_tell r t "${4-pushed to origin}" "${5-origin}" ) 2>"$T/err" >"$T/out"; }
+  rdy 0 0; [ "$?" = 0 ] && grep -q '^cc-msg --turn r READY TO LAND' "$T/sb.log" && ! grep -q '^cc-notify' "$T/sb.log"; t "cc done on a session row: the repo's planning turn takes READY TO LAND (0), no request filed" $?
+  rdy 5 0; [ "$?" = 7 ] && grep -q '^cc-notify --ask' "$T/sb.log" && grep -q 'filed as a request' "$T/err"; t "…no planning turn took it: filed as a request, and 7 saying so" $?
+  rdy 1 1; [ "$?" = 6 ] && grep -q 'nobody has been told' "$T/err"; t "…and a dead planning seat with no request route is 6 (not 7) saying nobody was told" $?
+  rdy 3 0 r; [ "$?" = 0 ] && [ ! -s "$T/sb.log" ] && grep -q "this is r's planning seat.*READY TO LAND: r/t" "$T/out"; t "…run from r's own planning seat: the note is printed for it (0), nothing typed at its own pane, no request filed" $?
+  rdy 3 0 other; [ "$?" = 7 ] && grep -q '^cc-msg --turn r READY' "$T/sb.log"; t "control: from another window it still goes to r's seat, then a request" $?
+  rdy 0 0 "" "committed in ~/dev/r" ""; [ "$?" = 0 ] && grep -q 'no PR to open.*Merge it into the base branch in ~/dev/r, or add a remote' "$T/sb.log" && ! grep -q 'Open its PR' "$T/sb.log"; t "…with no remote the note says there is no PR and what the seat can do instead" $?
+  printf '#!/bin/bash\ncase "$4" in status) cat "%s/bs";; notes) cat "%s/bn";; kind) cat "%s/bk";; esac\n' "$T" "$T" "$T" > "$T/sb/board"; chmod +x "$T/sb/board"
+  fin(){ echo "$1" > "$T/bs"; echo "$2" > "$T/bn"; echo "${3:-task}" > "$T/bk"; ( BOARD="$T/sb/board"; finished_row r t ); }
+  fin done "[]"; t "a merged/done row counts as finished: an interactive open is refused" $?
+  fin running "[{'ts': 'x', 'msg': 'landed by cc-land: PR #1'}, {'ts': 'y', 'msg': 'loop: DONE'}]"; t "…as does a running row cc-land landed under a live loop (its note, then the loop's)" $?
+  fin running "[{'ts': 'x', 'msg': 'landed by cc-land: PR #1'}, {'ts': 'y', 'msg': 'reopened: a follow-up'}]"; [ "$?" = 1 ]; t "control: a landed row reopened by a note opens again" $?
+  fin running "[{'ts': 'x', 'msg': 'dispatched headless worker (loop 2)'}]"; [ "$?" = 1 ]; t "control: a running row with no landing opens" $?
+  fin running "[{'ts': 'x', 'msg': 'landed by cc-land: PR #1'}]" session; [ "$?" = 1 ]; t "a kind=session row whose branch cc-land landed is a living project: it opens again" $?
   printf 'cc selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]
 }
@@ -1425,7 +1498,11 @@ case "${1:-}" in
       # finished by a `cc done` typed at it (2026-09-04). It still delivers; it just does not close.
       where="committed in ~/dev/$repo"; [ -n "$rem" ] && where="pushed to $rem"
       "$BOARD" note "$repo" "$track" "cc done: track/$track $where — a session row is a living project, so its status is untouched" >/dev/null 2>&1 || true
-      echo "delivered: track/$track $where. $repo/$track is a session row (a living project, not a task) — no PR, and its status is unchanged."; exit 0; fi
+      echo "delivered: track/$track $where. $repo/$track is a session row (a living project, not a task) — no PR, and its status is unchanged."
+      # A branch nobody is told about is a lesson that sat unlanded 47 min (raised-session-row-ready-to-land-wakes-nobody):
+      # a workspace with no remote is delivered by its commit alone; anything else is the planning seat's to land.
+      if member_workspace "$repo" && [ -z "$rem" ]; then exit 0; fi
+      ready_tell "$repo" "$track" "$where" "$rem"; exit $?; fi
     if member_workspace "$repo" && [ -n "$rem" ]; then
       # gh resolves a bare `pr create` against `origin`, which for a workspace's SECOND project is another
       # project's repository — so pin it to the one just pushed to. And a repository that has only ever
@@ -1628,7 +1705,7 @@ PY
   __runorch)  # internal: peer orchestrator session in the primary worktree, addressable in Slack by alias
     repo="$2"; alias="$3"; brief="${4:-}"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp=$(sp_orch "$repo" "$alias" "$base")
-    export CC_SLACK_ALIAS="$alias"
+    export CC_SLACK_ALIAS="$alias" CC_ORCH_REPO="$repo"   # cc-loop keys a dispatched worker's STOP/DONE to <this repo>@<alias>
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); mapfile -t EF < <(orch_effort_args "$alias"); chan_accept "$repo@$alias"; start_check "$repo@$alias"
     ft=$(sp_first "$repo" "$alias" "$brief")   # the purpose, as the session's own first turn — see sp_first
     crashed="${CC_SLACK_DIR:-$HOME/.cc/slack}/orch-crashed/$repo@$alias"; rm -f "$crashed"   # a restarted orch is live again
@@ -1707,7 +1784,10 @@ fi
 [ -n "$SESS" ] && { "$BOARD" set "$repo" "$track" kind session || exit 1; }
 case "$mode" in
   say) "$BIN/cc-pause" is "$repo" 2>/dev/null && { echo "cc: $repo is paused — \`cc-pause off $repo\` first"; exit 1; }   # typing at a session is a turn it spends
-       have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
+       # TYPED IS NOT HEARD (a-message-is-delivered-or-it-is-not): exit 0 only once a turn took the text. A pane gets
+       # cc-msg --turn (3 queued · 4 a model wall · 5 no turn); a headless --go worker has no pane, and gets cc-loop say
+       # (0 its running turn took it · 3 kept for its next tool call or iteration). Each non-zero exit says why.
+       say_to "$repo" "$track" "$win" "$text"; exit $? ;;
   go)  if inside; then   # INSIDE the boundary: no tmux, no ledger. The brief is written here (this state dir is the workspace's own);
          # the launch is brokered — the daemon runs `cc <h> <track> --go ""` on the host: budget gate, window and boundary included.
          write_brief || exit 1; exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}" ${REPAIR:+--repair}; fi
@@ -1749,7 +1829,7 @@ case "$mode" in
          "${CC_SLACK:-$BIN/cc-slack}" track-thread "$repo/$track" --title "$("$BOARD" get "$repo" "$track" title 2>/dev/null)" >/dev/null 2>&1 || true; fi
        xq=""; [ ${#XTRA[@]} -gt 0 ] && xq=$(printf ' %q' "${XTRA[@]}")   # printf %q with no argument emits '' — cc-loop would see an empty arg
        lock "$st/.lock"; [ -n "$(win_id "$win")" ] && tmux kill-window -t "$(win_id "$win")"
-       pre=""; for v in CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_FAILURES CC_WORKER_SANDBOX CC_EGRESS_ALLOW CC_WORKER_MODEL CC_LOOP_TRIM CC_SPEND_TIER CC_ROOM_DIR CC_WORKER_CAP CC_WORKER_PACE_MARGIN LANDER_LOADAVG LANDER_PSI_DIR CC_SLACK_ALIAS; do   # CC_ROOM_DIR, the two room keys and the load it reads (LANDER_*): `cc-room admit` in the window asks them again; CC_SLACK_ALIAS: the orch dispatching this, which cc-loop records for its stop notice and unsets before the worker runs   # tests: the new tmux window has the server's env, not ours — carry the log-only flag (or the worker's DONE notice really posts) and the run's own log/stamp/ledger (or a fixture loop's stop is recorded as the box's own)
+       pre=""; for v in CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_FAILURES CC_WORKER_SANDBOX CC_EGRESS_ALLOW CC_WORKER_MODEL CC_LOOP_TRIM CC_SPEND_TIER CC_ROOM_DIR CC_WORKER_CAP CC_WORKER_PACE_MARGIN LANDER_LOADAVG LANDER_PSI_DIR CC_SLACK_ALIAS CC_ORCH_REPO; do   # CC_ROOM_DIR, the two room keys and the load it reads (LANDER_*): `cc-room admit` in the window asks them again; CC_SLACK_ALIAS: the orch dispatching this, which cc-loop records for its stop notice and unsets before the worker runs   # tests: the new tmux window has the server's env, not ours — carry the log-only flag (or the worker's DONE notice really posts) and the run's own log/stamp/ledger (or a fixture loop's stop is recorded as the box's own)
          # …and every knob a person sets in FRONT of the dispatch (CC_WORKER_MODEL, CC_LOOP_TRIM): off this list the
          # variable never reaches the window, cc-config silently reads ~/.cc/config instead, and the run is the
          # opposite of what was asked for — in both directions, which is what would corrupt a shadow-week A/B.
@@ -1791,6 +1871,10 @@ esac
 lock "$st/.lock"
 if have_window "$win" && ! pane_live "$win"; then tmux kill-window -t "$(win_id "$win")"; fi   # dead window (claude exited, `exec bash`): recreate instead of attaching to a shell
 if ! have_window "$win"; then
+  # A LANDED ROW HAS NOTHING TO DO: a fresh session opened on one sat idle and cost three planning turns to prove it
+  # (raised-a-finished-row-got-a-fresh-session-with-nothing-to-do). A liveness probe is `cc ls`, not an open.
+  if finished_row "$repo" "$track"; then unlock
+    echo "cc: $repo/$track has landed — no session opened. Use cc ls to see what runs; to work on it again, reopen it on the board first (status running, and a note saying why)" >&2; exit 1; fi
   if member_workspace "$repo"; then inside && { echo "cc: inside the boundary a track session is opened from Slack (the track's thread in #$repo) or by the owner, not from here"; exit 1; }
     member_credential "$repo" "$track" || { unlock; exit 1; }   # no credential: no window, and the row below never says running
     tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf 'CC_CLAUDE=%q %q __runmember %q %q %q' "$CLAUDE" "$SELF" "$repo" "$track" "$CONT")"   # the boundary

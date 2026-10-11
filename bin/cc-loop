@@ -96,7 +96,11 @@
 # A STOP IS ADDRESSED TO THE SESSION THAT DISPATCHED THE TRACK — an orch when one did (`<repo>@<alias>`, the broker's
 # own key for it), the repo seat only when none is recorded. The record is $ST/orch, written by this loop at start from
 # CC_SLACK_ALIAS, which an orch's shell exports and `cc … --go` carries into the loop's window; a dispatch with none
-# removes it (that dispatcher is the repo seat), and the variable is unset before the worker runs.
+# removes it (that dispatcher is the repo seat), and the variable is unset before the worker runs. The key is the ORCH'S
+# repo, not the track's (CC_ORCH_REPO, else the one live `<x>@<alias>` window): an orch dispatching into another repo is
+# still `<its repo>@<alias>` (orch_record). A DONE is told to the same key, once, by done_card (done_heard says whether
+# anyone heard it). cc-broker's rc 0 means SENT, not heard: a stop or DONE sent to a key with no open seat window is
+# logged as unheard (and a stop is filed as a request), never passed off as delivered.
 # A STOP THAT IS A FAILURE IS WRITTEN TO THE FAILURES LEDGER BY THE LOOP, at the moment it stops (stop_record; design-failure-noticing
 # phase 2, "signals kept at their producers"): exits 5 6 9 10 as worker-loop/barren-stop, 4 12 as worker-loop/done-undelivered, 8 as
 # worker-loop/limit-outlasted-wait — one record per stop, through `cc-green red`, with a bounded excerpt of loop.log that outlives the
@@ -415,7 +419,8 @@ done_card(){ local s="" id; [ -n "$1" ] && s="The PR is $1."; [ -n "$2" ] && s="
   # THE THREAD AND THE SEAT, one line each: the title routes the card into the track's own thread, and the seat that
   # dispatched it gets the same line by the broker (a digest, not a page) — a DONE used to reach the -updates lane
   # only, and a finished track sat unseen (a-finished-worker-reaches-its-thread, 2026-09-20).
-  tell_planner "$(planner_line done "$(row_title). ${s:-It finished without a PR.}")" || true
+  local told=0; tell_planner "$(planner_line done "$(row_title). ${s:-It finished without a PR.}")" || told=$?
+  done_heard "$told"   # the verdict on that one line: no second inject (done_heard)
   # ONE CARD PER PR (per commit without one): a fix round that ends DONE on the same PR again posts nothing new.
   if [ -n "$1" ]; then id="pr${1##*/}"; else id=$(git -C "${WT:-.}" rev-parse --short HEAD 2>/dev/null); fi
   # The card's bold line is the row title alone; its body says in plain words that it finished, and names the PR.
@@ -435,12 +440,46 @@ stop_headline(){ local said="$1" h
   h="$(row_title) $said"; printf '%s\n' "${h^}"; }
 # WHO THIS TRACK ANSWERS TO. `<repo>` is the session that dispatched it — the same target cc-reconcile's board
 # watchdog uses, so the planner's events all arrive by one door.
-orch_record(){   # written ONCE at start: the orch this loop was dispatched by (CC_SLACK_ALIAS in the dispatch environment), or no file
-  if [ -n "${CC_SLACK_ALIAS:-}" ]; then printf '%s\n' "$CC_SLACK_ALIAS" > "$ST/orch"; else rm -f "$ST/orch"; fi; }
+seat_windows(){ tmux list-windows -t main -F '#W' 2>/dev/null | sort -u; }   # the box's live seats: cc names each window by its broker key
+                                                                            # (`<repo>` a repo seat, `<repo>@<alias>` an orch); grouped sessions repeat, hence sort -u
+orch_record(){   # written ONCE at start: the orch this loop was dispatched by, as its OWN broker key `<orchrepo>@<alias>`, or no file.
+                 # The alias is CC_SLACK_ALIAS, which an orch's shell exports (cc __runorch); the orch's repo is CC_ORCH_REPO when the
+                 # dispatcher carries it, else the one live `<x>@<alias>` window. An orch in study-coach dispatching into lesson-builder
+                 # is study-coach@<alias>, not lesson-builder@<alias>, which nobody owns. No unique answer: the alias alone, the old key.
+  local a="${CC_SLACK_ALIAS:-}" r="${CC_ORCH_REPO:-}"
+  [ -n "$a" ] || { ORCH_KEY=""; rm -f "$ST/orch"; return 0; }
+  if [ -z "$r" ]; then r=$(seat_windows | awk -F@ -v a="$a" 'NF==2 && $2==a && $1!="" {print $1}'); [ "$(grep -c . <<<"$r")" = 1 ] || r=""; fi
+  ORCH_KEY="${r:+$r@}$a"; printf '%s\n' "$ORCH_KEY" > "$ST/orch"; }
+ORCH_KEY=""   # what orch_record wrote, held by THIS process: $ST/orch is writable by the worker, so the file is trusted less
 stop_target(){   # the broker key a stop goes to: "a track dispatched by an orch has its stop notice addressed to that orch's alias,
-                 # the repo seat only when none is recorded" (the brief). cc's own alias grammar; a file holding anything else is the repo seat.
-  local a; a=$(head -1 "${ST:-/nonexistent}/orch" 2>/dev/null | tr -d '[:space:]')
-  if [[ "$a" =~ ^[a-z0-9-]{2,20}$ ]]; then printf '%s@%s\n' "$repo" "$a"; else printf '%s\n' "$repo"; fi; }
+                 # the repo seat only when none is recorded" (the brief). A record `<orchrepo>@<alias>` is used as it is; a bare alias
+                 # (an older record, or no orch repo found) is `<track repo>@<alias>`; anything else is the repo seat.
+                 # ANOTHER REPO'S ORCH ONLY FROM THIS PROCESS'S OWN ORCH_KEY. Read back from the file (a host-side
+                 # `member-stop`, or a record the worker rewrote) the key is pinned to this repo: `<x>@<alias>` there
+                 # is `<track repo>@<alias>`, so a planted record cannot aim a stop at another repo's seat (review of #635).
+  local a; a="${ORCH_KEY:-$(head -1 "${ST:-/nonexistent}/orch" 2>/dev/null | tr -d '[:space:]')}"
+  if [ -n "$ORCH_KEY" ] && [[ "$a" =~ ^[A-Za-z0-9._-]+@[a-z0-9-]{2,20}$ ]]; then printf '%s\n' "$a"
+  elif [[ "$a" =~ ^[A-Za-z0-9._-]+@([a-z0-9-]{2,20})$ ]]; then printf '%s@%s\n' "$repo" "${BASH_REMATCH[1]}"
+  elif [[ "$a" =~ ^[a-z0-9-]{2,20}$ ]]; then printf '%s@%s\n' "$repo" "$a"; else printf '%s\n' "$repo"; fi; }
+target_live(){ grep -qxF -- "$1" <<<"$(seat_windows)"; }   # $1 a broker key -> 0 a seat window of that name is open (no pipe: grep -q
+                                                            # quitting early SIGPIPEs the writer, and under pipefail a live seat read as dead)
+# WHAT "HEARD" MEANS. cc-broker's inject prints `delivered` and exits 0 for anything it takes, whether or not a session is
+# there (it holds and retries), so rc 0 is "sent to the broker", never proof a session read it. The loop adds the one
+# thing it can see: whether a window for that key is open. Sent to a key with no window is reported as unheard, never silent.
+# ONE BROKER CALL PER DONE: done_card's own tell_planner is the line the seat or orch gets, and this only says whether it
+# was heard. A second inject of its own made an orch hear every DONE twice (review of #635, findings 2 and 19).
+done_heard(){   # $1 tell_planner's rc for the DONE line done_card just sent → the liveness verdict on it, logged; a DONE
+                # sent to a recorded orch nobody could hear is a board note too. No orch recorded: the repo seat's line and the card.
+  # INSIDE A MEMBER BOUNDARY the broker is never asked (tell_planner), and the card goes out by the workspace's own socket,
+  # which the host relays (cc-slack escalate) — so "nobody heard it" would be false there (review of #635, finding 12).
+  inside_boundary && { log "DONE: inside the member boundary the broker is not asked; the card goes out by the workspace's relay"; return 0; }
+  [ -s "${ST:-/nonexistent}/orch" ] || { log "DONE: no orch recorded, so the repo seat's broker line and the card carry it"; return 0; }
+  local tg w; tg=$(stop_target)
+  if [ "$1" = 0 ]; then
+    target_live "$tg" && { log "DONE sent to the broker for $tg, whose session is live"; return 0; }
+    w="DONE sent to the broker for $tg, but no session is live there — nobody has heard it"
+  else w="DONE: nobody heard it — the broker would not take it for $tg"; fi
+  log "$w"; "$BOARD" note "$repo" "$track" "$w" >/dev/null 2>&1; return 0; }
 # A THROWAWAY REPO (cc-throwaway: a harness benchmark's hb-N) HAS NOBODY TO TELL. It has no seat, and its stops and
 # DONEs are the benchmark's to read off the board and loop.log: five hb-N runs each left a done-undelivered record
 # (one false recurring cluster) and the pulse started a seat for each, live 9 h after the repos were deleted.
@@ -466,13 +505,15 @@ stop_unheard(){   # a stop NO session took: "a request that reached no seat is p
                   # asked again is a new request): a seat usually answers a stop by relaunching the track, which closes
                   # nothing, so a stable id would leave the first stop open and swallow every later one as its dedup.
   "$BIN/cc-notify" --ask --id "stop:$repo/$track:$(date -u +%Y%m%dT%H%MZ)" -t "$repo/$track $1" "$2" >/dev/null 2>&1; }   # its exit: 0 filed, else nobody has it
-stop_route(){   # $1 heard (yes|no) · $2 title · $3 message → the log line saying where the stop went, filing the request when no session took it.
+stop_route(){   # $1 heard (sent|yes: a live seat has it · dead: the broker took it for a key with no live seat · no: nobody took it)
+                # · $2 title · $3 message → the log line saying where the stop went, filing the request when no session took it.
                 # Inside a member boundary the broker is never asked, so it read "session: no" while the request reached the planning
                 # seat within a minute and the workspace's own seat heard nothing (a member track, 2026-09-27): the line says both now,
                 # and the host's escalate relay hands that seat the line (cc-slack, raised-a-spend-limit-stop-reaches-no-one).
-  [ "$1" = yes ] && { printf "the stop went to %s's session: yes\n" "$(stop_target)"; return 0; }
+  case "$1" in sent|yes) printf "the stop went to %s's session: yes, whose session is live\n" "$(stop_target)"; return 0;; esac
   local r=no; stop_unheard "$2" "$3" && r=yes
-  printf "the stop went to %s's session: no — filed as a request for the planning seat%s: %s\n" "$(stop_target)" \
+  printf "the stop went to %s's session: no%s — filed as a request for the planning seat%s: %s\n" "$(stop_target)" \
+    "$([ "$1" = dead ] && printf " (the broker took it, but no session is live there, so nobody has heard it)")" \
     "$([ "${CC_MEMBER_SANDBOX:-}" = 1 ] && printf ", whose relay hands %s's own seat the line" "$repo")" "$r"; }
 stop_kind(){ case "$1" in 5|6|9|10) echo worker-loop/barren-stop;; 4|12) echo worker-loop/done-undelivered;; 8) echo worker-loop/limit-outlasted-wait;; *) :;; esac; }
 stop_record(){   # $1 exit code, $2 title, $3 message → one failures-ledger record for a stop that is a failure (stop_kind), none for the rest.
@@ -509,6 +550,139 @@ tier_hold(){   # $1 start|continue · $2 repo/track -> 0 the spend tier says thi
                # cc-tier on this box, a crash — is "go", the same leniency `cc-pause is` gets: a tier that cannot be
                # read must never be the reason a worker stops.
   "$BIN/cc-tier" allows "$1" "$2" >/dev/null 2>&1; [ $? = 1 ]; }
+# A RUNNING WORKER HAS A WAY IN. A headless `claude -p` has no pane to type at, and until 2026-09-24 the one documented
+# route answered "no running session" about a worker two minutes into an $8 iteration while a member's missing archive
+# sat unread (raised-cannot-message-a-running-worker). Now `cc <repo> <track> --say` hands the text to `cc-loop say`,
+# which spools it in $ST/say.spool; the worker's claude runs with a PostToolUse hook (`cc-loop inbox-hook $ST`, passed
+# with --settings) that hands the whole spool to the model as context after its next tool call, and moves it to
+# say.read with the time it was taken. A spool the iteration ended without taking opens the next iteration's prompt.
+# `say` waits SAY_WAIT for the take and says which happened: 0 taken by the live turn, 3 kept for the next tool call or
+# iteration (the loop is live, nobody has read it yet), 1 no live loop — nothing was spooled, and the line says so,
+# 2 the loop is live but its spool would not take the message (its lock held past SAY_LOCK_WAIT, or a planted name) —
+# nothing was sent, and cc must not read it as "no loop" and fall through to a pane (review of #635, finding 16).
+# EACH MESSAGE CARRIES ITS OWN ID, and `say` waits for THAT id in say.read: matching the text and the second it was sent
+# acked a message still in the spool off two older records (review of #635, finding 5).
+# The loop is live when $ST/loop.pid names a running cc-loop for this very track (loop_live): written at start,
+# removed on the way out, and a pid reused by something else is not the loop. A member workspace's loop writes a pid
+# from inside its sandbox's pid namespace, so for it any host process whose argv has `cc-loop <h> <t>` is the proof: cc
+# launches it as ONE `bash -c` string (its tmux window) and cc-sandbox execs bwrap, so an argv element holding spaces is
+# read as its words. Matched word by word, never as a regex a `.` in a track name would widen (review of #635, finding 17).
+# THE STATE DIR IS THE MEMBER'S TO WRITE. It is bound read-write into a member's boundary and a worker's sandbox, and
+# `cc --say` runs on the host as the owner: a `9>` on a planted `.say.lock -> ~/.cc/config` emptied that file before
+# flock ran (review of #635, findings 3 and 4). So say.spool, say.read, .say.lock and loop.pid are opened by say_io
+# alone: the dir through an O_NOFOLLOW directory descriptor, each file under it O_NOFOLLOW|O_NONBLOCK, kept only if it
+# is a regular file with one name, never truncated on open (the lock is O_APPEND; a write truncates only after that
+# check). A planted name is refused and said, and nothing is written through it.
+SAY_WAIT="${CC_SAY_WAIT:-45}"
+say_io(){   # $1 op  $2 the state dir  … → see the ops below; rc 1 "no/none", 2 refused or the lock was not had
+  python3 -I - "$@" <<'PY'
+import errno, fcntl, json, os, random, stat, sys, time
+op, st = sys.argv[1], sys.argv[2]
+class Refused(Exception): pass
+def say(m): sys.stderr.write("cc-loop: %s\n" % m)
+try:
+    dfd = os.open(st, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+except OSError as e:
+    if op in ("live", "take", "acked", "pidrm"): sys.exit(1)
+    say("%s is not a plain directory (%s) — refused, nothing written" % (st, e.strerror)); sys.exit(2)
+def fopen(name, flags, create=False):   # st/name, never through a link: a regular file with one name, or None when absent
+    try:
+        fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | (os.O_CREAT if create else 0), 0o600, dir_fd=dfd)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        if e.errno == errno.ELOOP: raise Refused("%s/%s is a symlink — refused (nothing here opens a planted name)" % (st, name))
+        raise Refused("%s/%s cannot be opened (%s) — refused" % (st, name, e.strerror))
+    s = os.fstat(fd)
+    if not stat.S_ISREG(s.st_mode) or s.st_nlink != 1:
+        os.close(fd); raise Refused("%s/%s is not a plain file — refused" % (st, name))
+    return fd
+def text(name):
+    fd = fopen(name, os.O_RDONLY)
+    if fd is None: return ""
+    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f: return f.read()
+def lock():   # the spool's lock, held to exit; None when it was not had inside SAY_LOCK_WAIT
+    fd = fopen(".say.lock", os.O_WRONLY | os.O_APPEND, create=True)
+    end = time.time() + float(os.environ.get("CC_SAY_LOCK_WAIT", "5"))
+    while True:
+        try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); return fd
+        except BlockingIOError:
+            if time.time() >= end: return None
+            time.sleep(0.1)
+def argv(p):
+    try:
+        with open("/proc/%s/cmdline" % p, "rb") as f: return [a.decode("utf-8", "replace") for a in f.read().split(b"\0")[:-1]]
+    except OSError: return []
+def is_(a, name): return a == name or a.endswith("/" + name)
+try:
+    if op == "live":   # → 0 a cc-loop for this very track runs: its loop.pid, or (a member's) the host's cc-sandbox for it
+        r, t = os.path.basename(os.path.dirname(st.rstrip("/"))), os.path.basename(st.rstrip("/"))
+        p = (text("loop.pid").split() or [""])[0]
+        if p.isdigit():
+            a = argv(p)
+            if any(is_(x, "cc-loop") and a[i + 1:i + 3] == [r, t] for i, x in enumerate(a)): sys.exit(0)
+        for q in os.listdir("/proc"):   # a member's loop: the host's `bash -c '… cc-loop r t …'` (cc's tmux window) or bwrap's argv
+            if not q.isdigit(): continue
+            w = [y for x in argv(q) for y in (x.split() if any(c.isspace() for c in x) else [x])]   # one string is words too
+            if any(is_(x, "cc-loop") and w[i + 1:i + 3] == [r, t] for i, x in enumerate(w)): sys.exit(0)
+        sys.exit(1)
+    if op == "pidw":   # $3 the pid → loop.pid holds it
+        fd = fopen("loop.pid", os.O_WRONLY, create=True); os.ftruncate(fd, 0); os.write(fd, ("%s\n" % sys.argv[3]).encode()); sys.exit(0)
+    if op == "pidrm":   # $3 the pid → loop.pid is gone when it still names that pid (a link is not followed, only refused)
+        if (text("loop.pid").split() or [""])[0] == sys.argv[3]: os.unlink("loop.pid", dir_fd=dfd)
+        sys.exit(0)
+    if op == "send":   # $3 from  $4 text → the message's id on stdout, appended to say.spool under the lock
+        lk = lock()
+        if lk is None: say("the spool lock of %s was held past %ss" % (st, os.environ.get("CC_SAY_LOCK_WAIT", "5"))); sys.exit(2)
+        mid = "%x-%d-%06x" % (time.time_ns(), os.getpid(), random.getrandbits(24))
+        line = json.dumps({"id": mid, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "from": sys.argv[3], "text": sys.argv[4]}, ensure_ascii=False)
+        fd = fopen("say.spool", os.O_WRONLY | os.O_APPEND, create=True); os.write(fd, (line + "\n").encode()); print(mid); sys.exit(0)
+    if op == "take":   # → the spooled messages as one block on stdout, moved to say.read with the time taken; none: rc 1
+        if not text("say.spool").strip(): sys.exit(1)
+        if lock() is None: sys.exit(1)
+        sp = fopen("say.spool", os.O_RDWR)
+        if sp is None: sys.exit(1)
+        with os.fdopen(os.dup(sp), "r", encoding="utf-8", errors="replace") as f: raw = f.read()
+        msgs = []
+        for l in raw.splitlines():
+            try: m = json.loads(l)
+            except ValueError: continue
+            if isinstance(m, dict): msgs.append(m)
+        if not msgs: os.ftruncate(sp, 0); sys.exit(1)
+        taken = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rd = fopen("say.read", os.O_WRONLY | os.O_APPEND, create=True)
+        os.write(rd, "".join(json.dumps(dict(m, taken=taken), ensure_ascii=False) + "\n" for m in msgs).encode())
+        os.ftruncate(sp, 0)
+        print("\n".join("[%s from %s] %s" % (m.get("at", ""), m.get("from", ""), m.get("text", "")) for m in msgs)); sys.exit(0)
+    if op == "acked":   # $3 the id → 0 say.read holds that very message as taken
+        for l in text("say.read").splitlines():
+            try: m = json.loads(l)
+            except ValueError: continue
+            if isinstance(m, dict) and m.get("id") == sys.argv[3] and m.get("taken"): sys.exit(0)
+        sys.exit(1)
+    say("say_io: unknown op %s" % op); sys.exit(2)
+except Refused as e:
+    say(str(e)); sys.exit(2 if op in ("send", "pidw") else 1)
+PY
+}
+loop_live(){ say_io live "$1"; }   # $1 the state dir → 0 while a cc-loop for it runs
+say_take(){ say_io take "$1"; }    # $1 the state dir → the spooled messages as one block on stdout (none: rc 1), moved to say.read
+inbox_hook(){   # $1 the state dir. PostToolUse: stdin is the hook's JSON (unread); stdout gives the model its messages
+  cat >/dev/null; [ -s "$1/say.spool" ] || exit 0   # every tool call runs this: nothing spooled starts no python
+  local m; m=$(say_take "$1") || exit 0
+  jq -n --arg c "MESSAGE FROM YOUR DISPATCHER, arriving while you work — read it now and let it change what you do next:
+$m" '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $c}}'; exit 0; }
+say_send(){   # $1 repo  $2 track  $3 text → the verdict above, and its rc
+  local st="$HOME/.cc/state/$1/$2" id n=0
+  loop_live "$st" || { echo "cc-loop: no live worker loop for $1/$2 — nothing was sent (its brief is $st/task.md; a new dispatch reads it)" >&2; return 1; }
+  id=$(say_io send "$st" "${CC_MSG_FROM:-$(ps -o comm= -p "$PPID" 2>/dev/null)}" "$3") \
+    || { echo "cc-loop: the loop for $1/$2 is live, but its spool did not take the message — nothing was sent (reason above)" >&2; return 2; }
+  while [ "$n" -lt "$SAY_WAIT" ]; do
+    say_io acked "$st" "$id" && { echo "taken by the running worker"; return 0; }
+    loop_live "$st" || break; sleep 1; n=$((n + 1)); done
+  if loop_live "$st"; then echo "cc-loop: kept for $1/$2, not yet heard — its worker made no tool call in ${SAY_WAIT}s; its next tool call or iteration takes it (do not send it again)" >&2
+  else echo "cc-loop: kept for $1/$2, not yet heard — the loop ended before its worker took it; the next dispatch's first iteration takes it" >&2; fi
+  return 3; }
 green_wait(){   # a cc-green run on THIS worktree still going when the iteration ended → wait it out here, journal its result, return 0; none → 1
   # "a live cc-green run of its own = not idle" (the brief). `cc-green wait` answers 3 while a run holds the root's lock,
   # else the tree's report (0/1) or 2 for no checkout at all. WHETHER A RUN IS LIVE is asked first, with `wait 0` (the
@@ -855,16 +1029,74 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   # only when none is recorded" (the brief). The record is $ST/orch, written from the dispatch environment; own state dir,
   # both halves — the orch that is recorded, and the one that is not — and a file a person mangled reads as none.
   local ST="$d/st7"; mkdir -p "$ST"
-  ( CC_SLACK_ALIAS=myorch orch_record ); t 'dispatched from an orch shell: the alias is recorded at start' "$(cat "$ST/orch")" myorch
+  seat_windows(){ cat "$d/seats" 2>/dev/null; }; : > "$d/seats"   # the box's tmux never enters a verdict: each case writes its own seats
+  CC_SLACK_ALIAS=myorch orch_record; t 'dispatched from an orch shell: the alias is recorded at start' "$(cat "$ST/orch")" myorch
   t "…and a stop goes to THAT orch, by the broker's own key for it" "$(stop_target)" demo@myorch
   tell_planner "$bl"; t '…really: the line the broker gets is addressed to the orch' "$(cat "$brec")" "inject --no-start --source loop demo@myorch $bl"
   : > "$brec"
-  ( CC_SLACK_ALIAS='' orch_record ); t 'dispatched with no orch in front of it: the record goes, that dispatcher is the repo seat' "$(test -e "$ST/orch" || echo gone)" gone
+  CC_SLACK_ALIAS='' orch_record; t 'dispatched with no orch in front of it: the record goes, that dispatcher is the repo seat' "$(test -e "$ST/orch" || echo gone)" gone
   t '…and the stop goes to the repo seat' "$(stop_target)" demo
   printf 'not an alias!\n' > "$ST/orch"; t 'a record that is not an alias on cc\047s own grammar is the repo seat too, not a key nobody owns' "$(stop_target)" demo
+  # THE ORCH'S OWN REPO (raised-worker-stop-never-reached-orch): an orch in study-coach dispatching into this repo was
+  # keyed demo@myorch, which nobody owns. Kept: the one live `<x>@myorch` window names it, and CC_ORCH_REPO outranks it.
+  # Suppressed: two such windows are no answer, so the old key stands rather than a guess.
+  printf 'demo\nstudy-coach@myorch\nstudy-coach\n' > "$d/seats"
+  CC_SLACK_ALIAS=myorch orch_record; t 'an orch dispatching cross-repo is recorded by its OWN repo' "$(cat "$ST/orch")|$(stop_target)" "study-coach@myorch|study-coach@myorch"
+  : > "$brec"; tell_planner "$bl"; t '…and the broker gets the stop under that key' "$(cat "$brec")" "inject --no-start --source loop study-coach@myorch $bl"
+  CC_SLACK_ALIAS=myorch CC_ORCH_REPO=lessons orch_record; t '…CC_ORCH_REPO, when the dispatch carries it, outranks the window' "$(stop_target)" lessons@myorch
+  printf 'a@myorch\nb@myorch\n' > "$d/seats"
+  CC_SLACK_ALIAS=myorch orch_record; t '…and two windows with that alias are no answer: the old key, not a guess' "$(cat "$ST/orch")|$(stop_target)" "myorch|demo@myorch"
+  # A DONE REACHES THE ORCH, ONCE (done_card + done_heard, driven as the pair the loop runs). Kept: an orch recorded hears
+  # it by its own key in ONE broker call — done_card's — and the log says its seat is live; a second inject made it hear
+  # every DONE twice (review of #635, findings 2 and 19). No orch: the repo seat's one line. Reported: a recorded orch
+  # with no open seat, or a broker that would not take it, is a log line and a board note saying nobody heard it.
+  # Suppressed: inside a member boundary the broker is never asked and the relay carries the card, so no "nobody heard it".
+  mkdir -p "$d/dtb" "$d/dtok" "$d/dtno"; printf '#!/bin/sh\n[ "$1" = note ] && printf "%%s\\n" "$*" >> "%s"; exit 0\n' "$d/dt.board" > "$d/dtb/cc-board"
+  cp "$bd/cc-broker" "$d/dtok/"; printf '#!/bin/sh\nexit 1\n' > "$d/dtno/cc-broker"
+  printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s"; echo >> "%s"\n' "$d/dt.n" "$d/dt.n" | tee "$d/dtok/cc-notify" > "$d/dtno/cc-notify"; chmod +x "$d/dtb"/* "$d/dtok"/* "$d/dtno"/*
+  dt(){ : > "$brec"; : > "$d/dt.log"; : > "$d/dt.board"; : > "$d/dt.n"
+    ( log(){ printf '%s\n' "$*" >> "$d/dt.log"; }; BOARD="$d/dtb/cc-board"; BIN="${DTB:-$d/dtok}"; WT="$d/nowt"; done_card https://x/pull/3 "It's queued to land." ) >/dev/null 2>&1; }
+  # PINNED TO THIS REPO WHEN READ BACK (review of #635): the loop's own ORCH_KEY may name another repo's orch; the file,
+  # which the worker can write, may not. Kept: the key this process recorded. Suppressed: the same text planted in the file.
+  ORCH_KEY=""; printf 'study-coach@myorch\n' > "$ST/orch"
+  t 'a cross-repo key read back from the file is pinned to this repo: a planted record cannot aim a stop elsewhere' "$(stop_target)" demo@myorch
+  ORCH_KEY=study-coach@myorch; t '…while the key this loop recorded itself stands' "$(stop_target)" study-coach@myorch
+  printf 'study-coach@myorch\n' | tee "$ST/orch" > "$d/seats"; dt
+  t 'DONE with an orch recorded: ONE broker call, to the orch by its own key, one card, and the log says its seat is live' \
+    "$(cat "$brec")|$(grep -c 'DONE sent to the broker for study-coach@myorch, whose session is live' "$d/dt.log")|$(grep -c . "$d/dt.board")|$(grep -c '^--id|done:demo/t7:pr3|' "$d/dt.n")" \
+    "inject --no-start --source loop study-coach@myorch loop: demo/t7 done — t7. The PR is https://x/pull/3. It's queued to land.|1|0|1"
+  rm -f "$ST/orch"; ORCH_KEY=""; dt
+  t 'DONE with no orch recorded: the repo seat'"'"'s one broker line and the card, one log line, no board note' \
+    "$(grep -c . "$brec")|$(grep -c '^inject --no-start --source loop demo loop: demo/t7 done' "$brec")|$(grep -c 'no orch recorded' "$d/dt.log")|$(grep -c . "$d/dt.board")" "1|1|1|0"
+  printf 'study-coach@myorch\n' > "$ST/orch"; ORCH_KEY=study-coach@myorch; : > "$d/seats"; dt
+  t 'DONE to an orch with no live seat is sent once but reported unheard, in the log and on the board' \
+    "$(grep -c . "$brec")|$(grep -c 'no session is live there — nobody has heard it' "$d/dt.log")|$(grep -c 'nobody has heard it' "$d/dt.board")" "1|1|1"
+  DTB="$d/dtno" dt; t '…and a broker that would not take it is "nobody heard it", not a silent exit' \
+    "$(grep -c 'nobody heard it — the broker would not take it for study-coach@myorch' "$d/dt.log")|$(grep -c 'nobody heard it' "$d/dt.board")" "1|1"
+  CC_MEMBER_SANDBOX=1 dt; t 'inside a member boundary a DONE writes no "nobody heard it" note: the broker is not asked, the relay carries the card' \
+    "$(wc -c < "$brec")|$(grep -c 'inside the member boundary' "$d/dt.log")|$(grep -c . "$d/dt.board")|$(grep -c '^--id|done:' "$d/dt.n")" "0|1|0|1"
+  # A STOP TO A DEAD SEAT (stop()): cc-broker's rc 0 is "sent", so a stop to a key with no open window is filed as a
+  # request too. Kept: a live seat, no request. Reported: no seat, a request and a log line.
+  mkdir -p "$d/stb"; cp "$bd/cc-broker" "$d/stb/"; printf '#!/bin/sh\n' > "$d/stb/cc-green"
+  printf '#!/bin/sh\nfor a in "$@"; do printf "%%s|" "$a"; done >> "%s"; echo >> "%s"\n' "$d/st.n" "$d/st.n" > "$d/stb/cc-notify"; chmod +x "$d/stb"/*
+  sp_(){ : > "$d/st.n"; : > "$d/dt.log"; ( log(){ printf '%s\n' "$*" >> "$d/dt.log"; }; BOARD="$d/dtb/cc-board"; BIN="$d/stb"; eval "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0")"; stop 6 "hit its cap" "nothing committed" ) >/dev/null 2>"$d/st.err"; }
+  printf 'study-coach@myorch\n' > "$d/seats"; sp_
+  t 'a stop to a live orch seat is sent and files no request' "$(grep -c '^--ask|' "$d/st.n")|$(grep -c 'whose session is live' "$d/dt.log")" "0|1"
+  : > "$d/seats"; sp_
+  t 'a stop to an orch with no live seat is reported unheard and filed as a request, not passed off as delivered' \
+    "$(grep -c '^--ask|' "$d/st.n")|$(grep -c 'session: no (the broker took it, but no session is live there, so nobody has heard it) — filed as a request for the planning seat: yes' "$d/dt.log")" "1|1"
+  sq_(){ : > "$d/st.n"; : > "$d/dt.log"; ( log(){ printf '%s\n' "$*" >> "$d/dt.log"; }; BOARD="$d/dtb/cc-board"; BIN="$d/stb"; eval "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0")"; stop 3 "needs you" "STATUS: BLOCKED: which port?" waiting "which port?" ) >/dev/null 2>"$d/st.err"; }
+  printf 'study-coach@myorch\n' > "$d/seats"; sq_
+  t 'a worker question sent to a live seat is the seat'"'"'s: no Slack post, no request' "$(grep -vc '^--ask|' "$d/st.n")|$(grep -c '^--ask|' "$d/st.n")" "0|0"
+  : > "$d/seats"; sq_
+  t '…but one sent to a key with no live seat nobody heard: it goes out once as the owner'"'"'s decision card, not as a request' \
+    "$(grep -c '^--ask|' "$d/st.n")|$(grep -c '^--decision|.*: which port?|$' "$d/st.n")|$(grep -c 'nobody has heard it) — its question went out as a decision card: yes' "$d/dt.log")" "0|1|1"
+  eval "$(grep '^seat_windows(){' "$0")"   # the real one back for whatever runs after
+  ORCH_KEY=""   # …and no orch recorded either
+  : > "$brec"
   rm -rf "$ST"; unset ST
   grep -q '^orch_record; unset CC_SLACK_ALIAS' "$0"; t 'and the loop writes that record at start and unsets the variable before the worker runs' "$?" 0
-  grep -q 'CC_SLACK_ALIAS; do' "$realbin/cc"; t '…having been handed it by `cc … --go`, on the list of what crosses into the loop\047s window' "$?" 0
+  grep -q 'CC_SLACK_ALIAS CC_ORCH_REPO; do' "$realbin/cc"; t '…having been handed it by `cc … --go`, on the list of what crosses into the loop\047s window' "$?" 0
   ( repo=_cctest99999; tell_planner "$bl" ); t "a suite's \`_cc<suite><pid>\` scratch repo has no session to wake" "$?" 1
   t "…and a fixture's stops never reach the box's own broker state" "$(wc -c < "$brec")" 0
   ( CC_MEMBER_SANDBOX=1 tell_planner "$bl" )
@@ -907,7 +1139,7 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "$d/sr-calls" > "$d/sr-ok/cc-notify"
   printf '#!/bin/sh\nexit 1\n' > "$d/sr-no/cc-notify"; chmod +x "$d/sr-ok/cc-notify" "$d/sr-no/cc-notify"
   t 'a stop a session took says so and files no request' \
-    "$(BIN="$d/sr-ok" repo=mw track=t1 ST="$d/sr-st" stop_route yes 'was refused' 'spend limit')|$(wc -c < "$d/sr-calls")" "the stop went to mw's session: yes|0"
+    "$(BIN="$d/sr-ok" repo=mw track=t1 ST="$d/sr-st" stop_route yes 'was refused' 'spend limit')|$(wc -c < "$d/sr-calls")" "the stop went to mw's session: yes, whose session is live|0"
   t 'on the host, a stop no session took is filed as a request, and the line says it was' \
     "$(BIN="$d/sr-ok" repo=mw track=t1 ST="$d/sr-st" stop_route no 'was refused' 'spend limit')" \
     "the stop went to mw's session: no — filed as a request for the planning seat: yes"
@@ -935,7 +1167,7 @@ down still leaves the board write, which is the half of this that must never be 
     "$(grep -c '^      done_card "\$(' "$0")" 2
   t '…and a track the board has no title for is named in words, not by its hyphenated name' \
     "$(repo=titled track=no-such-row BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" "no such row"
-  dc(){ ( repo=titled track=t1 BOARD="$BIN/cc-board" HOME="$d/bh" BIN="$d/dcbin" WT="$d/nowt"; done_card "$@" ) >/dev/null; cat "$d/dc.args"; }
+  dc(){ ( log(){ :; }; repo=titled track=t1 ST="$d/nost" BOARD="$BIN/cc-board" HOME="$d/bh" BIN="$d/dcbin" WT="$d/nowt"; done_card "$@" ) >/dev/null; cat "$d/dc.args"; }
   mkdir -p "$d/dcbin"; printf '#!/usr/bin/env bash\nprintf "%%s|" "$@" > "%s"\n' "$d/dc.args" > "$d/dcbin/cc-notify"; chmod +x "$d/dcbin/cc-notify"
   printf '#!/usr/bin/env bash\nprintf "%%s|" "$@" > "%s"\n' "$d/dc.broker" > "$d/dcbin/cc-broker"; chmod +x "$d/dcbin/cc-broker"   # the seat's door, recorded the same way
   t 'the done card is headed by the row title and still routed by repo/track' \
@@ -960,13 +1192,14 @@ down still leaves the board write, which is the half of this that must never be 
   printf '#!/bin/sh\ncase "$1" in reconcile|probe) exit 0;; esac\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done; shift; exec "$@"\n' > "$lb/cc-sandbox"
   printf '#!/bin/sh\nexit 0\n' > "$lb/cc-tier"
   printf '#!/bin/sh\nprintf "%%s\\n" "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS-UNSET}" > "$FK_ST/bgceil"\n[ -n "$FK_LINE" ] && printf "%%s\\n" "$FK_LINE" >> "$FK_ST/progress.md"\n[ "$FK_COMMIT" = 1 ] && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m step\nprintf "%%s\\n" "{\\"type\\":\\"result\\",\\"subtype\\":\\"success\\",\\"is_error\\":false,\\"num_turns\\":3,\\"total_cost_usd\\":1.25,\\"result\\":\\"did a step\\"}"\n' > "$lb/claude"
+  sed -i '1a printf "%s\\n" "$@" > "$FK_ST/argv"' "$lb/claude"   # what the loop handed claude, one arg a line
   printf '#!/bin/sh\nprintf "%%s\\n" "{\\"task_id\\":\\"x\\",\\"committed_sha\\":\\"abc\\",\\"pending\\":{},\\"errors\\":[],\\"pr_url\\":\\"https://x/pull/9\\",\\"landing\\":{\\"message\\":\\"It is queued to land.\\"}}"\n' > "$lb/cc-land"
   chmod +x "$lb"/*
   lrun(){ c=$1; mkdir -p "$lh/.cc/state/lp/$c" "$lh/.cc/worktrees/lp/$c"; echo "the task" > "$lh/.cc/state/lp/$c/task.md"
     git -C "$lh/.cc/worktrees/lp/$c" init -q; git -C "$lh/.cc/worktrees/lp/$c" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
     [ "$c" = dn ] && echo '{}' > "$lh/.cc/state/lp/$c/delivery.json"
     : > "$d/lb.n"
-    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
+    ( env -i PATH="${lpath:-/usr/bin:/bin}" HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/cc-land" CC_FAILURES="$d/lb.fl" \
         FK_ST="$lh/.cc/state/lp/$c" FK_LINE="$2" FK_COMMIT="$3" "$lb/cc-loop" lp "$c" "${@:4}" ) >/dev/null 2>&1; }
   slackn(){ grep -v '^--ask|' "$d/lb.n" | grep -c .; }   # the calls that reach Slack: all but the planner intake
   lrun it '- did one step, more to do' 0 --max-iter 1
@@ -1048,22 +1281,119 @@ TO
   t '…and no unmentioned --major post of it on #<repo>' "$(grep -c -- '--major' "$d/lb.n")" 0
   # THE SEAT TAKES IT: the same run beside a broker that answers, on its own bin copy. Nothing is posted, and the
   # seat's one line carries the decision card it would raise, under the same id.
+  # A seat that took it is a broker rc 0 AND an open window for its key (target_live): a tmux stub on the PATH says lp's is open.
+  mkdir -p "$d/lbt"; printf '#!/bin/sh\necho lp\n' > "$d/lbt/tmux"; chmod +x "$d/lbt/tmux"
   local sb="$d/lbs"; mkdir -p "$sb"; cp -p "$lb"/* "$sb/"
   printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "$d/lbs.br" > "$sb/cc-broker"; chmod +x "$sb/cc-broker"; : > "$d/lbs.br"
-  lb="$sb" lrun bks 'STATUS: BLOCKED: which port do I use?' 0 --max-iter 3
+  lb="$sb" lpath="$d/lbt:/usr/bin:/bin" lrun bks 'STATUS: BLOCKED: which port do I use?' 0 --max-iter 3
   t 'a BLOCKED question the seat took posts nothing and files no request' "$(grep -c . "$d/lb.n")" 0
   t '…the seat got it once, with the escalation it may run: cc-notify --decision under the blocked: id' \
     "$(grep -c '^inject --no-start --source loop lp loop: lp/bks needs you — STATUS: BLOCKED: which port do I use?.* — only the owner can settle it? cc-notify --decision --id blocked:lp/bks:[0-9a-f]*:[0-9]* -t "lp/bks needs you" "<the question>"$' "$d/lbs.br")" 1
-  : > "$d/lbs.br"; lb="$sb" lrun its '- did one step, more to do' 0 --max-iter 1
+  : > "$d/lbs.br"; lb="$sb" lpath="$d/lbt:/usr/bin:/bin" lrun its '- did one step, more to do' 0 --max-iter 1
   t 'a stop with no question the seat took: nothing posted, nothing filed, and its line offers no decision card' \
     "$(grep -c . "$d/lb.n")/$(grep -c 'cc-notify --decision' "$d/lbs.br")" 0/0
   lb="$d/lb"
   printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s"; echo >> "%s"\n' "$d/lb.b" "$d/lb.b" > "$lb/cc-broker"; chmod +x "$lb/cc-broker"; : > "$d/lb.b"
-  lrun bh 'STATUS: BLOCKED: may the two checks move from host to hermetic?' 0 --max-iter 3
+  lpath="$d/lbt:/usr/bin:/bin" lrun bh 'STATUS: BLOCKED: may the two checks move from host to hermetic?' 0 --max-iter 3
   rm -f "$lb/cc-broker"
   t 'a BLOCKED question the seat heard posts nothing to Slack and files no request — it is the seat'"'"'s to settle' "$(grep -c . "$d/lb.n")" 0
   t '…the seat gets the question, told to settle it or ask the owner itself' \
     "$(grep -c '^inject|--no-start|--source|loop|lp|loop: lp/bh needs you — STATUS: BLOCKED: may the two checks move from host to hermetic?  Settle it yourself if you can; only if it is the owner.s to decide, ask him with cc-notify --decision' "$d/lb.b")" 1
+  # ── A RUNNING WORKER HAS A WAY IN (say_send, inbox_hook, loop_live). "a message to a running track … reach[es] a live
+  # turn or exit[s] non-zero saying why. None exits 0 on nothing." Each case builds its own state dir.
+  local sh="$d/sayh" sst sp sayp
+  sy(){ ( HOME="$sh" CC_SAY_WAIT="${SW:-1}" CC_SAY_LOCK_WAIT="${SLW:-5}" CC_MSG_FROM=selfcheck "$lb/cc-loop" say lp "$1" "$2" >/dev/null 2>"$d/say.err" ); echo "rc=$?"; }
+  sst="$sh/.cc/state/lp/dead"; mkdir -p "$sst"
+  t 'say: no loop.pid is no live loop — rc 1, "nothing was sent", nothing spooled' \
+    "$(sy dead hi)|$(grep -c 'no live worker loop for lp/dead — nothing was sent' "$d/say.err")|$(test -e "$sst/say.spool" && echo spooled)" "rc=1|1|"
+  echo 4194303 > "$sst/loop.pid"
+  t '…nor is a pid that is no longer running' "$(sy dead hi)|$(test -e "$sst/say.spool" && echo spooled)" "rc=1|"
+  sleep 30 & sayp=$!; echo "$sayp" > "$sst/loop.pid"
+  t '…nor a live pid that is not a cc-loop for this track (a reused pid)' "$(sy dead hi)|$(test -e "$sst/say.spool" && echo spooled)" "rc=1|"
+  kill "$sayp" 2>/dev/null; wait "$sayp" 2>/dev/null
+  # The scan is host-wide, so these names carry this run's pid: a sibling selfcheck's `cc-loop lp mem` is not ours.
+  local mt="mem$$" ab="a.b$$" aXb="aXb$$"
+  sst="$sh/.cc/state/lp/$mt"; mkdir -p "$sst"; echo 2 > "$sst/loop.pid"   # a pid from inside bwrap's own namespace
+  # THE PRODUCTION SHAPE (review of #635): cc's tmux window is ONE `bash -c` string, and cc-sandbox execs bwrap, so
+  # neither host process has `cc-sandbox member … -- cc-loop …` as separate arguments. Each shape alone is a live loop.
+  bash -c "sleep 30; : $lb/cc-sandbox member lp $mt -- cc-loop lp $mt --max-iter 3; : $lb/cc-loop member-stop lp $mt 0" & sayp=$!
+  t 'say: a member workspace loop, whose loop.pid is namespace-local, is found by the host window'"'"'s bash -c string — rc 3, kept' \
+    "$(sy $mt 'the archive is in files/')|$(jq -r .text "$sst/say.spool")" "rc=3|the archive is in files/"
+  kill "$sayp" 2>/dev/null; wait "$sayp" 2>/dev/null; : > "$sst/say.spool"
+  bash -c 'sleep 30; :' bwrap --unshare-pid --die-with-parent --chdir / -- "$lb/cc-loop" lp $mt --max-iter 3 & sayp=$!
+  t '…and by a bwrap-style argv with no cc-sandbox in it — rc 3, kept' \
+    "$(sy $mt 'the archive is in files/')|$(jq -r .text "$sst/say.spool")" "rc=3|the archive is in files/"
+  kill "$sayp" 2>/dev/null; wait "$sayp" 2>/dev/null; : > "$sst/say.spool"
+  t '…and once that sandbox is gone it is no live loop — rc 1, nothing spooled' "$(sy $mt again)|$(wc -c < "$sst/say.spool")" "rc=1|0"
+  bash -c "sleep 30; : $lb/cc-loop say lp $mt hello; : $lb/cc-loop member-stop lp $mt 0; : cc-loop lp ${mt}x" & sayp=$!
+  t '…nor is a string naming cc-loop for another verb or another track — rc 1, nothing spooled' "$(sy $mt again)|$(wc -c < "$sst/say.spool")" "rc=1|0"
+  kill "$sayp" 2>/dev/null; wait "$sayp" 2>/dev/null
+  sst="$sh/.cc/state/lp/live"; mkdir -p "$sst"
+  bash -c 'sleep 30; :' "$lb/cc-loop" lp live & sayp=$!; echo "$sayp" > "$sst/loop.pid"
+  t 'say: a live loop whose worker takes nothing inside the wait is rc 3, "not yet heard", and the message is kept' \
+    "$(sy live 'the archive has a metadata file')|$(grep -c 'kept for lp/live, not yet heard' "$d/say.err")|$(jq -r .text "$sst/say.spool")" \
+    "rc=3|1|the archive has a metadata file"
+  t 'inbox-hook: the next tool call hands the spool to the turn as PostToolUse context' \
+    "$(echo '{}' | "$lb/cc-loop" inbox-hook "$sst" | jq -r '.hookSpecificOutput | "\(.hookEventName)|\(.additionalContext | test("the archive has a metadata file"))"')" "PostToolUse|true"
+  t '…moves it to say.read with the time it was taken, and empties the spool' \
+    "$(jq -r 'has("taken")' "$sst/say.read")|$(wc -c < "$sst/say.spool")" "true|0"
+  t '…and with nothing spooled it says nothing and exits 0 (a hook must never fail the tool call)' \
+    "$(echo '{}' | "$lb/cc-loop" inbox-hook "$sst"; echo "rc=$?")" "rc=0"
+  ( sleep 1; echo '{}' | "$lb/cc-loop" inbox-hook "$sst" >/dev/null ) &
+  t 'say: a live loop whose worker takes it inside the wait is rc 0, "taken by the running worker"' "$(SW=8 sy live 'second fact' 2>/dev/null)" "rc=0"
+  wait; kill "$sayp" 2>/dev/null; wait "$sayp" 2>/dev/null
+  # THE ACK IS THE MESSAGE'S OWN ID (review of #635, finding 5). Kept: the case above. Reported: older taken records with
+  # the same text and the same second are not this message, so it is rc 3, kept, not "taken".
+  sst="$sh/.cc/state/lp/ack"; mkdir -p "$sst"; bash -c 'sleep 30; :' "$lb/cc-loop" lp ack & sayp=$!; echo "$sayp" > "$sst/loop.pid"
+  for x in stop status; do printf '{"id":"old-%s","at":"%s","from":"x","text":"%s","taken":"%s"}\n' "$x" "$(date -u +%FT%TZ)" "$x" "$(date -u +%FT%TZ)" >> "$sst/say.read"; done
+  t 'say: older taken records with the same text in the same second do not ack a new message — rc 3, it stays spooled' \
+    "$(sy ack stop)|$(jq -r .text "$sst/say.spool")|$(jq -r '.id | test("^old-")' "$sst/say.spool")" "rc=3|stop|false"
+  # THE LOCK HELD PAST ITS WAIT IS ITS OWN CODE, 2 (review of #635, finding 16): not 1 "no live loop", which cc reads as
+  # "try the pane". Nothing is spooled.
+  : > "$sst/say.spool"; flock "$sst/.say.lock" sleep 3 & x=$!; sleep 0.3
+  t 'say: a live loop whose spool lock is held past its wait is rc 2, "did not take the message", nothing spooled' \
+    "$(SLW=0.5 sy ack 'held out')|$(grep -c 'did not take the message' "$d/say.err")|$(wc -c < "$sst/say.spool")" "rc=2|1|0"
+  wait "$x" 2>/dev/null
+  # A PLANTED NAME IS NEVER OPENED THROUGH (review of #635, findings 3 and 4). The state dir is the member's to write and
+  # `cc --say` runs as the owner, so each of the four names is planted as a link to an owner file here and the op that
+  # opens it must refuse, leave that file as it was, and say so. Kept: the plain files of the cases above.
+  printf 'keep\n' > "$d/victim"
+  rm -f "${sst:?}/.say.lock"; ln -s "$d/victim" "$sst/.say.lock"
+  t 'say: a planted .say.lock link is refused — rc 2, the file it names is untouched, the refusal said' \
+    "$(sy ack x)|$(cat "$d/victim")|$(grep -c '\.say\.lock is a symlink — refused' "$d/say.err")" "rc=2|keep|1"
+  rm -f "$sst/.say.lock" "$sst/say.spool"; ln -s "$d/victim" "$sst/say.spool"
+  t 'say: a planted say.spool link is refused — rc 2, the file it names is untouched' \
+    "$(sy ack x)|$(cat "$d/victim")|$(grep -c 'say\.spool is a symlink — refused' "$d/say.err")" "rc=2|keep|1"
+  t '…and the inbox hook takes nothing through it and still exits 0' \
+    "$(echo '{}' | "$lb/cc-loop" inbox-hook "$sst" 2>/dev/null; echo "rc=$?")|$(cat "$d/victim")" "rc=0|keep"
+  rm -f "$sst/say.spool"; mkfifo "$sst/say.spool"
+  t 'say: a FIFO planted at say.spool is refused, not blocked on' "$(sy ack x)" "rc=2"
+  rm -f "$sst/say.spool" "$sst/say.read"; printf '{"id":"m1","at":"x","from":"y","text":"waiting"}\n' > "$sst/say.spool"; ln -s "$d/victim" "$sst/say.read"
+  t 'take: a planted say.read link is refused — nothing written through it, and the spool keeps the message' \
+    "$(echo '{}' | "$lb/cc-loop" inbox-hook "$sst" 2>/dev/null)|$(cat "$d/victim")|$(jq -r .id "$sst/say.spool")" "|keep|m1"
+  t '…and an ack read through it is no ack' "$(say_io acked "$sst" m1 2>/dev/null; echo "rc=$?")" "rc=1"
+  rm -f "$sst/loop.pid"; ln -s "$d/victim" "$sst/loop.pid"
+  t 'loop.pid: a planted link is never written (rc 2, the file untouched) and never read as a live loop' \
+    "$(say_io pidw "$sst" 123 2>/dev/null; echo "rc=$?")|$(cat "$d/victim")|$(say_io live "$sst" 2>/dev/null; echo "rc=$?")" "rc=2|keep|rc=1"
+  t '…nor removed through: the loop'"'"'s exit leaves the link and the file it names alone' \
+    "$(say_io pidrm "$sst" 123 2>/dev/null; test -L "$sst/loop.pid" && echo link)|$(cat "$d/victim")" "link|keep"
+  kill "$sayp" 2>/dev/null; wait "$sayp" 2>/dev/null
+  # A TRACK NAME IS MATCHED AS ITSELF (review of #635, finding 17): the old regex read `.` as any character, so a loop
+  # for lp/aXb counted as live for lp/a.b. Kept: the member case above. Suppressed: the near name, both ways in.
+  sst="$sh/.cc/state/lp/$ab"; mkdir -p "$sst"
+  bash -c "sleep 30; : $lb/cc-sandbox member lp $aXb -- cc-loop lp $aXb --max-iter 3" & sayp=$!
+  bash -c 'sleep 30; :' "$lb/cc-loop" lp $aXb & x=$!; echo "$x" > "$sst/loop.pid"
+  t 'say: a loop for lp/aXb, by its pid or its sandbox command line, is no live loop for lp/a.b — rc 1, nothing spooled' \
+    "$(sy $ab hi)|$(test -e "$sst/say.spool" && echo spooled)" "rc=1|"
+  kill "$sayp" "$x" 2>/dev/null; wait "$sayp" "$x" 2>/dev/null
+  mkdir -p "$lh/.cc/state/lp/sy"; printf '%s\n' '{"at":"2026-09-24T03:00:00Z","from":"planning","text":"use the metadata file"}' > "$lh/.cc/state/lp/sy/say.spool"
+  lrun sy '- did one step' 0 --max-iter 1
+  sp=$(awk 'p{print; exit} $0=="-p"{p=1}' "$lh/.cc/state/lp/sy/argv")
+  t 'a message the last iteration never took opens the next iteration prompt, first' \
+    "$sp|$(grep -c 'from planning\] use the metadata file' "$lh/.cc/state/lp/sy/argv")" \
+    "# MESSAGES FROM YOUR DISPATCHER (arrived after the last iteration stopped reading — they come first)|1"
+  t '…the worker runs with the inbox hook, and the loop.pid it was reachable by is gone once it exits' \
+    "$(grep -A1 -x -- --settings "$lh/.cc/state/lp/sy/argv" | tail -1 | jq -r '.hooks.PostToolUse[0].hooks[0].command | test("cc-loop inbox-hook .*/lp/sy$")')|$(test -e "$lh/.cc/state/lp/sy/loop.pid" && echo left)" "true|"
   lrun dn 'STATUS: DONE' 0 --max-iter 3
   t 'a DONE posts exactly one card' "$(slackn)" 1
   t 'the loop calls cc-notify in three places only — the DONE card, the BLOCKED question, the planner intake — so a \
@@ -1071,6 +1401,28 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
     "$(grep -E '^[^#]*"\$BIN/cc-notify" ' "$0" | grep -oE 'done_card|--id "done:|--ask|--decision' | tr '\n' ' ')" '--id "done: --ask --decision '
   t '…into the track thread, by its title, once per PR, with no count and no dollar figure' \
     "$(cut -d'|' -f1-4 "$d/lb.n")|$(grep -c '\$' "$d/lb.n")" "--id|done:lp/dn:pr9|-t|lp/dn done|0"
+  # A kind=session row: `cc done` pushes and exits 7 when its READY TO LAND note went to the planner intake — delivered.
+  # 7 and nothing else: the t7 shape (guard.sh — a diverged branch and a member-written .cc/pushed) is refused with
+  # "cc-checkpoint adopt" and nothing pushed, and that refusal, at 3 or at 1, must stop 4 with no DONE card and never
+  # exit 0 (review of #635, findings 1 and 6). FK_DOUT is the line the stub cc done prints.
+  local lr="$d/lr"; mkdir -p "$lr"; cp "$lb"/* "$lr/"
+  printf '#!/bin/sh\n[ "$1" = done ] || exit 1\necho "${FK_DOUT:-cc: no live planning turn took it; filed as a request}"; exit "$FK_DRC"\n' > "$lr/cc"; chmod +x "$lr/cc"
+  drun(){ mkdir -p "$lh/.cc/state/lp/$1" "$lh/.cc/worktrees/lp/$1"; echo "the task" > "$lh/.cc/state/lp/$1/task.md"
+    git -C "$lh/.cc/worktrees/lp/$1" init -q; git -C "$lh/.cc/worktrees/lp/$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init; : > "$d/lb.n"
+    ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lr/claude" CC_LAND="$lr/cc-land" CC_FAILURES="$d/lr.fl" FK_DRC="$2" FK_DOUT="${3:-}" \
+        FK_ST="$lh/.cc/state/lp/$1" FK_LINE='STATUS: DONE' FK_COMMIT=0 "$lr/cc-loop" lp "$1" --max-iter 3 ) >/dev/null 2>&1; echo "rc=$?"; }
+  t 'a cc done that exits 7 (session row, note filed as a request) is a delivered DONE — loop rc 0, no stop, no second request' \
+    "$(drun ds 7)|$(grep -c 'opened no PR' "$lh/.cc/state/lp/ds/loop.log")|$(grep -c '^--ask|' "$d/lb.n")|$(grep -c 'the ready-to-land note was filed as a request' "$lh/.cc/state/lp/ds/loop.log")" "rc=0|0|0|1"
+  t '…while a cc done that fails any other way still stops 4, "opened no PR"' \
+    "$(drun df 2)|$(grep -c 'cc done failed (rc 2)' "$d/lb.n")" "rc=4|1"
+  lease="cc: not pushed — track/lt diverged from its remote and the host holds no lease saying what it last put there, so nothing was forced and nothing overwritten. One way on: 'cc-checkpoint adopt lp lt' says what the remote holds. No PR opened."
+  for x in 3 1; do
+    t "the t7 shape (diverged branch, member-written .cc/pushed): a lease refusal at rc $x is no DONE — stop 4, no DONE card, never rc 0" \
+      "$(drun "lt$x" "$x" "$lease")|$(grep -c "cc done failed (rc $x)" "$d/lb.n")|$(grep -c '^--id|done:' "$d/lb.n")|$(grep -c 'the ready-to-land note was filed' "$lh/.cc/state/lp/lt$x/loop.log")" "rc=4|1|0|0"
+  done
+  printf '#!/bin/sh\necho "$*" >> "%s/green.n"; echo recorded\n' "$d" > "$lr/cc-green"; chmod +x "$lr/cc-green"   # the ledger write, logged
+  t '…and a cc done that exits 6 (session row, the request could not be filed) stops 4 with its ledger entry and one request' \
+    "$(drun du 6)|$(grep -c 'cc done failed (rc 6)' "$d/lb.n")|$(grep -c 'the ready-to-land note was filed' "$lh/.cc/state/lp/du/loop.log")|$(grep -c '^red lp worker-loop/done-undelivered loop:lp/du:4:.*rc 6' "$d/green.n")" "rc=4|1|0|1"
   # ── A MEMBER'S DONE, INSIDE ITS BOUNDARY ── no lander is bound in there, so the receipt is `cc done --json`'s own and
   # the host's sweep queues the landing. Its own fixture: a cc-land that answers as the unbound lander did (exit 3, no
   # receipt) and a cc that records its argv. Inside: exit 0, one card naming cc done's PR, the lander never asked.
@@ -1295,6 +1647,8 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
 [ "${1:-}" = selfcheck ] && { selfcheck; exit $?; }
 [ "${1:-}" = worker-model ] && { worker_model "${2:-}"; exit 0; }   # cc asks this to name the model on its dispatch line
 [ "${1:-}" = context-report ] && { context_report "${@:2}"; exit $?; }
+[ "${1:-}" = say ] && { say_send "${2:?repo}" "${3:?track}" "${4:?text}"; exit $?; }   # cc … --say, at a headless worker (see SAY_WAIT)
+[ "${1:-}" = inbox-hook ] && inbox_hook "${2:?state dir}"   # the worker's PostToolUse hook: exits 0 always
 [ "${1:-}" = member-stop ] && { member_stop "${@:2}"; exit 0; }   # cc runs it on the host after a member's boundary exits
 repo="${1:?repo}"; track="${2:?track}"; shift 2
 MAXI=10; BUDGET=8; TURNS=80; MODEL=""; EFFORT="${CC_WORKER_EFFORT:-medium}"; QUIET=0; RESUME=0   # an opus-class worker spends ~$2/iteration: a $2 cap truncated real work mid-turn
@@ -1325,7 +1679,9 @@ mkdir -p "$ST/runs"; [ -s "$ST/task.md" ] || { echo "cc-loop: no task at $ST/tas
 [ -d "$WT" ] || { echo "cc-loop: no worktree $WT (run: cc $repo $track)" >&2; exit 2; }
 touch "$ST/progress.md"; LOG="$ST/loop.log"; SNAP="$ST/.progress.snap"
 log(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
-orch_record; unset CC_SLACK_ALIAS   # who dispatched this loop, for stop(); the worker's own environment does not carry it
+orch_record; unset CC_SLACK_ALIAS CC_ORCH_REPO   # who dispatched this loop, for stop(); the worker's own environment does not carry it
+pw=$(say_io pidw "$ST" $$ 2>&1) || log "loop.pid not written — ${pw#cc-loop: }; \`cc $repo $track --say\` cannot find this loop"   # loop_live: --say reaches it while it runs
+trap 'say_io pidrm "$ST" $$' EXIT   # only a loop.pid that is still this loop's, and never through a link (say_io)
 [ -e "$ST/stop" ] && { rm -f "$ST/stop"; log "a stop file from before this dispatch was cleared — re-dispatching overrides it"; }
 set -m   # each iteration runs in its own process group, so one kill takes claude AND everything it spawned
 child=""
@@ -1333,7 +1689,7 @@ kill_child(){ [ -n "$child" ] || return 0   # only ever signal a group we own: i
   if [ "$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ')" = "$child" ]; then kill -TERM -- -"$child" 2>/dev/null; sleep 2; kill -KILL -- -"$child" 2>/dev/null
   else kill -TERM "$child" 2>/dev/null; fi; }
 trap 'kill_child; parked; log "signalled — iteration aborted and its claude killed"; exit 130' HUP INT TERM   # tmux kill-window would otherwise re-parent claude to systemd, still editing this worktree
-stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" heard=no esc="" bid=""   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
+stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" heard=no esc="" bid="" tg=""   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
   # …and `waiting` when it stopped to ASK, which is not the same thing as stopping. The loop is the first to know, so it
   # writes the same word cc-reconcile would 20 min later — otherwise the board says `blocked` while the Home tab, reading
   # the very journal line this exit came from, already says `waiting`, and the tab prints the two of them as drift.
@@ -1347,16 +1703,18 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" hea
   [ -z "$said" ] || { bid="blocked:$repo/$track:$(git -C "${WT:-.}" rev-parse --short HEAD 2>/dev/null):$(printf '%s' "$said" | cksum | cut -d' ' -f1)"
     esc=" — only the owner can settle it? cc-notify --decision --id $bid -t \"$repo/$track $title\" \"<the question>\""; }
   # THE BOARD IS WRITTEN FIRST, whatever the broker does after it: a stop that reached nobody is filed as a request.
-  tell_planner "$(planner_line "$title" "$msg$esc")" && heard=yes
+  # cc-broker's rc 0 is "sent", not "heard" (done_heard): a stop sent to a key with no live seat is unheard too (`dead`).
+  tg=$(stop_target)
+  if tell_planner "$(planner_line "$title" "$msg$esc")"; then heard=dead; target_live "$tg" && heard=sent; fi
   # A seat that took it owns it, and nothing is posted: its line tells it to settle the question, or to ask the owner
   # itself with the --decision card it carries (comms audit 2026-10-01, change 6: demo-video-skill's "may the two
   # checks move from host to hermetic?" reached the owner as "needs you" on 09-30, a question the seat had settled
   # within minutes). Nobody took it: a question becomes the owner's decision card (cc-notify --decision: 🔒 @owner on
   # #<repo>, or a control-seat request when this caller lacks that authority); any other stop is filed as a planner
   # request, and the log line says where it went (stop_route).
-  if [ "$heard" = yes ] || [ -z "$said" ]; then log "$(stop_route "$heard" "$title" "$msg")"
+  if [ "$heard" = sent ] || [ -z "$said" ]; then log "$(stop_route "$heard" "$title" "$msg")"
   else local r=no; "$BIN/cc-notify" --decision --id "$bid" -t "$repo/$track $title" "$(row_title): $said" && r=yes
-    log "the stop went to $(stop_target)'s session: no — its question went out as a decision card: $r"; fi
+    log "the stop went to $tg's session: no$([ "$heard" = dead ] && printf ' (the broker took it, but no session is live there, so nobody has heard it)') — its question went out as a decision card: $r"; fi
   exit "$code"; }
 # THE PROJECT PAUSE. `cc-pause on <repo>` parks a whole project; what it does to a loop that is ALREADY RUNNING is
 # signal it, so this is read from the TERM trap and again at the top of every iteration — the flag can appear at any
@@ -1412,7 +1770,9 @@ while [ $i -lt "$MAXI" ]; do
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"
   cont=""; [ "$rounds" -gt 0 ] && cont=" This loop passed its original step limit and carried on because you are still committing work — pick up exactly where the journal stops."
   prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s of %s.%s\n' "$(cat "$ST/task.md")" "$(journal_block "$ST/progress.md")" "$i" "$MAXI" "$cont")
-  args=(-p "$prompt" --permission-mode auto --max-turns "$TURNS" --max-budget-usd "$BUDGET" --output-format json --append-system-prompt "$SP")
+  if said=$(say_take "$ST"); then prompt=$(printf '# MESSAGES FROM YOUR DISPATCHER (arrived after the last iteration stopped reading — they come first)\n%s\n\n%s' "$said" "$prompt"); log "iter $i opens with the message(s) sent while the last one ran"; fi
+  hook=$(jq -cn --arg c "$BIN/cc-loop inbox-hook $ST" '{hooks: {PostToolUse: [{hooks: [{type: "command", command: $c}]}]}}')   # a message sent mid-iteration reaches the turn (SAY_WAIT)
+  args=(-p "$prompt" --permission-mode auto --max-turns "$TURNS" --max-budget-usd "$BUDGET" --output-format json --append-system-prompt "$SP" --settings "$hook")
   m=$(worker_model "$MODEL")   # resolved every iteration, not pinned at dispatch: an outage mid-loop moves this worker down, and its lift moves it back
   asked=$(worker_model "$MODEL" asked); why=$(model_outage_why "$m" "$asked")   # both read every iteration (see there)
   note=$(model_change_note "$i" "$m" "$asked" "$lastm" "$lastwhy" "$why" "$lastasked")   # $() ate its newline; printf puts it back
@@ -1497,6 +1857,12 @@ while [ $i -lt "$MAXI" ]; do
       printf '%s\n' "$dout" >> "$LOG"; dlast=$(printf '%s\n' "$dout" | grep -v '^[[:space:]]*$' | tail -1); printf '%s\n' "$dlast" >&2
       # DONE is the worker's word; done is `cc done`'s. A push a DNS blip killed, a lease refused: the loop used to notify DONE with
       # `PR: ` empty and exit 0, and the board went green over work no PR carried (monthly audit 2026-09-01 F3; 05:07Z janitor-containers).
+      # rc 7 is a kind=session row: pushed, and its READY TO LAND note went to the planner intake because no live planning
+      # turn took it (cc done's contract) — delivered, not failed, so it is logged and not stopped on. It is 7 and not 3
+      # because no other ending of cc done uses 7; a bare 3 is a refusal elsewhere in the delivery chain (cc-checkpoint's
+      # "no host lease", the guard.sh t7 shape), and read as delivered it posted DONE over a branch that never left the
+      # box (review of #635, findings 1 and 6). Every other non-zero, 3 and 6 included, stops 4 below.
+      [ "$drc" = 7 ] && { log "cc done: pushed; the ready-to-land note was filed as a request — ${dlast:-no output}"; drc=0; }
       [ "$drc" = 0 ] || stop 4 "finished, but opened no PR" "the worker wrote STATUS: DONE, but cc done failed (rc $drc): ${dlast:-no output}. Fix the cause, then: cc done $repo $track"
       # THE STANDING GRANT (`cc lands`: every project but those CC_SELF_LAND_EXCEPT names): a project that holds it does not wait for a
       # 👍 on a PR the gates and the reviewer are about to judge anyway. THE QUEUEING IS HERE AND NOT IN `cc done`,
