@@ -334,8 +334,9 @@ def _door_head(job):
         from lander import jobs as J
         from lander import lane as L
         from lander import members as M
-        genv = M.env(job.member) if job.member else None
-        return L.pr_head(J.repo_root(job.repo), job.pr, (genv or {}).get("GH_TOKEN"), genv) or ""
+        genv = M.env(job.member, job.repo) if job.member else None
+        token = M.gh_token(job.member, job.repo) if job.member else None
+        return L.pr_head(J.repo_root(job.repo), job.pr, token, genv) or ""
     except Exception:   # noqa: BLE001 — the card goes without a head in its id rather than not at all
         return ""
 

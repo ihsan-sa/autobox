@@ -14,10 +14,13 @@
                           MEMBERS/<h>/github-token alone: its target must be SECRETS/github-<h>-<org>.token. The
                           link is read with readlink (never followed, never opened); a target anywhere else, or of
                           any other name, grants nothing. A set, because a workspace may come to hold one per org.
+  app_org()               the org the box's GitHub App installation covers, CC_GH_APP_OWNER (cc-config), when an
+                          installation is configured (CC_GH_APP_INSTALL_ID); else "". cc-gh-token mints a workspace's
+                          push token there, scoped to the repositories `cc-gh-token repos <h>` lists.
   member_project_url(h, t, pr)  (url, "") or ("", why): the board row's `pr` (member_board) is checked, not trusted — its
-                          owner must be one the HOST chose, CC_GH_PERSONAL_OWNER (cc-config) or a granted_orgs(h)
-                          org, and the name one `cc-gh-token repos <h> <owner>` lists; anything else is refused
-                          before the token is read. Neither the row nor the URL decides which owners are accepted.
+                          owner must be one the HOST chose, CC_GH_PERSONAL_OWNER (cc-config), a granted_orgs(h)
+                          org or app_org(), and the name one `cc-gh-token repos <h> <owner>` lists; anything else is
+                          refused before the token is read. Neither the row nor the URL decides which owners are accepted.
   member_clone(repo, url) (root, "") or ("", why): the host-only clone <LANDQ>/clones/<h>--<t>, no checkout, its
                           credential gh's helper answering with GH_TOKEN, never the box's login.
   gh_config_dir(root)     the empty GH_CONFIG_DIR for gh on that clone, <LANDQ>/clones/.gh-none/<h>--<t>: outside
@@ -32,7 +35,17 @@
   spent(h) -> (usd, cap) · charge(h, usd) -> None | (spent_before, cap)   the day's ledger cc's member_gate keeps,
                           <state>/member-spend.json, cap MEMBER_DAILY_USD (cc-config, else 20).
   route(job)              "#<h>" for a member job, else "" — where its stop is said.
-  env(h)                  the GH_TOKEN env for git in the clone, or None.
+  link_door(h, owner)     True only for an owner the link's token is for: a granted_orgs(h) org, or CC_GH_PERSONAL_OWNER
+                          read without failure (config_read tells a failed read from an empty one). Anything else,
+                          a failed or slow cc-config included, is the app's door: it fails closed, never to the link.
+  env(h, repo)            git's env in the clone: GH_TOKEN with the link's token on the link's door; else app_gitenv for
+                          the clone's URL, or NO_CREDENTIAL when it names no github.com owner (no repo included).
+  gh_token(h, repo)       the token gh calls for that project carry: the link's on the link's door, else a callable that
+                          asks app_token(h, url) — cc-gh-token's helper, as git asks it — each time gh runs, and that
+                          gh.gh() refuses to run gh on when it hands out nothing.
+  app_gitenv(h, url)      what `cc-gh-token gitargs <url> <h>` names, as GIT_CONFIG_* (command-line scope, so it resets
+                          the global gh helper and is never written to the clone's .git/config). No token is in it,
+                          only the helper that mints one when git asks; NO_CREDENTIAL when gitargs names no helper.
 A member project never deploys (lane.py).
 """
 from __future__ import annotations
@@ -61,18 +74,29 @@ TOKEN_SHAPES = re.compile(r"github_pat_[A-Za-z0-9_]{20,}|\bgh[pousr]_[A-Za-z0-9]
 HANDLE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 
 
-def run(argv, cwd=None, timeout=60, env=None):
+def run(argv, cwd=None, timeout=60, env=None, input=None):
     try:
-        p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+        p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, input=input,
+                           stdin=subprocess.DEVNULL if input is None else None,
                            env=dict(os.environ, **env) if env else None)
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return 125, "", str(e)
 
 
-def config(key, default=""):
+def config_read(key):
+    """`key` as cc-config holds it: its value when set (which may be ""), "" when it is unset (exit 1, nothing
+    printed), and None when the read failed or timed out, so a caller choosing a credential can tell them apart."""
     rc, out, _ = run([f"{J.bin_dir()}/cc-config", "get", key], timeout=30)
-    return (out.strip() if rc == 0 and out.strip() else "") or default
+    if rc == 0:
+        return out.strip()
+    return "" if rc == 1 and not out.strip() else None
+
+
+def config(key, default=""):
+    """`key`, or `default` when it is empty, unset or could not be read: for a caller to whom all three mean the same
+    (each of them then refuses or takes a default). Never the reader for which credential a call carries."""
+    return config_read(key) or default
 
 
 def member_of(repo):
@@ -115,9 +139,86 @@ def member_token(handle) -> str:
         return ""
 
 
-def env(handle):
-    tok = member_token(handle) if handle else ""
-    return {"GH_TOKEN": tok} if tok else None
+def _clone_url(repo) -> str:
+    from lander import git as G
+    return G.remote_url(J.repo_root(repo)) if repo else ""
+
+
+def env(handle, repo=""):
+    """git's env for workspace `handle`'s clone of `repo`: GH_TOKEN with the link's token only on the link's door
+    (link_door); on any other the app's helper (app_gitenv), or NO_CREDENTIAL — which is also what no `repo` gets,
+    since there is no URL to choose a door by (a caller fetching a URL of its own reads member_token itself). None
+    for no handle, or for the link's door with no token at the link."""
+    return git_env(handle, _clone_url(repo)) if handle else None
+
+
+def git_env(handle, url):
+    owner = url_owner(url)
+    if link_door(handle, owner):
+        tok = member_token(handle)
+        return {"GH_TOKEN": tok} if tok else None
+    # the app's door: git asks cc-gh-token, and the link's token rides along nowhere
+    return app_gitenv(handle, url) if owner else dict(NO_CREDENTIAL)
+
+
+def app_token(handle, url) -> str:
+    """The app's installation token for workspace `handle` on `url`, handed out the way git gets it: cc-gh-token's
+    helper (`--workspace <h> get`, the credential protocol on stdin), which refuses another workspace's repository.
+    "" when it refuses. Printed nowhere."""
+    m = re.fullmatch(r"https://github\.com/([^/\s]+/[^/\s]+)", url or "")
+    if not m or not HANDLE_RE.fullmatch(handle or ""):
+        return ""
+    rc, out, _ = run([f"{J.bin_dir()}/cc-gh-token", "--workspace", handle, "get"], timeout=60,
+                     input=f"protocol=https\nhost=github.com\npath={m.group(1)}\n\n")
+    tok = next((x[len("password="):] for x in out.splitlines() if x.startswith("password=")), "") if rc == 0 else ""
+    return tok.strip()
+
+
+def gh_token(handle, repo):
+    """What the lander's gh calls for member project `repo` carry: the link's token (member_token), or, for a project
+    only app_org() admits, a callable gh.gh() runs each time it calls gh, since the app token lives an hour and a
+    lane run may outlast what is left of it."""
+    url = _clone_url(repo)
+    if link_door(handle, url_owner(url)):
+        return member_token(handle)
+    return lambda: app_token(handle, url)
+
+
+# Resets git's helper list and names none, so a fetch the app should answer fails rather than reaching for gh's.
+NO_CREDENTIAL = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": ""}
+
+
+def app_gitenv(handle, url) -> dict:
+    rc, out, _ = run([f"{J.bin_dir()}/cc-gh-token", "gitargs", url, handle], timeout=60)
+    lines = out.splitlines()
+    if rc or not lines or len(lines) % 2 or any(x != "-c" for x in lines[0::2]):
+        return dict(NO_CREDENTIAL)
+    pairs = [x.partition("=") for x in lines[1::2]]
+    if not any(k == "credential.helper" and v.startswith("!") and "--workspace" in v for k, _, v in pairs):
+        return dict(NO_CREDENTIAL)
+    e = {"GIT_CONFIG_COUNT": str(len(pairs))}
+    for i, (k, _, v) in enumerate(pairs):
+        e[f"GIT_CONFIG_KEY_{i}"], e[f"GIT_CONFIG_VALUE_{i}"] = k, v
+    return e
+
+
+def url_owner(url) -> str:
+    """The account of a github.com https URL, or "" for anything else."""
+    m = re.fullmatch(r"https://github\.com/([^/\s]+)/[^/\s]+", url or "")
+    return m.group(1) if m else ""
+
+
+def link_door(handle, owner) -> bool:
+    """True only when the link's token is the one for `owner`: an org granted_orgs(h) names, or CC_GH_PERSONAL_OWNER
+    as cc-config read it. Decided by exclusion, so it fails closed: every other owner, no owner, and a config read
+    that failed or timed out take the app's door (app_token, app_gitenv), never member_token — a link may be the
+    owner's own token, and a slow cc-config once let it reach the app's org this way (review of #1079)."""
+    if not owner:
+        return False
+    if owner.lower() in {o.lower() for o in granted_orgs(handle)}:
+        return True
+    powner = config_read("CC_GH_PERSONAL_OWNER")
+    return bool(powner) and owner.lower() == powner.lower()
 
 
 BOARD_MAX = 8 << 20
@@ -181,6 +282,14 @@ def granted_orgs(handle) -> set:
     return {org} if ORG_RE.fullmatch(org) else set()
 
 
+def app_org() -> str:
+    # A workspace with no org token of its own still pushes to the app's org: cc-gh-token mints it an installation
+    # token there, scoped to the repositories its ~/dev checkout names as remotes. The org is the HOST's config,
+    # the same key cc-gh-token reads, and no org without a configured installation counts.
+    org = config("CC_GH_APP_OWNER")
+    return org if org and config("CC_GH_APP_INSTALL_ID") and ORG_RE.fullmatch(org) else ""
+
+
 def member_project_url(handle, track, pr):
     row = (member_board(handle).get("tracks") or {}).get(track) or {}
     m = re.fullmatch(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/([0-9]+)", row.get("pr") or "")
@@ -188,12 +297,13 @@ def member_project_url(handle, track, pr):
         return "", f"the {handle} board row for {track} does not carry PR #{pr} (pr='{row.get('pr') or ''}')"
     owner, name = m.group(1), m.group(2)
     powner = config("CC_GH_PERSONAL_OWNER")
-    accepted = ({powner} if powner else set()) | granted_orgs(handle)
+    aorg = app_org()
+    accepted = ({powner} if powner else set()) | granted_orgs(handle) | ({aorg} if aorg else set())
     # the owner handed on below is the HOST's spelling of it, taken from `accepted`, never the URL's
     hit = next((a for a in sorted(accepted) if a.lower() == owner.lower()), "")
     if not hit:
         return "", (f"{owner}/{name} is not under an account this workspace was granted "
-                    f"({', '.join(sorted(accepted)) or 'none: no CC_GH_PERSONAL_OWNER and no org token'})"
+                    f"({', '.join(sorted(accepted)) or 'none: no CC_GH_PERSONAL_OWNER, no org token and no app installation'})"
                     f" — a granted token opens nothing else")
     rc, out, _ = run([f"{J.bin_dir()}/cc-gh-token", "repos", handle, hit], timeout=60)
     if rc or name.lower() not in {x.strip().lower() for x in out.splitlines() if x.strip()}:
@@ -225,7 +335,7 @@ def member_clone(repo, url):
         return "", f"cannot make {root}: {e}"
     rc, out, err = run(["git", "clone", "-q", "--no-checkout", "-c", "credential.helper=",
                         "-c", "credential.helper=!gh auth git-credential", url, "."], cwd=root, timeout=900,
-                       env=dict(env(h) or {}, GH_CONFIG_DIR=ghc))
+                       env=dict(git_env(h, url) or {}, GH_CONFIG_DIR=ghc, GIT_TERMINAL_PROMPT="0"))
     if rc:
         shutil.rmtree(root, ignore_errors=True)
         return "", f"cannot clone {url}: {(err or out).strip()[-200:]}"
@@ -359,5 +469,5 @@ def route(job) -> str:
     return f"#{job.member}" if getattr(job, "member", None) else ""
 
 
-__all__ = ["member_of", "boundary_path", "design_path", "member_token", "member_board", "granted_orgs", "member_project_url", "member_clone", "gh_config_dir", "walls", "spent",
+__all__ = ["member_of", "boundary_path", "design_path", "member_token", "member_board", "granted_orgs", "app_org", "link_door", "url_owner", "config_read", "app_gitenv", "app_token", "gh_token", "git_env", "member_project_url", "member_clone", "gh_config_dir", "walls", "spent",
            "charge", "route", "env", "BOUNDARY_PATHS", "TOKEN_SHAPES", "MEMBER_DAILY_USD"]

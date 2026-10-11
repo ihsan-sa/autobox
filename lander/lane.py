@@ -406,8 +406,8 @@ class Lane:
         h, t = M.member_of(repo)
         self.member = h if h and t else ""
         self.root = J.repo_root(repo)
-        self.genv = M.env(self.member) if self.member else None
-        self.token = (self.genv or {}).get("GH_TOKEN")
+        self.genv = M.env(self.member, repo) if self.member else None
+        self.token = M.gh_token(self.member, repo) if self.member else None
         self.fallback = MF.host_fallback(repo)   # the release's landing-repos/<repo>.toml; "" when the repo has none
         self.lines = []
         self.tried = set()
@@ -1338,9 +1338,9 @@ def cmd_queue(argv):
         if not root:
             E.log("refused", repo, pr, "no-clone")
             return refuse(f"PR #{pr} is not queued — {why}", 1)
-        genv = M.env(handle)
+        genv = M.env(handle, repo)
     root = J.repo_root(repo)
-    token = (genv or {}).get("GH_TOKEN")
+    token = M.gh_token(handle, repo) if handle else None
     hit, approved_head = protected_hit(repo, root, pr, token, genv), ""
     if hit and not owner_approved(approved_by):
         E.log("refused", repo, pr, f"protected:{hit[0]}")

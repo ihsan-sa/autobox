@@ -2,7 +2,8 @@
 
     gh(argv, root, token=None, timeout=120)  -> (rc, stdout, stderr). A member landing passes its workspace token:
         it goes in GH_TOKEN (GH_CONFIG_DIR at an empty dir outside the clone, members.gh_config_dir, so the box's
-        own login is never used) and is printed nowhere.
+        own login is never used) and is printed nowhere. A callable token (members.gh_token, the app's) is called
+        for each gh run; when it gives nothing, gh is not run at all.
     pr_facts(root, pr, fields) -> (dict, "") | (None, why)     one `gh pr view --json <fields> [-R <slug>]`
     pr_files(root, pr) -> [paths] | None · slug(root) -> "owner/name" | ""
     merge_state(root, pr) -> (state, merge_oid): GitHub's "MERGED"/"OPEN"/"CLOSED" and the squash commit's oid, or
@@ -69,6 +70,10 @@ def _note(rc: int, out: str, err: str) -> None:
 
 def gh(argv, root, token=None, timeout=120):
     env = dict(os.environ)
+    if callable(token):   # a member's app token (members.gh_token), asked for now: it lives an hour
+        token = token()
+        if not token:   # never None, which would run gh as the box's own login
+            return 1, "", "cc-gh-token handed out no app token for this workspace's repository — gh was not run"
     if token:
         from lander import members as M   # members imports nothing of this module
         try:

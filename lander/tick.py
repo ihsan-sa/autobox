@@ -87,9 +87,9 @@ def sweep_handed() -> list:
             end("queued again by hand")
             continue
         h = M.member_of(repo)[0]
-        genv = M.env(h) if h else None
+        genv = M.env(h, repo) if h else None
         root = J.repo_root(repo)
-        facts = GH.pr_facts(root, pr, "headRefOid,state", (genv or {}).get("GH_TOKEN"))[0] or {}
+        facts = GH.pr_facts(root, pr, "headRefOid,state", M.gh_token(h, repo) if h else None)[0] or {}
         state = facts.get("state") or ""
         if state in ("MERGED", "CLOSED"):
             end(f"the PR is {state.lower()}")

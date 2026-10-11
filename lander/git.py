@@ -51,7 +51,8 @@ refspec. A checkout with no URL there, a URL there that is not https://github.co
 rewrites that URL (url.<x>.insteadOf) is refused. A member's clone under the lander's own clones dir is the one
 exception: the lander made it and set its URL from the member's board row (members.member_clone).
 
-`env` adds to os.environ for one call (a member landing's GH_TOKEN, which gh's credential helper answers with).
+`env` adds to os.environ for one call (a member landing's GH_TOKEN, which gh's credential helper answers with, or
+for an app-org project the GIT_CONFIG_* naming cc-gh-token's helper instead: members.env).
 """
 from __future__ import annotations
 
@@ -434,12 +435,23 @@ def blind_env() -> dict:
 def hookless_env(**extra) -> dict:
     """blind_env() with no hook (core.hooksPath at /dev/null), no replace objects and no commit-graph, plus `extra`
     (GIT_DIR of a borrowed() repo, say). A GIT_CONFIG_* entry is command-line scope, so it outranks the checkout's
-    own config when git runs there (update-ref's reference-transaction hook)."""
+    own config when git runs there (update-ref's reference-transaction hook). GIT_CONFIG_* entries in `extra` (the
+    app's credential helper, members.env) are merged in ahead of these pins, so for a key both name the pin, being
+    last, wins; a KEY_/VALUE_ that its COUNT does not cover, or a COUNT that is not a number, is refused."""
+    mine = {k: extra.pop(k) for k in [k for k in extra if k.startswith("GIT_CONFIG_")]}
+    try:
+        n = int(mine.pop("GIT_CONFIG_COUNT", "0"))
+        theirs = [(mine.pop(f"GIT_CONFIG_KEY_{i}"), mine.pop(f"GIT_CONFIG_VALUE_{i}")) for i in range(n)]
+    except (ValueError, KeyError) as e:
+        raise ValueError(f"hookless_env: a malformed GIT_CONFIG_* entry ({e})") from None
+    if mine:   # GIT_CONFIG_GLOBAL, _NOSYSTEM and _PARAMETERS included: the blind pins are not the caller's to move
+        raise ValueError(f"hookless_env: {', '.join(sorted(mine))} would move its pins")
     env = dict(blind_env(), GIT_NO_REPLACE_OBJECTS="1")
-    n = int(env["GIT_CONFIG_COUNT"])
-    for k, v in (("core.hooksPath", os.devnull), ("core.commitGraph", "false")):
-        env[f"GIT_CONFIG_KEY_{n}"], env[f"GIT_CONFIG_VALUE_{n}"], n = k, v, n + 1
-    env["GIT_CONFIG_COUNT"] = str(n)
+    pins = [(env.pop(f"GIT_CONFIG_KEY_{i}"), env.pop(f"GIT_CONFIG_VALUE_{i}")) for i in range(int(env["GIT_CONFIG_COUNT"]))]
+    pairs = theirs + pins + [("core.hooksPath", os.devnull), ("core.commitGraph", "false")]
+    for i, (k, v) in enumerate(pairs):
+        env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = k, v
+    env["GIT_CONFIG_COUNT"] = str(len(pairs))
     env.update(extra)
     return env
 

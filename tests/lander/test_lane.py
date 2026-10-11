@@ -48,6 +48,8 @@ me, a = os.path.basename(sys.argv[0]), sys.argv[1:]
 box_path = os.environ["FAKE_BOX"]
 box = json.load(open(box_path))
 box.setdefault("calls", []).append([me] + a)
+if me == "gh":
+    box.setdefault("gh_tokens", []).append(os.environ.get("GH_TOKEN", ""))
 def save(): json.dump(box, open(box_path, "w"), indent=1)
 def out(rc, text="", err=""):
     save()
@@ -136,8 +138,15 @@ if me == "cc-pause":
     out(0 if a[1] in box.get("paused", []) else 1)
 if me == "cc-tier":
     out(1 if box.get("tier_stop") else 0)
-if me == "cc-gh-token":   # member_repos: a list for any owner, or {owner: [names]} so the owner asked for counts
-    r = box.get("member_repos", [])
+if me == "cc-gh-token" and a[0] == "--workspace":   # the helper's get: app_token, the credential protocol
+    box["cred_in"] = sys.stdin.read()
+    out(0, f"username=x-access-token\npassword={box['app_token']}") if box.get("app_token") else out(1, "", "refused")
+if me == "cc-gh-token" and a[0] == "gitargs":   # gitargs: {handle: the lines it prints}
+    out(box.get("gitargs_rc", 0), box.get("gitargs", {}).get(a[2] if len(a) > 2 else "", ""))
+if me == "cc-gh-token":   # member_repos: a list for any owner, or {owner: [names]} so the owner asked for counts;
+    r = box.get("member_repos", [])   # ws_repos: {handle: {owner: [names]}} so the workspace asked for counts too
+    if "ws_repos" in box:
+        r = box["ws_repos"].get(a[1], {})
     out(0, "\n".join(r.get(a[2] if len(a) > 2 else "", []) if isinstance(r, dict) else r))
 if me == "cc":
     if a[0] == "done":
@@ -558,6 +567,12 @@ class Members(Fixture):
             os.symlink(real, f"{d}/github-token")
         # the host-only clone, made ahead as a clone of the fixture origin (member_clone keeps an existing one)
         self.git(self.tmp, "clone", "-q", self.origin, f"{J.clones_dir()}/alice--proj")
+        # that bare repo stands in for github.com/own/proj, the row's URL, as ALLOW_LOCAL lets it stand in for a pin:
+        # an owner the credential choice cannot read would take the app's door (link_door fails closed)
+        real = M.url_owner
+        p = mock.patch.object(M, "url_owner", lambda url: "own" if url == self.origin else real(url))
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_workspace_and_no_token_refused(self):
         self.make_member(token=False)
@@ -729,6 +744,244 @@ class Members(Fixture):
         rc, _, err = self.queue("alice--proj", "3", "--no-start")
         self.assertEqual(rc, 1)
         self.assertIn("acme/other is not a repository of workspace alice", err)
+
+    def test_an_app_org_row_reaches_a_queued_job_and_nothing_wider_does(self):
+        # a workspace with no org token pushes to the app's org with cc-gh-token's installation token; its PR there
+        # is accepted when the host configured that installation and `cc-gh-token repos <h> <org>` lists the name
+        self.make_member()
+        self.set_box(config={"CC_GH_PERSONAL_OWNER": "own", "CC_GH_APP_OWNER": "appco", "CC_GH_APP_INSTALL_ID": "1"},
+                     ws_repos={"alice": {"own": ["proj"], "appco": ["proj"]}, "bob": {"appco": ["bobs"]}})
+        self.assertEqual(M.granted_orgs("alice"), set())   # no org token: the app org is the only door here
+        self.row_pr("https://github.com/AppCo/proj/pull/1")
+        self.pr(1, {"docs/r.md": "n\n"})
+        urls = []
+
+        def clone(repo, url):
+            urls.append(url)
+            return f"{J.clones_dir()}/{repo}", ""
+        with mock.patch.object(M, "member_clone", clone):
+            rc, _, err = self.queue("alice--proj", "1", "--no-start")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("queued alice--proj#1", self.log())
+        self.assertEqual(urls, ["https://github.com/appco/proj.git"])   # the host's spelling of the owner, not the row's
+        self.assertIn(["cc-gh-token", "repos", "alice", "appco"], self.box()["calls"])
+        # another workspace's repository in the app org: the membership check still runs, for alice, and refuses
+        self.row_pr("https://github.com/appco/bobs/pull/2")
+        rc, _, err = self.queue("alice--proj", "2", "--no-start")
+        self.assertEqual(rc, 1)
+        self.assertIn("appco/bobs is not a repository of workspace alice", err)
+        # a repository in no workspace's list
+        self.row_pr("https://github.com/appco/other/pull/3")
+        rc, _, err = self.queue("alice--proj", "3", "--no-start")
+        self.assertEqual(rc, 1)
+        self.assertIn("appco/other is not a repository of workspace alice", err)
+        # an org with no installation for this box: refused before cc-gh-token is asked
+        self.row_pr("https://github.com/elsewhere/proj/pull/4")
+        self.set_box(calls=[])
+        rc, _, err = self.queue("alice--proj", "4", "--no-start")
+        self.assertEqual(rc, 1)
+        self.assertIn("elsewhere/proj is not under an account this workspace was granted (appco, own)", err)
+        self.assertFalse([c for c in self.box()["calls"] if c[0] == "cc-gh-token"])
+        # the app org named but no installation configured: not accepted, the same refusal
+        self.set_box(config={"CC_GH_PERSONAL_OWNER": "own", "CC_GH_APP_OWNER": "appco"})
+        self.assertEqual(M.app_org(), "")
+        self.row_pr("https://github.com/appco/proj/pull/5")
+        rc, _, err = self.queue("alice--proj", "5", "--no-start")
+        self.assertEqual(rc, 1)
+        self.assertIn("appco/proj is not under an account this workspace was granted (own)", err)
+        self.assertEqual(urls, ["https://github.com/appco/proj.git"])
+        self.assertEqual(len(J.requests()), 1)
+
+    def app_box(self):
+        helper = "!/x/cc-gh-token --workspace alice"
+        self.set_box(config={"CC_GH_PERSONAL_OWNER": "own", "CC_GH_APP_OWNER": "appco", "CC_GH_APP_INSTALL_ID": "1"},
+                     ws_repos={"alice": {"own": ["proj"], "appco": ["proj"]}},
+                     gitargs={"alice": f"-c\ncredential.helper=\n-c\ncredential.helper={helper}\n-c\ncredential.useHttpPath=true"})
+        return helper
+
+    def clone_spy(self, url):
+        """member_clone on a fresh box with git clone itself stubbed: the argv and env each call got."""
+        shutil.rmtree(J.clones_dir())
+        seen, real_run = [], M.run
+
+        def spy(argv, cwd=None, timeout=60, env=None):
+            seen.append((argv, dict(env or {})))
+            return (0, "", "") if argv[:2] == ["git", "clone"] else real_run(argv, cwd=cwd, timeout=timeout, env=env)
+        with mock.patch.object(M, "run", spy):
+            self.assertEqual(M.member_clone("alice--proj", url)[1], "")
+        return [(a, e) for a, e in seen if a[:2] == ["git", "clone"]][0], [a for a, _ in seen]
+
+    def test_an_app_org_clone_and_fetch_use_the_app_helper_not_the_link(self):
+        self.make_member()
+        helper = self.app_box()
+        (argv, cenv), calls = self.clone_spy("https://github.com/appco/proj.git")
+        self.assertIn([f"{J.bin_dir()}/cc-gh-token", "gitargs", "https://github.com/appco/proj.git", "alice"], calls)
+        self.assertEqual((cenv["GIT_CONFIG_COUNT"], cenv["GIT_CONFIG_KEY_0"], cenv["GIT_CONFIG_VALUE_0"]),
+                         ("3", "credential.helper", ""))   # the reset first: gh's helper never answers
+        self.assertEqual((cenv["GIT_CONFIG_KEY_1"], cenv["GIT_CONFIG_VALUE_1"]), ("credential.helper", helper))
+        self.assertFalse([x for x in argv if "tok-value" in x or "cc-gh-token" in x])   # nothing of it in argv
+        self.assertEqual(cenv["GIT_TERMINAL_PROMPT"], "0")   # a refused helper fails the clone, never waits on a tty
+        # every later fetch: env() reads the clone's URL, the one the lander fetches from
+        root = f"{J.clones_dir()}/alice--proj"
+        self.git(self.tmp, "clone", "-q", self.origin, root)
+        self.git(root, "remote", "set-url", "origin", "https://github.com/appco/proj.git")
+        e = M.env("alice", "alice--proj")
+        self.assertEqual(e["GIT_CONFIG_VALUE_1"], helper)
+        self.assertNotIn("GH_TOKEN", e)   # the link's token rides along nowhere on the app's door
+        with open(f"{root}/.git/config") as f:
+            self.assertNotIn("cc-gh-token", f.read())
+        # gitargs names no helper: no credential at all, never a fall back to gh's
+        self.set_box(gitargs={})
+        self.assertEqual({k: v for k, v in M.env("alice", "alice--proj").items() if k.startswith("GIT_")},
+                         M.NO_CREDENTIAL)
+        # the app org that is also an org the workspace holds a token for keeps the link's path
+        self.org_grant(f"{self.home}/.cc/secrets/github-alice-appco.token")
+        self.set_box(config={"CC_GH_APP_OWNER": "appco", "CC_GH_APP_INSTALL_ID": "1"})
+        self.assertTrue(M.link_door("alice", "appco"))
+        self.assertFalse(M.link_door("bob", "AppCo"))
+
+    def test_env_with_no_repo_has_no_door_and_hands_out_no_token(self):
+        # no clone URL to choose a door by: never the link's token (a publish fetch reads member_token itself)
+        self.make_member()
+        self.app_box()
+        self.assertEqual(M.env("alice"), M.NO_CREDENTIAL)
+
+    def test_hookless_env_merges_a_callers_git_config_under_its_own_pins(self):
+        # a caller spreads members' env into hookless_env: a GIT_CONFIG_COUNT/KEY_0 of the caller's once
+        # replaced the pins, so a fetch ran with the clone's hooks and commit-graph
+        helper = "!/x/cc-gh-token --workspace alice"
+        e = G.hookless_env(GIT_DIR="/x", GIT_CONFIG_COUNT="3", GIT_CONFIG_KEY_0="credential.helper", GIT_CONFIG_VALUE_0="",
+                           GIT_CONFIG_KEY_1="credential.helper", GIT_CONFIG_VALUE_1=helper,
+                           GIT_CONFIG_KEY_2="core.hooksPath", GIT_CONFIG_VALUE_2="/evil")
+        pairs = [(e[f"GIT_CONFIG_KEY_{i}"], e[f"GIT_CONFIG_VALUE_{i}"]) for i in range(int(e["GIT_CONFIG_COUNT"]))]
+        self.assertEqual(pairs, [("credential.helper", ""), ("credential.helper", helper), ("core.hooksPath", "/evil"),
+                                 ("core.attributesFile", os.devnull), ("core.hooksPath", os.devnull),
+                                 ("core.commitGraph", "false")])
+        self.assertEqual(e["GIT_DIR"], "/x")
+        # what git itself reads from it: the pin, last, wins over the caller's; the helpers keep their order
+        got = lambda *a: subprocess.run(["git", "config", *a], env=dict(e, GIT_DIR=self.origin),  # noqa: E731
+                                        capture_output=True, text=True).stdout.split("\n")[:-1]
+        self.assertEqual(got("--get", "core.hooksPath"), [os.devnull])
+        self.assertEqual(got("--get-all", "credential.helper"), ["", helper])
+        self.assertEqual(G.hookless_env(GH_TOKEN="t")["GIT_CONFIG_COUNT"], "3")   # no entries of the caller's: as before
+        for bad in ({"GIT_CONFIG_COUNT": "x"}, {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "a", "GIT_CONFIG_VALUE_0": "b"},
+                    {"GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/evil"}, {"GIT_CONFIG_GLOBAL": "/evil"}):
+            with self.assertRaises(ValueError, msg=bad):
+                G.hookless_env(**bad)
+
+    def test_app_gitenv_names_no_credential_on_any_doubt(self):
+        self.make_member()
+        url = "https://github.com/appco/proj.git"
+        helper = self.app_box()
+        good = f"-c\ncredential.helper=\n-c\ncredential.helper={helper}"
+        self.assertEqual(M.app_gitenv("alice", url)["GIT_CONFIG_VALUE_1"], helper)   # control: a helper is named
+        for why, box in (("rc", {"gitargs_rc": 1, "gitargs": {"alice": good}}),
+                         ("odd", {"gitargs": {"alice": good + "\n-c"}}),
+                         ("no --workspace", {"gitargs": {"alice": "-c\ncredential.helper=\n-c\n"
+                                                                  "credential.helper=!/x/cc-gh-token"}})):
+            self.set_box(**dict({"gitargs_rc": 0}, **box))
+            self.assertEqual(M.app_gitenv("alice", url), M.NO_CREDENTIAL, why)
+
+    def test_a_failed_or_slow_config_read_never_hands_out_the_links_token(self):
+        # the link may be the owner's own token: a cc-config that fails or times out at Lane() once made every gh
+        # call and fetch of an app-org PR run as the owner (review of #1079). Each read, each way, on both URLs.
+        self.make_member()
+        self.app_box()
+        root = f"{J.clones_dir()}/alice--proj"
+        real_run = M.subprocess.run
+        for key in ("CC_GH_PERSONAL_OWNER", "CC_GH_APP_OWNER", "CC_GH_APP_INSTALL_ID"):
+            for how in ("fails", "times out"):
+                for url in ("https://github.com/appco/proj.git", "https://github.com/own/proj.git"):
+                    if key != "CC_GH_PERSONAL_OWNER" and "own/" in url:
+                        continue   # the owner's account reads only CC_GH_PERSONAL_OWNER
+                    with self.subTest(key=key, how=how, url=url):
+                        self.app_box()
+                        cfg = dict(self.box()["config"])
+                        if how == "fails":
+                            cfg[key] = False
+                        self.set_box(config=cfg, app_token="", gh_tokens=[])
+
+                        def slow(argv, *a, **kw):
+                            if argv[-2:] == ["get", key] and how == "times out":
+                                raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+                            return real_run(argv, *a, **kw)
+                        self.git(root, "remote", "set-url", "origin", url)
+                        with mock.patch.object(M.subprocess, "run", slow):
+                            lane = L.Lane("alice--proj", units={})
+                        self.assertTrue(callable(lane.token))
+                        self.assertNotIn("GH_TOKEN", lane.genv or {})
+                        self.assertEqual(GH.pr_facts(root, 1, "state", lane.token)[0], None)
+                        self.assertEqual(self.box()["gh_tokens"], [])   # gh never ran, as the link or the box
+        # control: the same reads answering keep the owner's account on the link's token
+        self.app_box()
+        self.git(root, "remote", "set-url", "origin", "https://github.com/own/proj.git")
+        self.assertEqual(M.gh_token("alice", "alice--proj"), "tok-value")
+        self.assertEqual((M.config_read("CC_GH_PERSONAL_OWNER"), M.config_read("NOT_SET")), ("own", ""))
+        self.set_box(config={"CC_GH_PERSONAL_OWNER": False})
+        self.assertIsNone(M.config_read("CC_GH_PERSONAL_OWNER"))
+        self.assertEqual(M.config("CC_GH_PERSONAL_OWNER", "d"), "d")   # the old readers keep their default
+
+    def test_removing_the_install_id_with_a_job_queued_never_reaches_the_link(self):
+        self.make_member()
+        self.app_box()
+        self.git(f"{J.clones_dir()}/alice--proj", "remote", "set-url", "origin", "https://github.com/appco/proj.git")
+        self.row_pr("https://github.com/appco/proj/pull/1")
+        self.pr(1, {"docs/r.md": "n\n"})
+        with mock.patch.object(M, "member_clone", lambda repo, url: (f"{J.clones_dir()}/{repo}", "")):
+            rc, _, err = self.queue("alice--proj", "1", "--no-start")
+        self.assertEqual(rc, 0, err)
+        # the host removes the installation; cc-gh-token then hands out no app token
+        self.set_box(config={"CC_GH_PERSONAL_OWNER": "own", "CC_GH_APP_OWNER": "appco"}, app_token="", gh_tokens=[])
+        u, _ = self.land("alice--proj")
+        j = self.job(1, "alice--proj")
+        self.assertNotEqual(j.state, T.DONE)
+        self.assertIn("gh was not run", j.extra.get("why", ""))
+        self.assertEqual((self.box()["gh_tokens"], self.box().get("merges", [])), ([], []))
+
+    def test_the_watch_and_the_door_card_ask_gh_with_the_app_token(self):
+        self.make_member()
+        self.app_box()
+        self.git(f"{J.clones_dir()}/alice--proj", "remote", "set-url", "origin", "https://github.com/appco/proj.git")
+        self.set_box(app_token="app-tok", gh_tokens=[], prs={"1": {"state": "MERGED"}})   # read, then the watch ends
+        os.makedirs(J.handed_dir(), exist_ok=True)
+        J.write_atomic(f"{J.handed_dir()}/alice--proj-1.json",
+                       {"repo": "alice--proj", "pr": 1, "branch": "", "head": "", "until": "2999-01-01T00:00:00Z"})
+        TK.sweep_handed()   # tick's pr_facts on a handed-back member PR
+        C._door_head(T.Job(repo="alice--proj", pr=1, member="alice"))   # the door card's head
+        self.assertEqual(self.box()["gh_tokens"], ["app-tok", "app-tok"])
+
+    def test_an_app_org_prs_gh_calls_carry_the_app_token_not_the_links(self):
+        self.make_member()
+        self.app_box()
+        self.set_box(app_token="app-tok")
+        root = f"{J.clones_dir()}/alice--proj"
+        self.git(root, "remote", "set-url", "origin", "https://github.com/appco/proj.git")
+        lane = L.Lane("alice--proj", units={})
+        self.set_box(gh_tokens=[])
+        GH.pr_facts(root, 1, "state", lane.token)
+        self.assertEqual(self.box()["gh_tokens"], ["app-tok"])
+        self.assertIn("path=appco/proj.git", self.box()["cred_in"])
+        self.assertTrue([c for c in self.box()["calls"] if c[:4] == ["cc-gh-token", "--workspace", "alice", "get"]])
+        # cc-gh-token refuses: gh is not run at all, so neither the link's token nor the box's login answers
+        self.set_box(app_token="", gh_tokens=[])
+        rc, _, err = GH.gh(["pr", "view", "1"], root, token=lane.token)
+        self.assertEqual((rc, self.box()["gh_tokens"]), (1, []))
+        self.assertIn("gh was not run", err)
+        # the owner's account keeps the link's token
+        self.git(root, "remote", "set-url", "origin", "https://github.com/own/proj.git")
+        self.assertEqual(M.gh_token("alice", "alice--proj"), "tok-value")
+
+    def test_a_personal_owner_clone_and_fetch_keep_the_links_token(self):
+        self.make_member()
+        self.app_box()
+        (argv, cenv), calls = self.clone_spy("https://github.com/own/proj.git")
+        self.assertEqual(cenv["GH_TOKEN"], "tok-value")
+        self.assertFalse([k for k in cenv if k.startswith("GIT_CONFIG")])
+        self.assertFalse([c for c in calls if "gitargs" in c])
+        root = f"{J.clones_dir()}/alice--proj"
+        self.git(self.tmp, "clone", "-q", self.origin, root)
+        self.git(root, "remote", "set-url", "origin", "https://github.com/own/proj.git")
+        self.assertEqual(M.env("alice", "alice--proj"), {"GH_TOKEN": "tok-value"})
 
     def test_walls(self):
         self.make_member()
