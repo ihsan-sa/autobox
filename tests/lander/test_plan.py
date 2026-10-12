@@ -172,7 +172,7 @@ class Parsing(unittest.TestCase):
         self.assertEqual(faults, [])
         self.assertEqual(sorted(c.name for c in checks if c.bare),
                          ["e2e-cc-context", "selfcheck-cc-fence", "selfcheck-cc-member-broker",
-                          "selfcheck-cc-member-import", "selfcheck-cc-sandbox"])
+                          "selfcheck-cc-member-import", "selfcheck-cc-member-v2", "selfcheck-cc-sandbox"])
 
     def test_a_name_that_could_write_log_fields_is_a_fault(self):
         # the queue log keeps `gate=<name>`, and the lane's express path reads check times back from it

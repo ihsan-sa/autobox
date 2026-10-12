@@ -863,6 +863,15 @@ miss=""; for probe in "Write|{\"file_path\":\"$wt/notes.md\"}" "Write|{\"file_pa
   "Bash|{\"command\":\"git -C ~/dev/$REPO log -1\"}" "Bash|{\"command\":\"git commit -m \\\"no cp into ~/bin\\\"\"}" "Bash|{\"command\":\"echo x > out.txt 2>&1\"}"; do
   [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "...and no wider: its worktree, /tmp, its own state dir, a READ from ~/dev, a git log there, and prose naming the verbs all pass" || bad "worker write fence over-blocks:$miss"
+# A WORKSPACE HANDED OVER FROM ANOTHER TRACK TAKES THE WRITE TOOL (row raised-guard-blocks-inherited-ws): a subdirectory
+# of another track's state dir in this repo, a runs/ deep inside it included; that track's top-level files and its own
+# runs/ (the loop's spend records), and another repo's state, stay refused.
+os=$HOME/.cc/state/$REPO/w2; miss=""
+for probe in "Write|{\"file_path\":\"$os/ws/x\"}" "Write|{\"file_path\":\"$os/ws/uart/runs/sim.log\"}"; do
+  [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 0 ] || miss="$miss allowed:${probe#*|}"; done
+for probe in "Write|{\"file_path\":\"$os/task.md\"}" "Write|{\"file_path\":\"$os/runs/x\"}" "Write|{\"file_path\":\"$HOME/.cc/state/$REPO-other/w2/ws/x\"}"; do
+  [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 2 ] || miss="$miss refused:${probe#*|}"; done
+[ -z "$miss" ] && ok "a Write lands in a workspace under another track's state dir, a runs/ inside it too, while that track's task.md and runs/ and another repo's state are refused" || bad "handed-over workspace fence:$miss"
 slug=$(printf '%s' "$wt" | tr '/.' '--')   # a worker that cd'd into ~/dev/<repo>: no marker under its cwd, so the transcript path (the dir it started in) anchors the fence
 c(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s","transcript_path":"%s"}' "$1" "$2" "$3" "$HOME/.claude/projects/$slug/s.jsonl" | CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?; }
 [ "$(c Write "{\"file_path\":\"$HOME/dev/$REPO/r.md\"}" "$HOME/dev/$REPO")" = 2 ] && [ "$(c Bash '{"command":"echo x > r.md"}' "$HOME/dev/$REPO")" = 2 ] && [ "$(c Write "{\"file_path\":\"$wt/x.md\"}" "$HOME/dev/$REPO")" = 0 ] \
