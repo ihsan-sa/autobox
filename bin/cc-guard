@@ -7,7 +7,8 @@
 # Denies (exit 2 + reason) the four owner gates:
 #   1. merge to default branch / deploy      2. external comms in owner's name
 #   3. destructive / infra ops               4. (spend is enforced by --max-budget-usd on headless workers)
-# …and three gates for EVERY session, gated role or not: nothing kills the shared tmux server; no pattern kill (pkill,
+# …and three gates for EVERY session, gated role or not: nothing kills the shared tmux server (a tmux kill that ssh
+# runs on another host is that host's, and passes: sshrc); no pattern kill (pkill,
 # killall, or a pgrep/pidof feeding kill through xargs or $(…)) goes through while what it would take includes a session,
 # a loop runner or the tmux server — read from the raw command, quotes and all, and resolved with pgrep at that moment;
 # and nothing names a GitHub org on the box's deny list (~/.cc/github-deny — cc-github-deny wires the same list into git
@@ -3154,6 +3155,119 @@ P70
   [ "$e1$e2" = 22222222222222222222222222222222222222200000000 ] || { r=1; echo "      a join or heredoc behind ) < > then #: $e1 (want 222222222222222222222222222222222222222); kept: $e2 (want 00000000)"; }
   ok "a # right after ) < or > that decides whether the next line is joined or a heredoc opens is refused, both readings of it (a subshell, a redirection, a \$( ), <( ), \$(( )), \${ }, @( )), and a heredoc behind a comment in a \"\$( keeps its gated body; with nothing joined on, quoted or in a body it still passes" "$r"
 
+  # 71. A TMUX COMMAND SSH RUNS ON ANOTHER HOST IS NOT THIS BOX'S SERVER (row raised-guard-reads-remote-tmux-kill-as-
+  #     local). `ssh <host> 'tmux kill-session -t x'` runs over there and passes; a tmux kill this box runs — bare, by
+  #     bash -c or sh -c, after the ssh, inside a "$( )" ssh's own shell expands here, in an option ssh runs here, or
+  #     an ssh whose host is this box — is still refused. Its own fixture: ssh, hostname and getent are stand-ins on the
+  #     PATH, so what "this box" is does not depend on the box the suite runs on: this box is box71 at 10.71.0.1, the
+  #     ssh config maps selfalias to 127.0.0.1 and gives proxied a jump host, and only literal addresses resolve.
+  #     Each stand-in notes its call in $S71/calls, and the case fails unless all three were the ones the gate ran
+  #     (review of #1104: g passes PATH=… into the hook's env, and this shows the real ones were not reached).
+  #     A \n in a row is a newline.
+  GERR=$T/err71; r=0; S71=$T/bin71; mkdir -p "$S71"
+  cat > "$S71/ssh" <<'S71'
+#!/bin/sh
+echo ssh >> "${0%/*}/calls"; h=""; o=""; pj=""
+while [ $# -gt 0 ]; do case $1 in -G|--) ;; -o) shift; case $1 in [Hh]ost[Nn]ame=*) o=${1#*=};; [Pp]roxy[Jj]ump=*) pj=${1#*=};; esac;; *) h=$1;; esac; shift; done
+h=${h#*@}; [ -n "$o" ] && h=$o; [ "$h" = selfalias ] && h=127.0.0.1; [ "$h" = proxied ] && pj=jump
+echo "hostname $h"; [ -n "$pj" ] && echo "proxyjump $pj"; echo "tunnel false"; echo "sessiontype default"
+case $h in fwdcfg) echo "remoteforward 2222 [127.0.0.1]:22"; echo "forwardagent no";; agentcfg) echo "forwardagent yes";; *) echo "forwardagent no";; esac; exit 0
+S71
+  printf '#!/bin/sh\necho hostname >> "${0%%/*}/calls"\ncase $1 in -I) echo 10.71.0.1;; *) echo box71;; esac\n' > "$S71/hostname"
+  printf '#!/bin/sh\necho getent >> "${0%%/*}/calls"\ncase $2 in localhost) echo "127.0.0.1 STREAM localhost";; *[!0-9.]*) exit 2;; *) echo "$2 STREAM";; esac\n' > "$S71/getent"
+  chmod +x "$S71/ssh" "$S71/hostname" "$S71/getent"
+  while IFS='|' read -r want what; do
+    [ -n "$want" ] || continue
+    what=${what//\\n/$'\n'}
+    : > "$GERR"; got=$(g Bash "$(jq -nc --arg c "$what" '{command:$c}')" "$T" PATH="$S71:$PATH")
+    if [ "$want" = 0 ]; then [ "$got" = 0 ] || { r=1; echo "      refused, want it run: $what ($(head -c 60 "$GERR"))"; }
+    else { [ "$got" = 2 ] && grep -qF 'shared tmux server' "$GERR"; } || { r=1; echo "      rc $got, want refused by the tmux rule: $what"; }; fi
+  done <<'W71'
+0|ssh host 'tmux kill-session -t x'
+0|ssh -o UserKnownHostsFile=/x peer 'tmux kill-session -t move-signin'
+0|ssh peer tmux kill-server
+0|ssh -p 22 me@10.9.0.2 "tmux kill-server"
+2|tmux kill-server
+2|tmux kill-session -t x
+2|bash -c 'tmux kill-server'
+2|sh -c 'tmux kill-session -t x'
+2|ssh peer x; tmux kill-server
+2|ssh peer x && bash -c 'tmux kill-server'
+2|ssh localhost 'tmux kill-server'
+2|ssh selfalias 'tmux kill-session -t x'
+2|ssh 10.71.0.1 'tmux kill-server'
+2|ssh -o HostName=box71 peer 'tmux kill-server'
+2|ssh proxied 'tmux kill-server'
+2|ssh -o ProxyCommand='tmux kill-server' peer true
+2|ssh peer "$(tmux kill-server)"
+2|ssh(){ eval "$2"; }; ssh peer 'tmux kill-server'
+0|ssh peer -- tmux kill-server
+0|ssh 10.9.0.2 -p 22 -- 'tmux kill-session -t x'
+0|ssh -- peer 'tmux kill-session -t x'
+0|ssh peer \\n 'tmux kill-session -t x'
+2|ssh -F /tmp/c71 peer 'tmux kill-server'
+2|# ; ssh 10.9.0.2 '\ntmux kill-server\n# '
+2|true # ; ssh 10.9.0.2 '\ntmux kill-server\n# '
+2|ssh 10.9.0.2 x \\n# '\ntmux kill-server\n'
+2|echo $'\'' ' ; ssh 10.9.0.2 '\ntmux kill-server\necho $'\''
+2|echo "${x/'"'/}"';ssh 10.9.0.2 '\ntmux kill-server\n'
+2|ssh -J jump self.internal 'tmux kill-server'
+2|ssh -J peer self.internal 'tmux kill-server'
+2|ssh -Jjump 10.9.0.2 'tmux kill-server'
+2|ssh -o ProxyJump=jump 10.9.0.2 'tmux kill-server'
+2|ssh -S /tmp/s71 10.9.0.2 'tmux kill-server'
+2|ssh -o ControlPath=/tmp/s71 10.9.0.2 'tmux kill-server'
+2|ssh peer x; /usr/bin/tmux kill-server
+2|ssh peer x; tm[u]x kill-server
+2|ssh peer x; {tmux,kill-server}
+2|ssh peer 'tm[u]x kill-server'
+2|ssh peer '/usr/bin/s?h box71 tmux kill-server'
+2|eval 'ss''h(){ eval "$2"; }'; ssh 10.9.0.2 'tmux kill-server'
+2|. ./f; ssh 10.9.0.2 'tmux kill-server'
+2|source ./f; ssh 10.9.0.2 'tmux kill-server'
+2|PATH=/home/x/bin:$PATH; ssh 10.9.0.2 'tmux kill-server'
+2|export PATH=/home/x/bin:$PATH; ssh 10.9.0.2 'tmux kill-server'
+2|PATH=/home/x/bin ssh 10.9.0.2 'tmux kill-server'
+2|hash -p /bin/sh ssh; ssh 10.9.0.2 'tmux kill-server'
+2|command_not_found_handle(){ eval "$2"; }; ssh 10.9.0.2 'tmux kill-server'
+2|true\nssh 10.9.0.2 'tmux kill-server'
+2|echo x | ssh 10.9.0.2 'tmux kill-server'
+0|ssh 10.9.0.2 'tmux kill-server'
+2|ssh -o 'LocalCommand tmux kill-server' -o PermitLocalCommand=yes 10.9.0.2 x
+2|ssh 10.9.0.2 'ssh 10.71.0.1 tmux kill-server'
+2|ssh 10.9.0.2 ssh 10.71.0.1 tmux kill-server
+2|ssh 10.9.0.2 "ssh box71 'tmux kill-server'"
+2|ssh 10.9.0.2 'autossh box71 tmux kill-server'
+2|ssh 10.9.0.2 "s''sh box71 tmux kill-server"
+2|ssh 10.9.0.2 'eval $X tmux kill-server'
+2|ssh -R 2222:127.0.0.1:22 10.9.0.2 'ssh -p 2222 127.0.0.1 tmux kill-server'
+2|ssh -R /tmp/x:/tmp/tmux-1000/default 10.9.0.2 'TMUX_TMPDIR=/tmp/y tmux kill-server'
+2|ssh -R /tmp/x:/tmp/tmux-1000/default 10.9.0.2 'tmux -S /tmp/x kill-server'
+2|ssh 10.9.0.2 -R 2222:127.0.0.1:22 'tmux kill-server'
+2|ssh -fNR 2222:127.0.0.1:22 10.9.0.2 'tmux kill-server'
+2|ssh -L 2222:127.0.0.1:22 10.9.0.2 'tmux kill-server'
+2|ssh -D 1080 10.9.0.2 'tmux kill-server'
+2|ssh -W 127.0.0.1:22 10.9.0.2 'tmux kill-server'
+2|ssh -A 10.9.0.2 'tmux kill-server'
+2|ssh -o 'RemoteForward /tmp/x /tmp/tmux-1000/default' 10.9.0.2 'TMUX_TMPDIR=/tmp/y tmux kill-server'
+2|ssh -oRemoteForward=2222:127.0.0.1:22 10.9.0.2 'tmux kill-server'
+2|ssh -o 'LocalForward 2222 127.0.0.1:22' 10.9.0.2 'tmux kill-server'
+2|ssh -o DynamicForward=1080 10.9.0.2 'tmux kill-server'
+2|ssh -o ForwardAgent=yes 10.9.0.2 'tmux kill-server'
+2|ssh -o Tunnel=yes 10.9.0.2 'tmux kill-server'
+2|ssh fwdcfg 'tmux kill-server'
+2|ssh agentcfg 'tmux kill-server'
+2|ssh 10.9.0.2 ssh\ 10.71.0.1\ tmux\ kill-server
+2|ssh 10.9.0.2 ssh\	10.71.0.1\	tmux\	kill-server
+2|ssh 10.9.0.2 ssh\ box71\ tmux\ kill-server
+2|ssh 10.9.0.2 true ssh\ box71\ tmux\ kill-server
+0|git commit -m "cc-guard: ssh peer tmux\ kill-server passes"
+0|ssh -t 10.9.0.2 'tmux kill-server'
+0|ssh -p 22 -o User=me 10.9.0.2 tmux kill-session -t 'move-signin'
+W71
+  for w in ssh hostname getent; do grep -qx "$w" "$S71/calls" 2>/dev/null || { r=1; echo "      the stand-in $w never ran: the rows read the real one"; }; done
+  ok "a tmux kill ssh runs on another host passes, quoted or not, a -- before or after the host or a line joined on included; a tmux kill on this box is still refused — bare, by bash -c or sh -c, after the ssh (by its path or a glob too), in a \$( ) or a ProxyCommand ssh's caller runs here, through a function named ssh, an -F file or a control socket, behind a comment, a \$' ' string or a \${ } whose quotes the walk would misread, by an ssh with any other statement on the line or an env word before it (one could make ssh something else), through a LocalCommand, or by ssh to loopback, an alias of it, this box's own name or address, or any host reached through a proxy or a -J jump, or by an ssh whose remote command hops on (another ssh, plain, nested in quotes or spelled by a glob or a quote the far shell reads) or that forwards a port, a socket, an agent or a tunnel (a flag, an -o or its config), the tmux -S form included" "$r"
+
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
   exit 0
@@ -4407,6 +4521,110 @@ kpat(){   # $1 = the verb, $@ = the argv after it. Prints "<-f seen>\t<pattern>"
   [ -n "$pat" ] || return 1
   printf '%s\t%s' "$full" "$pat"
 }
+# A TMUX COMMAND SSH CARRIES TO ANOTHER HOST IS THAT HOST'S SERVER, NOT THIS BOX'S. `ssh <host> 'tmux kill-session
+# -t x'` runs the tmux over there, and the gate below refused it as this box's server (row raised-guard-reads-
+# remote-tmux-kill-as-local: closing a leftover session on the peer box). sshrc prints the command with the REMOTE
+# COMMAND of each plain `ssh … <host> <words>` statement blanked to '', and the gate refuses only if the tmux kill
+# is still there once those are gone; every other rule reads the command as it was. It blanks nothing at all when
+# the text holds what this walk does not follow (a heredoc, a backtick, a `$(`, a `${` or a `$'` whose quotes bash
+# reads its own way, a `#` that starts a comment, an open quote, a function or alias named ssh; review of #1104: a
+# quote inside a comment or a `${x/'"'/}` hid a local kill as ssh's), and nothing unless the WHOLE command is that one
+# ssh statement: a statement before it can make `ssh` something else here (an eval'd or sourced function, a PATH, a
+# `hash -p`, a command_not_found_handle; security read of #1104 at 3587a496), so one after a `;`, a pipe, a newline
+# or a redirection is never blanked, and an env word before ssh is not ssh. In that statement it it stops at the first word that is not a plain word, a whole single-quoted string,
+# or a double-quoted one with no `$`, backtick or backslash: `ssh h "$(tmux kill-server)"` expands HERE and stays
+# refused. Only a statement whose first word is ssh itself counts, so `bash -c 'tmux kill-server'` and
+# `ssh h x; tmux kill-server` are untouched. Option values are never blanked, because ssh runs ProxyCommand and
+# LocalCommand on THIS box, and a statement with -F, -S or a ControlPath (a socket can lead anywhere) is left alone.
+# A -- after the host ends the options, and what follows is the command. The host must be shown to be elsewhere:
+# `ssh -G` resolves it with the statement's own -o options and its -J as ProxyJump, and a host that resolves to this
+# box (loopback, or a name or address of its own), that ssh -G cannot read, or that is reached through any proxy or
+# jump (the far end resolves it, and may land here) keeps the whole command unblanked. Every way out keeps the
+# refusal; this only ever takes one off. Only the first hop is resolved, so the remote command is blanked only when
+# the far shell reads it as plain words (no quote, $, ; or the like left once ssh's own quotes come off) and none of
+# them is an ssh, mosh, rsh or telnet that could hop on, back to this box; and never when the statement, or the config
+# ssh -G reads for it, forwards a port, a socket, an agent, X11 or a tunnel (-R, -L, -D, -W, -w, -A, -X, -Y, any
+# *Forward*/Tunnel/RemoteCommand option): a -R to this box's sshd or tmux socket is a way back (security read of
+# #1104 at e6747487).
+sshrc(){   # $1 = the raw command; prints it with remote ssh commands blanked, or unchanged
+  local c=${1//$'\001'/} out hosts hl host hn g g2 px ips ip me o; local -a oa ox
+  case $c in *'<<'*|*'`'*|*'$('*|*'${'*|*"\$'"*) printf '%s' "$c"; return;; esac
+  grep -qE '(^|[^A-Za-z0-9_.-])ssh[ \t]*\(|function[ \t]+ssh|alias[^;&|]*ssh=' <<<"$c" && { printf '%s' "$c"; return; }
+  out=$(awk -v SQ="'" '
+    function plain(w) { return w ~ /^[A-Za-z0-9_.\/=:,@%+~-]+$/ }
+    function sq(w) { return length(w) >= 2 && substr(w, 1, 1) == SQ && substr(w, length(w), 1) == SQ && index(substr(w, 2, length(w) - 2), SQ) == 0 }
+    function dq(w) { return w ~ /^"[^"$`\\!]*"$/ }
+    function unq(w) { return sq(w) ? substr(w, 2, length(w) - 2) : w }
+    function stmt(   i, j, L, v, host, opts, nb, k, ot) {   # W[1..nw] one statement: blank its remote command, note its host
+      if (W[1] != "ssh" && W[1] !~ /^\/(usr\/)?bin\/ssh$/) return
+      host = ""; opts = ""; nb = 0; ot = 0; split("", B)
+      for (i = 2; i <= nw; i++) {
+        if (!ot && (host == "" || !nb)) {   # ssh reads options before the host and again after it, up to the command
+          if (W[i] == "--") { ot = 1; continue }   # …and none after a --: the next word is the host, or the command
+          if (W[i] ~ /^-./) {
+            if (!plain(W[i])) return
+            for (j = 2; j <= length(W[i]); j++) { L = substr(W[i], j, 1)
+              if (index("ADLRWwXY", L)) return   # a forward or tunnel (-R back to this box, a forwarded agent or socket)
+              if (!index("BbcDEeFIiJLlmOoPpQRSWw", L)) continue
+              v = substr(W[i], j + 1); if (v == "") { if (++i > nw) return; v = W[i] }
+              if (L == "F" || L == "S") return
+              if (L == "o" || L == "J") { if (!plain(v) && !sq(v)) return; v = unq(v)
+                if (L == "J") v = "ProxyJump=" v; else if (tolower(v) ~ /^[ \t]*[a-z0-9]*(control|forward|tunnel|localcommand|remotecommand|streamlocal|sessiontype|permitremoteopen|gatewayports)[a-z0-9]*([ \t=]|$)/) return
+                opts = opts "\037" v }
+              break }
+            continue } }
+        if (host == "") { if (!plain(W[i])) return; host = W[i]; continue }
+        if (plain(W[i]) || sq(W[i]) || dq(W[i])) { B[i] = 1; nb++ } else return }   # a word it cannot read (a \ escape): none of it
+      if (!nb) return
+      for (k in B) { v = W[k]; if (sq(v) || dq(v)) v = substr(v, 2, length(v) - 2)   # the remote shell reads it once more:
+        if (v !~ /^[A-Za-z0-9_.\/=:,@%+~ \t-]*$/) return   # a quote, $, ; or anything it would read its own way keeps it
+        if (tolower(v) ~ /ssh|mosh|rsh|rlogin|telnet|dbclient/) return }   # …and so does a hop on from there, perhaps back here
+      for (k in B) W[k] = SQ SQ
+      H = H host opts "\n" }
+    function emit(   i) { if (nw) { ns++; stmt() } for (i = 1; i <= nw; i++) T = T G[i] W[i]; T = T G[nw + 1]; nw = 0; split("", W); split("", G) }
+    BEGIN { RS = "\001" }
+    { s = $0; n = length(s); q = ""; cur = ""; inw = 0
+      for (p = 1; p <= n; p++) { ch = substr(s, p, 1)
+        if (q != "") { cur = cur ch; if (ch == q) q = ""; else if (q == "\"" && ch == "\\") cur = cur substr(s, ++p, 1); continue }
+        if (ch == SQ || ch == "\"") { q = ch; cur = cur ch; inw = 1; continue }
+        if (ch == "\\" && substr(s, p + 1, 1) == "\n") { p++; if (!inw) G[nw + 1] = G[nw + 1] "\\\n"; continue }   # a line joined on
+        if (ch == "\\") { cur = cur ch substr(s, ++p, 1); inw = 1; continue }
+        if (ch == "#" && !inw) { printf "%s", s; exit }   # a comment: the shell reads no quote or separator in it
+        if (index(" \t;&|(){}\n<>", ch)) {
+          if (inw) { W[++nw] = cur; cur = ""; inw = 0 }
+          if (ch == " " || ch == "\t") { G[nw + 1] = G[nw + 1] ch; continue }
+          emit(); T = T ch; continue }   # a separator or a redirection ends the statement here
+        cur = cur ch; inw = 1 }
+      if (q != "") { printf "%s", s; exit }
+      if (inw) W[++nw] = cur
+      emit(); if (ns != 1) { printf "%s", s; exit }   # the whole command is that one ssh statement, or nothing is blanked
+      printf "%s\001%s", T, H }' <<<"$c")
+  case $out in *$'\001'*) ;; *) printf '%s' "$c"; return;; esac
+  hosts=${out#*$'\001'}
+  [ -n "$hosts" ] || { printf '%s' "$c"; return; }
+  me=" $(hostname -I 2>/dev/null) "; g=" $(hostname 2>/dev/null) $(hostname -s 2>/dev/null) $(hostname -f 2>/dev/null) "; g=${g,,}
+  while IFS= read -r hl; do
+    [ -n "$hl" ] || continue
+    IFS=$'\037' read -r -a oa <<<"$hl"; host=${oa[0]}; oa=("${oa[@]:1}")
+    ox=(); for o in "${oa[@]}"; do ox+=(-o "$o"); done
+    g2=$(timeout 3 ssh -G "${ox[@]}" -- "$host" 2>/dev/null) || { printf '%s' "$c"; return; }
+    hn=$(awk '$1 == "hostname" { print tolower($2); exit }' <<<"$g2"); [ -n "$hn" ] || { printf '%s' "$c"; return; }
+    px=$(awk '($1 == "proxycommand" || $1 == "proxyjump") && $2 != "none" { print 1; exit }' <<<"$g2")
+    [ -z "$px" ] || { printf '%s' "$c"; return; }   # the far end of a proxy picks the host, and it may be this box
+    # …and a forward, a tunnel or a command the config file adds is a way back here (a -R to this box's sshd or its
+    # tmux socket, a forwarded agent the far end can ssh back with), so one set there keeps the command unblanked too
+    px=$(awk '$1 ~ /^(remoteforward|localforward|dynamicforward|remotecommand|localcommand)$/ || ($1 ~ /^(forwardagent|forwardx11|permitlocalcommand)$/ && $2 != "no") || ($1 == "tunnel" && $2 != "false" && $2 != "no") || ($1 == "sessiontype" && $2 != "default") { print 1; exit }' <<<"$g2")
+    [ -z "$px" ] || { printf '%s' "$c"; return; }
+    case $hn in localhost|localhost.*|ip6-localhost|ip6-loopback|0.0.0.0|::|::1|127.*|::ffff:127.*) printf '%s' "$c"; return;; esac
+    case $g in *" $hn "*) printf '%s' "$c"; return;; esac
+    ips=$(timeout 3 getent ahosts "$hn" 2>/dev/null | awk '{ print $1 }' | sort -u)
+    for ip in $ips; do
+      case $ip in 0.0.0.0|::|::1|127.*|::ffff:127.*) printf '%s' "$c"; return;; esac
+      case $me in *" $ip "*) printf '%s' "$c"; return;; esac
+    done
+  done <<<"$hosts"
+  out=${out%%$'\001'*}; printf '%s' "${out%$'\n'}"   # less the newline the <<< put on
+}
 if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones and their subagents included): nothing may kill the shared tmux server
   uk=$(hay "$(jq -r '.tool_input.command // ""' <<<"$inp")")   # …with the statement lines marked: see cmdpos
   u=${uk//$'\001'/}   # every rule but the cd walk reads a NAME at ^, so the mark comes off here, not in a second pass
@@ -4423,8 +4641,27 @@ if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones a
   # never gated (security reads of #975), so it picks neither. A space before the `#`, or quotes round it, decides.
   case $uk in *$'\003'*) echo "cc-guard: blocked — a # right after ) < or > may or may not start a comment, and here that decides whether the next line is joined on or a heredoc opens, so the gates cannot tell what runs. Put a space before the # if it is a comment, or quote it if it is text." >&2; exit 2;; esac
   # …the name by its path as well (`/usr/bin/tmux kill-server` passed, and so did the glob deglob turns into it: review of #1101)
-  { grep -qE "$AT"'([^ ]*/)?(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +([^ ]*/)?tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
-    || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
+  tmuxkill(){ grep -qE "$AT"'([^ ]*/)?(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +([^ ]*/)?tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$1" \
+    || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$1"; }
+  # …and read again with what ssh carries to another host taken out (sshrc): only a kill still there reaches this box.
+  # That copy gets deglob's lines as $u did (`ssh peer x; tm[u]x kill-server`), worked out in a subshell so the
+  # dg, dgcap and dgsplit the gates below read stay the ones from the command as typed
+  # The first look takes an ssh at a command position with a tmux kill anywhere in its text once this shell's quotes
+  # and backslashes are gone: `ssh peer ssh\ box71\ tmux\ kill-server` is one word here and `ssh box71 tmux kill-server`
+  # over there, which hay never puts at a command position (security read of #1104 at e431595e). sshrc reads no
+  # such word, so the command stays refused.
+  sshtmux(){ grep -qE "$AT"'([^ ]*/)?ssh([[:blank:]]|$)' <<<"$1" && grep -qE 'tmux[[:blank:]]+kill-se[rs]' <<<"${2//[\\\'\"]/}"; }
+  uc=$(jq -r '.tool_input.command // ""' <<<"$inp")
+  { { tmuxkill "$u" || sshtmux "$u" "$uc"; } && { us=$(sshrc "$uc")
+      [ "$us" = "$uc" ] || { us=$(hay "$us"); us=${us//$'\001'/}
+        us+=$(dg=""; deglob "$us"; [ -z "$dg" ] || { dh=$(hay "${dg#$'\n'}"); dh=${dh//[$'\001\002\003']/}; [ -z "$dh" ] || dg+=$'\n'$dh; }; printf '%s' "$dg")
+        tmuxkill "$us"; }; }; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
+  # …and an ssh that forwards a port, a socket, an agent or a tunnel, next to any tmux …kill-server or …kill-session:
+  # `ssh -R /tmp/x:/tmp/tmux-1000/default peer 'tmux -S /tmp/x kill-server'` reaches this box's server through the
+  # socket it forwards, though the -S form passes everywhere else (security read of #1104). Read loosely on purpose.
+  { grep -qE '(^|[^A-Za-z0-9_.-])ssh[[:blank:]]([^;&|]*[[:blank:]])?-[A-Za-z]*[ADLRWwXY]' <<<"$u" || grep -qiE '(^|[^A-Za-z0-9_.-])ssh([[:blank:]]|$)[^;&|]*(forward|tunnel)' <<<"$u"; } \
+    && grep -qE 'tmux[^;&|]*kill-se[rs]' <<<"$u" \
+    && { echo "cc-guard: blocked — an ssh that forwards a port, socket or agent next to a tmux kill can reach the shared tmux server (every session on the box) through the forward; run the forward and the kill as separate commands, without the forward if the kill is for the other host" >&2; exit 2; }
   # THE PERMISSION SEAT'S LAUNCH IS NOBODY'S TO TYPE — universal, every tier, the seat itself included. `cc
   # __runperms <id> <sid>` starts a claude with --dangerously-skip-permissions on the seat's brief.md, and `cc-handoff
   # --perms-dir` is the question it asks first; the only caller of either is the tmux window cc-handoff --overlap perms
