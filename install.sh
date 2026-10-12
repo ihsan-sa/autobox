@@ -187,6 +187,7 @@ if [ "$etc" = 1 ]; then
   h=/etc/ssh/sshd_config.d/10-hardening.conf                # test BEFORE keeping it: a bad file locks the box out
   if [ -f "$h" ]; then sudo cp -a "$h" "$h.bak"; fi         # sshd includes *.conf only, so the .bak is inert
   sudo install -m 644 "$E/10-hardening.conf" "$h"
+  sudo install -d -m 0755 /run/sshd   # sshd -t needs it; with ssh.socket a fresh box has none until sshd first runs
   if ! sudo sshd -t; then
     if [ -f "$h.bak" ]; then sudo mv -f "$h.bak" "$h"; else sudo rm -f "$h"; fi
     echo "install.sh: sshd -t rejected the new $h — restored the previous sshd config, nothing changed" >&2; exit 1
