@@ -34,7 +34,8 @@ checkout. `bin/cc-land` is the old name kept as a thin shim, so every caller tha
    `LAND` or `HANDBACK`, and a handback leaves the queue with the findings on the row. A handback still standing
    from an earlier head gets a delta read at the new head even when the change touches no paid path. A handback
    by a reader whose name says `security` stands until a later LAND by such a reader, and a PR whose comments
-   gh cannot give is held, never merged.
+   gh cannot give is held, never merged. The reader names in a review record are labels, not identities: they
+   say which read it was, and prove nothing about who made it.
 5. **Merge.** One merge lane per repo, `--squash --match-head-commit`. The board row closes and the approval card
    turns to landed.
 6. **Tip and deploy.** The tick runs the tip checks the merged range reaches, then deploys merged main target by
