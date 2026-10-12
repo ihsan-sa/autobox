@@ -60,6 +60,14 @@ EOS
   ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" >/dev/null 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1)" "an untracked file added after the run also moves the tree"
   rm -rf "$D2"
+  # 1b A RUN INSIDE A WORKER'S FENCE says so in its verdict (caged=1), and cc-try will not put a PR live on it.
+  D2=$(mktemp -d); R=$(newrepo caged); echo bwrap > "$D/pid1"; echo systemd > "$D/pid1-host"
+  ( cd "$R" && CC_GREEN_PID1_COMM="$D/pid1" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 )
+  k "$(t grep -qx caged=1 "$D2"/*.verdict)" "a run where pid 1 is bwrap writes caged=1 into its verdict"
+  rm -rf "$D2"; D2=$(mktemp -d)
+  ( cd "$R" && CC_GREEN_PID1_COMM="$D/pid1-host" CC_GREEN_DIR="$D2" "$SELF" run >/dev/null 2>&1 )
+  k "$(nt grep -q caged "$D2"/*.verdict)" "…and a run on the host does not"
+  rm -rf "$D2"
   D2=$(mktemp -d); R=$(newrepo never)
   out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
   k "$(t test "$rc" -eq 1 -a -n "$(grep 'no verdict on this worktree' <<<"$out")")" "a worktree nothing has run on is not green, exit 1"

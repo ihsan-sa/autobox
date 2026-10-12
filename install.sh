@@ -146,6 +146,12 @@ grep -qF 'PATH="$HOME/bin:$PATH"' ~/.bashrc 2>/dev/null || cat >> ~/.bashrc <<'B
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac
 B
+# cc-try's overlay ahead of ~/bin, in its own block so a box whose ~/.bashrc already has the one above gets it too
+grep -qF 'PATH="$HOME/.cc/try/bin:$PATH"' ~/.bashrc 2>/dev/null || cat >> ~/.bashrc <<'B'
+
+# autobox try overlay — tools `cc-try on` put live from a green, unlanded PR, ahead of ~/bin (empty otherwise)
+case ":$PATH:" in *":$HOME/.cc/try/bin:"*) ;; *) PATH="$HOME/.cc/try/bin:$PATH";; esac
+B
 
 if [ "$services" = 1 ]; then
   sudo -n loginctl enable-linger "$USER" 2>/dev/null || true

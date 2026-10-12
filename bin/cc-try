@@ -1,0 +1,800 @@
+#!/usr/bin/env python3
+"""cc-try — put a green, unlanded PR's tools live on this box now, and take them out again by itself.
+
+The landing can take hours, and a fix that is needed now should not wait for it (owner, 2026-10-11: run from the
+prototype, "with a bit more risk but at least working"). cc-try checks the PR's head out on its own and points the
+box at the tools that PR changes. When main has the change, or the PR stops being the thing that was tried, the
+box goes back to main without anyone being asked.
+
+  cc-try on <repo> <pr>     check the PR's head out at ~/.cc/try/co/<repo>-<pr> (not under ~/.cc/worktrees, where a
+                            track named try-<n> would get a writable bind onto it), link each tool it changes
+                            (core/bin/*, bin-private/*, bin/*) into ~/.cc/try/bin, which every session, worker and
+                            shell has ahead of ~/bin on its PATH, and give each user unit whose ExecStart runs one
+                            of those tools a drop-in that runs it from the overlay instead. A unit that is running
+                            and is not a oneshot is restarted; a timer's oneshot picks it up on its next run.
+  cc-try on <repo> --branch <branch|worktree>
+                            a HOT PATCH: a committed branch (or a worktree's HEAD) with no PR yet, put live the same
+                            way once each tool it changes passes its own `selfcheck` at that commit (a tool with no
+                            selfcheck is refused). Each changed tool's `<tool> selfcheck` is run in the checkout
+                            and must exit 0 and print the tally check.sh reads (`<tool> selfcheck: <k> passed,
+                            0 failed`). It expires 24 h after it went live unless a PR whose head IS that commit has
+                            been opened by the box's own gh login or the repo's owner; then it follows that PR's
+                            life like any try. Uncommitted edits in
+                            a worktree are not part of it.
+  cc-try off <repo> <pr>    undo exactly that: the links, the drop-ins (and a restart of what was restarted), the
+                            checkout and the record. Links and drop-ins cc-try did not write are left alone. The
+                            checkout removed is ~/.cc/try/co/<key>, worked out from the record's key and never read
+                            from the record; a key that is not one cc-try makes, or resolves outside ~/.cc/try/co,
+                            is not acted on.
+  cc-try off <repo> --branch <branch|worktree|head>
+                            the same for a hot patch, named as it was put on (or by its head)
+  cc-try list               what is live: the PR, the head, since when, which tools and which units; hot patches with
+                            no PR are listed apart, with their expiry
+  cc-try check              the reconcile timer's pass over what is live — a systemd timer, so it runs with no
+                            session alive; it turns a try off when
+                            - the try's guard files differ from the live checkout's, as `on` refuses (a guard fix
+                              deployed since it went live), whatever the PR's state and whether or not gh answers;
+                            - the PR merged and the live checkout (~/dev/<repo>) holds its merge commit, so main's
+                              copy is the same change (merged but not yet deployed stays on until it is);
+                            - the PR closed without merging;
+                            - the PR has a new head: the try is DROPPED, not moved, because the new head has not
+                              been gated — whoever wants it back runs `on` again once it is green;
+                            - a hot patch reached its expiry with no PR at its head (this does not wait on gh);
+                            - a tried tool's overlay link is gone;
+                            - a changed tool's own `selfcheck` fails at the tried head (run at most hourly per try).
+                            A PR it cannot read this pass is left as it is and asked again next pass. Then it sweeps
+                            any link into ~/.cc/try/co and any cc-try drop-in that no record owns.
+  cc-try digest [hours]     the ons, offs and adoptions of the last 24 h (or [hours]), for cc-reconcile's daily
+                            digest; hot patches are named as such, and every name is stripped of Slack markup
+  cc-try hint <repo> <pr|url> <track>
+                            the one line cc-loop adds to what the dispatching seat hears when a track finishes: the
+                            `cc-try on` command, said as ready when the track's host cc-green verdict is green at its
+                            HEAD; nothing when the PR changes no tool or touches a file that guards the box
+  cc-try selfcheck          fixtures only: a HOME of its own, gh and systemctl stubbed
+
+WHO RUNS IT: on, off and check write ~/.cc/try, so cc-guard refuses them to every gated role (a worker, a member, a
+retired session in handoff), as it refuses cc-land; the owner's own shell, a planning seat and the reconcile timer run
+them. list, digest, hint and selfcheck write nothing and stay open. It reads ~/dev, ~/.cc/state/land/green and
+~/.cc/try under HOME and takes no environment override for any of them.
+
+WHAT IT REFUSES, saying why, before it changes anything:
+  - a repo that is not one of the box's own: it needs a board, a checkout at ~/dev/<repo>, no throwaway mark, and it
+    must not be a member workspace (a board that links into ~/.cc/members, or a ~/.cc/members/<repo>): a member's PR
+    is opened with the member's own token, and its code never runs here as the owner, unfenced;
+  - a PR the box's workers did not open: its author must be the box's own gh login, its branch a `track/` branch of
+    the same repo (not a fork);
+  - a head whose gates are not green: the worker's cc-green verdict (~/.cc/state/land/green) for that track's
+    worktree must say `lander check` passed on exactly the head's tree, on the host (a verdict marked caged=1 was
+    written inside a worker's fence and does not count);
+  - a PR that changes any file that guards the box — cc-guard and cc-harness-codex (the Codex guard hook), the hooks, the sandbox, settings, the lander and its
+    lists, cc-approve and the permission tools and files, the CLAUDE.md rule sources, the unit installer, the tools
+    that start, fence or speak for a session (cc, cc-loop, cc-rc, cc-room, cc-tier, cc-member-*, gh, cc-msg, cc-mail,
+    cc-publish), and cc-try itself — or anything on the landing's gate_first, lander or paid_review lists in the live
+    checkout's tests/LANDING-policy.toml. Those keep the full landing, because a broken guard is the attack surface;
+  - a head whose guard files (the same list) differ from the live checkout's at all, a PR's or a hot patch's: a tried
+    tool resolves its siblings in the try checkout, so it would run beside an older or an edited cc-guard, cc-trust
+    or cc-harness-codex. Rebase it onto main and gate it again;
+  - a tool whose NAME is a guard's in any tool dir (the overlay is keyed by name, so bin-private/cc-land would
+    shadow core/bin/cc-land), and a tool ~/bin does not already run from that same file in ~/dev/<repo>: the
+    overlay sits ahead of ~/.local/bin and /usr/bin, so a new name (claude, git, sudo) would shadow them;
+  - two changed tools with one name, 100 or more changed files, a PR with no tool to put live, a tool another live
+    try already holds, a unit already running from another try, and a checkout path that already exists.
+
+~/.cc/try IS FENCED by cc-guard like ~/bin (its bin/ sits ahead of ~/bin on every PATH): only cc-try writes there.
+
+THE RECORD IS WRITTEN FIRST (~/.cc/try/live/<key>.json), before the checkout, the links or the drop-ins, and any
+failure on the way rolls back everything that call did and says so, so nothing goes live without a record that
+`off` and `check` can undo.
+
+WHAT GOES LIVE is the changed tools, and only those. A changed tool runs from the try checkout, so the helpers it
+reads beside itself (its tests/selfcheck, a sibling it calls by its own resolved dir) are the PR's too. A changed
+file that is not a tool goes live only through a changed tool that reads it, and a deleted tool stays live from
+main. A session already running keeps the PATH it started with; new sessions, workers, shells and units see it.
+
+EVERY ON, OFF, ADOPTION AND ROLLBACK IS A LEDGER LINE in ~/.cc/try/ledger.jsonl ({at, op, kind, repo, pr, branch,
+head, tools, units, by, reason}), and `digest` is how the owner sees them in the daily digest.
+"""
+import fcntl, hashlib, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+HOME = Path(os.path.expanduser("~"))
+DEV = HOME / "dev"           # no env override: a caller must not point cc-try at a checkout or verdict it made
+TRY = HOME / ".cc" / "try"
+OVERLAY, LIVE, LEDGER = TRY / "bin", TRY / "live", TRY / "ledger.jsonl"
+# The try checkouts live under ~/.cc/try, NOT ~/.cc/worktrees: a worker's fence binds ~/.cc/worktrees/<repo>/<track>
+# writable, so a track named try-<n> would have been handed the live tool's checkout (security read of #1086).
+CHECKOUTS = TRY / "co"
+KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}-(?:[0-9]{1,9}|patch-[0-9a-f]{12})$")
+WORKTREES = HOME / ".cc" / "worktrees"
+GREEN = HOME / ".cc" / "state" / "land" / "green"
+UNITS = HOME / ".config" / "systemd" / "user"
+REPO_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,80}$")
+TOOL_DIRS = ("core/bin/", "bin-private/", "bin/")
+SELFCHECK_EVERY = 3600
+PATCH_TTL = 24 * 3600              # "it expires by itself after 24 h unless a PR carrying the same change has been opened"
+
+# The files that guard the box, as repo-root globs (`*` stays in one segment, `**` crosses them). The brief's list:
+# "cc-guard, hooks, the sandbox, settings, the lander, cc-approve, permission files, and the CLAUDE.md rule sources".
+GUARDS = [
+    ("the guard", ["core/bin/cc-guard", "core/bin/cc-harness-codex"]),   # cc-harness-codex: the Codex guard hook
+    ("a hook every session runs", ["core/.githooks/**", "**/hooks/**", "core/bin/cc-checkpoint",
+                                   "core/bin/cc-refusals", "core/bin/cc-subagent-bound", "core/bin/cc-statusline"]),
+    ("the sandbox", ["core/bin/cc-sandbox", "core/bin/ccbox", "core/ccbox/**", "core/bin/cc-fence", "core/bin/cc-egress"]),
+    ("settings", ["**/claude-settings.json", "**/settings*.json", "core/bin/cc-settings"]),
+    ("the landing", ["core/lander/**", "core/bin/lander", "core/bin/lander-self", "core/config/lander/**",
+                     "core/tests/lander/**", "core/bin/cc-land", "core/bin/cc-green", "core/tests/green.sh",
+                     "core/tests/gate-first", "core/tests/control-layer", "**/LANDING*.toml", "**/reach.tsv"]),
+    ("approvals and permissions", ["core/bin/cc-approve", "core/bin/cc-trust", "core/bin/cc-scope", "core/bin/cc-config",
+                                   "core/bin/cc-gh-token", "core/bin/cc-gh-org", "core/bin/cc-github-deny",
+                                   "core/bin/git-remote-cc-github-deny", "**/*perm*", "**/*allow*"]),
+    ("a CLAUDE.md rule source", ["**/CLAUDE.md", "home/*.md", "core/home/**", "core/templates/**"]),
+    ("what installs the box's units", ["core/install.sh", "**/systemd-user/**", "**/units.json", "core/bin/cc-units"]),
+    # cc-loop decides the bwrap wrap; cc, cc-rc and cc-room start sessions; cc-tier sets their spend; gh, cc-msg and
+    # cc-publish speak for the box outward, and cc-mail sends in the owner's name; the cc-member-* tools draw the member-workspace boundary.
+    ("what starts, fences or speaks for a session", ["core/bin/cc", "core/bin/cc-loop", "core/bin/cc-rc", "core/bin/cc-room",
+                                                     "core/bin/cc-tier", "core/bin/cc-member*", "core/bin/gh",
+                                                     "core/bin/cc-msg", "core/bin/cc-mail", "core/bin/cc-publish"]),
+    ("cc-try itself", ["core/bin/cc-try", "core/tests/selfcheck/cc-try.py"]),
+]
+
+
+def glob_re(g):
+    out, i = "", 0
+    if g.startswith("**/"):                            # `**/x` matches x at the root too
+        out, i = "(?:.*/)?", 3
+    while i < len(g):
+        if g.startswith("**", i): out, i = out + ".*", i + 2
+        elif g[i] == "*": out, i = out + "[^/]*", i + 1
+        else: out, i = out + re.escape(g[i]), i + 1
+    return re.compile("^" + out + "$")
+
+
+def policy_guards(repo):
+    """gate_first, lander and paid_review from the LIVE checkout's tests/LANDING-policy.toml — main's, never the PR's."""
+    p = DEV / repo / "tests" / "LANDING-policy.toml"
+    try:
+        import tomllib
+        d = tomllib.loads(p.read_text())
+    except Exception:
+        return []
+    paths = d.get("paths") or {}
+    return [(f"on the landing's {k} list", list(paths.get(k) or [])) for k in ("gate_first", "lander", "paid_review")]
+
+
+def guard_of(path, repo):
+    for why, globs in GUARDS + policy_guards(repo):
+        if any(glob_re(g).match(path) for g in globs):
+            return why
+    return None
+
+
+def guard_of_name(name, repo):
+    """The overlay is keyed by basename, so bin-private/cc-land would shadow core/bin/cc-land: a tool's name is a
+    guard when it is one in ANY tool dir."""
+    for d in TOOL_DIRS:
+        why = guard_of(d + name, repo)
+        if why:
+            return f"{why}, as {d}{name}"
+    return None
+
+
+def safe(s):
+    """A name or branch as the Slack digest may show it: no mrkdwn, no links, no mentions."""
+    return re.sub(r"[^A-Za-z0-9._+#/ -]", "", str(s))[:120]
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime())
+
+
+def run(*cmd, cwd=None, timeout=120):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def out(*cmd, cwd=None, timeout=120):
+    r = run(*cmd, cwd=cwd, timeout=timeout)
+    return r.stdout.strip() if r is not None and r.returncode == 0 else None
+
+
+class Refused(Exception):
+    pass
+
+
+def ledger(op, rec, by, reason=""):
+    TRY.mkdir(parents=True, exist_ok=True)
+    line = {"at": now(), "op": op, "kind": rec.get("kind", "pr"), "repo": rec["repo"], "pr": rec.get("pr"),
+            "branch": rec.get("branch", ""), "head": rec["head"], "tools": rec.get("tools", []),
+            "units": [u["unit"] for u in rec.get("units", [])], "by": by, "reason": reason}
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps(line) + "\n")
+
+
+def lock():
+    TRY.mkdir(parents=True, exist_ok=True)
+    fh = open(TRY / ".lock", "w")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
+
+
+def live_file(key):
+    return LIVE / f"{key}.json"
+
+
+def save(rec):
+    LIVE.mkdir(parents=True, exist_ok=True)
+    tmp = LIVE / f".{rec['key']}.tmp"
+    tmp.write_text(json.dumps(rec, indent=1) + "\n")
+    os.replace(tmp, live_file(rec["key"]))
+
+
+def label(rec):
+    return f"{rec['repo']}#{rec['pr']}" if rec.get("pr") else f"hot patch {rec['repo']} {rec.get('branch') or rec['head'][:12]}"
+
+
+def records():
+    out_ = []
+    for p in sorted(LIVE.glob("*.json")) if LIVE.is_dir() else []:
+        try: r = json.loads(p.read_text())
+        except (OSError, ValueError): continue
+        # a record whose key is not one cc-try makes, or is not its own file's name, is not cc-try's to act on
+        if isinstance(r, dict) and checkout_of(r.get("key")) and p.stem == r["key"]:
+            out_.append(r)
+    return out_
+
+
+def pr_view(repo, pr):
+    r = run("gh", "pr", "view", str(pr), "--json",
+            "number,state,headRefOid,headRefName,isCrossRepository,author,mergeCommit,files", cwd=DEV / repo, timeout=60)
+    if r is None or r.returncode != 0:
+        return None
+    try: return json.loads(r.stdout)
+    except ValueError: return None
+
+
+def systemctl(*a):
+    return run("systemctl", "--user", *a, timeout=120)
+
+
+# ---------------------------------------------------------------------------------------------------------- on
+
+def check_repo(repo):
+    if not REPO_RE.match(repo) or "--" in repo:
+        raise Refused(f"'{repo}' is not one of the box's own repos (a member workspace or not a repo name)")
+    board = HOME / ".cc" / "boards" / f"{repo}.json"
+    if not board.is_file():
+        raise Refused(f"{repo} has no board, so it is not one of the box's own repos")
+    # A member workspace's board is a link into ~/.cc/members/<h>/board, and its PRs are opened with the member's own
+    # token, so the author check alone would pass them: their code never runs here as the owner, unfenced.
+    members = os.path.realpath(HOME / ".cc" / "members") + "/"
+    if board.is_symlink() or os.path.realpath(board).startswith(members) or (HOME / ".cc" / "members" / repo).exists():
+        raise Refused(f"{repo} is a member workspace; its code runs only inside its own fence, never live here")
+    if (HOME / ".cc" / "throwaway" / repo).exists():
+        raise Refused(f"{repo} is a throwaway repo; nothing of it runs live")
+    if not (DEV / repo / ".git").exists():
+        raise Refused(f"there is no live checkout at {DEV / repo}")
+
+
+def green_on(repo, track, tree):
+    """The track worktree's cc-green verdict: `lander check` passed (check=0) on exactly this tree, on the host."""
+    wt = WORKTREES / repo / track
+    key = hashlib.sha1(os.path.realpath(wt).encode()).hexdigest()[:12]
+    try: v = dict(l.split("=", 1) for l in (GREEN / f"run-{key}.verdict").read_text().splitlines() if "=" in l)
+    except OSError: return False, f"no cc-green verdict for the worktree {wt}"
+    if v.get("tree") != tree:
+        return False, f"its last cc-green verdict ({v.get('at', '?')}) is on tree {v.get('tree', '?')[:12]}, not the head's {tree[:12]}"
+    if v.get("caged") == "1":                       # a worker writes its own fence's files; only a host verdict counts
+        return False, f"its cc-green verdict ({v.get('at', '?')}) was written inside a worker's fence"
+    if v.get("check") != "0":
+        return False, f"cc-green says lander check did not pass on the head's tree (exit {v.get('check')}, {v.get('at', '?')})"
+    return True, ""
+
+
+def unit_files():
+    for p in sorted(UNITS.glob("*.service")) if UNITS.is_dir() else []:
+        if "@." not in p.name:
+            yield p
+
+
+def exec_lines(text):
+    return [l.split("=", 1)[1] for l in text.splitlines() if re.match(r"\s*ExecStart\s*=", l)]
+
+
+def tool_re(tool):
+    return re.compile(r"(%h|" + re.escape(str(HOME)) + r")/bin/" + re.escape(tool) + r"(?=\s|$)")
+
+
+def check_guards(repo, files):
+    if len(files) >= 100:
+        raise Refused(f"it changes {len(files)} files, more than gh lists; too big to try")
+    guarded = [(f, guard_of(f, repo)) for f in files]
+    guarded = [(f, w) for f, w in guarded if w]
+    if guarded:
+        raise Refused("it changes files that guard the box, which keep the full landing: "
+                      + "; ".join(f"{f} ({w})" for f, w in guarded))
+
+
+def check_guard_drift(repo, head):
+    """A tried tool resolves its siblings in the try checkout, so cc-guard, cc-trust or cc-harness-codex next to it
+    are the head's copies. A head whose guard files differ from the live checkout's (an older base, or an edit) is
+    refused, so a tried tool never runs beside an older or edited guard (security read of #1086 at 259aa5bc)."""
+    r = run("git", "-C", str(DEV / repo), "diff", "--name-only", "HEAD", head, timeout=120)
+    if r is None or r.returncode != 0:
+        raise Refused(f"could not compare {head[:12]}'s guard files with the live checkout's")
+    drift = [f for f in r.stdout.splitlines() if f and guard_of(f, repo)]
+    if drift:
+        raise Refused(f"{head[:12]}'s guard files differ from the live checkout's ({', '.join(drift[:6])}"
+                      f"{', …' if len(drift) > 6 else ''}); rebase it onto main and gate it again")
+
+
+def plan(repo, head, files):
+    """What would go live for these changed files at this head: (tools, units), or Refused saying why. Changes nothing."""
+    check_guards(repo, files)
+    check_guard_drift(repo, head)
+    git = ["git", "-C", str(DEV / repo)]
+    tools, seen = [], {}
+    for f in files:
+        d = next((d for d in TOOL_DIRS if f.startswith(d)), None)
+        name = f[len(d):] if d else ""
+        if not name or "/" in name or not (out(*git, "ls-tree", head, "--", f) or "").startswith("100755"):
+            continue                                  # not a tool, or deleted at the head (main's copy stays live)
+        if not NAME_RE.match(name):
+            raise Refused(f"{f}: '{name}' is not a tool name cc-try puts live")
+        why = guard_of_name(name, repo)
+        if why:
+            raise Refused(f"{f} has the name of a file that guards the box ({why}); it keeps the full landing")
+        if name in seen:
+            raise Refused(f"{seen[name]} and {f} share the name {name}, and the overlay holds one tool per name")
+        # ONLY A NAME ~/bin ALREADY RUNS FROM THIS FILE: the overlay sits ahead of ~/.local/bin and /usr/bin, so a new
+        # name (claude, git, sudo) or another tool's name would shadow it for every new session.
+        if os.path.realpath(HOME / "bin" / name) != os.path.realpath(DEV / repo / f) or not (HOME / "bin" / name).exists():
+            raise Refused(f"{name} is not a tool ~/bin runs from {DEV / repo / f}; a new name, or one ~/bin takes "
+                          "from elsewhere, never goes live by cc-try")
+        seen[name] = f
+        tools.append((name, f))
+    if not tools:
+        raise Refused(f"it changes no tool under {', '.join(TOOL_DIRS)}, so there is nothing to put live")
+    for name, _ in tools:
+        if os.path.lexists(OVERLAY / name):
+            raise Refused(f"{name} is already in the overlay ({os.readlink(OVERLAY / name) if (OVERLAY / name).is_symlink() else 'a file'}); "
+                          "another try holds it")
+    units = []
+    for p in unit_files():
+        lines = exec_lines(p.read_text())
+        hit = [n for n, _ in tools if any(tool_re(n).search(l) for l in lines)]
+        if not hit:
+            continue
+        if any((UNITS / f"{p.name}.d").glob("cc-try-*.conf")):
+            raise Refused(f"{p.name} already runs from another try")
+        new = lines
+        for n in hit:
+            new = [tool_re(n).sub(lambda m: f"{m.group(1)}/.cc/try/bin/{n}", l) for l in new]
+        units.append({"unit": p.name, "exec": new})
+    return tools, units
+
+
+def go_live(rec, files, prove=None):
+    """Put rec live. THE RECORD IS WRITTEN FIRST, so whatever happens after it, `off` and `check` know what to undo;
+    any failure on the way rolls back everything this call did, and says so. prove(rec) runs in the checkout before
+    any link exists (the hot patch's selfchecks) and raises Refused to stop it."""
+    repo, head, key = rec["repo"], rec["head"], rec["key"]
+    tools, units = plan(repo, head, files)
+    if checkout_of(key) is None:
+        raise Refused(f"'{key}' is not a name cc-try makes a checkout under")
+    co = CHECKOUTS / key
+    if os.path.lexists(co):
+        raise Refused(f"{co} already exists and no try records it; look at it, and remove it by hand")
+    rec.update(checkout=str(co), tools=[n for n, _ in tools], paths=dict(tools), since=now(), selfcheck_at=time.time(),
+               units=[{"unit": u["unit"], "restarted": False} for u in units])
+    save(rec)
+    try:
+        co.parent.mkdir(parents=True, exist_ok=True)
+        r = run("git", "-C", str(DEV / repo), "worktree", "add", "-q", "--detach", str(co), head, timeout=300)
+        if r is None or r.returncode != 0:
+            raise Refused(f"could not check {head[:12]} out at {co}: {(r.stderr if r else '').strip()}")
+        if prove:
+            prove(rec)
+        OVERLAY.mkdir(parents=True, exist_ok=True)
+        for name, f in tools:
+            os.symlink(co / f, OVERLAY / name)
+        for u in units:
+            d = UNITS / f"{u['unit']}.d"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"cc-try-{key}.conf").write_text(
+                f"# cc-try {label(rec)} at {head[:12]}: ExecStart through the try overlay. `cc-try off` removes it.\n"
+                "[Service]\nExecStart=\n" + "".join(f"ExecStart={l}\n" for l in u["exec"]))
+        if rec["units"]:
+            systemctl("daemon-reload")
+            for u in rec["units"]:
+                if restartable(u["unit"]):
+                    u["restarted"] = True
+                    save(rec)
+                    systemctl("restart", u["unit"])
+    except BaseException as e:
+        undo(rec)
+        ledger("rollback", rec, "hand", str(e)[:300])
+        raise Refused(f"{label(rec)} did not go live, and what it had done is rolled back: {e}")
+    ledger("on", rec, "hand")
+    print(f"cc-try: {label(rec)} is live at {head[:12]}: {', '.join(rec['tools'])}"
+          + (f"; units {', '.join(u['unit'] for u in rec['units'])}" if rec["units"] else "")
+          + (f"; it expires {rec['expires']} unless a PR at this head is opened" if rec.get("kind") == "patch" else ""))
+    return 0
+
+
+def cmd_on(repo, pr):
+    check_repo(repo)
+    v = pr_view(repo, pr)
+    if v is None:
+        raise Refused(f"gh could not read {repo}#{pr}")
+    if v.get("state") != "OPEN":
+        raise Refused(f"{repo}#{pr} is {str(v.get('state')).lower()}, not open")
+    me = out("gh", "api", "user", "--jq", ".login", cwd=DEV / repo)
+    who = (v.get("author") or {}).get("login")
+    branch = v.get("headRefName") or ""
+    if not me or who != me or v.get("isCrossRepository") or not branch.startswith("track/"):
+        raise Refused(f"{repo}#{pr} was not opened by the box's own workers (author {who}, branch {branch}; "
+                      f"the box's login is {me})")
+    head = v["headRefOid"]
+    key = f"{repo}-{pr}"
+    have = find(repo, pr=pr)
+    if have:
+        if have["head"] == head:
+            print(f"cc-try: {repo}#{pr} is already live at {head[:12]}")
+            return 0
+        raise Refused(f"{repo}#{pr} is live at another head {have['head'][:12]}; run off first")
+    files = [f["path"] for f in v.get("files") or []]
+    try: check_guards(repo, files)
+    except Refused as e:
+        raise Refused(f"{repo}#{pr}: {e}") from None
+    git = ["git", "-C", str(DEV / repo)]
+    r = run(*git, "fetch", "-q", "origin", f"pull/{pr}/head", timeout=300)
+    if r is None or r.returncode != 0 or out(*git, "rev-parse", "FETCH_HEAD") != head:
+        raise Refused(f"could not fetch {repo}#{pr}'s head {head[:12]}")
+    tree = out(*git, "rev-parse", f"{head}^{{tree}}")
+    ok, why = green_on(repo, branch[len("track/"):], tree or "")
+    if not ok:
+        raise Refused(f"{repo}#{pr}'s gates are not green at {head[:12]}: {why}")
+    try: return go_live({"key": key, "kind": "pr", "repo": repo, "pr": pr, "head": head, "branch": branch}, files)
+    except Refused as e:
+        raise Refused(f"{repo}#{pr}: {e}") from None
+
+
+def cmd_patch(repo, target):
+    """The hot patch: a branch (or a worktree's HEAD) with no PR yet. Its changed tools' own selfchecks must pass at
+    that commit; it goes live like a PR try, and `check` takes it off 24 h later unless a PR at the same head has
+    been opened by then, which it then follows."""
+    check_repo(repo)
+    git = ["git", "-C", str(DEV / repo)]
+    if os.path.isdir(target):
+        head = out("git", "-C", target, "rev-parse", "HEAD")
+        branch = out("git", "-C", target, "symbolic-ref", "-q", "--short", "HEAD") or ""
+        if not head or out(*git, "cat-file", "-t", head) != "commit":
+            raise Refused(f"{target} is not a worktree of {repo} (its HEAD is not in {DEV / repo})")
+    else:
+        branch = target
+        head = out(*git, "rev-parse", "--verify", "-q", f"refs/heads/{target}^{{commit}}")
+        if not head:
+            raise Refused(f"{repo} has no branch {target}")
+    if branch and not NAME_RE.match(branch.replace("/", "_")):
+        raise Refused(f"'{branch}' is not a branch name cc-try puts live")
+    r = run(*git, "merge-base", "--is-ancestor", head, "HEAD")
+    if r is not None and r.returncode == 0:
+        raise Refused(f"{head[:12]} is already in the live checkout; there is nothing to patch")
+    base = out(*git, "merge-base", "HEAD", head)
+    files = (out(*git, "diff", "--name-only", f"{base}..{head}") or "").splitlines() if base else []
+    if find(repo, head=head):
+        print(f"cc-try: {head[:12]} is already live")
+        return 0
+    key = f"{repo}-patch-{head[:12]}"
+
+    def prove(rec):
+        for n, f in rec["paths"].items():
+            p = Path(checkout_of(rec["key"])) / f
+            # THE SELFCHECK RUNS, and is judged by its exit code and the tally check.sh reads ("<n> selfcheck:
+            # <k> passed, 0 failed"), not by the word appearing somewhere in the file.
+            r = run(str(p), "selfcheck", timeout=900)
+            if r is None or r.returncode != 0:
+                tail = ((r.stdout + r.stderr) if r else "timed out").strip().splitlines()[-1:] or [""]
+                raise Refused(f"{n} selfcheck failed at {head[:12]}: {tail[0][:160]}")
+            if not re.search(rf"(?m)^{re.escape(n)} selfcheck: (?:[0-9]+ passed, )?0 failed\s*$", r.stdout + r.stderr):
+                raise Refused(f"{n} selfcheck exited 0 without its tally ('{n} selfcheck: <k> passed, 0 failed'), so "
+                              "it has no selfcheck to pass, and a hot patch goes live only on its tools' own selfchecks")
+
+    exp = time.time() + PATCH_TTL
+    rec = {"key": key, "kind": "patch", "repo": repo, "pr": None, "head": head, "branch": branch,
+           "expires_at": exp, "expires": time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(exp))}
+    return go_live(rec, files, prove)
+
+
+def restartable(unit):
+    a = systemctl("is-active", unit)
+    t = systemctl("show", "-p", "Type", "--value", unit)
+    return a is not None and a.stdout.strip() == "active" and t is not None and t.stdout.strip() != "oneshot"
+
+
+# --------------------------------------------------------------------------------------------------------- off
+
+def find(repo, pr=None, branch=None, head=None):
+    for r in records():
+        if r["repo"] == repo and ((pr is not None and r.get("pr") == pr) or (branch and r.get("branch") == branch
+                                  and r.get("kind") == "patch") or (head and r["head"] == head)):
+            return r
+    return None
+
+
+def checkout_of(key):
+    """The try's own checkout, worked out from its key and never read from the record: a forged record's "checkout"
+    would hand another track's worktree to `git worktree remove --force` (security read of #1086 at 259aa5bc).
+    None when the key is not one cc-try makes, or resolves outside ~/.cc/try/co."""
+    if not isinstance(key, str) or not KEY_RE.match(key) or ".." in key:
+        return None
+    co = CHECKOUTS / key
+    root = os.path.realpath(CHECKOUTS)
+    return str(co) if os.path.realpath(co).startswith(root + "/") else None
+
+
+def undo(rec):
+    """Take out what rec put live, as far as it got: its links (only those pointing into its own checkout), its
+    drop-ins (and a restart of what was restarted), the checkout and the record. The checkout is the one under
+    ~/.cc/try/co that its key names; the record's own "checkout" field is never used."""
+    repo, co = rec["repo"], checkout_of(rec.get("key"))
+    if co is None:
+        raise Refused(f"the record {rec.get('key')!r} names no checkout under {CHECKOUTS}; it is not one cc-try wrote")
+    for n in rec.get("tools", []):
+        p = OVERLAY / n
+        if p.is_symlink() and os.readlink(p).startswith(co + "/"):
+            p.unlink()
+    if rec.get("units"):
+        for u in rec["units"]:
+            f = UNITS / f"{u['unit']}.d" / f"cc-try-{rec['key']}.conf"
+            if f.exists(): f.unlink()
+            try: f.parent.rmdir()
+            except OSError: pass
+        systemctl("daemon-reload")
+        for u in rec["units"]:
+            if u.get("restarted"):
+                systemctl("restart", u["unit"])
+    if os.path.lexists(co) and os.path.realpath(co).startswith(os.path.realpath(CHECKOUTS) + "/"):
+        run("git", "-C", str(DEV / repo), "worktree", "remove", "--force", co, timeout=120)
+    live_file(rec["key"]).unlink(missing_ok=True)
+
+
+def turn_off(rec, by, reason):
+    undo(rec)
+    ledger("off", rec, by, reason)
+    print(f"cc-try: {label(rec)} is off ({reason})")
+
+
+def cmd_off(repo, pr=None, branch=None):
+    rec = find(repo, pr=pr, branch=branch, head=branch if branch and re.fullmatch(r"[0-9a-f]{7,40}", branch) else None)
+    if not rec and branch and os.path.isdir(branch):
+        rec = find(repo, head=out("git", "-C", branch, "rev-parse", "HEAD") or "-")
+    if not rec:
+        raise Refused(f"{repo}#{pr} is not live" if pr is not None else f"no hot patch of {repo} from {branch} is live")
+    turn_off(rec, "hand", "turned off by hand")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------- check/list
+
+def pr_at_head(repo, branch, head):
+    """The PR whose head IS this commit — "a PR carrying the same change" — as gh lists it for the branch, or None.
+    False when gh could not answer."""
+    if not branch:
+        return None
+    r = run("gh", "pr", "list", "--head", branch, "--state", "all", "--json",
+            "number,headRefOid,isCrossRepository,author", cwd=DEV / repo, timeout=60)
+    if r is None or r.returncode != 0:
+        return False
+    try: prs = json.loads(r.stdout)
+    except ValueError: return False
+    # Only a PR the owner or a box seat opened carries the change: anyone else's same-repo PR at that head would drop
+    # the 24 h expiry. The box's seats open PRs as the box's own login; the owner's is the repo's owner.
+    who = {out("gh", "api", "user", "--jq", ".login", cwd=DEV / repo),
+           out("gh", "repo", "view", "--json", "owner", "--jq", ".owner.login", cwd=DEV / repo)} - {None, ""}
+    return next((p["number"] for p in prs if p.get("headRefOid") == head and not p.get("isCrossRepository")
+                 and (p.get("author") or {}).get("login") in who), None)
+
+
+def why_off(rec):
+    """The reason this try must come off now, or None to keep it. The brief: "It reverts by itself when the PR
+    merges (main now has it), closes, or gets a new head ... It also reverts when a watcher it registers sees the
+    tool's selfcheck fail." "Main now has it" is read as the LIVE checkout holding the merge commit: until the
+    deploy pulls it, taking the try off would put the old tool back for a while.
+    A hot patch: "it expires by itself after 24 h unless a PR carrying the same change has been opened, in which case
+    it follows that PR's life". The PR is looked for every pass; the expiry does not wait on gh, so a patch nobody
+    opened a PR for comes off on time even when GitHub cannot be asked."""
+    repo = rec["repo"]
+    # A GUARD FIX THAT DEPLOYS AFTER THE TRY WENT LIVE: the try's checkout still holds the old cc-guard and cc-trust
+    # its tools resolve beside them, so the drift test `on` ran is run again every pass (security read of #1086 at
+    # fbc00924). Taking it off puts main's tool back, which is always safe; it does not wait on gh.
+    try:
+        check_guard_drift(repo, rec["head"])
+    except Refused as e:
+        return f"guard drift: {e}"
+    if rec.get("kind") == "patch" and not rec.get("pr"):
+        n = pr_at_head(repo, rec.get("branch"), rec["head"])
+        if n:
+            rec["pr"] = n
+            save(rec)
+            ledger("adopt", rec, "auto", f"#{n} carries this change; the patch follows that PR now")
+        elif time.time() >= rec.get("expires_at", 0):
+            return "expired: 24 h live, and no PR carries this change"
+        else:
+            return selfcheck_due(rec)
+    v = pr_view(repo, rec["pr"])
+    if v is None:
+        return None                                   # gh could not say this pass; ask again next pass
+    st = v.get("state")
+    if st == "MERGED":
+        mc = (v.get("mergeCommit") or {}).get("oid") or ""
+        live = run("git", "-C", str(DEV / repo), "merge-base", "--is-ancestor", mc, "HEAD") if mc else None
+        return f"merged, and the live checkout has {mc[:12]}" if live is not None and live.returncode == 0 else None
+    if st == "CLOSED":
+        return "closed without merging"
+    if v.get("headRefOid") and v["headRefOid"] != rec["head"]:
+        return f"new head {v['headRefOid'][:12]}, not gated yet; run on again once it is green"
+    return selfcheck_due(rec)
+
+
+def selfcheck_due(rec):
+    for n in rec.get("tools", []):
+        if not os.path.exists(OVERLAY / n):
+            return f"the overlay link for {n} is gone"
+    if time.time() - rec.get("selfcheck_at", 0) >= SELFCHECK_EVERY:
+        rec["selfcheck_at"] = time.time()
+        save(rec)
+        for n in rec.get("tools", []):
+            p = OVERLAY / n
+            try: has = b"selfcheck" in Path(p).read_bytes()
+            except OSError: has = False
+            if has:
+                r = run(str(p), "selfcheck", timeout=900)
+                if r is None or r.returncode != 0:
+                    tail = ((r.stdout + r.stderr) if r else "timed out").strip().splitlines()[-1:] or [""]
+                    return f"{n} selfcheck failed at {rec['head'][:12]}: {tail[0][:160]}"
+    return None
+
+
+def sweep():
+    """What no record owns comes out: a link into a try checkout, a cc-try drop-in. A try that died between its
+    first link and its record (or a record somebody deleted) leaves nothing live behind."""
+    recs = records()
+    cos = [c + "/" for c in (checkout_of(r.get("key")) for r in recs) if c]
+    keys = {r["key"] for r in recs}
+    roots = str(CHECKOUTS) + "/"
+    for p in sorted(OVERLAY.iterdir()) if OVERLAY.is_dir() else []:
+        if p.is_symlink():
+            t = os.readlink(p)
+            if t.startswith(roots) and not any(t.startswith(c) for c in cos):
+                p.unlink()
+                print(f"cc-try: removed {p.name}, a link no live try owns ({t})")
+    reload = False
+    for f in sorted(UNITS.glob("*.service.d/cc-try-*.conf")) if UNITS.is_dir() else []:
+        if f.name[len("cc-try-"):-len(".conf")] not in keys:
+            f.unlink(); reload = True
+            try: f.parent.rmdir()
+            except OSError: pass
+            print(f"cc-try: removed {f}, a drop-in no live try owns")
+    if reload:
+        systemctl("daemon-reload")
+
+
+def cmd_check():
+    for rec in records():
+        why = why_off(rec)
+        if why:
+            turn_off(rec, "auto", why)
+    sweep()
+    return 0
+
+
+def cmd_list():
+    recs = records()
+    prs = [r for r in recs if r.get("pr")]
+    patches = [r for r in recs if not r.get("pr")]
+    if not recs:
+        print("cc-try: nothing is live")
+    for r in prs:
+        print(f"{r['repo']}#{r['pr']}  head {r['head'][:12]}  since {r['since']}  tools {', '.join(r['tools'])}"
+              + (f"  units {', '.join(u['unit'] for u in r['units'])}" if r.get("units") else "")
+              + ("  (was a hot patch)" if r.get("kind") == "patch" else ""))
+    if patches:
+        print("Hot patches (no PR yet; each comes off at its expiry unless a PR at its head is opened):")
+    for r in patches:
+        print(f"  {r['repo']} {r.get('branch') or '(detached)'}  head {r['head'][:12]}  since {r['since']}  "
+              f"expires {r['expires']}  tools {', '.join(r['tools'])}"
+              + (f"  units {', '.join(u['unit'] for u in r['units'])}" if r.get("units") else ""))
+    return 0
+
+
+def cmd_digest(hours=24):
+    cut = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(time.time() - hours * 3600))
+    lines = []
+    try: entries = [json.loads(l) for l in LEDGER.read_text().splitlines() if l.strip()]
+    except (OSError, ValueError): entries = []
+    for e in entries:
+        if e.get("at", "") < cut or e.get("op") not in ("on", "off", "adopt"):
+            continue
+        tools = ", ".join(safe(t) for t in e.get("tools") or [])
+        patch = f"hot patch {safe(e['repo'])} {safe(e.get('branch') or e['head'][:12])}"
+        what = (patch if e.get("kind") == "patch" and not e.get("pr") else f"{safe(e['repo'])}#{e['pr']}") + f" ({tools})"
+        if e["op"] == "on":
+            lines.append(f"• {what} went live at {e['head'][:12]}, {e['at']}")
+        elif e["op"] == "adopt":
+            lines.append(f"• {patch} ({tools}) is carried by {safe(e['repo'])}#{e['pr']} now, {e['at']}")
+        else:
+            lines.append(f"• {what} came off, {e['at']}: {safe(e.get('reason') or e.get('by'))}")
+    recs = records()
+    n, np = len([r for r in recs if r.get("pr")]), len([r for r in recs if not r.get("pr")])
+    if np:
+        lines.append(f"• {np} hot patch{'es' if np > 1 else ''} live with no PR: `cc-try list`.")
+    if n:
+        lines.append(f"• {n} PR{'s' if n > 1 else ''} live before landing: `cc-try list`.")
+    if lines:
+        print("\n".join(lines))
+    return 0
+
+
+def cmd_hint(repo, pr, track):
+    """The one line for the seat that dispatched a track whose PR is up (cc-loop's done line): the `cc-try on`
+    command, said as ready when the track's host cc-green verdict is green at its HEAD. Nothing when the PR has no
+    tool to try or touches a file that guards the box. Offline: it reads only the worktree and the verdict."""
+    wt = WORKTREES / repo / track
+    g = ["git", "-C", str(wt)]
+    base = out(*g, "merge-base", "origin/main", "HEAD")
+    files = (out(*g, "diff", "--name-only", f"{base}..HEAD") or "").splitlines() if base else []
+    if not files or any(guard_of(f, repo) for f in files) or not any(f.startswith(TOOL_DIRS) for f in files):
+        return 0
+    ok, _ = green_on(repo, track, out(*g, "rev-parse", "HEAD^{tree}") or "")
+    print(f"Green at its head: `cc-try on {repo} {pr}` puts it live now." if ok
+          else f"Once its gate is green, `cc-try on {repo} {pr}` puts it live before it lands.")
+    return 0
+
+
+def selfcheck(*a, **k):
+    """The cases are core/tests/selfcheck/cc-try.py, run in THIS namespace. Defining them replaces this selfcheck()."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tests", "selfcheck", "cc-try.py")
+    with open(path, encoding="utf-8") as fh:
+        exec(compile(fh.read(), path, "exec"), globals())
+    return globals()["selfcheck"](*a, **k)
+
+
+def pr_arg(s):
+    if not s.isdigit():
+        raise Refused(f"'{s}' is not a PR number")
+    return int(s)
+
+
+def main(argv):
+    try:
+        if argv[:1] == ["on"] and len(argv) == 4 and argv[2] == "--branch":
+            with lock(): return cmd_patch(argv[1], argv[3])
+        if argv[:1] == ["off"] and len(argv) == 4 and argv[2] == "--branch":
+            with lock(): return cmd_off(argv[1], branch=argv[3])
+        if argv[:1] == ["on"] and len(argv) == 3:
+            with lock(): return cmd_on(argv[1], pr_arg(argv[2]))
+        if argv[:1] == ["off"] and len(argv) == 3:
+            with lock(): return cmd_off(argv[1], pr_arg(argv[2]))
+        if argv[:1] == ["hint"] and len(argv) == 4:
+            return cmd_hint(argv[1], pr_arg(argv[2].rstrip("/").rsplit("/", 1)[-1]), argv[3])
+        if argv == ["list"]:
+            return cmd_list()
+        if argv == ["check"]:
+            with lock(): return cmd_check()
+        if argv[:1] == ["digest"] and len(argv) <= 2:
+            return cmd_digest(int(argv[1]) if len(argv) == 2 and argv[1].isdigit() else 24)
+        if argv == ["selfcheck"]:
+            return 0 if selfcheck() else 1
+    except Refused as e:
+        print(f"cc-try: refused: {e}", file=sys.stderr)
+        return 1
+    print(__doc__.split("\nWHAT IT REFUSES")[0], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
