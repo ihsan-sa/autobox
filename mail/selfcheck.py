@@ -2858,11 +2858,12 @@ def run():
             kept = os.path.join(b.tmp, "classify-prompt.txt")
             stub = os.path.join(b.tmp, "stub-claude")
             with open(stub, "w") as f:
-                f.write("#!/bin/sh\ncat > '%s'\nprintf '%%s' '{\"structured_output\":{\"target\":\"career\"}}'\n"
-                        % kept)
+                f.write("#!/bin/sh\necho \"$@\" > '%s.argv'\ncat > '%s'\n"
+                        "printf '%%s' '{\"structured_output\":{\"target\":\"career\"}}'\n" % (kept, kept))
             os.chmod(stub, 0o755)
             saved_claude, router.CLAUDE = router.CLAUDE, stub
             os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
+            saved_model = os.environ.pop("CC_MAIL_ROUTE_MODEL", None)
             try:
                 dec = router.route(to("study", OWNER, subject="FW: Submit rankings for cycle 1 match",
                                       body="Rank the employers you interviewed with for the cycle 1 match."),
@@ -2870,7 +2871,14 @@ def run():
             finally:
                 router.CLAUDE = saved_claude
                 os.environ["CC_MAIL_ROUTE_FAKE"] = ""
+                if saved_model is not None:
+                    os.environ["CC_MAIL_ROUTE_MODEL"] = saved_model
             sent = open(kept).read() if os.path.exists(kept) else ""
+            # The classifier runs on the pinned Haiku 4.5, not the moving `haiku` alias (Haiku 5.5 answered `unsure`
+            # for course mail on the recorded replay, docs/models/haiku-5-5.md), when CC_MAIL_ROUTE_MODEL is unset.
+            ran = open(kept + ".argv").read().split() if os.path.exists(kept + ".argv") else []
+            k(ran[ran.index("--model") + 1:ran.index("--model") + 2] == ["claude-haiku-4-5"] if "--model" in ran else False,
+              "with CC_MAIL_ROUTE_MODEL unset the classifier is asked for claude-haiku-4-5, not the haiku alias")
             listed = [ln for ln in sent.splitlines() if ln.startswith("- ")]
             k([p.name for p in dec.to] == ["career"] and dec.rule == "no-channel:classified"
               and dec.note == "#study is not a channel I could deliver to.",

@@ -126,6 +126,10 @@ CLASSIFY_MAX = 4000          # of the body handed to the classifier; a target is
 CLASSIFY_TIMEOUT = 45        # seconds. A timeout reads as `unsure`, which is already the safe default
 MAX_PLACES = 40              # names offered to the classifier at once
 CAUSE_MAX = 120              # of the one line saying why the classifier did not answer
+# The classifier's model when CC_MAIL_ROUTE_MODEL is unset. Pinned, not the moving `haiku` alias: on 33 recorded
+# mails (2026-10-11, docs/models/haiku-5-5.md) Haiku 5.5 answered `unsure` for course mail Haiku 4.5 placed in
+# its lessons channel, matching 11 of the recorded routes to 4.5's 28.
+ROUTE_MODEL = "claude-haiku-4-5"
 
 CLAUDE = os.environ.get("CC_CLAUDE") or "claude"
 PROMPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "config", "mail-route-prompt.md")
@@ -715,7 +719,7 @@ def classify(msg, places):
                          "properties": {"target": {"type": "string", "enum": names + [UNSURE]}}})
     rc = None
     try:
-        r = subprocess.run([CLAUDE, "-p", "--model", os.environ.get("CC_MAIL_ROUTE_MODEL") or "haiku",
+        r = subprocess.run([CLAUDE, "-p", "--model", os.environ.get("CC_MAIL_ROUTE_MODEL") or ROUTE_MODEL,
                             "--tools", "", "--strict-mcp-config", "--setting-sources", "",
                             "--disable-slash-commands", "--max-turns", "3", "--no-session-persistence",
                             "--output-format", "json", "--json-schema", schema, "--max-budget-usd", "0.05"],

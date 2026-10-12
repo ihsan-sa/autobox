@@ -38,7 +38,24 @@ _cj(){ local f; f=$(mktemp); printf 'MemAvailable: %s kB\nSwapTotal: %s kB\nSwap
   || { echo "check.sh: the job-count rule fails its own fixtures"; exit 1; }
 if [ -n "${CC_CHECK_JOBS:-${CHECK_JOBS:-}}" ]; then JOBS=${CC_CHECK_JOBS:-$CHECK_JOBS}; echo "check.sh: $JOBS jobs at once (set by CC_CHECK_JOBS/CHECK_JOBS)"
 else read -r JOBS _why < <(check_jobs /proc/meminfo "$(nproc 2>/dev/null || echo 4)"); echo "check.sh: $JOBS jobs at once ($_why)"; fi
-GD=$(mktemp -d "${TMPDIR:-/tmp}/cc-check.XXXXXX"); trap 'rm -rf "$GD"' EXIT   # one scratch dir, one trap, both blocks
+# THE SCRATCH DIR'S CLEANUP NEVER DECIDES THE VERDICT. Under `set -e` a failing command in an EXIT trap becomes the
+# script's exit status, so a bare `rm -rf "$GD"` that tripped on one file turned a gate that had printed "OK" into
+# exit 1 (twice in one worker's cc-green, 2026-10-02/03; alone it passed). The trap keeps the gate's own status,
+# tries the rm once more after a second, and if the dir still will not go it says so on stderr and leaves it.
+GD_TRAP='rc=$?; rm -rf "$GD" 2>/dev/null || { sleep 1; rm -rf "$GD"; } || echo "check.sh: could not remove $GD; left it, exit stays $rc" >&2; exit "$rc"'
+_gt=$(mktemp -d); mkdir -p "$_gt/stuck/ro" "$_gt/clean"; : > "$_gt/stuck/ro/f"; chmod 555 "$_gt/stuck/ro"
+_gtrap(){ bash -c 'set -e; GD=$1; trap "$2" EXIT; exit "$3"' _ "$1" "$GD_TRAP" "$2" 2>"$_gt/err"; }
+if _gtrap "$_gt/stuck" 0; then _g0=0; else _g0=$?; fi; _gw=$(cat "$_gt/err")
+if _gtrap "$_gt/stuck" 3; then _g3=0; else _g3=$?; fi
+_gtrap "$_gt/clean" 0 && _gc=0 || _gc=$?
+[ "$_g0" = 0 ] && [ "$_g3" = 3 ] && [ "$_gc" = 0 ] && [ ! -e "$_gt/clean" ] \
+  && { [ ! -e "$_gt/stuck" ] || grep -q 'could not remove' <<<"$_gw"; } \
+  || { echo "check.sh: the scratch-dir trap changes the exit status (stuck: 0->$_g0, 3->$_g3; clean: $_gc)"; chmod -R u+w "$_gt"; rm -rf "$_gt"; exit 1; }
+chmod -R u+w "$_gt"; rm -rf "$_gt"
+GD=$(mktemp -d "${TMPDIR:-/tmp}/cc-check.XXXXXX")   # one scratch dir, one trap, both blocks
+# GD_TRAP is the trap's text, single-quoted where it is set, so $GD still expands when it fires.
+# shellcheck disable=SC2064
+trap "$GD_TRAP" EXIT
 if part_here shellcheck; then
 bash -n "${sh[@]}"
 # SHELLCHECK EVERY FILE, $JOBS AT A TIME. One call over all of bin/ was 38 s of this gate on one core — the largest

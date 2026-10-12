@@ -128,7 +128,9 @@ PHCOLS = ["ts", "why", "what", "repo", "track", "kind", "detail", "cwd"]
 # ONE rates table, $ per MILLION tokens: (input, output, cache read). Cache WRITES are 1.25x input at the 5-minute
 # TTL and 2x at the 1-hour one, and `usage.cache_creation` says which of the two a write was — so a write is
 # priced, never guessed. Claude Fable 5.1's cache read is 0.025x input rather than the usual 0.1x, and Opus 5.5's
-# is 0.05x. These numbers
+# and Sonnet 5.5's are 0.05x (Anthropic's own price page says $0.20 for Sonnet 5.5, but Claude Code's costUSD bills
+# $0.10, and this table follows costUSD). Haiku 5.5 has two cards, picked per request by prompt size: see LONG.
+# These numbers
 # were fitted against every ~/.cc/state/*/*/runs/*.json on this box and reproduce its modelUsage costUSD exactly.
 # A model with no row here is still counted in tokens; its est_usd is 0 and the views say how many rows that was.
 RATES = {
@@ -141,10 +143,16 @@ RATES = {
     "claude-opus-4-8":   (5.0, 25.0, 0.50),
     "claude-opus-4-7":   (5.0, 25.0, 0.50),
     "claude-opus-4-6":   (5.0, 25.0, 0.50),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.10),
     "claude-sonnet-5":   (2.0, 10.0, 0.20),
     "claude-sonnet-4-6": (3.0, 15.0, 0.30),
+    "claude-haiku-5-5":  (0.10, 0.50, 0.01),
     "claude-haiku-4-5":  (1.0, 5.0, 0.10),
 }
+# A request whose prompt (input + cache read + cache write) is OVER the threshold is priced on the second card,
+# writes included: "$0.10 / $0.50 when the prompt is 100K tokens or fewer, $0.50 / $2.50 above that" (claude-api
+# skill, models.md). Fitted on 2026-10-11 against a four-request Haiku 5.5 run, every request over 100K: exact.
+LONG = {"claude-haiku-5-5": (100_000, (0.50, 2.50, 0.05))}
 # Fast mode is the same model at premium prices (Opus only) — `usage.speed` names it, so it is not a guess either.
 FAST = {"claude-opus-5-5": (8.0, 40.0, 0.20), "claude-opus-5": (10.0, 50.0, 0.50), "claude-opus-4-8": (10.0, 50.0, 0.50)}
 W_5M, W_1H = 1.25, 2.0            # the cache-write multiples on the input rate, by TTL
@@ -161,23 +169,41 @@ GREW_WINDOW = 3600
 
 # ---------------------------------------------------------------- rates
 
-def rate(model, fast=False):
-    """The row for a model id. `claude-haiku-4-5-20251001` and `claude-opus-5[1m]` are the same families as their
-    bare names — Claude Code writes both spellings — so the match is on the longest prefix, suffix stripped."""
+def family(model):
+    """The RATES key a model id belongs to. `claude-haiku-4-5-20251001` and `claude-opus-5[1m]` are the same families
+    as their bare names — Claude Code writes both spellings — so the match is on the longest prefix, suffix
+    stripped. None for a model with no row."""
     m = re.sub(r"\[[^\]]*\]\s*$", "", (model or "").strip())
     for fam in sorted(RATES, key=len, reverse=True):
         if m.startswith(fam):
-            return (FAST.get(fam) if fast else None) or RATES[fam]
+            return fam
     return None
 
 
+def rate(model, fast=False):
+    """The row for a model id, by its family()."""
+    fam = family(model)
+    if fam is None:
+        return None
+    return (FAST.get(fam) if fast else None) or RATES[fam]
+
+
+def long_rate(model, prompt):
+    """The LONG card for this prompt size, when the model's own family() has one and the prompt is past it; else
+    None. Keyed on the same family rate() picked, so a shorter family's card never prices a longer one's model."""
+    card = LONG.get(family(model))
+    return card[1] if card and prompt > card[0] else None
+
+
 def usd(model, u, fast=False):
-    """The estimate for one usage block. Returns None for a model with no rates row, so callers can say so."""
+    """The estimate for one usage block — one request, so its prompt size picks a LONG card where a model has one.
+    Returns None for a model with no rates row, so callers can say so."""
     r = rate(model, fast)
     if r is None:
         return None
-    rin, rout, rread = r
     cw = int(u.get("cache_creation_input_tokens") or 0)
+    prompt = int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0) + cw
+    rin, rout, rread = long_rate(model, prompt) or r
     cc = u.get("cache_creation") or {}
     w1 = int(cc.get("ephemeral_1h_input_tokens") or 0)
     w5 = int(cc.get("ephemeral_5m_input_tokens") or 0)
@@ -1185,6 +1211,38 @@ def selfcheck():
        and abs(usd("claude-opus-5-5[1m]", {"input_tokens": 1_000_000}) - 4.0) < 1e-9)
     ok("an unknown model estimates nothing rather than guessing",
        usd("gpt-nonesuch", {"output_tokens": 10}) is None)
+    # Real requests from 2026-10-11 runs, against the costUSD Claude Code printed for them.
+    h_short = {"input_tokens": 2, "output_tokens": 4, "cache_read_input_tokens": 10585,
+               "cache_creation_input_tokens": 11139, "cache_creation": {"ephemeral_1h_input_tokens": 11139}}
+    s55 = {"input_tokens": 2, "output_tokens": 4, "cache_read_input_tokens": 10585,
+           "cache_creation_input_tokens": 10362, "cache_creation": {"ephemeral_1h_input_tokens": 10362}}
+    ok("Haiku 5.5 and Sonnet 5.5 have their own rows and reproduce costUSD (0.00233585, 0.0425505)",
+       rate("claude-haiku-5-5") == RATES["claude-haiku-5-5"] and rate("claude-sonnet-5-5[1m]") == RATES["claude-sonnet-5-5"]
+       and rate("claude-sonnet-5") == RATES["claude-sonnet-5"]
+       and abs(usd("claude-haiku-5-5", h_short) - 0.00233585) < 1e-9 and abs(usd("claude-sonnet-5-5", s55) - 0.0425505) < 1e-9)
+    hl = [(2, 4, 13147, 193179), (2, 692, 198210, 8559), (2, 477, 206769, 848), (2, 203, 207617, 555)]
+    hl_usd = sum(usd("claude-haiku-5-5", {"input_tokens": a, "output_tokens": b, "cache_read_input_tokens": c,
+                                          "cache_creation_input_tokens": d,
+                                          "cache_creation": {"ephemeral_1h_input_tokens": d}}) for a, b, c, d in hl)
+    ok("a Haiku 5.5 prompt over 100K is priced on the long card, reproducing a real run's costUSD (0.23787215)",
+       abs(hl_usd - 0.23787215) < 1e-9)
+    ok("the Haiku 5.5 card switches only when the prompt is OVER 100K: exactly 100K is the short card",
+       abs(usd("claude-haiku-5-5", {"input_tokens": 100_000}) - 0.01) < 1e-12
+       and abs(usd("claude-haiku-5-5", {"input_tokens": 100_001}) - 100_001 * 0.50 / 1e6) < 1e-12
+       and abs(usd("claude-haiku-4-5", {"input_tokens": 200_000}) - 0.20) < 1e-12)
+    ok("every LONG card belongs to a RATES family, so family() can reach it", set(LONG) <= set(RATES))
+    saved = dict(RATES), dict(LONG)
+    try:                                   # a shorter family with its own long card, listed FIRST, must not shadow
+        RATES["claude-haiku-5"] = (9.0, 9.0, 9.0)
+        LONG.clear()
+        LONG.update({"claude-haiku-5": (10, (7.0, 7.0, 7.0))}, **saved[1])
+        shadow = (long_rate("claude-haiku-5-5-20261001[1m]", 200_000) == saved[1]["claude-haiku-5-5"][1]
+                  and long_rate("claude-haiku-5-0", 200_000) == (7.0, 7.0, 7.0)
+                  and long_rate("claude-haiku-5-5", 100_000) is None and long_rate("gpt-nonesuch", 10**9) is None)
+    finally:
+        RATES.clear(); RATES.update(saved[0]); LONG.clear(); LONG.update(saved[1])
+    ok("long_rate takes rate()'s family, longest prefix and suffix stripped, not the first LONG key that matches",
+       shadow)
 
     # ---- the lane a cwd resolves to. Pure: no HOME fixture, nothing on disk is read.
     ok("a review or gate round in a landing's scratch checkout is charged to the repo it ran for, not to a dash",
