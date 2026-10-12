@@ -4,7 +4,9 @@
                                      `branch` is the head branch, else `track/<row>`, `planning/<row>` or
                                      `builder/<row>` naming a row; "" when none does
     close(job)                       the row goes `merged` with a note, unless an orch holds it (then a note only);
-                                     every row the PR body names with `Closes <row>` goes `done` (same board only)
+                                     every row the PR body names with `Closes <row>` goes `done` (same board only);
+                                     every OPEN planner request it names the same way (`Closes req-…`)
+                                     and the row's brief also Closes is answered (at most 3)
     followup(job, verdict)           one `review-followup-pr<N>` row carrying the review's advisory findings
 
 close() also files the follow-up row for the verdict review() bought at the job's digest, and marks the track's
@@ -14,6 +16,16 @@ CLOSES RULES. `Closes a, b and c` in the PR body (capital C). A row is skipped w
 merged/done; LEFT OPEN when a person holds it (`held`) or it is running/in review with no agent mark, since nobody's
 track will finish it then; closed `done` with a note and its agent mark cleared otherwise. A name with a dash, digit
 or underscore that is not on the board is reported; a bare word ("Closes the gap") is prose and ignored.
+
+A CLOSED REQUEST HEARS ITS FIX. A name with a file in ~/.cc/requests/ is a planner request (`cc-notify --ask`), not a
+row (an id of letters, digits, `-` and `_`, as `req-<stamp>-<pid>` is): one still open is answered with `cc-notify
+requests answer`, from the box's hand (cards.box_hand), so the repo that asked hears its fix landed; an answered one is
+skipped. ONLY A REQUEST THE ROW'S BRIEF ALSO CLOSES is answered: the brief (~/.cc/state/<project>/<row>/task.md, a
+regular file) is the planning seat's text, and the PR body is the track's, so a track cannot answer other repos' asks
+by listing their ids. At most REQUEST_CAP per PR, each answer bounded by REQUEST_TIMEOUT seconds, and each one logged
+(`request-answered`, with the asker) to queue.log. A member's PR answers none, since its body is the member's text.
+The answers run after the row's own close, and answer_requests never raises, so a bad request file cannot keep the
+row from going merged. ece298a's PLL worker sat blocked a day on a fix chip-flow had merged 44 minutes after it asked.
 
 Nothing here raises: a board write that fails is a line in the answer, and the merge already happened. The job's
 `extra` supplies `branch` (or the older `head_ref`), `title`, `body` and, when U1 set them, `project` (the board's name; the repo by default)
@@ -112,7 +124,8 @@ def close(job):
     project, track = project_of(job), track_for(job)
     tail = [x for x in (followup(job, review.saved(job.digest)), scope.merged(project, track, what(job))) if x]
     line = _close(job, project, track)
-    return "; ".join([line] + tail)
+    asked = answer_requests(job)  # after the row's own close: nothing a request file holds can keep it from merged
+    return "; ".join([line] + tail + ([asked] if asked else []))
 
 
 def _close(job, project, track):
@@ -140,7 +153,7 @@ def _close(job, project, track):
         if r == track or (isinstance(cur, dict) and cur.get("status") in ("merged", "done")):
             continue
         if not isinstance(cur, dict):
-            if re.search(r"[-_0-9]", r):
+            if re.search(r"[-_0-9]", r) and not request_file(r):
                 unknown.append(r)
             continue
         mark = str(cur.get("agent") or "").strip()
@@ -162,6 +175,78 @@ def _close(job, project, track):
     if unknown:
         line += f" (Closes names no row on the board: {', '.join(unknown)})"
     return line
+
+
+def request_file(name):
+    """~/.cc/requests/<name>.json when it is a regular file, else "". `name` is a CLOSES_RE word, so it holds no slash."""
+    p = os.path.join(C.PASSWD_HOME, ".cc", "requests", f"{name}.json")
+    return p if os.path.isfile(p) and not os.path.islink(p) else ""
+
+
+REQUEST_CAP = 3       # answers one PR may send; past it the ids are reported, not answered
+REQUEST_TIMEOUT = 20  # seconds per answer: they run one after another before the landed card
+SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def brief_closes(project, track):
+    """The names the row's brief (the planning seat's task.md) Closes; [] when there is no such regular file."""
+    if not (SAFE_NAME.fullmatch(project or "") and SAFE_NAME.fullmatch(track or "")) or ".." in project + track:
+        return []
+    p = os.path.join(C.PASSWD_HOME, ".cc", "state", project, track, "task.md")
+    if os.path.islink(p) or not os.path.isfile(p):
+        return []
+    try:
+        with open(p, errors="replace") as f:
+            return closes(f.read())
+    except OSError:
+        return []
+
+
+def answer_requests(job):
+    """-> a line: each open request both the PR body and the row's brief Close, answered once where it was asked.
+    "" when there is none. Never raises."""
+    try:
+        return _answer_requests(job)
+    except Exception as e:  # noqa: BLE001 - the merge happened; a request is a courtesy, never a reason to stop
+        return f"could not answer requests ({type(e).__name__})"
+
+
+def _answer_requests(job):
+    if job.member:
+        return ""
+    # brief: "Answer only ids that the row's brief (task.md, written by the planning seat) also names with 'Closes'"
+    allowed = set(brief_closes(project_of(job), track_for(job)))
+    done, failed, over, unbriefed = [], [], [], []
+    for r in closes(job.extra.get("body", "")):
+        f = request_file(r)
+        if not f:
+            continue
+        req = C.read_json(f, {})
+        if not isinstance(req, dict) or req.get("answered_at"):
+            continue
+        if r not in allowed:
+            unbriefed.append(r)
+            continue
+        if len(done) + len(failed) >= REQUEST_CAP:
+            over.append(r)
+            continue
+        rc, out = C.sh([tool("cc-notify"), "requests", "answer", r,
+                        f"Fixed: {job.repo} {what(job)} has merged, and it closes request {r}."],
+                       timeout=REQUEST_TIMEOUT, **C.box_hand())
+        if rc:
+            failed.append(f"{r} ({out.strip()[-120:]})")
+            continue
+        done.append(r)
+        asker = re.sub(r"\s+", "_", str(req.get("from") or "?"))[:80]
+        C.log("request-answered", job.repo, job.pr, request=r, asker=asker)
+    parts = [f"answers request {', '.join(done)}"] if done else []
+    if failed:
+        parts.append(f"could not answer request {', '.join(failed)}")
+    if over:
+        parts.append(f"more than {REQUEST_CAP} requests, left open: {', '.join(over)}")
+    if unbriefed:
+        parts.append(f"its brief does not close request {', '.join(unbriefed)}, left open")
+    return "; ".join(parts)
 
 
 def followup(job, verdict):

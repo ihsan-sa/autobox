@@ -141,13 +141,15 @@ c(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s","transcript_path":"%s"
 [ "$(c Write "{\"file_path\":\"$HOME/dev/$REPO/r.md\"}" "$HOME/dev/$REPO")" = 2 ] && [ "$(c Bash '{"command":"echo x > r.md"}' "$HOME/dev/$REPO")" = 2 ] && [ "$(c Write "{\"file_path\":\"$wt/x.md\"}" "$HOME/dev/$REPO")" = 0 ] \
   && ok "a worker that cd'd into ~/dev/<repo> is still fenced to its worktree — the transcript path says where it started" || bad "a cd'd worker is fenced by its cwd"
 rm -f "/tmp/cc-selftest-$RUN-lnk"
-[ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | CC_ROLE=worker env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing (gates would be silently off)" || bad "guard without jq"
+[ "$(CC_ROLE=worker env PATH=/nonexistent /bin/bash "$B/cc-guard" <<<"$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt")" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing (gates would be silently off)" || bad "guard without jq"
 # …while the planning session is the other side of the same line — it is ungated by design, so a broken PATH must
 # NOT start refusing its calls. (The steward tier that lived in that env went with cc-steward; a worker is the
 # gated role above.)
 #   `env -u` first: this suite's own runner may hold a CC_ROLE or a CC_HANDOFF, and either one inherited would
 #   make the assertion fail for the wrong reason (both are read by the same `case`).
-njq(){ printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | env -u CC_ROLE -u CC_HANDOFF ${1:+CC_ROLE=$1} PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+#   The input goes in as a here-string, not a pipe: with no jq, cc-guard exits without reading it, and under pipefail
+#   printf's broken pipe then failed the case at random on a loaded box (#1193, 2026-10-12).
+njq(){ env -u CC_ROLE -u CC_HANDOFF ${1:+CC_ROLE=$1} PATH=/nonexistent /bin/bash "$B/cc-guard" <<<"$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt")" >/dev/null 2>&1; echo $?; }
 [ "$(njq)" = 0 ] && ok "…while an ungated planning session with no jq still runs" || bad "guard without jq: planning=$(njq) (want 0)"
 # member-facing: the .cc/member-facing marker alone (NO CC_ROLE — the env is a convenience) = every worker gate plus spend/leak/wiring
 # A MEMBER DENY NOW SPEAKS (see below), so every member probe runs against a STUB HOME: a fake ~/bin/cc-slack and
@@ -690,7 +692,7 @@ b1=$(nocred alice); rb1=$?; b2=$(nocred alice todo); rb2=$?; b3=$(nocred alice t
 rm -f "$GH/.cc/members/alice/credentials.json" "$GH/.cc/members/alice/credential-asked" "$GH/.cc/members/alice/credential-told"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$mf" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
-[ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
+[ "$(CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" <<<"$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf")" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
 # A REFUSAL IN A MEMBER-FACING CHANNEL IS A QUERY TO THE BOX, NOT A LINE IN THE MEMBER'S CHANNEL (owner 2026-09-04,
 # #243). The member session gets its stderr line; ONE JSON line lands in the workspace's queries.spool with the
 # right class (page = the owner could say yes, nopage = no yes exists); NOTHING is posted to the member's channel

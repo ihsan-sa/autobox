@@ -40,7 +40,9 @@ stderr (the run's log) saying what it waits for, since when and whose ticket is 
 seconds (LANDER_WAIT_SAY, default 600). In a cc-green run, which names its status file in LANDER_WAIT_NOTE, the first line said
 past WAIT_SAY is also appended there ONCE as `waiting=`, so `cc-green wait` says the run is on slots, not hung, and
 what to do about it: such runs sat 2-3 h with only a header in their log five times between 09-29 and 10-01, each read
-as hung. The landing lane sets no note.
+as hung. The landing lane sets no note. A cc-green run also names a per-repo file in LANDER_WAIT_LOG (and its row in
+LANDER_WAIT_ROW), and every slot it takes appends `start end row who secs` there once held, the wait cc-i2m counts
+as the green stage: the run's own log is one per worktree and the next run overwrites it.
 
 HIGH LOAD (2026-09-28: load 31-80 on 12 cores and 12 GB swapped, checks went from under 5 min to 11-17). overloaded() is
 the one signal for "the box is overloaded": the lander serializes on it and gives its one run priority (below), and
@@ -250,6 +252,28 @@ def _note(line: str) -> None:
                     "landing runs the same checks in its own place in the queue.\n")
 
 
+def _waited(began: float, who: str) -> None:
+    """Append `start end row who secs` (tab-separated, UTC stamps) to the file LANDER_WAIT_LOG names, once a slot is
+    held: the durable record of a cc-green run's slot wait (row: LANDER_WAIT_ROW), which its one log per worktree
+    loses on the next run. cc-i2m reads it as the green stage. Nothing without the variable or outside ~/.cc; never raises."""
+    p = os.environ.get("LANDER_WAIT_LOG")
+    if not p:
+        return
+    end = time.time()
+    clean = lambda v: re.sub(r"[\x00-\x1f\x7f]", " ", v)[:200]   # one record is one line, whatever a name holds
+    stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    with contextlib.suppress(OSError, ValueError):
+        root = os.path.realpath(os.path.expanduser("~/.cc")) + os.sep
+        if not os.path.realpath(p).startswith(root):          # a misset variable never appends into a file elsewhere
+            return
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        # O_NONBLOCK: a FIFO with no reader fails at once (ENXIO) instead of blocking with the slot held
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW
+        with os.fdopen(os.open(p, flags, 0o600), "a") as f:
+            f.write(f"{stamp(began)}\t{stamp(end)}\t{clean(os.environ.get('LANDER_WAIT_ROW') or '-')}\t"
+                    f"{clean(who or '-')}\t{int(end - began)}\n")
+
+
 def _drop(p: str) -> None:
     with contextlib.suppress(OSError):
         os.unlink(p)
@@ -333,7 +357,7 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
     os.makedirs(q, exist_ok=True)
     total = max(1, slots() if k is None else k)
     say = say or (lambda line: print(line, file=sys.stderr, flush=True))
-    t0, said, since = time.monotonic(), None, time.strftime("%H:%MZ", time.gmtime())
+    t0, said, since, began = time.monotonic(), None, time.strftime("%H:%MZ", time.gmtime()), time.time()
     held: list = []
     gate = None   # the ALONE GATE: exclusive for an alone run, shared beside another's slot
     told: set = set()
@@ -396,6 +420,7 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
             os.unlink(os.path.join(q, mine))
         tf.close()
         tf = None
+        _waited(began, who)
         yield [n for n, _ in held]
     finally:
         if tf is not None:

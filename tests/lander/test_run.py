@@ -1407,6 +1407,49 @@ class Admission(unittest.TestCase):
                         pass
             self.assertFalse(A._noted)
 
+    def test_a_held_slot_appends_one_wait_record_and_a_waiter_without_a_log_writes_none(self):
+        # cc-green's one log per worktree is overwritten by the next run, so its slot waits went with it (cc-i2m)
+        st, d = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(lambda: [__import__("shutil").rmtree(x) for x in (st, d)])
+        wl, calm = os.path.join(d, ".cc", "w", "waits-r.tsv"), self.psi_dir(0, 0)
+        out = os.path.join(st, "elsewhere.tsv")                 # outside ~/.cc: never written
+        with mock.patch.dict(os.environ, {"HOME": d, "LANDER_WAIT_LOG": out}):
+            with A.slot(st, psi_root=calm, k=1, who="t@abc"):
+                pass
+        self.assertFalse(os.path.exists(out))
+        with mock.patch.dict(os.environ, {"HOME": d, "LANDER_WAIT_LOG": wl, "LANDER_WAIT_ROW": "row\n1"}):
+            with A.slot(st, psi_root=calm, k=1, who="t@abc"):
+                pass
+        env = {k: v for k, v in os.environ.items() if k != "LANDER_WAIT_LOG"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with A.slot(st, psi_root=calm, k=1, who="lane"):
+                pass
+        with open(wl) as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        start, end, row, who, secs = lines[0].split("\t")
+        self.assertRegex(start, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertLessEqual(start, end)
+        self.assertEqual((row, who), ("row 1", "t@abc"))
+        self.assertRegex(secs, r"^\d+$")
+
+    def test_an_unwritable_wait_log_never_breaks_the_held_slot(self):
+        # the record is best effort: a directory, a reader-less FIFO or a symlink at the path must not raise or block
+        st, d = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(lambda: [__import__("shutil").rmtree(x) for x in (st, d)])
+        cc = os.path.join(d, ".cc")
+        os.makedirs(os.path.join(cc, "dir"))
+        fifo, link = os.path.join(cc, "fifo"), os.path.join(cc, "link")
+        os.mkfifo(fifo)
+        os.symlink(os.path.join(cc, "target"), link)
+        for wl in (os.path.join(cc, "dir"), fifo, link):
+            ran = []
+            with mock.patch.dict(os.environ, {"HOME": d, "LANDER_WAIT_LOG": wl}):
+                with A.slot(st, psi_root=self.psi_dir(0, 0), k=1, who="t"):
+                    ran.append(wl)
+            self.assertEqual(ran, [wl])
+        self.assertFalse(os.path.exists(os.path.join(cc, "target")))
+
     def test_a_wait_note_cannot_plant_a_status_field(self):
         # a check name comes from the tree's TOML; a newline in it must not add an exit= line cc-green reads first
         note = tempfile.mktemp()

@@ -47,6 +47,7 @@ def selfcheck():
     fake(52, "claude", ["claude"], cwd=f"{tmp}/dev/r", start="999") # a pid reused by another process
     fake(10, "node", ["node"])
     fake(41, "python3", ["python3", "/x/cc-room", "admit", "r/py", "--log", "/x/loop.log", "--", "/x/cc-loop", "r", "py"])
+    fake(60, "python3", ["python3", "/x/tool.py", "core/bin/cc-loop", "a", "b"])   # a script reading cc-loop as a file
     tck = os.sysconf("SC_CLK_TCK") or 100
     open(f"{proc}/stat", "w").write(f"cpu 0 0 0\nbtime {now - 100000}\n")    # booted 100000 s ago
     board = {"tracks": {
@@ -123,6 +124,7 @@ def selfcheck():
     case("a claude in a worktree makes its track live; a cc-loop argv does too", {"r/w1", "r/sent"} <= live)
     case("a claude outside the worktrees is no track", not any("dev" in k for k in live))
     case("a cc-loop waiting in cc-room (comm python3) makes its track live", "r/py" in live)
+    case("a cc-loop word that is another process's argument makes no track live", "a/b" not in live)
     ss, smem = sessions(now, proc)
     ids = [s["id"] for s in ss]
     case("a session whose pid is gone, or was reused by another process, is left out", "99" not in ids and "52" not in ids)

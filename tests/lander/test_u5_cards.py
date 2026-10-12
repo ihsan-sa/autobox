@@ -373,6 +373,110 @@ class Board(Stubbed):
                                                          ["cc-board", "status", "demo", "free", "done"]])
         self.assertEqual(self.argvs("cc-board set"), [["cc-board", "set", "demo", "free", "agent", ""]])
 
+    def request(self, rid, **kw):
+        d = os.path.join(self.home, ".cc", "requests")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{rid}.json"), "w") as f:
+            json.dump({"id": rid, "from": "ece298a/pll", **kw} if kw.get("raw") is None else kw["raw"], f)
+
+    def brief(self, text, project="demo", track="own"):
+        d = os.path.join(self.home, ".cc", "state", project, track)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "task.md"), "w") as f:
+            f.write(text)
+        return os.path.join(d, "task.md")
+
+    def answered(self):
+        return [c["argv"][3] for c in self.calls("cc-notify requests")]
+
+    def test_closes_answers_an_open_request_its_brief_also_closes(self):
+        # "this is the repo that asked through a request id, which the merge never closes back to"
+        self.board("demo", {"own": {"pr": "7"}})
+        self.request("req-1")
+        self.request("req-2", answered_at=Q)
+        self.request("req-3")
+        self.brief("GOAL: harden clocks. Closes req-1 and req-2.")
+        line = B.close(self.job(title="harden clocks", body="Closes req-1, req-2, req-3 and no-such-row"))
+        asked = self.calls("cc-notify requests")
+        self.assertEqual([c["argv"][:4] for c in asked], [["cc-notify", "requests", "answer", "req-1"]])
+        self.assertIn("demo PR #7 harden clocks has merged", asked[0]["argv"][4])
+        self.assertEqual((asked[0]["cwd"], asked[0]["role"]), (os.path.realpath(self.home), None))
+        self.assertIn("answers request req-1", line)
+        self.assertIn("its brief does not close request req-3, left open", line)
+        self.assertIn("Closes names no row on the board: no-such-row)", line)
+        self.assertNotIn("req-2", line)
+        self.assertTrue(line.startswith("board: demo/own -> merged"), line)
+        with open(os.path.join(self.tmp, "land", "queue.log")) as f:
+            logged = [ln for ln in f if "request-answered" in ln]
+        self.assertEqual(len(logged), 1)
+        self.assertIn("request-answered demo#7 request=req-1 asker=ece298a/pll", logged[0])
+
+    def test_a_body_alone_answers_no_request(self):
+        # "Answer only ids that the row's brief (task.md, written by the planning seat) also names with 'Closes'"
+        self.board("demo", {"own": {"pr": "7"}})
+        self.request("req-1")
+        line = B.close(self.job(body="Closes req-1"))
+        self.assertEqual(self.answered(), [])
+        self.assertIn("its brief does not close request req-1", line)
+        self.brief("Closes req-1")
+        B.close(self.job(body="Closes req-1"))
+        self.assertEqual(self.answered(), ["req-1"])
+
+    def test_a_symlinked_brief_or_request_file_answers_nothing(self):
+        self.board("demo", {"own": {"pr": "7"}})
+        real = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(real)
+        with open(os.path.join(real, "task.md"), "w") as f:
+            f.write("Closes req-1 and req-2")
+        with open(os.path.join(real, "req-2.json"), "w") as f:
+            json.dump({"id": "req-2", "from": "x"}, f)
+        os.makedirs(os.path.join(self.home, ".cc", "state", "demo", "own"))
+        os.symlink(os.path.join(real, "task.md"), os.path.join(self.home, ".cc", "state", "demo", "own", "task.md"))
+        self.request("req-1")
+        B.close(self.job(body="Closes req-1"))
+        self.assertEqual(self.answered(), [])
+        os.remove(os.path.join(self.home, ".cc", "state", "demo", "own", "task.md"))
+        self.brief("Closes req-1 and req-2")
+        os.symlink(os.path.join(real, "req-2.json"), os.path.join(self.home, ".cc", "requests", "req-2.json"))
+        B.close(self.job(body="Closes req-1 and req-2"))
+        self.assertEqual(self.answered(), ["req-1"])
+
+    def test_at_most_three_requests_per_pr(self):
+        self.board("demo", {"own": {"pr": "7"}})
+        ids = [f"req-{n}" for n in range(1, 6)]
+        for r in ids:
+            self.request(r)
+        self.brief("Closes " + ", ".join(ids))
+        line = B.close(self.job(body="Closes " + ", ".join(ids)))
+        self.assertEqual(self.answered(), ids[:3])
+        self.assertIn("more than 3 requests, left open: req-4, req-5", line)
+
+    def test_a_bad_request_file_never_keeps_the_row_from_merged(self):
+        # "read_json returning a list or string raises AttributeError ... the row never goes merged"
+        self.board("demo", {"own": {"pr": "7"}})
+        self.request("req-1", raw=["not", "a", "dict"])
+        self.request("req-2", raw="a string")
+        self.brief("Closes req-1 and req-2")
+        line = B.close(self.job(body="Closes req-1 and req-2"))
+        self.assertEqual(self.answered(), [])
+        self.assertEqual(self.argvs("cc-board status"), [["cc-board", "status", "demo", "own", "merged"]])
+        self.assertTrue(line.startswith("board: demo/own -> merged"), line)
+        with mock.patch.object(B, "_answer_requests", side_effect=RuntimeError("boom")):
+            line = B.close(self.job(body="Closes req-1"))
+        self.assertIn("could not answer requests (RuntimeError)", line)
+        self.assertEqual(len(self.argvs("cc-board status")), 2)
+
+    def test_closes_answers_no_request_for_a_member_or_on_a_failed_answer(self):
+        self.board("h", {"t": {"status": "review"}})
+        self.request("req-x")
+        self.brief("Closes req-x", project="h", track="t")
+        B.close(self.job(repo="h--t", member="h", body="Closes req-x"))
+        self.assertEqual(self.calls("cc-notify"), [])
+        self.answer({"cc-notify": [1, "not control"]})
+        self.assertEqual(B.answer_requests(self.job(repo="h", body="Closes req-x", track="t")),
+                         "could not answer request req-x (not control)")
+        self.assertEqual(B.REQUEST_TIMEOUT, 20)
+
     def test_followup_row_name(self):
         self.answer({"cc-board get": [1, ""]})
         B.followup(self.job(repo="h--t", member="h"), T.Verdict(verdict=T.LAND, digest="d", advisory=["x"]))
