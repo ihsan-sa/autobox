@@ -3,7 +3,9 @@
 # defines, so every name here is the tool's, a `global` rebinds the tool's, and `__file__` is the tool. No
 # module docstring (it would replace the tool's __doc__) and no top-level name but the defs below.
 
+# recurring-defect-ok: pause-hold-missing — selfcheck fixtures: the two-host launches run against a fake peer in a temp tree, never a real project
 def selfcheck():
+    global PEER_LAUNCH_TIMEOUT
     import shutil
     import tempfile
     n = bad = 0
@@ -20,7 +22,7 @@ def selfcheck():
                                           "CC_WORKER_PACE_MARGIN", "CC_ROOM_POLL", "CC_CONFIG", "LANDER_LOADAVG",
                                           "TMUX", "TMUX_PANE", "CC_SLACK_ALIAS", "CC_ROOM_TMUX", "CC_ROOM_BIN",
                                           "CC_ROOM_NOTICE_AFTER", "CC_HEAVY_CAP", "CC_HEAVY_SCOPE",
-                                          "CC_ROOM_GRACE", "CC_ROOM_NOTICE_RETRY")}
+                                          "CC_ROOM_GRACE", "CC_ROOM_NOTICE_RETRY", "CC_PEER_DIR", "CC_PEER_SSH", "HOME")}
     procs = []
     strays = []   # (pid, start) of what a stub window ran: ended in the finally only while still that process
 
@@ -34,6 +36,9 @@ def selfcheck():
     os.environ["LANDER_LOADAVG"] = calm
     old_loadavg = admission.LOADAVG
     admission.LOADAVG = calm
+    # and the box's own peer must never be asked: no case reaches ~/.cc/peer
+    os.makedirs(f"{base}/nopeer")
+    os.environ["CC_PEER_DIR"] = f"{base}/nopeer"
 
     def fixture(name, cap=2, margin=10):
         """a room and a statusline dir of this case's own, nothing held, nothing queued"""
@@ -163,6 +168,123 @@ esac''')):
         w.wait(timeout=20)
         t("frees: it runs by itself once the slot is freed", os.path.exists(mark), True)
         t("frees: a finished launch holds no slot", live("slots"), {})
+
+        # TWO HOSTS: a busy home hands the next worker to a peer with room; a quiet home keeps it. The peer is a
+        # fake host: a home of its own, reached by a fake ssh that runs `cc-peer serve` there as the forced command
+        # does, with a cc that only records what it was asked and a cc-room that says the peer has room.
+        d = fixture("twohosts")
+        peer = f"{d}/peerhome"
+        os.makedirs(f"{peer}/bin")
+        os.makedirs(f"{peer}/dev/r/.git")
+        for tool, body in (("cc", f'printf "%s\\n" "$*" >>{peer}/cc.argv\nexit 0'), ("cc-room", "exit 0"),
+                           ("cc-board", "exit 0")):
+            open(f"{peer}/bin/{tool}", "w").write(f"#!/bin/sh\n{body}\n")
+            os.chmod(f"{peer}/bin/{tool}", 0o755)
+        fake_ssh = f"{d}/fake-ssh"
+        open(fake_ssh, "w").write(f'#!/bin/sh\nexec env -i PATH="$PATH" HOME={peer} CC_PEER_CC={peer}/bin/cc '
+                                  f'SSH_ORIGINAL_COMMAND="$*" {sys.executable} {BIN}/cc-peer serve\n')
+        os.chmod(fake_ssh, 0o755)
+        hub = f"{d}/hubhome"
+        os.makedirs(f"{hub}/.cc/peer")
+        os.makedirs(f"{hub}/.cc/state/r/w")
+        open(f"{hub}/.cc/peer/dest", "w").write("user@peerbox\n")
+        open(f"{hub}/.cc/state/r/w/task.md", "w").write("Goal: a worker.\n")
+        loop = f"{d}/cc-loop"   # the launch a seat makes; run here, it leaves a mark
+        open(loop, "w").write(f"#!/bin/sh\ntouch {d}/ran-here\n")
+        os.chmod(loop, 0o755)
+        os.environ.update(HOME=hub, CC_PEER_DIR=f"{hub}/.cc/peer", CC_PEER_SSH=fake_ssh, LANDER_LOADAVG=hot)
+        r = subprocess.run([sys.executable, __file__, "admit", "r/w", "--log", f"{d}/loop.log", "--", loop, "r", "w",
+                            "--max-iter", "2", "--model", "opus"], timeout=60, capture_output=True, text=True)
+        t("two hosts: a busy home hands the worker to the peer and ends", (r.returncode, os.path.exists(f"{d}/ran-here")),
+          (0, False))
+        argv = open(f"{peer}/cc.argv").read() if os.path.exists(f"{peer}/cc.argv") else ""
+        t("two hosts: the peer ran `cc r w --go` with the brief and the loop's flags",
+          argv.startswith("r w --go Goal: a worker.") and "--loop 2 --model opus" in argv, True)
+        t("two hosts: the hub recorded where it went", open(f"{hub}/.cc/peer/placed/r/w").read().split()[1], "peerbox")
+        t("two hosts: a worker on the peer holds no slot here", live("slots"), {})
+        os.environ["LANDER_LOADAVG"] = calm
+        r = subprocess.run([sys.executable, __file__, "admit", "r/w", "--", loop, "r", "w"], timeout=60,
+                           capture_output=True, text=True)
+        t("two hosts: a quiet home keeps the next one", (r.returncode, os.path.exists(f"{d}/ran-here")), (0, True))
+        t("two hosts: …and the peer was not asked to run it", open(f"{peer}/cc.argv").read().count("--go"), 1)
+        os.environ.update(LANDER_LOADAVG=hot)
+        open(f"{peer}/bin/cc-room", "w").write("#!/bin/sh\necho 'load 40 on 6 cores'\nexit 1\n")
+        admission.LOADAVG = hot
+        spot, why = place()
+        t("two hosts: both busy queues it, saying why for each", (spot, "the box is busy" in why, "load 40" in why),
+          ("", True, True))
+        t("two hosts: check exits 1 when neither host has room",
+          subprocess.run([sys.executable, __file__, "check"], capture_output=True, text=True).returncode, 1)
+        # A SLOW PEER HOLDS UP NOBODY ELSE (round-4 security read of #1159): the peer was asked inside the room lock,
+        # so while it took its time no heavy run, cancel or resume on the hub could move
+        slow = f"{d}/slow-ssh"
+        open(slow, "w").write(f"#!/bin/sh\ntouch {d}/asked\nsleep 8\nexit 1\n")
+        os.chmod(slow, 0o755)
+        os.environ["CC_PEER_SSH"] = slow
+        if os.path.exists(f"{d}/ran-here"):
+            os.unlink(f"{d}/ran-here")
+        slowp = subprocess.Popen([sys.executable, __file__, "admit", "r/w", "--", loop, "r", "w"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(slowp)
+        for _ in range(200):
+            if os.path.exists(f"{d}/asked"):
+                break
+            time.sleep(0.1)
+        t0 = time.time()
+        r = subprocess.run([sys.executable, __file__, "heavy", "--name", "h", "--", "touch", f"{d}/heavy-ran"],
+                           timeout=60, capture_output=True, text=True)
+        n_cancel = cancel("r/w")
+        took = time.time() - t0
+        t("slow peer: a heavy run and a cancel go through while the peer is still being asked",
+          (os.path.exists(f"{d}/asked"), r.returncode, os.path.exists(f"{d}/heavy-ran"), n_cancel, took < 3),
+          (True, 0, True, 1, True))
+        try:
+            arc = slowp.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            arc = "still waiting"
+        t("slow peer: …and the cancelled launch ends once the peer answers, run nowhere",
+          (arc, os.path.exists(f"{d}/ran-here"), open(f"{peer}/cc.argv").read().count("--go")), (0, False, 1))
+        # to_peer's own ends, in this process: a no rests the peer; a launch that hangs is bounded and rests it too;
+        # a cancel before the launch starts nothing; a cancel during it still drops the entry, the peer running it
+        os.environ["CC_PEER_SSH"] = fake_ssh   # its cc-room still says 'load 40'
+        _peer_rest[0] = 0.0
+        got = to_peer("r/w", [loop, "r", "w"], None, f"{d}/no-entry", "x")
+        t("to_peer: a peer that says no is rested, with its reason",
+          ("load 40" in got, _peer_rest[0] > time.time() + PEER_REST - 60, "asked again later" in peer_why()), (True, True, True))
+        hang = f"{d}/hang-ssh"
+        open(hang, "w").write('#!/bin/sh\n[ "$1" = room ] && exit 0\nsleep 5\n')
+        os.chmod(hang, 0o755)
+        os.environ["CC_PEER_SSH"] = hang
+        _peer_rest[0] = 0.0
+        got = to_peer("r/w", [loop, "r", "w"], None, f"{d}/no-entry", "x")
+        t("to_peer: a launch cancelled before it starts is never handed over", got, "cancelled")
+        ent = f"{room_dir()}/queue/x"
+        os.makedirs(os.path.dirname(ent), exist_ok=True)
+        open(ent, "w").write("{}")
+        keep_to = PEER_LAUNCH_TIMEOUT
+        PEER_LAUNCH_TIMEOUT = 1
+        t0 = time.time()
+        try:
+            got = to_peer("r/w", [loop, "r", "w"], None, ent, "x")
+        finally:
+            PEER_LAUNCH_TIMEOUT = keep_to
+        t("to_peer: a launch that never returns is bounded, and the peer rested",
+          ("did not take it" in got, time.time() - t0 < 10, _peer_rest[0] > time.time()), (True, True, True))
+        ok_ssh = f"{d}/ok-ssh"
+        open(ok_ssh, "w").write("#!/bin/sh\nexit 0\n")
+        os.chmod(ok_ssh, 0o755)
+        os.environ["CC_PEER_SSH"] = ok_ssh
+        _peer_rest[0] = 0.0
+        os.makedirs(f"{room_dir()}/cancelled", exist_ok=True)
+        open(f"{room_dir()}/cancelled/x", "w").write("{}")
+        got = to_peer("r/w", [loop, "r", "w"], f"{d}/tp.log", ent, "x")
+        t("to_peer: cancelled while the peer was starting it, the entry and tombstone go and the log says where it runs",
+          (got, os.path.exists(ent), os.path.exists(f"{room_dir()}/cancelled/x"),
+           "it runs on the peer" in open(f"{d}/tp.log").read()), ("peer", False, False, True))
+        _peer_rest[0] = 0.0
+        admission.LOADAVG = calm
+        os.environ.update(LANDER_LOADAVG=calm, CC_PEER_DIR=f"{base}/nopeer", HOME=keep["HOME"] or HOME)
+        os.environ.pop("CC_PEER_SSH", None)
 
         # admit fails open: a room it cannot even create still runs the launch, and says so once
         d = fixture("crash")

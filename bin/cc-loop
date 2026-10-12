@@ -1474,6 +1474,18 @@ limit wait, a model fallback or restore, or a reminder has no post of its own' \
     "$(grep '^{' "$lh/.cc/state/lp/mi/loop.log" | jq -r 'select(has("errors")) | .landing.status // "none"' 2>/dev/null | tail -1)" host
   t 'control, on the host: the lander is asked, cc done is not, and no receipt is still exit 12' \
     "$(mrun mh)|$(grep -c . "$d/mi.done")|$(grep -c . "$d/mi.land")" "12|0|1"
+  # ── A DONE ON A PEER HOST (CC_PEER_SPOOL set by the hub's launch) ── no lander and no Slack here: the DONE goes to
+  # `cc-peer spool land` and the loop exits 0 on its receipt; the lander is never asked and no DONE card is posted.
+  printf '#!/bin/sh\nfor a in "$@"; do printf "%%s|" "$a"; done >> "%s"\necho "{\\"task_id\\":\\"lp/pd\\",\\"errors\\":[],\\"pending\\":{\\"landing\\":\\"hub\\"}}"\n' "$d/pd.peer" > "$lb/cc-peer"
+  printf '#!/bin/sh\necho called >> "%s"\nexit 1\n' "$d/pd.land" > "$lb/landpd"; chmod +x "$lb/cc-peer" "$lb/landpd"
+  mkdir -p "$lh/.cc/state/lp/pd" "$lh/.cc/worktrees/lp/pd"; echo "the task" > "$lh/.cc/state/lp/pd/task.md"
+  git -C "$lh/.cc/worktrees/lp/pd" init -q; git -C "$lh/.cc/worktrees/lp/pd" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  : > "$d/lb.n"; : > "$d/pd.peer"; : > "$d/pd.land"
+  c=$( ( env -i PATH=/usr/bin:/bin HOME="$lh" CC_CLAUDE="$lb/claude" CC_LAND="$lb/landpd" CC_FAILURES="$d/lb.fl" CC_PEER_SPOOL="$d/pd.spool" \
+        FK_ST="$lh/.cc/state/lp/pd" FK_LINE='STATUS: DONE' FK_COMMIT=0 "$lb/cc-loop" lp pd --max-iter 1 ) >/dev/null 2>&1; echo $?)
+  t 'peer: a DONE on a host the hub placed it on goes to cc-peer spool land and exits 0, the lander never asked and no DONE card' \
+    "$c|$(cat "$d/pd.peer")|$(grep -c . "$d/pd.land")|$(grep -c '^--id|done:' "$d/lb.n")|$(grep -c 'the hub queues the landing' "$lh/.cc/state/lp/pd/loop.log")" \
+    "0|spool|land|lp|pd||0|0|1"
   # ── THE REAL `cc done`, INSIDE A MEMBER'S BOUNDARY, WITH NOWHERE TO PUSH ── the case above stubs cc done, and that
   # hid the ending this one pins (review of #965): with no remote the real one took "no remote, no PR", marked the row
   # done, said delivered and exited 0, so the loop exited 0 and nothing reached the queue or the ledger. Its own
@@ -1869,6 +1881,14 @@ while [ $i -lt "$MAXI" ]; do
     # RECEIPT it prints, never from an exit code — a board or card projection that could not be written used to
     # turn a real PR into "finished, but opened no PR". The branch below is the legacy one, for a row that has no
     # record; milestone 7 removes it with the rest.
+    # A WORKER THE HUB PLACED ON A PEER HOST (cc-peer; CC_PEER_SPOOL is set by that launch and nothing else) has no
+    # lander and no Slack here. Its DONE goes to the spool with the pushed tip and pr-body.md; the hub checks the tip
+    # on origin and runs its own `cc-land queue --task` when it drains this host. A Slack deliverable is not carried.
+    if [ -n "${CC_PEER_SPOOL:-}" ]; then
+      log "DONE (placed here by the hub: the hub queues the landing)"
+      rec=$("$BIN/cc-peer" spool land "$repo" "$track" 2>>"$LOG"); printf '%s\n' "$rec" >> "$LOG"
+      "$BOARD" note "$repo" "$track" "DONE on this host; the hub queues the landing when it drains it" >/dev/null 2>&1
+      exit 0; fi
     deliver_post   # the worker's Slack deliverable, if the brief asked for one: posted here, once, before the PR
     if [ -e "$ST/delivery.json" ] || [ -L "$ST/delivery.json" ]; then
       log "DONE"

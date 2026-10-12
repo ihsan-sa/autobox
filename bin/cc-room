@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """cc-room — does the box have room for one more headless worker, and a queue for the launch when it has not.
 
-  cc-room check                     exit 0 there is room · 1 there is not, and the one line on stdout says why
+  cc-room check                     exit 0 there is room, on this host or the peer · 1 there is not, and the one
+                                    line on stdout says why
   cc-room admit <repo/track> [--log FILE] [--resume ENTRY] -- CMD…
-                                    wait until there is room and this launch is the oldest one waiting, take a
-                                    slot, then exec CMD — the same pid, so the slot is held exactly as long as
-                                    CMD runs and frees itself when it exits. Nobody retypes a queued launch.
+                                    wait until there is room and this launch is the oldest one waiting. Room on
+                                    this host: take a slot, then exec CMD — the same pid, so the slot is held
+                                    exactly as long as CMD runs and frees itself when it exits. Room on the peer
+                                    only: hand the launch to `cc-peer launch` and exit with it. Nobody retypes a
+                                    queued launch.
   cc-room cancel <repo/track>       drop that launch from the queue: its waiting admit finds the tombstone on its next
                                     poll and exits 0 without running CMD. Nothing is killed. exit 1 when none is queued
   cc-room resume                    relaunch each launch a restart left behind (LOST, below) in a tmux window of its
@@ -31,6 +34,15 @@ Nothing here reads the weekly limit. The one thing it ever ends is a tmux window
 while every process in it is the `cc-room admit --resume` waiter that window was opened for, the shell line around
 it, or the idle shell it leaves behind: a launch that never started. Anything else in that window (the launch it
 went on to run, or a person's command) means the window is left alone, and so is a window it cannot read.
+
+TWO HOSTS (owner, 2026-10-12: "ideally full ram and cpu usage on both boxes"). With a peer configured (cc-peer:
+~/.cc/peer), a launch this host has no room for goes to the peer when the peer has room by its own count — its own
+cap, load and memory, asked over the launch key (`cc-peer room`) — and otherwise waits here as before. This host
+first, then the peer, then the queue. The five-hour pace is the account's, the same on both, so a launch held by it
+waits and the peer is not asked. Only a cc-loop launch can move; a member workspace's stays on its host. A peer that
+said no, did not answer or did not take a launch is not asked again for PEER_REST seconds. The peer is asked with the
+room lock released, so a slow one holds up no other admit, heavy run, cancel or resume. A worker on the peer holds a
+slot there, not here.
 
 WHY (2026-09-27): about 30 workers started inside an hour; load sat at 130-185 on 6 cores with swap full, the OOM
 killer ran 7 times and timed units failed one after another, while the five-hour window ran ahead of its clock.
@@ -135,7 +147,9 @@ RELAUNCH_ENV = ("CC_NOTIFY_LOG_ONLY", "CC_NOTIFY_LOG", "CC_LIMIT_STAMP", "CC_FAI
                 "CC_EGRESS_ALLOW", "CC_WORKER_MODEL", "CC_LOOP_TRIM", "CC_SPEND_TIER", "CC_ROOM_DIR", "CC_WORKER_CAP",
                 "CC_WORKER_PACE_MARGIN", "LANDER_LOADAVG", "LANDER_PSI_DIR", "CC_SLACK_ALIAS", "CC_ORCH_REPO",
                 "CC_CLAUDE", "CC_CONFIG", "CC_STATUSLINE_DIR", "CC_ROOM_POLL", "CC_ROOM_NOTICE_AFTER", "CC_ROOM_NOTICE_RETRY",
-                "CC_ROOM_GRACE", "CC_ROOM_BIN", "CC_ROOM_TMUX")
+                "CC_ROOM_GRACE", "CC_ROOM_BIN", "CC_ROOM_TMUX",
+                # a worker the hub placed here: resumed after a restart, its board, notices and DONE still go home
+                "CC_PEER_SPOOL", "CC_PEER_REPO", "CC_PEER_TRACK")
 NOTICE_TRIES = 8
 SHELLS = ("sh", "bash", "dash", "zsh")
 
@@ -245,13 +259,63 @@ def five_hour(now):
     return None
 
 
+PEER_REST = 600
+PEER_LAUNCH_TIMEOUT = 330
+
+
+def peer_dir():
+    return os.environ.get("CC_PEER_DIR") or f"{HOME}/.cc/peer"
+_peer_rest = [0.0]   # until when the peer is not asked again, after a launch it did not take
+
+
 def why_not(now=None):
-    """"" when there is room for one more worker, else the one-line reason."""
-    now = now or time.time()
+    """"" when there is room for one more worker on this host, else the one-line reason."""
+    return pace_why(now) or host_why()
+
+
+def host_why():
+    """"" when this host's own cap and load leave room, else why not."""
     cap = cfg("CC_WORKER_CAP", 12)
     held = len(live("slots"))
     if held >= cap:
         return f"{held} worker loops are running and the cap is {cap} (CC_WORKER_CAP)"
+    busy = admission.overloaded()
+    if busy:
+        return f"the box is busy: {busy}; landings go first"
+    return ""
+
+
+def peer_why():
+    """"" when the peer says it has room, else why not — no peer configured is a reason too."""
+    if not os.path.exists(f"{peer_dir()}/dest"):
+        return "no peer is configured"   # most hosts: asked without a process
+    if time.time() < _peer_rest[0]:
+        return "the peer did not take the last launch; it is asked again later"
+    try:
+        p = subprocess.run([f"{BIN}/cc-peer", "room"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"cc-peer room failed ({type(e).__name__})"
+    return "" if p.returncode == 0 else (p.stdout.strip().splitlines() or ["the peer has no room"])[0]
+
+
+def place(now=None, movable=True):
+    """-> (where, why): ("here", "") with room on this host, ("peer", "") with room on the peer only, else ("", the
+    reason). The brief: "starts the worker on the hub's host if that host has room, else on the peer, else queues it"."""
+    pace = pace_why(now)
+    if pace:
+        return "", pace   # the account's, and the peer runs on the same account
+    here = host_why()
+    if not here:
+        return "here", ""
+    if not movable:
+        return "", here
+    there = peer_why()
+    return ("peer", "") if not there else ("", f"{here}; and {there}")
+
+
+def pace_why(now=None):
+    """"" while the five-hour usage is not running ahead of its window, else why."""
+    now = now or time.time()
     fh = five_hour(now)
     if fh:
         used, resets = fh
@@ -262,9 +326,6 @@ def why_not(now=None):
             return (f"five-hour usage is at {used:.0f}% with {elapsed:.0f}% of the window gone, more than "
                     f"{margin} points ahead (CC_WORKER_PACE_MARGIN); it resets at "
                     f"{time.strftime('%H:%M', time.localtime(resets))}")
-    busy = admission.overloaded()
-    if busy:
-        return f"the box is busy: {busy}; landings go first"
     return ""
 
 
@@ -328,14 +389,15 @@ def where():
 
 
 def admit(what, cmd, log, resume=None):
-    """Wait for room, then exec cmd. FAIL OPEN: any error on the way (a room dir it cannot write, a lock, a bad
-    reading) runs cmd anyway with one line saying admission failed — a crash here would otherwise leave a queued
-    track that never runs and a window nobody reads. A cancelled launch is the one way out without cmd.
+    """Wait for room, then exec cmd here, or end once the peer has taken it. FAIL OPEN: any error on the way (a room
+    dir it cannot write, a lock, a bad reading) runs cmd here anyway with one line saying admission failed — a crash
+    here would otherwise leave a queued track that never runs and a window nobody reads. A cancelled launch, and one
+    the peer took, are the two ways out without cmd.
     Failing open drops the queue entry first: CMD runs under this same pid, so an entry it left would read as a
     waiter still queued at the head of the FIFO, and a resumed one as a launch `resume` should start again."""
     mine = {}
     try:
-        if not wait_for_room(what, cmd, log, resume, mine=mine):
+        if wait_for_room(what, cmd, log, resume, mine=mine) != "here":   # cancelled, or running on the peer
             sys.exit(0)
     except Exception as e:   # noqa: BLE001 — every failure here is the same one: no admission, so start anyway
         logline(log, f"cc-room: admission failed for {what} ({type(e).__name__}: {e}); starting it anyway")
@@ -358,8 +420,9 @@ def forget(paths, what, log):
 
 
 def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
-    """-> True holding a slot, False cancelled. kind "worker" waits on why_not() in queue/, "heavy" on the heavy
-    cap in heavy-queue/; only a worker's entry is kept through a restart and only a worker's wait gives notice.
+    """-> "here" holding a slot here, "peer" once the peer has started it, False cancelled. kind "worker" waits on
+    place() in queue/, "heavy" on the heavy cap in heavy-queue/; only a worker's entry is kept through a restart, only
+    a worker's wait gives notice and only a worker's cc-loop launch can go to the peer.
     mine["entry"] is the queue entry once written, for a caller that fails open to drop."""
     mine = {} if mine is None else mine
     qsub, ssub = ("queue", "slots") if kind == "worker" else ("heavy-queue", "heavy")
@@ -390,10 +453,11 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
                        target=old.get("target") or (f"{repo}@{alias}" if alias else repo))
         me = mine["entry"] = write_entry(qsub, name, what, rec)
     poll = float(os.environ.get("CC_ROOM_POLL") or 60)
+    movable = kind == "worker" and bool(cmd) and os.path.basename(cmd[0]) == "cc-loop"   # a member's cc-sandbox launch stays home
     retry = float(os.environ.get("CC_ROOM_NOTICE_RETRY") or 300)
     said, last = None, 0.0
     while True:
-        tell_now = False
+        tell_now = ask_peer = False
         with Lock():
             if not os.path.exists(me):
                 tomb = f"{room_dir()}/cancelled/{name}"
@@ -406,13 +470,19 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
                 write_entry(qsub, name, what, rec)
             waiting = live(qsub)
             first = next(iter(waiting), me) == me   # FIFO: the oldest launch still waiting goes first
-            why = (why_not() if kind == "worker" else heavy_why()) if first else ""
-            if first and not why:
+            if kind == "worker":   # this host here, under the lock; the peer (TWO HOSTS) below, once it is released
+                pace = pace_why() if first else ""
+                why = (pace or host_why()) if first else ""
+                ask_peer = bool(first and why and not pace and movable)
+            else:
+                why = heavy_why() if first else ""
+            spot = "here" if first and not why else ""   # `spot`, since where() is the pane's
+            if spot == "here":
                 write_entry(ssub, str(os.getpid()), what)
                 os.unlink(me)
                 if said is not None:
                     logline(log, f"cc-room: room now — {what} starts")
-                return True
+                return "here"
             if not first:
                 ahead = list(waiting).index(me) if me in waiting else 0
                 why = f"{ahead} launch(es) queued ahead of it"
@@ -424,6 +494,13 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
                 rec["notice_next"] = time.time() + min(retry * 2 ** (rec["notice_tries"] - 1), 6 * 3600)
                 tell_now = True
                 write_entry(qsub, name, what, rec)
+        if ask_peer:   # never under the lock: a peer slow to answer would hold up every admit, heavy run, cancel and resume
+            got = to_peer(what, cmd, log, me, name)
+            if got == "peer":
+                return "peer"
+            if got == "cancelled":
+                continue   # the loop's top reads the tombstone
+            why = f"{why}; and {got}"
         if tell_now:
             if notice(what, rec, why, log):
                 rec["noticed"] = True
@@ -437,6 +514,39 @@ def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
             logline(log, f"cc-room: {what} queued — {why}")
             said, last = why, time.time()
         time.sleep(poll)
+
+
+def to_peer(what, cmd, log, me, name):
+    """Hand the launch at the head of the queue to the peer, with the room lock NOT held: -> "peer" when the peer
+    started it (its entry dropped), "cancelled" when a cancel came first, else why it still waits here. A peer that
+    answered no, or not at all, is not asked again for PEER_REST seconds."""
+    there = peer_why()
+    if there:
+        if os.path.exists(f"{peer_dir()}/dest") and time.time() >= _peer_rest[0]:
+            _peer_rest[0] = time.time() + PEER_REST   # it said no or did not answer: a rest, not a 40 s ask a poll
+        return there
+    with Lock():
+        if not os.path.exists(me):
+            return "cancelled"
+    try:   # cc-peer's own three tries take at most about 280 s; this bounds a call that never returns
+        rc = subprocess.run([f"{BIN}/cc-peer", "launch", what] + (["--log", log] if log else []) + ["--"] + list(cmd),
+                            timeout=PEER_LAUNCH_TIMEOUT).returncode
+    except (OSError, subprocess.SubprocessError) as e:
+        logline(log, f"cc-room: cc-peer launch for {what} failed ({type(e).__name__})")
+        rc = 1
+    if rc:
+        _peer_rest[0] = time.time() + PEER_REST
+        return "the peer did not take it (cc-peer launch above); it waits here"
+    with Lock():   # started there: whatever came in meanwhile, the entry goes, so nothing runs it here too
+        tomb = f"{room_dir()}/cancelled/{name}"
+        if os.path.exists(tomb):
+            logline(log, f"cc-room: {what} was cancelled while the peer was starting it; it runs on the peer")
+        for x in (me, tomb):
+            try:
+                os.unlink(x)
+            except FileNotFoundError:
+                pass
+    return "peer"
 
 
 def ccboard():
@@ -712,8 +822,8 @@ def status():
             print(f"heavy   {what} (pid {pid})")
         for p, (pid, what) in live("heavy-queue").items():
             print(f"heavy queued {what} (pid {pid})")
-    w = why_not()
-    print("room: yes" if not w else f"room: no — {w}")
+    spot, w = place()
+    print({"here": "room: yes", "peer": "room: on the peer"}.get(spot, f"room: no — {w}"))
 
 
 def selfcheck(*a, **k):
@@ -727,10 +837,10 @@ def selfcheck(*a, **k):
 
 def main(a):
     if a[:1] == ["check"]:
-        w = why_not()
+        where, w = place()
         if w:
             print(w)
-        return 1 if w else 0
+        return 0 if where else 1
     if a[:1] == ["status"]:
         status()
         return 0

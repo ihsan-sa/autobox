@@ -607,8 +607,9 @@ pr_body(){   # the PR's body: the worker's own description and a link to the bri
   # file. The brief's own `Closes <row>` lines still ride along, because cc-land closes rows off the PR body and a
   # brief's Closes sentence counts. A worker that wrote nothing still gets the brief pasted: a PR is never opened empty.
   local instr="$1" repo="$2" track="$3" note="" closes=""
-  if [ -s "$STBASE/$repo/$track/pr-body.md" ]; then
-    note=$(cat "$STBASE/$repo/$track/pr-body.md"); closes=$(grep -E '(^|[^A-Za-z])Closes:? ' <<<"$instr" || true)
+  local pb="$STBASE/$repo/$track/pr-body.md"   # a plain file only: a link, a directory or a FIFO is as if absent
+  if [ -f "$pb" ] && [ ! -L "$pb" ] && [ -s "$pb" ] && note=$(dd if="$pb" iflag=nofollow,nonblock status=none 2>/dev/null) && [ -n "$note" ]; then
+    closes=$(grep -E '(^|[^A-Za-z])Closes:? ' <<<"$instr" || true)
     instr=$(printf '%s\n\n---\nBrief: ~/.cc/state/%s/%s/task.md%s' "$note" "$repo" "$track" "${closes:+$'\n'$closes}")
   fi
   printf '%s\n\n---\nOpened by cc from track %s. Review before merge.\nJournal: ~/.cc/state/%s/%s/progress.md' "$instr" "$track" "$repo" "$track"
@@ -1197,6 +1198,14 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   t "…and the brief's text is not pasted under it" "$rc"
   rc=0; case "$(STBASE="$T/pb" pr_body BRIEF r t)" in "cc-slackd needs a restart after merge"$'\n\n'"---"$'\n'"Brief: ~/.cc/state/r/t/task.md"$'\n\n'"---"$'\n'"Opened by cc from track t."*) ;; *) rc=1;; esac
   t "…and a brief with no Closes line adds none" "$rc"
+  # …but never through a link the worker planted there (security read of #1159): it would publish what it points at
+  printf 'SECRET-TOKEN\n' > "$T/pb/secret"; ln -sf "$T/pb/secret" "$T/pb/r/t/pr-body.md"
+  brief_only=$(printf 'BRIEF\n\n---\nOpened by cc from track t. Review before merge.\nJournal: ~/.cc/state/r/t/progress.md')
+  rc=0; [ "$(STBASE="$T/pb" pr_body BRIEF r t)" = "$brief_only" ] || rc=1
+  t "cc done: a pr-body.md that is a link is not read into the PR body, which is the brief as if it were absent" "$rc"
+  rm -f "${T:?}/pb/r/t/pr-body.md"; mkdir "$T/pb/r/t/pr-body.md"
+  rc=0; [ "$(STBASE="$T/pb" pr_body BRIEF r t)" = "$brief_only" ] || rc=1
+  t "…and so is a directory by that name: the brief, never a blank lead" "$rc"
   # DELIVERED OR SAYS WHY (a-delivery-reaches-a-turn-or-says-why). Stub helpers in $T/sb answer with the rc a file
   # names, and log what they were asked, so each route is driven on its own fixture — the dead target included.
   mkdir -p "$T/sb"; for w in cc-loop cc-msg cc-notify; do
@@ -1830,13 +1839,15 @@ case "$mode" in
          "${CC_SLACK:-$BIN/cc-slack}" track-thread "$repo/$track" --title "$("$BOARD" get "$repo" "$track" title 2>/dev/null)" >/dev/null 2>&1 || true; fi
        xq=""; [ ${#XTRA[@]} -gt 0 ] && xq=$(printf ' %q' "${XTRA[@]}")   # printf %q with no argument emits '' — cc-loop would see an empty arg
        lock "$st/.lock"; [ -n "$(win_id "$win")" ] && tmux kill-window -t "$(win_id "$win")"
-       pre=""; for v in CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_FAILURES CC_WORKER_SANDBOX CC_EGRESS_ALLOW CC_WORKER_MODEL CC_LOOP_TRIM CC_SPEND_TIER CC_ROOM_DIR CC_WORKER_CAP CC_WORKER_PACE_MARGIN LANDER_LOADAVG LANDER_PSI_DIR CC_SLACK_ALIAS CC_ORCH_REPO; do   # CC_ROOM_DIR, the two room keys and the load it reads (LANDER_*): `cc-room admit` in the window asks them again; CC_SLACK_ALIAS: the orch dispatching this, which cc-loop records for its stop notice and unsets before the worker runs   # tests: the new tmux window has the server's env, not ours — carry the log-only flag (or the worker's DONE notice really posts) and the run's own log/stamp/ledger (or a fixture loop's stop is recorded as the box's own)
+       pre=""; for v in CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_FAILURES CC_WORKER_SANDBOX CC_EGRESS_ALLOW CC_WORKER_MODEL CC_LOOP_TRIM CC_SPEND_TIER CC_ROOM_DIR CC_WORKER_CAP CC_WORKER_PACE_MARGIN LANDER_LOADAVG LANDER_PSI_DIR CC_PEER_SPOOL CC_PEER_REPO CC_PEER_TRACK CC_SLACK_ALIAS CC_ORCH_REPO; do   # CC_ROOM_DIR, the two room keys and the load it reads (LANDER_*): `cc-room admit` in the window asks them again; CC_SLACK_ALIAS: the orch dispatching this, which cc-loop records for its stop notice and unsets before the worker runs   # tests: the new tmux window has the server's env, not ours — carry the log-only flag (or the worker's DONE notice really posts) and the run's own log/stamp/ledger (or a fixture loop's stop is recorded as the box's own)
          # …and every knob a person sets in FRONT of the dispatch (CC_WORKER_MODEL, CC_LOOP_TRIM): off this list the
          # variable never reaches the window, cc-config silently reads ~/.cc/config instead, and the run is the
          # opposite of what was asked for — in both directions, which is what would corrupt a shadow-week A/B.
          # CC_SPEND_TIER too: the tier door this dispatch just passed is asked AGAIN by cc-loop at its start and at
          # every iteration, and off this list the loop asked the box's ~/.cc/config while the dispatcher had answered
          # from its environment — a fixture loop under the box's `stop` died at its door with no log line (2026-09-16..18).
+         # CC_PEER_SPOOL/REPO/TRACK: a worker the hub placed on this host (`cc-peer serve`), whose board, notify and DONE
+         # calls go to that spool for the hub to drain; off this list they would act on this host's own board and Slack.
          [ -n "${!v:-}" ] && pre="$pre$(printf '%s=%q ' "$v" "${!v}")"; done
        # ROOM FOR ONE MORE (cc-room): fewer than CC_WORKER_CAP loops running, and the five-hour window not ahead of
        # its clock by more than CC_WORKER_PACE_MARGIN. Without it the launch is QUEUED, not refused: the window opens

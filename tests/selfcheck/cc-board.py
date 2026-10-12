@@ -830,6 +830,18 @@ def selfcheck():
                and not glob.glob(f"{th}/.cc/boards/r.json.*tmp"))
         finally:
             BOARDS, os.replace, LOCK_WAIT = real_boards, real_replace, real_wait
+        # A WORKER THE HUB PLACED ON A PEER HOST (CC_PEER_SPOOL set): its note lands on the board here AND goes to the
+        # spool for the hub; a set or an add never does, and without the variable nothing is spooled
+        os.makedirs(f"{th}/dev/pr", exist_ok=True); run("init", "pr", f"{th}/dev/pr"); run("add", "pr", "w", "a row", "GOAL: x.")
+        sp = f"{th}/peer-spool"
+        run("note", "pr", "w", "half way", env={"CC_PEER_SPOOL": sp})
+        run("set", "pr", "w", "agent", "me", env={"CC_PEER_SPOOL": sp})
+        run("note", "pr", "w", "not placed")
+        got = [json.load(open(f"{sp}/{x}")) for x in sorted(os.listdir(sp))] if os.path.isdir(sp) else []
+        ok("peer: a placed worker's note is spooled for the hub, once, and its set is not",
+           [(g["tool"], g["argv"]) for g in got] == [("board", ["note", "pr", "w", "half way"])])
+        ok("…and the note is on this host's own row too", "half way" in run("get", "pr", "w", "notes").stdout
+           or "half way" in open(f"{th}/.cc/boards/pr.json").read())
         # INDEX-AT-WRITE: a note is in the knowledge base's index the moment `note` returns — `cc-lib ask` finds it with its
         # kind and ids and had nothing to re-read itself (re-read absent from COVERAGE: the hook did it, not the ask).
         # Its own HOME, its own board, and the baseline pass first so the only stale source a lazy ask could catch

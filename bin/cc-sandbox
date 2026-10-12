@@ -528,7 +528,8 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # this box can reach, so there is no name here for a walled-off session to redefine. ~/.cc/members/<h>/board is the
   # near miss — a member writes its CONTENTS (it is their ~/.cc/boards) but never sees the directory above it, so the
   # name is the host's. Refusing every worker launch because one member's board directory looks odd is the worse trade.
-  for f in "$H"/.cc/members/*/board; do [ -d "$f" ] && B+=(--ro-bind "$f" "$f"); done   # ~/.cc/boards/<h>.json is a link in here (board_dir): ro, it resolves, and a worker writes no member's board
+  # -try: a board removed between this glob and the mount (a member removed, a selfcheck fixture cleaned up) is skipped, not a failed launch
+  for f in "$H"/.cc/members/*/board; do [ -d "$f" ] && B+=(--ro-bind-try "$f" "$f"); done   # ~/.cc/boards/<h>.json is a link in here (board_dir): ro, it resolves, and a worker writes no member's board
   settings_bind "$H/.cc/sandbox/$1/$2"   # ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside
   skills_bind   # the box's shared skills, ro, one per name (skills_bind); ~/.claude is a tmpfs here, so no member name is in the way
   toolchains_bind   # ~/.cc/toolchains, ro, when it is the host's own and closed to every other writer (toolchains_bind)
@@ -2583,7 +2584,7 @@ print(\"dns=\"+dns())"
   git -C "$fh/dev/$w" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "${fh:?}"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
   local sw lp of sname pw
-  local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out out2 want rc c m0 t0 u0 hd held rsd rsd2 sec
+  local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out out2 want rc c m0 t0 u0 hd held rsd rsd2 sec vb
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   g(){ sed -n "s/^$1=//p" <<<"$out" | head -1; }
@@ -2868,6 +2869,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   mv "$dev/.git/hooks" "$dev/.git/hooks.gone"
   out=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo hooks=$(mkdir -p ~/dev/'"$r"'/.git/hooks 2>/dev/null; touch ~/dev/'"$r"'/.git/hooks/x 2>/dev/null && echo writable || echo ro)' 2>&1)
   t 'a repo with no .git/hooks gets the ro wall all the same — the name is never left free' "$(g hooks)" ro
+  [ -n "$(g hooks)" ] || sed -n '1,4s/^/      ↳ FAIL, the launch said: /p' <<<"${out:-nothing at all}"
   rm -rf "$dev/.git/hooks"; mv "$dev/.git/hooks.gone" "$dev/.git/hooks"
   # ── WHAT IS BOUND RW IN .git IS NOT TAKEN FROM A FILE THE WORKER WRITES (track_gitdir, branch_warn) ──────────────
   # The worktree's `.git` gitlink names the per-worktree git dir this launch binds rw, and it lives in a tree the worker
@@ -2922,6 +2924,18 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
       "$(g RAN)/$(grep -c decoy-swapped <<<"$out")/$sw" yes/0/swapped
     [ -n "$(g RAN)" ] || sed -n '1,4s/^/      ↳ FAIL, the launch said: /p' <<<"${out:-nothing at all}"   # why a launch never started; FAIL in the line so a gate log, which keeps only FAIL and ✗ lines, keeps it
   done
+  # A MEMBER'S BOARD THAT GOES AWAY DURING THE LAUNCH does not stop it. build globs ~/.cc/members/*/board and binds each
+  # by name, and a board removed between the glob and the mount (a member removed, or another selfcheck's fixture
+  # cleaned up, which is how three overlapping lander runs went red on 2026-10-12 with "bwrap: Can't find source path
+  # …/_ccsbxm<pid>/board") failed the whole launch. Removed while the launch sits in its delay, after the glob.
+  vb="$H/.cc/members/_ccsbxv$$/board"; mkdir -p "$vb"; of="$H/.cc/vanish-out.$$"
+  CC_SANDBOX_TEST_DELAY=3 CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo RAN=yes' >"$of" 2>&1 & lp=$!
+  sw=missed; for i in $(seq 1 1200); do
+    for f in $(pgrep -P "$lp" -x sleep); do [ "$(tr '\0' ' ' < "/proc/$f/cmdline" 2>/dev/null)" = "sleep 3 " ] && { rm -rf "${vb:?}"; sw=gone; }; done
+    [ "$sw" = gone ] || ! kill -0 "$lp" 2>/dev/null && break; sleep 0.05; done
+  wait "$lp"; out=$(cat "$of"); rm -f "$of"; rm -rf "$H/.cc/members/_ccsbxv$$"
+  t 'a member board removed between the glob and the mount does not stop a worker launch' "$(g RAN)/$sw" yes/gone
+  [ -n "$(g RAN)" ] || sed -n '1,4s/^/      ↳ FAIL, the launch said: /p' <<<"${out:-nothing at all}"
   # OFF (CC_WORKER_SANDBOX=0, the owner's switch): nothing changes — argv byte for byte, the environment untouched. Unset
   # is ON now, and selfcheck_fence drives that side.
   out=$(CC_WORKER_SANDBOX=0 TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)

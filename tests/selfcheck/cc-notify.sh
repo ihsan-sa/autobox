@@ -635,6 +635,13 @@ PY
   N -t "demorepo done" "$(printf 'one\ntwo\nthree\nfour\nfive\nsix')"
   k "$(no_ grep -q 'Bold the one thing' "$T/err")" "…and a routine note into the updates lane (phone=no) is told nothing either, however long: the nudge is gated on the door, not the word count"
 
+  # A WORKER THE HUB PLACED ON A PEER HOST (CC_PEER_SPOOL set) sends nothing from here: one spool entry for the hub,
+  # carrying --ask for any door and never a --run
+  CC_PEER_SPOOL="$T/spool" CC_PEER_REPO=r CC_PEER_TRACK=w N --approval --run "rm -rf ~" -t "r/w blocked" "need a hand"
+  k "$(no_ test -s "$T/slack.args")" "peer: a placed worker's notice does not reach Slack here"
+  k "$(no_ pushed)" "…nor the phone"
+  k "$(yes_ jq -e '.tool == "notify" and .repo == "r" and .track == "w" and (.argv | index("--ask")) and (.argv | index("--run") | not) and .argv[-1] == "need a hand"' "$T"/spool/*.json)" \
+    "…it is one notify entry in the spool, an --ask with the message last and no --run"
   out=$( cd "$T" && env -u CC_NOTIFY_LOG_ONLY -u CC_BOX HOME="$NH" CC_NOTIFY_LOG="$log" "$BIN/cc-notify" report today 2>&1 )
   k "$(yes_ grep -qE 'rung 1 +[0-9]' <<<"$out")" "report says how much was sent that day, broken out by rung"
   k "$(yes_ grep -q 'rang his phone' <<<"$out")" "…and how much of it rang his phone"
