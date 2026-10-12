@@ -45,6 +45,17 @@ def selfcheck():
         before = len(lines("alpha"))
         C("record", "--scope", "alpha", "--kind", K, "--observed", "seen by a script", "--detector", "box")
         ok("…detector box: one record, no gap record", len(lines("alpha")) == before + 1)
+        # ---- no --detector: the review's person-first test runs on --observed; each case on a scope of its own
+        rc, out, err = C("record", "--scope", "dflt", "--kind", K, "--observed", "the owner found it on the second run")
+        dl = lines("dflt")
+        ok("defaulted→person: no --detector and the observed says the owner found it: person, the phrase as evidence, and the gap record",
+           rc == 0 and dl[0]["detector"] == {"who": "person", "evidence": "owner found"} and len(dl) == 2 and dl[-1]["kind"] == GAP_KIND)
+        rc, out, err = C("record", "--scope", "expl", "--kind", K, "--observed", "the owner found it", "--detector", "unknown")
+        el = lines("expl")
+        ok("explicit --detector unknown is kept, though the observed says the owner found it", rc == 0 and len(el) == 1 and el[0]["detector"] == {"who": "unknown", "evidence": ""})
+        rc, out, err = C("record", "--scope", "nomatch", "--kind", K, "--observed", "a grep pattern was refused")
+        ol = lines("nomatch")
+        ok("no match→unknown: no --detector and no person in the observed: unknown, with no evidence", rc == 0 and len(ol) == 1 and ol[0]["detector"] == {"who": "unknown", "evidence": ""})
         rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "", "--cost", "turns=1", "--link", "pr=7")
         ok("an empty observed is refused", rc == 2)
         rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "x", "--cost", "turns=1", "--cost", "owner=one line", "--link", "pr=7", "--evidence", "a", "--evidence", "b", "--ts", "2026-09-01T10:00Z")
