@@ -67,7 +67,8 @@
 # minted FOR a workspace is therefore asked for with `repositories`: GitHub limits it to that list, and there
 # is NO fallback — a workspace that owns nothing is refused a token rather than handed the org. Ownership is
 # git's own account of it, not a second registry: a workspace owns the repositories its checkout
-# ~/dev/<handle> names as remotes. The host writes those (`create` below); cc-sandbox binds that .git/config
+# ~/dev/<handle> names as remotes — in its own .git/config, read the same whatever git environment the caller
+# runs this in (wsgit below). The host writes those (`create` below); cc-sandbox binds that .git/config
 # READ-ONLY inside the boundary, so a workspace cannot add another's repository to its own list.
 #
 # THE TOKEN IS THE SECRET AND IT IS TREATED LIKE ONE. It goes to git's stdin pipe and to ~/.cc/secrets/
@@ -113,6 +114,18 @@ die(){ echo "cc-gh-token: $1" >&2; exit 1; }
 # ── whose repository is it ───────────────────────────────────────────────────────────────────────
 # The marker, never the name: ~/dev/<handle>/.cc/member-workspace is what makes a directory a workspace
 # (docs/design-member-workspaces.md), and its remotes are what it owns.
+# Read from THAT checkout and nothing the caller set. As git's credential helper this runs in the caller's
+# environment, and git exports the caller's repository into it on every fetch (measured, git 2.53, 2026-10-12:
+# GIT_DIR=.git in a clone, `.` in a bare one, the absolute path under --git-dir as the lander fetches, and
+# GIT_CONFIG_PARAMETERS with every `-c` it was given). `git -C ~/dev/<h>` honoured that GIT_DIR and read the
+# CALLER's remotes, so the lander's clone decided what a member workspace owned (2026-10-12), and a `-c
+# remote.x.url=…` would have added a repository to any workspace's list. So every GIT_* goes, the repository is
+# named outright, and config is read --local: the file cc-sandbox binds read-only, and no other scope.
+wsgit(){   # $1 a workspace checkout, then git's arguments → git on that checkout alone
+  local d=$1 v u=(); shift
+  for v in $(compgen -e); do case $v in GIT_*) u+=(-u "$v") ;; esac; done
+  env "${u[@]}" git --git-dir="$d/.git" "$@"
+}
 ws_repos(){   # $1 handle [$2 owner, the app's by default] → its repo names under that owner, one per line, sorted. 1 = not a workspace,
               # which is NOT the same answer as a workspace with no repository yet (0, and nothing printed):
               # git exits non-zero when a repo has no remote at all, and under pipefail that read as "no
@@ -121,7 +134,7 @@ ws_repos(){   # $1 handle [$2 owner, the app's by default] → its repo names un
   case "$1" in ''|.|..|*/*) return 1 ;; esac
   d="$HOME/dev/$1"
   [ -f "$d/.cc/member-workspace" ] || return 1
-  cfg=$(git -C "$d" config --get-regexp '^remote\..*\.url$' 2>/dev/null) || cfg=''
+  cfg=$(wsgit "$d" config --local --get-regexp '^remote\..*\.url$' 2>/dev/null) || cfg=''
   printf '%s\n' "$cfg" | while read -r _ url; do
     u=${url%.git}
     case "${u,,}" in "https://${HOST,,}/${own,,}/"*) ;; *) continue ;; esac   # another host or another owner: not ours to open
@@ -315,10 +328,11 @@ EOF
 wire(){   # $1 workspace dir, $2 repo name, $3 url → the remote that makes it THIS workspace's (ws_repos above).
           # `origin` for a workspace that has no remote at all — its first repository, and nowhere to push until
           # now — and the repository's own name otherwise, because each project has its own repository (owner,
-          # 2026-09-03) and must not take another project's remote.
+          # 2026-09-03) and must not take another project's remote. Through wsgit, so a caller's GIT_DIR cannot
+          # make the remote land in the caller's own repository instead.
   local rn=origin
-  [ -z "$(git -C "$1" remote 2>/dev/null)" ] || rn="$2"
-  git -C "$1" remote add "$rn" "$3" 2>/dev/null
+  [ -z "$(wsgit "$1" remote 2>/dev/null)" ] || rn="$2"
+  wsgit "$1" remote add "$rn" "$3" 2>/dev/null
 }
 create(){   # $1 handle, $2 [<owner>/]<name> — a workspace's project ends up with somewhere to push, nobody present
   local ws="$1" name="$2" d url tok r msg other owner="$OWNER" ep
@@ -658,6 +672,27 @@ EOF
   k "$(t test "$(cat "$T/mints")" = 1)" "a repository created since the cached token was minted re-mints it, rather than pushing with a token that cannot open it"
   k "$(t test "$(jq -c .repositories "$T/body")" = '["repo-a","repo-a2"]')" "…for the workspace's whole list, the new repository included"
   k "$(t test -z "$(grep -F ghs_old_scope <<<"$out")")" "…and the narrower token is not the one git gets"
+
+  # ── the caller's repository is not the workspace's ──
+  # git runs this helper with the CALLER's GIT_DIR exported (an absolute one under --git-dir, as the lander
+  # fetches) and its -c in GIT_CONFIG_PARAMETERS; the lander's clone once decided what a member workspace owned (2026-10-12).
+  mkws wsg https://github.com/myorg/repo-g.git
+  git init -q "$T/caller" && git -C "$T/caller" remote add origin https://github.com/myorg/repo-x.git
+  out=$(GIT_DIR="$T/caller/.git" G repos wsg)
+  k "$(t test "$out" = repo-g)" "with a foreign GIT_DIR exported, a workspace still owns what its OWN checkout names, and only that"
+  out=$(GIT_CONFIG_PARAMETERS="'remote.inj.url'='https://github.com/myorg/repo-inj.git'" G repos wsg)
+  k "$(t test "$out" = repo-g)" "…and a caller's -c remote.<x>.url adds nothing to it"
+  k "$(t test -n "$(GIT_DIR="$T/caller/.git" G gitargs https://github.com/myorg/repo-g.git wsg)")" "gitargs under a foreign GIT_DIR still wires the workspace's own repository"
+  k "$(t test -z "$(GIT_DIR="$T/caller/.git" G gitargs https://github.com/myorg/repo-x.git wsg)")" "…and NOT the caller's, though the caller names it"
+  rm -f "$T"/cache*.json; : > "$T/body"
+  out=$(GIT_DIR="$T/caller/.git" askws wsg repo-g)
+  k "$(t test "$(jq -c .repositories "$T/body")" = '["repo-g"]')" "the helper under a foreign GIT_DIR mints for the workspace's list, not the caller's"
+  out=$(GIT_DIR="$T/caller/.git" askws wsg repo-x 2>/dev/null); rc=$?
+  k "$(t test $rc != 0 -a -z "$out")" "…and refuses the caller's repository at the helper itself"
+  : > "$T/created"
+  GIT_DIR="$T/caller/.git" G create wsg proj-g >/dev/null
+  k "$(t test "$(git -C "$T/dev/wsg" remote get-url proj-g 2>/dev/null)" = https://github.com/myorg/proj-g.git)" "create under a foreign GIT_DIR wires the remote into the workspace"
+  k "$(t test -z "$(git -C "$T/caller" remote get-url proj-g 2>/dev/null)")" "…and not into the caller's repository"
 
   # ── creating a repository for a workspace's project ──
   : > "$T/created"; rm -f "$T"/cache*.json
