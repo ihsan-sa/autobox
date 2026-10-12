@@ -1327,6 +1327,34 @@ class Admission(unittest.TestCase):
                 with A.slot(st, psi_root=calm, k=8, poll=0.05, deadline=0.2, say=lambda _: None):
                     pass
 
+    def test_free_counts_the_slots_a_check_takes_now_and_none_while_anyone_waits(self):
+        # brief (2026-10-02, #772): a check must not wait for a box slot while a runner has room, so spill() asks
+        # free() whether one would wait here; it looks without holding anything
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        calm = self.psi_dir(0, 0)
+        self.assertEqual(A.free(st, psi_root=calm, k=2), 2)   # no slots directory yet: every slot is free
+        with A.slot(st, psi_root=calm, k=2):
+            self.assertEqual(A.free(st, psi_root=calm, k=2), 1)
+            with A.slot(st, psi_root=calm, k=2):
+                self.assertEqual(A.free(st, psi_root=calm, k=2), 0)
+            self.assertEqual(A.free(st, psi_root=calm, k=2), 1)
+        self.assertEqual(A.free(st, psi_root=calm, k=2), 2)   # and looking took nothing
+        with A.slot(st, psi_root=calm, k=1):
+            self.assertEqual(A.free(st, psi_root=calm, k=1), 0)
+            self.assertEqual(A.free(st, psi_root=calm, k=3), 2)   # K rose: the slots past the held one are free
+        # a live ticket in the queue goes first (FAIR WAIT), so a new check would wait behind it
+        q = os.path.join(st, "slots", "queue")
+        name, tf = A._ticket(q)
+        try:
+            self.assertEqual(A.free(st, psi_root=calm, k=2), 0)
+        finally:
+            tf.close()
+        self.assertEqual(A.free(st, psi_root=calm, k=2), 2)   # its waiter gone, the ticket no longer counts
+        with A.slot(st, alone=True, psi_root=calm, k=1):   # an alone run holds the gate: nothing runs beside it
+            self.assertEqual(A.free(st, psi_root=calm, k=2), 0)
+        self.assertEqual(A.free(st, psi_root=calm, k=2), 2)
+
     def test_slots_now_backs_off_from_the_new_k(self):
         calm, hot = self.calm_load, self.loadavg(2.0 * (os.cpu_count() or 1))
         with mock.patch.object(A, "slots", lambda: 6):
@@ -2052,7 +2080,7 @@ class Judge(unittest.TestCase):
             seen.append(where)
             st = T.UNRUNNABLE if where == "laptop" else T.PASSED
             return T.Result(check=check.name, tree=tree, status=st, extra={"why": "no answer"})
-        with mock.patch.object(A, "busy", return_value=True), \
+        with mock.patch.object(A, "overloaded", return_value="load 50.0 on 20 cores (at least 2x)"), \
                 mock.patch.object(RUN, "laptop_dest", return_value="ccsuite@r"):
             outs = RUN.run_plan(".", m, T.Plan(checks=["a", "b"]), ["README.md"], self.H, "", runner=run)
         self.assertEqual(seen, ["laptop", "box", "box"])
@@ -2078,22 +2106,73 @@ class Judge(unittest.TestCase):
         p = mock.patch.dict(os.environ, {"CC_SUITES_DIR": d.name})
         p.start()
         self.addCleanup(p.stop)
-        with mock.patch.object(A, "busy", return_value=True), mock.patch.object(A, "loaded", return_value=False):
+        with mock.patch.object(A, "overloaded", return_value="load 50.0 on 20 cores (at least 2x)"):
+            # an overloaded lander spills: what may leave goes to the runners, hermetic and host included
             self.assertEqual(RUN.choose_where(c), "laptop")
-            # busy, not saturated, is enough for the PR's code: hermetic and host go too
             self.assertEqual(RUN.choose_where(chk(klass=T.HERMETIC, where=["box", "laptop"])), "laptop")
             self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "laptop")
             self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box"])), "box")     # needs this host
             for k in (T.BOX, T.TIMING):
                 self.assertEqual(RUN.choose_where(chk(klass=k, where=["box", "laptop"])), "box")
-        with mock.patch.object(A, "busy", return_value=False):
-            # laptop first (owner 2026-09-29): a calm box still sends what may leave it; the box is the fallback
-            self.assertEqual(RUN.choose_where(c), "laptop")
-            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "laptop")
-            # the lane saw the laptop give no answer a moment ago: the box takes it without waiting out ssh
+            # the lane saw the runners give no answer a moment ago: the box takes it without waiting out ssh
             self.assertEqual(RUN.choose_where(c, box_only=True), "box")
+        with mock.patch.object(A, "overloaded", return_value=""), mock.patch.object(A, "busy", return_value=True):
+            # a quiet lander keeps it (owner 2026-10-12): busy() is not overloaded(), and nothing leaves
+            self.assertEqual(RUN.choose_where(c), "box")
+            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "box")
+            # ...unless the lane placed it on the runners (it had no box slot for it): then it goes, if it may
+            self.assertEqual(RUN.choose_where(c, runners=True), "laptop")
+            self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box"]), runners=True), "box")
+            self.assertEqual(RUN.choose_where(chk(klass=T.BOX, where=["box", "laptop"]), runners=True), "box")
+            self.assertEqual(RUN.choose_where(c, box_only=True, runners=True), "box")
+            self.assertEqual(RUN.choose_where(c, "ann", runners=True), "member:ann")
 
-    def test_a_busy_box_sends_check_sh_and_the_e2e_suites_and_keeps_what_needs_it(self):
+    def test_spill_when_overloaded_or_every_admission_slot_is_held(self):
+        # brief (2026-10-02, #772 ran a check every 8-30 min on 1-2 box slots while the laptop said `free 6`):
+        # a calm box whose slots are all held sends what may leave to the runners, rather than wait for a slot
+        c = chk(klass=T.STATIC, where=["box", "laptop"])
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        with mock.patch.object(RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(A, "overloaded", return_value=""), mock.patch.object(A, "slots", return_value=1), \
+                mock.patch.dict(os.environ, {"LANDER_STATE": st}):
+            self.assertEqual((RUN.spill(), RUN.choose_where(c)), ("", "box"))   # a free slot: it stays
+            with A.slot(st, k=1):
+                self.assertEqual(RUN.spill(), "every admission slot on this host is held")
+                self.assertEqual(RUN.choose_where(c), "laptop")
+                self.assertEqual(RUN.choose_where(c, box_only=True), "box")
+                self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box"])), "box")   # needs this host
+            self.assertEqual((RUN.spill(), RUN.choose_where(c)), ("", "box"))
+        with mock.patch.object(A, "overloaded", return_value="load 50.0 on 20 cores (at least 2x)"), \
+                mock.patch.object(A, "free", return_value=3):
+            self.assertEqual(RUN.spill(), "load 50.0 on 20 cores (at least 2x)")   # overloaded says why first
+
+    def test_spill_when_the_admission_slots_cannot_be_read(self):
+        # Opus read: an OSError from A.free() counts as no free slot, so the check spills rather than the lane raising
+        c = chk(klass=T.STATIC, where=["box", "laptop"])
+        with mock.patch.object(RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(A, "overloaded", return_value=""), \
+                mock.patch.object(A, "free", side_effect=PermissionError("denied")):
+            self.assertTrue(RUN.spill().startswith("admission slots unreadable"))
+            self.assertEqual(RUN.choose_where(c), "laptop")
+        with mock.patch.object(RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(A, "overloaded", return_value=""), mock.patch.object(A, "free", return_value=1):
+            self.assertEqual((RUN.spill(), RUN.choose_where(c)), ("", "box"))   # readable and free: it stays
+
+    def test_run_plan_sends_the_lanes_runner_placement_on_to_choose_where(self):
+        m = M.Manifest(checks={"a": chk(name="a", klass=T.STATIC, where=["box", "laptop"])}, cwd={"a": ""})
+        seen = []
+
+        def run(check, tree, where, alone=False, **kw):
+            seen.append(where)
+            return T.Result(check=check.name, tree=tree, status=T.PASSED)
+        with mock.patch.object(RUN, "laptop_dest", return_value="ccsuite@r"), \
+                mock.patch.object(RUN, "spill", return_value=""):
+            RUN.run_plan(".", m, T.Plan(checks=["a"]), ["README.md"], self.H, "", runner=run, runners=True)
+            RUN.run_plan(".", m, T.Plan(checks=["a"]), ["README.md"], self.H, "", runner=run)
+        self.assertEqual(seen, ["laptop", "box"])
+
+    def test_an_overloaded_box_sends_check_sh_and_the_e2e_suites_and_keeps_what_needs_it(self):
         # the shipped manifests, as the lane reads them: the heavy host checks go, the ones bound to this host stay
         with open(os.path.join(CORE, "tests", "LANDING.toml")) as f:
             checks, faults = M.parse_checks(f.read())
@@ -2105,7 +2184,7 @@ class Judge(unittest.TestCase):
         self.addCleanup(d.cleanup)
         write(d.name, {"id_ed25519": "k\n", "remote": "ccsuite@r\n", "known_hosts": "r ssh-ed25519 AAAA\n"})
         with mock.patch.dict(os.environ, {"CC_SUITES_DIR": d.name}), \
-                mock.patch.object(A, "busy", return_value=True), mock.patch.object(A, "loaded", return_value=False):
+                mock.patch.object(A, "overloaded", return_value="load 50.0 on 20 cores (at least 2x)"):
             for n in ["check-sh"] + e2e:
                 self.assertEqual((n, RUN.choose_where(by[n])), (n, "laptop"))
             for n in ("selfcheck-cc-fence", "selfcheck-cc-sandbox", "selfcheck-lander"):
@@ -2287,7 +2366,7 @@ class CheckCaged(Env):
             return T.Result(check=check.name, tree=tree, status=T.PASSED, secs=0)
         c = T.Check(name="x", run="true", klass=T.HERMETIC, where=["laptop", "box"])
         m = M.Manifest(checks={"x": c})
-        with mock.patch.object(RUN, "laptop_dest", return_value="u@h"):
+        with mock.patch.object(RUN, "laptop_dest", return_value="u@h"), mock.patch.object(A, "overloaded", return_value="load 50.0 on 20 cores (at least 2x)"):
             RUN.run_plan(self.repo, m, T.Plan(checks=["x"]), [], "h", runner=runner, record_reds=False)
             RUN.run_plan(self.repo, m, T.Plan(checks=["x"]), [], "h", runner=runner, record_reds=False, caged=True)
         self.assertEqual(seen, ["laptop", "box"])

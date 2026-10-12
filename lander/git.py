@@ -311,6 +311,24 @@ def merge_tree(root, base, head, env=None):
         return tree, []
 
 
+def clash(root, a, b, env=None) -> list:
+    """The paths where two PR heads would not merge cleanly with each other ([] when they do): the same lines, or
+    hunks close enough that git will not rebase one over the other. Read sealed(), and nothing is written back to the
+    checkout. Any doubt raises GitError, which the lane reads as an overlap."""
+    with sealed(root, a, b) as ((rc, out), run):
+        if run is None:
+            raise GitError(f"git could not read {a[:12]} and {b[:12]} sealed: {str(out).strip()[-300:]}")
+        senv = dict(blind_env(), GIT_DIR=run.git_dir)
+        p = _bytes(["git", "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", *out], senv)
+        lines = p.stdout.decode(errors="replace").split("\0")
+        got = sorted({x for x in lines[1:] if x}) if p.returncode == 1 else []
+        if got:
+            return got
+        if p.returncode != 0 or not SHA_RE.fullmatch(lines[0].strip()):   # a conflict naming no path is a doubt
+            raise GitError(f"git merge-tree {a[:12]} {b[:12]}: {p.stderr.decode(errors='replace')[-300:]}")
+        return []
+
+
 def _bytes(argv, env, input=None, cwd=None, timeout=600):
     try:
         return subprocess.run(argv, cwd=cwd, env=env, input=input, capture_output=True, timeout=timeout,

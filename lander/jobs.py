@@ -11,7 +11,8 @@ PATHS are read from the environment at CALL time, so a test (or a second box lay
            <LANDQ>/lanes/<repo>.settle (flock): what the tick holds to settle a deploy-pending job, and drain
            holds to write one. The lane rests a job there and never takes it up again, so settling does not need
            the lane lock, which a busy lane holds from one job to the next.
-  handed   <LANDQ>/handed/<repo>-<pr>.json — the watch on a handed-back PR (lane.handback, tick).
+  handed   <LANDQ>/handed/<repo>-<pr>.json — the watch on a handed-back PR (lane.handback, tick); drain gives a new job
+           for that PR the check and head it was red on, so a green there on the retry is logged as a flake.
   rest     <LANDQ>/rest/<repo>-<pr>.json — a job that has ENDED (done, query, handback). The old lander unlinked its
            job file when the landing finished, and every reader counts <LANDQ>/*.json as a landing in flight (the Home
            tab's RUNNING tally, cc-bundle's queue depth), so an ended job leaves that directory; load() still finds it
@@ -496,6 +497,13 @@ def _drain(repo: str) -> list:
             job.member = h if h and t else None
             job.extra = {k: req[k] for k in CARRY if req.get(k)}
             job.extra.update(queued_at=E.stamp(), attempts=0)
+            red = read_json(handed_path(repo, pr))
+            red = red if isinstance(red, dict) else {}
+            if isinstance(red.get("red"), dict) and red["red"].get("head"):
+                # brief, 10-12: a check that fails and then passes on retry at the same head "is recorded as flaky".
+                # The place is not kept (perms, 10-12: "a re-queue after a red handback or a new head starts a fresh
+                # queued_at"), so the stamp above stands
+                job.extra["retry"] = dict(red["red"])
             job.history.append({"at": E.stamp(), "state": T.QUEUED})
             save(job)
             lines.append(f"{repo}#{pr} queued")

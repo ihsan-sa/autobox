@@ -15,8 +15,9 @@ A planning seat runs it by hand; the lander never installs itself.
         (cc-guard keeps this, like land/promote/rollback/pin, from a worker: it fetches a PR and runs its code.)
         Refuses the PR whole unless: every changed path is on the base's `lander` list; a LAND record by a reader
         whose name says `security` and a LAND record by another reader both stand at the PR's head (`lander record
-        --by`, which cc-guard keeps closed to workers); the candidate's own tests (`<core>/bin/lander selfcheck` and
-        `<core>/tests/lander`) pass on the merge tree inside bwrap (no network, empty HOME, no ~/.cc). Then prints a
+        --by`, which cc-guard keeps closed to workers); the merge tree's tests/check-extra.sh (`core-identity`: no
+        box identity in core/) and the candidate's own tests (`<core>/bin/lander selfcheck` and `<core>/tests/lander`)
+        pass on the merge tree inside bwrap (no network, empty HOME, no ~/.cc). Then prints a
         shadow plan: every job in the live queue planned by the current release and by the candidate, side by
         side, also inside bwrap. A job the current release plans and the candidate cannot is a refusal.
         Exit 0 passed, 1 refused, 3 could not run.
@@ -960,18 +961,47 @@ def merge_tree(root, base, head):
     return out.split()[0] if rc == 0 and out.split() else ""
 
 
-def candidate_tests(root, tree, pre):
-    """The candidate's own tests on its merge tree, in bwrap. -> (ok, lines)."""
+def candidate_tests(root, base, tree, pre, run=bwrap):
+    """The repo's identity gate and the candidate's own tests on its merge tree, in bwrap. -> (ok, lines).
+    The identity gate is tests/check-extra.sh (`core-identity` in the lander's manifest), which keeps the box's
+    identity out of the published core/. The copy that runs is the BASE's, put over the merge tree's, so a PR cannot
+    weaken the gate it is judged by; when the base has one and the merge tree drops it, the merge is refused. Only a
+    base with no gate leaves the merge tree's own copy, if any, and no copy at all says so and is not held. The gate
+    reads a git working tree, so it runs first, in a repo made inside the sandbox with every file of the tree as
+    extracted added to it: the tree's .gitignore files are deleted and the add is forced, because the gate's
+    `git grep --untracked` skips ignored files and `git archive` ships them. That repo is removed before the tests run."""
     tmp = tempfile.mkdtemp(prefix="lander-self.check.")
     try:
         a = subprocess.run(["git", "-C", root, "archive", "--format=tar", tree], capture_output=True)
         subprocess.run(["tar", "-x", "-C", tmp], input=a.stdout, check=False)
         c = f"{tmp}/{pre}"
         out, ok = [], True
+        gate = os.path.join(tmp, "tests", "check-extra.sh")
+        rc_b, base_gate, _ = git(root, "show", f"{base}:tests/check-extra.sh")
+        if rc_b == 0 and not os.path.isfile(gate):
+            out.append("core-identity: FAILED — the base has tests/check-extra.sh and this merge tree drops it")
+            ok = False
+        elif rc_b == 0 or os.path.isfile(gate):
+            if rc_b == 0:
+                with open(gate, "w") as f:
+                    f.write(base_gate)
+            for d, _, fs in os.walk(tmp):
+                if ".gitignore" in fs:
+                    os.remove(os.path.join(d, ".gitignore"))
+            rc, o, e = run(tmp, ["sh", "-c", "git init -q . && git add -Af . && exec bash tests/check-extra.sh"])
+            shutil.rmtree(os.path.join(tmp, ".git"), ignore_errors=True)
+            tail = [ln for ln in (o + e).strip().splitlines() if ln.strip()]
+            # the brief: "refuse the merge if it fails" — any non-zero exit is a red, and the hits go to the output
+            out.append(f"core-identity (tests/check-extra.sh): {'passed' if rc == 0 else f'FAILED (rc {rc})'} — "
+                       f"{(tail[-1:] or ['no output'])[0]}")
+            out += [f"  {ln}" for ln in tail[:-1][-10:]] if rc else []
+            ok = rc == 0
+        else:
+            out.append("core-identity: this tree has no tests/check-extra.sh, so there is none to run")
         for name, argv in (("lander selfcheck", ["python3", "-P", f"{c}lander/cli.py", "selfcheck"]),
                            ("tests/lander", ["python3", "-m", "unittest", "discover", "-s", f"{c}tests/lander",
                                              "-t", f"{c}tests/lander"])):
-            rc, o, e = bwrap(tmp, argv)
+            rc, o, e = run(tmp, argv)
             tail = [ln for ln in (o + e).strip().splitlines() if ln.strip()][-1:] or ["no output"]
             out.append(f"{name}: {'passed' if rc == 0 else f'FAILED (rc {rc})'} — {tail[0]}")
             ok = ok and rc == 0
@@ -1128,11 +1158,11 @@ def cmd_check(args, opts):
     pre = core_prefix(root, head)
     if not shutil.which("bwrap"):
         return die("check: bwrap is not installed, so the candidate's tests cannot run sandboxed", 3), None
-    ok, lines = candidate_tests(root, tree, pre)
+    ok, lines = candidate_tests(root, base_sha, tree, pre)
     for ln in lines:
         print(f"  {ln}")
     if not ok:
-        return die(f"check: PR #{pr}'s own tests are red on its merge tree"), None
+        return die(f"check: PR #{pr}'s merge tree is red on the identity gate or the candidate's own tests"), None
     tmp = tempfile.mkdtemp(prefix="lander-self.shadow.")
     try:
         a = subprocess.run(["git", "-C", root, "archive", "--format=tar", f"{tree}:{pre.rstrip('/')}" if pre else tree],
@@ -1148,7 +1178,7 @@ def cmd_check(args, opts):
     if bad:
         return die(f"check: the candidate cannot plan {bad} job(s) the current release plans"), None
     print(f"lander-self check: {repo}#{pr} at {head[:12]} passed — {len(files)} lander path(s), read by "
-          f"{', '.join(sorted(by))}, own tests green in bwrap")
+          f"{', '.join(sorted(by))}, identity gate and own tests green in bwrap")
     return 0, head
 
 
@@ -1438,10 +1468,81 @@ def selfcheck():
             sys.stderr.close()
             sys.stderr = _err
         case("shadow with two revs is a usage refusal", r_use == 2)
+    identity_gate_cases(case)
     HOME, ROOT = old
     bad = sum(1 for _, ok in results if not ok)
     print(f"lander-self selfcheck: {len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
+
+
+def identity_gate_cases(case):
+    """The merge tree's identity gate: a clean tree passes; a tree that puts the box's name in core/ is refused, in
+    a plain file, in a file its own .gitignore hides, or behind a gate it swapped for one that always passes; a tree
+    that drops the base's gate is refused; and with no gate on either side it is not held. Each case is its own
+    commit off the base it is judged against, extracted fresh. The runner is the
+    sandbox's argv run plainly in the tree with a clear env, so the cases need no bwrap; the gate stand-in reads
+    the working tree with git as the real one does, and git failing to read it is a red, so the repo made for it is
+    proven to be there."""
+    marker = "boxname" + "-x7"   # split, so this file never carries the string the fixture's gate looks for
+    gate = ("set -e; cd \"$(dirname \"$(readlink -f \"$0\")\")/..\"\n"
+            f"rc=0; o=$(git grep --untracked -n -i {marker} -- core) || rc=$?\n"
+            "case $rc in 1) echo 'check-extra.sh: OK';; 0) echo \"private string inside core/: $o\"; exit 1;;\n"
+            "  *) echo \"could not read the tree (rc $rc)\"; exit 2;; esac\n")
+    with tempfile.TemporaryDirectory() as t:
+        repo = os.path.join(t, "repo")
+        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": t, "LANG": "C.UTF-8", "TMPDIR": t,
+               "PYTHONDONTWRITEBYTECODE": "1", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def put(rel, text):
+            p = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(text)
+
+        def commit(msg, start, files=(), drop=()):
+            subprocess.run(["git", "-C", repo, "checkout", "-qf", "--detach", start], env=env, capture_output=True)
+            for rel, text in files:
+                put(rel, text)
+            for rel in drop:
+                os.remove(os.path.join(repo, rel))
+            subprocess.run(["git", "-C", repo, "add", "-Af", "."], env=env, capture_output=True)
+            subprocess.run(["git", "-C", repo, "commit", "-qm", msg], env=env, capture_output=True)
+            return git(repo, "rev-parse", "HEAD")[1].strip()
+
+        subprocess.run(["git", "init", "-q", repo], env=env, capture_output=True)
+        put("core/lander/cli.py", "print('lander selfcheck: 1 passed')\n")
+        put("core/tests/lander/test_ok.py", "import unittest\nclass T(unittest.TestCase):\n"
+                                            "    def test_ok(self):\n        pass\n")
+        subprocess.run(["git", "-C", repo, "add", "-A"], env=env, capture_output=True)
+        subprocess.run(["git", "-C", repo, "commit", "-qm", "bare"], env=env, capture_output=True)
+        bare = git(repo, "rev-parse", "HEAD")[1].strip()
+        boxed = ("core/lander/nightly.py", f"BOX = '{marker}'\n")
+        clean = commit("clean", bare, [("tests/check-extra.sh", gate)])
+        dirty = commit("box name in core", clean, [boxed])
+        hidden = commit("box name in an ignored core file", clean,
+                        [("core/lander/.gitignore", "secret.py\n"), ("core/lander/secret.py", f"BOX = '{marker}'\n")])
+        weak = commit("gate weakened", clean, [boxed, ("tests/check-extra.sh", "echo 'check-extra.sh: OK'\n")])
+        dropped = commit("gate dropped", clean, drop=["tests/check-extra.sh"])
+        run = lambda tree, argv: sh(argv, cwd=tree, env=env, timeout=120)  # noqa: E731
+        ok_c, l_c = candidate_tests(repo, clean, clean, "core/", run)
+        ok_d, l_d = candidate_tests(repo, clean, dirty, "core/", run)
+        ok_h, l_h = candidate_tests(repo, clean, hidden, "core/", run)
+        ok_w, l_w = candidate_tests(repo, clean, weak, "core/", run)
+        ok_x, l_x = candidate_tests(repo, clean, dropped, "core/", run)
+        ok_n, l_n = candidate_tests(repo, bare, bare, "core/", run)
+    case("a clean merge tree passes the identity gate and the candidate's tests",
+         ok_c and l_c[0].startswith("core-identity (tests/check-extra.sh): passed") and len(l_c) == 3)
+    case("a merge tree that puts box identity in core/ is refused, and the hit is named",
+         not ok_d and "FAILED (rc 1)" in l_d[0] and "core/lander/nightly.py" in "\n".join(l_d))
+    case("box identity in a core file the merge tree's own .gitignore hides is refused, and the hit is named",
+         not ok_h and "FAILED (rc 1)" in l_h[0] and "core/lander/secret.py" in "\n".join(l_h))
+    case("the base's gate runs, so a merge tree that swaps in a gate that always passes is still refused",
+         not ok_w and "FAILED (rc 1)" in l_w[0] and "core/lander/nightly.py" in "\n".join(l_w))
+    case("a merge tree that drops the gate the base has is refused",
+         not ok_x and "drops it" in l_x[0])
+    case("with no tests/check-extra.sh on the base or the merge tree, it says so and is not held",
+         ok_n and "none to run" in l_n[0])
 
 
 def prove_cases(case, t, real_names=names_under):

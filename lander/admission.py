@@ -47,7 +47,10 @@ the one signal for "the box is overloaded": the lander serializes on it and give
 `cc-room` queues new `--go` workers on the same call until it clears, so the landing queue keeps moving while the
 load that is already there drains. Nothing is stopped or paused; only starts wait.
 
-LAPTOP. Every check that may leave the box goes to the laptop first (run.choose_where, owner 2026-09-29), and the lane
+LAPTOP. While the box is overloaded(), or free() finds no slot a check could take now, every check that may leave it
+goes to the runners (run.spill and run.choose_where; owner 2026-10-12, which turned round 2026-09-29's laptop-first
+now the box has room to spare). The lane also sends a check out when it has no box place for it (its width() is
+full, or the job already holds its one box check), so no check waits for a box slot while a runner has room. The lane
 keeps up to LAPTOP_SLOTS (LANDER_LAPTOP_SLOTS, default 5) of them in flight beside the box's slots, which they do not
 take; a laptop that answers busy sends the check back to the box. busy() no longer places checks; it was the bar: cpu `some avg10` at PSI_LAPTOP (default 25), memory at
 PSI_MEM, or a 1-minute load average at LANDER_LAPTOP_LOAD (default 1) times the cores. A box under loaded()'s
@@ -415,6 +418,34 @@ def _gate(d: str, how: int):
         f.close()
         return None
     return f
+
+
+def free(state: str, psi_root: str = PSI_DIR, k: int | None = None, loadavg: str | None = None) -> int:
+    """How many of slots_now()'s slots a check would take now without waiting: each one nobody holds, and none while
+    a ticket waits in the queue (it goes first, FAIR WAIT) or an alone run holds the gate. It only looks: a slot is
+    flocked for the instant it takes to see it is free. run.spill() asks it, so a check that would wait here goes to
+    a runner instead."""
+    d = os.path.join(state, "slots")
+    if not os.path.isdir(d):
+        return slots_now(psi_root, k, loadavg)
+    q = os.path.join(d, "queue")
+    if os.path.isdir(q) and _ahead(q, "~")[0]:   # "~" sorts after every ticket's name, so each live one counts
+        return 0
+    gate = _gate(d, fcntl.LOCK_SH)
+    if gate is None:
+        return 0
+    n = 0
+    try:
+        for i in range(1, slots_now(psi_root, k, loadavg) + 1):
+            with open(os.path.join(d, f"slot.{i}"), "a") as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue
+                n += 1
+    finally:
+        gate.close()
+    return n
 
 
 def scope_available() -> bool:

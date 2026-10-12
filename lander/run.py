@@ -698,18 +698,38 @@ def may_leave(check: T.Check) -> bool:
     return check.klass in (T.STATIC, T.HERMETIC, T.HOST) and "laptop" in check.where
 
 
-def choose_where(check: T.Check, member: str = "", box_only: bool = False) -> str:
-    """member:<h> for a member's landing; the laptop for every check that may leave the box; else box.
-    box_only: the lane saw the laptop give no answer a moment ago, so the box takes it without waiting out ssh."""
+def choose_where(check: T.Check, member: str = "", box_only: bool = False, runners: bool = False) -> str:
+    """member:<h> for a member's landing; the runners for every check that may leave this host while spill() says
+    it is full, or when the caller placed it there (runners=True: the lane found no box slot for it); else box.
+    box_only: the lane saw the runners give no answer a moment ago, so the box takes it without waiting out ssh."""
     if member:
         return f"member:{member}"
-    # Laptop first (owner 2026-09-29: "move as much as possible to the laptop … the box is the fallback"), whether or
-    # not the box is busy: the PR's code already runs unsandboxed there as the whole suite. A laptop that is busy,
-    # on battery or gone is unrunnable and the box runs it; a laptop pass stands; a red is said again on the box
-    # (judge).
-    if not box_only and may_leave(check) and laptop_dest():
+    # THIS HOST FIRST, the runners when it is full (owner 2026-10-12: "ideally full ram and cpu usage on both boxes").
+    # The lander now runs on a host with room to spare, so sending every check out by default left it idle while the
+    # runners queued; it spills while admission.overloaded() says so (the same call cc-room holds workers on) or
+    # every admission slot is held, so no check waits for a box slot while a runner may take it (spill()).
+    # A runner that is busy, unfit or gone is unrunnable and the box runs it; a runner's pass stands; a red there is
+    # said again on the box (judge).
+    if not box_only and may_leave(check) and laptop_dest() and (runners or spill()):
         return "laptop"
     return "box"
+
+
+def spill() -> str:
+    """"" while this host keeps its own checks, else why they go to the runners: admission.overloaded(), the one
+    signal the lander serializes on and cc-room holds workers on, or no admission slot free now (admission.free), so a
+    check here would wait for one while a runner may sit idle (2026-10-02: #772 ran a check every 8-30 min on a
+    box cut to 1-2 slots while the laptop answered `free 6`). choose_where and the lane's runner flights ask it. An
+    OSError reading the slots counts as no slot free, so the check spills rather than the lane raising."""
+    why = A.overloaded()
+    if why:
+        return why
+    try:
+        if A.free(REC.state_dir()):
+            return ""
+    except OSError as e:
+        return f"admission slots unreadable ({e})"
+    return "every admission slot on this host is held"
 
 
 def uncaged(check: T.Check) -> str:
@@ -737,27 +757,30 @@ def laptop_gone(outs: dict) -> bool:
 def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree: str, base_tree: str = "", *,
              member: str = "", store=None, job_key: str = "", scope: str = "", pr: int | None = None,
              quarantine_text: str = "", runner=None, only=None, record_reds: bool = True,
-             fallback: str = "", box_only: bool = False, cancel=None, express: bool = False,
+             fallback: str = "", box_only: bool = False, runners: bool = False, cancel=None, express: bool = False,
              lane: bool = False, caged: bool = False) -> dict:
     """Every check in plan.checks through judge(), one after another; -> {name: Outcome}. The lane calls it with
     its store; `lander check` with none (a worker's own red is its work, and is not recorded). fallback: the host
     manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks. cancel: a
     threading.Event the lane sets to stop the plan; every execute() on this thread polls it. express: the lane's
     EXPRESS (a Δ rerun's check), whose runs take no admission slot; a diagnostic rerun alone still takes them all.
-    lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`). caged=True (`lander check
-    --caged-only`): a check uncaged() names is DEFERRED, never run and never a pass, and the rest run on the box only."""
+    lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`). runners=True from the lane
+    only: it found no box slot for these checks, so each that may leave goes to the runners (choose_where).
+    caged=True (`lander check --caged-only`): a check uncaged() names is DEFERRED, never run and never a pass, and the
+    rest run on the box only."""
     _STOP.event = cancel
     try:
         return _run_plan(repo_root, m, plan, files, head_tree, base_tree, member=member, store=store,
                          job_key=job_key, scope=scope, pr=pr, quarantine_text=quarantine_text, runner=runner,
-                         only=only, record_reds=record_reds, fallback=fallback, box_only=box_only, express=express,
-                         lane=lane, caged=caged)
+                         only=only, record_reds=record_reds, fallback=fallback, box_only=box_only, runners=runners,
+                         express=express, lane=lane, caged=caged)
     finally:
         _STOP.event = None
 
 
 def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store, job_key, scope, pr,
-              quarantine_text, runner, only, record_reds, fallback, box_only, express, lane, caged=False):
+              quarantine_text, runner, only, record_reds, fallback, box_only, express, lane, caged=False,
+              runners=False):
     rows = REC.quarantine_rows(quarantine_text)
     record = (lambda r, text: REC.record_red(scope, r, text, pr)) if (record_reds and scope) else None
     base_m = M.load(repo_root, base_tree, fallback=fallback, strict=False) if base_tree else None
@@ -776,7 +799,7 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
         own = [p for p in c.paths if "*" not in p] + [m.cwd.get(name, "") + M.run_file(c.run)]
         security = any(M.match(m.policy.gate_first, p) for p in own if p)
         touched = any(m.owns(name, f) for f in files) if name in m.checks else False
-        where = "box" if caged else choose_where(c, member, box_only=box_only)
+        where = "box" if caged else choose_where(c, member, box_only=box_only, runners=runners)
         if gone and where == "laptop" and "box" in c.where:
             where = "box"   # the laptop gave no answer once in this plan: do not wait out its timeout per check
         out[name] = judge(c, head_tree, base_tree, where, runner=runner, store=store,
