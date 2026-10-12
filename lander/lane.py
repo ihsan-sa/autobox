@@ -49,7 +49,8 @@ the Δ re-plan's (mergeable, below). Each turn of the loop first records the che
 is seen while parked jobs keep the turn list full, and a job held during the pass has a turn again once its
 not_before has passed. BOX HOLDS come first and leave the file untouched and the job untimed:
 `cc-pause is <repo or handle>` exit 0 holds everything; `cc-tier allows gates` exit 1 holds jobs before the merge.
-  queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a draft or a conflict -> held 15 min. Under
+  queued     gh facts; MERGED -> merged (by=before); CLOSED -> done; a draft -> held 15 min; a conflict -> CONFLICT
+             below (GitHub's CONFLICTING with no file git names -> held 15 min). Under
              the git lock fetch base and head; base_sha, files (merge-base..head), digest (the
              reviewer's digest_of, the key `record` and `will-review` use). A member PR meets its
              walls (-> handback). THE PROTECTED DOOR, asked again at every head, reads the approval record
@@ -99,8 +100,12 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              (no merge_attempt) reads the PR's state, head and base first: not OPEN, a head that is not job.head
              or a base that is not the base_ref it was read on -> queued instead, which ends a closed PR (done rc=1)
              or a merged one (merged, by=before) and starts a new head or base afresh; gh unreadable -> stays held another HOLD_SECS; a GitHub backoff -> waits for it.
+CONFLICT (a conflict with the base found at queued, checking or the merge; Lane.conflict, repair.py): a conflicting
+file that a planned, checking or mergeable PR also changes parks the job behind that PR; otherwise repair.start
+dispatches one rebase round to the PR's own row and the job is held until the branch moves, and a PR nothing will
+repair (no row, a member's, ROUNDS rounds failed) is handed back to "planning" (a member's to "#<h>").
 HANDBACK writes handed/<repo>-<pr>.json (7 days) and REMOVES the job file (N12); cards.stopped routes it to
-"#<h>" or "seat". DONE and QUERY move the job file to rest/ (jobs.py): off the readers' queue, as the old lander's
+"#<h>" or "seat", or the route the caller names. DONE and QUERY move the job file to rest/ (jobs.py): off the readers' queue, as the old lander's
 unlink was, but still loaded by a re-queue. A unit that is not installed holds the job ("<unit> is not
 installed"); a board unit that is absent is BoardRules below: the row carrying the PR -> merged (an orch-held row
 gets a note only), each `Closes <row>` of the same board -> done unless held or live without an agent mark, that
@@ -178,7 +183,7 @@ RECHECK_SECS = float(os.environ.get("LANDER_RECHECK_SECS") or 300)   # a checkin
 CI_UNREADS = 4           # holds (HOLD_SECS each: an hour) at one head whose CI GitHub would not show, then a query
 POLL = 5                 # seconds the lane waits on its checks before it looks at the inbox again
 MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": "cards", "board": "board",
-             "deploy": "deploy", "tip": "tip"}
+             "deploy": "deploy", "tip": "tip", "repair": "repair"}
 
 
 class Flight:
@@ -763,7 +768,28 @@ class Lane:
         self.stopped(job, why, route)
         self.say(f"PR #{job.pr} is a query for {route}: {why}")
 
-    def handback(self, job, why):
+    def conflict(self, job, paths):
+        """`job` conflicts with its base in `paths` (repair.py has the round). A conflicting file that a PR already
+        planned, checking or mergeable also changes waits for that PR, as an overlap from the start does (park): it
+        is repaired once that one has merged or left, so it is not repaired twice. Otherwise the repair unit answers:
+        a round launched or running holds the job; nothing that will repair it hands it back to the planning seat
+        (a member's to its own channel) with one message, and a push to the branch re-queues it."""
+        base = job.extra.get("base_ref") or "main"
+        why = f"PR #{job.pr} conflicts with {base}: {J.path_names(paths)}"   # a path is the branch's: shown clean
+        other = next((j for j in J.lane_jobs(self.repo)
+                      if j.key != job.key and j.state in ACTIVE and set(paths) & set(j.files)), None)
+        if other:
+            if job.state != T.QUEUED:
+                J.move(job, T.QUEUED, f"{why} — waits for PR #{other.pr}")
+            return self.park(job, other, read=True)
+        if not self.unit("repair"):
+            return self.hold(job, f"{why} — rebase it")
+        kind, words = self.call("repair", "start", self, job, paths)
+        if kind == "planning":
+            return self.handback(job, f"{why} — {words}", route=M.route(job) or "planning")
+        self.hold(job, f"{why} — {words}")
+
+    def handback(self, job, why, route=""):
         now = time.time()
         J.write_atomic(J.handed_path(job.repo, job.pr), {
             "repo": job.repo, "pr": job.pr, "head": job.head, "branch": job.extra.get("branch") or "",
@@ -773,7 +799,7 @@ class Lane:
         job.extra["why"] = why
         J.move(job, T.HANDBACK, why)
         J.remove(job)
-        self.stopped(job, why, M.route(job) or "seat")
+        self.stopped(job, why, route or M.route(job) or "seat")
         E.log("handed", job.repo, job.pr, f"head={job.head[:12]} — a push to {job.extra.get('branch') or '?'} "
                                           f"re-queues it (watched {HANDED_DAYS} days)")
         self.say(f"PR #{job.pr} handed back: {why}")
@@ -811,7 +837,16 @@ class Lane:
         if facts.get("isDraft"):
             return self.hold(job, f"PR #{job.pr} is a draft — mark it ready for review")
         if facts.get("mergeable") == "CONFLICTING":
-            return self.hold(job, f"PR #{job.pr} conflicts with {base} — rebase it")
+            # GitHub names no files: the merge-tree of what origin sends does, and an empty answer is GitHub's
+            # word against git's — held as before, and read again at the next wake
+            with self.lock():
+                got = self.fetch(base, branch)
+                job.base_sha, job.head = got[base], got[branch]
+                job.files = G.pr_changed(self.root, job.base_sha, job.head, env=self.genv)
+                _, paths = G.merge_tree(self.root, job.base_sha, job.head, env=self.genv)
+            if not paths:
+                return self.hold(job, f"PR #{job.pr} conflicts with {base} — rebase it")
+            return self.conflict(job, paths)
         with self.lock():
             got = self.fetch(base, branch)
             job.base_sha, job.head = got[base], got[branch]
@@ -932,8 +967,7 @@ class Lane:
                 with self.lock():
                     tree, conflicts = G.merge_tree(self.root, job.base_sha, job.head, env=self.genv)
             if tree is None:
-                return self.hold(job, f"PR #{job.pr} conflicts with {job.extra.get('base_ref') or 'main'}: "
-                                      f"{', '.join(conflicts[:5])}")
+                return self.conflict(job, conflicts)
             base_tree = G.tree_of(self.root, job.base_sha, env=self.genv)
             if job.extra.get("tree") != tree or job.extra.get("tree_of") != pair:
                 job.extra.update(tree=tree, tree_of=pair)
@@ -1152,13 +1186,15 @@ class Lane:
     def merge(self, job):
         pin = job.head   # door() made approved_head equal it when a protected path is hit; else it is stale
         base = job.extra.get("base_ref") or ""
-        with self.lock():
+        with contextlib.ExitStack() as held:
+            held.enter_context(self.lock())
             main_before = self.fetch(base)[base]
             if main_before != job.base_sha:
                 return "moved"
             expected, conflicts = G.merge_tree(self.root, main_before, job.head, env=self.genv)
             if expected is None:
-                self.hold(job, f"PR #{job.pr} conflicts with {base}: {', '.join(conflicts[:5])}")
+                held.close()   # the git lock is let go before a repair round is dispatched
+                self.conflict(job, conflicts)
                 return "held"
             job.extra["merge_attempt"] = {"main_before": main_before, "expected": expected, "pin": pin}
             J.save(job)

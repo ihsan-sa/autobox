@@ -41,6 +41,9 @@ verdict comes only from the lane's own review or from PR markers the box's login
   approvals <LANDQ>/approvals/<repo>-<pr>.json {approved_by, approved_head, at} — approve()/approval().
   carry     <LANDQ>/carry/<repo>-<pr>.json {reads_used} — a handed-back job's spent reads, written by the tick
             when a push re-queues it and taken by drain, so the reads cap still holds across the handback.
+  repair    <LANDQ>/repair/<repo>-<pr>.json {track, head, rounds, refusals, deadline[, refused]} — the PR's rebase
+            rounds (repair.py), the lane's own record: a fresh start (_fresh) keeps none of job.extra, and a round's
+            worker re-queues its PR, so the count lives here and only a merge (move) takes it away.
   first     <LANDQ>/first/<repo>-<pr>.json {by, at} — `lander queue --first` put the PR at the front of its lane
             (put_first/first). Never a request field, for the same reason as an approval. lane_jobs lists a job
             with one before every other, oldest `at` first. It is good for one landing: the job's move to a resting
@@ -281,6 +284,8 @@ def move(job: T.Job, state: str, why: str = "", **kv) -> T.Job:
     save(job)
     if state in RESTING:   # a put-first is good for one landing (jobs.first)
         drop_first(job.repo, job.pr)
+    if state == T.MERGED:   # its rebase rounds are over; a close keeps them, so a reopen does not buy more
+        drop_repair(job.repo, job.pr)
     E.stage(job.repo, job.pr, state, **kv)
     return job
 
@@ -359,6 +364,47 @@ def take_carry(repo: str, pr) -> int:
         os.unlink(p)
     n = r.get("reads_used") if isinstance(r, dict) else 0
     return n if isinstance(n, int) and n > 0 else 0
+
+
+def repair_path(repo: str, pr) -> str:
+    return f"{landq()}/repair/{safe(repo)}-{int(pr)}.json"
+
+
+def repair_record(repo: str, pr):
+    """The PR's rebase-round record (repair.py): {} when it has none, None when one is there but does not read as a
+    JSON object (repair.py spends no round on that)."""
+    p = repair_path(repo, pr)
+    if not os.path.lexists(p):
+        return {}
+    r = read_json(p)
+    return r if isinstance(r, dict) else None
+
+
+def put_repair(repo: str, pr, r: dict) -> None:
+    os.makedirs(os.path.dirname(repair_path(repo, pr)), exist_ok=True)
+    write_atomic(repair_path(repo, pr), r)
+
+
+def drop_repair(repo: str, pr) -> None:
+    with contextlib.suppress(OSError):
+        os.unlink(repair_path(repo, pr))
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")   # C0 (\r, \n, ESC among them), DEL and C1
+PATH_WIDTH, PATHS_SHOWN = 160, 5
+
+
+def path_names(paths, n: int = PATHS_SHOWN) -> str:
+    """Paths git named, for a line a person or a worker reads (a brief, a why, a board note): each with its control
+    characters taken out and cut to PATH_WIDTH, at most `n` of them, then how many more. A path is the branch's to
+    choose, so one holding a newline or an escape must not start a line or a sequence of its own where it is shown."""
+    paths = list(paths or ())
+    out = []
+    for p in paths[:n]:
+        s = _CONTROL.sub("", str(p))
+        out.append(s if len(s) <= PATH_WIDTH else s[:PATH_WIDTH - 1] + "…")
+    more = len(paths) - n
+    return ", ".join(out) + (f" and {more} more" if more > 0 else "")
 
 
 def _fresh(job: T.Job, req: dict) -> None:

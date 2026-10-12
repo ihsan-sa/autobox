@@ -37,6 +37,7 @@ from lander import jobs as J  # noqa: E402
 from lander import lane as L  # noqa: E402
 from lander import manifest as MF  # noqa: E402
 from lander import members as M  # noqa: E402
+from lander import repair as RP  # noqa: E402
 from lander import tick as TK  # noqa: E402
 from lander import types as T  # noqa: E402
 
@@ -151,6 +152,10 @@ if me == "cc-gh-token":   # member_repos: a list for any owner, or {owner: [name
 if me == "cc":
     if a[0] == "done":
         out(0, json.dumps(box["receipt"]))
+    if "--say" in a:   # a repair round typed to a live seat
+        out(box.get("say_rc", box.get("go_rc", 0)), box.get("say_out", box.get("go_out", "")))
+    if "--go" in a:   # a repair round's dispatch
+        out(box.get("go_rc", 0), box.get("go_out", ""))
     out(box.get("lands", 0))
 if me == "cc-board":
     p = os.path.join(os.environ["CC_BOARDS"], a[1] + ".json")
@@ -1470,6 +1475,316 @@ class Machine(Fixture):
         u, _ = self.land(planner=Planner(klass=T.LANDER))
         self.assertEqual(self.job().state, T.QUERY)
         self.assertEqual(u["cards"].calls[0][3], "lander-self")
+
+
+class Repair(Fixture):
+    """A conflict with main mends itself (repair.py): one rebase round per conflict, parked behind a PR that changes
+    the same file, and ONE message to the planning seat when nothing will repair it."""
+
+    def setUp(self):
+        super().setUp()
+        with open(f"{os.environ['CC_BOARDS']}/demo.json", "w") as f:
+            json.dump({"tracks": {f"row-{n}": {"status": "review"} for n in (1, 2, 3)}}, f)
+
+    def due(self, pr=1):
+        j = self.job(pr)
+        j.extra["not_before"] = E.stamp(time.time() - 1)
+        J.save(j)
+
+    def gos(self):
+        return [c for c in self.box().get("calls", []) if c[0] == "cc" and ("--go" in c or "--say" in c)]
+
+    def held_job(self, pr, state=T.CHECKING, files=("a/x",), branch=None):
+        j = T.Job(repo="demo", pr=pr, head="e" * 40, base_sha="d" * 40, files=list(files), state=state,
+                  extra={"branch": branch or f"track/row-{pr}", "base_ref": "main", "queued_at": E.stamp()})
+        J.save(j)
+        return j
+
+    def test_main_moves_under_a_queued_pr_and_its_round_repairs_it(self):
+        self.pr(1, {"a/x": "pr\n"})
+        self.push("main", {"a/x": "main\n"}, fresh=False)
+        J.submit("demo", 1)
+        self.land(repair=RP)
+        j = self.job()
+        self.assertEqual(j.state, T.HELD)
+        self.assertIn("conflicts with main: a/x — rebase round 1 of 2 dispatched in row-1", j.extra["why"])
+        go = self.gos()
+        self.assertEqual(len(go), 1)
+        self.assertEqual(go[0][1:4], ["demo", "row-1", "--go"])
+        self.assertIn("merge origin/main into this branch", go[0][4])
+        self.assertIn("--no-extend", go[0])
+        # the round's worker: main merged into the PR's own branch, resolved, pushed
+        self.git(self.work, "fetch", "-q", "origin")
+        self.git(self.work, "checkout", "-q", "-B", "track/row-1", "origin/track/row-1")
+        subprocess.run(["git", "merge", "-q", "origin/main"], cwd=self.work, capture_output=True)
+        self.write(self.work, {"a/x": "both\n"})
+        self.git(self.work, "commit", "-qam", "merge main")
+        self.git(self.work, "push", "-q", "origin", "track/row-1")
+        self.due()
+        self.land(repair=RP)
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+        self.assertEqual(self.git(self.tmp, "--git-dir", self.origin, "show", "main:a/x"), "both")
+        self.assertEqual(len(self.gos()), 1)   # the repaired head needed no second round
+
+    def test_a_round_still_running_is_not_dispatched_again(self):
+        self.pr(1, {"a/x": "pr\n"})
+        self.push("main", {"a/x": "main\n"}, fresh=False)
+        J.submit("demo", 1)
+        self.land(repair=RP)
+        self.due()
+        self.land(repair=RP)
+        self.assertEqual(len(self.gos()), 1)
+        self.assertIn("has until", self.job().extra["why"])
+
+    def test_refused_launches_spend_no_round_and_the_last_sends_one_message_and_never_another(self):
+        self.pr(1, {"a/x": "pr\n"})
+        self.push("main", {"a/x": "main\n"}, fresh=False)
+        self.set_box(go_rc=1, go_out="cc: demo is paused")
+        J.submit("demo", 1)
+        cards = Rec()
+        self.land(repair=RP, cards=cards)
+        self.assertIn("rebase round 1 in row-1 was not dispatched: cc: demo is paused — the next wake tries again",
+                      self.job().extra["why"])
+        for _ in range(RP.REFUSALS - 1):
+            self.due()
+            self.land(repair=RP, cards=cards)
+        self.assertEqual(len(self.gos()), RP.REFUSALS)
+        self.assertIn("rebase round 1 in row-1 was not dispatched: cc: demo is paused — the next wake hands it to "
+                      "the planning seat", self.job().extra["why"])
+        self.assertEqual((J.repair_record("demo", 1)["rounds"], J.repair_record("demo", 1)["refusals"]),
+                         (0, RP.REFUSALS))
+        self.assertEqual([c for c in cards.calls if c[0] == "stopped"], [])   # the refusals said nothing yet
+        self.due()
+        self.land(repair=RP, cards=cards)
+        for _ in range(3):   # later wakes and a sweep find nothing to say again
+            self.land(repair=RP, cards=cards)
+            with contextlib.redirect_stdout(io.StringIO()):
+                RP.cmd_sweep([])
+        stops = [c for c in cards.calls if c[0] == "stopped"]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0][3], "planning")
+        self.assertIn(f"PR #1 conflicts with main: a/x — the launch of its rebase round in row-1 was refused "
+                      f"{RP.REFUSALS} times (the last: cc: demo is paused): a/x", stops[0][2])
+        self.assertEqual(len(self.gos()), RP.REFUSALS)
+        self.assertTrue(os.path.exists(J.handed_path("demo", 1)))   # a push re-queues it
+
+    def test_a_pr_no_row_owns_goes_to_planning_at_once(self):
+        cards = Rec()
+        j = self.held_job(7, branch="planning/seat-fix")
+        L.Lane("demo", self.units(repair=RP, cards=cards)).conflict(j, ["a/x"])
+        self.assertEqual(self.gos(), [])
+        self.assertEqual([c[3] for c in cards.calls if c[0] == "stopped"], ["planning"])
+        self.assertIn("no row owns it", cards.calls[-1][2])
+
+    def test_a_conflict_on_a_file_a_planned_pr_changes_parks_behind_it_then_repairs(self):
+        other = self.held_job(2, files=("a/x", "c/z"))
+        j = self.held_job(1, files=("a/x", "b/y"))
+        lane = L.Lane("demo", self.units(repair=RP))
+        lane.conflict(j, ["a/x"])
+        self.assertEqual((j.state, j.extra["parked"]["on"]), (T.QUEUED, 2))
+        self.assertEqual(self.gos(), [])
+        # a conflict on a file the other PR does not change is not parked: it is repaired now
+        k = self.held_job(3, files=("b/y",))
+        lane.conflict(k, ["b/y"])
+        self.assertEqual(k.state, T.HELD)
+        self.assertEqual([c[2] for c in self.gos()], ["row-3"])
+        # once PR 2 has left, PR 1 is repaired
+        J.move(other, T.HANDBACK, "gone")
+        J.remove(other)
+        j = self.held_job(1, files=("a/x", "b/y"))
+        lane.conflict(j, ["a/x"])
+        self.assertEqual(j.state, T.HELD)
+        self.assertEqual([c[2] for c in self.gos()], ["row-3", "row-1"])
+
+    def conflicting_push(self, text):
+        """The round's worker pushed, but the head still conflicts; its re-queue goes through the request path."""
+        self.push("track/row-1", {"a/x": text}, fresh=False)
+        J.submit("demo", 1, who="cc-loop")
+
+    def test_a_requeue_keeps_the_round_count_and_round_3_goes_to_planning(self):
+        self.pr(1, {"a/x": "pr\n"})
+        self.push("main", {"a/x": "main\n"}, fresh=False)
+        J.submit("demo", 1)
+        cards = Rec()
+        self.land(repair=RP, cards=cards)
+        self.assertIn("rebase round 1 of 2 dispatched", self.job().extra["why"])
+        self.conflicting_push("pr two\n")
+        self.land(repair=RP, cards=cards)   # drained as a fresh start (jobs._fresh): the count is not in job.extra
+        self.assertIn("rebase round 2 of 2 dispatched", self.job().extra["why"])
+        self.conflicting_push("pr three\n")
+        self.land(repair=RP, cards=cards)
+        self.assertEqual(len(self.gos()), 2)
+        stops = [c for c in cards.calls if c[0] == "stopped"]
+        self.assertEqual([c[3] for c in stops], ["planning"])
+        self.assertIn("2 rebase rounds in row-1 did not resolve it", stops[0][2])
+
+    def test_a_new_head_after_a_refusal_streak_gets_its_round(self):
+        self.pr(1, {"a/x": "pr\n"})
+        self.push("main", {"a/x": "main\n"}, fresh=False)
+        self.set_box(go_rc=1, go_out="cc: demo is paused")
+        J.submit("demo", 1)
+        cards = Rec()
+        self.land(repair=RP, cards=cards)
+        for _ in range(RP.REFUSALS):
+            self.due()
+            self.land(repair=RP, cards=cards)
+        self.assertEqual([c[3] for c in cards.calls if c[0] == "stopped"], ["planning"])
+        self.set_box(go_rc=0, go_out="")
+        self.conflicting_push("pr two\n")   # the pause is over and the seat pushed: a new streak
+        self.land(repair=RP, cards=cards)
+        self.assertIn("rebase round 1 of 2 dispatched", self.job().extra["why"])
+        self.assertEqual(J.repair_record("demo", 1)["refusals"], 0)
+
+    def test_the_record_ends_with_the_merge(self):
+        J.put_repair("demo", 1, {"rounds": 2})
+        j = self.held_job(1, state=T.MERGEABLE)
+        J.move(j, T.MERGED, "landed")
+        self.assertEqual(J.repair_record("demo", 1), {})
+
+    def test_a_close_keeps_the_record_so_a_reopen_buys_no_rounds(self):
+        J.put_repair("demo", 1, {"rounds": 2})
+        J.move(self.held_job(1, state=T.QUEUED), T.DONE, "the PR is closed")
+        self.assertEqual(J.repair_record("demo", 1), {"rounds": 2})
+        cards = Rec()
+        L.Lane("demo", self.units(repair=RP, cards=cards)).conflict(self.held_job(1), ["a/x"])
+        self.assertEqual(self.gos(), [])
+        self.assertIn("2 rebase rounds in row-1 did not resolve it", cards.calls[-1][2])
+
+    def test_a_record_that_will_not_read_goes_to_planning_and_a_negative_count_reads_as_none(self):
+        bad = ('{"rounds": 1', "[2]", '"x"', '{"rounds": "x"}', '{"refusals": [1]}', '{"rounds": 1e999}')
+        for n, text in enumerate(bad, 1):
+            with self.subTest(text=text):
+                os.makedirs(os.path.dirname(J.repair_path("demo", 1)), exist_ok=True)
+                with open(J.repair_path("demo", 1), "w") as f:
+                    f.write(text)
+                cards = Rec()
+                L.Lane("demo", self.units(repair=RP, cards=cards)).conflict(self.held_job(1), ["a/x"])
+                self.assertEqual(self.gos(), [])
+                self.assertEqual([c[3] for c in cards.calls if c[0] == "stopped"], ["planning"])
+                self.assertIn("its rebase-round record will not read, so no round runs for it in row-1: a/x",
+                              cards.calls[-1][2])
+        J.put_repair("demo", 1, {"rounds": -9, "refusals": -9})
+        j = self.held_job(1)
+        L.Lane("demo", self.units(repair=RP)).conflict(j, ["a/x"])
+        self.assertIn("rebase round 1 of 2 dispatched", j.extra["why"])
+        self.assertEqual((J.repair_record("demo", 1)["rounds"], J.repair_record("demo", 1)["refusals"]), (1, 0))
+
+    def test_a_refused_launch_is_said_and_tried_again_at_the_next_wake(self):
+        self.set_box(go_rc=1, go_out="cc: demo/row-1 waits: the tier holds it")
+        j = self.held_job(1)
+        L.Lane("demo", self.units(repair=RP)).conflict(j, ["a/x"])
+        self.assertIn("round 1 in row-1 was not dispatched: cc: demo/row-1 waits: the tier holds it — the next wake "
+                      "tries again", j.extra["why"])
+        self.assertIn("--repair", self.gos()[0])   # cc reserves the repair, and adopts one a refusal left open
+        r = J.repair_record("demo", 1)
+        self.assertEqual((r["rounds"], r["refusals"], r["refused"]),
+                         (0, 1, "cc: demo/row-1 waits: the tier holds it"))   # the round is given back
+        self.assertLessEqual(r["deadline"], time.time())   # no wait on a round that never ran
+        self.set_box(go_rc=0)
+        j = self.held_job(1)
+        L.Lane("demo", self.units(repair=RP)).conflict(j, ["a/x"])
+        self.assertIn("rebase round 1 of 2 dispatched", j.extra["why"])
+
+    def test_two_refusals_then_a_launch_still_get_round_1_and_round_2(self):
+        lane = L.Lane("demo", self.units(repair=RP))
+        self.set_box(go_rc=1, go_out="cc: demo is paused")
+        for _ in range(2):
+            j = self.held_job(1)
+            lane.conflict(j, ["a/x"])
+            self.assertIn("round 1 in row-1 was not dispatched", j.extra["why"])
+        self.set_box(go_rc=0)
+        j = self.held_job(1)
+        lane.conflict(j, ["a/x"])
+        self.assertIn("rebase round 1 of 2 dispatched", j.extra["why"])
+        self.assertEqual(J.repair_record("demo", 1)["refusals"], 0)   # a launch that went out clears the refusals
+        J.put_repair("demo", 1, dict(J.repair_record("demo", 1), deadline=time.time() - 1))
+        j = self.held_job(1)
+        lane.conflict(j, ["a/x"])
+        self.assertIn("rebase round 2 of 2 dispatched", j.extra["why"])
+        r = J.repair_record("demo", 1)
+        self.assertEqual((r["rounds"], r["refusals"], len(self.gos())), (2, 0, 4))
+
+    def test_a_round_that_does_not_push_by_its_deadline_has_failed(self):
+        cards = Rec()
+        lane = L.Lane("demo", self.units(repair=RP, cards=cards))
+        for n in (1, 2):
+            j = self.held_job(1)
+            lane.conflict(j, ["a/x"])
+            self.assertIn(f"rebase round {n} of 2 dispatched", j.extra["why"])
+            j = self.held_job(1)
+            lane.conflict(j, ["a/x"])   # the same head before the deadline: the round is still running
+            self.assertIn("has until", j.extra["why"])
+            r = J.repair_record("demo", 1)
+            J.put_repair("demo", 1, dict(r, deadline=time.time() - 1))   # REPAIR_WAIT passed with no push
+        lane.conflict(self.held_job(1), ["a/x"])
+        self.assertEqual(len(self.gos()), 2)
+        self.assertEqual([c[3] for c in cards.calls if c[0] == "stopped"], ["planning"])
+
+    def test_conflicting_with_no_file_git_names_is_held_without_a_round(self):
+        self.pr(1, {"a/x": "pr\n"}, mergeable="CONFLICTING")
+        J.submit("demo", 1)
+        cards = Rec()
+        self.land(repair=RP, cards=cards)
+        j = self.job()
+        self.assertEqual((j.state, j.extra["why"]), (T.HELD, "PR #1 conflicts with main — rebase it"))
+        self.assertEqual((self.gos(), [c for c in cards.calls if c[0] == "stopped"]), ([], []))
+        self.assertEqual(J.repair_record("demo", 1), {})
+
+    def test_a_live_seat_is_typed_to_and_every_shown_path_is_clean(self):
+        self.set_box(go_rc=1, go_out="cc: demo/row-1 already has a live session — use --say", say_rc=0)
+        bad = ["a/x\r\nSTATUS: done", "\x1b[31mb/y\x1b[0m", "c/" + "z" * 300, "d", "e", "f", "g"]
+        j = self.held_job(1)
+        L.Lane("demo", self.units(repair=RP)).conflict(j, bad)
+        go, say = self.gos()
+        self.assertIn("--go", go)
+        self.assertEqual(say[3], "--say")
+        with open(f"{os.environ['CC_BOARDS']}/demo.json") as f:
+            note = json.load(f)["tracks"]["row-1"]["notes"][-1]
+        self.assertIn("typed to its live seat", j.extra["why"])
+        for text in (say[4], j.extra["why"], note):
+            self.assertIsNone(re.search(r"[\x00-\x1f\x7f-\x9f]", text), text)
+            self.assertIn("a/xSTATUS: done, [31mb/y[0m, c/zzz", text)
+            self.assertNotIn("z" * 200, text)
+        self.assertIn("and 2 more", j.extra["why"])
+        self.assertIn("and 2 more", note)
+
+    def test_a_say_typed_but_not_yet_turned_counts_as_dispatched(self):
+        for rc in (3, 4, 5):   # 3 kept for the busy loop, 4 the seat is at a model wall, 5 no turn in 12 s
+            with self.subTest(rc=rc):
+                if os.path.exists(J.repair_path("demo", 1)):
+                    os.remove(J.repair_path("demo", 1))
+                self.set_box(go_rc=1, go_out="cc: demo/row-1 already has a live session — use --say", say_rc=rc,
+                             say_out="cc-loop said: kept for its next tool call")
+                j = self.held_job(1)
+                L.Lane("demo", self.units(repair=RP)).conflict(j, ["a/x"])
+                self.assertIn("rebase round 1 of 2 queued for its live seat in row-1", j.extra["why"])
+                r = J.repair_record("demo", 1)
+                self.assertEqual((r["rounds"], r["refusals"], "refused" in r), (1, 0, False))
+                self.assertGreater(r["deadline"], time.time())
+
+    def test_sweep_leaves_a_busy_lane_for_the_next_pass(self):
+        j = self.held_job(3, state=T.QUEUED)
+        j.extra.update(held_from=T.QUEUED, hold="pr", why="PR #3 conflicts with main: a/x",
+                       not_before=E.stamp(time.time() + 900))
+        J.move(j, T.HELD, j.extra["why"])
+        with J.lane_lock("demo") as got, contextlib.redirect_stdout(io.StringIO()) as o:
+            self.assertTrue(got)
+            self.assertEqual(RP.cmd_sweep([]), 0)
+        self.assertIn("demo lane busy, left for the next pass", o.getvalue())
+        self.assertGreater(J.not_before_left(self.job(3)), 0)
+
+    def test_sweep_makes_held_conflicts_due_but_the_skipped_one(self):
+        for pr in (3, 4, 5):
+            j = self.held_job(pr, state=T.QUEUED)
+            why = f"PR #{pr} conflicts with main: a/x" if pr != 5 else "PR #5 is a draft — mark it ready for review"
+            j.extra.update(held_from=T.QUEUED, hold="pr", why=why, not_before=E.stamp(time.time() + 900))
+            J.move(j, T.HELD, why)
+        with contextlib.redirect_stdout(io.StringIO()) as o:
+            self.assertEqual(RP.cmd_sweep(["--skip", "demo#4"]), 0)
+        self.assertEqual(J.not_before_left(self.job(3)), 0)
+        self.assertGreater(J.not_before_left(self.job(4)), 0)
+        self.assertGreater(J.not_before_left(self.job(5)), 0)
+        self.assertIn("1 held on a conflict made due: demo#3", o.getvalue())
 
 
 class Lanes(Fixture):
