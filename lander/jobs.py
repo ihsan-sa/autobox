@@ -28,12 +28,18 @@ sets `stage` (stage_of: STAGE_OF[state], in the old lander's words where the rea
 checked job waiting on its read, `deferred` for a job held till a usage limit resets, which the Home tab and the
 dashboard do not count as running), and the record is validated (T.Job.to_dict) before it is written.
 
-DRAIN (the lane only, under the lane lock, then rest_lock): a request with no job makes a queued job; one for a job
-at rest (done, query, handback, or held for a reason a push mends) is a fresh start that keeps reads_used and the prior
-verdict (`requeued`); one for an active job fills chat/ts/who where empty (`again`), and on a checking job sets
+DRAIN (the lane only, under the lane lock, then rest_lock; release requests before rest_lock, see drain): a request
+with no job makes a queued job; one for a job at rest (done, query, handback, or held for a reason a push mends) is
+a fresh start that keeps reads_used and the prior verdict (`requeued`); one for an active job fills chat/ts/who where
+empty (`again`), and on a checking job sets
 extra.reread so it reads its PR's state and head at its next turn (a push mid-check re-queues it, which says `again`).
 A job held by the box itself (hold="box": a usage wall, a cap, an unrunnable check) is active: a fresh start would
 not mend it.
+A release request (release=WHO, from `lander release`) is applied before the rest, by release.apply: it drops a job
+still queued as the request found it, at the head it was read on, with the PR's other waiting requests, or logs why
+not; it never makes a job. A second release request for a PR this drain released is answered `duplicate`, and one
+that raises in apply is logged and moved aside (<inbox>/failed/<request>.failed), so it is not retried at every drain
+and no reader matching <inbox>/<repo>-<pr>.* takes it for a waiting request.
 A REQUEST IS UNTRUSTED. Anyone may write the inbox, so drain takes only chat, ts and who from it (repo and pr route
 it). An approval, a verdict or a reads count in a request is dropped: the owner's 👍 is the approval record
 `lander queue` writes after it checked the uid itself (approvals/<repo>-<pr>.json, read by the lane's door), and a
@@ -439,14 +445,48 @@ def _fresh(job: T.Job, req: dict) -> None:
 
 def drain(repo: str) -> list:
     """Fold every inbox request for `repo` into its job. Call only under lane_lock(repo). Returns one line each.
-    It takes rest_lock too (waiting: a settle holds it briefly), since a request may name a job the tick settles."""
+    Release requests first, under the lane lock alone: apply reads gh and fetches under git_lock, so holding rest_lock
+    across it would stall every settle behind a fetch, and no path may take rest_lock under git_lock (a tick takes
+    git_lock under rest_lock, tip.kick). A release drops only a queued job, which no settle touches. The rest take
+    rest_lock too (waiting: a settle holds it briefly), since a request may name a job the tick settles."""
+    lines = _releases(repo)
     with rest_lock(repo, wait=True):
-        return _drain(repo)
+        return lines + _drain(repo)
+
+
+def _releases(repo: str) -> list:
+    lines, reqs = [], requests(repo)
+    if any(r.get("release") for _, r in reqs):   # `lander release` asked: applied first (release.apply), and a PR
+        from lander import release as RL           # it releases takes its other waiting requests with it
+        done = {}                                  # pr -> rid of the request that released it in this drain
+        for path, req in reqs:
+            if not req.get("release"):
+                continue
+            pr = req["pr"]
+            try:
+                if pr in done:   # each request gets its own line, so its own --wait is answered
+                    ln = RL.refuse(repo, pr, req, "duplicate", f"released already by rid={done[pr]}")
+                else:
+                    ln = RL.apply(repo, pr, req, path)
+                    if " released by " in ln:
+                        done[pr] = RL.clean_rid(req.get("rid"))
+            except Exception as e:  # noqa: BLE001 — a request that breaks apply is set aside, never retried each drain
+                with contextlib.suppress(Exception):
+                    RL.refuse(repo, pr, req, "error", f"{type(e).__name__}: {e}")
+                with contextlib.suppress(OSError):   # out of <inbox>/<repo>-<pr>.*: a failed request owns nothing
+                    os.makedirs(f"{inbox_dir()}/failed", exist_ok=True)
+                    os.replace(path, f"{inbox_dir()}/failed/{os.path.basename(path)}.failed")
+                lines.append(f"{repo}#{pr} release refused (error)")
+                continue
+            lines.append(ln)
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+    return lines
 
 
 def _drain(repo: str) -> list:
-    lines = []
-    for path, req in requests(repo):
+    lines, reqs = [], requests(repo)
+    for path, req in reqs:
         pr = req["pr"]
         job, spent = load(repo, pr), take_carry(repo, pr)
         if job is None:
