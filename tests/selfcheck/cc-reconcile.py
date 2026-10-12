@@ -1825,6 +1825,16 @@ def selfcheck():
            in digest_text({}))
         open(f"{td}/fmetrics", "w").write("records: 5 (5 confirmed)  clusters: 2  eligible: 0\n"); open(f"{td}/feligible", "w").close()
         ok("…a ledger with records and nothing eligible says so", "🧾 The failure ledger holds 5 records in 2 groups, and none needs a look." in digest_text({}))
+        # what the perms seat granted from his goals is told after in the digest (cc-infer digest), never a card:
+        # the full report carries its block, the phone one names it; a ledger with nothing in the window adds nothing
+        open(f"{td}/stubs/cc-infer", "w").write(f'#!/bin/sh\ncat "{td}/granted"\n')
+        os.chmod(f"{td}/stubs/cc-infer", 0o755)
+        open(f"{td}/granted", "w").write("*Granted from your goals* (told after; nothing to tap)\n• serve the demo site (from goals.md; undo: unroute; watched)\n")
+        ok("…a grant from his goals is in the report, told after", "• serve the demo site (from goals.md; undo: unroute; watched)" in digest_text({})
+           and "what was granted from your goals" in digest_text({}, phone=True))
+        open(f"{td}/granted", "w").close()
+        ok("…and no grant in the window is no block and no mention", "Granted from your goals" not in digest_text({})
+           and "granted from your goals" not in digest_text({}, phone=True))
         open(f"{td}/fmetrics", "w").write("records: 0 (0 confirmed)  clusters: 0  eligible: 0\n")
         ok("…an empty ledger is no line at all", "🧾" not in digest_text({}))
         open(f"{td}/stubs/cc-failures", "w").write("#!/bin/sh\nexit 1\n")   # a box whose cc-failures cannot answer
