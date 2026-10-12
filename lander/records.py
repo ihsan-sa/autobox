@@ -1,7 +1,8 @@
 """What a run leaves behind: the result store, the failures-ledger record of a red, and the quarantine list (S12).
 
 THE STORE, under the landing state dir (LANDER_STATE, default ~/.cc/state/land):
-  jobs/<repo>-<pr>/results/<check>/<tree>.json   one job's own runs; read back only by that job
+  jobs/<repo>-<pr>/results/<check>/<tree>.json   one job's own runs; read back only by that job, whose lane skips a
+                                                 check it passed on the same tree under this release
   results/<check>/<tree>.json                    base-tree runs the lane made, the only runs another job may reuse
 Only the lane writes either (S12): a Store opened with the lane's lock fd refuses to write unless that fd still holds
 `lanes/<repo>.lock`. A shared run is stamped with this release and the lane's nonce (`lanes/<repo>.nonce`, made fresh
@@ -115,6 +116,7 @@ class Store:
 
     def put(self, job_key: str, r: T.Result) -> str:
         self._lane()
+        r.release = self.release   # the lane reuses a job's own pass only from the release that made it
         p = self.job_path(job_key, r.check, r.tree)
         _write(p, r.to_dict())
         return r.key

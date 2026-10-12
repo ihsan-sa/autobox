@@ -22,6 +22,9 @@
             tip.run, whose checks are the box-class checks the merged range reaches (tip_plan), each run on its
             commit by U2's runner (make_check). Green deploys that sha (deploy.run); red holds the targets, bisects
             and reverts a proven breaker. Then deploy.run again, for a request whose tip is already green (a retry).
+  nightly   for each repo the tip step runs for, at most once every nightly.NIGHTLY_SECS (a day) and only once
+            queue.log goes back nightly.WINDOW_DAYS: `lander nightly run --repo <repo>` as a transient unit, which
+            runs the checks nightly.py moved out of the per-PR plan on the applied tip.
   settle    each deploy-pending job, under the rest lock (not the lane lock: a busy lane holds that from one job to
             the next, and the lane never takes up a job it rested), once the request covering its tip_sha (that sha
             or a later one) has no target waiting: -> deployed -> done, and `done` rc 0 (verified), 4 (UNVERIFIED) or 1
@@ -56,6 +59,7 @@ from lander import jobs as J
 from lander import lane as L
 from lander import manifest as MF
 from lander import members as M
+from lander import nightly as NG
 from lander import tip as TP
 from lander import types as T
 
@@ -394,6 +398,24 @@ def tip_and_deploy(repo, units) -> list:
     return lines
 
 
+def nightly(repo, units) -> list:
+    """Once a day per repo, the never-red checks' sweep (nightly.py), started detached. As tip_and_deploy: only the
+    installed units run it, members and paused repos are skipped, and a fault is logged as tick-fault, never the
+    tick's end. The day is stamped only once the sweep has started, so a failed start tries again next tick."""
+    if not (inspect.ismodule(units.get("tip")) and inspect.ismodule(units.get("deploy"))) or "--" in repo:
+        return []
+    try:
+        if not NG.due(repo) or L.paused(repo):
+            return []
+        started, line = NG.spawn(repo)
+        if started:
+            NG.mark(repo)
+        return [line]
+    except Exception as e:  # noqa: BLE001 — as tip_and_deploy: one repo's fault is said and logged
+        E.log("tick-fault", repo, None, f"nightly: {type(e).__name__}: {e}")
+        return [f"[{repo}] the nightly sweep failed: {type(e).__name__}: {e}"]
+
+
 def spawn_lane(repo):
     argv = [sys.executable, "-P", os.path.join(J.CORE, "lander", "cli.py"), "lane", repo]
     try:
@@ -428,6 +450,7 @@ def cmd_tick(argv) -> int:
     units, known = L.load_units(), known_repos(repo)
     for r in known:
         lines += tip_and_deploy(r, units)
+        lines += nightly(r, units)
     lines += rearm(list(dict.fromkeys(repos + known)))
     for ln in lines:
         print(ln)

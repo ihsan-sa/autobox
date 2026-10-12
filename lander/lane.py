@@ -60,11 +60,13 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              (jobs.approval, never the request): the owner's uid, and the head he 👍'd — or a later head whose
              protected files are byte-identical, which carries approved_head to it (`approval … carried`); else
              -> query, route "owner". A job overlapping one in flight waits here (OVERLAP above). plan(); klass
-             lander -> query "lander-self".
+             lander -> query "lander-self"; then nightly.trim takes out the checks that run nightly instead (not on
+             a member's lane; the Δ re-plan trims the same way).
   checking   the plan's checks on merge-tree(base_sha, head), made once per base and head (extra tree_of), each
              through runner.run_plan (run.judge: the red-vs-base rule, the rerun alone under load, quarantine, the lane's records.Store under its lock, and the
              failures-ledger record of a red that is the diff's) against the manifest at base widened by the head's —
-             a member's on "member:<h>" — skipping those already in results. RE-READ: every RECHECK_SECS while it
+             a member's on "member:<h>" — skipping those already in results, and those the job's own store
+             holds a pass of on this very tree from this release (`stage … reused gate= tree=`). RE-READ: every RECHECK_SECS while it
              checks, and at its next turn after an `again` request, the job reads the PR's state and head; not OPEN or
              a new head -> its checks in flight are stopped (run.execute kills their process groups) and it goes
              back to queued, which ends a merged PR as merged (by=before) and a closed one as done, so nothing parked
@@ -148,6 +150,7 @@ from lander import git as G
 from lander import jobs as J
 from lander import manifest as MF
 from lander import members as M
+from lander import nightly as NG
 from lander import records as REC
 from lander import run as RUN
 from lander import types as T
@@ -921,7 +924,18 @@ class Lane:
         job.plan = self.call("planner", "plan", self.root, job.base_sha, job.head, job.files, fallback=self.fallback)
         if job.plan.klass == T.LANDER:
             return self.query(job, "it changes the lander itself — lander-self lands it", "lander-self")
+        job.plan = self.nightly(job.base_sha, job.plan)
         J.move(job, T.PLANNED)
+
+    def nightly(self, base, plan):
+        """`plan` (planned on `base`) without the checks nightly.py runs nightly instead; a member's lane, or a
+        manifest that does not load, keeps every check."""
+        if self.member:
+            return plan
+        try:
+            return NG.trim(self.repo, MF.load(self.root, base, fallback=self.fallback), plan)
+        except Exception:  # noqa: BLE001 — any fault runs every check, never the wrong answer
+            return plan
 
     def door(self, job):
         """Why the protected door stops this head, or ''. Asked at every head."""
@@ -1010,6 +1024,13 @@ class Lane:
                 job.extra.update(tree=tree, tree_of=pair)
                 J.save(job)
             store = REC.Store(self.repo, J.lane_fd(self.repo), J.landq()) if J.lane_fd(self.repo) is not None else None
+            # brief: "a check that passed on the same tree hash doesn't run again for the same PR" — the job's own
+            # store outlives a requeue (a hold for a red main, a push that merges to the same tree)
+            again = [n for n in todo if store is not None and self.passed(store, job, n, tree)]
+            if again:
+                if not [n for n in todo if n not in again] and not any(k[0] == job.key for k in self.inflight):
+                    return self.checking(job)
+                todo = [n for n in todo if n not in again]
             quarantine = RUN.quarantine_text(self.root, job.base_sha)
             for n in todo:
                 c = MF.builtin_check() if n == MF.BUILTIN else m.checks.get(n)
@@ -1037,6 +1058,17 @@ class Lane:
         if job.plan and job.plan.paid and not self.review(job):
             return None
         J.move(job, T.MERGEABLE)
+
+    def passed(self, store, job, n, tree) -> bool:
+        """True, with the pass kept in job.results and a `reused` stage line, when this job's own store holds a pass of
+        check n on this very tree from this release."""
+        r = store.get(job.key, n, tree)
+        if r is None or r.status != T.PASSED or r.tree != tree or r.check != n or r.release != store.release:
+            return False
+        E.stage(job.repo, job.pr, "reused", gate=n, tree=tree[:12])
+        job.results[n] = r.key
+        J.save(job)
+        return True
 
     def took(self, job, f, outs):
         """Record one finished check of `job` (f: its Flight): red hands back, main-red holds, else it is kept."""
@@ -1213,6 +1245,7 @@ class Lane:
         """Δ re-plan (S2). True when something must run again (only those checks' results are dropped)."""
         delta = G.changed(self.root, job.base_sha, main_now, env=self.genv)
         new = self.call("planner", "plan", self.root, main_now, job.head, job.files, fallback=self.fallback)
+        new = self.nightly(main_now, new)
         own = self.call("planner", "plan", self.root, job.base_sha, main_now, delta, fallback=self.fallback).checks
         old = set(job.plan.checks if job.plan else [])
         rerun = sorted((set(new.checks) - old) | (set(new.checks) & set(own)))

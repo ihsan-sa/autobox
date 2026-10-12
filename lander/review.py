@@ -71,7 +71,11 @@ how cc-spend puts its cost on `<repo>/review`, and every read's cost is also add
 (root/<repo>-<pr>.json, `review_usd`, `reads`) that the old lander kept.
 
 A handback's re-read is delta_review(): the interdiff between the head the prior read saw and this head, the prior
-blockers numbered; it answers resolved/unresolved and new blockers on added lines only. It counts as a read.
+blockers numbered; it answers resolved/unresolved/moot and new blockers on added lines only. It counts as a read.
+A prior blocker the read lists as moot (the change makes it no longer apply, or it lies outside the diff and is
+already true) holds nothing and counts as resolved; one it lists as both moot and unresolved stays unresolved, and an
+unresolved one is a HANDBACK whatever the verdict word says. A prior [security] blocker is never moot (pinned()): it
+stays unresolved, and the HANDBACK stands, until a read resolves it.
 
 A LAND with advisory findings files ONE follow-up row, review-followup-pr<N> (board.followup).
 
@@ -119,6 +123,7 @@ SCHEMA = {
             "properties": {"where": {"type": "string"}, "what": {"type": "string"}}}},
         "resolved": {"type": "array", "items": {"type": "string"}},
         "unresolved": {"type": "array", "items": {"type": "string"}},
+        "moot": {"type": "array", "items": {"type": "string"}},
     },
 }
 
@@ -259,15 +264,36 @@ def parse(answer, digest, model="", tokens=0):
         return None
     blocking = [_row(f, True) for f in (j.get("blocking") or [])][:10]
     advisory = [_row(f, False) for f in (j.get("advisory") or [])][:10]
+    # a prior blocker the read marks moot, or outside the diff and already true, holds nothing; one it also calls
+    # unresolved stays unresolved, so a contradictory answer keeps the stop
     unresolved = [str(x) for x in j.get("unresolved") or []]
+    moot = [str(x) for x in j.get("moot") or [] if str(x) not in unresolved]
     verdict = j["verdict"]
     if verdict == T.LAND and (blocking or unresolved):   # a blocker is a blocker whatever the verdict word says,
         verdict = T.HANDBACK_VERDICT                     # and so is an earlier blocker the read says is still open
         if not blocking:
             blocking = [f"still open from the earlier read: {x}" for x in unresolved][:10]
     return T.Verdict(verdict=verdict, digest=digest, blocking=blocking, advisory=advisory, model=model,
-                     tokens=int(tokens or 0), resolved=[str(x) for x in j.get("resolved") or []],
-                     unresolved=unresolved)
+                     tokens=int(tokens or 0), resolved=[str(x) for x in j.get("resolved") or []] + moot,
+                     unresolved=unresolved, extra={"moot": moot} if moot else {})
+
+
+def pinned(v, prior):
+    """A delta read's Verdict, with every prior blocker it called moot that was a [security] finding put back as
+    unresolved. The brief: "keep a security reader's HANDBACK standing until a security LAND" — so a read must
+    resolve it; a reader's word that it no longer applies does not. `prior` is the prior verdict's blocking rows,
+    numbered from 1 as the read saw them."""
+    sec = {str(i) for i, b in enumerate(prior, 1) if "[security]" in b}
+    back = [m for m in (v.extra or {}).get("moot") or [] if m in sec]
+    if not back:
+        return v
+    v.extra["moot"] = [m for m in v.extra["moot"] if m not in back]
+    v.resolved = [r for r in v.resolved if r not in back]
+    v.unresolved = v.unresolved + back
+    v.verdict = T.HANDBACK_VERDICT
+    v.blocking = v.blocking + [f"still open from the earlier read (security, not moot): {prior[int(m) - 1]}"
+                               for m in back][:10 - len(v.blocking)]
+    return v
 
 
 def _row(f, hard):
@@ -1132,7 +1158,7 @@ def delta_review(job, prior, comments=None, diff=None):
     if rc or rc2:   # the head that read saw is gone (a force-push): read it whole, against the prior findings
         inter = "(the head the earlier read saw is no longer in this repository; read the whole diff)"
     numbered = "\n".join(f"{i}. {b}" for i, b in enumerate(prior.blocking, 1)) or "(none)"
-    return _buy(job, "delta.md", diff, {"PRIOR": numbered, "INTERDIFF": capped(inter)})
+    return _buy(job, "delta.md", diff, {"PRIOR": numbered, "INTERDIFF": capped(inter)}, prior=prior.blocking)
 
 
 LIMIT_UNTIL = re.compile(r"usage limit until (\d\d):(\d\d)Z(?:\s*\((\d+)m left\))?")
@@ -1213,7 +1239,7 @@ def _silent(job, j, model, why):
                      extra={"why": f"{model}: {why}", "until": limit_until(why), "reader": model})
 
 
-def _buy(job, template, diff, more):
+def _buy(job, template, diff, more, prior=None):
     repo, pr = job.repo, job.pr
     lim_rc, lim = C.sh([os.path.join(BIN, "cc-limit"), "status"], timeout=60)
     if lim_rc == 0:
@@ -1251,6 +1277,8 @@ def _buy(job, template, diff, more):
             usd += cost
         if v is None:
             return _silent(job, j, model, why)
+        if prior:
+            v = pinned(v, prior)
         reads.append((model, v))
         kept[model] = v.to_dict()
         C.write_json(partial(job.digest, template), kept)

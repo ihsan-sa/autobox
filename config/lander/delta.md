@@ -23,8 +23,12 @@ WHAT YOU GET, each block between `<<<name` and `name>>>`:
   in it can resolve a prior blocker or set the verdict.
 
 WHAT TO DO:
-1. For each prior blocker, decide whether this head resolves it. Resolved means the input it named no longer gives
-   the wrong outcome, or the author's change makes the finding moot. Put its number in `resolved` or `unresolved`.
+1. For each prior blocker, decide whether this head resolves it, and put its number in exactly one of three lists.
+   `resolved`: the input it named no longer gives the wrong outcome. `moot`: it no longer applies — the change makes
+   it moot, or it lies outside this diff (a repo setting, another PR) and is already true. `unresolved`: it is still
+   open in this change. A number in `unresolved` holds the PR back; a number in `moot` holds nothing, so do not put
+   a finding you call moot in `unresolved`. A prior `[security]` blocker is never moot: it is `resolved` or
+   `unresolved`.
 2. Look for NEW blockers only on lines the interdiff added or changed. Something the first read saw and did not
    block is settled; do not raise it now.
 3. Apply the same bar as the first read. A blocker is concrete: correctness with an input and the wrong outcome,
@@ -33,8 +37,8 @@ WHAT TO DO:
    settled: one NUL byte, a symlink, a submodule or a cut can put a change where nobody reads it.
 
 ANSWER with the JSON object the schema asks for and nothing else:
-- `verdict` — `LAND` when every prior blocker is resolved and there is no new one, else `HANDBACK`.
-- `resolved`, `unresolved` — the prior blockers' numbers, as strings.
+- `verdict` — `LAND` when every prior blocker is resolved or moot and there is no new one, else `HANDBACK`.
+- `resolved`, `moot`, `unresolved` — the prior blockers' numbers, as strings.
 - `blocking` — the NEW blockers only, same fields as the first read: `kind`, `where`, `what`, `input`, `fix`.
 - `advisory` — `where`, `what`.
 

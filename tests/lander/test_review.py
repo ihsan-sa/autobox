@@ -409,6 +409,43 @@ class TestReview(Case):
         self.assertEqual((v.verdict, v.unresolved), (T.HANDBACK_VERDICT, ["1"]))
         self.assertIn("still open", v.blocking[0])
 
+    def delta(self, prior_rows, **said):
+        """A delta read of this job against a prior HANDBACK with `prior_rows`, the reader answering `said`."""
+        answer = dict({"verdict": "LAND", "blocking": [], "advisory": [], "resolved": [], "unresolved": []}, **said)
+        self.box(claude=(0, json.dumps({"type": "result", "total_cost_usd": 0.1, "structured_output": answer})))
+        prior = R.imported(self.comment("HANDBACK", "0dd", prior_rows, head="c" * 40)["body"])
+        return R.delta_review(self.job(), prior, comments=[])
+
+    def test_a_prior_blocker_the_delta_read_calls_moot_holds_nothing(self):
+        # website #104: the reader wrote "#103 already landed so the remedy is moot" and the lander handed it back
+        v = self.delta(["1. [scope] PR title — the remedy", "2. [correctness] repo setting — already true"],
+                       resolved=[], moot=["1", "2"])
+        self.assertEqual((v.verdict, v.blocking, v.unresolved), (T.LAND, [], []))
+        self.assertEqual(sorted(v.resolved), ["1", "2"])
+
+    def test_a_real_still_open_blocker_stays_beside_a_moot_one(self):
+        v = self.delta(["1. [scope] PR title — moot now", "2. [correctness] x.py — still wrong"],
+                       moot=["1"], unresolved=["2"])
+        self.assertEqual((v.verdict, v.unresolved), (T.HANDBACK_VERDICT, ["2"]))
+        self.assertEqual(v.blocking, ["still open from the earlier read: 2"])
+
+    def test_a_blocker_called_both_moot_and_unresolved_stays_open(self):
+        v = self.delta(["1. [correctness] x.py — bug"], moot=["1"], unresolved=["1"])
+        self.assertEqual((v.verdict, v.unresolved, v.resolved), (T.HANDBACK_VERDICT, ["1"], []))
+
+    def test_a_security_blocker_called_moot_stands_until_a_read_resolves_it(self):
+        rows = ["1. [security] x.py — the token leaks", "2. [scope] PR title — moot"]
+        v = self.delta(rows, moot=["1", "2"])
+        self.assertEqual((v.verdict, v.unresolved, v.resolved), (T.HANDBACK_VERDICT, ["1"], ["2"]))
+        self.assertIn("the token leaks", v.blocking[0])
+        v = self.delta(rows, resolved=["1"], moot=["2"])   # a read that resolves it lands
+        self.assertEqual((v.verdict, v.blocking, sorted(v.resolved)), (T.LAND, [], ["1", "2"]))
+
+    def test_moot_is_in_the_schema_and_the_delta_prompt(self):
+        self.assertIn("moot", R.SCHEMA["properties"])
+        self.assertIn("`moot`", R.load_prompt("delta.md"))
+        self.assertIn("moot", R.strict(R.SCHEMA)["required"])   # codex's closed schema asks for it too
+
     def test_no_diff_for_changed_files_is_incomplete_and_buys_nothing(self):
         box = self.box(claude=claude_says("LAND"), **{"git diff": (1, "fatal: bad object")})
         v = R.review(self.job(), comments=[])
