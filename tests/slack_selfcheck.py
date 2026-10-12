@@ -11121,5 +11121,289 @@ def run_selfcheck():
         os.environ.pop("CC_MAIL_VET_FAKE", None)
         shutil.rmtree(mdir, ignore_errors=True)
 
+    # -- more than one Slack workspace (brief slack-second-workspace): the default workspace keeps today's keys; an
+    # extra one has its own token pair, its own listener, and is heard only in its member workspace's channels.
+    callsW, deadDefaultW = [], {"on": False}
+    chansW = {"xoxb-a": {"CAHQ": "hq", "CAPPR": "approvals"},
+              "xoxb-b": {"CBMEM": "salt", "CBSUB": "salt--pna", "CBHQ": "hq"}}
+    def apiW(method, token, **kw):
+        callsW.append((method, token, kw))
+        if method == "conversations.info":
+            name = chansW.get(token, {}).get(kw.get("channel"))
+            if not name:
+                raise RuntimeError("conversations.info: channel_not_found")
+            return {"channel": {"id": kw["channel"], "name": name}}
+        if method == "users.info":
+            if kw.get("user") not in {"xoxb-a": {"UOWNER", "UASARA"}, "xoxb-b": {"UBUSER"}}.get(token, set()):
+                raise RuntimeError("users.info: user_not_found")
+            return {"user": {"id": kw["user"]}}
+        if method == "users.list":
+            return {"members": [{"id": u, "name": "sara"} for u in {"xoxb-a": ["UASARA"], "xoxb-b": ["UBUSER"]}.get(token, [])]}
+        if method == "conversations.create":
+            return {"channel": {"id": {"xoxb-a": "CANEW", "xoxb-b": "CBNEW"}[token]}}
+        if method == "auth.test":
+            if token == "xoxb-dead" or (token == "xoxb-a" and deadDefaultW["on"]):
+                raise RuntimeError("auth.test: invalid_auth")
+            return {"user_id": {"xoxb-a": "UBOTA", "xoxb-b": "UBOTB"}[token], "bot_id": {"xoxb-a": "BA", "xoxb-b": "BB"}[token]}
+        if method == "conversations.list":
+            return {"channels": [{"id": c, "name": n, "is_member": True} for c, n in chansW.get(token, {}).items()]}
+        return {"ok": True}
+    devW, dirW = tempfile.mkdtemp(prefix="cc-slack-ws-dev-"), tempfile.mkdtemp(prefix="cc-slack-ws-")
+    os.makedirs(f"{devW}/salt/.cc"); open(f"{devW}/salt/{MEMBER_MARKER}", "w").close()
+    wasW, dirWas = Effects("workspaces", api=apiW, dev=devW).install(), DIR
+    globals()["DIR"] = dirW
+    fakeW = []
+    import importlib.util
+    if importlib.util.find_spec("slack_sdk") is None:          # a bare clone: ws_request's ack import, faked
+        for m in ("slack_sdk", "slack_sdk.socket_mode", "slack_sdk.socket_mode.response"):
+            sys.modules[m] = types.ModuleType(m); fakeW.append(m)
+        sys.modules["slack_sdk.socket_mode.response"].SocketModeResponse = lambda envelope_id: envelope_id
+    try:
+        cfgW = {"SLACK_BOT_TOKEN": "xoxb-a", "SLACK_APP_TOKEN": "xapp-a", "SLACK_OWNER_ID": "UOWNER",
+                "SLACK_WORKSPACES": "b dead Bad! half",
+                "SLACK_BOT_TOKEN_B": "xoxb-b", "SLACK_APP_TOKEN_B": "xapp-b", "SLACK_OWNER_ID_B": "UOWNB",
+                "SLACK_MEMBER_WS_B": "salt", "SLACK_BOT_TOKEN_DEAD": "xoxb-dead", "SLACK_APP_TOKEN_DEAD": "xapp-dead",
+                "SLACK_MEMBER_WS_DEAD": "other", "SLACK_BOT_TOKEN_HALF": "xoxb-half"}
+        register_workspaces(cfgW)
+        check("workspaces: SLACK_WORKSPACES names each extra workspace; a bad name or one missing a token is no workspace",
+              sorted(WS["extra"]) == ["b", "dead"] and WS["extra"]["b"] == {"bot": "xoxb-b", "app": "xapp-b",
+                                                                            "owner": "UOWNB", "member": "salt"})
+        # (a) outbound: every call made with the default bot token goes out with its chat's own workspace's token
+        api("chat.postMessage", "xoxb-a", channel="CBMEM", text="hi")
+        api("chat.postMessage", "xoxb-a", channel="CAHQ", text="hi")
+        api("reactions.add", "xoxb-a", channel="CBMEM", name="eyes", timestamp="1.1")
+        api("files.completeUploadExternal", "xoxb-a", channel_id="CBSUB", files="[]")
+        api("chat.getPermalink", "xoxb-a", channel="CBMEM", message_ts="1.1")
+        api("apps.connections.open", "xapp-a")
+        sent = [(m, t) for m, t, kw in callsW if m != "conversations.info"]
+        probed = [(t, kw["channel"]) for m, t, kw in callsW if m == "conversations.info"]
+        check("workspaces (a): a post, a reaction, a file and a permalink in a channel of workspace B go out with B's "
+              "token, one in the default workspace with the default's, and an app-token call is left alone",
+              sent == [("chat.postMessage", "xoxb-b"), ("chat.postMessage", "xoxb-a"), ("reactions.add", "xoxb-b"),
+                       ("files.completeUploadExternal", "xoxb-b"), ("chat.getPermalink", "xoxb-b"),
+                       ("apps.connections.open", "xapp-a")])
+        check("workspaces (a): a channel id is resolved to its workspace once and cached, in the daemon's dir",
+              probed == [("xoxb-a", "CBMEM"), ("xoxb-b", "CBMEM"), ("xoxb-a", "CAHQ"), ("xoxb-a", "CBSUB"),
+                         ("xoxb-b", "CBSUB")]
+              and json.load(open(f"{dirW}/{WS_FILE}"))["chan"] == {"CBMEM": "b", "CAHQ": "", "CBSUB": "b"})
+        ws_remember("user", "UMEMB", "b")
+        check("workspaces (a): an upload URL, a DM opened to a B user and a channel made under the member workspace "
+              "use B's token; the owner's DM and a default channel's do not",
+              ws_token("files.getUploadURLExternal", "xoxb-a", {"channel": "CBMEM"}) == "xoxb-b"
+              and ws_token("conversations.open", "xoxb-a", {"users": "UMEMB"}) == "xoxb-b"
+              and ws_token("conversations.open", "xoxb-a", {"users": "UOWNER"}) == "xoxb-a"
+              and ws_token("conversations.create", "xoxb-a", {"name": "salt--new"}) == "xoxb-b"
+              and ws_token("conversations.create", "xoxb-a", {"name": "hq"}) == "xoxb-a"
+              and ws_token("chat.postMessage", "xoxb-b", {"channel": "CAHQ"}) == "xoxb-b")
+        check("workspaces (a): a user id no event has shown yet is asked with users.info, default token first, so a "
+              "DM to a B person goes out with B's token and the owner's stays the default's",
+              ws_token("conversations.open", "xoxb-a", {"users": "UBUSER"}) == "xoxb-b"
+              and ws_token("conversations.open", "xoxb-a", {"users": "UOWNER"}) == "xoxb-a"
+              and WS["user"].get("UBUSER") == "b" and WS["user"].get("UOWNER") == "")
+        WS["chan"]["CBMEM"] = "renamed-away"                     # workspaces.json from before SLACK_WORKSPACES changed
+        try:
+            staleW = ws_token("chat.postMessage", "xoxb-a", {"channel": "CBMEM"})
+        except Exception as e:
+            staleW = repr(e)
+        check("workspaces (a): a cached chat naming a workspace no longer configured is asked again, not sent with a "
+              "token that is not there", staleW == "xoxb-b" and WS["chan"]["CBMEM"] == "b")
+        callsW.clear()
+        newB, newA = ensure_channel(cfgW, "salt--new"), ensure_channel(cfgW, "hqnew")
+        invW = [(t, kw["channel"], kw["users"]) for m, t, kw in callsW if m == "conversations.invite"]
+        check("workspaces (a): a channel made in B invites the owner's id there (SLACK_OWNER_ID_B) with B's token, and "
+              "one made in the default workspace invites his default id",
+              newB == ("CBNEW", "created") and newA == ("CANEW", "created")
+              and invW == [("xoxb-b", "CBNEW", "UOWNB"), ("xoxb-a", "CANEW", "UOWNER")])
+        WS["extra"]["b"]["owner"] = ""
+        callsW.clear(); ensure_channel(cfgW, "salt--new3")
+        WS["extra"]["b"]["owner"] = "UOWNB"
+        check("workspaces (a): with no owner id set for B, a channel made there invites nobody",
+              [m for m, t, kw in callsW if m == "conversations.invite"] == [])
+        _users.update(t=0.0, map=None, ids={}, miss=0.0)          # the default table of earlier cases knows no "sara"
+        check("workspaces (a): an @handle in a B channel resolves among B's people with B's token, the same handle in "
+              "a default channel among the default's",
+              linkify_mentions(cfgW, "hi @sara", "CBMEM") == "hi <@UBUSER>"
+              and linkify_mentions(cfgW, "hi @sara", "#salt") == "hi <@UBUSER>"
+              and linkify_mentions(cfgW, "hi @sara", "CAHQ") == "hi <@UASARA>")
+        check("workspaces (a): a member workspace's names — itself, its --subs and their -updates lanes — live in B, "
+              "and a look-alike name does not",
+              [ws_of_name(n) for n in ("salt", "#salt--pna", "salt-updates", "salt--pna-updates", "salter", "hq")]
+              == ["b", "b", "b", "b", "", ""]
+              and resolve_channel(cfgW, "salt--pna") == "CBSUB" and resolve_channel(cfgW, "hq") == "CAHQ")
+        with open(f"{dirW}/channels-about.json", "w") as fh:
+            json.dump({"hq": "home", "_t": 1.0}, fh)
+        os.unlink(f"{dirW}/channels-b.json")
+        resolve_channel(cfgW, "salt")
+        check("workspaces (a): a rebuild of B's channel table writes B's channel descriptions to a file of its own "
+              "and leaves the default workspace's channels-about.json as it was",
+              json.load(open(f"{dirW}/channels-about.json")) == {"hq": "home", "_t": 1.0}
+              and set(json.load(open(f"{dirW}/channels-about-b.json"))) == {"_t"})
+        # (a)+(c) inbound: B's events carry their workspace; only its member workspace's channels are heard there
+        dmW = Daemon(use_slack=False); dmW.cfg = dict(cfgW); dmW.bot_user, dmW.bot_id = "UBOTA", "BA"
+        register_workspaces(cfgW)                                # Daemon() read the box's own config through load_cfg
+        dmW.ws_up["b"] = {"bot_user": "UBOTB", "bot_id": "BB", "connected": True}
+        dmW.route = lambda chat, ctype: {"CBMEM": "salt", "CBSUB": "salt/pna", "CBHQ": "hq",
+                                         "CAHQ": "hq", "CAPPR": None}.get(chat)
+        evM = {"type": "message", "user": "UMEMB2", "channel": "CBSUB", "ts": "5.1", "text": "hi", "_ws": "b",
+               "files": [{"id": "F1"}]}
+        evO = {"type": "message", "user": "UOWNB", "channel": "CBMEM", "ts": "5.2", "text": "go", "_ws": "b"}
+        evBot = {"type": "message", "subtype": "bot_message", "bot_id": "BB", "channel": "CBMEM", "ts": "5.3", "_ws": "b"}
+        refused = [{"type": "message", "user": "UMEMB2", "channel": "CBHQ", "ts": "6.1", "text": "@hq hi", "_ws": "b"},
+                   {"type": "message", "user": "UMEMB2", "channel": "DB1", "channel_type": "im", "ts": "6.2", "_ws": "b"},
+                   {"type": "reaction_added", "reaction": "+1", "user": "UMEMB2", "item": {"channel": "CAPPR", "ts": "1.1"}, "_ws": "b"},
+                   {"type": "team_join", "user": {"id": "UNEW"}, "_ws": "b"},
+                   {"type": "message", "user": "UMEMB2", "channel": "CBMEM", "ts": "6.3", "_ws": "nowhere"}]
+        okW = [dmW.ws_ingress(e) for e in (evM, evO, evBot)]
+        check("workspaces (a): a message in B's member channel is heard with B's user id kept, its files marked to "
+              "download with B's token, B's own bot taken as ours and the owner's id in B as the owner",
+              okW == [True, True, True] and evM["user"] == "UMEMB2" and evM["files"][0]["_ws"] == "b"
+              and evO["user"] == "UOWNER" and evBot["bot_id"] == "BA"
+              and dmW.role_of(evM["user"]) == "member" and dmW.role_of(evO["user"]) == "owner")
+        check("workspaces (c): a member in B is refused a B channel that routes to the default's #hq, a DM to the "
+              "box, an approval 👍 on a default-workspace channel, a join, and an event from no configured workspace",
+              [dmW.ws_ingress(e) for e in refused] == [False] * 5)
+        handW = []
+        dmW.hand_off = lambda target, text, meta, chat, thread, ts, alias=None: handW.append((target, chat, meta))
+        dmW.on_event(dict(refused[0]))
+        check("workspaces (c): a refused event never reaches a session", handW == [])
+        evE = {"type": "message", "subtype": "message_changed", "channel": "CBMEM", "_ws": "b",
+               "message": {"user": "UOWNB", "text": "go", "ts": "5.4"}, "previous_message": {"user": "UOWNB", "ts": "5.4"}}
+        evEb = {"type": "message", "subtype": "message_changed", "channel": "CBMEM", "_ws": "b",
+                "message": {"bot_id": "BB", "user": "UBOTB", "text": "ours", "ts": "5.5"}}
+        check("workspaces (a): an edit carries its author in the nested message: the owner's edit in B is the owner's "
+              "and an edit of our own B post is our bot's",
+              dmW.ws_ingress(evE) and evE["message"]["user"] == "UOWNER" and evE["previous_message"]["user"] == "UOWNER"
+              and dmW.ws_ingress(evEb) and evEb["message"]["bot_id"] == "BA" and evEb["message"]["user"] == "UBOTA")
+        dmW.bot_user, dmW.bot_id = None, None
+        earlyW = dmW.ws_ingress({"type": "message", "subtype": "bot_message", "bot_id": "BB", "channel": "CBMEM",
+                                 "ts": "5.6", "_ws": "b"})
+        dmW.bot_user, dmW.bot_id = "UBOTA", "BA"
+        check("workspaces (b): our own B post is dropped while the default workspace has not yet said who our bot is",
+              earlyW is False)
+        logsW, realLogW = [], globals()["log"]
+        globals()["log"] = lambda *a: logsW.append(" ".join(map(str, a)))
+        try:
+            genW = [dmW.ws_ingress({"type": "message", "user": "UMEMB2", "channel": "CBGEN", "ts": f"8.{i}", "text": "hi",
+                                    "_ws": "b"}) for i in range(3)]
+        finally:
+            globals()["log"] = realLogW
+        check("workspaces (c): a B channel that routes elsewhere logs its drop once, not once per message",
+              genW == [False] * 3 and len([m for m in logsW if "CBGEN" in m]) == 1)
+        check("workspaces (c): a member of B is no owner anywhere — every owner check compares the default owner id, "
+              "and a B id never equals it", dmW.role_of("UMEMB2") == "member" and dmW.role_of("UOWNB") == "member"
+              and dmW.cfg["SLACK_OWNER_ID"] == "UOWNER")
+        # (b) one dead token leaves the others up
+        class FakeSock:
+            def __init__(self): self.socket_mode_request_listeners, self.acks = [], []
+            def connect(self): pass
+            def is_connected(self): return True
+            def send_socket_mode_response(self, r): self.acks.append(r)
+        socksW, gotW = [], []
+        dmW.socket_client = lambda app, bot: socksW.append(FakeSock()) or socksW[-1]
+        dmW.dispatch = lambda ev, pool: gotW.append(ev)
+        exits = []
+        realExit = os._exit
+        os._exit = lambda code: exits.append(code)
+        try:
+            deadW = dmW.run_workspace("dead", WS["extra"]["dead"], None, wait=0, tries=2)
+            liveW = dmW.run_workspace("b", WS["extra"]["b"], None, wait=0, tries=2)
+        finally:
+            os._exit = realExit
+        liveW.socket_mode_request_listeners[0](liveW, types.SimpleNamespace(
+            type="events_api", envelope_id="E1", payload={"event": {"type": "message", "channel": "CBMEM", "ts": "7.1"}}))
+        startedW, realSleepW = [], time.sleep
+        class StopW(Exception): pass
+        def sleepW(n):
+            raise StopW()
+        dmW.start_workspaces = lambda pool: startedW.append(pool)
+        deadDefaultW["on"] = True
+        fakeSdkW = []
+        if fakeW or importlib.util.find_spec("slack_sdk") is None:  # a bare clone (or the fake above): start_slack's imports, faked
+            for m, attrs in (("slack_sdk", {}), ("slack_sdk.web", {"WebClient": object}),
+                             ("slack_sdk.socket_mode", {"SocketModeClient": object}),
+                             ("slack_sdk.socket_mode.response", {"SocketModeResponse": object})):
+                mod = sys.modules.get(m) or types.ModuleType(m)
+                for k, v in attrs.items():
+                    setattr(mod, k, v)
+                if m not in sys.modules:
+                    sys.modules[m] = mod; fakeSdkW.append(m)
+        callsW.clear()
+        time.sleep = sleepW
+        try:
+            dmW.start_slack()
+        except StopW:
+            pass
+        finally:
+            time.sleep = realSleepW; deadDefaultW["on"] = False
+            for m in fakeSdkW:
+                sys.modules.pop(m, None)
+            del dmW.start_workspaces
+        check("workspaces (b): the extra listeners start before the default workspace's own connect, so a default "
+              "token that never answers leaves them up",
+              len(startedW) == 1 and ("auth.test", "xoxb-a") in [(m, t) for m, t, kw in callsW])
+        check("workspaces (b): a dead token in one workspace is retried and given up in its own piece — no exit, no "
+              "socket opened — while the other connects and hands its events on marked with where they came from",
+              deadW is None and exits == [] and dmW.ws_up["dead"]["connected"] is False
+              and dmW.ws_up["b"]["connected"] is True and len(socksW) == 1 and [getattr(a, "envelope_id", a) for a in liveW.acks] == ["E1"]
+              and gotW == [{"type": "message", "channel": "CBMEM", "ts": "7.1", "_ws": "b"}])
+        # the move: channel-id records go to the same-named channels in B; nothing on disk under ~/dev moves
+        realLoadW = globals()["load_cfg"]
+        globals()["load_cfg"] = lambda: (register_workspaces(cfgW), dict(cfgW))[1]
+        try:
+            chansW["xoxb-a"].update({"CASALT": "salt", "CASALTU": "salt-updates", "CASUB": "salt--pna", "CAGONE": "salt--gone"})
+            chansW["xoxb-b"].update({"CBMEMU": "salt-updates"})
+            save_table("routes.json", {"CASALT": "salt", "CAHQ": "hq"}, indent=1)
+            save_table(TRACKS, {"salt/t1": {"chat": "CASALT", "ts": "1.0"}, "hq/t2": {"chat": "CAHQ", "ts": "2.0"}})
+            memW = {"salt": {"uid": "UOLD", "chan": "salt", "chan_id": "CASALT", "updates": "salt-updates",
+                             "updates_id": "CASALTU", "at": 1.0},
+                    "kim": {"uid": "UKIM", "chan": "kim", "chan_id": "CAKIM", "updates_id": "CAKIMU", "at": 2.0}}
+            save_members(memW)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rDryW = cmd_workspace(["move", "salt", "b"])
+                rMissW = cmd_workspace(["move", "salt", "b", "--apply"])
+                keptW = (load_routes(), load_table(TRACKS), load_members()["salt"]["uid"])
+                del chansW["xoxb-a"]["CAGONE"]
+                rBadW = cmd_workspace(["move", "salt", "dead", "--apply"])
+                lockW = open(f"{dirW}/daemon.lock", "w")
+                fcntl.flock(lockW, fcntl.LOCK_EX | fcntl.LOCK_NB)        # a running daemon holds it for its life
+                rLiveW = cmd_workspace(["move", "salt", "b", "--uid", "UMEMB3", "--apply"])
+                liveKeptW = (load_routes(), load_members())
+                lockW.close()
+                rApplyW = cmd_workspace(["move", "salt", "b", "--uid", "UMEMB3", "--apply"])
+        finally:
+            globals()["load_cfg"] = realLoadW
+        check("workspaces (move): a dry run and a move with a channel missing in B write nothing, a workspace bound to "
+              "another member workspace is refused, and --apply carries routes to the new ids, drops the old channels' "
+              "track threads, sets the member's id there and leaves the workspace folder where it was",
+              (rDryW, rMissW, rBadW, rApplyW) == (0, 1, 1, 0)
+              and keptW == ({"CASALT": "salt", "CAHQ": "hq"}, {"salt/t1": {"chat": "CASALT", "ts": "1.0"},
+                                                                   "hq/t2": {"chat": "CAHQ", "ts": "2.0"}}, "UOLD")
+              and load_routes() == {"CBMEM": "salt", "CAHQ": "hq"}
+              and load_table(TRACKS) == {"hq/t2": {"chat": "CAHQ", "ts": "2.0"}}
+              and load_members()["salt"]["uid"] == "UMEMB3" and os.path.isfile(f"{devW}/salt/{MEMBER_MARKER}"))
+        check("workspaces (move): members.json's channel ids follow the move, so the member record's readers "
+              "(MailPlaces.main, the welcome and digest posts) post in B; another member's record is left alone",
+              load_members() == {"salt": dict(memW["salt"], uid="UMEMB3", chan_id="CBMEM", updates_id="CBMEMU"),
+                                 "kim": memW["kim"]}
+              and WS["user"].get("UMEMB3") == "b")
+        check("workspaces (move): --apply is refused while a daemon holds its lock, and writes nothing",
+              rLiveW == 1 and liveKeptW == ({"CASALT": "salt", "CAHQ": "hq"}, memW))
+        # (d) the default single-workspace config behaves exactly as before
+        register_workspaces({"SLACK_BOT_TOKEN": "xoxb-a", "SLACK_OWNER_ID": "UOWNER"})
+        shutil.rmtree(dirW); os.makedirs(dirW); callsW.clear()
+        api("chat.postMessage", "xoxb-a", channel="CBMEM", text="hi")
+        api("conversations.open", "xoxb-a", users="UMEMB")
+        ws_remember("chan", "CBMEM", "")
+        check("workspaces (d): with no SLACK_WORKSPACES every call keeps its token, nothing is probed, nothing is "
+              "written, and no channel name belongs elsewhere",
+              [(m, t) for m, t, kw in callsW] == [("chat.postMessage", "xoxb-a"), ("conversations.open", "xoxb-a")]
+              and os.listdir(dirW) == [] and ws_of_name("salt") == "" and WS["extra"] == {})
+    finally:
+        register_workspaces({})
+        wasW.install(); globals()["DIR"] = dirWas
+        for m in fakeW:
+            sys.modules.pop(m, None)
+        shutil.rmtree(devW, ignore_errors=True); shutil.rmtree(dirW, ignore_errors=True)
+
     print(f"selfcheck: {len(fails)} failed")
     return 1 if fails else 0

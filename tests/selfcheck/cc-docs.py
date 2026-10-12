@@ -1695,7 +1695,7 @@ echo https://github.com/o/site/pull/7
     import threading
 
     class Site(http.server.BaseHTTPRequestHandler):
-        seen, links, answer = [], {}, [200]
+        seen, links, answer, plain = [], {}, [200], [None]
 
         def log_message(self, *args):
             pass
@@ -1715,6 +1715,8 @@ echo https://github.com/o/site/pull/7
             else:
                 out = {"error": "nope"}
             raw = json.dumps(out).encode()
+            if code != 200 and Site.plain[0]:
+                raw = Site.plain[0].encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
@@ -1780,6 +1782,25 @@ echo https://github.com/o/site/pull/7
                rc1 == 1 and "needs at least one --to" in o1 and rc2 == 1 and "only for --kind private" in o2
                and rc3 == 1 and len(Site.seen) == n0)
 
+            os.environ["MAIL_WORKSPACE"] = "Own@Example.org=owner,ann@example.org=anna"
+            try:
+                n0 = len(Site.seen)
+                rc, o = run("link", "001-0001", "--kind", "private", "--to", "OWN@example.org")
+                body = last()[3]
+                ok("link: private to the owner alone becomes a signed-in link with no people, and says so",
+                   rc == 0 and len(Site.seen) == n0 + 1 and body["kind"] == "signed-in" and "people" not in body
+                   and "signed-in link" in o)
+                rc, o = run("link", "001-0001", "--kind", "private", "--to", "own@example.org", "--to", "bob@example.org")
+                body = last()[3]
+                ok("link: private to the owner and another sends only the other",
+                   rc == 0 and body["kind"] == "private" and body["people"] == ["bob@example.org"])
+            finally:
+                os.environ.pop("MAIL_WORKSPACE", None)
+            Site.answer[0], Site.plain[0] = 400, "no people left\nsecond line"
+            rc, o = run("link", "001-0001", "--kind", "private", "--to", "bob@example.org")
+            Site.plain[0] = None
+            ok("link: a plain-text 400 body's first line is in the error",
+               rc == 1 and "malformed (no people left)" in o and "second line" not in o)
             lenv(**base, LIBRARY_LINK_CLIENT_ID="lid", LIBRARY_LINK_CLIENT_SECRET="lsec")
             run("link", "001-0001")
             ok("link: LIBRARY_LINK_* win over LIBRARY_FEEDBACK_*", last()[1:3] == ("lid", "lsec"))

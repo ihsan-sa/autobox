@@ -2957,6 +2957,17 @@ def link_people(kind, to):
     return people
 
 
+def owner_addrs():
+    """The owner's own addresses: the MAIL_WORKSPACE rows written `addr=owner` (what core/mail/outbound.owner_addrs
+    reads), lowercased."""
+    out = set()
+    for row in re.split(r"[,\n]", conf("MAIL_WORKSPACE")):
+        addr, sep, ws = row.strip().partition("=")
+        if sep and addr.strip() and ws.strip().lower() == "owner":
+            out.add(addr.strip().lower())
+    return out
+
+
 def link_credentials():
     """The box's own service token: LIBRARY_LINK_* when both are set, else LIBRARY_FEEDBACK_*. Nothing else."""
     for pre in ("LIBRARY_LINK_", "LIBRARY_FEEDBACK_"):
@@ -2979,10 +2990,15 @@ def mint_link(site, cred, body):
     except urllib.error.HTTPError as e:
         why = {403: "the site refused the service token", 404: "the site does not know that document yet",
                400: "the site called the request malformed"}.get(e.code, f"the site answered {e.code}")
+        raw = b""
         try:
-            detail = json.loads(e.read(4096)).get("error")
+            raw = e.read(4096)
+            detail = json.loads(raw).get("error")
         except Exception:
             detail = None
+        if not detail:
+            # the site answers some refusals in plain text: its first line is the reason
+            detail = next((ln.strip() for ln in raw.decode("utf-8", "replace").splitlines() if ln.strip()), None)
         raise Refused(why + (f" ({str(detail)[:200]})" if detail else ""))
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise Refused(f"the site could not be reached ({getattr(e, 'reason', e)})")
@@ -2999,6 +3015,17 @@ def cmd_link(a):
         if not site:
             raise Refused("no library site: set it with `cc-config set LIBRARY_URL <site>`")
         people = link_people(a.kind, a.to)
+        if a.kind == "private":
+            # the library drops the owner from a private link's people (he opens a signed-in one anyway) and answers
+            # 400 when nobody is left, so ask for the signed-in link then
+            mine = owner_addrs()
+            rest = [p for p in people if p.lower() not in mine]
+            if len(rest) < len(people):
+                if not rest:
+                    print("cc-docs: every --to is the owner, who opens a signed-in link anyway; minting a signed-in link",
+                          file=sys.stderr)
+                    a.kind = "signed-in"
+                people = rest
         num, rev = link_target(load(), a.target, a.pin)
     except Refused as e:
         print(f"cc-docs: {e}", file=sys.stderr)

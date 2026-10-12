@@ -2116,8 +2116,9 @@ class Judge(unittest.TestCase):
                 self.assertEqual(RUN.choose_where(chk(klass=k, where=["box", "laptop"])), "box")
             # the lane saw the runners give no answer a moment ago: the box takes it without waiting out ssh
             self.assertEqual(RUN.choose_where(c, box_only=True), "box")
-        with mock.patch.object(A, "overloaded", return_value=""), mock.patch.object(A, "busy", return_value=True):
-            # a quiet lander keeps it (owner 2026-10-12): busy() is not overloaded(), and nothing leaves
+        with mock.patch.object(A, "overloaded", return_value=""), mock.patch.object(A, "busy", return_value=True), \
+                mock.patch.object(A, "free", return_value=1):
+            # a quiet lander keeps it (a slot is free here, so the live box's own slots never decide this case) (owner 2026-10-12): busy() is not overloaded(), and nothing leaves
             self.assertEqual(RUN.choose_where(c), "box")
             self.assertEqual(RUN.choose_where(chk(klass=T.HOST, where=["box", "laptop"])), "box")
             # ...unless the lane placed it on the runners (it had no box slot for it): then it goes, if it may

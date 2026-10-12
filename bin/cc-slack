@@ -20,6 +20,7 @@
   cc-slack member instructions <handle>     put the member instructions into that workspace's README (appending if it already has one).
   cc-slack member register <handle> [<@user>]   put a workspace no join flow made (cc-sandbox convert) on record in members.json from the channel pair it already has; creates nothing.
   cc-slack members                    who has a workspace: handle → channels → folder → budget used today.
+  cc-slack workspace list | move <handle> <ws> [--uid U…] [--apply]   the extra Slack workspaces (config below) and whether their tokens answer; `move` carries a member workspace's channel-id records (routes, orchs, track threads, its members.json ids) over to the same-named channels in <ws>, a dry run without --apply, which refuses while the daemon runs. Nothing under ~/dev moves.
   cc-slack track-thread <repo>/<track> [--title T]   the ONE thread a --go track lives in, in #<repo>-updates when the repo has that lane, else #<repo> (a member workspace: its own #<handle>): opened by `cc … --go`, idempotent, prints `<chat> <ts>`; a track gets no channel of its own, and a repo with none of its own that CC_PROJECT_CHILDREN puts under a parent gets its threads — and its --route lines and PR cards — in the parent's channels. Its worker's lines (post --route "<repo>/<track> …") and its landing line go there, and a reply there reaches the track's session — or, for a headless or finished track, the repo's session with the track named; no notice line is posted.
   cc-slack mkchannel <name>… [--public]     create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the topic; a #<repo>--<sub> name inherits #<repo>'s people. No -updates twin is made (only a member's join makes one): a routine line with no twin of its own goes to the box's one log lane, #<box>-updates.
   cc-slack project <name>             from a member workspace's session, ask the daemon for the project's board row and its one thread in #<this workspace> (no channel); at most 3 an hour; the human way is `new project <name>` typed in the channel.
@@ -77,6 +78,10 @@ While a handoff overlap is open on a target, only the session the record calls l
 See ~/COMMS.md and ~/USAGE.md.
 
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
+More Slack workspaces: SLACK_WORKSPACES="<n> …" and, per name (<N> upper-cased, - as _), SLACK_BOT_TOKEN_<N>
+SLACK_APP_TOKEN_<N> SLACK_OWNER_ID_<N> SLACK_MEMBER_WS_<N>. Each gets its own Socket Mode listener; a call naming one
+of its chats or users goes out with its token; only channels of member workspace SLACK_MEMBER_WS_<N> are heard there,
+and everyone there but SLACK_OWNER_ID_<N> is a member.
 """
 import calendar, collections, contextlib, fcntl, glob, io, json, os, pwd, re, shutil, signal, socket, stat, struct, subprocess, sys, tempfile, threading, time, types, unicodedata, urllib.parse, urllib.request
 
@@ -297,6 +302,7 @@ def load_cfg():
         if "=" in line:
             k, v = line.split("=", 1)
             cfg[k] = v
+    register_workspaces(cfg)
     return cfg
 
 def set_cfg(key, value):
@@ -357,10 +363,120 @@ class Effects:
         return was
 
 def api(method, token, **params):
-    """The Slack Web API, through the adapter — see Effects."""
-    return EFFECTS.api(method, token, **params)
+    """The Slack Web API, through the adapter — see Effects. A call made with the default bot token that names a
+    chat or a user of another workspace goes out with that workspace's token (ws_token)."""
+    return EFFECTS.api(method, ws_token(method, token, params), **params)
 
 EFFECTS = Effects.real()
+
+# -- more than one Slack workspace ---------------------------------------------------------------------------------
+# The default workspace is SLACK_BOT_TOKEN / SLACK_APP_TOKEN / SLACK_OWNER_ID, as it always was. SLACK_WORKSPACES
+# ("b c", space-separated names of [a-z0-9-]) adds one Slack workspace per name, each read from four keys with <N> its
+# name upper-cased and - as _: SLACK_BOT_TOKEN_<N> and SLACK_APP_TOKEN_<N> (required), SLACK_OWNER_ID_<N> (the
+# owner's own user id in that team, when he is in it) and SLACK_MEMBER_WS_<N> (the one member workspace whose channels
+# live there). Everyone in it but that owner id is a member, and only channels that route to that member workspace
+# are heard there (Daemon.ws_ingress). With SLACK_WORKSPACES unset nothing below changes a single call.
+WS = {"bot": None, "extra": {}, "chan": {}, "user": {}, "loaded": False}
+WS_LOCK = threading.Lock()
+WS_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+WS_FILE = "workspaces.json"     # {"chan": {id: ws}, "user": {id: ws}} under DIR: "" is the default workspace
+
+def extra_workspaces(cfg):
+    """{name: {bot, app, owner, member}} of every workspace SLACK_WORKSPACES names that has both its tokens."""
+    out = {}
+    for name in (cfg.get("SLACK_WORKSPACES") or "").split():
+        if not WS_NAME_RE.match(name):
+            continue
+        k = name.upper().replace("-", "_")
+        w = {"bot": cfg.get(f"SLACK_BOT_TOKEN_{k}") or "", "app": cfg.get(f"SLACK_APP_TOKEN_{k}") or "",
+             "owner": cfg.get(f"SLACK_OWNER_ID_{k}") or "", "member": cfg.get(f"SLACK_MEMBER_WS_{k}") or ""}
+        if w["bot"] and w["app"]:
+            out[name] = w
+    return out
+
+def register_workspaces(cfg):
+    """Bind cfg's workspaces into WS, the table ws_token routes by. load_cfg calls it; a test calls it with its own."""
+    with WS_LOCK:
+        WS.update(bot=cfg.get("SLACK_BOT_TOKEN"), extra=extra_workspaces(cfg), chan={}, user={}, loaded=False)
+
+def ws_cache():
+    """WS's chat and user maps, read from DIR once per process and written back by ws_remember."""
+    if not WS["loaded"]:
+        try:
+            d = json.load(open(f"{DIR}/{WS_FILE}"))
+            WS["chan"].update({k: v for k, v in (d.get("chan") or {}).items() if k not in WS["chan"]})
+            WS["user"].update({k: v for k, v in (d.get("user") or {}).items() if k not in WS["user"]})
+        except Exception:
+            pass
+        WS["loaded"] = True
+    return WS
+
+def ws_remember(kind, key, name):
+    """Record that chat (kind="chan") or user (kind="user") `key` is in workspace `name` ("" = default). Only with
+    extra workspaces configured, so a single-workspace box writes nothing new."""
+    if not (WS["extra"] and key) or (name and name not in WS["extra"]):
+        return
+    with WS_LOCK:
+        c = ws_cache()
+        if c[kind].get(key) == name:
+            return
+        c[kind][key] = name
+        try:
+            os.makedirs(DIR, exist_ok=True)
+            with open(f"{DIR}/{WS_FILE}.tmp", "w") as f:
+                json.dump({"chan": c["chan"], "user": c["user"]}, f)
+            os.replace(f"{DIR}/{WS_FILE}.tmp", f"{DIR}/{WS_FILE}")
+        except Exception as e:
+            log(f"{WS_FILE}: {e!r}")
+
+def chat_workspace(chat):
+    """The workspace a chat or user id is in ("" = default); a #name is the default's (resolve_channel turns a member
+    workspace's names into ids first). An id not seen yet is asked once — conversations.info for a chat, users.info
+    for a user — default token first, and cached; one no token can see stays default and is asked again. A cached
+    answer naming a workspace that is no longer configured (renamed or dropped from SLACK_WORKSPACES) is forgotten and
+    asked again, so no call goes out with a token that is not there."""
+    if not WS["extra"] or not chat or chat.startswith("#") or chat == "local":
+        return ""
+    kind = "user" if chat[:1] in ("U", "W") else "chan"
+    with WS_LOCK:
+        c = ws_cache()
+        got = c[kind].get(chat)
+        if got == "" or got in WS["extra"]:
+            return got
+        c[kind].pop(chat, None)
+    method, arg = ("users.info", "user") if kind == "user" else ("conversations.info", "channel")
+    for name, tok in [("", WS["bot"])] + [(n, w["bot"]) for n, w in WS["extra"].items()]:
+        try:
+            EFFECTS.api(method, tok, **{arg: chat})
+        except Exception:
+            continue
+        ws_remember(kind, chat, name)
+        return name
+    return ""
+
+def ws_token(method, token, params):
+    """The token a Web API call goes out with: `token` itself, unless extra workspaces are configured, `token` is the
+    default bot token, and the call names a chat (channel, channel_id) or a user (user, users) of another workspace, or
+    creates a channel whose name another workspace owns (ws_of_name) — then that workspace's bot token."""
+    if not WS["extra"] or not token or token != WS["bot"]:
+        return token
+    if method == "conversations.create":            # a new channel is made where its name belongs
+        name = ws_of_name(params.get("name"))
+    else:
+        who = params.get("channel") or params.get("channel_id") or params.get("user") or params.get("users") or ""
+        name = chat_workspace(str(who).split(",")[0])
+    return (WS["extra"].get(name) or {}).get("bot") or token
+
+def ws_of_name(name):
+    """The extra workspace a channel NAME lives in, or "": the one whose member workspace owns it — `<h>` itself or a
+    `<h>--<sub>` under it, or either's -updates lane (the rebind: once SLACK_MEMBER_WS_<N>=<h>, #<h> means that workspace's #<h>)."""
+    n = (name or "").lstrip("#").lower()
+    n = main_lane(n) or n                           # #<h>-updates lives where #<h> does
+    for ws, w in WS["extra"].items():
+        h = w["member"]
+        if h and (n == h or n.startswith(h + "--")):
+            return ws
+    return ""
 
 REPLY_BOLD_MAX = 120    # chars in a reply's opening *…*: a phone line is ~40, three lines of bold is a paragraph
 REPLY_CHARS_MAX = 800   # chars in the whole reply, a link counted as its label
@@ -635,6 +751,26 @@ def user_table(cfg, refresh=False):
         log(f"users cache: {e!r}")
     return table
 
+_ws_users = {}   # extra workspace -> (t, handle table, handle -> [ids]): that workspace's own users.list, this process only
+
+def ws_user_table(ws):
+    """user_table for an extra workspace: its people, read with its own token, so an @handle in one of its channels
+    resolves among the people who can see it. Every id read is remembered as that workspace's (ws_remember). Never
+    raises: Slack down leaves the last table (or none, and every @handle goes out as code)."""
+    now, hit = time.time(), _ws_users.get(ws)
+    if hit and now - hit[0] < USERS_TTL:
+        return hit[1], hit[2]
+    try:
+        cand = user_handles({"SLACK_BOT_TOKEN": WS["extra"][ws]["bot"]})
+    except Exception as e:
+        log(f"users.list ({ws}): {e}")
+        _ws_users[ws] = (now - USERS_TTL + USERS_MISS_TTL, *(hit[1:] if hit else ({}, {})))
+        return _ws_users[ws][1], _ws_users[ws][2]
+    _ws_users[ws] = (now, {h: (ids[0] if len(ids) == 1 else None) for h, ids in cand.items()}, cand)
+    for u in {u for ids in cand.values() for u in ids}:
+        ws_remember("user", u, ws)
+    return _ws_users[ws][1], cand
+
 def channel_member_ids(cfg, chat):
     """The member ids of ONE channel (conversations.members), cached CHAN_MEMBERS_TTL. Never raises: a channel the bot
     cannot read simply has no members here and @-resolution falls back to the workspace table."""
@@ -660,6 +796,8 @@ def linkify_mentions(cfg, text, chat=None, unresolved=None, decision=False):
     if not text or "@" not in text:
         return text
     st = {"table": None, "orchs": None, "refreshed": False}
+    ws = (ws_of_name(chat) if chat.startswith("#") else chat_workspace(chat)) if chat else ""
+    owner = WS["extra"][ws]["owner"] if ws else cfg.get("SLACK_OWNER_ID")   # another workspace: its people, its owner id
 
     def reserved(key):
         if key in HANDOVER or key in BROADCAST:
@@ -669,6 +807,14 @@ def linkify_mentions(cfg, text, chat=None, unresolved=None, decision=False):
         return key in st["orchs"]
 
     def uid_for(key):
+        if ws:
+            if st["table"] is None:
+                st["table"], st["ids"] = ws_user_table(ws)
+            uid = st["table"].get(key)
+            if uid or key not in st["table"] or not chat:
+                return uid
+            here = [u for u in st["ids"].get(key, []) if u in channel_member_ids(cfg, chat)]
+            return here[0] if len(here) == 1 else None
         if st["table"] is None:
             st["table"] = user_table(cfg)
         if key not in st["table"] and not st["refreshed"]:
@@ -689,7 +835,7 @@ def linkify_mentions(cfg, text, chat=None, unresolved=None, decision=False):
         if not handle or reserved(key):
             return m.group(0)
         uid = uid_for(key)
-        if uid and not decision and uid == cfg.get("SLACK_OWNER_ID"):
+        if uid and not decision and uid == owner:
             if unresolved is None:
                 log(f"mention: @{handle} in {chat or '-'} is the owner and this is not a decision ask — sent as code")
             elif (handle, OWNER_WHY) not in unresolved:
@@ -1415,6 +1561,7 @@ def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True,
     if comment:   # a file's comment is a message like any other: its @handles must ping, or say they did not
         comment = linkify_mentions(cfg, mrkdwn(comment), to)
     try:
+        tok = ws_token("files.getUploadURLExternal", tok, {"channel": to})   # names no chat: the upload is to's workspace's
         up = api("files.getUploadURLExternal", tok, filename=name, length=str(size))
         with urllib.request.urlopen(urllib.request.Request(up["upload_url"], data=data, method="POST"), timeout=120) as r:
             r.read()
@@ -4315,6 +4462,8 @@ class Daemon:
         self.bot_user = None
         self.pair_wakes = {}                                # frozenset of two seats -> [(t, sender seat), …] (pingpong)
         self.bot_id = None                                  # our own B… id: bot-authored posts carry bot_id and no user
+        self.ws_up = {}                                     # extra workspace -> {bot_user, bot_id, connected} (run_workspace)
+        self.ws_dropped = set()                             # (workspace, chat) whose drop ws_ingress already logged
         self.default_chats = {}                             # target -> fallback chat for relays (resolved once per daemon life)
         self.load_queues()                                  # queued messages persisted by an earlier daemon life
         self.home_dirty, self.home_at = True, 0.0           # home.json: event-driven rewrite (home_loop)
@@ -5740,6 +5889,8 @@ class Daemon:
 
     def on_event(self, ev):
         self.home_dirty = True                             # anything the daemon saw is worth a home.json rewrite
+        if ev.get("_ws") and not self.ws_ingress(ev):
+            return
         if ev.get("type") == "team_join":
             return self.on_team_join(ev)
         if ev.get("type") in ("reaction_added", "reaction_removed"):
@@ -5915,7 +6066,8 @@ class Daemon:
                 "channel": "dm" if ctype == "im" else "#" + self.chan_name(chat), "target": target,
                 "lane": "main" if ctype == "im" else lane_of(self.chan_name(chat), target),
                 # a member workspace reaches here like any other target; only `new project` is diverted to member_channel above, and either way member_authority computes the rule in one place
-                **({"authority": "instructions"} if member_authority(target, user) else {})}
+                **({"authority": "instructions"} if member_authority(target, user) else {}),
+                **({"workspace": ev["_ws"]} if ev.get("_ws") else {})}   # which Slack it came from; the default names none
         if ev.get("files"):
             got = self.fetch_files(ev["files"], ws, pairs=True)   # a member's attachments land in its own dir (boundary's ~/.cc/slack/files)
             meta["files"] = str(len(ev["files"]))
@@ -6727,7 +6879,8 @@ class Daemon:
             safe = re.sub(r"[^A-Za-z0-9._-]+", "_", f.get("name") or "file")[:80]
             path = f"{fdir}/{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{fid}-{safe}"
             try:
-                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+                ftok = WS["extra"][f["_ws"]]["bot"] if f.get("_ws") in WS["extra"] else tok   # ws_ingress marks another workspace's files
+                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {ftok}"})
                 with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as w:
                     w.write(r.read(50 * 1024 * 1024 + 1))
                 out.append((f, path) if pairs else path)
@@ -8024,6 +8177,7 @@ class Daemon:
         from concurrent.futures import ThreadPoolExecutor
         pool = ThreadPoolExecutor(max_workers=4)
         tok = self.cfg["SLACK_BOT_TOKEN"]
+        self.start_workspaces(pool)                      # first: a default token that never answers must not hold them back
         while True:
             try:
                 me = api("auth.test", tok)
@@ -8041,7 +8195,9 @@ class Daemon:
         def on_req(client, req):
             if req.type == "events_api":
                 client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
-                self.dispatch(req.payload.get("event", {}), pool)
+                ev = req.payload.get("event", {})
+                ev.pop("_ws", None)                      # the default workspace's events name no other (ws_request sets it)
+                self.dispatch(ev, pool)
             elif req.type in ("slash_commands", "interactive"):
                 client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
                 # `interactive` is acked and dropped: nothing this daemon publishes carries a button any more
@@ -8062,6 +8218,103 @@ class Daemon:
             down_since = self.watchdog(self.connected, down_since, time.time())
             for t, payload in self.expire_queues():
                 self.expired(t, payload)
+
+    def socket_client(self, app_token, bot_token):
+        """A Socket Mode client for one extra workspace; the selfcheck puts a fake in its place."""
+        from slack_sdk.web import WebClient
+        from slack_sdk.socket_mode import SocketModeClient
+        return SocketModeClient(app_token=app_token, web_client=WebClient(token=bot_token))
+
+    def start_workspaces(self, pool):
+        """One listener thread per extra workspace (WS), each its own piece: a dead token or a dropped link there is
+        logged and retried in that thread, never exits the daemon (watchdog is the default workspace's alone) and never
+        touches another workspace's connection."""
+        for name, w in WS["extra"].items():
+            threading.Thread(target=self._safe, args=(self.watch_workspace, name, w, pool), daemon=True,
+                             name=f"slack-{name}").start()
+
+    def watch_workspace(self, name, w, pool, wait=30):
+        client = self.run_workspace(name, w, pool, wait)
+        while True:
+            time.sleep(wait)
+            up = client.is_connected()
+            if up != self.ws_up[name].get("connected"):
+                log(f"slack workspace {name}: {'connected' if up else 'disconnected'}")
+            self.ws_up[name]["connected"] = up
+
+    def run_workspace(self, name, w, pool, wait=30, tries=None):
+        """Connect one extra workspace: auth.test with its own bot token, then its own Socket Mode client whose events
+        reach dispatch marked with the workspace's name. Retries every `wait` s for ever (or `tries` times, then None)."""
+        up, n = self.ws_up.setdefault(name, {"connected": False}), 0
+        while True:
+            try:
+                me = api("auth.test", w["bot"])
+                up.update(bot_user=me["user_id"], bot_id=me.get("bot_id"))
+                client = self.socket_client(w["app"], w["bot"])
+                client.socket_mode_request_listeners.append(lambda c, req: self.ws_request(name, c, req, pool))
+                client.connect()
+                up["connected"] = True
+                log(f"slack workspace {name} connected (bot {up['bot_user']}), member workspace {w['member'] or 'NONE'}")
+                return client
+            except Exception as e:
+                up["connected"] = False
+                log(f"slack workspace {name}: {e}; retry in {wait}s")
+                n += 1
+                if tries and n >= tries:
+                    return None
+                time.sleep(wait)
+
+    def ws_request(self, name, client, req, pool):
+        """An extra workspace's Socket Mode request: acked like the default's, its event marked with where it came from."""
+        from slack_sdk.socket_mode.response import SocketModeResponse
+        if req.type in ("events_api", "slash_commands", "interactive"):
+            client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
+        if req.type == "events_api":
+            ev = req.payload.get("event", {})
+            ev["_ws"] = name
+            self.dispatch(ev, pool)
+
+    def ws_ingress(self, ev):
+        """An event from an extra workspace, made fit for on_event — True — or refused — False. Our bot there is our
+        bot and the owner's own id there (SLACK_OWNER_ID_<N>) is the owner; every other user stays the id that
+        workspace gave them, so it never equals the owner's and role_of and every owner check answer member. A join
+        there provisions nothing, a DM there reaches no one, and a channel is heard only when it routes to the member
+        workspace that workspace maps to, so a member there never reaches the owner's main channel, perms, approvals or any
+        channel of the default workspace."""
+        name = ev["_ws"]
+        w, up = WS["extra"].get(name), self.ws_up.get(name) or {}
+        if not w or ev.get("type") == "team_join":
+            return False
+        chat = ev.get("channel") or (ev.get("item") or {}).get("channel") or ""
+        if isinstance(chat, dict):                          # channel_* events carry the channel object
+            chat = chat.get("id") or ""
+        # an edit or a delete carries its author in the nested message, not at the top: rewrite every layer alike
+        for m in [ev] + [ev[k] for k in ("message", "previous_message") if isinstance(ev.get(k), dict)]:
+            uid = m.get("user") or ""
+            ours = (up.get("bot_id") and m.get("bot_id") == up["bot_id"]) or (up.get("bot_user") and uid == up["bot_user"])
+            if ours and not (self.bot_id and self.bot_user):
+                return False                                # the default workspace has not said who we are yet
+            if up.get("bot_id") and m.get("bot_id") == up["bot_id"]:
+                m["bot_id"] = self.bot_id
+            if up.get("bot_user") and uid == up["bot_user"]:
+                m["user"] = self.bot_user
+            elif w["owner"] and uid == w["owner"]:
+                m["user"] = self.cfg.get("SLACK_OWNER_ID")
+            elif uid:
+                ws_remember("user", uid, name)
+        for f in ev.get("files") or []:
+            f["_ws"] = name                                 # fetch_files downloads it with this workspace's token
+        if not chat:
+            return False
+        ws_remember("chan", chat, name)
+        target = None if chat.startswith("D") else self.route(chat, ev.get("channel_type"))
+        if not (target and w["member"] and workspace_of(target) == w["member"]):
+            if (name, chat) not in self.ws_dropped:         # once per channel: B's #general would fill the log
+                self.ws_dropped.add((name, chat))
+                log(f"slack workspace {name}: {ev.get('type')} in {chat} dropped — it routes to {target or 'nothing'}, "
+                    f"not member workspace {w['member'] or '(none set)'}; later events there are dropped unlogged")
+            return False
+        return True
 
     def expire_queues(self):
         """Drops what's sat in a queue past QUEUE_TTL, returning [(target, payload)] for the caller to report.
@@ -9122,12 +9375,15 @@ def cmd_post_file(argv):
     return 0
 
 def find_channel(cfg, name):
-    """#name → (id, is_member) across all channels the bot can see, or (None, False)."""
-    cur = None
+    """#name → (id, is_member) across all channels the bot can see, or (None, False); a name another workspace's
+    member workspace owns is looked for in that workspace alone (ws_of_name)."""
+    cur, ws = None, ws_of_name(name)
     while True:
-        r = api("conversations.list", cfg["SLACK_BOT_TOKEN"], types="public_channel,private_channel", exclude_archived="true", limit="200", cursor=cur)
+        r = api("conversations.list", WS["extra"][ws]["bot"] if ws else cfg["SLACK_BOT_TOKEN"],
+                types="public_channel,private_channel", exclude_archived="true", limit="200", cursor=cur)
         for ch in r["channels"]:
             if ch["name"] == name:
+                ws_remember("chan", ch["id"], ws)
                 return ch["id"], bool(ch.get("is_member"))
         cur = r.get("response_metadata", {}).get("next_cursor") or None
         if not cur:
@@ -9172,13 +9428,15 @@ def inherit_members(cfg, parent, cid, name):
         return 0
 
 def ensure_channel(cfg, name, private=True, parent=None, invite=()):
-    """#name exists, the bot is in it and the owner is invited → (id, "created"|"joined"|"member"). `parent` (a channel id) hands the new channel the parent's humans, on creation only, never a re-sync. `invite` = ids to add alongside the owner. The owner is never optional: every channel the box makes is one he is in."""
-    tok = cfg["SLACK_BOT_TOKEN"]
+    """#name exists, the bot is in it and the owner is invited → (id, "created"|"joined"|"member"). `parent` (a channel id) hands the new channel the parent's humans, on creation only, never a re-sync. `invite` = ids to add alongside the owner. The owner is never optional: every channel the box makes is one he is in — in another Slack workspace as his id there (SLACK_OWNER_ID_<N>), and none when he is not in it."""
+    tok, ws = cfg["SLACK_BOT_TOKEN"], ws_of_name(name)
+    owner = WS["extra"][ws]["owner"] if ws else cfg.get("SLACK_OWNER_ID")   # his id in that workspace; none if he is not in it
     cid, member = find_channel(cfg, name)
     how = "member"
     if not cid:
         try:
             cid = api("conversations.create", tok, name=name, is_private="true" if private else "false")["channel"]["id"]; how = "created"
+            ws_remember("chan", cid, ws)
             with contextlib.suppress(Exception):
                 record_twin(cid, name)                # an -updates lane the box makes is its own, under this name
         except RuntimeError as e:
@@ -9189,7 +9447,7 @@ def ensure_channel(cfg, name, private=True, parent=None, invite=()):
             inherit_members(cfg, parent, cid, name)   # before the owner invite: one clean batch into an empty channel
     elif not member:
         api("conversations.join", tok, channel=cid); how = "joined"
-    for who in [cfg.get("SLACK_OWNER_ID")] + [u for u in invite if u]:
+    for who in [owner] + [u for u in invite if u]:
         if not who:
             continue
         try:
@@ -9198,7 +9456,7 @@ def ensure_channel(cfg, name, private=True, parent=None, invite=()):
             if "already_in_channel" not in str(e):
                 log(f"invite {who} to #{name}: {e}")
     try:
-        os.unlink(f"{DIR}/channels.json")            # the name→id cache predates this channel
+        os.unlink(f"{DIR}/channels-{ws}.json" if ws else f"{DIR}/channels.json")   # the name→id cache predates this channel
     except FileNotFoundError:
         pass
     return cid, how
@@ -10080,6 +10338,114 @@ def cmd_approvals_sweep(argv):
           + (" (more than one run's worth — again with --now)" if len(edited) >= SWEEP_MAX else ""))
     return 0
 
+def member_channels(tok, handle):
+    """{name: id} of every channel one workspace's bot is in that member workspace `handle` owns: #<h>, #<h>--<sub>
+    and their -updates lanes (ws_of_name's rule)."""
+    out, cur = {}, None
+    while True:
+        r = api("conversations.list", tok, types="public_channel,private_channel", exclude_archived="true",
+                limit="200", cursor=cur)
+        for ch in r.get("channels") or []:
+            n = ch.get("name") or ""
+            b = main_lane(n) or n
+            if ch.get("is_member") and (b == handle or b.startswith(handle + "--")):
+                out[n] = ch["id"]
+        cur = (r.get("response_metadata") or {}).get("next_cursor") or None
+        if not cur:
+            return out
+
+def daemon_running():
+    """Does a cc-slack daemon hold DIR/daemon.lock (Daemon.__init__ takes it for its whole life)? Never creates it."""
+    try:
+        fh = open(f"{DIR}/daemon.lock")
+    except OSError:
+        return False
+    with fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    return False
+
+def cmd_workspace(args):
+    """`workspace list`: every extra Slack workspace, its member workspace and whether its two tokens answer.
+    `workspace move <handle> <ws> [--uid U…] [--apply]`: the records keyed by a channel id of the default workspace
+    (routes.json, orchs.json, track-threads.json) are moved to the same-named channel in <ws>, which the owner made
+    and invited the bot to; ~/dev/<handle> and everything else on disk is untouched. SLACK_MEMBER_WS_<N> must already
+    name <handle>: that key is the binding, this command only carries the ids over. Without --apply it prints the plan
+    and writes nothing; with it, a channel missing in <ws> refuses the whole move. --uid sets the member's own user id
+    in <ws> (members.json), the one whose word is an instruction in its channels. members.json's own channel ids
+    (chan_id, updates_id) are carried over the same way, so every reader of the member record posts in <ws>. --apply
+    refuses while a daemon holds DIR/daemon.lock: a live one keeps the old routes in memory."""
+    cfg = load_cfg()
+    if args[:1] == ["list"]:
+        if not WS["extra"]:
+            print("no extra workspace (SLACK_WORKSPACES is unset)")
+        for name, w in WS["extra"].items():
+            try:
+                team = api("auth.test", w["bot"]).get("team") or "?"; bot = f"bot OK ({team})"
+            except Exception as e:
+                bot = f"bot FAILED: {e}"
+            try:
+                api("apps.connections.open", w["app"]); app = "app OK"
+            except Exception as e:
+                app = f"app FAILED: {e}"
+            print(f"{name}: member workspace {w['member'] or '(none)'}, owner {w['owner'] or '(not in it)'}; {bot}; {app}")
+        return 0
+    pos, flags, uid, it = [], set(), "", iter(args)
+    for a in it:
+        if a == "--uid":
+            uid = next(it, "")
+        if a.startswith("--"):
+            flags.add(a)
+        else:
+            pos.append(a)
+    if pos[:1] != ["move"] or len(pos) != 3 or flags - {"--uid", "--apply"} or ("--uid" in flags and not re.match(r"[UW][A-Z0-9]+\Z", uid)):
+        print("usage: cc-slack workspace list | move <handle> <ws> [--uid U…] [--apply]", file=sys.stderr); return 2
+    handle, ws = pos[1], pos[2]
+    w = WS["extra"].get(ws)
+    if not w:
+        print(f"{ws} is not a configured workspace (SLACK_WORKSPACES, SLACK_BOT_TOKEN_<N>, SLACK_APP_TOKEN_<N>)", file=sys.stderr); return 1
+    if w["member"] != handle:
+        print(f"SLACK_MEMBER_WS_{ws.upper().replace('-', '_')} is {w['member'] or 'unset'}, not {handle}: set it first", file=sys.stderr); return 1
+    old, new = member_channels(cfg["SLACK_BOT_TOKEN"], handle), member_channels(w["bot"], handle)
+    ids = {}
+    for n in sorted(old):
+        print(f"#{n}  {old[n]} -> {new.get(n) or 'MISSING in ' + ws}")
+        if new.get(n):
+            ids[old[n]] = new[n]
+    missing = [n for n in old if n not in new]
+    if "--apply" not in flags:
+        print("dry run: nothing written (--apply moves it)"); return 0
+    if missing:
+        print(f"not moved: make {', '.join('#' + n for n in sorted(missing))} in {ws} and invite the bot", file=sys.stderr); return 1
+    if daemon_running():
+        print("not moved: cc-slackd is running and would keep the old routes — stop it first "
+              "(systemctl --user stop cc-slackd), then run this again", file=sys.stderr); return 1
+    routes = load_routes()
+    save_table("routes.json", {ids.get(k, k): v for k, v in routes.items()}, indent=1)
+    orchs = load_orchs()
+    if any(k in ids for k in orchs):
+        save_orchs({ids.get(k, k): v for k, v in orchs.items()})
+    tracks = load_table(TRACKS)
+    gone = [t for t, e in tracks.items() if e.get("chat") in ids]
+    if gone:   # their next line opens a fresh thread in the new channel
+        save_table(TRACKS, {t: e for t, e in tracks.items() if t not in gone}, indent=1)
+    for n, cid in new.items():
+        ws_remember("chan", cid, ws)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(f"{DIR}/channels.json")              # name -> id cache of the default workspace: re-read
+    m = load_members()
+    moved = {h: {k: ids.get(v, v) if isinstance(v, str) else v for k, v in (r or {}).items()} for h, r in m.items()}
+    if uid and handle in moved:
+        moved[handle]["uid"] = uid
+        ws_remember("user", uid, ws)
+    if moved != m:                                     # chan_id, updates_id: MailPlaces and every member post read them
+        save_members(moved)
+    print(f"moved {len(ids)} channel(s) of {handle} to {ws}; {len(gone)} track thread(s) reopen at their next line")
+    return 0
+
 def cmd_selfcheck():
     """Unit checks that need no Slack. Exit 1 on any failure. The cases are core/tests/slack_selfcheck.py, run in THIS
     namespace so their patches (globals()["api"] = fake, global DIR) land on the tool as they did when the body was here."""
@@ -10124,12 +10490,17 @@ def cmd_manifest(argv):
     return 0
 
 def resolve_channel(cfg, name):
-    """#name → channel id (only channels the bot is a member of); cached on disk for an hour.
+    """#name → channel id (only channels the bot is a member of); cached on disk for an hour. A name a member
+    workspace of another Slack workspace owns (ws_of_name) is looked up in that workspace alone, cached apart.
 
     The same rebuild writes channels-about.json beside it: each channel's purpose, or its topic when it has no
     purpose, as conversations.list already returns them. The mail classifier reads that to know what a channel
-    is for (MailPlaces._about), so describing a channel costs no call of its own."""
-    path = f"{DIR}/channels.json"
+    is for (MailPlaces._about), so describing a channel costs no call of its own. Another workspace's rebuild
+    writes its own channels-about-<ws>.json, so it never overwrites the home workspace's file."""
+    ws = ws_of_name(name)
+    tok = WS["extra"][ws]["bot"] if ws else cfg["SLACK_BOT_TOKEN"]
+    path = f"{DIR}/channels-{ws}.json" if ws else f"{DIR}/channels.json"
+    about_path = f"{DIR}/channels-about-{ws}.json" if ws else f"{DIR}/channels-about.json"
     try:
         c = json.load(open(path))
         if time.time() - c.get("_t", 0) < 3600 and name in c and c[name] not in load_retired():
@@ -10139,10 +10510,12 @@ def resolve_channel(cfg, name):
     cur, found, about, made = None, {}, {}, []
     try:
         while True:
-            r = api("conversations.list", cfg["SLACK_BOT_TOKEN"], types="public_channel,private_channel", exclude_archived="true", limit="200", cursor=cur)
+            r = api("conversations.list", tok, types="public_channel,private_channel", exclude_archived="true", limit="200", cursor=cur)
             for ch in r["channels"]:
                 if ch.get("is_member"):
                     found[ch["name"]] = ch["id"]
+                    if ws_of_name(ch["name"]) == ws:
+                        ws_remember("chan", ch["id"], ws)
                     made.append((ch["id"], ch["name"], ch.get("creator")))
                     said = channel_about(ch)
                     if said:
@@ -10157,7 +10530,7 @@ def resolve_channel(cfg, name):
         with contextlib.suppress(Exception):
             seed_twins(cfg, made)                                      # once: the -updates twins the bot made
         json.dump(found, open(path, "w"))
-        json.dump(about, open(f"{DIR}/channels-about.json", "w"))
+        json.dump(about, open(about_path, "w"))
     except Exception:
         pass
     return found.get(name)
@@ -10617,6 +10990,8 @@ def main(argv):
         return cmd_member(rest)
     elif cmd == "members":
         return cmd_members()
+    elif cmd == "workspace":
+        return cmd_workspace(rest)
     elif cmd == "folded":
         return cmd_folded(rest)
     elif cmd == "orch-channel":
