@@ -25,8 +25,9 @@ the list after each. CHECKS RUN IN PARALLEL, MERGES ONE AT A TIME (lander-redesi
 land side by side"; 2026-09-29 a three-file PR waited 7 h behind ~11 half-hour PRs on a box at load 4.8 of 6 cores):
 a checking job hands its next check to the lane's pool and the lane goes on to other jobs; everything else — the gh
 facts, planning, the review, the Δ re-plan and the merge — happens on the lane's own thread, so merges stay serial
-and pinned. The lane keeps at most A.slots_now() checks in flight (LANDER_SLOTS, default 3; 2 while the box is
-overloaded(), 1 under memory pressure) on the box, and up to A.LAPTOP_SLOTS more on the laptop; each box run still takes its box-wide
+and pinned. The lane keeps at most A.slots_now() checks in flight (A.slots(): LANDER_SLOTS from cc-config, else what
+the host's cores and memory hold, read again each minute; 2 while the box is overloaded(), 1 under memory
+pressure) on the box, and up to A.LAPTOP_SLOTS more on the laptop; each box run still takes its box-wide
 admission slot, so another repo's lane can hold this one's check at the door. A job holds one check at a time on the
 box, but its checks that may leave the box run on the laptop side by side, so a red stops the rest of the suite only
 once it is recorded (the ones already in flight finish). A member's lane never sends a check to the laptop. A laptop
@@ -39,9 +40,11 @@ So a small PR waits for at most one check when the box allows one slot, and for 
 WAITS MORE THAN A DAY (idea panel, 2026-10-04: #746 sat ~20 h re-queued, unplanned and unexplained): a job queued
 LANDER_WAIT_CAP seconds ago or more (default 86400) takes its turn before every younger one, small or heavy.
 PUT FIRST: a job `queue --first` stamped (jobs.first) goes before all of these, overdue, heavy or not, oldest stamp
-first; place() says who put it there. An older job sharing its files still goes first (OVERLAP below).
+first; place() says who put it there. An older job sharing its files still goes first, unless it is parked on a held
+PR, directly or down a chain of parks (OVERLAP below).
 OVERLAP FROM THE START: a queued job whose files meet those of a job already planned, checking or mergeable, or of an
-older job parked itself, is not planned yet (`waits for PR #N`, said once; its first park stamps parked_since and
+older job parked itself (unless this job was put first and that chain of parks reaches a held PR, so the park
+waits for nobody), is not planned yet (`waits for PR #N`, said once; its first park stamps parked_since and
 logs `stage <repo>#<pr> parked on=<n>`, once): it is planned from main once that one has merged or left, so two
 changes that overlap don't both burn CPU. A job parked LANDER_WAIT_CAP or longer is planned anyway, since the chain
 of parks is transitive (10-04: ~40 jobs behind one 55-check PR, most sharing no file with it). Overlap found later is
@@ -455,7 +458,9 @@ class Lane:
                     REC.new_nonce(self.repo, J.landq())
                 tried = self.tried = set()
                 self.waiting, self.inflight = set(), {}
-                with futures.ThreadPoolExecutor(max_workers=max(1, A.SLOTS) + A.LAPTOP_SLOTS + EXPRESS_SLOTS,
+                # as wide as the cores, not today's K: the pool outlives a change of K, which takes no restart
+                width = max(A.slots(), os.cpu_count() or 1)
+                with futures.ThreadPoolExecutor(max_workers=width + A.LAPTOP_SLOTS + EXPRESS_SLOTS,
                                                 thread_name_prefix="check") as pool:
                     self.pool = pool
                     moved = self.loop(tried)
@@ -654,19 +659,44 @@ class Lane:
 
     def overlapping(self, job):
         """A job that changes one of this job's files and goes first, or None: one already planned, checking or
-        mergeable, or an older one parked on an overlap itself — so a newer PR never jumps an older one it shares a
-        file with, and overlapping PRs keep their arrival order. None for a job parked WAIT_CAP or longer: it is
-        planned anyway, and the Δ re-plan at mergeable reruns what a real overlap reaches."""
+        mergeable, or an older one parked itself whose park still holds this one (parked_live: not, for a job put
+        first, a park on a held PR) — so a newer PR never jumps an older one it shares a
+        file with, and overlapping PRs keep their arrival order. None for a job parked WAIT_CAP
+        or longer: it is planned anyway, and the Δ re-plan at mergeable reruns what a real overlap reaches."""
         if self.overdue(job, "parked_since"):
             return None
         mine, since = set(job.files), J.arrival(job)
-        for j in J.lane_jobs(self.repo):   # "older" by arrival, not lane order: a job put first still waits (PUT FIRST)
+        jobs, first = J.lane_jobs(self.repo), bool(J.first(job.repo, job.pr))
+        for j in jobs:   # "older" by arrival, not lane order: a job put first still waits (PUT FIRST)
             if j.key == job.key:
                 continue
             if mine & set(j.files) and (j.state in ACTIVE
-                                        or (J.arrival(j) < since and j.state == T.QUEUED and j.extra.get("parked"))):
+                                        or (J.arrival(j) < since and self.parked_live(j, jobs, first))):
                 return j
         return None
+
+    @staticmethod
+    def parked_live(job, jobs, first) -> bool:
+        """`job` is queued and parked, and its park still holds back the job looking. One park waits for nobody:
+        that job was put first (queue --first) and the park, directly or down a chain, is on a held PR. The held PR is not in
+        flight, and what it is held for may be the very PR now looking (10-12: #961 held main-red, #1082 parked on
+        it, and #1121, put first to fix that red, parked on #1082). Only a put-first job passes that way: an ordinary
+        newer one keeps its place behind the older parked one, even one parked on it (a newer job re-queued after a
+        check: the older one never waits on a newer queued job, so it is planned and the two keep arrival order).
+        A park on a PR in flight, merged or gone stands, so the parked job is planned next, in arrival order."""
+        if job.state != T.QUEUED or not isinstance(job.extra.get("parked"), dict):
+            return False
+        if not first:   # planning 10-12: "gate it on J.first(j.repo, j.pr)" — an ordinary job keeps arrival order
+            return True
+        by_pr, seen = {j.pr: j for j in jobs}, {job.pr}
+        while True:
+            on = by_pr.get(job.extra["parked"].get("on"))
+            if on is not None and on.state == T.HELD:
+                return False
+            if on is None or on.state != T.QUEUED or not isinstance(on.extra.get("parked"), dict) or on.pr in seen:
+                return True
+            seen.add(on.pr)
+            job = on
 
     def park(self, job, other, read):
         """`job` waits for `other`. read: its facts were just read from GitHub, so the files are kept (saved) with
@@ -677,9 +707,13 @@ class Lane:
         first = not job.extra.get("parked_since")
         if first:
             job.extra["parked_since"] = E.stamp()
+        park = job.extra.get("parked")
+        moved = not read and isinstance(park, dict) and park.get("on") != other.pr
+        if moved:   # parked_live follows "on": it names the PR this job waits for now
+            park["on"] = other.pr
         if read:
             job.extra["parked"] = {"at": time.time(), "head": job.head, "on": other.pr}
-        if read or first:
+        if read or first or moved:
             J.save(job)
         if first:
             E.stage(job.repo, job.pr, "parked", on=other.pr)

@@ -352,6 +352,8 @@ def cmd_selfcheck():
         me = os.path.realpath(__file__)
 
         def run(trace, *extra):
+            # three slots unless the case names its own: the candidate's own K is its host's, never a case's
+            extra = extra if "--slots" in extra else (*extra, "--slots", "3")
             r = subprocess.run([sys.executable, me, "score", "--candidate", core, "--trace", trace, *extra],
                                capture_output=True, text=True, timeout=120)
             lines = r.stdout.splitlines()

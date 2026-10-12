@@ -1244,6 +1244,97 @@ class Admission(unittest.TestCase):
         self.assertIn("pressure", A.overloaded(self.psi_dir(40.0, 0), calm))
         self.assertEqual(A.psi("memory", "/nonexistent"), 0.0)
 
+    def meminfo(self, kb):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "w") as f:
+            f.write(f"MemTotal:       {kb} kB\nMemFree:        1000 kB\n")
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_host_slots_are_the_cores_and_memory_the_host_has(self):
+        # the tower of 2026-10-12: 20 cores and 30 GB ran 3 slots at load ~9 while PRs waited for one
+        tower = self.meminfo(31918896)
+        with mock.patch.object(A, "MEM_MAX", "6G"):
+            self.assertEqual(A.host_slots(tower, 20), 5)                       # 20 // 2 is 10, and 30 GB holds 5 of 6G
+            self.assertEqual(A.host_slots(self.meminfo(12 * 1024 ** 2), 20), 2)   # memory is the bound
+            self.assertEqual(A.host_slots(tower, 6), 3)                        # the old box keeps its 3
+            self.assertEqual(A.host_slots(tower, 1), 1)                        # never 0
+            self.assertEqual(A.host_slots("/nonexistent", 20), 10)             # no MemTotal: the cores decide
+        with mock.patch.object(A, "MEM_MAX", "infinity"):
+            self.assertEqual(A.host_slots(self.meminfo(1024), 20), 10)         # no per-check cap: the cores decide
+
+    def test_slots_come_from_cc_config_and_are_read_again_unrestarted(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        cfg = os.path.join(d, "config")
+        env = {k: v for k, v in os.environ.items() if k != "LANDER_SLOTS"}
+        env.update(CC_CONFIG=cfg, CC_BIN=os.path.join(os.path.dirname(A.__file__), "..", "bin"))
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(A, "_read", (None, 0.0)), \
+                mock.patch.object(A, "SLOTS", None), mock.patch.object(A, "host_slots", lambda *a, **k: 4):
+            write(d, {"config": "LANDER_SLOTS=7\n"})
+            self.assertEqual(A.slots(now=1000.0), 7)
+            write(d, {"config": "LANDER_SLOTS=2\n"})
+            self.assertEqual(A.slots(now=1000.0 + A.CONFIG_TTL - 1), 7)        # inside the TTL: not asked again
+            self.assertEqual(A.slots(now=1000.0 + A.CONFIG_TTL), 2)            # past it: the lane follows the change
+            for i, bad in enumerate(("0", "three", "", "\u00b2")):   # '²' is a digit to isdigit()
+                write(d, {"config": f"LANDER_SLOTS={bad}\n"})
+                self.assertEqual(A.slots(now=2000.0 * (i + 1)), 4)              # not a K: the host's
+            write(d, {"config": "LANDER_SLOTS=300\n"})
+            with mock.patch("os.cpu_count", return_value=8):
+                self.assertEqual(A.slots(now=8500.0), 8)                       # never more than the cores
+            write(d, {"config": f"LANDER_SLOTS={'9' * 5000}\n"})   # past int()'s 4300 digits: no ValueError
+            with mock.patch("os.cpu_count", return_value=8):
+                self.assertEqual(A.slots(now=8800.0), 8)                       # the cores, like 300
+            os.unlink(cfg)
+            self.assertEqual(A.slots(now=9000.0), 4)                           # unset: the host's
+            with mock.patch.object(A, "SLOTS", 9):
+                self.assertEqual(A.slots(now=9001.0), 9)                       # a caller's fixed K wins
+
+    def test_a_cc_config_missing_or_timing_out_leaves_the_host_k(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        with mock.patch.object(A, "_read", (None, 0.0)), mock.patch.object(A, "SLOTS", None), \
+                mock.patch.object(A, "host_slots", lambda *a, **k: 4):
+            with mock.patch.dict(os.environ, {"CC_BIN": d, "LANDER_SLOTS": "7"}):   # no cc-config in that bin
+                self.assertIsNone(A.config_slots())
+                self.assertEqual(A.slots(now=1000.0), 4)
+            boom = subprocess.TimeoutExpired(["cc-config"], 10)
+            with mock.patch.object(A.subprocess, "run", side_effect=boom):
+                self.assertIsNone(A.config_slots())
+                self.assertEqual(A.slots(now=2000.0), 4)
+
+    def test_alone_waits_for_a_slot_past_its_own_k(self):
+        # brief: "an 'alone' re-run ... runs beside checks on slots 4-8" when K rose 3 to 8 under it
+        st = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, st)
+        calm = self.psi_dir(0, 0)
+        with contextlib.ExitStack() as busy:
+            self.assertEqual(busy.enter_context(A.slot(st, psi_root=calm, k=8)), [1])
+            self.assertEqual(busy.enter_context(A.slot(st, psi_root=calm, k=8)), [2])   # past an alone run's K of 1
+            busy.close()
+            far = contextlib.ExitStack()
+            first = busy.enter_context(A.slot(st, psi_root=calm, k=8))
+            self.assertEqual(far.enter_context(A.slot(st, psi_root=calm, k=8)), [2])
+            self.assertEqual(first, [1])
+            busy.close()   # slot 1 free, slot 2 still busy: an alone run counting K=1 still waits
+            with self.assertRaises(TimeoutError):
+                with A.slot(st, alone=True, psi_root=calm, k=1, poll=0.05, deadline=0.2, say=lambda _: None):
+                    pass
+            far.close()
+        with A.slot(st, alone=True, psi_root=calm, k=1) as mine:   # nothing busy: it runs
+            self.assertEqual(mine, [1])
+            with self.assertRaises(TimeoutError):   # and while it runs, no check takes slot 2 beside it
+                with A.slot(st, psi_root=calm, k=8, poll=0.05, deadline=0.2, say=lambda _: None):
+                    pass
+
+    def test_slots_now_backs_off_from_the_new_k(self):
+        calm, hot = self.calm_load, self.loadavg(2.0 * (os.cpu_count() or 1))
+        with mock.patch.object(A, "slots", lambda: 6):
+            self.assertEqual(A.slots_now(self.psi_dir(1.0, 50.0), None, calm), 6)
+            self.assertEqual(A.slots_now(self.psi_dir(1.0, 99.9), None, calm), 2)   # cpu pressure keeps two
+            self.assertEqual(A.slots_now(self.psi_dir(0, 0), None, hot), 2)         # so does the load average
+            self.assertEqual(A.slots_now(self.psi_dir(40.0, 1.0), None, calm), 1)   # memory pressure keeps one
+
     def test_slots_admit_k_then_wait_and_alone_takes_them_all(self):
         st = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(st))
@@ -1595,6 +1686,9 @@ class Admission(unittest.TestCase):
         older = open(older_name, "a")
         fcntl.flock(older, fcntl.LOCK_EX)
         self.assertTrue(self._until(lambda: free(slot1)))   # it let slot 1 go to the older ticket
+        # and the ALONE GATE with it: kept, the older waiter's check could never take it shared, and the two wait
+        # on each other forever
+        self.assertTrue(self._until(lambda: free(os.path.join(st, "slots", "alone"))))
         older.close()
         os.unlink(older_name)
         two.close()

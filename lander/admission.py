@@ -1,6 +1,13 @@
 """Admission: how many checks run at once, and the limits each runs under (review S8).
 
-SLOTS. K = LANDER_SLOTS (default 3) box-wide slots, each a flock on `<state>/slots/slot.<n>`. The box's load is
+SLOTS. K = slots() box-wide slots, each a flock on `<state>/slots/slot.<n>`. K is LANDER_SLOTS as cc-config reads
+it (the environment, then ~/.cc/config) when that is a whole number of at least 1; otherwise the host's own: one slot
+per CORES_PER_SLOT (2) cores, and no more than MemTotal holds of LANDER_MEM_MAX, the most one check may use (on
+2026-10-12 a box of 20 cores and 30 GB ran 3, at load ~9 with PRs and green runs queued for a slot; it now runs 5,
+which its memory bounds, and the old box's 6 cores still run 3). Never below 1, and a LANDER_SLOTS above the box's
+cores counts as its cores. cc-config is asked again once CONFIG_TTL (60) seconds have passed, so a running lane follows a new
+value without a restart; a cc-config that does not answer counts as unset. The backoff below applies to K either
+way. The box's load is
 mostly not the lander's, so a load average would give one slot nearly always; pressure is the signal instead. When
 /proc/pressure/memory `some avg10` reaches PSI_MEM (default 20) or /proc/pressure/cpu `some avg10` reaches PSI_CPU
 (default 99.5 — this box idles near 98, so only a saturated one counts), the box is loaded(). It is overloaded() when it is
@@ -11,6 +18,9 @@ mergeable job's short check; each lane runs at most lane.EXPRESS_SLOTS of them a
 lane, and none while mem_loaded()) takes no slot and no ticket. A diagnostic rerun takes every
 slot at once (alone=True), so it runs by itself; it takes them in order and never past a busy one, because one
 lane now runs several checks at once and two alone runs each holding a slot would wait on each other forever.
+ALONE GATE: K is read per process, so two callers can disagree on it (LANDER_SLOTS raised, or one's cc-config did
+not answer) and slots 1..K alone would leave a busy slot past K. So an alone run first takes `<state>/slots/alone`
+exclusively, which it gets only once no check holds a slot, and every other check holds it shared beside its slot.
 
 FAIR WAIT (2026-10-01/02: worker green runs sat 2-8 h in the poll loop while a lane re-took slot.1 the moment it
 let go). Every wait takes a ticket, a flocked file in `<state>/slots/queue/` named by when it began, and only the
@@ -66,13 +76,17 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import time
 import uuid
 
 from lander import types as T
 
-SLOTS = int(os.environ.get("LANDER_SLOTS", "3") or 3)
+SLOTS: int | None = None   # a fixed K for a caller that sets it (cc-replay --slots); None: slots() works it out
+CORES_PER_SLOT = 2
+CONFIG_TTL = 60.0
+MEMINFO = "/proc/meminfo"
 PSI_MEM = float(os.environ.get("LANDER_PSI_MEM", "20"))
 PSI_CPU = float(os.environ.get("LANDER_PSI_CPU", "99.5"))
 PSI_LAPTOP = float(os.environ.get("LANDER_PSI_LAPTOP", "25"))
@@ -137,8 +151,61 @@ def overloaded(root: str = PSI_DIR, loadavg: str | None = None) -> str:
     return f"load {l1:.1f} on {n} cores (at least {LOAD_FACTOR:g}x)" if l1 >= LOAD_FACTOR * n else ""
 
 
+def _bytes(size: str) -> int | None:
+    """A systemd size (`6G`, `512M`, plain bytes) in bytes; None for `infinity`, a percentage or anything else."""
+    m = re.fullmatch(r"([0-9]+)([KMGT]?)", (size or "").strip().upper())
+    return int(m.group(1)) * 1024 ** ("KMGT".index(m.group(2)) + 1 if m.group(2) else 0) if m else None
+
+
+def host_slots(meminfo: str | None = None, cores: int | None = None) -> int:
+    """The host's own K: one slot per CORES_PER_SLOT cores, and no more than MemTotal / MEM_MAX. At least 1. A
+    MemTotal or MEM_MAX that will not read leaves the cores alone to decide."""
+    k = (cores or os.cpu_count() or 1) // CORES_PER_SLOT
+    cap, total = _bytes(MEM_MAX), None
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        with open(meminfo or MEMINFO) as f:
+            total = next((int(line.split()[1]) * 1024 for line in f if line.startswith("MemTotal:")), None)
+    if cap and total:
+        k = min(k, total // cap)
+    return max(1, k)
+
+
+def config_slots() -> int | None:
+    """LANDER_SLOTS as cc-config reads it, when it is a whole number of at least 1 (ASCII digits: '²' is a digit to
+    isdigit()), and no more than the box's cores (a number too long for int(), which refuses past 4300 digits, is
+    taken as above them); None when it is unset, not such a number, or cc-config did not answer."""
+    from lander import jobs as J   # here: jobs imports events, and admission is imported by the runner's every caller
+    try:
+        p = subprocess.run([f"{J.bin_dir()}/cc-config", "get", "LANDER_SLOTS"], capture_output=True, text=True,
+                           timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    v = p.stdout.strip()
+    if p.returncode != 0 or not (v.isascii() and v.isdigit()) or not v.lstrip("0"):
+        return None
+    cores = os.cpu_count() or 1
+    return cores if len(v.lstrip("0")) > 9 else min(int(v), cores)
+
+
+_read: tuple = (None, 0.0)   # (K, when): config_slots() spawns cc-config, and slot() asks every poll (2 s)
+
+
+def slots(now: float | None = None) -> int:
+    """K before any backoff: SLOTS when a caller fixed it, else LANDER_SLOTS from cc-config, else host_slots(),
+    read again once CONFIG_TTL seconds have passed, so a running lane follows a change without a restart."""
+    global _read
+    if SLOTS:
+        return max(1, SLOTS)
+    now = time.monotonic() if now is None else now
+    k, at = _read
+    if k is None or now - at >= CONFIG_TTL:
+        k = config_slots() or host_slots()
+        _read = (k, now)
+    return k
+
+
 def slots_now(root: str = PSI_DIR, k: int | None = None, loadavg: str | None = None) -> int:
-    k = max(1, SLOTS if k is None else k)
+    k = max(1, slots() if k is None else k)
     if not overloaded(root, loadavg):
         return k
     # cpu PSI or the load average: two still run. Memory pressure: one, because parallel checks have run the box
@@ -261,10 +328,11 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
     d = os.path.join(state, "slots")
     q = os.path.join(d, "queue")
     os.makedirs(q, exist_ok=True)
-    total = max(1, SLOTS if k is None else k)
+    total = max(1, slots() if k is None else k)
     say = say or (lambda line: print(line, file=sys.stderr, flush=True))
     t0, said, since = time.monotonic(), None, time.strftime("%H:%MZ", time.gmtime())
     held: list = []
+    gate = None   # the ALONE GATE: exclusive for an alone run, shared beside another's slot
     told: set = set()
     mine, tf = _ticket(q, lane)
     try:
@@ -277,19 +345,27 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                         f"older than {TICKET_CAP / 3600:g} h, so its waiter is taken for stuck")
                 with contextlib.suppress(OSError, ValueError):   # only say(): a gone or closed stderr
                     say(line)
-            for n in want if not ahead else ():   # only the oldest waiter takes a slot
+            if alone and not ahead and gate is None:
+                gate = _gate(d, fcntl.LOCK_EX)   # none while any check holds a slot, whatever K it counted
+            for n in want if not ahead and (gate or not alone) else ():   # only the oldest waiter takes a slot
                 if n in [h for h, _ in held]:
                     continue
                 f = open(os.path.join(d, f"slot.{n}"), "a")
                 try:
                     fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    held.append((n, f))
-                    if not alone:
-                        break
                 except OSError:
                     f.close()
                     if alone:   # in order, never past a busy one: two alone runs holding a slot each would wait forever
                         break
+                    continue
+                if not alone:
+                    gate = _gate(d, fcntl.LOCK_SH)
+                    if gate is None:   # an alone run holds the box
+                        f.close()
+                        break
+                held.append((n, f))
+                if not alone:
+                    break
             if held and (not alone or len(held) == total):
                 break
             if deadline is not None and time.monotonic() - t0 > deadline:
@@ -309,6 +385,9 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
                 for _, f in held:
                     f.close()
                 held = []
+                if gate is not None:
+                    gate.close()
+                    gate = None
             time.sleep(poll)
         with contextlib.suppress(OSError):
             os.unlink(os.path.join(q, mine))
@@ -322,6 +401,20 @@ def slot(state: str, alone: bool = False, poll: float = 2.0, deadline: float | N
             tf.close()
         for _, f in held:
             f.close()
+        if gate is not None:
+            gate.close()
+
+
+def _gate(d: str, how: int):
+    """The ALONE GATE flocked how (LOCK_EX or LOCK_SH) without waiting: the open file, or None when it is held the
+    other way."""
+    f = open(os.path.join(d, "alone"), "a")
+    try:
+        fcntl.flock(f, how | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
 
 
 def scope_available() -> bool:

@@ -3769,6 +3769,98 @@ class Starving(Fixture):
         self.assertIn("[demo] PR #3 waits for PR #2: both change b/y", lines)
         self.assertEqual(self.merged_order(), [1, 2, 3])
 
+    def test_a_park_on_a_held_pr_is_dead_and_a_newer_one_sharing_its_files_is_planned(self):
+        # 10-12: #961 held main-red; #1082 parked on it; #1121, put first to fix that red, parked on #1082
+        def job(pr, state, files, ago, on=None):
+            j = T.Job(repo="demo", pr=pr, head="e" * 40, base_sha="d" * 40, files=list(files), state=state,
+                      extra={"queued_at": E.stamp(time.time() - ago)})
+            if on:
+                j.extra.update(parked={"at": time.time(), "head": j.head, "on": on}, parked_since=E.stamp())
+            J.save(j)
+            return j
+        root = job(1, T.CHECKING, ("a/x",), 300)
+        job(2, T.QUEUED, ("a/x", "b/y"), 200, on=1)
+        new = job(3, T.QUEUED, ("b/y",), 100)
+        J.put_first("demo", 3, "seat")
+        lane = L.Lane("demo", self.units())
+        self.assertEqual(lane.overlapping(new).pr, 2)   # #2's park is live while #1 checks: #3 still waits
+        root.state = T.HELD
+        J.save(root)
+        self.assertIsNone(lane.overlapping(new))        # #1 held: #2 waits for nobody, so #3 goes
+        plain = job(5, T.QUEUED, ("b/y",), 50)            # not put first: it keeps its place behind #2
+        self.assertEqual(lane.overlapping(plain).pr, 2)
+        J.remove(plain)
+        mid = job(4, T.QUEUED, ("c/z",), 250, on=1)     # down a chain: #2 parked on #4, parked on held #1
+        two = self.job(2)
+        two.extra["parked"]["on"] = 4
+        J.save(two)
+        self.assertIsNone(lane.overlapping(new))
+        J.remove(mid)
+        J.remove(root)
+        self.assertEqual(lane.overlapping(new).pr, 2)   # #4 gone (merged or closed): #2 is planned next, #3 waits
+
+    def test_a_newer_job_re_queued_waits_for_the_older_one_parked_on_it(self):
+        # #2 checked first and #1 parked on it; #2 came back queued (no park): #2 must not pass #1 (HANDBACK: [2, 1])
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"a/x": "n\n"})
+        for n in (1, 2):
+            J.submit("demo", n)
+        self.seed(300, "queued_at", 1)
+        self.seed(200, "queued_at", 2)
+        one, two = self.job(1), self.job(2)
+        one.files = two.files = ["a/x"]
+        one.extra.update(parked={"at": time.time(), "head": one.head, "on": 2}, parked_since=E.stamp())
+        J.save(one)
+        J.save(two)
+        lane = L.Lane("demo", self.units())
+        self.assertEqual(lane.overlapping(self.job(2)).pr, 1)   # #1's park on #2 still holds the newer #2 back
+        self.assertIsNone(lane.overlapping(self.job(1)))        # #2 is newer and not in flight: #1 goes
+        self.land()
+        self.assertEqual(self.merged_order(), [1, 2])
+
+    def test_a_re_park_without_a_read_moves_on_to_the_pr_it_waits_for_now(self):
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"a/x": "n\n"})
+        self.pr(3, {"a/x": "n\n"})
+        for n in (1, 2, 3):
+            J.submit("demo", n)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        lane = L.Lane("demo", self.units())
+        job, one, two = self.job(3), self.job(1), self.job(2)
+        job.files = one.files = two.files = ["a/x"]
+        lane.park(job, one, read=True)
+        self.assertEqual(self.job(3).extra["parked"]["on"], 1)
+        at = self.job(3).extra["parked"]["at"]
+        lane.park(self.job(3), two, read=False)
+        self.assertEqual(self.job(3).extra["parked"]["on"], 2)    # saved: parked_live reads the PR it waits for now
+        self.assertEqual(self.job(3).extra["parked"]["at"], at)   # not a read: the files' read time stays
+        self.assertEqual(self.log().count("stage demo#3 parked"), 1)
+
+    def test_the_lane_plans_a_put_first_job_past_a_park_on_a_held_pr(self):
+        # #1 held (main-red, its hold not run out); #2 parked on it; #3, put first, shares b/y with #2 and goes first
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"a/x": "n\n", "b/y": "n\n"})
+        self.pr(3, {"b/y": "n\n"})
+        for n in (1, 2, 3):
+            J.submit("demo", n)
+        self.seed(300, "queued_at", 1)
+        self.seed(200, "queued_at", 2)
+        self.seed(100, "queued_at", 3)
+        one = self.job(1)
+        one.state = T.HELD
+        one.extra["not_before"] = E.stamp(time.time() + 3600)
+        J.save(one)
+        two = self.job(2)
+        two.files = ["a/x", "b/y"]
+        two.extra.update(parked={"at": time.time(), "head": two.head, "on": 1}, parked_since=E.stamp())
+        J.save(two)
+        J.put_first("demo", 3, "seat")
+        _, lines = self.land()
+        self.assertNotIn("PR #3 waits", " ".join(lines))
+        self.assertEqual(self.merged_order(), [3, 2])
+        self.assertEqual(self.job(1).state, T.HELD)
+
     def test_the_first_park_writes_one_queue_log_line(self):
         self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})   # three checks: several wakes while #2 waits
         self.pr(2, {"a/x": "n\n"})
