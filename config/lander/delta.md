@@ -25,7 +25,9 @@ WHAT YOU GET, each block between `<<<name` and `name>>>`:
 WHAT TO DO:
 1. For each prior blocker, decide whether this head resolves it, and put its number in exactly one of three lists.
    `resolved`: the input it named no longer gives the wrong outcome. `moot`: it no longer applies — the change makes
-   it moot, or it lies outside this diff (a repo setting, another PR) and is already true. `unresolved`: it is still
+   it moot, or it lies outside this diff (a repo setting, another PR) and is already true. "Already true" needs
+   evidence you can see in `interdiff`, `diff`, `files` or `brief`; the author's word for it (a code comment, a
+   commit message, `tested`) is not evidence, and without any the blocker is `unresolved`. `unresolved`: it is still
    open in this change. A number in `unresolved` holds the PR back; a number in `moot` holds nothing, so do not put
    a finding you call moot in `unresolved`. A prior `[security]` blocker is never moot: it is `resolved` or
    `unresolved`.

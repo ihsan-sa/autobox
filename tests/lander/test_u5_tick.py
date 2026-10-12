@@ -269,6 +269,18 @@ class Tick(unittest.TestCase):
         self.tick()                                                               # deployed and settled: no timer
         self.assertFalse(os.path.exists(self.arms))
 
+    def test_a_repo_whose_checkout_is_gone_arms_no_timer(self):
+        # 10-02/03: a suite fixture's timer re-armed ~77 times a day for a repo its run had deleted
+        D.record_applied("demo", self.first)
+        self.merged({"app/x": "4\n"})
+        with mock.patch.object(TK, "tip_and_deploy", lambda repo, units: []):
+            self.tick()
+            self.assertTrue(os.path.exists(self.arms))                            # the checkout is there: armed
+            os.unlink(self.arms)
+            shutil.rmtree(J.repo_root("demo"))
+            self.tick()                                                           # the same wait, no checkout: none
+        self.assertFalse(os.path.exists(self.arms))
+
     def test_a_second_tick_skips_a_tip_run_already_going(self):
         with TP.lock("demo") as got:
             self.assertTrue(got)

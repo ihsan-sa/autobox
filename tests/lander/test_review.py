@@ -427,7 +427,7 @@ class TestReview(Case):
         v = self.delta(["1. [scope] PR title — moot now", "2. [correctness] x.py — still wrong"],
                        moot=["1"], unresolved=["2"])
         self.assertEqual((v.verdict, v.unresolved), (T.HANDBACK_VERDICT, ["2"]))
-        self.assertEqual(v.blocking, ["still open from the earlier read: 2"])
+        self.assertEqual(v.blocking, ["[correctness] still open from the earlier read: x.py — still wrong"])
 
     def test_a_blocker_called_both_moot_and_unresolved_stays_open(self):
         v = self.delta(["1. [correctness] x.py — bug"], moot=["1"], unresolved=["1"])
@@ -437,7 +437,7 @@ class TestReview(Case):
         rows = ["1. [security] x.py — the token leaks", "2. [scope] PR title — moot"]
         v = self.delta(rows, moot=["1", "2"])
         self.assertEqual((v.verdict, v.unresolved, v.resolved), (T.HANDBACK_VERDICT, ["1"], ["2"]))
-        self.assertIn("the token leaks", v.blocking[0])
+        self.assertEqual(v.blocking, ["[security] still open from the earlier read: x.py — the token leaks"])
         v = self.delta(rows, resolved=["1"], moot=["2"])   # a read that resolves it lands
         self.assertEqual((v.verdict, v.blocking, sorted(v.resolved)), (T.LAND, [], ["1", "2"]))
 
@@ -445,6 +445,46 @@ class TestReview(Case):
         self.assertIn("moot", R.SCHEMA["properties"])
         self.assertIn("`moot`", R.load_prompt("delta.md"))
         self.assertIn("moot", R.strict(R.SCHEMA)["required"])   # codex's closed schema asks for it too
+
+    def test_a_carried_blocker_keeps_its_text_and_kind_tag_every_round(self):
+        """An unresolved prior row is carried with its own text and its [security] tag in front, so a delta read of
+        that handback still has a [security] row to pin; a row the read resolved is not carried."""
+        answer = lambda verdict, unresolved: (0, json.dumps({"type": "result", "total_cost_usd": 0.1,  # noqa: E731
+                                                             "structured_output": {
+            "verdict": verdict, "blocking": [], "advisory": [], "resolved": ["2"], "unresolved": unresolved}}))
+        prior = T.Verdict(verdict=T.HANDBACK_VERDICT, digest="0dd", extra={"head": "c" * 40},
+                          blocking=["[security] x.py — leaks the token", "[correctness] y.py — off by one"])
+        self.box(claude=answer("LAND", ["1"]))
+        v = R.delta_review(self.job(), prior, comments=[])
+        self.assertEqual((v.verdict, v.blocking),
+                         (T.HANDBACK_VERDICT, ["[security] still open from the earlier read: x.py — leaks the token"]))
+        self.box(claude=answer("LAND", ["1"]))
+        again = R.delta_review(self.job(), v, comments=[])
+        self.assertEqual(again.blocking, v.blocking)   # the next round: still tagged, the prefix not doubled
+
+    def test_a_handback_with_no_new_blocker_carries_the_prior_rows(self):
+        answer = (0, json.dumps({"type": "result", "total_cost_usd": 0.1, "structured_output": {
+            "verdict": "HANDBACK", "blocking": [], "advisory": [], "resolved": [], "unresolved": ["1"]}}))
+        prior = T.Verdict(verdict=T.HANDBACK_VERDICT, digest="0dd", extra={"head": "c" * 40},
+                          blocking=["[scope] z.py — not in the brief"])
+        self.box(claude=answer)
+        v = R.delta_review(self.job(), prior, comments=[])
+        self.assertEqual(v.blocking, ["[scope] still open from the earlier read: z.py — not in the brief"])
+        self.box(claude=(0, answer[1].replace('"unresolved": ["1"]', '"unresolved": []').replace('"resolved": []',
+                                                                                                   '"resolved": ["1"]')))
+        v = R.delta_review(self.job(), prior, comments=[])
+        self.assertEqual((v.verdict, v.blocking), (T.HANDBACK_VERDICT, []))   # nothing open, nothing carried
+
+    def test_a_security_pin_holds_in_the_round_after_the_one_that_pinned_it(self):
+        """Round two calls the [security] row moot; pinned() keeps it and its row keeps the tag. Round three calls it
+        moot again and is held again, because the row it was shown still starts with [security]."""
+        rows = ["1. [security] x.py — the token leaks"]
+        v = self.delta(rows, moot=["1"])
+        self.assertEqual(v.blocking, ["[security] still open from the earlier read: x.py — the token leaks"])
+        self.box(claude=(0, json.dumps({"type": "result", "total_cost_usd": 0.1, "structured_output": {
+            "verdict": "LAND", "blocking": [], "advisory": [], "resolved": [], "unresolved": [], "moot": ["1"]}})))
+        again = R.delta_review(self.job(), v, comments=[])
+        self.assertEqual((again.verdict, again.blocking), (T.HANDBACK_VERDICT, v.blocking))
 
     def test_no_diff_for_changed_files_is_incomplete_and_buys_nothing(self):
         box = self.box(claude=claude_says("LAND"), **{"git diff": (1, "fatal: bad object")})
@@ -1293,6 +1333,14 @@ class TestTwoReaders(Case):
 
 
 class TestRecord(Case):
+    def setUp(self):
+        super().setUp()
+        # the base as deploy.verified_tip() gives it when fetch and ls-remote agree; the fake box speaks to neither
+        from lander import deploy as D
+        real = D.verified_tip
+        D.verified_tip = lambda root, base: BASE
+        self.addCleanup(setattr, D, "verified_tip", real)
+
     def facts(self, comments=(), head=HEAD):
         return (0, json.dumps({"headRefOid": head, "baseRefName": "main", "comments": list(comments),
                                "state": "OPEN", "files": [{"path": "x.py"}], "headRefName": "track/x"}))
@@ -1327,6 +1375,26 @@ class TestRecord(Case):
     def test_record_refuses_land_over_a_standing_handback(self):
         d = R.change_digest(DIFF)
         box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. [correctness] x"])])})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 1)
+        self.assertEqual(box.called("gh pr comment"), [])
+
+    def test_record_refuses_when_the_change_digest_cannot_be_computed(self):
+        """A transient git failure once made the digest '' and a marker with 'change= ' was posted, which lander-self
+        skipped as no read at all. The same call with git answering posts; failing, it posts nothing."""
+        box = self.box(**{"gh pr view": self.facts()})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 0)
+        self.assertRegex(box.called("gh pr comment")[0]["input"], r"change=[0-9a-f]{40} base=[0-9a-f]{12} ")
+        box = self.box(**{"gh pr view": self.facts(), "git diff": (1, "fatal: bad object")})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 1)
+        self.assertEqual(box.called("gh pr comment"), [])
+
+    def test_record_refuses_when_the_base_cannot_be_verified(self):
+        from lander import deploy as D
+        box = self.box(**{"gh pr view": self.facts()})
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 0)   # set up's BASE: it posts
+        self.assertIn(f"base={BASE[:12]} ", box.called("gh pr comment")[0]["input"])
+        D.verified_tip = lambda root, base: ""   # fetch and ls-remote disagree: no base the lander may trust
+        box = self.box(**{"gh pr view": self.facts()})
         self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "seat"), 1)
         self.assertEqual(box.called("gh pr comment"), [])
 

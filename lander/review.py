@@ -2,7 +2,9 @@
 
     lander record <repo> <pr> LAND|HANDBACK --by <who> [--head <sha>] [--findings TEXT|-]
                                      write a read a seat made as the PR's marker comment; refused if --head moved,
-                                     or if it is looser than a HANDBACK already standing (old words map as below)
+                                     if it is looser than a HANDBACK already standing (old words map as below), or
+                                     if the head, the base or the change digest cannot be worked out right now (a
+                                     marker with an empty change= matches no reader, so nothing is posted)
     lander will-review <repo> <pr>   exit 0 when the lander would buy a read for this PR at its head, else 1
 
 ONE READ PER CHANGE DIGEST. The digest is digest_of(): change_digest() of `git diff base...head` as plain_diff()
@@ -75,7 +77,11 @@ blockers numbered; it answers resolved/unresolved/moot and new blockers on added
 A prior blocker the read lists as moot (the change makes it no longer apply, or it lies outside the diff and is
 already true) holds nothing and counts as resolved; one it lists as both moot and unresolved stays unresolved, and an
 unresolved one is a HANDBACK whatever the verdict word says. A prior [security] blocker is never moot (pinned()): it
-stays unresolved, and the HANDBACK stands, until a read resolves it.
+stays unresolved, and the HANDBACK stands, until a read resolves it. "Already true" needs evidence in the read's
+inputs, not the author's word (delta.md says so; no code can check it). Each prior blocker left unresolved is
+carried into the verdict as a blocking row with the prior row's own text and its kind tag in front,
+"[security] still open from the earlier read: …" (carried()), whatever the reader's verdict word and whether or
+not it named new blockers, so pinned() finds the [security] row again in the round after, and every round.
 
 A LAND with advisory findings files ONE follow-up row, review-followup-pr<N> (board.followup).
 
@@ -252,7 +258,8 @@ def load_prompt(name):
 
 
 def parse(answer, digest, model="", tokens=0):
-    """The model's answer -> Verdict. Anything that is not the schema's object is None (nothing read the diff)."""
+    """The model's answer -> Verdict. Anything that is not the schema's object is None (nothing read the diff).
+    Its unresolved prior blockers become blocking rows only once _buy() has run carried() on it."""
     try:
         j = json.loads(answer)
     except (TypeError, ValueError):
@@ -269,10 +276,8 @@ def parse(answer, digest, model="", tokens=0):
     unresolved = [str(x) for x in j.get("unresolved") or []]
     moot = [str(x) for x in j.get("moot") or [] if str(x) not in unresolved]
     verdict = j["verdict"]
-    if verdict == T.LAND and (blocking or unresolved):   # a blocker is a blocker whatever the verdict word says,
-        verdict = T.HANDBACK_VERDICT                     # and so is an earlier blocker the read says is still open
-        if not blocking:
-            blocking = [f"still open from the earlier read: {x}" for x in unresolved][:10]
+    if verdict == T.LAND and blocking:   # a blocker is a blocker whatever the verdict word says
+        verdict = T.HANDBACK_VERDICT
     return T.Verdict(verdict=verdict, digest=digest, blocking=blocking, advisory=advisory, model=model,
                      tokens=int(tokens or 0), resolved=[str(x) for x in j.get("resolved") or []] + moot,
                      unresolved=unresolved, extra={"moot": moot} if moot else {})
@@ -290,9 +295,33 @@ def pinned(v, prior):
     v.extra["moot"] = [m for m in v.extra["moot"] if m not in back]
     v.resolved = [r for r in v.resolved if r not in back]
     v.unresolved = v.unresolved + back
-    v.verdict = T.HANDBACK_VERDICT
-    v.blocking = v.blocking + [f"still open from the earlier read (security, not moot): {prior[int(m) - 1]}"
-                               for m in back][:10 - len(v.blocking)]
+    v.verdict = T.HANDBACK_VERDICT   # carried() writes each one's row, its [security] tag in front
+    return v
+
+
+STILL_OPEN = "still open from the earlier read: "
+KIND_TAG = re.compile(r"\[(correctness|security|scope)\] ")
+
+
+def carried(v, prior):
+    """A read's unresolved prior blockers -> blocking rows of their own, first and whatever the verdict word: each is
+    the prior row's text (`unresolved` names it by number) with its kind tag kept in front, so a [security] pin is
+    still a [security] row in the round after, and the round after that. A HANDBACK with no new blocker carries them
+    as a LAND does, and an earlier blocker the read says is still open makes the verdict HANDBACK. A name that is no
+    prior row's number is carried as the reader wrote it. `prior` is the prior verdict's blocking rows, as pinned()
+    takes them. Running it twice on one verdict adds nothing."""
+    rows = list(prior or [])
+    out = []
+    for x in v.unresolved:
+        n = x.strip().rstrip(".")
+        row = rows[int(n) - 1] if n.isdigit() and 1 <= int(n) <= len(rows) else x
+        m = KIND_TAG.match(row)
+        tag, row = (m.group(0), row[m.end():]) if m else ("", row)
+        row = row[len(STILL_OPEN):] if row.startswith(STILL_OPEN) else row
+        out.append(f"{tag}{STILL_OPEN}{row}")
+    if out:
+        v.verdict = T.HANDBACK_VERDICT
+        v.blocking = (out + [b for b in v.blocking if b not in out])[:10]
     return v
 
 
@@ -1277,8 +1306,7 @@ def _buy(job, template, diff, more, prior=None):
             usd += cost
         if v is None:
             return _silent(job, j, model, why)
-        if prior:
-            v = pinned(v, prior)
+        v = carried(pinned(v, prior) if prior else v, prior)   # a first read's stray `unresolved` holds it too
         reads.append((model, v))
         kept[model] = v.to_dict()
         C.write_json(partial(job.digest, template), kept)
@@ -1354,6 +1382,13 @@ def cmd_record(argv):
         return 1
     if facts.get("state") == "MERGED":
         print(f"lander record: PR #{pr} is merged; there is nothing to record a verdict for")
+        return 1
+    # brief: "Make lander record REFUSE (non-zero exit, nothing posted) when it can't compute the change digest or
+    # the base" — a marker with an empty change= is one lander-self's MARK_RE skips, so it is no read at all
+    missing = [n for n, x in (("head", job.head), ("base", job.base_sha), ("change digest", job.digest)) if not x]
+    if missing:
+        print(f"lander record: cannot work out the {' or the '.join(missing)} of PR #{pr} right now, so a marker "
+              "would name no change; nothing posted. Run it again.")
         return 1
     if head and not job.head.startswith(head):
         print(f"lander record: PR #{pr} is at {job.head[:12]} now, not {head[:12]} — the branch moved after that "

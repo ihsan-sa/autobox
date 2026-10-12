@@ -407,6 +407,23 @@ def path_names(paths, n: int = PATHS_SHOWN) -> str:
     return ", ".join(out) + (f" and {more} more" if more > 0 else "")
 
 
+_MARKUP = re.compile(r"[<>&`*~|]")   # Slack mrkdwn: a <@U…>/<!channel> mention or link, code, bold, strike
+_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")   # an ANSI sequence whole: dropping ESC alone leaves "[31m"
+_INVISIBLE = re.compile("[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")   # zero-width and bidi controls
+NOTE_WIDTH = 200
+
+
+def quoted(text, width: int = NOTE_WIDTH) -> str:
+    """A check's own words (a line of a gate's output) for a note a person reads: ANSI sequences, invisible and
+    control characters and markup out, `@` folded, whitespace runs made one space, cut to `width`. The gate prints
+    what it likes, so it must not mention anyone, start a line, or pass its text off as the lander's formatting where
+    the note is shown (#1169's perms finding). `@` is folded as the mail router's _plain() does, since cc-slack turns
+    a bare @handle into a real mention; the invisible characters go first, so one inside a handle can't split it."""
+    s = _INVISIBLE.sub("", _CSI.sub("", str(text or "")))
+    s = " ".join(_MARKUP.sub("", _CONTROL.sub(" ", s)).replace("@", "﹫").split())
+    return s if len(s) <= width else s[:width - 1] + "…"
+
+
 def _fresh(job: T.Job, req: dict) -> None:
     """Back to queued with a clean slate: what a person (or a push) asked for starts again; reads_used and the
     prior verdict stay, since the reads cap is per change family, not per queue. Only CARRY comes from `req`."""

@@ -74,7 +74,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              it, still checking, for 40+ min; ai-ee #99 checked a stale head for 50 min). FAILED (a red run.judge
              saw twice on the same tree) -> handback; a red then green passes and logs `flake <repo>#<pr> check=<n>`;
              blocked-by-main (red on the base tree too) -> held 15 min and planned again from main then, not blamed;
-             a check the manifest lacks -> query "planning"; UNRUNNABLE -> held 15 min, the 3rd -> query. Then,
+             a check the manifest lacks -> query "planning"; UNRUNNABLE -> held 15 min, the 3rd -> query, each
+             quoting its reason through jobs.quoted (a gate's output line: no control or markup, 200 chars). Then,
              when the plan is paid, one read (a delta read when a prior verdict exists; none when a LAND is already
              recorded at this digest): INCOMPLETE -> held till the `until` it names (a usage limit's reset; stage
              `deferred`, which no reader counts as running), no read counted; INCOMPLETE with extra host (a
@@ -1081,7 +1082,7 @@ class Lane:
             E.log("flake", job.repo, job.pr, check=n, head=job.head[:12])
         if o.status == T.FAILED:
             return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]})"
-                                      + (f": {o.note}" if o.note else ""))
+                                      + (f": {J.quoted(o.note)}" if o.note else ""))   # a gate's line
         if o.status == RUN.BLOCKED:
             job.extra["main_red"] = {"check": n, "base": job.base_sha, "head": job.head, "waits": 0}
             # design §0: base red too -> blocked-by-main, not blamed; it is planned again from main after the hold
@@ -1092,13 +1093,14 @@ class Lane:
             return self.query(job, f"the plan names checks the manifest at base lacks: {n}", "planning")
         if o.status == T.UNRUNNABLE:
             job.extra["attempts"] = int(job.extra.get("attempts") or 0) + 1
+            note = J.quoted(o.note)   # the note can quote a gate's own output line: shown clean and cut short
             if job.extra["attempts"] >= UNRUNNABLE_TRIES:
                 # the last try's reason goes with the query: "could not run 3 times" alone sent a full /tmp to
                 # planning as a mystery (#1087, 2026-10-11), its cause left in the hold history and a gone log
                 return self.query(job, f"check {n} could not run {UNRUNNABLE_TRIES} times"
-                                       + (f": {o.note}" if o.note else ""), "planning")
+                                       + (f": {note}" if note else ""), "planning")
             return self.hold(job, f"check {n} could not run (try {job.extra['attempts']} of "
-                                  f"{UNRUNNABLE_TRIES}): {o.note}", kind="box")
+                                  f"{UNRUNNABLE_TRIES}): {note}", kind="box")
         if (job.extra.get("main_red") or {}).get("check") == n:
             job.extra.pop("main_red", None)   # the check main was red on passes: main is green on it again
         job.results[n] = o.results[0].key if o.results else ""

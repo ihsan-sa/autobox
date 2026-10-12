@@ -35,6 +35,7 @@
             while the tip is not red. `systemd-run --user --on-active=<secs> --unit=lander-tick-<repo>-<epoch>
             <core/bin/lander> tick --repo <repo> --rearm`, skipped when the user manager's list-timers shows an
             active lander-tick-<repo>-* timer. No unit files are written, and nothing depends on a caller ticking.
+            A repo with no checkout (repo_root is not a directory) is never armed, so a gone repo's timer dies.
             $LANDER_SYSTEMD_RUN and $LANDER_SYSTEMCTL replace the two binaries (the tests' fakes).
 """
 from __future__ import annotations
@@ -241,6 +242,11 @@ def rearm(repos) -> list:
     lander = os.path.join(J.CORE, "bin", "lander")
     lines = []
     for repo in repos:
+        # A repo with no checkout arms nothing: a suite's fixture (_cctest<pid>) is deleted when its run ends, and its
+        # timer kept re-arming for that gone repo about 77 times a day across two releases (10-02/03). This tick is
+        # the last; the left-over state waits for a checkout that will not come back.
+        if not os.path.isdir(J.repo_root(repo)):
+            continue
         left = waits(repo)
         if not left:
             continue

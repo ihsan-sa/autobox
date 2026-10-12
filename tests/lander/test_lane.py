@@ -2498,6 +2498,51 @@ class Review(Fixture):
         self.assertEqual(j.state, T.QUERY)
         self.assertEqual(j.extra["why"], "check a could not run 3 times: No space left on device")
 
+    # a gate's output line: an ANSI colour, broadcasts, mrkdwn, a handle split by a zero-width space, a bidi
+    # override, a newline, and far more than fits
+    RAW_NOTE = ("bwrap: \x1b[31m<!channel> *ping* `x` @ada\u200b.byron @channel @here @everyone\u202e\x1b[0m\n"
+                "fake: line " + "y" * 400)
+    CLEAN_NOTE = "bwrap: !channel ping x \ufe6bada.byron \ufe6bchannel \ufe6bhere \ufe6beveryone fake: line y"
+
+    def assert_clean(self, why, prefix):
+        """`prefix` is a regex for the lander's own words before the quoted line."""
+        self.assertRegex(why, "^" + prefix + re.escape(self.CLEAN_NOTE))
+        for c in ("\x1b", "\n", "<", ">", "`", "*", "@", "[31m", "[0m", "\u200b", "\u202e"):
+            self.assertNotIn(c, why)
+        self.assertTrue(why.endswith("…"), why)
+
+    def test_unrunnable_note_is_quoted_clean(self):
+        """A gate's own output line reaches the note without control or markup characters and cut short."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.land(runner=Runner(status={"a": T.UNRUNNABLE}, notes={"a": self.RAW_NOTE}))
+        self.assert_clean(self.job().extra.get("why") or "", re.escape("check a could not run (try 1 of 3): "))
+        self.assertEqual(J.quoted("No space left on device"), "No space left on device")   # a plain reason as it is
+
+    def test_unrunnable_query_quotes_clean(self):
+        """The third try's query, which goes to Slack as the stopped card, carries the same clean line."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        for n in range(3):
+            j = self.job()
+            if j:
+                j.extra["not_before"] = E.stamp(time.time() - 1)
+                J.save(j)
+            self.land(runner=Runner(status={"a": T.UNRUNNABLE}, notes={"a": self.RAW_NOTE}))
+        j = self.job()
+        self.assertEqual((j.state, j.extra["attempts"]), (T.QUERY, 3))
+        self.assert_clean(j.extra.get("why") or "", re.escape("check a could not run 3 times: "))
+
+    def test_failed_handback_quotes_clean(self):
+        """A failed check's handback, kept in the handed record and sent as the stopped card, carries the clean line."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        u, _ = self.land(runner=Runner(status={"a": T.FAILED}, notes={"a": self.RAW_NOTE}))
+        self.assertIsNone(self.job())
+        prefix = r"check a failed on the merge with \S+ \([0-9a-f]+\): "
+        self.assert_clean(J.read_json(J.handed_path("demo", 1))["why"], prefix)
+        self.assert_clean(u["cards"].calls[0][2], prefix)
+
 
 class HeldRereads(Fixture):
     """A held job re-reads the PR's state and head when it is looked at again (2026-09-30: a PR sat closed for days,
@@ -2846,6 +2891,7 @@ class Tick(Fixture):
         self.assertEqual(self.job().state, T.DEPLOY_PENDING)
 
     def test_rearm_arms_one_unit_per_repo(self):
+        os.makedirs(J.repo_root("other"))             # tick skips a repo with no checkout
         for repo, pr in (("demo", 1), ("demo", 2), ("other", 3)):
             J.save(T.Job(repo=repo, pr=pr, state=T.HELD, extra={"not_before": E.stamp(time.time() + 300),
                                                                 "queued_at": E.stamp()}))
