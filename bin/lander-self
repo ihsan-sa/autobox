@@ -25,9 +25,18 @@ A planning seat runs it by hand; the lander never installs itself.
     lander-self promote [REV] [--repo DIR] [--pr N]
         Build ~/.cc/lander/releases/<sha>/ from `git archive` of REV (default origin/main) — committed code only,
         plus the repo's tests/landing-repos/ (the host fallback manifests the lander reads for a repo that ships
-        none) — run that release's `lander selfcheck`, and only if it is green point `current` at it, keeping the
-        one before as `previous`. A releases/<sha> already there is rebuilt beside it and kept only when the two
-        trees are byte-identical; otherwise the fresh build replaces it (a planted or edited release never runs).
+        none) — run that release's `lander selfcheck`, then prove it on main: the release's own `lander sweep` runs
+        every check in origin/main's manifest on this host as its lane runs them (each class's box runner, cc-nosignal
+        unless the check is bare, an admission slot and a scope), what it does not pass runs once more under it and
+        then under the current release, and any check green under the current release and red or unrunnable under the
+        new one refuses the switch by name (a check red under both is main's and does not block; with nothing
+        current, nothing does). Main's list of checks is read by the current release's manifest loader, and a name on
+        it the candidate did not run refuses too. Each sweep runs as a transient `systemd-run --user` service, as the
+        lane does: the user manager's environment, a private TMUX_TMPDIR, and none of the caller's tmux, CC_*
+        variables, sandbox or Landlock domain. The proof is one run capped at PROVE_CAP (an hour). Exit 1 refused,
+        3 when the proof gave no verdict (the cap, a sweep that did not finish); current is unchanged either way.
+        Only if all of that is green point `current` at it, keeping the one before as `previous`. A releases/<sha>
+        already there is rebuilt beside it and kept only when the two trees are byte-identical; otherwise the fresh build replaces it (a planted or edited release never runs).
         REV must be origin/main or an ancestor of it. THE ONE EXCEPTION is the cutover's step 5, which promotes the
         switch PR's head before it merges: `--pr N` allows a REV that is not on main only when it is exactly the
         head GitHub names for OPEN PR #N, and only for a caller that is not a worker or a member session (CC_ROLE,
@@ -35,6 +44,10 @@ A planning seat runs it by hand; the lander never installs itself.
         lane: before its next job each lane sees `current` moved, takes nothing new and starts a lane from the new
         release, so the job in flight ends on the old one and the next job runs the new one. It names the lanes
         running when it moves `current`.
+    lander-self prove [REV] [--repo DIR] [--pr N]
+        promote without the switch: the same refusals for REV, its selfcheck and the proof on main, against
+        `current` (against nothing when REV is current). Run it on a host before that host takes over landing.
+        Exit 0 proven, 1 refused, 3 could not run.
     lander-self rollback [--legacy]
         Point `current` back at `previous` (and `previous` at what current was). --legacy instead sends every
         `cc-land` call to the release pinned by `lander-self legacy` (the old lander, before the switch), and first
@@ -65,6 +78,7 @@ the repo keeps it under, because bin/lander execs `current/core/lander/cli.py`.
 import fcntl
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -414,6 +428,170 @@ def release_green(rel):
     return rc == 0, tail[0]
 
 
+# --- the proof on main: every check of origin/main, run by the candidate as its lane would run it ------------------
+# The owner, 10-12: main went red because #1024 (host checks under cc-nosignal) went live without anyone running
+# every check on main under it. Before `current` moves, the candidate release's own `lander sweep` runs every check in
+# origin/main's manifest on this host, each on the box's runner for its class (bwrap for static, hermetic and timing;
+# the host under cc-nosignal unless the check says bare = true), inside an admission slot and a transient scope:
+# run(), the code the lane calls per check. A check whose `where` has no box is unrunnable there under both releases
+# and so decides nothing. Only what the candidate does not pass is looked at again: once more under the candidate (a
+# red that does not repeat is not the release's, the lane's own rerun rule), then under the current release. "Refuse
+# the switch, naming the checks, if any check green under the current release is red under the candidate"; a check
+# red under the current release too is main's and does not block. One bounded run: PROVE_CAP for all of it. Main's
+# list of checks is the current release's reading of the manifest, and every sweep runs as a user unit (sweep_under).
+
+PROVE_CAP = 3600
+SWEEP_LINE = re.compile(r"^lander sweep: (\S+) (passed|failed|unrunnable) \d+s$", re.M)
+SEAT_ENV = ("TMUX", "TMUX_PANE", "TMUX_TMPDIR", "STY", "WINDOW")
+
+
+def prove_env():
+    """The caller's environment less its seat: no tmux or screen of the pane it was started from and no CC_* (the
+    seat's role, alias, channel), and XDG_RUNTIME_DIR at /run/user/<uid> where `systemd-run --user` finds the
+    manager. Only the systemd-run client and the manifest parse get it; the sweep itself gets the manager's own."""
+    env = {k: v for k, v in os.environ.items() if k not in SEAT_ENV and not k.startswith("CC_")}
+    run = f"/run/user/{os.getuid()}"
+    if os.path.isdir(run):
+        env["XDG_RUNTIME_DIR"] = run
+    return {**env, "PYTHONDONTWRITEBYTECODE": "1"}
+
+
+def passwd_home():
+    """The passwd home, as cards.PASSWD_HOME reads it. Read here and not imported: pin copies lander-self alone to
+    self/<sha>/, with no lander/ beside it (correctness read of 2354c5f3)."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        return "/nonexistent"
+
+
+def private_tmux():
+    """A private TMUX_TMPDIR: under /run/user/<uid> when it takes a directory, else the system temp dir."""
+    run = f"/run/user/{os.getuid()}"
+    if os.access(run, os.W_OK | os.X_OK):
+        try:
+            return tempfile.mkdtemp(prefix="lander-prove-tmux-", dir=run)
+        except OSError:
+            pass
+    return tempfile.mkdtemp(prefix="lander-prove-tmux-")
+
+
+def sweep_under(rel, root, sha, only=(), cap=PROVE_CAP, grace=120):
+    """Release `rel`'s `lander sweep` of commit `sha` in checkout `root` (only: just those checks), on the host as the
+    lane runs it: a transient `systemd-run --user` service like the lane's own, so it has the user manager's
+    environment and none of the caller's (security read, 10-12: a pane's TMUX let a host check's send-keys type
+    into the seat), a private TMUX_TMPDIR, no Landlock domain or sandbox the caller sits in (Opus read: under
+    cc-nosignal the bare checks went red under both releases and passed as main's own), and RuntimeMaxSec at the
+    cap. -> ({check: passed|failed|unrunnable}, why): why is '' when the sweep ran to its end.
+    PATH is the user manager's, which is what the lane's own unit gets: spawn_lane and a re-armed tick set none, and
+    only a tick that `queue` starts runs with tick_path() (correctness read of 2354c5f3: use the lane unit's). HOME
+    is the passwd home, as every lane has it."""
+    import time
+    sysrun = os.environ.get("LANDER_SYSTEMD_RUN") or "systemd-run"
+    unit = f"lander-prove-{os.getpid()}-{int(time.time() * 1000)}"
+    env, home = prove_env(), passwd_home()
+    try:
+        tmux = private_tmux()
+    except OSError as e:
+        return {}, f"no private TMUX_TMPDIR: {e}"
+    argv = [sysrun, "--user", "--wait", "--pipe", "--collect", "--quiet", f"--unit={unit}",
+            f"--property=RuntimeMaxSec={max(1, int(cap))}", "--setenv=PYTHONDONTWRITEBYTECODE=1",
+            f"--setenv=TMUX_TMPDIR={tmux}", f"--setenv=HOME={home}",
+            sys.executable, "-P", os.path.join(rel, "core", "lander", "cli.py"), "sweep", "--repo", root, "--rev", sha]
+    for n in only:
+        argv += ["--only", n]
+    t0 = time.monotonic()
+    try:
+        rc, out, err = sh(argv, timeout=max(1, int(cap)) + grace, env=env, stdin=subprocess.DEVNULL)
+    finally:
+        shutil.rmtree(tmux, ignore_errors=True)
+    got = {m.group(1): m.group(2) for m in SWEEP_LINE.finditer(err)}
+    if rc == 124 and not out:
+        sh([sysrun.replace("systemd-run", "systemctl"), "--user", "stop", unit], timeout=60, env=prove_env())
+        return got, f"stopped at the cap ({int(cap)}s)"
+    if rc not in (0, 1) or not re.search(r"^lander sweep: ", out, re.M):
+        if time.monotonic() - t0 >= cap:
+            return got, f"stopped at the cap ({int(cap)}s)"
+        return got, f"exit {rc}: {(err.strip().splitlines() or ['no output'])[-1][:200]}"
+    return got, ""
+
+
+NAMES = ("import sys; sys.path.insert(0, sys.argv[1]); from lander import check as K, manifest as M\n"
+         "r = K.host_top(sys.argv[2]).work_tree\n"
+         "print('\\n'.join(M.load(r, sys.argv[3], fallback=M.host_fallback(K.repo_name(r))).checks))\n")
+
+
+def names_under(rel, root, sha):
+    """Every check name in commit `sha`'s manifest, as release `rel`'s own loader reads it (the sweep's own load).
+    -> (names, why). The proof takes main's list from the current release, not from the candidate it is judging."""
+    rc, out, err = sh([sys.executable, "-P", "-c", NAMES, os.path.join(rel, "core"), root, sha], timeout=300,
+                      env=prove_env(), stdin=subprocess.DEVNULL)
+    names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    if rc != 0 or not names:
+        return [], f"exit {rc}: {(err.strip().splitlines() or ['it named no check'])[-1][:200]}"
+    return names, ""
+
+
+def prove(cand, cur, run, names=None, cap=PROVE_CAP, clock=None):
+    """Prove release `cand` against `cur` ('' when nothing is current) with run(rel, only, cap) -> (results, why) and
+    names(rel) -> (main's check names, why). -> (blocking checks, lines, why): why is non-empty when no verdict could
+    be had, which refuses the switch too."""
+    clock = clock or __import__("time").monotonic
+    end = clock() + cap
+    got, why = run(cand, (), cap)
+    if why or not got:
+        return [], [], f"the candidate's sweep gave no verdict: {why or 'it named no check'}"
+    lines = [f"candidate: {sum(1 for s in got.values() if s == 'passed')} of {len(got)} check(s) passed"]
+    # Opus read, 10-12: a candidate whose manifest loader drops a check (bare = true, where=) must not pass by not
+    # reporting it, so main's list comes from the current release and a name the candidate did not run blocks.
+    dropped = []
+    if cur and names:
+        want, why = names(cur)
+        if why:
+            return [], lines, f"the current release could not list main's checks: {why}"
+        dropped = sorted(set(want) - set(got))
+        for n in dropped:
+            lines.append(f"{n}: in main's manifest, not run by the candidate  ← REGRESSION")
+    off = sorted(n for n, s in got.items() if s != "passed")
+    if off:
+        again, why = run(cand, off, end - clock())
+        if why:
+            return [], lines, f"the candidate's rerun of {', '.join(off)} gave no verdict: {why}"
+        flaky = [n for n in off if again.get(n) == "passed"]
+        if flaky:
+            lines.append(f"red once, green on the rerun: {', '.join(flaky)}")
+        off = [n for n in off if again.get(n) != "passed"]
+    if not off:
+        return dropped, lines, ""
+    if not cur:
+        lines.append(f"no current release to compare with, so nothing blocks: {', '.join(off)}")
+        return [], lines, ""
+    base, why = run(cur, off, end - clock())
+    if why:
+        return [], lines, f"the current release's run of {', '.join(off)} gave no verdict: {why}"
+    for n in off:
+        lines.append(f"{n}: current {base.get(n, 'not run')} → candidate {got[n]}"
+                     + ("  ← REGRESSION" if base.get(n) == "passed" else "  (main's own, does not block)"))
+    return sorted(dropped + [n for n in off if base.get(n) == "passed"]), lines, ""
+
+
+def proven(rel, cur, root, main):
+    """('', False) when release `rel` keeps every check of origin/main (`main`) that `cur` passes, else (why not,
+    True when no verdict could be had: exit 3, not a refusal's 1). Prints the proof's lines."""
+    print(f"lander-self: proving {os.path.basename(rel)[:12]} on main {main[:12]}: every check, as the lane runs it "
+          f"(cap {PROVE_CAP}s)", flush=True)
+    bad, lines, why = prove(rel, cur, lambda r, only, cap: sweep_under(r, root, main, only, cap),
+                            names=lambda r: names_under(r, root, main))
+    for ln in lines:
+        print(f"  {ln}")
+    if why:
+        return why, True
+    if bad:
+        return (f"{len(bad)} check(s) green on main under the current release are red or not run under the "
+                f"candidate: {', '.join(bad)}"), False
+    return "", False
+
+
 def worker_caller(cwd=None):
     """True for a worker or a member session: CC_ROLE says so, or a .cc/track / .cc/member-facing marker sits in
     the cwd or above it (the marker cc-guard trusts over the env)."""
@@ -493,6 +671,9 @@ def cmd_promote(args, opts):
         unlink("legacy-on")
         print(f"lander-self: {sha[:12]} is already current")
         return 0
+    why, nov = proven(rel, cur, root, main)
+    if why:
+        return die(f"promote: refused, current is unchanged — {why}", 3 if nov else 1)
     if cur:
         swap("previous", cur)
     swap("current", rel)
@@ -503,6 +684,38 @@ def cmd_promote(args, opts):
     if busy:
         print(f"lander-self: lanes running for {', '.join(busy)}: each finishes its job and switches to {sha[:12]} "
               f"before the next (`lander-self status` shows them)")
+    return 0
+
+
+def cmd_prove(args, opts):
+    """promote's checks and its proof on main, without the switch: what a host runs before it takes over landing."""
+    root = repo_of(opts.get("repo", ""))
+    if len(args) > 1 or not root:
+        return die("usage: lander-self prove [REV] [--repo DIR] [--pr N]", 2)
+    for ln in pin_remotes(root):
+        print(f"lander-self: {ln}")
+    main = main_sha(root)
+    if not main:
+        return die(f"prove: cannot fetch origin/main in {root}, or it differs from what origin names", 3)
+    sha = resolve(root, args[0]) if args else main
+    if not sha:
+        return die(f"prove: cannot resolve {args[0]}", 3)
+    why = promotable(root, sha, opts.get("pr", ""), main=main)
+    if why:
+        return die(f"prove: refused — {why}")
+    try:
+        rel = build(root, sha, "releases")
+    except RuntimeError as e:
+        return die(f"prove: {e}", 3)
+    ok, tail = release_green(rel)
+    if not ok:
+        return die(f"prove: {sha[:12]}'s own selfcheck is red: {tail}")
+    cur = link_target("current")
+    why, nov = proven(rel, "" if cur == os.path.realpath(rel) else cur, root, main)
+    if why:
+        return die(f"prove: {sha[:12]} is not proven — {why}", 3 if nov else 1)
+    print(f"lander-self prove: {sha[:12]} keeps every check green on main {main[:12]}"
+          + ("" if cur and cur != os.path.realpath(rel) else " (no other release to compare with)"))
     return 0
 
 
@@ -991,12 +1204,27 @@ def selfcheck():
         os.makedirs(os.path.join(repo, "core", "lander"))
         os.makedirs(os.path.join(repo, "core", "bin"))
         cli = os.path.join(repo, "core", "lander", "cli.py")
+        # the sweep's user unit, faked: record what the client was handed, then run the command with the --setenv
+        # values alone, as a user manager would; the fake releases' manifest names one check, `demo`
+        sysrun = os.path.join(t, "systemd-run")
+        with open(sysrun, "w") as f:
+            f.write(f"#!{sys.executable}\nimport json, os, sys\na = sys.argv[1:]\n"
+                    f"json.dump({{'argv': a, 'env': dict(os.environ)}},\n"
+                    f"          open({os.path.join(t, 'sysrun.json')!r}, 'w'))\n"
+                    "env = {'PATH': '/usr/bin:/bin'}\nwhile a[0].startswith('--'):\n"
+                    "    if a[0].startswith('--setenv='):\n        env.update([a[0][9:].split('=', 1)])\n"
+                    "    a = a[1:]\nos.execve(a[0], a, env)\n")
+        os.chmod(sysrun, 0o755)
+        old_sysrun, os.environ["LANDER_SYSTEMD_RUN"] = os.environ.get("LANDER_SYSTEMD_RUN"), sysrun
+        real_names = names_under
+        globals()["names_under"] = lambda rel, root, sha: (["demo"], "")  # noqa: E731
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
                "GIT_COMMITTER_EMAIL": "t@t"}
 
         def commit(rc_word, msg):
             with open(cli, "w") as f:
-                f.write(f"import sys; print('lander selfcheck: 1 passed'); sys.exit({rc_word})\n")
+                f.write("import sys; print('lander selfcheck: 1 passed'); print('lander sweep: 1 passed'); "
+                        f"sys.stderr.write('lander sweep: demo passed 0s\\n'); sys.exit({rc_word})\n")
             with open(os.path.join(repo, "core", "bin", "lander-self"), "w") as f:
                 f.write(f"# {msg}\n")
             with open(os.path.join(repo, "core", "bin", "cc-land"), "w") as f:
@@ -1054,6 +1282,19 @@ def selfcheck():
             leg = link_target("legacy-on")
             r8 = cmd_promote([b], o)
             leg_after = link_target("legacy-on")
+            # the proof on main: a candidate that turns a check red which the current release passes is refused
+            real_sweep = sweep_under
+            globals()["sweep_under"] = lambda rel, root, sha, only=(), cap=0: (  # noqa: E731
+                {"demo": "passed" if os.path.realpath(rel) == link_target("current") else "failed"}, "")
+            try:
+                r_regress = cmd_promote([a], o)
+                cur_regress = link_target("current")
+                globals()["sweep_under"] = lambda rel, root, sha, only=(), cap=0: (  # noqa: E731
+                    {}, "stopped at the cap (1s)")
+                r_nov = cmd_promote([a], o)
+            finally:
+                globals()["sweep_under"] = real_sweep
+            cur_nov = link_target("current")
             r_side = cmd_promote([side], o)
             cur_side = link_target("current")
             r_pin_side = cmd_pin([], o)
@@ -1130,6 +1371,11 @@ def selfcheck():
         case("rollback --legacy with nothing pinned refuses", r5 != 0)
         case("legacy pins and rollback --legacy points at it", r6 == 0 and r7 == 0 and leg.endswith(a))
         case("promote clears the legacy switch", r8 == 0 and leg_after == "")
+        case("promote passes the proof when the candidate's sweep is green", r2 == 0 and r8 == 0)
+        case("promote refuses a candidate whose sweep turns a current green red, current kept",
+             r_regress == 1 and cur_regress == cur_b)
+        case("promote whose proof gives no verdict exits 3 (could not run), not 1, and keeps current",
+             r_nov == 3 and cur_nov == cur_b)
         case("a commit not on origin/main is refused", r_side != 0 and cur_side == cur_b)
         case("origin/main resolves to origin's, not to a local branch named origin/main",
              resolve(repo, "origin/main") == red and resolve(repo, "") == red)
@@ -1169,7 +1415,13 @@ def selfcheck():
             if role is not None:
                 os.environ["CC_ROLE"] = role
         rollback_legacy_cases(case, t)
+        prove_cases(case, t, real_names)
         status_lane_cases(case, t)
+        globals()["names_under"] = real_names
+        if old_sysrun is None:
+            os.environ.pop("LANDER_SYSTEMD_RUN", None)
+        else:
+            os.environ["LANDER_SYSTEMD_RUN"] = old_sysrun
     # shadow: a job that already names a head, or has no checkout, is left as it is (GitHub is never asked);
     # a second REV is a usage refusal before anything is read
     with tempfile.TemporaryDirectory() as dev:
@@ -1190,6 +1442,141 @@ def selfcheck():
     bad = sum(1 for _, ok in results if not ok)
     print(f"lander-self selfcheck: {len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
+
+
+def prove_cases(case, t, real_names=names_under):
+    """The proof on main: what blocks, what does not, and what gives no verdict. Each case its own fake sweep."""
+    def fake(table, why=None):
+        calls = []
+
+        def run(rel, only, cap):
+            calls.append((rel, tuple(only)))
+            if why and rel in why:
+                return {}, why[rel]
+            res = table[rel][min(sum(1 for c in calls if c[0] == rel), len(table[rel])) - 1]
+            return {n: s for n, s in res.items() if not only or n in only}, ""
+        return run, calls
+
+    green = {"a": "passed", "b": "passed"}
+    run, calls = fake({"cand": [{"a": "passed", "b": "failed"}] * 2, "cur": [green]})
+    bad, lines, why = prove("cand", "cur", run)
+    case("prove names a check green under current and red under the candidate", bad == ["b"] and why == "" and
+         any("b: current passed → candidate failed  ← REGRESSION" in ln for ln in lines))
+    case("…and runs only the candidate's reds again, under both",
+         calls == [("cand", ()), ("cand", ("b",)), ("cur", ("b",))])
+    run, _ = fake({"cand": [{"a": "passed", "b": "failed"}] * 2, "cur": [{"a": "passed", "b": "failed"}]})
+    bad, lines, why = prove("cand", "cur", run)
+    case("a check red under the current release too is main's and does not block",
+         bad == [] and why == "" and any("main's own" in ln for ln in lines))
+    run, calls = fake({"cand": [{"a": "passed", "b": "failed"}, green], "cur": [green]})
+    bad, _, why = prove("cand", "cur", run)
+    case("a red the candidate's rerun does not repeat does not block, and current is not asked",
+         bad == [] and why == "" and all(c[0] == "cand" for c in calls))
+    run, _ = fake({"cand": [{"a": "unrunnable", "b": "passed"}] * 2, "cur": [green]})
+    case("unrunnable under the candidate where current passes blocks too", prove("cand", "cur", run)[0] == ["a"])
+    run, calls = fake({"cand": [green]})
+    case("an all-green candidate is proven with one sweep", prove("cand", "cur", run)[0] == [] and len(calls) == 1)
+    run, _ = fake({"cand": [{"a": "failed"}] * 2})
+    bad, _, why = prove("cand", "", run)
+    case("with nothing current, nothing blocks", bad == [] and why == "")
+    run, _ = fake({}, why={"cand": "stopped at the cap (3600s)"})
+    case("a candidate sweep with no verdict refuses", "no verdict" in prove("cand", "cur", run)[2])
+    run, _ = fake({"cand": [{"a": "failed"}] * 2}, why={"cur": "exit 3: x"})
+    case("a current run with no verdict refuses", "current release" in prove("cand", "cur", run)[2])
+    run, _ = fake({"cand": [{}]})
+    case("a sweep that names no check refuses", "named no check" in prove("cand", "cur", run)[2])
+    # the replay of 10-12: #1024 put every host check under cc-nosignal; these six read what its Landlock domain hides
+    # and went red on main under it while the release before passed them (#1157, #1158, #1161 then marked them bare)
+    hidden = ["e2e-cc-context", "selfcheck-cc-fence", "selfcheck-cc-member-broker", "selfcheck-cc-member-import",
+              "selfcheck-cc-member-v2", "selfcheck-cc-sandbox"]
+    under = {n: "failed" for n in hidden}
+    run, _ = fake({"cand": [{**under, "selfcheck-cc-guard": "passed"}] * 2,
+                   "cur": [{n: "passed" for n in [*hidden, "selfcheck-cc-guard"]}]})
+    case("the replay of #1024's promote is refused, naming all six checks", prove("cand", "cur", run)[0] == hidden)
+    # a candidate whose loader drops a check reports it nowhere; main's list is the current release's, so it blocks
+    run, _ = fake({"cand": [green], "cur": [green]})
+    bad, lines, why = prove("cand", "cur", run, names=lambda r: (["a", "b", "c"], "") if r == "cur" else ([], "x"))
+    case("a check in main's manifest the candidate did not run blocks, by name",
+         bad == ["c"] and why == "" and any("c: in main's manifest, not run" in ln for ln in lines))
+    case("…and a candidate that runs every listed check passes",
+         prove("cand", "cur", run, names=lambda r: (["a", "b"], ""))[0] == [])
+    run, _ = fake({"cand": [green]})
+    case("no list of main's checks from the current release is no verdict",
+         "could not list" in prove("cand", "cur", run, names=lambda r: ([], "exit 1: x"))[2])
+    # sweep_under reads a real release's stderr lines, and a cap it hits is no verdict
+    rel = os.path.join(t, "fakerel")
+    os.makedirs(os.path.join(rel, "core", "lander"))
+    with open(os.path.join(rel, "core", "lander", "cli.py"), "w") as f:
+        f.write("import sys, time\nif '--only' in sys.argv: time.sleep(5)\n"
+                "sys.stderr.write('lander sweep: x passed 3s\\nlander sweep: y failed 1s\\nnoise\\n')\n"
+                "print('| table |'); print('lander sweep: 1 failed, 1 passed'); sys.exit(1)\n")
+    seat = {"TMUX": "/tmp/tmux-1/default,1,0", "TMUX_PANE": "%3", "CC_ROLE": "planning", "CC_SLACK_ALIAS": "x"}
+    kept = {k: os.environ.get(k) for k in seat}
+    os.environ.update(seat)
+    try:
+        got = sweep_under(rel, t, "s")
+        with open(os.path.join(t, "sysrun.json")) as f:
+            rec = json.load(f)
+        capped = sweep_under(rel, t, "s", ("y",), cap=1, grace=0)
+    finally:
+        for k, v in kept.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    case("sweep_under parses each check's verdict", got == ({"x": "passed", "y": "failed"}, ""))
+    tmux = next((a.split("=", 2)[2] for a in rec["argv"] if a.startswith("--setenv=TMUX_TMPDIR=")), "")
+    case("the sweep runs as a capped user unit with a private TMUX_TMPDIR, gone afterwards",
+         rec["argv"][:2] == ["--user", "--wait"] and "--property=RuntimeMaxSec=3600" in rec["argv"]
+         and tmux.startswith(f"/run/user/{os.getuid()}/" if os.access(f"/run/user/{os.getuid()}", os.W_OK | os.X_OK)
+                             else tempfile.gettempdir()) and "lander-prove-tmux-" in tmux and not os.path.exists(tmux))
+    case("…and the unit gets the passwd home as HOME and the user manager's PATH, as the lane's own unit does",
+         f"--setenv=HOME={pwd.getpwuid(os.getuid()).pw_dir}" in rec["argv"]
+         and not any(a.startswith("--setenv=PATH=") for a in rec["argv"]))
+    # a /run/user/<uid> it cannot write to gives a TMUX_TMPDIR in the temp dir, not a failed proof
+    kept_access = os.access
+    os.access = lambda p, m: False if p.startswith("/run/user/") else kept_access(p, m)  # noqa: E731
+    try:
+        d = private_tmux()
+    finally:
+        os.access = kept_access
+    case("private_tmux falls back to the temp dir when /run/user is not writable",
+         d.startswith(tempfile.gettempdir() + "/lander-prove-tmux-"))
+    shutil.rmtree(d, ignore_errors=True)
+    kept_mk = tempfile.mkdtemp
+    tempfile.mkdtemp = lambda **kw: (_ for _ in ()).throw(OSError("read-only"))
+    try:
+        nov = sweep_under(rel, t, "s")
+    finally:
+        tempfile.mkdtemp = kept_mk
+    case("…and a TMUX_TMPDIR it cannot make is no verdict, not a crash", nov == ({}, "no private TMUX_TMPDIR: read-only"))
+    case("…and its client is handed no seat: no TMUX, TMUX_PANE or CC_*",
+         not any(k in rec["env"] for k in seat) and not any(k.startswith("CC_") for k in rec["env"]))
+    case("sweep_under at its cap gives no verdict", "cap" in capped[1])
+    # main's list of checks comes from a release's own manifest loader, read in a process of its own
+    lr = os.path.join(t, "listrel")
+    os.makedirs(os.path.join(lr, "core", "lander"))
+    for mod, body in (("__init__", ""),
+                      ("check", "import types\nhost_top = lambda p: types.SimpleNamespace(work_tree=p)\n"
+                                "repo_name = lambda r: 'r'\n"),
+                      ("manifest", "import types\nhost_fallback = lambda n: ''\n"
+                                   "load = lambda r, rev, fallback='': types.SimpleNamespace(checks="
+                                   "{'a': 1, 'b': 2} if rev == 'good' else {})\n")):
+        with open(os.path.join(lr, "core", "lander", mod + ".py"), "w") as f:
+            f.write(body)
+    case("names_under lists main's checks as the release's loader reads them",
+         real_names(lr, t, "good") == (["a", "b"], ""))
+    case("names_under naming no check gives no list", real_names(lr, t, "bad")[1] != "")
+    # pin copies lander-self alone to self/<sha>/: the proof runs from there with no lander/ beside it
+    with open(os.path.join(lr, "core", "lander", "cli.py"), "w") as f:
+        f.write("import sys\nsys.stderr.write('lander sweep: a passed 1s\\nlander sweep: b failed 1s\\n')\n"
+                "print('lander sweep: 1 failed, 1 passed'); sys.exit(1)\n")
+    alone = os.path.join(t, "self", "abc123", "lander-self")
+    os.makedirs(os.path.dirname(alone))
+    shutil.copy(os.path.realpath(__file__), alone)
+    rc, out, err = sh([sys.executable, "-P", "-c",
+                       "import json, runpy, sys\ng = runpy.run_path(sys.argv[1], run_name='alone')\n"
+                       "print(json.dumps(g['proven'](sys.argv[2], sys.argv[2], sys.argv[3], 'good')))",
+                       alone, lr, t], cwd=t, timeout=120, stdin=subprocess.DEVNULL)
+    case("a lander-self copied alone proves from there: b red under both releases, a green, nothing blocks",
+         rc == 0 and out.strip().splitlines()[-1:] == ['["", false]'] and "b: current failed" in out)
 
 
 def rollback_legacy_cases(case, t):
@@ -1301,7 +1688,7 @@ def main(argv):
             return die("not pinned: run `lander-self pin` once (it copies the committed tool out of the checkout)", 3)
         os.execv(sys.executable, [sys.executable, "-P", p, *argv])
     args, opts = parse(argv[1:])
-    table = {"pin": cmd_pin, "promote": cmd_promote, "rollback": cmd_rollback, "legacy": cmd_legacy,
+    table = {"pin": cmd_pin, "promote": cmd_promote, "prove": cmd_prove, "rollback": cmd_rollback, "legacy": cmd_legacy,
              "status": cmd_status, "land": cmd_land, "shadow": cmd_shadow, "check": lambda a, o: cmd_check(a, o)[0]}
     if cmd not in table:
         return die(f"no command {cmd!r} (lander-self --help)", 2)

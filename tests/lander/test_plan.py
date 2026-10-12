@@ -219,6 +219,30 @@ class Parsing(unittest.TestCase):
                 self.assertEqual(list(M.load(d, "HEAD", fallback=fb).checks), ["check"])
                 self.assertEqual(M.load(d, "HEAD").checks, {})
 
+    def test_a_repo_with_no_manifest_plans_the_pytest_of_its_host_fallback(self):
+        # a repo that ships no manifest is planned by the release's landing-repos/<repo>.toml; with none it plans 0
+        with tempfile.TemporaryDirectory() as d:
+            fbdir = os.path.join(d, "landing-repos")
+            write(fbdir, {"demo.toml": '[[check]]\nname="pytest"\nrun="python3 -m pytest -q"\npaths=["**"]\n'
+                                       'class="host"\n'})
+            root = os.path.join(d, "demo")
+            os.mkdir(root)
+            git(root, "init", "-q")
+            write(root, {"pytest.ini": "[pytest]\n", "app.py": "x = 1\n", "tests/test_app.py": "def test_x(): pass\n"})
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "base")
+            base = git(root, "rev-parse", "HEAD")
+            write(root, {"app.py": "x = 2\n"})
+            git(root, "commit", "-qam", "head")
+            head = git(root, "rev-parse", "HEAD")
+            with mock.patch.object(M, "FALLBACK_DIR", fbdir), \
+                    mock.patch.dict(os.environ, {"CC_DEV": d}):   # git.taken: $CC_DEV/<repo> is a host checkout
+                fb = M.host_fallback("demo")
+                self.assertEqual(fb, os.path.join(fbdir, "demo.toml"))
+                self.assertEqual(M.host_fallback("other"), "")
+                self.assertEqual(P.plan(root, base, head, ["app.py"], fallback=fb).checks, ["pytest"])
+                self.assertEqual(P.plan(root, base, head, ["app.py"]).checks, [])
+
 
 class AddOnly(unittest.TestCase):
     def two(self, head_text, base_text=CORE_MANIFEST):
