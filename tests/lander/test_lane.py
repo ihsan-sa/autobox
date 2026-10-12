@@ -199,8 +199,9 @@ class Planner:
 
 
 class Runner:
-    def __init__(self, status=None, hook=None, missing=()):
+    def __init__(self, status=None, hook=None, missing=(), notes=None):
         self.status, self.hook, self.calls, self.missing = dict(status or {}), hook, [], set(missing)
+        self.notes = dict(notes or {})   # {name: the Outcome's note}, as run.judge says it (a flake's "flaky: …")
         self.plan_kw = []   # (only, express, lane) of each run_plan call
 
     def run_plan(self, root, m, plan, files, head_tree, base_tree="", *, member="", only=None, **kw):
@@ -215,7 +216,7 @@ class Runner:
                 out[n] = RUN.Outcome(n, T.UNRUNNABLE, "not in the manifest")
                 continue
             r = self.run(T.Check(name=n, run="true"), head_tree, f"member:{member}" if member else "box")
-            out[n] = RUN.Outcome(n, r.status, "", [r])
+            out[n] = RUN.Outcome(n, r.status, self.notes.get(n, ""), [r])
         return out
 
     def run(self, check, tree, where):
@@ -251,8 +252,8 @@ class Rec:
         return lambda *a: self.calls.append((name,) + a)
 
 
-def V(verdict, tokens=100, blocking=()):
-    return T.Verdict(verdict=verdict, digest="", tokens=tokens, blocking=list(blocking))
+def V(verdict, tokens=100, blocking=(), **extra):
+    return T.Verdict(verdict=verdict, digest="", tokens=tokens, blocking=list(blocking), extra=extra)
 
 
 # --- the fixture ---------------------------------------------------------------------------------------------------
@@ -2440,6 +2441,35 @@ class Review(Fixture):
         # the prior verdict is not carried by the lane: the reviewer finds it among the box's own PR markers
         self.assertEqual([c[0] for c in rv.calls], ["review"])
         self.assertEqual(u["cards"].calls[0][3], "planning")
+
+    def test_a_read_the_host_failed_twice_goes_to_planning_never_back_to_the_author(self):
+        # owner, 10-12: "If it fails again, the PR is held with that reason recorded and no fix asked of the author"
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        held = V(T.INCOMPLETE, tokens=0, host=True, cap=True, why="the read hit its own cap twice at abc")
+        u, _ = self.land(planner=Planner(paid=True), reviewer=Reviewer(held))
+        j = self.job()
+        self.assertEqual((j.state, j.reads_used), (T.QUERY, 0))
+        self.assertIn("own cap twice", j.extra["why"])
+        self.assertIsNone(J.read_json(J.handed_path("demo", 1)))   # no handback written
+        self.assertEqual(u["cards"].calls[0][3], "planning")
+        # …while a plain INCOMPLETE (the first failure) is still only held for the retry
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 2)
+        self.land(planner=Planner(paid=True), reviewer=Reviewer(V(T.INCOMPLETE, tokens=0, why="no answer")))
+        self.assertEqual(self.job(2).state, T.HELD)
+
+    def test_a_flaky_check_passes_and_is_logged_by_name(self):
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.land(runner=Runner(notes={"a": "flaky: red, then green on the same tree"}))
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+        self.assertIn("flake demo#1 check=a", self.log())
+        # a check that passed the first time logs no flake
+        self.pr(2, {"a/x": "m\n"})
+        J.submit("demo", 2)
+        self.land(runner=Runner())
+        self.assertNotIn("flake demo#2", self.log())
 
     def test_unrunnable_holds_then_queries(self):
         self.pr(1, {"a/x": "n\n"})

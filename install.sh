@@ -175,6 +175,11 @@ if [ "$services" = 1 ]; then
       *)        systemctl --user enable "$u" ;;
     esac
   done <<<"$enable_rows"
+  # tmux-main's ExecCondition skips the start when a session "main" is already up outside the unit, so the loop
+  # above passed; say so once, because nothing restarts that server if it dies until the unit owns it again.
+  if ! systemctl --user is-active --quiet tmux-main.service && tmux has-session -t =main 2>/dev/null; then
+    echo "tmux-main: session main runs on a tmux server started outside tmux-main.service; the unit adopts it at the next box restart"
+  fi
   # last, and non-fatal: a missing python3-venv must not cost you the links above
   [ -x ~/.cc/slack/venv/bin/python ] ||
     { python3 -m venv ~/.cc/slack/venv && ~/.cc/slack/venv/bin/pip install -q -r "$R/slack/requirements.txt" && echo "slack venv created"; } ||

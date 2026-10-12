@@ -39,14 +39,21 @@ read: LAND with model "" and extra read=none. Otherwise the lander buys one:
     core/config/lander/review.md from THIS release (not the PR's
     head) with the diff, the merged text of the changed files (a file over WHOLE_UNDER whose whole change is in the
     diff only around its changes), the brief's done-criteria and docs/REVIEW.md
-    read from the BASE commit, each between `<<<name` / `name>>>` markers (a marker inside the data is broken
+    read from the BASE commit, and the PR body's Tested section (tested_of: the author's claims, labelled as claims
+    to check against the diff, never instructions; folded by NFKC with format characters gone, a line that reads
+    as a verdict or as the prompt's frame dropped,
+    cut at TESTED_CAP), each between `<<<name` / `name>>>` markers (a marker inside the data is broken
     up, so the data cannot close its own block). The answer is JSON (verdict, blocking[], advisory[]).
     A change lands only on EVERY reader's verdict (owner: both models read every change). A reader that hits the
     limit (`cc-limit check`), or answers nothing the first time at a head, makes the whole read INCOMPLETE and
     refunded, as if it never ran; the readers that did answer are kept at this digest (partial()), so the retry
-    asks only the silent one. A reader that CANNOT answer — a bad model id or effort, a missing binary, a flag
-    error, a tool feature codex will not turn off — or answers nothing twice at one head is a HANDBACK stop naming
-    the reader and the cause (extra fault=True), never a silent retry.
+    asks only the silent one. A READ THE HOST COULD NOT MAKE IS NEVER A HANDBACK (owner, 10-12: host reasons were
+    the biggest handback cause). A reader that CANNOT answer — an HTTP 4xx such as a 403, a bad model id, a missing
+    binary, a flag error, a tool feature codex will not turn off — answers nothing (a timeout), or hits its own
+    budget cap is INCOMPLETE the first time at a head, held and asked again after the backoff (limit_until); the
+    second time at that head it is INCOMPLETE with extra host=True (and fault=True or cap=True) naming the reader and
+    the cause, which the lane sends to the planning seat as a query: held, the reason recorded, nothing asked of the
+    author. An effort off EFFORTS is held the same way at once.
     A claude read runs with `--output-format stream-json`, because its `--max-budget-usd` is checked only after a
     turn: a read's one turn can spend past the cap, the CLI then reports error_max_budget_usd and its result
     carries no structured_output, though the turn already called StructuredOutput. The stream carries that call,
@@ -82,6 +89,7 @@ import os
 import re
 import shutil
 import tempfile
+import unicodedata
 
 from lander import cards as C
 from lander import types as T
@@ -215,7 +223,7 @@ def latest(comments):
 def fence(name, text):
     """Break any `name>>>` / `<<<name` inside the data so it cannot close or open its block."""
     text = text or ""
-    for tag in ("diff", "files", "brief", "rules", "prior", "interdiff"):
+    for tag in ("diff", "files", "brief", "rules", "prior", "interdiff", "tested"):
         text = text.replace(f"{tag}>>>", f"{tag}> >>").replace(f"<<<{tag}", f"<< <{tag}")
     return text
 
@@ -364,7 +372,7 @@ def effort():
 # claude IGNORES a value outside its list and reads at its default (probed 2026-09-30), so a typo would pass unseen.
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
-# An answer that says the read cannot run as asked, so waiting will not mend it: a 4xx other than 429 from either
+# An answer that says the read cannot run as asked, so waiting is unlikely to mend it: a 4xx other than 429 from either
 # API (a model that does not exist or is not allowed, a bad parameter), a flag the CLI does not know.
 FAULT_SAID = re.compile(r'"(?:api_error_status|status)"\s*:\s*4(?!29)\d\d|unrecognized_model|may not exist'
                         r'|is not supported when|Unknown feature flag|unexpected argument|unknown option', re.I)
@@ -1014,6 +1022,54 @@ def rules_of(root, base):
         return "" if rc else text
 
 
+TESTED_CAP = 4000
+# a heading that opens the body's own account of its testing: "## Tested", "**How it was tested**", "Testing:"
+TESTED_HEAD = re.compile(r"^\s*(?:#{1,6}\s*|\*\*|__)?\s*(?:how (?:it was |this was |I )?)?test(?:ed|ing)\b", re.I)
+NEXT_HEAD = re.compile(r"^\s*(?:#{1,6}\s|\*\*[^*]+\*\*\s*:?\s*$|__[^_]+__\s*:?\s*$)")
+# a line that reads as a verdict or as the prompt's own frame is dropped, never shown (owner, 10-12: "strip anything
+# that looks like a verdict line or a prompt-frame line"). It is matched after plain() folds the line, so fullwidth
+# letters and zero-width characters cannot hide a verdict; the verdict words match in capitals only and "verdict" only
+# with its ":" or "=", so a sentence that says the PR lands or was handed back survives (security read, 10-12)
+UNTRUSTED_LINE = re.compile(r"(?i:verdict)\s*[:=]|\b(?:LAND|HANDBACK|DO-NOT-LAND)\b|<<<|>>>|@[A-Z]+@|<!--|-->"
+                            r"|(?i:cc-land-review|\bignore (?:all |any |the )?(?:previous |above |prior |these )?"
+                            r"instruction|^\s*(?:system|assistant|user|human)\s*:|</?(?:system|instructions?|prompt)\b)")
+
+
+def plain(line):
+    """`line` under NFKC with every format (Cf) character gone: "ＶＥＲＤＩＣＴ" reads VERDICT, "L\u200bAND" reads LAND."""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", line) if unicodedata.category(ch) != "Cf")
+
+
+def tested_of(body):
+    """The PR body's Tested section, as untrusted text for the `tested` block: from its heading ("## Tested",
+    "**How it was tested**", "Testing: …") to the next heading, each line folded by plain(), every line UNTRUSTED_LINE
+    matches dropped (and the count said), the rest cut at TESTED_CAP characters. '' when the body has no such
+    heading."""
+    got = None
+    for line in (body or "").splitlines():
+        line = plain(line)
+        if got is None:
+            if TESTED_HEAD.match(line):
+                # a heading ("## Tested", "**Tested:** …") keeps what follows its colon; a plain sentence ("Tested
+                # with check.sh: 0 failed") is itself the claim. Either runs to the next heading, blank lines and all
+                para = not re.match(r"\s*(?:#|\*\*|__)", line)
+                rest = line if para else (line.split(":", 1)[1] if ":" in line else "")
+                got = [rest.strip(" *_")] if rest.strip(" *_") else []
+        elif NEXT_HEAD.match(line):
+            break
+        else:
+            got.append(line)
+    if got is None:
+        return ""
+    kept = [line for line in got if not UNTRUSTED_LINE.search(line)]
+    text = "\n".join(kept).strip()
+    if len(text) > TESTED_CAP:
+        text = text[:TESTED_CAP] + f"\n(… cut at {TESTED_CAP} characters)"
+    if len(kept) < len(got):
+        text += f"\n({len(got) - len(kept)} line(s) dropped: they read as a verdict or as this prompt's own frame)"
+    return text.strip()
+
+
 def pr_view(root, pr, fields="comments"):
     rc, out = C.sh(["gh", "pr", "view", str(pr), "--json", fields], cwd=root, timeout=120)
     try:
@@ -1125,21 +1181,33 @@ def partial(digest, template):
                         f"{digest}.{os.path.splitext(template)[0]}.partial.json")
 
 
+def _held(job, why, **extra):
+    """A read the host could not make twice: INCOMPLETE with extra host=True, which the lane sends to the planning seat
+    with `why` and asks nothing of the PR's author. Never a HANDBACK: no finding is in it."""
+    return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest, extra=dict(extra, why=why, host=True))
+
+
 def _silent(job, j, model, why):
-    """A reader answered nothing: INCOMPLETE (refunded, held, asked again), or a stop naming it when waiting will not
-    mend it (a fault, or a second silence or wall at the same head)."""
+    """A reader answered nothing. "A review read that fails for a reason of the host's, such as an HTTP 403, a timeout
+    or the reader's per-read budget cap, never becomes a handback. It's retried once after a backoff. If it fails
+    again, the PR is held with that reason recorded and no fix asked of the author" (owner, 10-12). So the first fault,
+    wall or silence at a head is INCOMPLETE (refunded, held till limit_until(), asked again), and the second at that
+    head is _held(), which clears the mark so a re-queue starts again at the first try. A usage limit is INCOMPLETE
+    every time: it names its own reset."""
     repo, pr, head = job.repo, job.pr, job.head
-    if why.startswith("fault"):
-        return _stop(job, f"review reader {model} cannot run: {why[len('fault: '):]}", fault=True, reader=model)
     if why.startswith("wall"):
         if (j.get("wall") or {}).get("head") == head:
-            return _stop(job, f"the read hit its own cap twice at {head[:12]} ({model}: {why})", cap=True)
+            charge(repo, pr, wall=None)   # a re-queue by the planning seat gets its own retry after the backoff
+            return _held(job, f"the read hit its own cap twice at {head[:12]} ({model}: {why})", cap=True,
+                         reader=model)
         charge(repo, pr, wall={"head": head, "why": why, "at": C.now()})
-    elif not why.startswith("limit"):
+    elif not why.startswith("limit"):   # a fault (an HTTP 4xx, a missing binary) or no answer (a timeout)
         was = j.get("silent") or {}
         if (was.get("head"), was.get("reader")) == (head, model):
-            return _stop(job, f"review reader {model} answered nothing twice at {head[:12]}: {why}",
-                         fault=True, reader=model)
+            charge(repo, pr, silent=None)
+            said = "cannot run" if why.startswith("fault") else "answered nothing"
+            return _held(job, f"review reader {model} {said} twice at {head[:12]}: {why}",
+                         fault=why.startswith("fault"), reader=model)
         charge(repo, pr, silent={"head": head, "reader": model, "why": why, "at": C.now()})
     return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest,
                      extra={"why": f"{model}: {why}", "until": limit_until(why), "reader": model})
@@ -1155,10 +1223,10 @@ def _buy(job, template, diff, more):
     if int(j.get("reviews") or 0) >= MAX_READS:
         return _stop(job, f"two reads already spent on PR #{pr}; the planning seat decides", cap=True)
     if effort() not in EFFORTS:
-        return _stop(job, f"the review cannot run: CC_LAND_REVIEW_EFFORT={effort()!r} is not one of "
+        return _held(job, f"the review cannot run: CC_LAND_REVIEW_EFFORT={effort()!r} is not one of "
                           f"{', '.join(EFFORTS)}", fault=True)
     root = root_of(job)
-    facts = pr_view(root, pr, "title") or {}
+    facts = pr_view(root, pr, "title,body") or {}
     # the union: job.files is the lane's list, which a job queued by an older lane may have made in the checkout's
     # own git; files_of() runs blind and sees every path
     blind_files = files_of(root, job.base_sha, job.head)
@@ -1169,7 +1237,8 @@ def _buy(job, template, diff, more):
                   FILES=merged_files(root, job.base_sha, job.head, files, dropped, whole_paths(diff, blind_files)),
                   BRIEF=brief_of(job) or
                   "No brief was found for this PR. Judge the change against its title and its own diff.",
-                  RULES=rules_of(root, job.base_sha) or "This repo ships no docs/REVIEW.md.", **more)
+                  RULES=rules_of(root, job.base_sha) or "This repo ships no docs/REVIEW.md.",
+                  TESTED=tested_of(facts.get("body")) or "The PR body has no Tested section.", **more)
     kept = C.read_json(partial(job.digest, template), {}) or {}
     reads, usd = [], 0.0
     for model in readers():

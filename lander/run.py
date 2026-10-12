@@ -43,7 +43,10 @@ mount that is not there, a tree that did not reproduce. failed: anything else.
 JUDGE (a red, per check): the same check on the BASE tree — the lane's shared record when there is one — red there
 too is `blocked-by-main` (main is red, the diff is not blamed); a check the base does not define, or whose run file
 the base lacks, has no base run and its red is the diff's; a red run under load, on either tree, gets ONE diagnostic
-rerun alone (every slot held), and only a base run that stands is shared; green alone passes with a `flaky` note;
+rerun alone (every slot held), and only a base run that stands is shared; a head red that is not main's is run ONCE
+more on the same tree whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except,
+when it was not loaded, a check that guards a gate-first path or that the change touches, whose first red stands; green
+the second time passes with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check);
 a red whose every red line matches a live quarantine row passes with a `quarantined` note — never for a check that
 guards a gate-first path, and never when the change touches the check itself; what is left is `failed`, and goes to
 the failures ledger once (records.record_red).
@@ -658,12 +661,18 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
         if b.status == T.FAILED:
             out.status, out.note = BLOCKED, f"{BLOCKED}:{check.name}"
             return out
-    # design §0: "One diagnostic rerun alone for a red under load"
-    if r.extra.get("loaded"):
-        r2 = go(head_tree, alone=True)
+    # design §0: "One diagnostic rerun alone for a red under load"; and every other red is run once more on the
+    # same tree too, "a gate that goes red is re-run once on the same commit before the PR is handed back" (owner,
+    # 10-12: host-env reds were 27 handbacks): only a red that repeats is the PR's. The unloaded rerun follows
+    # quarantine's rule, "never on security checks or on a PR touching the check" (security read, 10-12: a race in
+    # auth code caught half the time would pass 3 times in 4)
+    loaded = bool(r.extra.get("loaded"))
+    if loaded or (not security and not touched):
+        r2 = go(head_tree, alone=loaded)
         out.results.append(r2)
         if r2.status == T.PASSED:
-            out.status, out.note = T.PASSED, "flaky: red under load, green alone"
+            out.status, out.note = T.PASSED, ("flaky: red under load, green alone" if loaded
+                                              else "flaky: red, then green on the same tree")
             return out
         if r2.status == T.UNRUNNABLE:
             out.status, out.note = T.UNRUNNABLE, r2.extra.get("why", "")

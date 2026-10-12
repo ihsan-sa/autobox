@@ -37,7 +37,9 @@ PLAN_CLASSES = (DOCS, LEAF, WIDE, GATE_FIRST, LANDER, PROTECTED)
 PASSED, FAILED, UNRUNNABLE = "passed", "failed", "unrunnable"
 RESULT_STATUSES = (PASSED, FAILED, UNRUNNABLE)
 
-# Verdict.verdict. INCOMPLETE is a usage or budget wall: the job goes `held`, no read is spent, the next tick retries.
+# Verdict.verdict. INCOMPLETE is a read that did not happen (a usage or budget wall, a reader that failed): the job
+# goes `held`, no read is spent, the next tick retries; with extra host (it failed twice at one head) the job is a
+# query for the planning seat. Only HANDBACK asks the author for a fix.
 LAND, HANDBACK_VERDICT, INCOMPLETE = "LAND", "HANDBACK", "INCOMPLETE"
 VERDICTS = (LAND, HANDBACK_VERDICT, INCOMPLETE)
 

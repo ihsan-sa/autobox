@@ -1738,10 +1738,10 @@ class Judge(unittest.TestCase):
         o = RUN.judge(chk(where=["box", "laptop"]), self.H, self.B, "laptop", runner=run)
         self.assertEqual((o.status, seen), (T.PASSED, ["laptop", "box"]))
         self.assertEqual(o.results[0].extra["laptop_red"], "laptop")
-        # a laptop-only check has no box to ask, so its red stands
+        # a laptop-only check has no box to ask, so its red stands once the laptop says it twice
         seen.clear()
         o = RUN.judge(chk(where=["laptop"]), self.H, "", "laptop", runner=run, on_base=False)
-        self.assertEqual((o.status, seen), (T.FAILED, ["laptop"]))
+        self.assertEqual((o.status, seen), (T.FAILED, ["laptop", "laptop"]))
 
     def test_a_box_red_under_load_is_never_overturned_by_the_laptop(self):
         seen = []
@@ -1845,13 +1845,56 @@ class Judge(unittest.TestCase):
         self.assertEqual(outs["a"].status, RUN.BLOCKED)                # a base that has it still compares
         self.assertEqual(calls.count((r.base, False)), 1)
 
-    def test_a_red_not_under_load_is_not_rerun_and_is_recorded_once(self):
+    def test_a_red_not_under_load_is_rerun_once_on_the_same_tree_and_recorded_once(self):
         run, calls = self.runner({self.H: T.FAILED, self.B: T.PASSED})
         rec = mock.Mock()
         o = RUN.judge(chk(), self.H, self.B, runner=run, record=rec)
-        self.assertEqual(o.status, T.FAILED)
-        self.assertNotIn((self.H, True), calls)
+        self.assertEqual(o.status, T.FAILED)                       # red twice: the PR's
+        self.assertEqual(calls, [(self.H, False), (self.B, False), (self.H, False)])
         rec.assert_called_once()
+
+    def test_a_red_then_green_on_the_same_tree_passes_as_a_flake_and_records_nothing(self):
+        n = [0]
+
+        def run(check, tree, where, alone=False, **kw):
+            n[0] += tree == self.H
+            st = T.FAILED if (tree == self.H and n[0] == 1) else T.PASSED
+            return T.Result(check=check.name, tree=tree, status=st, extra={"why": st})
+        rec = mock.Mock()
+        o = RUN.judge(chk(), self.H, self.B, runner=run, record=rec)
+        self.assertEqual((o.status, o.note), (T.PASSED, "flaky: red, then green on the same tree"))
+        self.assertEqual(n[0], 2)
+        rec.assert_not_called()
+
+    def red_then_green(self):
+        """A runner whose first head run is red and every later run green, and the head runs it made."""
+        n = [0]
+
+        def run(check, tree, where, alone=False, **kw):
+            n[0] += tree == self.H
+            st = T.FAILED if (tree == self.H and n[0] == 1) else T.PASSED
+            return T.Result(check=check.name, tree=tree, status=st, extra={"why": st})
+        return run, n
+
+    def test_a_security_check_red_is_never_rerun_so_a_flaky_red_stands(self):
+        run, n = self.red_then_green()
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run).status, T.PASSED)    # an ordinary check: flake
+        self.assertEqual(n[0], 2)
+        run, n = self.red_then_green()
+        rec = mock.Mock()
+        o = RUN.judge(chk(), self.H, self.B, runner=run, record=rec, security=True)
+        self.assertEqual(o.status, T.FAILED)                       # a race in auth code is the PR's at its first red
+        self.assertEqual(n[0], 1)
+        rec.assert_called_once()
+
+    def test_a_check_the_pr_touches_is_never_rerun_so_a_flaky_red_stands(self):
+        run, n = self.red_then_green()
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run).status, T.PASSED)
+        self.assertEqual(n[0], 2)
+        run, n = self.red_then_green()
+        o = RUN.judge(chk(), self.H, self.B, runner=run, touched=True)
+        self.assertEqual(o.status, T.FAILED)
+        self.assertEqual(n[0], 1)
 
     def test_quarantine_passes_a_matching_red_but_not_for_security_or_a_touched_check(self):
         rows = [("c", "flaky text")]

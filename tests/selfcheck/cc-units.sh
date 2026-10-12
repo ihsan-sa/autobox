@@ -169,6 +169,24 @@ J
     grep -q '^\[Install\]' "$UD/$u" 2>/dev/null || out="$out $u"
   done < <(rows)
   k "$(t test -z "$out")" "every required .service has an [Install] section —${out:- all do}"
+  # tmux-main's ExecCondition, run against a throwaway tmux server on its own socket dir (env -u TMUX, or tmux would
+  # talk to the live server this session sits in). A "main" the unit does not own reads as up and skips the start
+  # (2026-10-12: every deploy failed on "duplicate session: main"); no server, or only a "main2", still starts one.
+  if command -v tmux >/dev/null; then
+    u=$(sed -n 's/^ExecCondition=//p' "$UD/tmux-main.service")
+    T=$(mktemp -d /tmp/ccu.XXXXXX); mkfifo "$T/hold"
+    tx(){ env -u TMUX TMUX_TMPDIR="$T" "$@"; }
+    k "$(t tx bash -c "$u")" "tmux-main starts a server when none runs (a fresh boot, or the old server died)"
+    tx tmux new-session -d -s main2 "cat $T/hold"
+    k "$(t tx bash -c "$u")" "…and when the only session is main2, which a prefix match would have taken for main"
+    tx tmux new-session -d -s main "cat $T/hold"
+    k "$(nt tx bash -c "$u")" "a session main started outside the unit counts as up: the start is skipped, not failed"
+    : > "$T/hold"   # both panes read EOF and exit; the empty server exits with them
+    for _ in 1 2 3 4 5 6 7 8 9 10; do tx tmux has-session 2>/dev/null || break; sleep 0.2; done
+    rm -rf "$T"
+  else
+    k 1 "tmux is installed, so tmux-main's ExecCondition can be checked"
+  fi
   echo "cc-units selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]
 }

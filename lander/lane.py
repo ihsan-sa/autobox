@@ -66,12 +66,15 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              a new head -> its checks in flight are stopped (run.execute kills their process groups) and it goes
              back to queued, which ends a merged PR as merged (by=before) and a closed one as done, so nothing parked
              on it waits on checks for a PR that already left (10-04: #794 merged at 16:47Z and held 57 jobs behind
-             it, still checking, for 40+ min; ai-ee #99 checked a stale head for 50 min). FAILED -> handback;
+             it, still checking, for 40+ min; ai-ee #99 checked a stale head for 50 min). FAILED (a red run.judge
+             saw twice on the same tree) -> handback; a red then green passes and logs `flake <repo>#<pr> check=<n>`;
              blocked-by-main (red on the base tree too) -> held 15 min and planned again from main then, not blamed;
              a check the manifest lacks -> query "planning"; UNRUNNABLE -> held 15 min, the 3rd -> query. Then,
              when the plan is paid, one read (a delta read when a prior verdict exists; none when a LAND is already
              recorded at this digest): INCOMPLETE -> held till the `until` it names (a usage limit's reset; stage
-             `deferred`, which no reader counts as running), no read counted; HANDBACK ->
+             `deferred`, which no reader counts as running), no read counted; INCOMPLETE with extra host (a
+             read the host failed twice at one head: a 4xx, a timeout, its own cap) -> query "planning", never a
+             handback; HANDBACK ->
              reads_used+1, handback, or query "planning" at the 2nd; LAND counts a read only when it was bought.
              A member over its day's cap is held; a bought read is charged to it.
   mergeable  the head moved -> queued. main moved -> Δ re-plan (S2): rerun = (new − old) ∪ (new ∩ checks Δ
@@ -1008,6 +1011,8 @@ class Lane:
         secs = int(sum(r.secs for r in o.results))
         word = {T.PASSED: "yes", RUN.BLOCKED: "main-red"}.get(o.status, "no")
         E.stage(job.repo, job.pr, "gate", gate=n, ok=word, secs=secs, note=o.note if o.status == T.PASSED else "")
+        if o.status == T.PASSED and o.note.startswith("flaky"):   # "the flake is logged with the check's name"
+            E.log("flake", job.repo, job.pr, check=n, head=job.head[:12])
         if o.status == T.FAILED:
             return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]})"
                                       + (f": {o.note}" if o.note else ""))
@@ -1049,6 +1054,12 @@ class Lane:
         E.stage(job.repo, job.pr, "verdict", verdict=v.verdict)
         if self.member and v.tokens > 0:
             M.charge(self.member, float(v.extra.get("usd") or 1.0))
+        if v.verdict == T.INCOMPLETE and v.extra.get("host"):
+            # "If it fails again, the PR is held with that reason recorded and no fix asked of the author" (owner,
+            # 10-12): a read the host could not make twice is the planning seat's, never a handback
+            self.query(job, f"the review read could not be made, so nothing is asked of the PR: "
+                            f"{v.extra.get('why') or 'no reason given'}", "planning")
+            return False
         if v.verdict == T.INCOMPLETE:   # a usage or budget wall: wait for the reset it names, no read counted
             until = v.extra.get("until") or ""
             self.hold(job, f"the review stopped on a usage or budget wall ({v.extra.get('why') or 'no reason given'}); "
