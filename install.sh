@@ -3,18 +3,29 @@
 #   ./install.sh                  link everything, enable the user services
 #   ./install.sh --etc            also (re)install the /etc reference configs with sudo
 #   ./install.sh --no-services    link only — no systemctl/sudo (tests run this in a throwaway HOME)
+#   ./install.sh --join <peer>    install, then record that this box is to join <peer> (a skeleton: it writes
+#                                 ~/.cc/peer/join and prints what is left; no key, no network, no message yet)
+# The box's name is CC_BOX (environment, then ~/.cc/config), else `hostname -s`; nothing here names a real box.
 # A box may keep this tree as `core/` inside a private repo — the "overlay" — and then the installer also links
 # the overlay's home/*.md and bin-private/*, uses its config/etc, and lays its config/claude-settings.json over
 # the default when it writes a first ~/.claude/settings.json. A bare clone of autobox has no overlay.
 set -euo pipefail
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 O=""; [ "$(basename "$R")" = core ] && O="$(cd "$R/.." && pwd)"   # R = this tree, O = the private overlay or ""
-etc=0; services=1
-for a in "$@"; do case "$a" in
+etc=0; services=1; join=""
+usage="usage: $0 [--etc] [--no-services] [--join <peer>]"
+while [ $# -gt 0 ]; do case "$1" in
   --etc) etc=1 ;;
   --no-services) services=0 ;;
-  *) echo "usage: $0 [--etc] [--no-services]" >&2; exit 2 ;;
-esac; done
+  --join) [ $# -ge 2 ] || { echo "$usage" >&2; exit 2; }; join="$2"; shift ;;
+  *) echo "$usage" >&2; exit 2 ;;
+esac; shift; done
+box=$("$R/bin/cc-config" get CC_BOX "$(hostname -s)" 2>/dev/null) || true
+[ -n "$box" ] || { echo "install.sh: this box has no name: CC_BOX is empty or unset (environment, then ~/.cc/config) and hostname -s printed nothing; rerun with CC_BOX=<name>" >&2; exit 2; }
+if [ -n "$join" ]; then   # checked before anything is linked, so a bad name changes nothing
+  [[ $join =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "install.sh: --join wants a box name ([a-z0-9-]), not '$join'" >&2; exit 2; }
+  [ "$join" != "$box" ] || { echo "install.sh: this box is $box — it cannot join itself (set CC_BOX if the hostname is wrong)" >&2; exit 2; }
+fi
 
 mkdir -p ~/bin ~/.cc/{boards,worktrees,state,slack} ~/.config/systemd/user ~/.config/environment.d ~/dev
 [ -d ~/.cc/tmp ] || mkdir -m 700 ~/.cc/tmp   # TMPDIR for every unit and session (config/environment.d/cc-tmp.conf): made before anything reads it
@@ -43,13 +54,23 @@ if [ -n "$O" ]; then
   for f in "$O"/home/*.md; do                    # the overlay's ~ docs (CLAUDE.md, USAGE.md, RUNBOOK.md, COMMS.md, …)
     [ -f "$f" ] && link "$f" ~/"$(basename "$f")"
   done
+  # this machine's own facts (its network, what never to touch) live in boxes/<box>/BOX.md, one per box, so the
+  # overlay's shared docs can name ~/BOX.md and each box reads its own. A box with no entry yet gets no link, and
+  # loses the one an earlier install made for another box name (else it reads that machine's network as its own);
+  # a ~/BOX.md the owner made, a file or a link to anywhere else, stays.
+  if [ -f "$O/boxes/$box/BOX.md" ]; then link "$O/boxes/$box/BOX.md" ~/BOX.md
+  else
+    if [ -L ~/BOX.md ]; then case "$(readlink ~/BOX.md)" in
+      "$O"/boxes/*/BOX.md) rm -f ~/BOX.md; echo "removed ~/BOX.md: it pointed at another box's facts" ;;
+    esac; fi
+    echo "no boxes/$box/BOX.md in the overlay — this machine's facts are not written down yet"
+  fi
 fi
 # ~/CLAUDE.md and the guides beside it: whatever is still absent at ~ after the overlay's links is seeded ONCE from
 # templates/home/ — a copy, `<box>` and `<user>` filled in, the other <placeholders> the owner's to replace. A file
 # already there (the overlay's link, or the owner's own) is never rewritten: it is the box's memory, not the installer's.
 # This is what makes a bare clone a box with the same contract as any other: the autonomy norm, the approval list and the
 # doc pointers arrive with the scripts, instead of being copied by hand (or not).
-box=$("$R/bin/cc-config" get CC_BOX "$(hostname -s)" 2>/dev/null) || true
 # A template line that is exactly {{WRITING_BLOCK}} becomes config/writing-prompt.md, the box's one writing block:
 # the same file every session's system prompt and the Slack tool carry, so a template never keeps a copy of its own.
 fill() { sed -e "/^{{WRITING_BLOCK}}\$/{r $R/config/writing-prompt.md" -e 'd}' "$1"; }
@@ -222,4 +243,13 @@ fi
 [ -n "$O" ] && git -C "$O" rev-parse --git-dir >/dev/null 2>&1 &&
   git -C "$O" config core.hooksPath "$(realpath --relative-to="$O" "$R/.githooks")" ||   # pre-commit = core/tests/check.sh on the default branch
   git -C "$R" config core.hooksPath .githooks 2>/dev/null || true                        # a bare autobox clone: hook the repo itself
+# --join: the skeleton of bringing up a second box (docs/architecture/second-box.md in the overlay). Today it only
+# writes down the intent, so the steps still to come (the peer key, the introduction card, the overlay bundle) have
+# somewhere to start from, and says plainly that none of them has run.
+if [ -n "$join" ]; then
+  mkdir -p ~/.cc/peer && chmod 700 ~/.cc/peer
+  grep -qx "peer=$join" ~/.cc/peer/join 2>/dev/null ||   # a rerun keeps the first ask and its time
+    printf 'box=%s\npeer=%s\nasked=%s\n' "$box" "$join" "$(date -u +%FT%TZ)" > ~/.cc/peer/join
+  echo "join: $box is set to join $join (~/.cc/peer/join). Not built yet: the peer key, the link and the introduction card, so nothing has contacted $join."
+fi
 echo "linked: bin/* -> ~/bin, ccbox, overlay docs, tmux.conf, the scratch TMPDIR, user units. Packages expected: tmux git gh docker-ce jq curl python3 python3-venv bubblewrap socat shellcheck (see docs/DESIGN.md)."

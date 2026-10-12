@@ -3471,6 +3471,35 @@ gcg(){ env HOME="$IH" XDG_CONFIG_HOME="$IH/.config" git config --global "$@"; }
 [ "$(gcg --get rerere.enabled)" = true ] && ok "install.sh switches git rerere on for the box — a conflict resolved once in a rebase is not resolved by hand again" || bad "rerere not enabled: '$(gcg --get rerere.enabled)'"
 gcg rerere.enabled false; inst
 [ "$(gcg --get rerere.enabled)" = false ] && ok "…and never over the owner's own answer: an explicit false stands" || bad "install.sh overwrote the owner's rerere setting"
+# A SECOND BOX COMES FROM A FRESH CLONE (docs/architecture/second-box.md, milestone 1): installed as CC_BOX=testbox,
+# nothing it writes may carry the name of the machine running it. Each case below installs into a HOME of its own.
+inst_as(){ local h="$1" b="$2"; shift 2; mkdir -p "$h"; ( cd "$h" && env HOME="$h" XDG_CONFIG_HOME="$h/.config" USER=tester CC_BOX="$b" GIT_CEILING_DIRECTORIES="$T" "$@" --no-services ) >"$h.log" 2>&1; }
+host=$(hostname -s 2>/dev/null); [ -n "$host" ] && [ "$host" != testbox ] || host=no-such-host-name   # the real name; a fixture box named testbox would scan for nothing
+hostscan(){ grep -rIlwF -- "$host" "$1" 2>/dev/null; }   # -r, not -R: a link into the tree is the tree's, not something the install wrote
+JH="$T/join-home"; inst_as "$JH" testbox "$IR/install.sh" --join peerbox; jrc=$?
+{ [ $jrc = 0 ] && grep -qx 'box=testbox' "$JH/.cc/peer/join" && grep -qx 'peer=peerbox' "$JH/.cc/peer/join" && grep -q 'nothing has contacted peerbox' "$JH.log"; } \
+  && ok "install.sh --join peerbox installs, writes ~/.cc/peer/join and says nothing has contacted the peer yet" || bad "--join skeleton: rc=$jrc, join=$(tr '\n' ' ' < "$JH/.cc/peer/join" 2>/dev/null), log=$(tail -2 "$JH.log" | tr '\n' ' ')"
+[ -z "$(hostscan "$JH")" ] && ok "a CC_BOX=testbox install writes no real host name ($host) anywhere in its HOME" || bad "the testbox HOME names this machine ($host) in: $(hostscan "$JH" | tr '\n' ' ')"
+echo "joined from $host" > "$JH/.cc/planted"
+[ "$(hostscan "$JH")" = "$JH/.cc/planted" ] && ok "…and the scan does find the name when a file carries it" || bad "the host-name scan missed a planted file: '$(hostscan "$JH")'"
+SH="$T/self-join"; inst_as "$SH" testbox "$IR/install.sh" --join testbox; src=$?
+BH="$T/bad-join"; inst_as "$BH" testbox "$IR/install.sh" --join 'Not A Box'; brc=$?
+{ [ $src = 2 ] && [ $brc = 2 ] && [ ! -e "$SH/bin/cc" ] && [ ! -e "$BH/bin/cc" ]; } && ok "--join refuses this box's own name and a malformed one before linking anything" || bad "--join refusals: self rc=$src bad rc=$brc, links $(ls "$SH/bin" "$BH/bin" 2>/dev/null | wc -l)"
+# this machine's facts come from the overlay's boxes/<box>/BOX.md: the box named CC_BOX gets its own, another box's never
+OV="$T/overlay"; mkdir -p "$OV/boxes/testbox" "$OV/boxes/otherbox"; ln -s "$IR" "$OV/core"
+echo "testbox facts" > "$OV/boxes/testbox/BOX.md"; echo "otherbox facts" > "$OV/boxes/otherbox/BOX.md"
+OH="$T/overlay-home"; inst_as "$OH" testbox "$OV/core/install.sh"
+[ "$(readlink -f "$OH/BOX.md")" = "$OV/boxes/testbox/BOX.md" ] && ok "the overlay links boxes/testbox/BOX.md to ~/BOX.md on testbox, not otherbox's" || bad "~/BOX.md on testbox -> '$(readlink -f "$OH/BOX.md")' ($(tail -2 "$OH.log" | tr '\n' ' '))"
+NH="$T/overlay-newbox"; inst_as "$NH" thirdbox "$OV/core/install.sh"
+{ [ ! -e "$NH/BOX.md" ] && [ ! -L "$NH/BOX.md" ] && grep -q 'no boxes/thirdbox/BOX.md' "$NH.log"; } && ok "…and a box with no folder there gets no ~/BOX.md, and the install says so" || bad "a box with no boxes/ entry: BOX.md $([ -L "$NH/BOX.md" ] && echo linked || echo absent), log=$(grep -c 'no boxes/' "$NH.log")"
+# the same HOME reinstalled under a box name with no entry must drop the link to the first box's facts, never keep it
+inst_as "$OH" thirdbox "$OV/core/install.sh"
+{ [ ! -e "$OH/BOX.md" ] && [ ! -L "$OH/BOX.md" ] && grep -q 'no boxes/thirdbox/BOX.md' "$OH.log"; } && ok "…and testbox's HOME reinstalled as thirdbox (no entry) loses the link to testbox's facts" || bad "testbox -> thirdbox kept ~/BOX.md -> '$(readlink "$OH/BOX.md")' ($(tail -2 "$OH.log" | tr '\n' ' '))"
+FH="$T/owner-boxmd"; mkdir -p "$FH"; echo "the owner's own notes" > "$FH/BOX.md"; inst_as "$FH" thirdbox "$OV/core/install.sh"
+LH="$T/owner-boxlink"; mkdir -p "$LH"; echo "elsewhere" > "$T/elsewhere.md"; ln -s "$T/elsewhere.md" "$LH/BOX.md"; inst_as "$LH" thirdbox "$OV/core/install.sh"
+{ [ ! -L "$FH/BOX.md" ] && [ "$(cat "$FH/BOX.md")" = "the owner's own notes" ] && [ "$(readlink "$LH/BOX.md")" = "$T/elsewhere.md" ]; } && ok "…but a ~/BOX.md the owner made, a file or a link elsewhere, stays" || bad "owner's ~/BOX.md: file $([ -f "$FH/BOX.md" ] && echo kept || echo gone), link -> '$(readlink "$LH/BOX.md")'"
+EH="$T/no-name"; inst_as "$EH" "" "$IR/install.sh"; erc=$?
+{ [ $erc = 2 ] && grep -q 'this box has no name' "$EH.log" && [ ! -e "$EH/bin/cc" ]; } && ok "an empty box name stops the install with the cause, before it links anything" || bad "empty CC_BOX: rc=$erc, log=$(tail -2 "$EH.log" | tr '\n' ' ')"
 fi
 if stanza "ask ledger (cc-scope)"; then
 # The ledger has no fixtures to build: its selfcheck works in a temp dir of its own and removes it on the way out.

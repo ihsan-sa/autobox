@@ -9,6 +9,7 @@ my-box/                 private repo (the overlay)
 ├── core/               this tree, added with: git subtree add --prefix=core <autobox-url> main --squash
 ├── home/               CLAUDE.md RUNBOOK.md COMMS.md USAGE.md  → symlinked into ~
 ├── bin-private/        scripts only this box has            → symlinked into ~/bin
+├── boxes/<box>/BOX.md  one machine's own facts, per CC_BOX     → symlinked to ~/BOX.md on that box
 ├── config/etc/         this box's sshd / unattended-upgrades
 ├── config/systemd-user/  user units only this box runs      → symlinked into ~/.config/systemd/user (enable by hand)
 ├── docs/               this box's incidents, audits, guides
@@ -38,6 +39,10 @@ A bare clone of autobox works too — it just has no overlay, so `install.sh` li
 7. **`config/systemd-user/`** (optional) — `*.service` / `*.timer` for what only this box runs (typically driving a
    `bin-private/` script). `install.sh` links them next to core's; unlike core's it never enables them — do that once
    yourself with `systemctl --user enable --now <unit>`, so nothing starts on your box that you did not ask for.
+8. **`boxes/<box>/BOX.md`** (optional) — the facts of one machine (its network, what never to touch), one folder per
+   box named by its `CC_BOX`. `install.sh` links the one for this box to `~/BOX.md`, so an overlay that runs on two
+   machines keeps one set of shared docs and each box still reads its own. `install.sh --join <peer>` is the start of
+   bringing a second box up; today it only records the peer in `~/.cc/peer/join`.
 
 ## Keeping core in sync
 
