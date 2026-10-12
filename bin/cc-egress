@@ -1,7 +1,7 @@
 #!/usr/bin/python3 -IS
 # cc-egress — a worker's only way off the box: an allow-list HTTPS proxy on a unix socket, run by the user, no root.
 #   cc-egress serve --socket <path> [--allow <list>] [--log <file>] [--parent <pid>]
-#       HOST SIDE. Listens on <path> (mode 600) for HTTP CONNECT and opens the tunnel only to a host on <list>, else
+#       HOST SIDE. Listens on <path> (mode 600; the path appears only once it listens) for HTTP CONNECT and opens the tunnel only to a host on <list>, else
 #       answers 403 and logs one line "refused <host>:<port> <why>" to <file> (stderr when none; past 1 MiB the file
 #       moves to <file>.1, so a worker hammering refused hosts cannot fill the disk). --parent: exit with
 #       that process (PR_SET_PDEATHSIG), and refuse to start once it is gone — cc-sandbox passes its own pid and then
@@ -219,15 +219,19 @@ def serve(sock, allow_text, logfile, parent):
                 append_capped(logfile, line)
             else:
                 print("cc-egress: " + line, file=sys.stderr, flush=True)
+    # Bound on a side path and renamed onto <sock> once it listens, so a waiter that sees <sock> (the selfcheck,
+    # cc-sandbox's [ -S ]) can connect: bound but not yet listening, a connect is refused.
+    side = sock + ".new"
     try:
-        os.unlink(sock)
+        os.unlink(side)
     except FileNotFoundError:
         pass
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     old = os.umask(0o177)
-    srv.bind(sock)
+    srv.bind(side)
     os.umask(old)
     srv.listen(64)
+    os.replace(side, sock)
     while True:
         conn, _ = srv.accept()
         threading.Thread(target=handle, args=(conn, rules, log), daemon=True).start()
@@ -299,6 +303,30 @@ def selfcheck():
         else:
             print(f"  ok   {name}")
     d = tempfile.mkdtemp(prefix="cc-egress.")
+    # A waiter polls for the path, then connects; a path that exists before listen() is a refused connect under load.
+    early, seen = os.path.join(d, "early"), []
+
+    class Watched(socket.socket):
+        def listen(self, *a):
+            seen.append(os.path.exists(early))
+            return super().listen(*a)
+    plain, socket.socket = socket.socket, Watched
+    try:
+        threading.Thread(target=serve, args=(early, "", os.path.join(d, "early.log"), 0), daemon=True).start()
+        for _ in range(250):
+            if os.path.exists(early):
+                break
+            threading.Event().wait(0.02)
+    finally:
+        socket.socket = plain
+    c = socket.socket(socket.AF_UNIX)
+    try:
+        c.connect(early)
+        seen.append("connected")
+    except OSError as exc:
+        seen.append(type(exc).__name__)
+    c.close()
+    t("serve: the socket path is absent at listen() and connectable once it appears", seen, [False, "connected"])
     up = socket.socket()
     up.bind(("127.0.0.1", 0))
     up.listen(8)
