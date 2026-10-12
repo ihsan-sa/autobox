@@ -8,6 +8,7 @@ def selfcheck():
     """The decision table, then one end-to-end run of each part against a throwaway HOME. No network, no Slack."""
     import tempfile
     global BOARDS                          # declared once, up top: a later read of it must not predate this
+    globals().update(FILE_REMOTES=True)     # the fixtures' origins are local bare repos
     os.environ["CC_LIMIT_RESUMED"] = os.path.join(tempfile.gettempdir(), "cc-reconcile-selfcheck-no-episode")
     p = f = 0
 
@@ -69,6 +70,14 @@ def selfcheck():
     ok("loop exit → blocked, with the loop's own reason", decide(F(loop_end="exit 4: stalled"))[0][:2] == ("ask", "blocked"))
     ok("nothing says why → blocked and the owner hears about it", one() == ("ask", "blocked"))
     ok("review + merged PR → merged", one(status="review", pr="u", pr_state="MERGED") == ("fix", "merged"))
+    ok("a blocked or review row whose branch landed → merged, and no 'PR never opened' ask beside it",
+       one(status="blocked", landed="its branch landed inside #5") == ("fix", "merged")
+       and decide(F(status="review", landed="x")) == [("fix", "merged", "x")])
+    ok("a landed row outranks a stale STATUS: BLOCKED question: merged, not `waiting` and asked again every run",
+       decide(F(status="blocked", landed="x", journal=("BLOCKED", "which one?"))) == [("fix", "merged", "x")]
+       and one(status="review", landed="x", journal=("BLOCKED", "q")) == ("fix", "merged"))
+    ok("…but `landed` never moves a row that is not blocked or review", one(status="waiting", landed="x")[1] != "merged"
+       and one(status="queued", landed="x")[1] != "merged")
     ok("merged + open PR → review", one(status="merged", pr="u", pr_state="OPEN") == ("fix", "review"))
     ok("closed-not-merged PR is never guessed at", one(status="review", pr="u", pr_state="CLOSED") == ("ask", None))
     ok("an unreadable PR state is unknown, not a fix", one(status="review", pr="u", pr_state="?") == ("info", None))
@@ -615,21 +624,30 @@ def selfcheck():
     with tempfile.TemporaryDirectory() as tg:
         def g(d, *a):
             return subprocess.run(["git", "-C", d, *a], capture_output=True, text=True, timeout=30)
-        bare, wt2 = f"{tg}/origin.git", f"{tg}/wt"
-        g(tg, "init", "-q", "--bare", bare)
-        g(tg, "clone", "-q", bare, wt2)
-        g(wt2, "config", "user.email", "s@e"); g(wt2, "config", "user.name", "s")
-        open(f"{wt2}/a", "w").write("1")
-        g(wt2, "add", "a"); g(wt2, "commit", "-qm", "one")
-        ok("real git: a branch origin has never seen cannot be judged — None, so the marker's answer stands",
-           branch_unpushed(wt2) is None)
-        g(wt2, "push", "-q", "-u", "origin", "HEAD")
-        ok("real git: a branch origin HAS is not unpushed, whatever a leftover push.err says",
-           branch_unpushed(wt2) is False)
-        open(f"{wt2}/a", "w").write("2")
-        g(wt2, "commit", "-qam", "two")
-        ok("real git: a commit origin does not have IS unpushed", branch_unpushed(wt2) is True)
-        ok("real git: a directory that is not a checkout cannot be judged", branch_unpushed(tg + "/nope") is None)
+        _d, _w = DEV, WTS
+        globals().update(DEV=f"{tg}/dev", WTS=f"{tg}/wts")
+        try:
+            bare, co, wt2 = f"{tg}/origin.git", f"{tg}/dev/r", f"{tg}/wts/r/t"
+            g(tg, "init", "-q", "--bare", bare)
+            g(tg, "clone", "-q", bare, co)
+            g(co, "config", "user.email", "s@e"); g(co, "config", "user.name", "s")
+            open(f"{co}/a", "w").write("0"); g(co, "add", "a"); g(co, "commit", "-qm", "zero")
+            g(co, "worktree", "add", "-q", "-b", "track/t", wt2)
+            open(f"{wt2}/a", "w").write("1")
+            g(wt2, "commit", "-qam", "one")
+            ok("real git: a branch origin has never seen cannot be judged — None, so the marker's answer stands",
+               branch_unpushed("r", wt2) is None)
+            g(wt2, "push", "-q", "-u", "origin", "HEAD")
+            ok("real git: a branch origin HAS is not unpushed, whatever a leftover push.err says",
+               branch_unpushed("r", wt2) is False)
+            open(f"{wt2}/a", "w").write("2")
+            g(wt2, "commit", "-qam", "two")
+            ok("real git: a commit origin does not have IS unpushed", branch_unpushed("r", wt2) is True)
+            ok("real git: a directory that is not a checkout cannot be judged", branch_unpushed("r", tg + "/wts/r/nope") is None)
+            ok("real git: nor can the repo's own checkout, which is no worktree under WTS/<repo>/",
+               branch_unpushed("r", co) is None and wt_branch("r", wt2) == "track/t" and wt_branch("r", co) == "")
+        finally:
+            globals().update(DEV=_d, WTS=_w)
 
     with tempfile.TemporaryDirectory() as th:
         env = dict(os.environ, HOME=th, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log",
@@ -1068,15 +1086,18 @@ def selfcheck():
         # is still reported (the invariant up top, and asserted at decide level above). Dropping every line on a
         # MERGED PR took that safety ask off the wire and wrote its key as 0, so every pass dropped it again while
         # the sweep counted down to deleting the branch with the commits on it. Own fixture: a real checkout one
-        # commit ahead of its origin, with the failed-push marker beside it.
-        wtU, o11 = f"{th}/.cc/worktrees/{repo}/t11", f"{th}/o11.git"
+        # commit ahead of its origin, with the failed-push marker beside it. A worktree of the repo's own checkout,
+        # as cc makes them: git runs only in one of those (wt_pin).
+        wtU, o11, dv = f"{th}/.cc/worktrees/{repo}/t11", f"{th}/o11.git", f"{th}/dev/{repo}"
 
         def gu(*a, d=None):
-            return subprocess.run(["git", *(["-C", d] if d else []), *a], capture_output=True, text=True, timeout=30)
+            return subprocess.run(["git", *(["-C", d] if d else []), "-c", "user.name=s", "-c", "user.email=s@e", *a],
+                                  capture_output=True, text=True, timeout=30)
 
         gu("init", "-q", "--bare", o11)
-        gu("clone", "-q", o11, wtU)
-        gu("config", "user.email", "s@e", d=wtU); gu("config", "user.name", "s", d=wtU)
+        gu("init", "-q", "-b", "main", dv); gu("commit", "-q", "--allow-empty", "-m", "zero", d=dv)
+        gu("remote", "add", "origin", o11, d=dv)
+        gu("worktree", "add", "-q", "-b", "track/t11", wtU, d=dv)
         open(f"{wtU}/a", "w").write("1")
         gu("add", "a", d=wtU); gu("commit", "-qm", "one", d=wtU)
         gu("push", "-q", "-u", "origin", "HEAD", d=wtU)
@@ -1112,6 +1133,7 @@ def selfcheck():
         for tr in ("t11", "t12"):
             cb("rm", repo, tr)
         shutil.rmtree(wtU, ignore_errors=True); shutil.rmtree(o11, ignore_errors=True)
+        gu("worktree", "prune", d=dv); gu("remote", "remove", "origin", d=dv)
         open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
         json.dump({}, open(seenp, "w"))
 
@@ -1268,7 +1290,8 @@ def selfcheck():
         shutil.rmtree(f"{th}/.cc/worktrees/_ccsbx99999999", ignore_errors=True)
         deliv, prj = f"{th}/.cc/worktrees/{repo}/deliver", f"{th}/prs.json"
         os.makedirs(f"{th}/dev/{repo}", exist_ok=True)      # branch_prs asks from the repo's own checkout or not at all
-        subprocess.run(["git", "init", "-q", "-b", "track/deliver-x", deliv], capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", f"{th}/dev/{repo}", "worktree", "add", "-q", "-b", "track/deliver-x", deliv],
+                       capture_output=True, timeout=30)     # the repo's own checkout is a git repo since t11's case
         open(f"{th}/gh", "w").write(f'#!/bin/sh\ncase "$*" in\n  *"pr list"*) cat {prj} ;;\n  *) echo OPEN ;;\nesac\n')
         os.chmod(f"{th}/gh", 0o755)
 
@@ -1443,6 +1466,253 @@ def selfcheck():
            b["alive"]["status"] == "running" and not (b["alive"].get("notes") or []))
     finally:
         restore(); shutil.rmtree(ta, ignore_errors=True)
+    # (l) LANDED ELSEWHERE: a row whose branch landed inside another PR goes merged; a half-landed one stays
+    tl = tempfile.mkdtemp(prefix="cc-reconcile-landed-")
+    try:
+        R = f"{tl}/dev/rl"
+        g = lambda *a: (sh("git", "-C", R, "-c", "user.name=t", "-c", "user.email=t@t", *a, timeout=30).stdout or "").strip()
+        def put(name, body, msg):
+            open(f"{R}/{name}", "w").write(body); g("add", name); g("commit", "-qm", msg)
+        os.makedirs(R); g("init", "-q", "-b", "main"); open(f"{R}/r.txt", "w").write("x\ny\nz\n"); g("add", "r.txt")
+        open(f"{R}/ab.txt", "w").write("alpha=0\nbeta=0\n"); open(f"{R}/gd.txt", "w").write("gamma=0\ndelta=0\n")
+        g("add", "ab.txt", "gd.txt"); put("a.txt", "1\n2\n3\n", "c0")
+        g("branch", "track/stacked"); g("branch", "track/half"); g("branch", "track/rv")
+        g("branch", "track/adj"); g("branch", "track/combo")
+        put("b.txt", "b\n", "c1"); g("branch", "track/fresh")    # fresh: on main's first-parent line, no work of its own
+        g("checkout", "-q", "track/stacked"); put("a.txt", "one\n2\n3\n", "s1")
+        g("checkout", "-q", "-b", "track/evil"); g("merge", "-q", "--no-commit", "main")   # main merged in, z.txt added
+        open(f"{R}/z.txt", "w").write("z\n"); g("add", "z.txt"); g("commit", "-qm", "merge main")
+        g("checkout", "-q", "-b", "track/carrier", "main"); g("cherry-pick", "track/stacked")
+        put("a.txt", "one\n2\nthree\n", "k2")                    # the PR that carried s1, rebased, plus its own commit
+        g("checkout", "-q", "track/half"); g("cherry-pick", "track/stacked"); put("h.txt", "h\n", "h2")
+        g("checkout", "-q", "track/rv"); put("r.txt", "X\ny\nz\n", "rv1")
+        g("checkout", "-q", "-b", "track/reverter", "main"); g("cherry-pick", "track/rv")   # carried rv1, then
+        g("revert", "--no-edit", "HEAD"); put("q.txt", "q\n", "q1")                         # took it out before its squash
+        g("checkout", "-q", "track/adj"); put("ab.txt", "alpha=1\nbeta=0\n", "adj1")
+        g("checkout", "-q", "-b", "track/adjcarrier", "main"); g("cherry-pick", "track/adj")   # carried adj1, took it
+        g("revert", "--no-edit", "HEAD"); put("ab.txt", "alpha=0\nbeta=1\n", "adj2")     # out, then edited the next line
+        g("checkout", "-q", "track/combo"); put("gd.txt", "gamma=1\ndelta=0\n", "cb1")
+        g("checkout", "-q", "-b", "track/combocarrier", "main"); g("cherry-pick", "track/combo")
+        put("gd.txt", "gamma=1\ndelta=1\n", "cb2")                 # carried cb1 for real, plus the next line
+        g("checkout", "-q", "main"); g("merge", "-q", "--squash", "track/carrier"); g("commit", "-qm", "carrier (#5)")
+        g("merge", "-q", "--squash", "track/reverter"); g("commit", "-qm", "reverter (#8)")
+        g("merge", "-q", "--squash", "track/adjcarrier"); g("commit", "-qm", "adjcarrier (#10)")
+        g("merge", "-q", "--squash", "track/combocarrier"); g("commit", "-qm", "combocarrier (#11)")
+        put("a.txt", "ONE\n2\nthree\n", "c3")                    # main moves on: merging the stacked tip would conflict
+        put("gd.txt", "gamma=2\ndelta=1\n", "c4")                 # …and the combo tip
+        g("checkout", "-q", "-b", "track/plain"); put("p.txt", "p\n", "p1")
+        g("checkout", "-q", "main"); g("merge", "-q", "--no-ff", "-m", "plain (#6)", "track/plain")
+        g("branch", "track/busy", "track/stacked")             # landed too, but a worker is in it
+        g("branch", "track/ownpr", "track/stacked")            # landed too, but its own PR could not be read
+        g("branch", "feature/odd", "track/stacked")            # landed too, on a branch not named after its row
+        sh("git", "init", "-q", "--bare", f"{tl}/origin.git", timeout=30)
+        g("remote", "add", "origin", f"{tl}/origin.git"); g("push", "-q", "origin", "main")
+        g("checkout", "-q", "-b", "track/unpushed"); put("u.txt", "u\n", "u1")   # merged into a main nobody pushed
+        g("checkout", "-q", "main"); g("merge", "-q", "--no-ff", "-m", "local only", "track/unpushed")
+        heads = ",".join(f'{{"number": {n}, "headRefOid": "{g("rev-parse", b)}"}}' for n, b in ((5, "track/carrier"),
+                                                                    (8, "track/reverter"), (10, "track/adjcarrier"),
+                                                                    (11, "track/combocarrier")))
+        scratch(tl, dict(NOOP, gh=f'case "$*" in *"--state merged"*) echo \'[{heads}]\';; *) echo "[]";; esac'))
+        cbl = lambda *a: sh(f"{BIN}/cc-board", *a, timeout=30)
+        cbl("init", "rl", R, "main")
+        rows = (("stacked", "blocked"), ("half", "blocked"), ("fresh", "review"), ("plain", "review"), ("busy", "blocked"),
+                ("ownpr", "review"), ("rv", "blocked"), ("evil", "blocked"), ("unpushed", "review"), ("odd", "blocked"),
+                ("adj", "blocked"), ("combo", "blocked"))
+        for t, st in rows:
+            cbl("add", "rl", t, "a row", ""); cbl("status", "rl", t, st)
+            if t != "odd":
+                os.makedirs(f"{tl}/.cc/worktrees/rl/{t}")
+        g("worktree", "add", "-q", f"{tl}/.cc/worktrees/rl/odd", "feature/odd")
+        cbl("set", "rl", "ownpr", "pr", "https://github.com/o/rl/pull/9")
+        globals().update(procs=lambda: ({"rl/busy"}, set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}))
+        cache = f"{tl}/.cc/state/landed-patches.json"
+        rep = quietly(main, ["rl", "--grace", "0"])
+        b = board_read(f"{tl}/.cc/boards/rl.json")["tracks"]
+        ok("LANDED: a report run lists what it would close and writes neither the board nor the patch-id cache",
+           "would fix  rl/stacked" in rep and b["stacked"]["status"] == "blocked" and not os.path.exists(cache))
+        quietly(main, ["rl", "--apply", "--grace", "0"])
+        b = board_read(f"{tl}/.cc/boards/rl.json")["tracks"]
+        note = lambda t: " ".join(str(n.get("msg", "")) for n in b[t].get("notes") or [])
+        ok("LANDED: a blocked row whose branch was rebased into another PR that squash-merged goes `merged`, naming "
+           "that PR — main moved on past it, so only its patches say it landed; --apply keeps the patch-ids",
+           b["stacked"]["status"] == "merged" and "reconciled: blocked → merged (its branch landed inside #5)" in note("stacked")
+           and os.path.exists(cache))
+        ok("…and a review row whose branch merged into origin's main with a merge commit goes `merged` too",
+           b["plain"]["status"] == "merged" and "nothing left that main lacks" in note("plain"))
+        ok("…as does a row whose worktree sits on a branch not named after it (the worktree's own branch is read)",
+           b["odd"]["status"] == "merged" and "inside #5" in note("odd"))
+        ok("…while a half-landed branch (one commit landed, one nowhere) stays blocked, untouched",
+           b["half"]["status"] == "blocked" and "merged" not in note("half"))
+        ok("…a branch with no work of its own past main stays in review, and a landed one with a worker in it "
+           "is never set merged: 'never touch a row that is running or has a live worker'",
+           b["fresh"]["status"] == "review" and b["busy"]["status"] != "merged" and "merged" not in note("busy"))
+        ok("…and a landed one whose own PR this pass could not read stays in review: that PR may be open, and the "
+           "next pass would set it back (a row whose PR is still open while its commits sit inside another merged PR)",
+           b["ownpr"]["status"] == "review" and "merged" not in note("ownpr"))
+        ok("…a branch whose patch a merged PR applied and then reverted before its squash stays blocked: its patch-id "
+           "is in #8's history, but #8's final tree does not hold it",
+           b["rv"]["status"] == "blocked" and "merged" not in note("rv"))
+        adj_fork = g("merge-base", "origin/main", "track/adj")
+        ok("…a branch whose patch #10 applied, reverted, then edited the line next to it stays blocked: its hunk no "
+           "longer applies to #10's tree, but its old line is still there, and failing to apply proves nothing",
+           b["adj"]["status"] == "blocked" and "merged" not in note("adj")
+           and not delivered(R, adj_fork, g("rev-parse", "track/adj"), [g("rev-parse", "track/adjcarrier")]))
+        ok("…while one that really went in inside a combined #11, which then edited the line next to it, goes `merged`",
+           b["combo"]["status"] == "merged" and "inside #11" in note("combo"))
+        evil = g("rev-parse", "track/evil")
+        ok("…a branch whose own patch landed in #5 but whose merge commit added z.txt stays blocked: the merge adds "
+           "changes of its own, which a clean merge commit (main's `plain (#6)`) does not",
+           b["evil"]["status"] == "blocked" and merge_adds(R, evil) and not merge_adds(R, g("rev-parse", "origin/main")))
+        ok("…and a branch merged only into a local main nobody pushed stays in review: origin's main decides",
+           b["unpushed"]["status"] == "review" and "merged" not in note("unpushed"))
+        # a landed branch whose real worktree holds uncommitted work; and its clean twin, which does go merged
+        for t in ("dirtywt", "cleanwt"):
+            g("branch", f"track/{t}", "track/stacked"); cbl("add", "rl", t, "a row", ""); cbl("status", "rl", t, "blocked")
+            g("worktree", "add", "-q", f"{tl}/.cc/worktrees/rl/{t}", f"track/{t}")
+        open(f"{tl}/.cc/worktrees/rl/dirtywt/wip.txt", "w").write("not committed\n")
+        # a row whose `worktree` (board text a member writes) names a repo of its own with a planted core.fsmonitor:
+        # one outside WTS, and one inside WTS/rl/ that is a plain clone rather than a worktree of DEV/rl
+        pw = f"{tl}/fsmonitor-ran"
+        for t, path in (("planted", f"{tl}/member/planted"), ("planted2", f"{tl}/.cc/worktrees/rl/planted2")):
+            g("branch", f"track/{t}", "track/stacked"); cbl("add", "rl", t, "a row", ""); cbl("status", "rl", t, "blocked")
+            sh("git", "init", "-q", path, timeout=30)
+            open(f"{path}/.git/config", "a").write(f"[core]\n\tfsmonitor = touch {pw}\n")
+            cbl("set", "rl", t, "worktree", path)
+        sh("git", "-C", f"{tl}/member/planted", "status", "--porcelain", timeout=30)
+        armed = os.path.exists(pw)                       # the fixture is live: plain `git status` there runs it
+        if armed:
+            os.remove(pw)
+        quietly(main, ["rl", "--grace", "0"]); quietly(main, ["rl", "--apply", "--grace", "0"])
+        b = board_read(f"{tl}/.cc/boards/rl.json")["tracks"]
+        ok("LANDED: a landed branch whose worktree holds uncommitted work stays blocked, while its clean twin goes merged",
+           b["dirtywt"]["status"] == "blocked" and "merged" not in note("dirtywt")
+           and b["cleanwt"]["status"] == "merged" and "inside #5" in note("cleanwt"))
+        ok("LANDED: a row's `worktree` pointing at a repo with a planted core.fsmonitor never runs it (outside WTS, or "
+           "inside it but not a worktree of DEV/<repo>): the row is judged on its branch name alone",
+           armed and not os.path.exists(pw) and b["planted"]["status"] == "merged"
+           and b["planted2"]["status"] == "merged"
+           and wt_pin("rl", f"{tl}/member/planted") is None and wt_pin("rl", f"{tl}/.cc/worktrees/rl/planted2") is None
+           and wt_pin("rl", f"{tl}/.cc/worktrees/rl/cleanwt")[0] == os.path.realpath(f"{tl}/.cc/worktrees/rl/cleanwt"))
+        # the two shapes the security read reproduced, each armed first (plain git runs the planted command) and then
+        # run through every pass that reaches them, which must not. PAIR: a planted admin dir DEV/rl/.git/worktrees/
+        # pair whose `commondir` names a repo with an fsmonitor, and WTS/rl/pair/.git pointing at it; wt_pin() vouches
+        # for the pair, so only wt_git()'s own GIT_COMMON_DIR keeps git off that commondir. GITLINK: a real worktree with
+        # an embedded repo staged as a gitlink, whose own config has an fsmonitor: `status` would run git inside it.
+        pw2, rlg = f"{tl}/fsmonitor-ran2", os.path.realpath(R) + "/.git"
+        sh("git", "init", "-q", f"{tl}/member/evilcommon", timeout=30)
+        open(f"{tl}/member/evilcommon/.git/config", "a").write(f"[core]\n\tfsmonitor = touch {pw2}\n")
+        adm, pwt = f"{rlg}/worktrees/pair", f"{tl}/.cc/worktrees/rl/pair"
+        os.makedirs(adm); os.makedirs(pwt)
+        g("branch", "track/pair", "track/stacked"); cbl("add", "rl", "pair", "a row", ""); cbl("status", "rl", "pair", "blocked")
+        open(f"{adm}/HEAD", "w").write("ref: refs/heads/track/pair\n")
+        open(f"{adm}/commondir", "w").write(f"{tl}/member/evilcommon/.git\n")
+        open(f"{adm}/gitdir", "w").write(os.path.realpath(pwt) + "/.git\n")
+        open(f"{pwt}/.git", "w").write(f"gitdir: {adm}\n")
+        g("branch", "track/gitlink", "track/stacked"); cbl("add", "rl", "gitlink", "a row", ""); cbl("status", "rl", "gitlink", "done")
+        glw = f"{tl}/.cc/worktrees/rl/gitlink"
+        g("worktree", "add", "-q", glw, "track/gitlink")
+        gi = lambda *a: sh("git", "-C", glw, "-c", "user.name=t", "-c", "user.email=t@t", *a, timeout=30)
+        gi("init", "-q", "inner"); open(f"{glw}/inner/i", "w").write("i\n")
+        gi("-C", "inner", "add", "i"); gi("-C", "inner", "commit", "-qm", "i")
+        open(f"{glw}/inner/.git/config", "a").write(f"[core]\n\tfsmonitor = touch {pw}\n")
+        gi("add", "inner")
+        sh("git", "-C", pwt, "status", "--porcelain", timeout=30); sh("git", "-C", glw, "status", "--porcelain", timeout=30)
+        armed2 = os.path.exists(pw) and os.path.exists(pw2)
+        for x in (pw, pw2):
+            if os.path.exists(x):
+                os.remove(x)
+        quietly(main, ["rl", "--grace", "0"]); quietly(main, ["rl", "--apply", "--grace", "0"])
+        quietly(sweep_repo, "rl", Sweep(dry=True), {}, False, 0)   # rule 1 reads gitlink's dirt, rule 2 every row's
+        seen = branch_unpushed("rl", pwt), dirty("rl", glw), dirty("rl", pwt), wt_branch("rl", pwt)
+        b = board_read(f"{tl}/.cc/boards/rl.json")["tracks"]
+        ok("PINNED GIT: a planted worktrees/pair/commondir + WTS/rl/pair/.git pair, and a staged embedded repo with an "
+           "fsmonitor in a real worktree, run neither command through reconcile, --apply, the sweep or the helpers",
+           armed2 and not os.path.exists(pw) and not os.path.exists(pw2)
+           and wt_pin("rl", pwt) is not None and seen[3] == "track/pair"
+           and b["gitlink"]["status"] == "done")
+        _pi = patch_ids
+        try:                                             # a head whose read timed out is not cached for good
+            globals().update(patch_ids=lambda *a: None)
+            c0 = {}; landed_ctx(R, [(5, g("rev-parse", "track/carrier"))], c0)
+            globals().update(patch_ids=_pi)
+            c1 = {}; landed_ctx(R, [(5, g("rev-parse", "track/carrier"))], c1)
+        finally:
+            globals().update(patch_ids=_pi)
+        ok("LANDED: a merged head whose patch-ids could not be read (timeout) is left out of the cache; a read one is kept",
+           c0 == {} and list(c1.values())[0][0] == 5 and list(c1.values())[0][1])
+        # MAIN-GITDIR COMMONDIR: a member plants DEV/rl/.git/commondir naming a repo of theirs whose config gives origin
+        # an uploadpack command and an fsmonitor. Plain git in the checkout follows it (armed first); every repo-level
+        # call reconcile and the sweep make (has_remote, merged heads, patch-ids, ls-remote) must run neither.
+        pw3, evc = f"{tl}/commondir-ran", f"{tl}/member/evilcd"
+        sh("git", "init", "-q", evc, timeout=30)
+        open(f"{evc}/.git/config", "a").write(f'[remote "origin"]\n\turl = {tl}/origin.git\n'
+                                              f'\tuploadpack = touch {pw3}; git-upload-pack\n[core]\n\tfsmonitor = touch {pw3}\n')
+        open(f"{R}/.git/commondir", "w").write(f"{evc}/.git\n")
+        try:
+            sh("git", "-C", R, "ls-remote", "--heads", "origin", timeout=30)
+            armed3 = os.path.exists(pw3)
+            if armed3:
+                os.remove(pw3)
+            globals().get("_SHADOWS", {}).clear()            # nothing this pass made before the plant is reused
+            quietly(main, ["rl", "--grace", "0"])
+            out3 = quietly(sweep_repo, "rl", Sweep(dry=True), {}, False, 0)
+        finally:
+            os.remove(f"{R}/.git/commondir")
+        ok("PINNED GIT: a planted commondir in the checkout's own .git (origin's uploadpack and an fsmonitor in the repo "
+           "it names) runs nothing through reconcile or the sweep, which still list origin's branches",
+           armed3 and not os.path.exists(pw3) and "origin could not be listed" not in out3)
+    finally:
+        restore(); shutil.rmtree(tl, ignore_errors=True)
+    # (m) THE BAYESIAN-SQUIRREL SHAPE: six branches rebased into two squash-merged PRs, main moved on since. Five are
+    # a stack (backtester → backtester-fixes → live-path → live-path-fixes → live-kill-fixes) carried by #5 (the
+    # kill-file-fixes branch); prices is carried by #7 (prices-fixes). Each layer edits lines the one below wrote.
+    tm = tempfile.mkdtemp(prefix="cc-reconcile-bs-")
+    try:
+        R = f"{tm}/dev/bs"
+        g = lambda *a: (sh("git", "-C", R, "-c", "user.name=t", "-c", "user.email=t@t", *a, timeout=30).stdout or "").strip()
+        def put(name, body, msg):
+            open(f"{R}/{name}", "w").write(body); g("add", name); g("commit", "-qm", msg)
+        nine = lambda first, last: f"{first}\n" + "".join(f"{i}\n" for i in range(2, 9)) + f"{last}\n"
+        os.makedirs(R); g("init", "-q", "-b", "main"); put("a.txt", nine(1, 9), "c0")
+        g("checkout", "-q", "-b", "track/prices"); put("prices.py", "p\n", "p1")
+        g("checkout", "-q", "-b", "track/dashboard", "main"); put("dash.py", "d\n", "d1")   # landed nowhere
+        g("checkout", "-q", "-b", "track/backtester", "main"); put("bt.py", "a\nb\nc\n", "bt1")
+        g("checkout", "-q", "-b", "track/backtester-fixes"); put("bt.py", "a\nB\nc\n", "bt2")
+        g("checkout", "-q", "-b", "track/live-path"); put("live.py", "l1\nl2\n", "lp1"); put("a.txt", nine("L", 9), "lp1b")
+        g("checkout", "-q", "-b", "track/live-path-fixes"); put("live.py", "L1\nl2\n", "lp2")
+        g("checkout", "-q", "-b", "track/live-kill-fixes"); put("kill.py", "k\n", "lk1")
+        g("checkout", "-q", "main"); put("a.txt", nine(1, "9m"), "m1")   # main moves on, clear of lp1b's lines
+        stack = g("rev-list", "--reverse", "main..track/live-kill-fixes").split()
+        g("checkout", "-q", "-b", "track/kill-file-fixes"); g("cherry-pick", *stack)        # the stack, rebased
+        put("kf.txt", "kf\n", "kf1")
+        g("checkout", "-q", "main"); g("merge", "-q", "--squash", "track/kill-file-fixes"); g("commit", "-qm", "kill-file-fixes (#5)")
+        g("checkout", "-q", "-b", "track/prices-fixes"); g("cherry-pick", "track/prices"); put("prices.py", "P\n", "p2")
+        g("checkout", "-q", "main"); g("merge", "-q", "--squash", "track/prices-fixes"); g("commit", "-qm", "prices-fixes (#7)")
+        put("a.txt", nine("LL", "9m"), "m2"); put("prices.py", "PP\n", "m3"); put("bt.py", "a\nB\nC\n", "m4")   # on again
+        sh("git", "init", "-q", "--bare", f"{tm}/origin.git", timeout=30)
+        g("remote", "add", "origin", f"{tm}/origin.git"); g("push", "-q", "origin", "main")
+        heads = ",".join(f'{{"number": {n}, "headRefOid": "{g("rev-parse", b)}"}}' for n, b in ((5, "track/kill-file-fixes"),
+                                                                                            (7, "track/prices-fixes")))
+        scratch(tm, dict(NOOP, gh=f'case "$*" in *"--state merged"*) echo \'[{heads}]\';; *) echo "[]";; esac'))
+        cbl = lambda *a: sh(f"{BIN}/cc-board", *a, timeout=30)
+        cbl("init", "bs", R, "main")
+        six = ("backtester", "backtester-fixes", "live-path", "live-path-fixes", "live-kill-fixes", "prices")
+        for t in six + ("dashboard",):
+            os.makedirs(f"{tm}/.cc/worktrees/bs/{t}"); cbl("add", "bs", t, "a row", ""); cbl("status", "bs", t, "blocked")
+        globals().update(procs=lambda: (set(), set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}))
+        plain = all(sh("git", "-C", R, "merge-tree", "--write-tree", "origin/main", f"track/{t}", timeout=30).returncode
+                    for t in six)
+        quietly(main, ["bs", "--apply", "--grace", "0"])
+        b = board_read(f"{tm}/.cc/boards/bs.json")["tracks"]
+        inside = {t: next((n for n in (str(x.get("msg", "")) for x in b[t].get("notes") or []) if "landed inside" in n), "")
+                  for t in b}
+        ok("BAYESIAN-SQUIRREL: of seven blocked rows, exactly the six whose branches went in through fund#5 and #7 go "
+           "`merged` — none of them merges into main cleanly any more — and the one that landed nowhere stays",
+           plain and sorted(t for t in b if b[t]["status"] == "merged") == sorted(six) and b["dashboard"]["status"] == "blocked")
+        ok("…five name #5 and prices names #7",
+           all(inside[t].endswith("(its branch landed inside #5)") for t in six[:5]) and inside["prices"].endswith("inside #7)"))
+    finally:
+        restore(); shutil.rmtree(tm, ignore_errors=True)
     # (h) HOLDS: a hold that waits on a merged PR is lifted; on an open one it stands; beside another condition, a note
     ok("HOLDS: the hold's own wait words name the PRs — both of `#558 and #561`, `improve's #632` — and nothing else",
        hold_prs("starts when #558 and #561 land: same files; then one worker")[0] == (558, 561)
@@ -1785,6 +2055,84 @@ def selfcheck():
            on_origin() == ["track/later", "track/seat"] and "track/seat" not in out)
     finally:
         restore(); shutil.rmtree(tb, ignore_errors=True)
+    # (c3) A MEMBER WORKSPACE'S CHECKOUT: the sweep takes no destructive step in it — no `cc rm` (rule 1), no push
+    # --delete (rule 2), no worktree removal (rule 9) — and hands each to the member's own seat instead. Two attacks ride
+    # on it, and both went through at 5560f0c2: a refs/remotes/origin the member links at another repo's refs/heads (the
+    # owner's push --delete then deleted that repo's branch), and a .claude the member swaps for a link between the
+    # rule-9 check and its rmtree (which then removed a directory outside the workspace).
+    tm2 = tempfile.mkdtemp(prefix="cc-reconcile-member-")
+    _home = HOME
+    try:
+        def git(*a):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], capture_output=True,
+                                  text=True, timeout=30)
+        mb, vic, vdir = f"{tm2}/dev/mb", f"{tm2}/dev/vic", f"{tm2}/victim"
+        git("init", "-q", "--bare", f"{tm2}/origin.git")
+        git("init", "-q", "-b", "main", mb); git("-C", mb, "remote", "add", "origin", f"{tm2}/origin.git")
+        git("-C", mb, "commit", "-q", "--allow-empty", "-m", "c0"); git("-C", mb, "push", "-q", "origin", "main")
+        git("-C", mb, "push", "-q", "origin", "HEAD:refs/heads/track/once")
+        tip = git("-C", mb, "rev-parse", "HEAD").stdout.strip()
+        git("init", "-q", "-b", "main", vic); git("-C", vic, "commit", "-q", "--allow-empty", "-m", "v0")
+        git("-C", vic, "branch", "track/once")
+        shutil.rmtree(f"{mb}/.git/refs/remotes/origin/track", ignore_errors=True)    # origin/main stays a plain ref
+        os.symlink(f"{vic}/.git/refs/heads/track", f"{mb}/.git/refs/remotes/origin/track")   # the planted refs link
+        os.makedirs(f"{mb}/.cc"); open(f"{mb}/.cc/member-workspace", "w").close()
+        sub = f"{mb}/{AGENT_WT}/sub"
+        git("-C", mb, "worktree", "add", "-q", "--detach", sub)
+        os.makedirs(f"{vdir}/worktrees/sub"); open(f"{vdir}/worktrees/sub/keep", "w").write("the owner's\n")
+        for root, ds, fs in os.walk(f"{mb}/.claude"):                                # idle past rule 9's 4 h
+            for x in ds + fs + [""]:
+                os.utime(os.path.join(root, x), (0, 0), follow_symlinks=False)
+        scratch(tm2, dict(NOOP, gh=f"cat {tm2}/prs.json", cc=f'echo "$*" >> {tm2}/cc.log',
+                          **{"cc-msg": f'echo "$*" >> {tm2}/msg.log'}))
+        json.dump([{"number": 1, "state": "MERGED", "headRefName": "track/once", "headRefOid": tip,
+                    "mergedAt": "2026-09-20T00:00:00Z"}], open(f"{tm2}/prs.json", "w"))
+        young = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        json.dump({"repo": "mb", "tracks": {"once": {"status": "merged", "updated": young},
+                                            "gone": {"status": "merged", "updated": old}}},
+                  open(f"{tm2}/.cc/boards/mb.json", "w"))
+        os.makedirs(f"{tm2}/.cc/worktrees/mb/gone")
+        globals().update(procs=lambda: (set(), set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}))
+        _dirty, calls = dirty, []
+
+        def swapping(repo, wt):                          # the member's move, between rule 9's check and its rmtree
+            calls.append(wt)
+            if len([c for c in calls if c == sub]) == 2 and not os.path.islink(f"{mb}/.claude"):
+                os.rename(f"{mb}/.claude", f"{mb}/.claude-was"); os.symlink(vdir, f"{mb}/.claude")
+            return _dirty(repo, wt)
+        globals().update(dirty=swapping)
+        try:
+            out = quietly(sweep_cmd, ["mb"])
+        finally:
+            globals().update(dirty=_dirty)
+        if os.path.islink(f"{mb}/.claude"):
+            os.unlink(f"{mb}/.claude"); os.rename(f"{mb}/.claude-was", f"{mb}/.claude")
+        refs = lambda d: git("-C", d, "for-each-ref", "--format=%(refname)").stdout.split()
+        msgs = lambda: open(f"{tm2}/msg.log").read().splitlines() if os.path.exists(f"{tm2}/msg.log") else []
+        stale = open(f"{tm2}/.cc/state/mb/stale.md").read() if os.path.exists(f"{tm2}/.cc/state/mb/stale.md") else ""
+        ok("MEMBER CHECKOUT: a branch whose PR merged at origin's tip is not deleted, and the member's refs link at "
+           "another repo's refs/heads deletes nothing there", "refs/heads/track/once" in refs(f"{tm2}/origin.git")
+           and "refs/heads/track/once" in refs(vic) and "stale, left to its own seat: would delete" in out)
+        ok("…an idle subagent worktree is not removed, and a .claude swapped for a link mid-sweep removes nothing "
+           "outside the workspace", os.path.exists(f"{vdir}/worktrees/sub/keep") and os.path.isdir(sub))
+        ok("…a merged row past 48 h is not `cc rm`ed: its worktree is a worktree of the member's checkout",
+           not os.path.exists(f"{tm2}/cc.log") and os.path.isdir(f"{tm2}/.cc/worktrees/mb/gone"))
+        ok("…and all three go to the member's own seat: listed in its state dir's stale.md, with one cc-msg line",
+           all(x in stale for x in ("delete origin/track/once", f"rm worktree {sub}", "rm mb/gone"))
+           and len(msgs()) == 1 and msgs()[0].startswith("mb sweep: 3 stale items"))
+        quietly(sweep_cmd, ["mb"])
+        ok("…the next pass with the same list sends nothing more", len(msgs()) == 1)
+        sd = git_shadow(mb)
+        ok("…and a read's shadow holds COPIES of the refs, the planted link skipped, never followed",
+           not os.path.islink(f"{sd}/refs") and not os.path.lexists(f"{sd}/refs/remotes/origin/track")
+           and os.path.isfile(f"{sd}/refs/remotes/origin/main") and not os.path.islink(f"{sd}/objects"))
+        os.remove(f"{mb}/.cc/member-workspace"); os.makedirs(f"{tm2}/.cc/members/mb")
+        globals().update(HOME=tm2)
+        ok("MEMBER CHECKOUT: the host-side ~/.cc/members/<repo> marks a member workspace when the checkout's own marker "
+           "is gone (a member can delete that one), and a repo with neither is the owner's",
+           member_ws("mb") and not member_ws("vic"))
+    finally:
+        globals().update(HOME=_home); restore(); shutil.rmtree(tm2, ignore_errors=True)
     ok("branch_verdict: a MERGED PR with no head read deletes nothing",
        branch_verdict({"board": "merged", "pr": "MERGED", "head": "", "tip": "", "dirty": False})[0] == "report")
     # (d) digest: a waiting row's question is listed; a merged-and-quiet row is not there at all
@@ -1837,6 +2185,13 @@ def selfcheck():
            and "granted from your goals" not in digest_text({}, phone=True))
         open(f"{td}/fmetrics", "w").write("records: 0 (0 confirmed)  clusters: 0  eligible: 0\n")
         ok("…an empty ledger is no line at all", "🧾" not in digest_text({}))
+        ok("…no cc-collect snapshot is no agenticness section", "How far it ran without you" not in digest_text({}))
+        open(f"{td}/stubs/cc-agenticness", "w").write("#!/bin/sh\necho '• dg: 2 landed (1 never waited on a person)'\n")
+        os.chmod(f"{td}/stubs/cc-agenticness", 0o755)
+        ok("…while a snapshot's lines come in under their own heading in the whole report, and not in the phone one",
+           "*How far it ran without you*\n• dg: 2 landed (1 never waited on a person)" in digest_text({})
+           and "How far it ran" not in digest_text({}, phone=True))
+        os.remove(f"{td}/stubs/cc-agenticness")
         open(f"{td}/stubs/cc-failures", "w").write("#!/bin/sh\nexit 1\n")   # a box whose cc-failures cannot answer
         dnone = digest_text({})
         ok("…and a box whose cc-failures cannot answer gets no line either, and the report still prints", "Failures:" not in dnone and dnone.startswith("*fixturebox* today"))

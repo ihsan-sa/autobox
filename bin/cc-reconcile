@@ -35,6 +35,12 @@ cc-board with a `reconciled:` note. Undecidable (closed PR, gone worktree, refus
 no worker and nothing says why) is reported and, with --notify, offered to the repo's live session through the
 broker door (CC_RECONCILE_INJECT, CC_BROKER_SOURCE from the unit); what no session takes pages the owner. A row
 that never ran — no claim, never started, no journal, no worktree — is reported as never started, not as lost. A
+`blocked` or `review` row with nothing alive in it, no PR of its own or one closed unmerged, whose branch has nothing
+left to land on origin's main is set `merged`, naming the PR that carried it: merging its tip into main changes nothing,
+or every commit of its own has its patch in a merged PR's head (stacked under, or rebased into, a PR that was squashed)
+and every hunk of its own diff is in that PR's final tree. --apply keeps the heads' patch-ids in
+~/.cc/state/landed-patches.json; a report reads that file and writes nothing. A half-landed branch, a dirty worktree,
+a merge commit adding changes of its own, or a tip on main's own first-parent line stays as it is. A
 line about a PR is re-read at GitHub at send time and dropped if the merge ANSWERS it — a safety ask standing
 beside it, an unpushed branch, still goes out (--no-net never asks, so never drops). A finished row (`merged`/
 `done`) raises nothing on suspicion; a merged row whose branch really holds commits origin lacks is still
@@ -78,6 +84,21 @@ Rule 4: never the planning window, a live pane, or a row that is not terminal. R
 held by any live process → reported. Rule 9: a `.claude/worktrees/*` subagent worktree silent for 4 h
 (CC_JANITOR_AGENT_HOURS) with nothing live in it and no commit its merged PR lacks → removed; else reported.
 Anything uncertain is reported, never removed. Log: ~/.cc/state/janitor.log. Repos: CC_JANITOR_REPOS (~/.cc/config).
+A MEMBER WORKSPACE (~/.cc/members/<repo>, or .cc/member-workspace or .cc/member-facing in the checkout) gets no
+destructive step from the sweep: rules 1, 2 and 9 there are reported as stale to its own seat instead, listed in
+~/.cc/state/<repo>/stale.md with one cc-msg line when that list changes. Owner repos keep the clean-up above.
+
+GIT IN A WORKTREE: a row's `worktree` is board text a member can write, and a member repo's checkout is theirs, so
+git runs in a worktree only through wt_git(): one that resolves under ~/.cc/worktrees/<repo>/ or the checkout's
+.claude/worktrees/ and whose `.git` names its own admin dir under ~/dev/<repo>/.git/worktrees/, with GIT_DIR,
+GIT_COMMON_DIR and GIT_WORK_TREE set to those, and its branch read from that admin dir's HEAD as text. Any other is
+dirty to the sweep, and judged on its branch name alone by the landed check. Every git call passes
+-c core.fsmonitor=false, and `status` passes --ignore-submodules=all. A member's ~/dev/<repo> is theirs too, so git
+never reads its config, hooks or `commondir`: every repo-level call (and a worktree's common dir) goes through
+repo_git(), which points git at a git dir this process made, holding copies of the checkout's refs (a link among
+them is skipped), its objects as an alternate (what git writes stays in that dir) and a config of its own holding
+only origin's url. Origin is contacted over https or ssh only. Rule 9 lists worktrees
+from their admin dirs as text and removes one itself, never with `git worktree remove`.
 
 WAKE (in the tick, CC_WAKE=on only; unset, each repo logs a skip): for each repo whose board is not all `session` rows, that is not a throwaway repo
 (`cc-throwaway`: no pass of the tick reads its board, boards()), that `cc-pause` has not parked and that
@@ -94,7 +115,8 @@ DIGEST (`digest`): the five questions off the boards and the snapshot — shippe
 row inside a live bundle is counted "in bundles", not queued: the bundle row is what is moving), waiting
 on you (each row's question, then the owner's 📌 pins from ~/.cc/slack/revisit.json), stopped, cost (cc-spend
 today) — and one line from the failure ledger, what it holds and what crossed the rule (cc-failures owns the numbers;
-an empty ledger is no line), and what cc-slack's engagement gate held back in the last day, one line per project
+an empty ledger is no line), `cc-agenticness`'s lines, one per repo, under "How far it ran without you" (counts
+off cc-collect's snapshot; no snapshot is no section), and what cc-slack's engagement gate held back in the last day, one line per project
 (`cc-slack folded`; the phone one names it among the rest). That whole report is what `digest` prints. What `--notify` POSTS (the tick itself no
 longer does — it only stamps the day) is the phone one: the counts line, the limit and the tier's word,
 how many failure kinds crossed the rule (none is no line), every waiting row's question (cut to 120) and the asks count,
@@ -133,7 +155,7 @@ so is one GitHub could not be asked about. The writer never changes the pass: se
 
 Exit: 0 the board matches reality · 1 something needs a person · 2 usage error.
 """
-import calendar, datetime, glob, json, os, re, shutil, signal, subprocess, sys, time, zoneinfo
+import atexit, calendar, datetime, glob, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time, zoneinfo
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))      # siblings come from the same bin/ as this copy
@@ -158,6 +180,9 @@ STALE = 48 * 3600  # sweep rule 1: a terminal track younger than this is still b
 SWEEP_PRS = 200    # sweep rule 2: one `gh pr list` per repo, capped
 NEXT = "~next"     # cc-handoff's successor window suffix
 AGENT_WT = ".claude/worktrees"   # sweep rule 9: where the harness puts a subagent's worktree
+GIT = ("git", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+       "-c", "protocol.ssh.allow=always")   # every git call: no fsmonitor, and origin only over https or ssh
+FILE_REMOTES = False   # a local-path origin is never contacted (its hooks and config are its owner's); fixtures allow it
 AGENT_HOURS = 4    # …and the silence that says its subagent is gone (CC_JANITOR_AGENT_HOURS)
 QUIET_H = 24       # wake: hours the same look is not sent again
 WORKING_FOOTER = "esc to interrupt"   # the pane footer for a turn in progress (the string cc-slack reads)
@@ -608,29 +633,183 @@ def commit_marker(repo, track, home=None):
     return next((p for p in (host, member) if os.path.exists(p)), host)
 
 
-def wt_branch(wt):
-    """The branch checked out in <wt>, or "" (detached, no checkout of its own, git would not answer)."""
-    if not os.path.exists(f"{wt}/.git"):
+_SHADOWS = {}
+
+
+def git_shadow(checkout):
+    """A git dir this process made, standing in for <checkout>'s own `.git`, or None (no `.git` directory there). It
+    copies the checkout's refs and HEAD (copy_refs), reads its objects as an alternate, so git reads the repo's data, while its config
+    is written here: only origin's url (https or ssh, read with `git config --file --no-includes`) and the object
+    format. A member's ~/dev/<repo> is theirs, so git never reads its config, hooks, attributes drivers or `commondir`
+    (a planted one redirects all of those, and remote.origin.uploadpack in it ran as the owner on ls-remote)."""
+    try:
+        gd = os.path.realpath(checkout) + "/.git"
+        if gd in _SHADOWS:
+            return _SHADOWS[gd]
+        if not stat.S_ISDIR(os.lstat(gd).st_mode):
+            return None
+        head = open(f"{gd}/HEAD").read(4096).strip()
+    except (OSError, ValueError):
+        return None
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+    def conf(*a):
+        return sh_env(["git", "config", "--no-includes", *a], env, timeout=10)
+    def get(k):
+        x = conf("--file", f"{gd}/config", "--get", k)
+        return x.stdout.strip() if x is not None and x.returncode == 0 else ""
+    url, fmt = get("remote.origin.url"), get("extensions.objectformat")
+    d = tempfile.mkdtemp(prefix="cc-reconcile-git-")
+    atexit.register(shutil.rmtree, d, True)
+    copy_refs(gd, d)
+    os.makedirs(f"{d}/objects/info")                    # objects git writes (merge-tree) land here, never in the checkout
+    open(f"{d}/objects/info/alternates", "w").write(os.path.realpath(f"{gd}/objects") + "\n")
+    open(f"{d}/HEAD", "w").write(head + "\n")
+    cfg = f"{d}/config"
+    conf("--file", cfg, "core.repositoryformatversion", "1" if fmt else "0")
+    if fmt:
+        conf("--file", cfg, "extensions.objectformat", fmt)
+    if remote_ok(url):
+        conf("--file", cfg, "remote.origin.url", url)
+        conf("--file", cfg, "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+    _SHADOWS[gd] = d
+    return d
+
+
+def copy_refs(gd, d):
+    """git_shadow()'s refs: COPIES of the checkout's plain files (refs/, packed-refs, shallow), so a ref git writes or
+    deletes here (a push --delete drops origin/<b>) stays here. A symlink anywhere in them is skipped, never followed:
+    a member's refs/remotes/origin linked at another repo's refs/heads made the owner's push delete that repo's branch."""
+    for n in ("packed-refs", "shallow"):
+        try:
+            if stat.S_ISREG(os.lstat(f"{gd}/{n}").st_mode):
+                shutil.copyfile(f"{gd}/{n}", f"{d}/{n}", follow_symlinks=False)
+        except OSError:
+            pass
+    os.makedirs(f"{d}/refs")
+    try:
+        if not stat.S_ISDIR(os.lstat(f"{gd}/refs").st_mode):
+            return
+    except OSError:
+        return
+    for root, dirs, files in os.walk(f"{gd}/refs", followlinks=False):
+        rel = os.path.relpath(root, gd)
+        dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(root, x))]
+        for x in dirs:
+            os.makedirs(f"{d}/{rel}/{x}", exist_ok=True)
+        for x in files:
+            try:
+                if stat.S_ISREG(os.lstat(os.path.join(root, x)).st_mode):
+                    shutil.copyfile(os.path.join(root, x), f"{d}/{rel}/{x}", follow_symlinks=False)
+            except OSError:
+                continue
+
+
+def member_ws(repo):
+    """Is ~/dev/<repo> a member workspace's checkout? The host-side ~/.cc/members/<repo> (no bind of the boundary
+    reaches it, so no member removes it), or either marker in the checkout."""
+    return os.path.isdir(f"{HOME}/.cc/members/{repo}") or any(
+        os.path.lexists(f"{DEV}/{repo}/.cc/{m}") for m in ("member-workspace", "member-facing"))
+
+
+def remote_ok(url):
+    """An origin git may contact as the owner: https, ssh, or scp-like ssh; a local path only when fixtures allow it."""
+    if re.match(r"^(https|ssh)://[^-]", url) or re.match(r"^[\w.-]+@[\w.-]+:[^-:]", url):
+        return True
+    return FILE_REMOTES and bool(re.match(r"^(/|file:///)", url))
+
+
+def sh_env(cmd, env, timeout=120, cwd="/", input=None, text=True):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=text, timeout=timeout, cwd=cwd, env=env, input=input,
+                              **({} if input is not None else {"stdin": subprocess.DEVNULL}))
+    except Exception:
+        return None
+
+
+def repo_git(checkout, *args, timeout=120, input=None, env=None, text=True):
+    """THE one way cc-reconcile runs git on a repo's own checkout: against git_shadow(<checkout>), so with no config,
+    hook or commondir of the member's. None when there is no checkout's `.git`, or git could not run or hung."""
+    d = git_shadow(checkout)
+    if d is None:
+        return None
+    e = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    e.update(env or {}, GIT_DIR=d)
+    fx = ("-c", "protocol.file.allow=always") if FILE_REMOTES else ()
+    return sh_env([*GIT, *fx, *args], e, timeout=timeout, cwd=d, input=input, text=text)
+
+
+def wt_pin(repo, wt):
+    """(worktree, admin dir, common dir) when git may run in <wt> as the owner, else None. A row's `worktree` is board
+    text a member can write, and a member repo's checkout and worktrees are the member's: git run there follows the
+    path's own `.git`, its admin dir's `commondir` and any embedded repo, and reads each one's config (a planted
+    core.fsmonitor is a command). So <wt> must resolve under WTS/<repo>/ or DEV/<repo>/AGENT_WT/, its `.git` must be a
+    plain file whose gitdir is an admin dir directly under DEV/<repo>/.git/worktrees/, and that admin dir's `gitdir`
+    must name this `.git` back. wt_git() then names all three to git itself rather than let it follow a link."""
+    try:
+        real, common = os.path.realpath(wt), os.path.realpath(f"{DEV}/{repo}") + "/.git"
+        if not any(real.startswith(os.path.realpath(r) + os.sep) for r in (f"{WTS}/{repo}", f"{DEV}/{repo}/{AGENT_WT}")):
+            return None
+        if not stat.S_ISDIR(os.lstat(common).st_mode) or not stat.S_ISREG(os.lstat(f"{real}/.git").st_mode):
+            return None
+        line = open(f"{real}/.git").read(4096).strip()
+        if not line.startswith("gitdir:"):
+            return None
+        admin = os.path.realpath(os.path.join(real, line[len("gitdir:"):].strip()))
+        if os.path.dirname(admin) != f"{common}/worktrees":
+            return None
+        if os.path.realpath(open(f"{admin}/gitdir").read(4096).strip()) != f"{real}/.git":
+            return None
+    except (OSError, ValueError):
+        return None
+    return real, admin, common
+
+
+def wt_git(repo, wt, *args, timeout=60):
+    """THE one way cc-reconcile runs git in a worktree: None when wt_pin() refuses <wt>, or git could not run or hung.
+    GIT_DIR and GIT_WORK_TREE are the pinned ones and GIT_COMMON_DIR is git_shadow()'s, so neither the admin dir's
+    `commondir` nor the checkout's config is read; core.fsmonitor is off, and `status` never looks
+    inside a submodule or an embedded repo (a git run there would read that repo's config)."""
+    pin = wt_pin(repo, wt)
+    if pin is None:
+        return None
+    real, admin, common = pin
+    if args[:1] == ("status",):
+        args = ("status", "--ignore-submodules=all", *args[1:])
+    shadow = git_shadow(os.path.dirname(common))
+    if shadow is None:
+        return None
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_DIR=admin, GIT_COMMON_DIR=shadow, GIT_WORK_TREE=real, GIT_OPTIONAL_LOCKS="0")   # status writes no index
+    return sh_env([*GIT, *args], env, timeout=timeout, cwd=real)
+
+
+def wt_branch(repo, wt):
+    """The branch checked out in <wt>, or "" (detached, not a worktree wt_pin() vouches for). Read from its admin
+    dir's HEAD as text: no git runs."""
+    pin = wt_pin(repo, wt)
+    try:
+        head = open(f"{pin[1]}/HEAD").read(4096).strip() if pin else ""
+    except OSError:
         return ""
-    r = sh("git", "-C", wt, "symbolic-ref", "--short", "HEAD", timeout=10)
-    return "" if r is None or r.returncode else r.stdout.strip()
+    return head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else ""
 
 
-def branch_unpushed(wt):
+def branch_unpushed(repo, wt):
     """Does this worktree hold commits origin lacks? True / False / None (cannot tell: no branch, never on origin).
     The push.err marker is not this answer: nothing clears it when the branch reaches origin another way."""
-    br = wt_branch(wt)
+    br = wt_branch(repo, wt)
     if not br:
         return None
-    up = sh("git", "-C", wt, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{br}", timeout=10)
+    up = wt_git(repo, wt, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{br}", timeout=10)
     if up is None or up.returncode:
         return None
-    anc = sh("git", "-C", wt, "merge-base", "--is-ancestor", "HEAD", up.stdout.strip(), timeout=10)
+    anc = wt_git(repo, wt, "merge-base", "--is-ancestor", "HEAD", up.stdout.strip(), timeout=10)
     return None if anc is None else anc.returncode != 0
 
 
 def has_remote(repo):
-    p = sh("git", "-C", f"{DEV}/{repo}", "remote", "get-url", "origin", timeout=10)
+    p = repo_git(f"{DEV}/{repo}", "remote", "get-url", "origin", timeout=10)
     return p is not None and p.returncode == 0
 
 
@@ -661,6 +840,11 @@ def decide(f):
     never_ran = not (f.get("delivery") or f.get("started") or f.get("worked")) and not f["wt_exists"]
     if f.get("stop_why"):
         out.append(("stop", "blocked", f["stop_why"]))
+        settled = True
+    elif f.get("landed") and st in ("blocked", "review"):   # facts() only asks a row with nothing alive in it
+        # the landing answers a stale STATUS: BLOCKED question, so it outranks the person-wait below: otherwise the
+        # row flips to `waiting` and the owner is asked every run about work that is already on main
+        out.append(("fix", "merged", f["landed"]))
         settled = True
     elif who == "person" and st not in TERMINAL:        # a declaration outranks presence, and is said every run
         out.append(("ask", "waiting", "it is waiting on you: " + wwhy))
@@ -714,7 +898,7 @@ def decide(f):
             out.append(("ask", None, "its PR was closed without merging"))
         elif pr == "?":
             out.append(("info", None, "could not read its PR state"))
-    if st == "review" and not has_pr and f.get("has_remote"):
+    if st == "review" and not has_pr and f.get("has_remote") and not f.get("landed"):
         out.append(("ask", None, "it is waiting on a PR that was never opened"))
     word = next((s for _, s, _ in out if s), "") or st   # the word this run landed on
     finished = word in TERMINAL                          # the work landed: a gone worktree or branch is success
@@ -954,7 +1138,7 @@ def false_nags(gone, prs, net=True):
                 continue
             repo, track = m.groups()
             wt = f"{WTS}/{repo}/{track}"
-            cands = [b for b in ([wt_branch(wt)] if os.path.isdir(wt) else [track, f"track/{track}"]) if b]
+            cands = [b for b in ([wt_branch(repo, wt)] if os.path.isdir(wt) else [track, f"track/{track}"]) if b]
             hit = None
             for b in cands:
                 for n, st, merged, created in (branch_prs(repo, b, net) or []):
@@ -1057,14 +1241,16 @@ def boards():
     return out
 
 
-def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT_MARK):
-    """Every board track with what the box says about it. Yields (repo, track, board_track, facts)."""
+def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT_MARK, save=False):
+    """Every board track with what the box says about it. Yields (repo, track, board_track, facts). Only `save`
+    (an --apply run) writes the patch-id cache; a report keeps what it reads in memory."""
     live, ppids, sessions, workers, loops = procs()
     tlive, pane_idle, wins = tmux_live(ppids, sessions)
     live |= tlive
     seen, limited = ledger(f"{STATE}/wedged.json"), limit_active()
     started = limit_started()
     prs, remotes, t0, wp = 0, {}, now(), None
+    ctxs, patches = {}, None
     for fn, d in boards():
         if d is None:
             continue
@@ -1098,13 +1284,31 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
                  "journal": journal(repo, track), "loop_end": loop_end(repo, track),
                  "commit_err": os.path.exists(commit_marker(repo, track)),
                  "push_err": os.path.exists(push_marker(repo, track)), "has_remote": remotes[repo],
-                 "unpushed": branch_unpushed(wt) if os.path.exists(push_marker(repo, track)) else False,
+                 "unpushed": branch_unpushed(repo, wt) if os.path.exists(push_marker(repo, track)) else False,
                  "workers": workers.get(key, []), "loops": loops.get(key, []), "limited": limited,
                  "orphans": workers.get(key, []) if not loops.get(key) else [],
                  "idle": idle_for(repo, track, wt) if workers.get(key) else 0.0,
                  "pane_idle": pane_idle.get(key, 0.0)}
             f["stop_why"] = "" if no_stop else runaway(f, t0 - float(seen.get(key) or 0) <= WEDGE_SEEN, wedged)
             f["wedged_now"] = bool(f["workers"] and not f["limited"] and f["idle"] >= wedged)
+            # "Never touch a row that is running or has a live worker": only a still blocked/review row with nothing
+            # alive in it is asked whether it landed, and only one with no PR of its own or one closed unmerged — a
+            # PR this pass did not read may be open, and the next pass would set the row back to review
+            if (st in ("blocked", "review") and (not pr or f["pr_state"] == "CLOSED") and not f["live"]
+                    and not f["workers"] and not f["loops"] and not ag_live):
+                if repo not in ctxs:                    # one `gh pr list` per repo, and only for a repo that has one
+                    cache = f"{STATE}/landed-patches.json"   # {repo: {merged head oid: [PR number, [patch-ids]]}}
+                    patches = ledger(cache) if patches is None else patches
+                    known = len(patches.get(repo) or {})
+                    ctxs[repo] = landed_ctx(f"{DEV}/{repo}", merged_heads(repo, net), patches.setdefault(repo, {}),
+                                            d.get("default_branch") or "main")
+                    # a report run writes no cache, so a hand-run report on a busy repo re-reads every merged head
+                    # (up to SWEEP_PRS `git log -p` + patch-id) each time: slow there, but it leaves no state behind
+                    if save and len(patches[repo]) != known:   # a newly read head, under --apply: a report writes nothing
+                        ledger(cache, patches)
+                own = wt if wt_pin(repo, wt) else ""   # board text names `wt`: git runs in it only when it is ours
+                f["landed"] = landed(ctxs[repo], (wt_branch(repo, wt), t.get("branch") or "", f"track/{track}"),
+                                     repo, own)
             yield repo, track, t, f
 
 
@@ -1137,7 +1341,7 @@ def orphans(repos, net=True, grace=GRACE, busy=None):
         prs = None
         if asked < ORPHANPRS:
             asked += 1
-            prs = branch_prs(repo, wt_branch(p), net)
+            prs = branch_prs(repo, wt_branch(repo, p), net)
         if prs:
             busy = landing() if busy is None else busy
             if any(st == "OPEN" or (repo, n) in busy or (st == "MERGED" and t0 - at <= BETWEEN_ROUNDS)
@@ -1243,11 +1447,12 @@ def dur(s):
     return f"{int(s)}s"
 
 
-def dirty(wt):
-    """Uncommitted work (untracked included). No `.git` there: nothing to lose. git refusing to answer: dirty."""
-    if not os.path.exists(f"{wt}/.git"):
+def dirty(repo, wt):
+    """Uncommitted work (untracked included). No `.git` there: nothing to lose. A `.git` wt_pin() will not vouch for,
+    or git refusing to answer: dirty, so nothing is removed on a guess."""
+    if not os.path.lexists(f"{wt}/.git"):
         return False
-    p = sh("git", "-C", wt, "status", "--porcelain", timeout=60)
+    p = wt_git(repo, wt, "status", "--porcelain", timeout=60)
     return p is None or p.returncode != 0 or bool(p.stdout.strip())
 
 
@@ -1308,10 +1513,200 @@ def pr_of(prs, branch):
 
 def remote_tracks(repo):
     """{branch: tip sha} for the track/* branches on origin, or None when origin could not be listed."""
-    p = sh("git", "-C", f"{DEV}/{repo}", "ls-remote", "--heads", "origin", "refs/heads/track/*", timeout=60)
+    p = repo_git(f"{DEV}/{repo}", "ls-remote", "--heads", "origin", "refs/heads/track/*", timeout=60)
     if p is None or p.returncode != 0:
         return None
     return {ln.split("refs/heads/")[-1]: ln.split()[0] for ln in p.stdout.splitlines() if "refs/heads/track/" in ln}
+
+
+def merged_heads(repo, net=True):
+    """[(number, head_oid)] for the repo's merged PRs, oldest first, from one `gh pr list`; [] when not asked."""
+    cwd = f"{DEV}/{repo}"
+    if not net or not shutil.which("gh") or not os.path.isdir(cwd):
+        return []
+    p = sh("gh", "pr", "list", "--state", "merged", "--limit", str(SWEEP_PRS), "--json", "number,headRefOid",
+           cwd=cwd, timeout=60)
+    try:
+        rows = json.loads(p.stdout) if p is not None and p.returncode == 0 else []
+        return sorted((int(r["number"]), str(r.get("headRefOid") or "")) for r in rows)
+    except Exception:
+        return []
+
+
+def patch_ids(cwd, *revs):
+    """{patch-id: commit} for the non-merge commits `git log <revs>` walks; a commit with an empty diff has none.
+    None when git failed or hung: an unread answer, never an empty one."""
+    log = repo_git(cwd, "log", "-p", "--no-merges", "--no-color", "--no-ext-diff", *revs, timeout=120)
+    if log is None or log.returncode:
+        return None
+    if not log.stdout:
+        return {}
+    p = repo_git(cwd, "patch-id", "--stable", input=log.stdout, timeout=120)
+    if p is None or p.returncode:
+        return None
+    return dict(ln.split()[:2] for ln in p.stdout.splitlines() if len(ln.split()) >= 2)
+
+
+def landed_ctx(cwd, heads, cache=None, base="main"):
+    """What landed() reads for one repo: origin's main (never a local main: an unpushed merge there proves nothing),
+    its first-parent commits, and {patch-id: [(PR number, head oid)]} over the merged PRs' heads, oldest PR first.
+    A head's ids never change, so they are kept in `cache` ({oid: [number, [ids]]}); a read that failed or timed out
+    is not kept, so the next run reads that head again.
+    Nothing here fetches: a carrier head never fetched into this checkout is skipped, and a stale origin/main makes
+    every route miss. Both fail toward leaving the row as it is, so on a checkout nobody pulls this finds nothing."""
+    def rev(ref):
+        p = repo_git(cwd, "rev-parse", "-q", "--verify", ref + "^{commit}", timeout=20)
+        return p.stdout.strip() if p is not None and p.returncode == 0 else ""
+    b = next((x for x in (rev(f"refs/remotes/origin/{n}") for n in dict.fromkeys((base, "main", "master"))) if x), "")
+    bases = [b] if b else []
+    fp = set()
+    for b in bases:
+        p = repo_git(cwd, "rev-list", "--first-parent", "--max-count", "5000", b, timeout=60)
+        fp |= set((p.stdout if p is not None else "").split())
+    cache, pids = cache if cache is not None else {}, {}
+    for num, oid in heads:
+        if oid not in cache and oid and bases and rev(oid):   # a head never fetched here cannot be read: skipped
+            ids = patch_ids(cwd, oid, *(f"^{b}" for b in bases))
+            if ids is None:                              # timed out or failed: never cached, read again next run
+                continue
+            cache[oid] = [num, sorted(ids)]
+        for pid in (cache.get(oid) or [0, []])[1]:
+            pids.setdefault(pid, []).append((num, oid))
+    return {"cwd": cwd, "rev": rev, "bases": bases, "fp": fp, "pids": pids}
+
+
+def merge_adds(cwd, m):
+    """True when merge commit <m> holds anything its parents' clean merge does not: a conflict someone resolved, a
+    change made inside the merge (--no-commit, then an edit), or more than two parents. No patch-id covers that."""
+    p = repo_git(cwd, "rev-parse", f"{m}^1", f"{m}^2", f"{m}^{{tree}}", timeout=20)
+    q = repo_git(cwd, "rev-parse", "-q", "--verify", f"{m}^3", timeout=20)
+    if p is None or p.returncode or q is None or q.returncode == 0:
+        return True
+    p1, p2, tree = p.stdout.split()[:3]
+    t = repo_git(cwd, "merge-tree", "--write-tree", p1, p2, timeout=60)
+    return t is None or t.returncode != 0 or t.stdout.split()[:1] != [tree]
+
+
+HUNKS_MAX = 2000                                         # a branch with more is too big to vouch for: left alone
+
+
+def delivered(cwd, fork, tip, heads):
+    """True when each hunk of the branch's own diff (fork..tip) is in one of the carrier PRs' final trees, not just
+    somewhere in their history, and that tree shows it positively. A hunk that still applies there is not delivered:
+    its old lines are all there, as after a carrier that applied the patch and reverted it before its squash. A hunk
+    that applies in reverse is: its new lines sit there with their context. One that does neither (a carrier, or a
+    stacked fix inside it, edited lines next to it or the lines it wrote) needs the tree's lines to say so: none of
+    the lines it took out is left (no more copies than the fork had less the hunk's), and it took something out,
+    created the file, or a line it added that the fork lacked is there. Failing to apply never counts on its own: a
+    carrier that applied A, reverted it, then changed a line next to it fails both checks and still holds A's old line.
+    Known hole: a carrier that applied A, reverted it, then rewrote those same lines some third way reads as
+    delivered, since A's old lines are gone and the file is there; patch-id membership is all that stands behind it."""
+    import collections, tempfile
+    p = repo_git(cwd, "diff", "--binary", "--no-color", "--no-ext-diff", "--no-renames", fork, tip, timeout=120)
+    if p is None or p.returncode or not p.stdout.strip():
+        return False
+    units = []                                           # (path it writes, path it reads, created, header + one hunk)
+    for sec in re.split(r"(?m)^(?=diff --git )", p.stdout):
+        if not sec.startswith("diff --git "):
+            continue
+        head, *hunks = re.split(r"(?m)^(?=@@ )", sec)
+        hl = head.splitlines()
+        path = next((ln[6:] for ln in hl if ln.startswith("+++ b/")), "")
+        old = next((ln[6:] for ln in hl if ln.startswith("--- a/")), "")
+        new = any(ln.startswith("new file mode") for ln in hl)
+        units += [(path, old, new, head + h) for h in hunks] if hunks else [(path, old, new, head)]
+    if not units or len(units) > HUNKS_MAX:
+        return False
+    blobs = {}
+
+    def lines(rev, path):                                # Counter of a file's lines at rev; empty when it is absent
+        if (rev, path) not in blobs:
+            b = repo_git(cwd, "cat-file", "blob", f"{rev}:{path}", timeout=30) if path else None
+            blobs[rev, path] = collections.Counter(b.stdout.splitlines() if b is not None and b.returncode == 0
+                                                   else [])
+        return blobs[rev, path]
+
+    def applies(unit, env, *rev):
+        try:
+            p = repo_git(cwd, "apply", "--cached", "--check", *rev, "-", input=unit, env=env, timeout=30)
+            return None if p is None else p.returncode == 0
+        except Exception:
+            return None
+
+    with tempfile.TemporaryDirectory(prefix="cc-reconcile-landed-") as td:
+        trees = []
+        for i, h in enumerate(heads):
+            env = {"GIT_INDEX_FILE": f"{td}/index{i}"}
+            r = repo_git(cwd, "read-tree", h, env=env, timeout=60)
+            if r is None:
+                continue
+            ls = repo_git(cwd, "ls-tree", "-r", "--name-only", "-z", h, timeout=60)
+            if r.returncode == 0 and ls is not None and ls.returncode == 0:
+                trees.append((h, env, set(ls.stdout.split("\0"))))
+
+        def there(unit, h, env, files):
+            path, old, new, text = unit
+            if path and path not in files:
+                return False
+            fwd = applies(text, env)
+            if fwd is None or fwd:                       # it still applies: its old lines are all in that tree
+                return False
+            if applies(text, env, "-R"):                 # its new lines are there, context and all
+                return True
+            body = [ln for h_ in re.split(r"(?m)^(?=@@ )", text)[1:] for ln in h_.splitlines()[1:]]
+            net = collections.Counter(ln[1:] for ln in body if ln.startswith("+"))
+            net.subtract(ln[1:] for ln in body if ln.startswith("-"))
+            was, now = lines(fork, old or path), lines(h, path or old)
+            took = [ln for ln, d in net.items() if d < 0]
+            if any(now[ln] > was[ln] + net[ln] for ln in took):   # more copies left than delivery would leave
+                return False
+            return bool(took) or new or any(now[ln] > was[ln] for ln, d in net.items() if d > 0)
+        return bool(trees) and all(any(there(u, h, env, files) for h, env, files in trees) for u in units)
+
+
+def landed(ctx, branches, repo, wt):
+    """Why the row's branch has nothing left to land, or "". The brief: "a blocked or review row whose track branch
+    has NO diff left against main (diff-empty, not merely an ancestor, so a half-landed branch stays open)". The
+    branch is the worktree's own (only a worktree wt_pin() vouches for: `wt` is "" otherwise), else the row's
+    `branch`, else track/<track>; main is origin's. Two ways to be
+    diff-empty: merging the tip into main changes nothing, or every commit of its own has its patch inside a merged
+    PR's head (a branch stacked under, or rebased into, another PR that was squashed) AND each hunk of its own diff
+    is in such a PR's final tree, so a carrier that reverted it before merging does not count. A merge commit on the
+    branch that adds changes of its own refuses the patch route: no patch-id vouches for those. A commit rebased
+    next to lines main had changed takes new context, so a new patch-id, and leaves its branch blocked: a miss, never
+    a false close.
+    Left alone: a dirty worktree (work nobody committed; `wt` is "" when wt_pin() refused it, and then none is read),
+    and a tip on main's first-parent line. That last one is either a branch with no commit of its own or one
+    fast-forwarded into main. git cannot tell the two apart, so
+    neither is closed: a row whose worker never committed must not read as landed.
+    Measured on this box: the 10-05 07:28Z report run on bayesian-squirrel listed exactly the six rows its goals pass
+    was stuck behind. Someone set all six `done` by hand at 17:35Z that day, with no reconcile note, so the
+    10-10 run lists none of them ("the board matches reality (24 tracks)"). landed() on their six branches,
+    10-10 at 08:05Z, still names #5 for backtester, backtester-fixes, live-path, live-path-fixes and
+    live-kill-fixes and #7 for prices; none of the six tips is on main's first-parent line. Case (m) is that shape.
+    Needs git 2.38+ for merge-tree --write-tree: on an older git the first route and every merge commit fail closed."""
+    cwd, rev = ctx["cwd"], ctx["rev"]
+    tip = next((x for x in (rev(f"refs/heads/{b}") or rev(f"refs/remotes/origin/{b}") for b in branches if b) if x), "")
+    if not tip or not ctx["bases"] or tip in ctx["fp"] or (wt and dirty(repo, wt)):
+        return ""
+    b = ctx["bases"][0]
+    p = repo_git(cwd, "merge-tree", "--write-tree", b, tip, timeout=60)
+    t = repo_git(cwd, "rev-parse", b + "^{tree}", timeout=20)
+    if p is not None and t is not None and p.returncode == 0 and p.stdout.split()[:1] == t.stdout.split():
+        return "its branch has nothing left that main lacks"
+    m = repo_git(cwd, "rev-list", "--merges", tip, f"^{b}", timeout=60)
+    if m is None or m.returncode or any(merge_adds(cwd, x) for x in m.stdout.split()):
+        return ""
+    own = patch_ids(cwd, tip, f"^{b}")
+    if not own or not all(pid in ctx["pids"] for pid in own):
+        return ""
+    fork = repo_git(cwd, "merge-base", b, tip, timeout=20)
+    heads = sorted({oid for pid in own for _, oid in ctx["pids"][pid]})
+    if fork is None or fork.returncode or not delivered(cwd, fork.stdout.strip(), tip, heads):
+        return ""
+    # the PR whose merge finished landing it: each commit counts at the first merged PR that carried it (a branch
+    # stacked on an earlier PR's commits names its own carrier, not that earlier PR)
+    return f"its branch landed inside #{max(ctx['pids'][pid][0][0] for pid in own)}"
 
 
 def newest_write(path):
@@ -1333,7 +1728,7 @@ def local_only(repo_dir, head):
     """(commits `head` carries that no remote ref reaches, when the newest was committed); (-1, 0.0) = git would not say."""
     if not head:
         return (0, 0.0)
-    p = sh("git", "-C", repo_dir, "log", "--format=%ct", head, "--not", "--remotes", timeout=120)
+    p = repo_git(repo_dir, "log", "--format=%ct", head, "--not", "--remotes", timeout=120)
     if p is None or p.returncode != 0:
         return (-1, 0.0)
     ts = [float(x) for x in p.stdout.split() if x.strip().isdigit()]
@@ -1341,33 +1736,40 @@ def local_only(repo_dir, head):
 
 
 def agent_worktrees(repo):
-    """Rule 9's candidates: the worktrees registered directly under <repo>/.claude/worktrees, measured."""
+    """Rule 9's candidates: the worktrees registered directly under <repo>/.claude/worktrees, measured. Read from the
+    admin dirs' `gitdir` files as text, and only those wt_pin() vouches for: no `git worktree list` in the checkout."""
     dev = os.path.realpath(f"{DEV}/{repo}")
-    p = sh("git", "-C", dev, "worktree", "list", "--porcelain", timeout=120)
-    if p is None or p.returncode != 0:
-        return []
-    rows, cur = [], {}
-    for line in p.stdout.splitlines() + [""]:
-        if not line.strip():
-            if cur.get("worktree"):
-                rows.append(cur)
-            cur = {}
-            continue
-        k, _, v = line.partition(" ")
-        cur[k] = v
     hits = []
-    for w in rows:
-        path = w["worktree"].rstrip("/")
-        if os.path.dirname(path) != f"{dev}/{AGENT_WT}":
+    for gdf in sorted(glob.glob(f"{dev}/.git/worktrees/*/gitdir")):
+        try:
+            path = os.path.dirname(open(gdf).read(4096).strip()).rstrip("/")
+        except OSError:
+            continue
+        if os.path.dirname(path) != f"{dev}/{AGENT_WT}" or not wt_pin(repo, path):
             continue
         written = newest_write(path)
         if written is None:
             continue
-        local, newest = local_only(dev, w.get("HEAD") or "")
+        br = wt_branch(repo, path)
+        h = wt_git(repo, path, "rev-parse", "-q", "--verify", "HEAD", timeout=20)
+        local, newest = local_only(dev, h.stdout.strip() if h is not None and h.returncode == 0 else "")
         hits.append({"path": path, "name": os.path.basename(path), "idle": max(0.0, now() - written),
-                     "branch": (w.get("branch") or "").replace("refs/heads/", ""),
-                     "dirty": dirty(path), "local": local, "newest": newest})
+                     "branch": br, "dirty": dirty(repo, path), "local": local, "newest": newest})
     return hits
+
+
+def drop_worktree(repo, path):
+    """Rule 9's removal, without `git worktree remove` (it runs git inside the worktree, which reads the admin dir's
+    `commondir`): the worktree wt_pin() vouches for, clean and unlocked, and its admin dir. A CompletedProcess."""
+    pin = None if member_ws(repo) else wt_pin(repo, path)
+    why = ("not a worktree of an owner's checkout" if pin is None else "it is locked" if os.path.exists(f"{pin[1]}/locked")
+           else "it has uncommitted changes" if dirty(repo, path) else "")
+    if not why:
+        try:
+            shutil.rmtree(pin[0]); shutil.rmtree(pin[1])
+        except OSError as e:
+            why = str(e)
+    return subprocess.CompletedProcess([], 1 if why else 0, "", why)
 
 
 def held_by(path):
@@ -1451,7 +1853,7 @@ class Sweep:
     """One sweep: the dry flag and the tally; every rule logs the same way."""
 
     def __init__(self, dry=False):
-        self.dry, self.did, self.said = dry, [], []
+        self.dry, self.did, self.said, self.stale = dry, [], [], {}
 
     def log(self, repo, verb, target, why):
         print(f"  {'would ' if self.dry else ''}{verb} {target} — {why}")
@@ -1468,7 +1870,7 @@ class Sweep:
         if self.dry:
             self.log(repo, verb, target, why); self.did.append(target)
             return True
-        p = sh(*run, timeout=300)
+        p = run() if callable(run) else sh(*run, timeout=300)
         if p is not None and p.returncode == 0:
             self.log(repo, verb, target, why); self.did.append(target)
             return True
@@ -1480,6 +1882,13 @@ class Sweep:
     def report(self, repo, target, why):
         self.said.append((target, why))
         self.log(repo, "report", target, why)
+
+    def hand(self, repo, verb, target, why, run=None):
+        """act()'s stand-in on a member workspace: the host takes no destructive step in a member's checkout (a check
+        and the rm after it race a member swapping a link in between), so the step is the member's own seat's."""
+        self.stale.setdefault(repo, []).append(f"{verb} {target} — {why}")
+        self.report(repo, target, f"stale, left to its own seat: would {verb} ({why})")
+        return False
 
 
 def agent_hours():
@@ -1496,6 +1905,9 @@ def sweep_repo(repo, r, snap, net=True, stale=STALE):
         print(f"cc-reconcile sweep {repo}: paused — skipped (cc-pause off {repo})")
         return
     print(f"cc-reconcile sweep {repo}{' (dry run)' if r.dry else ''}")
+    _SHADOWS.clear()                                    # a pass reads the refs as they are now
+    member = member_ws(repo)
+    act = r.hand if member else r.act                   # rules 1, 2 and 9 touch the checkout; on a member's, none runs
     try:
         d = board_read(f"{BOARDS}/{repo}.json")
     except Exception:
@@ -1510,7 +1922,7 @@ def sweep_repo(repo, r, snap, net=True, stale=STALE):
         st = t.get("status", "")
         verdict, why = track_verdict({"status": st, "age": max(0.0, now() - terminal_since(d, track, t)),
                                       "snap": snap.get(f"{repo}/{track}"), "stale": stale,
-                                      "dirty": dirty(wt) if st in TERMINAL else False})
+                                      "dirty": dirty(repo, wt) if st in TERMINAL else False})
         if verdict == "rm" and no_snap:
             verdict, why = "report", f"would rm ({why}) — held: no liveness snapshot this pass"
         if verdict == "rm":
@@ -1522,7 +1934,7 @@ def sweep_repo(repo, r, snap, net=True, stale=STALE):
             if spared:
                 verdict, why = "report", f"spared {wt}: " + "; ".join(spared)
         if verdict == "rm":
-            r.act(repo, "rm", f"{repo}/{track}", why, [sib("cc"), "rm", repo, track])
+            act(repo, "rm", f"{repo}/{track}", why, [sib("cc"), "rm", repo, track])
         elif verdict == "report":
             r.report(repo, f"{repo}/{track}", why)
     try:                                                              # 2 — remote branches (rule 1 took rows off the board)
@@ -1541,10 +1953,11 @@ def sweep_repo(repo, r, snap, net=True, stale=STALE):
             state, _, head = pr_of(prs, b)
             verdict, why = branch_verdict({"board": t.get("status", ""), "kind": t.get("kind") or "track",
                                            "pr": state, "head": head, "tip": branches[b],
-                                           "dirty": dirty(t.get("worktree") or f"{WTS}/{repo}/{track}")})
+                                           "dirty": dirty(repo, t.get("worktree") or f"{WTS}/{repo}/{track}")})
             if verdict == "delete":
-                r.act(repo, "delete", f"origin/{b}", why, ["git", "-C", f"{DEV}/{repo}", "push", "origin",   # the lease: a
-                      f"--force-with-lease=refs/heads/{b}:{branches[b]}", "--delete", b])   # push since ls-remote survives
+                act(repo, "delete", f"origin/{b}", why,        # the lease: a push since ls-remote survives
+                      lambda b=b: repo_git(f"{DEV}/{repo}", "push", "origin", f"--force-with-lease=refs/heads/{b}:{branches[b]}",
+                                           "--delete", b, timeout=300))
             elif verdict == "report":
                 r.report(repo, f"origin/{b}", why)
     for name, (wid, _) in windows().items():                          # 3 and 4 — windows; `<repo>` itself is never one
@@ -1570,9 +1983,42 @@ def sweep_repo(repo, r, snap, net=True, stale=STALE):
             if spared:
                 verdict, why = "report", f"spared {w['path']}: " + "; ".join(spared)
         if verdict == "rm":
-            r.act(repo, "rm", f"worktree {w['path']}", why, ["git", "-C", f"{DEV}/{repo}", "worktree", "remove", w["path"]])
+            act(repo, "rm", f"worktree {w['path']}", why, lambda w=w: drop_worktree(repo, w["path"]))
         elif verdict == "report":
             r.report(repo, f"worktree {w['path']}", why)
+    if member and not r.dry:
+        tell_seat(repo, r.stale.get(repo) or [])
+
+
+def tell_seat(repo, items):
+    """A member workspace's stale list goes to its own seat: ~/.cc/state/<repo>/stale.md (its own state dir, which it
+    sees), and one cc-msg line when that list changed. Written as a new file swapped in, so a link planted at that
+    name is replaced, never written through."""
+    path = f"{STATE}/{repo}/stale.md"
+    body = "".join(f"- {x}\n" for x in items)
+    body = (f"# Stale in this workspace ({stamp()})\nThe host's sweep takes no step in a member's checkout; these are "
+            f"yours to clean up.\n" + body) if body else ""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as fh:
+            old = fh.read()
+    except OSError:
+        old = ""
+    if old.split("\n", 1)[-1] == body.split("\n", 1)[-1]:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not body:
+            os.unlink(path)
+            return
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".stale-")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(body)
+        os.replace(tmp, path)
+    except OSError:
+        return
+    sh(sib("cc-msg"), repo, f"sweep: {len(items)} stale item{'' if len(items) == 1 else 's'} in your workspace (merged "
+       f"branches, idle worktrees). The host does not touch a member's checkout, so they are yours: {path}", timeout=60)
 
 
 def fixture_pid(name):
@@ -2006,6 +2452,10 @@ def digest_text(snap=None, phone=False):
         out += ["", "*Shipped*"] + groups(ship, 4, 3)
     if n_move:
         out += ["", "*Moving*"] + groups(move, 4, 3) + ([f"• in review: {few(review, 3)}"] if review else [])
+    ag = sh(sib("cc-agenticness"), timeout=60)          # one line per repo off cc-collect's snapshot: counts only
+    ag = (ag.stdout or "").strip() if ag is not None and ag.returncode == 0 else ""
+    if ag:
+        out += ["", "*How far it ran without you*"] + ag.splitlines()
     rest = [x for c, x in ((n["q"], f"{n['q']} queued"), (n["bund"], f"{n['bund']} in bundles"), (n["park"], f"{n['park']} parked"),
                            (n["sess"], f"{n['sess']} session{'' if n['sess'] == 1 else 's'} open")) if c]
     if rest:
@@ -2348,6 +2798,7 @@ def tick(snap, net):
 
 
 def main(argv):
+    _SHADOWS.clear()
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
     if argv[:1] == ["view"]:
@@ -2406,7 +2857,7 @@ def main(argv):
             print(f"cc-reconcile: no board for '{r}'", file=sys.stderr)
             return 2
     recs, tracks, wedging, snaprows = [], 0, {}, []
-    for repo, track, t, f in facts(repos, net, grace, no_stop, wedged, mark):
+    for repo, track, t, f in facts(repos, net, grace, no_stop, wedged, mark, save=apply_):
         tracks += 1
         if f.get("wedged_now"):
             wedging[f"{repo}/{track}"] = now()

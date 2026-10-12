@@ -101,6 +101,21 @@ def selfcheck():
              "entry and a scratch board are left out",
              len(B) == 1 and B[0]["track"] == "t" and B[0]["statuses"] == ["01-10T12:00 running"] and B[0]["n"] == 4
              and [n[12:] for n in B[0]["notes"]] == ["note two", "note three"] and idx["sources"]["board"]["removed_only"] == 1)
+        long = [{"ts": IN, "track": "w", "msg": f"status -> {w}"} for w in
+                ("queued", "running", "review", "running", "waiting", "running", "review", "running", "review", "merged")]
+        _, _, got = run({"boards/r.json": json.dumps({"repo": "r", "tracks": {"a": {"goal": "G1"}, "n": {"goal": "G2"}}, "log": [
+            {"ts": IN, "track": "a", "msg": "added: a row"}, {"ts": IN, "track": "n", "msg": "added the fix note"}] + long})})
+        B = {r["track"]: r for r in got["board"]}
+        case("cc-board's `added: ` line marks a row added and its board `goal` comes along; a note that merely starts "
+             "with the word does not count as added",
+             B["a"].get("added") is True and B["a"].get("goal") == "G1" and "added" not in B["n"] and B["n"].get("goal") == "G2")
+        case("a long trail is cut to its first and last four moves, but `waited` still says it went waiting (5th of 10)",
+             "…" in B["w"]["statuses"] and not any(x.endswith(" waiting") for x in B["w"]["statuses"])
+             and B["w"].get("waited") is True and "waited" not in B["a"])
+        _, _, got = run({"boards/r.json": json.dumps({"repo": "r", "tracks": ["not", "a", "dict"],
+                                                       "log": [{"ts": IN, "track": "a", "msg": "added: a row"}]})})
+        case("a board whose `tracks` is not a dict still folds its log, with no goal", len(got["board"]) == 1
+             and got["board"][0].get("added") is True and "goal" not in got["board"][0])
 
         # failures
         _, _, got = run({"failures/r.jsonl": arch(

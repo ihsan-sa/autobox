@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""cc-agenticness — one line per repo on how far its work moved without a person, off cc-collect's daily snapshot.
+
+  cc-agenticness [--snapshot DIR]   print the lines; DIR defaults to ~/.cc/state/improve/snapshots/latest
+  cc-agenticness selfcheck          fixtures in a temp dir, never this box's
+
+Each line counts, for the snapshot's window (board.jsonl, index.json's window) and nothing else:
+  · landed      rows whose status reached `merged` or `done`, and how many of those never went `waiting` (a row that
+                asked a person something is one a person touched; cc-collect's `waited` says so even when it cut
+                the `waiting` move out of a long trail)
+  · to merge    the median wall hours from a landed row's first move inside the window to its landing
+  · from goals  rows added inside the window that name a goal (`goal` on the row: what cc-goals files)
+  · idle        whole hours of the window with no row of the repo `running` while ~/.cc/state/<repo>/goals.md has a
+                `## Now` section with something in it. A row running since before the window with no move inside it
+                is not seen, and cc-collect keeps a long trail's first and last four moves only, so this is an
+                upper bound
+It prints counts and hours only — never a title, a note or a message — so a member repo's line says nothing of what
+its people wrote. A repo with nothing landed, nothing from goals and no idle hours prints no line. No snapshot, or an
+unreadable one, prints nothing and exits 0. No model, no network, no writes. cc-reconcile's digest is its one caller.
+"""
+import json, os, statistics, sys, tempfile, shutil
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+LANDED = ("merged", "done")
+
+
+def ts(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def moves(row, until):
+    """[(when, word)] off a board.jsonl row's `statuses` ("MM-DDTHH:MM word"; cc-collect drops the year)."""
+    out = []
+    for s in row.get("statuses") or []:
+        stamp, _, word = str(s).partition(" ")
+        try:
+            t = datetime.strptime(f"{until.year}-{stamp}", "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue                                     # the "…" cc-collect puts where it cut a long trail
+        out.append((t.replace(year=t.year - 1) if t > until + timedelta(days=1) else t, word.strip()))
+    return out
+
+
+def goals_open(repo, home):
+    try:
+        body = open(f"{home}/.cc/state/{repo}/goals.md", errors="replace").read()
+    except OSError:
+        return False
+    now = body.split("## Now", 1)[1] if "## Now" in body else ""
+    now = now.split("\n## ", 1)[0]
+    return any(ln.strip() and not ln.lstrip().startswith("#") for ln in now.splitlines())
+
+
+def lines(snap, home=HOME):
+    try:
+        win = json.load(open(f"{snap}/index.json"))["window"]
+        since, until = ts(win["since"]), ts(win["until"])
+        rows = [json.loads(ln) for ln in open(f"{snap}/board.jsonl") if ln.strip()]
+    except Exception:
+        return []
+    if not since or not until:
+        return []
+    per = {}
+    for r in rows:
+        per.setdefault(str(r.get("repo") or ""), []).append(r)
+    out = []
+    for repo in sorted(per):
+        if not repo or repo.startswith("_"):
+            continue
+        landed, quiet, hours, goal_rows, runs = 0, 0, [], 0, []
+        for r in per[repo]:
+            mv = moves(r, until)
+            done = next((t for t, w in mv if w in LANDED), None)
+            if done:
+                landed += 1
+                quiet += not (r.get("waited") or any(w == "waiting" for _, w in mv))
+                start = ts(r.get("first"))
+                if start and done >= start:
+                    hours.append((done - start).total_seconds() / 3600)
+            goal_rows += bool(r.get("goal") and r.get("added"))
+            for i, (t, w) in enumerate(mv):              # a `running` stretch lasts until the row's next move
+                if w == "running":
+                    runs.append((t, mv[i + 1][0] if i + 1 < len(mv) else until))
+        idle = 0
+        if goals_open(repo, home):
+            h = since
+            while h < until:                             # an hour counts idle when no running stretch touches it
+                e = min(h + timedelta(hours=1), until)
+                idle += not any(a < e and b > h for a, b in runs)
+                h = e
+        bits = []
+        if landed:
+            bits.append(f"{landed} landed ({quiet} never waited on a person)")
+        if hours:
+            bits.append(f"{statistics.median(hours):.1f} h median to merge")
+        if goal_rows:
+            bits.append(f"{goal_rows} row{'' if goal_rows == 1 else 's'} from goals passes")
+        if idle:
+            bits.append(f"{idle} h with nothing running and goals open")
+        if bits:
+            out.append(f"• {repo}: " + ", ".join(bits))
+    return out
+
+
+def selfcheck():
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        p, f = p + bool(cond), f + (not cond)
+        if not cond:
+            print(f"  ✗ {name}")
+    d = tempfile.mkdtemp(prefix="cc-agenticness-")
+    try:
+        snap, home = f"{d}/snap", f"{d}/home"
+        os.makedirs(snap); os.makedirs(f"{home}/.cc/state/fund"); os.makedirs(f"{home}/.cc/state/quiet")
+        json.dump({"window": {"since": "2026-10-04T00:00:00Z", "until": "2026-10-05T00:00:00Z"}}, open(f"{snap}/index.json", "w"))
+        rows = [
+            {"repo": "fund", "track": "a", "first": "2026-10-04T02:00:00Z", "added": True, "goal": "G1",
+             "statuses": ["10-04T02:00 running", "10-04T04:00 review", "10-04T06:00 merged"], "notes": ["secret text"]},
+            {"repo": "fund", "track": "b", "first": "2026-10-04T08:00:00Z",
+             "statuses": ["10-04T08:00 running", "10-04T09:00 waiting", "10-04T12:00 merged"]},
+            {"repo": "fund", "track": "w", "first": "2026-10-04T14:00:00Z", "waited": True,     # cc-collect cut its
+             "statuses": ["10-04T14:00 running", "10-04T14:10 review", "10-04T14:20 running", "10-04T14:30 review",
+                          "…", "10-04T15:00 running", "10-04T15:10 review", "10-04T15:20 running", "10-04T15:40 merged"]},
+            {"repo": "fund", "track": "c", "first": "2026-10-04T13:00:00Z", "added": True,
+             "statuses": ["10-04T13:00 blocked"]},
+            {"repo": "quiet", "track": "x", "first": "2026-10-04T13:00:00Z", "statuses": ["10-04T13:00 blocked"]},
+            {"repo": "_cctest1", "track": "y", "first": "2026-10-04T13:00:00Z", "statuses": ["10-04T13:00 merged"]}]
+        open(f"{snap}/board.jsonl", "w").write("".join(json.dumps(r) + "\n" for r in rows))
+        open(f"{home}/.cc/state/fund/goals.md", "w").write("## Now\n- G1 run the fund\n\n## Log\n- old\n")
+        open(f"{home}/.cc/state/quiet/goals.md", "w").write("## Now\n\n## Log\n- G0 done\n")
+        out = lines(snap, home)
+        fund = next((ln for ln in out if ln.startswith("• fund:")), "")
+        ok("landed rows are counted, and the one that waited on a person is not 'never waited' — nor is one whose "
+           "`waiting` move cc-collect cut out of a long trail (its `waited` says so)",
+           "3 landed (1 never waited on a person)" in fund)
+        ok("the median wall hours from first move to landing (4 h, 4 h and 1.7 h)", "4.0 h median to merge" in fund)
+        ok("a row added inside the window naming a goal counts as from goals; one without a goal does not",
+           "1 row from goals passes" in fund)
+        ok("idle hours: 24 h less the hours a row was running (02-04, 08-09, 14-16), goals open",
+           "19 h with nothing running" in fund)
+        ok("a repo with nothing landed and an empty Now section prints no line; a scratch board never does",
+           not any(ln.startswith(("• quiet", "• _cc")) for ln in out))
+        ok("no title, note or message text reaches the line", "secret" not in "\n".join(out))
+        ok("no snapshot prints nothing", lines(f"{d}/none", home) == [])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print(f"cc-agenticness selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    snap = f"{HOME}/.cc/state/improve/snapshots/latest"
+    if argv[:1] == ["--snapshot"] and len(argv) == 2:
+        snap = argv[1]
+    elif argv:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    for ln in lines(snap):
+        print(ln)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
