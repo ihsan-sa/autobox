@@ -247,7 +247,9 @@ class Job(Record):
 class Check(Record):
     """One manifest [[check]] (LANDING.toml). run: the command, from the repo root. paths: the globs it owns.
     cap: seconds before it is killed (unrunnable, not red). where: runners it may use ("box", "laptop",
-    "member"; U2 owns the list). mounts/net/fixtures: what its bwrap profile adds to the default."""
+    "member"; U2 owns the list). mounts/net/fixtures: what its bwrap profile adds to the default. bare: a host or
+    box check run on the box without cc-nosignal's signal scope (run.py), for one whose cases read what a Landlock
+    domain hides; it may signal whatever the lander can. Only a host or box check may say it."""
     name: str
     run: str
     paths: list = field(default_factory=list)
@@ -257,6 +259,7 @@ class Check(Record):
     mounts: list = field(default_factory=list)
     net: bool = False
     fixtures: list = field(default_factory=list)
+    bare: bool = False
     extra: dict = field(default_factory=dict)
     KEYS: ClassVar[dict] = {"klass": "class"}
 
@@ -268,6 +271,9 @@ class Check(Record):
         _check_type("Check", "run", self.run, (str,))
         _check_type("Check", "cap", self.cap, (int,))
         _check_type("Check", "net", self.net, (bool,))
+        _check_type("Check", "bare", self.bare, (bool,))
+        if self.bare and self.klass not in (HOST, BOX):
+            raise ValueError(f"Check {self.name!r}: bare = true is for a host or box check, not {self.klass}")
         for n in ("paths", "where", "mounts", "fixtures"):
             _check_strs("Check", n, getattr(self, n))
         if not self.name or not self.run:

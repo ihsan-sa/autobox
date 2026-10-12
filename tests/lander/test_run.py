@@ -44,6 +44,11 @@ HAS_BWRAP = S.available() and subprocess.run(["bwrap", "--ro-bind", "/", "/", "t
 CLI = os.path.join(CORE, "lander", "cli.py")
 
 
+def nnp(status: str) -> str:
+    """The NoNewPrivs value out of a /proc/<pid>/status text, '' when it has none."""
+    return next((ln.split(":", 1)[1].strip() for ln in status.splitlines() if ln.startswith("NoNewPrivs:")), "")
+
+
 def chk(name="c", run="true", klass=T.HERMETIC, **kw):
     return T.Check(name=name, run=run, klass=klass, **kw)
 
@@ -840,6 +845,28 @@ class HostAndRunners(Env):
             self.assertTrue(argv[0].endswith("/cc-nosignal"), argv)
             self.assertEqual(argv[1], "--")
             self.assertEqual((how, wd), ("host", "/head"))
+
+    def test_a_bare_check_is_not_wrapped_in_cc_nosignal(self):
+        for klass in (T.HOST, T.BOX):
+            argv, wd, _env, how = RUN._box_argv(chk(run="echo hi", klass=klass, bare=True), "/head", "", "/run", {})
+            self.assertEqual(argv, ["/bin/sh", "-c", "echo hi"])
+            self.assertEqual((how, wd), ("host", "/head"))
+
+    def test_a_bare_check_runs_outside_the_signal_scope_and_an_ordinary_one_inside(self):
+        # cc-nosignal's scope is a Landlock domain with no_new_privs, which nothing clears: a bare check's process
+        # reads 0, an ordinary host check's 1. (cc-member-v2 cannot read a live sandbox's fds from inside one.)
+        with open("/proc/self/status") as f:
+            mine = nnp(f.read())
+        if mine != "0":
+            self.skipTest("this suite already runs with no_new_privs (a sandbox or a scope), so 0 cannot be seen")
+        probe = "grep -q '^NoNewPrivs:[[:space:]]*{}$' /proc/self/status"
+        inside = self.run_(chk(run=probe.format(1), klass=T.HOST))
+        if inside.status == T.UNRUNNABLE:
+            self.skipTest(f"cc-nosignal cannot scope a check on this kernel: {inside.extra}")
+        self.assertEqual(inside.status, T.PASSED, inside.extra)
+        for klass in (T.HOST, T.BOX):
+            bare = self.run_(chk(run=probe.format(0), klass=klass, bare=True))
+            self.assertEqual(bare.status, T.PASSED, (klass, bare.extra))
 
     def test_a_sandboxed_check_is_not_wrapped_in_cc_nosignal(self):
         with mock.patch.object(S, "available", return_value=True), \

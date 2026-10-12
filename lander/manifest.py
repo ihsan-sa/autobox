@@ -16,11 +16,11 @@ relative path (S2: a change to a check's script or fixtures selects the check).
 ADD-ONLY (S3). A head may widen the manifest, never narrow it. widen_faults(base, head) names every narrowing: a
 check removed or its `run` changed, a path, fixture or `where` taken away, a class moved down CLASS_RANK (toward
 fewer or later runs), a policy entry removed. It also names a check the head adds or changes that grants itself
-a class outside the sandbox, net = true or a mount its base definition lacks (self_widening); a check the head adds
-with no class line is hermetic, not T.Check's host default (head_check). The built-in check `manifest-widen`
-(BUILTIN) is selected by any change to a manifest, policy or reach file and runs widen_faults in-process on the two
-git trees; `lander manifest-widen` runs it by hand. The policy file is also lander-class: plan() sends a change to
-it to lander-self.
+a class outside the sandbox, net = true, bare = true or a mount its base definition lacks (self_widening); a check
+the head adds with no class line is hermetic, not T.Check's host default (head_check), and may not say bare. The
+built-in check `manifest-widen` (BUILTIN) is selected by any change to a manifest, policy or reach file and runs
+widen_faults in-process on the two git trees; `lander manifest-widen` runs it by hand. The policy file is also
+lander-class: plan() sends a change to it to lander-self.
 
 A broken BASE manifest raises ManifestError: nothing can be planned on it. A broken HEAD manifest is not fatal to the
 plan (the base rules), but its faults are carried out and make manifest-widen red.
@@ -179,6 +179,9 @@ def parse_checks(text: str, prefix: str = "", source: str = "", unclassed: set |
         if not NAME_RE.fullmatch(c.name):
             faults.append(f"{source}: check #{i + 1}: name {c.name!r} is not letters, digits, '_', '.' and '-'")
             continue
+        if c.bare and "class" not in d:   # a new one with no class line is judged hermetic (head_check), never bare
+            faults.append(f"{source}: check {c.name!r}: bare = true needs its host or box class written out")
+            continue
         c.paths = [prefix + p for p in c.paths]
         c.fixtures = [prefix + p for p in c.fixtures]
         if unclassed is not None and "class" not in d:
@@ -273,13 +276,16 @@ def head_check(base: Manifest, head: Manifest, n: str) -> T.Check:
 
 def self_widening(b, h: T.Check) -> list:
     """How head check h reaches past what its base definition b (None: the head adds it) already had: a class that
-    runs outside the sandbox (UNSANDBOXED), net = true, or a mount (every mount is outside the tree). A check the
-    head adds or changes may not grant itself any of these; the same grant already in the base is not a widening."""
+    runs outside the sandbox (UNSANDBOXED), net = true, bare = true (no signal scope), or a mount (every mount is
+    outside the tree). A check the head adds or changes may not grant itself any of these; the same grant already in
+    the base is not a widening."""
     out = []
     if h.klass in UNSANDBOXED and (b is None or b.klass != h.klass):
         out.append(f"class {h.klass}")
     if h.net and not (b is not None and b.net):
         out.append("net = true")
+    if h.bare and not (b is not None and b.bare):
+        out.append("bare = true")
     out += [f"mount {m}" for m in h.mounts if b is None or m not in b.mounts]
     return out
 

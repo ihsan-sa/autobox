@@ -155,6 +155,25 @@ class Parsing(unittest.TestCase):
         checks, faults = M.parse_checks('[[check]]\nname="x"\nrun="y"\n', "", "m")
         self.assertEqual((len(checks), faults), (1, []))
 
+    def test_bare_is_a_host_or_box_checks_boolean_and_anything_else_is_a_fault(self):
+        one = '[[check]]\nname="x"\nrun="y"\n'
+        checks, faults = M.parse_checks(one + 'class="host"\nbare=true\n', "", "m")
+        self.assertEqual(([c.bare for c in checks], faults), ([True], []))
+        self.assertFalse(M.parse_checks(one + 'class="host"\n', "", "m")[0][0].bare)   # default: in the scope
+        for bad in ('class="host"\nbare="yes"\n', 'class="host"\nbare=1\n', 'class="hermetic"\nbare=true\n',
+                    'class="static"\nbare=true\n', 'class="timing"\nbare=true\n', 'bare=true\n'):
+            checks, faults = M.parse_checks(one + bad, "", "m")
+            self.assertEqual(checks, [], bad)
+            self.assertTrue(any("bare" in f for f in faults), (bad, faults))
+
+    def test_the_shipped_manifest_runs_bare_only_what_a_landlock_domain_blinds(self):
+        with open(os.path.join(CORE, "tests", "LANDING.toml")) as f:
+            checks, faults = M.parse_checks(f.read(), "core/", "core/tests/LANDING.toml")
+        self.assertEqual(faults, [])
+        self.assertEqual(sorted(c.name for c in checks if c.bare),
+                         ["e2e-cc-context", "selfcheck-cc-fence", "selfcheck-cc-member-broker",
+                          "selfcheck-cc-member-import"])
+
     def test_a_name_that_could_write_log_fields_is_a_fault(self):
         # the queue log keeps `gate=<name>`, and the lane's express path reads check times back from it
         checks, faults = M.parse_checks('[[check]]\nname="heavy ok=yes secs=1"\nrun="y"\n'
@@ -238,6 +257,10 @@ class AddOnly(unittest.TestCase):
                             "'e2e-x': changes itself to net = true"),
             "changed mount": (CORE_MANIFEST.replace('class = "box"', 'class = "box"\nmounts = ["~/.venv"]'),
                               "'e2e-x': changes itself to mount ~/.venv"),
+            "added bare": (CORE_MANIFEST + '\n[[check]]\nname = "new"\nrun = "true"\nclass = "host"\nbare = true\n',
+                           "'new': adds itself to bare = true"),
+            "changed bare": (CORE_MANIFEST.replace('class = "box"', 'class = "box"\nbare = true'),
+                             "'e2e-x': changes itself to bare = true"),
         }
         for what, (text, words) in cases.items():
             base, head = self.two(text)
@@ -258,7 +281,7 @@ class AddOnly(unittest.TestCase):
         self.assertTrue(M.widen_check(r.root, r.base, head)[0])
 
     def test_a_grant_the_base_already_has_is_not_a_widening(self):
-        base_text = CORE_MANIFEST.replace('class = "box"', 'class = "box"\nnet = true\nmounts = ["/opt/x"]')
+        base_text = CORE_MANIFEST.replace('class = "box"', 'class = "box"\nnet = true\nmounts = ["/opt/x"]\nbare = true')
         wider = base_text.replace('paths = ["bin/b"]\nclass = "box"', 'paths = ["bin/b", "bin/y"]\nclass = "box"')
         self.assertEqual(M.widen_faults(*self.two(wider, base_text)), [])
         more = base_text.replace('mounts = ["/opt/x"]', 'mounts = ["/opt/x", "/opt/y"]')

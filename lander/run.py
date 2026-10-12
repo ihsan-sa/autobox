@@ -11,6 +11,9 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
   box      by class — static, hermetic and timing in the bwrap profile (sandbox.py); host and box on the host with
            the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set),
            under cc-nosignal, so a check signals only what it started (the user manager went down on 2026-10-02).
+           A check that says bare = true runs without it: its cases read what cc-nosignal's Landlock domain hides
+           (cc-member-v2 reading a live sandbox's /proc/<pid>/fd, cc-fence's no_new_privs case), and nothing leaves
+           a domain, so inside one they fail closed or are skipped. Bare means it may signal what the lander can.
            Every one inside an admission slot and a transient scope (admission.py). Timing runs only while the box
            is not loaded. No bwrap on this machine makes a sandboxed class unrunnable, never a host run.
   laptop   static, hermetic and host (never box or timing), over cc-suites' own transport: its key, the
@@ -318,7 +321,8 @@ def prune_logs(d: str, now: float | None = None) -> None:
 
 def _box_argv(check, head, cwd, run_dir, env_extra):
     if check.klass in M.UNSANDBOXED:
-        return ([os.path.join(BIN, "cc-nosignal"), "--", "/bin/sh", "-c", check.run], os.path.join(head, cwd) if cwd else head,
+        scope = [] if check.bare else [os.path.join(BIN, "cc-nosignal"), "--"]
+        return (scope + ["/bin/sh", "-c", check.run], os.path.join(head, cwd) if cwd else head,
                 clean_env(env_extra), "host")
     if not S.available():
         raise Unrunnable("bwrap is not installed, so a sandboxed check has nowhere to run")

@@ -112,6 +112,17 @@ class Refusals(unittest.TestCase):
         with self.assertRaises(ValueError):
             T.Check.from_dict({"name": "c", "run": "true", "path": ["x"]})
 
+    def test_bare_is_a_boolean_on_a_host_or_box_check_only(self):
+        for klass in (T.HOST, T.BOX):
+            c = T.Check(name="c", run="true", klass=klass, bare=True)
+            self.assertEqual(through_json(c), c)
+            self.assertIs(c.to_dict()["bare"], True)
+        self.assertFalse(T.Check(name="c", run="true").bare)
+        for bad in ({"bare": "true"}, {"bare": 1}, {"bare": None}, {"bare": True, "class": T.HERMETIC},
+                    {"bare": True, "class": T.STATIC}, {"bare": True, "class": T.TIMING}):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                T.Check.from_dict({"name": "c", "run": "true", **bad})
+
     def test_enum_tuples_are_what_the_design_says(self):
         self.assertEqual(len(T.JOB_STATES), 11)
         self.assertEqual(T.CHECK_CLASSES, ("static", "hermetic", "box", "timing", "host"))
