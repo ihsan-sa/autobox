@@ -16,6 +16,7 @@ spend of two sessions; past the ROTATE LINE the box runs it for the session (--s
                                              one whose skills changed (SKILL CHANGES)
   cc-handoff --kick <target> [<id>]          internal: brief the successor once it is up, check it landed
   cc-handoff --retire <target>               internal: wait out the predecessor's subagents, DRAIN it, end it
+                                             (the sweep starts another if none is running)
   cc-handoff --brief <target>                ONE packet of what a successor would otherwise re-read a tool
                                              call at a time — the board in it is unfinished rows, without
                                              their truncated `task:` line, and a queued row's header (and
@@ -60,7 +61,10 @@ BOUNDED. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 20 min). The sweep
 the cc-reconcile timer, expires an overlap past it, or one whose successor's session died (two sweeps apart),
 and types a `[cc-handoff]` line into the predecessor saying so (it has written its hand-off entry and is waiting
 on the successor; the owner is not told), and finalizes a record whose predecessor is gone past the grace, so the survivor is not
-gated by the record of its own success.
+gated by the record of its own success. A cut-over record that no `--retire` is finishing (it holds a lock per target
+while it runs) gets one from the sweep: the one --ready starts can die with the successor's Bash call, and a predecessor
+told to stay for subagents that had all reported then held the record, and the live seat's next hand-off, for the
+stay's whole hour (2026-10-03).
 
 ROTATION. A seat past CC_CONTEXT_ROTATE_TOKENS (cc-context's second line, 200k, above the 150k hand-off
 line the Stop hook nags at) is handed off by the box whether or not it acts on the nag: five course seats sat
@@ -1421,6 +1425,20 @@ def drain_start(rec, amax):
     return rec.get("drain_from") or (rec.get("cutover") or 0) + (amax if rec.get("held") else 0)
 
 
+def retire_lock(target):
+    """The lock a running --retire holds on its target for its whole life, taken without waiting: the open file
+    when this process now holds it, None when another --retire does. The sweep asks it to tell a retirement in
+    progress from one whose process died."""
+    os.makedirs(HANDOFF, exist_ok=True)
+    fh = open(os.path.join(HANDOFF, slug(target) + ".retire.lock"), "a")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
 def retire(target):
     """--retire, detached by derive(): DRAIN the predecessor, then END it — every time, not only when a human
     happened to be watching (a session cannot exit itself; on 2026-08-31 a retired one ran on for 35 min as a
@@ -1433,11 +1451,21 @@ def retire(target):
     rec = read(target)
     if not rec or live_side(rec) != "successor":
         return 0                                   # missing, corrupt, or before cutover: kill NOTHING
+    lk = retire_lock(target)                       # held until this returns; the sweep restarts us if we die
+    if not lk:
+        print(f"cc-handoff: {target} — another --retire is already finishing it; nothing to do",
+              file=sys.stderr)
+        return 0
+    rec = read(target)                             # re-read under the lock: a --retire that died may have stamped it
+    if not rec or live_side(rec) != "successor":
+        return 0
     pre = (rec.get("predecessor") or {}).get("tmux") or ""
     grace, drain = cfg("CC_HANDOFF_RETIRE_GRACE", 120), cfg("CC_HANDOFF_DRAIN", 600)
     # A predecessor holding live subagents was told to stay: it is waited out FIRST, and the final handoff
-    # message it gets at the end of that is what starts the drain — see stay().
-    t0 = stay(rec, pre) if rec.get("held") else (rec.get("cutover") or time.time())
+    # message it gets at the end of that is what starts the drain — see stay(). A --retire the sweep restarts
+    # after that stay ended resumes from the stay's drain_from: from cutover, it would kill at once a predecessor
+    # that took its final message seconds ago, with no grace to journal it.
+    t0 = stay(rec, pre) if rec.get("held") else (rec.get("drain_from") or rec.get("cutover") or time.time())
     quiet = 0
     while pane_live_id(pre):                       # a session that exited leaves a bare shell: nothing left to drain
         now = time.time()
@@ -1815,6 +1843,9 @@ def sweep(rotate_too=False):
         should have ended it died, or refused because a --forced cutover runs it from the predecessor's own pane
         (refuse_kill); left alone it is `~old` forever at phase retired, and its successor's <id>.done is never
         written. Same fence as --retire; the sweep has no pane of its own.
+      any other cut-over record no --retire is finishing (retire_lock is free) -> a detached --retire. The one
+        --ready starts can die with the successor's Bash call; without this a stay whose subagents had all
+        reported held the record for the stay's whole cap, and the live seat could not hand off again.
     A sweep only ever un-gates, so a WRONG 'gone' is the expensive direction: if tmux cannot be read at all —
     no server, no session main — every window looks gone, so nothing is swept."""
     if tmux("list-windows", "-t", SESSION, "-F", "#{window_id}") is None:
@@ -1850,6 +1881,11 @@ def sweep(rotate_too=False):
                 continue
             tmux("kill-window", "-t", pre)
             finalize(rec, "the predecessor outlived its drain (its --retire never ended it); ended by the sweep")
+        elif live_side(rec) == "successor":
+            lk = retire_lock(target)               # nobody is finishing it: start the --retire that died
+            if lk:
+                lk.close()                         # the child takes it; a second one started meanwhile just exits
+                run([os.path.realpath(__file__), "--retire", target], wait=False)
         elif live_side(rec) == "predecessor" and now > rec.get("deadline", 0) + grace:
             rec = read(target)                     # the DECIDING read: a --ready committing after the loop copied
             if not rec or live_side(rec) != "predecessor" or now <= rec.get("deadline", 0) + grace:

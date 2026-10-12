@@ -828,6 +828,24 @@ def run_selfcheck():
         t0 = clk[0]
         ok("the older TUI's empty box (`>` and a placeholder) reads as idle too",
            retire("r12") == 0 and 120 <= clk[0] - t0 < 600)
+        # A --retire the sweep restarts after a stay ENDED (held cleared, drain_from stamped) and before its drain
+        # did: its clock is the stay's end, not a cutover half an hour back — or it kills a predecessor that took
+        # its final message seconds ago, with no grace to journal it (lander review, PR #1123).
+        r = cutover("rs1")
+        pre = r["predecessor"]["tmux"]
+        rr = read("rs1"); rr["cutover"] = clk[0] - 1800; rr["held"] = []; rr["drain_from"] = clk[0] - 10; write(rr)
+        panes[pre] = "❯ working\n\n✻ Thinking… (" + WORKING + ")\n──────\n❯\u00a0\n──────"
+        t0 = clk[0]
+        ok("a --retire restarted inside a finished stay's drain resumes it from the stay's end: a busy "
+           "predecessor keeps the rest of its drain", retire("rs1") == 0 and 590 <= clk[0] - t0 < 600 + 60
+           and pre not in wins.values() and read("rs1") is None)
+        r = cutover("rs2")
+        pre = r["predecessor"]["tmux"]
+        rr = read("rs2"); rr["cutover"] = clk[0] - 1800; rr["held"] = []; rr["drain_from"] = clk[0] - 10; write(rr)
+        panes[pre] = IDLE
+        t0 = clk[0]
+        ok("...and an idle one still gets the rest of its minimum grace for its final journal entry",
+           retire("rs2") == 0 and 110 <= clk[0] - t0 < 600 and read("rs2") is None)
 
         # ---- THE PREDECESSOR STAYS FOR ITS SUBAGENTS: the successor is live for the channel from cutover, the
         # old session keeps running to hand each report on, and its retirement waits for the last one.
@@ -1058,6 +1076,25 @@ def run_selfcheck():
         rr = read("s6"); rr.pop("held"); rr["drain_from"] = time.time() - 601; write(rr)
         ok("...and once the stay is over it drains and is ended like any other",
            sweep() == 0 and read("s6") is None and pre not in wins.values() and wins.get("s6") == suc)
+        # 2026-10-03: the --retire --ready started died, the stay's subagents had all reported, and the record (and
+        # the live seat's next hand-off) sat for the stay's whole cap. The sweep starts one when none is running.
+        r = cutover("s8")
+        rr = read("s8"); rr["held"] = ["a-done"]; write(rr)
+        retires = lambda: sum(1 for a in msgs if isinstance(a, list) and a[-2:] == ["--retire", "s8"])
+        n8, lk = retires(), retire_lock("s8")          # a live --retire holds it
+        ok("a cut-over record a live --retire is finishing gets no second one from the sweep",
+           sweep() == 0 and retires() == n8 and read("s8") is not None)
+        lk.close()                                      # …and that --retire died
+        ok("...but one whose --retire died gets a new one, so a finished stay ends now and not at the stay's cap",
+           sweep() == 0 and retires() == n8 + 1 and read("s8") is not None)
+        lk = retire_lock("s8")
+        e8 = io.StringIO()
+        with contextlib.redirect_stderr(e8):
+            rc8 = retire("s8")
+        ok("...and a second --retire leaves at once while one holds the lock, ending nothing, and says so",
+           rc8 == 0 and read("s8") is not None and r["predecessor"]["tmux"] in wins.values()
+           and "another --retire is already finishing it" in e8.getvalue())
+        lk.close(); wins.pop("s8~old", None); clear("s8")
         os.environ["CC_HANDOFF_DRAIN"] = "0"
 
         os.environ.pop("CC_HANDOFF", None)
