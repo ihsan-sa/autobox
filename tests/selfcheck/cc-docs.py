@@ -213,6 +213,7 @@ def _selfcheck():
         v1 = mkpdf(src, "v1", "Gamma first version")
         v2 = mkpdf(src, "v2", "Gamma second version")
         tex = os.path.join(src, "gamma.tex")
+        open(tex, "w").write("\\documentclass{article}\n")   # a --source must exist now
         run("file", v1, "--project", "Box", "--kind", "work", "--title", "Gamma", "--source", tex)
         rc, o = run("file", v1, "--project", "Box", "--title", "Gamma", "--source", tex)
         d = load()["documents"]["001-0001"]
@@ -251,6 +252,17 @@ def _selfcheck():
         d = load()["documents"]["001-0001"]
         ok("a recorded source whose path is gone is replaced on an unchanged rebuild too",
            rc == 0 and "unchanged" in o and len(d["revisions"]) == 1 and d["source"] == os.path.abspath(moved))
+        # a --source or --latex that is not there (another branch checked out) refuses the filing outright
+        ROOT = os.path.join(t, "r2e")
+        absent = os.path.join(alone2, "absent", "resume.tex")
+        rc, o = run("file", z1, "--project", "Box", "--kind", "work", "--title", "Zeta", "--source", absent)
+        rc2, o2 = run("file", z1, "--project", "Box", "--kind", "work", "--title", "Zeta", "--latex", absent)
+        ok("a --source or --latex path that does not exist is refused and nothing is filed",
+           rc == 2 and rc2 == 2 and "--source " + absent in o and "--latex " + absent in o2
+           and "filed" not in o.replace("nothing filed", "") and not os.path.exists(regpath()))
+        rc, o = run("file", z1, "--project", "Box", "--kind", "work", "--title", "Zeta", "--source", moved)
+        ok("the same filing with a --source that exists files and keeps it",
+           rc == 0 and "\tfiled" in o and load()["documents"]["001-0001"]["revisions"][0].get("source_files"))
         # board revision, note and cost: a register of its own
         ROOT = os.path.join(t, "r2c")
         rc, o = run("file", v1, "--project", "Boards", "--kind", "work", "--title", "Board doc", "--describes", "PCB-1")
@@ -341,6 +353,7 @@ def _selfcheck():
         ROOT = os.path.join(t, "r4")
         e1, e2, e3 = (mkpdf(src, f"e{i}", f"Epsilon version {w}") for i, w in ((1, "one"), (2, "two"), (3, "three")))
         etex = os.path.join(src, "eps.tex")
+        open(etex, "w").write("\\documentclass{article}\n")
         run("file", e3, "--project", "Box", "--kind", "work", "--title", "Eps", "--source", etex, "--date", "2026-09-20")
         run("file", e1, "--project", "Box", "--title", "Eps (v1)", "--date", "2026-09-10")
         run("file", e2, "--project", "Box", "--title", "Eps (v2)", "--date", "2026-09-15")
