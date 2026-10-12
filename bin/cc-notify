@@ -14,7 +14,8 @@
 #                 is stored on the host beside it (~/.cc/approvals/run/<card ts>.json, 0600). The owner's own 👍 on that
 #                 card runs it once, as the box's user: the exit code comes back in the card's thread, the output in his DM
 #                 (`cc-slack run-approved`). Refused, with nothing posted, anywhere a --approval card cannot be made:
-#                 a caller that is not the control seat, a member workspace, or a box with no bot token.
+#                 a caller that is not the control seat, a member workspace, or a box with no bot token; and a
+#                 --long flag that one of this box's own scripts in the command does not name anywhere in its text.
 #     --owner     the owner's DM. Same authority as --decision.
 #     --heading   the bold line a person sees in place of the title. The title still routes, dedups and names the kind.
 #     --keep      a plain notice that is HIS TO MOVE (a failure or stop only he can shift): cc-slack's engagement gate
@@ -450,6 +451,48 @@ if [ -n "$run" ]; then
   if perl -CA -e 'exit($ARGV[0] =~ /(?![\t\n])\p{Cc}|[\p{Cf}\p{Zl}\p{Zp}]/ ? 0 : 1)' "$run$msg$title$heading"; then
     echo "cc-notify: a --run card holds a control, bidi or zero-width character, so it would not show what runs — nothing posted" >&2; exit 2; fi
   [ "${#run}" -le 2000 ] || { echo "cc-notify: --run is over 2000 characters, and a card split in two runs nothing — nothing posted" >&2; exit 2; }
+  # A FLAG THE TOOL DOES NOT TAKE never reaches a card: for each simple command in it whose program is one of this
+  # box's own scripts (it resolves to a text file under $HOME), every --long flag must appear in that script's text,
+  # where its usage and its parser are. Read, never run. Six of 25 approved cards (09-27..10-11) ran and failed,
+  # one on a usage error, and each cost the owner a second tap. A program that is not such a script is not checked.
+  badflag=$(python3 -I - "$run" 2>/dev/null <<'PY'
+import os, re, shlex, shutil, sys
+home = os.path.realpath(os.path.expanduser("~"))
+try:
+    lex = shlex.shlex(sys.argv[1], posix=True, punctuation_chars=True); lex.whitespace_split = True; toks = list(lex)
+except ValueError:
+    sys.exit(0)                          # quoting shlex cannot read: bash may still, so it is not this check's to refuse
+segs, cur = [], []
+for t in toks:
+    if t and set(t) <= set(";&|()"):
+        segs.append(cur); cur = []
+    else:
+        cur.append(t)
+segs.append(cur)
+for seg in segs:
+    while seg and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]):
+        seg = seg[1:]
+    if not seg:
+        continue
+    prog = os.path.expanduser(seg[0])
+    path = prog if "/" in prog else shutil.which(prog, path=f"{home}/bin:" + os.environ.get("PATH", ""))
+    if not path or not os.path.realpath(path).startswith(home + "/"):
+        continue
+    try:
+        with open(path, "rb") as fh:
+            src = fh.read(4 << 20)
+    except OSError:
+        continue
+    if not src.startswith(b"#!"):
+        continue
+    for a in seg[1:]:
+        m = re.match(r"^(--[A-Za-z0-9][A-Za-z0-9-]*)(=|$)", a)
+        if m and not re.search(re.escape(m.group(1)).encode() + rb"(?![A-Za-z0-9-])", src):
+            print(f"{m.group(1)} is not in {seg[0]}'s usage or code ({path})"); sys.exit(0)
+PY
+) || true
+  if [ -n "$badflag" ]; then
+    echo "cc-notify: --run: $badflag, so the command would fail when he taps it — nothing posted" >&2; exit 2; fi
   runsha=$(printf '%s' "$run" | sha256sum | cut -c1-64)
   shown=$(printf '%s' "$run" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')   # Slack reads <…> as a link
   msg="$(printf '%s\n```\n%s\n```\nYour 👍 runs this once on the box; the exit code comes back here and the output in your DM · `run:%s`' "$msg" "$shown" "${runsha:0:16}")"
@@ -600,7 +643,7 @@ if [ "$to_slack" = 1 ]; then   # one channel: the bot, else the webhook
       elif [ -e "$rdir/$cardts.json" ]; then
         echo "cc-notify: a run record for card $cardts is already on file — left as it was" >&2
       elif ! (umask 077 && mkdir -p "$rdir" && chmod 700 "$rdir" &&
-              jq -n --arg ts "$cardts" --arg cmd "$run" --arg sha "$runsha" --arg from "${from_seat:-${BOX:-}}" \
+              jq -n --arg ts "$cardts" --arg cmd "$run" --arg sha "$runsha" --arg from "${from_seat:-${CTL:-${BOX:-}}}" \
                  --arg at "$(date -u +%FT%TZ)" '{ts:$ts, cmd:$cmd, sha256:$sha, from:$from, posted_at:$at}' \
                  > "$rdir/$cardts.json.tmp" && mv "$rdir/$cardts.json.tmp" "$rdir/$cardts.json"); then
         echo "cc-notify: the card went out but its run record could not be written — a 👍 on it runs nothing" >&2

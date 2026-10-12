@@ -93,12 +93,18 @@ class Status(unittest.TestCase):
                  ((0, "3 failed\nretry: 0 failed"), T.PASSED), ((1, "boom"), T.FAILED),
                  ((124, ""), T.UNRUNNABLE), ((137, ""), T.UNRUNNABLE), ((-9, ""), T.UNRUNNABLE),
                  ((1, "write: No space left on device"), T.UNRUNNABLE),
+                 # a passing check may quote the box-state text itself (cc-subject's /work-too-small case)
+                 ((0, "cp: No space left on device\nok 25 passed, 0 failed"), T.PASSED),
+                 ((0, "Cannot allocate memory\n3 failed"), T.FAILED),
+                 ((0, "3 failed"), T.FAILED),
                  ((1, "bwrap: Can't mount proc on /newroot/proc"), T.UNRUNNABLE),
                  ((1, "Failed to connect to user scope bus via local transport"), T.UNRUNNABLE),
                  ((0, "bwrap: a line of the check's own that says bwrap:"), T.PASSED)]
         for (rc, text), want in cases:
             self.assertEqual(RUN.status_of(rc, text)[0], want, (rc, text))
         self.assertEqual(RUN.status_of(0, "", capped=True)[0], T.UNRUNNABLE)
+        self.assertEqual(RUN.status_of(1, "cp: No space left on device"),
+                         (T.UNRUNNABLE, "the box, not the tree: No space left on device"))
 
     def test_red_lines_leave_out_pass_lines(self):
         self.assertEqual(RUN.red_lines("ok 1 fine\n✗ broke here\nFAIL two\n✓ FAIL-looking pass"),

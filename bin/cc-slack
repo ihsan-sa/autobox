@@ -39,14 +39,16 @@
                                       OWNER's own 👍 lands on such a card in #approvals; anyone else's 👍 is logged and runs
                                       nothing. It checks everything again itself — the record on the host (its own, 0600, its
                                       sha256 still the command's), the card (the bot's, never edited, ENDING with that command and
-                                      its `run:` stamp, with no fence of its own or hidden character in either) and the owner's
+                                      its `run:` stamp once a link Slack made of a domain is put back as the text it stood for,
+                                      with no fence of its own or hidden character in either) and the owner's
                                       👍 on it through Slack. The owner, the token, #approvals and the record dir come from the
                                       password database's home and its ~/.cc/config, never the environment, and the command runs
                                       in an environment built there, not the caller's. It claims the card twice before
                                       it runs, on the host (an O_EXCL .ran file) and in Slack (the bot's ⏳ on the card), and
                                       either one already there refuses the run. The DM masks tokens, keys and NAME=secret
                                       values; the whole output stays in ~/.cc/approvals/run/<ts>.ran. Every refusal and
-                                      every run is a line in ~/.cc/approvals/run/log.
+                                      every run is a line in ~/.cc/approvals/run/log. When his 👍 is refused or the command
+                                      fails, the seat that posted the card (the record's `from`) is told why by cc-msg.
   cc-slack selfcheck                  unit checks, no Slack needed (tests/selftest.sh runs it); the cases are core/tests/slack_selfcheck.py, run in this file's namespace; every state it touches is its own scratch dir, never the box's.
   cc-slack manifest --print | --config-token xoxe.xoxp-… --app A0…      paste-ready manifest, or push it onto an existing app; the owner still taps Reinstall and generates the app-level token.
 
@@ -9594,7 +9596,7 @@ def run_card_refusal(cfg, chat, ts):
     # character makes the card show one command while bash runs another.
     if "```" in cmd or "```" in text[:-len(tail)]:
         return "the card or its command holds three backticks of its own, so it may not show what runs", None, True
-    if run_hidden(cmd) or run_hidden(text):
+    if run_hidden(cmd) or run_hidden(text) or run_hidden(msg.get("text") or ""):   # raw too: unlinking drops the URL
         return "the card or its command holds a control, bidi or zero-width character, so it may not show what runs", None, True
     return None, rec, False
 
@@ -9609,6 +9611,7 @@ def run_approved(cfg, chat, ts, run=None):
         run_log(f"{ts}: not run — {why}")
         if tell:
             post(cfg, chat, f"Not run: {why}. Nothing ran on the box.", thread=ts, mail=False)
+            run_tell_seat(ts, f"was refused: {why}. Nothing ran.")
         return None
     try:
         fd = os.open(f"{RUN_CARDS}/{ts}.ran", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -9648,7 +9651,32 @@ def run_approved(cfg, chat, ts, run=None):
     except Exception as e:
         run_log(f"{ts}: the output did not reach the owner's DM ({e!r}); it is in the .ran file")
     react(cfg, chat, ts, "white_check_mark" if rc == 0 else "x")
+    if rc != 0:
+        run_tell_seat(ts, f"ran, and its command exited {rc}. The whole output is in {RUN_CARDS}/{ts}.ran.")
     return rc
+
+RUN_SEAT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@/-]{0,79}$")
+
+def run_tell_seat(ts, what):
+    """Tell the seat that posted the card (the record's `from`, written by cc-notify) that the owner's 👍 did not do what
+    the card asked, so it re-posts the card fixed or finishes the step another way. Before this only the owner heard
+    "Not run" or ❌, and 16 of 25 approved cards (09-27..10-11) ended so with nobody acting on it. Called only where the
+    thread is told too: his 👍 on a card in #approvals with a record on file, so no one else can make it speak. The
+    reason is the daemon's own words; no output goes in the message, since it may hold a secret."""
+    try:
+        seat = (json.load(open(f"{RUN_CARDS}/{ts}.json")).get("from") or "").strip()
+    except (OSError, ValueError, AttributeError):
+        seat = ""
+    if not RUN_SEAT_RE.match(seat):
+        run_log(f"{ts}: no seat on the record to tell ({seat[:80]!r})"); return
+    text = (f"Your #approvals run card {ts} got the owner's 👍 but {what} Re-post it fixed (cc-notify --approval "
+            f"--run), or finish the step another way. The trail is {RUN_CARDS}/log.")
+    try:
+        r = EFFECTS.run([f"{BIN}/cc-msg", window_for(seat), text], env=dict(os.environ, CC_MSG_FROM=f"run-card:{ts}"),
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90)
+        run_log(f"{ts}: told {seat} why (cc-msg exit {r.returncode})")
+    except Exception as e:
+        run_log(f"{ts}: could not tell {seat} why ({e!r})")
 
 def run_mask(text):
     """A run's output with every secret shape this box has met masked: SECRET_RE's, RUN_MASKS' and NAME=value pairs.

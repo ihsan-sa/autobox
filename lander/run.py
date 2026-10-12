@@ -218,12 +218,13 @@ def read_log(log: str, limit: int = 400_000) -> str:
 
 
 def status_of(rc: int, text: str, capped: bool = False) -> tuple:
-    """-> (status, why)."""
+    """-> (status, why). A clean exit with no 'N failed' above zero passes whatever it prints: a check that quotes
+    a box-state error (a case that fills a disk on purpose) is not the box failing, so that text counts on rc != 0."""
     if capped:
         return T.UNRUNNABLE, "stopped at its cap"
     if rc < 0 or rc in KILLED:
         return T.UNRUNNABLE, f"killed (exit {rc})"
-    m = BOX_STATE_RE.search(text)
+    m = BOX_STATE_RE.search(text) if rc else None
     if m:
         return T.UNRUNNABLE, f"the box, not the tree: {m.group(0)}"
     head = text.lstrip()[:2000]

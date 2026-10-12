@@ -8701,12 +8701,12 @@ def run_selfcheck():
     # Slack, and a fake shell that records what it was asked to run. Every case asserts what ran AND what did not.
     import hashlib
     def rc_case(cmd="echo hi", text=None, edited=False, reactors=("UOWNER",), mode=0o600, rewrite=None, chat="CAPPR",
-                claimed=False, claim_fails=False, author=None):
+                claimed=False, claim_fails=False, author=None, frm="demo", rc=0):
         d = tempfile.mkdtemp(prefix="cc-slack-selfcheck-run-")
         os.chmod(d, 0o700)
         ts, sha = "1790000000.000100", hashlib.sha256(cmd.encode()).hexdigest()
         with open(f"{d}/{ts}.json", "w") as fh:
-            json.dump({"ts": ts, "cmd": cmd, "sha256": sha}, fh)
+            json.dump({"ts": ts, "cmd": cmd, "sha256": sha, **({"from": frm} if frm is not None else {})}, fh)
         os.chmod(f"{d}/{ts}.json", mode)
         if rewrite:
             with open(f"{d}/{ts}.json", "w") as fh:
@@ -8719,7 +8719,8 @@ def run_selfcheck():
             msg["edited"] = {"user": "UBOT", "ts": "1790000001.000000"}
         # posts = what the card's channel got, dms = what the owner's DM got; reactions are Slack's own record, so
         # the bot's claim placed by one run is on the card for the next (claimed= puts one there from the start)
-        c = {"dir": d, "ts": ts, "chat": chat, "posts": [], "dms": [], "reacts": [], "ran": [],
+        # told = the cc-msg calls run_tell_seat made: what the posting seat heard
+        c = {"dir": d, "ts": ts, "chat": chat, "posts": [], "dms": [], "reacts": [], "ran": [], "told": [],
              "claim": ["UBOT"] if claimed else []}
         def fake(method, token, **kw):
             if method == "auth.test":
@@ -8743,16 +8744,17 @@ def run_selfcheck():
                 c["reacts"].append(kw.get("name")); return {}
             return {}
         c["fake"] = fake
-        c["run"] = lambda argv, **kw: c["ran"].append(argv) or type("R", (), {"returncode": 0, "stdout": "hi\n", "stderr": ""})()
+        c["run"] = lambda argv, **kw: c["ran"].append(argv) or type("R", (), {"returncode": rc, "stdout": "hi\n", "stderr": ""})()
         return c
     def rc_go(c):
-        was_api, was_cards = globals()["api"], globals()["RUN_CARDS"]
+        was_api, was_cards, was_run = globals()["api"], globals()["RUN_CARDS"], EFFECTS.run_impl
         globals()["api"], globals()["RUN_CARDS"] = c["fake"], c["dir"]
+        EFFECTS.run_impl = lambda argv, **kw: c["told"].append(argv) or type("R", (), {"returncode": 0})()
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 return run_approved({"SLACK_BOT_TOKEN": "xoxb-x", "SLACK_OWNER_ID": "UOWNER"}, c["chat"], c["ts"], run=c["run"])
         finally:
-            globals()["api"], globals()["RUN_CARDS"] = was_api, was_cards
+            globals()["api"], globals()["RUN_CARDS"], EFFECTS.run_impl = was_api, was_cards, was_run
     def rc_log(c):
         try:
             return open(f"{c['dir']}/log").read()
@@ -9029,6 +9031,32 @@ def run_selfcheck():
     check("run card: …while the same stored form ending with another command runs nothing, and the thread says why",
           rc_go(c) is None and not c["ran"] and "does not end with this command" in rc_log(c)
           and len(c["posts"]) == 1 and c["posts"][0][1].startswith("Not run:"))
+    # A REFUSED OR FAILED 👍 IS TOLD TO THE SEAT THAT POSTED THE CARD (approval-tap-acts-fast): 16 of 25 approved cards
+    # (09-27..10-11) were refused or failed, and only the owner heard about it.
+    dcmd = "cc-zonetool dns set 2b --proxied --zone example.org"
+    dsha = hashlib.sha256(dcmd.encode()).hexdigest()
+    c = rc_case(cmd=dcmd, text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* point it"
+                + run_card_tail(dcmd, dsha).replace("example.org", "<http://example.org|evil.cc>"))
+    check("run card: the owner's 👍 on a card that is refused tells the posting seat why, once, by cc-msg to the "
+          "record's `from`, so it can re-post the card",
+          rc_go(c) is None and not c["ran"] and len(c["told"]) == 1 and c["told"][0][0].endswith("/cc-msg")
+          and c["told"][0][1] == "demo" and "was refused" in c["told"][0][2]
+          and "does not end with this command" in c["told"][0][2] and "told demo why" in rc_log(c))
+    c = rc_case()
+    check("run card: …while a card that runs and exits 0 tells no seat anything",
+          rc_go(c) == 0 and len(c["ran"]) == 1 and not c["told"])
+    c = rc_case(rc=1)
+    check("run card: a command that runs and exits 1 tells the posting seat, once, with the exit code and where the output "
+          "is",
+          rc_go(c) == 1 and len(c["ran"]) == 1 and len(c["told"]) == 1 and "exited 1" in c["told"][0][2]
+          and f"{c['ts']}.ran" in c["told"][0][2]
+          and rc_go(c) is None and len(c["told"]) == 1)
+    c = rc_case(reactors=("UMEMBER",), text="<#CAPPR> ❓ <@UOWNER> 🔐 *Approval needed:* x" + run_card_tail("echo other", hashlib.sha256(b"echo hi").hexdigest()))
+    check("run card: a member's 👍 on a card that would refuse tells no seat (and the thread hears nothing): only the "
+          "owner's 👍 makes the bot speak", rc_go(c) is None and not c["told"] and not c["posts"])
+    c = rc_case(rc=2, frm="bad seat; rm -rf /")
+    check("run card: a record whose `from` is not a seat name tells nobody, and the log says so",
+          rc_go(c) == 2 and not c["told"] and "no seat on the record to tell" in rc_log(c))
     # Two copies of one test, perl's in cc-notify and run_hidden here: held to the same verdict on every sample.
     mP = re.search(r"perl -CA -e '(exit\(\$ARGV\[0\] =~ /[^/]*/ \? 0 : 1\))' \"\$run", notify_src)
     differ = []
