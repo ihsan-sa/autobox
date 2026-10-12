@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""cc-i2m — idea to merged, per stage: where the time went for every PR merged in a window.
+
+    cc-i2m [--repo R] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--top N] [--json]
+    cc-i2m selfcheck
+
+The window is UTC days, both ends inclusive, today when neither is given (--from alone runs to today, --to alone is that one day). The repo is
+--repo, else the first line of the worktree's .cc/track. Prints each stage's p50, p95 and total over the PRs it
+touched, the N slowest PRs (5) with their dominant stage, and one verdict line naming the biggest stage. --json
+prints the same as one object: window, prs (each with its stages in seconds), stages, verdict.
+
+THE STAGES. Every second from the row's creation (the PR opening, when it has no row) to its merge lands in exactly
+one, so a PR's stages add up to its whole time:
+  brief      the row created to its dispatch
+  worker     the dispatch to the PR opening, less its green waits; the row's creation when no dispatch is on record
+  green      a worker's cc-green run waiting for an admission slot, inside the worker's span
+  pre-queue  the PR open, not yet queued for the lander
+  lander     queued, taken by a lane but not yet planned, or parked behind another PR
+  checks     the lane's plan, checks and review read
+  handback   handed back for a fix (by the lane, or by a seat's recorded HANDBACK), until it is queued again
+  main-red   a checking pass that ended held on a check red on main too, and that hold
+  seat       a query for the planning seat, until it is queued again; all of a PR a seat landed by hand
+  hold       any other hold, and whatever the record does not explain
+
+WHAT IT READS, all of it read-only:
+  merges     `git log` of the board's checkout (its `path`), origin/<default branch> or else the branch: a commit whose
+             subject ends `(#N)` and whose commit time is in the window is PR N, merged then. A merge queue.log saw
+             that the checkout has not fetched yet counts too. With no checkout to read, the board's merged rows do.
+  the board  $CC_BOARDS (~/.cc/boards)/<repo>.json. The PR's row is the one whose `pr` names it, else the one whose
+             branch tip (track/<row>, local or origin) is a head queue.log named for the PR, else the one titled like
+             its merge commit, else one whose title says `(#N`. From the row: `created`; its dispatch, the first
+             `dispatched headless worker` note before the PR opened, else the `dispatched` stamp cc-board writes when
+             a worker starts. The PR opened at the row's first `status -> review` or its own first queue.log line,
+             whichever is first; with no review line (a seat built it, or there is no row) its branch's first commit
+             that main lacks counts too, because a seat opens its PR as it commits.
+  queue.log  $CC_LANDER_STATE (~/.cc/state/land)/queue.log, replayed the way the lander moved the PR.
+  green waits $CC_GREEN_DIR (~/.cc/state/land/green)/waits-<repo>.tsv: `start end row who secs`, one line per
+             slot a cc-green run waited on (lander/admission.py writes it when LANDER_WAIT_LOG names it).
+A PR with no lane line in its open life, only `recorded` ones, was landed by a seat by hand. All of its open life is
+seat time: a record line says when a seat's read ended, not how long it ran or when the seat picked the PR up.
+"""
+import calendar
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CORE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, CORE)
+from lander.events import epoch_of, pctl, span_words  # noqa: E402  (the queue's own stamp and percentile)
+
+STAGES = ("brief", "worker", "green", "pre-queue", "lander", "checks", "handback", "main-red", "seat", "hold")
+QLINE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\t(\S+) ([\w.-]+)#(\d+)(.*)$")
+SUBJECT_PR = re.compile(r"\s*\(#(\d+)\)\s*$")
+HEADS = re.compile(r"(?:\bhead=|->)([0-9a-f]{7,40})")
+
+
+def home(*p):
+    return os.path.join(os.path.expanduser("~"), *p)
+
+
+def day_epoch(d):
+    return calendar.timegm(time.strptime(d, "%Y-%m-%d"))
+
+
+def queue_events(lines, repo):
+    """{pr: [(at, kind, rest, staged)]} from queue.log lines; a `stage` line's kind is its stage name, staged True."""
+    got = {}
+    for ln in lines:
+        m = QLINE.match(ln.rstrip("\n"))
+        if not m or m.group(3) != repo:
+            continue
+        at, kind, rest, staged = epoch_of(m.group(1)), m.group(2), m.group(5).strip(), False
+        if kind == "stage":
+            kind, _, rest = rest.partition(" ")
+            staged = True
+        got.setdefault(int(m.group(4)), []).append((at, kind, rest, staged))
+    return got
+
+
+def git_merges(lines):
+    """{pr: (merged, subject)} from `git log --format=%ct%x09%s` lines (newest first): squash merges, `subject (#N)`."""
+    got = {}
+    for ln in lines:
+        at, _, subject = ln.rstrip("\n").partition("\t")
+        m = SUBJECT_PR.search(subject)
+        if at.isdigit() and m:
+            got.setdefault(int(m.group(1)), (int(at), subject[:m.start()].strip()))
+    return got
+
+
+def branch_tips(lines):
+    """[(sha, row)] from `git for-each-ref --format='%(objectname) %(refname)'` lines for track/ branches."""
+    got = []
+    for ln in lines:
+        sha, _, ref = ln.strip().partition(" ")
+        m = re.match(r"refs/(?:heads|remotes/[^/]+)/track/(\S+)$", ref)
+        if m and re.fullmatch(r"[0-9a-f]{7,40}", sha):
+            got.append((sha, m.group(1)))
+    return got
+
+
+def green_waits(lines):
+    """{row: [(start, end)]} from waits-<repo>.tsv lines."""
+    got = {}
+    for ln in lines:
+        f = ln.rstrip("\n").split("\t")
+        if len(f) < 3:
+            continue
+        s, e = epoch_of(f[0]), epoch_of(f[1])
+        if s and e >= s:
+            got.setdefault(f[2], []).append((s, e))
+    return got
+
+
+def clipped(spans, lo, hi):
+    """Seconds of the union of `spans` that fall inside [lo, hi]."""
+    total, end = 0, lo
+    for s, e in sorted(spans):
+        s, e = max(s, end), min(e, hi)
+        if e > s:
+            total, end = total + e - s, e
+    return total
+
+
+def same_head(a, b):
+    n = min(len(a), len(b))
+    return n >= 7 and a[:n] == b[:n]
+
+
+def pr_of(t):
+    m = re.search(r"/pull/(\d+)", t.get("pr") or "")
+    return int(m.group(1)) if m else None
+
+
+def find_row(pr, subject, tracks, events, tips):
+    """(name, row or None) for PR `pr`: the row whose `pr` names it; else the track/ branch whose tip is a head
+    queue.log named for it (its row, when the board has one that names no other PR); else a row titled (or named) as
+    the merge commit's subject; else one whose title says `(#pr`. ("", None) when nothing ties it to a row."""
+    own = [n for n, t in tracks.items() if pr_of(t) == pr]
+    if own:
+        return own[0], tracks[own[0]]
+    free = {n: t for n, t in tracks.items() if pr_of(t) is None}
+    heads = {h for e in events for h in HEADS.findall(e[2])}
+    for sha, name in tips:
+        if any(same_head(sha, h) for h in heads):
+            return name, free.get(name)
+    s = (subject or "").strip().lower()
+    for n, t in free.items():
+        if s and s in ((t.get("title") or "").strip().lower(), n.lower()):
+            return n, t
+    for n, t in free.items():
+        if re.search(rf"\(#{pr}(?!\d)", t.get("title") or ""):
+            return n, t
+    return "", None
+
+
+def opened_at(review, first_q, first_commit, merged):
+    """When the PR opened: the row's first `status -> review` or the PR's first queue.log line, whichever is first.
+    With no review line the board never saw it open (a seat built it, or there is no row), and a seat opens its PR
+    as it commits, so its branch's first commit (`first_commit()`, 0 when unknown) stands in too."""
+    got = [x for x in (review, first_q) if x]
+    if not review:
+        got += [x for x in (first_commit(),) if x]
+    return min(min(got, default=merged), merged)
+
+
+def row_times(name, t, log, first_q, merged, first_commit=lambda: 0):
+    """(created, dispatch or 0, opened) for a PR's board row. `first_q` is the PR's first queue.log line, or 0."""
+    created = epoch_of(t.get("created"))
+    lines = [(epoch_of(e.get("ts")), e.get("msg") or "") for e in log if e.get("track") == name]
+    lines += [(epoch_of(n.get("ts")), n.get("msg") or "") for n in t.get("notes") or [] if isinstance(n, dict)]
+    review = min([at for at, m in lines if m == "status -> review" and created <= at <= merged], default=0)
+    opened = opened_at(review, first_q, first_commit, merged)
+    starts = [at for at, m in lines if m.startswith("dispatched headless worker") and at <= opened]
+    stamped = epoch_of(t.get("dispatched"))
+    dispatch = min(starts, default=0) or (stamped if stamped and stamped <= opened else 0)
+    return created, dispatch, opened
+
+
+def lander_spans(events, end):
+    """[(start, end, stage)] of a PR's time in the lander up to `end`, replaying its queue.log lines as the lander moved
+    it: a retry tick of a held PR keeps it held, a lane that takes it keeps it waiting until it is planned, and a
+    checking pass that ends held on a check red on main belongs to that hold."""
+    spans, cur, since, red, incomplete, last_hold, merged_at, idle_fix = [], None, 0, False, False, None, 0, False
+
+    def to(t, stage):
+        nonlocal cur, since, idle_fix
+        idle_fix = False
+        if cur not in (None, "done") and t > since:
+            spans.append((since, t, "handback" if cur == "seat-handback" else cur))
+        cur, since = stage, t
+
+    for t, kind, rest, staged in sorted(events, key=lambda e: e[0]):
+        if t > end:
+            break
+        if (kind in ("queued", "requeued", "handed-pushed") and not staged) or (staged and kind == "queued"):
+            if staged and cur in ("hold", "main-red", "lander"):
+                continue   # the lander's own retry tick: still where it was
+            to(t, "lander")
+        elif staged and kind == "lane":
+            if cur in (None, "done", "handback"):
+                to(t, "lander")
+        elif staged and kind == "parked":
+            to(t, "lander")
+        elif staged and kind in ("planned", "checking", "mergeable"):
+            if cur != "checks":
+                red = incomplete = False
+                to(t, "checks")
+        elif staged and kind == "gate":
+            red = red or " ok=main-red" in f" {rest}"
+        elif staged and kind.startswith("verdict"):
+            incomplete = incomplete or "verdict=INCOMPLETE" in f"{kind} {rest}"
+        elif staged and kind == "held":
+            cause = ("main-red" if red else "hold" if incomplete
+                     else last_hold if cur in ("hold", "main-red", "checks") and last_hold else "hold")
+            last_hold = cause
+            if cur == "checks" and cause == "main-red":
+                cur = "main-red"   # the pass that found main red is part of that hold
+            if cur != cause:
+                to(t, cause)
+        elif staged and kind == "query":
+            to(t, "seat")
+        elif kind == "recorded" and "verdict=HANDBACK" in rest:
+            if cur == "seat":
+                to(t, "seat-handback")   # the seat sent it back: a fix round, though the lander still says query
+            elif cur in (None, "done"):
+                to(t, "handback")
+                idle_fix = True   # a fix round only if a queue line ends it; a seat may land it by hand instead
+        elif (kind == "handed" and not staged) or (staged and kind == "handback"):
+            if cur not in ("handback", "seat-handback"):
+                to(t, "handback")
+        elif staged and kind == "merged":
+            to(t, "done")
+            merged_at = t
+        elif kind in ("done", "removed", "dropped", "reaped"):
+            if not (merged_at and t - merged_at < 86400) and cur != "done":
+                to(t, "done")
+        elif kind == "handed-end" and "watched long enough" in rest and cur == "handback":
+            to(t, "done")
+    if idle_fix:
+        cur = None
+    to(end, "done")
+    return spans
+
+
+def pr_stages(created, dispatch, opened, merged, events, waits):
+    """{stage: seconds} for one PR; they add up to merged - created. `events` are its queue.log lines."""
+    out = dict.fromkeys(STAGES, 0)
+    opened = min(opened or merged, merged)
+    created = min(created or opened, opened)
+    dispatch = dispatch if created <= dispatch <= opened else created
+    out["brief"] = dispatch - created
+    out["green"] = clipped(waits, dispatch, opened)
+    out["worker"] = opened - dispatch - out["green"]
+    inside = [(max(a, opened), min(b, merged), s) for a, b, s in lander_spans(events, merged) if min(b, merged) > max(a, opened)]
+    if not inside:
+        hand = any(e[1] == "recorded" and e[0] <= merged for e in events)
+        out["seat" if hand else "hold"] += merged - opened   # landed by a seat by hand, or nothing on record
+        return out
+    at = opened
+    for a, b, s in inside:
+        if a > at:
+            out["pre-queue" if at == opened else "hold"] += a - at
+        out[s] += b - a
+        at = b
+    out["hold"] += merged - at
+    return out
+
+
+def measure(board, qlines, wlines, repo, lo, hi, glines=None, rlines=(), first_commit=None):
+    """Every PR merged in [lo, hi): [{"pr", "row", "title", "total", "stages", ...}], slowest first. `glines` is the
+    checkout's `git log` (git_merges), None when there is none to read; `rlines` its track/ branch tips;
+    `first_commit(row)` the first commit time on track/<row> that main does not have, 0 when unknown."""
+    fc = first_commit or (lambda row: 0)
+    q, w = queue_events(qlines, repo), green_waits(wlines)
+    tracks, log = board.get("tracks") or {}, board.get("log") or []
+    merges = git_merges(glines or [])
+    for pr, ev in q.items():   # the lander merged it; git may not have fetched it yet
+        at = min([e[0] for e in ev if e[3] and e[1] == "merged"], default=0)
+        if at and pr not in merges:
+            merges[pr] = (at, "")
+    if glines is None:   # no checkout to read: the board's merged rows are all there is
+        for name, t in tracks.items():
+            pr = pr_of(t)
+            if pr and pr not in merges and t.get("status") in ("merged", "done"):
+                at = min([epoch_of(e.get("ts")) for e in log if e.get("track") == name
+                          and e.get("msg") == "status -> merged"], default=0)
+                if at:
+                    merges[pr] = (at, "")
+    tips = branch_tips(rlines)
+    prs = []
+    for pr, (merged, subject) in merges.items():
+        if not lo <= merged < hi:
+            continue
+        ev = q.get(pr, [])
+        name, t = find_row(pr, subject, tracks, ev, tips)
+        first_q = min([e[0] for e in ev], default=0)
+        branch_first = (lambda: fc(name)) if name else (lambda: 0)
+        if t:
+            created, dispatch, opened = row_times(name, t, log, first_q, merged, branch_first)
+        else:
+            created, dispatch, opened = 0, 0, opened_at(0, first_q, branch_first, merged)
+        st = pr_stages(created, dispatch, opened, merged, ev, w.get(name, []) if name else [])
+        top = max(STAGES, key=lambda s: st[s])
+        prs.append({"pr": pr, "row": name, "title": (t or {}).get("title") or subject or name or f"#{pr}",
+                    "total": sum(st.values()), "dominant": top, "dispatch_known": bool(t and dispatch),
+                    "on_board": bool(t), "stages": st})
+    return sorted(prs, key=lambda p: (-p["total"], p["pr"]))
+
+
+def git_lines(path, *args):
+    """A git command's output lines in the checkout at `path`, None when git fails."""
+    try:
+        r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.splitlines(True) if r.returncode == 0 else None
+
+
+def checkout_lines(board, lo):
+    """(git log lines, branch tip lines, first_commit) for the board's checkout; (None, (), None) when it has none."""
+    path, branch = board.get("path") or "", board.get("default_branch") or "main"
+    if not path or not os.path.isdir(path):
+        return None, (), None
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(lo - 86400))
+    for main in (f"origin/{branch}", branch):
+        got = git_lines(path, "log", main, f"--since={since}", "--format=%ct%x09%s", "--")
+        if got is not None:
+            break
+    tips = git_lines(path, "for-each-ref", "--format=%(objectname) %(refname)",
+                     "refs/heads/track", "refs/remotes/origin/track") or ()
+
+    def first_commit(row):
+        for ref in (f"origin/track/{row}", f"track/{row}"):
+            at = git_lines(path, "log", "--format=%at", f"{main}..{ref}", "--")
+            if at:
+                return min(int(x) for x in at if x.strip().isdigit())
+        return 0
+    return got, tips, first_commit
+
+
+def summary(prs, top=5):
+    stages = {}
+    for s in STAGES:
+        vals = [p["stages"][s] for p in prs if p["stages"][s] > 0]
+        stages[s] = {"p50": pctl(vals, 50) or 0, "p95": pctl(vals, 95) or 0, "total": sum(vals), "prs": len(vals)}
+    whole = sum(v["total"] for v in stages.values())
+    big = max(STAGES, key=lambda s: stages[s]["total"]) if whole else ""
+    verdict = (f"the biggest stage is {big}: {span_words(stages[big]['total'])} of {span_words(whole)} "
+               f"({100 * stages[big]['total'] // whole}%) across {stages[big]['prs']} of {len(prs)} PRs"
+               if big else "no PR merged in this window")
+    return {"stages": stages, "total": whole, "biggest": big, "verdict": verdict,
+            "dispatch_unknown": sum(1 for p in prs if not p["dispatch_known"]), "slowest": prs[:top]}
+
+
+def render(repo, frm, to, prs, s):
+    w = lambda v: span_words(v) if v else "-"
+    out = [f"idea to merged, {repo}, {frm}" + (f" to {to}" if to != frm else "") + f" (UTC): {len(prs)} PRs merged"
+           + (f", {s['dispatch_unknown']} with no dispatch on record (brief 0)" if s["dispatch_unknown"] else "")]
+    out.append(f"  {'stage':<10}{'p50':>8}{'p95':>8}{'total':>9}{'PRs':>5}")
+    for k in STAGES:
+        v = s["stages"][k]
+        out.append(f"  {k:<10}{w(v['p50']):>8}{w(v['p95']):>8}{w(v['total']):>9}{v['prs']:>5}")
+    if s["slowest"]:
+        out.append("slowest:")
+        for p in s["slowest"]:
+            out.append(f"  #{p['pr']:<6}{w(p['total']):>7}  {p['dominant']} {w(p['stages'][p['dominant']])}  {p['title'][:60]}")
+    out.append(f"verdict: {s['verdict']}")
+    return "\n".join(out)
+
+
+def read_lines(path):
+    try:
+        with open(path, errors="replace") as f:
+            return f.readlines()
+    except OSError:
+        return []
+
+
+def run(repo, frm, to, top=5, as_json=False):
+    bp = os.path.join(os.environ.get("CC_BOARDS") or home(".cc", "boards"), f"{repo}.json")
+    try:
+        with open(bp) as f:
+            board = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"cc-i2m: no board for {repo}: {e}", file=sys.stderr)
+        return 1
+    land = os.environ.get("CC_LANDER_STATE") or home(".cc", "state", "land")
+    gdir = os.environ.get("CC_GREEN_DIR") or os.path.join(land, "green")
+    lo, hi = day_epoch(frm), day_epoch(to) + 86400
+    glines, rlines, first_commit = checkout_lines(board, lo)
+    prs = measure(board, read_lines(os.path.join(land, "queue.log")),
+                  read_lines(os.path.join(gdir, f"waits-{repo}.tsv")), repo, lo, hi, glines, rlines, first_commit)
+    s = summary(prs, top)
+    if as_json:
+        print(json.dumps({"repo": repo, "from": frm, "to": to, "prs": prs, **s}, indent=1))
+    else:
+        print(render(repo, frm, to, prs, s))
+    return 0
+
+
+def selfcheck(*a, **k):
+    """The cases are core/tests/selfcheck/cc-i2m.py, run in THIS namespace; defining them replaces this selfcheck()."""
+    path = os.path.join(CORE, "tests", "selfcheck", "cc-i2m.py")
+    with open(path, encoding="utf-8") as fh:
+        exec(compile(fh.read(), path, "exec"), globals())
+    return globals()["selfcheck"](*a, **k)
+
+
+USAGE = "usage: cc-i2m [--repo R] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--top N] [--json] | selfcheck | --help"
+
+
+def main(argv):
+    if argv == ["selfcheck"]:
+        return selfcheck()
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    as_json = "--json" in argv
+    argv = [x for x in argv if x != "--json"]
+    opts = dict(zip(argv[::2], argv[1::2]))
+    if len(argv) % 2 or set(opts) - {"--repo", "--from", "--to", "--top"}:
+        print(USAGE, file=sys.stderr)
+        return 2
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    frm, to = opts.get("--from") or opts.get("--to") or today, opts.get("--to") or today
+    try:
+        day_epoch(frm), day_epoch(to)
+        top = int(opts.get("--top") or 5)
+    except ValueError:
+        print("cc-i2m: dates are YYYY-MM-DD and --top a number", file=sys.stderr)
+        return 2
+    repo = opts.get("--repo")
+    if not repo:
+        track = read_lines(".cc/track")
+        repo = track[0].strip() if track else ""
+    if not repo:
+        print("cc-i2m: which repo? --repo R (no .cc/track here to say)", file=sys.stderr)
+        return 2
+    return run(repo, frm, to, top, as_json)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

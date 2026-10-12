@@ -165,8 +165,20 @@ verdict_field(){ sed -n "s/^$1=//p" "$VERDICT" 2>/dev/null | head -1; }
 # The log is a file, not a pipe, so the run comes back on the check's own exit whatever it left running.
 # The check runs under cc-nosignal, as a suite does in run_cmd: it may signal what it started and nothing else, so a
 # pid it computes wrong (the user manager, on 2026-10-02) gets EPERM. A stop from here still reaches it.
+# THE SLOT WAIT OUTLIVES THE LOG. The log is one per root and the next run overwrites it, so the time a run waited
+# for an admission slot went with it. The check is told a durable per-repo file, $GDIR/waits-<repo>.tsv
+# (LANDER_WAIT_LOG), and the row (LANDER_WAIT_ROW); lander/admission.py appends `start end row who secs` there for
+# every slot it holds, and cc-i2m reads that as the green stage. Repo and row come from the worktree's .cc/track,
+# else the main checkout's directory name and the worktree's.
+wait_log(){   # $1 = root → "FILE ROW", the run's slot-wait record
+  local repo="" row="" c
+  { read -r repo; read -r row; } < "$1/.cc/track" 2>/dev/null
+  [ -n "$repo" ] || { c=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && repo=$(basename "$(dirname "$c")"); }
+  [ -n "$row" ] || row=$(basename "$1")
+  echo "$GDIR/waits-${repo:-unknown}.tsv $row"
+}
 run_check(){   # $1 = root → lander check's exit; 3 when there is no lander to run
-  local r=$1 rc=0 n gp scrub=()
+  local r=$1 rc=0 n gp wl wrow scrub=()
   local -a LCMD=()
   if ! lander_cmd "$r"; then
     echo "cc-green: no lander here — neither $r/core/lander/cli.py nor a \`lander\` on PATH — no verdict"
@@ -174,8 +186,9 @@ run_check(){   # $1 = root → lander check's exit; 3 when there is no lander to
   fi
   echo "cc-green: ${LCMD[*]}"
   while read -r n; do scrub+=(-u "$n"); done < <(secret_names)
+  read -r wl wrow < <(wait_log "$r")
   ( cd "$r" && exec setsid "$BIN/cc-nosignal" -- env "${scrub[@]}" PYTHONDONTWRITEBYTECODE=1 CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" \
-      "${LCMD[@]}" ) </dev/null 9>&- & gp=$!
+      LANDER_WAIT_LOG="$wl" LANDER_WAIT_ROW="$wrow" "${LCMD[@]}" ) </dev/null 9>&- & gp=$!
   printf 'gate_pgid=%s\n' "$gp" >> "$STATUS"     # what `stop` may reach besides the run itself
   trap 'kill -TERM -- -"$gp" 2>/dev/null; exit 130' INT TERM
   wait "$gp" || rc=$?

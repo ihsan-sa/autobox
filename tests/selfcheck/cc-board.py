@@ -439,6 +439,23 @@ def selfcheck():
         ok("`agent ''` hands the row back, time and all",
            run("get", "r", "t1", "agent").stdout.strip() == ""
            and run("get", "r", "t1", "agent_at").stdout.strip() == "")
+        # WHEN A WORKER STARTED: stamped once on the first start of each kind, never moved, never set by hand
+        for dpn in ("dp1", "dp2", "dp3", "dp4"):   # not `n` (the failure count ok() keeps) nor `row` (a helper)
+            run("add", "r", dpn, dpn)
+        runt("set", "r", "dp1", "agent", "me"); run("status", "r", "dp2", "running")
+        run("note", "r", "dp3", "dispatched headless worker (loop 1)"); run("note", "r", "dp4", "a remark")
+        run("status", "r", "dp4", "review")
+        dp = lambda dpn: run("get", "r", dpn, "dispatched").stdout.strip()
+        first = dp("dp2")
+        d = json.load(open(f"{th}/.cc/boards/r.json"))
+        d["tracks"]["dp2"]["dispatched"] = "2020-01-01T00:00:00Z"
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        run("status", "r", "dp2", "running")
+        ok("a row a worker starts on carries `dispatched` (a mark, `status running` or cc --go's note), kept once "
+           "stamped; a remark or another status stamps nothing, and it is not set by hand",
+           all(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", dp(dpn) or "") for dpn in ("dp1", "dp3")) and first
+           and dp("dp2") == "2020-01-01T00:00:00Z" and dp("dp4") == ""
+           and run("set", "r", "dp4", "dispatched", "2099-01-01T00:00:00Z").returncode != 0 and dp("dp4") == "")
         # A MARK FROM A WINDOW NO READER COUNTS IS REFUSED (2026-09-07). The reader keeps a mark only where its
         # window is in tmux session `main` and named for the ROW'S OWN REPO — cc-reconcile's mark_why matches
         # `#{window_name}` against the repo, and cc-pulse and the Home tab read its snapshot. A

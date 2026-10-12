@@ -164,6 +164,18 @@ EOS
   k "$(t grep -q "^CC_CONFIG_DENY=$(realpath -m "$HOME/.cc/config")\$" "$D/secret.env")" "…and the live ~/.cc/config is denied to it (CC_CONFIG_DENY, which cc-config reads as empty)"
   rm -rf "$D2"
 
+  # 8b THE SLOT WAIT OUTLIVES THE LOG: the check is told the per-repo wait file and the row, from .cc/track when
+  # the worktree has one, else the main checkout's name and the worktree's. The fake prints what it was told.
+  for nm in waitrow waitbare; do
+    printf '%s\n' "open('$D/$nm.env', 'w').write(os.environ.get('LANDER_WAIT_LOG', '-') + ' ' + os.environ.get('LANDER_WAIT_ROW', '-'))" > "$D/$nm.py"; done
+  D2=$(mktemp -d); R=$(newrepo waitrow); mkdir -p "$R/.cc"; printf 'repo1\nrow1\n' > "$R/.cc/track"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run ) >/dev/null 2>&1
+  k "$(t test "$(cat "$D/waitrow.env")" = "$D2/waits-repo1.tsv row1")" "a run tells its check the repo's wait file and its row, from .cc/track"
+  rm -rf "$D2"; D2=$(mktemp -d); R=$(newrepo waitbare)
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run ) >/dev/null 2>&1
+  k "$(t test "$(cat "$D/waitbare.env")" = "$D2/waits-waitbare.tsv waitbare")" "…and with no .cc/track, the checkout's name and the worktree's"
+  rm -rf "$D2"
+
   # 9 `red` WRITES ONE LEDGER RECORD PER KEY, with a bounded excerpt of the log that outlives it, and never fails
   # its caller: cc-loop's stops call it.
   printf 'line\n  ✗ the thing that broke\nmore\n' > "$D/red.log"
