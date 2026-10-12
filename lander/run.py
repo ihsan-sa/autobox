@@ -9,7 +9,8 @@ checkout's runs or shapes them. Everything under the run directory goes when the
 
 THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` for a member's landing):
   box      by class — static, hermetic and timing in the bwrap profile (sandbox.py); host and box on the host with
-           the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set).
+           the environment scrubbed as today's clean_start (no CLAUDE*, no token-shaped variables, CC_CONFIG_DENY set),
+           under cc-nosignal, so a check signals only what it started (the user manager went down on 2026-10-02).
            Every one inside an admission slot and a transient scope (admission.py). Timing runs only while the box
            is not loaded. No bwrap on this machine makes a sandboxed class unrunnable, never a host run.
   laptop   static, hermetic and host (never box or timing), over cc-suites' own transport: its key, the
@@ -78,7 +79,8 @@ FAILED_RE = re.compile(r"(\d+) failed")
 BOX_STATE_RE = re.compile(r"Disk quota exceeded|No space left on device|Cannot allocate memory|fork: retry"
                           r"|Resource temporarily unavailable")
 SETUP_RE = re.compile(r"^(bwrap:|systemd-run:|Failed to start transient scope"
-                      r"|Failed to connect to (user )?(scope )?bus).*", re.M)
+                      r"|Failed to connect to (user )?(scope )?bus"
+                      r"|cc-nosignal: .*refused, nothing ran).*", re.M)
 RED_RE = re.compile(r"✗|✘|FAIL|Error\b|error:|not ok|Traceback")
 PASS_RE = re.compile(r"^\W*[✓✔]|^\s*(?:ok|pass(?:ed)?)\b", re.I)
 KILLED = (124, 137, 143)
@@ -313,7 +315,8 @@ def prune_logs(d: str, now: float | None = None) -> None:
 
 def _box_argv(check, head, cwd, run_dir, env_extra):
     if check.klass in M.UNSANDBOXED:
-        return ["/bin/sh", "-c", check.run], os.path.join(head, cwd) if cwd else head, clean_env(env_extra), "host"
+        return ([os.path.join(BIN, "cc-nosignal"), "--", "/bin/sh", "-c", check.run], os.path.join(head, cwd) if cwd else head,
+                clean_env(env_extra), "host")
     if not S.available():
         raise Unrunnable("bwrap is not installed, so a sandboxed check has nowhere to run")
     if check.klass == T.TIMING and A.loaded():

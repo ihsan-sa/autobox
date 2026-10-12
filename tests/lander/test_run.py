@@ -99,6 +99,8 @@ class Status(unittest.TestCase):
                  ((0, "3 failed"), T.FAILED),
                  ((1, "bwrap: Can't mount proc on /newroot/proc"), T.UNRUNNABLE),
                  ((1, "Failed to connect to user scope bus via local transport"), T.UNRUNNABLE),
+                 # no signal scope on the kernel: cc-nosignal refuses and nothing ran, so it isn't the tree's red
+                 ((3, "cc-nosignal: Landlock ABI 5 has no signal scope — refused, nothing ran. A check here"), T.UNRUNNABLE),
                  ((0, "bwrap: a line of the check's own that says bwrap:"), T.PASSED)]
         for (rc, text), want in cases:
             self.assertEqual(RUN.status_of(rc, text)[0], want, (rc, text))
@@ -831,6 +833,21 @@ class HostAndRunners(Env):
             self.assertEqual((r.status, calls), (T.PASSED, []))
             r = self.run_(chk(klass=T.HOST), lane=True)
             self.assertEqual((r.status, calls), (T.PASSED, [(False, True)]))
+
+    def test_host_and_box_checks_are_wrapped_in_cc_nosignal(self):
+        for klass in (T.HOST, T.BOX):
+            argv, wd, _env, how = RUN._box_argv(chk(run="echo hi", klass=klass), "/head", "", "/run", {})
+            self.assertTrue(argv[0].endswith("/cc-nosignal"), argv)
+            self.assertEqual(argv[1], "--")
+            self.assertEqual((how, wd), ("host", "/head"))
+
+    def test_a_sandboxed_check_is_not_wrapped_in_cc_nosignal(self):
+        with mock.patch.object(S, "available", return_value=True), \
+                mock.patch.object(S, "write_stub", return_value="/stub"), \
+                mock.patch.object(S, "argv", return_value=["bwrap", "--", "sh"]):
+            argv, _wd, _env, how = RUN._box_argv(chk(run="true", klass=T.HERMETIC), "/head", "", "/run", {})
+        self.assertEqual((argv, how), (["bwrap", "--", "sh"], "bwrap"))
+        self.assertFalse(any(a.endswith("cc-nosignal") for a in argv))
 
     def test_a_runner_the_check_does_not_list_is_refused(self):
         r = self.run_(chk(run="true", where=["box"]), where="laptop")
