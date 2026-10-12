@@ -21,14 +21,14 @@
   cc-slack member register <handle> [<@user>]   put a workspace no join flow made (cc-sandbox convert) on record in members.json from the channel pair it already has; creates nothing.
   cc-slack members                    who has a workspace: handle → channels → folder → budget used today.
   cc-slack track-thread <repo>/<track> [--title T]   the ONE thread a --go track lives in, in #<repo>-updates when the repo has that lane, else #<repo> (a member workspace: its own #<handle>): opened by `cc … --go`, idempotent, prints `<chat> <ts>`; a track gets no channel of its own, and a repo with none of its own that CC_PROJECT_CHILDREN puts under a parent gets its threads — and its --route lines and PR cards — in the parent's channels. Its worker's lines (post --route "<repo>/<track> …") and its landing line go there, and a reply there reaches the track's session — or, for a headless or finished track, the repo's session with the track named; no notice line is posted.
-  cc-slack mkchannel <name>… [--public]     create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the topic; a #<repo>--<sub> name inherits #<repo>'s people; comes paired with #<name>-updates.
+  cc-slack mkchannel <name>… [--public]     create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the topic; a #<repo>--<sub> name inherits #<repo>'s people. No -updates twin is made (only a member's join makes one): a routine line with no twin of its own goes to the box's one log lane, #<box>-updates.
   cc-slack project <name>             from a member workspace's session, ask the daemon for the project's board row and its one thread in #<this workspace> (no channel); at most 3 an hour; the human way is `new project <name>` typed in the channel.
   cc-slack escalate --notice [--file P] [--id ID] -t "<h>/<track> <kind>" "text"   from inside a member boundary: a worker's END LINE or its Slack deliverable — posted by the host into the track's thread (the file with it, under the text) and one `loop:` line to the control seat; never a request or a page. --id posts it once (the ledger keeps it under the workspace's name); the seat's line goes every time. cc-notify (a plain call titled with the track) and cc-loop use it. Without --notice, `escalate` is cc-notify's --ask relay, and one titled `<h>/<track> …` (cc-loop's stop) also hands that workspace's own seat a `loop:` line.
   cc-slack ask [-t "title"] "text"      from a member workspace's session, ask the box's planning seat (a repo, a host-side push, a question): the daemon posts a 🙋 card in the control repo's #<repo>-threads lane on the workspace's behalf, hands it to the planning session, and carries every reply in the card's thread (the seat's or the owner's) back to #<workspace>, handed to its session; at most 5 an hour. Never ask the owner to relay.
   cc-slack seat                          the seat the daemon says owns this process (`<repo>`, `<repo>/<track>`, `<repo>@<alias>`), from the socket's pid chain and the live subscriptions; empty and exit 1 when none does, exit 2 when the daemon could not be reached at all. cc-notify reads it to decide who may ask the owner, and a caller it cannot identify (exit 2) is not the box's own hand.
   cc-slack grant allow '<rule>' [-t "why"]   from a box session (planning or a track) that a permission layer refused: the daemon posts a 🔐 grant card in the control repo's #<repo>-threads lane naming that ONE allow line; the owner's `yes <id> fix` there has the daemon write it into ~/.claude/settings.json (cc-settings grant), `no <id>` declines; the card shows ⚙️ or ❌. `cc-slack grant config KEY VALUE` is the same for one ~/.cc/config key (never a credential's). An allow or config ask goes to the box's approver first (cc-approve, APPROVER=off skips it): what the owner's merged grants cover, asked by a planning seat, the daemon writes with no card and a ⚙️ line in that lane; the rest is the card. Never a member workspace's verb, never answerable by a session; at most 5 an hour. `cc-slack grant unit <file.service|.timer>` is the same card for a user unit install (file, sha256 and the enable both named). `cc-slack grant confirm '<command>' -w <window>` is the same card for a seat parked on the auto-mode confirm dialog behind a command that is not read-only (cc-model's tick raises it): the owner's `yes <id>` / `no <id>` is written to ~/.cc/state/confirm-answers/<id>, and cc-model's next tick presses that answer into the dialog — this once, never for good. Design: docs/design-seat-grant-from-slack.md.
   cc-slack permission <id> yes|no [fix]     answer a 🔐 prompt from here, the same path as a `yes <id>` Slack reply; every session's prompt but the planning session's own goes to the control repo's #<repo>-threads lane for it to decide; `fix` marks the capability granted for good. On a member workspace's WebFetch or WebSearch card, `yes <id> fix` (here or the owner's in Slack) also grants that workspace the web (`cc-sandbox web`): from its next launch those two tools are no ask rule, and auto mode judges each call. It re-reads the session's pane: a dialog still standing unchanged after the answer went out is reported as not landed (exit 1, the prompt stays open), never as delivered.
-  cc-slack updates-sweep [--dry-run]  give every repo channel that predates the split its -updates lane (idempotent; skips a bot-only channel).
+  cc-slack retire <C…>… [--to <#chan|C…>] [--dry-run]   archive channels BY ID (never by name or suffix) after recording each in ~/.cc/slack/retired.json with where its posts go now (--to, else the log lane #<box>-updates). Refuses #alerts, #approvals, the log lane, the vitals store, a member's channel and a channel a live seat routes to. --dry-run archives nothing and prints, per id, its name, whether it is archived already, and where a post aimed at it would land.
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]     give a sub-orchestrator its own channel, recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it).
   cc-slack archive <#chan|C…> | archive --orch <target> <alias>      archive a sub-orch channel; it stops routing and leaves home.json's channel list.
   cc-slack unarchive <C…> [--superseded-by <C…>]   bring an archived sub-orch channel back and route it again; with --superseded-by a newer live channel stays the orch's home, and the old one keeps its history with one pinned line pointing there.
@@ -980,32 +980,59 @@ def submit(cfg, pid, chat, text, thread=None, username=None, ts=None, decision=F
             sent_prune()
         else:
             rchat = rec.get("chat") or chat
+            rthread = rec["thread"] if "thread" in rec else thread   # the record's thread, an explicit None included
+            if rec.get("moved_from"):                # moved off a retired channel before: the record says where, not the caller
+                chat, thread = rchat, rthread
+                text = retired_note(rec.get("moved_name") or rec["moved_from"], rec.get("moved_thread")) + text
             if cfg.get("SLACK_BOT_TOKEN") and (rchat or "")[:1] in ("U", "W"):
                 # a raw user id (owner DM) works for chat.postMessage but not conversations.history (channel_not_found),
                 # so it's resolved to the DM's own D… id and that is what the record keeps; unresolvable = cannot be asked.
                 rchat = api("conversations.open", cfg["SLACK_BOT_TOKEN"], users=rchat)["channel"]["id"]
                 rec["chat"] = rchat; sent_write(pid, rec)
-            found = find_accepted(cfg, pid, rchat, rec.get("thread") or thread, text, rec.get("intent"), decision=decision)
+            # looked for where the record says first, the retired channel included (its history still reads): a post
+            # Slack took there before the channel was archived is found, never sent again in its new home
+            found = find_accepted(cfg, pid, rchat, rthread, text, rec.get("intent"), decision=decision)
+            home = None if found or rchat not in load_retired() else retired_home(cfg, rchat, decision)
+            if home:                                 # not there, and its channel was retired since: the intent moves, top level
+                if not rec.get("moved_from"):        # its first move: the note names the channel it was meant for
+                    rec.update(moved_from=rchat, moved_name=home[1], moved_thread=bool(rthread))
+                    text = retired_note(home[1], rthread) + text
+                rec.update(chat=home[0], thread=None); sent_write(pid, rec)
+                chat = rchat = home[0]; thread = None
+                found = find_accepted(cfg, pid, rchat, None, text, rec.get("intent"), decision=decision)
             if found:
                 rec.update(accepted=now, ts=found); sent_write(pid, rec)
                 return 0, found, "found"
-        n, first = post(cfg, chat, text, thread, username=username, ts=ts, meta=pid, decision=decision, ask=ask)
+        landed = {}
+        n, first = post(cfg, chat, text, thread, username=username, ts=ts, meta=pid, decision=decision, ask=ask,
+                        landed=landed)
         if not first:
             return n, first, "unsent"
+        if landed.get("rerouted"):                   # post() found it archived and said it elsewhere: the record follows
+            rec.update(chat=landed["chat"], thread=None, moved_from=landed["rerouted"], moved_name=landed["name"],
+                       moved_thread=bool(thread))
         rec.update(accepted=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), ts=first); sent_write(pid, rec)
         return n, first, "sent"
 
-def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None, meta=None, decision=False, ask=None):
+def retired_note(name, thread):
+    """The head of a line said in a retired channel's new home: whose it was, and that it lost its thread."""
+    return f"(for #{name}, archived{', was a thread reply' if thread else ''}) "
+
+def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None, meta=None, decision=False, ask=None,
+         rerouted=False, landed=None):
     """Post mrkdwn text (chunked) as the bot; no token means outbox log only. Returns (n_chunks, first_ts).
     `decision` opens with 🔒 + the owner's mention, the only post allowed to carry either: every other post has
     both taken off (owner_marks_off). `ask` says whether the post waits on his answer (the owner-asks ledger): True
     for a `cc-notify --owner` escalation, False for a post that pages him but asks nothing (`cc-notify test`), None
     to read it off the 🔒 head (owner_asked). `mail` taps this
     post to the mail door; `ts` picks the reply medium, a mail-origin reply travels back by mail. The outbox
-    line is written only once Slack accepts, so a refused or lost post logs as `post-failed`."""
+    line is written only once Slack accepts, so a refused or lost post logs as `post-failed`. A channel found archived
+    (`is_archived`) is recorded as retired and the post goes, once, to where its posts go now (retired_home). A caller
+    that keeps the ts with a channel passes `landed` (a dict): a rerouted post fills it with {chat, name, rerouted},
+    the channel the ts belongs to, the old name and the archived id, so the caller never pairs that ts with the old id."""
     if not decision:
         text = owner_marks_off(cfg, text)
-    body = text                     # what the caller said: the mail door gets this, never the decision head below
+    body = text                      # what the caller said: the mail door gets this, never the decision head below
     if decision:
         text = decision_head(cfg, text)
     tok = cfg.get("SLACK_BOT_TOKEN")
@@ -1026,10 +1053,22 @@ def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None, meta=N
                 md = None   # a workspace that refuses message metadata still gets the post; find_accepted matches on text
                 r = api("chat.postMessage", tok, channel=chat, text=c, thread_ts=thread, username=uname,
                         unfurl_links="false", unfurl_media="false")
-        except Exception:
+        except Exception as e:
             if first:   # first chunk already landed: a dropped tail is logged, never re-sent
                 log(f"post: a later chunk to {chat} was refused after ts {first} went out")
                 break
+            if "is_archived" in str(e) and not rerouted:
+                # the channel was archived (by `retire`, or by hand): record it, and say it where its posts go now —
+                # top level, since a thread in an archived channel cannot be continued anywhere else
+                if chat not in load_retired():
+                    retire_record(cfg, chat, chat_name(cfg, chat))   # named, so a decision finds its project's channel
+                home = retired_home(cfg, chat, decision)
+                if home:
+                    log(f"post: {chat} is archived — sent to {home[0]} instead")
+                    if landed is not None:
+                        landed.update(chat=home[0], name=home[1], rerouted=chat)
+                    return post(cfg, home[0], retired_note(home[1], thread) + body, None, username=username, mail=mail,
+                                ts=ts, meta=meta, decision=decision, ask=ask, rerouted=True)
             outbox("post-failed", chat, thread, text)
             raise
         first, where = first or r.get("ts"), where or r.get("channel")
@@ -1537,8 +1576,8 @@ def home_of(cfg, repo):
         repo = par
     return repo
 
-# Each repo has 2 channels: #<repo> for owner Q&A, #<repo>-updates for automated/long output.
-# Same session; reply goes to the lane that asked. Sub-orch channels aren't split, inherit the cap.
+# A repo has #<repo> for owner Q&A; automated lines go to its #<repo>-updates twin where one still exists (a member's),
+# else to the box's one log lane (log_lane). Same session; reply goes to the lane that asked. Sub-orch channels aren't split.
 def updates_name(name):
     """The -updates lane belonging to a channel name."""
     return f"{(name or '').lower()}-{UPDATES}"
@@ -1548,6 +1587,141 @@ def main_lane(name):
     n = (name or "").lower()
     suffix = f"-{UPDATES}"
     return n[:-len(suffix)] or None if n.endswith(suffix) else None
+
+RETIRED = "retired.json"           # {chat id: {name, to, at}}: channels the box archived (`retire`) or found archived on a post
+
+def log_lane(cfg):
+    """The box's one machine log lane, #<box>-updates (SLACK_LOG_LANE overrides): where a routine line goes when its
+    repo has no -updates twin of its own. Twins are no longer made for the owner's repos (comms-only-read-channels-
+    remain), so this is the lane the box keeps; the owner leaves it and nobody is paged there."""
+    return (cfg.get("SLACK_LOG_LANE") or updates_name(BOX)).lstrip("#").lower()
+
+TWINS = "twins.json"               # {chat id: {name, at}}: the -updates twins the box itself made, under the name it made them
+
+def own_twin(cfg, name):
+    """The chat id of #<name>-updates when the box keeps it as its own, else None. Since mkchannel stopped reserving
+    the name, anyone can make a channel called #<repo>-updates and invite the bot, so a name the bot is in proves
+    nothing. What counts is the log lane, a twin the box made (twins.json: record_twin, seed_twins), and a member's twin
+    on record (members.json `updates`/`updates_id`), and the last two only when the id is recorded under exactly
+    this name: a member who renames their own twin to #<repo>-updates, or a twin renamed by hand, matches nothing.
+    A squatted name is treated as gone, and nothing routine, no card and no track root is sent to it."""
+    lane = updates_name(name)
+    cid = resolve_channel(cfg, lane) if name else None
+    if not cid:
+        return None
+    if lane == log_lane(cfg) or (load_table(TWINS).get(cid) or {}).get("name") == lane:
+        return cid
+    if any(e.get("updates_id") == cid and str(e.get("updates") or "").lower() == lane
+           for e in load_members().values() if isinstance(e, dict)):
+        return cid
+    return None
+
+BOT_ME = {}                        # bot token → the bot's own user id (auth.test), once per process; the daemon fills it on connect
+
+def seed_twins(cfg, seen):
+    """A ONE-TIME backfill of twins.json, for the twins the box made before it kept the file: runs only while the file
+    does not exist, and writes it even when it records nothing, so it never runs again and no later rebuild adds to
+    it (after that, record_twin records a twin when ensure_channel makes it). `seen` is one conversations.list:
+    [(id, name, creator)]. A channel is seeded, under its current name, when the bot itself created it and its name
+    ends in -updates. Slack's conversations.list and conversations.info do not return previous_names for these
+    channels, so the backfill cannot tell a renamed channel from one made under its name: a channel the bot made and
+    someone renamed into an -updates name before this first ran would be seeded. The twins live at rollout were
+    checked by hand and all were made by the box under that name. After the backfill nothing can join that way:
+    it never runs again, own_twin needs the id AND the recorded name to match, and ensure_channel records new twins
+    as it makes them. Runs inside resolve_channel's rebuild, so a deploy seeds the twins with no step of its own.
+    Returns the ids recorded, or None when it did not run (the file exists, or auth.test failed and the next rebuild
+    retries)."""
+    if os.path.exists(f"{DIR}/{TWINS}"):
+        return None
+    cand = [(c, n, who) for c, n, who in seen if main_lane(n) and who]
+    mine = []
+    if cand:
+        tok = cfg.get("SLACK_BOT_TOKEN") or ""
+        me = BOT_ME.get(tok) or api("auth.test", tok).get("user_id")
+        if not me:
+            return None
+        BOT_ME[tok] = me
+        mine = [(c, n) for c, n, who in cand if who == me]
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    save_table(TWINS, {c: {"name": n.lower(), "at": at} for c, n in mine}, indent=1, sort_keys=True)
+    log(f"twins: backfilled once, {', '.join('#' + n for _, n in mine) or 'none'} as the box's own "
+        f"(the bot created them)")
+    return [c for c, _ in mine]
+
+def record_twin(cid, name):
+    """ensure_channel just created #name: when it is an -updates lane, record it in twins.json under the name it was
+    made with. While the file does not exist yet nothing is written here, because writing it would stop seed_twins'
+    one-time backfill; that backfill seeds this channel on the next rebuild."""
+    if not main_lane(name) or not os.path.exists(f"{DIR}/{TWINS}"):
+        return False
+    twins = load_table(TWINS)
+    twins[cid] = {"name": name.lower(), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    save_table(TWINS, twins, indent=1, sort_keys=True)
+    return True
+
+def ambient_lane(cfg, name):
+    """Where a routine, machine-made line about #name goes: its own -updates twin while the box keeps one (own_twin:
+    a member's lane), else the log lane when the bot is in it, else None and the caller keeps its old fallback."""
+    if own_twin(cfg, name):
+        return updates_name(name)
+    lane = log_lane(cfg)
+    return lane if resolve_channel(cfg, lane) else None
+
+def load_retired():
+    return load_table(RETIRED)
+
+RETIRE_GRACE = 600                 # s: `retire` writes its record before Slack answers the archive, so a young one stays
+
+def retired_back(live):
+    """Drop the record of every retired channel Slack lists live again (unarchived by hand), so its posts go to it
+    once more instead of where it was retired to. `live` is the ids a full conversations.list returned. A record
+    younger than RETIRE_GRACE is kept: `retire` writes it first and archives after, and a listing in between must
+    not undo it. Returns the ids dropped."""
+    r = load_retired()
+    def age(at):
+        try:
+            return time.time() - (float(at) if isinstance(at, (int, float)) else calendar.timegm(time.strptime(str(at), "%Y-%m-%dT%H:%M:%SZ")))
+        except (TypeError, ValueError):
+            return RETIRE_GRACE + 1
+    back = [c for c in set(live) & set(r) if age((r[c] or {}).get("at")) > RETIRE_GRACE]
+    if back:
+        for c in back:
+            r.pop(c, None)
+        save_table(RETIRED, r)
+        log(f"retired: {', '.join(sorted(back))} live again (unarchived) — its record is dropped, posts go to it again")
+    return back
+
+def retire_record(cfg, chat, name="", to=""):
+    """Put `chat` in retired.json (keeping a `to` already there) and drop the name cache, whose hour-old copy may
+    still map a name to it. Called before `retire` archives and when a post finds a channel archived by hand."""
+    r = load_retired()
+    rec = r.get(chat) or {}
+    r[chat] = dict(rec, name=rec.get("name") or name, to=rec.get("to") or to,
+                   at=rec.get("at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    save_table(RETIRED, r)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(f"{DIR}/channels.json")
+    return r[chat]
+
+def retired_home(cfg, chat, decision=False):
+    """(chat id, old name) a post aimed at the retired `chat` goes to instead: its record's `to`, else the log lane.
+    A decision (it pages the owner) goes only where decision_lane would put it: the project's main channel — an orch's
+    target repo, the base of a -updates/-threads/`--` lane — else #<CTL>; never the log lane or a `to`.
+    None when there is nowhere live to go (the post then fails as it would have)."""
+    rec = load_retired().get(chat) or {}
+    dests = (rec.get("to"), "#" + log_lane(cfg))
+    if decision:
+        name, orch = (rec.get("name") or "").lower(), load_orchs().get(chat) or {}
+        base = (main_lane(name) or (name[:-len(f"-{THREADS}")] if threads_lane(name) else name)).split("--")[0]
+        dests = (orch.get("target") and "#" + str(orch["target"]).split("/")[0].lower(),
+                 base and base != name and "#" + base, "#" + CTL.lower())
+    for dest in dests:
+        if not dest:
+            continue
+        cid = resolve_channel(cfg, dest[1:]) if dest.startswith("#") else dest
+        if cid and cid != chat and cid not in load_retired():
+            return cid, rec.get("name") or chat
+    return None
 
 THREADS = "threads"                # #<repo>-threads: where a session's QUESTIONS reach whoever steers that repo
 
@@ -1780,9 +1954,9 @@ def ask_file(out):
     return head.rstrip() + "\n(nothing attached: that file is not in the document register)", None
 
 def lane_split(name):
-    """Does #name get an -updates sibling? A repo channel does; #approvals, #alerts, an already-split lane, a
-    `#<repo>--<track>` channel (already a detail lane), VITALS_STORE (nobody talks there) and the ask lane (a lane
-    already, nothing automated posts in it) do not."""
+    """Is #name a main lane whose routine `-c` lines divert to its -updates twin (while it has one)? A repo channel is;
+    #approvals, #alerts, an -updates lane, a `#<repo>--<track>` channel (already a detail lane), VITALS_STORE (nobody
+    talks there) and the ask lane are not. No twin is made for it any more — only a member's join makes one."""
     n = (name or "").lower()
     return bool(n) and n not in (APPROVALS, ALERTS, VITALS_STORE) and "--" not in n and not main_lane(n) and not ask_lane(n)
 
@@ -1801,14 +1975,6 @@ def routine_text(text):
         return False
     return not re.search(r"[?？❓🔐]|<@[UW][A-Z0-9]+|<!(?:here|channel|everyone)>", t)
 
-def bot_only(cfg, cid):
-    """A channel whose only member is the bot: the box's own store, not a place people talk, so no -updates twin.
-    Unknown (API refusal) → False; the sweep is idempotent, so a rerun settles it."""
-    try:
-        return len(channel_members(cfg, cid)) <= 1
-    except Exception:
-        return False
-
 def load_table(name):
     """{DIR}/{name} as a dict of dicts: a missing, unreadable or hand-broken file reads as empty, never raises."""
     try:
@@ -1820,10 +1986,15 @@ def load_table(name):
 def save_table(name, obj, **dump):
     """Atomic 0600 write of {DIR}/{name}: a temp file beside it, then os.replace; **dump goes to json.dump."""
     os.makedirs(DIR, exist_ok=True)
-    tmp = f"{DIR}/{name}.tmp"
-    with open(tmp, "w") as f:
-        os.fchmod(f.fileno(), 0o600); json.dump(obj, f, **dump)
-    os.replace(tmp, f"{DIR}/{name}")
+    tmp = f"{DIR}/{name}.{os.getpid()}.{threading.get_ident()}.tmp"   # each writer its own, so two never share a half-file
+    try:
+        with open(tmp, "w") as f:
+            os.fchmod(f.fileno(), 0o600); json.dump(obj, f, **dump)
+        os.replace(tmp, f"{DIR}/{name}")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 def load_provisioned():
     """Session dirs this daemon created for a channel: {target: {"chan":…, "at": ts}}. Read from disk each use
@@ -2459,6 +2630,8 @@ def track_thread(target):
     """(chat, ts) of <repo>/<track>'s thread, or None. The brief: "its worker's progress lines, its landing card, and
     anything a person or a seat sends it live in ONE thread in the project's channel"."""
     e = load_track_threads().get(target or "") or {}
+    if e.get("chat") in load_retired():                  # its channel was archived: the thread is dead, so a new one opens
+        return None
     return (e["chat"], e["ts"]) if e.get("chat") and e.get("ts") else None
 
 def thread_target(chat, thread_ts):
@@ -2492,13 +2665,15 @@ def open_track_thread(cfg, target, title="", at=None, username=None):
     if have:
         return have
     home = home_of(cfg, target.partition("/")[0])
-    lane = None if home in load_members() or members_read(home) else resolve_channel(cfg, updates_name(home))
+    lane = None if home in load_members() or members_read(home) else own_twin(cfg, home)   # a squatted name is no lane
     cid = lane or resolve_channel(cfg, home)
     if not cid:
         return None
-    _n, ts = post(cfg, cid, track_root(target, title), username=username, mail=False)
+    landed = {}
+    _n, ts = post(cfg, cid, track_root(target, title), username=username, mail=False, landed=landed)
     if not ts:
         return None
+    cid = landed.get("chat") or cid                     # archived under a stale cached id: the root went elsewhere, and so does the record
     with orchs_locked():                                 # one lock for both small routing tables
         tt = load_track_threads()
         tt[target] = {"chat": cid, "ts": ts, "at": at if at is not None else time.time()}
@@ -5385,7 +5560,7 @@ class Daemon:
         return "owner" if uid and uid == self.cfg.get("SLACK_OWNER_ID") else "member"
 
     def route(self, chat, ctype):
-        """The session a channel is. An unmapped channel falls back to its normalised name (dir provisioned on the channel's first message, see needs_dir/provision_dir); `#<repo>-updates` routes as the same session as `#<repo>` by name alone, so a hand-made lane works too, with no second table to keep in step. Never for a DM (goes to the box session), #approvals/#alerts, a sub-orch channel (its orch owns it), a name nothing valid survives, or `#<repo>-ask` — the question lane is answered by cc-ask (on_event → ask_start) and is nobody's session, so nothing said or reacted there can wake one."""
+        """The session a channel is. An unmapped channel falls back to its normalised name (dir provisioned on the channel's first message, see needs_dir/provision_dir); `#<repo>-updates` routes as the same session as `#<repo>` only when it is the twin the box recorded (own_twin), since anyone can make a channel of that name. Never for a DM (goes to the box session), #approvals/#alerts, a sub-orch channel (its orch owns it), a name nothing valid survives, or `#<repo>-ask` — the question lane is answered by cc-ask (on_event → ask_start) and is nobody's session, so nothing said or reacted there can wake one."""
         e = load_orchs().get(chat)                       # a sub-orch's channel: every message there belongs to that orch (chan_alias)
         if e:
             return e.get("target") if not e.get("archived") and valid_target(e.get("target")) else None
@@ -5397,10 +5572,17 @@ class Daemon:
             return None
         t = routes.get(chat) or routes.get("#" + name)
         if not t:
-            # #<repo>-updates is the other lane of #<repo>, not its own session, unless `foo-updates` is itself a real project
+            # #<repo>-updates is the other lane of #<repo>, not its own session, unless `foo-updates` is itself a real
+            # project; but only the twin the box recorded (own_twin), never a channel of that name someone else made —
+            # anyone can, and it would talk into #<repo>'s session. A squatted one is its own name, or nobody's.
             base = main_lane(name)
             b = base and (routes.get("#" + base) or base.replace("--", "/", 1))
-            t = b if b and valid_target(b) else name.replace("--", "/", 1)
+            if b and valid_target(b):
+                if own_twin(self.cfg, base) == chat:
+                    return b
+                own = name.replace("--", "/", 1)
+                return own if "/" not in own and valid_target(own) else None
+            t = name.replace("--", "/", 1)
         if valid_target(t):
             return t
         if name in (APPROVALS, ALERTS):
@@ -6190,7 +6372,8 @@ class Daemon:
         MailPlaces, so the twin is the daemon's own Place for it, and a twin the bot is not in leaves `pl` as it was."""
         dm = pl.name == "dm" and pl.target == "box"   # MailPlaces.main's Place for his DM; a channel #dm routes as "dm"
         name = updates_name(CTL) if dm else updates_name(pl.name) if lane_split(pl.name) else ""
-        return (d.place(name) if name else None) or pl
+        own = name and own_twin(self.cfg, main_lane(name))   # a twin name someone else made never gets his mail
+        return (d.place(name) if own else None) or pl
 
     @staticmethod
     def mail_asks(v, own):
@@ -7844,7 +8027,7 @@ class Daemon:
         while True:
             try:
                 me = api("auth.test", tok)
-                self.bot_user, self.bot_id = me["user_id"], me.get("bot_id"); break
+                self.bot_user, self.bot_id = me["user_id"], me.get("bot_id"); BOT_ME[tok] = self.bot_user; break
             except Exception as e:
                 log(f"auth.test failed ({e}); retry in 30s"); time.sleep(30)
         if not self.cfg.get("SLACK_OWNER_ID"):
@@ -8717,6 +8900,7 @@ def sender_name(chat=None):
 def cmd_post(argv):
     cfg = load_cfg()
     chan = thread = route = ts = pid = rtrack = None
+    weigh = None                                     # the lane the engagement gate weighs, when not the one posted to
     mention = major = keep = False
     ask = None                                       # None: an ask iff it opens with his 🔒 head (owner_asked)
     args = []
@@ -8768,7 +8952,7 @@ def cmd_post(argv):
         # BOX, not socket.gethostname(): cc-notify titles from CC_BOX, so asking the kernel can misname the box and misroute a "<box> limit" line away from #alerts.
         if len(words) >= 2 and words[1].lower() in ALERT_KINDS and words[0].lower() in (BOX.lower(), "box"):
             chan = "#" + (cfg.get("SLACK_ALERTS") or ALERTS)   # "<box> boot|limit|audit|review": machinery, never a project thread
-            if not mention and words[1].lower() in UPDATE_KINDS and resolve_channel(cfg, updates_name(words[0])):
+            if not mention and words[1].lower() in UPDATE_KINDS and own_twin(cfg, words[0].lower()):
                 chan = "#" + updates_name(words[0])            # a digest is progress: the updates lane, #alerts only if none
         elif not (mention or major) and track_thread(words[0].lower() if words else ""):
             # "<repo>/<track> done|round over|<stop>": the track's own thread in #<repo> — the brief: "its worker's
@@ -8781,11 +8965,27 @@ def cmd_post(argv):
                 text = f"[{name}] {text}"                     # …and says whose it is there, where the title alone would not
             name = home
             # --major keeps it on the main lane: the one line of a landing the owner is told (cc-land's landed())
-            chan = "#" + (updates_name(name) if not (mention or major) and resolve_channel(cfg, updates_name(name)) else name) if name else None
+            lane = ambient_lane(cfg, name) if name and not (mention or major) else None
+            if lane and lane != updates_name(name):
+                weigh = updates_name(name)                    # the shared log lane: weighed as <name>'s own updates
+                text = text if name in text else f"[{name}] {text}"   # and say whose line it is
+            chan = "#" + (lane or name) if name else None
+    was_thread = thread                              # a reply stays a reply to the engagement gate, even moved top level below
+    if chan and chan.startswith("#") and main_lane(chan[1:].lower()) and not mention and not own_twin(cfg, main_lane(chan[1:].lower())):
+        # `-c '#<repo>-updates'` for a twin that is gone (retired, never made, or a name someone else made — own_twin):
+        # the log lane, labelled, and no wake, since the lane is nobody's seat — a spend line from `cc` must not wake
+        # the box's planning seat instead. Top level: a thread ts of the old lane means nothing in the log lane, so a
+        # reply says it was one (retired_note, as post() does). A --mention skips this: decision_lane takes it to #<repo>.
+        base = main_lane(chan[1:].lower())
+        if resolve_channel(cfg, log_lane(cfg)):
+            chan, named, weigh = "#" + log_lane(cfg), False, updates_name(base)
+            text = (retired_note(updates_name(base), thread) + text if thread
+                    else text if base in text else f"[{base}] {text}")
+            thread = None
     if chan and chan.startswith("#") and not (mention or thread or major):
         # the main lane is the owner's: -c '#<repo>' takes a question, a decision, or a deliberate --major, nothing routine; everything else redirects to the -updates twin when the box has one.
         name = chan[1:].lower()
-        if lane_split(name) and routine_text(text) and resolve_channel(cfg, updates_name(name)):
+        if lane_split(name) and routine_text(text) and own_twin(cfg, name):
             print(f"cc-slack: routine → #{updates_name(name)} (#{name} takes a question, a decision or --major)", file=sys.stderr)
             chan = "#" + updates_name(name)
     if mention:
@@ -8793,6 +8993,9 @@ def cmd_post(argv):
         # -threads or `--` sub-lane move to the repo's main lane, and a thread there means nothing in the new one.
         was = chan or "#" + (cfg.get("SLACK_ALERTS") or ALERTS)
         moved, home = decision_lane(cfg, was)
+        base = main_lane(str(was)[1:].lower()) if str(was).startswith("#") else None
+        if not home and base and not own_twin(cfg, base) and resolve_channel(cfg, CTL.lower()):
+            moved, home = "#" + CTL.lower(), CTL.lower()   # #<repo> is gone too: never the twin's name, which anyone can hold
         if home:
             print(f"cc-slack: decision → #{home} (a 🔒 post lands only in #<repo> or #{APPROVALS})", file=sys.stderr)
             chan, thread = moved, None
@@ -8817,9 +9020,9 @@ def cmd_post(argv):
     lane = (pre[1:] if pre.startswith("#") else pre if re.match(r"^[a-z0-9][a-z0-9_-]*$", pre) else chat_name(cfg, chan)).lower()
     addressed = not mention and ((named and not own) or text.lstrip().startswith(("<#", AGENT_MARK)) or threads_lane(lane))
     to = chan
-    if addressed and not thread and lane_split(lane) and resolve_channel(cfg, updates_name(lane)):
+    if addressed and not thread and lane_split(lane) and own_twin(cfg, lane):
         print(f"cc-slack: agent post → #{updates_name(lane)} (a 🤖 post never goes top level in #{lane})", file=sys.stderr)
-        chan = resolve_channel(cfg, updates_name(lane))
+        chan = own_twin(cfg, lane)
     if named and not own:
         text = f"<#{to}> {AGENT_HEAD_RE.sub('', text)}"   # the session it is for, even from its -updates lane
     if addressed:
@@ -8827,12 +9030,15 @@ def cmd_post(argv):
     # THE ENGAGEMENT GATE, the one place a post is weighed against how much the owner has been in its project lately.
     # Brief: "Where he has not been involved at all, the box tells him only what is his to move, and the rest goes to
     # the journal or the digest" — so a held post is on record (fold), never dropped, and never ringing anyone.
-    verdict, why = engage_gate(cfg, lane, text, mention=mention, keep=keep or ask is True, thread=thread, agent=addressed or bool(rtrack))
+    # A line in the box's shared log lane is about the project it names, not the box (no -updates twins any more):
+    # weigh it as that project's -updates lane, so his engagement THERE decides, and the fold is filed under it.
+    weigh = weigh or lane
+    verdict, why = engage_gate(cfg, weigh, text, mention=mention, keep=keep or ask is True, thread=thread or was_thread, agent=addressed or bool(rtrack))
     if verdict != "post":
         if pid and (sent_record(pid) or {}).get("accepted"):
             verdict = "post"                         # already out once: submit() below answers the replay with its ts
         else:
-            fold(engage_project(lane), verdict, chan, pid, text)
+            fold(engage_project(weigh), verdict, chan, pid, text)
             print("")
             print(f"cc-slack: held for the {verdict} ({why}) — not posted; `cc-slack folded` lists it", file=sys.stderr)
             return 0
@@ -8973,6 +9179,8 @@ def ensure_channel(cfg, name, private=True, parent=None, invite=()):
     if not cid:
         try:
             cid = api("conversations.create", tok, name=name, is_private="true" if private else "false")["channel"]["id"]; how = "created"
+            with contextlib.suppress(Exception):
+                record_twin(cid, name)                # an -updates lane the box makes is its own, under this name
         except RuntimeError as e:
             if "name_taken" not in str(e):
                 raise
@@ -9079,16 +9287,8 @@ def cmd_mkchannel(argv):
         except RuntimeError as e:
             print(f"  topic: {e}")
         print(f"  #{name} → {target if valid_target(target) else '(PR approvals)' if name == APPROVALS else f'cc-ask ({ask_lane(name)} question lane, no session)' if ask_lane(name) else '(unmapped)'}")
-        if not lane_split(name):
-            continue
-        try:                                     # a repo channel is a pair: the sibling comes with it
-            ucid, uhow = ensure_updates_lane(cfg, name, cid, private)
-        except ChannelExists as e:
-            print(f"  {e}"); rc = 1; continue
-        except Exception as e:
-            print(f"  #{updates_name(name)}: {e}"); rc = 1; continue
-        print(f"  #{updates_name(name)} ({ucid}) {'created' if uhow == 'created' else 'already there'} → {target} "
-              f"— the updates lane: automated posts and depth, so #{name} stays one sentence per idea")
+        # no -updates twin (comms-only-read-channels-remain): the owner read none of them, so a routine line goes to
+        # the box's one log lane instead; only a member's join still makes a twin, the member's own lane
     print("Anyone you add to a channel can talk to that session and their reactions count as yours (:+1: merges); "
           "only you answer permission prompts and the owner gates.")
     return rc
@@ -9197,32 +9397,88 @@ def cmd_members():
           "(docs/design-member-workspaces.md).")
     return 0
 
-def cmd_updates_sweep(argv):
-    """updates-sweep [--dry-run] — give every repo channel the bot is in its -updates sibling; idempotent. Skips #approvals, #alerts, a lane itself, a `#<repo>--<track>` or sub-orch channel, and a bot-only channel."""
+def retire_dest(cfg, dest, ids):
+    """Why `dest` (#name or C…) cannot take a retired channel's posts, or "" when it can: it resolves, is not one of
+    `ids` or retired already, is not archived, and has the bot in it (a post there is not refused)."""
+    cid = (resolve_channel(cfg, dest[1:].lower()) if dest.startswith("#") else dest) or ""
+    if not cid:
+        return "no channel the bot is in has that name"
+    if cid in ids or cid in load_retired():
+        return "it is being retired itself"
+    try:
+        ch = api("conversations.info", cfg["SLACK_BOT_TOKEN"], channel=cid)["channel"]
+    except Exception as e:
+        return f"it cannot be read ({str(e)[:80]})"
+    if ch.get("is_archived"):
+        return "it is archived"
+    return "" if ch.get("is_member") else "the bot is not in it, so a post there is refused"
+
+def cmd_retire(argv):
+    """retire <C…>… [--to <#chan|C…>] [--dry-run] — archive channels by ID from an explicit list, never by name or
+    suffix. Each is written to retired.json first (with `to`, else the log lane), so a post, a persisted job or a
+    stale cached id aimed at it goes there instead of failing. Refused: #alerts, #approvals, the log lane, the vitals
+    store, the box's own #<box>, the mail channel (MAIL_CHANNEL), the control repo's -threads lane, a member's channel,
+    and a channel a live seat (tmux window) routes to. The destination is checked first, dry run too: one that does not
+    resolve, is archived, is being retired or does not have the bot in it archives nothing (exit 1). Exit 2 usage,
+    3 no token, 1 when any id was refused or not archived."""
+    dry, to, ids, i = "--dry-run" in argv, "", [], 0
+    while i < len(argv):
+        if argv[i] == "--to" and i + 1 < len(argv):
+            to = argv[i + 1]; i += 2
+        elif argv[i] == "--dry-run":
+            i += 1
+        else:
+            ids.append(argv[i]); i += 1
+    if not ids or not all(re.fullmatch(r"[CG][A-Z0-9]+", c) for c in ids) or (to and not re.fullmatch(r"#[a-z0-9_-]+|[CG][A-Z0-9]+", to)):
+        print("cc-slack retire <C…>… [--to <#chan|C…>] [--dry-run]   (channel ids only — never a name)", file=sys.stderr); return 2
     cfg = load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
-        print("no SLACK_BOT_TOKEN — cc slack setup first", file=sys.stderr); return 1
-    dry, orchs, cur, seen, rc = "--dry-run" in argv, load_orchs(), None, [], 0
-    while True:
-        r = api("conversations.list", cfg["SLACK_BOT_TOKEN"], types="public_channel,private_channel", exclude_archived="true", limit="200", cursor=cur)
-        seen += [(ch["name"], ch["id"]) for ch in r["channels"] if ch.get("is_member") and ch["id"] not in orchs]
-        cur = r.get("response_metadata", {}).get("next_cursor") or None
-        if not cur:
-            break
-    have = {n for n, _ in seen}
-    todo = [(n, c) for n, c in sorted(seen) if lane_split(n) and not bot_only(cfg, c)]
-    for name, cid in todo:
-        un = updates_name(name)
-        if dry:
-            print(f"#{name} → #{un} {'(already there)' if un in have else '(would create)'}"); continue
+        print("cc-slack retire: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
+    keep = {APPROVALS, ALERTS, VITALS_STORE, log_lane(cfg), BOX.lower(), (cfg.get("SLACK_ALERTS") or ALERTS),
+            threads_name(CTL), (cfg.get("MAIL_CHANNEL") or "").strip().lstrip("#").lower()} - {""}
+    home = to or "#" + log_lane(cfg)
+    bad = retire_dest(cfg, home, ids)
+    if bad:                                          # before any record or archive: a post must have somewhere live to go
+        print(f"cc-slack retire: its posts would go to {home}, but {bad} — nothing archived", file=sys.stderr); return 1
+    members = load_members()
+    member_ids = {e.get(k) for e in members.values() for k in ("chan_id", "updates_id")} - {None, ""}
+    member_names = {n for h, e in members.items() for n in (h, e.get("chan"), e.get("updates"))} - {None, ""}
+    wins, orchs, rc = set(home_windows()), load_orchs(), 0
+    for cid in ids:
         try:
-            ucid, how = ensure_updates_lane(cfg, name, cid)
-        except ChannelExists as e:
-            print(e, file=sys.stderr); rc = 1; continue
+            ch = api("conversations.info", cfg["SLACK_BOT_TOKEN"], channel=cid)["channel"]
         except Exception as e:
-            print(f"#{un}: {e}", file=sys.stderr); rc = 1; continue
-        print(f"#{un} ({ucid}) {how} → {name.replace('--', '/', 1)}")
-    print(f"{len(todo)} repo channel(s); the rest are not split (#{APPROVALS}, #{ALERTS}, lanes, tracks, sub-orchs, bot-only stores).")
+            print(f"{cid}: cannot read it ({str(e)[:80]}) — refused", file=sys.stderr); rc = 1; continue
+        name = (ch.get("name") or "").lower()
+        o = orchs.get(cid) or {}
+        seat = (f"{o.get('target')}@{o.get('alias')}" if o and not o.get("archived")
+                else None if main_lane(name) else name.replace("--", "/", 1))
+        why = ("kept by rule" if name in keep else "a member's channel" if cid in member_ids or name in member_names
+               or any(name.startswith(f"{h}--") for h in members)
+               else f"live seat {seat}" if seat and seat in wins else "")
+        eff = (load_retired().get(cid) or {}).get("to") or home    # retire_record keeps a `to` already recorded
+        bad = retire_dest(cfg, eff, ids) if not why and eff != home else ""
+        why = why or (f"its recorded destination {eff}: {bad}" if bad else "")
+        if why:
+            print(f"{cid} #{name}: refused — {why}", file=sys.stderr); rc = 1; continue
+        state = "archived already" if ch.get("is_archived") else f"{ch.get('num_members', '?')} members"
+        if dry:
+            print(f"{cid} #{name}: {state}; would archive, its posts → {eff}"); continue
+        prev = load_retired().get(cid)
+        retire_record(cfg, cid, name, home)
+        with orchs_locked():
+            orchs = load_orchs()
+            ok = archive_channel(cfg, cid, orchs)
+            save_orchs(orchs)
+        if not ok:                                   # the channel is still live: take back the record, or its posts detour
+            r = load_retired()
+            if prev is None:
+                r.pop(cid, None)
+            else:
+                r[cid] = prev
+            save_table(RETIRED, r)
+        print(f"{cid} #{name}: {'archived' if ok else 'could NOT archive'}; its posts → {eff}")
+        rc |= 0 if ok else 1
     return rc
 
 def cmd_orch_channel(argv):
@@ -9352,15 +9608,16 @@ def self_lands(cfg, repo):
 
 def card_lane(cfg, repo):
     """(channel id or None, channel name) for `repo`'s PR cards. A repo that lands its own PRs needs nobody's 👍, so
-    its card is a landing record and goes to the log lane, #<repo>-updates, when the bot is in one — routine PR
+    its card is a landing record and goes to a log lane — #<repo>-updates while it has one (a member's), else the box's
+    one log lane #<box>-updates — routine PR
     cards leave #approvals, which is for actions that need the owner's OK (the brief comms-requests-reach-who-decides).
     Every other repo's card stays in #approvals, where the owner's 👍 IS the merge; a self-landing repo with no log
     lane falls back there too, so no card is lost. A landing that STOPS asks for his 👍 wherever its card stands, so
     his own 👍 on a card in the log lane RE-QUEUES that landing (Daemon.owner_card_thumb) — a queue, not an
     authorization: it carries no --approved-by and lifts no protected-path hold."""
     if self_lands(cfg, repo):
-        lane = updates_name(home_of(cfg, repo))          # a channel-less child's card goes to its parent's log lane
-        cid = resolve_channel(cfg, lane)
+        lane = ambient_lane(cfg, home_of(cfg, repo))     # its own twin (a member's), else the box's one log lane
+        cid = resolve_channel(cfg, lane) if lane else None
         if cid:
             return cid, lane
     cid, member = find_channel(cfg, APPROVALS)
@@ -9875,17 +10132,18 @@ def resolve_channel(cfg, name):
     path = f"{DIR}/channels.json"
     try:
         c = json.load(open(path))
-        if time.time() - c.get("_t", 0) < 3600 and name in c:
-            return c[name]
+        if time.time() - c.get("_t", 0) < 3600 and name in c and c[name] not in load_retired():
+            return c[name]         # a cached id of a channel since retired is a miss: re-list, which skips archived ones
     except Exception:
         c = {}
-    cur, found, about = None, {}, {}
+    cur, found, about, made = None, {}, {}, []
     try:
         while True:
             r = api("conversations.list", cfg["SLACK_BOT_TOKEN"], types="public_channel,private_channel", exclude_archived="true", limit="200", cursor=cur)
             for ch in r["channels"]:
                 if ch.get("is_member"):
                     found[ch["name"]] = ch["id"]
+                    made.append((ch["id"], ch["name"], ch.get("creator")))
                     said = channel_about(ch)
                     if said:
                         about[ch["name"]] = said
@@ -9894,6 +10152,10 @@ def resolve_channel(cfg, name):
                 break
         found["_t"] = about["_t"] = time.time()
         os.makedirs(DIR, exist_ok=True)
+        with contextlib.suppress(Exception):
+            retired_back([v for k, v in found.items() if k != "_t"])   # an unarchived channel is live again
+        with contextlib.suppress(Exception):
+            seed_twins(cfg, made)                                      # once: the -updates twins the bot made
         json.dump(found, open(path, "w"))
         json.dump(about, open(f"{DIR}/channels-about.json", "w"))
     except Exception:
@@ -10349,8 +10611,8 @@ def main(argv):
         sys.exit(cmd_track_thread(sys.argv[2:]))
     elif cmd == "mkchannel":
         return cmd_mkchannel(rest)
-    elif cmd == "updates-sweep":
-        return cmd_updates_sweep(rest)
+    elif cmd == "retire":
+        return cmd_retire(rest)
     elif cmd == "member":
         return cmd_member(rest)
     elif cmd == "members":

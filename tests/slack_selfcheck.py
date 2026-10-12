@@ -45,6 +45,15 @@ def run_selfcheck():
         print(("  ✓ " if cond else "  ✗ ") + name)
         if not cond:
             fails.append(name)
+    REAL_LOAD_MEMBERS = load_members
+    def kept_twins(*ids):
+        """load_members for a box that keeps these -updates twin ids on record (own_twin reads `updates_id` and the
+        `updates` name it was recorded under), on top of the members it has: a fixture whose twin should take routine
+        lines says so, because a name the bot is merely in no longer counts (anyone can make #<repo>-updates and
+        invite it). Each id is `C-<lane name>` (the name is read off it) or an (id, lane name) pair."""
+        pairs = [c if isinstance(c, tuple) else (c, c[2:]) for c in ids]
+        return lambda: dict(REAL_LOAD_MEMBERS(), **{f"twin{i}": {"updates_id": c, "updates": n}
+                                                    for i, (c, n) in enumerate(pairs)})
     # NOT ONE THING THIS RUN MAKES MAY REACH THE OWNER. Cases stub subprocess.run one at a time, but land_soon()
     # and publish_soon() do their work on a BACKGROUND thread: the call lands after the stub was put back, on a
     # thread the case never had — so the REAL cc-notify paged the owner about a fixture. That is where four days
@@ -755,6 +764,10 @@ def run_selfcheck():
                 real_cfg_pa, real_rc_pa = globals()["load_cfg"], resolve_channel
                 globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER", "CC_SELF_LAND_EXCEPT": "other"}
                 globals()["resolve_channel"] = lambda cfg, name: "CUPD" if name == f"{rname}-updates" else None
+                # the twins here are the box's own, on record (own_twin): a name the bot is merely in would not count
+                members_pa = load_members()
+                save_members({"mate": {"updates": f"{rname}-updates", "updates_id": "CUPD"},
+                              "mate2": {"updates": "x-updates", "updates_id": "CUPD2"}})
                 lane_hist, posted_to = {"CAPPR": [], "CUPD": []}, []
                 def api5(method, token, **kw):
                     if method == "auth.test":
@@ -834,6 +847,7 @@ def run_selfcheck():
                                         ("CAPPR", f"[{other}] PR #9: t — https://x/9  ·  :+1: from the owner merges (squash)")]
                       and not lane_hist["CUPD2"] and [m["text"][:len(other) + 2] for m in lane_hist["CAPPR"]] == [f"[{other}]"])
                 globals()["load_cfg"], globals()["resolve_channel"] = real_cfg_pa, real_rc_pa
+                save_members(members_pa)
             finally:
                 globals()["post"], globals()["find_channel"], subprocess.run = real_post, real_find, real_run2
                 globals()["SENT_DIR"] = real_sent_pa
@@ -2677,7 +2691,7 @@ def run_selfcheck():
     check("claude.ai's '*Sent using* Claude' suffix is stripped before PERM_RE — `yes <id>` answers the prompt — A1",
           len(got1) == 1 and got1[0].get("type") == "permission" and got1[0].get("request_id") == "abcde")
     posted16 = []
-    real_rc, real_post = resolve_channel, post
+    real_rc, real_post, real_lm16 = resolve_channel, post, load_members
     try:
         globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") else f"C-{name}"
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: posted16.append(chat) or (1, "1.0")
@@ -2685,10 +2699,12 @@ def run_selfcheck():
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_post(["--route", "[myrepo] PR #3: fix things", "merge failed"])
         globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"        # …and the same box once #myrepo-updates exists
+        globals()["load_members"] = lambda: {"mate": {"updates": f"myrepo-{UPDATES}", "updates_id": f"C-myrepo-{UPDATES}"}}   # …as its own (own_twin)
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_post(["--route", "[myrepo] PR #3: fix things", "merge failed"])
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["load_members"] = real_lm16
     check("post --route: a landing's title '[repo] PR #n …' lands in #repo, not SLACK_CHANNEL — L16; with the repo's "
           "second lane in place the automated post goes there instead, and nothing else moves (owner, 2026-09-01)",
           posted16 == ["C-myrepo", f"C-myrepo-{UPDATES}"])
@@ -2712,13 +2728,14 @@ def run_selfcheck():
                                                     # machine's name), where the lane it lands in is still lower-case
         rbox = BOX; alt = f"{host}-alt"              # CC_BOX set to something that is NOT this host's name: cc-notify
         globals()["BOX"] = alt                       # titles on it, so --route has to as well or the alert misses #alerts
+        globals()["load_members"] = kept_twins(f"C-{host}-{UPDATES}")   # the host-named repo's twin is on record
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_post(["--route", f"{alt} limit", "resumes at 11:40"]); cmd_post(["--route", f"{alt} audit review", "ok"]); cmd_post(["--route", f"{alt}/t1 done", "PR: x"])
             cmd_post(["--route", f"{alt} digest", "3 tracks running"])
             cmd_post(["--route", f"{host} limit", "a repo that happens to be named after the host"])
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
-        globals()["BOX"] = rbox
+        globals()["BOX"] = rbox; globals()["load_members"] = REAL_LOAD_MEMBERS
     # A TRACK IS A THREAD (owner, 2026-09-18): a worker's "<repo>/<track> …" line lands in the track's ONE thread in
     # #<repo> when the TRACKS table has one — before the updates lane, which is where a track with no thread (a legacy
     # channel, or a repo the bot cannot see) still goes. --mention is rung 1 and stays on the main lane, unthreaded.
@@ -2728,12 +2745,14 @@ def run_selfcheck():
         globals()["resolve_channel"] = lambda cfg, name: {"alerts": "C-alerts"}.get(name, "C-" + name)
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: postedT.append((chat, thread)) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
+        globals()["load_members"] = lambda: {"mate": {"updates": f"myrepo-{UPDATES}", "updates_id": f"C-myrepo-{UPDATES}"}}   # the twin is on record (own_twin)
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_post(["--route", "myrepo/t1 done", "PR: x"]); cmd_post(["--route", "myrepo/t1 round over", "next: y"])
             cmd_post(["--route", "myrepo/t2 done", "PR: z"])
             cmd_post(["--route", "myrepo/t1 done", "--mention", "needs you"])
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["load_members"] = real_lm16
         save_table(TRACKS, {})
     check("post --route: a track WITH a thread in #<repo> gets its 'done' and 'round over' lines IN that thread, not the "
           "updates lane; a track without one takes the lane as before; --mention still opens on the main lane, unthreaded",
@@ -2790,11 +2809,14 @@ def run_selfcheck():
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: rootsK.append((chat, text)) or (1, f"8.{len(rootsK)}")
         globals()["load_cfg"] = lambda: cfgK
         # `own` stands in for a member's #<handle> here: a member cannot see the -updates lane, so its thread stays put
-        globals()["load_members"] = lambda: {"own": {"chan": "own"}}
+        # …and the twins are the box's own, on record (own_twin): the member's, and par's kept under another entry
+        membersK = {"own": {"chan": "own", "updates": f"own-{UPDATES}", "updates_id": "C-own-up"},
+                    "keep": {"updates": f"par-{UPDATES}", "updates_id": "C-par-up"},
+                    "keep2": {"updates": f"mfk-{UPDATES}", "updates_id": "C-mfk-up"}}
+        globals()["load_members"] = lambda: membersK
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             rcK = [cmd_track_thread(["kid/t1"]), cmd_track_thread(["own/t1"]), cmd_track_thread(["lone/t1"])]
             rcMF = cmd_track_thread(["mfk/t1"])
-        globals()["load_members"] = real_lm
         ttK = (track_thread("kid/t1"), track_thread("own/t1"), track_thread("lone/t1"))
         ttMF = track_thread("mfk/t1")
         save_table(TRACKS, {})
@@ -2876,16 +2898,32 @@ def run_selfcheck():
         globals()["BOX"] = rbox
     check("post --route: no updates lane on this box → the digest falls back to #alerts, exactly as before the split",
           postedC == ["C-alerts"])
+    postedC2 = []
+    try:                                                     # …and a `box digest` whose #box-updates the box never recorded
+        globals()["resolve_channel"] = lambda cfg, name: "C-alerts" if name == "alerts" else "C-" + name
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: postedC2.append(chat) or (1, "1.0")
+        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
+        globals()["BOX"] = alt
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_post(["--route", "box digest", "3 tracks running"]); cmd_post(["--route", f"{alt} digest", "3 tracks running"])
+    finally:
+        globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["BOX"] = rbox
+    check("post --route: a `box digest` whose #box-updates is not the log lane and not on record stays in #alerts (anyone "
+          "could make that name); the box's own digest still goes to its log lane",
+          postedC2 == ["C-alerts", f"C-{alt.lower()}-{UPDATES}"])
     postedL = []
     try:                                                     # THE LADDER (owner, 2026-09-01): rung 1 vs rung 5, told apart only by --mention
         globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: postedL.append((chat, text, kw.get("decision"))) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+        globals()["load_members"] = kept_twins(f"C-myrepo-{UPDATES}")
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_post(["--route", "[myrepo] blocked", "--mention", "which database do I restore?"])
             cmd_post(["--route", "[myrepo] step 3", "green, moving on"])
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["load_members"] = REAL_LOAD_MEMBERS
     check("the ladder: a decision-class notice (cc-notify --decision → post --mention) goes to the MAIN channel as a "
           "decision ask — rung 1, 'you, now', post() opens it with 🔒 and his mention; the same notice without it is "
           "ambient, no decision, and lands in the -updates lane — rung 5",
@@ -2994,6 +3032,7 @@ def run_selfcheck():
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
         globals()["sender_name"] = lambda chan: ("mybox · main", ownA[0])
         globals()["sock_request"] = lambda req, timeout=15: {}
+        globals()["load_members"] = kept_twins("C-myrepo-updates")
         _users.update(t=time.time(), map={}, ids={}, miss=time.time())
         postA("-c", "#myrepo", "can you rebuild the index?")                       # 0: another seat's main lane, top level
         postA("-c", "#myrepo", "--thread", "7.0", "rebuilt?")                      # 1: …in a thread there
@@ -3014,7 +3053,7 @@ def run_selfcheck():
     finally:
         globals()["resolve_channel"], globals()["load_cfg"], globals()["sender_name"] = real_rc, real_load_cfg, real_snA
         globals()["sock_request"], globals()["api"] = real_sockA, real_api
-        _users.update(usersA)
+        _users.update(usersA); globals()["load_members"] = REAL_LOAD_MEMBERS
     check("agent post: a seat's top-level post into another session's #<repo> arrives first char 🤖, `🤖 <#C-myrepo> …`, "
           "in #<repo>-updates, one stderr line saying so",
           outA[0][0] == [("C-myrepo-updates", "🤖 <#C-myrepo> can you rebuild the index?", None)]
@@ -3060,6 +3099,7 @@ def run_selfcheck():
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None, **kw: postedG.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
         globals()["unresolved_mentions"] = lambda cfg, text, chat=None, **kw: []   # the fake token cannot ask users.list; the warning path has its own cases
+        globals()["load_members"] = kept_twins("C-myrepo-updates")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errG):
             rcG = cmd_post(["-c", "#myrepo", "bug report from lesson-builder: the skill drops step 3"])   # routine → the twin
             cmd_post(["-c", "#myrepo", "restore which database?"])                                       # a question → main
@@ -3074,7 +3114,7 @@ def run_selfcheck():
             cmd_post(["-c", "C123", "raw id, routine"])                                                   # the reply tool's door: not gated
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
-        globals()["unresolved_mentions"] = real_um
+        globals()["unresolved_mentions"] = real_um; globals()["load_members"] = REAL_LOAD_MEMBERS
     check("the main lane is the owner's: a routine -c '#<repo>' post is redirected to #<repo>-updates and one stderr line says so "
           "(exit 0); a question ('?'), a decision (❓ / 🔐 / an @-mention / --mention), a --thread reply and --major (alias --main) "
           "stay in #<repo>; #alerts, a track channel, a lane and a raw id are untouched",
@@ -3092,7 +3132,7 @@ def run_selfcheck():
     # fold() read this fixture, and the finally below puts the box's DIR back
     DIR = tempfile.mkdtemp(prefix="cc-slack-selfcheck-engage-")
     postedE, errE, outE, heldE, byE, scores = [], io.StringIO(), io.StringIO(), io.StringIO(), {}, {}
-    keepE, fortyE, gateE = None, None, []
+    keepE, fortyE, gateE, logE = None, None, [], {}
     try:
         os.environ["CC_ENGAGE_DAYS"] = "3"; os.environ.pop("CC_ENGAGE_ACTIVE", None)
         nowE = time.time()
@@ -3135,6 +3175,7 @@ def run_selfcheck():
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
         globals()["unresolved_mentions"] = lambda cfg, text, chat=None, **kw: []
         globals()["track_thread"] = lambda target: None
+        globals()["load_members"] = kept_twins(*(f"C-{p}-{UPDATES}" for p in ("busy", "some", "quiet")))
         with contextlib.redirect_stdout(outE), contextlib.redirect_stderr(errE):
             for p in ("busy", "some", "quiet"):
                 n0 = len(postedE)
@@ -3153,9 +3194,23 @@ def run_selfcheck():
                      open(f"{DIR}/{FOLDED}").read() == foldedE0)
         with contextlib.redirect_stdout(heldE):
             cmd_folded([])
+        # NO -updates TWINS (comms-only-read-channels-remain): a routine line for <p>, by --route or by a -c into its
+        # gone twin, lands in the box's one log lane. The gate weighs it as <p>'s updates, not as the log lane's own
+        # project: busy's is posted there, some's held for the digest, quiet's journal-only, each filed under <p>.
+        globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") and name != f"hub-{UPDATES}" else f"C-{name}"
+        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER", "SLACK_LOG_LANE": f"hub-{UPDATES}"}
+        foldN0 = len(open(f"{DIR}/{FOLDED}").read().splitlines())
+        with contextlib.redirect_stdout(outE), contextlib.redirect_stderr(io.StringIO()):
+            for p in ("busy", "some", "quiet"):
+                n0 = len(postedE)
+                rc = [cmd_post(["--route", f"{p} step", "step 4 green, moving on"]),
+                      cmd_post(["-c", f"#{p}-{UPDATES}", "step 5 green, moving on"])]
+                logE[p] = (rc, postedE[n0:])
+        logE["folded"] = [(r["project"], r["tier"]) for r in map(json.loads, open(f"{DIR}/{FOLDED}").read().splitlines()[foldN0:])]
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
         globals()["unresolved_mentions"] = real_um; globals()["track_thread"] = real_tt
+        globals()["load_members"] = REAL_LOAD_MEMBERS
         DIR = was_dir
         os.environ["CC_ENGAGE_DAYS"] = was_days if was_days is not None else "0"
     alwaysE = lambda p: [(f"C-{p}", None), (f"C-{p}-{UPDATES}", None), (f"C-{p}", None), (f"C-{p}", "1700.1"),
@@ -3181,6 +3236,13 @@ def run_selfcheck():
     check("engagement: the digest's own --major --keep post in an idle project is delivered to its main lane and leaves "
           "folded.jsonl untouched (the digest is never folded into itself) " + repr(keepE),
           keepE == (0, [("C-quiet", None)], True))
+    logC = f"C-hub-{UPDATES}"
+    check("engagement with no -updates twins: a routine line for a project (--route, or -c into its gone twin) lands in "
+          "the box's log lane and is weighed by HIS engagement in that project — busy's both posted there, some's held "
+          "for the digest, quiet's journal-only, each folded under its own project, never the log lane's " + repr(logE),
+          logE.get("busy") == ([0, 0], [(logC, None), (logC, None)]) and logE.get("some") == ([0, 0], [])
+          and logE.get("quiet") == ([0, 0], [])
+          and logE.get("folded") == [("some", "digest")] * 2 + [("quiet", "journal")] * 2)
     check(f"engagement: a 40-day window on 10-10 counts his 3 messages of 09-30 (a month neither end names), so the "
           f"project is active ({fortyE} >= {ENGAGE_ACTIVE})", fortyE == 3 and fortyE >= ENGAGE_ACTIVE)
     check("engagement: CC_ENGAGE_DAYS in the environment wins over ~/.cc/config both ways, and the channel SLACK_ALERTS "
@@ -6375,7 +6437,7 @@ def run_selfcheck():
         finally:
             globals()["react"], globals()["api"], globals()["home_windows"], globals()["find_channel"] = _rc8, _api8, _hw8, _fc8
             os.path.exists(f"{DIR}/{ORCHS}") and os.unlink(f"{DIR}/{ORCHS}")
-    # ---- a repo channel is created as a PAIR, and the sweep is the same call for the ones that predate it
+    # ---- a repo channel is created alone: no -updates twin, and no sweep that would make one
     _apiU, _fcU, _lcU = globals()["api"], globals()["find_channel"], globals()["load_cfg"]
     devU = tempfile.mkdtemp(prefix="cc-slack-devU-")
     _devU = DEV
@@ -6403,38 +6465,379 @@ def run_selfcheck():
             madeU = sorted(liveU)
             rcU2 = cmd_mkchannel(["repou"])            # …twice: idempotent, no second channel and no second create
         createsU = [kw["name"] for m, kw in callsU if m == "conversations.create"]
-        check("mkchannel: a repo channel is created as a PAIR — #<repo> and its routed #<repo>-updates sibling — and a "
-              "second run creates NOTHING (idempotent, so it is safe as the one-shot for existing repos)",
-              (rcU1, rcU2) == (0, 0) and madeU == ["repou", f"repou-{UPDATES}"] and sorted(liveU) == madeU
-              and createsU == ["repou", f"repou-{UPDATES}"])
-        topicU = [kw["topic"] for m, kw in callsU if m == "conversations.setTopic" and kw["channel"] == f"C-repou-{UPDATES}"]
-        check("the lane's topic says what it is for and where the other half of the conversation lives",
-              topicU and "UPDATES lane" in topicU[0] and "#repou" in topicU[0] and "`repou`" in topicU[0])
+        check("mkchannel: a repo channel comes ALONE — no #<repo>-updates twin (comms-only-read-channels-remain: the owner "
+              "read none of them) — and a second run creates nothing",
+              (rcU1, rcU2) == (0, 0) and madeU == ["repou"] and createsU == ["repou"])
         callsU.clear()
         with contextlib.redirect_stdout(io.StringIO()):
-            for nU in ("approvals", "alerts", "repou--w1", "kidrepo-orch-abcd"):
-                liveU[nU] = "C-" + nU
-            save_orchs({"C-kidrepo-orch-abcd": {"target": "repou", "alias": "orch", "name": "kidrepo-orch-abcd"}})
-            os.mkdir(f"{devU}/older"); liveU["older"] = "C-older"
-            rcU3 = cmd_updates_sweep([])
-        check(f"updates-sweep: a repo channel that predates the split gains its lane; #{APPROVALS}, #{ALERTS}, a track "
-              "channel, a sub-orch channel and a lane itself are left alone — each is already somebody's detail lane",
-              rcU3 == 0 and [kw["name"] for m, kw in callsU if m == "conversations.create"] == [f"older-{UPDATES}"])
-        callsU.clear()
-        with contextlib.redirect_stdout(io.StringIO()):
-            rcU4 = cmd_updates_sweep([])
-        check("updates-sweep runs twice with no second channel: the lane routes by NAME, so there is no table to drift",
-              rcU4 == 0 and not [1 for m, _ in callsU if m == "conversations.create"])
-        callsU.clear()
-        with contextlib.redirect_stdout(io.StringIO()):
-            liveU[VITALS_STORE] = "C-" + VITALS_STORE; liveU["lonely"] = "C-lonely"; membersU["C-lonely"] = ["UBOT"]
-            rcU5 = cmd_updates_sweep([]); rcU6 = cmd_mkchannel([VITALS_STORE])
-        check(f"updates-sweep and mkchannel: #{VITALS_STORE} (the box's picture store) and any channel whose only member is the "
-              "bot get NO -updates twin — on 2026-09-01 the sweep made one for the store and the owner archived it by hand",
-              (rcU5, rcU6) == (0, 0) and not [1 for m, _ in callsU if m == "conversations.create"] and not lane_split(VITALS_STORE))
+            liveU[VITALS_STORE] = "C-" + VITALS_STORE
+            rcU6 = cmd_mkchannel([VITALS_STORE, "older"])
+        check("no sweep and no mkchannel recreates a retired lane: the updates-sweep verb is gone, and mkchannel on two "
+              "more names makes only the one that was missing — never a -updates twin",
+              "cmd_updates_sweep" not in globals() and "updates-sweep" not in __doc__ and rcU6 == 0
+              and [kw["name"] for m, kw in callsU if m == "conversations.create"] == ["older"] and not lane_split(VITALS_STORE))
     finally:
         globals()["api"], globals()["find_channel"], globals()["load_cfg"], globals()["DEV"] = _apiU, _fcU, _lcU, _devU
         os.path.exists(f"{DIR}/{ORCHS}") and os.unlink(f"{DIR}/{ORCHS}")
+    # ---- retired channels (comms-only-read-channels-remain): a post, a stale cached id or a persisted job aimed at an
+    # archived channel goes where its posts go now; each case builds its own retired.json and api, and asserts the
+    # kept case beside the rerouted one
+    _apiR, _rcR, _lcR, _sdR, _hwR = globals()["api"], resolve_channel, globals()["load_cfg"], SENT_DIR, globals()["home_windows"]
+    _postR, _slR, _snR = post, self_lands, globals()["sender_name"]
+    cfgR = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+    LL = updates_name(BOX)
+    def fresh_retired(tbl):
+        save_table(RETIRED, tbl)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f"{DIR}/channels.json")
+    try:
+        globals()["SENT_DIR"] = tempfile.mkdtemp(prefix="cc-slack-sentR-")
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG", "lessons": "CLES"}.get(name)
+        # R1 — chat.postMessage answers is_archived: recorded, then sent ONCE to the log lane, top level, labelled
+        fresh_retired({})
+        sentR = []
+        def apiR(m, tok, **kw):
+            if m == "chat.postMessage":
+                sentR.append((kw["channel"], kw.get("thread_ts"), kw["text"]))
+                if kw["channel"] in ("CARCH", "CARCH2"):
+                    raise RuntimeError("is_archived")
+                if kw["channel"] == "CGONE":
+                    raise RuntimeError("not_in_channel")
+                return {"ts": "9.1"}
+            return {}
+        globals()["api"] = apiR
+        with contextlib.redirect_stderr(io.StringIO()):
+            n1, ts1 = post(cfgR, "CARCH", "a landing line", "4.4", mail=False)
+            err1 = ""
+            try:
+                post(cfgR, "CGONE", "x", mail=False)
+            except RuntimeError as e:
+                err1 = str(e)
+        check("R1 is_archived on a post: the channel is recorded retired and the line goes ONCE to the log lane, top "
+              "level (a thread there cannot continue) and saying whose it was; any other refusal still raises, no reroute",
+              ts1 == "9.1" and [c for c, _, _ in sentR] == ["CARCH", "CLOG", "CGONE"] and sentR[1][1] is None
+              and "archived" in sentR[1][2] and "CARCH" in load_retired() and err1 == "not_in_channel"
+              and "CGONE" not in load_retired())
+        # R2 — a record's `to` wins over the log lane
+        fresh_retired({"CARCH2": {"name": "myrepo-email-ab12", "to": "#lessons"}})
+        sentR.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            post(cfgR, "CARCH2", "open ask", mail=False)
+        check("R2 a retired channel with a `to` sends there, naming the old channel; one hop, never a loop",
+              [c for c, _, _ in sentR] == ["CARCH2", "CLES"] and "#myrepo-email-ab12" in sentR[1][2])
+        # R2d — a DECISION aimed at a retired channel goes to its project's main channel (decision_lane), never the
+        # log lane or a `to`: by the record's name, by its orch's target, and #<CTL> when the project has no channel
+        save_orchs({"CORCHD": {"target": "lessons", "alias": "dash", "name": "lessons-dash-ab12"}})
+        fresh_retired({"CARCHD": {"name": "lessons-updates", "to": ""}, "CORCHD": {"name": "lessons-dash-ab12", "to": "#lessons"},
+                       "CZED": {"name": "zed", "to": ""}})
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG", "lessons": "CLES", CTL: "CCTL"}.get(name)
+        sentR.clear()
+        def apiR2d(m, tok, **kw):
+            if m == "chat.postMessage":
+                sentR.append((kw["channel"], kw.get("thread_ts"), kw["text"]))
+                if kw["channel"] in ("CARCHD", "CORCHD", "CZED"):
+                    raise RuntimeError("is_archived")
+                return {"ts": "9.2"}
+            return {}
+        globals()["api"] = apiR2d
+        with contextlib.redirect_stderr(io.StringIO()):
+            post(cfgR, "CARCHD", "pick A or B?", "4.4", mail=False, decision=True, ask=False)
+            post(cfgR, "CORCHD", "pick C or D?", mail=False, decision=True, ask=False)
+            post(cfgR, "CZED", "pick E or F?", mail=False, decision=True, ask=False)
+            post(cfgR, "CARCHD", "a routine line", mail=False)
+        save_orchs({})
+        check("R2d a decision aimed at a retired -updates lane, orch channel or main channel goes to #<repo>, the orch's "
+              "repo, and #<CTL> respectively, with its 🔒 head; a routine line to the same retired lane still goes to the log lane",
+              [c for c, _, _ in sentR] == ["CARCHD", "CLES", "CORCHD", "CLES", "CZED", "CCTL", "CARCHD", "CLOG"]
+              and sentR[1][1] is None and "🔒" in sentR[1][2] and "was a thread reply" in sentR[1][2])
+        # R2n — the FIRST post to learn a lane is archived records it under its name (chat_name), so a decision the
+        # same call reroutes still finds the project's #<repo>; a nameless record would send it to #<CTL>
+        fresh_retired({})
+        json.dump({"_t": time.time(), "lessons-updates": "CNEWU"}, open(f"{DIR}/channels.json", "w"))
+        sentR.clear()
+        def apiR2n(m, tok, **kw):
+            if m == "chat.postMessage":
+                sentR.append((kw["channel"], kw.get("thread_ts"), kw["text"]))
+                if kw["channel"] == "CNEWU":
+                    raise RuntimeError("is_archived")
+                return {"ts": "9.3"}
+            return {}
+        globals()["api"] = apiR2n
+        with contextlib.redirect_stderr(io.StringIO()):
+            post(cfgR, "CNEWU", "pick G or H?", mail=False, decision=True, ask=False)
+        check("R2n a decision to a lane Slack just reported archived is recorded under the lane's name and lands in its "
+              "project's #<repo>, not #<CTL>",
+              [c for c, _, _ in sentR] == ["CNEWU", "CLES"] and (load_retired().get("CNEWU") or {}).get("name") == "lessons-updates")
+        globals()["api"] = apiR
+        # R3 — a stale cached id of a retired channel is a miss; a live cached id is served from the cache
+        globals()["resolve_channel"] = _rcR
+        listed = []
+        def apiR3(m, tok, **kw):
+            listed.append(m)
+            return {"channels": [{"id": "CLIVE", "name": "live", "is_member": True}]}
+        globals()["api"] = apiR3
+        fresh_retired({"COLD": {"name": "old-updates", "to": ""}})
+        json.dump({"_t": time.time(), "old-updates": "COLD", "live": "CLIVE"}, open(f"{DIR}/channels.json", "w"))
+        hitR3 = resolve_channel(cfgR, "live"); listedR3 = list(listed)
+        missR3 = resolve_channel(cfgR, "old-updates")
+        check("R3 a cached id of a channel since retired is a miss (re-listed, archived ones skipped → None); a live "
+              "cached id is still served from the cache with no API call",
+              hitR3 == "CLIVE" and listedR3 == [] and missR3 is None and listed == ["conversations.list"])
+        # R3u — a retired channel unarchived by hand is listed live again: its record is dropped, so its posts go to
+        # it once more; a record younger than RETIRE_GRACE (retire writes it before the archive call) and one whose
+        # channel is still archived stay
+        globals()["api"] = lambda m, tok, **kw: {"channels": [{"id": "CBACK", "name": "back", "is_member": True},
+                                                              {"id": "CYOUNG", "name": "young", "is_member": True}]}
+        fresh_retired({"CBACK": {"name": "back", "at": "2026-01-01T00:00:00Z"}, "CSTILL": {"name": "still", "at": 1},
+                       "CYOUNG": {"name": "young", "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}})
+        with contextlib.redirect_stderr(io.StringIO()):
+            backR3 = resolve_channel(cfgR, "back")
+        check("R3u a retired channel Slack lists live again (unarchived) loses its record and resolves; a young record "
+              "and a still-archived channel's record are kept",
+              backR3 == "CBACK" and set(load_retired()) == {"CSTILL", "CYOUNG"})
+        # R4 — a persisted submit intent aimed at a channel retired since: looked for and sent where its posts go now
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG"}.get(name)
+        fresh_retired({"COLDJ": {"name": "lessons-updates", "to": ""}})
+        sent_write("land:x:1:landed@1", {"id": "land:x:1:landed@1", "chat": "COLDJ", "thread": "3.3",
+                                         "intent": "2026-09-27T00:00:00Z", "accepted": None, "ts": None})
+        sentR.clear()
+        def apiR4(m, tok, **kw):
+            if m in ("conversations.history", "conversations.replies"):
+                sentR.append(("look", kw["channel"], None)); return {"messages": []}
+            if m == "chat.postMessage":
+                sentR.append((kw["channel"], kw.get("thread_ts"), kw["text"])); return {"ts": "8.8"}
+            return {}
+        globals()["api"] = apiR4
+        with contextlib.redirect_stderr(io.StringIO()):
+            nR4, tsR4, howR4 = submit(cfgR, "land:x:1:landed@1", "COLDJ", "PR #1 landed", "3.3")
+        check("R4 a persisted job (a queued landing's reply coordinates) whose channel was retired since: the retry looks "
+              "in the old channel first, then in the log lane, and posts it there top level, labelled — the record follows",
+              howR4 == "sent" and tsR4 == "8.8" and [x[:2] for x in sentR] == [("look", "COLDJ"), ("look", "CLOG"), ("CLOG", None)]
+              and sentR[2][2].startswith("(for #lessons-updates, archived, was a thread reply) ")
+              and sent_record("land:x:1:landed@1")["chat"] == "CLOG")
+        # R4d — the same retry for a DECISION goes to the project's #<repo> (retired_home with decision), never the log lane
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG", "lessons": "CLES"}.get(name)
+        sent_write("land:x:9:ask@1", {"id": "land:x:9:ask@1", "chat": "COLDJ", "thread": None,
+                                      "intent": "2026-09-27T00:00:00Z", "accepted": None, "ts": None})
+        sentR.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            nR4d, tsR4d, howR4d = submit(cfgR, "land:x:9:ask@1", "COLDJ", "pick A or B?", decision=True, ask=False)
+        check("R4d a persisted decision whose channel was retired since is retried in the project's #<repo>, not the log lane",
+              howR4d == "sent" and [x[0] for x in sentR if x[0] != "look"] == ["CLES"]
+              and sent_record("land:x:9:ask@1")["chat"] == "CLES")
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG"}.get(name)
+        # R4b — Slack took it in the old channel before the archive, and the process died before writing `accepted`
+        sent_write("land:x:2:landed@1", {"id": "land:x:2:landed@1", "chat": "COLDJ", "thread": "3.3",
+                                         "intent": "2026-09-27T00:00:00Z", "accepted": None, "ts": None})
+        sentR.clear()
+        def apiR4b(m, tok, **kw):
+            if m in ("conversations.history", "conversations.replies"):
+                sentR.append(("look", kw["channel"], kw.get("ts")))
+                hit = kw["channel"] == "COLDJ" and kw.get("ts") == "3.3"
+                return {"messages": [{"ts": "3.4", "metadata": {"event_type": "cc_submit",
+                                                                "event_payload": {"id": "land:x:2:landed@1"}}}] if hit else []}
+            return apiR4(m, tok, **kw)
+        globals()["api"] = apiR4b
+        with contextlib.redirect_stderr(io.StringIO()):
+            nR4b, tsR4b, howR4b = submit(cfgR, "land:x:2:landed@1", "COLDJ", "PR #2 landed", "3.3")
+        check("R4b a post Slack took in a channel before it was retired is FOUND there on the retry (its history still "
+              "reads), and nothing is sent again in the log lane",
+              howR4b == "found" and tsR4b == "3.4" and [x[0] for x in sentR] == ["look"]
+              and sent_record("land:x:2:landed@1")["chat"] == "COLDJ")
+        # R4c — the record moved to the log lane, then the post failed: the caller's retry with the old coordinates
+        # must look, and post, where the record says — top level — never in a thread the log lane does not have
+        sent_write("land:x:3:landed@1", {"id": "land:x:3:landed@1", "chat": "CLOG", "thread": None, "moved_from": "COLDJ",
+                                         "moved_name": "lessons-updates", "moved_thread": True,
+                                         "intent": "2026-09-27T00:00:00Z", "accepted": None, "ts": None})
+        sentR.clear()
+        globals()["api"] = apiR4
+        with contextlib.redirect_stderr(io.StringIO()):
+            nR4c, tsR4c, howR4c = submit(cfgR, "land:x:3:landed@1", "COLDJ", "PR #3 landed", "3.3")
+        check("R4c a moved intent retried with the caller's old channel and thread: the record's channel and its explicit "
+              "null thread win, so it looks and posts in the log lane top level, labelled as before",
+              howR4c == "sent" and [x[:2] for x in sentR] == [("look", "CLOG"), ("CLOG", None)]
+              and sentR[1][2].startswith("(for #lessons-updates, archived, was a thread reply) "))
+        # R4d — a fresh submit whose post meets is_archived: the record keeps the channel the ts belongs to
+        fresh_retired({})
+        globals()["api"] = apiR
+        sentR.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            nR4d, tsR4d, howR4d = submit(cfgR, "card:x:4", "CARCH", "PR #4 card", "5.5")
+        recR4d = sent_record("card:x:4")
+        check("R4d a fresh submit rerouted by post() off an archived channel records the log lane, top level, beside the "
+              "log lane's ts — never the archived id with a ts from another channel",
+              howR4d == "sent" and tsR4d == "9.1" and recR4d["chat"] == "CLOG" and recR4d["thread"] is None
+              and recR4d["moved_from"] == "CARCH" and recR4d["ts"] == "9.1")
+        # R5 — --route with no twin → the log lane, labelled; a member's twin is still its own
+        postedR5 = []
+        globals()["post"] = lambda cfg, chat, text, thread=None, **kw: postedR5.append((chat, text)) or (1, "1.0")
+        globals()["load_cfg"] = lambda: dict(cfgR)
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG", "myrepo": "CMY", "mem-updates": "CMEMU", "mem": "CMEM"}.get(name)
+        save_members({"mem": {"chan": "mem", "chan_id": "CMEM", "updates": "mem-updates", "updates_id": "CMEMU"}})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cmd_post(["--route", "myrepo board", "3 rows"]); cmd_post(["--route", "mem board", "2 rows"])
+            cmd_post(["-c", "#myrepo-updates", "spend line"])
+        check("R5 --route for a repo with no -updates twin goes to the box's log lane, labelled [repo]; a member's twin "
+              "still takes its own; `-c #<repo>-updates` for a twin that is gone goes to the log lane too",
+              [c for c, _ in postedR5] == ["CLOG", "CMEMU", "CLOG"] and postedR5[0][1].startswith("[myrepo] ")
+              and not postedR5[1][1].startswith("[mem]") and postedR5[2][1].startswith("[myrepo] "))
+        # R5s — A SQUATTED TWIN NAME: since mkchannel stopped making twins, anyone can make #<repo>-updates and invite
+        # the bot. A name the box did not record (members.json `updates_id`) gets no routine line, no -c line, no
+        # agent post and no main-lane redirect: it is treated as gone, and the line goes to the log lane.
+        postedR5.clear()
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG", "sq": "CSQM", "sq-updates": "CSQ"}.get(name)
+        globals()["sender_name"] = lambda chan: ("mybox · main", False)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cmd_post(["--route", "sq board", "3 rows"]); cmd_post(["-c", "#sq-updates", "spend line"])
+            cmd_post(["-c", "#sq", "step 3 green"]); cmd_post(["-c", "#sq", "can you rebuild the index?"])
+        globals()["sender_name"] = _snR
+        check("R5s a #<repo>-updates the bot is in but the box never recorded (a member made it) takes nothing: a --route "
+              "line and a -c into it go to the log lane, a routine -c '#<repo>' stays in #<repo>, an agent post too",
+              [c for c, _ in postedR5] == ["CLOG", "CLOG", "CSQM", "CSQM"] and "CSQ" not in [c for c, _ in postedR5])
+        # R5m/R5t — a --mention or a --thread reply aimed at a gone twin. A decision pages the owner, so it goes to
+        # the project's main channel (decision_lane), never the log lane under another label; a thread reply goes to
+        # the log lane TOP LEVEL, since the old lane's thread ts means nothing there, saying it was one.
+        postedR5m = []
+        globals()["post"] = lambda cfg, chat, text, thread=None, **kw: postedR5m.append((chat, thread, text, kw.get("decision"))) or (1, "1.0")
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG", "lessons": "CLES", "sq-updates": "CSQ", CTL: "CCTL"}.get(name)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cmd_post(["-c", "#lessons-updates", "--mention", "pick A or B?"])
+            cmd_post(["-c", "#lessons-updates", "--thread", "4.4", "--mention", "pick C or D?"])
+            cmd_post(["-c", "#sq-updates", "--mention", "pick E or F?"])        # squatted twin, no #sq: the control repo's channel
+            cmd_post(["-c", "#lessons-updates", "--thread", "4.4", "done, see above"])
+        check("R5m a --mention aimed at a gone twin lands in its project's #<repo> as a decision, unthreaded and "
+              "unlabelled — never the log lane; at a squatted twin whose #<repo> is gone too, the control repo's channel",
+              [(c, t, d) for c, t, _, d in postedR5m[:3]] == [("CLES", None, True), ("CLES", None, True), ("CCTL", None, True)]
+              and postedR5m[0][2] == "pick A or B?")
+        check("R5t a --thread reply aimed at a gone twin goes to the log lane top level, opening with the retired note "
+              "that names the old lane and says it was a thread reply",
+              postedR5m[3][:2] == ("CLOG", None)
+              and postedR5m[3][2] == "(for #lessons-updates, archived, was a thread reply) done, see above")
+        # R5tg — the same reply with the engagement gate ON and the owner idle in lessons: moved top level, it is still a
+        # reply in a thread, and a reply is never held (engage_gate) — so it is posted, not sent to the journal
+        postedR5m.clear(); was_daysR = os.environ.get("CC_ENGAGE_DAYS")
+        os.environ["CC_ENGAGE_DAYS"] = "3"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                cmd_post(["-c", "#lessons-updates", "--thread", "4.4", "done, see above"])
+        finally:
+            os.environ["CC_ENGAGE_DAYS"] = was_daysR if was_daysR is not None else "0"
+        check("R5tg with the engagement gate on and the owner idle, a --thread reply aimed at a gone twin is still posted "
+              "to the log lane (a reply is never held), not folded into the journal",
+              [x[:2] for x in postedR5m] == [("CLOG", None)]
+              and postedR5m[0][2] == "(for #lessons-updates, archived, was a thread reply) done, see above")
+        globals()["post"] = _postR
+        # R6 — retire: ids only, dry run archives nothing, the kept channels are refused, a real run records first
+        callsR6 = []
+        infoR6 = {"CA": "alerts", "CM": "mem", "CS": "website", "CU": "lessons-updates", "CO": "myrepo-dashboard-cd34",
+                  "CLOG": LL, "CX": "out-of-reach", "CZ": "gone-already", "CT": threads_name(CTL), "CML": "box-mail",
+                  "CS2": "spare-updates"}
+        def apiR6(m, tok, **kw):
+            callsR6.append((m, kw.get("channel")))
+            if m == "conversations.info":
+                if kw["channel"] == "CNOTREAL":
+                    raise RuntimeError("channel_not_found")
+                return {"channel": {"name": infoR6[kw["channel"]], "num_members": 2, "is_member": kw["channel"] != "CX",
+                                    "is_archived": kw["channel"] == "CZ"}}
+            return {}
+        globals()["api"] = apiR6
+        globals()["home_windows"] = lambda: {"website": "claude", "lessons": "claude"}
+        fresh_retired({})
+        save_members({"mem": {"chan": "mem", "chan_id": "CM", "updates": "mem-updates", "updates_id": "CMU"}})
+        save_orchs({"CO": {"target": "myrepo", "alias": "dashboard", "name": "myrepo-dashboard-cd34"}})
+        with contextlib.redirect_stdout(io.StringIO()) as outR6, contextlib.redirect_stderr(io.StringIO()) as errR6:
+            rcName = cmd_retire(["#lessons-updates"])
+            rcDry = cmd_retire(["CU", "CO", "--dry-run"])
+            dryCalls = [m for m, _ in callsR6 if m == "conversations.archive"]
+            rcKeep = cmd_retire(["CA", "CM", "CS"])
+            rcReal = cmd_retire(["CU", "CO"])
+        arch = [c for m, c in callsR6 if m == "conversations.archive"]
+        check("R6 retire: a name is refused (ids only); --dry-run archives nothing; #alerts, a member's channel and a "
+              "channel a live seat routes to are refused; a real run archives exactly the ids given — a live seat's "
+              "-updates twin included — records each first and marks an orch entry archived so it never routes again",
+              (rcName, rcDry, rcKeep, rcReal) == (2, 0, 1, 0) and dryCalls == [] and arch == ["CU", "CO"]
+              and set(load_retired()) == {"CU", "CO"} and load_orchs()["CO"].get("archived")
+              and "alerts: refused" in errR6.getvalue() and "live seat website" in errR6.getvalue())
+        # R6c — a destination that cannot take posts archives nothing, dry run included; the mail channel and the
+        # control repo's -threads lane are kept by rule
+        callsR6.clear()
+        globals()["load_cfg"] = lambda: dict(cfgR, MAIL_CHANNEL="#box-mail")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errR6c:
+            rcBad = [cmd_retire(["CS2", "--to", d]) for d in ("CNOTREAL", "CX", "CZ", "CU", "#nosuch")]
+            rcBadDry = cmd_retire(["CS2", "--to", "CNOTREAL", "--dry-run"])
+            rcKept = cmd_retire(["CT", "CML"])
+        check("R6c retire refuses before any record or archive when its destination does not exist, lacks the bot, is "
+              "archived, is retired, or has no such name — and so does --dry-run; #<control>-threads and the mail "
+              "channel are refused as kept",
+              rcBad == [1] * 5 and rcBadDry == 1 and rcKept == 1
+              and not [1 for m, _ in callsR6 if m == "conversations.archive"] and set(load_retired()) == {"CU", "CO"}
+              and "nothing archived" in errR6c.getvalue() and errR6c.getvalue().count("kept by rule") == 2)
+        globals()["load_cfg"] = lambda: dict(cfgR)
+        # R6b — an archive Slack refuses leaves the channel live, so its record is taken back and its posts stay put
+        infoR6["CF"] = "myrepo-fails"
+        def apiR6b(m, tok, **kw):
+            if m == "conversations.archive":
+                raise RuntimeError("not_in_channel")
+            return apiR6(m, tok, **kw)
+        globals()["api"] = apiR6b
+        with contextlib.redirect_stdout(io.StringIO()) as outR6b, contextlib.redirect_stderr(io.StringIO()):
+            rcFail = cmd_retire(["CF"])
+        check("R6b retire: when Slack refuses the archive, the record written first is rolled back (the channel is live, "
+              "so a post to it must not detour) and the run exits 1",
+              rcFail == 1 and "CF" not in load_retired() and set(load_retired()) == {"CU", "CO"}
+              and "could NOT archive" in outR6b.getvalue())
+        # R7 — a self-landing repo's PR card goes to the log lane when it has no twin, never back to #approvals
+        globals()["self_lands"] = lambda cfg, repo: True
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG"}.get(name)
+        laneR7 = card_lane(cfgR, "myrepo")
+        globals()["resolve_channel"] = lambda cfg, name: {LL: "CLOG", "myrepo-updates": "CMYU"}.get(name)
+        save_members({})
+        laneR7s = card_lane(cfgR, "myrepo")                # a #myrepo-updates the box never recorded: squatted
+        save_members({"mem": {"chan": "mem", "updates": "myrepo-updates", "updates_id": "CMYU"}})
+        laneR7b = card_lane(cfgR, "myrepo")
+        check("R7 a self-landing repo's card with no -updates twin goes to the log lane, not #approvals; with a twin on "
+              "record, the twin; a twin name the box never recorded is no twin, so the log lane",
+              laneR7 == ("CLOG", LL) and laneR7b == ("CMYU", "myrepo-updates") and laneR7s == ("CLOG", LL))
+        # R7t — a track root never opens in a squatted twin: #<repo> instead; in a recorded one (the box's own), there
+        save_table(TRACKS, {}); save_members({})
+        globals()["resolve_channel"] = lambda cfg, name: {"myrepo": "CREPO", "myrepo-updates": "CMYU"}.get(name)
+        postedR7t = []
+        globals()["post"] = lambda cfg, cid, text, **kw: postedR7t.append(cid) or (1, f"3.{len(postedR7t)}")
+        open_track_thread(cfgR, "myrepo/sq1", "squat")
+        save_members({"keep": {"updates": "myrepo-updates", "updates_id": "CMYU"}})
+        open_track_thread(cfgR, "myrepo/own1", "own")
+        globals()["post"] = _postR; save_members({}); save_table(TRACKS, {})
+        check("R7t a track root goes to #<repo> when its -updates name is not on record (a member could hold it and "
+              "reach the track's session through its thread), and to the twin when it is the box's own",
+              postedR7t == ["CREPO", "CMYU"])
+        # R8 — a track thread stored in a channel since retired is dead: track_thread says None and a new thread opens in #<repo>
+        save_table(TRACKS, {"myrepo/t1": {"chat": "CDEAD", "ts": "1.1"}})
+        fresh_retired({"CDEAD": {"name": "myrepo-updates", "to": "CLOG", "at": 1}})
+        globals()["resolve_channel"] = lambda cfg, name: {"myrepo": "CREPO"}.get(name)
+        postedR8 = []
+        globals()["post"] = lambda cfg, cid, text, **kw: postedR8.append((cid, text)) or ("1", "2.2")
+        deadR8 = track_thread("myrepo/t1")
+        openR8 = open_track_thread(cfgR, "myrepo/t1", "a title")
+        check("R8 a track thread stored in a retired channel is None, and open_track_thread opens a new one in #<repo>",
+              deadR8 is None and openR8 == ("CREPO", "2.2") and [c for c, _ in postedR8] == ["CREPO"]
+              and track_thread("myrepo/t1") == ("CREPO", "2.2"))
+        # R8b — a root rerouted off a channel archived by hand (its id still cached) records the channel it landed in
+        save_table(TRACKS, {})
+        def postR8b(cfg, cid, text, landed=None, **kw):
+            landed is not None and landed.update(chat="CLOG", name="myrepo", rerouted=cid)
+            return 1, "7.7"
+        globals()["post"] = postR8b
+        openR8b = open_track_thread(cfgR, "myrepo/t2", "another")
+        check("R8b a track root that post() rerouted off an archived channel is recorded with the channel its ts is in",
+              openR8b == ("CLOG", "7.7") and load_track_threads()["myrepo/t2"]["chat"] == "CLOG")
+    finally:
+        globals()["api"], globals()["resolve_channel"], globals()["load_cfg"] = _apiR, _rcR, _lcR
+        globals()["post"], globals()["self_lands"], globals()["home_windows"] = _postR, _slR, _hwR
+        globals()["sender_name"] = _snR
+        shutil.rmtree(SENT_DIR, ignore_errors=True); globals()["SENT_DIR"] = _sdR
+        for f in (RETIRED, ORCHS, MEMBERS, TRACKS, "channels.json"):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f"{DIR}/{f}")
     check("the channel-server INSTRUCTIONS no longer keep a style text of their own: the slogan lines sessions were "
           "copying the voice of are gone, and how to write is the one block's to say (its own case is above)",
           not any(w.lower() in INSTRUCTIONS.lower() for w in (
@@ -6505,10 +6908,124 @@ def run_selfcheck():
               and [lane_split(n) for n in ("myrepo", "myrepo-updates", "myrepo--w1", APPROVALS, ALERTS, "")]
               == [True, False, False, False, False, False])
         namesP["CUPD"] = "myrepo-updates"; namesP["CUPD2"] = "nosuchrepo-updates"; namesP["CTRKU"] = "myrepo--w1-updates"
-        check("route: #<repo>-updates is the SAME session as #<repo> — the second lane, not a session of its own; a "
-              "`<name>-updates` channel whose base is NOT a project still gets its own dir like any other channel",
+        # the twins the box recorded (own_twin): the bot is in them (channels.json) and members.json names their ids
+        json.dump({"_t": time.time(), "myrepo-updates": "CUPD", "myrepo--w1-updates": "CTRKU"}, open(f"{DIR}/channels.json", "w"))
+        twinsP = {"twinrec": {"updates": "myrepo-updates", "updates_id": "CUPD"},
+                  "twinrec2": {"updates": "myrepo--w1-updates", "updates_id": "CTRKU"}}
+        save_members(twinsP)
+        check("route: a recorded #<repo>-updates is the SAME session as #<repo> — the second lane, not a session of its "
+              "own; a `<name>-updates` channel whose base is NOT a project still gets its own dir like any other channel",
               (dmP.route("CUPD", "channel"), dmP.route("CUPD2", "channel"), dmP.route("CTRKU", "channel"))
               == ("myrepo", "nosuchrepo-updates", "myrepo/w1"))
+        # SQUATTED: twins are no longer reserved, so a member can make #myrepo-updates, invite the bot and talk. With
+        # no record the name proves nothing: it must not reach the owner's myrepo session, nor provision a dir.
+        save_members({})
+        check("route: a #<repo>-updates (or #<repo>--<track>-updates) the box never recorded — anyone can make one now — "
+              "routes to no session at all, never #<repo>'s",
+              (dmP.route("CUPD", "channel"), dmP.route("CTRKU", "channel")) == (None, None))
+        # RENAMED MEMBER TWIN: alice's recorded #alice-updates, renamed by her to #myrepo-updates, keeps its id. An id on
+        # record under ANOTHER name is not this lane's twin, or her channel would talk into the owner's myrepo session.
+        save_members({"alice": {"updates": "alice-updates", "updates_id": "CUPD"}})
+        check("route: a member's recorded twin id that now carries #<repo>-updates (recorded under her own name) "
+              "routes to no session, and own_twin does not count it for <repo>",
+              dmP.route("CUPD", "channel") is None and own_twin(dmP.cfg, "myrepo") is None)
+        # TWINS THE BOX MADE (twins.json): backfilled ONCE, while the file does not exist, from conversations.list:
+        # `creator` == the bot's own user id and a -updates name. The payload is Slack's real shape: conversations.list
+        # carries no previous_names for these channels, so nothing here has one
+        _apiTW, chansTW, authTW, madeTW = globals()["api"], [], [], []
+        def apiTW(method, token, **kw):
+            if method == "auth.test":
+                authTW.append(token)
+                return {"user_id": "UBOTTW"}
+            if method == "conversations.list":
+                return {"channels": [dict(c, is_member=True) for c in chansTW]}
+            if method == "conversations.create":
+                madeTW.append(kw.get("name"))
+                return {"channel": {"id": "CMADE"}}
+            return {}
+        globals()["api"] = apiTW
+        BOT_ME.clear(); save_members({})
+        def rebuildTW(*chans):
+            chansTW[:] = list(chans)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f"{DIR}/channels.json")
+            resolve_channel(dmP.cfg, "myrepo-updates")
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f"{DIR}/{TWINS}")
+            # the box's own twin is seeded by the backfill and routes to its repo; beside it, an -updates channel
+            # someone else made is not seeded
+            rebuildTW({"id": "CUPD", "name": "myrepo-updates", "creator": "UBOTTW"},
+                      {"id": "COTH", "name": "other-updates", "creator": "UMEMBER"})
+            twTW = load_table(TWINS)
+            check("seed_twins: the backfill records a #<repo>-updates the bot itself created (creator == auth.test "
+                  "user_id, no previous_names in the payload) under its name, and it routes as #<repo>'s second lane",
+                  twTW.get("CUPD", {}).get("name") == "myrepo-updates"
+                  and dmP.route("CUPD", "channel") == "myrepo" and authTW == ["xoxb-test"])
+            check("seed_twins: the backfill skips an -updates channel someone else made; it does not count as its "
+                  "repo's twin",
+                  set(twTW) == {"CUPD"} and own_twin(dmP.cfg, "other") is None)
+            # the backfill runs once: a second rebuild with a new bot-made -updates channel adds nothing
+            rebuildTW({"id": "CUPD", "name": "myrepo-updates", "creator": "UBOTTW"},
+                      {"id": "CNEWU", "name": "newrepo-updates", "creator": "UBOTTW"})
+            check("seed_twins: the backfill runs once; a later rebuild adds no channel to twins.json",
+                  set(load_table(TWINS)) == {"CUPD"} and own_twin(dmP.cfg, "newrepo") is None)
+            # a member's own channel the bot made (#alice), renamed by her to #myrepo-updates after the backfill, is
+            # never seeded, so her channel does not talk into the owner's myrepo session
+            save_table(TWINS, {}); namesP["CALI"] = "myrepo-updates"
+            rebuildTW({"id": "CALI", "name": "myrepo-updates", "creator": "UBOTTW"})
+            check("seed_twins: a bot-made member channel renamed to #<repo>-updates after the backfill is not seeded "
+                  "and routes to no session",
+                  "CALI" not in load_table(TWINS) and dmP.route("CALI", "channel") is None
+                  and own_twin(dmP.cfg, "myrepo") is None)
+            # an empty twins.json is the backfill done: even a bot-made twin is not added by a rebuild
+            rebuildTW({"id": "CUPD", "name": "myrepo-updates", "creator": "UBOTTW"})
+            check("seed_twins: an existing, empty twins.json means the backfill is done, and a rebuild seeds nothing",
+                  load_table(TWINS) == {} and dmP.route("CUPD", "channel") is None)
+            # a seeded twin renamed: #alice-updates (the bot made it) is renamed #myrepo-updates; its record keeps the
+            # old name and the rebuild does not re-seed it under the new one
+            save_table(TWINS, {"CUPD": {"name": "alice-updates", "at": "2026-10-01T00:00:00Z"}})
+            rebuildTW({"id": "CUPD", "name": "myrepo-updates", "creator": "UBOTTW"})
+            check("seed_twins: a twin the box made and recorded, renamed to #<repo>-updates, is not re-seeded under "
+                  "the new name and routes to no session",
+                  load_table(TWINS).get("CUPD", {}).get("name") == "alice-updates"
+                  and dmP.route("CUPD", "channel") is None)
+            # record_twin: an -updates lane ensure_channel creates is recorded under the name it was made with, once
+            # the file exists; before then nothing is written, so the backfill still runs and seeds it
+            save_table(TWINS, {}); chansTW[:] = []; madeTW.clear()
+            ensure_channel(dmP.cfg, "fresh-updates"); ensure_channel(dmP.cfg, "fresh")
+            check("record_twin: ensure_channel creating #<x>-updates records it in twins.json under that name; "
+                  "creating a channel with any other name records nothing",
+                  madeTW == ["fresh-updates", "fresh"]
+                  and set(load_table(TWINS)) == {"CMADE"}
+                  and (load_table(TWINS).get("CMADE") or {}).get("name") == "fresh-updates")
+            os.unlink(f"{DIR}/{TWINS}")
+            ensure_channel(dmP.cfg, "fresh-updates")
+            check("record_twin: before the backfill has run (no twins.json) a created twin writes no file, so the "
+                  "one-time backfill is not skipped",
+                  not os.path.exists(f"{DIR}/{TWINS}"))
+            _replTW, tmpTW = os.replace, []
+            def replTW(a, b):
+                tmpTW.append(os.path.basename(a)); return _replTW(a, b)
+            os.replace = replTW
+            try:
+                save_table(TWINS, {"X": {"name": "x"}})
+                with contextlib.suppress(TypeError):
+                    save_table(TWINS, {"X": {"bad": object()}})      # json.dump fails half-way
+            finally:
+                os.replace = _replTW
+            check("save_table: the temp file is named for this process and thread, so two writers never share one, and "
+                  "a write that fails leaves no temp file and the old table intact",
+                  tmpTW == [f"{TWINS}.{os.getpid()}.{threading.get_ident()}.tmp"]
+                  and not [f for f in os.listdir(DIR) if f.startswith(TWINS) and f.endswith(".tmp")]
+                  and load_table(TWINS) == {"X": {"name": "x"}})
+        finally:
+            globals()["api"] = _apiTW
+            BOT_ME.clear()
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f"{DIR}/{TWINS}")
+            json.dump({"_t": time.time(), "myrepo-updates": "CUPD", "myrepo--w1-updates": "CTRKU"}, open(f"{DIR}/channels.json", "w"))
+        save_members(twinsP)
         check("lane_of: the tag says which lane a message arrived on, and only a real sibling counts as one",
               (lane_of("myrepo-updates", "myrepo"), lane_of("#myrepo-updates", "myrepo"), lane_of("myrepo", "myrepo"),
                lane_of("nosuchrepo-updates", "nosuchrepo-updates"), lane_of("myrepo--w1-updates", "myrepo/w1"))
@@ -6631,6 +7148,9 @@ def run_selfcheck():
         check("inbound on the -updates lane reaches the SAME target as the main channel, with the lane in the tag "
               "(lane=updates / lane=main) so a reply can go back to where it was asked",
               lanesP == [("myrepo", "#myrepo-updates", "updates"), ("myrepo", "#myrepo", "main"), ("box", "dm", "main")])
+        for f in (MEMBERS, "channels.json", TWINS):  # the recorded twins above were this block's own fixture
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f"{DIR}/{f}")
         delivP.clear(); saidP.clear()                # the provisioning cases below count what THEY delivered and said
         evP = lambda chat, text, ts, ct="channel": {"type": "message", "channel": chat, "ts": ts, "user": "UOWNER",
                                                     "text": text, "channel_type": ct}
@@ -10079,6 +10599,7 @@ def run_selfcheck():
         for d_ in madeW:
             os.makedirs(f"{DEV}/{d_}")
         homeW = dmA.cfg.pop("MAIL_HOME")
+        globals()["load_members"] = kept_twins(("C-PROJU", "proj-updates"))   # proj's twin is on record; a name alone no longer counts
         msaid.clear(); mhanded.clear()
         mail_write("W1", to=["proj@box.example"], subject="fwd: the invoice", **{"from": "boss@allowed.example"})
         resW1, saidW1, handW1 = dmA.take_mail("W1"), list(msaid), list(mhanded)
@@ -10109,6 +10630,13 @@ def run_selfcheck():
               and resW4["to"] == ["#box"] and rootW4)
         check("own forward: `move #proj` of his own mail opens its new thread in #proj-updates, first char '_'",
               movedW and [c for c, _, _, _ in saidW5] == ["C-PROJU"] and saidW5[0][2].startswith("_email from "))
+        globals()["load_members"] = REAL_LOAD_MEMBERS
+        msaid.clear(); mhanded.clear()                      # …the same mail once #proj-updates is a name nobody recorded
+        mail_write("W6", to=["proj@box.example"], subject="fwd: the receipt", **{"from": "boss@allowed.example"})
+        resW6, saidW6 = dmA.take_mail("W6"), list(msaid)
+        check("own forward: a #proj-updates the box never recorded (a member could have made it) never gets his mail: "
+              "it stays top level in #proj",
+              resW6["routed"] and resW6["to"] == ["#proj"] and [(c, t) for c, t, _, _ in saidW6] == [("C-PROJ", None)])
         for k in addW:
             del mchans[k]
         for v in addW.values():

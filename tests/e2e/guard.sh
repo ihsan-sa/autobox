@@ -190,10 +190,10 @@ MP=('Bash|{"command":"sudo apt install x"}' 'Bash|{"command":"gh pr merge 1"}' '
     'Bash|{"command":"docker run -v /:/host alpine"}' 'Bash|{"command":"cat ~/.claude/.credentials.json"}'
     'Bash|{"command":"head -1 ~/ccbox/env"}'
     'Bash|{"command":"cc slack off"}' 'Bash|{"command":"cc slack mkchannel help"}'
-    'Bash|{"command":"cc-slack updates-sweep"}'
+    'Bash|{"command":"cc-slack updates-sweep"}' 'Bash|{"command":"cc-slack retire C0123ABC"}'
     "Read|{\"file_path\":\"$GH/.cc/config\"}" "Edit|{\"file_path\":\"$GH/member-probe.txt\"}")
 miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 2 ] || miss="$miss ${probe#*|}"; done
-[ -z "$miss" ] && ok "member-facing marker denies all 16 probes (merge/host, dispatch, secrets, containers, credentials, Slack wiring incl. updates-sweep, edit outside)" || bad "member gate misses:$miss"
+[ -z "$miss" ] && ok "member-facing marker denies all 17 probes (merge/host, dispatch, secrets, containers, credentials, Slack wiring incl. updates-sweep and retire, edit outside)" || bad "member gate misses:$miss"
 # ...and a session refused mkchannel must be able to get a channel WITHOUT the owner: the working path is the member
 # typing `new project <name>` in the workspace channel (cc-slack's daemon makes it). A session that does not know that
 # escalates to a person for something the box does by itself — which is what happened at 18:50Z on 2026-09-02.

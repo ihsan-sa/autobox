@@ -442,6 +442,69 @@ class Select(unittest.TestCase):
         # the class lists still decide: an added file on the gate-first list is gate-first
         self.assertEqual(P.select(self.m, ["core/bin/guard"], added=["core/bin/guard"]).klass, T.GATE_FIRST)
 
+    def test_code_no_check_runs_on_is_paid_so_it_is_read(self):
+        # finding 10-04: fund#2 landed with "plan checks [], results {}, review_key ''" — a repo with no manifest
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = os.path.join(d.name, "fund")
+        os.mkdir(root)
+        with mock.patch.dict(os.environ, {"CC_DEV": d.name}):   # $CC_DEV/fund: a checkout the host made
+            bare = self.bare_repo(root)
+        p = P.select(bare, ["collectors/old.py", "collectors/new.py", "README.md"], added=["collectors/new.py"])
+        self.assertEqual(bare.checks, {})
+        self.assertEqual((p.checks, p.extra["tip"], p.paid, p.extra.get("ungated")), ([], [], True, True))
+        p = P.select(bare, ["collectors/new.py"], added=["collectors/new.py"])   # add-only: still nothing runs
+        self.assertTrue(p.paid)
+        # padding: a change that also touches tests/reach.tsv selects manifest-widen, which reads no code
+        p = P.select(bare, ["collectors/new.py", "tests/reach.tsv"], added=["collectors/new.py"])
+        self.assertEqual((p.checks, p.paid), ([M.BUILTIN], True))
+        # kept paid: changed data (it may be read by code), and code added among data
+        self.assertTrue(P.select(bare, ["collectors/table.csv"]).paid)
+        self.assertTrue(P.select(bare, ["data/x.csv", "lib/run.py"], added=["data/x.csv", "lib/run.py"]).paid)
+        self.assertTrue(P.select(bare, ["config/x.json"], added=["config/x.json"]).paid)   # loaded by place
+        # perms 10-12: inert()'s two guards bound the exemption. Each of these is added data or prose by its
+        # extension, but something loads it by place or name (loads_by_nothing) or it instructs (NOT_PROSE): read.
+        for f in (".github/workflows/ci.yml", ".mcp.json", "tests/fixtures/x.json", "lib/REVIEW.md"):
+            p = P.select(bare, [f], added=[f])
+            self.assertEqual((p.paid, p.extra.get("ungated")), (True, True), f)
+        # kept unpaid: added data and assets, which no code is in (planning 10-12)
+        p = P.select(bare, ["data/x.csv", "assets/logo.png", "docs/a.md"], added=["data/x.csv", "assets/logo.png"])
+        self.assertEqual((p.checks, p.unowned, p.paid), ([], ["data/x.csv"], False))
+        self.assertNotIn("ungated", p.extra)
+        # kept unpaid: prose alone, which nothing unowned is in
+        p = P.select(bare, ["README.md", "docs/x.md"])
+        self.assertEqual((p.checks, p.unowned, p.paid), ([], [], False))
+        self.assertNotIn("ungated", p.extra)
+        # kept unpaid: a check runs on the change (owned, or widened to by the unowned path)
+        for files in (["core/bin/c"], ["home/x.sh"]):
+            p = self.sel(*files)
+            self.assertTrue(p.checks, files)
+            self.assertFalse(p.paid, files)
+            self.assertNotIn("ungated", p.extra, files)
+
+    def test_code_a_box_check_runs_after_the_merge_is_not_ungated(self):
+        # "no check runs on the change, before the merge or after it": the tip's box check is one after it
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = os.path.join(d.name, "fund")
+        os.mkdir(root)
+        with mock.patch.dict(os.environ, {"CC_DEV": d.name}):
+            bare = self.bare_repo(root)
+        files = ["collectors/old.py", "collectors/new.py"]
+        self.assertTrue(P.select(bare, files, added=["collectors/new.py"]).paid)   # suppressed: nothing runs
+        bare.checks["e2e"] = T.Check(name="e2e", run="true", paths=["collectors/old.py"], klass=T.BOX)
+        p = P.select(bare, files, added=["collectors/new.py"])
+        self.assertEqual((p.checks, p.extra["tip"], p.unowned), ([], ["e2e"], ["collectors/new.py"]))
+        self.assertEqual((p.paid, p.extra.get("ungated")), (False, None))
+
+    @staticmethod
+    def bare_repo(root):
+        git(root, "init", "-q")
+        write(root, {"collectors/old.py": "x = 1\n", "README.md": "fund\n"})
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "base")
+        return M.load(root, git(root, "rev-parse", "HEAD"))
+
     def test_the_class_order_protected_lander_gate_first(self):
         self.assertEqual(self.sel("core/lander/plan.py", "core/bin/guard").klass, T.LANDER)
         self.assertEqual(self.sel("core/lander/plan.py", protected=["core/lander/**"]).klass, T.PROTECTED)
@@ -473,6 +536,33 @@ class PlanOnGit(unittest.TestCase):
         self.assertIn("d", p.checks)
         self.assertIn(M.BUILTIN, p.checks)
         self.assertEqual(p.klass, T.LEAF)
+
+    def test_ungated_is_the_bases_word_not_a_check_the_head_adds(self):
+        # perms 10-12: "a plan-level probe with run='true' over ** went unpaid" — the head's own LANDING.toml
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        root = os.path.join(d.name, "fund")
+        os.mkdir(root)
+        with mock.patch.dict(os.environ, {"CC_DEV": d.name}):
+            git(root, "init", "-q")
+            write(root, {"collectors/old.py": "x = 1\n"})
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "base")
+            base = git(root, "rev-parse", "HEAD")
+            write(root, {"collectors/old.py": "x = 2\n"})
+            git(root, "commit", "-qam", "code")
+            code = git(root, "rev-parse", "HEAD")
+            write(root, {"tests/LANDING.toml": '[[check]]\nname = "probe"\nrun = "true"\npaths = ["**"]\n'})
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "probe")
+            probe = git(root, "rev-parse", "HEAD")
+            p = P.plan(root, base, code, P.changed(root, base, code))
+            self.assertEqual((p.paid, p.extra.get("ungated")), (True, True))   # control: nothing runs on it
+            files = P.changed(root, base, probe)
+            self.assertIn("probe", M.widen(M.load(root, base), M.load(root, probe, strict=False)).checks)
+            p = P.plan(root, base, probe, files)
+            self.assertIn("probe", p.checks)
+            self.assertEqual((p.paid, p.extra.get("ungated")), (True, True))
 
     def test_plan_on_a_head_that_removes_the_policy_is_lander_class(self):
         r = Repo(self)

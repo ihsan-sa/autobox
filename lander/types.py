@@ -132,7 +132,8 @@ class Record:
 class Plan(Record):
     """plan()'s answer. checks: the check names to run. owned: changed files some check owns. unowned: changed
     executable files nothing owns (they widen to the policy's default set, and the card names them). paid: the
-    change touches a paid_review path, so the lander buys a read when no recorded one exists."""
+    change touches a paid_review path, or is ungated (unowned code and no check at all), so the lander buys a read
+    when no recorded one exists."""
     checks: list = field(default_factory=list)
     owned: list = field(default_factory=list)
     klass: str = LEAF

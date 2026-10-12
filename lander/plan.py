@@ -30,7 +30,10 @@ GENERATED reach file: one where every edge the change adds is one `lander reach`
 and every edge it drops is one it does not, so the change follows from the code and lands with it; an edge the code
 does not make, or a change git cannot prove, stays lander, and a working copy proves nothing) > gate-first
 > docs (every file prose) > wide (some path unowned, bar an add-only change's quiet ones) > leaf.
-paid: some file matches paid_review.
+paid: some file matches paid_review, or UNGATED: some unowned path is code (anything but an added data or asset file,
+inert()) and no check bar manifest-widen runs on the change, before the merge or after it (a repo with no manifest of
+its own and no host fallback, or an add-only change nothing owns). Such a change is read instead of landing on
+nothing, and extra["ungated"] says why it was paid.
 
     lander plan [--repo DIR] [--manifest FILE] BASE [HEAD]    (no HEAD: the working copy; prints the Plan as JSON)
 """
@@ -45,6 +48,8 @@ from lander import reach as R
 from lander import types as T
 
 PROSE_EXT = (".md", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
+DATA_EXT = (".json", ".csv", ".tsv", ".txt", ".yaml", ".yml", ".toml", ".xml", ".parquet", ".ico", ".woff",
+            ".woff2", ".ttf", ".mp3", ".wav", ".mp4")
 PROSE_DIRS = ("docs/**", "core/docs/**")
 NOT_PROSE = ("core/templates/**", "templates/**", "home/**", "core/config/**", "config/**", "**/agents/**",
              "**/REVIEW.md")
@@ -67,6 +72,13 @@ def is_prose(path: str) -> bool:
     if M.match(NOT_PROSE, path):
         return False
     return M.match(PROSE_DIRS, path) or path.lower().endswith(PROSE_EXT)
+
+
+def inert(path: str, added=()) -> bool:
+    """An added file that is not code: data or an asset (DATA_EXT, or prose's extensions outside the instruction
+    paths) in a place nothing loads by place or name. An ungated change made only of these, and prose, is not read."""
+    return (path in added and loads_by_nothing(path) and not M.match(NOT_PROSE, path)
+            and path.lower().endswith(DATA_EXT + PROSE_EXT))
 
 
 def tool_name(path: str) -> str:
@@ -146,22 +158,37 @@ def select(m: M.Manifest, files: list, protected=(), added=(), generated=()) -> 
         tip = {n for n in names if n in m.checks and m.checks[n].klass == T.BOX}
         names -= tip
     extra = {"tip": sorted(tip), "reached": dict(sorted(reached.items()))}
+    # finding 10-04 (raised-member-pr-lands-with-no-checks): fund#2 "merged ... about 4 seconds after it was queued"
+    # with "plan checks [], results {}, review_key ''" because the repo has no check map. Code that no check runs on,
+    # before the merge or after it, is read instead: the plan is paid, so the lane buys a review.
+    # planning 10-12: "add-only files that aren't code (docs, data, assets) need no paid read, but any unowned code
+    # path, added or changed, does". manifest-widen is padding here: it reads the manifest, never the code.
+    ungated = any(not inert(f, added) for f in unowned) and not (names - {M.BUILTIN}) and not tip
+    if ungated:
+        extra["ungated"] = True
     if quiet:
         extra["add_only"] = quiet
     if faults:
         extra["faults"] = faults
     return T.Plan(checks=sorted(names), owned=owned, unowned=unowned, klass=klass,
-                  paid=any(M.match(pol.paid_review, f) for f in files), extra=extra)
+                  paid=ungated or any(M.match(pol.paid_review, f) for f in files), extra=extra)
 
 
 def plan(repo_root: str, base_sha: str, head_sha: str, files: list, protected=(), fallback: str = "") -> T.Plan:
     """Planner.plan. base_sha must carry a manifest that parses (else ManifestError); head_sha "" is the working
     copy. protected: the box's CC_PROTECTED_PATHS for this repo, which no tree may carry. fallback: a host manifest
-    for a repo that ships none."""
+    for a repo that ships none. Ungated code (select) is judged on the base's checks alone, never the head's."""
     base = M.load(repo_root, base_sha, fallback=fallback)
     head = M.load(repo_root, head_sha, fallback=fallback, strict=False)
-    return select(M.widen(base, head), list(files), protected, added_files(repo_root, base_sha, head_sha, files),
-                  generated_reach(repo_root, base_sha, head_sha, files))
+    files = list(files)
+    added = added_files(repo_root, base_sha, head_sha, files)
+    generated = generated_reach(repo_root, base_sha, head_sha, files)
+    p = select(M.widen(base, head), files, protected, added, generated)
+    # perms 10-12: "the lane can't build its plan from the PR's own head LANDING.toml". Whether code is ungated is
+    # the base's word: a check the head adds (run = 'true' over **) would otherwise make it look gated, and unpaid.
+    if not p.extra.get("ungated") and select(base, files, protected, added, generated).extra.get("ungated"):
+        p.paid, p.extra["ungated"] = True, True
+    return p
 
 
 def generated_reach(repo_root: str, base: str, head: str, files: list) -> set:

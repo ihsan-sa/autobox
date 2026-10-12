@@ -22,8 +22,8 @@ row); any other LAND-AFTER-FIX, and DO-NOT-LAND, is HANDBACK. Only comments the 
 (gh's viewerDidAuthor), as before: anyone can type a marker into a PR.
 
 WHEN A READ IS BOUGHT (review()). A recorded verdict at the digest (or the legacy digest, which kept the hunk
-tail) is returned as it is. Otherwise, a change that touches no paid-review path (job.plan.paid false) needs no
-read: LAND with model "" and extra read=none. Otherwise the lander buys one:
+tail) is returned as it is. Otherwise, a change the plan did not make paid (job.plan.paid false: no paid-review path, and
+some check runs on it, or it adds or changes no code nothing owns) needs no read: LAND with model "" and extra read=none. Otherwise the lander buys one:
   - the usage limit binds (`cc-limit status` exit 0) -> INCOMPLETE, no read counted, nothing posted; extra
     `until` (limit_until) says when to ask again, and the lane holds the job till then.
   - two reads already spent on this PR (the family: repo + PR number, so a push or a reopen does not reset it) ->
@@ -1358,7 +1358,7 @@ def would_read(job, comments):
     if recorded(comments, keys(job, diff_of(root_of(job), job.base_sha, job.head))):
         return False, "a verdict is already recorded for this change, and the landing reads that"
     if not (job.plan and job.plan.paid):
-        return False, "it touches no paid-review path, so nothing reads it"
+        return False, "it touches no paid-review path and no unchecked code, so nothing reads it"
     if reads_used(job.repo, job.pr) >= MAX_READS:
         return False, f"its {MAX_READS} reads are spent; record the verdict of a read you buy (`lander record`)"
     return True, "the landing reads it — do not buy a read of your own"
@@ -1374,7 +1374,8 @@ def cmd_will_review(argv):
         return 1
     try:
         from lander import plan as P   # U2's; without it the policy cannot be read, so say the lander reads it
-        job.plan = P.plan(root_of(job), job.base_sha, job.head, job.files)
+        from lander import manifest as MF   # the lane plans with the release's fallback; so does this
+        job.plan = P.plan(root_of(job), job.base_sha, job.head, job.files, fallback=MF.host_fallback(job.repo))
     except Exception:  # noqa: BLE001
         job.plan = T.Plan(paid=True)
     yes, why = would_read(job, facts.get("comments") or [])

@@ -1294,5 +1294,25 @@ class TestRecord(Case):
         self.assertEqual(box.called("gh pr comment"), [])
 
 
+class TestWillReview(unittest.TestCase):
+    def test_will_review_plans_with_the_host_fallback_as_the_lane_does(self):
+        # repair 10-12: without fallback= it planned the eight fallback repos as manifest-less and said WILL read
+        from unittest import mock
+        from lander import manifest as MF
+        from lander import plan as P
+        job = T.Job(repo="fund", pr=2, base_sha=BASE, head=HEAD, files=["a.py"])
+        seen = {}
+
+        def plan(*a, **kw):
+            seen.update(kw)
+            return T.Plan(paid=False)
+
+        with mock.patch.object(R, "_job_of", return_value=(job, {"comments": []})), \
+                mock.patch.object(MF, "host_fallback", return_value="/rel/landing-repos/fund.toml"), \
+                mock.patch.object(P, "plan", side_effect=plan), mock.patch.object(R, "diff_of", return_value=DIFF):
+            self.assertEqual(R.cmd_will_review(["fund", "2"]), 1)
+        self.assertEqual(seen.get("fallback"), "/rel/landing-repos/fund.toml")
+
+
 if __name__ == "__main__":
     unittest.main()
