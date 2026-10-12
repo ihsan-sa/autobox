@@ -2,11 +2,18 @@
 """cc-room — does the box have room for one more headless worker, and a queue for the launch when it has not.
 
   cc-room check                     exit 0 there is room · 1 there is not, and the one line on stdout says why
-  cc-room admit <repo/track> [--log FILE] -- CMD…
+  cc-room admit <repo/track> [--log FILE] [--resume ENTRY] -- CMD…
                                     wait until there is room and this launch is the oldest one waiting, take a
                                     slot, then exec CMD — the same pid, so the slot is held exactly as long as
                                     CMD runs and frees itself when it exits. Nobody retypes a queued launch.
-  cc-room status                    the slots held and the launches queued
+  cc-room cancel <repo/track>       drop that launch from the queue: its waiting admit finds the tombstone on its next
+                                    poll and exits 0 without running CMD. Nothing is killed. exit 1 when none is queued
+  cc-room resume                    relaunch each launch a restart left behind (LOST, below) in a tmux window of its
+                                    own, in its old place in the queue. cc-reconcile's tick runs it every 20 min
+  cc-room heavy [--name L] [--log FILE] -- CMD
+                                    a CPU-heavy tool run (annealing, SPICE, routing): wait for one of CC_HEAVY_CAP heavy
+                                    slots, then exec CMD in a user scope that competes as one block (HEAVY, below)
+  cc-room status                    the slots held, the launches queued and the ones lost in a restart
   cc-room selfcheck
 
 ROOM MEANS ALL THREE; the first two are cc-config keys (the environment wins, as it does for every key):
@@ -20,23 +27,66 @@ ROOM MEANS ALL THREE; the first two are cc-config keys (the environment wins, as
                               1-minute load average at LANDER_LOAD_FACTOR (2) times the cores or more. It is the
                               same call the lander serializes on, so while the box is overloaded new workers wait
                               and the landing queue gets the room the load frees as it drains.
-Nothing here reads the weekly limit, and nothing here stops or kills a thing that is already running.
+Nothing here reads the weekly limit. The one thing it ever ends is a tmux window `resume` itself opened, and only
+while every process in it is the `cc-room admit --resume` waiter that window was opened for, the shell line around
+it, or the idle shell it leaves behind: a launch that never started. Anything else in that window (the launch it
+went on to run, or a person's command) means the window is left alone, and so is a window it cannot read.
 
 WHY (2026-09-27): about 30 workers started inside an hour; load sat at 130-185 on 6 cores with swap full, the OOM
 killer ran 7 times and timed units failed one after another, while the five-hour window ran ahead of its clock.
 
 Only `cc <repo> <track> --go` calls `admit` (it wraps the loop's tmux window in it). Interactive seats and landings
 never pass through here, so they are never counted and never capped. A slot is a file under ~/.cc/state/room/slots
-(CC_ROOM_DIR) naming a pid and its start time; a waiting launch is a file under queue/. Both are cleared as soon as
-their process is gone. A loop started before this tool existed holds no slot, so it is not counted.
+(CC_ROOM_DIR) naming a pid and its start time; a waiting launch is a file under queue/. A slot is cleared as soon
+as its process is gone, and a queue entry is too unless a restart took it (LOST, below). A loop started before this tool existed holds no slot, so it is not counted.
 A paused project never gets here (`cc` refuses --go first), and a launch that waited through a pause is still
 refused by cc-loop's own `cc-pause is` check the moment it starts.
+
+LOST (2026-10-01: three owner-asked workers queued 2.5 h died with the 18:32Z tmux-main restart and nothing brought
+them back, because they had never started). A queue entry is JSON and carries what it takes to start the launch
+again: CMD, its cwd and log, the environment `cc … --go` carries into the window (RELAUNCH_ENV, an allow-list: no
+token rides along), its tmux session and window, and the tmux server it
+waits in, with its socket (the first field of $TMUX), so `resume` reaches that server and not the default one. A
+waiter that is gone while that server is ALIVE was ended on purpose (its window killed) — or the server is still on
+its way down in a restart, which ends the waiter first. So the entry waits CC_ROOM_GRACE seconds (300) out of the
+FIFO, the first sighting stamped in it, and goes only if the server is still up then. One whose server is gone too
+died with a restart: the entry stays, out of the FIFO so it holds nobody
+up, until `resume` starts `admit --resume <entry>` in a new window of the same name — same entry, same place, same
+queued-since — or a fresh `cc … --go` of the same track adopts it. A window of that name already open means someone
+started it by hand, and the entry goes instead. A window `resume` itself opened whose admit never wrote the entry is
+looked at first: holding only that waiter or its idle shell, it is closed and opened again; running anything else,
+the launch went ahead on its own, so the entry goes and the window stays; unreadable, both stay and the log says so.
+An `admit --resume` that fails open drops its entry before it runs CMD, so `resume` has nothing left to act on.
+`admit --resume` of an entry whose waiter is alive starts nothing: someone adopted it first. The saved environment
+goes to the window with `tmux new-window -e`, never into its command line. An entry nothing resumes in 7 days goes.
+`resume` does its tmux calls outside the room lock, one `resume` at a time, and re-reads an entry under the lock
+before it changes it, so a cancel or an adoption in between is never written over.
+
+NOTICE (2026-10-01: a light website worker sat 3 h behind "the box is busy" while the owner chased it twice). A
+launch queued CC_ROOM_NOTICE_AFTER seconds (cc-config, 3600) tells the seat that dispatched it, once: `cc-broker
+inject --source room` to `<repo>@<alias>` when an orch dispatched it (CC_SLACK_ALIAS, which `cc … --go` carries into
+the window), else `<repo>`; a broker that does not take it files a `cc-notify --ask` instead. The line says why it
+waits and how to cancel it. Delivered is kept in the entry apart from tried, so a restart does not repeat a notice
+that arrived and a failed one is not taken for one: both refused, it tries again CC_ROOM_NOTICE_RETRY seconds (300)
+later, doubling up to 6 h, NOTICE_TRIES times at most.
+
+HEAVY (2026-09-27: place_anneal ran at 4% CPU at load 160 beside ~20 sessions). `heavy` is FIFO over CC_HEAVY_CAP
+slots (cc-config, default a third of the cores, at least 1) and waits on nothing else: the load is the sessions',
+so waiting for it to fall would never end. The slot taken, CMD runs in a transient `systemd-run --user --scope`
+directly in app.slice with CPUWeight=CC_HEAVY_CPU_WEIGHT (1000). A weight only counts against siblings, and the
+sessions' tmux-spawn scopes sit directly in app.slice, so the run gets ten sessions' share of their CPU; the cap
+bounds how many such runs there are. lander.slice, a peer of app.slice, keeps the share landings had. Nothing
+system-level: a user scope, no unit file. With no user bus (or CC_HEAVY_SCOPE=0) it runs unscoped and says so in
+one line. Heavy runs take no worker slot.
+Env (tests): CC_ROOM_TMUX the tmux binary · CC_ROOM_BIN where cc-broker and cc-notify are.
 """
 # recurring-defect-ok: pause-hold-missing — cc refuses --go on a paused repo before admit, and cc-loop checks cc-pause as its first act
 import fcntl
 import glob
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -77,24 +127,106 @@ def starttime(pid):
         return None
 
 
+LOST_MAX = 7 * 86400
+# what a relaunch needs again, and nothing more: the keys `cc … --go` carries into the window (its `pre` list, which
+# the selfcheck holds this to), CC_CLAUDE it sets in front of the loop, and the knobs cc-room itself reads. An
+# allow-list, so a token that rides in the environment is never written into an entry or onto tmux's argv.
+RELAUNCH_ENV = ("CC_NOTIFY_LOG_ONLY", "CC_NOTIFY_LOG", "CC_LIMIT_STAMP", "CC_FAILURES", "CC_WORKER_SANDBOX",
+                "CC_EGRESS_ALLOW", "CC_WORKER_MODEL", "CC_LOOP_TRIM", "CC_SPEND_TIER", "CC_ROOM_DIR", "CC_WORKER_CAP",
+                "CC_WORKER_PACE_MARGIN", "LANDER_LOADAVG", "LANDER_PSI_DIR", "CC_SLACK_ALIAS", "CC_ORCH_REPO",
+                "CC_CLAUDE", "CC_CONFIG", "CC_STATUSLINE_DIR", "CC_ROOM_POLL", "CC_ROOM_NOTICE_AFTER", "CC_ROOM_NOTICE_RETRY",
+                "CC_ROOM_GRACE", "CC_ROOM_BIN", "CC_ROOM_TMUX")
+NOTICE_TRIES = 8
+SHELLS = ("sh", "bash", "dash", "zsh")
+
+
+def read_entry(p):
+    """an entry as a dict: JSON, or the older `pid start what` line; {} when unreadable"""
+    try:
+        raw = open(p).read()
+    except OSError:
+        return {}
+    try:
+        e = json.loads(raw)
+        if isinstance(e, dict):
+            return e
+    except ValueError:
+        pass
+    try:
+        pid, st, what = raw.split(" ", 2)
+        return {"pid": int(pid), "start": st, "what": what.strip()}
+    except ValueError:
+        return {}
+
+
+def alive(e):
+    return bool(e.get("pid")) and starttime(e["pid"]) == e.get("start")
+
+
+def lost(e):
+    """the waiter died with its tmux server — a restart, not a kill — and the entry can start it again"""
+    # the brief: "a launch waiting in cc-room survives a user-service restart" — a server gone is that restart
+    srv = e.get("server") or []
+    return (len(srv) == 2 and starttime(srv[0]) != srv[1] and bool(e.get("cmd"))
+            and time.time() - float(e.get("queued") or 0) < LOST_MAX)
+
+
+def server_up(e):
+    srv = e.get("server") or []
+    return len(srv) == 2 and starttime(srv[0]) == srv[1]
+
+
+def rewrite(p, e):
+    """an entry written again in place, 0600; the tmp is this process's own, so a concurrent writer's is never torn"""
+    tmp = f"{p}.{os.getpid()}.tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(e, f)
+    os.replace(tmp, p)
+
+
+def settling(p, e):
+    """a dead waiter whose tmux server is still up: a kill, or a restart whose server has not finished stopping (it
+    ends the waiter first). True while CC_ROOM_GRACE runs from the first sighting, stamped in the entry. Callers hold
+    the room lock, and the stamp goes on the entry as it is on disk now: one cancelled since e was read stays gone"""
+    if not (e.get("cmd") and server_up(e)):
+        return False
+    seen = float(e.get("dead_seen") or 0)
+    if not seen:
+        cur = read_entry(p)
+        if cur.get("pid") != e.get("pid") or cur.get("start") != e.get("start"):
+            return bool(cur)   # gone (a cancel): nothing to stamp; written again by its waiter: not ours to stamp
+        cur["dead_seen"] = e["dead_seen"] = time.time()
+        try:
+            rewrite(p, cur)
+        except OSError:
+            pass
+        return True
+    return time.time() - seen < float(os.environ.get("CC_ROOM_GRACE") or 300)
+
+
 def live(sub):
-    """{path: (pid, what)} of the entries in sub/ whose process is still the one that wrote them; the rest go."""
+    """{path: (pid, what)} of the entries in sub/ whose process is still the one that wrote them; a lost queue entry,
+    or one still settling, stays on disk but out of the answer, and the rest go."""
     out = {}
     for p in sorted(glob.glob(f"{room_dir()}/{sub}/*")):
         if p.endswith(".tmp"):   # another process's entry, half written
             continue
-        try:
-            pid, st, what = open(p).read().split(" ", 2)
-        except (OSError, ValueError):
-            pid, st, what = "", "", ""
-        if pid and starttime(pid) == st:
-            out[p] = (int(pid), what.strip())
-        else:
+        e = read_entry(p)
+        if e and alive(e):
+            out[p] = (int(e["pid"]), e.get("what", ""))
+        elif not (sub == "queue" and e and (lost(e) or settling(p, e))):
             try:
                 os.unlink(p)
             except OSError:
                 pass
     return out
+
+
+def lost_entries():
+    """{path: entry} of the queue entries a restart left behind"""
+    live("queue")   # clears the dead ones first
+    return {p: e for p in sorted(glob.glob(f"{room_dir()}/queue/*")) if not p.endswith(".tmp")
+            for e in [read_entry(p)] if e and not alive(e) and lost(e)}
 
 
 def five_hour(now):
@@ -136,12 +268,17 @@ def why_not(now=None):
     return ""
 
 
-def write_entry(sub, name, what):
+def write_entry(sub, name, what, extra=None):
+    """this process's entry: `pid start what` for a slot, JSON with the launch's own record for a queue entry"""
     os.makedirs(f"{room_dir()}/{sub}", exist_ok=True)
     p = f"{room_dir()}/{sub}/{name}"
     tmp = f"{p}.tmp"
-    with open(tmp, "w") as f:
-        f.write(f"{os.getpid()} {starttime(os.getpid())} {what}\n")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # a queue entry carries the launch's environment
+    with os.fdopen(fd, "w") as f:
+        if extra is None:
+            f.write(f"{os.getpid()} {starttime(os.getpid())} {what}\n")
+        else:
+            json.dump({**extra, "pid": os.getpid(), "start": starttime(os.getpid()), "what": what}, f)
     os.replace(tmp, p)
     return p
 
@@ -157,37 +294,144 @@ def logline(path, msg):
             pass
 
 
-def admit(what, cmd, log):
+class Lock:
+    def __enter__(self):
+        self.f = open(f"{room_dir()}/.lock", "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+def tmux(e=None):
+    """the tmux argv, pointed at the server entry e waits in when it saved one; an older entry has no socket and
+    gets the default server, as before"""
+    sock = (e or {}).get("socket")
+    return [os.environ.get("CC_ROOM_TMUX") or "tmux"] + (["-S", sock] if sock else [])
+
+
+def where():
+    """(server [pid, start], session, window, socket) of the tmux pane this runs in, all None outside tmux"""
+    t = os.environ.get("TMUX", "").split(",")
+    if len(t) < 2 or not t[1].isdigit() or not starttime(t[1]):
+        return None, None, None, None
+    sess, win = "main", None
+    try:
+        r = subprocess.run(tmux({"socket": t[0]}) + ["display-message", "-p", "-t", os.environ.get("TMUX_PANE", ""),   # $TMUX's server
+                            "#{session_name}\t#{window_name}"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and "\t" in r.stdout:
+            sess, win = r.stdout.rstrip("\n").split("\t", 1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return [t[1], starttime(t[1])], sess, win, t[0] or None
+
+
+def admit(what, cmd, log, resume=None):
     """Wait for room, then exec cmd. FAIL OPEN: any error on the way (a room dir it cannot write, a lock, a bad
     reading) runs cmd anyway with one line saying admission failed — a crash here would otherwise leave a queued
-    track that never runs and a window nobody reads."""
+    track that never runs and a window nobody reads. A cancelled launch is the one way out without cmd.
+    Failing open drops the queue entry first: CMD runs under this same pid, so an entry it left would read as a
+    waiter still queued at the head of the FIFO, and a resumed one as a launch `resume` should start again."""
+    mine = {}
     try:
-        wait_for_room(what, log)
+        if not wait_for_room(what, cmd, log, resume, mine=mine):
+            sys.exit(0)
     except Exception as e:   # noqa: BLE001 — every failure here is the same one: no admission, so start anyway
         logline(log, f"cc-room: admission failed for {what} ({type(e).__name__}: {e}); starting it anyway")
+        forget([mine.get("entry"), resume and f"{room_dir()}/queue/{os.path.basename(resume)}"], what, log)
     os.execvp(cmd[0], cmd)
 
 
-def wait_for_room(what, log):
+def forget(paths, what, log):
+    """unlink these queue entries and their tombstones, without the lock (it may be what failed): the launch is
+    about to run unadmitted, and nothing may later take it for one still waiting, or one a restart left behind"""
+    for p in filter(None, paths):
+        for x in (p, f"{room_dir()}/cancelled/{os.path.basename(p)}"):
+            try:
+                os.unlink(x)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logline(log, f"cc-room: could not drop {x} for {what} ({e}); `resume` will find this window "
+                             f"running something other than its waiter and leave it alone")
+
+
+def wait_for_room(what, cmd, log, resume=None, kind="worker", mine=None):
+    """-> True holding a slot, False cancelled. kind "worker" waits on why_not() in queue/, "heavy" on the heavy
+    cap in heavy-queue/; only a worker's entry is kept through a restart and only a worker's wait gives notice.
+    mine["entry"] is the queue entry once written, for a caller that fails open to drop."""
+    mine = {} if mine is None else mine
+    qsub, ssub = ("queue", "slots") if kind == "worker" else ("heavy-queue", "heavy")
     os.makedirs(room_dir(), exist_ok=True)
-    me = write_entry("queue", f"{time.time_ns()}-{os.getpid()}", what)
+    bound = cfg("CC_ROOM_NOTICE_AFTER", 3600)
+    with Lock():
+        if resume:   # relaunched by `resume`: the same entry, so the same place in the queue
+            name = os.path.basename(resume)
+            if not os.path.exists(f"{room_dir()}/{qsub}/{name}"):
+                logline(log, f"cc-room: {what} was cancelled while it was down; not starting it")
+                return False
+            if alive(read_entry(f"{room_dir()}/{qsub}/{name}")):   # a fresh `cc … --go` adopted it first
+                logline(log, f"cc-room: {what} is already waiting in another window; not starting it twice")
+                return False
+        else:        # a fresh `cc … --go` of a track a restart left queued takes over its place
+            name = next((os.path.basename(p) for p, e in (lost_entries() if kind == "worker" else {}).items()
+                         if e.get("what") == what), None) or f"{time.time_ns()}-{os.getpid()}"
+        old = read_entry(f"{room_dir()}/{qsub}/{name}")
+        rec = {"queued": old.get("queued") or time.time(), "noticed": bool(old.get("noticed")), "cmd": cmd,
+               "cwd": os.getcwd(), "log": log, "notice_tries": int(old.get("notice_tries") or 0),
+               "notice_next": float(old.get("notice_next") or 0)}
+        if kind == "worker":
+            server, sess, win, sock = where()
+            alias = os.environ.get("CC_SLACK_ALIAS", "")
+            repo = what.split("/", 1)[0]
+            rec.update(server=server, socket=sock, session=sess, window=win or what,
+                       env={k: os.environ[k] for k in RELAUNCH_ENV if k in os.environ},
+                       target=old.get("target") or (f"{repo}@{alias}" if alias else repo))
+        me = mine["entry"] = write_entry(qsub, name, what, rec)
     poll = float(os.environ.get("CC_ROOM_POLL") or 60)
+    retry = float(os.environ.get("CC_ROOM_NOTICE_RETRY") or 300)
     said, last = None, 0.0
     while True:
-        with open(f"{room_dir()}/.lock", "w") as lk:
-            fcntl.flock(lk, fcntl.LOCK_EX)
-            waiting = live("queue")
+        tell_now = False
+        with Lock():
+            if not os.path.exists(me):
+                tomb = f"{room_dir()}/cancelled/{name}"
+                if os.path.exists(tomb):
+                    os.unlink(tomb)
+                    logline(log, f"cc-room: {what} was cancelled from the queue; not starting it")
+                    return False
+                # gone with no tombstone: a waiter still running the older code read this JSON entry as a dead
+                # one and removed it (the deploy window) — write it again rather than take it for a cancel
+                write_entry(qsub, name, what, rec)
+            waiting = live(qsub)
             first = next(iter(waiting), me) == me   # FIFO: the oldest launch still waiting goes first
-            why = why_not() if first else ""
+            why = (why_not() if kind == "worker" else heavy_why()) if first else ""
             if first and not why:
-                write_entry("slots", str(os.getpid()), what)
+                write_entry(ssub, str(os.getpid()), what)
                 os.unlink(me)
                 if said is not None:
                     logline(log, f"cc-room: room now — {what} starts")
-                break
-        if not first:
-            ahead = list(waiting).index(me) if me in waiting else 0
-            why = f"{ahead} launch(es) queued ahead of it"
+                return True
+            if not first:
+                ahead = list(waiting).index(me) if me in waiting else 0
+                why = f"{ahead} launch(es) queued ahead of it"
+            # the brief: "tells the seat that dispatched it when it has waited past a bound" — once delivered, kept in
+            # the entry; a try is stamped before it is made, so a restart mid-try waits out its backoff too
+            if (kind == "worker" and not rec["noticed"] and time.time() - rec["queued"] >= bound
+                    and rec["notice_tries"] < NOTICE_TRIES and time.time() >= rec["notice_next"]):
+                rec["notice_tries"] += 1
+                rec["notice_next"] = time.time() + min(retry * 2 ** (rec["notice_tries"] - 1), 6 * 3600)
+                tell_now = True
+                write_entry(qsub, name, what, rec)
+        if tell_now:
+            if notice(what, rec, why, log):
+                rec["noticed"] = True
+            elif rec["notice_tries"] >= NOTICE_TRIES:
+                logline(log, f"cc-room: gave up telling anyone that {what} waits, after {NOTICE_TRIES} tries")
+            with Lock():
+                if os.path.exists(me):   # a cancel in between moved it away: never write it back
+                    write_entry(qsub, name, what, rec)
         # one line when the reason changes, and one an hour while it holds, so a long wait is seen and not re-logged
         if why != said or time.time() - last >= 3600:
             logline(log, f"cc-room: {what} queued — {why}")
@@ -195,11 +439,279 @@ def wait_for_room(what, log):
         time.sleep(poll)
 
 
+def ccboard():
+    """cc-board imported as a module beside THIS copy, for the fixture rule: asked, never copied (its selfcheck's tripwire)"""
+    if not hasattr(ccboard, "mod"):
+        import importlib.machinery
+        import importlib.util
+        s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader("ccboard", f"{BIN}/cc-board"))
+        ccboard.mod = importlib.util.module_from_spec(s)
+        s.loader.exec_module(ccboard.mod)
+    return ccboard.mod
+
+
+def test_namespace(what):
+    """a launch under a suite's scratch prefix (cc-board FIXTURE): it has no seat to tell. A cc-board that will not load
+    is not a reason to stay quiet, so the launch is then taken as real and its seat is told."""
+    try:
+        return what.startswith(ccboard().FIXTURE)
+    except Exception:
+        return False
+
+
+def notice(what, rec, why, log):
+    """-> True once someone has it: the broker took it, or cc-notify exited 0 (a test namespace has nobody to tell)"""
+    mins = int((time.time() - rec["queued"]) // 60)
+    line = (f"{what} has waited {mins // 60} h {mins % 60:02d} min in the worker queue and has not started: {why}. "
+            f"It starts on its own when there is room; `cc-room cancel {what}` drops it.")
+    if test_namespace(what):   # a suite's scratch namespace has no seat, and must not reach the box's broker
+        logline(log, f"cc-room: told nobody (a test namespace): {line}")
+        return True
+    b = os.environ.get("CC_ROOM_BIN") or BIN
+    how = ""
+    try:
+        r = subprocess.run(["timeout", "30", f"{b}/cc-broker", "inject", "--no-start", "--source", "room",
+                            rec["target"], line], capture_output=True, timeout=40)
+        how = rec["target"] if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not how:
+        stamp = time.strftime("%Y%m%dT%H%MZ", time.gmtime(rec["queued"]))
+        try:
+            r = subprocess.run([f"{b}/cc-notify", "--ask", "--id", f"room:{what}:{stamp}", "-t", f"{what} queued",
+                                line], capture_output=True, timeout=60)
+            how = "a planner request (cc-notify --ask)" if r.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if how:
+        logline(log, f"cc-room: told {how}: {line}")
+        return True
+    logline(log, f"cc-room: could not tell anyone that {what} waits (the broker and cc-notify both refused; "
+                 f"try {rec.get('notice_tries', 1)} of {NOTICE_TRIES})")
+    return False
+
+
+def proc_argv(pid):
+    """argv of pid, [] for a zombie or a kernel thread, None when it cannot be read"""
+    try:
+        return open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").split("\0")[:-1]
+    except OSError:
+        return None
+
+
+def tree(pid):
+    """pid and every process below it"""
+    kids = {}
+    for s in glob.glob("/proc/[0-9]*/stat"):
+        try:
+            kids.setdefault(int(open(s).read().rsplit(")", 1)[1].split()[1]), []).append(int(s.split("/")[2]))
+        except (OSError, IndexError, ValueError):
+            continue
+    out, todo = [], [int(pid)]
+    while todo:
+        x = todo.pop()
+        if x not in out:
+            out.append(x)
+            todo += kids.get(x, [])
+    return out
+
+
+def waiter_argv(a, name):
+    """a is the `cc-room admit --resume <name>` waiter `resume` started, the shell line around it, or the idle
+    shell that line ends in — and nothing it went on to run"""
+    if not a:
+        return False
+    sh = os.path.basename(a[0]).lstrip("-")
+    if sh in SHELLS and len(a) == 1:
+        return True
+    if sh in SHELLS and len(a) == 3 and a[1] == "-c":
+        try:
+            a = shlex.split(a[2])
+        except ValueError:
+            return False
+    i = next((i for i, x in enumerate(a) if os.path.basename(x) == "cc-room"), None)
+    return i is not None and a[i + 1:i + 4] == ["admit", "--resume", name]
+
+
+def window_state(tm, wid, name):
+    """what is in the window an earlier resume opened: "gone"; "waiter" when every process in it is its waiter
+    (waiter_argv); "running" when anything else is (the launch it ran, a person's command); None when unsure"""
+    try:
+        r = subprocess.run(tm + ["list-windows", "-a", "-F", "#{window_id}"], capture_output=True, text=True,
+                           timeout=10)
+        if r.returncode:
+            return None
+        if wid not in r.stdout.split():
+            return "gone"
+        r = subprocess.run(tm + ["list-panes", "-t", wid, "-F", "#{pane_pid}"], capture_output=True, text=True,
+                           timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pids = [x for x in r.stdout.split() if x.isdigit()]
+    if r.returncode or not pids:
+        return None
+    for pid in (x for pp in pids for x in tree(pp)):
+        a = proc_argv(pid)
+        if a is None and starttime(pid) is None:
+            continue   # it ended while we looked
+        if not a:
+            return None
+        if not waiter_argv(a, name):
+            return "running"
+    return "waiter"
+
+
+def resume():
+    """relaunch each lost entry in a new window of its tmux session; -> how many. One resume at a time; the tmux
+    calls run outside the room lock, and every change to an entry re-reads it under the lock first"""
+    n = 0
+    os.makedirs(room_dir(), exist_ok=True)
+    with open(f"{room_dir()}/.resume.lock", "w") as one:
+        try:
+            fcntl.flock(one, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("another cc-room resume is running")
+            return 0
+        with Lock():
+            todo = {p: e for p, e in lost_entries().items()
+                    if time.time() - float(e.get("relaunched") or 0) >= 600}   # else its admit has not written yet
+        for p, e in todo.items():
+            n += resume_one(p, e)
+    return n
+
+
+def resume_one(p, e):
+    what, sess = e.get("what", ""), e.get("session") or "main"
+    win, name, tm = e.get("window") or what, os.path.basename(p), tmux(e)
+
+    def drop(why):
+        with Lock():
+            if read_entry(p) == e:   # still the entry read, untouched by a cancel, an adoption or its own admit
+                os.unlink(p)
+        logline(e.get("log"), f"cc-room: dropped {what} from the queue: {why}")
+        print(f"dropped {what}: {why}")
+        return 0
+
+    try:
+        if subprocess.run(tm + ["has-session", "-t", sess], capture_output=True, timeout=10).returncode:
+            return 0   # its server is not back yet: the next tick tries again
+        opened = e.get("opened") or []
+        if len(opened) == 3 and opened[2] and starttime(opened[1]) == opened[2]:
+            # the window an earlier resume opened on this same server (a server never reuses a window id), and its
+            # admit never wrote the entry. Closed only while it holds nothing that started: see the header
+            state = window_state(tm, opened[0], name)
+            if state == "running":   # the admit failed open and ran the launch; never a second one, never a kill
+                return drop(f"its launch already runs in window {opened[0]}, which is left alone")
+            if state is None:
+                logline(e.get("log"), f"cc-room: {what} not relaunched: cannot tell what runs in window "
+                                      f"{opened[0]}, so it and the queue entry are left alone")
+                print(f"left {what}: cannot tell what runs in window {opened[0]}")
+                return 0
+            if state == "waiter":
+                with Lock():
+                    if read_entry(p) != e:
+                        return 0   # its admit wrote after all, or a cancel or an adoption came first
+                    subprocess.run(tm + ["kill-window", "-t", opened[0]], capture_output=True, timeout=10)
+        wins = subprocess.run(tm + ["list-windows", "-t", sess, "-F", "#{window_name}"],
+                              capture_output=True, text=True, timeout=10).stdout.splitlines()
+        if win in wins:
+            return drop(f"a window {win} is already open in {sess}")
+        # the environment rides on -e, not in the shell line: the line stays in the pane's argv all wait
+        env = [x for k, v in sorted((e.get("env") or {}).items()) if k in RELAUNCH_ENV
+               for x in ("-e", f"{k}={v}")]
+        line = (f"{shlex.join([f'{BIN}/cc-room', 'admit', '--resume', name] + (['--log', e['log']] if e.get('log') else []) + [what, '--'] + e['cmd'])}"
+                f"; echo; echo {shlex.quote('[worker finished — shell stays]')}; exec bash")
+        cwd = e.get("cwd") if os.path.isdir(e.get("cwd") or "") else HOME
+        r = subprocess.run(tm + ["new-window", "-d", "-P", "-F", "#{window_id} #{pid}", "-t", sess, "-n", win,
+                                 "-c", cwd] + env + [line], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as x:
+        print(f"could not relaunch {what}: {x}")
+        return 0
+    if r.returncode:
+        print(f"could not relaunch {what}: {r.stderr.strip()}")
+        return 0
+    wid, _, spid = r.stdout.strip().partition(" ")
+    with Lock():
+        cur = read_entry(p)
+        if cur == e:
+            e["relaunched"] = time.time()
+            e["opened"] = [wid, spid, starttime(spid)] if wid and spid.isdigit() else []
+            rewrite(p, e)
+        elif not alive(cur):   # cancelled or adopted while the window opened: its admit finds that and starts nothing
+            print(f"relaunched {what}, but its entry changed meanwhile; the new window starts nothing")
+            return 0
+        # else its admit already took the entry back: it is waiting again
+    logline(e.get("log"), f"cc-room: {what} relaunched after a restart, still queued in its old place")
+    print(f"resumed {what} in {sess}:{win}")
+    return 1
+
+
+def cancel(what):
+    """drop every queued entry of that launch, waiting or lost; -> how many. A waiting one moves to cancelled/,
+    the tombstone its waiter reads as the cancel and removes; a lost one has no waiter and just goes."""
+    n = 0
+    os.makedirs(f"{room_dir()}/cancelled", exist_ok=True)
+    with Lock():
+        for sub in ("queue", "heavy-queue"):
+            for p in glob.glob(f"{room_dir()}/{sub}/*"):
+                e = read_entry(p)
+                if p.endswith(".tmp") or e.get("what") != what:
+                    continue
+                if alive(e):
+                    os.replace(p, f"{room_dir()}/cancelled/{os.path.basename(p)}")
+                else:
+                    os.unlink(p)
+                n += 1
+    return n
+
+
+def heavy_cap():
+    return max(1, cfg("CC_HEAVY_CAP", max(1, (os.cpu_count() or 1) // 3)))
+
+
+def heavy_why():
+    held, cap = len(live("heavy")), heavy_cap()
+    return f"{held} heavy runs are going and the cap is {cap} (CC_HEAVY_CAP)" if held >= cap else ""
+
+
+def heavy_argv(label, cmd, scoped):
+    if not scoped:
+        return cmd
+    unit = f"heavy-{''.join(c if c.isalnum() else '-' for c in label)[:60]}-{os.getpid()}"
+    weight = cfg("CC_HEAVY_CPU_WEIGHT", 1000)
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--slice=app.slice", f"--unit={unit}",
+            "-p", f"CPUWeight={weight}", "--"] + cmd
+
+
+def heavy(label, cmd, log):
+    """a heavy slot, then exec cmd in its scope; fails open like admit"""
+    scoped, mine = False, {}
+    try:
+        if not wait_for_room(label, cmd, log, kind="heavy", mine=mine):
+            sys.exit(0)
+        scoped = os.environ.get("CC_HEAVY_SCOPE", "1") != "0" and admission.scope_available()
+        if not scoped:
+            logline(log, f"cc-room: {label} runs without its scope (no user systemd bus, or CC_HEAVY_SCOPE=0)")
+    except Exception as e:   # noqa: BLE001
+        logline(log, f"cc-room: heavy admission failed for {label} ({type(e).__name__}: {e}); starting it anyway")
+        forget([mine.get("entry")], label, log)   # else it heads the heavy FIFO for as long as CMD runs
+    argv = heavy_argv(label, cmd, scoped)
+    os.execvp(argv[0], argv)
+
+
 def status():
-    for p, (pid, what) in live("slots").items():
-        print(f"running {what} (pid {pid})")
-    for p, (pid, what) in live("queue").items():
-        print(f"queued  {what} (pid {pid})")
+    os.makedirs(room_dir(), exist_ok=True)
+    with Lock():   # its sweep removes and stamps entries: never between a cancel and the entry it read before it
+        for p, (pid, what) in live("slots").items():
+            print(f"running {what} (pid {pid})")
+        for p, (pid, what) in live("queue").items():
+            print(f"queued  {what} (pid {pid})")
+        for p, e in lost_entries().items():
+            print(f"lost    {e.get('what')} — its waiter died with a restart; `cc-room resume` starts it again")
+        for p, (pid, what) in live("heavy").items():
+            print(f"heavy   {what} (pid {pid})")
+        for p, (pid, what) in live("heavy-queue").items():
+            print(f"heavy queued {what} (pid {pid})")
     w = why_not()
     print("room: yes" if not w else f"room: no — {w}")
 
@@ -224,16 +736,26 @@ def main(a):
         return 0
     if a[:1] == ["selfcheck"]:
         return selfcheck()
-    if a[:1] == ["admit"] and "--" in a:
+    if a[:1] == ["resume"]:
+        resume()
+        return 0
+    if a[:1] == ["cancel"] and len(a) == 2:
+        n = cancel(a[1])
+        print(f"cancelled {a[1]}: its waiting launch exits on its next poll" if n else f"nothing queued for {a[1]}")
+        return 0 if n else 1
+    if a[:1] in (["admit"], ["heavy"]) and "--" in a:
         i = a.index("--")
         head, cmd = a[1:i], a[i + 1:]
-        log = None
-        if "--log" in head:
-            j = head.index("--log")
-            log = head[j + 1] if j + 1 < len(head) else None
-            head = head[:j] + head[j + 2:]
-        if len(head) == 1 and cmd:
-            admit(head[0], cmd, log)
+        opts = {}
+        for flag in ("--log", "--resume", "--name"):
+            if flag in head:
+                j = head.index(flag)
+                opts[flag] = head[j + 1] if j + 1 < len(head) else None
+                head = head[:j] + head[j + 2:]
+        if a[0] == "admit" and len(head) == 1 and cmd and "--name" not in opts:
+            admit(head[0], cmd, opts.get("--log"), opts.get("--resume"))
+        if a[0] == "heavy" and not head and cmd and "--resume" not in opts:
+            heavy(opts.get("--name") or os.path.basename(cmd[0]), cmd, opts.get("--log"))
     print(__doc__.split("\n\n")[0], file=sys.stderr)
     return 2
 
