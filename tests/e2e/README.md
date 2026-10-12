@@ -19,8 +19,10 @@ selfcheck, and one `e2e-<slug>` per file here. The class says where and when a c
 - `host` is today's run: on the host, with the environment scrubbed, serially per repo, before the merge. While
   the box is busy, a host check whose `where` names the laptop runs there instead, with a tmux `main` of its own;
   every e2e file and `check-sh` do. One that needs this box itself (its kernel, a working bwrap) keeps `["box"]`.
-- `hermetic` is for checks proven to pass in the lander's sandbox. None is yet, so every selfcheck and every
-  e2e file starts as `host` and moves only after that proof.
+- `hermetic` is for checks proven to pass in the lander's sandbox. Every existing selfcheck and every e2e file
+  started as `host` and moves only after that proof. A check that a change adds is the exception:
+  manifest-widen refuses a new check whose class is outside the sandbox, so it starts `hermetic` and must
+  pass there (`selfcheck-cc-watch` is one; its `tests/LANDING.toml` rows live in the lander-half PR #1092).
 
 `check-sh` is the whole of `tests/check.sh`, because its agent-frontmatter, unit and prefetch-window blocks cannot
 run on their own. It owns only the paths no narrower check covers.
@@ -98,6 +100,7 @@ run on their own. It owns only the paths no narrower check covers.
 | `py-compile-cc-time` | static | reads the file only: python compiles it |
 | `py-compile-cc-tmp-reap` | static | reads the file only: python compiles it |
 | `py-compile-cc-unfiled` | static | reads the file only: python compiles it |
+| `py-compile-cc-watch` | static | reads the file only: python compiles it (LANDING.toml row in #1092) |
 | `py-compile-cc-vitals` | static | reads the file only: python compiles it |
 | `py-compile-cc-voice` | static | reads the file only: python compiles it |
 | `py-compile-cc-wakes` | static | reads the file only: python compiles it |
@@ -166,6 +169,7 @@ run on their own. It owns only the paths no narrower check covers.
 | `selfcheck-cc-time` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-tmp-reap` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-unfiled` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
+| `selfcheck-cc-watch` | hermetic | fake curl, Slack and Cloudflare in a temp HOME; no network, no real state (LANDING.toml row in #1092) |
 | `selfcheck-cc-units` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-vitals` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-voice` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |

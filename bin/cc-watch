@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""cc-watch — a cheap watcher beside every permission the box grants itself, with the revert ready.
+
+    cc-watch add --name N --granted TEXT --check 'CMD' [--every 15m] [--revert 'CMD'|tell] [--expires ISO]
+                 --owner CHANNEL
+        Writes the watcher spec ~/.cc/watch/<N>.json ($CC_WATCH_DIR). The perms seat runs this beside each grant.
+    cc-watch run
+        Runs every watcher that is due, once. The box's <box>-watch.timer calls it every five minutes.
+    cc-watch list
+        One line per watcher: name, last verdict and reason, when it last ran, and whether it has expired.
+    cc-watch url <host> [--expect access|page|reachable] [--path /p]
+        The public-URL check, for a watcher's --check. Outsider: an unauthenticated GET gets what was asked for
+        (access: a 302 to Cloudflare Access; page: a 200; reachable: anything under 500) over valid TLS. Exposure:
+        /.git/HEAD, /.git/config and /.env are not served, and / and up to five same-host pages it links to (query
+        string kept; a 500's body is read too) carry no directory listing, server traceback or secret-shaped string. Traffic: through the Cloudflare GraphQL
+        API, the last hour's requests to the host against the hour average of the six before, the scanner paths
+        hit and the share of 4xx and 5xx. Traffic only ever WARNs: a stranger can send scanner paths at will, so
+        letting them reach BAD would hand anyone the revert. A token that cannot read zone analytics makes the
+        traffic part say "no analytics scope" and count as OK, quietly (the Cloudflare tool's owner ping on a 403 is
+        switched off here), so the other two still decide. Exposure runs for access watchers too.
+    cc-watch selfcheck
+
+A SPEC is JSON: name, granted (what was granted, in words), check (a shell command), every (seconds), revert (a
+shell command, or "tell" when the grant predates watchers or undoing it is a person's call), expires (ISO UTC to the
+minute, like 2026-12-01T00:00Z, or null) and owner (the granting seat's Slack channel). Specs are read from ~/.cc/watch and from the repo's
+config/watch ($CC_WATCH_SHIPPED), which holds the watchers for the public hosts that predate this tool.
+
+A CHECK exits 0 for OK, 1 for WARN and 2 for BAD, and its last line of output is the reason. Any other exit, or
+no answer inside two minutes, is a WARN that names it.
+
+ALERTS fire on a change of verdict, once: OK is silent and clears the record. A WARN posts to the owner's
+channel. A BAD runs the revert (never a second time until the watcher has been OK again) and posts to #alerts
+with the reason and what the revert did. A WARN post that fails is tried again on the next due run; a BAD post
+that fails is queued, behind any earlier one, and tried on every run until it lands, whatever the watcher says meanwhile; the revert is never
+run again. An expired watcher is skipped and its spec left in place. A spec that cannot be read (a bad `every` or
+`expires`) is named on stderr and skipped; the other watchers still run. One run at a time: a run that finds
+another holding the state dir's .lock exits 0 and does nothing. No model is ever called. State is
+~/.cc/watch/state/<name>.json ($CC_WATCH_STATE): outside ~/.cc/state, which a member sandbox may bind, and a run
+refuses a state dir that is a symlink, not its own, or open to group or others (it must be 0700), and opens the lock
+without following a symlink. The spool is held to the same rule, because each spec is a shell command: a run skips
+a spool that fails it (the shipped specs still run), and `add` refuses to write into one. `add` refuses an --every
+or --expires it cannot read with one line on stderr.
+"""
+import datetime
+import fcntl
+import glob
+import html.parser
+import importlib.machinery
+import json
+import os
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+SPOOL = os.environ.get("CC_WATCH_DIR") or os.path.join(HOME, ".cc", "watch")
+SHIPPED = os.environ.get("CC_WATCH_SHIPPED") or os.path.join(os.path.dirname(os.path.dirname(BIN)), "config", "watch")
+STATE = os.environ.get("CC_WATCH_STATE") or os.path.join(SPOOL, "state")
+ALERTS = "#" + (os.environ.get("SLACK_ALERTS") or "alerts")
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}\.)+[a-z]{2,}")
+CODES = {0: "OK", 1: "WARN", 2: "BAD"}
+CHECK_TIMEOUT = 120
+# cc-lib's TOKEN_SHAPE (what the knowledge base refuses to store), plus the shapes a leaked .env tends to carry.
+SECRET = re.compile(r"ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|xox[abprs]-[A-Za-z0-9-]{10,}|"
+                    r"sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|"
+                    r"sk_live_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}")
+LISTING = re.compile(r"<title>\s*(Index of /|Directory listing for)", re.I)
+TRACEBACK = re.compile(r"Traceback \(most recent call last\)|Werkzeug Debugger|<b>Fatal error</b>|"
+                       r"at [a-z]+(\.[A-Za-z0-9_$]+)+\([A-Za-z0-9_]+\.java:\d+\)|Exception in thread \"|"
+                       r"node:internal/|DEBUG = True|Whoops! There was an error", re.I)
+SCANNER = ["/wp-admin", "/wp-login.php", "/.env", "/phpmyadmin", "/.git/config", "/xmlrpc.php", "/admin.php",
+           "/vendor/phpunit", "/cgi-bin/", "/.aws/credentials", "/server-status"]
+SPIKE = 5.0          # an hour over five times the six-hour average is a spike,
+SPIKE_FLOOR = 300    # once it is more than this many requests (a quiet site doubling from 3 to 15 is nothing)
+ERROR_SHARE = 0.5    # 4xx+5xx over half of the hour's requests (with at least SPIKE_FLOOR of them)
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def stamp(t):
+    return t.strftime("%Y-%m-%dT%H:%MZ")
+
+
+def parse_every(v):
+    m = re.fullmatch(r"(\d+)([smhd]?)", str(v))
+    if not m:
+        raise ValueError(f"--every {v!r} is not a number of seconds or like 15m, 1h")
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def parse_when(v):
+    """An ISO UTC stamp to the minute (2026-12-01T00:00Z), the resolution stamp() prints; None for none."""
+    if not v:
+        return None
+    return datetime.datetime.strptime(v.rstrip("Z"), "%Y-%m-%dT%H:%M").replace(tzinfo=datetime.timezone.utc)
+
+
+# ---- the framework ----
+
+def specs():
+    """Every spec, by name. The spool wins over a shipped spec of the same name, so a seat can override one."""
+    got = {}
+    dirs = [SHIPPED]
+    if os.path.lexists(SPOOL):
+        try:
+            dirs.append(own_dir(SPOOL))
+        except PermissionError as e:   # a spec is a shell command, so a spool anyone else can write is never read
+            print(f"cc-watch: skipped the spool: {e}", file=sys.stderr)
+    for d in dirs:
+        for p in sorted(glob.glob(os.path.join(d, "*.json"))):
+            try:
+                with open(p) as fh:
+                    s = json.load(fh)
+            except (OSError, ValueError) as e:
+                print(f"cc-watch: skipped {p}: {e}", file=sys.stderr)
+                continue
+            if not isinstance(s, dict) or not NAME_RE.fullmatch(str(s.get("name", ""))) or not s.get("check"):
+                print(f"cc-watch: skipped {p}: no name or check", file=sys.stderr)
+                continue
+            got[s["name"]] = s
+    return got
+
+
+def load_state(name):
+    try:
+        with open(os.path.join(STATE, name + ".json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def own_dir(path):
+    """path, made 0700 if absent; raises when it is a symlink, not ours, or open to anyone else."""
+    if not os.path.lexists(path):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    s = os.lstat(path)
+    if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.geteuid() or s.st_mode & 0o077:
+        raise PermissionError(f"{path} must be a directory of our own with mode 0700 "
+                              f"(it is {stat.filemode(s.st_mode)}, uid {s.st_uid})")
+    return path
+
+
+def state_dir():
+    """The state dir, held to own_dir()'s rules, and the spool first when it sits there (the default), so the
+    spool it creates is 0700 too and not refused by the next specs()."""
+    if os.path.dirname(os.path.abspath(STATE)) == os.path.abspath(SPOOL):
+        own_dir(SPOOL)
+    return own_dir(STATE)
+
+
+def save_state(name, st):
+    state_dir()
+    fd, tmp = tempfile.mkstemp(dir=STATE, prefix="." + name)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(st, fh, indent=1)
+    os.replace(tmp, os.path.join(STATE, name + ".json"))
+
+
+def run_check(cmd):
+    """(verdict, reason) for one check command."""
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=CHECK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "WARN", f"the check gave no answer in {CHECK_TIMEOUT}s"
+    lines = [ln for ln in (p.stdout or "").splitlines() if ln.strip()]
+    reason = lines[-1].strip()[:400] if lines else ""
+    if p.returncode in CODES:
+        return CODES[p.returncode], reason
+    err = (p.stderr or "").strip().splitlines()
+    return "WARN", f"the check could not run (exit {p.returncode}): {(err[-1] if err else reason)[:300]}"
+
+
+def post(channel, pid, text):
+    try:
+        return subprocess.run(["cc-slack", "post", "-c", channel, "--id", pid, text],
+                              capture_output=True, text=True, timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def step(s, st, t):
+    """One due run of one watcher; returns its new state. The only place verdicts turn into alerts."""
+    name = s["name"]
+    verdict, reason = run_check(s["check"])
+    st.update(last=t.timestamp(), verdict=verdict, reason=reason)
+    if verdict == "OK":
+        # "OK is silent": the record clears, so the next WARN or BAD is a new episode and is told again. An unsent
+        # BAD post (st["unsent"]) is not part of that record: a revert that ran is still told.
+        st.update(told=None, pending=None, reverted=False, revert_note=None)
+        return st
+    if verdict == "BAD" and not st.get("reverted"):
+        # "BAD runs the revert", once: marked before anything else can fail, so a crash never runs it twice.
+        st["reverted"] = True
+        revert = s.get("revert") or "tell"
+        if revert == "tell":
+            st["revert_note"] = "not reverted: this grant is the owner's to undo, so look at it"
+        else:
+            save_state(name, st)
+            try:
+                r = subprocess.run(revert, shell=True, capture_output=True, text=True, timeout=CHECK_TIMEOUT)
+                st["revert_note"] = f"reverted with `{revert}` (exit {r.returncode})"
+            except subprocess.TimeoutExpired:
+                st["revert_note"] = f"the revert `{revert}` gave no answer in {CHECK_TIMEOUT}s"
+    if st.get("told") == verdict:
+        return st
+    episode = int(st.get("episode") or 0) + (0 if st.get("pending") == verdict else 1)
+    st.update(episode=episode, pending=verdict)
+    what = f"watcher {name} ({s.get('granted') or 'no description'})"
+    if verdict == "WARN":
+        if post(s.get("owner") or ALERTS, f"watch:{name}:{episode}:WARN", f"⚠️ {what}: {reason}"):
+            st.update(told=verdict, pending=None)
+        return st
+    # A BAD post is owed until it lands: it joins the queue st["unsent"], which flush() tries on every run, so a
+    # second BAD while Slack is down queues behind the first rather than replacing it.
+    st.update(told=verdict, pending=None, unsent=owed(st) + [{
+        "channel": ALERTS, "id": f"watch:{name}:{episode}:BAD",
+        "text": f"🚨 {what}: {reason}. {st.get('revert_note') or ''}".strip()}])
+    flush(st)
+    return st
+
+
+def owed(st):
+    """The BAD posts this watcher still owes, oldest first (a state written before the queue holds one dict)."""
+    u = st.get("unsent") or []
+    return [u] if isinstance(u, dict) else list(u)
+
+
+def flush(st):
+    """Send the BAD posts this watcher still owes, in order, stopping at the first that fails; True when none is
+    owed afterwards."""
+    q = owed(st)
+    while q and post(q[0]["channel"], q[0]["id"], q[0]["text"]):
+        q.pop(0)
+    st["unsent"] = q or None
+    return not q
+
+
+def cmd_run(argv):
+    try:
+        # O_NOFOLLOW and no O_TRUNC: a .lock planted as a symlink fails here and its target is never touched.
+        lock = os.open(os.path.join(state_dir(), ".lock"), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        print(f"cc-watch: refusing to run: {e}", file=sys.stderr)
+        return 1
+    try:
+        # One run at a time, so a manual run beside the timer's can never run a revert twice.
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("cc-watch: another run holds the lock; nothing done", file=sys.stderr)
+        return 0
+    t = now()
+    for name, s in specs().items():
+        try:
+            run_one(name, s, t)
+        except Exception as e:   # noqa: BLE001 — one bad spec must not stop the watchers after it
+            print(f"cc-watch: {name}: skipped: {type(e).__name__}: {e}", file=sys.stderr)
+    return 0
+
+
+def run_one(name, s, t):
+    st = load_state(name)
+    if st.get("unsent"):   # owed whatever the check says next, so it goes before the expiry and due tests
+        flush(st)
+        save_state(name, st)
+    exp = parse_when(s.get("expires"))
+    every = parse_every(s.get("every") or 900)
+    # Stamps are minutes, so the expiry minute itself counts as expired: "2026-12-01T00:00Z" runs no check at 00:00:30.
+    if exp and t >= exp:
+        if not st.get("expired"):
+            st["expired"] = stamp(t)
+            save_state(name, st)
+        return
+    if t.timestamp() - float(st.get("last") or 0) < every:
+        return
+    save_state(name, step(s, st, t))
+
+
+def cmd_list(argv):
+    for name, s in specs().items():
+        st = load_state(name)
+        last = stamp(datetime.datetime.fromtimestamp(st["last"], datetime.timezone.utc)) if st.get("last") else "never"
+        tail = f"  expired {st['expired']}" if st.get("expired") else ""
+        print(f"{name:28} {st.get('verdict') or '-':4} {last}  {st.get('reason') or ''}{tail}")
+    return 0
+
+
+def cmd_add(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="cc-watch add")
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--granted", required=True)
+    ap.add_argument("--check", required=True)
+    ap.add_argument("--every", default="15m")
+    ap.add_argument("--revert", default="tell")
+    ap.add_argument("--expires")
+    ap.add_argument("--owner", required=True)
+    a = ap.parse_args(argv)
+    if not NAME_RE.fullmatch(a.name):
+        print("cc-watch: a name is lowercase letters, digits, '.', '_' and '-'", file=sys.stderr)
+        return 2
+    try:
+        every, expires = parse_every(a.every), parse_when(a.expires)
+    except ValueError as e:
+        print(f"cc-watch add: {e}", file=sys.stderr)
+        return 2
+    spec = {"name": a.name, "granted": a.granted, "check": a.check, "every": every,
+            "revert": a.revert, "expires": stamp(expires) if expires else None, "owner": a.owner}
+    try:
+        own_dir(SPOOL)
+    except PermissionError as e:
+        print(f"cc-watch add: {e}", file=sys.stderr)
+        return 2
+    with open(os.path.join(SPOOL, a.name + ".json"), "w") as fh:
+        json.dump(spec, fh, indent=1)
+    print(os.path.join(SPOOL, a.name + ".json"))
+    return 0
+
+
+# ---- the public-URL kit ----
+
+def curl(url, body_file):
+    """(status, location, curl exit) for one unauthenticated GET that does not follow redirects. -g: a fetched link
+    like /[1-99999] is a path, never a curl range."""
+    try:
+        p = subprocess.run(["curl", "-sS", "-g", "-o", body_file, "-m", "20", "--max-filesize", "2000000",
+                            "-A", "cc-watch/1 (outsider check)", "-w", "%{http_code} %{redirect_url}", url],
+                           capture_output=True, text=True, timeout=40)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0, "", -1
+    parts = (p.stdout or "").split(" ", 1)
+    try:
+        return int(parts[0]), (parts[1] if len(parts) > 1 else "").strip(), p.returncode
+    except ValueError:
+        return 0, "", p.returncode
+
+
+def read_body(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(2_000_000).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+class Links(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.hrefs += [v for k, v in attrs if k == "href" and v]
+
+
+def is_access(status, location):
+    """Cloudflare Access's own login redirect, https://<team>.cloudflareaccess.com/cdn-cgi/access/login/<app>: the
+    host and the path both, so a redirect that only mentions either (a lookalike host, a same-host path, a query
+    string) is not taken for it."""
+    if status not in (301, 302, 303, 307):
+        return False
+    u = urllib.parse.urlsplit(location.strip())
+    host = (u.hostname or "").lower()
+    return (u.scheme == "https" and host.endswith(".cloudflareaccess.com") and host != ".cloudflareaccess.com"
+            and u.path.startswith("/cdn-cgi/access/login/"))
+
+
+def outsider(host, expect, path, tmp):
+    """[(level, reason)] for what an outsider gets from https://host/path."""
+    status, loc, rc = curl(f"https://{host}{path}", os.path.join(tmp, "root"))
+    if rc in (35, 51, 58, 59, 60, 77, 83, 90, 91):
+        return [(2, f"TLS is not valid (curl exit {rc})")]
+    if rc != 0 or not status:
+        return [(1, f"no answer (curl exit {rc})")]
+    if expect == "access":
+        if is_access(status, loc):
+            return [(0, "Access login as expected")]
+        if status == 200:
+            return [(2, "served a page with no Access login in front")]
+        return [(1, f"expected an Access login, got HTTP {status}")]
+    if expect == "page":
+        return [(0, "HTTP 200")] if status == 200 else [(1, f"expected a page, got HTTP {status}")]
+    return [(0, f"HTTP {status}")] if status < 500 else [(1, f"HTTP {status}")]
+
+
+def exposure(host, path, tmp):
+    found = []
+    for probe, tell in (("/.git/HEAD", lambda b: b.startswith("ref:") or re.fullmatch(r"[0-9a-f]{40}\s*", b)),
+                        ("/.git/config", lambda b: "[core]" in b),
+                        ("/.env", lambda b: re.search(r"(?m)^[A-Z_][A-Z0-9_]*=\S", b) and "<html" not in b.lower())):
+        f = os.path.join(tmp, "probe")
+        status, _, _ = curl(f"https://{host}{probe}", f)
+        if status == 200 and tell(read_body(f)):
+            found.append(f"{probe} is served")
+    pages = [path]
+    status, _, _ = curl(f"https://{host}{path}", os.path.join(tmp, "page0"))
+    first = read_body(os.path.join(tmp, "page0")) if status in (200, 500) else ""   # a 500 can carry a traceback
+    links = Links()
+    try:
+        links.feed(first)
+    except Exception:   # noqa: BLE001 — a page that does not parse only loses its links
+        pass
+    for h in links.hrefs:
+        u = urllib.parse.urlsplit(urllib.parse.urljoin(f"https://{host}{path}", h))
+        p = (u.path or "/") + (f"?{u.query}" if u.query else "")   # the query string is kept: it can pick the page
+        if u.scheme == "https" and u.hostname == host and p not in pages and len(pages) < 6:
+            pages.append(p)
+    for i, p in enumerate(pages):
+        shown = p.split("?", 1)[0] + ("?…" if "?" in p else "")   # a query can carry a token: never into state or Slack
+        if i:
+            status, _, _ = curl(f"https://{host}{p}", os.path.join(tmp, f"page{i}"))
+            body = read_body(os.path.join(tmp, f"page{i}")) if status in (200, 500) else ""
+        else:
+            body = first
+        if LISTING.search(body):
+            found.append(f"{shown} is a directory listing")
+        if TRACEBACK.search(body):
+            found.append(f"{shown} shows a server traceback")
+        if SECRET.search(body):
+            found.append(f"{shown} carries a secret-shaped string")   # never the string itself
+    return [(2, "; ".join(found))] if found else [(0, "nothing exposed")]
+
+
+def cloudflare():
+    """The box's Cloudflare tool (<box>-cloudflare on PATH, or $CC_WATCH_CF), loaded as a module so its token
+    handling is the only one."""
+    box = os.environ.get("CC_BOX") or socket.gethostname().split(".")[0]
+    path = os.environ.get("CC_WATCH_CF") or shutil.which(f"{box}-cloudflare")
+    if not path:
+        return None
+    return importlib.machinery.SourceFileLoader("cfwatch", path).load_module()
+
+
+def traffic(host):
+    try:
+        cf = cloudflare()
+    except Exception as e:   # noqa: BLE001
+        return [(1, f"traffic not read: the Cloudflare tool did not load ({type(e).__name__})")]
+    if cf is None:
+        return [(0, "traffic not read: no Cloudflare tool on this box")]
+    # The brief: a token without analytics scope makes this say "no analytics scope", quietly. The tool's api()
+    # pings the owner on every 403, which would page him each time the card lapses, so that ping is off here.
+    cf.ping_permission_needed = lambda scope: None
+    zone = ".".join(host.split(".")[-2:])
+    t = now().replace(second=0, microsecond=0)
+    span = lambda a, b: (f'{{datetime_geq: "{(t - datetime.timedelta(hours=a)).strftime("%Y-%m-%dT%H:%M:%SZ")}", '
+                         f'datetime_lt: "{(t - datetime.timedelta(hours=b)).strftime("%Y-%m-%dT%H:%M:%SZ")}", '
+                         f'clientRequestHTTPHost: $h')
+    paths = ", ".join(json.dumps(p) for p in SCANNER)
+    query = ("query($z: string!, $h: string!) { viewer { zones(filter: {zoneTag: $z}) { "
+             f"hour: httpRequestsAdaptiveGroups(limit: 100, filter: {span(1, 0)}}}) "
+             "{ count dimensions { edgeResponseStatus } } "
+             f"before: httpRequestsAdaptiveGroups(limit: 1, filter: {span(7, 1)}}}) {{ count }} "
+             f"scan: httpRequestsAdaptiveGroups(limit: 1, filter: {span(1, 0)}, clientRequestPath_in: [{paths}]}}) "
+             "{ count } } } }")
+    try:
+        r = cf.api("POST", "/graphql", "Zone > Analytics > Read",
+                   {"query": query, "variables": {"z": cf.zone_id(zone), "h": host}})
+    except SystemExit:
+        return [(1, "traffic not read: the Cloudflare tool stopped (its own line says why)")]
+    except Exception as e:   # noqa: BLE001 — ApiError, or anything else; its text is never printed
+        if getattr(e, "status", None) == 403:
+            return [(0, "no analytics scope")]
+        return [(1, f"traffic not read ({type(e).__name__} {getattr(e, 'status', '')})".strip())]
+    errs = " ".join(str(x.get("message", "")) + str((x.get("extensions") or {}).get("code", ""))
+                    for x in (r.get("errors") or []) if isinstance(x, dict)).lower()
+    if errs:
+        if "authz" in errs or "not authorized" in errs or "does not have access" in errs:
+            return [(0, "no analytics scope")]
+        return [(1, "traffic not read: the analytics query was refused")]
+    try:
+        z = r["data"]["viewer"]["zones"][0]
+        groups = z.get("hour") or []
+        hour = sum(int(g.get("count") or 0) for g in groups)
+        errors = sum(int(g.get("count") or 0) for g in groups
+                     if int((g.get("dimensions") or {}).get("edgeResponseStatus") or 0) >= 400)
+        base = sum(int(g.get("count") or 0) for g in z.get("before") or []) / 6
+        scan = sum(int(g.get("count") or 0) for g in z.get("scan") or [])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return [(1, "traffic not read: the answer had no zone in it")]
+    out = []
+    if hour >= SPIKE_FLOOR and hour > SPIKE * max(base, 1):
+        out.append((1, f"{hour} requests in the last hour against {base:.0f} an hour before"))
+    if scan:   # WARN only, however many: anyone can send these, so they must never be able to trigger a revert
+        out.append((1, f"{scan} scanner-path requests in the last hour"))
+    if hour >= SPIKE_FLOOR and errors > ERROR_SHARE * hour:
+        out.append((1, f"{errors} of {hour} requests in the last hour were 4xx or 5xx"))
+    return out or [(0, f"traffic normal ({hour} requests in the last hour)")]
+
+
+def cmd_url(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="cc-watch url")
+    ap.add_argument("host")
+    ap.add_argument("--expect", choices=("access", "page", "reachable"), default="page")
+    ap.add_argument("--path", default="/")
+    a = ap.parse_args(argv)
+    if not HOST_RE.fullmatch(a.host) or not a.path.startswith("/"):
+        print("cc-watch url: a host is like www.example.com and a path starts with /")
+        return 3
+    with tempfile.TemporaryDirectory(prefix="cc-watch-url-") as tmp:
+        # Access watchers are probed too: an Access policy that leaves /.git or /.env out is exactly the leak.
+        results = outsider(a.host, a.expect, a.path, tmp) + exposure(a.host, a.path, tmp)
+        results += traffic(a.host)
+    worst = max(lv for lv, _ in results)
+    print("; ".join(r for lv, r in results if lv == worst or worst == 0))
+    return worst
+
+
+def selfcheck(*a, **k):
+    """The cases are core/tests/selfcheck/cc-watch.py, run in THIS namespace. Defining them replaces this one."""
+    path = os.path.join(os.path.dirname(BIN), "tests", "selfcheck", "cc-watch.py")
+    with open(path) as fh:
+        exec(compile(fh.read(), path, "exec"), globals())
+    return globals()["selfcheck"](*a, **k)
+
+
+def main(argv):
+    verbs = {"run": cmd_run, "list": cmd_list, "add": cmd_add, "url": cmd_url, "selfcheck": lambda _: selfcheck()}
+    if not argv or argv[0] not in verbs:
+        print(__doc__)
+        return 2
+    return verbs[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

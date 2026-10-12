@@ -154,3 +154,4 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc-docs link <number> [--kind private --to A | --kind public]   the link a PDF goes out as (signed-in by default);
                                          `file` and `cc-mail send` turn a filed PDF into it and refuse an unfiled one
     cc-unfiled [--hours 24] [--to F]     PDFs built lately that look finished but are not filed; a daily timer runs it
+    cc-watch add|run|list|url            a watcher beside each self-granted permission; a user timer runs it
