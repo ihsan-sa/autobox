@@ -385,6 +385,40 @@ EOS
   k "$(t test "$(cat "$D/stA.log" "$D/stB.log" 2>/dev/null)" = "")" "…and no stopped check ever finished"
   rm -rf "$D2"
 
+  # 18b START AND STOP IN TWO OF A WORKER'S BASH CALLS. Each call is a signal scope of its own (cc-nosignal-shell), so
+  # the stop's call can neither read the run's environment nor signal it: the stop asks, and the run ends itself.
+  if "$BIN/cc-nosignal" probe >/dev/null 2>&1; then
+    D2=$(mktemp -d); R=$(newrepo stC 120)
+    ( cd "$R" && CC_GREEN_DIR="$D2" CC_GREEN_SCOPE=0 timeout 20 "$BIN/cc-nosignal-shell" "$SELF start" >/dev/null 2>&1 )
+    for _ in $(seq 100); do [ -s "$D/stC.pid" ] && break; sleep 0.1; done
+    gpid=$(head -1 "$D/stC.pid"); GDIR=$D2 lock_files "$R"; p2=$(status_field pid)
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$BIN/cc-nosignal-shell" "test -r /proc/$p2/environ && : < /proc/$p2/environ" 2>&1 ); rc=$?
+    k "$(t test "$rc" -ne 0)" "a second Bash call cannot read the run's environment (the control: why stop must ask)"
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" timeout 60 "$BIN/cc-nosignal-shell" "$SELF stop" 2>&1 ); rc=$?
+    k "$(t test "$rc" -eq 0 -a -n "$(grep 'asking it to stop' <<<"$out")" -a -n "$(grep 'stopped' <<<"$out")")" \
+      "stop in a later Bash call asks the run, and it stops, exit 0"
+    k "$(nt kill -0 "$gpid")" "…and its check is gone"
+    out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" wait 5 2>&1 ); rc=$?
+    k "$(t test "$rc" -eq 1 -a -n "$(grep 'was interrupted' <<<"$out")")" "…and wait on it says interrupted, exit 1"
+    k "$(t test "$(cat "$D/stC.log" 2>/dev/null)" = "")" "…and the check never finished"
+    k "$(t test ! -e "$STATUS.stop")" "…and the stop took its .stop file away once the run was gone"
+    rm -rf "$D2"
+  else echo "  skip 18b: no Landlock signal scope here, so a Bash call is no scope of its own"; fi
+  # 18c A STOP ASKED BEFORE THE CHECK STARTS. The watcher starts with the run, so a runid already in .stop while the
+  # run is still taking its tree ends the run there, and its check never starts. A git whose write-tree takes 50 s
+  # holds the run in that step: a watcher that started only with the check (the code before) let the run sit there
+  # past the 45 s a `cc-green stop` waits on the run's lock, so that stop gave up though the run stopped later.
+  D2=$(mktemp -d); R=$(newrepo stD 120); GDIR=$D2 lock_files "$R"; mkdir -p "$D2" "$D/sgit"; echo early > "$STATUS.stop"
+  # Only the fixture's tree is slow, not the one green.sh takes of this checkout as cc-green sources it.
+  printf '#!/bin/sh\n[ "$1" = write-tree ] && [ "$(pwd -P)" = "%s" ] && for _ in $(seq 500); do [ -e "%s/sgit/go" ] && break; sleep 0.1; done\nexec %s "$@"\n' \
+    "$(readlink -f "$R")" "$D" "$(command -v git)" > "$D/sgit/git"; chmod +x "$D/sgit/git"
+  t0=$SECONDS
+  out=$( cd "$R" && PATH="$D/sgit:$PATH" CC_GREEN_DIR="$D2" CC_GREEN_RUNID=early timeout 60 "$SELF" __run 2>&1 ); rc=$?
+  k "$(t test "$((SECONDS - t0))" -lt 45)" "a stop asked while the run takes its tree ends it inside the 45 s a stop waits ($((SECONDS - t0)) s)"
+  k "$(t test "$rc" -ne 0 -a "$rc" -ne 124 -a -n "$(grep 'asked to stop' <<<"$out")")" "…not exit 0 and not the timeout, and it says it was asked"
+  k "$(t test ! -e "$D/stD.pid")" "…and its check never started"
+  touch "$D/sgit/go"; rm -rf "$D2"
+
   # THE RECURRING DEFECTS: every catalogue class against its own fixtures, then the report holding a hand-over on one.
   out=$(python3 "$CORE/tests/recurring_defects.py" selftest 2>&1); rc=$?
   k "$rc" "every recurring-defect class goes red on its fixture diff and holds its suppressed cases ($(tail -1 <<<"$out"))"

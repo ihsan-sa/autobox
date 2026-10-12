@@ -1202,6 +1202,33 @@ def selfcheck():
             died = False
         ok("ending a runaway really ends it, group and all", ended and died)
         ok("a process that is already gone counts as ended, not as a failure", end_it([victim.pid]))
+        # A process in a group it does not lead: the group is someone else's, so only the process is TERMed.
+        lead = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!; exec sleep 60"], start_new_session=True,
+                                stdout=subprocess.PIPE, text=True)
+        member = int(lead.stdout.readline())
+        end_it([member])
+        time.sleep(0.3)
+        try:
+            gone = open(f"/proc/{member}/stat").read().rsplit(")", 1)[1].split()[0] == "Z"
+        except OSError:
+            gone = True
+        ok("a process that does not lead its group is ended alone; the group's leader is left running",
+           gone and lead.poll() is None)
+        lead.kill(); lead.wait()
+        ok("pid 1 is never signalled, whatever the list says", keeper(1) and not end_it([1]))
+        named = "import ctypes, sys, time; ctypes.CDLL(None).prctl(15, b'systemd', 0, 0, 0); print(1, flush=True); time.sleep(30)"
+        fakes = [subprocess.Popen([sys.executable, "-c", named] + extra, stdout=subprocess.PIPE) for extra in ([], ["--user"])]
+        for fp in fakes:
+            fp.stdout.readline()
+        sysd = f"{th}/systemd"   # a binary named systemd, so its exe is one: the shape of the real manager
+        shutil.copy("/bin/sh", sysd)
+        fakes.append(subprocess.Popen([sysd, "-c", "echo 1; read x", "systemd", "--user"], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE))
+        fakes[2].stdout.readline()
+        ok("a runaway that names itself systemd is no keeper, nor one that also has --user in its argv; a binary "
+           "named systemd run with --user is", not keeper(fakes[0].pid) and not keeper(fakes[1].pid) and keeper(fakes[2].pid))
+        for fp in fakes:
+            fp.kill(); fp.wait()
         other = subprocess.Popen(["sleep", "300"])
         fx, own = f"_cctest{other.pid}", f"_cctest{os.getpid()}"
         try:

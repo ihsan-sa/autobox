@@ -344,6 +344,7 @@ SH
 printf '#!/bin/sh\necho "$*" >> "$D/starts"\nexit 0\n' > "$D/bin/systemd-run"
 printf '#!/bin/sh\necho "$*" >> "$D/notices"\n' > "$D/bin/cc-notify"
 printf '#!/bin/sh\n[ "$1" = probe ] && exit 0\nwhile [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n' > "$D/bin/cc-sandbox"
+printf '#!/bin/sh\nshift; exec "$@"\n' > "$D/bin/cc-nosignal"   # cc-loop launches claude through it; its own selfcheck proves the scope
 for tool in cc-pause tmux; do printf '#!/bin/sh\nexit 1\n' > "$D/bin/$tool"; done
 for tool in cc-model cc-limit cc-scope cc-trust cc-gh-token; do printf '#!/bin/sh\nexit 1\n' > "$D/bin/$tool"; done
 chmod +x "$D/bin/"*

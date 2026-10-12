@@ -2,9 +2,30 @@
 # cc-heartbeat — 10 s fsync'd "alive" timestamp so a sudden power loss can be dated to ~10 s (gaps are POST-dominated; 1 Hz cost ~7 GB/day on the SSD for ±1 s nobody needs).
 # On start it compares the previous run's last-alive time with this boot and appends one line to
 # ~/.cc/state/power-events.log (read by cc-boot-notify), labelled cause=clean-reboot|power-loss|unknown from the previous
-# boot's journal (did PID 1 reach reboot/poweroff.target?). A restart within the same boot logs nothing.
+# boot's journal (did PID 1 reach reboot/poweroff.target?). A restart within the same boot logs nothing, unless the
+# user manager itself restarted (it started under 5 min ago) after more than a minute without a heartbeat: then one
+# `restart=… cause=user-manager-restart` line, which cc-boot-notify posts, because every session went down with it.
 # `cc-heartbeat --dry-run [<last_alive>]` prints the line it would log (default last_alive: the current stamp), touches nothing, exits.
+# `cc-heartbeat selfcheck` proves the restart line through --dry-run, with a scratch HOME and a manager pid of its own.
 set -uo pipefail
+if [ "${1:-}" = selfcheck ]; then
+  n=0 f=0; k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  up=$(cut -d. -f1 /proc/uptime)
+  [ "$up" -gt 400 ] || { echo "cc-heartbeat selfcheck: the box has been up ${up}s, under the 400 s a same-boot stamp needs — not run"; exit 0; }
+  H=$(mktemp -d); sleep 60 & fresh=$!   # a "manager" that started a moment ago
+  trap 'kill "$fresh" 2>/dev/null; rm -rf "$H"' EXIT
+  ago(){ date -u -d "@$(( $(date -u +%s) - $1 ))" +%FT%TZ; }
+  a=$(ago 120); out=$(HOME=$H MANAGERPID=$fresh "$0" --dry-run "$a")
+  grep -qE "restart=[^ ]+ last_alive=$a gap=1[12][0-9]s cause=user-manager-restart" <<<"$out"
+  k $? "a manager under 5 min old after a 2 min gap in the heartbeat: one restart line with the gap"
+  out=$(HOME=$H MANAGERPID=$fresh "$0" --dry-run "$(ago 30)")
+  ! grep -q 'user-manager-restart' <<<"$out"; k $? "…not after a gap of a minute or less (the heartbeat alone restarted)"
+  out=$(HOME=$H MANAGERPID=1 "$0" --dry-run "$a")
+  ! grep -q 'user-manager-restart' <<<"$out"; k $? "…and not under a manager that has run longer than 5 min (pid 1 here)"
+  [ -z "$(ls -A "$H")" ]; k $? "--dry-run wrote nothing under HOME"
+  echo "cc-heartbeat selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" = 0 ]; exit $?
+fi
 hb="$HOME/.cc/state/heartbeat"; log="$HOME/.cc/state/power-events.log"
 dry=0; [ "${1:-}" = --dry-run ] && dry=1
 [ $dry = 1 ] || mkdir -p "$HOME/.cc/state"
@@ -25,7 +46,15 @@ if [ -n "$prev" ]; then
     case $cause in clean-reboot) note="gap = shutdown + POST + kernel start";; *) note="gap = outage + POST + kernel start";; esac
     emit "$(date -u +%FT%TZ) boot=$boot last_alive=$prev gap=${gap}s cause=$cause ($note)"
     [ $dry = 1 ] || logger -t cc-heartbeat "previous run last alive at $prev; this boot at $boot; gap ${gap}s; cause $cause"
-  elif [ $dry = 1 ]; then echo "DRY-RUN: last_alive=$prev is not before boot=$boot — same boot, nothing would be logged"
+  else
+    # Known false restart, left as is: this heartbeat stopped for over a minute and started again within a fresh
+    # manager's first 5 min of a boot (an install.sh re-enable) logs a restart that did not happen. Comparing the
+    # manager's start with the gap's start would tell the two apart; it is one log line, so not done yet.
+    gap=$(( $(date -u +%s) - prev_s )); up=$(ps -o etimes= -p "${MANAGERPID:-0}" 2>/dev/null | tr -d ' ')
+    if [ "$gap" -gt 60 ] && [ -n "$up" ] && [ "$up" -lt 300 ]; then
+      emit "$(date -u +%FT%TZ) restart=$(date -u +%FT%TZ) last_alive=$prev gap=${gap}s cause=user-manager-restart"
+    elif [ $dry = 1 ]; then echo "DRY-RUN: last_alive=$prev is not before boot=$boot — same boot, nothing would be logged"
+    fi
   fi
 else
   emit "$(date -u +%FT%TZ) boot=$boot last_alive=none (first run)"

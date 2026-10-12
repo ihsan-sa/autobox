@@ -36,7 +36,12 @@
 #                            run's own CC_GREEN_RUNID — no process is found by name or pattern, and another worktree's
 #                            run has another lock, note and runid. TERM first, so the run takes its check down and says
 #                            `interrupted`; a run still holding the lock 30 s later gets KILL, and so does a group of
-#                            its still there 5 s after that.
+#                            its still there 5 s after that. A worker's later Bash call is a signal scope of its own
+#                            that can neither read nor signal the run an earlier call started, so from there it asks:
+#                            the runid goes into the note's .stop file, and the run stops itself (stop_watch,
+#                            which starts with the run, so a stop asked before its check starts is carried out
+#                            too). The stop removes the file once the run is gone. A file left by a stop that
+#                            gave up is harmless, since each run has its own runid.
 #                            Then `cc-green start` runs on the tree as it is now. exit 0 once none is going (or none
 #                            was), 1 when the lock is held by something this cannot prove is the run
 #   cc-green red SCOPE KIND KEY --observed TEXT [--log FILE] [--writer W] [--expected TEXT] [--link k=v]... [--cost k=v]...
@@ -158,6 +163,8 @@ verdict_field(){ sed -n "s/^$1=//p" "$VERDICT" 2>/dev/null | head -1; }
 # ran on as an orphan, and the next `run` on that root started a second one beside it. Never on this shell's stdin,
 # and never holding the run lock (fd 9): a child the check leaves behind would keep the root locked after the run.
 # The log is a file, not a pipe, so the run comes back on the check's own exit whatever it left running.
+# The check runs under cc-nosignal, as a suite does in run_cmd: it may signal what it started and nothing else, so a
+# pid it computes wrong (the user manager, on 2026-10-02) gets EPERM. A stop from here still reaches it.
 run_check(){   # $1 = root → lander check's exit; 3 when there is no lander to run
   local r=$1 rc=0 n gp scrub=()
   local -a LCMD=()
@@ -167,7 +174,7 @@ run_check(){   # $1 = root → lander check's exit; 3 when there is no lander to
   fi
   echo "cc-green: ${LCMD[*]}"
   while read -r n; do scrub+=(-u "$n"); done < <(secret_names)
-  ( cd "$r" && exec setsid env "${scrub[@]}" PYTHONDONTWRITEBYTECODE=1 CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" \
+  ( cd "$r" && exec setsid "$BIN/cc-nosignal" -- env "${scrub[@]}" PYTHONDONTWRITEBYTECODE=1 CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" \
       "${LCMD[@]}" ) </dev/null 9>&- & gp=$!
   printf 'gate_pgid=%s\n' "$gp" >> "$STATUS"     # what `stop` may reach besides the run itself
   trap 'kill -TERM -- -"$gp" 2>/dev/null; exit 130' INT TERM
@@ -208,6 +215,7 @@ take_run(){   # $1 = root. The RUN's side: the lock its launcher handed over on 
   # The exit, written by the run itself whatever ends it short of a SIGKILL: `wait` tells a run that ended from one
   # that was killed by this line being there or not. Without run_traps a TERM reaches this with $? = 0.
   trap 'printf "exit=%s\nended=%s\n" "$?" "$(now)" >> "$STATUS"' EXIT
+  stop_watch
 }
 begin_run(){   # $1 = root, $2 = tree. Under the lock: what this run is; written first with no tree, then with it
   printf 'root=%s\ntree=%s\npid=%s\nstarted=%s\nlog=%s\nrunid=%s\n' "$1" "$2" "$$" "$(now)" "$LOG" "$CC_GREEN_RUNID" > "$STATUS"
@@ -317,7 +325,7 @@ run_cmd(){   # $1 = root, $2… = the suite (suite_ok has passed it). The RUN's 
   local r=$1 gp rc=0; shift
   echo "cc-green: running $* in $r (pid $$) — log $LOG"
   # Its own process group, as lander check gets in run_check, so an INT or TERM on the run takes the command down with it.
-  ( cd "$r" && exec setsid "$@" ) </dev/null 9>&- & gp=$!
+  ( cd "$r" && exec setsid "$BIN/cc-nosignal" -- "$@" ) </dev/null 9>&- & gp=$!
   printf 'gate_pgid=%s\n' "$gp" >> "$STATUS"
   trap 'kill -TERM -- -"$gp" 2>/dev/null; exit 130' INT TERM
   wait "$gp" || rc=$?
@@ -359,6 +367,33 @@ stale_hint(){   # $1 = root (lock_files already read). Says nothing unless the r
   echo "  That run is on ${was:0:12} and this working copy is ${now_t:0:12} now, so its verdict will not answer for it:"
   echo "  \`cc-green stop\` ends it, then \`cc-green start\` runs on the tree as it is."
 }
+# A STOP FROM ANOTHER SIGNAL SCOPE. A cc-loop worker's Bash calls each run in a scope of their own
+# (cc-nosignal-shell), so the `cc-green stop` of a later call can neither read the environment of a run an earlier
+# call started nor signal it: the kernel refuses both (review of #942). That stop leaves the note's runid in
+# $STATUS.stop instead, and the run carries it out from inside its own scope: this watcher, beside the check, reads
+# the file once a second, and on its own runid TERMs the run, whose trap takes the check's group down — the same
+# path as a stop that can reach the run — then KILLs the run and the group if they are still there 30 s later.
+# It starts with the run, not with its check: a stop asked while the run is still taking its tree would otherwise
+# wait out the stop's 45 s and exit 1 though the run went on to stop itself (review of #942). So the group is read
+# from the note when the stop comes, and a run stopped before its check started has none. It holds no fd of the
+# lock and ends with the run.
+stop_watch(){   # The RUN's side, started by take_run
+  local me=$$ g
+  ( exec 9>&-
+    while kill -0 "$me" 2>/dev/null; do
+      if [ -n "${CC_GREEN_RUNID:-}" ] && [ "$(cat "$STATUS.stop" 2>/dev/null)" = "$CC_GREEN_RUNID" ]; then
+        echo "cc-green: asked to stop (cc-green stop, from a scope that cannot signal this run) — stopping"
+        kill -TERM "$me" 2>/dev/null
+        for _ in $(seq 300); do kill -0 "$me" 2>/dev/null || break; sleep 0.1; done
+        g=$(status_field gate_pgid)
+        is_ours "$me" "$CC_GREEN_RUNID" && kill -KILL "$me" 2>/dev/null
+        [ -z "$g" ] || { is_ours "$g" "$CC_GREEN_RUNID" && kill -KILL -- -"$g" 2>/dev/null; }
+        exit 0
+      fi
+      sleep 1
+    done ) </dev/null &
+}
+hidden(){ [ -n "$1" ] && [ -e "/proc/$1" ] && ! { : < "/proc/$1/environ"; } 2>/dev/null; }   # a live pid whose environment this process may not read
 # `cc-green stop`. Every pid it signals is one this root's status note names AND whose environment carries that
 # note's runid, which a run and its check inherit from the launcher: a pid reused since, or a lock held by anything
 # else, is left alone and said. Never pgrep/pkill -f — a -f pattern once killed ~26 sessions.
@@ -369,6 +404,14 @@ stop_run(){   # $1 = root → 0 when no run holds the root any more, 1 when this
   exec 9>"$LOCK"
   if flock -n 9; then flock -u 9; echo "cc-green: no run is going on $1 — nothing to stop"; return 0; fi
   pid=$(status_field pid); runid=$(status_field runid)
+  if [ -n "$runid" ] && hidden "$pid"; then   # another Bash call's scope: ask the run itself (stop_watch); nothing is signalled from here
+    echo "cc-green: the run on $1 (pid $pid) is in a signal scope this call cannot reach — asking it to stop"
+    printf '%s\n' "$runid" > "$STATUS.stop"
+    flock -w 45 9 || { echo "cc-green: the run on $1 did not stop within 45 s of being asked — log $(status_field log)" >&2; return 1; }
+    flock -u 9; rm -f "${STATUS:?}.stop"   # done with; a stale one could never match a later run's runid anyway
+    echo "cc-green: stopped — \`cc-green start\` runs lander check on the tree as it is now"
+    return 0
+  fi
   if ! is_ours "$pid" "$runid"; then
     echo "cc-green: the run lock on $1 is held, but pid ${pid:-?} is not a run carrying runid ${runid:-?} — nothing signalled" >&2
     return 1
@@ -411,7 +454,11 @@ main(){
   [ "$mode" = __run ] && { take_run "$r" || exit 3; }
   [ "$mode" = __run ] && [ -n "$CMD" ] && { shift 2; run_cmd "$r" "$@"; exit $?; }
   lock_files "$r"
-  tree=$(green_tree "$r")
+  # Taken in the background and waited on, because bash runs a trap only once its foreground child is done: a stop
+  # asked while git is still hashing a large tree (stop_watch's TERM) ends the run now, not when git has finished.
+  tf=$(mktemp "${TMPDIR:-/tmp}/cc-green-tree.XXXXXX") || exit 2
+  green_tree "$r" > "$tf" & wait $!
+  tree=$(cat "$tf"); rm -f "$tf"
   [ -n "$tree" ] || { echo "cc-green: cannot take this working copy's tree" >&2; exit 2; }
   if [ "$mode" = __run ]; then
     begin_run "$r" "$tree"

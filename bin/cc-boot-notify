@@ -1,16 +1,56 @@
 #!/usr/bin/env bash
 # cc-boot-notify — one Slack/ntfy message per boot (via cc-notify): when the box came up, whether the
-# previous boot ended cleanly or by power loss / hard reset, and how long it was dark (from cc-heartbeat).
+# previous boot ended cleanly or by power loss / hard reset, and how long it was dark (from cc-heartbeat); and one
+# per user-manager restart inside a boot (cc-heartbeat's cause=user-manager-restart line), with how long it was dark.
 # The "announced" stamp is written only after cc-notify accepts the message, so a boot whose network never
 # came back stays unannounced and is retried by the next `systemctl --user start cc-boot-notify` (the unit
 # runs with TimeoutStartSec=infinity: the wait-for-network + retries can outlast any finite timeout).
+# `cc-boot-notify selfcheck` proves the restart notice in a scratch HOME, with a cc-notify stub that records its call.
 set -uo pipefail
+if [ "${1:-}" = selfcheck ]; then
+  n=0 f=0; k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  H=$(mktemp -d); trap 'rm -rf "$H"' EXIT; mkdir -p "$H/bin" "$H/.cc/state"
+  printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s/calls"; echo >> "%s/calls"; [ ! -e "%s/down" ]\n' "$H" "$H" "$H" > "$H/bin/cc-notify"
+  chmod +x "$H/bin/cc-notify"
+  cat /proc/sys/kernel/random/boot_id > "$H/.cc/state/boot-announced"   # this boot is announced: only a restart is said
+  echo '2026-10-02T14:01:57Z restart=2026-10-02T14:01:57Z last_alive=2026-10-02T09:30:10Z gap=16307s cause=user-manager-restart' \
+    > "$H/.cc/state/power-events.log"
+  out=$(HOME=$H TZ=UTC CC_BOX=box "$0" 2>&1); rc=$?
+  want="-t|box restart|-p|high|The user manager restarted at 14:01 without a reboot, so every session and user service had stopped: the box was dark 4h 31m, from the last heartbeat at 09:30.|"
+  c=0; [ "$rc" = 0 ] && [ "$(cat "$H/calls")" = "$want" ] || c=1; k "$c" "a user-manager restart in an announced boot is said once, high priority, with how long the box was dark"
+  c=0; [ "$(cat "$H/.cc/state/manager-restart-announced" 2>/dev/null)" = 2026-10-02T14:01:57Z ] || c=1; k "$c" "…and its stamp is kept"
+  out=$(HOME=$H TZ=UTC CC_BOX=box "$0" 2>&1); rc=$?
+  c=0; [ "$rc" = 0 ] && [ "$(wc -l < "$H/calls")" = 1 ] || c=1; k "$c" "…and a second run in the same boot says nothing more"
+  echo '2026-10-02T15:00:00Z restart=2026-10-02T15:00:00Z last_alive=2026-10-02T14:58:00Z gap=120s cause=user-manager-restart' \
+    >> "$H/.cc/state/power-events.log"; touch "$H/down"
+  out=$(HOME=$H TZ=UTC CC_BOX=box "$0" 2>&1); rc=$?
+  [ "$rc" = 1 ] && [ "$(cat "$H/.cc/state/manager-restart-announced")" = 2026-10-02T14:01:57Z ] && grep -q 'later run retries' <<<"$out"
+  k $? "a later restart no channel takes exits 1 and keeps the old stamp, so a later run retries it"
+  grep -q 'dark 2m,' "$H/calls"; k $? "…and its notice gave the gap in minutes"
+  echo "cc-boot-notify selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" = 0 ]; exit $?
+fi
 log="$HOME/.cc/state/power-events.log"
 notify="$HOME/bin/cc-notify"
 # announce each boot exactly once: a re-run in the same boot (installer re-enable, manual start) must stay silent
 stamp="$HOME/.cc/state/boot-announced"; bootid=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || uptime -s)
-[ "$(cat "$stamp" 2>/dev/null)" = "$bootid" ] && exit 0
 [ -x "$notify" ] || { echo "cc-boot-notify: $notify is missing — nothing announced" >&2; exit 1; }
+# …except a user-manager restart inside the boot: every session and user service stopped with it (2026-10-01 and
+# 10-02: a test TERMed the manager, and the 10-02 one went unsaid for 4.5 h). cc-heartbeat logs it as one
+# cause=user-manager-restart line; that line is said once, high priority, with how long the box was dark.
+if [ "$(cat "$stamp" 2>/dev/null)" = "$bootid" ]; then
+  mstamp="$HOME/.cc/state/manager-restart-announced"; line=""
+  for _ in $(seq 1 15); do
+    line=$(grep 'cause=user-manager-restart' "$log" 2>/dev/null | tail -n1)
+    [ -n "$line" ] && [ "${line%% *}" != "$(cat "$mstamp" 2>/dev/null)" ] && break; line=""; sleep 1
+  done
+  [ -n "$line" ] || exit 0
+  alive=$(sed -n 's/.*last_alive=\([^ ]*\).*/\1/p' <<<"$line"); gap=$(sed -n 's/.*gap=\([0-9]*\)s.*/\1/p' <<<"$line")
+  dark="$((gap / 3600))h $((gap % 3600 / 60))m"; [ "$gap" -ge 3600 ] || dark="$((gap / 60))m"
+  msg="The user manager restarted at $(date -d "${line%% *}" +%H:%M) without a reboot, so every session and user service had stopped: the box was dark ${dark}, from the last heartbeat at $(date -d "$alive" +%H:%M)."
+  "$notify" -t "${CC_BOX:-$(hostname -s)} restart" -p high "$msg" || { echo "cc-boot-notify: no channel took the restart notice — a later run retries" >&2; exit 1; }
+  printf '%s\n' "$msg"; printf '%s\n' "${line%% *}" > "$mstamp"; exit 0
+fi
 hhmmss() { local t=${1#*T}; printf '%s' "${t%Z}"; }   # 2026-08-27T04:05:06Z -> 04:05:06 (the message says UTC once)
 boot=$(date -u -d "$(uptime -s)" +%FT%TZ)
 # the last line the previous boot managed to flush to disk — journald writes in batches, so it lags the actual end by up to ~5 min

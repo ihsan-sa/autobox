@@ -1,0 +1,346 @@
+#!/usr/bin/python3 -IS
+# cc-nosignal — run a command that can signal only the processes it started.
+#   cc-nosignal [--] <command...>   exec the command inside a Landlock signal scope (ABI 6+)
+#   cc-nosignal probe               one line: enforced, or why not; exit 0 when enforced, 1 when not
+#   cc-nosignal fixture             the attack: TERM its parent's parent, pid 1, -1, the user manager, every tmux
+#                                   server, and an orphan's new parent. It fires only when it can reach no process
+#                                   it did not start, and refuses (exit 2) otherwise, so running it bare is harmless.
+#   cc-nosignal selfcheck           the fixture through this wrapper, and what it must leave alive
+# WHY (2026-10-02 05:38): a selfcheck's RETURN trap killed a parent pid it had computed at run time, and a setsid'd
+# process's parent was the user manager, so the trap TERMed it; on a user manager TERM starts exit.target and every
+# session went down for 4.5 h. Nothing that reads command text sees a pid computed inside a script; the kernel does.
+# HOW: a Landlock domain with LANDLOCK_SCOPE_SIGNAL. A process inside it may signal its own domain and the ones
+# nested in it, and nothing else: kill(2), kill -1, a process group, pidfd_send_signal and SIGIO all get EPERM for
+# a process outside. Signals from outside in still arrive, so a runner can stop its check. It needs no privilege and
+# no user namespace (bwrap cannot nest here: AppArmor refuses a user namespace inside one), it stacks under any
+# runner, and every child inherits it. It sets no_new_privs, so a setuid program (sudo) gains nothing inside.
+# WHAT IT DOES NOT STOP: IPC. A command can still reach the user bus (`systemctl --user exit`, `systemd-run --user`)
+# and the tmux socket (`tmux kill-server`), which is how a test that needs the real tmux or the bus still works.
+# WITH NO SIGNAL SCOPE (kernel ABI < 6, Landlock left out of the boot's LSM list, not Linux) IT REFUSES: exit 3,
+# nothing runs, and the line names the way out. Running bare with a warning would have let a kernel change, or a box
+# that never had the scope, take every check back to the 2026-10-02 state with nothing red to say so. A runner where
+# there is nothing to protect (a throwaway CI VM: no user manager of anyone's, no sessions) sets CC_NOSIGNAL_BARE=1,
+# and then each run says on stderr that it ran WITHOUT the scope, and why. Where the scope exists the variable does
+# nothing: it cannot switch the scope off, only stand in for one the kernel lacks.
+# FILESYSTEM: none. The ruleset handles no fs access, so on its own it changes no open, rename or mount. One kernel
+# rule reaches it anyway: once ANY layer of a domain handles fs access, every layer counts as refusing a cross-directory
+# rename or link (REFER) that no rule of its own grants, and the call gets EXDEV. So this scope stacked with a
+# filesystem sandbox (cc-fence) refuses those, which is why tests/check.sh runs cc-fence's selfcheck outside it.
+# Handling and granting REFER here would not mend it: a layer that handles any fs access also refuses every mount
+# change, and bwrap (cc-sandbox, the member sandboxes) under it then fails ("Failed to make / slave"). Measured.
+# Used by: cc-green (its check and its suite), lander check (a host-class check), tests/check.sh (each selfcheck)
+# and cc-loop (a worker's claude, so its own Bash runs are inside too; and through cc-nosignal-shell, its prefix, each
+# Bash call in a scope of its own, so a test cannot signal that claude either).
+# ABI: https://www.kernel.org/doc/html/latest/userspace-api/landlock.html
+import ctypes as C
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+SCOPE_SIGNAL = 1 << 1
+MIN_ABI = 6
+LIBC = C.CDLL(None, use_errno=True)
+LIBC.syscall.restype = C.c_long
+SELF = os.path.realpath(__file__)
+
+
+class Ruleset(C.Structure):
+    _fields_ = [("handled_access_fs", C.c_uint64), ("handled_access_net", C.c_uint64), ("scoped", C.c_uint64)]
+
+
+def abi():
+    # landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION); 444 on every 64-bit Linux architecture
+    if not sys.platform.startswith("linux") or C.sizeof(C.c_void_p) != 8:
+        return -1
+    return LIBC.syscall(C.c_long(444), C.c_void_p(), C.c_size_t(0), C.c_uint(1))
+
+
+def why_not():
+    """'' when the scope can be applied here, else the reason in words."""
+    v = abi()
+    if v < 0:
+        return f"Landlock is not available here (errno {C.get_errno()})"
+    if v < MIN_ABI:
+        return f"Landlock ABI {v} has no signal scope (needs {MIN_ABI})"
+    return ""
+
+
+def restrict():
+    attr = Ruleset(0, 0, SCOPE_SIGNAL)
+    fd = LIBC.syscall(C.c_long(444), C.byref(attr), C.c_size_t(C.sizeof(attr)), C.c_uint(0))
+    if fd < 0:
+        raise OSError(C.get_errno(), "landlock_create_ruleset")
+    if LIBC.prctl(38, 1, 0, 0, 0):  # PR_SET_NO_NEW_PRIVS
+        raise OSError(C.get_errno(), "prctl(NO_NEW_PRIVS)")
+    if LIBC.syscall(C.c_long(446), C.c_int(fd), C.c_uint(0)) < 0:  # landlock_restrict_self
+        raise OSError(C.get_errno(), "landlock_restrict_self")
+    os.close(fd)
+
+
+def run(cmd):
+    if not cmd:
+        print("usage: cc-nosignal [--] <command...> | probe | fixture | selfcheck", file=sys.stderr)
+        return 2
+    why = why_not()
+    if why and os.environ.get("CC_NOSIGNAL_BARE") != "1":
+        print(f"cc-nosignal: {why} — refused, nothing ran. A check here could signal anything this user runs. Where "
+              "nothing needs protecting (a throwaway CI VM), CC_NOSIGNAL_BARE=1 runs it without the scope", file=sys.stderr)
+        return 3
+    if why:
+        print(f"cc-nosignal: {why} — running {cmd[0]} WITHOUT a signal scope, because CC_NOSIGNAL_BARE=1", file=sys.stderr)
+    else:
+        try:
+            restrict()
+        except OSError as e:
+            # Refused rather than run bare: the kernel said it has the scope, so a failure here is not a missing
+            # feature, and a check that thinks it is protected must not run without it.
+            print(f"cc-nosignal: {e} — refused, nothing ran", file=sys.stderr)
+            return 3
+        os.environ["CC_NOSIGNAL_ROOT"] = str(os.getpid())   # the scope's first process (exec keeps the pid): the fixture's guard
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        print(f"cc-nosignal: {cmd[0]}: {e.strerror}", file=sys.stderr)
+        return 127
+
+
+# --- what the fixture and its check read -----------------------------------------------------------------------
+
+def stat(pid):
+    """-> (comm, ppid, starttime) of a live pid, or None."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            s = f.read()
+    except OSError:
+        return None
+    comm, rest = s[s.index("(") + 1:s.rindex(")")], s[s.rindex(")") + 2:].split()
+    return comm, int(rest[1]), int(rest[19])
+
+
+def mine():
+    uid = os.getuid()
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                if os.stat(f"/proc/{d}").st_uid == uid:
+                    yield int(d)
+            except OSError:
+                pass
+
+
+def cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().split(b"\0")
+    except OSError:
+        return []
+
+
+def protected():
+    """{pid: (what, starttime)}: the user manager(s) and tmux servers this user runs, as /proc shows them."""
+    out = {}
+    for p in mine():
+        s = stat(p)
+        if not s:
+            continue
+        if s[0] == "systemd" and b"--user" in cmdline(p):
+            out[p] = ("the user manager", s[2])
+        elif s[0].startswith("tmux: server"):
+            out[p] = ("a tmux server", s[2])
+    return out
+
+
+def fixture():
+    me = os.getpid()
+    # THE GUARD. This fires only when no process it did not start answers a signal 0 — signal 0 delivers nothing and
+    # says whether a real one would. Bare in a shell, the shell itself answers, so it refuses and nothing is sent.
+    # Its own ancestors up to the scope's first process (CC_NOSIGNAL_ROOT) were started inside the scope, so they may
+    # answer: that is a worker's Bash call, where the fixture runs under the call's own shell. Never pid 1, the user
+    # manager or a tmux server, and the targets are checked again below, so a forged variable arms nothing.
+    root, chain, p = int(os.environ.get("CC_NOSIGNAL_ROOT") or 0), set(), os.getppid()
+    while root and p > 1:
+        chain.add(p)
+        if p == root:
+            break
+        p = (stat(p) or ("", 0, 0))[1]
+    else:
+        chain = set()
+    chain -= set(protected()) | {1}
+    reach = [p for p in mine() if p != me and p not in chain and _can(p)]
+    if reach:
+        print(f"fixture: refused — it can signal pid {reach[0]} (and {len(reach) - 1} more), which it did not start; "
+              "run it under cc-nosignal")
+        return 2
+    gp = (stat(os.getppid()) or ("", 0, 0))[1]
+    targets = [("parent's parent", gp), ("pid 1", 1)] + [(w, p) for p, (w, _) in protected().items()]
+    live = [f"{w} ({p})" for w, p in targets if p not in chain and _can(p)]
+    if live:
+        print(f"fixture: refused — it can signal {live[0]}; run it under cc-nosignal")
+        return 2
+    for what, pid in targets:
+        print(f"fixture: TERM {what} ({pid}): {_term(pid)}")
+    # kill(-1) returns 0 when there was any process to try, even when every one refused it: the kernel passes an
+    # EPERM up from no single target, and says ESRCH only when there was none (kill_something_info; under this scope
+    # kill(-1, 0) returns 0). So `returned 0` says nothing about what was reached; that is read after, by pid.
+    print(f"fixture: TERM -1 (kill -1): {'returned 0' if _term(-1) == 'SENT' else 'refused'}")
+    # An orphan's new parent is whatever reaps orphans — the user manager, as subreaper, for a setsid'd process.
+    r, w = os.pipe()
+    if os.fork() == 0:
+        os.close(r)
+        if os.fork() == 0:
+            time.sleep(0.3)
+            os.write(w, f"TERM its new parent ({os.getppid()}): {_term(os.getppid())}".encode())
+            os._exit(0)
+        os._exit(0)
+    os.close(w)
+    os.waitpid(-1, 0)
+    with os.fdopen(r) as f:
+        print(f"fixture: an orphan: {f.read()}")
+    return 0
+
+
+def _can(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _term(pid):
+    if pid in (0, os.getpid()):
+        return "skipped (itself)"
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return "SENT"
+    except OSError as e:
+        return {1: "EPERM", 3: "ESRCH"}.get(e.errno, e.strerror)
+
+
+def selfcheck():
+    passed = failed = skipped = 0
+
+    def k(ok, name):
+        nonlocal passed, failed
+        passed, failed = passed + bool(ok), failed + (not ok)
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}")
+
+    py = [sys.executable, "-IS", "-c"]
+    # 0 NO SCOPE, NO RUN — on any kernel: this file loaded with why_not() standing in for one that has no signal
+    # scope. Without CC_NOSIGNAL_BARE it refuses (exit 3) and the command never starts; with it the command runs and
+    # stderr says it ran without the scope. Where the scope exists, the variable does not switch it off (case 1).
+    stub = ("import importlib.machinery as M, importlib.util as U, sys\n"
+            "l = M.SourceFileLoader('ns', sys.argv[1]); t = U.module_from_spec(U.spec_from_loader('ns', l)); l.exec_module(t)\n"
+            "t.why_not = lambda: 'Landlock ABI 5 has no signal scope (a stand-in)'\n"
+            "sys.exit(t.run(sys.argv[2:]))")
+    tmp = tempfile.mkdtemp(prefix="cc-nosignal-sc.")
+    try:
+        mark, clean = os.path.join(tmp, "ran"), {k: v for k, v in os.environ.items() if k != "CC_NOSIGNAL_BARE"}
+        old = subprocess.run(py + [stub, SELF, "touch", mark], capture_output=True, text=True, env=clean)
+        k(old.returncode == 3 and not os.path.exists(mark) and "refused, nothing ran" in old.stderr
+          and "CC_NOSIGNAL_BARE=1" in old.stderr, "no signal scope: it refuses, exit 3, nothing runs, and says the way out")
+        bare = subprocess.run(py + [stub, SELF, "touch", mark], capture_output=True, text=True,
+                              env=dict(clean, CC_NOSIGNAL_BARE="1"))
+        k(bare.returncode == 0 and os.path.exists(mark) and "WITHOUT a signal scope" in bare.stderr,
+          "…and with CC_NOSIGNAL_BARE=1 it runs, saying on stderr that it ran without one")
+        why = why_not()
+        if why:
+            skipped += 1
+            print(f"  skip {why}: the scope cannot be checked here, and the fixture is not run")
+            print(f"cc-nosignal selfcheck: {passed} passed, {failed} failed, {skipped} skipped")
+            return 1 if failed else 0
+        # 5 NO FILESYSTEM RULE: a cross-directory rename and link work under the wrapper and in a worker's Bash call
+        # (a scope nested in a scope), where a ruleset that handled any fs access would make them EXDEV.
+        ren = ("import os,sys; d=sys.argv[1]; os.makedirs(d+'/a'); os.makedirs(d+'/b'); open(d+'/a/f','w').close(); "
+               "os.rename(d+'/a/f', d+'/b/f'); os.link(d+'/b/f', d+'/a/g'); print('moved')")
+        one = subprocess.run([SELF, "--"] + py + [ren, os.path.join(tmp, "one")], capture_output=True, text=True)
+        k(one.stdout.strip() == "moved", "a cross-directory rename and link work under the wrapper" +
+          ("" if one.returncode == 0 else f": {one.stderr.strip()[-120:]}"))
+        shell = os.path.join(os.path.dirname(SELF), "cc-nosignal-shell")
+        two = subprocess.run([SELF, "--", shell, f"{sys.executable} -IS -c \"{ren}\" {os.path.join(tmp, 'two')}"],
+                             capture_output=True, text=True)
+        k(two.stdout.strip() == "moved", "…and in a worker's Bash call, a scope inside a scope" +
+          ("" if two.returncode == 0 else f": {two.stderr.strip()[-120:]}"))
+        # 6 ONE ARGUMENT. cc-nosignal-shell takes the command as one word; given several it says so and runs them
+        # all, joined, where `bash -c "$@"` alone would have run the first and dropped the rest without a word.
+        three = subprocess.run([SELF, "--", shell, "echo", "joined"], capture_output=True, text=True)
+        k(three.stdout.strip() == "joined" and "as one argument, got 2" in three.stderr,
+          "cc-nosignal-shell given the command as two words says so and runs both")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # 1 THE SCOPE, both ways: a child signals its parent bare, and cannot once wrapped — but still its own child.
+    probe = "import os,sys; os.kill(int(sys.argv[1]), 0); print('reached')"
+    bare = subprocess.run(py + [probe, str(os.getpid())], capture_output=True, text=True)
+    k(bare.stdout.strip() == "reached", "bare, a child can signal the process that started it (the control)")
+    held = subprocess.run([SELF] + py + [probe, str(os.getpid())], capture_output=True, text=True)
+    k(held.returncode != 0 and "PermissionError" in held.stderr, "under cc-nosignal it cannot: EPERM")
+    held = subprocess.run([SELF] + py + [probe, str(os.getpid())], capture_output=True, text=True,
+                          env=dict(os.environ, CC_NOSIGNAL_BARE="1"))
+    k(held.returncode != 0 and "PermissionError" in held.stderr,
+      "…nor with CC_NOSIGNAL_BARE=1, which only stands in for a scope the kernel lacks")
+    own = subprocess.run([SELF] + py + ["import subprocess as s; p=s.Popen(['sleep','5']); p.terminate(); "
+                                        "print(p.wait())"], capture_output=True, text=True)
+    k(own.stdout.strip() == "-15", "…and can still TERM a process it started")
+    k(subprocess.run([SELF, "probe"], capture_output=True).returncode == 0, "probe says enforced")
+    # 2 THE GUARD: bare, the fixture reaches this process, so it refuses and sends nothing. Bare means without the
+    # CC_NOSIGNAL_ROOT a wrapper around this selfcheck set (tests/check.sh runs it under one): with it, this process
+    # is the scope's root, the guard lets it answer, and the fixture's kill -1 TERMed this selfcheck (exit 143).
+    before = protected()
+    bare = subprocess.run([SELF, "fixture"], capture_output=True, text=True,
+                          env={k: v for k, v in os.environ.items() if k != "CC_NOSIGNAL_ROOT"})
+    k(bare.returncode == 2 and "refused" in bare.stdout and "TERM" not in bare.stdout,
+      "the fixture run bare refuses and sends nothing")
+    forged = subprocess.run([SELF, "fixture"], capture_output=True, text=True,
+                            env=dict(os.environ, CC_NOSIGNAL_ROOT="1"))
+    k(forged.returncode == 2 and "TERM" not in forged.stdout, "…and so it does with a forged CC_NOSIGNAL_ROOT")
+    # 3 THE FIXTURE through the wrapper: every TERM is EPERM, and the user manager, every tmux server, this process
+    # and its parent are the same processes afterwards (same pid, same start time).
+    keep = dict(before)
+    keep[os.getpid()] = ("this selfcheck", stat(os.getpid())[2])
+    pp = os.getppid()
+    if stat(pp):
+        keep[pp] = ("its caller", stat(pp)[2])
+    out = subprocess.run([SELF, "--", SELF, "fixture"], capture_output=True, text=True)
+    lines = [ln for ln in out.stdout.splitlines() if "TERM" in ln]
+    k(out.returncode == 0 and len(lines) >= 4, f"the fixture fired under the wrapper ({len(lines)} attempts)")
+    sent = [ln for ln in lines if ln.endswith("SENT")]
+    k(not sent, "…and every TERM it aimed outside itself was refused" + (f": {sent}" if sent else ""))
+    # Not on a box that runs this inside bwrap under cc-nosignal (a member workspace): there an orphan's new parent is
+    # bwrap's init, inside the same scope, so this TERM is SENT and the case goes red, though nothing outside was hit.
+    k(any("orphan" in ln and "EPERM" in ln for ln in lines), "…including an orphan's TERM of its new parent")
+    # …and as a worker's Bash call runs it (cc-loop: CLAUDE_CODE_SHELL_PREFIX=cc-nosignal-shell, inside the session's
+    # own scope): its shell is inside the call's scope and may answer, and every TERM aimed past it is still refused.
+    call = subprocess.run([SELF, "--", os.path.join(os.path.dirname(SELF), "cc-nosignal-shell"), f"{SELF} fixture; true"],
+                          capture_output=True, text=True)
+    lines = [ln for ln in call.stdout.splitlines() if "TERM" in ln]
+    # Its own `kill -1` takes the call's shell down with it (inside the scope, so allowed): the exit code says nothing.
+    k(len(lines) >= 4 and not [ln for ln in lines if ln.endswith("SENT")],
+      f"the fixture fired as a worker's Bash call, and nothing it aimed outside was reached ({len(lines)} attempts)")
+    gone = [f"{w} ({p})" for p, (w, t) in keep.items() if (stat(p) or (0, 0, -1))[2] != t]
+    k(not gone, "the user manager, the tmux servers and this session are untouched" + (f": {gone}" if gone else ""))
+    if not before:
+        skipped += 1
+        print("  skip no user manager or tmux server is visible here (a pid namespace): the parent's parent stands for them")
+    print(f"cc-nosignal selfcheck: {passed} passed, {failed} failed, {skipped} skipped")
+    return 1 if failed else 0
+
+
+def main():
+    a = sys.argv[1:]
+    if a == ["probe"]:
+        why = why_not()
+        print(why or f"enforced: Landlock ABI {abi()} signal scope")
+        return 1 if why else 0
+    if a == ["fixture"]:
+        return fixture()
+    if a == ["selfcheck"]:
+        return selfcheck()
+    return run(a[1:] if a[:1] == ["--"] else a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

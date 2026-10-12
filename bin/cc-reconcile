@@ -1146,8 +1146,31 @@ def orphans(repos, net=True, grace=GRACE, busy=None):
     return out
 
 
+def keeper(pid):
+    """True for a process no sweep may signal: pid 1 and below, the user manager, a tmux server. The user manager is
+    `systemd` run with --user from a binary named systemd: a comm is one prctl away from any runaway and an argv is
+    whatever it was started with, so a runaway calling itself `systemd --user` would be passed over by every sweep,
+    while /proc/<pid>/exe is the file the kernel ran. An exe this cannot read (a systemd upgraded under it reads
+    "systemd (deleted)", which still matches) leaves comm and argv to decide: passing a runaway over costs less than
+    signalling the manager."""
+    try:
+        comm = open(f"/proc/{pid}/comm").read().strip()
+        user = comm == "systemd" and b"--user" in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+    except OSError:
+        return pid <= 1
+    if user:
+        try:
+            user = os.path.basename(os.readlink(f"/proc/{pid}/exe")).removesuffix(" (deleted)") == "systemd"
+        except OSError:
+            pass
+    return pid <= 1 or user or comm.startswith("tmux: server")
+
+
 def end_it(pids):
-    """SIGTERM to each process's whole group, never our own; one already gone counts as ended."""
+    """SIGTERM to each process's whole group when it leads that group, else to it alone; never our own group, and
+    never pid 1, the user manager or a tmux server, whoever leads the group. One already gone counts as ended.
+    A group the pid does not lead is someone else's: a process the manager forked has the manager's group until it
+    calls setsid, and a TERM to the user manager is exit.target, which took every session down on 2026-10-01."""
     mine, ok = os.getpgid(0), False
     for pid in pids:
         try:
@@ -1155,8 +1178,10 @@ def end_it(pids):
         except OSError:
             ok = True
             continue
+        if keeper(pid) or keeper(pg):
+            continue
         try:
-            if pg != mine:
+            if pg == pid and pg != mine:
                 os.killpg(pg, signal.SIGTERM)
             else:
                 os.kill(pid, signal.SIGTERM)

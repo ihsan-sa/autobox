@@ -202,7 +202,7 @@ tally_line(){ grep -o "$1 selfcheck: .*" <<<"$2" | tail -1; }
 tally_ok(){ grep -qE '(: |, )0 failed' <<<"$(tally_line "$1" "$2")"; }
 # CONTROL: the two greps above are a copy of chk()'s, and a copy that stopped discriminating would pass every tool
 # in silence. These are the shapes that matter, including the two that have actually been written by mistake.
-tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 failed" \
+tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 failed" && tally_ok x "x selfcheck: 0 passed, 0 failed, 1 skipped" \
   && ! tally_ok x "x selfcheck: 28/28" && ! tally_ok x "x selfcheck: all passed" \
   && ! tally_ok x "x selfcheck: 4 passed, 10 failed" && ! tally_ok x "ran 12 cases, none failed" \
   || { echo "check.sh: the tally-shape rule no longer tells a readable tally from an unreadable one"; exit 1; }
@@ -354,9 +354,33 @@ ROOT=$PWD; mkdir -p "$GD/cwd/.cc"; printf 'fixture-repo fixture-track\n' > "$GD/
 # same way), a session's CC_ROLE, CC_HANDOFF, CC_MEMBER_SANDBOX or CC_FAILURES would each prove something else. So
 # every CC_* but this gate's own knobs is dropped at the one place a selfcheck starts — by rule, never by name — and
 # what this gate's own env carries is untouched (cc-green's case 17 reads it after this file ends).
-sc_env=(); for v in "${!CC_@}"; do case $v in CC_CHECK_JOBS|CC_SUITE_PART|CC_LAND_CHANGED|CC_GREEN_DIR|CC_CONFIG_DENY|CC_FIXTURE_SCOPE) ;; *) sc_env+=(-u "$v");; esac; done
-run_sc(){ cd "$GD/cwd" && env "${sc_env[@]}" "$1" selfcheck; }   # ONE way to start a selfcheck: the loop's and the control's
-running=0; ran=""
+# …AND EACH IN A SIGNAL SCOPE OF ITS OWN (cc-nosignal): a selfcheck signals what it started, never this gate, a
+# sibling selfcheck, the user manager or the tmux server — the 2026-10-02 outage was a selfcheck's trap killing a pid.
+# Where the kernel has no signal scope cc-nosignal refuses, and every selfcheck goes red with its line saying so,
+# unless the runner set CC_NOSIGNAL_BARE=1 (the core CI's throwaway VMs do): that knob passes the scrub below.
+# EXCEPT THREE, which read what a Landlock domain hides, and which signal only children they started. The scope is a
+# domain with no_new_privs, and both are inherited. cc-fence tests the kernel's Landlock from a clean process: its
+# "restrict_self without no_new_privs" case cannot be set up, and a stacked domain refuses every cross-directory
+# rename and link (any layer denies REFER unless a rule grants it), so four cases went red on #942's landing.
+# cc-member-broker's and cc-member-import's fixtures drive cc-member-v2, which reads every live member sandbox's
+# /proc/<pid>/fd; a domain may not (Landlock refuses ptrace access outside it), so they refused while one ran.
+# …AND NOT AT ALL WHEN THIS GATE IS ALREADY IN A SCOPE: a cc-loop worker, cc-green's check, a lander that wraps it.
+# Nothing leaves a domain, so the three cannot start clean there and would go red on every worker. The test is the
+# kernel's no_new_privs bit, which cc-nosignal sets, nothing clears and no env scrub drops (CC_NOSIGNAL_ROOT is an env
+# var a scrub loses). Each prints one line and is NOT RUN: not a pass, not in the verdicts, not retried. The landing
+# check runs this gate bare, so they run there; a sandbox that sets the bit without Landlock skips them too, which is
+# right for cc-fence (that case needs the bit unset) and costs nothing for the member tools, whose bwrap cannot nest.
+# Bare means unprotected: those three can signal whatever this gate can. They are not started as user units, which
+# would make the user manager their parent, so a `kill $PPID` in one would be the 2026-10-02 outage again.
+UNSCOPED="cc-fence cc-member-broker cc-member-import"
+scoped(){ [ "$(sed -n 's/^NoNewPrivs:[[:space:]]*//p' /proc/self/status 2>/dev/null)" = 1 ]; }
+clean_only(){   # clean_only <tool> -> 0, with its line printed, when the tool needs a clean process and this gate is not one
+  case " $UNSCOPED " in *" $1 "*) scoped && { echo "  $1: not run — this gate already runs with no_new_privs (inside cc-nosignal's scope or a sandbox), and its cases need a process without it; the landing check runs it"; return 0; };; esac
+  return 1; }
+sc_env=(); for v in "${!CC_@}"; do case $v in CC_CHECK_JOBS|CC_SUITE_PART|CC_LAND_CHANGED|CC_GREEN_DIR|CC_CONFIG_DENY|CC_FIXTURE_SCOPE|CC_NOSIGNAL_BARE) ;; *) sc_env+=(-u "$v");; esac; done
+run_sc(){ local w=("$ROOT/bin/cc-nosignal" --); case " $UNSCOPED " in *" ${1##*/} "*) w=();; esac
+  cd "$GD/cwd" && env "${sc_env[@]}" "${w[@]}" "$1" selfcheck; }   # ONE way to start a selfcheck: the loop's and the control's
+running=0; ran=""; notrun=""
 # cc-board is named here for a reason that is not the list's: the loop must stay one literal `for c in cc-…` line
 # holding ` cc-board `, gated by one `want_selfcheck "$c"`, because cc-board's own selfcheck reads this file and
 # pins both shapes — the rule that its tripwire runs for a change to ANY tool is dead the moment this loop goes
@@ -368,6 +392,23 @@ printf '#!/usr/bin/env bash\nd=$PWD; while [ "$d" != / ]; do [ -f "$d/.cc/track"
 chmod +x "$GD/cwd-probe"
 [ "$(run_sc "$GD/cwd-probe")" = "fixture-repo fixture-track" ] \
   || { echo "check.sh: the selfchecks' cwd no longer carries a track marker of its own — a case that reads its cwd would pass here and fail in every worker's worktree"; exit 1; }
+# CONTROL: the scope is on for a selfcheck (no_new_privs set, where the kernel has it) and off for the three above,
+# which start with this gate's own no_new_privs. Fixtures that print it, three of them named as those tools.
+mkdir -p "$GD/nnp"; for f in cc-fence cc-member-broker cc-member-import cc-other; do printf '#!/bin/sh\nsed -n "s/^NoNewPrivs:[[:space:]]*//p" /proc/self/status\n' > "$GD/nnp/$f"; chmod +x "$GD/nnp/$f"; done
+nnp_gate=$(sed -n 's/^NoNewPrivs:[[:space:]]*//p' /proc/self/status 2>/dev/null)
+if [ -n "$nnp_gate" ] && "$ROOT/bin/cc-nosignal" probe >/dev/null 2>&1; then
+  [ "$(run_sc "$GD/nnp/cc-other" 2>/dev/null)" = 1 ] && [ "$(run_sc "$GD/nnp/cc-fence" 2>/dev/null)" = "$nnp_gate" ] \
+    && [ "$(run_sc "$GD/nnp/cc-member-broker" 2>/dev/null)" = "$nnp_gate" ] && [ "$(run_sc "$GD/nnp/cc-member-import" 2>/dev/null)" = "$nnp_gate" ] \
+    || { echo "check.sh: run_sc no longer starts a selfcheck in cc-nosignal's scope, or no longer starts the three named above outside it"; exit 1; }
+  # …AND INSIDE A SCOPE THE THREE ARE NOT RUN, each with its line, while every other tool still is; outside one, all run.
+  { echo '#!/usr/bin/env bash'; declare -p UNSCOPED; declare -f scoped clean_only; echo 'for c in "$@"; do clean_only "$c" || echo "runs $c"; done'; } > "$GD/scope-probe"
+  chmod +x "$GD/scope-probe"
+  in=$("$ROOT/bin/cc-nosignal" -- "$GD/scope-probe" $UNSCOPED cc-other 2>/dev/null); out=$("$GD/scope-probe" $UNSCOPED cc-other)
+  told=0; for c in $UNSCOPED; do grep -qx "  $c: not run — .*the landing check runs it" <<<"$in" && told=$((told + 1)); done
+  { [ "$told" = 3 ] && [ "$(grep -c '^runs ' <<<"$in")" = 1 ] && grep -qx 'runs cc-other' <<<"$in" \
+      && { [ "$nnp_gate" = 1 ] || [ "$(grep -c '^runs ' <<<"$out")" = 4 ]; }; } \
+    || { echo "check.sh: inside a scope the three no longer print 'not run' while the rest run, or outside one they no longer all run:"; printf '%s\n' "$in" "$out"; exit 1; }
+fi
 # RED ONCE IS NOT RED FOR THE DIFF — selftest.sh's chk() rule, here too. This gate runs beside other roots' suites,
 # and a case that races the machine goes red under that load and green alone on the same tree: cc-member-broker's
 # /proc fd read and cc-digest's ledger line each cost a whole cc-green run on 2026-09-12. So a selfcheck that exits
@@ -410,6 +451,7 @@ for c in cc-board $others; do
   # …and only by the half that owns it. A tool's selfcheck belongs to this box only if it says so (PART_BOX_TOOLS
   # in tests/green.sh names the four and why); every other one is portable and runs wherever this half runs.
   part_here "$c" "$(part_of_tool "$c")" || { echo "  · $PART_WHY"; continue; }
+  clean_only "$c" && { notrun="$notrun $c"; continue; }   # this half's to run, and not runnable from inside a scope
   ran="$ran $c"
   { rc=0; o=$(run_sc "$ROOT/bin/$c" 2>&1) || rc=$?; printf '%s' "$o" > "$SCD/$c.out"; echo "$rc" > "$SCD/$c.rc"; } &
   running=$((running + 1))
@@ -421,11 +463,12 @@ done
 # counted — what ran here, what another runner owns, what ships nothing, what this change did not reach — because
 # a count cannot tell you which tool went missing and the name can.
 n_of(){ set -- $1; echo $#; }   # counted inside a function, so this gate's own "$@" (extra python files) is untouched
-echo "check.sh: selfchecks: $(n_of "$FOUND") of $(n_of "$FOUND$NOSC") tools under bin/ ship one — $(n_of "$ran") ran here, $(n_of "$ELSEWHERE") run elsewhere, $(n_of "$skipped") out of this change's reach, $(part_n "$PART_DEFERRED") in the other half"
+echo "check.sh: selfchecks: $(n_of "$FOUND") of $(n_of "$FOUND$NOSC") tools under bin/ ship one — $(n_of "$ran") ran here, $(n_of "$notrun") not run inside a scope, $(n_of "$ELSEWHERE") run elsewhere, $(n_of "$skipped") out of this change's reach, $(part_n "$PART_DEFERRED") in the other half"
 echo "  here:$ran"
 echo "  elsewhere, not twice (tests/selftest.sh, or the tool named):$ELSEWHERE"
 echo "  ships none — not a failure, named so an absent selfcheck is visible:$NOSC"
 [ -z "$skipped" ] || echo "  not in this change's reach, not run:$skipped"
+[ -z "$notrun" ] || echo "  not run — this gate is inside a scope and they need a clean process; not a pass, the landing check runs them:$notrun"
 wait
 # THE VERDICT LOOP WALKS WHAT WAS STARTED, not what happens to have left a file behind. A job killed before it
 # could write its rc leaves nothing, and a loop reading the directory would have counted that silence as a tool
