@@ -8,6 +8,7 @@
 # `cc-sandbox selfcheck`. Nothing live selects this yet: `cc` and `cc-sandbox` reach it only
 # under CC_MEMBER_V2=1, and the fence refuses a TTY, so it takes pipes or /dev/null on stdio.
 import ctypes as C
+import errno
 import fcntl
 import json
 import os
@@ -89,6 +90,13 @@ def exiting(proc):
     return bool(int((proc / "stat").read_text().rsplit(")", 1)[1].split()[6]) & 0x4)
 
 
+def why(exc, step):
+    # WHAT REFUSED, IN THE REFUSAL. "cannot be inspected" alone held main red for a morning (2026-10-12)
+    # and named nothing to look at, and the box was green again before anyone could. So it says which call failed
+    # and with which errno, never the descriptor target, which is text from the other namespace.
+    return f"{step}: {errno.errorcode.get(exc.errno, exc.errno)}"
+
+
 def gone(task):
     # Not evidence: a task whose stat no longer reads has gone, and one with PF_EXITING is part-way out.
     try:
@@ -129,19 +137,22 @@ def inventory(v):
             continue
         try:
             tasks.extend((p / "task").iterdir())
-        except OSError:
+        except OSError as exc:
             if not gone(p):
-                raise ValueError(f"live namespace {p.name} cannot be inspected") from None
+                raise ValueError(f"live namespace {p.name} cannot be inspected ({why(exc, 'task/')})") from None
     for p in tasks:
+        step = "stat"
         try:
             if p.stat().st_uid != os.getuid():
                 continue
+            step = "mountinfo"
             rows = mounts(p)
             if not any(at == Path("/") and fs == "tmpfs" for _, _, at, fs in rows):
                 continue
             # A NON-DUMPABLE PROCESS (prctl PR_SET_DUMPABLE 0) answers EACCES on ns/mnt and fd/ while its
             # mountinfo still reads. It is live, so it is not skipped: without ns/mnt it counts as another
             # namespace, its mount table is checked, and the descriptor listing below refuses it.
+            step = "ns/mnt"
             try:
                 if os.readlink(p / "ns/mnt") == own:
                     continue
@@ -163,8 +174,9 @@ def inventory(v):
             require(None not in exposed, f"live namespace {p.name} exposes V; stop it before provisioning")
             require(len(exposed) <= 1,
                     f"live namespace {p.name} exposes storage of more than one task; stop it before provisioning")
+            step = "fd/"
             entries = list((p / "fd").iterdir())
-        except OSError:
+        except OSError as exc:
             # /proc GOES WITH THE PROCESS, and this walk is over a whole box. A pid that exits under
             # it answers ENOENT, ESRCH or, once it is a zombie, EINVAL — measured on a busy box, where
             # `mountinfo` of an exiting process refused every launch. A process that is gone is not
@@ -177,19 +189,22 @@ def inventory(v):
             # non-dumpable process is live, and refuses.
             if gone(p):
                 continue
-            raise ValueError(f"live namespace {p.name} cannot be inspected") from None
+            raise ValueError(f"live namespace {p.name} cannot be inspected ({why(exc, step)})") from None
         for fd in entries:
+            step = f"fd {fd.name} readlink"
             try:
                 target = Path(os.readlink(fd).removesuffix(" (deleted)"))
                 if not target.is_absolute():
                     continue
+                step = f"fd {fd.name} stat"
                 st = fd.stat()
             except FileNotFoundError:
                 continue   # one descriptor closed under the walk; every other one is still counted
-            except OSError:
+            except OSError as exc:
                 if gone(p):
                     continue
-                raise ValueError(f"live namespace {p.name} has a descriptor that cannot be inspected") from None
+                raise ValueError(f"live namespace {p.name} has a descriptor that cannot be inspected "
+                                 f"({why(exc, step)})") from None
             # TWO TESTS, AND THE SECOND IS ONLY MEANINGFUL ON V'S OWN FILESYSTEM. The inode pair is
             # namespace-independent and catches a descriptor on V or on any parent of it, which is the
             # real exposure. The path is TEXT READ FROM THE OTHER NAMESPACE, where the same spelling

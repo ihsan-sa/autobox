@@ -473,8 +473,10 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                             proc.communicate(b"stop\n", timeout=GUARD)
                         os.close(vfd)
                 shape, refused = hidden("nodump")
-                check(shape == "ns/mnt unreadable" and "cannot be inspected" in refused,
-                      "a live non-dumpable process in a sandbox's namespace, holding a descriptor on V, refuses",
+                # …and the refusal names the call and the errno, so a red on a box says what to look at.
+                check(shape == "ns/mnt unreadable" and "cannot be inspected (fd/: EACCES)" in refused,
+                      "a live non-dumpable process in a sandbox's namespace, holding a descriptor on V, refuses "
+                      "and names the call that was refused",
                       f"{shape}; {refused or 'allowed'}")
                 shape, refused = hidden("nodump", bind=("--bind", v, "/exposed"), fd_on_v=False)
                 check(shape == "ns/mnt unreadable" and "exposes V" in refused,

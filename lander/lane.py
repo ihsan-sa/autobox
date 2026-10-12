@@ -1027,7 +1027,10 @@ class Lane:
         if o.status == T.UNRUNNABLE:
             job.extra["attempts"] = int(job.extra.get("attempts") or 0) + 1
             if job.extra["attempts"] >= UNRUNNABLE_TRIES:
-                return self.query(job, f"check {n} could not run {UNRUNNABLE_TRIES} times", "planning")
+                # the last try's reason goes with the query: "could not run 3 times" alone sent a full /tmp to
+                # planning as a mystery (#1087, 2026-10-11), its cause left in the hold history and a gone log
+                return self.query(job, f"check {n} could not run {UNRUNNABLE_TRIES} times"
+                                       + (f": {o.note}" if o.note else ""), "planning")
             return self.hold(job, f"check {n} could not run (try {job.extra['attempts']} of "
                                   f"{UNRUNNABLE_TRIES}): {o.note}", kind="box")
         if (job.extra.get("main_red") or {}).get("check") == n:

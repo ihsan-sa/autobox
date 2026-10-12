@@ -20,7 +20,9 @@ or `cc-loop`, with its kind and what relaunches it.
   member  <repo>, `cc __runmember`: `cc <repo>`, and it comes back COLD, on a new conversation. There is no supported
           way to resume it: its claude runs inside `cc-sandbox member`, which links its own claude and takes no
           CC_CLAUDE wrapper from the host, and the seat path of `cc __runmember` passes no --resume. Resuming one
-          needs a change to cc and cc-sandbox, not here.
+          needs a change to cc and cc-sandbox, not here. A member TRACK, window <repo>/<track> on `cc __runmember
+          <repo> <track>`, keeps its track and comes back `cc <repo> <track>` (cold the same way), with its catch-up
+          by `--say`; a plain `cc <repo>` would find the workspace's own window up and bring nothing back.
   track   <repo>/<track>, `cc __run`: `cc <repo> <track>`, which resumes on the board's own session id.
   worker  <repo>/<track> running cc-loop: `cc <repo> <track> --go "" --loop N <its flags> --resume-last`.
   Never saved: `box` (tmux-main starts it), `_*` test windows, `~next`/`~old` handoff windows, and the perms
@@ -56,7 +58,7 @@ address, the hotspot and the firewall are never touched — the detector only re
 RESTORE: it marks itself running before it reads the saved set, so no tick rewrites that set until it ends. Then
 the tmux server (cc-boot), then the network (up to 15 min by the wall clock: claude needs it), then each saved
 session in turn, seats → orchs → members → tracks → workers, 20 s apart. One already live is left alone. Each
-non-worker gets a catch-up message once its claude is up (cc-msg; a track by `cc <repo> <track> --say`); a worker
+non-worker gets a catch-up message once its claude is up (cc-msg; a track or member track by `cc <repo> <track> --say`); a worker
 keeps its own journal and gets none. The result goes to restore.log and one cc-notify line. The saved set is a file,
 so no record is trusted: one whose names are not from a safe charset, whose repo is not a directory under ~/dev, whose
 worker flags are not the ones a scan saves, or whose claude is not the box's own ~/.local/bin/claude is REFUSED, logged
@@ -311,7 +313,7 @@ def classify(name, pane):
     rec = {"kind": kind, "window": name, "repo": repo}
     if kind == "orch":
         rec["alias"] = alias
-    if kind == "track":
+    if kind == "track" or (kind == "member" and track):   # a member track: `cc __runmember <repo> <track>`
         rec["track"] = track
     if kind in ("seat", "orch"):
         c = claude_under(pane)
@@ -628,6 +630,8 @@ def unsafe(rec):
     if k not in ORDER:
         return "unknown kind"
     fields = ["repo"] + {"orch": ["alias"], "track": ["track"], "worker": ["track"]}.get(k, [])
+    if k == "member" and rec.get("track") is not None:
+        fields.append("track")
     for f in fields:
         if not isinstance(rec.get(f), str) or not NAME.fullmatch(rec[f]):
             return f"bad {f}"
@@ -636,7 +640,9 @@ def unsafe(rec):
     repo, w = rec["repo"], rec.get("window")
     want = {"orch": [f"{repo}@{rec.get('alias')}"], "track": [f"{repo}/{rec.get('track')}"],
             "worker": [f"{repo}/{rec.get('track')}"]}.get(k, [repo])
-    if not (w in want or (k == "member" and isinstance(w, str) and w.startswith(repo + "/") and NAME.fullmatch(w[len(repo) + 1:]))):
+    if k == "member" and rec.get("track"):
+        want = [f"{repo}/{rec['track']}"]
+    if w not in want:   # a member window <repo>/<x> with no track is refused: plain `cc <repo>` would not bring it back
         return "window does not match its repo"
     dev = os.path.realpath(DEV)
     if not (os.path.isdir(os.path.join(DEV, repo)) and os.path.dirname(os.path.realpath(os.path.join(DEV, repo))) == dev):
@@ -679,7 +685,7 @@ def launch_argv(rec):
     k = rec["kind"]
     if k == "orch":
         return [cc, rec["repo"], "--orch", rec["alias"], ""]
-    if k == "track":
+    if k == "track" or (k == "member" and rec.get("track")):
         return [cc, rec["repo"], rec["track"]]
     if k == "worker":
         flags = list(rec.get("flags", []))
@@ -811,7 +817,7 @@ def relaunch(sessions, msg, env):
                 log("restore.log", f"{w}: no claude under the window after 90 s — no catch-up sent")
             else:
                 time.sleep(settle)
-                if rec["kind"] == "track":
+                if rec.get("track"):   # a track or a member track
                     mrc, mout = run([os.path.join(BIN, "cc"), rec["repo"], rec["track"], "--say", msg], env=env)
                 else:
                     mrc, mout = run([os.path.join(BIN, "cc-msg"), w, msg], env=env)
@@ -1142,6 +1148,29 @@ def selfcheck():
         check("restore: a paused project stays down while the rest come back",
               not any(c.startswith("cc|m1|") for c in calls) and any(c.startswith("cc|r1|") for c in calls)
               and "m1 is paused" in open(path("restore.log")).read())
+        # a member workspace's track window (`cc __runmember <repo> <track>`) comes back as that track, not as the
+        # workspace: the hub move lost two this way, `cc m1` finding the workspace window up and returning 0
+        d = fixture()
+        proc(200, ["bash", "/b/cc", "__runmember", "m1"], [201]); proc(201, ["bwrap", "--", "claude"])
+        proc(210, ["bash", "/b/cc", "__runmember", "m1", "stock", ""], [211]); proc(211, ["bwrap", "--", "claude"])
+        open(f"{d}/windows.tsv", "w").write("box\t160\nm1\t200\nm1/stock\t210\n")
+        s = scan()
+        check("scan: a member track keeps its track; the member workspace has none",
+              s["m1/stock"]["kind"] == "member" and s["m1/stock"].get("track") == "stock" and "track" not in s["m1"])
+        save({}); open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        globals()["claude_pid"] = lambda w: "999"
+        rc = restore(boot=True)
+        calls = open(f"{d}/calls").read().splitlines()
+        check("restore: a member track is relaunched `cc <repo> <track>` and caught up by --say; the workspace by cc <repo>",
+              "cc|m1|stock|" in calls and "cc|m1|" in calls and any(c.startswith("cc|m1|stock|--say|") for c in calls)
+              and any(c.startswith("cc-msg|m1|") for c in calls) and not any(c.startswith("cc-msg|m1/stock|") for c in calls) and rc == 0)
+        d = fixture(); store("live.json", {"saved": "", "sessions": {"m1/x": {"kind": "member", "window": "m1/x", "repo": "m1"},
+                                                                    "m1/y": {"kind": "member", "window": "m1/y", "repo": "m1", "track": "z"}}})
+        restore(boot=True)
+        rlog = open(path("restore.log")).read()
+        check("restore: a member record on a <repo>/<x> window with no track, or another track, is refused, not run as cc <repo>",
+              rlog.count("window does not match its repo") == 2
+              and (not os.path.exists(f"{d}/calls") or not any(c.startswith("cc|") for c in open(f"{d}/calls").read().splitlines())))
         d = fixture(); live_box(d); save({})
         open(f"{d}/windows.tsv", "w").write("box\t160\n")
         os.environ["CC_RECOVER_RESTORE"] = "off"

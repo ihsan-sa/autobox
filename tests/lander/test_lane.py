@@ -2484,6 +2484,20 @@ class Review(Fixture):
         self.assertEqual((j.state, j.extra["attempts"]), (T.QUERY, 3))
         self.assertIn("gate=a ok=no", self.log())
 
+    def test_unrunnable_query_says_why(self):
+        """The query carries the last try's reason (#1087: a full /tmp reached planning as 'could not run 3 times')."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        for n in range(3):
+            j = self.job()
+            if j:
+                j.extra["not_before"] = E.stamp(time.time() - 1)
+                J.save(j)
+            self.land(runner=Runner(status={"a": T.UNRUNNABLE}, notes={"a": "No space left on device"}))
+        j = self.job()
+        self.assertEqual(j.state, T.QUERY)
+        self.assertEqual(j.extra["why"], "check a could not run 3 times: No space left on device")
+
 
 class HeldRereads(Fixture):
     """A held job re-reads the PR's state and head when it is looked at again (2026-09-30: a PR sat closed for days,

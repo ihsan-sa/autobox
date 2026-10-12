@@ -36,7 +36,7 @@ ONE PASS PER DIR, two tool-less model calls:
            Slack thread (C…/ts) or a PR number (#123). A note that is a symlink is never read or written.
   The script, not the model, writes every file, and it refuses an op that would:
     · drop a `feedback` or `user` note (only `project` and `reference` notes are ever dropped);
-    · lose an owner quote (a "…" of 20+ characters in a feedback note), a **Why:** or **How to apply:** line (in a
+    · lose the first sentence of a feedback or user source (the rule itself), an owner quote (a "…" of 20+ characters in a feedback note), a **Why:** or **How to apply:** line (in a
       feedback or user note, its text word for word), a URL, or a [[link]] to a note outside the merge;
     · drop a note another note [[links]] to;
     · merge a feedback or user note into a note of another type, or grow the merged body past its sources';
@@ -421,6 +421,12 @@ def reasons(text):
     return [(m.group(1), flat(m.group(2))) for m in MARK.finditer(text)]
 
 
+def rule_line(text):
+    """A feedback or user note's first sentence: the rule itself, which carries no marker of its own."""
+    head = flat(re.split(r"\*\*(?:Why|How to apply):\*\*", text, maxsplit=1)[0])
+    return re.split(r"(?<=[.!?])\s", head, maxsplit=1)[0]
+
+
 def keepers(text, typ):
     """What a merged body must still carry from one source."""
     k = set(re.findall(r"\[\[[^\]]+\]\]", text)) | set(re.findall(r"https?://[^\s)>\]]+", text))
@@ -447,6 +453,10 @@ def check_merge(m, notes):
     inside = {f"[[{x[:-3]}]]" for x in src}    # a link to a note this merge folds in has nowhere left to point
     whole = flat(body)
     for s in src:
+        # a rule's own sentence has no quote, link or marker to hold it; each source's first sentence must survive too
+        rule = rule_line(notes[s]["body"]) if notes[s]["type"] in ("feedback", "user") else ""
+        if rule and rule not in whole:
+            return f"{s} would lose its rule {rule[:60]!r}"
         lost = [k for k in keepers(notes[s]["body"], notes[s]["type"]) - inside if k not in body]
         if lost:
             return f"{s} would lose {lost[0][:60]!r}"
@@ -633,7 +643,6 @@ def dream_dir(d, models, day, dry=False):
                     c["skipped_live"] += 1
                     log.append(f"- skipped merge {src}: a session wrote one of them during the pass")
                     continue
-                used |= set(src)
                 log.append(f"- merged {', '.join(src)} → {into}: {str(m.get('why', ''))[:200]}")
                 if dry:
                     out = set(src) - {into}
@@ -649,6 +658,7 @@ def dream_dir(d, models, day, dry=False):
                             os.unlink(os.path.join(d, s))
                             touched.add(s)
                             out.add(s)
+                used |= set(src)    # only a merge that happened takes its sources out of reach of the drops and links
                 gone |= out
                 merged[into] = [s for s in src if s == into or s in out]
                 retitle[into] = (m["title"].strip(), m["hook"].strip())
@@ -742,6 +752,12 @@ def dream_dir(d, models, day, dry=False):
                 if not commit(d, f"dream {day}: {c['merged']} merged, {c['dropped']} dropped, {c['hooks']} hooks, "
                                  f"{c['linked']} linked", empty=True, paths=sorted(touched)):
                     raise RuntimeError("the dream commit failed; its changes are on disk uncommitted, and rollback would undo an earlier night")
+    except Exception as e:
+        # a partly applied night stays readable: cmd_run writes the detail from what the pass had logged so far
+        c["log"], c["proposals_list"] = log, []
+        c.setdefault("index_after", c["index_before"])
+        e.dream_partial = c
+        raise
     finally:
         if fd is not None:
             os.close(fd)
@@ -810,6 +826,10 @@ def cmd_run(argv):
         except Exception as e:     # one dir's failure never ends the night; its writes are already committed or untouched
             why = str(e) if isinstance(e, (RuntimeError, OSError)) else f"{type(e).__name__}: {e}"
             errs.append(f"{os.path.basename(os.path.dirname(d))}: {why[:120]}")
+            part = getattr(e, "dream_partial", None)
+            if part and not dry:
+                part["log"].append(f"- ERROR, the pass stopped here: {why[:200]}")
+                write_detail(d, day, part)
             continue
         for k, v in c.items():
             if isinstance(v, int) and not k.startswith("index"):
@@ -1165,14 +1185,15 @@ def selfcheck():
         try:
             dream_dir(d, Fake({"merges": [MERGE], "drops": [{"file": "old-incident.md"}]}), "2026-01-01")
             raised = False
-        except OSError:
-            raised = True
+        except OSError as e:
+            raised = "- merged " in "\n".join(getattr(e, "dream_partial", {}).get("log", []))
         finally:
             os.unlink = real_unlink
         ok(raised and git(d, "log", "-1", "--format=%s").stdout.startswith("dream 2026-01-01: 1 merged")
            and "rule-a-dup.md" not in read(os.path.join(d, "MEMORY.md"))
            and git(d, "status", "--porcelain", "--", ":(glob)*.md").stdout.split() == ["M", "pref.md"],
-           "a failure after the first write still lands the index edit and the dream commit, and only the pass's files")
+           "a failure after the first write still lands the index edit and the dream commit, and only the pass's files; "
+           "the error carries the night's log so far")
     os.environ.clear()
     os.environ.update(env0)
 
@@ -1204,8 +1225,10 @@ def selfcheck():
         q = 'Owner said "never post to Slack without a thread ts".\n\n'
         one_why = dict(MERGE, body=q + "**Why:** noise.\n\n**How to apply:** pass thread_ts on every reply.")
         no_how = dict(MERGE, body=q + "**Why:** noise. Also, a reader on a phone loses the thread.\n\n**How to apply:** always.")
-        run(tmp, root, {"merges": [one_why, no_how]})
-        ok(os.path.exists(os.path.join(d, "rule-a-dup.md")) and "refused=2" in read(os.path.join(tmp, "state", "nights.log")),
+        no_rule = dict(MERGE, body='"never post to Slack without a thread ts"\n\n**Why:** noise. Also, a reader on a phone loses '
+                                   'the thread.\n\n**How to apply:** pass thread_ts on every reply.')
+        run(tmp, root, {"merges": [one_why, no_how, no_rule]})
+        ok(os.path.exists(os.path.join(d, "rule-a-dup.md")) and "refused=3" in read(os.path.join(tmp, "state", "nights.log")),
            "a feedback merge that loses one source's Why or How-to-apply text is refused")
         both = dict(MERGE, body=q + "**Why:** noise. Also, a reader on a phone loses the thread.\n\n**How to apply:** pass thread_ts on every reply.")
         run(tmp, root, {"merges": [both]}, args=("--dir", d))
