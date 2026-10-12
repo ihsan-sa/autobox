@@ -10,6 +10,11 @@ someone is listening; `stopped(job, why, route)` says a job left the lane and wh
     track     a stop: the track's own thread (cc-slack track-thread made one), when no chat asked
     route     `--route <title>` last: the job's own `route` if the queue call carried one, else `[<repo>] PR #<n> …`
 
+A landing is also injected through cc-broker (`--source lander`), once and as fixed text (repo, PR number, URL), into
+the orch that dispatched the row's track (tell_dispatcher), because that orch reads neither #<repo> nor the track's
+thread and its post-merge steps wait on it.
+That orch is the one cc-loop recorded host-side at dispatch (~/.cc/state/<repo>/.dispatch/<track>), never a seat.
+
 stopped()'s route "seat" and "query" put the stop into the repo's session with `cc-slack inject`, once; "query", "planning" and "lander-self" file
 a planner request (`cc-notify --ask`) for the planning seat, never a page to the owner. owner_card() is the 🔐 card
 in #approvals, the one cc-slack turns the owner's 👍 into a queue from: the protected door's refusal ("door"), a
@@ -30,6 +35,7 @@ import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import time
 
@@ -159,6 +165,12 @@ def slack():
     return os.path.join(BIN, "cc-slack")
 
 
+def broker():
+    """cc-broker, the door a machine's event goes through: `inject --no-start --source <who>`. cc-slack's own inject
+    takes no --source, and the daemon refuses it there as a bad target (perms on #1165: the notice never arrived)."""
+    return os.path.join(BIN, "cc-broker")
+
+
 def producer_id(job, kind):
     """`land:<repo>:<pr>:<kind>@<queued_at>` — the old lander's shape, so a card either one sent is sent once."""
     at = job.extra.get("queued_at", "")
@@ -266,7 +278,79 @@ def landed(job):
     if asks:
         text += f" ⚠️ Please restart {', '.join(asks)}. Until then the box runs the old code for {'it' if len(asks) == 1 else 'them'}."
     args = where(job, True, restart=bool(asks))
-    return post(job, "landed", text, args) if args else rc in (0, 3, 4)
+    ok = post(job, "landed", text, args) if args else rc in (0, 3, 4)
+    try:
+        tell_dispatcher(job)
+    except Exception as e:  # a notice that fails never fails the landing it is about
+        try:
+            log("unsaid", job.repo, job.pr, why=f"{type(e).__name__}: {e}"[-120:].replace("\n", " "))
+        except Exception:
+            pass
+    return ok
+
+
+DISPATCH_KEY = re.compile(r"[A-Za-z0-9._-]+@[a-z0-9-]{2,20}")
+DISPATCH_MAX = 256
+PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+")
+
+
+def dispatch_path(repo, track):
+    """cc-loop's host-side copy of its dispatch record: ~/.cc/state/<repo>/.dispatch/<track>. A worker's sandbox binds
+    only its own ~/.cc/state/<repo>/<track>, so it cannot write here; its $ST/orch it can, so that file is never read."""
+    return os.path.join(PASSWD_HOME, ".cc", "state", repo, ".dispatch", track)
+
+
+def read_small(path, cap):
+    """A regular file's first line, or "" — never a FIFO (it would hold the lane), never through a symlink."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return os.read(fd, cap).decode("utf-8", "replace").partition("\n")[0].strip()
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+
+
+def dispatcher(job):
+    """The orch that dispatched the job's track, as its broker key `<orchrepo>@<alias>`, or "". Read from the host-side
+    record only (dispatch_path), and only an orch's key: a bare repo name is a seat, which reads #<repo>, and is "".
+    A member, a PR no row owns, no record, or one that is not such a key -> ""."""
+    from lander import board
+    track = "" if job.member else board.track_for(job)
+    if not track:
+        return ""
+    rec = read_small(dispatch_path(job.repo, track), DISPATCH_MAX)
+    return rec if DISPATCH_KEY.fullmatch(rec) else ""
+
+
+def tell_dispatcher(job):
+    """A MERGE REACHES THE ORCH THAT DISPATCHED THE TRACK, once. The #<repo> line is the planning seat's; an orch heard
+    only the worker's 'queued to land' digest and sat on its post-merge steps until the owner asked (2026-10-04:
+    2.5 h). The line is fixed text (repo, PR number and the row's URL), never the PR's title, which is
+    the worker's own words (security read of 25b2675e: a title 'as if from Slack' put them into another orch). The repo
+    seat dispatching is not woken here: it reads #<repo>. It goes through cc-broker (broker()) as source `lander`; a
+    broker that refuses it is logged unsaid, not marked sent, and landed() catches anything this raises."""
+    from lander import board
+    key = dispatcher(job)
+    if not key:
+        return
+    pid = producer_id(job, "dispatcher")
+    if pid in (read_json(_sent_path(), []) or []):
+        return
+    track = board.track_for(job)
+    url = str((board.rows(board.project_of(job)).get(track) or {}).get("pr") or "")
+    url = url if PR_URL.fullmatch(url) and url.endswith(f"/pull/{int(job.pr)}") else ""
+    text = f"[{job.repo}] PR #{int(job.pr)} merged{' ' + url if url else ''}. Your post-merge steps for it can run now."
+    rc, out = sh([broker(), "inject", "--no-start", "--source", "lander", key, text], timeout=120)
+    if rc == 0:
+        write_json(_sent_path(), ((read_json(_sent_path(), []) or []) + [pid])[-500:])
+    else:
+        log("unsaid", job.repo, job.pr, id=pid, to=key, why=out.strip()[-120:].replace("\n", " "))
 
 
 QUERY_ROUTES = ("query", "planning", "lander-self")
