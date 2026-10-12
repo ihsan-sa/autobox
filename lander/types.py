@@ -330,6 +330,10 @@ class Reviewer(Protocol):
         """U3, lander/review.py. The re-read after a handback: the interdiff against prior.blocking, filling
         resolved/unresolved; new blockers only on added lines."""
 
+    def standing(self, job: Job) -> Optional[Verdict]:
+        """U3, lander/review.py. The HANDBACK the box last wrote on the PR at any head, or None; the lane asks it of
+        a change on no paid path, so a handback is never dropped because the head moved."""
+
 
 class Events(Protocol):
     def log(self, kind: str, repo: str, pr: int, **kv: Any) -> None:

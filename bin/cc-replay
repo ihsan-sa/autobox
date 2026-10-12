@@ -9,7 +9,9 @@ TODAY'S LANDER (the core/lander package):
       branch gone, plus history's 1-minute load (sysstat) and its slot waits: each time a check started 1-60 min
       after the lane's `checking` line (or the check before it). A PR already in flight when the window opened is
       kept and marked inflight: the score replays it, because it held slots and parked PRs on its files, but
-      never counts it. One that merged or ended before the window is left out. Each PR also carries when and how
+      never counts it. One that merged or ended before the window is left out. Each PR keeps its last head and
+      clean_with: the PRs sharing a file with it whose last heads git merges cleanly with its own (merge-tree in the
+      repo's checkout), which answers a candidate that parks only on a clash. Each PR also carries when and how
       history's lane first let it go (left: a query, a handback or a merge). A `refused` ask (a member's token,
       repository or clone, a protected path) never reached the inbox, so it is a blocked arrival: a PR refused
       before its first `queued` keeps those refusals and its ready time, the earliest refusal or the stamp FILE
@@ -31,7 +33,8 @@ TODAY'S LANDER (the core/lander package):
       Prints queued→merged p50 and p95 and the lane-minutes full-suite PRs held, history's same numbers beside
       them over the PRs both merged; then ready→left p50 and p95, from the PR's ready time (its first `queued`
       unless it was refused first) to its first query, handback or merge, over the PRs both let go, and what the
-      door held; then a per-PR table (both columns, and how each left) and a per-repo one of ready→left. The
+      door held; then the replay's parks (`stage … parked` lines), per hour of the window, and the PR-hours parked
+      (each from its first park to its next stage line); then a per-PR table (both columns, and how each left) and a per-repo one of ready→left. The
       refusals are history's in both columns, since the replay drives the lane and not its door. The replay's
       own queue.log is read by the same parser.
 
@@ -1918,11 +1921,13 @@ def lander_trace(log, landq, since, until, repos=(), rels="", ready=None):
         p["paid"] = bool(plan.get("paid")) if plan else bool(p["verdicts"])
         p["klass"] = plan.get("klass") or "leaf"
         p["files"] = list(j.get("files") or [])
+        p["head"] = str(j.get("head") or "")
         p["title"] = str(j.get("title") or "")
         p["opaque"] = not j and not p["gates"]   # history's lane never planned it: nothing says what it would run
         for g, runs in p["gates"].items():
             gsecs.setdefault(g, []).extend(r[1] for r in runs if r[2] == "yes")
         rsecs.extend(s for _, _, s in p["verdicts"])
+    clean_pairs(prs.values())
     return {"version": 3, "kind": "lander", "since": stamp(since), "until": stamp(until), "extracted_at": stamp(time.time()),
             "left_out": sorted(left_out - set(prs)), "cores": os.cpu_count() or 1, "waiting": waiting,
             "undated": sorted(k for k in undated if not repos or k.rpartition("#")[0] in repos),
@@ -1931,6 +1936,27 @@ def lander_trace(log, landq, since, until, repos=(), rels="", ready=None):
             "medians": {"gate": {g: int(median(v, 60)) for g, v in sorted(gsecs.items())},
                         "review": int(median(rsecs, DEFAULT_REVIEW))},
             "prs": sorted(prs.values(), key=lambda p: (p["arrivals"][0], p["repo"], p["pr"]))}
+
+
+def clean_pairs(prs):
+    """Each PR's clean_with: the PRs of its repo it shares a file with and whose last heads git merges cleanly with its
+    own (merge-tree of the two heads), for a candidate that parks only on a clash (lane.clashes). Read once at extract,
+    from the job's last head only, so a PR that moved in the window answers for every head it had."""
+    by = {}
+    for p in prs:
+        p["clean_with"] = []
+        if p.get("head") and p["files"]:
+            by.setdefault(p["repo"], []).append(p)
+    for repo, ps in by.items():
+        root = repo_root_of(repo)
+        for i, a in enumerate(ps):
+            for b in ps[i + 1:]:
+                if set(a["files"]) & set(b["files"]):
+                    rc, _ = sh(["git", "merge-tree", "--write-tree", "--name-only", "--no-messages", a["head"],
+                                b["head"]], cwd=root)
+                    if rc == 0:
+                        a["clean_with"].append(b["pr"])
+                        b["clean_with"].append(a["pr"])
 
 
 def main_red_spans(trace):
@@ -2075,7 +2101,13 @@ def replay_numbers(trace, log):
     asks = {f"{p['repo']}#{p['pr']}": asked(p) for p in scored(trace)}
     full = {f"{p['repo']}#{p['pr']}" for p in scored(trace) if full_suite(p)}
     lead, lane, gates, reads, left = {}, 0, 0, 0, {}
+    parks, since = {"n": 0, "secs": 0}, {}   # since: key -> when its park began, until its next stage line
     for e, k, key, w in lander_events(log):
+        if k.startswith("stage:") and key in since:
+            parks["secs"] += e - since.pop(key)
+        if k == "stage:parked":
+            parks["n"] += 1
+            since[key] = e
         if key not in starts:
             continue
         if k in LEFT and key not in left:
@@ -2088,7 +2120,8 @@ def replay_numbers(trace, log):
                 lane += int(kv_of(w).get("secs") or 0)
         elif k == "stage:verdict":
             reads += 1
-    return lead, lane, gates, reads, left
+    parks["secs"] += sum(max(0, epoch(trace["until"]) - at) for at in since.values())
+    return lead, lane, gates, reads, left, parks
 
 
 def candidate_core(path):
@@ -2387,6 +2420,17 @@ class LanderWorld:
             return None, list(p["files"][:1]) or ["?"]
         return sha("tree", base, head), []
 
+    def clash(self, root, a, b, env=None):
+        """lane.clashes' question, answered from the trace's clean_with (clean_pairs): [] when git merged the two PRs'
+        heads cleanly at extract, else the files they share (or "?")."""
+        repo = self.repo_of(root)
+        pa, pb = self.pr_of_head(repo, a), self.pr_of_head(repo, b)
+        if pa and pb and pb["pr"] in (pa.get("clean_with") or []):
+            return []
+        if not (pa and pb):
+            return ["?"]
+        return sorted(set(pa["files"]) & set(pb["files"])) or ["?"]
+
     def fetch(self, root, *branches, env=None):
         """{branch: sha} as G.fetch reports what origin sent (a lander that reads origin/<b> afterwards ignores it)."""
         repo = self.repo_of(root)
@@ -2554,6 +2598,7 @@ def stand_in(mods, world, clock):
     L.futures = VFutures(world)
     G.fetch = world.fetch
     G.rev, G.tree_of, G.changed, G.merge_tree = world.rev, world.tree_of, world.changed, world.merge_tree
+    G.clash = world.clash   # a candidate that parks only on a clash asks it; an older one never does
     G.pr_changed = world.changed   # a PR head's files are the PR's own, whatever the base
     G.merge_base = lambda root, a, b, env=None: a
     G.patch_digest = lambda root, base, head, env=None: sha("digest", head)
@@ -2661,8 +2706,8 @@ def lander_score(candidate, trace, slots=0, keep_root=False, pickup="history"):
     try:
         with tripwire(core):
             log = drive(trace, mods, world, clock, root, pickup)
-        lead, lane, gates, reads, left = replay_numbers(trace, f"{root}/land/queue.log")
-        return lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads, left), "\n".join(log)
+        lead, lane, gates, reads, left, parks = replay_numbers(trace, f"{root}/land/queue.log")
+        return lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads, left, parks), "\n".join(log)
     except ReplayLeak as e:
         raise SystemExit(str(e)) from None
     finally:
@@ -2704,12 +2749,13 @@ def leave_line(who, secs):
     return f"{who} p50 {mins(pctl(secs, .5))} min  p95 {mins(pctl(secs, .95))} min"
 
 
-def lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads, left):
+def lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads, left, parks):
     hist, hlane, hleft = history_numbers(trace)
     lboth = sorted(set(hleft) & set(left))
     door = [p for p in scored(trace) if p.get("refusals")]
     waiting, undated = trace.get("waiting") or [], trace.get("undated") or []
     until = epoch(trace["until"])
+    hours = max(until - epoch(trace["since"]), 1) / 3600
     both = sorted(set(hist) & set(lead))
     rp = [lead[k] for k in both]
     hp = [hist[k] for k in both]
@@ -2726,6 +2772,8 @@ def lander_report(trace, candidate, slots, pickup, lead, lane, gates, reads, lef
            f"at the door: {len(door)} PR(s) refused before their first queued (counted from their ready time), "
            f"{len(waiting)} refused and never queued by the window's end (waited {mins(pctl([until - w['ready'] for w in waiting], .5))}"
            f" min p50), {len(undated)} refusal(s) undated, unreplayable",
+           f"parked: replay {parks['n']} park(s), {parks['n'] / hours:.2f} per hour, {parks['secs'] / 3600:.1f} PR-hours"
+           f" parked over the {hours:.1f} h window (first park to the PR's next stage line)",
            "", f"{'PR':<36} {'history':>8} {'replay':>8} {'h-left':>8} {'r-left':>8}  how (history/replay)"]
     for p in scored(trace):
         k = f"{p['repo']}#{p['pr']}"

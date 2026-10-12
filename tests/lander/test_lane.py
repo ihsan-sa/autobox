@@ -228,7 +228,7 @@ class Runner:
 
 class Reviewer:
     def __init__(self, *verdicts):
-        self.verdicts, self.calls = list(verdicts), []
+        self.verdicts, self.calls, self.stands = list(verdicts), [], None
 
     def digest_of(self, root, base, head):
         return "f" * 40
@@ -240,6 +240,9 @@ class Reviewer:
     def delta_review(self, job, prior):
         self.calls.append(("delta", prior.verdict))
         return self.verdicts.pop(0)
+
+    def standing(self, job):
+        return self.stands
 
 
 class Rec:
@@ -2423,6 +2426,38 @@ class Review(Fixture):
         self.land(planner=Planner(paid=True), reviewer=Reviewer(V(T.LAND)))
         j = self.job()
         self.assertEqual((j.state, j.reads_used), (T.DEPLOY_PENDING, 1))
+
+    def test_a_handback_standing_from_an_earlier_head_is_read_again_off_the_paid_paths(self):
+        """#1064: a seat's security HANDBACK at one head, a new head on no paid path -> read again, never merged unread."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        rv = Reviewer(V(T.HANDBACK_VERDICT, blocking=["still wipes the disk"]))
+        rv.stands = V(T.HANDBACK_VERDICT, blocking=["wipes any NVMe disk"], head="c" * 40)
+        u, _ = self.land(planner=Planner(paid=False), reviewer=rv)
+        self.assertEqual(rv.calls, [("review", "f" * 40)])
+        self.assertIsNone(self.job())                               # handed back, not merged
+        self.assertEqual(u["cards"].calls[0][3], "seat")
+        # …and the same unpaid change with no handback standing merges with no read, as before
+        self.pr(2, {"a/y": "n\n"})
+        J.submit("demo", 2)
+        rv = Reviewer()
+        self.land(planner=Planner(paid=False), reviewer=rv)
+        self.assertEqual((rv.calls, self.job(2).state), ([], T.DEPLOY_PENDING))
+
+    def test_the_jobs_own_handback_is_read_again_off_the_paid_paths_with_none_on_the_pr(self):
+        """The job's own last read was a HANDBACK and nothing stands on the PR (standing() is None): still read."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        j = self.job()
+        j.extra["verdict"] = V(T.HANDBACK_VERDICT, blocking=["wipes any NVMe disk"]).to_dict()
+        J.save(j)
+        rv = Reviewer(V(T.HANDBACK_VERDICT, blocking=["still wipes the disk"]))
+        u, _ = self.land(planner=Planner(paid=False), reviewer=rv)
+        self.assertEqual(rv.calls, [("delta", T.HANDBACK_VERDICT)])
+        self.assertIsNone(self.job())                               # handed back, not merged
+        self.assertEqual(u["cards"].calls[0][3], "seat")
 
     def test_reads_cap_goes_to_planning(self):
         self.pr(1, {"a/x": "n\n"})

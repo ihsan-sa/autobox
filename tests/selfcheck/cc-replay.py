@@ -558,6 +558,21 @@ def cmd_selfcheck():
         check("v3 score: the replay's own log is read the same way: each leave kind, the first one only, and a refused "
               "PR's wait counted from its ready time",
               rleft == {"v#1": (5, "query"), "v#2": (40, "handback"), "v#3": (50, "merged"), "m--t#4": (2500, "merged")})
+        with open(f"{vq}/parks.log", "w") as f:   # its own log: one park that ends at a stage line, one that never does
+            f.write("".join(sorted([L(10, "stage v#1 parked on=2"), L(70, "stage v#1 planned"),
+                                    L(100, "stage v#3 parked on=1"), L(120, "queued v#2 who=x")])))
+        parks = replay_numbers(rt, f"{vq}/parks.log")[5]
+        check("v3 score: each `stage … parked` is a park, and it lasts to the PR's next stage line, or to the window's end",
+              parks == {"n": 2, "secs": 60 + 3900})
+        import types as _types
+        pa, pb, pc = ({"pr": 1, "files": ["a", "b"], "clean_with": [2]}, {"pr": 2, "files": ["b"], "clean_with": [1]},
+                      {"pr": 3, "files": ["b", "c"], "clean_with": []})
+        heads = {"h1": pa, "h2": pb, "h3": pc}
+        w = _types.SimpleNamespace(repo_of=lambda root: "v", pr_of_head=lambda repo, h: heads.get(h))
+        check("…a candidate's clash is answered from clean_with: none for a pair git merged cleanly, the shared files "
+              "for one it did not, and a doubt for a head no PR had",
+              LanderWorld.clash(w, "r", "h1", "h2") == [] and LanderWorld.clash(w, "r", "h1", "h3") == ["b"]
+              and LanderWorld.clash(w, "r", "h1", "hx") == ["?"])
         leave = f"{lroot}/leave.json"
         with open(leave, "w") as f:
             json.dump(rt, f)

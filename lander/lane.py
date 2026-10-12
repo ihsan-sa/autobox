@@ -76,7 +76,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              blocked-by-main (red on the base tree too) -> held 15 min and planned again from main then, not blamed;
              a check the manifest lacks -> query "planning"; UNRUNNABLE -> held 15 min, the 3rd -> query, each
              quoting its reason through jobs.quoted (a gate's output line: no control or markup, 200 chars). Then,
-             when the plan is paid, one read (a delta read when a prior verdict exists; none when a LAND is already
+             when the plan is paid or a HANDBACK stands on the PR from any head (handed_back(): the job's own, or
+             one the box wrote there), one read (a delta read when a prior verdict exists; none when a LAND is already
              recorded at this digest): INCOMPLETE -> held till the `until` it names (a usage limit's reset; stage
              `deferred`, which no reader counts as running), no read counted; INCOMPLETE with extra host (a
              read the host failed twice at one head: a 4xx, a timeout, its own cap) -> query "planning", never a
@@ -987,8 +988,9 @@ class Lane:
         return self.tips["m"]
 
     def checking(self, job):
-        """Hand the job's next check to the pool (when the lane has a slot for it), or, when the plan is paid, go on
-        to the review and the merge. The check's outcome is recorded by took(), on the lane's thread."""
+        """Hand the job's next check to the pool (when the lane has a slot for it), or, when the plan is paid or a
+        handback stands, go on to the review and the merge. The check's outcome is recorded by took(), on the lane's
+        thread."""
         if not self.unit("runner"):
             return self.hold(job, "runner is not installed", kind="box")
         if self.reread_due(job) and self.reread(job):
@@ -1056,9 +1058,19 @@ class Lane:
                                                      express)
             self.waiting.add(job.key)   # submitted or not, it goes on when a check finishes and frees a slot
             return None
-        if job.plan and job.plan.paid and not self.review(job):
+        # a handback standing from an earlier head is read again even off the paid paths: #1064's security handback
+        # "was tied to the old head and nothing carried it forward or asked for a new read"
+        if ((job.plan and job.plan.paid) or self.handed_back(job)) and not self.review(job):
             return None
         J.move(job, T.MERGEABLE)
+
+    def handed_back(self, job):
+        """True when a HANDBACK stands on the PR: the job's own last read, or the newest verdict the box wrote there
+        (a seat's `lander record`). A PR whose comments cannot be read raises, so the job is held, never merged."""
+        pv = job.extra.get("verdict")
+        if isinstance(pv, dict) and pv.get("verdict") == T.HANDBACK_VERDICT:
+            return True
+        return bool(self.unit("reviewer") and self.call("reviewer", "standing", job))
 
     def passed(self, store, job, n, tree) -> bool:
         """True, with the pass kept in job.results and a `reused` stage line, when this job's own store holds a pass of

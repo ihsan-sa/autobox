@@ -23,9 +23,15 @@ LAND-AFTER-FIX whose findings are all `[other]` lands (that was its rule too: th
 row); any other LAND-AFTER-FIX, and DO-NOT-LAND, is HANDBACK. Only comments the box's own GitHub login wrote count
 (gh's viewerDidAuthor), as before: anyone can type a marker into a PR.
 
-WHEN A READ IS BOUGHT (review()). A recorded verdict at the digest (or the legacy digest, which kept the hunk
-tail) is returned as it is. Otherwise, a change the plan did not make paid (job.plan.paid false: no paid-review path, and
-some check runs on it, or it adds or changes no code nothing owns) needs no read: LAND with model "" and extra read=none. Otherwise the lander buys one:
+WHEN A READ IS BOUGHT (review(), delta_review()). PR comments gh cannot give -> INCOMPLETE, nothing read or landed:
+a handback recorded there cannot be ruled out. A HANDBACK by a reader whose name says `security` stands, at any
+head, until a later LAND by a reader whose name says `security` (open_security()); while it stands the verdict is
+that HANDBACK and no read is bought, because no read the lander buys is a security reader's. A recorded verdict at
+the digest (or the legacy digest, which kept the hunk tail) is returned as it is. Otherwise a HANDBACK the box last
+wrote at an earlier head (latest()) gets the delta read below, paid or not: a handback is never dropped because the
+head moved. Otherwise, a change the plan did not make paid (job.plan.paid false: no paid-review path, and some check
+runs on it, or it adds or changes no code nothing owns) needs no read: LAND with model "" and extra read=none.
+Otherwise the lander buys one:
   - the usage limit binds (`cc-limit status` exit 0) -> INCOMPLETE, no read counted, nothing posted; extra
     `until` (limit_until) says when to ask again, and the lane holds the job till then.
   - two reads already spent on this PR (the family: repo + PR number, so a push or a reopen does not reset it) ->
@@ -226,6 +232,23 @@ def latest(comments):
     for c in comments:
         v = imported(c.get("body", "")) if c.get("viewerDidAuthor") else None
         found = v or found
+    return found
+
+
+def security_reader(v):
+    """True when the reader named on verdict `v` says `security` (the name lander-self asks for too)."""
+    return "security" in (v.model or "").lower()
+
+
+def open_security(comments):
+    """The newest HANDBACK a security reader wrote on this PR that no later security reader's LAND has cleared, at
+    any digest, or None. "Only a later security-reader LAND should clear it" (perms, PR #1174): a LAND by any other
+    reader, the lander's own included, leaves it standing."""
+    found = None
+    for c in comments:
+        v = imported(c.get("body", "")) if c.get("viewerDidAuthor") else None
+        if v and security_reader(v):
+            found = v if v.verdict == T.HANDBACK_VERDICT else None if v.verdict == T.LAND else found
     return found
 
 
@@ -1152,29 +1175,76 @@ def _no_diff(job):
                             "until": limit_until("")})
 
 
+def _unread(job):
+    """gh could not give the PR's comments: a handback recorded there cannot be ruled out, so nothing is read and
+    nothing lands; the next tick asks again (PR #1174: a transient gh error read as "no comments" merged it unread)."""
+    return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest,
+                     extra={"why": f"cannot read PR #{job.pr}'s comments", "until": limit_until("")})
+
+
+def _security_stands(job, comments):
+    """A security reader's HANDBACK no security reader's LAND has cleared -> that HANDBACK, read or not: no read the
+    lander buys is a security reader's, so none can clear it. Else None."""
+    sec = open_security(comments)
+    if not sec:
+        return None
+    was = sec.extra.get("head", "")[:12] or "an earlier head"
+    return T.Verdict(verdict=T.HANDBACK_VERDICT, digest=job.digest, model=sec.model,
+                     blocking=list(sec.blocking) + [f"a security HANDBACK by {sec.model} stands from {was}; only a "
+                                                    "security reader's LAND clears it (`lander record ... LAND --by "
+                                                    "<security reader>`)"],
+                     extra={"head": sec.extra.get("head", ""), "security": True})
+
+
 def review(job, comments=None):
     """See the module doc. `comments` is the PR's comment list when the caller already has it."""
     root = root_of(job)
     if comments is None:
-        comments = (pr_view(root, job.pr) or {}).get("comments") or []
+        facts = pr_view(root, job.pr)
+        if facts is None:
+            return _unread(job)
+        comments = facts.get("comments") or []
+    sec = _security_stands(job, comments)
+    if sec:
+        return sec
     diff = diff_of(root, job.base_sha, job.head)
     if not diff and job.files:
         return _no_diff(job)
     have = recorded(comments, keys(job, diff))
     if have:
         return have
-    if not (job.plan and job.plan.paid):
-        return T.Verdict(verdict=T.LAND, digest=job.digest, extra={"read": "none"})
+    # a HANDBACK standing from an earlier head is read again whether or not the change is on a paid path: #1064's
+    # security handback was dropped when its new head touched no paid path and landed with no read
     prior = latest(comments)
     if prior and prior.verdict == T.HANDBACK_VERDICT and prior.extra.get("head"):
         return delta_review(job, prior, comments=comments, diff=diff)
+    if not (job.plan and job.plan.paid) and not (prior and prior.verdict == T.HANDBACK_VERDICT):
+        return T.Verdict(verdict=T.LAND, digest=job.digest, extra={"read": "none"})
     return _buy(job, "review.md", diff, {})
+
+
+def standing(job, comments=None):
+    """The HANDBACK the box last wrote on this PR, at any head, or None. The lane asks it of a change on no paid path
+    before it lets one merge unread; a PR whose comments cannot be read raises, so the job is held, not merged."""
+    if comments is None:
+        facts = pr_view(root_of(job), job.pr)
+        if facts is None:
+            raise RuntimeError(f"cannot read PR #{job.pr}'s comments, so a standing handback cannot be ruled out")
+        comments = facts.get("comments") or []
+    prior = open_security(comments) or latest(comments)
+    return prior if prior and prior.verdict == T.HANDBACK_VERDICT else None
 
 
 def delta_review(job, prior, comments=None, diff=None):
     root = root_of(job)
     if comments is None:
-        comments = (pr_view(root, job.pr) or {}).get("comments") or []
+        facts = pr_view(root, job.pr)
+        if facts is None:
+            return _unread(job)
+        comments = facts.get("comments") or []
+    sec = _security_stands(job, comments)
+    if sec:
+        return sec
     diff = diff if diff is not None else diff_of(root, job.base_sha, job.head)
     if not diff and job.files:
         return _no_diff(job)
@@ -1417,10 +1487,18 @@ def cmd_record(argv):
 
 
 def would_read(job, comments):
-    """-> (bool, why): whether review() would buy a read for this job now; it matches the same keys() review() does."""
+    """-> (bool, why): whether review() would buy a read for this job now; it matches the same keys() review() does.
+    A standing security HANDBACK comes first, as in review(): the landing buys no read that can clear it, so the
+    security reader is told to buy its own (perms, PR #1174: "do not buy a read" blocked the one read that clears it)."""
+    sec = open_security(comments)
+    if sec:
+        was = sec.extra.get("head", "")[:12] or "an earlier head"
+        return False, (f"a security HANDBACK by {sec.model} stands from {was}, and no read the landing buys can clear "
+                       "it — a security reader buys its own read and records it (`lander record ... --by <security "
+                       "reader>`)")
     if recorded(comments, keys(job, diff_of(root_of(job), job.base_sha, job.head))):
         return False, "a verdict is already recorded for this change, and the landing reads that"
-    if not (job.plan and job.plan.paid):
+    if not (job.plan and job.plan.paid) and not standing(job, comments):
         return False, "it touches no paid-review path and no unchecked code, so nothing reads it"
     if reads_used(job.repo, job.pr) >= MAX_READS:
         return False, f"its {MAX_READS} reads are spent; record the verdict of a read you buy (`lander record`)"
