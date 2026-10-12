@@ -15,12 +15,20 @@ THE RUNNER (`where`, one of the check's own `where` list, or `member:<h>[:<t>]` 
   laptop   static, hermetic and host (never box or timing), over cc-suites' own transport: its key, the
            destination and the pinned host key in ~/.cc/suites (CC_SUITES_DIR: id_ed25519, remote, known_hosts,
            StrictHostKeyChecking=yes), so the laptop is configured exactly when cc-suites' runner is, and a destination known_hosts does not name is refused
-           before ssh starts. The tree goes to the runner's `job` form (`cc-suites runner`, the key's forced command),
-           which unpacks it into a fresh directory with a fresh HOME per job, proves it by write-tree, runs it caged
+           before ssh starts. The tree goes to the runner's `job` form (`/usr/local/bin/cc-suites runner`, a
+           root-owned copy, the key's forced command), which unpacks it into a fresh directory with a fresh HOME per
+           job, proves it by write-tree, runs it caged
            (writable only in that directory, and with no network unless the check says net = true, which goes as
            the job's trailing `net`; cc-suites, THE CAGE) and removes both; `lander job-serve` hands
            the same job to it. Busy, unfit or not answering is
-           unrunnable there, never red, and judge() then runs the check on the box. A host check's line goes with
+           unrunnable there, never red, and judge() then runs the check on the box. `remote` lists the runners in
+           order, one per line (the peer host first, the laptop second; runner_dests): one the job provably never started on
+           (never sent, refused busy or unfit, or ssh never reached it; never_started) is passed over for the next,
+           an unreached one for RUNNER_REST, and only past the last does the box take it. A job that started on one
+           and then hit its cap or went silent is that runner's result, never sent again: judge() runs it on the
+           box. Every runner keeps the laptop's terms: a red on any of them is said again on
+           the box. Result.runner names the runner that took it (`laptop:<user@host>:-`) and extra.passed_over the
+           ones passed over, so the replay can score each. A host check's line goes with
            HOST_PREP in front: what a box has and a fresh account does not (a tmux session `main`, of a server of
            the job's own, and a waiting ~/.local/bin/claude), as `cc-suites runner` gives a whole suite, so the
            e2e suites and check.sh can run there. A check that needs this box's own host keeps `where = ["box"]`.
@@ -333,17 +341,58 @@ def _suites_dir() -> str:
     return os.environ.get("CC_SUITES_DIR") or os.path.expanduser("~/.cc/suites")
 
 
-def laptop_dest() -> str:
-    """cc-suites' runner (user@host) when its key, destination and pinned host key are all there, else ''."""
+def runner_dests() -> list:
+    """cc-suites' runners (user@host), in the order they are tried — one per line of its `remote`, the peer host first and the
+    laptop second — when its key and pinned host keys are there; else []. A line that is not
+    user@host is skipped. Every runner takes the same key, so a second runner adds no key to this box."""
     d = _suites_dir()
     try:
         with open(os.path.join(d, "remote")) as f:
-            dest = "".join(f.readline().split())
+            lines = ["".join(ln.split()) for ln in f]
     except OSError:
+        return []
+    if not all(os.path.isfile(p) and os.path.getsize(p) for p in (os.path.join(d, "id_ed25519"),
+                                                                    os.path.join(d, "known_hosts"))):
+        return []
+    out = []
+    for dest in lines:
+        if re.fullmatch(r"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+", dest) and dest not in out:
+            out.append(dest)
+    return out
+
+
+def laptop_dest() -> str:
+    """The first runner off the box (runner_dests), or '' when none is configured."""
+    return next(iter(runner_dests()), "")
+
+
+# A runner ssh could not reach is passed over for RUNNER_REST seconds, so a gone peer host does not cost every check its
+# ssh connect timeout before the laptop takes it. {user@host: monotonic time}.
+RUNNER_REST = 300
+_SILENT: dict = {}
+NO_ANSWER = "laptop refused or did not answer"   # _laptop_verdict's word for a runner that gave no verdict
+# What proves a job never started on a runner, so the next may take it (security read of #1097: a job that ran there,
+# then hit its cap or lost its connection, is that runner's result, never sent again). Either is a line back
+# with no relayed `| ` line, no verdict and no cap: the runner's own refusal, said before it unpacks anything (cc-suites
+# runner_job, job-serve), or ssh failing before any session (connect, name, host key, auth, key exchange).
+# ssh says a refused key as `user@host: Permission denied (publickey).`, so that one carries its user@host prefix.
+# The user part takes no `@`, so a long line of them is read in linear time (two \S+ around one @ backtracked for seconds).
+REFUSED_RE = re.compile(r"(?:cc-suite-runner|lander-job): (?:busy|unfit|refused)\b")
+UNREACHED_RE = re.compile(r"ssh: connect to host \S+ port \d+: |ssh: Could not resolve hostname |"
+                          r"Host key verification failed\.|(?:[^\s@]+@\S+: )?Permission denied \(|"
+                          r"kex_exchange_identification: ")
+
+
+def never_started(text: str, capped: bool) -> str:
+    """'refused' or 'unreached' when the runner's raw output proves the job never began there, else ''."""
+    lines = [ln.strip() for ln in text.split("\n")]
+    if capped or any(ln.startswith("|") or "verdict" in ln for ln in lines):
         return ""
-    ok = all(os.path.isfile(p) and os.path.getsize(p) for p in (os.path.join(d, "id_ed25519"),
-                                                                 os.path.join(d, "known_hosts")))
-    return dest if ok and re.fullmatch(r"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+", dest) else ""
+    # any line, not the first: ssh may warn ahead of it (a non-post-quantum key exchange), and neither kind can
+    # come after a job began, when the runner says nothing but `| ` lines and a verdict
+    if any(REFUSED_RE.match(ln) for ln in lines):
+        return "refused"
+    return "unreached" if any(UNREACHED_RE.match(ln) for ln in lines) else ""
 
 
 # A host check's box on the laptop: a tmux server under the job's TMPDIR (so it is gone with the job, and never
@@ -359,8 +408,9 @@ HOST_PREP = ('unset TMUX; TMUX_TMPDIR="${TMPDIR:-/tmp}/tmux"; export TMUX_TMPDIR
              "trap 'tmux kill-server 2>/dev/null' EXIT; tmux new-session -d -s main -x 200 -y 50 2>/dev/null\n")
 
 
-def laptop_argv(check, tree, cwd):
-    dest = laptop_dest()
+def laptop_argv(check, tree, cwd, dest=""):
+    """The ssh argv that hands `check` on `tree` to the runner `dest` (default: the first, laptop_dest)."""
+    dest = dest or laptop_dest()
     if not dest:
         raise Unrunnable(f"no laptop is configured (cc-suites: {_suites_dir()})")
     if check.klass not in (T.STATIC, T.HERMETIC, T.HOST):
@@ -421,11 +471,54 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         run_dir, head = materialise(repo_root, tree_sha, label)
     except Unrunnable as e:
         return res(T.UNRUNNABLE, str(e))
+    try:
+        if kind != "laptop":
+            return _attempt(check, tree_sha, where, "", head, run_dir, cwd, env_extra, alone, state, express, lane)
+        # the brief (R3): "the peer host keeps laptop semantics: busy or unfit means unrunnable, and a red there never counts".
+        # the runners in order (the peer host first, the laptop second): one the job provably never started on (never sent,
+        # refused busy or unfit, or not reached) is passed over and the next takes it; past the last, judge() runs it
+        # on the box. A job that started on one (its cap, a dropped connection, any answer) is that runner's result
+        # and goes nowhere else. A red on any of them is never final (judge).
+        dests = runner_dests()
+        if not dests:
+            raise Unrunnable(f"no laptop is configured (cc-suites: {_suites_dir()})")
+        now, passed = time.monotonic(), []
+        awake = [d for d in dests if now - _SILENT.get(d, -RUNNER_REST) >= RUNNER_REST]
+        passed += [f"{d}: not reached lately" for d in dests if d not in awake]
+        r, took = None, False
+        for dest in awake:
+            r = _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane)
+            why = str(r.extra.get("why", ""))
+            if r.status != T.UNRUNNABLE or stopped() or not (r.extra.get("not_sent") or r.extra.get("never_started")):
+                if r.extra.get("never_started") != "unreached":
+                    _SILENT.pop(dest, None)
+                took = True
+                break
+            if r.extra.get("never_started") == "unreached":
+                _SILENT[dest] = time.monotonic()
+            passed.append(f"{dest}: {why.splitlines()[0] if why else 'no answer'}")
+        if r is None:
+            raise Unrunnable("; ".join(passed))
+        if passed:   # each runner passed over, and why, so the replay can score them
+            r.extra["passed_over"] = passed
+            if not took:
+                r.extra["why"] = "; ".join(passed)
+        return r
+    except Unrunnable as e:
+        return res(T.UNRUNNABLE, str(e))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone, state, express, lane) -> T.Result:
+    """One run of `check` at `where` (on the runner `dest` when that is the laptop kind); Result.runner names the
+    runner that took it: `laptop:<user@host>:-` off the box."""
+    kind = where.split(":")[0]
     log = os.path.join(run_dir, "log")
     try:
         stdin, tar = None, None
         if kind == "laptop":
-            argv, wd, env, how = laptop_argv(check, tree_sha, cwd), run_dir, clean_env(), "laptop"
+            argv, wd, env, how = laptop_argv(check, tree_sha, cwd, dest), run_dir, clean_env(), dest
             tar = subprocess.Popen(["tar", "-C", head, "-cf", "-", "."], stdout=subprocess.PIPE)
             stdin = tar.stdout
         elif kind == "member":
@@ -446,11 +539,12 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
         if tar is not None:
             tar.stdout.close()
             tar.wait()
-        text = read_log(log)
+        text, started = read_log(log), {}
         if kind == "laptop":
+            started = {"never_started": never_started(text, capped)} if dest else {}
             text, rc = _laptop_verdict(text, rc)
         st, why = status_of(rc, text, capped)
-        if kind == "laptop" and rc == -1:
+        if kind == "laptop" and rc == -1 and not capped:   # capped: it ran there, and "stopped at its cap" says so
             why = text.splitlines()[0] if text else "the laptop did not answer"
         kept = {}
         if st == T.FAILED:   # the log outlives run_dir, and the result names the line that failed
@@ -461,11 +555,10 @@ def run(check: T.Check, tree_sha: str, where: str = "box", *, repo_root: str = "
                         cases=[{"name": ln[:200], "status": T.FAILED} for ln in red_lines(text)[:50]]
                         if st == T.FAILED else [],
                         extra={"why": why, "rc": rc, "loaded": loaded, "alone": alone,
-                               "tail": text.splitlines()[-TAIL:], **kept})
+                               "tail": text.splitlines()[-TAIL:], **kept, **started})
     except Unrunnable as e:
-        return res(T.UNRUNNABLE, str(e))
-    finally:
-        shutil.rmtree(run_dir, ignore_errors=True)
+        return T.Result(check=check.name, tree=tree_sha, status=T.UNRUNNABLE, secs=0.0, load=os.getloadavg()[0],
+                        runner=f"{where}:{dest}:-" if dest else where, extra={"why": str(e), "not_sent": True})
 
 
 def _laptop_verdict(text: str, rc: int) -> tuple:
@@ -479,7 +572,7 @@ def _laptop_verdict(text: str, rc: int) -> tuple:
     m = re.fullmatch(r"lander-job: verdict exit=([0-9]{1,3})", last)
     if rc != 0 or len(got) != 1 or not m:
         refused = next((ln for ln in lines if ln.strip() and not ln.startswith("| ")), "no answer")
-        return f"laptop refused or did not answer: {refused[:200]}\n{body}", -1
+        return f"{NO_ANSWER}: {refused[:200]}\n{body}", -1
     return body, int(m.group(1))
 
 

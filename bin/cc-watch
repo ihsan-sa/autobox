@@ -23,7 +23,9 @@
 A SPEC is JSON: name, granted (what was granted, in words), check (a shell command), every (seconds), revert (a
 shell command, or "tell" when the grant predates watchers or undoing it is a person's call), expires (ISO UTC to the
 minute, like 2026-12-01T00:00Z, or null) and owner (the granting seat's Slack channel). Specs are read from ~/.cc/watch and from the repo's
-config/watch ($CC_WATCH_SHIPPED), which holds the watchers for the public hosts that predate this tool.
+config/watch ($CC_WATCH_SHIPPED), which holds the watchers for the public hosts that predate this tool. A shipped
+spec's check must parse, as a whole, to `cc-watch url ...`, and its revert must be "tell": it runs as argv through
+this tool, never through a shell, and a shipped spec that is anything else is named on stderr and skipped.
 
 A CHECK exits 0 for OK, 1 for WARN and 2 for BAD, and its last line of output is the reason. Any other exit, or
 no answer inside two minutes, is a WARN that names it.
@@ -49,6 +51,7 @@ import importlib.machinery
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -126,8 +129,29 @@ def specs():
             if not isinstance(s, dict) or not NAME_RE.fullmatch(str(s.get("name", ""))) or not s.get("check"):
                 print(f"cc-watch: skipped {p}: no name or check", file=sys.stderr)
                 continue
+            s.pop("argv", None)
+            if d == SHIPPED:
+                # A shipped spec comes in with a repo change, not from a seat, so it runs only "cc-watch url ..."
+                # as argv, never a shell, and never reverts: the whole command must parse to cc-watch url.
+                argv = url_argv(s["check"])
+                if not argv or (s.get("revert") or "tell") != "tell":
+                    print(f"cc-watch: skipped {p}: a shipped check must be `cc-watch url ...` with revert tell",
+                          file=sys.stderr)
+                    continue
+                s["argv"] = argv
             got[s["name"]] = s
     return got
+
+
+def url_argv(cmd):
+    """The argv that runs a shipped check, this tool's own url command, or None when cmd parses to anything else."""
+    try:
+        argv = shlex.split(str(cmd))
+    except ValueError:
+        return None
+    if argv[:2] != ["cc-watch", "url"]:
+        return None
+    return [sys.executable, os.path.realpath(__file__)] + argv[1:]
 
 
 def load_state(name):
@@ -166,11 +190,13 @@ def save_state(name, st):
 
 
 def run_check(cmd):
-    """(verdict, reason) for one check command."""
+    """(verdict, reason) for one check: a seat's shell command, or a shipped spec's argv, run without a shell."""
     try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=CHECK_TIMEOUT)
+        p = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=CHECK_TIMEOUT)
     except subprocess.TimeoutExpired:
         return "WARN", f"the check gave no answer in {CHECK_TIMEOUT}s"
+    except OSError as e:
+        return "WARN", f"the check could not run: {e}"
     lines = [ln for ln in (p.stdout or "").splitlines() if ln.strip()]
     reason = lines[-1].strip()[:400] if lines else ""
     if p.returncode in CODES:
@@ -190,7 +216,7 @@ def post(channel, pid, text):
 def step(s, st, t):
     """One due run of one watcher; returns its new state. The only place verdicts turn into alerts."""
     name = s["name"]
-    verdict, reason = run_check(s["check"])
+    verdict, reason = run_check(s.get("argv") or s["check"])
     st.update(last=t.timestamp(), verdict=verdict, reason=reason)
     if verdict == "OK":
         # "OK is silent": the record clears, so the next WARN or BAD is a new episode and is told again. An unsent

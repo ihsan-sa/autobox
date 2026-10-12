@@ -906,6 +906,97 @@ exec bash {RUN.BIN}/cc-suites runner
         argv = RUN.laptop_argv(chk(name="unit-tests_2.x+y"), t, "core/")   # an ordinary name still goes
         self.assertEqual(argv[argv.index("job") + 1], "unit-tests_2.x+y")
 
+    def two_runners(self):
+        # R3: `remote` lists the peer host first and the laptop second; each fake runner answers as the
+        # file $tmp/say.<host> says (busy, red, gone, dropped, hang; else a pass), and the stub logs which it was asked
+        d = self.laptop(host="peer")
+        write(d, {"remote": "ccsuite@peer\nccsuite@laptop\n",
+                  "known_hosts": "peer,laptop ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIxx\n"})
+        calls = os.path.join(self.tmp, "calls")
+        env = self.shim("two", f'''prev=; for a in "$@"; do [ "$a" = -- ] && break; prev=$a; done
+h=${{prev#*@}}; echo "$h" >> {calls}; cat >/dev/null
+case "$(cat {self.tmp}/say.$h 2>/dev/null)" in
+  busy) echo "lander-job: busy (load 9.00)"; exit 75;;
+  gone) echo "ssh: connect to host $h port 22: Connection timed out" >&2; exit 255;;
+  dropped) echo "Timeout, server $h not responding." >&2; exit 255;;
+  hang) sleep 30;;
+  red) echo "| it broke"; echo "lander-job: verdict exit=1";;
+  *) echo "| ran on $h"; echo "lander-job: verdict exit=0";;
+esac
+''')
+        c = chk(run="echo ran", where=["box", "laptop"])
+        RUN._SILENT.clear()
+        self.addCleanup(RUN._SILENT.clear)
+
+        def go(c=c, **say):
+            for h in ("peer", "laptop"):
+                write(self.tmp, {f"say.{h}": say.get(h, "") + "\n"})
+            open(calls, "w").close()
+            with mock.patch.dict(os.environ, env):
+                r = self.run_(c, where="laptop")
+            with open(calls) as f:
+                return r, f.read().split()
+        return go
+
+    def test_two_runners_in_order_the_busy_one_is_passed_over_and_the_one_that_took_it_is_named(self):
+        go = self.two_runners()
+        r, asked = go(peer="busy")              # the first busy: the second takes it, and the result says so
+        self.assertEqual((r.status, r.runner, asked), (T.PASSED, "laptop:ccsuite@laptop:-", ["peer", "laptop"]),
+                         r.extra)
+        self.assertIn("ran on laptop", r.extra["tail"])
+        self.assertIn("busy", r.extra["passed_over"][0])
+        self.assertTrue(r.extra["passed_over"][0].startswith("ccsuite@peer: "))
+        r, asked = go()                          # the first free: it takes it, and the second is never asked
+        self.assertEqual((r.status, r.runner, asked), (T.PASSED, "laptop:ccsuite@peer:-", ["peer"]), r.extra)
+        self.assertNotIn("passed_over", r.extra)
+        r, asked = go(peer="red")               # a red there is a red to judge(), never a turn for the next runner
+        self.assertEqual((r.status, r.runner, asked), (T.FAILED, "laptop:ccsuite@peer:-", ["peer"]), r.extra)
+        r, asked = go(peer="busy", laptop="busy")   # both busy: unrunnable, so judge() runs it on the box
+        self.assertEqual((r.status, asked), (T.UNRUNNABLE, ["peer", "laptop"]), r.extra)
+        self.assertEqual(len(r.extra["passed_over"]), 2)
+        self.assertEqual(RUN._SILENT, {})        # a busy runner answered: it is not rested
+        r, asked = go(peer="gone")              # one ssh never reached is passed over, and rested for RUNNER_REST…
+        self.assertEqual((r.status, r.runner, asked), (T.PASSED, "laptop:ccsuite@laptop:-", ["peer", "laptop"]))
+        self.assertIn("Connection timed out", r.extra["passed_over"][0])
+        r, asked = go()
+        self.assertEqual((r.runner, asked), ("laptop:ccsuite@laptop:-", ["laptop"]))
+        self.assertIn("not reached lately", r.extra["passed_over"][0])
+        RUN._SILENT["ccsuite@peer"] -= RUN.RUNNER_REST     # …and asked again once that is over
+        r, asked = go()
+        self.assertEqual((r.runner, asked), ("laptop:ccsuite@peer:-", ["peer"]))
+
+    def test_a_job_that_started_on_a_runner_is_never_sent_to_the_next(self):
+        # the security read of #1097: a check that ran on the first runner, then lost its connection or hit its cap,
+        # ran once already; the second must not run it again, and the first is not rested for it. judge() takes it.
+        go = self.two_runners()
+        r, asked = go(peer="dropped")
+        self.assertEqual((r.status, r.runner, asked), (T.UNRUNNABLE, "laptop:ccsuite@peer:-", ["peer"]), r.extra)
+        self.assertIn("not responding", r.extra["why"])
+        self.assertNotIn("passed_over", r.extra)
+        r, asked = go(chk(run="sleep 30", where=["box", "laptop"], cap=1), peer="hang")
+        self.assertEqual((r.status, r.runner, asked), (T.UNRUNNABLE, "laptop:ccsuite@peer:-", ["peer"]), r.extra)
+        self.assertEqual(r.extra["why"], "stopped at its cap")
+        self.assertEqual(RUN._SILENT, {})
+        r, asked = go()                          # and peer takes the next check at once
+        self.assertEqual((r.status, r.runner, asked), (T.PASSED, "laptop:ccsuite@peer:-", ["peer"]), r.extra)
+        # what proves a job never began there: a refusal or ssh failing before any session, never a cap or a relay
+        self.assertEqual(RUN.never_started("cc-suite-runner: unfit (missing: git)\n", False), "refused")
+        self.assertEqual(RUN.never_started("** WARNING: connection is not using a post-quantum key exchange\n"
+                                           "ssh: Could not resolve hostname peer: Name or service not known\n",
+                                           False), "unreached")
+        # ssh puts user@host ahead of a refused key: a peer without the account or the key must still be passed over
+        self.assertEqual(RUN.never_started("ccsuite@peer: Permission denied (publickey).\n", False), "unreached")
+        self.assertEqual(RUN.never_started("ccsuite@fd7a::1: Permission denied (publickey).\n", False), "unreached")
+        # a runner's line is not trusted to be short: 40k '@' is read in linear time, not seconds of backtracking
+        t0 = time.monotonic()
+        self.assertEqual(RUN.never_started("@" * 40000 + "\n", False), "")
+        self.assertLess(time.monotonic() - t0, 0.5)
+        for text, capped in (("", False), ("ssh: connect to host x port 22: No route to host\n", True),
+                             ("| ccsuite@peer: Permission denied (publickey).\n", False),
+                             ("| cc-suite-runner: busy\nlander-job: verdict exit=1\n", False),
+                             ("Connection to peer closed by remote host.\n", False)):
+            self.assertEqual(RUN.never_started(text, capped), "", text)
+
     @unittest.skipUnless(HAS_BWRAP, "no working bwrap on this machine")
     def test_the_laptop_round_trip_gives_every_job_a_fresh_home(self):
         self.laptop()

