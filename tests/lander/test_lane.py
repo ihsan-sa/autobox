@@ -8,6 +8,7 @@ PATH starts with a tmp bin of fakes (gh answering from a JSON file and squashing
 cc-config, cc-pause, cc-tier, cc-board, cc, cc-gh-token, systemd-run, systemctl, tmux). The units are stubs.
 """
 import contextlib
+import errno
 from concurrent import futures
 import io
 import json
@@ -1294,24 +1295,23 @@ class Machine(Fixture):
             D.pull(self.root, "main", merged, said=said)
         self.assertIn("1 untracked dir(s) stand where the merge adds a file and are left for a person: .mail-out",
                       e.exception.why)
-        self.assertIn("they are back", e.exception.why)     # the draft went aside for the retry and came back
         self.assertEqual((self.git(self.root, "rev-parse", "HEAD"), said), (head, []))
         self.assertEqual(open(os.path.join(self.root, ".mail-out/queued.eml")).read(), "a queued message\n")
         self.assertEqual(open(os.path.join(self.root, "docs/draft.md")).read(), "old draft\n")
-        self.assertEqual(os.listdir(self.aside_root()), [])   # the emptied aside dir is gone too
+        self.assertFalse(os.path.exists(self.aside_root()))   # refused before anything went aside
 
     def test_a_move_that_fails_puts_back_what_moved_and_moves_nothing(self):
         from lander import deploy as D
         self.write(self.root, {"docs/one.md": "one\n", "docs/two.md": "two\n"})
         merged = self.push("main", {"docs/one.md": "committed\n", "docs/two.md": "committed\n"})
         head = self.git(self.root, "rev-parse", "HEAD")
-        real = D.shutil.move
+        real = D.move
 
-        def move(src, dst):
-            if src == os.path.join(self.root, "docs/two.md"):
+        def move(src, dst, rel):
+            if (src, rel) == (self.root, "docs/two.md"):
                 raise OSError(28, "No space left on device")
-            return real(src, dst)
-        with mock.patch.object(D.shutil, "move", move), self.assertRaises(D.Failed) as e:
+            return real(src, dst, rel)
+        with mock.patch.object(D, "move", move), self.assertRaises(D.Failed) as e:
             D.pull(self.root, "main", merged)
         self.assertIn("moving docs/two.md aside failed", e.exception.why)
         self.assertIn("nothing was moved", e.exception.why)
@@ -1327,13 +1327,13 @@ class Machine(Fixture):
         D.pull(self.root, "main", first)
         self.write(self.root, {"keep.txt": "a local edit\n", "docs/draft.md": "old draft\n"})
         merged = self.push("main", {"keep.txt": "v2\n", "docs/draft.md": "committed\n"})
-        real = D.shutil.move
+        real = D.move
 
-        def move(src, dst):
-            if dst == os.path.join(self.root, "docs/draft.md"):
+        def move(src, dst, rel):
+            if (dst, rel) == (self.root, "docs/draft.md"):
                 raise OSError(13, "Permission denied")
-            return real(src, dst)
-        with mock.patch.object(D.shutil, "move", move), self.assertRaises(D.Failed) as e:
+            return real(src, dst, rel)
+        with mock.patch.object(D, "move", move), self.assertRaises(D.Failed) as e:
             D.pull(self.root, "main", merged)
         self.assertNotIn("they are back", e.exception.why)
         [dest] = os.listdir(self.aside_root())
@@ -1368,6 +1368,259 @@ class Machine(Fixture):
         self.assertFalse(os.path.exists(self.aside_root()))
         self.assertTrue(D.unsafe("../canary") and D.unsafe("a/./b") and D.unsafe("a//b") and D.unsafe(".GIT/x"))
         self.assertFalse(D.unsafe("docs/.gitignore"))
+
+    def push_forced(self, files):
+        """A commit on main that adds `files` with `git add -f`, past the tree's own .gitignore."""
+        self.git(self.work, "fetch", "-q", "origin")
+        self.git(self.work, "checkout", "-q", "-B", "main", "origin/main")
+        self.write(self.work, files)
+        self.git(self.work, "add", "-f", *files)
+        self.git(self.work, "commit", "-qm", f"forced {sorted(files)}")
+        self.git(self.work, "push", "-q", "origin", "main:refs/heads/main")
+        return self.git(self.work, "rev-parse", "HEAD")
+
+    def test_an_ignored_file_where_main_adds_one_is_moved_aside_never_overwritten(self):
+        """The #967 security read (2026-10-04): git 2.53's read-tree -m -u overwrites an ignored file without
+        refusing, so a merge adding core/ccbox/env would replace the token file. It is moved aside as an untracked one
+        is; an ignored file the merge does not touch stays."""
+        from lander import deploy as D
+        D.pull(self.root, "main", self.push("main", {".gitignore": "env\nother\n"}))
+        self.write(self.root, {"env": "SECRET\n", "other": "mine\n"})
+        self.assertIn("!! env", self.git(self.root, "status", "--porcelain", "--ignored"))
+        merged = self.push_forced({"env": "committed\n"})
+        said = []
+        D.pull(self.root, "main", merged, said=said)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), merged)
+        self.assertEqual(open(os.path.join(self.root, "env")).read(), "committed\n")
+        self.assertEqual(open(os.path.join(self.root, "other")).read(), "mine\n")
+        self.assertIn(D.MOVED, said[0])
+        dest = said[0].split(" to ", 1)[1].split(": ", 1)[0]
+        self.assertEqual(open(os.path.join(dest, "env")).read(), "SECRET\n")
+        self.assertFalse(os.path.exists(os.path.join(dest, "other")))
+
+    def test_an_ignored_dir_where_main_adds_a_file_is_refused_and_kept(self):
+        """read-tree would delete an ignored folder (.claude/worktrees) to write a file there: the deploy refuses
+        before read-tree runs, so the folder and HEAD stay, and nothing goes aside."""
+        from lander import deploy as D
+        first = self.push("main", {".gitignore": "wt\n"})
+        D.pull(self.root, "main", first)
+        self.write(self.root, {"wt/session/notes": "a worktree\n"})
+        merged = self.push_forced({"wt": "a file now\n"})
+        with self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged)
+        self.assertIn("1 untracked dir(s) stand where the merge adds a file and are left for a person: wt",
+                      e.exception.why)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), first)
+        self.assertEqual(open(os.path.join(self.root, "wt/session/notes")).read(), "a worktree\n")
+        self.assertFalse(os.path.exists(self.aside_root()))
+
+    def test_a_tracked_dir_holding_an_ignored_file_that_main_makes_a_file_is_refused(self):
+        """A tracked dir main replaces with a file would lose the ignored file inside it with the tracked ones: refused,
+        and a tracked dir with nothing else in it still becomes the file."""
+        from lander import deploy as D
+        first = self.push("main", {".gitignore": "*.tok\n", "cfg/a": "tracked\n", "plain/b": "tracked\n"})
+        D.pull(self.root, "main", first)
+        self.write(self.root, {"cfg/secret.tok": "SECRET\n"})
+        self.git(self.work, "rm", "-q", "-r", "cfg")
+        self.git(self.work, "commit", "-qm", "drop cfg")
+        self.git(self.work, "push", "-q", "origin", "main:refs/heads/main")
+        merged = self.push_forced({"cfg": "a file now\n"})
+        with self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged)
+        self.assertIn("left for a person: cfg", e.exception.why)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), first)
+        self.assertEqual(open(os.path.join(self.root, "cfg/secret.tok")).read(), "SECRET\n")
+        os.unlink(os.path.join(self.root, "cfg/secret.tok"))   # the kept case: nothing but tracked files
+        D.pull(self.root, "main", merged)
+        self.assertEqual(open(os.path.join(self.root, "cfg")).read(), "a file now\n")
+
+    def test_a_symlinked_parent_dir_moves_as_a_link_and_its_target_is_never_touched(self):
+        """An untracked symlink `docs2` -> a dir outside, where main adds docs2/draft.md: the link moves aside as
+        itself and the file behind it is untouched."""
+        from lander import deploy as D
+        out = os.path.join(self.tmp, "outdir")
+        self.write(out, {"draft.md": "outside\n"})
+        os.symlink(out, os.path.join(self.root, "docs2"))
+        merged = self.push("main", {"docs2/draft.md": "committed\n"})
+        said = []
+        D.pull(self.root, "main", merged, said=said)
+        self.assertEqual(open(os.path.join(self.root, "docs2/draft.md")).read(), "committed\n")
+        self.assertFalse(os.path.islink(os.path.join(self.root, "docs2")))
+        dest = said[0].split(" to ", 1)[1].split(": ", 1)[0]
+        self.assertEqual(os.readlink(os.path.join(dest, "docs2")), out)
+        self.assertEqual(open(os.path.join(out, "draft.md")).read(), "outside\n")
+
+    def test_a_state_dir_on_another_filesystem_gets_a_copy_with_its_mode_and_links_as_links(self):
+        """No hard link across filesystems (EXDEV): the file is copied with its mode, a symlink is made anew, and the
+        originals leave the checkout; without EXDEV nothing is copied."""
+        from lander import deploy as D
+        out = os.path.join(self.tmp, "outside.txt")
+        self.write(self.tmp, {"outside.txt": "not the checkout's\n"})
+        self.write(self.root, {"docs/run.sh": "#!/bin/sh\n"})
+        os.chmod(os.path.join(self.root, "docs/run.sh"), 0o750)
+        os.symlink(out, os.path.join(self.root, "docs/link"))
+        merged = self.push("main", {"docs/run.sh": "committed\n", "docs/link": "committed\n"})
+
+        def link(*a, **kw):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        said = []
+        with mock.patch.object(D.os, "link", link), mock.patch.object(D, "copy_at", wraps=D.copy_at) as cp:
+            D.pull(self.root, "main", merged, said=said)
+        self.assertEqual(cp.call_count, 2)
+        dest = said[0].split(" to ", 1)[1].split(": ", 1)[0]
+        self.assertEqual(open(os.path.join(dest, "docs/run.sh")).read(), "#!/bin/sh\n")
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(dest, "docs/run.sh")).st_mode), 0o750)
+        self.assertEqual(os.readlink(os.path.join(dest, "docs/link")), out)
+        self.assertEqual(open(os.path.join(self.root, "docs/link")).read(), "committed\n")
+        self.assertEqual(open(out).read(), "not the checkout's\n")
+        self.write(self.root, {"docs/new.md": "draft\n"})                     # same filesystem: a link, no copy
+        merged = self.push("main", {"docs/new.md": "committed\n"})
+        with mock.patch.object(D, "copy_at", wraps=D.copy_at) as cp:
+            D.pull(self.root, "main", merged)
+        self.assertEqual(cp.call_count, 0)
+
+    def test_a_parent_swapped_for_a_symlink_after_the_walk_moves_nothing_through_it(self):
+        """The race the #967 re-read named: a parent dir turned into a symlink between the lstat walk and the move.
+        The move opens each parent with O_NOFOLLOW, so it refuses, the deploy fails and the file outside stays."""
+        from lander import deploy as D
+        out = os.path.join(self.tmp, "outdir")
+        self.write(out, {"draft.md": "outside\n"})
+        os.symlink(out, os.path.join(self.root, "docs2"))
+        merged = self.push("main", {"docs2/draft.md": "committed\n"})
+        head = self.git(self.root, "rev-parse", "HEAD")
+        with mock.patch.object(D, "in_the_way", lambda *a: (["docs2/draft.md"], [])), \
+                self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged)
+        self.assertIn("moving docs2/draft.md aside failed", e.exception.why)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), head)
+        self.assertEqual(open(os.path.join(out, "draft.md")).read(), "outside\n")
+        self.assertEqual(os.listdir(self.aside_root()), [])
+
+    def test_a_git_that_cannot_list_the_index_fails_the_deploy_and_merges_nothing(self):
+        """in_the_way -> None when `git ls-files` fails: the deploy fails before read-tree and HEAD stays; with
+        ls-files working the same merge goes in."""
+        from lander import deploy as D
+        merged = self.push("main", {"docs/new.md": "committed\n"})
+        head = self.git(self.root, "rev-parse", "HEAD")
+        real = D.git
+
+        def git(root, *args, **kw):
+            return (128, "fatal: index file corrupt") if args[:1] == ("ls-files",) else real(root, *args, **kw)
+        with mock.patch.object(D, "git", git), self.assertRaises(D.Failed) as e:
+            D.pull(self.root, "main", merged)
+        self.assertIn("git could not list what", e.exception.why)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), head)
+        D.pull(self.root, "main", merged)
+        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), merged)
+
+    def test_an_unreadable_subdir_of_a_tracked_dir_counts_as_holding_something(self):
+        """A 000-mode dir under a tracked dir main makes a file: what cannot be seen is never handed to read-tree to
+        delete, so the deploy refuses; readable again and holding only tracked files, it goes in."""
+        from lander import deploy as D
+        if os.geteuid() == 0:
+            self.skipTest("root reads a 000-mode dir")
+        first = self.push("main", {"cfg/sub/a": "tracked\n"})
+        D.pull(self.root, "main", first)
+        self.git(self.work, "rm", "-q", "-r", "cfg")
+        self.git(self.work, "commit", "-qm", "drop cfg")
+        self.git(self.work, "push", "-q", "origin", "main:refs/heads/main")
+        merged = self.push("main", {"cfg": "a file now\n"})
+        sub = os.path.join(self.root, "cfg/sub")
+        os.chmod(sub, 0)
+        try:
+            self.assertTrue(D.holds_untracked(self.root, "cfg", {"cfg/sub/a"}))
+            with self.assertRaises(D.Failed) as e:
+                D.pull(self.root, "main", merged)
+            self.assertIn("left for a person: cfg", e.exception.why)
+            self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), first)
+        finally:
+            os.chmod(sub, 0o755)
+        self.assertFalse(D.holds_untracked(self.root, "cfg", {"cfg/sub/a"}))
+        D.pull(self.root, "main", merged)
+        self.assertEqual(open(os.path.join(self.root, "cfg")).read(), "a file now\n")
+
+    def two_dirs(self, files):
+        src, dst = os.path.join(self.tmp, "src"), os.path.join(self.tmp, "dst")
+        self.write(src, files)
+        os.makedirs(os.path.join(dst, "d"), exist_ok=True)
+        return src, dst
+
+    def test_a_source_that_will_not_unlink_leaves_no_copy_behind(self):
+        """move(): when the source unlink fails the destination link is removed and the error raised, so the file is
+        in one place only; with the unlink working it moves."""
+        from lander import deploy as D
+        src, dst = self.two_dirs({"d/f": "mine\n"})
+        real, calls = os.unlink, []
+
+        def unlink(name, *a, dir_fd=None, **kw):
+            calls.append(name)
+            if len(calls) == 1:
+                raise OSError(errno.EACCES, "Permission denied")
+            return real(name, *a, dir_fd=dir_fd, **kw)
+        with mock.patch.object(D.os, "unlink", unlink), self.assertRaises(OSError):
+            D.move(src, dst, "d/f")
+        self.assertEqual(calls, ["f", "f"])
+        self.assertEqual(open(os.path.join(src, "d/f")).read(), "mine\n")
+        self.assertFalse(os.path.lexists(os.path.join(dst, "d/f")))
+        D.move(src, dst, "d/f")
+        self.assertFalse(os.path.lexists(os.path.join(src, "d/f")))
+        self.assertEqual(open(os.path.join(dst, "d/f")).read(), "mine\n")
+
+    def test_a_link_refused_with_eperm_is_copied_without_setuid_and_other_errors_stand(self):
+        """The FIX read (2026-10-12): under fs.protected_hardlinks=1 linking another user's file fails with EPERM, so a
+        stray root-owned file would fail every deploy. EPERM copies as EXDEV does, and the copy keeps the permission
+        bits but never a setuid or setgid bit; any other link error still fails the move and copies nothing."""
+        from lander import deploy as D
+        src, dst = self.two_dirs({"d/run": "#!/bin/sh\n", "d/other": "x\n"})
+        os.chmod(os.path.join(src, "d/run"), 0o6755)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(src, "d/run")).st_mode) & 0o6000, 0o6000)
+
+        def link(*a, **kw):
+            raise OSError(errno.EPERM, "Operation not permitted")
+        with mock.patch.object(D.os, "link", link), mock.patch.object(D, "copy_at", wraps=D.copy_at) as cp:
+            D.move(src, dst, "d/run")
+        self.assertEqual(cp.call_count, 1)
+        self.assertFalse(os.path.lexists(os.path.join(src, "d/run")))
+        self.assertEqual(open(os.path.join(dst, "d/run")).read(), "#!/bin/sh\n")
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(dst, "d/run")).st_mode), 0o755)
+
+        def link2(*a, **kw):
+            raise OSError(errno.EACCES, "Permission denied")
+        with mock.patch.object(D.os, "link", link2), mock.patch.object(D, "copy_at", wraps=D.copy_at) as cp, \
+                self.assertRaises(OSError):
+            D.move(src, dst, "d/other")
+        self.assertEqual(cp.call_count, 0)
+        self.assertEqual(open(os.path.join(src, "d/other")).read(), "x\n")
+        self.assertFalse(os.path.lexists(os.path.join(dst, "d/other")))
+
+    def test_copy_at_refuses_a_fifo_and_removes_a_part_written_copy(self):
+        """copy_at() copies only a file or a symlink: a fifo raises EPERM and nothing is made. A write that fails part
+        way removes the copy; the same file with writes working is copied whole."""
+        from lander import deploy as D
+        src, dst = self.two_dirs({"d/big": "a" * (3 << 20)})
+        os.mkfifo(os.path.join(src, "d/pipe"))
+        s, d = os.open(os.path.join(src, "d"), os.O_RDONLY), os.open(os.path.join(dst, "d"), os.O_RDONLY)
+        try:
+            with self.assertRaises(OSError) as e:
+                D.copy_at(s, d, "pipe")
+            self.assertEqual(e.exception.errno, errno.EPERM)
+            self.assertFalse(os.path.lexists(os.path.join(dst, "d/pipe")))
+            real, n = os.write, []
+
+            def write(fd, b):
+                n.append(1)
+                if len(n) > 1:
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                return real(fd, b)
+            with mock.patch.object(D.os, "write", write), self.assertRaises(OSError):
+                D.copy_at(s, d, "big")
+            self.assertEqual(len(n), 2)   # one chunk written before the failure
+            self.assertFalse(os.path.lexists(os.path.join(dst, "d/big")))
+            D.copy_at(s, d, "big")
+            self.assertEqual(os.path.getsize(os.path.join(dst, "d/big")), 3 << 20)
+        finally:
+            os.close(s)
+            os.close(d)
 
     def test_a_state_dir_that_cannot_be_made_fails_the_deploy_cleanly_and_counts(self):
         """A file where deploy-aside/ goes: no OSError escapes; read-tree's refusal stands, the target is failed and

@@ -15,11 +15,13 @@ THE STEPS, per target, in order; the first that fails stops that target and says
               lander holds (git.remote_url, never the checkout's "origin") and checks it against ls-remote; a sha
               that is not that tip or an ancestor of it is refused; then fast_forward: what `git merge --ff-only
               <sha>` did, with no hook, filter or config of the checkout's run, so a checkout a person moved is
-              refused, never reset. An untracked file or symlink standing where <sha> adds a tracked one (a draft
-              of a doc that later got committed) is moved to the lander's state dir, deploy-aside/<checkout>/, and
-              the move is tried once more; the deploy's line names what moved. If it still refuses, the files go
-              back, and the line names any that could not. An untracked directory there is never moved: the deploy
-              fails and names it
+              refused, never reset. Before read-tree runs, an untracked file or symlink standing where <sha> adds a
+              tracked one (a draft of a doc that later got committed), ignored or not, is moved to the lander's state
+              dir, deploy-aside/<checkout>/, through parents opened with O_NOFOLLOW; the deploy's line names what
+              moved. If read-tree still refuses, the files go back, and the line names any that could not. An
+              untracked directory there, or a tracked one holding anything untracked, is never moved: the deploy
+              fails and names it, and read-tree never runs (git 2.53's would overwrite an ignored file and delete an
+              ignored directory without refusing)
   3. install  the first executable of core/install.sh, install.sh, with no flags; then `systemctl --user
               daemon-reload`; then <repo>.applied records the sha
   4. units    a systemd-user unit this change ADDED is enabled with `enable --now`, unless its .timer does it, it
@@ -42,11 +44,11 @@ failed one) takes its changed files from `from`..sha. A request with no target r
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import os
 import re
 import shlex
-import shutil
 import stat
 import tempfile
 import time
@@ -255,8 +257,10 @@ def fast_forward(root, base, head, sha):
     run: a worker can write its shared .git, so a post-merge, post-checkout or reference-transaction hook, or a smudge
     filter its config names, would run as the lander. read-tree -m -u runs in a borrowed() repo (no config, so no
     filter; read-tree runs no hook) on the checkout's own index and files, and refuses as merge does when a changed or
-    untracked file is in the way; then update-ref moves the branch, hooks off. When it refuses, the untracked files at
-    paths `sha` adds are moved aside (aside()) and read-tree runs once more; if that also refuses, they are put back.
+    untracked file is in the way; then update-ref moves the branch, hooks off. read-tree does NOT refuse for an ignored
+    file, so before it runs, the untracked files at paths `sha` adds, ignored ones too, are moved aside (aside()), and
+    an untracked dir there (in_the_way) refuses the deploy with read-tree never run. If read-tree refuses after the
+    move, the files are put back.
     A checkout already at `sha` or past it is left as it is, as `merge --ff-only` leaves it ("Already up to date").
     -> a line naming what was moved aside, or "". Raises Failed, or GitError when no borrowed repo could be made."""
     if head == sha:
@@ -271,30 +275,32 @@ def fast_forward(root, base, head, sha):
             raise Failed("pull", f"git names no git dir for {root}: {last(gitdir)}")
         env = G.hookless_env(GIT_DIR=gd, GIT_WORK_TREE=root, GIT_INDEX_FILE=os.path.join(gitdir, "index"))
         git(root, "update-index", "-q", "--refresh", env=env)   # rc 1 = a file differs; read-tree says which
-        rc, out = git(root, "read-tree", "-m", "-u", head, sha, env=env)
-        said = ""
         # the brief (2026-10-03): "an older untracked draft of it (09-27) sat in the checkout, so the deploy's git
         # read-tree refused 3 times" — an untracked file where `sha` adds a tracked one is moved aside, not left to
-        # stop every deploy after it
-        if rc:
-            files, dirs = in_the_way(root, head, sha, env)
-            moved, dest, why = aside(root, files)
-            if moved:
-                rc, out = git(root, "read-tree", "-m", "-u", head, sha, env=env)
-                if rc:
-                    left = put_back(root, moved, dest)
-                    out += (f" (it still refused with {len(moved)} untracked file(s) moved aside; "
-                            + (f"{len(moved) - len(left)} went back and {len(left)} could not, so they stay in "
-                               "deploy-aside: " + ", ".join(os.path.join(dest, p) for p in left) if left
-                               else "they are back") + ")")
-                else:
-                    said = (f"moved {len(moved)} {MOVED} to {dest}: "
-                            + ", ".join(moved[:5]) + (", ..." if len(moved) > 5 else ""))
-            elif why:
-                out += f" ({why})"
-            if rc and dirs:   # a directory is a person's work, a mail queue or a build: it is never moved
-                out += (f" ({len(dirs)} untracked dir(s) stand where the merge adds a file and are left for a person: "
-                        + ", ".join(dirs[:5]) + ")")
+        # stop every deploy after it. And BEFORE read-tree, not on its refusal: the #967 security read (2026-10-04)
+        # found git 2.53's read-tree -m -u "overwrites ignored files and deletes ignored folders ... without
+        # refusing", so an ignored path is treated as an untracked one is: moved aside or refused, never overwritten
+        found = in_the_way(root, head, sha, env)
+        if found is None:
+            raise Failed("pull", f"git could not list what {sha[:12]} adds over {head[:12]} in {root}; nothing merged")
+        files, dirs = found
+        if dirs:   # a directory is a person's work, a mail queue or a build: it is never moved, nor left to read-tree
+            raise Failed("pull", f"{len(dirs)} untracked dir(s) stand where the merge adds a file and are left for a "
+                                 f"person: {', '.join(dirs[:5])}; nothing merged into {root}")
+        moved, dest, why = aside(root, files)
+        if why:
+            raise Failed("pull", f"{why}; nothing merged into {root}")
+        rc, out = git(root, "read-tree", "-m", "-u", head, sha, env=env)
+        said = ""
+        if rc and moved:
+            left = put_back(root, moved, dest)
+            out += (f" (it still refused with {len(moved)} untracked file(s) moved aside; "
+                    + (f"{len(moved) - len(left)} went back and {len(left)} could not, so they stay in "
+                       "deploy-aside: " + ", ".join(os.path.join(dest, p) for p in left) if left
+                       else "they are back") + ")")
+        elif moved:
+            said = (f"moved {len(moved)} {MOVED} to {dest}: "
+                    + ", ".join(moved[:5]) + (", ..." if len(moved) > 5 else ""))
     if rc:
         raise Failed("pull", f"git read-tree -m -u {head[:12]} {sha[:12]} in {root}: {last(out, 600)}")
     rc, out = git(root, "update-ref", "-m", f"lander: fast-forward to {sha[:12]}", f"refs/heads/{base}", sha, head,
@@ -314,14 +320,17 @@ def in_the_way(root, head, sha, env):
     """-> (files, dirs): the untracked paths in `root` that stop read-tree adding what `sha` adds over `head`. Files
     are the added path itself, or the first part of it that is not a directory, when that is a regular file or a
     symlink (never followed); only they are moved aside. Dirs are untracked directories standing where `sha` adds a
-    file: never moved (a PR that adds a file `.mail-out` must not move the mail queue), so read-tree's refusal stands
-    and names them. A tracked path is never either; read-tree's refusal for a changed tracked file stands. A path with
-    a `..`, `.` or `.git` part, or whose parent resolves outside `root`, is skipped: a crafted tree entry moves
-    nothing outside the checkout."""
+    file: never moved (a PR that adds a file `.mail-out` must not move the mail queue), so fast_forward refuses and
+    names them. Untracked takes in ignored: git 2.53's read-tree overwrites an ignored file and deletes an ignored
+    dir where it refuses for any other untracked one, so fast_forward calls this before read-tree, never on its
+    refusal. A tracked dir where `sha` adds a file is a dir here too when it holds anything untracked (an ignored token
+    file read-tree would delete with the tracked ones). A tracked path is otherwise never either; read-tree's refusal
+    for a changed tracked file stands. A path with a `..`, `.` or `.git` part, or whose parent resolves outside
+    `root`, is skipped: a crafted tree entry moves nothing outside the checkout. -> None when git cannot list them."""
     rc, out = git(root, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", head, sha, env=env)
     rc2, idx = git(root, "ls-files", "-z", env=env)
     if rc or rc2:
-        return [], []
+        return None
     tracked = {p for p in idx.split("\0") if p}
     top = os.path.realpath(root)
     files, dirs = [], []
@@ -340,14 +349,31 @@ def in_the_way(root, head, sha, env):
                 continue
             # the parent, not q itself: a symlink in the way is moved as a link wherever it points
             up = os.path.realpath(os.path.dirname(full))
-            if (up == top or up.startswith(top + os.sep)) and q not in tracked \
-                    and not any(t.startswith(q + "/") for t in tracked):
+            inside = up == top or up.startswith(top + os.sep)
+            if inside and q not in tracked and not any(t.startswith(q + "/") for t in tracked):
                 if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
                     files += [q] if q not in files else []
                 elif stat.S_ISDIR(st.st_mode):
                     dirs += [q] if q not in dirs else []
+            elif inside and stat.S_ISDIR(st.st_mode) and holds_untracked(root, q, tracked):
+                dirs += [q] if q not in dirs else []
             break
     return files, dirs
+
+
+def holds_untracked(root, q, tracked):
+    """Is there anything under the dir `q` that is not in `tracked`? Links are not followed; a dir that cannot be
+    read counts as yes, so what cannot be seen is never handed to read-tree to delete."""
+    def no(x):
+        raise x
+    try:
+        for d, subs, names in os.walk(os.path.join(root, q), onerror=no):
+            for n in names + [s for s in subs if os.path.islink(os.path.join(d, s))]:
+                if os.path.relpath(os.path.join(d, n), root).replace(os.sep, "/") not in tracked:
+                    return True
+    except OSError:
+        return True
+    return False
 
 
 def aside(root, paths):
@@ -366,7 +392,7 @@ def aside(root, paths):
     for p in paths:
         try:
             os.makedirs(os.path.dirname(os.path.join(dest, p)), exist_ok=True)
-            shutil.move(os.path.join(root, p), os.path.join(dest, p))
+            move(root, dest, p)
         except OSError as x:
             left = put_back(root, moved, dest)
             return [], "", (f"moving {p} aside failed ({x}), so nothing was moved"
@@ -377,13 +403,12 @@ def aside(root, paths):
 
 
 def put_back(root, moved, dest):
-    """Move `moved` back from `dest` into `root`; never over something now there. -> the paths still in `dest`."""
+    """Move `moved` back from `dest` into `root`; never over something now there (move()). -> the paths still in
+    `dest`."""
     left = []
     for p in moved:
         try:
-            if os.path.lexists(os.path.join(root, p)):
-                raise FileExistsError(p)
-            shutil.move(os.path.join(dest, p), os.path.join(root, p))
+            move(dest, root, p)
         except OSError:
             left.append(p)
     if not left:
@@ -391,6 +416,83 @@ def put_back(root, moved, dest):
             with contextlib.suppress(OSError):
                 os.rmdir(d)
     return left
+
+
+def walk_to(root, rel):
+    """-> an fd on the dir holding `rel` under `root`, each part below `root` opened with O_NOFOLLOW, so a parent that
+    is a symlink raises OSError instead of being followed. The caller closes it."""
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in (x for x in os.path.dirname(rel).split("/") if x):
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def move(src_root, dst_root, rel):
+    """Move the file or symlink `rel` from `src_root` to the same path under `dst_root` (whose dirs exist), as itself:
+    a link moves as a link. Through parents walk_to() opened with O_NOFOLLOW, and never over anything at the
+    destination: a hard link then an unlink, or a copy made with O_EXCL where the link fails with EXDEV (another
+    filesystem) or EPERM (a file another user owns, under fs.protected_hardlinks); a failed unlink removes the copy. The #967 re-read
+    (2026-10-04) named "a race window between the lstat walk and the move": a parent swapped for a symlink in between
+    is refused here, not followed, and a leaf swapped for a dir cannot be linked."""
+    name = os.path.basename(rel)
+    s = walk_to(src_root, rel)
+    try:
+        d = walk_to(dst_root, rel)
+        try:
+            try:
+                os.link(name, name, src_dir_fd=s, dst_dir_fd=d, follow_symlinks=False)
+            except OSError as x:
+                # the FIX read (2026-10-12): link fails "with EPERM on a file owned by another user
+                # (fs.protected_hardlinks=1 here), where the old rename worked", so EPERM copies as EXDEV does
+                if x.errno not in (errno.EXDEV, errno.EPERM):
+                    raise
+                copy_at(s, d, name)
+            try:
+                os.unlink(name, dir_fd=s)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.unlink(name, dir_fd=d)
+                raise
+        finally:
+            os.close(d)
+    finally:
+        os.close(s)
+
+
+def copy_at(s, d, name):
+    """Copy the file or symlink `name` from dir fd `s` to dir fd `d`, never following a link and never over anything;
+    the copy gets the permission bits only (no setuid, setgid or sticky), anything else raises EPERM, and a
+    part-written copy is removed."""
+    st = os.stat(name, dir_fd=s, follow_symlinks=False)
+    if stat.S_ISLNK(st.st_mode):
+        os.symlink(os.readlink(name, dir_fd=s), name, dir_fd=d)
+        return
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(errno.EPERM, "neither a file nor a symlink", name)
+    i = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=s)   # a fifo swapped in never blocks
+    try:
+        if not stat.S_ISREG(os.fstat(i).st_mode):
+            raise OSError(errno.EPERM, "neither a file nor a symlink", name)
+        o = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=d)
+        try:
+            os.fchmod(o, st.st_mode & 0o777)   # never a setuid or setgid bit onto a file the lander owns
+            while chunk := os.read(i, 1 << 20):
+                while chunk:
+                    chunk = chunk[os.write(o, chunk):]
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=d)
+            raise
+        finally:
+            os.close(o)
+    finally:
+        os.close(i)
 
 
 def install(root, repo, sha):

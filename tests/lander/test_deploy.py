@@ -117,7 +117,7 @@ class Box(Case):
             return 0, ""
 
         answers = {"git " + k: git for k in ("rev-parse", "diff", "log", "fetch", "merge", "ls-remote", "merge-base",
-                                             "update-index", "read-tree", "update-ref")}
+                                             "update-index", "read-tree", "update-ref", "ls-files")}
         answers.update({"systemctl": systemctl, "install.sh": (0, "linked\n"), "cc-units restart-for": (0, ""),
                         "cc-units daemons-for": (0, ""), "cc-units policy": (0, "box\n"),
                         "cc-scope list": (0, "[]"), "cc-slack post": (0, ""), "cc-slack inject": (0, ""),
