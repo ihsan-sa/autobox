@@ -1,0 +1,956 @@
+#!/usr/bin/env python3
+# cc-hostdoor — the door between a box's hub and a SESSION HOST: a second machine where member-workspace sessions run
+# while the Slack daemon, the boards and ~/.cc/state stay on the hub (docs/architecture/two-hosts.md). cc-msg types
+# into a window over there (its "A WINDOW ON ANOTHER HOST"); this carries the other direction, a member session's
+# traffic back to the hub, over ONE ssh key per session host that the hub lets run nothing but `cc-hostdoor door`.
+#
+#   cc-hostdoor door --host <name>   HUB SIDE. The forced command of a session host's key in the hub's authorized_keys:
+#                         restrict,from="<that host's addrs>",command="$HOME/bin/cc-hostdoor door --host <name>" ssh-ed25519 …
+#                       The host is the forced command's, never the client's. SSH_ORIGINAL_COMMAND is exactly two words:
+#                         slack <h>    stdin/stdout spliced to the hub daemon's door socket for <h>, ~/.cc/slack/door/<h>/sock,
+#                                      which cc-slack bind_member_sock serves with the member socket's own handler: the
+#                                      daemon's authority is WHICH socket, so a byte splice reuses every rule it has. Not
+#                                      member/<h>/sock, which <h>'s sandbox binds and could swap for a link: the door dirs
+#                                      must be this user's and 0700, the socket not a link, and the listener's peer
+#                                      credentials this user in this mount namespace (no sandboxed process), or rc 1.
+#                         queries <h>  stdin (≤ 64 KB, JSON lines; any other line dropped) appended to the hub's
+#                                      ~/.cc/state/<h>/queries.spool under flock ~/.cc/state/<h>/.queries.lock — the
+#                                      spool cc-guard record_query writes and cc-msg drain_queries reads as untrusted.
+#                         views <h>    a tar on stdout of the member's read-only views ~/.cc/library/ws/<id>/ and
+#                                      ~/.cc/documents/ws/<id>/, <id> = ~/.cc/members/<h>/workspace-id (cc-sandbox lib_bind,
+#                                      docs_bind), as library/… and documents/…; regular files only.
+#                         board <h>    a tar on stdin (≤ 4 MB) of the member's board files: flat names, regular files, no
+#                                      *.lock; each replaces ~/.cc/members/<h>/board/<name> by rename under <h>.lock. Any
+#                                      other entry (a path, .., a link) refuses the whole tar and nothing is written.
+#                       THE GATE, for every verb but `queries _nomarker` (below): <h> is a handle ([a-z0-9][a-z0-9_-]*), ~/.cc/members/<h>/ is a real
+#                       directory on the hub, and the hub's ~/.cc/windows — trusted only under cc-msg's owned() rule — has
+#                       an entry for <h> or one of its windows (<h>/<track>, <h>@…, <h>~…) naming exactly this --host.
+#                       Otherwise rc 2 and nothing is opened. Refusals go to ~/.cc/state/hostdoor.log.
+#   cc-hostdoor relay   SESSION-HOST SIDE, long-running (cc-hostdoor-relay.service). For every local member handle
+#                       (~/.cc/members/<h>/) it listens on ~/.cc/slack/member/<h>/sock — the path cc-sandbox shows the
+#                       member as ~/.cc/slack/sock — mode 0600 as cc-slack makes it, and each connection becomes one
+#                       `ssh <hub> slack <h>`, spliced both ways. The hub is the one record in ~/.cc/hosts with role=hub.
+#                       Refuses to start on the hub itself: a live daemon on ~/.cc/slack/sock, or $CC_HOSTDOOR_HERE
+#                       equal to the hub's name. Handles are re-scanned every $CC_HOSTDOOR_SCAN seconds.
+#   cc-hostdoor queries-push   one-shot (cc-hostdoor-queries.timer, 60 s): each local member's ~/.cc/state/<h>/queries.spool,
+#                       under its lock, goes to the hub as `queries <h>`; the local spool loses what was sent only on rc 0.
+#                       ~/.cc/state/_nomarker/queries.spool (cc-guard's key for a markerless session) goes up the same way
+#                       as `queries _nomarker`, the one name the door takes that is not a member; the host is its key's.
+#   cc-hostdoor sync    one-shot (cc-hostdoor-sync.timer, 5 min): pulls `views <h>` into the local same paths (each file
+#                       written in a temp dir and renamed into place, files the hub no longer has removed; the directory
+#                       itself stays, since a running sandbox binds it), and pushes the local board dir as `board <h>`
+#                       when it changed since the last push that was taken.
+#                       Each board file is opened O_NOFOLLOW|O_NONBLOCK and taken only if fstat says a regular file with
+#                       one link and at most BOARD_MAX; anything else is skipped, so a member can't swap in a link to the
+#                       door key or another member's file between a check and the read.
+#   cc-hostdoor selfcheck      two fake hosts in temp HOMEs, a stub ssh that plays the hub's sshd.
+# rc: 0 done · 1 failed (unreachable, no socket, no key) · 2 refused · 3 the hub's state would not take it.
+#
+# ENV (each for a test or an odd box; the defaults are the box's layout):
+#   CC_HOSTDOOR_WINDOWS  the window directory, default ~/.cc/windows (`<head-or-window> <host>` per line)
+#   CC_HOSTDOOR_HOSTS    host records, default ~/.cc/hosts/<host> (name=, addr=, user=, role=hub on the hub's own)
+#   CC_HOSTDOOR_KEYS     the session host's key dir, default ~/.cc/hostdoor: id_ed25519 and known_hosts (the hub's key
+#                        pinned, StrictHostKeyChecking=yes). Neither file, nothing is sent.
+#   CC_HOSTDOOR_HERE     this host's name, default hostname -s
+#   CC_HOSTDOOR_SSH      the ssh binary, default ssh
+#   CC_HOSTDOOR_SCAN     relay re-scan interval in seconds, default 60
+# core/ names no host: every name and address comes from ~/.cc/hosts and ~/.cc/windows.
+import fcntl, hashlib, io, json, os, re, shutil, socket, stat, struct, subprocess, sys, tarfile, tempfile, threading, time
+
+HOME = os.path.expanduser("~")
+CC = f"{HOME}/.cc"
+WINDOWS = os.environ.get("CC_HOSTDOOR_WINDOWS") or f"{CC}/windows"
+HOSTS = os.environ.get("CC_HOSTDOOR_HOSTS") or f"{CC}/hosts"
+KEYS = os.environ.get("CC_HOSTDOOR_KEYS") or f"{CC}/hostdoor"
+HERE = os.environ.get("CC_HOSTDOOR_HERE") or socket.gethostname().split(".")[0]
+SSH = os.environ.get("CC_HOSTDOOR_SSH") or "ssh"
+SCAN = float(os.environ.get("CC_HOSTDOOR_SCAN") or 60)
+HANDLE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
+HOSTNAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+ADDR = re.compile(r"[A-Za-z0-9.:][A-Za-z0-9.:-]*\Z")
+LOGIN = re.compile(r"[a-z0-9_][a-z0-9_-]*\Z")
+BOARDFILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+QMAX, SPOOL_MAX, BOARD_MAX, VIEWS_MAX = 65536, 1048576, 4 << 20, 64 << 20
+
+
+def log(msg):
+    try:
+        os.makedirs(f"{CC}/state", exist_ok=True)
+        with open(f"{CC}/state/hostdoor.log", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{msg}\n")
+    except OSError:
+        pass
+
+
+def owned(p):
+    """cc-msg's owned(): a regular file, not a link, this user's, writable by nobody else (this user's own group aside),
+    in a directory the same holds for."""
+    for q in (p, os.path.dirname(p)):
+        try:
+            st = os.lstat(q)
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode) or (q == p and not stat.S_ISREG(st.st_mode)) or st.st_uid != os.getuid():
+            return False
+        if st.st_mode & 0o002 or (st.st_mode & 0o020 and st.st_gid != os.getgid()):
+            return False
+    return True
+
+
+def real_dir(p):
+    try:
+        return stat.S_ISDIR(os.lstat(p).st_mode)
+    except OSError:
+        return False
+
+
+def no_links(*paths):
+    return not any(os.path.islink(p) for p in paths)
+
+
+def window_hosts(h):
+    """The hosts the trusted window directory puts any window of <h> on (its own entry, or one whose head is <h>, the
+    head as cc-msg cuts it at the first / @ ~): a session of <h> runs on each of them. Empty when the file is not trusted."""
+    if not owned(WINDOWS):
+        return set()
+    hosts = set()
+    with open(WINDOWS, errors="replace") as f:
+        for line in f:
+            w = line.split()
+            if len(w) >= 2 and re.split(r"[/@~]", w[0], maxsplit=1)[0] == h:
+                hosts.add(w[1])
+    return hosts
+
+
+def hub_record():
+    """(name, user@addr) of the ONE trusted record with role=hub, or None."""
+    found = []
+    try:
+        names = sorted(os.listdir(HOSTS))
+    except OSError:
+        return None
+    for n in names:
+        rec = f"{HOSTS}/{n}"
+        if not HOSTNAME.match(n) or not owned(rec):
+            continue
+        kv = {}
+        with open(rec, errors="replace") as f:
+            for line in f:
+                k, _, v = line.rstrip("\n").partition("=")
+                kv.setdefault(k, v)
+        if kv.get("role") == "hub" and kv.get("name") == n:
+            found.append((n, kv.get("addr", ""), kv.get("user", "")))
+    if len(found) != 1 or not ADDR.match(found[0][1]) or not LOGIN.match(found[0][2]):
+        return None
+    return found[0][0], f"{found[0][2]}@{found[0][1]}"
+
+
+NOMARKER = "_nomarker"   # cc-guard's key for a refusal from a member session with no marker to name its workspace
+
+
+def local_handles():
+    try:
+        return {h for h in os.listdir(f"{CC}/members") if HANDLE.match(h) and real_dir(f"{CC}/members/{h}")}
+    except OSError:
+        return set()
+
+
+def ws_id(h):
+    p = f"{CC}/members/{h}/workspace-id"
+    try:
+        if not stat.S_ISREG(os.lstat(p).st_mode):
+            return None
+        with open(p) as f:
+            i = f.read(17).strip()
+    except OSError:
+        return None
+    return i if re.fullmatch(r"[0-9a-f]{16}", i) else None
+
+
+def locked(path, wait=10):
+    """An fd holding flock on <path> (no link followed), or None after <wait> s, or None when <path> can't be
+    opened: a link a member planted there is refused by O_NOFOLLOW, and that must skip its handle, not crash the run."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o664)
+    except OSError:
+        return None
+    end = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() > end:
+                os.close(fd)
+                return None
+            time.sleep(0.05)
+
+
+def writeall(fd, d):
+    while d:
+        d = d[os.write(fd, d):]
+
+
+def splice(a, b):
+    """Bytes both ways between a and b, each (read, write, shut_write); returns when b's read side ends."""
+    def up():
+        try:
+            while True:
+                d = a[0]()
+                if not d:
+                    break
+                b[1](d)
+        except Exception:
+            pass
+        try:
+            b[2]()
+        except Exception:
+            pass
+    threading.Thread(target=up, daemon=True).start()
+    try:
+        while True:
+            d = b[0]()
+            if not d:
+                break
+            a[1](d)
+    except Exception:
+        pass
+    try:
+        a[2]()
+    except Exception:
+        pass
+
+
+def sock_side(s):
+    return (lambda: s.recv(65536), s.sendall, lambda: s.shutdown(socket.SHUT_WR))
+
+
+# ── HUB SIDE ─────────────────────────────────────────────────────────────────────────────────────────────────────
+def door(argv):
+    host = argv[1] if len(argv) == 2 and argv[0] == "--host" else ""
+    words = os.environ.get("SSH_ORIGINAL_COMMAND", "").split()
+    verb, h = (words + ["", ""])[:2]
+    why = None
+    if not HOSTNAME.match(host):
+        why = "no --host in the forced command"
+    elif len(words) != 2 or verb not in ("slack", "queries", "views", "board"):
+        why = "not one verb and one handle"
+    elif verb == "queries" and h == NOMARKER:
+        pass        # a markerless session's refusals: no member to check, the host's own pinned key is the authority
+    elif not HANDLE.match(h):
+        why = "not a handle"
+    elif not real_dir(f"{CC}/members/{h}"):
+        why = "no such member here"
+    elif host not in window_hosts(h):
+        why = "the trusted window directory does not put it on this host"
+    if why:
+        log(f"refused\t{host or '?'}\t{os.environ.get('SSH_ORIGINAL_COMMAND', '')[:80]!r}\t{why}")
+        print(f"cc-hostdoor door: refused — {why}", file=sys.stderr)
+        return 2
+    return {"slack": door_slack, "queries": door_queries, "views": door_views, "board": door_board}[verb](h)
+
+
+def private_dir(p):
+    """A real directory (not a link), this user's, mode 0700: nobody else, and no sandbox, can put anything in it."""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700
+
+
+def door_slack(h):
+    # perms 10-13: "a per-member socket in a 0700 dir that no sandbox binds, plus a peer-credential check". The daemon's
+    # member/<h>/sock is bound into <h>'s sandbox, so a member could swap it for a link to the owner's socket; the door
+    # dials door/<h>/sock instead (cc-slack bind_member_sock binds both), and only a listener that is this user and
+    # in this mount namespace — the daemon, not a sandboxed process — is spliced to.
+    p = f"{CC}/slack/door/{h}/sock"
+    try:
+        if not (private_dir(f"{CC}/slack/door") and private_dir(os.path.dirname(p))):
+            raise OSError("door dir is not a private 0700 directory")
+        st = os.lstat(p)
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError("not this user's socket")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(p)
+        pid, uid, _gid = struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if uid != os.getuid() or os.stat(f"/proc/{pid}/ns/mnt").st_ino != os.stat("/proc/self/ns/mnt").st_ino:
+            s.close()
+            raise OSError("the listener is not the daemon (another user, or inside a sandbox)")
+    except OSError as e:
+        print(f"cc-hostdoor door: no member socket for {h}: {e}", file=sys.stderr)
+        return 1
+    splice((lambda: os.read(0, 65536), lambda d: writeall(1, d), lambda: os.close(1)), sock_side(s))
+    return 0
+
+
+def door_queries(h):
+    data = sys.stdin.buffer.read(QMAX + 1)
+    if len(data) > QMAX:
+        print("cc-hostdoor door: queries over 64 KB, refused", file=sys.stderr)
+        return 2
+    out = b""
+    for line in data.splitlines():
+        try:
+            if isinstance(json.loads(line), dict):
+                out += line.strip() + b"\n"
+        except ValueError:
+            pass
+    sd = f"{CC}/state/{h}"
+    if not no_links(f"{CC}/state", sd):
+        return 3
+    os.makedirs(sd, exist_ok=True)
+    if not out:
+        return 0
+    lk = locked(f"{sd}/.queries.lock")
+    if lk is None:
+        return 3
+    try:
+        sp = f"{sd}/queries.spool"
+        try:
+            st = os.lstat(sp)
+            if not stat.S_ISREG(st.st_mode) or st.st_size + len(out) > SPOOL_MAX:
+                return 3    # cc-msg's qtake would discard the whole file as a plant
+        except FileNotFoundError:
+            pass
+        fd = os.open(sp, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o664)
+        writeall(fd, out)
+        os.close(fd)
+    finally:
+        os.close(lk)
+    return 0
+
+
+def door_views(h):
+    i = ws_id(h)
+    if not i:
+        return 3
+    files = []
+    for root in ("library", "documents"):
+        base = f"{CC}/{root}/ws/{i}"
+        if not no_links(f"{CC}/{root}", f"{CC}/{root}/ws", base):
+            return 3
+        for d, dirs, names in os.walk(base):
+            dirs[:] = [x for x in dirs if not os.path.islink(f"{d}/{x}")]
+            for n in names:
+                p = f"{d}/{n}"
+                st = os.lstat(p)
+                if stat.S_ISREG(st.st_mode):
+                    files.append((p, f"{root}/{os.path.relpath(p, base)}", st.st_size))
+    if sum(f[2] for f in files) > VIEWS_MAX:
+        return 3
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as t:
+        for p, arc, _ in files:
+            t.add(p, arcname=arc, recursive=False)
+    return 0
+
+
+def board_entries(data):
+    """The (name, bytes) of a board tar, or None when any entry is not a flat regular file."""
+    out = []
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as t:
+            for m in t.getmembers():
+                if not m.isreg() or not BOARDFILE.match(m.name):
+                    return None
+                if not m.name.endswith(".lock"):
+                    out.append((m.name, t.extractfile(m).read()))
+    except (tarfile.TarError, OSError):
+        return None
+    return out
+
+
+def door_board(h):
+    data = sys.stdin.buffer.read(BOARD_MAX + 1)
+    ents = None if len(data) > BOARD_MAX else board_entries(data)
+    bd = f"{CC}/members/{h}/board"
+    if ents is None or not no_links(bd) or any(os.path.lexists(f"{bd}/{n}") and not stat.S_ISREG(os.lstat(f"{bd}/{n}").st_mode) for n, _ in ents):
+        print("cc-hostdoor door: board tar refused (only flat regular files)", file=sys.stderr)
+        return 2
+    os.makedirs(bd, exist_ok=True)
+    lk = locked(f"{bd}/{h}.lock")
+    if lk is None:
+        return 3
+    try:
+        for n, b in ents:
+            tmp = f"{bd}/.{n}.hostdoor.{os.getpid()}"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o664)
+            writeall(fd, b)
+            os.close(fd)
+            os.rename(tmp, f"{bd}/{n}")
+    finally:
+        os.close(lk)
+    return 0
+
+
+# ── SESSION-HOST SIDE ────────────────────────────────────────────────────────────────────────────────────────────
+def ssh_argv(dest, words):
+    return [SSH, "-i", f"{KEYS}/id_ed25519", "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={KEYS}/known_hosts",
+            "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ClearAllForwardings=yes", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=30", "-T", "--", dest] + words
+
+
+def the_hub():
+    """user@addr of the hub, or None with why on stderr."""
+    hub = hub_record()
+    if not hub:
+        print(f"cc-hostdoor: no single trusted role=hub record in {HOSTS}", file=sys.stderr)
+        return None
+    if not all(os.path.isfile(f"{KEYS}/{f}") and os.path.getsize(f"{KEYS}/{f}") for f in ("id_ed25519", "known_hosts")):
+        print(f"cc-hostdoor: no key and pinned host key in {KEYS}", file=sys.stderr)
+        return None
+    return hub
+
+
+def call(dest, words, data=b"", cap=None):
+    """(rc, stdout) of one door call."""
+    try:
+        p = subprocess.run(ssh_argv(dest, words), input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return 255, b""
+    return p.returncode, p.stdout if cap is None or len(p.stdout) <= cap else b""
+
+
+def hub_alive():
+    p = f"{CC}/slack/sock"
+    try:
+        if not stat.S_ISSOCK(os.lstat(p).st_mode):
+            return False
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        try:
+            s.connect(p)
+            return True
+        finally:
+            s.close()
+    except OSError:
+        return False
+
+
+def relay_conn(c, h, dest):
+    try:
+        p = subprocess.Popen(ssh_argv(dest, ["slack", h]), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        c.close()
+        return
+    def to_ssh(d):
+        p.stdin.write(d)
+        p.stdin.flush()
+    splice(sock_side(c), (lambda: os.read(p.stdout.fileno(), 65536), to_ssh, p.stdin.close))
+    c.close()
+    try:
+        p.stdin.close()
+        p.wait(timeout=5)
+    except Exception:
+        p.kill()
+        p.wait()
+
+
+def relay():
+    hub = the_hub()
+    if not hub:
+        return 1
+    name, dest = hub
+    if HERE == name or hub_alive():
+        print(f"cc-hostdoor relay: this host is the hub ({name}) — nothing to relay", file=sys.stderr)
+        return 2
+    live = {}   # handle -> (server socket, inode of its path)
+
+    def serve(srv, h):
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=relay_conn, args=(c, h, dest), daemon=True).start()
+
+    while True:
+        want = local_handles()
+        for h, (srv, ino) in list(live.items()):
+            try:
+                same = os.lstat(f"{CC}/slack/member/{h}/sock").st_ino == ino
+            except OSError:
+                same = False
+            if h not in want or not same:
+                srv.close()
+                del live[h]
+        for h in sorted(want - set(live)):
+            d = f"{CC}/slack/member/{h}"
+            try:
+                if not no_links(f"{CC}/slack", f"{CC}/slack/member", d):
+                    raise OSError("a link under ~/.cc/slack")
+                os.makedirs(f"{d}/files", exist_ok=True)
+                os.close(os.open(f"{d}/enabled", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o664))
+                path = f"{d}/sock"
+                if os.path.lexists(path):
+                    os.unlink(path)
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                old = os.umask(0o177)   # 0600 at bind: a chmod after it would follow a link planted in between
+                try:
+                    srv.bind(path)
+                finally:
+                    os.umask(old)
+                srv.listen(16)
+                live[h] = (srv, os.lstat(path).st_ino)
+                threading.Thread(target=serve, args=(srv, h), daemon=True).start()
+                print(f"cc-hostdoor relay: {h} → {name}", file=sys.stderr, flush=True)
+            except OSError as e:
+                print(f"cc-hostdoor relay: {h}: {e}", file=sys.stderr, flush=True)
+        time.sleep(SCAN)
+
+
+def queries_push():
+    hub = the_hub()
+    if not hub:
+        return 1
+    rc = 0
+    for h in sorted(local_handles()) + [NOMARKER]:   # _nomarker too: this host's drain routes nothing, so it would sit here
+        sd = f"{CC}/state/{h}"
+        sp = f"{sd}/queries.spool"
+        try:
+            if not no_links(sd) or not stat.S_ISREG(os.lstat(sp).st_mode) or not os.path.getsize(sp):
+                continue
+        except OSError:
+            continue
+        lk = locked(f"{sd}/.queries.lock")
+        if lk is None:
+            rc = 1
+            continue
+        try:
+            fd = os.open(sp, os.O_RDWR | os.O_NOFOLLOW)   # a link planted after the lstat is not read or truncated
+        except OSError:
+            os.close(lk)
+            continue
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            os.close(lk)
+            continue
+        try:
+            for _ in range(16):
+                os.lseek(fd, 0, os.SEEK_SET)
+                data = b""
+                while True:
+                    d = os.read(fd, 1 << 20)
+                    if not d:
+                        break
+                    data += d
+                if not data:
+                    break
+                cut = data[:QMAX].rfind(b"\n") + 1
+                if not cut:   # one line over 64 KB is no query: drop it, or it blocks the spool forever
+                    nl = data.find(b"\n")
+                    rest = data[nl + 1:] if nl >= 0 else b""
+                else:
+                    r, _ = call(hub[1], ["queries", h], data[:cut])
+                    if r != 0:
+                        rc = 1
+                        break
+                    rest = data[cut:]
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                writeall(fd, rest)
+        finally:
+            os.close(fd)
+            os.close(lk)
+    return rc
+
+
+def view_entries(data):
+    """{(root, rel): bytes} of a views tar, or None when any entry is not a plain file or dir under library/ or documents/."""
+    out = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as t:
+            for m in t.getmembers():
+                parts = m.name.split("/")
+                if m.name.startswith("/") or parts[0] not in ("library", "documents") or len(parts) < 2 \
+                        or any(x in ("", ".", "..") for x in parts[1:]) or not (m.isreg() or m.isdir()):
+                    return None
+                if m.isreg():
+                    out[(parts[0], "/".join(parts[1:]))] = t.extractfile(m).read()
+    except (tarfile.TarError, OSError):
+        return None
+    return out
+
+
+def unpack_views(i, ents):
+    for root in ("library", "documents"):
+        top, ws, base = f"{CC}/{root}", f"{CC}/{root}/ws", f"{CC}/{root}/ws/{i}"
+        if not no_links(top, ws, base):
+            return 2
+        os.makedirs(base, exist_ok=True)
+        os.chmod(top, 0o700)
+        tmp = tempfile.mkdtemp(prefix=f".{i}.sync.", dir=ws)
+        try:
+            keep = set()
+            for (r, rel), b in ents.items():
+                if r != root:
+                    continue
+                d = os.path.dirname(rel)
+                if os.path.realpath(f"{base}/{d}") != os.path.normpath(os.path.realpath(base) + "/" + d):
+                    return 2    # a link under the view: nothing is made or written through it
+                os.makedirs(f"{base}/{d}", exist_ok=True)
+                os.makedirs(f"{tmp}/{d}", exist_ok=True)
+                with open(f"{tmp}/{rel}", "wb") as f:
+                    f.write(b)
+                os.rename(f"{tmp}/{rel}", f"{base}/{rel}")
+                keep.add(rel)
+            for d, dirs, names in os.walk(base):
+                for n in names:
+                    rel = os.path.relpath(f"{d}/{n}", base)
+                    if rel not in keep:
+                        os.unlink(f"{d}/{n}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return 0
+
+
+def board_tar(h):
+    bd = f"{CC}/members/{h}/board"
+    if not real_dir(bd):
+        return None
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        for n in sorted(os.listdir(bd)):
+            if not BOARDFILE.match(n) or n.endswith(".lock"):
+                continue
+            # perms 10-13: "open with O_NOFOLLOW|O_NONBLOCK, fstat it is a regular file with nlink 1, cap it at a
+            # BOARD_MAX, skip it on any error" — the member owns this dir, and a link (or a hard link) swapped in after a
+            # lstat would carry the door key or another member's file up to the hub.
+            try:
+                fd = os.open(f"{bd}/{n}", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except OSError:
+                continue
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > BOARD_MAX:
+                    continue
+                b = b""
+                while len(b) <= BOARD_MAX:
+                    d = os.read(fd, 65536)
+                    if not d:
+                        break
+                    b += d
+                if len(b) > BOARD_MAX:
+                    continue
+            except OSError:
+                continue
+            finally:
+                os.close(fd)
+            ti = tarfile.TarInfo(n)
+            ti.size, ti.mode = len(b), 0o664
+            t.addfile(ti, io.BytesIO(b))
+    return buf.getvalue()
+
+
+def sync():
+    hub = the_hub()
+    if not hub:
+        return 1
+    rc = 0
+    for h in sorted(local_handles()):
+        i = ws_id(h)
+        if i:
+            r, data = call(hub[1], ["views", h], cap=2 * VIEWS_MAX)
+            ents = view_entries(data) if r == 0 else None
+            if ents is None or unpack_views(i, ents) != 0:
+                rc = rc or (2 if r == 0 else 1)
+        tar = board_tar(h)
+        if tar is not None:
+            stamp = f"{KEYS}/board-{h}.sent"
+            sha = hashlib.sha256(tar).hexdigest()
+            try:
+                with open(stamp) as f:
+                    if f.read().strip() == sha:
+                        continue
+            except OSError:
+                pass
+            r, _ = call(hub[1], ["board", h], tar)
+            if r == 0:
+                with open(stamp, "w") as f:
+                    f.write(sha + "\n")
+            else:
+                rc = rc or 1
+    return rc
+
+
+# ── SELFCHECK ────────────────────────────────────────────────────────────────────────────────────────────────────
+STUB = r'''#!/usr/bin/env bash
+[ -n "${CC_FAKE_SSH_DOWN:-}" ] && exit 255
+key="" kh="" strict=""
+while [ $# -gt 0 ]; do case "$1" in
+  -i) key=$2; shift 2;;
+  -o) case "$2" in UserKnownHostsFile=*) kh=${2#*=};; StrictHostKeyChecking=*) strict=${2#*=};; esac; shift 2;;
+  -T) shift;; --) shift; break;; *) break;; esac; done
+dest=$1; shift
+[ "$strict" = yes ] && [ "$kh" = "$CC_FAKE_PIN" ] && [ -s "$kh" ] && [ -s "$key" ] && [ "$dest" = "$CC_FAKE_DEST" ] || exit 255
+if [ -n "${CC_FAKE_EVIL_TAR:-}" ] && [ "$1" = views ]; then cat "$CC_FAKE_EVIL_TAR"; exit 0; fi
+SSH_ORIGINAL_COMMAND="$*" HOME="$CC_FAKE_HUB" exec env -u CC_HOSTDOOR_HERE -u CC_HOSTDOOR_SCAN -u CC_HOSTDOOR_SSH \
+  python3 "$CC_FAKE_TOOL" door --host "$CC_FAKE_AS"
+'''
+
+
+class Echo:
+    """A member socket of the hub's daemon: one line in, `echo:<line>` back. n counts the connections it took."""
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.n, self.srv = 0, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(path)
+        self.srv.listen(8)
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            self.n += 1
+            try:
+                c.sendall(b"echo:" + c.makefile("rb").readline())
+            except OSError:
+                pass    # a probe that only connected (hub_alive) and left
+            c.close()
+
+
+def selfcheck():
+    me = os.path.realpath(__file__)
+    T = tempfile.mkdtemp(prefix="cc-hostdoor-sc.")
+    HUB, SES = f"{T}/hub", f"{T}/ses"
+    res = [0, 0]
+
+    def k(ok, what):
+        res[0 if ok else 1] += 1
+        print(f"  {'ok  ' if ok else 'FAIL'} {what}")
+
+    def w(p, b, mode=0o644):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb" if isinstance(b, bytes) else "w") as f:
+            f.write(b)
+        os.chmod(p, mode)
+
+    def rd(p):
+        try:
+            with open(p, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    w(f"{T}/bin/ssh", STUB, 0o755)
+    base = {x: v for x, v in os.environ.items() if not x.startswith("CC_")}
+    base.update(CC_FAKE_PIN=f"{SES}/.cc/hostdoor/known_hosts", CC_FAKE_DEST="u@100.64.0.1", CC_FAKE_HUB=HUB,
+                CC_FAKE_TOOL=me, CC_FAKE_AS="ses", CC_HOSTDOOR_SSH=f"{T}/bin/ssh", CC_HOSTDOOR_HERE="ses", CC_HOSTDOOR_SCAN="0.2")
+    for d in (HUB, SES):
+        for h in ("alice", "bob", "carol"):
+            if not (d == HUB and h == "carol"):
+                os.makedirs(f"{d}/.cc/members/{h}/board")
+                w(f"{d}/.cc/members/{h}/workspace-id", f"{h[0] * 16}\n")
+    for h in ("dan", "erin", "eve"):
+        os.makedirs(f"{HUB}/.cc/members/{h}/board")
+    w(f"{HUB}/.cc/windows", "alice ses\nbob other\ncarol ses\ndan/t1 ses\nerin other\nerin/t1 other\nevening ses\n")
+    echo = {h: Echo(f"{HUB}/.cc/slack/door/{h}/sock") for h in ("alice", "bob", "carol", "dan", "erin", "eve")}
+    for d, _, _ in os.walk(f"{HUB}/.cc/slack/door"):
+        os.chmod(d, 0o700)     # as cc-slack bind_member_sock makes them
+    owner = Echo(f"{HUB}/.cc/slack/sock")
+    w(f"{SES}/.cc/hosts/hub", "name=hub\naddr=100.64.0.1\nuser=u\nrole=hub\n")
+    w(f"{SES}/.cc/hostdoor/id_ed25519", "key\n", 0o600)
+    w(f"{SES}/.cc/hostdoor/known_hosts", "100.64.0.1 ssh-ed25519 AAAA\n")
+
+    def run(args, home, inp=b"", **extra):
+        e = dict(base, HOME=home, **extra)
+        p = subprocess.run([me] + args, input=inp, env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        return p.returncode, p.stdout
+
+    def door_(words, inp=b"", host="ses"):
+        return run(["door", "--host", host], HUB, inp, SSH_ORIGINAL_COMMAND=words)
+
+    def talk(path, msg=b"ping\n"):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(path)
+        s.sendall(msg)
+        out = b""
+        while True:
+            d = s.recv(4096)
+            if not d:
+                return out
+            out += d
+
+    try:
+        # relay refuses to run on the hub
+        sesock = f"{SES}/.cc/slack/member/alice/sock"
+        rc, _ = run(["relay"], SES, CC_HOSTDOOR_HERE="hub")
+        k(rc == 2 and not os.path.exists(sesock), f"relay refuses where CC_HOSTDOOR_HERE is the hub (rc {rc}), no socket bound")
+        live = Echo(f"{SES}/.cc/slack/sock")
+        rc, _ = run(["relay"], SES)
+        k(rc == 2 and not os.path.exists(sesock), f"…and where a live daemon holds ~/.cc/slack/sock (rc {rc})")
+        live.srv.close()
+        os.unlink(f"{SES}/.cc/slack/sock")
+
+        # the relay end to end
+        rp = subprocess.Popen([me, "relay"], env=dict(base, HOME=SES), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(100):
+                if os.path.exists(f"{SES}/.cc/slack/member/bob/sock"):
+                    break
+                time.sleep(0.05)
+            k(stat.S_IMODE(os.stat(sesock).st_mode) == 0o600, "relay binds each local member's socket, mode 0600")
+            out = talk(sesock)
+            k(out == b"echo:ping\n" and echo["alice"].n == 1, f"alice (windows: this host) reaches the hub's member socket: {out!r}")
+            k(echo["bob"].n == 0 and echo["carol"].n == 0, "…and no other member's socket on the hub is opened")
+            out = talk(f"{SES}/.cc/slack/member/bob/sock")
+            k(out == b"" and echo["bob"].n == 0, f"bob (windows: another host) gets nothing over the relay and the hub socket is never opened: {out!r}")
+        finally:
+            rp.kill()
+            rp.wait()
+
+        # the gate, at the door
+        rc, out = door_("slack alice", b"x\n")
+        k(rc == 0 and out == b"echo:x\n", f"door: slack alice spliced (rc {rc})")
+        # perms 10-13: a link swapped in for the door socket, or a door dir someone else could write, reaches nothing
+        dsock = f"{HUB}/.cc/slack/door/dan/sock"
+        os.unlink(dsock)
+        os.symlink(f"{HUB}/.cc/slack/sock", dsock)
+        rc, out = door_("slack dan", b"x\n")
+        k(rc == 1 and out == b"" and owner.n == 0, f"door: door/dan/sock swapped for a link to the owner's socket is refused (rc {rc}), owner socket never opened")
+        os.unlink(dsock)
+        echo["dan"] = Echo(dsock)
+        n0 = echo["alice"].n
+        os.chmod(f"{HUB}/.cc/slack/door/alice", 0o755)
+        rc, out = door_("slack alice", b"x\n")
+        os.chmod(f"{HUB}/.cc/slack/door/alice", 0o700)
+        k(rc == 1 and out == b"" and echo["alice"].n == n0, f"door: a door dir that is not 0700 is refused (rc {rc}), its socket never opened")
+        rc, out = door_("slack alice", b"y\n")
+        k(rc == 0 and out == b"echo:y\n", f"…and with it 0700 again the same member is spliced (rc {rc})")
+        rc, _ = door_("slack bob", b"x\n")
+        k(rc == 2 and echo["bob"].n == 0, f"door: bob mapped to another host refused (rc {rc}), socket never opened")
+        rc, _ = door_("slack carol", b"x\n")
+        k(rc == 2 and echo["carol"].n == 0, f"door: carol with no ~/.cc/members/carol on the hub refused (rc {rc}), socket never opened")
+        rc, out = door_("slack dan", b"x\n")
+        k(rc == 0 and out == b"echo:x\n" and echo["dan"].n == 1, f"door: dan, with only a track entry (dan/t1) on this host, spliced (rc {rc})")
+        rc, _ = door_("slack erin", b"x\n")
+        k(rc == 2 and echo["erin"].n == 0, f"door: erin, handle and track both on another host, refused (rc {rc})")
+        rc, _ = door_("slack eve", b"x\n")
+        k(rc == 2 and echo["eve"].n == 0, f"door: eve, whose name only prefixes an entry (evening), refused (rc {rc})")
+        rc, _ = door_("slack alice", b"x\n", host="other")
+        n = echo["alice"].n
+        k(rc == 2, f"door: the host is the forced command's — alice under --host other refused (rc {rc})")
+        os.chmod(f"{HUB}/.cc/windows", 0o666)
+        rc, _ = door_("slack alice", b"x\n")
+        k(rc == 2 and echo["alice"].n == n, f"door: an o+w ~/.cc/windows is not read (rc {rc})")
+        os.chmod(f"{HUB}/.cc/windows", 0o644)
+        os.rename(f"{HUB}/.cc/windows", f"{HUB}/.cc/windows.real")
+        os.symlink(f"{HUB}/.cc/windows.real", f"{HUB}/.cc/windows")
+        rc, _ = door_("slack alice", b"x\n")
+        k(rc == 2 and echo["alice"].n == n, f"door: a symlinked ~/.cc/windows is not read (rc {rc})")
+        os.unlink(f"{HUB}/.cc/windows")
+        os.rename(f"{HUB}/.cc/windows.real", f"{HUB}/.cc/windows")
+        rc, _ = door_("slack alice", b"x\n")
+        k(rc == 0 and echo["alice"].n == n + 1, "…and the same file, put back, is read again")
+        bad = ["", "rm -rf /", "slack ../x", "slack alice extra", "queries", "slack Alice", "slack -x", "door alice", "slack alice;id"]
+        rcs = [door_(b_)[0] for b_ in bad]
+        k(all(r == 2 for r in rcs), f"door: garbage words, slack ../x, extra args all rc 2: {rcs}")
+
+        # queries
+        hsp = f"{HUB}/.cc/state/alice/queries.spool"
+        rc, _ = door_("queries alice", b'{"a":1}\nnot json\n')
+        k(rc == 0 and rd(hsp) == b'{"a":1}\n', f"door: queries alice appends its JSON lines to the hub spool, the rest dropped: {rd(hsp)!r}")
+        rc, _ = door_("queries bob", b'{"a":1}\n')
+        k(rc == 2 and rd(f"{HUB}/.cc/state/bob/queries.spool") is None, f"door: queries bob refused (rc {rc}), no spool written")
+        lsp = f"{SES}/.cc/state/alice/queries.spool"
+        w(lsp, b'{"q":2}\n')
+        rc, _ = run(["queries-push"], SES, CC_FAKE_SSH_DOWN="1")
+        k(rc == 1 and rd(lsp) == b'{"q":2}\n' and rd(hsp) == b'{"a":1}\n', f"queries-push with the door down keeps the local spool (rc {rc})")
+        rc, _ = run(["queries-push"], SES)
+        k(rc == 0 and rd(lsp) == b"" and rd(hsp) == b'{"a":1}\n{"q":2}\n', f"queries-push delivered: hub spool appended, local truncated (rc {rc})")
+        lkp = f"{SES}/.cc/state/alice/.queries.lock"
+        if os.path.lexists(lkp):
+            os.unlink(lkp)
+        os.symlink(f"{SES}/elsewhere", lkp)
+        w(lsp, b'{"q":3}\n')
+        pq = subprocess.run([me, "queries-push"], env=dict(base, HOME=SES), stdin=subprocess.DEVNULL,
+                            capture_output=True, timeout=20)
+        rc, out = pq.returncode, pq.stderr
+        k(rc == 1 and b"Traceback" not in out and rd(lsp) == b'{"q":3}\n' and not os.path.exists(f"{SES}/elsewhere"),
+          f"queries-push: a link planted at .queries.lock skips that handle (rc {rc}, spool kept, no crash, link not followed)")
+        os.unlink(lkp)
+        rc, _ = run(["queries-push"], SES)
+        k(rc == 0 and rd(lsp) == b"" and rd(hsp) == b'{"a":1}\n{"q":2}\n{"q":3}\n', f"…and with the link gone the same spool goes up (rc {rc})")
+        # a markerless session's refusals (cc-guard's _nomarker key): this host's own drain routes nothing, so the push carries them
+        nsp, nhp = f"{SES}/.cc/state/_nomarker/queries.spool", f"{HUB}/.cc/state/_nomarker/queries.spool"
+        w(nsp, b'{"n":1}\n')
+        rc, _ = run(["queries-push"], SES)
+        k(rc == 0 and rd(nsp) == b"" and rd(nhp) == b'{"n":1}\n', f"queries-push carries the _nomarker spool to the hub's own (rc {rc})")
+        rc, _ = door_("views _nomarker")
+        rc2, _ = door_("slack _nomarker")
+        k(rc == 2 and rc2 == 2, f"door: _nomarker is a name for queries only — views and slack refuse it (rc {rc}, {rc2})")
+
+        # views + board through sync
+        ai, bi = "a" * 16, "b" * 16
+        w(f"{HUB}/.cc/library/ws/{ai}/index.db", b"LIB")
+        w(f"{HUB}/.cc/documents/ws/{ai}/files/r.pdf", b"PDF")
+        w(f"{HUB}/.cc/library/ws/{bi}/index.db", b"BOB")
+        w(f"{SES}/.cc/documents/ws/{ai}/stale", b"old")
+        w(f"{HUB}/.cc/members/alice/board/alice.json", b"HUB")
+        w(f"{SES}/.cc/members/alice/board/alice.json", b"LOCAL")
+        w(f"{HUB}/.cc/members/bob/board/bob.json", b"HUB")
+        w(f"{SES}/.cc/members/bob/board/bob.json", b"LOCAL")
+        rc, _ = run(["sync"], SES)
+        k(rd(f"{SES}/.cc/library/ws/{ai}/index.db") == b"LIB" and rd(f"{SES}/.cc/documents/ws/{ai}/files/r.pdf") == b"PDF"
+          and rd(f"{SES}/.cc/documents/ws/{ai}/stale") is None, "sync pulls alice's views into the same paths, a file the hub dropped removed")
+        k(rd(f"{SES}/.cc/library/ws/{bi}/index.db") is None, "…and bob's views (another host) are never pulled")
+        k(rd(f"{HUB}/.cc/members/alice/board/alice.json") == b"LOCAL", "sync pushes alice's board to the hub")
+        k(rd(f"{HUB}/.cc/members/bob/board/bob.json") == b"HUB", f"…and bob's board is refused there, the hub's kept (sync rc {rc})")
+        evil = io.BytesIO()
+        with tarfile.open(fileobj=evil, mode="w") as t:
+            for n in ("library/index.db", "library/../../../evil"):
+                ti = tarfile.TarInfo(n)
+                ti.size = 3
+                t.addfile(ti, io.BytesIO(b"BAD"))
+        w(f"{T}/evil.tar", evil.getvalue())
+        rc, _ = run(["sync"], SES, CC_FAKE_EVIL_TAR=f"{T}/evil.tar")
+        k(rc != 0 and rd(f"{SES}/.cc/library/ws/{ai}/index.db") == b"LIB" and not os.path.exists(f"{SES}/.cc/evil")
+          and not os.path.exists(f"{SES}/.cc/library/evil"), f"a views tar with ../ is refused whole, nothing written (rc {rc})")
+        btar = io.BytesIO()
+        with tarfile.open(fileobj=btar, mode="w") as t:
+            for n in ("alice.json", "../evil"):
+                ti = tarfile.TarInfo(n)
+                ti.size = 3
+                t.addfile(ti, io.BytesIO(b"BAD"))
+        rc, _ = door_("board alice", btar.getvalue())
+        k(rc == 2 and rd(f"{HUB}/.cc/members/alice/board/alice.json") == b"LOCAL" and not os.path.exists(f"{HUB}/.cc/members/alice/evil"),
+          f"door: a board tar with ../ is refused whole, nothing written (rc {rc})")
+        # perms 10-13: a member swaps board files for links to the door key or another member's file
+        w(f"{SES}/.cc/members/bob/secret", b"BOBS")
+        os.symlink(f"{SES}/.cc/hostdoor/id_ed25519", f"{SES}/.cc/members/alice/board/key.json")
+        os.link(f"{SES}/.cc/members/bob/secret", f"{SES}/.cc/members/alice/board/hard.json")
+        w(f"{SES}/.cc/members/alice/board/alice.json", b"LOCAL2")
+        rc, _ = run(["sync"], SES)
+        k(rd(f"{HUB}/.cc/members/alice/board/alice.json") == b"LOCAL2"
+          and not os.path.lexists(f"{HUB}/.cc/members/alice/board/key.json")
+          and not os.path.lexists(f"{HUB}/.cc/members/alice/board/hard.json"),
+          f"sync: a symlink to the door key and a hard link to bob's file are skipped, the real board file still goes up (rc {rc})")
+    finally:
+        shutil.rmtree(T, ignore_errors=True)
+    print(f"cc-hostdoor selfcheck: {res[0]} passed, {res[1]} failed")
+    return 1 if res[1] else 0
+
+
+def main(argv):
+    cmd = argv[0] if argv else ""
+    if cmd == "door":
+        return door(argv[1:])
+    if cmd == "relay" and len(argv) == 1:
+        return relay()
+    if cmd == "queries-push" and len(argv) == 1:
+        return queries_push()
+    if cmd == "sync" and len(argv) == 1:
+        return sync()
+    if cmd == "selfcheck":
+        return selfcheck()
+    print("usage: cc-hostdoor door --host <name> | relay | queries-push | sync | selfcheck", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

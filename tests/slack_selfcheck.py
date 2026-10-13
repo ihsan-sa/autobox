@@ -1231,6 +1231,79 @@ def run_selfcheck():
     finally:
         globals()["paused"] = real_paused
 
+    # A WINDOW ON ANOTHER HOST IS NEVER STARTED ON THIS ONE (review of #1126). With no subscriber, the keyboard and
+    # autostart used to look only at this host's tmux and then run `cc` here, so a member on the session host whose
+    # relay dropped got a second session on the hub with the next message. remote_host is stubbed (cc-msg --where
+    # has its own cases in cc-msg's selfcheck); every subprocess goes through a fake Effects that records it.
+    real_rh, real_pausedF, real_tmuxF, real_devF = remote_host, paused, tmux, globals()["DEV"]
+    runsF, popsF, rcF = [], [], [0]
+    effF = Effects("selfcheck-two-hosts",
+                   run=lambda cmd, **k: runsF.append(list(cmd)) or subprocess.CompletedProcess(cmd, rcF[0], "", ""),
+                   popen=lambda cmd, **k: popsF.append(list(cmd)) or type("P", (), {"poll": lambda s: 0})())
+    wasF = effF.install()
+    with tempfile.TemporaryDirectory() as dF:
+        try:
+            globals()["DEV"] = dF
+            os.makedirs(f"{dF}/memf/.cc"); open(f"{dF}/memf/{MEMBER_MARKER}", "w").close()
+            os.makedirs(f"{dF}/nearrepo")
+            globals()["remote_host"] = lambda w: "u@100.64.0.7" if w in ("farrepo", "memf") else None
+            globals()["paused"] = lambda t: False
+            globals()["tmux"] = lambda *a: (0, "")       # this host's tmux: up, and no window of either name in it
+            dmF = Daemon(use_slack=False); dmF.queues.clear()
+            rF = dmF.deliver("farrepo", {"type": "message", "content": "over there"})
+            check("two hosts: a message for a target whose window is on another host goes to cc-msg, which carries it "
+                  "there, and is 'spooled' (cc-msg never drops what it takes); `cc` is not run on this host",
+                  rF == "spooled" and runsF == [[f"{BIN}/cc-msg", "farrepo", "over there"]]
+                  and not popsF and not dmF.queues.get("farrepo"))
+            runsF.clear()
+            rM = dmF.deliver("memf", {"type": "message", "content": "for the member"})
+            check("…and a member's target on the other host goes the same way: the boundary that keeps cc-slack off a "
+                  "member's pane here does not stop cc-msg carrying it to that member's own host",
+                  rM == "spooled" and runsF == [[f"{BIN}/cc-msg", "memf", "for the member"]] and not popsF)
+            runsF.clear(); rcF[0] = 1
+            rD = dmF.deliver("farrepo", {"type": "message", "content": "while it is down"})
+            check("…and when cc-msg can't take it (the far host is down), the message is queued and autostart says "
+                  "'elsewhere' and starts NOTHING here: no duplicate session on this host",
+                  rD == "elsewhere" and not popsF and len(dmF.queues["farrepo"]) == 1)
+            check("…and autostart asked by name (`!restart`) for a target on the other host starts nothing here either",
+                  Daemon.autostart(dmF, "memf", asked=True) == "elsewhere" and not popsF)
+            rcF[0] = 0; dmF.starting.clear()
+            rN = Daemon.autostart(dmF, "nearrepo")
+            check("…while a target with no entry (it is here) still starts with `cc` on this host, as before",
+                  rN == "starting" and popsF == [[f"{BIN}/cc", "nearrepo"]])
+        finally:
+            globals()["remote_host"], globals()["paused"] = real_rh, real_pausedF
+            wasF.install()                                 # install() sets DEV too: put it back after
+            globals()["tmux"], globals()["DEV"] = real_tmuxF, real_devF
+
+    # THE DOOR SOCKET (perms' read of #1126, 10-13): bind_member_sock also serves each member on DIR/door/<h>/sock, in
+    # 0700 dirs no sandbox binds, because <h>'s sandbox binds member/<h> and could swap that socket for a link to the
+    # owner's. A link planted at door/<h>/sock is removed, not followed; a door dir that is a link refuses the bind.
+    real_dirS = globals()["DIR"]
+    with tempfile.TemporaryDirectory() as dS:
+        try:
+            globals()["DIR"] = dS
+            open(f"{dS}/victim", "w").close()
+            os.makedirs(f"{dS}/door/memy", mode=0o755); os.chmod(f"{dS}/door", 0o755)
+            os.symlink(f"{dS}/victim", f"{dS}/door/memy/sock")
+            dmS = Daemon(use_slack=False)
+            dmS.accept_member = lambda srv, h: srv.close()     # no accept loop left running past the case
+            dmS.bind_member_sock("memy")
+            m = lambda q: stat.S_IMODE(os.lstat(q).st_mode)
+            check("door socket: bind_member_sock serves door/<h>/sock beside member/<h>/sock, both dirs made 0700, and a "
+                  "link planted at the socket path is replaced, its target untouched",
+                  stat.S_ISSOCK(os.lstat(f"{dS}/door/memy/sock").st_mode) and stat.S_ISSOCK(os.lstat(f"{dS}/member/memy/sock").st_mode)
+                  and m(f"{dS}/door") == 0o700 and m(f"{dS}/door/memy") == 0o700 and os.path.isfile(f"{dS}/victim"))
+            os.makedirs(f"{dS}/elsewhere"); os.symlink(f"{dS}/elsewhere", f"{dS}/door/memz")
+            try:
+                dmS.bind_member_sock("memz"); refused = False
+            except OSError:
+                refused = True
+            check("…and a door dir that is a link refuses the door bind, nothing made through it",
+                  refused and os.listdir(f"{dS}/elsewhere") == [])
+        finally:
+            globals()["DIR"] = real_dirS
+
     # `!handoff` IS `cc-handoff --overlap` on the channel's target: a stub cc-handoff in a BIN of its own records its
     # argv, and the channel gets exactly one line — the success line, or cc-handoff's own refusal.
     hbin = tempfile.mkdtemp(prefix="cc-slack-selfcheck-handoff-")

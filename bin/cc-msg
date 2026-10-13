@@ -22,6 +22,14 @@
 #                               ever read the table at them.) Behind every MEMBER window it also reads the
 #                               workspace's credential file: one gone blank under a running session is said once
 #                               to #<handle> and the owner (member_signed_out).
+#   cc-msg --door               the forced command of the hub's delivery key on a session host: SSH_ORIGINAL_COMMAND
+#                               `deliver|turn <window> [<from>]`, the text on stdin, typed here and never forwarded on
+#                               ("A WINDOW ON ANOTHER HOST", below). A window the hub's directory puts on another host
+#                               is delivered there, through this door, by the send, --turn and --drain forms above.
+#   cc-msg --where <window>     prints the user@addr of the other host the window directory puts <window> on, and
+#                               nothing when it is here or the entry fails a check (win_host, below). cc-slack asks
+#                               this before it types a pane or starts a session, so it starts nothing on the hub
+#                               for a window that lives on another host.
 #   cc-msg selfcheck
 # Prints "queued" (rc 0) when the text went to the spool, nothing when it was typed.
 # A window whose name has an open handoff record (~/.cc/state/handoff) is not typed into: the text goes to
@@ -614,8 +622,9 @@ free_pane(){  # $1 window  $2 window id → 0 when the pane will take keys now; 
 spool_pop(){ tail -n +2 "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }   # the head line is gone; under the lock
 
 drain_window(){   # $1 window — deliver the spool in order while the pane stays free; keeps what it cannot deliver
-  local sp satf id n=0 line text was sat
+  local sp satf id n=0 line text was sat dest
   sp="$(sdir "$1")/inbox.spool"; satf="$(sdir "$1")/inbox.sat"; [ -s "$sp" ] || return 0
+  dest=$(win_host "$1"); [ -z "$dest" ] || { drain_remote "$1" "$dest" >/dev/null; return 0; }   # typed on its own host
   id=$(win_id "$1"); [ -n "$id" ] || { orphan_seen "$1"; return 0; }   # gone or not up yet: the spool waits, but not silently forever
   live_claude "$id" || return 0
   ( flock -w 10 9 || exit 1
@@ -732,6 +741,10 @@ qsay(){   # $1 = workspace, $2 = the text → rc 0 the first time this query is 
 }
 drain_queries(){
   local chan sp rel ws f n=0 line text tgt res rc dropped held k slice m paged=0 first=""
+  # A SESSION HOST ROUTES NOTHING ITSELF: a host holding the key to its hub's door (cc-hostdoor) has no queries seat
+  # of its own, and `cc-hostdoor queries-push` carries each spool (every member's, and _nomarker's) to the hub, whose drain routes it. Taking it here
+  # first would strand it in this host's $QDIR.
+  [ -s "${CC_HOSTDOOR_KEYS:-$HOME/.cc/hostdoor}/id_ed25519" ] && return 0
   # NO CHANNEL IS NOT NO ROUTE (landing review of #243): this file replaced the guard's own page to the owner, so a
   # box that never set CC_QUERIES_CHANNEL must still get each query to a session, and the owner told ONCE a tick.
   chan=$(cfg CC_QUERIES_CHANNEL)
@@ -939,8 +952,102 @@ handoff_relay(){   # $1 window  $2 text → rc 0 and cc-slack's word (delivered|
   case "$res" in delivered|held) echo "$res"; return 0;; esac
   return 1                                         # anything else (daemon down, paused): the keyboard, as before
 }
+# ── A WINDOW ON ANOTHER HOST ─────────────────────────────────────────────────────────────────────────────────
+# The box's hub can keep sessions on a second host (docs/architecture/two-hosts.md, "What crosses"). Its tmux is not
+# this one, so the typing happens THERE: the window directory names the host, and the text goes over one ssh key that
+# the session host allows to run nothing but `cc-msg --door`. Every link is read here and must hold, or the entry is
+# ignored and the message goes to the local window as before (said in msg.log): a planted entry redirects nothing.
+#   $CC_MSG_WINDOWS (~/.cc/windows)  `<window> <host>` or `<head> <host>` per line, head = the window's name before its
+#                    first / @ ~ (a member's `<handle>` covers `<handle>/<track>`); an exact name beats a head. Written by
+#                    the hub's own tools only. Trusted only as a regular file, not a link, owned by this user and
+#                    writable by nobody else (this user's own group aside), in a directory that holds to the same; no member
+#                    boundary binds ~/.cc, so no member session can write it either.
+#   $CC_MSG_HOSTS (~/.cc/hosts)/<host>  the host's record: name=<host>, addr=, user=, under the same ownership rule.
+#   $CC_MSG_DOOR (~/.cc/door)  id_ed25519, the hub's delivery key, and known_hosts, every session host's key pinned
+#                    (StrictHostKeyChecking=yes). Neither file, no forward: the text waits in the hub's spool.
+# A host equal to this one ($CC_MSG_HERE, hostname -s) is this one. The door itself never forwards (CC_MSG_NO_FORWARD).
+# $CC_MSG_SSH (ssh) is the ssh binary the door is called with (the selfcheck's stub).
+WINDIR="${CC_MSG_WINDOWS:-$HOME/.cc/windows}"
+HOSTS_DIR="${CC_MSG_HOSTS:-$HOME/.cc/hosts}"
+DOOR="${CC_MSG_DOOR:-$HOME/.cc/door}"
+HERE="${CC_MSG_HERE:-$(hostname -s 2>/dev/null)}"
+DOOR_MAX=65536                               # bytes of one message the door reads; a message is a line, not a file
+valid_window(){ case "$1" in ''|-*|/*|*..*|*[!A-Za-z0-9._@~/-]*) return 1;; esac; }
+owned(){   # $1 path → 0 for a regular file, not a link, owned by this user, that nobody else may write, in a dir the same holds for
+  local p m
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  for p in "$1" "$(dirname "$1")"; do
+    [ "$(stat -c %u "$p" 2>/dev/null)" = "$(id -u)" ] || return 1
+    m=$(stat -c %A "$p" 2>/dev/null) || return 1
+    case "$m" in l*|????????w?) return 1;; esac                 # a link, or other-writable
+    # group-writable only in this user's own group (the box's umask is 002, so the records are written g+w)
+    case "$m" in ?????w????) [ "$(stat -c %g "$p" 2>/dev/null)" = "$(id -g)" ] || return 1;; esac
+  done
+}
+win_host(){   # $1 window → user@addr of the host its directory entry names when that is another host and every link holds
+  local h host rec addr user
+  [ -z "${CC_MSG_NO_FORWARD:-}" ] && [ -e "$WINDIR" ] || return 0
+  owned "$WINDIR" || { msg_log "$1" windir-untrusted "$WINDIR is not a file only this user writes: ignored, delivered here"; return 0; }
+  h=${1%%/*}; h=${h%%@*}; h=${h%%~*}
+  host=$(awk -v w="$1" -v h="$h" '$1 == w { e = $2 } $1 == h && g == "" { g = $2 } END { print (e != "" ? e : g) }' "$WINDIR")
+  [ -n "$host" ] && [ "$host" != "$HERE" ] || return 0
+  case "$host" in -*|*[!a-z0-9-]*) msg_log "$1" windir-untrusted "host '${host:0:40}' is not a host name: ignored"; return 0;; esac
+  rec="$HOSTS_DIR/$host"
+  owned "$rec" && grep -qx "name=$host" "$rec" ||
+    { msg_log "$1" windir-untrusted "no trusted record $rec: ignored, delivered here"; return 0; }
+  addr=$(sed -n 's/^addr=//p' "$rec" | head -1); user=$(sed -n 's/^user=//p' "$rec" | head -1)
+  # a bad record: a user like -oProxyCommand=… is an ssh option, not a login
+  case "$addr" in ''|-*|*[!A-Za-z0-9.:-]*) msg_log "$1" windir-untrusted "$rec: addr is not an address"; return 0;; esac
+  case "$user" in ''|-*|*[!a-z0-9_-]*) msg_log "$1" windir-untrusted "$rec: user is not a login"; return 0;; esac
+  printf '%s@%s' "$user" "$addr"
+}
+door_ssh(){   # $1 user@addr  $2 deliver|turn  $3 window; the text on stdin → the session host's `cc-msg --door`, its rc ours
+  local from=${CC_MSG_FROM:-cc-msg}; case "$from" in *[!A-Za-z0-9:._@/-]*) from=cc-msg;; esac
+  [ -s "$DOOR/id_ed25519" ] && [ -s "$DOOR/known_hosts" ] || { echo "cc-msg: no delivery key in $DOOR" >&2; return 255; }
+  "${CC_MSG_SSH:-ssh}" -i "$DOOR/id_ed25519" -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes \
+    -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$DOOR/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+    -o ClearAllForwardings=yes -o ConnectTimeout=10 -T -- "$1" "$2" "$3" "$from"
+}
+drain_remote(){   # $1 window  $2 user@addr → the hub's spool for it, forwarded in order; each door's stdout printed
+  local sp text rc
+  sp="$(sdir "$1")/inbox.spool"; [ -s "$sp" ] || return 0
+  ( flock -w 10 9 || exit 1
+    while [ -s "$sp" ]; do
+      if ! text=$(head -1 "$sp" | jq -er '.text | strings' 2>/dev/null); then
+        msg_log "$1" spool-dropped "not a message, discarded before the door: $(head -1 "$sp" | cut -c1-200)"; spool_pop "$sp"; continue
+      fi
+      printf '%s' "$text" | door_ssh "$2" deliver "$1" 2>>"$(sdir "$1")/door.err"; rc=$?
+      # unreachable, refused or no such window there: the line stays at the head, and the next drain tries it again
+      [ "$rc" = 0 ] || { msg_log "$1" door-failed "rc $rc from $2 (door.err beside the spool)"; break; }
+      spool_pop "$sp"
+    done ) 9>"$(lock "$1")"
+}
+send_remote(){   # $1 window  $2 text  $3 user@addr — send()'s contract across hosts: the hub's spool first, as locally
+  local line out sp
+  line=$(spool_add "$1" "$2") || { echo "cc-msg: could not spool for $1" >&2; exit 1; }
+  out=$(drain_remote "$1" "$3")
+  sp="$(sdir "$1")/inbox.spool"
+  if { [ -f "$sp" ] && grep -qxF "$line" "$sp"; } || [ "$(printf '%s' "$out" | tail -1)" = queued ]; then echo queued; fi
+  return 0
+}
+door(){   # the forced command of the hub's key on a session host: `deliver|turn <window> [<from>]`, the text on stdin
+  local verb w from text
+  set -f; set -- ${SSH_ORIGINAL_COMMAND:-}; set +f
+  verb=${1:-}; w=${2:-}; from=${3:-door}
+  { [ $# -ge 2 ] && [ $# -le 3 ] && valid_window "$w"; } || { echo "cc-msg --door: refused '${SSH_ORIGINAL_COMMAND:-}'" >&2; exit 2; }
+  case "$from" in *[!A-Za-z0-9:._@/-]*) from=door;; esac
+  text=$(head -c "$DOOR_MAX")
+  export CC_MSG_NO_FORWARD=1 CC_MSG_FROM="$from"
+  case "$verb" in
+    deliver) send "$w" "$text";;
+    turn)    send_turn "$w" "$text"; exit $?;;
+    *)       echo "cc-msg --door: refused '$verb'" >&2; exit 2;;
+  esac
+}
+
 send(){    # $1 window  $2 text — THE contract: delivered, or queued and reported as queued. Never dropped.
-  local id res
+  local id res dest
+  dest=$(win_host "$1"); [ -z "$dest" ] || { send_remote "$1" "$2" "$dest"; return 0; }
   # A NAME MID-HANDOFF IS TWO SESSIONS, and the keyboard of whichever holds it is the wrong door: on 2026-09-16 a
   # relay typed into the retiring `lessons` seat was never acted on, and its successor never saw it. With an open
   # overlap record for this name the text goes to cc-slack instead, which hands it to the live side and, at the
@@ -1019,7 +1126,14 @@ turn_seen(){   # $1 window id  $2 the text as typed → the verdict on stdout; r
   done
 }
 send_turn(){   # $1 window  $2 text — send(), then the verdict --turn promises (above)
-  local id out sp line why st rc res
+  local id out sp line why st rc res dest
+  dest=$(win_host "$1")
+  if [ -n "$dest" ]; then   # the session host answers --turn itself; only a door that never answered is ours to keep
+    [ -s "$(sdir "$1")/inbox.spool" ] || { printf '%s' "$2" | door_ssh "$dest" turn "$1"; rc=$?; [ "$rc" = 255 ] || return "$rc"; }
+    send_remote "$1" "$2" "$dest" >/dev/null
+    echo "cc-msg: $1 lives on another host and its door did not answer — kept in the hub's spool, the drain forwards it (do not send it again)" >&2
+    return 3
+  fi
   # MID-HANDOFF, THE SAME DOOR AS send() (findings 8 and 9): typing would reach whichever pane holds the name. cc-slack
   # hands it to the live side, but nothing here can see that side's turn, so it is 3, never 0.
   if res=$(handoff_relay "$1" "$2"); then
@@ -1873,6 +1987,15 @@ $BUSY"; out=$(msg "hello mid-turn")
   CC_FAKE_QCHAN=qchan CC_FAKE_QSESS="$W" "$T/bin/cc-msg" --drain
   k "$(t grep -qF 'post -c #qchan' "$T/calls")" "a markerless member's refusal reaches the queries channel under the reserved _nomarker key"
   k "$(t grep -q '^inject .*_nomarker was refused' "$T/calls")" "…and the queries session, like any other query"
+  # …and on a SESSION HOST (it holds the key to its hub's door) the same spool is left where it is, and routed by
+  #    nothing here: cc-hostdoor queries-push carries _nomarker to the hub with the members' spools (its own selfcheck
+  #    asserts that push; review of #1126 found it carried only real handles, so these sat on the session host)
+  reset; rm -rf "$QD"; mkdir -p "$(dirname "$NQS")" "$T/.cc/hostdoor"; echo key > "$T/.cc/hostdoor/id_ed25519"; scr "$FREE"
+  printf '%s\n' '{"at":"t","workspace":"_nomarker","class":"page","reason":"merging a PR","command":"gh pr merge 1"}' > "$NQS"
+  CC_FAKE_QCHAN=qchan CC_FAKE_QSESS="$W" "$T/bin/cc-msg" --drain
+  k "$(t test -s "$NQS")" "a session host's own drain leaves a markerless session's query spool in place (cc-hostdoor queries-push takes it)"
+  k "$(nt grep -q -e '^post' -e '^inject' "$T/calls")" "…and routes nothing itself"
+  rm -rf "$T/.cc/hostdoor"
 
   # …no queries channel on the box: the query still reaches the session, and the owner is paged ONCE a tick — the
   #    guard's own page is gone, so an unwired box must still get a refusal to somebody (landing review of #243)
@@ -2169,6 +2292,94 @@ $BUSY"; "$T/bin/cc-msg" --sweep
   k "$(nt grep -q -e '^post' -e '^notify' "$T/calls")" "…and a member window with no live claude under it is not 'a running session': the start wall says it when the next one starts"
   rm -rf "$MEM" "$T/dev/mem"
 
+  # ── two hosts: the hub ($T, CC_MSG_HERE=hub) and a session host ($T/far, a home of its own). The stub ssh is that
+  # host's sshd as the delivery key meets it: the key and a pinned host-key file must be given, the destination must
+  # be the record's, and the words after it become SSH_ORIGINAL_COMMAND for `cc-msg --door`, run in the far HOME with
+  # its own pane, keys and windows. The hub has a window of the same name too, so a message that was NOT forwarded
+  # lands in $T/keys: every case asserts which of the two keyboards it reached and that the other stayed empty.
+  cat > "$T/bin/ssh-far" <<'STUB'
+#!/usr/bin/env bash
+printf 'ssh %s\n' "$*" >> "$CC_FAKE_CALLS"
+[ -n "${CC_FAKE_SSH_DOWN:-}" ] && exit 255                         # the host is off, or the tailnet is
+key="" kh="" strict=""
+while [ $# -gt 0 ]; do case "$1" in
+  -i) key=$2; shift 2;;
+  -o) case "$2" in UserKnownHostsFile=*) kh=${2#*=};; StrictHostKeyChecking=*) strict=${2#*=};; esac; shift 2;;
+  -T) shift;; --) shift; break;; *) break;; esac; done
+dest=$1; shift
+[ "$strict" = yes ] && [ -s "$kh" ] && [ -s "$key" ] && [ "$dest" = "$CC_FAKE_FAR_DEST" ] || exit 255
+F=$CC_FAKE_FAR
+SSH_ORIGINAL_COMMAND="$*" HOME="$F" CC_MSG_HERE=far CC_FAKE_WIN="$CC_FAKE_FAR_WIN" CC_FAKE_SCREEN="$F/screen" \
+  CC_FAKE_KEYS="$F/keys" CC_FAKE_GONE="$F/gone" CC_FAKE_MODE_F="$F/mode" CC_FAKE_SWAP_N="$F/swapn" \
+  CC_FAKE_SWALLOW_F="$F/swallow" exec "$(dirname "$0")/cc-msg" --door
+STUB
+  chmod +x "$T/bin/ssh-far"
+  local FAR="$T/far" HW='far/t1'
+  hosts(){   # a fresh pair: the far window free, a trusted entry and record on the hub, the delivery key and pinned host key
+    reset; rm -rf "$FAR" "$T/dev/mem" "$T/pwned" "$T/.cc/windows" "$T/.cc/hosts" "$T/.cc/door"; mkdir -p "$FAR" "$T/.cc/hosts" "$T/.cc/door"; chmod 755 "$T/.cc" "$T/.cc/hosts"
+    scr "$FREE"; printf '> \n' > "$FAR/screen"; : > "$FAR/keys"
+    printf 'name=far\naddr=100.64.0.7\nuser=u\nrole=peer\n' > "$T/.cc/hosts/far"
+    echo key > "$T/.cc/door/id_ed25519"; echo '100.64.0.7 ssh-ed25519 AAAA' > "$T/.cc/door/known_hosts"
+    printf '%s far\n' "$HW" > "$T/.cc/windows"; chmod 644 "$T/.cc/windows" "$T/.cc/hosts/far"; }
+  two(){ CC_MSG_HERE=hub CC_MSG_SSH="$T/bin/ssh-far" CC_FAKE_FAR="$FAR" CC_FAKE_FAR_DEST=u@100.64.0.7 \
+           CC_FAKE_FAR_WIN="$HW" CC_FAKE_WIN="$HW" "$T/bin/cc-msg" "$@"; }
+  far_got(){ grep -qF "$1" "$FAR/keys"; }
+  hub_got(){ grep -qF "$1" "$T/keys"; }
+
+  hosts; out=$(two "$HW" "over the door")
+  k "$(t far_got 'over the door')" "two hosts: a message for a window the directory puts on the other host is typed into that host's pane"
+  k "$(nt hub_got 'over the door')" "…and not into the hub's own window of the same name"
+  k "$(t test -z "$out")" "…and cc-msg stays silent, as for a local delivery the pane took"
+  k "$(nt test -s "$T/.cc/state/$HW/inbox.spool")" "…and the hub's spool for it is empty afterwards"
+  hosts; out=$(two --where "$HW")
+  k "$(t test "$out" = u@100.64.0.7)" "--where: a window the directory puts on the other host prints that host's login (what cc-slack asks)"
+  out=$(two --where 'here/t9')
+  k "$(t test -z "$out")" "…and a window with no entry prints nothing: it is here"
+  chmod 666 "$T/.cc/windows"; out=$(two --where "$HW")
+  k "$(t test -z "$out")" "…and an entry in a directory anyone may write prints nothing either"
+  hosts; printf '%s far\n' far > "$T/.cc/windows"; two "$HW" "by its head" >/dev/null
+  k "$(t far_got 'by its head')" "two hosts: an entry for the window's head (a member's handle) covers its tracks"
+
+  hosts; chmod 666 "$T/.cc/windows"; two "$HW" "forged o+w" >/dev/null
+  k "$(t hub_got 'forged o+w')" "a window directory anyone may write is not read: delivered here"
+  k "$(nt far_got 'forged o+w')" "…and nothing went to the other host"
+  hosts; mkdir -p "$T/dev/mem/.cc"; printf '%s far\n' "$HW" > "$T/dev/mem/.cc/windows"; rm -f "$T/.cc/windows"
+  ln -s "$T/dev/mem/.cc/windows" "$T/.cc/windows"; two "$HW" "member link" >/dev/null
+  k "$(t hub_got 'member link')" "a directory that is a link into a member's tree (a member-written entry) is not read: delivered here"
+  k "$(nt grep -q '^ssh ' "$T/calls")" "…and no ssh was even tried"
+  hosts; printf '%s evil\n' "$HW" > "$T/.cc/windows"; two "$HW" "no record" >/dev/null
+  k "$(t hub_got 'no record')" "an entry naming a host with no record of its own redirects nothing"
+  hosts; printf 'name=far\naddr=100.64.0.7\nuser=-oProxyCommand=touch%s\nrole=peer\n' "$T/pwned" > "$T/.cc/hosts/far"
+  two "$HW" "bad user" >/dev/null
+  k "$(t hub_got 'bad user')" "a record whose user is an ssh option is not a host: delivered here"
+  k "$(nt test -e "$T/pwned")" "…and no option of it ever reached ssh"
+  hosts; chmod 666 "$T/.cc/hosts/far"; two "$HW" "open record" >/dev/null
+  k "$(t hub_got 'open record')" "a host record anyone may write is not trusted either"
+
+  hosts; out=$(CC_FAKE_SSH_DOWN=1 two "$HW" "while it was down")
+  k "$(t test "$out" = queued)" "the other host unreachable: the message is kept, and cc-msg says queued"
+  k "$(t grep -qF 'while it was down' "$T/.cc/state/$HW/inbox.spool")" "…in the hub's spool for that window"
+  k "$(nt hub_got 'while it was down')" "…and never typed into the hub's same-named window instead"
+  two --drain "$HW"
+  k "$(t far_got 'while it was down')" "…and the next drain forwards it once the door answers"
+  k "$(nt test -s "$T/.cc/state/$HW/inbox.spool")" "…leaving the hub's spool empty"
+  hosts; out=$(CC_FAKE_SSH_DOWN=1 two --turn "$HW" "turn while down" 2>&1); rc=$?
+  k "$(t test "$rc" = 3)" "--turn at an unreachable host is rc 3, kept on the hub (got $rc)"
+
+  hosts; mkdir -p "$FAR/.cc/hosts"; printf '%s hub\n' "$HW" > "$FAR/.cc/windows"
+  printf 'name=hub\naddr=100.64.0.1\nuser=u\n' > "$FAR/.cc/hosts/hub"; chmod 644 "$FAR/.cc/windows" "$FAR/.cc/hosts/hub"; chmod 755 "$FAR/.cc"
+  two "$HW" "no bounce" >/dev/null
+  k "$(t far_got 'no bounce')" "the door types where it runs, whatever a directory on that host says"
+  k "$(t test "$(grep -c '^ssh ' "$T/calls")" = 1)" "…one ssh, never a second hop back"
+  hosts
+  for c in 'sh -c id' 'deliver ../x' 'deliver -x' 'deliver /x' 'deliver far/t1 me extra' 'drain far/t1' ''; do
+    out=$(printf 'nope' | SSH_ORIGINAL_COMMAND="$c" HOME="$FAR" CC_FAKE_WIN="$HW" CC_FAKE_SCREEN="$FAR/screen" CC_FAKE_KEYS="$FAR/keys" \
+          "$T/bin/cc-msg" --door 2>&1); rc=$?
+    k "$(t test "$rc" = 2)" "the door refuses '$c' (rc $rc)"
+  done
+  k "$(nt test -s "$FAR/keys")" "…and typed nothing for any of them"
+  rm -rf "$FAR" "$T/.cc/windows" "$T/.cc/hosts" "$T/.cc/door" "$T/dev/mem"
+
   echo "cc-msg selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ]
 }
@@ -2179,7 +2390,9 @@ case "${1:-}" in
   --ask)      shift; ask "${1:?cc-msg: --ask needs a window}" "${2:?cc-msg: --ask needs a /command}";;
   --sweep)    sweep;;
   --turn)     shift; w=${1:?cc-msg: --turn needs a window}; shift; send_turn "$w" "${*:-$(cat)}"; exit $?;;
+  --door)     door;;
+  --where)    shift; d=$(win_host "${1:?cc-msg: --where needs a window}"); [ -z "$d" ] || echo "$d";;
   selfcheck)  selfcheck;;
-  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --turn <window> "text" | cc-msg --drain [<window>] | cc-msg --sweep | cc-msg --ask <window> /cmd | cc-msg selfcheck' >&2; exit 2;;
+  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --turn <window> "text" | cc-msg --drain [<window>] | cc-msg --sweep | cc-msg --ask <window> /cmd | cc-msg --door | cc-msg --where <window> | cc-msg selfcheck' >&2; exit 2;;
   *)          w=$1; shift; send "$w" "${*:-$(cat)}";;
 esac

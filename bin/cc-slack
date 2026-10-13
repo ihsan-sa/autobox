@@ -2379,6 +2379,20 @@ def drop_retry(uid):
         with contextlib.suppress(Exception):
             save_retries(r)
 
+def remote_host(window):
+    """The user@addr of the other host the window directory (cc-msg's, ~/.cc/windows) puts this window on, or None
+    when it is here. cc-msg owns that file and its trust rules, so this only asks `cc-msg --where`; no directory, or
+    a cc-msg that can't answer, is here. A window that lives on another host is never typed or started on this one:
+    on 10-13 a member whose relay dropped would have got a second session on the hub with the next message."""
+    if not os.path.exists(os.environ.get("CC_MSG_WINDOWS") or f"{HOME}/.cc/windows"):
+        return None
+    try:
+        r = EFFECTS.run([f"{BIN}/cc-msg", "--where", window], stdin=subprocess.DEVNULL,
+                        capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        log(f"remote_host {window}: {e!r}"); return None
+    return ((r.stdout or "").strip() or None) if r.returncode == 0 else None
+
 def workspace_of(target):
     """The member workspace `target` belongs to, or None. `<handle>` and `<handle>/<project>` both answer
     `<handle>`; the marker file at ~/dev/<handle> is the truth, not members.json, so a hand-made one works too."""
@@ -4539,6 +4553,20 @@ class Daemon:
         self.member_srv[h] = srv
         threading.Thread(target=self.accept_member, args=(srv, h), daemon=True).start()
         log(f"member socket {h}: {path}")
+        # The same member's door socket, for cc-hostdoor's `slack <h>` from another host: DIR/door/<h>/sock in 0700 dirs
+        # that no sandbox binds, because <h>'s sandbox could swap member/<h>/sock for a link (perms, 10-13).
+        dd = f"{DIR}/door/{h}"
+        for q in (f"{DIR}/door", dd):
+            os.makedirs(q, mode=0o700, exist_ok=True)
+            st = os.lstat(q)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+                raise OSError(f"{q} is not this user's directory")
+            os.chmod(q, 0o700)
+        if os.path.lexists(f"{dd}/sock"):
+            os.unlink(f"{dd}/sock")
+        door = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        door.bind(f"{dd}/sock"); os.chmod(f"{dd}/sock", 0o600); door.listen(16)
+        threading.Thread(target=self.accept_member, args=(door, h), daemon=True).start()
 
     def accept_member(self, srv, h):
         while True:
@@ -5489,22 +5517,25 @@ class Daemon:
 
     def type_into_pane(self, target, payload, alias=None):
         """Last resort with no subscriber: `cc-msg` types the pane, answers safe prompts, spools, never drops.
-        Returns "typed", "spooled" (a 90s-killed cc-msg still counts if its spool holds the text), or None.
+        Returns "typed", "spooled" (a 90s-killed cc-msg still counts if its spool holds the text; a window on another
+        host is always this, since cc-msg carries it there), or None.
         None: no window, idle leftover, startup dialog, a refused pane, or a session seconds old. Text only."""
         if alias is not None:                          # an orch's window is <repo>@<alias>, not window_for(target):
             return None                                # its message waits in the alias-keyed queue, never main's pane
         if payload.get("type") == "permission" or not payload.get("content"):
             return None
-        if workspace_of(target):                       # THE BOUNDARY (autostart's "no-sandbox"): a member's target is
-            return None                                # never a pane on the host, so there is nothing here to type into
-        if time.time() - self.starting.get(target, 0) < 90:
-            return None
-        wid, _ = tmux_window(window_for(target))
-        if not wid or pane_idle(wid):
-            return None
-        rc, pane = tmux("capture-pane", "-p", "-t", wid)
-        if rc != 0 or startup_prompt(pane):            # a startup dialog is autostart's to press through: the channel
-            return None                                # is a moment away, and the message waits for it in the queue
+        far = remote_host(window_for(target))
+        if not far:                                    # a window on another host is cc-msg's to carry there (its door
+            if workspace_of(target):                   # types it on that host): nothing below reads this host's tmux
+                return None                            # THE BOUNDARY (autostart's "no-sandbox"): a member's target is
+            if time.time() - self.starting.get(target, 0) < 90:   # never a pane on the host, so nothing to type into
+                return None
+            wid, _ = tmux_window(window_for(target))
+            if not wid or pane_idle(wid):
+                return None
+            rc, pane = tmux("capture-pane", "-p", "-t", wid)
+            if rc != 0 or startup_prompt(pane):        # a startup dialog is autostart's to press through: the channel
+                return None                            # is a moment away, and the message waits for it in the queue
         t0 = time.time() - 1                           # -1: cc-msg's stamp is truncated to the second
         # Every message is its own sender: cc-msg collapses a RETRY (same sender, same text within 120s).
         # Sender = (channel, ts), not process name, so two distinct "yes"es don't collapse into one.
@@ -5523,13 +5554,18 @@ class Daemon:
             log(f"type_into_pane {target}: {e!r}"); return None
         if r.returncode != 0:
             return None                                # cc-msg refused the pane: fall back to the queue
-        return "spooled" if (r.stdout or "").strip() == "queued" else "typed"
+        # across hosts it is "spooled" either way: cc-msg holds it in the hub's spool until that host's door takes it
+        return "spooled" if far or (r.stdout or "").strip() == "queued" else "typed"
 
     def autostart(self, target, asked=False):
         """No subscriber: start the session (or explain why one can't take the message). Returns a state string.
         `asked` is the owner naming a session himself (`!restart`); an arriving message never is, and that
-        is the whole difference for a `<repo>/<track>` target — see the "no-session" branch below."""
+        is the whole difference for a `<repo>/<track>` target — see the "no-session" branch below. A target whose
+        window the window directory puts on another host is "elsewhere" and starts nothing here (remote_host)."""
         win = window_for(target)   # a member workspace target starts like any other: cc itself puts it inside the boundary (cc-sandbox member)
+        if remote_host(win):       # it lives on another host: `cc` here would be a second session of it on this one
+            log(f"autostart {target}: its window is on another host — nothing started here, the message waits")
+            return "elsewhere"
         # An unminted credential is not "starting": no credential, session, or wait makes one appear.
         # `cc` is still asked below only for the #<h> stamp line and the owner's daily page; opens nothing.
         ws = workspace_of(target)
@@ -6245,6 +6281,9 @@ class Daemon:
             elif res == "typed":
                 self.say(chat, f"typed into `{target}`'s terminal — that session runs without the channel, so its answer "
                                f"stays there. For a chat session restart it on the box (`cc handoff …`).", thread, mail=False)
+            elif res == "elsewhere":
+                self.say(chat, f"`{target}` runs on another host and couldn't be reached just now. Your message is "
+                               f"queued and goes to it when that host answers again.", thread, mail=False)
             elif res == "paused":
                 repo = (target or "").partition("/")[0].partition("@")[0]
                 self.say(chat, f"`{repo}` is paused — nothing there spends until `!resume`. Your message is queued and "
