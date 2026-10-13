@@ -25,6 +25,11 @@
             never waited on). Nothing is posted, closed on a board or deployed for it:
             the tip catch-up deploys main. One repo's fault is said and logged (tick-fault), never the tick's end.
             `lander settle-merged <repo> <pr> [--by WHO]` runs the same for one PR at once (lander-self land calls it).
+  waited    each repo with a job (no gh call; none at all in a GitHub backoff): the oldest due job (Lane.due) queued
+            more than cards.WAIT_FLAG_SECS (60 min) ago and not held by the box (lane.box_hold: paused, a tier
+            stop; or a lane "box" hold) -> one planner request (cards.waited), once per queuing and at most one per
+            repo, or per member across its lanes, per hour; marked sent only once cc-notify took it. A box hold is
+            noted (cards.held), and the age counts from the hold's end (the last hold seen, or the job's unheld_at).
   deploy    for each repo with a deploy-pending job, under its rest lock (jobs.rest_lock): tip.kick(repo) and a
             deploy.request not yet made — only when those units are installed.
   tip       for each repo the box knows (boards, <repo>.applied, jobs; members and paused repos skipped), under the
@@ -527,6 +532,52 @@ def nightly(repo, units) -> list:
         return [f"[{repo}] the nightly sweep failed: {type(e).__name__}: {e}"]
 
 
+def flag_waited(repos, cards, now=None) -> list:
+    """Brief: "have the lander's tick flag once when the oldest due job has waited over 60 min". For each repo, the
+    due job (Lane.due: not at rest, no hold still running) with the oldest queued_at; queued more than
+    cards.WAIT_FLAG_SECS ago (queued_at is to the second, so seconds are compared, and exactly 60 min is not over)
+    -> cards.waited, which says it once per queuing and at most once per repo per WAIT_FLAG_SECS. A job with no
+    queued_at has no age and is never flagged.
+    Nothing is flagged while the box itself holds the queue: a GitHub backoff (every repo), or the oldest due job held
+    by L.box_hold (its repo or member paused, a spend tier stop) or in a lane "box" hold (the day review cap, a usage
+    wall) whose time is up but which the lane has not let go yet, since the lane is not late then (perms' read, 10-13:
+    a held repo sent a false "Nothing stopped it" each tick). Each such hold is noted (cards.held), and the age counts
+    from the latest of queued_at, the job's unheld_at (Lane.unhold stamps it when a box hold ends) and the last tick
+    that found a hold, so a queue a hold just let go is not late at once (perms' read, 10-13). `cards` is the installed cards unit (L.load_units); with none, nothing is flagged."""
+    lines, t = [], int(now if now is not None else time.time())
+    if GH.backoff():
+        for r in (repos if cards else []):
+            try:
+                if J.lane_jobs(r):
+                    cards.held(r, t)
+            except Exception as e:  # noqa: BLE001 — as below
+                E.log("tick-fault", r, None, f"waited: {type(e).__name__}: {e}")
+        return lines
+    for r in (repos if cards else []):
+        try:
+            aged = [(E.epoch_of(j.extra.get("queued_at") or ""), j) for j in J.lane_jobs(r) if L.Lane.due(j)]
+            aged = [(at, j) for at, j in aged if at]
+            if not aged:
+                continue
+            at, job = min(aged, key=lambda x: x[0])
+            h, tr = M.member_of(r)
+            # a box hold still running is skipped; one whose time is up is due but HELD until the lane's unhold(), so
+            # its age counts from the hold's end (not_before) — a dead lane that never unholds it is still flagged
+            if L.box_hold(h if h and tr else r, job):
+                cards.held(r, t)
+                continue
+            since = max(at, E.epoch_of(job.extra.get("unheld_at") or "") or 0, int(cards.held_at(r) or 0),
+                        E.epoch_of(job.extra.get("not_before") or "") or 0)
+            if t - since <= C.WAIT_FLAG_SECS:
+                continue
+            if cards.waited(job, t - at, now=t):
+                lines.append(f"[{r}] PR #{job.pr} has waited {(t - at) // 60} min in the queue; "
+                             f"the planning seat is told")
+        except Exception as e:  # noqa: BLE001 — as tip_and_deploy: one repo's fault is said and logged
+            E.log("tick-fault", r, None, f"waited: {type(e).__name__}: {e}")
+    return lines
+
+
 def spawn_lane(repo):
     argv = [sys.executable, "-P", os.path.join(J.CORE, "lander", "cli.py"), "lane", repo]
     try:
@@ -560,6 +611,7 @@ def cmd_tick(argv) -> int:
             lines += [spawn_lane(r)] if detach else L.Lane(r).run()
         lines += retry_deploys(repos)
     units, known = L.load_units(), known_repos(repo)
+    lines += flag_waited(repos, units.get("cards"))
     for r in known:
         lines += tip_and_deploy(r, units)
         lines += nightly(r, units)

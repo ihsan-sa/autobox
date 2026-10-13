@@ -1,7 +1,11 @@
 """What the lander tells people, and the few box calls the U3 modules share.
 
-A CARD is one message about one job. `landed(job)` turns the PR's #approvals card to landed and says the merge where
-someone is listening; `stopped(job, why, route)` says a job left the lane and who picks it up. Where it goes (where()):
+A CARD is one message about one job. `positions(repo, jobs)` gives each job in the queue one card saying where it
+stands (`<i> of <n> in the lane`, its stage) and edits it as the job moves, then once more when it leaves;
+`waited(job, secs, now)` files one planner request when the tick finds the oldest due job past WAIT_FLAG_SECS, at
+most one per repo (per member, across its lanes) per WAIT_FLAG_SECS; `held(repo, now)` notes a box hold, from which that age counts.
+`landed(job)` turns the PR's #approvals card to landed and says the merge where someone is listening;
+`stopped(job, why, route)` says a job left the lane and who picks it up. Where it goes (where()):
 
     chat      the Slack thread the landing was asked from (job extra `chat`, `ts`)
     member    `#<h>-updates` for a member's landing, `#<h>` for its stop; the owner's channels never hear of it
@@ -30,7 +34,9 @@ them, and the tests swap exactly these.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import pwd
@@ -216,6 +222,36 @@ def _pending_path():
     return state("cards", "pending.json")
 
 
+@contextlib.contextmanager
+def _flock(name):
+    os.makedirs(state("cards"), exist_ok=True)
+    fd = os.open(state("cards", name), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _sent_lock():
+    """cards/sent.json and cards/waited.json are read, added to and written again by the lane, its cards thread and
+    the tick at once; each read-modify-write runs under this lock, so one never writes back a copy that loses another's
+    mark (perms' read, 10-13: the cards thread wiped a once-marker)."""
+    return _flock("sent.lock")
+
+
+def _pending_lock():
+    """The same for cards/pending.json (say() and retry()). Never held with _sent_lock, nor across a post: retry()
+    reads under it, posts, and writes its outcome back under it onto a fresh read (perms' read, 10-13)."""
+    return _flock("pending.lock")
+
+
+def mark_sent(*pids):
+    """Add `pids` to cards/sent.json, read afresh under _sent_lock (the last 500 are kept)."""
+    with _sent_lock():
+        write_json(_sent_path(), ((read_json(_sent_path(), []) or []) + list(pids))[-500:])
+
+
 def _post(argv, pid, hand=False):
     rc, out = sh(argv, timeout=180, **(box_hand() if hand else {}))
     return rc == 0 or "no SLACK_BOT_TOKEN" in out, out
@@ -230,33 +266,41 @@ def say(pid, argv, repo, pr, hand=False):
         return True
     ok, out = _post(argv, pid, hand)
     if ok:
-        write_json(_sent_path(), (sent + [pid])[-500:])
+        mark_sent(pid)
         return True
-    pending = read_json(_pending_path(), {}) or {}
-    pending[pid] = {"argv": argv, "tries": 1, "repo": repo, "pr": pr, "hand": bool(hand)}
-    write_json(_pending_path(), pending)
+    with _pending_lock():
+        pending = read_json(_pending_path(), {}) or {}
+        pending[pid] = {"argv": argv, "tries": 1, "repo": repo, "pr": pr, "hand": bool(hand)}
+        write_json(_pending_path(), pending)
     log("unsaid", repo, pr, id=pid, tries=f"1/{SAY_TRIES}", why=out.strip()[-120:].replace("\n", " "))
     return False
 
 
 def retry():
-    pending = read_json(_pending_path(), {}) or {}
+    with _pending_lock():
+        pending = read_json(_pending_path(), {}) or {}
     if not pending:
         return
-    sent = read_json(_sent_path(), []) or []
-    for pid, p in list(pending.items()):
+    sent, gone, tried = [], [], []
+    for pid, p in pending.items():
         ok, out = _post(p["argv"], pid, bool(p.get("hand")))
         if ok:
             sent.append(pid)
-            del pending[pid]
         elif p["tries"] + 1 >= SAY_TRIES:
             log("unsaid", p.get("repo", "-"), p.get("pr", 0), id=pid, gave_up="yes",
                 why="Slack never took it; this line is all it gets")
-            del pending[pid]
+            gone.append(pid)
         else:
-            p["tries"] += 1
-    write_json(_sent_path(), sent[-500:])
-    write_json(_pending_path(), pending)
+            tried.append(pid)
+    with _pending_lock():   # onto a fresh read: a card say() added meanwhile is kept
+        now = read_json(_pending_path(), {}) or {}
+        for pid in sent + gone:
+            now.pop(pid, None)
+        for pid in tried:
+            if pid in now:
+                now[pid]["tries"] = max(int(now[pid].get("tries") or 1), pending[pid]["tries"] + 1)
+        write_json(_pending_path(), now)
+    mark_sent(*sent)
 
 
 def post(job, kind, text, args):
@@ -348,9 +392,155 @@ def tell_dispatcher(job):
     text = f"[{job.repo}] PR #{int(job.pr)} merged{' ' + url if url else ''}. Your post-merge steps for it can run now."
     rc, out = sh([broker(), "inject", "--no-start", "--source", "lander", key, text], timeout=120)
     if rc == 0:
-        write_json(_sent_path(), ((read_json(_sent_path(), []) or []) + [pid])[-500:])
+        mark_sent(pid)
     else:
         log("unsaid", job.repo, job.pr, id=pid, to=key, why=out.strip()[-120:].replace("\n", " "))
+
+
+# --- where a queued PR stands --------------------------------------------------------------------------------------
+
+STAGE_WORDS = {T.QUEUED: "waiting its turn", T.PLANNED: "planned, its checks next",
+               T.CHECKING: "its checks are running", T.MERGEABLE: "checks green, merging next", T.MERGED: "merged",
+               T.HELD: "held, it is tried again later"}
+LEFT_WORDS = {T.MERGED: "merged", T.DEPLOY_PENDING: "merged", T.DEPLOYED: "merged", T.DONE: "done",
+              T.QUERY: "stopped, its NOT merged line says why", T.HANDBACK: "handed back to its seat"}
+WAIT_FLAG_SECS = 3600
+
+
+def _queued_path(repo):
+    """One file per repo: each repo's lane is its own process, so a shared file would lose one lane's cards."""
+    return state("cards", f"queued-{repo}.json")
+
+
+def queued_where(job):
+    """Where a queued card goes: the chat the landing was asked from, a member's `#<h>-updates`, the track's thread,
+    else the queue call's own --route title or `[<repo>] PR #<n> queued`."""
+    if job.extra.get("chat"):
+        return ["-c", job.extra["chat"]] + (["--thread", job.extra["ts"]] if job.extra.get("ts") else [])
+    if job.member:
+        return ["-c", f"#{job.member}-updates"]
+    tt = track_thread(job)
+    return ["--route", f"{tt} queued" if tt else job.extra.get("route") or f"[{job.repo}] PR #{job.pr} queued"]
+
+
+def ledger(pid):
+    """(chat, ts) of the post cc-slack's sent ledger holds for a producer id, else ("", "")."""
+    name = re.sub(r"[^A-Za-z0-9._@#:+-]", "_", pid)[:200] + ".json"
+    rec = read_json(os.path.join(os.path.expanduser(conf("CC_SLACK_DIR", "~/.cc/slack")), "sent", name), {})
+    if isinstance(rec, dict) and rec.get("accepted") and rec.get("chat") and rec.get("ts"):
+        return str(rec["chat"]), str(rec["ts"])
+    return "", ""
+
+
+def _edit(pid, text, repo, pr):
+    """Rewrite the card posted under `pid`. One not out yet (pending a retry, or held by cc-slack's engagement gate)
+    has nothing to edit, and is left."""
+    chat, ts = ledger(pid)
+    if not ts:
+        return
+    rc, out = sh([slack(), "edit", chat, ts, text], timeout=120)
+    if rc != 0:
+        log("unsaid", repo, pr, id=pid, edit="yes", why=out.strip()[-120:].replace("\n", " "))
+
+
+def positions(repo, jobs):
+    """A QUEUED PR SAYS WHERE IT STANDS (brief: "post a queued card with the PR's position and update it as it
+    moves"). `jobs` is the lane's list (jobs.lane_jobs: put first, then arrival); those not at rest are the queue.
+    Each gets one card, `[<repo>] PR #<n> is queued to land: <i> of <n> in the lane, <stage>.`, posted once under
+    `land:<repo>:<pr>:queued@<queued_at>` (queued_where) and edited in place (`cc-slack edit`) when its words change.
+    A card whose job left the queue gets one last edit saying how, and its record goes. cards/queued-<repo>.json keeps
+    what each card last said, so a queue that has not moved sends nothing; it is read and written under the repo's
+    own cards lock (lanes/<repo>.cards), so a lane's cards thread still running after its lane lock went (CARDS_WAIT
+    ran out) and the next lane's never lose each other's write. No model call. The lane calls it on a thread of its
+    own (Lane.carding), so a slow Slack never holds a landing."""
+    from lander import jobs as J
+    os.makedirs(J.lanes_dir(), exist_ok=True)
+    fd = os.open(J.lane_file(repo, "cards"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _positions(repo, jobs, J)
+    finally:
+        os.close(fd)
+
+
+def _positions(repo, jobs, J):
+    said = read_json(_queued_path(repo), {}) or {}
+    live = [j for j in jobs if j.state not in J.RESTING]
+    mine, moved = set(), False
+    for i, job in enumerate(live, 1):
+        pid = producer_id(job, "queued")
+        mine.add(pid)
+        text = (f"[{job.repo}] PR #{job.pr} is queued to land: {i} of {len(live)} in the lane, "
+                f"{STAGE_WORDS.get(job.state, job.state)}.")
+        last = said.get(pid)
+        if last and last.get("text") == text:
+            continue
+        if last:
+            _edit(pid, text, job.repo, job.pr)
+        else:
+            post(job, "queued", text, queued_where(job))
+        said[pid], moved = {"repo": job.repo, "pr": job.pr, "text": text}, True
+    state_of = {producer_id(j, "queued"): j.state for j in jobs}
+    for pid, last in list(said.items()):
+        if last.get("repo") != repo or pid in mine:
+            continue
+        how = LEFT_WORDS.get(state_of.get(pid), "out of the lane")
+        _edit(pid, f"[{repo}] PR #{last.get('pr')} has left the landing queue: {how}.", repo, last.get("pr"))
+        del said[pid]
+        moved = True
+    if moved:   # the lane calls this every pass: an unmoved queue writes nothing either
+        write_json(_queued_path(repo), said)
+
+
+def _waited_path():
+    return state("cards", "waited.json")
+
+
+def held(repo, now):
+    """The tick found the box holding `repo`'s queue at `now` (a pause, a tier stop, a GitHub backoff). The age the
+    tick flags counts from the last such tick, not from queued_at, so a hold that lifts is not read as a late lane."""
+    with _sent_lock():
+        d = read_json(_waited_path(), {}) or {}
+        d.setdefault(repo, {})["held"] = int(now)
+        write_json(_waited_path(), d)
+
+
+def held_at(repo):
+    """When the tick last found `repo`'s queue held by the box (held()); 0 when never."""
+    return int(((read_json(_waited_path(), {}) or {}).get(repo) or {}).get("held") or 0)
+
+
+def waited(job, secs, now=None):
+    """THE OLDEST DUE JOB HAS WAITED TOO LONG (brief: "have the lander's tick flag once when the oldest due job has
+    waited over 60 min"). A planner request (`cc-notify --ask` from box_hand) for the planning seat, never a page to
+    the owner, and a `waited` queue.log line. Once per queuing: its id `land:<repo>:<pr>:waited@<queued_at>` goes into
+    cards/sent.json once cc-notify took it (one cc-notify refused is tried again next tick). And at most one per repo
+    per WAIT_FLAG_SECS (cards/waited.json), whichever job it names: a queue whose oldest job keeps changing, as a member
+    closing a PR on every tick, wakes the planning seat once an hour, not once a tick (perms' read, 10-13). A member's
+    lanes (`<h>--<row>`, one per board row) share one cap, keyed `member:<h>`: perms' read, 10-13, "six rows meant six
+    wake-ups at once". A repo name has no ":", so no member key can be a box repo's.
+    -> True when it was said now."""
+    t = int(now if now is not None else time.time())
+    pid = producer_id(job, "waited")
+    if pid in (read_json(_sent_path(), []) or []):
+        return False
+    key = f"member:{job.member}" if job.member else job.repo
+    last = int(((read_json(_waited_path(), {}) or {}).get(key) or {}).get("said") or 0)
+    if last and t - last < WAIT_FLAG_SECS:
+        return False
+    text = (f"[{job.repo}] PR #{job.pr} has waited {secs // 60} min in the landing queue, the oldest job due there "
+            f"({STAGE_WORDS.get(job.state, job.state)}). Nothing stopped it; the lane has not landed it yet.")
+    rc, _ = sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", pid, "-t", f"{job.repo} landing", text],
+               timeout=60, **box_hand())
+    log("waited", job.repo, job.pr, mins=secs // 60, rc=rc)
+    if rc != 0:   # not taken: left unmarked, so the next tick tries again (Opus read, 10-13)
+        return False
+    mark_sent(pid)
+    with _sent_lock():
+        d = read_json(_waited_path(), {}) or {}
+        d.setdefault(key, {})["said"] = t
+        write_json(_waited_path(), d)
+    return True
 
 
 QUERY_ROUTES = ("query", "planning", "lander-self")
@@ -398,7 +588,7 @@ def stopped(job, why, route):
         if pid not in sent:
             sh([slack(), "inject", job.repo, f"[{job.repo}] PR #{job.pr} landing stopped: {short}. The way back in: "
                 f"fix it and push; the lane takes the new head."], timeout=120)
-            write_json(_sent_path(), (sent + [pid])[-500:])
+            mark_sent(pid)
     return said
 
 

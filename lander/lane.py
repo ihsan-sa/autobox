@@ -27,7 +27,9 @@ a checking job hands its next check to the lane's pool and the lane goes on to o
 review read is due (at most REVIEW_SLOTS reads at once): a read takes up to READ_TIMEOUT per reader, and while it ran on
 the lane's thread no finished check was recorded and no free slot filled (10-13: 3 of 5 slots free for hours, 39 jobs
 checking). Its verdict is acted on at the job's next turn; everything else — the gh facts, planning, the Δ re-plan and
-the merge — happens on the lane's own thread, so merges stay serial and pinned. The lane keeps at most
+the merge — happens on the lane's own thread, so merges stay serial and pinned. Each pass hands the queue to
+cards.positions on a thread of its own (Lane.cards_pass), so a slow Slack holds neither; the lane's end waits up to
+CARDS_WAIT for those cards. The lane keeps at most
 A.slots_now() checks in flight (A.slots(): LANDER_SLOTS from cc-config, else what the host's cores and memory hold,
 read again each minute; 2 while the box is overloaded(), 1 under memory pressure) on the box, and up to
 A.LAPTOP_SLOTS more on the laptop; each box run still takes its box-wide admission slot, so another repo's lane can
@@ -222,6 +224,7 @@ CI_REGISTER_WAITS = 2    # waits on a base with workflows but no check yet, befo
 STARVED_RERUNS = 2       # reruns of runs GitHub cancelled for want of a hosted runner, at one head, before red
 RECHECK_SECS = float(os.environ.get("LANDER_RECHECK_SECS") or 300)   # a checking job re-reads its PR this often
 CI_UNREADS = 4           # holds (HOLD_SECS each: an hour) at one head whose CI GitHub would not show, then a query
+CARDS_WAIT = 30          # seconds the lane's end waits for its queued cards (cards_pass); a slower Slack is left
 POLL = 5                 # seconds the lane waits on its checks before it looks at the inbox again
 MODULE_OF = {"planner": "plan", "runner": "run", "reviewer": "review", "cards": "cards", "board": "board",
              "deploy": "deploy", "tip": "tip", "repair": "repair"}
@@ -449,6 +452,18 @@ class BoardRules:
         return line
 
 
+def box_hold(target, job):
+    """Why the box holds `job` from its turn ("" when it does not): `target` (the member, else the repo) paused, or a
+    spend tier stop for a job not merged yet. The lane says it per turn; the tick's age flag (tick.flag_waited) skips
+    a held job, since nothing in the queue is late while the box itself holds it."""
+    if paused(target):
+        return f"{target} is paused — still queued, lands after `cc-pause off {target}`"
+    pre = job.state in PRE_MERGE or (job.state == T.HELD and job.extra.get("held_from", T.QUEUED) in PRE_MERGE)
+    if pre and tier_stop():
+        return "spend tier stop — still queued, its checks run after `cc-tier set` a wider tier"
+    return ""
+
+
 # --- the lane ------------------------------------------------------------------------------------------------------
 
 class Lane:
@@ -478,6 +493,8 @@ class Lane:
         self.jobs = []           # the lane's jobs as this pass of the loop read them (spare_box)
         self.reading = {}        # job key -> Reading: each review read the lane has in the pool
         self.dropped = []        # reads whose job moved on mid-read: they hold a REVIEW_SLOTS place until they end
+        self.carding = None      # the thread posting the queued cards (cards_pass), at most one at a time
+        self.carded = None       # what the queue looked like at the last cards pass that went through
 
     def say(self, text):
         self.lines.append(f"[{self.repo}] {text}")
@@ -511,6 +528,7 @@ class Lane:
                                                 thread_name_prefix="check") as pool:
                     self.pool = pool
                     moved = self.loop(tried)
+                self.cards_pass(J.lane_jobs(self.repo), wait=CARDS_WAIT)   # the last edits go out before the lock does
             if moved:   # the lock is let go first, so the lane started from `current` can take it
                 mine = os.path.basename(J.running_release())[:12]
                 ok, how = spawn_lane(self.repo, moved)
@@ -538,6 +556,7 @@ class Lane:
                 self.say(ln)
             jobs = self.jobs = J.lane_jobs(self.repo)
             self.drop_reads(jobs)
+            self.cards_pass(jobs)
             for k, r in self.reading.items():   # a read that has ended gives its job a turn, once
                 if r.future.done() and not r.seen:
                     r.seen = True
@@ -642,6 +661,34 @@ class Lane:
     def express_room(self) -> bool:
         return sum(1 for f in self.inflight.values() if f.express) < EXPRESS_SLOTS
 
+    def cards_pass(self, jobs, wait=0):
+        """Each queued PR's card says where it stands (cards.positions), on a daemon thread of its own: a slow or
+        hung Slack holds neither the loop nor a check slot (Opus read, 10-13: "positions() must not hold the lane loop
+        on a slow Slack"). One pass at a time: while one runs the queue is not handed over again, and a later pass
+        hands over the queue as it is then. A queue unchanged since the last hand-over sends nothing. `wait`: seconds
+        the lane's end waits for the cards (CARDS_WAIT), so a PR that just left gets its last edit; a fault is
+        logged `unsaid`, never the lane's, and leaves the queue unmarked, so the next pass hands it over again (Opus
+        read, 10-13: a faulted pass was not retried until the queue moved)."""
+        if not self.unit("cards"):
+            return
+        seen = [(j.pr, j.state, j.extra.get("queued_at")) for j in jobs]
+        if wait and self.carding:
+            self.carding.join(wait)
+        if seen == self.carded or (self.carding and self.carding.is_alive()):
+            return
+
+        def say():
+            try:
+                self.call("cards", "positions", self.repo, jobs)
+                self.carded = seen
+            except UnitFault as e:
+                E.log("unsaid", self.repo, None, str(e)[:160])
+
+        self.carding = threading.Thread(target=say, name="cards", daemon=True)
+        self.carding.start()
+        if wait:
+            self.carding.join(wait)
+
     def laptop_up(self) -> bool:
         return time.time() - self.laptop_down >= LAPTOP_REST
 
@@ -736,7 +783,8 @@ class Lane:
         """What only a re-queue or a new head changes: a move or a hold leaves it alone."""
         return str(job.extra.get("queued_at") or ""), job.head
 
-    def due(self, job):
+    @staticmethod
+    def due(job):
         return job.state not in J.RESTING and not (job.state == T.HELD and J.not_before_left(job))
 
     @staticmethod
@@ -853,13 +901,7 @@ class Lane:
                      f"{sorted(set(job.files) & set(other.files))[0]}")
 
     def box_hold(self, job):
-        target = self.member or self.repo
-        if paused(target):
-            return f"{target} is paused — still queued, lands after `cc-pause off {target}`"
-        pre = job.state in PRE_MERGE or (job.state == T.HELD and job.extra.get("held_from", T.QUEUED) in PRE_MERGE)
-        if pre and tier_stop():
-            return "spend tier stop — still queued, its checks run after `cc-tier set` a wider tier"
-        return ""
+        return box_hold(self.member or self.repo, job)
 
     def advance(self, job):
         if job.state == T.QUEUED and job.key not in self.parked and not job.extra.get("parked"):   # staged once
@@ -929,6 +971,8 @@ class Lane:
                 target, why = T.QUEUED, f"retry after hold: the head moved to {head[:12]}"
             elif base and was and base != was:   # retargeted: its base_sha, files and results were read on `was`
                 target, why = T.QUEUED, f"retry after hold: the base moved from {was} to {base}"
+        if job.extra.get("hold") == "box":   # tick.flag_waited counts the job's age from here (perms' read, 10-13)
+            job.extra["unheld_at"] = E.stamp()
         for k in ("held_from", "hold", "not_before", "deferred"):
             job.extra.pop(k, None)
         J.move(job, target if target in J.NEXT[T.HELD] else T.QUEUED, why=why)

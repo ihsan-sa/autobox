@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
 from lander import board as B  # noqa: E402
 from lander import cards as C  # noqa: E402
+from lander import events as E  # noqa: E402
 from lander import lane as L  # noqa: E402
 from lander import types as T  # noqa: E402
 
@@ -501,6 +502,233 @@ class OwnerCard(Stubbed):
         C.owner_card("land:demo:7:protected-door", "[demo] PR #7 is not queued")
         self.assertEqual(self.argvs("cc-notify"), [])
         self.assertEqual(self.argvs("cc-slack post")[0][2:4], ["-c", "#approvals"])
+
+
+Q2 = "2026-09-27T00:10:00Z"
+
+
+class QueuedCards(Stubbed):
+    """Brief: "post a queued card with the PR's position and update it as it moves", and "have the lander's tick flag
+    once when the oldest due job has waited over 60 min". Each case builds its own jobs, ledger and clock."""
+
+    def jobs(self, *spec):
+        return [T.Job(repo="demo", pr=pr, state=st, stage=st, extra={"queued_at": at}) for pr, at, st in spec]
+
+    def ledger(self, pr, at, ts):
+        """What cc-slack's sent ledger holds once the card for (pr, at) is out."""
+        d = os.path.join(os.environ["CC_SLACK_DIR"], "sent")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"land:demo:{pr}:queued@{at}.json"), "w") as f:
+            json.dump({"id": f"land:demo:{pr}:queued@{at}", "chat": "C1", "ts": ts, "accepted": True}, f)
+
+    def test_each_queued_pr_gets_one_card_with_its_place_and_an_unmoved_queue_sends_nothing(self):
+        jobs = self.jobs((7, Q, T.CHECKING), (8, Q2, T.QUEUED), (6, Q, T.QUERY))
+        C.positions("demo", jobs)
+        self.assertEqual(self.argvs("cc-slack post"), [
+            ["cc-slack", "post", "--route", "[demo] PR #7 queued", "--id", f"land:demo:7:queued@{Q}",
+             "[demo] PR #7 is queued to land: 1 of 2 in the lane, its checks are running."],
+            ["cc-slack", "post", "--route", "[demo] PR #8 queued", "--id", f"land:demo:8:queued@{Q2}",
+             "[demo] PR #8 is queued to land: 2 of 2 in the lane, waiting its turn."]])   # PR #6 is at rest: no card
+        C.positions("demo", jobs)
+        self.assertEqual(len(self.argvs("cc-slack")), 2)   # nothing moved, so nothing is posted or edited
+
+    def test_the_card_is_edited_as_the_queue_moves_and_once_more_when_the_pr_leaves(self):
+        C.positions("demo", self.jobs((7, Q, T.MERGEABLE), (8, Q2, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.ledger(8, Q2, "1.8")
+        C.positions("demo", self.jobs((7, Q, T.DEPLOY_PENDING), (8, Q2, T.PLANNED)))
+        self.assertEqual(self.argvs("cc-slack edit"), [
+            ["cc-slack", "edit", "C1", "1.8", "[demo] PR #8 is queued to land: 1 of 1 in the lane, planned, its checks "
+             "next."],
+            ["cc-slack", "edit", "C1", "1.7", "[demo] PR #7 has left the landing queue: merged."]])
+        self.assertEqual(len(self.argvs("cc-slack post")), 2)   # edits, never a second post
+        C.positions("demo", self.jobs((8, Q2, T.PLANNED)))
+        self.assertEqual(len(self.argvs("cc-slack edit")), 2)   # PR #7's record went with its last edit
+
+    def test_a_card_not_out_yet_is_not_edited_and_another_repos_cards_are_left(self):
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        C.positions("demo", self.jobs((7, Q, T.CHECKING)))   # no ledger record: held or pending, so no edit
+        C.positions("other", [])
+        self.assertEqual(self.argvs("cc-slack edit"), [])
+        self.ledger(7, Q, "1.7")
+        C.positions("demo", self.jobs((7, Q, T.MERGEABLE)))
+        self.assertEqual(self.argvs("cc-slack edit"), [
+            ["cc-slack", "edit", "C1", "1.7", "[demo] PR #7 is queued to land: 1 of 1 in the lane, checks green, "
+             "merging next."]])
+
+    def test_a_chat_landing_is_carded_in_its_thread_and_a_members_in_its_updates_channel(self):
+        chat = T.Job(repo="demo", pr=7, state=T.QUEUED, stage=T.QUEUED,
+                     extra={"queued_at": Q, "chat": "C9", "ts": "5.5"})
+        C.positions("demo", [chat])
+        mem = T.Job(repo="h--t", pr=8, state=T.QUEUED, stage=T.QUEUED, member="h", extra={"queued_at": Q})
+        C.positions("h--t", [mem])
+        self.assertEqual([a[:6] for a in self.argvs("cc-slack post")], [
+            ["cc-slack", "post", "-c", "C9", "--thread", "5.5"],
+            ["cc-slack", "post", "-c", "#h-updates", "--id", f"land:h--t:8:queued@{Q}"]])
+
+    def test_a_cards_pass_waits_for_another_holding_the_repos_cards_lock(self):
+        import fcntl
+        import threading
+        from lander import jobs as J
+        os.makedirs(J.lanes_dir(), exist_ok=True)
+        fd = os.open(J.lane_file("demo", "cards"), os.O_RDWR | os.O_CREAT)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        t = threading.Thread(target=C.positions, args=("demo", self.jobs((7, Q, T.QUEUED))))
+        t.start()
+        t.join(1)
+        self.assertTrue(t.is_alive())   # held off while another pass holds the lock
+        self.assertEqual(self.argvs("cc-slack post"), [])
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        t.join(10)
+        self.assertEqual(len(self.argvs("cc-slack post")), 1)
+
+    def test_a_mark_made_while_another_writer_holds_sent_json_is_not_lost(self):
+        """perms' read, 10-13: the cards thread wrote sent.json back from a stale copy and wiped a once-marker."""
+        import threading
+        C.mark_sent("a")
+        with C._sent_lock():
+            t = threading.Thread(target=C.mark_sent, args=("b",))
+            t.start()
+            t.join(1)
+            self.assertTrue(t.is_alive())   # held off while another read-modify-write holds the lock
+            C.write_json(C._sent_path(), C.read_json(C._sent_path(), []) + ["c"])
+        t.join(10)
+        self.assertEqual(C.read_json(C._sent_path(), []), ["a", "c", "b"])
+
+    def flag(self, jobs, secs_after_q, paused=False, tier_stop=False, backoff=0):
+        from lander import events as E
+        from lander import tick as TK
+        with mock.patch.object(TK.J, "lane_jobs", lambda r: jobs), \
+                mock.patch.object(L, "paused", lambda target: paused), \
+                mock.patch.object(L, "tier_stop", lambda: tier_stop), \
+                mock.patch.object(TK.GH, "backoff", lambda: backoff):
+            return TK.flag_waited(["demo"], C, now=E.epoch_of(Q) + secs_after_q)
+
+    def test_a_queue_the_box_holds_is_not_flagged_until_the_hold_lifts(self):
+        # perms' read: a paused repo, a tier stop or a GitHub backoff sent "Nothing stopped it" every tick
+        jobs = self.jobs((7, Q, T.QUEUED))
+        self.assertEqual(self.flag(jobs, 3601, paused=True), [])
+        self.assertEqual(self.flag(jobs, 3601, tier_stop=True), [])
+        self.assertEqual(self.flag(jobs, 3601, backoff=30), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
+        # perms' read, 10-13: the age counts from the last tick that found the hold, not from queued_at
+        self.assertEqual(self.flag(jobs, 3601 + 3600), [])   # 60 min since the hold lifted is not over 60
+        self.assertEqual(self.flag(jobs, 3601 + 3601), ["[demo] PR #7 has waited 120 min in the queue; "
+                                                        "the planning seat is told"])
+
+    def test_a_lane_box_hold_is_not_flagged_and_the_age_counts_from_its_end(self):
+        # perms' read, 10-13: a "box" hold (the day review cap, a usage wall) whose time was up flagged at once
+        held = T.Job(repo="demo", pr=7, state=T.HELD, stage=T.HELD,
+                     extra={"queued_at": Q, "hold": "box", "held_from": T.QUEUED, "not_before": Q})
+        self.assertEqual(self.flag([held], 3601, paused=True), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
+        self.assertEqual(C.held_at("demo"), E.epoch_of(Q) + 3601)
+
+    def test_a_box_held_job_the_lane_never_unholds_is_flagged_from_the_end_of_its_hold(self):
+        # the lane is dead or crashes on the job: it stays HELD past not_before, and the flag must still fire
+        end = E.stamp(E.epoch_of(Q) + 7200)
+        held = T.Job(repo="demo", pr=7, state=T.HELD, stage=T.HELD,
+                     extra={"queued_at": Q, "hold": "box", "held_from": T.QUEUED, "not_before": end})
+        self.assertEqual(self.flag([held], 7200 + 3600), [])
+        self.assertEqual(C.held_at("demo"), 0)
+        self.assertEqual(self.flag([held], 7200 + 3600 + 60), ["[demo] PR #7 has waited 181 min in the queue; "
+                                                              "the planning seat is told"])
+
+    def test_a_job_a_box_hold_let_go_counts_its_age_from_unheld_at(self):
+        lifted = E.stamp(E.epoch_of(Q) + 3000)
+        jobs = [T.Job(repo="demo", pr=7, state=T.QUEUED, stage=T.QUEUED, extra={"queued_at": Q, "unheld_at": lifted})]
+        self.assertEqual(self.flag(jobs, 3000 + 3600), [])
+        self.assertEqual(self.flag(jobs, 3000 + 3601), ["[demo] PR #7 has waited 110 min in the queue; "
+                                                        "the planning seat is told"])
+
+    def test_unhold_stamps_unheld_at_only_for_a_box_hold(self):
+        moved = []
+        with mock.patch.object(L.J, "move", lambda job, st, why="": moved.append((job.pr, st))):
+            for pr, kind in ((7, "box"), (8, "pr")):
+                job = T.Job(repo="demo", pr=pr, state=T.HELD, stage=T.HELD,
+                            extra={"queued_at": Q, "hold": kind, "held_from": T.QUEUED})
+                L.Lane.unhold(mock.Mock(), job)
+                self.assertEqual("unheld_at" in job.extra, kind == "box")
+                self.assertNotIn("hold", job.extra)
+        self.assertEqual(moved, [(7, T.QUEUED), (8, T.QUEUED)])
+
+    def test_a_members_lanes_share_one_hourly_cap(self):
+        # perms' read, 10-13: "six rows meant six wake-ups at once"
+        now = E.epoch_of(Q) + 3601
+        rows = [T.Job(repo=f"h--row{i}", pr=i, member="h", state=T.QUEUED, stage=T.QUEUED, extra={"queued_at": Q})
+                for i in range(3)]
+        self.assertEqual([C.waited(j, 3601, now=now) for j in rows], [True, False, False])
+        box = T.Job(repo="h", pr=9, state=T.QUEUED, stage=T.QUEUED, extra={"queued_at": Q})
+        self.assertTrue(C.waited(box, 3601, now=now))   # a box repo named like the handle keeps its own cap
+        self.assertTrue(C.waited(rows[1], 3601, now=now + 3600))
+        self.assertEqual(len(self.argvs("cc-notify")), 3)
+
+    def test_retry_keeps_a_card_say_added_while_it_posted(self):
+        # perms' read, 10-13: pending.json had no lock, so retry() wrote back a copy without say()'s new card
+        C.write_json(C._pending_path(), {"a": {"argv": ["x"], "tries": 1, "repo": "demo", "pr": 1}})
+
+        def post(argv, pid, hand=False):
+            with C._pending_lock():
+                d = C.read_json(C._pending_path(), {})
+                d["b"] = {"argv": ["y"], "tries": 1, "repo": "demo", "pr": 2}
+                C.write_json(C._pending_path(), d)
+            return False, "refused"
+        with mock.patch.object(C, "_post", post):
+            C.retry()
+        got = C.read_json(C._pending_path(), {})
+        self.assertEqual(sorted(got), ["a", "b"])
+        self.assertEqual((got["a"]["tries"], got["b"]["tries"]), (2, 1))
+
+    def test_a_tier_stop_holds_only_a_job_not_merged_yet(self):
+        merging = self.jobs((7, Q, T.MERGEABLE))
+        self.assertEqual(self.flag(merging, 3601, tier_stop=True), ["[demo] PR #7 has waited 60 min in the queue; "
+                                                                    "the planning seat is told"])
+
+    def test_a_member_closing_the_oldest_pr_each_tick_wakes_the_seat_once_an_hour(self):
+        """perms' read, 10-13: one waited request per queuing gave one wake-up per tick when the oldest job kept
+        leaving; now it is at most one per repo per hour."""
+        older = [(pr, Q, T.QUEUED) for pr in range(1, 7)]
+        got = [self.flag(self.jobs(*older[i:]), 3601 + 300 * i) for i in range(5)]   # one closed each 5-min tick
+        self.assertEqual(sum(1 for g in got if g), 1)
+        self.assertEqual(len(self.argvs("cc-notify")), 1)
+        self.assertEqual(self.flag(self.jobs(*older[4:]), 3601 + 3599), [])   # still inside the hour
+        self.assertEqual(self.flag(self.jobs(*older[5:]), 3601 + 3600), ["[demo] PR #6 has waited 120 min in the "
+                                                                         "queue; the planning seat is told"])
+        self.assertEqual(len(self.argvs("cc-notify")), 2)
+
+    def test_a_flag_cc_notify_refused_is_not_marked_and_goes_out_next_tick(self):
+        jobs = self.jobs((7, Q, T.QUEUED))
+        self.answer({"cc-notify": [1, "refused"]})
+        self.assertEqual(self.flag(jobs, 3601), [])
+        self.answer({})
+        self.assertEqual(self.flag(jobs, 3661), ["[demo] PR #7 has waited 61 min in the queue; "
+                                                 "the planning seat is told"])
+        self.assertEqual(self.flag(jobs, 3721), [])
+        self.assertEqual(len(self.argvs("cc-notify")), 2)
+
+    def test_the_oldest_due_job_past_an_hour_is_flagged_once_and_a_requeue_again(self):
+        jobs = self.jobs((7, Q, T.CHECKING), (8, Q2, T.QUEUED))
+        self.assertEqual(self.flag(jobs, 3601), ["[demo] PR #7 has waited 60 min in the queue; "
+                                                 "the planning seat is told"])
+        self.assertEqual(self.flag(jobs, 7200), [])   # once per queuing
+        self.assertEqual([a[:6] for a in self.argvs("cc-notify")],
+                         [["cc-notify", "--ask", "--id", f"land:demo:7:waited@{Q}", "-t", "demo landing"]])
+        self.assertEqual(self.argvs("cc-slack"), [])   # a planner request, never a page or a post
+        self.assertEqual(self.flag(self.jobs((7, Q2, T.QUEUED)), 3601 + 3600), ["[demo] PR #7 has waited 110 min in "
+                                                                                 "the queue; the planning seat is "
+                                                                                 "told"])   # a re-queue, an hour on
+
+    def test_exactly_an_hour_or_a_job_not_due_is_not_flagged(self):
+        self.assertEqual(self.flag(self.jobs((7, Q, T.QUEUED)), 3600), [])   # "over 60 min": 60 min itself is not
+        held = T.Job(repo="demo", pr=7, state=T.HELD, stage=T.HELD,
+                     extra={"queued_at": Q, "not_before": "2099-01-01T00:00:00Z"})
+        rest = self.jobs((6, Q, T.QUERY))[0]
+        young = self.jobs((8, Q2, T.QUEUED))[0]   # due, but queued 10 min after Q: 51 min at Q + 61 min
+        self.assertEqual(self.flag([held, rest, young], 3660), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
+        self.assertEqual(self.flag([held, rest, young], 4201), ["[demo] PR #8 has waited 60 min in the queue; the "
+                                                                "planning seat is told"])
 
 
 if __name__ == "__main__":

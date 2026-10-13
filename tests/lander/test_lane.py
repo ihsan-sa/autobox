@@ -246,13 +246,29 @@ class Reviewer:
 
 
 class Rec:
+    """A unit that records each call. The lane's every-pass `positions` (the queued cards) goes to its own list, so
+    `calls` reads as the events a case asserts."""
     def __init__(self):
-        self.calls = []
+        self.calls, self.positions_calls = [], []
+
+    def positions(self, repo, jobs):
+        self.positions_calls.append((repo, [(j.pr, j.state) for j in jobs]))
 
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
         return lambda *a: self.calls.append((name,) + a)
+
+
+class SlowCards(Rec):
+    """A cards unit whose queued cards hang, as a Slack that does not answer: positions waits until `go` is set."""
+    def __init__(self):
+        super().__init__()
+        self.go = threading.Event()
+
+    def positions(self, repo, jobs):
+        super().positions(repo, jobs)
+        self.go.wait(60)
 
 
 def V(verdict, tokens=100, blocking=(), **extra):
@@ -1163,6 +1179,51 @@ class Machine(Fixture):
         self.assertEqual(u["deploy"].calls, [("request", "demo", self.origin_rev("main"), [])])
         self.assertEqual([c[0] for c in u["board"].calls + u["cards"].calls + u["tip"].calls],
                          ["close", "landed", "kick"])
+
+    def test_a_hung_slack_holds_no_landing_and_only_one_cards_pass_runs(self):
+        """Opus read, 10-13: "positions() must not hold the lane loop on a slow Slack"."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        slow = SlowCards()
+        try:
+            with mock.patch.object(L, "CARDS_WAIT", 0.2):
+                t0 = time.time()
+                self.land(cards=slow)
+                took = time.time() - t0
+        finally:
+            slow.go.set()
+        self.assertLess(took, 30)   # a lane held by the hung card would have waited its 60 s
+        self.assertEqual(self.job(1).state, T.DEPLOY_PENDING)
+        self.assertEqual([c[0] for c in slow.calls], ["landed"])
+        self.assertEqual(len(slow.positions_calls), 1)   # while one pass hangs, no second one is started
+
+    def test_a_slack_that_answers_gets_each_move_once_and_the_lane_ends_on_the_last(self):
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        u, _ = self.land()
+        seen = [states for _, states in u["cards"].positions_calls]
+        self.assertEqual(seen[-1], [(1, T.DEPLOY_PENDING)])   # the PR's card hears it left before the lock goes
+        self.assertEqual(len(seen), len(set(map(tuple, seen))))   # an unchanged queue is not handed over twice
+
+    def test_a_cards_pass_that_faults_is_handed_the_same_queue_again(self):
+        """Opus read, 10-13: `carded` was set before the pass ran, so a faulted pass waited for the queue to move."""
+        calls = []
+
+        class Flaky:
+            def positions(self, repo, jobs):
+                calls.append(repo)
+                if len(calls) == 1:
+                    raise OSError("slack said no")
+
+        lane = types.SimpleNamespace(repo="demo", carding=None, carded=None, unit=lambda n: Flaky(),
+                                     call=lambda n, fn, *a: L.Lane.call(lane, n, fn, *a))
+        jobs = [T.Job(repo="demo", pr=1, state=T.QUEUED, stage=T.QUEUED, extra={"queued_at": "x"})]
+        L.Lane.cards_pass(lane, jobs, wait=5)
+        self.assertEqual(lane.carded, None)   # the fault left the queue unmarked
+        L.Lane.cards_pass(lane, jobs, wait=5)
+        self.assertEqual(len(calls), 2)   # so the same queue went again
+        L.Lane.cards_pass(lane, jobs, wait=5)
+        self.assertEqual(len(calls), 2)   # and once through, an unchanged queue is not handed over again
 
     def test_a_local_branch_named_origin_main_is_not_main(self):
         """refs/heads/origin/<b> (a worker's `git branch origin/main`) must never stand in for origin's <b>."""
