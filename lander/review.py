@@ -89,6 +89,23 @@ carried into the verdict as a blocking row with the prior row's own text and its
 "[security] still open from the earlier read: …" (carried()), whatever the reader's verdict word and whether or
 not it named new blockers, so pinned() finds the [security] row again in the round after, and every round.
 
+A SECURITY PATH needs perms' security read (perms, after #1265: a tunnel unit and the Cloudflare door merged with
+no security read, and the read after found a HIGH). When the plan names a changed file on the base's
+tests/LANDING-security.toml (plan.extra["security"]), review(), delta_review() and would_read() look for perms'
+RECORD of it, never a PR comment (perms' HANDBACK at 2f9fde5e: a seat can post any marker with `gh pr comment`):
+perms_recorded() reads <passwd home>/.cc/state/<repo>/perms/security-reads.json, the perms seat's own directory,
+which cc-guard lets no other session write (the Cloudflare door trusts perms-allow.json beside it the same way). It
+must be the box user's own plain 0600 file, reached through no symlink, holding a JSON list of entries like
+  {"repo": "<repo>", "pr": 1270, "head": "<40-hex head sha>", "change": "<the change digest>"}
+and one counts only when repo, pr and head are this job's exactly and change is one of keys(). The lander only
+reads that file; perms writes it. With no such record the answer is INCOMPLETE with extra host=True and
+security=True, which the lane sends to the planning seat as a query, and no read is bought, because none the lander
+buys is perms'. Any LAND marker, the lander's own and one signed PERMS_SECURITY_READER included, does not merge it.
+With the record, a verdict recorded at this digest stands as on any change (a HANDBACK there still hands it back);
+with none recorded the record is the LAND (model PERMS_SECURITY_READER, extra read="perms"), and nothing is bought.
+`lander record ... --by perms-*` is refused unless the calling Claude session works in the perms seat
+(perms_seat_caller()), but a marker by that name is only a comment: it clears nothing.
+
 A LAND with advisory findings files ONE follow-up row, review-followup-pr<N> (board.followup).
 
 PAUSE. The lane asks cc-pause and cc-tier before it calls review() (U1 owns that hold, per the design); nothing
@@ -104,6 +121,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import unicodedata
 
@@ -238,6 +256,62 @@ def latest(comments):
 def security_reader(v):
     """True when the reader named on verdict `v` says `security` (the name lander-self asks for too)."""
     return "security" in (v.model or "").lower()
+
+
+# The reader a security path's LAND is signed with (the verdict review() returns on perms' record). A PR marker of
+# that name counts for nothing on its own (perms' HANDBACK at 2f9fde5e); only perms_recorded() clears the path.
+PERMS_SECURITY_READER = "perms-security-read"
+# The perms seat's state root, at the passwd home: never $HOME or $CC_STATE, which a caller sets (tests patch this).
+PERMS_STATE = os.path.join(C.PASSWD_HOME, ".cc", "state")
+PERMS_READS = "security-reads.json"
+
+
+def perms_reads_path(repo):
+    return os.path.join(PERMS_STATE, str(repo).rsplit("/", 1)[-1], "perms", PERMS_READS)
+
+
+def perms_reads(repo):
+    """-> (entries, why): perms' security-read records for `repo` (the module doc), or ([], the reason none count):
+    absent, reached through a symlink, not the box user's own plain 0600 file, or not a JSON list."""
+    path = perms_reads_path(repo)
+    if os.path.realpath(path) != os.path.abspath(path):
+        return [], f"{path} resolves through a symlink"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        return [], f"{path} will not open: {e.strerror}"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+            return [], f"{path} is not this user's own plain mode-600 file"
+        with os.fdopen(fd, encoding="utf-8") as f:
+            fd = None
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return [], f"{path} will not read: {e}"
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if not isinstance(data, list):
+        return [], f"{path} is not a JSON list"
+    return [e for e in data if isinstance(e, dict)], ""
+
+
+def perms_recorded(repo, pr, head, digests) -> bool:
+    """True when perms' file holds a record for exactly this repo, PR and head at one of `digests`: what a security
+    path merges on (_security_unread, lane.landed_at) and is released on (release.remote_rules)."""
+    if not (head and digests):
+        return False
+    return any(e.get("repo") == repo and e.get("pr") == pr and e.get("head") == head and e.get("change") in digests
+               for e in perms_reads(repo)[0])
+
+
+def _perms_land(job):
+    """The LAND perms' record stands for, on a plan with a security path whose record _security_unread found; None
+    on any other plan."""
+    if not (job.plan and job.plan.extra.get("security")):
+        return None
+    return T.Verdict(verdict=T.LAND, digest=job.digest, model=PERMS_SECURITY_READER, extra={"read": "perms"})
 
 
 def open_security(comments):
@@ -1196,6 +1270,22 @@ def _security_stands(job, comments):
                      extra={"head": sec.extra.get("head", ""), "security": True})
 
 
+def _security_unread(job, comments, digests):
+    """The plan names a security path (plan.extra["security"]) and perms' file holds no record of this head at any of
+    `digests` (perms_recorded) -> INCOMPLETE for the planning seat (host=True, security=True); nothing is bought.
+    Else None. `comments` is not read: no marker clears a security path."""
+    need = list((job.plan.extra.get("security") if job.plan else None) or [])
+    if not need:
+        return None
+    if perms_recorded(job.repo, job.pr, job.head, digests):
+        return None
+    shown = ", ".join(need[:5]) + (f" and {len(need) - 5} more" if len(need) > 5 else "")
+    return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest, extra={
+        "host": True, "security": True,
+        "why": f"it changes {shown}, which merges only on perms' security read of this change, and perms' "
+               f"{PERMS_READS} holds no record of head {job.head[:12]} (perms adds it, then queue it again)"})
+
+
 def review(job, comments=None):
     """See the module doc. `comments` is the PR's comment list when the caller already has it."""
     root = root_of(job)
@@ -1210,7 +1300,10 @@ def review(job, comments=None):
     diff = diff_of(root, job.base_sha, job.head)
     if not diff and job.files:
         return _no_diff(job)
-    have = recorded(comments, keys(job, diff))
+    need = _security_unread(job, comments, keys(job, diff))
+    if need:
+        return need
+    have = recorded(comments, keys(job, diff)) or _perms_land(job)
     if have:
         return have
     # a HANDBACK standing from an earlier head is read again whether or not the change is on a paid path: #1064's
@@ -1248,7 +1341,10 @@ def delta_review(job, prior, comments=None, diff=None):
     diff = diff if diff is not None else diff_of(root, job.base_sha, job.head)
     if not diff and job.files:
         return _no_diff(job)
-    have = recorded(comments, keys(job, diff))
+    need = _security_unread(job, comments, keys(job, diff))
+    if need:
+        return need
+    have = recorded(comments, keys(job, diff)) or _perms_land(job)
     if have:   # a verdict recorded at this digest after the prior one (a seat's `record`) is the one that stands
         return have
     was = prior.extra.get("head", "")
@@ -1426,8 +1522,42 @@ def _job_of(repo, pr):
     return job, facts
 
 
+def claude_ancestor(pid=None, proc="/proc"):
+    """The pid of the first process named `claude` at or above `pid` (default: this one's parent), walking
+    /proc/<pid>/status PPid, or None when the walk reaches pid 1 or a process it cannot read."""
+    pid, seen = pid or os.getppid(), set()
+    while pid and pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            with open(os.path.join(proc, str(pid), "comm")) as f:
+                if f.read().strip() == "claude":
+                    return pid
+            with open(os.path.join(proc, str(pid), "status")) as f:
+                pid = next((int(ln.split()[1]) for ln in f if ln.startswith("PPid:")), 0)
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
+def perms_seat_caller(repo, pid=None, proc="/proc", state=None):
+    """True when the Claude session that called (claude_ancestor()) runs in the perms seat: its /proc/<pid>/cwd
+    resolves to <CC_STATE>/<repo>/perms. Perms, 10-13: "lander record refuses --by perms-* unless the calling Claude
+    ancestor ... has /proc/<pid>/cwd realpath == ~/.cc/state/<repo>/perms"."""
+    seat = claude_ancestor(pid, proc)
+    if seat is None:
+        return False
+    state = state or os.path.expanduser(C.conf("CC_STATE", "~/.cc/state"))
+    try:
+        cwd = os.path.realpath(os.readlink(os.path.join(proc, str(seat), "cwd")))
+    except OSError:
+        return False
+    return cwd == os.path.realpath(os.path.join(state, repo.rsplit("/", 1)[-1], "perms"))
+
+
 def cmd_record(argv):
-    """record <repo> <pr> <VERDICT> --by <who> [--head <sha>] [--findings <text>|-]"""
+    """record <repo> <pr> <VERDICT> --by <who> [--head <sha>] [--findings <text>|-]. A --by starting `perms-`
+    (perms-security-read among them) is refused unless perms_seat_caller(): only the perms seat writes perms' name.
+    No marker clears a security path; perms' own record does (perms_recorded)."""
     args, opts = [], {}
     it = iter(argv)
     for a in it:
@@ -1441,6 +1571,11 @@ def cmd_record(argv):
     if not opts.get("by"):
         print("lander record: --by names who read it; a verdict with no reader is refused")
         return 2
+    # perms, 10-13: "lander record refuses --by perms-* unless the calling Claude ancestor" runs in the perms seat
+    if re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"]).lower().startswith("perms-") and not perms_seat_caller(args[0]):
+        print(f"lander record: --by {opts['by']} is perms' name, and this was not run from the perms seat; "
+              "nothing posted")
+        return 1
     head = (opts.get("head") or "").lower()
     if head and not re.fullmatch(r"[0-9a-f]{7,40}", head):
         print(f"lander record: --head {head!r} is not a commit")
@@ -1496,8 +1631,14 @@ def would_read(job, comments):
         return False, (f"a security HANDBACK by {sec.model} stands from {was}, and no read the landing buys can clear "
                        "it — a security reader buys its own read and records it (`lander record ... --by <security "
                        "reader>`)")
-    if recorded(comments, keys(job, diff_of(root_of(job), job.base_sha, job.head))):
+    digests = keys(job, diff_of(root_of(job), job.base_sha, job.head))
+    need = _security_unread(job, comments, digests)
+    if need:
+        return False, (need.extra["why"] + " — perms reads it and records that; the landing buys none")
+    if recorded(comments, digests):
         return False, "a verdict is already recorded for this change, and the landing reads that"
+    if _perms_land(job):
+        return False, "perms recorded its security read of this change, and the landing lands on that"
     if not (job.plan and job.plan.paid) and not standing(job, comments):
         return False, "it touches no paid-review path and no unchecked code, so nothing reads it"
     if reads_used(job.repo, job.pr) >= MAX_READS:

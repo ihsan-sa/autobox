@@ -98,9 +98,11 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              quoting its reason through jobs.quoted (a gate's output line: no control or markup, 200 chars). Then,
              when the plan is paid or a HANDBACK stands on the PR from any head (handed_back(): the job's own, or
              one the box wrote there), one read (a delta read when a prior verdict exists; none when a LAND is already
-             recorded at this digest): INCOMPLETE -> held till the `until` it names (a usage limit's reset; stage
+             recorded at this digest, and on a plan with a security path only while perms' record of it stands,
+             landed_at()): INCOMPLETE -> held till the `until` it names (a usage limit's reset; stage
              `deferred`, which no reader counts as running), no read counted; INCOMPLETE with extra host (a
-             read the host failed twice at one head: a 4xx, a timeout, its own cap) -> query "planning", never a
+             read the host failed twice at one head: a 4xx, a timeout, its own cap; or a security path with no
+             record by perms of this head and digest) -> query "planning", never a
              handback; HANDBACK ->
              reads_used+1, handback, or query "planning" at the 2nd; LAND counts a read only when it was bought.
              A member over its day's cap is held; a bought read is charged to it. A read whose job leaves
@@ -271,6 +273,17 @@ def run(argv, timeout=60, **kw):
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return 125, "", str(e)
+
+
+def landed_at(job, pv) -> bool:
+    """pv, a Verdict's dict, is a LAND at this job's digest the merge may stand on without asking the reviewer again.
+    On a plan that names a security path (plan.extra["security"]) it is only while perms' own file records this head
+    and digest (review.perms_recorded); a LAND marker alone never is, whoever it names."""
+    if not (pv and pv.get("verdict") == T.LAND and pv.get("digest") == job.digest):
+        return False
+    from lander import review as R
+    return not (job.plan and job.plan.extra.get("security")) or R.perms_recorded(job.repo, job.pr, job.head,
+                                                                                 {job.digest})
 
 
 def paused(target) -> bool:
@@ -1359,7 +1372,7 @@ class Lane:
         check) or it has been held, handed back or queried."""
         prior = job.extra.get("verdict")
         pv = T.Verdict.from_dict(prior) if isinstance(prior, dict) and prior else None
-        if pv and pv.verdict == T.LAND and pv.digest == job.digest:
+        if pv and landed_at(job, pv.to_dict()):
             return True   # a LAND already read at this very digest (a Δ rerun): no second read
         if not self.unit("reviewer"):
             self.hold(job, "reviewer is not installed", kind="box")
@@ -1521,8 +1534,8 @@ class Lane:
                                                                                if n not in FULL_CHECKS]))}
         # a plan that became paid with no LAND at this digest must go through the review too
         pv = job.extra.get("verdict") or {}
-        needs_read = new.paid and not (pv.get("verdict") == T.LAND and pv.get("digest") == job.digest)
         job.plan, job.base_sha = new, main_now
+        needs_read = new.paid and not landed_at(job, pv)
         for n in rerun:
             job.results.pop(n, None)
         job.extra["rerun"] = rerun

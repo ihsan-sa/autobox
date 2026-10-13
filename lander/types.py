@@ -285,16 +285,19 @@ class Check(Record):
 class Policy(Record):
     """LANDING-policy.toml [paths], read from BASE. Every field but `default` is a list of path globs: gate_first
     (box checks pre-merge, serially), paid_review (a recorded read or one the lander buys), lander (lander-self
-    only), protected (a person decides). default: the check NAMES an unowned executable path widens to."""
+    only), protected (a person decides). security_review comes from tests/LANDING-security.toml beside it (a security
+    reader's LAND at the change's digest before the merge). default: the check NAMES an unowned executable path
+    widens to."""
     gate_first: list = field(default_factory=list)
     paid_review: list = field(default_factory=list)
     lander: list = field(default_factory=list)
     protected: list = field(default_factory=list)
     default: list = field(default_factory=list)
     extra: dict = field(default_factory=dict)
+    security_review: list = field(default_factory=list)
 
     def validate(self) -> None:
-        for n in ("gate_first", "paid_review", "lander", "protected", "default"):
+        for n in ("gate_first", "paid_review", "lander", "protected", "default", "security_review"):
             _check_strs("Policy", n, getattr(self, n))
 
 

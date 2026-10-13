@@ -39,6 +39,7 @@ from lander import lane as L  # noqa: E402
 from lander import manifest as MF  # noqa: E402
 from lander import members as M  # noqa: E402
 from lander import repair as RP  # noqa: E402
+from lander import review as R  # noqa: E402
 from lander import tick as TK  # noqa: E402
 from lander import types as T  # noqa: E402
 
@@ -4779,6 +4780,44 @@ class FlakeRetry(Fixture):
         lane.hold(job, "gh could not read it", kind="box")   # suppressed: the next one stamps it afresh
         self.assertNotEqual(job.extra["queued_at"], old)
         self.assertLess(time.time() - E.epoch_of(job.extra["queued_at"]), 120)
+
+
+class LandedAt(unittest.TestCase):
+    """A LAND the job already holds lets it skip the reviewer, but on a security path only while perms' own file
+    records this head and change (review.perms_recorded): no LAND marker, whoever it names."""
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp(prefix="lander-landed-at.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        p = mock.patch.object(R, "PERMS_STATE", tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def job(self, security=()):
+        plan = T.Plan(paid=True, extra={"security": list(security)} if security else {})
+        return T.Job(repo="demo", pr=7, head="h" * 40, base_sha="b" * 40, digest="d1", plan=plan)
+
+    def record(self, **kw):
+        path = R.perms_reads_path("demo")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump([dict({"repo": "demo", "pr": 7, "head": "h" * 40, "change": "d1"}, **kw)], f)
+        os.chmod(path, 0o600)
+
+    def test_a_security_path_needs_perms_record(self):
+        plain, door = self.job(), self.job(["config/systemd-user/tunnel.service"])
+        for n in ("opus", "x-security", "security", "perms-security-read-2", "perms-security-read"):
+            pv = {"verdict": T.LAND, "digest": "d1", "model": n}
+            self.assertTrue(L.landed_at(plain, pv), n)
+            self.assertFalse(L.landed_at(door, pv), n)   # no record: no marker counts
+        self.record(head="c" * 40)
+        self.assertFalse(L.landed_at(door, {"verdict": T.LAND, "digest": "d1", "model": "opus"}))
+        self.record()
+        pv = {"verdict": T.LAND, "digest": "d1", "model": "opus"}
+        self.assertTrue(L.landed_at(door, pv))
+        for bad in ({}, dict(pv, digest="d0"), dict(pv, verdict=T.HANDBACK_VERDICT)):
+            self.assertFalse(L.landed_at(door, bad))
+            self.assertFalse(L.landed_at(plain, bad))
 
 
 if __name__ == "__main__":

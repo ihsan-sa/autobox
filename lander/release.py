@@ -24,6 +24,9 @@ files. Otherwise the command refuses: one line on stdout, `lander release: refus
   lander     the PR is lander-class: a changed file on the base policy's lander list or a LANDING-policy file
   handback   a standing HANDBACK the box's own login wrote: a reader's newest marker is HANDBACK at the PR's head,
              or a security reader's (its name says `security`, as lander-self reads it) newest is HANDBACK at any head
+  security   the PR touches a path on the base's tests/LANDING-security.toml and perms' own file holds no record
+             of the PR's head at its change digest (review.perms_recorded), as the lane itself would not merge it; a
+             diff that will not read is `unread`
 THE LANE APPLIES IT (apply, under the lane lock but not rest_lock, before it drains any other request). A request is
 anyone's, so it is trusted for nothing but which job it names, and every rule above is read again there, the PR's
 facts too, failing closed. It drops the job only when the request is whole (`request`: a hex rid, a seen that is an
@@ -69,7 +72,8 @@ class Refused(Exception):
 
 
 def facts(repo, pr) -> dict:
-    """What the remote rules read: {head, comments, files, lander (globs), protected (rules)}. Raises Unread."""
+    """What the remote rules read: {head, comments, files, lander (globs), protected (rules), security (the changed
+    files on the base's security list), digests (the change's, when security names one)}. Raises Unread."""
     from lander import lane as L   # lane imports half the package; only a release that gets this far needs it
     root = J.repo_root(repo)
     j, err = GH.pr_facts(root, pr, "headRefOid,baseRefName,comments,files")
@@ -96,8 +100,15 @@ def facts(repo, pr) -> dict:
     rules = L.protected_rules(repo)
     if rules is None:
         raise Unread("cc-config would not read the repo's protected paths")
+    security, digests = [p for p in files if MF.match(pol.security_review, p)], []
+    if security:   # the digests a perms LAND may carry, as review.keys() names them
+        diff = R.diff_of(root, sha, head)
+        if not diff:
+            raise Unread(f"git would not diff the PR at {head[:12]}")
+        digests = sorted({R.change_digest(diff), R.change_digest(diff, legacy=True)} - {""})
     return {"head": head, "comments": j.get("comments") or [], "files": files,
-            "lander": list(pol.lander) + [p + MF.POLICY for p in MF.PREFIXES], "protected": rules}
+            "lander": list(pol.lander) + [p + MF.POLICY for p in MF.PREFIXES], "protected": rules,
+            "security": security, "digests": digests}
 
 
 def standing_handback(comments, head):
@@ -147,6 +158,10 @@ def remote_rules(job, f):
     hb = standing_handback(f["comments"], f["head"])
     if hb:
         raise Refused("handback", f"{hb[0]}'s HANDBACK at {hb[1][:12] or 'no head'} stands")
+    sec = f.get("security") or []
+    if sec and not R.perms_recorded(job.repo, job.pr, f["head"], set(f.get("digests") or [])):
+        raise Refused("security", f"it changes {J.path_names(sec[:1])}, a security path, and perms has recorded no "
+                                  "security read of this change")
 
 
 def all_rules(repo, pr, job) -> dict:

@@ -135,8 +135,9 @@ class Case(unittest.TestCase):
             json.dump({"path": self.tmp}, f)
         self.real_sh = C.sh
         # the reviewer keys come from the passwd home's config, never the box's real one in a test
-        self.real_reviewer = (C.REVIEWER_CONFIG, C.PASSWD_HOME)
+        self.real_reviewer = (C.REVIEWER_CONFIG, C.PASSWD_HOME, R.PERMS_STATE)
         C.PASSWD_HOME = os.path.join(self.tmp, "home")
+        R.PERMS_STATE = os.path.join(self.tmp, "perms-state")   # never the box's real perms records
         C.REVIEWER_CONFIG = os.path.join(C.PASSWD_HOME, ".cc", "config")
         self.claude = self.install_claude("1.0")
         os.makedirs(os.path.join(C.PASSWD_HOME, ".local", "bin"))
@@ -145,7 +146,7 @@ class Case(unittest.TestCase):
 
     def tearDown(self):
         C.sh = self.real_sh
-        C.REVIEWER_CONFIG, C.PASSWD_HOME = self.real_reviewer
+        C.REVIEWER_CONFIG, C.PASSWD_HOME, R.PERMS_STATE = self.real_reviewer
         for k, v in self.env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -1481,6 +1482,44 @@ class TestRecord(Case):
                                          "--findings", "[correctness] x breaks"), 0)
         self.assertIn("verdict=HANDBACK", box.called("gh pr comment")[0]["input"])
 
+    def proc(self, cwd, comm="claude"):
+        """A fixture /proc: this process (pid 30) -> a shell (20) -> a process named `comm` (10) in `cwd`."""
+        root = os.path.join(self.tmp, "proc-" + comm + str(len(os.listdir(self.tmp))))
+        for pid, name, ppid in ((30, "python3", 20), (20, "bash", 10), (10, comm, 1)):
+            os.makedirs(os.path.join(root, str(pid)))
+            with open(os.path.join(root, str(pid), "comm"), "w") as f:
+                f.write(name + "\n")
+            with open(os.path.join(root, str(pid), "status"), "w") as f:
+                f.write(f"Name:\t{name}\nPPid:\t{ppid}\n")
+        os.makedirs(cwd, exist_ok=True)
+        os.symlink(cwd, os.path.join(root, "10", "cwd"))
+        return root
+
+    def test_only_the_perms_seat_passes_as_the_caller(self):
+        state = os.environ["CC_STATE"]
+        seat = os.path.join(state, "demo", "perms")
+        self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(seat), state))
+        self.assertTrue(R.perms_seat_caller("owner/demo", 30, self.proc(seat), state))
+        for root in (self.proc(os.path.join(state, "demo", "planning")),
+                     self.proc(os.path.join(state, "demo", "perms", "sub")),
+                     self.proc(os.path.join(state, "other", "perms")),
+                     self.proc(seat, comm="node")):       # no claude above the caller
+            self.assertFalse(R.perms_seat_caller("demo", 30, root, state), root)
+
+    def test_record_refuses_a_perms_name_outside_the_perms_seat(self):
+        box = self.box(**{"gh pr view": self.facts()})
+        seat = [False]
+        real = R.perms_seat_caller
+        R.perms_seat_caller = lambda repo, *a, **kw: seat[0]
+        self.addCleanup(setattr, R, "perms_seat_caller", real)
+        for by in ("perms-security-read", "perms-anything", "Perms-Security-Read"):
+            self.assertEqual(self.run_record("demo", "7", "LAND", "--by", by), 1, by)
+        self.assertEqual(box.called("gh pr comment"), [])
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "x-security"), 0)   # not perms' name
+        seat[0] = True
+        self.assertEqual(self.run_record("demo", "7", "LAND", "--by", "perms-security-read"), 0)
+        self.assertEqual(len(box.called("gh pr comment")), 2)
+
     def test_record_refuses_land_over_a_standing_handback(self):
         d = R.change_digest(DIFF)
         box = self.box(**{"gh pr view": self.facts([self.comment("HANDBACK", d, ["1. [correctness] x"])])})
@@ -1526,6 +1565,104 @@ class TestWillReview(unittest.TestCase):
                 mock.patch.object(P, "plan", side_effect=plan), mock.patch.object(R, "diff_of", return_value=DIFF):
             self.assertEqual(R.cmd_will_review(["fund", "2"]), 1)
         self.assertEqual(seen.get("fallback"), "/rel/landing-repos/fund.toml")
+
+
+class TestSecurityPaths(Case):
+    """Perms after #1265: a change on the base's LANDING-security.toml merges only on a security reader's LAND."""
+
+    PATHS = ["bin-private/door", "config/systemd-user/tunnel.service"]
+
+    def sec_job(self, path):
+        j = self.job(paid=True)
+        j.files, j.plan.extra["security"] = [path], [path]
+        return j
+
+    def reads(self, entries, mode=0o600, repo="demo"):
+        """Write perms' security-read records for `repo` as perms would: its own plain file, mode `mode`."""
+        path = R.perms_reads_path(repo)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.lexists(path):
+            os.unlink(path)
+        with open(path, "w") as f:
+            json.dump(entries, f)
+        os.chmod(path, mode)
+        return path
+
+    def rec(self, j, **kw):
+        return dict({"repo": j.repo, "pr": j.pr, "head": j.head, "change": j.digest}, **kw)
+
+    def blocked(self, j, comments, path):
+        for v in (R.review(j, comments=comments), R.delta_review(j, R.imported(comments[0]["body"]) if comments
+                                                                  else T.Verdict(verdict=T.LAND, digest="0"), comments=comments)):
+            self.assertEqual(v.verdict, T.INCOMPLETE, (path, comments))
+            self.assertEqual((v.extra.get("host"), v.extra.get("security")), (True, True), v.extra)
+            self.assertIn(path, v.extra["why"])
+            self.assertIn("security-reads.json holds no record", v.extra["why"])
+        ok, why = R.would_read(j, comments)
+        self.assertFalse(ok)
+        self.assertIn("the landing buys none", why)
+
+    def test_no_pr_marker_clears_a_security_path(self):
+        """Perms' HANDBACK at 2f9fde5e: a seat can post any marker with `gh pr comment`, so none counts, whatever
+        reader it names (perms' read of 5ee8a474: x-security, security, perms-security-read-2 included)."""
+        for path in self.PATHS:
+            box = self.box(claude=claude_says("LAND"))
+            j = self.sec_job(path)
+            opus = self.comment("LAND", j.digest, by="opus")
+            for comments in [[], [opus]] + [[opus, self.comment("LAND", j.digest, by=n)] for n in (
+                    "x-security", "security", "perms-security-read-2", "perms-security", "perms-security-read")]:
+                self.blocked(j, comments, path)
+            self.assertEqual(box.called("claude"), [])   # no read the lander buys is perms'
+
+    def test_perms_record_of_this_head_and_change_merges_a_security_path(self):
+        for path in self.PATHS:
+            box = self.box(claude=claude_says("LAND"))
+            j = self.sec_job(path)
+            opus = self.comment("LAND", j.digest, by="opus")
+            self.reads([self.rec(j)])
+            v = R.review(j, comments=[])
+            self.assertEqual((v.verdict, v.model, v.extra.get("read")), (T.LAND, "perms-security-read", "perms"))
+            self.assertEqual(R.review(j, comments=[opus]).verdict, T.LAND)
+            self.assertEqual(R.delta_review(j, R.imported(opus["body"]), comments=[opus]).verdict, T.LAND)
+            self.assertEqual(R.would_read(j, [])[1], "perms recorded its security read of this change, and the "
+                                                     "landing lands on that")
+            self.assertEqual(box.called("claude"), [])
+            # a HANDBACK recorded at this digest still stands over perms' record
+            back = self.comment("HANDBACK", j.digest, ["1. [security] keeps the docker group"], by="perms-security")
+            self.assertEqual(R.review(j, comments=[opus, back]).verdict, T.HANDBACK_VERDICT)
+
+    def test_a_record_that_does_not_match_or_is_not_perms_own_file_clears_nothing(self):
+        box = self.box(claude=claude_says("LAND"))
+        path = self.PATHS[0]
+        j = self.sec_job(path)
+        opus = self.comment("LAND", j.digest, by="opus")
+        for entries in ([self.rec(j, head="c" * 40)], [self.rec(j, change="0dd")], [self.rec(j, pr=8)],
+                        [self.rec(j, repo="other")], [self.rec(j, pr="7")], {"x": self.rec(j)}, []):
+            self.reads(entries)
+            self.blocked(j, [opus], path)
+        self.reads([self.rec(j)], mode=0o644)          # not mode 600: anyone in the group could have written it
+        self.blocked(j, [opus], path)
+        real = self.reads([self.rec(j)])
+        os.rename(real, real + ".real")
+        os.symlink(real + ".real", real)                # a link: refused, as the door refuses one
+        self.blocked(j, [opus], path)
+        os.unlink(real)
+        self.reads([self.rec(j)])
+        self.assertEqual(R.review(j, comments=[opus]).verdict, T.LAND)   # the same file, plainly there, counts
+        self.assertEqual(box.called("claude"), [])
+
+    def test_a_change_on_no_security_path_is_unaffected(self):
+        box = self.box(claude=claude_says("LAND"))
+        j = self.job(paid=True)
+        self.assertNotIn("security", j.plan.extra)
+        opus = self.comment("LAND", j.digest, by="opus")
+        self.assertEqual(R.review(j, comments=[opus]).verdict, T.LAND)
+        self.assertEqual(R.would_read(j, [opus])[1], "a verdict is already recorded for this change, and the "
+                                                     "landing reads that")
+        self.assertEqual(box.called("claude"), [])
+        self.assertEqual(R.review(self.job(paid=False), comments=[]).extra.get("read"), "none")
+        self.reads([self.rec(j)])   # a record names no path: an unpaid job off the list still reads as before
+        self.assertEqual(R.review(self.job(paid=False), comments=[]).extra.get("read"), "none")
 
 
 if __name__ == "__main__":

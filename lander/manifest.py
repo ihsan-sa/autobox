@@ -6,7 +6,10 @@ published tree inside it), and describes the tree it sits in: its `paths`, `fixt
 fixtures, and keeps the prefix as the check's working directory (Manifest.cwd). The policy is
 `<prefix>tests/LANDING-policy.toml`: top-level `default_checks` (the check NAMES an unowned path widens to) and a
 `[paths]` table of globs — gate_first, paid_review, lander, protected, and `default` (paths known to be unowned, kept
-in Policy.extra["default_paths"] for the card). The reach graph is `<prefix>tests/reach.tsv` (reach.py).
+in Policy.extra["default_paths"] for the card). `<prefix>tests/LANDING-security.toml` is one key, `paths`: the globs
+a change to which needs a security reader's LAND before it merges (Policy.security_review, read by plan.select and
+review.py). It is a file of its own, not a [paths] key, because a release that does not know a key faults on it and
+a base it cannot read plans nothing. The reach graph is `<prefix>tests/reach.tsv` (reach.py).
 
 GLOBS. `*` and `?` stay inside one path segment, `**` crosses them; `dir/**` is everything under dir.
 
@@ -23,13 +26,13 @@ whose run files, paths and fixtures are all gone, and drop a path or fixture tha
 a relative path or by a dotted module after `-m` (tests.test_x is tests/test_x.py); a file git's -M sees renamed,
 edited or not, is not gone. A changed run line is
 always a fault, so a check whose run names a deleted file goes whole or not at all. A `where`, a class, a cwd and
-the policy never narrow. plan() hands widen() the same trees, so a check removed as dead is not run on the files it
+the policy (its security list too) never narrow. plan() hands widen() the same trees, so a check removed as dead is not run on the files it
 named. widen_faults also names a check the head adds or changes that grants itself a class outside the sandbox,
 net = true, bare = true or a mount its base definition lacks (self_widening); a check the head adds with no class
 line is hermetic, not T.Check's host default (head_check), and may not say bare. The built-in check
-`manifest-widen` (BUILTIN) is selected by any change to a manifest, policy or reach file and runs widen_faults
+`manifest-widen` (BUILTIN) is selected by any change to a manifest, policy, security or reach file and runs widen_faults
 in-process on the two git trees; `lander manifest-widen` runs it by hand, and its red is never quarantined (run.py).
-The policy file is also lander-class: plan() sends a change to it to lander-self. A manifest edit is CLEAN when
+The policy file and the security file are also lander-class: plan() sends a change to it to lander-self. A manifest edit is CLEAN when
 clean_faults is empty: widen_faults, no check both trees have changes anything but the paths and fixtures it adds
 (its run, class, where, bare, net, mounts or cap), and no added check's cap is above the base's largest. plan.clean_manifest then lets the change land in the normal
 lane, judged on the merge tree; anything else in a manifest is lander-class.
@@ -56,6 +59,7 @@ from lander import types as T
 
 PREFIXES = ("", "core/")
 MANIFEST, POLICY, REACH = "tests/LANDING.toml", "tests/LANDING-policy.toml", "tests/reach.tsv"
+SECURITY = "tests/LANDING-security.toml"
 POLICY_LISTS = ("gate_first", "paid_review", "lander", "protected")
 TOOL_DIRS = ("bin/", "bin-private/", "core/bin/")
 # Higher runs earlier or on more: host runs before every merge, box only on the tip, hermetic in the sandbox,
@@ -249,9 +253,22 @@ def parse_policy(text: str, prefix: str = "", source: str = "") -> tuple:
     return pol, faults
 
 
+def parse_security(text: str, prefix: str = "", source: str = "") -> tuple:
+    """-> ([glob], [fault]): LANDING-security.toml's `paths`, prefixed. Any other key is a fault."""
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        return [], [f"{source}: not TOML: {e}"]
+    faults = [f"{source}: unknown top-level key {k!r}" for k in doc if k != "paths"]
+    paths = doc.get("paths", [])
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        return [], faults + [f"{source}: paths must be a list of strings"]
+    return [prefix + p for p in paths], faults
+
+
 def union_policy(a: T.Policy, b: T.Policy) -> T.Policy:
     u = lambda x, y: x + [v for v in y if v not in x]   # noqa: E731
-    return T.Policy(default=u(a.default, b.default),
+    return T.Policy(default=u(a.default, b.default), security_review=u(a.security_review, b.security_review),
                     extra={"default_paths": u(a.extra.get("default_paths", []), b.extra.get("default_paths", []))},
                     **{k: u(getattr(a, k), getattr(b, k)) for k in POLICY_LISTS})
 
@@ -280,6 +297,11 @@ def load(repo_root: str, rev: str, fallback: str = "", strict: bool = True, read
             m.sources.append(pre + POLICY)
             pol, faults = parse_policy(text, pre, pre + POLICY)
             m.policy, m.faults = union_policy(m.policy, pol), m.faults + faults
+        text = get(pre + SECURITY)
+        if text is not None:
+            m.sources.append(pre + SECURITY)
+            globs, faults = parse_security(text, pre, pre + SECURITY)
+            m.policy, m.faults = union_policy(m.policy, T.Policy(security_review=globs)), m.faults + faults
         text = get(pre + REACH)
         if text is not None:
             m.sources.append(pre + REACH)
@@ -303,9 +325,9 @@ def load(repo_root: str, rev: str, fallback: str = "", strict: bool = True, read
 
 
 def builtin_check() -> T.Check:
-    """manifest-widen: owns every manifest, policy and reach file; run.py runs it in-process (static, reads git)."""
+    """manifest-widen: owns every manifest, policy, security and reach file; run.py runs it in-process (static)."""
     return T.Check(name=BUILTIN, run="lander manifest-widen", klass=T.STATIC, cap=60,
-                   paths=[p + f for p in PREFIXES for f in (MANIFEST, POLICY, REACH)])
+                   paths=[p + f for p in PREFIXES for f in (MANIFEST, POLICY, SECURITY, REACH)])
 
 
 def head_check(base: Manifest, head: Manifest, n: str) -> T.Check:
@@ -466,7 +488,7 @@ def widen_faults(base: Manifest, head: Manifest, files=None) -> list:
             bad.append(f"check {n!r}: class moved from {b.klass} down to {h.klass}")
         if head.cwd.get(n, "") != base.cwd.get(n, ""):
             bad.append(f"check {n!r} moved to another manifest")
-    for k in POLICY_LISTS + ("default",):
+    for k in POLICY_LISTS + ("default", "security_review"):
         lost = [x for x in getattr(base.policy, k) if x not in getattr(head.policy, k)]
         if lost:
             bad.append(f"policy {k} lost {', '.join(lost)}")

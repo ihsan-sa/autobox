@@ -1199,5 +1199,56 @@ class Reach(unittest.TestCase):
         self.assertEqual(R.callers([("a", "b"), ("c", "b"), ("a", "d")], "b"), ["a", "c"])
 
 
+class SecurityPaths(unittest.TestCase):
+    """tests/LANDING-security.toml: the changed files on it go in plan.extra["security"] and the plan is paid."""
+
+    SEC = 'paths = ["bin-private/door", "config/systemd-user/**"]\n'
+
+    def test_a_change_on_the_bases_security_list_is_marked_and_paid(self):
+        r = Repo(self, {"tests/LANDING-security.toml": self.SEC})
+        m = M.load(r.root, r.base)
+        self.assertEqual(m.policy.security_review, ["bin-private/door", "config/systemd-user/**"])
+        for f in ("bin-private/door", "config/systemd-user/tunnel.service"):
+            p = P.select(m, [f, "core/bin/a"])
+            self.assertEqual((p.extra.get("security"), p.paid), ([f], True), f)
+        p = P.select(m, ["core/bin/a", "bin-private/door2", "config/units.json"])
+        self.assertNotIn("security", p.extra)
+        self.assertFalse(p.paid)
+
+    def test_no_security_file_marks_nothing(self):
+        r = Repo(self)
+        p = P.select(M.load(r.root, r.base), ["bin-private/door", "config/systemd-user/tunnel.service"])
+        self.assertNotIn("security", p.extra)
+
+    def test_the_security_file_is_lander_class_and_may_not_narrow(self):
+        r = Repo(self, {"tests/LANDING-security.toml": self.SEC})
+        head = r.commit("narrow", {"tests/LANDING-security.toml": 'paths = ["bin-private/door"]\n'})
+        files = P.changed(r.root, r.base, head)
+        p = P.plan(r.root, r.base, head, files)
+        self.assertEqual(p.klass, T.LANDER)
+        self.assertIn(M.BUILTIN, p.checks)
+        bad = M.widen_faults(M.load(r.root, r.base), M.load(r.root, head, strict=False))
+        self.assertTrue(any("security_review lost config/systemd-user/**" in b for b in bad), bad)
+        wider = r.commit("widen", {"tests/LANDING-security.toml": self.SEC.replace(']', ', "bin-private/x"]')})
+        self.assertEqual(M.widen_faults(M.load(r.root, head), M.load(r.root, wider, strict=False)), [])
+
+    def test_a_list_naming_itself_marks_a_head_that_removes_an_entry(self):
+        """Perms' HANDBACK at 2f9fde5e: the list protects itself, so a removal needs the same perms read; the plan
+        reads the base's list, which still names the file the head changes."""
+        own = 'paths = ["tests/LANDING-security.toml", "bin-private/door", "config/systemd-user/**"]\n'
+        r = Repo(self, {"tests/LANDING-security.toml": own})
+        head = r.commit("drop", {"tests/LANDING-security.toml": own.replace(', "config/systemd-user/**"', "")})
+        p = P.plan(r.root, r.base, head, P.changed(r.root, r.base, head))
+        self.assertEqual((p.extra.get("security"), p.paid), (["tests/LANDING-security.toml"], True))
+        r2 = Repo(self, {"tests/LANDING-security.toml": self.SEC})   # a list not naming itself: not marked
+        head2 = r2.commit("drop", {"tests/LANDING-security.toml": 'paths = ["bin-private/door"]\n'})
+        self.assertNotIn("security", P.plan(r2.root, r2.base, head2, P.changed(r2.root, r2.base, head2)).extra)
+
+    def test_a_security_file_with_another_key_is_a_fault(self):
+        self.assertEqual(M.parse_security('paths = ["a"]\n', "core/"), (["core/a"], []))
+        self.assertTrue(M.parse_security('paths = ["a"]\nskip = true\n')[1])
+        self.assertTrue(M.parse_security('paths = "a"\n')[1])
+
+
 if __name__ == "__main__":
     unittest.main()

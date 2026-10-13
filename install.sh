@@ -223,6 +223,25 @@ if [ "$etc" = 1 ]; then
     sudo udevadm control --reload-rules 2>/dev/null || true
     sudo udevadm trigger --subsystem-match=powercap --action=change 2>/dev/null || true
   fi
+  if [ -f "$E/claude-bwrap" ] && [ -f "$E/claude-bwrap-path.json" ]; then   # Claude Code's Bash sandbox under the AppArmor userns restriction: see the profile's header
+    b=/usr/local/libexec/claude-bwrap                       # a copy, so re-run --etc after a bubblewrap update
+    a=/etc/apparmor.d/claude-bwrap ms=/etc/claude-code/managed-settings.d/50-claude-bwrap.json
+    k=$(mktemp -d)                                          # a re-run that fails puts the working pair back; never a .bak in apparmor.d, which loads at boot
+    if [ -f "$b" ] && [ -f "$a" ]; then sudo cp -a "$b" "$k/copy" && sudo cp -a "$a" "$k/profile"; fi
+    sudo install -D -o root -g "$(id -gn)" -m 0750 /usr/bin/bwrap "$b"   # 0750: only the owner's uid may use the userns it grants
+    sudo install -m 644 "$E/claude-bwrap" "$a"
+    if ! sudo apparmor_parser -r "$a"; then
+      if [ -f "$k/copy" ] && [ -f "$k/profile" ]; then                    # the kernel kept the old profile; the files go back to match it
+        sudo cp -a "$k/copy" "$b" && sudo cp -a "$k/profile" "$a"
+        sudo rm -rf "$k"
+        echo "install.sh: apparmor_parser rejected the new claude-bwrap — restored the previous profile and copy, sandbox.bwrapPath unchanged" >&2; exit 1
+      fi
+      sudo rm -rf "$k"; sudo rm -f "$a" "$b" "$ms"          # no copy left behind, so no setting may name it
+      echo "install.sh: apparmor_parser rejected claude-bwrap — removed it, the copy and sandbox.bwrapPath" >&2; exit 1
+    fi
+    sudo rm -rf "$k"
+    sudo install -D -m 644 "$E/claude-bwrap-path.json" "$ms"   # bwrapPath is honoured from managed settings only
+  fi
   echo "/etc configs installed (sshd -t passed)"
 fi
 # git rerere, for every clone on the box. A track branch is a chain of wip checkpoints, so rebasing one onto a moved

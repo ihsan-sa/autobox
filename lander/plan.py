@@ -12,7 +12,7 @@ SELECTION, per changed file:
     UNOWNED: the change widens to the policy's default_checks and Plan.unowned names it for the card.
   - a changed tool (a file under bin/, bin-private/ or core/bin/) also selects the non-static checks that own each
     of its direct callers in reach.tsv — one hop, never further.
-  - a change to a manifest, policy or reach file selects the built-in manifest-widen check.
+  - a change to a manifest, policy, security or reach file selects the built-in manifest-widen check.
   - ADD-ONLY (owner, 2026-09-28: "a brand-new standalone tool that nothing calls should be live in minutes"): a change
     that only adds files, and modifies or deletes none, does not widen to default_checks for an unowned path, and is
     leaf rather than wide — nothing that exists can break by a file appearing next to it. Every check that OWNS an
@@ -25,7 +25,7 @@ Plan.checks holds what runs BEFORE the merge. Box-class checks run on main's tip
 Plan.extra["tip"] instead — except for a gate-first change, which keeps them before the merge (owner, 2026-09-24).
 
 KLASS, first match wins: protected (a policy protected glob, or the caller's `protected` list — CC_PROTECTED_PATHS
-lives in the box's config, never in a tree) > lander (a policy lander glob, or the policy file itself — bar a
+lives in the box's config, never in a tree) > lander (a policy lander glob, or the policy or security file — bar a
 GENERATED reach file: one where every edge the change adds is one `lander reach` writes on merge-tree(base, head)
 and every edge it drops is one it does not, so the change follows from the code and lands with it; an edge the code
 does not make, or a change git cannot prove, stays lander, and a working copy proves nothing; and bar a CLEAN manifest
@@ -37,6 +37,9 @@ paid: some file matches paid_review, or UNGATED: some unowned path is code (anyt
 inert()) and no check bar manifest-widen runs on the change, before the merge or after it (a repo with no manifest of
 its own and no host fallback, or an add-only change nothing owns). Such a change is read instead of landing on
 nothing, and extra["ungated"] says why it was paid.
+SECURITY: the changed files that match the base's tests/LANDING-security.toml (Policy.security_review) go in
+extra["security"], and the plan is paid. review.py then lands it only on a security reader's LAND at its digest
+(perms, after #1265 merged a tunnel unit with no security read and its read found a HIGH).
 
     lander plan [--repo DIR] [--manifest FILE] BASE [HEAD]    (no HEAD: the working copy; prints the Plan as JSON)
 """
@@ -141,7 +144,7 @@ def select(m: M.Manifest, files: list, protected=(), added=(), generated=(), cle
             else:
                 faults.append(f"default check {n!r} is not in the manifest")
     prot = list(pol.protected) + list(protected)
-    lander = list(pol.lander) + [p + M.POLICY for p in M.PREFIXES]
+    lander = list(pol.lander) + [p + f for p in M.PREFIXES for f in (M.POLICY, M.SECURITY)]
     if any(M.match(prot, f) for f in files):
         klass = T.PROTECTED
     # brief: "a reach.tsv change that exactly matches what the generator writes on the PR's merge tree follows from
@@ -177,8 +180,11 @@ def select(m: M.Manifest, files: list, protected=(), added=(), generated=(), cle
         extra["add_only"] = quiet
     if faults:
         extra["faults"] = faults
+    security = [f for f in files if M.match(pol.security_review, f)]
+    if security:
+        extra["security"] = security
     return T.Plan(checks=sorted(names), owned=owned, unowned=unowned, klass=klass,
-                  paid=ungated or any(M.match(pol.paid_review, f) for f in files), extra=extra)
+                  paid=ungated or bool(security) or any(M.match(pol.paid_review, f) for f in files), extra=extra)
 
 
 def plan(repo_root: str, base_sha: str, head_sha: str, files: list, protected=(), fallback: str = "") -> T.Plan:

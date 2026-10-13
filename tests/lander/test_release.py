@@ -173,6 +173,35 @@ class Release(unittest.TestCase):
         ]
         self.requested()
 
+    def test_a_security_path_needs_perms_record_of_the_change(self):
+        p = mock.patch.object(R, "PERMS_STATE", os.path.join(self.tmp, "perms-state"))
+        p.start()
+        self.addCleanup(p.stop)
+        path = R.perms_reads_path("demo")
+        os.makedirs(os.path.dirname(path))
+
+        def record(**kw):
+            with open(path, "w") as f:
+                json.dump([dict({"repo": "demo", "pr": 5, "head": HEAD, "change": "c0ffee"}, **kw)], f)
+            os.chmod(path, 0o600)
+        self.queued()
+        self.facts.update(files=["config/systemd-user/x.service"], security=["config/systemd-user/x.service"],
+                          digests=["c0ffee"])
+        land = {"body": R.marker(T.Verdict(verdict=T.LAND, digest="c0ffee"), "d" * 40, HEAD, "perms-security-read"),
+                "viewerDidAuthor": True}
+        self.facts["comments"] = [land]   # a marker alone, even signed perms-security-read, is no record
+        self.assertIn("perms has recorded no security read", self.refused("security"))
+        for kw in ({"head": OLD}, {"change": "0dd"}, {"pr": 6}):
+            record(**kw)
+            self.refused("security")
+        record()
+        self.requested()
+
+    def test_no_security_path_needs_no_perms_land(self):
+        self.queued()
+        self.facts.update(security=[], digests=[], comments=[mark(T.LAND, "opus-5.5")])
+        self.requested()
+
     def test_an_unread_fact_fails_closed(self):
         self.queued()
         self.facts = RL.Unread("gh would not read the PR: boom")
