@@ -15,8 +15,8 @@ A planning seat runs it by hand; the lander never installs itself.
     lander-self check <repo> <pr> [--repo-dir DIR]
         (cc-guard keeps this, like land/promote/rollback/pin, from a worker: it fetches a PR and runs its code.)
         Refuses the PR whole unless: every changed path is on the base's `lander` list or under the lander's own
-        tree (LANDER_TREE: core/lander, core/tests/lander); a LAND record by a reader
-        whose name says `security` and a LAND record by another reader both stand at the PR's head (`lander record
+        tree (LANDER_TREE: core/lander, core/tests/lander); a LAND record by exactly `perms-security-read` (review.py's
+        security reader) and a LAND record by another reader both stand at the PR's head (`lander record
         --by`, which cc-guard keeps closed to workers); the merge tree's tests/check-extra.sh (`core-identity`: no
         box identity in core/) and the candidate's own tests (`<core>/bin/lander selfcheck` and `<core>/tests/lander`)
         pass on the merge tree inside bwrap (no network, empty HOME, no ~/.cc). Then prints a
@@ -972,8 +972,13 @@ def readers(comments, head):
     return out
 
 
+# review.py's PERMS_SECURITY_READER since #1285. Perms, 10-13: "Align it to the exact constant perms-security-read" —
+# a name that merely contains `security` is anyone's to write.
+PERMS_SECURITY_READER = "perms-security-read"
+
+
 def reads_missing(by):
-    sec = {b for b in by if "security" in b.lower()}
+    sec = {b for b in by if b == PERMS_SECURITY_READER}
     miss = []
     if not sec:
         miss.append("a security read")
@@ -1286,13 +1291,17 @@ def selfcheck():
     h = "0123456789abcdef0123"
     mk = lambda hd, v, b, own=True: {"viewerDidAuthor": own, "body":  # noqa: E731
                                      f"<!-- cc-land-review v2 change=ab base=cd head={hd} verdict={v} by={b} -->\nx"}
-    by = readers([mk(h[:12], "LAND", "opus-5.5"), mk(h[:12], "LAND", "security-reviewer"),
+    by = readers([mk(h[:12], "LAND", "opus-5.5"), mk(h[:12], "LAND", "perms-security-read"),
                   mk(h[:12], "LAND", "forged-security", own=False), mk("fedcba987654", "LAND", "old-security"),
                   mk(h[:12], "HANDBACK", "sec-security")], h)
-    case("readers keep own LAND at head only", by == {"opus-5.5", "security-reviewer"})
+    case("readers keep own LAND at head only", by == {"opus-5.5", "perms-security-read"})
     case("both reads present -> nothing missing", reads_missing(by) == [])
     case("no security read is named", reads_missing({"opus-5.5"}) == ["a security read"])
-    case("a security read alone is not enough", reads_missing({"security-reviewer"}) == ["an Opus read"])
+    case("a security read alone is not enough", reads_missing({"perms-security-read"}) == ["an Opus read"])
+    case("only exactly perms-security-read is the security read; a name that contains security is not",
+         reads_missing({"opus-5.5", "perms-security-read"}) == [] and
+         all(reads_missing({"opus-5.5", n}) == ["a security read"]
+             for n in ("security-reviewer", "x-security", "perms-security-read-2", "Perms-Security-Read")))
     # pin / promote / rollback / legacy on a throwaway repo and HOME
     with tempfile.TemporaryDirectory() as t:
         HOME, ROOT = t, os.path.join(t, ".cc", "lander")
@@ -1490,7 +1499,7 @@ def selfcheck():
         case("an edited release dir is rebuilt from the commit", r_plant == 0 and clean)
         role, here = os.environ.pop("CC_ROLE", None), os.getcwd()
         os.chdir(t)   # no .cc/track above: this selfcheck may itself run inside a worker's worktree
-        both = [mk(side[:12], "LAND", "opus-5.5"), mk(side[:12], "LAND", "security-reviewer")]
+        both = [mk(side[:12], "LAND", "opus-5.5"), mk(side[:12], "LAND", "perms-security-read")]
         m = red
         try:
             case("--pr allows exactly the open PR's head with both LAND records",
@@ -1498,9 +1507,11 @@ def selfcheck():
             case("--pr with another head is refused", promotable(repo, side, "5", lambda r, n: (a, both), main=m) != "")
             case("--pr without a security LAND at the head is refused", "security" in promotable(
                 repo, side, "5", lambda r, n: (side, both[:1]), main=m))
+            case("--pr with a LAND by a name that only contains security is refused", "security" in promotable(
+                repo, side, "5", lambda r, n: (side, [both[0], mk(side[:12], "LAND", "x-security")]), main=m))
             case("--pr with LAND records at an older head is refused", promotable(
                 repo, side, "5", lambda r, n: (side, [mk(a[:12], "LAND", "opus-5.5"),
-                                                      mk(a[:12], "LAND", "security-reviewer")]), main=m) != "")
+                                                      mk(a[:12], "LAND", "perms-security-read")]), main=m) != "")
             case("no --pr: a non-main commit is refused", promotable(repo, side, "", main=m) != "")
             case("no verified main: everything is refused", promotable(repo, b, "") != "")
             os.environ["CC_ROLE"] = "worker"
@@ -1662,14 +1673,14 @@ def prove_cases(case, t, real_names=names_under):
     case("a current run with no verdict refuses", "current release" in prove("cand", "cur", run)[2])
     run, _ = fake({"cand": [{}]})
     case("a sweep that names no check refuses", "named no check" in prove("cand", "cur", run)[2])
-    # the replay of 10-12: #1024 put every host check under cc-nosignal; these six read what its Landlock domain hides
-    # and went red on main under it while the release before passed them (#1157, #1158, #1161 then marked them bare)
-    hidden = ["e2e-cc-context", "selfcheck-cc-fence", "selfcheck-cc-member-broker", "selfcheck-cc-member-import",
-              "selfcheck-cc-member-v2", "selfcheck-cc-sandbox"]
+    # the replay of 10-12: #1024 put every host check under cc-nosignal; these read what its Landlock domain hides
+    # and went red on main under it while the release before passed them (#1157, #1158, #1161 then marked them bare;
+    # #1286 since dropped the cc-member-* checks, so the replay keeps the three that still exist)
+    hidden = ["e2e-cc-context", "selfcheck-cc-fence", "selfcheck-cc-sandbox"]
     under = {n: "failed" for n in hidden}
     run, _ = fake({"cand": [{**under, "selfcheck-cc-guard": "passed"}] * 2,
                    "cur": [{n: "passed" for n in [*hidden, "selfcheck-cc-guard"]}]})
-    case("the replay of #1024's promote is refused, naming all six checks", prove("cand", "cur", run)[0] == hidden)
+    case("the replay of #1024's promote is refused, naming every hidden check", prove("cand", "cur", run)[0] == hidden)
     # a candidate whose loader drops a check reports it nowhere; main's list is the current release's, so it blocks
     run, _ = fake({"cand": [green], "cur": [green]})
     bad, lines, why = prove("cand", "cur", run, names=lambda r: (["a", "b", "c"], "") if r == "cur" else ([], "x"))
