@@ -632,6 +632,64 @@ class QueuedCards(Stubbed):
         self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7", "1.8", "1.8"])   # PR #8's still go
         self.assertEqual(list(C.read_json(C._queued_path("demo"), {})), [f"land:demo:8:queued@{Q2}"])
 
+    def test_new_cards_are_posted_under_the_same_cap_and_a_held_post_goes_on_a_later_pass(self):
+        """Opus read of #1275: posts skipped the per-minute cap that edits kept."""
+        with mock.patch.object(C, "EDITS_PER_MIN", 1), mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.QUEUED), (8, Q2, T.QUEUED))))
+        self.assertEqual([a[5] for a in self.argvs("cc-slack post")], [f"land:demo:7:queued@{Q}"])   # #8's is held
+        self.assertEqual(list(C.read_json(C._queued_path("demo"), {})), [f"land:demo:7:queued@{Q}"])
+        with mock.patch.object(C, "EDITS_PER_MIN", 1), mock.patch.object(C.time, "time", return_value=1061.0):
+            self.assertTrue(C.positions("demo", self.jobs((7, Q, T.QUEUED), (8, Q2, T.QUEUED))))
+        self.assertEqual([a[5] for a in self.argvs("cc-slack post")], [f"land:demo:7:queued@{Q}",
+                                                                       f"land:demo:8:queued@{Q2}"])
+
+    def test_a_429s_retry_after_is_cut_to_edit_backoff_max_and_a_short_one_is_kept(self):
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.answer({"cc-slack edit": [1, "cc-slack edit: HTTP Error 429: Too Many Requests (Retry-After: 86400)"]})
+        with mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.CHECKING))))
+        self.assertEqual(C.read_json(C._edits_path(), {})["until"], 1000.0 + C.EDIT_BACKOFF_MAX)
+        os.unlink(C._edits_path())
+        self.answer({"cc-slack edit": [1, "cc-slack edit: HTTP Error 429: Too Many Requests (Retry-After: 7)"]})
+        with mock.patch.object(C.time, "time", return_value=2000.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.CHECKING))))
+        self.assertEqual(C.read_json(C._edits_path(), {})["until"], 2007.0)
+
+    def test_a_back_off_further_off_than_edit_backoff_max_is_not_kept_and_a_near_one_is(self):
+        """An `until` past EDIT_BACKOFF_MAX came from a clock stepped back, or from before the clamp: it holds nothing."""
+        for until, slot in ((1000.0 + C.EDIT_BACKOFF_MAX + 1, True), (1000.0 + C.EDIT_BACKOFF_MAX, False)):
+            C.write_json(C._edits_path(), {"until": until, "at": []})
+            self.assertEqual(C._edit_slot(1000.0), slot)
+            self.assertEqual(C.edit_wait(1000.0), 0 if slot else C.EDIT_BACKOFF_MAX)
+
+    def test_an_edits_file_that_is_not_a_dict_reads_as_empty(self):
+        """Opus read of #1275: a non-dict cards/edits.json raised, and every lane's cards stopped."""
+        C.positions("demo", self.jobs((7, Q, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        for junk in ([1, 2], "x", {"until": "soon", "at": 3}):
+            with open(C._edits_path(), "w") as f:
+                json.dump(junk, f)
+            self.assertEqual(C._edits(), {"until": 0.0, "at": []})
+        self.assertTrue(C.positions("demo", self.jobs((7, Q, T.CHECKING))))
+        self.assertEqual([a[3] for a in self.argvs("cc-slack edit")], ["1.7"])
+        self.assertEqual(len(C.read_json(C._edits_path(), {})["at"]), 1)   # and the file is a dict again
+
+    def test_a_held_last_edit_is_left_held_until_it_goes_and_edit_wait_says_when(self):
+        C.positions("demo", self.jobs((7, Q, T.QUEUED), (8, Q2, T.QUEUED)))
+        self.ledger(7, Q, "1.7")
+        self.ledger(8, Q2, "1.8")
+        self.assertFalse(C.left_held("demo"))
+        with mock.patch.object(C, "EDITS_PER_MIN", 1), mock.patch.object(C.time, "time", return_value=1000.0):
+            self.assertFalse(C.positions("demo", self.jobs((7, Q, T.CHECKING))))   # #7's edit, then #8 left: held
+            self.assertTrue(C.left_held("demo"))
+            self.assertEqual(C.edit_wait(1000.0), 60.0)
+            self.assertEqual(C.edit_wait(1060.0), 0)
+        with mock.patch.object(C, "EDITS_PER_MIN", 1), mock.patch.object(C.time, "time", return_value=1060.0):
+            self.assertTrue(C.positions("demo", self.jobs((7, Q, T.CHECKING))))
+        self.assertFalse(C.left_held("demo"))
+        self.assertEqual(self.argvs("cc-slack edit")[-1][3], "1.8")
+
     def test_a_cards_pass_waits_for_another_holding_the_repos_cards_lock(self):
         import fcntl
         import threading

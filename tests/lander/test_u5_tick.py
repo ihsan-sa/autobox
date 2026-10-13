@@ -269,6 +269,34 @@ class Tick(unittest.TestCase):
         self.tick()                                                               # deployed and settled: no timer
         self.assertFalse(os.path.exists(self.arms))
 
+    def test_a_held_last_card_edit_is_retried_by_the_tick_and_a_running_lane_is_left_to_it(self):
+        """Opus read of #1275: a last edit the cap or a 429 held was never retried once its lane had ended."""
+        calls, held = [], {"demo"}
+        cards = mock.Mock(left_held=lambda r: r in held, positions=lambda r, jobs: calls.append(r))
+        TK.retry_cards(["demo", "other"], cards)
+        self.assertEqual(calls, ["demo"])                       # only the repo with a held edit
+        with mock.patch.object(J, "running", lambda r: 4242):
+            TK.retry_cards(["demo"], cards)
+        self.assertEqual(calls, ["demo"])                       # a running lane hands its queue over itself
+        TK.retry_cards(["demo"], None)
+        self.assertEqual(calls, ["demo"])                       # no cards unit, nothing retried
+
+    def test_a_repo_with_a_queued_card_record_is_ticked_for_it_and_one_without_is_not(self):
+        """A queue that emptied may leave no job, board or .applied to name its repo."""
+        self.assertNotIn("gone", TK.carded_repos())
+        C.write_json(C._queued_path("gone"), {})
+        self.assertIn("gone", TK.carded_repos())
+        self.assertEqual(TK.carded_repos("demo"), ["demo"])
+
+    def test_a_held_last_card_edit_arms_a_tick_for_when_a_slot_frees(self):
+        self.assertEqual(TK.waits("demo"), [])
+        C.write_json(C._queued_path("demo"), {"land:demo:8:queued@x": {"repo": "demo", "pr": 8, "left": "merged"}})
+        C.write_json(C._edits_path(), {"until": 0, "at": [1000.0] * C.EDITS_PER_MIN})
+        with mock.patch.object(TK.time, "time", return_value=1030.0):
+            self.assertEqual(TK.waits("demo"), [30])
+        with mock.patch.object(TK.time, "time", return_value=1100.0):
+            self.assertEqual(TK.waits("demo"), [1])             # a slot is free now: the next tick soon
+
     def test_a_repo_whose_checkout_is_gone_arms_no_timer(self):
         # 10-02/03: a suite fixture's timer re-armed ~77 times a day for a repo its run had deleted
         D.record_applied("demo", self.first)

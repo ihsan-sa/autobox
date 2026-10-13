@@ -2,7 +2,9 @@
 
 A CARD is one message about one job. `positions(repo, jobs)` gives each job in the queue one card saying where it
 stands (`place <i> in the lane`, its stage) and edits it when its place or stage changes, then once more when it leaves;
-those edits are capped box-wide (EDITS_PER_MIN), wait out a Slack 429, and skip a card cc-slack will not edit;
+those posts and edits are capped box-wide (EDITS_PER_MIN), wait out a Slack 429 (Retry-After, at most
+EDIT_BACKOFF_MAX), and skip a card cc-slack will not edit; a last edit held when its lane ended goes on a later tick
+(left_held, tick.retry_cards);
 `waited(job, secs, now)` files one planner request when the tick finds the oldest due job past WAIT_FLAG_SECS, at
 most one per repo (per member, across its lanes) per WAIT_FLAG_SECS; `held(repo, now)` notes a box hold, from which that age counts.
 `landed(job)` turns the PR's #approvals card to landed and says the merge where someone is listening;
@@ -433,8 +435,9 @@ def ledger(pid):
     return "", ""
 
 
-EDITS_PER_MIN = 12    # queued-card edits a minute, box-wide across every lane (10-13: ~10/min from one lane drew 429s)
+EDITS_PER_MIN = 12    # queued-card posts and edits a minute, box-wide across every lane (10-13: ~10/min drew 429s)
 EDIT_BACKOFF = 60     # seconds every card edit waits after a 429 that names no Retry-After
+EDIT_BACKOFF_MAX = 300   # a longer Retry-After is cut to this: a misread number never silences the cards for hours
 NOT_OURS = "not a message this bot posted"
 
 
@@ -442,14 +445,24 @@ def _edits_path():
     return state("cards", "edits.json")
 
 
+def _edits():
+    """cards/edits.json as {"until": secs, "at": [secs]}. Anything else there (not a dict, a field that is not a
+    number) reads as empty, never a raise: a raise here would stop every lane's cards."""
+    d = read_json(_edits_path(), {})
+    try:
+        return {"until": float(d.get("until") or 0), "at": [float(t) for t in d.get("at") or []]}
+    except (AttributeError, TypeError, ValueError):
+        return {"until": 0.0, "at": []}
+
+
 def _edit_slot(now):
-    """May a queued-card edit go now? Not while a 429's back-off runs (`until`), nor once EDITS_PER_MIN edits went out
-    in the last 60 s; else the edit is counted and True. cards/edits.json is shared by every lane, under its own lock."""
+    """May a queued-card post or edit go now? Not while a 429's back-off runs (`until`), nor once EDITS_PER_MIN went
+    out in the last 60 s; else it is counted and True. cards/edits.json is shared by every lane, under its own lock."""
     with _flock("edits.lock"):
-        d = read_json(_edits_path(), {}) or {}
-        if now < float(d.get("until") or 0):
+        d = _edits()
+        if 0 < d["until"] - now <= EDIT_BACKOFF_MAX:   # an `until` further off came from a clock stepped back
             return False
-        recent = [t for t in (d.get("at") or []) if now - float(t) < 60]
+        recent = [t for t in d["at"] if 0 <= now - t < 60]   # a stamp ahead of a clock stepped back is not counted
         if len(recent) >= EDITS_PER_MIN:
             return False
         d["at"] = recent + [now]
@@ -457,13 +470,24 @@ def _edit_slot(now):
         return True
 
 
+def edit_wait(now):
+    """Seconds until _edit_slot could say yes again: the 429 back-off's end, or the oldest edit in a full minute
+    leaving it; 0 when a slot is free now."""
+    d = _edits()
+    recent = sorted(t for t in d["at"] if 0 <= now - t < 60)
+    full = recent[-EDITS_PER_MIN] + 60 - now if len(recent) >= EDITS_PER_MIN else 0
+    wait = d["until"] - now
+    return max(wait if wait <= EDIT_BACKOFF_MAX else 0, full, 0)
+
+
 def _back_off(out, now):
-    """Slack said 429: every card edit waits Retry-After seconds when the answer names it, else EDIT_BACKOFF."""
+    """Slack said 429: every card edit waits Retry-After seconds when the answer names it (at most EDIT_BACKOFF_MAX),
+    else EDIT_BACKOFF."""
     m = re.search(r"retry[-_ ]after\D{0,3}(\d+)", out, re.I)
-    secs = int(m.group(1)) if m else EDIT_BACKOFF
+    secs = min(int(m.group(1)), EDIT_BACKOFF_MAX) if m else EDIT_BACKOFF
     with _flock("edits.lock"):
-        d = read_json(_edits_path(), {}) or {}
-        d["until"] = max(float(d.get("until") or 0), now + secs)
+        d = _edits()
+        d["until"] = max(d["until"], now + secs)
         write_json(_edits_path(), d)
     return secs
 
@@ -501,7 +525,10 @@ def positions(repo, jobs):
     stage changes (10-13: a card that also counted the lane was edited for every PR that joined behind it, and the
     edits drew Slack 429s). A card whose job left the queue gets one last edit saying how, and its record goes.
     Edits go through _edit: one the box-wide cap or a 429 holds stays unrecorded and goes on a later pass; a card
-    cc-slack refuses as not this bot's is marked and never edited again. cards/queued-<repo>.json keeps each card's
+    cc-slack refuses as not this bot's is marked and never edited again. A new card's post takes a slot under the
+    same cap and back-off (Opus read of #1275: posts skipped the cap), and one held is posted on a later pass. A
+    last edit held keeps its words (`left`) in the record; a lane that ends with one held leaves it to the tick
+    (left_held). cards/queued-<repo>.json keeps each card's
     place and stage, so a queue that has not moved sends nothing; it is read and written under the repo's
     own cards lock (lanes/<repo>.cards), so a lane's cards thread still running after its lane lock went (CARDS_WAIT
     ran out) and the next lane's never lose each other's write. No model call. The lane calls it on a thread of its
@@ -518,7 +545,8 @@ def positions(repo, jobs):
 
 
 def _positions(repo, jobs, J):
-    said = read_json(_queued_path(repo), {}) or {}
+    said = read_json(_queued_path(repo), {})
+    said = said if isinstance(said, dict) else {}
     live = [j for j in jobs if j.state not in J.RESTING]
     mine, moved, later = set(), False, False
     for i, job in enumerate(live, 1):
@@ -529,11 +557,14 @@ def _positions(repo, jobs, J):
             continue
         text = (f"[{job.repo}] PR #{job.pr} is queued to land: place {i} in the lane, "
                 f"{STAGE_WORDS.get(job.state, job.state)}.")
-        how = "skip" if last and last.get("noedit") else _edit(pid, text, job.repo, job.pr) if last else ""
+        if last:
+            how = "skip" if last.get("noedit") else _edit(pid, text, job.repo, job.pr)
+        else:
+            how = "post" if _edit_slot(time.time()) else "later"
         if how == "later":
             later = True
             continue
-        if not last:
+        if how == "post":
             post(job, "queued", text, queued_where(job))
         said[pid], moved = {"repo": job.repo, "pr": job.pr, "place": i, "state": job.state,
                             **({"noedit": True} if how == "skip" else {})}, True
@@ -552,6 +583,14 @@ def _positions(repo, jobs, J):
     if moved:   # the lane calls this every pass: an unmoved queue writes nothing either
         write_json(_queued_path(repo), said)
     return not later
+
+
+def left_held(repo):
+    """Does a card of `repo`'s wait on a last edit the cap or a 429 held (its record keeps `left`)? Its lane may have
+    ended since, and nothing then hands its queue over again, so the tick does (tick.retry_cards; Opus read of #1275:
+    a held last edit was never retried)."""
+    said = read_json(_queued_path(repo), {})
+    return isinstance(said, dict) and any(isinstance(v, dict) and v.get("left") for v in said.values())
 
 
 def _waited_path():

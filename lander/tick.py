@@ -30,6 +30,9 @@
             stop; or a lane "box" hold) -> one planner request (cards.waited), once per queuing and at most one per
             repo, or per member across its lanes, per hour; marked sent only once cc-notify took it. A box hold is
             noted (cards.held), and the age counts from the hold's end (the last hold seen, or the job's unheld_at).
+  cards     each repo (those above, and each with a queued-card record) with no lane running whose queued card
+            waits on a last edit the box-wide cap or a Slack 429 held (cards.left_held): cards.positions on its queue, so the edit goes once a slot is free; the rearm
+            step arms a tick for when it will be (cards.edit_wait). A running lane hands its queue over itself.
   deploy    for each repo with a deploy-pending job, under its rest lock (jobs.rest_lock): tip.kick(repo) and a
             deploy.request not yet made — only when those units are installed.
   tip       for each repo the box knows (boards, <repo>.applied, jobs; members and paused repos skipped), under the
@@ -343,6 +346,8 @@ def waits(repo) -> list:
     pending = any(j.state in (T.DEPLOY_PENDING, T.DEPLOYED) for j in jobs)
     if os.path.exists(TP.want_path(repo)) or ((requested or pending) and not os.path.exists(TP.red_path(repo))):
         out.append(TICK_SECS)
+    if C.left_held(repo):   # a held last card edit (retry_cards): a tick once the cap or the 429's back-off lets it go
+        out.append(max(int(C.edit_wait(time.time())), 1))
     return out
 
 
@@ -581,6 +586,28 @@ def flag_waited(repos, cards, now=None) -> list:
     return lines
 
 
+def carded_repos(repo="") -> list:
+    """Each repo with a queued-card record (cards/queued-<repo>.json), or just `repo`: one whose queue emptied may have
+    no job, board or .applied left to name it, and still wait on a held last edit."""
+    if repo:
+        return [repo]
+    names = [os.path.basename(p)[len("queued-"):-len(".json")] for p in glob.glob(C.state("cards", "queued-*.json"))]
+    return sorted(n for n in names if J.REPO_RE.fullmatch(n))
+
+
+def retry_cards(repos, cards) -> None:
+    """A queued card's last edit that the cap or a 429 held goes again (cards.left_held): its lane may have ended with
+    it held, and an empty queue starts no lane to hand it over (Opus read of #1275). A repo whose lane runs is left to
+    the lane. `cards` is the installed cards unit; with none, nothing is retried. Nothing is said: the card is the
+    message, and queue.log has the edit's own `unsaid` line when it is held again."""
+    for r in (repos if cards else []):
+        try:
+            if cards.left_held(r) and not J.running(r):
+                cards.positions(r, J.lane_jobs(r))
+        except Exception as e:  # noqa: BLE001 — as flag_waited: one repo's fault is logged, never the tick's end
+            E.log("tick-fault", r, None, f"cards: {type(e).__name__}: {e}")
+
+
 def parked_behind(job, jobs):
     """Brief (planning seat, 10-13): "A parked job's waited line should name what it's parked on, or not fire while its
     blocker is open" (#922, parked on #1128, was flagged as "Nothing stopped it"). The due job in `jobs` that queued
@@ -626,10 +653,11 @@ def cmd_tick(argv) -> int:
         lines += retry_deploys(repos)
     units, known = L.load_units(), known_repos(repo)
     lines += flag_waited(repos, units.get("cards"))
+    retry_cards(list(dict.fromkeys(repos + known + carded_repos(repo))), units.get("cards"))
     for r in known:
         lines += tip_and_deploy(r, units)
         lines += nightly(r, units)
-    lines += rearm(list(dict.fromkeys(repos + known)))
+    lines += rearm(list(dict.fromkeys(repos + known + carded_repos(repo))))
     for ln in lines:
         print(ln)
     return 0
