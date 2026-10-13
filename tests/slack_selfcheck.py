@@ -1709,9 +1709,10 @@ def run_selfcheck():
             dmQ.relay_permission("box", {"tool_name": "Bash", "description": "box's", "input_preview": "x", "request_id": "NOT-A-RID"})
             norid_got = gotQ[n_got:]
             # -- THE OUTCOME IS A REACTION ON THE CARD (row a-permission-answer-is-a-reaction-in-threads) --
-            n_rx = len(rxM)
+            n_rx, n_said = len(rxM), len(saidQ)
             dmQ.on_event(msgM("q.3", "UOWNER", "yes hjkmn fix", chan="CTHREADS"))
             rx_fix, got_fix = rxM[n_rx:], [g for g in gotQ if g[1].get("request_id") == "hjkmn"]
+            said_ofix = [x for x in saidQ[n_said:] if x[0] == "CTHREADS" and "hjkmn" in x[1]]
             n_rx = len(rxM); cli_no = dmQ.answer_permission("pqrst", "no", CTL); rx_no, said_no = rxM[n_rx:], saidQ[-1]
             n_rx = len(rxM); cli_fix = dmQ.answer_permission("vwxyz", "yes", CTL, fix=True); rx_cfix, said_fix = rxM[n_rx:], saidQ[-1]
             dmQ.relay_permission(f"{CTL}/t1", {"tool_name": "Edit", "description": "plain yes", "input_preview": "x", "request_id": "rstvw"})
@@ -1720,16 +1721,17 @@ def run_selfcheck():
             # Each case raises its own card. Kept: the owner's fix and the seat's fix on a member's WebFetch/WebSearch
             # card. Suppressed: a plain yes, a fix on a member's Bash card, a fix on a WebFetch card from a repo that
             # is no member workspace.
-            webQ, _runW = [], EFFECTS.run_impl
+            webQ, _runW, web_rx = [], EFFECTS.run_impl, {}
             EFFECTS.run_impl = lambda cmd, **kw: webQ.append(cmd) or type("R", (), {"returncode": 0, "stdout": "granted", "stderr": ""})()
             try:
                 def web_case(target, tool, rid, answer, seat=False):
                     dmQ.relay_permission(target, {"tool_name": tool, "description": "look it up", "input_preview": "x", "request_id": rid})
-                    n_w, n_s = len(webQ), len(saidQ)
+                    n_w, n_s, n_r = len(webQ), len(saidQ), len(rxM)
                     if seat:
                         dmQ.answer_permission(rid, "yes", CTL, fix=answer.endswith("fix"))
                     else:
                         dmQ.on_event(msgM("w." + rid, "UOWNER", answer.format(rid), chan="CTHREADS"))
+                    web_rx[rid] = ([r[2] for r in rxM[n_r:]], [x[1] for x in saidQ[n_s:]])
                     return [c[1:] for c in webQ[n_w:]], [x[1] for x in saidQ[n_s:] if x[1].startswith("🌐")]
                 web_owner = web_case("mem1/lessons", "WebFetch", "bcdfg", "yes {} fix")
                 web_seat = web_case("mem1", "WebSearch", "cdfgh", "yes fix", seat=True)
@@ -1955,19 +1957,28 @@ def run_selfcheck():
               and "main approve it" in mem_got[0][1]["content"] and "@main" not in mem_got[0][1]["content"])   # perm_field defanged the @
         check("…a prompt with no answerable id still reaches the seat, saying so",
               len(norid_got) == 1 and "no id anyone can answer by" in norid_got[0][1]["content"])
-        check("the outcome is a reaction ON THE CARD (owner, 2026-09-10): `yes <id> fix` in the lane delivers the allow, "
-              "✅ on his own line as before, and ✅ + ⚙️ on the card — approved this time AND the capability is being "
-              "given for good",
+        check("the outcome is a reaction ON THE CARD (owner, 2026-09-10): `yes <id> fix` on a Bash card delivers the allow, "
+              "✅ on his own line and on the card — but NO ⚙️, and the card's thread says the fix wrote nothing lasting, "
+              "because nothing is written for a Bash call (2026-10-04: 'given for good' four times, and every next "
+              "variant of the curl/gh call raised a new card)",
               got_fix and got_fix[-1][1]["behavior"] == "allow"
               and ("CTHREADS", "q.3", "white_check_mark") in rx_fix
               and ("CTHREADS", orch_ask.get("card"), "white_check_mark") in rx_fix
-              and ("CTHREADS", orch_ask.get("card"), "gear") in rx_fix)
+              and not [r for r in rx_fix if r[2] == "gear"]
+              and len(said_ofix) == 1 and "nothing lasting" in said_ofix[0][1] and "given for good" not in said_ofix[0][1])
         check("…`cc-slack permission <id> no` from the seat puts ❌ on the card and says *denied* in its thread",
               cli_no.get("ok") and [r for r in rx_no if r[2] == "x"] and not [r for r in rx_no if r[2] == "gear"]
               and "*denied*" in said_no[1])
-        check("…`cc-slack permission <id> yes fix` puts ✅ + ⚙️ on the card and says so in the thread",
-              cli_fix.get("ok") and [r for r in rx_cfix if r[2] == "white_check_mark"] and [r for r in rx_cfix if r[2] == "gear"]
-              and "given for good" in said_fix[1])
+        check("…`cc-slack permission <id> yes fix` on a Bash card is ✅ alone, and the thread says it is this once, "
+              "never 'given for good'",
+              cli_fix.get("ok") and [r for r in rx_cfix if r[2] == "white_check_mark"] and not [r for r in rx_cfix if r[2] == "gear"]
+              and "nothing lasting" in said_fix[1] and "given for good" not in said_fix[1])
+        check("…and a fix that does write a grant — a member's web card, the seat's or the owner's — still puts ⚙️ on "
+              "the card, and the seat's thread line says given for good; a fix on a member's Bash card does neither",
+              "gear" in web_rx["cdfgh"][0] and "gear" in web_rx["bcdfg"][0]
+              and any("given for good" in x for x in web_rx["cdfgh"][1])
+              and "gear" not in web_rx["fghjk"][0] and any("nothing lasting" in x for x in web_rx["fghjk"][1])
+              and not any("given for good" in x for x in web_rx["fghjk"][1]))
         check("…and a plain `yes <id>` is ✅ alone: no ⚙️ unless somebody said fix",
               [r for r in rx_yes if r[2] == "white_check_mark"] and not [r for r in rx_yes if r[2] == "gear"])
         check("a fix on a member workspace's WebFetch or WebSearch card grants THAT workspace the web — the owner's in "
