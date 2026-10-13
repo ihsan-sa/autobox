@@ -2563,10 +2563,45 @@ class Ratchet(unittest.TestCase):
             self.assertEqual(RUN.judge(chk(name="c"), self.H, self.B, runner=run).status, want, ran)
 
     def test_ran_reads_passes_and_crashes(self):
-        self.assertEqual(RUN.ran("✓ a\n✓ b\n✗ c\n"), {"passes": 2, "crash": False})
-        self.assertEqual(RUN.ran("✓ a\n== 7 passed, 1 failed ==\n"), {"passes": 7, "crash": False})
+        self.assertEqual(RUN.ran("✓ a\n✓ b\n✗ c\n"), {"passes": 2, "failed": 1, "crash": False})
+        self.assertEqual(RUN.ran("✓ a\n== 7 passed, 1 failed ==\n"), {"passes": 7, "failed": 1, "crash": False})
         self.assertEqual(RUN.ran("✓ a\nTraceback (most recent call last):\n")["crash"], True)
         self.assertEqual(RUN.ran("✓ a\nSegmentation fault (core dumped)\n")["crash"], True)
+        # Opus delta read, 10-13: an indented Traceback and bash's own kill line are crashes; a case naming one is not
+        self.assertEqual(RUN.ran("✓ a\n    Traceback (most recent call last):\n")["crash"], True)
+        self.assertEqual(RUN.ran("✓ a\n./t.sh: line 1: 123 Killed    python3 x\n")["crash"], True)
+        self.assertEqual(RUN.ran("✓ a\n✓ a Killed process is reaped\n")["crash"], False)
+        # one case failing twice is two failures
+        self.assertEqual(RUN.ran("FAIL a\nFAIL a\n")["failed"], 2)
+
+    def test_a_head_with_more_failures_than_the_base_holds(self):
+        # Opus delta read, 10-13: "hold when the head has more failing lines than the base, including no-pass-line
+        # suites and an added passing test masking a lost one"
+        fails = {self.H: ["FAIL a"], self.B: ["FAIL a"]}
+        for ran, want in (({self.H: {"passes": 0, "failed": 2}, self.B: {"passes": 0, "failed": 1}}, RUN.BLOCKED),
+                          ({self.H: {"passes": 10, "failed": 2}, self.B: {"passes": 9, "failed": 1}}, RUN.BLOCKED),
+                          ({self.H: {"passes": 9, "failed": 1}, self.B: {"passes": 9, "failed": 2}}, T.PASSED),
+                          ({self.H: {"passes": 9, "failed": 1}, self.B: {"passes": 9, "failed": 1}}, T.PASSED)):
+            run, _ = self.runner(fails, ran=ran)
+            self.assertEqual(RUN.judge(chk(name="c"), self.H, self.B, runner=run).status, want, ran)
+
+    def test_run_plan_treats_the_member_wall_the_door_and_security_toml_paths_as_security(self):
+        # perms' read of #1305, 10-13: "treat LANDING-security.toml paths plus those two as security and never
+        # ratchet them"
+        paths = {"wall": "core/bin/cc", "member": "core/bin/cc-member-v2", "door": "bin-private/box-cloudflare",
+                 "unit": "config/cloudflare/w.js", "gate": "core/bin/guard", "plain": "core/bin/plain",
+                 "other": "bin-private/box-move"}
+        m = M.Manifest(checks={n: chk(name=n, paths=[p]) for n, p in paths.items()}, cwd={n: "" for n in paths},
+                       policy=T.Policy(gate_first=["core/bin/guard"], security_review=["config/cloudflare/**"]))
+        got = {}
+
+        def judge(c, *a, security=False, **kw):
+            got[c.name] = security
+            return RUN.Outcome(c.name, T.PASSED, "")
+        with mock.patch.object(RUN, "judge", judge), mock.patch.object(M, "load", return_value=M.Manifest()):
+            RUN.run_plan(".", m, T.Plan(checks=list(paths)), ["README.md"], self.H, self.B)
+        self.assertEqual(got, {"wall": True, "member": True, "door": True, "unit": True, "gate": True,
+                               "plain": False, "other": False})
 
     def test_a_stored_base_red_whose_rerun_gives_no_answer_holds_as_main_red(self):
         # Opus and perms, 10-13: "fall back to the stored base red and hold as main-red, never hand the PR back"
@@ -2644,12 +2679,12 @@ class Ratchet(unittest.TestCase):
 class FailIds(unittest.TestCase):
     def test_a_suites_failing_lines_with_their_scratch_blanked(self):
         text = "\n".join([
-            "  ✓ fine", "  ✗ cc-context reads /tmp/tmp.Xy12ab/state in 3.2s", "FAIL: race at abcdef0123456789",
+            "  ✓ fine", "  ✗ cc-context reads /tmp/tmp.Xy12ab/state", "FAIL: race at " + "abcdef0123" * 4,
             "FAILED tests/x.py::test_a - AssertionError: 1 != 2", "not ok 7 - tap case", "Traceback (most recent call",
             "== result: 3 passed, 4 failed ==", "ok 8 - tap fine"])
         self.assertEqual(RUN.fail_ids(text), sorted([
-            "✗ cc-context reads /tmp/… in N s", "FAIL: race at …", "FAILED tests/x.py::test_a", "not tap case"]))
-        same = RUN.fail_ids("  ✗ cc-context reads /tmp/tmp.Qq99zz/state in 41.0s")
+            "✗ cc-context reads /tmp/…", "FAIL: race at …", "FAILED tests/x.py::test_a", "not tap case"]))
+        same = RUN.fail_ids("  ✗ cc-context reads /tmp/tmp.Qq99zz/state")
         self.assertTrue(set(same) <= set(RUN.fail_ids(text)))   # another run's scratch is the same case
         self.assertEqual(RUN.fail_ids("exit 1 and nothing to say\nTraceback x"), [])
         self.assertIsNone(RUN.fail_ids("\n".join(f"✗ case {i}" for i in range(RUN.FAILS_CAP + 1))))
@@ -2657,6 +2692,12 @@ class FailIds(unittest.TestCase):
         self.assertEqual(RUN.fail_ids("ERROR: port 4123 in use\nERROR connecting to db\n"
                                       "ERROR tests/y.py::test_b - OSError\nERROR tests/z.py\n"),
                          ["ERROR tests/y.py::test_b", "ERROR tests/z.py"])
+        # ...and in unittest's form, so an error moving between tests is a new id (Opus delta read, 10-13)
+        self.assertEqual(RUN.fail_ids("ERROR: test_q (m.C)\nERROR: test_q failed to start\n"),
+                         ["ERROR: test_q (m.C)"])
+        # only a scratch path and a full sha are blanked: a duration or a short id is part of the case (same read)
+        self.assertNotEqual(RUN.fail_ids("✗ done after 900 s"), RUN.fail_ids("✗ done after 31 s"))
+        self.assertNotEqual(RUN.fail_ids("✗ job 12345678"), RUN.fail_ids("✗ job 87654321"))
 
 
 if __name__ == "__main__":

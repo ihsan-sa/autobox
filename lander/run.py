@@ -45,23 +45,24 @@ mount that is not there, a tree that did not reproduce. failed: anything else.
 
 JUDGE (a red, per check): the same check on the BASE tree — main's own record of it on exactly that tree when the
 tip run made one (health.py): green there is no base red, and red there stands as `blocked-by-main` with no run when
-the ratchet cannot apply (a check that guards a gate-first path or that the change touches); else the lane's shared
+the ratchet cannot apply (a check that guards a security path or that the change touches); else the lane's shared
 record when there is one — red there too
 is `blocked-by-main` (main is red, the diff is not blamed) — unless THE RATCHET lets it pass: every case the head's run
-names failing (fail_ids: its ✗/✘, FAIL, FAILED/ERROR or not ok lines, scratch paths, shas and durations blanked) fails
-on the base too, the head ran as far (no fewer passes, no crash the base lacks), both ran in the same place, and the
-base's red is a run made now, in this judge() (a shared one that would let it pass is run again first, and when that
-re-run is unrunnable the shared red holds as main-red), then it passes with a `ratchet` note and Outcome.sets naming
-both sets (no_new_reds; never for a check that guards a gate-first path or that the change touches, and never for a head
-red that names no case, where the exit code is all there is); a check the base does not define, or whose run file the
-base lacks, has no base run and its red is the diff's; a red run under load, on either tree, gets ONE diagnostic rerun
-alone (every slot held), and only a base run that stands is shared; a head red that is not main's is run ONCE more on
-the same tree whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except, when it was
-not loaded, a check that guards a gate-first path or that the change touches, whose first red stands; green the second
-time passes with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check); a red
-whose every red line matches a live quarantine row passes with a `quarantined` note — never for a check that guards a
-gate-first path, and never when the change touches the check itself; what is left is `failed`, and goes to the failures
-ledger once (records.record_red).
+names failing (fail_ids: its ✗/✘, FAIL, FAILED/ERROR or not ok lines, scratch paths and full shas blanked) fails
+on the base too, the head ran as far (no fewer passes, no more failures, no crash the base lacks), both ran in the
+same place, and the base's red is a run made now, in this judge() (a shared one that would let it pass is run again
+first, and when that re-run is unrunnable the shared red holds as main-red), then it passes with a `ratchet` note and
+Outcome.sets naming both sets (no_new_reds; never for a check that guards a security path — gate_first,
+LANDING-security.toml's paths or SECURITY_PATHS — or that the change touches, and never for a head red that names no
+case, where the exit code is all there is); a check the base does not define, or whose run file the base lacks, has no
+base run and its red is the diff's; a red run under load, on either tree, gets ONE diagnostic rerun alone (every slot
+held), and only a base run that stands is shared; a head red that is not main's is run ONCE more on the same tree
+whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except, when it was not loaded,
+a check that guards a security path or that the change touches, whose first red stands; green the second time passes
+with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check); a red whose every
+red line matches a live quarantine row passes with a `quarantined` note — never for a check that guards a security
+path, and never when the change touches the check itself; what is left is `failed`, and goes to the failures ledger
+once (records.record_red).
 
 A RED KEEPS ITS LOG. A failed run's output (read_log's bound) is copied to <state>/logs/ (records.state_dir, never
 /tmp) before run_dir goes, at most LOG_KEEP files and none older than LOG_DAYS; the result's extra carries `log` (the
@@ -270,25 +271,30 @@ def red_lines(text: str) -> list:
 # ERROR id (an ERROR line only in pytest's summary form, a .py path or a node id: a log's ERROR line is no case), TAP's
 # not ok — read from the whole output. A run's own scratch (a /tmp path, a sha, a duration) is
 # blanked so the same case is the same id on two trees; anything else that varies makes a new id, which holds.
-FAIL_ID_RE = re.compile(r"^\s*(?:[✗✘]|FAIL(?:ED)?\b:?|ERROR\s(?=\S*(?:\.py\b|::))|not ok\b(?:\s*\d+\s*-?)?)"
+FAIL_ID_RE = re.compile(r"^\s*(?:[✗✘]|FAIL(?:ED)?\b:?|ERROR\s(?=\S*(?:\.py\b|::))|ERROR:\s(?=\w+ \([\w.]+\)$)"
+                        r"|not ok\b(?:\s*\d+\s*-?)?)"
                         r"\s*(.*?)\s*$")
 FAILS_CAP = 500   # more failing lines than this and the set is not trusted: fail_ids says None, and the red holds
-SCRATCH_RES = ((re.compile(r"(?:/tmp|/var/tmp)/[^\s:'\"),]*"), "/tmp/…"), (re.compile(r"\b[0-9a-f]{8,40}\b"), "…"),
-               (re.compile(r"\b\d+(?:\.\d+)?\s?(?:ms|s|secs?|min)\b"), "N s"))
+# Only a scratch path and a full 40-char sha are blanked: a duration or a short hex run is part of the id, because
+# blanking it made 'after 900 s' the same case as 'after 31 s' (Opus read of #1305, 10-13)
+SCRATCH_RES = ((re.compile(r"(?:/tmp|/var/tmp)/[^\s:'\"),]*"), "/tmp/…"), (re.compile(r"\b[0-9a-f]{40}\b"), "…"))
 
 
 # ...and how far a run got: its pass lines or its last `N passed`, and whether it crashed or was cut short. A head that
 # ran less than the base, or crashed where the base did not, hides its own reds behind main's (Opus and perms, 10-13)
 PASSED_N_RE = re.compile(r"\b(\d+) passed\b")
-CRASH_RE = re.compile(r"^(?:Traceback \(most recent call last\)|INTERNALERROR>)|Segmentation fault|core dumped|"
-                      r"^(?:Killed|Aborted)\b", re.M)
+CRASH_RE = re.compile(r"^\s*(?:Traceback \(most recent call last\)|INTERNALERROR>)|Segmentation fault|core dumped|"
+                      r"^\s*(?:Killed|Aborted)\b|\bline \d+:\s+\d+ (?:Killed|Aborted)\b", re.M)
 
 
 def ran(text: str) -> dict:
-    """-> {"passes": its last `N passed`, else its count of pass lines; "crash": a crash or abort marker in it}."""
+    """-> {"passes": its last `N passed`, else its count of pass lines; "failed": its last `N failed`, else its count of
+    failing lines (one case failing twice is two); "crash": a crash or abort marker in it}."""
     n = PASSED_N_RE.findall(text)
     passes = int(n[-1]) if n else sum(1 for ln in text.splitlines() if PASS_RE.search(ln))
-    return {"passes": passes, "crash": bool(CRASH_RE.search(text))}
+    f = FAILED_RE.findall(text)
+    failed = int(f[-1]) if f else sum(1 for ln in text.splitlines() if FAIL_ID_RE.match(ln) and not PASS_RE.search(ln))
+    return {"passes": passes, "failed": failed, "crash": bool(CRASH_RE.search(text))}
 
 
 def fail_ids(text: str):
@@ -778,12 +784,14 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
 def no_new_reds(head: T.Result, base: T.Result) -> bool:
     """THE RATCHET: True when both reds ran in the same place (the box, a runner, a member) and every case the head's
     run names failing the base's names too, and the head ran as far as the base: no fewer passes, and no crash or abort
-    the base lacks (a head cut short names fewer reds only because it ran less). A head run that names none falls back
-    to the exit code, which says only that both are red, so it holds; so does a set fail_ids could not trust (None)."""
+    the base lacks (a head cut short names fewer reds only because it ran less), and no more failures than the base (a
+    case failing twice, or a lost test masked by an added passing one). A head run that names none falls back to the
+    exit code, which says only that both are red, so it holds; so does a set fail_ids could not trust (None)."""
     pr, main = head.extra.get("fails"), base.extra.get("fails")
     same = head.runner.split(":")[0] == base.runner.split(":")[0]
     went = (head.extra.get("passes") or 0) >= (base.extra.get("passes") or 0) and \
-        not (head.extra.get("crash") and not base.extra.get("crash"))
+        not (head.extra.get("crash") and not base.extra.get("crash")) and \
+        (head.extra.get("failed") or 0) <= (base.extra.get("failed") or 0)
     return same and went and bool(pr) and main is not None and set(pr) <= set(main)
 
 
@@ -893,7 +901,8 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
             continue
         own = [p for p in c.paths if "*" not in p] + [m.cwd.get(name, "") + M.run_file(c.run)]
         # perms' terms (#1234): manifest-widen's "red blocks as a fault, never advisory", so it is never quarantined
-        security = name == M.BUILTIN or any(M.match(m.policy.gate_first, p) for p in own if p)
+        security = name == M.BUILTIN or any(M.match(list(m.policy.gate_first) + list(m.policy.security_review) +
+                                                     list(SECURITY_PATHS), p) for p in own if p)
         touched = any(m.owns(name, f) for f in files) if name in m.checks else False
         where = "box" if caged else choose_where(c, member, box_only=box_only, runners=runners)
         if gone and where == "laptop" and "box" in c.where:
@@ -907,6 +916,12 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
                           **({"express": True} if express else {}), **({"lane": True} if lane else {}))
         gone = gone or laptop_gone({name: out[name]})
     return out
+
+
+# A SECURITY CHECK guards a path no red may slip past: gate_first, tests/LANDING-security.toml's paths, and these —
+# the member wall (core/bin/cc, cc-member-v2) and the Cloudflare door. perms' read of #1305, 10-13: "treat
+# LANDING-security.toml paths plus those two as security and never ratchet them".
+SECURITY_PATHS = ("core/bin/cc", "core/bin/cc-member-v2", "bin-private/*-cloudflare")
 
 
 def runs_on_base(repo_root: str, base_tree: str, base_m, name: str) -> bool:
