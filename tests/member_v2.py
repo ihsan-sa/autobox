@@ -1,5 +1,6 @@
 """Called by cc-sandbox selfcheck through cc-member-v2; all effects use fixtures."""
 import errno
+import fcntl
 import grp
 import hashlib
 import json
@@ -35,6 +36,10 @@ def selfcheck(m):
     # nothing a live sandbox holds. The cases after "inventory control" prove both halves.
     scratch = Path(os.environ["HOME"]) / ".cc/member-v2-selfcheck"
     scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # ONE SELFCHECK AT A TIME ON THE BOX. Its non-dumpable cases plant a live task the walk cannot read, which must
+    # not be called clear, so a second selfcheck's inventory refused on it whenever two landings ran this suite
+    # together (2026-10-02). The lock is released when the process exits.
+    fcntl.flock(os.open(scratch / "lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600), fcntl.LOCK_EX)
     with tempfile.TemporaryDirectory(prefix="cc-member-v2-", dir=scratch) as temp:
         root = Path(temp).resolve()
         h, v = root / "home", root / "vault"
@@ -315,8 +320,12 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                         check(refused, "older live namespace exposes V: refused")
                     finally:
                         older.communicate(b"stop\n", timeout=GUARD)
-                m.inventory(v)
-                check(True, "inventory control: provisioning allowed after exposed namespace exits")
+                try:
+                    m.inventory(v)
+                    refused = ""
+                except ValueError as exc:
+                    refused = str(exc)
+                check(not refused, "inventory control: provisioning allowed after exposed namespace exits", refused)
                 # …AND UNDER V IS EXPOSURE TOO, not only V and above. The registry decides a task's
                 # authority and the broker re-reads it under the lock; the state directory is the lock
                 # and the status log. A namespace holding either is refused like one holding V. The
@@ -404,7 +413,7 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                 finally:
                     gone.wait()
                 # A LIVE PROCESS THAT WILL NOT BE READ IS NOT SKIPPED. A process that joins a sandbox's namespaces
-                # (nsenter -U -m) and calls prctl(PR_SET_DUMPABLE, 0) answers EACCES on ns/mnt and fd/ while its
+                # (nsenter -U -m) and calls prctl(PR_SET_DUMPABLE, 0) answers EACCES (or "") on ns/mnt and fd/ while its
                 # mountinfo still reads, and the walk used to take that for a gone pid. A thread-group leader that
                 # exits leaves its other threads live, holding the descriptors, behind a zombie /proc/<pid>. Each
                 # case builds its own sandbox and holds an inherited descriptor on V unless it says otherwise.
@@ -488,6 +497,125 @@ mkdir /local/before; mv /local/before /local/after; test -d /local/after
                       and "descriptor reaching V" in refused and not control,
                       "a live thread whose leader exited is walked: its descriptor on V refuses, one without passes",
                       f"{shape}; {refused or 'allowed'}; control: {control_shape}; {control or 'allowed'}")
+                # A HOLD OUTSIDE fd/, AND ONE THAT OUTRUNS THE WALK. Each case is its own sandbox shaped as a session of
+                # this task (it binds the task's repo leaf, so it is a candidate), handed a descriptor on V that it turns
+                # into another shape and then closes, and each kept shape has a control that turns it back before it
+                # says ready: a working directory, a mapped file, a descriptor in flight in a unix socket's queue, an
+                # io_uring's registered file, and a fork-and-exit chain that carries the descriptor.
+                plant = ("import ctypes,mmap,os,socket,sys\nmode,fd=sys.argv[1],int(sys.argv[2])\nkeep=[]\n"
+                         "libc=ctypes.CDLL(None,use_errno=True); libc.syscall.restype=ctypes.c_long\n"
+                         "if mode.startswith('cwd'):\n os.fchdir(fd)\n if mode=='cwd-back': os.chdir('/')\n"
+                         "if mode.startswith('map'):\n f=os.open('registry/task.json',os.O_RDONLY,dir_fd=fd)\n"
+                         " keep.append(mmap.mmap(f,0,prot=mmap.PROT_READ)); os.close(f)\n"
+                         " if mode=='map-back': keep.pop().close()\n"
+                         "if mode.startswith('listen'):\n c=socket.socket(socket.AF_UNIX)\n"
+                         " c.connect('\\0cc-member-v2-selfcheck-listen'); socket.send_fds(c,[b'x'],[fd])\n"
+                         " if mode=='listen-back': c.recv(1)\n c.close()\n"
+                         "if mode.startswith(('flight','dgram')):\n dgram=mode.startswith('dgram')\n"
+                         " a,b=socket.socketpair(socket.AF_UNIX,socket.SOCK_DGRAM if dgram else socket.SOCK_STREAM)\n"
+                         " keep+=[a,b]; socket.send_fds(a,[b'' if dgram else b'x'],[fd])\n"
+                         " if mode.endswith('-back'): [os.close(x) for x in socket.recv_fds(b,1,1)[1]]\n"
+                         "if mode.startswith('ring'):\n r=libc.syscall(425,4,ctypes.create_string_buffer(120))\n"
+                         " r>=0 or sys.exit('io_uring_setup')\n"
+                         " mode=='ring-back' or libc.syscall(427,r,2,(ctypes.c_int*1)(fd),1)==0 or sys.exit('register')\n"
+                         "if mode=='chain' and os.fork()==0:\n os.close(1); os.close(2)\n"
+                         " while True:\n  if os.fork(): os._exit(0)\n"
+                         "os.close(fd); sys.stdout.write('ready\\n'); sys.stdout.flush(); sys.stdin.readline()\n")
+
+                def planted(mode, target=v, leaf=("--bind", launcher.data / "repo", "/repo")):
+                    vfd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        # --die-with-parent: the chain outlives its parent, and bwrap's init would wait on it forever.
+                        argv = [*minimal, "--die-with-parent", *leaf, "--", "/usr/bin/python3", "-c", plant, mode, vfd]
+                        with sp.Popen([str(x) for x in argv],
+                                      stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, pass_fds=(vfd,)) as box:
+                            try:
+                                m.require(box.stdout.readline() == b"ready\n", f"{mode} case did not start")
+                                try:
+                                    m.inventory(v)
+                                    return ""
+                                except ValueError as exc:
+                                    return str(exc)
+                            finally:
+                                box.communicate(b"stop\n", timeout=GUARD)
+                    finally:
+                        os.close(vfd)
+                for mode, refusal in (("cwd", "working directory reaching V"), ("map", "mapping reaching V"),
+                                      ("flight", "descriptor in flight"), ("dgram", "descriptor in flight")):
+                    kept, control = planted(mode), planted(f"{mode}-back")
+                    check(refusal in kept and not control,
+                          f"a sandbox holding V only as its {mode} shape refuses; one that let it go does not",
+                          f"{kept or 'allowed'}; control: {control or 'allowed'}")
+                # A PENDING CONNECTION CARRIES A DESCRIPTOR TOO. A session connects to an abstract listener in a sandbox
+                # that cannot name V, sends V's descriptor on the connection nobody has accepted, and closes its end:
+                # the descriptor sits in the listener's accept queue. The control's listener accepts and drops it.
+                listen = ("import os,socket,sys\nl=socket.socket(socket.AF_UNIX)\n"
+                          "l.bind('\\0cc-member-v2-selfcheck-listen'); l.listen()\nprint('ready',flush=True)\n"
+                          "if sys.argv[1]=='back':\n s,_=l.accept(); [os.close(x) for x in socket.recv_fds(s,1,1)[1]]\n"
+                          " s.send(b'k')\nsys.stdin.readline()\n")
+                pending = {}
+                for back in ("", "back"):
+                    with sp.Popen([str(x) for x in [*minimal, "--die-with-parent", "--", "/usr/bin/python3", "-c",
+                                                    listen, back or "kept"]],
+                                  stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE) as listener:
+                        try:
+                            m.require(listener.stdout.readline() == b"ready\n", "listener case did not start")
+                            pending[back] = planted("listen-back" if back else "listen")
+                        finally:
+                            listener.communicate(b"stop\n", timeout=GUARD)
+                check("descriptor in flight" in pending[""] and not pending["back"],
+                      "V's descriptor on an unaccepted connection to another sandbox's listener refuses; "
+                      "one the listener accepted and dropped does not",
+                      f"{pending[''] or 'allowed'}; control: {pending['back'] or 'allowed'}")
+                # IN FLIGHT ANYWHERE A SESSION CAN REACH. A session shares the host's network namespace, so it can queue
+                # V's descriptor in a socket of a sandbox that cannot name V and close its own copy; and a socket in a
+                # network namespace of its own is read through its holder all the same.
+                for name, leaf in (("a sandbox that cannot name V", ()),
+                                   ("a session in a network namespace of its own",
+                                    ("--unshare-net", "--bind", launcher.data / "repo", "/repo"))):
+                    kept, control = planted("flight", leaf=leaf), planted("flight-back", leaf=leaf)
+                    check("descriptor in flight" in kept and not control,
+                          f"{name}, holding V only in flight, refuses; one that received it back does not",
+                          f"{kept or 'allowed'}; control: {control or 'allowed'}")
+                # A COUNT THE KERNEL LEAVES OUT IS NOT ZERO. An io_uring prints UserFiles only when it wins its ring's
+                # lock, which no case can hold still, so the reader is made to miss it, and scm_fds likewise.
+                check(m.counted("pos:\t0\nscm_fds: 2\n", "scm_fds") == 2 and m.counted("UserFiles:\t0\n", "UserFiles") == 0
+                      and m.counted("pos:\t0\n", "UserFiles") is None, "fdinfo counts read, and a missing one reads as None")
+                real = m.counted
+                for key, mode, refusal in (("scm_fds", "flight-back", "unix socket the walk cannot read"),
+                                           ("UserFiles", "ring-back", "io_uring the walk cannot read")):
+                    if mode == "ring-back" and Path("/proc/sys/kernel/io_uring_disabled").read_text().strip() != "0":
+                        check(True, "io_uring is off for this UID, so an unreadable ring cannot occur")
+                        continue
+                    m.counted = lambda info, k, key=key: None if k == key else real(info, k)
+                    try:
+                        unread = planted(mode)
+                    finally:
+                        m.counted = real
+                    check(refusal in unread and "did not settle" in unread,
+                          f"a {key} line the walk cannot read is not clear", unread or "allowed")
+                if Path("/proc/sys/kernel/io_uring_disabled").read_text().strip() == "0":
+                    kept, control = planted("ring"), planted("ring-back")
+                    check("io_uring with registered files" in kept and not control,
+                          "a sandbox holding V only as an io_uring registered file refuses; an empty ring does not",
+                          f"{kept or 'allowed'}; control: {control or 'allowed'}")
+                else:
+                    check(True, "io_uring is off for this UID, so a ring cannot hold V")
+                # The chain never stops while the sandbox lives, so the walk either reads a live link holding V or
+                # never settles; both are refusals. The control is the same walk once that sandbox has gone.
+                kept = planted("chain")
+                try:
+                    m.inventory(v)
+                    control = ""
+                except ValueError as exc:
+                    control = str(exc)
+                check(("did not settle" in kept or "descriptor reaching V" in kept) and not control,
+                      "a fork-and-exit chain carrying a descriptor on V refuses; the walk clears once it is gone",
+                      f"{kept or 'allowed'}; control: {control or 'allowed'}")
+                # The suppressed side of churn: the same chain in a sandbox that cannot name V and holds nothing of it,
+                # as a lander's or worker's gates do, is read in every pass but does not unsettle one.
+                busy = planted("chain", target=Path("/usr"), leaf=())
+                check(not busy, "a fork-and-exit chain in a sandbox that cannot reach V does not hold the walk", busy)
                 # The suppressed side: a non-dumpable process outside any sandbox (ssh-agent, gpg-agent) sees V
                 # as this launcher does and is not inspected, so it must not refuse the box.
                 with sp.Popen(["/usr/bin/python3", "-c", hold, "nodump"], stdin=sp.PIPE, stdout=sp.PIPE) as agent:

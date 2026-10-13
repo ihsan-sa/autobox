@@ -23,7 +23,16 @@ def selfcheck(m):
     # enforcement with a deadline of its own, 300 times shorter than the pause it cuts off; every other case proves
     # behaviour, so its bound only stops a hang.
     m.WALL = 600.0
-    with tempfile.TemporaryDirectory(prefix="cc-member-import-") as temp:
+    # THE FIXTURE VAULT IS NOT IN TMPDIR, AND THIS SUITE RUNS ALONE BESIDE cc-member-v2's. Every import walks every live
+    # namespace on the box, as a real one must. A vault under TMPDIR was refused whenever a sandbox bound TMPDIR (a
+    # landing's, or cc-member-v2's own case proving that binding TMPDIR is harmless), and cc-member-v2's selfcheck
+    # plants a descriptor in flight and an unreadable task on purpose, which no walk may call clear. So the vault sits
+    # where cc-member-v2 keeps its own, a directory under ~/.cc that no sandbox profile binds, and this suite takes the
+    # same lock: two runs of either suite never overlap (2026-10-12). The lock is released when the process exits.
+    scratch = Path(os.environ["HOME"]) / ".cc/member-v2-selfcheck"
+    scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fcntl.flock(os.open(scratch / "lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600), fcntl.LOCK_EX)
+    with tempfile.TemporaryDirectory(prefix="cc-member-import-", dir=scratch) as temp:
         root = Path(temp).resolve(); home, v = root / "home", root / "v"
         for path in (home / ".claude", home / ".local/bin", home / ".cc/members/team", v / "registry", v / "repos"):
             path.mkdir(parents=True)

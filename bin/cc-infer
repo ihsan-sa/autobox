@@ -10,7 +10,8 @@
 
 The perms seat calls it, and so does the approver (`cc-approve decide …` runs this). It returns GRANT, GRANT+WATCH,
 ASK-OWNER or REFUSE with its reasons and evidence; exit 0 on a GRANT or GRANT+WATCH, 1 otherwise, 2 on usage. ASK-OWNER
-means the box doesn't grant it itself: perms decides, for the owner. It fails closed: anything it can't read, parse or
+means the box doesn't grant it itself, and its `who` says who decides: "owner" for a hard line (rule 3), unreadable
+letters or a claim that it reaches past him, "perms" for the rest, which perms decides for him. It fails closed: anything it can't read, parse or
 resolve is not a grant.
 
 A GRANT comes only from a closed set of command shapes, parsed from the ask's whole text, never matched against prose
@@ -48,6 +49,13 @@ Rules, deterministic and in this order, so the backtest replays them exactly:
      1: a negated clause of plain words that ends with its clause ("no secrets, no member widening"), a Z-stamped or
      dated time ("03:21Z"), and a ref ending in a default branch ("origin/main"); a verb beside them still matches. These are an extra refusal layer: rule 4
      is what keeps a rewording out.
+     One carve-out, read before the hard lines (owner, 10-12, above credential_move()): an ask whose text names a
+     credential and copies it where its readers widen (a member or workspace, a member's name from ~/.cc/members,
+     anything public, an env name a site ships to its client code like VITE_ or PUBLIC_, a log, a commit, Slack, or a
+     `reaches` past the owner) is REFUSE. One that moves or copies a credential the box already holds into its own
+     services (an env, cc-config, a unit, Pages or Workers), where every place it copies into names one, no path
+     appears, no word of minting or rotating appears (env names included), and every other hard line it crosses
+     matches only on the word cc-config, is ASK-OWNER with who "perms": perms' call, never a grant.
   4. ASK-OWNER unless the whole ask parses to one of the shapes above.
   5. ASK-OWNER with no resolved evidence of his intent that shares a content word with the ask: no evidence, no grant.
   6. `reaches` and `reversible` are claims, and only a stricter one counts: a claim past the owner, or that it can't
@@ -270,6 +278,7 @@ HARD = [
     ("~/.cc/config or ~/.cc/env", r"\.cc[\s/\\.]*(?:config|env)" + R + r"|" + W(r"cc_config|cc_config_deny|cc_env")),
 ]
 HARD_RE = [(n, re.compile(p)) for n, p in HARD]
+SECRET_RE = dict(HARD_RE)["secrets and credentials"]
 # What the hard lines and the ports don't read (perms, 10-12: "no secrets", "no member widening", "03:21Z" and
 # "origin/main" each sent a one-off promote to the owner): a negated clause of plain words that ends where the clause
 # does, a Z-stamped or dated time, and a ref ending in a default branch. Only these are masked, so a verb beside them
@@ -289,6 +298,101 @@ def unread(t):
     """The folded text with what UNREAD names blanked out: what the hard lines and the ports are matched on."""
     return squash(UNREAD.sub(" ", t))
 _NEVER = {}
+
+# Owner, 10-12, of a card asking him to copy a client id the box already held into a site's Pages env: "why are my
+# approvals needed for these things?? I approve them blindly anyways". So moving or copying a credential the box
+# ALREADY holds between its own services (env files, cc-config, a unit's environment, a Pages or Workers env) is
+# perms' call, not his. Minting or rotating one stays his, and perms refuses a copy that
+# widens who can read it (a member workspace, anything public, a log). credential_move() reads which one an ask is.
+CRED_WIDEN = re.compile(W(r"members?|workspaces?|guests?|third[ -]part(?:y|ies)|collaborators?|contractors?|"
+                          r"customers?|outsiders?|public\w*|publish\w*|gists?|pastebin|logs?|logged|logging|stdout|"
+                          r"stderr|readme|commit\w*|slack|channels?|threads?|issues?|comments?|screenshots?|"
+                          r"share[sd]?|sharing|e-?mail\w*|mail\w*"))
+CRED_MINT = re.compile(W(r"mint\w*|rotat\w*|regenerat\w*|generat\w*|creat\w*|revok\w*|reissu\w*|roll|rolls|rolled|"
+                         r"rolling|reset\w*|renew\w*|re-?keys?|re-?keying|new|fresh|register\w*|sign(?:ing)? up"))
+CRED_MOVE = re.compile(W(r"cop(?:y|ies|ied|ying)|mov(?:e|es|ed|ing)|sync\w*|set|sets|setting|put|puts|putting|"
+                         r"store[sd]?|storing|add|adds|added|adding|wire[sd]?|wiring"))
+CRED_DEST = re.compile(r"cc-config|" + W(r"env|envs|environment|dotenv|systemd|units?|services?|pages|workers?|"
+                                         r"wrangler|cloudflare"))
+CRED_INTO = re.compile(W(r"into|to|onto|in"))
+# the destination stretch ends where the ask turns to the value or its source; every piece of it, split on and/then/
+# so/commas, must name one of the box's services (security read of #1214: only the first one was read)
+CRED_UNTIL = re.compile(W(r"from|with|for"))
+CRED_PIECE = re.compile(W(r"and|then|so|plus|also|or") + r"|[,;&+]")
+CRED_PUT = re.compile(r"wrangler (?:pages )?secret put" + R)
+# a path is never one of the box's own services (security read of #1214: /tmp/env, a member's ~/dev/<name>/.env)
+CRED_PATH = re.compile(r"(?<![\w.-])(?:~|\.{1,2})?/\S|\S/\S*/|(?<![a-z0-9])\.env" + R)
+# env names a site build ships to its client code, so anyone who loads the page reads the value
+CRED_CLIENT = re.compile(L + r"(?:vite|react_app|next_public|expo_public|nuxt_public|gatsby|public)_[a-z0-9_]+")
+
+
+def credential_dest_ok(t):
+    """Every place the ask copies into is one of the box's own services: each stretch after into/to/onto/in, up to a
+    from/with/for, is split on and/then/so/commas, and every piece names one; there is at least one (or the command
+    is `wrangler secret put` itself), and no path appears anywhere in the ask."""
+    if CRED_PATH.search(t):
+        return False
+    pieces = [p for m in CRED_INTO.finditer(t) for p in CRED_PIECE.split(CRED_UNTIL.split(t[m.end():], 1)[0])]
+    return all(CRED_DEST.search(p) for p in pieces) and bool(pieces or CRED_PUT.search(t))
+
+
+def member_names():
+    """The member workspaces' names (~/.cc/members/<name> without the owner-workspace marker), each with its first
+    part, so "so robin can use it" reads as the member robin-example (security read of #1214)."""
+    members = place("members", f"{HOME}/.cc/members")
+    try:
+        names = [n for n in os.listdir(members) if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", n)
+                 and os.path.isdir(f"{members}/{n}") and not os.path.isfile(f"{members}/{n}/owner-workspace")]
+    except OSError:
+        names = []
+    out = set()
+    for n in names:
+        out.add(n.casefold())
+        first = re.split(r"[._-]", n.casefold())[0]
+        if len(first) >= 3:
+            out.add(first)
+    return out
+
+
+# the only other hard line an own-service move may cross: the box's controls on the word cc-config, which is where
+# the box holds such a value. A path to ~/.cc/config or ~/.cc/env names the whole file, so that line still holds.
+CRED_MOVE_ALSO = {"the box's own controls": "cc-config"}
+
+
+ENV_NAME = re.compile(r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+(?![A-Za-z0-9_])")
+
+
+def credential_move(a, t):
+    """For an ask whose own text names a credential: "widen" for a copy that widens who can read it (by its words, a
+    member's name, an env name a site ships to its client code, or a `reaches` claim past the owner; perms refuses
+    it), "box" for a move of a held one between the box's own services (perms' call), else None (still the owner's: a
+    mint or rotation, a path, another hard line, or anything this can't read as a move)."""
+    # a credential named in a negated clause is none ("no secrets", #1202); the rest reads the whole text, stricter
+    if not SECRET_RE.search(unread(t)):
+        return None
+    if (CRED_WIDEN.search(t) or CRED_CLIENT.search(t) or REACH_RANK.get(a.get("reaches"), 0) > REACH_RANK["owner"]
+            or any(re.search(W(re.escape(n)), t) for n in member_names())):
+        return "widen"
+    # The mint words and the hard lines are read on the whole text, env names included (GENERATED_API_TOKEN is a
+    # mint, PUSH_TO_ORIGIN_MAIN a push). The mask is only for a non-owner word inside an env name, since CLIENT in
+    # LIBRARY_FEEDBACK_CLIENT_ID is no client, and for reading the move and its places (TO in an env name is no "to").
+    if CRED_MINT.search(t):
+        return None
+    masked = fold(ENV_NAME.sub("the value", str(a.get("ask") or "")))
+    if not (CRED_MOVE.search(masked) and credential_dest_ok(masked)):
+        return None
+    hard = [h for h in hard_lines(a, t) if h[0] != "widening a non-owner"]
+    hard += [h for h in hard_lines(a, masked) if h[0] == "widening a non-owner"]
+    for n, _ in hard:
+        if n == "secrets and credentials":
+            continue
+        # every match of the line, not the first one hard_lines() keeps: "from cc-config into the hooks env" is a
+        # hook as well as cc-config (security read of #1214)
+        rx = dict(HARD_RE).get(n)
+        if CRED_MOVE_ALSO.get(n) is None or rx is None or \
+                any(m.group(0).strip() != CRED_MOVE_ALSO[n] for m in rx.finditer(t)):
+            return None
+    return "box"
 
 
 def never_touch_path():
@@ -504,8 +608,11 @@ def decide(a, cited_ok=False):
     t = fold(a.get("ask"))
     out = {"verdict": "", "reasons": [], "evidence": [], "evidence_refused": [], "ask": squash(a.get("ask"))}
 
-    def done(v, *why):
-        out["verdict"] = v; out["reasons"] += list(why); return out
+    def done(v, *why, who="perms"):
+        out["verdict"] = v; out["reasons"] += list(why)
+        if v == "ASK-OWNER":
+            out["who"] = who
+        return out
     if not out["ask"]:
         return done("REFUSE", "no ask text")
     if a.get("owner_refused"):
@@ -513,10 +620,19 @@ def decide(a, cited_ok=False):
     if 22 in text_ports(unread(t)) or str(a.get("port") or "").strip() == "22":
         return done("REFUSE", "port 22 is SSH into the host, never a site's app port")
     if foreign_letters(t):
-        return done("ASK-OWNER", "the ask has letters the rules can't read, so nothing is granted on it")
+        return done("ASK-OWNER", "the ask has letters the rules can't read, so nothing is granted on it", who="owner")
     hard = hard_lines(a, unread(t))
+    move = credential_move(a, t)
+    if move == "widen":
+        return done("REFUSE", "a copy that widens who can read a credential (a member, anything public, a log); "
+                    "perms refuses it")
+    if move == "box":
+        # never a grant: perms weighs it, and the owner is not asked (owner, 10-12)
+        return done("ASK-OWNER", "a credential the box already holds, moved between its own services: perms' call, "
+                    "not the owner's, so perms decides")
     if hard:
-        return done("ASK-OWNER", *[f"hard line: {h}, on {w!r}; perms or the owner decides" for h, w in hard])
+        return done("ASK-OWNER", *[f"hard line: {h}, on {w!r}; perms or the owner decides" for h, w in hard],
+                    who="owner")
     shape = parse_shape(a.get("ask"))
     if not shape:
         return done("ASK-OWNER", "not one of the command shapes the box may grant itself; perms decides")
@@ -537,7 +653,7 @@ def decide(a, cited_ok=False):
     rev = a.get("reversible") if UNDO_RANK.get(a.get("reversible"), 0) > 0 else "minutes"
     out["reaches"], out["reversible"] = reach, rev
     if REACH_RANK[reach] > REACH_RANK["owner"]:
-        return done("ASK-OWNER", f"it is said to reach {reach}, further than the box grants itself")
+        return done("ASK-OWNER", f"it is said to reach {reach}, further than the box grants itself", who="owner")
     if rev == "no":
         return done("ASK-OWNER", "it is said to be impossible to undo")
     if rev == "minutes":
@@ -1070,7 +1186,61 @@ def selfcheck():
                           ("controls", {"ask": "add an allow rule to settings.json", "kind": "config"}),
                           ("kind alone", {"ask": "cc-config set CC_ASK_TURNS 16", "kind": "secret"})]:
             d = decide(dict(ask, evidence=ev + sev, reversible="minutes", reaches="box"))
-            check(f"hard line holds against evidence: {name}", d["verdict"] == "ASK-OWNER")
+            check(f"hard line holds against evidence: {name}", d["verdict"] == "ASK-OWNER" and d["who"] == "owner")
+        # Owner, 10-12: "why are my approvals needed for these things?? I approve them blindly anyways". A credential
+        # the box holds, moved between its own services, is perms' call; a mint stays his; a widening copy is refused.
+        # Each ask stands alone, under a benign kind with good evidence, so neither the kind nor the goal decides it.
+        for text in ("copy the Cloudflare API token the box holds from cc-config into the library's Pages env",
+                     "wrangler pages secret put LIBRARY_FEEDBACK_SECRET with the value the box already holds",
+                     "set GH_TOKEN in the cc-slackd unit's environment from the box's env file"):
+            d = decide({"ask": text, "kind": "config", "reaches": "box", "reversible": "minutes", "evidence": ev})
+            check(f"an own-service credential copy is perms' call, never a grant: {text!r}",
+                  d["verdict"] == "ASK-OWNER" and d["who"] == "perms" and any("perms' call" in r for r in d["reasons"]))
+        for text in ("mint a new Cloudflare API token and put it in the library's Pages env",
+                     "rotate the GH token and set it in the cc-slackd unit's environment",
+                     "copy the API token from ~/.cc/env into the library's Pages env",
+                     "copy the Cloudflare API token into /tmp/t"):
+            d = decide({"ask": text, "kind": "config", "reaches": "box", "reversible": "minutes", "evidence": ev})
+            check(f"... while a mint, a whole ~/.cc file or a place outside its services stays the owner's: {text!r}",
+                  d["verdict"] == "ASK-OWNER" and d["who"] == "owner")
+        for text, claim in (("copy the GH token into the member workspace's env", {}),
+                            ("put the Cloudflare API token into the public repo's README", {}),
+                            ("copy the API token into the Pages env and print it to the log", {}),
+                            ("copy the Cloudflare API token into the library's Pages env", {"reaches": "public"})):
+            d = decide(dict({"ask": text, "kind": "config", "reaches": "box", "reversible": "minutes", "evidence": ev},
+                            **claim))
+            check(f"... and a copy that widens who can read it is REFUSE: {text!r} {claim}", d["verdict"] == "REFUSE"
+                  and "who" not in d)
+        d = decide({"ask": "copy LIBRARY_FEEDBACK_CLIENT_SECRET from cc-config into the library's Pages env"})
+        check("an env name's CLIENT is no client, so the owner's own case is perms' call", d["who"] == "perms")
+        d = decide({"ask": "copy the API token into the client's Pages env"})
+        check("... while a client named in the ask's words is still widening a non-owner", d["who"] == "owner")
+        d = decide({"ask": "copy GH_TOKEN into the MEMBER_WORKSPACE env"})
+        check("... and a widening word inside an env name still refuses", d["verdict"] == "REFUSE")
+        # Perms' security read of #1214: each of these came back perms' call before it.
+        os.makedirs(f"{td}/members/robin-example", exist_ok=True)
+        for text, verdict, who in (
+                ("copy the GH token into /home/owner/dev/robin-example/.env", "REFUSE", None),
+                ("copy the GH token into /tmp/env", "ASK-OWNER", "owner"),
+                ("copy the GH token into the library's Pages env and /home/owner/dev/robin-example/.env", "REFUSE", None),
+                ("copy the GH token into the library's Pages env and /tmp/env", "ASK-OWNER", "owner"),
+                ("copy the GH token into the Pages env so robin can use it", "REFUSE", None),
+                ("copy the GH token into the Pages env and the hooks env", "ASK-OWNER", "owner"),
+                ("copy the GH token from cc-config into the settings.json env block", "ASK-OWNER", "owner"),
+                ("copy the GH token from cc-config into the hooks env", "ASK-OWNER", "owner"),
+                ("put the GENERATED_API_TOKEN into the Pages env", "ASK-OWNER", "owner"),
+                ("copy the token into the PUSH_TO_ORIGIN_MAIN env", "ASK-OWNER", "owner"),
+                ("copy the GH token into the library's Pages env as VITE_GH_TOKEN", "REFUSE", None),
+                ("set REACT_APP_API_KEY in the Pages env from cc-config", "REFUSE", None),
+                ("set PUBLIC_FEEDBACK_SECRET in the library's Pages env", "REFUSE", None),
+                ("copy the GH token from cc-config into the library's Pages env and the cc-slackd unit's environment",
+                 "ASK-OWNER", "perms")):
+            d = decide({"ask": text, "kind": "config", "reaches": "box", "reversible": "minutes", "evidence": ev})
+            check(f"a probe from the #1214 security read reads {verdict} {who}: {text!r}",
+                  d["verdict"] == verdict and d.get("who") == who)
+        d = decide({"ask": "set the Pages env for the library", "kind": "config"})
+        check("an ask that names no credential is no credential move", d["verdict"] == "ASK-OWNER" and d["who"] == "perms"
+              and not any("perms' call" in r for r in d["reasons"]))
         d = decide({"ask": "send the owner the site link", "kind": "mail", "reaches": "owner", "reversible": "minutes", "evidence": ev})
         check("mail is never the box's to grant, even to the owner", d["verdict"] == "ASK-OWNER")
         d = decide({"ask": "serve the app at x.example.org through a Cloudflare tunnel", "port": "22"})
