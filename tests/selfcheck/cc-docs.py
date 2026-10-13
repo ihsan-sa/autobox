@@ -631,6 +631,17 @@ def _selfcheck():
            and len(load()["documents"]) == 1)
         o, e = ask("kid1", pdf=m1, source=os.path.join(src, "a.tex"), title="Other")
         ok("a source outside the workspace is refused", o is None and "not a path inside" in e)
+        # --no-source across the socket: a workspace's generated PDF (no .tex beside it) is marked gone at filing
+        keep, ROOT = ROOT, os.path.join(t, "r6-nosrc")
+        os.makedirs(os.path.join(ws, "gen"), exist_ok=True)
+        shutil.copy(m1, os.path.join(ws, "gen", "stock.pdf"))
+        o, e = ask("kid1", pdf=os.path.join(ws, "gen", "stock.pdf"), title="Stock", no_source="generated from live data")
+        o2, e2 = ask("kid1", pdf=m1, title="Stock", no_source=7)
+        rs = [r for d in load()["documents"].values() for r in d["revisions"]]
+        ok("a workspace's no_source marks the revision it files gone, and one that is not a string is refused",
+           bool(o) and len(rs) == 1 and rs[0].get("source_gone", {}).get("why") == "generated from live data"
+           and o2 is None and "no_source must be a string" in e2)
+        ROOT = keep
         with open(os.path.join(ws, "notes.pdf"), "w") as f:
             f.write("just text\n")
         o, e = ask("kid1", pdf=os.path.join(ws, "notes.pdf"), title="Other")
@@ -1178,6 +1189,48 @@ def _selfcheck():
                and rcg == 0 and og.strip() == "001-0001-A\tgone\tbuilt in a scratch dir since deleted"
                and rcm == 2 and "keeps its source" in om
                and rc2 == 0 and o2.splitlines() == ["001-0001-A\tgone\tbuilt in a scratch dir since deleted",
+                                                    "0 of 0 kept sources compile"])
+            # a new revision with no source carries the mark of the one before; with no mark before, it still fails
+            ROOT = os.path.join(t, "r-inherit")
+            bare = os.path.join(t, "bare")
+            os.makedirs(bare, exist_ok=True)
+            for nm, body in (("s1", "Stock one"), ("s2", "Stock two"), ("u1", "Upload one"), ("u2", "Upload two")):
+                shutil.copy(mkpdf(src, nm, body), os.path.join(bare, nm + ".pdf"))
+            bp = lambda nm: os.path.join(bare, nm + ".pdf")     # noqa: E731
+            run("file", bp("s1"), "--project", "Inh", "--kind", "work", "--title", "Stock")
+            run("file", bp("u1"), "--project", "Inh", "--title", "Upload")
+            run("gone", "001-0001-A", "--why", "generated from live Odoo data")
+            rcs, os_ = run("file", bp("s2"), "--project", "Inh", "--title", "Stock")
+            rcu, ou = run("file", bp("u2"), "--project", "Inh", "--title", "Upload")
+            rc, o = run("check")
+            revs = {n: d["revisions"] for n, d in load()["documents"].items()}
+            ok("a new revision filed with no source carries the gone mark of the one before; one whose revision before "
+               "has no mark is not marked and still fails check",
+               rcs == 0 and "001-0001-B" in os_ and "marked gone as it was" in os_
+               and revs["001-0001"][1].get("source_gone", {}).get("why") == "generated from live Odoo data"
+               and rcu == 0 and "source_gone" not in revs["001-0002"][1] and "marked gone" not in ou
+               and rc == 1 and o.splitlines() == ["001-0002-B\tno source\tno --source recorded",
+                                                  "001-0001-B\tgone\tgenerated from live Odoo data",
+                                                  "0 of 0 kept sources compile"])
+            # --no-source marks at filing; an unchanged rebuild with it marks a sourceless current revision
+            ROOT = os.path.join(t, "r-nosource")
+            rcr = [run("file", bp("s1"), "--project", "Nos", "--kind", "work", "--title", "T", *x)[0]
+                   for x in (("--no-source", "  "), ("--no-source", "x", "--source", bp("s2")),
+                             ("--no-source", "x", "--latex", c3))]
+            nothing = not os.path.exists(os.path.join(ROOT, "register.json")) or not load()["documents"]
+            rcn, on = run("file", bp("s1"), "--project", "Nos", "--kind", "work", "--title", "Stock",
+                          "--no-source", "generated  from live Odoo data")
+            run("file", bp("u1"), "--project", "Nos", "--title", "Upload")
+            rc, o = run("check")
+            rcb, ob = run("file", bp("u1"), "--project", "Nos", "--title", "Upload", "--no-source", "a Notability note")
+            rc2, o2 = run("check")
+            ok("--no-source marks the revision it files gone; an unchanged rebuild with it marks the sourceless current "
+               "one; an empty why, or --no-source with --source or --latex, is refused and files nothing",
+               rcr == [2, 2, 2] and nothing and rcn == 0 and "001-0001-A" in on
+               and rc == 1 and o.splitlines()[0] == "001-0002-A\tno source\tno --source recorded"
+               and rcb == 0 and "unchanged" in ob and "source gone" in ob
+               and rc2 == 0 and o2.splitlines() == ["001-0001-A\tgone\tgenerated from live Odoo data",
+                                                    "001-0002-A\tgone\ta Notability note",
                                                     "0 of 0 kept sources compile"])
             # gone on a kept source: only one that fails now (a cached pass is no help), and check then says gone
             ROOT = os.path.join(t, "r-partial")

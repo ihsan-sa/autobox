@@ -10,7 +10,7 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
     cc-docs file <pdf> --project <name|PPP> --title <t> [--source <path>] [--latex <main.tex>] [--no-stamp]
                  [--kind work|course|member] [--member <handle>] [--date YYYY-MM-DD]
                  [--describes PCB-NNNN-R] [--note <text>] [--cost <step>=<usd>]… [--attach <file>]…
-                 [--filer-editor <email>]
+                 [--filer-editor <email>] [--no-source <why>]
         Called by a maker at the end of a finished build. The same source path, or else the same title in the same
         project, is the same document. Content unchanged since the current revision files nothing and prints that
         revision; otherwise the next letter is filed. A PDF whose text carries no number gets a small grey stamp
@@ -138,6 +138,11 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         not compile (DOCS_SOURCE_CHECK is run on it now; a cached pass does not count) is marked too, with
         "partial": the source is kept but incomplete, its files being gone for good. Refused for one whose kept
         source compiles; a source `backfill-sources` keeps later clears the mark. Prints `<number>\tgone\t<why>`.
+        `file --no-source <why>` marks the revision it files the same way at filing (a PDF generated from live data,
+        or one the owner uploaded): refused with --source, --latex or Markdown, and on an unchanged rebuild it marks
+        the current revision when that keeps no source and is not marked yet. A new revision filed with neither
+        --source nor --no-source that keeps no source carries the mark of the revision before it, when that one is
+        marked gone (the why, not "partial"), and says so on stderr; one with no mark before it still fails `check`.
     cc-docs number --project <name|PPP> --title <t> [--source <path>] [--describes PCB-NNNN-R] [--tex]
         The number `file` would give a changed build of this document now, for a build that prints its own footer:
         plain, or with --tex as `\\def\\docnumber{…}\\def\\docstamp{… · 24 Sep 2026}` to \\input before compiling.
@@ -1536,6 +1541,13 @@ def cmd_file(a):
     if getattr(a, "filer_editor", None) is not None and MD_SRC.search(a.pdf):
         raise Refused(f"--filer-editor files a compiled LaTeX draft, never Markdown: {a.pdf} is refused")
     filer_editor(a)
+    nosrc = " ".join((getattr(a, "no_source", None) or "").split())
+    if getattr(a, "no_source", None) is not None:
+        if not nosrc:
+            raise Refused("--no-source says why there is no source to keep, for whoever reads the check")
+        if a.source or getattr(a, "latex", None) or MD_SRC.search(a.pdf):
+            raise Refused("--no-source files a PDF that has no source: it is refused with --source, --latex or Markdown")
+    a.no_source = nosrc or None
     decl = declared(a)
     if decl and not MD_SRC.search(a.pdf):
         # brief: "cc-docs file picks that up so the Markdown is the kept source by default". A text draft's send
@@ -1613,6 +1625,10 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()
                     if got:
                         cur.update(got)
                         recorded.append(f"sources {got['sources']}")
+            # --no-source on an unchanged rebuild marks the current revision when it keeps none and is not marked
+            if getattr(a, "no_source", None) and "sources" not in cur and not (cur.get("source_gone") or {}).get("why"):
+                cur["source_gone"] = {"why": a.no_source, "at": utcnow()}
+                recorded.append("source gone")
             if any(w != "unchanged" for _, w in said):
                 extra.commit()
                 cur["attachments"] = lst
@@ -1628,8 +1644,8 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()
             raise Refused(f"{shown} already carries {', '.join(sorted(carried - {full}))}, but it would be filed as "
                           f"{full}; rebuild it with `cc-docs number`")
         # brief: "A later revision doesn't silently drop a revision's files"
-        lst = merge_attachments(carry_attachments(current(d) if d else None, describes, extra, full), extra, False,
-                                full)[0]
+        prev = current(d) if d else None
+        lst = merge_attachments(carry_attachments(prev, describes, extra, full), extra, False, full)[0]
         check_attachments(reg, num, rev, lst)
         nostamp = a.no_stamp or bool(d and d.get("stamp") is False)
         rel = os.path.join("files", proj, f"{full}_{slugify(a.title)}.pdf")
@@ -1677,6 +1693,16 @@ def file_locked(a, src, shown, date, describes, cost, text, fp, staged, extra=()
                 d["revisions"][-1].update(staged.commit(proj, full))
             except OSError as e:
                 print(f"cc-docs: the source of {full} was not kept: {e}", file=sys.stderr)
+        new = d["revisions"][-1]
+        # brief: "a new revision filed without --source inherits the source_gone reason of the revision before it,
+        # when that one is marked gone"; a PDF with no source and no reason still fails the check
+        before = ((prev or {}).get("source_gone") or {}).get("why")
+        why = a.no_source or (before if not (a.source or getattr(a, "latex", None)) else None)
+        if why and "sources" not in new:
+            new["source_gone"] = {"why": why, "at": utcnow()}
+            if not a.no_source:
+                print(f"cc-docs: {full} keeps no source, like {num}-{prev['rev']}: marked gone as it was ({why})",
+                      file=sys.stderr)
         save(reg)
         write_views(reg, set(d["visibility"]) - {"owner"})
         # brief: "When cc-docs files a new revision of a document with open feedback, mark those done"; a member's
@@ -3142,7 +3168,8 @@ MEMBER_CAP = 64 << 20     # the largest PDF a workspace may file, in bytes
 NOTE_CAP = 2000           # the longest note a workspace may file with a revision, in characters
 MEMBER_WAIT = 300         # seconds the workspace waits on the host: stamping and printing a long PDF takes a while
 HANDLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
-ASK = {"op", "pdf", "title", "project", "source", "kind", "member", "describes", "note", "date", "cost", "no_stamp", "tex"}
+ASK = {"op", "pdf", "title", "project", "source", "kind", "member", "describes", "note", "date", "cost", "no_stamp", "tex",
+       "no_source"}
 
 
 def across(a):
@@ -3157,6 +3184,8 @@ def across(a):
     if a.cmd == "file":
         ask["pdf"] = os.path.abspath(a.pdf)
         ask["no_stamp"] = bool(a.no_stamp)
+        if a.no_source is not None:
+            ask["no_source"] = a.no_source
     else:
         ask["tex"] = bool(a.tex)
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -3280,7 +3309,7 @@ def member_ask(handle, ask, files=""):
         raise Refused("a document needs a title")
     if not isinstance(cost, list) or not all(isinstance(c, str) for c in cost):
         raise Refused("cost is a list of <step>=<usd>")
-    for k in ("project", "kind", "member", "describes", "note", "date", "source", "pdf"):
+    for k in ("project", "kind", "member", "describes", "note", "date", "source", "pdf", "no_source"):
         if ask.get(k) is not None and not isinstance(ask[k], str):
             raise Refused(f"{k} must be a string")
     if ask.get("member") and ask["member"] != handle:
@@ -3305,7 +3334,7 @@ def member_ask(handle, ask, files=""):
         a = argparse.Namespace(cmd=op, title=title.strip(), source=source or None, describes=ask.get("describes"),
                                note=ask.get("note"), date=ask.get("date"), cost=cost, no_stamp=bool(ask.get("no_stamp")),
                                tex=bool(ask.get("tex")), origin=ask.get("pdf"), pdf=pdf if op == "file" else None,
-                               trees=trees, filer={"member": handle},
+                               trees=trees, filer={"member": handle}, no_source=ask.get("no_source"),
                                srcpath=os.path.normpath(here(source)) if source else None)
         with Lock():
             a.project, a.kind, a.member = member_project(load(), handle, ask.get("project"))
@@ -3353,6 +3382,7 @@ def main(argv):
             p.add_argument("--latex")
             p.add_argument("--attach", action="append")
             p.add_argument("--filer-editor")
+            p.add_argument("--no-source")
         else:
             p.add_argument("--tex", action="store_true")
         p.add_argument("--project", required=not IN_SANDBOX)   # inside a workspace the host picks the member's own

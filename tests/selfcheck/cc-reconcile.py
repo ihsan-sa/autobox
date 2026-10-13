@@ -174,8 +174,15 @@ def selfcheck():
        "branch, which is success", decide(F(**mrg)) == [] and decide(F(**dict(mrg, wt_exists=False))) == [])
     ok("…and `done` is the other finished word, with no PR to re-read and the same silence",
        decide(F(status="done", push_err=True, unpushed=None, commit_err=True, wt_exists=False)) == [])
-    ok("…while a branch that is genuinely unpushed on a row nobody merged still says so",
-       any("not pushed" in w for _, _, w in decide(F(status="running", live=True, push_err=True, unpushed=True))))
+    ok("…while a branch that is genuinely unpushed on a row nobody merged still says so, once its loop has ended",
+       any("not pushed" in w for _, _, w in decide(F(status="running", live=False, push_err=True, unpushed=True))))
+    # "shouldn't alert 'its branch is not pushed' while the row's worker loop is still alive (live loop.pid, or a
+    # live window for the row)": top-harden-lef-pin-only and -macro-fill were told mid-iteration 1, nothing to push yet
+    for alive in (dict(live=True), dict(agent_live=True)):
+        ok(f"UNPUSHED WHILE RUNNING: a row whose worker is still alive ({next(iter(alive))}) is not told its branch "
+           "is not pushed, however sure the box is; the same row with its loop ended is",
+           not any("not pushed" in w for _, _, w in decide(F(status="running", push_err=True, unpushed=True, **alive)))
+           and any("not pushed" in w for _, _, w in decide(F(status="running", push_err=True, unpushed=True))))
     for w_ in ("merged", "done"):
         ok(f"a `{w_}` row whose branch really does hold commits origin lacks is STILL told, though the same row is "
            "forgiven a branch the box could not judge — a fact is not a doubt",
@@ -1844,6 +1851,9 @@ def selfcheck():
             os.makedirs(f"{th}/.cc/worktrees/{repo}/{t}"); os.makedirs(f"{th}/.cc/state/{repo}/{t}")
             open(f"{th}/.cc/state/{repo}/{t}/progress.md", "w").write("STATUS: BLOCKED: no API key on the box\n")
             cb("add", repo, t, "a row that stood down", ""); cb("status", repo, t, "waiting")
+        os.makedirs(f"{th}/.cc/worktrees/{repo}/unpushed-t-row/.cc")   # its loop ended; the branch is unjudged
+        open(f"{th}/.cc/worktrees/{repo}/unpushed-t-row/.cc/push.err", "w").close()
+        cb("add", repo, "unpushed-t-row", "a row whose push failed", ""); cb("status", repo, "unpushed-t-row", "review")
         cb("note", repo, "parked-t-row", "Parked on purpose: the key arrives as an env grant after #1022 lands.")
         argv = [sys.executable, os.path.realpath(__file__), repo, "--notify", "--no-net", "--grace", "0", "--repeat", "0"]
         for _ in range(3):
@@ -1857,6 +1867,9 @@ def selfcheck():
            any("asked-t-row" in ln and "an owner ask is already pending, so this is said once" in ln for ln in told)
            and any("parked-t-row" in ln and "parked on purpose" in ln for ln in told))
         ok("…while the plain waiting row is told on every pass, as before", n["plain-t-row"] == 3)
+        ok("UNPUSHED ONCE: three passes at --repeat 0 tell an ended row's unpushed branch once, not every pass, "
+           "beside the plain row that is told three times",
+           sum(f"{repo}/unpushed-t-row " in ln and "not pushed" in ln for ln in told) == 1)
     # (b1) OWNER-HELD (brief C6): "a row that is waiting on an open owner ask, held for his yes, or noted as parked on
     # purpose wakes its seat once and not every day. When a wake does fire, it says an owner ask is already pending."
     T = now()

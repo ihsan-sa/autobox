@@ -50,7 +50,8 @@ a merge commit adding changes of its own, or a tip on main's own first-parent li
 line about a PR is re-read at GitHub at send time and dropped if the merge ANSWERS it — a safety ask standing
 beside it, an unpushed branch, still goes out (--no-net never asks, so never drops). A finished row (`merged`/
 `done`) raises nothing on suspicion; a merged row whose branch really holds commits origin lacks is still
-reported. A `held` row keeps its fixes, stops, safety asks and its question; the guesses go quiet.
+reported. An unpushed branch is not told while the row's loop or window is alive (the worker may push yet), and
+once the loop has ended it is told once while it stands, not every --repeat. A `held` row keeps its fixes, stops, safety asks and its question; the guesses go quiet.
 A finished track with an open PR nobody is landing is offered once per PR and alerted once, ever, past the
 4 h window — unless the row itself waits on a person, which is somebody having picked it up: that one raises neither.
 
@@ -884,6 +885,9 @@ def idle_session(f, idle=IDLE):
     return bool(f.get("live")) and not f.get("workers") and not f.get("loops") and f.get("pane_idle", 0.0) >= idle
 
 
+UNPUSHED = "its branch is not pushed"   # told once while it stands, not every --repeat
+
+
 def decide(f):
     """Pure: facts in, [(kind, status|None, why)] out. fix = decidable, applied silently · ask = needs a person,
     applied when it also has one right status · info = could not tell · held = known and nobody's · stop = ended."""
@@ -976,8 +980,11 @@ def decide(f):
     safety = []                                          # work about to be lost: the host's, never muted by a hold
     if f.get("commit_err") and not finished:
         safety.append(("ask", None, "its last checkpoint would not commit — that work is only in the worktree"))
-    if f.get("push_err") and (f.get("unpushed") is True or (f.get("unpushed") is None and not finished)):
-        safety.append(("ask", None, "its branch is not pushed"))   # True is told on a finished row too: sweep rule 1 would delete it
+    # "shouldn't alert 'its branch is not pushed' while the row's worker loop is still alive (live loop.pid, or a
+    # live window for the row)": `live` is a cc-loop process, a live window, or a live session's mark
+    if (f.get("push_err") and not live
+            and (f.get("unpushed") is True or (f.get("unpushed") is None and not finished))):
+        safety.append(("ask", None, UNPUSHED))   # True is told on a finished row too: sweep rule 1 would delete it
     out += safety
     hold = str(f.get("held") or "").strip()              # a person stopped this: the guesses go quiet, the rest stands
     if hold:
@@ -3067,7 +3074,8 @@ def main(argv):
             f = row_facts.get(f"{r['repo']}/{r['track']}") or {}
             r["owner"] = owner_held(r["repo"], r["track"], f.get("notes"), owner_asks, repo_channels(r["repo"])) if r["kind"] == "ask" else ""
         fresh = [r for k, r in keys.items()
-                 if (not old.get(k) if r["owner"] else t0 - float(old.get(k, 0) or 0) >= repeat)
+                 if (not old.get(k) if r["owner"] or r["why"] == UNPUSHED   # "alert once, not on every pass"
+                     else t0 - float(old.get(k, 0) or 0) >= repeat)
                  and not merge_answers(r)]   # merged since the run began: the next pass fixes the row
         told = {f"{r['repo']}/{r['track']}: {r['why']}" for r in fresh}
         keep, busy = {}, None
