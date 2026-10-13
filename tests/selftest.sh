@@ -955,8 +955,14 @@ case "$sp2" in *'`cc slack project <name>`'*) spp=0;; *) spp=1;; esac
   && grep -q 'cc slack on|off' <<<"$dspu" \
   && ok "the door the member prompt names is the door \`cc\` opens: \`cc slack project <name>\` reaches cc-slack (which answers that this HOME has no Slack link), while an unknown verb still falls to the usage line" \
   || bad "cc slack project does not dispatch (prompt names it: $spp; got: $(tr '\n' '|' <<<"$dsp"))"
-miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$HOME")" = 0 ] || miss="$miss ${probe#*|}"; done
-[ -z "$miss" ] && ok "no regression: an unmarked cwd (planning session) is gated by none of them" || bad "unmarked cwd gated:$miss"
+# …except the harness logins and the PAT: the argv layer refuses those to every role, a planning seat included,
+# because perms' true-catch set (tests/guard-replay-box.jsonl) has planning-seat token reads in it (#1221).
+miss=""; for probe in "${MP[@]}"; do case "$probe" in *credentials.json*|*ccbox/env*) continue;; esac
+  [ "$(m "${probe%%|*}" "${probe#*|}" "$HOME")" = 0 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "no regression: an unmarked cwd (planning session) is gated by none of them but the credential reads" || bad "unmarked cwd gated:$miss"
+miss=""; for probe in "${MP[@]}"; do case "$probe" in *credentials.json*|*ccbox/env*) ;; *) continue;; esac
+  [ "$(m "${probe%%|*}" "${probe#*|}" "$HOME")" = 2 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "…and those credential reads are refused to the planning session too (argv layer, #1221)" || bad "planning credential read passed:$miss"
 miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t help the owner must decide this"}' \
              'Bash|{"command":"git log --oneline -5"}' "Read|{\"file_path\":\"$mf/note.md\"}" "Edit|{\"file_path\":\"$mf/note.md\"}"; do
   [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 0 ] || miss="$miss ${probe#*|}"; done

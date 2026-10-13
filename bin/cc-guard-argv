@@ -1,0 +1,1296 @@
+#!/usr/bin/env python3
+"""cc-guard-argv: the argv backstop for a gated Bash call (design: guard-keeps-only-the-backstop).
+
+  cc-guard-argv judge      the raw command on stdin; prints nothing (allowed) or ONE line `deny<TAB>why` (needs the
+                           owner) or `never<TAB>why`, exit 0. Exit 3 + stderr on an internal error (cc-guard refuses).
+  cc-guard-argv parse      the command on stdin as JSON lines: verb, argv, redirects, cwd after cd, nested-in, via.
+  cc-guard-argv selfcheck  parser unit cases + every line of core/tests/guard-replay{,-pending}.jsonl in a fixture HOME.
+Env: GUARD_ROLE worker|member|pf (anything else: allowed; pf = the ungated tier, see below), HOME (or GUARD_HOME),
+GUARD_CWD, GUARD_ROOT (the tree this session writes, ':'-separated), GUARD_MWS (member workspace), GUARD_PSEAT=1 (the permission seat).
+GUARD_NEVER_TOUCH (a file) replaces config/never-touch.txt; only the selfcheck sets it, and cc-guard unsets it.
+It only judges: nothing here launches a worker, dispatches or writes the board.
+recurring-defect-ok: pause-hold-missing — a judge that refuses `--go`; it never launches or writes the board
+recurring-defect-ok: held-files-unchecked — a judge that refuses `--go`; it never dispatches or groups rows
+
+Only what bash would exec is judged. Words are read after VAR= and wrappers (env timeout nice nohup setsid stdbuf
+ionice time command builtin exec chrt taskset xargs busybox flock watch systemd-run unshare nsenter); the parser
+recurses into sh -c, eval, $( ), backticks, <( ), find -exec, xargs fed by a pipe, env -S/--split-string, and a
+heredoc, here-string, pipe or `< <( )` fed to a shell, `script -c CMD`, a git `!` alias given as -c alias.X=!CMD or set by git config, and the string
+literals of an interpreter's -c/-e code (python perl ruby node php…: each literal, and all of them joined by blanks,
+so os.system("<cmd>") and subprocess.run(["git", "push", …]) are judged as the commands they run; a literal that
+does not parse is data). Other quoted args, heredoc bodies and commit messages are data; the credentials rule also
+reads an interpreter's -c/-e (or stdin heredoc) body and awk/sed program text.
+
+Rules for both gated roles:
+- root: sudo doas su runuser pkexec sudoedit                                                        -> never
+- power: reboot shutdown poweroff halt kexec; systemctl|loginctl reboot|poweroff|halt|kexec|suspend|hibernate|
+  rescue|emergency|isolate|default                                                                   -> never
+- network units: systemctl|service stop|disable|mask|kill|restart.. on NetworkManager hostapd wpa_supplicant
+  systemd-networkd iwd dnsmasq                                                                        -> never
+- firewall: iptables ip6tables nft ufw firewall-cmd ebtables, unless a read (-L/-S, list, status, --list-*) -> never
+- partition: fdisk sfdisk gdisk sgdisk parted wipefs mkfs* mkswap cryptsetup lvm/pv/vg/lv verbs unless a listing,
+  and any write onto a block device (/dev/sd*, nvme*, mmcblk*, ...)                                   -> never
+- network: ip <obj> add|del|set|flush|change|replace, nmcli non-read, iw set|add|del|connect, wpa_cli non-read,
+  netplan apply|set|try, ifconfig <if> <arg>, ifup/ifdown, ethtool -s/-K.., route add|del, rfkill block, tc add.. -> never
+- never-touch: a network verb whose argv names a line of config/never-touch.txt (GUARD_NEVER_TOUCH, a file,
+  replaces it in the selfcheck)                                                             -> never
+- containers: docker podman nerdctl docker-compose podman-compose ctr                               -> never
+- credentials: an argv word (or its @file / =value part) or `<` source resolving to secret_all (worker) or
+  secret_path (member), or anything under ~/.cc/secrets or any credentials.json / .credentials.json / *.token under
+  ~, for any verb but echo/printf; or one of those path names (ccbox/env, .credentials.json, credentials.json,
+  .cc/secrets, .codex/auth.json, cursor/auth.json; member also .cc/config .ssh .claude/settings.json .cc/sandbox) as text inside
+  a python/perl/ruby/node/php -c/-e body or awk/sed program (so a commit message or grep pattern still passes) -> never
+- git push whose refspec destination is main/master (+main, :main, -d main, HEAD:main) or a glob ('+refs/heads/*:
+  refs/heads/*'); `HEAD` alone, or no refspec, is the branch checked out at the cwd / git -C / --git-dir (read
+  from its HEAD; outside a checkout git refuses the push itself); --mirror, --all, --branches; -c remote.*.push|
+  mirror / push.default or a GIT_CONFIG_* assignment on the push; git config setting remote.*.push|mirror or
+  push.default; a worker's force push (-f, --force*, +refspec) or delete (-d, --delete, :dst) whose
+  destination is not a track/… branch; GIT_DIR/GIT_WORK_TREE name the checkout like --git-dir; any push in a
+  command that also moves HEAD (git checkout|switch|symbolic-ref|worktree, branch -m, update-ref HEAD, gh pr
+  checkout), or whose refspec, remote, -C, --git-dir, GIT_DIR or cd target is computed                 -> deny
+- a worker's gh pr|issue comment|create|close|reopen|edit|review|merge|lock|unlock|delete|transfer      -> deny
+- gh repo delete|archive; gh api -X DELETE repos/o/r or repos/o/r/git/refs/heads/main|master; gh api PATCH/POST/PUT
+  (or fields given, so POST) on repos/o/r/git/refs/heads/main|master; gh api DELETE/PATCH/POST/PUT on
+  repos/o/r/branches/main|master/protection[/..] or repos/o/r/rulesets[/..]; gh api graphql naming deleteRef,
+  updateRef(s), deleteRepository or archiveRepository; gh api PATCH/POST/PUT on repos/o/r/collaborators|invitations
+  or orgs/o/members|memberships|invitations|outside_collaborators (widening a non-owner); the endpoint is read as
+  gh resolves it (a full URL, a leading / and a ?query come off; -X=METHOD); graphql also naming
+  (delete|update)BranchProtectionRule or (delete|update)RepositoryRuleset, or read from a file (--input, query=@) -> deny
+- bypass: a launch with --dangerously-skip-permissions or --permission-mode bypassPermissions, or --settings whose JSON
+  or file names bypassPermissions, is computed, or comes with a command that writes that word         -> never
+- cc __runperms; cc-handoff --perms-dir; lander-self land|promote|rollback|pin; cc-try on|off|check   -> never
+- cc-config set|unset CC_PROTECTED_PATHS_*|SLACK_OWNER_ID|CC_LAND_REVIEW*|CC_CLAUDE|CC_CODEX; cc-settings apply|grant -> never
+- write fence: a redirect target or the destination of cp mv ln install rsync tee dd(of=) sed -i perl -i truncate rm
+  rmdir unlink shred touch mkdir chmod chown curl -o wget -O find -delete, or git -C <dir> (or the cwd) with a verb
+  that writes the tree, landing (relative = after this command's own cd/pushd) in ~/dev/* (except GUARD_ROOT and
+  ~/dev/<mws>), ~/bin, ~/.cc/try, ~/.cc/lander, ~/.cc/state/land, ~/.cc/config, ~/.claude/settings.json, or
+  ~/.cc/state/<x>/perms or ~/.cc/state/handoff/perms.{json,brief} (unless GUARD_PSEAT). A `$` target passes; a glob
+  is cut at its first wildcard and the cut judged as a prefix, but for the seat's state it is matched a component at a
+  time against the seat places that exist (above, at or inside one is refused)                      -> never
+- remove from above: rm rmdir, mv (sources), rsync --delete* (destination) or --remove-source-files, find -delete
+  whose target is a PARENT of an existing ~/.cc/state/<x>/perms or handoff seat file, of ~/dev, or of a write-fence
+  place (`rm -rf ~/.cc`, `mv ~/.cc/state x`); unless GUARD_PSEAT                                     -> never
+- a `$X` verb is the literal value of an earlier X= / export / declare in the same command; any other `$X` /
+  `$(..)` verb passes unless a word of that command (or of the text an X=$(..) was built from), read with its quotes and backslashes taken off
+  (`$X re''boot` is reboot), is a hard-limit verb name (a member's too: cc-config, cc-loop) (-> never), or its arguments would be refused as
+  the arguments of one of CANDV (git gh systemctl cc-slack claude lander-self cc-handoff; cp, so a
+  last argument in the write fence; ip when the first argument is an ip object; cc when an argument is one of
+  CCWORDS), so
+  `$(echo git) push -f origin main` is a push to main                                  -> that verb's answer
+- an unclosed quote, substitution or ( )                                    -> never "could not parse this command"
+Every role, pf included:
+- power: a power verb (or systemctl|loginctl on a reboot/poweroff/halt/kexec/suspend/rescue/emergency/... .target
+  unless the subcommand reads it), and what sudo/doas/pkexec/runuser runs (options skipped) judged as a command of
+  its own (`sudo /sbin/reboot`, `sudo env reboot`), or su -c; a `$X` verb next to reboot/shutdown/poweroff/halt/kexec -> never
+- ssh to any host: what it carries (the words after the host joined by blanks, -o RemoteCommand, and a heredoc,
+  here-string, <( ) or pipe it is fed) judged as a command for this role; for a gated role also any root, power,
+  firewall, disk, container, systemctl, ip, nmcli or netplan verb in it. -o ProxyCommand/LocalCommand/
+  KnownHostsCommand run here and are parsed as local commands                                         -> never
+- cc-slack member add / cc slack member add (widening who reaches the box)                           -> never
+pf (the ungated tier) only, besides those: the seat-state part of the write fence, remove-from-above for the seat's
+state, and the credentials rule.
+Member only:
+- CC_MEMBER_SANDBOX= assignment; cc --go outside ~/dev/<mws> (cc board|quick exempt); cc-loop; `cc <repo>` naming
+  another repo; claude -p/--print; cc slack / cc-slack off|setup|mkchannel|updates-sweep|archive|retire;
+  cc-config                                                                                            -> never
+- cc-slack inject|post|post-approval, cc-broker inject|ledger, cc-publish (but status/selfcheck/setup/--dry-run/--help) -> deny
+Not here (cc-guard keeps them, they need /proc or the tool input): tmux kill-server/kill-session, pattern kills,
+the member kill fence, the Write/Edit rules.
+"""
+import fnmatch, glob, json, os, re, sys, tempfile
+
+class ParseError(Exception):
+    pass
+
+ROOTV = {'sudo', 'doas', 'su', 'runuser', 'pkexec', 'sudoedit'}
+POWERV = {'reboot', 'shutdown', 'poweroff', 'halt', 'kexec'}
+POWERSUB = {'reboot', 'poweroff', 'halt', 'kexec', 'suspend', 'hibernate', 'hybrid-sleep', 'suspend-then-hibernate',
+            'rescue', 'emergency', 'isolate', 'default'}
+# `systemctl start reboot.target` is a reboot by its unit's name (perms' read of 600963af)
+POWERTGT = re.compile(r'(reboot|poweroff|halt|kexec|shutdown|suspend|hibernate|hybrid-sleep|suspend-then-hibernate|sleep|'
+                      r'rescue|emergency|ctrl-alt-del|exit|soft-reboot)\.target')
+
+def power(v, a):   # a reboot, halt, suspend or target switch, by its verb, its systemctl subcommand or its unit
+    first = next((x for x in a if not x.startswith('-')), '')
+    tgt = first not in ('status', 'show', 'cat', 'list-dependencies', 'list-units', 'is-active', 'is-enabled', 'help') \
+        and any(POWERTGT.fullmatch(x) for x in a)   # a read of the unit passes
+    return v in POWERV or (v in ('systemctl', 'loginctl') and (bool(POWERSUB & set(a)) or tgt)) \
+        or (v in ('init', 'telinit') and first in ('0', '1', '6', 's', 'S'))
+NETUNIT = re.compile(r'(NetworkManager|hostapd|wpa_supplicant|systemd-networkd|iwd|dnsmasq)(@[^.]*)?(\.service|\.socket)?')
+UNITSTOP = {'stop', 'disable', 'mask', 'kill', 'restart', 'try-restart', 'reload-or-restart', 'try-reload-or-restart', 'force-reload'}
+INTERP = re.compile(r'(python[0-9.]*|pypy[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node|nodejs|deno|bun|php[0-9.]*)')
+AWKS = {'awk', 'gawk', 'mawk', 'nawk', 'busybox-awk'}
+SEATLAB = "the permission seat's state"
+GHREF = re.compile(r'\b(deleteRef|updateRefs?|deleteRepository|archiveRepository|(delete|update)BranchProtectionRule|(delete|update)RepositoryRuleset)\b')
+FW = {'iptables', 'ip6tables', 'iptables-nft', 'iptables-legacy', 'ip6tables-nft', 'ip6tables-legacy',
+      'iptables-restore', 'ip6tables-restore', 'nft', 'ufw', 'firewall-cmd', 'ebtables', 'arptables'}
+PART = {'fdisk', 'sfdisk', 'gdisk', 'sgdisk', 'cfdisk', 'cgdisk', 'parted', 'wipefs', 'mkswap', 'mke2fs', 'cryptsetup',
+        'lvm', 'pvcreate', 'pvremove', 'pvresize', 'pvmove', 'vgcreate', 'vgremove', 'vgextend', 'vgreduce', 'lvcreate',
+        'lvremove', 'lvresize', 'lvextend', 'lvreduce', 'mdadm', 'blkdiscard', 'tune2fs', 'resize2fs'}
+NET = {'ip', 'nmcli', 'iw', 'iwconfig', 'wpa_cli', 'wpa_supplicant', 'netplan', 'ifconfig', 'ifup', 'ifdown', 'ethtool',
+       'route', 'dhclient', 'rfkill', 'hostapd', 'hostapd_cli', 'tc', 'brctl', 'bridge', 'nmtui', 'networkctl'} | FW
+CONT = {'docker', 'podman', 'nerdctl', 'docker-compose', 'podman-compose', 'ctr'}
+HARD = ROOTV - {'su'} | POWERV | FW | PART | CONT | {'nmcli', 'wpa_cli', 'netplan'}
+SSHHARD = ROOTV | POWERV | FW | PART | CONT | {'systemctl', 'ip', 'nmcli', 'netplan'}
+SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh', 'ash', 'mksh', 'rbash'}
+WRAP = {'env': set(), 'timeout': {'-s', '--signal', '-k', '--kill-after'}, 'nice': {'-n', '--adjustment'},
+        'ionice': {'-c', '-n', '-p', '-P', '-u', '--class', '--classdata'}, 'stdbuf': {'-i', '-o', '-e'},
+        'nohup': set(), 'setsid': set(), 'time': {'-f', '--format', '-o', '--output'}, 'command': set(),
+        'builtin': set(), 'exec': {'-a'}, 'chrt': set(), 'taskset': set(), 'busybox': set(), 'toybox': set(),
+        'xargs': {'-a', '-d', '-E', '-I', '-L', '-n', '-P', '-s', '--arg-file', '--delimiter', '--max-args', '--max-procs'},
+        'flock': {'-w', '-E', '--timeout', '--conflict-exit-code'}, 'watch': {'-n', '--interval'},
+        'systemd-run': {'-u', '--unit', '-p', '--property', '-E', '--setenv', '-M', '--machine', '-H', '--host',
+                        '--description', '--slice', '--uid', '--gid', '--nice', '--working-directory'},
+        'unshare': {'-S', '-G', '-R', '-w'}, 'nsenter': {'-t', '--target', '-S', '-G', '-r', '-w'}}
+KW = {'!', 'if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '{', '}', 'esac', 'function', 'coproc'}
+WRITEV = {'cp', 'mv', 'ln', 'install', 'rsync', 'tee', 'dd', 'sed', 'perl', 'truncate', 'rm', 'rmdir', 'unlink',
+          'shred', 'touch', 'mkdir', 'chmod', 'chown', 'chgrp', 'curl', 'wget', 'find', 'git'}
+TOOLS = {'service', 'gh', 'claude', 'cc', 'cc-loop', 'cc-room', 'cc-handoff', 'lander-self', 'cc-try', 'cc-config', 'cc-settings',
+         'cc-slack', 'cc-broker', 'cc-publish', 'tmux', 'pkill', 'killall', 'systemctl', 'loginctl', 'eval'}
+GATED = ROOTV | POWERV | FW | PART | NET | CONT | SHELLS | set(WRAP) | WRITEV | TOOLS
+GITW = {'add', 'am', 'apply', 'checkout', 'cherry-pick', 'clean', 'commit', 'merge', 'mv', 'pull', 'rebase', 'reset',
+        'restore', 'revert', 'rm', 'stash', 'switch', 'worktree', 'submodule', 'update-ref', 'symbolic-ref', 'init', 'clone'}
+LAUNCHERS = {'claude', 'cc', 'cc-loop', 'cc-room', 'cc-handoff', 'npx', 'bunx', 'node', 'codex'}
+PROTKEY = re.compile(r'(CC_PROTECTED_PATHS_\w*|SLACK_OWNER_ID|CC_LAND_REVIEW\w*|CC_CLAUDE|CC_CODEX)(=|$)')
+ASSIGN = re.compile(r'[A-Za-z_]\w*(\[[^]]*\])?\+?=')
+BLOCKDEV = re.compile(r'/dev/(sd[a-z]|nvme\d|mmcblk\d|vd[a-z]|xvd[a-z]|hd[a-z]|md\d|dm-|mapper/|disk/|loop\d)')
+HELP = {'-h', '--help', 'help'}
+ROOTOPT = {'-u', '-g', '-h', '-p', '-C', '-D', '-r', '-t', '-U', '-T', '--user', '--group', '--host', '--prompt', '--chdir',
+           '--role', '--type', '--other-user', '--command-timeout'}   # sudo's options that take a value
+SSHOPT = {'-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-Q', '-R', '-S', '-W', '-w', '-B'}
+SECBASE = re.compile(r'\.?credentials\.json|[^/]*\.token')
+GHPOST = {'comment', 'create', 'close', 'reopen', 'edit', 'review', 'merge', 'lock', 'unlock', 'delete', 'transfer'}
+# the verbs whose hard limits are keyed on their arguments: a `$X` / `$(..)` verb is judged as each of them
+CANDV = ('git', 'gh', 'systemctl', 'ip', 'cc', 'cc-slack', 'claude', 'lander-self', 'cc-handoff', 'cp')
+CCWORDS = {'--go', '__runperms', 'slack', 'board', 'done', 'rm', 'handoff'}
+IPOBJ = {'link', 'addr', 'address', 'route', 'rule', 'neigh', 'neighbour', 'tunnel', 'tuntap', 'netns', 'xfrm', 'maddress',
+         'mroute', 'vrf', 'nexthop', 'token', 'ntable', 'l2tp', 'fou', 'macsec', 'mptcp', 'tcp_metrics', 'netconf', 'sr'}
+RMOPTS = {'tee': (), 'rm': (), 'rmdir': (), 'unlink': (), 'shred': {'-n', '--iterations', '-s', '--size'}, 'mkdir': {'-m', '--mode'},
+          'touch': {'-d', '--date', '-t', '-r', '--reference'}, 'truncate': {'-s', '--size', '-r', '--reference'}}
+
+# ---------------------------------------------------------------------------------------------------------- lexer
+class Word:
+    __slots__ = ('v', 'raw', 'q', 'dyn', 'glob', 'brace', 'subs')
+    def __init__(w, v='', dyn=False, glob=False):
+        w.v, w.raw, w.q, w.dyn, w.glob, w.brace, w.subs = v, v, False, dyn, glob, False, []
+    def like(w, v):   # a part of this word (of=X, --x=X) keeps what is known about it
+        n = Word(v, w.dyn, w.glob); n.q = w.q; return n
+
+def close(s, k, o='(', c=')'):   # index of the `c` closing an `o` already open before k
+    d, n = 1, len(s)
+    while k < n:
+        ch = s[k]
+        if ch == '\\': k += 2; continue
+        if ch == "'" and o == '(':
+            j = s.find("'", k + 1)
+            if j < 0: raise ParseError('quote')
+            k = j + 1; continue
+        if ch == '"':
+            k += 1
+            while k < n and s[k] != '"': k += 2 if s[k] == '\\' else 1
+            if k >= n: raise ParseError('quote')
+        elif ch == '`':
+            k = tick(s, k + 1)
+        elif ch == o: d += 1
+        elif ch == c:
+            d -= 1
+            if d == 0: return k
+        k += 1
+    raise ParseError('unclosed ' + o)
+
+def tick(s, k):
+    while k < len(s):
+        if s[k] == '\\': k += 2; continue
+        if s[k] == '`': return k
+        k += 1
+    raise ParseError('backtick')
+
+def dollar(s, i, w, buf, home, inq):
+    nx = s[i + 1:i + 2]
+    if s.startswith('$((', i):
+        j = close(s, i + 2); buf.append(s[i:j + 1]); w.dyn = True; return j + 1
+    if nx == '(':
+        j = close(s, i + 2); w.subs.append(s[i + 2:j]); w.dyn = True; buf.append(s[i:j + 1]); return j + 1
+    if nx == '{':
+        j = close(s, i + 2, '{', '}'); inner = s[i + 2:j]
+        if inner == 'HOME': buf.append(home)
+        else:
+            w.dyn = True; buf.append(s[i:j + 1]); w.subs += subs_in(inner)
+        return j + 1
+    if nx == "'" and not inq:
+        j = i + 2
+        while j < len(s) and s[j] != "'": j += 2 if s[j] == '\\' else 1
+        if j >= len(s): raise ParseError('quote')
+        try: buf.append(s[i + 2:j].encode('latin-1', 'backslashreplace').decode('unicode_escape'))
+        except (UnicodeError, ValueError): buf.append(s[i + 2:j])
+        w.q = True; return j + 1
+    if nx == '"' and not inq: return i + 1
+    m = re.match(r'[A-Za-z_]\w*', s[i + 1:])
+    if m:
+        if m.group() == 'HOME': buf.append(home)
+        else: w.dyn = True; buf.append('$' + m.group())
+        return i + 1 + m.end()
+    if nx and nx in '@*#?$!-0123456789':
+        w.dyn = True; buf.append(s[i:i + 2]); return i + 2
+    buf.append('$'); return i + 1
+
+def subs_in(t):   # $( ) and backticks in text where quotes mean nothing (an unquoted heredoc body)
+    out, k = [], 0
+    while k < len(t):
+        if t[k] == '\\': k += 2; continue
+        if t.startswith('$(', k) and not t.startswith('$((', k):
+            j = close(t, k + 2); out.append(t[k + 2:j]); k = j + 1; continue
+        if t[k] == '`':
+            j = tick(t, k + 1); out.append(re.sub(r'\\([`\\$])', r'\1', t[k + 1:j])); k = j + 1; continue
+        k += 1
+    return out
+
+META = set(' \t\n;&|()<>')
+
+def word(s, i, home):
+    w, buf, plain, st, n = Word(), [], [], i, len(s)
+    while i < n:
+        c = s[i]
+        if c in META:
+            if c in '<>' and s[i + 1:i + 2] == '(' and not buf:   # <(..) >(..): a process substitution
+                j = close(s, i + 2); w.subs.append(s[i + 2:j]); w.dyn = True; buf.append('/dev/fd/63'); i = j + 1; continue
+            if c == '(' and not w.q and ASSIGN.fullmatch(''.join(buf)):   # a=( x y ): data
+                j = close(s, i + 1); buf.append(s[i:j + 1]); i = j + 1; continue
+            break
+        if c == '\\':
+            if s[i + 1:i + 2] != '\n': buf.append(s[i + 1:i + 2]); w.q = True
+            i += 2; continue
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j < 0: raise ParseError('quote')
+            buf.append(s[i + 1:j]); w.q = True; i = j + 1; continue
+        if c == '"':
+            w.q = True; i += 1
+            while True:
+                if i >= n: raise ParseError('quote')
+                d = s[i]
+                if d == '"': i += 1; break
+                if d == '\\':
+                    if s[i + 1:i + 2] in ('$', '`', '"', '\\'): buf.append(s[i + 1])
+                    elif s[i + 1:i + 2] != '\n': buf.append(s[i:i + 2])
+                    i += 2
+                elif d == '$': i = dollar(s, i, w, buf, home, True)
+                elif d == '`':
+                    j = tick(s, i + 1); w.subs.append(re.sub(r'\\([`\\$])', r'\1', s[i + 1:j])); w.dyn = True
+                    buf.append(s[i:j + 1]); i = j + 1
+                else: buf.append(d); i += 1
+            continue
+        if c == '$': i = dollar(s, i, w, buf, home, False); continue
+        if c == '`':
+            j = tick(s, i + 1); w.subs.append(re.sub(r'\\([`\\$])', r'\1', s[i + 1:j])); w.dyn = True
+            buf.append(s[i:j + 1]); i = j + 1; continue
+        if c == '~' and i == st and (i + 1 >= n or s[i + 1] == '/' or s[i + 1] in META):
+            buf.append(home); i += 1; continue
+        buf.append(c); plain.append(c); i += 1
+    w.v, w.raw, p = ''.join(buf), s[st:i], ''.join(plain)
+    w.glob = bool(re.search(r'[*?[]', p))
+    w.brace = bool(re.search(r'\{[^{}]*(,|\.\.)[^{}]*\}', p))
+    return w, i
+
+OPS = ('<<<', '<<-', '&>>', ';;&', '&&', '||', '|&', ';;', ';&', '<<', '>>', '<>', '<&', '>&', '>|', '&>',
+       ';', '&', '|', '(', ')', '<', '>')
+REDIR = {'<', '>', '>>', '>|', '<>', '<&', '>&', '&>', '&>>', '<<', '<<-', '<<<'}
+
+def lex(s, home):
+    toks, pend, i, n = [], [], 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in ' \t\r': i += 1; continue
+        if c == '\\' and s[i + 1:i + 2] == '\n': i += 2; continue
+        if c == '#':
+            j = s.find('\n', i); i = n if j < 0 else j; continue
+        if c == '\n':
+            toks.append(('OP', '\n')); i += 1
+            for r in pend: i = body(s, i, r)
+            pend = []; continue
+        op = None if (c in '<>' and s[i + 1:i + 2] == '(') else next((o for o in OPS if s.startswith(o, i)), None)
+        if op is None:
+            w, i = word(s, i, home)
+            if re.fullmatch(r'\d+|\{\w+\}', w.raw) and s[i:i + 1] in ('<', '>'): continue   # an fd number
+            toks.append(('W', w)); continue
+        i += len(op)
+        if op not in REDIR: toks.append(('OP', op)); continue
+        while i < n and s[i] in ' \t': i += 1
+        if i >= n or s[i] in '\n;&|)': raise ParseError('redirect without a target')
+        w, i = word(s, i, home)
+        r = {'op': op, 'w': w, 'body': None, 'qd': w.q}
+        toks.append(('R', r))
+        if op in ('<<', '<<-'): pend.append(r)
+    for r in pend: r['body'] = r['body'] or ''
+    return toks
+
+def body(s, i, r):
+    lines, n = [], len(s)
+    while i < n:
+        j = s.find('\n', i); line = s[i:] if j < 0 else s[i:j]; i = n if j < 0 else j + 1
+        cmp = line.lstrip('\t') if r['op'] == '<<-' else line
+        if cmp == r['w'].v: break
+        lines.append(cmp)
+    r['body'] = '\n'.join(lines); return i
+
+def bexp(s):   # bash brace expansion of one word: {a,b} only
+    for i, c in enumerate(s):
+        if c != '{': continue
+        d, parts, st = 0, [], i + 1
+        for j in range(i, len(s)):
+            if s[j] == '{': d += 1
+            elif s[j] == '}':
+                d -= 1
+                if d == 0: break
+            elif s[j] == ',' and d == 1: parts.append(s[st:j]); st = j + 1
+        else: return [s]
+        if not parts: continue
+        parts.append(s[st:j])
+        return [x for p in parts for x in bexp(s[:i] + p + s[j + 1:])][:256]
+    return [s]
+
+def pos(ws, argopts=()):   # positional words, options (and the values of argopts) skipped
+    out, k = [], 0
+    while k < len(ws):
+        x = ws[k].v
+        if x == '--': return out + ws[k + 1:]
+        if x.startswith('-') and len(x) > 1: k += 2 if x in argopts else 1; continue
+        out.append(ws[k]); k += 1
+    return out
+
+def optval(ws, short, long):   # the value of -t X / --target-directory=X
+    for k, w in enumerate(ws):
+        if w.v == short or w.v == long:
+            if k + 1 < len(ws): return ws[k + 1]
+        elif w.v.startswith(long + '='): return w.like(w.v[len(long) + 1:])
+    return None
+
+# --------------------------------------------------------------------------------------------------------- parser
+class Guard:
+    def __init__(g, env):
+        g.home = os.path.normpath(env.get('GUARD_HOME') or env.get('HOME') or '/nonexistent')
+        g.role = env.get('GUARD_ROLE', '')
+        g.base = os.path.normpath(env.get('GUARD_CWD') or os.getcwd())
+        g.root = env.get('GUARD_ROOT', '')
+        g.mws = env.get('GUARD_MWS', '') if g.role == 'member' else ''
+        g.pseat = env.get('GUARD_PSEAT') == '1'
+        g.pathdirs = [d for d in env.get('PATH', '').split(':') if d]
+        g.env = env
+        g.out, g.dirs, g._names, g.vars = [], [], None, {}
+        g.headmove = g.cddyn = g.bypass = False
+        g.vsrc = {}   # a variable set from a substitution: its source text, read as a computed verb's words
+        nt = env.get('GUARD_NEVER_TOUCH') or os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'config', 'never-touch.txt')
+        g.nt = set()
+        try:
+            with open(nt) as f: g.nt |= {l.strip() for l in f if l.strip() and not l.lstrip().startswith('#')}
+        except OSError: pass
+        H = g.home
+        g.secf = {H + '/.claude/.credentials.json', H + '/ccbox/env', H + '/.codex/auth.json', H + '/.config/cursor/auth.json'}
+        g.secf |= {os.path.realpath(f) for f in g.secf}
+        g.secd = [H + '/.cc/config', H + '/.ssh', H + '/.claude/settings.json', H + '/.cc/sandbox', H + '/.cc/members'] if g.role == 'member' else []
+        g.own = H + '/.cc/members/' + g.mws if g.mws else ''   # member isolation: its own record is its own
+        g.allow = [d for d in g.root.split(':') + [H + '/dev/' + g.mws if g.mws else ''] if d]
+        g.allow += [os.path.realpath(d) for d in g.allow]
+        g.fixed = [(H + '/bin', '~/bin'), (H + '/.cc/try', '~/.cc/try'), (H + '/.cc/lander', '~/.cc/lander'),
+                   (H + '/.cc/state/land', '~/.cc/state/land'), (H + '/.cc/config', '~/.cc/config'),
+                   (H + '/.claude/settings.json', '~/.claude/settings.json')]
+        g.secx = [H + '/.cc/secrets']   # every role: the box's tokens, and any credentials.json / *.token under ~ (SECBASE)
+        names = ['.credentials.json', 'credentials.json', 'ccbox/env', '.codex/auth.json', 'cursor/auth.json', '.cc/secrets']   # as body text
+        names += ['.cc/config', '.ssh', '.claude/settings.json', '.cc/sandbox'] if g.role == 'member' else []
+        g.secn = re.compile(r'(?<![\w.-])(' + '|'.join(map(re.escape, names)) + r')(?![\w.-])')
+        seat = [d for d in glob.glob(H + '/.cc/state/*/perms') if os.path.isdir(d)]   # the seat's state as it stands now
+        seat += [f for f in (H + '/.cc/state/handoff/perms.json', H + '/.cc/state/handoff/perms.brief') if os.path.exists(f)]
+        g.above = [(d, "the permission seat's state") for d in seat]
+        if g.role != 'pf': g.above += [(H + '/dev', '~/dev (the live checkouts)')] + g.fixed
+
+    def absp(g, v, cwd):
+        return os.path.normpath(v if v.startswith('/') else os.path.join(cwd, v))
+
+    def deglob(g, pat):   # a globbed verb is every command name it can match
+        if g._names is None:
+            g._names = set(GATED)
+            for d in g.pathdirs:
+                try: g._names.update(os.listdir(d))
+                except OSError: pass
+        pat = pat.replace('[^', '[!')
+        return sorted(n for n in g._names if fnmatch.fnmatchcase(n, pat)) or [pat]
+
+    def script(g, text, cwd, nested, depth):
+        if depth > 8: raise ParseError('nested too deep')
+        start, toks, cmds, stack, k = len(g.out), lex(text, g.home), [], [], 0
+        cwdl, cur = [cwd], {'words': [], 'redirs': [], 'pipe': None}
+        def end(pipe=False):
+            nonlocal cur
+            idx = None
+            if cur['words'] or cur['redirs']:
+                g.finish(cur, cwdl, nested, depth, cmds); cmds.append(cur); idx = len(cmds) - 1
+            cur = {'words': [], 'redirs': [], 'pipe': idx if pipe else None}
+        while k < len(toks):
+            t = toks[k]; k += 1; top = stack[-1] if stack else None
+            if top and top[0] == 'casepat':   # case patterns are data up to their `)`
+                if t[0] == 'W' and t[1].v == 'esac' and not t[1].q: stack.pop()
+                elif t == ('OP', ')'): top[0] = 'casecmd'
+                continue
+            if t[0] == 'W':
+                w = t[1]
+                if not cur['words'] and not w.q and w.v == 'case' and k + 1 < len(toks) and toks[k][0] == 'W' \
+                        and toks[k + 1][0] == 'W' and toks[k + 1][1].v == 'in':
+                    for sub in toks[k][1].subs: g.script(sub, cwdl[0], '$()', depth + 1)
+                    k += 2; stack.append(['casepat']); continue
+                if not cur['words'] and not w.q and w.v == 'esac' and top and top[0] == 'casecmd':
+                    stack.pop(); continue
+                cur['words'].append(w)
+            elif t[0] == 'R': cur['redirs'].append(t[1])
+            elif t[1] in ('|', '|&'): end(True)
+            elif t[1] == '(':
+                if cur['words'] and k < len(toks) and toks[k] == ('OP', ')'):   # f() { ..; }: the name goes
+                    k += 1; cur['words'] = []; continue
+                end(); stack.append(['sub', cwdl[0]])
+            elif t[1] == ')':
+                end()
+                if not (top and top[0] == 'sub'): raise ParseError('unbalanced )')
+                cwdl[0] = top[1]; stack.pop()
+            elif t[1] in (';;', ';&', ';;&'):
+                end()
+                if not (top and top[0] == 'casecmd'): raise ParseError('stray ;;')
+                top[0] = 'casepat'
+            else: end()
+        end()
+        if any(e[0] == 'sub' for e in stack): raise ParseError('unclosed (')
+        return g.out[start:]
+
+    def finish(g, cur, cwdl, nested, depth, cmds):
+        for w in cur['words'] + [r['w'] for r in cur['redirs']]:
+            for sub in w.subs: g.script(sub, cwdl[0], '$()', depth + 1)
+        for r in cur['redirs']:
+            if r['body'] and not r['qd']:
+                for sub in subs_in(r['body']): g.script(sub, cwdl[0], '$()', depth + 1)
+        ws = []
+        for w in cur['words']:
+            ws += [w.like(x) for x in bexp(w.v)] if w.brace else [w]
+        i = 0
+        while i < len(ws) and not ws[i].q and ws[i].v in KW: i += 2 if ws[i].v == 'function' else 1
+        assigns = []
+        while i < len(ws) and ASSIGN.match(ws[i].raw): assigns.append(ws[i].v); i += 1
+        if i >= len(ws) and not assigns and not cur['redirs']: cur['rs'] = []; return
+        if i >= len(ws):   # X=docker on its own: a later `$X` in this command is that word (literal values only)
+            for w in ws[i - len(assigns):i]:
+                k, _, val = w.v.partition('=')
+                g.vars[k.rstrip('+')] = None if (w.dyn or w.glob or k.endswith('+')) else val
+                if w.dyn: g.vsrc[k.rstrip('+')] = w.raw.partition('=')[2]   # `X=$(echo docker)`: the text it is built from
+        cur['rs'] = g.expand(ws[i:], cur['redirs'], cwdl[0], assigns, [], nested, depth, (cmds, cur))
+        if cur['pipe'] is not None:   # the commands piped into this one (the kill fence asks whether a pgrep feeds it)
+            src = [[S['verb'] or ''] + S['args'] for S in cmds[cur['pipe']].get('rs', [])]
+            for R in cur['rs']: R['from'] = src
+        for R in cur['rs']:
+            if R['verb'] in ('cd', 'pushd', 'popd') and not R['via']: cwdl[0] = g.cd(R, cwdl[0])
+            if R['verb'] in ('export', 'declare', 'typeset', 'readonly', 'local'):
+                for w in R['argw']:
+                    if ASSIGN.match(w.raw):
+                        k, _, val = w.v.partition('=')
+                        g.vars[k.rstrip('+')] = None if (w.dyn or w.glob or k.endswith('+')) else val
+
+    def cd(g, R, cwd):
+        if R['verb'] == 'popd': return g.dirs.pop() if g.dirs else g.base
+        a = [w for w in R['argw'] if not w.v.startswith('-') or w.v == '-']
+        if not a: tgt = g.home if R['verb'] == 'cd' else g.base
+        elif a[0].dyn or a[0].v == '-': tgt = g.base; g.cddyn = True   # a cd this cannot resolve: judge against the session cwd
+        else: tgt = g.absp(re.split(r'[*?[]', a[0].v)[0] if a[0].glob else a[0].v, cwd)
+        if R['verb'] == 'pushd': g.dirs.append(cwd)
+        return tgt
+
+    def emit(g, verb, ws, redirs, cwd, assigns, via, nested, raw):
+        R = {'verb': verb, 'argw': ws, 'args': [w.v for w in ws], 'redirs': redirs, 'cwd': cwd,
+             'assigns': assigns, 'via': via, 'nested': nested, 'raw': raw}
+        g.out.append(R); return R
+
+    def expand(g, ws, redirs, cwd, assigns, via, nested, depth, ctx):
+        raw = [w.raw for w in ws]
+        if not ws: return [g.emit('', [], redirs, cwd, assigns, via, nested, raw)]
+        w0 = ws[0]
+        m = re.fullmatch(r'"?\$(\{)?([A-Za-z_]\w*)(?(1)\})"?', w0.raw)
+        if w0.dyn and m and g.vars.get(m.group(2)) is not None and depth < 8:   # `X=docker; $X run`: the verb is docker
+            val = g.vars[m.group(2)]
+            nw = [Word(val)] if w0.raw.startswith('"') else [Word(x, glob=bool(re.search(r'[*?[]', x))) for x in val.split()]
+            return g.expand(nw + ws[1:], redirs, cwd, assigns, via, nested, depth + 1, ctx) if nw else \
+                [g.emit('', ws[1:], redirs, cwd, assigns, via, nested, raw)]
+        if w0.dyn: return [g.emit(None, ws[1:], redirs, cwd, assigns, via, nested, raw + [g.vsrc.get(m.group(2), '') if m else ''])]
+        b0 = w0.v.rsplit('/', 1)[-1]
+        out = []
+        for b in (g.deglob(b0) if w0.glob else [b0]):
+            if b in WRAP and len(via) < 8:
+                j, info = g.unwrap(b, ws)
+                for t in info.get('script', []): out += g.script(t, cwd, b, depth + 1)
+                c2 = g.absp(info['cd'].v, cwd) if 'cd' in info and not info['cd'].dyn else cwd
+                if b == 'xargs' and ctx[1]['pipe'] is not None and j < len(ws):   # its argv grows from the pipe
+                    text = ' '.join("'" + w.v.replace("'", "'\\''") + "'" for w in ws[j:]) + ' ' + g.produced(ctx)
+                    try: out += g.script(text, c2, 'xargs', depth + 1)
+                    except ParseError: pass
+                if j is None or j >= len(ws): out.append(g.emit(b, ws[1:], redirs, cwd, assigns, via, nested, raw))
+                else: out += g.expand(ws[j:], redirs, c2, assigns + info.get('assigns', []), via + [b], nested, depth, ctx)
+                continue
+            R = g.emit(b, ws[1:], redirs, cwd, assigns, via, nested, raw); out.append(R)
+            out += g.inner(R, ws, depth, ctx)
+        return out
+
+    def unwrap(g, b, ws):   # -> (index of the wrapped command or None, {script, cd, assigns})
+        a, j, info = [w.v for w in ws], 1, {}
+        if b == 'command' and a[1:2] and a[1] in ('-v', '-V'): return None, info
+        if b in ('watch', 'flock', 'env'):
+            while j < len(a) and a[j].startswith('-') and a[j] != '-':
+                x = a[j]
+                if x in {'flock': ('-c', '--command'), 'env': ('-S', '--split-string')}.get(b, ()) and j + 1 < len(a):
+                    info.setdefault('script', []).append(a[j + 1]); return None, info
+                if b == 'env' and ((x.startswith('-S') and len(x) > 2) or x.startswith('--split-string=')):
+                    info.setdefault('script', []).append(x[2:] if x.startswith('-S') else x[15:]); return None, info
+                if x in ('-C', '--chdir') and j + 1 < len(a): info['cd'] = ws[j + 1]; j += 2; continue
+                if x.startswith('--chdir='): info['cd'] = ws[j].like(x[8:])
+                j += 2 if x in WRAP[b] | {'-u', '--unset'} else 1
+            while b == 'env' and j < len(a) and ASSIGN.match(a[j]): info.setdefault('assigns', []).append(a[j]); j += 1
+            if b == 'watch': info.setdefault('script', []).append(' '.join(a[j:])); return None, info
+            if b == 'flock': j += 1   # the lock file
+            return j, info
+        while j < len(a) and a[j].startswith('-') and a[j] != '-':
+            if a[j] == '--': j += 1; break
+            j += 2 if a[j] in WRAP[b] else 1
+        if b in ('taskset', 'chrt') and '-p' in a[1:j]: return None, info
+        if b in ('timeout', 'chrt', 'taskset'): j += 1   # its duration, priority or mask
+        return j, info
+
+    def produced(g, ctx):   # what the commands piped into this one print, read as words
+        cmds, cur = ctx; texts, idx = [], cur['pipe']
+        while idx is not None:
+            for R in cmds[idx].get('rs', []): texts.append(g.data(R))
+            idx = cmds[idx]['pipe']
+        return '\n'.join(reversed(texts))
+
+    def data(g, R):
+        bodies = [r['body'] if r['op'] in ('<<', '<<-') else r['w'].v for r in R['redirs'] if r['op'] in ('<<', '<<-', '<<<')]
+        if bodies: return '\n'.join(bodies)
+        a = R['args']
+        if R['verb'] in ('echo', 'printf'):
+            while a and re.fullmatch(r'-[neE]+', a[0]): a = a[1:]
+            return ' '.join(a).replace('\\n', '\n')
+        return ' '.join(a)
+
+    def fed(g, subs, cwd, via, depth):   # what a <( ) prints, read as the script a shell or `source` runs
+        out = []
+        for sub in subs:
+            rs = g.script(sub, cwd, '<()', depth + 1)
+            try: out += g.script('\n'.join(g.data(r) for r in rs), cwd, via, depth + 1)
+            except ParseError: pass
+        return out
+
+    def inner(g, R, ws, depth, ctx):   # what this command runs: sh -c, stdin to a shell, eval, find -exec, source <(..)
+        b, a, cwd, out = R['verb'], R['args'], R['cwd'], []
+        if b in SHELLS:
+            k, c, s = 0, False, False
+            while k < len(a) and a[k][:1] in ('-', '+') and a[k] not in ('-', '--'):
+                if a[k] in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file'): k += 2; continue
+                if not a[k].startswith('--'): c, s = c or 'c' in a[k], s or 's' in a[k]
+                k += 1
+            if a[k:k + 1] == ['--']: k += 1
+            if c:
+                if k < len(a): out += g.script(a[k], cwd, b + ' -c', depth + 1)
+            elif k >= len(a) or s:
+                for r in R['redirs']:
+                    if r['op'] in ('<<', '<<-', '<<<'):
+                        out += g.script(r['body'] if r['op'] != '<<<' else r['w'].v, cwd, 'stdin>' + b, depth + 1)
+                    if r['op'] == '<' and r['w'].subs:   # `bash < <(echo 'docker run ..')`: what the <( ) prints is the script
+                        out += g.fed(r['w'].subs, cwd, 'stdin>' + b, depth)
+                if ctx[1]['pipe'] is not None:
+                    try: out += g.script(g.produced(ctx), cwd, 'pipe>' + b, depth + 1)
+                    except ParseError: pass
+        elif b == 'script':   # script -c CMD / -qc CMD / --command[=]CMD runs CMD in a shell
+            for k, x in enumerate(a):
+                t = a[k + 1] if (re.fullmatch(r'-[A-Za-z]*c', x) or x == '--command') and k + 1 < len(a) else \
+                    x.split('=', 1)[1] if x.startswith('--command=') else None
+                if t is not None: out += g.script(t, cwd, 'script -c', depth + 1)
+        elif b == 'git':   # a `!` alias runs its text in a shell: -c alias.X=!CMD, or git config alias.X '!CMD'
+            cmds = [c.split('=', 1)[1][1:] for c in gitcfg(ws[1:]) if re.match(r'alias\.[^=]*=!', c, re.I)]
+            _, sub, rest = gitparse(ws[1:])
+            if sub == 'config':
+                rv = [w.v for w in rest]
+                cmds += [rv[k + 1][1:] for k, x in enumerate(rv[:-1]) if re.match(r'alias\.', x, re.I) and rv[k + 1].startswith('!')]
+            for t in cmds: out += g.script(t, cwd, 'git alias', depth + 1)
+        elif INTERP.fullmatch(b or ''):   # the code's string literals as the commands it may run: each literal, and
+            lits, runs = [], []          # each run that one list or concatenation holds ("a", "b" -> `a b`; "a " + "b" -> `a b`)
+            for code in progtext(b, a, []):
+                end = None
+                for m in re.finditer(r'"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\'|`((?:[^`\\]|\\.)*)`', code, re.S):
+                    t = re.sub(r'\\(.)', r'\1', next(x for x in m.groups() if x is not None))
+                    gap = code[end:m.start()] if end is not None else None
+                    if gap is not None and re.fullmatch(r'\s*[,+.]?\s*', gap): runs[-1] += (' ' if ',' in gap else '') + t
+                    else: runs.append(t)
+                    lits.append(t); end = m.end()
+            for t in dict.fromkeys(x for x in lits + runs if x.strip()):
+                n0 = len(g.out)
+                try: out += g.script(t, cwd, b + ' code', depth + 1)
+                except ParseError: del g.out[n0:]
+        elif b == 'ssh':   # what the far shell runs is kept on R['sshrem'] and judged by everyrole; what ssh runs HERE
+            rem, k = [], 0  # (-o ProxyCommand / LocalCommand / KnownHostsCommand) is parsed as local commands
+            while k < len(a) and a[k].startswith('-'):
+                if a[k] == '--': k += 1; break
+                opt = a[k + 1] if a[k] == '-o' and k + 1 < len(a) else a[k][2:] if a[k].startswith('-o') else ''
+                m = re.match(r'\s*(\w+)\s*(?:=\s*|\s+)(.*)', opt, re.S)
+                if m and m.group(1).lower() == 'remotecommand': rem.append(m.group(2))
+                elif m and m.group(1).lower() in ('proxycommand', 'localcommand', 'knownhostscommand'):
+                    out += g.script(m.group(2), cwd, 'ssh -o', depth + 1)
+                k += 2 if a[k] in SSHOPT else 1
+            if a[k + 1:]: rem.append(' '.join(a[k + 1:]))   # the words after the host, joined by blanks as ssh sends them
+            # …and what it is fed: a heredoc, a here-string, a <( ), or a pipe (`echo 'sudo reboot' | ssh <host>`)
+            rem += [r['body'] if r['op'] != '<<<' else r['w'].v for r in R['redirs'] if r['op'] in ('<<', '<<-', '<<<')]
+            for r in R['redirs']:
+                if r['op'] == '<' and r['w'].subs:
+                    rem += ['\n'.join(g.data(x) for x in g.script(sub, cwd, '<()', depth + 1)) for sub in r['w'].subs]
+            if ctx[1]['pipe'] is not None: rem.append(g.produced(ctx))
+            R['sshrem'] = [t for t in rem if t.strip()]
+        elif b == 'eval' and a:
+            out += g.script(' '.join(a), cwd, 'eval', depth + 1)
+        elif b in ('source', '.') and ws[1:2] and ws[1].subs:
+            out += g.fed(ws[1].subs, cwd, 'source', depth)
+        elif b == 'find':
+            k = 1
+            while k < len(ws):
+                if ws[k].v in ('-exec', '-execdir', '-ok', '-okdir'):
+                    j = k + 1
+                    while j < len(ws) and ws[j].v not in (';', '+'): j += 1
+                    out += g.expand(ws[k + 1:j], [], cwd, [], R['via'] + ['find -exec'], R['nested'], depth + 1, ctx)
+                    k = j
+                k += 1
+        return out
+
+    # ------------------------------------------------------------------------------------------------------ rules
+    def prot(g, p, cut=False, pat=None):   # the protected place p lands in (cut: p is the literal prefix of glob pat), or None
+        H = g.home
+        for q in ({p, os.path.realpath(p)} if not cut else {p}):
+            if BLOCKDEV.match(q): return 'a block device'
+            inside = lambda d: q == d or q.startswith(d + '/')
+            if inside(H + '/dev') and not any(inside(d) for d in g.allow): return '~/dev (the live checkouts)'
+            for d, lab in g.fixed:
+                if inside(d): return lab
+            if not g.pseat and re.match(re.escape(H) + r'/\.cc/state/([^/]+/perms(/|$)|handoff/perms\.(json(\.tmp)?|brief)$)', q):
+                return "the permission seat's state"
+            if cut:   # the glob may reach a protected root from above
+                # the seat's state first (the ungated tier reads no other label): refused when the glob, read a path
+                # component at a time, can name a seat place as it stands now, a directory above one, or a path inside
+                # one (`rm ~/.cc/state/s*` beside the seat passes)
+                if not g.pseat and pat is not None:
+                    pc = pat.rstrip('/').split('/')
+                    for d, lab in g.above:
+                        if lab != SEATLAB: continue
+                        dc = d.split('/')
+                        if all(fnmatch.fnmatchcase(x, y) for x, y in zip(dc, pc)): return SEATLAB
+                for d in [H + '/dev/'] + [d for d, _ in g.fixed]:
+                    if d.startswith(q): return d.replace(H, '~', 1)
+        return None
+
+    def wtargets(g, R):
+        v, ws, out = R['verb'], R['argw'], []
+        if v != '[[':
+            for r in R['redirs']:
+                if r['op'] in ('>', '>>', '>|', '&>', '&>>', '<>') or (r['op'] == '>&' and not re.fullmatch(r'\d*-?', r['w'].v)):
+                    out.append(r['w'])
+        a = R['args']
+        if v in ('cp', 'install', 'ln', 'rsync', 'mv'):
+            t = optval(ws, '-t', '--target-directory')
+            p = pos(ws, {'-t', '--target-directory', '-S', '--suffix', '-m', '--mode', '-o', '--owner', '-g', '--group', '-e', '--rsh'})
+            if v == 'mv': out += p + ([t] if t else [])
+            elif t: out.append(t)
+            elif len(p) >= 2 and not (v == 'rsync' and re.match(r'[^/]*:', p[-1].v)): out.append(p[-1])
+            elif v == 'ln' and p: out.append(Word('.'))
+            if v == 'rsync' and '--remove-source-files' in a: out += p[:-1]
+        elif v in RMOPTS: out += pos(ws, RMOPTS[v])
+        elif v in ('chmod', 'chown', 'chgrp'):
+            p = pos(ws, {'--reference'}); out += p if any(x.startswith('--reference') for x in a) else p[1:]
+        elif v == 'dd': out += [w.like(w.v[3:]) for w in ws if w.v.startswith('of=')]
+        elif v in ('sed', 'perl') and any(re.match(r'-[A-Za-z]*i', x) or x.startswith('--in-place') for x in a):
+            p, k, given = [], 0, False
+            while k < len(ws):
+                x = ws[k].v
+                if re.fullmatch(r'-[A-Za-z]*[efE]', x) or x in ('--expression', '--file'): given = True; k += 2; continue
+                if x.startswith(('--expression=', '--file=')): given = True
+                elif not x.startswith('-'): p.append(ws[k])
+                k += 1
+            out += p if given else p[1:]
+        elif v == 'curl': out += [t for t in [optval(ws, '-o', '--output')] if t]
+        elif v == 'wget': out += [t for t in (optval(ws, '-O', '--output-document'), optval(ws, '-P', '--directory-prefix')) if t]
+        elif v == 'find' and '-delete' in a:
+            k = 0
+            while k < len(ws) and not ws[k].v.startswith(('-', '(', '!')): k += 1
+            out += ws[:k] or [Word('.')]
+        elif v == 'git':
+            dirs, sub, rest = gitparse(ws)
+            if sub in GITW:
+                base = Word('.')
+                for d in dirs: base = d.like(os.path.join(base.v, d.v)) if not base.dyn else base
+                if sub == 'clone':
+                    p = pos(rest, {'-b', '--branch', '-o', '--origin', '--depth', '-c', '--config', '--reference'})
+                    base = p[1] if len(p) > 1 else Word(os.path.join(base.v, re.sub(r'\.git$', '', p[0].v.rstrip('/').rsplit('/', 1)[-1]))) if p else base
+                out.append(base)
+        return out
+
+    def is_secret(g, cand, glob, cwd):
+        p = g.absp(cand, cwd)
+        if g.own and any(q == g.own or q.startswith(g.own + '/') for q in (p, os.path.realpath(p))): return False
+        if glob:
+            cut = re.split(r'[*?[]', p)[0]
+            return any(fnmatch.fnmatchcase(f, p) for f in g.secf) or any(cut.startswith(d) or d.startswith(cut) for d in g.secd + g.secx)
+        for q in (p, os.path.realpath(p)):
+            if q in g.secf or any(q == d or q.startswith(d + '/') for d in g.secd + g.secx): return True
+            if q.startswith(g.home + '/') and SECBASE.fullmatch(os.path.basename(q)): return True
+            if q.endswith('/ccbox/env') and (os.path.exists(q) or cand.rstrip('/') != 'ccbox/env'):
+                return True   # the PAT file in any checkout (main's secret_all: */ccbox/env); a bare `ccbox/env` that
+                # names no file here is a grep pattern, not a path
+        return False
+
+    def rmtargets(g, R):   # what this command removes or moves away whole (its parents matter, not only its insides)
+        v, ws, a = R['verb'], R['argw'], R['args']
+        if v in ('rm', 'rmdir'): return pos(ws)
+        if v == 'mv':
+            p = pos(ws, {'-t', '--target-directory', '-S', '--suffix'})
+            return p if optval(ws, '-t', '--target-directory') else p[:-1]
+        if v == 'rsync':
+            p = [w for w in pos(ws, {'-e', '--rsh', '-f', '--filter', '--exclude', '--include', '-T', '--temp-dir'})
+                 if not re.match(r'[^/]*:', w.v)]
+            out = p[:-1] if '--remove-source-files' in a else []
+            return out + (p[-1:] if len(p) >= 2 and any(x.startswith('--del') for x in a) else [])
+        if v == 'find' and '-delete' in a:
+            k = 0
+            while k < len(ws) and not ws[k].v.startswith(('-', '(', '!')): k += 1
+            return ws[:k] or [Word('.')]
+        return []
+
+    def fence(g, R):   # the write fence, and a remove/move of a directory holding a protected place
+        for w in g.wtargets(R):
+            if w.dyn and not w.v.startswith(g.home): continue
+            if w.glob:
+                cut = re.split(r'[*?[]', w.v)[0]
+                lab = g.prot(cut if cut.startswith('/') else os.path.join(R['cwd'], cut), cut=True,
+                             pat=w.v if w.v.startswith('/') else os.path.join(R['cwd'], w.v))
+            else: lab = g.prot(g.absp(w.v, R['cwd']))
+            if g.role == 'pf' and lab != SEATLAB: continue
+            if lab == 'a block device': return 'never', 'writing onto a block device (partitioning by another name)'
+            if lab == SEATLAB: return 'never', SEATWHY
+            if lab: return 'never', f'writing into {lab}: the live tree and the gates are written by the lander alone'
+        if g.pseat: return None
+        for w in g.rmtargets(R):
+            if w.dyn or w.glob: continue   # a glob's cut prefix is judged by prot above
+            for q in {g.absp(w.v, R['cwd']), os.path.realpath(g.absp(w.v, R['cwd']))}:
+                for d, lab in g.above:
+                    if d.startswith(q.rstrip('/') + '/'):
+                        return 'never', f'removing or moving {w.v} takes {lab} with it' + (f' ({SEATWHY})' if lab == SEATLAB else
+                                        ': the live tree and the gates are written by the lander alone')
+        return None
+
+    def secread(g, R, mem=False):   # a read of the box's credentials: an argv word, a `<` source, or an interpreter's program text
+        v = R['verb']
+        if v not in ('echo', 'printf'):
+            for w in R['argw'] + [r['w'] for r in R['redirs'] if r['op'] in ('<', '<>')]:
+                if w.dyn and not w.v.startswith(g.home): continue
+                cands = {w.v} | ({w.v.split('=', 1)[1]} if '=' in w.v else set()) | ({w.v.split('@', 1)[1]} if '@' in w.v else set())
+                if any(c and '\n' not in c and g.is_secret(c, w.glob, R['cwd']) for c in cands):
+                    return 'never', "reading the box's credentials" + (" or secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json, ~/.cc/sandbox)" if mem else '')
+        for t in progtext(v or '', R['args'], R['redirs']):
+            m = g.secn.search(t)
+            if m: return 'never', f"reading the box's credentials ({m.group(1)}) from inside a {v} program"
+        return None
+
+    def everyrole(g, R):   # the hard limits no role is without, the ungated tier included
+        v, a = R['verb'], R['args']
+        while v in ROOTV and v != 'su':   # `sudo -n reboot`: the verb that runs as root is the one after the options
+            k = 0
+            while k < len(a) and a[k].startswith('-'): k += 2 if a[k] in ROOTOPT else 1
+            v, a = (a[k], a[k + 1:]) if k < len(a) else (None, [])
+            if v is not None and v != 'su':   # what sudo runs is judged as a command of its own: `sudo /sbin/reboot`,
+                # `sudo env reboot` (the way su -c is; perms' read of 600963af)
+                h = judge(' '.join(shq(x) for x in [v] + a), dict(g.env, GUARD_ROLE=g.role))
+                if h: return h
+                v = v.rsplit('/', 1)[-1]
+        if v == 'su' and '-c' in a[:-1]: return judge(a[a.index('-c') + 1], dict(g.env, GUARD_ROLE=g.role))
+        if power(v, a):
+            return 'never', f'rebooting, halting, suspending or switching the target of the box ({v}): a hard limit for every role'
+        if R['verb'] is None and any(f in POWERV for t in [re.sub(r'[\\\'"]', '', x) for x in R['raw']] + a
+                                     for f in re.findall(r'[A-Za-z0-9_.+-]+', t)):
+            return 'never', 'a command word this cannot read (a $ or a substitution) next to a reboot or shutdown; spell the command out'
+        for t in R.get('sshrem', []):   # SSH CARRIES THE HARD LIMITS WITH IT, to any host: its remote command, its
+            h = judge(t, dict(g.env, GUARD_ROLE=g.role))   # -o RemoteCommand and what it is fed are judged for this role
+            if h: return 'never', f'an ssh carrying a hard limit (on any host the same limit as typing it here): {h[1]}'
+            if g.role != 'pf':   # …and for a gated role any root, power, firewall, disk, container, unit or network verb at
+                s2 = Guard(dict(g.env, GUARD_ROLE=g.role)); s2.script(t, g.base, 'ssh', 1)   # all (perms' read of 1ed108ee)
+                bad = sorted({R2['verb'] for R2 in s2.out if R2['verb'] in SSHHARD or (R2['verb'] or '').startswith('mkfs')})
+                if bad: return 'never', f'an ssh carrying `{bad[0]}`: a root, power, firewall, disk, container, unit or network verb on any host'
+        if (v == 'cc-slack' and a[:2] == ['member', 'add']) or (v == 'cc' and a[:3] == ['slack', 'member', 'add']):
+            return 'never', "widening who reaches the box (cc-slack member add) is the owner's to do"
+        return None
+
+    def rules(g, R):
+        v, a, mem = R['verb'], R['args'], g.role == 'member'
+        h = g.everyrole(R)
+        if h: return h
+        if g.role == 'pf':   # THE UNGATED TIER: the seat's state, the hard limits above (ssh carrying them too), the credentials
+            return g.fence(R) or g.secread(R)
+        n = [x for x in a if not x.startswith('-')]
+        first = n[0] if n else ''
+        if v is None:
+            # quotes and backslashes come off first: `$X re''boot` runs reboot, so it is matched as reboot
+            text = [re.sub(r'[\\\'"]', '', raw) for raw in R['raw']] + a
+            bad = sorted(f for t in text for f in re.findall(r'[A-Za-z0-9_.+-]+', t)
+                         if f in HARD or f.startswith('mkfs') or (mem and f in ('cc-config', 'cc-loop')))   # a member's whatever the args
+            if bad: return 'never', f'a command word this cannot read (a $ or a substitution) next to `{bad[0]}`; spell the command out'
+            # …and the hard limits keyed on a verb's ARGUMENTS (`$(echo git) push -f origin main`): the arguments are
+            # judged as each such verb's, and the first refusal stands
+            for cand in CANDV:
+                if cand == 'ip' and first not in IPOBJ: continue   # ip refuses any non-read; only its own objects say ip
+                if cand == 'cc' and not (CCWORDS & set(a) or any(x.startswith('--go=') for x in a)): continue   # …and cc any other repo
+                r = g.rules(dict(R, verb=cand))
+                if r: return r[0], f'a command word this cannot read (a $ or a substitution) whose arguments, run by {cand}, are refused: {r[1]}'
+        if v in ROOTV: return 'never', f'running as root ({v}): reboot, firewall, partitions and the network sit behind it'
+        if power(v, a): return 'never', f'rebooting, halting, suspending or switching the target of the box ({v})'
+        if v in ('systemctl', 'service') and UNITSTOP & set(a):
+            u = next((x for x in a if NETUNIT.fullmatch(x)), None)
+            if u: return 'never', f'stopping a network unit ({v} {u}): the links and the hotspot are never-touch'
+        if v in NET and any(e.lower() in x.lower() for x in a for e in g.nt):
+            return 'never', f'touching a never-touch network entry ({v})'
+        if v in FW and not fwread(v, a, n): return 'never', f'changing the firewall ({v})'
+        if (v in PART or (v or '').startswith('mkfs')) and not partread(v, a, n):
+            return 'never', f'partitioning or formatting a disk ({v})'
+        if v in NET and netwrite(v, a, n): return 'never', f'changing the network ({v}): the links and the hotspot are never-touch'
+        if v in CONT: return 'never', f'running a container ({v}): the socket is root-equivalent'
+        h = g.secread(R, mem)
+        if h: return h
+        if v == 'git':
+            dirs, sub, rest = gitparse(R['argw'])
+            if sub == 'push':
+                rv = [w.v for w in rest]
+                if '--mirror' in rv: return 'deny', 'git push --mirror rewrites every ref on the remote, the default branch included'
+                if {'--all', '--branches'} & set(rv): return 'deny', 'git push --all pushes every branch, the default branch included'
+                if any(re.match(r'(remote\.[^=]*\.(push|mirror)|push\.default)=', c, re.I) for c in gitcfg(R['argw'])) \
+                        or any(x.startswith('GIT_CONFIG_') for x in R['assigns']):
+                    return 'deny', 'a git push whose -c config picks the refspec (it can name the default branch)'
+                pw = pos(rest, {'-o', '--push-option', '--repo', '--receive-pack', '--exec'})
+                p = [w.v for w in pw][1:]
+                gd = [w for k, w in enumerate(R['argw'][1:], 1) if R['argw'][k - 1].v == '--git-dir'] + \
+                     [w.like(w.v[10:]) for w in R['argw'] if w.v.startswith('--git-dir=')]
+                genv = [x.split('=', 1)[1] for x in R['assigns'] if x.startswith(('GIT_DIR=', 'GIT_WORK_TREE='))] + \
+                       [g.vars[k] for k in ('GIT_DIR', 'GIT_WORK_TREE') if k in g.vars]
+                # the branch a push reaches is read off the checkout BEFORE the command runs, so a push in a command
+                # that also moves HEAD, or whose destination, -C, --git-dir, GIT_DIR or cd is computed, is refused
+                # (perms' read of 600963af: `git switch -C main; git push -f origin HEAD`, `git push origin HEAD:$(echo main)`)
+                if g.headmove: return 'deny', 'a git push in a command that also moves HEAD (checkout, switch, symbolic-ref, branch -m): push in a command of its own'
+                if any(w.dyn for w in pw + dirs + gd) or g.cddyn or any(x is None or '$' in x or '`' in x for x in genv):
+                    return 'deny', 'a git push whose destination, -C, --git-dir, GIT_DIR or directory is computed: spell it out'
+                gdir = (g.absp(gd[0].v, R['cwd']) if gd else g.absp(genv[0], R['cwd']) if genv else None)
+                cur = lambda: (gitbranch(gdir) if gdir else
+                               curbranch(g.absp(dirs[-1].v, R['cwd']) if dirs else R['cwd']))
+                if not p and cur() in ('main', 'master'):   # no refspec: the current branch goes (push.default)
+                    return 'deny', 'pushing from the default branch (main/master)'
+                for rs in p:
+                    src, _, dst = rs.lstrip('+').rpartition(':') if ':' in rs else ('', '', rs.lstrip('+'))
+                    if ':' not in rs and dst in ('HEAD', '@'): dst = cur()   # `git push origin HEAD`: the current branch's name
+                    dst = re.sub(r'^refs/heads/', '', dst or '')
+                    if dst in ('main', 'master') or '*' in dst:   # None = no checkout here: git itself refuses that push
+                        return 'deny', 'pushing to the default branch (main/master), or to a glob that matches it'
+                # a worker rewrites or deletes only its own track branch: `--force … publish:refs/heads/publish` from a
+                # copy in /tmp is a force push all the same (perms' replay set, row "force push or deleting refspec")
+                force = any(x in ('-f', '--force', '-d', '--delete') or x.startswith(('--force-', '--force=')) or
+                            re.fullmatch(r'-[a-zA-Z]*[fd][a-zA-Z]*', x) for x in rv if x.startswith('-')) or any(x.startswith(('+', ':')) for x in p)
+                if g.role == 'worker' and force:
+                    dsts = [re.sub(r'^refs/heads/', '', rs.lstrip('+').rpartition(':')[2] if ':' in rs else rs.lstrip('+')) for rs in p]
+                    dsts = [cur() if d in ('HEAD', '@') else d for d in dsts] if p else [cur()]
+                    if any(not (d or '').startswith('track/') for d in dsts):
+                        return 'deny', "a force push or branch delete off this track's own branch (track/…)"
+            if sub == 'config' and any(re.fullmatch(r'remote\..*\.(push|mirror)|push\.default', w.v, re.I) for w in rest):
+                return 'deny', 'setting the refspec a later git push sends (remote.*.push / mirror, push.default)'
+        if v == 'gh':
+            gn = [w.v for w in pos(R['argw'], {'-R', '--repo'})]
+            if gn[:2] in (['repo', 'delete'], ['repo', 'archive']): return 'deny', f'gh repo {gn[1]}'
+            if g.role == 'worker' and gn[:1] in (['pr'], ['issue']) and gn[1:2] and gn[1] in GHPOST:
+                return 'deny', f"posting to a PR or issue (gh {gn[0]} {gn[1]}): a worker's PR text goes up through cc done"
+            if gn[:1] == ['api']:
+                ep = [w.v for w in pos(R['argw'], {'-X', '--method', '-H', '--header', '-f', '-F', '--field', '--raw-field', '--input',
+                                                   '-q', '--jq', '-t', '--template', '--cache', '--hostname', '-p', '--preview', '-R', '--repo'})][1:2]
+                meth = ''
+                for k, x in enumerate(a):
+                    if x in ('-X', '--method') and k + 1 < len(a): meth = a[k + 1]
+                    elif x.startswith('--method=') or (x.startswith('-X') and len(x) > 2): meth = x.split('=', 1)[-1] if x.startswith('--') else x[2:].lstrip('=')
+                # the endpoint as gh resolves it: a full URL, a leading / and a ?query come off (perms' read of 600963af)
+                ep = [re.sub(r'\?.*$', '', re.sub(r'^(https?://[^/]+/(api/v3/)?)?/*', '', e)).rstrip('/') for e in ep]
+                if meth.upper() == 'DELETE' and ep and re.fullmatch(r'repos/[^/]+/[^/]+(/git/refs/heads/(main|master))?', ep[0]):
+                    return 'deny', 'deleting a repo or its default branch through gh api'
+                form = any(x in ('-f', '-F', '--field', '--raw-field', '--input') or x.startswith(('-f', '-F', '--field=', '--raw-field=', '--input='))
+                           for x in a)
+                if (meth.upper() or ('POST' if form else 'GET')) in ('PATCH', 'POST', 'PUT') and ep \
+                        and re.fullmatch(r'repos/[^/]+/[^/]+/git/refs/heads/(main|master)', ep[0]):
+                    return 'deny', 'moving the default branch (main/master) through gh api'
+                prot = r'repos/[^/]+/[^/]+/(branches/(main|master)/protection(/.*)?|rulesets(/.*)?)'
+                if (meth.upper() or ('POST' if form else 'GET')) in ('DELETE', 'PATCH', 'POST', 'PUT') and ep and re.fullmatch(prot, ep[0]):
+                    return 'deny', "removing or rewriting the default branch's protection (or a ruleset) through gh api"
+                # widening a non-owner (cc-infer's "widening a non-owner"): a collaborator, an org member or an invitation
+                wid = r'repos/[^/]+/[^/]+/(collaborators|invitations)(/.*)?|orgs/[^/]+/(members|memberships|invitations|outside_collaborators)(/.*)?'
+                if (meth.upper() or ('POST' if form else 'GET')) in ('PATCH', 'POST', 'PUT') and ep and re.fullmatch(wid, ep[0]):
+                    return 'deny', "widening a non-owner's access (a collaborator, org member or invitation) through gh api"
+                if ep == ['graphql'] and any(GHREF.search(x) for x in a):
+                    return 'deny', 'a GraphQL mutation that deletes or rewrites a branch, its protection or a repo'
+                if ep == ['graphql'] and any(x == '--input' or x.startswith('--input=') or re.match(r'query=@', x) for x in a):
+                    return 'deny', 'a GraphQL query read from a file (this cannot see whether it rewrites a branch, its protection or a repo)'
+        if v in LAUNCHERS and any(x.startswith(('--dangerously-skip-permissions', '--allow-dangerously-skip-permissions'))
+                                   or x == 'bypassPermissions' or x.endswith('=bypassPermissions') for x in a):
+            return 'never', 'starting a session with its permission checks skipped'
+        w = optval(R['argw'], '--settings', '--settings') if v in LAUNCHERS else None
+        if w:   # --settings JSON or FILE naming bypassPermissions (perms' read of 600963af), a computed one, or a file
+            try:  # this same command writes with it
+                with open(g.absp(w.v, R['cwd'])) as f: body = f.read()
+            except (OSError, ValueError): body = ''
+            if w.dyn or 'bypassPermissions' in w.v + body or g.bypass:
+                return 'never', 'starting a session whose --settings skips its permission checks'
+        if (v == 'cc' and '__runperms' in a) or (v == 'cc-handoff' and any(x.startswith('--perms-dir') for x in a)):
+            return 'never', 'starting the permission seat (the one session that runs with checks skipped)'
+        help_ = bool(HELP & set(a))
+        if v == 'lander-self' and first in ('land', 'promote', 'rollback', 'pin') and not help_:
+            return 'never', f'lander-self {first}: the gate rewriting itself'
+        if v == 'cc-try' and first in ('on', 'off', 'check'): return 'never', 'cc-try switches the live overlay in front of ~/bin'
+        if v == 'cc-config' and mem: return 'never', "the box's config is not a member's to read or rewrite (cc-config)"
+        if v == 'cc-config' and first in ('set', 'unset') and len(n) > 1 and PROTKEY.match(n[1]):
+            return 'never', f'cc-config {first} {n[1].split("=")[0]}: a key the landing gate reads'
+        if v == 'cc-settings' and first in ('apply', 'grant'): return 'never', 'cc-settings rewrites the permission layer'
+        h = g.fence(R)
+        if h: return h
+        if not mem: return None
+        if any(x.startswith(('CC_MEMBER_SANDBOX=', 'CC_MEMBER_SANDBOX+=')) for x in R['assigns'] +
+               (a if v in ('export', 'declare', 'typeset', 'readonly', 'local') else [])):
+            return 'never', 'setting CC_MEMBER_SANDBOX: the boundary opens a workspace session from outside'
+        if v == 'cc':
+            if any(x == '--go' or x.startswith('--go=') for x in a) and a[:1] not in (['board'], ['quick']) \
+                    and not (g.mws and a[:1] == [g.mws]):
+                return 'never', ('dispatching outside this workspace' if g.mws else 'a member-facing session does not dispatch workers (cc --go)')
+            if g.mws and a:
+                r = ''
+                if a[0] == 'board': r = a[2] if len(a) > 2 and not a[2].startswith('-') else ''
+                elif a[0] in ('done', 'rm', 'handoff', '-c'): r = next((x for x in a[1:] if not x.startswith('-')), '')
+                elif a[0] not in ('slack', 'rc', 'digest', 'quick', 'ls', 'resume') and not a[0].startswith('-'): r = a[0]
+                r = r.split('/')[0]
+                if r and r != g.mws: return 'never', f'creating outside `{g.mws}`: this workspace makes tracks, boards and sessions under ~/dev/{g.mws} only'
+            if a[:1] == ['slack'] and a[1:2] and a[1] in ('off', 'setup', 'mkchannel', 'updates-sweep', 'archive', 'retire'):
+                return 'never', f"re-wiring the box's Slack (cc slack {a[1]})"
+        if v == 'cc-loop': return 'never', 'a member does not call cc-loop (it spends without the ledger)'
+        if v == 'claude' and any(x in ('-p', '--print') or x.startswith('--print=') for x in a):
+            return 'never', "a headless claude spends the owner's budget"
+        if v == 'cc-slack' and first in ('off', 'setup', 'mkchannel', 'updates-sweep', 'archive', 'retire'):
+            return 'never', f"re-wiring the box's Slack (cc-slack {first})"
+        if not help_ and ((v == 'cc-slack' and first in ('inject', 'post', 'post-approval')) or (v == 'cc-broker' and first in ('inject', 'ledger'))):
+            return 'deny', f"posting to the owner's Slack ({v} {first})"
+        if v == 'cc-publish' and not help_ and first not in ('status', 'selfcheck', 'setup') and '--dry-run' not in a:
+            return 'deny', "publishing the box's code outward (cc-publish)"
+        return None
+
+def progtext(v, a, redirs):   # the program text an interpreter -c/-e, awk or sed runs (data to the parser, read here as text)
+    out = []
+    m = INTERP.fullmatch(v)
+    if m:
+        fl = {'python': 'c', 'pypy': 'c', 'perl': 'eE', 'ruby': 'e', 'node': 'ep', 'nodejs': 'ep', 'deno': '', 'bun': 'e', 'php': 'r'}
+        f = fl[re.match(r'[a-z]+', v).group()]
+        for k, x in enumerate(a):
+            if x in ('--eval', '--print', '--run') and k + 1 < len(a): out.append(a[k + 1])
+            elif x.startswith(('--eval=', '--print=')): out.append(x.split('=', 1)[1])
+            elif f and not x.startswith('--'):
+                mm = re.fullmatch(r'-[A-Za-z]*?[%s](.*)' % f, x, re.S)
+                if mm: out.append(mm.group(1) or (a[k + 1] if k + 1 < len(a) else ''))
+        out += [r['body'] if r['op'] in ('<<', '<<-') else r['w'].v for r in redirs if r['op'] in ('<<', '<<-', '<<<')]
+    elif v in AWKS or v == 'sed':
+        valopts = {'-F', '-v', '-f', '-i', '-l', '-W', '--assign', '--field-separator', '--include', '--load', '--file'} if v != 'sed' \
+            else {'-f', '-l', '--file', '--line-length'}
+        given, k, posn = False, 0, []
+        while k < len(a):
+            x = a[k]
+            if x in ('-e', '--source', '--expression') or (v == 'sed' and re.fullmatch(r'-[A-Za-z]*e', x)):
+                if k + 1 < len(a): out.append(a[k + 1])
+                given = True; k += 2; continue
+            if x.startswith(('--source=', '--expression=')): out.append(x.split('=', 1)[1]); given = True
+            elif x in valopts: given = given or x in ('-f', '--file'); k += 2; continue
+            elif x.startswith('--file='): given = True
+            elif not x.startswith('-') or x == '-': posn.append(x)
+            k += 1
+        if not given and posn: out.append(posn[0])
+    return out
+
+def gitparse(ws):   # git's global options -> (-C dirs, subcommand, the words after it)
+    k, dirs = 0, []
+    while k < len(ws):
+        x = ws[k].v
+        if x in ('-C', '--work-tree') and k + 1 < len(ws): dirs.append(ws[k + 1]); k += 2
+        elif x in ('-c', '--git-dir', '--namespace', '--config-env', '--super-prefix'): k += 2
+        elif x.startswith('--work-tree='): dirs.append(ws[k].like(x[12:])); k += 1
+        elif x.startswith('-'): k += 1
+        else: return dirs, x, ws[k + 1:]
+    return dirs, '', []
+
+def shq(x):   # one word, single-quoted for the shell
+    return "'" + x.replace("'", "'\\''") + "'"
+
+def gitcfg(ws):   # the values of git's global -c options, before the subcommand
+    out, k = [], 0
+    while k < len(ws) and (ws[k].v.startswith('-') or (k and ws[k - 1].v in ('-C', '-c', '--work-tree', '--git-dir', '--namespace', '--config-env'))):
+        if ws[k].v == '-c' and k + 1 < len(ws): out.append(ws[k + 1].v)
+        k += 1
+    return out
+
+def headmove(R):   # a command that changes which branch HEAD names
+    if R['verb'] == 'gh': return R['args'][:2] == ['pr', 'checkout']
+    if R['verb'] != 'git': return False
+    _, sub, rest = gitparse(R['argw'])
+    rv = [w.v for w in rest]
+    return sub in ('checkout', 'switch', 'symbolic-ref', 'worktree') or (sub == 'branch' and bool({'-m', '-M', '--move'} & set(rv))) \
+        or (sub == 'update-ref' and 'HEAD' in rv)
+
+def gitbranch(gd):   # the branch a git dir's HEAD names ('HEAD' when detached, so not main), or None
+    try:
+        with open(os.path.join(gd, 'HEAD')) as f: head = f.read().strip()
+    except OSError: return None
+    return head[len('ref: refs/heads/'):] if head.startswith('ref: refs/heads/') else 'HEAD'
+
+def curbranch(d):   # the branch checked out at d (its .git, a worktree's gitdir file followed), or None outside a checkout
+    while d and d != '/':
+        dg = os.path.join(d, '.git')
+        try:
+            if os.path.isfile(dg):
+                with open(dg) as f: dg = os.path.join(d, f.read().split('gitdir:', 1)[1].strip())
+        except (OSError, IndexError): return None
+        if os.path.isdir(dg): return gitbranch(dg)
+        d = os.path.dirname(d)
+    return None
+
+def fwread(v, a, n):
+    if v.startswith(('iptables', 'ip6tables', 'ebtables', 'arptables')) and not v.endswith('restore'):
+        lst = any(re.fullmatch(r'-[A-Za-z]*[LS][A-Za-z]*', x) or x in ('--list', '--list-rules') for x in a)
+        wr = any(re.fullmatch(r'-[A-Za-z]*[ADIRFXPNZE][A-Za-z]*', x) or x in ('--append', '--delete', '--insert', '--replace',
+                 '--flush', '--delete-chain', '--policy', '--new-chain', '--zero', '--rename-chain') for x in a)
+        return lst and not wr
+    if v == 'nft': return '-f' not in a and (n[:1] == ['list'] or (bool(a) and set(a) <= HELP | {'-v', '--version'}))
+    if v == 'ufw': return n[:1] in (['status'], ['show'], ['version']) or (n[:1] == ['app'] and n[1:2] in (['list'], ['info'])) or bool(HELP & set(a))
+    if v == 'firewall-cmd': return bool(a) and all(re.fullmatch(r'--(state|list-.*|get-.*|query-.*|info-.*|zone=.*|permanent|version|help)|-[hq]', x) for x in a)
+    return False
+
+def partread(v, a, n):
+    if v in ('fdisk', 'sfdisk', 'gdisk', 'sgdisk', 'cfdisk', 'parted'):
+        return bool({'-l', '--list', 'print', '-p', '--print', '--version', '-V'} & set(a) | HELP & set(a))
+    if v == 'wipefs': return not any(re.fullmatch(r'-[A-Za-z]*[ao][A-Za-z]*', x) or x.startswith(('--all', '--offset')) for x in a)
+    if v == 'cryptsetup': return first_in(n, ('status', 'luksDump', 'isLuks')) or bool(HELP & set(a))
+    if v == 'lvm': return first_in(n, ('lvs', 'vgs', 'pvs', 'version', 'help', 'lvdisplay', 'vgdisplay', 'pvdisplay'))
+    return False
+
+def first_in(n, xs): return bool(n) and n[0] in xs
+def pm(x, *words): return bool(x) and any(w.startswith(x) for w in words)
+
+def netwrite(v, a, n):
+    if v == 'ip':
+        if any(x in ('-b', '-batch', '-force') for x in a): return True
+        n = [x for k, x in enumerate(a) if not x.startswith('-') and not (k and a[k - 1] in ('-n', '-netns', '-f', '-family'))]
+        act = n[1] if len(n) > 1 else ''
+        return bool(act) and not (pm(act, 'show', 'list', 'get', 'help', 'monitor', 'save') or act in ('ls', 'lst'))
+    if v == 'nmcli':
+        n = [x for k, x in enumerate(a) if not x.startswith('-') and not (k and a[k - 1] in ('-f', '--fields', '-g', '--get-values', '-e', '--escape', '-c', '--colors', '-m', '--mode', '-w', '--wait'))]
+        if not n or pm(n[0], 'monitor', 'help'): return False
+        o, x = n[0], n[1] if len(n) > 1 else ''
+        if pm(o, 'general'): return not (len(n) <= 2 and (not x or pm(x, 'status', 'permissions', 'logging', 'hostname')))
+        if pm(o, 'networking'): return not (len(n) == 1 or pm(x, 'connectivity'))
+        if pm(o, 'radio'): return len(n) > 2
+        if pm(o, 'connection'): return not (not x or pm(x, 'show'))
+        if pm(o, 'device'): return not (not x or pm(x, 'status', 'show') or (pm(x, 'wifi') and (len(n) == 2 or pm(n[2], 'list'))))
+        return True
+    if v == 'iw': return bool({'set', 'add', 'del', 'connect', 'disconnect', 'join', 'leave', 'start', 'stop', 'ibss', 'mesh'} & set(a))
+    if v == 'iwconfig' or v == 'ifconfig': return len(n) > 1
+    if v == 'wpa_cli':
+        n = [x for k, x in enumerate(a) if not x.startswith('-') and not (k and a[k - 1] in ('-i', '-p', '-g', '-P', '-G', '-a'))]
+        return not first_in(n, ('status', 'list_networks', 'scan_results', 'ping', 'help', 'get', 'mib', 'signal_poll'))
+    if v == 'netplan': return not (not n or n[0] in ('get', 'info', 'status', 'help') or HELP & set(a))
+    if v == 'ethtool': return bool({'-s', '--change', '-K', '--features', '--offload', '-A', '--pause', '-G', '--set-ring', '-C', '--coalesce',
+                                    '-L', '--set-channels', '-E', '--change-eeprom', '-f', '--flash', '-r', '--negotiate', '--reset'} & set(a))
+    if v == 'route': return first_in(n, ('add', 'del', 'delete', 'flush', 'change'))
+    if v == 'rfkill': return first_in(n, ('block', 'unblock', 'toggle'))
+    if v == 'hostapd_cli': return not first_in(n, ('status', 'all_sta', 'list_sta', 'ping', 'help', 'get_config'))
+    if v in ('tc', 'bridge'): return bool({'add', 'del', 'delete', 'change', 'replace', 'flush', 'set'} & set(a))
+    if v == 'brctl': return any(x.startswith(('add', 'del', 'set', 'stp')) for x in n)
+    if v == 'networkctl': return first_in(n, ('up', 'down', 'reconfigure', 'reload', 'renew', 'forcerenew', 'delete'))
+    if v in FW: return False   # judged by fwread
+    return not (set(a) and set(a) <= HELP | {'--version', '-V'})   # ifup ifdown dhclient hostapd wpa_supplicant nmtui
+
+# ----------------------------------------------------------------------------------------------------------- main
+def judge(text, env):
+    g = Guard(env)
+    if g.role not in ('worker', 'member', 'pf'): return None
+    try: g.script(text, g.base, None, 0)
+    except ParseError: return 'never', 'could not parse this command; split it or put it in a file'
+    g.headmove = any(headmove(R) for R in g.out)
+    g.bypass = any('bypassPermissions' in x for R in g.out for x in R['args'] + [r.get('body') or '' for r in R['redirs']])
+    hits = [h for h in (g.rules(R) for R in g.out) if h]
+    return next((h for h in hits if h[0] == 'never'), None) or (hits[0] if hits else None)
+
+def parse(text, env):
+    g = Guard(env); g.script(text, g.base, None, 0)
+    return [{'verb': R['verb'], 'argv': R['args'], 'redirects': [[r['op'], r['w'].v] for r in R['redirs']],
+             'cwd': R['cwd'], 'nested': R['nested'], 'via': R['via']} for R in g.out]
+
+SEATWHY = ("only the permission seat writes its state (~/.cc/state/<repo>/perms and its handoff record): whoever writes "
+           "its brief.md controls the next permission-skipping session")
+
+UNIT = [   # (command, verbs that must be seen, verbs that must not)
+    ("cat > f <<EOF\nsudo reboot\nEOF", ['cat'], ['sudo']),
+    ("echo 'sudo reboot'; grep -rn 'docker run' .", ['echo', 'grep'], ['sudo', 'docker']),
+    ("git commit -m 'sudo reboot; docker rm x'", ['git'], ['sudo', 'docker']),
+    ("bash -c 'sudo reboot'", ['bash', 'sudo'], []),
+    ("bash -lc \"echo hi; docker ps\"", ['docker'], []),
+    ("echo sudo reboot | bash", ['sudo'], []),
+    ("printf 'docker ps\\n' | sh -s", ['docker'], []),
+    ("bash <<EOF\nsudo reboot\nEOF", ['sudo'], []),
+    ("sh <<< 'nft flush ruleset'", ['nft'], []),
+    ("echo $(sudo reboot)", ['echo', 'sudo'], []),
+    ("echo \"`docker ps`\"", ['docker'], []),
+    ("cat <<EOF\n$(sudo reboot)\nEOF", ['sudo'], []),
+    ("cat <<'EOF'\n$(sudo reboot)\nEOF", ['cat'], ['sudo']),
+    ("timeout 5 tmux kill-server", ['tmux'], ['timeout']),
+    ("echo x | xargs sudo reboot", ['sudo'], []),
+    ("echo reboot | xargs -r systemctl", ['systemctl'], []),
+    ("find . -name x -exec docker rm {} \\;", ['find', 'docker'], []),
+    ("env FOO=1 BAR=2 docker ps", ['docker'], ['env']),
+    ("env -S 'sudo reboot'", ['sudo'], []),
+    ("nice -n 5 nohup setsid stdbuf -oL ionice -c 3 parted /dev/sda rm 1", ['parted'], []),
+    ("sud[o] reboot", ['sudo'], []),
+    ("/usr/bin/sudo reboot", ['sudo'], []),
+    ("{sudo,reboot}", ['sudo'], []),
+    ("s''udo \\reboot", ['sudo'], []),
+    ("eval 'sudo reboot'", ['eval', 'sudo'], []),
+    ("source <(echo docker ps)", ['docker'], []),
+    ("f() { sudo reboot; }; f", ['sudo'], []),
+    ("case $x in a) docker ps;; b|c) echo;; esac", ['docker', 'echo'], []),
+    ("python3 -c 'import os; os.system(\"sudo reboot\")'", ['python3', 'sudo'], []),
+    ("python3 -c 'print(1)'", ['python3'], ['print']),
+    ("script -qc 'docker ps' /dev/null", ['script', 'docker'], []),
+    ("git -c alias.x='!docker ps' x", ['git', 'docker'], []),
+    ("git -c alias.x='log' x", ['git'], ['log']),
+    ("python3 - <<'EOF'\nprint('iptables -F')\nEOF", ['python3'], ['iptables']),
+    ("for mail in a b; do echo $mail; done", ['echo'], ['mail']),
+    ("command -v docker", ['command'], ['docker']),
+]
+
+def selfcheck():
+    ok = bad = 0
+    def fail(msg):
+        nonlocal bad; bad += 1; print('FAIL ' + msg)
+    with tempfile.TemporaryDirectory(prefix='cc-guard-argv.') as H:
+        H = os.path.realpath(H)
+        os.makedirs(H + '/.cc/state/demo/perms')   # the seat's state exists, so a parent of it is found (rule D)
+        base = {'HOME': H, 'GUARD_ROLE': 'worker', 'GUARD_CWD': H + '/.cc/worktrees/demo/t', 'GUARD_ROOT': H + '/.cc/worktrees/demo/t'}
+        for cmd, want, unwanted in UNIT:
+            try: seen = [r['verb'] for r in parse(cmd, base)]
+            except ParseError as e: fail(f'unit {cmd!r}: parse error {e}'); continue
+            miss = [v for v in want if v not in seen] + [v for v in unwanted if v in seen]
+            if miss: fail(f'unit {cmd!r}: saw {seen}, wrong on {miss}')
+            else: ok += 1
+        for cmd, cwd, want in [("cd ~/dev/x && echo > f", None, H + '/dev/x'), ("cd $D; touch f", None, base['GUARD_CWD']),
+                               ("(cd /tmp); touch f", None, base['GUARD_CWD']), ("pushd /a; popd; touch f", None, base['GUARD_CWD'])]:
+            last = parse(cmd, base)[-1]
+            if last['cwd'] != want: fail(f'unit cwd {cmd!r}: {last["cwd"]} != {want}')
+            else: ok += 1
+        # a glob beside the seat's state (state/demo/perms here) is judged on what it can name, a component at a time
+        for cmd, refuse in [(f'rm {H}/.cc/state/s* /tmp/x*', False), (f'rm -rf {H}/.cc/state/s*/perms', False),
+                            (f'rm -rf {H}/.cc/state/d*', True), (f'rm -rf {H}/.cc/s*', True),
+                            (f'cp /tmp/x {H}/.cc/state/de*/perms/brief.md', True), (f'rm -rf {H}/.cc/state/*/per?s', True)]:
+            for role in ('worker', 'pf'):
+                if (judge(cmd, dict(base, GUARD_ROLE=role)) is not None) != refuse: fail(f'seat glob {role}: {cmd!r} (want {"refuse" if refuse else "pass"})')
+                else: ok += 1
+        for cmd in ("echo 'unclosed", 'echo "$(date', 'ls )', 'echo `date'):
+            if (judge(cmd, base) or ('',))[0] != 'never': fail(f'unit {cmd!r}: an unparseable command was not refused')
+            else: ok += 1
+        # the hard limits perms' read of #1221 found open: each case gets a fresh checkout on the branch it names
+        # (a plain .git dir, or a worktree's .git file pointing at its gitdir), and each refusal has its near miss
+        def repo(branch, wt):
+            d = tempfile.mkdtemp(dir=H, prefix='repo.')
+            gd = d + '/.gitdir' if wt else d + '/.git'
+            os.makedirs(gd)
+            with open(gd + '/HEAD', 'w') as f: f.write(f'ref: refs/heads/{branch}\n')
+            if wt:
+                with open(d + '/.git', 'w') as f: f.write('gitdir: .gitdir\n')
+            return d
+        rb = 're' + 'boot'
+        for role, branch, cmd, refuse in [
+                ('worker', 'main', 'git push -f origin HEAD', True), ('worker', 'track/x', 'git push -f origin HEAD', False),
+                ('worker', 'main', 'git push --force', True), ('worker', 'track/x', 'git push --force', False),
+                ('worker', 'track/x', 'git push --all --force origin', True), ('worker', 'track/x', 'git push origin track/x', False),
+                ('worker', 'track/x', "git push origin '+refs/heads/*:refs/heads/*'", True),
+                ('worker', 'track/x', "git push origin '+refs/heads/track/x:refs/heads/track/x'", False),
+                ('worker', 'track/x', 'git -c remote.origin.push=HEAD:main push origin', True),
+                ('worker', 'track/x', 'git -c user.name=x push origin HEAD', False),
+                ('worker', 'track/x', 'git config remote.origin.push HEAD:main', True), ('worker', 'track/x', 'git config user.name x', False),
+                ('worker', 'track/x', 'gh api -X DELETE repos/o/r/branches/main/protection', True),
+                ('worker', 'track/x', 'gh api repos/o/r/branches/main/protection', False),
+                ('worker', 'track/x', 'gh api -X PUT repos/o/r/collaborators/X', True),
+                ('worker', 'track/x', 'gh api --method=PUT orgs/o/memberships/X -f role=member', True),
+                ('worker', 'track/x', 'gh api repos/o/r/collaborators', False),
+                ('worker', 'track/x', 'gh api --method PUT repos/o/r/branches/master/protection --input p.json', True),
+                ('worker', 'track/x', "X=$(printf 'su%s' do); $X " + rb[:2] + "''" + rb[2:], True),
+                ('worker', 'track/x', "X=$(printf 'e%s' cho); $X hel''lo", False),
+                ('member', None, 'cc-slack retire C1', True), ('member', None, 'cc slack retire', True),
+                ('member', None, 'cc-slack status', False),
+                ('worker', 'track/x', 'git push --force https://example.invalid/r.git publish:refs/heads/publish', True),
+                ('worker', 'track/x', 'git push --force-with-lease origin HEAD', False),
+                ('worker', 'track/x', 'git push origin :old-branch', True), ('worker', 'track/x', 'git push origin publish', False),
+                ('worker', 'track/x', 'gh pr comment 9 --body hi', True), ('worker', 'track/x', 'gh pr view 9 --comments', False),
+                ('worker', 'track/x', 'jq . ~/.claude-workers/.credentials.json', True), ('worker', 'track/x', 'jq . ~/notes.json', False),
+                ('worker', 'track/x', 'cat ~/.cc/secrets/x.token', True), ('worker', 'track/x', 'ls ~/.cc', False),
+                ('pf', None, 'cc-slack member add x', True), ('pf', None, 'cc-slack member list', False),
+                ('pf', None, 'sudo -n ' + rb, True), ('pf', None, 'sudo -n true', False),
+                ('pf', None, "ssh h 'rm -f ~/.cc/members/x/credentials.json'", True), ('pf', None, 'ssh h uptime', False)]:
+            cwd = repo(branch, branch != 'main') if branch else H + '/dev/alice'
+            env = dict(base, GUARD_ROLE=role, GUARD_CWD=cwd, GUARD_ROOT=cwd, GUARD_MWS='alice' if role == 'member' else '')
+            got = judge(cmd, env)
+            if (got is not None) != refuse: fail(f'case {role} on {branch}: {cmd!r} -> {got} (want {"refuse" if refuse else "pass"})')
+            else: ok += 1
+        mr, tr = repo('main', False), repo('track/x', True)   # git -C / --git-dir name the checkout, not the cwd
+        for cmd, refuse in [(f'git -C {mr} push -f origin HEAD', True), (f'git -C {tr} push -f origin HEAD', False),
+                            (f'git --git-dir={mr}/.git push -f', True), (f'git --git-dir={tr}/.gitdir push -f', False)]:
+            got = judge(cmd, dict(base, GUARD_CWD=tr, GUARD_ROOT=tr))
+            if (got is not None) != refuse: fail(f'case git -C: {cmd!r} -> {got}')
+            else: ok += 1
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'tests', 'guard-replay.jsonl')
+        skipped = 0
+        with open(H + '/never-touch.txt', 'w') as f: f.write('# fixture\n192.0.2.10\n')
+        # the pending false refusals (expect pass) too: main's text judges still refuse them, but this layer must not
+        lines = open(path).read().splitlines() + open(path[:-len('.jsonl')] + '-pending.jsonl').read().splitlines()
+        for no, line in enumerate(lines, 1):
+                if not line.strip(): continue
+                c = json.loads(line)
+                if c.get('layer', 'argv') != 'argv': skipped += 1; continue
+                role = c['role']; mws = c.get('mws', 'alice' if role == 'member' else '')
+                dflt = H + '/dev/' + mws if role == 'member' else base['GUARD_CWD']
+                fx = lambda p: p.replace('~', H, 1) if p.startswith('~') else p
+                env = {'HOME': H, 'GUARD_ROLE': role, 'GUARD_MWS': mws, 'GUARD_CWD': fx(c.get('cwd', dflt)),
+                       'GUARD_ROOT': fx(c.get('root', dflt)), 'GUARD_PSEAT': '1' if c.get('pseat') else '',
+                       'GUARD_NEVER_TOUCH': H + '/never-touch.txt'}
+                got = judge(c['cmd'], env)
+                if (got is not None) != (c['expect'] == 'refuse'):
+                    fail(f"replay {no} ({c['expect']}, {role}): {c['cmd'][:70]!r} -> {got}")
+                else: ok += 1
+    print(f'replay lines left to cc-guard (tmux, pattern kill): {skipped}')
+    print(f'cc-guard-argv selfcheck: {ok} passed, {bad} failed')
+    return 1 if bad else 0
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ''
+    if mode == 'selfcheck': sys.exit(selfcheck())
+    if mode not in ('judge', 'parse'):
+        print('usage: cc-guard-argv judge|parse|selfcheck  (command on stdin)', file=sys.stderr); sys.exit(2)
+    text = sys.stdin.read()
+    try:
+        if mode == 'parse':
+            try: rows = parse(text, os.environ)
+            except ParseError as e: print(json.dumps({'error': str(e)})); return
+            for r in rows: print(json.dumps(r))
+            return
+        h = judge(text, os.environ)
+        if h: print(f'{h[0]}\t{h[1]}')
+    except Exception as e:   # noqa: BLE001 - a crash must refuse, never allow
+        print(f'cc-guard-argv: internal error: {type(e).__name__}: {e}', file=sys.stderr); sys.exit(3)
+
+if __name__ == '__main__':
+    main()

@@ -4,6 +4,10 @@
 # worktree, role=worker) or .cc/member-facing (a session anybody in a Slack channel can talk to, role=member) —
 # so interactive TRACK sessions are gated too (intended); plain operator/planning sessions are not.
 # The MARKER is the truth: CC_ROLE is only a convenience, the walk works with no env at all.
+# On top of every judge here, cc-guard-argv (next to this file) judges each Bash call on the argv bash would run, for
+# the gated role, or as role pf for every other session but the permission seat (the hard limits no role is without:
+# a reboot, a read of the box's credentials, a cc-slack member add). It only refuses: a call is refused when it or
+# any judge here refuses, and nothing it answers lets through what a judge here refuses.
 # Denies (exit 2 + reason) the four owner gates:
 #   1. merge to default branch / deploy      2. external comms in owner's name
 #   3. destructive / infra ops               4. (spend is enforced by --max-budget-usd on headless workers)
@@ -170,6 +174,27 @@ FSTUB
     jq -e . >/dev/null 2>&1 <<<"$pl" || { echo 99; return; }
     printf '%s' "$pl" \
       | env HOME="${GH:-$H}" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" "$@" "$0" >/dev/null 2>"${GERR:-/dev/null}"; echo $?; }
+
+  # 0. THE ARGV LAYER ONLY ADDS REFUSALS. Its own selfcheck passes; a reboot is refused for a session with no role and
+  #    for a worker, and so is a worker's force push to main spelled as the argv reads it; a plain read still passes
+  #    for both. A cc-guard-argv that crashes (exit 3) refuses a worker and lets the no-role `ls` through.
+  CALLS=$T/calls0; ASKS=$T/asks0; mkdir -p "$T/x0"
+  GA0=$(dirname "$(realpath "$0")")/cc-guard-argv
+  "$GA0" selfcheck > "$T/ga0" 2>&1; ok "0 cc-guard-argv selfcheck ($(tail -1 "$T/ga0"))" $?
+  for c in 'sudo reboot' 'sudo shutdown -h now' 'sudo poweroff' 'X=$(printf su%s do); $X re\"\"boot'; do
+    r0=0; [ "$(g Bash "{\"command\":\"$c\"}" "$T/x0")" = 2 ] || r0=1; ok "0 no role: $c refused" $r0
+    r0=0; [ "$(g Bash "{\"command\":\"$c\"}" "$WT")" = 2 ] || r0=1; ok "0 worker: $c refused" $r0
+  done
+  r0=0; [ "$(g Bash '{"command":"git -c remote.origin.push=HEAD:main push -f"}' "$WT")" = 2 ] || r0=1; ok "0 worker: push via remote.origin.push=HEAD:main refused" $r0
+  r0=0; [ "$(g Bash '{"command":"ls -la"}' "$T/x0")" = 0 ] || r0=1; ok "0 no role: ls passes" $r0
+  r0=0; [ "$(g Bash '{"command":"ls -la"}' "$WT")" = 0 ] || r0=1; ok "0 worker: ls passes" $r0
+  mkdir -p "$T/fake0"; cp "$(realpath "$0")" "$T/fake0/cc-guard"
+  printf '#!/bin/sh\n[ "$1" = judge ] && { echo boom >&2; exit 3; }\nexec "%s" "$@"\n' "$GA0" > "$T/fake0/cc-guard-argv"
+  chmod +x "$T/fake0/cc-guard" "$T/fake0/cc-guard-argv"
+  fk(){ printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$1" \
+    | env HOME="$H" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" "$T/fake0/cc-guard" >/dev/null 2>&1; echo $?; }
+  r0=0; [ "$(fk "$WT")" = 2 ] || r0=1; ok "0 argv exit 3: worker refused" $r0
+  r0=0; [ "$(fk "$T/x0")" = 0 ] || r0=1; ok "0 argv exit 3: no role passes" $r0
 
   # 1. A MEMBER REFUSAL IS A QUERY, NOT A LINE IN THE MEMBER'S CHANNEL. The landing tool from a member-facing
   #    session: refused, a query RECORDED for the box's queries session, and NOTHING in the member's own channel
@@ -6074,6 +6099,29 @@ if [ "$tool" = Bash ]; then
     [ -n "$lsd" ] && ! pseat && never "starting a claude in the permission seat's directory (the call's cwd, or a …/perms path it names) — a claude there passes the seat check and writes the seat's state, so only the owner starts one, through the seat's own launcher"
   fi
 fi
+# THE ARGV LAYER ONLY REFUSES. cc-guard-argv (next to this file; its docstring has the rules) judges a Bash call on the
+# argv bash would run, once every judge in the Bash branch below has let it through, so those judges run whole and keep
+# their own reasons: a call is refused when either refuses, and nothing it answers lets through what they refuse.
+# A gated role is asked as itself; every other session as role pf, which holds the hard limits no role is without (a
+# reboot through sudo, ssh or a computed verb, a read of the box's credentials, an ssh whose remote words carry one).
+# The permission seat is the one session past pf. A crash refuses a gated role, and lets the ungated tier through: a
+# broken helper never locks the planning seat out.
+argv_layer(){
+  { [ -z "$pfonly" ] || ! pseat; } || return 0
+  RX=""   # no text rule fired this refusal: an earlier rx match that refused nothing is not named in it
+  GA=$(dirname "$(realpath "$0")")/cc-guard-argv   # ~/bin/cc-guard is a symlink into core/bin
+  ac=$(jq -r '.tool_input.command // ""' <<<"$inp"); ar=$role; [ -n "$pfonly" ] && ar=pf
+  gr=$root${mdir:+:$mdir}${awt:+:$awt}               # GUARD_ROOT: the trees this session writes, ':'-separated
+  gp=""; [ -z "$pfonly" ] && grep -qF perms <<<"$ac" && pseat && gp=1   # GUARD_PSEAT: the /proc walk only when perms is named
+  av=$(env -u GUARD_NEVER_TOUCH HOME="$HOME" GUARD_HOME="$HOME" GUARD_ROLE="$ar" GUARD_CWD="$cwd" \
+         GUARD_ROOT="$gr" GUARD_MWS="$mws" GUARD_PSEAT="$gp" "$GA" judge <<<"$ac" 2>&1); arc=$?
+  if [ "$arc" != 0 ]; then [ -z "$pfonly" ] && never "the guard could not parse this command (cc-guard-argv rc $arc: ${av:0:200})"
+  else case "$av" in
+    '') ;;
+    deny$'\t'*)  deny "${av#*$'\t'}";;
+    never$'\t'*) never "${av#*$'\t'}";;
+    *) [ -z "$pfonly" ] && never "the guard could not parse this command (cc-guard-argv answered: ${av:0:120})";;
+  esac; fi; return 0; }
 [ -n "$pfonly" ] && case "$tool" in Bash|Edit|Write|MultiEdit|NotebookEdit) ;; *) exit 0;; esac   # nothing else reaches the seat's state
 case "$tool" in
   Bash)
@@ -6827,7 +6875,7 @@ case "$tool" in
       done <<<"$uk"
       wbase=$cwd
     else wscan "$cmd"; fi
-    [ -n "$pfonly" ] && exit 0   # the ungated tier: the write walk above was the one rule it meets (pfonly)
+    [ -n "$pfonly" ] && { argv_layer; exit 0; }   # the ungated tier: the write walk above, then the argv layer's pf (pfonly)
     # 4. member-facing only: a member must not be able to make the box SPEND or LEAK. Be honest about the ceiling —
     #    a Bash blocklist is not a sandbox: it stops accidents and casual prompt-injection, not a determined attacker
     #    (a redirection, a copied binary, a script it writes first). Real containment is ccbox. cc-notify stays
@@ -6880,6 +6928,7 @@ case "$tool" in
       # secrets line above for a session that may not see them. Members get neither the read nor the write.
       rx "$AT"'([^ ]*/)?cc-config\b' && never "the box's config is not a member's to read or rewrite (cc-config)"
     fi
+    argv_layer   # last: every judge above has let this call through (see argv_layer)
     ;;
   Read|NotebookRead|Grep|Glob)   # gating these files in Bash alone would be theatre if a file-reading TOOL served them
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.path // ""' <<<"$inp")
