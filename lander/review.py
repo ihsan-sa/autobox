@@ -280,6 +280,7 @@ def security_reader(v):
     return (v.model or "") == PERMS_SECURITY_READER
 # The perms seat's state root, at the passwd home: never $HOME or $CC_STATE, which a caller sets (tests patch this).
 PERMS_STATE = os.path.join(C.PASSWD_HOME, ".cc", "state")
+CLAUDE_VERSIONS = os.path.join(C.PASSWD_HOME, ".local", "share", "claude", "versions")   # the claude binaries
 PERMS_READS = "security-reads.json"
 
 
@@ -1555,16 +1556,28 @@ def _job_of(repo, pr):
     return job, facts
 
 
-def claude_ancestor(pid=None, proc="/proc"):
-    """The pid of the first process named `claude` at or above `pid` (default: this one's parent), walking
-    /proc/<pid>/status PPid, or None when the walk reaches pid 1 or a process it cannot read."""
+def is_claude_session(pid, proc="/proc", versions=None):
+    """True when pid is a real Claude session: its comm is `claude` AND its /proc/<pid>/exe resolves under
+    versions (CLAUDE_VERSIONS unless a test passes one). Perms, 10-13: any same-uid process can rewrite its own comm,
+    so "accept a process as the perms seat only when /proc/<pid>/exe resolves under ~/.local/share/claude/versions/
+    AND its comm is claude". A binary an update deleted reads "<path> (deleted)", still under versions."""
+    with open(os.path.join(proc, str(pid), "comm")) as f:
+        if f.read().strip() != "claude":
+            return False
+    exe = os.path.realpath(os.readlink(os.path.join(proc, str(pid), "exe")))
+    return exe.startswith(os.path.realpath(versions or CLAUDE_VERSIONS) + os.sep)
+
+
+def claude_ancestor(pid=None, proc="/proc", versions=None):
+    """The pid of the first Claude session (is_claude_session()) at or above `pid` (default: this one's parent), walking
+    /proc/<pid>/status PPid, or None when the walk reaches pid 1 or a process it cannot read. A process that only
+    calls itself `claude` is walked past, like any other."""
     pid, seen = pid or os.getppid(), set()
     while pid and pid > 1 and pid not in seen:
         seen.add(pid)
         try:
-            with open(os.path.join(proc, str(pid), "comm")) as f:
-                if f.read().strip() == "claude":
-                    return pid
+            if is_claude_session(pid, proc, versions):
+                return pid
             with open(os.path.join(proc, str(pid), "status")) as f:
                 pid = next((int(ln.split()[1]) for ln in f if ln.startswith("PPid:")), 0)
         except (OSError, ValueError, IndexError):
@@ -1572,13 +1585,13 @@ def claude_ancestor(pid=None, proc="/proc"):
     return None
 
 
-def perms_seat_caller(repo, pid=None, proc="/proc", state=None):
+def perms_seat_caller(repo, pid=None, proc="/proc", state=None, versions=None):
     """True when the Claude session that called (claude_ancestor()) runs in the perms seat: its /proc/<pid>/cwd
     resolves to <state>/<repo>/perms, state being PERMS_STATE at the passwd home unless a test passes one. Perms,
     10-13: "lander record refuses --by perms-* unless the calling Claude ancestor ... has /proc/<pid>/cwd realpath ==
     ~/.cc/state/<repo>/perms". Never $CC_STATE or $HOME, which a caller sets: a seat that set CC_STATE could start a
     claude in a <CC_STATE>/<repo>/perms of its own and write perms' name."""
-    seat = claude_ancestor(pid, proc)
+    seat = claude_ancestor(pid, proc, versions)
     if seat is None:
         return False
     state = state or PERMS_STATE

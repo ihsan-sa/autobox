@@ -615,16 +615,27 @@ def worker_caller(cwd=None):
         d = up
 
 
-def claude_ancestor(pid=None, proc="/proc"):
-    """The pid of the first process named `claude` at or above `pid` (default: this one's parent), walking
-    /proc/<pid>/status PPid, or None. The lander's review.claude_ancestor, copied: this file shares no code."""
+def is_claude_session(pid, proc="/proc", versions=None):
+    """True when pid's comm is `claude` AND its /proc/<pid>/exe resolves under versions (the passwd home's
+    ~/.local/share/claude/versions unless a test passes one): any same-uid process can rewrite its own comm. The
+    lander's review.is_claude_session, copied."""
+    with open(os.path.join(proc, str(pid), "comm")) as f:
+        if f.read().strip() != "claude":
+            return False
+    versions = versions or os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "share", "claude", "versions")
+    exe = os.path.realpath(os.readlink(os.path.join(proc, str(pid), "exe")))
+    return exe.startswith(os.path.realpath(versions) + os.sep)
+
+
+def claude_ancestor(pid=None, proc="/proc", versions=None):
+    """The pid of the first Claude session (is_claude_session()) at or above `pid` (default: this one's parent),
+    walking /proc/<pid>/status PPid, or None. The lander's review.claude_ancestor, copied: this file shares no code."""
     pid, seen = pid or os.getppid(), set()
     while pid and pid > 1 and pid not in seen:
         seen.add(pid)
         try:
-            with open(os.path.join(proc, str(pid), "comm")) as f:
-                if f.read().strip() == "claude":
-                    return pid
+            if is_claude_session(pid, proc, versions):
+                return pid
             with open(os.path.join(proc, str(pid), "status")) as f:
                 pid = next((int(ln.split()[1]) for ln in f if ln.startswith("PPid:")), 0)
         except (OSError, ValueError, IndexError):
@@ -632,11 +643,11 @@ def claude_ancestor(pid=None, proc="/proc"):
     return None
 
 
-def perms_caller(root, pid=None, proc="/proc", state=None):
+def perms_caller(root, pid=None, proc="/proc", state=None, versions=None):
     """True when the calling Claude session works in the perms seat of root's repo: its /proc/<pid>/cwd resolves to
     <passwd home>/.cc/state/<basename of root>/perms. Perms on #1277: give promote the same caller check as
     `lander record --by perms-*`, so only perms moves the live lander to a new release."""
-    seat = claude_ancestor(pid, proc)
+    seat = claude_ancestor(pid, proc, versions)
     if seat is None or not root:
         return False
     state = state or os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".cc", "state")
@@ -1902,12 +1913,15 @@ def perms_caller_cases(case):
         for d in ("perms", "planning"):
             os.makedirs(seat(d))
 
-        def ps(pid, comm, ppid, cwd=""):
+        versions = os.path.join(t, "versions")
+
+        def ps(pid, comm, ppid, cwd="", exe=os.path.join(versions, "1.0.0")):
             os.makedirs(os.path.join(proc, str(pid)))
             with open(os.path.join(proc, str(pid), "comm"), "w") as f:
                 f.write(comm + "\n")
             with open(os.path.join(proc, str(pid), "status"), "w") as f:
                 f.write(f"Name:\t{comm}\nPPid:\t{ppid}\n")
+            os.symlink(exe, os.path.join(proc, str(pid), "exe"))
             if cwd:
                 os.symlink(cwd, os.path.join(proc, str(pid), "cwd"))
         ps(10, "bash", 20)
@@ -1915,10 +1929,16 @@ def perms_caller_cases(case):
         ps(11, "bash", 21)
         ps(21, "claude", 1, seat("planning"))
         ps(12, "bash", 1)
-        case("promote: a claude in the perms seat may", perms_caller("/dev/box",10, proc, state))
-        case("promote: a claude in another seat may not", not perms_caller("/dev/box",11, proc, state))
-        case("promote: another repo's perms seat may not", not perms_caller("/dev/other", 10, proc, state))
-        case("promote: no claude above the caller may not", not perms_caller("/dev/box",12, proc, state))
+        ps(13, "bash", 23)
+        ps(23, "claude", 1, seat("perms"), exe=os.path.join(t, "bin", "claude"))   # a renamed shell, say
+        args = (proc, state, versions)
+        case("promote: a claude in the perms seat may", perms_caller("/dev/box", 10, *args))
+        case("promote: a claude in another seat may not", not perms_caller("/dev/box", 11, *args))
+        case("promote: another repo's perms seat may not", not perms_caller("/dev/other", 10, *args))
+        case("promote: no claude above the caller may not", not perms_caller("/dev/box", 12, *args))
+        # perms, 10-13: accept the seat "only when /proc/<pid>/exe resolves under ~/.local/share/claude/versions/
+        # AND its comm is claude"
+        case("promote: a process only named claude in the perms seat may not", not perms_caller("/dev/box", 13, *args))
 
 
 def main(argv):

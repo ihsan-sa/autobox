@@ -247,7 +247,12 @@ blocked(){    # $1 = pane text → "" free · "busy" mid-turn · "dialog" a moda
 
 dialog_line(){   # the one line of a dialog worth repeating: its question. Read from the BOTTOM — a dialog is drawn
   local l        # at the foot of the pane and the transcript above it asks questions of its own — and never a line
-  l=$(printf '%s\n' "$1" | grep -F "$HELD_HEAD" | tail -1)   # a held message: who sent it is the line worth saying
+  # a held message: who sent it is the line worth saying, but only when the held dialog is the one at the foot. A
+  # transcript that quotes an old one above a different question named the old sender for it (review of #762).
+  l=$(printf '%s\n' "$1" | awk -v head="$HELD_HEAD" -v opt="$HELD_DELIVER" '
+        index($0, head) { h = $0; o = 0 } index($0, opt) && h != "" { o = 1; next }
+        o && /[A-Za-z0-9]/ && !/^[^A-Za-z0-9]*[0-9]\. / && !/Esc to|Enter to|to navigate|to select/ { h = ""; o = 0 }
+        END { if (o) print h }')
   [ -n "$l" ] || l=$(printf '%s\n' "$1" | grep -e 'Do you want to' -e 'Would you like to proceed' -e 'reached your' -e '?' | tail -1)
   [ -n "$l" ] || l=$(printf '%s\n' "$1" | grep '[A-Za-z]' | tail -1)   # …with no letters in it: keys we just sent echo
   printf '%s' "$l" | sed 's/^[^A-Za-z0-9]*//' | cut -c1-160
@@ -261,15 +266,18 @@ win_id(){ tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null |
 # `bash -c '… cc __runnext …'`, so that session's claude is a GRANDCHILD — the direct-child test called it dead
 # and this script refused to type at a perfectly live session, every time, for as long as it lived.
 # `claude -p` is still refused: a headless worker prints and exits, and there is no prompt for the text to land in.
-claude_pids(){   # $1 = window id → every `claude` under that pane. Also WHICH session is behind a screen: a pid
-                 # that has changed is a different one, however alike the two panes read.
+# THE PANE PROCESS ITSELF COUNTS (2026-10-12). The walk named only descendants, so a seat the tower restored with
+# claude AS the pane process read as "runs no interactive claude" while it was live, and the architect missed a
+# relay of review findings for it. A wrapper (a python __runorch, a bash -c) is not claude and is walked through.
+claude_pids(){   # $1 = window id → every `claude` in that pane's tree, the pane process included. Also WHICH
+                 # session is behind a screen: a pid that has changed is a different one, however alike the panes read.
   local pp
   pp=$(tmux list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null | head -1)
   ps -eo pid=,ppid=,comm= | awk -v root="${pp:-0}" '
     { kids[$2] = kids[$2] " " $1; name[$1] = $3 }
     END { q[1] = root; n = 1                                   # breadth-first over the pane subtree
           for (i = 1; i <= n; i++) { m = split(kids[q[i]], c, " "); for (j = 1; j <= m; j++) q[++n] = c[j] }
-          for (i = 2; i <= n; i++) if (name[q[i]] == "claude") print q[i] }'
+          for (i = 1; i <= n; i++) if (name[q[i]] == "claude") print q[i] }'   # i = 1: the pane process too
 }
 
 live_claude(){   # $1 = window id
@@ -855,6 +863,9 @@ member_signed_out(){   # $1 window name → said once when the workspace behind 
   # THE BLANK AND ITS REASON ARE READ TOGETHER, under the lock `cc-sandbox signout` writes both under. A sweep that read
   # between signout's two writes saw a blank with no reason, called it a refused refresh, stamped the event, and never read
   # the reason that came a moment later (review of #977). Held only for this snapshot, never across a post; busy → next tick.
+  # Opening it with >> CREATES credential.lock on the first blank this sweep sees, beside the stamps (review of #977).
+  # That is the file signout locks too, and an empty file is all a lock is, so it is left there and never removed:
+  # removing it while signout holds it would let the next opener lock a different inode than signout's.
   exec {lk}>>"$HOME/.cc/members/$h/credential.lock" || return 0
   flock -w 10 "$lk" || { exec {lk}>&-; return 0; }
   cred_ok "$own" && { exec {lk}>&-; rm -f "$stamp" "$miss"; return 0; }   # minted again while this waited
@@ -1342,8 +1353,11 @@ STUB
   cat > "$T/bin/ps" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
-  *-eo*) printf '991234 1 bash\n%s 991234 %s\n' "${CC_FAKE_PID:-991235}" "${CC_FAKE_PROC:-claude}"   # a claude under the pane
-         printf '881234 1 bash\n%s 881234 claude\n' "${CC_FAKE_PERMS:-881235}";;   # …and the perms window's
+  # the pane process is CC_FAKE_ROOT (bash, unless a case makes the pane process claude itself or a python wrapper),
+  # with CC_FAKE_PROC under it. The perms window's claude is always 881235: CC_FAKE_PERMS only says whether the
+  # window perms exists (the tmux stub), so a case that sets it to a word cannot also make up a pid out of it.
+  *-eo*) printf '991234 1 %s\n%s 991234 %s\n' "${CC_FAKE_ROOT:-bash}" "${CC_FAKE_PID:-991235}" "${CC_FAKE_PROC:-claude}"
+         printf '881234 1 bash\n881235 881234 claude\n';;
   *)     echo cc-test;;                                                           # ps -o comm= -p $PPID
 esac
 STUB
@@ -1900,6 +1914,14 @@ $BUSY"; out=$(msg "hello mid-turn")
   k "$(nt test -f "$SP")" "…and nothing is spooled for it: a headless worker has no keyboard to drain to"
   reset; scr "$FREE"; out=$(CC_FAKE_WIN=other "$T/bin/cc-msg" "$W" "nowhere" 2>&1); rc=$?
   k "$(t test "$rc" != 0)" "an unknown window is still an error, not a queue that nothing will ever read"
+  # (10a) A CLAUDE THAT IS THE PANE PROCESS (2026-10-12): the tower restored the architect that way, and cc-msg
+  # refused it as "runs no interactive claude" while it was live. Each case builds its own process tree.
+  reset; scr "$FREE"; out=$(CC_FAKE_ROOT=claude CC_FAKE_PROC=bash "$T/bin/cc-msg" "$W" "to the pane root" 2>&1); rc=$?
+  k "$(t sh -c "[ '$rc' = 0 ] && grep -qF 'to the pane root' '$T/keys'")" "a pane whose own process is claude is reached: the text is typed"
+  reset; scr "$FREE"; out=$(CC_FAKE_ROOT=python3 "$T/bin/cc-msg" "$W" "through the wrapper" 2>&1); rc=$?
+  k "$(t sh -c "[ '$rc' = 0 ] && grep -qF 'through the wrapper' '$T/keys'")" "…and so is a claude under a python wrapper that is the pane process"
+  reset; scr "$FREE"; out=$(CC_FAKE_ROOT=python3 CC_FAKE_PROC=bash "$T/bin/cc-msg" "$W" "wrapper, no claude" 2>&1); rc=$?
+  k "$(t sh -c "[ '$rc' != 0 ] && ! grep -q . '$T/keys'")" "…but a wrapper with no claude under it is still refused, and not one key is sent"
 
   # (11) --ask: a bare /command typed at a FREE pane, and the pane's own answer back. Never spooled.
   local CTX='> /context
@@ -2168,6 +2190,7 @@ Esc to cancel"; "$T/bin/cc-msg" --sweep
   reset; scr "$(held 772000 planner)"; CC_FAKE_PERMS=881235 "$T/bin/cc-msg" --sweep
   k "$(nt grep -q . "$T/keys")" "…one from another pid gets NO key"
   k "$(t test -f "$DG")" "…and stands as a dialog, reported like any other"
+  k "$(t grep -q 'verified pid 772000' "$DG")" "…named by its sender's line, since the held dialog is the one at the foot"
   reset; scr "$(held 772000 perms)"; CC_FAKE_PERMS=881235 "$T/bin/cc-msg" --sweep
   k "$(nt grep -q . "$T/keys")" "…nor one that CLAIMS the name perms from a different pid"
   reset; scr "$(held 881235 perms)"; "$T/bin/cc-msg" --sweep
@@ -2180,6 +2203,7 @@ Esc to cancel"; "$T/bin/cc-msg" --sweep
 ❯ 1. Land it
 Esc to cancel"; CC_FAKE_PERMS=881235 "$T/bin/cc-msg" --sweep
   k "$(nt grep -q . "$T/keys")" "…nor another dialog drawn under a transcript that quotes a perms held message"
+  k "$(t sh -c "test -f '$DG' && ! grep -q 'verified pid' '$DG'")" "…and the dialog it reports is not named after the old held message's sender (review of #762)"
   reset; scr "$TEACH"; CC_FAKE_PERMS=881235 CC_FAKE_SWAP_AFTER=2 CC_FAKE_SWAP_TO="$(held 772000 perms)" "$T/bin/cc-msg" --sweep
   k "$(t test "$(keys | awk '{print $NF}')" = '3')" "…and a held message that appears under a row's follow-on key is not Entered unless it is the perms session's"
   reset; scr "$PERM"; "$T/bin/cc-msg" --sweep

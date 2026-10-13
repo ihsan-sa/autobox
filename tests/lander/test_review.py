@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1553,8 +1554,9 @@ class TestRecord(Case):
                                          "--findings", "[correctness] x breaks"), 0)
         self.assertIn("verdict=HANDBACK", box.called("gh pr comment")[0]["input"])
 
-    def proc(self, cwd, comm="claude"):
-        """A fixture /proc: this process (pid 30) -> a shell (20) -> a process named `comm` (10) in `cwd`."""
+    def proc(self, cwd, comm="claude", exe=None):
+        """A fixture /proc: this process (pid 30) -> a shell (20) -> a process named `comm` (10) in `cwd`, running
+        `exe` (default: a binary under the CLAUDE_VERSIONS the test patches in)."""
         root = os.path.join(self.tmp, "proc-" + comm + str(len(os.listdir(self.tmp))))
         for pid, name, ppid in ((30, "python3", 20), (20, "bash", 10), (10, comm, 1)):
             os.makedirs(os.path.join(root, str(pid)))
@@ -1564,23 +1566,57 @@ class TestRecord(Case):
                 f.write(f"Name:\t{name}\nPPid:\t{ppid}\n")
         os.makedirs(cwd, exist_ok=True)
         os.symlink(cwd, os.path.join(root, "10", "cwd"))
+        os.symlink(exe or os.path.join(R.CLAUDE_VERSIONS, "1.0.0"), os.path.join(root, "10", "exe"))
         return root
+
+    def versions(self):
+        """A CLAUDE_VERSIONS of the test's own, put back when it ends."""
+        d = os.path.join(self.tmp, "versions")
+        os.makedirs(d, exist_ok=True)
+        self.addCleanup(setattr, R, "CLAUDE_VERSIONS", R.CLAUDE_VERSIONS)
+        R.CLAUDE_VERSIONS = d
+        return d
 
     def test_only_the_perms_seat_passes_as_the_caller(self):
         state = os.environ["CC_STATE"]
         seat = os.path.join(state, "demo", "perms")
+        versions = self.versions()
         self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(seat), state))
         self.assertTrue(R.perms_seat_caller("owner/demo", 30, self.proc(seat), state))
+        self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(versions, "1.0.0 (deleted)")),
+                                            state))   # a seat whose binary an update has since removed
         for root in (self.proc(os.path.join(state, "demo", "planning")),
                      self.proc(os.path.join(state, "demo", "perms", "sub")),
                      self.proc(os.path.join(state, "other", "perms")),
-                     self.proc(seat, comm="node")):       # no claude above the caller
+                     self.proc(seat, comm="node"),         # no claude above the caller
+                     self.proc(seat, exe=os.path.join(self.tmp, "bin", "claude")),   # named claude, runs elsewhere
+                     self.proc(seat, exe=versions + "-other/1.0.0")):              # beside versions, not under it
             self.assertFalse(R.perms_seat_caller("demo", 30, root, state), root)
+
+    def test_a_renamed_shell_in_the_perms_seat_is_refused(self):
+        """Perms, 10-13: "accept a process as the perms seat only when /proc/<pid>/exe resolves under
+        ~/.local/share/claude/versions/ AND its comm is claude". A real /bin/sh copied to a file named `claude` runs
+        in the seat's directory with comm `claude`: refused. The same copy under versions passes, the control."""
+        state = os.path.join(self.tmp, "seat-state")
+        seat = os.path.join(state, "demo", "perms")
+        os.makedirs(seat)
+        versions = self.versions()
+        for d in (os.path.join(self.tmp, "bin"), versions):
+            os.makedirs(d, exist_ok=True)
+            shutil.copy2("/bin/sh", os.path.join(d, "claude"))
+        for d, passes in ((os.path.join(self.tmp, "bin"), False), (versions, True)):
+            p = subprocess.Popen([os.path.join(d, "claude")], cwd=seat, stdin=subprocess.PIPE)   # waits on stdin
+            self.addCleanup(p.wait)
+            self.addCleanup(p.kill)
+            with open(f"/proc/{p.pid}/comm") as f:
+                self.assertEqual(f.read().strip(), "claude")
+            self.assertEqual(R.perms_seat_caller("demo", p.pid, "/proc", state), passes, d)
 
     def test_a_cc_state_override_does_not_move_the_perms_seat(self):
         """The seat is found at the passwd home (PERMS_STATE) whatever CC_STATE says, in the environment or the
         caller's config: a claude in <CC_STATE>/demo/perms is refused, one in the passwd home's seat passes."""
         fake = os.path.join(self.tmp, "fake-state")
+        self.versions()
         os.environ["CC_STATE"] = fake
         with open(os.environ["CC_CONFIG"], "w") as f:
             f.write(f"CC_STATE={fake}\n")
