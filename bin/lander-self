@@ -15,8 +15,9 @@ A planning seat runs it by hand; the lander never installs itself.
     lander-self check <repo> <pr> [--repo-dir DIR]
         (cc-guard keeps this, like land/promote/rollback/pin, from a worker: it fetches a PR and runs its code.)
         Refuses the PR whole unless: every changed path is on the base's `lander` list or under the lander's own
-        tree (LANDER_TREE: core/lander, core/tests/lander); a LAND record by exactly `perms-security-read` (review.py's
-        security reader) and a LAND record by another reader both stand at the PR's head (`lander record
+        tree (LANDER_TREE: core/lander, core/tests/lander); no path it adds or changes under core/ is a __pycache__
+        path, a .pyc, .pyo, .so or .pyd, or binary (a NUL in its first 8000 bytes); a LAND record by exactly
+        `perms-security-read` (review.py's security reader) and a LAND record by another reader both stand at the PR's head (`lander record
         --by`, which cc-guard keeps closed to workers); the merge tree's tests/check-extra.sh (`core-identity`: no
         box identity in core/) and the candidate's own tests (`<core>/bin/lander selfcheck` and `<core>/tests/lander`)
         pass on the merge tree inside bwrap (no network, empty HOME, no ~/.cc). Then prints a
@@ -30,7 +31,8 @@ A planning seat runs it by hand; the lander never installs itself.
         none, leaves it to the lander tick's `ended` sweep, and the land still exits 0.
     lander-self promote [REV] [--repo DIR] [--pr N]
         Build ~/.cc/lander/releases/<sha>/ from `git archive` of REV (default origin/main) — committed code only,
-        plus the repo's tests/landing-repos/ (the host fallback manifests the lander reads for a repo that ships
+        less any __pycache__ it tracks (a tracked unchecked-hash .pyc would run in place of its .py), plus the repo's
+        tests/landing-repos/ (the host fallback manifests the lander reads for a repo that ships
         none) — run that release's `lander selfcheck`, then prove it on main: the release's own `lander sweep` runs
         every check in origin/main's manifest on this host as its lane runs them (each class's box runner, cc-nosignal
         unless the check is bare, an admission slot and a scope), what it does not pass runs once more under it and
@@ -345,9 +347,28 @@ def tree_digest(d):
     return h.hexdigest()
 
 
+def drop_pycache(d):
+    """Remove every entry named __pycache__ under d, whatever its kind. -> the paths removed, relative to d.
+    Opus read of #1296: a tracked core/lander/__pycache__/run.cpython-314.pyc compiled UNCHECKED_HASH is what
+    `import lander.run` loads, never looking at run.py, while the reuse hashes only run.py (runtime pycs differ, so
+    __pycache__ is not hashed). With none in the build, a __pycache__ in a release is one Python wrote from its .py."""
+    out = []
+    for top, dirs, files in os.walk(d):
+        for n in [x for x in dirs + files if x == "__pycache__"]:
+            p = os.path.join(top, n)
+            out.append(os.path.relpath(p, d))
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            else:
+                os.unlink(p)
+        dirs[:] = [x for x in dirs if x != "__pycache__"]
+    return sorted(out)
+
+
 def build(root, sha, kind, must="lander/cli.py"):
     """ROOT/<kind>/<sha>/core/ from `git archive` of the commit's core tree, which must hold `must`, and — when the
     repo keeps core under core/ — <sha>/tests/landing-repos/ from the same commit (the host fallback manifests).
+    Every __pycache__ the commit tracks is left out (drop_pycache), so the release runs its source.
     Always built afresh: a <sha> dir already there is kept only when it is byte-identical to the new build
     (tree_digest), else replaced — so a release planted or edited under ROOT never runs. Returns the release dir;
     raises RuntimeError."""
@@ -376,6 +397,10 @@ def build(root, sha, kind, must="lander/cli.py"):
         if x2.returncode != 0:
             shutil.rmtree(tmp, ignore_errors=True)
             raise RuntimeError(f"{sha[:12]}'s tests/landing-repos would not extract")
+    dropped = drop_pycache(tmp)
+    if dropped:
+        print(f"lander-self: {sha[:12]} tracks {len(dropped)} __pycache__ path(s) ({', '.join(dropped[:4])}); the "
+              "release leaves them out, so it runs its .py source", file=sys.stderr)
     if os.path.isdir(dest) and not os.path.islink(dest) and tree_digest(dest) == tree_digest(tmp):
         shutil.rmtree(tmp, ignore_errors=True)
         return dest
@@ -559,7 +584,8 @@ def names_under(rel, root, sha):
 # core/ first on sys.path", so everything importable directly in either dir is hashed: a .py, a .pyc, a .so or a
 # package dir (runner_paths, the union of both releases' names), not a hand-kept list of what cli.py happens to import today; plus the tools run.py execs,
 # cc-config for LANDER_SLOTS, and the release's host fallback manifests. Any of them differing, or missing on one
-# side only, sweeps everything as before.
+# side only, sweeps everything as before. __pycache__ is not hashed, because runtime pycs differ; build() leaves out
+# any the commit tracks, so the pycs a release holds are compiled from the .py hashed here.
 RUNNER = ("core/bin/cc-nosignal", "core/bin/cc-sandbox", "core/bin/cc-suites", "core/bin/cc-config",
           "tests/landing-repos")
 RUNNER_GLOBS = ("core/lander", "core")   # every importable entry directly in each
@@ -1190,6 +1216,31 @@ def outside(files, pats):
     return [f for f in files if not any(r.match(f) for r in rx)]
 
 
+# Perms, after #1296: "make the lander's own check refuse any PR that tracks a __pycache__ path, a .pyc, a .so or
+# another binary under core/" — the live lander imports from its release, so a tracked unchecked-hash .pyc runs there.
+NOT_SOURCE = (".pyc", ".pyo", ".so", ".pyd")
+
+
+def binaries(root, base, head, pre):
+    """Each path under the core tree (`pre`; the whole repo when '') that `head` adds or changes from `base` and that
+    is not source: one with a __pycache__ segment, a NOT_SOURCE suffix, or a NUL in its first 8000 bytes (git's own
+    binary test, read from the blob, so a .gitattributes in the PR cannot call it text). A path whose blob cannot be
+    read (a submodule) counts too. None when git cannot list them."""
+    rc, out, _ = git(root, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=d", base, head, "--",
+                     *([pre] if pre else []))
+    if rc != 0:
+        return None
+    hits = []
+    for p in sorted(x for x in out.split("\0") if x):
+        if "__pycache__" in p.split("/") or p.endswith(NOT_SOURCE):
+            hits.append(p)
+            continue
+        b = subprocess.run(["git", "-C", root, "cat-file", "blob", f"{head}:{p}"], capture_output=True)
+        if b.returncode != 0 or b"\0" in b.stdout[:8000]:
+            hits.append(p)
+    return hits
+
+
 def readers(comments, head):
     """Who recorded LAND at this head, from markers this box's own login wrote. -> set of `by` names."""
     out = set()
@@ -1426,6 +1477,13 @@ def cmd_check(args, opts):
     if out_:
         return die(f"check: PR #{pr} is refused whole: {len(out_)} changed path(s) are not the lander's — "
                    f"{', '.join(out_[:8])}. Split them into an ordinary PR."), None
+    bins = binaries(root, mb.strip(), head, core_prefix(root, head))
+    if bins is None:
+        return die(f"check: cannot list what PR #{pr} adds under core/", 3), None
+    if bins:
+        return die(f"check: PR #{pr} is refused: it tracks {len(bins)} file(s) under core/ that are not source "
+                   f"(__pycache__, .pyc, .so or binary) — {', '.join(bins[:8])}. The lander imports from core/, so "
+                   "a compiled file there could run in place of the code that was read."), None
     by = readers(facts.get("comments"), head)
     miss = reads_missing(by)
     if miss:
@@ -1784,10 +1842,78 @@ def selfcheck():
         case("shadow with two revs is a usage refusal", r_use == 2)
     perms_caller_cases(case)
     identity_gate_cases(case)
+    pycache_cases(case)
     HOME, ROOT = old
     bad = sum(1 for _, ok in results if not ok)
     print(f"lander-self selfcheck: {len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
+
+
+def pycache_cases(case):
+    """A commit that force-adds core/lander/__pycache__/run.<tag>.pyc, compiled UNCHECKED_HASH from other source than
+    its run.py: the release built from it imports run.py's code, not the pyc's. And `check`'s binaries(): a PR that
+    adds a __pycache__ path, a .pyc, a .so or a binary under core/ is named for each; a .py it adds, a binary already
+    on the base, one it deletes, and one outside core/ are not. Its own repo and ROOT."""
+    global ROOT
+    import importlib.util
+    import py_compile
+    old_root = ROOT
+    with tempfile.TemporaryDirectory() as t:
+        ROOT = os.path.join(t, "lander")
+        repo = os.path.join(t, "repo")
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def put(rel, data):
+            p = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(data if isinstance(data, bytes) else data.encode())
+
+        def commit(msg):
+            subprocess.run(["git", "-C", repo, "add", "-Af", "."], check=True, env=env, capture_output=True)
+            subprocess.run(["git", "-C", repo, "commit", "-qm", msg], check=True, env=env, capture_output=True)
+            return git(repo, "rev-parse", "HEAD")[1].strip()
+
+        subprocess.run(["git", "init", "-q", repo], check=True, env=env, capture_output=True)
+        put("core/lander/cli.py", "")
+        put("core/lander/__init__.py", "")
+        put("core/docs/old.png", b"\x89PNG\0old")
+        put("core/docs/gone.bin", b"\0gone")
+        base = commit("base")
+        put("core/lander/run.py", "X = 'source'\n")
+        evil = os.path.join(t, "evil.py")
+        with open(evil, "w") as f:
+            f.write("X = 'pyc'\n")
+        pyc = importlib.util.cache_from_source(os.path.join(repo, "core", "lander", "run.py"))
+        py_compile.compile(evil, cfile=pyc, doraise=True,
+                           invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+        put("core/lander/fast.cpython-314-x86_64-linux-gnu.so", "not really")
+        put("core/lander/blob.dat", b"text\0then a NUL")
+        put("core/.gitattributes", "*.dat text diff\n")
+        put("core/lander/ok.py", "Y = 1\n")
+        put("docs/outside.bin", b"\0outside")
+        os.remove(os.path.join(repo, "core", "docs", "gone.bin"))
+        head = commit("adds a pyc")
+        rel_pyc = os.path.relpath(pyc, repo)
+        rel = build(repo, head, "releases")
+        rc, out, err = sh([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import lander.run as r; "
+                           "print(r.X)", os.path.join(rel, "core")], env={**env, "PYTHONDONTWRITEBYTECODE": "1"})
+        # the brief: "a force-added pyc compiled with PycInvalidationMode.UNCHECKED_HASH ... import lander.run loads
+        # the pyc" — so the release must not carry it, and the import must run run.py
+        case("a release built from a commit tracking an unchecked-hash pyc runs the .py, not the pyc",
+             rc == 0 and out.strip() == "source" and
+             not os.path.lexists(os.path.join(rel, rel_pyc)) and
+             os.path.isfile(os.path.join(rel, "core", "lander", "run.py")))
+        case("…and the commit does track it, so the build is what left it out",
+             git(repo, "cat-file", "-e", f"{head}:{rel_pyc}")[0] == 0)
+        case("check's binaries() names every non-source file the PR adds under core/, and nothing else",
+             binaries(repo, base, head, "core/") == sorted([
+                 rel_pyc, "core/lander/blob.dat", "core/lander/fast.cpython-314-x86_64-linux-gnu.so"]))
+        case("…the whole repo is the core tree when it has no core/ prefix",
+             "docs/outside.bin" in (binaries(repo, base, head, "") or []))
+        case("…and an unknown base is None, not a pass", binaries(repo, "0" * 40, head, "core/") is None)
+    ROOT = old_root
 
 
 def identity_gate_cases(case):
