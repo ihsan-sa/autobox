@@ -1169,6 +1169,159 @@ class Members(Fixture):
         self.assertEqual(M.route(T.Job(repo="demo", pr=1)), "")
 
 
+class Compiled(Fixture):
+    """Perms, after #1298: "EVERY lane refuses __pycache__, .pyc, .pyo, .so, .pyd and NUL-bearing blobs under core/
+    AND bin-private/ ... Add an end-to-end case in which a .so beside a gate module is refused in the ordinary lane"."""
+
+    def handed_why(self, pr):
+        return J.read_json(J.handed_path("demo", pr)).get("why") or ""
+
+    def test_a_so_beside_a_gate_module_is_handed_back_in_the_ordinary_lane(self):
+        so = "core/lander/git.cpython-314-x86_64-linux-gnu.so"
+        self.pr(1, {"core/lander/git.py": "X = 1\n", so: "not really an ELF\n"})
+        J.submit("demo", 1)
+        u, _ = self.land()
+        self.assertIsNone(self.job(1))
+        self.assertEqual(u["cards"].calls[0][0], "stopped")
+        self.assertIn(so, self.handed_why(1))
+        self.assertNotIn("core/lander/git.py,", self.handed_why(1))
+        self.assertEqual(u["runner"].calls, [])   # refused before a check ran or a read was bought
+
+    def test_a_nul_bearing_file_under_bin_private_is_handed_back_and_source_beside_it_lands(self):
+        self.pr(1, {"bin-private/door": "#!/bin/sh\n\0x\n", "bin-private/door-ok": "#!/bin/sh\n"})
+        J.submit("demo", 1)
+        self.land()
+        self.assertIsNone(self.job(1))
+        self.assertIn("bin-private/door)", self.handed_why(1))
+        self.pr(2, {"core/lander/fast.py": "Y = 1\n", "bin-private/door-ok": "#!/bin/sh\n"})
+        J.submit("demo", 2)
+        self.land()
+        self.assertEqual(self.job(2).state, T.DEPLOY_PENDING)
+
+    def test_a_binary_outside_both_roots_is_the_ordinary_lanes_as_before(self):
+        self.pr(1, {"docs/pic.png": "\x89PNG\0"})
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(self.job(1).state, T.DEPLOY_PENDING)
+
+    def linked(self, num, files, links, branch=None, gone=()):
+        """pr() with `links` ({path: target}) committed as symlinks beside `files`, after `gone` (paths) are removed;
+        branch "main" pushes to main."""
+        branch = branch or f"track/row-{num}"
+        self.git(self.work, "fetch", "-q", "origin")
+        self.git(self.work, "checkout", "-q", "-B", branch, "origin/main")
+        for rel in gone:
+            self.git(self.work, "rm", "-rq", rel)
+        self.write(self.work, files)
+        for rel, target in links.items():
+            os.makedirs(os.path.dirname(os.path.join(self.work, rel)), exist_ok=True)
+            os.symlink(target, os.path.join(self.work, rel))
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-qm", f"{branch} links")
+        self.git(self.work, "push", "-q", "-f", "origin", f"{branch}:refs/heads/{branch}")
+        if branch != "main":
+            b = self.box()
+            b["prs"][str(num)] = {"headRefName": branch, "title": f"row {num} change"}
+            self.set_box(prs=b["prs"])
+
+    def test_a_symlinked_package_dir_onto_a_so_outside_the_roots_is_handed_back(self):
+        """Opus security read of #1301: "A PR adds the symlink core/lander/git -> ../../docs/p and puts
+        docs/p/__init__.cpython-314-x86_64-linux-gnu.so outside both roots; binaries() returns []"."""
+        so = "docs/p/__init__.cpython-314-x86_64-linux-gnu.so"
+        self.linked(1, {so: "not really an ELF\n"}, {"core/lander/git": "../../docs/p"})
+        J.submit("demo", 1)
+        self.land()
+        self.assertIsNone(self.job(1))
+        self.assertIn("core/lander/git,", self.handed_why(1))
+        self.assertIn(so, self.handed_why(1))
+
+    def test_a_new_symlink_under_core_is_handed_back_even_onto_source(self):
+        self.linked(1, {"docs/p/__init__.py": "X = 1\n"}, {"core/lander/git": "../../docs/p"})
+        J.submit("demo", 1)
+        self.land()
+        self.assertIsNone(self.job(1))
+        self.assertIn("(core/lander/git)", self.handed_why(1))
+
+    def test_a_compiled_name_outside_both_roots_is_handed_back(self):
+        so = "docs/p/x.cpython-314-x86_64-linux-gnu.so"
+        self.pr(1, {so: "not really an ELF\n"})
+        J.submit("demo", 1)
+        self.land()
+        self.assertIsNone(self.job(1))
+        self.assertIn(f"({so})", self.handed_why(1))
+
+    def test_a_symlink_main_already_tracks_lands(self):
+        self.linked(0, {}, {"core/bin/cc-mail": "../mail/receiver.py"}, branch="main")
+        self.linked(1, {"core/bin/other": "#!/bin/sh\n"}, {})
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(self.job(1).state, T.DEPLOY_PENDING)
+
+    def test_a_root_replaced_whole_by_a_symlink_is_handed_back(self):
+        """Opus delta read of #1301 at 5889bc9a: "a PR that deletes bin-private's files and adds the symlink
+        bin-private -> /home/<member>/x lists the bare path 'bin-private'" — here onto a dir inside the repo, so
+        only the bare-root rule names it."""
+        self.linked(0, {"bin-private/door": "#!/bin/sh\n", "docs/p/door": "#!/bin/sh\n"}, {}, branch="main")
+        self.linked(1, {}, {"bin-private": "docs/p"}, gone=("bin-private",))
+        J.submit("demo", 1)
+        self.land()
+        self.assertIsNone(self.job(1))
+        self.assertIn("(bin-private)", self.handed_why(1))
+
+    def test_a_file_outside_the_roots_turned_into_a_symlink_out_of_the_repo_is_handed_back(self):
+        """The same read: "type-changing a file outside the roots (dashboard/server.py ...) into a symlink with an
+        absolute target, or one that resolves outside the repo ... lands unread"."""
+        self.linked(0, {"dashboard/server.py": "print(1)\n", "vr/server.py": "print(2)\n"}, {}, branch="main")
+        self.linked(1, {}, {"dashboard/server.py": "/tmp/evil.py", "vr/server.py": "../../evil.py"},
+                    gone=("dashboard/server.py", "vr/server.py"))
+        J.submit("demo", 1)
+        self.land()
+        self.assertIsNone(self.job(1))
+        self.assertIn("(dashboard/server.py, vr/server.py)", self.handed_why(1))
+
+    def test_a_symlink_under_config_system_lands_and_one_inside_the_repo_does_not(self):
+        self.linked(1, {"vr/real.py": "print(3)\n"},
+                    {"config/system/etc/x.service": "/usr/lib/systemd/system/x.service"})
+        J.submit("demo", 1)
+        self.land()
+        self.assertEqual(self.job(1).state, T.DEPLOY_PENDING)
+        self.linked(2, {}, {"vr/server.py": "real.py"})
+        J.submit("demo", 2)
+        self.land()
+        self.assertIsNone(self.job(2))
+        self.assertIn("(vr/server.py)", self.handed_why(2))
+
+    def test_a_link_chained_through_config_system_is_handed_back(self):
+        """Opus delta read of #1301 at b57c0deb, bypass (a): "config/system/evil -> /tmp/evil.py plus
+        dashboard/server.py -> ../config/system/evil"."""
+        self.linked(0, {"dashboard/server.py": "print(1)\n"}, {}, branch="main")
+        self.linked(1, {}, {"config/system/evil": "/tmp/evil.py", "dashboard/server.py": "../config/system/evil"},
+                    gone=("dashboard/server.py",))
+        J.submit("demo", 1)
+        self.land()
+        self.assertIsNone(self.job(1))
+        self.assertIn("(dashboard/server.py)", self.handed_why(1))
+
+    def test_a_link_through_a_directory_link_is_handed_back(self):
+        """The same read, bypass (b): "docs/up -> .. plus dashboard/server.py -> ../docs/up/../../tmp/evil.py"."""
+        self.linked(0, {"dashboard/server.py": "print(1)\n"}, {}, branch="main")
+        self.linked(1, {}, {"docs/up": "..", "dashboard/server.py": "../docs/up/../../tmp/evil.py"},
+                    gone=("dashboard/server.py",))
+        J.submit("demo", 1)
+        self.land()
+        self.assertIsNone(self.job(1))
+        self.assertIn("(dashboard/server.py, docs/up)", self.handed_why(1))
+
+    def test_no_self_tool_holds_the_job_rather_than_letting_it_through(self):
+        self.pr(1, {"core/lander/fast.py": "Y = 1\n"})
+        J.submit("demo", 1)
+        with mock.patch.object(L, "SELF_TOOL", os.path.join(self.tmp, "gone")), mock.patch.object(L, "_SELF", []):
+            self.land()
+        j = self.job(1)
+        self.assertEqual(j.state, T.HELD)
+        self.assertIn("compiled", j.extra["why"])
+
+
 class Machine(Fixture):
     def test_every_edge(self):
         for s in T.JOB_STATES:

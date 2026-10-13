@@ -76,7 +76,13 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              below (GitHub's CONFLICTING with no file git names -> held 15 min). Under
              the git lock fetch base and head; base_sha, files (merge-base..head), digest (the
              reviewer's digest_of, the key `record` and `will-review` use). A member PR meets its
-             walls (-> handback). THE PROTECTED DOOR, asked again at every head, reads the approval record
+             walls (-> handback). EVERY lane then refuses a PR that adds or changes a compiled file (__pycache__,
+             .pyc, .pyo, .so, .pyd) anywhere, a binary under core/ or bin-private/, or a new or changed symlink
+             anywhere but config/system/ (-> handback naming
+             them; a list that will not read holds, kind box): the set is
+             binaries() of the bin/lander-self committed beside this lander/ (SELF_TOOL, loaded, never copied),
+             read in the sealed repo, so the two lanes refuse one set. THE PROTECTED DOOR, asked again at every head,
+             reads the approval record
              (jobs.approval, never the request): the owner's uid, and the head he 👍'd — or a later head whose
              protected files are byte-identical, which carries approved_head to it (`approval … carried`); else
              -> query, route "owner". A job overlapping one in flight waits here (OVERLAP above). plan(); klass
@@ -187,6 +193,43 @@ from lander import nightly as NG
 from lander import records as REC
 from lander import run as RUN
 from lander import types as T
+
+# Perms, after #1298: "EVERY lane refuses __pycache__, .pyc, .pyo, .so, .pyd and NUL-bearing blobs under core/ AND
+# bin-private/" — one definition, binaries() of the bin/lander-self in the same tree as this lane.
+SELF_TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "lander-self")
+_SELF = []
+
+
+def compiled(root, base, head):
+    """The paths `head` adds or changes from merge-base(base, head) that are not source, as SELF_TOOL's binaries()
+    names them (a compiled name anywhere; a binary under core/ or bin-private/; a symlink anywhere but
+    config/system/), read in a sealed repo on every PR, since a name alone shows no mode. None on any doubt: the tool
+    missing or not loading, or a sealed read or list failing."""
+    try:
+        if not _SELF:
+            from importlib.machinery import SourceFileLoader
+            import importlib.util as iu
+            loader = SourceFileLoader("lander_self_tool", SELF_TOOL)
+            mod = iu.module_from_spec(iu.spec_from_loader(loader.name, loader))
+            loader.exec_module(mod)
+            _SELF.append(mod)
+        tool = _SELF[0]
+        with G.sealed(root, base, head) as ((rc, out), run):
+            if run is None:
+                return None
+            rc, mb = run("merge-base", *out)
+            if rc:
+                return None
+            env = {**G.blind_env(), "GIT_DIR": run.git_dir}
+
+            def raw(*a):
+                p = subprocess.run(["git", *a], cwd=run.git_dir, env=env, capture_output=True,
+                                   stdin=subprocess.DEVNULL, timeout=120)
+                return p.returncode, p.stdout
+            return tool.binaries(root, mb.strip(), out[1], tool.BINARY_ROOTS, run=raw)
+    except Exception:  # noqa: BLE001 — fail closed: a doubt holds the job, it never lets a binary through
+        return None
+
 
 HOLD_SECS = 900          # a held job waits this long before the lane tries it again
 UNRUNNABLE_TRIES = 3     # the 3rd unrunnable check (or refused merge) is a query, not another hold
@@ -1147,6 +1190,15 @@ class Lane:
             why = M.walls(self.root, job.base_sha, job.head, job.files, self.genv)
             if why:
                 return self.handback(job, why)
+        bins = compiled(self.root, job.base_sha, job.head)
+        if bins is None:
+            return self.hold(job, "the lander could not read whether the PR adds a compiled file", kind="box")
+        if bins:
+            return self.handback(job, f"it adds {len(bins)} file(s) that are not source — compiled anywhere, or a "
+                                      f"binary under core/ or bin-private/, or a symlink outside config/system/ "
+                                      f"({', '.join(bins[:8])}); "
+                                      "these could run in place of the source that was read, so take them out of "
+                                      "the PR")
         why = self.door(job)
         if why:
             return self.query(job, why, "owner")
