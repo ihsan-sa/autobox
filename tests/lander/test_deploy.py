@@ -339,6 +339,86 @@ class TestDeploy(Box):
         self.assertIn("mine.service", cards[0][-1])
         self.assertEqual(cards[0][cards[0].index("--run") + 1], "systemctl --user enable --now mine.service")
 
+    def test_policy_is_read_from_the_deployed_trees_manifest(self):
+        # #1126 added three units and their enable=owner rows in one change; the policy came from the lander's own
+        # release, which had no rows yet, so the hub got all three enabled
+        self.unit("new.service")
+        os.makedirs(os.path.join(self.root, "core", "config"))
+        core = os.path.join(self.root, "core", "config", "units.json")
+        with open(core, "w") as f:
+            json.dump({"units": [{"unit": "new.service", "enable": "owner"}]}, f)
+        box = self.fake(changes="A\tcore/config/systemd-user/new.service")
+        D.request("demo", NEW)
+        D.run("demo", green=lambda r, s: True)
+        env = box.called("cc-units policy")[0]["env"]
+        self.assertEqual((env["CC_UNITS_MANIFEST"], env["CC_UNITS_OVERLAY"]), (core, self.root))
+
+    def broken_tree_leaves_unit_off(self, rel):
+        self.unit("new.service")
+        os.makedirs(os.path.join(self.root, "core", "config"))
+        with open(os.path.join(self.root, "core", "config", "units.json"), "w") as f:
+            json.dump({"units": [{"unit": "new.service", "enable": "box"}]}, f)
+        os.makedirs(os.path.dirname(os.path.join(self.root, rel)), exist_ok=True)
+        with open(os.path.join(self.root, rel), "w") as f:
+            f.write('{"units": [')
+        box = self.fake(changes="A\tcore/config/systemd-user/new.service")
+        D.request("demo", NEW)
+        D.run("demo", green=lambda r, s: True)
+        self.assertNotIn("enable", [c["argv"][2] for c in box.called("systemctl")])
+        self.assertEqual(len(box.called("cc-notify --approval")), 1)
+
+    def test_a_broken_core_manifest_leaves_the_unit_off(self):
+        self.broken_tree_leaves_unit_off("core/config/units.json")
+
+    def test_a_broken_overlay_manifest_leaves_the_unit_off(self):
+        self.broken_tree_leaves_unit_off("config/units.json")
+
+    def test_an_empty_or_failed_policy_answer_leaves_the_unit_off(self):
+        for answer in ((0, ""), (2, "jq: parse error\n")):
+            self.unit("new.service")
+            box = self.fake(changes="A\tconfig/systemd-user/new.service", **{"cc-units policy": answer})
+            D.request("demo", NEW)
+            D.run("demo", green=lambda r, s: True)
+            self.assertNotIn("enable", [c["argv"][2] for c in box.called("systemctl")])
+
+    def test_restart_reads_the_deployed_trees_manifest(self):
+        # a restart=owner row added in the same change answers, not the lander's own release without it
+        self.unit("demo-daemon.service")
+        os.makedirs(os.path.join(self.root, "core", "config"))
+        core = os.path.join(self.root, "core", "config", "units.json")
+        with open(core, "w") as f:
+            json.dump({"units": [{"unit": "demo-daemon.service", "restart": "owner"}]}, f)
+
+        def restart_for(argv):
+            return 0, "demo-daemon.service\towner\n"
+        box = self.fake(**{"cc-units restart-for": restart_for, "cc-scope add": (0, "")})
+        D.request("demo", NEW)
+        D.run("demo", green=lambda r, s: True)
+        env = box.called("cc-units restart-for")[0]["env"]
+        self.assertEqual((env["CC_UNITS_MANIFEST"], env["CC_UNITS_OVERLAY"]), (core, self.root))
+        self.assertNotIn("restart", [c["argv"][2] for c in box.called("systemctl")])
+        self.assertEqual(len(box.called("cc-scope add")), 1)
+
+    def test_a_tree_with_only_its_own_manifest_asks_that_one(self):
+        self.unit("new.service")
+        os.makedirs(os.path.join(self.root, "config"))
+        own = os.path.join(self.root, "config", "units.json")
+        with open(own, "w") as f:
+            json.dump({"units": [{"unit": "new.service", "enable": "box"}]}, f)
+        box = self.fake(changes="A\tconfig/systemd-user/new.service")
+        D.request("demo", NEW)
+        D.run("demo", green=lambda r, s: True)
+        env = box.called("cc-units policy")[0]["env"]
+        self.assertEqual((env["CC_UNITS_MANIFEST"], env["CC_UNITS_OVERLAY"]), (own, ""))
+        self.assertEqual([c["argv"][-1] for c in box.called("systemctl") if c["argv"][2] == "enable"], ["new.service"])
+
+    def test_a_tree_with_no_manifest_asks_the_landers_own(self):
+        self.unit("new.service")
+        box = self.fake(changes="A\tconfig/systemd-user/new.service")
+        D.request("demo", NEW)
+        D.run("demo", green=lambda r, s: True)
+        self.assertIsNone(box.called("cc-units policy")[0]["env"])
+
     def test_a_bare_daemon_restart_is_proved_by_new_pids(self):
         box = self.fake(**{"cc-units daemons-for": (0, "watcher\tbin/restart-watcher\tbin/daemon\n"),
                            "restart-watcher": (0, "")})

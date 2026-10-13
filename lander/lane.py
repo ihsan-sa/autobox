@@ -1,7 +1,7 @@
 """One lane per repo: intake, the job machine (checks side by side), Δ revalidation, the merge (one at a time) and
 its tree proof.
 
-    lander queue <repo|h--t> <pr> [--chat C --ts T --who W --approved-by UID --no-start]
+    lander queue <repo|h--t> <pr> [--chat C --ts T --who W --approved-by UID --no-start --light]
     lander queue --task <repo> <row>
     lander lane <repo>          run the repo's lane in the foreground (what `queue` and `tick` start)
 
@@ -18,6 +18,17 @@ says where it waits (exit 0); otherwise `lander tick --repo <repo>` is started d
 the caller's environment: tick_env), and a start that fails is
 exit 1 "queued, but…". `queue --task` is the old queue_task unchanged: `cc done <repo> <row> --json`, `cc lands`
 0 queue / 1 approval / 2 refused, anything else failed; the receipt (with `landing`) is the one line on stdout.
+`queue --light` also prints whether the PR's paths let it go the light way, naming the path that does not
+(light_word); the lane decides it for every PR anyway, asked or not.
+
+THE LIGHT LANE (light.py has who qualifies): at each queued turn of a PR in the repo's own lane, Lane.light() asks
+light.why_not (no file on a list the lander guards a landing by) and then reviewer.land_recorded (a LAND recorded at
+the head and digest) and keeps the answer in extra["light"]: True (`stage <repo>#<pr> light`, once per head), or
+why not. A light job is not parked on an overlap, plans only its static and hermetic checks (light.trim, at
+planned; a plan that keeps none is not light), goes before every due job but one put first, is handed back when a
+check is blocked by main (since the ratchet, reds it refused to call main's), moves its base to main without a Δ re-plan when main moves at mergeable and the new base still lets it go light (the merge's
+merge-tree still proves it clean), and is handed back on a conflict with its base found after it was planned
+(checking, the merge) instead of a park or a repair round. Everything else (the door, the compiled-file refusal, GitHub CI, the pinned merge and its proof) is as below.
 
 THE LANE (Lane.run) takes <repo>.lock (busy: return — the running lane re-reads), drains the inbox, and steps each
 job until it rests (held until not_before, query, done, deploy-pending, handed back) or waits on a check, re-reading
@@ -197,6 +208,7 @@ from lander import git as G
 from lander import health as HL
 from lander import jobs as J
 from lander import manifest as MF
+from lander import light as LT
 from lander import members as M
 from lander import nightly as NG
 from lander import records as REC
@@ -419,6 +431,25 @@ def protected_hit(repo, root, pr, token=None, genv=None):
         if files is None:
             return "?", f"gh lists only the first {GH_PR_FILES} files and git could not list the rest"
     return first_hit(files, rules)
+
+
+def light_word(repo, root, pr, token=None, genv=None) -> str:
+    """What `queue --light` prints: whether the PR's paths let it go the light way (light.py), naming the path that
+    does not. The LAND it also needs is the lane's to find, at the head it plans."""
+    if M.member_of(repo)[0]:
+        return f"PR #{pr} goes the normal way: it is a member's PR"
+    j = GH.pr_facts(root, pr, "baseRefName,headRefName", token, 60)[0] or {}
+    base, branch = (j.get("baseRefName") or "").strip(), (j.get("headRefName") or "").strip()
+    try:
+        with G.git_lock(root):
+            got = G.fetch(root, base, branch, env=genv) if base and branch else {}
+        files = G.pr_changed(root, got[base], got[branch], env=genv) if got else []
+    except G.GitError:
+        got, files = {}, []
+    why = LT.why_not(root, got[base], files, protected_rules(repo), MF.host_fallback(repo)) if got \
+        else "gh or git could not name its base, head and files"
+    return (f"PR #{pr} goes the normal way: {why}" if why
+            else f"PR #{pr} goes the light way once a LAND is recorded at its head")
 
 
 # --- the board (used when lander.board is not installed) ------------------------------------------------------------
@@ -669,7 +700,8 @@ class Lane:
             # check runs), else the oldest heavy one; and of those, while a slot is free, a checking job with a check
             # left first (brief, 10-13: "while a check slot is free and some checking job has a check left to run, the
             # lane starts that check before it spends time replanning queued or parked jobs")
-            job = min(todo, key=lambda j: (not J.first(j.repo, j.pr), not self.overdue(j, "queued_at"),
+            job = min(todo, key=lambda j: (not J.first(j.repo, j.pr), j.extra.get("light") is not True,
+                                           not self.overdue(j, "queued_at"),
                                            self.still_parked(j, jobs),
                                            self.heavy(j) and not (self.overdue(j, "queued_at", HEAVY_WAIT)
                                                                   and not self.started(j)),
@@ -1114,6 +1146,9 @@ class Lane:
         (a member's to its own channel) with one message, and a push to the branch re-queues it."""
         base = job.extra.get("base_ref") or "main"
         why = f"PR #{job.pr} conflicts with {base}: {J.path_names(paths)}"   # a path is the branch's: shown clean
+        # brief 10-13: "If it can't merge cleanly, hand it back. Don't park it." A queued job's flag is an older head's
+        if job.extra.get("light") is True and job.state != T.QUEUED:
+            return self.handback(job, f"{why} — rebase it and queue it again")
         other = next((j for j in J.lane_jobs(self.repo)
                       if j.key != job.key and j.state in ACTIVE and set(paths) & set(j.files)), None)
         if other:
@@ -1222,7 +1257,8 @@ class Lane:
         why = self.door(job)
         if why:
             return self.query(job, why, "owner")
-        other = self.overlapping(job)
+        # brief 10-13: "No host checks, no e2e, no main-red hold, no overlap parking" for a light job
+        other = None if self.light(job) else self.overlapping(job)
         if other:   # design: "Two changes that overlap from the start don't both burn CPU; the later one waits"
             return self.park(job, other, read=True)
         self.parked.discard(job.key)
@@ -1277,7 +1313,30 @@ class Lane:
             return ""
         return f"{words}, at a head the owner has not 👍'd ({ah[:12] or 'no head recorded'} → {job.head[:12]})"
 
+    def light(self, job) -> bool:
+        """Whether `job` at this head goes the light way (light.py), kept in job.extra["light"]: True, or the reason
+        it does not. Asked at every queued turn, since a new head or a newly recorded LAND changes the answer."""
+        why = "it is a member's PR" if self.member else LT.why_not(self.root, job.base_sha, job.files,
+                                                                    protected_rules(self.repo), self.fallback)
+        if not why:
+            try:   # a reader that fails is the normal lane, never a hold
+                land = self.call("reviewer", "land_recorded", job) if self.unit("reviewer") else None
+            except Exception:  # noqa: BLE001
+                land = None
+            why = "" if land is not None and land.verdict == T.LAND else "no LAND is recorded at its head"
+        was = job.extra.get("light")
+        job.extra["light"] = why or True
+        if not why and was is not True:
+            E.stage(job.repo, job.pr, "light", head=job.head[:12])
+        return not why
+
     def planned(self, job):
+        if job.extra.get("light") is True:   # brief 10-13: "the PR's static and hermetic checks"
+            kept = LT.trim(self.manifest(job), job.plan) if job.plan else None
+            if kept is not None and kept.checks:
+                job.plan = kept
+            else:   # security read of #1316: "a trimmed plan that comes out empty means the PR isn't light"
+                job.extra["light"] = "its plan keeps no static or hermetic check"
         J.move(job, T.CHECKING)
 
     def manifest(self, job):
@@ -1413,7 +1472,8 @@ class Lane:
         return True
 
     def took(self, job, f, outs):
-        """Record one finished check of `job` (f: its Flight): red hands back, main-red holds, else it is kept."""
+        """Record one finished check of `job` (f: its Flight): red hands back, main-red holds (a light job hands back),
+        else it is kept."""
         n, tree, base_ref = f.name, f.tree, job.extra.get("base_ref") or "main"
         o = outs.get(n) or RUN.Outcome(n, T.UNRUNNABLE, "the runner gave no outcome")
         secs = int(sum(r.secs for r in o.results))
@@ -1434,6 +1494,12 @@ class Lane:
             job.extra["red"] = {"check": n, "head": job.head}
             return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]})"
                                       + (f": {J.quoted(o.note)}" if o.note else ""))   # a gate's line
+        if o.status == RUN.BLOCKED and job.extra.get("light") is True:
+            # security read of #1316: since the ratchet, blocked-by-main means reds it refused (a security check, a
+            # check the PR touches, new failing cases), so a light job hands back; it is never kept and merged
+            return self.handback(job, f"check {n} is red on the merge with {base_ref} ({tree[:12]}) and the ratchet "
+                                      f"would not call it main's, so the light lane hands it back"
+                                      + (f": {J.quoted(o.note)}" if o.note else ""))
         if o.status == RUN.BLOCKED:
             # since: when this check first held this job, kept while it holds it again, for tick.flag_main_red's
             # hour; fails: main's failing ids, which that alert names
@@ -1544,6 +1610,14 @@ class Lane:
                 head_now, main_now = got[branch], got[base]
             if head_now != job.head:
                 return J.move(job, T.QUEUED, why=f"the head moved to {head_now[:12]}")
+            if main_now != job.base_sha and job.extra.get("light") is True:
+                # asked again at the new base: a policy main took since may now list one of its files
+                why = LT.why_not(self.root, main_now, job.files, protected_rules(self.repo), self.fallback)
+                if why:
+                    job.extra["light"] = why   # not light any more: the Δ re-plan below, as for any job
+                else:
+                    job.base_sha = main_now   # brief 10-13: "merge at the head right away"; merge() proves it clean
+                    J.save(job)
             if main_now != job.base_sha:
                 rerun = self.revalidate(job, main_now)
                 # a reach.tsv the old base's merge tree generated need not be what the new one generates
@@ -1835,8 +1909,8 @@ def cmd_queue(argv):
     if argv and argv[0] == "--task":
         return queue_task(argv[1:])
     pos, opts = split_opts(argv, "--chat", "--ts", "--who", "--approved-by")
-    start, put_first = "--no-start" not in pos, "--first" in pos
-    pos = [a for a in pos if a not in ("--no-start", "--first")]
+    start, put_first, light = "--no-start" not in pos, "--first" in pos, "--light" in pos
+    pos = [a for a in pos if a not in ("--no-start", "--first", "--light")]
     if len(pos) > 2:
         return refuse(f"queue: unexpected '{pos[2]}'")
     repo, pr = (pos + ["", ""])[:2]
@@ -1891,6 +1965,8 @@ def cmd_queue(argv):
     if put_first:
         E.log("first", repo, pr, who=J.first(repo, pr).get("by") or "-")
     print(f"[{repo}] PR #{pr} queued — its checks run first, then the merge, then the deploy")
+    if light:   # brief 10-13: "Print why a PR doesn't qualify, naming the protected path"
+        print(f"lander: {light_word(repo, root, pr, token, genv)}")
     if paused(handle or repo):
         print(f"lander: {handle or repo} is paused — nothing lands until `cc-pause off {handle or repo}`, "
               f"and this request waits for it")

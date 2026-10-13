@@ -12,7 +12,9 @@ makes it (blind to the checkout's config and attributes, so binary means binary 
 lines dropped (a binary file's full blob ids kept) and the rest hashed, so a rebase that does not change the change
 keeps its key. It is the one key: the lane names its job by it, and `record` and `will-review` by it too. A read
 recorded at that digest (or the legacy one, keys()) — by this lander, by a seat through `record`, or by the old
-lander — is reused, never bought again, by review() and delta_review() alike.
+lander — is reused, never bought again, by review() and delta_review() alike. The light lane (light.py) asks
+land_recorded(): that recorded verdict when it is a LAND whose marker names the PR's head now, else None; it buys
+nothing.
 
 WHERE VERDICTS LIVE. On the PR, as marker comments. Today's shape is kept so every reader still parses it:
 
@@ -1413,6 +1415,20 @@ def standing(job, comments=None):
         comments = facts.get("comments") or []
     prior = open_security(comments, job.head) or latest(comments)
     return prior if prior and prior.verdict == T.HANDBACK_VERDICT else None
+
+
+def land_recorded(job, comments=None):
+    """The LAND already recorded at this job's head and digest (a seat's `lander record`, or an earlier read), or
+    None: no such marker, a newer HANDBACK at the digest, or comments that will not read. The light lane (light.py)
+    lands only on one."""
+    if comments is None:
+        facts = pr_view(root_of(job), job.pr)
+        if facts is None:
+            return None
+        comments = facts.get("comments") or []
+    v = recorded(comments, keys(job, diff_of(root_of(job), job.base_sha, job.head)), job.head)
+    at = (v.extra.get("head") or "") if v else ""
+    return v if v and v.verdict == T.LAND and len(at) >= 7 and job.head.startswith(at) else None
 
 
 def delta_review(job, prior, comments=None, diff=None):

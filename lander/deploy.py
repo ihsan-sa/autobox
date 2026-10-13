@@ -26,7 +26,9 @@ THE STEPS, per target, in order; the first that fails stops that target and says
               daemon-reload`; then <repo>.applied records the sha
   4. units    a systemd-user unit this change ADDED is enabled with `enable --now`, unless its .timer does it, it
               has no [Install], install.sh did not link it, or `cc-units policy <u> enable` says owner — then the
-              owner gets one 🔐 card with the command, and nothing else asks him (S5)
+              owner gets one 🔐 card with the command, and nothing else asks him (S5). The policy is read from the
+              manifests of the tree just deployed, never the lander's own release: a change that adds a unit and
+              its enable=owner row together is otherwise enabled anyway (#1126's hostdoor units on the hub, 10-13)
   5. restart  a linked .service whose Exec runs a changed file, or that `cc-units restart-for` names, is restarted
               and PROVED by a new MainPID. `cc-units` policy none skips it; policy owner files a cc-scope restart
               ask (scope.owner_ask). tmux-main.service is NEVER restarted: it holds every session on the box.
@@ -46,6 +48,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import json
 import os
 import re
 import shlex
@@ -167,8 +170,8 @@ def unit_text(u):
         return ""
 
 
-def cc_units(*args, timeout=120):
-    return C.sh([os.path.join(C.BIN, "cc-units"), *args], timeout=timeout)
+def cc_units(*args, timeout=120, env=None):
+    return C.sh([os.path.join(C.BIN, "cc-units"), *args], timeout=timeout, env=env)
 
 
 @contextlib.contextmanager
@@ -507,9 +510,37 @@ def install(root, repo, sha):
     return f"installed with {inst}" if inst else "pulled; no install.sh to run"
 
 
-def enable_units(changes, repo, sha):
+def manifest_env(root):
+    """cc-units' env for the tree at `root`: its core manifest with `root` as the overlay when it keeps core/ inside,
+    else its own config/units.json. {} for a tree with neither (the lander's own manifests then answer)."""
+    core = os.path.join(root, "core", "config", "units.json")
+    if os.path.isfile(core):
+        return {"CC_UNITS_MANIFEST": core, "CC_UNITS_OVERLAY": root}
+    own = os.path.join(root, "config", "units.json")
+    return {"CC_UNITS_MANIFEST": own, "CC_UNITS_OVERLAY": ""} if os.path.isfile(own) else {}
+
+
+def manifests_parse(extra):
+    """Whether every manifest `extra` (manifest_env's answer) points cc-units at parses: the core one and the
+    overlay's own config/units.json. True for {} (the lander's own manifests answer then)."""
+    paths = [extra.get("CC_UNITS_MANIFEST", "")]
+    if extra.get("CC_UNITS_OVERLAY"):
+        paths.append(os.path.join(extra["CC_UNITS_OVERLAY"], "config", "units.json"))
+    for p in filter(os.path.isfile, filter(None, paths)):
+        try:
+            with open(p) as f:
+                json.load(f)["units"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+    return True
+
+
+def enable_units(changes, repo, sha, root):
     added = [m.group(1) for s, p in changes if s == "A" for m in [UNIT_RE.search(p)] if m]
     have, notes, on = linked(), [], []
+    extra = manifest_env(root)
+    env = {**os.environ, **extra} if extra else None
+    broken = not manifests_parse(extra)
     for u in added:
         stem, ext = u.rsplit(".", 1)
         if ext == "service" and f"{stem}.timer" in set(added) | set(have):
@@ -521,8 +552,10 @@ def enable_units(changes, repo, sha):
         if ext == "service" and "[Install]" not in unit_text(u):
             notes.append(f"{u} has no [Install]")
             continue
-        _, pol = cc_units("policy", u, "enable", timeout=30)
-        if pol.strip() == "owner":
+        # brief: "if the deployed tree's units.json (core or overlay) doesn't parse, or cc-units gives an empty or
+        # unreadable answer for a unit, treat that unit as enable=owner: leave it off and card it, never enable --now"
+        rc, pol = (1, "") if broken else cc_units("policy", u, "enable", timeout=30, env=env)
+        if rc or pol.strip() in ("", "owner"):
             C.owner_card(f"land:{repo}:deploy:enable-{u}@{sha[:12]}",
                          f"[{repo}] {u} is new, and cc-units keeps turning it on for you: "
                          f"`systemctl --user enable --now {u}`", run=f"systemctl --user enable --now {u}")
@@ -558,7 +591,8 @@ def restart_units(root, changes, project, src):
     if not files:
         return [], [], []
     moved = {os.path.basename(p) for p in files}
-    rc, out = cc_units("restart-for", "--root", root, *files)
+    extra = manifest_env(root)   # the deployed tree's rows, as enable_units reads them, not the lander's own release
+    rc, out = cc_units("restart-for", "--root", root, *files, env={**os.environ, **extra} if extra else None)
     if rc:
         raise Failed("restart", f"cc-units restart-for: {last(out)}")
     declared = dict(ln.split("\t") for ln in out.splitlines() if ln.count("\t") == 1)
@@ -681,7 +715,7 @@ def deploy_one(repo, target, sha, since=None):
         said = []
         changes = pull(root, base_of(repo), sha, before, said)
         said.append(install(root, repo, sha))
-        on, notes = enable_units(changes, repo, sha)
+        on, notes = enable_units(changes, repo, sha, root)
         restarted, asks, n2 = restart_units(root, changes, repo, f"deploy of {repo} at {sha[:12]}")
         started, n3 = daemons(root, changes)
     except Failed as e:   # files moved aside before an install or restart failed are still said: a retry moves none

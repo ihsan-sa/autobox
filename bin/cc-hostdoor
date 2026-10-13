@@ -30,8 +30,10 @@
 #                       (~/.cc/members/<h>/) it listens on ~/.cc/slack/member/<h>/sock — the path cc-sandbox shows the
 #                       member as ~/.cc/slack/sock — mode 0600 as cc-slack makes it, and each connection becomes one
 #                       `ssh <hub> slack <h>`, spliced both ways. The hub is the one record in ~/.cc/hosts with role=hub.
-#                       Refuses to start on the hub itself: a live daemon on ~/.cc/slack/sock, or $CC_HOSTDOOR_HERE
-#                       equal to the hub's name. Handles are re-scanned every $CC_HOSTDOOR_SCAN seconds.
+#                       Refuses (rc 2) to start on the hub itself: a live daemon on ~/.cc/slack/sock, checked before
+#                       any hub record is looked for, or $CC_HOSTDOOR_HERE equal to the hub's name. The unit sets
+#                       RestartPreventExitStatus=2, so a relay enabled on the hub stops once instead of looping.
+#                       Handles are re-scanned every $CC_HOSTDOOR_SCAN seconds.
 #   cc-hostdoor queries-push   one-shot (cc-hostdoor-queries.timer, 60 s): each local member's ~/.cc/state/<h>/queries.spool,
 #                       under its lock, goes to the hub as `queries <h>`; the local spool loses what was sent only on rc 0.
 #                       ~/.cc/state/_nomarker/queries.spool (cc-guard's key for a markerless session) goes up the same way
@@ -448,11 +450,16 @@ def relay_conn(c, h, dest):
 
 
 def relay():
+    # brief: "check whether this host is the hub before looking for a hub record, and exit 2" — the hub keeps no
+    # role=hub record of itself, and a 1 there is what Restart=on-failure crash-looped over 1000 times (10-13)
+    if hub_alive():
+        print("cc-hostdoor relay: a live daemon holds ~/.cc/slack/sock, so this host is the hub — nothing to relay", file=sys.stderr)
+        return 2
     hub = the_hub()
     if not hub:
         return 1
     name, dest = hub
-    if HERE == name or hub_alive():
+    if HERE == name:
         print(f"cc-hostdoor relay: this host is the hub ({name}) — nothing to relay", file=sys.stderr)
         return 2
     live = {}   # handle -> (server socket, inode of its path)
@@ -786,6 +793,17 @@ def selfcheck():
         k(rc == 2 and not os.path.exists(sesock), f"…and where a live daemon holds ~/.cc/slack/sock (rc {rc})")
         live.srv.close()
         os.unlink(f"{SES}/.cc/slack/sock")
+        # the hub keeps no role=hub record of itself: its live daemon answers first, rc 2 and not the 1 that
+        # Restart=on-failure crash-looped over 1000 times on the tower (10-13)
+        bare = f"{T}/bare"     # a host with a member, no hub record and no daemon: not the hub, so a plain failure
+        os.makedirs(f"{bare}/.cc/members/alice/board")
+        rc, _ = run(["relay"], bare)
+        k(rc == 1 and not os.path.exists(f"{bare}/.cc/slack/member/alice/sock"), f"no hub record and no live daemon: the relay fails (rc {rc}), no socket bound")
+        hsock = f"{HUB}/.cc/slack/member/alice/sock"
+        rc, _ = run(["relay"], HUB)   # the fake hub: its daemon is live, and it has no ~/.cc/hosts at all
+        k(rc == 2 and not os.path.exists(hsock) and not os.path.exists(f"{HUB}/.cc/hosts"),
+          f"…and on a hub with no ~/.cc/hosts hub record but a live daemon, it refuses (rc {rc})")
+        owner.n = 0            # that refusal's hub_alive probe connected once; the door cases below count from none
 
         # the relay end to end
         rp = subprocess.Popen([me, "relay"], env=dict(base, HOME=SES), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
