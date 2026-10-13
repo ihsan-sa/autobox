@@ -15,7 +15,7 @@ def selfcheck():
     base = tempfile.mkdtemp(prefix="cc-tmp-reap-sc.")
     root = f"{base}/tmp"
     os.makedirs(root)
-    kids = []
+    kids, socks, fifo_fds = [], [], []
     try:
         uid = os.getuid()
         sid_dead, sid_argv, sid_env = ("11111111-2222-3333-4444-555555555555", "22222222-3333-4444-5555-666666666666",
@@ -40,6 +40,48 @@ def selfcheck():
         for p in (young, f"{young}/f", f"{fresh_inside}/b"):
             os.utime(p, (now, now))
         unnamed = [mk("tmp.AbCdEf1234"), mk("abcdefgh12"), mk("notes"), mk("dash-src-")]
+        # a user service's PrivateTmp=yes /tmp and snap's: old, unheld, unnamed, ours, and never taken
+        private = [mk("systemd-private-0123456789abcdef0123456789abcdef-box-cal.service-AbCdEf"),
+                   mk("snap-private-tmp"), mk("snap-private-tmp.AbCd12")]
+
+        # A server's door: bound by a relative name from inside its dir, because an AF_UNIX path stops at 108 bytes
+        # and a lander's run root under TMPDIR is longer than that (the 922 review: bind raised and the check died).
+        import socket as _socket
+
+        def listen_in(d, name):
+            here = os.getcwd()
+            os.chdir(d)
+            try:
+                sk = _socket.socket(_socket.AF_UNIX)
+                socks.append(sk)
+                sk.bind(name)
+                sk.listen(1)
+            finally:
+                os.chdir(here)
+
+        # headless Chrome's scratch is a family, a dot name included; a listening socket or a fifo inside keeps it
+        # whatever its age, and this process holding the socket is no help: its fd reads socket:[inode] in /proc
+        chrome_go = mk(".com.google.Chrome.Go12Cd")
+        open(f"{root}/.com.google.Chrome.Fi12Le", "w").write("x")
+        chrome_sock = mk(".com.google.Chrome.Sk12Cd")
+        listen_in(chrome_sock, "SingletonSocket")
+
+        def fifo_in(d, held_open):
+            os.mkfifo(f"{d}/pipe")
+            if held_open:   # a fifo's fd reads as its path in /proc, so the process holding it keeps the dir
+                fifo_fds.append(os.open(f"{d}/pipe", os.O_RDWR | os.O_NONBLOCK))
+            return d
+        chrome_fifo = fifo_in(mk(".com.google.Chrome.Ff12Cd"), True)
+        land_fifo = fifo_in(mk("cc-land.run.999999997.fifo1234"), True)
+        dash_sock = mk("dash-web-sock1234/run")
+        listen_in(dash_sock, "s")
+        dash_sock = os.path.dirname(dash_sock)
+        # a dead server's door: a socket file nothing has bound any more, and a fifo nobody has open
+        dead_sock = mk("cc-render.Dsock1/run")
+        listen_in(dead_sock, f"gone-sc-{os.getpid()}")
+        socks.pop().close()
+        dead_sock = os.path.dirname(dead_sock)
+        dead_fifo = fifo_in(mk(".com.google.Chrome.Dfifo1"), False)
         target = mk("real-dir-elsewhere")
         os.symlink(target, f"{root}/cc-brief.l1nk3d99")
         cwd_held = mk("cc-land-selfcheck-h-cwdheld1")
@@ -53,6 +95,9 @@ def selfcheck():
         s_argv = mk(f"claude-{uid}/-home-u-dev-r/{sid_argv}/scratchpad")
         s_env = mk(f"claude-{uid}/-home-u-dev-r/{sid_env}/tasks")
         s_notsid = mk(f"claude-{uid}/-home-u-dev-r/not-a-session")
+        s_fifo = mk(f"claude-{uid}/-home-u-dev-r/88888888-9999-aaaa-bbbb-cccccccccccc/scratchpad")
+        fifo_in(s_fifo, True)
+        s_dead_fifo = fifo_in(mk(f"claude-{uid}/-home-u-dev-r/99999999-aaaa-bbbb-cccc-dddddddddddd/scratchpad"), False)
         s_cwd = mk(f"claude-{uid}/-home-u-dev-r/44444444-5555-6666-7777-888888888888")
         sid_json = "55555555-6666-7777-8888-999999999999"
         s_json = mk(f"claude-{uid}/-home-u-dev-r/{sid_json}/tasks")
@@ -87,7 +132,8 @@ def selfcheck():
             open(f"{base}/x/{f}", "w").write("import time\ntime.sleep(60)\n")
         new_l = spawn([sys.executable, "-P", f"{base}/x/core/lander/cli.py", "lane", "r"])
         self_l = spawn(["bash", "-c", "exec -a /x/core/bin/lander-self sleep 60"])
-        not_l = spawn([sys.executable, "-P", f"{base}/x/landerish.py", "lander"])
+        # by a relative name, so a base under a lander's own run root (cc-land.run.*) puts no lander word in argv
+        not_l = spawn([sys.executable, "-P", "landerish.py", "lander"], cwd=f"{base}/x")
         kids += [new_l, self_l, not_l]
         run_new = mk(f"cc-land.run.{new_l.pid}.newlnd12")
         run_self = mk(f"cc-land.run.{self_l.pid}.selfln12")
@@ -98,12 +144,14 @@ def selfcheck():
         by_json = spawn(["bash", "-c", "exec -a claude sleep 60"])
         kids.append(by_json)
         json.dump({"sessionId": sid_json, "cwd": "/home/u/dev/r"}, open(f"{sessions}/{by_json.pid}.json", "w"))
-        kids.append(spawn(["bash", "-c", "exec -a claude sleep 60"], cwd=blind_cwd))
+        # `claude` straight from execve, not from bash: bash exports PWD, and a TMPDIR holding a session id (a
+        # session's own scratch) would make this cwd name one, so the claude would not be blind
+        kids.append(spawn(["claude", "60"], executable=sleep, cwd=blind_cwd))
         time.sleep(0.5)   # let each child reach its cwd, its open() and its mmap
 
         def reap(apply_, when=now, as_uid=None, hours=HOURS):
             buf = io.StringIO()
-            todo = run(root, apply_, hours, now=when, uid=as_uid, out=buf, sessions=sessions)
+            todo = run(root, apply_, hours, now=when, uid=as_uid, out=buf, sessions=sessions, any_name=True)
             return {p for p, *_ in todo}, buf.getvalue()
 
         dry, text = reap(False)
@@ -114,9 +162,56 @@ def selfcheck():
         ok("an old file of a named family goes (a gate log)", f"{root}/cc-green.gate.Ab12Cd" in dry)
         ok("an old render scratch dir goes (cc-suites render, killed mid-stream)", render_left in dry)
         ok("a young one stays", young not in dry)
+        ok("an old headless Chrome scratch dir or file goes, dot name and all",
+           chrome_go in dry and f"{root}/.com.google.Chrome.Fi12Le" in dry)
+        ok("…but not one holding a live listening socket that no process names", chrome_sock not in dry)
+        ok("…nor one holding a fifo a process has open", chrome_fifo not in dry)
+        ok("a socket or fifo keeps every family: a dead lander's run root, a dash dir with one a level down",
+           land_fifo not in dry and dash_sock not in dry)
+        ok("a dead server's socket file pins nothing: its old dir goes", dead_sock in dry)
+        ok("…and nor does a fifo nobody has open", dead_fifo in dry)
         ok("an old dir with one fresh file inside stays", fresh_inside not in dry)
-        ok("names no tool here made stay, however old (tmp.*, a bare mkdtemp, a person's dir, a prefix alone)",
+        ok("names no tool here made stay for 72 h (tmp.*, a bare mkdtemp, a person's dir, a prefix alone)",
            not dry.intersection(unnamed))
+        # …and then go: a session's ad-hoc /tmp/<name> (13 G of a 16 G /tmp on 2026-09-27) has no family,
+        # so its session ending is read as nothing naming it, holding it or writing to it for STALE_HOURS
+        named_live = mk("ss-live-session")
+        kids.append(spawn(["bash", "-c", "sleep 60; :", f"{named_live}/out.txt"]))   # a live session's argv names it
+        door = mk("tmux-0")
+        listen_in(door, "default")
+        dot = mk(".X99-lock-dir")
+        # names with odd bytes, each named by a live process and nothing else: a whitespace split once kept `my` and
+        # took `my task` (the 922 review). A space in argv, a newline in the environment, a shell-escaped space in a
+        # `bash -c` script, and a cwd whose name has both.
+        odd = {"space in argv": mk("my task"), "newline in environ": mk("line\nbreak"),
+               "escaped space in a script": mk("esc aped"), "space and newline in cwd": mk("cwd sp\nnl")}
+        kids.append(spawn(["bash", "-c", "sleep 60; :", f"{odd['space in argv']}/out.txt"]))
+        kids.append(spawn([sleep, "60"], env={**quiet, "OUT": f"{odd['newline in environ']}/out.txt"}))
+        kids.append(spawn(["bash", "-c", f"sleep 60; cat {root}/esc\\ aped/out; :"]))
+        kids.append(spawn([sleep, "60"], cwd=odd["space and newline in cwd"]))
+        time.sleep(0.3)
+        later = reap(False, when=now + 2 * 86400)[0]
+        ok("…and after 72 h an unnamed dir nothing holds or names goes (an ended session's scratch)",
+           set(unnamed) <= later)
+        ok("…but never a service's private /tmp (systemd-private-*), at any age", private[0] not in later)
+        ok("…nor snap's (snap-private-tmp, snap-private-tmp.*), at any age", not later.intersection(private[1:]))
+        buf = io.StringIO()
+        tmpdir_only = {p for p, *_ in run(root, False, HOURS, now=now + 2 * 86400, out=buf, sessions=sessions,
+                                           any_name=False)}
+        ok("…and in a root other than /tmp and the scratch on disk an unnamed dir stays at any age, a family still goes",
+           not tmpdir_only.intersection(unnamed) and old_dash in tmpdir_only)
+        ok("…which TMPDIR naming another dir is: only /tmp and the scratch on disk take any name",
+           os.path.realpath(root) not in stale_roots() and os.path.realpath("/tmp") in stale_roots()
+           and os.path.realpath(SCRATCH) in stale_roots())
+        ok("…while one a live process names in its argv stays", named_live not in later)
+        for what, p in odd.items():
+            ok(f"…and so does one with odd bytes in its name ({what})", p not in later)
+        ok("a mention keeps every name it may mean: up to a space or a colon, and whole",
+           named_entries(f"x {root}/my task/out\0P={root}/a:{root}/b c".encode(), root)
+           >= {"my", "my task", "a", "a:", "b", "b c"})
+        ok("…and never a name it cannot (another root, a longer name with the same start)",
+           not named_entries(f"/elsewhere/my task {root}x/my {root}/mytask".encode(), root) & {"my", "my task"})
+        ok("…and one with a socket inside (a server's door) or a dot name stays", door not in later and dot not in later)
         ok("a symlink named like a family stays, and so does what it points at",
            f"{root}/cc-brief.l1nk3d99" not in dry and target not in dry)
         ok("a dir some process has as its cwd stays", cwd_held not in dry)
@@ -131,6 +226,8 @@ def selfcheck():
         ok("…and one with the .kept marker stays for 72 h", run_kept not in dry)
         ok("…and goes after them", run_kept in reap(False, when=now + 3 * 86400)[0])
         ok("a session's scratch whose id no process names goes", os.path.dirname(s_dead) in dry)
+        ok("…but not one with a fifo inside that a process has open", os.path.dirname(s_fifo) not in dry)
+        ok("…while one whose fifo nobody has open goes", os.path.dirname(s_dead_fifo) in dry)
         ok("…and one whose id is in a live process's argv stays", os.path.dirname(s_argv) not in dry)
         ok("…and one whose id is in a live process's environment stays", os.path.dirname(s_env) not in dry)
         ok("…and one a live process has its cwd in stays", s_cwd not in dry)
@@ -186,7 +283,7 @@ def selfcheck():
                 todo = real_plan(*a, **k)
                 os.utime(f"{written}/f")
                 kids.append(spawn([sleep, "60"], cwd=held))
-                kids.append(spawn(["bash", "-c", "exec -a claude sleep 60"], cwd=proj))
+                kids.append(spawn(["claude", "60"], executable=sleep, cwd=proj))
                 time.sleep(0.5)
                 return todo
             try:
@@ -205,6 +302,10 @@ def selfcheck():
                os.path.lexists(f"{sdir}/scratchpad/f") and f"left {sdir}:" in text)
         race("newpid", 3600)
         race("reread", 0)
+        gone, _ = reap(True, when=now + 3 * 86400)
+        ok("--apply after 72 h takes the unnamed dirs and leaves each odd-named one a live process names",
+           set(unnamed) <= gone and all(os.path.isdir(p) for p in odd.values()) and not gone & set(odd.values())
+           and all(os.path.isdir(p) for p in private))
         # WHERE: the scratch on disk and TMPDIR are reaped beside /tmp, each once; a root that is missing is skipped.
         real_scratch, real_tempdir = SCRATCH, tempfile.tempdir
         try:
@@ -222,6 +323,10 @@ def selfcheck():
         ok("…and a scratch root that does not exist yet is left out, not an error",
            missing == ["/tmp", os.path.realpath(root)])
     finally:
+        for sk in socks:
+            sk.close()
+        for fd in fifo_fds:
+            os.close(fd)
         for k in kids:   # the whole group: a `bash -c` fixture's sleep would outlive its shell
             try:
                 os.killpg(k.pid, 9)

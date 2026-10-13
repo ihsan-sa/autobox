@@ -162,6 +162,34 @@ J
   k "$(nt grep -q 'cc-audit.timer=not-armed' <<<"$out")" "a timer with no NEXT whose service is running is armed, not a fault"
   out=$( sc(){ fake inactive "$@"; }; CC_UNITS_LINKDIR="$UD" check 2>&1 )
   k "$(t grep -q 'cc-audit.timer=not-armed' <<<"$out")" "…and with its service idle it is not-armed, as before"
+  # the overlay's own rows (10-01: a linked, never-enabled library editor stayed down 3.5 h after a restart). Its own
+  # fixture tree: one unit each that is reported, and one each that is kept quiet.
+  T=$(mktemp -d); mkdir -p "$T/config/systemd-user"; d="$T/config/systemd-user"
+  printf '[Service]\nType=oneshot\n[Install]\nWantedBy=default.target\n' > "$d/ov-boot.service"   # linked, never enabled
+  printf '[Service]\nType=oneshot\n' > "$d/ov-bytimer.service"                                    # linked, no [Install]: its timer's
+  printf '[Service]\nType=simple\n[Install]\nWantedBy=default.target\n' > "$d/ov-down.service"     # enabled, not running
+  printf '[Service]\nType=simple\n[Install]\nWantedBy=default.target\n' > "$d/ov-up.service"       # enabled and running
+  printf '[Service]\nType=oneshot\n[Install]\nWantedBy=default.target\n' > "$d/ov-ran.service"     # enabled oneshot, done
+  printf '[Service]\nType=simple\n[Install]\nWantedBy=default.target\n' > "$d/ov-wk@.service"      # a template; its instances are units
+  ln -s /dev/null "$d/ov-masked.service"                                                          # masked: no [Install] to read
+  printf '[Service]\nType=oneshot\n' > "$d/ov-gone.service"                                       # no [Install], and systemd cannot load it
+  printf '{"units":[{"unit":"ov-boot.service"},{"unit":"ov-bytimer.service"},{"unit":"ov-down.service"},{"unit":"ov-up.service"},{"unit":"ov-ran.service"},{"unit":"ov-tpl@.service"},{"unit":"ov-wk@reports.service"},{"unit":"ov-wk@live.service"},{"unit":"ov-masked.service"},{"unit":"ov-gone.service"}]}\n' > "$T/config/units.json"
+  ovfake(){ case "$1:$2" in
+      is-enabled:ov-boot.service|is-enabled:ov-bytimer.service) echo linked;; is-enabled:ov-wk@reports.service) echo disabled;;
+      is-enabled:ov-masked.service) echo masked;; is-enabled:ov-gone.service) echo not-found;;
+      is-enabled:*) echo enabled;;
+      is-active:ov-down.service|is-active:ov-ran.service|is-active:ov-wk@reports.service) echo inactive;; is-active:*) echo active;;
+      is-failed:*) echo inactive;; *) ;; esac; }
+  out=$( sc(){ ovfake "$@"; }; OV="$T"; CC_UNITS_LINKDIR="$d" check 2>&1 )
+  k "$(t grep -q 'ov-boot.service=not-enabled(linked)' <<<"$out")" "an overlay unit linked but never enabled is reported"
+  k "$(nt grep -q 'ov-bytimer' <<<"$out")" "…but one with no [Install] is its timer's to start, not a fault"
+  k "$(t grep -q 'ov-down.service=inactive' <<<"$out")" "an enabled overlay service that is not running is reported down"
+  k "$(nt grep -qE 'ov-up|ov-ran|ov-tpl|ov-wk@live' <<<"$out")" "…while a running one, a oneshot that has run and a template are not"
+  # an instance of a template is a unit of its own (the 922 review: `*@*` hid a disabled worker@reports.service)
+  k "$(t grep -q 'ov-wk@reports.service=not-enabled(disabled)' <<<"$out")" "…but a declared instance of a template that is not enabled is"
+  k "$(t grep -q 'ov-masked.service=not-enabled(masked)' <<<"$out")" "…and so is a masked one, though its /dev/null has no [Install]"
+  k "$(t grep -q 'ov-gone.service=not-enabled(not-found)' <<<"$out")" "…and one with no [Install] that systemd cannot load"
+  rm -rf "$T"
   # a unit the installer enables must have somewhere to be enabled FROM
   out=""; while IFS=$'\t' read -r u en st he re; do
     [ "$en" = required ] || continue

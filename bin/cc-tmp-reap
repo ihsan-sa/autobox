@@ -12,10 +12,20 @@ moves, because a tool started with the old environment still writes there.
 
 WHAT IT MAY REMOVE — every rule, all of them at once:
   · an entry directly under the temp root (or one session dir, below), owned by this user, not a symlink;
-  · whose name is one of FAMILIES: a known prefix plus mktemp's random tail. A name nothing here made is never
-    touched, however old — `tmp.XXXX`, a bare mkdtemp and a person's `/tmp/notes` included;
+  · whose name is one of FAMILIES: a known prefix plus mktemp's random tail. Any other name — `tmp.XXXX`, a bare
+    mkdtemp, a session's own `/tmp/<task>`, a person's `/tmp/notes` — is left STALE_HOURS (72) since its last write,
+    then goes too: those are what filled the /tmp quota on 2026-09-27 and killed an Xvfb. Never a dot name (a lock,
+    .X11-unix) unless a family names it (headless Chrome's). That rule is for /tmp and ~/.cc/tmp only
+    (stale_roots()): a TMPDIR naming some other dir gets the families and nothing else;
+  · never `systemd-private-*` or `snap-private-tmp*` (NEVER), whatever else holds: a running service's PrivateTmp=yes
+    /tmp lives there, owned by this user for a user unit, and nothing in /proc shows its path;
+  · with no live socket at or under it (tmux's door, an agent's, a headless Chrome's), whatever its name or age: one
+    bound now, as /proc/<pid>/net/unix lists it in any network namespace of this user's processes. A socket file
+    whose server is gone pins nothing, and nor does a fifo: one a process has open is held (below), one nobody has
+    open goes by age like any file;
   · whose newest mtime/ctime anywhere inside is older than --hours (24);
-  · that no process of this user holds: no cwd, open file or mapped file under it;
+  · that no process of this user holds: no cwd, open file or mapped file under it, and no argv or environment
+    naming it (a session that writes `/tmp/x/out` between commands holds nothing open there);
   · `cc-land.run.<pid>.*` (the lander's run root, which kept the old tool's name): and the pid is not a live lander,
     that is a process whose first three argv words name cc-land, bin/lander, lander-self or core/lander/cli.py (the
     shim execs the lander, so a running landing's argv is `python3 -P …/core/lander/cli.py <cmd> …`). One carrying
@@ -40,6 +50,7 @@ import os
 import json
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -62,6 +73,9 @@ FAMILIES = [
                          r"cc-failures-(sc|replay)\.|cc-fence-|cc-improve(-[a-z]+)?-|cc-member-import-|"
                          r"cc-replay(-[a-z]+)?-|cc-stall-sc[.-]|cc-settings-sc\.|cc-evals-h\.|cc-audit(-sc)?\.|"
                          r"ccskills-|ccsbx[a-z]+-|cc-mint-)" + TAIL),
+    ("library selfcheck", r"library-pages-sc-(next-?|src-?)?" + TAIL),
+    ("render bundles", r"remotion-webpack-bundle-" + TAIL),
+    ("headless Chrome", r"\.com\.google\.Chrome\." + TAIL),
 ]
 LAND_RUN = re.compile(r"cc-land\.run\.(\d+)\..+")
 # A live lander's argv word: the old tool, the shim's target, lander-self, or the package's entry run by python3 -P.
@@ -69,7 +83,10 @@ LANDER_WORD = re.compile(rb"(?:cc-land|(?:^|/)lander(?:-self)?$|(?:^|/)lander/cl
 KEPT, KEPT_HOURS = ".kept", 72
 SESSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 HOURS, SESSION_HOURS = 24.0, 24   # the default line, and the floor under a session's scratch (a resumed one reads it)
-SESS_FAM, LAND_FAM = "dead sessions' scratch", "dead lander runs"
+SESS_FAM, LAND_FAM, STALE_FAM = "dead sessions' scratch", "dead lander runs", "stale scratch, no family"
+STALE_HOURS = 72  # an entry no family names: left alone this long after its last write, and while anything names it
+# A service's private /tmp (PrivateTmp=yes) and snap's: no process names the path, so no other rule would keep them.
+NEVER = re.compile(r"systemd-private-.*|snap-private-tmp.*")
 RECHECK_S = 5   # a full /proc read costs seconds on a busy box, so between two, only new pids are read
 
 
@@ -108,11 +125,12 @@ def procs(uid, only=None):
                 held.add(os.readlink(f"{p}/{link}"))
             except OSError:
                 pass
-        try:
-            for ln in open(f"{p}/maps"):
-                i = ln.find("/")
+        try:   # bytes: a path that is not UTF-8 must not raise out of the whole run. maps writes a newline as \012
+            for ln in open(f"{p}/maps", "rb"):
+                i = ln.find(b"/")
                 if i > 0:
-                    held.add(ln[i:].rstrip("\n").removesuffix(" (deleted)"))
+                    m = ln[i:].rstrip(b"\n").removesuffix(b" (deleted)")
+                    held.update({os.fsdecode(m), os.fsdecode(m.replace(b"\\012", b"\n"))})
         except OSError:
             pass
         out.append((int(d), argv, env, held))
@@ -142,6 +160,53 @@ def newest(path):
                 except OSError:
                     pass
     return t
+
+
+def bound_sockets(ps):
+    """The AF_UNIX socket paths bound now: (full paths, last components). Read from /proc/<pid>/net/unix once per
+    network namespace among `ps` and this process's own (a sandboxed session binds in its own namespace). A socket
+    bound by a relative name is listed by that name alone, so its last component is all there is to match."""
+    full, seen = set(), set()
+    for pid in ["self"] + [str(p) for p, *_ in ps]:
+        try:
+            ns = os.readlink(f"/proc/{pid}/ns/net")
+            if ns in seen:
+                continue
+            seen.add(ns)
+            lines = open(f"/proc/{pid}/net/unix", "rb").read().split(b"\n")[1:]
+        except OSError:
+            continue
+        for ln in lines:
+            f = ln.split(None, 7)
+            if len(f) == 8 and not f[7].startswith(b"@"):   # @: an abstract socket, no file
+                full.add(os.fsdecode(f[7]))
+    return full, {os.path.basename(x) for x in full}
+
+
+def has_socket(path, bound):
+    """A live socket at or under `path`: a server's door (tmux's, an agent's), whose mtime says nothing. `bound` is
+    bound_sockets(); a socket file it does not list is a dead server's and pins nothing."""
+    full, last = bound
+
+    def live(q, m):
+        return stat.S_ISSOCK(m) and (q in full or os.path.basename(q) in last)
+    try:
+        m = os.lstat(path).st_mode
+    except OSError:
+        return True
+    if live(path, m):
+        return True
+    if stat.S_ISDIR(m):
+        for r, ds, fs in os.walk(path, onerror=lambda e: None):
+            for n in ds + fs:
+                q = os.path.join(r, n)
+                try:
+                    m = os.lstat(q).st_mode
+                except OSError:
+                    continue
+                if live(q, m):
+                    return True
+    return False
 
 
 def size(path):
@@ -189,26 +254,54 @@ def live_sessions(ps, sessions_dir):
     return named, blind
 
 
+NAME_BYTE = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+
+
+def named_entries(blob, root):
+    """Every name directly under `root` that NUL-separated argv/environ `blob` may be naming. An entry's name can hold
+    any byte but / and NUL, so a mention runs from `root/` to the next / or NUL, and every prefix of it that ends
+    before a byte no mktemp tail has (a space, a quote, `:`, a newline) is a name it may mean as well: `/tmp/my task/x`
+    keeps both `my task` and `my`, and `/tmp/a:/tmp/b` keeps `a`. Each entry is read once more with \\ ' and " taken
+    out, for a shell-quoted `/tmp/my\\ task` or `/tmp/'my task'`. Keeping one name too many costs a tick; one too few
+    deletes a live session's files."""
+    pre, out = root.encode() + b"/", set()
+    for ent in blob.split(b"\0"):
+        for e in {ent, ent.replace(b"\\", b"").replace(b"'", b"").replace(b'"', b"")}:
+            i = e.find(pre)
+            while i >= 0:
+                s = i + len(pre)
+                j = e.find(b"/", s)
+                r = e[s:min(len(e) if j < 0 else j, s + 255)]   # 255: NAME_MAX
+                out.update(r[:k] for k in range(1, len(r)) if r[k] not in NAME_BYTE)
+                if r:
+                    out.add(r)
+                i = e.find(pre, s)
+    return {os.fsdecode(n) for n in out}
+
+
 def live(ps, root, sessions_dir):
     """What the processes `ps` keep alive under `root`: (held names — top entries and claude-<uid>/<slug>/<sid> —,
-    session ids named, blind cwd slugs, live lander pids)."""
+    session ids named, blind cwd slugs, live lander pids, bound_sockets())."""
     held = set()
-    for _, _, _, paths in ps:
+    for _, argv, env, paths in ps:
         for h in paths:
             if h.startswith(root + "/"):
                 parts = h[len(root) + 1:].split("/")
                 held.add(parts[0])
                 held.add("/".join(parts[:3]))
+        # a live process that names an entry (a session's `--add-dir /tmp/x`, TMPDIR=…) keeps it, held open or not
+        held.update(named_entries(argv + b"\0" + env, root))
     named, blind = live_sessions(ps, sessions_dir)
     landers = {pid for pid, argv, _, _ in ps if any(LANDER_WORD.search(a) for a in argv.split(b"\0")[:3])}
-    return held, named, blind, landers
+    return held, named, blind, landers, bound_sockets(ps)
 
 
-def plan(root, uid, now, hours, ps, sessions_dir):
+def plan(root, uid, now, hours, ps, sessions_dir, any_name=True):
     """[(path, family, newest mtime)] under `root` that every rule in the docstring lets go. Reads, never writes."""
     cutoff, kept_cutoff = now - hours * 3600, now - KEPT_HOURS * 3600
     sess_cutoff = min(cutoff, now - SESSION_HOURS * 3600)
-    held, named, blind, live_landers = live(ps, root, sessions_dir)
+    stale_cutoff = min(cutoff, now - STALE_HOURS * 3600)
+    held, named, blind, live_landers, bound = live(ps, root, sessions_dir)
 
     def ours(p):
         try:
@@ -220,7 +313,7 @@ def plan(root, uid, now, hours, ps, sessions_dir):
     out = []
     for name in sorted(_ls(root)):
         p = f"{root}/{name}"
-        if not ours(p):
+        if NEVER.fullmatch(name) or not ours(p):
             continue
         if name == f"claude-{uid}" and os.path.isdir(p):   # every live session holds this dir; judged per session
             for slug in sorted(_ls(p)):
@@ -231,12 +324,16 @@ def plan(root, uid, now, hours, ps, sessions_dir):
                     q = f"{sp}/{sid}"
                     rel = f"{name}/{slug}/{sid}"
                     if (SESSION.fullmatch(sid) and sid not in named and rel not in held and ours(q)
-                            and os.path.isdir(q)):
+                            and os.path.isdir(q) and not has_socket(q, bound)):
                         t = newest(q)
                         if t < sess_cutoff:
                             out.append((q, SESS_FAM, t))
             continue
-        if name in held:
+        # A bound socket inside is a live server's door whatever the name says: its fd reads socket:[inode] in
+        # /proc, so `held` never sees it, and its mtime stops when the server goes quiet. Every family, before any
+        # match is taken (the 922 review: a listening /tmp/.com.google.Chrome.* once went on its name alone).
+        # A fifo a process has open is in `held`; a dead server's socket file or an unopened fifo keeps nothing.
+        if name in held or has_socket(p, bound):
             continue
         m = LAND_RUN.fullmatch(name)
         if m:
@@ -251,13 +348,17 @@ def plan(root, uid, now, hours, ps, sessions_dir):
             t = newest(p)
             if t < cutoff:
                 out.append((p, fam, t))
+        elif any_name and not name.startswith("."):   # a dot name is a lock or a door (.X0-lock, .X11-unix)
+            t = newest(p)
+            if t < stale_cutoff:
+                out.append((p, STALE_FAM, t))
     return out
 
 
 def still_dead(root, p, fam, t, state):
     """The plan's verdict on `p`, taken again right before its remove: nothing in `state` (live()) keeps it, and its
     newest mtime is still `t`."""
-    held, named, blind, landers = state
+    held, named, blind, landers, _ = state
     rel = p[len(root) + 1:]
     parts = rel.split("/")
     if fam == SESS_FAM:   # every live session holds claude-<uid> itself, so the session dir is what counts
@@ -285,14 +386,15 @@ def mb(n):
     return f"{n / 1e6:.1f} MB"
 
 
-def run(root, apply_, hours, now=None, uid=None, out=sys.stdout, sessions=None):
+def run(root, apply_, hours, now=None, uid=None, out=sys.stdout, sessions=None, any_name=None):
     root = os.path.realpath(root)   # the kernel names held paths canonically
+    any_name = root in stale_roots() if any_name is None else any_name
     uid = os.getuid() if uid is None else uid
     now = time.time() if now is None else now
     sessions = os.path.expanduser("~/.claude/sessions") if sessions is None else sessions
     seen = pids()   # read before the processes, so one started during the read counts as new below
     ps, taken = procs(os.getuid()), time.monotonic()
-    todo = plan(root, uid, now, hours, ps, sessions)
+    todo = plan(root, uid, now, hours, ps, sessions, any_name)
     state = None
     fams, total, gone = {}, 0, 0
     for p, fam, t in todo:
@@ -320,8 +422,9 @@ def run(root, apply_, hours, now=None, uid=None, out=sys.stdout, sessions=None):
     for fam, (c, n) in sorted(fams.items(), key=lambda x: -x[1][1]):
         print(f"  {fam}: {c}, {mb(n)}", file=out)
     verb = "removed" if apply_ else "would remove"
+    stale = f", {max(hours, STALE_HOURS):g} h for a name no family has" if any_name else ", named families only"
     print(f"cc-tmp-reap: {verb} {sum(c for c, _ in fams.values())} entries, {mb(total)} "
-          f"(older than {hours:g} h, no process holding them) in {root}", file=out)
+          f"(older than {hours:g} h{stale}; no process holding or naming them) in {root}", file=out)
     return todo
 
 
@@ -333,6 +436,11 @@ def roots():
     """The temp roots to reap, each once by its real path, leaving out one that does not exist."""
     return [r for r in dict.fromkeys(os.path.realpath(p) for p in ("/tmp", SCRATCH, tempfile.gettempdir()))
             if os.path.isdir(r)]
+
+
+def stale_roots():
+    """The roots where a name no family has may go after STALE_HOURS: /tmp and the scratch on disk, never TMPDIR's."""
+    return {os.path.realpath("/tmp"), os.path.realpath(SCRATCH)}
 
 
 def selfcheck(*a, **k):

@@ -11225,6 +11225,37 @@ def run_selfcheck():
         os.environ.pop("CC_MAIL_VET_FAKE", None)
         shutil.rmtree(mdir, ignore_errors=True)
 
+    # a boot before DNS (10-02 05:25Z): conversations.info failed, chan_name cached the raw id as the name, and the control channel
+    # was routed as a new project named after its id. A failed lookup is not cached, the message is held and routed again.
+    real_api_L = api
+    try:
+        dmL = Daemon(use_slack=False); dmL.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "x"}; dmL.bot_user = "UBOT"
+        held, redone = [], []
+        dmL.later = lambda secs, fn: held.append((secs, fn))
+        dmL.dispatch = lambda ev, pool: redone.append(ev)
+        def api_down(method, token, **kw):
+            raise OSError("gaierror: Temporary failure in name resolution")
+        globals()["api"] = api_down
+        check("lookup: a failed name lookup returns the id but is not cached",
+              dmL.chan_name("C0LOOKUP1") == "C0LOOKUP1" and "C0LOOKUP1" not in dmL.names and "C0LOOKUP1" in dmL.unnamed)
+        check("lookup: an unnamed channel routes nowhere, never as its lowercased id", dmL.route("C0LOOKUP1", "channel") is None)
+        evL = {"type": "message", "channel": "C0LOOKUP1", "ts": "5.1", "user": "UOWNER", "text": "hello", "channel_type": "channel"}
+        dmL.on_event(evL)
+        check("lookup: its message is held for a retry, and no project dir is made from the id",
+              len(held) == 1 and held[0][0] == LOOKUP_WAIT and not os.path.exists(f"{DEV}/c0lookup1"))
+        held[0][1]()
+        check("lookup: the retry forgets the event as seen and routes it again",
+              redone == [evL] and ("C0LOOKUP1", "5.1") not in dmL.seen)
+        globals()["api"] = lambda method, token, **kw: {"channel": {"name": "myrepo"}}
+        check("lookup: the next call retries and caches the real name",
+              dmL.chan_name("C0LOOKUP1") == "myrepo" and dmL.names.get("C0LOOKUP1") == "myrepo" and "C0LOOKUP1" not in dmL.unnamed)
+        held.clear(); dmL.unnamed.add("C0SPENT")
+        spent = dmL.hold_for_lookup({"channel": "C0SPENT", "ts": "6.1", "_lookup_tries": LOOKUP_TRIES})
+        kept = dmL.hold_for_lookup({"channel": "C0SPENT", "ts": "6.2", "_lookup_tries": LOOKUP_TRIES - 1})
+        check("lookup: held at most LOOKUP_TRIES times, then routed as unmapped", spent is False and kept is True and len(held) == 1)
+    finally:
+        globals()["api"] = real_api_L
+
     # -- more than one Slack workspace (brief slack-second-workspace): the default workspace keeps today's keys; an
     # extra one has its own token pair, its own listener, and is heard only in its member workspace's channels.
     callsW, deadDefaultW = [], {"on": False}

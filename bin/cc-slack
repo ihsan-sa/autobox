@@ -3029,6 +3029,7 @@ class Conn:
 # ---------------------------------------------------------------- home.json (one live view for the dashboard, never a message)
 HOME_UNITS = (("tmux-main", "tmux-main.service"), ("cc-slackd", "cc-slackd.service"),
               ("heartbeat", "cc-heartbeat.service"), ("audit", "cc-audit.timer"))
+LOOKUP_WAIT, LOOKUP_TRIES = 30, 20             # a message whose channel name can't be looked up yet: retried 30 s apart for 10 min
 HOME_CACHE = 5                                 # seconds a costly input (tmux/systemctl/pgrep/cc-limit) is cached for
 HOME_LEDGER = 1 << 18                          # bytes of cc-context's handoff ledger the dashboard reads (its tail)
 HOME_SLOW = 600                                # the only two inputs that cost a network call (channel list, PR states)
@@ -4469,6 +4470,7 @@ class Daemon:
         self.unminted = set()                                # targets whose last `starting` stamp was an unminted attempt
         self.pending = {}                                   # "tmux" -> expiry (unix time) of an armed !restart tmux confirm
         self.names, self.users = {}, {}
+        self.unnamed = set()                            # chats whose last name lookup failed (chan_name): not routed by id
         self.threads_chats = {}                             # repo -> its #<repo>-threads chat id (or None), looked up once
         self.perm_asks = {}                                 # request_id -> {target, chat, thread, at, card}: who asked, so an answer given elsewhere still lands
         self.perm_posts = {}                                # target -> [ts, …] of its recent 🔐 posts (perm_room's window)
@@ -5628,9 +5630,30 @@ class Daemon:
             try:
                 info = api("conversations.info", self.cfg["SLACK_BOT_TOKEN"], channel=chat)["channel"]
                 self.names[chat] = "dm" if info.get("is_im") else info.get("name", chat)
-            except Exception:
-                self.names[chat] = chat
+                self.unnamed.discard(chat)
+            except Exception as e:                      # not cached: no DNS yet after a boot must not fix the raw id as the name
+                log(f"channel {chat}: name lookup failed ({e!r}); retried on the next call")
+                self.unnamed.add(chat)
+                return chat
         return self.names[chat]
+
+    def hold_for_lookup(self, ev):
+        """A message from a channel whose name lookup failed waits and is routed again, LOOKUP_WAIT s apart and at most
+        LOOKUP_TRIES times, instead of being routed by its raw id: on 10-02 that made the control channel a new project named after its id.
+        False once the tries are spent: the caller goes on unrouted (the "no project maps" notice)."""
+        n = ev.get("_lookup_tries", 0) + 1
+        if n > LOOKUP_TRIES:
+            log(f"channel {ev.get('channel')}: name still unknown after {LOOKUP_TRIES} tries — routed as unmapped")
+            return False
+        ev["_lookup_tries"] = n
+        def again():
+            self.seen.pop((ev.get("channel"), ev.get("ts")), None)
+            self.dispatch(ev, None)                     # a message: its chat's own executor, so order holds
+        self.later(LOOKUP_WAIT, again)
+        return True
+
+    def later(self, secs, fn):
+        t = threading.Timer(secs, self._safe, (fn,)); t.daemon = True; t.start()
 
     def permalink(self, chat, ts):
         """Slack link to one message, for the channel purpose ("… from <link>"). Best effort: no link is not an error."""
@@ -5767,6 +5790,8 @@ class Daemon:
             return "box"
         routes = load_routes()
         name = self.chan_name(chat)
+        if chat in self.unnamed and not routes.get(chat):   # lookup failed: the raw id is no name (on_event retries)
+            return None
         if ask_lane(name):
             return None
         t = routes.get(chat) or routes.get("#" + name)
@@ -5981,6 +6006,8 @@ class Daemon:
         tracked = thread_target(chat, ev.get("thread_ts"))   # a reply under a track's root: that track's, not the channel session's (no @alias handover there)
         if tracked:
             target = tracked
+        if not target and not is_bot and ctype != "im" and chat in self.unnamed and self.hold_for_lookup(ev):
+            return
         route_alias = self.update_owner(target, chat, thread, ev.get("thread_ts"), text) if target and ctype != "im" and may_own and not tracked else None
         if is_bot:      # our own post is never delivered back (its seat's `wake` hands it on); another app's is (bot_post)
             return self.bot_post(ev, chat, ctype, ts, thread, text, target) if self.is_foreign_bot(ev) else None
