@@ -797,7 +797,8 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
             out[name] = Outcome(name, DEFERRED, f"runs at landing: {why}")
             continue
         own = [p for p in c.paths if "*" not in p] + [m.cwd.get(name, "") + M.run_file(c.run)]
-        security = any(M.match(m.policy.gate_first, p) for p in own if p)
+        # perms' terms (#1234): manifest-widen's "red blocks as a fault, never advisory", so it is never quarantined
+        security = name == M.BUILTIN or any(M.match(m.policy.gate_first, p) for p in own if p)
         touched = any(m.owns(name, f) for f in files) if name in m.checks else False
         where = "box" if caged else choose_where(c, member, box_only=box_only, runners=runners)
         if gone and where == "laptop" and "box" in c.where:

@@ -453,6 +453,22 @@ def paths_in(root, rev, paths) -> set:
         return {p for p in paths if (o.entry(tree, p) or (b"40000",))[0] != b"40000"}
 
 
+def files_in(root, rev) -> dict:
+    """{path: object id} of every path rev's tree (a commit or tree) holds as anything but a directory, read verified
+    (what `ls-tree -r` lists, submodules included)."""
+    with Objects(root) as o:
+        out, todo = {}, [("", o.tree(rev))]
+        while todo:
+            pre, tree = todo.pop()
+            for name, (mode, oid) in o.entries(tree).items():
+                p = pre + name.decode("utf-8", "replace")
+                if mode == b"40000":
+                    todo.append((p + "/", oid))
+                else:
+                    out[p] = oid
+        return out
+
+
 def has_workflows(root, rev) -> bool:
     """rev's tree has a GitHub Actions workflow (a .yml or .yaml file in .github/workflows); read VERIFIED."""
     with Objects(root) as o:

@@ -15,12 +15,24 @@ relative path (S2: a change to a check's script or fixtures selects the check).
 
 ADD-ONLY (S3). A head may widen the manifest, never narrow it. widen_faults(base, head) names every narrowing: a
 check removed or its `run` changed, a path, fixture or `where` taken away, a class moved down CLASS_RANK (toward
-fewer or later runs), a policy entry removed. It also names a check the head adds or changes that grants itself
-a class outside the sandbox, net = true, bare = true or a mount its base definition lacks (self_widening); a check
-the head adds with no class line is hermetic, not T.Check's host default (head_check), and may not say bare. The
-built-in check `manifest-widen` (BUILTIN) is selected by any change to a manifest, policy or reach file and runs
-widen_faults in-process on the two git trees; `lander manifest-widen` runs it by hand. The policy file is also
-lander-class: plan() sends a change to it to lander-self.
+fewer or later runs), a policy entry removed. The one exception is dead weight the same head deletes (Trees, gone):
+an entry is gone when it names a file in the base tree and none in the head's (a glob by match, a plain path as
+itself or a directory above files), and no base file it names has its blob at any path in the head (a move or a
+rename keeps it). Given the two trees, a head may then remove a check whose run line names a file (run_files) and
+whose run files, paths and fixtures are all gone, and drop a path or fixture that is gone. A run line names a file by
+a relative path or by a dotted module after `-m` (tests.test_x is tests/test_x.py); a file git's -M sees renamed,
+edited or not, is not gone. A changed run line is
+always a fault, so a check whose run names a deleted file goes whole or not at all. A `where`, a class, a cwd and
+the policy never narrow. plan() hands widen() the same trees, so a check removed as dead is not run on the files it
+named. widen_faults also names a check the head adds or changes that grants itself a class outside the sandbox,
+net = true, bare = true or a mount its base definition lacks (self_widening); a check the head adds with no class
+line is hermetic, not T.Check's host default (head_check), and may not say bare. The built-in check
+`manifest-widen` (BUILTIN) is selected by any change to a manifest, policy or reach file and runs widen_faults
+in-process on the two git trees; `lander manifest-widen` runs it by hand, and its red is never quarantined (run.py).
+The policy file is also lander-class: plan() sends a change to it to lander-self. A manifest edit is CLEAN when
+clean_faults is empty: widen_faults, no check both trees have changes anything but the paths and fixtures it adds
+(its run, class, where, bare, net, mounts or cap), and no added check's cap is above the base's largest. plan.clean_manifest then lets the change land in the normal
+lane, judged on the merge tree; anything else in a manifest is lander-class.
 
 A broken BASE manifest raises ManifestError: nothing can be planned on it. A broken HEAD manifest is not fatal to the
 plan (the base rules), but its faults are carried out and make manifest-widen red.
@@ -32,6 +44,8 @@ reviewed text; its `where` is taken only for a check whose run, class and workin
 from __future__ import annotations
 
 import dataclasses
+import functools
+import hashlib
 import os
 import re
 import sys
@@ -152,11 +166,38 @@ def run_file(run: str) -> str:
     return w if "/" in w and not w.startswith(("/", "-", "$", "~")) else ""
 
 
+MODULE_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+
+
 def run_files(run: str) -> list:
     """Every word of a run line that names a file or directory relative to the tree (`bin/x selfcheck`, `-s
-    tests/lander`), without a trailing slash: what the check runs, beside the paths it owns."""
-    return [w.rstrip("/") for w in run.replace("'", " ").replace('"', " ").split()
-            if "/" in w and not w.startswith(("/", "-", "$", "~"))]
+    tests/lander`), without a trailing slash: what the check runs, beside the paths it owns. A dotted module after
+    `-m` (`python3 -m unittest tests.test_x`, up to the next `&&`, `;` or `|`) names its file, tests/test_x.py."""
+    words = run.replace("'", " ").replace('"', " ").split()
+    out = [w.rstrip("/") for w in words if "/" in w and not w.startswith(("/", "-", "$", "~"))]
+    for i, w in enumerate(words):
+        if w == "-m":
+            for x in words[i + 1:]:
+                if x in ("&&", "||", ";", "|"):
+                    break
+                if MODULE_RE.fullmatch(x.rstrip(";")):
+                    out.append(x.rstrip(";").replace(".", "/") + ".py")
+                if x.endswith(";"):
+                    break
+    return out
+
+
+def renamed(out: str) -> set:
+    """The source paths of the renames in `git diff-tree -r -M -z --name-status` output: a file moved, edited or
+    not, is no delete."""
+    t, src, i = out.split("\0"), set(), 0
+    while i < len(t):
+        if t[i].startswith(("R", "C")) and i + 2 < len(t):
+            src.add(t[i + 1])
+            i += 3
+        else:
+            i += 2 if t[i] else 1
+    return src
 
 
 def parse_checks(text: str, prefix: str = "", source: str = "", unclassed: set | None = None) -> tuple:
@@ -215,14 +256,16 @@ def union_policy(a: T.Policy, b: T.Policy) -> T.Policy:
                     **{k: u(getattr(a, k), getattr(b, k)) for k in POLICY_LISTS})
 
 
-def load(repo_root: str, rev: str, fallback: str = "", strict: bool = True) -> Manifest:
+def load(repo_root: str, rev: str, fallback: str = "", strict: bool = True, read=None) -> Manifest:
     """The manifest, policy and reach graph at rev. fallback: a manifest file on the host for a repo that ships none
     (the overlay's landing-repos/<repo>.toml), read only when the tree has no manifest of its own. strict: a fault
-    raises ManifestError (the base); otherwise faults are kept on the Manifest (a head)."""
+    raises ManifestError (the base); otherwise faults are kept on the Manifest (a head). read(path) -> text or None
+    reads the tree in place of read_at (plan.clean_manifest's sealed merge tree)."""
     from lander import reach as R
+    get = read or (lambda path: read_at(repo_root, rev, path))
     m = Manifest()
     for pre in PREFIXES:
-        text = read_at(repo_root, rev, pre + MANIFEST)
+        text = get(pre + MANIFEST)
         if text is not None:
             m.sources.append(pre + MANIFEST)
             checks, faults = parse_checks(text, pre, pre + MANIFEST, m.unclassed)
@@ -232,12 +275,12 @@ def load(repo_root: str, rev: str, fallback: str = "", strict: bool = True) -> M
                     m.faults.append(f"{pre + MANIFEST}: check {c.name!r} is defined twice")
                     continue
                 m.checks[c.name], m.cwd[c.name] = c, pre
-        text = read_at(repo_root, rev, pre + POLICY)
+        text = get(pre + POLICY)
         if text is not None:
             m.sources.append(pre + POLICY)
             pol, faults = parse_policy(text, pre, pre + POLICY)
             m.policy, m.faults = union_policy(m.policy, pol), m.faults + faults
-        text = read_at(repo_root, rev, pre + REACH)
+        text = get(pre + REACH)
         if text is not None:
             m.sources.append(pre + REACH)
             m.reach += R.parse(text)
@@ -290,12 +333,84 @@ def self_widening(b, h: T.Check) -> list:
     return out
 
 
-def widen(base: Manifest, head: Manifest) -> Manifest:
+class Trees:
+    """{path: blob id} of the base and head trees (rev "" is the working copy), each listed the first time a narrowing
+    asks: a head that only widens never reads them. moved: the base paths `git diff -M` renames in the head."""
+    def __init__(self, repo_root: str, base: str, head: str):
+        self.root, self.revs = repo_root, (base, head)
+
+    def _files(self, rev: str) -> dict:
+        """{path: blob id}; the working copy's ids are what `git add` would store (a symlink's is its target's text)."""
+        from lander import git as G
+        if rev:
+            return G.files_in(self.root, rev)
+        r = G.git(self.root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", check=True)
+        ps = [p for p in dict.fromkeys(r.out.split("\0")) if p and os.path.lexists(os.path.join(self.root, p))]
+        out = {p: "?" + p for p in ps}   # not a file (a submodule's directory): no blob, so never a move target
+        for p in ps:
+            if os.path.islink(os.path.join(self.root, p)):
+                t = os.fsencode(os.readlink(os.path.join(self.root, p)))
+                out[p] = hashlib.sha1(b"blob %d\0" % len(t) + t).hexdigest()
+        plain = [p for p in ps if os.path.isfile(os.path.join(self.root, p)) and not os.path.islink(
+            os.path.join(self.root, p))]
+        batch = [p for p in plain if "\n" not in p]
+        ids = G.git(self.root, "hash-object", "--stdin-paths", input="".join(p + "\n" for p in batch),
+                    check=True).out.split() if batch else []
+        if len(ids) != len(batch):
+            raise G.GitError(f"hash-object gave {len(ids)} ids for {len(batch)} files")
+        out.update(zip(batch, ids))
+        for p in plain:
+            if "\n" in p:
+                out[p] = G.git(self.root, "hash-object", "--", p, check=True).out.strip()
+        return out
+
+    @functools.cached_property
+    def base(self) -> dict:
+        return self._files(self.revs[0])
+
+    @functools.cached_property
+    def head(self) -> dict:
+        return self._files(self.revs[1])
+
+    @functools.cached_property
+    def moved(self) -> set:
+        from lander import git as G
+        b, h = self.revs
+        args = ["diff-tree", "-r", b, h] if h else ["diff-index", b]
+        return renamed(G.git(self.root, *args, "-M", "-l0", "-z", "--name-status", "--no-ext-diff", check=True).out)
+
+
+def gone(entry: str, files) -> bool:
+    """The head deleted everything entry names: it names a file in the base tree and none in the head's, no base
+    file it names has its blob at any path in the head, and none is the source of a rename (files.moved, git's -M):
+    a move or a rename is not a delete, edited or not. An entry names a file its glob matches, or one under it as a
+    directory (a run line's `-s tests/lander`)."""
+    d = entry.rstrip("/") + "/"
+    names = lambda p: p.startswith(d) or match([entry], p)   # noqa: E731
+    was = {p: o for p, o in files.base.items() if names(p)}
+    return (bool(was) and not any(map(names, files.head)) and not set(was.values()) & set(files.head.values())
+            and not set(was) & set(getattr(files, "moved", ())))
+
+
+def dead_check(b: T.Check, cwd: str, files) -> bool:
+    """The head may remove base check b: its run line names a file (run_files; `-m unittest tests.x` names
+    tests/x.py), and every run file, path and fixture it names is gone in this head."""
+    run = [cwd + w for w in run_files(b.run)]
+    return bool(run) and all(gone(x, files) for x in run + b.paths + b.fixtures)
+
+
+def widen(base: Manifest, head: Manifest, files=None) -> Manifest:
     """What plan() selects from: the base's checks, each check's paths and fixtures widened by the head's, plus every
     check the head adds. A narrowing in the head is ignored here (and is manifest-widen's red), and so is a check the
-    head adds that grants itself more than the sandbox: it never runs before manifest-widen refuses it."""
+    head adds that grants itself more than the sandbox: it never runs before manifest-widen refuses it. With files
+    (Trees), a base check the head removes as dead goes: it may not run on files the head deleted."""
     out = Manifest(checks=dict(base.checks), cwd=dict(base.cwd), policy=base.policy, reach=list(base.reach),
                    sources=base.sources, faults=list(head.faults))
+    if files is not None:
+        for n, b in base.checks.items():
+            h = head.checks.get(n)
+            if h is None and dead_check(b, base.cwd.get(n, ""), files):
+                del out.checks[n], out.cwd[n]
     for n in head.checks:
         c = head_check(base, head, n)
         if n not in out.checks:
@@ -322,8 +437,9 @@ def placed(m: Manifest, tip: Manifest) -> Manifest:
     return out
 
 
-def widen_faults(base: Manifest, head: Manifest) -> list:
-    """Every way the head narrows the base (S3). Empty = the head only widens."""
+def widen_faults(base: Manifest, head: Manifest, files=None) -> list:
+    """Every way the head narrows the base (S3). Empty = the head only widens, or narrows only what it deletes
+    (files: Trees, the two trees' files; None allows no narrowing at all)."""
     bad = list(head.faults)
     # the owner's call on U2's review: a check the head adds or changes may not widen its own boundary
     for n in head.checks:
@@ -331,25 +447,48 @@ def widen_faults(base: Manifest, head: Manifest) -> list:
             bad.append(f"check {n!r}: {'adds' if n not in base.checks else 'changes'} itself to {w}, "
                        "which its base definition does not have")
     for n, b in base.checks.items():
-        h = head.checks.get(n)
+        h, cwd = head.checks.get(n), base.cwd.get(n, "")
+        # the brief: "a removed check whose run target survives" stays a fault; one naming only deleted files may go
         if h is None:
-            bad.append(f"check {n!r} was removed")
+            if files is None or not dead_check(b, cwd, files):
+                bad.append(f"check {n!r} was removed")
             continue
         if h.run != b.run:
             bad.append(f"check {n!r}: run changed from {b.run!r} to {h.run!r}")
         for what in ("paths", "fixtures", "where"):
-            gone = [x for x in getattr(b, what) if x not in getattr(h, what)]
-            if gone:
-                bad.append(f"check {n!r}: {what} lost {', '.join(gone)}")
+            # "narrowing a path that still exists" stays a fault; a `where` names runners, never files, so never goes
+            lost = [x for x in getattr(b, what) if x not in getattr(h, what)
+                    and (what == "where" or files is None or not gone(x, files))]
+            if lost:
+                bad.append(f"check {n!r}: {what} lost {', '.join(lost)}")
         # review S3: refuse "a removed check, a narrowed paths, box→hermetic, a removed where"
         if CLASS_RANK[h.klass] < CLASS_RANK[b.klass]:
             bad.append(f"check {n!r}: class moved from {b.klass} down to {h.klass}")
         if head.cwd.get(n, "") != base.cwd.get(n, ""):
             bad.append(f"check {n!r} moved to another manifest")
     for k in POLICY_LISTS + ("default",):
-        gone = [x for x in getattr(base.policy, k) if x not in getattr(head.policy, k)]
-        if gone:
-            bad.append(f"policy {k} lost {', '.join(gone)}")
+        lost = [x for x in getattr(base.policy, k) if x not in getattr(head.policy, k)]
+        if lost:
+            bad.append(f"policy {k} lost {', '.join(lost)}")
+    return bad
+
+
+def clean_faults(base: Manifest, head: Manifest, files) -> list:
+    """What keeps a manifest edit lander-class (plan.clean_manifest): widen_faults on the two trees, and any change to a
+    check both have beyond the paths and fixtures it adds (its run, class, where, bare, net, mounts, cap), and an
+    added check whose cap is above the base's largest (any, with no base check). Empty = the head adds checks the
+    sandbox holds, adds paths or fixtures, or drops only what it deletes."""
+    bad = widen_faults(base, head, files)
+    # perms 10-12: an added check whose cap is above the base manifest's largest cap is refused
+    ceiling = max((c.cap for c in base.checks.values()), default=0)
+    bad += [f"check {n!r}: adds itself with cap {c.cap}, above the base's largest, {ceiling}"
+            for n, c in head.checks.items() if n not in base.checks and c.cap > ceiling]
+    for n, b in base.checks.items():
+        h = head.checks.get(n)
+        moved = [f.name for f in dataclasses.fields(b)
+                 if f.name not in ("paths", "fixtures") and h is not None and getattr(h, f.name) != getattr(b, f.name)]
+        if moved:
+            bad.append(f"check {n!r}: changes its {', '.join(moved)}")
     return bad
 
 
@@ -360,7 +499,7 @@ def widen_check(repo_root: str, base: str, head: str) -> tuple:
         b = load(repo_root, base)
     except ManifestError as e:
         return True, f"manifest-widen: the base does not parse ({e}); nothing to compare against"
-    bad = widen_faults(b, load(repo_root, head, strict=False))
+    bad = widen_faults(b, load(repo_root, head, strict=False), Trees(repo_root, base, head))
     return (not bad), "\n".join([f"manifest-widen: FAIL {x}" for x in bad]
                                 + [f"manifest-widen: {'0 failed' if not bad else f'{len(bad)} failed'}"])
 
@@ -382,4 +521,5 @@ def cmd_widen(argv):
     return 0 if ok else 1
 
 
-COMMANDS = {"manifest-widen": (cmd_widen, "refuse a head that narrows LANDING.toml or its policy (S3)")}
+COMMANDS = {"manifest-widen": (cmd_widen,
+                                "refuse a head that narrows LANDING.toml or its policy beyond what it deletes (S3)")}

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from unittest import mock
 
@@ -357,6 +358,225 @@ class AddOnly(unittest.TestCase):
         self.assertIn("identity", text)
 
 
+class DeadWeight(unittest.TestCase):
+    """A head may narrow only what it deletes: an entry naming files the base has and the head does not."""
+    BASE = textwrap.dedent('''
+        [[check]]
+        name = "selfcheck-cc-model"
+        run = "bin/cc-model selfcheck"
+        paths = ["bin/cc-model", "config/claude-settings.json"]
+        class = "host"
+        where = ["box", "laptop"]
+
+        [[check]]
+        name = "e2e-limit-episode"
+        run = "tests/e2e/limit-episode.sh"
+        paths = ["bin/cc-limit", "bin/cc-model", "tests/e2e/limit-episode.sh"]
+        class = "host"
+        where = ["box", "laptop"]
+        fixtures = ["tests/e2e/lib.sh"]
+
+        [[check]]
+        name = "member"
+        run = "bin/cc-member selfcheck"
+        paths = ["bin/cc-member", "tests/member.py", "tests/quarantine"]
+        class = "host"
+        fixtures = ["tests/member-lib.sh"]
+
+        [[check]]
+        name = "py-compile-tests"
+        run = "python3 -m py_compile mail/*.py tests/slack.py tests/member.py"
+        paths = ["mail/**", "tests/slack.py", "tests/member.py"]
+        class = "static"
+
+        [[check]]
+        name = "noop"
+        run = "true"
+        class = "static"
+    ''')
+    BASE_FILES = {"core/bin/cc-model", "core/config/claude-settings.json", "core/bin/cc-limit",
+                  "core/tests/e2e/limit-episode.sh", "core/tests/e2e/lib.sh", "core/bin/cc-member",
+                  "core/tests/member.py", "core/tests/quarantine/a", "core/tests/quarantine/b/c",
+                  "core/tests/member-lib.sh", "core/mail/x.py", "core/tests/slack.py"}
+
+    @classmethod
+    def trees(cls, deleted=(), moved=None, edited=None):
+        """Trees-like {path: blob}: each base file its own blob; deleted ones gone, moved ones {old: new} renamed,
+        edited ones {old: new} renamed with new bytes, which only git's -M (moved) still ties to the old path."""
+        base = {p: "blob:" + p for p in cls.BASE_FILES}
+        head = {p: o for p, o in base.items() if p[5:] not in deleted}
+        for old, new in (moved or {}).items():
+            head["core/" + new] = head.pop("core/" + old)
+        for old, new in (edited or {}).items():
+            head["core/" + new] = head.pop("core/" + old) + ":edited"
+        return types.SimpleNamespace(base=base, head=head, moved={"core/" + p for p in (edited or {})})
+
+    def faults(self, head_text, deleted=(), base_text=None, moved=None, edited=None):
+        base, head = AddOnly.two(None, head_text, base_text or self.BASE)
+        return M.widen_faults(base, head, self.trees(deleted, moved, edited))
+
+    def drop(self, name, text=None):
+        """The base text with check `name` cut out."""
+        text = text or self.BASE
+        start = text.index(f'name = "{name}"') - len("[[check]]\n")
+        end = text.find("[[check]]", start + 1)
+        return text[:start] + (text[end:] if end > 0 else "")
+
+    def test_a_check_whose_files_are_all_deleted_may_go_and_one_with_a_survivor_may_not(self):
+        member = ("bin/cc-member", "tests/member.py", "tests/quarantine/a", "tests/quarantine/b/c",
+                  "tests/member-lib.sh")
+        self.assertEqual(self.faults(self.drop("member"), member), [])
+        # the run target survives: refused
+        self.assertEqual(self.faults(self.drop("member"), member[1:]), ["check 'member' was removed"])
+        # a directory entry with one file left under it survives too
+        self.assertEqual(self.faults(self.drop("member"), member[:3] + member[4:]), ["check 'member' was removed"])
+        # a fixture that survives keeps it
+        self.assertEqual(self.faults(self.drop("member"), member[:4]), ["check 'member' was removed"])
+        # no trees given: every removal is a fault, as before
+        base, head = AddOnly.two(None, self.drop("member"), self.BASE)
+        self.assertEqual(M.widen_faults(base, head), ["check 'member' was removed"])
+
+    def test_a_check_that_names_no_file_may_never_go(self):
+        self.assertEqual(self.faults(self.drop("noop"), tuple(f[5:] for f in self.BASE_FILES)),
+                         ["check 'noop' was removed"])
+
+    def test_the_two_narrowings_1233_got_wrong_stay_refused(self):
+        # both files survive the head, so neither path may be dropped from the check that covers it
+        text = self.BASE.replace('paths = ["bin/cc-model", "config/claude-settings.json"]', 'paths = ["bin/cc-model"]')
+        text = text.replace('paths = ["bin/cc-limit", "bin/cc-model", ', 'paths = ["bin/cc-limit", ')
+        self.assertEqual(self.faults(text, ("bin/cc-member", "tests/member.py")),
+                         ["check 'selfcheck-cc-model': paths lost core/config/claude-settings.json",
+                          "check 'e2e-limit-episode': paths lost core/bin/cc-model"])
+        # the same drops are allowed once the head deletes those files
+        self.assertEqual(self.faults(text, ("config/claude-settings.json", "bin/cc-model")), [])
+
+    def test_a_path_or_fixture_may_drop_only_when_its_file_is_deleted(self):
+        text = self.BASE.replace('"tests/member.py", "tests/quarantine"]', '"tests/quarantine"]')
+        text = text.replace('fixtures = ["tests/member-lib.sh"]', 'fixtures = []')
+        self.assertEqual(self.faults(text, ("tests/member.py", "tests/member-lib.sh")), [])
+        self.assertEqual(self.faults(text, ("tests/member.py",)),
+                         ["check 'member': fixtures lost core/tests/member-lib.sh"])
+        self.assertEqual(self.faults(text, ("tests/member-lib.sh",)),
+                         ["check 'member': paths lost core/tests/member.py"])
+
+    def test_a_glob_may_drop_only_when_it_matches_no_file_in_the_head(self):
+        text = self.BASE.replace('paths = ["mail/**", ', 'paths = [')
+        self.assertEqual(self.faults(text, ("mail/x.py",)), [])
+        self.assertEqual(self.faults(text), ["check 'py-compile-tests': paths lost core/mail/**"])
+        # a glob that matched nothing in the base is never gone, so it never drops
+        empty = self.BASE.replace('"mail/**", ', '"mail/**", "nowhere/*.py", ')
+        self.assertEqual(self.faults(self.BASE, tuple(f[5:] for f in self.BASE_FILES), empty),
+                         ["check 'py-compile-tests': paths lost core/nowhere/*.py"])
+
+    def test_a_changed_run_line_is_a_fault_even_when_its_dropped_word_is_deleted(self):
+        text = self.BASE.replace(" tests/member.py\"", "\"").replace('"tests/slack.py", "tests/member.py"]',
+                                                                     '"tests/slack.py"]')
+        self.assertEqual(self.faults(text, ("tests/member.py",)),
+                         ["check 'py-compile-tests': run changed from "
+                          "'python3 -m py_compile mail/*.py tests/slack.py tests/member.py' to "
+                          "'python3 -m py_compile mail/*.py tests/slack.py'"])
+
+    def test_a_move_or_a_rename_is_not_a_delete(self):
+        # git mv tests/member.py tests/m/member.py, and the path dropped: the blob survives at the new path
+        text = self.BASE.replace('"tests/member.py", "tests/quarantine"]', '"tests/quarantine"]')
+        self.assertEqual(self.faults(text, moved={"tests/member.py": "tests/m/member.py"}),
+                         ["check 'member': paths lost core/tests/member.py"])
+        # bin/cc-member renamed to bin/cc_member and the whole check dropped: refused
+        member = ("tests/member.py", "tests/quarantine/a", "tests/quarantine/b/c", "tests/member-lib.sh")
+        self.assertEqual(self.faults(self.drop("member"), member, moved={"bin/cc-member": "bin/cc_member"}),
+                         ["check 'member' was removed"])
+        # the same with bin/cc-member really deleted is allowed
+        self.assertEqual(self.faults(self.drop("member"), member + ("bin/cc-member",)), [])
+
+    def test_a_move_with_an_edit_is_not_a_delete(self):
+        """perms 10-12: moving cc-member, editing one line and dropping its check is a fault. Its bytes changed, so
+        no head blob matches; git's -M rename (files.moved) is what keeps it."""
+        member = ("tests/member.py", "tests/quarantine/a", "tests/quarantine/b/c", "tests/member-lib.sh")
+        self.assertEqual(self.faults(self.drop("member"), member, edited={"bin/cc-member": "bin/cc_member"}),
+                         ["check 'member' was removed"])
+        text = self.BASE.replace('"tests/member.py", "tests/quarantine"]', '"tests/quarantine"]')
+        self.assertEqual(self.faults(text, edited={"tests/member.py": "tests/m/member.py"}),
+                         ["check 'member': paths lost core/tests/member.py"])
+
+    def test_a_module_run_target_names_its_file(self):
+        """perms 10-12: `python3 -m unittest tests.slack` names tests/slack.py, so the check stays while it exists."""
+        self.assertEqual(M.run_files("bin/x && python3 -m unittest -v tests.a tests.b.c; echo done.ok"),
+                         ["bin/x", "tests/a.py", "tests/b/c.py"])
+        member = ("bin/cc-member", "tests/member.py", "tests/quarantine/a", "tests/quarantine/b/c",
+                  "tests/member-lib.sh")
+        unit = self.BASE.replace('run = "bin/cc-member selfcheck"',
+                                 'run = "bin/cc-member selfcheck && python3 -m unittest tests.slack"')
+        self.assertEqual(self.faults(self.drop("member", unit), member, unit), ["check 'member' was removed"])
+        self.assertEqual(self.faults(self.drop("member", unit), member + ("tests/slack.py",), unit), [])
+
+    def test_a_check_whose_run_names_no_file_or_a_survivor_never_goes(self):
+        # `-m unittest discover` names no file: the check stays even with every path and fixture gone
+        member = ("bin/cc-member", "tests/member.py", "tests/quarantine/a", "tests/quarantine/b/c",
+                  "tests/member-lib.sh")
+        unit = self.BASE.replace('run = "bin/cc-member selfcheck"', 'run = "python3 -m unittest discover"')
+        self.assertEqual(self.faults(self.drop("member", unit), member, unit), ["check 'member' was removed"])
+        # a run file that survives keeps it, though every path and fixture is deleted
+        both = self.BASE.replace('run = "bin/cc-member selfcheck"', 'run = "bin/cc-member tests/slack.py"')
+        self.assertEqual(self.faults(self.drop("member", both), member, both), ["check 'member' was removed"])
+        self.assertEqual(self.faults(self.drop("member", both), member + ("tests/slack.py",), both), [])
+
+    def test_where_class_and_cwd_never_narrow_even_on_a_deleted_file(self):
+        everything = tuple(f[5:] for f in self.BASE_FILES)
+        where = self.BASE.replace('class = "host"\nwhere = ["box", "laptop"]\nfixtures',
+                                  'class = "host"\nwhere = ["box"]\nfixtures')
+        self.assertEqual(self.faults(where, everything), ["check 'e2e-limit-episode': where lost laptop"])
+        down = self.BASE.replace('run = "bin/cc-member selfcheck"\npaths = ["bin/cc-member", "tests/member.py", '
+                                 '"tests/quarantine"]\nclass = "host"',
+                                 'run = "bin/cc-member selfcheck"\npaths = ["bin/cc-member", "tests/member.py", '
+                                 '"tests/quarantine"]\nclass = "box"')
+        self.assertIn("check 'member': class moved from host down to box", self.faults(down, everything))
+
+    def test_widen_drops_a_dead_check_and_never_takes_a_changed_run(self):
+        text = self.drop("member").replace(" tests/member.py\"", "\"")
+        base, head = AddOnly.two(None, text, self.BASE)
+        dead = ("bin/cc-member", "tests/member.py", "tests/quarantine/a", "tests/quarantine/b/c", "tests/member-lib.sh")
+        w = M.widen(base, head, self.trees(dead))
+        self.assertNotIn("member", w.checks)
+        self.assertEqual(w.checks["py-compile-tests"].run, base.checks["py-compile-tests"].run)
+        # a survivor keeps the check
+        w = M.widen(base, head, self.trees(dead[2:]))
+        self.assertIn("member", w.checks)
+        self.assertIn("member", M.widen(base, head).checks)   # and with no trees nothing narrows
+
+    def test_on_git_trees_and_through_plan(self):
+        r = Repo(self)
+        # bin/a and bin/b share bin/c's bytes, and a blob at any path in the head keeps it: c gets its own first
+        r.base = r.commit("own c", {"core/bin/c": "#!/bin/sh\necho c\n"})
+        manifest = CORE_MANIFEST.replace(
+            '[[check]]\nname = "c"\nrun = "bin/c selfcheck"\npaths = ["bin/c"]\nclass = "host"\n', "")
+        # a rename (bin/c -> bin/d) with the check dropped is refused on real trees
+        os.rename(os.path.join(r.root, "core/bin/c"), os.path.join(r.root, "core/bin/d"))
+        moved = r.commit("moved", {"core/tests/LANDING.toml": manifest})
+        ok, text = M.widen_check(r.root, r.base, moved)
+        self.assertFalse(ok)
+        self.assertIn("check 'c' was removed", text)
+        os.remove(os.path.join(r.root, "core/bin/d"))
+        dead = r.commit("dead")
+        ok, text = M.widen_check(r.root, r.base, dead)
+        self.assertTrue(ok, text)
+        p = P.plan(r.root, r.base, dead, P.changed(r.root, r.base, dead))
+        self.assertNotIn("c", p.checks)
+        self.assertIn(M.BUILTIN, p.checks)
+        # the working copy reads its own files and hashes them: c's bytes at a new, untracked path are a move
+        write(r.root, {"core/bin/e": "#!/bin/sh\necho c\n"})
+        self.assertFalse(M.widen_check(r.root, r.base, "")[0])
+        os.remove(os.path.join(r.root, "core/bin/e"))
+        self.assertTrue(M.widen_check(r.root, r.base, "")[0])
+        # and core/bin/c back on disk makes the removal a fault again
+        write(r.root, {"core/bin/c": "#!/bin/sh\n"})
+        ok, text = M.widen_check(r.root, r.base, "")
+        self.assertFalse(ok)
+        self.assertIn("check 'c' was removed", text)
+        kept = r.commit("kept")
+        self.assertFalse(M.widen_check(r.root, r.base, kept)[0])
+        self.assertIn("c", P.plan(r.root, r.base, kept, ["core/tests/LANDING.toml", "core/bin/c"]).checks)
+
+
 class Prose(unittest.TestCase):
     def test_prose_is_docs_pdfs_images_and_markdown(self):
         for p in ("docs/x.md", "docs/a/b.txt", "core/docs/DESIGN.md", "README.md", "a/b.pdf", "fig.svg"):
@@ -615,11 +835,28 @@ class GeneratedReach(unittest.TestCase):
         self.assertNotEqual(p.klass, T.LANDER)
         self.assertIn(M.BUILTIN, p.checks)   # the reach file still selects manifest-widen
 
-    def test_an_authored_edge_the_code_does_not_make_is_lander_class(self):
+    def test_an_authored_edit_that_deletes_a_line_is_lander_class(self):
+        """render() drops the base's comment line, so the diff is not pure additions and nothing generates a -> d."""
         r = self.repo()
         head = r.commit("hand edge", {"core/bin/d": "#!/bin/sh\n",
                                       "core/tests/reach.tsv": R.render([("b", "a"), ("c", "b"), ("a", "d")])})
         self.assertEqual(self.plan(r, head).klass, T.LANDER)
+
+    def test_an_authored_edge_added_alone_is_not_lander_class(self):
+        """perms' terms (#1234): a reach.tsv diff of pure additions, with a clean manifest, plans with its other
+        files; the same edge with one base line taken out stays lander."""
+        r = self.repo()
+        git(r.root, "checkout", "-qb", "add")
+        head = r.commit("hand edge", {"core/bin/d": "#!/bin/sh\n", "core/tests/reach.tsv": REACH + "a\td\n"})
+        files = P.changed(r.root, r.base, head)
+        self.assertEqual(P.generated_reach(r.root, r.base, head, files), set())   # authored, not generated
+        p = self.plan(r, head)
+        self.assertNotEqual(p.klass, T.LANDER)
+        self.assertIn(M.BUILTIN, p.checks)
+        git(r.root, "checkout", "-q", r.base)
+        cut = r.commit("hand edge, b -> a gone", {"core/bin/d": "#!/bin/sh\n",
+                                                  "core/tests/reach.tsv": "# a comment\nc\tb\na\td\n"})
+        self.assertEqual(self.plan(r, cut).klass, T.LANDER)
 
     def test_a_dropped_edge_the_code_still_makes_is_lander_class(self):
         r = self.repo()
@@ -642,7 +879,8 @@ class GeneratedReach(unittest.TestCase):
 
     def test_drift_already_on_the_base_does_not_stop_a_pr_that_adds_its_own_edge(self):
         """main's reach.tsv lacks b -> a, which its code makes (an earlier PR never added it). A PR that adds only
-        its own generated edge is not lander-class; one that adds the same edge plus an authored one is."""
+        its own generated edge is not lander-class; one that adds the same edge plus an authored one is not generated,
+        and is not lander-class either only because it deletes no line (perms' terms, #1234)."""
         r = Repo(self, {"tests/LANDING-policy.toml": self.LANDER_POLICY, **self.CALLS,
                         "core/tests/reach.tsv": R.render([("c", "b")])})
         files = {"core/bin/d": "#!/bin/sh\n", "core/bin/c": '#!/bin/sh\n"$BIN/b"\n"$BIN/d"\n'}
@@ -652,7 +890,8 @@ class GeneratedReach(unittest.TestCase):
         git(r.root, "checkout", "-q", r.base)
         bad = r.commit("own edge and a made one",
                        {**files, "core/tests/reach.tsv": R.render([("a", "c"), ("c", "b"), ("c", "d")])})
-        self.assertEqual(self.plan(r, bad).klass, T.LANDER)
+        self.assertEqual(P.generated_reach(r.root, r.base, bad, P.changed(r.root, r.base, bad)), set())
+        self.assertNotEqual(self.plan(r, bad).klass, T.LANDER)
 
     def test_a_deleted_reach_file_is_lander_class(self):
         r = self.repo()
@@ -776,6 +1015,168 @@ class GeneratedReach(unittest.TestCase):
         self.assertEqual(R.generate_at(r.root, head, ""),
                          R.generate(r.root, ["bin-private"], ["bin-private", "core/bin"], []))
         self.assertEqual(R.generate_at(r.root, head, ""), [("p", "c"), ("q", "p")])
+
+
+class CleanManifest(unittest.TestCase):
+    """perms' terms (#1234): a LANDING.toml / reach.tsv edit that only widens inside the sandbox, or drops only what
+    the head deletes, plans with the PR's other files; anything else stays lander-class. Each case builds its own
+    repo, with the manifests and reach files on the policy's lander list as they are in this repo."""
+    POLICY = POLICY.replace('lander = ["core/lander/**"]', 'lander = ["core/lander/**", "core/tests/LANDING.toml", '
+                            '"tests/LANDING.toml", "core/tests/reach.tsv", "tests/reach.tsv"]')
+    NEW = '\n[[check]]\nname = "d"\nrun = "bin/d selfcheck"\npaths = ["bin/d"]\nclass = "hermetic"\n'
+
+    def repo(self, extra=None):
+        # bin/c gets bytes of its own: a delete is judged by blob, and a, b and c would otherwise share one
+        return Repo(self, {"tests/LANDING-policy.toml": self.POLICY, "core/bin/c": "#!/bin/sh\necho c\n",
+                           **(extra or {})})
+
+    def plan(self, r, head, base=None):
+        base = base or r.base
+        return P.plan(r.root, base, head, P.changed(r.root, base, head))
+
+    def drop_c(self):
+        """CORE_MANIFEST with check c cut out."""
+        start = CORE_MANIFEST.index('[[check]]\nname = "c"')
+        return CORE_MANIFEST[:start] + CORE_MANIFEST[CORE_MANIFEST.index("[[check]]", start + 1):]
+
+    def test_an_added_hermetic_check_plans_leaf_or_wide(self):
+        r = self.repo()
+        head = r.commit("tool d and its check", {"core/bin/d": "#!/bin/sh\n",
+                                                 "core/tests/LANDING.toml": CORE_MANIFEST + self.NEW})
+        p = self.plan(r, head)
+        self.assertIn(p.klass, (T.LEAF, T.WIDE))
+        self.assertIn(M.BUILTIN, p.checks)   # manifest-widen runs on every such plan
+        self.assertIn("d", p.checks)
+
+    def test_an_added_host_check_is_still_lander_class(self):
+        r = self.repo()
+        head = r.commit("host check d", {"core/bin/d": "#!/bin/sh\n", "core/tests/LANDING.toml": CORE_MANIFEST
+                                         + self.NEW.replace('class = "hermetic"', 'class = "host"')})
+        self.assertEqual(self.plan(r, head).klass, T.LANDER)
+
+    def test_a_changed_run_class_or_where_is_still_lander_class(self):
+        r = self.repo()
+        for what, text in {"run": CORE_MANIFEST.replace('run = "bin/c selfcheck"', 'run = "bin/c selfcheck -v"'),
+                           "class": CORE_MANIFEST.replace('run = "bash -n bin/a"\npaths = ["bin/a"]\n'
+                                                          'class = "static"', 'run = "bash -n bin/a"\n'
+                                                          'paths = ["bin/a"]\nclass = "hermetic"'),
+                           "where": CORE_MANIFEST.replace('paths = ["bin/c"]', 'paths = ["bin/c"]\n'
+                                                          'where = ["box", "laptop"]')}.items():
+            git(r.root, "checkout", "-q", r.base)
+            head = r.commit(what, {"core/bin/d": "#!/bin/sh\n", "core/tests/LANDING.toml": text})
+            self.assertEqual(self.plan(r, head).klass, T.LANDER, what)
+
+    def test_a_path_added_to_a_host_check_is_clean(self):
+        """It triggers the unsandboxed check on more changes; perms allowed it, and the PR body says so."""
+        r = self.repo()
+        head = r.commit("c owns d", {"core/bin/d": "#!/bin/sh\n", "core/tests/LANDING.toml":
+                                     CORE_MANIFEST.replace('paths = ["bin/c"]', 'paths = ["bin/c", "bin/d"]')})
+        p = self.plan(r, head)
+        self.assertNotEqual(p.klass, T.LANDER)
+        self.assertIn("c", p.checks)
+
+    def test_a_deleted_file_and_its_dropped_check_plan_clean_and_a_move_does_not(self):
+        r = self.repo()
+        git(r.root, "checkout", "-qb", "rm")
+        os.unlink(os.path.join(r.root, "core/bin/c"))
+        gone = r.commit("rm c and its check", {"core/tests/LANDING.toml": self.drop_c()})
+        p = self.plan(r, gone)
+        self.assertNotEqual(p.klass, T.LANDER)
+        self.assertNotIn("c", p.checks)   # not run on the file it named
+        git(r.root, "checkout", "-q", r.base)
+        git(r.root, "mv", "core/bin/c", "core/bin/c2")
+        moved = r.commit("mv c and drop its check", {"core/tests/LANDING.toml": self.drop_c()})
+        self.assertEqual(self.plan(r, moved).klass, T.LANDER)
+
+    def test_a_deleted_file_keeps_its_class_when_its_check_goes_too(self):
+        """Reads come from the strictest class over every file, deleted ones included: dropping a gate-first file
+        with its check is gate-first, and a deleted file on the lander list keeps the change lander-class."""
+        guard = '\n[[check]]\nname = "guard"\nrun = "bin/guard selfcheck"\npaths = ["bin/guard"]\nclass = "host"\n'
+        r = self.repo({"core/bin/guard": "#!/bin/sh\necho guard\n", "core/lander/x.py": "x = 1\n",
+                       "core/tests/LANDING.toml": CORE_MANIFEST + guard})
+        git(r.root, "checkout", "-qb", "rm")
+        os.unlink(os.path.join(r.root, "core/bin/guard"))
+        head = r.commit("rm guard and its check", {"core/tests/LANDING.toml": CORE_MANIFEST})
+        self.assertEqual(self.plan(r, head).klass, T.GATE_FIRST)
+        git(r.root, "checkout", "-q", r.base)
+        os.unlink(os.path.join(r.root, "core/lander/x.py"))
+        head = r.commit("rm lander file, add d", {"core/bin/d": "#!/bin/sh\n",
+                                                  "core/tests/LANDING.toml": CORE_MANIFEST + guard + self.NEW})
+        self.assertEqual(self.plan(r, head).klass, T.LANDER)
+
+    def test_an_added_check_may_not_raise_its_cap_above_the_base_largest(self):
+        """perms 10-12: `cap = 999999999` over ** planned clean. The base's largest cap is 600 (the default)."""
+        r = self.repo()
+        git(r.root, "checkout", "-qb", "big")
+        big = r.commit("d, uncapped", {"core/bin/d": "#!/bin/sh\n", "core/tests/LANDING.toml": CORE_MANIFEST
+                                       + self.NEW.replace('paths = ["bin/d"]', 'paths = ["**"]\ncap = 999999999')})
+        self.assertEqual(self.plan(r, big).klass, T.LANDER)
+        git(r.root, "checkout", "-q", r.base)
+        ok = r.commit("d, at the ceiling", {"core/bin/d": "#!/bin/sh\n", "core/tests/LANDING.toml": CORE_MANIFEST
+                                            + self.NEW.replace('paths = ["bin/d"]', 'paths = ["bin/d"]\ncap = 600')})
+        self.assertNotEqual(self.plan(r, ok).klass, T.LANDER)
+
+    def test_a_move_with_an_edit_and_its_check_dropped_is_lander_class(self):
+        """perms 10-12: git mv the guarded tool, edit one line and drop its check. Its blob is at no head path,
+        but git's -M sees the rename on the merge tree, so the tool survives and the drop is a fault."""
+        body = "".join(f"echo line {i}\n" for i in range(20))
+        guard = '\n[[check]]\nname = "guard"\nrun = "bin/guard selfcheck"\npaths = ["bin/guard"]\nclass = "host"\n'
+        r = self.repo({"core/bin/guard": "#!/bin/sh\n" + body, "core/tests/LANDING.toml": CORE_MANIFEST + guard})
+        git(r.root, "checkout", "-qb", "mv")
+        git(r.root, "mv", "core/bin/guard", "core/bin/guard2")
+        head = r.commit("mv guard, edit a line, drop its check", {
+            "core/bin/guard2": "#!/bin/sh\n" + body.replace("line 3\n", "line three\n"),
+            "core/tests/LANDING.toml": CORE_MANIFEST})
+        self.assertEqual(self.plan(r, head).klass, T.LANDER)
+        git(r.root, "checkout", "-q", r.base)
+        os.unlink(os.path.join(r.root, "core/bin/guard"))
+        gone = r.commit("rm guard and its check", {"core/tests/LANDING.toml": CORE_MANIFEST})
+        self.assertNotEqual(self.plan(r, gone).klass, T.LANDER)
+
+    def test_a_move_past_gits_rename_limit_still_survives(self):
+        """Opus read 10-12: with 1001 files deleted and 1001 added beside the move, git's default diff.renameLimit
+        skips inexact renames (a warning, rc 0), so the edited guard read as gone. -l0 keeps the rename."""
+        body = "".join(f"echo line {i}\n" for i in range(20))
+        guard = '\n[[check]]\nname = "guard"\nrun = "bin/guard selfcheck"\npaths = ["bin/guard"]\nclass = "host"\n'
+        junk = {f"core/junk/a{i}": f"a {i}\n" for i in range(1001)}
+        r = self.repo({"core/bin/guard": "#!/bin/sh\n" + body, "core/tests/LANDING.toml": CORE_MANIFEST + guard,
+                       **junk})
+        git(r.root, "checkout", "-qb", "mv")
+        git(r.root, "rm", "-rq", "core/junk")
+        git(r.root, "mv", "core/bin/guard", "core/bin/guard2")
+        head = r.commit("mv guard past the rename limit, drop its check", {
+            "core/bin/guard2": "#!/bin/sh\n" + body.replace("line 3\n", "line three\n"),
+            "core/tests/LANDING.toml": CORE_MANIFEST, **{f"core/more/b{i}": f"b {i} x\n" for i in range(1001)}})
+        self.assertEqual(self.plan(r, head).klass, T.LANDER)
+
+    def test_a_reach_line_dropped_beside_a_clean_check_is_lander_class_and_one_added_is_not(self):
+        # c calls b, so the generator still makes c -> b and dropping it is no generated change
+        r = self.repo({"core/bin/c": '#!/bin/sh\n"$BIN/b"\necho c\n'})
+        files = {"core/bin/d": "#!/bin/sh\n", "core/tests/LANDING.toml": CORE_MANIFEST + self.NEW}
+        git(r.root, "checkout", "-qb", "add")
+        add = r.commit("d, and a -> d", {**files, "core/tests/reach.tsv": REACH + "a\td\n"})
+        self.assertNotEqual(self.plan(r, add).klass, T.LANDER)
+        git(r.root, "checkout", "-q", r.base)
+        cut = r.commit("d, and c -> b dropped", {**files, "core/tests/reach.tsv": "# a comment\nb\ta\n"})
+        self.assertEqual(self.plan(r, cut).klass, T.LANDER)
+
+    def test_the_policy_file_is_still_lander_class(self):
+        r = self.repo()
+        head = r.commit("policy", {"tests/LANDING-policy.toml": self.POLICY + "# a note\n",
+                                   "core/tests/LANDING.toml": CORE_MANIFEST + self.NEW, "core/bin/d": "#!/bin/sh\n"})
+        self.assertEqual(self.plan(r, head).klass, T.LANDER)
+
+    def test_it_is_judged_on_the_merge_tree_not_the_head(self):
+        """main adds check z after the PR branched: against main the PR's head lacks z, which reads as a removed
+        check; on the merge tree it is there, so the PR's own added check is clean."""
+        r = self.repo()
+        git(r.root, "checkout", "-qb", "pr")
+        head = r.commit("check d", {"core/bin/d": "#!/bin/sh\n", "core/tests/LANDING.toml": CORE_MANIFEST + self.NEW})
+        git(r.root, "checkout", "-q", "-")
+        z = '[[check]]\nname = "z"\nrun = "bin/a z"\npaths = ["bin/a"]\nclass = "hermetic"\n'
+        main = r.commit("check z", {"core/tests/LANDING.toml": z + CORE_MANIFEST})   # at the top: the merge is clean
+        self.assertTrue(M.clean_faults(M.load(r.root, main), M.load(r.root, head), M.Trees(r.root, main, head)))
+        self.assertNotEqual(self.plan(r, head, main).klass, T.LANDER)
 
 
 class Reach(unittest.TestCase):

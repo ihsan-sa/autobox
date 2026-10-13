@@ -2115,6 +2115,18 @@ class Judge(unittest.TestCase):
             outs = RUN.run_plan(".", m, plan, ["core/bin/c"], self.H, self.B, runner=run, quarantine_text=q)
             self.assertEqual(outs["c"].status, T.FAILED)             # the change touches the check
 
+    def test_a_quarantine_row_never_passes_a_manifest_widen_red(self):
+        # perms' terms (#1234): manifest-widen's "red blocks as a fault, never advisory"
+        m = M.Manifest(checks={}, cwd={})
+        run, _ = self.runner({self.H: T.FAILED, self.B: T.PASSED})
+        q = f"{M.BUILTIN}\tflaky text\tw\to\t2099-01-01\n"
+        with mock.patch.object(REC, "quarantine_rows", return_value=[(M.BUILTIN, "flaky text")]), \
+                mock.patch.object(M, "load", return_value=M.Manifest()):
+            outs = RUN.run_plan(".", m, T.Plan(checks=[M.BUILTIN]), ["README.md"], self.H, self.B,
+                                runner=run, quarantine_text=q)
+        self.assertEqual(outs[M.BUILTIN].status, T.FAILED)
+        self.assertNotEqual(outs[M.BUILTIN].note, "quarantined")
+
     def test_after_one_laptop_no_answer_the_rest_of_the_plan_goes_to_the_box(self):
         m = M.Manifest(checks={n: chk(name=n, klass=T.STATIC, where=["box", "laptop"]) for n in ("a", "b")}, cwd={"a": "", "b": ""})
         seen = []

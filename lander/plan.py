@@ -1,8 +1,8 @@
 """plan(): which checks a change reaches, and what kind of landing it is (design §0 Selection, §4; review S2, S3, S10).
 
-PURE. It reads the manifest, policy and reach graph out of git at base_sha (and the head's, which may only widen:
-manifest.widen) and returns a Plan. It writes nothing (a reach file's merge is written into a scratch repo that
-git.sealed() removes), runs nothing and asks no network.
+PURE. It reads the manifest, policy and reach graph out of git at base_sha (and the head's, which may only widen, or
+drop what it deletes: manifest.widen) and returns a Plan. It writes nothing (a reach file's merge is written into a
+scratch repo that git.sealed() removes), runs nothing and asks no network.
 
 SELECTION, per changed file:
   - PROSE (is_prose, S10) reaches only the static checks that own it: docs/**, core/docs/**, *.pdf, images, and
@@ -28,7 +28,10 @@ KLASS, first match wins: protected (a policy protected glob, or the caller's `pr
 lives in the box's config, never in a tree) > lander (a policy lander glob, or the policy file itself — bar a
 GENERATED reach file: one where every edge the change adds is one `lander reach` writes on merge-tree(base, head)
 and every edge it drops is one it does not, so the change follows from the code and lands with it; an edge the code
-does not make, or a change git cannot prove, stays lander, and a working copy proves nothing) > gate-first
+does not make, or a change git cannot prove, stays lander, and a working copy proves nothing; and bar a CLEAN manifest
+edit (clean_manifest): on merge-tree(base, head), read by this release's code, manifest.clean_faults is empty and no
+changed reach file loses a line, so the manifest and reach files drop out and the change is classed by its other
+files, deleted ones included; the policy file never drops out) > gate-first
 > docs (every file prose) > wide (some path unowned, bar an add-only change's quiet ones) > leaf.
 paid: some file matches paid_review, or UNGATED: some unowned path is code (anything but an added data or asset file,
 inert()) and no check bar manifest-widen runs on the change, before the merge or after it (a repo with no manifest of
@@ -42,6 +45,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 
 from lander import manifest as M
 from lander import reach as R
@@ -88,11 +92,12 @@ def tool_name(path: str) -> str:
     return ""
 
 
-def select(m: M.Manifest, files: list, protected=(), added=(), generated=()) -> T.Plan:
+def select(m: M.Manifest, files: list, protected=(), added=(), generated=(), clean=()) -> T.Plan:
     """The pure core of plan(), on an already-loaded manifest. Tests call this. added: the files in `files` that do
     not exist at the base (plan() works it out); when every file is one, the change is add-only. generated: the reach
     files in `files` whose change agrees with the generator on the merge tree (plan() works it out); they do not
-    make the change lander-class."""
+    make the change lander-class. clean: the manifest and reach files in `files` whose edit is clean (clean_manifest);
+    they do not make it lander-class either."""
     pol = m.policy
     names, tip, owned, unowned, reached = set(), set(), [], [], {}
     builtin = M.builtin_check()
@@ -143,7 +148,9 @@ def select(m: M.Manifest, files: list, protected=(), added=(), generated=()) -> 
     # the code, so it's not a policy edit"; "a reach.tsv edit that doesn't match the generator still goes to
     # lander-self".
     # Matched edge by edge (generated_change), so drift main already carries does not stop a PR that adds its own.
-    elif any(M.match(lander, f) for f in files if f not in generated):
+    # perms' terms (#1234): "A LANDING.toml / reach.tsv edit stops counting toward LANDER when widen_faults(base, head)
+    # is empty AND reach.tsv's diff is pure additions"; every other file, deleted ones included, still counts.
+    elif any(M.match(lander, f) for f in files if f not in generated and f not in clean):
         klass = T.LANDER
     elif any(M.match(pol.gate_first, f) for f in files):
         klass = T.GATE_FIRST
@@ -183,10 +190,11 @@ def plan(repo_root: str, base_sha: str, head_sha: str, files: list, protected=()
     files = list(files)
     added = added_files(repo_root, base_sha, head_sha, files)
     generated = generated_reach(repo_root, base_sha, head_sha, files)
-    p = select(M.widen(base, head), files, protected, added, generated)
+    clean = clean_manifest(repo_root, base_sha, head_sha, files, generated, fallback)
+    p = select(M.widen(base, head, M.Trees(repo_root, base_sha, head_sha)), files, protected, added, generated, clean)
     # perms 10-12: "the lane can't build its plan from the PR's own head LANDING.toml". Whether code is ungated is
     # the base's word: a check the head adds (run = 'true' over **) would otherwise make it look gated, and unpaid.
-    if not p.extra.get("ungated") and select(base, files, protected, added, generated).extra.get("ungated"):
+    if not p.extra.get("ungated") and select(base, files, protected, added, generated, clean).extra.get("ungated"):
         p.paid, p.extra["ungated"] = True, True
     return p
 
@@ -213,6 +221,67 @@ def generated_reach(repo_root: str, base: str, head: str, files: list) -> set:
                 return set()   # a conflict, or git failing: nothing is proven
             return {p + M.REACH for p in wanted if R.generated_change(run, b, tree, p)}
     except Exception:  # noqa: BLE001 — git missing, a timeout, anything: nothing is proven
+        return set()
+
+
+def clean_manifest(repo_root: str, base: str, head: str, files: list, generated=(), fallback: str = "") -> set:
+    """The manifest and reach files among `files` (never the policy) when the change's whole manifest edit is clean,
+    else the empty set. Clean: on merge-tree(base, head), read in git.sealed() by this release's code (never the PR's),
+    manifest.clean_faults(base, merge) is empty (checks added inside the sandbox, paths and fixtures added, and only
+    what the head deletes dropped, by blob, a -M rename's source surviving), no added check's cap above the base's
+    largest, and each changed reach file is in `generated` or git's diff of it from
+    base deletes no line. A working copy, a conflict, a reach file the merge lacks, or git failing is not clean."""
+    mine = [p + f for p in M.PREFIXES for f in (M.MANIFEST, M.REACH) if p + f in files]
+    if not mine or not head:
+        return set()
+    from lander import git as G
+
+    def listing(run, rev):   # {path: (mode, type, oid)}
+        rc, out = run("ls-tree", "-r", "-z", "--full-tree", rev, timeout=300)
+        if rc:
+            raise OSError(f"ls-tree {rev[:12]}: {str(out).strip()[-300:]}")
+        rows = [r.partition("\t") for r in out.split("\0") if r]
+        return {path: tuple(meta.split(" ")) for meta, _, path in rows}
+
+    def reader(run, ls):
+        def read(path):
+            if path not in ls:
+                return None
+            mode, kind, oid = ls[path]
+            if mode not in ("100644", "100755") or kind != "blob":
+                raise OSError(f"{path} is not a regular file")
+            rc, text = run("cat-file", "blob", oid)
+            if rc:
+                raise OSError(f"cat-file {oid[:12]}: {str(text).strip()[-300:]}")
+            return text
+        return read
+
+    try:
+        with G.sealed(repo_root, base, head) as ((rc, out), run):
+            if run is None:
+                return set()
+            b, h = out
+            rc, merged = run("merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", b, h, timeout=300)
+            tree = merged.split("\0")[0].strip() if rc == 0 else ""
+            if not G.SHA_RE.fullmatch(tree):
+                return set()   # a conflict, or git failing: nothing is proven
+            at_b, at_t = listing(run, b), listing(run, tree)
+            for r in (f for f in mine if f.endswith(M.REACH) and f not in generated):
+                rc, out = run("diff-tree", "--numstat", "-r", b, tree, "--", r, timeout=300)
+                rows = [x.split("\t") for x in out.splitlines() if x]
+                # "reach.tsv's diff is pure additions": every row adds lines and deletes none
+                if rc or r not in at_t or any(len(x) != 3 or not x[0].isdigit() or x[1] != "0" for x in rows):
+                    return set()
+            was = M.load(repo_root, b, fallback=fallback, read=reader(run, at_b))
+            now = M.load(repo_root, tree, fallback=fallback, strict=False, read=reader(run, at_t))
+            # perms 10-12: "a move plus an edit must not count as a delete": every -M rename source survives
+            rc, diff = run("diff-tree", "-r", "-M", "-l0", "-z", "--name-status", "--no-ext-diff", b, tree, timeout=300)
+            if rc:
+                return set()
+            trees = types.SimpleNamespace(base={p: v[2] for p, v in at_b.items()},
+                                          head={p: v[2] for p, v in at_t.items()}, moved=M.renamed(diff))
+            return set() if M.clean_faults(was, now, trees) else set(mine)
+    except Exception:  # noqa: BLE001 — git missing, a timeout, a base that will not parse, anything: nothing is proven
         return set()
 
 
