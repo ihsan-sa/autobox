@@ -44,6 +44,9 @@
             tip.run, whose checks are the box-class checks the merged range reaches (tip_plan), each run on its
             commit by U2's runner (make_check). Green deploys that sha (deploy.run); red holds the targets, bisects
             and reverts a proven breaker. Then deploy.run again, for a request whose tip is already green (a retry).
+            Then, on a tip the run looked at (green or red), health.run: the blocking checks the merged range reaches
+            and every check main is red on, run on the tip and kept as main's own record (the lane plans by it); a
+            check that turns red is said once on the tip run's route. It holds no deploy and reverts nothing.
   nightly   for each repo the tip step runs for, at most once every nightly.NIGHTLY_SECS (a day) and only once
             queue.log goes back nightly.WINDOW_DAYS: `lander nightly run --repo <repo>` as a transient unit, which
             runs the checks nightly.py moved out of the per-PR plan on the applied tip.
@@ -77,6 +80,7 @@ from lander import cards as C
 from lander import deploy as D
 from lander import events as E
 from lander import gh as GH
+from lander import health as HL
 from lander import git as G
 from lander import jobs as J
 from lander import lane as L
@@ -517,6 +521,18 @@ def tip_and_deploy(repo, units) -> list:
                 lines.append(f"[{repo}] tip run: {st}")
             if st != "red":
                 deploy.run(repo)
+            if st in ("green", "red"):   # a tip was looked at: main's own record of its blocking checks (health.py)
+                # its own fault is logged and skipped, so settle(repo) below still runs (architect read, 10-13)
+                try:
+                    ran = HL.run(repo, make_check(D.root_of(repo), fallback=fb), fallback=fb)
+                except Exception as e:  # noqa: BLE001 — main health is a record, never the deploy's settling
+                    E.log("tick-fault", repo, None, f"main health: {type(e).__name__}: {e}")
+                    lines.append(f"[{repo}] main health failed: {type(e).__name__}: {e}")
+                    ran = {}
+                if ran:
+                    bad = sorted(n for n, said in ran.items() if said == T.FAILED)
+                    lines.append(f"[{repo}] main health: {len(ran)} check(s)"
+                                 + (f", red: {', '.join(bad)}" if bad else ""))
         lines += settle(repo)
     except Exception as e:  # noqa: BLE001 — one repo's fault is said and logged, never the tick's end
         E.log("tick-fault", repo, None, f"{type(e).__name__}: {e}")

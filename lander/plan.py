@@ -13,6 +13,9 @@ SELECTION, per changed file:
   - a changed tool (a file under bin/, bin-private/ or core/bin/) also selects the non-static checks that own each
     of its direct callers in reach.tsv — one hop, never further.
   - a change to a manifest, policy, security or reach file selects the built-in manifest-widen check.
+  - a change to the lander (core/lander/**), a LANDING*.toml or the sandbox (cc-sandbox, cc-fence, the claude-bwrap
+    profile), E2E_TRIGGERS, selects every e2e check (a name starting `e2e-`): two of main's longest red stretches
+    followed such changes that ran none of the e2e cases they broke. extra["e2e"] names the file that did it.
   - ADD-ONLY (owner, 2026-09-28: "a brand-new standalone tool that nothing calls should be live in minutes"): a change
     that only adds files, and modifies or deletes none, does not widen to default_checks for an unowned path, and is
     leaf rather than wide — nothing that exists can break by a file appearing next to it. Every check that OWNS an
@@ -60,6 +63,12 @@ DATA_EXT = (".json", ".csv", ".tsv", ".txt", ".yaml", ".yml", ".toml", ".xml", "
 PROSE_DIRS = ("docs/**", "core/docs/**")
 NOT_PROSE = ("core/templates/**", "templates/**", "home/**", "core/config/**", "config/**", "**/agents/**",
              "**/REVIEW.md")
+
+
+# brief 10-13: "A change to core/lander, a LANDING*.toml or the sandbox (cc-sandbox, cc-fence, bwrap profile) selects
+# the full e2e set"
+E2E_TRIGGERS = ("core/lander/**", "**/LANDING*.toml", "bin/cc-sandbox", "core/bin/cc-sandbox", "bin/cc-fence",
+                "core/bin/cc-fence", "**/claude-bwrap*")
 
 
 GLOB_LOADED = ("tests/**", "core/tests/**", ".githooks/**", "core/.githooks/**", ".github/**", "core/.github/**",
@@ -133,6 +142,9 @@ def select(m: M.Manifest, files: list, protected=(), added=(), generated=(), cle
                     if m.checks[n].klass != T.STATIC and n not in names:
                         reached.setdefault(n, f)
     names.update(reached)
+    e2e = next((f for f in files if M.match(E2E_TRIGGERS, f)), "")
+    if e2e:
+        names.update(n for n in m.checks if n.startswith("e2e-"))
     faults = list(m.faults)
     add_only = bool(files) and set(files) <= set(added)
     quiet = [f for f in unowned if add_only and loads_by_nothing(f)]
@@ -168,6 +180,8 @@ def select(m: M.Manifest, files: list, protected=(), added=(), generated=(), cle
         tip = {n for n in names if n in m.checks and m.checks[n].klass == T.BOX}
         names -= tip
     extra = {"tip": sorted(tip), "reached": dict(sorted(reached.items()))}
+    if e2e:
+        extra["e2e"] = e2e
     # finding 10-04 (raised-member-pr-lands-with-no-checks): fund#2 "merged ... about 4 seconds after it was queued"
     # with "plan checks [], results {}, review_key ''" because the repo has no check map. Code that no check runs on,
     # before the merge or after it, is read instead: the plan is paid, so the lane buys a review.

@@ -7719,6 +7719,7 @@ def run_selfcheck():
         globals()["BOX_STATE"] = tempfile.mkdtemp(prefix="cc-slack-selfcheck-state-")
         os.makedirs(f"{BOX_STATE}/house"); os.makedirs(f"{BOX_STATE}/hank")
         state_own = state_taken("hank")
+        state_rot = state_taken("rotation")   # cc-rotation's proposals, which `cc-rotation archive` acts on as the owner
         before_coll = sorted(fkm.created), sorted(os.listdir(DEV)), sorted(load_members())
         coll = {u: ensure_member(cfgw, u)[0] for u in ("UBOX", "UUPD", "UCAROL", "UDAVE", "UROOM", "UHOUSE")}
         after_coll = sorted(fkm.created), sorted(os.listdir(DEV)), sorted(load_members())
@@ -7865,10 +7866,11 @@ def run_selfcheck():
           "channel that already exists and a name in routes.json — nothing created, no channel joined, no stranger "
           "invited into somebody else's channel",
           set(coll.values()) == {"refused"} and after_coll == before_coll and carol_untouched)
-    check("a handle naming the box's own state is REFUSED: `room` (cc-room's queue, relaunched as the owner) before "
+    check("a handle naming the box's own state is REFUSED: `room` (cc-room's queue, relaunched as the owner) or `rotation` (its archive proposals) before "
           "its dir exists, and any name whose ~/.cc/state dir is already there and no member workspace's — while a "
           "provisioned workspace keeps its own", coll["UROOM"] == "refused" and coll["UHOUSE"] == "refused"
-          and state_own == "" and "house" not in os.listdir(DEV) and "room" not in os.listdir(DEV))
+          and state_own == "" and "house" not in os.listdir(DEV) and "room" not in os.listdir(DEV)
+          and "rotation" not in os.listdir(BOX_STATE) and "box keeps its own state" in state_rot)
     check("`cc-slack member add <@u>` is the same join by hand — it creates the pair and the workspace, and running "
           "it again changes nothing", rc_cli == 0 and rc_cli2 == 0
           and made_cli == sorted(after_coll[0] + ["erin", "erin-updates"]) and made_cli2 == made_cli)

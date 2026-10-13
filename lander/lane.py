@@ -78,7 +78,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              the git lock fetch base and head; base_sha, files (merge-base..head), digest (the
              reviewer's digest_of, the key `record` and `will-review` use). A member PR meets its
              walls (-> handback). EVERY lane then refuses a PR that adds or changes a compiled file (__pycache__,
-             .pyc, .pyo, .so, .pyd) anywhere, a binary under core/ or bin-private/, or a new or changed symlink
+             .pyc, .pyo, .so, .pyd) anywhere, a binary under core/ or bin-private/, an executable binary anywhere,
+             or a new or changed symlink
              anywhere but config/system/ (-> handback naming
              them; a list that will not read holds, kind box): the set is
              binaries() of the bin/lander-self committed beside this lander/ (SELF_TOOL, loaded, never copied),
@@ -88,7 +89,9 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              protected files are byte-identical, which carries approved_head to it (`approval … carried`); else
              -> query, route "owner". A job overlapping one in flight waits here (OVERLAP above). plan(); klass
              lander -> query "lander-self"; then nightly.trim takes out the checks that run nightly instead (not on
-             a member's lane; the Δ re-plan trims the same way).
+             a member's lane), and health.trim the checks main's own record holds red that the change owns no
+             path of (extra main_red; not on a member's lane). The Δ re-plan trims both ways the same. A check
+             main's record holds on this very base tree stands for its base run in run.judge.
   checking   the plan's checks on merge-tree(base_sha, head), made once per base and head (extra tree_of), each
              through runner.run_plan (run.judge: the red-vs-base rule, the rerun alone under load, quarantine, the lane's records.Store under its lock, and the
              failures-ledger record of a red that is the diff's) against the manifest at base widened by the head's —
@@ -191,6 +194,7 @@ from lander import cards as C
 from lander import events as E
 from lander import gh as GH
 from lander import git as G
+from lander import health as HL
 from lander import jobs as J
 from lander import manifest as MF
 from lander import members as M
@@ -207,8 +211,9 @@ _SELF = []
 
 def compiled(root, base, head):
     """The paths `head` adds or changes from merge-base(base, head) that are not source, as SELF_TOOL's binaries()
-    names them (a compiled name anywhere; a binary under core/ or bin-private/; a symlink anywhere but
-    config/system/), read in a sealed repo on every PR, since a name alone shows no mode. None on any doubt: the tool
+    names them (a compiled name anywhere; a binary under core/ or bin-private/; an executable binary anywhere; a
+    symlink anywhere but config/system/), read in a sealed repo on every PR, since a name alone shows no mode. None
+    on any doubt: the tool
     missing or not loading, or a sealed read or list failing."""
     try:
         if not _SELF:
@@ -231,7 +236,8 @@ def compiled(root, base, head):
                 p = subprocess.run(["git", *a], cwd=run.git_dir, env=env, capture_output=True,
                                    stdin=subprocess.DEVNULL, timeout=120)
                 return p.returncode, p.stdout
-            return tool.binaries(root, mb.strip(), out[1], tool.BINARY_ROOTS, run=raw)
+            return tool.binaries(root, mb.strip(), out[1], tool.BINARY_ROOTS, run=raw,
+                                 peek=tool.git_peek(["git"], cwd=run.git_dir, env=env))
     except Exception:  # noqa: BLE001 — fail closed: a doubt holds the job, it never lets a binary through
         return None
 
@@ -1207,8 +1213,9 @@ class Lane:
         if bins is None:
             return self.hold(job, "the lander could not read whether the PR adds a compiled file", kind="box")
         if bins:
-            return self.handback(job, f"it adds {len(bins)} file(s) that are not source — compiled anywhere, or a "
-                                      f"binary under core/ or bin-private/, or a symlink outside config/system/ "
+            return self.handback(job, f"it adds {len(bins)} file(s) that are not source — compiled anywhere, a "
+                                      f"binary under core/ or bin-private/, an executable binary anywhere, or a "
+                                      f"symlink outside config/system/ "
                                       f"({', '.join(bins[:8])}); "
                                       "these could run in place of the source that was read, so take them out of "
                                       "the PR")
@@ -1227,7 +1234,7 @@ class Lane:
         job.plan = self.call("planner", "plan", self.root, job.base_sha, job.head, job.files, fallback=self.fallback)
         if job.plan.klass == T.LANDER:
             return self.query(job, "it changes the lander itself — lander-self lands it", "lander-self")
-        job.plan = self.nightly(job.base_sha, job.plan)
+        job.plan = self.main_red(job, job.base_sha, self.nightly(job.base_sha, job.plan))
         J.move(job, T.PLANNED)
 
     def nightly(self, base, plan):
@@ -1237,6 +1244,16 @@ class Lane:
             return plan
         try:
             return NG.trim(self.repo, MF.load(self.root, base, fallback=self.fallback), plan)
+        except Exception:  # noqa: BLE001 — any fault runs every check, never the wrong answer
+            return plan
+
+    def main_red(self, job, base, plan):
+        """`plan` (planned on `base`) without the checks main's own record holds red that the change owns no path
+        of (health.trim); a member's lane, or a manifest that does not load, keeps every check."""
+        if self.member:
+            return plan
+        try:
+            return HL.trim(self.repo, MF.load(self.root, base, fallback=self.fallback), plan, job.files)
         except Exception:  # noqa: BLE001 — any fault runs every check, never the wrong answer
             return plan
 
@@ -1336,6 +1353,7 @@ class Lane:
                     return self.checking(job)
                 todo = [n for n in todo if n not in again]
             quarantine = RUN.quarantine_text(self.root, job.base_sha)
+            main = {} if self.member else HL.at(self.repo, base_tree)   # main's own record on this base (health.py)
             for n in todo:
                 c = MF.builtin_check() if n == MF.BUILTIN else m.checks.get(n)
                 express = n in fast and self.express_room()
@@ -1362,7 +1380,7 @@ class Lane:
                                        scope=self.member or self.repo, pr=job.pr, quarantine_text=quarantine,
                                        only=[n], fallback=self.fallback, cancel=stop, lane=True,
                                        **({"runners": True} if laptop else kw),
-                                       **({"express": True} if express else {}))
+                                       **({"express": True} if express else {}), **({"main": main} if main else {}))
                 self.inflight[(job.key, n)] = Flight(fut, job.pr, n, job.head, job.base_sha, tree, laptop, stop,
                                                      express)
             self.waiting.add(job.key)   # submitted or not, it goes on when a check finishes and frees a slot
@@ -1601,7 +1619,7 @@ class Lane:
         """Δ re-plan (S2). True when something must run again (only those checks' results are dropped)."""
         delta = G.changed(self.root, job.base_sha, main_now, env=self.genv)
         new = self.call("planner", "plan", self.root, main_now, job.head, job.files, fallback=self.fallback)
-        new = self.nightly(main_now, new)
+        new = self.main_red(job, main_now, self.nightly(main_now, new))
         own = self.call("planner", "plan", self.root, job.base_sha, main_now, delta, fallback=self.fallback).checks
         old = set(job.plan.checks if job.plan else [])
         rerun = sorted((set(new.checks) - old) | (set(new.checks) & set(own)))

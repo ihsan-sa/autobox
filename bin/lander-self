@@ -18,7 +18,8 @@ A planning seat runs it by hand; the lander never installs itself.
         Refuses the PR whole unless: every changed path is on the base's `lander` list or under the lander's own
         tree (LANDER_TREE: core/lander, core/tests/lander); no path it adds or changes anywhere is a __pycache__
         path, a .pyc, .pyo, .so or .pyd, none under core/ or bin-private/ (or either one itself) is a symlink or
-        binary (a NUL in its first 8000 bytes), and none outside config/system/ is a symlink:
+        binary (a NUL in its first 8000 bytes), none outside config/system/ is a symlink, and no executable
+        (mode 100755) anywhere is binary:
         binaries(), which the ordinary lane loads from this file and runs on every PR too; a
         LAND record by exactly
         `perms-security-read` (review.py's security reader) and a LAND record by another reader both stand at the PR's head (`lander record
@@ -33,7 +34,7 @@ A planning seat runs it by hand; the lander never installs itself.
         it runs the current release's `lander settle-merged <repo> <pr> --by lander-self` (its own process), which
         moves the PR's query job to merged and writes the lane's merged line; a release without that command, or
         none, leaves it to the lander tick's `ended` sweep, and the land still exits 0.
-    lander-self promote [REV] [--repo DIR] [--pr N] [--cap SECONDS]
+    lander-self promote [REV] [--repo DIR] [--pr N] [--cap SECONDS] [--no-prove]
         Build ~/.cc/lander/releases/<sha>/ from `git archive` of REV (default origin/main) — committed code only,
         less any __pycache__, .pyc, .pyo, .so, .pyd or binary file it tracks (not_source: a tracked unchecked-hash
         .pyc or an extension module would run in place of its .py), plus the repo's
@@ -71,6 +72,9 @@ A planning seat runs it by hand; the lander never installs itself.
         running when it moves `current`. Only the perms seat promotes: the Claude session that runs it must work in
         <passwd home>/.cc/state/<repo>/perms (<repo> the checkout's directory name), the check `lander record --by
         perms-*` makes, or it is refused (exit 1) before anything is built.
+        --no-prove skips the proof on main (its sweeps and its lane hold) and nothing else: the perms check, the
+        build, the release's own selfcheck and `previous` all stand, and the promoted line says the proof was
+        skipped (owner, 2026-10-13 17:33Z: a fix to the lander must not wait on the proof sweep).
     lander-self prove [REV] [--repo DIR] [--pr N] [--cap SECONDS]
         promote without the switch: the same refusals for REV, its selfcheck and the proof on main (and its hold),
         against
@@ -80,6 +84,13 @@ A planning seat runs it by hand; the lander never installs itself.
         The commits perms reads before a promote: those from the current release to REV (default origin/main) that
         touch a path on origin/main's `lander` list in tests/LANDING-policy.toml, one `<sha12> <subject>` per line,
         then how many others there were (since #1277 those land on one paid read). Exit 0, 3 could not list them.
+    lander-self sweep [REV] [--repo DIR]
+        The periodic sweep (alert only, it never reverts): every path in the tree at REV (default origin/main, as
+        fetched from the pinned remote and matched against ls-remote) that `check` would refuse were it new — a
+        compiled name anywhere, a binary or gitlink under core/ or bin-private/, an executable binary anywhere — and
+        each symlink outside config/system/ whose target names a compiled path or resolves to one of those, or out
+        of the repo from under core/ or bin-private/. One path per line, then a summary line. Exit 0 clean, 2 found
+        (a cc-watch check's BAD), 3 could not run.
     lander-self rollback [--legacy]
         Point `current` back at `previous` (and `previous` at what current was). --legacy instead sends every
         `cc-land` call to the release pinned by `lander-self legacy` (the old lander, before the switch), and first
@@ -108,6 +119,7 @@ checkout releases are built from). A release is always laid out with the core tr
 the repo keeps it under, because bin/lander execs `current/core/lander/cli.py`.
 """
 import fcntl
+import io
 import json
 import os
 import pwd
@@ -1033,15 +1045,19 @@ def cmd_promote(args, opts):
         unlink("legacy-on")
         print(f"lander-self: {sha[:12]} is already current")
         return 0
-    why, nov = proven(rel, cur, root, main, cap)
-    if why:
-        return die(f"promote: refused, current is unchanged — {why}", 3 if nov else 1)
+    # brief: "It skips the proof sweep ... and nothing else" — every check above has already run
+    skip = bool(opts.get("no-prove"))
+    if not skip:
+        why, nov = proven(rel, cur, root, main, cap)
+        if why:
+            return die(f"promote: refused, current is unchanged — {why}", 3 if nov else 1)
     if cur:
         swap("previous", cur)
     swap("current", rel)
     unlink("legacy-on")
     print(f"lander-self: promoted {sha[:12]} (was {os.path.basename(cur)[:12] or 'none'}); "
-          f"`lander-self rollback` puts it back")
+          f"`lander-self rollback` puts it back"
+          + ("; proof skipped (--no-prove) on the owner's 2026-10-13 17:33Z direction" if skip else ""))
     busy = running_lanes(landq())
     if busy:
         print(f"lander-self: lanes running for {', '.join(busy)}: each finishes its job and switches to {sha[:12]} "
@@ -1102,10 +1118,35 @@ def cmd_reads(args, opts):
     return 0
 
 
+def cmd_sweep(args, opts):
+    """The tree at REV (default origin/main as main_sha verifies it) through tree_binaries(): binaries() sees only a
+    PR's own changes, so this is what catches a compiled file that reached main another way. It only reports."""
+    root = repo_of(opts.get("repo", ""))
+    if len(args) > 1 or not root:
+        return die("usage: lander-self sweep [REV] [--repo DIR]", 3)
+    sha = resolve(root, args[0]) if args else main_sha(root)
+    if not sha:
+        why = f"cannot resolve {args[0]}" if args else f"cannot fetch origin/main in {root}, or it differs from origin"
+        return die(f"sweep: {why}", 3)
+    hits = tree_binaries(root, sha, (core_prefix(root, sha), *BINARY_ROOTS[1:]))
+    if hits is None:
+        return die(f"sweep: cannot list or read the tree at {sha[:12]}", 3)
+    for h in hits:
+        print(h)
+    if hits:
+        print(f"lander-self sweep: {sha[:12]} tracks {len(hits)} path(s) that are not source ({', '.join(hits[:4])}"
+              f"{', …' if len(hits) > 4 else ''}); they could run in place of the code that was read, so take them "
+              "out by hand")
+        return 2
+    print(f"lander-self sweep: {sha[:12]} tracks no compiled or binary path under core/ or bin-private/, no executable "
+          "binary, and no symlink into one")
+    return 0
+
+
 def cmd_prove(args, opts):
     """promote's checks and its proof on main, without the switch: what a host runs before it takes over landing."""
     root, cap = repo_of(opts.get("repo", "")), cap_of(opts)
-    if len(args) > 1 or not root or not cap:
+    if len(args) > 1 or not root or not cap or opts.get("no-prove"):   # --no-prove is promote's alone
         return die("usage: lander-self prove [REV] [--repo DIR] [--pr N] [--cap SECONDS]", 2)
     for ln in pin_remotes(root):
         print(f"lander-self: {ln}")
@@ -1358,17 +1399,69 @@ def git_bytes(root):
     return run
 
 
-def binaries(root, base, head, pres=BINARY_ROOTS, run=None):
+PEEK = 8000   # the bytes not_source reads, git's own binary test
+
+
+def git_peek(argv=None, **kw):
+    """peek(shas) -> {sha: its first PEEK bytes, or None when it is no blob git can read}, from one
+    `git cat-file --batch` (argv is the git command, default ["git"]; kw goes to Popen, as cwd and env). Each blob
+    streams through and only PEEK bytes are kept (perms, after #1301: "binaries() reads each blob whole"). Asked by
+    sha, never by path, so no path can break a request line. None for the whole set when git fails mid-way."""
+    def peek(shas):
+        got = {}
+        if not shas:
+            return got
+        try:
+            p = subprocess.Popen([*(argv or ["git"]), "cat-file", "--batch"], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **kw)
+        except OSError:
+            return None
+        try:
+            for sha in dict.fromkeys(shas):
+                p.stdin.write(sha.encode() + b"\n")
+                p.stdin.flush()
+                head = p.stdout.readline().split()
+                if len(head) != 3:            # "<sha> missing" (a submodule's commit), "ambiguous"
+                    if not head:
+                        return None
+                    got[sha] = None
+                    continue
+                n, keep = int(head[2]), b""
+                while n:
+                    chunk = p.stdout.read(min(n, 1 << 16))
+                    if not chunk:
+                        return None
+                    keep += chunk[:PEEK - len(keep)]
+                    n -= len(chunk)
+                p.stdout.read(1)              # the LF after the content
+                got[sha] = keep if head[1] == b"blob" else None
+            return got
+        except (OSError, ValueError):
+            return None
+        finally:
+            for fh in (p.stdin, p.stdout):
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            p.kill()
+            p.wait()
+    return peek
+
+
+def binaries(root, base, head, pres=BINARY_ROOTS, run=None, peek=None):
     """Each path `head` adds or changes from `base` that is not source. Anywhere in the repo: a compiled name
     (not_source(path, b""): __pycache__ or a NOT_SOURCE suffix). Under the trees `pres` (a prefix or a tuple of them;
     '' is the whole repo): also a symlink (mode 120000) or a blob not_source calls binary, read from the blob, so a
     .gitattributes in the PR cannot call it text; a path whose blob cannot be read (a submodule) counts too; a root
     itself ('bin-private', 'core') counts as under it. Anywhere else but under LINKS_OK: any symlink, whatever its
-    target. A symlink the PR leaves as it is (main's core/bin/cc-mail and bin-private's) is not in the
-    diff, so it is not named.
-    `run` reads git as git_bytes does (the lane passes its sealed repo's). None when git cannot list them."""
+    target, and an executable (mode 100755) blob not_source calls binary. A symlink the PR leaves as it is (main's
+    core/bin/cc-mail and bin-private's) is not in the diff, so it is not named.
+    `run` reads git as git_bytes does and `peek` reads blobs as git_peek does (the lane passes its sealed repo's for
+    both). None when git cannot list them or read them."""
     pres = (pres,) if isinstance(pres, str) else tuple(pres)
     run = run or git_bytes(root)
+    peek = peek or git_peek(["git", "-C", root])
     rc, out = run("diff", "--raw", "-z", "--no-abbrev", "--no-renames", "--no-relative", "--ignore-submodules=none",
                   "--diff-filter=d", base, head)
     if rc != 0:
@@ -1378,7 +1471,7 @@ def binaries(root, base, head, pres=BINARY_ROOTS, run=None):
         parts.pop()
     if len(parts) % 2:
         return None
-    hits = set()
+    hits, read = set(), []
     for meta, raw in zip(parts[0::2], parts[1::2]):
         f = meta.split()
         if len(f) < 5 or not f[0].startswith(b":"):
@@ -1394,14 +1487,96 @@ def binaries(root, base, head, pres=BINARY_ROOTS, run=None):
             if f[1] == b"120000":
                 hits.add(p)
                 continue
-            rc, data = run("cat-file", "blob", f"{head}:{p}")
-            if not_source(p, None if rc else data):
-                hits.add(p)
+            read.append((p, f[3].decode()))
         elif f[1] == b"120000" and not p.startswith(LINKS_OK):
             # Opus delta read of #1301 at b57c0deb: "refuse EVERY added or changed mode-120000 entry anywhere in the
             # repo except under config/system/, whatever its target" — a target read lexically escapes through
             # another link (docs/up -> .., then dashboard/server.py -> ../docs/up/../../tmp/evil.py), and main's
             # overlay's dashboard launcher runs dashboard/server.py
+            hits.add(p)
+        elif f[1] == b"100755":
+            # perms, after #1301: "a NUL-bearing executable outside core/ and bin-private/ still lands" — such as
+            # dashboard/server.py, which bin-private/box-dash links to
+            read.append((p, f[3].decode()))
+    data = peek([sha for _, sha in read])
+    if data is None:
+        return None
+    hits.update(p for p, sha in read if not_source(p, data.get(sha)))
+    return sorted(hits)
+
+
+def tree_binaries(root, rev, pres=BINARY_ROOTS, run=None, peek=None):
+    """What binaries() would refuse in the whole tree at `rev`, as if every path were new, less the symlinks it
+    already holds: a compiled name anywhere; under `pres`, a binary blob or a gitlink; an executable binary blob
+    anywhere; and a symlink, anywhere but LINKS_OK, whose target names a compiled path or resolves (lexically, through
+    the tree's other links) to a path this list names, or out of the repo from under `pres`. The brief: "a compiled
+    file (.so, .pyc, __pycache__, a symlink into one) that reaches main another way is never caught". None when git
+    cannot list or read the tree."""
+    pres = (pres,) if isinstance(pres, str) else tuple(pres)
+    run = run or git_bytes(root)
+    peek = peek or git_peek(["git", "-C", root])
+    rc, out = run("ls-tree", "-r", "-z", "--full-tree", rev)
+    if rc != 0:
+        return None
+    ents = {}
+    for rec in out.split(b"\0"):
+        if not rec:
+            continue
+        meta, _, raw = rec.partition(b"\t")
+        f = meta.split()
+        if len(f) != 3 or not raw:
+            return None
+        ents[raw.decode(errors="surrogateescape")] = (f[0], f[2].decode())
+
+    def under(p):
+        return "" in pres or p.startswith(pres) or p in {r.rstrip("/") for r in pres}
+
+    hits, read, links = set(), [], {}
+    for p, (mode, sha) in ents.items():
+        if not_source(p, b""):
+            hits.add(p)
+        elif mode == b"120000":
+            links[p] = sha
+        elif mode == b"160000":
+            if under(p):
+                hits.add(p)
+        elif under(p) or mode == b"100755":
+            read.append((p, sha))
+    data = peek([sha for _, sha in read] + list(links.values()))
+    if data is None:
+        return None
+    hits.update(p for p, sha in read if not_source(p, data.get(sha)))
+
+    def land(p, depth=0):
+        """Where link p points in the tree, through other links; '..' when it leaves the repo, None past 40 hops."""
+        target = (data.get(links[p]) or b"").decode(errors="surrogateescape")
+        if depth > 40 or not target or target.startswith("/"):
+            return None if depth > 40 else ".."
+        parts = []
+        for seg in (os.path.dirname(p) + "/" + target).split("/"):
+            if seg in ("", "."):
+                continue
+            if seg == "..":
+                if not parts:
+                    return ".."
+                parts.pop()
+                continue
+            parts.append(seg)
+            sofar = "/".join(parts)
+            if sofar in links and sofar != p:
+                hop = land(sofar, depth + 1)
+                if hop in (None, ".."):
+                    return hop
+                parts = hop.split("/") if hop else []
+        return "/".join(parts)
+
+    for p in links:
+        if p.startswith(LINKS_OK):
+            continue
+        to = land(p)
+        target = (data.get(links[p]) or b"").decode(errors="surrogateescape")
+        if (not_source(target, b"") or to is None or (to == ".." and under(p)) or to in hits
+                or any(h.startswith(to + "/") for h in hits)):
             hits.add(p)
     return sorted(hits)
 
@@ -1650,7 +1825,8 @@ def cmd_check(args, opts):
         return die(f"check: cannot list what PR #{pr} adds under core/ and bin-private/", 3), None
     if bins:
         return die(f"check: PR #{pr} is refused: it tracks {len(bins)} file(s) that are not source (__pycache__, "
-                   f".pyc, .pyo, .so or .pyd anywhere; a binary under core/ or bin-private/; a symlink anywhere but "
+                   f".pyc, .pyo, .so or .pyd anywhere; a binary under core/ or bin-private/; an executable binary "
+                   f"anywhere; a symlink anywhere but "
                    f"config/system/) — "
                    f"{', '.join(bins[:8])}. The lander "
                    "imports from core/, so a compiled file there could run in place of the code that was read."), None
@@ -1862,6 +2038,31 @@ def selfcheck():
             finally:
                 globals()["sweep_under"] = real_sweep
             cur_nov = link_target("current")
+            # --no-prove (owner, 10-13): no proof is started, the rest of promote still stands
+            real_proven, proofs = proven, []
+            globals()["proven"] = lambda *a, **_: (proofs.append(a), ("a proof would refuse", False))[1]  # noqa: E731
+            np = {**o, "no-prove": True}
+            try:
+                globals()["perms_caller"] = lambda root: False
+                r_np_notperms = cmd_promote([a], np)
+                cur_np_notperms = link_target("current")
+                globals()["perms_caller"] = lambda root: True
+                r_np_red = cmd_promote([red], np)
+                cur_np_red = link_target("current")
+                r_np_proved = cmd_promote([a], o)       # without the flag the (stubbed, refusing) proof still runs
+                proofs_without = len(proofs)
+                del proofs[:]
+                sys.stdout = said = io.StringIO()
+                try:
+                    r_np = cmd_promote([a], np)
+                finally:
+                    sys.stdout = quiet
+                cur_np, prev_np = link_target("current"), link_target("previous")
+                r_np_prove = cmd_prove([a], np)
+            finally:
+                globals()["proven"] = real_proven
+            r_np_rb = cmd_rollback([], {})            # back to b current, a previous, for the cases below
+            cur_np_rb = link_target("current")
             r_side = cmd_promote([side], o)
             cur_side = link_target("current")
             r_pin_side = cmd_pin([], o)
@@ -1946,6 +2147,18 @@ def selfcheck():
              r_regress == 1 and cur_regress == cur_b)
         case("promote whose proof gives no verdict exits 3 (could not run), not 1, and keeps current",
              r_nov == 3 and cur_nov == cur_b)
+        case("promote --no-prove from a seat that is not perms is refused and moves nothing",
+             r_np_notperms == 1 and cur_np_notperms == cur_b)
+        case("promote --no-prove still refuses a release whose own selfcheck is red",
+             r_np_red != 0 and cur_np_red == cur_b)
+        case("promote without --no-prove still runs the proof, and its refusal keeps current",
+             r_np_proved == 1 and proofs_without == 1)
+        case("promote --no-prove switches without starting a proof, keeps previous and says it skipped",
+             r_np == 0 and proofs == [] and cur_np.endswith(a) and prev_np == cur_b and
+             "proof skipped (--no-prove) on the owner's 2026-10-13 17:33Z direction" in said.getvalue())
+        case("rollback after a --no-prove promote puts the one before back", r_np_rb == 0 and cur_np_rb == cur_b)
+        case("prove refuses --no-prove (promote's alone)", r_np_prove == 2)
+        case("--no-prove: parse() takes it", parse(["promote", "--no-prove"])[1].get("no-prove") is True)
         case("a commit not on origin/main is refused", r_side != 0 and cur_side == cur_b)
         case("origin/main resolves to origin's, not to a local branch named origin/main",
              resolve(repo, "origin/main") == red and resolve(repo, "") == red)
@@ -2016,6 +2229,7 @@ def selfcheck():
     identity_gate_cases(case)
     pycache_cases(case)
     check_binaries_cases(case)
+    sweep_cases(case)
     HOME, ROOT, LAND_STATE = old
     bad = sum(1 for _, ok in results if not ok)
     print(f"lander-self selfcheck: {len(results) - bad} passed, {bad} failed")
@@ -2167,6 +2381,125 @@ def check_binaries_cases(case):
     case("…and a NUL-bearing file under bin-private/", said["9"][0] == 1 and "bin-private/door" in said["9"][1])
     case("…while the same PR with a .py passes that step and stops at the reads",
          said["8"][0] == 1 and "not source" not in said["8"][1] and "needs" in said["8"][1])
+
+
+def sweep_cases(case):
+    """Perms' three gaps after #1301, and `sweep`. Each block builds its own repo: (a) a symlink under mcp/ (or
+    dashboard/, lessons/, vr/) is named, one under config/system/ is not; (b) an executable with a NUL outside the
+    roots is named, the same bytes not executable and an executable script are not; (c) git_peek keeps PEEK bytes of
+    a large blob, so a NUL past them is not seen; and tree_binaries()/`sweep` on a whole tree."""
+    import contextlib
+    import io
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def fixture(t):
+        repo = os.path.join(t, "repo")
+        subprocess.run(["git", "init", "-q", repo], check=True, env=env, capture_output=True)
+
+        def put(rel, data, mode=0o644, link=None):
+            p = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            if link is not None:
+                os.symlink(link, p)
+                return
+            with open(p, "wb") as f:
+                f.write(data if isinstance(data, bytes) else data.encode())
+            os.chmod(p, mode)
+
+        def commit(msg):
+            subprocess.run(["git", "-C", repo, "add", "-Af", "."], check=True, env=env, capture_output=True)
+            subprocess.run(["git", "-C", repo, "commit", "-q", "--allow-empty", "-m", msg], check=True, env=env,
+                           capture_output=True)
+            return git(repo, "rev-parse", "HEAD")[1].strip()
+        return repo, put, commit
+
+    with tempfile.TemporaryDirectory() as t:
+        repo, put, commit = fixture(t)
+        put("core/lander/cli.py", "")
+        base = commit("base")
+        for d in ("mcp", "dashboard", "lessons", "vr"):
+            put(f"{d}/run", None, link="../docs/x")
+        put("config/system/etc/unit.service", None, link="/dev/null")
+        head = commit("links")
+        got = binaries(repo, base, head)
+        # perms, after #1301: "(a) symlinks under mcp/, dashboard/, lessons/ and vr/ are still allowed"
+        case("binaries() names a new symlink under mcp/, dashboard/, lessons/ and vr/",
+             got == ["dashboard/run", "lessons/run", "mcp/run", "vr/run"])
+        case("…and not one under config/system/", "config/system/etc/unit.service" not in (got or []))
+    with tempfile.TemporaryDirectory() as t:
+        repo, put, commit = fixture(t)
+        put("core/lander/cli.py", "")
+        base = commit("base")
+        put("dashboard/server.py", b"\x7fELF\0\0", mode=0o755)
+        put("dashboard/data.bin", b"\0data")
+        put("dashboard/start", "#!/bin/sh\nexec true\n", mode=0o755)
+        head = commit("exec")
+        got = binaries(repo, base, head)
+        # perms, after #1301: "(b) a NUL-bearing executable outside core/ and bin-private/ still lands"
+        case("binaries() names a NUL-bearing executable outside core/ and bin-private/",
+             "dashboard/server.py" in (got or []))
+        case("…but not the same kind of bytes without the x bit, nor an executable script",
+             got == ["dashboard/server.py"])
+    with tempfile.TemporaryDirectory() as t:
+        repo, put, commit = fixture(t)
+        put("core/lander/cli.py", "")
+        base = commit("base")
+        put("core/big.txt", b"a" * (PEEK + 5) + b"\0")
+        put("core/small.txt", b"x\0")
+        head = commit("big")
+        shas = [git(repo, "rev-parse", f"{head}:core/{n}")[1].strip() for n in ("big.txt", "small.txt")]
+        got = git_peek(["git", "-C", repo])(shas + ["0" * 40])
+        # perms, after #1301: "(c) binaries() reads each blob whole"
+        case("git_peek keeps PEEK bytes of a large blob, reads several in one go, and a missing one is None",
+             got is not None and got[shas[0]] == b"a" * PEEK and got[shas[1]] == b"x\0" and got["0" * 40] is None)
+        case("…so binaries() does not see a NUL past PEEK, and does see one inside it",
+             binaries(repo, base, head) == ["core/small.txt"])
+    with tempfile.TemporaryDirectory() as t:
+        repo, put, commit = fixture(t)
+        put("core/lander/cli.py", "")
+        put("core/bin/cc-mail", None, link="../mail/receiver.py")
+        put("core/mail/receiver.py", "print(1)\n", mode=0o755)
+        put("dashboard/ok.py", "print(1)\n", mode=0o755)
+        put("bin-private/box-ok", None, link="../dashboard/ok.py")
+        put("docs/away", None, link="../../elsewhere")
+        put("config/system/etc/x.service", None, link="/usr/lib/x.service")
+        clean = commit("clean")
+        e = io.StringIO()
+        with contextlib.redirect_stdout(e):
+            rc_clean = cmd_sweep([clean], {"repo": repo})
+        case("sweep passes a tree whose only links point at source, or out of the repo from outside the roots",
+             tree_binaries(repo, clean) == [] and rc_clean == 0 and "tracks no compiled" in e.getvalue())
+        put("core/lander/__pycache__/run.cpython-314.pyc", b"\0pyc")
+        put("bin-private/door.so", "x")
+        put("dashboard/server.py", b"\x7fELF\0", mode=0o755)
+        put("bin-private/box-dash", None, link="../dashboard/server.py")
+        put("docs/cache", None, link="../core/lander/__pycache__")
+        put("docs/up", None, link="..")
+        put("docs/via", None, link="up/dashboard/server.py")
+        put("core/out", None, link="../../etc/passwd")
+        put("docs/loop1", None, link="loop2")
+        put("docs/loop2", None, link="loop1")
+        dirty = commit("dirty")
+        e = io.StringIO()
+        with contextlib.redirect_stdout(e):
+            rc_dirty = cmd_sweep([dirty], {"repo": repo})
+        got = tree_binaries(repo, dirty)
+        # the brief: "a compiled file (.so, .pyc, __pycache__, a symlink into one) that reaches main another way"
+        case("sweep names a compiled file, an executable binary, and each symlink into one, through another link",
+             got == sorted(["core/lander/__pycache__/run.cpython-314.pyc", "bin-private/door.so",
+                            "dashboard/server.py", "bin-private/box-dash", "docs/cache", "docs/via", "core/out",
+                            "docs/loop1", "docs/loop2"]))
+        case("…and exits 2 with the summary last, for cc-watch's BAD",
+             rc_dirty == 2 and e.getvalue().splitlines()[-1].startswith("lander-self sweep: ") and
+             "9 path(s)" in e.getvalue())
+        _err, sys.stderr = sys.stderr, open(os.devnull, "w")
+        try:
+            rc_bad = cmd_sweep(["no-such-rev"], {"repo": repo})
+        finally:
+            sys.stderr.close()
+            sys.stderr = _err
+        case("…while a REV it cannot resolve is 3, not a pass", rc_bad == 3)
 
 
 def hold_cases(case):
@@ -2765,6 +3098,8 @@ def parse(argv):
             opts[a[2:]] = next(it, "")
         elif a == "--legacy":
             opts["legacy"] = True
+        elif a == "--no-prove":
+            opts["no-prove"] = True
         else:
             args.append(a)
     return args, opts
@@ -2855,7 +3190,7 @@ def main(argv):
         os.execv(sys.executable, [sys.executable, "-P", p, *argv])
     args, opts = parse(argv[1:])
     table = {"pin": cmd_pin, "promote": cmd_promote, "prove": cmd_prove, "rollback": cmd_rollback, "legacy": cmd_legacy,
-             "status": cmd_status, "reads": cmd_reads, "land": cmd_land, "shadow": cmd_shadow,
+             "status": cmd_status, "reads": cmd_reads, "sweep": cmd_sweep, "land": cmd_land, "shadow": cmd_shadow,
              "check": lambda a, o: cmd_check(a, o)[0]}
     if cmd not in table:
         return die(f"no command {cmd!r} (lander-self --help)", 2)

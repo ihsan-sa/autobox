@@ -1,0 +1,1342 @@
+#!/usr/bin/env python3
+"""cc-rotation — the box's parts reviewed in turn: an evidence pack for each, a model's verdict on it, and rows for what it found.
+
+    cc-rotation auto [--no-llm]        what the daily timer runs (cc-rotation.timer). Once a day at most: a second run
+                                       on the same day does nothing. While the FIRST SWEEP is open it reviews the next
+                                       batch of parts nobody has reviewed yet (at most ROTATION_BATCH, default 8,
+                                       stalest first), until every part has had one read; the sweep as a whole stops at
+                                       ROTATION_SWEEP_CAP dollars (default 100) and says so. After the sweep it runs
+                                       once every 7 days: it builds the pack for EVERY part (no model) and reads only the
+                                       parts whose pack changed in a way that matters, plus the one reviewed longest ago,
+                                       within ROTATION_WEEK_CAP dollars (default 15) a run.
+    cc-rotation review <part> [--no-llm]   one part now, by hand, whatever the schedule says.
+    cc-rotation pack <part>            print the part's evidence pack. No model call, nothing written.
+    cc-rotation list                   every part, its kind and when it was last reviewed.
+    cc-rotation archive <date> <part>… carry out the archive proposals of that date's ask for these parts. The perms
+                                       session runs it, and only for the parts it approved; each step is logged with the
+                                       command that brings it back (rotation/archive.log). It runs the plan rebuilt
+                                       from the live part, and refuses a part whose stored proposal differs from it.
+    cc-rotation selfcheck
+
+THE PARTS. Code: core's tools grouped by job (JOBS below; a tool the table does not name is a part of its own), any
+other bin dir's tools grouped by name family (a family named like a top-level directory, the overlay's dash tool
+beside dashboard/, joins that directory's part), every top-level directory of the repo and core's own (lander, mail,
+slack, web, templates…), each skill, and each user unit whose ExecStart is not one of those tools (a unit that runs a
+tool is reviewed with that tool, and its journal is that tool's "last ran"). Live: the tmux sessions of the box
+(each orch on its own; each project's seat together with that project's Slack channels), the agent types in ~/.claude/agents, the live
+skills in ~/.claude/skills, and the board rows idle for 14 days or more as one part. A member's workspace, channels
+and session are LISTED as theirs and never reviewed or archived from here.
+
+THE PACK, no model: the part's files, its last commit and how many commits touched it in 90 days, the last time it
+ran or was used (unit journal, its state files, Slack posts, tmux activity), its callers and callees in
+core/tests/reach.tsv, open board rows and cc-failures records naming it, the docs that mention it, and the names it
+calls that no tool, unit or directory carries any more. Every list is sorted and every age is counted from the run's
+date, so the same box on the same day gives the same pack.
+
+THE READ: one headless `claude -p` with no tools, the pack plus the part's code in the prompt, capped at
+ROTATION_READ_CAP dollars (default 3) on ROTATION_MODEL (default claude-opus-5-5). It answers keep, refresh, merge or
+retire with findings, each with evidence. The reviewer never edits or deletes anything. Each actionable finding
+becomes one board row raised-stale-<part>-<short> on ROTATION_REPO with its evidence in the brief (no repo set: no
+rows, and the report says so). A retire is a row for the planning seat too; for a LIVE part it is also an ARCHIVE
+proposal, one line saying what is archived and how it comes back, and a run's proposals go to the perms session as
+ONE ask (cc-msg to ROTATION_PERMS_WINDOW, default perms). Nothing is archived unless perms runs `archive` for it.
+
+WHAT IT WRITES: ROTATION_HOME/rotation.json (last-reviewed per part, the sweep's tally, the packs' signatures) and
+ROTATION_HOME/rotation/<date>-<part>.md per review (ROTATION_HOME default ~/.cc/state/rotation), and one plain line
+per run into ROTATION_CHANNEL (no channel set: no post). Keys come from cc-config, the environment first.
+ROTATION_ROOT is the repo to inventory (default the checkout this file lives in).
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SELF = os.path.realpath(__file__)
+CORE = os.path.dirname(os.path.dirname(SELF))
+BIN = os.path.dirname(SELF)
+HOME = os.path.expanduser("~")
+
+# Core's own tools by the job they do. A tool missing here is still reviewed, as a part of its own.
+JOBS = {
+    "sessions": "cc cc-loop cc-room cc-name cc-rename cc-started cc-native tmux-helper cc-statusline cc-msg cc-live",
+    "session-upkeep": "cc-handoff cc-context cc-checkpoint cc-pause cc-stall cc-wakes cc-heartbeat cc-boot cc-boot-notify",
+    "model-and-spend": "cc-model cc-limit cc-tier cc-spend cc-vitals",
+    "landing": "lander lander-self cc-land cc-green cc-suites cc-bundle cc-publish cc-bin-at",
+    "board-and-planning": "cc-board cc-brief cc-reconcile cc-task cc-scope cc-digest cc-approve",
+    "improvement": "cc-improve cc-improve-batch cc-collect cc-evals cc-replay cc-replay-moments cc-audit cc-failures",
+    "guard-and-perms": "cc-guard cc-fence cc-sandbox cc-trust cc-settings cc-refusals cc-github-deny "
+                       "git-remote-cc-github-deny cc-gh-token gh cc-subagent-bound",
+    "messaging": "cc-slack cc-notify cc-mail cc-broker cc-voice",
+    "members": "cc-member-broker cc-member-import cc-member-v2 ccbox",
+    "knowledge": "cc-lib cc-ask cc-docs cc-unfiled cc-skills cc-graphs",
+    "box-basics": "cc-config cc-time cc-tmp-reap cc-rc cc-units box-status cc-rotation",
+}
+TOP_SKIP = {"core", "docs", "tests", "config", "bin-private", "node_modules"}
+VERDICTS = ("keep", "refresh", "merge", "retire")
+ARCHIVABLE = {"orch", "project", "agent", "skill", "unit"}
+OPEN = {"queued", "running", "review", "blocked", "waiting"}
+IDLE_DAYS = 14
+
+
+def cfg(key, default=""):
+    """A key: the environment wins (set, even empty), else cc-config, else the default."""
+    if key in os.environ:
+        return os.environ[key]
+    try:
+        r = subprocess.run([os.environ.get("CC_CONFIG_BIN", os.path.join(BIN, "cc-config")), "get", key, default],
+                           capture_output=True, text=True, timeout=20)
+        return r.stdout.strip() if r.returncode == 0 else default
+    except (OSError, subprocess.TimeoutExpired):
+        return default
+
+
+TOOLS = {"board": os.path.join(BIN, "cc-board"), "slack": os.path.join(BIN, "cc-slack"), "msg": os.path.join(BIN, "cc-msg")}
+
+
+def tool(name):   # CC_BOARD, CC_SLACK, CC_MSG point at another binary (the selfcheck's fakes)
+    return os.environ.get("CC_" + name.upper(), TOOLS[name])
+
+
+def sh(cmd, timeout=60, **kw):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+
+
+def today():
+    return datetime.date.fromisoformat(os.environ["ROTATION_TODAY"]) if os.environ.get("ROTATION_TODAY") else datetime.date.today()
+
+
+def days_since(stamp, t):
+    try:
+        return (t - datetime.date.fromisoformat(stamp[:10])).days
+    except (TypeError, ValueError):
+        return None
+
+
+def slug(s, n=40):
+    """kebab-case, at most n characters, cut at a word boundary when a word would be split."""
+    full = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", s.lower())).strip("-")
+    if len(full) <= n:
+        return full
+    cut = full[:n + 1]
+    return (cut[:cut.rfind("-")] if "-" in cut else full[:n]).strip("-")
+
+
+def root():
+    r = cfg("ROTATION_ROOT")
+    if r:
+        return r
+    rc, out = sh(["git", "-C", CORE, "rev-parse", "--show-toplevel"])
+    return out.strip() if rc == 0 and out.strip() else CORE
+
+
+def rhome():
+    return os.path.expanduser(cfg("ROTATION_HOME", os.path.join(HOME, ".cc/state/rotation")))
+
+
+# ---------------------------------------------------------------- live state: read once a run, from the box or a fixture
+def load_live(t):
+    """Everything the box says about itself that is not a file in the repo. ROTATION_LIVE names a JSON fixture instead."""
+    if os.environ.get("ROTATION_LIVE"):
+        return json.load(open(os.environ["ROTATION_LIVE"]))
+    live = {"windows": {}, "members": [], "channels": [], "timers": {}, "agents": [], "skills": [], "board": {},
+            "failures": []}
+    rc, out = sh(["tmux", "list-windows", "-t", "main", "-F", "#{window_name}\t#{window_activity}"])
+    for line in out.splitlines():
+        name, _, act = line.partition("\t")
+        if act.isdigit():
+            live["windows"][name] = datetime.datetime.fromtimestamp(int(act), datetime.timezone.utc).strftime("%Y-%m-%d")
+    live["members"], known = discover_members()
+    if not known:
+        live["members_unknown"] = True
+    live["channels"] = slack_channels()
+    for f in sorted(glob.glob(os.path.join(HOME, ".config/systemd/user/*.timer"))):
+        stem = os.path.basename(f)[:-6]
+        if "@" in stem and stem.endswith("@"):
+            continue
+        live["timers"][stem] = {"files": [f, f[:-6] + ".service"], "last_ran": unit_last(stem)}
+    live["agents"] = sorted(glob.glob(os.path.join(HOME, ".claude/agents/*.md")))
+    live["skills"] = sorted(d for d in glob.glob(os.path.join(HOME, ".claude/skills/*")) if os.path.isdir(d))
+    repo = cfg("ROTATION_REPO")
+    if repo:
+        rc, out = sh([tool("board"), "json", repo])
+        try:
+            live["board"] = json.loads(out).get("tracks", {}) if rc == 0 else {}
+        except ValueError:
+            pass
+    for f in sorted(glob.glob(os.path.join(HOME, ".cc/failures/*.jsonl"))):
+        for line in open(f, errors="replace"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            live["failures"].append({"id": r.get("id", ""), "ts": r.get("ts", ""), "kind": r.get("kind", ""),
+                                     "text": " ".join(str(r.get(k, "")) for k in ("observed", "expected", "kind"))})
+    return live
+
+
+def slack_dir():
+    return os.environ.get("CC_SLACK_DIR", os.path.join(HOME, ".cc/slack"))
+
+
+def discover_members(sdir=None, dev=None):
+    """(member handles, True): every handle in cc-slack's members.json plus every ~/dev/<h> holding the
+    .cc/member-workspace marker (the marker is the truth, so a hand-made workspace with no members.json entry counts).
+    A missing members.json in cc-slack's dir is no members from it. FAILS CLOSED, ([], False), when the file exists
+    but cannot be read or parsed, or the dir itself is missing (a sandbox that hides it would read as no members): an unknown member list makes every session and channel of unknown ownership, held from reviews and
+    archive asks. Reads the files, never `cc-slack members` text, which prints a prose line and exits 0 on a bad file."""
+    f = os.path.join(sdir or slack_dir(), "members.json")
+    if not os.path.isdir(os.path.dirname(f)):
+        return [], False
+    names = set()
+    if os.path.lexists(f):
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            return [], False
+        if not isinstance(d, dict):
+            return [], False
+        names |= set(d)
+    names |= {os.path.basename(os.path.dirname(os.path.dirname(m)))
+              for m in glob.glob(os.path.join(dev or os.path.join(HOME, "dev"), "*", ".cc", "member-workspace"))
+              if os.path.isfile(m)}
+    return sorted(names), True
+
+
+def unit_last(stem):
+    for suffix in (".service", ".timer"):
+        rc, out = sh(["journalctl", "--user", "-u", stem + suffix, "-n", "1", "-o", "short-iso", "--no-pager", "-q"])
+        if out.strip():
+            return out.split()[0][:10]
+    return None
+
+
+def slack_api(method, **params):
+    tok = cfg("SLACK_BOT_TOKEN")
+    if not tok:
+        return {}
+    req = urllib.request.Request("https://slack.com/api/%s?%s" % (method, urllib.parse.urlencode(params)),
+                                 headers={"Authorization": "Bearer " + tok})
+    for _ in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                return {}
+            import time
+            time.sleep(int(e.headers.get("Retry-After", "5")))
+        except (OSError, ValueError):
+            return {}
+    return {}
+
+
+def slack_channels():
+    """The channels the bot is in, with the date of the last human and the last box post in each."""
+    chans, cursor = [], ""
+    while True:
+        d = slack_api("users.conversations", types="public_channel,private_channel", exclude_archived="true",
+                      limit=200, cursor=cursor)
+        for c in d.get("channels", []):
+            chans.append({"id": c["id"], "name": c["name"]})
+        cursor = (d.get("response_metadata") or {}).get("next_cursor", "")
+        if not cursor:
+            break
+    for c in chans:
+        h = slack_api("conversations.history", channel=c["id"], limit=100)
+        human = box = None
+        for m in h.get("messages", []):
+            day = datetime.datetime.fromtimestamp(float(m["ts"]), datetime.timezone.utc).strftime("%Y-%m-%d")
+            if m.get("bot_id") or m.get("subtype") == "bot_message":
+                box = box or day
+            elif not m.get("subtype"):
+                human = human or day
+        c["last_human"], c["last_box"] = human, box
+    return sorted(chans, key=lambda c: c["name"])
+
+
+# ---------------------------------------------------------------- inventory
+def is_tool(p):
+    return os.path.isfile(p) and os.access(p, os.X_OK) and not os.path.basename(p).startswith(".")
+
+
+def family(names):
+    """name -> family, for a bin dir with no job table: the dir's common first segment dropped, the next one kept."""
+    firsts = [n.split("-")[0] for n in names if "-" in n]
+    common = max(set(firsts), key=firsts.count) if firsts else ""
+    out = {}
+    for n in names:
+        rest = n[len(common) + 1:] if common and n.startswith(common + "-") and firsts.count(common) * 2 >= len(names) else n
+        out[n] = rest.split("-")[0] or n
+    return out
+
+
+def unit_exec(path):
+    try:
+        m = re.search(r"^ExecStart=\S*?/bin/([A-Za-z0-9_.-]+)", open(path, errors="replace").read(), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def inventory(r, live):
+    """part id -> {kind, files (abs), names (words that name it), owner?, ...}. Sorted, deterministic."""
+    parts, tool_part = {}, {}
+    core = os.path.join(r, "core") if os.path.isdir(os.path.join(r, "core")) else r
+    cbin = os.path.join(core, "bin")
+    listed = {t: job for job, ts in JOBS.items() for t in ts.split()}
+    for p in sorted(glob.glob(os.path.join(cbin, "*"))):
+        if is_tool(p):
+            n = os.path.basename(p)
+            pid = listed.get(n, "tool-" + n)
+            parts.setdefault(pid, {"kind": "tools", "files": [], "names": []})
+            parts[pid]["files"].append(p); parts[pid]["names"].append(n); tool_part[n] = pid
+    for d in sorted(glob.glob(os.path.join(r, "*bin*"))):
+        if not os.path.isdir(d) or os.path.realpath(d) == os.path.realpath(cbin):
+            continue
+        tools = sorted(os.path.basename(p) for p in glob.glob(os.path.join(d, "*")) if is_tool(p))
+        for n, fam in sorted(family(tools).items()):
+            pid = "bin-" + slug(fam)
+            parts.setdefault(pid, {"kind": "tools", "files": [], "names": []})
+            parts[pid]["files"].append(os.path.join(d, n)); parts[pid]["names"].append(n); tool_part[n] = pid
+    for base, pre in ((r, ""), (core, "core-")):
+        if base == core and core == r:
+            pre = ""
+        for d in sorted(glob.glob(os.path.join(base, "*"))):
+            n = os.path.basename(d)
+            if not os.path.isdir(d) or n.startswith(".") or n in TOP_SKIP or "bin" in n or (base == r and pre == "" and d == core):
+                continue
+            if n == "skills" and base == core:
+                for s in sorted(glob.glob(os.path.join(d, "*"))):
+                    if os.path.isdir(s):
+                        parts["skill-" + slug(os.path.basename(s))] = {"kind": "skill", "files": [s], "names": [os.path.basename(s)]}
+                continue
+            parts[pre + slug(n)] = {"kind": "dir", "files": [d], "names": [n]}
+    for pid in [i for i in parts if i.startswith("bin-")]:   # an overlay tool named for a top-level dir is that dir's server: one part
+        home = sorted((i for i, q in parts.items() if q["kind"] == "dir" and q["files"][0] == os.path.join(r, q["names"][0])
+                       and q["names"][0].startswith(pid[4:])), key=len)
+        if home:
+            q = parts.pop(pid)
+            parts[home[0]]["files"] += q["files"]; parts[home[0]]["names"] += q["names"]
+            tool_part.update({n: home[0] for n in q["names"]})
+    units = {}
+    for d in (os.path.join(core, "config/systemd-user"), os.path.join(r, "config/systemd-user")):
+        for f in sorted(glob.glob(os.path.join(d, "*.service")) + glob.glob(os.path.join(d, "*.timer"))):
+            units.setdefault(os.path.basename(f).rsplit(".", 1)[0], []).append(f)
+    for stem, t in sorted((live.get("timers") or {}).items()):
+        units.setdefault(stem, [f for f in t.get("files", []) if os.path.exists(f)])
+    for stem, files in sorted(units.items()):
+        ex = next((unit_exec(f) for f in files if f.endswith(".service") and unit_exec(f)), None)
+        if ex in tool_part:
+            parts[tool_part[ex]]["files"].extend(files)
+            parts[tool_part[ex]].setdefault("units", []).append(stem)
+        else:
+            parts["unit-" + slug(stem)] = {"kind": "unit", "files": files, "names": [stem], "units": [stem],
+                                           "timer": any(f.endswith(".timer") for f in files) or stem in (live.get("timers") or {})}
+    members = set(live.get("members") or [])
+    unknown = bool(live.get("members_unknown"))   # discovery failed: any session or channel might be a member's
+    projects = {}   # a project's seat and its channels are one part: the seat's window and #<p>, #<p>-updates, #<p>--<x>…
+    for w, act in sorted((live.get("windows") or {}).items()):
+        if "/" in w or w.startswith("_"):
+            continue
+        if "@" in w:
+            p = {"kind": "orch", "files": [], "names": [w], "window": w, "last_used": act}
+            if w.split("@")[0] in members:
+                p["owner"] = w.split("@")[0]
+            elif unknown:
+                p["owner_unknown"] = True
+            parts["orch-" + slug(w.replace("@", "-"))] = p
+        else:
+            projects.setdefault(w, {"kind": "project", "files": [], "names": [w], "window": w, "last_used": act, "channels": []})
+    for c in live.get("channels") or []:
+        base = re.sub(r"-updates$|-threads$", "", c["name"].split("--")[0])
+        projects.setdefault(base, {"kind": "project", "files": [], "names": [], "channels": []})["channels"].append(c)
+    for base, p in sorted(projects.items()):
+        p["names"] = sorted(set(p["names"]) | {c["name"] for c in p["channels"]})
+        if base in members:
+            p["owner"] = base
+        elif unknown:
+            p["owner_unknown"] = True
+        parts["project-" + slug(base)] = p
+    for a in live.get("agents") or []:
+        n = os.path.basename(a)[:-3]
+        parts["agent-" + slug(n)] = {"kind": "agent", "files": [a], "names": [n], "live": a}
+    for s in live.get("skills") or []:
+        pid = "skill-" + slug(os.path.basename(s))
+        if pid in parts:
+            parts[pid]["live"] = s
+        else:
+            parts[pid] = {"kind": "skill", "files": [s], "names": [os.path.basename(s)], "live": s}
+    parts["board-idle-rows"] = {"kind": "rows", "files": [], "names": []}
+    return dict(sorted(parts.items()))
+
+
+# ---------------------------------------------------------------- evidence
+def part_files(p, limit=400):
+    out = []
+    for f in p["files"]:
+        if os.path.isdir(f):
+            for dp, dn, fn in os.walk(f):
+                dn[:] = sorted(x for x in dn if not x.startswith(".") and x not in ("node_modules", "__pycache__", "dist"))
+                out.extend(os.path.join(dp, x) for x in sorted(fn))
+        elif os.path.isfile(f):
+            out.append(f)
+    return out[:limit]
+
+
+def mentions(word, text):
+    return re.search(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(word), text) is not None
+
+
+def reach(r):
+    f = os.path.join(r, "core/tests/reach.tsv") if os.path.isdir(os.path.join(r, "core")) else os.path.join(r, "tests/reach.tsv")
+    try:
+        return sorted(tuple(l.rstrip("\n").split("\t")[:2]) for l in open(f) if "\t" in l and not l.startswith("#"))
+    except OSError:
+        return []
+
+
+def build_pack(pid, p, ctx):
+    """The evidence pack: a dict of sorted facts, no model call."""
+    t, r, live = ctx["today"], ctx["root"], ctx["live"]
+    words = [w for w in p["names"] if len(w) >= 4]
+    pk = {"part": pid, "kind": p["kind"], "date": t.isoformat()}
+    if p.get("owner"):
+        pk["owner"] = p["owner"]
+    files = part_files(p)
+    inrepo = [f for f in files if f.startswith(r + os.sep)]
+    pk["files"] = sorted(os.path.relpath(f, r) if f in inrepo else f.replace(HOME, "~") for f in files)[:60]
+    pk["file_count"] = len(files)
+    if inrepo:
+        rels = sorted({os.path.relpath(f, r) for f in p["files"] if f.startswith(r + os.sep)})
+        rc, out = sh(["git", "-C", r, "log", "-1", "--format=%cs %s", "--"] + rels)
+        pk["last_commit"] = out.strip() or None
+        since = (t - datetime.timedelta(days=90)).isoformat()
+        rc, out = sh(["git", "-C", r, "log", "--since=" + since, "--until=" + (t + datetime.timedelta(days=1)).isoformat(),
+                      "--format=%h", "--"] + rels)
+        pk["commits_90d"] = len(out.split())
+    # last real use
+    seen = []
+    for u in p.get("units", []):
+        d = (live.get("timers", {}).get(u) or {}).get("last_ran") if ctx["fixture"] else unit_last(u)
+        if d:
+            seen.append((d, "unit " + u))
+    if p.get("last_used"):
+        seen.append((p["last_used"], "tmux activity"))
+    for c in p.get("channels", []):
+        if c.get("last_human"):
+            seen.append((c["last_human"], "human post in #" + c["name"]))
+        if c.get("last_box"):
+            seen.append((c["last_box"], "box post in #" + c["name"]))
+    if p["kind"] == "tools" and not ctx["fixture"]:
+        for w in words:
+            for f in glob.glob(os.path.join(HOME, ".cc/state", w.replace("cc-", "") + "*")):
+                seen.append((datetime.datetime.fromtimestamp(os.path.getmtime(f), datetime.timezone.utc).strftime("%Y-%m-%d"),
+                             "state " + f.replace(HOME, "~")))
+    if p.get("live") and os.path.exists(p["live"]) and not ctx["fixture"]:
+        seen.append((datetime.datetime.fromtimestamp(os.path.getmtime(p["live"]), datetime.timezone.utc).strftime("%Y-%m-%d"),
+                     "live copy changed"))
+    seen.sort(reverse=True)
+    pk["last_used"] = ("%s (%s, %s days ago)" % (seen[0][0], seen[0][1], days_since(seen[0][0], t))) if seen else "not measured"
+    pk["running"] = None if not seen else (days_since(seen[0][0], t) or 0) <= IDLE_DAYS
+    if p.get("channels"):
+        pk["channels"] = ["#%s last human %s, last box %s" % (c["name"], c.get("last_human") or "none in the last 100",
+                                                               c.get("last_box") or "none") for c in p["channels"]]
+    edges = ctx["reach"]
+    mine = set(p["names"])
+    pk["callers"] = sorted({a for a, b in edges if b in mine and a not in mine})
+    pk["callees"] = sorted({b for a, b in edges if a in mine and b not in mine})
+    # board rows and failures naming it
+    board = live.get("board") or {}
+    if p["kind"] == "rows":
+        idle = []
+        for k, v in sorted(board.items()):
+            last = max([n.get("ts", "") for n in v.get("notes") or []] + [v["started"] if isinstance(v.get("started"), str) else ""])
+            age = days_since(last, t)
+            if v.get("status") in OPEN and age is not None and age >= IDLE_DAYS:
+                idle.append("%s [%s] idle %d days: %s" % (k, v.get("status"), age, (v.get("title") or "")[:80]))
+        pk["idle_rows"] = idle
+    rows = sorted(k for k, v in board.items() if v.get("status") in OPEN
+                  and any(mentions(w, k + " " + (v.get("title") or "")) for w in words))
+    pk["open_rows"] = rows
+    fl = sorted((f for f in live.get("failures") or [] if any(mentions(w, f.get("text", "")) for w in words)),
+                key=lambda f: (f.get("ts", ""), f.get("id", "")))
+    pk["failures"] = len(fl)
+    pk["failure_samples"] = ["%s %s %s: %s" % (f.get("ts", "")[:10], f.get("id", ""), f.get("kind", ""), f.get("text", "")[:160])
+                             for f in fl[-3:]]
+    pk["docs"] = sorted(d for d, text in ctx["docs"].items() if any(mentions(w, text) for w in words))[:12]
+    # names it calls that nothing carries any more
+    called = set()
+    for f in files[:200]:
+        try:
+            if os.path.getsize(f) > 400_000:
+                continue
+            txt = open(f, errors="replace").read()
+        except OSError:
+            continue
+        called |= set(re.findall(r"(?<![A-Za-z0-9_./-])(cc-[a-z][a-z0-9-]*[a-z0-9])(?![A-Za-z0-9_.-])", txt))
+        called |= set(re.findall(r"(?:%h|~|\$HOME)/bin/([A-Za-z0-9_-]+)", txt))
+    pk["dangling"] = sorted(n for n in called - ctx["known"] if n not in mine)[:20]
+    return pk
+
+
+SIG_KEYS = ("failures", "open_rows", "callers", "callees", "dangling", "running")
+
+
+def signature(pk):
+    return {k: pk.get(k) for k in SIG_KEYS}
+
+
+def changed(old, new):
+    """Why this pack's change matters, or [] when it does not."""
+    if not old:
+        return ["new part"]
+    why = []
+    if (new.get("failures") or 0) > (old.get("failures") or 0):
+        why.append("new failures")
+    if set(new.get("open_rows") or []) - set(old.get("open_rows") or []):
+        why.append("new rows")
+    if new.get("callers") != old.get("callers") or new.get("callees") != old.get("callees"):
+        why.append("callers or dependencies changed")
+    if set(new.get("dangling") or []) - set(old.get("dangling") or []):
+        why.append("a dependency vanished")
+    if old.get("running") is True and new.get("running") is False:
+        why.append("stopped running")
+    return why
+
+
+def pack_md(pk):
+    out = ["# Evidence pack: %s (%s), %s" % (pk["part"], pk["kind"], pk["date"]), ""]
+    for k, v in pk.items():
+        if k in ("part", "kind", "date"):
+            continue
+        if isinstance(v, list):
+            out.append("- %s: %s" % (k, "none" if not v else ""))
+            out.extend("  - " + str(x) for x in v)
+        else:
+            out.append("- %s: %s" % (k, v))
+    return "\n".join(out) + "\n"
+
+
+def context(r, live, t):
+    known = set(live.get("timers") or {})
+    for d in [os.path.join(HOME, "bin")] + glob.glob(os.path.join(r, "*bin*")) + glob.glob(os.path.join(r, "core/bin")):
+        known |= {os.path.basename(p) for p in glob.glob(os.path.join(d, "*"))}
+    for d in glob.glob(os.path.join(r, "core/config/systemd-user/*")) + glob.glob(os.path.join(r, "config/systemd-user/*")):
+        known.add(os.path.basename(d).rsplit(".", 1)[0])
+    known |= {os.path.basename(p) for p in glob.glob(os.path.join(HOME, ".cc/state/*")) + glob.glob(os.path.join(HOME, ".cc/*"))}
+    docs = {}
+    fixture = bool(os.environ.get("ROTATION_LIVE"))
+    for f in sorted(glob.glob(os.path.join(r, "docs/**/*.md"), recursive=True) + glob.glob(os.path.join(r, "core/docs/**/*.md"), recursive=True)
+                    + ([] if fixture else glob.glob(os.path.join(HOME, "*.md")))):
+        try:
+            docs[os.path.relpath(f, r) if f.startswith(r + os.sep) else f.replace(HOME, "~")] = open(f, errors="replace").read()
+        except OSError:
+            pass
+    return {"root": r, "live": live, "today": t, "reach": reach(r), "known": known, "docs": docs, "fixture": fixture}
+
+
+# ---------------------------------------------------------------- the read
+PROMPT = """You are reviewing one part of a self-running home server (Claude Code sessions, tools, units, Slack
+channels). Judge it critically against how the box works TODAY, from the evidence pack and the code below. You
+cannot edit anything; you only give a verdict.
+
+Answer with ONE JSON object and nothing else:
+{"verdict": "keep|refresh|merge|retire",
+ "summary": "two sentences: what it is for and whether it still earns its place",
+ "findings": [{"short": "kebab-slug, 3-5 words", "title": "what should change, under 60 chars",
+               "evidence": ["a line from the pack, or file:line"], "stale": "what is out of date against the box today",
+               "improve": "what changing it would improve", "actionable": true}],
+ "archive": "only for retire: what to archive and how to bring it back, one line"}
+keep = earns its place as is; refresh = keep but bring it up to date; merge = another part does the same job (name it);
+retire = nothing uses it or it is superseded. Only findings you can back with the evidence; at most 6. Mark
+actionable false for an observation nobody needs to act on.
+
+"""
+
+
+def read_part(pid, pk, p, ctx):
+    """One model read. Returns (verdict dict or None, cost, why-not)."""
+    code, total, cap = [], 0, 90_000
+    for f in sorted(part_files(p), key=lambda f: "check" in os.path.basename(f) or "/test" in f):   # tests last: the code first
+        try:
+            if os.path.getsize(f) > 200_000:
+                code.append("== %s (%d bytes, omitted)" % (f, os.path.getsize(f))); continue
+            txt = open(f, errors="strict").read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if total + len(txt) > cap:
+            code.append("== %s (omitted: the code budget is spent)" % f.replace(HOME, "~")); continue
+        total += len(txt)
+        code.append("== %s\n%s" % (f.replace(HOME, "~"), txt))
+    prompt = PROMPT + pack_md(pk) + "\n# Code\n" + ("\n".join(code) or "(no files: a live part, judged from the pack)")
+    cap_usd = cfg("ROTATION_READ_CAP", "3")
+    if os.environ.get("ROTATION_FAKE_LLM"):
+        raw = open(os.environ["ROTATION_FAKE_LLM"]).read()
+    else:
+        env = dict(os.environ, CC_ROLE="worker")
+        try:
+            raw = subprocess.run([os.environ.get("CLAUDE", "claude"), "-p", "--model", cfg("ROTATION_MODEL", "claude-opus-5-5"),
+                                  "--max-budget-usd", cap_usd, "--max-turns", "2", "--output-format", "json", "--tools", "",
+                                  "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands"],
+                                 input=prompt, capture_output=True, text=True, timeout=1200, env=env, cwd=tempfile.gettempdir()).stdout
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return None, 0.0, "the read did not finish: %s" % e
+    try:
+        j = json.loads(raw)
+    except ValueError:
+        return None, 0.0, "claude printed no JSON"
+    cost = float(j.get("total_cost_usd") or 0)
+    res = j.get("result") or ""
+    if j.get("is_error") or not res:
+        return None, cost, "the read failed: subtype %s" % j.get("subtype")
+    m = re.search(r"\{.*\}", res, re.S)
+    try:
+        v = json.loads(m.group(0)) if m else None
+    except ValueError:
+        v = None
+    if not isinstance(v, dict) or v.get("verdict") not in VERDICTS:
+        return None, cost, "the answer had no verdict"
+    return v, cost, ""
+
+
+# ---------------------------------------------------------------- after the read: report, rows, proposals
+def orch_channel(repo, alias):
+    """The orch's own channel id from cc-slack's orchs.json ({chat: {target, alias, ...}}), or None."""
+    try:
+        d = json.load(open(os.path.join(slack_dir(), "orchs.json")))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    return next((c for c, e in sorted(d.items()) if isinstance(e, dict) and e.get("target") == repo and e.get("alias") == alias), None)
+
+
+def archive_plan(pid, p):
+    """What archiving this live part does and what brings it back, as (line, [do], [undo]) — or None."""
+    if p["kind"] not in ARCHIVABLE or p.get("owner") or p.get("owner_unknown"):
+        return None
+    attic = os.path.join(rhome(), "attic")
+    if p["kind"] == "orch":
+        repo, alias = p["window"].split("@", 1)
+        jr, att = os.path.join(HOME, ".cc/state", p["window"]), os.path.join(attic, "orchs", p["window"])
+        keep = [["mv", jr, att]] if os.path.isdir(jr) else []   # its journal goes to the attic, and comes back the same way
+        chat = orch_channel(repo, alias)
+        undo = ([["mv", att, jr]] if keep else []) + ([[tool("slack"), "unarchive", chat]] if chat else []) + [["cc", repo, "--orch", alias]]
+        return ("stop the %s session, archive its channel and move its journal to the attic; bring back with the journal moved home, "
+                "`cc-slack unarchive %s` and `cc %s --orch %s`" % (p["window"], chat or "<its channel>", repo, alias),
+                [[tool("slack"), "archive", "--orch", repo, alias]] + keep + [["tmux", "kill-window", "-t", "main:" + p["window"]]],
+                undo)
+    if p["kind"] == "project" and p["channels"]:   # its seat, if one runs, is the planning seat's to stop: the row says so
+        ids = [c["id"] for c in p["channels"]]
+        return ("archive %s (not deleted); bring back with cc-slack unarchive" % ", ".join("#" + c["name"] for c in p["channels"]),
+                [[tool("slack"), "archive", i] for i in ids], [[tool("slack"), "unarchive", i] for i in ids])
+    if p["kind"] in ("agent", "skill") and p.get("live"):
+        dst = os.path.join(attic, p["kind"] + "s", os.path.basename(p["live"]))
+        return ("move %s to the attic; bring back by moving it home" % p["live"].replace(HOME, "~"),
+                [["mv", p["live"], dst]], [["mv", dst, p["live"]]])
+    if p["kind"] == "unit":
+        u = [s + (".timer" if p.get("timer") else ".service") for s in p["units"]]
+        return ("disable %s; bring back with systemctl --user enable --now" % ", ".join(u),
+                [["systemctl", "--user", "disable", "--now"] + u], [["systemctl", "--user", "enable", "--now"] + u])
+    return None
+
+
+def file_rows(pid, p, v, report, ctx):
+    repo = cfg("ROTATION_REPO")
+    if not repo:
+        return [], "no ROTATION_REPO set: findings stay in this report"
+    board, filed = ctx["live"].get("board") or {}, []
+    items = [f for f in v.get("findings") or [] if f.get("actionable")]
+    if v["verdict"] == "retire":
+        items.append({"short": "retire", "title": "Retire %s?" % pid, "evidence": [v.get("summary", "")],
+                      "stale": v.get("archive") or "", "improve": "one part fewer to run and read"})
+    for f in items:
+        row = ("raised-stale-%s-%s" % (slug(pid, 30), slug(f.get("short") or f.get("title") or "finding", 24)))[:64].strip("-")
+        if row in board or row in filed:
+            continue
+        brief = "\n".join(["From the rotating review of %s on %s (verdict: %s). Report: %s" % (pid, ctx["today"], v["verdict"], report),
+                           "", "What is out of date: " + str(f.get("stale", "")), "What changing it would improve: " + str(f.get("improve", "")),
+                           "", "Evidence:"] + ["- " + str(e) for e in f.get("evidence") or []]
+                          + ([] if f.get("short") != "retire" else ["", "A retire is the planning seat's call; nothing has been removed."]))
+        rc, _ = sh([tool("board"), "add", repo, row, str(f.get("title") or row)[:60], brief])
+        if rc == 0:
+            filed.append(row)
+    return filed, ""
+
+
+def write_report(pid, pk, v, cost, why, rows, note, proposal):
+    d = os.path.join(rhome(), "rotation")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "%s-%s.md" % (pk["date"], pid))
+    out = ["# Review of %s, %s" % (pid, pk["date"]), ""]
+    if v:
+        out += ["**Verdict: %s.** %s" % (v["verdict"], v.get("summary", "")), "", "Read cost: $%.2f" % cost, "", "## Findings", ""]
+        for f in v.get("findings") or []:
+            out += ["### %s%s" % (f.get("title", ""), "" if f.get("actionable") else " (no action)"),
+                    "- Out of date: %s" % f.get("stale", ""), "- Would improve: %s" % f.get("improve", "")]
+            out += ["- Evidence: %s" % e for e in f.get("evidence") or []] + [""]
+        if proposal:
+            out += ["## Archive proposal", "", proposal, ""]
+        out += ["## Rows filed", ""] + (["- " + r for r in rows] or ["- none" + (": " + note if note else "")]) + [""]
+    else:
+        out += ["**No verdict:** %s." % why, ""]
+    out += [pack_md(pk)]
+    with open(path, "w") as fh:
+        fh.write("\n".join(out))
+    return path
+
+
+# ---------------------------------------------------------------- state and runs
+def load_state():
+    try:
+        return json.load(open(os.path.join(rhome(), "rotation.json")))
+    except (OSError, ValueError):
+        return {"parts": {}, "sweep": {"done": False, "spent": 0.0, "counts": {}, "rows": 0}}
+
+
+def save_state(st):
+    os.makedirs(rhome(), exist_ok=True)
+    tmp = os.path.join(rhome(), ".rotation.json.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(st, fh, indent=1, sort_keys=True)
+    os.replace(tmp, os.path.join(rhome(), "rotation.json"))
+
+
+def stalest(ids, st):
+    """Never-reviewed parts first, then the one reviewed longest ago; the id breaks a tie."""
+    return sorted(ids, key=lambda i: ((st["parts"].get(i) or {}).get("last_reviewed") or "", i))
+
+
+FIRST = "dashboard"   # the owner named it: the first sweep starts with it
+
+
+def sweep_order(ids, st):
+    """The sweep's order: the dashboard first while it has never been tried, then stalest()."""
+    order = stalest(ids, st)
+    if FIRST in order and not (st["parts"].get(FIRST) or {}).get("last_reviewed"):
+        order.remove(FIRST)
+        order.insert(0, FIRST)
+    return order
+
+
+UNSWEPT = ("unread", "held")   # a failed read, and a part whose owner is unknown: neither counts as reviewed
+
+
+def review(pid, p, pk, ctx, st, no_llm):
+    """One part: read (unless --no-llm), report, rows, proposal. Returns (verdict word, cost, rows, proposal)."""
+    skip = no_llm or p.get("owner") or p.get("owner_unknown")
+    v, cost, why = (None, 0.0, "pack only (--no-llm), no model read") if skip else read_part(pid, pk, p, ctx)
+    if p.get("owner"):
+        why = "a member's part, listed for %s's own workspace and never reviewed from here" % p["owner"]
+    elif p.get("owner_unknown"):
+        why = "held: member discovery failed, so this part might be a member's; no read and no archive ask until it works"
+    rows, note, proposal = [], "", None
+    path = os.path.join(rhome(), "rotation", "%s-%s.md" % (pk["date"], pid))
+    if v:
+        rows, note = file_rows(pid, p, v, path.replace(HOME, "~"), ctx)
+        plan = archive_plan(pid, p) if v["verdict"] == "retire" else None
+        if plan:
+            proposal = plan[0]
+    write_report(pid, pk, v, cost, why, rows, note, proposal)
+    word = v["verdict"] if v else "listed" if p.get("owner") else "held" if p.get("owner_unknown") else \
+        "pack-only" if no_llm else "unread"
+    if word == "held":   # nothing about it is recorded as reviewed: not its date, its verdict or its baseline
+        return word, cost, rows, None
+    st["parts"][pid] = dict(st["parts"].get(pid) or {}, last_reviewed=pk["date"], verdict=word)
+    if word not in UNSWEPT:   # a read that failed keeps the old baseline, so next week's pass still sees the change
+        st["parts"][pid]["sig"] = signature(pk)
+    return word, cost, rows, (pid, p) if proposal else None
+
+
+def ask_perms(props, t):
+    """A run's archive proposals as ONE ask to the perms session, with the evidence in the reports."""
+    if not props:
+        return
+    d = os.path.join(rhome(), "rotation")
+    plan = {}
+    for pid, p in props:
+        line, do, undo = archive_plan(pid, p)
+        plan[pid] = {"line": line, "do": do, "undo": undo}
+    # A day's proposals ACCUMULATE: a second run that day adds its own and keeps every one an earlier ask already
+    # sent, so `archive <date> <part>` still finds each part any ask of that date named.
+    pf = os.path.join(d, "%s-proposals.json" % t)
+    try:
+        sent = json.load(open(pf))
+    except (OSError, ValueError):
+        sent = {}
+    with open(pf + ".tmp", "w") as fh:
+        json.dump(dict(sent, **plan), fh, indent=1, sort_keys=True)
+    os.replace(pf + ".tmp", pf)
+    lines = ["Archive ask from the rotating review, %s. Each line archives one part, reversibly; the evidence is in %s/%s-<part>.md."
+             % (t, d.replace(HOME, "~"), t)]
+    lines += ["- %s: %s" % (pid, x["line"]) for pid, x in sorted(plan.items())]
+    lines.append("For each one you approve, run: cc-rotation archive %s <part> (it logs the undo). Refuse the rest by doing nothing." % t)
+    with open(os.path.join(d, "%s-ask.md" % t), "a") as fh:
+        fh.write("\n".join(lines) + "\n\n")
+    sh([tool("msg"), cfg("ROTATION_PERMS_WINDOW", "perms"), "\n".join(lines)])
+
+
+def post(line):
+    ch = cfg("ROTATION_CHANNEL")
+    if ch:
+        sh([tool("slack"), "post", "-c", ch, line])
+    print(line)
+
+
+def run_batch(ids, parts, packs, ctx, st, no_llm, cap, spent):
+    """Review ids in order while the next read still fits under the cap. Returns (results, spent, stopped-at-cap)."""
+    read_cap = float(cfg("ROTATION_READ_CAP", "3"))
+    res, props = [], []
+    for pid in ids:
+        p = parts[pid]
+        reads = not no_llm and not p.get("owner") and not p.get("owner_unknown")
+        if reads and spent + read_cap > cap + 1e-9:
+            return res, props, spent, True
+        word, cost, rows, prop = review(pid, p, packs[pid], ctx, st, no_llm)
+        spent += cost
+        res.append((pid, word, rows))
+        if prop:
+            props.append(prop)
+    return res, props, spent, False
+
+
+def summary(res):
+    return ", ".join("%s %s%s" % (pid, w, " (%d rows)" % len(r) if r else "") for pid, w, r in res) or "nothing"
+
+
+def cmd_auto(no_llm):
+    t = today()
+    st = load_state()
+    if st.get("last_run") == t.isoformat():
+        print("cc-rotation: already ran today (%s); nothing to do" % t)
+        return 0
+    r = root()
+    live = load_live(t)
+    ctx = context(r, live, t)
+    parts = inventory(r, live)
+    sw = st.setdefault("sweep", {"done": False, "spent": 0.0, "counts": {}, "rows": 0})
+    held = sorted(i for i in parts if parts[i].get("owner_unknown"))
+    hold = " %d parts held: member discovery failed, so they might be a member's." % len(held) if held else ""
+    if not sw.get("done"):
+        todo = sweep_order([i for i in parts if not (st["parts"].get(i) or {}).get("swept") and i not in held], st)
+        batch = todo[:int(cfg("ROTATION_BATCH", "8"))]
+        packs = {i: build_pack(i, parts[i], ctx) for i in batch}
+        res, props, spent, capped = run_batch(batch, parts, packs, ctx, st, no_llm, float(cfg("ROTATION_SWEEP_CAP", "100")), sw.get("spent", 0.0))
+        sw["spent"] = round(spent, 4)
+        for pid, w, rows in res:
+            st["parts"][pid]["swept"] = w not in UNSWEPT   # a read that failed stays in the sweep, behind the parts not tried yet
+            sw["counts"][w] = sw["counts"].get(w, 0) + 1
+            sw["rows"] = sw.get("rows", 0) + len(rows)
+        left = len(todo) - len([1 for _, w, _ in res if w not in UNSWEPT]) + len(held)   # held parts keep the sweep open
+        st["last_run"] = t.isoformat()
+        ask_perms(props, t.isoformat())
+        save_state(st)
+        tail = " The sweep stopped at its $%s cap with %d parts unread." % (cfg("ROTATION_SWEEP_CAP", "100"), left) if capped else \
+            (" %d parts left." % left if left else "")
+        if capped and not res and sw.get("cap_posted"):   # the cap line goes to the channel once, not every day after
+            print("cc-rotation: the sweep is still at its cap; nothing read, nothing posted")
+            return 0
+        sw["cap_posted"] = capped
+        save_state(st)
+        post("Box review sweep, %d of %d parts: %s.%s%s" % (len(res), len(parts), summary(res), tail, hold))
+        if not left:
+            sw["done"], st["last_weekly"] = True, t.isoformat()
+            c = sw["counts"]
+            post("Box review sweep finished: %d keep, %d refresh, %d merge, %d retire, %d rows filed, $%.2f spent."
+                 % tuple([c.get(w, 0) for w in VERDICTS] + [sw.get("rows", 0), sw["spent"]]))
+            save_state(st)
+        return 0
+    last = st.get("last_weekly")
+    if last and days_since(last, t) is not None and days_since(last, t) < 7:
+        print("cc-rotation: the weekly pass ran %s; next on or after %s" % (last, datetime.date.fromisoformat(last) + datetime.timedelta(days=7)))
+        return 0
+    packs = {i: build_pack(i, parts[i], ctx) for i in parts}
+    why = {i: changed((st["parts"].get(i) or {}).get("sig"), signature(packs[i])) for i in parts}
+    pick = [i for i in stalest(parts, st) if why[i] and i not in held]
+    # The one reviewed longest ago goes FIRST, so a week of changed parts can never spend the cap before it is read.
+    old = next((i for i in stalest(parts, st) if i not in pick and i not in held), None)
+    if old:
+        pick.insert(0, old)
+    res, props, spent, capped = run_batch(pick, parts, packs, ctx, st, no_llm, float(cfg("ROTATION_WEEK_CAP", "15")), 0.0)
+    done = {pid for pid, _, _ in res}
+    for i in parts:   # an unchanged pack is the new baseline; a changed one not read yet keeps its old one, so it is read next week
+        if i not in done and not why[i] and i not in held:
+            st["parts"].setdefault(i, {})["sig"] = signature(packs[i])
+    st["last_run"] = st["last_weekly"] = t.isoformat()
+    ask_perms(props, t.isoformat())
+    save_state(st)
+    tail = " Stopped at the $%s cap, %d changed parts wait for next week." % (cfg("ROTATION_WEEK_CAP", "15"), len(pick) - len(res)) if capped else ""
+    post("Box review, weekly: %d of %d parts changed; %s.%s%s"
+         % (len([i for i in parts if why[i] and i not in held]), len(parts), summary(res), tail, hold))
+    return 0
+
+
+def cmd_review(pid, no_llm):
+    t = today()
+    r = root()
+    live = load_live(t)
+    ctx = context(r, live, t)
+    parts = inventory(r, live)
+    if pid not in parts:
+        sys.exit("cc-rotation: no part %r (cc-rotation list)" % pid)
+    st = load_state()
+    word, cost, rows, prop = review(pid, parts[pid], build_pack(pid, parts[pid], ctx), ctx, st, no_llm)
+    if word not in UNSWEPT:   # a read that failed, or a held part, stays in the sweep exactly as the timer's runs leave it
+        st["parts"][pid]["swept"] = True
+    sw = st.setdefault("sweep", {"done": False, "spent": 0.0, "counts": {}, "rows": 0})
+    sw["spent"] = round(sw.get("spent", 0.0) + cost, 4)
+    sw["counts"][word] = sw["counts"].get(word, 0) + 1
+    sw["rows"] = sw.get("rows", 0) + len(rows)
+    ask_perms([prop] if prop else [], t.isoformat())
+    save_state(st)
+    post("Box review: %s, %s, %d rows filed." % (pid, word, len(rows)))
+    return 0
+
+
+def cmd_archive(date, pids):
+    plan_f = os.path.join(rhome(), "rotation", "%s-proposals.json" % date)
+    try:
+        plan = json.load(open(plan_f))
+    except (OSError, ValueError):
+        sys.exit("cc-rotation: no proposals for %s (%s)" % (date, plan_f))
+    log = os.path.join(rhome(), "rotation", "archive.log")
+    # The stored file is only a record of what was proposed, never what to run: it sits under ~/.cc/state, so
+    # anything that can write there could plant a command. The plan is rebuilt from the live inventory, and a
+    # part whose stored commands differ from that rebuild is refused with nothing run.
+    parts = inventory(root(), load_live(today()))
+    rc = 0
+    for pid in pids:
+        x = plan.get(pid) if isinstance(plan, dict) else None
+        if not x:
+            print("cc-rotation: %s was not proposed on %s; nothing done" % (pid, date)); rc = 1; continue
+        built = archive_plan(pid, parts[pid]) if pid in parts else None
+        if not built:
+            print("cc-rotation: %s is no longer an archivable live part; nothing done" % pid); rc = 1; continue
+        line, do, undo = built
+        if not isinstance(x, dict) or x.get("do") != do or x.get("undo") != undo:
+            print("cc-rotation: the stored proposal for %s does not match what archiving it does now; nothing done "
+                  "(review it again for a fresh ask)" % pid); rc = 1; continue
+        x = {"line": line, "do": do, "undo": undo}
+        ok = True
+        for c in x["do"]:
+            if c[0] == "mv":
+                os.makedirs(os.path.dirname(c[2]), exist_ok=True)
+            if sh(c, timeout=120)[0] != 0:
+                ok = False
+                break
+        with open(log, "a") as fh:
+            fh.write("%s\t%s\t%s\t%s\tundo: %s\n" % (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), pid,
+                                                    "archived" if ok else "FAILED part-way", x["line"],
+                                                    " ; ".join(" ".join(u) for u in x["undo"])))
+        print("%s: %s" % (pid, "archived" if ok else "failed part-way, see %s" % log))
+        rc = rc or (0 if ok else 1)
+    return rc
+
+
+def cmd_list():
+    t = today()
+    st = load_state()
+    live = load_live(t)
+    for pid, p in inventory(root(), live).items():
+        s = st["parts"].get(pid) or {}
+        print("%-40s %-9s %-11s %s%s" % (pid, p["kind"], s.get("last_reviewed") or "never", s.get("verdict") or "",
+                                         "  (member: %s)" % p["owner"] if p.get("owner") else ""))
+    return 0
+
+
+# ---------------------------------------------------------------- selfcheck
+def selfcheck():
+    passed = failed = 0
+
+    def ok(cond, what):
+        nonlocal passed, failed
+        if cond:
+            passed += 1
+        else:
+            failed += 1
+            print("FAIL: " + what)
+
+    tmp = tempfile.mkdtemp(prefix="cc-rotation-sc.")
+    try:
+        r = os.path.join(tmp, "repo")
+        for f, body in {"core/bin/cc-board": "#!/bin/sh\n# calls cc-slack and cc-gone-tool\n",
+                        "core/bin/cc-slack": "#!/bin/sh\n", "core/bin/cc-zeta": "#!/bin/sh\nexec cc-board\n",
+                        "core/tests/reach.tsv": "# x\ncc-zeta\tcc-board\ncc-board\tcc-slack\n",
+                        "core/config/systemd-user/cc-zeta.service": "[Service]\nExecStart=%h/bin/cc-zeta\n",
+                        "core/config/systemd-user/cc-zeta.timer": "[Timer]\n",
+                        "core/config/systemd-user/cc-lone.service": "[Service]\nExecStart=/usr/bin/true\n",
+                        "core/lander/x.py": "print(1)\n", "bin-private/box-dash": "#!/bin/sh\n", "bin-private/box-cal": "#!/bin/sh\n", "dashboard/index.html": "<p>dash</p>\n",
+                        "docs/a.md": "the dashboard and cc-zeta\n"}.items():
+            os.makedirs(os.path.dirname(os.path.join(r, f)), exist_ok=True)
+            with open(os.path.join(r, f), "w") as fh:
+                fh.write(body)
+            if "/bin/" in f or f.startswith("bin-private/"):
+                os.chmod(os.path.join(r, f), 0o755)
+        genv = dict(os.environ, GIT_AUTHOR_DATE="2026-09-01T00:00:00Z", GIT_COMMITTER_DATE="2026-09-01T00:00:00Z",
+                    GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        for c in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "fixture"]):
+            subprocess.run(["git", "-C", r] + c, env=genv, capture_output=True)
+        agent = os.path.join(tmp, "agents/old.md")
+        os.makedirs(os.path.dirname(agent))
+        open(agent, "w").write("an agent\n")
+        live = {"windows": {"proj@alpha": "2026-09-30", "alice": "2026-10-01"}, "members": ["alice"],
+                "channels": [{"id": "C1", "name": "proj", "last_human": "2026-08-01", "last_box": "2026-09-01"},
+                             {"id": "C2", "name": "proj-updates", "last_human": None, "last_box": "2026-09-02"},
+                             {"id": "C3", "name": "alice", "last_human": "2026-10-01", "last_box": None}],
+                "timers": {"cc-zeta": {"files": [], "last_ran": "2026-10-01"}},
+                "agents": [agent], "skills": [],
+                "board": {"old-row": {"status": "queued", "title": "something about cc-zeta", "notes": [{"ts": "2026-08-01T00:00:00Z"}]},
+                          "fresh-row": {"status": "queued", "title": "other", "notes": [{"ts": "2026-10-03T00:00:00Z"}]}},
+                "failures": [{"id": "f-1", "ts": "2026-09-20T00:00:00Z", "kind": "x", "text": "cc-board broke"}]}
+        lf = os.path.join(tmp, "live.json")
+        json.dump(live, open(lf, "w"))
+        log = os.path.join(tmp, "calls.log")
+        fakes = {}
+        for n in ("board", "slack", "msg"):
+            fakes[n] = os.path.join(tmp, "fake-" + n)
+            with open(fakes[n], "w") as fh:
+                fh.write("#!/bin/sh\nprintf '%s %%s\\n' \"$*\" >> %s\n" % (n, log))
+            os.chmod(fakes[n], 0o755)
+        llm = os.path.join(tmp, "llm.json")
+
+        def fake_llm(cost, verdict="refresh", findings=None, archive="", is_error=False):
+            res = {"verdict": verdict, "summary": "s.", "archive": archive, "findings": findings if findings is not None else
+                   [{"short": "Old Docs", "title": "docs out of date", "evidence": ["docs: a.md"], "stale": "x", "improve": "y", "actionable": True},
+                    {"short": "fine", "title": "ok", "evidence": [], "actionable": False}]}
+            json.dump({"result": json.dumps(res), "total_cost_usd": cost, "is_error": is_error, "subtype": "error_max_budget_usd"
+                       if is_error else "success"}, open(llm, "w"))
+
+        def env(day, **kw):
+            home = os.path.join(tmp, "home")
+            e = {"ROTATION_ROOT": r, "ROTATION_HOME": home, "ROTATION_LIVE": lf, "ROTATION_TODAY": day, "ROTATION_REPO": "box",
+                 "ROTATION_CHANNEL": "C0TEST", "ROTATION_PERMS_WINDOW": "perms", "ROTATION_BATCH": "8", "ROTATION_READ_CAP": "3",
+                 "ROTATION_SWEEP_CAP": "100", "ROTATION_WEEK_CAP": "15", "ROTATION_FAKE_LLM": llm,
+                 "CC_BOARD": fakes["board"], "CC_SLACK": fakes["slack"], "CC_MSG": fakes["msg"], "HOME": os.environ.get("HOME", "")}
+            e.update(kw)
+            return e
+
+        def run(args, day, **kw):
+            saved = dict(os.environ)
+            os.environ.update(env(day, **kw))
+            try:
+                import io
+                import contextlib
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = main(args)
+                return rc, buf.getvalue()
+            finally:
+                os.environ.clear(); os.environ.update(saved)
+
+        def calls():
+            return open(log).read().splitlines() if os.path.exists(log) else []
+
+        def reset():
+            shutil.rmtree(os.path.join(tmp, "home"), ignore_errors=True)
+            if os.path.exists(log):
+                os.remove(log)
+
+        def state():
+            return json.load(open(os.path.join(tmp, "home/rotation.json")))
+
+        # 1. inventory: job groups, a tool the table lacks, dirs, units folded into their tool, live parts, members listed
+        os.environ.update({"ROTATION_LIVE": lf})
+        inv = inventory(r, live)
+        os.environ.pop("ROTATION_LIVE")
+        ok({"board-and-planning", "messaging", "tool-cc-zeta", "dashboard", "core-lander", "unit-cc-lone", "orch-proj-alpha",
+            "project-proj", "project-alice", "agent-old", "board-idle-rows"} <= set(inv), "inventory: %s" % sorted(inv))
+        ok("box-dash" in inv["dashboard"]["names"] and "bin-dash" not in inv and inv["bin-cal"]["names"] == ["box-cal"],
+           "an overlay tool named for a dir joins that dir's part, any other is a part of its own")
+        ok("unit-cc-zeta" not in inv and "cc-zeta" in inv["tool-cc-zeta"].get("units", []), "a unit that runs a tool is reviewed with it")
+        ok(archive_plan("unit-cc-lone", inv["unit-cc-lone"])[1] == [["systemctl", "--user", "disable", "--now", "cc-lone.service"]]
+           and archive_plan("u", {"kind": "unit", "units": ["cc-t"], "timer": True})[1][0][-1] == "cc-t.timer",
+           "a retired unit disables its timer when it has one, else its service")
+        ok(inv["project-proj"]["names"] == ["proj", "proj-updates"] and not inv["project-proj"].get("owner"), "a project's channels are one part")
+        ok(inv["project-alice"].get("owner") == "alice" and inv["project-alice"]["window"] == "alice", "a member's seat and channels are one part, listed as theirs")
+
+        # 2. the pack is deterministic and carries the evidence
+        os.environ["ROTATION_LIVE"] = lf
+        ctx = context(r, live, datetime.date(2026, 10, 4))
+        a = build_pack("board-and-planning", inv["board-and-planning"], ctx)
+        b = build_pack("board-and-planning", inventory(r, live)["board-and-planning"], context(r, live, datetime.date(2026, 10, 4)))
+        z = build_pack("tool-cc-zeta", inv["tool-cc-zeta"], ctx)
+        idle = build_pack("board-idle-rows", inv["board-idle-rows"], ctx)
+        os.environ.pop("ROTATION_LIVE")
+        ok(pack_md(a) == pack_md(b), "the same box on the same day gives the same pack")
+        ok(a["callers"] == ["cc-zeta"] and a["failures"] == 1 and a["dangling"] == ["cc-gone-tool"], "pack: callers, failures, dangling: %s" % a)
+        ok(a["last_commit"].startswith("2026-09-01") and a["commits_90d"] == 1, "pack: git history")
+        ok(z["open_rows"] == ["old-row"] and z["docs"] == ["docs/a.md"] and z["running"] is True and "unit cc-zeta" in z["last_used"],
+           "pack: rows, docs, last run from the unit: %s" % z)
+        ok(any(x.startswith("old-row") for x in idle["idle_rows"]) and not any(x.startswith("fresh-row") for x in idle["idle_rows"]),
+           "idle rows: 14+ days kept, a fresh one not")
+
+        # 3. stalest first
+        ok(stalest(["b", "a", "c"], {"parts": {"a": {"last_reviewed": "2026-09-01"}, "c": {"last_reviewed": "2026-08-01"}}}) == ["b", "c", "a"],
+           "never reviewed first, then the oldest")
+        ok(sweep_order(["agent-old", "dashboard"], {"parts": {}}) == ["dashboard", "agent-old"]
+           and sweep_order(["agent-old", "dashboard"], {"parts": {"dashboard": {"last_reviewed": "2026-10-01"}}}) == ["agent-old", "dashboard"],
+           "the sweep starts with the dashboard while it has never been tried, and after that it waits its turn")
+        reset()
+        run(["auto", "--no-llm"], "2026-10-04", ROTATION_BATCH="1")
+        ok([k for k, v in state()["parts"].items() if v.get("swept")] == ["dashboard"], "a fresh sweep reviews the dashboard first")
+
+        # 3b. member discovery reads members.json and the ~/dev/<h>/.cc/member-workspace markers, never cc-slack's text,
+        # and FAILS CLOSED when members.json is there but will not parse: every session and channel's owner is then
+        # unknown, and those parts get no read, no row and no archive ask until discovery works again
+        def disc(members_body, markers):
+            d = tempfile.mkdtemp(dir=tmp)
+            os.makedirs(os.path.join(d, "slack"))
+            if members_body is not None:
+                open(os.path.join(d, "slack/members.json"), "w").write(members_body)
+            for h in markers:
+                os.makedirs(os.path.join(d, "dev", h, ".cc"))
+                open(os.path.join(d, "dev", h, ".cc/member-workspace"), "w").write("# marker\n")
+            os.makedirs(os.path.join(d, "dev", "plain", ".cc"), exist_ok=True)   # a repo with no marker is not a member
+            return discover_members(os.path.join(d, "slack"), os.path.join(d, "dev"))
+        got = {"good": disc('{"alice": {"uid": "U1"}}', []), "no-slack-dir": discover_members(os.path.join(tmp, "nowhere"), os.path.join(tmp, "nowhere")), "corrupt": disc("{not json", ["bob"]),
+               "not-a-dict": disc('["alice"]', []), "missing": disc(None, []),
+               "marker-only": disc('{"alice": {}}', ["bob"]), "missing+marker": disc(None, ["bob"])}
+        ok(got == {"good": (["alice"], True), "no-slack-dir": ([], False), "corrupt": ([], False), "not-a-dict": ([], False), "missing": ([], True),
+                   "marker-only": (["alice", "bob"], True), "missing+marker": (["bob"], True)},
+           "member discovery: members.json handles plus every marker, closed on a corrupt file: %s" % got)
+        # an orch's archive is undone by more than its journal: the channel unarchived and the session started again
+        os.makedirs(os.path.join(tmp, "slackdir"), exist_ok=True)
+        json.dump({"C9": {"target": "proj", "alias": "alpha"}, "C8": {"target": "proj", "alias": "beta"}},
+                  open(os.path.join(tmp, "slackdir/orchs.json"), "w"))
+        os.environ["CC_SLACK_DIR"] = os.path.join(tmp, "slackdir")
+        undo = archive_plan("orch-proj-alpha", inv["orch-proj-alpha"])[2]
+        os.environ.pop("CC_SLACK_DIR")
+        ok([tool("slack"), "unarchive", "C9"] in undo and ["cc", "proj", "--orch", "alpha"] in undo
+           and not any("C8" in u for u in undo), "an orch's undo unarchives its own channel and restarts it: %s" % undo)
+        lu = os.path.join(tmp, "live-unknown.json")
+        json.dump(dict(live, members=[], members_unknown=True), open(lu, "w"))
+        invu = inventory(r, dict(live, members=[], members_unknown=True))
+        heldu = sorted(i for i, p in invu.items() if p.get("owner_unknown"))
+        ok(heldu == ["orch-proj-alpha", "project-alice", "project-proj"] and not any(p.get("owner") for p in invu.values())
+           and not any(archive_plan(i, invu[i]) for i in heldu) and not invu["agent-old"].get("owner_unknown"),
+           "unknown members: every session and channel part is of unknown ownership, and none can be proposed: %s" % heldu)
+        reset()
+        fake_llm(1.0, "retire", [], "x")
+        rc, out = run(["auto"], "2026-10-04", ROTATION_LIVE=lu, ROTATION_BATCH="100")
+        su = state()
+        ok(not any((su["parts"].get(i) or {}).get("swept") or (su["parts"].get(i) or {}).get("last_reviewed") for i in heldu)
+           and not su["sweep"]["done"] and "3 parts held" in out, "held parts are neither read nor swept, and keep the sweep open: %s" % out)
+        ok(not [c for c in calls() if re.search(r"raised-stale-(orch|project)-|^- (orch|project)-", c)]
+           and any(c.startswith("- agent-old: move") for c in calls()), "no row and no archive ask for a held part; the box's own still get theirs")
+        n_calls = len(calls())
+        rc, out = run(["review", "project-proj"], "2026-10-04", ROTATION_LIVE=lu)
+        ok(not [c for c in calls()[n_calls:] if c.startswith("msg") or c.startswith("board")] and "held" in out
+           and not state()["parts"].get("project-proj", {}).get("swept"), "a held part reviewed by hand is still held: %s" % out)
+
+        # 3c. a manual read that FAILED does not mark the part swept, so the sweep still reads it
+        reset()
+        fake_llm(2.0, is_error=True)
+        rc, out = run(["review", "dashboard"], "2026-10-04")
+        ok(state()["parts"]["dashboard"].get("verdict") == "unread" and not state()["parts"]["dashboard"].get("swept"),
+           "a failed manual read leaves the part in the sweep: %s" % state()["parts"]["dashboard"])
+        fake_llm(1.0, "keep", [])
+        run(["auto"], "2026-10-05", ROTATION_BATCH="100")
+        ok(state()["parts"]["dashboard"].get("swept") and state()["parts"]["dashboard"].get("verdict") == "keep",
+           "and the next sweep run reads it")
+
+        # 4. --no-llm sweep batching: 8 parts a run, then the rest, then one summary line; a second run the same day does nothing
+        reset()
+        n = len(inv)
+        rc, out = run(["auto", "--no-llm"], "2026-10-04")
+        st1 = state()
+        ok(rc == 0 and sum(1 for v in st1["parts"].values() if v.get("swept")) == 8 and not st1["sweep"]["done"], "first batch is 8 parts")
+        ok(os.path.exists(os.path.join(tmp, "home/rotation/2026-10-04-agent-old.md")), "a report per part")
+        rc, out2 = run(["auto", "--no-llm"], "2026-10-04")
+        ok("already ran today" in out2 and state() == st1 and len([c for c in calls() if c.startswith("slack post")]) == 1,
+           "a second run on the same day does nothing")
+        days = 0
+        while not state()["sweep"]["done"] and days < 10:
+            days += 1
+            run(["auto", "--no-llm"], "2026-10-%02d" % (4 + days))
+        posts = [c for c in calls() if c.startswith("slack post")]
+        ok(days == -(-n // 8) - 1 and len(posts) == days + 2 and "sweep finished" in posts[-1], "the sweep ends with one summary line: %s" % posts[-2:])
+        ok(not [c for c in calls() if c.startswith("board")], "--no-llm files no rows")
+
+        # 4b. the prompt goes to claude on stdin: one argv element over 128 KiB fails every read of a big part
+        reset()
+        fake_llm(1.0)
+        rec = os.path.join(tmp, "claude-rec")
+        cl = os.path.join(tmp, "fake-claude")
+        with open(cl, "w") as fh:
+            fh.write('#!/bin/sh\ncat > "%s.in"\nprintf "%%s\\n" "$@" > "%s.argv"\ncat "%s"\n' % (rec, rec, llm))
+        os.chmod(cl, 0o755)
+        rc, out = run(["review", "dashboard"], "2026-10-04", ROTATION_FAKE_LLM="", CLAUDE=cl)
+        sin = open(rec + ".in").read() if os.path.exists(rec + ".in") else ""
+        sargv = open(rec + ".argv").read() if os.path.exists(rec + ".argv") else "?"
+        ok("# Code" in sin and "# Code" not in sargv and rc == 0, "the read prompt is fed on stdin, not argv: rc=%s argv=%r" % (rc, sargv[:80]))
+
+        # 5. the sweep's dollar cap, with a fake cost
+        reset()
+        fake_llm(40.0)
+        rc, out = run(["auto"], "2026-10-04", ROTATION_READ_CAP="40")
+        st5 = state()
+        members_read = [i for i in st5["parts"] if inv.get(i, {}).get("owner")]
+        ok(abs(st5["sweep"]["spent"] - 80.0) < 1e-6 and "stopped at its $100 cap" in out, "the sweep stops before a read would pass $100: %s" % out)
+        ok(len(st5["parts"]) - len(members_read) == 2, "two reads at $40 each fit, a third does not")
+        # the cap line is posted once: the next day's run reads nothing and posts nothing; a sweep under its cap still posts
+        n_posts = len([c for c in calls() if c.startswith("slack post")])
+        rc, out = run(["auto"], "2026-10-05", ROTATION_READ_CAP="40")
+        ok(rc == 0 and len([c for c in calls() if c.startswith("slack post")]) == n_posts == 1 and "still at its cap" in out,
+           "a sweep stuck at its cap posts its cap line once, not every day: %d posts, %s" % (n_posts, out))
+        adds = [c for c in calls() if c.startswith("board add")]
+        ok(adds and all("raised-stale-" in c for c in adds) and all("-old-docs " in c for c in adds) and not any("-fine " in c for c in adds),
+           "an actionable finding is a row, an observation is not: %s" % adds[:2])
+
+        # 6. retire of a live part: one ask to perms; archive carries out only what was proposed, and logs the undo
+        reset()
+        fake_llm(1.0, "retire", [], "move the agent to the attic")
+        rc, out = run(["review", "agent-old"], "2026-10-04")
+        msgs = [c for c in calls() if c.startswith("msg perms")]
+        ok(len(msgs) == 1 and any(c.startswith("- agent-old: move") for c in calls()), "a retire of a live part is one ask to perms")
+        ok(any("raised-stale-agent-old-retire" in c for c in calls()), "and a row for the planning seat")
+        ok(os.path.exists(agent), "nothing is archived by the review itself")
+        rc, out = run(["review", "unit-cc-lone"], "2026-10-04")   # a second run the same day: its ask adds, never replaces
+        prop = json.load(open(os.path.join(tmp, "home/rotation/2026-10-04-proposals.json")))
+        msgs = [c for c in calls() if c.startswith("msg perms")]
+        ok(sorted(prop) == ["agent-old", "unit-cc-lone"] and len(msgs) == 2 and not any(c.startswith("- agent-old") for c in calls()[-4:])
+           and open(os.path.join(tmp, "home/rotation/2026-10-04-ask.md")).read().count("Archive ask") == 2,
+           "a second ask the same day keeps the first one's proposals: %s" % sorted(prop))
+        rc, out = run(["archive", "2026-10-04", "project-proj"], "2026-10-04")
+        ok(rc == 1 and "was not proposed" in out, "archive refuses a part nobody proposed")
+        # a planted or edited proposal never runs: the stored `do` is checked against the plan rebuilt from the live part
+        pf = os.path.join(tmp, "home/rotation/2026-10-04-proposals.json")
+        good = open(pf).read()
+        planted = os.path.join(tmp, "planted")
+        bad = json.loads(good)
+        bad["agent-old"]["do"] = [["touch", planted]]
+        bad["ghost-part"] = {"line": "x", "do": [["touch", planted]], "undo": []}
+        json.dump(bad, open(pf, "w"))
+        rc, out = run(["archive", "2026-10-04", "agent-old"], "2026-10-04")
+        ok(rc == 1 and "does not match" in out and not os.path.exists(planted) and os.path.exists(agent)
+           and not os.path.exists(os.path.join(tmp, "home/rotation/archive.log")),
+           "archive refuses a tampered proposal and runs nothing: rc=%s %s" % (rc, out.strip()))
+        rc, out = run(["archive", "2026-10-04", "ghost-part"], "2026-10-04")
+        ok(rc == 1 and "no longer an archivable live part" in out and not os.path.exists(planted),
+           "archive refuses a proposal for a part the live inventory lacks: rc=%s %s" % (rc, out.strip()))
+        open(pf, "w").write(good)
+        rc, out = run(["archive", "2026-10-04", "agent-old"], "2026-10-04")
+        alog = open(os.path.join(tmp, "home/rotation/archive.log")).read()
+        ok(rc == 0 and not os.path.exists(agent) and os.path.exists(os.path.join(tmp, "home/attic/agents/old.md")) and "undo: mv" in alog,
+           "archive moves it to the attic and logs the undo")
+        shutil.move(os.path.join(tmp, "home/attic/agents/old.md"), agent)
+        reset()
+        fake_llm(1.0, "retire", [], "x")
+        run(["review", "project-alice"], "2026-10-04")
+        ok(not [c for c in calls() if c.startswith("msg") or c.startswith("board")], "a member's part is never reviewed or proposed")
+
+        # 7. after the sweep: change-triggered reads plus the stalest, under the weekly cap
+        reset()
+        run(["auto", "--no-llm"], "2026-10-04")
+        d = 4
+        while not state()["sweep"]["done"]:
+            d += 1
+            run(["auto", "--no-llm"], "2026-10-%02d" % d)
+        sweep_end = "2026-10-%02d" % d
+        rc, out = run(["auto", "--no-llm"], "2026-10-%02d" % (d + 1))
+        ok("weekly pass ran" in out, "the weekly pass waits 7 days")
+        live2 = json.loads(json.dumps(live))
+        live2["failures"].append({"id": "f-2", "ts": "2026-10-10T00:00:00Z", "kind": "x", "text": "cc-slack fell over"})
+        json.dump(live2, open(lf, "w"))
+        before = dict((k, v.get("last_reviewed")) for k, v in state()["parts"].items())
+        wk = (datetime.date.fromisoformat(sweep_end) + datetime.timedelta(days=7)).isoformat()
+        fake_llm(1.0, "keep", [])
+        rc, out = run(["auto"], wk)
+        after = state()["parts"]
+        read = sorted(k for k, v in after.items() if v.get("last_reviewed") == wk)
+        oldest = stalest([i for i in inv if i != "messaging"], {"parts": {k: {"last_reviewed": v} for k, v in before.items()}})[0]
+        ok("messaging" in read and oldest in read and len(read) == 2, "weekly reads the changed part and the stalest: %s" % read)
+        ok("1 of %d parts changed" % n in out, "the weekly line counts the changed parts: %s" % out)
+        json.dump(live, open(lf, "w"))
+        # the weekly cap: every part changed (no signatures), $5 a read, $15 cap -> three reads
+        s = state()
+        for v in s["parts"].values():
+            v.pop("sig", None)
+        s["last_weekly"] = "2026-01-01"; s["last_run"] = "2026-01-01"
+        json.dump(s, open(os.path.join(tmp, "home/rotation.json"), "w"))
+        fake_llm(5.0, "keep", [])
+        rc, out = run(["auto"], "2026-11-30", ROTATION_READ_CAP="5")
+        read = [k for k, v in state()["parts"].items() if v.get("last_reviewed") == "2026-11-30" and not inv.get(k, {}).get("owner")]
+        ok(len(read) == 3 and "Stopped at the $15 cap" in out, "the weekly run stops at $15: %d read, %s" % (len(read), out))
+        rc, out = run(["auto"], "2026-12-07", ROTATION_READ_CAP="5")
+        ok(len([k for k, v in state()["parts"].items() if v.get("last_reviewed") == "2026-12-07"]) >= 3, "the changed parts not read wait for next week")
+        # the oldest unchanged part is read even when the changed parts alone would spend the whole cap
+        reset()
+        os.environ["ROTATION_LIVE"] = lf
+        cx = context(r, live, datetime.date(2027, 1, 4))
+        sigs = {i: signature(build_pack(i, inv[i], cx)) for i in inv}
+        os.environ.pop("ROTATION_LIVE")
+        plain = sorted(i for i in inv if not inv[i].get("owner"))
+        chg, target = plain[:4], plain[4]
+        ps = {i: {"last_reviewed": "2026-12-20", "sig": sigs[i], "swept": True} for i in inv}
+        ps.update({i: {"last_reviewed": "2025-01-01", "swept": True} for i in chg})
+        ps[target]["last_reviewed"] = "2025-06-01"
+        save_dir = os.path.join(tmp, "home")
+        os.makedirs(save_dir, exist_ok=True)
+        json.dump({"parts": ps, "sweep": {"done": True, "spent": 0.0, "counts": {}, "rows": 0}, "last_weekly": "2026-12-01",
+                   "last_run": "2026-12-01"}, open(os.path.join(save_dir, "rotation.json"), "w"))
+        fake_llm(5.0, "keep", [])
+        rc, out = run(["auto"], "2027-01-04", ROTATION_READ_CAP="5")
+        read = sorted(k for k, v in state()["parts"].items() if v.get("last_reviewed") == "2027-01-04")
+        ok(target in read and len(read) == 3 and "4 of %d parts changed" % n in out,
+           "four changed parts at $5 under a $15 cap still leave the oldest unchanged one its read: %s, %s" % (read, out))
+
+        # 8. pure helpers: change detection names each kind of change that matters, and nothing else
+        base = {"failures": 1, "open_rows": ["a"], "callers": ["x"], "callees": [], "dangling": [], "running": True}
+        ok(slug("Drop Nothing outward is switched on", 24) == "drop-nothing-outward-is" and slug("abcdefghij", 4) == "abcd",
+           "a slug is cut at a word boundary")
+        ok(changed(base, dict(base)) == [], "an unchanged pack triggers nothing")
+        ok(changed(base, dict(base, failures=2)) == ["new failures"] and changed(base, dict(base, open_rows=["a", "b"])) == ["new rows"]
+           and changed(base, dict(base, callers=[])) == ["callers or dependencies changed"]
+           and changed(base, dict(base, dangling=["cc-x"])) == ["a dependency vanished"]
+           and changed(base, dict(base, running=False)) == ["stopped running"] and changed(base, dict(base, failures=0)) == [],
+           "each kind of change is named, a drop in failures is not one")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("cc-rotation selfcheck: %d passed, %d failed" % (passed, failed))
+    return 1 if failed else 0
+
+
+def main(argv):
+    if not argv:
+        sys.exit(__doc__)
+    cmd, rest = argv[0], argv[1:]
+    no_llm = "--no-llm" in rest
+    rest = [a for a in rest if a != "--no-llm"]
+    if cmd == "auto":
+        return cmd_auto(no_llm)
+    if cmd == "review" and len(rest) == 1:
+        return cmd_review(rest[0], no_llm)
+    if cmd == "pack" and len(rest) == 1:
+        t = today(); live = load_live(t); parts = inventory(root(), live)
+        if rest[0] not in parts:
+            sys.exit("cc-rotation: no part %r" % rest[0])
+        print(pack_md(build_pack(rest[0], parts[rest[0]], context(root(), live, t))), end="")
+        return 0
+    if cmd == "list":
+        return cmd_list()
+    if cmd == "archive" and len(rest) >= 2:
+        return cmd_archive(rest[0], rest[1:])
+    if cmd == "selfcheck":
+        return selfcheck()
+    sys.exit("usage: cc-rotation auto|review <part>|pack <part>|list|archive <date> <part>…|selfcheck  [--no-llm]")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -2725,6 +2725,23 @@ class Review(Fixture):
         self.assertEqual([h.get("why") for h in kept[-1]["history"] if h["state"] == T.HELD],
                          ["main-red: check x is red on main too"])
         self.assertEqual(kept[-1]["state"], T.HANDBACK)
+        self.assertEqual(stat.S_IMODE(os.stat(J.attic_path("demo", 1)).st_mode), 0o600)
+
+    def test_a_link_planted_at_the_attic_path_is_refused(self):
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        target = os.path.join(self.tmp, "victim")
+        with open(target, "w") as f:
+            f.write("untouched\n")
+        os.makedirs(os.path.dirname(J.attic_path("demo", 1)), exist_ok=True)
+        os.symlink(target, J.attic_path("demo", 1))
+        J.remove(self.job())
+        self.assertIsNone(self.job())                               # the job still leaves the queue
+        with open(target) as f:
+            self.assertEqual(f.read(), "untouched\n")               # nothing appended through the link
+        self.assertTrue(os.path.islink(J.attic_path("demo", 1)))
 
     def test_reads_cap_goes_to_planning(self):
         self.pr(1, {"a/x": "n\n"})

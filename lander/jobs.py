@@ -18,7 +18,8 @@ PATHS are read from the environment at CALL time, so a test (or a second box lay
            tab's RUNNING tally, cc-bundle's queue depth), so an ended job leaves that directory; load() still finds it
            here, so a re-queue keeps reads_used and the prior verdict.
   attic    <LANDQ>/attic/<repo>-<pr>.jsonl — one line per job remove() drops (a handback, a release), the whole record
-           with its history, so a hold's reason outlives the job (the `stage held` line carries none).
+           with its history, so a hold's reason outlives the job (the `stage held` line carries none). Opened
+           O_NOFOLLOW, created 0600: a link planted there is refused and that line is lost, not written through it.
   log      <LANDQ>/queue.log (events.py).
   BIN $CC_BIN or <core>/bin · DEV $CC_DEV or $HOME/dev · BOARDS $CC_BOARDS or $HOME/.cc/boards ·
   MEMBERS $CC_MEMBERS or $HOME/.cc/members.
@@ -279,10 +280,14 @@ def save(job: T.Job) -> None:
 
 
 def remove(job: T.Job) -> None:
-    """The job leaves the queue and rest/; its record goes on the end of its attic file first."""
+    """The job leaves the queue and rest/; its record goes on the end of its attic file first. The attic file is
+    opened O_NOFOLLOW and created 0600 like a job file: a link planted at that path is refused (ELOOP), the line
+    is dropped, and the job is removed all the same."""
     with contextlib.suppress(OSError):
         os.makedirs(os.path.dirname(attic_path(job.repo, job.pr)), exist_ok=True)
-        with open(attic_path(job.repo, job.pr), "a") as f:
+        fd = os.open(attic_path(job.repo, job.pr),
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, "a") as f:
             f.write(json.dumps(job.to_dict()) + "\n")
     for p in (job_path(job.repo, job.pr), rest_path(job.repo, job.pr)):
         with contextlib.suppress(FileNotFoundError):

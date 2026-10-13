@@ -43,7 +43,10 @@ it exited with). unrunnable — never red: killed at the check's cap, killed by 
 (exit 124, 137, 143 or a signal), a box-state message (disk, quota, memory, fork), a sandbox that did not start, a
 mount that is not there, a tree that did not reproduce. failed: anything else.
 
-JUDGE (a red, per check): the same check on the BASE tree — the lane's shared record when there is one — red there too
+JUDGE (a red, per check): the same check on the BASE tree — main's own record of it on exactly that tree when the
+tip run made one (health.py): green there is no base red, and red there stands as `blocked-by-main` with no run when
+the ratchet cannot apply (a check that guards a gate-first path or that the change touches); else the lane's shared
+record when there is one — red there too
 is `blocked-by-main` (main is red, the diff is not blamed) — unless THE RATCHET lets it pass: every case the head's run
 names failing (fail_ids: its ✗/✘, FAIL, FAILED/ERROR or not ok lines, scratch paths, shas and durations blanked) fails
 on the base too, the head ran as far (no fewer passes, no crash the base lacks), both ran in the same place, and the
@@ -669,10 +672,11 @@ class Outcome:
 
 def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *, runner=None, store=None,
           job_key: str = "", security: bool = False, touched: bool = False, quarantine: list = (),
-          record=None, on_base: bool = True, **run_kw) -> Outcome:
+          record=None, on_base: bool = True, main: str = "", **run_kw) -> Outcome:
     """What one check says about a change. runner defaults to run(); store (records.Store, the lane's) keeps each
     run and shares base runs; record(result, text) is called once for a red that is the diff's. on_base=False: the
-    base tree has no such check or not its run file, so there is no base run and a red is the diff's."""
+    base tree has no such check or not its run file, so there is no base run and a red is the diff's. main: main's
+    own record of this check on exactly base_tree (health.at), passed or failed, which stands for the base run."""
     runner = runner or run
     kw = {**run_kw, "base_tree": base_tree}
 
@@ -702,7 +706,12 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
     if r.status != T.FAILED:
         return out
     # a check the base does not have (or whose run file it lacks) has no base to compare: its red is the diff's
-    if base_tree and check.name != M.BUILTIN and on_base:
+    # brief 10-13: "This replaces judge()'s base re-run for checks with a fresh main record" -- a red record stands
+    # without a run only where the ratchet could not let the head pass anyway; it needs a base run made now
+    if base_tree and check.name != M.BUILTIN and on_base and main == T.FAILED and (security or touched):
+        out.status, out.note = BLOCKED, f"{BLOCKED}:{check.name} (main's own record)"
+        return out
+    if base_tree and check.name != M.BUILTIN and on_base and main != T.PASSED:
         def base_run():
             b = go(base_tree, base=True, keep=False)
             if b.status == T.FAILED and b.extra.get("loaded"):
@@ -843,7 +852,7 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
              member: str = "", store=None, job_key: str = "", scope: str = "", pr: int | None = None,
              quarantine_text: str = "", runner=None, only=None, record_reds: bool = True,
              fallback: str = "", box_only: bool = False, runners: bool = False, cancel=None, express: bool = False,
-             lane: bool = False, caged: bool = False) -> dict:
+             lane: bool = False, caged: bool = False, main=None) -> dict:
     """Every check in plan.checks through judge(), one after another; -> {name: Outcome}. The lane calls it with
     its store; `lander check` with none (a worker's own red is its work, and is not recorded). fallback: the host
     manifest `m` was loaded with (manifest.host_fallback), so the base is judged by the same checks. cancel: a
@@ -852,20 +861,21 @@ def run_plan(repo_root: str, m: M.Manifest, plan: T.Plan, files: list, head_tree
     lane=True from the lane only: its box runs wait ahead of a worker's (run's `lane`). runners=True from the lane
     only: it found no box slot for these checks, so each that may leave goes to the runners (choose_where).
     caged=True (`lander check --caged-only`): a check uncaged() names is DEFERRED, never run and never a pass, and the
-    rest run on the box only."""
+    rest run on the box only. main: {check: status} of main's own record on exactly base_tree (health.at), which
+    judge() takes in place of a base run."""
     _STOP.event = cancel
     try:
         return _run_plan(repo_root, m, plan, files, head_tree, base_tree, member=member, store=store,
                          job_key=job_key, scope=scope, pr=pr, quarantine_text=quarantine_text, runner=runner,
                          only=only, record_reds=record_reds, fallback=fallback, box_only=box_only, runners=runners,
-                         express=express, lane=lane, caged=caged)
+                         express=express, lane=lane, caged=caged, main=main or {})
     finally:
         _STOP.event = None
 
 
 def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store, job_key, scope, pr,
               quarantine_text, runner, only, record_reds, fallback, box_only, express, lane, caged=False,
-              runners=False):
+              runners=False, main=None):
     rows = REC.quarantine_rows(quarantine_text)
     record = (lambda r, text: REC.record_red(scope, r, text, pr)) if (record_reds and scope) else None
     base_m = M.load(repo_root, base_tree, fallback=fallback, strict=False) if base_tree else None
@@ -891,6 +901,7 @@ def _run_plan(repo_root, m, plan, files, head_tree, base_tree, *, member, store,
         out[name] = judge(c, head_tree, base_tree, where, runner=runner, store=store,
                           job_key=job_key, security=security, touched=touched, quarantine=rows, record=record,
                           on_base=name == M.BUILTIN or runs_on_base(repo_root, base_tree, base_m, name),
+                          main=(main or {}).get(name, ""),
                           repo_root=repo_root, cwd=m.cwd.get(name, ""), changed=files,
                           label=".".join(job_key.rsplit("-", 1)) if job_key else "lander.0",
                           **({"express": True} if express else {}), **({"lane": True} if lane else {}))
