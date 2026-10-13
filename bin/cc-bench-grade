@@ -1,0 +1,1230 @@
+#!/usr/bin/env -S python3 -I
+"""cc-bench-grade — grade a container-graded benchmark task, and do nothing else with docker.
+
+  cc-bench-grade swebench PREDS INSTANCE RUN   SWE-bench's official harness (swebench.harness.run_evaluation)
+                                               on one instance of SWE-bench Verified, prebuilt image from
+                                               Docker Hub, one worker. PREDS is a predictions .jsonl
+  cc-bench-grade swebench-pro PREDS INSTANCE RUN
+                                               SWE-bench Pro's local-docker evaluator on one instance
+  cc-bench-grade tbench up TASKDIR RUN         build a Terminal-Bench (Harbor format) task's environment and
+                                               start it; TASKDIR holds task.toml, environment/, tests/
+  cc-bench-grade tbench exec RUN -- CMD...     run CMD in that task's container (how an agent works the task)
+  cc-bench-grade tbench grade RUN              copy tests/ in, run the verifier, print the reward
+  cc-bench-grade tbench oracle RUN             run the task's reference solution in it (the grader's own
+                                               check: oracle then grade must score 1)
+  cc-bench-grade tbench down RUN               remove the task's container
+  sudo cc-bench-grade setup                    build the harness (a venv with pinned swebench, SWE-bench Pro's
+                                               evaluator at a pinned commit) root-owned under /opt/cc-bench-grade,
+                                               once, by a person: no session can write there, and the swebench
+                                               suites refuse a harness a session could have changed
+  cc-bench-grade selfcheck                     the filter's cases, on fixtures: no daemon is touched
+
+INSTANCE and RUN are plain names ([A-Za-z0-9_.-]); each run keeps its logs and report under
+~/.cache/cc-bench-grade/runs/RUN, and prints where. Both places are fixed: no environment variable moves them, and
+this runs as `python3 -I`, so neither PYTHONPATH nor a user site-packages file reaches its imports or the
+harness's. Exit 0 = graded (the verdict is on stdout), 1 = could not grade, 2 = refused by the filter or bad
+arguments.
+
+WHY A FILTER. The box's user is in group `docker`, so the raw socket is root: `docker run -v /:/host` reads and
+writes everything. cc-guard refuses every container command a session types, and this tool is the one way
+through. It never hands a harness the real socket. It serves a private one, and each Docker API request on it
+is checked before it reaches the daemon:
+  * an allowlist of endpoints: ping/version/info, image pull/inspect/tag/build, container create/start/stop/
+    wait/logs/attach/exec/archive/remove, network and volume create/remove. Everything else is refused
+    (image removal and prune, commit, update, plugins, swarm, BuildKit's /session and /grpc among them);
+  * a build or a tag names its image under cc-bench-grade/ and nowhere else, and an image import
+    (`images/create?fromSrc`) is refused, so no grading overwrites an image the box runs elsewhere;
+  * a request body is JSON with no key twice, counting two keys the same when they differ only in case, `_` or
+    `-`, and every key the filter reads is spelled exactly as the daemon's: the daemon matches field names
+    without regard to case and the last one wins, so `hostconfig` or a second `HostConfig` would otherwise reach
+    it unread. What is forwarded is the body re-serialised from what was checked, never the caller's bytes;
+  * container create: no --privileged, no bind mounts or host-path volumes of any kind, no volume driver
+    options, no host network/pid/ipc/uts/userns/cgroupns, no added capabilities, no devices, no security-opt
+    beyond no-new-privileges, no custom runtime, cgroup parent or sysctls, no published ports (a port opens the
+    box to the outside). The filter stamps a label on what it lets through;
+  * every later request that names a container, an exec, a network or a volume must name one carrying that
+    label, so nothing reaches a container this tool did not create (a sandbox's, a person's);
+  * exec create: no --privileged. Build: no host network;
+  * container start, restart or unpause: while one labelled container runs and the 1-minute load is 50 or more,
+    a second is refused (one container at a time on a loaded box).
+Each connection carries one request (the filter asks the daemon to close after it), so no second request can
+ride behind a checked one; an attach or exec upgrade is spliced both ways only after the daemon answers 101.
+
+WHICH COPY RUNS. The installed one, by its bare name (~/bin/cc-bench-grade, a link into the main checkout). A
+worktree copy is editable by the session that would run it, so cc-guard refuses this tool named by a path or
+through an interpreter (selfcheck and --help excepted) and refuses it with PATH changed in the same command.
+What the filter cannot stop is a session that writes its own program against the real socket: cc-guard reads
+commands, not programs, so that stays depth, not containment.
+"""
+import contextlib, fcntl, io, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse
+from pathlib import Path
+
+LABEL = "cc-bench-grade"
+DAEMON = "/var/run/docker.sock"
+# Both places are fixed, never read from the environment: the caller's environment once chose which python ran
+# with the real socket (security read of #776 at 676f4253). HARNESS holds the code a grading runs (the venv and
+# SWE-bench Pro's checkout) and is root-owned, made by `sudo cc-bench-grade setup`, so no session writes it; ROOT
+# holds only each run's output and the lock. The selfcheck reads neither from anywhere else either.
+HARNESS = Path("/opt/cc-bench-grade")
+ROOT = Path.home() / ".cache/cc-bench-grade"
+IMAGE_NAME = re.compile(rf"{LABEL}/[a-z0-9][a-z0-9._/-]{{0,199}}(:[A-Za-z0-9_][A-Za-z0-9_.-]{{0,127}})?")
+IMAGE_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+LOAD_ONE_AT_A_TIME = 50.0
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$")
+PRO_REPO, PRO_COMMIT = "https://github.com/scaleapi/SWE-bench_Pro-os", "66f92766bba642462d4bbe5479e83f91f9211862"
+PRO_DATASET, PRO_IMAGES = "ScaleAI/SWE-bench_Pro", "jefzda"
+SWEBENCH_PIN = "swebench==3.0.15"   # 5.x adds SYS_ADMIN to every container and drops --namespace
+MAX_BODY = 16 << 20
+
+
+class Refused(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- the policy (pure, apart from `owned`)
+
+ROUTES = [   # (methods, path regex after the /vN.NN prefix, what the named object must be)
+    ("GET HEAD", r"/_ping", None), ("GET", r"/version", None), ("GET", r"/info", None),
+    ("GET", r"/events", None),
+    ("GET", r"/images/json", None), ("POST", r"/images/create", None),
+    ("GET", r"/images/(?P<img>.+)/(json|history)", None), ("POST", r"/images/(?P<img>.+)/tag", None),
+    ("GET", r"/distribution/(?P<img>.+)/json", None),
+    ("POST", r"/build", None),
+    ("GET", r"/containers/json", "list"), ("POST", r"/containers/create", "create"),
+    ("GET", r"/containers/(?P<id>[^/]+)/(json|logs|top|stats|changes|export)", "container"),
+    ("POST", r"/containers/(?P<id>[^/]+)/(start|stop|kill|restart|pause|unpause|attach|resize|wait)", "container"),
+    ("POST", r"/containers/(?P<id>[^/]+)/exec", "exec-create"),
+    ("GET HEAD PUT", r"/containers/(?P<id>[^/]+)/archive", "container"),
+    ("DELETE", r"/containers/(?P<id>[^/]+)", "container"),
+    ("POST", r"/exec/(?P<id>[^/]+)/(start|resize)", "exec"), ("GET", r"/exec/(?P<id>[^/]+)/json", "exec"),
+    ("GET", r"/networks", None), ("GET", r"/networks/(?P<id>[^/]+)", None),
+    ("POST", r"/networks/create", "network-create"),
+    ("DELETE", r"/networks/(?P<id>[^/]+)", "network"),
+    ("POST", r"/networks/(?P<id>[^/]+)/(connect|disconnect)", "network-connect"),
+    ("GET", r"/volumes", None), ("GET", r"/volumes/(?P<id>[^/]+)", None),
+    ("POST", r"/volumes/create", "volume-create"), ("DELETE", r"/volumes/(?P<id>[^/]+)", "volume"),
+]
+BODY_KINDS = {"create", "exec-create", "network-create", "network-connect", "volume-create"}
+
+
+def route(method, target):
+    """(kind, match) for an allowed request, else Refused. `target` is the raw request target."""
+    u = urllib.parse.urlsplit(target)
+    path = re.sub(r"^/v[0-9]+(\.[0-9]+)?(?=/)", "", urllib.parse.unquote(u.path))
+    if ".." in path.split("/"):
+        raise Refused(f"path {path}")
+    for methods, rx, kind in ROUTES:
+        m = re.fullmatch(rx, path)
+        if m and method in methods.split():
+            q = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+            if path == "/build" and any(v.lower() == "host" for v in q.get("networkmode", [])):
+                raise Refused("a build on the host network")
+            # A NAME OUTSIDE cc-bench-grade/ CAN BE AN IMAGE THE BOX RUNS: `build?t=ccbox-x:latest`, or a tag onto
+            # that name, replaces what it starts next (security read of #776). Every value is judged, not the first.
+            if path == "/build":
+                for v in q.get("t", []):
+                    if not IMAGE_NAME.fullmatch(v):
+                        raise Refused(f"a build named {v[:80]!r}, outside {LABEL}/")
+            if path.endswith("/tag") and m.groupdict().get("img") is not None:
+                repos, tags = q.get("repo", []), q.get("tag", [])
+                if not repos or any(not IMAGE_NAME.fullmatch(v) for v in repos):
+                    raise Refused(f"a tag naming {(repos or [''])[0][:80]!r}, outside {LABEL}/")
+                if any(v and not IMAGE_TAG.fullmatch(v) for v in tags):
+                    raise Refused("a tag that is not a plain tag")
+            # …and an import names its image by `repo`: the daemon imports whenever fromImage is empty, so only a
+            # request that names an image to pull is one.
+            if path == "/images/create" and ("fromSrc" in q or not (q.get("fromImage") or [""])[0]):
+                raise Refused("an image import (no fromImage, or fromSrc): only a pull")
+            return kind, m
+    raise Refused(f"{method} {path} is not an endpoint grading uses")
+
+
+# THE DAEMON READS A BODY'S FIELD NAMES WITHOUT REGARD TO CASE, AND THE LAST OF TWO WINS (Go's encoding/json), while
+# a dict here reads one exact spelling. `{"hostconfig": {"Privileged": true}}` was never looked at and reached the
+# daemon privileged, and so did `{"hostconfig": {…}, "HostConfig": {}}`, the second decoded INTO the first (security
+# read of #776 at 676f4253). So a body is parsed with no key twice in one object — two keys counting as the same when
+# they fold to one name, Unicode case folding with `_` and `-` dropped, wider than the daemon's own match on purpose —
+# and at every level the filter reads, a key that folds to a field it reads must be spelled exactly as that field.
+# What is forwarded is json.dumps of the object these checks read, never the caller's bytes.
+CREATE_TOP = ("HostConfig", "Labels")
+HOST_CONFIG = ("Privileged", "Binds", "Mounts", "PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode",
+               "NetworkMode", "CapAdd", "Capabilities", "Devices", "DeviceRequests", "DeviceCgroupRules", "VolumesFrom",
+               "Sysctls", "PortBindings", "MaskedPaths", "ReadonlyPaths", "PublishAllPorts", "CgroupParent", "Runtime",
+               "SecurityOpt")
+MOUNT, VOLUME_OPTIONS = ("Type", "Source", "VolumeOptions"), ("DriverConfig",)
+BODY_FIELDS = {"exec-create": ("Privileged",), "network-create": ("Driver", "ConfigFrom", "Ingress", "Labels"),
+               "network-connect": ("Container",), "volume-create": ("Driver", "DriverOpts", "Labels")}
+
+
+def fold(k):
+    return k.casefold().replace("_", "").replace("-", "")
+
+
+def unique_keys(pairs):
+    """json.loads' object_pairs_hook: one object, no key twice (folded)."""
+    seen = {}
+    for k, _ in pairs:
+        if fold(k) in seen:
+            raise Refused(f"a body naming {k!r} twice ({seen[fold(k)]!r} first): the daemon would read the last")
+        seen[fold(k)] = k
+    return dict(pairs)
+
+
+def parse_body(raw):
+    try:
+        body = json.loads(raw or b"{}", object_pairs_hook=unique_keys)
+    except ValueError:
+        raise Refused("a body that is not JSON")
+    return exact(body, "the body", ())
+
+
+def exact(obj, where, fields):
+    """`obj` as a dict ({} for null) whose keys spell each of `fields` exactly, or Refused."""
+    if obj is None:
+        return {}
+    if not isinstance(obj, dict):
+        raise Refused(f"{where} that is not an object")
+    want = {fold(f): f for f in fields}
+    for k in obj:
+        if fold(k) in want and k != want[fold(k)]:
+            raise Refused(f"{where} spelling {want[fold(k)]} as {k!r}: the daemon reads it, this filter would not")
+    return obj
+
+
+def strings(v, where):
+    if v is None:
+        return []
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        raise Refused(f"{where} that is not a list of strings")
+    return v
+
+
+def check_create(body, owned):
+    """Container create: refuse what reaches the host; stamp the label. Returns the body to forward.
+    No bind of any host path, not even the run's own dir: a container's root could leave a setuid-root file in
+    it for the session to run. Files go in and out through the archive endpoints instead."""
+    exact(body, "a create", CREATE_TOP)
+    hc = exact(body.get("HostConfig"), "HostConfig", HOST_CONFIG)
+    bad = []
+    if hc.get("Privileged"):
+        bad.append("--privileged")
+    for b in strings(hc.get("Binds"), "Binds"):
+        src, _, rest = b.partition(":")
+        opts = set(rest.partition(":")[2].split(",")) - {""}
+        if not src.startswith("/"):
+            if not owned("volume", src):
+                bad.append(f"volume {src}, which this tool did not create")
+        else:
+            bad.append(f"a bind mount of {src}")
+        if opts - {"ro", "rw", "nocopy"}:
+            bad.append(f"volume options {','.join(sorted(opts))}")
+    mounts = hc.get("Mounts") or []
+    if not isinstance(mounts, list):
+        raise Refused("Mounts that is not a list")
+    for m in mounts:
+        m = exact(m, "a mount", MOUNT)
+        t = m.get("Type") or ""
+        if not isinstance(t, str):
+            raise Refused("a mount type that is not a string")
+        t = t.lower()
+        if t == "tmpfs":
+            continue
+        if t != "volume":
+            bad.append(f"a {t or 'bind'} mount")
+        elif exact(m.get("VolumeOptions"), "VolumeOptions", VOLUME_OPTIONS).get("DriverConfig"):
+            bad.append("a volume with driver options")
+        elif m.get("Source") and not (isinstance(m["Source"], str) and owned("volume", m["Source"])):
+            bad.append(f"volume {m['Source']}, which this tool did not create")
+    for key in ("PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode", "NetworkMode"):
+        v = hc.get(key) or ""
+        if not isinstance(v, str):
+            raise Refused(f"{key} that is not a string")
+        if v == "host":
+            bad.append(f"{key}=host")
+        elif v.startswith("container:") and not owned("container", v.split(":", 1)[1]):
+            bad.append(f"{key} joining a container this tool did not create")
+    if hc.get("CapAdd"):
+        bad.append("--cap-add")
+    for key in ("Capabilities", "Devices", "DeviceRequests", "DeviceCgroupRules", "VolumesFrom", "Sysctls",
+                "PortBindings"):
+        if hc.get(key):
+            bad.append(key)
+    for key in ("MaskedPaths", "ReadonlyPaths"):   # an EMPTY list is systempaths=unconfined, /proc unmasked
+        if hc.get(key) is not None:
+            bad.append(key)
+    if hc.get("PublishAllPorts"):
+        bad.append("PublishAllPorts")
+    if hc.get("CgroupParent"):
+        bad.append("CgroupParent")
+    if (hc.get("Runtime") or "runc") != "runc":
+        bad.append(f"runtime {hc['Runtime']}")
+    for so in strings(hc.get("SecurityOpt"), "SecurityOpt"):
+        if not so.replace(":", "=").startswith("no-new-privileges"):
+            bad.append(f"security-opt {so}")
+    if bad:
+        raise Refused("container create with " + ", ".join(bad))
+    body["Labels"] = dict(exact(body.get("Labels"), "Labels", ()), **{LABEL: "1"})
+    return body
+
+
+def check_body(kind, m, body, owned):
+    if kind == "create":
+        return check_create(body, owned)
+    exact(body, "the body", BODY_FIELDS.get(kind, ()))
+    if kind == "exec-create":
+        if body.get("Privileged"):
+            raise Refused("a privileged exec")
+        return body
+    if kind == "network-create":
+        if (body.get("Driver") or "bridge") != "bridge" or body.get("ConfigFrom") or body.get("Ingress"):
+            raise Refused("a network that is not a plain bridge")
+        body["Labels"] = dict(exact(body.get("Labels"), "Labels", ()), **{LABEL: "1"})
+        return body
+    if kind == "network-connect":
+        c = body.get("Container") or ""
+        if not isinstance(c, str) or not owned("container", c):
+            raise Refused("connecting a container this tool did not create")
+        return body
+    if kind == "volume-create":
+        if (body.get("Driver") or "local") != "local" or body.get("DriverOpts"):
+            raise Refused("a volume with a driver or driver options (a local bind in disguise)")
+        body["Labels"] = dict(exact(body.get("Labels"), "Labels", ()), **{LABEL: "1"})
+        return body
+    return body
+
+
+def own_list(target):
+    """A container list asks only for labelled ones: another container's name never reaches a harness, and
+    one that inspects everything it lists (swebench's final report) is not refused on a stranger's."""
+    u = urllib.parse.urlsplit(target)
+    q = urllib.parse.parse_qs(u.query)
+    try:
+        f = json.loads(q.get("filters", ["{}"])[0]) or {}
+    except ValueError:
+        raise Refused("a container list with filters that are not JSON")
+    lab = f.get("label") or []
+    f["label"] = dict(lab, **{f"{LABEL}=1": True}) if isinstance(lab, dict) else list(lab) + [f"{LABEL}=1"]
+    q["filters"] = [json.dumps(f)]
+    return urllib.parse.urlunsplit(u._replace(query=urllib.parse.urlencode(q, doseq=True)))
+
+
+def check_object(kind, m, owned):
+    what = {"container": "container", "exec-create": "container", "exec": "exec",
+            "network": "network", "network-connect": "network", "volume": "volume"}.get(kind)
+    if what and not owned(what, m.group("id")):
+        raise Refused(f"{what} {m.group('id')[:24]}, which this tool did not create")
+
+
+# ---------------------------------------------------------------- talking to the daemon
+
+def api(method, path, body=None, sock=None):
+    """One request on the REAL socket, from the filter itself. (status, parsed JSON or None)."""
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(30)
+    s.connect(sock or DAEMON)
+    data = json.dumps(body).encode() if body is not None else b""
+    s.sendall(f"{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n"
+              f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n".encode() + data)
+    buf = b""
+    while True:
+        c = s.recv(65536)
+        if not c:
+            break
+        buf += c
+    s.close()
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    status = int(head.split(b" ", 2)[1])
+    if b"transfer-encoding: chunked" in head.lower():
+        rest = dechunk(rest)
+    try:
+        return status, json.loads(rest) if rest.strip() else None
+    except ValueError:
+        return status, None
+
+
+def dechunk(b):
+    out = b""
+    while b:
+        size, _, b = b.partition(b"\r\n")
+        n = int(size.split(b";")[0] or b"0", 16)
+        if n == 0:
+            break
+        out, b = out + b[:n], b[n + 2:]
+    return out
+
+
+def make_owned(sock=None):
+    def owned(what, ident):
+        if not ident or "/" in ident:
+            return False
+        q = urllib.parse.quote(ident, safe="")
+        if what == "exec":
+            st, j = api("GET", f"/exec/{q}/json", sock=sock)
+            return st == 200 and owned("container", (j or {}).get("ContainerID", ""))
+        path = {"container": f"/containers/{q}/json", "network": f"/networks/{q}",
+                "volume": f"/volumes/{q}"}[what]
+        st, j = api("GET", path, sock=sock)
+        if st != 200 or not isinstance(j, dict):
+            return False
+        labels = (j.get("Config") or {}).get("Labels") if what == "container" else j.get("Labels")
+        return (labels or {}).get(LABEL) == "1"
+    return owned
+
+
+def running_labelled(sock=None):
+    f = urllib.parse.quote(json.dumps({"label": [f"{LABEL}=1"], "status": ["running"]}))
+    st, j = api("GET", f"/containers/json?filters={f}", sock=sock)
+    return len(j or []) if st == 200 else 0
+
+
+def load1():
+    try:
+        return os.getloadavg()[0]
+    except OSError:
+        return 0.0
+
+
+# ---------------------------------------------------------------- the filtering proxy
+
+def read_head(conn):
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        c = conn.recv(65536)
+        if not c:
+            return None, b""
+        buf += c
+        if len(buf) > 1 << 16:
+            raise Refused("a request head over 64 KiB")
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    return head.decode("latin-1"), rest
+
+
+def read_body(conn, headers, rest, limit=None):
+    """Yield the request body as it arrives, raw framing kept for chunked; stops at its end, reads no further."""
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        buf = rest
+        while True:
+            while b"\r\n" not in buf:
+                c = conn.recv(65536)
+                if not c:
+                    return
+                buf += c
+            line, _, buf = buf.partition(b"\r\n")
+            n = int(line.split(b";")[0].strip() or b"0", 16)
+            if limit is not None and n > limit:
+                raise Refused("a request body over the limit")
+            while len(buf) < n + 2:
+                c = conn.recv(65536)
+                if not c:
+                    return
+                buf += c
+            if n == 0:   # trailers are not used by any docker client; the CRLF after the 0 chunk ends it
+                yield b"0\r\n\r\n"
+                return
+            yield line + b"\r\n" + buf[:n + 2]
+            buf = buf[n + 2:]
+    n = int(headers.get("content-length", "0") or "0")
+    if limit is not None and n > limit:
+        raise Refused("a request body over the limit")
+    got = rest[:n]
+    yield got
+    n -= len(got)
+    while n > 0:
+        c = conn.recv(min(n, 65536))
+        if not c:
+            return
+        n -= len(c)
+        yield c
+
+
+def refuse(conn, why, log):
+    msg = json.dumps({"message": f"cc-bench-grade refused: {why}"}).encode()
+    try:
+        conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nConnection: close\r\n"
+                     b"Content-Length: " + str(len(msg)).encode() + b"\r\n\r\n" + msg)
+    except OSError:
+        pass
+    log(f"refused: {why}")
+
+
+def pump(src, dst):
+    try:
+        while True:
+            c = src.recv(65536)
+            if not c:
+                break
+            dst.sendall(c)
+    except OSError:
+        pass
+    try:
+        dst.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+
+
+def handle(conn, daemon, owned, log, running=running_labelled, load=load1):
+    sent = False   # once any byte went to the daemon, an error is a dropped connection, never a refusal
+    try:
+        head, rest = read_head(conn)
+        if head is None:
+            return
+        lines = head.split("\r\n")
+        method, target, _ = lines[0].split(" ", 2)
+        headers = {}
+        for ln in lines[1:]:
+            k, _, v = ln.partition(":")
+            headers[k.strip().lower()] = v.strip()
+        kind, m = route(method, target)
+        if kind == "list":
+            target = own_list(target)
+        if kind in ("container", "exec-create", "exec", "network", "network-connect", "volume"):
+            check_object(kind, m, owned)
+        # the brief: "Load: one container at a time until load < 50" — a second one runs only below 50
+        if kind == "container" and target.split("?")[0].endswith(("/start", "/restart", "/unpause")) \
+                and running() >= 1 \
+                and load() >= LOAD_ONE_AT_A_TIME:
+            raise Refused(f"a second container while one runs and the load is {load():.0f} (>= 50)")
+        upgrade = "upgrade" in headers
+        keep = [ln for ln in lines[1:] if ln.partition(":")[0].strip().lower()
+                not in ("connection", "content-length", "transfer-encoding", "keep-alive")]
+        if kind in BODY_KINDS:
+            raw = b"".join(read_body(conn, headers, rest, MAX_BODY))
+            if headers.get("transfer-encoding", "").lower() == "chunked":
+                raw = dechunk(raw)
+            data = json.dumps(check_body(kind, m, parse_body(raw), owned)).encode()
+            framing, chunks = [f"Content-Length: {len(data)}"], [data]
+        else:
+            if "transfer-encoding" in headers:
+                framing = ["Transfer-Encoding: chunked"]
+            elif "content-length" in headers:
+                framing = [f"Content-Length: {headers['content-length']}"]
+            else:
+                framing = []
+            chunks = read_body(conn, headers, rest)
+        conn_hdr = ["Connection: Upgrade"] if upgrade else ["Connection: close"]
+        up = socket.socket(socket.AF_UNIX)
+        up.connect(daemon)
+        sent = True
+        up.sendall(("\r\n".join([f"{method} {target} HTTP/1.1"] + keep + framing + conn_hdr) + "\r\n\r\n")
+                   .encode("latin-1"))
+        for c in chunks:
+            if c:
+                up.sendall(c)
+        log(f"{method} {target.split('?')[0]}")
+        if upgrade:   # only a 101 from the daemon opens the client->daemon direction again
+            first = up.recv(65536)
+            conn.sendall(first)
+            if first.startswith(b"HTTP/1.1 101") or first.startswith(b"HTTP/1.0 101"):
+                t = threading.Thread(target=pump, args=(conn, up), daemon=True)
+                t.start()
+                pump(up, conn)
+                t.join(5)
+            else:
+                pump(up, conn)
+        else:
+            pump(up, conn)
+        up.close()
+    except Refused as e:
+        refuse(conn, str(e), log)
+    except (OSError, ValueError, IndexError, TypeError, AttributeError, RecursionError) as e:   # a body of the wrong shape
+        if sent:
+            log(f"dropped: {e.__class__.__name__}")
+        else:
+            refuse(conn, f"a malformed request ({e.__class__.__name__})", log)
+    finally:
+        conn.close()
+
+
+class Filter:
+    """The private socket a harness is given, in a 0700 dir; runs until stop()."""
+
+    def __init__(self, path, daemon=None, owned=None, log=None, running=None, load=None):
+        self.path, self.daemon = str(path), daemon or DAEMON
+        self.owned = owned or make_owned(self.daemon)
+        self.running = running or (lambda: running_labelled(self.daemon))
+        self.load = load or load1
+        self.log = log or (lambda s: None)
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(Path(self.path).parent, 0o700)
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+        self.srv = socket.socket(socket.AF_UNIX)
+        self.srv.bind(self.path)
+        os.chmod(self.path, 0o600)
+        self.srv.listen(64)
+        self.t = threading.Thread(target=self.serve, daemon=True)
+        self.t.start()
+
+    def serve(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(c, self.daemon, self.owned, self.log, self.running, self.load),
+                             daemon=True).start()
+
+    def stop(self):
+        self.srv.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- the suites
+
+def die(msg, code=2):
+    print(f"cc-bench-grade: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def name(v, what):
+    if not NAME.fullmatch(v or ""):
+        die(f"{what} {v!r} is not a plain name ([A-Za-z0-9_.-])")
+    return v
+
+
+def run_dir(run):
+    d = ROOT / "runs" / name(run, "RUN")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def with_filter(run, fn):
+    """fn(env, rundir) with DOCKER_HOST at the filter; one grading at a time (a lock over ROOT)."""
+    d = run_dir(run)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    lock = open(ROOT / ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    logf = open(d / "filter.log", "a")
+    lk = threading.Lock()
+
+    def log(s):
+        with lk:
+            logf.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()) + s + "\n")
+            logf.flush()
+    sockdir = Path(tempfile.mkdtemp(prefix="cc-bench-grade-"))
+    f = Filter(sockdir / "docker.sock", log=log)
+    env = dict(os.environ, DOCKER_HOST=f"unix://{f.path}", DOCKER_BUILDKIT="0")
+    try:
+        return fn(env, d)
+    finally:
+        f.stop()
+        shutil.rmtree(sockdir, ignore_errors=True)
+        logf.close()
+        refused = [ln for ln in (d / "filter.log").read_text().splitlines() if " refused: " in ln]
+        if refused:
+            print(f"cc-bench-grade: the filter refused {len(refused)} request(s); {d}/filter.log", file=sys.stderr)
+        lock.close()
+
+
+def venv_py():
+    return HARNESS / "venv/bin/python"
+
+
+def untrusted(paths):
+    """The first of `paths` a session could have changed — missing, a link, not root's, or writable by group or
+    others — else None. A link's target is judged by passing it resolved, as the venv's python is."""
+    for p in paths:
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return f"{p} is missing"
+        if os.path.islink(p):
+            return f"{p} is a link"
+        if st.st_uid != 0:
+            return f"{p} is not root's"
+        if st.st_mode & 0o022:
+            return f"{p} is writable by group or others"
+    return None
+
+
+def harness(pro=False, home=None):
+    """Die unless the harness a grading would run is the one `sudo cc-bench-grade setup` left: the venv's own
+    directories, its python and its site-packages (and SWE-bench Pro's checkout) root-owned and closed."""
+    home = home or HARNESS
+    v, pro_dir = home / "venv", home / "swe-bench-pro"
+    if not (v / "bin/python").exists() or (pro and not (pro_dir / "swe_bench_pro_eval.py").exists()):
+        die(f"no harness at {home} yet: a person runs `sudo cc-bench-grade setup` (by its full path) once", 1)
+    paths = [home, v, v / "bin", v / "lib", (v / "bin/python").resolve(), *sorted(v.glob("lib/python*/site-packages"))]
+    if pro:
+        paths += [pro_dir, pro_dir / "swe_bench_pro_eval.py"]
+    why = untrusted(paths)
+    if why:
+        die(f"the harness is not root's alone ({why}): rebuild it with `sudo cc-bench-grade setup`", 1)
+
+
+def setup(euid=None):
+    """Build HARNESS as root. Run by a person (`sudo …/cc-bench-grade setup`), never by a session: as anyone else
+    the venv would be the session's to edit, and it runs with the filter's socket."""
+    if (os.geteuid() if euid is None else euid) != 0:
+        die(f"setup builds the harness root-owned under {HARNESS}, where no session can write it; a person runs it "
+            "once as `sudo <full path to cc-bench-grade> setup`")
+    os.umask(0o022)
+    py, pro = venv_py(), HARNESS / "swe-bench-pro"
+    HARNESS.mkdir(mode=0o755, parents=True, exist_ok=True)
+    if not py.exists():
+        subprocess.run([sys.executable, "-I", "-m", "venv", str(HARNESS / "venv")], check=True)
+    subprocess.run([str(py), "-I", "-m", "pip", "install", "-q", SWEBENCH_PIN, "pandas", "tqdm", "docker"],
+                   check=True)
+    if not (pro / ".git").exists():
+        subprocess.run(["git", "clone", "-q", "--filter=blob:none", PRO_REPO, str(pro)], check=True)
+    subprocess.run(["git", "-C", str(pro), "checkout", "-q", PRO_COMMIT], check=True)
+    print(f"cc-bench-grade: harness venv at {HARNESS / 'venv'}, SWE-bench Pro at {pro} ({PRO_COMMIT[:12]})")
+
+
+def preds_file(p, instance):
+    p = Path(p).resolve()
+    if not p.is_file():
+        die(f"no predictions file at {p}")
+    return p
+
+
+def swebench(preds, instance, run):
+    instance, preds = name(instance, "INSTANCE"), preds_file(preds, instance)
+    harness()
+    rows = [json.loads(ln) for ln in preds.read_text().splitlines() if ln.strip()]
+    if not any(r.get("instance_id") == instance and (r.get("model_patch") or "").strip() for r in rows):
+        # the harness skips an empty patch and writes no report; SWE-bench counts it unresolved, and so does this
+        print(json.dumps({"suite": "swebench", "instance": instance, "run": run, "resolved": False,
+                          "report": None, "note": "empty patch: not run, unresolved by SWE-bench's rule"}))
+        return 0
+
+    def go(env, d):
+        cmd = [str(venv_py()), "-I", "-m", "swebench.harness.run_evaluation",   # -I: the run dir is not on sys.path
+               "--dataset_name", "princeton-nlp/SWE-bench_Verified", "--split", "test",
+               "--predictions_path", str(preds), "--instance_ids", instance, "--max_workers", "1",
+               "--run_id", run, "--namespace", "swebench", "--cache_level", "instance", "--clean", "False",
+               "--report_dir", str(d)]
+        rc = subprocess.run(cmd, cwd=d, env=env).returncode
+        report = next(iter(sorted(d.glob(f"logs/run_evaluation/{run}/*/{instance}/report.json"))), None)
+        if not report:
+            die(f"no report for {instance} (harness exit {rc}); logs under {d}", 1)
+        res = json.loads(report.read_text()).get(instance, {})
+        print(json.dumps({"suite": "swebench", "instance": instance, "run": run,
+                          "resolved": bool(res.get("resolved")), "report": str(report)}))
+    return with_filter(run, go)
+
+
+def hf_row(dataset, field, value):
+    import urllib.request
+    q = urllib.parse.urlencode({"dataset": dataset, "config": "default", "split": "test",
+                                "where": f"\"{field}\"='{value}'", "length": 1})
+    for attempt in range(4):
+        try:
+            rows = json.load(urllib.request.urlopen(f"https://datasets-server.huggingface.co/filter?{q}", timeout=60))
+            break
+        except (OSError, ValueError):   # the dataset server answers a non-JSON page when busy
+            time.sleep(5 * (attempt + 1))
+    else:
+        die(f"could not reach the dataset server for {value}", 1)
+    if not rows.get("rows"):
+        die(f"{value} is not in {dataset}", 2)
+    return rows["rows"][0]["row"]
+
+
+# SWE-bench Pro's local-docker path binds <output_dir>/<uid>/workspace into the container, which the filter
+# refuses. This runs its own main() unchanged but for the transport: containers.run with that one bind becomes
+# create, put_archive of the workspace, start; wait() then reads back the three files its collector reads, as
+# plain bytes, and removes the container. Which tests run and how they are scored stay the evaluator's.
+PRO_DRIVER = r"""
+import io, os, sys, tarfile, docker, swe_bench_pro_eval as P
+
+def root(ti):
+    ti.uid = ti.gid = 0
+    ti.uname = ti.gname = "root"
+    return ti
+
+class Ran:
+    def __init__(self, c, ws):
+        self.c, self.ws = c, ws
+
+    def wait(self, **k):
+        try:
+            r = self.c.wait(**k)
+            for n in ("stdout.log", "stderr.log", "output.json"):
+                try:
+                    bits, _ = self.c.get_archive("/workspace/" + n)
+                except docker.errors.NotFound:
+                    continue
+                t = tarfile.open(fileobj=io.BytesIO(b"".join(bits)))
+                m = t.next()
+                if m is not None and m.isreg():
+                    with open(os.path.join(self.ws, n), "wb") as f:
+                        f.write(t.extractfile(m).read())
+            return r
+        finally:
+            self.c.remove(force=True)
+
+def bindless(client):
+    def run(image, volumes=None, remove=False, detach=True, **kw):
+        (ws, spec), = volumes.items()
+        c = client.containers.create(image, **kw)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as t:
+            t.add(ws, arcname=spec["bind"].strip("/"), filter=root)
+        c.put_archive("/", buf.getvalue())
+        c.start()
+        return Ran(c, ws)
+    client.containers.run = run
+    return client
+
+from_env = docker.from_env
+P.docker.from_env = lambda *a, **k: bindless(from_env(*a, **k))
+sys.argv = ["swe_bench_pro_eval.py", *sys.argv[1:]]
+P.main()
+"""
+
+
+def swebench_pro(preds, instance, run):
+    instance, preds, pro = name(instance, "INSTANCE"), preds_file(preds, instance), HARNESS / "swe-bench-pro"
+    harness(pro=True)
+
+    def go(env, d):
+        sample = d / "sample.jsonl"
+        sample.write_text(json.dumps(hf_row(PRO_DATASET, "instance_id", instance)) + "\n")
+        out = d / "out"
+        driver = f"import sys; sys.path.insert(0, {str(pro)!r})\n" + PRO_DRIVER   # -I leaves cwd off sys.path
+        cmd = [str(venv_py()), "-I", "-c", driver, "--raw_sample_path", str(sample), "--patch_path", str(preds),
+               "--output_dir", str(out), "--scripts_dir", str(pro / "run_scripts"),
+               "--dockerhub_username", PRO_IMAGES, "--use_local_docker", "--num_workers", "1", "--redo"]
+        rc = subprocess.run(cmd, cwd=pro, env=env).returncode
+        res = out / "eval_results.json"
+        if not res.exists() or instance not in json.loads(res.read_text()):
+            die(f"no result for {instance} (evaluator exit {rc}); logs under {out}", 1)
+        print(json.dumps({"suite": "swebench-pro", "instance": instance, "run": run,
+                          "resolved": bool(json.loads(res.read_text())[instance]), "report": str(res)}))
+    return with_filter(run, go)
+
+
+def tb_task(d):
+    import tomllib
+    return tomllib.loads((d / "task" / "task.toml").read_text())
+
+
+def dk(env, *a, check=True, **k):
+    """The docker CLI, pointed at the filter by env's DOCKER_HOST."""
+    r = subprocess.run(["docker", *a], env=env, **k)
+    if check and r.returncode:
+        die(f"the docker CLI's {a[0]} exited {r.returncode}", 1)
+    return r
+
+
+def tbench(argv):
+    sub, rest = (argv[0], argv[1:]) if argv else ("", [])
+    if sub == "up" and len(rest) == 2:
+        src, run = Path(rest[0]).resolve(), name(rest[1], "RUN")
+        if not (src / "task.toml").is_file() or not (src / "tests" / "test.sh").is_file():
+            die(f"{src} is not a Terminal-Bench task (task.toml, tests/test.sh)")
+    elif sub in ("exec", "grade", "oracle", "down") and rest:
+        run = name(rest[0], "RUN")
+        if not (ROOT / "runs" / run / "task").is_dir():
+            die(f"no task was brought up as {run}", 1)
+    else:
+        die("usage: cc-bench-grade tbench up TASKDIR RUN | exec RUN -- CMD... | grade RUN | oracle RUN | down RUN")
+    ctr = f"{LABEL}-{run}"
+
+    def go(env, d):
+        if sub == "up":
+            shutil.rmtree(d / "task", ignore_errors=True)
+            shutil.copytree(src, d / "task", symlinks=True)   # tests are read from this copy, taken now
+            e = tb_task(d).get("environment", {})
+            img = e.get("docker_image")
+            if img:
+                dk(env, "pull", "-q", img, stdout=subprocess.DEVNULL)
+            else:
+                img = f"{LABEL}/tb-{src.name}:{run}".lower()
+                dk(env, "build", "-q", "-t", img, str(d / "task" / "environment"), stdout=subprocess.DEVNULL)
+            args = ["run", "-d", "--name", ctr, "--entrypoint", "sh"]
+            if e.get("cpus"):
+                args += ["--cpus", str(e["cpus"])]
+            if e.get("memory_mb"):
+                args += ["--memory", f"{int(e['memory_mb'])}m"]
+            if e.get("allow_internet") is False:
+                args += ["--network", "none"]
+            for k, v in (e.get("env") or {}).items():
+                args += ["-e", f"{k}={v}"]
+            dk(env, *args, img, "-c", "mkdir -p /logs/agent /logs/verifier && exec sleep infinity",
+               stdout=subprocess.DEVNULL)
+            print(json.dumps({"suite": "tbench", "run": run, "container": ctr, "image": img,
+                              "instruction": str(d / "task" / "instruction.md")}))
+            return 0
+        if sub == "exec":
+            cmd = rest[2:] if rest[1:2] == ["--"] else rest[1:]
+            if not cmd:
+                die("exec needs a command after --")
+            return dk(env, "exec", "-i", ctr, *cmd, check=False).returncode
+        if sub == "down":
+            dk(env, "rm", "-f", ctr, stdout=subprocess.DEVNULL)
+            return 0
+        if sub == "oracle":   # the reference solution: the grader's own check, gold must score 1
+            dk(env, "cp", str(d / "task" / "solution") + "/.", f"{ctr}:/solution")
+            return 1 if dk(env, "exec", ctr, "bash", "/solution/solve.sh", check=False,
+                           stdout=subprocess.DEVNULL).returncode else 0
+        t = tb_task(d)
+        dk(env, "exec", ctr, "sh", "-c", "rm -rf /tests && mkdir -p /tests /logs/verifier")
+        dk(env, "cp", str(d / "task" / "tests") + "/.", f"{ctr}:/tests")
+        venv = [a for k, v in ((t.get("verifier") or {}).get("env") or {}).items() for a in ("-e", f"{k}={v}")]
+        with open(d / "verifier.log", "w") as log:
+            try:
+                rc = dk(env, "exec", *venv, ctr, "bash", "/tests/test.sh", check=False, stdout=log,
+                        stderr=subprocess.STDOUT,
+                        timeout=float((t.get("verifier") or {}).get("timeout_sec", 900))).returncode
+            except subprocess.TimeoutExpired:
+                rc = "timeout"
+        r = dk(env, "exec", ctr, "cat", "/logs/verifier/reward.txt", check=False, capture_output=True, text=True)
+        try:
+            reward = float(r.stdout.strip())
+        except ValueError:
+            reward = 0.0
+        print(json.dumps({"suite": "tbench", "run": run, "reward": reward, "resolved": reward >= 1.0,
+                          "verifier_exit": rc, "log": str(d / "verifier.log")}))
+        return 0
+    return with_filter(run, go)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if argv[0] == "selfcheck":
+        return selfcheck()
+    if argv[0] == "setup":
+        return setup()
+    if argv[0] == "swebench" and len(argv) == 4:
+        return swebench(*argv[1:])
+    if argv[0] == "swebench-pro" and len(argv) == 4:
+        return swebench_pro(*argv[1:])
+    if argv[0] == "tbench":
+        return tbench(argv[1:])
+    die("usage: see cc-bench-grade --help")
+
+
+# ---------------------------------------------------------------- selfcheck
+
+def selfcheck():
+    """Each case builds its own fixture: a fake daemon on its own socket, a filter in front of it."""
+    passed = failed = 0
+
+    def ok(cond, what):
+        nonlocal passed, failed
+        if cond:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL: {what}")
+
+    def refused(fn):
+        try:
+            fn()
+            return False
+        except Refused:
+            return True
+
+    mine = {"container": {"c-mine"}, "volume": {"v-mine"}, "network": {"n-mine"}, "exec": {"e-mine"}}
+    owned = lambda what, ident: ident in mine.get(what, ())
+    create = lambda hc, **top: check_create(dict(top, Image="alpine", HostConfig=hc), owned)
+
+    # the create policy, one rule a case, each with the kept shape beside the refused one
+    ok(create({})["Labels"] == {LABEL: "1"}, "a plain create is kept and labelled")
+    ok(create({}, Labels={"a": "b"})["Labels"] == {"a": "b", LABEL: "1"}, "the label joins the harness's own labels")
+    ok(refused(lambda: create({"Privileged": True})), "--privileged is refused")
+    ok(refused(lambda: create({"Binds": ["/:/host"]})), "a bind of / is refused")
+    ok(refused(lambda: create({"Binds": ["/tmp/x:/x:ro"]})), "a read-only bind is refused too")
+    ok(refused(lambda: create({"Binds": [f"{ROOT}/runs/r1/out/i/workspace:/workspace:rw"]})),
+       "a bind of the run's own dir is refused too (a container's root could leave a setuid file there)")
+    ok(create({"Binds": ["v-mine:/v:nocopy"]}) is not None, "a volume this tool created, in Binds form, is kept")
+    ok(refused(lambda: create({"Mounts": [{"Type": "bind", "Source": "/", "Target": "/h"}]})), "a Mounts bind is refused")
+    ok(refused(lambda: create({"Mounts": [{"Type": "volume", "Source": "v-mine", "Target": "/v",
+                                           "VolumeOptions": {"DriverConfig": {"Name": "local", "Options":
+                                                             {"type": "none", "o": "bind", "device": "/"}}}}]})),
+       "a volume mount carrying a local-bind driver config is refused")
+    ok(create({"Mounts": [{"Type": "volume", "Source": "v-mine", "Target": "/v"}]}) is not None,
+       "a volume this tool created is kept")
+    ok(refused(lambda: create({"Mounts": [{"Type": "volume", "Source": "v-other", "Target": "/v"}]})),
+       "a volume it did not create is refused")
+    ok(create({"Mounts": [{"Type": "tmpfs", "Target": "/t"}]}) is not None, "a tmpfs is kept")
+    for key in ("NetworkMode", "PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode"):
+        ok(refused(lambda: create({key: "host"})), f"{key}=host is refused")
+    ok(create({"NetworkMode": "bridge", "IpcMode": "private"}) is not None, "bridge network and private ipc are kept")
+    ok(refused(lambda: create({"PidMode": "container:c-other"})), "joining another's pid namespace is refused")
+    ok(create({"NetworkMode": "container:c-mine"}) is not None, "joining its own container's network is kept")
+    ok(refused(lambda: create({"CapAdd": ["SYS_ADMIN"]})), "--cap-add is refused")
+    ok(refused(lambda: create({"Capabilities": ["CAP_SYS_ADMIN"]})), "the old full capability list is refused as well")
+    ok(create({"CapDrop": ["ALL"]}) is not None, "--cap-drop is kept")
+    ok(refused(lambda: create({"Devices": [{"PathOnHost": "/dev/sda"}]})), "a device is refused")
+    ok(refused(lambda: create({"DeviceRequests": [{"Count": -1}]})), "a GPU request is refused")
+    ok(refused(lambda: create({"VolumesFrom": ["c-other"]})), "--volumes-from is refused")
+    ok(refused(lambda: create({"PortBindings": {"80/tcp": [{"HostPort": "8080"}]}})), "a published port is refused")
+    ok(refused(lambda: create({"PublishAllPorts": True})), "-P is refused")
+    ok(refused(lambda: create({"SecurityOpt": ["seccomp=unconfined"]})), "seccomp=unconfined is refused")
+    ok(refused(lambda: create({"SecurityOpt": ["apparmor=unconfined"]})), "apparmor=unconfined is refused")
+    ok(create({"SecurityOpt": ["no-new-privileges"]}) is not None, "no-new-privileges is kept")
+    ok(refused(lambda: create({"MaskedPaths": []})) and refused(lambda: create({"ReadonlyPaths": ["/x"]})),
+       "an empty MaskedPaths (systempaths=unconfined) and a custom path list are both refused")
+    ok(create({"MaskedPaths": None}) is not None, "MaskedPaths null, the daemon's default, is kept")
+    ok(refused(lambda: create({"Runtime": "nvidia"})), "another runtime is refused")
+    ok(refused(lambda: create({"CgroupParent": "/"})), "a cgroup parent is refused")
+    ok(refused(lambda: create({"Sysctls": {"kernel.x": "1"}})), "a sysctl is refused")
+
+    # the harness a grading runs is root's alone, and only a person builds it (security read of #776)
+    def dies(fn):   # die()'s exit code, its line kept off the selfcheck's own output
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                fn()
+        except SystemExit as e:
+            return e.code
+        return None
+    with tempfile.TemporaryDirectory(prefix="cc-bench-grade-sc-") as hd:
+        hd = Path(hd)
+        ok(untrusted([Path("/usr"), Path("/usr/bin")]) is None, "a root-owned, closed directory is trusted")
+        ok("missing" in (untrusted([hd / "nope"]) or ""), "a missing harness path is not")
+        (hd / "ln").symlink_to("/usr")
+        ok("link" in (untrusted([hd / "ln"]) or ""), "a link in the harness is not, whatever it points at")
+        ok("writable" in (untrusted([Path("/tmp")]) or ""), "a root-owned directory others can write is not")
+        ok(os.geteuid() == 0 or "not root's" in (untrusted([hd]) or ""), "a directory the user owns is not")
+        ok(dies(lambda: harness(home=hd / "none")) == 1, "no harness yet: the suites stop, exit 1")
+        (hd / "venv/bin").mkdir(parents=True)
+        (hd / "venv/lib/python3/site-packages").mkdir(parents=True)
+        (hd / "venv/bin/python").write_text("")
+        ok(dies(lambda: harness(home=hd)) == 1 if os.geteuid() else True,
+           "a harness the user could have written: the suites refuse to run it, exit 1")
+        ok(dies(lambda: harness(pro=True, home=hd)) == 1, "…and SWE-bench Pro's without its checkout")
+        ok(dies(lambda: setup(euid=1000)) == 2, "setup as anyone but root is refused, before it writes anything")
+
+    # routes
+    ok(route("GET", "/v1.47/_ping")[0] is None, "ping is kept")
+    lf = lambda t: json.loads(urllib.parse.parse_qs(urllib.parse.urlsplit(own_list(t)).query)["filters"][0])
+    ok(lf("/v1.47/containers/json?all=1") == {"label": [f"{LABEL}=1"]}, "a container list asks for labelled ones only")
+    ok(lf('/containers/json?filters={"label":["a=b"],"status":["running"]}') ==
+       {"label": ["a=b", f"{LABEL}=1"], "status": ["running"]}, "…keeping the harness's own filters beside it")
+    ok(lf('/containers/json?filters={"label":{"a=b":true}}') == {"label": {"a=b": True, f"{LABEL}=1": True}},
+       "…in the older map form too")
+    ok(refused(lambda: own_list("/containers/json?filters=notjson")), "a list with unreadable filters is refused")
+    ok(route("POST", "/v1.47/images/create?fromImage=swebench/sweb.eval.x86_64.a&tag=latest")[0] is None,
+       "a pull is kept")
+    ok(route("GET", "/images/jefzda/sweap-images:tag/json")[0] is None, "inspecting an image with a / in its name is kept")
+    for meth, p in [("DELETE", "/v1.47/images/alpine"), ("POST", "/images/prune"), ("POST", "/containers/prune"),
+                    ("POST", "/commit"), ("POST", "/session"), ("POST", "/grpc"), ("POST", "/plugins/pull"),
+                    ("POST", "/swarm/init"), ("POST", "/containers/c-mine/update"), ("GET", "/secrets"),
+                    ("POST", "/v1.47/images/load"), ("POST", "/containers/c-mine/../../images/x/push")]:
+        ok(refused(lambda: route(meth, p)), f"{meth} {p} is refused")
+    ok(refused(lambda: route("POST", "/build?networkmode=host")), "a build on the host network is refused")
+    ok(route("POST", "/build?t=cc-bench-grade/x")[0] is None, "a plain build is kept")
+    k, m = route("POST", "/containers/c-other/start")
+    ok(refused(lambda: check_object(k, m, owned)), "starting another's container is refused")
+    k, m = route("POST", "/containers/c-mine/start")
+    ok(not refused(lambda: check_object(k, m, owned)), "starting its own is kept")
+    k, m = route("POST", "/containers/c-other/exec")
+    ok(refused(lambda: check_object(k, m, owned)), "an exec into another's container is refused")
+    ok(refused(lambda: check_body("exec-create", None, {"Privileged": True}, owned)), "a privileged exec is refused")
+    k, m = route("GET", "/exec/e-other/json")
+    ok(refused(lambda: check_object(k, m, owned)), "another's exec is refused")
+    k, m = route("GET", "/containers/c-other/archive?path=/")
+    ok(refused(lambda: check_object(k, m, owned)), "reading files out of another's container is refused")
+    ok(refused(lambda: check_body("volume-create", None, {"DriverOpts": {"o": "bind", "device": "/"}}, owned)),
+       "a volume with bind driver options is refused")
+    ok(check_body("volume-create", None, {"Name": "x"}, owned)["Labels"] == {LABEL: "1"}, "a plain volume is labelled")
+    ok(refused(lambda: check_body("network-create", None, {"Driver": "macvlan"}, owned)), "a macvlan network is refused")
+    ok(refused(lambda: check_body("network-connect", None, {"Container": "c-other"}, owned)),
+       "connecting another's container is refused")
+
+    # end to end: a fake daemon that records what reached it and answers 200, and a filter in front
+    with tempfile.TemporaryDirectory(prefix="cc-bench-grade-sc-") as td:
+        td = Path(td)
+        seen = []
+        dsock = str(td / "daemon.sock")
+        ds = socket.socket(socket.AF_UNIX)
+        ds.bind(dsock)
+        ds.listen(16)
+
+        def daemon():
+            while True:
+                try:
+                    c, _ = ds.accept()
+                except OSError:
+                    return
+                buf = b""
+                c.settimeout(2)
+                try:
+                    while True:
+                        x = c.recv(65536)
+                        if not x:
+                            break
+                        buf += x
+                        head, sep, rest = buf.partition(b"\r\n\r\n")
+                        if sep:
+                            n = re.search(rb"(?i)content-length: *(\d+)", head)
+                            if (n and len(rest) >= int(n.group(1))) or (not n and b"chunked" not in head.lower()) \
+                                    or rest.endswith(b"0\r\n\r\n"):
+                                break
+                except OSError:
+                    pass
+                seen.append(buf)
+                if b"Upgrade: tcp" in buf:
+                    c.sendall(b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+                    try:
+                        seen.append(c.recv(65536))
+                    except OSError:
+                        pass
+                    c.sendall(b"stream-out")
+                else:
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                c.close()
+        threading.Thread(target=daemon, daemon=True).start()
+        logs = []
+        state = {"running": 0, "load": 0.0}
+        f = Filter(td / "f" / "docker.sock", daemon=dsock, owned=owned, log=logs.append,
+                   running=lambda: state["running"], load=lambda: state["load"])
+
+        def req(raw):
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(5)
+            s.connect(f.path)
+            s.sendall(raw)
+            out = b""
+            try:
+                while True:
+                    x = s.recv(65536)
+                    if not x:
+                        break
+                    out += x
+            except OSError:
+                pass
+            s.close()
+            return out
+
+        ok(oct(os.stat(td / "f").st_mode & 0o777) == "0o700", "the filter's socket dir is private (0700)")
+        n0 = len(seen)
+        out = req(b"GET /v1.47/_ping HTTP/1.1\r\nHost: x\r\n\r\n")
+        ok(out.endswith(b"OK") and len(seen) == n0 + 1 and b"Connection: close" in seen[-1],
+           "an allowed request reaches the daemon with Connection: close")
+        n0 = len(seen)
+        body = json.dumps({"Image": "alpine", "HostConfig": {"Binds": ["/:/host"]}}).encode()
+        out = req(b"POST /v1.47/containers/create HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        ok(out.startswith(b"HTTP/1.1 403") and b"bind mount" in out and len(seen) == n0,
+           "a create with a bind of / is answered 403 and never reaches the daemon")
+        n0 = len(seen)
+        body = json.dumps({"Image": "alpine"}).encode()
+        out = req(b"POST /v1.47/containers/create?name=t HTTP/1.1\r\nHost: x\r\nContent-Length: "
+                  + str(len(body)).encode() + b"\r\n\r\n" + body)
+        ok(out.endswith(b"OK") and len(seen) == n0 + 1 and b'"cc-bench-grade": "1"' in seen[-1],
+           "a plain create reaches the daemon with the label stamped in")
+        n0 = len(seen)
+        chunked = json.dumps({"Image": "alpine", "HostConfig": {"Privileged": True}}).encode()
+        out = req(b"POST /containers/create HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                  + hex(len(chunked))[2:].encode() + b"\r\n" + chunked + b"\r\n0\r\n\r\n")
+        ok(out.startswith(b"HTTP/1.1 403") and len(seen) == n0, "a chunked --privileged create is refused too")
+        n0 = len(seen)
+        out = req(b"GET /_ping HTTP/1.1\r\nHost: x\r\n\r\nDELETE /images/alpine HTTP/1.1\r\nHost: x\r\n\r\n")
+        ok(len(seen) == n0 + 1 and b"DELETE" not in seen[-1],
+           "a second request pipelined behind a kept one never reaches the daemon")
+        n0 = len(seen)
+        out = req(b"DELETE /v1.47/images/alpine HTTP/1.1\r\nHost: x\r\n\r\n")
+        ok(out.startswith(b"HTTP/1.1 403") and len(seen) == n0 and any("refused" in l for l in logs),
+           "an image delete is refused, and the refusal is logged")
+        n0 = len(seen)
+        out = req(b"POST /containers/c-other/attach?stream=1 HTTP/1.1\r\nHost: x\r\nUpgrade: tcp\r\n"
+                  b"Connection: Upgrade\r\n\r\n")
+        ok(out.startswith(b"HTTP/1.1 403") and len(seen) == n0, "attaching to another's container is refused")
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(5)
+        s.connect(f.path)
+        s.sendall(b"POST /containers/c-mine/attach?stream=1 HTTP/1.1\r\nHost: x\r\nUpgrade: tcp\r\n"
+                  b"Connection: Upgrade\r\n\r\n")
+        first = s.recv(65536)
+        s.sendall(b"stdin-bytes")
+        rest = b""
+        try:
+            while True:
+                x = s.recv(65536)
+                if not x:
+                    break
+                rest += x
+        except OSError:
+            pass
+        s.close()
+        ok(first.startswith(b"HTTP/1.1 101") and b"stream-out" in first + rest and seen[-1] == b"stdin-bytes",
+           "an attach to its own container is spliced both ways after the daemon's 101")
+        n0 = len(seen)
+        state.update(running=1, load=80.0)
+        out = req(b"POST /containers/c-mine/start HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+        ok(out.startswith(b"HTTP/1.1 403") and b"load" in out and len(seen) == n0,
+           "a second container start on a loaded box (load 80, one running) is refused")
+        out = req(b"POST /containers/c-mine/restart HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+        ok(out.startswith(b"HTTP/1.1 403") and len(seen) == n0, "…and so is a restart, which starts one too")
+        state.update(running=1, load=50.0)
+        out = req(b"POST /containers/c-mine/start HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+        ok(out.startswith(b"HTTP/1.1 403") and len(seen) == n0, "…and at exactly 50, since only below 50 is free")
+        state.update(running=1, load=10.0)
+        out = req(b"POST /containers/c-mine/start HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+        ok(out.endswith(b"OK") and len(seen) == n0 + 1, "the same start at load 10 is kept")
+        state.update(running=0, load=80.0)
+        out = req(b"POST /containers/c-mine/start HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+        ok(out.endswith(b"OK") and len(seen) == n0 + 2, "the first container on a loaded box is kept")
+        # BEGIN security-read-776 rows: each reached the daemon at 676f4253
+        state.update(running=0, load=0.0)
+
+        def post(path, raw):
+            return req(b"POST " + path + b" HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                       b"Content-Length: " + str(len(raw)).encode() + b"\r\n\r\n" + raw)
+
+        def stopped(path, raw, what):
+            n = len(seen)
+            out = post(path, raw)
+            ok(out.startswith(b"HTTP/1.1 403") and len(seen) == n, what + " is answered 403 and never reaches the daemon")
+        for raw, what in [
+                (b'{"Image": "alpine", "hostconfig": {"Privileged": true}}', "a create spelling HostConfig as hostconfig"),
+                (b'{"Image": "alpine", "HostConfig": {"privileged": true}}', "a create spelling Privileged as privileged"),
+                (b'{"Image": "alpine", "HostConfig": {"binds": ["/:/host"]}}', "a create spelling Binds as binds"),
+                (b'{"Image": "alpine", "HostConfig": {"Sysctl\\u017f": {"kernel.x": "1"}}}',
+                 "a create spelling Sysctls with a long s, which the daemon folds to s"),
+                (b'{"Image": "alpine", "HostConfig": {"Mounts": [{"Type": "volume", "Source": "v-mine", "Target": "/v",'
+                 b' "volumeOptions": {"DriverConfig": {"Options": {"o": "bind", "device": "/"}}}}]}}',
+                 "a volume mount spelling VolumeOptions as volumeOptions"),
+                (b'{"Image": "alpine", "hostconfig": {"Privileged": true}, "HostConfig": {}}',
+                 "a create carrying HostConfig twice in two cases (the daemon decodes the second into the first)"),
+                (b'{"Image": "alpine", "HostConfig": {"Privileged": true, "Privileged": false}}',
+                 "a create carrying Privileged twice")]:
+            stopped(b"/v1.47/containers/create", raw, what)
+        stopped(b"/containers/c-mine/exec", b'{"Cmd": ["sh"], "privileged": true}', "an exec spelling Privileged as privileged")
+        stopped(b"/networks/create", b'{"Name": "n", "driver": "macvlan"}', "a network spelling Driver as driver")
+        stopped(b"/volumes/create", b'{"Name": "v", "driverOpts": {"o": "bind", "device": "/"}}',
+                "a volume spelling DriverOpts as driverOpts")
+        for path, what in [(b"/build?t=ccbox-x:latest", "a build named outside cc-bench-grade/"),
+                           (b"/build?t=cc-bench-grade/tb-x:r1&t=ccbox-x", "a build with a second name outside it"),
+                           (b"/v1.47/images/alpine/tag?repo=ccbox-x&tag=latest", "a tag onto a name outside cc-bench-grade/"),
+                           (b"/images/alpine/tag?repo=docker.io/cc-bench-grade/x", "a tag naming the prefix behind a registry"),
+                           (b"/images/create?fromSrc=-&repo=ccbox-x&tag=latest", "an image import from the body"),
+                           (b"/images/create?repo=ccbox-x", "a create with no image to pull, which the daemon imports")]:
+            stopped(path, b"", what)
+        for path, what in [(b"/build?t=cc-bench-grade/tb-x:r1", "a build named under cc-bench-grade/"),
+                           (b"/images/alpine/tag?repo=cc-bench-grade/x&tag=r1", "a tag under it")]:
+            n = len(seen)
+            ok(post(path, b"").endswith(b"OK") and len(seen) == n + 1, what + " is kept")
+        n = len(seen)
+        ok(post(b"/containers/c-mine/exec", b'{"Cmd": ["sh"], "Privileged": false}').endswith(b"OK") and len(seen) == n + 1,
+           "an exec spelled exactly is kept")
+        probe = ("import runpy, sys; g = runpy.run_path(sys.argv[1], run_name='probe')\n"
+                 "print(g['ROOT'], g['DAEMON'], g.get('HARNESS'))")
+        evil = td / "evil"
+        r = subprocess.run([sys.executable, "-I", "-c", probe, __file__], capture_output=True, text=True,
+                           env=dict(os.environ, CC_BENCH_GRADE_ROOT=str(evil), CC_BENCH_GRADE_DAEMON=str(evil)))
+        ok(r.returncode == 0 and str(evil) not in r.stdout and "/var/run/docker.sock" in r.stdout,
+           f"CC_BENCH_GRADE_ROOT and _DAEMON in the environment move nothing: {r.stdout.strip()}{r.stderr[-200:]}")
+        (td / "pp").mkdir()
+        (td / "pp" / "json.py").write_text(f"open({str(td / 'pp-reached')!r}, 'w').close()\n")
+        subprocess.run([__file__, "--help"], capture_output=True, env=dict(os.environ, PYTHONPATH=str(td / "pp")))
+        ok(not (td / "pp-reached").exists(), "a PYTHONPATH the caller sets reaches none of this tool's imports")
+        # END security-read-776 rows
+        f.stop()
+        ds.close()
+
+    print(f"cc-bench-grade selfcheck: {passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)
