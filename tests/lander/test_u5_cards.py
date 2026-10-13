@@ -730,6 +730,42 @@ class QueuedCards(Stubbed):
         self.assertTrue(C.waited(rows[1], 3601, now=now + 3600))
         self.assertEqual(len(self.argvs("cc-notify")), 3)
 
+    def parked(self, pr, on, since):
+        return T.Job(repo="demo", pr=pr, state=T.QUEUED, stage=T.QUEUED,
+                     extra={"queued_at": Q, "parked_since": since, "parked": {"at": 0, "head": HEAD, "on": on}})
+
+    def test_a_job_parked_behind_a_due_pr_is_not_flagged_and_the_next_oldest_is(self):
+        # planning seat, 10-13: #922, parked on=1128 behind #1126's repair, was sent as "Nothing stopped it"
+        later = E.stamp(E.epoch_of(Q) + 600)
+        blocker = T.Job(repo="demo", pr=8, state=T.HELD, stage=T.HELD, extra={"queued_at": later, "hold": "pr"})
+        self.assertEqual(self.flag([self.parked(7, 8, E.stamp()), blocker], 3601 + 600),
+                         ["[demo] PR #8 has waited 60 min in the queue; the planning seat is told"])
+        self.assertEqual(len(self.argvs("cc-notify")), 1)
+        self.assertNotIn("PR #7", " ".join(self.argvs("cc-notify")[0]))
+
+    def test_a_job_parked_behind_a_pr_too_young_to_flag_is_not_flagged(self):
+        blocker = T.Job(repo="demo", pr=8, state=T.CHECKING, stage=T.CHECKING, extra={"queued_at": E.stamp()})
+        self.assertEqual(self.flag([self.parked(7, 8, E.stamp()), blocker], 3601), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
+
+    def test_a_job_parked_on_a_pr_that_left_is_flagged_naming_the_park(self):
+        self.assertEqual(self.flag([self.parked(7, 8, E.stamp())], 3601),
+                         ["[demo] PR #7 has waited 60 min in the queue; the planning seat is told"])
+        text = " ".join(self.argvs("cc-notify")[0])
+        self.assertIn("It was parked on PR #8", text)
+        self.assertNotIn("Nothing stopped it", text)
+
+    def test_a_job_parked_a_day_is_flagged_though_its_blocker_is_still_due(self):
+        # past WAIT_CAP the lane plans it anyway (Lane.overdue), so a job still sitting is late again
+        blocker = T.Job(repo="demo", pr=8, state=T.CHECKING, stage=T.CHECKING, extra={"queued_at": E.stamp()})
+        self.assertEqual(self.flag([self.parked(7, 8, Q), blocker], 3601),
+                         ["[demo] PR #7 has waited 60 min in the queue; the planning seat is told"])
+        self.assertIn("It was parked on PR #8", " ".join(self.argvs("cc-notify")[0]))
+
+    def test_an_unparked_job_still_says_nothing_stopped_it(self):
+        self.assertEqual(len(self.flag(self.jobs((7, Q, T.QUEUED)), 3601)), 1)
+        self.assertIn("Nothing stopped it", " ".join(self.argvs("cc-notify")[0]))
+
     def test_retry_keeps_a_card_say_added_while_it_posted(self):
         # perms' read, 10-13: pending.json had no lock, so retry() wrote back a copy without say()'s new card
         C.write_json(C._pending_path(), {"a": {"argv": ["x"], "tries": 1, "repo": "demo", "pr": 1}})

@@ -534,7 +534,8 @@ def nightly(repo, units) -> list:
 
 def flag_waited(repos, cards, now=None) -> list:
     """Brief: "have the lander's tick flag once when the oldest due job has waited over 60 min". For each repo, the
-    due job (Lane.due: not at rest, no hold still running) with the oldest queued_at; queued more than
+    due job (Lane.due: not at rest, no hold still running), less any parked behind a due job (parked_behind), with the
+    oldest queued_at; queued more than
     cards.WAIT_FLAG_SECS ago (queued_at is to the second, so seconds are compared, and exactly 60 min is not over)
     -> cards.waited, which says it once per queuing and at most once per repo per WAIT_FLAG_SECS. A job with no
     queued_at has no age and is never flagged.
@@ -555,7 +556,9 @@ def flag_waited(repos, cards, now=None) -> list:
         return lines
     for r in (repos if cards else []):
         try:
-            aged = [(E.epoch_of(j.extra.get("queued_at") or ""), j) for j in J.lane_jobs(r) if L.Lane.due(j)]
+            jobs = J.lane_jobs(r)
+            aged = [(E.epoch_of(j.extra.get("queued_at") or ""), j) for j in jobs
+                    if L.Lane.due(j) and not parked_behind(j, jobs)]
             aged = [(at, j) for at, j in aged if at]
             if not aged:
                 continue
@@ -576,6 +579,17 @@ def flag_waited(repos, cards, now=None) -> list:
         except Exception as e:  # noqa: BLE001 — as tip_and_deploy: one repo's fault is said and logged
             E.log("tick-fault", r, None, f"waited: {type(e).__name__}: {e}")
     return lines
+
+
+def parked_behind(job, jobs):
+    """Brief (planning seat, 10-13): "A parked job's waited line should name what it's parked on, or not fire while its
+    blocker is open" (#922, parked on #1128, was flagged as "Nothing stopped it"). The due job in `jobs` that queued
+    `job` is parked on (extra["parked"]["on"]), while it is due and the park is younger than WAIT_CAP; else None. Past
+    WAIT_CAP the lane plans the job anyway, so from then on it is flagged again, and cards.waited names the park."""
+    park = job.extra.get("parked")
+    if job.state != T.QUEUED or not isinstance(park, dict) or L.Lane.overdue(job, "parked_since"):
+        return None
+    return next((j for j in jobs if j.pr == park.get("on") and j.key != job.key and L.Lane.due(j)), None)
 
 
 def spawn_lane(repo):
