@@ -12,6 +12,10 @@ selfcheck(){
   # …and so is every manifest a landing reads, the overlay's own included — nothing else lints that one on a
   # bare box, and unreadable it would declare no unit at all without saying so
   k "$(t lint_manifests)" "every manifest a landing reads is valid json"
+  # #1325: the hostdoor relay and its timers stay off on the hub — their core rows say owner, whatever the overlay does
+  for u in cc-hostdoor-relay.service cc-hostdoor-queries.timer cc-hostdoor-sync.timer; do
+    k "$(t test "$(cell "$u" enable)" = owner)" "$u answers enable=owner, so a landing never switches it on"
+  done
   k "$(t test "$(rows | wc -l)" -gt 0)" "manifest has rows"
   # every declared unit exists, and every unit file is declared: adding a file without a row must FAIL, loudly
   out=""; while IFS=$'\t' read -r u _; do [ -f "$UD/$u" ] || out="$out $u"; done < <(rows)
@@ -109,7 +113,12 @@ J
   k "$(t test "$(pl tool.service enable)" = required)" "policy answers a core-declared field from the core manifest"
   k "$(t test "$(pl dash.service enable)" = owner)" "…and an OVERLAY-declared field too — the gap #679's review caught"
   k "$(t test "$(pl tool.service enable)" = required)" "a unit both manifests name answers from core — the overlay only fills a field core leaves blank"
-  k "$(t test -z "$(pl quiet.service enable)")" "…and a field no row names comes back empty, not a stale answer"
+  k "$(t test -z "$(pl quiet.service restart_typo)")" "…and a field no row names comes back empty, not a stale answer"
+  # owner 10-13: declaring a unit in the overlay IS wanting it, so a row there with no enable word answers
+  # `required` (a landing enables it); an explicit owner stays owner, and a unit with no row stays empty (owner)
+  k "$(t test "$(pl quiet.service enable)" = required)" "an overlay row with no enable word answers required, not the empty answer a landing cards"
+  k "$(t test "$(pl dash.service enable)" = owner)" "…while an overlay row that says owner still answers owner"
+  k "$(t test "$(pl quiet.service start)" = "")" "…and only enable is filled: another blank overlay field stays empty"
   k "$(t test -z "$(pl no-such.service enable)")" "…and a unit no manifest declares comes back empty, not an error"
   unset -f pl
 
@@ -119,6 +128,9 @@ J
   out=$(rf dashboard/server.py 2>&1); re=$?
   k "$(t test "$re" -ne 0)" "an unreadable overlay manifest exits non-zero — an empty answer here is a landing's silent guess"
   k "$(t grep -q 'not valid json' <<<"$out")" "…and says which file, on stderr"
+  out=$(CC_UNITS_MANIFEST="$T/core/config/units.json" CC_UNITS_DIR="$T/core/config/systemd-user" \
+        CC_UNITS_OVERLAY="$T" "$0" policy quiet.service enable 2>/dev/null)
+  k "$(t test -z "$out")" "…and policy hears no row in an unreadable overlay manifest: empty, which a landing cards as owner"
   out=$(df core/bin/graphs 2>&1); re=$?
   k "$(t test "$re" -ne 0)" "…and daemons-for refuses it the same way: a daemon a landing cannot be told about is one it leaves on the old code"
   rm -rf "$T"; unset -f rf df

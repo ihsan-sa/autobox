@@ -7,6 +7,7 @@ python3 -m unittest discover -s core/tests/lander -p 'test_deploy.py'
 import contextlib
 import json
 import os
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -380,6 +381,52 @@ class TestDeploy(Box):
             D.request("demo", NEW)
             D.run("demo", green=lambda r, s: True)
             self.assertNotIn("enable", [c["argv"][2] for c in box.called("systemctl")])
+
+    def real_policy(self, argv):
+        """The fake box's `cc-units policy`, answered by the real cc-units over the deployed tree's manifests."""
+        r = subprocess.run([os.path.join(HERE, "..", "..", "bin", "cc-units"), *argv[1:]], capture_output=True,
+                           text=True, env={**os.environ, **D.manifest_env(self.root)})
+        return r.returncode, r.stdout
+
+    def overlay_tree(self, overlay):
+        os.makedirs(os.path.join(self.root, "core", "config"))
+        with open(os.path.join(self.root, "core", "config", "units.json"), "w") as f:
+            json.dump({"units": [{"unit": "relay.service", "enable": "owner"}]}, f)
+        os.makedirs(os.path.join(self.root, "config"), exist_ok=True)
+        with open(os.path.join(self.root, "config", "units.json"), "w") as f:
+            f.write(overlay)
+
+    def test_an_overlay_row_with_no_enable_word_is_enabled(self):
+        # owner 10-13: "a present overlay row with no enable word means enable. owner stays only for a missing row or
+        # an unreadable or empty manifest". An explicit owner row, a row-less unit and #1325's hub-off core row stay off
+        units = ("plain.service", "mine.service", "orphan.service", "relay.service")
+        for u in units:
+            self.unit(u)
+        self.overlay_tree(json.dumps({"units": [{"unit": "plain.service", "restart": "restart"},
+                                                {"unit": "mine.service", "enable": "owner"}]}))
+        box = self.fake(changes="\n".join(f"A\tconfig/systemd-user/{u}" for u in units),
+                        **{"cc-units policy": self.real_policy})
+        D.request("demo", NEW)
+        D.run("demo", green=lambda r, s: True)
+        enabled = [c["argv"][-1] for c in box.called("systemctl") if c["argv"][2] == "enable"]
+        self.assertEqual(enabled, ["plain.service"])
+        carded = sorted(u for c in box.called("cc-notify --approval") for u in units[1:] if u in c["argv"][-1])
+        self.assertEqual(carded, ["mine.service", "orphan.service", "relay.service"])
+
+    def wordless_row_stays_off(self, overlay):
+        self.unit("plain.service")
+        self.overlay_tree(overlay)
+        box = self.fake(changes="A\tconfig/systemd-user/plain.service", **{"cc-units policy": self.real_policy})
+        D.request("demo", NEW)
+        D.run("demo", green=lambda r, s: True)
+        self.assertNotIn("enable", [c["argv"][2] for c in box.called("systemctl")])
+        self.assertEqual(len(box.called("cc-notify --approval")), 1)
+
+    def test_an_unreadable_overlay_manifest_leaves_even_a_wordless_row_off(self):
+        self.wordless_row_stays_off('{"units": [{"unit": "plain.service"}')
+
+    def test_an_empty_overlay_manifest_leaves_the_unit_off(self):
+        self.wordless_row_stays_off("")
 
     def test_restart_reads_the_deployed_trees_manifest(self):
         # a restart=owner row added in the same change answers, not the lander's own release without it
