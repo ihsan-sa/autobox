@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""cc-goal — a goal with a number, and the landed attempts at it: says when the number has not moved, and stops the next
+attempt at the same approach until somebody names what is different.
+
+  cc-goal add REPO NAME --measure "CMD" --direction min|max [--min-delta D] [--after N] [--settle-h H] [--seat WINDOW]
+      Name a goal and how to measure it. The measure runs once now and that is the baseline; it must print a number
+      as the last line of its stdout. --after (default 2) is how many landed attempts may leave the number where it
+      was; --settle-h (default 6) is how long after a landing the number is read, because a measure like the median
+      time from queued to merged needs its landings to show up in it; --seat (default REPO) is the window told.
+  cc-goal attempt REPO NAME ROW [--pivot "WHAT IS DIFFERENT"]
+      Say that the board row ROW is an attempt at the goal. REFUSED (exit 3) while the goal is stalled, unless --pivot
+      says what this attempt does differently: a pivot starts the count again from the latest number.
+  cc-goal check [--apply]
+      For each goal, the attempt rows its board marks "landed by" are its landed attempts. Once a landing is
+      --settle-h old the measure runs once for it. A goal read after its --after-th settled landing, with no reading
+      that beat the baseline by more than --min-delta in --direction, is STALLED (a measure that failed is no reading). Prints one line per goal; with --apply a goal
+      that has just stalled is marked so and said ONCE: to the owner (cc-notify --major --keep, #<repo>) and to the
+      seat (cc-msg). cc-broker runs `check --apply` on its sweep (every 2 min); without --apply nothing is written.
+  cc-goal selfcheck
+
+Why (the owner, 2026-09-25): landing speed was the top goal for two days. #640 landed and the
+median from queued to merged stayed at 5.3 h, and the next fix was built inside the same design before anybody read
+the number again. "You cant keep getting stuck in one small way of implementing and sometimes you need to step
+outside the system or framework." So the number is read for the seat, and the door to another attempt asks it to
+step outside first.
+
+State: ~/.cc/goals.json (CC_GOALS), written under a lock. Boards are read from ~/.cc/boards/<repo>.json
+(CC_GOAL_BOARDS); cc-notify and cc-msg beside this bin (CC_GOAL_NOTIFY, CC_GOAL_MSG). A measure that fails or
+prints no number is a line on stderr and no reading; it is tried again on the next check. It asks no model.
+"""
+import calendar, contextlib, fcntl, json, os, subprocess, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+GOALS = os.environ.get("CC_GOALS") or f"{HOME}/.cc/goals.json"
+BOARDS = os.environ.get("CC_GOAL_BOARDS") or f"{HOME}/.cc/boards"
+NOTIFY = os.environ.get("CC_GOAL_NOTIFY") or f"{BIN}/cc-notify"
+MSG = os.environ.get("CC_GOAL_MSG") or f"{BIN}/cc-msg"
+MEASURE_S = int(os.environ.get("CC_GOAL_MEASURE_S") or 300)
+
+
+def stamp(t=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if t is None else t))
+
+
+def secs(s):
+    return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+@contextlib.contextmanager
+def locked(wait=True):
+    os.makedirs(os.path.dirname(GOALS) or ".", exist_ok=True)
+    with open(GOALS + ".lock", "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def load():
+    try:
+        return json.load(open(GOALS))
+    except (OSError, ValueError):
+        return {}
+
+
+def save(goals):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(GOALS) or ".", prefix=".goals.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(goals, f, indent=1)
+    os.replace(tmp, GOALS)
+
+
+def key(repo, name):
+    return f"{repo}/{name}"
+
+
+def measure(cmd):
+    """The number the measure prints as its last line, or None (said on stderr)."""
+    try:
+        p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=MEASURE_S)
+    except subprocess.TimeoutExpired:
+        print(f"cc-goal: measure timed out after {MEASURE_S}s: {cmd}", file=sys.stderr)
+        return None
+    lines = p.stdout.strip().splitlines()
+    try:
+        if p.returncode:
+            raise ValueError(f"exit {p.returncode}")
+        return float(lines[-1].split()[0])
+    except (ValueError, IndexError) as e:
+        print(f"cc-goal: measure gave no number ({e}): {cmd}", file=sys.stderr)
+        return None
+
+
+def better(g, v):
+    """Did reading v beat the baseline by more than min_delta, in the goal's direction?"""
+    d = (g["baseline"] - v) if g["direction"] == "min" else (v - g["baseline"])
+    return d > g["min_delta"]
+
+
+def landed_at(repo, row):
+    """When the board's row was landed (its first "landed by" note), or None."""
+    try:
+        t = (json.load(open(f"{BOARDS}/{repo}.json")).get("tracks") or {}).get(row) or {}
+    except (OSError, ValueError):
+        return None
+    for n in t.get("notes") or []:
+        if str(n.get("msg", "")).startswith(("landed by", "milestone landed by")):
+            return n.get("ts")
+    return None
+
+
+def cmd_add(a):
+    v = measure(a.measure)
+    if v is None:
+        print("cc-goal: no baseline, so no goal: the measure must print a number", file=sys.stderr)
+        return 2
+    with locked():
+        goals = load()
+        goals[key(a.repo, a.name)] = {"repo": a.repo, "name": a.name, "measure": a.measure, "direction": a.direction,
+                                      "min_delta": a.min_delta, "after": a.after, "settle_h": a.settle_h,
+                                      "seat": a.seat or a.repo, "baseline": v, "since": stamp(), "attempts": [],
+                                      "readings": [], "stalled_at": "", "pivots": []}
+        save(goals)
+    print(f"{key(a.repo, a.name)}: baseline {v:g}")
+    return 0
+
+
+def cmd_attempt(a):
+    with locked():
+        goals = load()
+        g = goals.get(key(a.repo, a.name))
+        if not g:
+            print(f"cc-goal: no goal {key(a.repo, a.name)} (cc-goal add)", file=sys.stderr)
+            return 2
+        if g["stalled_at"] and not a.pivot:
+            print(f"cc-goal: {key(a.repo, a.name)} has not moved after {len(g['attempts'])} landed attempts "
+                  f"({', '.join(x['row'] for x in g['attempts'])}): baseline {g['baseline']:g}. Another attempt at "
+                  f"the same approach is refused. Step outside it, then say what is different: "
+                  f"cc-goal attempt {a.repo} {a.name} {a.row} --pivot \"...\"", file=sys.stderr)
+            return 3
+        if a.pivot:
+            last = g["readings"][-1]["value"] if g["readings"] else g["baseline"]
+            g["pivots"].append({"at": stamp(), "text": a.pivot, "attempts": [x["row"] for x in g["attempts"]],
+                                "from": g["baseline"], "to": last})
+            g.update(baseline=last, since=stamp(), attempts=[], readings=[], stalled_at="")
+        if not any(x["row"] == a.row for x in g["attempts"]):
+            g["attempts"].append({"row": a.row, "at": stamp()})
+        save(goals)
+    print(f"{key(a.repo, a.name)}: {a.row} is attempt {len(g['attempts'])}")
+    return 0
+
+
+def tell(g, n):
+    rows = ", ".join(x["row"] for x in g["attempts"])
+    last = g["readings"][-1]["value"] if g["readings"] else g["baseline"]
+    text = (f"*{g['name']} has not moved after {n} landed attempts.* It was {g['baseline']:g} before them and reads "
+            f"{last:g} now ({rows}). The next attempt at the same approach is refused until it names what is "
+            f"different: step outside the design, then `cc-goal attempt {g['repo']} {g['name']} <row> --pivot \"...\"`.")
+    for argv in ([NOTIFY, "-t", f"{g['repo']}/{g['name']} stalled", "--major", "--keep", text], [MSG, g["seat"], text]):
+        try:
+            p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+            if p.returncode:
+                print(f"cc-goal: {argv[0]} exited {p.returncode}: {p.stderr.strip()[:200]}", file=sys.stderr)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"cc-goal: {argv[0]}: {e}", file=sys.stderr)
+
+
+def cmd_check(a, now=None):
+    now = time.time() if now is None else now
+    with locked(wait=False) as got:
+        if not got:
+            print("cc-goal: another check holds the lock; this one stands down")
+            return 0
+        goals = load()
+        for k, g in sorted(goals.items()):
+            settled = [t for t in (landed_at(g["repo"], x["row"]) for x in g["attempts"])
+                       if t and now - secs(t) >= g["settle_h"] * 3600]
+            n = len(settled)
+            if n > (g["readings"][-1]["landed"] if g["readings"] else 0):
+                v = measure(g["measure"])
+                if v is not None:
+                    g["readings"].append({"at": stamp(now), "value": v, "landed": n})
+            moved = any(better(g, r["value"]) for r in g["readings"])
+            if moved:
+                state = "moved"
+            elif g["stalled_at"] or (g["readings"] and g["readings"][-1]["landed"] >= g["after"]):
+                state = "STALLED"
+                if a.apply and not g["stalled_at"]:
+                    g["stalled_at"] = stamp(now)
+                    tell(g, n)
+            else:
+                state = "open"
+            last = g["readings"][-1]["value"] if g["readings"] else None
+            print(f"{k}\t{state}\tbaseline {g['baseline']:g}\tlatest {'-' if last is None else f'{last:g}'}"
+                  f"\tlanded {n}/{len(g['attempts'])}")
+        if a.apply:
+            save(goals)
+    return 0
+
+
+def main(argv):
+    import argparse
+    p = argparse.ArgumentParser(prog="cc-goal", description=__doc__.split("\n")[0])
+    s = p.add_subparsers(dest="cmd", required=True)
+    x = s.add_parser("add")
+    x.add_argument("repo"); x.add_argument("name")
+    x.add_argument("--measure", required=True)
+    x.add_argument("--direction", choices=("min", "max"), required=True)
+    x.add_argument("--min-delta", type=float, default=0.0)
+    x.add_argument("--after", type=int, default=2)
+    x.add_argument("--settle-h", type=float, default=6.0)
+    x.add_argument("--seat")
+    x = s.add_parser("attempt")
+    x.add_argument("repo"); x.add_argument("name"); x.add_argument("row")
+    x.add_argument("--pivot")
+    x = s.add_parser("check")
+    x.add_argument("--apply", action="store_true")
+    s.add_parser("selfcheck")
+    a = p.parse_args(argv)
+    return {"add": cmd_add, "attempt": cmd_attempt, "check": cmd_check,
+            "selfcheck": lambda _: selfcheck()}[a.cmd](a)
+
+
+def selfcheck():
+    global GOALS, BOARDS, NOTIFY, MSG
+    import io
+    ok = bad = 0
+
+    def k(cond, what):
+        nonlocal ok, bad
+        if cond:
+            ok += 1
+        else:
+            bad += 1; print(f"FAIL: {what}")
+
+    def fixture():
+        """Each case's own: an empty goal file, a board, a measure file, stub notify/msg that write one line each."""
+        global GOALS, BOARDS, NOTIFY, MSG
+        d = tempfile.mkdtemp(prefix="cc-goal-sc.")
+        GOALS, BOARDS = f"{d}/goals.json", d
+        for name in ("notify", "msg"):
+            with open(f"{d}/{name}", "w") as f:
+                f.write(f'#!/bin/sh\necho "$*" >> {d}/told\n')
+            os.chmod(f"{d}/{name}", 0o755)
+        NOTIFY, MSG = f"{d}/notify", f"{d}/msg"
+        return d
+
+    def board(d, landed):        # landed: {row: ts of its "landed by" note}
+        tracks = {r: {"status": "merged", "notes": [{"ts": "2026-01-01T00:00:00Z", "msg": "dispatched"},
+                                                     {"ts": t, "msg": "landed by cc-land: PR #1"}]}
+                  for r, t in landed.items()}
+        tracks["open-row"] = {"status": "running", "notes": [{"ts": "2026-01-01T00:00:00Z", "msg": "dispatched"}]}
+        json.dump({"tracks": tracks}, open(f"{d}/r.json", "w"))
+
+    def value(d, v):
+        open(f"{d}/m", "w").write(f"{v}\n")
+
+    def told(d):
+        try:
+            return open(f"{d}/told").read().splitlines()
+        except OSError:
+            return []
+
+    def run(*args, now=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            if args[0] == "check":
+                rc = cmd_check(type("A", (), {"apply": "--apply" in args})(), now=now)
+            else:
+                rc = main(list(args))
+        return rc, out.getvalue() + err.getvalue()
+
+    T = secs("2026-09-25T00:00:00Z")
+    L1, L2 = "2026-09-24T00:00:00Z", "2026-09-24T06:00:00Z"   # both settled (6 h) by T
+
+    # 1 the 09-25 case: two landed attempts, the median still 5.3 h, so the goal stalls, is told once, and the next
+    #   attempt at it is refused
+    d = fixture(); value(d, 5.3)
+    run("add", "r", "speed", "--measure", f"cat {d}/m", "--direction", "min", "--min-delta", "0.5")
+    run("attempt", "r", "speed", "optimistic-merge"); run("attempt", "r", "speed", "skip-suite")
+    board(d, {"optimistic-merge": L1, "skip-suite": L2})
+    rc, out = run("check", "--apply", now=T)
+    k("r/speed\tSTALLED" in out, f"two landed attempts and the number unmoved: stalled: {out}")
+    k(len(told(d)) == 2 and "--major --keep" in told(d)[0] and told(d)[1].startswith("r *speed has not moved"),
+      f"…said to the owner (cc-notify --major --keep) and to the seat (cc-msg r): {told(d)}")
+    run("check", "--apply", now=T + 600)
+    k(len(told(d)) == 2, "…and said once, not on every sweep")
+    rc, out = run("attempt", "r", "speed", "third-same")
+    k(rc == 3 and "--pivot" in out, f"another attempt at the same approach is refused while stalled: {rc} {out}")
+    # …and a pivot that names what is different is let through, counting again from the latest number
+    rc, out = run("attempt", "r", "speed", "land-by-hand", "--pivot", "land the lander fix by hand")
+    g = load()["r/speed"]
+    k(rc == 0 and not g["stalled_at"] and [x["row"] for x in g["attempts"]] == ["land-by-hand"]
+      and g["pivots"][0]["attempts"] == ["optimistic-merge", "skip-suite"], f"a pivot opens the door again: {rc} {out}")
+
+    # 2 kept: an attempt that moved the number is never stalled, however many landed
+    d = fixture(); value(d, 5.3)
+    run("add", "r", "speed", "--measure", f"cat {d}/m", "--direction", "min", "--min-delta", "0.5")
+    run("attempt", "r", "speed", "a"); run("attempt", "r", "speed", "b")
+    board(d, {"a": L1, "b": L2}); value(d, 2.0)
+    rc, out = run("check", "--apply", now=T)
+    k("r/speed\tmoved" in out and told(d) == [], f"a number that moved past min-delta: moved, nobody told: {out}")
+    k(run("attempt", "r", "speed", "c")[0] == 0, "…and the next attempt is let through")
+
+    # 3 direction and min-delta: a move inside the delta, or the wrong way, is not a move
+    d = fixture(); value(d, 10)
+    run("add", "r", "rate", "--measure", f"cat {d}/m", "--direction", "max", "--min-delta", "1")
+    run("attempt", "r", "rate", "a"); run("attempt", "r", "rate", "b")
+    board(d, {"a": L1, "b": L2}); value(d, 10.5)
+    k("STALLED" in run("check", now=T)[1], "a max goal that rose by less than min-delta has not moved")
+    d = fixture(); value(d, 10)
+    run("add", "r", "rate", "--measure", f"cat {d}/m", "--direction", "max")
+    run("attempt", "r", "rate", "a"); run("attempt", "r", "rate", "b")
+    board(d, {"a": L1, "b": L2}); value(d, 12)
+    k("\tmoved" in run("check", now=T)[1], "…and one that rose past it has")
+
+    # 4 not yet: fewer than --after landings, an attempt the board has not landed, or a landing still settling
+    d = fixture(); value(d, 5.3)
+    run("add", "r", "speed", "--measure", f"cat {d}/m", "--direction", "min")
+    run("attempt", "r", "speed", "a"); run("attempt", "r", "speed", "open-row")
+    board(d, {"a": L1})
+    rc, out = run("check", "--apply", now=T)
+    k("\topen\t" in out and "landed 1/2" in out and told(d) == [], f"one landing of two attempts is not a stall: {out}")
+    d = fixture(); value(d, 5.3)
+    run("add", "r", "speed", "--measure", f"cat {d}/m", "--direction", "min")
+    run("attempt", "r", "speed", "a"); run("attempt", "r", "speed", "b")
+    board(d, {"a": L1, "b": stamp(T - 3600)})
+    k("\topen\t" in run("check", now=T)[1], "a landing an hour old has not settled into the number yet")
+
+    # 5 without --apply nothing is written or said; a measure that prints no number is no goal and no reading
+    d = fixture(); value(d, 5.3)
+    run("add", "r", "speed", "--measure", f"cat {d}/m", "--direction", "min")
+    run("attempt", "r", "speed", "a"); run("attempt", "r", "speed", "b"); board(d, {"a": L1, "b": L2})
+    run("check", now=T)
+    k(told(d) == [] and load()["r/speed"]["readings"] == [] and not load()["r/speed"]["stalled_at"],
+      "check without --apply writes nothing and tells nobody")
+    os.remove(f"{d}/m")
+    rc, out = run("check", "--apply", now=T)
+    k("\topen\t" in out and told(d) == [], f"two settled landings and a measure that failed: no reading, no stall: {out}")
+    value(d, 5.3)
+    k("STALLED" in run("check", "--apply", now=T + 120)[1], "…and once the measure answers, the stall is read")
+    rc, out = run("add", "r", "bad", "--measure", "echo none", "--direction", "min")
+    k(rc == 2 and "r/bad" not in load(), "a measure with no number makes no goal")
+
+    print(f"cc-goal selfcheck: {ok} passed, {bad} failed")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -58,9 +58,10 @@ THE ONE TIMER. cc-broker.timer is the box's only delivery tick, so a bare `--flu
 to have timers of their own (the owner's audit of 2026-10-03: cc-msg.timer and cc-broker.timer each ran 1,173 times
 a day for about 95 deliveries). Every tick, `cc-msg --drain` runs beside the flush, started first and waited for
 last, so a message spooled behind a busy pane or a dialog is typed within the same 60 s it always was and a slow
-inject here does not hold it up. Every SWEEP_S, after the flush, `cc-stall --apply` and then `cc-msg --sweep` run
-(they were cc-sweep.timer, 2 min). A rider that fails is a line on stderr, in the unit's journal, and never stops
-the flush or the other rider; what the drain could not deliver it keeps and reports itself, as it always did.
+inject here does not hold it up. Every SWEEP_S, after the flush, `cc-stall --apply`, `cc-msg --sweep` and then
+`cc-goal check --apply` run (the first two were cc-sweep.timer, 2 min; the last reads a goal's number after its
+landings and says when it has not moved). A rider that fails is a line on stderr, in the unit's journal, and never stops
+the flush or the other riders; what the drain could not deliver it keeps and reports itself, as it always did.
 A flush aimed at one target runs no rider: that is a caller's door, not the tick.
 """
 import sys, os, re, json, time, calendar, socket, subprocess, fcntl, contextlib
@@ -84,6 +85,7 @@ TOOK = ("delivered", "typed")           # cc-slack's two words for "a session ha
 HELD = ("queued", "spooled")
 MSG = os.environ.get("CC_BROKER_MSG") or f"{BIN}/cc-msg"          # the riders (THE ONE TIMER, above)
 STALL = os.environ.get("CC_BROKER_STALL") or f"{BIN}/cc-stall"
+GOAL = os.environ.get("CC_BROKER_GOAL") or f"{BIN}/cc-goal"
 SWEEP_S = int(os.environ.get("CC_BROKER_SWEEP_S", "120"))          # the sweep's own cadence, as cc-sweep.timer had it
 SWEEP_STAMP = f"{BROKER}/sweep.stamp"
 
@@ -343,6 +345,7 @@ def tick():
             open(SWEEP_STAMP, "a").close(); os.utime(SWEEP_STAMP)    # stamped at the START: a sweep that dies
             rider([STALL, "--apply"])                                 # is not retried every tick
             rider([MSG, "--sweep"])
+            rider([GOAL, "check", "--apply"])
         if drain:
             drain.wait()
             if drain.returncode:
@@ -611,13 +614,13 @@ def selfcheck():
     with open(f"{th}/rider-stub", "w") as f:   # sweep presses keys at every pane of this box's tmux
         f.write('#!/usr/bin/env bash\necho "${0##*/} $*" >> "$CC_SC_RIDERS"\nexit "${CC_SC_RIDER_RC:-0}"\n')
     os.chmod(f"{th}/rider-stub", 0o755)
-    for name in ("cc-msg", "cc-stall"):
+    for name in ("cc-msg", "cc-stall", "cc-goal"):
         os.symlink(f"{th}/rider-stub", f"{th}/{name}")
 
     def env(**extra):
         return {**os.environ, "HOME": th, "CC_BROKER_INJECT": stub, "CC_SC_REC": rec, "CC_SC_SLOW": slow,
                 "CC_BOX": "abox", "CC_NOTIFY_LOG_ONLY": "1",
-                "CC_BROKER_MSG": f"{th}/cc-msg", "CC_BROKER_STALL": f"{th}/cc-stall", "CC_SC_RIDERS": riders, "CC_NOTIFY_LOG": f"{th}/notify.log",
+                "CC_BROKER_MSG": f"{th}/cc-msg", "CC_BROKER_STALL": f"{th}/cc-stall", "CC_BROKER_GOAL": f"{th}/cc-goal", "CC_SC_RIDERS": riders, "CC_NOTIFY_LOG": f"{th}/notify.log",
                 "CC_SPEND_TIER": "autonomous",     # the tier the box is on right now is nobody's fixture
                 **extra}
 
@@ -858,9 +861,9 @@ def selfcheck():
         run("inject", "--source", "reconcile", "r12", "idle: r12/t — quiet")
         run("--flush", CC_BROKER_DEBOUNCE_S="0", CC_SC_RIDER_RC="1")
         got = open(riders).read().splitlines()
-        ok("a bare --flush runs cc-msg --drain, and the first tick runs cc-stall --apply then cc-msg --sweep",
-           "cc-msg --drain" in got and got.count("cc-msg --sweep") == 1
-           and got.index("cc-stall --apply") < got.index("cc-msg --sweep"))
+        ok("a bare --flush runs cc-msg --drain, and the first tick runs cc-stall --apply, cc-msg --sweep, cc-goal check --apply",
+           "cc-msg --drain" in got and got.count("cc-msg --sweep") == 1 and got.count("cc-goal check --apply") == 1
+           and got.index("cc-stall --apply") < got.index("cc-msg --sweep") < got.index("cc-goal check --apply"))
         ok("…and riders that fail cost the flush nothing: the held event is still delivered",
            "r12" in said() and not pending("r12"))
         open(riders, "w").close()

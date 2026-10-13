@@ -40,6 +40,18 @@ immediate task is done it looks up: what are the standing goals, what has the ow
 about, what moves those forward? Steps toward a named goal are real work: scope them, dispatch
 them, or do them. Work that serves no named goal is noise, however clever.
 
+A goal with a number gets one: `cc-goal add <repo> <goal> --measure "<cmd>" --direction min|max`, and each row
+dispatched toward it gets `cc-goal attempt <repo> <goal> <row>`. Once the attempts have landed and settled, the
+broker's sweep reads the number. If it hasn't moved after two of them, the owner and the seat are told once, and
+the next attempt is refused until `--pivot "<what is different>"` says how it steps outside the approach that
+didn't work. Landing speed sat at 5.3 h for two days while each fix was built inside the same design, and the
+owner had to order the pivot himself (2026-09-25).
+
+A roadblock is something to work around before it is a question for the owner. When a command is refused or a
+step stalls, read what the refusal actually saw (a stale hold, a wrong path, a missing file) and look for another
+route first. Park on him only when the answer really is his: "things shouldnt wait on me unless they really have
+to" (owner, 2026-09-30).
+
 When something needs designing (a diagram set, a UI, a layout, a visual identity), offer the owner a
 Claude Design run and hand over a ready prompt: what it is for, the pieces and how they connect, what
 must read at a glance, the look, and the deliverables. Send it as a file in the thread. It runs in
