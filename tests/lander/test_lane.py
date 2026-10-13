@@ -3873,14 +3873,60 @@ class Parallel(Fixture):
         self.assertEqual(calls, 2)   # the read that parked it, and the read before it is planned
         self.assertEqual(self.merged_order(), [1, 2])
 
-    def test_a_parked_pr_is_read_again_once_its_read_is_stale(self):
+    def test_a_parked_pr_with_a_stale_read_has_no_turn_until_the_pr_it_waits_for_moves(self):
+        # brief, 10-13: "A parked job is replanned only when its blocker changed (merged, moved or left the lane), not
+        # on every wake": #1's five checks are five wakes, and none of them gives #2 a turn, stale read or not
         self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n", "d/w": "n\n", "e/v": "n\n"})
         self.pr(2, {"a/x": "n\n"})
         for n in (1, 2):
             J.submit("demo", n)
         with mock.patch.object(L, "PARK_FRESH", 0):
             calls, _ = self.facts_calls(2)
-        self.assertGreater(calls, 2)
+        self.assertEqual(calls, 2)   # the read that parked it, and the read once #1 had merged
+        self.assertEqual(self.merged_order(), [1, 2])
+
+    def test_a_free_slot_starts_a_checking_jobs_next_check_before_parked_jobs_are_replanned(self):
+        # brief, 10-13: "while a check slot is free and some checking job has a check left to run, the lane starts that
+        # check before it spends time replanning queued or parked jobs" (#1189 ran check-sh at 03:15, then nothing
+        # until 05:47, while every wake replanned the parked PRs ahead of its heavy plan)
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})   # heavy: a, b
+        self.pr(2, {"c/z": "n\n", "d/w": "n\n"})   # heavy: c, d
+        for n in (3, 4, 5):                         # each parks on #1
+            self.pr(n, {"a/x": "n\n", f"e{n}/v": "n\n"})
+        for n in (1, 2, 3, 4, 5):
+            J.submit("demo", n)
+        events, lock, real = [], threading.Lock(), L.Lane.queued
+
+        def queued(lane, job):   # a turn of a queued job: a park, or a replan
+            with lock:
+                events.append(("turn", job.pr, (self.job(1).state, self.job(2).state)))
+            return real(lane, job)
+
+        def hook(name, n):
+            if n <= 2:   # the first checks of #1 and #2 run until #3-#5 are parked, so they end with the parks made
+                end = time.time() + 10
+                while not all(self.job(p).extra.get("parked_since") for p in (3, 4, 5)) and time.time() < end:
+                    time.sleep(0.02)
+            with lock:
+                events.append(("check", name))
+        planner = Planner(owners={"a": "a/", "b": "b/", "c": "c/", "d": "d/", **{f"e{n}": f"e{n}/" for n in (3, 4, 5)}})
+        with mock.patch.object(L.Lane, "width", lambda self: 2), mock.patch.object(L, "SMALL_CHECKS", 1), \
+                mock.patch.object(L, "PARK_FRESH", 0), mock.patch.object(L.Lane, "queued", queued):
+            u, lines = self.land(planner=planner, runner=Runner(hook=hook))
+        self.assertIn("[demo] PR #3 waits for PR #1: both change a/x", lines)
+        firsts = [e for e in events if e[0] == "check"][:2]
+        self.assertEqual(sorted(e[1] for e in firsts), ["a", "c"])
+        # the suppressed case: no parked job has a turn between the first checks ending and #1's and #2's next ones
+        after = events[events.index(firsts[-1]) + 1:]
+        seconds = [i for i, e in enumerate(after) if e[0] == "check" and e[1] in ("b", "d")]
+        self.assertEqual(len(seconds), 2, events)
+        self.assertEqual([e for e in after[:max(seconds)] if e[0] == "turn" and e[1] in (3, 4, 5)], [], events)
+        # and no parked job is replanned while #1, the job it waits for, still checks: one turn each, the park
+        while_checking = [e[1] for e in events if e[0] == "turn" and e[1] in (3, 4, 5) and e[2][0] == T.CHECKING]
+        self.assertEqual(sorted(while_checking), [3, 4, 5], events)
+        # the kept case: once #1 has moved, the parked jobs are planned and land
+        self.assertEqual(self.merged_order()[:2], [1, 2])
+        self.assertEqual(sorted(self.merged_order()), [1, 2, 3, 4, 5])
 
     def test_a_parked_pr_whose_head_moved_is_planned_and_pinned_at_the_new_head(self):
         self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
@@ -3902,6 +3948,58 @@ class Parallel(Fixture):
         self.assertEqual([c[1] for c in planner.calls if c[2] == ("c/z",)], [new[0]])
         pin = self.box()["merges"][-1]
         self.assertEqual(pin[pin.index("--match-head-commit") + 1], new[0])
+
+    def blocker_moves_while(self, hold, counted):
+        """#2 parks on #1; then, while #1's check runs, `hold()` turns a box hold on and #1 is held by hand, so #2's
+        blocker has moved while the lane may not move #2. `counted` (a module and a name) is wrapped to count its
+        calls and to raise past 500, so a lane that spins fails the case rather than hanging it. -> (calls, lines)"""
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"a/x": "n\n"})
+        for n in (1, 2):
+            J.submit("demo", n)
+        calls, real = [0], getattr(*counted)
+
+        def counting(*a, **k):
+            calls[0] += 1
+            if calls[0] > 500:
+                raise AssertionError("the lane spun on the parked job")
+            return real(*a, **k)
+
+        def hook(name, n):
+            if n == 1:
+                end = time.time() + 10
+                while not (J.load("demo", 2).extra or {}).get("parked") and time.time() < end:
+                    time.sleep(0.02)
+                hold()
+                job = J.load("demo", 1)
+                J.move(job, T.HELD, "held by hand")
+                job.extra.update(held_from=T.QUEUED, hold="box", not_before=E.stamp(time.time() + 900))
+                J.save(job)
+                time.sleep(0.5)   # ~10 passes at POLL 0.05 before the check ends and the lane may stop
+        with mock.patch.object(*counted, counting):
+            _, lines = self.land(runner=Runner(hook=hook))
+        self.assertIn("[demo] PR #2 waits for PR #1: both change a/x", lines)
+        self.assertEqual(self.job(2).state, T.QUEUED)
+        return calls[0], lines
+
+    def test_a_parked_pr_whose_blocker_moved_during_a_pause_sleeps_rather_than_spinning(self):
+        # review, 10-13: an unblocked parked job was let back in every pass while the box held it, refused before it
+        # moved, so todo never emptied and reap(POLL) never slept
+        held = threading.Event()
+        with mock.patch.object(L, "paused", lambda target: held.is_set()):
+            calls, lines = self.blocker_moves_while(held.set, (L, "box_hold"))
+        self.assertLess(calls, 50, "the lane spun on the parked job")
+        self.assertLessEqual(sum("PR #2: demo is paused" in ln for ln in lines), 1, lines[-3:])
+
+    def test_a_parked_pr_whose_blocker_moved_during_a_github_backoff_sleeps_rather_than_spinning(self):
+        # review, 10-13: step() leaves a queued job where it is during a backoff, so the unblocked parked job had a
+        # turn every pass, unslept
+        def backoff():
+            J.write_atomic(GH.backoff_path(), {"until": time.time() + 600, "fails": 1})
+            self.addCleanup(os.unlink, GH.backoff_path())
+        calls, lines = self.blocker_moves_while(backoff, (L.Lane, "step"))
+        self.assertLess(calls, 50, "the lane spun on the parked job")
+        self.assertLessEqual(sum("PR #2: GitHub backoff" in ln for ln in lines), 1, lines[-3:])
 
     def test_a_check_whose_job_left_checking_meanwhile_is_not_recorded(self):
         self.pr(1, {"a/x": "n\n"})

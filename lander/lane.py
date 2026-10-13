@@ -205,8 +205,9 @@ EXPRESS_SLOTS = int(os.environ.get("LANDER_EXPRESS_SLOTS") or 1)
 # one with no green run there (a new or renamed check) waits for a slot like any other
 EXPRESS_SECS = float(os.environ.get("LANDER_EXPRESS_SECS") or 120)
 EXPRESS_TAIL = 1 << 20
-# a job parked on an overlap is retried at every wake; within this many seconds of its last read of GitHub it is
-# checked against the files that read gave, with no new call (a head moved meanwhile is read once this runs out)
+# a job parked on an overlap is retried when the job it waits for moves (unblocked), not at every wake; within this many
+# seconds of its last read of GitHub it is checked against the files that read gave, with no new call (a head moved
+# meanwhile is read at the first such turn after this runs out, or at once when it is queued again)
 PARK_FRESH = float(os.environ.get("LANDER_PARK_FRESH") or 300)
 # idea panel, 10-04: "no PR waits more than 24 h in a lane without a landing attempt". A job parked this long is planned
 # despite its overlap (the Δ re-plan at mergeable catches a real one), and one queued this long takes a slot first
@@ -486,6 +487,7 @@ class Lane:
         self.origin = {}         # {branch: sha}: what origin last sent for each branch this lane fetched
         self.said = set()        # (job, job it waits for): said once
         self.parked = set()      # queued jobs waiting on an overlapping one
+        self.park_on = {}        # parked job key -> (key, state, head) of the job it waits for when it parked
         self.clash_of = {}       # (head, head) sorted -> True when the two do not merge cleanly (clashes)
         self.tried_nb = {}       # job key -> its not_before when it last had its turn: a later one has fallen due
         self.tried_q = {}        # job key -> (queued_at, head) when its turn ended: another is a re-queue or a push
@@ -566,15 +568,18 @@ class Lane:
             for j in jobs:   # a job that has had its turn gets another when (a) it was held since and that hold has
                 # run out, (b) it is checking and due a re-read of its PR, waiting or not, unless the box holds it
                 # (paused, a tier stop): re-admitted, it would be refused before it read, every pass, unslept, or
-                # (c) it was queued again since or has a new head (a push): its queued_at or head differs. A move or
-                # a hold (reap) is no re-queue. A job whose turn ended it (handed back, query, done) left `tried` then,
+                # (c) it was queued again since or has a new head (a push): its queued_at or head differs, or (d) it is
+                # parked and the job it waits for has moved, unless a GitHub backoff or the box holds it, for (b)'s
+                # reason: step() moves no queued job during a backoff. A move or a hold (reap) is no re-queue. A job whose turn ended it (handed back, query, done) left `tried` then,
                 # since a re-queue may share its one-second stamp. Without these a re-queue drained in this pass sat
                 # in `tried` until the lane process ended (#1226, #1228, #1234)
                 if j.key not in tried:
                     continue
                 if (j.state == T.HELD and self.due(j) and self.tried_nb.get(j.key) != j.extra.get("not_before")) \
                         or (self.reread_due(j) and not self.box_hold(j)) \
-                        or self.tried_q.get(j.key) != self.queued_mark(j):
+                        or self.tried_q.get(j.key) != self.queued_mark(j) \
+                        or (j.key in self.parked and self.unblocked(j, jobs) and not GH.backoff()
+                            and not self.box_hold(j)):
                     tried.discard(j.key)
             todo = [j for j in jobs if j.key not in tried and self.due(j)]
             if not todo:   # every due job has had its turn: record what finished (a freed slot), or wait for it
@@ -582,12 +587,17 @@ class Lane:
                     return ""
                 self.reap(POLL)   # the timeout lets a new request in while every check still runs
                 continue
-            # one put first (queue --first), then a job in the lane WAIT_CAP or longer, then the oldest small job
-            # (a heavy one queued HEAVY_WAIT or longer ago counts as small until its first check runs), else the
-            # oldest heavy one
+            free = self.slot_free()
+            # one put first (queue --first), then a job in the lane WAIT_CAP or longer, then any job not still parked,
+            # then the oldest small job (a heavy one queued HEAVY_WAIT or longer ago counts as small until its first
+            # check runs), else the oldest heavy one; and of those, while a slot is free, a checking job with a check
+            # left first (brief, 10-13: "while a check slot is free and some checking job has a check left to run, the
+            # lane starts that check before it spends time replanning queued or parked jobs")
             job = min(todo, key=lambda j: (not J.first(j.repo, j.pr), not self.overdue(j, "queued_at"),
+                                           self.still_parked(j, jobs),
                                            self.heavy(j) and not (self.overdue(j, "queued_at", HEAVY_WAIT)
-                                                                  and not self.started(j))))
+                                                                  and not self.started(j)),
+                                           not (free and self.check_left(j))))
             tried.add(job.key)
             self.tried_nb[job.key] = job.extra.get("not_before")
             self.tried_q[job.key] = self.queued_mark(job)
@@ -604,8 +614,34 @@ class Lane:
                 self.wake(but=job.key)   # a job moved or took a slot: whatever waited on it looks again
 
     def wake(self, but=""):
-        self.tried -= self.waiting - {but}
-        self.waiting &= {but}
+        """The jobs waiting on a slot or a read look again; a parked job does not: the loop gives it a turn when the job
+        it waits for has moved (unblocked)."""
+        self.tried -= self.waiting - self.parked - {but}
+        self.waiting &= {but} | self.parked
+
+    def unblocked(self, job, jobs) -> bool:
+        """brief, 10-13: "A parked job is replanned only when its blocker changed (merged, moved or left the lane), not
+        on every wake": the job `job` parked on has left the lane or has another state or head than when it parked, or
+        `job` has been parked WAIT_CAP or longer (overlapping() then lets it be planned)."""
+        key, state, head = self.park_on.get(job.key) or ("", "", "")
+        on = next((j for j in jobs if j.key == key), None)
+        return on is None or (on.state, on.head) != (state, head) or self.overdue(job, "parked_since")
+
+    def still_parked(self, job, jobs) -> bool:
+        """`job` is queued and parked, and this lane has not seen the job it waits for move (one parked before the lane
+        started has not)."""
+        return job.state == T.QUEUED and (job.key in self.parked or isinstance(job.extra.get("parked"), dict)) \
+            and not (job.key in self.park_on and self.unblocked(job, jobs))
+
+    def check_left(self, job) -> bool:
+        """A checking job with a check of its plan neither recorded nor in the pool."""
+        return job.state == T.CHECKING and bool(job.plan) and any(
+            n not in job.results and (job.key, n) not in self.inflight for n in job.plan.checks)
+
+    def slot_free(self) -> bool:
+        """A box slot is free, or a runner's while the laptop is up."""
+        return self.room(False) or (bool(RUN.laptop_dest()) and not self.member and self.laptop_up()
+                                    and self.room(True))
 
     def width(self) -> int:
         """How many box checks this lane keeps in flight: the admission slots the box allows now."""
@@ -879,10 +915,12 @@ class Lane:
 
     def park(self, job, other, read):
         """`job` waits for `other`. read: its facts were just read from GitHub, so the files are kept (saved) with
-        the time, and later wakes check them without a new call until PARK_FRESH runs out. The first park stamps
-        parked_since (never refreshed until it is planned) and writes the one queue.log line that says it waits."""
+        the time, and its later turns (unblocked) check them without a new call until PARK_FRESH runs out. The first
+        park stamps parked_since (never refreshed until it is planned) and writes the one queue.log line that says it
+        waits."""
         self.waiting.add(job.key)
         self.parked.add(job.key)
+        self.park_on[job.key] = (other.key, other.state, other.head)
         first = not job.extra.get("parked_since")
         if first:
             job.extra["parked_since"] = E.stamp()
@@ -1099,6 +1137,7 @@ class Lane:
         if other:   # design: "Two changes that overlap from the start don't both burn CPU; the later one waits"
             return self.park(job, other, read=True)
         self.parked.discard(job.key)
+        self.park_on.pop(job.key, None)
         for k in ("parked", "parked_since"):
             job.extra.pop(k, None)
         if not self.unit("planner"):

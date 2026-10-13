@@ -28,7 +28,13 @@ worker, a loop, a pane moved inside 2 h — overrides them. A mark flips a `queu
 abandoned path; it is not work in flight.
 
 WAITING: the worker's own `STATUS: BLOCKED: <question>` line makes a track `waiting` on a person, whatever is
-running; a loop sitting out a usage limit waits on the clock and never reaches the owner. Prose is never read.
+running; a loop sitting out a usage limit waits on the clock and never reaches the owner. Prose never raises an ask.
+
+OWNER-HELD: a row an open owner ask names (cc-slack's owner-asks.json, a week at most, the track's slug and its repo in its text),
+or whose last three notes park it on purpose ("parked on purpose", "held … on purpose", "when the owner says yes"),
+waits on the owner already. Its ask goes out once and is not repeated daily while it stands, and its stopped line in
+the wake's look wakes the seat once, never again after 24 h; the line that does go out says an owner ask is already
+pending (or that the row is parked on purpose). A `held` row stays out of both, as before.
 
 DRIFT: decidable (the PR merged, a worker is in the worktree, it finished and its PR is open) is applied through
 cc-board with a `reconciled:` note. Undecidable (closed PR, gone worktree, refused checkpoint, unpushed branch,
@@ -184,7 +190,12 @@ GIT = ("git", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "-c", 
        "-c", "protocol.ssh.allow=always")   # every git call: no fsmonitor, and origin only over https or ssh
 FILE_REMOTES = False   # a local-path origin is never contacted (its hooks and config are its owner's); fixtures allow it
 AGENT_HOURS = 4    # …and the silence that says its subagent is gone (CC_JANITOR_AGENT_HOURS)
-QUIET_H = 24       # wake: hours the same look is not sent again
+QUIET_H = 24       # wake: hours the same look is not sent again (an owner-held row's line: never again)
+OWNER_ASKS = f"{os.environ.get('CC_SLACK_DIR') or HOME + '/.cc/slack'}/owner-asks.json"   # cc-slack's open pages to the owner
+CHANNELS = f"{os.environ.get('CC_SLACK_DIR') or HOME + '/.cc/slack'}/channels.json"   # cc-slack's name → channel id table
+OWNER_ASK_KEEP = 7 * 86400   # cc-slack drops an ask he never answered after a week; so does this read
+PARKED = re.compile(r"\bparked\b[^.\n]*\bon purpose\b|\bon purpose\b[^.\n]*\bparked\b|\b(?:held|waits?|waiting|taken down)\b"
+                    r"[^.\n]*\bon purpose\b|\bwhen the owner says (?:yes|go)\b", re.I)
 WORKING_FOOTER = "esc to interrupt"   # the pane footer for a turn in progress (the string cc-slack reads)
 BOARD_DUE = ("queued", "blocked", "todo")
 PULSE_LOG, JANITOR_LOG = f"{STATE}/pulse.log", f"{STATE}/janitor.log"
@@ -476,6 +487,58 @@ def waits_for(f):
     if f.get("limited") and f.get("loops") and not f.get("workers"):
         return ("clock", "a Claude usage limit — the loop resumes by itself, nobody is being asked")
     return ("", "")
+
+
+def open_asks(path=None, t0=None):
+    """The owner's open asks as (chat, text) (cc-slack's owner-asks.json): unanswered, a week at most. Unreadable → none."""
+    t0 = now() if t0 is None else t0
+    try:
+        d = json.load(open(path or OWNER_ASKS))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for k, a in (d.items() if isinstance(d, dict) else ()):
+        if str(k).startswith("_") or not isinstance(a, dict):
+            continue                                    # "_<answer>" keys are his answers, not asks
+        try:
+            at = float(a.get("at") or 0)
+        except (TypeError, ValueError):
+            at = 0.0
+        if t0 - at <= OWNER_ASK_KEEP:
+            out.append((str(a.get("chat") or ""), str(a.get("text") or "")))
+    return out
+
+
+def repo_channels(repo, path=None, repos=None):
+    """The channel ids that are this repo's: channels.json keys `<repo>`, `<repo>-…` and `<repo>@…`, never `<repo>--…` (its own repo). Unreadable → none.
+    A key goes to the LONGEST repo it starts with (`repos`, default every board), so `chip` never takes `chip-flow-…`."""
+    try:
+        d = json.load(open(path or CHANNELS))
+    except (OSError, ValueError):
+        return set()
+    if not repo:
+        return set()
+    names = set(repos if repos is not None else (os.path.basename(f)[:-5] for f in glob.glob(f"{BOARDS}/*.json"))) | {repo}
+
+    def owner(k):   # the longest name k is, or starts with as `<name>-` / `<name>@`
+        return max((n for n in names if k == n or k.startswith((n + "-", n + "@"))), key=len, default="")
+    return {str(v) for k, v in (d.items() if isinstance(d, dict) else ())
+            if isinstance(v, str) and owner(str(k)) == repo and not str(k).startswith(repo + "--")}
+
+
+def owner_held(repo, track, notes, asks, chans=()):
+    """Pure: why this row already waits on the owner, or "". Brief (C6): "a row that is waiting on an open owner
+    ask, held for his yes, or noted as parked on purpose wakes its seat once and not every day. When a wake does
+    fire, it says an owner ask is already pending." `held` rows never reach here: the wake and the asks skip them."""
+    # An ask record has no repo field ({chat, thread, ts, text, link, at}), so the repo is the one its chat is
+    # (`chans`: this repo's channel ids) or the one its text names — the slug alone is not enough, repos reuse names.
+    slug = re.compile(rf"(?<![\w-]){re.escape(track)}(?![\w-])")
+    rp = re.compile(rf"(?<![\w-]){re.escape(repo)}(?![\w-])")
+    if track and repo and any(slug.search(t) and ((c and c in chans) or rp.search(t)) for c, t in asks):
+        return "an owner ask is already pending"
+    if any(PARKED.search(str(n or "")) for n in list(notes or ())[-3:]):
+        return "parked on purpose, by its note"
+    return ""
 
 
 def panes(lines, ppids, sessions=(), t0=None):
@@ -1273,6 +1336,7 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
                                          seat_turn(wp.get(ag)) if ag and wp else None)
             f = {"agent": (t.get("agent") or "").strip(), "agent_live": ag_live, "agent_stale": ag_stale,
                  "held": str(t.get("held") or "").strip(),
+                 "notes": [str((n or {}).get("msg") or "") for n in (t.get("notes") or [])[-3:] if isinstance(n, dict)],
                  "repo": repo, "track": track, "status": st, "pr": pr, "kind": t.get("kind") or "track",
                  "pr_state": pr_state(repo, pr, net) if ask_pr else ("?" if want_pr and net else None),
                  "live": key in live, "wt_exists": os.path.isdir(wt),
@@ -2198,6 +2262,11 @@ def wake_repo(repo, rows, snap, net, on):
     due = sorted(k for k, (w, a, h) in words.items() if w in BOARD_DUE and not a and not h and not bundled(k))
     due = [k for k in due if tier_allows("start", f"{repo}/{k}")]
     stopped = [k for k in due if words[k][0] == "blocked"]
+    asks_ = open_asks() if stopped else []
+    owner = {k: owner_held(repo, k, [(n or {}).get("msg") for n in (rows[k].get("notes") or []) if isinstance(n, dict)], asks_,
+                          repo_channels(repo))
+             for k in stopped}
+    owner = {k: w for k, w in owner.items() if w}
     start, could, free = "none", "", []
     if due and net:                                     # the one network call: cc-brief's room arithmetic
         lim = sh(sib("cc-limit"), "status", timeout=30)
@@ -2224,10 +2293,16 @@ def wake_repo(repo, rows, snap, net, on):
                       + ([f"start {k}" for k in free] or ([f"start {start}: {could}"] if start != "none" else [])))
     seen, when = last_look(repo)
     new = [ln for ln in look.splitlines() if ln not in seen.splitlines()]
-    if when and now() - when < QUIET_H * 3600 and not new:
-        return pulse_log(repo, "skip", f"woken {int((now() - when) // 60)}m ago for this same state")
+    # AN OWNER-HELD ROW WAKES ITS SEAT ONCE. Its line stays in the look, so the first wake carries it, but it never
+    # re-sends after QUIET_H on its own: website/aiportfolio-404 waits on the owner's yes and the "rows stopped" wake
+    # re-fired on it 10-11 and 10-12 for the seat to reply nothing (raised-owner-held-row-wakes-planning-daily).
+    again = [ln for ln in look.splitlines() if ln.removeprefix("stopped ") not in owner]
+    if when and not new and (now() - when < QUIET_H * 3600 or not again):
+        return pulse_log(repo, "skip", f"woken {int((now() - when) // 60)}m ago for this same state"
+                         + ("" if again else " — its stopped rows wait on the owner"))
     shown = [k for k in stopped if f"stopped {k}" in new] + [k for k in stopped if f"stopped {k}" not in new]
-    note = " · ".join(x for x in (f"{len(stopped)} row(s) stopped ({', '.join(shown[:3])})" if stopped else "",
+    tag = lambda k: f"{k}: {owner[k]}" if k in owner else k
+    note = " · ".join(x for x in (f"{len(stopped)} row(s) stopped ({', '.join(tag(k) for k in shown[:3])})" if stopped else "",
                                   could + (f" (cc-brief ready {repo})" if start != "none" else "")) if x)
     h = sh(sib("cc-handoff"), "--status", repo, timeout=60)     # 0 = a handoff is open, 1 = none, else unknown
     # Only until the cutover: from then `<repo>` is the successor's name and it is live, and a drain of up to ten
@@ -2974,7 +3049,15 @@ def main(argv):
             return f is None or not any(w == r["why"] for _, _, w in decide(dict(f, pr_state="MERGED")))
 
         keys = {f"{r['repo']}/{r['track']}: {r['why']}": r for r in asks if not project_parked(r["repo"])}
-        fresh = [r for k, r in keys.items() if t0 - float(old.get(k, 0) or 0) >= repeat
+        # AN OWNER-HELD ROW'S ASK GOES OUT ONCE, not every `repeat`: boxtown-grok was told "is waiting on you" three
+        # times past its "Parked on purpose" note, and chip-flow/sensor-counted-rebuild re-woken on a stale BLOCKED
+        # line while its card sat in owner-asks.json (raised-watchdog-repings-parked-row, -repeats-open-owner-ask).
+        owner_asks = open_asks(t0=t0) if keys else []
+        for r in keys.values():
+            f = row_facts.get(f"{r['repo']}/{r['track']}") or {}
+            r["owner"] = owner_held(r["repo"], r["track"], f.get("notes"), owner_asks, repo_channels(r["repo"])) if r["kind"] == "ask" else ""
+        fresh = [r for k, r in keys.items()
+                 if (not old.get(k) if r["owner"] else t0 - float(old.get(k, 0) or 0) >= repeat)
                  and not merge_answers(r)]   # merged since the run began: the next pass fixes the row
         told = {f"{r['repo']}/{r['track']}: {r['why']}" for r in fresh}
         keep, busy = {}, None
@@ -3041,14 +3124,15 @@ def main(argv):
             # the repeat window — the digest still carries the track meanwhile.
             paged = []
             for r in fresh:
-                line = f"board watchdog: {r['repo']}/{r['track']} — {r['why']}" + (f" (set to {r['to']})" if r["applied"] else "")
+                line = (f"board watchdog: {r['repo']}/{r['track']} — {r['why']}" + (f" (set to {r['to']})" if r["applied"] else "")
+                        + (f" — {r['owner']}, so this is said once" if r["owner"] else ""))
                 if not offer(r["repo"], line):
                     paged.append(r)
             if paged:
                 one = {r["repo"] for r in paged}
                 title = f"{one.pop()} board" if len(one) == 1 else "board"
                 body = "\n".join(f"• {r['repo']}/{r['track']} — {r['why']}" + (f" (set to {r['to']})" if r["applied"] else "")
-                                 for r in paged)
+                                 + (f" — {r['owner']}" if r["owner"] else "") for r in paged)
                 sh(f"{BIN}/cc-notify", "-t", title, f"The board did not match the box, and this part needs you:\n{body}", timeout=30)
     return 1 if asks else 0
 

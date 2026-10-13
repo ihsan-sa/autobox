@@ -1826,6 +1826,117 @@ def selfcheck():
         ok("…and once the bundle row is no longer live its member is queued again, and wakes the seat", woke() == ["start wr"] * 4)
     finally:
         restore(); shutil.rmtree(tb, ignore_errors=True)
+    # OWNER-HELD ASKS, end to end: "it is waiting on you" goes out once for a parked or asked row, however short the
+    # repeat; a plain waiting row is still told again each repeat (raised-watchdog-repings-parked-row).
+    with tempfile.TemporaryDirectory() as th:
+        env = dict(os.environ, HOME=th, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log",
+                   CC_SLACK_DIR=f"{th}/.cc/slack", CC_RECONCILE_INJECT=f"{th}/inj")
+        repo = f"selfcheckowner{os.getpid()}"
+        open(f"{th}/inj", "w").write(f'#!/bin/sh\necho "$@" >> {th}/inj.log\n'); os.chmod(f"{th}/inj", 0o755)
+        os.makedirs(f"{th}/.cc/slack")
+        json.dump({"C1:1": {"text": f"🔒 confirm the release for {repo}/asked-t-row?", "at": now()}},
+                  open(f"{th}/.cc/slack/owner-asks.json", "w"))
+
+        def cb(*a):
+            return subprocess.run([f"{BIN}/cc-board", *a], env=env, capture_output=True, text=True, timeout=30)
+        cb("init", repo, f"{th}/dev/{repo}", "main")
+        for t in ("parked-t-row", "asked-t-row", "plain-t-row"):
+            os.makedirs(f"{th}/.cc/worktrees/{repo}/{t}"); os.makedirs(f"{th}/.cc/state/{repo}/{t}")
+            open(f"{th}/.cc/state/{repo}/{t}/progress.md", "w").write("STATUS: BLOCKED: no API key on the box\n")
+            cb("add", repo, t, "a row that stood down", ""); cb("status", repo, t, "waiting")
+        cb("note", repo, "parked-t-row", "Parked on purpose: the key arrives as an env grant after #1022 lands.")
+        argv = [sys.executable, os.path.realpath(__file__), repo, "--notify", "--no-net", "--grace", "0", "--repeat", "0"]
+        for _ in range(3):
+            subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120)
+        told = open(f"{th}/inj.log").read().splitlines() if os.path.exists(f"{th}/inj.log") else []
+        n = {t: sum(f"{repo}/{t} " in ln and "waiting on you" in ln for ln in told)
+             for t in ("parked-t-row", "asked-t-row", "plain-t-row")}
+        ok("OWNER-HELD ASKS: three passes at --repeat 0 tell the parked row and the asked row once each",
+           n["parked-t-row"] == 1 and n["asked-t-row"] == 1)
+        ok("…and that one line says it is said once, naming the pending owner ask or the parking note",
+           any("asked-t-row" in ln and "an owner ask is already pending, so this is said once" in ln for ln in told)
+           and any("parked-t-row" in ln and "parked on purpose" in ln for ln in told))
+        ok("…while the plain waiting row is told on every pass, as before", n["plain-t-row"] == 3)
+    # (b1) OWNER-HELD (brief C6): "a row that is waiting on an open owner ask, held for his yes, or noted as parked on
+    # purpose wakes its seat once and not every day. When a wake does fire, it says an owner ask is already pending."
+    T = now()
+    ok("OWNER-HELD: an open owner ask naming the row's slug holds it, and the line says an ask is already pending",
+       owner_held("chip-flow", "sensor-counted-rebuild", [], [("", "🔒 <@U1> chip-flow/sensor-counted-rebuild: confirm the release?")])
+       == "an owner ask is already pending")
+    ok("…while an ask naming a LONGER slug that contains it does not, nor does a row with no ask and plain notes",
+       owner_held("chip-flow", "sensor", [], [("", "about sensor-counted-rebuild")]) == "" and owner_held("r", "x-y", ["re-dispatched"], []) == "")
+    ok("…and the repo counts: the same slug under another repo is not held, the same repo is",
+       owner_held("other-repo", "sensor-counted-rebuild", [], [("", "🔒 <@U1> chip-flow/sensor-counted-rebuild: confirm?")]) == ""
+       and owner_held("chip-flow", "sensor-counted-rebuild", [], [("", "chip-flow sensor-counted-rebuild: ok?")]) != ""
+       and owner_held("chip", "sensor-counted-rebuild", [], [("", "chip-flow/sensor-counted-rebuild: ok?")]) == "")
+    ok("…and the ask's chat counts: no repo in the text, the ask in this repo's channel holds; in another repo's channel it does not",
+       owner_held("chip-flow", "sensor-counted-rebuild", [], [("C9", "release ok? sensor-counted-rebuild")], {"C9"}) != ""
+       and owner_held("chip-flow", "sensor-counted-rebuild", [], [("C7", "release ok? sensor-counted-rebuild")], {"C9"}) == ""
+       and owner_held("chip-flow", "sensor-counted-rebuild", [], [("C9", "release ok? sensor")], {"C9"}) == ""
+       and owner_held("chip-flow", "sensor-counted-rebuild", [], [("", "release ok? sensor-counted-rebuild")], {"C9"}) == "")
+    tc = tempfile.mkdtemp(prefix="cc-reconcile-chans-")
+    try:
+        json.dump({"chip-flow": "C9", "chip-flow-updates": "C8", "chip-flow@x": "C6", "chip": "C1", "chip-flows": "C2", "chip-flow--sub": "C5", "chip-flow--sub-updates": "C4"},
+                  open(f"{tc}/channels.json", "w"))
+        ok("…repo_channels takes `<repo>`, `<repo>-…` and `<repo>@…` keys but not `<repo>--…` ones, and an unreadable file is none",
+           repo_channels("chip-flow", f"{tc}/channels.json") == {"C9", "C8", "C6"}
+           and repo_channels("chip-flow", f"{tc}/none.json") == set())
+        ok("…and a key goes to the longest repo it starts with: `chip` keeps `chip-flows` but never takes `chip-flow`'s channels, nor a `chip-flow--` repo's",
+           repo_channels("chip", f"{tc}/channels.json", ["chip", "chip-flow"]) == {"C1", "C2"}
+           and repo_channels("chip-flow", f"{tc}/channels.json", ["chip", "chip-flow"]) == {"C9", "C8", "C6"}
+           and owner_held("chip", "sensor-counted-rebuild", [], [("C9", "release ok? sensor-counted-rebuild")],
+                          repo_channels("chip", f"{tc}/channels.json", ["chip", "chip-flow"])) == "")
+    finally:
+        shutil.rmtree(tc, ignore_errors=True)
+    ok("…a note that parks the row on purpose holds it (any of the last three notes), an older one does not",
+       owner_held("r", "boxtown-grok", ["loop exit 3", "Parked on purpose: the key arrives later."], []) != ""
+       and owner_held("r", "aiportfolio-404", ["Superseded: it comes back when the owner says yes."], []) != ""
+       and owner_held("r", "r", ["Parked on purpose.", "a", "b", "c"], []) == "")
+    tq = tempfile.mkdtemp(prefix="cc-reconcile-asks-")
+    try:
+        json.dump({"C1:1": {"text": "asks about row-a-b", "at": T - 3600},
+                   "C1:2": {"text": "asks about row-c-d", "at": T - 8 * 86400},
+                   "_C1:3": {"text": "row-e-f", "at": T}}, open(f"{tq}/owner-asks.json", "w"))
+        ok("OWNER-HELD: open_asks reads the unanswered asks inside a week — not one older, not an answer's \"_\" key",
+           open_asks(f"{tq}/owner-asks.json", T) == [("", "asks about row-a-b")])
+        ok("…and an unreadable table is no asks, not an error", open_asks(f"{tq}/none.json", T) == [])
+    finally:
+        shutil.rmtree(tq, ignore_errors=True)
+    tw = tempfile.mkdtemp(prefix="cc-reconcile-ownerwake-")
+    _oa = OWNER_ASKS
+    try:
+        scratch(tw, dict(NOOP, **{"cc-brief": ":",          # `cc-brief ready` on blocked rows alone prints nothing
+                                  "cc": f'echo "start $1" >> {tw}/cc.log', "cc-msg": f'echo "msg $1" >> {tw}/cc.log'}))
+        os.environ["CC_WAKE"] = "on"
+        globals().update(procs=lambda: (set(), set(), set(), {}, {}), tmux_live=lambda p, s=(): (set(), {}, {}),
+                         OWNER_ASKS=f"{tw}/owner-asks.json")
+        json.dump({"C1:1": {"text": "🔒 confirm the release for wask/ask-row-x?", "at": now()}}, open(f"{tw}/owner-asks.json", "w"))
+        for r, row in (("wpark", {"status": "blocked", "updated": old,
+                                  "notes": [{"msg": "Parked on purpose: the key arrives with #1022."}]}),
+                       ("wask", {"status": "blocked", "updated": old}),
+                       ("wplain", {"status": "blocked", "updated": old, "notes": [{"msg": "loop exit 3"}]})):
+            os.makedirs(f"{tw}/dev/{r}")
+            k = "ask-row-x" if r == "wask" else f"{r}-row"
+            json.dump({"repo": r, "tracks": {k: row}}, open(f"{tw}/.cc/boards/{r}.json", "w"))
+
+        def woke(r):
+            return sum(ln == f"start {r}" for ln in open(f"{tw}/cc.log").read().splitlines()) if os.path.exists(f"{tw}/cc.log") else 0
+        quietly(tick, {}, True)
+        plog = open(f"{tw}/.cc/state/pulse.log").read()
+        ok("OWNER-HELD WAKE: the first time, each stopped row wakes its seat — parked, asked and plain alike",
+           (woke("wpark"), woke("wask"), woke("wplain")) == (1, 1, 1))
+        ok("…and that wake says the parked row is parked and the asked row's owner ask is already pending",
+           "wpark-row: parked on purpose" in plog and "ask-row-x: an owner ask is already pending" in plog
+           and "wplain-row:" not in plog)
+        for r in ("wpark", "wask", "wplain"):           # a day and an hour later, nothing changed
+            os.utime(f"{tw}/.cc/state/{r}/pulse.look", (now() - 25 * 3600,) * 2)
+        quietly(tick, {}, True)
+        plog = open(f"{tw}/.cc/state/pulse.log").read()
+        ok("OWNER-HELD WAKE: past QUIET_H the parked and the asked rows wake nobody again, and pulse.log says why",
+           (woke("wpark"), woke("wask")) == (1, 1) and "wpark skip" in plog and "wait on the owner" in plog)
+        ok("…while the plain stopped row is re-woken after QUIET_H, as before", woke("wplain") == 2)
+    finally:
+        restore(); globals().update(OWNER_ASKS=_oa); shutil.rmtree(tw, ignore_errors=True)
     # (b2) a LIVE seat: an idle pane is typed one cc-msg line, never a second session; a pane mid-turn is typed nothing
     ti = tempfile.mkdtemp(prefix="cc-reconcile-idle-")
     try:
