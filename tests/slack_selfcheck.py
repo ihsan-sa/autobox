@@ -980,6 +980,21 @@ def run_selfcheck():
     dmBP.peer_seat = lambda peer, member=None: ("lessons", "library")  # the seat itself, posting into its own channel
     rBPown = dmBP.wake_channel("CLES", "20.4", None, "a note to myself", ("peer",))
     ownBP = wokeBP[len(svcBP):]
+    # A SEAT'S REPLY NEVER COMES BACK TO IT AS A NEW MESSAGE (raised-reply-echoed-into-own-session, 2026-10-08: the
+    # career seat's reply, sent while it had no live subscriber, was typed into its own pane). Its own fixture: no
+    # subscription owns the caller, and the reply tool names the seat it runs for.
+    dmRE = Daemon(use_slack=False); dmRE.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmRE.names.update({"CCAR": "career"}); wokeRE = []
+    dmRE.route = lambda chat, ctype: {"CCAR": "career"}.get(chat)
+    dmRE.chan_alias = lambda chat: None
+    dmRE.deliver = lambda target, payload, autostart=True, alias=None: wokeRE.append((target, alias, payload)) or "typed"
+    dmRE.peer_seat = lambda peer, member=None: None
+    rREown = dmRE.wake_channel("CCAR", "30.1", "29.9", "my own reply", (4250, os.getuid(), HOME), ["career", ""])
+    rREorch = dmRE.wake_channel("CCAR", "30.2", "29.9", "a reply from an orch", (4251, os.getuid(), HOME), ["career", "jobs"])
+    rREsvc = dmRE.wake_channel("CCAR", "30.3", None, "a service line", (4252, os.getuid(), HOME))
+    check("a seat's own reply with no live subscriber behind it is 'own' and is not typed back into its pane; another "
+          "seat's reply and a service's line into the same channel still reach it",
+          rREown.get("result") == "own" and rREorch.get("result") == "typed" and rREsvc.get("result") == "typed"
+          and [w[2]["content"] for w in wokeRE] == ["a reply from an orch", "a service line"])
     subprocess.run(["rm", "-rf", wtBP])
     check("a box post from a process no session owns (the library editor) reaches the seat of the channel it went to, "
           "in its thread, as role=bot and never role=owner; the seat's own post into its channel does not, and neither "

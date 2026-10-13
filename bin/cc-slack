@@ -4630,10 +4630,10 @@ class Daemon:
                     return t, alias
         return None
 
-    def wake(self, chat, ts, thread, text, peer):
+    def wake(self, chat, ts, thread, text, peer, own=None):
         """wake_channel, then the post's @alias mentions (route_mentions), minus the session the channel wake already
         handed it to, so a `post -c '#<orch channel>' "@<that orch> …"` reaches it once."""
-        out = self.wake_channel(chat, ts, thread, text, peer)
+        out = self.wake_channel(chat, ts, thread, text, peer, own)
         seat = self.peer_seat(peer)
         if seat and ts:                          # a file's post has no ts to key its mentions on: the channel wake only
             done = {(out["target"], self.chan_alias(chat))} if out.get("target") else set()
@@ -4704,11 +4704,15 @@ class Daemon:
             out.append(m)
         return out
 
-    def wake_channel(self, chat, ts, thread, text, peer):
+    def wake_channel(self, chat, ts, thread, text, peer, own=None):
         """`{"wake": chat, "ts", "thread_ts", "text"}` from `cc-slack post -c`: a session's word, handed to it.
         Own post's event drops (on_event); a session caller (peer_seat) wakes as the box's word, a caller no session
         owns (a service, a shell) as role=bot (wake_unseated). Only into another's channel; answers in the post's
-        thread. Author is the box, never a claimed name."""
+        thread. Author is the box, never a claimed name.
+        `own` is the (target, alias) the reply/file tool's channel server runs for ({"self"} on the request). It
+        counts only when peer_seat finds no live subscription for the caller, and only to say "own": the brief
+        (raised-reply-echoed-into-own-session, 2026-10-08) — the career seat's reply, sent while it had no
+        subscriber, was typed back into its own pane as a new message, "acting on its own text as owner authority"."""
         target = self.route(chat, "im" if str(chat).startswith("D") else None)
         if not target or str(chat).startswith("D"):
             return {"ok": True, "result": "no-session"}
@@ -4717,6 +4721,8 @@ class Daemon:
         if tt:
             target, alias = tt, None
         seat = self.peer_seat(peer)
+        if not seat and isinstance(own, list) and len(own) == 2 and (own[0], own[1] or None) == (target, alias):
+            return {"ok": True, "result": "own"}
         if not seat:
             return self.wake_unseated(chat, ts, thread, text, peer, target, alias)
         if seat == (target, alias):
@@ -5322,9 +5328,9 @@ class Daemon:
                 c.sendall((json.dumps({"ok": True, "slack": self.use_slack, "connected": self.connected, "bot_user": self.bot_user,
                                        "owner": self.cfg.get("SLACK_OWNER_ID") or None, "pair_code": self.pair_code,
                                        "subs": subs, "queued": queued, "uptime": int(time.time() - self.t0)}) + "\n").encode())
-            elif verb == "wake":         # {"wake": chat, "ts":…, "thread_ts":…, "text":…} — a session's post into another session's channel
+            elif verb == "wake":         # {"wake": chat, "ts":…, "thread_ts":…, "text":…[, "self": [target, alias]]} — a session's post into another session's channel
                 res = self.wake(str(first["wake"] or ""), str(first.get("ts") or ""), first.get("thread_ts") or None,
-                                str(first.get("text") or ""), self.peer_of(c))
+                                str(first.get("text") or ""), self.peer_of(c), first.get("self") or None)
                 c.sendall((json.dumps(res) + "\n").encode())
             elif verb == "mention":      # {"mention": chat, "ts":…, "thread_ts":…, "text":…} — a session's post naming @<alias>
                 seat = self.peer_seat(self.peer_of(c))
@@ -8912,7 +8918,8 @@ class Channel:
                     # workspace's ask, which the daemon carries to the member (ask_hop) — one local call tells both
                     r = {}
                     try:
-                        r = sock_request({"wake" if wake else "mention": chat, "ts": pts, "thread_ts": a.get("thread_ts") or None, "text": a.get("text", "")}, timeout=15)
+                        r = sock_request({"wake" if wake else "mention": chat, "ts": pts, "thread_ts": a.get("thread_ts") or None, "text": a.get("text", ""),
+                                          "self": [self.target, self.alias]}, timeout=15)
                         if named:
                             routed = ("\n\nMENTIONS NOT ROUTED: the box sees no live session behind this reply, so no session you @-named was woken"
                                       if r.get("result") == "not-a-session" else mentions_line(r.get("mentions")) if r.get("ok") else
@@ -8943,7 +8950,7 @@ class Channel:
                     return (f"NOT sent to Slack — logged to {DIR}/outbox.log (no SLACK_BOT_TOKEN); "
                             "nothing reached anyone, so do not say the file arrived"), False
                 missed = unresolved_mentions(self.cfg, a.get("text") or "", chat)
-                woke = file_wake(chat, a.get("thread_ts"), a.get("text") or os.path.basename(path)) if self.wants_wake(chat, a) else ""
+                woke = file_wake(chat, a.get("thread_ts"), a.get("text") or os.path.basename(path), own=[self.target, self.alias]) if self.wants_wake(chat, a) else ""
                 return (f"sent {os.path.basename(path)}" + (" in the thread" if a.get("thread_ts") else "")
                         + mention_warning(missed) + woke), False
             if name == "react":
@@ -9399,12 +9406,14 @@ def cmd_post(argv):
             print("cc-slack: " + ask_line(r["ask"]).strip(), file=sys.stderr)
     return 0
 
-def file_wake(chat, thread, text):
+def file_wake(chat, thread, text, own=None):
     """A file a session posts into another session's channel wakes that session, as `post -c` does (Daemon.wake
     decides: its own channel is "own", a DM or a caller that is no session wakes nobody). The upload hands back no
-    message ts, so the wake carries none. Returns the line for the caller's result, "" when nobody was handed it."""
+    message ts, so the wake carries none. `own` is the channel server's (target, alias) when the file tool sends it,
+    so a seat with no live subscriber is not handed its own file (Daemon.wake_channel). Returns the line for the
+    caller's result, "" when nobody was handed it."""
     try:
-        r = sock_request({"wake": chat, "ts": "", "thread_ts": thread or None, "text": f"[file] {text}"}, timeout=15)
+        r = sock_request({"wake": chat, "ts": "", "thread_ts": thread or None, "text": f"[file] {text}", "self": own}, timeout=15)
     except Exception:
         return ""                                    # no daemon: the file stands, and there is no session to hand it to
     if r.get("recorded"):
