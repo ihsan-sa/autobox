@@ -3320,6 +3320,223 @@ class Parallel(Fixture):
         self.assertEqual(len(u["runner"].calls), 4)
         self.assertEqual(sorted(self.merged_order()), [1, 2, 3, 4])
 
+    def test_a_heavy_prs_checks_fill_every_free_box_slot_when_no_other_job_wants_one(self):
+        # brief, 10-13: 3 of 5 slots sat free for hours while 39 jobs were checking, each held to one box check
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
+        J.submit("demo", 1)
+        three, broke = threading.Barrier(3, timeout=5), []
+
+        class Together(Runner):
+            def run(self, check, tree, where):
+                try:
+                    three.wait()
+                except threading.BrokenBarrierError:
+                    broke.append(check.name)
+                return super().run(check, tree, where)
+        with mock.patch.object(L.RUN, "spill", return_value=""):   # this host keeps its own checks
+            u, _ = self.land(runner=Together())
+        self.assertEqual(broke, [], "the PR's three checks did not run at once on three free box slots")
+        self.assertEqual(sorted(c[0] for c in u["runner"].calls), ["a", "b", "c"])
+        self.assertEqual(self.merged_order(), [1])
+
+    def test_a_heavy_pr_takes_no_second_box_slot_while_another_job_waits_for_its_first(self):
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n", "c/z": "n\n"})
+        self.pr(2, {"d/w": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        both, started, lock = threading.Barrier(2, timeout=10), [], threading.Lock()
+
+        class FirstTwo(Runner):
+            def run(self, check, tree, where):
+                with lock:
+                    started.append(check.name)
+                    first_two = len(started) <= 2
+                if first_two:   # the first two checks wait for each other: both are live at once
+                    both.wait()
+                return super().run(check, tree, where)
+        with mock.patch.object(L.Lane, "width", lambda self: 2):
+            self.land(planner=Planner(owners={"a": "a/", "b": "b/", "c": "c/", "d": "d/"}), runner=FirstTwo())
+        self.assertEqual(sorted(started[:2]), ["a", "d"])   # #1's first check and #2's only one, not #1's first two
+        self.assertEqual(sorted(started), ["a", "b", "c", "d"])
+        self.assertEqual(sorted(self.merged_order()), [1, 2])
+
+    def test_a_review_read_does_not_stop_another_jobs_checks(self):
+        # 10-13: 3 of 5 box slots sat free for hours with 39 jobs checking. A read (up to READ_TIMEOUT per reader) ran
+        # on the lane's thread, so no finished check was recorded and no free slot filled until it ended
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        J.submit("demo", 2)
+        runner, seen = Runner(), []
+
+        class Slow(Reviewer):
+            def review(self, job):   # #1's read lasts until #2's check has run (at most 5 s)
+                end = time.time() + 5
+                while "b" not in [c[0] for c in runner.calls] and time.time() < end:
+                    time.sleep(0.02)
+                seen.append([c[0] for c in runner.calls])
+                return super().review(job)
+        with one_slot():   # #2's check waits for #1's slot, which frees just before #1's read
+            # three reads: #2 is read again once #1's merge moves main
+            self.land(planner=Planner(paid=True), runner=runner, reviewer=Slow(*[V(T.LAND)] * 3))
+        self.assertEqual(seen[0], ["a", "b"], "#2's check did not run while #1's review read was in the pool")
+        self.assertEqual(sorted(self.merged_order()), [1, 2])
+
+    def spare_lane(self, *states):
+        """A lane whose pass read #1 (checking, two checks, none run) and one job per state in `states` (#2, #3…),
+        each with a plan of one check. -> (lane, #1, [the others])."""
+        for n in range(1, len(states) + 2):
+            self.pr(n, {f"f/{n}": "n\n"})
+            J.submit("demo", n)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        lane = L.Lane("demo", self.units())
+        me = self.job(1)
+        me.state, me.plan = T.CHECKING, T.Plan(checks=["a", "b"])
+        others = []
+        for n, st in enumerate(states, 2):
+            j = self.job(n)
+            j.state, j.plan = st, T.Plan(checks=["c"])
+            others.append(j)
+        lane.jobs = [me] + others
+        quiet = mock.patch.object(L.RUN, "spill", return_value="")   # no admission ticket waits, a slot is free
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        return lane, me, others
+
+    def test_no_spare_slot_in_a_member_lane_or_while_a_check_waits_at_the_door(self):
+        # perms, 10-13: a member PR ran 3 checks at once where main runs 1, its tickets ahead of the owner's greens
+        lane, me, _ = self.spare_lane()
+        self.assertTrue(lane.spare_box(me))    # alone, on a quiet host: spare
+        lane.member = "alice"
+        self.assertFalse(lane.spare_box(me))
+        lane.member = ""
+        with mock.patch.object(L.RUN, "spill", return_value="every admission slot on this host is held"):
+            self.assertFalse(lane.spare_box(me))
+
+    def sibling_stopped(self, red, wait):
+        """#1 runs a and b side by side (a quiet host); a ends as `red` says while b waits up to `wait` seconds for
+        its stop. -> [whether b was stopped]."""
+        self.pr(1, {"a/x": "n\n", "b/y": "n\n"})
+        J.submit("demo", 1)
+        stopped = []
+
+        class Red(Runner):
+            def run_plan(self, *a, only=None, **kw):
+                if only == ["b"]:
+                    stopped.append(kw["cancel"].wait(wait))
+                return super().run_plan(*a, only=only, **kw)
+        with mock.patch.object(L.RUN, "spill", return_value=""):
+            self.land(planner=Planner(owners={"a": "a/", "b": "b/"}), runner=Red(status={"a": red} if red else {}))
+        return stopped
+
+    def test_a_handback_stops_the_jobs_other_checks(self):
+        # perms, 10-13: after a handback the job's other checks kept running for nothing
+        self.assertEqual(self.sibling_stopped(T.FAILED, 5), [True])
+        self.assertEqual(self.job(1), None)    # handed back: it left the lane
+
+    def test_a_main_red_hold_stops_the_jobs_other_checks(self):
+        self.assertEqual(self.sibling_stopped(L.RUN.BLOCKED, 5), [True])
+        self.assertEqual(self.job(1).state, T.HELD)
+
+    def test_a_green_check_stops_none_of_the_others(self):
+        self.assertEqual(self.sibling_stopped(None, 0.3), [False])
+        self.assertEqual(self.merged_order(), [1])
+
+    def reads_lane(self, member=""):
+        """A lane with #1 and #2 checking at their own digests, and a pool whose reads end only when the test ends
+        them. -> (lane, #1, #2, [the futures of the reads submitted])."""
+        for n in (1, 2):
+            self.pr(n, {f"f/{n}": "n\n"})
+            J.submit("demo", n)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        lane = L.Lane("demo", self.units())
+        lane.member, lane.waiting = member, set()
+        submitted = []
+
+        class Pool:
+            def submit(self, *a):
+                submitted.append(futures.Future())
+                return submitted[-1]
+        lane.pool = Pool()
+        one, two = self.job(1), self.job(2)
+        for j in (one, two):
+            j.state, j.digest = T.CHECKING, f"{j.pr}" * 40
+        return lane, one, two, submitted
+
+    def test_a_read_whose_job_left_checking_holds_its_place_until_it_ends(self):
+        # opus, 10-13: a read dropped when its job left checking kept running, and a second read started beside it
+        lane, one, two, submitted = self.reads_lane()
+        self.assertFalse(lane.review(one))
+        one.state = T.QUEUED   # a push mid-read
+        lane.drop_reads([one, two])
+        self.assertFalse(lane.review(two))
+        self.assertEqual(len(submitted), 1, "a second read started beside a dropped one (REVIEW_SLOTS=1)")
+        self.assertIn(two.key, lane.waiting)
+        submitted[0].set_result(V(T.LAND))
+        lane.drop_reads([one, two])
+        self.assertFalse(lane.review(two))
+        self.assertEqual(len(submitted), 2, "the dropped read ended, yet #2's read did not start")
+
+    def test_a_read_whose_job_left_checking_is_charged_when_it_ends(self):
+        # opus, 10-13: a member who pushed during each read stayed under the day's cap
+        Members.make_member(self)
+        self.set_box(config={"CC_GH_PERSONAL_OWNER": "own", "MEMBER_DAILY_USD": "5"})
+        lane, one, two, submitted = self.reads_lane(member="alice")
+        lane.review(one)
+        one.state = T.QUEUED
+        lane.drop_reads([one, two])
+        self.assertEqual(M.spent("alice")[0], 0)   # still running: nothing charged yet
+        submitted[0].set_result(V(T.LAND, usd=0.5))
+        lane.drop_reads([one, two])
+        self.assertEqual(M.spent("alice")[0], 0.5)
+        lane.drop_reads([one, two])
+        self.assertEqual(M.spent("alice")[0], 0.5)   # charged once
+
+    def test_a_read_of_an_earlier_digest_holds_its_place_until_it_ends(self):
+        # opus, 10-13: a push within one pass (a new digest, still checking) dropped the running read uncounted
+        lane, one, _, submitted = self.reads_lane()
+        self.assertFalse(lane.review(one))
+        one.digest = "9" * 40
+        self.assertFalse(lane.review(one))
+        self.assertEqual(len(submitted), 1, "a read of the new digest started beside the earlier one (REVIEW_SLOTS=1)")
+        submitted[0].set_result(V(T.LAND))
+        lane.drop_reads([one])
+        self.assertFalse(lane.review(one))
+        self.assertEqual(len(submitted), 2, "the earlier read ended, yet the new digest's read did not start")
+
+    def test_the_lane_waits_for_a_dropped_read_still_running(self):
+        # opus, 10-13: loop() returned while a dropped read ran, so it was never charged
+        lane, one, two, submitted = self.reads_lane()
+        lane.review(one)
+        one.state = T.QUEUED
+        lane.drop_reads([one, two])
+        self.assertEqual(lane.pending_reads(), [submitted[0]])
+        submitted[0].set_result(V(T.LAND))
+        lane.drop_reads([one, two])
+        self.assertEqual(lane.pending_reads(), [])
+
+    def test_a_parked_job_leaves_a_free_slot_spare(self):
+        # 28 jobs sat parked live: one parked waits on another PR, not on a slot, so it holds no slot back
+        lane, me, (q,) = self.spare_lane(T.QUEUED)
+        self.assertFalse(lane.spare_box(me))   # queued, not parked: it wants its first slot
+        q.extra["parked"] = {"at": time.time(), "head": q.head, "on": 1}
+        self.assertTrue(lane.spare_box(me))
+        q.extra.pop("parked")
+        lane.parked.add(q.key)                 # parked in this lane's own pass
+        self.assertTrue(lane.spare_box(me))
+
+    def test_a_checking_job_with_no_box_check_keeps_the_slot_from_a_second_one(self):
+        lane, me, (c,) = self.spare_lane(T.CHECKING)
+        self.assertFalse(lane.spare_box(me))   # a check left and none on the box: it wants a box slot
+        done = futures.Future()
+        lane.inflight[(c.key, "c")] = L.Flight(done, c.pr, "c", c.head, c.base_sha, "t", False, threading.Event())
+        self.assertTrue(lane.spare_box(me))    # its one is on the box
+        lane.inflight.clear()
+        c.results["c"] = "k"
+        self.assertTrue(lane.spare_box(me))    # nothing left to run
+
     def test_a_prs_laptop_checks_run_side_by_side_beside_one_box_slot(self):
         # owner 2026-09-29: the laptop sat at 4% while 19 PRs waited; every check that may leave the box goes there,
         # several at once, and does not wait for the box's slots (width 1 here, as on an overloaded box)
@@ -3627,8 +3844,8 @@ class Parallel(Fixture):
         moved = []
         hook = lambda name, n: moved.append("/rel/new") if n == 1 else None  # noqa: E731
         with mock.patch.object(J, "stale_release", lambda: moved[0] if moved else ""), \
-                mock.patch.object(L, "spawn_lane", lambda repo, rel: (True, "unit x")):
-            u, lines = self.land(runner=Runner(hook=hook))
+                mock.patch.object(L, "spawn_lane", lambda repo, rel: (True, "unit x")), one_slot():
+            u, lines = self.land(runner=Runner(hook=hook))   # one slot: `b` would otherwise start beside `a`
         self.assertEqual([c[0] for c in u["runner"].calls], ["a"])   # nothing new after the promote
         self.assertEqual(sorted(self.job(1).results), ["a"])           # the one in flight is kept
         self.assertEqual(self.job(1).state, T.CHECKING)
@@ -3944,6 +4161,35 @@ class Starving(Fixture):
             u, _ = self.land(planner=planner)
         self.assertEqual(self.merged_order(), [2, 1, 3])
         self.assertEqual([c[0] for c in u["runner"].calls][:2], ["a", "b"])
+
+    def heavy_among_small(self, ago):
+        """#1 small (c) holds the one slot, while #2 heavy (a, b) queued `ago` seconds back and #3 small (d) meet
+        at the free slot; HEAVY_WAIT an hour (create: on a lane without it the case reads as a wrong order, not a
+        missing name). -> the runner's calls."""
+        planner = Planner(owners={"a": "a/", "b": "b/", "c": "c/", "d": "d/"})
+        self.pr(1, {"c/z": "n\n"})
+        self.pr(2, {"a/x": "n\n", "b/y": "n\n"})
+        self.pr(3, {"d/w": "n\n"})
+        for n in (1, 2, 3):
+            J.submit("demo", n)
+        self.seed(ago + 60, "queued_at", 1)   # #1 stays first in arrival order
+        self.seed(ago, "queued_at", 2)
+        with mock.patch.object(L, "SMALL_CHECKS", 1), mock.patch.object(L, "HEAVY_WAIT", 3600, create=True), \
+                one_slot():
+            # c runs until #2 and #3 are both planned and wait for the slot: they meet there, not in their turns' order
+            u, _ = self.land(planner=planner, runner=first_check_waits(
+                self, lambda: all(self.job(n).state == T.CHECKING for n in (2, 3))))
+        return [c[0] for c in u["runner"].calls]
+
+    def test_a_heavy_job_queued_an_hour_ago_counts_as_small_until_its_first_check_runs(self):
+        # brief, 10-13: #943 (38 checks) ran none for 3 h behind small and parked jobs; and owner, 09-28: a one-line
+        # PR waits for at most that first check, not for every check of every aged heavy PR
+        self.assertEqual(self.heavy_among_small(3600 + 60), ["c", "a", "d", "b"])
+        self.assertEqual(self.merged_order(), [1, 3, 2])
+
+    def test_a_heavy_job_queued_under_an_hour_ago_still_waits_for_a_small_one(self):
+        self.assertEqual(self.heavy_among_small(3600 - 600), ["c", "d", "a", "b"])
+        self.assertEqual(self.merged_order(), [1, 3, 2])
 
     def test_a_pr_put_first_goes_before_one_past_the_cap(self):
         planner = Planner(owners={"a": "a/", "b": "b/", "c": "c/"})

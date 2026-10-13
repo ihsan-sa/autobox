@@ -23,21 +23,33 @@ THE LANE (Lane.run) takes <repo>.lock (busy: return — the running lane re-read
 job until it rests (held until not_before, query, done, deploy-pending, handed back) or waits on a check, re-reading
 the list after each. CHECKS RUN IN PARALLEL, MERGES ONE AT A TIME (lander-redesign.tex, "Changes that don't overlap
 land side by side"; 2026-09-29 a three-file PR waited 7 h behind ~11 half-hour PRs on a box at load 4.8 of 6 cores):
-a checking job hands its next check to the lane's pool and the lane goes on to other jobs; everything else — the gh
-facts, planning, the review, the Δ re-plan and the merge — happens on the lane's own thread, so merges stay serial
-and pinned. The lane keeps at most A.slots_now() checks in flight (A.slots(): LANDER_SLOTS from cc-config, else what
-the host's cores and memory hold, read again each minute; 2 while the box is overloaded(), 1 under memory
-pressure) on the box, and up to A.LAPTOP_SLOTS more on the laptop; each box run still takes its box-wide
-admission slot, so another repo's lane can hold this one's check at the door. A job holds one check at a time on the
-box, but its checks that may leave the box run on the laptop side by side (any check that may leave goes there
-when the lane has no box place for it now, or run.spill() finds every admission slot held), so a red stops the
-rest of the suite only once it is recorded (the ones already in flight finish). A member's lane never sends a check
-to the laptop. A laptop that gave no answer rests for LAPTOP_REST: the box takes the lane's checks meanwhile. Where a
-check may run is the tip of the PR's base branch's word on it (manifest.placed), not the PR's base. A finished check is recorded on the lane's thread; one whose job left checking, or its head or base, meanwhile is not.
+a checking job hands its next check to the lane's pool and the lane goes on to other jobs, and so does a job whose
+review read is due (at most REVIEW_SLOTS reads at once): a read takes up to READ_TIMEOUT per reader, and while it ran on
+the lane's thread no finished check was recorded and no free slot filled (10-13: 3 of 5 slots free for hours, 39 jobs
+checking). Its verdict is acted on at the job's next turn; everything else — the gh facts, planning, the Δ re-plan and
+the merge — happens on the lane's own thread, so merges stay serial and pinned. The lane keeps at most
+A.slots_now() checks in flight (A.slots(): LANDER_SLOTS from cc-config, else what the host's cores and memory hold,
+read again each minute; 2 while the box is overloaded(), 1 under memory pressure) on the box, and up to
+A.LAPTOP_SLOTS more on the laptop; each box run still takes its box-wide admission slot, so another repo's lane can
+hold this one's check at the door. A job holds one check at a time on the box while another due job wants its first
+there (one queued and not parked, planned, or checking with none on the box); when none does, its checks the runners
+do not take fill every free box slot, but only while run.spill() is quiet (no admission ticket waits, so another
+lane's or a worker's check is not pushed back) and never in a member's lane. A job held or handed back
+has its other checks in flight stopped. Its checks that may leave the box run on the laptop side by side (any check
+that may leave goes there when the lane has no box place for it now, or run.spill() finds every admission slot
+held), so a red stops the rest of the suite only once it is recorded (the ones already in flight finish). A
+member's lane never sends a check to the laptop. A laptop that gave no answer rests for LAPTOP_REST: the box takes
+the lane's checks meanwhile. Where a check may run is the tip of the PR's base branch's word on it (manifest.placed),
+not the PR's base. A finished check is recorded on the lane's thread; one whose job left checking, or its head or
+base, meanwhile is not.
 SMALL FIRST (owner, 2026-09-28: a one-line PR waited behind ~20 full-suite PRs): a free slot goes to the oldest job
 that is not heavy — a plan of more than LANDER_SMALL_CHECKS (default 5) checks, or one with a full-suite check
-(LANDER_FULL_CHECKS, default check-sh) — and only then to the oldest heavy one; a job not planned yet counts as small.
-So a small PR waits for at most one check when the box allows one slot, and for none when a slot is free. NO PR
+(LANDER_FULL_CHECKS, default check-sh) — and only then to the oldest heavy one; a job not planned yet counts as small,
+and so does a heavy one queued LANDER_HEAVY_WAIT seconds ago or more (default 3600: 10-13, #943's 38 checks ran none
+for 3 h behind small and parked jobs) until its first check runs; from then on it is heavy again (owner, 09-28: a
+one-line PR must not wait behind every aged heavy one). So a small PR waits for at most one check when the box allows
+one slot, besides the first check of each heavy PR queued LANDER_HEAVY_WAIT before it, and for none when a slot is
+free. NO PR
 WAITS MORE THAN A DAY (idea panel, 2026-10-04: #746 sat ~20 h re-queued, unplanned and unexplained): a job queued
 LANDER_WAIT_CAP seconds ago or more (default 86400) takes its turn before every younger one, small or heavy.
 PUT FIRST: a job `queue --first` stamped (jobs.first) goes before all of these, overdue, heavy or not, oldest stamp
@@ -89,7 +101,8 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              read the host failed twice at one head: a 4xx, a timeout, its own cap) -> query "planning", never a
              handback; HANDBACK ->
              reads_used+1, handback, or query "planning" at the 2nd; LAND counts a read only when it was bought.
-             A member over its day's cap is held; a bought read is charged to it.
+             A member over its day's cap is held; a bought read is charged to it. A read whose job leaves
+             checking (or its digest) mid-read keeps its REVIEW_SLOTS place until it ends, and is charged then.
   mergeable  the head moved -> queued. main moved -> Δ re-plan (S2): rerun = (new − old) ∪ (new ∩ checks Δ
              reaches); a new plan that is lander-class (a reach file the new base does not generate) -> query
              "lander-self"; non-empty -> checking with only those, each one not in FULL_CHECKS, defined at the head
@@ -196,6 +209,12 @@ PARK_FRESH = float(os.environ.get("LANDER_PARK_FRESH") or 300)
 # idea panel, 10-04: "no PR waits more than 24 h in a lane without a landing attempt". A job parked this long is planned
 # despite its overlap (the Δ re-plan at mergeable catches a real one), and one queued this long takes a slot first
 WAIT_CAP = float(os.environ.get("LANDER_WAIT_CAP") or 86400)
+# brief, 10-13: "end the starvation of heavy plans". A heavy job queued this long ago counts as small, so it takes its
+# turn in arrival order beside the small ones (#943, 38 checks, ran none for 3 h behind small and parked jobs)
+HEAVY_WAIT = float(os.environ.get("LANDER_HEAVY_WAIT") or 3600)
+# review reads the lane's pool runs at once (each up to review.READ_TIMEOUT per reader); a job past its checks waits for
+# a place like a check does. One keeps the reads, and their spend, as serial as when they ran on the lane's thread
+REVIEW_SLOTS = int(os.environ.get("LANDER_REVIEW_SLOTS") or 1)
 LAPTOP_REST = 300       # seconds the box takes the laptop's checks after the laptop gave no answer
 CI_WAIT_SECS = 120       # a head whose GitHub CI is still running is looked at again this often…
 CI_WAITS = 30            # …this many times (an hour) before it is a query
@@ -216,6 +235,13 @@ class Flight:
         self.laptop = laptop   # sent to the laptop: it counts against LAPTOP_SLOTS, not the box's slots
         self.stop = stop   # a threading.Event; set: run.execute kills the check (the job left this head)
         self.express = express   # a Δ rerun's (EXPRESS): it counts against EXPRESS_SLOTS, not the box's slots
+
+
+class Reading:
+    """One review read a job has in the lane's pool, and the digest it reads; seen: its end has woken the job."""
+
+    def __init__(self, future, digest):
+        self.future, self.digest, self.seen = future, digest, False
 
 
 class UnitFault(Exception):
@@ -449,6 +475,9 @@ class Lane:
         self.tried_nb = {}       # job key -> its not_before when it last had its turn: a later one has fallen due
         self.tried_q = {}        # job key -> (queued_at, head) when its turn ended: another is a re-queue or a push
         self.pool = None
+        self.jobs = []           # the lane's jobs as this pass of the loop read them (spare_box)
+        self.reading = {}        # job key -> Reading: each review read the lane has in the pool
+        self.dropped = []        # reads whose job moved on mid-read: they hold a REVIEW_SLOTS place until they end
 
     def say(self, text):
         self.lines.append(f"[{self.repo}] {text}")
@@ -478,7 +507,7 @@ class Lane:
                 self.waiting, self.inflight = set(), {}
                 # as wide as the cores, not today's K: the pool outlives a change of K, which takes no restart
                 width = max(A.slots(), os.cpu_count() or 1)
-                with futures.ThreadPoolExecutor(max_workers=width + A.LAPTOP_SLOTS + EXPRESS_SLOTS,
+                with futures.ThreadPoolExecutor(max_workers=width + A.LAPTOP_SLOTS + EXPRESS_SLOTS + REVIEW_SLOTS,
                                                 thread_name_prefix="check") as pool:
                     self.pool = pool
                     moved = self.loop(tried)
@@ -507,7 +536,12 @@ class Lane:
                 continue       # and a promote that came while it ran is seen before any job moves on
             for ln in J.drain(self.repo):
                 self.say(ln)
-            jobs = J.lane_jobs(self.repo)
+            jobs = self.jobs = J.lane_jobs(self.repo)
+            self.drop_reads(jobs)
+            for k, r in self.reading.items():   # a read that has ended gives its job a turn, once
+                if r.future.done() and not r.seen:
+                    r.seen = True
+                    tried.discard(k)
             heads = {j.head for j in jobs if j.head}   # a pair of heads no job holds any more is never asked again
             self.clash_of = {p: v for p, v in self.clash_of.items() if p[0] in heads and p[1] in heads}
             for j in jobs:   # a job that has had its turn gets another when (a) it was held since and that hold has
@@ -525,14 +559,16 @@ class Lane:
                     tried.discard(j.key)
             todo = [j for j in jobs if j.key not in tried and self.due(j)]
             if not todo:   # every due job has had its turn: record what finished (a freed slot), or wait for it
-                if not self.inflight:
+                if not self.inflight and not self.pending_reads():
                     return ""
                 self.reap(POLL)   # the timeout lets a new request in while every check still runs
                 continue
-            # one put first (queue --first), then a job in the lane WAIT_CAP or longer, then the oldest small job,
-            # else the oldest heavy one
+            # one put first (queue --first), then a job in the lane WAIT_CAP or longer, then the oldest small job
+            # (a heavy one queued HEAVY_WAIT or longer ago counts as small until its first check runs), else the
+            # oldest heavy one
             job = min(todo, key=lambda j: (not J.first(j.repo, j.pr), not self.overdue(j, "queued_at"),
-                                           self.heavy(j)))
+                                           self.heavy(j) and not (self.overdue(j, "queued_at", HEAVY_WAIT)
+                                                                  and not self.started(j))))
             tried.add(job.key)
             self.tried_nb[job.key] = job.extra.get("not_before")
             self.tried_q[job.key] = self.queued_mark(job)
@@ -612,10 +648,10 @@ class Lane:
     def reap(self, wait):
         """Record each check the pool has finished (waiting up to `wait` seconds for the first) on the lane's thread;
         the job then goes on at its next turn."""
-        if not self.inflight:
+        pending = [f.future for f in self.inflight.values()] + self.pending_reads()
+        if not pending:
             return
-        done, _ = futures.wait([f.future for f in self.inflight.values()], timeout=wait,
-                               return_when=futures.FIRST_COMPLETED)
+        done, _ = futures.wait(pending, timeout=wait, return_when=futures.FIRST_COMPLETED)
         for key, f in list(self.inflight.items()):
             if f.future not in done:
                 continue
@@ -635,6 +671,31 @@ class Lane:
                 self.hold(job, str(e), kind="box")
         if done:
             self.wake()
+
+    def pending_reads(self) -> list:
+        """The futures of the review reads in the pool whose end has not woken their job yet, and of the dropped reads
+        still running (the lane waits for them, so each is charged when it ends)."""
+        return [r.future for r in self.reading.values() if not r.seen] + [r.future for r in self.dropped]
+
+    def drop_reads(self, jobs):
+        """A read whose job has left checking or moved to another digest is dropped (its verdict is on the PR, so a
+        later read at that digest finds it and buys none). Opus, 10-13: "Keep a dropped read counted until its future
+        is done, and charge it then": it keeps its REVIEW_SLOTS place while it runs, and a member pays for it at its
+        end, so a push mid-read does not dodge the day's cap."""
+        checking = {j.key: j.digest for j in jobs if j.state == T.CHECKING}
+        for k, r in list(self.reading.items()):
+            if checking.get(k) != r.digest:
+                del self.reading[k]
+                self.dropped.append(r)
+        for r in [r for r in self.dropped if r.future.done()]:
+            self.dropped.remove(r)
+            if r.future.exception() is None:   # a reviewer's fault on a read nobody waits for charges nothing
+                self.charge(r.future.result())
+
+    def charge(self, v):
+        """A member's lane pays for a read that bought tokens."""
+        if self.member and v.tokens > 0:
+            M.charge(self.member, float(v.extra.get("usd") or 1.0))
 
     @staticmethod
     def reread_due(job) -> bool:
@@ -686,10 +747,38 @@ class Lane:
                                   or any(n in FULL_CHECKS for n in job.plan.checks)))
 
     @staticmethod
-    def overdue(job, field) -> bool:
-        """The stamp in job.extra[field] (queued_at: in the lane; parked_since: parked) is WAIT_CAP or more ago."""
+    def overdue(job, field, cap=None) -> bool:
+        """The stamp in job.extra[field] (queued_at: in the lane; parked_since: parked) is `cap` (WAIT_CAP) or more
+        ago."""
         at = E.epoch_of(job.extra.get(field) or "")
-        return bool(at) and time.time() - at >= WAIT_CAP
+        return bool(at) and time.time() - at >= (WAIT_CAP if cap is None else cap)
+
+    def started(self, job) -> bool:
+        """A check of `job`'s plan has run here: one is recorded or in the pool."""
+        return bool(job.results) or any(k[0] == job.key for k in self.inflight)
+
+    def spare_box(self, job) -> bool:
+        """A box slot free now is spare for `job`'s second (third…) check: no other due job of this pass wants its
+        first one — a queued job not parked, a planned one, or a checking one with a check left to start and none on
+        the box. (brief, 10-13: "every free slot runs a pending check"; three of five slots sat free for hours while
+        39 jobs were checking, each held to one box check.) Never in a member's lane (perms, 10-13: a member PR ran 3
+        checks at once where main runs 1, its tickets ahead of the owner's worker greens), and only while this host
+        keeps its own checks (run.spill() says nothing: no admission ticket waits, a slot is free, not overloaded)."""
+        if self.member:
+            return False
+        for j in self.jobs:
+            if j.key == job.key or not self.due(j) or j.state == T.HELD:
+                continue
+            if j.state == T.QUEUED and not (j.key in self.parked or isinstance(j.extra.get("parked"), dict)):
+                return False
+            if j.state == T.PLANNED:
+                return False
+            if j.state == T.CHECKING and j.plan:
+                mine = [k for k in self.inflight if k[0] == j.key]
+                left = [n for n in j.plan.checks if n not in j.results and (j.key, n) not in self.inflight]
+                if left and not any(not self.inflight[k].laptop and not self.inflight[k].express for k in mine):
+                    return False
+        return not RUN.spill()   # last: it reads the admission slots
 
     def overlapping(self, job):
         """A job whose change really overlaps this one's and goes first, or None: one already planned, checking or
@@ -801,6 +890,8 @@ class Lane:
         the one it was held from). deferred: the job waits on a limit, not on work — stage `deferred`."""
         if job.state == T.HELD:
             return
+        # perms, 10-13: "after a handback or a main-red hold, the job's other checks keep running for nothing"
+        self.stop_checks(job)
         job.extra.pop("parked", None)   # a held job's files are read again when it comes back
         # perms, 10-12: "only the early holds keep the place, and that keep must be bounded": past PLACE_HOLDS holds
         # the place goes, or a job held for days would come back overdue and go ahead of everyone
@@ -882,6 +973,7 @@ class Lane:
             "verdict": job.extra.get("verdict") or {}, "why": why, "chat": job.extra.get("chat") or "",
             "ts": job.extra.get("ts") or "", "red": job.extra.get("red") or {}})
         job.extra["why"] = why
+        self.stop_checks(job)   # perms, 10-13: a red's sibling checks would run on for nothing
         J.move(job, T.HANDBACK, why)
         J.remove(job)
         self.stopped(job, why, route or M.route(job) or "seat")
@@ -1090,9 +1182,11 @@ class Lane:
                     # taken, the job holds its one, or every admission slot is (run.spill; #772 waited 8-30 min a
                     # check on a box cut to 1-2 slots while the laptop answered `free 6`)
                     laptop = True
-                elif box:
-                    # the box, one check per job at a time (so an older heavy PR does not take every box slot); a
-                    # check that may leave runs here too when the laptop is full or resting and the box has room
+                elif box or (self.room(False) and self.spare_box(job)):
+                    # the box, one check per job at a time while another job waits for its first (so an older heavy
+                    # PR does not take every box slot), and as many as are free when none does (spare_box) and the
+                    # runners will not take them; a check that may leave runs here too when the laptop is full or
+                    # resting and the box has room
                     laptop = False
                 else:
                     continue   # no place of either kind for it now: tried again when a check finishes
@@ -1109,7 +1203,9 @@ class Lane:
             return None
         # a handback standing from an earlier head is read again even off the paid paths: #1064's security handback
         # "was tied to the old head and nothing carried it forward or asked for a new read"
-        if ((job.plan and job.plan.paid) or self.handed_back(job)) and not self.review(job):
+        # (a read already in the pool is waited on, with no new look at the PR's comments)
+        if (job.key in self.reading or (job.plan and job.plan.paid) or self.handed_back(job)) \
+                and not self.review(job):
             return None
         J.move(job, T.MERGEABLE)
 
@@ -1175,7 +1271,8 @@ class Lane:
         return None
 
     def review(self, job):
-        """True when the job may go on to the merge; otherwise it has been held, handed back or queried."""
+        """True when the job may go on to the merge; otherwise its read is in the pool (the job waits for it, as for a
+        check) or it has been held, handed back or queried."""
         prior = job.extra.get("verdict")
         pv = T.Verdict.from_dict(prior) if isinstance(prior, dict) and prior else None
         if pv and pv.verdict == T.LAND and pv.digest == job.digest:
@@ -1188,10 +1285,25 @@ class Lane:
             if usd >= cap:
                 self.hold(job, f"{self.member} has spent its day's review cap (${usd:g} of ${cap:g})", kind="box")
                 return False
-        v = self.call("reviewer", "delta_review", job, pv) if pv else self.call("reviewer", "review", job)
+        r = self.reading.get(job.key)
+        if r is not None and r.digest != job.digest:   # a read of an earlier digest still holds its place
+            self.dropped.append(self.reading.pop(job.key))
+            r = None
+        if r is None:
+            if len(self.reading) + len(self.dropped) >= REVIEW_SLOTS:
+                self.waiting.add(job.key)   # it goes on when a read ends and frees its place
+                return False
+            fn = ("delta_review", job, pv) if pv else ("review", job)
+            self.reading[job.key] = Reading(self.pool.submit(self.call, "reviewer", *fn), job.digest)
+            self.waiting.add(job.key)
+            return False
+        if not r.future.done():
+            self.waiting.add(job.key)
+            return False
+        del self.reading[job.key]
+        v = r.future.result()   # a reviewer's fault is a UnitFault here, on the lane's thread: step() holds the job
         E.stage(job.repo, job.pr, "verdict", verdict=v.verdict)
-        if self.member and v.tokens > 0:
-            M.charge(self.member, float(v.extra.get("usd") or 1.0))
+        self.charge(v)
         if v.verdict == T.INCOMPLETE and v.extra.get("host"):
             # "If it fails again, the PR is held with that reason recorded and no fix asked of the author" (owner,
             # 10-12): a read the host could not make twice is the planning seat's, never a handback
