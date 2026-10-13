@@ -1577,6 +1577,18 @@ class TestRecord(Case):
                      self.proc(seat, comm="node")):       # no claude above the caller
             self.assertFalse(R.perms_seat_caller("demo", 30, root, state), root)
 
+    def test_a_cc_state_override_does_not_move_the_perms_seat(self):
+        """The seat is found at the passwd home (PERMS_STATE) whatever CC_STATE says, in the environment or the
+        caller's config: a claude in <CC_STATE>/demo/perms is refused, one in the passwd home's seat passes."""
+        fake = os.path.join(self.tmp, "fake-state")
+        os.environ["CC_STATE"] = fake
+        with open(os.environ["CC_CONFIG"], "w") as f:
+            f.write(f"CC_STATE={fake}\n")
+        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(os.path.join(fake, "demo", "perms"))))
+        self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(os.path.join(R.PERMS_STATE, "demo", "perms"))))
+        del os.environ["CC_STATE"]   # the config's CC_STATE alone moves it no more than the environment's
+        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(os.path.join(fake, "demo", "perms"))))
+
     def test_record_refuses_a_perms_name_outside_the_perms_seat(self):
         box = self.box(**{"gh pr view": self.facts()})
         seat = [False]

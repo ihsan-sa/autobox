@@ -1574,12 +1574,14 @@ def claude_ancestor(pid=None, proc="/proc"):
 
 def perms_seat_caller(repo, pid=None, proc="/proc", state=None):
     """True when the Claude session that called (claude_ancestor()) runs in the perms seat: its /proc/<pid>/cwd
-    resolves to <CC_STATE>/<repo>/perms. Perms, 10-13: "lander record refuses --by perms-* unless the calling Claude
-    ancestor ... has /proc/<pid>/cwd realpath == ~/.cc/state/<repo>/perms"."""
+    resolves to <state>/<repo>/perms, state being PERMS_STATE at the passwd home unless a test passes one. Perms,
+    10-13: "lander record refuses --by perms-* unless the calling Claude ancestor ... has /proc/<pid>/cwd realpath ==
+    ~/.cc/state/<repo>/perms". Never $CC_STATE or $HOME, which a caller sets: a seat that set CC_STATE could start a
+    claude in a <CC_STATE>/<repo>/perms of its own and write perms' name."""
     seat = claude_ancestor(pid, proc)
     if seat is None:
         return False
-    state = state or os.path.expanduser(C.conf("CC_STATE", "~/.cc/state"))
+    state = state or PERMS_STATE
     try:
         cwd = os.path.realpath(os.readlink(os.path.join(proc, str(seat), "cwd")))
     except OSError:
