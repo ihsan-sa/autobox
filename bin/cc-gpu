@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+# cc-gpu — one queue for the GPU jobs of this host, whoever starts them. There is one card, so jobs share it: a job
+# says how much VRAM it needs, waits until the card has that much free, runs, and leaves one line in a log.
+#   cc-gpu run --vram MB [--name LABEL] [--wait-max SEC] -- <cmd...>
+#        waits until nvidia-smi says MB of VRAM is free on the card, then runs <cmd> with the card and exits with ITS
+#        exit code. Jobs are admitted ONE AT A TIME (a lock), and the admitted job holds the lock for a settle window
+#        (CC_GPU_SETTLE seconds, default 10, or until it exits if sooner), so the next job's reading of free VRAM already
+#        includes what this one took. What that does not cover: a job that keeps growing after its settle window can
+#        push the card past full, and that job (or the next) sees CUDA's own out-of-memory error. Ask for the peak.
+#        Appends one JSON line to ~/.cc/gpu/jobs.jsonl when the job ends: ts (UTC, start), name, cmd (argv, cut to 200
+#        characters), vram_mb (asked), wait_s (queue + VRAM wait), run_s, peak_vram_mb, exit. peak_vram_mb is the card's
+#        highest used VRAM while the job ran minus what was used when it started, sampled every second; with two jobs
+#        on the card at once it counts both, so it is an upper bound on the job's own use.
+#        REFUSED, exit 4, nothing run: --vram above the card's total memory. GAVE UP, exit 5, nothing run: still not
+#        enough free after --wait-max seconds (default 0, which waits as long as it takes).
+#   cc-gpu ffmpeg -- <ffmpeg args...>
+#        an x264/x265 encode on the GPU when there is a card: `-c:v libx264` becomes h264_nvenc and `libx265` hevc_nvenc,
+#        `-crf N` becomes NVENC's constant quality (`-rc vbr -cq N -b:v 0`), x264's `-preset` its nearest NVENC one
+#        (medium → p5, slow → p6, slower and veryslow → p7; p5 when none is given), `-tune` becomes hq, and the
+#        x264/x265-only `-x264-params`/`-x265-params` are dropped; then it runs as `cc-gpu run --vram 512` (more than a
+#        1080p NVENC encode takes). With no card, with CC_GPU_ENCODE=0, or with no x264/x265 in the args, it is plain
+#        ffmpeg with the args untouched, on the CPU. Exits with ffmpeg's code. CC_GPU_FFMPEG names the ffmpeg.
+#   cc-gpu probe        exit 0 and one line (the card, its total and free MB) when a card is usable here; else exit 3
+#                       and the reason. A caller with a CPU path asks this first and falls back on 3.
+#   cc-gpu status       the card, then the last ten jobs of the log
+#   cc-gpu selfcheck    the rules above against a fake nvidia-smi, in a scratch dir; no card needed
+#   cc-gpu --help | -h  this header
+# NO CARD, exit 3, nothing run, for `run` and `probe` alike: nvidia-smi is missing, fails, or lists no GPU. The message
+#   says to fall back to the CPU, so the caller's own fallback is the place a CPU path lives; cc-gpu never runs one.
+# IT RUNS ON THE HOST. A worker's sandbox does not see the card or this queue yet: there `probe` says there is no card
+#   and the caller takes the CPU path. Sandboxed workers get the card once PR #1198 (sandbox-sees-gpu) lands, which
+#   binds the device nodes and the queue's two files (~/.cc/gpu/lock, ~/.cc/gpu/jobs.jsonl) into the sandbox.
+# ENV: CC_GPU_DIR (the queue's dir, default ~/.cc/gpu) · CC_GPU_SMI (the nvidia-smi to ask, default nvidia-smi) ·
+#   CC_GPU_SETTLE (seconds, default 10) · CC_GPU_POLL (seconds between VRAM readings while waiting, default 2).
+# Only the first GPU nvidia-smi lists is used; this host has one. Installs nothing; needs only the driver's nvidia-smi.
+import fcntl, json, os, shutil, signal, subprocess, sys, tempfile, threading, time
+
+USAGE = "usage: cc-gpu run --vram MB [--name LABEL] [--wait-max SEC] -- <cmd...> | ffmpeg -- <args...> | probe | status | selfcheck  (runs on the host; sandboxed workers get it once PR #1198 lands)"
+NVENC = {"libx264": "h264_nvenc", "libx265": "hevc_nvenc"}
+PRESET = {"ultrafast": "p1", "superfast": "p1", "veryfast": "p2", "faster": "p3", "fast": "p4", "medium": "p5",
+          "slow": "p6", "slower": "p7", "veryslow": "p7", "placebo": "p7"}
+ENCODE_VRAM = 512
+NO_GPU, REFUSED, GAVE_UP = 3, 4, 5
+
+
+def gdir():
+    return os.environ.get("CC_GPU_DIR") or os.path.expanduser("~/.cc/gpu")
+
+
+def fnum(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+def card():
+    """(name, total MB, used MB, free MB) of the first GPU, or (None, reason)."""
+    smi = os.environ.get("CC_GPU_SMI") or "nvidia-smi"
+    if not shutil.which(smi):
+        return None, f"no {smi} on this host"
+    try:
+        r = subprocess.run([smi, "--query-gpu=name,memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"{smi} did not answer ({e})"
+    line = next((l for l in r.stdout.splitlines() if l.strip()), "")
+    if r.returncode != 0 or not line:
+        why = (r.stdout + r.stderr).strip().splitlines()
+        return None, f"{smi} failed: {why[0] if why else 'exit %d' % r.returncode}"
+    try:
+        name, total, used, free = [x.strip() for x in line.rsplit(",", 3)]
+        return (name, int(float(total)), int(float(used)), int(float(free))), None
+    except ValueError:
+        return None, f"{smi} printed something cc-gpu cannot read: {line!r}"
+
+
+def no_gpu(why):
+    print(f"cc-gpu: no usable GPU here: {why.rstrip('.')}. Fall back to the CPU.", file=sys.stderr)
+    return NO_GPU
+
+
+def opened(path, flags):
+    # O_NOFOLLOW: a link at either queue file is refused rather than written through
+    return os.open(path, flags | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+
+
+def log(rec):
+    try:
+        os.makedirs(gdir(), mode=0o700, exist_ok=True)
+        fd = opened(os.path.join(gdir(), "jobs.jsonl"), os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(fd, (json.dumps(rec) + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(f"cc-gpu: could not write the log ({e}); the job itself ran", file=sys.stderr)
+
+
+def run(argv):
+    vram, name, wait_max, cmd = None, None, 0.0, []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            cmd = argv[i + 1:]; break
+        if a in ("--vram", "--name", "--wait-max") and i + 1 < len(argv):
+            v = argv[i + 1]; i += 2
+            try:
+                if a == "--vram": vram = int(v)
+                elif a == "--wait-max": wait_max = float(v)
+                else: name = v
+            except ValueError:
+                print(f"cc-gpu: {a} wants a number, not {v!r}", file=sys.stderr); return 2
+            continue
+        print(f"cc-gpu: unknown argument {a!r}\n{USAGE}", file=sys.stderr); return 2
+    if vram is None or vram <= 0 or not cmd:
+        print(USAGE, file=sys.stderr); return 2
+    c, why = card()
+    if c is None:
+        return no_gpu(why)
+    if vram > c[1]:
+        print(f"cc-gpu: refused: the job asks for {vram} MB and the card ({c[0]}) has {c[1]} MB in all", file=sys.stderr)
+        return REFUSED
+    t0 = time.time()
+    os.makedirs(gdir(), mode=0o700, exist_ok=True)
+    lk = opened(os.path.join(gdir(), "lock"), os.O_RDWR)
+    poll, settle = max(0.05, fnum("CC_GPU_POLL", 2)), max(0.0, fnum("CC_GPU_SETTLE", 10))
+    while True:   # the lock first, so jobs are admitted in turn; then free VRAM, read while holding it
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+        except BlockingIOError:
+            if wait_max and time.time() - t0 > wait_max:
+                print(f"cc-gpu: gave up: the queue was still busy after {wait_max:g} s", file=sys.stderr); return GAVE_UP
+            time.sleep(poll)
+    while True:
+        c, why = card()
+        if c is None:
+            return no_gpu(why)
+        if c[3] >= vram:
+            break
+        if wait_max and time.time() - t0 > wait_max:
+            print(f"cc-gpu: gave up: {c[3]} MB free after {wait_max:g} s, the job asks for {vram} MB", file=sys.stderr)
+            return GAVE_UP
+        time.sleep(poll)
+    base, peak, start = c[2], [c[2]], time.time()
+    try:
+        p = subprocess.Popen(cmd)
+    except OSError as e:
+        print(f"cc-gpu: could not start {cmd[0]}: {e}", file=sys.stderr); return 127
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, lambda n, f: p.send_signal(n))
+    done = threading.Event()
+
+    def sample():
+        while not done.wait(1.0):
+            x, _ = card()
+            if x: peak[0] = max(peak[0], x[2])
+    threading.Thread(target=sample, daemon=True).start()
+    try:
+        p.wait(timeout=settle)
+    except subprocess.TimeoutExpired:
+        pass
+    fcntl.flock(lk, fcntl.LOCK_UN); os.close(lk)
+    while True:
+        try:
+            rc = p.wait(); break
+        except InterruptedError:
+            continue
+    done.set()
+    x, _ = card()
+    if x: peak[0] = max(peak[0], x[2])
+    log({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0)), "name": name or os.path.basename(cmd[0]),
+         "cmd": " ".join(cmd)[:200], "vram_mb": vram, "wait_s": round(start - t0, 1), "run_s": round(time.time() - start, 1),
+         "peak_vram_mb": max(0, peak[0] - base), "exit": rc})
+    return rc if rc >= 0 else 128 - rc
+
+
+def nvenc_args(a):
+    """The ffmpeg args `a` with each x264/x265 setting turned into its NVENC one, or None when `a` encodes neither."""
+    if not any(x in NVENC for x in a):
+        return None
+    out, i, preset = [], 0, False
+    while i < len(a):
+        k, v = a[i], a[i + 1] if i + 1 < len(a) else None
+        opt = k.split(":")[0]
+        if opt in ("-c", "-codec", "-vcodec") and v in NVENC:
+            out += [k, NVENC[v]]
+        elif opt == "-crf" and v is not None:
+            out += ["-rc", "vbr", "-cq", v, "-b:v", "0"]
+        elif opt == "-preset" and v is not None:
+            out += [k, PRESET.get(v, v)]; preset = True
+        elif opt == "-tune" and v is not None:
+            out += [k, "hq"]
+        elif opt in ("-x264-params", "-x265-params", "-x264opts") and v is not None:
+            pass
+        else:
+            out.append(k); i += 1; continue
+        i += 2
+    if not preset:   # an output option, so it goes just before the last arg (the output file), never among an input's
+        out = out[:-1] + ["-preset", "p5", out[-1]]
+    return out
+
+
+def ffmpeg(argv):
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    ff = os.environ.get("CC_GPU_FFMPEG") or "ffmpeg"
+    nv = None if os.environ.get("CC_GPU_ENCODE") == "0" else nvenc_args(argv)
+    if nv is not None and card()[0] is not None:
+        return run(["--vram", str(ENCODE_VRAM), "--name", "ffmpeg", "--", ff] + nv)
+    try:
+        return subprocess.run([ff] + argv).returncode
+    except OSError as e:
+        print(f"cc-gpu: could not start {ff}: {e}", file=sys.stderr); return 127
+
+
+def probe():
+    c, why = card()
+    if c is None:
+        return no_gpu(why)
+    print(f"cc-gpu: {c[0]}, {c[1]} MB in all, {c[3]} MB free")
+    return 0
+
+
+def status():
+    rc = probe()
+    try:
+        with open(os.path.join(gdir(), "jobs.jsonl")) as f:
+            for l in f.readlines()[-10:]:
+                print(l.rstrip())
+    except OSError:
+        print("cc-gpu: no jobs logged yet")
+    return 0 if rc in (0, NO_GPU) else rc
+
+
+def selfcheck():
+    me, fails = os.path.realpath(__file__), []
+    tmp = tempfile.mkdtemp(prefix="ccgpu-")
+    smi, usedf = os.path.join(tmp, "nvidia-smi"), os.path.join(tmp, "used")
+    with open(smi, "w") as f:   # a card of 8151 MB; "used" is whatever the file says, or the fake fails when it is absent
+        f.write('#!/bin/sh\n[ -f "%s" ] || { echo "NVIDIA-SMI has failed"; exit 9; }\n'
+                'u=$(cat "%s"); echo "Fake RTX, 8151, $u, $((8151 - u))"\n' % (usedf, usedf))
+    os.chmod(smi, 0o755)
+
+    def env(**kw):
+        e = dict(os.environ, CC_GPU_DIR=os.path.join(tmp, "q"), CC_GPU_SMI=smi, CC_GPU_POLL="0.1", CC_GPU_SETTLE="0.3")
+        e.update(kw); return e
+
+    def go(args, **kw):
+        return subprocess.run([sys.executable, me] + args, env=env(**kw), capture_output=True, text=True, timeout=60)
+
+    def t(label, got, want):
+        print(("ok   " if got == want else "FAIL ") + label + ("" if got == want else f": got {got!r}, want {want!r}"))
+        if got != want: fails.append(label)
+
+    def logged():
+        try:
+            with open(os.path.join(tmp, "q", "jobs.jsonl")) as f:
+                return [json.loads(l) for l in f if l.strip()]
+        except OSError:
+            return []
+
+    def used(mb):
+        with open(usedf, "w") as f: f.write(str(mb))
+
+    try:
+        # no card: probe and run both exit 3 with the fallback line, and run starts nothing
+        r = go(["probe"]); t("no card: probe exits 3 and says to fall back to the CPU", (r.returncode, "Fall back to the CPU" in r.stderr), (3, True))
+        mark = os.path.join(tmp, "ran")
+        r = go(["run", "--vram", "100", "--", "touch", mark])
+        t("no card: run exits 3 and runs nothing", (r.returncode, os.path.exists(mark)), (3, False))
+        r = go(["probe"], CC_GPU_SMI=os.path.join(tmp, "absent-smi"))
+        t("no nvidia-smi at all: exit 3, the reason names it", (r.returncode, "no " in r.stderr), (3, True))
+        # a card: probe is 0; a job that fits runs with its own exit code and leaves one line
+        used(1000)
+        r = go(["probe"]); t("a card: probe exits 0 and names it", (r.returncode, "Fake RTX" in r.stdout), (0, True))
+        r = go(["run", "--vram", "4000", "--name", "enc", "--", "sh", "-c", "exit 7"])
+        rec = logged()
+        t("a job that fits runs and cc-gpu exits with the job's code", r.returncode, 7)
+        t("…and logs one line with what it asked, its name and exit",
+          [(x["name"], x["vram_mb"], x["exit"]) for x in rec], [("enc", 4000, 7)])
+        t("…carrying wait, run time and peak", sorted(k for k in rec[0] if k in ("wait_s", "run_s", "peak_vram_mb")),
+          ["peak_vram_mb", "run_s", "wait_s"])
+        # peak: the job raises "used" by 2500 while it runs
+        r = go(["run", "--vram", "100", "--", "sh", "-c", f"echo 3500 > {usedf}; sleep 1.5; echo 1000 > {usedf}"])
+        t("peak VRAM is the highest used while it ran minus used at its start", logged()[-1]["peak_vram_mb"], 2500)
+        # refused: more than the card has
+        n = len(logged())
+        r = go(["run", "--vram", "9000", "--", "touch", mark])
+        t("a job asking for more than the card has is refused, exit 4, nothing run, nothing logged",
+          (r.returncode, os.path.exists(mark), len(logged()) - n, "refused" in r.stderr), (4, False, 0, True))
+        r = go(["run", "--vram", "8151", "--wait-max", "0.3", "--", "true"])
+        t("…but exactly the card's total is not refused: it waits for it (here: gives up, exit 5)", r.returncode, 5)
+        # waits: not enough free → waits, then runs when it frees up
+        used(6000)
+        p = subprocess.Popen([sys.executable, me, "run", "--vram", "4000", "--", "touch", mark], env=env(),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(1.0)
+        t("not enough free VRAM: the job waits and has not run", (p.poll(), os.path.exists(mark)), (None, False))
+        used(1000); p.wait(timeout=30)
+        t("…and runs once enough is free, its wait logged", (p.returncode, os.path.exists(mark), logged()[-1]["wait_s"] >= 0.9), (0, True, True))
+        used(6000)
+        r = go(["run", "--vram", "4000", "--wait-max", "0.5", "--", "touch", mark + "2"])
+        t("--wait-max: still not enough free, exit 5 and nothing run", (r.returncode, os.path.exists(mark + "2")), (5, False))
+        used(1000)
+        # the queue: a job holds admission for its settle window, so a second waits behind it
+        first = subprocess.Popen([sys.executable, me, "run", "--vram", "100", "--", "sleep", "3"], env=env(CC_GPU_SETTLE="2"))
+        time.sleep(0.5)
+        t0 = time.time(); r = go(["run", "--vram", "100", "--wait-max", "0.5", "--", "true"])
+        t("a job inside another's settle window waits for the lock (here: gives up, exit 5)", r.returncode, 5)
+        first.wait(timeout=30)
+        r = go(["run", "--vram", "100", "--", "true"])
+        t("…and is admitted once the window is over", r.returncode, 0)
+        # a link at the log is not written through
+        os.remove(os.path.join(tmp, "q", "jobs.jsonl")); target = os.path.join(tmp, "elsewhere")
+        open(target, "w").close(); os.symlink(target, os.path.join(tmp, "q", "jobs.jsonl"))
+        r = go(["run", "--vram", "100", "--", "true"])
+        t("a link planted at the log is refused, not followed; the job still ran", (r.returncode, os.path.getsize(target)), (0, 0))
+        r = go(["run", "--vram", "x", "--", "true"]); t("a non-number --vram is a usage error, exit 2", r.returncode, 2)
+        os.remove(os.path.join(tmp, "q", "jobs.jsonl"))   # the link above, so the cases below log again
+        # ffmpeg: a fake that prints its args, so what cc-gpu turned them into is what the test reads; a card with room
+        used(1000)
+        fake = os.path.join(tmp, "ffmpeg")
+        with open(fake, "w") as f: f.write('#!/bin/sh\necho "$@"\n')
+        os.chmod(fake, 0o755)
+        x264 = ["-i", "in.mkv", "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-tune", "animation", "-x264-params", "a=1", "-pix_fmt", "yuv420p", "out.mp4"]
+        n = len(logged()); r = go(["ffmpeg", "--"] + x264, CC_GPU_FFMPEG=fake)
+        t("ffmpeg on a card: x264 becomes NVENC, CRF its CQ, the preset its nearest, x264-only params dropped",
+          r.stdout.split(), ["-i", "in.mkv", "-c:v", "h264_nvenc", "-preset", "p6", "-rc", "vbr", "-cq", "18", "-b:v", "0", "-tune", "hq", "-pix_fmt", "yuv420p", "out.mp4"])
+        t("…queued like any job: one line in the log", (len(logged()) - n, logged()[-1]["vram_mb"]), (1, 512))
+        r = go(["ffmpeg", "--", "-i", "a", "-c:v", "libx265", "b.mp4"], CC_GPU_FFMPEG=fake)
+        t("…x265 becomes hevc_nvenc, and with no preset given it gets p5 just before the output", r.stdout.split(), ["-i", "a", "-c:v", "hevc_nvenc", "-preset", "p5", "b.mp4"])
+        n = len(logged()); r = go(["ffmpeg", "--"] + x264, CC_GPU_FFMPEG=fake, CC_GPU_ENCODE="0")
+        t("CC_GPU_ENCODE=0: plain ffmpeg, args untouched, not queued", (r.stdout.split(), len(logged()) - n), (x264, 0))
+        r = go(["ffmpeg", "--", "-i", "a", "-vf", "palettegen", "p.png"], CC_GPU_FFMPEG=fake)
+        t("no x264/x265 in the args: plain ffmpeg, untouched, not queued", (r.stdout.split(), len(logged()) - n), (["-i", "a", "-vf", "palettegen", "p.png"], 0))
+        os.remove(usedf); r = go(["ffmpeg", "--"] + x264, CC_GPU_FFMPEG=fake)
+        t("no card: the CPU, args untouched, exit 0", (r.returncode, r.stdout.split()), (0, x264))
+        used(1000)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"cc-gpu selfcheck: {len(fails)} failed")
+    return 1 if fails else 0
+
+
+def main(a):
+    if not a or a[0] in ("-h", "--help"):
+        with open(os.path.realpath(__file__)) as f:
+            for l in f:
+                if not l.startswith("#"): break
+                if not l.startswith("#!"): print(l[2:].rstrip())
+        return 0 if a else 2
+    cmd = {"run": lambda: run(a[1:]), "ffmpeg": lambda: ffmpeg(a[1:]), "probe": probe, "status": status, "selfcheck": selfcheck}.get(a[0])
+    if not cmd:
+        print(USAGE, file=sys.stderr); return 2
+    return cmd()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

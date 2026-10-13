@@ -982,6 +982,41 @@ class TestReview(Case):
         self.assertEqual(box.called("claude"), [])
         self.assertEqual(R.reads_used("demo", 7), 0)
 
+    def test_a_land_at_this_head_stands_over_the_landers_own_later_handback(self):
+        """#1113: a seat's LAND sat at the PR's exact head and change key, the lander's own read then handed it back,
+        and the read cap sent it to the planning seat for a third read."""
+        box = self.box(claude=claude_says("HANDBACK"))
+        j = self.job()
+        land, mine = self.comment("LAND", j.digest, by="seat"), "+".join(R.readers())
+        v = R.review(j, comments=[land, self.comment("HANDBACK", j.digest, ["1. [correctness] x"], by=mine)])
+        self.assertEqual((v.verdict, v.model), (T.LAND, "seat"))
+        # a HANDBACK a seat recorded after it still stands, and so does the lander's over a LAND at another head
+        v = R.review(j, comments=[land, self.comment("HANDBACK", j.digest, ["1. [correctness] x"], by="seat")])
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)
+        v = R.review(j, comments=[self.comment("LAND", j.digest, by="seat", head="c" * 40),
+                                  self.comment("HANDBACK", j.digest, ["1. [correctness] x"], by=mine)])
+        self.assertEqual(v.verdict, T.HANDBACK_VERDICT)
+        self.assertEqual(box.called("claude"), [])
+
+    def test_a_land_recorded_while_the_read_ran_stands_over_its_handback(self):
+        blocker = {"kind": "correctness", "where": "x.py:2", "what": "wrong", "input": "b", "fix": "c"}
+        j = self.job()
+        facts = json.dumps({"comments": [self.comment("LAND", j.digest, by="seat")], "title": "a change"})
+        self.box(claude=claude_says("HANDBACK", blocking=[blocker]), **{"gh pr view": (0, facts)})
+        self.assertEqual(R.review(j, comments=[]).verdict, T.LAND)
+        self.box(claude=claude_says("HANDBACK", blocking=[blocker]))   # no LAND on the PR: the handback stands
+        self.assertEqual(R.review(self.job(), comments=[]).verdict, T.HANDBACK_VERDICT)
+
+    def test_a_security_handback_posted_while_the_read_ran_outranks_that_land(self):
+        """Every other path runs _security_stands before a recorded LAND; the re-read after a bought HANDBACK does too."""
+        blocker = {"kind": "correctness", "where": "x.py:2", "what": "wrong", "input": "b", "fix": "c"}
+        j = self.job()
+        sec = self.comment("HANDBACK", "0dd", ["1. [security] x"], head="c" * 40, by="perms-security")
+        facts = json.dumps({"comments": [sec, self.comment("LAND", j.digest, by="seat")], "title": "a change"})
+        self.box(claude=claude_says("HANDBACK", blocking=[blocker]), **{"gh pr view": (0, facts)})
+        v = R.review(self.job(), comments=[])
+        self.assertEqual((v.verdict, v.model, v.extra.get("security")), (T.HANDBACK_VERDICT, "perms-security", True))
+
     def test_a_binary_change_is_flagged_unless_it_is_a_known_binary_type(self):
         """One NUL byte makes git call a script, a unit file or a web page binary, and each still runs, so its change
         would show as one line nobody reads. The files block gives both blob ids and flags every binary change but

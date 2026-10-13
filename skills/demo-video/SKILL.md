@@ -87,6 +87,10 @@ cursor moves on every frame. Nothing real may be in frame: every beat checks the
 - `web-encode.sh`: the web copies of a finished film. `web-encode.sh mp4 IN OUT [CRF]` is a small H.264 for a page's
   video (CRF 24 by default, faststart), and `web-encode.sh gif IN OUT WIDTH FPS COLOURS [SS T]` a GIF with one palette
   and no dithering, which keeps a UI's flat colours clean; `web-encode.sh selfcheck` checks both.
+- Every H.264 encode here (the beat clips, the stitched film, the web MP4) goes through `cc-gpu ffmpeg` when the host
+  has cc-gpu, so it runs as NVENC on the card when there is one and as x264 on the CPU when there is not. cc-gpu runs
+  on the host; inside a worker's sandbox it takes the CPU path until PR #1198 lands.
+  `CC_GPU_ENCODE=0` keeps it on the CPU.
 
 ## How to make one
 

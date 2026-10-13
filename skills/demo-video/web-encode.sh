@@ -2,7 +2,10 @@
 # web-encode.sh — the web copies of a finished film: a small MP4 for a page's <video> and a GIF for where video won't play.
 #
 #   web-encode.sh mp4 IN OUT [CRF]                       H.264 High, yuv420p, preset slow, CRF (default 24), faststart,
-#                                                        IN's size and frame rate; IN's audio as AAC 128k when it has any
+#                                                        IN's size and frame rate; IN's audio as AAC 128k when it has any.
+#                                                        Through `cc-gpu ffmpeg` when cc-gpu is here: h264_nvenc on the
+#                                                        card (preset p6, CQ = CRF) when it finds one, unless
+#                                                        CC_GPU_ENCODE=0; libx264 on the CPU otherwise
 #   web-encode.sh gif IN OUT WIDTH FPS COLOURS [SS T]    WIDTH px wide (height kept in proportion, lanczos), FPS frames a
 #                                                        second, one palette of COLOURS (stats_mode=diff), no dithering,
 #                                                        diff_mode=rectangle; SS and T cut T seconds from SS seconds in
@@ -12,11 +15,14 @@
 # GIF keeps the flat colours of a UI clean and compresses far better; a photo-like frame shows bands instead.
 set -euo pipefail
 
-usage(){ sed -n '4,9p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage(){ sed -n '4,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+on_gpu(){ [ "${CC_GPU_ENCODE:-}" != 0 ] && "${CC_GPU:-cc-gpu}" probe >/dev/null 2>&1; }
+ffx=(ffmpeg); command -v "${CC_GPU:-cc-gpu}" >/dev/null && ffx=("${CC_GPU:-cc-gpu}" ffmpeg --)   # cc-gpu turns x264 into NVENC when there is a card
 
 mp4(){
   local in=$1 out=$2 crf=${3:-24}
-  ffmpeg -hide_banner -loglevel error -y -i "$in" -map 0:v:0 -map '0:a:0?' \
+  "${ffx[@]}" -hide_banner -loglevel error -y -i "$in" -map 0:v:0 -map '0:a:0?' \
     -c:v libx264 -preset slow -crf "$crf" -profile:v high -pix_fmt yuv420p \
     -c:a aac -b:a 128k -movflags +faststart "$out"
 }
@@ -39,6 +45,8 @@ selfcheck(){
   ok(){ if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: got '$2', want '$3'"; fails=$((fails + 1)); fi; }
   probe(){ ffprobe -v error -select_streams "$1" -show_entries "$2" -of csv=p=0 "$3" | head -1; }
 
+  local gpu=0; on_gpu && gpu=1
+  export CC_GPU_ENCODE=0   # the x264 path first, whatever this host has
   mp4 "$tmp/in.mkv" "$tmp/a.mp4"
   ok 'mp4: video is H.264 High yuv420p at the source size and rate' \
      "$(probe v:0 stream=codec_name,profile,pix_fmt,width,height,r_frame_rate "$tmp/a.mp4")" 'h264,High,640,360,yuv420p,30/1'
@@ -49,6 +57,15 @@ selfcheck(){
   mp4 "$tmp/silent.mkv" "$tmp/b.mp4" 30
   ok 'mp4: a silent source gives a silent MP4' "$(probe a stream=codec_name "$tmp/b.mp4")" ''
   ok 'mp4: CRF given is CRF used' "$(grep -ao 'crf=[0-9.]*' "$tmp/b.mp4" | head -1)" 'crf=30.0'
+  # the GPU path, when there is a card: the same stream, and no x264 settings in it (x264 writes them; NVENC does not)
+  if [ "$gpu" = 1 ]; then
+    CC_GPU_ENCODE= mp4 "$tmp/in.mkv" "$tmp/g.mp4"
+    ok 'mp4 on the GPU: H.264 High yuv420p at the source size and rate' \
+       "$(probe v:0 stream=codec_name,profile,pix_fmt,width,height,r_frame_rate "$tmp/g.mp4")" 'h264,High,640,360,yuv420p,30/1'
+    ok 'mp4 on the GPU: encoded by NVENC, not x264' "$(grep -c -a 'x264 - core' "$tmp/g.mp4")" 0
+  else
+    echo "skip mp4 on the GPU: cc-gpu probe finds no card here"
+  fi
 
   gif "$tmp/in.mkv" "$tmp/a.gif" 320 10 64
   ok 'gif: WIDTH wide, height in proportion, FPS a second' \

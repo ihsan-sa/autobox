@@ -2422,7 +2422,7 @@ def selfcheck():
     _ie = {k: os.environ.get(k) for k in ("HOME", "CC_CONFIG", "CC_FAILURES", "CC_RECONCILE_LAUNCH", "CC_RECONCILE_PROC",
                                           "CC_RECONCILE_DEEP_LAUNCH",
                                           "CC_SPEND_TIER", "CC_RECONCILE_STUBS")}
-    _is, _inv, _deep = STATE, investigate, deep_fix
+    _is, _inv, _deep, _ij = STATE, investigate, deep_fix, ideas_judge
     try:
         os.environ.pop("CC_RECONCILE_STUBS", None)
         os.environ.update(HOME=ti, CC_CONFIG=f"{ti}/.cc/config", CC_FAILURES=f"{ti}/.cc/failures",
@@ -2516,11 +2516,13 @@ def selfcheck():
         scratch(ti, NOOP)
         globals()["investigate"] = lambda dry=False: "  investigation  from-the-tick"
         globals()["deep_fix"] = lambda dry=False: "  deep fix   from-the-tick"
+        globals()["ideas_judge"] = lambda: ["  ideas  from-the-tick"]
         ok("THE TICK carries it: the investigation's line is printed by tick(), no timer of its own",
            "investigation  from-the-tick" in quietly(tick, {}, False))
         ok("…and so does the deep fix's", "deep fix   from-the-tick" in quietly(tick, {}, False))
+        ok("…and so does the ideas judge's", "ideas  from-the-tick" in quietly(tick, {}, False))
     finally:
-        restore(); globals().update(STATE=_is, investigate=_inv, deep_fix=_deep)
+        restore(); globals().update(STATE=_is, investigate=_inv, deep_fix=_deep, ideas_judge=_ij)
         for k, v in _ie.items():
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
         shutil.rmtree(ti, ignore_errors=True)

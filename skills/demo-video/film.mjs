@@ -337,6 +337,13 @@ export function firstDenied(text, deny) {
 
 const hex = (c) => c.replace(/^#/, '0x');
 const q = ['-hide_banner', '-loglevel', 'error', '-y'];
+/* THE ENCODER: `cc-gpu ffmpeg` when this host has cc-gpu. It turns the x264 settings below into NVENC's and queues the
+   encode on the card when there is one, and is plain ffmpeg on the CPU when there is not, or with CC_GPU_ENCODE=0. */
+const CC_GPU = process.env.CC_GPU || 'cc-gpu';
+let viaGpu;
+const ff = (args) => ((viaGpu ??= spawnSync(CC_GPU, ['--help'], { stdio: 'ignore' }).status === 0)
+  ? execFileSync(CC_GPU, ['ffmpeg', '--', ...args], { stdio: 'inherit', env: { ...process.env, CC_GPU_FFMPEG: FFMPEG } })
+  : execFileSync(FFMPEG, args, { stdio: 'inherit' }));
 const H264 = ['-c:v', 'libx264', '-preset', 'slow', '-crf', '16', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'];
 
 /** The ffmpeg filter that adds the caption strip (CAPTION's look) to a frame, its words read from `textFile`.
@@ -414,8 +421,8 @@ export async function encodeClip(beat, { mp4, work, bg = '#ffffff' }) {
   } finally { await browser.close(); }
   writeFileSync(text, beat.caption || '');
   const vf = beat.caption ? captionFilter(text) + ',' : '';
-  execFileSync(FFMPEG, [...q, '-framerate', String(beat.fps), '-i', join(dir, 'c%06d.png'),
-    '-vf', `${vf}scale=trunc(iw/2)*2:trunc(ih/2)*2:out_range=tv,format=yuv420p`, ...CLIP, mp4], { stdio: 'inherit' });
+  ff([...q, '-framerate', String(beat.fps), '-i', join(dir, 'c%06d.png'),
+    '-vf', `${vf}scale=trunc(iw/2)*2:trunc(ih/2)*2:out_range=tv,format=yuv420p`, ...CLIP, mp4]);
   if (!process.env.DEMO_KEEP) rmSync(dir, { recursive: true, force: true });
   return beat.frames.length / beat.fps;
 }
@@ -438,8 +445,8 @@ export function encodeFrames(frames, { mp4, list, vf = '', fps = 30 }) {
     while (i + 1 < kept.length && start + kept[i].dur <= t) { start += kept[i].dur; i++; }
     symlinkSync(resolve(kept[i].file), join(seq, `s${String(o + 1).padStart(6, '0')}${ext}`));
   }
-  execFileSync(FFMPEG, [...q, '-framerate', String(fps), '-i', join(seq, `s%06d${ext}`),
-    '-vf', `${vf ? vf + ',' : ''}scale=trunc(iw/2)*2:trunc(ih/2)*2:out_range=tv,format=yuv420p`, ...CLIP, mp4], { stdio: 'inherit' });
+  ff([...q, '-framerate', String(fps), '-i', join(seq, `s%06d${ext}`),
+    '-vf', `${vf ? vf + ',' : ''}scale=trunc(iw/2)*2:trunc(ih/2)*2:out_range=tv,format=yuv420p`, ...CLIP, mp4]);
   rmSync(seq, { recursive: true, force: true });
   return count / fps;
 }
@@ -461,7 +468,7 @@ export function stitch(clips, { mp4, fade = 0 }) {
     { encoding: 'utf8' }).trim();
   if (clips.length === 1 || !fade) {
     const graph = clips.map((_, i) => `[${i}:v]`).join('') + `concat=n=${clips.length}:v=1:a=0[v]`;
-    execFileSync(FFMPEG, [...q, ...clips.flatMap((c) => ['-i', c]), '-filter_complex', graph, '-map', '[v]', '-r', r, ...H264, mp4], { stdio: 'inherit' });
+    ff([...q, ...clips.flatMap((c) => ['-i', c]), '-filter_complex', graph, '-map', '[v]', '-r', r, ...H264, mp4]);
     return;
   }
   const at = fadeOffsets(clips.map(lengthOf), fade);
@@ -471,8 +478,8 @@ export function stitch(clips, { mp4, fade = 0 }) {
     graph += `[${last}][${i + 1}:v]xfade=transition=fade:duration=${fade}:offset=${off.toFixed(3)}[${out}];`;
     last = out;
   });
-  execFileSync(FFMPEG, [...q, ...clips.flatMap((c) => ['-i', c]), '-filter_complex', graph.replace(/;$/, ''), '-map', '[v]',
-    '-r', r, ...H264, mp4], { stdio: 'inherit' });
+  ff([...q, ...clips.flatMap((c) => ['-i', c]), '-filter_complex', graph.replace(/;$/, ''), '-map', '[v]',
+    '-r', r, ...H264, mp4]);
 }
 
 /** A GIF of a film: fewer frames, smaller, its own palette. */

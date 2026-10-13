@@ -5,6 +5,7 @@
 Each case builds its own fixture (a manifest text, or a git repo of its own), and asserts both what is selected and
 what is left out.
 """
+import ast
 import os
 import subprocess
 import sys
@@ -1197,6 +1198,88 @@ class Reach(unittest.TestCase):
         self.assertEqual(R.parse(R.render(edges)), edges)
         self.assertEqual(R.parse("# x\n\nbad line\na\tb\n"), [("a", "b")])
         self.assertEqual(R.callers([("a", "b"), ("c", "b"), ("a", "d")], "b"), ["a", "c"])
+
+
+class TestLivePolicy(unittest.TestCase):
+    """The repo's own policy: brief, "a lander-class PR that doesn't touch a gate land whole with ONE strong read";
+    the gate paths keep lander-self."""
+    PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "tests", "LANDING-policy.toml")
+
+    def test_only_the_landers_gate_paths_go_to_lander_self(self):
+        if not os.path.exists(self.PATH):
+            self.skipTest("no overlay policy in this tree")
+        with open(self.PATH) as f:
+            pol, faults = M.parse_policy(f.read(), source="policy")
+        self.assertEqual(faults, [])
+        for gate in ("core/lander/review.py", "core/lander/plan.py", "core/lander/check.py", "core/lander/lane.py",
+                     "core/lander/sandbox.py", "core/lander/gh.py", "core/lander/records.py", "core/lander/cli.py",
+                     "core/bin/lander-self", "tests/LANDING-policy.toml"):
+            self.assertTrue(M.match(pol.lander, gate), gate)
+        for plain in ("core/lander/board.py", "core/lander/tick.py", "core/tests/lander/test_plan.py"):
+            self.assertFalse(M.match(pol.lander, plain), plain)
+            self.assertTrue(M.match(pol.paid_review, plain), plain)
+
+    @staticmethod
+    def _lander_imports(tree, top_only):
+        """The core/lander module names an ast `tree` imports (`from lander import x`, `import lander.x`,
+        `from lander.x import`, `from . import x`, `from .x import`); with `top_only`, only the imports that run when
+        the module loads, not those inside a function body."""
+        out, stack = set(), list(ast.iter_child_nodes(tree))
+        while stack:
+            n = stack.pop()
+            if top_only and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(n, ast.ImportFrom) and n.level == 1:
+                out |= {n.module.split(".")[0]} if n.module else {a.name for a in n.names}
+            elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module == "lander":
+                out |= {a.name for a in n.names}
+            elif isinstance(n, ast.ImportFrom) and n.level == 0 and (n.module or "").startswith("lander."):
+                out.add(n.module.split(".")[1])
+            elif isinstance(n, ast.Import):
+                out |= {a.name.split(".")[1] for a in n.names if a.name.startswith("lander.")}
+            stack.extend(ast.iter_child_nodes(n))
+        return out
+
+    def test_what_tools_import_from_the_live_checkout_goes_to_lander_self(self):
+        """perms' read of #1277: the overlay's Cloudflare door imports lander.git and lander.members from the live
+        checkout and runs them with its token, and members loads jobs, events, types and the package. Every Python
+        tool in bin-private/ and core/bin/ is parsed for the lander modules it imports; what those load when imported
+        (module-level imports, followed within core/lander), the package's __init__ and cards (where perms' reads
+        are read, and the walls) must all be lander-class, or a change to one would run there on one paid read."""
+        if not os.path.exists(self.PATH):
+            self.skipTest("no overlay policy in this tree")
+        with open(self.PATH) as f:
+            pol, _ = M.parse_policy(f.read(), source="policy")
+        root, pkg = os.path.dirname(CORE), os.path.join(CORE, "lander")
+        here = lambda m: os.path.isfile(os.path.join(pkg, m + ".py"))   # noqa: E731
+        todo, entry = [], {}
+        for d in ("bin-private", os.path.join("core", "bin")):
+            full = os.path.join(root, d)
+            for name in sorted(os.listdir(full)) if os.path.isdir(full) else []:
+                p = os.path.join(full, name)
+                if not os.path.isfile(p) or os.path.islink(p):
+                    continue
+                with open(p, "rb") as f:
+                    src = f.read()
+                if not (src.startswith(b"#!") and b"python" in src.split(b"\n", 1)[0]):
+                    continue
+                mods = {m for m in self._lander_imports(ast.parse(src, p), top_only=False) if here(m)}
+                if mods:
+                    entry[f"{d}/{name}"] = sorted(mods)
+                    todo += mods
+        self.assertTrue(entry, "no tool imports the lander package: the scan found nothing to check")
+        seen = set()
+        while todo:
+            m = todo.pop()
+            if m in seen:
+                continue
+            seen.add(m)
+            with open(os.path.join(pkg, m + ".py")) as f:
+                todo += [x for x in self._lander_imports(ast.parse(f.read()), top_only=True) if here(x)]
+        for m in sorted(seen | {"__init__", "cards"}):
+            path = f"core/lander/{m}.py"
+            who = [t for t, ms in entry.items() if m in ms] or "a module those load"
+            self.assertTrue(M.match(pol.lander, path), f"{path} ({who}) is not on the lander list")
 
 
 class SecurityPaths(unittest.TestCase):

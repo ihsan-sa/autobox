@@ -27,7 +27,9 @@ WHEN A READ IS BOUGHT (review(), delta_review()). PR comments gh cannot give -> 
 a handback recorded there cannot be ruled out. A HANDBACK by a reader whose name says `security` stands, at any
 head, until a later LAND by a reader whose name says `security` (open_security()); while it stands the verdict is
 that HANDBACK and no read is bought, because no read the lander buys is a security reader's. A recorded verdict at
-the digest (or the legacy digest, which kept the hunk tail) is returned as it is. Otherwise a HANDBACK the box last
+the digest (or the legacy digest, which kept the hunk tail) is returned as it is: the newest, except that a LAND at
+the PR's exact head is not replaced by a later HANDBACK the lander's own readers wrote (recorded(), bought()), and a
+read that hands back while such a LAND was recorded returns that LAND. Otherwise a HANDBACK the box last
 wrote at an earlier head (latest()) gets the delta read below, paid or not: a handback is never dropped because the
 head moved. Otherwise, a change the plan did not make paid (job.plan.paid false: no paid-review path, and some check
 runs on it, or it adds or changes no code nothing owns) needs no read: LAND with model "" and extra read=none.
@@ -233,14 +235,26 @@ def imported(body):
                      extra={"head": head.group(1) if head else "", "imported": old})
 
 
-def recorded(comments, digests):
+def bought(v):
+    """True when `v` is a read the lander bought: every reader named on it is one of readers()."""
+    return bool(v.model) and set(v.model.split("+")) <= set(readers())
+
+
+def recorded(comments, digests, head=""):
     """The newest verdict among the PR's `comments` (gh's [{"body", "viewerDidAuthor"}]) at any of `digests`. Only
-    comments this box's own GitHub login wrote count: anyone can type a marker into a PR. -> Verdict or None."""
+    comments this box's own GitHub login wrote count: anyone can type a marker into a PR. -> Verdict or None.
+    Brief (#1113): "Honour a LAND that already sits at the PR's exact head and change key" — a HANDBACK the lander's
+    own readers wrote after such a LAND does not replace it, so the read cap neither queries the planning seat nor
+    asks a third read. A HANDBACK anyone else recorded (a seat, a security reader) still does."""
     found = None
     for c in comments:
         v = imported(c.get("body", "")) if c.get("viewerDidAuthor") else None
-        if v and v.digest in digests:
-            found = v
+        if not v or v.digest not in digests:
+            continue
+        at = (found.extra.get("head") or "") if found else ""
+        if head and len(at) >= 7 and head.startswith(at) and found.verdict == T.LAND and bought(v):
+            continue
+        found = v
     return found
 
 
@@ -1303,7 +1317,7 @@ def review(job, comments=None):
     need = _security_unread(job, comments, keys(job, diff))
     if need:
         return need
-    have = recorded(comments, keys(job, diff)) or _perms_land(job)
+    have = recorded(comments, keys(job, diff), job.head) or _perms_land(job)
     if have:
         return have
     # a HANDBACK standing from an earlier head is read again whether or not the change is on a paid path: #1064's
@@ -1344,7 +1358,7 @@ def delta_review(job, prior, comments=None, diff=None):
     need = _security_unread(job, comments, keys(job, diff))
     if need:
         return need
-    have = recorded(comments, keys(job, diff)) or _perms_land(job)
+    have = recorded(comments, keys(job, diff), job.head) or _perms_land(job)
     if have:   # a verdict recorded at this digest after the prior one (a seat's `record`) is the one that stands
         return have
     was = prior.extra.get("head", "")
@@ -1484,6 +1498,12 @@ def _buy(job, template, diff, more, prior=None):
     posted = post(root, pr, marker(v, job.base_sha, job.head, v.model))
     C.write_json(C.state("reviews", f"{job.digest}.json"), dict(v.to_dict(), repo=repo, pr=pr, posted=posted))
     C.log("stage", repo, pr, verdict=v.verdict, digest=job.digest[:12], usd=f"{usd:.2f}")
+    if v.verdict == T.HANDBACK_VERDICT:   # a seat's LAND recorded at this head while the read ran stands (recorded())
+        now = (pr_view(root, pr) or {}).get("comments") or []
+        land = recorded(now, keys(job, diff), job.head)
+        if land and land.verdict == T.LAND:
+            # the same check every other path runs first: a security HANDBACK posted while the read ran outranks it
+            return _security_stands(job, now) or land
     return v
 
 
@@ -1600,7 +1620,7 @@ def cmd_record(argv):
               "read, so it did not read this head. Read it again.")
         return 1
     findings = sys.stdin.read() if opts.get("findings") == "-" else (opts.get("findings") or "")
-    stands = recorded(facts.get("comments") or [], {job.digest})
+    stands = recorded(facts.get("comments") or [], {job.digest}, job.head)
     who = re.sub(r"[^A-Za-z0-9._@-]+", "-", opts["by"])
     # a second reader's LAND is posted too: lander-self needs an Opus read and a security read at one head
     if stands and stands.verdict == word and (word != T.LAND or stands.model == who):
@@ -1635,7 +1655,7 @@ def would_read(job, comments):
     need = _security_unread(job, comments, digests)
     if need:
         return False, (need.extra["why"] + " — perms reads it and records that; the landing buys none")
-    if recorded(comments, digests):
+    if recorded(comments, digests, job.head):
         return False, "a verdict is already recorded for this change, and the landing reads that"
     if _perms_land(job):
         return False, "perms recorded its security read of this change, and the landing lands on that"

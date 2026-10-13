@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""cc-ideas-judge — judge each logged idea on its revisit date, from records the box already keeps.
+
+  cc-ideas-judge run [--today YYYY-MM-DD]   judge what is due, print one line per verdict or failure record
+  cc-ideas-judge selfcheck                  a fixture log, ledger and board: held, not held, the three-day record
+
+It rides cc-reconcile's tick (--apply), so it has no timer of its own. It asks no model and no network.
+
+THE LOG is an ideas log (docs/architecture/ideas-log.md in a repo under ~/dev; CC_IDEAS_LOGS="repo=path …" names
+others). An entry is a `### N. Title` under a `## YYYY-MM-DD` heading, and it is judged only when it carries both
+  - **Revisit:** 2026-10-11              the first date on the line is the one used
+  - **Measure:** failures SCOPE[/KIND] Nd OP NUM   confirmed cc-failures records of SCOPE whose kind starts with
+                                                 KIND, in the N days up to the end of today
+  - **Measure:** rows REPO STATUS OP NUM          rows on REPO's board in that status
+OP is one of <= >= < > ==. The band is OP NUM, so `failures ctl/channel-wake 14d <= 3` holds while the count is
+3 or fewer. A measure, its band and the revisit date are the writer's, changed by a PR and never by this script:
+the only thing it adds to the log is the verdict line. An entry with no Measure line is left to the person who
+judges it by hand.
+
+THE VERDICT. On the first run on or after the revisit date the measure is read once, and one line is added at the
+end of the entry in the log itself: `- **Judged <day>:** held|not held: <measure> = <value>`. The same verdict goes
+to ~/.cc/state/<repo>/ideas-verdicts.md as `- <day> · <date> #N <title> · held|not held: <measure> = <value>`. A
+measure that cannot be parsed gets `not judged: unreadable measure` instead, once. A reading that fails (the ledger
+or the board would not read) writes nothing and is tried again on the next tick. A verdict is marked in state
+before its lines are written, so a run killed between the two never writes it twice, and an entry that already
+has a Judged line never gets a second one, even when state is lost. Every other line of the log is left as it was.
+A log that is gone or not UTF-8 is skipped, and a state file that is not a JSON object starts again.
+
+THREE DAYS OUT. After the revisit date the measure is read once per UTC day (~/.cc/state/<repo>/ideas-judge.json
+keeps each day's value and the measure text it was read with). When it is out of its band on three consecutive
+days with the same measure text, one cc-failures record is written in the
+repo's scope, kind idea-measure/out-of-band, with `--once` keyed on the entry and the first day of the run, so a
+run that goes on for a week is still one record and a new run after a day back in band is a new one. A missed day
+breaks the run, and so does a measure or band changed by a PR: the run restarts on the new text. The record reaches the improve seat the way every ledger record does, through cc-collect's
+snapshot; this script launches nothing and posts nothing. When cc-failures is missing or hangs, no record
+is written that day and the next tick tries again.
+"""
+import datetime, glob, json, os, re, shutil, subprocess, sys, tempfile
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+KIND = "idea-measure/out-of-band"
+OPS = {"<=": lambda a, b: a <= b, ">=": lambda a, b: a >= b, "<": lambda a, b: a < b,
+       ">": lambda a, b: a > b, "==": lambda a, b: a == b}
+MEASURE = re.compile(r"^(?:failures\s+(?P<scope>[\w.-]+)(?:/(?P<kind>\S+))?\s+(?P<days>\d+)d"
+                     r"|rows\s+(?P<repo>[\w.-]+)\s+(?P<status>[\w-]+))\s+(?P<op><=|>=|==|<|>)\s+(?P<num>\d+)$")
+
+
+def state_root():
+    return os.environ.get("CC_STATE") or f"{HOME}/.cc/state"
+
+
+def logs():
+    """(repo, path) for each ideas log: CC_IDEAS_LOGS when set, else every ~/dev/<repo>/docs/architecture/ideas-log.md."""
+    named = os.environ.get("CC_IDEAS_LOGS", "").split()
+    if named:
+        return [tuple(n.split("=", 1)) for n in named if "=" in n]
+    return [(p.split("/")[-4], p) for p in sorted(glob.glob(f"{HOME}/dev/*/docs/architecture/ideas-log.md"))]
+
+
+def entries(path):
+    """Each entry that carries a Revisit line: key, title, revisit date, measure text (None when it has none)."""
+    out, day, cur = [], "", None
+    for ln in open(path, encoding="utf-8"):
+        m = re.match(r"^## (\d{4}-\d{2}-\d{2})\b", ln)
+        if m:
+            day, cur = m.group(1), None
+            continue
+        m = re.match(r"^### (\d+)\.\s*(.*)", ln)
+        if m:
+            cur = {"key": f"{day} #{m.group(1)}", "title": m.group(2).strip(), "revisit": "", "measure": None,
+                   "judged": False}
+            out.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = re.match(r"^- \*\*Revisit:\*\*\s*.*?(\d{4}-\d{2}-\d{2})", ln)
+        if m and not cur["revisit"]:
+            cur["revisit"] = m.group(1)
+        m = re.match(r"^- \*\*Measure:\*\*\s*(.*)", ln)
+        if m:
+            cur["measure"] = m.group(1).strip().strip("`").strip()
+        if ln.startswith("- **Judged "):
+            cur["judged"] = True
+    return [e for e in out if e["revisit"]]
+
+
+def read(spec, today):
+    """The measure's value now, or None when the record would not read. Raises ValueError on a spec it can't parse."""
+    m = MEASURE.match(spec or "")
+    if not m:
+        raise ValueError(spec)
+    if m.group("scope"):
+        try:
+            p = subprocess.run([f"{BIN}/cc-failures", "show", "--scope", m.group("scope"), "--all", "--json"],
+                               capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+            recs = json.loads(p.stdout) if p.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            recs = None
+        if not isinstance(recs, list):
+            return None
+        end = datetime.date.fromisoformat(today) + datetime.timedelta(days=1)
+        since = (end - datetime.timedelta(days=int(m.group("days")))).isoformat()
+        kind = m.group("kind") or ""
+        return sum(1 for r in recs if r.get("status") == "confirmed" and str(r.get("kind", "")).startswith(kind)
+                   and since <= str(r.get("ts", ""))[:10] < end.isoformat())
+    try:
+        board = json.load(open(f"{HOME}/.cc/boards/{m.group('repo')}.json"))
+    except (OSError, ValueError):
+        return None
+    return sum(1 for t in (board.get("tracks") or {}).values() if t.get("status") == m.group("status"))
+
+
+def held(spec, value):
+    m = MEASURE.match(spec)
+    return OPS[m.group("op")](value, int(m.group("num")))
+
+
+def run(today):
+    lines = []
+    for repo, path in logs():
+        try:
+            es = entries(path)
+        except (OSError, ValueError):                  # a log that is gone or not UTF-8 is skipped, not a dead tick
+            continue
+        sd = f"{state_root()}/{repo}"
+        sf = f"{sd}/ideas-judge.json"
+        try:
+            st = json.load(open(sf))
+        except (OSError, ValueError):
+            st = {}
+        if not isinstance(st, dict):
+            st = {}
+        changed = False
+        for e in es:
+            # "each owner idea ... gets judged automatically when that date comes": on the date itself, and after
+            if e["measure"] is None or e["revisit"] > today:
+                continue
+            s = st.get(e["key"])
+            if not isinstance(s, dict) or not isinstance(s.get("days"), dict):
+                s = st[e["key"]] = {"days": {}}
+            try:
+                value = read(e["measure"], today)
+            except ValueError:
+                if "verdict" not in s:
+                    s["verdict"] = today
+                    save(sf, st)                       # saved before the line goes out: a kill between never repeats it
+                    if not e["judged"]:
+                        lines.append(verdict(sd, path, e, today, f"not judged: unreadable measure `{e['measure']}`"))
+                continue
+            if value is None:
+                continue
+            ok = held(e["measure"], value)
+            if today not in s["days"]:
+                s["days"][today] = {"value": value, "held": ok, "measure": e["measure"]}
+                changed = True
+            if "verdict" not in s:
+                s["verdict"] = today
+                save(sf, st)
+                changed = False
+                if not e["judged"]:                    # judged already in the log: state was lost, say nothing twice
+                    lines.append(verdict(sd, path, e, today, f"{'held' if ok else 'not held'}: {e['measure']} = {value}"))
+            rec = three_days(repo, path, e, s["days"], today)
+            if rec:
+                lines.append(rec)
+        if changed:
+            save(sf, st)
+    return lines
+
+
+def save(sf, st):
+    os.makedirs(os.path.dirname(sf), exist_ok=True)
+    tmp = f"{sf}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(st, fh, indent=1, sort_keys=True)
+    os.replace(tmp, sf)
+
+
+def verdict(sd, path, e, today, text):
+    """"appends 'held' or 'not held' with the numbers to the log": a Judged line at the end of the entry, once."""
+    if not e["judged"]:
+        try:
+            judge_into_log(path, e["key"], f"- **Judged {today}:** {text}\n")
+        except (OSError, ValueError):                  # the log went or changed under us: state still has the verdict
+            pass
+        e["judged"] = True
+    line = f"- {today} · {e['key']} {e['title']} · {text}"
+    os.makedirs(sd, exist_ok=True)
+    with open(f"{sd}/ideas-verdicts.md", "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    return line
+
+
+def judge_into_log(path, key, add):
+    """Insert ADD after the last non-blank line of entry KEY; no other line changes. Written whole, then renamed."""
+    lines = open(path, encoding="utf-8").readlines()
+    day, at, last = "", None, None
+    for i, ln in enumerate(lines):
+        m = re.match(r"^## (\d{4}-\d{2}-\d{2})\b", ln)
+        n = re.match(r"^### (\d+)\.", ln)
+        if at is not None and (m or n):
+            break
+        if m:
+            day = m.group(1)
+        elif n and f"{day} #{n.group(1)}" == key:
+            at = last = i
+        elif at is not None and ln.strip():
+            last = i
+    if at is None:
+        raise ValueError(key)
+    if not lines[last].endswith("\n"):
+        lines[last] += "\n"
+    lines.insert(last + 1, add)
+    tmp = f"{path}.judge-tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+    os.replace(tmp, path)
+
+
+def three_days(repo, path, e, days, today):
+    """"A measure out of its band three days running writes one cc-failures record" — the run ends today."""
+    # "the streak restarts when the text changes": only days read with today's measure text count
+    d, run_days = datetime.date.fromisoformat(today), []
+    while (d.isoformat() in days and not days[d.isoformat()]["held"]
+           and days[d.isoformat()].get("measure") == e["measure"]):
+        run_days.append(d.isoformat())
+        d -= datetime.timedelta(days=1)
+    if len(run_days) < 3:
+        return None
+    first = run_days[-1]
+    vals = ", ".join(str(days[x]["value"]) for x in reversed(run_days[:3]))
+    try:
+        p = subprocess.run([f"{BIN}/cc-failures", "record", "--scope", repo, "--kind", KIND, "--once",
+                            "--link", f"source=cc-ideas-judge:{repo}:{e['key']}:{first}",
+                            "--expected", f"{e['measure']} (idea {e['key']}: {e['title']})",
+                            "--observed", f"out of band on {len(run_days)} days running from {first}: {vals}",
+                            "--evidence", f"{path} {e['key']}", "--detector", "box",
+                            "--detector-evidence", "cc-ideas-judge read the measure once a day",
+                            "--writer", "cc-ideas-judge"],
+                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):    # no ledger tool or a hang: no record now, the next tick tries again
+        return None
+    out = p.stdout.strip()
+    if p.returncode != 0 or out.startswith("already"):
+        return None
+    return f"- {today} · {e['key']} {e['title']} · out of band 3 days from {first}: failure {out.split()[0] if out else '?'}"
+
+
+def selfcheck():
+    T = tempfile.mkdtemp(prefix="cc-ideas-judge-sc.")
+    passed = failed = 0
+
+    def ok(what, cond):
+        nonlocal passed, failed
+        passed, failed = passed + bool(cond), failed + (not cond)
+        print(("  ok    " if cond else "  FAIL  ") + what)
+
+    global HOME, BIN
+    _home, HOME = HOME, T
+    env_keep = {k: os.environ.get(k) for k in ("CC_FAILURES", "CC_STATE", "CC_IDEAS_LOGS", "CC_FAILURES_CATALOGUE")}
+    try:
+        os.environ.update(CC_FAILURES=f"{T}/failures", CC_STATE=f"{T}/state", CC_IDEAS_LOGS=f"fx={T}/ideas-log.md")
+        os.environ.pop("CC_FAILURES_CATALOGUE", None)
+        os.makedirs(f"{T}/failures")
+        os.makedirs(f"{T}/.cc/boards")
+        day0 = "2026-10-11"
+        log = ("# Ideas log\n\n## 2026-10-03\n\n"
+               "### 1. Few wake failures\n- **Revisit:** 2026-10-11\n- **Measure:** `failures fx/channel-wake 14d <= 2`\n\n"
+               "### 2. Nothing stays running\n- **Revisit:** 2026-10-10, or sooner\n- **Measure:** rows fx running <= 0\n\n"
+               "### 3. Not due yet\n- **Revisit:** 2026-10-25\n- **Measure:** rows fx running <= 0\n\n"
+               "### 4. Judged by hand\n- **Revisit:** 2026-10-01\n\n"
+               "### 5. Garbled\n- **Revisit:** 2026-10-01\n- **Measure:** vibes are good\n")
+        open(f"{T}/ideas-log.md", "w").write(log)
+        json.dump({"tracks": {"a": {"status": "running"}, "b": {"status": "merged"}}}, open(f"{T}/.cc/boards/fx.json", "w"))
+        for ts, kind, status in (("2026-10-09T10:00:00Z", "channel-wake/nobody-woken", "confirmed"),
+                                 ("2026-10-09T11:00:00Z", "channel-wake/nobody-woken", "refuted"),
+                                 ("2026-09-01T10:00:00Z", "channel-wake/nobody-woken", "confirmed"),
+                                 ("2026-10-09T12:00:00Z", "other/thing", "confirmed")):
+            subprocess.run([f"{BIN}/cc-failures", "record", "--scope", "fx", "--kind", kind, "--observed", "x",
+                            "--status", status, "--ts", ts], capture_output=True, text=True, check=True)
+        vf, sf = f"{T}/state/fx/ideas-verdicts.md", f"{T}/state/fx/ideas-judge.json"
+
+        def recs():
+            p = subprocess.run([f"{BIN}/cc-failures", "show", "--scope", "fx", "--all", "--json"],
+                               capture_output=True, text=True)
+            return [r for r in json.loads(p.stdout) if r["kind"] == KIND]
+
+        out = run(day0)
+        v = open(vf).read()
+        ok("held: the confirmed record in the window counts, the refuted, the old and the other kind do not",
+           "#1 Few wake failures · held: failures fx/channel-wake 14d <= 2 = 1" in v)
+        ok("not held: one running row against a band of <= 0", "#2 Nothing stays running · not held: rows fx running <= 0 = 1" in v)
+        ok("an entry before its revisit date is not judged", "#3" not in v)
+        ok("an entry with no Measure line is left to a person", "#4" not in v)
+        ok("an unreadable measure says so once", "#5 Garbled · not judged: unreadable measure `vibes are good`" in v)
+        ok("each verdict is printed for the tick", len(out) == 3)
+        lg = open(f"{T}/ideas-log.md").read()
+        ok("the verdict goes into the entry itself, with the number",
+           "<= 2`\n- **Judged 2026-10-11:** held: failures fx/channel-wake 14d <= 2 = 1\n\n### 2." in lg
+           and "running <= 0\n- **Judged 2026-10-11:** not held: rows fx running <= 0 = 1\n\n### 3." in lg
+           and lg.endswith("vibes are good\n- **Judged 2026-10-11:** not judged: unreadable measure `vibes are good`\n"))
+        ok("…and every line that was there is still there, in order, measure and band untouched",
+           [x for x in lg.splitlines() if not x.startswith("- **Judged ")] == log.splitlines())
+        ok("…and #3 (not due) and #4 (no measure) get no Judged line", lg.count("**Judged ") == 3)
+        run(day0)
+        ok("a second tick the same day writes nothing new", open(vf).read() == v and open(f"{T}/ideas-log.md").read() == lg)
+        os.rename(sf, f"{sf}.lost")
+        run(day0)
+        ok("…and with state lost, the log still gets no second Judged line", open(f"{T}/ideas-log.md").read() == lg)
+        os.rename(f"{sf}.lost", sf)
+        ok("…and one reading per day is kept", list(json.load(open(sf))["2026-10-03 #2"]["days"]) == [day0])
+        run("2026-10-12")
+        ok("two days out of band: no failure record yet", recs() == [])
+        out = run("2026-10-13")
+        r = recs()
+        ok("three days out of band: one failure record", len(r) == 1 and any("out of band 3 days" in x for x in out))
+        ok("…in the repo's scope, naming the entry and the three readings",
+           r and r[0]["scope"] == "fx" and "2026-10-03 #2" in r[0]["expected"] and "1, 1, 1" in r[0]["observed"])
+        ok("…and the held measure raises nothing", all("#1" not in x["expected"] for x in r))
+        ok("…and the verdict is not written again", open(vf).read() == v)
+        run("2026-10-14")
+        ok("a fourth day of the same run is still one record", len(recs()) == 1)
+        json.dump({"tracks": {"a": {"status": "merged"}}}, open(f"{T}/.cc/boards/fx.json", "w"))
+        run("2026-10-15")
+        json.dump({"tracks": {"a": {"status": "running"}}}, open(f"{T}/.cc/boards/fx.json", "w"))
+        run("2026-10-16")
+        run("2026-10-17")
+        ok("a day back in band breaks the run: two days out after it, no new record", len(recs()) == 1)
+        run("2026-10-18")
+        ok("…and the third day of the new run is a new record", len(recs()) == 2)
+        json.dump({"tracks": {}}, open(f"{T}/.cc/boards/fx.json", "w"))
+        run("2026-10-19")
+        json.dump({"tracks": {"a": {"status": "running"}}}, open(f"{T}/.cc/boards/fx.json", "w"))
+        run("2026-10-20")
+        run("2026-10-21")
+        run("2026-10-23")
+        ok("a missed day breaks the run too: out, out, no reading, out is no record", len(recs()) == 2)
+        os.environ["CC_IDEAS_LOGS"] = f"fx={T}/missing.md"
+        ok("a log that is not there is no line and no crash", run("2026-10-24") == [])
+
+        # Each case below has a repo of its own: its own log, board, state and ledger scope.
+        def fixture(repo, running=True):
+            text = ("## 2026-10-03\n\n### 1. Nothing stays running\n- **Revisit:** 2026-10-01\n"
+                    f"- **Measure:** rows {repo} running <= 0\n")
+            open(f"{T}/{repo}.md", "w").write(text)
+            json.dump({"tracks": {"a": {"status": "running" if running else "merged"}}},
+                      open(f"{T}/.cc/boards/{repo}.json", "w"))
+            os.environ["CC_IDEAS_LOGS"] = f"{repo}={T}/{repo}.md"
+            return f"{T}/state/{repo}/ideas-verdicts.md"
+
+        def records(scope):
+            p = subprocess.run([f"{BIN}/cc-failures", "show", "--scope", scope, "--all", "--json"],
+                               capture_output=True, text=True)
+            return [r for r in json.loads(p.stdout or "[]") if r["kind"] == KIND] if p.returncode == 0 else []
+
+        _bin = BIN
+        vfa = fixture("fa")
+        run("2026-11-01")
+        run("2026-11-02")
+        BIN = f"{T}/no-bin"
+        try:
+            out = run("2026-11-03")
+        except Exception as ex:
+            out = [f"raised {ex.__class__.__name__}"]
+        finally:
+            BIN = _bin
+        ok("no cc-failures on the third day: no crash, no record line", out == [] and records("fa") == [])
+        out = run("2026-11-03")
+        ok("…and the next tick writes the one record, with the verdict still written once",
+           len(records("fa")) == 1 and any("out of band 3 days" in x for x in out)
+           and open(vfa).read().count("#1 Nothing stays running") == 1)
+
+        vfb = fixture("fb", running=False)
+        _three = three_days
+
+        def boom(*a):
+            raise RuntimeError("killed after the verdict")
+        globals()["three_days"] = boom
+        try:
+            run("2026-11-01")
+        except RuntimeError:
+            pass
+        finally:
+            globals()["three_days"] = _three
+        run("2026-11-01")
+        run("2026-11-02")
+        ok("a run killed after its verdict does not write the verdict again",
+           open(vfb).read().count("#1 Nothing stays running · held") == 1)
+
+        vfc = fixture("fc")
+        os.makedirs(f"{T}/state/fc")
+        open(f"{T}/state/fc/ideas-judge.json", "w").write("[]")
+        open(f"{T}/fd.md", "wb").write(b"## 2026-10-03\n\n### 1. Bad bytes \xff\xfe\n- **Revisit:** 2026-10-01\n")
+        os.environ["CC_IDEAS_LOGS"] = f"fd={T}/fd.md fc={T}/fc.md"
+        try:
+            out = run("2026-11-01")
+        except Exception as ex:
+            out = [f"raised {ex.__class__.__name__}"]
+        ok("a state file that is not an object starts again, and a log that is not UTF-8 is skipped",
+           out == ["- 2026-11-01 · 2026-10-03 #1 Nothing stays running · not held: rows fc running <= 0 = 1"]
+           and os.path.exists(vfc) and isinstance(json.load(open(f"{T}/state/fc/ideas-judge.json")), dict))
+
+        fixture("fg")
+        json.dump({"tracks": {"a": {"status": "running"}}}, open(f"{T}/.cc/boards/fg.json", "w"))
+        text = open(f"{T}/fg.md").read()
+        open(f"{T}/fg.md", "w").write(text.replace("- **Revisit:** 2026-10-01", "- **Revisit:** 2026-10-11"))
+        run("2026-10-11")
+        run("2026-10-12")
+        text = open(f"{T}/fg.md").read()
+        open(f"{T}/fg.md", "w").write(text.replace("rows fg running <= 0", "rows fg running <= 5"))
+        json.dump({"tracks": {str(i): {"status": "running"} for i in range(6)}}, open(f"{T}/.cc/boards/fg.json", "w"))
+        out = run("2026-10-13")
+        days = json.load(open(f"{T}/state/fg/ideas-judge.json"))["2026-10-03 #1"]["days"]
+        ok("a band changed by a PR restarts the run: <= 0 at 1 twice, then <= 5 at 6, is not three days out",
+           records("fg") == [] and out == [] and days["2026-10-13"] == {"value": 6, "held": False,
+                                                                         "measure": "rows fg running <= 5"})
+        run("2026-10-14")
+        run("2026-10-15")
+        ok("…and three days out on the new text is a record", len(records("fg")) == 1)
+        ok("…and the changed band line is the writer's: the script left it as the PR wrote it",
+           "- **Measure:** rows fg running <= 5\n" in open(f"{T}/fg.md").read())
+    finally:
+        HOME = _home
+        for k, val in env_keep.items():
+            os.environ.pop(k, None) if val is None else os.environ.update({k: val})
+        shutil.rmtree(T, ignore_errors=True)
+    print(f"cc-ideas-judge selfcheck: {passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    if argv[:1] == ["run"]:
+        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        if argv[1:2] == ["--today"] and len(argv) > 2:
+            today = argv[2]
+        for ln in run(today):
+            print(ln)
+        return 0
+    print("\n".join(__doc__.splitlines()[2:5]), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
