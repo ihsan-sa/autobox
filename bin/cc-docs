@@ -62,11 +62,11 @@ content differs from the last (I and O are skipped, and after Z comes AA). A fil
         let edit that document (the site decides who may; no session sees the draft): the revision's filer is
         {"editor": the address lower-cased}, with no session in it, so the library never hands questions on it to one
         of the owner's sessions. It files only the next revision of a document that already exists, under its own
-        project and exact title, and never a new document; it needs --latex and an email address, refuses a Markdown
-        file, answers none of the document's open feedback, and leaves the document's project, title and visibility
-        as they are (a document filed --no-stamp stays unstamped). The
-        source is then read only from the --latex file's own folder (and the box's style trees), and kpsewhich is not
-        asked.
+        project and exact title, and never a new document; it needs an email address and --latex with a PDF (a
+        Markdown file is filed as the next text revision, which the box renders in its sandbox), answers none of the
+        document's open feedback, and leaves the document's project, title and visibility as they are (a document
+        filed --no-stamp stays unstamped). The source is then read only from the --latex file's own folder (and the
+        box's style trees), and kpsewhich is not asked.
         A MARKDOWN FILE (.md or .markdown, at most 2 MiB) in place of the PDF files a TEXT REVISION: no PDF (file
         null), the .md kept as its source (source_main, and source_sha256 of its bytes), the .md itself the
         document's --source unless one is given. The site shows it rendering and hands it to the box's renderer,
@@ -1519,9 +1519,11 @@ def filer_editor(a):
     e = fe.strip().lower()
     if len(e) > 254 or not EMAIL.match(e):
         raise Refused(f"--filer-editor: {fe[:80]!r} is not an email address")
+    a.filer = {"editor": e}
+    if MD_SRC.search(a.pdf):
+        return      # a member's Markdown draft: the next text revision, checked by file_markdown's check_filer_editor
     if not getattr(a, "latex", None):
         raise Refused("--filer-editor files a LaTeX draft: it needs --latex")
-    a.filer = {"editor": e}
     a.trees = [os.path.realpath(os.path.dirname(os.path.abspath(a.latex)))]
 
 
@@ -1536,10 +1538,6 @@ def check_filer_editor(proj, d, a):
 
 
 def cmd_file(a):
-    # the editor files a member's LaTeX draft as the next revision of a document; a Markdown file would make or
-    # extend a text revision with no check_filer_editor, so it is refused outright
-    if getattr(a, "filer_editor", None) is not None and MD_SRC.search(a.pdf):
-        raise Refused(f"--filer-editor files a compiled LaTeX draft, never Markdown: {a.pdf} is refused")
     filer_editor(a)
     nosrc = " ".join((getattr(a, "no_source", None) or "").split())
     if getattr(a, "no_source", None) is not None:
@@ -1742,6 +1740,7 @@ def file_markdown(a, decl=None):
     with Lock():
         reg = load()
         proj, num, d, rev = plan(reg, a)
+        check_filer_editor(proj, d, a)
         cur = current(d) if d else None
         if cur and cur.get("source_sha256") == sha:
             print(f"{num}-{cur['rev']}\t{os.path.join(ROOT, cur['file']) if cur.get('file') else '-'}"
@@ -1756,6 +1755,7 @@ def file_markdown(a, decl=None):
     with Lock():
         reg = load()
         proj, num, d, rev = plan(reg, a)
+        check_filer_editor(proj, d, a)
         cur = current(d) if d else None
         if cur and cur.get("source_sha256") == sha:   # filed by another call meanwhile
             print(f"{num}-{cur['rev']}\t-\tunchanged, nothing filed")
@@ -1771,7 +1771,8 @@ def file_markdown(a, decl=None):
                     "visibility": ["owner"] + ([pd["workspace"]] if pd.get("workspace") else []),
                     "member": pd.get("member"), "starred_by": [], "stamp": not a.no_stamp, "revisions": []}
             d["title"] = a.title
-            if not d.get("source") or not os.path.exists(d["source"]):
+            # a member's draft is filed from the editor's scratch dir, gone after: the document keeps its own source
+            if (not d.get("source") or not os.path.exists(d["source"])) and getattr(a, "filer_editor", None) is None:
                 d["source"] = os.path.abspath(a.source)
             r = {"rev": rev, "file": None, "date": date.isoformat(), "from": src, "filed_at": utcnow()}
             who = filer() if getattr(a, "filer", None) is None else a.filer
@@ -1783,7 +1784,8 @@ def file_markdown(a, decl=None):
             d["revisions"].append(r)
             save(reg)
             write_views(reg, set(d["visibility"]) - {"owner"})
-            answered = answer_feedback(num, rev, d.get("moved_from", ()))
+            # a member's kept edit (--filer-editor) answers none of the owner's feedback, as file_locked's doesn't
+            answered = 0 if (who or {}).get("editor") else answer_feedback(num, rev, d.get("moved_from", ()))
         finally:
             st.close()
     # the path `cc-docs pdf` files its PDF at, once the box has rendered it

@@ -563,15 +563,32 @@ def _selfcheck():
                    for k in ("project", "title", "visibility", "member", "stamp"))
            and after["documents"]["901-0001"]["visibility"] == ["owner", wid])
         dp, dt = ed_fixture("md")
-        md = os.path.join(os.path.dirname(dt), "notes.md")
+        own_md = os.path.join(t, "ed-src-md", "plan.md")
+        with open(own_md, "w") as f:
+            f.write("# Plan\n\nThe owner's Markdown.\n")
+        run("file", own_md, "--project", "Owner stuff", "--title", "Plan")
+        num_md = next(n for n, d in load()["documents"].items() if d["title"] == "Plan")
+        md = os.path.join(os.path.dirname(dt), "plan.md")
         with open(md, "w") as f:
-            f.write("# Fresh\n\nA member's Markdown.\n")
+            f.write("# Plan\n\nA member's Markdown.\n")
+        fbm = {"items": {"1": {"id": "1", "number": num_md, "rev": "A", "status": "delivered"}}}
+        with open(feedback_path(), "w") as f:
+            json.dump(fbm, f)
         before = json.loads(json.dumps(load()))
         rc, o = run("file", md, "--project", "Owner stuff", "--title", "Fresh md", "--filer-editor", "kid1@example.com")
-        rc2, o2 = run("file", md, "--project", "Owner stuff", "--title", "Owner notes", "--latex", dt,
+        rc2, o2 = run("file", md, "--project", "Owner stuff", "--title", "Plan", "--latex", dt,
                       "--filer-editor", "kid1@example.com")
-        ok("--filer-editor on a Markdown file is refused outright, new document or old, and files nothing",
-           rc == 2 and "never Markdown" in o and rc2 == 2 and "never Markdown" in o2 and load() == before)
+        ok("--filer-editor on a Markdown file never makes a new document, takes no --latex, and files nothing then",
+           rc == 2 and "existing document only" in o and rc2 == 2 and "no --attach or --latex" in o2
+           and load() == before)
+        rc, o = run("file", md, "--project", "Owner stuff", "--title", "Plan", "--filer-editor", " Kid1@Example.COM ")
+        dm = load()["documents"][num_md]
+        ok("--filer-editor files a member's Markdown as the document's next text revision, no PDF yet, filer the "
+           "address, its source and the owner's open feedback left as they were",
+           rc == 0 and o.startswith(f"{num_md}-B\t") and [r["rev"] for r in dm["revisions"]] == ["A", "B"]
+           and dm["revisions"][-1].get("file") is None and dm["revisions"][-1].get("source_main") == "plan.md"
+           and dm["revisions"][-1].get("filer") == {"editor": "kid1@example.com"}
+           and dm["source"] == before["documents"][num_md]["source"] and json.load(open(feedback_path())) == fbm)
         dp, dt = ed_fixture("fb")
         fbi = {"items": {"1": {"id": "1", "number": "001-0001", "rev": "A", "status": "delivered"},
                          "2": {"id": "2", "number": "001-0001-A", "status": "new"}}}
