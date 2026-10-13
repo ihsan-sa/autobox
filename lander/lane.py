@@ -59,10 +59,11 @@ first; place() says who put it there. An older job that clashes with it still go
 holds nobody (OVERLAP below).
 OVERLAP FROM THE START: a queued job that clashes with a job already planned, checking or mergeable, or with an older
 job parked itself whose park still holds, is not planned yet (`waits for PR #N`, said once; its first park stamps
-parked_since and logs `stage <repo>#<pr> parked on=<n>`, once): it is planned from main once that one has merged or
-left, so two changes that overlap don't both burn CPU. Two jobs CLASH when they share a file and their heads do not
-merge cleanly with each other (git merge-tree of the two heads: the same lines, or hunks too close to rebase); a
-shared file whose hunks merge cleanly is no overlap, and a head not read yet or a git that will not answer is one.
+parked_since; `stage <repo>#<pr> parked on=<n>` is logged whenever <n> changes): it is planned from main once that
+one has merged or left, so two changes that overlap don't both burn CPU. Two jobs CLASH when they share a file and
+their heads do not merge cleanly with each other (git merge-tree of the two heads: the same lines, or hunks too
+close to rebase); a shared file whose hunks merge cleanly is no overlap, and a head not read yet or a git that
+will not answer is one.
 A parked job's park holds a newer job only while the PR it waits for is in flight or has just left: one parked on a
 held PR (a person's hold, a red main) or on a job parked itself holds nobody, so the first ready job goes first and
 chains of parks are one deep (a query leaves the lane, so a park on it ends at the parked job's next turn). A job
@@ -545,6 +546,7 @@ class Lane:
         self.lines = []
         self.tried = set()
         self.waiting = set()     # tried and waiting on a slot or an overlapping job: tried again when either moves
+        self.refused = set()     # tried and refused a turn by a GitHub backoff or a box hold: tried again when it ends
         self.inflight = {}       # (job key, check) -> Flight: every check the lane has in the pool
         self.laptop_down = 0.0   # when the laptop last gave no answer: the box takes its checks for LAPTOP_REST
         self.tips = {}           # {"sha", "m"}: the base branch tip's manifest, for where a check may run
@@ -587,7 +589,7 @@ class Lane:
                 with contextlib.suppress(OSError, ValueError):   # base runs an earlier lane shared are not reused
                     REC.new_nonce(self.repo, J.landq())
                 tried = self.tried = set()
-                self.waiting, self.inflight = set(), {}
+                self.waiting, self.refused, self.inflight = set(), set(), {}
                 # as wide as the cores, not today's K: the pool outlives a change of K, which takes no restart
                 width = max(A.slots(), os.cpu_count() or 1)
                 with futures.ThreadPoolExecutor(max_workers=width + A.LAPTOP_SLOTS + EXPRESS_SLOTS + REVIEW_SLOTS,
@@ -634,7 +636,9 @@ class Lane:
                 # (paused, a tier stop): re-admitted, it would be refused before it read, every pass, unslept, or
                 # (c) it was queued again since or has a new head (a push): its queued_at or head differs, or (d) it is
                 # parked and the job it waits for has moved, unless a GitHub backoff or the box holds it, for (b)'s
-                # reason: step() moves no queued job during a backoff. A move or a hold (reap) is no re-queue. A job whose turn ended it (handed back, query, done) left `tried` then,
+                # reason: step() moves no queued job during a backoff, or (e) its turn was refused by a backoff or a box
+                # hold that has ended: nothing else lets it back while checks run, so it sat silent until the lane
+                # process ended. A move or a hold (reap) is no re-queue. A job whose turn ended it (handed back, query, done) left `tried` then,
                 # since a re-queue may share its one-second stamp. Without these a re-queue drained in this pass sat
                 # in `tried` until the lane process ended (#1226, #1228, #1234)
                 if j.key not in tried:
@@ -643,8 +647,10 @@ class Lane:
                         or (self.reread_due(j) and not self.box_hold(j)) \
                         or self.tried_q.get(j.key) != self.queued_mark(j) \
                         or (j.key in self.parked and self.unblocked(j, jobs) and not GH.backoff()
-                            and not self.box_hold(j)):
+                            and not self.box_hold(j)) \
+                        or (j.key in self.refused and not GH.backoff() and not self.box_hold(j)):
                     tried.discard(j.key)
+                    self.refused.discard(j.key)
             todo = [j for j in jobs if j.key not in tried and self.due(j)]
             if not todo:   # every due job has had its turn: record what finished (a freed slot), or wait for it
                 if not self.inflight and not self.pending_reads():
@@ -668,6 +674,7 @@ class Lane:
             why = self.box_hold(job)
             if why:
                 self.say(f"PR #{job.pr}: {why}")
+                self.refused.add(job.key)
                 continue
             before = (job.state, len(job.history), len(self.inflight))
             self.advance(job)
@@ -980,8 +987,9 @@ class Lane:
     def park(self, job, other, read):
         """`job` waits for `other`. read: its facts were just read from GitHub, so the files are kept (saved) with
         the time, and its later turns (unblocked) check them without a new call until PARK_FRESH runs out. The first
-        park stamps parked_since (never refreshed until it is planned) and writes the one queue.log line that says it
-        waits."""
+        park stamps parked_since (never refreshed until it is planned). A queue.log line says whom it waits for each
+        time that changes: the first park, a park on another PR, a park after a hold dropped the last one; a park
+        again on the same PR writes none."""
         self.waiting.add(job.key)
         self.parked.add(job.key)
         self.park_on[job.key] = (other.key, other.state, other.head)
@@ -989,14 +997,14 @@ class Lane:
         if first:
             job.extra["parked_since"] = E.stamp()
         park = job.extra.get("parked")
-        moved = not read and isinstance(park, dict) and park.get("on") != other.pr
-        if moved:   # parked_live follows "on": it names the PR this job waits for now
+        moved = not isinstance(park, dict) or park.get("on") != other.pr
+        if moved and not read and isinstance(park, dict):   # parked_live follows "on": it names the PR this job waits for now
             park["on"] = other.pr
         if read:
             job.extra["parked"] = {"at": time.time(), "head": job.head, "on": other.pr}
         if read or first or moved:
             J.save(job)
-        if first:
+        if first or moved:
             E.stage(job.repo, job.pr, "parked", on=other.pr)
         if (job.key, other.key) not in self.said:
             self.said.add((job.key, other.key))
@@ -1022,6 +1030,7 @@ class Lane:
                  T.MERGEABLE: self.mergeable, T.MERGED: self.merged, T.HELD: self.unhold}
         if job.state in (T.QUEUED, T.MERGEABLE) and GH.backoff():
             self.say(f"PR #{job.pr}: GitHub backoff, {GH.backoff()}s left — tried again after it")
+            self.refused.add(job.key)
             return
         try:
             steps[job.state](job)

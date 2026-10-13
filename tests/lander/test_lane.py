@@ -2710,6 +2710,22 @@ class Review(Fixture):
         self.assertIsNone(self.job())                               # handed back, not merged
         self.assertEqual(u["cards"].calls[0][3], "seat")
 
+    def test_a_handback_keeps_the_jobs_hold_reasons_in_its_attic_file(self):
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        lane = L.Lane("demo", self.units())
+        self.assertFalse(os.path.exists(J.attic_path("demo", 1)))
+        lane.hold(self.job(), "main-red: check x is red on main too")
+        lane.handback(self.job(), "check y failed")
+        self.assertIsNone(self.job())                               # off the queue and out of rest/, as before
+        with open(J.attic_path("demo", 1)) as f:
+            kept = [json.loads(ln) for ln in f]
+        self.assertEqual([h.get("why") for h in kept[-1]["history"] if h["state"] == T.HELD],
+                         ["main-red: check x is red on main too"])
+        self.assertEqual(kept[-1]["state"], T.HANDBACK)
+
     def test_reads_cap_goes_to_planning(self):
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
@@ -4266,6 +4282,36 @@ class Parallel(Fixture):
         self.assertLess(calls, 50, "the lane spun on the parked job")
         self.assertLessEqual(sum("PR #2: GitHub backoff" in ln for ln in lines), 1, lines[-3:])
 
+    def test_a_queued_pr_refused_by_a_github_backoff_gets_its_turn_when_the_backoff_ends(self):
+        # brief, 10-13 cause 2: a queued job that used its turn without moving waited in `tried`; one refused by a
+        # backoff had nothing to let it back while another PR's check ran, so it sat queued until the lane ended
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"b/y": "n\n"})
+        J.submit("demo", 1)
+        moved, said, say = [], [], L.Lane.say
+
+        def saying(lane, ln, *a, **k):
+            said.append(ln)
+            return say(lane, ln, *a, **k)
+
+        def hook(name, n):
+            if n != 1 or moved:
+                return
+            J.write_atomic(GH.backoff_path(), {"until": time.time() + 600, "fails": 1})
+            J.submit("demo", 2)
+            end = time.time() + 10
+            while not any("PR #2: GitHub backoff" in ln for ln in said) and time.time() < end:
+                time.sleep(0.02)
+            os.unlink(GH.backoff_path())
+            end = time.time() + 5
+            while J.load("demo", 2).state == T.QUEUED and time.time() < end:
+                time.sleep(0.02)
+            moved.append(J.load("demo", 2).state != T.QUEUED)   # while #1's check still runs
+        with mock.patch.object(L.Lane, "say", saying):
+            self.land(runner=Runner(hook=hook))
+        self.assertTrue(any("PR #2: GitHub backoff" in ln for ln in said), said)
+        self.assertEqual(moved, [True])
+
     def test_a_check_whose_job_left_checking_meanwhile_is_not_recorded(self):
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
@@ -4742,7 +4788,32 @@ class Starving(Fixture):
         lane.park(self.job(3), two, read=False)
         self.assertEqual(self.job(3).extra["parked"]["on"], 2)    # saved: parked_live reads the PR it waits for now
         self.assertEqual(self.job(3).extra["parked"]["at"], at)   # not a read: the files' read time stays
-        self.assertEqual(self.log().count("stage demo#3 parked"), 1)
+        self.assertEqual(self.log().count("stage demo#3 parked"), 2)   # whom it waits for changed: said again
+        self.assertIn("stage demo#3 parked on=2", self.log())
+        lane.park(self.job(3), two, read=False)
+        self.assertEqual(self.log().count("stage demo#3 parked"), 2)   # the same PR again: no line
+
+    def test_a_park_after_a_hold_writes_its_line_again(self):
+        # a hold drops the park but keeps parked_since: the next park on the same PR is a new wait, and says so
+        self.pr(1, {"a/x": "n\n"})
+        self.pr(2, {"a/x": "n\n"})
+        for n in (1, 2):
+            J.submit("demo", n)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        lane = L.Lane("demo", self.units())
+        job, one = self.job(2), self.job(1)
+        job.files = one.files = ["a/x"]
+        lane.park(job, one, read=True)
+        lane.park(self.job(2), one, read=False)
+        self.assertEqual(self.log().count("stage demo#2 parked on=1"), 1)
+        lane.hold(self.job(2), "a test hold")
+        back = self.job(2)
+        self.assertNotIn("parked", back.extra)
+        self.assertIn("parked_since", back.extra)
+        back.state = T.QUEUED
+        lane.park(back, one, read=True)
+        self.assertEqual(self.log().count("stage demo#2 parked on=1"), 2)
 
     def test_the_lane_plans_a_put_first_job_past_a_park_on_a_held_pr(self):
         # #1 held (main-red, its hold not run out); #2 parked on it; #3, put first, shares b/y with #2 and goes first

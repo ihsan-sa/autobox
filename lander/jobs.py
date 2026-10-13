@@ -17,6 +17,8 @@ PATHS are read from the environment at CALL time, so a test (or a second box lay
            job file when the landing finished, and every reader counts <LANDQ>/*.json as a landing in flight (the Home
            tab's RUNNING tally, cc-bundle's queue depth), so an ended job leaves that directory; load() still finds it
            here, so a re-queue keeps reads_used and the prior verdict.
+  attic    <LANDQ>/attic/<repo>-<pr>.jsonl — one line per job remove() drops (a handback, a release), the whole record
+           with its history, so a hold's reason outlives the job (the `stage held` line carries none).
   log      <LANDQ>/queue.log (events.py).
   BIN $CC_BIN or <core>/bin · DEV $CC_DEV or $HOME/dev · BOARDS $CC_BOARDS or $HOME/.cc/boards ·
   MEMBERS $CC_MEMBERS or $HOME/.cc/members.
@@ -157,6 +159,10 @@ def rest_path(repo: str, pr) -> str:
     return f"{rest_dir()}/{repo}-{int(pr)}.json"
 
 
+def attic_path(repo: str, pr) -> str:
+    return f"{landq()}/attic/{repo}-{int(pr)}.jsonl"
+
+
 def handed_path(repo: str, pr) -> str:
     return f"{handed_dir()}/{repo}-{int(pr)}.json"
 
@@ -273,6 +279,11 @@ def save(job: T.Job) -> None:
 
 
 def remove(job: T.Job) -> None:
+    """The job leaves the queue and rest/; its record goes on the end of its attic file first."""
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(attic_path(job.repo, job.pr)), exist_ok=True)
+        with open(attic_path(job.repo, job.pr), "a") as f:
+            f.write(json.dumps(job.to_dict()) + "\n")
     for p in (job_path(job.repo, job.pr), rest_path(job.repo, job.pr)):
         with contextlib.suppress(FileNotFoundError):
             os.unlink(p)
