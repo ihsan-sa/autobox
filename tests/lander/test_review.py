@@ -1627,7 +1627,7 @@ class TestRecord(Case):
         self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(gone, "evil (deleted)")),
                                              state))
         self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(gone, "evil")), state))
-        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=versions + "/../gone/evil")), state)
+        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=versions + "/../gone/evil"), state))
         self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(versions, "evil")), state))
 
     def versions_file(self, text, mode=0o644):

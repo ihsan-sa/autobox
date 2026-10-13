@@ -38,10 +38,10 @@ A planning seat runs it by hand; the lander never installs itself.
         new one refuses the switch by name (a check red under both is main's and does not block; with nothing
         current, nothing does). Main's list of checks is read by the current release's manifest loader, and a name on
         it the candidate did not run refuses too. A check the current release has a `passed` record for on main's
-        exact tree (the lane's results/ and jobs/*/results/ under ~/.cc/state/land, stamped with that release) is
-        taken as the candidate's pass and not swept again, but only when the two releases run checks with
-        byte-identical code (RUNNER: the sweep's lander modules, the tools run.py execs, cc-config and the fallback
-        manifests); otherwise every check is swept. A name on main's list is either reused or run, and the proof
+        exact tree (the lane's shared results/ under ~/.cc/state/land, stamped with that release; never a job's
+        own records), resolved with replace refs ignored, is taken as the candidate's pass and not swept again, but
+        only when the two releases run checks with byte-identical code (every core/lander/*.py and core/*.py, the
+        tools run.py execs, cc-config and the fallback manifests); otherwise every check is swept. A name on main's list is either reused or run, and the proof
         prints how many of each. Each sweep runs as a transient `systemd-run --user` service, as the
         lane does: the user manager's environment, a private TMUX_TMPDIR, and none of the caller's tmux, CC_*
         variables, sandbox or Landlock domain. The proof is one run capped at PROVE_CAP (an hour). Exit 1 refused,
@@ -555,21 +555,49 @@ def names_under(rel, root, sha):
 # REUSE (10-13): the lane's own checks starve the proof's sweep of admission slots, so promotes stopped at the cap.
 # A check the current release has already passed on main's exact tree is not swept again when the candidate runs
 # checks with byte-identical code: same code, same tree, same runner, so the candidate's answer is that green. The
-# files below are what `lander sweep` runs a check with: cli.py's dispatch, check.py's sweep, run.py and everything
-# they import (jobs and events through git's and admission's lazy imports), the tools run.py execs, cc-config for
-# LANDER_SLOTS, and the release's host fallback manifests. Any of them differing, or missing on one side only,
-# sweeps everything as before.
-RUNNER = tuple(f"core/lander/{m}.py" for m in (
-    "__init__", "cli", "check", "run", "admission", "sandbox", "manifest", "reach", "plan", "git", "types", "records",
-    "jobs", "events")) + ("core/bin/cc-nosignal", "core/bin/cc-sandbox", "core/bin/cc-suites", "core/bin/cc-config",
-                         "tests/landing-repos")
+# files below are what `lander sweep` runs a check with. Perms, 10-13: the sweep "imports every core/lander/*.py with
+# core/ first on sys.path", so everything importable directly in either dir is hashed: a .py, a .pyc, a .so or a
+# package dir (runner_paths, the union of both releases' names), not a hand-kept list of what cli.py happens to import today; plus the tools run.py execs,
+# cc-config for LANDER_SLOTS, and the release's host fallback manifests. Any of them differing, or missing on one
+# side only, sweeps everything as before.
+RUNNER = ("core/bin/cc-nosignal", "core/bin/cc-sandbox", "core/bin/cc-suites", "core/bin/cc-config",
+          "tests/landing-repos")
+RUNNER_GLOBS = ("core/lander", "core")   # every importable entry directly in each
 LAND_STATE = os.path.join(passwd_home(), ".cc", "state", "land")
 
 
+def runner_paths(*rels):
+    """RUNNER plus every importable entry directly under a RUNNER_GLOBS dir of any of the release dirs `rels`, sorted:
+    a file ending in an import suffix (.py, .pyc, any .so), and a subdirectory holding an __init__.*, since either
+    shadows a module of that name (core/ is first on sys.path, so core/json/ or core/json.pyc shadows stdlib json).
+    A RUNNER_GLOBS dir inside another is listed on its own, not hashed whole. None when a dir that exists cannot be
+    listed: what it holds is unknown, so nothing is reused."""
+    import importlib.machinery
+    sufs = tuple(importlib.machinery.all_suffixes())
+    mods = set()
+    for r in rels:
+        for d in RUNNER_GLOBS:
+            top = os.path.join(r, d)
+            if not os.path.lexists(top):
+                continue
+            try:
+                for n in os.listdir(top):
+                    p = os.path.join(top, n)
+                    if n.endswith(sufs) or (f"{d}/{n}" not in RUNNER_GLOBS and os.path.isdir(p)
+                                            and any(m.startswith("__init__.") for m in os.listdir(p))):
+                        mods.add(f"{d}/{n}")
+            except OSError:
+                return None
+    return RUNNER + tuple(sorted(mods))
+
+
 def same_runner(cand, cur):
-    """True when every RUNNER path is byte-identical in the two release dirs (a directory by tree_digest), or absent
-    from both."""
-    for p in RUNNER:
+    """True when every runner_paths path is byte-identical in the two release dirs (a directory by tree_digest), or
+    absent from both. False when either side cannot be listed or read."""
+    paths = runner_paths(cand, cur)
+    if paths is None:
+        return False
+    for p in paths:
         a, b = os.path.join(cand, p), os.path.join(cur, p)
         if os.path.lexists(a) != os.path.lexists(b):
             return False
@@ -577,45 +605,51 @@ def same_runner(cand, cur):
             continue
         if os.path.islink(a) or os.path.islink(b):
             return False
-        if os.path.isdir(a) or os.path.isdir(b):
-            if not (os.path.isdir(a) and os.path.isdir(b)) or tree_digest(a) != tree_digest(b):
-                return False
-            continue
-        with open(a, "rb") as fa, open(b, "rb") as fb:
-            if fa.read() != fb.read() or (os.stat(a).st_mode & 0o111) != (os.stat(b).st_mode & 0o111):
-                return False
+        try:
+            if os.path.isdir(a) or os.path.isdir(b):
+                if not (os.path.isdir(a) and os.path.isdir(b)) or tree_digest(a) != tree_digest(b):
+                    return False
+                continue
+            with open(a, "rb") as fa, open(b, "rb") as fb:
+                if fa.read() != fb.read() or (os.stat(a).st_mode & 0o111) != (os.stat(b).st_mode & 0o111):
+                    return False
+        except OSError:
+            return False
     return True
 
 
 def main_greens(cur, tree, state=LAND_STATE):
     """The checks the lane recorded `passed` on `tree` under release `cur` (its basename, as records.release() stamps
-    it): the files records.py writes, results/<check>/<tree>.json (base runs) and jobs/*/results/<check>/<tree>.json
-    (a job's runs, on merge-tree(base, head), which is main's tree once that job merged). A record counts only when
-    its own check, tree and release fields agree with its path and with these. Read, not imported: lander-self shares
-    no code with lander/. Like the store itself, it trusts what a process of this uid wrote there (records.py's
-    stated residual); it does not take the nonce, so a green an earlier lane of the same release made counts."""
+    it): the shared base records records.py writes, results/<check>/<tree>.json. Perms, 10-13: "reuse only this
+    repo's shared base records, never job records" — a job's jobs/*/results/ ran on a PR's merge tree under that
+    job's own scope, so it is not read. A record counts only when its own check, tree and release fields agree with
+    its path and with these. Read, not imported: lander-self shares no code with lander/. Like the store itself, it
+    trusts what a process of this uid wrote there (records.py's stated residual); it does not take the nonce, so a
+    green an earlier lane of the same release made counts."""
     if not cur or not re.fullmatch(r"[0-9a-f]{40,64}", tree or ""):
         return set()
-    rel, out = os.path.basename(cur.rstrip("/")), set()
+    rel, out, d = os.path.basename(cur.rstrip("/")), set(), os.path.join(state, "results")
     try:
-        jobs = sorted(os.listdir(os.path.join(state, "jobs")))
+        checks = os.listdir(d)
     except OSError:
-        jobs = []
-    for d in [os.path.join(state, "results")] + [os.path.join(state, "jobs", j, "results") for j in jobs]:
+        checks = []
+    for c in checks:
         try:
-            checks = os.listdir(d)
-        except OSError:
+            with open(os.path.join(d, c, f"{tree}.json")) as f:
+                r = json.load(f)
+        except (OSError, ValueError):
             continue
-        for c in checks:
-            try:
-                with open(os.path.join(d, c, f"{tree}.json")) as f:
-                    r = json.load(f)
-            except (OSError, ValueError):
-                continue
-            if (isinstance(r, dict) and r.get("check") == c and r.get("tree") == tree and r.get("status") == "passed"
-                    and r.get("release") == rel):
-                out.add(c)
+        if (isinstance(r, dict) and r.get("check") == c and r.get("tree") == tree and r.get("status") == "passed"
+                and r.get("release") == rel):
+            out.add(c)
     return out
+
+
+def main_tree(root, main):
+    """Commit `main`'s tree, or ''. Perms, 10-13: resolved "with git --no-replace-objects", so a refs/replace/ entry
+    in the checkout cannot make main's tree read as another commit's and pick up that tree's greens."""
+    rc, out, _ = sh(["git", "--no-replace-objects", "-C", root, "rev-parse", f"{main}^{{tree}}"])
+    return out.strip() if rc == 0 else ""
 
 
 def reusable(cand, cur, tree, state=LAND_STATE):
@@ -688,8 +722,7 @@ def proven(rel, cur, root, main):
     True when no verdict could be had: exit 3, not a refusal's 1). Prints the proof's lines."""
     print(f"lander-self: proving {os.path.basename(rel)[:12]} on main {main[:12]}: every check, as the lane runs it "
           f"(cap {PROVE_CAP}s)", flush=True)
-    rc, tree, _ = git(root, "rev-parse", f"{main}^{{tree}}")
-    reuse = reusable(rel, cur, tree.strip() if rc == 0 else "")
+    reuse = reusable(rel, cur, main_tree(root, main))
     if cur and not same_runner(rel, cur):
         print("  the candidate runs checks with code that differs from the current release's: sweeping every check",
               flush=True)
@@ -874,15 +907,20 @@ def cmd_promote(args, opts):
 
 def gate_commits(root, base, sha, pats):
     """The commits in base..sha that touch a path on the `lander` list `pats`, oldest first: [(sha, subject)], and how
-    many others there were. None when git cannot list them."""
-    rc, out, _ = git(root, "log", "--reverse", "--no-renames", "--format=%x00%H %s", "--name-only", f"{base}..{sha}")
+    many others there were. None when git cannot list them. Perms, 10-13: the listing uses -z, so a path with a
+    space, or one git would quote (a non-ASCII byte), is read whole and matched as it is."""
+    rc, out, _ = git(root, "log", "--reverse", "--format=%H %s", f"{base}..{sha}")
     if rc != 0:
         return None
     rx, hit, other = [glob_re(p) for p in pats], [], 0
-    for chunk in out.split("\x00")[1:]:
-        head, _, files = chunk.partition("\n")
+    for head in out.split("\n"):   # not splitlines(): a subject may hold U+2028
+        if not head:
+            continue
         c, _, subject = head.partition(" ")
-        if any(r.match(f) for f in files.split() for r in rx):
+        rc, names, _ = git(root, "diff-tree", "-z", "-r", "--root", "--no-commit-id", "--name-only", "--no-renames", c)
+        if rc != 0:
+            return None
+        if any(r.match(f) for f in names.split("\x00") if f for r in rx):
             hit.append((c, subject))
         else:
             other += 1
@@ -1835,7 +1873,9 @@ def reuse_cases(case, t, fake):
         for d, body in ((cur, "RUN"), (cand, cand_run)):
             put(os.path.join(d, "core", "lander", "run.py"), body)
             put(os.path.join(d, "core", "bin", "cc-nosignal"), "ns", 0o755)
-            put(os.path.join(d, "core", "lander", "lane.py"), d)   # not a runner file: may differ
+            put(os.path.join(d, "core", "lander", "lane.py"), "LANE")
+            put(os.path.join(d, "core", "lander", "README"), d)   # not a runner file: may differ
+            put(os.path.join(d, "core", "tests", "t.py"), d)      # nor is a module below core/'s own *.py
             put(os.path.join(d, "tests", "landing-repos", "r.toml"), "x")
         if extra:
             put(os.path.join(cand, extra), "new")
@@ -1857,14 +1897,25 @@ def reuse_cases(case, t, fake):
     rec(state, "results", "g", name="a")              # a record whose check is not its path's
     cand, cur = rels("same")
     case("same_runner: identical runner files match although other lander files differ", same_runner(cand, cur))
-    case("main_greens takes only passed records of the current release at main's tree, shared and per job",
-         reusable(cand, cur, tree, state) == {"a", "b", "z"})
-    run, calls = fake({cand: [{"c": "passed"}]})
+    case("main_greens takes only passed shared records of the current release at main's tree, never a job's (b)",
+         reusable(cand, cur, tree, state) == {"a", "z"})
+    run, calls = fake({cand: [{"b": "passed", "c": "passed"}]})
     bad, lines, why = prove(cand, cur, run, names=lambda r: (["a", "b", "c"], "") if r == cur else ([], "x"),
                             reuse=reusable(cand, cur, tree, state))
     case("prove sweeps only what was not reused, and z (not on main's list) is not counted",
-         bad == [] and why == "" and calls == [(cand, ("c",))] and lines[0].startswith("reused 2 check(s)")
-         and lines[0].endswith("ran 1"))
+         bad == [] and why == "" and calls == [(cand, ("b", "c"))] and lines[0].startswith("reused 1 check(s)")
+         and lines[0].endswith("ran 2"))
+    # every core/lander/*.py and core/*.py is a runner file, whether or not today's cli.py imports it
+    for tag, path in (("lane", "core/lander/lane.py"), ("top", "core/x.py")):
+        cand, cur = rels(tag)
+        put(os.path.join(cur, path), "one")
+        put(os.path.join(cand, path), "two")
+        case(f"a {path} that differs is a different runner", not same_runner(cand, cur))
+        put(os.path.join(cand, path), "one")
+        case(f"…and the same {path} on both sides is not", same_runner(cand, cur))
+    cand, cur = rels("only", extra="core/lander/new.py")
+    case("a core/lander module only the candidate has is a different runner",
+         not same_runner(cand, cur) and not same_runner(cur, cand))
     run, calls = fake({cand: [{"c": "passed"}]})
     bad, lines, why = prove(cand, cur, run, names=lambda r: (["a", "b", "c", "q"], ""), reuse={"a", "b", "z"})
     case("…a listed name neither reused nor run by the candidate still blocks", bad == ["q"] and why == "")
@@ -1885,6 +1936,48 @@ def reuse_cases(case, t, fake):
     cand, cur = rels("exec")
     os.chmod(os.path.join(cand, "core", "bin", "cc-nosignal"), 0o644)
     case("an exec bit that differs is a different runner", not same_runner(cand, cur))
+    # anything importable shadows a module: a package dir, a .pyc or a .so (core/ is first on sys.path)
+    for tag, path in (("pkg", "core/lander/run/__init__.py"), ("stdpkg", "core/json/__init__.py"),
+                      ("pyc", "core/json.pyc"), ("so", "core/json.cpython-314-x86_64-linux-gnu.so")):
+        cand, cur = rels(tag, extra=path)
+        case(f"a {path} only the candidate has is a different runner",
+             not same_runner(cand, cur) and not same_runner(cur, cand))
+    cand, cur = rels("nopkg", extra="core/lander/run/x.txt")
+    put(os.path.join(cand, "core", "json", "x.txt"), "no __init__")
+    case("…but a dir with no __init__ is not importable over a module, so it is not a runner file",
+         same_runner(cand, cur))
+    for tag, part in (("pkgsame", "core/json/__init__.py"), ("pkgdiff", "core/json/__init__.py")):
+        cand, cur = rels(tag)
+        put(os.path.join(cur, part), "one")
+        put(os.path.join(cand, part), "one" if tag == "pkgsame" else "two")
+        case(f"a package dir on both sides compares by its tree ({tag})",
+             same_runner(cand, cur) == (tag == "pkgsame"))
+
+    def patched(mod, attr, path, fn):
+        """fn() with mod.attr raising PermissionError for `path`; 'raised' when fn raised."""
+        real = getattr(mod, attr)
+
+        def deny(p, *a, **k):
+            if os.fspath(p) == path:
+                raise PermissionError(13, "denied", p)
+            return real(p, *a, **k)
+        setattr(mod, attr, deny)
+        try:
+            return fn()
+        except OSError:
+            return "raised"
+        finally:
+            setattr(mod, attr, real)
+
+    import builtins
+    cand, cur = rels("ls")
+    case("a runner dir that exists but cannot be listed reuses nothing",
+         same_runner(cand, cur) and
+         patched(os, "listdir", os.path.join(cand, "core", "lander"), lambda: same_runner(cand, cur)) is False)
+    cand, cur = rels("rd")
+    case("a runner file that cannot be read reuses nothing, without raising",
+         patched(builtins, "open", os.path.join(cand, "core", "lander", "run.py"),
+                 lambda: same_runner(cand, cur)) is False)
     case("no current release reuses nothing", reusable(cand, "", tree, state) == set())
     # the commits perms reads: only those touching main's lander list
     g = os.path.join(t, "gc")
@@ -1909,6 +2002,21 @@ def reuse_cases(case, t, fake):
     case("gate_commits picks only commits touching the lander list, oldest first",
          hit == [(on, "runner change"), (on2, "config deep")] and other == 3)
     case("gate_commits is None when git cannot list", gate_commits(g, "0" * 40, head, ["x"]) is None)
+    sp = commit("core/lander/a b.py", "a space")
+    na = commit("core/lander/é.py", "non-ascii")
+    commit("core/lander/c d/e.py", "outside, a space")
+    hit, other = gate_commits(g, head, "HEAD", ["core/lander/a b.py", "core/lander/é.py"])
+    case("gate_commits reads a path with a space or a quoted byte whole (-z), and not a near miss",
+         hit == [(sp, "a space"), (na, "non-ascii")] and other == 1)
+    ls = commit("core/lander/run.py", "line separator")
+    case("gate_commits keeps a subject holding U+2028 whole",
+         gate_commits(g, na, ls, ["core/lander/run.py"]) == ([(ls, "line separator")], 1))
+    # main's tree is read with replace refs ignored
+    subprocess.run(["git", "-C", g, "replace", head, base], check=True, env=env)
+    case("main_tree ignores a refs/replace entry for main",
+         main_tree(g, head) == git(g, "--no-replace-objects", "rev-parse", f"{head}^{{tree}}")[1].strip()
+         != git(g, "rev-parse", f"{head}^{{tree}}")[1].strip())
+    case("main_tree is '' when git cannot resolve", main_tree(g, "0" * 40) == "")
 
 
 def prove_cases(case, t, real_names=names_under):
