@@ -94,6 +94,13 @@ model_args(){ local m; m=$("$BIN/cc-model" current 2>/dev/null) && [ -n "$m" ] &
 member_model_args(){ local m; m=$("$BIN/cc-config" get CC_MEMBER_MODEL claude-sonnet-5 2>/dev/null); [ -n "$m" ] || m=claude-sonnet-5; printf '%s\n%s\n' --model "$m"; }
 orch_effort_args(){ local kv; for kv in $("$BIN/cc-config" get CC_ORCH_EFFORT 2>/dev/null); do [ "${kv%%=*}" = "$1" ] || continue
   case "${kv#*=}" in low|medium|high|xhigh|max) printf '%s\n%s\n' --effort "${kv#*=}";; *) echo "cc: CC_ORCH_EFFORT: '${kv#*=}' for $1 is not an effort level (low|medium|high|xhigh|max); starting on settings.json's" >&2;; esac; return 0; done; return 0; }
+orch_model_args(){ local kv kvs m; read -ra kvs <<<"$("$BIN/cc-config" get CC_ORCH_MODEL 2>/dev/null)"   # read: no glob on [1m]
+  for kv in "${kvs[@]}"; do case "$kv" in "$1="?*) ;; *) continue;; esac   # alias=model only: a bare alias pins nothing
+    m=$("$BIN/cc-model" resolve "${kv#*=}" 2>/dev/null); printf '%s\n%s\n' --model "${m:-${kv#*=}}"; return 0; done; model_args; }
+                # …AND TO A MODEL (owner, 2026-10-13: "ensure your successors also go on fable 5.1 max"). CC_ORCH_MODEL lists
+                # alias=model pairs, e.g. 'autobox2=claude-fable-5-1[1m]'; __runorch and an orch's __runnext start a listed
+                # orch on `cc-model resolve <its model>` — the pin, or the next rung while the pin is out — and cc-model
+                # makes the pin that window's band, so reconcile keeps it there. An unlisted alias starts on cc-model current.
                 # AN ORCH CAN BE PINNED TO AN EFFORT (owner, 2026-10-04: the architect always on max). CC_ORCH_EFFORT in
                 # ~/.cc/config lists alias=level pairs, e.g. 'architect=max'; __runorch and an orch's __runnext pass it as
                 # --effort, so a handoff keeps it where a typed /effort was lost. An alias it does not list gets no --effort
@@ -1100,6 +1107,33 @@ $(sed 's/Say fewer things/Say less/' "$ROOT/config/writing-prompt.md")"; rc=$?; 
   ef ef5 ef-bad __runorch r1 a1
   rc=0; grep -qxF -- --effort "$T/ef5" 2>/dev/null && rc=1; [ -s "$T/ef5" ] || rc=1
   t "control: a level the CLI has not got (a1=huge) passes no --effort" "$rc"
+  # AN ORCH CC_ORCH_MODEL NAMES STARTS ON THAT MODEL, fresh and as a handoff successor; one it does not name starts on
+  # `cc-model current`, as every other session does. The [1m] rides along unglobbed: the two files are what the value
+  # alone and the whole a1=… word would glob to in the orch's cwd.
+  printf 'CC_ORCH_MODEL=other=claude-haiku-5-5 a1=claude-fable-5-1[1m]\n' > "$T/mo-a1"
+  : > "$T/dev/r1/claude-fable-5-1m"; : > "$T/dev/r1/a1=claude-fable-5-1m"   # files the glob would match
+  ef mo1 mo-a1 __runorch r1 a1
+  rc=0; grep -A1 -xF -- --model "$T/mo1" 2>/dev/null | grep -qxF 'claude-fable-5-1[1m]' || rc=1
+  t "an orch CC_ORCH_MODEL lists (a1=claude-fable-5-1[1m]) starts with --model claude-fable-5-1[1m]" "$rc"
+  ef mo2 mo-a1 __runnext r1@a1 h5 s5
+  rc=0; grep -A1 -xF -- --model "$T/mo2" 2>/dev/null | grep -qxF 'claude-fable-5-1[1m]' && grep -qxF -- s5 "$T/mo2" || rc=1
+  t "…and so does its handoff successor" "$rc"
+  ef mo3 mo-a1 __runorch r1 a2; cur=$(HOME="$T" CC_CONFIG="$T/mo-a1" "$BIN/cc-model" current 2>/dev/null)
+  rc=0; [ -n "$cur" ] && [ "$(grep -A1 -xF -- --model "$T/mo3" 2>/dev/null | sed -n 2p)" = "$cur" ] || rc=1
+  t "control: an orch the key does not list starts on cc-model current ($cur)" "$rc"
+  # …AND WHILE ITS MODEL IS OUT, ON THE RUNG `cc-model resolve` NAMES: with Fable on record as not this account's to
+  # run, the pinned orch and its successor start on Opus 5.5. The pin passed as written would start them refused.
+  mkdir -p "$T/.cc/state"; printf 'fable\t%s\t%s\tFable 5.1 requires usage credits\n' "$(date -u +%s)" "$(date -u +%s)" > "$T/.cc/state/model-unavailable"
+  ef mo4 mo-a1 __runorch r1 a1
+  rc=0; grep -A1 -xF -- --model "$T/mo4" 2>/dev/null | grep -qxF 'claude-opus-5-5[1m]' || rc=1
+  t "a pinned orch whose model is out (a fable row) starts with --model claude-opus-5-5[1m]" "$rc"
+  ef mo5 mo-a1 __runnext r1@a1 h6 s6
+  rc=0; grep -A1 -xF -- --model "$T/mo5" 2>/dev/null | grep -qxF 'claude-opus-5-5[1m]' && grep -qxF -- s6 "$T/mo5" || rc=1
+  t "…and so does its handoff successor" "$rc"
+  rm -f "$T/.cc/state/model-unavailable" "$T/dev/r1/claude-fable-5-1m" "$T/dev/r1/a1=claude-fable-5-1m"
+  printf 'CC_ORCH_MODEL=a1\n' > "$T/mo-bare"; ef mo6 mo-bare __runorch r1 a1
+  rc=0; [ -n "$cur" ] && [ "$(grep -A1 -xF -- --model "$T/mo6" 2>/dev/null | sed -n 2p)" = "$cur" ] || rc=1
+  t "control: a bare alias with no =model (a1) pins nothing: it starts on cc-model current ($cur)" "$rc"
   mkdir -p "$T/dev/r1/.cc"; : > "$T/dev/r1/.cc/member-facing"; xs xs6 __runmain r1; rm -f "$T/dev/r1/.cc/member-facing"
   rc=0; grep -qF -- crossSessionInbound "$T/xs6" 2>/dev/null && rc=1; [ -s "$T/xs6" ] || rc=1
   t "control: a named planning seat that is member-facing starts without it" "$rc"
@@ -1724,7 +1758,7 @@ PY
       "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --session-id "$sid" "${CH[@]}" "${MO[@]}"
     else
       IN=(); [ -z "$track$alias" ] && mapfile -t IN < <(inbound_args "$repo")   # the planning seat's successor only, as __runmain
-      EF=(); [ -n "$alias" ] && [ -z "$track" ] && mapfile -t EF < <(orch_effort_args "$alias")   # an orch's successor keeps its pinned effort, as __runorch
+      EF=(); [ -n "$alias" ] && [ -z "$track" ] && { mapfile -t EF < <(orch_effort_args "$alias"); mapfile -t MO < <(orch_model_args "$alias"); }   # an orch's successor keeps its pinned effort and model, as __runorch
       "$CLAUDE" "${AUTO[@]}" "${IN[@]}" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}" "${EF[@]}"
     fi
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
@@ -1739,7 +1773,7 @@ PY
     repo="$2"; alias="$3"; brief="${4:-}"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp=$(sp_orch "$repo" "$alias" "$base")
     export CC_SLACK_ALIAS="$alias" CC_ORCH_REPO="$repo"   # cc-loop keys a dispatched worker's STOP/DONE to <this repo>@<alias>
-    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); mapfile -t EF < <(orch_effort_args "$alias"); chan_accept "$repo@$alias"; start_check "$repo@$alias"
+    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(orch_model_args "$alias"); mapfile -t EF < <(orch_effort_args "$alias"); chan_accept "$repo@$alias"; start_check "$repo@$alias"
     ft=$(sp_first "$repo" "$alias" "$brief")   # the purpose, as the session's own first turn — see sp_first
     crashed="${CC_SLACK_DIR:-$HOME/.cc/slack}/orch-crashed/$repo@$alias"; rm -f "$crashed"   # a restarted orch is live again
     "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}" "${EF[@]}" ${ft:+"$ft"}; orc=$?

@@ -1332,8 +1332,11 @@ class Lane:
 
     def planned(self, job):
         if job.extra.get("light") is True:   # brief 10-13: "the PR's static and hermetic checks"
-            kept = LT.trim(self.manifest(job), job.plan) if job.plan else None
-            if kept is not None and kept.checks:
+            wide = LT.widened(job.plan) if job.plan else ""
+            kept = LT.trim(self.manifest(job), job.plan) if job.plan and not wide else None
+            if wide:   # Opus read of #1316: "a plan of klass T.WIDE, or any widening entry in unowned, is not light"
+                job.extra["light"] = wide
+            elif kept is not None and kept.checks:
                 job.plan = kept
             else:   # security read of #1316: "a trimmed plan that comes out empty means the PR isn't light"
                 job.extra["light"] = "its plan keeps no static or hermetic check"

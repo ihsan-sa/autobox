@@ -5,7 +5,8 @@
 # and any other — minor windows, tutor seats, tracks, and a session moved between the lower rungs — gets `/model` typed
 # at its next turn boundary (see A MAJOR SEAT COMES BACK BY HANDOFF below). No return asks the owner first. EVERY
 # TICK, WITH NO EVENT, `reconcile` compares each live session with the model it belongs on (want_of: a planning or
-# major window's band is the primary — or, with CC_MODEL_PRIMARY_WINDOWS set, only a LISTED one's is and every other
+# major window's band is its CC_ORCH_MODEL pin when it is an orch the key names, else the primary — or, with
+# CC_MODEL_PRIMARY_WINDOWS set, only a LISTED one's is and every other
 # planning or major window's is the floor; a moved one's is what it was on; a rowless minor one is not touched) and makes
 # the same move up or down, so a session born on the fallback with no record comes back too. A non-planning window with
 # every rung out has nothing to move to and is left where it is, and no pass ever types a /model that names no model (reconcile drops one left queued in a spool, and reads a banked [1m][1m] once). LLM-free except the
@@ -189,7 +190,8 @@
 #   rung and a move down to it banks no moved row; unset, every planning and major window is the primary's — see ONLY
 #   LISTED WINDOWS BELONG ON THE PRIMARY) · CC_MODEL_RETURN_GAP (7200) · CC_MODEL_RETURN_CHANNEL (the card's
 #   channel when the session's repo has none: `#<box>`) · CC_MODEL_PLANNING (~/.cc/config: windows or globs such as
-#   `lessons/*` that are planning on top of the default rule) · CC_MODEL_FLOOR (the lowest a planning session runs;
+#   `lessons/*` that are planning on top of the default rule) · CC_ORCH_MODEL (~/.cc/config: alias=model pairs; a listed orch's band is
+#   its pin, as `cc` starts it) · CC_MODEL_FLOOR (the lowest a planning session runs;
 #   default Opus while it is on the chain, else the fallback) · CC_MODEL_CRED (whose login, see Unavailable) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC, CC_MODEL_SESSIONS
 #   (a file of "<pane-id> <window>" standing in for the live session list), CC_MODEL_LIVE (a file of
 #   "<pane-id>\t<model>" standing in for what each pane's session is running), CC_MODEL_MEMBERS (~/.cc/members),
@@ -646,10 +648,13 @@ want_of(){   # $1 pane · $2 window → the model this session belongs on NOW, "
              # rowless minor window is where its dispatcher or a person put it, and is left there. FROM THE BAND DOWN, the
              # first rung that is not out (out_why: on record as not the account's, or the primary under an override).
              # A planning window never lands below the floor: "park" when everything down to it is out.
-  local b m; if moved_by_box "$1" ""; then b=$(moved_row "$1"); elif planning "$2" || major "$2"; then b=$(band_of "$2"); else return 1; fi
+  local b m n; if moved_by_box "$1" ""; then b=$(moved_row "$1"); elif planning "$2" || major "$2"; then b=$(band_of "$2"); else return 1; fi
   # every rung out: a planning window parks, any other has nothing to be moved to (exit 1, reconcile leaves it). Until
   # 2026-09-25 that second case returned 0 with no model, and reconcile typed a bare /model into five tutor windows.
-  m="$b"; while out_why "$m" >/dev/null; do m=$(chain_next "$m") || { planning "$2" && { echo park; return 0; }; return 1; }; done
+  # Each step is resolve's: the next rung, or for a band OFF the chain the chain's first runnable rung; resolve handing
+  # the model back is the end. A Fable pin is off the shipped chain, and chain_next alone had nothing after it: the
+  # orch was parked, the owner told Opus was out, and its handoff successor parked again (review of #1320).
+  m="$b"; while out_why "$m" >/dev/null; do n=$(resolve "$m"); [ "$n" != "$m" ] || { planning "$2" && { echo park; return 0; }; return 1; }; m="$n"; done
   { planning "$2" && below_floor "$m"; } && { echo park; return 0; }
   printf '%s\n' "$m"; }
 reconcile(){   # EVERY TICK, NO EVENT NEEDED (owner, 2026-09-21): each live session's model against want_of, and the move
@@ -723,7 +728,7 @@ cfg_v(){   # $1 key → its value into REPLY, no fork: the env when set, else th
   local k="$1"; if [ -n "${!k:-}" ]; then REPLY="${!k}"; return 0; fi
   [ -n "${CFG[$k]+x}" ] || CFG[$k]=$("$BIN/cc-config" get "$k" 2>/dev/null)
   REPLY="${CFG[$k]}"; }
-cfg_prime(){ local k; for k in CC_MODEL_MAJOR CC_MODEL_PLANNING CC_MODEL_PRIMARY_WINDOWS; do cfg_v "$k"; done; }
+cfg_prime(){ local k; for k in CC_MODEL_MAJOR CC_MODEL_PLANNING CC_MODEL_PRIMARY_WINDOWS CC_ORCH_MODEL; do cfg_v "$k"; done; }
 major(){   # $1 window → 0 = handed back unasked. CC_MODEL_MAJOR (env, else ~/.cc/config; windows, space- or comma-
            # separated) is the whole list when set; else the default rule above. `~next`/`~old` is mid-handoff: never.
   local w="${1:-}" list; case "$w" in ''|*~*) return 1;; esac
@@ -774,8 +779,15 @@ listed_primary(){   # $1 window → 0 = named on CC_MODEL_PRIMARY_WINDOWS. An em
   IFS=', ' read -ra gs <<<"$(primary_windows)"   # read, not $(…): no pathname expansion
   # shellcheck disable=SC2254   # $g unquoted on purpose: a glob
   for g in "${gs[@]}"; do case "$w" in $g) return 0;; esac; done; return 1; }
-band_of(){   # $1 window (a planning or major one) → the model it belongs on before any outage: the primary, or the
-             # floor rung when the list is set and this window is not on it.
+pin_of(){   # $1 window → the model CC_ORCH_MODEL (~/.cc/config, alias=model pairs, as `cc` reads them) pins this orch
+            # `<repo>@<alias>` to, or nothing (exit 1). A person's pin (owner, 2026-10-13: "ensure your successors also go
+            # on fable 5.1 max") is that window's band, so reconcile neither types it down to the floor nor hands it back.
+  local w="${1:-}" kv kvs; case "$w" in *~*|*/*) return 1;; *@*) ;; *) return 1;; esac
+  cfg_v CC_ORCH_MODEL; read -ra kvs <<<"$REPLY"   # read, not $(…): no glob on [1m]
+  for kv in "${kvs[@]}"; do case "$kv" in "${w#*@}="?*) printf '%s\n' "${kv#*=}"; return 0;; esac; done; return 1; }   # a bare alias pins nothing
+band_of(){   # $1 window (a planning or major one) → the model it belongs on before any outage: its CC_ORCH_MODEL pin, else
+             # the primary, or the floor rung when the list is set and this window is not on it.
+  pin_of "$1" && return 0
   { [ -z "$(primary_windows)" ] || listed_primary "$1"; } && { printf '%s\n' "$PRIMARY"; return 0; }
   floor_rung; }
 policy_band(){   # $1 pane · $2 window → 0 = this window's band is the floor BY POLICY, so a move down to it is not an
@@ -783,6 +795,7 @@ policy_band(){   # $1 pane · $2 window → 0 = this window's band is the floor 
                  # its row is its band, and dropping the bank would strand it a rung down after the lift.
   [ -n "$(primary_windows)" ] || return 1
   moved_by_box "$1" "" && return 1
+  pin_of "$2" >/dev/null && return 1   # a pin is a person's band, not the policy's: a move off it is banked to come back
   { planning "$2" || major "$2"; } && ! listed_primary "$2"; }
 parked_row(){   # $1 pane → 0 = banked `parked`, off whatever family: a parked seat waits for the FLOOR either way
   awk -F'\t' -v p="${1:-}" '$1==p && $5=="parked"{y=1} END{exit !y}' "$MOVED" 2>/dev/null; }
@@ -2060,8 +2073,8 @@ TXT
   local oldtp; oldtp=$(declare -f tick_pass); local cfgpl="${CC_MODEL_PLANNING-}"; unset CC_MODEL_PLANNING
   tick_pass(){ planning lab/a && planning lab/b && ! planning other/c && echo "$(planning lab/c && echo y)" > "$d/cfgseen"; CC_MODEL_PLANNING='solo/*' planning solo/x && echo env >> "$d/cfgseen"; }
   : > "$d/cfgcalls"; tick
-  t 'a tick reads each config key once, however often its passes ask' "$(wc -l < "$d/cfgcalls"):$(paste -sd, "$d/cfgseen")" "3:y,env"
-  t '…and keeps nothing after it: the next read outside a tick asks again' "${#CFG[@]}:$(planning lab/z && echo y):$(wc -l < "$d/cfgcalls")" "0:y:4"
+  t 'a tick reads each config key once, however often its passes ask' "$(wc -l < "$d/cfgcalls"):$(paste -sd, "$d/cfgseen")" "4:y,env"
+  t '…and keeps nothing after it: the next read outside a tick asks again' "${#CFG[@]}:$(planning lab/z && echo y):$(wc -l < "$d/cfgcalls")" "0:y:5"
   eval "$oldtp"; BIN="$cfgbin"; [ -n "$cfgpl" ] && CC_MODEL_PLANNING="$cfgpl"
   # ── A MODEL THIS ACCOUNT CANNOT RUN (2026-09-03): recorded, left out of the chain, and the box moved off it ──────
   # Own state under $d, no tmux at all (no live session is listed here, let alone typed into), a stub cc-notify.
@@ -2656,6 +2669,22 @@ TXT
   note_unavailable "$(fam "$fl")" "You've hit your monthly spend limit"; reconcile
   t '(w) the floor out: an unlisted window on the primary is left there, banked nothing, the owner told nothing' \
     "$(cat "$MOVED" 2>/dev/null):$(grep -c 'Planning parked' "$d/calls"):$(typed other@orch)" ":0:"
+  # AN ORCH CC_ORCH_MODEL PINS HAS THE PIN AS ITS BAND (owner, 2026-10-13): left on it, moved down the chain when it
+  # is out and banked, and handed back when it answers. Beside it an unpinned orch, which goes to the floor as above.
+  export CC_ORCH_MODEL="orch=$PRIMARY"
+  pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS='repo'
+  printf '%s\n' '%2 other@orch' '%6 other@free' > "$d/sess"; printf '%s\t%s\n' '%2' "$PRIMARY" '%6' "$PRIMARY" > "$d/live"; reconcile
+  t '(pin) a pinned orch on its pin is left there; an unpinned one beside it is typed to the floor' \
+    "$(want_of '%2' other@orch):$(typed other@orch):$(typed other@free):$(paste -sd'|' "$d/handoffs")" "$PRIMARY::/model $fl:"
+  t '(pin) a bare alias with no =model pins nothing: that orch keeps the policy band' "$(CC_ORCH_MODEL='orch' want_of '%2' other@orch)" "$fl"
+  pl; rm -f "$OV"; CC_MODEL_PRIMARY_WINDOWS='repo'
+  printf '%s\n' '%2 other@orch' > "$d/sess"; printf '%s\t%s\n' '%2' "$PRIMARY" > "$d/live"
+  note_unavailable "$(fam "$PRIMARY")" 'the cap'; reconcile
+  t '(pin) its pin out: the pinned orch moves down the chain and is banked to come back' \
+    "$(typed other@orch):$(awk -F'\t' '$1=="%2"{print $5 ":" $6}' "$MOVED")" "/model $fl:moved:$(fam "$PRIMARY")"
+  printf '%s\t%s\n' '%2' "$fl" > "$d/live"; rm -f "$UNAV"; : > "$LOG"; : > "$d/typed"; reconcile
+  t '(pin) …and when the pin answers it is handed back to it' "$(paste -sd'|' "$d/handoffs")$(typed other@orch)" "other@orch"
+  unset CC_ORCH_MODEL
   export CC_MODEL_PRIMARY_WINDOWS=''
   # ── THE SHIPPED CHAIN, IN PROCESS (2026-09-29): Opus 5.5 the primary and the planning floor, nothing under it ──
   local fxp="$PRIMARY" fxf="$FALLBACK" fxc="$CHAIN"
@@ -2677,6 +2706,24 @@ TXT
     "$(typed repo):$(typed repo@orch):$(typed lessons/ece1):$(grep -c 'Planning parked' "$d/calls")" ':::0'
   t '(n) …and the log says why once, not once a tick' "$(grep -c $'\thold\t.*nothing below Opus 5.5 on the chain' "$LOG")" 1
   rm -f "$ST/claude-limit" "$d/keys"; for pn in 1 2 3 4 5; do printf '> \n' > "$d/screen.%$pn"; done
+  # (pin) A PIN OFF THE CHAIN (review of #1320): Fable is no rung of the shipped chain, so a Fable-pinned orch whose
+  #     Fable is out goes to the chain's first runnable rung, Opus 5.5, as `cc` launches it (cc-model resolve), and sits
+  #     there quietly until Fable answers. chain_next alone parked it, told the owner Opus was out, and looped a handoff.
+  export CC_ORCH_MODEL='orch=claude-fable-5-1[1m]'
+  pl; rm -f "$OV"; printf '%s\n' '%2 repo@orch' > "$d/sess"; printf '%s\t%s\n' '%2' 'claude-fable-5-1[1m]' > "$d/live"
+  note_unavailable fable 'Fable 5.1 requires usage credits'; reconcile
+  t '(pin) shipped, its Fable pin out: the orch on Fable is typed to Opus 5.5, not parked, not handed off, the owner told nothing' \
+    "$(want_of '%2' repo@orch):$(typed repo@orch):$(cat "$MOVED" 2>/dev/null):$(paste -sd'|' "$d/handoffs"):$(grep -c '^notify' "$d/calls")" \
+    "$PRIMARY:/model $PRIMARY:::0"
+  printf '%s\t%s\n' '%2' "$PRIMARY" > "$d/live"; : > "$d/typed"
+  for pn in 1 2 3; do : > "$LOG"; reconcile; done   # the retune gap cleared before each pass: only want_of keeps it put
+  printf '%s\n' '%3 repo@orch' > "$d/sess"; printf '%s\t%s\n' '%3' "$PRIMARY" > "$d/live"   # a handoff successor, rowless, launched on resolve's rung
+  for pn in 1 2 3; do : > "$LOG"; reconcile; done
+  t '(pin) …on Opus 5.5 it stays tick after tick, and so does a successor launched there: nothing typed, no park, no handoff, no owner line' \
+    "$(typed repo@orch):$(cat "$MOVED" 2>/dev/null):$(paste -sd'|' "$d/handoffs"):$(grep -c '^notify' "$d/calls")" ":::0"
+  forget_unavailable fable; : > "$LOG"; reconcile
+  t '(pin) …and when Fable answers it is typed back to its pin' "$(typed repo@orch):$(paste -sd'|' "$d/handoffs")" "/model claude-fable-5-1[1m]:"
+  unset CC_ORCH_MODEL
   # THE KEPT SIDE, on a two-rung CC_MODEL_CHAIN (the env override still works): a rung under the floor exists again,
   # and an Opus limit parks the planning seats and moves the track as before. The rest of this block runs on it.
   CHAIN="$CHAIN claude-sonnet-5"; FALLBACK=$(chain_fallback)

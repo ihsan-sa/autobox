@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# cc-claude-login — start a Claude login the owner asked for, hand back its link, and finish it with his code.
+#
+#   cc-claude-login start <name>         start `claude auth login` for ~/.claude-<name> and print the login link
+#   cc-claude-login code <name> <code>   paste the code the owner got back from that link, and say whether it took
+#   cc-claude-login status <name>        `claude auth status` for ~/.claude-<name>
+#   cc-claude-login selfcheck
+#
+# WHY (2026-10-12). The owner asked the planning seat for a login link "quickly", so a second account could carry
+# the workers (~/.claude-workers) and keep his own free for sessions. The seat put `claude setup-token` in a
+# detached tmux window by hand to read the link off it, the auto-mode classifier refused that as persistence, and
+# he had to go to perms himself. This is the one named route for that ask: a seat runs `start`, posts the link,
+# and runs `code` with what he sends back.
+#
+# HOW. The login is `claude auth login` (its credentials land in that config dir, the way an interactive /login
+# does), never `setup-token`, whose year-long token is printed into a pane and a scrollback. It runs in a tmux
+# session of its own, cc-login-<name>, because it waits for the code after this command returns; the session is
+# wide so the link is never wrapped, and it is killed once the code has been tried. A second `start` for a name whose
+# login is still waiting prints the same link again instead of starting another. <name> is letters, digits and
+# dashes, so the config dir is always ~/.claude-<name> and never a path somebody passed in.
+#
+# Exit: 0 done, 1 failed (no link within CC_LOGIN_WAIT seconds, a code the login refused, not logged in), 2 usage.
+# CC_CLAUDE_BIN and CC_LOGIN_TMUX (a tmux socket path) are for the selfcheck.
+set -u
+CLAUDE="${CC_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+WAIT="${CC_LOGIN_WAIT:-30}"
+USAGE="usage: cc-claude-login start <name> | code <name> <code> | status <name> | selfcheck"
+B="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+tm(){ if [ -n "${CC_LOGIN_TMUX:-}" ]; then tmux -S "$CC_LOGIN_TMUX" "$@"; else tmux "$@"; fi; }
+name_ok(){ [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,31}$ ]] || { echo "cc-claude-login: name must be letters, digits and dashes: '${1:-}'" >&2; return 2; }; }
+cfg(){ printf '%s/.claude-%s' "$HOME" "$1"; }
+sess(){ printf 'cc-login-%s' "$1"; }
+screen(){ tm capture-pane -p -J -t "$(sess "$1")" 2>/dev/null; }
+link(){ screen "$1" | grep -o -E 'https://[^[:space:]]+' | grep -E 'oauth|authorize|login' | tail -1; }
+
+start(){
+  local n="$1" s u i
+  s=$(sess "$n")
+  if ! tm has-session -t "=$s" 2>/dev/null; then
+    mkdir -p "$(cfg "$n")" && chmod 700 "$(cfg "$n")" || return 1
+    tm new-session -d -s "$s" -x 1000 -y 50 \
+      env CLAUDE_CONFIG_DIR="$(cfg "$n")" "$CLAUDE" auth login || { echo "cc-claude-login: could not start the login session" >&2; return 1; }
+    tm set-option -t "$s" remain-on-exit on >/dev/null 2>&1
+  fi
+  for ((i = 0; i < WAIT * 2; i++)); do
+    u=$(link "$n"); [ -n "$u" ] && { echo "$u"; return 0; }
+    sleep 0.5
+  done
+  echo "cc-claude-login: no login link within ${WAIT}s; the screen was:" >&2; screen "$n" | sed '/^$/d' | tail -5 >&2
+  tm kill-session -t "=$s" 2>/dev/null; return 1
+}
+
+code(){
+  local n="$1" c="$2" s i dead
+  s=$(sess "$n")
+  tm has-session -t "=$s" 2>/dev/null || { echo "cc-claude-login: no login is waiting for '$n'; run start first" >&2; return 1; }
+  tm send-keys -t "$s" -l "$c" && tm send-keys -t "$s" Enter
+  for ((i = 0; i < WAIT * 2; i++)); do
+    dead=$(tm display-message -p -t "$s" '#{pane_dead}' 2>/dev/null); [ "$dead" = 1 ] && break
+    sleep 0.5
+  done
+  [ "$dead" = 1 ] || echo "cc-claude-login: the login was still running after ${WAIT}s; stopping it" >&2
+  tm kill-session -t "=$s" 2>/dev/null
+  status "$n"
+}
+
+status(){
+  local out
+  out=$(CLAUDE_CONFIG_DIR="$(cfg "$1")" "$CLAUDE" auth status 2>&1); echo "$out"
+  grep -q -E '"loggedIn": *true' <<<"$out"
+}
+
+selfcheck(){   # the cases are tests/selfcheck/cc-claude-login.sh beside this bin/; sourcing it replaces this selfcheck()
+  . "$(dirname "$B")/tests/selfcheck/cc-claude-login.sh" || return 1
+  selfcheck "$@"; }
+
+case "${1:-}" in
+  start)  [ $# = 2 ] || { echo "$USAGE" >&2; exit 2; }; name_ok "$2" || exit 2; start "$2" ;;
+  code)   [ $# = 3 ] && [ -n "$3" ] || { echo "$USAGE" >&2; exit 2; }; name_ok "$2" || exit 2; code "$2" "$3" ;;
+  status) [ $# = 2 ] || { echo "$USAGE" >&2; exit 2; }; name_ok "$2" || exit 2; status "$2" ;;
+  selfcheck) selfcheck ;;
+  *) echo "$USAGE" >&2; exit 2 ;;
+esac

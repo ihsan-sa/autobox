@@ -76,14 +76,33 @@ class Qualify(unittest.TestCase):
         with mock.patch.object(MF, "load", return_value=MF.Manifest(sources=[MF.POLICY])):
             self.assertEqual(LT.why_not("/r", "a" * 40, ["a/x"]), "")   # with one it qualifies
 
-    def test_member_and_perms_tools_are_never_light_on_the_live_policy(self):
-        root = os.path.dirname(CORE)
-        m = MF.load(root, "HEAD", strict=False, read=lambda path: _text(os.path.join(root, path)))
-        for f in ("core/bin/cc-member-v2", "core/bin/cc-member-broker", "core/bin/cc-member-import",
-                  "core/bin/cc-member-new", "core/bin/cc-approve", "core/bin/cc-perms-eval", "core/bin/cc-hostdoor"):
-            self.assertIn(f"it touches {f}", LT.path_hit(m.policy, [f]))
-        self.assertEqual(LT.path_hit(m.policy, ["docs/x.md"]), "")
+    def test_member_perms_sandbox_and_wall_tools_on_gate_first_are_never_light(self):
+        # the globs tests/LANDING-policy.toml puts on gate_first for them, on a fixture policy
+        pol = T.Policy(gate_first=["core/bin/cc-member-v2", "core/bin/cc-member-*", "core/bin/cc-approve",
+                                   "core/bin/cc-perms-*", "core/bin/cc-hostdoor", "core/bin/cc-fence",
+                                   "core/bin/cc-egress", "core/bin/gh", "core/bin/git-remote-cc-github-deny",
+                                   "core/bin/cc-subagent-bound", "core/bin/cc-native", "core/bin/cc-tier",
+                                   "core/bin/cc-room"])
+        for f in ("core/bin/cc-member-v2", "core/bin/cc-member-broker", "core/bin/cc-member-new",
+                  "core/bin/cc-approve", "core/bin/cc-perms-eval", "core/bin/cc-hostdoor", "core/bin/cc-fence",
+                  "core/bin/cc-egress", "core/bin/gh", "core/bin/git-remote-cc-github-deny",
+                  "core/bin/cc-subagent-bound", "core/bin/cc-native", "core/bin/cc-tier", "core/bin/cc-room"):
+            self.assertEqual(LT.path_hit(pol, [f]), f"it touches {f}, on the lander's gate_first list")
+        self.assertEqual(LT.path_hit(pol, ["core/bin/cc-other"]), "")   # the kept case beside them
 
+    def test_a_widened_plan_is_not_light(self):
+        self.assertEqual(LT.widened(T.Plan(checks=["lint"], unowned=["core/bin/new-tool"], klass=T.WIDE)),
+                         "no check owns core/bin/new-tool, so its plan widens to the default checks")
+        self.assertEqual(LT.widened(T.Plan(checks=["lint"], klass=T.WIDE)), "its plan widens to the default checks")
+        # an add-only file that loads by nothing is quiet: no widening, so it stays light
+        self.assertEqual(LT.widened(T.Plan(checks=["lint"], unowned=["d/new.json"], klass=T.LEAF,
+                                           extra={"add_only": ["d/new.json"]})), "")
+        self.assertEqual(LT.widened(T.Plan(checks=["lint"], klass=T.LEAF)), "")
+
+    def test_config_names_is_never_light_whatever_the_policy(self):
+        self.assertEqual(LT.path_hit(T.Policy(), ["config/names.json"]),
+                         "it touches config/names.json, on the lander's lander list")
+        self.assertEqual(LT.path_hit(T.Policy(), ["config/other.json"]), "")   # the kept case beside it
 
     def test_a_default_path_is_never_light_and_keeps_the_default_checks(self):
         pol, faults = MF.parse_policy('default_checks = ["check-sh", "check-extra"]\n[paths]\ndefault = ["x/**"]\n',
@@ -100,21 +119,6 @@ class Qualify(unittest.TestCase):
         checks = P.select(m, files).checks
         self.assertIn("check-sh", checks)
         self.assertIn("check-extra", checks)
-
-    def test_a_file_on_the_lander_list_alone_is_never_light(self):
-        pol, faults = MF.parse_policy('[paths]\nlander = ["config/names.json"]\n', "", "p")
-        self.assertEqual(faults, [])
-        self.assertEqual(LT.path_hit(pol, ["config/names.json"]),
-                         "it touches config/names.json, on the lander's lander list")
-        self.assertEqual(LT.path_hit(pol, ["config/other.json"]), "")   # the kept case beside it
-
-
-def _text(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
-    except OSError:
-        return None
 
 
 class Reviewer(TL.Reviewer):
@@ -179,6 +183,19 @@ class LightLane(TL.Fixture):
         rv = self.lane(1, {"a/x": "n\n"})
         self.assertEqual([c[0] for c in rv.calls], ["lint"])   # the whole plan ran, untrimmed
         self.assertEqual(self.job().extra["light"], "its plan keeps no static or hermetic check")
+
+    def test_a_file_no_check_owns_widens_and_is_not_light(self):
+        # Opus read of #1316: s/a.sh plus core/bin/new-tool came out trimmed to [lint], so the tool landed unchecked
+        self.write(self.fb, {"demo.toml": self.FB.replace('paths = ["**"]', 'paths = ["s/**"]', 1)
+                             .replace('paths = ["**"]', 'paths = ["z/**"]')})
+        # s/a.sh is on main already, so the PR is not add-only and the new tool widens (an add-only one that loads by
+        # nothing is quiet in plan.py, on either lane)
+        self.push("main", {"tests/LANDING-policy.toml": 'default_checks = ["suite"]\n[paths]\npaid_review = ["b/**"]\n',
+                           "s/a.sh": "o\n"})
+        rv = self.lane(1, {"s/a.sh": "n\n", "core/bin/new-tool": "n\n"})
+        self.assertIn("suite", [c[0] for c in rv.calls])   # the default check ran, untrimmed
+        self.assertEqual(self.job().extra["light"],
+                         "no check owns core/bin/new-tool, so its plan widens to the default checks")
 
     def test_a_check_blocked_by_main_hands_a_light_pr_back(self):
         from lander import run as RUN
