@@ -33,7 +33,8 @@ boundary reads one file, its own workspace's, and can reach no other.
   cc-lib index [--rebuild] [--json]
         Reconcile every registered source with the index (no deadline) and print the measurements: sources,
         records, source bytes, text bytes, index bytes and ratios, seconds, peak RSS. `ask` reconciles stale
-        sources too, inside a 1.5 s budget, and names the ones it did not reach as pending; nothing runs a whole
+        sources too, inside a 1.5 s budget — the ones its --object names first, then the inbound Slack archive, then
+        the rest by path — and names the ones it did not reach as pending; nothing runs a whole
         rebuild inline, and nothing runs on a timer of its own — cc-checkpoint --sweep (the 5-minute timer the box
         already has) runs this form, which is what picks up an edit that bypassed the hooks below, and a full pass
         that reached every source clears the misses log. A re-read works at record grain: an unchanged text keeps
@@ -1268,7 +1269,11 @@ def reconcile(c, deadline=None, prefer=(), reg=None):
             out["removed"] += 1
     c.commit()
     pref = set(os.path.abspath(x) for x in prefer)
-    todo.sort(key=lambda s: (0 if s[0] in pref else 1, s[0]))
+    # THE OWNER'S WORDS BEFORE THE REST: after what the ask named, the Slack archive goes first, because a channel's
+    # month file grows with every message and sorted by path it waited behind ~/.cc/boards and the rest of ~/.cc; on
+    # 10-04 the words he had said in one channel were 'pending' to the seat that asked in another, and he was asked
+    # to redo a finished step.
+    todo.sort(key=lambda s: (0 if s[0] in pref else 1 if s[1] == "slack" else 2, s[0]))
     for s in todo:
         if deadline is not None and time.monotonic() - t0 > deadline:
             out["pending"].append(s[0])
@@ -2799,6 +2804,32 @@ def selfcheck_p3(th, ok, run, w):
     rc, o = run("ask", "--object", "1789239600.000300", "--need", "history")
     ok("found by TS: --object <message ts> is that message alone, a member's words under the member role",
        rc == 0 and "OCELOT" in o and "bob (member)" in o and "MARMOSET" not in o)
+    # ---- an ask's 1.5 s reconcile reaches the Slack archive before the rest: on 10-04 the owner's words in one channel
+    # sat 'pending' to a seat asking in another. A journal whose path sorts before ~/.cc/slack and an archive, both stale.
+    oj = w(".cc/a-order/progress.md", "## 2026-10-04T16:00Z iter 1\nORDERJOURNAL a step.\n")
+    osl = w(".cc/slack/archive/r9/C0BBBBBBBB2/2026-10.jsonl",
+            json.dumps({"ts": "1791133000.000100", "chat": "C0BBBBBBBB2", "channel": "#ai-lab", "user": "ada", "role": "owner",
+                        "target": "r9", "text": "ORDERSLACK the token has the three zones now", "at": "2026-10-04T16:40:00Z"}) + "\n")
+    oreg = [(oj, "journal", "r9", "a-order"), (osl, "slack", "r9", "")]
+    seen, orig = [], globals()["index_source"]
+    globals()["index_source"] = lambda c, path, *a: (seen.append(path), orig(c, path, *a))[1]
+    try:
+        c = db()
+        reconcile(c, reg=oreg)
+        ok("ask's reconcile reads a stale Slack archive before a stale journal that sorts ahead of it by path",
+           seen == [osl, oj])
+        w(".cc/a-order/progress.md", "## 2026-10-04T16:00Z iter 1\nORDERJOURNAL a step, edited.\n")
+        with open(osl, "a") as f:
+            f.write(json.dumps({"ts": "1791133060.000200", "chat": "C0BBBBBBBB2", "user": "ada", "role": "owner", "text": "ORDERSLACK two"}) + "\n")
+        seen.clear()
+        reconcile(c, prefer=[oj], reg=oreg)
+        ok("…control: the source the ask names (--object) still goes before the archive", seen == [oj, osl])
+        c.close()
+    finally:
+        globals()["index_source"] = orig
+    os.remove(oj)
+    os.remove(osl)
+    run("index")   # the narrowed registry above dropped every other source: bring the fixture index back whole
 
     # ---- the cold set: what would leave the hot index, and nothing leaves
     with open(os.path.join(th, ".cc", "boards", "r1.json")) as f:
