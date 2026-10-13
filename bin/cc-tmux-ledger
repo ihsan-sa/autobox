@@ -1,0 +1,918 @@
+#!/usr/bin/env python3
+"""cc-tmux-ledger — what the tmux server had running, so a server crash costs a restart, not the work.
+
+  cc-tmux-ledger save              write this server's windows to its ledger (tmux.conf's after-new-window hook)
+  cc-tmux-ledger watch             tmux.conf starts it at server start: when the last server crashed, starts
+                                   cc-recover (which brings the sessions back), then saves every 30 s while this
+                                   server lives; one per server. It relaunches nothing itself
+  cc-tmux-ledger restore           by hand: relaunch, in a window of the same name, cwd and command, every window
+                                   the dead server had running that is not live now. Refused while cc-recover holds
+                                   its lock, so the two never start the same window twice
+  cc-tmux-ledger list              what the dead server had running that is not live now, and the one command
+                                   that brings it back
+  cc-tmux-ledger forget            tmux-main.service's ExecStop, before its kill-server: a deliberate stop (`!restart
+                                   tmux`, a stop of the unit, a clean reboot) is not a crash, so the next server
+                                   starts clean. With no live server, or under systemd with no MAINPID (the unit's
+                                   server already died), it does nothing: that was a crash
+  cc-tmux-ledger selfcheck         a real scratch tmux server, killed with SIGSEGV twice
+
+WHY. The tmux 3.6 server segfaulted on 2026-10-01 and again on 10-03 (kernel: "tmux: server segfault at 10 …
+error 4"). Every seat, orch and --go loop lived in that one server, so all of them died at once, tmux-main
+recreated only the box window, and nothing recorded what had been live: each one was found and restarted by hand.
+
+THE LEDGER is ~/.cc/tmux-ledger/<socket>.json (mode 700, and not under ~/.cc/state, where a member workspace's
+handle names a directory), one per tmux socket, and only the default socket keeps one:
+a test fixture's scratch server that reads ~/.tmux.conf writes nothing here. CC_TMUX_LEDGER_SOCKET names another
+socket (`tmux -L`) and CC_TMUX_LEDGER_DIR another directory, for the selfcheck and for a hand run. Each window is
+recorded once (grouped sessions share their windows) with its session, name, start directory (the cwd its command
+was started in, not wherever the pane has cd'd since), command and state:
+  running   the pane is still doing its work
+  ended     the pane's process is a bare interactive shell: the work finished and only the "shell stays" prompt is
+            left (cc's workers and seats end `…; exec bash`), even if someone has since typed a command into it.
+            Never relaunched, because a finished --go worker relaunched would run a whole new iteration.
+  shell     the window was opened with no command. Never relaunched.
+The command is the pane's own `sh -c` argument read from /proc when it is still there, and otherwise tmux's
+#{pane_start_command} decoded — never eval'd, because tmux leaves backticks and > unescaped in it, and an unquoted
+one (several arguments) only when it is all plain characters. A command neither way recovers is listed and not
+relaunched.
+
+A DEAD SERVER'S LEDGER becomes <socket>.lost.json the first time anything runs against a server other than the one the
+ledger names, when that one is no longer a tmux server. A server is its pid and the boot it ran in (the kernel's
+boot_id), in the ledger and in forget's marker alike, because pids recur across boots: a new server that reuses the
+old pid after a reboot is still a new server. That holds whichever runs first after a crash — the
+new server's first save or its watcher — so the new server never overwrites the list of what the old one lost.
+Two crashes before a restore merge into one lost list. `restore` removes each entry it relaunched or found live.
+Each entry keeps the time its ledger was last saved, which is within 30 s of the crash, and an entry over a day old
+is dropped. An entry or a file of the wrong shape is skipped, never a crash.
+
+AFTER A CRASH, cc-recover is the one thing that relaunches sessions: it resumes each seat and orch on its own
+conversation, refuses a record it cannot trust, skips what is live, and takes a lock (~/.cc/recover/.lock) so a
+second trigger does nothing. Archiving a crash marks the lost list `recover: due`, and the watcher, finding it so,
+starts cc-recover-restore.service (CC_TMUX_LEDGER_RECOVER names another command, for the selfcheck) and marks it
+`sent`, under the ledger's lock, so one crash starts it once. A second crash within 15 minutes of the last start
+does not start it again (the box may be crashing on what it restored): it is logged and announced, and is `held`.
+
+Every name, session and cwd handed back to tmux has its # doubled: tmux expands #(…) and #{…} in -n, -s and -c,
+so a window named `#(cmd)` would otherwise run cmd. The command itself and the -t targets are not expanded.
+tmux prints a window name or start directory raw, newlines included, so the one list-panes a save makes ends each
+record in a random token and is split on that, and a pane whose record is not one line of the expected fields is
+read again with its own `display -p`, then skipped and logged: a directory named "x\n<fields>" must not add a
+window to the ledger that restore would then run.
+A dead pane (remain-on-exit) is left out. A name or path that is not UTF-8 is kept byte for byte, and a save that
+fails anyway is logged while the watcher carries on: a dead watcher would be crash protection off without a word.
+
+WHAT IT DOES NOT DO: it does not stop the crash (a tmux upgrade is the owner's), and a window a hand `restore`
+relaunches starts a new conversation unless its own command resumes one (cc's `__run` and `__runmember` do):
+`cc-recover restore` is the way back for a seat or an orch.
+"""
+import fcntl
+import json
+import os
+import secrets
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+INTERVAL = float(os.environ.get("CC_TMUX_LEDGER_INTERVAL", "30"))
+GAP = float(os.environ.get("CC_TMUX_LEDGER_GAP", "2"))   # seconds between relaunches, so thirty seats do not start at once
+GUARD = 15 * 60                                           # a crash inside this of the last cc-recover start does not start it again
+EXPIRE = 24 * 60 * 60                                     # an entry older than this leaves the lost list
+SHELLS = {"bash", "sh", "dash", "zsh", "fish", "-bash", "-sh", "-zsh"}
+SEP = "\x1f"
+
+
+def socket_name():
+    s = os.environ.get("CC_TMUX_LEDGER_SOCKET")
+    if s:
+        return s
+    t = os.environ.get("TMUX", "")
+    return os.path.basename(t.split(",")[0]) if t else "default"
+
+
+def allowed():
+    # Only the box's own server keeps a ledger unless a socket is named outright: a fixture server is never ours.
+    return bool(os.environ.get("CC_TMUX_LEDGER_SOCKET")) or socket_name() == "default"
+
+
+def statedir():
+    d = os.environ.get("CC_TMUX_LEDGER_DIR") or os.path.expanduser("~/.cc/tmux-ledger")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def path(kind):
+    return os.path.join(statedir(), f"{socket_name()}.{kind}")
+
+
+def tmux(*args, check=False):
+    cmd = ["tmux"] + (["-L", os.environ["CC_TMUX_LEDGER_SOCKET"]] if os.environ.get("CC_TMUX_LEDGER_SOCKET") else []) + list(args)
+    # tmux prints names and paths as raw bytes: surrogateescape keeps a byte that is not UTF-8 (0xff) and gives it
+    # back to tmux unchanged, where strict decoding would raise and stop the watcher
+    r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape")
+    if check and r.returncode:
+        raise RuntimeError(f"tmux {' '.join(args[:2])}: {r.stderr.strip()}")
+    return r
+
+
+def server_pid():
+    r = tmux("list-sessions", "-F", "#{pid}")
+    if r.returncode or not r.stdout.strip():
+        return None
+    return int(r.stdout.split()[0])
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+BOOT = boot_id()
+
+
+def is_tmux_server(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip() == "tmux: server"
+    except OSError:
+        return False
+
+
+def alive(pid, boot):
+    """pid is a live tmux server of this boot. A pid alone names no server: pids recur across boots."""
+    return bool(pid) and boot == BOOT and is_tmux_server(pid)
+
+
+def log(msg):
+    with open(path("log"), "a", errors="backslashreplace") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z ") + msg + "\n")
+
+
+def read_json(p):
+    """A ledger or lost list as a dict, or None: unreadable, not JSON, or JSON of another shape."""
+    try:
+        with open(p) as f:
+            obj = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def windows(obj):
+    """The entries of a ledger that have the shape restore needs; anything else is skipped, not a crash."""
+    ws = obj.get("windows") if isinstance(obj, dict) else None
+    if not isinstance(ws, list):
+        return []
+    return [w for w in ws if isinstance(w, dict)
+            and all(isinstance(w.get(k), str) for k in ("session", "name", "state"))
+            and isinstance(w.get("cwd") or "", str) and isinstance(w.get("cmd") or "", str)
+            and isinstance(w.get("start") or "", str)]
+
+
+def pid_of(obj, key):
+    v = obj.get(key) if isinstance(obj, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def boot_of(obj):
+    v = obj.get("boot") if isinstance(obj, dict) else None
+    return v if isinstance(v, str) else ""
+
+
+def when(w):
+    v = w.get("saved")
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def lit(s):
+    """A string tmux would format-expand (-n, -s, -c), made to mean itself."""
+    return s.replace("#", "##")
+
+
+def write_json(p, obj):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".tmp-")
+    text = json.dumps(obj, indent=1, ensure_ascii=False)
+    try:
+        text.encode()
+    except UnicodeEncodeError:   # a byte that is not UTF-8 in a name or path: written as \udcff, read back the same
+        text = json.dumps(obj, indent=1)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, p)
+
+
+class Lock:
+    def __init__(self, kind="lock", block=True):
+        self.f = open(path(kind), "a")
+        self.block = block
+
+    def __enter__(self):
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | (0 if self.block else fcntl.LOCK_NB))
+        except BlockingIOError:
+            self.f.close()
+            return None
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+PLAIN = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _./=:,+@%-")
+
+
+def decode(s):
+    """tmux's #{pane_start_command} back to the string it ran, or None when that cannot be done for certain.
+    tmux wraps an argument with a special character in "…" and escapes \\ " $ inside (or in '…' with no escapes);
+    a VIS escape (\\n, \\342) or a second quoted argument means it is not one string we can give back exactly.
+    Unquoted, it is one word or several arguments joined by spaces, and tmux leaves ` > < ( * ? ! unquoted there:
+    restore hands the command to sh -c, so `tail -f /dev/null x\\`id\\`` would run id and `x>~/.bashrc` would empty
+    the file. Such a command is given back only when every character is a plain one (PLAIN); else it is listed."""
+    if len(s) >= 2 and s[0] == s[-1] == "'":
+        inner = s[1:-1]
+        return None if "'" in inner else inner
+    if len(s) >= 2 and s[0] == s[-1] == '"':
+        out, i, inner = [], 0, s[1:-1]
+        while i < len(inner):
+            c = inner[i]
+            if c == "\\":
+                if i + 1 < len(inner) and inner[i + 1] in '\\"$':
+                    out.append(inner[i + 1]); i += 2; continue
+                return None
+            if c == '"':
+                return None
+            out.append(c); i += 1
+        return "".join(out)
+    return s if s and all(c in PLAIN for c in s) else None
+
+
+def argv(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode(errors="surrogateescape") for a in f.read().split(b"\0")[:-1]]
+    except OSError:
+        return []
+
+
+FIELDS = ["#{pane_id}", "#{window_id}", "#{session_name}", "#{session_group}", "#{window_name}", "#{pane_index}",
+          "#{pane_pid}", "#{pane_start_path}", "#{pane_start_command}", "#{pane_dead}"]
+_SKIPPED = set()   # panes already logged as unreadable, so the watcher logs each once, not every 30 s
+
+
+def panes():
+    """Each pane as its fields, or None when tmux cannot be asked. One list-panes reads every pane, so a save is one
+    tmux client and not one per pane. tmux prints a window name or start directory raw, newlines and all, so a line
+    is not a record: a directory named "x\n<fields>" would add a window of its own. Each record therefore ends in a
+    token made at random for this read, which no name or path can hold, and the answer is split on that; a record
+    starts with its pane id (%N, which holds no separator). A record that is not exactly the expected fields on one
+    line is read again on its own with display -p, and one still not right is skipped and logged."""
+    end = SEP + secrets.token_hex(16) + "\n"
+    r = tmux("list-panes", "-a", "-F", SEP.join(FIELDS) + end[:-1])
+    if r.returncode:
+        return None
+    recs = r.stdout.split(end)
+    if recs[-1]:   # the answer stops mid-record (the server died as it answered): no list rather than half of one
+        return None
+    out, bad, ids = [], [], set()
+    for rec in recs[:-1]:
+        f = rec.split(SEP)
+        pid = f[0]
+        if not (pid[:1] == "%" and pid[1:].isdigit()):
+            bad.append(repr(rec[:20])); continue
+        if pid in ids:   # a grouped session lists its panes again
+            continue
+        ids.add(pid)
+        if len(f) != len(FIELDS) or "\n" in rec:
+            d = tmux("display", "-p", "-t", pid, "-F", SEP.join(FIELDS))
+            if d.returncode:   # the server died mid-read: half a list must not replace the last whole one
+                return None
+            line = d.stdout[:-1] if d.stdout.endswith("\n") else None
+            f = line.split(SEP) if line is not None and "\n" not in line else []
+            if line is not None and not line.strip(SEP):
+                continue   # the pane closed since the listing: tmux answers with empty fields
+            if len(f) != len(FIELDS) or f[0] != pid:
+                bad.append(pid); continue
+        if f[-1] != "1":   # a dead pane (remain-on-exit) runs nothing, and its pid may be someone else's by now
+            out.append(f[1:-1])
+    new = [p for p in bad if p not in _SKIPPED]
+    if new:
+        _SKIPPED.update(new)
+        log(f"skipped pane(s) {' '.join(new)}: tmux's answer was not one line of {len(FIELDS)} fields "
+            "(a newline or separator in a window name or start directory)")
+    return out
+
+
+def snapshot():
+    ps = panes()
+    if ps is None:
+        return None
+    seen, wins = set(), []
+    for wid, sess, group, name, idx, pid, cwd, start in ps:
+        if wid in seen:   # a grouped session lists the same window again; its first pane is the window's
+            continue
+        seen.add(wid)
+        av = argv(int(pid)) if pid.isdigit() else []
+        if not start:
+            state, cmd = "shell", None
+        elif len(av) == 1 and os.path.basename(av[0]) in SHELLS:   # what it runs now is someone's typing, not the work
+            state, cmd = "ended", decode(start)
+        else:
+            state = "running"
+            cmd = av[2] if len(av) >= 3 and av[1] == "-c" and os.path.basename(av[0]) in SHELLS else decode(start)
+        wins.append({"session": group or sess, "name": name, "cwd": cwd, "state": state, "cmd": cmd, "start": start})
+    return wins
+
+
+def forgotten():
+    """The server forget marked, as (pid, boot), or (0, "") when there is no marker or it cannot be read."""
+    try:
+        with open(path("forget")) as f:
+            pid, boot = (f.read().split() + ["", ""])[:2]
+        return int(pid), boot
+    except (OSError, ValueError):
+        return 0, ""
+
+
+def archive(cur):
+    """Under the lock: a ledger a dead server wrote becomes (or joins) the lost list, unless it was stopped on purpose."""
+    gone = forgotten()
+    if gone[0] and gone != (cur, BOOT) and not alive(*gone):
+        os.remove(path("forget"))   # that server is dead now; its marker has done its work
+    led = read_json(path("json"))
+    if led is None:
+        if os.path.exists(path("json")):   # not a ledger at all: set aside, so the saves go on
+            os.remove(path("json"))
+            log("removed a ledger file that was not a ledger")
+        return
+    spid, sboot = pid_of(led, "server_pid"), boot_of(led)
+    if (spid, sboot) == (cur, BOOT) or alive(spid, sboot):
+        return
+    if spid and (spid, sboot) == gone:
+        os.remove(path("json"))
+        log(f"server {spid} was stopped on purpose: nothing to restore")
+        return
+    lost = read_json(path("lost.json"))
+    keep = {(w["session"], w["name"]): w for w in windows(lost)}
+    for w in windows(led):
+        if w["state"] == "running":
+            keep[(w["session"], w["name"])] = dict(w, saved=when(w) or when(led))
+    lost = {"server_pid": spid, "boot": sboot, "saved": when(led), "windows": list(keep.values()), "recover": "due"}
+    write_json(path("lost.json"), lost)
+    os.remove(path("json"))
+    log(f"server {spid or '?'} is gone: {len(lost['windows'])} running window(s) on the lost list")
+
+
+def save():
+    if not allowed():
+        return 0
+    cur = server_pid()
+    if cur is None:
+        return 0
+    with Lock():
+        archive(cur)
+        if forgotten() == (cur, BOOT):   # being stopped on purpose: a save now would make the stop look like a crash
+            return 0
+        wins = snapshot()
+        if wins is None:
+            return 0
+        write_json(path("json"), {"server_pid": cur, "boot": BOOT, "saved": int(time.time()), "windows": wins})
+    return 0
+
+
+def live_names():
+    r = tmux("list-windows", "-a", "-F", "#{session_group}" + SEP + "#{session_name}" + SEP + "#{window_name}")
+    out = set()
+    for line in r.stdout.splitlines():
+        g, s, n = (line.split(SEP) + ["", "", ""])[:3]
+        out.add((g or s, n))
+    return out
+
+
+def pending():
+    lost = read_json(path("lost.json")) or {}
+    live, now = live_names(), time.time()
+    return lost, [w for w in windows(lost) if (w["session"], w["name"]) not in live and now - when(w) < EXPIRE]
+
+
+def forget():
+    if not allowed():
+        return 0
+    cur = server_pid()
+    if cur is None:   # the server is already dead, so this is a crash's ExecStop: what it lost stays to be restored
+        return 0
+    mp = os.environ.get("MAINPID", "")   # systemd's: the server the unit is stopping, if it is still alive
+    if mp and mp != str(cur):   # a server someone else started after the unit's one died is not being stopped
+        return 0
+    if os.environ.get("INVOCATION_ID") and not mp:   # under systemd with no MAINPID: the unit's server already died
+        print("cc-tmux-ledger: forget did nothing: under systemd with no MAINPID, the unit's own server already died",
+              file=sys.stderr)
+        return 0
+    with Lock():
+        with open(path("forget"), "w") as f:
+            f.write(f"{cur} {BOOT}")
+        for k in ("json", "lost.json"):
+            if os.path.exists(path(k)):
+                os.remove(path(k))
+    log(f"server {cur} is being stopped on purpose: the next server starts clean")
+    return 0
+
+
+def describe(ws):
+    return ", ".join(w["name"] for w in ws)
+
+
+def notify(msg):
+    # Only the box's own server tells anyone: a selfcheck or a hand run on a named socket never reaches Slack.
+    if os.environ.get("CC_TMUX_LEDGER_SOCKET") or not shutil.which("cc-notify"):
+        return
+    subprocess.run(["cc-notify", "-t", "tmux server restarted", msg], capture_output=True)
+
+
+def recover_lock():
+    """cc-recover's own lock, ~/.cc/recover/.lock, taken without waiting: an open fd while held, None while another
+    holder (a cc-recover restore) has it. Whoever relaunches sessions holds it, so two never start the same one."""
+    d = os.path.join(os.path.expanduser("~"), ".cc", "recover")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(d, ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def recover_cmd():
+    c = os.environ.get("CC_TMUX_LEDGER_RECOVER")
+    return shlex.split(c) if c else ["systemctl", "--user", "start", "--no-block", "cc-recover-restore.service"]
+
+
+def recover():
+    """The watcher's one step after a crash: start cc-recover, once per crash, and never relaunch anything here."""
+    if not allowed():
+        return 0
+    with Lock():
+        lost = read_json(path("lost.json"))
+        if not lost or lost.get("recover") != "due":
+            return 0
+        stamp = path("recovered")
+        if os.path.exists(stamp) and time.time() - os.path.getmtime(stamp) < GUARD:
+            write_json(path("lost.json"), dict(lost, recover="held"))
+            msg = ("The tmux server died again within 15 minutes, so I did not start cc-recover again. "
+                   "`cc-tmux-ledger list` shows what it lost, and `cc-recover restore` brings the sessions back.")
+            log(msg); notify(msg); print(msg)
+            return 0
+        with open(stamp, "w"):
+            pass
+        write_json(path("lost.json"), dict(lost, recover="sent"))
+    try:
+        r = subprocess.run(recover_cmd(), capture_output=True, text=True, timeout=60)
+        rc, err = r.returncode, (r.stderr or r.stdout).strip()[:200]
+    except (OSError, subprocess.SubprocessError) as e:
+        rc, err = 127, str(e)
+    if rc == 0:
+        log("the tmux server died: cc-recover started to bring the sessions back")
+    else:
+        msg = (f"The tmux server died and cc-recover could not be started (rc={rc} {err}). "
+               "`cc-recover restore` brings the sessions back.")
+        log(msg); notify(msg)
+    return 0
+
+
+def restore():
+    if not allowed():
+        return 0
+    cur = server_pid()
+    if cur is None:
+        print("cc-tmux-ledger: no tmux server is running", file=sys.stderr)
+        return 1
+    held = recover_lock()
+    if held is None:
+        print("cc-tmux-ledger: cc-recover is bringing the sessions back right now; run this again once it is done",
+              file=sys.stderr)
+        return 1
+    try:
+        return relaunch(cur)
+    finally:
+        os.close(held)
+
+
+def relaunch(cur):
+    with Lock():
+        archive(cur)
+        lost, todo = pending()
+        if not todo:
+            if os.path.exists(path("lost.json")):
+                os.remove(path("lost.json"))
+            return 0
+        done, skipped = [], []
+        for w in todo:
+            if not w.get("cmd"):
+                skipped.append(w); continue
+            if (w["session"], w["name"]) in live_names():   # something else (cc-recover, a seat's own revival) got there first
+                done.append(w); continue
+            cwd = w["cwd"] if os.path.isdir(w["cwd"] or "") else os.path.expanduser("~")
+            # recurring-defect-ok: pause-hold-missing — this relaunches the window's own command, and a worker's is cc-loop, which asks `cc-pause is <repo>` before it starts anything
+            # -t is matched literally, but -n, -s and -c are format-expanded: lit() keeps #(…) in a name from running
+            has = tmux("has-session", "-t", "=" + w["session"]).returncode == 0
+            if has:
+                r = tmux("new-window", "-d", "-t", "=" + w["session"] + ":", "-n", lit(w["name"]), "-c", lit(cwd), w["cmd"])
+            else:
+                r = tmux("new-session", "-d", "-s", lit(w["session"]), "-n", lit(w["name"]), "-c", lit(cwd), w["cmd"])
+            (done if r.returncode == 0 else skipped).append(w)
+            if GAP:
+                time.sleep(GAP)
+        left = [w for w in todo if w not in done]   # one already live counts as back
+        if left:
+            write_json(path("lost.json"), dict(lost, windows=left))
+        else:
+            os.remove(path("lost.json"))
+    msg = f"Brought back {len(done)} window(s) the tmux server lost: {describe(done) or 'none'}."
+    if skipped:
+        msg += f" Not brought back, because their command could not be recovered or would not start: {describe(skipped)}."
+    log(msg); print(msg)
+    save()
+    return 0
+
+
+def listing():
+    if not allowed():
+        return 0
+    _, todo = pending()
+    for w in todo:
+        print(f"{w['session']}:{w['name']}\t{w.get('cwd') or ''}\t{w.get('cmd') or '(command not recoverable) ' + (w.get('start') or '')}")
+    if todo:
+        print("cc-tmux-ledger restore   brings these back")
+    return 0
+
+
+def guarded(fn, **kw):
+    """The watcher's one call: a failure is logged and the watcher carries on, because a dead watcher is crash
+    protection switched off without a word."""
+    try:
+        fn(**kw)
+    except Exception as e:
+        log(f"{fn.__name__} failed, the watcher carries on: {e!r}")
+
+
+def watch():
+    if not allowed():
+        return 0
+    for _ in range(60):   # tmux.conf runs before the server's first session exists
+        cur = server_pid()
+        if cur:
+            break
+        time.sleep(0.5)
+    else:
+        return 0
+    with Lock(f"watch-{cur}", block=False) as held:   # a second `source-file` must not start a second watcher
+        if not held:
+            return 0
+        guarded(save)   # moves a dead server's ledger to the lost list before anything can overwrite it
+        guarded(recover)   # a crash just found: cc-recover brings the sessions back, this relaunches nothing
+        while server_pid() == cur:
+            guarded(save)
+            time.sleep(INTERVAL)
+    try:
+        os.remove(path(f"watch-{cur}"))
+    except OSError:
+        pass
+    return 0
+
+
+SELFCHECK = r'''
+set -u
+B="$1"; n=0; f=0
+k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+T=$(mktemp -d); SOCK="cctl-$$-$RANDOM"
+export HOME="$T/home" CC_TMUX_LEDGER_SOCKET="$SOCK" CC_TMUX_LEDGER_DIR="$T/state" CC_TMUX_LEDGER_GAP=0 CC_TMUX_LEDGER_INTERVAL=1
+export CC_TMUX_LEDGER_RECOVER="$T/recover"   # stands in for cc-recover-restore.service: counts its starts
+mkdir -p "$HOME" "$T/state" "$T/w/a dir" "$T/w/d#(echo x)y"
+printf '#!/bin/sh\necho started >> %s/recover.calls\n' "$T" > "$T/recover"; chmod +x "$T/recover"
+calls(){ if [ -f "$T/recover.calls" ]; then wc -l < "$T/recover.calls"; else echo 0; fi; }
+X(){ tmux -L "$SOCK" "$@"; }
+trap 'X kill-server 2>/dev/null; rm -rf "$T"' EXIT
+L="CC_TMUX_LEDGER_SOCKET=$SOCK CC_TMUX_LEDGER_DIR=$T/state CC_TMUX_LEDGER_GAP=0 CC_TMUX_LEDGER_INTERVAL=1 CC_TMUX_LEDGER_RECOVER=$T/recover $B"
+cat > "$T/tmux.conf" <<C
+set-hook -g after-new-window 'run-shell -b "$L save >/dev/null 2>&1"'
+run-shell -b "$L watch >/dev/null 2>&1"
+C
+boot(){ X -f "$T/tmux.conf" new-session -d -s main -n box -c "$T/w" 'sleep 600'; }   # what tmux-main.service does
+upto(){ local i; for i in $(seq 60); do eval "$1" && return 0; sleep 0.25; done; return 1; }
+has(){ X list-windows -t main -F '#W' 2>/dev/null | grep -qxF "$1"; }
+HS='o#(echo pwn)'; HW='w#{pane_id}#(echo pwn)'; HD="$T/w/d#(echo x)y"   # tmux would run or expand these if not escaped
+hashed(){ X list-windows -t "=$HS" -F '#W' 2>/dev/null | grep -qxF "$HW"; }
+inledger(){ python3 -c "import json,sys; sys.exit(0 if sys.argv[1] in [x['name'] for x in json.load(open('$T/state/$SOCK.json'))['windows']] else 1)" "$1" 2>/dev/null; }
+saved(){ python3 -c "import json; print(json.load(open('$T/state/$SOCK.json'))['saved'])" 2>/dev/null || echo 0; }
+fresh(){ local s0; s0=$(saved); upto "[ \"\$(saved)\" -gt $s0 ]"; }   # one more save by the watcher
+boot
+# work: counts its own starts. odd/one@x: a command tmux quotes with $, backticks, quotes and a dash — its output
+# must be byte-identical after the relaunch. fin: finished, its shell stays (cc's `…; exec bash`). bare: no command.
+X new-window -d -t main: -n work -c "$T/w" "cd /; echo started >> $T/work.starts; sleep 600"
+X new-window -d -t main: -n 'odd/one@x' -c "$T/w/a dir" "printf '%s|' \"\$PWD\" '\$HOME' \"a \\\"b\\\"\" '[shell stays — ok]' >> $T/odd.out; echo >> $T/odd.out; sleep 600"
+X new-window -d -t main: -n fin -c "$T/w" "echo done; exec bash"
+X new-window -d -t main: -n bare -c "$T/w"
+X new-session -d -s main-1 -t main   # a grouped client session: its windows are main's, recorded once
+# A session of its own (the boot makes only main, so the relaunch has to create it), whose session, window name and
+# cwd hold #(…) and #{…}: made here with ## so tmux stores them as written.
+X new-session -d -s 'o##(echo pwn)' -n 'w##{pane_id}##(echo pwn)' -c "$T/w/d##(echo x)y" "pwd >> $T/hash.out; sleep 600"
+upto '[ -s $T/odd.out ] && [ -s $T/hash.out ] && python3 -c "import json,sys; w=json.load(open(\"$T/state/$SOCK.json\"))[\"windows\"]; sys.exit(0 if len(w)==6 and [x[\"state\"] for x in w if x[\"name\"]==\"fin\"]==[\"ended\"] else 1)" 2>/dev/null'
+k $? "the ledger holds each window once, grouped sessions or not, and a finished one is 'ended'"
+# Someone types a command into a finished worker's leftover shell: it is still finished, not the worker again.
+X send-keys -t main:fin 'sleep 600' Enter
+upto 'pgrep -P "$(X display -p -t main:fin "#{pane_pid}")" >/dev/null'; k $? "a command typed into the finished window is running"
+fresh
+st=$(python3 -c "import json; print(' '.join(x['name']+'='+x['state'] for x in json.load(open('$T/state/$SOCK.json'))['windows']))")
+k "$([ "$st" = "box=running work=running odd/one@x=running fin=ended bare=shell $HW=running" ] && echo 0 || echo 1)" "states, fin still 'ended' with that command under it: $st"
+wc=$(python3 -c "import json; print([x['cwd'] for x in json.load(open('$T/state/$SOCK.json'))['windows'] if x['name']=='work'][0])")
+k "$([ "$wc" = "$T/w" ] && echo 0 || echo 1)" "a window's cwd is the one its command started in, not where it has cd'd since: $wc"
+spid=$(X list-sessions -F '#{pid}' | head -1); first=$(head -1 "$T/odd.out")
+kill -SEGV "$spid"; upto '! kill -0 $spid 2>/dev/null'; k $? "SIGSEGV kills the scratch server, as the real one died"
+boot
+upto '[ "$(calls)" = 1 ]'; k $? "after the crash the new server's watcher starts cc-recover"
+fresh; fresh
+k "$(! has work && ! has 'odd/one@x' && [ "$(wc -l < $T/work.starts)" = 1 ] && [ "$(calls)" = 1 ] && echo 0 || echo 1)" "…once, and relaunches nothing itself: cc-recover is the one relauncher"
+out=$("$B" list); k "$(grep -q '^main:work' <<<"$out" && grep -qF 'main:odd/one@x' <<<"$out" && echo 0 || echo 1)" "list names the windows the dead server had running"
+"$B" restore >/dev/null
+upto 'has work && has odd/one@x'; k $? "a hand restore brings back the windows that were running"
+upto '[ "$(wc -l < $T/work.starts)" = 2 ]'; k $? "…by running their command again (work started twice)"
+upto '[ "$(wc -l < $T/odd.out)" = 2 ]'; second=$(sed -n 2p "$T/odd.out")
+k "$([ -n "$first" ] && [ "$first" = "$second" ] && echo 0 || echo 1)" "…the same command, byte for byte, in the same cwd: '$second'"
+k "$(has fin || has bare && echo 1 || echo 0)" "a finished window and a bare shell are not relaunched"
+upto hashed; k $? "a session that no longer exists is made again, its session and window named as written: '$HS' '$HW'"
+upto '[ "$(wc -l < $T/hash.out)" = 2 ]'
+k "$([ "$(sort -u "$T/hash.out")" = "$HD" ] && echo 0 || echo 1)" "…in its own cwd, the #(…) in the path left alone: $(tail -1 "$T/hash.out")"
+k "$([ "$(X list-windows -t main -F '#W' | grep -cx box)" = 1 ] && echo 0 || echo 1)" "the window the new server made itself is not doubled"
+k "$([ ! -e "$T/state/$SOCK.lost.json" ] && echo 0 || echo 1)" "the lost list is cleared once everything on it is back"
+# A second crash inside 15 minutes: the box may be crashing on what it restored, so cc-recover is not started again.
+upto 'python3 -c "import json,sys; sys.exit(0 if \"work\" in [x[\"name\"] for x in json.load(open(\"$T/state/$SOCK.json\"))[\"windows\"]] else 1)" 2>/dev/null'
+spid=$(X list-sessions -F '#{pid}' | head -1); kill -SEGV "$spid"; upto '! kill -0 $spid 2>/dev/null'
+boot; upto '[ -s $T/state/$SOCK.log ] && grep -q "died again" $T/state/$SOCK.log'
+k "$([ $? = 0 ] && [ "$(calls)" = 1 ] && echo 0 || echo 1)" "a second crash within 15 minutes is logged and does not start cc-recover again"
+k "$(has work; [ $? = 1 ] && echo 0 || echo 1)" "…work is not running"
+mkdir -p "$HOME/.cc/recover"
+out=$( { flock -n 9 && "$B" restore; } 9>"$HOME/.cc/recover/.lock" 2>&1 ); rc=$?
+k "$([ $rc = 1 ] && grep -q 'cc-recover is bringing' <<<"$out" && ! has work && echo 0 || echo 1)" "a hand restore is refused while cc-recover holds its lock, and starts nothing: $out"
+out=$("$B" list); k "$(grep -q '^main:work' <<<"$out" && grep -q '^cc-tmux-ledger restore' <<<"$out" && echo 0 || echo 1)" "list names what was lost and the one command"
+"$B" restore >/dev/null; k "$(has work && has 'odd/one@x' && echo 0 || echo 1)" "a hand restore brings them back"
+k "$([ -z "$("$B" list)" ] && echo 0 || echo 1)" "…and list is then empty"
+upto '[ "$(wc -l < $T/hash.out)" = 3 ]'
+k "$(hashed && [ "$(sort -u "$T/hash.out")" = "$HD" ] && echo 0 || echo 1)" "a second relaunch leaves the #s alone too"
+# A deliberate stop: tmux-main's ExecStop runs forget, then kill-server. The next server must start clean.
+upto 'inledger work'; spid=$(X list-sessions -F '#{pid}' | head -1)
+MAINPID=1 "$B" forget
+k "$([ ! -e "$T/state/$SOCK.forget" ] && [ -e "$T/state/$SOCK.json" ] && echo 0 || echo 1)" "forget leaves alone a live server that is not the one systemd is stopping (MAINPID)"
+out=$(env -u MAINPID INVOCATION_ID=selfcheck "$B" forget 2>&1)
+k "$([ ! -e "$T/state/$SOCK.forget" ] && [ -e "$T/state/$SOCK.json" ] && grep -q 'no MAINPID' <<<"$out" && echo 0 || echo 1)" "…nor under systemd with no MAINPID, when the unit's own server already died, and it says so: $out"
+MAINPID=$spid "$B" forget; X kill-server; upto '! kill -0 $spid 2>/dev/null'
+k "$([ -e "$T/state/$SOCK.forget" ] && [ ! -e "$T/state/$SOCK.json" ] && echo 0 || echo 1)" "forget marks the live server and drops its ledger"
+boot; upto '[ -e $T/state/$SOCK.json ]' && fresh
+k "$(! has work && [ "$(calls)" = 1 ] && echo 0 || echo 1)" "a deliberate stop (forget, then kill-server) starts no cc-recover and brings nothing back"
+k "$([ ! -e "$T/state/$SOCK.lost.json" ] && [ ! -e "$T/state/$SOCK.forget" ] && echo 0 || echo 1)" "…and leaves no lost list and no marker behind"
+# On a crash systemd runs ExecStop too, after the server is gone: forget must then do nothing.
+X new-window -d -t main: -n work2 -c "$T/w" "sleep 600"
+upto 'inledger work2'; spid=$(X list-sessions -F '#{pid}' | head -1); kill -SEGV "$spid"; upto '! kill -0 $spid 2>/dev/null'
+"$B" forget; rm -f "${T:?}/state/$SOCK.recovered"
+boot; upto '[ "$(calls)" = 2 ]'
+k "$([ $? = 0 ] && grep -q '^main:work2' <<<"$("$B" list)" && echo 0 || echo 1)" "forget after the server already died (a crash's ExecStop) changes nothing: the crash starts cc-recover and work2 is listed"
+# Age: an entry over a day old is dropped. Entries of the wrong shape sit beside them and are skipped.
+python3 - "$T/state/$SOCK.lost.json" "$T/w" <<'P'
+import json, sys, time
+now = int(time.time())
+w = lambda n, age: {"session": "main", "name": n, "cwd": sys.argv[2], "state": "running", "cmd": "sleep 600", "start": "sleep 600", "saved": now - age}
+json.dump({"server_pid": 1, "saved": now, "windows": [w("fresh1", 60), w("old1", 7200), w("gone1", 90000),
+           1, "x", {"session": 3, "name": "bad1"}, {"name": "bad2"}, dict(w("bad3", 60), cmd=["sleep"])]}, open(sys.argv[1], "w"))
+P
+out=$("$B" list); k "$(grep -q '^main:old1' <<<"$out" && grep -q '^main:fresh1' <<<"$out" && ! grep -q gone1 <<<"$out" && echo 0 || echo 1)" "an entry over a day old is dropped from the list; an hour-old one stays"
+out=$("$B" restore 2>&1); rc=$?
+k "$([ $rc = 0 ] && has fresh1 && has old1 && ! has gone1 && ! has bad3 && ! grep -q Traceback <<<"$out" && echo 0 || echo 1)" "a hand restore brings back both, and skips the wrong-shaped entries without a crash: $out"
+lostlist(){ python3 - "$T/state/$SOCK.lost.json" "$T/w" "$@" <<'P'
+import json, sys, time
+now = int(time.time())
+ws = [{"session": s, "name": n, "cwd": sys.argv[2], "state": "running", "cmd": "sleep 600", "start": "sleep 600",
+       "saved": now - int(a)} for s, n, a in (x.split(":") for x in sys.argv[3:])]
+json.dump({"server_pid": 1, "boot": "", "saved": now, "windows": ws}, open(sys.argv[1], "w"))
+P
+}
+lostnames(){ python3 -c "import json; print(' '.join(x['name'] for x in json.load(open('$T/state/$SOCK.lost.json'))['windows']))" 2>/dev/null; }
+# A relaunch tmux refuses (an empty session name) is reported and stays on the list; the one beside it comes back.
+lostlist :nostart1:60 main:fresh2:60
+out=$("$B" restore 2>&1); rc=$?
+k "$([ $rc = 0 ] && has fresh2 && grep -q 'would not start: nostart1' <<<"$out" && [ "$(lostnames)" = nostart1 ] && echo 0 || echo 1)" "a relaunch that fails is named and kept on the lost list: $out"
+# A ledger and a lost list of the wrong shape must not stop the watcher's saves.
+echo '[1, 2]' > "$T/state/$SOCK.json"; echo '"x"' > "$T/state/$SOCK.lost.json"
+upto 'python3 -c "import json,sys; sys.exit(0 if json.load(open(\"$T/state/$SOCK.json\")).get(\"server_pid\") else 1)" 2>/dev/null'
+k $? "a ledger of the wrong shape is set aside and the watcher keeps saving"
+out=$("$B" restore 2>&1); rc=$?
+k "$([ $rc = 0 ] && ! grep -q Traceback <<<"$out" && [ ! -e "$T/state/$SOCK.lost.json" ] && echo 0 || echo 1)" "…and a lost list of the wrong shape is cleared, not a crash: rc=$rc $out"
+# Pids recur across boots: a ledger or a forget marker naming the live server's pid from another boot names a dead server.
+cur=$(X list-sessions -F '#{pid}' | head -1); rm -f "${T:?}/state/$SOCK.lost.json"
+flock "$T/state/$SOCK.lock" python3 - "$T/state/$SOCK.json" "$cur" "$T/w" <<'P'   # under the lock, so a watcher save in flight cannot overwrite it
+import json, os, sys, time
+now = int(time.time())
+w = {"session": "main", "name": "prevboot1", "cwd": sys.argv[3], "state": "running", "cmd": "sleep 600", "start": "sleep 600"}
+json.dump({"server_pid": int(sys.argv[2]), "boot": "another-boot", "saved": now, "windows": [w]}, open(sys.argv[1] + ".t", "w"))
+os.replace(sys.argv[1] + ".t", sys.argv[1])
+P
+"$B" save; out=$("$B" list)
+k "$(grep -q '^main:prevboot1' <<<"$out" && python3 -c "import json,sys; sys.exit(0 if json.load(open('$T/state/$SOCK.json'))['boot'] == open('/proc/sys/kernel/random/boot_id').read().strip() else 1)" && echo 0 || echo 1)" "a ledger naming the live pid from another boot is a dead server's: its windows go on the lost list"
+rm -f "${T:?}/state/$SOCK.lost.json"; printf '%s another-boot\n' "$cur" > "$T/state/$SOCK.forget"; s0=$(saved); sleep 1.1; "$B" save
+k "$([ ! -e "$T/state/$SOCK.forget" ] && [ "$(saved)" -gt "$s0" ] && echo 0 || echo 1)" "a forget marker naming the live pid from another boot is cleared, and the saves go on"
+# The server check is the exact process name, so another process named "tmux…" (a client's is "tmux") is not a server.
+d=$(python3 - "$B" "$spid" "$(X list-sessions -F '#{pid}' | head -1)" <<'P'
+import importlib.machinery, importlib.util, subprocess, sys, time
+ld = importlib.machinery.SourceFileLoader("l", sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader("l", ld)); ld.exec_module(m)
+p = subprocess.Popen([sys.executable, "-c", "import ctypes, time; ctypes.CDLL(None).prctl(15, b'tmux: client', 0, 0, 0); time.sleep(30)"])
+for _ in range(50):
+    if open(f"/proc/{p.pid}/comm").read().strip() == "tmux: client":
+        break
+    time.sleep(0.1)
+r = [m.is_tmux_server(int(sys.argv[3])), open(f"/proc/{p.pid}/comm").read().strip() == "tmux: client",
+     m.is_tmux_server(p.pid), m.is_tmux_server(int(sys.argv[2]))]
+p.kill()
+print(r == [True, True, False, False])
+P
+)
+k "$([ "$d" = True ] && echo 0 || echo 1)" "only a process named exactly 'tmux: server' counts as a live server"
+# A fixture server reading ~/.tmux.conf on another socket keeps no ledger: only the default socket or a named one.
+before=$(ls "$T/state" | sort); out=$(env -u CC_TMUX_LEDGER_SOCKET TMUX="/tmp/tmux-0/fixture,1,0" "$B" save; echo rc=$?)
+k "$([ "$out" = rc=0 ] && [ "$(ls "$T/state" | sort)" = "$before" ] && echo 0 || echo 1)" "a scratch server on an unnamed socket writes nothing"
+# tmux prints a start directory and a window name raw, newlines included: one made of a newline and forged fields
+# must not become a ledger entry that restore would run.
+U=$'\x1f'; EV="$T/w/nl"$'\n'"@99${U}main${U}${U}forged${U}0${U}1${U}$T${U}touch $T/PWNED"
+mkdir -p "$EV"
+X new-window -d -t main: -n victim -c "$EV" 'sleep 600'
+X new-window -d -t main: -n "nm"$'\n'"%0${U}@98${U}main${U}${U}forged2${U}0${U}1${U}$T${U}touch $T/PWNED2" 'sleep 600'
+# The line after the newline is exactly the right fields and starts with the window's own pane id, so a reader that
+# trusted "a pane id and the right field count" would take it as a window @97 named forged3. (rename-window escapes
+# a newline, new-window -n does not, so the id is the next one tmux hands out.)
+X new-window -d -t main: -n idprobe 'sleep 600'; P=$(X display -p -t main:idprobe '#{pane_id}'); X kill-window -t main:idprobe
+P="%$(( ${P#%} + 1 ))"
+X new-window -d -t main: -n "s"$'\n'"$P${U}@97${U}main${U}${U}forged3" 'sleep 600'
+k "$([ "$(X list-panes -a -F '#{pane_id}' | grep -cxF "$P")" -ge 1 ] && echo 0 || echo 1)" "the window whose name forges a record of its own pane id $P exists"
+"$B" save
+fg=$(python3 -c "import json; print(' '.join(x['name'] for x in json.load(open('$T/state/$SOCK.json'))['windows'] if 'forged' in x['name'] or 'PWNED' in (x.get('cmd') or '') or x['name'] == 'victim'))")
+k "$([ -z "$fg" ] && inledger fresh2 && grep -q 'skipped pane' "$T/state/$SOCK.log" && echo 0 || echo 1)" "a window whose start directory or name holds a newline and forged fields is skipped and logged, not forged into the ledger: '$fg'"
+# A window name and start directory holding a byte that is not UTF-8 (0xff) must not kill save or the watcher,
+# and both are recorded so that tmux gets the same bytes back.
+FF="$T/w/f"$'\xff'"f"; mkdir -p "$FF"
+X new-window -d -t main: -n "ff"$'\xff' -c "$FF" 'sleep 600'
+out=$("$B" save 2>&1); rc=$?
+ff=$(python3 -c "import json,sys; print(sum(x['name'] == 'ff\udcff' and x['cwd'] == sys.argv[1] for x in json.load(open('$T/state/$SOCK.json'))['windows']))" "$FF" 2>&1)
+k "$([ $rc = 0 ] && [ -z "$out" ] && [ "$ff" = 1 ] && echo 0 || echo 1)" "a window name and start directory holding byte 0xff are saved, not a crash: rc=$rc '$ff' $out"
+fresh; k $? "…and the watcher goes on saving with that window open"
+# A command of several arguments comes back from tmux unquoted, with ` and > left as they are: restore must not hand
+# it to sh -c. A cc launcher's command, one string that tmux quotes, still comes back.
+printf '#!/bin/sh\ntouch %s/PWNED3\n' "$T" > "$T/pw"; chmod +x "$T/pw"; echo keep > "$T/clobber"
+printf '#!/bin/sh\necho "$*" >> %s/ccl.starts\nexec sleep 600\n' "$T" > "$T/fakecc"; chmod +x "$T/fakecc"
+X new-window -d -t main: -n evil1 -c "$T/w" env "X=x\`$T/pw\`" sleep 600
+X new-window -d -t main: -n evil2 -c "$T/w" env "X=x>$T/clobber" sleep 600
+X new-window -d -t main: -n ccl -c "$T/w" "$(printf 'CC_CLAUDE=%q %q __run %q %q %q' claude "$T/fakecc" demo row '')"
+upto 'inledger evil1 && inledger evil2 && inledger ccl && [ -s $T/ccl.starts ]'
+ev=$(python3 -c "import json; print(' '.join(x['name'] for x in json.load(open('$T/state/$SOCK.json'))['windows'] if x['name'] in ('evil1', 'evil2') and x['state'] == 'running' and x['cmd'] is None and x['start'].startswith('env X=x') and not set(x['start']) & set(chr(34) + chr(39) + chr(92))))")
+k "$([ "$ev" = "evil1 evil2" ] && echo 0 || echo 1)" "a running command of several arguments, tmux leaving its \` or > unquoted, is saved with no command: '$ev'"
+c0=$(calls); spid=$(X list-sessions -F '#{pid}' | head -1); kill -SEGV "$spid"; upto '! kill -0 $spid 2>/dev/null'
+rm -f "${T:?}/state/$SOCK.recovered"; boot
+upto '[ "$(calls)" = $((c0 + 1)) ]' && "$B" restore >/dev/null
+upto 'has ccl && [ "$(wc -l < $T/ccl.starts)" = 2 ]'; k $? "after a crash a hand restore relaunches a cc launcher's command (one quoted string): $(tail -1 "$T/ccl.starts")"
+upto 'grep -q "could not be recovered.*evil1" $T/state/$SOCK.log'
+k "$(! has evil1 && ! has evil2 && [ ! -e "$T/PWNED3" ] && [ "$(cat "$T/clobber")" = keep ] && grep -q 'could not be recovered.*evil2' "$T/state/$SOCK.log" && echo 0 || echo 1)" "…and the two are listed and logged, not run: no backtick command ran and no file was truncated"
+# panes() and the watcher, with tmux answering as it does mid-crash: stubbed, so each answer is exactly the one meant.
+d=$(python3 - "$B" "$T/imp" <<'P'
+import importlib.machinery, importlib.util, json, os, sys, types
+os.environ.update(CC_TMUX_LEDGER_DIR=sys.argv[2], CC_TMUX_LEDGER_SOCKET="imp")
+ld = importlib.machinery.SourceFileLoader("l", sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader("l", ld)); ld.exec_module(m)
+S, ans, lp, calls, cut = m.SEP, {}, [], [], [0]
+row = lambda p, w, dead="0": S.join([p, w, "main", "", "n" + w, "0", "1", "/", "sleep 9", dead])
+def tmux(*a, check=False):
+    calls.append(a[0])
+    if a[0] == "list-sessions":
+        rc, out = 0, "4242\n"
+    elif a[0] == "list-panes":   # each record ends in the token panes() put after the fields in its format
+        out = "".join(x + a[3][len(S.join(m.FIELDS)):] + "\n" for x in lp)
+        rc, out = 0, out[:len(out) - cut[0]]
+    else:
+        rc, out = ans[a[3]]
+    return types.SimpleNamespace(returncode=rc, stdout=out, stderr="")
+m.tmux = tmux
+# (a) the server dies partway: while a malformed record is read again, or mid-answer. No list, and the last whole
+# ledger stays as it was
+lp, ans = [row("%1", "@1"), S.join(["%2", "@2", "main"])], {"%2": (1, "")}
+led = json.dumps({"server_pid": 4242, "boot": m.BOOT, "saved": 1, "windows": []})
+with open(m.path("json"), "w") as f:
+    f.write(led)
+a = m.panes() is None and m.save() == 0 and open(m.path("json")).read() == led
+lp, cut[0] = [row("%1", "@1"), row("%4", "@4")], 5
+a = a and m.panes() is None and m.save() == 0 and open(m.path("json")).read() == led
+# (b) one list-panes for the lot; only a malformed record is read again. A pane that closed before that read (empty
+# fields, rc 0), a dead one and a grouped session's repeat are left out; the others are kept
+lp, cut[0] = [row("%1", "@1"), S.join(["%2", "@2"]), row("%3", "@3", "1"), row("%4", "@4"), row("%1", "@1")], 0
+ans = {"%2": (0, S * (len(m.FIELDS) - 1) + "\n")}
+calls.clear(); ps = m.panes()
+b = ([p[0] for p in ps] == ["@1", "@4"] and all(len(p) == len(m.FIELDS) - 2 for p in ps) and not m._SKIPPED
+     and calls == ["list-panes", "display"])
+# (c) a save that raises is logged and the watcher carries on until its server is gone
+pids = iter([4242, 4242, 4242])
+m.server_pid = lambda: next(pids, None)
+def save():
+    raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "stub")
+m.save, m.INTERVAL = save, 0
+c = m.watch() == 0 and open(m.path("log")).read().count("save failed, the watcher carries on") == 3
+print(*(int(not x) for x in (a, b, c)))
+P
+)
+read -r da db dc <<<"$d"
+k "${da:-1}" "a tmux answer cut off, or a re-read that fails, gives no pane list, and save leaves the last ledger as it was: $d"
+k "${db:-1}" "a save is one list-panes, a malformed record alone is read again, and a closed or dead pane is left out"
+k "${dc:-1}" "a save that raises is logged and the watcher carries on"
+# Two watchers finding the same crash at once (a second server start, a hand run): cc-recover is started once.
+d=$(python3 - "$B" "$T/race" <<'P'
+import json, os, subprocess, sys
+os.makedirs(sys.argv[2])
+env = dict(os.environ, CC_TMUX_LEDGER_DIR=sys.argv[2], CC_TMUX_LEDGER_SOCKET="race",
+           CC_TMUX_LEDGER_RECOVER=f"sh -c 'sleep 0.3; echo x >> {sys.argv[2]}/calls'")
+with open(f"{sys.argv[2]}/race.lost.json", "w") as f:
+    json.dump({"server_pid": 1, "boot": "", "saved": 1, "windows": [], "recover": "due"}, f)
+code = ("import importlib.machinery, importlib.util, sys; ld = importlib.machinery.SourceFileLoader('l', sys.argv[1]); "
+        "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('l', ld)); ld.exec_module(m); sys.exit(m.recover())")
+ps = [subprocess.Popen([sys.executable, "-c", code, sys.argv[1]], env=env) for _ in range(2)]
+rcs = [p.wait() for p in ps]
+calls = open(f"{sys.argv[2]}/calls").read().count("x") if os.path.exists(f"{sys.argv[2]}/calls") else 0
+state = json.load(open(f"{sys.argv[2]}/race.lost.json")).get("recover")
+print(int(not (rcs == [0, 0] and calls == 1 and state == "sent")), rcs, calls, state)
+P
+)
+k "${d%% *}" "two watchers that find the same crash at once start cc-recover exactly once: $d"
+# Unset, the command is the systemd unit (named only, never run here); a start that fails is logged and stays `sent`.
+d=$(python3 - "$B" "$T/fail" <<'P'
+import importlib.machinery, importlib.util, json, os, sys
+os.makedirs(sys.argv[2])
+os.environ.update(CC_TMUX_LEDGER_DIR=sys.argv[2], CC_TMUX_LEDGER_SOCKET="fail")
+os.environ.pop("CC_TMUX_LEDGER_RECOVER", None)
+ld = importlib.machinery.SourceFileLoader("l", sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader("l", ld)); ld.exec_module(m)
+a = m.recover_cmd() == ["systemctl", "--user", "start", "--no-block", "cc-recover-restore.service"]
+os.environ["CC_TMUX_LEDGER_RECOVER"] = "false"
+with open(m.path("lost.json"), "w") as f:
+    json.dump({"server_pid": 1, "boot": "", "saved": 1, "windows": [], "recover": "due"}, f)
+b = (m.recover() == 0 and "cc-recover could not be started (rc=1" in open(m.path("log")).read()
+     and json.load(open(m.path("lost.json")))["recover"] == "sent")
+print(int(not a), int(not b))
+P
+)
+read -r da db <<<"$d"
+k "${da:-1}" "with no override the watcher starts cc-recover-restore.service through systemctl --user, without waiting"
+k "${db:-1}" "a cc-recover that cannot be started is logged, and the crash is not started again"
+# decode never guesses: tmux's quoting is reversed exactly or the command is listed instead.
+d=$(python3 - "$B" <<'P'
+import importlib.machinery, importlib.util, sys
+ld = importlib.machinery.SourceFileLoader("l", sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader("l", ld)); ld.exec_module(m)
+cases = [('"a \\"b\\" \\$x `y` \\\\z"', 'a "b" $x `y` \\z'), ("plain", "plain"), ("'a \"b'", 'a "b'),
+         ('"a\\nb"', None), ('"a" "b"', None), ('"\\342\\200\\224"', None),
+         ("tail -f /dev/null x`id`", None), ("tail -f /dev/null x>/home/u/.bashrc", None), ("a x<y", None),
+         ("a (y)", None), ("a x*", None), ("a x?", None), ("a x!y", None), ("a x\ty", None), ("a ~x", None), ("", None),
+         ("tail -f /dev/null x", "tail -f /dev/null x"), ("/home/u/bin/cc-rc", "/home/u/bin/cc-rc"),
+         ('"CC_CLAUDE=claude /home/u/bin/cc __run demo row \'\'"', "CC_CLAUDE=claude /home/u/bin/cc __run demo row ''")]
+print(sum(m.decode(s) != want for s, want in cases))
+P
+)
+k "$([ "$d" = 0 ] && echo 0 || echo 1)" "decode reverses tmux's quoting and refuses what it cannot reverse exactly"
+echo "cc-tmux-ledger selfcheck: $((n - f)) passed, $f failed"
+[ "$f" -eq 0 ]
+'''
+
+
+def selfcheck():
+    for k in ("TMUX", "CC_SLACK_ALIAS"):
+        os.environ.pop(k, None)
+    return subprocess.run(["bash", "-c", SELFCHECK, "selfcheck", os.path.abspath(__file__)]).returncode
+
+
+def main(a):
+    cmd = a[0] if a else ""
+    for s in (sys.stdout, sys.stderr):   # a window name that is not UTF-8 must not make a print raise
+        s.reconfigure(errors="backslashreplace")
+    if cmd == "save":
+        return save()
+    if cmd == "watch":
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        return watch()
+    if cmd == "restore":
+        return restore()
+    if cmd == "list":
+        return listing()
+    if cmd == "forget":
+        return forget()
+    if cmd == "selfcheck":
+        return selfcheck()
+    print("usage: cc-tmux-ledger save | watch | restore | list | forget | selfcheck", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

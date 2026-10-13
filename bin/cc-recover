@@ -58,7 +58,9 @@ due, so turning it on during an outage acts on the next tick. A reboot command t
 records no reboot; it is tried again 10 min later, at most 3 times an episode. The network interface, the rescue
 address, the hotspot and the firewall are never touched — the detector only reads.
 
-RESTORE: it marks itself running before it reads the saved set, so no tick rewrites that set until it ends. Then
+RESTORE: it takes ~/.cc/recover/.lock without waiting and holds it to the end, so of two restores started at once
+(cc-tmux-ledger's watcher after a tmux crash and the detector, say, or `cc-tmux-ledger restore` by hand) the second
+logs that and does nothing. It marks itself running before it reads the saved set, so no tick rewrites that set until it ends. Then
 the tmux server (cc-boot), then the network (up to 15 min by the wall clock: claude needs it), then each saved
 session in turn, seats → orchs → members → tracks → workers, 20 s apart. One already live is left alone. Each
 non-worker gets a catch-up message once its claude is up (cc-msg; a track or member track by `cc <repo> <track> --say`); a worker
@@ -94,13 +96,16 @@ CC_RECOVER_SETTLE (15 s from a claude coming up to its catch-up). Fixtures only:
 CC_RECOVER_TMUX, CC_RECOVER_PROC, CC_RECOVER_BIN (where cc, cc-msg, cc-boot, cc-notify are), CC_RECOVER_REBOOT_CMD,
 CC_RECOVER_RESTORE_CMD, CC_RECOVER_MANAGER_CMD.
 """
-import calendar, json, math, os, random, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time
+import calendar, fcntl, json, math, os, random, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 # Box-owned, like ~/.cc/lander and ~/.cc/steward: never under ~/.cc/state/<name>, because a member workspace binds
 # ~/.cc/state/<its handle> read-write, and a member whose handle were `recover` would own the set a restore runs.
 STATE_HOME = os.path.join(HOME, ".cc/recover")
 STATE = os.environ.get("CC_RECOVER_STATE") or STATE_HOME
+# One restore at a time, whoever starts it: the boot unit, the detector, cc-tmux-ledger's watcher after a tmux crash,
+# a hand run. Under $HOME always, never CC_RECOVER_STATE, because `cc-tmux-ledger restore` takes the same lock.
+LOCK = os.path.join(STATE_HOME, ".lock")
 DEV = os.path.join(HOME, "dev")                        # a saved repo must be a directory here
 CLAUDE = os.path.join(HOME, ".local/bin/claude")       # the one claude a restore runs (cc's own default)
 PROC = os.environ.get("CC_RECOVER_PROC") or "/proc"
@@ -738,10 +743,35 @@ def run(argv_, env=None, timeout=120):
         return 127, str(e)
 
 
+def take_lock():
+    """LOCK, taken without waiting: an open fd while this process holds it, None while another holder has it."""
+    own_dir(os.path.dirname(LOCK))
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def restore(boot=False):
     if cfg("CC_RECOVER_RESTORE", "on") == "off":
         log("restore.log", "CC_RECOVER_RESTORE is off — nothing restored")
         return 0
+    # two triggers at once (a tmux crash's watcher and the detector's mass loss) must start each session once: the
+    # restoring guard below is a check then a write, so two could both pass it, and the lock closes that gap
+    held = take_lock()
+    if held is None:
+        log("restore.log", "another cc-recover holds the lock — this one does nothing")
+        return 0
+    try:
+        return restore_locked(boot)
+    finally:
+        os.close(held)
+
+
+def restore_locked(boot):
     # restoring() drops a guard left from before a restart (the --boot case after a power cut mid-restore), so
     # only a restore running in this boot, on the very process the guard names, stops this one
     if restoring():
@@ -1102,7 +1132,7 @@ def status():
 # ---- selftest ----
 
 def selfcheck():
-    global STATE, PROC, TMUX, BIN, DEV, CLAUDE
+    global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK
     fails, passed, made = [], [0], []
 
     def check(name, cond):
@@ -1114,10 +1144,11 @@ def selfcheck():
 
     def fixture():
         """A fresh state dir, fake /proc, fake tmux and fake bin of its own: no case reads another's leftovers."""
-        global STATE, PROC, TMUX, BIN, DEV, CLAUDE, CCSTATE, MEMBERS
+        global STATE, PROC, TMUX, BIN, DEV, CLAUDE, LOCK, CCSTATE, MEMBERS
         d = tempfile.mkdtemp(prefix="cc-recover-st.")
         made.append(d)
         STATE, PROC, BIN, DEV, CLAUDE = f"{d}/state", f"{d}/proc", f"{d}/bin", f"{d}/dev", "/c/claude"
+        LOCK = f"{d}/lock/.lock"   # never the real ~/.cc/recover/.lock: a selfcheck must not stop a real restore
         CCSTATE, MEMBERS = f"{d}/ccstate", f"{d}/members"
         for x in (PROC, BIN, f"{PROC}/sys/kernel/random", f"{PROC}/net", *(f"{DEV}/{r}" for r in ("r1", "r2", "r3", "m1"))):
             os.makedirs(x, exist_ok=True)
@@ -1470,6 +1501,55 @@ def selfcheck():
         restore(boot=True)
         check("restore --boot: an old-format guard naming a live pid does not stop it",
               os.path.exists(f"{d}/calls") and "cc|" in open(f"{d}/calls").read())
+
+        # 8b. the lock: a restore while another holds it launches nothing
+        d = fixture(); live_box(d); save({})
+        open(f"{d}/windows.tsv", "w").write("box\t160\n")
+        os.makedirs(os.path.dirname(LOCK), mode=0o700)
+        other = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(other, fcntl.LOCK_EX)
+        rc = restore(boot=True)
+        os.close(other)
+        check("restore: while another holds the lock, a restore exits 0, says so and launches nothing",
+              rc == 0 and (not os.path.exists(f"{d}/calls") or "cc|" not in open(f"{d}/calls").read())
+              and "another cc-recover holds the lock" in open(path("restore.log")).read())
+        check("restore: the selfcheck's lock is its fixture's, never the real one", LOCK.startswith(d + "/"))
+        # two restores started at the same moment, as two processes on one $HOME: the session starts exactly once
+        d = fixture()
+        home_state = f"{d}/.cc/recover"
+        os.makedirs(home_state, mode=0o700)
+        rec = {"kind": "worker", "window": "r1/job", "repo": "r1", "track": "job", "loop": "1", "flags": []}
+        with open(f"{home_state}/live.json", "w") as f:
+            json.dump({"saved": iso(now()), "sessions": {"r1/job": rec}}, f)
+        with open(f"{BIN}/cc", "w") as f:   # marks that it began, waits for go, then starts the session once
+            f.write(f"#!/bin/sh\ntouch {d}/began\nwhile [ ! -f {d}/go ]; do sleep 0.05; done\n"
+                    f"echo x >> {d}/starts\nprintf 'r1/job\\t1\\n' >> {d}/windows.tsv\n")
+        os.chmod(f"{BIN}/cc", 0o755)
+        srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(8)   # the network probe connects here: "up"
+        env = {k: v for k, v in os.environ.items() if k not in ("CC_RECOVER_STATE", "CC_SLACK_ALIAS", "CC_CLAUDE", "CC_RECOVER_RESTORE_CMD")}
+        env.update(HOME=d, CC_RECOVER_BIN=BIN, CC_RECOVER_TMUX=TMUX, CC_RECOVER_PROC=PROC, CC_RECOVER_RESTORE="on",
+                   CC_RECOVER_PROBES=f"127.0.0.1:{srv.getsockname()[1]}", CC_RECOVER_STAGGER="0", CC_RECOVER_SETTLE="0")
+        me = os.path.realpath(__file__)
+        ps = [subprocess.Popen([sys.executable, me, "restore"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              for _ in range(2)]
+        first, end = None, time.monotonic() + 30
+        while first is None and time.monotonic() < end:
+            first = next((p for p in ps if p.poll() is not None), None)
+            real["sleep"](0.05)
+        began = os.path.exists(f"{d}/began")
+        open(f"{d}/go", "w").close()
+        try:
+            rcs = [p.wait(timeout=60) for p in ps]
+        except subprocess.TimeoutExpired:
+            rcs = None
+            for p in ps:
+                p.kill()
+        srv.close()
+        rlog = open(f"{home_state}/restore.log").read() if os.path.exists(f"{home_state}/restore.log") else ""
+        starts = open(f"{d}/starts").read().count("x") if os.path.exists(f"{d}/starts") else 0
+        check(f"restore: two started at once on one $HOME start the session exactly once (starts={starts} rcs={rcs})",
+              first is not None and began and rcs == [0, 0] and starts == 1
+              and rlog.count("another cc-recover holds the lock") == 1 and rlog.count("r1/job: worker launch rc=0") == 1)
 
         # 9. the saved set is a file, so every record is checked before anything runs from it
         check("state: the saved set lives outside ~/.cc/state/<name>, which a member handle can own",

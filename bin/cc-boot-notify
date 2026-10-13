@@ -3,16 +3,27 @@
 # previous boot ended cleanly or by power loss / hard reset, and how long it was dark (from cc-heartbeat); and one
 # per user-manager restart inside a boot (cc-heartbeat's cause=user-manager-restart line), with how long it was dark.
 # After a boot's message, `cc-units check`: a declared unit that is down or never enabled goes to the planning seat (--ask).
+# Every later run in the same boot runs that check too, notice or none: a fresh user manager (a crash, a TERM) starts
+# default.target and so this unit again, and units it brought back half-way are said once per manager pid. A
+# `daemon-reexec` keeps the manager's pid and every unit's state and queues no default job, so it runs nothing here.
+# The manager pid is $MANAGERPID, or in a terminal run the MainPID of user@<uid>.service from `systemctl show` (the
+# manager object itself has no MainPID). A pid neither gives is unknown: it is written into no stamp, and the ask is
+# keyed on the last restart cc-heartbeat logged. A re-run under the boot's own manager (install.sh re-enable, a manual
+# start) asks under the boot ask's id, so nothing new is asked; a boot announced before boot-manager was written knows
+# its manager by age (started within 5 min of the kernel). A run waits up to 15 s for cc-heartbeat's restart line only under a new manager that may yet log one: not under
+# the boot's manager, the one whose restart was already said, or one up longer than cc-heartbeat's 5 min.
 # The "announced" stamp is written only after cc-notify accepts the message, so a boot whose network never
 # came back stays unannounced and is retried by the next `systemctl --user start cc-boot-notify` (the unit
 # runs with TimeoutStartSec=infinity: the wait-for-network + retries can outlast any finite timeout).
-# `cc-boot-notify selfcheck` proves the restart notice in a scratch HOME, with a cc-notify stub that records its call.
+# `cc-boot-notify selfcheck` proves the restart notice and the unit check after it in a scratch HOME, with cc-notify,
+# cc-units, systemctl and ps stubs (cc-notify records its call).
 set -uo pipefail
 if [ "${1:-}" = selfcheck ]; then
   n=0 f=0; k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   H=$(mktemp -d); trap 'rm -rf "$H"' EXIT; mkdir -p "$H/bin" "$H/.cc/state"
   printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s/calls"; echo >> "%s/calls"; [ ! -e "%s/down" ]\n' "$H" "$H" "$H" > "$H/bin/cc-notify"
-  chmod +x "$H/bin/cc-notify"
+  printf '#!/bin/sh\nexit 0\n' > "$H/bin/cc-units"; printf '#!/bin/sh\n[ "$*" = "show -p MainPID --value user@%s.service" ] && echo 5151\n' "$(id -u)" > "$H/bin/systemctl"   # every unit up
+  chmod +x "$H/bin/cc-notify" "$H/bin/cc-units" "$H/bin/systemctl"; export PATH="$H/bin:$PATH"; unset MANAGERPID
   cat /proc/sys/kernel/random/boot_id > "$H/.cc/state/boot-announced"   # this boot is announced: only a restart is said
   echo '2026-10-02T14:01:57Z restart=2026-10-02T14:01:57Z last_alive=2026-10-02T09:30:10Z gap=16307s cause=user-manager-restart' \
     > "$H/.cc/state/power-events.log"
@@ -20,37 +31,104 @@ if [ "${1:-}" = selfcheck ]; then
   want="-t|box restart|-p|high|The user manager restarted at 14:01 without a reboot, so every session and user service had stopped: the box was dark 4h 31m, from the last heartbeat at 09:30.|"
   c=0; [ "$rc" = 0 ] && [ "$(cat "$H/calls")" = "$want" ] || c=1; k "$c" "a user-manager restart in an announced boot is said once, high priority, with how long the box was dark"
   c=0; [ "$(cat "$H/.cc/state/manager-restart-announced" 2>/dev/null)" = 2026-10-02T14:01:57Z ] || c=1; k "$c" "…and its stamp is kept"
-  out=$(HOME=$H TZ=UTC CC_BOX=box "$0" 2>&1); rc=$?
-  c=0; [ "$rc" = 0 ] && [ "$(wc -l < "$H/calls")" = 1 ] || c=1; k "$c" "…and a second run in the same boot says nothing more"
+  s=$SECONDS; out=$(HOME=$H TZ=UTC CC_BOX=box "$0" 2>&1); rc=$?
+  c=0; [ "$rc" = 0 ] && [ "$(wc -l < "$H/calls")" = 1 ] && [ $((SECONDS - s)) -lt 5 ] || c=1
+  k "$c" "…and a second run in the same boot under that manager says nothing more, without waiting for a new line"
   echo '2026-10-02T15:00:00Z restart=2026-10-02T15:00:00Z last_alive=2026-10-02T14:58:00Z gap=120s cause=user-manager-restart' \
     >> "$H/.cc/state/power-events.log"; touch "$H/down"
   out=$(HOME=$H TZ=UTC CC_BOX=box "$0" 2>&1); rc=$?
   [ "$rc" = 1 ] && [ "$(cat "$H/.cc/state/manager-restart-announced")" = 2026-10-02T14:01:57Z ] && grep -q 'later run retries' <<<"$out"
   k $? "a later restart no channel takes exits 1 and keeps the old stamp, so a later run retries it"
   grep -q 'dark 2m,' "$H/calls"; k $? "…and its notice gave the gap in minutes"
+  # a unit a manager left down, in a scratch HOME of its own: the boot's manager (4242) asks under the boot ask's id, a
+  # manager up 999 s (4343) asks at once, a young one (4444) asks after its notice; terminal runs get 4444 from systemctl
+  U=$(mktemp -d); trap 'rm -rf "$H" "$U"' EXIT; mkdir -p "$U/bin" "$U/.cc/state"; printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s/calls"; echo >> "%s/calls"\n' "$U" "$U" > "$U/bin/cc-notify"
+  printf '#!/bin/sh\necho "cc-library.service=inactive"; exit 1\n' > "$U/bin/cc-units"; printf '#!/bin/sh\n[ "$*" = "show -p MainPID --value user@%s.service" ] && echo 4444\n' "$(id -u)" > "$U/bin/systemctl"
+  # shellcheck disable=SC2016  # $4 is the stub's own argument
+  printf '#!/bin/sh\n[ "$4" = 4343 ] && echo 999 || echo 30\n' > "$U/bin/ps"; chmod +x "$U/bin/"*; b=$(cat /proc/sys/kernel/random/boot_id)
+  echo "$b" > "$U/.cc/state/boot-announced"; echo "$b 4242" > "$U/.cc/state/boot-manager"; echo 2026-10-02T14:01:57Z > "$U/.cc/state/manager-restart-announced"
+  echo '2026-10-02T14:01:57Z restart=2026-10-02T14:01:57Z last_alive=2026-10-02T09:30:10Z gap=16307s cause=user-manager-restart' \
+    > "$U/.cc/state/power-events.log"
+  u(){ rm -f "$U/calls"; s=$SECONDS; HOME=$U PATH="$U/bin:$PATH" TZ=UTC CC_BOX=box "$@" "$0" >/dev/null 2>&1; rc=$?; t=$((SECONDS - s)); }
+  u env MANAGERPID=4242
+  c=0; [ "$rc" = 0 ] && [ "$t" -lt 5 ] && [ "$(cat "$U/calls")" = "--ask|-t|units down after a user-manager restart|--id|units-boot:$b|cc-library.service=inactive|" ] || c=1
+  k "$c" "a re-run under the boot's own manager asks under the boot ask's id, so nothing new is asked, and does not wait"
+  u env MANAGERPID=4343
+  c=0; [ "$rc" = 0 ] && [ "$t" -lt 5 ] && [ "$(wc -l < "$U/calls")" = 1 ] && grep -q "^--ask|.*|units-restart:$b:4343|" "$U/calls" || c=1
+  k "$c" "a new manager up longer than 5 min (no restart line can come) is asked under its pid at once"
+  echo '2026-10-02T15:00:00Z restart=2026-10-02T15:00:00Z last_alive=2026-10-02T14:58:00Z gap=120s cause=user-manager-restart' >> "$U/.cc/state/power-events.log"
+  u env MANAGERPID=4444
+  c=0; [ "$rc" = 0 ] && [ "$(wc -l < "$U/calls")" = 2 ] && grep -q '^-t|box restart|' "$U/calls" \
+    && [ "$(sed -n 2p "$U/calls")" = "--ask|-t|units down after a user-manager restart|--id|units-restart:$b:4444|cc-library.service=inactive|" ] || c=1
+  k "$c" "after a restart notice, a unit cc-units finds down is asked once, under the manager's pid"
+  u env -u MANAGERPID
+  c=0; [ "$rc" = 0 ] && [ "$t" -lt 5 ] && [ "$(wc -l < "$U/calls")" = 1 ] && grep -q "^--ask|.*|units-restart:$b:4444|" "$U/calls" || c=1
+  k "$c" "…and a terminal run (no MANAGERPID) takes the manager's MainPID from systemctl, the same id, without waiting"
+  printf '#!/bin/sh\nexit 0\n' > "$U/bin/cc-units"; u env MANAGERPID=4444
+  c=0; [ "$rc" = 0 ] && [ ! -e "$U/calls" ] || c=1; k "$c" "…and with every unit up nothing is asked"
+  # a pid nothing gives (systemctl answers empty): no stamp says "none", and the ask is keyed on the last logged restart
+  printf '#!/bin/sh\necho "cc-library.service=inactive"; exit 1\n' > "$U/bin/cc-units"; printf '#!/bin/sh\n' > "$U/bin/systemctl"
+  echo '2026-10-02T16:00:00Z restart=2026-10-02T16:00:00Z last_alive=2026-10-02T15:58:00Z gap=120s cause=user-manager-restart' >> "$U/.cc/state/power-events.log"
+  u env -u MANAGERPID
+  c=0; [ "$rc" = 0 ] && grep -q '^-t|box restart|' "$U/calls" && grep -q "^--ask|.*|units-restart:$b:at-2026-10-02T16:00:00Z|" "$U/calls" \
+    && ! grep -q none "$U/.cc/state/boot-manager" "$U/.cc/state/manager-restart-announced.manager" || c=1
+  k "$c" "an unknown manager pid is written into no stamp, and its ask is keyed on the last logged restart"
+  # a boot announced before boot-manager existed: its own manager (started with the kernel) asks under the boot ask's id
+  P=$(mktemp -d); trap 'rm -rf "$H" "$U" "$P"' EXIT; mkdir -p "$P/.cc/state"; cp -r "$U/bin" "$P/bin"; echo "$b" > "$P/.cc/state/boot-announced"
+  printf '#!/bin/sh\nprintf "%%s|" "$@" >> "%s/calls"; echo >> "%s/calls"\n' "$P" "$P" > "$P/bin/cc-notify"
+  # shellcheck disable=SC2016  # $4 is the stub's own argument
+  printf '#!/bin/sh\nu=$(cut -d. -f1 /proc/uptime); [ "$4" = 5555 ] && echo $((u - 20)) || echo 30\n' > "$P/bin/ps"
+  HOME=$P PATH="$P/bin:$PATH" TZ=UTC CC_BOX=box MANAGERPID=5555 "$0" >/dev/null 2>&1; rc=$?
+  c=0; [ "$rc" = 0 ] && [ "$(cat "$P/calls")" = "--ask|-t|units down after a user-manager restart|--id|units-boot:$b|cc-library.service=inactive|" ] || c=1
+  echo '2026-10-02T17:00:00Z restart=2026-10-02T17:00:00Z last_alive=2026-10-02T16:58:00Z gap=120s cause=user-manager-restart' >> "$P/.cc/state/power-events.log"
+  rm -f "$P/calls"; HOME=$P PATH="$P/bin:$PATH" TZ=UTC CC_BOX=box MANAGERPID=6666 "$0" >/dev/null 2>&1
+  grep -q "^--ask|.*|units-restart:$b:6666|" "$P/calls" || c=1
+  k "$c" "a boot announced before boot-manager existed asks its own manager under the boot ask's id, and a later one under its pid"
   echo "cc-boot-notify selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ]; exit $?
 fi
 log="$HOME/.cc/state/power-events.log"
 notify="$HOME/bin/cc-notify"
-# announce each boot exactly once: a re-run in the same boot (installer re-enable, manual start) must stay silent
+# announce each boot exactly once: a re-run in the same boot (installer re-enable, manual start) says nothing of the boot
 stamp="$HOME/.cc/state/boot-announced"; bootid=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || uptime -s)
+mpid=${MANAGERPID:-$(systemctl show -p MainPID --value "user@$(id -u).service" 2>/dev/null)}; [ "${mpid:-0}" != 0 ] || mpid=""
+bootmgr="$HOME/.cc/state/boot-manager"   # "<boot id> <manager pid>" of the run that announced the boot
 [ -x "$notify" ] || { echo "cc-boot-notify: $notify is missing — nothing announced" >&2; exit 1; }
 # …except a user-manager restart inside the boot: every session and user service stopped with it (2026-10-01 and
 # 10-02: a test TERMed the manager, and the 10-02 one went unsaid for 4.5 h). cc-heartbeat logs it as one
 # cause=user-manager-restart line; that line is said once, high priority, with how long the box was dark.
 if [ "$(cat "$stamp" 2>/dev/null)" = "$bootid" ]; then
-  mstamp="$HOME/.cc/state/manager-restart-announced"; line=""
+  mstamp="$HOME/.cc/state/manager-restart-announced"; line=""; known=""
+  # no new restart line can come under the boot's manager, one whose restart was already said, or one cc-heartbeat
+  # no longer counts as fresh (it logs a restart only under a manager up less than 5 min)
+  if [ -n "$mpid" ]; then
+    up=$(ps -o etimes= -p "$mpid" 2>/dev/null | tr -d ' '); [[ "$up" =~ ^[0-9]+$ ]] || up=0
+    bm=$(cat "$bootmgr" 2>/dev/null)
+    [ "$bm" = "$bootid $mpid" ] && known=boot
+    # a boot announced before boot-manager was written: the boot's manager is the one that started with the kernel
+    [ "${bm%% *}" != "$bootid" ] && [ "$up" -ge $(( $(cut -d. -f1 /proc/uptime) - 300 )) ] && known=boot
+    [ "$(cat "$mstamp.manager" 2>/dev/null)" = "$bootid $mpid" ] && known=${known:-said}
+    [ "$up" -gt 300 ] && known=${known:-old}
+  fi
   for _ in $(seq 1 15); do
     line=$(grep 'cause=user-manager-restart' "$log" 2>/dev/null | tail -n1)
-    [ -n "$line" ] && [ "${line%% *}" != "$(cat "$mstamp" 2>/dev/null)" ] && break; line=""; sleep 1
+    [ -n "$line" ] && [ "${line%% *}" != "$(cat "$mstamp" 2>/dev/null)" ] && break; line=""; [ -z "$known" ] || break; sleep 1
   done
-  [ -n "$line" ] || exit 0
-  alive=$(sed -n 's/.*last_alive=\([^ ]*\).*/\1/p' <<<"$line"); gap=$(sed -n 's/.*gap=\([0-9]*\)s.*/\1/p' <<<"$line")
-  dark="$((gap / 3600))h $((gap % 3600 / 60))m"; [ "$gap" -ge 3600 ] || dark="$((gap / 60))m"
-  msg="The user manager restarted at $(date -d "${line%% *}" +%H:%M) without a reboot, so every session and user service had stopped: the box was dark ${dark}, from the last heartbeat at $(date -d "$alive" +%H:%M)."
-  "$notify" -t "${CC_BOX:-$(hostname -s)} restart" -p high "$msg" || { echo "cc-boot-notify: no channel took the restart notice — a later run retries" >&2; exit 1; }
-  printf '%s\n' "$msg"; printf '%s\n' "${line%% *}" > "$mstamp"; exit 0
+  if [ -n "$line" ]; then
+    alive=$(sed -n 's/.*last_alive=\([^ ]*\).*/\1/p' <<<"$line"); gap=$(sed -n 's/.*gap=\([0-9]*\)s.*/\1/p' <<<"$line")
+    dark="$((gap / 3600))h $((gap % 3600 / 60))m"; [ "$gap" -ge 3600 ] || dark="$((gap / 60))m"
+    msg="The user manager restarted at $(date -d "${line%% *}" +%H:%M) without a reboot, so every session and user service had stopped: the box was dark ${dark}, from the last heartbeat at $(date -d "$alive" +%H:%M)."
+    "$notify" -t "${CC_BOX:-$(hostname -s)} restart" -p high "$msg" || { echo "cc-boot-notify: no channel took the restart notice — a later run retries" >&2; exit 1; }
+    printf '%s\n' "$msg"; printf '%s\n' "${line%% *}" > "$mstamp"
+    [ -z "$mpid" ] || printf '%s %s\n' "$bootid" "$mpid" > "$mstamp.manager"
+  fi
+  # #922's boot check, after a restart too: a quick one (a minute or less dark) logs no line but stops every unit all
+  # the same. The id is the manager's pid, so a re-run under the same manager (install.sh, a retry) asks nothing new;
+  # under the boot's own manager it is the boot ask's id, and with no pid known it is the last restart cc-heartbeat logged.
+  id="units-restart:$bootid:$mpid"; [ "$known" = boot ] && id="units-boot:$bootid"
+  if [ -z "$mpid" ]; then last=$(grep 'cause=user-manager-restart' "$log" 2>/dev/null | tail -n1); id="units-restart:$bootid:at-${last%% *}"; fi
+  units=$("$HOME/bin/cc-units" check 2>&1) || "$notify" --ask -t "units down after a user-manager restart" --id "$id" "$units" || true
+  exit 0
 fi
 hhmmss() { local t=${1#*T}; printf '%s' "${t%Z}"; }   # 2026-08-27T04:05:06Z -> 04:05:06 (the message says UTC once)
 boot=$(date -u -d "$(uptime -s)" +%FT%TZ)
@@ -85,7 +163,7 @@ for i in 1 2 3 4 5 6; do
 done
 printf '%s\n' "$msg"
 [ "$posted" = 1 ] || { echo "cc-boot-notify: no channel took the message — leaving this boot unannounced so a later run retries" >&2; exit 1; }
-printf '%s\n' "$bootid" > "$stamp"
+printf '%s\n' "$bootid" > "$stamp"; [ -z "$mpid" ] || printf '%s %s\n' "$bootid" "$mpid" > "$bootmgr"
 # …then whether every declared unit came back. A unit linked but never enabled does not survive a restart, and the
 # planning seat is the one that switches it on (the library editor stayed down 3.5 h after the 10-01 restart).
 units=$("$HOME/bin/cc-units" check 2>&1) || "$notify" --ask -t "units down after boot" --id "units-boot:$bootid" "$units" || true

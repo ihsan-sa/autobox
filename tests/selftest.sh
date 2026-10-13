@@ -777,6 +777,7 @@ printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_t
 if stanza "cc-context (the real number, and what refuses to run without it)"; then
 chk cc-context
 chk cc-statusline   # the harness's own per-turn file cc-context prefers over its transcript estimate
+chk cc-tmux-ledger   # a real scratch tmux server killed with SIGSEGV: the next server starts cc-recover once, and a hand restore brings back what was running
 chk cc-sandbox   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
 chk cc-bench-grade   # the container filter, on a fake daemon: nothing reaches the real one
 chk cc-egress   # the worker's only way out: listed hosts tunnel, the rest 403, and the in-sandbox forwarder
