@@ -14,6 +14,7 @@ def run_selfcheck():
     _real_can_reload = can_reload
     _real = {"win_id": win_id, "pane_live": pane_live, "pane_live_id": pane_live_id, "pane_claude": pane_claude}   # the real-tmux case
     _real_measure = measure_seat   # the real one: the rotation cases stub measure_seat and check one refusal of the real
+    _real_seat_of = seat_of        # ...and seat_of, whose session-file read one case below runs for real
     p = f = 0
 
     def ok(what, cond):
@@ -1546,6 +1547,101 @@ def run_selfcheck():
                    (_real_measure("rt9", "", True) or {}).get("rotate") is True)
                 ok("...and bound to a seat that started after it, nothing there is measurable: a FRESH no-id seat is not rotated",
                    _real_measure("rt9", "", True, time.time() - 60) is None)
+            finally:
+                for k, v in keep.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+            # ---- A SEAT NO WINDOW HOLDS: the brief (2026-10-12) — "make the rotation sweep find a past-the-line seat
+            # by its pid/session file when the pane id is missing, instead of skipping it silently. When a seat can't
+            # be rotated, it should say so once in the planning seat's events." Each case writes its own session
+            # file and /proc entry, and asserts both the seat that is reported and the one left alone.
+            for k in [k for k in wins if k.startswith("rt")]:
+                del wins[k]
+            sessd, procd = os.path.join(d, "pl-sessions"), os.path.join(d, "pl-proc")
+            os.makedirs(sessd, exist_ok=True)
+            keep = {k: os.environ.get(k) for k in ("CC_HANDOFF_SESSIONS", "CC_HANDOFF_PROC", "CC_BOX")}
+            os.environ.update({"CC_HANDOFF_SESSIONS": sessd, "CC_HANDOFF_PROC": procd, "CC_BOX": "boxp"})
+
+            def sess(pid, sid, used=0, rotate=False, kind="interactive", entry="cli", argv=("claude",), start="777",
+                     filestart=None):
+                os.makedirs(os.path.join(procd, str(pid)), exist_ok=True)
+                with open(os.path.join(procd, str(pid), "stat"), "w") as fh:   # field 22 is the 20th after ")"
+                    fh.write(f"{pid} (claude) S " + " ".join(["0"] * 18) + f" {start} 0\n")
+                with open(os.path.join(procd, str(pid), "cmdline"), "wb") as fh:
+                    fh.write("\0".join(argv).encode() + b"\0")
+                with open(os.path.join(sessd, f"{pid}.json"), "w") as fh:
+                    json.dump({"pid": pid, "sessionId": sid, "cwd": "/dev/pl", "kind": kind, "entrypoint": entry,
+                               "procStart": filestart or start}, fh)
+                meas[sid] = {"used": used, "rotate_line": 200000, "rotate": rotate, "pct": 0}
+
+            def told(sid):
+                return [m for m in msgs if m[0].endswith("cc-broker") and m[1:4] == ["ledger", "--once", "boxp"]
+                        and sid in m[4]]
+            try:
+                sess(901, "sid-pl-live", start="555")
+                sess(902, "sid-pl-reused", start="556", filestart="111")
+                ok("a session file is read for the process it names: the pid and its start agree",
+                   session_file("901").get("sessionId") == "sid-pl-live")
+                ok("...and a file a dead pid left behind says nothing about the process that reused the number",
+                   session_file("902") == {})
+                # the real seat_of, on this very process as the pane's claude: its argv carries no id, so the id is
+                # the session file's or nothing
+                mine, pc = os.path.join(sessd, f"{os.getpid()}.json"), pane_claude
+                os.environ.pop("CC_HANDOFF_PROC")
+                pane_claude = lambda wid: str(os.getpid())
+                try:
+                    ok("seat_of with no session file and no id on the command line has no id", _real_seat_of("@x")[0] == "")
+                    with open(mine, "w") as fh:
+                        json.dump({"pid": os.getpid(), "sessionId": "sid-pl-me", "kind": "interactive",
+                                   "procStart": open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19]}, fh)
+                    ok("...and with one, the session it names is the seat's id", _real_seat_of("@x")[0] == "sid-pl-me")
+                finally:
+                    pane_claude = pc
+                    os.environ["CC_HANDOFF_PROC"] = procd
+                    os.path.exists(mine) and os.remove(mine)
+
+                sess(911, "sid-pl-over", used=283000, rotate=True)       # the architect: 283k, no window holds it
+                sess(912, "sid-pl-under", used=150000, rotate=False)     # under the line: nothing to say
+                msgs.clear(); sweep(True)
+                ok("a past-the-line seat no window holds is said once in the box planning seat's events, and opens nothing",
+                   len(told("sid-pl-over")) == 1 and "283k" in told("sid-pl-over")[0][4] and read("pl") is None
+                   and os.path.exists(os.path.join(HANDOFF, "unrotatable-sid-pl-over")))
+                ok("...and one under the line is not mentioned", not told("sid-pl-under")
+                   and not os.path.exists(os.path.join(HANDOFF, "unrotatable-sid-pl-under")))
+                msgs.clear(); mcalls.clear(); sweep(True)
+                ok("...ONCE: the next sweep neither says it again nor measures it", not told("sid-pl-over")
+                   and ("", "sid-pl-over", False) not in mcalls)
+
+                sess(921, "sid-pl-iter", used=300000, rotate=True, entry="sdk-cli", argv=("claude", "-p", "x"))
+                sess(922, "sid-pl-perms", used=600000, rotate=True, argv=("claude", PERMS_FLAG))
+                sess(923, "sid-pl-ctl", used=300000, rotate=True)        # the control beside them: reported
+                msgs.clear(); sweep(True)
+                ok("a worker's -p iteration and the perms seat are never reported, while the control beside them is",
+                   not told("sid-pl-iter") and not told("sid-pl-perms") and len(told("sid-pl-ctl")) == 1)
+
+                seat("rtp/held", "sid-pl-held", used=150000, rotate=False)   # a window holds this one
+                sess(931, "sid-pl-held", used=150000, rotate=False)
+                sess(932, "sid-pl-free", used=150000, rotate=False)
+                mcalls.clear(); sweep(True)
+                ok("a session a window holds is measured through its window, not again as one no window holds",
+                   any(c[:2] == ("rtp/held", "sid-pl-held") for c in mcalls) and ("", "sid-pl-held", False) not in mcalls
+                   and ("", "sid-pl-free", False) in mcalls)
+                del wins["rtp/held"]
+
+                sess(941, "sid-pl-down", used=300000, rotate=True)
+                real_run = run
+                run = lambda argv, wait=True: False if argv[0].endswith("cc-broker") else real_run(argv, wait)
+                try:
+                    sweep(True)
+                    ok("a broker that refused leaves no stamp, so the next tick says it",
+                       not os.path.exists(os.path.join(HANDOFF, "unrotatable-sid-pl-down")))
+                finally:
+                    run = real_run
+                msgs.clear(); sweep(True)
+                ok("...and the next tick does", len(told("sid-pl-down")) == 1)
             finally:
                 for k, v in keep.items():
                     if v is None:

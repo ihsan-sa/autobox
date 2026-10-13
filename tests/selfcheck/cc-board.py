@@ -382,9 +382,9 @@ def selfcheck():
         stub = f"{th}/stub"; os.makedirs(stub, exist_ok=True)
         def tmux_stub(body):
             open(f"{stub}/tmux", "w").write("#!/bin/sh\n" + body + "\n"); os.chmod(f"{stub}/tmux", 0o755)
-        def runt(*args, pane="%9"):
+        def runt(*args, pane="%9", ccpane=""):   # CC_TMUX_PANE always set here: a seat running this suite has its own
             return subprocess.run([sys.executable, os.path.realpath(__file__), *args],
-                                  env={**os.environ, "HOME": th, "TMUX_PANE": pane,
+                                  env={**os.environ, "HOME": th, "TMUX_PANE": pane, "CC_TMUX_PANE": ccpane,
                                        "PATH": stub + os.pathsep + os.environ.get("PATH", "")},
                                   capture_output=True, text=True)
         # the three fields agent_id asks for: the mark, and the two things a reader tests the window on
@@ -404,6 +404,13 @@ def selfcheck():
         r = runt("set", "r", "t1", "agent", "me", pane="")
         ok("…outside tmux it refuses rather than storing a mark that means nothing, and the old one stands",
            r.returncode != 0 and run("get", "r", "t1", "agent").stdout.strip() == "@7:4242")
+        win_stub("main", "r", mark="@8:4242")
+        r = runt("set", "r", "t1", "agent", "me", pane="", ccpane="%9")
+        ok("…but a seat whose claude lost $TMUX_PANE (a restored one: claude scrubs it on respawn) marks through "
+           "$CC_TMUX_PANE, which `cc __run*` set from the same pane",
+           r.returncode == 0 and run("get", "r", "t1", "agent").stdout.strip() == "@8:4242")
+        win_stub("main", "r")
+        runt("set", "r", "t1", "agent", "me")
         tmux_stub("exit 1")
         r = runt("set", "r", "t1", "agent", "me")
         ok("…and a tmux that will not name the window is a refusal too, never a blank mark",

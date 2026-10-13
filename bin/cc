@@ -717,7 +717,7 @@ say_to(){   # $1 repo $2 track $3 window $4 text → the exit code `cc --say` re
   have_window "$3" && pane_live "$3" || { echo "cc: no running session or worker loop in $3 — nothing was sent (open it with: cc $1 $2, or dispatch one with --go)" >&2; return 1; }
   "$BIN/cc-msg" --turn "$3" "$4"
 }
-own_window(){ [ -n "${TMUX_PANE:-}" ] && tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null; }   # the window this runs in, if any
+own_window(){ local p="${TMUX_PANE:-${CC_TMUX_PANE:-}}"; [ -n "$p" ] && tmux display-message -p -t "$p" '#W' 2>/dev/null; }   # the window this runs in, if any
 ready_tell(){   # $1 repo $2 track $3 where $4 the push remote ("" = none) → 0 when the repo's planning seat's turn took
   # "ready to land", or when that seat is the one running this; else a durable request (cc-notify --ask) and 7, saying on
   # stderr that nobody live heard it; 6 when that request could not be filed either, so nobody has been told and cc-loop
@@ -997,6 +997,21 @@ $(sed 's/Say fewer things/Say less/' "$ROOT/config/writing-prompt.md")"; rc=$?; 
   runorch argv2
   rc=0; grep -q . "$T/argv2" 2>/dev/null || rc=1; grep -q -- 'ship the widget' "$T/argv2" 2>/dev/null && rc=1
   t "control: the same branch with no purpose starts the same session and hands it no prompt" "$rc"
+  # …AND THE SEAT KEEPS ITS PANE UNDER CC_TMUX_PANE, which claude does not scrub (THE PANE, UNDER A SECOND NAME):
+  # this window's own pane id, and an inherited one is emptied rather than passed on as if it were this window's.
+  printf '#!/usr/bin/env bash\nprintf "%%s" "${CC_TMUX_PANE-unset}" > "$CC_ARGV"\n' > "$T/bin/claude-pane"; chmod +x "$T/bin/claude-pane"
+  HOME="$T" PATH="$T/bin:$PATH" CC_CLAUDE="$T/bin/claude-pane" CC_ARGV="$T/pane1" TMUX_PANE=%42 CC_TMUX_PANE=%9 \
+    bash "$S" __runorch r1 a1 </dev/null >/dev/null 2>&1
+  rc=0; [ "$(cat "$T/pane1" 2>/dev/null)" = %42 ] || rc=1
+  t "a seat's claude starts with CC_TMUX_PANE set to its own pane" "$rc"
+  HOME="$T" PATH="$T/bin:$PATH" CC_CLAUDE="$T/bin/claude-pane" CC_ARGV="$T/pane2" CC_TMUX_PANE=%9 \
+    env -u TMUX_PANE bash "$S" __runorch r1 a1 </dev/null >/dev/null 2>&1
+  rc=0; [ -e "$T/pane2" ] && [ -z "$(cat "$T/pane2")" ] || rc=1
+  t "…and with no pane of its own, an inherited CC_TMUX_PANE is emptied, not passed on" "$rc"
+  mkdir -p "$T/dev/r1"; HOME="$T" PATH="$T/bin:$PATH" CC_CLAUDE="$T/bin/claude-pane" CC_ARGV="$T/pane3" TMUX_PANE=%43 CC_TMUX_PANE=%9 \
+    CC_HANDOFF_DIR="$T/no-handoff" bash "$S" __runnext r1 h9 s9 </dev/null >/dev/null 2>&1
+  rc=0; [ "$(cat "$T/pane3" 2>/dev/null)" = %43 ] || rc=1
+  t "…and so does a handoff successor (__runnext), which marks rows like any seat" "$rc"
   # …AND THE PLAIN-FOLDER SESSION IS TOLD TOO. A channel minted for a folder that is no repo starts through
   # __runplain, which hands claude no system prompt at all unless the folder is member-facing — so the three text
   # cases above cannot see this kind, and it was the one a person would most likely ask for a mail in. The same
@@ -1242,6 +1257,14 @@ case "${1:-}" in __run|__runmain|__runplain|__runorch)   # depth: a workspace se
   # `cc-handoff --overlap <handle>` runs it on the host — listed here, the successor was refused before it could (review of #530).
   addr_split "${2:-}"   # `${2%%/*}` left an orch successor's repo as `<repo>@<alias>`, a name no
   member_workspace "$repo" && ! inside && { echo "cc: ~/dev/$repo is a member workspace — its sessions run only inside the boundary (cc $repo ...), never bare on the host. Refused."; exit 1; };; esac   # workspace has, so this guard read no marker and failed OPEN on the one shape it could not parse
+# THE PANE, UNDER A SECOND NAME, for every host seat. claude 2.1.29x scrubs TMUX and TMUX_PANE from a session it
+# respawns (both are on that list in its binary), and the seats restored with --resume at the 07:47Z hub move
+# came up with neither: `cc board set … agent me` refused, and own_window() found nothing.
+# CC_TMUX_PANE is a name claude passes through; the readers take TMUX_PANE first and this after it. Set (or
+# emptied) here, so a value inherited from somewhere else never stands in for this window's own.
+# __runnext is in this one: a handoff successor marks rows like any seat, and cc-sandbox member drops the name for a
+# member workspace's successor (--unsetenv CC_TMUX_PANE), so only host seats keep it.
+case "${1:-}" in __run|__runmain|__runplain|__runorch|__runnext) export CC_TMUX_PANE="${TMUX_PANE:-}" ;; esac
 case "${1:-}" in
   "") ensure_main; attach_main; exit 0 ;;
   -h|--help) usage; exit 0 ;;

@@ -71,8 +71,9 @@ line the Stop hook nags at) is handed off by the box whether or not it acts on t
 on five nags each, grew to 242k-487k, and one 30-minute wake across them re-read 13M cached tokens
 (2026-09-19). Every `--sweep --rotate` (cc-reconcile --apply's tick; a bare cc-reconcile reports and opens
 nothing), each live window in `main` named like a target — no record open, no `~next` beside it, not a
-worker's — is measured by the seat in it (seat_of: the `claude` under the pane, its `--session-id`/`--resume`;
-a planning seat or an orch carries none and is measured by its checkout only when no other interactive claude
+worker's — is measured by the seat in it (seat_of: the `claude` under the pane, and the session its
+~/.claude/sessions/<pid>.json names, else its `--session-id`/`--resume`; a seat with neither is a planning seat
+or an orch on an older claude, measured by its checkout only when no other interactive claude
 in any window of `main` shares that checkout — the peer count is taken before those filters, so a peer with
 its own overlap open or misread as a worker still counts, and the checkout is read only from that seat's OWN
 start, `cc-context --since`, or the session the owner quit is measured as the one he just started) through
@@ -81,7 +82,11 @@ opens the ordinary overlap: the successor reads the journal, asks the seat its o
 itself — the seat's own transcript and journal stay the packet, and no window is killed under it.
 `<slug>.rotated` (~/.cc/state/handoff), written only when the overlap opened, holds the box off a target for
 CC_HANDOFF_ROTATE_RETRY (1 h), so an overlap that expired is not reopened every tick; a start that refused
-is tried again next tick.
+is tried again next tick. A live interactive session no window holds (a seat whose claude runs outside the pane it
+was started from: the 07:47Z hub move restored a dozen) is found by its ~/.claude/sessions/<pid>.json and measured
+by its id; past the line, the sweep cannot open its handoff, so it says so ONCE, by `cc-broker ledger --once
+<CC_BOX>` (the box planning seat's events.md, no wake), stamped `unrotatable-<sid>` under ~/.cc/state/handoff.
+Workers' `-p` runs and the perms seat are never in that list.
 A seat the sweep cannot find under its pane or cannot measure (a member workspace's, inside its sandbox, whose
 transcript is not under ~/.claude/projects) is left alone.
 
@@ -586,7 +591,7 @@ def unaddressable():
 def self_wid():
     """The window THIS process is running in, from $TMUX_PANE — never a bare `display-message`, which answers
     with whatever window is ACTIVE and would cheerfully name somebody else's session."""
-    pane = os.environ.get("TMUX_PANE") or ""
+    pane = os.environ.get("TMUX_PANE") or os.environ.get("CC_TMUX_PANE") or ""   # cc __run* keeps the pane under a name claude does not scrub
     if not pane:
         return ""
     return (tmux("display-message", "-p", "-t", pane, "#{window_id}") or "").strip()
@@ -1594,7 +1599,93 @@ def seat_of(wid):
         i = argv.index(flag) if flag in argv else -1
         if 0 <= i < len(argv) - 1 and SID_RE.match(argv[i + 1]):
             sid = argv[i + 1]
-    return sid, cwd, started
+    live = session_file(k).get("sessionId") or ""
+    return (live if SID_RE.match(live) else sid), cwd, started
+
+
+def sessions_dir():
+    return os.environ.get("CC_HANDOFF_SESSIONS") or os.path.expanduser("~/.claude/sessions")
+
+
+def session_file(pid):
+    """The harness's own record of the session a live claude runs NOW, ~/.claude/sessions/<pid>.json, or {}.
+    It outranks the command line: `--resume <sid>` names the conversation a seat STARTED on (a restore's wrapper,
+    a track brought back), a /clear since then is a session the argv never hears of, and a planning seat or an
+    orch carries no id at all. Trusted only when it names that pid and that process's start (procStart, field 22
+    of /proc/<pid>/stat), so a file a dead pid left behind says nothing about a process that reused the number."""
+    proc = os.environ.get("CC_HANDOFF_PROC") or "/proc"
+    try:
+        with open(os.path.join(sessions_dir(), f"{pid}.json")) as fh:
+            s = json.load(fh)
+        st = open(f"{proc}/{pid}/stat").read().rsplit(")", 1)[1].split()
+    except (OSError, ValueError, IndexError):
+        return {}
+    if not isinstance(s, dict) or str(s.get("pid")) != str(pid) or len(st) < 20 or str(s.get("procStart")) != st[19]:
+        return {}
+    return s
+
+
+PERMS_FLAG = "--dangerously-" + "skip-permissions"   # the perms seat's flag, spelled in two halves for cc-guard's sake
+
+
+def paneless_seats(owned):
+    """The live interactive sessions no window in `main` holds: [(pid, session id, cwd)] off ~/.claude/sessions,
+    leaving out the ids in `owned` (the seats the window walk found). A seat whose claude runs without the pane it
+    was started from (the 07:47Z hub move restored a dozen like that) is invisible to that walk, and the sweep used
+    to pass it over without a word. Never a worker's iteration (`-p`, an sdk entrypoint) and never the perms seat
+    (PERMS_FLAG): the box rotates neither."""
+    proc, found = os.environ.get("CC_HANDOFF_PROC") or "/proc", []
+    try:
+        names = sorted(os.listdir(sessions_dir()))
+    except OSError:
+        return []
+    for n in names:
+        pid = n[:-5] if n.endswith(".json") else ""
+        if not pid.isdigit():
+            continue
+        s = session_file(pid)
+        sid = s.get("sessionId") or ""
+        if not SID_RE.match(sid) or sid in owned or s.get("kind") != "interactive" \
+                or str(s.get("entrypoint") or "").startswith("sdk"):
+            continue
+        try:
+            argv = open(f"{proc}/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        if any(a in ("-p", "--print", PERMS_FLAG) for a in argv):
+            continue
+        found.append((pid, sid, str(s.get("cwd") or "")))
+    return found
+
+
+def unrotatable(pid, sid, cwd, m):
+    """Say ONCE, in the box planning seat's events (cc-broker's ledger: a line in its events.md, and no wake), that
+    a seat is past the rotate line and the sweep cannot hand it off. Once per session id, by a stamp written only
+    after the line went in, so a broker that is down is tried again on the next tick. 1 when it said so."""
+    stamp = os.path.join(HANDOFF, f"unrotatable-{sid}")
+    if os.path.exists(stamp):
+        return 0
+    box = os.environ.get("CC_BOX") or ""
+    if not box:
+        try:
+            box = subprocess.run([os.path.join(BIN, "cc-config"), "get", "CC_BOX", ""], capture_output=True,
+                                 text=True, stdin=subprocess.DEVNULL, timeout=10).stdout.strip()
+        except Exception:
+            box = ""
+    box = box or socket.gethostname().split(".")[0]
+    line = (f"{MACHINE} a seat the box cannot rotate: session {sid} (pid {pid}, {cwd or 'no cwd'}) is at "
+            f"{int(m['used']) // 1000}k tokens, past the {int(m['rotate_line']) // 1000}k rotate line, but no window "
+            f"in tmux {SESSION} holds it, so the sweep cannot open its handoff. Hand it off or relaunch it by hand.")
+    if not run([os.path.join(BIN, "cc-broker"), "ledger", "--once", box, line]):
+        return 0
+    try:
+        os.makedirs(HANDOFF, exist_ok=True)
+        with open(stamp, "w") as fh:
+            json.dump({"pid": pid, "session_id": sid, "cwd": cwd, "used": m["used"], "ts": time.time()}, fh)
+    except OSError:
+        pass
+    logd(f"rotation: session {sid} (pid {pid}) at {int(m['used'])} tokens has no window — told {box}")
+    return 1
 
 
 def pane_claude(wid):
@@ -1659,9 +1750,10 @@ def rotate():
     opened. PEERS ARE COUNTED FIRST, over every live window: a planning seat and its orch share one checkout and
     neither has an id, so "alone" must see the orch even when the orch is filtered out below (its overlap open,
     its `~next` up, a worker misread) — counted after the filters, a 50k planning seat was rotated on its orch
-    predecessor's 300k number (review of #552)."""
+    predecessor's 300k number (review of #552). Then the sessions no window holds (paneless_seats): one past the
+    line is said once to the box planning seat (unrotatable), and opens nothing."""
     retry, now = cfg("CC_HANDOFF_ROTATE_RETRY", 3600), time.time()
-    seats, peers = [], {}                          # (target, window id, session id, cwd, start); cwd -> live seats there, any window
+    seats, peers, owned = [], {}, set()            # (target, window id, session id, cwd, start); cwd -> live seats there, any window
     for l in (tmux("list-windows", "-t", SESSION, "-F", "#{window_id} #{pane_pid} #W") or "").splitlines():
         col = l.split(" ", 2)
         if len(col) < 3:
@@ -1673,6 +1765,7 @@ def rotate():
         if not seat:
             continue
         peers[seat[1]] = peers.get(seat[1], 0) + 1
+        owned.add(seat[0])                         # a window holds it, candidate below or not
         if not TARGET_RE.match(name):
             continue                               # a side of a handoff or an unaddressable window: a peer, never a candidate
         if read(name) or win_id(name + NEXT):
@@ -1710,6 +1803,15 @@ def rotate():
             pass
         journal(target, f"rotated by the box: {why}")
         opened += 1
+    # "make the rotation sweep find a past-the-line seat by its pid/session file when the pane id is missing,
+    # instead of skipping it silently ... When a seat can't be rotated, it should say so once in the planning
+    # seat's events" (the brief, 2026-10-12)
+    for pid, sid, cwd in paneless_seats(owned):
+        if os.path.exists(os.path.join(HANDOFF, f"unrotatable-{sid}")):
+            continue                               # said once already: not measured again
+        m = measure_seat("", sid, False)
+        if m and m.get("rotate"):
+            unrotatable(pid, sid, cwd, m)
     return opened + skilled
 
 
