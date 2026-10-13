@@ -354,7 +354,9 @@ class AddOnly(unittest.TestCase):
         added = OVERLAY_MANIFEST + '\n[[check]]\nname="n"\nrun="true"\nclass="static"\n'
         ok, _ = M.widen_check(r.root, r.base, r.commit("add", {"tests/LANDING.toml": added}))
         self.assertTrue(ok)
-        ok, text = M.widen_check(r.root, r.base, r.commit("drop", {"tests/LANDING.toml": ""}))
+        # identity's run file has to be in a tree, or the check never ran and may go (DeadWeight)
+        ok, text = M.widen_check(r.root, r.base, r.commit("drop", {"tests/LANDING.toml": "",
+                                                                   "tests/check-extra.sh": "#!/bin/sh\n"}))
         self.assertFalse(ok)
         self.assertIn("identity", text)
 
@@ -440,6 +442,42 @@ class DeadWeight(unittest.TestCase):
     def test_a_check_that_names_no_file_may_never_go(self):
         self.assertEqual(self.faults(self.drop("noop"), tuple(f[5:] for f in self.BASE_FILES)),
                          ["check 'noop' was removed"])
+
+    GHOST = textwrap.dedent('''
+        [[check]]
+        name = "ghost"
+        run = "bin/cc-ghost selfcheck"
+        paths = ["bin/cc-ghost", "bin/cc-model"]
+        class = "hermetic"
+    ''')
+
+    def test_a_check_whose_run_file_is_in_neither_tree_may_go(self):
+        """2026-10-13: #1046 and #1154 left checks on main for tools only unmerged PRs had; they may come out."""
+        base_text = self.BASE + self.GHOST
+        self.assertEqual(self.faults(self.BASE, base_text=base_text), [])
+        base, head = AddOnly.two(None, self.BASE, base_text)
+        self.assertNotIn("ghost", M.widen(base, head, self.trees()).checks)
+        # the head that brings the tool may not drop its check, and neither may one on a base that has it
+        files = self.trees()
+        files.head["core/bin/cc-ghost"] = "blob:ghost"
+        self.assertEqual(M.widen_faults(base, head, files), ["check 'ghost' was removed"])
+        files = self.trees()
+        files.base["core/bin/cc-ghost"] = files.head["core/bin/cc-ghost"] = "blob:ghost"
+        self.assertEqual(M.widen_faults(base, head, files), ["check 'ghost' was removed"])
+
+    def test_a_check_added_before_its_tool_is_refused(self):
+        base, head = AddOnly.two(None, self.BASE + self.GHOST, self.BASE)
+        self.assertEqual(M.widen_faults(base, head, self.trees()),
+                         ["check 'ghost': adds itself to run core/bin/cc-ghost, which this head does not have"])
+        # added with its tool: allowed
+        files = self.trees()
+        files.head["core/bin/cc-ghost"] = "blob:ghost"
+        self.assertEqual(M.widen_faults(base, head, files), [])
+        # a run that names no file, or no trees to read: no such fault
+        base, head = AddOnly.two(None, self.BASE + self.GHOST.replace("bin/cc-ghost selfcheck", "true"), self.BASE)
+        self.assertEqual(M.widen_faults(base, head, self.trees()), [])
+        base, head = AddOnly.two(None, self.BASE + self.GHOST, self.BASE)
+        self.assertEqual(M.widen_faults(base, head), [])
 
     def test_the_two_narrowings_1233_got_wrong_stay_refused(self):
         # both files survive the head, so neither path may be dropped from the check that covers it

@@ -24,12 +24,16 @@ itself or a directory above files), and no base file it names has its blob at an
 rename keeps it). Given the two trees, a head may then remove a check whose run line names a file (run_files) and
 whose run files, paths and fixtures are all gone, and drop a path or fixture that is gone. A run line names a file by
 a relative path or by a dotted module after `-m` (tests.test_x is tests/test_x.py); a file git's -M sees renamed,
-edited or not, is not gone. A changed run line is
+edited or not, is not gone. A check whose run line names files and none of them is in either tree never ran
+here, so a head may remove it too (never_ran; 2026-10-13 #1046 and #1154 left checks on main for tools only unmerged
+PRs had, red on every run). A changed run line is
 always a fault, so a check whose run names a deleted file goes whole or not at all. A `where`, a class, a cwd and
 the policy (its security list too) never narrow. plan() hands widen() the same trees, so a check removed as dead is not run on the files it
 named. widen_faults also names a check the head adds or changes that grants itself a class outside the sandbox,
 net = true, bare = true or a mount its base definition lacks (self_widening); a check the head adds with no class
-line is hermetic, not T.Check's host default (head_check), and may not say bare. The built-in check
+line is hermetic, not T.Check's host default (head_check), and may not say bare. Given the trees, a check the
+head adds whose run line names files, none of them in the head's tree, is a fault too: a check lands
+with its tool or after it, never before. The built-in check
 `manifest-widen` (BUILTIN) is selected by any change to a manifest, policy, security or reach file and runs widen_faults
 in-process on the two git trees; `lander manifest-widen` runs it by hand, and its red is never quarantined (run.py).
 The policy file and the security file are also lander-class: plan() sends a change to it to lander-self. A manifest edit is CLEAN when
@@ -402,23 +406,35 @@ class Trees:
         return renamed(G.git(self.root, *args, "-M", "-l0", "-z", "--name-status", "--no-ext-diff", check=True).out)
 
 
+def names(entry: str, tree) -> bool:
+    """entry names a path in tree (a glob by match, a plain path as itself or a directory above it)."""
+    d = entry.rstrip("/") + "/"
+    return any(p.startswith(d) or match([entry], p) for p in tree)
+
+
+def never_ran(run: list, files) -> bool:
+    """run (a check's run files, prefixed) is not empty and names no file in the base tree or the head's."""
+    return bool(run) and not any(names(x, files.base) or names(x, files.head) for x in run)
+
+
 def gone(entry: str, files) -> bool:
     """The head deleted everything entry names: it names a file in the base tree and none in the head's, no base
     file it names has its blob at any path in the head, and none is the source of a rename (files.moved, git's -M):
     a move or a rename is not a delete, edited or not. An entry names a file its glob matches, or one under it as a
     directory (a run line's `-s tests/lander`)."""
     d = entry.rstrip("/") + "/"
-    names = lambda p: p.startswith(d) or match([entry], p)   # noqa: E731
-    was = {p: o for p, o in files.base.items() if names(p)}
-    return (bool(was) and not any(map(names, files.head)) and not set(was.values()) & set(files.head.values())
+    hit = lambda p: p.startswith(d) or match([entry], p)   # noqa: E731
+    was = {p: o for p, o in files.base.items() if hit(p)}
+    return (bool(was) and not any(map(hit, files.head)) and not set(was.values()) & set(files.head.values())
             and not set(was) & set(getattr(files, "moved", ())))
 
 
 def dead_check(b: T.Check, cwd: str, files) -> bool:
     """The head may remove base check b: its run line names a file (run_files; `-m unittest tests.x` names
-    tests/x.py), and every run file, path and fixture it names is gone in this head."""
+    tests/x.py), and every run file, path and fixture it names is gone in this head; or its run files name nothing
+    in either tree (never_ran), so it could not run on the base and cannot on the head."""
     run = [cwd + w for w in run_files(b.run)]
-    return bool(run) and all(gone(x, files) for x in run + b.paths + b.fixtures)
+    return never_ran(run, files) or bool(run) and all(gone(x, files) for x in run + b.paths + b.fixtures)
 
 
 def widen(base: Manifest, head: Manifest, files=None) -> Manifest:
@@ -468,6 +484,10 @@ def widen_faults(base: Manifest, head: Manifest, files=None) -> list:
         for w in self_widening(base.checks.get(n), head_check(base, head, n)):
             bad.append(f"check {n!r}: {'adds' if n not in base.checks else 'changes'} itself to {w}, "
                        "which its base definition does not have")
+        # 2026-10-13: #1046 and #1154 added checks for tools only unmerged PRs had, and main ran them red
+        run = [head.cwd.get(n, "") + w for w in run_files(head.checks[n].run)]
+        if n not in base.checks and files is not None and run and not any(names(x, files.head) for x in run):
+            bad.append(f"check {n!r}: adds itself to run {', '.join(run)}, which this head does not have")
     for n, b in base.checks.items():
         h, cwd = head.checks.get(n), base.cwd.get(n, "")
         # the brief: "a removed check whose run target survives" stays a fault; one naming only deleted files may go
