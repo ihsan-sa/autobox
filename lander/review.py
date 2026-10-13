@@ -106,6 +106,12 @@ security=True, which the lane sends to the planning seat as a query, and no read
 buys is perms'. Any LAND marker, the lander's own and one signed PERMS_SECURITY_READER included, does not merge it.
 With the record, a verdict recorded at this digest stands as on any change (a HANDBACK there still hands it back);
 with none recorded the record is the LAND (model PERMS_SECURITY_READER, extra read="perms"), and nothing is bought.
+A record CARRIES to a new head (carried_from()): when this head has none, an entry for an earlier head of the same
+PR counts if its `verdict` is LAND or absent and the trees of that head and this one differ on no path the base's
+security list matches (security_globs(), plan.select's own list). A delta that touches one, an old head that is
+gone, or a manifest that will not load carries nothing. The LAND then names the old head in extra carried_from, so
+nobody takes it for a fresh read. Only review(), delta_review() and would_read() carry; perms_recorded() itself, and
+so lane.landed_at() and release, still want the head exact.
 `lander record ... --by perms-*` is refused unless the calling Claude session works in the perms seat
 (perms_seat_caller()), but a marker by that name is only a comment: it clears nothing.
 
@@ -328,12 +334,60 @@ def perms_recorded(repo, pr, head, digests) -> bool:
                for e in perms_reads(repo)[0])
 
 
-def _perms_land(job):
+def security_globs(root, base, repo):
+    """The base's security paths (Policy.security_review, as plan.select reads them), or None when the base's
+    manifest will not load: then nothing is carried."""
+    from lander import manifest as M
+    try:
+        return list(M.load(root, base, fallback=M.host_fallback(str(repo).rsplit("/", 1)[-1])).policy.security_review)
+    except Exception:   # noqa: BLE001 — any failure to read the list fails closed
+        return None
+
+
+def delta_files(root, old, new):
+    """The paths whose content differs between two heads' trees, or None when that diff will not run (the old head
+    is gone after a force-push)."""
+    rc, full = git(root, "rev-parse", "--verify", "-q", f"{old}^{{commit}}")
+    if rc:
+        return None
+    rc, out = plain_diff(root, full.strip(), new, "--name-only", "--no-renames", "-z")
+    return None if rc else [p for p in out.split("\0") if p]
+
+
+def carried_from(job):
+    """The earlier head of this PR whose perms LAND carries to job.head, or "". Owner brief: "carried forward to
+    the new head, but only if the delta from the old head to the new head touches no security path", and "If the
+    delta touches any such path, or the old entry is missing or wasn't a LAND, carry nothing over". An entry with
+    no `verdict` is a LAND (perms records only reads it passes); one naming any other word is not. Newest first."""
+    olds = [e.get("head") for e in perms_reads(job.repo)[0]
+            if e.get("repo") == job.repo and e.get("pr") == job.pr and e.get("verdict", T.LAND) == T.LAND
+            and isinstance(e.get("head"), str) and re.fullmatch(r"[0-9a-f]{40}", e["head"]) and e["head"] != job.head]
+    if not (olds and job.head):
+        return ""
+    root = root_of(job)
+    globs = security_globs(root, job.base_sha, job.repo)
+    if globs is None:
+        return ""
+    from lander import manifest as M
+    for old in reversed(olds):
+        files = delta_files(root, old, job.head)
+        if files is not None and not any(M.match(globs, f) for f in files):
+            return old
+    return ""
+
+
+def _perms_land(job, digests=()):
     """The LAND perms' record stands for, on a plan with a security path whose record _security_unread found; None
-    on any other plan."""
+    on any other plan. A record carried from an earlier head says so in extra carried_from, so nobody takes it for
+    a fresh read of this one."""
     if not (job.plan and job.plan.extra.get("security")):
         return None
-    return T.Verdict(verdict=T.LAND, digest=job.digest, model=PERMS_SECURITY_READER, extra={"read": "perms"})
+    extra = {"read": "perms"}
+    if not perms_recorded(job.repo, job.pr, job.head, digests):
+        was = carried_from(job)
+        if was:
+            extra["carried_from"] = was
+    return T.Verdict(verdict=T.LAND, digest=job.digest, model=PERMS_SECURITY_READER, extra=extra)
 
 
 def open_security(comments, head):
@@ -1304,12 +1358,13 @@ def _security_stands(job, comments):
 
 def _security_unread(job, comments, digests):
     """The plan names a security path (plan.extra["security"]) and perms' file holds no record of this head at any of
-    `digests` (perms_recorded) -> INCOMPLETE for the planning seat (host=True, security=True); nothing is bought.
+    `digests` (perms_recorded) nor one that carries to it (carried_from) -> INCOMPLETE for the planning seat
+    (host=True, security=True); nothing is bought.
     Else None. `comments` is not read: no marker clears a security path."""
     need = list((job.plan.extra.get("security") if job.plan else None) or [])
     if not need:
         return None
-    if perms_recorded(job.repo, job.pr, job.head, digests):
+    if perms_recorded(job.repo, job.pr, job.head, digests) or carried_from(job):
         return None
     shown = ", ".join(need[:5]) + (f" and {len(need) - 5} more" if len(need) > 5 else "")
     return T.Verdict(verdict=T.INCOMPLETE, digest=job.digest, extra={
@@ -1335,7 +1390,7 @@ def review(job, comments=None):
     need = _security_unread(job, comments, keys(job, diff))
     if need:
         return need
-    have = recorded(comments, keys(job, diff), job.head) or _perms_land(job)
+    have = recorded(comments, keys(job, diff), job.head) or _perms_land(job, keys(job, diff))
     if have:
         return have
     # a HANDBACK standing from an earlier head is read again whether or not the change is on a paid path: #1064's
@@ -1376,7 +1431,7 @@ def delta_review(job, prior, comments=None, diff=None):
     need = _security_unread(job, comments, keys(job, diff))
     if need:
         return need
-    have = recorded(comments, keys(job, diff), job.head) or _perms_land(job)
+    have = recorded(comments, keys(job, diff), job.head) or _perms_land(job, keys(job, diff))
     if have:   # a verdict recorded at this digest after the prior one (a seat's `record`) is the one that stands
         return have
     was = prior.extra.get("head", "")
@@ -1716,7 +1771,7 @@ def would_read(job, comments):
         return False, (need.extra["why"] + " — perms reads it and records that; the landing buys none")
     if recorded(comments, digests, job.head):
         return False, "a verdict is already recorded for this change, and the landing reads that"
-    if _perms_land(job):
+    if _perms_land(job, digests):
         return False, "perms recorded its security read of this change, and the landing lands on that"
     if not (job.plan and job.plan.paid) and not standing(job, comments):
         return False, "it touches no paid-review path and no unchecked code, so nothing reads it"

@@ -1823,6 +1823,46 @@ class TestSecurityPaths(Case):
                                 by="perms-security-read")
             self.assertEqual(R.review(j, comments=[opus, back]).verdict, T.HANDBACK_VERDICT)
 
+    OLD = "a" * 40
+
+    def carry(self, delta, entry=None):
+        """A security job at HEAD, perms' file holding only `entry` (an earlier head's LAND by default), and the
+        trees of that head and this one differing on `delta`. -> the job."""
+        self.fake = self.box(claude=claude_says("LAND"))
+        j = self.sec_job(self.PATHS[0])
+        self.reads([entry or self.rec(j, head=self.OLD, change="0" * 16)])
+        real = (R.security_globs, R.delta_files)
+        self.addCleanup(lambda: (setattr(R, "security_globs", real[0]), setattr(R, "delta_files", real[1])))
+        R.security_globs = lambda root, base, repo: list(self.PATHS)
+        R.delta_files = lambda root, old, new: list(delta) if old == self.OLD and new == j.head else None
+        return j
+
+    def test_a_perms_land_carries_to_a_head_whose_delta_touches_no_security_path(self):
+        j = self.carry(["x.py", "docs/notes.md"])
+        for v in (R.review(j, comments=[]), R.delta_review(j, T.Verdict(verdict=T.LAND, digest="0"), comments=[])):
+            self.assertEqual((v.verdict, v.model, v.extra.get("read"), v.extra.get("carried_from")),
+                             (T.LAND, "perms-security-read", "perms", self.OLD))
+        self.assertFalse(R.would_read(j, [])[0])
+        self.assertEqual(self.fake.called("claude"), [])
+        # a record at this very head is a fresh read, never marked carried
+        self.reads([self.rec(j)])
+        self.assertNotIn("carried_from", R.review(j, comments=[]).extra)
+
+    def test_a_delta_that_touches_a_security_path_carries_nothing(self):
+        for touched in self.PATHS:
+            j = self.carry(["x.py", touched])
+            self.assertEqual(R.carried_from(j), "")
+            self.blocked(j, [], self.PATHS[0])
+
+    def test_an_entry_that_is_not_a_land_or_is_gone_carries_nothing(self):
+        j = self.carry(["x.py"])
+        self.assertEqual(R.carried_from(j), self.OLD)   # the same fixture with a LAND entry does carry
+        for entry in (self.rec(j, head=self.OLD, verdict="HANDBACK"), self.rec(j, head=self.OLD, pr=8),
+                      self.rec(j, head="c" * 40)):   # another PR's, and a head whose delta will not run
+            j = self.carry(["x.py"], entry)
+            self.assertEqual(R.carried_from(j), "", entry)
+            self.blocked(j, [], self.PATHS[0])
+
     def test_a_record_that_does_not_match_or_is_not_perms_own_file_clears_nothing(self):
         box = self.box(claude=claude_says("LAND"))
         path = self.PATHS[0]
