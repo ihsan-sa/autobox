@@ -26,7 +26,8 @@ def selfcheck():
     for d in ("boards", "state/r/w1", "state/statusline", "state/vitals", "land", "proc", "wt/r/w1", "bin",
               "sessions", "members/mem", "dev/r", "state/fund", "state/mem"):
         os.makedirs(f"{tmp}/{d}")
-    open(f"{tmp}/bin/suites", "w").write("#!/bin/sh\necho 'cc-suites: runner lap answers: free 3'\n")
+    open(f"{tmp}/bin/suites", "w").write("#!/bin/sh\necho 'cc-suites: runner lap answers: free 3'\n"
+                                         "echo \"cc-suites: its GPU: Fake 4070, 5% busy, 300/8188 MiB, 40 C ($*)\"\n")
     open(f"{tmp}/bin/hang", "w").write("#!/bin/sh\nexec sleep 30\n")
     for n in ("suites", "hang"):
         os.chmod(f"{tmp}/bin/{n}", 0o755)
@@ -324,7 +325,19 @@ def selfcheck():
     Pulse(proc).step(now)
     case("a laptop that hangs does not hold up a step", time.monotonic() - t0 < 3)     # it hangs 30 s
     os.environ["CC_PULSE_SUITES"] = f"{tmp}/bin/suites"
-    case("the laptop's line is cc-suites status's", laptop_line().endswith("answers: free 3"))
+    lap = laptop_line()
+    case("the laptop's lines are cc-suites status's: its answer, then its GPU's stats",
+         lap == "cc-suites: runner lap answers: free 3\ncc-suites: its GPU: Fake 4070, 5% busy, 300/8188 MiB, 40 C (status --quick)")
+    case("…asked with --quick, never plain status, whose Blender probe outlasts the 6 s", "(status)" not in lap)
+    bx = [t for t, _ in section({**p, "glance": {**p["glance"], "laptop": lap}}, "box", 80, None, now)[0]]
+    case("the box section shows each laptop line on a row of its own",
+         "  laptop      cc-suites: runner lap answers: free 3" in bx
+         and "              cc-suites: its GPU: Fake 4070, 5% busy, 300/8188 MiB, 40 C (status --quick)" in bx)
+    # the main screen leaves the laptop to the box section (x): a two-line glance.laptop puts no row on it, and no
+    # row of it carries a newline that would push the 80x24 screen out of shape
+    hm = home({**p, "glance": {**p["glance"], "laptop": lap}}, 80, 24)[0]
+    case("the main screen prints no laptop line, and no row of it spans two lines",
+         hm[1:] == home(p, 80, 24)[0][1:] and not any("\n" in t or "cc-suites" in t for t, _ in hm))
 
     # the feed: a write to a watched input reaches emit fast; our own write does not loop
     got, stop = [], [False]

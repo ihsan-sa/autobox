@@ -11,7 +11,7 @@ selfcheck(){
   b(){ if eval "$1"; then echo 0; else echo 1; fi; }   # a condition as a case
   export CC_SUITES_DIR="$D/sd" CC_SUITES_RUNNER_DIR="$D/runner" CC_GREEN_DIR="$D/green"
   SD="$D/sd"; RUNNER_DIR="$D/runner"   # this shell's own view too: the cases below call its functions
-  unset CC_SUITES_SSH CC_SUITE_PART CC_LAND_CHANGED CC_SUITES_SPILL_TIMEOUT CC_SUITES_RUNNER_TIMEOUT
+  unset CC_SUITES_SSH CC_SUITES_GPUSTAT_TIMEOUT CC_SUITE_PART CC_LAND_CHANGED CC_SUITES_SPILL_TIMEOUT CC_SUITES_RUNNER_TIMEOUT
   # the runner's view of power and load is a fixture too: on AC (no supply info) and idle, unless a case says not
   mkdir -p "$D/power" && echo "0.00 0.00 0.00 1/1 1" > "$D/loadavg"
   export CC_SUITES_POWER_DIR="$D/power" CC_SUITES_LOADAVG="$D/loadavg" CC_SUITES_RUNNER_NEEDS="bash git"
@@ -343,11 +343,12 @@ d=${CC_RENDER_DEVICE:-CPU}; [ "$d" = GPU ] && d="OPTIX Fake GPU"; fb=$(dirname "
 if [ "$CC_RENDER_DEVICE" = GPU ] && [ -e "$fb/nogpu" ]; then echo "cc-render: device none, Blender 9.9"; c=$(cat "$fb/nogpu"); exit "${c:-3}"; fi
 echo "cc-render: device $d, Blender 9.9"
 [ "${CC_RENDER_PROBE:-}" = 1 ] && exit 0
+echo "cc-render: ld=${LD_LIBRARY_PATH:-}"
 [ -z "$sc" ] || . "$sc"
 for f in $(seq "${CC_RENDER_START:-1}" "${CC_RENDER_END:-2}"); do
   printf 'frame %s %s nice=%s\n' "$f" "$CC_RENDER_DEVICE" "$(nice)" > "$CC_RENDER_OUT/frame_$(printf %04d "$f").png"; done
 EOF
-  chmod +x "$FB/blender"; export CC_SUITES_BLENDER="$FB/blender"
+  chmod +x "$FB/blender"; export CC_SUITES_BLENDER="$FB/blender" CC_SUITES_WSL_LIB="$D/no-wsl-lib"
   printf '#!/usr/bin/env bash\necho "$*" >> "%s/render.calls"\nexec env HOME="%s/rhome" SSH_ORIGINAL_COMMAND="$*" CC_SUITES_RUNNER_DIR="%s/runner" bash "%s" runner\n' "$D" "$D" "$D" "$SELF" > "$D/xport-render"
   chmod +x "$D/xport-render"; echo "0.00 0.00 0.00 1/1 1" > "$D/loadavg"; rm -f "$D/runner/slots" "$D/runner/maxload"
   sc(){ mkdir -p "$SC/$1" && printf '%s\n' "${2:-true}" > "$SC/$1/scene.py"; }   # a scene directory of a case's own
@@ -355,6 +356,10 @@ EOF
   out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/gpu/scene.py" "$D/o-gpu" 3 4 2>&1); rc=$?
   k "$(b '[ "$rc" = 0 ] && grep -q "rendered on the laptop (OPTIX Fake GPU, Blender 9.9)" <<<"$out" && [ "$(ls "$D/o-gpu" | tr "\n" " ")" = "frame_0003.png frame_0004.png " ] && grep -qx "frame 4 GPU nice=19" "$D/o-gpu/frame_0004.png"')" "render: a free laptop renders the frames asked on its GPU at nice 19, and they come back as files (got $rc)"
   k "$(b 'grep -q "^cc-render: device OPTIX Fake GPU" "$D/o-gpu.log" && [ -z "$(ls -d "$D/runner"/render.* 2>/dev/null)" ]')" "…with Blender's log beside OUT, and nothing left in the runner's directory"
+  k "$(b 'grep -q "^cc-render: device OPTIX Fake GPU" "$D/o-gpu.log" && grep -qx "cc-render: ld=" "$D/o-gpu.log"')" "…and with no WSL library directory, no LD_LIBRARY_PATH"
+  mkdir -p "$D/wsl-lib"; sc wsl
+  out=$(CC_SUITES_WSL_LIB="$D/wsl-lib" CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/wsl/scene.py" "$D/o-wsl" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "rendered on the laptop" <<<"$out" && grep -qx "cc-render: ld=$D/wsl-lib" "$D/o-wsl.log"')" "…on WSL, Blender gets its NVIDIA library directory on LD_LIBRARY_PATH, so OptiX can load by name (got $rc)"
   touch "$FB/nogpu"; sc nogpu
   out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" render "$SC/nogpu/scene.py" "$D/o-nogpu" 2>&1); rc=$?
   k "$(b '[ "$rc" = 0 ] && grep -q "unfit (Blender sees no GPU)" <<<"$out" && grep -q "rendered on this box.s CPU (nice 19)" <<<"$out" && grep -qx "frame 2 CPU nice=19" "$D/o-nogpu/frame_0002.png"')" "…a laptop whose Blender sees no GPU is unfit, and the box renders it on its CPU at nice 19 (got $rc)"
@@ -438,12 +443,13 @@ EOF
   k "$(b '[ "$rc" = 0 ] && grep -q "is [0-9]* bytes, over the 500 the laptop takes" <<<"$out" && ! grep -q "^render" "$D/render.calls" && grep -qx "frame 1 CPU nice=19" "$D/o-bigdir/frame_0001.png"')" "…and a directory du says is over RENDER_TREE_MAX is never tarred or sent: the box renders it (got $rc)"
   # WHAT THE LAPTOP SAYS ON STDERR is the reason (an older runner refuses render there), bounded and printable
   printf '#!/usr/bin/env bash
-case $1 in status) echo "free 1";; gpu) printf "cc-suite-runner: refused: gpu\\033[2J\\n" >&2; exit 2;; *) cat >/dev/null; head -c 9000 /dev/zero | tr "\\0" x >&2; printf "\\ncc-suite-runner: refused: render\\n" >&2; exit 2;; esac
+case $1 in status) echo "free 1";; gpustat) echo "cc-suite-runner: refused: gpustat" >&2; exit 2;; gpu) printf "cc-suite-runner: refused: gpu\\033[2J\\n" >&2; exit 2;; *) cat >/dev/null; head -c 9000 /dev/zero | tr "\\0" x >&2; printf "\\ncc-suite-runner: refused: render\\n" >&2; exit 2;; esac
 ' > "$D/xport-old"; chmod +x "$D/xport-old"
   sc oldrunner; out=$(CC_SUITES_SSH="$D/xport-old" bash "$SELF" render "$SC/oldrunner/scene.py" "$D/o-oldrunner" 2>&1); rc=$?
   k "$(b '[ "$rc" = 0 ] && grep -q "brought back no frames after [0-9]*s (cc-suite-runner: refused: render)" <<<"$out" && grep -qx "cc-suites: the laptop said: cc-suite-runner: refused: render" "$D/o-oldrunner.laptop.log" && grep -q "rendered on this box" <<<"$out"')" "a render the laptop refuses on stderr names the refusal as the reason, and keeps it in OUT.laptop.log (got $rc)"
   out=$(CC_SUITES_SSH="$D/xport-old" bash "$SELF" status 2>&1)
-  k "$(b 'grep -qx "cc-suites: its Blender renders with: no answer (cc-suite-runner: refused: gpu?\[2J)" <<<"$out"')" "…and status names a gpu refusal, its control bytes made printable"
+  k "$(b 'grep -qx "cc-suites: its Blender renders with: not asked (its runner is older than gpu; rerun laptop-setup)" <<<"$out" && ! grep -q $'"'"'\033'"'"' <<<"$out"')" "…and status reads a gpu refusal as a runner older than the question, never printing its control bytes"
+  k "$(b 'grep -qx "cc-suites: runner .* answers: free 1" <<<"$out" && grep -qx "cc-suites: its GPU: not asked (its runner is older than gpustat; rerun laptop-setup)" <<<"$out"')" "…and a runner from before gpustat is still free, its GPU line saying it was not asked, not that it gave no answer"
   printf '#!/usr/bin/env bash
 echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
 ' > "$D/xport-gone"; chmod +x "$D/xport-gone"
@@ -476,11 +482,51 @@ echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
   k "$(b '[ "$rc" = 0 ] && grep -qF "rendered on the laptop (OPTIX E?[31mX nice=19, Blender 9.9)" <<<"$out" && ! grep -q $'"'"'\033'"'"' <<<"$out"')" "a render's success line prints the laptop's device name printable (got $rc)"
   out=$(SSH_ORIGINAL_COMMAND="gpu now" bash "$SELF" runner 2>&1 </dev/null); rc=$?
   k "$(b '[ "$rc" = 2 ]')" "…and takes no argument (got $rc)"
-  out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" status 2>&1)
-  k "$(b 'grep -qx "cc-suites: its Blender renders with: OPTIX Fake GPU, Blender 9.9" <<<"$out"')" "status says the GPU the runner's Blender renders with"
+  # GPUSTAT: nvidia-smi's word on the GPU, a fake that answers as nvidia-smi does (no devices while $FB/nodev exists)
+  printf '#!/usr/bin/env bash\n[ -e "%s/nodev" ] && { echo "No devices were found"; exit 6; }\necho "NVIDIA Fake 4070, 12, 900, 8188, 41"\n' "$FB" > "$FB/nvidia-smi"
+  chmod +x "$FB/nvidia-smi"; export CC_SUITES_NVIDIA_SMI="$FB/nvidia-smi"
+  out=$(SSH_ORIGINAL_COMMAND="gpustat" bash "$SELF" runner 2>&1 </dev/null); rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ "$out" = "gpustat NVIDIA Fake 4070, 12% busy, 900/8188 MiB, 41 C" ]')" "gpustat gives the GPU's name, use, memory and temperature (got: $out)"
+  touch "$FB/nodev"; out=$(SSH_ORIGINAL_COMMAND="gpustat" bash "$SELF" runner 2>&1 </dev/null); rm -f "$FB/nodev"
+  k "$(b '[ "$out" = "gpustat none (nvidia-smi: No devices were found)" ]')" "…none, with nvidia-smi's reason, when it finds no GPU (got: $out)"
+  out=$(CC_SUITES_NVIDIA_SMI="$D/no-such-smi" SSH_ORIGINAL_COMMAND="gpustat" bash "$SELF" runner 2>&1 </dev/null); rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ "$out" = "gpustat none (no nvidia-smi)" ]')" "…none when the laptop has no nvidia-smi (got: $out)"
+  out=$(SSH_ORIGINAL_COMMAND="gpustat now" bash "$SELF" runner 2>&1 </dev/null); rc=$?
+  k "$(b '[ "$rc" = 2 ] && grep -q "refused: gpustat takes nothing" <<<"$out" && ! grep -q "^gpustat " <<<"$out"')" "…and takes no argument: refused, nvidia-smi never asked (got $rc)"
+  rm -f "$D/render.calls"; out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -qx "cc-suites: its Blender renders with: OPTIX Fake GPU, Blender 9.9" <<<"$out" && grep -qx gpu "$D/render.calls"')" "status says the GPU the runner's Blender renders with, asking it gpu (got $rc)"
+  k "$(b '[ "$(sed -n 2p <<<"$out")" = "cc-suites: its GPU: NVIDIA Fake 4070, 12% busy, 900/8188 MiB, 41 C" ] && grep -qx gpustat "$D/render.calls"')" "…and names the GPU with its stats, under the runner's answer"
+  rm -f "$D/render.calls"; out=$(CC_SUITES_SSH="$D/xport-render" bash "$SELF" status --quick 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "answers: free" <<<"$out" && grep -qx "cc-suites: its GPU: NVIDIA Fake 4070, 12% busy, 900/8188 MiB, 41 C" <<<"$out" && grep -qx gpustat "$D/render.calls"')" "status --quick still prints the GPU's stats (got $rc)"
+  k "$(b '[ "$(wc -l <<<"$out")" = 2 ] && ! grep -q "Blender" <<<"$out" && ! grep -qx gpu "$D/render.calls"')" "…but never asks gpu, so Blender is not started there"
+  out=$(CC_SUITES_NVIDIA_SMI="$D/no-such-smi" CC_SUITES_SSH="$D/xport-render" bash "$SELF" status --quick 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -qx "cc-suites: its GPU: none (no nvidia-smi)" <<<"$out"')" "…and a laptop with no nvidia-smi says so, still free (got $rc)"
+  # NO ANSWER IS NOT A GPU FAULT (2026-10-03): a refusal says the runner predates the question, silence only that it
+  # was not answered, and both say a 1-frame render is the test, so nobody reads either as a broken GPU
+  printf '#!/usr/bin/env bash\n[ "$1" = gpustat ] && { echo "cc-suite-runner: refused: gpustat" >&2; exit 2; }\nexec "%s" "$@"\n' "$D/xport-render" > "$D/xport-pregpustat"; chmod +x "$D/xport-pregpustat"
+  out=$(CC_SUITES_SSH="$D/xport-pregpustat" bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -qx "cc-suites: its GPU: not asked (its runner is older than gpustat; rerun laptop-setup)" <<<"$out" && grep -qx "cc-suites: its Blender renders with: OPTIX Fake GPU, Blender 9.9" <<<"$out" && ! grep -q "no answer" <<<"$out"')" "…a runner from before gpustat whose Blender sees the GPU: its GPU was not asked, beside the device it renders with (got $rc: $out)"
+  printf '#!/usr/bin/env bash\ncase $1 in gpustat) exit 255;; gpu) printf "ssh: lost\\033[2J\\n" >&2; exit 255;; esac\nexec "%s" "$@"\n' "$D/xport-render" > "$D/xport-silent"; chmod +x "$D/xport-silent"
+  out=$(CC_SUITES_SSH="$D/xport-silent" bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -qx "cc-suites: its GPU: no answer to gpustat (not a GPU fault on its own; a 1-frame render tells)" <<<"$out" && grep -qx "cc-suites: its Blender renders with: no answer to gpu (ssh: lost?\[2J; not a GPU fault on its own; a 1-frame render tells)" <<<"$out" && ! grep -q "not asked" <<<"$out"')" "…a runner silent on both says no answer, names what ssh said (printable), and that a render is the test (got $rc: $out)"
+  printf '#!/usr/bin/env bash\ncase $1 in gpustat|gpu) echo "cc-suite-runner: refused: $1" >&2; exit 2;; esac\nexec "%s" "$@"\n' "$D/xport-render" > "$D/xport-pregpu"; chmod +x "$D/xport-pregpu"
+  out=$(CC_SUITES_SSH="$D/xport-pregpu" bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -qx "cc-suites: its Blender renders with: not asked (its runner is older than gpu; rerun laptop-setup)" <<<"$out" && grep -q "its GPU: not asked" <<<"$out"')" "…and a runner from before gpu says that line was not asked either (got $rc: $out)"
+  # a runner whose nvidia-smi is slow: gpustat gets two thirds of the status bound, so the answer still arrives in
+  # time and the GPU line says its stats are unavailable (exec sleep, so the pipe closes when timeout kills it)
+  printf '#!/usr/bin/env bash\n[ "$1" = gpustat ] && exec sleep 30\nexec "%s" "$@"\n' "$D/xport-render" > "$D/xport-slowgpu"
+  chmod +x "$D/xport-slowgpu"
+  local ms; ms=$(date +%s%N); out=$(CC_SUITES_SSH="$D/xport-slowgpu" CC_SUITES_STATUS_TIMEOUT=3s bash "$SELF" status --quick 2>&1); rc=$?
+  ms=$(( ($(date +%s%N) - ms) / 1000000 ))
+  k "$(b '[ "$rc" = 0 ] && [ "$ms" -lt 3000 ] && grep -q "answers: free" <<<"$out" && grep -qx "cc-suites: its GPU: stats unavailable (gpustat gave nothing in 2s)" <<<"$out"')" "…and a runner whose GPU stats are slow still answers free inside the bound, its stats unavailable (got $rc in ${ms}ms)"
+  k "$(b '[ "$(twothirds 08s)" = 5s ] && [ "$(twothirds 09m)" = 360s ] && [ "$(twothirds 09)" = 6s ] && [ "$(twothirds x)" = 1s ]')" "…a leading zero (08, 09) is a decimal number, not octal, and junk is 1s"
+  k "$(b '[ "$(twothirds 6s)" = 4s ] && [ "$(twothirds 20s)" = 13s ] && [ "$(twothirds 1m)" = 40s ] && [ "$(twothirds 1s)" = 1s ] && [ "$(twothirds 30)" = 20s ]')" "…the stats get two thirds of the bound, in whole seconds and at least 1"
+  k "$(b '[ "$(twothirds 08s)" = 5s ] && [ "$(twothirds 090)" = 60s ] && [ "$(twothirds 09m)" = 360s ] && [ "$(limit 00s 20s)" = 20s ] && [ "$(limit 09s 20s)" = 09s ]')" "…a bound with a leading zero is read in base 10, not octal, and 00s is no bound"
+  k "$(b '[ "$(t bash "$SELF" status --slow)" = 2 ] && [ "$(t bash "$SELF" status --quick x)" = 2 ]')" "status refuses any argument but --quick"
+  unset CC_SUITES_NVIDIA_SMI; rm -f "$FB/nvidia-smi"
   mkdir -p "$D/o-full"; : > "$D/o-full/x"
   k "$(b '[ "$(t bash "$SELF" render "$SC/gpu/scene.py" "$D/o-full")" = 2 ] && [ "$(t bash "$SELF" render "$SC/gpu/scene.py" "$D/o-rev" 4 3)" = 2 ] && [ "$(t bash "$SELF" render "$SC/gpu/texture.txt" "$D/o-txt")" = 2 ]')" "render refuses an OUT that is not empty, a range backwards, and a scene that is not NAME.py"
-  unset CC_SUITES_BLENDER; rm -f "$FB/blender"; rmdir "$FB"
+  unset CC_SUITES_BLENDER CC_SUITES_WSL_LIB; rm -f "$FB/blender"; rmdir "$FB"
   # laptop-setup: the key, the remote, and a script that carries this very file and the key's public half
   local cmd re f="$D/sd/laptop-setup.ps1"
   mkdir -p "$D/sd" && echo stale > "$f"
@@ -502,7 +548,7 @@ echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
   k "$(b 'grep -qF "restrict,command=\"/usr/local/bin/cc-suites runner\" $(cat "$D/sd/id_ed25519.pub")" <<<"$out"')" "…and its script pins that key to the runner, restricted"
   k "$(b 'awk "/^base64 -d/{f=1;next} /^B64\$/{f=0} f" <<<"$out" | base64 -d | cmp -s - "$SELF"')" "…and carries this file byte for byte"
   k "$(b 'grep -q "bubblewrap" <<<"$out"')" "…installs bwrap, which the suite's sandbox cases run"
-  k "$(b 'grep -qF "https://download.blender.org/release/Blender5.2/blender-$BLENDER_VERSION-linux-x64.tar.xz" <<<"$out" && grep -qF "echo \"$BLENDER_SHA256  \$t/b.tar.xz\" | sha256sum -c --quiet" <<<"$out" && grep -qx "  ln -sfn /opt/blender-$BLENDER_VERSION/blender /usr/local/bin/blender" <<<"$out" && grep -q "SSH_ORIGINAL_COMMAND=gpu" <<<"$out"')" "…installs the official Blender $BLENDER_VERSION, checked by sha256, as /usr/local/bin/blender, and says what GPU it sees"
+  k "$(b 'grep -qF "https://download.blender.org/release/Blender5.2/blender-$BLENDER_VERSION-linux-x64.tar.xz" <<<"$out" && grep -qF "echo \"$BLENDER_SHA256  \$t/b.tar.xz\" | sha256sum -c --quiet" <<<"$out" && grep -qx "  ln -sfn /opt/blender-$BLENDER_VERSION/blender /usr/local/bin/blender" <<<"$out" && grep -q "SSH_ORIGINAL_COMMAND=gpu " <<<"$out" && grep -q "SSH_ORIGINAL_COMMAND=gpustat " <<<"$out"')" "…installs the official Blender $BLENDER_VERSION, checked by sha256, as /usr/local/bin/blender, and says what GPU it sees and its stats"
   k "$(b 'grep -qx "printf '\''python3 %s\\\\nshellcheck %s\\\\n'\'' $(tool_version python3 | cut -d. -f1,2) $(tool_version shellcheck) >/etc/cc-suites/floor; chmod 644 /etc/cc-suites/floor" <<<"$out" && grep -q "sha256sum -c" <<<"$out"')" "…writes this box's python3 and shellcheck as the floor, and checks the shellcheck it fetches"
   # …and leaves the runner account nothing of its own to rewrite: the runner, the home, .ssh and authorized_keys root's
   k "$(b 'grep -qx "chown root:root /usr/local/bin/cc-suites; chmod 755 /usr/local/bin/cc-suites" <<<"$out" && grep -qx "install -d -m 755 -o root -g root /home/ccsuite /home/ccsuite/.ssh" <<<"$out" && grep -qx "chown root:root /home/ccsuite/.ssh/authorized_keys; chmod 644 /home/ccsuite/.ssh/authorized_keys" <<<"$out" && ! grep -q "chown ccsuite\|-o ccsuite -g ccsuite /home/ccsuite/.ssh\|useradd -m" <<<"$out"')" "…makes the runner, the runner account's home, .ssh and authorized_keys root's, never the account's"
@@ -511,7 +557,8 @@ echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
   awk "/^cat >\/etc\/ssh\/ssh_host_cc_suites_ed25519/{f=1;next} /^KEY\$/{f=0} f" <<<"$out" > "$D/hk"; chmod 600 "$D/hk"
   k "$(b '[ "$(cat "$D/sd/known_hosts")" = "my-node $(ssh-keygen -y -f "$D/hk" | cut -d" " -f1,2)" ] && grep -q "^HostKey /etc/ssh/ssh_host_cc_suites_ed25519" <<<"$out"')" "…and pins a host key of its own making: known here for my-node, installed there as sshd's only one"
   k "$(b '[ -z "$(ls "$D/sd" | grep -v "^id_ed25519\|^known_hosts\$\|^remote\$\|^laptop-setup.ps1\$")" ] && grep -q "PRIVATE KEY" "$f" && ! grep -q "PRIVATE KEY" <<<"$cmd"')" "…keeps that private key here only in the script's file, and never prints it"
-  CC_SUITES_SSH="$D/xport-mute" CC_SUITES_STATUS_TIMEOUT=2s bash "$SELF" status >/dev/null 2>&1
+  SECONDS=0; out=$(CC_SUITES_SSH="$D/xport-mute" CC_SUITES_STATUS_TIMEOUT=2s bash "$SELF" status --quick 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && [ "$SECONDS" -lt 4 ] && grep -q "does not answer" <<<"$out" && ! grep -q "its GPU" <<<"$out"')" "status --quick against a runner that hangs waits one bound, not one per question, and prints no GPU line (got $rc in ${SECONDS}s)"
   k "$(b '[ -s "$f" ]')" "a status the runner does not answer keeps the box's copy of the script…"
   # xport-old answers both status and the gpu question status now asks, so this waits on neither
   CC_SUITES_SSH="$D/xport-old" bash "$SELF" status >/dev/null 2>&1

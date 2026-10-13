@@ -16,16 +16,22 @@
 #                                 itself and does not offer it again. A red there is never a red here on its own: the
 #                                 laptop is not the box (2026-09-25, a live run came back 481 passed, 7 failed, every
 #                                 red a gap in the runner's environment), so only this box's own run can fail a landing.
-#   cc-suites status              the runner this box would use, what it answers, and the GPU its Blender renders
-#                                 with. exit 0 reachable, 75 not
+#   cc-suites status [--quick]    the runner this box would use, what it answers, its GPU's name, use, memory and
+#                                 temperature (nvidia-smi there), and the device its Blender renders with (a few
+#                                 seconds; --quick, the dashboards' form, leaves that out). A GPU line says "not
+#                                 asked" when the runner predates that question and "no answer to …" when it is silent;
+#                                 neither is a GPU fault, and a 1-frame render is the test. The GPU's stats get two
+#                                 thirds of the status bound (CC_SUITES_GPUSTAT_TIMEOUT overrides): a slow nvidia-smi
+#                                 says "stats unavailable" and never makes a reachable runner look offline to a caller
+#                                 that waits only the status bound. exit 0 reachable, 75 not, 2 usage
 #   cc-suites render SCENE.py OUT [START END] [--here]
 #                                 render a Blender scene script (Cycles) into OUT on the runner's GPU, or on this box's
 #                                 CPU at nice 19 when the runner is asleep, busy or unfit (the render section below); --here
 #                                 skips the runner. OUT.log is Blender's log. exit 0 frames in OUT, 1 failed, 2 usage
 #   cc-suites runner              the runner's side, on the other machine: the forced command of the key, reading
 #                                 SSH_ORIGINAL_COMMAND (`status`, `run SUITE TREE PART CHANGED-B64`, the lander's
-#                                 one check, `job CHECK TREE CAP RUN-B64 CWD-B64 [net]`, `render TREE CAP START END SCENE`
-#                                 or `gpu`) and a tar on stdin
+#                                 one check, `job CHECK TREE CAP RUN-B64 CWD-B64 [net]`, `render TREE CAP START END SCENE`,
+#                                 `gpu` or `gpustat`) and a tar on stdin
 #   cc-suites laptop-setup [NODE] write the PowerShell script the owner runs once on a Windows laptop (below) to
 #                                 ~/.cc/suites/laptop-setup.ps1 (mode 600), and print the one command that fetches
 #                                 it over ssh from this box (its tailnet name, read at run time; CC_SUITES_BOX
@@ -104,7 +110,7 @@ set -uo pipefail
 SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
 SD="${CC_SUITES_DIR:-$HOME/.cc/suites}"            # remote (user@host), id_ed25519, known_hosts
 RUNNER_DIR="${CC_SUITES_RUNNER_DIR:-$HOME/.cc-suite-runner}"   # the runner's slots and scratch trees, on its machine
-USAGE="usage: cc-suites [reap [--dry]|spill SUITE [ARG…]|status|render SCENE.py OUT [START END] [--here]|runner|laptop-setup [NODE]|selfcheck]"
+USAGE="usage: cc-suites [reap [--dry]|spill SUITE [ARG…]|status [--quick]|render SCENE.py OUT [START END] [--here]|runner|laptop-setup [NODE]|selfcheck]"
 ALLOWED_SUITES="core/tests/selftest.sh tests/selftest.sh"
 SUITE_RE='(^|/)tests/selftest\.sh$'
 
@@ -160,25 +166,56 @@ xp_kept(){ local f=$1; shift; { "$@" 2>&1 1>&3 3>&- | tail -c 4096 >"$f"; } 3>&1
 err_of(){ LC_ALL=C tr -c ' -~\n' '?' <"$1" 2>/dev/null | grep -a -v '^ *$' | tail -1 | cut -c1-200; }
 printable(){ printf %s "$1" | sed 's/—/-/g' | LC_ALL=C tr -c ' -~' '?' | cut -c1-200; }   # a line a laptop said
 # A wall-clock bound in timeout(1)'s form (90m, 2s); anything else is the default.
-limit(){ local v=${1:-}; [[ $v =~ ^[0-9]+[smh]?$ ]] && [ "${v%[smh]}" != 0 ] && echo "$v" || echo "$2"; }
+limit(){ local v=${1:-}; [[ $v =~ ^[0-9]+[smh]?$ ]] && [ "$((10#${v%[smh]}))" != 0 ] && echo "$v" || echo "$2"; }
+# two thirds of such a bound, in whole seconds and at least 1 (6s is 4s, 20s is 13s, 1m is 40s)
+twothirds(){ local v=$1 n=${1%[smh]}; [[ $n =~ ^[0-9]+$ ]] || n=1; n=$((10#$n))   # 10#: "08" is not octal
+  case $v in *m) n=$((n * 60));; *h) n=$((n * 3600));; esac
+  n=$((n * 2 / 3)); [ "$n" -ge 1 ] || n=1; echo "${n}s"; }
+
+# What a GPU question ($1) the runner did not answer says, from its stderr in $2. Neither is a verdict on the GPU: a
+# refusal means the runner predates the question, silence means only that it was not answered, and a 1-frame
+# `cc-suites render` is the proof (2026-10-03: "no answer" from an old runner beside a GPU that rendered with CUDA).
+unanswered(){ local e; e=$(err_of "$2")
+  case $e in "cc-suite-runner: refused: $1"*) echo "not asked (its runner is older than $1; rerun laptop-setup)";;
+    *) echo "no answer to $1 (${e:+$e; }not a GPU fault on its own; a 1-frame render tells)";; esac; }
 
 status(){
+  local a g st rc ef sf se sr sp lim glim q=""; local -a XP
+  case "$*" in "") ;; --quick) q=1;; *) echo "usage: cc-suites status [--quick]" >&2; return 2;; esac
   configured || { echo "cc-suites: no runner set ($SD/remote) — every suite runs here"; return 75; }
-  local a g rc ef; local -a XP; xport_argv || return 75
+  xport_argv || return 75
   ef=$(mktemp "${TMPDIR:-/tmp}/cc-suites-err.XXXXXX") || return 75
-  a=$(xp_kept "$ef" timeout "$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)" "${XP[@]}" status </dev/null | tail -1)
+  sf=$(mktemp "${TMPDIR:-/tmp}/cc-suites-err.XXXXXX") || { rm -f "${ef:?}"; return 75; }
+  se=$(mktemp "${TMPDIR:-/tmp}/cc-suites-err.XXXXXX") || { rm -f "${ef:?}" "${sf:?}"; return 75; }
+  sr=$(mktemp "${TMPDIR:-/tmp}/cc-suites-err.XXXXXX") || { rm -f "${ef:?}" "${sf:?}" "${se:?}"; return 75; }
+  lim=$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)
+  # the GPU's own stats (nvidia-smi there), asked beside the answer rather than after it, so --quick costs one wait:
+  # `gpustat <name>, U% busy, USED/TOTAL MiB, T C`. Its stdout's last line goes to $sf, its stderr to $se, its exit
+  # to $sr. It is bounded shorter than the answer (2026-10-12: with both at the dashboard's 6 s, a runner that said
+  # `free 1` at once but whose nvidia-smi was slow ran the dashboard out of time and showed as offline)
+  glim=$(limit "${CC_SUITES_GPUSTAT_TIMEOUT:-}" "$(twothirds "$lim")")
+  { xp_kept "$se" timeout "$glim" "${XP[@]}" gpustat </dev/null | tail -1 >"$sf"; echo "${PIPESTATUS[0]}" >"$sr"; } & sp=$!
+  a=$(xp_kept "$ef" timeout "$lim" "${XP[@]}" status </dev/null | tail -1)
+  wait "$sp"
   a=$(printable "$a"); [ -n "$a" ] || a=$(err_of "$ef")
   case $a in "free "*|"busy"*|"unfit"*)
     # the runner answered, so the setup script (and the host key in it) has done its work: drop the box's copy
     rm -f "$SD/laptop-setup.ps1"
-    # the GPU a render there would use, asked of its Blender (a few seconds): `gpu OPTIX <name>, Blender 5.2.2`
-    g=$(xp_kept "$ef" timeout 120s "${XP[@]}" gpu </dev/null | tail -1); g=${g#gpu }
-    g=$(printable "$g"); [ -n "$g" ] || g="no answer ($(err_of "$ef"))"
+    st=$(cat "$sf"); case $st in "gpustat "*) st=$(printable "${st#gpustat }");;
+      *) if [ "$(cat "$sr")" = 124 ]; then st="stats unavailable (gpustat gave nothing in $glim)"
+         else st=$(unanswered gpustat "$se"); fi;; esac
+    # the GPU a render there would use, asked of its Blender (a few seconds): `gpu OPTIX <name>, Blender 5.2.2`.
+    # --quick (the dashboards') leaves it out: it starts Blender there, which takes longer than they wait
+    if [ -z "$q" ]; then
+      g=$(xp_kept "$ef" timeout 120s "${XP[@]}" gpu </dev/null | tail -1); g=${g#gpu }
+      g=$(printable "$g"); [ -n "$g" ] || g=$(unanswered gpu "$ef")
+    fi
     case $a in "free "*) echo "cc-suites: runner $(remote) answers: $a"; rc=0;;
                       *) echo "cc-suites: runner $(remote) answers: $a — every suite runs here for now"; rc=75;; esac
-    echo "cc-suites: its Blender renders with: ${g% ()}";;
+    echo "cc-suites: its GPU: $st"
+    [ -n "$q" ] || echo "cc-suites: its Blender renders with: $g";;
     *) echo "cc-suites: runner $(remote) does not answer${a:+ ($a)}"; rc=75;; esac
-  rm -f "${ef:?}"
+  rm -f "${ef:?}" "${sf:?}" "${se:?}" "${sr:?}"
   return $rc
 }
 
@@ -407,6 +444,7 @@ runner(){
     job) runner_job "${a[@]:1}"; return;;
     render) runner_render "${a[@]:1}"; return;;
     gpu) runner_gpu "${a[@]:1}"; return;;
+    gpustat) runner_gpustat "${a[@]:1}"; return;;
     *) echo "cc-suite-runner: refused: ${a[0]:-nothing}" >&2; return 2;;
   esac
   [ "${#a[@]}" = 5 ] || { echo "cc-suite-runner: refused: run takes SUITE TREE PART CHANGED" >&2; return 2; }
@@ -592,6 +630,11 @@ bpy.ops.render.render(animation=True)
 PY
 )
 blender_bin(){ command -v "${CC_SUITES_BLENDER:-blender}" 2>/dev/null; }   # CC_SUITES_BLENDER: the selfcheck's fake
+# GE: what a Blender started with env -i needs to reach WSL's NVIDIA libraries by name. ld.so's cache knows WSL's
+# OptiX library only by its soname, libnvoptix_loader.so.1, so Cycles' dlopen("libnvoptix.so.1") fails without this
+# path (2026-10-01, the laptop: OptiX error 7804 without it; 7805 with it while the Windows driver ships no Linux
+# OptiX behind that loader, so CUDA renders). Read-only already, so it opens nothing. CC_SUITES_WSL_LIB: the selfcheck.
+gpu_env(){ local d=${CC_SUITES_WSL_LIB:-/usr/lib/wsl/lib}; GE=(); [ ! -d "$d" ] || GE=(LD_LIBRARY_PATH="$d"); }
 # THE CAGE for Blender: cage_argv's without --net (so no network, only lo, and an empty /run), and WSL's GPU device
 # node, the one thing added. The NVIDIA libraries it needs are under /usr/lib/wsl, already read-only.
 render_cage(){
@@ -623,10 +666,10 @@ runner_render(){
   [ -f "$j/tree/$scene" ] && [ ! -L "$j/tree/$scene" ] || { echo "cc-suite-runner: no scene $scene in the tree — refused"; return 1; }
   local -a pre=(timeout -k 10 "$cap" nice -n 19)
   command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
-  render_cage "$j"
+  render_cage "$j"; gpu_env
   ( cd "$j/tree" && ulimit -f $((RENDER_MAX_BYTES / 1024 + 1)) && exec setsid env -i HOME="$j/home" USER="${USER:-$(id -un)}" PATH=/usr/local/bin:/usr/bin:/bin \
       LANG=C.UTF-8 TERM=dumb TMPDIR="$j" CC_RENDER_OUT="$j/out" CC_RENDER_START="${s#-}" CC_RENDER_END="${e#-}" \
-      CC_RENDER_DEVICE=GPU "${pre[@]}" "${CG[@]}" "$bl" -b --factory-startup -noaudio --python-exit-code 1 \
+      CC_RENDER_DEVICE=GPU "${GE[@]}" "${pre[@]}" "${CG[@]}" "$bl" -b --factory-startup -noaudio --python-exit-code 1 \
       --python "$j/tree/$scene" --python-expr "$RENDER_PY" ) </dev/null {LK}>&- >"$j.log" 2>&1 & gp=$!; pg=$gp
   rc=0; wait "$gp" || rc=$?; gp=""
   kill -KILL -- -"$pg" 2>/dev/null; pg=""
@@ -660,11 +703,28 @@ runner_gpu(){
   trap 'rc=$?; [ -z "$w" ] || rm -rf "$w"; exit $rc' EXIT
   local -a pre=(timeout -k 5 90 nice -n 19)
   command -v ionice >/dev/null 2>&1 && ionice -c3 true 2>/dev/null && pre+=(ionice -c3)
-  render_cage "$j"
+  render_cage "$j"; gpu_env
   dev=$(cd "$j" && setsid env -i HOME="$j" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TERM=dumb TMPDIR="$j" \
-    CC_RENDER_DEVICE=GPU CC_RENDER_PROBE=1 "${pre[@]}" "${CG[@]}" "$bl" -b --factory-startup -noaudio \
+    CC_RENDER_DEVICE=GPU CC_RENDER_PROBE=1 "${GE[@]}" "${pre[@]}" "${CG[@]}" "$bl" -b --factory-startup -noaudio \
     --python-expr "$RENDER_PY" </dev/null 2>&1 | sed -n 's/^cc-render: device //p' | head -1 | LC_ALL=C tr -c ' -~\n' '?')
   echo "gpu ${dev:-none (Blender gave no answer)}"
+}
+# `gpustat`: the GPU's own word on itself, from nvidia-smi (on WSL the Windows driver's, under /usr/lib/wsl/lib):
+# `gpustat <name>, U% busy, USED/TOTAL MiB, T C` for the first GPU, or `gpustat none (…)` saying why. It runs no
+# scene and reads nothing the box sends, so like status it runs outside the cage; it takes no slot and is quick.
+# CC_SUITES_NVIDIA_SMI: the selfcheck's fake.
+runner_gpustat(){
+  local smi o n u mu mt t v; local -a f
+  [ "$#" = 0 ] || { echo "cc-suite-runner: refused: gpustat takes nothing"; return 2; }
+  smi=$(PATH=/usr/lib/wsl/lib:/usr/local/bin:/usr/bin:/bin command -v "${CC_SUITES_NVIDIA_SMI:-nvidia-smi}") \
+    || { echo "gpustat none (no nvidia-smi)"; return 0; }
+  o=$(timeout -k 2 15 env -i PATH=/usr/bin:/bin "$smi" --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu \
+    --format=csv,noheader,nounits </dev/null 2>&1 | head -1 | LC_ALL=C tr -cd ' -~' | cut -c1-160)
+  IFS=, read -r n u mu mt t <<<"$o"
+  f=(); for v in "$u" "$mu" "$mt" "$t"; do v=${v// /}; [[ $v =~ ^[0-9]+$ ]] || v="?"; f+=("$v"); done
+  n=$(sed 's/^ *//; s/ *$//' <<<"$n")
+  [ -n "$n" ] && [ -n "$t" ] || { echo "gpustat none (nvidia-smi: ${o:-no answer})"; return 0; }
+  echo "gpustat $n, ${f[0]}% busy, ${f[1]}/${f[2]} MiB, ${f[3]} C"
 }
 
 # ---- render (the box's side) --------------------------------------------------------------------------------------
@@ -917,6 +977,8 @@ wsl.exe -d \$Distro -u root -- tailscale up --hostname=$node --accept-dns=false
 Write-Host "The runner answers: \$ready  ('free N' is ready; 'unfit (missing: ...)' names what this laptop still lacks)"
 \$gpu = wsl.exe -d \$Distro -u ccsuite -- env SSH_ORIGINAL_COMMAND=gpu /usr/local/bin/cc-suites runner
 Write-Host "Blender renders with: \$gpu  ('gpu OPTIX ...' or 'gpu CUDA ...' is ready; 'gpu none' means the box renders on its own CPU)"
+\$stat = wsl.exe -d \$Distro -u ccsuite -- env SSH_ORIGINAL_COMMAND=gpustat /usr/local/bin/cc-suites runner
+Write-Host "Its GPU now: \$stat"
 Write-Host "Done. The box will send suites and the lander's quick checks here while this laptop is open and not busy (on battery too)."
 PS1
   local src; src="$(id -un)@$(box_name):$f"
@@ -936,7 +998,7 @@ selfcheck(){   # the cases are tests/selfcheck/cc-suites.sh beside this bin/; so
 case "${1:-}" in
   reap) shift; reap "${1:-}";;
   spill) shift; spill "$@";;
-  status) status;;
+  status) shift; status "$@";;
   render) shift; render "$@";;
   runner) runner;;
   laptop-setup) shift; laptop_setup "$@";;
