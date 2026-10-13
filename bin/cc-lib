@@ -19,8 +19,12 @@ boundary reads one file, its own workspace's, and can reach no other.
         misses use 2/4/8 KiB) and ends with COVERAGE (sources, watermark, pending, unreadable, excluded, refused,
         deadline, hook-misses when a write hook failed to index, re-read when this ask had to bring a stale source in
         itself) and OUTCOME answered | partial | not-recorded. It never invents: an empty search is "not
-        recorded in the covered scope", and --need current says in so many words that a live state (a unit, a
-        URL, a token, a process, a merged ref) was not probed — records say what was written, as of their stamps.
+        recorded in the covered scope". --need current SEARCHES NO RECORDS: the object's own routes and the live ledger
+        still run, the query is not searched (`search: skipped` in COVERAGE, outcome partial when no route answered), and
+        a PROBE line above COVERAGE names where the live state is read — `gh pr view`, the landing queue, `tmux
+        list-windows` — with the PR number or row filled in; the caveat says in so many words that a live state (a
+        unit, a URL, a token, a process, a merged ref) was not probed — records say what was written, as of their
+        stamps, and a hit ranked first reads as the state now. --need history finds what was written about it.
         THE LIVE LEDGER: a question that names the spend tier — the word `tier` in the query, or --object tier |
         ~/.cc/state/tier.log — is answered first off ~/.cc/state/tier.log READ AT THAT MOMENT, never off the index:
         `ROUTE live … read now` with the tier, since when, and the change count (any need but current lists the last
@@ -123,10 +127,12 @@ COVERAGE as `not numbers-only` and never read further. Every other workspace is 
 SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), indexed in place at record grain:
   journals    ~/.cc/state/<repo>/<track>/progress.md, <repo>/<alias>-handoff.md | -handover.md — one record per
               dated `## ` entry (kind checkpoint); an entry over 6 KiB is split at paragraphs into linked spans
-  briefs/docs ~/.cc/state/<repo>/*.md (goals, backlog, packets), <track>/task.md, perms/*.md (a permission session's
-              brief and ledger), <project>/docs/**/*.md,
-              <project>/core/docs/*.md, <project>/{CLAUDE,README}.md, ~/*.md (the home guides) — one record per
-              heading (kind document; a heading that says "decision" is kind decision)
+  briefs/docs ~/.cc/state/<repo>/*.md (goals, backlog, packets), <track>/*.md (task.md, pr-body.md, …), perms/*.md
+              (a permission session's brief and ledger), every <project>/**/*.md (a dot-directory and node_modules
+              are not walked; a path a REPO_SOURCES pattern placed is read at that skind only), ~/*.md (the home
+              guides) — one record per heading (kind document; a heading that says "decision" is kind decision)
+  perms log   ~/.cc/state/<repo>/perms/*.jsonl (cc-refusals' ledger): one record per line, a decision kind decision,
+              any other line an event, its id an exact id
   memory      ~/.claude/projects/*/memory/*.md — one record per file (type feedback → decision, else note); MEMORY.md and
               MEMORY-facts.md, the two index files, are pointers and never sources
   slack       ~/.cc/slack/archive/<target>/<chat>/<YYYY-MM>.jsonl — the daemon's inbound archive (P3): one record per
@@ -158,7 +164,8 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
               is read, the newest by mtime, a tie going to the worktree — a seat writes there and merges at
               milestones, so a search that saw only the primary would miss the current state.
   Never read: anything not listed; a file whose name says secret, credential, password or .env, or token unless it
-  is a .md (a memory file is named after its rule); a file over 4 MiB.
+  is a .md (a memory file is named after its rule); a file over 4 MiB, except a board and the landing queue (UNCAPPED),
+  which are read whole at any size.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
   Exact ids (#pr, repo#pr, SHAs, board row names, channel ids, Slack message ts) live in a column of their own, so tokenisation
   cannot split them; text is FTS5 (unicode61, detail=full, BM25).
@@ -188,6 +195,9 @@ HITS = 8               # search hits shown per page
 FTS_DEADLINE = 2.0     # seconds, one index operation
 RECONCILE_BUDGET = 1.5 # seconds `ask` spends bringing stale sources in before it searches
 MAX_SOURCE = 4 << 20   # a registered file over this is unreadable, not read
+# …except these, read whole at any size: a busy repo's board passed 4 MiB in 2026-10 and every row, note and log item
+# on it dropped out of the index, and the landing queue only grows. Both are re-read at record grain, so size costs a parse.
+UNCAPPED = ("board", "land-queue")
 NEEDS = ("current", "decision", "history", "aggregate")   # kinds: event note decision finding document checkpoint chat
 # kind fit per need: "a decision outranks a journal opinion about it"; a state record outranks prose for `current`
 FIT = {"current": {"event": 3, "finding": 3, "checkpoint": 2, "note": 2, "decision": 1, "document": 0, "chat": 0},
@@ -488,6 +498,10 @@ def registry():
             add(p, "doc", repo, os.path.basename(os.path.dirname(p)))
         for p in sorted(glob.glob(os.path.join(st, "perms", "*.md"))):   # a repo's permission session: its role and its decisions
             add(p, "doc", repo, "perms")
+        for p in sorted(glob.glob(os.path.join(st, "perms", "*.jsonl"))):   # …and its JSONL ledgers (cc-refusals' refusals and decisions)
+            add(p, "perms-log", repo, "perms")
+        for p in sorted(glob.glob(os.path.join(st, "*", "*.md"))):   # every other .md in a track's dir: pr-body, slack-post, notes
+            add(p, "doc", repo, os.path.basename(os.path.dirname(p)))
         for p in sorted(glob.glob(os.path.join(st, "*.md"))):
             b = os.path.basename(p)[:-3]
             if b.endswith("-handoff") or b.endswith("-handover"):
@@ -495,15 +509,13 @@ def registry():
             else:
                 add(p, "doc", repo)
         if proj and os.path.isdir(proj):
-            for pat in ("docs/**/*.md", "core/docs/*.md", "CLAUDE.md", "README.md", "core/README.md"):
-                for p in sorted(glob.glob(os.path.join(proj, pat), recursive=True)):
-                    add(p, "doc", repo)
             # REPO_SOURCES, "over the project path and each live course-seat worktree, worktree first": the trees are
             # every worktree under ~/.cc/worktrees/<repo>/ and then the primary; of the copies of one relative path
             # the newest by mtime is read (a tie goes to the worktree, first in the order) and the others are not —
             # the design's "a newer copy in a worktree wins over the primary", and a seat left behind by main loses.
             trees = [(t, os.path.basename(t)) for t in sorted(glob.glob(os.path.join(H, ".cc", "worktrees", repo, "*")))
                      if os.path.isdir(t) and not os.path.islink(t)] + [(proj, "")]
+            claimed = set()   # a path a REPO_SOURCES pattern placed (its primary copy too) is not read again as a plain doc
             for pat, skind in REPO_SOURCES.get(repo, ()):
                 best = {}   # relative path -> (mtime, path, track)
                 for tree, track in trees:
@@ -517,6 +529,15 @@ def registry():
                             best[rel] = (mt, p, track)
                 for rel in sorted(best):
                     add(best[rel][1], skind, repo, best[rel][2])
+                    claimed.add(os.path.abspath(os.path.join(proj, rel)))
+            # every .md in the project, at heading grain: docs/, core/docs/, a README or a CLAUDE.md anywhere, plans and
+            # notes kept beside the code. A dot-directory (.git, .venv, .cc) and node_modules are not walked.
+            for d, dirs, files in os.walk(proj):
+                dirs[:] = sorted(x for x in dirs if not x.startswith(".") and x != "node_modules")
+                for fn in sorted(files):
+                    p = os.path.abspath(os.path.join(d, fn))
+                    if fn.endswith(".md") and p not in claimed:
+                        add(p, "doc", repo)
     for p in sorted(glob.glob(os.path.join(H, "*.md"))):
         add(p, "doc")
     for p in sorted(glob.glob(os.path.join(H, ".claude", "projects", "*", "memory", "*.md"))):
@@ -778,6 +799,29 @@ def parse_queue(path, text):
     return recs
 
 
+def parse_perms_log(path, text):
+    """A permission session's JSONL ledgers (perms/*.jsonl, e.g. cc-refusals' refusals.jsonl), one record per line:
+    a line of kind decision is kind decision, any other line an event. The text is the line's own fields, and its id
+    is an exact id, so a refusal and the decision on it are found together."""
+    recs = []
+    for i, l in enumerate(text.split("\n")):
+        if not l.strip():
+            continue
+        try:
+            d = json.loads(l)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        k = str(d.get("kind", ""))
+        rid = str(d.get("id", ""))
+        body = " · ".join(f"{a}: {v if isinstance(v, str) else json.dumps(v)}" for a, v in d.items())
+        recs.append(dict(kind="decision" if k == "decision" else "event", title=f"perms {k} {rid}".strip(),
+                         ts=str(d.get("at") or d.get("ts") or ""), text=body[:4000], span=f"L{i + 1}", part=0, track="perms",
+                         extra_ids={rid} if rid else set()))
+    return recs
+
+
 FAIL_ID = re.compile(r"\b[cfi]-[0-9a-f]{8,10}\b")   # cc-failures' ids: c- a cluster, f- a record, i- a claim
 
 
@@ -920,8 +964,8 @@ def parse_chatlog(path, text, track):
 
 def parse(path, skind, repo, track, rows):
     with open(path, "rb") as f:
-        raw = f.read(MAX_SOURCE + 1)
-    if len(raw) > MAX_SOURCE:
+        raw = f.read() if skind in UNCAPPED else f.read(MAX_SOURCE + 1)
+    if skind not in UNCAPPED and len(raw) > MAX_SOURCE:
         raise ValueError("over 4 MiB")
     text = raw.decode("utf-8", "replace")
     if skind in ("journal", "doc", "memory"):
@@ -944,6 +988,8 @@ def parse(path, skind, repo, track, rows):
         return parse_queue(path, text)
     if skind == "failures":
         return parse_failures(path, text, repo)
+    if skind == "perms-log":
+        return parse_perms_log(path, text)
     if skind == "slack":
         return parse_slack(path, text)
     if skind == "docs":
@@ -1520,6 +1566,14 @@ def live_read(name, path, need):
     return lines, ""
 
 
+def probe_line(o):
+    """The --need current pointer: the three places live state is read from, with the object filled in when it is one."""
+    pr = o[2] if o and o[0] == "pr" else "<n>"
+    win = o[2] if o and o[0] == "row" else "<name>"
+    return (f"PROBE (--need current searches no records): gh pr view {pr} --json state,mergedAt,headRefOid · "
+            f"grep '#{pr}' ~/.cc/state/land/queue.log | tail -3 · tmux list-windows -t main | grep '{win}'")
+
+
 def ask(argv):
     obj, need, repo, cap, q = None, "history", None, PAGE, []
     i = 0
@@ -1649,7 +1703,10 @@ def ask(argv):
         if kind in ("pr", "id"):
             sections.append(("records naming it, newest first", by_ids(c, object_ids, orepo, limit=HITS)))
     hits, phase, deadline_hit = ([], "", False)
-    if query:
+    # --need current SEARCHES NOTHING: a record says what was written as of its stamp, and a hit ranked first reads as
+    # the state now. The object's own routes above still run; the query gets a PROBE line naming where the state lives.
+    skipped = bool(query) and need == "current"
+    if query and not skipped:
         hits, phase, deadline_hit = search(c, query, repo, need, object_ids)
     shown_rids = set()
     routed = 0
@@ -1666,9 +1723,9 @@ def ask(argv):
                + (f" · hook-misses {hm}" if hm else "")
                + (f" · re-read {cov['indexed']}" if cov["indexed"] else "")   # sources this ask had to bring in itself: the hooks' misses, measured
                + ((" · host-indexed, this workspace only" + ("" if os.path.isfile(dbpath()) else " · NO FILE BOUND YET (the host has not indexed this workspace)")) if member else "")
-               + (f" · search {phase}-phase" if phase else (" · search: no hit" if query else ""))
+               + (f" · search {phase}-phase" if phase else (" · search: skipped (need current)" if skipped else " · search: no hit" if query else ""))
                + (" · DEADLINE HIT (partial)" if deadline_hit else ""))
-    tail = [covline] + ([CURRENT_CAVEAT] if need == "current" else [])
+    tail = ([probe_line(o)] if need == "current" else []) + [covline] + ([CURRENT_CAVEAT] if need == "current" else [])
     last_tpl = f"OUTCOME not-recorded · {cap} bytes · 99999 ms · ticket {T} turn 1 · budget {TICKET_CAP} left {TICKET_CAP}"
     reserve = sum(len(l.encode()) + 1 for l in tail) + len(header.encode()) + 1 + len(last_tpl.encode()) + 1
     budget = cap - reserve
@@ -1724,7 +1781,10 @@ def ask(argv):
             for h, _ in groups:
                 counts[h[2]] = counts.get(h[2], 0) + 1
             body.append("  aggregate over the index only (not a corpus scan): " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
-    if query and not groups and not routed:
+    if skipped and not routed:
+        body.append("  search skipped: --need current reads the state where it lives (PROBE below), not the index; "
+                    "--need history finds what was written about it")
+    if query and not groups and not routed and not skipped:
         body.append("  not recorded: no record in the covered scope matches; the two phases (all words, any word) found nothing"
                     + (f"; {len(cov['pending'])} source(s) not yet searched (pending)" if cov["pending"] else ""))
     # OUTCOME: answered when a route or an all-words hit was shown; partial when only any-word leads were, or nothing
@@ -1732,7 +1792,7 @@ def ask(argv):
     # complete and holds nothing. The cap cutting a packet short is not partial coverage — the packet says what it cut.
     if routed or (query and phase == "and" and shown_hits):
         outcome = "answered"
-    elif groups or (query and phase):
+    elif groups or (query and phase) or skipped:   # a skipped search is not an empty one: nothing was looked for
         outcome = "partial"
     else:
         outcome = "not-recorded"
@@ -2431,9 +2491,14 @@ def selfcheck():
 
         # ---- the other twelve, as the knowledge base sees them
         rc, o = run("ask", "--need", "current", "does the token reach every private repo")
-        ok("miss 2 (token reach): the rule is found (a decision), and the current caveat says the token itself was not probed",
-           "public-repo read proves nothing" in o and "CURRENT:" in o and outcome(o) in ("answered", "partial"))
-        rc, o = run("ask", "--need", "current", "--repo", "r1", "which scopes does the token have")
+        ok("miss 2 (token reach) under --need current: no record is searched — a PROBE line just above COVERAGE, the caveat, partial",
+           "public-repo read proves nothing" not in o and "HITS" not in o and "search skipped" in o
+           and re.search(r"^PROBE .*gh pr view <n> .*queue\.log.*tmux list-windows -t main.*\nCOVERAGE ", o, re.M)
+           and "search: skipped (need current)" in o and "CURRENT:" in o and outcome(o) == "partial")
+        rc, o = run("ask", "--need", "decision", "does the token reach every private repo")
+        ok("…and the same words under --need decision find the rule (a decision), with no PROBE line",
+           "public-repo read proves nothing" in o and "PROBE" not in o)
+        rc, o = run("ask", "--need", "history", "--repo", "r1", "which scopes does the token have")
         ok("miss 3 (token scopes): what exists is a journal line that says the list was typed and not verified — returned as a "
            "checkpoint with its stamp, not as the object", "[checkpoint 2026-09-10T23:30Z]" in o and "Not verified" in o)
         rc, o = run("ask", "--object", "r1#36", "--need", "history", "when was it reviewed")
@@ -2625,6 +2690,7 @@ def selfcheck():
         selfcheck_lessons(th, ok, run, w)
         selfcheck_docs(th, ok, run, w)
         selfcheck_perms(th, ok, run, w)
+        selfcheck_sources(th, ok, run, w)
         selfcheck_quarantine(ok, run)
     finally:
         H = H0
@@ -2652,14 +2718,17 @@ def selfcheck_live(th, ok, run, w):
     with open(log, "a") as f:
         f.write("2026-09-18T18:11:52Z essential -> moderate\n")
     rc, o = run("ask", "--need", "current", "spend tier stop")
-    ok("…and the log moved under it is read as it is now — moderate since the new stamp, 3 changes — with the stale checkpoint below it, not as the tier",
+    ok("…and the log moved under it is read as it is now — moderate since the new stamp, 3 changes — and under --need current the stale checkpoint is not shown at all",
        rc == 0 and "spend tier: moderate since 2026-09-18T18:11:52Z (essential -> moderate) · 3 change(s)" in o
-       and "essential since" not in o and o.index("read now (1)") < o.index("STALE-TIER-PROSE"))
+       and "essential since" not in o and "STALE-TIER-PROSE" not in o)
+    rc, o = run("ask", "--need", "history", "spend tier stop")
+    ok("…while --need history shows that checkpoint below the live route, as a record and not as the tier",
+       rc == 0 and "spend tier: moderate since" in o and o.index("read now (1)") < o.index("STALE-TIER-PROSE"))
     os.remove(log)
     rc, o = run("ask", "--need", "current", "spend tier stop")
     ok("a missing log is a said NO ANSWER: partial, counted unreadable, the stale checkpoint (an all-words hit) not promoted to the tier",
        rc == 0 and "ROUTE live ~/.cc/state/tier.log, read now: NO ANSWER — missing" in o and "spend tier:" not in o
-       and "STALE-TIER-PROSE" in o and outcome(o) == "partial"
+       and "STALE-TIER-PROSE" not in o and outcome(o) == "partial"
        and re.search(r"^COVERAGE .*unreadable [1-9].*~/\.cc/state/tier\.log \(missing", o, re.M))
     os.mkdir(log)
     rc, o = run("ask", "--need", "current", "spend tier")
@@ -3100,12 +3169,12 @@ def selfcheck_docs(th, ok, run, w):
                                   {"rev": "B", "file": "files/001/001-0004-B_quokka-field-explanation.pdf", "date": "2026-09-24"}]},
         "001-0005": {"number": "001-0005", "project": "001", "title": "Wombat never filed", "revisions": []}}}))
     run("index")
-    rc, o = run("ask", "--need", "current", "quokka field explanation")
+    rc, o = run("ask", "--need", "history", "quokka field explanation")
     ok("docs: a filed document is found by its title, with its current revision's file",
        "001-0004-B" in o and "001-0004-B_quokka-field-explanation.pdf" in o)
-    rc, o = run("ask", "--need", "current", "document 001-0004")
+    rc, o = run("ask", "--need", "history", "document 001-0004")
     ok("docs: a filed document is found by its number", "001-0004-B_quokka-field-explanation.pdf" in o)
-    rc, o = run("ask", "--need", "current", "wombat never filed")
+    rc, o = run("ask", "--need", "history", "wombat never filed")
     ok("docs: a document with no filed revision is not a record", "001-0005" not in o)
 
 
@@ -3226,7 +3295,10 @@ def selfcheck_quarantine(ok, run):
 
 def selfcheck_perms(th, ok, run, w):
     """A repo's permission session keeps its brief and ledger in ~/.cc/state/<repo>/perms/: each .md there is a doc
-    source, and nothing else in that directory is."""
+    source, each .jsonl a perms-log source (one record per line), and nothing else in that directory is."""
+    def outcome(out):
+        m = re.search(r"^OUTCOME (\S+)", out, re.M)
+        return m.group(1) if m else "?"
     w(".cc/state/r1/perms/ledger.md", "# ledger\n\n## 2026-09-28T14:00Z granted\nkangaroo pause rule, for the seat.\n")
     w(".cc/state/r1/perms/refusals.jsonl", json.dumps({"kind": "refusal", "id": "x1", "reason": "platypus refusal"}) + "\n")
     w(".cc/state/r1/perms/old/brief.md", "# brief\n\n## role\nnumbat archived brief.\n")
@@ -3234,9 +3306,69 @@ def selfcheck_perms(th, ok, run, w):
     rc, o = run("ask", "--need", "history", "kangaroo pause rule")
     ok("perms: a permission session's ledger is a source, found by its words", "perms/ledger.md" in o)
     rc, o = run("ask", "--need", "history", "platypus refusal")
-    ok("…and its refusals.jsonl is not (not .md)", "refusals.jsonl" not in o)
+    ok("…and so is its refusals.jsonl, one record per line, the refusal an event carrying its id",
+       "refusals.jsonl[L1]" in o and "[event" in o and "x1" in o)
+    w(".cc/state/r1/perms/notes.txt", "WOMBATTXT line\n")
+    run("index")
+    rc, o = run("ask", "--need", "history", "WOMBATTXT")
+    ok("…but a file there that is neither .md nor .jsonl is not", "WOMBATTXT line" not in o and outcome(o) == "not-recorded")
     rc, o = run("ask", "--need", "history", "numbat archived brief")
     ok("…nor a .md one directory further down", "old/brief.md" not in o)
+
+
+def selfcheck_sources(th, ok, run, w):
+    """What the 2026-10-12 coverage sample found missing: a board and the landing queue over 4 MiB are read whole (any
+    other source over it stays unreadable), every .md in a track's state dir and in the project tree is a doc (not one in
+    node_modules or a dot-directory), and --need current names a probe with the object filled in. Its own repo `cov`."""
+    def outcome(out):
+        m = re.search(r"^OUTCOME (\S+)", out, re.M)
+        return m.group(1) if m else "?"
+    big = "x" * ((4 << 20) + 4096)
+    proj = os.path.join(th, "dev", "cov")
+    w(".cc/boards/cov.json", json.dumps({"repo": "cov", "path": proj, "padding": big, "log": [], "tracks": {
+        "cov-row": {"title": "CAPYBARA-ROW a row on a board over 4 MiB", "kind": "track", "status": "running"}}}))
+    jbig = w(".cc/state/cov/bigj/progress.md", "## 2026-10-12T00:00Z one\nCAPYBARA-BIGJOURNAL " + big + "\n")
+    qp = os.path.join(th, ".cc", "state", "land", "queue.log")
+    keep_q = open(qp).read() if os.path.isfile(qp) else None
+    w(".cc/state/land/queue.log", (keep_q or "") + big + "\n2026-10-12T01:00:00Z\tcov#77 CAPYBARA-QUEUE NOT merged: gates red\n")
+    w(".cc/state/cov/t9/pr-body.md", "# PR\n\n## What changed\nCAPYBARA-PRBODY the body.\n")
+    w(".cc/state/cov/t9/sub/deeper.md", "# deeper\n\nCAPYBARA-DEEPER one level too far.\n")
+    w("dev/cov/src/notes/plan.md", "# plan\n\n## Step\nCAPYBARA-NESTED a plan beside the code.\n")
+    w("dev/cov/node_modules/pkg/README.md", "# pkg\n\nCAPYBARA-NODEMOD vendored.\n")
+    w("dev/cov/.hidden/x.md", "# x\n\nCAPYBARA-DOTDIR hidden.\n")
+    rc, o = run("index")
+    c = db()
+    srcs = dict(c.execute("SELECT path, status FROM sources WHERE path LIKE ? OR path LIKE ? OR path LIKE ?",
+                          (proj + "/%", os.path.join(th, ".cc", "state", "cov") + "/%", "%/cov.json")).fetchall())
+    c.close()
+    rc, o = run("ask", "--need", "history", "CAPYBARA-ROW")
+    ok("a board over 4 MiB is read whole: its row is found, cited at the board",
+       "boards/cov.json[rows/cov-row]" in o and "cov.json (unreadable" not in o)
+    rc, o = run("ask", "--need", "history", "CAPYBARA-BIGJOURNAL")
+    ok("…while a journal over 4 MiB is still unreadable, named so in COVERAGE",
+       "CAPYBARA-BIGJOURNAL " not in o and "progress.md (unreadable: over 4 MiB)" in o and jbig in srcs)
+    rc, o = run("ask", "--object", "cov#77", "--need", "history")
+    ok("the landing queue over 4 MiB is read whole: its line for cov#77 is a landing event",
+       "ROUTE landing events" in o and "CAPYBARA-QUEUE" in o and "PROBE" not in o)
+    rc, o = run("ask", "--object", "cov#77", "--need", "current", "did it land")
+    ok("--need current on a PR: the object's routes still answer, and the PROBE line carries its number",
+       "CAPYBARA-QUEUE" in o and "gh pr view 77 --json" in o and "grep '#77'" in o and "HITS" not in o)
+    rc, o = run("ask", "--need", "history", "CAPYBARA-PRBODY")
+    ok("a track dir's other .md (pr-body.md) is a doc of that track",
+       "cov/t9/pr-body.md[" in o and "[document" in o)
+    rc, o = run("ask", "--need", "history", "CAPYBARA-NESTED")
+    ok("a .md anywhere in the project tree is a doc, not only docs/",
+       "dev/cov/src/notes/plan.md[" in o)
+    ok("…but not one a level under a track dir, in node_modules or in a dot-directory",
+       not any(p.endswith(("sub/deeper.md", "node_modules/pkg/README.md", ".hidden/x.md")) for p in srcs)
+       and os.path.join(proj, "src", "notes", "plan.md") in srcs)
+    os.remove(os.path.join(th, ".cc", "boards", "cov.json"))
+    if keep_q is None:
+        os.remove(qp)
+    else:
+        with open(qp, "w") as f:
+            f.write(keep_q)
+    run("index")
 
 
 def selfcheck_lessons(th, ok, run, w):
@@ -3263,7 +3395,8 @@ def selfcheck_lessons(th, ok, run, w):
       "[2026-09-16T10:53:15.559Z] [CHAT_OK] chatNum=17 msg=1 input=10 output=1069 cost=0.12 totalCost=2.85 response=QUOKKA-ANSWER-ONE: a Poisson limit.\n"
       "[2026-09-16T10:56:33.086Z] [CHAT_START] chatNum=18 msg=1 model=sonnet effort=high message=QUOKKA-TURN-TWO, unanswered yet\n"
       "[2026-09-16T10:57:00.000Z] [CHAT_ERROR] chatNum=18 error=timeout\n")
-    # the same five files under a SECOND registered repo, which has no patterns: never read
+    # the same five files under a SECOND registered repo, which has no patterns: never read at a course skind (its .md
+    # files are plain docs of the project walk, like any project's; its chat.log is no source at all)
     other = os.path.join(th, "dev", "other")
     w(".cc/boards/other.json", json.dumps({"repo": "other", "path": other, "tracks": {}, "log": []}))
     for rel in (course + "COURSE.md", course + "STUDY.md", course + "materials/notes/2026-09-15-ps1.md",
@@ -3292,15 +3425,19 @@ def selfcheck_lessons(th, ok, run, w):
        and "Q: what is QUOKKA-TURN-ONE about?\na second line of the question\n\nA: QUOKKA-ANSWER-ONE" in t1[0][1]
        and not c.execute("SELECT 1 FROM records WHERE repo='lessons' AND (text LIKE '%SERVER_START%' OR text LIKE '%timeout%')").fetchone())
     ok("…a turn whose answer has not arrived is its question alone", len(t2) == 1 and t2[0][1] == "Q: QUOKKA-TURN-TWO, unanswered yet")
-    ok("the same files under the second repo are NOT sources: per repo, not a global glob",
-       not c.execute("SELECT 1 FROM sources WHERE path LIKE ?", (other + "%",)).fetchone()
-       and not c.execute("SELECT 1 FROM records WHERE text LIKE '%QUOKKA-OTHER-REPO%'").fetchone())
+    oth = dict(c.execute("SELECT path, skind FROM sources WHERE path LIKE ?", (other + "%",)).fetchall())
+    ok("the same files under the second repo are NOT course sources: per repo, not a global glob — its four .md are plain "
+       "docs of the project walk and its chat.log is not read",
+       sorted(oth.values()) == ["doc"] * 4 and not any(p.endswith("chat.log") for p in oth)
+       and not c.execute("SELECT 1 FROM records r JOIN sources s ON s.id=r.source_id WHERE s.path LIKE ? AND r.kind!='document'",
+                         (other + "%",)).fetchone())
     c.close()
-    rc, o = run("ask", "--repo", "lessons", "--need", "current", "QUOKKA-CORRECTION-OLD")
+    rc, o = run("ask", "--repo", "lessons", "--need", "history", "QUOKKA-CORRECTION-OLD")
     ok("found by ask: the correction, kind finding, cited at the primary's STUDY.md",
        rc == 0 and outcome(o) == "answered" and "[finding " in o and "~/dev/lessons/lessons/ECE203/STUDY.md[" in o)
     rc, o = run("ask", "--need", "history", "QUOKKA-OTHER-REPO")
-    ok("…and the second repo's copy is not found by ask", outcome(o) == "not-recorded" and "QUOKKA-OTHER-REPO must" not in o)
+    ok("…and ask finds the second repo's copy only as a document, never a finding or a chat",
+       "QUOKKA-OTHER-REPO must" in o and "[finding " not in o and "[chat " not in o)
     # ---- a course seat's worktree: its NEWER STUDY.md wins over the primary's; its OLDER COURSE.md loses to it
     wt = os.path.join(th, ".cc", "worktrees", "lessons", "ece203")
     st2 = w(".cc/worktrees/lessons/ece203/" + course + "STUDY.md", "# ECE203 — study state\n\n## Corrections\n- 2026-09-17: QUOKKA-CORRECTION-NEW, the seat's copy.\n")
@@ -3318,12 +3455,12 @@ def selfcheck_lessons(th, ok, run, w):
        rc == 0 and paths.get(st2) == "ece203" and st not in paths)
     ok("control: the worktree's OLDER COURSE.md loses to the primary's newer copy — the newest wins, not the worktree as such",
        os.path.join(proj, course, "COURSE.md") in paths and co2 not in paths)
-    rc, o = run("ask", "--repo", "lessons", "--need", "current", "QUOKKA-CORRECTION-NEW")
+    rc, o = run("ask", "--repo", "lessons", "--need", "history", "QUOKKA-CORRECTION-NEW")
     ok("found by ask: the seat's correction, cited at the worktree path",
        rc == 0 and outcome(o) == "answered" and "~/.cc/worktrees/lessons/ece203/lessons/ECE203/STUDY.md[" in o)
-    rc, o = run("ask", "--repo", "lessons", "--need", "current", "QUOKKA-CORRECTION-OLD")
+    rc, o = run("ask", "--repo", "lessons", "--need", "history", "QUOKKA-CORRECTION-OLD")
     ok("…and the primary's older correction is gone from the index", outcome(o) == "not-recorded")
-    rc, o = run("ask", "--repo", "lessons", "--need", "current", "QUOKKA-OUTLINE-STALE")
+    rc, o = run("ask", "--repo", "lessons", "--need", "history", "QUOKKA-OUTLINE-STALE")
     ok("…as is the seat's stale outline", outcome(o) == "not-recorded")
     # a tie goes to the worktree: "worktree first"
     os.utime(st, (now - 50, now - 50))

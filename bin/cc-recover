@@ -6,6 +6,9 @@
   cc-recover restore [--boot] bring back every saved session that is not live: resumed on its own conversation,
                               then handed a catch-up turn (cc-recover-restore.service runs it at every boot);
                               a session whose project `cc-pause is <repo>` calls paused is left down and logged
+  cc-recover bringup [--except <repo>...]
+                              the owner's "bring it all back up", in one detached run (a transient user unit; --here
+                              runs it in place): see BRING-UP below
   cc-recover watch-manager    is the user systemd manager alive? Run from the SYSTEM timer
                               config/systemd-system/cc-recover-manager@.timer, which the installer never enables
   cc-recover status           the saved set, the detector's state and its last decisions
@@ -64,6 +67,26 @@ so no record is trusted: one whose names are not from a safe charset, whose repo
 worker flags are not the ones a scan saves, or whose claude is not the box's own ~/.local/bin/claude is REFUSED, logged
 and not relaunched. ~/.cc/recover and its wrapper directory must be this user's alone, and each wrapper is a new file.
 
+BRING-UP (owner, 2026-10-05: "find all the missing cc sessions … restart them", "unpause everything", "prompt planning
+sessions to resume dropped/in progress work"). It holds the restore guard while it runs, so no tick rewrites the saved
+set and no restore runs beside it, and a repo named in --except is left exactly as it is in every step below:
+  1. `cc-pause off <repo> --only` for each repo `cc-pause list` names, so an excluded child keeps its pause.
+  2. Relaunches every seat, orch and member with no live claude under its window, whether the window is gone or holds
+     only a shell: the saved set's records (seats and orchs resumed on their sid), then a window's name for a shell
+     window the set lacks (cold), then every ~/dev/<h> with .cc/member-workspace (cold). The relaunch rules are
+     restore's, but 2-4 s apart, and its catch-up turn asks the session to pick its work back up.
+  3. Relaunches each worker loop that stopped on the usage limit (loop.log ends on `exit 8` or a limit wait, no
+     cc-loop in its window, its journal's last STATUS neither DONE nor BLOCKED) with its own --loop and --budget,
+     read off its last `iter i/N start (budget $X` line, and --resume-last.
+  4. Lists each window showing the usage-limit dialog ("What do you want to do?"). It never answers one: sending keys
+     to a workload is refused, so a person picks the option.
+  5. Sends each live seat and orch it did not just relaunch one cc-msg asking it to resume dropped or in-progress
+     work. A window on the dialog gets none, since the message would land in the dialog.
+  6. Writes one summary to bringup.log and cc-notify: what it unpaused and relaunched, whom it asked, what it left
+     and why, the dialog windows, and member credentials that look blank (296 bytes or fewer, or no file); a member
+     whose credential looks blank is not launched.
+  perms is never relaunched (its relaunch is the planning seat's); bring-up only says when it is down.
+
 KEYS (cc-config; the environment wins): CC_RECOVER_REBOOT off|on · CC_RECOVER_RESTORE on|off (off = the boot
 restore does nothing) · CC_RECOVER_NET_MIN · CC_RECOVER_GAP_H · CC_RECOVER_HOLD_MIN · CC_RECOVER_MASS_MIN · CC_RECOVER_PROBES
 ("host:port …", default 1.1.1.1:443 8.8.8.8:53 9.9.9.9:443) · CC_RECOVER_STAGGER (20 s between launches) ·
@@ -71,7 +94,7 @@ CC_RECOVER_SETTLE (15 s from a claude coming up to its catch-up). Fixtures only:
 CC_RECOVER_TMUX, CC_RECOVER_PROC, CC_RECOVER_BIN (where cc, cc-msg, cc-boot, cc-notify are), CC_RECOVER_REBOOT_CMD,
 CC_RECOVER_RESTORE_CMD, CC_RECOVER_MANAGER_CMD.
 """
-import calendar, json, math, os, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time
+import calendar, json, math, os, random, re, shlex, shutil, socket, stat, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 # Box-owned, like ~/.cc/lander and ~/.cc/steward: never under ~/.cc/state/<name>, because a member workspace binds
@@ -769,26 +792,32 @@ def paused(repo):
         return False
 
 
-def relaunch(sessions, msg, env):
-    stagger = cfg_num("CC_RECOVER_STAGGER", 20)
+def relaunch(sessions, msg, env, live=None, stagger=None, report=None, notify=True, logname="restore.log"):
+    """Launch each record that is safe, not live and not paused, seats first. `live(rec)` says a session is up
+    (default: its window exists); `stagger()` is the pause after each launch (default CC_RECOVER_STAGGER); a
+    `report` dict gets the back/failed/already/paused/refused windows; notify=False sends no cc-notify line; each line goes
+    to `logname` in the state dir."""
+    live = live or (lambda r: wid_live(r["window"]))
+    gap = stagger or (lambda: cfg_num("CC_RECOVER_STAGGER", 20))
     settle = cfg_num("CC_RECOVER_SETTLE", 15)
-    back, failed, already, refused = [], [], [], []
+    back, failed, already, refused, held = [], [], [], [], []
     sessions.sort(key=lambda r: (ORDER.index(r.get("kind")) if isinstance(r, dict) and r.get("kind") in ORDER else 9,
                                  str(r.get("window", "")) if isinstance(r, dict) else ""))
     for rec in sessions:
         why = unsafe(rec)
         if why:
             refused.append(rec)
-            log("restore.log", f"{json.dumps(rec.get('window') if isinstance(rec, dict) else None)[:80]}: REFUSED, {why} — not relaunched")
+            log(logname, f"{json.dumps(rec.get('window') if isinstance(rec, dict) else None)[:80]}: REFUSED, {why} — not relaunched")
             continue
         w = rec["window"]
-        if wid_live(w):
+        if live(rec):
             already.append(w)
-            log("restore.log", f"{w}: already live")
+            log(logname, f"{w}: already live")
             continue
         if paused(rec["repo"]):   # a paused project spends nothing the box starts on its own (cc-pause)
             already.append(w)
-            log("restore.log", f"{w}: {rec['repo']} is paused — left down")
+            held.append(w)
+            log(logname, f"{w}: {rec['repo']} is paused — left down")
             continue
         e = dict(env)
         if rec["kind"] in ("seat", "orch") and rec.get("sid"):
@@ -796,10 +825,10 @@ def relaunch(sessions, msg, env):
                 e["CC_CLAUDE"] = wrapper(rec)
             except (OSError, RuntimeError) as x:
                 failed.append(w)
-                log("restore.log", f"{w}: no resume wrapper ({x}) — not relaunched")
+                log(logname, f"{w}: no resume wrapper ({x}) — not relaunched")
                 continue
         rc, out = run(launch_argv(rec), env=e, timeout=110 if rec["kind"] == "worker" else 90)
-        log("restore.log", f"{w}: {rec['kind']} launch rc={rc}{' sid=' + rec['sid'] if rec.get('sid') else ''} {out[-160:]}")
+        log(logname, f"{w}: {rec['kind']} launch rc={rc}{' sid=' + rec['sid'] if rec.get('sid') else ''} {out[-160:]}")
         if rc != 0:
             failed.append(w)
             continue
@@ -814,23 +843,248 @@ def relaunch(sessions, msg, env):
                 time.sleep(3)
             if not cp:
                 failed.append(w)
-                log("restore.log", f"{w}: no claude under the window after 90 s — no catch-up sent")
+                log(logname, f"{w}: no claude under the window after 90 s — no catch-up sent")
             else:
                 time.sleep(settle)
                 if rec.get("track"):   # a track or a member track
                     mrc, mout = run([os.path.join(BIN, "cc"), rec["repo"], rec["track"], "--say", msg], env=env)
                 else:
                     mrc, mout = run([os.path.join(BIN, "cc-msg"), w, msg], env=env)
-                log("restore.log", f"{w}: catch-up rc={mrc} {mout[:160]}")
+                log(logname, f"{w}: catch-up rc={mrc} {mout[:160]}")
                 back.append(w)
-        time.sleep(stagger)
+        time.sleep(gap())
+    if report is not None:
+        report.update(back=back, failed=failed, already=already, paused=held, refused=[r.get("window") if isinstance(r, dict) else None for r in refused])
     summary = (f"Brought back {len(back)} of {len(sessions) - len(already) - len(refused)} sessions"
                + (f"; these did not come up: {', '.join(failed)}" if failed else "")
-               + (f"; {len(refused)} saved record(s) refused as unsafe, see restore.log" if refused else ""))
-    log("restore.log", "done: " + summary)
-    if back or failed or refused:
+               + (f"; {len(refused)} saved record(s) refused as unsafe, see {logname}" if refused else ""))
+    log(logname, "done: " + summary)
+    if notify and (back or failed or refused):
         run([os.path.join(BIN, "cc-notify"), "-t", "box recovered", summary + "."], env=env, timeout=60)
     return 1 if failed or refused else 0
+
+
+# ---- bring-up: everything back up, on the owner's word ----
+
+CCSTATE = os.path.join(HOME, ".cc/state")      # <repo>/<track>/loop.log and progress.md, as cc-loop writes them
+MEMBERS = os.path.join(HOME, ".cc/members")    # <handle>/credentials.json, as cc-sandbox mints them
+BLANK_CRED = 296                               # a signed-out credential file is this many bytes or fewer
+LIMIT_DIALOG = "What do you want to do?"       # the usage-limit dialog's prompt
+ITER_START = re.compile(r" iter \d+/(\d+) start \(budget \$([0-9][0-9.]*)")
+
+
+def bringup_text():
+    return ("The owner asked for the whole box to be brought back up, so every project is unpaused and every missing "
+            "session was relaunched. Check your Slack channel and threads, your board rows and your journal for work "
+            "that was dropped or left in progress, and pick it back up: re-dispatch a row whose worker stopped, and "
+            "answer whatever is waiting on you. Once you have, post one short update in your own channel saying what "
+            "is running again and what is still waiting.")
+
+
+def member_ws(repo):
+    return os.path.isfile(os.path.join(DEV, repo, ".cc/member-workspace"))
+
+
+def blank_cred(h):
+    """A member credential that looks signed out: no file, or one no bigger than the blank shape `cc-sandbox signout` leaves."""
+    try:
+        return os.stat(os.path.join(MEMBERS, h, "credentials.json")).st_size <= BLANK_CRED   # the brief: "stat size 296 or less"
+    except OSError:
+        return True
+
+
+def by_name(name):
+    """A seat, orch or member record read off a window's name alone, for a window that holds only a shell, which the
+    scan saves nothing for. It comes back cold. Tracks and workers (a `/` in the name) are not read this way."""
+    if skipped_name(name) or "/" in name:
+        return None
+    repo, at, alias = name.partition("@")
+    if at:
+        return {"kind": "orch", "window": name, "repo": repo, "alias": alias}
+    return {"kind": "member" if member_ws(repo) else "seat", "window": name, "repo": repo}
+
+
+def tail_lines(f, n=65536):
+    try:
+        with open(f, "rb") as h:
+            h.seek(0, 2)
+            h.seek(max(0, h.tell() - n))
+            return h.read().decode(errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def limit_stopped(excluded, running):
+    """Worker loops that stopped on the Claude usage limit, as worker records: loop.log's last line is cc-loop's
+    `exit 8` (a limit that outlasted its wait) or a limit wait that nothing is running any more, the journal's last
+    STATUS line is neither DONE nor BLOCKED, and no cc-loop runs in its window. --loop and --budget are the loop's
+    own, off its last `iter i/N start (budget $X` line."""
+    out = []
+    try:
+        repos = sorted(os.listdir(CCSTATE))
+    except OSError:
+        return out
+    for repo in repos:
+        if repo in excluded or not NAME.fullmatch(repo):
+            continue
+        try:
+            tracks = sorted(os.listdir(os.path.join(CCSTATE, repo)))
+        except OSError:
+            continue
+        for t in tracks:
+            d = os.path.join(CCSTATE, repo, t)
+            if not NAME.fullmatch(t) or f"{repo}/{t}" in running:
+                continue
+            lines = [l for l in tail_lines(os.path.join(d, "loop.log")) if l.strip()]
+            if not lines or not (" exit 8: " in lines[-1] or " usage limit — waiting until " in lines[-1]):
+                continue
+            status = [l for l in tail_lines(os.path.join(d, "progress.md")) if l.startswith("STATUS: ")]
+            if status and (status[-1].strip() == "STATUS: DONE" or status[-1].startswith("STATUS: BLOCKED")):
+                continue   # the brief: "restarts worker loops that stopped on a usage limit (not BLOCKED and not done)"
+            rec = {"kind": "worker", "window": f"{repo}/{t}", "repo": repo, "track": t, "loop": "1", "flags": []}
+            m = next((m for m in map(ITER_START.search, reversed(lines)) if m), None)
+            if m:
+                rec["loop"], rec["flags"] = m.group(1), ["--budget", m.group(2)]
+            out.append(rec)
+    return out
+
+
+def on_limit_dialog(name):
+    return LIMIT_DIALOG in (tmux("capture-pane", "-p", "-t", f"main:={name}") or "")
+
+
+def bringup(args):
+    """`cc-recover bringup [--except <repo>...]`: hand the run to a transient user unit and return at once, since it
+    takes minutes; `--here` runs it in this process (the unit's own call, and the selfcheck's)."""
+    excluded, here, i = [], False, 0
+    while i < len(args):
+        if args[i] == "--here":
+            here = True
+        elif args[i] == "--except":
+            while i + 1 < len(args) and not args[i + 1].startswith("--"):
+                excluded.append(args[i + 1]); i += 1
+        else:
+            print(f"cc-recover bringup: unknown argument {args[i]!r}", file=sys.stderr)
+            return 2
+        i += 1
+    if here:
+        return bringup_here(excluded)
+    unit = f"cc-recover-bringup-{int(now())}"
+    rc, out = run(["systemd-run", "--user", "--collect", "--unit", unit, os.path.realpath(__file__), "bringup", "--here",
+                   *(["--except", *excluded] if excluded else [])], timeout=30)
+    if rc != 0:
+        print(f"cc-recover bringup: could not start {unit} (rc={rc}: {out[-200:]})", file=sys.stderr)
+        return 1
+    print(f"started {unit}: its summary goes to {path('bringup.log')} and one cc-notify line when it ends, in a few minutes")
+    return 0
+
+
+def bringup_here(excluded):
+    # the restore guard: no tick rewrites the saved set, and no restore or second bring-up runs, until this one ends
+    if restoring():
+        msg = "a restore or bring-up is already running — this bring-up does nothing"
+        log("bringup.log", msg)
+        print(msg)
+        return 1
+    store("restoring", {"pid": os.getpid(), "boot_id": boot_id(), "start": proc_start(os.getpid())})
+    try:
+        return bringup_held(excluded)
+    finally:
+        try:
+            os.remove(path("restoring"))
+        except OSError:
+            pass
+
+
+def bringup_held(excluded):
+    env = {k: v for k, v in os.environ.items() if k not in ("CC_SLACK_ALIAS", "CC_CLAUDE")}
+    gap = lambda: random.uniform(2, 4)   # 2-4 s between launches: the load reached 35 on 10-03 with them all at once
+    left, unpaused = [], []
+    for x in excluded:
+        if not os.path.isdir(os.path.join(DEV, x)):
+            left.append(f"{x}: named in --except, but there is no such project")
+    log("bringup.log", f"bring-up{' except ' + ', '.join(excluded) if excluded else ''}")
+    # (1) every paused project back on, one at a time with --only, so an excluded child keeps its pause
+    pause = os.path.join(BIN, "cc-pause")
+    rc, out = run([pause, "list"], env=env, timeout=30)
+    for repo in (out.split() if rc == 0 else []):
+        if repo in excluded:
+            left.append(f"{repo}: excluded, still paused")
+        elif NAME.fullmatch(repo):
+            prc, pout = run([pause, "off", repo, "--only"], env=env, timeout=60)
+            log("bringup.log", f"cc-pause off {repo} --only rc={prc} {pout[-160:]}")
+            (unpaused.append(repo) if prc == 0 else left.append(f"{repo}: cc-pause off failed (rc={prc})"))
+    # (4) the windows on the usage-limit dialog are listed, never answered: keys sent to a workload are refused
+    ws = windows() or []
+    stuck = [n for n, _ in ws if n != "box" and on_limit_dialog(n)]
+    # (2) every seat, orch and member with no live claude under its window, whether the window is gone or holds a shell
+    saved = load("live.json", {})
+    recs = {}
+    for r in (saved.get("sessions") or {}).values() if isinstance(saved, dict) else []:
+        if isinstance(r, dict) and r.get("kind") in ("seat", "orch", "member") and isinstance(r.get("window"), str):
+            recs[r["window"]] = r
+    for n, _ in ws:
+        r = by_name(n)
+        if r and n not in recs:
+            recs[n] = r
+    try:
+        members = sorted(h for h in os.listdir(DEV) if member_ws(h))
+    except OSError:
+        members = []
+    for h in members:
+        recs.setdefault(h, {"kind": "member", "window": h, "repo": h})
+    blank = [h for h in members if h not in excluded and blank_cred(h)]
+    want = []
+    for w, r in sorted(recs.items()):
+        if r.get("repo") in excluded:
+            left.append(f"{w}: excluded, left as it is")
+        elif claude_pid(w) is not None:
+            continue
+        elif r["kind"] == "member" and r.get("repo") in blank:
+            left.append(f"{w}: its credential looks blank, so it was not launched")
+        else:
+            want.append(r)
+    # (3) worker loops that stopped on the usage limit
+    running = {n for n, p in ws if (classify(n, p) or {}).get("kind") == "worker"}
+    want += limit_stopped(excluded, running)
+
+    def up(r):
+        if r["kind"] == "worker":
+            return any(n == r["window"] and (classify(n, p) or {}).get("kind") == "worker" for n, p in windows() or [])
+        return claude_pid(r["window"]) is not None
+    rep = {}
+    relaunch(want, bringup_text(), env, live=up, stagger=gap, report=rep, notify=False, logname="bringup.log")
+    left += [f"{w}: did not come up, see bringup.log" for w in rep.get("failed", [])]
+    left += [f"{w}: refused as unsafe, see bringup.log" for w in rep.get("refused", [])]
+    left += [f"{w}: its project is still paused" for w in rep.get("paused", [])]
+    # (5) every live seat and orch not just relaunched (those had the same message) is asked to pick its work back up
+    told = []
+    for n, p in windows() or []:
+        r = classify(n, p)
+        if (r and r["kind"] in ("seat", "orch") and r["repo"] not in excluded and n not in rep.get("back", [])
+                and n not in stuck and claude_under(p)):
+            mrc, mout = run([os.path.join(BIN, "cc-msg"), n, bringup_text()], env=env)
+            log("bringup.log", f"{n}: resume message rc={mrc} {mout[:160]}")
+            (told.append(n) if mrc == 0 else left.append(f"{n}: the resume message failed (rc={mrc})"))
+            time.sleep(gap())
+    if not any(n == "perms" and claude_under(p) for n, p in windows() or []):
+        left.append("perms: not live, and left alone — its relaunch is the planning seat's")
+    # (6) one summary
+    back = rep.get("back", [])
+    lines = [f"unpaused: {', '.join(unpaused) or 'nothing'}",
+             f"relaunched: {', '.join(back) or 'nothing'}",
+             f"asked to resume their work: {', '.join(told) or 'nobody'}",
+             f"left: {'; '.join(left) or 'nothing'}",
+             f"on the usage-limit dialog, to answer by hand: {', '.join(stuck) or 'none'}",
+             f"member credentials that look blank: {', '.join(blank) or 'none'}"]
+    for l in lines:
+        log("bringup.log", l)
+        print(l)
+    run([os.path.join(BIN, "cc-notify"), "-t", "box brought back up",
+         f"Unpaused {len(unpaused)} projects, relaunched {len(back)} sessions and asked {len(told)} seats to resume; "
+         f"{len(left)} left and {len(stuck)} on the usage-limit dialog. The list is in {path('bringup.log')}."], env=env, timeout=60)
+    return 1 if rep.get("failed") or rep.get("refused") else 0
+
 
 
 def status():
@@ -860,10 +1114,11 @@ def selfcheck():
 
     def fixture():
         """A fresh state dir, fake /proc, fake tmux and fake bin of its own: no case reads another's leftovers."""
-        global STATE, PROC, TMUX, BIN, DEV, CLAUDE
+        global STATE, PROC, TMUX, BIN, DEV, CLAUDE, CCSTATE, MEMBERS
         d = tempfile.mkdtemp(prefix="cc-recover-st.")
         made.append(d)
         STATE, PROC, BIN, DEV, CLAUDE = f"{d}/state", f"{d}/proc", f"{d}/bin", f"{d}/dev", "/c/claude"
+        CCSTATE, MEMBERS = f"{d}/ccstate", f"{d}/members"
         for x in (PROC, BIN, f"{PROC}/sys/kernel/random", f"{PROC}/net", *(f"{DEV}/{r}" for r in ("r1", "r2", "r3", "m1"))):
             os.makedirs(x, exist_ok=True)
         open(f"{PROC}/sys/kernel/random/boot_id", "w").write("boot-1\n")
@@ -872,14 +1127,18 @@ def selfcheck():
         open(f"{d}/windows.tsv", "w").close()
         TMUX = f"{BIN}/tmux"
         with open(TMUX, "w") as f:   # has-session/list-windows off windows.tsv; no file = the server is down
-            f.write(f"#!/bin/sh\n[ -f {d}/windows.tsv ] || exit 1\n[ \"$1\" = list-windows ] && cat {d}/windows.tsv\nexit 0\n")
+            f.write(f"#!/bin/sh\n[ -f {d}/windows.tsv ] || exit 1\n[ \"$1\" = list-windows ] && cat {d}/windows.tsv\n"
+                    # capture-pane -p -t main:=<w> prints {d}/pane.main__<w> with / : = @ as _; any other verb is logged
+                    f"[ \"$1\" = capture-pane ] && {{ f={d}/pane.$(printf %s \"$4\" | tr '/:=@' '____'); [ -f \"$f\" ] && cat \"$f\"; exit 0; }}\n"
+                    f"case \"$1\" in has-session|list-windows) ;; *) printf 'tmux|%s|' \"$@\" >> {d}/calls; echo >> {d}/calls;; esac\nexit 0\n")
         for tool in ("cc", "cc-msg", "cc-boot", "cc-notify"):
             with open(f"{BIN}/{tool}", "w") as f:
                 f.write(f"#!/bin/sh\nprintf '%s|' {tool} \"$@\" >> {d}/calls; echo >> {d}/calls\n")
         with open(f"{BIN}/cc-config", "w") as f:
             f.write("#!/bin/sh\necho \"$4\"\n")
-        with open(f"{BIN}/cc-pause", "w") as f:   # `is <repo>`: paused when the fixture made {d}/paused-<repo>
-            f.write(f"#!/bin/sh\n[ -f {d}/paused-$2 ]\n")
+        with open(f"{BIN}/cc-pause", "w") as f:   # paused when the fixture made {d}/paused-<repo>; `off` removes it and is logged
+            f.write(f"#!/bin/sh\ncase \"$1\" in\n is) [ -f {d}/paused-$2 ];;\n list) for f in {d}/paused-*; do [ -f \"$f\" ] && echo \"${{f##*/paused-}}\"; done; exit 0;;\n"
+                    f" off) printf '%s|' cc-pause \"$@\" >> {d}/calls; echo >> {d}/calls; rm -f {d}/paused-$2;;\nesac\n")
         for x in os.listdir(BIN):
             os.chmod(f"{BIN}/{x}", 0o755)
         return d
@@ -1290,6 +1549,102 @@ def selfcheck():
         except RuntimeError:
             loose = "refused"
         check("state: a state directory others can write is refused", loose == "refused" and not os.path.exists(path("live.json")))
+
+        # 9. bring-up: unpause, relaunch what is missing, restart limit-stopped workers, list dialogs, ask seats to resume
+        def bringup_box(d):
+            for m in ("m1", "m2"):
+                os.makedirs(f"{DEV}/{m}/.cc"); open(f"{DEV}/{m}/.cc/member-workspace", "w").close()
+            for m, size in (("m1", 400), ("m2", BLANK_CRED)):
+                os.makedirs(f"{MEMBERS}/{m}"); open(f"{MEMBERS}/{m}/credentials.json", "w").write("x" * size)
+            for r in ("r2", "r3"):
+                open(f"{d}/paused-{r}", "w").close()
+            store("live.json", {"saved": "2026-10-11T01:00:00Z", "sessions": {
+                "r1@ops": {"kind": "orch", "window": "r1@ops", "repo": "r1", "alias": "ops", "sid": "sid-orch", "claude": "/c/claude"},
+                "r2": {"kind": "seat", "window": "r2", "repo": "r2", "sid": "", "claude": ""}}})
+            proc(100, ["bash", "/b/cc", "__runmain", "r1"], [101]); proc(101, ["/c/claude"])          # live seat
+            proc(110, ["-bash"]); proc(120, ["-bash"]); proc(150, ["-bash"])                          # r1@ops, r3, perms: a shell only
+            proc(130, ["bash", "/b/cc", "__runorch", "r1@x"], [131]); proc(131, ["/c/claude"])       # live, on the dialog
+            proc(140, ["bash", "-c", "cc-loop r1 run --max-iter 2"], [141]); proc(141, ["/c/claude", "-p", "go"])
+            proc(160, ["bash", "/b/cc-rc"])
+            open(f"{d}/windows.tsv", "w").write("box\t160\nperms\t150\nr1\t100\nr1@ops\t110\nr3\t120\nr1@x\t130\nr1/run\t140\n")
+            open(f"{d}/pane.main__r1_x", "w").write("You've hit your limit\nWhat do you want to do?\n> 1. Stop and wait\n")
+            def loop(repo, t, last, status=None, n=3, budget="8"):
+                os.makedirs(f"{CCSTATE}/{repo}/{t}")
+                open(f"{CCSTATE}/{repo}/{t}/loop.log", "w").write(
+                    f"2026-10-11T01:00:00Z iter 1/{n} start (budget ${budget}, turns 80, model m)\n2026-10-11T01:10:00Z {last}\n")
+                if status:
+                    open(f"{CCSTATE}/{repo}/{t}/progress.md", "w").write(f"## iter\n- x\n{status}\n")
+            lim = "exit 8: The Claude usage limit lasts until 09:00, which is longer than the loop waits."
+            loop("r1", "job", lim)
+            loop("r1", "wait", "usage limit — waiting until 2026-10-11T09:00Z, then rerunning iteration 2", n=2, budget="15")
+            loop("r1", "done1", lim, "STATUS: DONE"); loop("r1", "blk", lim, "STATUS: BLOCKED: which one?")
+            loop("r1", "ok", "exit 0: done"); loop("r3", "lim", lim); loop("r1", "run", lim)
+            with open(f"{BIN}/cc", "w") as f:
+                f.write(f"#!/bin/sh\nprintf '%s|' cc \"$@\" >> {d}/calls; printf 'CC_CLAUDE=%s' \"$CC_CLAUDE\" >> {d}/calls; echo >> {d}/calls\n")
+
+        def launched(d, w):
+            repo, at, alias = w.partition("@")
+            want = f"cc|{repo}|--orch|{alias}|" if at else f"cc|{w}|"
+            return os.path.exists(f"{d}/calls") and any(c.startswith(want) for c in open(f"{d}/calls").read().splitlines())
+
+        d = fixture(); bringup_box(d)
+        globals()["claude_pid"] = lambda w, d=d: real["claude_pid"](w) or ("999" if launched(d, w) else None)
+        slept = []
+        time.sleep = slept.append
+        rc = bringup(["--here", "--except", "r3", "nosuch"])
+        time.sleep = lambda s: None
+        calls = open(f"{d}/calls").read().splitlines()
+        cc_calls = [c for c in calls if c.startswith("cc|")]
+        blog = open(path("bringup.log")).read()
+        check("bringup: each paused project but the excluded one is unpaused, one at a time with --only",
+              "cc-pause|off|r2|--only|" in calls and not any(c.startswith("cc-pause|off|r3") for c in calls) and os.path.exists(f"{d}/paused-r3"))
+        orch = next((c for c in cc_calls if c.startswith("cc|r1|--orch|ops||CC_CLAUDE=")), "")
+        check("bringup: a seat whose window is gone and an orch holding only a shell come back, the orch on its saved sid",
+              "cc|r2|CC_CLAUDE=" in cc_calls and orch and "--resume sid-orch" in open(orch.split("CC_CLAUDE=", 1)[1]).read())
+        check("bringup: a member with no window comes back cold; one whose credential is 296 bytes is not launched, and is named",
+              "cc|m1|CC_CLAUDE=" in cc_calls and not any(c.startswith("cc|m2|") for c in cc_calls)
+              and "member credentials that look blank: m2" in blog and "m2: its credential looks blank" in blog)
+        check("bringup: workers stopped on the limit restart with their own --loop and --budget, and --resume-last",
+              "cc|r1|job|--go||--loop|3|--budget|8|--resume-last|CC_CLAUDE=" in cc_calls
+              and "cc|r1|wait|--go||--loop|2|--budget|15|--resume-last|CC_CLAUDE=" in cc_calls)
+        check("bringup: a DONE, a BLOCKED, a clean exit, a running loop and an excluded repo's worker are not restarted",
+              not any(c.startswith(("cc|r1|done1|", "cc|r1|blk|", "cc|r1|ok|", "cc|r1|run|", "cc|r3|")) for c in cc_calls))
+        check("bringup: a live seat, a live orch and the excluded repo's shell window are not relaunched",
+              not any(c.startswith(("cc|r1|CC_CLAUDE=", "cc|r1|--orch|x|", "cc|r3|")) for c in cc_calls) and len(cc_calls) == 5)
+        check("bringup: each live seat or orch it did not relaunch gets one resume message; the dialog window and the excluded none",
+              sorted(c.split("|")[1] for c in calls if c.startswith("cc-msg|")) == ["m1", "r1", "r1@ops", "r2"]
+              and "owner asked for the whole box to be brought back up" in next(c for c in calls if c.startswith("cc-msg|r1|")))
+        check("bringup: the dialog window is listed and no key is sent to any window",
+              "on the usage-limit dialog, to answer by hand: r1@x" in blog and not any(c.startswith("tmux|") for c in calls))
+        check("bringup: perms is never relaunched or messaged, and its being down is said",
+              not any("perms" in c for c in calls) and "perms: not live, and left alone" in blog)
+        gaps = [x for x in slept if x >= 1 and x != 15]   # subprocess waits in steps under 0.1 s
+        check("bringup: launches and messages are 2-4 s apart (6 of them), not restore's 20 s",
+              len(gaps) == 6 and all(2 <= x <= 4 for x in gaps))
+        check("bringup: one summary with what was left and why, one notify line, and the guard is gone",
+              sum(c.startswith("cc-notify|") for c in calls) == 1 and "nosuch: named in --except, but there is no such project" in blog
+              and "r3: excluded, still paused" in blog and "r3: excluded, left as it is" in blog
+              and "relaunched: r2, r1@ops, m1, r1/job, r1/wait" in blog and rc == 0 and not os.path.exists(path("restoring")))
+        globals()["claude_pid"] = real["claude_pid"]
+        d = fixture(); bringup_box(d)
+        store("restoring", {"pid": os.getpid(), "boot_id": "boot-1", "start": ""})
+        rc = bringup(["--here"])
+        check("bringup: a restore or bring-up already running means this one does nothing and leaves its guard",
+              rc == 1 and not os.path.exists(f"{d}/calls") and os.path.exists(f"{d}/paused-r2") and os.path.exists(path("restoring")))
+        d = fixture()
+        with open(f"{BIN}/systemd-run", "w") as f:
+            f.write(f"#!/bin/sh\nprintf '%s|' systemd-run \"$@\" >> {d}/calls; echo >> {d}/calls\n")
+        os.chmod(f"{BIN}/systemd-run", 0o755)
+        path_was = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{BIN}:{path_was}"
+        try:
+            rc, bad = bringup(["--except", "r3"]), bringup(["--bogus"])
+        finally:
+            os.environ["PATH"] = path_was
+        calls = open(f"{d}/calls").read().splitlines()
+        check("bringup: without --here it starts one transient unit running --here with the same --except, and nothing else",
+              rc == 0 and bad == 2 and len(calls) == 1 and calls[0].startswith("systemd-run|--user|--collect|--unit|cc-recover-bringup-")
+              and calls[0].endswith(f"|{os.path.realpath(__file__)}|bringup|--here|--except|r3|"))
     finally:
         globals().update({k: v for k, v in real.items() if k != "sleep"})
         time.sleep = real["sleep"]
@@ -1316,6 +1671,8 @@ def main():
         status()
     elif cmd == "restore":
         return restore(boot="--boot" in sys.argv)
+    elif cmd == "bringup":
+        return bringup(sys.argv[2:])
     elif cmd == "watch-manager":
         watch_manager()
     elif cmd == "status":

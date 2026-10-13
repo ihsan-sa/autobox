@@ -64,6 +64,16 @@ wakes that repo's planning seat once per state — there is no 2-hourly wake of 
 never woken this way; its own channel and its own workers wake it. Each session works the order above on its own;
 nothing here waits to be asked.
 
+## "bring it all back up"
+When the owner says to bring everything back up (or unpause everything, or restart the missing sessions), the
+planning seat runs one command, `cc-recover bringup`, with `--except <repo>` for any project he names as separate.
+It returns at once and runs detached for a few minutes. It unpauses every project, relaunches each missing seat,
+orch and member, restarts worker loops that stopped on the usage limit, and asks each live seat to pick its work
+back up. It never answers a usage-limit dialog and never touches perms. Read its summary in
+`~/.cc/recover/bringup.log` when the cc-notify line arrives, then do the two things it leaves to you: relaunch
+perms if it says perms is down, and tell the owner which windows sit on the dialog and which member credentials
+look blank. The steps are in `cc-recover`'s docstring.
+
 ## taking a board row
 The native managed path is opt-in: `cc-config get CC_NATIVE_ADAPTER 0` must return `1`, and the owner must
 have registered `$HOME/bin/cc-native` by hand in `~/.claude/settings.json` (PreToolUse with matcher
@@ -134,7 +144,7 @@ or a probe of the object, and the ticket it prints is the receipt. Of fifteen re
 (`docs/design-knowledge-library-2026-09-11.md`), twelve had the record on disk and the session answered from memory
 or a proxy. The tool retrieves; it never calls a model. The steps:
 1. Name the claim — current state, a rule or decision, history, or an aggregate — and the object (row, PR, run, path, channel, date). Split only independent claims.
-2. `cc-lib ask --object <id> --need current|decision|history|aggregate "<question>"`. It opens a ticket with the byte cap and 1.5 s budget and prints the best hits, then COVERAGE and OUTCOME.
+2. `cc-lib ask --object <id> --need current|decision|history|aggregate "<question>"`. It opens a ticket with the byte cap and 1.5 s budget and prints the best hits, then COVERAGE and OUTCOME. With `--need current` it searches no records: it prints the object's own routes and a PROBE line naming where the live state is read (`gh pr view`, the landing queue, tmux).
 3. Authoritative route first: task state from the reconciler, a review from the landing root record at the matching head, a run from its id, cost from `cc-spend` on the right time basis. A live claim needs a live probe of the object — a record about it is not the object.
 4. Search only what is unresolved. Follow a hit to its record (`cc-lib get <rid>`) and its span; never read a whole journal because one line matched.
 5. Widen deliberately: one reformulation, then dates and kinds, then (owner sessions only) across workspaces.
