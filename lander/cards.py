@@ -652,6 +652,36 @@ def waited(job, secs, now=None):
     return True
 
 
+def main_red(job, secs, now=None):
+    """A CHECK RED ON MAIN HAS HELD A PR FOR AN HOUR (brief: "ONE alert line naming the check and its failing IDs ...
+    not one per PR"). `job` is a PR it holds (extra.main_red); a planner request (`cc-notify --ask` from box_hand), as
+    waited's, and a `main-red-alert` queue.log line. At most one per repo and check per WAIT_FLAG_SECS
+    (cards/waited.json, key `main-red:<repo>:<check>`), whichever PR it names and whatever main's failing set says: a
+    pid, port or count left in a case id would make every base run a new set (Opus and perms, 10-13), so the set is
+    never the key. -> True when it was said now."""
+    t = int(now if now is not None else time.time())
+    mr = job.extra.get("main_red") or {}
+    check, fails = mr.get("check") or "?", list(mr.get("fails") or [])
+    key = f"main-red:{job.repo}:{check}"
+    last = int(((read_json(_waited_path(), {}) or {}).get(key) or {}).get("said") or 0)
+    if last and t - last < WAIT_FLAG_SECS:
+        return False
+    named = "; ".join(fails[:5]) + (f" (+{len(fails) - 5} more)" if len(fails) > 5 else "") if fails \
+        else "none named, only its exit code"
+    text = (f"[{job.repo}] check {check} has been red on main for {secs // 60} min and holds PRs that add a red of "
+            f"their own to it (PR #{job.pr} among them). Main's failing cases: {named}.")
+    rc, _ = sh([os.path.join(BIN, "cc-notify"), "--ask", "--id", f"land:{key}@{t}", "-t", f"{job.repo} landing", text],
+               timeout=60, **box_hand())
+    log("main-red-alert", job.repo, job.pr, check=check, mins=secs // 60, fails=len(fails), rc=rc)
+    if rc != 0:   # not taken: left unmarked, so the next tick tries again
+        return False
+    with _sent_lock():
+        d = read_json(_waited_path(), {}) or {}
+        d.setdefault(key, {})["said"] = t
+        write_json(_waited_path(), d)
+    return True
+
+
 QUERY_ROUTES = ("query", "planning", "lander-self")
 PROTECTED_RE = re.compile(r"\(CC_PROTECTED_PATHS_[^)]*\)")
 

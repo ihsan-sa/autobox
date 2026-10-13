@@ -418,6 +418,15 @@ def cmd_selfcheck():
               got == [[]] and (raw is None or ("lane.compiled:" in raw and "`git " in raw)))
         check("…and a replay of this checkout's lander called nothing the world does not answer (the line above names it)",
               a.returncode == 0)
+        # a head history let past main's red (ok=ratchet) comes back as a pass with the ratchet's note, so the
+        # candidate's lane.took logs it ok=ratchet again, not ok=yes (Opus read, 10-13); a plain pass has no note
+        rw = LanderWorld({"prs": [{"repo": "r", "pr": 1, "bumps": [], "gates": {"g": [[0, 5, "ratchet", 100]],
+                                                                               "y": [[0, 5, "yes", 100]]}}],
+                          "medians": {"review": 1, "gate": {}}, "until": "1970-01-01T00:00:00Z"}, lmods, VClock(0, 1),
+                         0, wroot)
+        ro = rw.run_plan("/x/r", None, __import__("types").SimpleNamespace(checks=["g", "y"]), [], "t", pr=1)
+        check("…a recorded ok=ratchet replays as a pass whose note the lane reads as a ratchet",
+              ro["g"].status == lmods["types"].PASSED and ro["g"].note.startswith("ratchet") and ro["y"].note == "")
         # history's load reaches the candidate's own admission: three PRs side by side on a calm box, and on a box
         # at 2x its cores as many as the candidate's slots_now() admits at that load, the rest a check later
         tq = f"{lroot}/land-load"

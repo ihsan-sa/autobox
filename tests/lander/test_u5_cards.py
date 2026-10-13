@@ -912,5 +912,50 @@ class QueuedCards(Stubbed):
                                                                 "planning seat is told"])
 
 
+class MainRedAlert(Stubbed):
+    """Brief 10-13: "A main-red check that has held anything for more than an hour produces ONE alert line naming the
+    check and its failing IDs ... not one per PR"."""
+
+    def held(self, pr, check="e2e-cc-context", since=Q, fails=("✗ a", "✗ b")):
+        return T.Job(repo="demo", pr=pr, state=T.HELD, stage=T.HELD,
+                     extra={"queued_at": Q, "main_red": {"check": check, "base": "c" * 40, "since": since,
+                                                          "fails": list(fails)}})
+
+    def flag(self, jobs, secs_after_q, backoff=0):
+        from lander import tick as TK
+        with mock.patch.object(TK.J, "lane_jobs", lambda r: jobs), mock.patch.object(TK.GH, "backoff", lambda: backoff):
+            return TK.flag_main_red(["demo"], C, now=E.epoch_of(Q) + secs_after_q)
+
+    def test_one_alert_per_red_check_after_an_hour_whatever_it_holds(self):
+        later = E.stamp(E.epoch_of(Q) + 600)
+        jobs = [self.held(7, since=later), self.held(8), self.held(9, check="other", since=later)]
+        self.assertEqual(self.flag(jobs, 3600), [])                      # exactly an hour is not more than one
+        self.assertEqual(self.flag(jobs, 3601, backoff=30), [])
+        self.assertEqual(self.argvs("cc-notify"), [])
+        self.assertEqual(self.flag(jobs, 3601), ["[demo] check e2e-cc-context has been red on main for 60 min; "
+                                                 "the planning seat is told"])
+        self.assertEqual(self.flag(jobs, 4201 + 60), ["[demo] check other has been red on main for 61 min; "
+                                                      "the planning seat is told"])
+        self.assertEqual(self.flag(jobs, 7000), [])                      # each said once in its hour
+        sent = self.argvs("cc-notify")
+        self.assertEqual(len(sent), 2)
+        self.assertIn("PR #8", sent[0][-1])                              # the oldest hold is the one named
+        self.assertIn("✗ a; ✗ b", sent[0][-1])
+        # Opus and perms, 10-13: a pid or count left in an id makes each base run a new set, so the key is the repo
+        # and the check, once an hour: another set on the same check inside the hour is not said again
+        self.assertEqual(self.flag([self.held(10, fails=("✗ c on port 41234",))], 7000), [])
+        self.assertEqual(len(self.flag([self.held(10, fails=("✗ c on port 41235",))], 3601 + 3600)), 1)
+        self.assertEqual(len(self.argvs("cc-notify")), 3)
+
+    def test_a_refused_alert_is_tried_again_and_a_suite_naming_nothing_is_said_so(self):
+        os.makedirs(self.answers_path, exist_ok=True)
+        with open(os.path.join(self.answers_path, "cc-notify.rc"), "w") as f:
+            f.write("1")
+        self.assertEqual(self.flag([self.held(7, fails=())], 3601), [])
+        os.remove(os.path.join(self.answers_path, "cc-notify.rc"))
+        self.assertEqual(len(self.flag([self.held(7, fails=())], 3602)), 1)
+        self.assertIn("none named, only its exit code", self.argvs("cc-notify")[-1][-1])
+
+
 if __name__ == "__main__":
     unittest.main()

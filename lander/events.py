@@ -10,8 +10,9 @@ row, not a PR). A log that will not write loses the line and never stops a landi
 
 KEPT SHAPES. cc-reconcile, cc-replay, the old `times` and PR #757's scripts read this file, so the kinds and their
 shapes are today's (KINDS): `queued … who= chat=`, `requeued`, `again`, `refused <repo>#<pr> <reason>`,
-`stage … lane | gate gate= ok=yes|no secs= | verdict verdict= | merged sha= by=` (and one `stage` per state the job
-machine enters), `done … rc=`, `handed`, `handed-pushed`, `handed-end`, `notify`, `recorded`, `approval`, and
+`stage … lane | gate gate= ok=yes|no|main-red|ratchet secs= | verdict verdict= | merged sha= by=` (and one `stage`
+per state the job machine enters), `done … rc=`, `handed`, `handed-pushed`, `handed-end`, `notify`, `recorded`,
+`approval`, and
 `delivery-pending <repo>/<row> pr= projections=`. `times` reads them back with LOG_EVENT_RE, unchanged.
 """
 from __future__ import annotations

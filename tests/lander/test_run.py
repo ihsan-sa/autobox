@@ -2531,5 +2531,133 @@ class Sweep(unittest.TestCase):
         self.assertEqual(self.rows(T.UNRUNNABLE, T.UNRUNNABLE), "unrunnable")
 
 
+class Ratchet(unittest.TestCase):
+    """Owner, 10-13: "a red check on main stops holding PRs that don't make it worse". judge() with a scripted runner
+    whose reds name failing cases (extra.fails, as run() reads them with fail_ids)."""
+
+    H, B = "h" * 40, "b" * 40
+
+    def runner(self, fails, where_of=lambda tree: "box", ran=None):
+        """fails: tree -> its failing ids (a list, or None), False (green), or "unrunnable" (no answer). ran: tree -> the
+        extra run() reads off a red with RUN.ran ({"passes": n, "crash": bool})."""
+        calls = []
+
+        def run(check, tree, where, alone=False, **kw):
+            calls.append((tree, alone))
+            f = fails[tree]
+            st = {False: T.PASSED, "unrunnable": T.UNRUNNABLE}.get(f, T.FAILED) if not isinstance(f, list) \
+                else T.FAILED
+            return T.Result(check=check.name, tree=tree, status=st, runner=f"{where_of(tree)}:x:-",
+                            extra={"loaded": False, "why": st,
+                                   **({"fails": f, **(ran or {}).get(tree, {})} if st == T.FAILED else {})})
+        return run, calls
+
+    def test_a_head_that_ran_less_or_crashed_where_the_base_did_not_holds(self):
+        # Opus and perms, 10-13: "a crash or early abort reads as no new reds"
+        fails = {self.H: ["✗ a"], self.B: ["✗ a"]}
+        for ran, want in (({self.H: {"passes": 3}, self.B: {"passes": 9}}, RUN.BLOCKED),
+                          ({self.H: {"passes": 9, "crash": True}, self.B: {"passes": 9}}, RUN.BLOCKED),
+                          ({self.H: {"passes": 9, "crash": True}, self.B: {"passes": 9, "crash": True}}, T.PASSED),
+                          ({self.H: {"passes": 9}, self.B: {"passes": 9}}, T.PASSED)):
+            run, _ = self.runner(fails, ran=ran)
+            self.assertEqual(RUN.judge(chk(name="c"), self.H, self.B, runner=run).status, want, ran)
+
+    def test_ran_reads_passes_and_crashes(self):
+        self.assertEqual(RUN.ran("✓ a\n✓ b\n✗ c\n"), {"passes": 2, "crash": False})
+        self.assertEqual(RUN.ran("✓ a\n== 7 passed, 1 failed ==\n"), {"passes": 7, "crash": False})
+        self.assertEqual(RUN.ran("✓ a\nTraceback (most recent call last):\n")["crash"], True)
+        self.assertEqual(RUN.ran("✓ a\nSegmentation fault (core dumped)\n")["crash"], True)
+
+    def test_a_stored_base_red_whose_rerun_gives_no_answer_holds_as_main_red(self):
+        # Opus and perms, 10-13: "fall back to the stored base red and hold as main-red, never hand the PR back"
+        store = self.store()
+        run, _ = self.runner({self.H: ["✗ a"], self.B: ["✗ a"]})
+        store.put_base(run(chk(), self.B, "box"))
+        run, calls = self.runner({self.H: ["✗ a"], self.B: "unrunnable"})
+        rec = mock.Mock()
+        o = RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-1", record=rec)
+        self.assertEqual((o.status, o.note), (RUN.BLOCKED, "blocked-by-main:c"))
+        self.assertEqual(calls, [(self.H, False), (self.B, False)])
+        rec.assert_not_called()
+
+    def store(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d))
+        os.makedirs(os.path.join(d, "lanes"))
+        lock = open(os.path.join(d, "lanes", "repo.lock"), "a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        REC.new_nonce("repo", d)
+        return REC.Store("repo", lock, d)
+
+    def test_a_red_that_main_has_too_passes_and_names_both_sets(self):
+        run, calls = self.runner({self.H: ["✗ a"], self.B: ["✗ a", "✗ b"]})
+        rec = mock.Mock()
+        o = RUN.judge(chk(name="c"), self.H, self.B, runner=run, record=rec)
+        self.assertEqual((o.status, o.note[:7]), (T.PASSED, "ratchet"))
+        self.assertEqual(o.sets, {"pr": ["✗ a"], "main": ["✗ a", "✗ b"]})
+        self.assertEqual(calls, [(self.H, False), (self.B, False)])   # no rerun of the head: main's red explains it
+        rec.assert_not_called()
+
+    def test_a_red_main_lacks_still_holds(self):
+        run, _ = self.runner({self.H: ["✗ a", "✗ new"], self.B: ["✗ a"]})
+        o = RUN.judge(chk(name="c"), self.H, self.B, runner=run)
+        self.assertEqual((o.status, o.note), (RUN.BLOCKED, "blocked-by-main:c"))
+        self.assertEqual(o.sets, {"pr": ["✗ a", "✗ new"], "main": ["✗ a"]})
+
+    def test_a_suite_that_names_nothing_falls_back_to_the_exit_code_and_holds(self):
+        for head, base in (([], ["✗ a"]), ([], []), (["✗ a"], []), (None, ["✗ a"]), (["✗ a"], None)):
+            run, _ = self.runner({self.H: head, self.B: base})
+            o = RUN.judge(chk(name="c"), self.H, self.B, runner=run)
+            self.assertEqual(o.status, RUN.BLOCKED, (head, base))
+
+    def test_a_shared_base_red_is_run_again_now_before_it_lets_a_pr_through(self):
+        store = self.store()
+        run, calls = self.runner({self.H: ["✗ a"], self.B: ["✗ a"]})
+        RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-1")
+        calls.clear()
+        o = RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-2")
+        self.assertEqual(o.status, T.PASSED)
+        self.assertEqual(calls, [(self.H, False), (self.B, False)])   # the stored red was not taken on its word
+        # main fixed since (the host state the stored red was made in is gone): the fresh base is green, so the
+        # PR's red is its own, said twice on its tree
+        run, calls = self.runner({self.H: ["✗ a"], self.B: False})
+        o = RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-3")
+        self.assertEqual(o.status, T.FAILED)
+        self.assertEqual(store.base("c", self.B).status, T.PASSED)
+        # a stored red that already shows a new red holds without a base run
+        run, calls = self.runner({self.H: ["✗ new"], self.B: ["✗ a"]})
+        store.put_base(run(chk(), self.B, "box"))
+        calls.clear()
+        o = RUN.judge(chk(), self.H, self.B, runner=run, store=store, job_key="repo-4")
+        self.assertEqual((o.status, calls), (RUN.BLOCKED, [(self.H, False)]))
+
+    def test_never_for_a_security_check_a_touched_check_or_runs_in_two_places(self):
+        run, _ = self.runner({self.H: ["✗ a"], self.B: ["✗ a"]})
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, security=True).status, RUN.BLOCKED)
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run, touched=True).status, RUN.BLOCKED)
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run).status, T.PASSED)   # the same pair, untouched
+        run, _ = self.runner({self.H: ["✗ a"], self.B: ["✗ a"]}, where_of=lambda t: "laptop" if t == self.H else "box")
+        self.assertEqual(RUN.judge(chk(), self.H, self.B, runner=run).status, RUN.BLOCKED)
+
+
+class FailIds(unittest.TestCase):
+    def test_a_suites_failing_lines_with_their_scratch_blanked(self):
+        text = "\n".join([
+            "  ✓ fine", "  ✗ cc-context reads /tmp/tmp.Xy12ab/state in 3.2s", "FAIL: race at abcdef0123456789",
+            "FAILED tests/x.py::test_a - AssertionError: 1 != 2", "not ok 7 - tap case", "Traceback (most recent call",
+            "== result: 3 passed, 4 failed ==", "ok 8 - tap fine"])
+        self.assertEqual(RUN.fail_ids(text), sorted([
+            "✗ cc-context reads /tmp/… in N s", "FAIL: race at …", "FAILED tests/x.py::test_a", "not tap case"]))
+        same = RUN.fail_ids("  ✗ cc-context reads /tmp/tmp.Qq99zz/state in 41.0s")
+        self.assertTrue(set(same) <= set(RUN.fail_ids(text)))   # another run's scratch is the same case
+        self.assertEqual(RUN.fail_ids("exit 1 and nothing to say\nTraceback x"), [])
+        self.assertIsNone(RUN.fail_ids("\n".join(f"✗ case {i}" for i in range(RUN.FAILS_CAP + 1))))
+        # an ERROR line is a case only in pytest's summary form; a log's own ERROR line names none (Opus read, 10-13)
+        self.assertEqual(RUN.fail_ids("ERROR: port 4123 in use\nERROR connecting to db\n"
+                                      "ERROR tests/y.py::test_b - OSError\nERROR tests/z.py\n"),
+                         ["ERROR tests/y.py::test_b", "ERROR tests/z.py"])
+
+
 if __name__ == "__main__":
     unittest.main()

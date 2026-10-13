@@ -99,7 +99,11 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              on it waits on checks for a PR that already left (10-04: #794 merged at 16:47Z and held 57 jobs behind
              it, still checking, for 40+ min; ai-ee #99 checked a stale head for 50 min). FAILED (a red run.judge
              saw twice on the same tree) -> handback; a red then green passes and logs `flake <repo>#<pr> check=<n>`;
-             blocked-by-main (red on the base tree too) -> held 15 min and planned again from main then, not blamed;
+             a red whose failing cases are all red on the base too (run.no_new_reds, the ratchet) passes, with
+             `stage … gate ok=ratchet` and a `ratchet <repo>#<pr> check= pr_reds= main_reds=` line naming both sets;
+             blocked-by-main (red on the base tree too, with a case the base does not fail or none named) -> held 15
+             min and planned again from main then, not blamed; extra.main_red keeps since= (its first hold on that
+             check) and main's ids for tick.flag_main_red;
              a check the manifest lacks -> query "planning"; UNRUNNABLE -> held 15 min, the 3rd -> query, each
              quoting its reason through jobs.quoted (a gate's output line: no control or markup, 200 chars). Then,
              when the plan is paid or a HANDBACK stands on the PR from any head (handed_back(): the job's own, or
@@ -1386,8 +1390,12 @@ class Lane:
         n, tree, base_ref = f.name, f.tree, job.extra.get("base_ref") or "main"
         o = outs.get(n) or RUN.Outcome(n, T.UNRUNNABLE, "the runner gave no outcome")
         secs = int(sum(r.secs for r in o.results))
-        word = {T.PASSED: "yes", RUN.BLOCKED: "main-red"}.get(o.status, "no")
+        ratchet = o.status == T.PASSED and o.note.startswith("ratchet")
+        word = "ratchet" if ratchet else {T.PASSED: "yes", RUN.BLOCKED: "main-red"}.get(o.status, "no")
         E.stage(job.repo, job.pr, "gate", gate=n, ok=word, secs=secs, note=o.note if o.status == T.PASSED else "")
+        if ratchet:   # brief: "logged as ok=ratchet with both sets"
+            E.log("ratchet", job.repo, job.pr, check=n, head=job.head[:12], base=job.base_sha[:12],
+                  pr_reds=";".join(o.sets.get("pr") or []), main_reds=";".join(o.sets.get("main") or []))
         if o.status == T.PASSED and o.note.startswith("flaky"):   # "the flake is logged with the check's name"
             E.log("flake", job.repo, job.pr, check=n, head=job.head[:12])
         retry = job.extra.get("retry")
@@ -1400,7 +1408,12 @@ class Lane:
             return self.handback(job, f"check {n} failed on the merge with {base_ref} ({tree[:12]})"
                                       + (f": {J.quoted(o.note)}" if o.note else ""))   # a gate's line
         if o.status == RUN.BLOCKED:
-            job.extra["main_red"] = {"check": n, "base": job.base_sha, "head": job.head, "waits": 0}
+            # since: when this check first held this job, kept while it holds it again, for tick.flag_main_red's
+            # hour; fails: main's failing ids, which that alert names
+            mr = job.extra.get("main_red") if isinstance(job.extra.get("main_red"), dict) else {}
+            since = mr.get("since") if mr.get("check") == n and mr.get("since") else E.stamp()
+            job.extra["main_red"] = {"check": n, "base": job.base_sha, "head": job.head, "waits": 0, "since": since,
+                                     "fails": (o.sets.get("main") or [])[:20]}
             # design §0: base red too -> blocked-by-main, not blamed; it is planned again from main after the hold
             return self.hold(job, f"{o.note}: check {n} is red on {base_ref} ({job.base_sha[:12]}) too, so it "
                                   f"is main's, not this PR's — tried again from {base_ref} later",

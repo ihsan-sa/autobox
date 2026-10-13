@@ -43,16 +43,22 @@ it exited with). unrunnable — never red: killed at the check's cap, killed by 
 (exit 124, 137, 143 or a signal), a box-state message (disk, quota, memory, fork), a sandbox that did not start, a
 mount that is not there, a tree that did not reproduce. failed: anything else.
 
-JUDGE (a red, per check): the same check on the BASE tree — the lane's shared record when there is one — red there
-too is `blocked-by-main` (main is red, the diff is not blamed); a check the base does not define, or whose run file
-the base lacks, has no base run and its red is the diff's; a red run under load, on either tree, gets ONE diagnostic
-rerun alone (every slot held), and only a base run that stands is shared; a head red that is not main's is run ONCE
-more on the same tree whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except,
-when it was not loaded, a check that guards a gate-first path or that the change touches, whose first red stands; green
-the second time passes with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check);
-a red whose every red line matches a live quarantine row passes with a `quarantined` note — never for a check that
-guards a gate-first path, and never when the change touches the check itself; what is left is `failed`, and goes to
-the failures ledger once (records.record_red).
+JUDGE (a red, per check): the same check on the BASE tree — the lane's shared record when there is one — red there too
+is `blocked-by-main` (main is red, the diff is not blamed) — unless THE RATCHET lets it pass: every case the head's run
+names failing (fail_ids: its ✗/✘, FAIL, FAILED/ERROR or not ok lines, scratch paths, shas and durations blanked) fails
+on the base too, the head ran as far (no fewer passes, no crash the base lacks), both ran in the same place, and the
+base's red is a run made now, in this judge() (a shared one that would let it pass is run again first, and when that
+re-run is unrunnable the shared red holds as main-red), then it passes with a `ratchet` note and Outcome.sets naming
+both sets (no_new_reds; never for a check that guards a gate-first path or that the change touches, and never for a head
+red that names no case, where the exit code is all there is); a check the base does not define, or whose run file the
+base lacks, has no base run and its red is the diff's; a red run under load, on either tree, gets ONE diagnostic rerun
+alone (every slot held), and only a base run that stands is shared; a head red that is not main's is run ONCE more on
+the same tree whatever the load (alone when it was loaded), so only a red that repeats is the PR's — except, when it was
+not loaded, a check that guards a gate-first path or that the change touches, whose first red stands; green the second
+time passes with a `flaky` note, which the lane logs as `flake <repo>#<pr> check=<name>` (a count per check); a red
+whose every red line matches a live quarantine row passes with a `quarantined` note — never for a check that guards a
+gate-first path, and never when the change touches the check itself; what is left is `failed`, and goes to the failures
+ledger once (records.record_red).
 
 A RED KEEPS ITS LOG. A failed run's output (read_log's bound) is copied to <state>/logs/ (records.state_dir, never
 /tmp) before run_dir goes, at most LOG_KEEP files and none older than LOG_DAYS; the result's extra carries `log` (the
@@ -255,6 +261,50 @@ def status_of(rc: int, text: str, capped: bool = False) -> tuple:
 
 def red_lines(text: str) -> list:
     return [ln.strip() for ln in text.splitlines() if RED_RE.search(ln) and not PASS_RE.search(ln)]
+
+
+# THE RATCHET'S IDS: the line a suite prints for one failing case — its own ✗/✘ line, a FAIL line, pytest's FAILED or
+# ERROR id (an ERROR line only in pytest's summary form, a .py path or a node id: a log's ERROR line is no case), TAP's
+# not ok — read from the whole output. A run's own scratch (a /tmp path, a sha, a duration) is
+# blanked so the same case is the same id on two trees; anything else that varies makes a new id, which holds.
+FAIL_ID_RE = re.compile(r"^\s*(?:[✗✘]|FAIL(?:ED)?\b:?|ERROR\s(?=\S*(?:\.py\b|::))|not ok\b(?:\s*\d+\s*-?)?)"
+                        r"\s*(.*?)\s*$")
+FAILS_CAP = 500   # more failing lines than this and the set is not trusted: fail_ids says None, and the red holds
+SCRATCH_RES = ((re.compile(r"(?:/tmp|/var/tmp)/[^\s:'\"),]*"), "/tmp/…"), (re.compile(r"\b[0-9a-f]{8,40}\b"), "…"),
+               (re.compile(r"\b\d+(?:\.\d+)?\s?(?:ms|s|secs?|min)\b"), "N s"))
+
+
+# ...and how far a run got: its pass lines or its last `N passed`, and whether it crashed or was cut short. A head that
+# ran less than the base, or crashed where the base did not, hides its own reds behind main's (Opus and perms, 10-13)
+PASSED_N_RE = re.compile(r"\b(\d+) passed\b")
+CRASH_RE = re.compile(r"^(?:Traceback \(most recent call last\)|INTERNALERROR>)|Segmentation fault|core dumped|"
+                      r"^(?:Killed|Aborted)\b", re.M)
+
+
+def ran(text: str) -> dict:
+    """-> {"passes": its last `N passed`, else its count of pass lines; "crash": a crash or abort marker in it}."""
+    n = PASSED_N_RE.findall(text)
+    passes = int(n[-1]) if n else sum(1 for ln in text.splitlines() if PASS_RE.search(ln))
+    return {"passes": passes, "crash": bool(CRASH_RE.search(text))}
+
+
+def fail_ids(text: str):
+    """-> the sorted failing case ids `text` names ([] when it names none: the exit code is all there is), or None
+    past FAILS_CAP."""
+    got = set()
+    for ln in text.splitlines():
+        m = FAIL_ID_RE.match(ln)
+        if not m or PASS_RE.search(ln):
+            continue
+        name = m.group(1)
+        if "::" in name:   # pytest's `FAILED tests/x.py::t - AssertionError: …`: the id is before the message
+            name = name.split(" - ", 1)[0]
+        for rx, to in SCRATCH_RES:
+            name = rx.sub(to, name)
+        got.add(f"{ln.split()[0]} {name}"[:200])
+        if len(got) > FAILS_CAP:
+            return None
+    return sorted(got)
 
 
 # pytest's own words for what failed: its short summary, pytest itself falling over, and a file whose progress has F/E
@@ -558,7 +608,8 @@ def _attempt(check, tree_sha, where, dest, head, run_dir, cwd, env_extra, alone,
             why = text.splitlines()[0] if text else "the laptop did not answer"
         kept = {}
         if st == T.FAILED:   # the log outlives run_dir, and the result names the line that failed
-            kept = {"cause": cause_of(text, rc), "log": keep_log(text, check.name, tree_sha, state)}
+            kept = {"cause": cause_of(text, rc), "log": keep_log(text, check.name, tree_sha, state),
+                    "fails": fail_ids(text), **ran(text)}
             why = f"{why}: {kept['cause']}"
         return T.Result(check=check.name, tree=tree_sha, status=st, secs=round(secs, 2), cpu_secs=round(cpu, 2),
                         load=os.getloadavg()[0], runner=f"{where}:{how}:{scope}",
@@ -613,6 +664,7 @@ class Outcome:
     status: str
     note: str = ""
     results: list = field(default_factory=list)
+    sets: dict = field(default_factory=dict)   # a red on both trees: {"pr": ids, "main": ids} (no_new_reds)
 
 
 def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *, runner=None, store=None,
@@ -651,8 +703,7 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
         return out
     # a check the base does not have (or whose run file it lacks) has no base to compare: its red is the diff's
     if base_tree and check.name != M.BUILTIN and on_base:
-        b = store.base(check.name, base_tree) if store is not None else None
-        if b is None:
+        def base_run():
             b = go(base_tree, base=True, keep=False)
             if b.status == T.FAILED and b.extra.get("loaded"):
                 # the head's rule on the base too: a red under load is rerun alone, and only that rerun is shared
@@ -660,10 +711,32 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
                 b = go(base_tree, alone=True, base=True)
             elif store is not None and b.status != T.UNRUNNABLE:
                 store.put_base(b)
+            return b
+        b = store.base(check.name, base_tree) if store is not None else None
+        fresh = b is None
+        b = base_run() if fresh else b
         out.results.append(b)
-        # design §0: "Base red too → blocked-by-main:<check>, not blamed"
+        # the ratchet follows quarantine's rule: never on security checks or on a PR touching the check, whose
+        # change could reword its own red lines into main's
+        may = not security and not touched
+        if b.status == T.FAILED and may and not fresh and no_new_reds(r, b):
+            # brief: "main's result at the PR's own base_sha, run in the same environment, never a cached result
+            # from another host state": the shared red would let this one through, so the base is run again now
+            # ...and a re-run that gave no answer (unrunnable: its cap, the laptop gone) keeps the stored red, which
+            # holds as main-red: the PR is never handed back for a red main has (Opus and perms, 10-13)
+            again = base_run()
+            out.results.append(again)
+            if again.status != T.UNRUNNABLE:
+                b, fresh = again, True
         if b.status == T.FAILED:
+            # brief: "If the PR's failing set is a subset of main's, the check counts as passed for this PR"
+            if may and fresh and no_new_reds(r, b):
+                out.status, out.note = T.PASSED, f"ratchet: no new reds, {check.name} is red on the base too"
+                out.sets = {"pr": r.extra["fails"], "main": b.extra["fails"]}
+                return out
+            # design §0: "Base red too → blocked-by-main:<check>, not blamed"
             out.status, out.note = BLOCKED, f"{BLOCKED}:{check.name}"
+            out.sets = {"pr": r.extra.get("fails"), "main": b.extra.get("fails")}
             return out
     # design §0: "One diagnostic rerun alone for a red under load"; and every other red is run once more on the
     # same tree too, "a gate that goes red is re-run once on the same commit before the PR is handed back" (owner,
@@ -691,6 +764,18 @@ def judge(check: T.Check, head_tree: str, base_tree: str, where: str = "box", *,
     if record:
         record(r, "\n".join(r.extra.get("tail", [])))
     return out
+
+
+def no_new_reds(head: T.Result, base: T.Result) -> bool:
+    """THE RATCHET: True when both reds ran in the same place (the box, a runner, a member) and every case the head's
+    run names failing the base's names too, and the head ran as far as the base: no fewer passes, and no crash or abort
+    the base lacks (a head cut short names fewer reds only because it ran less). A head run that names none falls back
+    to the exit code, which says only that both are red, so it holds; so does a set fail_ids could not trust (None)."""
+    pr, main = head.extra.get("fails"), base.extra.get("fails")
+    same = head.runner.split(":")[0] == base.runner.split(":")[0]
+    went = (head.extra.get("passes") or 0) >= (base.extra.get("passes") or 0) and \
+        not (head.extra.get("crash") and not base.extra.get("crash"))
+    return same and went and bool(pr) and main is not None and set(pr) <= set(main)
 
 
 def may_leave(check: T.Check) -> bool:

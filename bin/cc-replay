@@ -22,7 +22,8 @@ TODAY'S LANDER (the core/lander package):
       Its own Lane runs each repo's arrivals on a virtual clock, one repo at a time. The world stands in for git,
       GitHub, the manifest, the runner, the reviewer, the laptop (never reachable), the cards, the board, the tip
       and the deploy: a check returns the k-th result history recorded for it on that head after its recorded
-      secs (main-red while history had that check red on main, anywhere); a check waits for a box-wide slot, as
+      secs (main-red while history had that check red on main, anywhere, unless history let that head past it,
+      ok=ratchet); a check waits for a box-wide slot, as
       the runner's flock does, until fewer than the candidate's own slots_now() are busy — history's checks of the
       other repos and the replay's own, plus, during one of history's slot waits, the slots history's own checks
       left to work it never saw (a worker's own check run) — where slots_now() reads history's load; a review
@@ -2504,15 +2505,19 @@ class LanderWorld:
             idx = self.head_idx(p) if p else 0
             runs = [r for r in (p.get("gates") or {}).get(n, []) if r[0] == idx and r[2] != "main-red"]
             red = next((r for r in (p.get("gates") or {}).get(n, []) if r[2] == "main-red"), None)
-            if any(a <= self.clock.now < b for a, b in self.red.get(n, [])):
+            if any(r[2] == "ratchet" for r in runs):   # history's lane let this head past main's red on it
+                secs, ok = next(r[1] for r in runs if r[2] == "ratchet"), "ratchet"
+            elif any(a <= self.clock.now < b for a, b in self.red.get(n, [])):
                 secs, ok = (red[1] if red else self.med["gate"].get(n, 60)), "main-red"
             elif runs:
                 _, secs, ok = runs[min(self.ask(repo, p.get("pr"), idx, n), len(runs) - 1)][:3]
             else:
                 secs, ok = self.med["gate"].get(n, 60), "yes"
-            status = {"yes": T.PASSED, "main-red": RUN.BLOCKED}.get(ok, T.FAILED)
-            res = T.Result(check=n, tree=tree, status=T.PASSED if ok == "yes" else T.FAILED, secs=float(secs))
-            out[n] = RUN.Outcome(n, status, "main-red" if ok == "main-red" else "", [res])
+            status = {"yes": T.PASSED, "ratchet": T.PASSED, "main-red": RUN.BLOCKED}.get(ok, T.FAILED)
+            res = T.Result(check=n, tree=tree, status=T.PASSED if ok in ("yes", "ratchet") else T.FAILED,
+                           secs=float(secs))
+            note = {"main-red": "main-red", "ratchet": f"ratchet: no new reds, {n} is red on the base too"}.get(ok, "")
+            out[n] = RUN.Outcome(n, status, note, [res])   # lane.took reads a ratchet off its note
             self.secs += secs
         return out
 

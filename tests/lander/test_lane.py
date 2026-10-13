@@ -2745,6 +2745,38 @@ class Review(Fixture):
         self.land(planner=Planner(paid=True), reviewer=Reviewer(V(T.INCOMPLETE, tokens=0, why="no answer")))
         self.assertEqual(self.job(2).state, T.HELD)
 
+    def test_a_ratchet_pass_lands_and_logs_both_sets(self):
+        # owner, 10-13: "a red check on main stops holding PRs that don't make it worse"
+        class Ratchet(Runner):
+            def run_plan(self, *a, **kw):
+                out = super().run_plan(*a, **kw)
+                out["a"].sets = {"pr": ["FAIL x"], "main": ["FAIL x", "FAIL y"]}
+                return out
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.land(runner=Ratchet(notes={"a": "ratchet: no new reds, a is red on the base too"}))
+        self.assertEqual(self.job().state, T.DEPLOY_PENDING)
+        self.assertIn("gate=a ok=ratchet", self.log())
+        self.assertRegex(self.log(), r"ratchet demo#1 check=a head=\w+ base=\w+ pr_reds=FAIL x main_reds=FAIL x;FAIL y")
+        self.assertNotIn("ok=yes", self.log().split("gate=a ")[1].split("\n")[0])
+
+    def test_a_main_red_hold_keeps_when_it_first_held_on_that_check(self):
+        lane = mock.Mock()
+        job = T.Job(repo="demo", pr=1, head="h" * 40, base_sha="b" * 40, extra={})
+        blocked = {"a": L.RUN.Outcome("a", L.RUN.BLOCKED, "blocked-by-main:a", [],
+                                      {"pr": ["FAIL n"], "main": ["FAIL m"]})}
+        f = mock.Mock(tree="t" * 40)
+        f.name = "a"
+        L.Lane.took(lane, job, f, blocked)
+        first = job.extra["main_red"]
+        self.assertEqual((first["check"], first["fails"]), ("a", ["FAIL m"]))
+        job.extra["main_red"]["since"] = "2026-10-13T00:00:00Z"
+        L.Lane.took(lane, job, f, blocked)
+        self.assertEqual(job.extra["main_red"]["since"], "2026-10-13T00:00:00Z")   # held again: the same hour runs on
+        f.name = "b"
+        L.Lane.took(lane, job, f, {"b": L.RUN.Outcome("b", L.RUN.BLOCKED, "blocked-by-main:b")})
+        self.assertNotEqual(job.extra["main_red"]["since"], "2026-10-13T00:00:00Z")   # another check starts its own
+
     def test_a_flaky_check_passes_and_is_logged_by_name(self):
         self.pr(1, {"a/x": "n\n"})
         J.submit("demo", 1)
