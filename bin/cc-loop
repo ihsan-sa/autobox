@@ -12,8 +12,9 @@
 #                                           and `blocked` where it has none. Only a bound reached with nothing
 #                                           committed is exit 6 / `blocked` / "paused".
 #   cc-loop worker-model [M]  the model a worker runs on, and why (worker_model below) — cc names it on its dispatch line
-#   cc-loop member-stop <handle> <track> <rc>  ON THE HOST, after `cc-sandbox member … -- cc-loop` exits: the failures-ledger
-#                                            record the loop inside could not write (member_stop below)
+#   cc-loop member-stop <handle> <track> <rc>  ON THE HOST, after `cc-sandbox member … -- cc-loop` exits: for exit 4 or 12
+#                                            it runs the host's `cc done` the loop inside could not finish, then the
+#                                            failures-ledger record the loop inside could not write (member_stop below)
 #   cc-loop context-report <session.jsonl>…  what a turn of a past iteration actually carried, and what the context
 #                                            trim below would have left of it — the shadow week's one command
 # THE STEP LIMIT IS A CHECKPOINT, NOT A VERDICT: reaching --max-iter with work COMMITTED in that iteration buys
@@ -95,8 +96,9 @@
 # would never be stopped by anything), not a batch, and not under --no-extend, whose bound is the caller's promise.
 # A STOP IS ADDRESSED TO THE SESSION THAT DISPATCHED THE TRACK — an orch when one did (`<repo>@<alias>`, the broker's
 # own key for it), the repo seat only when none is recorded. The record is $ST/orch, written by this loop at start from
-# CC_SLACK_ALIAS, which an orch's shell exports and `cc … --go` carries into the loop's window; a dispatch with none
-# removes it (that dispatcher is the repo seat), and the variable is unset before the worker runs. The key is the ORCH'S
+# CC_SLACK_ALIAS, which an orch's shell exports and `cc … --go` carries into the loop's window, else from CC_DISPATCH_WIN,
+# the tmux window `cc` ran in, when that is an orch's `<repo>@<alias>`. A dispatch from any other window removes it (that
+# dispatcher is not an orch); one that names no window at all keeps it. Both variables are unset before the worker runs. The key is the ORCH'S
 # repo, not the track's (CC_ORCH_REPO, else the one live `<x>@<alias>` window): an orch dispatching into another repo is
 # still `<its repo>@<alias>` (orch_record). A DONE is told to the same key, once, by done_card (done_heard says whether
 # anyone heard it). cc-broker's rc 0 means SENT, not heard: a stop or DONE sent to a key with no open seat window is
@@ -454,9 +456,18 @@ orch_record(){   # written ONCE at start: the orch this loop was dispatched by, 
                  # The alias is CC_SLACK_ALIAS, which an orch's shell exports (cc __runorch); the orch's repo is CC_ORCH_REPO when the
                  # dispatcher carries it, else the one live `<x>@<alias>` window. An orch in study-coach dispatching into lesson-builder
                  # is study-coach@<alias>, not lesson-builder@<alias>, which nobody owns. No unique answer: the alias alone, the old key.
+                 # NOT THE ALIAS ALONE (raised-film-stops-skip-the-video-seat): a seat unsets CC_SLACK_ALIAS to run its suites, and a
+                 # dispatch made that way, or any later one with no alias, wiped the record, so two film rows' stops reached the control repo's
+                 # session and not the orch that sent them. `cc` also carries CC_DISPATCH_WIN, the tmux window it ran in, which is
+                 # the dispatcher's own broker key: `<repo>@<alias>` there is that orch, anything else is not an orch. A dispatch
+                 # that names neither (a relaunch from no seat) keeps the record it finds and takes ORCH_KEY back from the host-side
+                 # copy below, which the worker cannot write, so another repo's orch still gets its stop (review of #1238).
                  # THE HOST-SIDE COPY, ${ST%/*}/.dispatch/<track>: the full key, which the landing's merge notice reads (cards.py
                  # tell_dispatcher). A worker's sandbox binds only $ST, so it can rewrite $ST/orch but not this one.
-  local a="${CC_SLACK_ALIAS:-}" r="${CC_ORCH_REPO:-}" hd="${ST%/*}/.dispatch"
+  local a="${CC_SLACK_ALIAS:-}" r="${CC_ORCH_REPO:-}" w="${CC_DISPATCH_WIN:-}" hd="${ST%/*}/.dispatch"
+  if [ -z "$a" ] && [[ "$w" =~ ^([A-Za-z0-9._-]+)@([a-z0-9-]{2,20})$ ]]; then a=${BASH_REMATCH[2]}; r=${BASH_REMATCH[1]}; fi
+  if [ -z "$a" ] && [ -z "$w" ]; then ORCH_KEY=$(head -1 "$hd/${ST##*/}" 2>/dev/null | tr -d '[:space:]')
+    [[ "$ORCH_KEY" =~ ^[A-Za-z0-9._-]+@[a-z0-9-]{2,20}$ ]] || ORCH_KEY=""; return 0; fi
   [ -n "$a" ] || { ORCH_KEY=""; rm -f "$ST/orch" "$hd/${ST##*/}"; return 0; }
   if [ -z "$r" ]; then r=$(seat_windows | awk -F@ -v a="$a" 'NF==2 && $2==a && $1!="" {print $1}'); [ "$(grep -c . <<<"$r")" = 1 ] || r=""; fi
   ORCH_KEY="${r:+$r@}$a"; printf '%s\n' "$ORCH_KEY" > "$ST/orch"
@@ -545,13 +556,30 @@ member_stop(){   # $1 handle, $2 track, $3 the exit code `cc-sandbox member … 
   # THE LINK IS NAMED member-log, NOT log: that path is the member's to write, so it can be a link to anything of the
   # host's. Nothing in the box opens a record's links today (cc-failures prints them as text); whatever comes to read
   # this one opens it O_NOFOLLOW as a regular file, the way members.member_board reads a member's board (review of #965).
-  local h=${1:-} t=${2:-} rc=${3:-} k r
+  # AN UNDELIVERED FINISH IS DELIVERED HERE (raised-member-worker-finish-always-needs-the-host): exit 4 or 12 inside is
+  # "cc done … on the host", which a seat used to run by hand after a planning wake-up. This is the host, so it runs that
+  # very command: the host's own $BIN/cc, named by nothing the member wrote, on a handle and track checked below, and
+  # cc done keeps its own walls for a member's tree (member_gitdir, the main checkout's hooksPath, push-state off the
+  # binds). Delivered is no failure: no record, and cc done's card is the word. Not delivered: the record, and the
+  # workspace's own seat is told, since inside nobody was (stop() leaves exit 4 to the host).
+  local h=${1:-} t=${2:-} rc=${3:-} k r dout drc
   inside_boundary && { echo "cc-loop member-stop: the host side of the boundary only" >&2; return 0; }
   [[ "$h" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$rc" =~ ^[0-9]+$ ]] \
     || { echo "cc-loop member-stop: usage: member-stop <handle> <track> <exit code>" >&2; return 0; }
+  case "$rc" in 4|12)
+    dout=$("${CC_DONE:-$BIN/cc}" done "$h" "$t" 2>&1); drc=$?   # CC_DONE: test hook, as in complete_task
+    dout=$(printf '%s\n' "$dout" | grep -v '^[[:space:]]*$' | tail -1 | head -c 300)
+    [ "$drc" = 7 ] && drc=0   # pushed, the ready-to-land note filed as a request: delivered (the loop's own reading of cc done)
+    [ "$drc" = 0 ] && { echo "delivered by the host: cc done $h $t — ${dout:-no output}"; return 0; }
+    echo "the host's cc done $h $t failed (rc $drc): ${dout:-no output}";;
+  esac
   k=$(stop_kind "$rc"); [ -n "$k" ] || { echo "failures ledger ($h): not a failure (exit $rc)"; return 0; }
+  # ST="": the member's own orch file is never read here, so the line goes to the workspace's seat, `<handle>` itself
+  case "$rc" in 4|12) ( repo=$h track=$t ST="" BOARD="$BIN/cc-board" ORCH_KEY=""
+    { tell_planner "$(planner_line "finished, but opened no PR" "the worker finished inside the boundary and the host's cc done failed (rc $drc). Fix the cause, then: cc done $h $t")" && target_live "$h"; } \
+      || stop_unheard "finished, but opened no PR" "the host's cc done failed (rc $drc); then: cc done $h $t" ) >/dev/null 2>&1 || :;; esac
   r=$("$BIN/cc-green" red "$h" "$k" "loop:$h/$t:$rc:host:$(date -u +%Y%m%dT%H%MZ)" \
-        --observed "a member workspace's cc-loop exited $rc inside its boundary" \
+        --observed "a member workspace's cc-loop exited $rc inside its boundary${drc:+, and cc done on the host failed (rc $drc)}" \
         --expected "a worker loop ends in a PR, a DONE or a question" --writer cc-loop \
         --link "track=$t" --link "exit=$rc" --link "boundary=member" --link "member-log=$HOME/.cc/state/$h/$t/loop.log" 2>&1 | tail -1) \
     || r="not recorded: cc-green red failed"
@@ -1045,9 +1073,22 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   t "…and a stop goes to THAT orch, by the broker's own key for it" "$(stop_target)" demo@myorch
   tell_planner "$bl"; t '…really: the line the broker gets is addressed to the orch' "$(cat "$brec")" "inject --no-start --source loop demo@myorch $bl"
   : > "$brec"
-  CC_SLACK_ALIAS='' orch_record; t 'dispatched with no orch in front of it: the record goes, that dispatcher is the repo seat' "$(test -e "$ST/orch" || echo gone)" gone
+  CC_SLACK_ALIAS='' CC_DISPATCH_WIN=demo orch_record; t 'dispatched with no orch in front of it: the record goes, that dispatcher is the repo seat' "$(test -e "$ST/orch" || echo gone)" gone
   t '…and the stop goes to the repo seat' "$(stop_target)" demo
   printf 'not an alias!\n' > "$ST/orch"; t 'a record that is not an alias on cc\047s own grammar is the repo seat too, not a key nobody owns' "$(stop_target)" demo
+  # THE ALIAS UNSET FOR A SUITE (raised-film-stops-skip-the-video-seat): an orch seat dispatched with CC_SLACK_ALIAS gone
+  # and its rows' stops reached the repo seat. Kept: the window `cc` ran in names the orch. Suppressed: a repo seat's window
+  # records none, and a dispatch from no window at all (a relaunch) neither writes nor wipes the record it finds.
+  CC_SLACK_ALIAS='' CC_DISPATCH_WIN=study-coach@video orch_record
+  t 'an orch seat that unset its alias is still recorded, by the window it dispatched from' "$(cat "$ST/orch")|$ORCH_KEY|$(stop_target)" "study-coach@video|study-coach@video|study-coach@video"
+  printf 'study-coach@video\n' > "$ST/orch"; ORCH_KEY=x; CC_SLACK_ALIAS='' CC_DISPATCH_WIN='' orch_record
+  t '…a relaunch that names no dispatcher keeps the record, and the host-side copy still aims its stop at study-coach' "$(cat "$ST/orch" 2>/dev/null)|$ORCH_KEY|$(stop_target)" "study-coach@video|study-coach@video|study-coach@video"
+  printf 'evil@video\n' > "$ST/orch"; ORCH_KEY=x; CC_SLACK_ALIAS='' CC_DISPATCH_WIN='' orch_record
+  t '…while a record the worker rewrote moves nothing: the key comes from the host-side copy' "$ORCH_KEY|$(stop_target)" "study-coach@video|study-coach@video"
+  mv "${ST%/*}/.dispatch/${ST##*/}" "$ST.hd"; ORCH_KEY=x; CC_SLACK_ALIAS='' CC_DISPATCH_WIN='' orch_record
+  t '…and with no host-side copy the record is read back pinned to this repo' "$ORCH_KEY|$(stop_target)" "|demo@video"; mv "$ST.hd" "${ST%/*}/.dispatch/${ST##*/}"
+  printf 'study-coach@video\n' > "$ST/orch"; CC_SLACK_ALIAS='' CC_DISPATCH_WIN=demo/t7 orch_record
+  t '…and a dispatch from a window that is no orch is the repo seat' "$(test -e "$ST/orch" || echo gone)|$(stop_target)" "gone|demo"
   # THE ORCH'S OWN REPO (raised-worker-stop-never-reached-orch): an orch in study-coach dispatching into this repo was
   # keyed demo@myorch, which nobody owns. Kept: the one live `<x>@myorch` window names it, and CC_ORCH_REPO outranks it.
   # Suppressed: two such windows are no answer, so the old key stands rather than a guess.
@@ -1060,7 +1101,7 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   # THE HOST-SIDE COPY the merge notice reads (cards.py tell_dispatcher), beside the track dir the worker can write:
   # the full key when an orch dispatched, gone when the repo seat did.
   CC_SLACK_ALIAS=myorch CC_ORCH_REPO=lessons orch_record; t 'the host-side dispatch record holds the orch key, outside $ST' "$(cat "$d/.dispatch/st7")" lessons@myorch
-  CC_SLACK_ALIAS='' orch_record; t '…and goes when the repo seat dispatched' "$(test -e "$d/.dispatch/st7" || echo gone)" gone
+  CC_SLACK_ALIAS='' CC_DISPATCH_WIN=demo orch_record; t '…and goes when the repo seat dispatched' "$(test -e "$d/.dispatch/st7" || echo gone)" gone
   # A DONE REACHES THE ORCH, ONCE (done_card + done_heard, driven as the pair the loop runs). Kept: an orch recorded hears
   # it by its own key in ONE broker call — done_card's — and the log says its seat is live; a second inject made it hear
   # every DONE twice (review of #635, findings 2 and 19). No orch: the repo seat's one line. Reported: a recorded orch
@@ -1110,8 +1151,8 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
   ORCH_KEY=""   # …and no orch recorded either
   : > "$brec"
   rm -rf "$ST"; unset ST
-  grep -q '^orch_record; unset CC_SLACK_ALIAS' "$0"; t 'and the loop writes that record at start and unsets the variable before the worker runs' "$?" 0
-  grep -q 'CC_SLACK_ALIAS CC_ORCH_REPO; do' "$realbin/cc"; t '…having been handed it by `cc … --go`, on the list of what crosses into the loop\047s window' "$?" 0
+  grep -q '^orch_record; unset CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN' "$0"; t 'and the loop writes that record at start and unsets the variable before the worker runs' "$?" 0
+  grep -qF 'CC_DISPATCH_WIN=$([ -n "${TMUX_PANE:-}" ] && tmux display-message -p -t "$TMUX_PANE"' "$realbin/cc" && grep -q 'CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN; do' "$realbin/cc"; t '…having been handed it by `cc … --go`, on the list of what crosses into the loop\047s window' "$?" 0
   ( repo=_cctest99999; tell_planner "$bl" ); t "a suite's \`_cc<suite><pid>\` scratch repo has no session to wake" "$?" 1
   t "…and a fixture's stops never reach the box's own broker state" "$(wc -c < "$brec")" 0
   ( CC_MEMBER_SANDBOX=1 tell_planner "$bl" )
@@ -1673,8 +1714,50 @@ post --file $d/dp/report.md --to C1 --thread 1.2 -m here it is"
   t 'inside a member boundary stop_record leaves the stop to the host and writes nothing' \
     "$(CC_MEMBER_SANDBOX=1 sr g 12 'no receipt' x | cut -c1-13)|$(ls "$d/fl/g" 2>/dev/null | wc -l)" "left to the h|0"
   mkdir -p "$d/fl/mh/mem/t2"; printf 'MEMBERTEXT error (2): planted\n' > "$d/fl/mh/mem/t2/loop.log"
-  ms(){ ( export CC_FAILURES="$d/fl/$1" HOME="$d/fl/mh"; unset CC_MEMBER_SANDBOX; member_stop "${@:2}" ); }
-  t 'member-stop on the host records exit 12 under the handle, as done-undelivered' "$(ms h mem t2 12 | cut -c1-53)" \
+  # the host's cc done, the broker and the request door are fakes that write down what they were asked (CC_DONE, $d/fl/bin);
+  # the ledger is the real cc-green, as above. FD_RC is the fake cc done's exit; $d/fl/seats the live windows.
+  mkdir -p "$d/fl/bin"; for f in cc-green cc-failures; do ln -s "$BIN/$f" "$d/fl/bin/$f"; done
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\necho "done: a line"\nexit "${FD_RC:-1}"\n' "$d/fl/done.n" > "$d/fl/bin/fake-cc"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$d/fl/out.n" | tee "$d/fl/bin/cc-broker" > "$d/fl/bin/cc-notify"
+  printf '#!/bin/sh\nexit 1\n' | tee "$d/fl/bin/cc-throwaway" > "$d/fl/bin/cc-board"; chmod +x "$d/fl/bin"/*
+  ms(){ ( export CC_FAILURES="$d/fl/$1" HOME="$d/fl/mh" CC_DONE="$d/fl/bin/fake-cc"; unset CC_MEMBER_SANDBOX; BIN="$d/fl/bin"
+          seat_windows(){ cat "$d/fl/seats" 2>/dev/null; }; member_stop "${@:2}" ); }
+  msr(){ : > "$d/fl/done.n"; : > "$d/fl/out.n"; ms "$@" | tail -1; }
+  # A MEMBER'S FINISH, DELIVERED BY THE HOST (raised-member-worker-finish-always-needs-the-host). Kept: exit 4 runs the host's
+  # cc done itself and, delivered, records nothing and wakes no seat. Reported: a cc done that fails is recorded and told to
+  # the workspace's own seat — never a key read from the member's orch file — or filed as a request when no seat is live.
+  # Suppressed: an exit that is no delivery (3, asked) runs no cc done.
+  printf 'mem@planted\n' > "$d/fl/mh/mem/t2/orch"; printf 'mem\n' > "$d/fl/seats"
+  t 'member-stop: exit 4 has the host run cc done itself, and delivered it records nothing and tells no seat' \
+    "$(FD_RC=0 msr j mem t2 4 | cut -c1-29)|$(cat "$d/fl/done.n")|$(wc -c < "$d/fl/out.n")|$(ls "$d/fl/j" 2>/dev/null | wc -l)" "delivered by the host: cc don|done mem t2|0|0"
+  t '…and cc done exit 7 (pushed, its ready-to-land note filed) is delivered too' "$(FD_RC=7 msr j mem t2 12 | cut -c1-21)" "delivered by the host"
+  t '…a host cc done that fails is recorded and told to the workspace seat by its own key, not the member-written one' \
+    "$(FD_RC=1 msr k mem t2 4 | cut -c1-53)|$(grep -c '^inject --no-start --source loop mem loop: mem/t2 finished, but opened no PR' "$d/fl/out.n")|$(grep -c planted "$d/fl/out.n")|$(grep -c '^--ask' "$d/fl/out.n")" \
+    "failures ledger (mem, recorded by the host): recorded|1|0|0"
+  : > "$d/fl/seats"
+  t '…and with no live seat it is filed as a request too' "$(FD_RC=1 msr l mem t2 4 >/dev/null; grep -c '^--ask --id stop:mem/t2:' "$d/fl/out.n")" 1
+  t '…while an exit that is no delivery runs no cc done' "$(msr m mem t2 3 >/dev/null; wc -c < "$d/fl/done.n")" 0
+  # INSIDE, EXIT 4 IS LEFT TO THE HOST: no broker call, no request for the planning seat — the wake-up the host's cc done saves.
+  ( ST="$d/st4" BIN="$d/stb" BOARD=true LOG=/dev/null; export CC_MEMBER_SANDBOX=1; mkdir -p "$ST"; : > "$d/st.n"; : > "$d/dt.log"
+    log(){ printf '%s\n' "$*" >> "$d/dt.log"; }; eval "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0")"
+    stop 4 "finished, but opened no PR" "cc done failed: nowhere to push" ) >/dev/null 2>&1
+  t 'inside a member boundary stop 4 asks nobody and files nothing: the host finishes it' \
+    "$(wc -c < "$d/st.n")|$(grep -c "the stop is the host's" "$d/dt.log")" "0|1"
+  # A SIGNAL NEVER ENDS THE LOOP SILENTLY (raised-a-killed-iteration-ends-its-loop-silently). Kept: TERM while an iteration
+  # runs aborts that iteration and the loop goes on. Reported: HUP, or TERM between iterations, ends it through stop().
+  # Suppressed: the stop() when `cc` holds the track's lock, re-dispatching over this loop.
+  mkdir -p "$d/sg"; : > "$d/sg/.lock"
+  sg(){ : > "$d/sg.log"; ( log(){ printf '%s\n' "$*" >> "$d/sg.log"; }; kill_child(){ echo killed >> "$d/sg.log"; }; parked(){ return 1; }
+        stopped(){ return 1; }; stop(){ echo "stop $1" >> "$d/sg.log"; exit "$1"; }; BOARD=true ST="$d/sg" child="$2" i=2
+        eval "$(sed -n '/^redispatching(){/p;/^signalled(){/,/  stop 130 /p' "$0")"; signalled "$1"; echo returned >> "$d/sg.log" ) >/dev/null 2>&1
+        echo "rc=$? $(grep -cx killed "$d/sg.log") $(grep -c '^stop 130' "$d/sg.log") $(grep -c returned "$d/sg.log")"; }
+  t 'TERM during an iteration kills its claude and the loop goes on' "$(sg TERM 123)|$(grep -c 'the loop goes on' "$d/sg.log")" "rc=0 1 0 1|1"
+  t 'TERM between iterations ends the loop, and through stop(), so its dispatcher hears' "$(sg TERM '')" "rc=130 1 1 0"
+  t 'HUP (the window closed) during an iteration ends the loop through stop() too' "$(sg HUP 123)" "rc=130 1 1 0"
+  exec {sgl}>>"$d/sg/.lock"; flock -x "$sgl"
+  t '…but not while cc holds the lock to re-dispatch over it: claude killed, quiet exit, no stop' "$(sg HUP 123)|$(grep -c 're-dispatch is replacing' "$d/sg.log")" "rc=130 1 0 0|1"
+  exec {sgl}>&-
+  t 'member-stop on the host records exit 12 under the handle, as done-undelivered' "$(msr h mem t2 12 | cut -c1-53)" \
     "failures ledger (mem, recorded by the host): recorded"
   t '…one record, keyed to the host, linking the log and copying none of the member text into it' \
     "$(CC_FAILURES="$d/fl/h" "$BIN/cc-failures" show --json --scope mem | jq -r '"\(length) \(.[0].kind) \(.[0].links.exit) \(.[0].links.track) \(.[0].links["member-log"] | endswith("/mem/t2/loop.log")) \(.[0].links.log == null) \([.[0].evidence[]? | select(startswith("excerpt:"))] | length)"')|$(grep -rc MEMBERTEXT "$d/fl/h" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')" \
@@ -1723,7 +1806,7 @@ mkdir -p "$ST/runs"; [ -s "$ST/task.md" ] || { echo "cc-loop: no task at $ST/tas
 [ -d "$WT" ] || { echo "cc-loop: no worktree $WT (run: cc $repo $track)" >&2; exit 2; }
 touch "$ST/progress.md"; LOG="$ST/loop.log"; SNAP="$ST/.progress.snap"
 log(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
-orch_record; unset CC_SLACK_ALIAS CC_ORCH_REPO   # who dispatched this loop, for stop(); the worker's own environment does not carry it
+orch_record; unset CC_SLACK_ALIAS CC_ORCH_REPO CC_DISPATCH_WIN   # who dispatched this loop, for stop(); the worker's own environment does not carry it
 pw=$(say_io pidw "$ST" $$ 2>&1) || log "loop.pid not written — ${pw#cc-loop: }; \`cc $repo $track --say\` cannot find this loop"   # loop_live: --say reaches it while it runs
 trap 'say_io pidrm "$ST" $$' EXIT   # only a loop.pid that is still this loop's, and never through a link (say_io)
 [ -e "$ST/stop" ] && { rm -f "$ST/stop"; log "a stop file from before this dispatch was cleared — re-dispatching overrides it"; }
@@ -1732,7 +1815,23 @@ child=""
 kill_child(){ [ -n "$child" ] || return 0   # only ever signal a group we own: if the child is not a group leader, kill just it
   if [ "$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ')" = "$child" ]; then kill -TERM -- -"$child" 2>/dev/null; sleep 2; kill -KILL -- -"$child" 2>/dev/null
   else kill -TERM "$child" 2>/dev/null; fi; }
-trap 'kill_child; parked; log "signalled — iteration aborted and its claude killed"; exit 130' HUP INT TERM   # tmux kill-window would otherwise re-parent claude to systemd, still editing this worktree
+# A SIGNAL ENDS AN ITERATION OR THE LOOP, AND NEVER SILENTLY (raised-a-killed-iteration-ends-its-loop-silently: a kill
+# aimed at a stuck claude took the loop with it, exit 130, and nobody was told). TERM while an iteration runs is a kill
+# of that iteration: its claude goes, and the loop goes on, counting it as a failed iteration (two in a row is stop 5,
+# with word). HUP (the window closed), INT (Ctrl-C at the window), or any signal between iterations ends the loop, and
+# the dispatcher hears it through stop() — unless `cc` holds the track's lock, which it does only while it kills this
+# window to start the loop that replaces it: that seat knows, and a stop now would write `blocked` over its `running`.
+# The project pause and the stop file stay what they were (parked, stopped). tmux kill-window would otherwise re-parent
+# claude to systemd, still editing this worktree, so the child is killed first in every case.
+redispatching(){ [ -f "$ST/.lock" ] && [ ! -L "$ST/.lock" ] && ! flock -n -s 8 8<"$ST/.lock"; }   # a read-only open of a plain file: nothing is created or written through a link
+signalled(){ local s="$1" had="$child"; redispatching && { kill_child; log "signalled ($s) — a re-dispatch is replacing this loop; its claude killed"; exit 130; }
+  kill_child; parked
+  if [ "$s" = TERM ] && [ -n "$had" ]; then
+    log "signalled (TERM) — iteration ${i:-?} aborted and its claude killed; the loop goes on"
+    "$BOARD" note "$repo" "$track" "iteration ${i:-?} was killed (TERM); the loop goes on" >/dev/null 2>&1; return 0; fi
+  stopped || :; trap '' HUP INT TERM   # one ending: a second signal does not start a second stop()
+  stop 130 "was stopped" "The loop was signalled ($s) during iteration ${i:-0} and has ended; its claude was killed. To start it again: cc $repo $track --go \"\""; }
+trap 'signalled HUP' HUP; trap 'signalled INT' INT; trap 'signalled TERM' TERM
 stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" heard=no esc="" bid="" tg=""   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
   # …and `waiting` when it stopped to ASK, which is not the same thing as stopping. The loop is the first to know, so it
   # writes the same word cc-reconcile would 20 min later — otherwise the board says `blocked` while the Home tab, reading
@@ -1741,6 +1840,8 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" said="${5:-}" hea
   log "exit $code: $msg"
   if throwaway; then log "throwaway repo: no ledger record, no seat, nothing posted"; exit "$code"; fi   # see throwaway()
   log "failures ledger ($repo): $(stop_record "$code" "$title" "$msg")"   # the tool that saw it writes it down; the exit is decided already
+  if [ "$code" = 4 ] && inside_boundary; then   # the host finishes it: member_stop runs cc done there, and tells this seat only if that fails
+    log "the stop is the host's: when the boundary exits it runs cc done $repo $track, and tells $repo's seat only if that fails"; exit "$code"; fi
   # A WORKER'S QUESTION ($5) is asked ONCE, under an id stable for that question at that commit, so a relaunch that stops
   # on it again does not ask twice. The seat tries first: its line carries the exact card to raise if only the owner can
   # settle it. Until 2026-10 the loop posted the question itself, unmentioned on #<repo>, and most went unanswered.

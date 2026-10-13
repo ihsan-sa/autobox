@@ -4025,6 +4025,12 @@ cd ~ || exit 1
 #        one explanation is a CC_* path a case left pointing at ~/.cc, which is what #501's 90 rows were.
 #   SAID, not red: the marker anywhere else — printed, file by file, so whoever reads the run sees what the box
 #        wrote about the fixture and can tell a new leak from a watcher. A landing is not stopped on a watcher.
+#   SAID, not red, in a box path too: a file whose every line naming this run's fixture also names ANOTHER run's
+#        (_cctest<N> or selftest-<N>). Nothing in this run knows another run's name, so that line is a live process
+#        listing the leftover ~/dev/_cctest* folders. The lander-self promote at 15:10Z on 10-06 posted such a list,
+#        cc-slack logged it to ~/.cc/slack/outbox.log, and #904's round-3 run went red on it with nothing leaked.
+#        A listing that names this run's folder alone still reads as a leak; the red line names file and line
+#        numbers, so the reader opens those lines instead of hunting.
 # BOX_PATHS is the mirror of the export block and is read beside it: a path added there is added here.
 BOX_PATHS="notify.log failures state/claude-limit state/handoff state/context state/statusline guard-asks scope state/limit-seen state/limit-interrupted state/limit-nudged state/limit-resumed slack"
 box_marked(){   # <root> → the files under it, changed since this run began, that name this run's fixtures
@@ -4032,10 +4038,17 @@ box_marked(){   # <root> → the files under it, changed since this run began, t
        -o -path "$1/toolchains" -prune -o -path "$1/tmp" -prune -o -path "$1/selftest-*" -prune -o -path "$1/state/$REPO" -prune \
        -o -type f -newer "$T/born" ! -name "$REPO.*" ! -name 'selftest.lock*' -print 2>/dev/null \
      | xargs -r grep -l -e "$REPO" -e "selftest-$RUN" 2>/dev/null; }
-box_split(){   # <root> <marked files…> → $leak: under a BOX_PATHS default of <root>; $seen: anywhere else
+box_listing(){   # <file> → true when every line naming this run's fixture also names another run's: a live listing, not a write
+  awk -v r="$REPO" -v s="selftest-$RUN" 'index($0, r) || index($0, s) { own++; other = 0; t = $0
+      while (match(t, /(_cctest|selftest-)[0-9]+/)) { w = substr(t, RSTART, RLENGTH); if (w != r && w != s) other = 1; t = substr(t, RSTART + RLENGTH) }
+      if (!other) bare++ }
+    END { exit !(own && !bare) }' "$1"; }
+box_lines(){   # <files…> → each as file:N,N… — the lines that name this run's fixture, the first five per file
+  local f; for f in "$@"; do printf ' %s:%s' "$f" "$(grep -n -e "$REPO" -e "selftest-$RUN" "$f" 2>/dev/null | head -5 | cut -d: -f1 | paste -sd,)"; done; }
+box_split(){   # <root> <marked files…> → $leak: under a BOX_PATHS default of <root>, unless only a listing names it; $seen: the rest
   local r=$1 f b hit; shift; leak=""; seen=""
   for f in "$@"; do hit=""; for b in $BOX_PATHS; do case $f in "$r/$b"|"$r/$b"/*) hit=1;; esac; done
-    if [ -n "$hit" ]; then leak="$leak $f"; else seen="$seen $f"; fi; done; }
+    if [ -n "$hit" ] && ! box_listing "$f"; then leak="$leak $f"; else seen="$seen $f"; fi; done; }
 # CONTROL, both directions, on a fixture ~/.cc under $T — nothing is written to the box to prove the box is not
 # written to. The same walk and the same split: a marker in state/context is the leak, in reconcile.log the watcher;
 # a file older than this run, one under a sibling selftest-*, the run's own board file and a file that never names
@@ -4056,10 +4069,21 @@ box_split "$C" $(box_marked "$C"); want=$(tr ' ' '\n' <<<"$want" | sort | tr '\n
 [ "$got" = "$want" ] && [ -z "$seen" ] \
   && ok "control: a stray marker under each of the $(wc -w <<<"$BOX_PATHS") box paths is a leak, and one under toolchains/ or tmp/ is not walked" \
   || bad "the leak walk missed a box path or walked toolchains/ or tmp/: leak=[$leak] seen=[$seen]"
+# …and in a box path, a line that lists this run's fixture beside another run's is a live process's listing, not
+# this run's write (#904, 10-06): said, not red. One line naming this run's fixture alone, in the same file or
+# another, is still the leak.
+C=$T/boxctl3; mkdir -p "$C/slack" "$C/state/context"
+printf '2026-10-06T15:10:00Z\tpost\tC1\t\tleft over: ~/dev/_cctest1 ~/dev/%s ~/dev/_cctest22\n' "$REPO" > "$C/slack/outbox.log"
+printf '%s\n%s _cctest1\n' "$REPO" "$REPO" > "$C/state/context/handoffs.jsonl"
+box_split "$C" $(box_marked "$C")
+[ "$leak" = " $C/state/context/handoffs.jsonl" ] && [ "$seen" = " $C/slack/outbox.log" ] \
+  && [ "$(box_lines $leak)" = " $C/state/context/handoffs.jsonl:1,2" ] \
+  && ok "control: a box-path line listing this run's fixture beside another run's is a watcher; a file with one bare mention is a leak, named by file and line" \
+  || bad "the listing/leak split is wrong: leak=[$leak] seen=[$seen] lines=[$(box_lines $leak)]"
 box_split ~/.cc $(box_marked ~/.cc)   # brief: "a run leaves ~/.cc byte-identical (checked)" — empty $leak is that, for the paths the block redirects
 [ -z "$leak" ] && ok "the run wrote nothing of its own into a box file: no $REPO in the box's copy of a path the export block redirects" \
-  || bad "a box file carries this run's fixtures (a CC_* state path still points at ~/.cc — add it to the export block, and its default to BOX_PATHS):$leak"
-[ -z "$seen" ] || echo "  · the box's own watchers wrote about this run's fixtures (not a leak — a live tick reading the fixture board or transcripts):$seen"
+  || bad "a box file carries this run's fixtures (a CC_* state path still points at ~/.cc — add it to the export block, and its default to BOX_PATHS):$(box_lines $leak)"
+[ -z "$seen" ] || echo "  · the box's own watchers wrote about this run's fixtures (not a leak — a live tick reading the fixture board or transcripts, or a live post listing the _cctest folders):$seen"
 box_flags > "$T/flags.after"
 # …BUT ~/.cc/config IS LIVE. `cc-config set` is how every planning seat changes the box, and a seat that set a key
 # while this ~20 min suite ran turned unrelated landings red (five retained logs, 2026-09 — the box's state, not the

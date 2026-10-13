@@ -147,10 +147,17 @@ box_marked(){   # <root> → the files under it, changed since this run began, t
        -o -path "$1/toolchains" -prune -o -path "$1/tmp" -prune -o -path "$1/selftest-*" -prune -o -path "$1/state/$REPO" -prune \
        -o -type f -newer "$T/born" ! -name "$REPO.*" ! -name 'selftest.lock*' -print 2>/dev/null \
      | xargs -r grep -l -e "$REPO" -e "selftest-$RUN" 2>/dev/null; }
-box_split(){   # <root> <marked files…> → $leak: under a BOX_PATHS default of <root>; $seen: anywhere else
+box_listing(){   # <file> → true when every line naming this run's fixture also names another run's: a live listing, not a write
+  awk -v r="$REPO" -v s="selftest-$RUN" 'index($0, r) || index($0, s) { own++; other = 0; t = $0
+      while (match(t, /(_cctest|selftest-)[0-9]+/)) { w = substr(t, RSTART, RLENGTH); if (w != r && w != s) other = 1; t = substr(t, RSTART + RLENGTH) }
+      if (!other) bare++ }
+    END { exit !(own && !bare) }' "$1"; }
+box_lines(){   # <files…> → each as file:N,N… — the lines that name this run's fixture, the first five per file
+  local f; for f in "$@"; do printf ' %s:%s' "$f" "$(grep -n -e "$REPO" -e "selftest-$RUN" "$f" 2>/dev/null | head -5 | cut -d: -f1 | paste -sd,)"; done; }
+box_split(){   # <root> <marked files…> → $leak: under a BOX_PATHS default of <root>, unless only a listing names it; $seen: the rest
   local r=$1 f b hit; shift; leak=""; seen=""
   for f in "$@"; do hit=""; for b in $BOX_PATHS; do case $f in "$r/$b"|"$r/$b"/*) hit=1;; esac; done
-    if [ -n "$hit" ]; then leak="$leak $f"; else seen="$seen $f"; fi; done; }
+    if [ -n "$hit" ] && ! box_listing "$f"; then leak="$leak $f"; else seen="$seen $f"; fi; done; }
 C=$T/boxctl; mkdir -p "$C/state/context" "$C/selftest-0" "$C/boards"
 echo "$REPO" > "$C/state/context/handoffs.jsonl"; echo "$REPO" > "$C/state/reconcile.log"
 echo "$REPO" > "$C/old"; touch -d "@$(($(stat -c %Y "$T/born") - 3600))" "$C/old"; echo "$REPO" > "$C/selftest-0/log"; echo "$REPO" > "$C/boards/$REPO.json"; echo other > "$C/state/clean.log"
@@ -167,10 +174,21 @@ box_split "$C" $(box_marked "$C"); want=$(tr ' ' '\n' <<<"$want" | sort | tr '\n
 [ "$got" = "$want" ] && [ -z "$seen" ] \
   && ok "control: a stray marker under each of the $(wc -w <<<"$BOX_PATHS") box paths is a leak, and one under toolchains/ or tmp/ is not walked" \
   || bad "the leak walk missed a box path or walked toolchains/ or tmp/: leak=[$leak] seen=[$seen]"
+# …and in a box path, a line that lists this run's fixture beside another run's is a live process's listing, not
+# this run's write (#904, 10-06): said, not red. One line naming this run's fixture alone, in the same file or
+# another, is still the leak.
+C=$T/boxctl3; mkdir -p "$C/slack" "$C/state/context"
+printf '2026-10-06T15:10:00Z\tpost\tC1\t\tleft over: ~/dev/_cctest1 ~/dev/%s ~/dev/_cctest22\n' "$REPO" > "$C/slack/outbox.log"
+printf '%s\n%s _cctest1\n' "$REPO" "$REPO" > "$C/state/context/handoffs.jsonl"
+box_split "$C" $(box_marked "$C")
+[ "$leak" = " $C/state/context/handoffs.jsonl" ] && [ "$seen" = " $C/slack/outbox.log" ] \
+  && [ "$(box_lines $leak)" = " $C/state/context/handoffs.jsonl:1,2" ] \
+  && ok "control: a box-path line listing this run's fixture beside another run's is a watcher; a file with one bare mention is a leak, named by file and line" \
+  || bad "the listing/leak split is wrong: leak=[$leak] seen=[$seen] lines=[$(box_lines $leak)]"
 box_split ~/.cc $(box_marked ~/.cc)   # brief: "a run leaves ~/.cc byte-identical (checked)" — empty $leak is that, for the paths the block redirects
 [ -z "$leak" ] && ok "the run wrote nothing of its own into a box file: no $REPO in the box's copy of a path the export block redirects" \
-  || bad "a box file carries this run's fixtures (a CC_* state path still points at ~/.cc — add it to the export block, and its default to BOX_PATHS):$leak"
-[ -z "$seen" ] || echo "  · the box's own watchers wrote about this run's fixtures (not a leak — a live tick reading the fixture board or transcripts):$seen"
+  || bad "a box file carries this run's fixtures (a CC_* state path still points at ~/.cc — add it to the export block, and its default to BOX_PATHS):$(box_lines $leak)"
+[ -z "$seen" ] || echo "  · the box's own watchers wrote about this run's fixtures (not a leak — a live tick reading the fixture board or transcripts, or a live post listing the _cctest folders):$seen"
 box_flags > "$T/flags.after"
 flagdiff=$(diff "$T/flags.before" "$T/flags.after" | grep '^[<>]'); cfgdiff=$(grep '^[<>] config ' <<<"$flagdiff")
 if [ -n "$cfgdiff" ] && ! grep -q -e "$REPO" -e "selftest-$RUN" ~/.cc/config 2>/dev/null; then

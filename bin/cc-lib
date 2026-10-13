@@ -14,7 +14,7 @@ boundary reads one file, its own workspace's, and can reach no other.
         `site` or `r1/site`, a path `~/.cc/state/...`, a SHA); the exact-object routes run first — the landing
         record for a PR, the board row and its newest notes for a row, the resolved journal (progress.md, else
         -handoff.md, else the legacy -handover.md — never guessed, each path tried is named) — and only then the
-        FTS5 search over the query, top hits ranked exact id → kind fit for --need → BM25 → freshness, copies of
+        FTS5 search over the query, top hits ranked exact id → BM25 weighted by kind fit for --need → freshness, copies of
         one text collapsed into one hit with provenance. The packet is capped (default 8 KiB, the three worked
         misses use 2/4/8 KiB) and ends with COVERAGE (sources, watermark, pending, unreadable, excluded, refused,
         deadline, hook-misses when a write hook failed to index, re-read when this ask had to bring a stale source in
@@ -204,6 +204,9 @@ FIT = {"current": {"event": 3, "finding": 3, "checkpoint": 2, "note": 2, "decisi
        "decision": {"decision": 3, "document": 2, "note": 1, "finding": 1, "checkpoint": 0, "event": 0, "chat": 0},
        "history": {"checkpoint": 3, "note": 2, "event": 2, "finding": 2, "document": 1, "decision": 1, "chat": 1},
        "aggregate": {}}
+# fit WEIGHTS the BM25 score (x1 + FIT_WEIGHT * fit) and does not outrank it: as a sort key above BM25 it put any
+# checkpoint sharing a word ahead of the owner's own Slack reply that answered (evals/cc-lib-retrieval, 2026-10-13)
+FIT_WEIGHT = 0.5
 # PER-REPO SOURCES (design-notes-ingest.md §5, row 5): repo name -> ((pattern under <tree>, skind), …). Registered for
 # that repo by name and never as a global glob — "a member repo that happened to be registered would not match".
 REPO_SOURCES = {"lessons": (("lessons/*/COURSE.md", "course"), ("lessons/*/STUDY.md", "study"),
@@ -1358,9 +1361,12 @@ def with_deadline(c, seconds):
     c.set_progress_handler(lambda: 1 if time.monotonic() > end else 0, 5000)
 
 
-def search(c, query, repo, need, object_ids, limit=40):
-    """FTS hits, AND phase then one OR reformulation; ranked exact id -> kind fit -> BM25 + freshness."""
+def search(c, query, repo, need, object_ids, limit=40, leads=None):
+    """FTS hits, AND phase then one OR reformulation; ranked exact id -> BM25 weighted by kind fit + freshness.
+    An AND phase short of a page is followed by the OR phase's other hits, ranked after it; their ids go into `leads`.
+    (Eval 2026-10-13: a stray record holding every word stopped the search before the answer, which held most.)"""
     hits, phase, deadline_hit = [], "", False
+    fill = set() if leads is None else leads
     for mode in ("and", "or"):
         expr = fts_expr(query, mode)
         if not expr:
@@ -1379,8 +1385,14 @@ def search(c, query, repo, need, object_ids, limit=40):
                 rows = []
         finally:
             c.set_progress_handler(None, 0)
-        if rows:
+        if rows and not hits:
             hits, phase = rows, mode
+            if len(rows) >= HITS:
+                break
+        elif rows:
+            got = set(h[0] for h in hits)
+            fill.update(r[0] for r in rows if r[0] not in got)
+            hits += [r for r in rows if r[0] in fill]
             break
     now = time.time()
     ranked = []
@@ -1389,7 +1401,7 @@ def search(c, query, repo, need, object_ids, limit=40):
         exact = 0 if (object_ids and rid_ids & object_ids) else 1
         fit = FIT.get(need, {}).get(h[2], 0)
         age = max(0.0, (now - ts_num(h[5])) / 86400.0) if ts_num(h[5]) else 365.0
-        ranked.append(((exact, -fit, h[13] + math.log1p(age) / 4.0), h))
+        ranked.append(((exact, h[0] in fill, h[13] * (1 + FIT_WEIGHT * fit) + math.log1p(age) / 4.0), h))   # bm25 is negative: more fit, lower
     ranked.sort(key=lambda x: x[0])
     return [h for _, h in ranked], phase, deadline_hit
 
@@ -1703,11 +1715,12 @@ def ask(argv):
         if kind in ("pr", "id"):
             sections.append(("records naming it, newest first", by_ids(c, object_ids, orepo, limit=HITS)))
     hits, phase, deadline_hit = ([], "", False)
+    leads = set()   # any-word hits filling a short all-words page
     # --need current SEARCHES NOTHING: a record says what was written as of its stamp, and a hit ranked first reads as
     # the state now. The object's own routes above still run; the query gets a PROBE line naming where the state lives.
     skipped = bool(query) and need == "current"
     if query and not skipped:
-        hits, phase, deadline_hit = search(c, query, repo, need, object_ids)
+        hits, phase, deadline_hit = search(c, query, repo, need, object_ids, leads=leads)
     shown_rids = set()
     routed = 0
     body = []
@@ -1723,7 +1736,7 @@ def ask(argv):
                + (f" · hook-misses {hm}" if hm else "")
                + (f" · re-read {cov['indexed']}" if cov["indexed"] else "")   # sources this ask had to bring in itself: the hooks' misses, measured
                + ((" · host-indexed, this workspace only" + ("" if os.path.isfile(dbpath()) else " · NO FILE BOUND YET (the host has not indexed this workspace)")) if member else "")
-               + (f" · search {phase}-phase" if phase else (" · search: skipped (need current)" if skipped else " · search: no hit" if query else ""))
+               + (f" · search {phase}-phase" + (" + any-word fill" if leads else "") if phase else (" · search: skipped (need current)" if skipped else " · search: no hit" if query else ""))
                + (" · DEADLINE HIT (partial)" if deadline_hit else ""))
     tail = ([probe_line(o)] if need == "current" else []) + [covline] + ([CURRENT_CAVEAT] if need == "current" else [])
     last_tpl = f"OUTCOME not-recorded · {cap} bytes · 99999 ms · ticket {T} turn 1 · budget {TICKET_CAP} left {TICKET_CAP}"
@@ -1760,7 +1773,9 @@ def ask(argv):
     groups = [(h, also) for h, also in collapse(hits) if h[1] not in shown_rids]
     shown_hits = 0
     if query and groups:
-        line = f"HITS {min(len(groups), HITS)} of {len(groups)} " + ("(all words)" if phase == "and" else
+        nlead = sum(1 for h, _ in groups[:HITS] if h[0] in leads)
+        line = f"HITS {min(len(groups), HITS)} of {len(groups)} " + ("(all words)" if phase == "and" and not nlead else
+                                                                f"(all words: {min(len(groups), HITS) - nlead}, then any word — leads)" if phase == "and" else
                                                                 "(any word — no record holds all the words; leads, not an answer)")
         u, rendered = used + len(line.encode()) + 1, []
         for h, also in groups[:HITS]:
@@ -2691,6 +2706,7 @@ def selfcheck():
         selfcheck_docs(th, ok, run, w)
         selfcheck_perms(th, ok, run, w)
         selfcheck_sources(th, ok, run, w)
+        selfcheck_ranking(th, ok, run, w)
         selfcheck_quarantine(ok, run)
     finally:
         H = H0
@@ -3368,6 +3384,38 @@ def selfcheck_sources(th, ok, run, w):
     else:
         with open(qp, "w") as f:
             f.write(keep_q)
+    run("index")
+
+
+def selfcheck_ranking(th, ok, run, w):
+    """What the 2026-10-13 retrieval eval changed: kind fit weights BM25 instead of sorting above it, and an all-words
+    phase short of a page is followed by the any-word hits, labelled leads. Its own channel under r1, removed after."""
+    def outcome(out):
+        m = re.search(r"^OUTCOME (\S+)", out, re.M)
+        return m.group(1) if m else "?"
+    filler = "\n\n".join(f"paragraph {k} of a long checkpoint about other things entirely, words words words " * 4 for k in range(10))
+    jp = w(".cc/state/r1/rk-handoff.md", "# rk journal\n\n## 2026-10-10T00:00Z long\nWOMBAT once.\n\n" + filler + "\n\nQUOKKA once.\n")
+    msgs = [("1791000000.000100", "WOMBAT QUOKKA: the WOMBAT QUOKKA rule, all of it here"),
+            ("1791000060.000200", "PANGOLIN AARDVARK in one stray line"),
+            ("1791000120.000300", "PANGOLIN alone, the record that answers it")]
+    msgs += [(f"1791000{200 + k}.000400", f"NARWHAL LEMUR, page line {k}") for k in range(HITS)]
+    msgs += [("1791000300.000500", "NARWHAL alone, past a full page")]
+    ap = w(".cc/slack/archive/r1/C0RRRRRRRR1/2026-10.jsonl", "".join(
+        json.dumps({"ts": ts, "chat": "C0RRRRRRRR1", "channel": "#r1", "user": "ada", "role": "owner", "target": "r1", "text": t}) + "\n"
+        for ts, t in msgs))
+    run("index")
+    rc, o = run("ask", "--need", "history", "WOMBAT QUOKKA")
+    ok("kind fit weights BM25, it does not outrank it: a short note holding both words twice comes before a long checkpoint "
+       "holding each once", re.search(r"HITS.*\n  \[note", o) is not None and "rk-handoff.md[" in o)
+    rc, o = run("ask", "--need", "history", "PANGOLIN AARDVARK")
+    ok("an all-words phase short of a page is followed by the any-word hits, after it and labelled leads; still answered",
+       "(all words: 1, then any word — leads)" in o and "+ any-word fill" in o and outcome(o) == "answered"
+       and 0 <= o.find("PANGOLIN AARDVARK in one") < o.find("PANGOLIN alone"))
+    rc, o = run("ask", "--need", "history", "NARWHAL LEMUR")
+    ok("…but a full page of all-words hits is not filled: no lead past it", "(all words)" in o and "any-word fill" not in o
+       and "NARWHAL alone" not in o)
+    os.remove(jp)
+    os.remove(ap)
     run("index")
 
 
