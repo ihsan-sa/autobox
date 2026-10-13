@@ -145,6 +145,36 @@ class Run(Case):
         self.assertEqual(HL.load("demo")["checks"], {})
         self.assertEqual(self.said, [])
 
+    def test_a_killed_pass_keeps_its_finished_results_and_the_next_pass_picks_up_from_there(self):
+        self.go(TIP1, ["app/x.py"])
+        self.tip, self.files[TIP2] = TIP2, ["app/y.py", "lib/z.py"]
+
+        def killed(name, sha):
+            if name == "lib":
+                raise KeyboardInterrupt("killed")
+            return T.Result(check=name, tree=sha, status=T.PASSED)
+        with self.assertRaises(KeyboardInterrupt):
+            HL.run("demo", killed)
+        rec = HL.load("demo")
+        self.assertEqual(rec["checks"]["app"]["tip"], TIP2, "app finished before the kill: it is on disk")
+        self.assertEqual((rec["tip"], rec["running"]), (TIP1, TIP2), "the pass is not marked done")
+        self.assertTrue(HL.pending("demo"))
+        ran, asked = self.go(TIP2, ["app/y.py", "lib/z.py"])
+        self.assertEqual(asked, [("lib", TIP2)], "only the check the killed pass had not reached runs")
+        self.assertEqual(ran, {"lib": T.PASSED})
+        rec = HL.load("demo")
+        self.assertEqual((rec["tip"], rec["running"]), (TIP2, ""))
+        self.assertFalse(HL.pending("demo"))
+
+    def test_a_killed_pass_on_an_older_tip_is_not_taken_for_the_new_tip(self):
+        self.go(TIP1, ["app/x.py"])
+        self.tip, self.files[TIP2] = TIP2, ["app/y.py"]
+        with self.assertRaises(KeyboardInterrupt):
+            HL.run("demo", lambda n, s: (_ for _ in ()).throw(KeyboardInterrupt()))
+        self.files[TIP3] = ["app/y.py", "lib/z.py"]
+        ran, asked = self.go(TIP3, ["app/y.py", "lib/z.py"])
+        self.assertEqual(ran, {"app": T.PASSED, "lib": T.PASSED}, "every check the range reaches runs on the new tip")
+
     def test_a_lander_change_runs_the_e2e_set(self):
         ran, _ = self.go(TIP1, ["core/lander/tip.py"])
         self.assertIn("e2e-flow", ran)
@@ -230,9 +260,10 @@ class Judge(unittest.TestCase):
 
 
 class Tick(Case):
-    def tick(self, health):
+    def tick(self, health, st="green", tipran=None):
         tip, deploy = types.ModuleType("tip"), types.ModuleType("deploy")
-        tip.run, tip.catchup = (lambda repo, plan, check: "green"), (lambda repo: False)
+        tip.run = lambda repo, plan, check: (tipran.append(repo) if tipran is not None else None) or st
+        tip.catchup = lambda repo: False
         deploy.run = lambda repo: None
         settled = []
         with mock.patch.object(HL, "run", health), \
@@ -256,6 +287,30 @@ class Tick(Case):
         lines, settled = self.tick(lambda *a, **k: {"app": T.PASSED})
         self.assertEqual(settled, ["demo"])
         self.assertFalse(any("failed" in x for x in lines), lines)
+
+    def test_a_tip_run_starts_while_main_health_is_mid_run(self):
+        inner, tipran = {}, []
+
+        def health(*a, **k):   # mid-run: the next merge's tick comes in
+            with TP.lock("demo") as got:
+                inner["tip lock free"] = got
+            inner["lines"], _ = self.tick(lambda *a, **k: self.fail("a second health pass ran"), tipran=tipran)
+            return {"app": T.PASSED}
+        lines, settled = self.tick(health)
+        self.assertTrue(inner["tip lock free"], "main health holds the tip lock")
+        self.assertEqual(tipran, ["demo"], "the second tick's tip run did not start")
+        self.assertNotIn("[demo] a tip run is already going", inner["lines"])
+        self.assertIn("[demo] main health is already running", inner["lines"])
+        self.assertTrue(HL.pending("demo"), "the skipped tick asks for one more pass")
+        self.assertIn("[demo] main health: 1 check(s)", lines)
+
+    def test_an_owed_pass_runs_on_an_idle_tip_and_none_runs_when_nothing_is_owed(self):
+        ran = []
+        self.tick(lambda *a, **k: ran.append(1) or {}, st="idle")
+        self.assertEqual(ran, [], "an idle tip with nothing owed runs no health pass")
+        HL.want("demo")
+        self.tick(lambda *a, **k: ran.append(1) or {}, st="idle")
+        self.assertEqual(ran, [1], "an owed pass runs though the tip was idle")
 
 
 class E2E(unittest.TestCase):

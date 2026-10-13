@@ -75,6 +75,7 @@ The `!` commands are `!pause`/`!resume` (each also as `-only` and `-under`), `!r
 `!pause-only`/`!resume-only` stop at this project and leave what is under it exactly as it was; `!pause-under`/`!resume-under` say the walk out loud and mean what the bare verbs already do. Either way the answer ends with a `Reach:` line naming how far it went, so nobody has to predict it from CC_PROJECT_CHILDREN.
 ~/.cc/state/home.json is the box's one live view and the dashboard reads it: rewritten every 30 s and within 2 s of any event, leading with what needs the owner, then running/idle counts, the backlog, the channels, load, handoff count, audit and boot. There is no Slack App Home tab: the daemon publishes a one-line pointer to the dashboard once at start and never again.
 While a handoff overlap is open on a target, only the session the record calls live is delivered to (permission answers included); the muted one's reply/react/file are refused. The muted one is never delivered to, even alone: a message with no live side subscribed is held and handed over at the cutover (cc-handoff's `{"cutover"}` word, or the 30 s tick) or at the live side's hello. At the cutover the successor also gets what the predecessor was handed from 10 min before the overlap and never answered (no box post in its thread, no box reaction but 👀 on it, no 👍 from a woken turn), with a line saying so. An orch is a seat of its own: it reads its own record, `<repo>@<alias>`, never the repo's.
+Every hop of a person's message leaves one receipt line in ~/.cc/receipts/<day>.jsonl (CC_RECEIPTS_DIR): received with the session its route picked, each delivery try and its result (a track's hand-on to its repo or parent seat says where it went), an expiry, and the reply, file, Slack-accepted reaction or 👍, or threaded `post -c`, that answered it with the session that made it. `cc-receipts check` reads them; nothing here does.
 See ~/COMMS.md and ~/USAGE.md.
 
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
@@ -1020,6 +1021,43 @@ def archive_in(target, chat, thread, ts, user, role, channel, text):
     except Exception as e:
         log(f"archive: {chat} {ts}: {e!r}")
 
+RECEIPTS = os.environ.get("CC_RECEIPTS_DIR", f"{HOME}/.cc/receipts")
+
+def receipt(stage, chat, ts, thread=None, **f):
+    """One line per hop of an inbound message, keyed by (chat, ts) of the message, under RECEIPTS/<YYYY-MM-DD>.jsonl:
+    `received` (who said it, which session the route picked), `delivery` (what deliver() did with it, per try),
+    `expired` (a queued message aged out, and the thread was told) and `answered` (a reply, reaction or file in its
+    thread, stamped with the session that made it). cc-receipts reads them and checks the invariants; nothing here
+    decides anything. One os.write of one line on an O_APPEND fd; best-effort, a failure is one log line."""
+    if not chat or not ts:
+        return
+    try:
+        os.makedirs(RECEIPTS, exist_ok=True)
+        now = time.time()
+        line = json.dumps(dict({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "t": round(now, 3),
+                                "stage": stage, "via": "slack", "chat": chat, "ts": str(ts),
+                                "thread": str(thread or ts)}, **{k: v for k, v in f.items() if v not in (None, "")}),
+                          ensure_ascii=False) + "\n"
+        fd = os.open(f"{RECEIPTS}/{time.strftime('%Y-%m-%d', time.gmtime(now))}.jsonl",
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8", "replace"))
+        finally:
+            os.close(fd)
+    except Exception as e:
+        log(f"receipt: {stage} {chat} {ts}: {e!r}")
+
+def seat_name(target, alias=None):
+    """The session a receipt names: `<target>` or `<target>@<alias>`, the same key cc-slack seat prints."""
+    return f"{target}@{alias}" if alias else (target or "")
+
+def answered(chat, ts, thread, session, how, **f):
+    """The `answered` receipt every reply path writes once Slack took the answer: the Channel tools, the daemon's
+    member verbs and ack, and `cc-slack post` from a session. Keyed by the message it answers (ts), else the thread it
+    went into; written only for a known session, since an answer nobody can name is no session's answer."""
+    if session:
+        receipt("answered", chat, ts or thread, thread, session=session, how=how, **f)
+
 # submit() is the outbound authority: producer names an event id, records intent then accepted+ts.
 # Replay of an accepted id returns the old ts; an unconfirmed retry checks Slack (find_accepted).
 SENT_DIR = f"{DIR}/sent"      # one JSON file per producer id
@@ -1239,21 +1277,24 @@ def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None, meta=N
 
 def react(cfg, chat, ts, name, remove=False, thread=None):
     """Our reaction on a message goes to the outbox like a post, since it counts as an answer. Filed under
-    the thread's own ts, not the message's own ts, so a 👍 on a follow-up still answers the thread it's in."""
+    the thread's own ts, not the message's own ts, so a 👍 on a follow-up still answers the thread it's in.
+    Returns True only when Slack accepted it: a refused call, no token or no ts is False, so a caller that counts
+    the reaction as an answer (an `answered` receipt) counts only one that is on the message."""
     kind = "react"
     tok = cfg.get("SLACK_BOT_TOKEN")
     if not tok or not ts:
         if ts and not remove:
             outbox(kind, chat, thread or ts, name)   # no Slack to accept it: the log is the channel
-        return
+        return False
     try:
         api("reactions.remove" if remove else "reactions.add", tok, channel=chat, timestamp=ts, name=name)
     except Exception:
         if not remove:
             outbox("react-failed", chat, thread or ts, name)   # refused: not a word of ours (cc-owed does not count it)
-        return
+        return False
     if not remove:
         outbox(kind, chat, thread or ts, name)   # accepted: written after the call, as post() does
+    return True
 
 # THE OWNER'S OPEN ASKS. Every post that pages him is written here as it goes out: one that opens with 🔒 and his
 # mention (decision_head: a decision, an approval card, a needs_owner reply, a 🔐 prompt), or a `cc-notify --owner`
@@ -4827,7 +4868,8 @@ class Daemon:
         if not chat or not ts:
             return
         self.mark_answered(chat, ts=ts)                  # the turn that read it took it on: no re-hand at a cutover
-        self._safe(react, self.cfg, chat, ts, "+1")
+        if self._safe(react, self.cfg, chat, ts, "+1"):   # only a 👍 Slack took is an answer
+            answered(chat, ts, None, seat_name(target, alias), "ack")
         log(f"ack {target}{'@' + alias if alias else ''}: 👍 on {chat}/{ts}")
 
     def sender(self, chat, peer):
@@ -4958,14 +5000,18 @@ class Daemon:
                 dec = False
             missed = unresolved_mentions(self.cfg, text, chat if chat != "local" else None, decision=dec)
             n, _ = post(self.cfg, chat, text, thread, username=display_name(target), ts=ts or None, decision=dec)
+            if n:
+                answered(chat, ts, thread, target, "reply")
             if ts:
                 react(self.cfg, chat, ts, "eyes", remove=True)
             return {"ok": True, "text": (f"sent ({n} message(s))" if n else f"logged to {DIR}/outbox.log") + mention_warning(missed) + asked}
         if verb == "react":
             ts, emoji = str(first.get("ts") or ""), str(first.get("emoji") or "eyes")
-            react(self.cfg, chat, ts, emoji, thread=first.get("thread_ts") or None)
+            took = react(self.cfg, chat, ts, emoji, thread=first.get("thread_ts") or None)
             if ts and emoji.strip(":") not in ("eyes", "👀"):
                 react(self.cfg, chat, ts, "eyes", remove=True)
+                if took:                                 # a reaction Slack refused answers nothing
+                    answered(chat, ts, first.get("thread_ts"), target, "react")
             return {"ok": True, "text": "ok"}
         if verb == "file":
             path = os.path.realpath(str(first.get("path") or ""))
@@ -4981,6 +5027,7 @@ class Daemon:
                 react(self.cfg, chat, str(first["ts"]), "eyes", remove=True)
             if not fid:
                 return {"ok": True, "text": f"NOT sent to Slack — logged to {DIR}/outbox.log; nothing reached anyone"}
+            answered(chat, first.get("ts"), first.get("thread_ts"), target, "file")
             return {"ok": True, "text": f"sent {os.path.basename(path)}" + (" in the thread" if first.get("thread_ts") else "")}
         if verb in ("history", "thread"):
             tok = self.cfg.get("SLACK_BOT_TOKEN")
@@ -5258,6 +5305,9 @@ class Daemon:
                 for t, payload, _a in backlog:
                     if time.time() - t < QUEUE_TTL:
                         conn.send(payload)
+                        m = payload.get("meta") or {}
+                        receipt("delivery", m.get("chat_id"), m.get("ts"), m.get("thread_ts"),
+                                session=seat_name(target, alias), result="delivered", late=True)
                 for line in f:                          # channel server → daemon (permission requests, logs)
                     try:
                         msg = json.loads(line)
@@ -5495,6 +5545,14 @@ class Daemon:
         return p
 
     def deliver(self, target, payload, autostart=True, alias=None):
+        """Hands a payload to the target's session (_deliver says how) and leaves a `delivery` receipt for a message."""
+        res = self._deliver(target, payload, autostart, alias)
+        if payload.get("type") == "message":
+            m = payload.get("meta") or {}
+            receipt("delivery", m.get("chat_id"), m.get("ts"), m.get("thread_ts"), session=seat_name(target, alias), result=res)
+        return res
+
+    def _deliver(self, target, payload, autostart=True, alias=None):
         # Parked project's message goes to the durable queue (save_queues), exempt from TTL sweep.
         # `!resume` is a command, never delivered, so it still works. A permission answer still delivers (a modal can't wait).
         if paused(target) and payload.get("type") != "permission":
@@ -6287,6 +6345,8 @@ class Daemon:
         plumbing never reaches a mail sender."""
         self.last_chat[target] = (chat, thread or ts)      # the root of the thread it last heard from (permission_chat, Home)
         save_last(self.last_chat)
+        receipt("received", chat, ts, thread, role=meta.get("role"), user=meta.get("user"), channel=meta.get("channel"),
+                session=seat_name(target, alias))
         res = self.deliver(target, {"type": "message", "content": text, "meta": meta}, alias=alias)
         react(self.cfg, chat, ts, "eyes")
         if res == "delivered":
@@ -6355,6 +6415,9 @@ class Daemon:
         named = f"[{repo}] " if home != repo else ""
         if chat:
             self.last_chat[home] = (chat, meta.get("thread_ts") or ts); save_last(self.last_chat)
+        # the route's own word that it handed the message on, and to whom: cc-receipts accepts `home` taking it only
+        # because this says so (a parent's seat for a channel-less child is not a guess it could make from the name)
+        receipt("delivery", chat, ts, meta.get("thread_ts"), session=target, result="fallback", to=home, why=res)
         r2 = self.deliver(home, {"type": "message", "meta": dict(meta, target=home),
                                  "content": f"{named}[asked in {chan} {where}] {payload.get('content') or ''}"})
         log(f"{res} {target}: handed to {home} ({r2})")
@@ -8448,14 +8511,17 @@ class Daemon:
         if payload.get("type") != "message" or not chat or chat == "local":
             return
         when = time.strftime("%H:%M", time.localtime(float(meta.get("ts") or time.time())))
+        told = False
         try:
             self.say(chat, f"⚠️ `{target}` {why} — your {when} message was dropped, resend", meta.get("thread_ts"))
+            told = True
         except Exception as e:
             log(f"expiry notice for {target} failed: {e!r}")
+        receipt("expired", chat, meta.get("ts"), meta.get("thread_ts"), session=seat_name(target), told=told)
 
     def _safe(self, fn, *a):
         try:
-            fn(*a)
+            return fn(*a)
         except Exception as e:
             log(f"handler error: {e!r}")
 
@@ -8938,6 +9004,8 @@ class Channel:
                 missed = unresolved_mentions(self.cfg, a.get("text", ""), chat if chat != "local" else None, decision=dec)
                 n, pts = post(self.cfg, chat, a.get("text", ""), a.get("thread_ts") or None, username=display_name(self.target, self.alias),
                               ts=a.get("ts") or None, decision=dec)
+                if n:
+                    answered(chat, a.get("ts"), a.get("thread_ts"), seat_name(self.target, self.alias), "reply", pid=os.getpid())
                 routed, named = "", bool(alias_mentions(a.get("text", "")))
                 wake = self.wants_wake(chat, a)
                 if pts and chat != "local" and (named or a.get("thread_ts") or wake):
@@ -8973,6 +9041,8 @@ class Channel:
                     return f"not sent — {e}", True
                 if a.get("ts"):
                     react(self.cfg, chat, a["ts"], "eyes", remove=True)   # the file is the answer: 👀 comes off
+                if fid:
+                    answered(chat, a.get("ts"), a.get("thread_ts"), seat_name(self.target, self.alias), "file", pid=os.getpid())
                 if not fid:
                     return (f"NOT sent to Slack — logged to {DIR}/outbox.log (no SLACK_BOT_TOKEN); "
                             "nothing reached anyone, so do not say the file arrived"), False
@@ -8982,9 +9052,11 @@ class Channel:
                         + mention_warning(missed) + woke), False
             if name == "react":
                 chat, ts, emoji = a.get("chat_id", ""), a.get("ts", ""), str(a.get("emoji", "eyes"))
-                react(self.cfg, chat, ts, emoji, thread=a.get("thread_ts") or None)
+                took = react(self.cfg, chat, ts, emoji, thread=a.get("thread_ts") or None)
                 if ts and emoji.strip(":") not in ("eyes", "👀"):
                     react(self.cfg, chat, ts, "eyes", remove=True)   # this reaction is our answer: 👀 comes off
+                    if took:                                         # …but only one Slack took is an answer
+                        answered(chat, ts, a.get("thread_ts"), seat_name(self.target, self.alias), "react", pid=os.getpid())
                 return "ok", False
             if name == "history":
                 tok = self.cfg.get("SLACK_BOT_TOKEN")
@@ -9241,12 +9313,16 @@ def post_flag(tok):
     """Is this argv token a flag? A dash and a word with no space in it — so "- first point" and "-3" are text."""
     return bool(re.match(r"^--?[A-Za-z][\w-]*$", tok))
 
+SENDER = {}   # the daemon's `sender` answer this process last had: cmd_post reads the calling seat from it, no second ask
+
 def sender_name(chat=None):
-    """(display name, own) for the post about to go: the session the daemon says is calling, and whether `chat` is that session's own channel. Always asked of the daemon, never worked out locally. No daemon or no session behind the caller: (None, True), the app's plain name and no mention. CC_SLACK_PLAIN_NAME=1 drops the name only, not who the post is addressed to."""
+    """(display name, own) for the post about to go: the session the daemon says is calling, and whether `chat` is that session's own channel. Always asked of the daemon, never worked out locally. No daemon or no session behind the caller: (None, True), the app's plain name and no mention. CC_SLACK_PLAIN_NAME=1 drops the name only, not who the post is addressed to. The seat it names is kept in SENDER."""
+    SENDER.clear()
     try:
         r = sock_request({"sender": chat or ""}, timeout=5)
     except Exception:
         return None, True
+    SENDER["seat"] = r.get("seat") or None
     name = None if os.environ.get("CC_SLACK_PLAIN_NAME") == "1" else (r.get("name") or None)
     return name, bool(r.get("own", True))
 
@@ -9364,7 +9440,9 @@ def cmd_post(argv):
     elif re.match(r"^[a-z0-9][a-z0-9_-]*$", chan):     # a bare `-c lessons` (Slack names are lower case, ids never are): its id, so the wake and the woken seat's reply name the channel as Slack does
         chan = resolve_channel(cfg, chan) or chan
     # --mention is rung 1, "you, now": post() opens it with 🔒 and the raw <@U…> form; without --mention a typed @handle of his is code. Every post signs with the calling session's name; a `-c '#name'` post into ANOTHER session's channel also opens with a mention of that channel, so it reads as addressed, not anonymous.
+    SENDER.clear()                                   # a stale seat from an earlier ask in this process names nobody
     uname, own = sender_name(chan)
+    seat = SENDER.get("seat")                        # the daemon's word for who is calling, for the answered receipt below
     if rtrack and not uname and os.environ.get("CC_SLACK_PLAIN_NAME") != "1":   # a headless loop has no seat: its line into the track's thread is signed with the track (posts name their sender)
         uname = display_name(rtrack)
     # a post one agent makes for another (owner, 2026-10-01) opens with 🤖 (agent_head) and never goes top level in
@@ -9411,6 +9489,10 @@ def cmd_post(argv):
         except Exception as e:
             print(f"cc-slack post: not sent ({e.__class__.__name__}: {str(e)[:160]})", file=sys.stderr); return 1
     print(posted_ts or "")
+    if posted_ts and named and (ts or thread):
+        # a session answering in a thread from the shell (`-c`, never --route machinery) is an answer like its reply
+        # tool's: where it really went (chan and thread after every redirect above) and the seat the daemon sees
+        answered(chan, ts, thread, seat, "post", pid=os.getpid())
     if missed:                                       # stderr, so a caller piping the ts is unaffected and a human still sees it
         print("cc-slack:" + mention_warning(missed).strip(), file=sys.stderr)
     if posted_ts and (named or alias_mentions(text) or thread):

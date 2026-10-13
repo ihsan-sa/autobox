@@ -12,7 +12,11 @@ CC_MEMORY_ROOT), with its history, lock and guards: this script imports cc-memor
 ONE PASS PER DIR:
   claims   one tool-less model call reads the notes and returns the checkable claims in them, each a clause quoted
            verbatim from one note, a probe kind, its argument and what the note says the probe will find:
-             model       available | out        `cc-model out <model>` (exit 0: out)
+             model       available | out        `cc-model out <model>` (exit 0: out); when that has nothing on record
+                                         (exit 1, which is also its answer for a model it does not know), one
+                                         one-token `claude -p` turn on the model, read by `cc-model classify`: ok is
+                                         available, refusal is out, a limit or an error settles nothing. One turn a
+                                         model a night. Credentials or account access to a model are model claims.
              config_key  set | unset            `cc-config get KEY`, its value read for emptiness and never kept
              unit        active | inactive | enabled | disabled    `systemctl --user is-active|is-enabled`; only
                                          enabled, enabled-runtime and disabled settle is-enabled (linked, static … do not)
@@ -23,7 +27,11 @@ ONE PASS PER DIR:
                                          is missing, and EACCES or any other error settles nothing
              command     exists | missing       PATH lookup
              none        a question             `cc-lib ask --need current "<question>"`, its answer judged in the
-                                         fix call: a clause the records say changed is rewritten or retired
+                                         fix call: a clause the records say changed is rewritten or retired. A
+                                         question or clause that names a model (fable, opus, sonnet, haiku,
+                                         claude-…) also gets the model probe above, and its live answer goes to the
+                                         fix call with the records' (a dry run filed "Fable falls back to Opus when
+                                         it returns null" as a records question, and nothing checked the model)
            A claim whose clause is not in its note word for word, does not name what it probes (a path's basename, a
            command, a unit, a PR number, a sha), or whose kind, argument or answer is not one of these, is refused. The script runs every probe itself, argv only, no shell; a probe that errors settles
            nothing.
@@ -50,7 +58,8 @@ one commit "dream <day>: verify …" of only the files it wrote, so `cc-memory-d
 Merging duplicates stays with cc-memory-dream's tidy call; this pass only checks facts.
 
 SPEND. cc-tier `stop` runs nothing, `essential` the largest dir only. MEMORY_VERIFY_MODEL (default sonnet) for both
-calls, the night stopping at MEMORY_VERIFY_BUDGET dollars (default 2). At most MAX_CLAIMS claims a dir and MAX_ASKS
+calls, the night stopping at MEMORY_VERIFY_BUDGET dollars (default 2), the model probe's turns (about $0.08 each)
+counted in it. At most MAX_CLAIMS claims a dir and MAX_ASKS
 cc-lib asks a night.
 
 REPORT. The night's detail in ~/.cc/state/memory-verify/<day>/<slug>.md, one line appended to
@@ -61,8 +70,8 @@ rewrote, by note name. --dry-run writes nothing, posts nothing, and prints what 
   cc-memory-verify run [--dir D] [--dry-run]  the night's pass (cc-memory-verify.timer runs it)
   cc-memory-verify selfcheck                  fixture dirs, a fake claude and stubbed probes, never a real memory dir
 Test hooks: CC_MEMORY_VERIFY_PROBES (a JSON file {"kind:arg": result}; set, it answers every probe and nothing is run)
-and CC_MEMORY_VERIFY_TOOLS (a dir searched for cc-slack and cc-lib before this one); CC_MEMORY_VERIFY_SANDBOXED=0|1 overrides
-the sandbox test.
+and CC_MEMORY_VERIFY_TOOLS (a dir searched for cc-slack, cc-lib and cc-model before this one); CC_CLAUDE is the claude
+the model probe's turn runs, as for the model calls; CC_MEMORY_VERIFY_SANDBOXED=0|1 overrides the sandbox test.
 """
 import datetime
 import importlib.machinery
@@ -133,24 +142,62 @@ def sandboxed():
 
 
 FETCHED = {}        # repo checkout -> whether this night's fetch of origin/main worked
+MODELS = {}         # model -> this night's answer, so each model costs one turn a night across every dir
+MODEL_WORD = re.compile(r"\b(claude-[a-z]+-\d[a-z0-9.\-]*|fable|opus|sonnet|haiku)\b", re.I)
+
+
+def model_probe(m, models=None):
+    """available | out | None for model m, live. `cc-model out` exit 0 is a refusal or limit on record: out. Exit 1 only
+    says nothing is on record (a model cc-model does not know gets it too), so one one-token turn asks the model itself."""
+    p = sh([tool("cc-model"), "out", m])
+    if p is None or p.returncode not in (0, 1):
+        return None
+    if p.returncode == 0:
+        return "out"
+    # the turn counts against the night's budget: a first turn on a model costs ~$0.15 in cache writes, so 0.10 refused it
+    cap = min(0.50, models.budget - models.cost) if models else 0.50
+    if cap < 0.05:
+        return None
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDECODE", "CLAUDE_CODE_"))}
+    claude = os.environ.get("CC_CLAUDE") or dream.home(".local", "bin", "claude")
+    with tempfile.TemporaryDirectory(prefix="cc-memory-verify.") as tmp:
+        o, e = os.path.join(tmp, "o.json"), os.path.join(tmp, "o.err")
+        try:
+            with open(o, "w") as fo, open(e, "w") as fe:
+                subprocess.run([claude, "-p", "reply ok", "--model", m, "--tools", "", "--strict-mcp-config",
+                                "--setting-sources", "", "--disable-slash-commands", "--max-turns", "1",
+                                "--no-session-persistence", "--max-budget-usd", f"{cap:.2f}", "--output-format", "json"],
+                               stdout=fo, stderr=fe, stdin=subprocess.DEVNULL, timeout=90, cwd=tmp, env=env)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if models:
+            try:
+                with open(o) as f:
+                    models.cost += float(json.load(f).get("total_cost_usd") or 0)
+            except (OSError, ValueError, AttributeError):
+                pass
+        c = sh([tool("cc-model"), "classify", o, e, m])
+    # a limit is the account waiting, not the model gone; an error is the run failing: neither settles it
+    return {"ok": "available", "refusal": "out"}.get(c.stdout.split("\t")[0].strip()) if c and not c.returncode else None
 ABSENT = {"missing", "unset", "inactive", "disabled", "out"}
 
 
-def probe(kind, arg, says, repo):
+def probe(kind, arg, says, repo, models=None):
     """What the box shows for a claim, in the claim's own words (one of SAYS[kind]), or None when it cannot tell.
     Inside a sandbox an answer that something is absent is None: the sandbox may only hide it."""
-    got = _probe(kind, arg, says, repo)
+    got = _probe(kind, arg, says, repo, models)
     return None if got in ABSENT and sandboxed() else got
 
 
-def _probe(kind, arg, says, repo):
+def _probe(kind, arg, says, repo, models=None):
     stub = os.environ.get("CC_MEMORY_VERIFY_PROBES")
     if stub:
         with open(stub) as f:
             return json.load(f).get(f"{kind}:{arg}")
     if kind == "model":
-        p = sh([tool("cc-model"), "out", arg])
-        return None if p is None or p.returncode not in (0, 1) else ("out" if p.returncode == 0 else "available")
+        if arg not in MODELS:
+            MODELS[arg] = model_probe(arg, models)
+        return MODELS[arg]
     if kind == "config_key":
         p = sh([tool("cc-config"), "get", arg, ""])
         return None if p is None or p.returncode else ("set" if p.stdout.strip() else "unset")   # the value is dropped here
@@ -227,7 +274,8 @@ Return ONE JSON object and nothing else:
 
 clause: the shortest span of the note's text that states the fact, copied character for character (no line break).
 kind and says, and what arg is:
-  model       says available | out          arg a model name as the note uses it (fable, opus, claude-fable-5-1)
+  model       says available | out          arg a model name as the note uses it (fable, opus, claude-fable-5-1);
+              credentials, a login or account access to a model are model claims too ("the Fable creds are gone": out)
   config_key  says set | unset              arg the KEY name, never a value
   unit        says active | inactive | enabled | disabled   arg the unit file name (x.service, x.timer)
   pr          says merged | open | closed   arg "#123", or "repo#123" for another repo
@@ -244,7 +292,8 @@ FIX = """Some facts in a project's memory notes are contradicted by a live check
 the clause so the note says what is true now, or retire the note when the stale fact was its whole point.
 Other facts could not be probed, so the project's records were asked about them. Treat those the same way ONLY when
 the records plainly say the fact changed after the note was written; when they agree, say nothing, or are unclear,
-leave the clause alone.
+leave the clause alone. Where a live model probe is given as well, it is the box today and outranks the records: act
+on it when it plainly disagrees with what the clause says about that model.
 
 Return ONE JSON object and nothing else:
 {{"rewrite": [{{"file": "x.md", "clause": "the clause exactly as given", "new": "replacement text", "why": "..."}}],
@@ -355,17 +404,26 @@ def verify_dir(d, models, day, dry=False):
             if models.asks < MAX_ASKS:
                 models.asks += 1
                 rec["records"] = ask_records(x["arg"])
-            if rec.get("records", ASK_FAILED) == ASK_FAILED:
+            said = []
+            m = MODEL_WORD.search(x["arg"] + " " + x["clause"])
+            if m:       # a model named in a records question is probed live too: the records lag the box
+                rec["model"] = m.group(1).lower()
+                rec["found"] = probe("model", rec["model"], "", repo, models)
+                if rec["found"]:
+                    said.append(f"the live model probe on {day} says {rec['model']} is {rec['found']}")
+            if rec.get("records", ASK_FAILED) != ASK_FAILED:
+                said.append(f"the records say: {rec['records']}")
+            if not said:
                 c["unsettled"] += 1
-                log.append(f"- unsettled {x['file']}: {x['clause'][:120]!r} (no probe, and the records were not asked: {x['arg'][:100]!r})")
+                log.append(f"- unsettled {x['file']}: {x['clause'][:120]!r} (no probe settled it, and the records were not asked: {x['arg'][:100]!r})")
             else:
                 c["checked"] += 1
-                asked.append((x, rec["records"]))     # judged by the fix call; listed below if it leaves it alone
+                asked.append((x, "; ".join(said)))     # judged by the fix call; listed below if it leaves it alone
             recs.append(rec)
             continue
         key = (x["kind"], x["arg"], x["says"] if x["kind"] == "unit" else "")
         if key not in seen:
-            seen[key] = probe(x["kind"], x["arg"], x["says"], repo)
+            seen[key] = probe(x["kind"], x["arg"], x["says"], repo, models)
         rec["found"] = got = seen[key]
         c["checked"] += 1
         if got is None:
@@ -385,8 +443,8 @@ def verify_dir(d, models, day, dry=False):
             f"- {x['file']} (type: {notes[x['file']]['type'] or 'none'}): {x['clause']!r} says {x['kind']} {x['arg']} is "
             f"{x['says']}; checked {day}, it is {seen[(x['kind'], x['arg'], x['says'] if x['kind'] == 'unit' else '')]}"
             for x in bad) or "(none)", records="\n".join(
-            f"- {x['file']} (type: {notes[x['file']]['type'] or 'none'}): {x['clause']!r}; asked {x['arg']!r}; the "
-            f"records say: {ans}" for x, ans in asked) or "(none)",
+            f"- {x['file']} (type: {notes[x['file']]['type'] or 'none'}): {x['clause']!r}; asked {x['arg']!r}; {ans}"
+            for x, ans in asked) or "(none)",
             notes="\n".join(f"### {f}\n{notes[f]['body']}" for f in files)))
 
     def live(f):
@@ -471,7 +529,7 @@ def verify_dir(d, models, day, dry=False):
             for x, _ in asked:
                 if (x["file"], x["clause"]) not in handled:
                     c["unsettled"] += 1
-                    log.append(f"- unsettled {x['file']}: {x['clause'][:120]!r} (no probe; the records did not settle "
+                    log.append(f"- unsettled {x['file']}: {x['clause'][:120]!r} (neither the records nor a live probe settled "
                                f"{x['arg'][:100]!r})")
         finally:
             if not dry and (gone or touched):
@@ -760,6 +818,52 @@ def selfcheck():
                and "REFUSED retire fable-gone.md: new-link.md links to it" in detail,
                f"a link written during the pass stops the retirement ({detail[-300:]})")
             ok("Fable creds are set" in rd(os.path.join(d, "model-rule.md")), "the rest of that night still lands")
+
+        # 5b. the model probe, unstubbed: a stale "Fable creds gone" note is rewritten after one live turn says Fable
+        # answers; a model cc-model has on record as out is kept and costs no turn; a refused turn reads as out; and a
+        # records question that names a model gets the live answer too, from the same night's one turn on it
+        with tempfile.TemporaryDirectory() as tmp:
+            d = setup(tmp)
+            os.environ.pop("CC_MEMORY_VERIFY_PROBES", None)
+            for f, body in (("creds.md", "The Fable creds are gone since 09-14."), ("sonnet-out.md", "Sonnet is out on this account."),
+                            ("haiku-ok.md", "Haiku runs here."), ("fallback.md", "Fable falls back to Opus when it returns null.")):
+                with open(os.path.join(d, f), "w") as fh:
+                    fh.write(note("project", body))
+            plans = ({"claims": [
+                {"file": "creds.md", "clause": "The Fable creds are gone since 09-14", "kind": "model", "arg": "fable", "says": "out"},
+                {"file": "sonnet-out.md", "clause": "Sonnet is out on this account", "kind": "model", "arg": "sonnet", "says": "out"},
+                {"file": "haiku-ok.md", "clause": "Haiku runs here", "kind": "model", "arg": "haiku", "says": "available"},
+                {"file": "fallback.md", "clause": "Fable falls back to Opus when it returns null", "kind": "none",
+                 "arg": "Is Fable still usable?", "says": ""}]},
+                {"rewrite": [{"file": "creds.md", "clause": "The Fable creds are gone since 09-14",
+                              "new": "The Fable creds work (checked 2026-10-13)", "why": "a live turn answered"}], "retire": []})
+            for n, pl in enumerate(plans, 1):
+                with open(os.path.join(tmp, "fake", f"r{n}"), "w") as fh:
+                    fh.write(json.dumps({"result": json.dumps(pl), "total_cost_usd": 0.01}))
+            with open(os.path.join(tmp, "claude"), "w") as fh:
+                fh.write("#!/bin/sh\ncase \"$*\" in *'reply ok'*)\n"
+                         f"  m=$(echo \"$*\" | sed 's/.*--model \\([^ ]*\\).*/\\1/'); echo \"$m\" >> '{tmp}/turns'\n"
+                         "  case \"$m\" in haiku) echo '{\"is_error\": true, \"result\": \"requires usage credits\"}';;\n"
+                         "  *) echo '{\"result\": \"ok\"}';; esac; exit 0;; esac\n"
+                         f"cd '{tmp}/fake'\nn=$(( $(cat n 2>/dev/null || echo 0) + 1 )); echo $n > n\n"
+                         "cat > prompt$n\n[ $n -gt 2 ] && n=2\nexec cat r$n\n")
+            with open(os.path.join(tmp, "tools", "cc-model"), "w") as fh:
+                fh.write("#!/bin/sh\ncase \"$1\" in\n  out) [ \"$2\" = sonnet ] && { echo 'sonnet is not available'; exit 0; }; exit 1;;\n"
+                         "  classify) grep -q '\"result\": \"ok\"' \"$2\" && printf 'ok\\t\\n' || printf 'refusal\\tneeds usage credits\\n';;\n"
+                         "esac\n")
+            os.chmod(os.path.join(tmp, "tools", "cc-model"), 0o755)
+            p = run()
+            day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+            detail = rd(os.path.join(tmp, "vstate", day, "-home-u-dev-demo.md"))
+            ok(p.returncode == 0 and "The Fable creds work (checked 2026-10-13)" in rd(os.path.join(d, "creds.md"))
+               and "gone since" not in rd(os.path.join(d, "creds.md")),
+               f"a stale 'Fable creds gone' note is rewritten after a live turn ({p.stderr.strip()[-200:]})")
+            ok("Sonnet is out" in rd(os.path.join(d, "sonnet-out.md")) and "sonnet-out.md" not in detail
+               and sorted(rd(os.path.join(tmp, "turns")).split()) == ["fable", "haiku"],
+               f"cc-model's out record is kept and costs no turn; one turn a model ({detail[-300:]})")
+            ok("contradicted haiku-ok.md" in detail and "the box shows out" in detail, "a refused turn reads as out")
+            ok(f"the live model probe on {day} says fable is available" in rd(os.path.join(tmp, "fake", "prompt2")),
+               "a records question naming a model carries the live probe to the fix call")
 
         # 6. the probes themselves, unstubbed: a stale origin/main, a fetch that fails, EACCES, and is-enabled
         with tempfile.TemporaryDirectory() as tmp:

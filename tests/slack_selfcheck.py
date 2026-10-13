@@ -5,9 +5,10 @@
 # as they were when this body lived in the tool. Two consequences: no module docstring here (it would replace the
 # tool's __doc__, which prints as usage), and no top-level name but run_selfcheck (anything else lands in the tool).
 def run_selfcheck():
-    global DIR, SOCK
+    global DIR, SOCK, RECEIPTS
     import tempfile
     DIR = tempfile.mkdtemp(prefix="cc-slack-selfcheck-")     # every state file a case touches (marks, flags, queue, last…) lands here, never in the live dir
+    RECEIPTS = f"{DIR}/receipts"                             # …the hop receipts too: a routed test message must not land in the box's ledger
     SOCK = f"{DIR}/sock"                                     # …and the daemon's door with it: SOCK was fixed at import from the box's DIR, so a
                                                              # stubbed `-c '#name'` post woke the LIVE daemon and printed its 'handed to …' — red from
                                                              # a box shell, green in a sandbox where no daemon answers (raised-a-slack-gate-is-green-
@@ -2968,11 +2969,22 @@ def run_selfcheck():
     evH = {"type": "message", "content": "hi", "meta": {"chat_id": "C-par", "thread_ts": "8.1", "ts": "8.5"}}
     try:
         globals()["resolve_channel"] = lambda cfg, name: chansK.get(name)
+        shutil.rmtree(RECEIPTS, ignore_errors=True)
         with contextlib.redirect_stderr(io.StringIO()):
             rH = [dmH.hand_to_repo("kid/t1", evH, "no-session"), dmH.hand_to_repo("own/t1", evH, "no-session")]
             dmH.subs["kid"] = ["live-conn"]; rH.append(dmH.hand_to_repo("kid/t1", evH, "no-session"))
+        rcpH = [json.loads(ln) for f in sorted(os.listdir(RECEIPTS)) for ln in open(f"{RECEIPTS}/{f}")] if os.path.isdir(RECEIPTS) else []
     finally:
         globals()["resolve_channel"] = real_rc
+    # …and each hand-on is on record at its source (review of #1001): the route's own `fallback` delivery receipt names
+    # the seat it went to, the parent's for a channel-less child, so cc-receipts accepts that seat taking it by the
+    # record instead of calling it a wrong window
+    check("hand_to_repo: each hand-on leaves the route's `fallback` receipt naming the seat it went to and why — the "
+          "PARENT's seat for a channel-less child's finished track",
+          [(r["chat"], r["ts"], r["session"], r.get("to"), r.get("why")) for r in rcpH
+           if r["stage"] == "delivery" and r.get("result") == "fallback"]
+          == [("C-par", "8.5", "kid/t1", "par", "no-session"), ("C-par", "8.5", "own/t1", "own", "no-session"),
+              ("C-par", "8.5", "kid/t1", "kid", "no-session")])
     check("a reply in a finished channel-less child's thread in the parent's channel reaches the PARENT's seat as "
           "`[kid] [asked in …] …`; an own-channel child and a child whose own seat is live keep their own",
           rH == ["delivered"] * 3 and [(t, m) for t, _, m in gotH] == [("par", "par"), ("own", "own"), ("kid", "kid")]
@@ -7397,6 +7409,123 @@ def run_selfcheck():
         check("hand_off: 'starting' and 'spooled' post nothing (the 👀 and then the answer are the whole story); "
               "'paused' still says the repo is paused",
               len(saidT) == 1 and "is paused" in saidT[0])
+        # THE HOP RECEIPTS (cc-receipts checks them): hand_off writes `received` with the route it picked, and the
+        # class's deliver() a `delivery` saying what happened, both keyed by the message's (chat, ts); a payload
+        # that is not a message (a permission answer) leaves none. Own scratch dir, emptied first.
+        prevD, prevApiR, prevRxR = dmT.deliver, globals()["api"], globals()["react"]
+        try:
+            shutil.rmtree(RECEIPTS, ignore_errors=True)
+            del dmT.deliver                                   # back to the class's deliver, the one that writes
+            dmT._deliver = lambda target, payload, autostart=True, alias=None: "delivered"
+            dmT.hand_off("myrepo", "hi", {"chat_id": "CREPO", "ts": "9.8", "thread_ts": "9.8", "role": "owner",
+                                          "user": "U1"}, "CREPO", None, "9.8")
+            dmT.deliver("myrepo", {"type": "permission", "request_id": "abcde", "behavior": "allow"})
+            rcp = [json.loads(ln) for f in sorted(os.listdir(RECEIPTS)) for ln in open(f"{RECEIPTS}/{f}")]
+            check("receipts: a routed message leaves `received` (role, user, the route's session) then `delivery` "
+                  "(the result), keyed by its chat and ts; a permission answer leaves nothing",
+                  [(r["stage"], r["chat"], r["ts"], r.get("session"), r.get("result"), r.get("role")) for r in rcp]
+                  == [("received", "CREPO", "9.8", "myrepo", None, "owner"), ("delivery", "CREPO", "9.8", "myrepo", "delivered", None)])
+            shutil.rmtree(RECEIPTS, ignore_errors=True)
+            globals()["api"] = lambda method, token, **kw: {"ok": True}   # Slack takes the 👍 (a refused one: below)
+            globals()["react"] = _reactP                                 # the tool's own react(), not this block's stub
+            dmT.ack_post("myrepo", "arch", "CREPO", "9.8")
+            dmT.ack_post("myrepo", None, "CREPO", "")
+            rcp = [json.loads(ln) for f in sorted(os.listdir(RECEIPTS)) for ln in open(f"{RECEIPTS}/{f}")]
+            check("receipts: the 👍 a woken session leaves is an `answered` receipt naming that session (target@alias); "
+                  "one with no ts to answer leaves none",
+                  [(r["stage"], r["ts"], r.get("session"), r.get("how")) for r in rcp] == [("answered", "9.8", "myrepo@arch", "ack")])
+            # A REACTION IS AN ANSWER ONLY WHEN SLACK TOOK IT (review of #1001): react() says whether it did, and the
+            # Channel react tool, the daemon's react verb and its 👍 ack each write `answered` only then.
+            def rxAPI(take):
+                def f(method, token, **kw):
+                    if method.startswith("reactions.") and not take:
+                        raise RuntimeError("invalid_name")
+                    return {"ok": True}
+                return f
+            def answeredRx():
+                if not os.path.isdir(RECEIPTS):
+                    return []
+                return sorted((r["ts"], r.get("session"), r.get("how")) for f in sorted(os.listdir(RECEIPTS))
+                              for r in map(json.loads, open(f"{RECEIPTS}/{f}")) if r["stage"] == "answered")
+            realRx, roleRx, rxRes = globals()["api"], os.environ.pop("CC_ROLE", None), {}
+            chRx = Channel("myrepo"); chRx.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
+            try:
+                for take in (False, True):
+                    shutil.rmtree(RECEIPTS, ignore_errors=True)
+                    globals()["api"] = rxAPI(take)
+                    tookRx = react({"SLACK_BOT_TOKEN": "xoxb-test"}, "CREPO", "9.6", "+1")
+                    chRx.call("react", {"chat_id": "CREPO", "ts": "9.6", "emoji": "+1"})
+                    dmT.member_verb("myrepo", {"react": "CREPO", "ts": "9.7", "emoji": "+1"}, "react")
+                    dmT.ack_post("myrepo", None, "CREPO", "9.8")
+                    rxRes[take] = (tookRx, answeredRx())
+            finally:
+                globals()["api"] = realRx
+                if roleRx is not None:
+                    os.environ["CC_ROLE"] = roleRx
+            check("receipts: a reaction Slack refuses is no answer — react() says False and neither the react tool, the "
+                  "daemon's react verb nor its 👍 ack writes `answered`",
+                  rxRes[False] == (False, []))
+            check("…and the same three Slack takes each write one, naming the session that made it",
+                  rxRes[True] == (True, [("9.6", "myrepo", "react"), ("9.7", "myrepo", "react"), ("9.8", "myrepo", "ack")]))
+            # A THREADED `cc-slack post -c` FROM A SESSION IS AN ANSWER (review of #1001), written where it really went
+            # with the seat the daemon sees behind the caller; a top-level post, or one no session made, is not.
+            realPo = {k: globals()[k] for k in ("api", "load_cfg", "resolve_channel", "sock_request")}
+            try:
+                shutil.rmtree(RECEIPTS, ignore_errors=True)
+                globals()["api"] = lambda method, token, **kw: {"ts": "9.95", "channel": kw.get("channel")}
+                globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+                globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
+                # the real sender_name: the daemon's `sender` answer names the seat, and the receipt takes it from there
+                globals()["sock_request"] = lambda req, timeout=15: ({"ok": True, "name": "mybox · web", "own": True, "seat": "web"}
+                                                                     if "sender" in req else {})
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rcPo = [cmd_post(["-c", "#web", "--thread", "9.9", "the answer"]),
+                            cmd_post(["-c", "#web", "--major", "a top-level line, no thread"])]
+                    globals()["sock_request"] = lambda req, timeout=15: ({"ok": True, "name": None, "own": True, "seat": None}
+                                                                         if "sender" in req else {})
+                    rcPo.append(cmd_post(["-c", "#web", "--thread", "9.9", "from a process no session owns"]))
+                rcpPo = [(r["chat"], r["ts"], r["thread"], r.get("session"), r.get("how")) for f in sorted(os.listdir(RECEIPTS))
+                         for r in map(json.loads, open(f"{RECEIPTS}/{f}")) if r["stage"] == "answered"] if os.path.isdir(RECEIPTS) else []
+            finally:
+                globals().update(realPo)
+            check("receipts: a session's `cc-slack post -c '#web' --thread <ts>` writes `answered` in that thread naming "
+                  "the session; a top-level post and one from no session write none",
+                  rcPo == [0, 0, 0] and rcpPo == [("C-web", "9.9", "9.9", "web", "post")])
+            # A REPLAYED `--id` WRITES NO SECOND RECEIPT (review of #1001 claimed it did): submit() answers the replay
+            # `already` with the first ts, cmd_post returns before answered(), so an old answer can never cover a
+            # newer unanswered owner message in the thread.
+            realRp = {k: globals()[k] for k in ("api", "load_cfg", "resolve_channel", "sock_request", "SENT_DIR")}
+            try:
+                shutil.rmtree(RECEIPTS, ignore_errors=True)
+                globals()["SENT_DIR"] = tempfile.mkdtemp(prefix="_selfcheck_replay_")
+                sentRp = []
+                def apiRp(method, token, **kw):
+                    if method == "chat.postMessage":
+                        sentRp.append(kw)
+                    return {"ts": "9.97", "channel": kw.get("channel")}
+                globals()["api"] = apiRp
+                globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+                globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
+                globals()["sock_request"] = lambda req, timeout=15: ({"ok": True, "name": "mybox · web", "own": True, "seat": "web"}
+                                                                     if "sender" in req else {})
+                argvRp = ["-c", "#web", "--thread", "100.0", "--id", "answer-1", "answer"]
+                outRp = []
+                for _ in range(2):          # the second run is the replay, after the owner's follow-up in the thread (101.0)
+                    bufRp = io.StringIO()
+                    with contextlib.redirect_stdout(bufRp), contextlib.redirect_stderr(io.StringIO()):
+                        outRp.append((cmd_post(list(argvRp)), bufRp.getvalue().strip()))
+                    time.sleep(1.1)
+                ansRp = [r for f in sorted(os.listdir(RECEIPTS)) for r in map(json.loads, open(f"{RECEIPTS}/{f}"))
+                         if r["stage"] == "answered" and r["thread"] == "100.0"] if os.path.isdir(RECEIPTS) else []
+            finally:
+                shutil.rmtree(globals()["SENT_DIR"], ignore_errors=True)
+                globals().update(realRp)
+            check("receipts: replaying `cc-slack post --thread T --id X` posts nothing, prints the first ts and writes no "
+                  "second `answered` receipt for the thread",
+                  outRp == [(0, "9.97"), (0, "9.97")] and len(sentRp) == 1 and len(ansRp) == 1)
+        finally:
+            dmT.__dict__.pop("_deliver", None)
+            dmT.deliver, globals()["api"], globals()["react"] = prevD, prevApiR, prevRxR
         saidT.clear(); delivT.clear()
         dmT.deliver = lambda target, payload, **k: delivT.append((target, payload.get("content"), None)) or "delivered"
         dmT.on_event(dict(evP("CREPO", "status?", "9.4"), thread_ts="9.0"))

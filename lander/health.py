@@ -1,14 +1,21 @@
 """Main's own health: which checks are red on main, found on main itself rather than by a PR whose red judge() re-ran
 on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended in a main-red hold).
 
-    run(repo, check, fallback="")  the tick's call after a tip run, under the tip lock. On a tip not yet checked: each
+    run(repo, check, fallback="")  the tick's call after a tip run, under its own lock (lock(repo)), never the tip
+                                   lock, so a merge's tip run and deploy never wait on it. On a tip not yet checked: each
                                    blocking check (plan.select, less the box checks the tip run itself runs and the
                                    checks nightly.py moved out) that the range since the last checked tip reaches, and
                                    every check the record holds red, run once on the tip by `check(name, sha)`
                                    (tick.make_check). Each result is recorded. A check that turns red sends ONE alert
                                    on the tip run's route, naming the check, the merge, and whether the merge's parent
                                    passes it (code: the merge broke it) or fails it too (machine). -> {name: status}
-                                   of what ran, {} when the tip was already checked.
+                                   of what ran, {} when the tip was already checked. Each result is written as it
+                                   finishes, with "running": tip; a pass killed part-way leaves those on disk, and the
+                                   next pass on the same tip runs only the checks it had not reached.
+    lock(repo)                     the health lock: True when held, False when another pass holds it (never waits)
+    pending(repo)                  a pass is owed though no tip was just looked at: one was killed part-way, or a tick
+                                   found the lock taken and asked for one more (want(repo)), since the running pass
+                                   may be on an older tip.
     red(repo)                      {name: entry} of every check the record holds red on main, whatever tree
     at(repo, tree)                 {name: status} measured on exactly `tree` within the last FRESH seconds: a fresh
                                    record of a PR's base, which run.judge() takes instead of running the check on that
@@ -19,14 +26,17 @@ on its base (architect panel, 10-13: 585 of 1,334 check rounds in 7 days ended i
                                    it green, and while main is still red on it a red there is main's (judge's
                                    blocked-by-main), so it waits for that check alone.
 
-THE RECORD, <land state>/tip/<repo>.health: {"tip": the last tip checked, "checks": {name: {"status", "tree", "tip",
+THE RECORD, <land state>/tip/<repo>.health: {"tip": the last tip checked in full, "running": the tip a
+pass is on ("" between passes), "checks": {name: {"status", "tree", "tip",
 "at", "since", "cause"}}}. since and cause are kept from the run that turned the check red until it is green again.
 An unrunnable result is never recorded, as red or green. Nothing here holds a deploy or reverts a merge: the tip run
 does that, for the box checks.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
+import fcntl
 import os
 import re
 
@@ -43,7 +53,7 @@ def path(repo):
 
 def load(repo):
     rec = C.read_json(path(repo), {}) or {}
-    return {"tip": rec.get("tip") or "", "checks": dict(rec.get("checks") or {})}
+    return {"tip": rec.get("tip") or "", "running": rec.get("running") or "", "checks": dict(rec.get("checks") or {})}
 
 
 def red(repo):
@@ -99,12 +109,45 @@ def git(root, *args):
     return rc, out.strip()
 
 
+@contextlib.contextmanager
+def lock(repo):
+    """Its own lock, not the tip lock: on 10-13 a pass held the tip lock for an hour and #1308's tip run and deploy
+    could not start."""
+    p = C.state("tip", f"{repo}.health.lock")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+def want_path(repo):
+    return C.state("tip", f"{repo}.health-want")
+
+
+def want(repo):
+    if not os.path.exists(want_path(repo)):
+        C.write_json(want_path(repo), {"at": C.now()})
+
+
+def pending(repo):
+    return bool(load(repo)["running"]) or os.path.exists(want_path(repo))
+
+
 def run(repo, check, fallback=""):
     from lander import deploy as D
     from lander import manifest as MF
     from lander import nightly as NG
     from lander import run as RUN
     from lander import tip as TP
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(want_path(repo))   # this pass answers any want made before it read origin's tip
     root, base = D.root_of(repo), D.base_of(repo)
     tip = TP.origin_tip(root, base)
     rec = load(repo)
@@ -119,6 +162,11 @@ def run(repo, check, fallback=""):
     plan = T.Plan(checks=sorted(select(m, files)), klass=T.LEAF)
     names = set(NG.trim(repo, m, plan).checks) | {n for n in rec["checks"] if n in m.checks and
                                                   rec["checks"][n].get("status") == T.FAILED}
+    # brief: "a killed or interrupted run keeps what it already learned and the next run picks up from there"
+    if rec["running"] == tip:
+        names = {n for n in names if (rec["checks"].get(n) or {}).get("tip") != tip}
+    rec["running"] = tip
+    C.write_json(path(repo), rec)
     tree = RUN.tree_of(root, tip)
     rc, subject = git(root, "log", "-1", "--format=%s", tip)
     merge = subject if rc == 0 and subject else tip[:12]
@@ -136,8 +184,9 @@ def run(repo, check, fallback=""):
             e.update(since=tip, cause=cause(check(name, parent).status if parent else T.UNRUNNABLE))
             alert(repo, base, name, tip, merge, e["cause"])
         rec["checks"][name] = e
+        C.write_json(path(repo), rec)   # as it finishes: a killed pass keeps what it learned
         C.log("main-health", repo, "tip", tip=tip[:12], check=name, ok=r.status)
-    rec["tip"] = tip
+    rec["tip"], rec["running"] = tip, ""
     C.write_json(path(repo), rec)
     return done
 

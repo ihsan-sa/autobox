@@ -64,7 +64,24 @@ MSG_LOG="$HOME/.cc/state/msg.log"            # one line per routine event this f
                                              # spool line dropped. A debugging engineer's read, not the owner's —
                                              # the actionable case (say_wedge, below) still reaches the planning seat.
 msg_log(){ mkdir -p "$(dirname "$MSG_LOG")" 2>/dev/null
-           printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" >> "$MSG_LOG" 2>/dev/null || true; }
+           printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" >> "$MSG_LOG" 2>/dev/null || true
+           receipt event "$1" "" "$2"; }
+# THE HOP RECEIPT, the same line cc-slack writes for a Slack message (its receipt()), so cc-receipts can check that a
+# queued message is delivered or fails loudly: `queued` when a new line goes into the spool, `delivery` when the drain
+# types it (result typed, or sat when its Enter never took) or drops it (dropped: empty, or not a message), `event` for
+# every msg_log kind (dialog-told, spool-dropped…). Keyed by chat "msg:<window>" and the spool line's hash, which the
+# drain reads back unchanged. Best-effort, never fails. A suite fixture's window (_cctest*, _selfcheck*) leaves none:
+# a suite run under the real HOME would leave queued lines that read as stuck spools half an hour later.
+receipt(){   # $1 stage  $2 window  $3 spool line ("" for an event)  $4 result or event kind (optional)
+  local d="${CC_RECEIPTS_DIR:-$HOME/.cc/receipts}" key="" line=${3:-} result=${4:-}
+  case "$2" in _cctest*|_selfcheck*) return 0;; esac
+  [ -n "$line" ] && key=$(printf '%s' "$line" | md5sum | cut -c1-12)
+  mkdir -p "$d" 2>/dev/null || return 0
+  jq -cn --arg at "$(date -u +%FT%TZ)" --argjson t "$(date +%s)" --arg stage "$1" --arg chat "msg:$2" --arg ts "$key" \
+         --arg result "$result" --arg from "$(printf '%s' "$line" | jq -r '.from? // empty' 2>/dev/null)" \
+         '{at:$at,t:$t,stage:$stage,via:"cc-msg",chat:$chat,ts:$ts,thread:$ts,session:($chat|ltrimstr("msg:"))}
+          + (if $result != "" then {result:$result} else {} end) + (if $from != "" then {from:$from} else {} end)' \
+    >> "$d/$(date -u +%F).jsonl" 2>/dev/null || true; }
 
 # THE DIALOG GUARD. A modal is waiting for a keypress, so the text — or the Enter after it, or a digit inside it —
 # ANSWERS it, and a tool-permission prompt answered by a script is an unattended approval of exactly what the owner
@@ -350,7 +367,7 @@ spool_add(){  # $1 window  $2 text — under the lock, so a drain never rewrites
     if [ -f "$sp" ] && dup=$(jq -c --arg t "$2" --arg f "$from" --argjson now "$now" --argjson w "$DEDUP_S" \
          'select(.text == $t and .from == $f and (.at | fromdateiso8601) > ($now - $w))' < "$sp" 2>/dev/null | tail -1) \
        && [ -n "$dup" ]; then printf '%s' "$dup"; exit 0; fi                     # the copy already queued
-    printf '%s\n' "$line" >> "$sp"; printf '%s' "$line" ) 9>"$(lock "$1")" )   # 9> is the SUBSHELL's, not the
+    printf '%s\n' "$line" >> "$sp"; receipt queued "$1" "$line"; printf '%s' "$line" ) 9>"$(lock "$1")" )   # 9> is the SUBSHELL's, not the
   [ $? = 0 ] || return 1                                                    # assignment's — flock reads fd 9
   printf '%s' "$out"
 }
@@ -650,7 +667,7 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
       # and its pane is free, so neither report above ever fires. It goes to $MSG_LOG instead (comms review,
       # 2026-09-22 — a spool diagnostic, not a Slack post): a debugging engineer's read.
       if ! text=$(printf '%s' "$line" | jq -er '.text | strings' 2>/dev/null); then
-        spool_pop "$sp"
+        spool_pop "$sp"; receipt delivery "$1" "$line" dropped   # settled, so cc-receipts never reads it as stuck
         msg_log "$1" spool-dropped "not a message (no .text to type), so the drain discarded it rather than stop the queue at it: ${line:0:200}"
         n=$((n + 1)); continue
       fi
@@ -662,7 +679,7 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
       # type. (Reachable: `cc-msg <win> ""` under the timer, and an attachment-only Slack message.)
       case "$text" in
         *[![:space:]]*) ;;
-        *) spool_pop "$sp"
+        *) spool_pop "$sp"; receipt delivery "$1" "$line" dropped
            msg_log "$1" spool-dropped "nothing to type (its text is empty), so the drain discarded it rather than judge a pane it never touched: ${line:0:200}"
            n=$((n + 1)); continue;;
       esac
@@ -672,6 +689,7 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
       type_at "$id" "$text"; sat=$?
       if [ -n "$was" ] && ! moved "$id" "$was"; then hung_seen "$1" "$id"; break; fi
       spool_pop "$sp"
+      receipt delivery "$1" "$line" "$([ "$sat" = 0 ] && echo typed || echo sat)"
       # TYPED, AND STILL IN THE BOX AFTER EVERY ENTER: the text is on the pane, one keypress from sent, so it is not
       # typed again (a second copy behind it is one prompt of two) and not left at the head (the next tick would
       # type exactly that). It is said once, to a person, and the queue behind it waits for them: inbox.sat holds
@@ -1445,6 +1463,22 @@ STUB
   k "$(t test -z "$out")" "a free pane: delivered, and cc-msg stays silent (the contract every caller reads)"
   k "$(t grep -qF 'hello one' "$T/keys")" "a free pane: the text reached the keyboard"
   k "$(nt test -s "$SP")" "a free pane: the spool is emptied and removed, not left as a puddle"
+  # the hop receipts (cc-receipts reads them): a queued line and its typed delivery, one key, in its own scratch dir
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"; msg "receipt one" >/dev/null
+  rq=$(cat "$T"/.cc/receipts/*.jsonl 2>/dev/null)
+  rk=$(printf '%s\n' "$rq" | jq -r 'select(.stage == "queued") | .ts' 2>/dev/null)
+  k "$(t test -n "$rk")" "a message cc-msg takes leaves a queued receipt keyed by its spool line"
+  k "$(t test "$(printf '%s\n' "$rq" | jq -r --arg k "$rk" 'select(.stage == "delivery" and .ts == $k) | .result' 2>/dev/null)" = typed)" \
+    "…and the drain that typed it leaves a delivery receipt, result typed, under the same key"
+  # …and nothing a message was NOT taken for leaves one: a pane with no interactive claude refuses it, a retry inside
+  # the dedup window is the line already queued, and a suite fixture's window is nobody's (review of #1001)
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"; CC_FAKE_PROC=bash "$T/bin/cc-msg" "$W" "refused here" >/dev/null 2>&1
+  k "$(nt test -d "$T/.cc/receipts")" "…and a message refused (no interactive claude) leaves no receipt"
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$PERM"; msg "retry me" >/dev/null; msg "retry me" >/dev/null
+  k "$(t test "$(cat "$T"/.cc/receipts/*.jsonl 2>/dev/null | jq -s '[.[] | select(.stage == "queued")] | length' 2>/dev/null)" = 1)" \
+    "…and a retry inside the dedup window, already queued, leaves no second queued receipt"
+  rm -rf "${T:?}/.cc/receipts"; receipt queued _cctest5/m1 '{"text":"x"}'; receipt event _selfcheck9 "" dialog-told
+  k "$(nt test -d "$T/.cc/receipts")" "…and a suite fixture's window (_cctest*, _selfcheck*) leaves none"
 
   # (1a) A NAME MID-HANDOFF: with an overlap record for the window the text goes to cc-slack, which knows the live
   # side, and nothing is typed; held there reads "queued"; no record, or cc-slack's own typing, is the keyboard
@@ -1617,6 +1651,8 @@ $BUSY"; out=$(msg "hello mid-turn")
   k "$(nt grep -q '^notify' "$T/calls")" "…and the drop is not posted to Slack at all — it is a spool diagnostic (comms review, 2026-09-22)"
   k "$(t test "$(grep -c '	spool-dropped	' "$T/.cc/state/msg.log")" = 1)" "…said once in the log instead"
   k "$(t grep -qF 'not json' "$T/.cc/state/msg.log")" "…naming the line that was dropped"
+  k "$(t test "$(jq -r --arg k "$(printf '%s' 'not json' | md5sum | cut -c1-12)" 'select(.stage == "delivery" and .ts == $k) | .result' "$T"/.cc/receipts/*.jsonl 2>/dev/null)" = dropped)" \
+    "…and leaves a delivery receipt, result dropped, under the line's own key: a dropped line is settled, not stuck"
   reset; scr "$PERM"; msg "after null" >/dev/null
   { printf '{"at":"2026-01-01T00:00:00Z","from":"x"}\n'; cat "$SP"; } > "$SP.new" && mv "$SP.new" "$SP"
   scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
@@ -1651,11 +1687,15 @@ $BUSY"; out=$(msg "hello mid-turn")
   # byte-identical after it — the test's answer for a dead one — and the window would be killed and reopened, and
   # then again every tick as the line sat at the spool head. `cc-msg <win> ""` under the timer (its `$(cat)` reads
   # /dev/null there) and an attachment-only Slack message both arrive here.
-  reset; scr "$FREE"; out=$(CC_MSG_HUNG_WAIT=0 msg "" </dev/null)
+  reset; rm -rf "${T:?}/.cc/receipts"; scr "$FREE"; out=$(CC_MSG_HUNG_WAIT=0 msg "" </dev/null)
   k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "an empty message at a healthy pane: the window is neither killed nor reopened"
   k "$(nt grep -q '^notify' "$T/calls")" "…and nothing goes to Slack for it"
   k "$(t test "$(grep -c 'spool-dropped' "$T/.cc/state/msg.log")" = 1)" "…the line is dropped and logged once, like any other the drain cannot type"
   k "$(nt test -f "$SP")" "…and nothing is left at the spool head to kill it again on the next tick"
+  rq=$(cat "$T"/.cc/receipts/*.jsonl 2>/dev/null); rk=$(printf '%s\n' "$rq" | jq -r 'select(.stage == "queued") | .ts' 2>/dev/null)
+  k "$(t test -n "$rk")" "…its queued receipt was written when it went into the spool"
+  k "$(t test "$(printf '%s\n' "$rq" | jq -r --arg k "$rk" 'select(.stage == "delivery" and .ts == $k) | .result' 2>/dev/null)" = dropped)" \
+    "…and the drop settles it with a delivery receipt, result dropped, so cc-receipts never calls it a stuck spool"
   reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 msg "$(printf ' \n ')" >/dev/null
   k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "…and whitespace only is the same message: flattened it is still nothing typed"
 

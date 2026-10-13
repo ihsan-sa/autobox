@@ -44,9 +44,13 @@
             tip.run, whose checks are the box-class checks the merged range reaches (tip_plan), each run on its
             commit by U2's runner (make_check). Green deploys that sha (deploy.run); red holds the targets, bisects
             and reverts a proven breaker. Then deploy.run again, for a request whose tip is already green (a retry).
-            Then, on a tip the run looked at (green or red), health.run: the blocking checks the merged range reaches
-            and every check main is red on, run on the tip and kept as main's own record (the lane plans by it); a
-            check that turns red is said once on the tip run's route. It holds no deploy and reverts nothing.
+            Then, with the tip lock let go and the repo's jobs settled (below), on a tip the run looked at (green or
+            red) or when a pass is owed (health.pending: one killed part-way, or asked for while another ran),
+            health.run under the repo's health lock (a second tick skips it and asks for one more pass): the blocking
+            checks the merged range reaches and every check main is red on, run on the tip and kept as main's own
+            record (the lane plans by it), each result written as it finishes; a check that turns red is said once
+            on the tip run's route. It holds no deploy, reverts nothing, and never holds the tip lock, so the next
+            merge's tip run and deploy start while it runs.
   nightly   for each repo the tip step runs for, at most once every nightly.NIGHTLY_SECS (a day) and only once
             queue.log goes back nightly.WINDOW_DAYS: `lander nightly run --repo <repo>` as a transient unit, which
             runs the checks nightly.py moved out of the per-PR plan on the applied tip.
@@ -507,37 +511,47 @@ def tip_and_deploy(repo, units) -> list:
     tip, deploy = units.get("tip"), units.get("deploy")
     if not (inspect.ismodule(tip) and inspect.ismodule(deploy)) or "--" in repo or L.paused(repo):
         return []
-    lines = []
+    lines, st, fb = [], "idle", ""
     try:
+        fb = MF.host_fallback(repo)
         with TP.lock(repo) as got:
             if not got:
                 return [f"[{repo}] a tip run is already going"]
             if due_catchup(repo) and tip.catchup(repo):
                 lines.append(f"[{repo}] origin moved past what this box runs: a tip run is wanted")
-            fb = MF.host_fallback(repo)
             st = tip.run(repo, plan=lambda *a: tip_plan(*a, fallback=fb),
                          check=make_check(D.root_of(repo), fallback=fb))
             if st != "idle":
                 lines.append(f"[{repo}] tip run: {st}")
             if st != "red":
                 deploy.run(repo)
-            if st in ("green", "red"):   # a tip was looked at: main's own record of its blocking checks (health.py)
-                # its own fault is logged and skipped, so settle(repo) below still runs (architect read, 10-13)
-                try:
-                    ran = HL.run(repo, make_check(D.root_of(repo), fallback=fb), fallback=fb)
-                except Exception as e:  # noqa: BLE001 — main health is a record, never the deploy's settling
-                    E.log("tick-fault", repo, None, f"main health: {type(e).__name__}: {e}")
-                    lines.append(f"[{repo}] main health failed: {type(e).__name__}: {e}")
-                    ran = {}
-                if ran:
-                    bad = sorted(n for n, said in ran.items() if said == T.FAILED)
-                    lines.append(f"[{repo}] main health: {len(ran)} check(s)"
-                                 + (f", red: {', '.join(bad)}" if bad else ""))
         lines += settle(repo)
     except Exception as e:  # noqa: BLE001 — one repo's fault is said and logged, never the tick's end
         E.log("tick-fault", repo, None, f"{type(e).__name__}: {e}")
         lines.append(f"[{repo}] the tip run or the deploy failed: {type(e).__name__}: {e}")
-    return lines
+    return lines + main_health(repo, st in ("green", "red"), fb)
+
+
+def main_health(repo, looked, fb) -> list:
+    """Main's own record of its blocking checks (health.py), after the tip lock is let go and the jobs are settled.
+    brief: "a merge's tip run and deploy never wait on main health": it holds its own lock, so the next tick's tip
+    run starts while it runs. It runs on a tip the run just looked at (green or red), or when a pass is owed (one
+    killed part-way, or one asked for while another held the lock). Its fault is logged, never the tick's end."""
+    try:
+        if not (looked or HL.pending(repo)):
+            return []
+        with HL.lock(repo) as got:
+            if not got:
+                HL.want(repo)
+                return [f"[{repo}] main health is already running"]
+            ran = HL.run(repo, make_check(D.root_of(repo), fallback=fb), fallback=fb)
+    except Exception as e:  # noqa: BLE001 — main health is a record, never the deploy's settling
+        E.log("tick-fault", repo, None, f"main health: {type(e).__name__}: {e}")
+        return [f"[{repo}] main health failed: {type(e).__name__}: {e}"]
+    if not ran:
+        return []
+    bad = sorted(n for n, said in ran.items() if said == T.FAILED)
+    return [f"[{repo}] main health: {len(ran)} check(s)" + (f", red: {', '.join(bad)}" if bad else "")]
 
 
 def nightly(repo, units) -> list:

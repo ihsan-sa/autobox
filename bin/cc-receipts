@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""cc-receipts — does a message reach the right session, and does that session answer it? Checked over the hop
+receipts cc-slack and cc-msg write, never over a pane: code over records, and a model reads only what came out red.
+
+usage: cc-receipts check [--record] [--as-of UTC] [--json]   the invariants below over the last two days of receipts;
+                                                            one line per red, nothing when green. --record writes each
+                                                            red to the failure ledger once (cc-reconcile's tick does).
+       cc-receipts sample [--days N] [--as-of UTC]          every owner message of the last N days (7), who it was
+                                                            routed to and which session answered it, and how fast
+       cc-receipts selfcheck
+
+THE RECEIPTS are ~/.cc/receipts/<YYYY-MM-DD>.jsonl (CC_RECEIPTS_DIR elsewhere; UTC days), one JSON line per hop,
+keyed by the message's (chat, ts): {at, t, stage, via, chat, ts, thread, session, …}. The writers are cc-slack's
+receipt() and cc-msg's receipt(); the stages they write:
+  received   cc-slack hand_off: a person's message, who said it (role, user) and the session its route picked
+  delivery   cc-slack deliver(): what happened to it (result: delivered, typed, spooled, starting, held, queued, …),
+             once per try, `late` when a session's hello took it from the queue; result `fallback` with `to` when
+             hand_to_repo hands a track's message on to its repo's seat or a channel-less child's parent's (session is
+             the route it fell back from); cc-msg's drain: typed, sat, or dropped (a line it could not type)
+  expired    a queued Slack message aged out, and `told` whether its thread was told
+  answered   a reply, file or reaction in its thread (how), or the 👍 a woken session leaves (ack), stamped with
+             the session that made it — `<target>` or `<target>@<alias>`, the key `cc-slack seat` prints
+  queued     cc-msg spooled a message for a window (chat `msg:<window>`, ts the spool line's hash)
+  event      cc-msg said something about a window's spool (its msg.log kinds: dialog-told, hung-restarted, …)
+
+THE INVARIANTS (pure functions of the receipts and the time; each red names a ledger kind):
+  owner-reply/unanswered       an owner message has no reply, file or reaction in its thread within
+                               CC_RECEIPTS_ANSWER_MIN (15) minutes of arriving
+  owner-reply/wrong-session    its first answer came from a session it was neither routed nor delivered to
+  message-delivery/wrong-window  it was taken by a session other than its route's — except the seat the route's own
+                               `fallback` receipt names (cc-slack's hand_to_repo: the repo's, or a parent's)
+  message-delivery/silent-wait   no session took it within CC_RECEIPTS_QUEUE_MIN (30) minutes and the last thing
+                               that happened to it is a wait cc-slack does not announce (starting, held, no
+                               delivery at all); a wait it announces in the thread (queued, paused, unreached…) or
+                               an expiry it told is loud, so it is not red here
+  message-delivery/spool-stuck   a cc-msg spool line sat untyped past CC_RECEIPTS_QUEUE_MIN minutes and nothing was
+                               said about that window since it was queued (dialog-told, orphan-told, hung-restarted)
+Only messages a person wrote are checked for an answer: role owner, not the box's own wakes (user box or handoff).
+
+THE RECORD (--record): each red is one `cc-failures record --once --link source=receipt:<kind>:<chat>:<ts>`, so a
+red seen on every tick is written once, and the ledger's clusters (scope, kind) do the dedup the investigator reads.
+The scope is the routed session's repo. A check never replies to anyone and never posts.
+"""
+import json, os, subprocess, sys, time, calendar, glob
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+DIR = os.environ.get("CC_RECEIPTS_DIR") or os.path.expanduser("~/.cc/receipts")
+NOT_PEOPLE = ("box", "handoff")                                 # the box's own wakes carry role owner; they ask no answer
+TAKEN = ("delivered", "typed", "spooled", "sat")                # a session has it (spooled: cc-msg's spool, checked there)
+SILENT = ("starting", "held")                                   # waits hand_off says nothing about (it narrates the rest)
+LOUD_EVENTS = ("dialog-told", "orphan-told", "hung-restarted")
+
+
+def setting(key, dflt):
+    v = os.environ.get(key)
+    if v is None:
+        try:
+            r = subprocess.run([f"{BIN}/cc-config", "get", key], capture_output=True, text=True, timeout=10)
+            v = r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            v = ""
+    try:
+        return float(v) if v else dflt
+    except ValueError:
+        return dflt
+
+
+def parse_utc(s):
+    return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def load(as_of, days=2, d=None):
+    """The receipts of the `days` UTC days up to as_of, in file order; a line that is not one is skipped."""
+    d = d or DIR
+    out = []
+    for i in range(days - 1, -1, -1):
+        p = f"{d}/{time.strftime('%Y-%m-%d', time.gmtime(as_of - i * 86400))}.jsonl"
+        try:
+            fh = open(p, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get("stage") and isinstance(r.get("t"), (int, float)) and r["t"] <= as_of:
+                    out.append(r)
+    return out
+
+
+def repo_of(session):
+    return (session or "").partition("@")[0].partition("/")[0]
+
+
+def answers_to(m, recs):
+    """The answers in m's thread at or after it: a reply in its thread, or anything on its own ts."""
+    return sorted((a for a in recs if a["stage"] == "answered" and a.get("chat") == m["chat"] and a["t"] >= m["t"] - 1
+                   and (a.get("ts") == m["ts"] or a.get("thread") == m.get("thread"))), key=lambda a: a["t"])
+
+
+def took(m, recs):
+    """The delivery receipts of message m, oldest first."""
+    return sorted((r for r in recs if r["stage"] == "delivery" and r.get("chat") == m["chat"] and r.get("ts") == m["ts"]),
+                  key=lambda r: r["t"])
+
+
+def allowed(m, dels):
+    """The sessions that may take and answer m: its route, any session a delivery was handed to, and the seat the
+    route itself said it handed m on to (hand_to_repo's `fallback` receipt: the repo's seat, or for a channel-less
+    child its parent's). Read from the record, never guessed from the name."""
+    route = m.get("session") or ""
+    ok = {route} | {d.get("session") for d in dels if d.get("result") in TAKEN}
+    ok |= {d.get("to") for d in dels if d.get("session") == route and d.get("result") == "fallback" and d.get("to")}
+    return ok
+
+
+def red(kind, m, observed, **extra):
+    return dict({"kind": kind, "chat": m["chat"], "ts": m["ts"], "thread": m.get("thread"), "session": m.get("session"),
+                 "t": m["t"], "observed": observed}, **extra)
+
+
+def check_owner_reply(recs, now, answer_min):
+    """owner-reply/unanswered and owner-reply/wrong-session."""
+    # brief: "an owner message gets a reply or reaction in its thread within N min, from the session its channel or
+    # thread routes to" — so no answer inside N is red, and an answer from outside the routed/delivered set is red
+    out = []
+    for m in (r for r in recs if r["stage"] == "received"):
+        if m.get("role") != "owner" or m.get("user") in NOT_PEOPLE or m.get("chat") in ("", "local"):
+            continue
+        if now - m["t"] < answer_min * 60:
+            continue                                     # not due yet: the current minute is a wait, not a red
+        ans = [a for a in answers_to(m, recs) if a["t"] - m["t"] <= answer_min * 60]
+        if not ans:
+            late = answers_to(m, recs)
+            out.append(red("owner-reply/unanswered", m,
+                           f"an owner message routed to {m.get('session')} had no answer in its thread within {answer_min:g} min"
+                           + (f" (answered {(late[0]['t'] - m['t']) / 60:.0f} min after, by {late[0].get('session')})" if late else "")))
+            continue
+        ok = allowed(m, took(m, recs))
+        if ans[0].get("session") not in ok:
+            out.append(red("owner-reply/wrong-session", m,
+                           f"an owner message routed to {m.get('session')} was answered first by {ans[0].get('session')}",
+                           answered_by=ans[0].get("session")))
+    return out
+
+
+def check_delivery(recs, now, queue_min):
+    """message-delivery/wrong-window and message-delivery/silent-wait, for every message a person sent."""
+    # brief: "a queued message is delivered or fails loudly" — so red only when NOT taken AND NOT said: a taken
+    # delivery, a told expiry or a wait hand_off announces in the thread all keep it green
+    out = []
+    for m in (r for r in recs if r["stage"] == "received"):
+        if m.get("user") in NOT_PEOPLE or m.get("chat") in ("", "local"):
+            continue
+        dels = took(m, recs)
+        ok = allowed(m, [d for d in dels if d.get("session") == m.get("session")])
+        stray = [d for d in dels if d.get("result") in TAKEN and d.get("session") not in ok]
+        if stray:
+            out.append(red("message-delivery/wrong-window", m,
+                           f"a message routed to {m.get('session')} was taken by {stray[0].get('session')} ({stray[0].get('result')})",
+                           taken_by=stray[0].get("session")))
+            continue
+        if now - m["t"] < queue_min * 60 or any(d.get("result") in TAKEN for d in dels):
+            continue
+        if any(r["stage"] == "expired" and r.get("chat") == m["chat"] and r.get("ts") == m["ts"] and r.get("told")
+               for r in recs):
+            continue                                     # aged out, and the thread was told: loud
+        last = dels[-1].get("result") if dels else None
+        if last is None or last in SILENT:
+            out.append(red("message-delivery/silent-wait", m,
+                           f"a message routed to {m.get('session')} reached no session in {queue_min:g} min, and nothing was said "
+                           + (f"(last: {last})" if last else "(no delivery was ever tried)")))
+    return out
+
+
+def check_spool(recs, now, queue_min):
+    """message-delivery/spool-stuck: a cc-msg line queued, never typed, and nothing said about its window since."""
+    out = []
+    for q in (r for r in recs if r["stage"] == "queued" and r.get("via") == "cc-msg"):
+        if now - q["t"] < queue_min * 60:
+            continue
+        if any(r["stage"] == "delivery" and r.get("chat") == q["chat"] and r.get("ts") == q["ts"] for r in recs):
+            continue
+        if any(r["stage"] == "event" and r.get("chat") == q["chat"] and r.get("result") in LOUD_EVENTS and r["t"] >= q["t"]
+               for r in recs):
+            continue
+        out.append(red("message-delivery/spool-stuck", q,
+                       f"a message spooled for window {q.get('session')} was not typed in {queue_min:g} min and nothing said why",
+                       sender=q.get("from")))
+    return out
+
+
+def check(recs, now, answer_min=15, queue_min=30):
+    return check_owner_reply(recs, now, answer_min) + check_delivery(recs, now, queue_min) + check_spool(recs, now, queue_min)
+
+
+def record(r):
+    """One ledger line for one red, once (cc-failures --once on its source key). Returns cc-failures' word."""
+    scope = repo_of(r.get("session")) or "box"
+    argv = [f"{BIN}/cc-failures", "record", "--scope", scope, "--kind", r["kind"], "--observed", r["observed"],
+            "--expected", "a person's message reaches the session its route names, and that session answers it in its thread",
+            "--writer", "cc-receipts", "--detector", "box", "--detector-evidence", "the hop receipts in ~/.cc/receipts",
+            "--ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["t"])), "--once",
+            "--link", f"source=receipt:{r['kind']}:{r['chat']}:{r['ts']}", "--evidence", f"receipts {r['chat']} {r['ts']}"]
+    if r.get("thread") and not str(r["chat"]).startswith("msg:"):
+        argv += ["--link", f"thread={r['chat']}/{r['thread']}"]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        return p.stdout.strip() if p.returncode == 0 else f"writer failed rc={p.returncode}: {p.stderr.strip()[:160]}"
+    except Exception as e:
+        return f"writer failed: {e.__class__.__name__}"
+
+
+def sample(recs, now, days):
+    """Each owner message in the window: when, where, routed to, first answer by whom and after how long."""
+    rows = []
+    for m in (r for r in recs if r["stage"] == "received" and r.get("role") == "owner" and r.get("user") not in NOT_PEOPLE
+              and r.get("chat") not in ("", "local") and now - r["t"] <= days * 86400):
+        ans = answers_to(m, recs)
+        a = ans[0] if ans else None
+        rows.append({"at": m.get("at"), "channel": m.get("channel") or m["chat"], "ts": m["ts"], "routed": m.get("session"),
+                     "answered_by": a.get("session") if a else None, "how": a.get("how") if a else None,
+                     "after_min": round((a["t"] - m["t"]) / 60, 1) if a else None})
+    return rows
+
+
+def opt(argv, name, dflt=None):
+    return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else dflt
+
+
+def main(argv):
+    cmd = argv[0] if argv else ""
+    try:
+        as_of = parse_utc(opt(argv, "--as-of")) if opt(argv, "--as-of") else time.time()
+    except ValueError:
+        print(f"cc-receipts: --as-of wants a UTC time like 2026-10-12T09:30:00Z, not {opt(argv, '--as-of')!r}", file=sys.stderr)
+        return 2
+    if cmd == "check":
+        reds = check(load(as_of), as_of, setting("CC_RECEIPTS_ANSWER_MIN", 15), setting("CC_RECEIPTS_QUEUE_MIN", 30))
+        for r in reds:
+            if "--record" in argv:
+                r["recorded"] = record(r)
+            print(json.dumps(r, ensure_ascii=False) if "--json" in argv else
+                  f"receipts  {r['kind']}  {r['chat']} {r['ts']}  {r['observed']}"
+                  + (f"  [{r['recorded']}]" if r.get("recorded") else ""))
+        return 0
+    if cmd == "sample":
+        days = int(opt(argv, "--days", "7"))
+        rows = sample(load(as_of, days + 1), as_of, days)
+        for s in rows:
+            print(f"{s['at']}  {s['channel']} {s['ts']}  routed {s['routed']}  "
+                  + (f"answered by {s['answered_by']} ({s['how']}, {s['after_min']} min)" if s["answered_by"] else "UNANSWERED"))
+        return 0
+    if cmd == "selfcheck":
+        return selfcheck()
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+def selfcheck():
+    import tempfile, shutil
+    fails, passed = [], []
+    T0 = 1_790_000_000.0
+
+    def ok(cond, what):
+        print(("ok    " if cond else "FAIL  ") + what)
+        if cond:
+            passed.append(what)
+        if not cond:
+            fails.append(what)
+
+    def rc(stage, chat="C1", ts="100.1", t=T0, **f):
+        return dict({"stage": stage, "via": "slack", "chat": chat, "ts": ts, "thread": f.pop("thread", ts), "t": t}, **f)
+
+    def got(reds, kind):
+        return [r for r in reds if r["kind"] == kind]
+
+    owner = lambda **f: rc("received", role="owner", user="U1", session=f.pop("session", "web"), **f)
+    later = T0 + 20 * 60
+
+    # each case builds its own receipts; nothing carries over from the one before
+    reds = check([owner(), rc("delivery", session="web", result="delivered"),
+                  rc("answered", t=T0 + 120, session="web", how="reply")], later)
+    ok(reds == [], "an owner message delivered and answered in its thread by its own session is green")
+
+    reds = check([owner(), rc("delivery", session="web", result="delivered")], later)
+    ok(len(got(reds, "owner-reply/unanswered")) == 1, "an owner message with no answer after 15 min is red: unanswered")
+    ok(check([owner(), rc("delivery", session="web", result="delivered")], T0 + 14 * 60) == [],
+       "…and the same message at 14 min is not due yet")
+    ok(check([owner(), rc("delivery", session="web", result="delivered")], T0 + 15 * 60) != [],
+       "…and at exactly 15 min it is due")
+    reds = check([owner(), rc("delivery", session="web", result="delivered"),
+                  rc("answered", t=T0 + 40 * 60, session="web", how="reply")], T0 + 50 * 60)
+    ok(len(got(reds, "owner-reply/unanswered")) == 1 and "answered 40 min after" in reds[0]["observed"],
+       "an answer after the deadline is still red, and says how late")
+    reds = check([owner(thread="90.0"), rc("delivery", session="web", result="delivered", thread="90.0"),
+                  rc("answered", ts="90.0", thread="90.0", t=T0 + 60, session="web", how="reply")], later)
+    ok(reds == [], "a reply anywhere in the message's thread answers it")
+    reds = check([owner(), rc("delivery", session="web", result="delivered"),
+                  rc("answered", t=T0 - 600, session="web", how="reply")], later)
+    ok(len(got(reds, "owner-reply/unanswered")) == 1, "a reply in the thread BEFORE the message does not answer it")
+    reds = check([owner(), rc("delivery", session="web", result="delivered"),
+                  rc("answered", chat="C2", t=T0 + 60, session="web", how="reply")], later)
+    ok(len(got(reds, "owner-reply/unanswered")) == 1, "an answer in another channel does not answer it")
+    ok(check([rc("received", role="member", user="ada", session="web"), rc("delivery", session="web", result="delivered")],
+             later) == [], "a member's message is not checked for an answer")
+    ok(check([rc("received", role="owner", user="box", session="web"), rc("delivery", session="web", result="delivered")],
+             later) == [], "the box's own wake (user box, role owner) is not checked for an answer")
+    ok(check([owner(), rc("delivery", session="web", result="delivered"),
+              rc("answered", t=T0 + 60, session="web", how="react")], later) == [], "a reaction on the message answers it")
+
+    reds = check([owner(), rc("delivery", session="web", result="delivered"),
+                  rc("answered", t=T0 + 60, session="myrepo", how="reply")], later)
+    ok(len(got(reds, "owner-reply/wrong-session")) == 1 and reds[0]["answered_by"] == "myrepo",
+       "an answer from a session the message was neither routed nor delivered to is red: wrong-session")
+    reds = check([owner(session="web/t1"), rc("delivery", session="web/t1", result="no-session"),
+                  rc("delivery", session="web/t1", result="fallback", to="web"),
+                  rc("delivery", session="web", result="delivered"),
+                  rc("answered", t=T0 + 60, session="web", how="reply")], later)
+    ok(reds == [], "a track's message the repo session took after the track handed it on (fallback), and answered, is green")
+    # cc-slack's own receipts for a reply in kid/t1's thread, kid a channel-less child declared under par and kid/t1
+    # with no session: hand_to_repo hands it to the PARENT's seat, and the fallback receipt names that seat
+    reds = check([owner(session="kid/t1"), rc("delivery", session="kid/t1", result="no-session"),
+                  rc("delivery", session="kid/t1", result="fallback", to="par"),
+                  rc("delivery", session="par", result="delivered"),
+                  rc("answered", t=T0 + 60, session="par", how="reply")], later)
+    ok(reds == [], "a channel-less child's track message handed on to its PARENT's seat, and answered there, is green")
+    reds = check([owner(session="kid/t1"), rc("delivery", session="kid/t1", result="no-session"),
+                  rc("delivery", session="par", result="delivered")], later + 60)
+    ok(len(got(reds, "message-delivery/wrong-window")) == 1,
+       "…and the parent taking it with no fallback receipt from the route is still red: wrong-window")
+    reds = check([owner(session="web/t1"), rc("delivery", session="web/t1", result="no-session"),
+                  rc("delivery", session="web", result="delivered")], later)
+    ok(len(got(reds, "message-delivery/wrong-window")) == 1,
+       "a repo session taking a track's message the route never said it handed on is red, whatever the route's result")
+    reds = check([owner(session="web/t1"), rc("delivery", session="web", result="delivered"),
+                  rc("answered", t=T0 + 60, session="web", how="reply")], later)
+    ok(len(got(reds, "message-delivery/wrong-window")) == 1,
+       "a track's message taken by the repo session while the track never failed is red: wrong-window")
+    reds = check([owner(), rc("delivery", session="blog", result="delivered"),
+                  rc("answered", t=T0 + 60, session="blog", how="reply")], later)
+    ok(len(got(reds, "message-delivery/wrong-window")) == 1 and got(reds, "owner-reply/wrong-session") == [],
+       "a message delivered to another window is red once, as wrong-window, and its answer from there is not a second red")
+    reds = check([owner(session="myrepo@arch"), rc("delivery", session="myrepo@arch", result="delivered"),
+                  rc("answered", t=T0 + 60, session="myrepo@arch", how="reply")], later)
+    ok(reds == [], "an orch's own message, answered by that orch (target@alias), is green")
+    reds = check([owner(session="myrepo@arch"), rc("delivery", session="myrepo@arch", result="delivered"),
+                  rc("answered", t=T0 + 60, session="myrepo", how="reply")], later)
+    ok(len(got(reds, "owner-reply/wrong-session")) == 1, "…and the same message answered by the planning seat is red")
+
+    mk = lambda last: [rc("received", role="member", user="ada", session="web")] + \
+        ([rc("delivery", session="web", result=last)] if last else [])
+    ok(len(got(check(mk("starting"), T0 + 31 * 60), "message-delivery/silent-wait")) == 1,
+       "a message left at 'starting' past 30 min, said nowhere, is red: silent-wait")
+    ok(len(got(check(mk(None), T0 + 31 * 60), "message-delivery/silent-wait")) == 1,
+       "a received message no delivery was ever tried for is red: silent-wait")
+    ok(check(mk("starting"), T0 + 29 * 60) == [], "…and at 29 min it is still waiting, not red")
+    ok(check(mk("queued"), T0 + 31 * 60) == [], "a wait the thread was told about (queued) is loud, not red")
+    ok(check(mk("starting") + [rc("delivery", t=T0 + 600, session="web", result="delivered", late=True)], T0 + 31 * 60) == [],
+       "a message the session's hello took from the queue later is green")
+    ok(check(mk("starting") + [rc("expired", t=T0 + 4 * 3600, session="web", told=True)], T0 + 5 * 3600) == [],
+       "a message that aged out and whose thread was told is loud, not red")
+    ok(len(got(check(mk("starting") + [rc("expired", t=T0 + 4 * 3600, session="web", told=False)], T0 + 5 * 3600),
+               "message-delivery/silent-wait")) == 1, "…and one that aged out with nobody told is red")
+
+    q = lambda **f: dict({"stage": "queued", "via": "cc-msg", "chat": "msg:web", "ts": "abc", "thread": "abc",
+                          "session": "web", "t": T0, "from": "slack:C1:100.1"}, **f)
+    ok(len(got(check([q()], T0 + 31 * 60), "message-delivery/spool-stuck")) == 1,
+       "a spool line never typed past 30 min, nothing said, is red: spool-stuck")
+    ok(check([q(), dict(q(), stage="delivery", result="typed", t=T0 + 60)], T0 + 31 * 60) == [],
+       "a spool line the drain typed is green")
+    ok(check([q(), dict(q(), stage="event", ts="", result="dialog-told", t=T0 + 600)], T0 + 31 * 60) == [],
+       "a spool line behind a dialog the box was told about is loud, not red")
+    ok(len(check([q(), dict(q(), stage="event", ts="", result="dialog-untold", t=T0 + 600)], T0 + 31 * 60)) == 1,
+       "…and one behind a dialog nobody could be told about is red")
+    ok(len(check([q(), dict(q(), stage="event", ts="", result="dialog-told", t=T0 - 600)], T0 + 31 * 60)) == 1,
+       "…and a telling from before the line was queued does not cover it")
+    ok(check([q()], T0 + 29 * 60) == [], "a spool line at 29 min is still waiting")
+    ok(check([q(), dict(q(), stage="delivery", result="dropped", t=T0 + 60)], T0 + 31 * 60) == [],
+       "a spool line the drain dropped (empty, or not a message) is settled, not stuck")
+
+    s = sample([owner(), rc("answered", t=T0 + 120, session="web", how="reply"), owner(ts="200.2", t=T0 + 5)], T0 + 3600, 7)
+    ok([(r["routed"], r["answered_by"], r["after_min"]) for r in s] == [("web", "web", 2.0), ("web", None, None)],
+       "sample names the answering session of every owner message, and says when none answered")
+
+    # the files and the ledger: a red is written once however many ticks see it, and nothing outside the scratch dir
+    T = tempfile.mkdtemp(prefix="cc-receipts-selfcheck-")
+    try:
+        day = time.strftime("%Y-%m-%d", time.gmtime(T0))
+        with open(f"{T}/{day}.jsonl", "w") as f:
+            for r in [owner(), rc("delivery", session="web", result="delivered"), "not json"]:
+                f.write((json.dumps(r) if isinstance(r, dict) else r) + "\n")
+        recs = load(later, d=T)
+        ok(len(recs) == 2, "load reads a day's file and skips a line that is not a receipt")
+        ok(load(T0 - 1, d=T) == [], "load leaves out receipts after --as-of")
+        env = dict(os.environ, CC_FAILURES=f"{T}/failures", CC_RECEIPTS_DIR=T, CC_RECEIPTS_ANSWER_MIN="15",
+                   CC_RECEIPTS_QUEUE_MIN="30")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(later))
+        run = lambda: subprocess.run([os.path.realpath(__file__), "check", "--record", "--as-of", at], env=env,
+                                     capture_output=True, text=True, timeout=60)
+        a, b = run(), run()
+        ok(a.returncode == 0 and "owner-reply/unanswered" in a.stdout, "check --record prints the red")
+        led = glob.glob(f"{T}/failures/*.jsonl")
+        n = sum(1 for p in led for ln in open(p) if '"owner-reply/unanswered"' in ln)
+        ok(n == 1, f"two ticks over one unanswered message write one ledger record (got {n})")
+        ok("already" in b.stdout, "…and the second tick says the record is already there")
+        ok([os.path.basename(p) for p in led] == ["web.jsonl"], "the record's scope is the routed session's repo")
+        bad = subprocess.run([os.path.realpath(__file__), "check", "--as-of", "yesterday"], env=env,
+                             capture_output=True, text=True, timeout=60)
+        ok(bad.returncode == 2 and "--as-of wants" in bad.stderr and "Traceback" not in bad.stderr,
+           "a malformed --as-of is a usage line and exit 2, not a traceback")
+    finally:
+        shutil.rmtree(T, ignore_errors=True)
+    print(f"cc-receipts selfcheck: {len(passed)} passed, {len(fails)} failed")   # the shape selftest.sh's chk() reads
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
