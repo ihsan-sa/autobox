@@ -1135,8 +1135,14 @@ fi
 # still past the line an hour later. The stamp is one empty file per session, pruned when the next one is written.
 # And never while the harness says a Stop hook is already holding this turn open (stop_hook_active): blocking
 # again there is what a block-loop looks like from in here.
+# THE PERMISSION SEAT'S HAND-OFF GATE. cc-perms handoff and relaunch refuse until the box goes live, so a line that
+# tells the seat to hand off then sends it into a refusal. perms_handoff_open asks cc-perms' own `gate` (exit 0 open,
+# 1 shut: <why>), the one place that checks both the config key and the root-owned go-live marker; a missing binary,
+# a failure or a timeout counts as shut. While it is shut, the seat hears PERMS_SHUT and no instruction to hand off.
+PERMS_SHUT="The hand-off is shut until go-live, so cc-perms handoff and relaunch refuse; do not run them (cc-perms gate says why)."
+perms_handoff_open(){ timeout 10 "$BIN/cc-perms" gate >/dev/null 2>&1; }
 journal_nudge(){   # $1 the Stop payload.  One reason line on stdout (relay wraps it), or nothing at all. Never fatal.
-  local tp sid stamp last m
+  local tp sid stamp last m cwd r
   case "${1//[[:space:]]/}" in *'"stop_hook_active":true'*) return 0;; esac   # whitespace out: one pattern, either spelling
   tp=$(printf '%s' "$1" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
   [ -n "$tp" ] && [ -f "$tp" ] || return 0
@@ -1147,14 +1153,52 @@ journal_nudge(){   # $1 the Stop payload.  One reason line on stdout (relay wrap
   mkdir -p "${stamp%/*}" 2>/dev/null && : > "$stamp" 2>/dev/null
   find "${stamp%/*}" -type f -mtime +7 -delete 2>/dev/null
   m=${m//[\"\\]/}   # the reason below is JSON on one line, and the measurement goes inside it as plain text
+  # THE PERMISSION SEAT HANDS ITSELF OFF: the box's rotation never starts it (cc-handoff refuses), so its line says
+  # what only it can do — journal, then cc-perms handoff, which refuses without a fresh HAND-OFF ENTRY. A cwd that
+  # merely looks like the seat's gets this text and nothing more: the verb decides who the seat is, not this line.
+  # The call waits up to 90 s for the successor; under a timeout shorter than 120 s, a hard kill could leave perms~next.
+  cwd=$(printf '%s' "$1" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  case "$cwd" in "$HOME"/.cc/state/*/perms) r=${cwd#"$HOME"/.cc/state/}; r=${r%/perms}
+    if [[ $r != */* ]] && [ -f "$cwd/brief.md" ] && ! perms_handoff_open; then   # shut: it journals, and hears why there is no hand-off
+      printf '%s\n' "CONTEXT $m. You are the permission seat, past the hand-off line. Before this turn ends, append a dated entry to handoff.md in your own directory, ~/.cc/state/$r/perms/handoff.md (what is done, what is next in order, the gotchas), then carry on. $PERMS_SHUT"
+      return 0
+    elif [[ $r != */* ]] && [ -f "$cwd/brief.md" ]; then
+      printf '%s\n' "CONTEXT $m. You are the permission seat, past the hand-off line. Before this turn ends, append an entry headed '## HAND-OFF ENTRY <UTC time to the minute>Z ... START HERE' to handoff.md in your own directory, ~/.cc/state/$r/perms/handoff.md, which only you can write and the only journal your successor reads (what is done, what is next in order, the gotchas), then run cc-perms handoff in the foreground, never in the background, with a Bash timeout of at least 120000 ms, so a timeout cannot stop it halfway. A fresh seat starts from brief.md and that entry, takes window perms, and this window ends."
+      return 0; fi;; esac
   printf '%s\n' "CONTEXT $m. Append a dated entry to this session's journal now, before this turn ends: what is done, what is next in order, the gotchas. A track journals to ~/.cc/state/<repo>/<track>/progress.md, any other session to ~/.cc/state/<repo>/<alias-or-planning>-handoff.md. Write it from what you already know, then carry on. A fresh session starts from that file and from nothing else."
 }
 # The hook's JSON payload (verified fields: session_id, transcript_path, cwd, stop_hook_active, …) — read before
 # anything can exit, capped, and never fatal: the pipe must be drained whatever happens (a hook that leaves it
 # unread can stall the writer), and asking how full a context is must not cost a session its commit. What comes
 # back is relayed AFTER the commit below, so the work is on the branch before the turn is interrupted.
+# THE PERMISSION SEAT'S PINS. cc-perms relaunch and handoff refuse to start a seat while ~/.claude's startup entries,
+# ~/.claude.json, the seat's auto-memory or the claude binary differ from the hashes the seat pinned, and only the seat
+# can pin. So the seat hears it at the end of a turn, whatever its context, rather than when a hand-off or a crash
+# finds out: "startup surface changed since the last pin: <entries>". The comparison is cc-perms' own (pins-diff, one
+# hash pass, about a second here, no model), never a copy of it. Said once per set of entries per session, so a seat
+# that is still looking is not held a second turn every turn; a new change is a new set, and is said again.
+# IT SAYS REVIEW, NEVER JUST "PIN". A changed entry is what a planted startup file looks like, and a seat told to pin
+# would bless the plant, so the line sends it to read each change first. While the hand-off gate is shut it carries
+# PERMS_SHUT instead of pointing at a hand-off the box will refuse, and the nudge beside it drops its own copy.
+pins_line(){   # $1 the Stop payload.  One line on stdout, or nothing at all. Never fatal.
+  local cwd r d sid stamp k
+  case "${1//[[:space:]]/}" in *'"stop_hook_active":true'*) return 0;; esac
+  cwd=$(printf '%s' "$1" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  case "$cwd" in "$HOME"/.cc/state/*/perms) r=${cwd#"$HOME"/.cc/state/}; r=${r%/perms};; *) return 0;; esac
+  [[ $r != */* ]] && [ -f "$cwd/brief.md" ] && [ -x "$BIN/cc-perms" ] || return 0
+  d=$(timeout 30 "$BIN/cc-perms" pins-diff "$r" 2>/dev/null); [ $? = 1 ] && [ -n "$d" ] || return 0   # 0 matches, 2 or 124: nothing to say
+  sid=$(printf '%s' "$1" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"/]*\)".*/\1/p' | head -1)
+  stamp="$HOME/.cc/state/checkpoint/pins-said/${sid:-$r}"; k=$(printf '%s' "$d" | sha256sum | cut -c1-16)
+  [ "$(cat "$stamp" 2>/dev/null)" = "$k" ] && return 0
+  mkdir -p "${stamp%/*}" 2>/dev/null && printf '%s\n' "$k" > "$stamp" 2>/dev/null
+  find "${stamp%/*}" -type f -mtime +7 -delete 2>/dev/null
+  d=$(paste -sd '\t' <<<"$d"); d=${d//$'\t'/, }
+  d="startup surface changed since the last pin: ${d//[\"\\]/} — review each change before re-pinning; never pin an entry you haven't read."
+  if perms_handoff_open; then printf '%s\n' "$d Until the pins match, cc-perms handoff and relaunch refuse to start a seat."
+  else printf '%s\n' "$d $PERMS_SHUT"; fi; }
 [ "$STRICT" = 1 ] || [ -t 0 ] || payload=$(timeout 5 cat)
 [ -n "${payload:-}" ] && say=$(journal_nudge "$payload")
+[ -n "${payload:-}" ] && { pl=$(pins_line "$payload"); [ -z "$pl" ] || { say=${say//" $PERMS_SHUT"/}; say=$pl${say:+ }${say:-}; }; }   # the shut line said once
 # INDEX-AT-WRITE for the knowledge base (cc-lib): the journal this turn appended to (~/.cc/state) and the memory
 # file it saved (~/.claude/projects) are searchable a minute later, not at the next sweep. Every session, track or
 # not, on the hook alone — never `--commit`, and never inside a member's boundary (a member reads its workspace's

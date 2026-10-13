@@ -1,0 +1,1066 @@
+#!/usr/bin/env bash
+# cc-perms — bring the permission seat back when its window is gone, or let it hand itself to a fresh one. The
+# seat (tmux window `perms`, cwd ~/.cc/state/<repo>/perms) is the one session the box runs with --dangerously-skip-permissions, and a tmux crash
+# takes it with everything else. Until this, only the owner could start it again, by hand.
+#   cc-perms relaunch    from a repo's planning seat: open window `perms` on that repo's seat, always a fresh
+#                        conversation that starts from its brief.md and the last entry of its journal (handoff.md).
+#                        While a live seat exists it does nothing and exits 0.
+#   cc-perms handoff     from the permission seat itself, past its hand-off line: start a fresh seat in window
+#                        `perms~next`, and once it is listening move the names (old → `perms~old`, new → `perms`)
+#                        and end the old window, last. Refused unless handoff.md in the seat's own directory gained
+#                        a `## HAND-OFF ENTRY <UTC minute>Z` heading in the last 15 minutes. A successor that is not
+#                        up within 90 s is removed and the old seat kept, and so it is when the call is stopped.
+#   cc-perms pin         from the permission seat itself: record what a new seat starts from (~/.claude's startup
+#                        entries and the claude binary, by hash) in `pins` in its own directory. Both verbs above
+#                        refuse to start a seat while any of those differs, so the seat takes a change on here.
+#   cc-perms pins-diff REPO  read only: each entry of REPO's seat that differs from its pins, one a line (rc 1), or
+#                        nothing (rc 0); rc 2 when REPO has no seat. The seat's stop line (cc-checkpoint) asks it.
+#   cc-perms selfcheck   the refusals and the launches, against fixtures in a HOME of their own
+# WHY IT IS SAFE TO CALL: the property that fenced the seat is that nothing another session can call, write or
+# signal starts a session that skips permissions under that session's say-so. So relaunch takes NO argument, reads
+# nothing from the caller's environment, and builds one fixed command: the seat's own directory, its own brief.md,
+# the one model written below ($MODEL, never cc-model, an override file or the env), and nothing else. The caller
+# decides only WHEN, never WHAT.
+# NO LAUNCH EVER LOADS A TRANSCRIPT: any unsandboxed shell can write a .jsonl into ~/.claude/projects, and a seat
+# that resumed it would take a planted turn as its own. So relaunch, like handoff, always starts FRESH: a session id
+# this script picks (recorded in the seat's own directory, session-id) and the fixed prompt, which reads brief.md and
+# the last "START HERE" entry of the journal beside it. Never --continue or --resume.
+# WHO MAY CALL COMES FROM THE PROCESS, never from anything typed. The nearest `claude` above this shell must:
+#   - be the real claude binary (/proc/PID/exe under ~/.local/share/claude/versions/), not a copy named claude;
+#   - stand exactly in ~/dev/<repo>, and that repo has a seat (~/.cc/state/<repo>/perms/brief.md), so another
+#     repo's seat is refused and nobody can name a repo they do not sit in;
+#   - carry no member or track marker in that directory and no CC_ROLE in its own environment (a worker, a member
+#     workspace and a member-facing seat all run with one);
+#   - have no second `claude` above it (a session that starts a child claude in ~/dev/<repo> does not become the seat);
+#   - run inside a pane of tmux session `main` whose window is <repo> or its handoff successor <repo>~next, so a
+#     claude detached into ~/dev/<repo> is refused too.
+# HANDOFF'S CALLER is the seat itself, read the same way: the nearest claude above is the real binary, carries the
+# skip flag, stands in ~/.cc/state/<repo>/perms (with its brief.md), has no CC_ROLE and no claude above it, and sits
+# in the pane of the one tmux window `perms`. Its launch is relaunch's fixed command, always FRESH (a session id it
+# picks, the fixed prompt; never --continue or --resume), so the caller still decides only WHEN. The session id is
+# recorded only once the names have moved, so a failed hand-off leaves the old seat's id in place.
+# THE JOURNAL THE SUCCESSOR FOLLOWS IS FENCED LIKE brief.md: it is handoff.md inside the seat's own directory, which
+# cc-guard lets only the seat write, at every tier. Whoever writes the entry the fresh seat starts from steers it,
+# so it never lives beside the seat (~/.cc/state/<repo>/*-handoff.md is any unsandboxed worker's to append to).
+# A STOPPED HAND-OFF LEAVES ONE SEAT. The wait fits under Bash's 120 s default, and a trap on EXIT, TERM, INT and HUP
+# settles whatever stopped it: before the names moved it closes perms~next and gives the old window its name back;
+# after, it finishes the cutover forward. Only a SIGKILL gets past the trap, and settle ignores a second signal.
+# NOTHING ABOVE THE SEAT STEERS IT (security reads of #940). Claude Code loads CLAUDE.md, CLAUDE.local.md and .claude/
+# from every directory above the one it starts in, and ~/.cc/state/<repo>, ~/.cc/state and ~/.cc are any unsandboxed
+# worker's to write. Both verbs refuse to launch while one sits above the seat; the one allowed is ~/CLAUDE.md as a
+# link that resolves into ~/dev/<repo> (~/.claude is the account's own settings). The launch is an argument list, never
+# a shell string: a fixed sh cds into the seat and execs `env -i` with a fixed HOME, PATH, TERM and LANG and the pane's
+# own TMUX and TMUX_PANE, so nothing in the tmux server's environment reaches the seat. What it runs is the program
+# ~/.local/bin/claude resolves to, checked to be a file directly in ~/.local/share/claude/versions/, through a link
+# named claude in the seat's own directory (so the session is still called claude); a hand-off waits for exactly that
+# program.
+# WHAT THE SEAT STARTS FROM IS FIXED BY CONSTRUCTION (third security read of #940). Any unsandboxed shell of this
+# account can write ~/.claude, ~/.claude.json and ~/.local/bin, and a session loads all three as it starts. So:
+#   - MCP: the launch carries --strict-mcp-config and --mcp-config launch/mcp.json, which this script writes from a
+#     fixed template (the one server the seat had: cc-slack, the one beside this script, tools only), so no server
+#     from ~/.claude.json or a project file starts with the seat.
+#   - ~/.claude: CLAUDE.md, rules/, agents/, skills/, commands/, output-styles/, plugins/, settings.json and
+#     settings.local.json (all of each but its permission rules and autoMode text, which a session that skips
+#     permissions never consults), ~/.claude.json (but for what every session rewrites as it runs: see CJ_DROP), the
+#     seat's own auto-memory (~/.claude/projects/<its directory>/memory/, MEMORY.md and every file in it), and the
+#     binary ~/.local/bin/claude resolves to, must match the hashes in `pins` in the seat's own directory. Only the
+#     seat writes there (cc-guard), and `cc-perms pin`, run by the seat, records them. A mismatch refuses with one
+#     line naming the entry, so an updater's bump or a skill sync waits for the seat to look and re-pin. Left out of
+#     the hash is what the account's own sync rewrites by itself: a .git dir, __pycache__, .last-complete-round, a
+#     lastUpdated stamp, and the plugin catalogs (plugins/marketplaces, synced, store, the directory cache).
+#     Installed plugins (installed_plugins.json, cache/) are in it, and so is what a skill links to.
+#   - PATH is ~/bin and the system's own directories, nothing else, so ~/.local/bin is off it. ~/bin comes first
+#     because its shims (gh, cc) must win over the system's names, and it is held the way the seat's hooks are,
+#     since they run from there too: cc-guard refuses a worker's or member's write into ~/bin and ~/dev, and the
+#     launch refuses while an entry of ~/bin resolves outside the box's own repo in ~/dev (a member's workspace is
+#     in ~/dev too, and its member writes it). Python the seat runs keeps its bytecode in
+#     launch/pycache (PYTHONPYCACHEPREFIX), so a __pycache__ planted beside a script is never read.
+# These paths are all this account's to swap, so this narrows the window; the caller's pane is the gate.
+# NO LAUNCH WHILE WORKERS RUN UNSANDBOXED (fourth security read of #940). A worker outside bwrap can still write
+# ~/.claude, ~/.claude.json, ~/bin and the seat's pins through a path cc-guard's text check never sees: a name it
+# computes, a path printf builds, a script it writes and then runs. So the pins alone cannot hold an unattended
+# launch, and both verbs refuse, before anything else, while CC_WORKER_SANDBOX is not 1 (read from ~/.cc/config alone). One gap is moot under that gate, because it needs a writer that
+# is not the seat: ~/.claude.json's hash leaves out cachedGrowthBookFeatures, which the account rewrites by itself.
+# The pins are hashed twice, once before the launch is set up and once just before the tmux call (pins_again), and
+# the go-live gate below is asked twice the same way, so a marker removed mid-call stops the launch.
+# GO-LIVE, in order: (a) the worker-sandbox rollout reports it is safe, with the dispatchers reading ~/.cc/config;
+# (b) the perms seat sets CC_WORKER_SANDBOX=1 there; (c) perms confirms no unsandboxed box workers are running;
+# (d) perms reviews ~/.claude and pins it clean; (e) the owner runs one command:
+#   sudo install -D -o root -g root -m 0644 /dev/null /etc/cc/perms-handoff-live
+# (-D makes /etc/cc as well, which the box does not have.)
+# Only then do hand-offs run: both verbs also need that marker (a regular file, not a link, root:root, 0644 or
+# stricter), and `cc-perms gate` says whether both locks are open (exit 0) or why not (exit 1). The gate reads the key
+# from ~/.cc/config only, never the environment or a CC_CONFIG file. Be plain about what this holds: the box's user
+# has passwordless sudo, so nothing on disk (the key, the pins or this marker) holds against a deliberately hostile
+# unsandboxed session. The marker stops honest mistakes and forges made as text; the real lock is the worker sandbox
+# (no_new_privs).
+# THE PLANNING SEAT IS TRUSTED. It can edit cc-perms and cc-slack in ~/dev and start a claude that skips permissions
+# on its own, and no PR can fence that. Everything here holds against a prompt, a worker or a member, not against it.
+# cc-guard refuses `cc-perms relaunch` and `cc-perms handoff` from a worker or member shell as text; this check is what holds when the
+# command is spelled some other way. The account's home comes from passwd, not $HOME, and PATH is set to the
+# system's own directories before anything is looked up, so a getent, id or stat planted on the caller's PATH never
+# names it. A FIXTURE is only a run the selfcheck starts: CC_PERMS_FIXTURE=1, which the selfcheck sets for its own
+# calls and nothing else does, with a $HOME that is not the account's. Only a fixture reads its paths from $HOME,
+# honours the CC_PERMS_* overrides (a stand-in session, the marker and its owner, the wait, a mid-launch hook) and
+# runs the tmux and cc-notify stand-ins in $HOME/fixture-bin, never the caller's PATH: its tmux runs with TMUX and
+# TMUX_TMPDIR unset against a socket in $HOME, so a fixture called from a real pane never reaches the real server or
+# the owner's DMs. Its launch carries --fixture-no-bypass where the real one carries --dangerously-skip-permissions,
+# so no fixture, and no session that fakes one, ever starts a session that skips permissions. Anything else is real:
+# every gate, pin and launch path comes from the passwd home.
+set -uo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; export PATH
+AH=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)
+[ -n "$AH" ] || { echo "cc-perms: cannot read this account's home from passwd; nothing started" >&2; exit 1; }
+FX=""; H=$AH
+if [ "${CC_PERMS_FIXTURE:-}" = 1 ] && [ -n "${HOME:-}" ] && [ "$HOME" != "$AH" ]; then FX=1; H=$HOME; fi
+if [ -n "$FX" ]; then SKIP=--fixture-no-bypass; TM=(env -u TMUX -u TMUX_TMPDIR "$H/fixture-bin/tmux" -S "$H/tmux.sock"); EXE=$(readlink -f /bin/bash)   # the stand-ins are bash scripts
+else SKIP=--dangerously-skip-permissions; TM=(env -u TMUX -u TMUX_TMPDIR /usr/bin/tmux -S "/tmp/tmux-$(id -u)/default"); EXE=$AH/.local/share/claude/versions/; fi
+# the owner's alert goes out through the cc-notify beside this script; a fixture's is its stub in $H/fixture-bin
+HERE=$(dirname -- "$(readlink -f -- "$0")")
+if [ -n "$FX" ]; then NOTIFY=("$H/fixture-bin/cc-notify"); else NOTIFY=("$HERE/cc-notify"); fi
+VERS=$H/.local/share/claude/versions/   # where ~/.local/bin/claude must resolve for a launch
+SESSION=main; WIN=perms
+PROMPT="Read brief.md in this directory; it is your whole job. Then read the last \"START HERE\" entry in handoff.md in this same directory, and in no other file, if there is one. Then wait for requests."
+# where a claude listens for other sessions' messages (<pid>.sock); a fixture's is its own
+# the wait for a successor: under the 120 s a Bash call gets by default, so the caller's timeout never stops it midway
+if [ -n "$FX" ]; then SOCKS=$H/cc-socks; UP=${CC_PERMS_UP_SECS:-90}; else SOCKS=/run/user/$(id -u)/cc-socks; UP=90; fi
+# the one lock relaunch, handoff and pin share: a file of its own in the account's runtime directory (0700, this
+# account's alone), never this script, which every account on the box may read and so hold a shared lock on
+if [ -n "$FX" ]; then LOCK=$H/cc-perms.lock; else LOCK=/run/user/$(id -u)/cc-perms.lock; fi
+# the seat's model, written here and nowhere else: "--model 'claude-opus-5-5[1m]'" — the spec. Not cc-model, whose
+# answer an override file or the env can change, so no config a worker can reach picks the bypass session's model.
+MODEL='claude-opus-5-5[1m]'
+JOURNAL_MIN=15
+
+die(){ echo "cc-perms: $*" >&2; exit 1; }
+# lock WHAT — takes $LOCK on fd 9 or dies saying WHAT is already running. The file is made 0600 by this caller, and a
+# link or anything but a regular file there is refused rather than followed. The type is checked before the open,
+# since opening a FIFO for writing blocks; the open is read-write, which never blocks on a FIFO, so one swapped in
+# after that check is caught by the check after the open.
+lock(){ local um
+  [ -L "$LOCK" ] && die "the lock $LOCK is a link; nothing started"
+  [ -e "$LOCK" ] && [ ! -f "$LOCK" ] && die "the lock $LOCK exists and is not a regular file; nothing started"
+  um=$(umask); umask 077; exec 9<>"$LOCK"; umask "$um"
+  [ -f "$LOCK" ] && [ ! -L "$LOCK" ] || die "cannot take the lock $LOCK; nothing started"
+  flock -n 9 || die "$1"; }
+# sandboxed — rc 0 when CC_WORKER_SANDBOX=1 in the box's own $H/.cc/config, parsed as cc-config does (last line wins,
+# one layer of quotes); the environment and a CC_CONFIG override are ignored on purpose, so a worker cannot set the key
+# for one call (see NO LAUNCH WHILE WORKERS RUN UNSANDBOXED); relaunch and handoff ask it first and refuse otherwise
+sandboxed(){ local l k v="" f=$H/.cc/config
+  [ -f "$f" ] || return 1
+  while IFS= read -r l || [ -n "$l" ]; do
+    l="${l#"${l%%[![:space:]]*}"}"; case "$l" in '#'*|*=*) ;; *) continue;; esac
+    k="${l%%=*}"; k="${k%"${k##*[![:space:]]}"}"; [ "$k" = CC_WORKER_SANDBOX ] || continue
+    l="${l#*=}"; l="${l#"${l%%[![:space:]]*}"}"; l="${l%"${l##*[![:space:]]}"}"
+    case "$l" in '"'*'"'|"'"*"'") l="${l:1:${#l}-2}";; esac; v=$l
+  done < "$f"
+  [ "$v" = 1 ]; }
+# handoff_gate_open — rc 0 when both locks are open, else rc 1 with the reason on stdout: the sandbox key, then the
+# owner's marker /etc/cc/perms-handoff-live (a regular file, not a link, owned by root:root, mode 0644 or stricter,
+# checked with stat). Only a fixture (CC_PERMS_FIXTURE, see above) may move the marker and the ids it expects; a real
+# run reads the one path, whatever its environment. Both verbs ask it first and again just before the tmux call.
+handoff_gate_open(){ local m=/etc/cc/perms-handoff-live mu=0 mg=0 st
+  if [ -n "$FX" ]; then m=${CC_PERMS_MARKER:-$m}; mu=${CC_PERMS_MARKER_UID:-0}; mg=${CC_PERMS_MARKER_GID:-0}; fi
+  sandboxed || { echo "workers run unsandboxed (CC_WORKER_SANDBOX is not 1 in ~/.cc/config), so a startup file one of them planted could pass the pins"; return 1; }
+  if [ -L "$m" ] || [ ! -f "$m" ]; then echo "the owner's marker $m is missing or not a regular file"; return 1; fi
+  st=$(stat -c '%u %g %a' -- "$m" 2>/dev/null) || { echo "the owner's marker $m cannot be read with stat"; return 1; }
+  [ "${st%% *}" = "$mu" ] && st=${st#* } && [ "${st%% *}" = "$mg" ] || { echo "the owner's marker $m is not owned by root:root"; return 1; }
+  [ $(( 8#${st##* } & ~8#644 )) = 0 ] || { echo "the owner's marker $m is writable by group or others, or looser than 0644"; return 1; }
+  return 0; }
+# ctl_repo — the box's own repo, the one rule cc, cc-notify and cc-slack read it by: the repo this copy of cc-perms
+# lives in under ~/dev, else cc-config's CC_BOX, else the host's short name
+ctl_repo(){ local c=""
+  case "$HERE" in "$H/dev/"?*) c=${HERE#"$H/dev/"}; c=${c%%/*};; esac
+  [ -n "$c" ] || c=$("$HERE/cc-config" get CC_BOX 2>/dev/null)
+  [ -n "$c" ] || c=$(hostname -s 2>/dev/null)
+  printf %s "$c"; }
+ppid_of(){ awk '{print $4}' "/proc/$1/stat" 2>/dev/null; }   # the field after comm; a comm with spaces never reaches here (claude has none)
+comm_of(){ cat "/proc/$1/comm" 2>/dev/null; }
+
+# session_pid — prints the nearest claude above this shell (a fixture may name a stand-in), or says why not (rc 1)
+session_pid(){
+  local p="" n=0
+  if [ -n "$FX" ] && [ -n "${CC_PERMS_ROOT_PID:-}" ]; then p=$CC_PERMS_ROOT_PID
+  else p=$PPID
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 64 ]; do
+      [ "$(comm_of "$p")" = claude ] && break
+      p=$(ppid_of "$p"); n=$((n+1)); done
+  fi
+  [ "$(comm_of "${p:-0}")" = claude ] || { echo "not called from a session"; return 1; }
+  case "$(readlink "/proc/$p/exe" 2>/dev/null)" in "$EXE"*) ;; *) echo "the session is not the claude binary"; return 1;; esac
+  printf '%s\n' "$p"; }
+# claude_above PID — rc 0 when a claude sits above PID (a session started by another session)
+claude_above(){
+  local n=0 q; q=$(ppid_of "$1")
+  while [ -n "$q" ] && [ "$q" != 0 ] && [ "$q" != 1 ] && [ "$n" -lt 64 ]; do
+    [ "$(comm_of "$q")" = claude ] && return 0
+    q=$(ppid_of "$q"); n=$((n+1)); done
+  return 1; }
+
+# caller_repo — prints the repo whose planning seat this call comes from, or says why not (rc 1)
+caller_repo(){
+  local p n=0 d r q
+  p=$(session_pid) || { echo "$p"; return 1; }
+  d=$(readlink "/proc/$p/cwd" 2>/dev/null)
+  case "$d" in "$H"/dev/?*) r=${d#"$H"/dev/};; *) echo "not a repo's planning seat (the session stands in ${d:-?})"; return 1;; esac
+  case "$r" in */*|.|..) echo "not a repo's planning seat (the session stands in $d)"; return 1;; esac
+  [ -e "$d/.cc/track" ] || [ -e "$d/.cc/member-facing" ] || [ -e "$d/.cc/member-workspace" ] \
+    && { echo "$r is a track or member session, not a planning seat"; return 1; }
+  tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q '^CC_ROLE=' && { echo "the session runs as a worker or member"; return 1; }
+  claude_above "$p" && { echo "the session was started by another session"; return 1; }
+  local panes inpane=""; panes=$("${TM[@]}" list-panes -s -t "$SESSION" -F '#{window_name} #{pane_pid}' 2>/dev/null)
+  n=0; q=$p
+  while [ -n "$q" ] && [ "$q" != 0 ] && [ "$q" != 1 ] && [ "$n" -lt 64 ]; do
+    awk -v a="$r" -v b="$r~next" -v q="$q" '($1 == a || $1 == b) && $2 == q {f=1} END {exit !f}' <<<"$panes" && { inpane=1; break; }
+    q=$(ppid_of "$q"); n=$((n+1)); done
+  [ -n "$inpane" ] || { echo "the session is not in tmux window $SESSION:$r"; return 1; }
+  [ -f "$H/.cc/state/$r/perms/brief.md" ] || { echo "$r has no permission seat"; return 1; }
+  printf '%s\n' "$r"; }
+
+# live_seat DIR — prints the pid of a live seat in DIR (a claude carrying the skip flag, standing there), rc 1 if none
+live_seat(){
+  local f p
+  for f in /proc/[0-9]*/comm; do
+    [ "$(cat "$f" 2>/dev/null)" = claude ] || continue
+    p=${f#/proc/}; p=${p%/comm}
+    [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$1" ] || continue
+    tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qxF -- "$SKIP" || continue
+    printf '%s\n' "$p"; return 0; done
+  return 1; }
+
+# above_clean DIR REPO — rc 0 when no CLAUDE.md, CLAUDE.local.md or .claude sits in a directory above DIR, which a
+# session started in DIR would load; otherwise says which (rc 1). Allowed: ~/CLAUDE.md as a link resolving into
+# ~/dev/REPO, and ~/.claude (the account's settings: pins_match holds its startup entries, and ~/.claude.json, which
+# no directory walk loads). A fixture stops at its HOME: above that is the machine running it.
+above_clean(){
+  local d=${1%/*} n f
+  while :; do
+    for n in CLAUDE.md CLAUDE.local.md .claude; do
+      f=$d/$n; [ -e "$f" ] || [ -L "$f" ] || continue
+      [ "$d" = "$H" ] && [ "$n" = .claude ] && continue
+      [ "$d" = "$H" ] && [ "$n" = CLAUDE.md ] && [ -L "$f" ] \
+        && case "$(readlink -f -- "$f" 2>/dev/null)" in "$H/dev/$2"/?*) true;; *) false;; esac && continue
+      echo "$f sits above the seat's directory, and a seat started there would load it"; return 1; done
+    { [ -n "$FX" ] && [ "$d" = "$H" ]; } || [ "$d" = / ] || [ -z "$d" ] && break
+    d=${d%/*}; [ -n "$d" ] || d=/; done
+  return 0; }
+
+# launch_target — prints the program ~/.local/bin/claude resolves to when that is an executable file directly in
+# ~/.local/share/claude/versions/, or says why not (rc 1)
+launch_target(){
+  local c; c=$(readlink -f -- "$H/.local/bin/claude" 2>/dev/null)
+  case "$c" in "$VERS"?*) ;; *) echo "$H/.local/bin/claude does not resolve into $VERS (it resolves to ${c:-nothing})"; return 1;; esac
+  case "${c#"$VERS"}" in */*) echo "$H/.local/bin/claude resolves below $VERS, not directly in it ($c)"; return 1;; esac
+  [ -f "$c" ] && [ -x "$c" ] || { echo "$c is not an executable file"; return 1; }
+  printf '%s\n' "$c"; }
+
+# bin_clean — rc 0 when every entry of ~/bin, which is first on the seat's PATH, resolves into the box's own repo in
+# ~/dev (ctl_repo), where cc-guard refuses a worker's or member's write, and none but cc and gh shares its name with
+# a program in /usr/local/bin, /usr/bin or /bin (cc must beat the C compiler; a ~/bin/jq must never stand in for jq).
+# Anywhere else in ~/dev is not enough: a member workspace sits there too, and its member writes it. Otherwise it
+# says which entry fails (rc 1). A directory is never run, so it passes.
+bin_clean(){
+  local f c b d r; r=$(ctl_repo)
+  case "$r" in ""|*/*|.|..) echo "cannot tell which repo in $H/dev is the box's own, so ~/bin cannot be checked"; return 1;; esac
+  for f in "$H"/bin/* "$H"/bin/.[!.]* "$H"/bin/..?*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    c=$(readlink -f -- "$f" 2>/dev/null); [ -d "$c" ] && continue
+    case "$c" in "$H/dev/$r"/?*) ;; *) echo "$f resolves to ${c:-nothing}, outside $H/dev/$r, and ~/bin is on the seat's PATH"; return 1;; esac
+    b=${f##*/}; case "$b" in cc|gh) continue;; esac
+    for d in /usr/local/bin /usr/bin /bin; do
+      [ -e "$d/$b" ] || [ -L "$d/$b" ] || continue
+      echo "$f shadows $d/$b, and ~/bin comes first on the seat's PATH (only cc and gh may)"; return 1
+    done
+  done
+  return 0; }
+
+# THE PINS. fhash FILE prints its sha256. treehash DIR [PATH…] prints one hash over every name and file below DIR,
+# following links (a skill that links into a checkout is pinned by what it links to), leaving out the PATHs given
+# (relative to DIR) and what the account's own sync rewrites by itself: .git, __pycache__ and .last-complete-round
+# anywhere, and the lastUpdated stamps in a manifest.json or known_marketplaces.json. A missing DIR is "absent".
+fhash(){ sha256sum < "$1" 2>/dev/null | cut -c1-64; }
+treehash(){
+  local d=$1 x; shift
+  [ -e "$d" ] || [ -L "$d" ] || { echo absent; return 0; }
+  [ -d "$d" ] || { echo "file:$(fhash "$d")"; return 0; }   # a file where a directory belongs still pins
+  local -a pr=(); for x in "$@"; do pr+=(-path "./$x" -o); done
+  # every file's sha256 in one sha256sum run (a fork per file took ~/.claude/skills' 3,400 files to 20 s); the lines
+  # hashed are the same as one fhash per file would give, and a file sha256sum cannot read hashes as empty, as there
+  ( cd -- "$d" || { echo unreadable; exit 0; }
+    local -A fh=()
+    while IFS= read -r -d '' x; do fh[${x:66}]=${x:0:64}; done < <(find -L . -mindepth 1 \( "${pr[@]}" -name .git -o -name __pycache__ \
+      -o -name .last-complete-round \) -prune -o -type f -print0 2>/dev/null | xargs -0 -r sha256sum -z -- 2>/dev/null)
+    find -L . -mindepth 1 \( "${pr[@]}" -name .git -o -name __pycache__ -o -name .last-complete-round \) -prune -o -printf '%y %p\n' 2>&1 \
+      | LC_ALL=C sort | while IFS=' ' read -r y p; do
+          [ "$y" = f ] || { printf '%s %s\n' "$y" "$p"; continue; }
+          x=""; case "${p##*/}" in manifest.json|known_marketplaces.json)
+            x=$(jq -cS 'walk(if type == "object" then del(.lastUpdated) else . end)' -- "$p" 2>/dev/null) && x=json:$(printf '%s' "$x" | sha256sum | cut -c1-64) || x="";; esac
+          printf 'f %s %s\n' "$p" "${x:-${fh[$p]:-}}"; done ) | sha256sum | cut -c1-64; }
+# pin_now TARGET DIR — the pins as they stand: one "<path> <hash>" line for each of ~/.claude's startup entries, one
+# for ~/.claude.json, and one for TARGET (the binary a launch runs), keyed by its own path so an updater's bump has no
+# pin until the seat makes one. DIR is the seat's directory, whose own entry under .projects is the one it starts from.
+PINS=(CLAUDE.md rules agents skills commands output-styles plugins settings.json settings.local.json)
+# ~/.claude.json is rewritten by every session of the account as it starts and runs (counters, caches, tips, each
+# directory's last-run figures), so its hash leaves out these keys, the other directories' entries under .projects,
+# and the seat's own entry's last* figures and exampleFiles. Every other key, mcpServers included, is pinned.
+CJ_DROP='["numStartups","promptQueueUseCount","btwUseCount","tipsHistory","tipsHistoryByCommand","tipLifetimeShownCounts",
+"skillUsage","pluginUsage","agentLastUsed","lastPlanModeUse","announcementImpressions","seenNotifications",
+"promoStartupSeenCount","promoStartupStatusCache","passesLastSeenRemaining","passesUpsellSeenCount","passesEligibilityCache",
+"fullscreenUpsellSeenCount","rcLongTurnNudgeSeenCount","rcLongTurnNudgeSeenKey","rcPermissionNudgeSeenCount",
+"remoteControlReadyPushCount","remoteControlReadyPushKey","remoteControlSurfacesSeen","hasSeenEffortMediumNudgeByModel",
+"feedbackSurveyState","changelogLastFetched","closedIssuesLastChecked","lastReleaseNotesSeen","cachedGrowthBookFeatures",
+"cachedGrowthBookFeaturesAt","cachedExperimentData","cachedExperimentFeatures","cachedExtraUsageDisabledReason",
+"cachedUsageUtilization","cachedArtifactRoster","additionalModelCostsCache","additionalModelOptionsCache",
+"additionalModelOptionsAnsweredAt","autoCompactWindowsCache","clientDataCacheSlots","githubWebConnectionStatusCache",
+"groveConfigCache","modelAccessCache","orgModelDefaultCache","githubRepoPaths","replBridgePlaceholders"]'
+cjhash(){
+  local s
+  s=$(jq -cS --arg d "$2" --argjson drop "$CJ_DROP" '
+      (.projects[$d] // null | if type == "object" then with_entries(select(.key | startswith("last") | not)) | del(.exampleFiles) else . end) as $p
+      | del(.projects) | delpaths([$drop[] | [.]]) | .seatProject = $p' -- "$1" 2>/dev/null) \
+    && printf 'json:%s\n' "$(printf '%s' "$s" | sha256sum | cut -c1-64)" || printf 'raw:%s\n' "$(fhash "$1")"; }
+pin_now(){
+  local c=$H/.claude e s
+  for e in "${PINS[@]}"; do
+    if [ ! -e "$c/$e" ] && [ ! -L "$c/$e" ]; then s=absent
+    else case "$e" in
+      CLAUDE.md) s=$(fhash "$c/$e"); s=${s:-unreadable};;
+      settings.json|settings.local.json) s=$(jq -cS 'del(.permissions, .autoMode)' -- "$c/$e" 2>/dev/null) \
+          && s=json:$(printf '%s' "$s" | sha256sum | cut -c1-64) || s=raw:$(fhash "$c/$e");;
+      plugins) s=$(treehash "$c/$e" marketplaces synced store 'plugin-directory-cache*');;
+      *) s=$(treehash "$c/$e");;
+    esac; fi
+    printf '%s %s\n' "$c/$e" "$s"; done
+  if [ ! -e "$H/.claude.json" ] && [ ! -L "$H/.claude.json" ]; then s=absent; else s=$(cjhash "$H/.claude.json" "$2"); fi
+  printf '%s %s\n' "$H/.claude.json" "$s"
+  s=$H/.claude/projects/$(sed 's/[^A-Za-z0-9]/-/g' <<<"$2")/memory; printf '%s %s\n' "$s" "$(treehash "$s")"   # the seat's auto-memory
+  printf '%s %s\n' "$1" "$(fhash "$1")"; }
+# pins_diff DIR TARGET — prints every entry pin_now gives whose hash is not the one in DIR/pins, one a line in pin_now's
+# order, or "nothing pinned yet" when DIR/pins is empty or missing; rc 0 when nothing differs, 1 otherwise. One hash
+# pass, and it writes nothing: relaunch, handoff, the pins-diff verb and the seat's stop line all compare through it.
+pins_diff(){
+  [ -s "$1/pins" ] || { echo "nothing pinned yet"; return 1; }
+  pin_now "$2" "$1" | awk 'NR == FNR {p[$1] = $2; next} p[$1] != $2 {print $1; n++} END {exit n > 0}' "$1/pins" -; }
+# pins_match DIR TARGET — rc 0 when every pin in DIR/pins is what pin_now says now; otherwise names the first that is not (rc 1)
+pins_match(){
+  local d
+  [ -s "$1/pins" ] || { echo "the seat has pinned nothing yet (no pins in $1); the seat runs cc-perms pin"; return 1; }
+  d=$(pins_diff "$1" "$2") && return 0
+  echo "${d%%$'\n'*} is not what the seat pinned in $1/pins; the seat checks the change and runs cc-perms pin"; return 1; }
+# pins_again DIR TARGET — the second look, just before the tmux call that starts claude (only the gate's second ask
+# comes after it): everything pins_match
+# passed is hashed again, so a write landing while the launch was set up (its link, mcp.json, the session id) refuses
+# it. What is left is the moment between this hash and claude's own read as it starts. A fixture may name a program in
+# CC_PERMS_MIDHOOK, run just before, to make that write; the real launch never reads it.
+pins_again(){
+  [ -n "$FX" ] && [ -n "${CC_PERMS_MIDHOOK:-}" ] && "$CC_PERMS_MIDHOOK"
+  local why; why=$(pins_match "$1" "$2") && return 0
+  echo "$why (it changed while the launch was being set up)"; return 1; }
+
+# pins_alert REPO DIR TARGET — relaunch was refused on the pins, so the seat stays down and only a person can start it
+# (pin is the seat's own verb). One owner alert names the entries and the one command that starts the seat by hand,
+# and it is posted once per set of entries: DIR/pins-alerted holds the set's hash, and the same hash is the post's
+# --id, so a planning seat or a watchdog that retries the relaunch does not post it again. A relaunch that gets past
+# the pins removes the stamp. Never fatal: the refusal is what matters, and it is said either way.
+pins_alert(){
+  local set k d=$2 cmd msg
+  set=$(pins_diff "$2" "$3"); k=$(printf '%s' "$set" | sha256sum | cut -c1-16)
+  [ "$(cat "$2/pins-alerted" 2>/dev/null)" = "$k" ] && return 0
+  case "$d" in "$H"/*) d=\~/${d#"$H"/};; esac   # the path as he types it
+  cmd="tmux new-window -t $SESSION -n $WIN -c $d -- ~/.local/bin/claude --model '$MODEL' --effort max --dangerously-skip-permissions 'Read brief.md in this directory; it is your whole job. Your startup files changed since your last pin: check what changed, then run cc-perms pin.'"
+  msg="The $1 permission seat is down, and cc-perms relaunch will not start it because its startup files changed since it last pinned them: $(paste -sd '\t' <<<"$set" | sed 's/\t/, /g'). Check those, then start it by hand with: $cmd"
+  "${NOTIFY[@]}" --owner -t "$1 perms" --heading "The $1 permission seat is down until you start it by hand" --id "perms-pins:$1:$k" "$msg" >/dev/null 2>&1 \
+    && printf '%s\n' "$k" > "$2/pins-alerted"
+  return 0; }
+
+# pins_diff_verb REPO — `cc-perms pins-diff`: REPO's seat entries that differ from its pins. Anyone may ask; it reads.
+# A ~/.local/bin/claude that does not resolve where a launch needs it is named as the entry that changed.
+pins_diff_verb(){
+  local pd cl
+  case "$1" in ""|*/*|.|..) echo "cc-perms: pins-diff takes the repo whose permission seat it reads" >&2; exit 2;; esac
+  pd=$H/.cc/state/$1/perms; [ -f "$pd/brief.md" ] || { echo "cc-perms: $1 has no permission seat" >&2; exit 2; }
+  cl=$(launch_target) || { echo "$H/.local/bin/claude"; return 1; }
+  pins_diff "$pd" "$cl"; }
+
+# seat_argv DIR TARGET — fills SEAT with the one fixed launch both verbs start from, as an argument list: a fixed sh
+# that cds into DIR and execs env -i with the pane's own TMUX and TMUX_PANE (tmux sets those per pane) and a fixed
+# environment, then TARGET through DIR/launch/claude (so the process is still called claude), only the MCP servers in
+# DIR/launch/mcp.json (written here, from the template below), $MODEL, max effort, the skip flag and inbound messages
+# accepted. Each verb adds only how the conversation starts. rc 1: the link or the MCP file was not written.
+# --mcp-config takes several values, so it comes before other options and never just before the prompt.
+SEAT=()
+seat_argv(){
+  local l=$1/launch/claude m=$1/launch/mcp.json u; u=$(id -un)
+  mkdir -p "$1/launch" && ln -sfn -- "$2" "$l.$$" && mv -Tf -- "$l.$$" "$l" || return 1
+  jq -n --arg c "$(dirname -- "$(readlink -f -- "$0")")/cc-slack" '{mcpServers: {"cc-slack": {command: $c, args: ["channel"]}}}' > "$m.$$" \
+    && mv -f -- "$m.$$" "$m" || { rm -f -- "$m.$$"; return 1; }
+  SEAT=(/bin/sh -c 'cd -- "$1" && shift && exec /usr/bin/env -i TMUX="${TMUX:-}" TMUX_PANE="${TMUX_PANE:-}" "$@"' cc-perms-seat "$1"
+    HOME="$H" USER="$u" LOGNAME="$u" SHELL=/bin/bash PATH="$H/bin:/usr/local/bin:/usr/bin:/bin"
+    TERM=tmux-256color LANG=C.UTF-8 XDG_RUNTIME_DIR="/run/user/$(id -u)" PYTHONPYCACHEPREFIX="$1/launch/pycache")
+  [ -d "$H/.cc/tmp" ] && SEAT+=(TMPDIR="$H/.cc/tmp")
+  SEAT+=("$l" --strict-mcp-config --mcp-config "$m" --model "$MODEL" --effort max "$SKIP" --settings '{"crossSessionInbound":"accept"}'); }
+
+relaunch(){
+  local r why pd cl lexe pid sid U how
+  why=$(handoff_gate_open) || die "refused — $why. Nothing started."
+  lock "another relaunch is running; nothing started"
+  why=$(caller_repo) || die "refused — $why. Only a repo's planning seat brings its own permission seat back."
+  r=$why; pd="$H/.cc/state/$r/perms"
+  pid=$(live_seat "$pd") && { echo "cc-perms: the permission seat is already live (pid $pid); nothing to do"; return 0; }
+  "${TM[@]}" list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qxF "$WIN" \
+    && die "window $SESSION:$WIN is open with no seat in it; close it, then run this again. Nothing started."
+  why=$(above_clean "$pd" "$r") || die "refused — $why. Move it away, then run this again. Nothing started."
+  cl=$(launch_target) || die "refused — $cl. Nothing started."
+  why=$(bin_clean) || die "refused — $why. Nothing started."
+  why=$(pins_match "$pd" "$cl") || { pins_alert "$r" "$pd" "$cl"; die "refused — $why. Nothing started."; }
+  rm -f -- "$pd/pins-alerted"   # past the pins: a later change is a new set, and its alert goes out
+  if [ -n "$FX" ]; then lexe=$EXE; else lexe=$cl; fi   # a fixture's stand-in is a bash script
+  seat_argv "$pd" "$cl" || die "could not write the launch link in $pd; nothing started"
+  why=$(pins_again "$pd" "$cl") || { pins_alert "$r" "$pd" "$cl"; die "refused — $why. Nothing started."; }
+  why=$(handoff_gate_open) || die "refused — $why. Nothing started."   # again, the last check: a marker removed mid-call stops it
+  # fresh, always, as handoff: a session id picked here and the fixed prompt, never --continue or --resume
+  U='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  sid=$(cat /proc/sys/kernel/random/uuid); [[ $sid =~ $U ]] || die "could not pick a session id; nothing started"
+  printf '%s\n' "$sid" > "$pd/session-id" || die "could not record the session id in $pd; nothing started"
+  SEAT+=(--session-id "$sid" "$PROMPT"); how="starting fresh from brief.md and its journal"
+  # 9<&-: the seat must not inherit the relaunch lock, or every later call would read as a relaunch in progress
+  "${TM[@]}" new-window -d -t "$SESSION" -n "$WIN" -c "$pd" -- "${SEAT[@]}" 9<&- || die "tmux would not open window $SESSION:$WIN"
+  for _ in $(seq 20); do
+    pid=$(live_seat "$pd") && [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = "$lexe" ] \
+      && { echo "cc-perms: the permission seat is back in $SESSION:$WIN (pid $pid, $how)"; return 0; }
+    sleep 0.5; done
+  die "opened $SESSION:$WIN, but no seat running $cl is in it after 10 s; look at the window"; }
+
+# seat_caller — prints "<repo> <window id>" of the permission seat this call comes from, or says why not (rc 1)
+seat_caller(){
+  local p d r q n=0 w
+  p=$(session_pid) || { echo "$p"; return 1; }
+  d=$(readlink "/proc/$p/cwd" 2>/dev/null)
+  case "$d" in "$H"/.cc/state/?*/perms) r=${d#"$H"/.cc/state/}; r=${r%/perms};; *) echo "not the permission seat (the session stands in ${d:-?})"; return 1;; esac
+  case "$r" in */*|.|..) echo "not the permission seat (the session stands in $d)"; return 1;; esac
+  [ -f "$d/brief.md" ] || { echo "$r has no permission seat"; return 1; }
+  tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qxF -- "$SKIP" || { echo "the session does not run with permissions skipped, so it is not the seat"; return 1; }
+  tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q '^CC_ROLE=' && { echo "the session runs as a worker or member"; return 1; }
+  claude_above "$p" && { echo "the session was started by another session"; return 1; }
+  # the ONE window named perms, and the session in its pane (or under the pane's shell)
+  w=$("${TM[@]}" list-panes -s -t "$SESSION" -F '#{window_id} #{window_name} #{pane_pid}' 2>/dev/null | awk -v w="$WIN" '$2 == w')
+  [ "$(grep -c . <<<"$w")" = 1 ] || { echo "there is not exactly one window $SESSION:$WIN"; return 1; }
+  q=$p
+  while [ -n "$q" ] && [ "$q" != 0 ] && [ "$q" != 1 ] && [ "$n" -lt 64 ]; do
+    [ "$q" = "$(awk '{print $3}' <<<"$w")" ] && { printf '%s %s\n' "$r" "$(awk '{print $1}' <<<"$w")"; return 0; }
+    q=$(ppid_of "$q"); n=$((n+1)); done
+  echo "the session is not the one in tmux window $SESSION:$WIN"; return 1; }
+
+# journal_fresh FILE — rc 0 when FILE's last `## HAND-OFF ENTRY <stamp>Z` heading is 0-15 minutes old. Stamps are
+# written to the minute, so the age is counted in whole minutes: the current minute is 0 and fresh, minute 15 is
+# still fresh, 16 is stale, and a stamp ahead of the clock is refused rather than trusted.
+journal_fresh(){
+  local l s a
+  l=$(grep -E '^## HAND-OFF ENTRY ' "$1" 2>/dev/null | tail -1)
+  [[ $l =~ ^'## HAND-OFF ENTRY '([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2}:[0-9]{2})(:[0-9]{2})?Z ]] || return 1
+  s=$(date -u -d "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" +%s 2>/dev/null) || return 1
+  a=$(( $(date -u +%s) / 60 - s / 60 ))
+  [ "$a" -ge 0 ] && [ "$a" -le "$JOURNAL_MIN" ]; }
+
+# listening PID — rc 0 when PID's message socket ($SOCKS/PID.sock) is a listening unix socket (/proc/net/unix
+# flag 00010000), i.e. the session is up and can be reached
+listening(){ awk -v s="$SOCKS/$1.sock" '$4 == "00010000" && $8 == s {f=1} END {exit !f}' /proc/net/unix 2>/dev/null; }
+
+# settle — handoff's EXIT trap. Whatever stopped the hand-off (a die below, Bash's timeout, ^C, the session ending),
+# the box ends with exactly one window perms. Once the successor's window is named perms the names have moved, so
+# the cutover is finished forward: its session id recorded, the old window ended. Otherwise its window is closed
+# (looked up by name if tmux was stopped before it said the id) and the old window gets back the name perms.
+HO_PD=""; HO_OW=""; HO_NW=""; HO_SID=""; HO_GO=""; HO_DONE=""
+settle(){
+  local rc=$? names w
+  # ignored, not reset: a second TERM, ^C or hang-up mid-cleanup would otherwise stop it with perms~next still up
+  trap - EXIT; trap '' TERM INT HUP
+  { [ -n "$HO_GO" ] && [ -z "$HO_DONE" ]; } || exit "$rc"
+  names=$("${TM[@]}" list-windows -t "$SESSION" -F '#{window_id} #{window_name}' 2>/dev/null)
+  if [ -n "$HO_NW" ] && awk -v w="$HO_NW" -v n="$WIN" '$1 == w && $2 == n {f=1} END {exit !f}' <<<"$names"; then
+    printf '%s\n' "$HO_SID" > "$HO_PD/session-id"
+    echo "cc-perms: stopped after the names moved, so I finished the cutover: the new seat is $SESSION:$WIN, and this window ends now" >&2
+    "${TM[@]}" kill-window -t "$HO_OW" 2>/dev/null; exit 1; fi
+  w=$HO_NW; [ -n "$w" ] || w=$(awk -v n="$WIN~next" '$2 == n {print $1; exit}' <<<"$names")
+  [ -n "$w" ] && "${TM[@]}" kill-window -t "$w" 2>/dev/null
+  "${TM[@]}" rename-window -t "$HO_OW" "$WIN" 2>/dev/null   # a no-op unless the first of the two moves had happened
+  echo "cc-perms: I closed $SESSION:$WIN~next, so this seat stays $SESSION:$WIN and nothing else changed." >&2
+  exit 1; }
+
+handoff(){
+  local who r U np t0 prompt nw why cl lexe
+  why=$(handoff_gate_open) || die "refused — $why. Nothing started."
+  lock "a relaunch or hand-off is already running; nothing started"
+  # "It runs only when its caller descends from the claude process in the current perms window's pane" — the spec
+  who=$(seat_caller) || die "refused — $who. Only the permission seat hands itself off. Nothing started."
+  r=${who% *}; HO_OW=${who#* }; HO_PD="$H/.cc/state/$r/perms"
+  # "The verb refuses unless perms-handoff.md gained a ## HAND-OFF ENTRY in the last 15 minutes" — the spec; the file
+  # is handoff.md inside the seat's directory, fenced like brief.md (see THE JOURNAL above), and no other is read
+  journal_fresh "$HO_PD/handoff.md" \
+    || die "refused — no '## HAND-OFF ENTRY <UTC minute>Z' heading in the last $JOURNAL_MIN minutes of handoff.md in this seat's directory ($HO_PD). Write the START HERE entry there first. Nothing started."
+  "${TM[@]}" list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qxF -e "$WIN~next" -e "$WIN~old" \
+    && die "a window $SESSION:$WIN~next or $WIN~old is already open; close it, then run this again. Nothing started."
+  why=$(above_clean "$HO_PD" "$r") || die "refused — $why. Move it away, then run this again. Nothing started."
+  cl=$(launch_target) || die "refused — $cl. Nothing started."
+  why=$(bin_clean) || die "refused — $why. Nothing started."
+  why=$(pins_match "$HO_PD" "$cl") || die "refused — $why. Nothing started."
+  if [ -n "$FX" ]; then lexe=$EXE; else lexe=$cl; fi   # a fixture's stand-in is a bash script
+  U='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  HO_SID=$(cat /proc/sys/kernel/random/uuid); [[ $HO_SID =~ $U ]] || die "could not pick a session id; nothing started"
+  prompt="Read brief.md in this directory; it is your whole job. Then read the last \"START HERE\" entry in handoff.md in this same directory, and in no other file. Then tell the $r seat you are live (cc-msg $r). Then wait for requests."
+  # fresh, always: a session id picked here and the fixed prompt, never --continue or --resume
+  seat_argv "$HO_PD" "$cl" || die "could not write the launch link in $HO_PD; nothing started"
+  SEAT+=(--session-id "$HO_SID" "$prompt")
+  why=$(pins_again "$HO_PD" "$cl") || die "refused — $why. Nothing started."
+  why=$(handoff_gate_open) || die "refused — $why. Nothing started."   # again, the last check: a marker removed mid-call stops it
+  # from here every way out goes through settle; a signal is an exit with its own code, so EXIT sees it
+  trap settle EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; HO_GO=1
+  nw=$("${TM[@]}" new-window -d -P -F '#{window_id} #{pane_pid}' -t "$SESSION" -n "$WIN~next" -c "$HO_PD" -- "${SEAT[@]}" 9<&-) \
+    || die "tmux would not open window $SESSION:$WIN~next."
+  np=${nw#* }; HO_NW=${nw%% *}
+  t0=$SECONDS
+  until [ "$(comm_of "$np")" = claude ] && [ "$(readlink "/proc/$np/cwd" 2>/dev/null)" = "$HO_PD" ] \
+        && [ "$(readlink "/proc/$np/exe" 2>/dev/null)" = "$lexe" ] && listening "$np"; do
+    # "If the successor isn't live within about 3 minutes, the verb kills perms~next, keeps the old perms and says so"
+    # — the spec; $UP is 90 s so that Bash's own timeout never ends the wait first (settle closes perms~next)
+    [ $((SECONDS - t0)) -ge "$UP" ] && die "the new seat was not up after $UP s."
+    sleep 1; done
+  # ONE tmux call for both names, as cc-handoff's cutover: between two, no window is `perms`
+  "${TM[@]}" rename-window -t "$HO_OW" "$WIN~old" \; rename-window -t "$HO_NW" "$WIN" 2>/dev/null \
+    || die "tmux would not move the window names."
+  printf '%s\n' "$HO_SID" > "$HO_PD/session-id"   # the new seat's id, so the record names who holds the seat
+  HO_DONE=1
+  echo "cc-perms: the new seat is $SESSION:$WIN (pid $np, fresh from brief.md and the START HERE entry); this window ends now"
+  # "Ending the old window is the verb's last act" — the spec
+  "${TM[@]}" kill-window -t "$HO_OW"; }
+
+# pin — the seat records what its successor may start from (see WHAT THE SEAT STARTS FROM). The caller is checked as
+# handoff's is, so only the seat in window perms pins; a planning seat, a worker or a member is refused.
+pin(){
+  local who pd cl old
+  lock "a relaunch, hand-off or pin is already running; nothing pinned"
+  who=$(seat_caller) || die "refused — $who. Only the permission seat pins what a new seat starts from. Nothing pinned."
+  pd="$H/.cc/state/${who% *}/perms"
+  cl=$(launch_target) || die "refused — $cl. Nothing pinned."
+  old=$(cat "$pd/pins" 2>/dev/null)
+  pin_now "$cl" "$pd" > "$pd/pins.$$" && mv -f -- "$pd/pins.$$" "$pd/pins" || { rm -f -- "$pd/pins.$$"; die "could not write $pd/pins; nothing pinned"; }
+  echo "cc-perms: pinned what a new seat starts from, in $pd/pins"
+  awk 'NR == FNR {o[$1] = $2; next} o[$1] != $2 {print "  now pinned: " $1; n++} END {if (!n) print "  nothing had changed"}' \
+    <(printf '%s\n' "$old") "$pd/pins"; }
+
+selfcheck(){
+  local T pass=0 fail=0 pids="" out rc
+  # the trap kills only a pid whose argv names a file under $T, so a wrong pid in $pids can never reach a real process
+  T=$(mktemp -d); trap 'for p in $pids; do tr "\0" "\n" 2>/dev/null < "/proc/$p/cmdline" | grep -q "^$T/" && kill "$p" 2>/dev/null; done; rm -rf "$T"' RETURN
+  ok(){ if [ "$1" = 0 ]; then pass=$((pass+1)); echo "  ok   $2"; else fail=$((fail+1)); echo "  FAIL $2"; printf "%s\n" "$out" | head -3; fi; }
+  # fx NAME — a fresh fixture: a HOME with a seat for repo r1, a second repo r2 without one, a member workspace, a
+  # track, a fake tmux whose panes come from $F/panes and whose new-window runs its command, and stand-ins for
+  # claude (a sleeping script named claude) and a cc-model and a model override that both say evil-model, so a launch
+  # that asked either would show it
+  fx(){ F=$T/$1; H=$F/home; mkdir -p "$H/dev/r1" "$H/dev/r2" "$H/dev/m1/.cc" "$H/.cc/worktrees/r1/t1/.cc" \
+      "$H/.cc/state/r1/perms" "$H/.local/bin" "$H/.local/share/claude/versions" "$H/bin" "$H/fixture-bin" "$F/fbin"
+    : > "$H/dev/m1/.cc/member-workspace"; printf 'r1\nt1\n' > "$H/.cc/worktrees/r1/t1/.cc/track"
+    printf 'brief\n' > "$H/.cc/state/r1/perms/brief.md"; : > "$F/panes"
+    # the claude stand-in listens on its message socket like the real one, unless $F/nosock says it never comes up.
+    # It lives in versions/ behind ~/.local/bin/claude, as the real one does, and writes down its argv and environment.
+    { printf '#!/bin/bash\nF=%q; S=%q\n' "$F" "$H/cc-socks"; cat <<'EOF'
+printf "%s\n" "$@" > "$F/args.$$"; env > "$F/env.$$"
+[ -e "$F/nosock" ] || python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(); time.sleep(30)' "$S/$$.sock" </dev/null >/dev/null 2>&1 &
+exec 0<&- 1>&- 2>&-
+sleep 30
+EOF
+    } > "$H/.local/share/claude/versions/9.9.9"; ln -s "$H/.local/share/claude/versions/9.9.9" "$H/.local/bin/claude"
+    chmod +x "$H/.local/share/claude/versions/9.9.9"; mkdir -p "$H/cc-socks"
+    # ~/bin holds links into ~/dev, as the real one does; the launch refuses one that resolves anywhere else
+    printf '#!/bin/sh\necho evil-model\n' > "$H/dev/r2/cc-model"; ln -s "$H/dev/r2/cc-model" "$H/bin/cc-model"; echo evil-model > "$H/.cc/state/model-override"
+    # $F/panes holds "<window name> <pane pid>" lines; a window's id is @<pane pid>. Commands chain with `;` as in tmux.
+    # It is called as `-S SOCKET CMD…`: a call naming any socket but $H/tmux.sock, or with TMUX or TMUX_TMPDIR in its
+    # environment, is written down in $F/tmux.leak, since the real tmux would follow them to the real server
+    { printf '#!/bin/bash\nF=%q; H=%q\n' "$F" "$H"; cat <<'EOF'
+S=""; [ "${1:-}" = -S ] && { S=$2; shift 2; }
+[ "$S" = "$H/tmux.sock" ] && [ -z "${TMUX+x}${TMUX_TMPDIR+x}" ] || echo "S=$S TMUX=${TMUX-} TMUX_TMPDIR=${TMUX_TMPDIR-} $*" >> "$F/tmux.leak"
+echo "$*" >> "$F/tmux.log"; P=$F/panes
+one(){ local c=$1 f="" n="" d="" pr="" t wn pp o; shift
+  case "$c" in
+    list-panes|list-windows) while [ $# -gt 0 ]; do [ "$1" = -F ] && { f=$2; shift; }; shift; done
+      while read -r wn pp; do [ -n "$wn" ] || continue
+        o=${f:-'#{window_name}'}; o=${o//'#{window_name}'/$wn}; o=${o//'#{pane_pid}'/$pp}; o=${o//'#{window_id}'/@$pp}
+        printf '%s\n' "$o"; done < "$P";;
+    # the launch is an argument list after `--`, run as it stands; a shell string (one word) is refused, as the
+    # launch must never be one
+    new-window) while [ $# -gt 0 ]; do case "$1" in -c) d=$2; shift 2;; -n) n=$2; shift 2;; -d) shift;; -P) pr=1; shift;; --) shift; break;; -*) shift 2;; *) break;; esac; done
+      [ $# -gt 1 ] || { echo "fake tmux: new-window got a shell string, not an argument list" >&2; return 1; }
+      rm -f "$F/pane.pid"
+      (cd "$d" && setsid -f bash -c 'echo $$ > "$0"; exec "$@"' "$F/pane.pid" "$@" </dev/null >/dev/null 2>&1)
+      for _ in $(seq 50); do [ -s "$F/pane.pid" ] && break; sleep 0.1; done; pp=$(cat "$F/pane.pid")
+      echo "${n:-x} $pp" >> "$P"; [ -z "$pr" ] || echo "@$pp $pp";;
+    rename-window) t=${2#@}; grep -q " $t\$" "$P" || return 1
+      # $F/norename: the first move onto the name perms fails, as a tmux that went away between the two moves would
+      [ "$3" = perms ] && [ -e "$F/norename" ] && { rm -f "$F/norename"; return 1; }
+      awk -v t="$t" -v n="$3" '$2 == t {$1 = n} 1' "$P" > "$P.tmp" && mv "$P.tmp" "$P";;
+    kill-window) t=${2#@}; grep -q " $t\$" "$P" || return 1
+      awk -v t="$t" '$2 != t' "$P" > "$P.tmp" && mv "$P.tmp" "$P"
+      # only a stand-in of this selfcheck is ever signalled: its argv names a file under the selfcheck's own dir
+      tr '\0' '\n' < "/proc/$t/cmdline" 2>/dev/null | grep -q "^${F%/*}/" && kill "$t" 2>/dev/null; return 0;;
+  esac; }
+# $F/sigafter names commands, one a line: once a call starting with the first is done, the hand-off running it gets a
+# TERM, as Bash's timeout would send, and the next line waits its turn. The topmost cc-perms handoff above is the
+# script itself; any below it are its subshells.
+post(){ [ "$(head -1 "$F/sigafter" 2>/dev/null)" = "$1" ] || return 0; sed -i 1d "$F/sigafter"; [ -s "$F/sigafter" ] || rm -f "$F/sigafter"
+  local q=$PPID top="" n=0
+  while [ -n "$q" ] && [ "$q" -gt 1 ] && [ "$n" -lt 8 ]; do
+    # argv itself, never a substring of the whole line: a session whose prompt names "cc-perms handoff" is an ancestor
+    # too, and matching its text TERMed the worker running this selfcheck (2026-10-13, #940 repair, rc 143 twice)
+    tr '\0' '\n' < "/proc/$q/cmdline" 2>/dev/null | awk 'p ~ /(^|\/)cc-perms$/ && $0 == "handoff" {f=1} {p=$0} END {exit !f}' && top=$q
+    q=$(awk '{print $4}' "/proc/$q/stat" 2>/dev/null); n=$((n+1)); done
+  [ -n "$top" ] && kill -TERM "$top"; }
+first=$1; a=(); for x in "$@"; do if [ "$x" = ";" ]; then one "${a[@]}" || exit 1; a=(); else a+=("$x"); fi; done
+[ ${#a[@]} = 0 ] || one "${a[@]}" || exit 1
+post "$first"
+EOF
+    } > "$H/fixture-bin/tmux"
+    # cc-notify writes down each call, so no fixture ever reaches the real one (relaunch alerts the owner on the pins)
+    printf '#!/bin/sh\n{ printf "%%s\\n" "$@"; echo ---; } >> %q\n' "$F/notify.log" > "$H/fixture-bin/cc-notify"
+    chmod +x "$H/.local/bin/claude" "$H/bin/cc-model" "$H/fixture-bin/tmux" "$H/fixture-bin/cc-notify"
+    HOME=$H "$0" __pins "$(sd)" > "$H/.cc/state/r1/perms/pins"; }   # what the seat would pin in this fixture as it stands
+  # stand DIR [VAR=VAL…] — a stand-in session: a claude standing in DIR with exactly that environment; prints its pid
+  # (SBIN=PATH stands in with that program instead, e.g. a copy of bash named claude, running the stand-in)
+  # (SARG=ARG adds one argument, e.g. the skip flag the permission seat runs with)
+  stand(){ local d=$1 b=${SBIN:-$T/claude}; shift; (cd "$d" && env -i "$@" setsid -f "$b" "$T/claude" ${SARG:+"$SARG"} </dev/null >/dev/null 2>&1)
+    local f p; for _ in $(seq 40); do for f in /proc/[0-9]*/comm; do p=${f#/proc/}; p=${p%/comm}
+      [ "$(cat "$f" 2>/dev/null)" = claude ] && [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$d" ] \
+        && tr '\0' '\n' 2>/dev/null < "/proc/$p/cmdline" | grep -qxF "$b" && { echo "$p"; return; }
+      done; sleep 0.1; done; }
+  printf '#!/bin/bash\nexec 0<&- 1>&- 2>&-\nsleep 30\n' > "$T/claude"; chmod +x "$T/claude"
+  # run PID — the verb ($V, default relaunch) from the stand-in session PID. Workers count as sandboxed unless $SBX
+  # says otherwise (SBX=unset: neither the environment nor the outer CC_CONFIG gives it, so only $H/.cc/config can),
+  # and the box's own repo is r2, where the fixture's ~/bin links point
+  mkdir -p "$T/mk"; : > "$T/mk/good"; chmod 644 "$T/mk/good"   # the fixture's marker, owned by whoever runs this
+  CC_PERMS_MARKER_UID=$(id -u); CC_PERMS_MARKER_GID=$(id -g); CC_PERMS_MARKER=$T/mk/good; export CC_PERMS_MARKER CC_PERMS_MARKER_UID CC_PERMS_MARKER_GID
+  CC_PERMS_FIXTURE=1; export CC_PERMS_FIXTURE   # every call below is a fixture; nothing outside this function sets it
+  # (TO=SECS runs the call under timeout, so a hang fails its case rather than the suite)
+  run(){ local s=(CC_WORKER_SANDBOX="${SBX-1}") to=(); [ "${SBX-}" = unset ] && s=(-u CC_WORKER_SANDBOX); [ -n "${TO:-}" ] && to=(timeout "$TO")
+    [ "${SBX-}" = unset ] || { mkdir -p "$H/.cc"; { grep -v '^CC_WORKER_SANDBOX=' "$H/.cc/config" 2>/dev/null; echo "CC_WORKER_SANDBOX=${SBX-1}"; } > "$H/.cc/config.n"; mv "$H/.cc/config.n" "$H/.cc/config"; }
+    "${to[@]}" env -u CC_CONFIG "${s[@]}" HOME="$H" PATH="$F/fbin:$PATH" CC_BOX=r2 CC_PERMS_ROOT_PID="$1" "$0" "${V:-relaunch}" 2>&1; }
+  sd(){ printf '%s' "$H/.cc/state/r1/perms"; }   # r1's seat directory in the current fixture
+  started(){ grep -q '^new-window' "$F/tmux.log" 2>/dev/null; }
+  seatargs(){ local p; p=$(HOME=$H "$0" __live "$H/.cc/state/r1/perms") || return 1; pids="$pids $p"
+    for _ in $(seq 40); do [ -s "$F/args.$p" ] && break; sleep 0.1; done; cat "$F/args.$p"; }
+
+  echo "cc-perms selfcheck"
+  fx worker; c=$(stand "$H/.cc/worktrees/r1/t1" CC_ROLE=worker); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  out=$(run "$c"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started && [[ $out == *refused* ]]; echo $?)" "a worker's session is refused and opens nothing"
+  fx member; c=$(stand "$H/dev/m1" CC_ROLE=member); pids="$pids $c"; echo "m1 $c" > "$F/panes"
+  out=$(run "$c"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started; echo $?)" "a member workspace's session is refused and opens nothing"
+  fx other; c=$(stand "$H/dev/r2"); pids="$pids $c"; echo "r2 $c" > "$F/panes"
+  out=$(run "$c"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started && [[ $out == *"no permission seat"* ]]; echo $?)" "another repo's planning seat is refused and opens nothing"
+  fx role; c=$(stand "$H/dev/r1" CC_ROLE=worker); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  out=$(run "$c"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started; echo $?)" "a session in r1 running as a worker is refused"
+  fx detached; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r2 $c" > "$F/panes"
+  out=$(run "$c"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started && [[ $out == *"not in tmux window"* ]]; echo $?)" "a session in r1 outside window r1 is refused"
+  fx nested; o=$(stand "$H/dev/r2"); pids="$pids $o"
+  # a child claude in r1 under another claude: the parent is the outer stand-in, so the walk meets a second claude
+  # (its trailing exit 0 keeps bash from exec'ing the child in its own place, which would leave no parent to meet)
+  printf '#!/bin/bash\ncd %q && "%s"\nexit 0\n' "$H/dev/r1" "$T/claude" > "$T/outer-claude"; chmod +x "$T/outer-claude"
+  mkdir -p "$T/o"; cp "$T/outer-claude" "$T/o/claude"; (cd "$H/dev/r2" && env -i setsid -f "$T/o/claude" </dev/null >/dev/null 2>&1)
+  c=""; for _ in $(seq 40); do c=$(for f in /proc/[0-9]*/comm; do p=${f#/proc/}; p=${p%/comm}
+      [ "$(cat "$f" 2>/dev/null)" = claude ] && [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$H/dev/r1" ] \
+        && [ "$(tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | sed -n 2p)" = "$T/claude" ] && echo "$p"; done | head -1)
+    [ -n "$c" ] && break; sleep 0.1; done
+  # the inner stand-in only (its argv is $T/claude; the outer's is $T/o/claude): picking the outer made ppid_of its
+  # parent, the user's systemd that setsid reparents to, and the RETURN trap SIGTERMed it (2026-10-02, every session down)
+  op=$(ppid_of "${c:-0}"); tr '\0' '\n' < "/proc/${op:-0}/cmdline" 2>/dev/null | grep -qxF "$T/o/claude" || op=""
+  pids="$pids $c $op"; echo "r1 $c" > "$F/panes"
+  out=$(run "${c:-0}"); rc=$?
+  ok "$( [ -n "$c" ] && [ $rc = 1 ] && ! started && [[ $out == *"another session"* ]]; echo $?)" "a claude started by another session in r1 is refused"
+  fx forged; mkdir -p "$T/x"; cp "$(readlink -f /bin/bash)" "$T/x/claude"; c=$(SBIN=$T/x/claude stand "$H/dev/r1")
+  pids="$pids $c"; echo "r1 $c" > "$F/panes"; out=$(run "${c:-0}"); rc=$?
+  ok "$( [ -n "$c" ] && [ $rc = 1 ] && ! started && [[ $out == *"not the claude binary"* ]]; echo $?)" "a copy of another program named claude is refused"
+  fx window; c=$(stand "$H/dev/r1"); pids="$pids $c"; printf 'r1 %s\nperms 1\n' "$c" > "$F/panes"
+  out=$(run "$c"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started; echo $?)" "an open perms window with no seat in it is left alone"
+  # ── no launch while workers run unsandboxed: CC_WORKER_SANDBOX unset or not 1 refuses first, and ~/.cc/config can set it ──
+  fx sandbox; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  out=$(SBX='unset' run "$c"); r1=$?; s1=$(started && echo y); o1=$out
+  out=$(SBX=0 run "$c"); r2=$?; s2=$(started && echo y); o2=$out; t2=$( [ -e "$F/tmux.log" ] && echo y)   # no tmux call yet: refused first
+  echo 'CC_WORKER_SANDBOX=1' > "$H/.cc/config"; out=$(SBX='unset' run "$c"); r3=$?
+  ok "$( [ "$r1$r2$r3" = 110 ] && [ -z "$s1$s2$t2" ] && [[ $o1 == *"workers run unsandboxed"* ]] && [[ $o2 == *"workers run unsandboxed"* ]] \
+      && started && [[ $out == *"back in"* ]]; echo $?)" \
+    "relaunch: refused before anything else while CC_WORKER_SANDBOX is unset or 0, and goes ahead once ~/.cc/config sets it to 1 ($r1$r2$r3)"
+  # the gate reads only the real ~/.cc/config: neither the environment nor a CC_CONFIG file can open it
+  fx envgate; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; printf 'CC_WORKER_SANDBOX=1\n' > "$F/other.config"
+  out=$(env CC_WORKER_SANDBOX=1 HOME="$H" PATH="$F/fbin:$PATH" CC_BOX=r2 CC_PERMS_ROOT_PID="$c" "$0" relaunch 2>&1); r1=$?
+  out2=$(env -u CC_WORKER_SANDBOX CC_CONFIG="$F/other.config" HOME="$H" PATH="$F/fbin:$PATH" CC_BOX=r2 CC_PERMS_ROOT_PID="$c" "$0" relaunch 2>&1); r2=$?
+  ok "$( [ "$r1$r2" = 11 ] && ! started && [[ $out == *"workers run unsandboxed"* ]] && [[ $out2 == *"workers run unsandboxed"* ]] \
+      && [ -f "$F/other.config" ] && [ "$(CC_CONFIG="$F/other.config" "$HERE/cc-config" get CC_WORKER_SANDBOX)" = 1 ]; echo $?)" \
+    "relaunch: CC_WORKER_SANDBOX=1 in the environment, or in a CC_CONFIG file, does not open the gate while ~/.cc/config is unset ($r1$r2)"
+  echo 'CC_WORKER_SANDBOX=1' > "$H/.cc/config"; out=$(env -u CC_WORKER_SANDBOX HOME="$H" PATH="$F/fbin:$PATH" CC_BOX=r2 CC_PERMS_ROOT_PID="$c" "$0" relaunch 2>&1); r3=$?
+  ok "$( [ $r3 = 0 ] && started; echo $?)" "relaunch: ~/.cc/config set to 1 opens the gate with no environment key ($r3)"
+  # the owner's marker: key=1 is not enough
+  gt(){ env -u CC_WORKER_SANDBOX HOME="$H" PATH="$F/fbin:$PATH" CC_BOX=r2 CC_PERMS_ROOT_PID="$c" "$@" 2>&1; }
+  fx marker; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; echo 'CC_WORKER_SANDBOX=1' > "$H/.cc/config"
+  out=$(CC_PERMS_MARKER=$T/mk/none gt "$0" relaunch); r1=$?; s1=$(started && echo y)
+  out2=$(CC_PERMS_MARKER_UID=0 gt "$0" relaunch); r2=$?   # the marker is ours, not root's
+  ln -s "$T/mk/good" "$T/mk/link"; out3=$(CC_PERMS_MARKER=$T/mk/link gt "$0" relaunch); r3=$?
+  : > "$T/mk/gw"; chmod 664 "$T/mk/gw"; out4=$(CC_PERMS_MARKER=$T/mk/gw gt "$0" relaunch); r4=$?
+  g1=$(CC_PERMS_MARKER=$T/mk/none gt "$0" gate); g2=$?
+  ok "$( [ "$r1$r2$r3$r4$g2" = 11111 ] && [ -z "$s1" ] && ! started && [[ $out == *perms-handoff-live* || $out == *"$T/mk/none"* ]] \
+      && [[ $out2 == *"not owned by root"* ]] && [[ $out3 == *"not a regular file"* ]] && [[ $out4 == *"writable by group"* ]] && [[ $g1 == shut:* ]]; echo $?)" \
+    "relaunch: with the key at 1 it is still refused with no marker, a marker not owned by root, a symlink, or a group-writable one; gate says shut ($r1$r2$r3$r4$g2)"
+  out=$(gt "$0" gate); g3=$?; out2=$(gt "$0" relaunch); r5=$?
+  ok "$( [ "$g3$r5" = 00 ] && [ "$out" = open ] && started; echo $?)" "relaunch: the key at 1 and a good marker pass the gate, and gate says open ($g3$r5)"
+  # outside the selfcheck (no CC_PERMS_FIXTURE), a getent on PATH that names this fixture as the account's home, with
+  # HOME there and every override set, changes nothing: gate answers exactly as it does from the passwd home ($AH)
+  fx realmode; mkdir -p "$H/.cc"; echo 'CC_WORKER_SANDBOX=1' > "$H/.cc/config"
+  printf '#!/bin/sh
+echo "x:x:%s:%s::%s:/bin/bash"
+' "$(id -u)" "$(id -g)" "$H" > "$F/fbin/getent"; chmod +x "$F/fbin/getent"
+  g1=$(env -u CC_PERMS_FIXTURE HOME="$H" PATH="$F/fbin:$PATH" CC_PERMS_MARKER="$T/mk/none" "$0" gate 2>&1)
+  g2=$(env -u CC_PERMS_FIXTURE HOME="$H" PATH="$F/fbin:$PATH" "$0" gate 2>&1)
+  g0=$(env -u CC_PERMS_FIXTURE -u CC_PERMS_MARKER -u CC_PERMS_MARKER_UID -u CC_PERMS_MARKER_GID HOME="$AH" "$0" gate 2>&1)
+  gf=$(CC_PERMS_MARKER="$T/mk/none" gt "$0" gate)   # the control: the same call as a fixture names the fixture's marker
+  ok "$( [ -n "$g0" ] && [ "$g1" = "$g0" ] && [ "$g2" = "$g0" ] && [[ $g1 != *"$T"* ]] && [[ $gf == *"$T/mk/none"* ]] && echo 0 || echo 1)" \
+    "outside the selfcheck, a fake getent on PATH, HOME elsewhere and the CC_PERMS_* overrides are ignored: gate reads the passwd home ($g1)"
+
+  fx fresh; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  out=$(CC_MODEL_PRIMARY=evil-model run "$c"); rc=$?; a=$(seatargs)
+  ok "$( [ $rc = 0 ] && started && grep -qxF -- --fixture-no-bypass <<<"$a" && ! grep -qx -- '--dangerously-skip-permissions' <<<"$a" \
+      && grep -qxF "$PROMPT" <<<"$a" && ! grep -qx -- --resume <<<"$a" && grep -qx -- --session-id <<<"$a" \
+      && grep -qxF "$(cat "$H/.cc/state/r1/perms/session-id")" <<<"$a" && grep -qxF 'claude-opus-5-5[1m]' <<<"$a" \
+      && ! grep -q evil <<<"$a" && [[ $out == *"fresh from brief.md"* ]]; echo $?)" \
+    "r1's planning seat brings the seat back from brief.md, on the pinned model and not cc-model's, an override's or the env's (a fixture never skips permissions)"
+  : > "$F/tmux.log"; out=$(run "$c"); rc=$?
+  ok "$( [ $rc = 0 ] && ! started && [[ $out == *"already live"* ]]; echo $?)" "a second call while the seat is live does nothing"
+
+  fx resume; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  # the recorded conversation, and a newer one planted beside it, as any unsandboxed shell could write
+  t="$H/.claude/projects/$(sed 's/[^A-Za-z0-9]/-/g' <<<"$(sd)")"; mkdir -p "$t"
+  u=0f0f0f0f-1111-4222-8333-444455556666; echo "$u" > "$(sd)/session-id"; echo '{}' > "$t/$u.jsonl"
+  sleep 1; echo '{}' > "$t/ffffffff-0000-4000-8000-000000000000.jsonl"
+  out=$(run "$c"); rc=$?; a=$(seatargs)
+  ok "$( [ $rc = 0 ] && ! grep -qx -- --resume <<<"$a" && ! grep -qx -- --continue <<<"$a" && ! grep -qxF "$u" <<<"$a" \
+      && ! grep -q ffffffff <<<"$a" && grep -qx -- --session-id <<<"$a" && grep -qxF "$(cat "$(sd)/session-id")" <<<"$a" \
+      && ! grep -qxF "$u" "$(sd)/session-id" && grep -qxF "$PROMPT" <<<"$a" && [[ $out == *"starting fresh"* ]]; echo $?)" \
+    "relaunch never resumes: with a recorded transcript, and a newer one planted beside it, the seat starts fresh from brief.md and its journal under a new id"
+  fx planted; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  t="$H/.claude/projects/$(sed 's/[^A-Za-z0-9]/-/g' <<<"$H/.cc/state/r1/perms")"; mkdir -p "$t"; echo '{}' > "$t/ffffffff-0000-4000-8000-000000000000.jsonl"
+  out=$(run "$c"); rc=$?; a=$(seatargs)
+  ok "$( [ $rc = 0 ] && ! grep -q ffffffff <<<"$a" && ! grep -qx -- --resume <<<"$a" && grep -qxF "$PROMPT" <<<"$a"; echo $?)" \
+    "with no recorded id a transcript someone left there is ignored and the seat starts from brief.md"
+
+  # ── nothing above the seat steers it, and the launch is the program in versions/, under env -i, as an argument list ──
+  fx above; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; rs=""; ss=""
+  for f in .cc/state/r1/CLAUDE.md .cc/state/CLAUDE.local.md .cc/.claude/ CLAUDE.md CLAUDE.local.md r2link; do
+    case "$f" in */) mkdir -p "$H/$f";; r2link) ln -s "$H/dev/r2/CLAUDE.md" "$H/CLAUDE.md";; *) echo planted > "$H/$f";; esac
+    out=$(run "$c"); rs+="$?"; started && ss+=y; [[ $out == *"sits above"* ]] || ss+=n
+    case "$f" in */) rmdir "$H/$f";; r2link) rm -f "$H/CLAUDE.md";; *) rm -f "${H:?}/$f";; esac; done
+  ok "$( [ "$rs" = 111111 ] && [ -z "$ss" ] && [ ! -e "$(sd)/session-id" ] && echo 0 || echo 1)" \
+    "a CLAUDE.md, CLAUDE.local.md or .claude/ above the seat (its repo's state, ~/.cc/state, ~/.cc, home), or a ~/CLAUDE.md that is a file or a link into another repo, refuses the launch ($rs$ss)"
+  fx homelink; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  echo rules > "$H/dev/r1/CLAUDE.md"; ln -s "$H/dev/r1/CLAUDE.md" "$H/CLAUDE.md"; mkdir -p "$H/.claude"
+  echo '{"mcpServers":{"planted":{"command":"/bin/false"}}}' > "$H/.claude.json"   # the account's MCP list: never read
+  HOME=$H "$0" __pins "$(sd)" > "$(sd)/pins"   # even pinned, so the launch goes ahead
+  out=$(PLANTED=1 run "$c"); rc=$?; p=$(HOME=$H "$0" __live "$(sd)"); pids="$pids $p"
+  for _ in $(seq 40); do [ -s "$F/env.$p" ] && [ -s "$F/args.$p" ] && break; sleep 0.1; done
+  e=$(cat "$F/env.${p:-x}" 2>/dev/null); a=$(cat "$F/args.${p:-x}" 2>/dev/null)
+  ok "$( [ $rc = 0 ] && [ -n "$p" ] && grep -q '^new-window .* -c [^ ]*/perms -- /bin/sh -c ' "$F/tmux.log" \
+      && [ "$(readlink "$(sd)/launch/claude")" = "$H/.local/share/claude/versions/9.9.9" ] \
+      && grep -qxF "HOME=$H" <<<"$e" && grep -qx 'LANG=C.UTF-8' <<<"$e" && grep -qx 'TERM=tmux-256color' <<<"$e" \
+      && grep -qxF "PATH=$H/bin:/usr/local/bin:/usr/bin:/bin" <<<"$e" && grep -qxF "PYTHONPYCACHEPREFIX=$(sd)/launch/pycache" <<<"$e" \
+      && ! grep -qE '^(PLANTED|CC_PERMS_ROOT_PID)=' <<<"$e"; echo $?)" \
+    "a CLAUDE.md in home that links into the repo, and .claude in home, are allowed, and the seat starts from its argument list under env -i (PATH ~/bin and the system's, no ~/.local/bin), through the program in versions/"
+  ok "$( [ "$(sed -n 1p <<<"$a")" = --strict-mcp-config ] && [ "$(sed -n 2p <<<"$a")" = --mcp-config ] && [ "$(sed -n 3p <<<"$a")" = "$(sd)/launch/mcp.json" ] \
+      && [ "$(jq -c '.mcpServers | to_entries | map([.key, .value.command, .value.args])' "$(sd)/launch/mcp.json")" \
+           = "$(jq -nc --arg c "$(dirname -- "$(readlink -f -- "$0")")/cc-slack" '[["cc-slack", $c, ["channel"]]]')" ] \
+      && ! grep -q planted <<<"$a"; echo $?)" \
+    "the seat loads only the MCP servers in its own launch/mcp.json (cc-slack beside this script), never the account's"
+
+  # ── the pins: ~/.claude's startup entries and the binary must be what the seat pinned, and ~/bin only links into ~/dev ──
+  fx pins; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; rs=""; ss=""; C=$H/.claude; V9=$H/.local/share/claude/versions/9.9.9
+  cp "$(sd)/pins" "$F/pins.good"; cp "$V9" "$F/v9.good"
+  for f in nopins CLAUDE.md rules agents skills commands output-styles plugins settings.json settings.local.json .json binary; do
+    case "$f" in
+      nopins) rm -f "$(sd)/pins";;
+      CLAUDE.md) mkdir -p "$C"; echo planted > "$C/CLAUDE.md";;
+      settings.json|settings.local.json) mkdir -p "$C"; echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/tmp/x"}]}]}}' > "$C/$f";;
+      .json) echo '{"mcpServers":{"x":{"command":"/tmp/x"}}}' > "$C.json";;
+      binary) echo '# a new build' >> "$V9";;
+      plugins) mkdir -p "$C/plugins/cache/m/p"; echo planted > "$C/plugins/cache/m/p/hook.sh";;
+      *) mkdir -p "$C/$f/x"; echo planted > "$C/$f/x/SKILL.md";;
+    esac
+    out=$(run "$c"); rs+="$?"; started && ss+=y
+    case "$f" in nopins) [[ $out == *"pinned nothing"* ]] || ss+=n;; binary) [[ $out == *"$V9 is not what the seat pinned"* ]] || ss+=n;;
+      .json) [[ $out == *"$C.json is not what the seat pinned"* ]] || ss+=n;;
+      *) [[ $out == *"$C/$f is not what the seat pinned"* ]] || ss+=n;; esac
+    rm -rf "${C:?}" "$C.json"; cp "$F/pins.good" "$(sd)/pins"; cp "$F/v9.good" "$V9"; done
+  ok "$( [ "$rs" = 111111111111 ] && [ -z "$ss" ] && [ ! -e "$(sd)/session-id" ] && echo 0 || echo 1)" \
+    "no pins, or a changed ~/.claude/CLAUDE.md, rules/, agents/, skills/, commands/, output-styles/, plugins/, settings.json, settings.local.json, ~/.claude.json or claude binary, refuses the launch and names it ($rs$ss)"
+  # ── the owner's alert: a relaunch refused on the pins says so to him once per set of entries, with the hand command ──
+  fx alert; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; C=$H/.claude
+  mkdir -p "$C/skills/x"; echo planted > "$C/skills/x/SKILL.md"
+  out=$(run "$c"); r1=$?; out=$(run "$c"); r2=$?; n1=$(grep -c '^---$' "$F/notify.log" 2>/dev/null); a1=$(cat "$F/notify.log" 2>/dev/null)
+  echo planted > "$C/CLAUDE.md"; out=$(run "$c"); r3=$?; n2=$(grep -c '^---$' "$F/notify.log" 2>/dev/null); s3=$(started && echo y)
+  rm -rf "${C:?}"; out=$(run "$c"); r4=$?
+  ok "$( [ "$r1$r2$r3$r4" = 1110 ] && [ "$n1" = 1 ] && [ "$n2" = 2 ] && [ -z "$s3" ] && grep -qxF -- --owner <<<"$a1" \
+      && grep -qF "changed since it last pinned them: $C/skills." <<<"$a1" \
+      && grep -qF "tmux new-window -t main -n perms -c ~/.cc/state/r1/perms -- ~/.local/bin/claude --model '$MODEL'" <<<"$a1" \
+      && grep -qF -- '--dangerously-skip-permissions' <<<"$a1" && [[ $(tail -n +2 "$F/notify.log") == *"since it last pinned them: $C/CLAUDE.md, $C/skills."* ]] \
+      && [ ! -e "$(sd)/pins-alerted" ] && started && echo 0 || echo 1)" \
+    "relaunch refused on the pins alerts the owner once with the entries and the command that starts the seat by hand; a retry with the same set posts nothing, a new set posts again, and a launch past the pins clears it ($r1$r2$r3$r4 $n1 $n2)"
+  # ── pins-diff: every entry that differs, one a line, and it writes nothing ──
+  fx pdiff; C=$H/.claude; V9=$H/.local/share/claude/versions/9.9.9
+  snap(){ find "$F" -printf '%p %T@ %s %m %l\n' | LC_ALL=C sort | sha256sum; }
+  out=$(HOME=$H "$0" pins-diff r1); r0=$?; o0=$out
+  mkdir -p "$C/rules"; echo r > "$C/rules/a.md"; echo '# a new build' >> "$V9"
+  s0=$(snap); out=$(HOME=$H "$0" pins-diff r1); r1=$?; o1=$out; s1=$(snap)
+  out=$(HOME=$H "$0" pins-diff r2 2>&1); r2=$?; o2=$out
+  mv "$(sd)/pins" "$F/pins.keep"; out=$(HOME=$H "$0" pins-diff r1); r3=$?; o3=$out; mv "$F/pins.keep" "$(sd)/pins"
+  ln -sfn "$H/bin/cc-model" "$H/.local/bin/claude"; out=$(HOME=$H "$0" pins-diff r1); r4=$?; o4=$out
+  ok "$( [ "$r0$r1$r2$r3$r4" = 01211 ] && [ -z "$o0" ] && [ "$o1" = "$C/rules"$'\n'"$V9" ] && [ "$s0" = "$s1" ] && [[ $o2 == *"no permission seat"* ]] \
+      && [ "$o3" = "nothing pinned yet" ] && [ "$o4" = "$H/.local/bin/claude" ] && echo 0 || echo 1)" \
+    "pins-diff names every entry that differs (rc 1), nothing as pinned (rc 0), and writes nothing; no seat is rc 2, no pins and a claude outside versions/ are named ($r0$r1$r2$r3$r4)"
+  fx pinkeep; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; C=$H/.claude
+  mkdir -p "$C/skills/s/.git" "$C/skills/s/__pycache__" "$C/skills/synced/u" "$C/plugins/marketplaces/m" "$C/plugins/synced/u" "$C/plugins/store" "$H/dev/r2/sk"
+  echo a > "$C/skills/s/SKILL.md"; echo l > "$H/dev/r2/sk/SKILL.md"; ln -s "$H/dev/r2/sk" "$C/skills/linked"
+  printf '{"lastUpdated":1,"skills":[]}\n' > "$C/skills/synced/u/manifest.json"; echo r1 > "$C/skills/synced/u/.last-complete-round"
+  echo '{"m":{"lastUpdated":"a"}}' > "$C/plugins/known_marketplaces.json"; echo '{"permissions":{"allow":[]},"hooks":{}}' > "$C/settings.json"
+  HOME=$H "$0" __pins "$(sd)" > "$(sd)/pins"
+  echo l2 >> "$H/dev/r2/sk/SKILL.md"; out=$(run "$c"); r1=$?; s1=$(started && echo y); o1=$out; echo l > "$H/dev/r2/sk/SKILL.md"
+  echo x > "$C/skills/s/.git/FETCH_HEAD"; echo x > "$C/skills/s/__pycache__/m.pyc"; echo r2 > "$C/skills/synced/u/.last-complete-round"
+  printf '{"lastUpdated":2,"skills":[]}\n' > "$C/skills/synced/u/manifest.json"; echo '{"m":{"lastUpdated":"b"}}' > "$C/plugins/known_marketplaces.json"
+  echo '{"permissions":{"allow":["Bash(x)"]},"autoMode":{"allow":["y"]},"hooks":{}}' > "$C/settings.json"
+  for f in marketplaces/m/new synced/u/.marketplaces.json store/s.json plugin-directory-cache-v2.json; do echo x > "$C/plugins/$f"; done
+  out=$(run "$c"); rc=$?
+  ok "$( [ "$r1" = 1 ] && [ -z "$s1" ] && [[ $o1 == *"$C/skills is not what"* ]] && [ $rc = 0 ] && started; echo $?)" \
+    "a skill's linked content is pinned, while what the account's sync rewrites (.git, __pycache__, a lastUpdated stamp, the plugin catalogs, the permission rules) leaves the launch alone"
+  fx cjkeep; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  cj(){ jq -n --arg d "$(sd)" --argjson a "$1" --argjson n "$2" --arg o "$3" \
+    '{numStartups: $n, tipsHistory: {t: $n}, mcpServers: {}, projects: ({($d): {allowedTools: $a, lastCost: $n, exampleFiles: [$o]}} + {($o): {}})}' > "$H/.claude.json"; }
+  cj '[]' 1 a; HOME=$H "$0" __pins "$(sd)" > "$(sd)/pins"
+  cj '["Bash"]' 1 a; out=$(run "$c"); r1=$?; s1=$(started && echo y); o1=$out
+  cj '[]' 7 "$H/dev/r2"; out=$(run "$c"); rc=$?
+  ok "$( [ "$r1" = 1 ] && [ -z "$s1" ] && [[ $o1 == *"$H/.claude.json is not what"* ]] && [ $rc = 0 ] && started; echo $?)" \
+    "the account's .claude.json pins the seat's own directory entry, while a counter, a tip, its last-run figures and another directory's entry leave the launch alone"
+  fx memory; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  m="$H/.claude/projects/$(sed 's/[^A-Za-z0-9]/-/g' <<<"$(sd)")/memory"; mkdir -p "$m"; echo '- [a](a.md)' > "$m/MEMORY.md"; echo a > "$m/a.md"
+  HOME=$H "$0" __pins "$(sd)" > "$(sd)/pins"
+  echo 'run this' >> "$m/a.md"; out=$(run "$c"); r1=$?; o1=$out; echo a > "$m/a.md"
+  echo '- [b](b.md)' > "$m/b.md"; out=$(run "$c"); r2=$?; rm -f "$m/b.md"; s1=$(started && echo y); out3=$(run "$c"); rc=$?
+  ok "$( [ "$r1$r2" = 11 ] && [ -z "$s1" ] && [[ $o1 == *"$m is not what the seat pinned"* ]] && [[ $out == *"$m is not what"* ]] \
+      && [ $rc = 0 ] && started && [[ $out3 == *"back in"* ]]; echo $?)" \
+    "an edit to the seat's auto-memory, or a file added there, refuses the launch until the seat pins it; as pinned, it starts"
+  fx toctou; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  printf '#!/bin/sh\nmkdir -p %q && echo planted > %q\n' "$H/.claude/skills/x" "$H/.claude/skills/x/SKILL.md" > "$F/midhook"; chmod +x "$F/midhook"
+  out=$(CC_PERMS_MIDHOOK=$F/midhook run "$c"); r1=$?; s1=$(started && echo y); o1=$out; rm -rf "${H:?}/.claude"
+  out=$(CC_PERMS_MIDHOOK=/bin/true run "$c"); rc=$?
+  ok "$( [ "$r1" = 1 ] && [ -z "$s1" ] && [[ $o1 == *"$H/.claude/skills is not what"*"changed while the launch was being set up"* ]] \
+      && [ $rc = 0 ] && started; echo $?)" \
+    "relaunch: a skill written after the pins passed, while the launch is set up, is caught by the second hash just before the tmux call, and nothing starts"
+  fx binplant; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  printf '#!/bin/sh\n' > "$H/bin/jq"; chmod +x "$H/bin/jq"; out=$(run "$c"); r1=$?; s1=$(started && echo y); o1=$out
+  rm -f "$H/bin/jq"; ln -s "$T/claude" "$H/bin/jq"; out=$(run "$c"); r2=$?; s2=$(started && echo y)
+  ok "$( [ "$r1$r2" = 11 ] && [ -z "$s1$s2" ] && [[ $o1 == *"$H/bin/jq resolves to"* ]] && [[ $out == *"outside $H/dev"* ]] && echo 0 || echo 1)" \
+    "a file in ~/bin, or a link there that resolves outside ~/dev, refuses the launch"
+  fx binmember; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  printf '#!/bin/sh\n' > "$H/dev/m1/cc-x-member"; chmod +x "$H/dev/m1/cc-x-member"; ln -s "$H/dev/m1/cc-x-member" "$H/bin/cc-x-member"
+  out=$(run "$c"); r1=$?; s1=$(started && echo y); o1=$out; rm -f "$H/bin/cc-x-member"; out=$(run "$c"); rc=$?
+  ok "$( [ "$r1" = 1 ] && [ -z "$s1" ] && [[ $o1 == *"$H/bin/cc-x-member resolves to $H/dev/m1/cc-x-member, outside $H/dev/r2"* ]] && [ $rc = 0 ] && started; echo $?)" \
+    "a link in ~/bin into another repo in ~/dev (a member workspace), not the box's own, refuses the launch"
+  fx binshadow; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; HOME=$H "$0" __pins "$(sd)" > "$(sd)/pins"
+  ln -s "$H/dev/r2/cc-model" "$H/bin/jq"; out=$(run "$c"); r1=$?; s1=$(started && echo y); o1=$out; rm -f "$H/bin/jq"
+  ln -s "$H/dev/r2/cc-model" "$H/bin/cc"; ln -s "$H/dev/r2/cc-model" "$H/bin/gh"; out=$(run "$c"); rc=$?
+  ok "$( [ "$r1" = 1 ] && [ -z "$s1" ] && [[ $o1 == *"$H/bin/jq shadows /"*"/jq"* ]] && [ $rc = 0 ] && started; echo $?)" \
+    "a link in ~/bin into ~/dev that shadows a system program (jq) refuses the launch, while cc and gh may"
+  fx badexe; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  ln -sfn "$H/bin/cc-model" "$H/.local/bin/claude"; out=$(run "$c"); r1=$?; s1=$(started && echo y); o1=$out
+  mkdir -p "$H/.local/share/claude/versions/sub"; cp "$H/bin/cc-model" "$H/.local/share/claude/versions/sub/x"
+  ln -sfn "$H/.local/share/claude/versions/sub/x" "$H/.local/bin/claude"; out=$(run "$c"); r2=$?; s2=$(started && echo y)
+  ok "$( [ "$r1$r2" = 11 ] && [ -z "$s1$s2" ] && [[ $o1 == *"does not resolve into"* ]] && [[ $out == *"not directly in it"* ]] && echo 0 || echo 1)" \
+    "a ~/.local/bin/claude that resolves outside versions/, or below it, refuses the launch"
+
+  # ── handoff: the seat stand-in stands in r1's seat directory with the flag a fixture launch carries (never the real one) ──
+  # jn MIN — a HAND-OFF ENTRY heading stamped MIN minutes ago (negative: ahead of the clock), to the minute
+  # into FILE (default: handoff.md in the seat's directory, the one the verb reads)
+  jn(){ printf '## HAND-OFF ENTRY %s (stand-in): START HERE\n' "$(date -u -d "$(( -$1 )) min" +%Y-%m-%dT%H:%MZ)" >> "${2:-$(sd)/handoff.md}"; }
+  echo "cc-perms selfcheck: handoff"
+  fx hnonseat; c=$(stand "$H/dev/r1"); pids="$pids $c"; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"
+  printf 'r1 %s\nperms %s\n' "$c" "$o" > "$F/panes"; jn 0
+  out=$(V=handoff run "$c"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started && [[ $out == *"not the permission seat"* ]]; echo $?)" "handoff: a repo's planning seat is refused and opens nothing"
+  out=$(V=handoff run "$o"); rc=$?   # the same fixture, from the seat: the case that is kept
+  pids="$pids $(cat "$F/pane.pid" 2>/dev/null)"
+  ok "$( [ $rc = 0 ] && started; echo $?)" "handoff: …and the seat itself, in the same fixture, is let through"
+  fx hsandbox; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0
+  out=$(SBX='unset' V=handoff run "$o"); r1=$?; s1=$(started && echo y); o1=$out; a1=$(kill -0 "$o" && echo y)
+  out=$(SBX=0 V=handoff run "$o"); r2=$?; s2=$(started && echo y)
+  out=$(V=handoff run "$o"); r3=$?; pids="$pids $(cat "$F/pane.pid" 2>/dev/null)"
+  ok "$( [ "$r1$r2$r3" = 110 ] && [ -z "$s1$s2" ] && [ "$a1" = y ] && [[ $o1 == *"workers run unsandboxed"* ]] && started; echo $?)" \
+    "handoff: refused while CC_WORKER_SANDBOX is unset or 0, keeping the seat, and goes ahead with it set to 1 ($r1$r2$r3)"
+  fx hnowin; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms 1\n' > "$F/panes"; jn 0
+  out=$(V=handoff run "$o"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started && [[ $out == *"not the one in tmux window"* ]]; echo $?)" "handoff: a flagged claude in the seat's directory but not in window perms is refused"
+  fx hnoflag; o=$(stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0
+  out=$(V=handoff run "$o"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started && [[ $out == *"not run with permissions skipped"* ]]; echo $?)" "handoff: a claude in window perms without the skip flag is refused"
+  fx hforged; mkdir -p "$T/xh"; cp "$(readlink -f /bin/bash)" "$T/xh/claude"; o=$(SBIN=$T/xh/claude SARG=--fixture-no-bypass stand "$(sd)")
+  pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0
+  out=$(V=handoff run "${o:-0}"); rc=$?
+  ok "$( [ -n "$o" ] && [ $rc = 1 ] && ! started && [[ $out == *"not the claude binary"* ]]; echo $?)" "handoff: a copy of bash named claude, in window perms with the flag, is refused"
+  fx hstale; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"
+  out=$(V=handoff run "$o"); r1=$?; s1=$(started && echo y)          # no journal at all
+  jn 16; out=$(V=handoff run "$o"); r2=$?; s2=$(started && echo y)   # the last entry is 16 minutes old
+  jn -2; out=$(V=handoff run "$o"); r3=$?; s3=$(started && echo y)  # …and one stamped ahead of the clock
+  ok "$( [ "$r1$r2$r3" = 111 ] && [ -z "$s1$s2$s3" ] && [[ $out == *"HAND-OFF ENTRY"* ]] && kill -0 "$o"; echo $?)" \
+    "handoff: a missing, 16-minute-old or future journal entry is refused, opens nothing and leaves the seat"
+  fx hdead; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0; : > "$F/nosock"
+  out=$(V=handoff CC_PERMS_UP_SECS=2 run "$o"); rc=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
+  ok "$( [ $rc = 1 ] && started && [ -n "$np" ] && [ "$(cat "$F/panes")" = "perms $o" ] && kill -0 "$o" \
+      && ! kill -0 "$np" 2>/dev/null && [ ! -e "$(sd)/session-id" ] && [[ $out == *"not up"* ]]; echo $?)" \
+    "handoff: a successor that never listens is closed with its window, and the old seat keeps window perms"
+  fx happy; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0
+  out=$(PLANTED=1 CC_MODEL_PRIMARY=evil-model V=handoff run "$o"); rc=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
+  for _ in $(seq 40); do [ -s "$F/args.$np" ] && [ -s "$F/env.$np" ] && break; sleep 0.1; done; a=$(cat "$F/args.$np" 2>/dev/null)
+  e=$(cat "$F/env.$np" 2>/dev/null)
+  ok "$( grep -qxF "HOME=$H" <<<"$e" && grep -qx 'LANG=C.UTF-8' <<<"$e" && ! grep -qE '^(PLANTED|CC_MODEL_PRIMARY|CC_PERMS_ROOT_PID)=' <<<"$e" \
+      && grep -q '^new-window .* -n perms~next -c [^ ]*/perms -- /bin/sh -c ' "$F/tmux.log"; echo $?)" \
+    "handoff: the successor starts from an argument list under env -i, so nothing in the caller's or tmux's environment reaches it"
+  ok "$( [ $rc = 0 ] && [ "$(cat "$F/panes")" = "perms $np" ] && [ "$np" != "$o" ] && ! kill -0 "$o" 2>/dev/null \
+      && grep -q "^rename-window -t @$o perms~old ; rename-window -t @$np perms$" "$F/tmux.log" \
+      && [ "$(tail -1 "$F/tmux.log")" = "kill-window -t @$o" ] && grep -q '^new-window .* -n perms~next ' "$F/tmux.log" \
+      && grep -qxF -- --fixture-no-bypass <<<"$a" && grep -qx -- --session-id <<<"$a" && grep -qxF "$(cat "$(sd)/session-id")" <<<"$a" \
+      && ! grep -qxE -- '--(resume|continue)' <<<"$a" && grep -q 'START HERE' <<<"$a" && grep -qxF 'claude-opus-5-5[1m]' <<<"$a" \
+      && ! grep -q evil <<<"$a" && grep -q 'START HERE" entry in handoff.md in this same directory, and in no other file' <<<"$a" \
+      && ! grep -q 'perms-handoff' <<<"$a"; echo $?)" \
+    "handoff: the fresh seat starts in perms~next on the pinned model, both names move in one call, and ending the old window comes last"
+
+  # ── the successor follows only the fenced journal, and a stopped or half-done hand-off leaves exactly one seat ──
+  fx hbeside; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"
+  jn 0 "$H/.cc/state/r1/perms-handoff.md"   # fresh, but beside the seat, where any unsandboxed worker can append
+  out=$(V=handoff run "$o"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started && [[ $out == *"in this seat's directory"* ]] && kill -0 "$o"; echo $?)" \
+    "handoff: a fresh entry in the journal beside the seat (not in its own directory) does not count, and nothing starts"
+  fx hrename; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0; : > "$F/norename"
+  out=$(V=handoff run "$o"); rc=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
+  ok "$( [ $rc = 1 ] && started && [ -n "$np" ] && [ "$(cat "$F/panes")" = "perms $o" ] && kill -0 "$o" \
+      && ! kill -0 "$np" 2>/dev/null && [ ! -e "$(sd)/session-id" ] && [[ $out == *"would not move"* ]]; echo $?)" \
+    "handoff: when the second name move fails, the new seat is closed and the old one gets back window perms"
+  fx htermnew; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0
+  echo new-window > "$F/sigafter"   # stopped the moment tmux has opened perms~next, before the id is back
+  out=$(V=handoff run "$o"); rc=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
+  ok "$( [ $rc = 1 ] && started && [ -n "$np" ] && [ "$(cat "$F/panes")" = "perms $o" ] && kill -0 "$o" \
+      && ! kill -0 "$np" 2>/dev/null && [ ! -e "$(sd)/session-id" ] && [[ $out == *"closed main:perms~next"* ]]; echo $?)" \
+    "handoff: stopped as perms~next opens, it closes perms~next and the old seat keeps window perms"
+  fx htermwait; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0; : > "$F/nosock"
+  mkdir -p "$H/.cc"; echo CC_WORKER_SANDBOX=1 > "$H/.cc/config"
+  HOME=$H PATH="$F/fbin:$PATH" CC_WORKER_SANDBOX=1 CC_BOX=r2 CC_PERMS_ROOT_PID=$o CC_PERMS_UP_SECS=60 "$0" handoff > "$F/out" 2>&1 & hp=$!
+  for _ in $(seq 50); do grep -q '^perms~next ' "$F/panes" 2>/dev/null && break; sleep 0.1; done
+  sleep 0.3; kill -TERM "$hp" 2>/dev/null; wait "$hp"; rc=$?; out=$(cat "$F/out"); np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
+  ok "$( [ $rc = 1 ] && [ -n "$np" ] && [ "$(cat "$F/panes")" = "perms $o" ] && kill -0 "$o" \
+      && ! kill -0 "$np" 2>/dev/null && [ ! -e "$(sd)/session-id" ] && [[ $out == *"closed main:perms~next"* ]]; echo $?)" \
+    "handoff: a TERM while it waits for the successor (Bash's timeout) closes perms~next and keeps the old seat"
+  fx hterm2; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0
+  printf 'new-window\nlist-windows\n' > "$F/sigafter"   # a TERM as perms~next opens, and a second one in settle's first step
+  out=$(V=handoff run "$o"); rc=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
+  ok "$( [ $rc = 1 ] && [ -n "$np" ] && [ ! -e "$F/sigafter" ] && [ "$(cat "$F/panes")" = "perms $o" ] && kill -0 "$o" \
+      && ! kill -0 "$np" 2>/dev/null && [[ $out == *"closed main:perms~next"* ]]; echo $?)" \
+    "handoff: a second TERM while it cleans up is ignored, so perms~next is still closed and the old seat keeps window perms"
+  fx habove; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0
+  mkdir -p "$H/.cc/state/r1/.claude"; out=$(V=handoff run "$o"); r1=$?; s1=$(started && echo y); o1=$out; rmdir "$H/.cc/state/r1/.claude"
+  ln -sfn "$H/bin/cc-model" "$H/.local/bin/claude"; out=$(V=handoff run "$o"); r2=$?; s2=$(started && echo y)
+  ok "$( [ "$r1$r2" = 11 ] && [ -z "$s1$s2" ] && [[ $o1 == *"sits above"* ]] && [[ $out == *"does not resolve into"* ]] \
+      && [ "$(cat "$F/panes")" = "perms $o" ] && kill -0 "$o"; echo $?)" \
+    "handoff: a .claude/ above the seat, or a ~/.local/bin/claude outside versions/, refuses the hand-off and keeps the seat"
+  fx htoctou; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0
+  printf '#!/bin/sh\nmkdir -p %q && echo planted > %q\n' "$H/.claude" "$H/.claude/CLAUDE.md" > "$F/midhook"; chmod +x "$F/midhook"
+  out=$(CC_PERMS_MIDHOOK=$F/midhook V=handoff run "$o"); rc=$?
+  ok "$( [ $rc = 1 ] && ! started && [[ $out == *"$H/.claude/CLAUDE.md is not what"*"changed while the launch was being set up"* ]] \
+      && [ "$(cat "$F/panes")" = "perms $o" ] && kill -0 "$o" && [ ! -e "$(sd)/session-id" ]; echo $?)" \
+    "handoff: a CLAUDE.md written after the pins passed is caught by the second hash just before the tmux call; nothing starts and the seat stays"
+  # the gate is asked again just before the tmux call: a marker removed after the first ask stops either verb
+  fx gatemid; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; : > "$F/mk"; chmod 644 "$F/mk"
+  printf '#!/bin/sh
+rm -f %q
+' "$F/mk" > "$F/midhook"; chmod +x "$F/midhook"
+  out=$(CC_PERMS_MARKER=$F/mk CC_PERMS_MIDHOOK=$F/midhook run "$c"); r1=$?; s1=$(started && echo y); o1=$out
+  n1=$( [ -e "$F/notify.log" ] && echo y); i1=$( [ -e "$(sd)/session-id" ] && echo y)
+  fx gatemidh; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s
+' "$o" > "$F/panes"; jn 0
+  : > "$F/mk"; chmod 644 "$F/mk"; printf '#!/bin/sh
+rm -f %q
+' "$F/mk" > "$F/midhook"; chmod +x "$F/midhook"
+  out=$(CC_PERMS_MARKER=$F/mk CC_PERMS_MIDHOOK=$F/midhook V=handoff run "$o"); r2=$?; s2=$(started && echo y)
+  : > "$F/mk"; chmod 644 "$F/mk"; out3=$(CC_PERMS_MARKER=$F/mk CC_PERMS_MIDHOOK=/bin/true V=handoff run "$o"); r3=$?; pids="$pids $(cat "$F/pane.pid" 2>/dev/null)"
+  ok "$( [ "$r1$r2$r3" = 110 ] && [ -z "$s1$s2$n1$i1" ] && [[ $o1 == *"refused — the owner's marker $T/gatemid/mk is missing"*"Nothing started."* ]] \
+      && [[ $out == *"refused — the owner's marker $F/mk is missing"* ]] && started; echo $?)" \
+    "relaunch and handoff: the marker removed after the first ask is caught by the gate's second ask just before the tmux call; nothing starts, and with it in place the hand-off goes ($r1$r2$r3)"
+  # the lock is a file of its own: a shared flock held on this script (anyone may read it) blocks nothing, while one
+  # held on the lock file does, so the lock is still taken
+  fx lockfile; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"
+  exec 8<"$0"; flock -s 8; out=$(run "$c" 8<&-); r1=$?; o1=$out; s1=$(started && echo y); exec 8<&-
+  pids="$pids $(cat "$F/pane.pid" 2>/dev/null)"; m1=$(stat -c %a "$H/cc-perms.lock" 2>/dev/null); : > "$F/tmux.log"
+  exec 8<"$H/cc-perms.lock"; flock -s 8; out=$(run "$c" 8<&-); r2=$?; exec 8<&-
+  ok "$( [ "$r1$r2" = 01 ] && [ "$s1" = y ] && [[ $o1 == *"back in"* ]] && [ "$m1" = 600 ] && ! started && [[ $out == *"another relaunch is running"* ]]; echo $?)" \
+    "relaunch: a shared flock held on cc-perms itself no longer blocks it; it locks its own file, made 0600, and one held there still does ($r1$r2 $m1)"
+  # a FIFO at the lock path: opening it for writing would block, so each verb refuses it before the open, at once
+  fx lockfifo; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; mkfifo "$H/cc-perms.lock"
+  out=$(TO=10 run "$c"); r1=$?; o1=$out; out=$(TO=10 V=handoff run "$c"); r2=$?; o2=$out; out=$(TO=10 V=pin run "$c"); r3=$?
+  ok "$( [ "$r1$r2$r3" = 111 ] && ! started && [ -p "$H/cc-perms.lock" ] \
+      && [[ "$o1 $o2 $out" == *"not a regular file"*"not a regular file"*"not a regular file"* ]]; echo $?)" \
+    "relaunch, handoff and pin: a FIFO at the lock path is refused before it is opened, at once and nonzero, and nothing starts ($r1$r2$r3)"
+  # a fixture called from a real pane: a decoy TMUX and TMUX_TMPDIR in its environment, and a decoy tmux and cc-notify
+  # first on its PATH that each write a marker when run; the fixture uses only its own stand-ins and socket in $H
+  fx decoy; c=$(stand "$H/dev/r1"); pids="$pids $c"; echo "r1 $c" > "$F/panes"; mkdir -p "$F/decoy"
+  for b in tmux cc-notify; do printf '#!/bin/sh\necho "$0 $*" >> %q\n' "$F/decoy.hit" > "$F/decoy/$b"; chmod +x "$F/decoy/$b"; done
+  mkdir -p "$H/.claude/skills/x"; echo planted > "$H/.claude/skills/x/SKILL.md"   # refused on the pins: the alert path
+  mkdir -p "$H/.cc"; echo CC_WORKER_SANDBOX=1 > "$H/.cc/config"   # the gate reads the sandbox flag from the config, as run() writes it
+  dc(){ env -u CC_CONFIG TMUX="$F/decoy/sock,1,0" TMUX_TMPDIR="$F/decoy" PATH="$F/decoy:$F/fbin:$PATH" CC_WORKER_SANDBOX=1 HOME="$H" CC_BOX=r2 CC_PERMS_ROOT_PID="$c" "$0" relaunch 2>&1; }
+  out=$(dc); r1=$?; n1=$(grep -c '^---$' "$F/notify.log" 2>/dev/null); rm -rf "${H:?}/.claude"; out=$(dc); r2=$?
+  pids="$pids $(cat "$F/pane.pid" 2>/dev/null)"
+  ok "$( [ "$r1$r2" = 10 ] && [ "$n1" = 1 ] && started && [ ! -e "$F/decoy.hit" ] && [ ! -e "$F/tmux.leak" ]; echo $?)" \
+    "a fixture with a decoy TMUX and a decoy tmux and cc-notify first on PATH alerts and launches through its own stand-ins and socket, and reaches none of the decoys ($r1$r2 $n1)"
+  # ── pin: only the seat records the pins, and a hand-off waits for it ──
+  fx hpin; c=$(stand "$H/dev/r1"); o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $c $o"; printf 'r1 %s\nperms %s\n' "$c" "$o" > "$F/panes"; jn 0
+  mkdir -p "$H/.claude/skills/new"; echo s > "$H/.claude/skills/new/SKILL.md"; cp "$(sd)/pins" "$F/pins.before"
+  out=$(V=pin run "$c"); r1=$?; o1=$out; cmp -s "$(sd)/pins" "$F/pins.before"; m1=$?
+  out=$(V=handoff run "$o"); r2=$?; s2=$(started && echo y); o2=$out
+  out=$(V=pin run "$o"); r3=$?; o3=$out
+  out=$(V=handoff run "$o"); r4=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
+  ok "$( [ "$r1$m1" = 10 ] && [[ $o1 == *"not the permission seat"* ]] && [ "$r2" = 1 ] && [ -z "$s2" ] && [[ $o2 == *"/.claude/skills is not what"* ]] \
+      && [ "$r3" = 0 ] && [[ $o3 == *"now pinned: $H/.claude/skills"* ]] && [ "$r4" = 0 ] && echo 0 || echo 1)" \
+    "pin: a planning seat is refused and changes nothing; a changed skill holds the hand-off until the seat pins it, and then it goes"
+  fx htermmoved; o=$(SARG=--fixture-no-bypass stand "$(sd)"); pids="$pids $o"; printf 'perms %s\n' "$o" > "$F/panes"; jn 0
+  echo rename-window > "$F/sigafter"   # stopped between moving the names and ending the old window
+  out=$(V=handoff run "$o"); rc=$?; np=$(cat "$F/pane.pid" 2>/dev/null); pids="$pids $np"
+  for _ in $(seq 40); do [ -s "$F/args.$np" ] && break; sleep 0.1; done; a=$(cat "$F/args.$np" 2>/dev/null)
+  ok "$( [ $rc = 1 ] && [ -n "$np" ] && [ "$(cat "$F/panes")" = "perms $np" ] && ! kill -0 "$o" 2>/dev/null \
+      && kill -0 "$np" && grep -qxF "$(cat "$(sd)/session-id" 2>/dev/null)" <<<"$a" && [[ $out == *"finished the cutover"* ]]; echo $?)" \
+    "handoff: stopped after the names moved, it finishes the cutover: the new seat keeps perms and the old window ends"
+
+  echo "cc-perms selfcheck: $pass passed, $fail failed"; [ "$fail" = 0 ]; }
+
+case "${1:-}" in
+  relaunch) [ $# = 1 ] || die "relaunch takes no arguments: the seat it brings back is the caller's repo's, as it was"; relaunch;;
+  handoff) [ $# = 1 ] || die "handoff takes no arguments: its successor is the caller's own seat, started fresh"; handoff;;
+  gate) [ $# = 1 ] || die "gate takes no arguments"; if g=$(handoff_gate_open); then echo "open"; else echo "shut: $g"; exit 1; fi;;   # read-only
+  pin) [ $# = 1 ] || die "pin takes no arguments: it pins what is there now, for the caller's own seat"; pin;;
+  pins-diff) [ $# = 2 ] || { echo "cc-perms: pins-diff takes one argument, the repo whose seat it reads" >&2; exit 2; }; pins_diff_verb "$2";;
+  __live) [ -n "$FX" ] || die "__live is the selfcheck's"; live_seat "${2:-}";;   # fixture only: the seat pid, for selfcheck
+  __pins) [ -n "$FX" ] || die "__pins is the selfcheck's"; c=$(launch_target) || die "$c"; pin_now "$c" "${2:?the seat directory}";;   # fixture only: the pins as they stand
+  selfcheck)   # its stand-ins are started and killed, so it runs in a pid namespace of its own when bwrap is there
+    # Inside the lander's hermetic sandbox a nested namespace is refused (AppArmor's unprivileged-userns rule), but that
+    # sandbox already has a pid namespace of its own, so it runs right there. Outside one, a refusal stops it.
+    if [ -z "${CC_PERMS_NS:-}" ] && command -v bwrap >/dev/null; then
+      if bwrap --dev-bind / / --unshare-pid --proc /proc --die-with-parent true 2>/dev/null; then
+        CC_PERMS_NS=1 exec bwrap --dev-bind / / --unshare-pid --proc /proc --die-with-parent "$0" selfcheck
+      elif [ "$(cat /proc/1/comm 2>/dev/null)" = bwrap ]; then :
+      else echo "cc-perms selfcheck: bwrap could not make a pid namespace and this is not inside one, so no stand-in starts" >&2; exit 2; fi
+    fi
+    selfcheck;;
+  -h|--help|"") sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//';;
+  *) die "unknown command '$1' (relaunch | handoff | gate | pin | pins-diff | selfcheck)";;
+esac

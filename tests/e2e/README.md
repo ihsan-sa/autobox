@@ -149,6 +149,7 @@ run on their own. It owns only the paths no narrower check covers.
 | `selfcheck-cc-native` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-notify` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-pause` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
+| `selfcheck-cc-perms` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-publish` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-reconcile` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |
 | `selfcheck-cc-refusals` | host | starts the tool's own processes and temp HOME; not yet proven in the sandbox |

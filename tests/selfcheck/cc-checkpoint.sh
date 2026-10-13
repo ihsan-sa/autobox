@@ -1258,6 +1258,66 @@ SH
   k "$([ -z "$out" ] && echo 0 || echo 1)" "…and not again next turn: a session that journalled a moment ago is not told twice" "$out"
   NUDGE_MIN=0; out=$(stophook "$(pay big)"); NUDGE_MIN=60
   k "$(grep -qF '"decision": "block"' <<<"$out" && echo 0 || echo 1)" "…until the cooldown is up (CC_CHECKPOINT_NUDGE_MIN), which is a cooldown and not a once-ever" "$out"
+  # the permission seat's line names cc-perms handoff; the same transcript from any other directory gets the journal line
+  mkdir -p "$HOME/.cc/state/rp/perms"; echo brief > "$HOME/.cc/state/rp/perms/brief.md"; tx seat 160000; tx notseat 160000; tx seatshut 160000
+  # a stub cc-perms in the fixture bin answers `gate` from a flag file (open while $HOME/.cc/gate-open exists) and runs the real one for the rest
+  printf '#!/bin/sh\n[ "$1" = gate ] && { [ -e "$HOME/.cc/gate-open" ]; exit; }\nexec env CC_PERMS_FIXTURE=1 "$REALBIN/cc-perms" "$@"\n' > "$bin/cc-perms"; chmod +x "$bin/cc-perms"
+  # …but only while the hand-off gate is open. Shut (no CC_WORKER_SANDBOX=1 in ~/.cc/config; the environment's key does
+  # not count), the seat is told to journal and why there is no hand-off, and nothing that sends it to hand off.
+  out=$(stophook "$(pay seatshut "$HOME/.cc/state/rp/perms")" "$HOME/.cc/state/rp/perms")
+  k "$(grep -qF 'The hand-off is shut until go-live' <<<"$out" && grep -qF 'state/rp/perms/handoff.md' <<<"$out" \
+      && ! grep -qF 'run cc-perms handoff' <<<"$out" && ! grep -qF 'HAND-OFF ENTRY' <<<"$out" && ! grep -qF 'in the foreground' <<<"$out" \
+      && [ "$(grep -c . <<<"$out")" = 1 ] && echo 0 || echo 1)" \
+    "nudge: with the hand-off gate shut, the permission seat past the line journals and hears the hand-off is shut until go-live, with no push to hand off" "$out"
+  mkdir -p "$HOME/.cc"; printf 'CC_WORKER_SANDBOX=1\n' > "$HOME/.cc/config"; : > "$HOME/.cc/gate-open"   # the stub gate is open
+  out=$(stophook "$(pay seat "$HOME/.cc/state/rp/perms")" "$HOME/.cc/state/rp/perms")
+  k "$(! grep -qF 'shut until go-live' <<<"$out" && echo 0 || echo 1)" "…and with it open (cc-perms gate exits 0), no word of it being shut" "$out"
+  k "$(grep -qF 'run cc-perms handoff' <<<"$out" && grep -qF 'state/rp/perms/handoff.md' <<<"$out" && ! grep -qF 'perms-handoff' <<<"$out" && grep -qF '## HAND-OFF ENTRY' <<<"$out" \
+      && grep -qF 'cc-perms handoff in the foreground' <<<"$out" && grep -qF 'Bash timeout of at least 120000 ms' <<<"$out" \
+      && ! grep -qF 'Append a dated entry' <<<"$out" && [ "$(grep -c . <<<"$out")" = 1 ] && echo 0 || echo 1)" \
+    "nudge: the permission seat past the line is told to write its HAND-OFF ENTRY, then run cc-perms handoff in the foreground under a Bash timeout of at least 120000 ms" "$out"
+  out=$(stophook "$(pay notseat)")
+  k "$(grep -qF 'Append a dated entry' <<<"$out" && ! grep -qF 'cc-perms' <<<"$out" && echo 0 || echo 1)" \
+    "…and a session anywhere else gets the journal line, with no word of cc-perms" "$out"
+  # the key says 1 but cc-perms gate says shut (no go-live marker): the seat hears the shut line, not a hand-off
+  rm -f "$HOME/.cc/gate-open"; tx seatshut2 160000
+  out=$(stophook "$(pay seatshut2 "$HOME/.cc/state/rp/perms")" "$HOME/.cc/state/rp/perms")
+  k "$(grep -qF 'The hand-off is shut until go-live' <<<"$out" && ! grep -qF 'run cc-perms handoff' <<<"$out" && echo 0 || echo 1)" \
+    "nudge: the config key at 1 does not open the gate while cc-perms gate says shut (no go-live marker): the seat hears the shut line" "$out"
+  rm -f "$HOME/.cc/config"   # the pins cases below start with the gate shut
+  # the seat's pins: the REAL cc-perms beside the copy under test, run against this fixture's HOME (which makes it a
+  # fixture of its own), with a claude stand-in where a launch looks for one. Removed after, so no later case asks it.
+  pd="$HOME/.cc/state/rp/perms"
+  mkdir -p "$HOME/.local/bin" "$HOME/.local/share/claude/versions" "$HOME/.claude/skills/s"; echo s > "$HOME/.claude/skills/s/SKILL.md"
+  printf '#!/bin/sh\n' > "$HOME/.local/share/claude/versions/9.9.9"; chmod +x "$HOME/.local/share/claude/versions/9.9.9"
+  ln -sfn "$HOME/.local/share/claude/versions/9.9.9" "$HOME/.local/bin/claude"
+  "$bin/cc-perms" __pins "$pd" > "$pd/pins" 2>/dev/null; tx pinned 20000; tx pinned2 20000; tx pinned3 20000
+  out=$(stophook "$(pay pinned "$pd")" "$pd")
+  k "$([ -z "$out" ] && [ -s "$pd/pins" ] && echo 0 || echo 1)" "pins: the permission seat whose startup files are as it pinned them hears nothing" "$out"
+  echo planted >> "$HOME/.claude/skills/s/SKILL.md"
+  out=$(stophook "$(pay pinned "$pd")" "$pd")
+  k "$(grep -qF '"decision": "block"' <<<"$out" && grep -qF "startup surface changed since the last pin: $HOME/.claude/skills — review each change before re-pinning; never pin an entry you haven't read." <<<"$out" \
+      && ! grep -qF 'run cc-perms pin' <<<"$out" && ! grep -qiF 'and run cc-perms' <<<"$out" && [ "$(grep -c . <<<"$out")" = 1 ] && echo 0 || echo 1)" \
+    "pins: a changed skill puts 'startup surface changed since the last pin: <entry>' on the permission seat's stop line, naming ~/.claude/skills, and tells it to review each change, never just to pin" "$out"
+  k "$(grep -qF 'The hand-off is shut until go-live' <<<"$out" && ! grep -qF 'refuse to start a seat' <<<"$out" && echo 0 || echo 1)" \
+    "…and with the hand-off gate shut it says the hand-off is shut until go-live, not that a hand-off waits on the pins" "$out"
+  o2=$(stophook "$(pay pinned "$pd")" "$pd"); echo x > "$HOME/.claude/CLAUDE.md"; o3=$(stophook "$(pay pinned "$pd")" "$pd")
+  k "$([ -z "$o2" ] && grep -qF "since the last pin: $HOME/.claude/CLAUDE.md, $HOME/.claude/skills — review" <<<"$o3" && echo 0 || echo 1)" \
+    "…once per set of entries: the same set next turn is not said again, and a further change names both" "$o2 | $o3"
+  # gate open: the same review line, then that hand-off and relaunch wait on the pins; and nothing about it being shut
+  echo CC_WORKER_SANDBOX=1 > "$HOME/.cc/config"; : > "$HOME/.cc/gate-open"; tx pinned4 20000; out=$(stophook "$(pay pinned4 "$pd")" "$pd")
+  k "$(grep -qF 'review each change before re-pinning; never pin an entry you' <<<"$out" && grep -qF 'Until the pins match, cc-perms handoff and relaunch refuse to start a seat.' <<<"$out" \
+      && ! grep -qF 'shut until go-live' <<<"$out" && ! grep -qF 'run cc-perms pin' <<<"$out" && echo 0 || echo 1)" \
+    "pins: with the hand-off gate open, the line says to review each change, and that hand-off and relaunch wait until the pins match" "$out"
+  # both lines at once, gate shut: the pins line first, the nudge after it, and the shut sentence said once, not twice
+  rm -f "$HOME/.cc/config" "$HOME/.cc/gate-open"; tx pinnedbig 160000; out=$(stophook "$(pay pinnedbig "$pd")" "$pd")
+  k "$([[ $out == *'startup surface changed since the last pin'*'You are the permission seat, past the hand-off line'* ]] \
+      && [ "$(grep -o 'shut until go-live' <<<"$out" | grep -c .)" = 1 ] && ! grep -qF 'run cc-perms handoff' <<<"$out" && [ "$(grep -c . <<<"$out")" = 1 ] && echo 0 || echo 1)" \
+    "…and with the gate shut and the seat past the hand-off line too, one stop line: pins first, then the journal ask, the shut sentence once" "$out"
+  out=$(stophook "$(pay pinned2 "$pd" true)" "$pd"); o2=$(stophook "$(pay pinned3 "$T")")
+  k "$([ -z "$out" ] && [ -z "$o2" ] && echo 0 || echo 1)" \
+    "…and never while a Stop hook holds the turn, nor in a session outside the seat's directory" "$out | $o2"
+  rm -f "$bin/cc-perms" "$HOME/.local/bin/claude" "$HOME/.claude/CLAUDE.md"; rm -rf "$HOME/.claude/skills"
   out=$(stophook "$(pay small)")
   k "$([ -z "$out" ] && echo 0 || echo 1)" "nudge: a session under the line is told nothing at all" "$out"
   out=$(stophook "$(pay held "" true)")
