@@ -20,7 +20,14 @@ checkout. `bin/cc-land` is the old name kept as a thin shim, so every caller tha
    The plan is the static checks, every check whose paths the change touches, and a changed tool's direct
    callers. A path no check owns widens to the manifest's `default` set, and the card names it. The path policy
    (`tests/LANDING-policy.toml`, also read from the base) says which paths need every check before the merge
-   (`gate_first`), which need a paid review, and which only `lander-self` may land.
+   (`gate_first`), which need a paid review, and which only `lander-self` may land. A change to a manifest or a
+   reach file (`tests/reach.tsv`) is not a lander change when it is clean on the merge tree: it adds checks the
+   sandbox holds (no host, box, net, bare or mount, and no cap above the base's largest), adds paths or fixtures
+   to checks, or drops a whole check or a path or fixture entry whose files the same change deletes (a move or a
+   rename is not a delete, even with an edit), changes nothing else about an existing check, and deletes no line of
+   a reach file. A run line names a file by its path or by a module after `-m` (`tests.test_x`). Such a change is planned by its other files,
+   deleted ones included, and the built-in `manifest-widen` check runs on it and blocks it if red. Anything else,
+   and any change to the policy file or the lander's own code, still goes to `lander-self`.
 3. **Run.** Hermetic checks run in bwrap on the merge tree, with no network and no tokens. A red check is compared
    with the same check on the base: red there too means main is red, and the PR waits as `blocked-by-main` without
    blame. Box-class checks (the ones that need tmux, systemd or live state) run on main's tip after the merge.
