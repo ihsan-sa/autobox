@@ -3845,6 +3845,69 @@ class Starving(Fixture):
         self.assertEqual(requeued, [True])                     # handed back, then queued again mid-lane
         self.assertEqual(sorted(self.merged_order()), [1, 2])  # and the re-queue had its turn before the lane ended
 
+    def test_a_pr_that_ended_unplanned_and_is_queued_again_in_the_same_second_gets_its_turn(self):
+        """The case the test above cannot reach: there the re-queue clears a head the job had, so its queued mark
+        moves anyway. #1 here ends before it is planned (the PR is closed: no head read) and is queued again in the
+        same one-second stamp, so its (queued_at, head) mark is the one its turn left. Only the lane letting an ended
+        job out of `tried` ("A job whose turn ended it ... left `tried` then, since a re-queue may share its
+        one-second stamp") gives the re-queue its turn."""
+        self.pr(1, {"a/x": "n\n"}, state="CLOSED")
+        self.pr(2, {"b/y": "n\n"})
+        real, now = E.stamp, time.time()
+        p = mock.patch.object(E, "stamp", lambda at=None: real(now if at is None else at))   # one second throughout
+        p.start()
+        self.addCleanup(p.stop)
+        requeued = []
+
+        def hook(name, n):   # #2's check runs until #1 has ended, then #1's PR is reopened and queued again
+            end = time.time() + 10
+            while name == "b" and not requeued and time.time() < end:
+                j = self.job(1)
+                if j is not None and j.state == T.DONE:
+                    self.assertEqual(j.head, "")   # ended before it was planned
+                    self.set_box(prs={**self.box()["prs"], "1": {**self.box()["prs"]["1"], "state": "OPEN"}})
+                    J.submit("demo", 1)
+                    requeued.append(j.extra.get("queued_at"))
+                    break
+                time.sleep(0.02)
+        for n in (1, 2):
+            J.submit("demo", n)
+        self.land(planner=Planner(), runner=Runner(hook=hook))
+        self.assertEqual(len(requeued), 1)                              # it ended, then was queued again mid-lane
+        self.assertEqual(self.job(1).extra.get("queued_at"), requeued[0])   # in the stamp it ended under
+        self.assertEqual(sorted(self.merged_order()), [1, 2])           # and the re-queue had its turn
+
+    def test_a_hold_leaves_the_queued_mark_and_a_requeue_moves_it(self):
+        """queued_mark is what only a re-queue or a new head changes. A hold (reap's took holds a job whose check was
+        red on main, or could not run; a turn holds a draft) appends to the job's history but is no re-queue: a mark
+        that counted history would re-admit every job a reap held. A re-queue in the same second still moves it, by
+        its cleared head. (In the lane loop today reap lets the job it holds out of `tried` itself, so only the mark
+        shows this.)"""
+        self.pr(1, {"a/x": "n\n"})
+        real, now = E.stamp, time.time()
+        p = mock.patch.object(E, "stamp", lambda at=None: real(now if at is None else at))
+        p.start()
+        self.addCleanup(p.stop)
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        job = self.job(1)
+        job.head = "a" * 40   # as planning leaves it
+        job.state = T.CHECKING
+        J.save(job)
+        lane = L.Lane("demo", self.units())
+        mark = lane.queued_mark(job)
+        lane.hold(job, "PR #1 is a draft — mark it ready for review")   # a pr hold: a new queue starts it afresh
+        job = self.job(1)
+        self.assertEqual(job.state, T.HELD)
+        self.assertEqual(lane.queued_mark(job), mark)      # held: the same mark, though its history grew
+        J.submit("demo", 1)
+        with J.lane_lock("demo"):
+            J.drain("demo")
+        job = self.job(1)
+        self.assertEqual(job.state, T.QUEUED)
+        self.assertNotEqual(lane.queued_mark(job), mark)   # queued again, same second: the mark moves
+
     def test_a_finished_check_is_recorded_while_other_jobs_wait_their_turn(self):
         self.pr(1, {"a/x": "n\n"})
         self.pr(2, {"b/y": "n\n"})
