@@ -11433,7 +11433,8 @@ def run_selfcheck():
         register_workspaces(cfgW)
         check("workspaces: SLACK_WORKSPACES names each extra workspace; a bad name or one missing a token is no workspace",
               sorted(WS["extra"]) == ["b", "dead"] and WS["extra"]["b"] == {"bot": "xoxb-b", "app": "xapp-b",
-                                                                            "owner": "UOWNB", "member": "salt"})
+                                                                            "owner": "UOWNB", "member": "salt",
+                                                                            "mirror": False, "approver": "", "invite": []})
         # (a) outbound: every call made with the default bot token goes out with its chat's own workspace's token
         api("chat.postMessage", "xoxb-a", channel="CBMEM", text="hi")
         api("chat.postMessage", "xoxb-a", channel="CAHQ", text="hi")
@@ -11654,6 +11655,99 @@ def run_selfcheck():
               and WS["user"].get("UMEMB3") == "b")
         check("workspaces (move): --apply is refused while a daemon holds its lock, and writes nothing",
               rLiveW == 1 and liveKeptW == ({"CASALT": "salt", "CAHQ": "hq"}, memW))
+        # (mirror) a second face on the same sessions: names stay home, its own channels route by id, replies go back
+        # with its token, its approver's word is the member's and an employee's is not. Its own fixture throughout.
+        callsM = []
+        chansM = {"xoxb-a": {"CASALT": "salt", "CAHQ": "hq"},
+                  "xoxb-m": {"CMHOME": "home", "CMRUG": "rug-finder", "CMSALT": "salt", "CMHQ": "hq-face"}}
+        def apiM(method, token, **kw):
+            callsM.append((method, token, kw))
+            if method == "conversations.info":
+                name = chansM.get(token, {}).get(kw.get("channel"))
+                if not name:
+                    raise RuntimeError("conversations.info: channel_not_found")
+                return {"channel": {"id": kw["channel"], "name": name}}
+            if method == "conversations.list":
+                return {"channels": [{"id": c, "name": n, "is_member": True} for c, n in chansM.get(token, {}).items()]}
+            if method == "conversations.create":
+                cid = "CMNEW" + str(len(chansM[token]))
+                chansM[token][cid] = kw["name"]
+                return {"channel": {"id": cid}}
+            return {"ok": True}
+        os.makedirs(f"{devW}/hq", exist_ok=True)
+        dirM = tempfile.mkdtemp(prefix="cc-slack-mirror-")
+        wasM, dirWasM = Effects("mirror", api=apiM, dev=devW).install(), DIR
+        globals()["DIR"] = dirM
+        cfgM = {"SLACK_BOT_TOKEN": "xoxb-a", "SLACK_APP_TOKEN": "xapp-a", "SLACK_OWNER_ID": "UOWNER",
+                "SLACK_WORKSPACES": "m", "SLACK_BOT_TOKEN_M": "xoxb-m", "SLACK_APP_TOKEN_M": "xapp-m",
+                "SLACK_OWNER_ID_M": "UOWNM", "SLACK_MEMBER_WS_M": "salt", "SLACK_MIRROR_M": "1",
+                "SLACK_APPROVER_ID_M": "UAPPR", "SLACK_INVITE_M": "UOWNM USAS bogus"}
+        realLoadM = globals()["load_cfg"]
+        globals()["load_cfg"] = lambda: (register_workspaces(cfgM), dict(cfgM))[1]
+        try:
+            register_workspaces(cfgM)
+            save_table("routes.json", {"CMHOME": "salt", "CMRUG": "salt/rug", "CMHQ": "hq", "CAHQ": "salt"}, indent=1)
+            save_members({"salt": {"uid": "UOLD", "chan": "salt", "chan_id": "CASALT", "at": 1.0}})
+            check("workspaces (mirror): SLACK_MIRROR_<N>, SLACK_APPROVER_ID_<N> and SLACK_INVITE_<N> are read, a "
+                  "malformed invite id dropped",
+                  WS["extra"]["m"]["mirror"] is True and WS["extra"]["m"]["approver"] == "UAPPR"
+                  and WS["extra"]["m"]["invite"] == ["UOWNM", "USAS"])
+            check("workspaces (mirror): the member workspace's names stay in the default workspace — #salt keeps "
+                  "working there — while a reply to a channel of the mirror goes out with the mirror's token",
+                  [ws_of_name(n) for n in ("salt", "#salt--pna", "salt-updates")] == ["", "", ""]
+                  and ws_token("chat.postMessage", "xoxb-a", {"channel": "#salt"}) == "xoxb-a"
+                  and ws_token("chat.postMessage", "xoxb-a", {"channel": "CASALT"}) == "xoxb-a"
+                  and ws_token("chat.postMessage", "xoxb-a", {"channel": "CMHOME"}) == "xoxb-m")
+            dmM = Daemon(use_slack=False); dmM.cfg = dict(cfgM)
+            check("workspaces (mirror): a mirror channel routes by its id alone — #home to salt, #rug-finder to "
+                  "salt/rug — and one named after the member workspace with no route of its own routes nowhere",
+                  [dmM.route(c, "group") for c in ("CMHOME", "CMRUG", "CMSALT")] == ["salt", "salt/rug", None])
+            check("workspaces (mirror): a mirror channel routed to the member is its own channel; one routed elsewhere, "
+                  "or a default-workspace channel routes.json points at it, is not; the name rule still holds",
+                  member_chat("salt", "CMHOME", "home") and member_chat("salt", "CMRUG", "rug-finder")
+                  and not member_chat("salt", "CMHQ", "hq-face") and not member_chat("salt", "CAHQ", "hq")
+                  and not member_chat("hq", "CMHQ", "hq-face") and member_chat("salt", "CASALT", "salt")
+                  and not member_chat("salt", "", "home"))
+            check("workspaces (mirror): the approver's id there counts as the member — instructions in its channels — "
+                  "the member's own id still does, and an employee's never does",
+                  member_user("salt", "UAPPR") and member_user("salt", "UOLD") and not member_user("salt", "UEMP")
+                  and not member_user("hq", "UAPPR") and member_authority("salt/rug", "UAPPR") == "instructions"
+                  and member_authority("salt", "UEMP") == "")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                callsM.clear()
+                rChanM = cmd_workspace(["channel", "m", "stock-report", "salt/stock", "--title", "Stock report",
+                                        "--purpose", "Ask for the stock report.", "--with", "UEXTRA"])
+                chanCallsM = list(callsM)
+                callsM.clear()
+                rEmpM = cmd_workspace(["employee", "m", "eliane", "UELI"])
+                empCallsM = list(callsM)
+                rAgainM = cmd_workspace(["employee", "m", "eliane", "UELI"])
+                rRouteM = cmd_workspace(["route", "m", "CMSALT", "salt"])
+                rForeignM = cmd_workspace(["route", "m", "CMHQ", "hq"])
+                rMissingM = cmd_workspace(["route", "m", "CMNOPE", "salt"])
+                rNoWsM = cmd_workspace(["channel", "zz", "x", "salt"])
+                rUsageM = cmd_workspace(["employee", "m", "eliane", "not-a-uid"])
+            made = {n: c for c, n in chansM["xoxb-m"].items()}
+            check("workspaces (mirror): `workspace channel` makes the channel PRIVATE in the mirror with its own "
+                  "token, invites the owner's id there, SLACK_INVITE and --with, sets topic and purpose, and routes it",
+                  rChanM == 0 and "stock-report" in made and "stock-report" not in chansM["xoxb-a"].values()
+                  and [(kw.get("is_private"), t) for m, t, kw in chanCallsM if m == "conversations.create"] == [("true", "xoxb-m")]
+                  and sorted(kw["users"] for m, t, kw in chanCallsM if m == "conversations.invite") == ["UEXTRA", "UOWNM", "USAS"]
+                  and ("conversations.setTopic", "xoxb-m", {"channel": made["stock-report"], "topic": "Stock report"}) in chanCallsM
+                  and load_routes().get(made["stock-report"]) == "salt/stock")
+            check("workspaces (mirror): `workspace employee` makes #<name> routed to the track <member>/<name> with the "
+                  "person invited, and a second run reuses it and changes nothing",
+                  rEmpM == 0 and rAgainM == 0 and load_routes().get(made["eliane"]) == "salt/eliane"
+                  and "UELI" in [kw["users"] for m, t, kw in empCallsM if m == "conversations.invite"]
+                  and list(chansM["xoxb-m"].values()).count("eliane") == 1)
+            check("workspaces (mirror): `workspace route` records an existing channel's id; a target of another "
+                  "workspace, a channel the bot cannot see, an unknown workspace and a bad id are refused",
+                  rRouteM == 0 and load_routes().get("CMSALT") == "salt" and load_routes().get("CMHQ") == "hq"
+                  and (rForeignM, rMissingM, rNoWsM, rUsageM) == (1, 1, 1, 2) and "CMNOPE" not in load_routes())
+        finally:
+            globals()["load_cfg"] = realLoadM
+            wasM.install(); globals()["DIR"] = dirWasM
+            shutil.rmtree(dirM, ignore_errors=True)
         # (d) the default single-workspace config behaves exactly as before
         register_workspaces({"SLACK_BOT_TOKEN": "xoxb-a", "SLACK_OWNER_ID": "UOWNER"})
         shutil.rmtree(dirW); os.makedirs(dirW); callsW.clear()

@@ -21,6 +21,7 @@
   cc-slack member register <handle> [<@user>]   put a workspace no join flow made (cc-sandbox convert) on record in members.json from the channel pair it already has; creates nothing.
   cc-slack members                    who has a workspace: handle → channels → folder → budget used today.
   cc-slack workspace list | move <handle> <ws> [--uid U…] [--apply]   the extra Slack workspaces (config below) and whether their tokens answer; `move` carries a member workspace's channel-id records (routes, orchs, track threads, its members.json ids) over to the same-named channels in <ws>, a dry run without --apply, which refuses while the daemon runs. Nothing under ~/dev moves.
+  cc-slack workspace route <ws> <C…> <target> | channel <ws> <name> <target> [--title T] [--purpose P] [--with U…] | employee <ws> <name> <U…>   route one channel of <ws> to a target of its member workspace (routes.json, by id); `channel` makes it PRIVATE first, invites the owner's id there, SLACK_INVITE_<N> and --with, and sets its topic and purpose; `employee` is `channel` for one person, routed to the track <member>/<name>. A mirror's channels (SLACK_MIRROR_<N>=1) come in this way, under any name.
   cc-slack track-thread <repo>/<track> [--title T]   the ONE thread a --go track lives in, in #<repo>-updates when the repo has that lane, else #<repo> (a member workspace: its own #<handle>): opened by `cc … --go`, idempotent, prints `<chat> <ts>`; a track gets no channel of its own, and a repo with none of its own that CC_PROJECT_CHILDREN puts under a parent gets its threads — and its --route lines and PR cards — in the parent's channels. Its worker's lines (post --route "<repo>/<track> …") and its landing line go there, and a reply there reaches the track's session — or, for a headless or finished track, the repo's session with the track named; no notice line is posted.
   cc-slack mkchannel <name>… [--public]     create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the topic; a #<repo>--<sub> name inherits #<repo>'s people. No -updates twin is made (only a member's join makes one): a routine line with no twin of its own goes to the box's one log lane, #<box>-updates.
   cc-slack project <name>             from a member workspace's session, ask the daemon for the project's board row and its one thread in #<this workspace> (no channel); at most 3 an hour; the human way is `new project <name>` typed in the channel.
@@ -82,7 +83,9 @@ Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHAN
 More Slack workspaces: SLACK_WORKSPACES="<n> …" and, per name (<N> upper-cased, - as _), SLACK_BOT_TOKEN_<N>
 SLACK_APP_TOKEN_<N> SLACK_OWNER_ID_<N> SLACK_MEMBER_WS_<N>. Each gets its own Socket Mode listener; a call naming one
 of its chats or users goes out with its token; only channels of member workspace SLACK_MEMBER_WS_<N> are heard there,
-and everyone there but SLACK_OWNER_ID_<N> is a member.
+and everyone there but SLACK_OWNER_ID_<N> is a member. SLACK_MIRROR_<N>=1 makes it a second face on the same sessions
+rather than a move: names stay in the default workspace and its channels route by id (`workspace route|channel|employee`).
+SLACK_APPROVER_ID_<N> is the id there whose word counts as the member's; SLACK_INVITE_<N>="U… …" joins every channel made there.
 """
 import calendar, collections, contextlib, fcntl, glob, io, json, os, pwd, re, shutil, signal, socket, stat, struct, subprocess, sys, tempfile, threading, time, types, unicodedata, urllib.parse, urllib.request
 
@@ -377,20 +380,29 @@ EFFECTS = Effects.real()
 # owner's own user id in that team, when he is in it) and SLACK_MEMBER_WS_<N> (the one member workspace whose channels
 # live there). Everyone in it but that owner id is a member, and only channels that route to that member workspace
 # are heard there (Daemon.ws_ingress). With SLACK_WORKSPACES unset nothing below changes a single call.
+# A MIRROR (SLACK_MIRROR_<N>=1) is a second face on the same sessions, not a move: names stay in the default workspace
+# (ws_of_name skips it), so #<h> and #<h>--<x> keep working there, and each of its channels comes in by id through a
+# routes.json entry (`cc-slack workspace route|channel|employee`), under whatever plain name it has. A reply goes back
+# to the chat it was asked in, with that chat's token (ws_token). SLACK_APPROVER_ID_<N> is the user id there whose word
+# counts as the member's (member_user); SLACK_INVITE_<N> ("U… U…") is invited to every channel the box makes there.
 WS = {"bot": None, "extra": {}, "chan": {}, "user": {}, "loaded": False}
 WS_LOCK = threading.Lock()
 WS_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
 WS_FILE = "workspaces.json"     # {"chan": {id: ws}, "user": {id: ws}} under DIR: "" is the default workspace
 
 def extra_workspaces(cfg):
-    """{name: {bot, app, owner, member}} of every workspace SLACK_WORKSPACES names that has both its tokens."""
+    """{name: {bot, app, owner, member, mirror, approver, invite}} of every workspace SLACK_WORKSPACES names that has
+    both its tokens."""
     out = {}
     for name in (cfg.get("SLACK_WORKSPACES") or "").split():
         if not WS_NAME_RE.match(name):
             continue
         k = name.upper().replace("-", "_")
         w = {"bot": cfg.get(f"SLACK_BOT_TOKEN_{k}") or "", "app": cfg.get(f"SLACK_APP_TOKEN_{k}") or "",
-             "owner": cfg.get(f"SLACK_OWNER_ID_{k}") or "", "member": cfg.get(f"SLACK_MEMBER_WS_{k}") or ""}
+             "owner": cfg.get(f"SLACK_OWNER_ID_{k}") or "", "member": cfg.get(f"SLACK_MEMBER_WS_{k}") or "",
+             "mirror": (cfg.get(f"SLACK_MIRROR_{k}") or "").strip().lower() in ("1", "true", "yes", "on"),
+             "approver": cfg.get(f"SLACK_APPROVER_ID_{k}") or "",
+             "invite": [u for u in (cfg.get(f"SLACK_INVITE_{k}") or "").split() if re.match(r"[UW][A-Z0-9]+\Z", u)]}
         if w["bot"] and w["app"]:
             out[name] = w
     return out
@@ -475,6 +487,8 @@ def ws_of_name(name):
     n = main_lane(n) or n                           # #<h>-updates lives where #<h> does
     for ws, w in WS["extra"].items():
         h = w["member"]
+        if w.get("mirror"):                         # a mirror leaves every name where it was: its channels come in by id
+            continue
         if h and (n == h or n.startswith(h + "--")):
             return ws
     return ""
@@ -2342,6 +2356,29 @@ def member_chat_ok(handle, name):
     base = main_lane(n) or n
     return bool(n) and n != "dm" and (base == handle or base.startswith(handle + "--"))
 
+def member_chat(handle, chat, name):
+    """member_chat_ok by NAME, or a channel id of another Slack workspace bound to `handle` (SLACK_MEMBER_WS_<N>) that
+    routes.json sends to `handle` or one of its targets: how a mirror's plainly named channel (#home) is the
+    workspace's own. A route in the default workspace never widens it, and neither does a channel of a workspace bound
+    to someone else."""
+    if member_chat_ok(handle, name):
+        return True
+    if not (handle and chat) or chat[:1] not in ("C", "G"):
+        return False
+    w = WS["extra"].get(chat_workspace(chat))
+    t = (load_routes() or {}).get(chat) if w and w["member"] == handle else None
+    return isinstance(t, str) and t.partition("/")[0] == handle
+
+def member_user(handle, uid):
+    """Is `uid` the member whose workspace is `handle` — the id members.json holds, or the approver
+    (SLACK_APPROVER_ID_<N>) of another Slack workspace bound to it? Anyone else there is a member of the public, and
+    their word, a 👍 included, is weighed, never obeyed."""
+    if not (handle and uid):
+        return False
+    if (load_members().get(handle) or {}).get("uid") == uid:
+        return True
+    return any(w["member"] == handle and w.get("approver") == uid for w in WS["extra"].values())
+
 QUERIES_STATE = os.environ.get("CC_QUERIES_STATE") or f"{HOME}/.cc/state"   # cc-guard's spool root: <ws>/queries.spool under it
 QUERIES_SPOOL_MAX = 1048576     # cc-msg discards a whole queries.spool over 1 MB as a plant, so nothing is appended past it
 QUERIES_LOCK_WAIT = 5           # …and the daemon waits no longer than this for a lock in that member-writable dir, as cc-guard's `flock -w 5` does
@@ -2473,12 +2510,12 @@ def member_minted(handle):
 MINT_LINE = "mint incomplete — on the box: `cc-sandbox mint {h}`"   # the same words `cc` posts once in #<h>
 
 def member_authority(target, uid):
-    """"instructions" when `uid` is the member whose workspace `target` is — in their own channel their word is
-    an instruction, elsewhere a member is weighed, not obeyed. Empty otherwise (the owner's role=owner already
+    """"instructions" when `uid` is the member whose workspace `target` is (member_user: their id, or the approver
+    of a Slack workspace bound to it) — in their own channel their word is an instruction, elsewhere a member is
+    weighed, not obeyed. Empty otherwise (the owner's role=owner already
     says it)."""
     h = workspace_of(target)
-    m = load_members().get(h) if h else None
-    return "instructions" if m and uid and m.get("uid") == uid else ""
+    return "instructions" if h and h in load_members() and member_user(h, uid) else ""
 
 def member_budget(cfg=None):
     try:
@@ -4930,7 +4967,7 @@ class Daemon:
             elif verb in self.MEMBER_VERBS:
                 chat = str(first[verb])
                 name = chat[1:] if chat.startswith("#") else self.chan_name(chat) if chat and chat != "local" else chat
-                if chat != "local" and (chat.startswith("D") or not member_chat_ok(member, name)):
+                if chat != "local" and (chat.startswith("D") or not member_chat(member, "" if chat.startswith("#") else chat, name)):
                     return f"{chat} is not one of {member}'s channels"
             else:
                 return f"{verb or 'that'} is not a member verb"
@@ -5315,7 +5352,7 @@ class Daemon:
                         continue
                     if not isinstance(msg, dict):
                         continue
-                    if member and msg.get("chat") and not member_chat_ok(member, self.chan_name(str(msg["chat"]))):
+                    if member and msg.get("chat") and not member_chat(member, str(msg["chat"]), self.chan_name(str(msg["chat"]))):
                         # the workspace's scope applies to every type, permission_request included: relay_permission
                         # names the lane itself (permission_chat), so a chat in the payload is either hers or a lie.
                         log(f"member {member}: dropped a {msg.get('type')} on {msg.get('chat')} — not its channel")
@@ -5326,7 +5363,7 @@ class Daemon:
                         self.ack_post(target, alias, str(msg.get("chat") or ""), str(msg.get("ts") or ""))
                     elif msg.get("type") == "log":
                         log(f"[{target}] {msg.get('text', '')}")
-                    elif member and not member_chat_ok(member, self.chan_name(str(msg.get("chat") or ""))):
+                    elif member and not member_chat(member, str(msg.get("chat") or ""), self.chan_name(str(msg.get("chat") or ""))):
                         log(f"member {member}: dropped a {msg.get('type')} on {msg.get('chat')} — not its channel")
             elif verb == "inject":
                 # `<repo>@<alias>` reaches only that orch's subscription (steward escalations arrive this way).
@@ -5840,13 +5877,16 @@ class Daemon:
         return "owner" if uid and uid == self.cfg.get("SLACK_OWNER_ID") else "member"
 
     def route(self, chat, ctype):
-        """The session a channel is. An unmapped channel falls back to its normalised name (dir provisioned on the channel's first message, see needs_dir/provision_dir); `#<repo>-updates` routes as the same session as `#<repo>` only when it is the twin the box recorded (own_twin), since anyone can make a channel of that name. Never for a DM (goes to the box session), #approvals/#alerts, a sub-orch channel (its orch owns it), a name nothing valid survives, or `#<repo>-ask` — the question lane is answered by cc-ask (on_event → ask_start) and is nobody's session, so nothing said or reacted there can wake one."""
+        """The session a channel is. An unmapped channel falls back to its normalised name (dir provisioned on the channel's first message, see needs_dir/provision_dir); `#<repo>-updates` routes as the same session as `#<repo>` only when it is the twin the box recorded (own_twin), since anyone can make a channel of that name. Never for a DM (goes to the box session), #approvals/#alerts, a sub-orch channel (its orch owns it), a name nothing valid survives, or `#<repo>-ask` — the question lane is answered by cc-ask (on_event → ask_start) and is nobody's session, so nothing said or reacted there can wake one. A channel of a mirror workspace (SLACK_MIRROR_<N>) routes by its routes.json id entry alone, never by its name."""
         e = load_orchs().get(chat)                       # a sub-orch's channel: every message there belongs to that orch (chan_alias)
         if e:
             return e.get("target") if not e.get("archived") and valid_target(e.get("target")) else None
         if ctype == "im":
             return "box"
         routes = load_routes()
+        if WS["extra"] and (WS["extra"].get(chat_workspace(chat)) or {}).get("mirror"):
+            t = routes.get(chat)                        # a mirror's channel routes by its id alone, never by its name
+            return t if isinstance(t, str) and valid_target(t) else None
         name = self.chan_name(chat)
         if chat in self.unnamed and not routes.get(chat):   # lookup failed: the raw id is no name (on_event retries)
             return None
@@ -6693,8 +6733,7 @@ class Daemon:
             return False
         ws = rec.get("workspace") or ""
         if not is_owner:
-            m = load_members().get(ws) or {}
-            if not (user and m.get("uid") == user and member_chat_ok(ws, self.chan_name(chat))):
+            if not (member_user(ws, user) and member_chat(ws, chat, self.chan_name(chat))):
                 return False
         ids = ",".join(h.get("mail") or "?" for h in holds)
         if word == "drop":
@@ -6890,8 +6929,7 @@ class Daemon:
             return False
         ws = rec.get("workspace") or ""
         if not is_owner:
-            m = load_members().get(ws) or {}
-            if not (user and m.get("uid") == user and member_chat_ok(ws, self.chan_name(chat))):
+            if not (member_user(ws, user) and member_chat(ws, chat, self.chan_name(chat))):
                 return False
         here = next((r for r in rec.get("roots") or [] if r["chat"] == chat and r["ts"] == thread), None)
         if here is None:
@@ -9558,10 +9596,10 @@ def cmd_post_file(argv):
         print("cc-slack:" + woke, file=sys.stderr)
     return 0
 
-def find_channel(cfg, name):
+def find_channel(cfg, name, ws=None):
     """#name → (id, is_member) across all channels the bot can see, or (None, False); a name another workspace's
-    member workspace owns is looked for in that workspace alone (ws_of_name)."""
-    cur, ws = None, ws_of_name(name)
+    member workspace owns is looked for in that workspace alone (ws_of_name), and so is any name when `ws` names it."""
+    cur, ws = None, ws_of_name(name) if ws is None else ws
     while True:
         r = api("conversations.list", WS["extra"][ws]["bot"] if ws else cfg["SLACK_BOT_TOKEN"],
                 types="public_channel,private_channel", exclude_archived="true", limit="200", cursor=cur)
@@ -9611,11 +9649,12 @@ def inherit_members(cfg, parent, cid, name):
         log(f"#{name}: could not inherit the parent channel's members ({e!r}) — invite them in Slack")
         return 0
 
-def ensure_channel(cfg, name, private=True, parent=None, invite=()):
-    """#name exists, the bot is in it and the owner is invited → (id, "created"|"joined"|"member"). `parent` (a channel id) hands the new channel the parent's humans, on creation only, never a re-sync. `invite` = ids to add alongside the owner. The owner is never optional: every channel the box makes is one he is in — in another Slack workspace as his id there (SLACK_OWNER_ID_<N>), and none when he is not in it."""
-    tok, ws = cfg["SLACK_BOT_TOKEN"], ws_of_name(name)
+def ensure_channel(cfg, name, private=True, parent=None, invite=(), ws=None):
+    """#name exists, the bot is in it and the owner is invited → (id, "created"|"joined"|"member"). `parent` (a channel id) hands the new channel the parent's humans, on creation only, never a re-sync. `invite` = ids to add alongside the owner. The owner is never optional: every channel the box makes is one he is in — in another Slack workspace as his id there (SLACK_OWNER_ID_<N>), and none when he is not in it. `ws` makes it in that extra workspace whatever the name (a mirror's own channels), with that workspace's own bot token."""
+    ws = ws_of_name(name) if ws is None else ws
+    tok = WS["extra"][ws]["bot"] if ws else cfg["SLACK_BOT_TOKEN"]
     owner = WS["extra"][ws]["owner"] if ws else cfg.get("SLACK_OWNER_ID")   # his id in that workspace; none if he is not in it
-    cid, member = find_channel(cfg, name)
+    cid, member = find_channel(cfg, name) if ws == ws_of_name(name) else find_channel(cfg, name, ws)
     how = "member"
     if not cid:
         try:
@@ -10575,8 +10614,11 @@ def cmd_workspace(args):
                 api("apps.connections.open", w["app"]); app = "app OK"
             except Exception as e:
                 app = f"app FAILED: {e}"
-            print(f"{name}: member workspace {w['member'] or '(none)'}, owner {w['owner'] or '(not in it)'}; {bot}; {app}")
+            print(f"{name}: member workspace {w['member'] or '(none)'}{' (mirror)' if w.get('mirror') else ''}, "
+                  f"owner {w['owner'] or '(not in it)'}, approver {w.get('approver') or '(none)'}; {bot}; {app}")
         return 0
+    if args[:1] in (["route"], ["channel"], ["employee"]):
+        return workspace_face(cfg, args)
     pos, flags, uid, it = [], set(), "", iter(args)
     for a in it:
         if a == "--uid":
@@ -10586,7 +10628,7 @@ def cmd_workspace(args):
         else:
             pos.append(a)
     if pos[:1] != ["move"] or len(pos) != 3 or flags - {"--uid", "--apply"} or ("--uid" in flags and not re.match(r"[UW][A-Z0-9]+\Z", uid)):
-        print("usage: cc-slack workspace list | move <handle> <ws> [--uid U…] [--apply]", file=sys.stderr); return 2
+        print("usage: cc-slack workspace list | move <handle> <ws> [--uid U…] [--apply]\n" + WS_FACE_USAGE, file=sys.stderr); return 2
     handle, ws = pos[1], pos[2]
     w = WS["extra"].get(ws)
     if not w:
@@ -10628,6 +10670,74 @@ def cmd_workspace(args):
     if moved != m:                                     # chan_id, updates_id: MailPlaces and every member post read them
         save_members(moved)
     print(f"moved {len(ids)} channel(s) of {handle} to {ws}; {len(gone)} track thread(s) reopen at their next line")
+    return 0
+
+WS_FACE_USAGE = ("usage: cc-slack workspace route <ws> <C…> <target>\n"
+                 "       cc-slack workspace channel <ws> <name> <target> [--title T] [--purpose P] [--with U…]\n"
+                 "       cc-slack workspace employee <ws> <name> <U…> [--title T] [--purpose P]")
+
+def workspace_face(cfg, args):
+    """A channel of extra workspace <ws> routed to one target of its member workspace — the way a mirror's channels,
+    plainly named, reach the sessions that already exist. `route` records an existing channel's id in routes.json.
+    `channel` makes #<name> there (always PRIVATE), invites the owner's id there, SLACK_INVITE_<N> and any --with,
+    sets its topic (--title) and purpose (--purpose), and routes it. `employee <ws> <name> <U…>` is `channel` for one
+    person: #<name>, routed to the track <member>/<name>, with them invited too; their session starts at their first
+    message, inside the member workspace like any of its tracks, and they are a member there, never its approver. Each
+    is idempotent: a channel already there is reused, a route already right is left. The target must belong to the
+    member workspace <ws> is bound to (SLACK_MEMBER_WS_<N>): no channel there can be routed to the box's own sessions."""
+    pos, opt, it = [], {"--title": "", "--purpose": "", "--with": []}, iter(args)
+    for a in it:
+        if a in ("--title", "--purpose"):
+            opt[a] = next(it, "")
+        elif a == "--with":
+            opt[a].append(next(it, ""))
+        elif a.startswith("--"):
+            print(WS_FACE_USAGE, file=sys.stderr); return 2
+        else:
+            pos.append(a)
+    verb = pos[0]
+    uid_re = r"[UW][A-Z0-9]+\Z"
+    if len(pos) != 4 or (verb == "route" and not re.match(r"[CG][A-Z0-9]+\Z", pos[2])) \
+            or (verb != "route" and not re.match(r"[a-z0-9][a-z0-9_-]{0,79}\Z", pos[2])) \
+            or (verb == "employee" and not re.match(uid_re, pos[3])) or not all(re.match(uid_re, u) for u in opt["--with"]):
+        print(WS_FACE_USAGE, file=sys.stderr); return 2
+    ws = pos[1]
+    w = WS["extra"].get(ws)
+    if not w:
+        print(f"{ws} is not a configured workspace (SLACK_WORKSPACES, SLACK_BOT_TOKEN_<N>, SLACK_APP_TOKEN_<N>)", file=sys.stderr); return 1
+    h = w["member"]
+    target = f"{h}/{pos[2]}" if verb == "employee" else pos[3]
+    if not h or target.partition("/")[0] != h or not valid_target(target):
+        print(f"{target} is not a target of {ws}'s member workspace ({h or 'SLACK_MEMBER_WS_' + ws.upper().replace('-', '_') + ' unset'})", file=sys.stderr); return 1
+    if verb == "route":
+        cid = pos[2]
+        try:
+            info = api("conversations.info", w["bot"], channel=cid)["channel"]
+        except Exception as e:
+            print(f"{cid} is not a channel the bot can see in {ws}: {e}", file=sys.stderr); return 1
+        name = info.get("name") or cid
+    else:
+        name = pos[2]
+        invite = [u for u in dict.fromkeys(w.get("invite", []) + opt["--with"] + ([pos[3]] if verb == "employee" else []))
+                  if u != w["owner"]]                   # ensure_channel invites the owner's id there itself
+        cid, how = ensure_channel(cfg, name, True, invite=invite, ws=ws)
+        print(f"#{name} {cid}: {how} in {ws}, invited {' '.join(invite) or 'nobody else'}")
+        title = opt["--title"] or (f"{name.replace('-', ' ').title()}'s own channel" if verb == "employee" else "")
+        purpose = opt["--purpose"] or ("Ask for anything here, or suggest a project. Your assistant answers in this "
+                                       "channel." if verb == "employee" else "")
+        for method, key, text in (("conversations.setTopic", "topic", title), ("conversations.setPurpose", "purpose", purpose)):
+            if text:
+                try:
+                    api(method, w["bot"], channel=cid, **{key: text})
+                except Exception as e:
+                    print(f"#{name}: {key} not set ({e})", file=sys.stderr)
+    ws_remember("chan", cid, ws)
+    routes = load_routes() or {}
+    if routes.get(cid) == target:
+        print(f"#{name} {cid} already routes to {target}"); return 0
+    routes[cid] = target
+    save_table("routes.json", routes, indent=1)
+    print(f"#{name} {cid} in {ws} → {target}")
     return 0
 
 def cmd_selfcheck():
