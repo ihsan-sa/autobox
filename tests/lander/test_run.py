@@ -1664,6 +1664,42 @@ class Admission(unittest.TestCase):
         with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=lambda _: None, lane=True) as held:
             self.assertEqual(held, [1])
 
+    def test_a_prove_hold_holds_the_lane_and_lets_its_own_sweep_through(self):
+        # PROVE HOLD: "the lane admits no new checks while a prove runs" — but the sweep that names the hold does
+        import time
+        now = time.time_ns()
+        hold = f"+{now - 60 * 10**9:019d}-4545-0000a0a0"   # lander-self's, a minute in
+        st = self.lanes_first_queue(hold)
+        q = os.path.join(st, "slots", "queue")
+        lane = open(os.path.join(q, f"+{now - 30 * 10**9:019d}-4646-0000b0b0"), "a")   # a lane waiter behind it
+        fcntl.flock(lane, fcntl.LOCK_EX)
+        self.addCleanup(lane.close)
+        said = []
+        with self.assertRaises(TimeoutError):   # the lane's next check waits behind the hold
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, poll=0.02, deadline=0.2, say=said.append, lane=True):
+                pass
+        self.assertIn("2 waiting ahead of it, the oldest pid 4545", said[0])
+        self.assertEqual(A.free(st, self.psi_dir(0, 0), 2), 0)   # so the lane sends what it can to the runners
+        with mock.patch.dict(os.environ, {"LANDER_PROVE_HOLD": hold}):
+            self.assertEqual(A._ahead(q, "~")[:2], (0, None))   # neither the hold nor the lane behind it counts
+            self.assertEqual(A.free(st, self.psi_dir(0, 0), 2), 2)
+            with A.slot(st, psi_root=self.psi_dir(0, 0), k=2, deadline=1, say=lambda _: None) as held:
+                self.assertEqual(held, [1])
+        older = open(os.path.join(q, f"+{now - 90 * 10**9:019d}-4747-0000c0c0"), "a")   # a waiter from before it
+        fcntl.flock(older, fcntl.LOCK_EX)
+        self.addCleanup(older.close)
+        with mock.patch.dict(os.environ, {"LANDER_PROVE_HOLD": hold}):
+            self.assertEqual(A._ahead(q, "~")[:2], (1, os.path.basename(older.name)))   # still goes first
+        with mock.patch.dict(os.environ, {"LANDER_PROVE_HOLD": "!not-a-ticket"}):
+            self.assertEqual(A._ahead(q, "~")[0], 3)   # a name no ticket has bounds nothing
+        older.close()
+        # lander-self crashed: its flock is gone, and the next waiter removes the ticket and goes on
+        q_hold = os.path.join(q, hold)
+        os.rename(q_hold, q_hold + ".x")   # the held file moves off a ticket's name; an unlocked one takes its place
+        open(q_hold, "a").close()
+        self.assertEqual(A._ahead(q, "~")[:2], (1, os.path.basename(lane.name)))
+        self.assertFalse(os.path.exists(q_hold))
+
     def test_a_stopped_waiter_is_passed_after_the_cap_and_said(self):
         st = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(st))

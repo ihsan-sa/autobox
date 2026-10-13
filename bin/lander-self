@@ -29,7 +29,7 @@ A planning seat runs it by hand; the lander never installs itself.
         it runs the current release's `lander settle-merged <repo> <pr> --by lander-self` (its own process), which
         moves the PR's query job to merged and writes the lane's merged line; a release without that command, or
         none, leaves it to the lander tick's `ended` sweep, and the land still exits 0.
-    lander-self promote [REV] [--repo DIR] [--pr N]
+    lander-self promote [REV] [--repo DIR] [--pr N] [--cap SECONDS]
         Build ~/.cc/lander/releases/<sha>/ from `git archive` of REV (default origin/main) — committed code only,
         less any __pycache__ it tracks (a tracked unchecked-hash .pyc would run in place of its .py), plus the repo's
         tests/landing-repos/ (the host fallback manifests the lander reads for a repo that ships
@@ -46,8 +46,15 @@ A planning seat runs it by hand; the lander never installs itself.
         tools run.py execs, cc-config and the fallback manifests); otherwise every check is swept. A name on main's list is either reused or run, and the proof
         prints how many of each. Each sweep runs as a transient `systemd-run --user` service, as the
         lane does: the user manager's environment, a private TMUX_TMPDIR, and none of the caller's tmux, CC_*
-        variables, sandbox or Landlock domain. The proof is one run capped at PROVE_CAP (an hour). Exit 1 refused,
-        3 when the proof gave no verdict (the cap, a sweep that did not finish); current is unchanged either way.
+        variables, sandbox or Landlock domain. The proof is one run capped at PROVE_CAP (an hour); `--cap SECONDS`
+        sets another for this run only. While it runs it HOLDS THE LANE (perms, 10-13): a ticket in the landing
+        queue that sorts before every lane ticket (hold_lane), so no new check of the lane's takes a box slot while
+        the ones already running finish, and the candidate's sweep, told the ticket's name, waits only behind what
+        was there first. The hold goes when the proof ends, however it ends: lander-self drops it, and a crash drops
+        its flock, which makes the next waiter remove it. No hold for a release whose admission does not read
+        LANDER_PROVE_HOLD (its sweep would wait behind it), so the current release's comparison sweep runs unheld.
+        Exit 1 refused, 3 when the proof gave no verdict (the cap, a sweep that did not finish); current is
+        unchanged either way.
         Only if all of that is green point `current` at it, keeping the one before as `previous`. A releases/<sha>
         already there is rebuilt beside it and kept only when the two trees are byte-identical; otherwise the fresh build replaces it (a planted or edited release never runs).
         REV must be origin/main or an ancestor of it. THE ONE EXCEPTION is the cutover's step 5, which promotes the
@@ -59,8 +66,9 @@ A planning seat runs it by hand; the lander never installs itself.
         running when it moves `current`. Only the perms seat promotes: the Claude session that runs it must work in
         <passwd home>/.cc/state/<repo>/perms (<repo> the checkout's directory name), the check `lander record --by
         perms-*` makes, or it is refused (exit 1) before anything is built.
-    lander-self prove [REV] [--repo DIR] [--pr N]
-        promote without the switch: the same refusals for REV, its selfcheck and the proof on main, against
+    lander-self prove [REV] [--repo DIR] [--pr N] [--cap SECONDS]
+        promote without the switch: the same refusals for REV, its selfcheck and the proof on main (and its hold),
+        against
         `current` (against nothing when REV is current). Run it on a host before that host takes over landing.
         Exit 0 proven, 1 refused, 3 could not run.
     lander-self reads [REV] [--repo DIR]
@@ -521,13 +529,14 @@ def private_tmux():
     return tempfile.mkdtemp(prefix="lander-prove-tmux-")
 
 
-def sweep_under(rel, root, sha, only=(), cap=PROVE_CAP, grace=120):
+def sweep_under(rel, root, sha, only=(), cap=PROVE_CAP, grace=120, hold=""):
     """Release `rel`'s `lander sweep` of commit `sha` in checkout `root` (only: just those checks), on the host as the
     lane runs it: a transient `systemd-run --user` service like the lane's own, so it has the user manager's
     environment and none of the caller's (security read, 10-12: a pane's TMUX let a host check's send-keys type
     into the seat), a private TMUX_TMPDIR, no Landlock domain or sandbox the caller sits in (Opus read: under
     cc-nosignal the bare checks went red under both releases and passed as main's own), and RuntimeMaxSec at the
-    cap. -> ({check: passed|failed|unrunnable}, why): why is '' when the sweep ran to its end.
+    cap. hold: the lane hold's ticket name (hold_lane), passed as LANDER_PROVE_HOLD so the sweep waits only behind
+    the tickets older than it. -> ({check: passed|failed|unrunnable}, why): why is '' when the sweep ran to its end.
     PATH is the user manager's, which is what the lane's own unit gets: spawn_lane and a re-armed tick set none, and
     only a tick that `queue` starts runs with tick_path() (correctness read of 2354c5f3: use the lane unit's). HOME
     is the passwd home, as every lane has it."""
@@ -542,6 +551,7 @@ def sweep_under(rel, root, sha, only=(), cap=PROVE_CAP, grace=120):
     argv = [sysrun, "--user", "--wait", "--pipe", "--collect", "--quiet", f"--unit={unit}",
             f"--property=RuntimeMaxSec={max(1, int(cap))}", "--setenv=PYTHONDONTWRITEBYTECODE=1",
             f"--setenv=TMUX_TMPDIR={tmux}", f"--setenv=HOME={home}",
+            *([f"--setenv=LANDER_PROVE_HOLD={hold}"] if hold else []),
             sys.executable, "-P", os.path.join(rel, "core", "lander", "cli.py"), "sweep", "--repo", root, "--rev", sha]
     for n in only:
         argv += ["--only", n]
@@ -743,17 +753,105 @@ def prove(cand, cur, run, names=None, cap=PROVE_CAP, clock=None, reuse=()):
     return sorted(dropped + [n for n in off if base.get(n) == "passed"]), lines, ""
 
 
-def proven(rel, cur, root, main):
+# THE HOLD (perms, 10-13: "the lane admits no new checks while a prove runs, and checks already running finish").
+# Admission slots are flocks the whole box shares, and only the oldest live ticket in <state>/slots/queue may take
+# one (admission.py, FAIR WAIT). hold_lane() writes a ticket of the lane's own form (`+` and 19 digits of
+# nanoseconds), named one nanosecond before the oldest lane ticket there and never more than HOLD_BACK seconds back
+# (a lane's TICKET_CAP, 12 h, takes an older one for stuck), and keeps it flocked for the proof. Every release's
+# admission, the current one's included, then counts it as the oldest waiter, so the lane takes no new box slot;
+# admission.free() is 0, so the lane sends what it can to the runners. The candidate's sweep gets the name in
+# LANDER_PROVE_HOLD and waits only behind the tickets older than it. Release: Hold.drop() unlinks it and closes the
+# flock when the proof ends; a lander-self killed in between loses the flock with its process, and the next waiter's
+# _ahead() finds the ticket unlocked and removes it. Read, not imported: lander-self shares no code with lander/.
+HOLD_BACK = 3600
+HOLD_RE = re.compile(r"\+([0-9]{19})-[0-9]+-[0-9a-f]{8}")
+
+
+def holds(rel):
+    """True when release `rel`'s admission reads LANDER_PROVE_HOLD, so its sweep can run while the lane is held."""
+    try:
+        with open(os.path.join(rel, "core", "lander", "admission.py"), encoding="utf-8", errors="replace") as f:
+            return "LANDER_PROVE_HOLD" in f.read()
+    except OSError:
+        return False
+
+
+def hold_lane(state=LAND_STATE, now_ns=None):
+    """Write and flock the hold's ticket in <state>/slots/queue -> (name, open file). Locked before it is renamed to
+    its ticket's name, as admission._ticket does, so nobody sees it unlocked and takes it for a dead one."""
+    import time
+    import uuid
+    q = os.path.join(state, "slots", "queue")
+    os.makedirs(q, exist_ok=True)
+    now = time.time_ns() if now_ns is None else now_ns
+    born = min([now] + [int(m.group(1)) - 1 for m in map(HOLD_RE.fullmatch, os.listdir(q)) if m])
+    born = max(born, now - HOLD_BACK * 10**9)
+    name = f"+{born:019d}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    tmp = os.path.join(q, f".new-{name}")
+    f = open(tmp, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        os.rename(tmp, os.path.join(q, name))
+    except OSError:
+        f.close()
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return name, f
+
+
+class Hold:
+    """The lane hold for one proof: take() before a sweep of a release that holds(), drop() before one that does not
+    and when the proof ends. A hold that cannot be written is said and the proof goes on unheld."""
+
+    def __init__(self, state=LAND_STATE, say=print):
+        self.state, self.say, self.name, self.f = state, say, "", None
+
+    def take(self):
+        if self.f is None:
+            try:
+                self.name, self.f = hold_lane(self.state)
+                self.say(f"lander-self: holding the lane's new checks for the proof (ticket {self.name})")
+            except OSError as e:
+                self.say(f"lander-self: could not hold the lane, so the proof runs beside it: {e}")
+                self.name = ""
+        return self.name
+
+    def drop(self):
+        if self.f is not None:
+            try:
+                os.unlink(os.path.join(self.state, "slots", "queue", self.name))
+            except OSError:
+                pass
+            self.f.close()
+            self.say("lander-self: the lane's checks are admitted again")
+        self.name, self.f = "", None
+
+
+def proven(rel, cur, root, main, cap=PROVE_CAP, state=None):
     """('', False) when release `rel` keeps every check of origin/main (`main`) that `cur` passes, else (why not,
-    True when no verdict could be had: exit 3, not a refusal's 1). Prints the proof's lines."""
+    True when no verdict could be had: exit 3, not a refusal's 1). Prints the proof's lines. The lane is held
+    (THE HOLD) while a release that holds() sweeps, and never past the proof."""
     print(f"lander-self: proving {os.path.basename(rel)[:12]} on main {main[:12]}: every check, as the lane runs it "
-          f"(cap {PROVE_CAP}s)", flush=True)
+          f"(cap {cap}s)", flush=True)
     reuse = reusable(rel, cur, main_tree(root, main))
     if cur and not same_runner(rel, cur):
         print("  the candidate runs checks with code that differs from the current release's: sweeping every check",
               flush=True)
-    bad, lines, why = prove(rel, cur, lambda r, only, cap: sweep_under(r, root, main, only, cap),
-                            names=lambda r: names_under(r, root, main), reuse=reuse)
+    hold = Hold(state or LAND_STATE, lambda ln: print(ln, flush=True))
+    if not holds(rel):
+        print("  the candidate's admission does not read LANDER_PROVE_HOLD, so the lane is not held", flush=True)
+
+    def run(r, only, left):
+        if not holds(r):
+            hold.drop()   # this release's sweep would wait behind the hold
+        return sweep_under(r, root, main, only, left, hold=hold.take() if holds(r) else "")
+    try:
+        bad, lines, why = prove(rel, cur, run, names=lambda r: names_under(r, root, main), cap=cap, reuse=reuse)
+    finally:
+        hold.drop()
     for ln in lines:
         print(f"  {ln}")
     if why:
@@ -886,9 +984,11 @@ def promotable(root, sha, pr="", head_of=open_pr_head, main=""):
 
 
 def cmd_promote(args, opts):
-    root = repo_of(opts.get("repo", ""))
+    root, cap = repo_of(opts.get("repo", "")), cap_of(opts)
     if not root:
         return die("promote: no checkout (--repo DIR)", 2)
+    if not cap:
+        return die("promote: --cap takes a whole number of seconds above 0", 2)
     if not perms_caller(root):
         return die("promote: refused — only the perms seat moves the live lander to a new release "
                    f"(run it from {os.path.basename(root)}'s perms seat); current is unchanged")
@@ -915,7 +1015,7 @@ def cmd_promote(args, opts):
         unlink("legacy-on")
         print(f"lander-self: {sha[:12]} is already current")
         return 0
-    why, nov = proven(rel, cur, root, main)
+    why, nov = proven(rel, cur, root, main, cap)
     if why:
         return die(f"promote: refused, current is unchanged — {why}", 3 if nov else 1)
     if cur:
@@ -986,9 +1086,9 @@ def cmd_reads(args, opts):
 
 def cmd_prove(args, opts):
     """promote's checks and its proof on main, without the switch: what a host runs before it takes over landing."""
-    root = repo_of(opts.get("repo", ""))
-    if len(args) > 1 or not root:
-        return die("usage: lander-self prove [REV] [--repo DIR] [--pr N]", 2)
+    root, cap = repo_of(opts.get("repo", "")), cap_of(opts)
+    if len(args) > 1 or not root or not cap:
+        return die("usage: lander-self prove [REV] [--repo DIR] [--pr N] [--cap SECONDS]", 2)
     for ln in pin_remotes(root):
         print(f"lander-self: {ln}")
     main = main_sha(root)
@@ -1008,7 +1108,7 @@ def cmd_prove(args, opts):
     if not ok:
         return die(f"prove: {sha[:12]}'s own selfcheck is red: {tail}")
     cur = link_target("current")
-    why, nov = proven(rel, "" if cur == os.path.realpath(rel) else cur, root, main)
+    why, nov = proven(rel, "" if cur == os.path.realpath(rel) else cur, root, main, cap)
     if why:
         return die(f"prove: {sha[:12]} is not proven — {why}", 3 if nov else 1)
     print(f"lander-self prove: {sha[:12]} keeps every check green on main {main[:12]}"
@@ -1554,7 +1654,7 @@ def settle_merged(repo, pr, run=sh):
 
 def selfcheck():
     """Every case builds its own HOME and repo. Prints `lander-self selfcheck: N passed, M failed`."""
-    global HOME, ROOT, ALLOW_LOCAL
+    global HOME, ROOT, ALLOW_LOCAL, LAND_STATE
     results = []
 
     def case(name, cond):
@@ -1562,7 +1662,7 @@ def selfcheck():
         if not cond:
             print(f"lander-self selfcheck: FAIL {name}")
 
-    old = HOME, ROOT
+    old = HOME, ROOT, LAND_STATE
     # the path rule: every changed path must be on the list, and ** crosses segments while * does not
     pats = ["core/lander/**", "core/bin/lander", "core/bin/lander-self", "tests/LANDING.toml"]
     case("paths on the list pass", outside(["core/lander/a/b.py", "core/bin/lander-self"], pats) == [])
@@ -1591,6 +1691,7 @@ def selfcheck():
     # pin / promote / rollback / legacy on a throwaway repo and HOME
     with tempfile.TemporaryDirectory() as t:
         HOME, ROOT = t, os.path.join(t, ".cc", "lander")
+        LAND_STATE = os.path.join(t, ".cc", "state", "land")   # a proof's hold never touches the live queue
         repo = os.path.join(t, "repo")
         os.makedirs(os.path.join(repo, "core", "lander"))
         os.makedirs(os.path.join(repo, "core", "bin"))
@@ -1680,12 +1781,12 @@ def selfcheck():
             leg_after = link_target("legacy-on")
             # the proof on main: a candidate that turns a check red which the current release passes is refused
             real_sweep = sweep_under
-            globals()["sweep_under"] = lambda rel, root, sha, only=(), cap=0: (  # noqa: E731
+            globals()["sweep_under"] = lambda rel, root, sha, only=(), cap=0, **_: (  # noqa: E731
                 {"demo": "passed" if os.path.realpath(rel) == link_target("current") else "failed"}, "")
             try:
                 r_regress = cmd_promote([a], o)
                 cur_regress = link_target("current")
-                globals()["sweep_under"] = lambda rel, root, sha, only=(), cap=0: (  # noqa: E731
+                globals()["sweep_under"] = lambda rel, root, sha, only=(), cap=0, **_: (  # noqa: E731
                     {}, "stopped at the cap (1s)")
                 r_nov = cmd_promote([a], o)
             finally:
@@ -1841,9 +1942,10 @@ def selfcheck():
             sys.stderr = _err
         case("shadow with two revs is a usage refusal", r_use == 2)
     perms_caller_cases(case)
+    hold_cases(case)
     identity_gate_cases(case)
     pycache_cases(case)
-    HOME, ROOT = old
+    HOME, ROOT, LAND_STATE = old
     bad = sum(1 for _, ok in results if not ok)
     print(f"lander-self selfcheck: {len(results) - bad} passed, {bad} failed")
     return 1 if bad else 0
@@ -1914,6 +2016,115 @@ def pycache_cases(case):
              "docs/outside.bin" in (binaries(repo, base, head, "") or []))
         case("…and an unknown base is None, not a pass", binaries(repo, "0" * 40, head, "core/") is None)
     ROOT = old_root
+
+
+def hold_cases(case):
+    """THE HOLD and --cap: each case on its own queue dir."""
+    import time
+    g = globals()
+
+    def locked(p):
+        with open(p, "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return False
+            except OSError:
+                return True
+    with tempfile.TemporaryDirectory(prefix="lander-self-hold.") as t:
+        now = time.time_ns()
+        st = os.path.join(t, "a")
+        q = os.path.join(st, "slots", "queue")
+        os.makedirs(q)
+        lane = f"+{now - 30 * 10**9:019d}-4646-0000b0b0"
+        worker = f"0{now - 600 * 10**9:019d}-4747-0000c0c0"
+        for n in (lane, worker):
+            open(os.path.join(q, n), "a").close()
+        name, f = hold_lane(st, now)
+        case("hold: its ticket sorts before every lane and worker ticket", sorted(os.listdir(q))[0] == name
+             and name < lane < worker and name.startswith(f"+{now - 30 * 10**9 - 1:019d}-"))
+        case("hold: its ticket is flocked while held", locked(os.path.join(q, name)))
+        f.close()
+        case("hold: a closed hold leaves a ticket any waiter takes for dead", not locked(os.path.join(q, name)))
+
+        st = os.path.join(t, "b")
+        q = os.path.join(st, "slots", "queue")
+        os.makedirs(q)
+        open(os.path.join(q, f"+{now - 7200 * 10**9:019d}-4848-0000d0d0"), "a").close()   # a stuck lane waiter
+        name, f = hold_lane(st, now)
+        case("hold: never named more than HOLD_BACK back", name.startswith(f"+{now - HOLD_BACK * 10**9:019d}-"))
+        f.close()
+
+        st = os.path.join(t, "c")
+        said = []
+        h = Hold(st, said.append)
+        n1 = h.take()
+        case("hold: take() holds once, however often it is asked", n1 and h.take() == n1
+             and os.listdir(os.path.join(st, "slots", "queue")) == [n1])
+        h.drop()
+        h.drop()
+        case("hold: drop() removes the ticket, once", os.listdir(os.path.join(st, "slots", "queue")) == []
+             and sum("admitted again" in ln for ln in said) == 1)
+        bad = os.path.join(t, "file")
+        open(bad, "w").close()
+        h = Hold(bad, said.append)
+        case("hold: a hold that cannot be written is said, and the proof goes on unheld",
+             h.take() == "" and "could not hold the lane" in said[-1])
+
+        # a lander-self killed mid-proof: the kernel drops its flock, so the ticket is a dead one
+        st = os.path.join(t, "d")
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            nm, _f = hold_lane(st)
+            os.write(w, nm.encode())
+            time.sleep(60)
+            os._exit(0)
+        os.close(w)
+        nm = os.read(r, 200).decode()
+        os.close(r)
+        p = os.path.join(st, "slots", "queue", nm)
+        alive = locked(p)
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        case("hold: a killed lander-self's ticket is held while it lives and dead after", alive and not locked(p))
+
+        rel_new, rel_old = os.path.join(t, "new"), os.path.join(t, "old")
+        for r_, text in ((rel_new, "x = os.environ.get('LANDER_PROVE_HOLD')\n"), (rel_old, "x = 1\n")):
+            os.makedirs(os.path.join(r_, "core", "lander"))
+            with open(os.path.join(r_, "core", "lander", "admission.py"), "w") as f:
+                f.write(text)
+        case("hold: a release whose admission reads LANDER_PROVE_HOLD holds, one without does not",
+             holds(rel_new) and not holds(rel_old) and not holds(os.path.join(t, "none")))
+
+        # proven: the candidate's sweep runs held, the current release's unheld, and the hold goes however it ends
+        st = os.path.join(t, "e")
+        q = os.path.join(st, "slots", "queue")
+        seen = []
+
+        def sweep(rel, root, sha, only=(), cap=0, grace=0, hold=""):
+            seen.append((os.path.basename(rel), hold, cap, sorted(os.listdir(q)) if os.path.isdir(q) else []))
+            if rel == rel_new:
+                return ({"a": "failed"} if not only else {n: "failed" for n in only}), ""
+            raise ValueError("the current release's sweep fell over")
+        saved = {k: g[k] for k in ("sweep_under", "names_under")}
+        g["sweep_under"], g["names_under"] = sweep, lambda r, root, sha: (["a"], "")
+        try:
+            out = _raises(lambda: proven(rel_new, rel_old, t, "f" * 40, 77, st))
+        finally:
+            g.update(saved)
+        case("hold: the candidate's sweeps run held and under --cap", [s_[:3] for s_ in seen[:2]] ==
+             [("new", seen[0][1], 77), ("new", seen[0][1], seen[1][2])] and seen[0][1]
+             and seen[0][3] == [seen[0][1]] and seen[1][1] == seen[0][1])
+        case("hold: the current release's sweep runs unheld, with no ticket in the queue",
+             len(seen) == 3 and seen[2][:2] == ("old", "") and seen[2][3] == [])
+        case("hold: a proof that raises leaves the lane unheld", out and os.listdir(q) == [])
+
+    case("--cap: none is PROVE_CAP", cap_of({}) == PROVE_CAP)
+    case("--cap: whole seconds are taken for this run", cap_of({"cap": "5400"}) == 5400)
+    case("--cap: 0, a sign, a word or a superscript is refused",
+         not any(cap_of({"cap": v}) for v in ("0", "-5", "+5", "1h", "", "\u00b2", "9" * 12)))
+    case("--cap: parse() takes its value", parse(["x", "--cap", "90"])[1].get("cap") == "90")
 
 
 def identity_gate_cases(case):
@@ -2399,13 +2610,22 @@ def _raises(f):
 def parse(argv):
     args, opts, it = [], {}, iter(argv)
     for a in it:
-        if a in ("--repo", "--rev", "--repo-dir", "--pr"):
+        if a in ("--repo", "--rev", "--repo-dir", "--pr", "--cap"):
             opts[a[2:]] = next(it, "")
         elif a == "--legacy":
             opts["legacy"] = True
         else:
             args.append(a)
     return args, opts
+
+
+def cap_of(opts):
+    """The proof's cap in seconds: --cap when given (a whole number above 0, ASCII digits), else PROVE_CAP; 0 when
+    --cap is not such a number."""
+    v = opts.get("cap")
+    if v is None:
+        return PROVE_CAP
+    return int(v) if v.isascii() and v.isdigit() and len(v) < 9 and int(v) > 0 else 0
 
 
 def perms_caller_cases(case):

@@ -44,6 +44,17 @@ as hung. The landing lane sets no note. A cc-green run also names a per-repo fil
 LANDER_WAIT_ROW), and every slot it takes appends `start end row who secs` there once held, the wait cc-i2m counts
 as the green stage: the run's own log is one per worktree and the next run overwrites it.
 
+PROVE HOLD (perms, 10-13: promotes stopped at lander-self's PROVE_CAP because the lane's queued checks took every
+slot from the proof's sweep). While `lander-self promote` or `prove` proves a release, it holds a lane-named ticket
+of its own, named to sort before every lane ticket less than an hour old, so every waiter after it, the lane's
+included, waits behind it: the lane admits no new box check, checks already holding a slot finish, and free() is 0,
+so the lane sends what it can to the runners. An express run takes no slot, so the hold does not stop it. The
+sweep that lander-self starts names that ticket in LANDER_PROVE_HOLD, and to its _ahead() only the tickets older
+than the hold count, so it waits behind those and nothing else. A ticket is a flock: when lander-self ends, by its
+own release or by a crash, the next waiter finds it dead and removes it, as any other. lander-self does not hold
+the lane for a release whose admission does not read LANDER_PROVE_HOLD, because that release's sweep would wait
+behind the hold until the cap.
+
 HIGH LOAD (2026-09-28: load 31-80 on 12 cores and 12 GB swapped, checks went from under 5 min to 11-17). overloaded() is
 the one signal for "the box is overloaded": the lander serializes on it and gives its one run priority (below), and
 `cc-room` queues new `--go` workers on the same call until it clears, so the landing queue keeps moving while the
@@ -287,9 +298,11 @@ def _ahead(qdir: str, mine: str, cap: float | None = None) -> tuple:
     entry that is not a regular file, or a `.new-` ticket a crash left before its rename. A name _ticket would not
     have given is skipped."""
     cap = TICKET_CAP if cap is None else cap
+    hold = os.environ.get("LANDER_PROVE_HOLD", "")   # PROVE HOLD: the proof's sweep counts only what is older
+    stop = min(mine, hold) if TICKET.fullmatch(hold) else mine
     n, oldest, stale = 0, None, []
     for name in sorted(os.listdir(qdir)):
-        if name >= mine:
+        if name >= stop:
             break
         born = _born(name)
         if born is None:   # not a ticket's name: never waited on, never said
