@@ -183,6 +183,20 @@ class Routes(Stubbed):
             ["cc-slack", "inject", "demo", "[demo] PR #7 landing stopped: a check is red. The way back in: fix it and "
              "push; the lane takes the new head."]])
 
+    def test_a_behind_update_is_said_and_put_into_the_repos_session_once(self):
+        """Row note (10-13): the lane updated a BEHIND branch "and say so to the repo's seat"."""
+        why = "GitHub refused the merge because the branch is behind main, so the lane updated the branch"
+        C.behind(self.job(), why)
+        C.behind(self.job(), why)
+        text = f"[demo] PR #7: {why}."
+        self.assertEqual(self.argvs("cc-slack post"), [
+            ["cc-slack", "post", "--route", "[demo] PR #7 stopped", "--id", f"land:demo:7:behind@{Q}", text]])
+        self.assertEqual(self.argvs("cc-slack inject"), [["cc-slack", "inject", "demo", text]])
+        # a member's goes to its own channel and is never injected
+        C.behind(T.Job(repo="h--t", pr=8, member="h", extra={"queued_at": Q}), why)
+        self.assertEqual(self.argvs("cc-slack post")[-1][:4], ["cc-slack", "post", "-c", "#h"])
+        self.assertEqual(len(self.argvs("cc-slack inject")), 1)
+
     def test_planning_and_lander_self_file_the_planner_request(self):
         for i, route in enumerate(("planning", "lander-self", "query")):
             j = T.Job(repo="demo", pr=10 + i, extra={"queued_at": Q})

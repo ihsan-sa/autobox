@@ -77,6 +77,7 @@ if me == "gh":
         d = {"state": "OPEN", "isDraft": False, "mergeable": "MERGEABLE", "baseRefName": "main",
              "title": "PR %s" % a[2], "body": ""}
         d.update(pr)
+        d["mergeStateStatus"] = "BEHIND" if box.get("behind") else "CLEAN"   # strict protection, base moved on
         if d["state"] == "OPEN":
             d["headRefOid"] = g("rev-parse", "refs/heads/" + pr["headRefName"])
         if "files" in fields:
@@ -97,6 +98,8 @@ if me == "gh":
             os.close(fd)
         if box.get("merge_fail"):
             out(1, "", box["merge_fail"])
+        if box.get("behind"):
+            out(1, "", 'GraphQL: Required status check "check" is expected. (mergePullRequest)')
         head = g("rev-parse", "refs/heads/" + pr["headRefName"])
         pin = a[a.index("--match-head-commit") + 1]
         if pin != head:
@@ -120,6 +123,19 @@ if me == "gh":
             box["down"] = True
             out(124, "", "gh timed out")
         out(0, "merged")
+    if a[:3] == ["api", "-X", "PUT"] and a[3].endswith("/update-branch"):   # GitHub merges main into the branch
+        pr = prs[a[3].split("/")[-2]]
+        box.setdefault("updates", []).append(a[3:])
+        if box.get("update_fail"):
+            out(1, "", box["update_fail"])
+        head = g("rev-parse", "refs/heads/" + pr["headRefName"])
+        if a[a.index("-f") + 1] != "expected_head_sha=" + head:
+            out(1, "", "gh: expected head sha didn't match current head ref. (HTTP 422)")
+        tree = g("merge-tree", "--write-tree", "refs/heads/main", head).splitlines()[0]
+        c = g("commit-tree", tree, "-p", head, "-p", "refs/heads/main", "-m", "Merge branch 'main'")
+        g("update-ref", "refs/heads/" + pr["headRefName"], c)
+        box["behind"] = bool(box.get("stay_behind"))
+        out(0, json.dumps({"message": "Updating pull request branch.", "url": "x"}))
     if a[:1] == ["api"] and a[1].endswith("/annotations"):   # repos/<slug>/check-runs/<id>/annotations
         out(0, json.dumps(box.get("annotations", {}).get(a[1].split("/")[-2], [])))
     if a[:1] == ["api"] and ("/actions/jobs/" in a[1] or "/check-runs/" in a[1]):   # one job, one check run
@@ -3044,10 +3060,73 @@ class Branches(Fixture):
         j = self.job()
         self.assertEqual((j.state, j.extra["attempts"]), (T.QUERY, 3))
         self.assertNotIn("merge_attempt", j.extra)
+        self.assertNotIn("updates", self.box())   # a refusal that is not BEHIND never updates the branch
         ok, text = GH.merge(self.root, 1, "x" * 40, "t")
         self.assertFalse(ok)
         self.set_box(merge_fail="--auto: auto-merge is not allowed")
         self.assertIn("no auto-merge was armed", GH.merge(self.root, 1, "x" * 40, "t")[1])
+
+    def unhold(self):
+        j = self.job()
+        j.extra["not_before"] = E.stamp(time.time() - 1)
+        J.save(j)
+
+    def test_a_behind_refusal_updates_the_branch_once_tells_the_seat_and_lands_at_the_new_head(self):
+        """Row note (10-13): "on a strict BEHIND refusal, update the branch, wait for checks at the new head and retry
+        once, and say so to the repo's seat"."""
+        old = self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.enterContext(mock.patch.object(GH, "slug", lambda root: "o/demo"))   # update-branch names the repo
+        self.set_box(behind=True)
+        u, _ = self.land()
+        j = self.job()
+        self.assertEqual((j.state, j.extra["behind_update"]["from"]), (T.HELD, old))
+        self.assertEqual(self.box()["updates"], [["repos/o/demo/pulls/1/update-branch", "-f",
+                                                  f"expected_head_sha={old}"]])
+        said = [c for c in u["cards"].calls if c[0] == "behind"]
+        self.assertEqual(len(said), 1)
+        self.assertIn(f"behind main, so the lane updated the branch from {old[:12]}", said[0][2])
+        self.assertEqual([c for c in u["cards"].calls if c[0] == "stopped"], [])
+        new = self.origin_rev("refs/heads/track/row-1")
+        self.assertNotEqual(new, old)
+        self.unhold()
+        for _ in range(3):
+            self.land()
+        j = self.job()
+        self.assertEqual(j.state, T.DEPLOY_PENDING)
+        self.assertEqual(j.head, new)   # merged at the updated head, after its checks ran there
+        pins = [m[m.index("--match-head-commit") + 1] for m in self.box()["merges"]]
+        self.assertEqual(pins, [old, new])
+        self.assertEqual(len(self.box()["updates"]), 1)
+
+    def test_behind_again_after_the_one_update_is_a_query_not_another_merge(self):
+        """Row note: "don't retry the same refusal"."""
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.enterContext(mock.patch.object(GH, "slug", lambda root: "o/demo"))   # update-branch names the repo
+        self.set_box(behind=True, stay_behind=True)
+        self.land()
+        self.unhold()
+        for _ in range(3):
+            self.land()
+        j = self.job()
+        self.assertEqual(j.state, T.QUERY)
+        self.assertIn("again after the lane updated the branch once", j.extra["why"])
+        self.assertEqual((len(self.box()["updates"]), len(self.box()["merges"])), (1, 2))
+        self.assertFalse(j.extra.get("attempts"))
+
+    def test_an_update_github_refuses_is_a_query(self):
+        self.pr(1, {"a/x": "n\n"})
+        J.submit("demo", 1)
+        self.enterContext(mock.patch.object(GH, "slug", lambda root: "o/demo"))   # update-branch names the repo
+        self.set_box(behind=True, update_fail="gh: Resource not accessible by integration (HTTP 403)")
+        u, _ = self.land()
+        j = self.job()
+        self.assertEqual(j.state, T.QUERY)
+        self.assertIn("updating the branch failed: gh: Resource not accessible", j.extra["why"])
+        self.assertNotIn("behind_update", j.extra)
+        self.assertEqual([c[3] for c in u["cards"].calls if c[0] == "stopped"], ["planning"])
+        self.assertEqual([c for c in u["cards"].calls if c[0] == "behind"], [])
 
     def test_closed_pr_is_done_and_unknown_check_is_a_query(self):
         self.pr(1, {"a/x": "n\n"}, state="CLOSED", headRefOid="e" * 40)

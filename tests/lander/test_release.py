@@ -32,6 +32,16 @@ def mark(verdict, by, head=HEAD, own=True):
     return {"body": R.marker(v, "d" * 40, head, by), "viewerDidAuthor": own}
 
 
+class StandingHandback(unittest.TestCase):
+    def test_only_perms_security_reader_stands_at_an_old_head(self):
+        """Perms, 10-13: a reader whose name only says `security` is anyone's to write, so it is not perms'."""
+        self.assertEqual(RL.standing_handback([mark(T.HANDBACK_VERDICT, "perms-security-read", head=OLD)], HEAD),
+                         ("perms-security-read", OLD[:12]))
+        for by in ("x-security", "perms-security-read-2", "security"):
+            self.assertIsNone(RL.standing_handback([mark(T.HANDBACK_VERDICT, by, head=OLD)], HEAD), by)
+            self.assertEqual(RL.standing_handback([mark(T.HANDBACK_VERDICT, by)], HEAD), (by, HEAD[:12]), by)
+
+
 class Release(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="lander-release.")
@@ -161,7 +171,7 @@ class Release(unittest.TestCase):
 
     def test_security_handback_stands_at_any_head(self):
         self.queued()
-        self.facts["comments"] = [mark(T.HANDBACK_VERDICT, "security-reviewer", head=OLD)]
+        self.facts["comments"] = [mark(T.HANDBACK_VERDICT, R.PERMS_SECURITY_READER, head=OLD)]
         self.refused("handback")
 
     def test_handbacks_that_do_not_stand_are_released(self):

@@ -24,8 +24,8 @@ row); any other LAND-AFTER-FIX, and DO-NOT-LAND, is HANDBACK. Only comments the 
 (gh's viewerDidAuthor), as before: anyone can type a marker into a PR.
 
 WHEN A READ IS BOUGHT (review(), delta_review()). PR comments gh cannot give -> INCOMPLETE, nothing read or landed:
-a handback recorded there cannot be ruled out. A HANDBACK by a reader whose name says `security` stands, at any
-head, until a later LAND by a reader whose name says `security` at its head or the PR's head now
+a handback recorded there cannot be ruled out. A HANDBACK by perms' security reader (security_reader(): exactly
+perms-security-read) stands, at any head, until a later LAND by that reader at its head or the PR's head now
 (open_security()); while it stands the verdict is
 that HANDBACK and no read is bought, because no read the lander buys is a security reader's. A recorded verdict at
 the digest (or the legacy digest, which kept the hunk tail) is returned as it is: the newest, except that a LAND at
@@ -268,14 +268,16 @@ def latest(comments):
     return found
 
 
-def security_reader(v):
-    """True when the reader named on verdict `v` says `security` (the name lander-self asks for too)."""
-    return "security" in (v.model or "").lower()
-
-
 # The reader a security path's LAND is signed with (the verdict review() returns on perms' record). A PR marker of
 # that name counts for nothing on its own (perms' HANDBACK at 2f9fde5e); only perms_recorded() clears the path.
 PERMS_SECURITY_READER = "perms-security-read"
+
+
+def security_reader(v):
+    """True when the reader named on verdict `v` is exactly PERMS_SECURITY_READER, the name `lander record` writes
+    only from the perms seat. Perms, 10-13: "Make it match the exact constant perms-security-read that lander record
+    trusts" — a name that merely says `security` (x-security, perms-security-read-2) is anyone's to write."""
+    return (v.model or "") == PERMS_SECURITY_READER
 # The perms seat's state root, at the passwd home: never $HOME or $CC_STATE, which a caller sets (tests patch this).
 PERMS_STATE = os.path.join(C.PASSWD_HOME, ".cc", "state")
 PERMS_READS = "security-reads.json"
@@ -1291,7 +1293,7 @@ def _security_stands(job, comments):
     return T.Verdict(verdict=T.HANDBACK_VERDICT, digest=job.digest, model=sec.model,
                      blocking=list(sec.blocking) + [f"a security HANDBACK by {sec.model} stands from {was}; only a "
                                                     "security reader's LAND clears it (`lander record ... LAND --by "
-                                                    "<security reader>`)"],
+                                                    f"{PERMS_SECURITY_READER}` from the perms seat)"],
                      extra={"head": sec.extra.get("head", ""), "security": True})
 
 
@@ -1660,8 +1662,8 @@ def would_read(job, comments):
     if sec:
         was = sec.extra.get("head", "")[:12] or "an earlier head"
         return False, (f"a security HANDBACK by {sec.model} stands from {was}, and no read the landing buys can clear "
-                       "it — a security reader buys its own read and records it (`lander record ... --by <security "
-                       "reader>`)")
+                       "it — a security reader buys its own read and records it (`lander record ... --by "
+                       f"{PERMS_SECURITY_READER}` from the perms seat)")
     digests = keys(job, diff_of(root_of(job), job.base_sha, job.head))
     need = _security_unread(job, comments, digests)
     if need:

@@ -113,7 +113,8 @@ def facts(repo, pr) -> dict:
 
 def standing_handback(comments, head):
     """(reader, marker head) of a standing box-written HANDBACK, or None. Each reader's newest marker counts: a
-    HANDBACK at the PR's head stands, and a security reader's stands at any head; a marker naming no head stands."""
+    HANDBACK at the PR's head stands, and perms' security reader's (R.PERMS_SECURITY_READER, exactly) stands at any
+    head; a marker naming no head stands."""
     newest = {}
     for c in comments:
         v = R.imported(c.get("body", "")) if isinstance(c, dict) and c.get("viewerDidAuthor") else None
@@ -121,7 +122,7 @@ def standing_handback(comments, head):
             newest[v.model or "?"] = v
     for by, v in newest.items():
         at = (v.extra or {}).get("head") or ""
-        if v.verdict == T.HANDBACK_VERDICT and ("security" in by.lower() or not at or head.startswith(at)):
+        if v.verdict == T.HANDBACK_VERDICT and (by == R.PERMS_SECURITY_READER or not at or head.startswith(at)):
             return by, at
     return None
 

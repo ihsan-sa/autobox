@@ -8,7 +8,8 @@ EDIT_BACKOFF_MAX), and skip a card cc-slack will not edit; a last edit held when
 `waited(job, secs, now)` files one planner request when the tick finds the oldest due job past WAIT_FLAG_SECS, at
 most one per repo (per member, across its lanes) per WAIT_FLAG_SECS; `held(repo, now)` notes a box hold, from which that age counts.
 `landed(job)` turns the PR's #approvals card to landed and says the merge where someone is listening;
-`stopped(job, why, route)` says a job left the lane and who picks it up. Where it goes (where()):
+`stopped(job, why, route)` says a job left the lane and who picks it up; `behind(job, why)` says the lane updated a
+BEHIND PR's branch, where a stop goes, and puts it into the repo's session once. Where it goes (where()):
 
     chat      the Slack thread the landing was asked from (job extra `chat`, `ts`)
     member    `#<h>-updates` for a member's landing, `#<h>` for its stop; the owner's channels never hear of it
@@ -696,6 +697,20 @@ def stopped(job, why, route):
         if pid not in sent:
             sh([slack(), "inject", job.repo, f"[{job.repo}] PR #{job.pr} landing stopped: {short}. The way back in: "
                 f"fix it and push; the lane takes the new head."], timeout=120)
+            mark_sent(pid)
+    return said
+
+
+def behind(job, why):
+    """The lane updated a BEHIND PR's branch for GitHub's strict protection (Lane.behind): said where a stop is said,
+    and, but for a member, put into the repo's session once, so its seat knows the head moved under it and why."""
+    why = " ".join(str(why).split())
+    text = f"[{job.repo}] PR #{job.pr}: {why}."
+    said = post(job, "behind", text, where(job, False))
+    if not job.member:
+        pid = producer_id(job, "behind-inject")
+        if pid not in (read_json(_sent_path(), []) or []):
+            sh([slack(), "inject", job.repo, text], timeout=120)
             mark_sent(pid)
     return said
 

@@ -124,9 +124,13 @@ not_before has passed. BOX HOLDS come first and leave the file untouched and the
              merge-tree(main_before, head); merge_attempt {main_before, expected, pin} written BEFORE gh; the squash
              pinned to head (the door made the approved head equal it), --delete-branch, --subject "<title> (#N)";
              fetch; the tip's tree must equal expected, else the tip is `unvalidated` (no deploy request; `stage …
-             merged … proof=mismatch`). A refused merge drops merge_attempt; one GitHub cannot confirm either way
-             keeps it and holds (box). A resume that finds merge_attempt asks GitHub first: MERGED proves against
-             the squash commit GitHub names; unreadable holds again, attempt kept; any other state drops it.
+             merged … proof=mismatch`). A refused merge drops merge_attempt; refused with the PR BEHIND its base
+             (gh.behind: strict branch protection), the lane updates the branch once per job (gh.update_branch,
+             extra behind_update), says so to the repo's seat (cards.behind) and holds CI_WAIT_SECS, so the new head
+             is queued again and checked before the one retry; BEHIND again, or an update GitHub refuses, is a
+             query "planning". Any other refusal holds, the UNRUNNABLE_TRIES-th a query. One GitHub cannot confirm
+             either way keeps it and holds (box). A resume that finds merge_attempt asks GitHub first: MERGED proves
+             against the squash commit GitHub names; unreadable holds again, attempt kept; any other state drops it.
   merged     board.close, cards.landed, tip.kick, deploy.request(repo, tip) — each once (job.post flags) —
              then deploy-pending; done (rc=0) for a member or an unvalidated tip. Members never deploy.
   held       past not_before, back to the state it was held from. One held from planned, checking or mergeable
@@ -1563,6 +1567,9 @@ class Lane:
                 return "held"
             if not ok:
                 job.extra.pop("merge_attempt", None)
+                if GH.behind(self.root, job.pr, self.token):
+                    held.close()
+                    return self.behind(job, base, text)
                 job.extra["attempts"] = int(job.extra.get("attempts") or 0) + 1
                 if job.extra["attempts"] >= UNRUNNABLE_TRIES:
                     self.query(job, f"the merge was refused {job.extra['attempts']} times: {text}", "planning")
@@ -1572,6 +1579,33 @@ class Lane:
             tip = self.fetch(base)[base]
         self.proved(job, expected, tip, pin)
         return "merged"
+
+    def behind(self, job, base, refused):
+        """GitHub's strict branch protection refused the merge because the PR's branch is BEHIND `base` (chip-flow #66,
+        10-13: refused three times as 'Required status check "check" is expected', and nobody was told). The row: "on
+        a strict BEHIND refusal, update the branch, wait for checks at the new head and retry once, and say so to the
+        repo's seat; don't retry the same refusal." So the branch is updated once per job (extra behind_update), the
+        seat is told (cards.behind), and the job is held: the update moves the head, so unhold() queues it again and
+        its checks and GitHub's CI run at the new head before the one retry. BEHIND again after that update, or an
+        update GitHub refuses, is a query for the planning seat, never another merge call. -> "held"."""
+        done = job.extra.get("behind_update")
+        if isinstance(done, dict):
+            self.query(job, f"GitHub refused the merge as behind {base} again after the lane updated the branch once "
+                            f"(from {str(done.get('from') or '')[:12]}): {refused}", "planning")
+            return "held"
+        ok, text = GH.update_branch(self.root, job.pr, job.head, self.token)
+        if not ok:
+            self.query(job, f"GitHub refused the merge as behind {base} ({refused}), and updating the branch failed: "
+                            f"{text}", "planning")
+            return "held"
+        job.extra["behind_update"] = {"from": job.head, "at": E.stamp()}
+        why = (f"GitHub refused the merge because the branch is behind {base}, so the lane updated the branch from "
+               f"{job.head[:12]}; it merges once the checks pass at the new head")
+        if self.unit("cards"):
+            with contextlib.suppress(UnitFault):
+                self.call("cards", "behind", job, why)
+        self.hold(job, why, kind="box", secs=CI_WAIT_SECS)
+        return "held"
 
     def proved(self, job, expected, tip, pin):
         """S1: the tip's tree must be the merge-tree the lane computed just before the merge call."""

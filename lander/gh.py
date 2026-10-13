@@ -14,6 +14,10 @@
         detail), "unregistered" (no check yet, though the base has workflows), "none" (no CI at all) or ""
         (unreadable). The lane merges on green or none only.
     rerun(root, run_id) -> (ok, text): `gh run rerun <run_id> --failed [-R <slug>]`, which reruns the cancelled jobs.
+    behind(root, pr) -> bool: GitHub's mergeStateStatus is BEHIND (strict branch protection: the PR's branch must hold
+        the base's tip before it merges); False when gh would not answer.
+    update_branch(root, pr, head) -> (ok, text): `gh api -X PUT repos/<slug>/pulls/<pr>/update-branch -f
+        expected_head_sha=<head>`, which merges the base into the PR's branch on GitHub; refused if the head moved.
     merge(root, pr, pin, title) -> (ok, text), ok True | False | None
         `gh pr merge <pr> --squash --delete-branch --match-head-commit <pin> [-R <slug>] --subject "<title> (#<pr>)"`.
         "already merged" is merged; "is closed" and any other failure are merged only when GitHub then reports the
@@ -124,6 +128,24 @@ def merge_state(root, pr, token=None):
         return "", ""
     mc = j.get("mergeCommit")
     return str(j["state"]), (str(mc.get("oid") or "") if isinstance(mc, dict) else "")
+
+
+def behind(root, pr, token=None) -> bool:
+    """True when GitHub says the PR's branch is BEHIND its base, the state a strict branch protection refuses to merge
+    (chip-flow #66, 2026-10-13: 'Required status check "check" is expected', three times). Unreadable is False."""
+    j = pr_facts(root, pr, "mergeStateStatus", token, 60)[0]
+    return bool(j) and j.get("mergeStateStatus") == "BEHIND"
+
+
+def update_branch(root, pr, head, token=None):
+    """Merge the base into the PR's branch on GitHub, pinned to `head` (expected_head_sha): GitHub refuses it when the
+    branch moved since. The new head is GitHub's merge commit, so the PR's checks run again there. -> (ok, text)."""
+    s = slug(root)
+    if not (s and head):
+        return False, "no GitHub repo or head to update the branch at"
+    rc, out, err = gh(["api", "-X", "PUT", f"repos/{s}/pulls/{int(pr)}/update-branch", "-f",
+                       f"expected_head_sha={head}"], root, token, 60)
+    return not rc, last(err or out) or ("updated" if not rc else f"gh exit {rc}")
 
 
 CI_GREEN = {"SUCCESS", "NEUTRAL", "SKIPPED"}

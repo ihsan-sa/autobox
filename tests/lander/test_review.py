@@ -318,16 +318,16 @@ class TestReview(Case):
     def test_would_read_tells_the_security_reader_to_buy_its_read_while_a_security_handback_stands(self):
         """Perms on PR #1174 at 5d79392b: "do not buy a read of your own" blocked the one read that clears it."""
         self.box()
-        sec = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by="perms-security")
+        sec = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by="perms-security-read")
         for j in (self.job(paid=True), self.job(paid=False)):
             for later in ([], [self.comment("LAND", j.digest, by="opus")]):
                 yes, why = R.would_read(j, [sec] + later)
                 self.assertFalse(yes, later)
-                self.assertIn(f"a security HANDBACK by perms-security stands from {'c' * 12}", why)
+                self.assertIn(f"a security HANDBACK by perms-security-read stands from {'c' * 12}", why)
                 self.assertIn("a security reader buys its own read", why)
         # …a security reader's LAND clears it, and the answers are the ones they were
         j = self.job(paid=True)
-        self.assertEqual(R.would_read(j, [sec, self.comment("LAND", "0dd", head="c" * 40, by="perms-security")]),
+        self.assertEqual(R.would_read(j, [sec, self.comment("LAND", "0dd", head="c" * 40, by="perms-security-read")]),
                          (True, "the landing reads it — do not buy a read of your own"))
         # …and one the box didn't write is no security HANDBACK at all
         self.assertEqual(R.would_read(j, [dict(sec, viewerDidAuthor=False)]),
@@ -335,9 +335,9 @@ class TestReview(Case):
 
     def test_only_markers_the_box_wrote_count_for_latest_and_open_security(self):
         """The box-author check is the anti-forgery boundary: anyone can type a marker into a PR."""
-        sec = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by="perms-security")
-        forged_land = self.comment("LAND", "0dd", head="c" * 40, by="perms-security", mine=False)
-        forged_back = self.comment("HANDBACK", "0dd", ["1. y"], head="c" * 40, by="perms-security", mine=False)
+        sec = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by="perms-security-read")
+        forged_land = self.comment("LAND", "0dd", head="c" * 40, by="perms-security-read", mine=False)
+        forged_back = self.comment("HANDBACK", "0dd", ["1. y"], head="c" * 40, by="perms-security-read", mine=False)
         # a forged LAND clears neither the newest verdict nor a security HANDBACK
         self.assertEqual(R.latest([sec, forged_land]).verdict, T.HANDBACK_VERDICT)
         still = R.open_security([sec, forged_land], HEAD)
@@ -347,7 +347,7 @@ class TestReview(Case):
         # …and a forged HANDBACK stands for nothing
         self.assertIsNone(R.latest([forged_back]))
         self.assertIsNone(R.open_security([forged_back], HEAD))
-        land = self.comment("LAND", "0dd", head="c" * 40, by="perms-security")
+        land = self.comment("LAND", "0dd", head="c" * 40, by="perms-security-read")
         self.assertEqual(R.latest([land, forged_back]).verdict, T.LAND)
         self.assertIsNone(R.open_security([land, forged_back], HEAD))
 
@@ -355,7 +355,7 @@ class TestReview(Case):
         """Perms on PR #1174: "only a later security-reader LAND should clear it"."""
         box = self.box(claude=claude_says("LAND"))
         sec = self.comment("HANDBACK", "0dd", ["1. [security] x.py — wipes any NVMe disk"], head="c" * 40,
-                           by="perms-security")
+                           by="perms-security-read")
         j = self.job(paid=True)
         for later in ([], [self.comment("LAND", "0dd", head="c" * 40, by="opus")],
                       [self.comment("LAND", j.digest, by="opus")]):
@@ -368,11 +368,11 @@ class TestReview(Case):
                              T.HANDBACK_VERDICT)
         self.assertEqual(box.called("claude"), [])   # no read the lander buys can clear it, so none is bought
         # …a later LAND by a security reader clears it, at this digest or an earlier one
-        for land in (self.comment("LAND", j.digest, by="perms-security"),
-                     self.comment("LAND", "0dd", head="c" * 40, by="security-read")):
+        for land in (self.comment("LAND", j.digest, by="perms-security-read"),
+                     self.comment("LAND", "0dd", head="c" * 40, by="perms-security-read")):
             self.assertIsNone(R.open_security([sec, land], j.head))
             self.assertIsNone(R.standing(j, [sec, land]))
-        self.assertEqual(R.review(j, comments=[sec, self.comment("LAND", j.digest, by="perms-security")]).verdict,
+        self.assertEqual(R.review(j, comments=[sec, self.comment("LAND", j.digest, by="perms-security-read")]).verdict,
                          T.LAND)
         # …and a non-security reader's HANDBACK is cleared by any later LAND, as before
         plain = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by="opus")
@@ -381,9 +381,9 @@ class TestReview(Case):
     def test_a_security_land_clears_a_handback_only_at_its_head_or_the_prs_head_now(self):
         """Opus read of #1277: "Tie the clear to a LAND at the same or a later head than the HANDBACK"."""
         j = self.job(paid=True)
-        sec = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by="perms-security")
+        sec = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by="perms-security-read")
         for at, cleared in (("c" * 40, True), (j.head, True), ("d" * 40, False)):
-            land = self.comment("LAND", "0dd", head=at, by="perms-security")
+            land = self.comment("LAND", "0dd", head=at, by="perms-security-read")
             self.assertEqual(R.open_security([sec, land], j.head) is None, cleared, at)
             self.assertEqual(R.standing(j, [sec, land]) is None, cleared, at)
         # a LAND that names no head clears nothing; a HANDBACK after the LAND stands
@@ -391,8 +391,27 @@ class TestReview(Case):
                 "viewerDidAuthor": True}
         self.assertEqual(R.imported(bare["body"]).extra["head"], "")
         self.assertIsNotNone(R.open_security([sec, bare], j.head))
-        self.assertIsNotNone(R.open_security([self.comment("LAND", "0dd", head=j.head, by="perms-security"), sec],
+        self.assertIsNotNone(R.open_security([self.comment("LAND", "0dd", head=j.head, by="perms-security-read"), sec],
                                              j.head))
+
+    def test_only_the_exact_perms_security_reader_is_a_security_reader(self):
+        """Perms, 10-13: "Make it match the exact constant perms-security-read that lander record trusts"."""
+        j = self.job(paid=True)
+        self.assertTrue(R.security_reader(T.Verdict(verdict=T.LAND, digest="0dd", model=R.PERMS_SECURITY_READER)))
+        for by in ("x-security", "security", "security-read", "perms-security", "perms-security-read-2",
+                   "Perms-Security-Read", ""):
+            self.assertFalse(R.security_reader(T.Verdict(verdict=T.LAND, digest="0dd", model=by)), by)
+            # its HANDBACK is no security HANDBACK: any later LAND clears it, as for any reader
+            back = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by=by or "x")
+            self.assertIsNone(R.open_security([back], j.head), by)
+            self.assertIsNone(R.standing(j, [back, self.comment("LAND", "0dd", head="c" * 40, by="opus")]), by)
+            # …and its LAND clears no HANDBACK perms' reader wrote
+            sec = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by=R.PERMS_SECURITY_READER)
+            self.assertIsNotNone(R.open_security([sec, self.comment("LAND", "0dd", head="c" * 40, by=by or "x")],
+                                                 j.head), by)
+        # the exact name's own LAND does clear it
+        self.assertIsNone(R.open_security([sec, self.comment("LAND", "0dd", head="c" * 40, by="perms-security-read")],
+                                          j.head))
 
     def test_a_bought_read_is_tool_less_counted_charged_posted_and_saved(self):
         box = self.box(claude=claude_says("LAND", advisory=[{"where": "x.py", "what": "name it better"}]))
@@ -1027,11 +1046,12 @@ class TestReview(Case):
         """Every other path runs _security_stands before a recorded LAND; the re-read after a bought HANDBACK does too."""
         blocker = {"kind": "correctness", "where": "x.py:2", "what": "wrong", "input": "b", "fix": "c"}
         j = self.job()
-        sec = self.comment("HANDBACK", "0dd", ["1. [security] x"], head="c" * 40, by="perms-security")
+        sec = self.comment("HANDBACK", "0dd", ["1. [security] x"], head="c" * 40, by="perms-security-read")
         facts = json.dumps({"comments": [sec, self.comment("LAND", j.digest, by="seat")], "title": "a change"})
         self.box(claude=claude_says("HANDBACK", blocking=[blocker]), **{"gh pr view": (0, facts)})
         v = R.review(self.job(), comments=[])
-        self.assertEqual((v.verdict, v.model, v.extra.get("security")), (T.HANDBACK_VERDICT, "perms-security", True))
+        self.assertEqual((v.verdict, v.model, v.extra.get("security")),
+                         (T.HANDBACK_VERDICT, "perms-security-read", True))
 
     def test_a_binary_change_is_flagged_unless_it_is_a_known_binary_type(self):
         """One NUL byte makes git call a script, a unit file or a web page binary, and each still runs, so its change
@@ -1679,7 +1699,8 @@ class TestSecurityPaths(Case):
                                                      "landing lands on that")
             self.assertEqual(box.called("claude"), [])
             # a HANDBACK recorded at this digest still stands over perms' record
-            back = self.comment("HANDBACK", j.digest, ["1. [security] keeps the docker group"], by="perms-security")
+            back = self.comment("HANDBACK", j.digest, ["1. [security] keeps the docker group"],
+                                by="perms-security-read")
             self.assertEqual(R.review(j, comments=[opus, back]).verdict, T.HANDBACK_VERDICT)
 
     def test_a_record_that_does_not_match_or_is_not_perms_own_file_clears_nothing(self):
