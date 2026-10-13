@@ -12,14 +12,19 @@
 #        highest used VRAM while the job ran minus what was used when it started, sampled every second; with two jobs
 #        on the card at once it counts both, so it is an upper bound on the job's own use.
 #        REFUSED, exit 4, nothing run: --vram above the card's total memory. GAVE UP, exit 5, nothing run: still not
-#        enough free after --wait-max seconds (default 0, which waits as long as it takes).
+#        enough free after --wait-max seconds (default 0, which waits as long as it takes). REFUSED too, exit 4: the
+#        queue's lock cannot be opened, as when a link sits at ~/.cc/gpu/lock (it is never followed).
 #   cc-gpu ffmpeg -- <ffmpeg args...>
 #        an x264/x265 encode on the GPU when there is a card: `-c:v libx264` becomes h264_nvenc and `libx265` hevc_nvenc,
-#        `-crf N` becomes NVENC's constant quality (`-rc vbr -cq N -b:v 0`), x264's `-preset` its nearest NVENC one
+#        `-crf N` becomes NVENC's constant quality (`-rc vbr -cq N -b:v 0`; a stream specifier on it is kept, so
+#        `-crf:v:1 N` becomes `-rc:v:1 vbr -cq:v:1 N -b:v:1 0`), x264's `-preset` its nearest NVENC one
 #        (medium → p5, slow → p6, slower and veryslow → p7; p5 when none is given), `-tune` becomes hq, and the
 #        x264/x265-only `-x264-params`/`-x265-params` are dropped; then it runs as `cc-gpu run --vram 512` (more than a
 #        1080p NVENC encode takes). With no card, with CC_GPU_ENCODE=0, or with no x264/x265 in the args, it is plain
-#        ffmpeg with the args untouched, on the CPU. Exits with ffmpeg's code. CC_GPU_FFMPEG names the ffmpeg.
+#        ffmpeg with the args untouched, on the CPU. When the NVENC run fails (no h264_nvenc in this ffmpeg, the card's
+#        session cap, the queue refusing it) it is retried once on the CPU with the args untouched, after removing an
+#        output file the failed run created; not when it was stopped by a signal (exit above 128). Exits with the
+#        code of the last ffmpeg run. CC_GPU_FFMPEG names the ffmpeg.
 #   cc-gpu probe        exit 0 and one line (the card, its total and free MB) when a card is usable here; else exit 3
 #                       and the reason. A caller with a CPU path asks this first and falls back on 3.
 #   cc-gpu status       the card, then the last ten jobs of the log
@@ -124,7 +129,12 @@ def run(argv):
         return REFUSED
     t0 = time.time()
     os.makedirs(gdir(), mode=0o700, exist_ok=True)
-    lk = opened(os.path.join(gdir(), "lock"), os.O_RDWR)
+    try:
+        lk = opened(os.path.join(gdir(), "lock"), os.O_RDWR)
+    except OSError as e:   # ELOOP when a link sits at the lock: refused, never followed
+        print(f"cc-gpu: refused: cannot open the queue's lock {os.path.join(gdir(), 'lock')} ({e.strerror}); "
+              "if it is a link, remove it", file=sys.stderr)
+        return REFUSED
     poll, settle = max(0.05, fnum("CC_GPU_POLL", 2)), max(0.0, fnum("CC_GPU_SETTLE", 10))
     while True:   # the lock first, so jobs are admitted in turn; then free VRAM, read while holding it
         try:
@@ -186,8 +196,9 @@ def nvenc_args(a):
         opt = k.split(":")[0]
         if opt in ("-c", "-codec", "-vcodec") and v in NVENC:
             out += [k, NVENC[v]]
-        elif opt == "-crf" and v is not None:
-            out += ["-rc", "vbr", "-cq", v, "-b:v", "0"]
+        elif opt == "-crf" and v is not None:   # keep the stream specifier: -crf:v:1 18 sets stream 1 only
+            sp = k[len(opt):]
+            out += ["-rc" + sp, "vbr", "-cq" + sp, v, "-b" + (sp or ":v"), "0"]
         elif opt == "-preset" and v is not None:
             out += [k, PRESET.get(v, v)]; preset = True
         elif opt == "-tune" and v is not None:
@@ -208,7 +219,14 @@ def ffmpeg(argv):
     ff = os.environ.get("CC_GPU_FFMPEG") or "ffmpeg"
     nv = None if os.environ.get("CC_GPU_ENCODE") == "0" else nvenc_args(argv)
     if nv is not None and card()[0] is not None:
-        return run(["--vram", str(ENCODE_VRAM), "--name", "ffmpeg", "--", ff] + nv)
+        out = argv[-1]
+        existed = os.path.lexists(out)
+        rc = run(["--vram", str(ENCODE_VRAM), "--name", "ffmpeg", "--", ff] + nv)
+        if rc == 0 or rc > 128:   # done, or stopped by a signal: no retry
+            return rc
+        print(f"cc-gpu: the NVENC encode failed (exit {rc}); retrying once on the CPU with the args as given", file=sys.stderr)
+        if not existed and os.path.isfile(out) and not os.path.islink(out):
+            os.remove(out)   # the failed run's partial output, so the retry is not asked whether to overwrite it
     try:
         return subprocess.run([ff] + argv).returncode
     except OSError as e:
@@ -318,6 +336,14 @@ def selfcheck():
         r = go(["run", "--vram", "100", "--", "true"])
         t("a link planted at the log is refused, not followed; the job still ran", (r.returncode, os.path.getsize(target)), (0, 0))
         r = go(["run", "--vram", "x", "--", "true"]); t("a non-number --vram is a usage error, exit 2", r.returncode, 2)
+        # a link at the lock is refused with a message, not a traceback; the plain lock is admitted
+        lock = os.path.join(tmp, "q", "lock"); os.remove(lock); os.symlink(target, lock)
+        r = go(["run", "--vram", "100", "--", "touch", mark + "3"])
+        t("a link planted at the lock: refused, exit 4, a message and no traceback, nothing run",
+          (r.returncode, "refused" in r.stderr, "Traceback" in r.stderr, os.path.exists(mark + "3")), (4, True, False, False))
+        os.remove(lock)
+        r = go(["run", "--vram", "100", "--", "touch", mark + "3"])
+        t("…and with the link gone the job runs", (r.returncode, os.path.exists(mark + "3")), (0, True))
         os.remove(os.path.join(tmp, "q", "jobs.jsonl"))   # the link above, so the cases below log again
         # ffmpeg: a fake that prints its args, so what cc-gpu turned them into is what the test reads; a card with room
         used(1000)
@@ -331,6 +357,26 @@ def selfcheck():
         t("…queued like any job: one line in the log", (len(logged()) - n, logged()[-1]["vram_mb"]), (1, 512))
         r = go(["ffmpeg", "--", "-i", "a", "-c:v", "libx265", "b.mp4"], CC_GPU_FFMPEG=fake)
         t("…x265 becomes hevc_nvenc, and with no preset given it gets p5 just before the output", r.stdout.split(), ["-i", "a", "-c:v", "hevc_nvenc", "-preset", "p5", "b.mp4"])
+        r = go(["ffmpeg", "--", "-i", "a", "-c:v:0", "libx264", "-crf:v:0", "18", "-c:v:1", "libx264", "-crf:v:1", "30", "b.mkv"], CC_GPU_FFMPEG=fake)
+        t("…a stream specifier on -crf is kept, so each stream keeps its own quality", r.stdout.split(),
+          ["-i", "a", "-c:v:0", "h264_nvenc", "-rc:v:0", "vbr", "-cq:v:0", "18", "-b:v:0", "0", "-c:v:1", "h264_nvenc",
+           "-rc:v:1", "vbr", "-cq:v:1", "30", "-b:v:1", "0", "-preset", "p5", "b.mkv"])
+        # a fake that fails on NVENC (leaving a partial output) and prints its args on the CPU
+        failing = os.path.join(tmp, "ffmpeg-nonvenc"); outp = os.path.join(tmp, "o.mp4")
+        with open(failing, "w") as f:
+            f.write('#!/bin/sh\ncase "$*" in *nvenc*) : > "%s"; echo "Unknown encoder h264_nvenc" >&2; exit 1;; esac\n'
+                    '[ -e "%s" ] && { echo "exists, not overwriting" >&2; exit 1; }\necho "$@"\n' % (outp, outp))
+        os.chmod(failing, 0o755)
+        r = go(["ffmpeg", "--", "-i", "a", "-c:v", "libx264", "-crf", "18", outp], CC_GPU_FFMPEG=failing)
+        t("the NVENC run fails: retried once on the CPU, args untouched, its partial output removed first, exit 0",
+          (r.returncode, r.stdout.split(), "retrying once on the CPU" in r.stderr), (0, ["-i", "a", "-c:v", "libx264", "-crf", "18", outp], True))
+        open(outp, "w").close()
+        r = go(["ffmpeg", "--", "-i", "a", "-c:v", "libx264", "-crf", "18", outp], CC_GPU_FFMPEG=failing)
+        t("…an output that was there before the NVENC run is not removed (so the retry fails and says so)",
+          (r.returncode, os.path.exists(outp)), (1, True))
+        os.remove(outp)
+        n = len(logged()); r = go(["ffmpeg", "--"] + x264, CC_GPU_FFMPEG=fake)
+        t("an NVENC run that succeeds is not retried: one run, one line", (r.returncode, r.stdout.count("\n"), len(logged()) - n), (0, 1, 1))
         n = len(logged()); r = go(["ffmpeg", "--"] + x264, CC_GPU_FFMPEG=fake, CC_GPU_ENCODE="0")
         t("CC_GPU_ENCODE=0: plain ffmpeg, args untouched, not queued", (r.stdout.split(), len(logged()) - n), (x264, 0))
         r = go(["ffmpeg", "--", "-i", "a", "-vf", "palettegen", "p.png"], CC_GPU_FFMPEG=fake)

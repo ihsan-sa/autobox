@@ -482,12 +482,14 @@ def edit_wait(now):
 
 def _back_off(out, now):
     """Slack said 429: every card edit waits Retry-After seconds when the answer names it (at most EDIT_BACKOFF_MAX),
-    else EDIT_BACKOFF."""
+    else EDIT_BACKOFF. An `until` more than EDIT_BACKOFF_MAX off came from a clock stepped back, so it is dropped,
+    not kept by the max (Opus read of #1279)."""
     m = re.search(r"retry[-_ ]after\D{0,3}(\d+)", out, re.I)
     secs = min(int(m.group(1)), EDIT_BACKOFF_MAX) if m else EDIT_BACKOFF
     with _flock("edits.lock"):
         d = _edits()
-        d["until"] = max(d["until"], now + secs)
+        kept = d["until"] if d["until"] - now <= EDIT_BACKOFF_MAX else 0
+        d["until"] = max(kept, now + secs)
         write_json(_edits_path(), d)
     return secs
 

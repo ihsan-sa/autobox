@@ -7,6 +7,7 @@ what is left out.
 """
 import ast
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1213,39 +1214,58 @@ class TestLivePolicy(unittest.TestCase):
         self.assertEqual(faults, [])
         for gate in ("core/lander/review.py", "core/lander/plan.py", "core/lander/check.py", "core/lander/lane.py",
                      "core/lander/sandbox.py", "core/lander/gh.py", "core/lander/records.py", "core/lander/cli.py",
+                     "core/lander/board.py", "core/lander/scope.py", "core/lander/tick.py",
                      "core/bin/lander-self", "tests/LANDING-policy.toml"):
             self.assertTrue(M.match(pol.lander, gate), gate)
-        for plain in ("core/lander/board.py", "core/lander/tick.py", "core/tests/lander/test_plan.py"):
+        for plain in ("core/lander/repair.py", "core/tests/lander/test_plan.py"):
             self.assertFalse(M.match(pol.lander, plain), plain)
             self.assertTrue(M.match(pol.paid_review, plain), plain)
 
-    @staticmethod
-    def _lander_imports(tree, top_only):
-        """The core/lander module names an ast `tree` imports (`from lander import x`, `import lander.x`,
-        `from lander.x import`, `from . import x`, `from .x import`); with `top_only`, only the imports that run when
-        the module loads, not those inside a function body."""
-        out, stack = set(), list(ast.iter_child_nodes(tree))
-        while stack:
-            n = stack.pop()
-            if top_only and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                continue
+    # The text forms of a lander import, read anywhere in a file: a Python import statement at any depth, a
+    # `python3 -c '...'` string in a shell tool or inside a Python one, importlib.import_module("lander.x").
+    TEXT_IMPORTS = (re.compile(r"\bfrom\s+lander\s+import\s+\(?([\w\s,]+)"),
+                    re.compile(r"\bfrom\s+lander\.(\w+)\s+import\b"), re.compile(r"\bimport\s+lander\.(\w+)"),
+                    re.compile(r"\bimport_module\(\s*['\"]lander\.(\w+)"))
+
+    @classmethod
+    def _lander_imports(cls, src):
+        """The core/lander module names the text `src` imports, at any depth: a function body's imports count, since
+        the function runs in the importing process (Opus read of #1277: board and scope, loaded inside cards' and
+        deploy's functions, were off the lander list). Python's own `from . import x` / `from .x import` are read by
+        ast when `src` parses."""
+        out = set()
+        for i, rx in enumerate(cls.TEXT_IMPORTS):
+            for m in rx.finditer(src):
+                out |= {a.split()[0] for a in m.group(1).split(",") if a.split()} if i == 0 else {m.group(1)}
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return out
+        for n in ast.walk(tree):
             if isinstance(n, ast.ImportFrom) and n.level == 1:
                 out |= {n.module.split(".")[0]} if n.module else {a.name for a in n.names}
-            elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module == "lander":
-                out |= {a.name for a in n.names}
-            elif isinstance(n, ast.ImportFrom) and n.level == 0 and (n.module or "").startswith("lander."):
-                out.add(n.module.split(".")[1])
-            elif isinstance(n, ast.Import):
-                out |= {a.name.split(".")[1] for a in n.names if a.name.startswith("lander.")}
-            stack.extend(ast.iter_child_nodes(n))
         return out
+
+    def test_the_import_reader_counts_function_bodies_c_strings_and_import_module(self):
+        """Each form the transitive scan below must see, and text that only names the package, which it must not."""
+        src = ("import os\n"
+               "def f():\n    from lander import board, scope as S\n"
+               "def g():\n    import importlib\n    return importlib.import_module('lander.tick')\n"
+               "CMD = \"python3 -c 'from lander.repair import x'\"\n"
+               "import lander.events as E\n"
+               "from . import jobs\n"
+               "# the lander lands it; lander_self is a word\n")
+        self.assertEqual(self._lander_imports(src), {"board", "scope", "tick", "repair", "events", "jobs"})
+        self.assertEqual(self._lander_imports("#!/bin/sh\npython3 -c 'from lander import run' \"$x\"\n"), {"run"})
+        self.assertEqual(self._lander_imports("the lander imports nothing here\nimport landers\n"), set())
 
     def test_what_tools_import_from_the_live_checkout_goes_to_lander_self(self):
         """perms' read of #1277: the overlay's Cloudflare door imports lander.git and lander.members from the live
         checkout and runs them with its token, and members loads jobs, events, types and the package. Every Python
-        tool in bin-private/ and core/bin/ is parsed for the lander modules it imports; what those load when imported
-        (module-level imports, followed within core/lander), the package's __init__ and cards (where perms' reads
-        are read, and the walls) must all be lander-class, or a change to one would run there on one paid read."""
+        tool in bin-private/ and core/bin/, Python or shell, is read for the lander modules it imports
+        (_lander_imports: function bodies, -c strings and import_module included); what those load in turn (followed
+        within core/lander, function bodies included), the package's __init__ and cards (where perms' reads are
+        read, and the walls) must all be lander-class, or a change to one would run there on one paid read."""
         if not os.path.exists(self.PATH):
             self.skipTest("no overlay policy in this tree")
         with open(self.PATH) as f:
@@ -1259,11 +1279,8 @@ class TestLivePolicy(unittest.TestCase):
                 p = os.path.join(full, name)
                 if not os.path.isfile(p) or os.path.islink(p):
                     continue
-                with open(p, "rb") as f:
-                    src = f.read()
-                if not (src.startswith(b"#!") and b"python" in src.split(b"\n", 1)[0]):
-                    continue
-                mods = {m for m in self._lander_imports(ast.parse(src, p), top_only=False) if here(m)}
+                with open(p, errors="replace") as f:
+                    mods = {m for m in self._lander_imports(f.read()) if here(m)}
                 if mods:
                     entry[f"{d}/{name}"] = sorted(mods)
                     todo += mods
@@ -1275,7 +1292,7 @@ class TestLivePolicy(unittest.TestCase):
                 continue
             seen.add(m)
             with open(os.path.join(pkg, m + ".py")) as f:
-                todo += [x for x in self._lander_imports(ast.parse(f.read()), top_only=True) if here(x)]
+                todo += [x for x in self._lander_imports(f.read()) if here(x)]
         for m in sorted(seen | {"__init__", "cards"}):
             path = f"core/lander/{m}.py"
             who = [t for t, ms in entry.items() if m in ms] or "a module those load"

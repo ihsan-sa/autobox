@@ -347,7 +347,9 @@ def waits(repo) -> list:
     if os.path.exists(TP.want_path(repo)) or ((requested or pending) and not os.path.exists(TP.red_path(repo))):
         out.append(TICK_SECS)
     if C.left_held(repo):   # a held last card edit (retry_cards): a tick once the cap or the 429's back-off lets it go
-        out.append(max(int(C.edit_wait(time.time())), 1))
+        # …but a running lane hands it over itself and retry_cards skips it, so one TICK_SECS tick looks again after,
+        # not a tick every 2 s while it runs (Opus read of #1279)
+        out.append(TICK_SECS if J.running(repo) else max(int(C.edit_wait(time.time())), 1))
     return out
 
 

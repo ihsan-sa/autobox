@@ -49,7 +49,9 @@ A planning seat runs it by hand; the lander never installs itself.
         or a .cc/track or .cc/member-facing marker above the cwd). Clears a legacy rollback. Promote never kills a
         lane: before its next job each lane sees `current` moved, takes nothing new and starts a lane from the new
         release, so the job in flight ends on the old one and the next job runs the new one. It names the lanes
-        running when it moves `current`.
+        running when it moves `current`. Only the perms seat promotes: the Claude session that runs it must work in
+        <passwd home>/.cc/state/<repo>/perms (<repo> the checkout's directory name), the check `lander record --by
+        perms-*` makes, or it is refused (exit 1) before anything is built.
     lander-self prove [REV] [--repo DIR] [--pr N]
         promote without the switch: the same refusals for REV, its selfcheck and the proof on main, against
         `current` (against nothing when REV is current). Run it on a host before that host takes over landing.
@@ -613,6 +615,38 @@ def worker_caller(cwd=None):
         d = up
 
 
+def claude_ancestor(pid=None, proc="/proc"):
+    """The pid of the first process named `claude` at or above `pid` (default: this one's parent), walking
+    /proc/<pid>/status PPid, or None. The lander's review.claude_ancestor, copied: this file shares no code."""
+    pid, seen = pid or os.getppid(), set()
+    while pid and pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            with open(os.path.join(proc, str(pid), "comm")) as f:
+                if f.read().strip() == "claude":
+                    return pid
+            with open(os.path.join(proc, str(pid), "status")) as f:
+                pid = next((int(ln.split()[1]) for ln in f if ln.startswith("PPid:")), 0)
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
+def perms_caller(root, pid=None, proc="/proc", state=None):
+    """True when the calling Claude session works in the perms seat of root's repo: its /proc/<pid>/cwd resolves to
+    <passwd home>/.cc/state/<basename of root>/perms. Perms on #1277: give promote the same caller check as
+    `lander record --by perms-*`, so only perms moves the live lander to a new release."""
+    seat = claude_ancestor(pid, proc)
+    if seat is None or not root:
+        return False
+    state = state or os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".cc", "state")
+    try:
+        cwd = os.path.realpath(os.readlink(os.path.join(proc, str(seat), "cwd")))
+    except OSError:
+        return False
+    return cwd == os.path.realpath(os.path.join(state, os.path.basename(os.path.realpath(root)), "perms"))
+
+
 def open_pr_head(root, pr):
     """(head sha, comments) GitHub names for PR #pr when it is OPEN, else ("", [])."""
     rc, out, _ = sh(["gh", "pr", "view", str(pr), *gh_repo(root), "--json", "headRefOid,state,comments"], cwd=root, timeout=60)
@@ -654,6 +688,9 @@ def cmd_promote(args, opts):
     root = repo_of(opts.get("repo", ""))
     if not root:
         return die("promote: no checkout (--repo DIR)", 2)
+    if not perms_caller(root):
+        return die("promote: refused — only the perms seat moves the live lander to a new release "
+                   f"(run it from {os.path.basename(root)}'s perms seat); current is unchanged")
     for ln in pin_remotes(root):
         print(f"lander-self: {ln}")
     main = main_sha(root)
@@ -1325,6 +1362,11 @@ def selfcheck():
             nolocal = pin_remotes(repo)          # a local path is no GitHub repo: nothing is pinned
             pins_nolocal = load_remotes()
             ALLOW_LOCAL = True
+            real_caller = perms_caller
+            globals()["perms_caller"] = lambda root: False      # any seat but perms: refused, nothing moved
+            r_notperms = cmd_promote([a], o)
+            cur_notperms = link_target("current")
+            globals()["perms_caller"] = lambda root: True       # the perms seat, for the cases below
             r_pin = cmd_pin([], {**o, "rev": a})
             pins_first = load_remotes()
             pinned_a = open(os.path.join(ROOT, "self", "current", "lander-self")).read()
@@ -1404,11 +1446,14 @@ def selfcheck():
             r_plant = cmd_promote([b], o)
             clean = "planted" not in open(os.path.join(ROOT, "releases", b, "core", "lander", "cli.py")).read()
         finally:
+            globals()["perms_caller"] = real_caller
             sys.stdout, sys.stderr = _out, _err
             quiet.close()
             ALLOW_LOCAL = False
             for k, v in saved_env.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        case("promote from a seat that is not perms is refused and moves nothing",
+             r_notperms == 1 and cur_notperms == "" and r1 == 0)
         case("a checkout whose origin is not GitHub is not pinned", pins_nolocal == {} and
              any("will not fetch" in ln for ln in nolocal))
         case("pin pins the tool's checkout and each project board's, not a member repo's",
@@ -1498,6 +1543,7 @@ def selfcheck():
             sys.stderr.close()
             sys.stderr = _err
         case("shadow with two revs is a usage refusal", r_use == 2)
+    perms_caller_cases(case)
     identity_gate_cases(case)
     HOME, ROOT = old
     bad = sum(1 for _, ok in results if not ok)
@@ -1835,6 +1881,33 @@ def parse(argv):
         else:
             args.append(a)
     return args, opts
+
+
+def perms_caller_cases(case):
+    """perms_caller on a fake /proc: the claude above the caller must work in <state>/<repo>/perms."""
+    with tempfile.TemporaryDirectory(prefix="lander-self-perms.") as t:
+        proc, state = os.path.join(t, "proc"), os.path.join(t, "state")
+        seat = lambda name: os.path.join(state, "box", name)  # noqa: E731
+        for d in ("perms", "planning"):
+            os.makedirs(seat(d))
+
+        def ps(pid, comm, ppid, cwd=""):
+            os.makedirs(os.path.join(proc, str(pid)))
+            with open(os.path.join(proc, str(pid), "comm"), "w") as f:
+                f.write(comm + "\n")
+            with open(os.path.join(proc, str(pid), "status"), "w") as f:
+                f.write(f"Name:\t{comm}\nPPid:\t{ppid}\n")
+            if cwd:
+                os.symlink(cwd, os.path.join(proc, str(pid), "cwd"))
+        ps(10, "bash", 20)
+        ps(20, "claude", 1, seat("perms"))
+        ps(11, "bash", 21)
+        ps(21, "claude", 1, seat("planning"))
+        ps(12, "bash", 1)
+        case("promote: a claude in the perms seat may", perms_caller("/dev/box",10, proc, state))
+        case("promote: a claude in another seat may not", not perms_caller("/dev/box",11, proc, state))
+        case("promote: another repo's perms seat may not", not perms_caller("/dev/other", 10, proc, state))
+        case("promote: no claude above the caller may not", not perms_caller("/dev/box",12, proc, state))
 
 
 def main(argv):

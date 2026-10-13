@@ -461,7 +461,7 @@ echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
   rt=$(cd "$SC/gpu" && tar -cf - . | { mkdir -p "$D/rt" && tar -x -C "$D/rt" && cd "$D/rt" && git init -q && git add -A && git write-tree; })
   for ro in "render $rt 60 - - ../scene.py" "render $rt 60 - - /etc/scene.py" "render $rt 60 5 3 scene.py" "render $rt 60 08 9 scene.py" \
             "render $rt 0 - - scene.py" "render $rt 90000 - - scene.py" "render $rt 60 - - scene.py x" "render $rt 60 - 3 scene.py" "render $rt 60 - - scene.sh"; do
-    out=$(cd "$SC/gpu" && tar -cf - . | SSH_ORIGINAL_COMMAND="$ro" bash "$SELF" runner 2>&1); rc=$?
+    out=$(cd "$SC/gpu" && tar -cf - . 2>/dev/null | SSH_ORIGINAL_COMMAND="$ro" bash "$SELF" runner 2>&1); rc=$?   # it refuses unread: tar's EPIPE is expected
     k "$(b '[ "$rc" = 2 ] && grep -q "refused: render TREE CAP START END SCENE" <<<"$out" && ! grep -q "cc-render: device" <<<"$out"')" "the runner refuses '${ro#render $rt }' and runs nothing (got $rc)"
   done
   out=$(cd "$SC/gpu" && tar -cf - . | SSH_ORIGINAL_COMMAND="render $(printf %040d 0) 60 - - scene.py" bash "$SELF" runner 2>&1); rc=$?
@@ -524,6 +524,13 @@ echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
   k "$(b '[ "$(twothirds 08s)" = 5s ] && [ "$(twothirds 090)" = 60s ] && [ "$(twothirds 09m)" = 360s ] && [ "$(limit 00s 20s)" = 20s ] && [ "$(limit 09s 20s)" = 09s ]')" "…a bound with a leading zero is read in base 10, not octal, and 00s is no bound"
   k "$(b '[ "$(t bash "$SELF" status --slow)" = 2 ] && [ "$(t bash "$SELF" status --quick x)" = 2 ]')" "status refuses any argument but --quick"
   unset CC_SUITES_NVIDIA_SMI; rm -f "$FB/nvidia-smi"
+  # with two runners, render goes to the last (the laptop, the one with a GPU) and never asks the first
+  mkdir -p "$D/sd"; printf 'ccsuite@peer\nccsuite@laptop\n' > "$D/sd/remote"; : > "$D/render2.calls"
+  printf '#!/usr/bin/env bash\necho "$CC_SUITES_DEST $1" >> "%s/render2.calls"\nexec "%s/xport-render" "$@"\n' "$D" "$D" > "$D/xport-render2"
+  chmod +x "$D/xport-render2"; sc tworun
+  out=$(CC_SUITES_SSH="$D/xport-render2" bash "$SELF" render "$SC/tworun/scene.py" "$D/o-tworun" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "rendered on the laptop" <<<"$out" && grep -qx "ccsuite@laptop render" "$D/render2.calls" && ! grep -q "^ccsuite@peer" "$D/render2.calls"')" "render with two runners goes to the last, and the first is never asked (got $rc)"
+  rm -f "${D:?}/sd/remote"
   mkdir -p "$D/o-full"; : > "$D/o-full/x"
   k "$(b '[ "$(t bash "$SELF" render "$SC/gpu/scene.py" "$D/o-full")" = 2 ] && [ "$(t bash "$SELF" render "$SC/gpu/scene.py" "$D/o-rev" 4 3)" = 2 ] && [ "$(t bash "$SELF" render "$SC/gpu/texture.txt" "$D/o-txt")" = 2 ]')" "render refuses an OUT that is not empty, a range backwards, and a scene that is not NAME.py"
   unset CC_SUITES_BLENDER CC_SUITES_WSL_LIB; rm -f "$FB/blender"; rmdir "$FB"
@@ -556,7 +563,7 @@ echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
   k "$(b 'grep -q '\''^enabled=false'\'' <<<"$out" && grep -q '\''AllowUsers ccsuite@100.64.0.0/10'\'' <<<"$out"')" "…with interop and the C: mount off, and sshd for ccsuite from the tailnet only"
   awk "/^cat >\/etc\/ssh\/ssh_host_cc_suites_ed25519/{f=1;next} /^KEY\$/{f=0} f" <<<"$out" > "$D/hk"; chmod 600 "$D/hk"
   k "$(b '[ "$(cat "$D/sd/known_hosts")" = "my-node $(ssh-keygen -y -f "$D/hk" | cut -d" " -f1,2)" ] && grep -q "^HostKey /etc/ssh/ssh_host_cc_suites_ed25519" <<<"$out"')" "…and pins a host key of its own making: known here for my-node, installed there as sshd's only one"
-  k "$(b '[ -z "$(ls "$D/sd" | grep -v "^id_ed25519\|^known_hosts\$\|^remote\$\|^laptop-setup.ps1\$")" ] && grep -q "PRIVATE KEY" "$f" && ! grep -q "PRIVATE KEY" <<<"$cmd"')" "…keeps that private key here only in the script's file, and never prints it"
+  k "$(b '[ -z "$(ls "$D/sd" | grep -v "^id_ed25519\|^known_hosts\$\|^remote\$\|^laptop-setup.ps1\$\|^laptop-setup.node\$")" ] && [ "$(cat "$D/sd/laptop-setup.node")" = ccsuite@my-node ] && grep -q "PRIVATE KEY" "$f" && ! grep -q "PRIVATE KEY" <<<"$cmd"')" "…keeps that private key here only in the script's file, and never prints it"
   SECONDS=0; out=$(CC_SUITES_SSH="$D/xport-mute" CC_SUITES_STATUS_TIMEOUT=2s bash "$SELF" status --quick 2>&1); rc=$?
   k "$(b '[ "$rc" = 75 ] && [ "$SECONDS" -lt 4 ] && grep -q "does not answer" <<<"$out" && ! grep -q "its GPU" <<<"$out"')" "status --quick against a runner that hangs waits one bound, not one per question, and prints no GPU line (got $rc in ${SECONDS}s)"
   k "$(b '[ -s "$f" ]')" "a status the runner does not answer keeps the box's copy of the script…"
@@ -568,8 +575,59 @@ echo "ssh: connect to host x port 22: No route to host" >&2; exit 255
   k "$(b '[ -s "$f" ]')" "a spill the runner does not answer keeps it too…"
   CC_SUITES_SSH="$D/xport-busy" bash "$SELF" spill "$R/core/tests/selftest.sh" >/dev/null 2>&1; rc=$?
   k "$(b '[ "$rc" = 75 ] && [ ! -e "$f" ]')" "…and one it answers, even busy, removes it and runs nothing (got $rc)"
+  # THE RUNNERS: two in `remote`, tried in order. The first answers busy and is passed over; the second takes the run.
+  # Both busy: nothing runs and the box keeps it (75). The stub tells them apart by CC_SUITES_DEST.
+  printf 'ccsuite@peer\nccsuite@laptop\n' > "$D/sd/remote"; : > "$D/two.calls"
+  cat > "$D/xport-two" <<EOF
+#!/usr/bin/env bash
+echo "\$CC_SUITES_DEST \$1" >> "$D/two.calls"
+[ "\$1" = status ] && [ -e "$D/busy.\${CC_SUITES_DEST#*@}" ] && { echo "busy (load 9.00)"; exit 0; }
+exec "$D/xport" "\$@"
+EOF
+  chmod +x "$D/xport-two"; touch "$D/busy.peer"
+  out=$(CC_SUITES_SSH="$D/xport-two" bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "running on the runner ccsuite@laptop" <<<"$out" && grep -q "ccsuite@peer answers busy" <<<"$out"')" "two runners, the first busy: the second runs the suite and the log names it (got $rc)"
+  k "$(b '[ "$(grep -c "^ccsuite@peer" "$D/two.calls")" = 1 ] && grep -qx "ccsuite@peer status" "$D/two.calls" && grep -qx "ccsuite@laptop run" "$D/two.calls"')" "…the busy one was asked its status and given nothing to run"
+  : > "$D/two.calls"; rm -f "$D/busy.peer"
+  out=$(CC_SUITES_SSH="$D/xport-two" bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "running on the runner ccsuite@peer" <<<"$out" && ! grep -q "^ccsuite@laptop" "$D/two.calls"')" "…and with the first free, the first takes it and the second is never asked (got $rc)"
+  touch "$D/busy.peer" "$D/busy.laptop"; : > "$D/two.calls"
+  out=$(CC_SUITES_SSH="$D/xport-two" bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && [ "$(grep -c " status$" "$D/two.calls")" = 2 ] && ! grep -q " run$" "$D/two.calls"')" "both busy: spill asks each, runs nothing and says 75 (got $rc)"
+  out=$(CC_SUITES_SSH="$D/xport-two" bash "$SELF" status 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q "runner ccsuite@peer answers: busy" <<<"$out" && grep -q "runner ccsuite@laptop answers: busy" <<<"$out"')" "…and status reports both, in order (got $rc)"
+  rm -f "$D/busy.peer" "$D/busy.laptop"
+  # the setup script is the laptop's: a peer that answers first must not delete it before the laptop has fetched it
+  echo again > "$D/sd/laptop-setup.ps1"; echo ccsuite@laptop > "$D/sd/laptop-setup.node"
+  printf '#!/usr/bin/env bash\n[ "${CC_SUITES_DEST#*@}" = laptop ] && exit 0\nexec "%s" "$@"\n' "$D/xport" > "$D/xport-lapmute"; chmod +x "$D/xport-lapmute"
+  CC_SUITES_SSH="$D/xport-lapmute" bash "$SELF" status >/dev/null 2>&1
+  k "$(b '[ -s "$f" ] && [ -s "$D/sd/laptop-setup.node" ]')" "two runners, the peer answers and the laptop does not: status leaves the laptop's setup script (and its record) alone"
+  CC_SUITES_SSH="$D/xport-two" bash "$SELF" spill "$R/core/tests/selftest.sh" >/dev/null 2>&1
+  k "$(b '[ -s "$f" ]')" "…and so does a spill the peer takes"
+  touch "$D/busy.peer"; CC_SUITES_SSH="$D/xport-two" bash "$SELF" spill "$R/core/tests/selftest.sh" >/dev/null 2>&1; rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ ! -e "$f" ] && [ ! -e "$D/sd/laptop-setup.node" ]')" "the laptop answering (the busy peer passed over) removes the script and its record (got $rc)"
+  rm -f "$D/busy.peer"
+  # a silent peer (its stub exits with no output) is passed over for the next runner; only the last says nothing of a next
+  cat > "$D/xport-silent" <<EOF
+#!/usr/bin/env bash
+[ "\${CC_SUITES_DEST#*@}" = peer ] && exit 0
+exec "$D/xport" "\$@"
+EOF
+  chmod +x "$D/xport-silent"
+  out=$(CC_SUITES_SSH="$D/xport-silent" bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 0 ] && grep -q "running on the runner ccsuite@laptop" <<<"$out" && grep -q "ccsuite@peer answers nothing: trying the next" <<<"$out"')" "a silent first runner is passed over and the second runs the suite (got $rc)"
+  touch "$D/busy.peer" "$D/busy.laptop"
+  out=$(CC_SUITES_SSH="$D/xport-two" bash "$SELF" spill "$R/core/tests/selftest.sh" 2>&1); rc=$?
+  k "$(b '[ "$rc" = 75 ] && grep -q "ccsuite@peer answers busy.*: trying the next" <<<"$out" && grep -q "ccsuite@laptop answers busy" <<<"$out" && ! grep -q "ccsuite@laptop answers busy.*trying the next" <<<"$out"')" "the last runner passed over says nothing about a next (got $rc)"
+  rm -f "$D/busy.peer" "$D/busy.laptop"
+  # a rerun of laptop-setup keeps the other runner's line and pinned key, and replaces only its own node's, last
+  printf 'ccsuite@peer\nccsuite@my-node\n' > "$D/sd/remote"; echo "peer ssh-ed25519 AAAApeer" >> "$D/sd/known_hosts"
+  local oldkey; oldkey=$(grep '^my-node ' "$D/sd/known_hosts")
+  CC_SUITES_BOX=my-box bash "$SELF" laptop-setup my-node >/dev/null 2>&1; rc=$?
+  k "$(b '[ "$rc" = 0 ] && [ "$(cat "$D/sd/remote")" = "$(printf "ccsuite@peer\nccsuite@my-node")" ] && grep -qx "peer ssh-ed25519 AAAApeer" "$D/sd/known_hosts" && [ "$(grep -c "^my-node " "$D/sd/known_hosts")" = 1 ] && ! grep -qxF "$oldkey" "$D/sd/known_hosts"')" "a rerun of laptop-setup keeps the peer host first and its key, and re-pins only its own node"
   unset CC_SUITES_SSH; local -a XP
-  k "$(b 'xport_argv && printf "%s\n" "${XP[@]}" | grep -qx StrictHostKeyChecking=yes && ! printf "%s\n" "${XP[@]}" | grep -q accept-new')" "the transport takes that key and no other (StrictHostKeyChecking=yes)"
+  # here-strings, not printf | grep -q: under pipefail grep -q's early exit breaks printf's pipe and fails the case
+  k "$(b 'xport_argv && grep -qx StrictHostKeyChecking=yes <<<"$(printf "%s\n" "${XP[@]}")" && ! grep -q accept-new <<<"$(printf "%s\n" "${XP[@]}")"')" "the transport takes that key and no other (StrictHostKeyChecking=yes)"
   rm -f "$D/sd/known_hosts"
   k "$(b '! configured')" "…and with no pinned key there is no runner"
   kill $p1 $p2 $p3 $p4 2>/dev/null; rm -rf "$D"

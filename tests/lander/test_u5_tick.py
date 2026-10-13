@@ -296,6 +296,30 @@ class Tick(unittest.TestCase):
             self.assertEqual(TK.waits("demo"), [30])
         with mock.patch.object(TK.time, "time", return_value=1100.0):
             self.assertEqual(TK.waits("demo"), [1])             # a slot is free now: the next tick soon
+            with mock.patch.object(J, "running", lambda r: 4242):
+                self.assertEqual(TK.waits("demo"), [TK.TICK_SECS])   # its lane hands it over: no 2 s churn
+
+    def test_cmd_tick_retries_a_held_edit_and_arms_a_repo_named_only_by_its_card_record(self):
+        """Opus read of #1279: no test drove cmd_tick's retry_cards call or the carded_repos rearm. "solo" has a
+        checkout but no job, board or .applied, so only its queued-card record names it."""
+        os.makedirs(J.repo_root("solo"))
+        calls = []
+        cards = mock.Mock(left_held=C.left_held, positions=lambda r, jobs: calls.append(r))
+
+        def tick():
+            with mock.patch.object(TK.L, "load_units", return_value={"cards": cards}), \
+                    mock.patch.object(TK, "tip_and_deploy", lambda repo, units: []), \
+                    mock.patch.object(TK, "nightly", lambda repo, units: []), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(TK.cmd_tick([]), 0)
+            with contextlib.suppress(FileNotFoundError), open(self.arms) as f:
+                return f.read()
+            return ""
+        self.assertNotIn("--repo solo", tick())                # no record: neither retried nor armed
+        self.assertEqual(calls, [])
+        C.write_json(C._queued_path("solo"), {"land:solo:8:queued@x": {"repo": "solo", "pr": 8, "left": "merged"}})
+        self.assertIn("--repo solo", tick())                   # held edit: retried, and a tick armed for it
+        self.assertEqual(calls, ["solo"])
 
     def test_a_repo_whose_checkout_is_gone_arms_no_timer(self):
         # 10-02/03: a suite fixture's timer re-armed ~77 times a day for a repo its run had deleted

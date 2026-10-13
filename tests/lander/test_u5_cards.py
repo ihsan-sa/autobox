@@ -663,6 +663,13 @@ class QueuedCards(Stubbed):
             self.assertEqual(C._edit_slot(1000.0), slot)
             self.assertEqual(C.edit_wait(1000.0), 0 if slot else C.EDIT_BACKOFF_MAX)
 
+    def test_a_429_drops_a_back_off_from_a_clock_stepped_back_and_keeps_a_near_longer_one(self):
+        """Opus read of #1279: max(until, now + secs) kept an `until` more than EDIT_BACKOFF_MAX off."""
+        for until, want in ((1000.0 + C.EDIT_BACKOFF_MAX + 1, 1007.0), (1200.0, 1200.0), (0.0, 1007.0)):
+            C.write_json(C._edits_path(), {"until": until, "at": []})
+            self.assertEqual(C._back_off("HTTP Error 429 (Retry-After: 7)", 1000.0), 7)
+            self.assertEqual(C.read_json(C._edits_path(), {})["until"], want, until)
+
     def test_an_edits_file_that_is_not_a_dict_reads_as_empty(self):
         """Opus read of #1275: a non-dict cards/edits.json raised, and every lane's cards stopped."""
         C.positions("demo", self.jobs((7, Q, T.QUEUED)))

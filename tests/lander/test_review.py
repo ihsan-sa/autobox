@@ -340,16 +340,16 @@ class TestReview(Case):
         forged_back = self.comment("HANDBACK", "0dd", ["1. y"], head="c" * 40, by="perms-security", mine=False)
         # a forged LAND clears neither the newest verdict nor a security HANDBACK
         self.assertEqual(R.latest([sec, forged_land]).verdict, T.HANDBACK_VERDICT)
-        still = R.open_security([sec, forged_land])
+        still = R.open_security([sec, forged_land], HEAD)
         self.assertIsNotNone(still)
         self.assertEqual(still.blocking, ["x"])
         self.assertEqual(R.standing(self.job(paid=False), [sec, forged_land]).verdict, T.HANDBACK_VERDICT)
         # …and a forged HANDBACK stands for nothing
         self.assertIsNone(R.latest([forged_back]))
-        self.assertIsNone(R.open_security([forged_back]))
+        self.assertIsNone(R.open_security([forged_back], HEAD))
         land = self.comment("LAND", "0dd", head="c" * 40, by="perms-security")
         self.assertEqual(R.latest([land, forged_back]).verdict, T.LAND)
-        self.assertIsNone(R.open_security([land, forged_back]))
+        self.assertIsNone(R.open_security([land, forged_back], HEAD))
 
     def test_only_a_later_security_readers_land_clears_a_security_handback(self):
         """Perms on PR #1174: "only a later security-reader LAND should clear it"."""
@@ -370,13 +370,29 @@ class TestReview(Case):
         # …a later LAND by a security reader clears it, at this digest or an earlier one
         for land in (self.comment("LAND", j.digest, by="perms-security"),
                      self.comment("LAND", "0dd", head="c" * 40, by="security-read")):
-            self.assertIsNone(R.open_security([sec, land]))
+            self.assertIsNone(R.open_security([sec, land], j.head))
             self.assertIsNone(R.standing(j, [sec, land]))
         self.assertEqual(R.review(j, comments=[sec, self.comment("LAND", j.digest, by="perms-security")]).verdict,
                          T.LAND)
         # …and a non-security reader's HANDBACK is cleared by any later LAND, as before
         plain = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by="opus")
         self.assertIsNone(R.standing(j, [plain, self.comment("LAND", "0dd", head="c" * 40, by="opus")]))
+
+    def test_a_security_land_clears_a_handback_only_at_its_head_or_the_prs_head_now(self):
+        """Opus read of #1277: "Tie the clear to a LAND at the same or a later head than the HANDBACK"."""
+        j = self.job(paid=True)
+        sec = self.comment("HANDBACK", "0dd", ["1. x"], head="c" * 40, by="perms-security")
+        for at, cleared in (("c" * 40, True), (j.head, True), ("d" * 40, False)):
+            land = self.comment("LAND", "0dd", head=at, by="perms-security")
+            self.assertEqual(R.open_security([sec, land], j.head) is None, cleared, at)
+            self.assertEqual(R.standing(j, [sec, land]) is None, cleared, at)
+        # a LAND that names no head clears nothing; a HANDBACK after the LAND stands
+        bare = {"body": sec["body"].replace("verdict=HANDBACK", "verdict=LAND").replace(f"head={'c' * 12} ", ""),
+                "viewerDidAuthor": True}
+        self.assertEqual(R.imported(bare["body"]).extra["head"], "")
+        self.assertIsNotNone(R.open_security([sec, bare], j.head))
+        self.assertIsNotNone(R.open_security([self.comment("LAND", "0dd", head=j.head, by="perms-security"), sec],
+                                             j.head))
 
     def test_a_bought_read_is_tool_less_counted_charged_posted_and_saved(self):
         box = self.box(claude=claude_says("LAND", advisory=[{"where": "x.py", "what": "name it better"}]))

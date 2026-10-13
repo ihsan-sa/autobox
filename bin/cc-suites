@@ -5,7 +5,7 @@
 #
 #   cc-suites reap [--dry]        kill every selftest.sh run whose owner or log is gone (below). One line per run it
 #                                 kills, nothing when there is none. exit 0
-#   cc-suites spill SUITE [ARG…]  run SUITE on the runner in ~/.cc/suites/remote if that answers and has a free slot:
+#   cc-suites spill SUITE [ARG…]  run SUITE on the first runner in ~/.cc/suites/remote that answers with a free slot:
 #                                 ship the tree SUITE's checkout would commit, stream the run's output here, and on a
 #                                 pass exit 0 after filing the green record a local pass would have.
 #                                 exit 75 when nothing ran there: no runner set, not reachable, busy or unfit. The
@@ -16,14 +16,15 @@
 #                                 itself and does not offer it again. A red there is never a red here on its own: the
 #                                 laptop is not the box (2026-09-25, a live run came back 481 passed, 7 failed, every
 #                                 red a gap in the runner's environment), so only this box's own run can fail a landing.
-#   cc-suites status [--quick]    the runner this box would use, what it answers, its GPU's name, use, memory and
-#                                 temperature (nvidia-smi there), and the device its Blender renders with (a few
-#                                 seconds; --quick, the dashboards' form, leaves that out). A GPU line says "not
-#                                 asked" when the runner predates that question and "no answer to …" when it is silent;
-#                                 neither is a GPU fault, and a 1-frame render is the test. The GPU's stats get two
-#                                 thirds of the status bound (CC_SUITES_GPUSTAT_TIMEOUT overrides): a slow nvidia-smi
-#                                 says "stats unavailable" and never makes a reachable runner look offline to a caller
-#                                 that waits only the status bound. exit 0 reachable, 75 not, 2 usage
+#   cc-suites status [--quick]    each runner this box would use, in order (THE RUNNERS), what it answers, its GPU's
+#                                 name, use, memory and temperature (nvidia-smi there), and the device its Blender
+#                                 renders with (a few seconds; --quick, the dashboards' form, leaves that out). A GPU
+#                                 line says "not asked" when the runner predates that question and "no answer to …" when
+#                                 it is silent; neither is a GPU fault, and a 1-frame render is the test. The GPU's stats
+#                                 get two thirds of the status bound (CC_SUITES_GPUSTAT_TIMEOUT overrides): a slow
+#                                 nvidia-smi says "stats unavailable" and never makes a reachable runner look offline to
+#                                 a caller that waits only the status bound. exit 0 when one answers free, 75 when none
+#                                 does, 2 usage
 #   cc-suites render SCENE.py OUT [START END] [--here]
 #                                 render a Blender scene script (Cycles) into OUT on the runner's GPU, or on this box's
 #                                 CPU at nice 19 when the runner is asleep, busy or unfit (the render section below); --here
@@ -36,7 +37,7 @@
 #                                 ~/.cc/suites/laptop-setup.ps1 (mode 600), and print the one command that fetches
 #                                 it over ssh from this box (its tailnet name, read at run time; CC_SUITES_BOX
 #                                 overrides it), runs it only once that fetch worked, and deletes the laptop's copy.
-#                                 On this box make the key and point ~/.cc/suites/remote at ccsuite@NODE (default
+#                                 On this box make the key and put ccsuite@NODE last in ~/.cc/suites/remote (default
 #                                 cc-suites-runner, the tailnet name the script gives the runner). The box's copy is
 #                                 removed by the next
 #                                 laptop-setup, or by the first `status` or `spill` the runner answers
@@ -146,9 +147,21 @@ reap(){
 }
 
 # ---- the transport ------------------------------------------------------------------------------------------------
-remote(){ [ -s "$SD/remote" ] && head -1 "$SD/remote" | tr -d '[:space:]'; }
-xport_argv(){   # sets XP to the transport command. CC_SUITES_SSH replaces ssh for the selfcheck
-  if [ -n "${CC_SUITES_SSH:-}" ]; then XP=("$CC_SUITES_SSH"); return 0; fi
+# THE RUNNERS. ~/.cc/suites/remote names them one user@host per line, in the order they are tried: the peer host first, the
+# laptop second. All of them take the same key and are pinned in the same known_hosts, so a
+# second runner adds no key here. On every runner that key is forced to the absolute path of a root-owned copy,
+# `restrict,from="<this box>",command="/usr/local/bin/cc-suites runner"`, as laptop-setup writes it: a relative
+# command, or a copy the runner's own user can write, lets anything running as that user print a pass. spill and the
+# lander's `job` go to the first that answers free and fit; one that is busy, unfit or silent before it takes the run
+# is passed over for the next, and a red on any of them is never final. render goes to the LAST, the laptop: it is
+# the one with a GPU.
+# remotes: every runner line, in order (a line that is not user@host is skipped); RUNNER, when set, is the one in use.
+remotes(){ [ -s "$SD/remote" ] && tr -d ' \t\r' <"$SD/remote" | grep -E '^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$' | awk '!seen[$0]++'; }
+remote(){ if [ -n "${RUNNER:-}" ]; then echo "$RUNNER"; else remotes | head -1; fi; }
+# the runners spill and status walk: the list, or one stand-in when the selfcheck's transport is set and names none
+runner_list(){ local l; l=$(remotes); if [ -n "$l" ]; then echo "$l"; elif [ -n "${CC_SUITES_SSH:-}" ]; then echo stub@runner; fi; }
+xport_argv(){   # sets XP to the transport command. CC_SUITES_SSH replaces ssh for the selfcheck (told the runner as CC_SUITES_DEST)
+  if [ -n "${CC_SUITES_SSH:-}" ]; then XP=(env CC_SUITES_DEST="$(remote)" "$CC_SUITES_SSH"); return 0; fi
   local r; r=$(remote); [ -n "$r" ] && [ -s "$SD/id_ed25519" ] && [ -s "$SD/known_hosts" ] || return 75
   # The host key is the one laptop-setup made and pinned: an unknown or changed key is no runner.
   XP=(ssh -F /dev/null -i "$SD/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=8
@@ -158,7 +171,7 @@ xport_argv(){   # sets XP to the transport command. CC_SUITES_SSH replaces ssh f
       -a -x -T -C "$r" --)
 }
 xport(){ xport_argv || return 75; "${XP[@]}" "$@"; }   # $@ = the remote command; stdin goes with it
-configured(){ [ -n "${CC_SUITES_SSH:-}" ] || { [ -n "$(remote)" ] && [ -s "$SD/id_ed25519" ] && [ -s "$SD/known_hosts" ]; }; }
+configured(){ [ -n "${CC_SUITES_SSH:-}" ] || { [ -n "$(remotes)" ] && [ -s "$SD/id_ed25519" ] && [ -s "$SD/known_hosts" ]; }; }
 # xp_kept FILE CMD…: CMD with its stdout as it is and the last 4 KB of its stderr in FILE. A laptop's refusal comes on
 # stderr (an older runner's `refused: render`), and it is the reason a person reads, so it is kept, never dropped.
 # err_of FILE: that stderr's last line that says something, printable and at most 200 bytes.
@@ -179,11 +192,24 @@ unanswered(){ local e; e=$(err_of "$2")
   case $e in "cc-suite-runner: refused: $1"*) echo "not asked (its runner is older than $1; rerun laptop-setup)";;
     *) echo "no answer to $1 (${e:+$e; }not a GPU fault on its own; a 1-frame render tells)";; esac; }
 
-status(){
-  local a g st rc ef sf se sr sp lim glim q=""; local -a XP
+status(){   # every runner in order; 0 when any of them answers free
+  local q=""   # read by status_one
   case "$*" in "") ;; --quick) q=1;; *) echo "usage: cc-suites status [--quick]" >&2; return 2;; esac
   configured || { echo "cc-suites: no runner set ($SD/remote) — every suite runs here"; return 75; }
-  xport_argv || return 75
+  local RUNNER rc=75
+  while read -r RUNNER; do status_one && rc=0; done < <(runner_list)
+  return $rc
+}
+# setup_done: a runner answered, so the setup script (and the host key in it) has done its work: drop the box's copy.
+# Only when the runner that answered is the node laptop-setup wrote it for (laptop-setup.node); a script with no
+# such record (written before it existed) goes as it always did.
+setup_done(){
+  local n; n=$(cat "$SD/laptop-setup.node" 2>/dev/null)
+  [ -z "$n" ] || [ "$n" = "$(remote)" ] || return 0
+  rm -f "$SD/laptop-setup.ps1" "$SD/laptop-setup.node"
+}
+status_one(){
+  local a g st rc ef sf se sr sp lim glim; local -a XP; xport_argv || return 75
   ef=$(mktemp "${TMPDIR:-/tmp}/cc-suites-err.XXXXXX") || return 75
   sf=$(mktemp "${TMPDIR:-/tmp}/cc-suites-err.XXXXXX") || { rm -f "${ef:?}"; return 75; }
   se=$(mktemp "${TMPDIR:-/tmp}/cc-suites-err.XXXXXX") || { rm -f "${ef:?}" "${sf:?}"; return 75; }
@@ -199,8 +225,7 @@ status(){
   wait "$sp"
   a=$(printable "$a"); [ -n "$a" ] || a=$(err_of "$ef")
   case $a in "free "*|"busy"*|"unfit"*)
-    # the runner answered, so the setup script (and the host key in it) has done its work: drop the box's copy
-    rm -f "$SD/laptop-setup.ps1"
+    setup_done
     st=$(cat "$sf"); case $st in "gpustat "*) st=$(printable "${st#gpustat }");;
       *) if [ "$(cat "$sr")" = 124 ]; then st="stats unavailable (gpustat gave nothing in $glim)"
          else st=$(unanswered gpustat "$se"); fi;; esac
@@ -211,7 +236,7 @@ status(){
       g=$(printable "$g"); [ -n "$g" ] || g=$(unanswered gpu "$ef")
     fi
     case $a in "free "*) echo "cc-suites: runner $(remote) answers: $a"; rc=0;;
-                      *) echo "cc-suites: runner $(remote) answers: $a — every suite runs here for now"; rc=75;; esac
+                      *) echo "cc-suites: runner $(remote) answers: $a — it takes no suite for now"; rc=75;; esac
     echo "cc-suites: its GPU: $st"
     [ -n "$q" ] || echo "cc-suites: its Blender renders with: $g";;
     *) echo "cc-suites: runner $(remote) does not answer${a:+ ($a)}"; rc=75;; esac
@@ -269,9 +294,17 @@ spill(){
   rel=${suite#"$root"/}
   case " $ALLOWED_SUITES " in *" $rel "*) ;; *) return 75;; esac
   [ "$#" = 0 ] || return 75          # the runner takes no arguments for the suite; a run that has some stays here
-  xport_argv || return 75
-  a=$(timeout "$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)" "${XP[@]}" status </dev/null 2>/dev/null | tail -1)   # a runner that answers nothing in 20 s is none
-  case $a in "free "*|"busy"*|"unfit"*) rm -f "$SD/laptop-setup.ps1";; esac   # it answered: drop the setup script, as status does
+  # the first runner in the list that answers free and fit takes it; a busy, unfit or silent one is passed over
+  local RUNNER r last; last=$(runner_list | tail -1)
+  for r in $(runner_list); do
+    RUNNER=$r; xport_argv || continue
+    a=$(timeout "$(limit "${CC_SUITES_STATUS_TIMEOUT:-}" 20s)" "${XP[@]}" status </dev/null 2>/dev/null | tail -1)   # a runner that answers nothing in 20 s is none
+    case $a in "free "*|"busy"*|"unfit"*) setup_done;; esac   # it answered: drop the setup script, as status does
+    case $a in "free "[1-9]*) break;; esac
+    if [ "$r" = "$last" ]; then echo "== the runner $r answers ${a:-nothing} ==" >&2
+    else echo "== the runner $r answers ${a:-nothing}: trying the next ==" >&2; fi
+    a=""
+  done
   case $a in "free "[1-9]*) ;; *) return 75;; esac
   # green.sh's start tree is taken HERE, as it is sourced, and names the suite: the tree shipped is that tree, and
   # green_record below refuses to file anything if the checkout moved while the runner ran it.
@@ -290,28 +323,28 @@ spill(){
   git -C "$root" archive --format=tar "$tree" | timeout -k 10 "$lim" "${XP[@]}" run "$rel" "$tree" "$part" "$changed" \
     | tee "$out" | sed -u 's/^| //'
   rc=${PIPESTATUS[1]}; took=$SECONDS
-  case $rc in 124|137) echo "== the runner took longer than $lim — stopped it ==";; esac
+  case $rc in 124|137) echo "== the runner $(remote) took longer than $lim — stopped it ==";; esac
   v=$(verdict_of "$out")
   # "A laptop verdict counts only for the exact tree it ran" (the brief): no verdict line, or one for another tree, is none.
   if [ -z "$v" ] || [ "${v##* tree=}" != "$tree" ]; then
     rm -f "$out"
-    echo "== the runner gave no verdict for ${tree:0:12} after ${took}s (transport exit $rc) — running it here instead =="
+    echo "== the runner $(remote) gave no verdict for ${tree:0:12} after ${took}s (transport exit $rc) — running it here instead =="
     return 76
   fi
   rc=${v#*exit=}; rc=${rc%% *}
   if [ "$rc" != 0 ]; then
     tools=$(finishable "$out"); rm -f "$out"
     if [ -z "$tools" ]; then
-      echo "== the runner's verdict for ${tree:0:12} is red (exit $rc) after ${took}s — a red there fails nothing: running it here =="
+      echo "== the runner $(remote)'s verdict for ${tree:0:12} is red (exit $rc) after ${took}s — a red there fails nothing: running it here =="
       return 76
     fi
-    echo "== the runner's verdict for ${tree:0:12} is red (exit $rc) after ${took}s, only in the own selfcheck of: $(echo $tools) — running just that here =="
+    echo "== the runner $(remote)'s verdict for ${tree:0:12} is red (exit $rc) after ${took}s, only in the own selfcheck of: $(echo $tools) — running just that here =="
     # shellcheck disable=SC2086   # one tool per word, by construction (finishable)
     if ! finish_here "$suite" "$(cd "$(dirname "$suite")/../bin" 2>/dev/null && pwd)" $tools; then
       echo "== red here too — running the whole suite here =="
       return 76
     fi
-  else rm -f "$out"; echo "== the runner passed ${tree:0:12} in ${took}s =="; fi
+  else rm -f "$out"; echo "== the runner $(remote) passed ${tree:0:12} in ${took}s =="; fi
   # A pass there is filed as a pass here, at the scope this checkout would have run it at — land_scope is a pure
   # function of the tree and CC_LAND_CHANGED, so it is the scope the runner's own copy printed.
   land_scope "$(cd "$(dirname "$suite")/../bin" 2>/dev/null && pwd)"
@@ -779,8 +812,8 @@ render(){
   if [ -n "$here" ]; then :
   elif ! configured; then echo "== no laptop is set up: rendering on this box's CPU =="
   else
-    local -a XP; local tmp tree ans why dsz
-    xport_argv
+    local -a XP; local tmp tree ans why dsz RUNNER
+    RUNNER=$(runner_list | tail -1); xport_argv   # the last runner, the laptop: the one with a GPU (THE RUNNERS)
     # on disk, never /tmp (a tmpfs, so RAM): the stream and the frames it carries may come to gigabytes
     mkdir -p "$HOME/.cc/tmp" && tmp=$(mktemp -d "$HOME/.cc/tmp/cc-render.XXXXXX") && mkdir "$tmp/w" || return 1
     ans=$(xp_kept "$tmp/err" timeout 20s "${XP[@]}" status </dev/null | tail -1); ans=$(printable "$ans")
@@ -842,7 +875,7 @@ laptop_setup(){
   local e; for e in $SHELLCHECK_SUMS; do [ "${e%%=*}" != "$scv" ] || scsum=${e#*=}; done
   [ -n "$scsum" ] || echo "cc-suites: no pinned sum for shellcheck $scv (SHELLCHECK_SUMS): the laptop keeps its own, and answers unfit while it is older" >&2
   mkdir -p "$SD" && chmod 700 "$SD"
-  f="$SD/laptop-setup.ps1"; rm -f "$f"   # a script from an earlier run carries a host key no longer pinned
+  f="$SD/laptop-setup.ps1"; rm -f "$f" "$SD/laptop-setup.node"   # a script from an earlier run carries a host key no longer pinned
   [ -s "$SD/id_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -C "cc-suites@$("$BIN/cc-config" get CC_BOX "$(hostname -s)" 2>/dev/null)" -f "$SD/id_ed25519" >/dev/null || return 1
   # The runner's host key is made HERE and pinned before the laptop is ever reached: the box trusts that key for
   # NODE and no other (StrictHostKeyChecking=yes), so a tailnet name that answers with another key is no runner.
@@ -850,13 +883,15 @@ laptop_setup(){
   # the script printed last is the only one that works (run it again after any rerun of laptop-setup).
   local kd; kd=$(mktemp -d "${TMPDIR:-/tmp}/cc-suites-hostkey.XXXXXX") || return 1
   ssh-keygen -q -t ed25519 -N "" -C "cc-suites-runner" -f "$kd/k" >/dev/null || { rm -rf "$kd"; return 1; }
-  echo "$node $(cut -d' ' -f1,2 "$kd/k.pub")" > "$SD/known_hosts"
+  # the other runners (the peer host) keep their line and their pinned key; this node's are replaced, and it goes last
+  { awk -v n="$node" '$1 != n' "$SD/known_hosts" 2>/dev/null; echo "$node $(cut -d' ' -f1,2 "$kd/k.pub")"; } > "$SD/known_hosts.new" \
+    && mv -f "$SD/known_hosts.new" "$SD/known_hosts"
   hk=$(cat "$kd/k"); rm -rf "$kd"
-  echo "ccsuite@$node" > "$SD/remote"
+  { remotes | grep -vxF "ccsuite@$node"; echo "ccsuite@$node"; } > "$SD/remote.new" && mv -f "$SD/remote.new" "$SD/remote"
   pub=$(cat "$SD/id_ed25519.pub"); b64=$(base64 -w76 "$SELF")
   # The script carries that private key, so it is never printed: it goes to a file only this user can read, and
   # the laptop fetches it over ssh (pasting an 89 kB script by hand failed, 2026-09-29).
-  ( umask 077 && : > "$f" ) || return 1
+  ( umask 077 && : > "$f" && echo "ccsuite@$node" > "$SD/laptop-setup.node" ) || return 1   # the runner this script is for
   cat > "$f" <<PS1
 # SECRET: this script carries the runner's private SSH host key. Run it, then delete it; do not share or paste it.
 # cc-suites runner for this laptop. Run once in an ADMINISTRATOR PowerShell; running it again is safe.

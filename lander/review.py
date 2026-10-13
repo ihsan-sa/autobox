@@ -25,7 +25,8 @@ row); any other LAND-AFTER-FIX, and DO-NOT-LAND, is HANDBACK. Only comments the 
 
 WHEN A READ IS BOUGHT (review(), delta_review()). PR comments gh cannot give -> INCOMPLETE, nothing read or landed:
 a handback recorded there cannot be ruled out. A HANDBACK by a reader whose name says `security` stands, at any
-head, until a later LAND by a reader whose name says `security` (open_security()); while it stands the verdict is
+head, until a later LAND by a reader whose name says `security` at its head or the PR's head now
+(open_security()); while it stands the verdict is
 that HANDBACK and no read is bought, because no read the lander buys is a security reader's. A recorded verdict at
 the digest (or the legacy digest, which kept the hunk tail) is returned as it is: the newest, except that a LAND at
 the PR's exact head is not replaced by a later HANDBACK the lander's own readers wrote (recorded(), bought()), and a
@@ -328,15 +329,25 @@ def _perms_land(job):
     return T.Verdict(verdict=T.LAND, digest=job.digest, model=PERMS_SECURITY_READER, extra={"read": "perms"})
 
 
-def open_security(comments):
+def open_security(comments, head):
     """The newest HANDBACK a security reader wrote on this PR that no later security reader's LAND has cleared, at
     any digest, or None. "Only a later security-reader LAND should clear it" (perms, PR #1174): a LAND by any other
-    reader, the lander's own included, leaves it standing."""
+    reader, the lander's own included, leaves it standing. "Tie the clear to a LAND at the same or a later head than
+    the HANDBACK" (Opus read of #1277): the LAND must name the HANDBACK's head or `head`, the PR's head now (no head
+    is later than that one); a LAND at some other head, or naming none, leaves it standing. Heads compare at the
+    12 characters a marker keeps."""
+    now = (head or "")[:12]
     found = None
     for c in comments:
         v = imported(c.get("body", "")) if c.get("viewerDidAuthor") else None
-        if v and security_reader(v):
-            found = v if v.verdict == T.HANDBACK_VERDICT else None if v.verdict == T.LAND else found
+        if not (v and security_reader(v)):
+            continue
+        if v.verdict == T.HANDBACK_VERDICT:
+            found = v
+        elif v.verdict == T.LAND and found:
+            at = v.extra.get("head", "")[:12]
+            if at and at in (found.extra.get("head", "")[:12], now):
+                found = None
     return found
 
 
@@ -1273,7 +1284,7 @@ def _unread(job):
 def _security_stands(job, comments):
     """A security reader's HANDBACK no security reader's LAND has cleared -> that HANDBACK, read or not: no read the
     lander buys is a security reader's, so none can clear it. Else None."""
-    sec = open_security(comments)
+    sec = open_security(comments, job.head)
     if not sec:
         return None
     was = sec.extra.get("head", "")[:12] or "an earlier head"
@@ -1338,7 +1349,7 @@ def standing(job, comments=None):
         if facts is None:
             raise RuntimeError(f"cannot read PR #{job.pr}'s comments, so a standing handback cannot be ruled out")
         comments = facts.get("comments") or []
-    prior = open_security(comments) or latest(comments)
+    prior = open_security(comments, job.head) or latest(comments)
     return prior if prior and prior.verdict == T.HANDBACK_VERDICT else None
 
 
@@ -1645,7 +1656,7 @@ def would_read(job, comments):
     """-> (bool, why): whether review() would buy a read for this job now; it matches the same keys() review() does.
     A standing security HANDBACK comes first, as in review(): the landing buys no read that can clear it, so the
     security reader is told to buy its own (perms, PR #1174: "do not buy a read" blocked the one read that clears it)."""
-    sec = open_security(comments)
+    sec = open_security(comments, job.head)
     if sec:
         was = sec.extra.get("head", "")[:12] or "an earlier head"
         return False, (f"a security HANDBACK by {sec.model} stands from {was}, and no read the landing buys can clear "
