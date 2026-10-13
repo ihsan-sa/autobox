@@ -1570,11 +1570,13 @@ class TestRecord(Case):
         return root
 
     def versions(self):
-        """A CLAUDE_VERSIONS of the test's own, put back when it ends."""
+        """A CLAUDE_VERSIONS of the test's own, and no CLAUDE_VERSIONS_FILE (never the host's), put back when it ends."""
         d = os.path.join(self.tmp, "versions")
         os.makedirs(d, exist_ok=True)
         self.addCleanup(setattr, R, "CLAUDE_VERSIONS", R.CLAUDE_VERSIONS)
+        self.addCleanup(setattr, R, "CLAUDE_VERSIONS_FILE", R.CLAUDE_VERSIONS_FILE)
         R.CLAUDE_VERSIONS = d
+        R.CLAUDE_VERSIONS_FILE = os.path.join(self.tmp, "no-claude-versions")
         return d
 
     def test_only_the_perms_seat_passes_as_the_caller(self):
@@ -1611,6 +1613,76 @@ class TestRecord(Case):
             with open(f"/proc/{p.pid}/comm") as f:
                 self.assertEqual(f.read().strip(), "claude")
             self.assertEqual(R.perms_seat_caller("demo", p.pid, "/proc", state), passes, d)
+
+    def test_a_deleted_folder_replaced_by_a_symlink_to_versions_is_refused(self):
+        """Perms, 10-13: realpath "resolves the path a second time through a filesystem the caller controls (a
+        deleted folder replaced by a symlink to versions/ passes)". The kernel still prints the old folder, so the raw
+        string is compared: refused. The same binary read under versions passes, the control."""
+        state = os.environ["CC_STATE"]
+        seat = os.path.join(state, "demo", "perms")
+        versions = self.versions()
+        os.makedirs(os.path.join(versions, "evil"))
+        gone = os.path.join(self.tmp, "gone")
+        os.symlink(versions, gone)   # the folder the binary ran from, now a symlink into versions
+        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(gone, "evil (deleted)")),
+                                             state))
+        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(gone, "evil")), state))
+        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=versions + "/../gone/evil")), state)
+        self.assertTrue(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(versions, "evil")), state))
+
+    def versions_file(self, text, mode=0o644):
+        """A CLAUDE_VERSIONS_FILE of the test's own holding `text`, put back when it ends."""
+        p = os.path.join(self.tmp, "claude-versions-" + str(len(os.listdir(self.tmp))))
+        with open(p, "w") as f:
+            f.write(text)
+        os.chmod(p, mode)
+        self.addCleanup(setattr, R, "CLAUDE_VERSIONS_FILE", R.CLAUDE_VERSIONS_FILE)
+        R.CLAUDE_VERSIONS_FILE = p
+        return p
+
+    def test_a_root_owned_versions_file_adds_one_root(self):
+        """Perms, 10-13: for a Claude installed outside ~/.local/share/claude/versions, "also accept one extra root
+        read from a root-owned file ... only if that file is owned by root and not group- or world-writable". ROOT_UID
+        is stubbed to this uid, so the test's own file stands in for a root-owned one."""
+        state = os.environ["CC_STATE"]
+        seat = os.path.join(state, "demo", "perms")
+        self.versions()
+        elsewhere = os.path.join(self.tmp, "opt-claude")
+        root = self.proc(seat, exe=os.path.join(elsewhere, "1.0.0"))
+        self.addCleanup(setattr, R, "ROOT_UID", R.ROOT_UID)
+        R.ROOT_UID = os.getuid()
+        self.versions_file(elsewhere + "\n")
+        self.assertEqual(R.extra_versions_root(), elsewhere)
+        self.assertTrue(R.perms_seat_caller("demo", 30, root, state))
+        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=elsewhere + "-x/1.0.0"), state))
+        for mode in (0o664, 0o646):   # group- or world-writable: names no root
+            self.versions_file(elsewhere + "\n", mode)
+            self.assertIsNone(R.extra_versions_root(), oct(mode))
+            self.assertFalse(R.perms_seat_caller("demo", 30, root, state), oct(mode))
+        self.versions_file("relative/dir\n")
+        self.assertIsNone(R.extra_versions_root())
+        link = os.path.join(self.tmp, "versions-link")
+        os.symlink(self.versions_file(elsewhere + "\n"), link)   # a symlink, even to a good file, is not followed
+        R.CLAUDE_VERSIONS_FILE = link
+        self.assertIsNone(R.extra_versions_root())
+        R.CLAUDE_VERSIONS_FILE = os.path.join(self.tmp, "absent")
+        self.assertIsNone(R.extra_versions_root())
+        self.assertFalse(R.perms_seat_caller("demo", 30, root, state))
+
+    def test_a_versions_file_not_owned_by_root_is_refused(self):
+        """The same file, owned by this uid and not by ROOT_UID (left at 0 here; or stubbed to another uid when the
+        suite runs as root), names no root: a seat could have written it."""
+        state = os.environ["CC_STATE"]
+        seat = os.path.join(state, "demo", "perms")
+        self.versions()
+        elsewhere = os.path.join(self.tmp, "opt-claude")
+        if os.getuid() == 0:
+            self.addCleanup(setattr, R, "ROOT_UID", R.ROOT_UID)
+            R.ROOT_UID = 1
+        self.versions_file(elsewhere + "\n")
+        self.assertIsNone(R.extra_versions_root())
+        self.assertFalse(R.perms_seat_caller("demo", 30, self.proc(seat, exe=os.path.join(elsewhere, "1.0.0")), state))
+        self.assertEqual(R.extra_versions_root(owner=os.getuid()), elsewhere)   # the control: owned as asked, it reads
 
     def test_a_cc_state_override_does_not_move_the_perms_seat(self):
         """The seat is found at the passwd home (PERMS_STATE) whatever CC_STATE says, in the environment or the

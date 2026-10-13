@@ -4237,6 +4237,11 @@ def run_selfcheck():
                                               [f"{BIN}/cc-notify", "-t", "myrepo needs a decision", "--ask"]]
           and all("--from" not in c for c in ran_na[:3])          # the seat is the daemon's word out there, never a caller's claim
           and ran_na[0][-1].startswith("deploy to prod or not?") and "C1" in ran_na[0][-1])
+    check("reply tool: …and the filed request TELLS the planning seat it is the owner's to answer — settle it or ask "
+          "him, never point it at another seat — because on 2026-09-30 such an ask went perms -> seat -> 'perms already "
+          "has it' and nobody asked him",
+          all(c[-1].endswith(OWNER_ASK_NOTE) for c in ran_na[:3]) and "perms included" in OWNER_ASK_NOTE
+          and "cc-notify --decision" in OWNER_ASK_NOTE)
     check("reply tool: …and the session is TOLD its escalation went to the planning seat and not to him, with the "
           "request id — a sender that believes it has reached him stops trying — while a cc-notify that did not take "
           "it says so instead of reading as filed; the reply itself is posted either way",

@@ -281,6 +281,10 @@ def security_reader(v):
 # The perms seat's state root, at the passwd home: never $HOME or $CC_STATE, which a caller sets (tests patch this).
 PERMS_STATE = os.path.join(C.PASSWD_HOME, ".cc", "state")
 CLAUDE_VERSIONS = os.path.join(C.PASSWD_HOME, ".local", "share", "claude", "versions")   # the claude binaries
+# One more versions root, for a Claude installed elsewhere: read only from this root-owned file, never from cc-config
+# or the environment, which a seat writes. The code never creates it; the owner does (tests patch this and ROOT_UID).
+CLAUDE_VERSIONS_FILE = "/etc/cc/claude-versions"
+ROOT_UID = 0
 PERMS_READS = "security-reads.json"
 
 
@@ -1556,16 +1560,43 @@ def _job_of(repo, pr):
     return job, facts
 
 
+def extra_versions_root(path=None, owner=None):
+    """The versions root named on the first line of `path` (CLAUDE_VERSIONS_FILE unless a test passes one), or None.
+    Perms, 10-13: accept it "only if that file is owned by root and not group- or world-writable" — a file a seat
+    could write, or a symlink to one, names no root. A missing or unreadable file, or a relative path, is None."""
+    try:
+        fd = os.open(path or CLAUDE_VERSIONS_FILE, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != (ROOT_UID if owner is None else owner) or st.st_mode & 0o022:
+            return None
+        line = os.read(fd, 4096).decode("utf-8", "replace").strip().split("\n")[0].strip()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return line if os.path.isabs(line) else None
+
+
 def is_claude_session(pid, proc="/proc", versions=None):
-    """True when pid is a real Claude session: its comm is `claude` AND its /proc/<pid>/exe resolves under
-    versions (CLAUDE_VERSIONS unless a test passes one). Perms, 10-13: any same-uid process can rewrite its own comm,
-    so "accept a process as the perms seat only when /proc/<pid>/exe resolves under ~/.local/share/claude/versions/
-    AND its comm is claude". A binary an update deleted reads "<path> (deleted)", still under versions."""
+    """True when pid is a real Claude session: its comm is `claude` AND its /proc/<pid>/exe is under a versions root
+    (CLAUDE_VERSIONS and extra_versions_root(), unless a test passes one). Perms, 10-13: any same-uid process can
+    rewrite its own comm, so "accept a process as the perms seat only when /proc/<pid>/exe resolves under
+    ~/.local/share/claude/versions/ AND its comm is claude". A binary an update deleted reads "<path> (deleted)",
+    still under versions. The exe is compared as the kernel printed it, never realpath'd: "realpath resolves the path
+    a second time through a filesystem the caller controls (a deleted folder replaced by a symlink to versions/
+    passes)"."""
     with open(os.path.join(proc, str(pid), "comm")) as f:
         if f.read().strip() != "claude":
             return False
-    exe = os.path.realpath(os.readlink(os.path.join(proc, str(pid), "exe")))
-    return exe.startswith(os.path.realpath(versions or CLAUDE_VERSIONS) + os.sep)
+    exe = os.readlink(os.path.join(proc, str(pid), "exe"))
+    if exe.endswith(" (deleted)"):
+        exe = exe[:-len(" (deleted)")]
+    exe = os.path.normpath(exe)   # a string operation: it reads no filesystem
+    roots = [versions] if versions else [CLAUDE_VERSIONS, extra_versions_root()]
+    return any(exe.startswith(r + os.sep) for v in roots if v for r in {os.path.normpath(v), os.path.realpath(v)})
 
 
 def claude_ancestor(pid=None, proc="/proc", versions=None):
