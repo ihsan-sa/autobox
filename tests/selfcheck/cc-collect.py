@@ -232,14 +232,43 @@ def selfcheck():
              and [r.get("source") for r in S if r["text"] == "dup"] == [None]
              and not os.path.exists(home("slack", "archive", "r", "C1", "backfill.jsonl")))
 
+        # backfill, thread parent before --since: its in-window reply is read; an ok:false body is an error, not 0 rows
+        def old_parent(method, token, **kw):
+            lo, hi = float(kw["oldest"]), float(kw["latest"])
+            if method == "conversations.history":
+                ms = [{"ts": "1767000000.0", "user": "UO", "text": "old", "reply_count": 2, "latest_reply": "1768046550.0"},
+                      {"ts": "1767000100.0", "user": "UO", "text": "quiet", "reply_count": 1, "latest_reply": "1767000200.0"}]
+                return {"messages": [m for m in ms if lo <= float(m["ts"]) < hi]}
+            return {"messages": [{"ts": kw["ts"], "user": "UO", "text": "p"},
+                                 {"ts": "1768046550.0", "user": "UO", "text": "late reply"},
+                                 {"ts": "1767000300.0", "user": "UO", "text": "early reply"}]}
+        rows, errs = backfill(old_parent, "tok", "UO", {"C1": "r"}, datetime(2026, 1, 10, tzinfo=timezone.utc),
+                              datetime(2026, 1, 11, tzinfo=timezone.utc), pause=0)
+        case("backfill follows a thread whose parent is before --since and keeps only its in-window reply",
+             [r["text"] for r in rows] == ["late reply"] and not errs)
+        rows, errs = backfill(lambda m, t, **kw: {"ok": False, "error": "missing_scope"}, "tok", "UO", {"C1": "r"},
+                              datetime(2026, 1, 10, tzinfo=timezone.utc), datetime(2026, 1, 11, tzinfo=timezone.utc), pause=0)
+        case("an ok:false body from the api names the chat as not read", not rows and errs.keys() == {"C1"})
+
+        # spend with columns this tool does not know, and a loop line that ends in DONE
+        _, idx, _ = run({"state/spend/2026-01-10.tsv": "#when\tcost\n" + f"{IN}\t1\n"})
+        case("a spend file no row of which matches the columns is named in missing",
+             any(m.startswith("state/spend (") for m in idx["missing"]))
+        _, _, got = run({"state/r/t/loop.log": f"{IN} STATUS: DONE\n{IN} track finished DONE\n"})
+        case("a loop line ending in DONE after other text counts as done", got["loops"][0]["done"] == 2)
+
         # the command itself: default name, latest link, a second run replaces, old ones pruned
         h = fx({"slack/outbox.log": ""})
         old = home("state", "improve", "snapshots", "2000-01-01")
         os.makedirs(old)
         os.utime(old, (time.time() - (KEEP_DAYS + 1) * 86400,) * 2)
         p1 = subprocess.run([sys.executable, __file__], capture_output=True, text=True, env={**os.environ, "HOME": h}, timeout=60)
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = default_name(datetime.now(timezone.utc).replace(microsecond=0))
         root = home("state", "improve", "snapshots")
+        at = lambda t: default_name(datetime.fromisoformat(t))
+        case("the default name is the window's midpoint day: 23:50 names its own day; 00:00 and a 00:05 catch-up the day before",
+             at("2026-10-12T23:50:00+00:00") == "2026-10-12" and at("2026-10-13T00:00:00+00:00") == "2026-10-12"
+             and at("2026-10-13T00:05:00+00:00") == "2026-10-12" and at("2026-10-13T12:00:01+00:00") == "2026-10-13")
         case("a default run writes <today>/, points latest at it and removes a snapshot written over 90 days ago",
              p1.returncode == 0 and os.readlink(os.path.join(root, "latest")) == today
              and os.path.exists(os.path.join(root, today, "index.json")) and not os.path.exists(old))

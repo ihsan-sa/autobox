@@ -32,7 +32,7 @@ WHAT IT READS (read-only, all under ~/.cc) and WHAT IT WRITES, one JSON line per
 Every text is cut to a fixed length and every file to a line cap that grows with the window's days (a file past it
 keeps its newest rows, and failures and spend their biggest), and what was cut is counted in index.json, so a day's snapshot stays small enough for one model pass without a subagent.
 
-WHERE. ~/.cc/state/improve/snapshots/<name>/, where <name> is the window's end date (UTC) for the default window
+WHERE. ~/.cc/state/improve/snapshots/<name>/, where <name> is the date (UTC) of the default window's midpoint
 and <since-date>..<until-date> for any other; a second run with the same name replaces it. `latest` points at the
 newest, and a snapshot written more than 90 days ago is removed. Times compare as the sources print them, to the second, UTC; a
 window holds its first second and not its last, so consecutive windows never both hold a row.
@@ -44,7 +44,8 @@ window holds its first second and not its last, so consecutive windows never bot
                         read the owner's own messages back from Slack's history with the box's existing bot token
                         (conversations.history and conversations.replies, nothing else) for every chat the box
                         knows, into ~/.cc/state/improve/slack-backfill.jsonl, which the snapshot reads beside the
-                        archive. The archive itself is never written. A chat the token cannot read is named and skipped
+                        archive. The archive itself is never written. A chat the token cannot read is named and skipped. A thread
+                        whose parent is up to 30 days before --since is followed when it has a reply in the window
   cc-collect selfcheck  fixtures in a HOME of its own, never this box's
 """
 import bisect
@@ -365,7 +366,7 @@ def g_loops(w, repos, outbox, missing):
                 if re.match(r"iter \d+ end ", rest):   # the space: "iter N ended with its own cc-green run still going" is the same iteration, not another
                     r["iters"] += 1
                     r["iter_errors"] += not re.search(r" rc=0 err=false", rest)
-                elif re.match(r"(STATUS: )?DONE\b|DONE$", rest):
+                elif re.match(r"(STATUS: )?DONE\b|.*\bDONE$", rest):
                     r["done"] += 1
                 elif re.match(r"iter \d+ ended with ", rest):
                     pass   # the loop waiting on the iteration's own cc-green run: not an exit, and must not push a real one out of the three
@@ -422,7 +423,7 @@ def g_handoffs(w, repos, outbox, missing):
 
 
 def g_spend(w, repos, outbox, missing):
-    agg, tracks, files = {}, {}, 0
+    agg, tracks, files, odd = {}, {}, 0, 0
     nums = ("in", "out", "cache_read", "cache_write")
     for day in w.dates():
         try:
@@ -438,6 +439,7 @@ def g_spend(w, repos, outbox, missing):
                     head = [c.lstrip("#") for c in p]
                     continue
                 if head is None or len(p) != len(head):
+                    odd += 1
                     continue
                 r = dict(zip(head, p))
                 if not w.has(r.get("ts", "")):
@@ -445,6 +447,7 @@ def g_spend(w, repos, outbox, missing):
                 try:
                     v = [int(r[k]) for k in nums] + [float(r.get("est_usd") or 0)]
                 except (KeyError, ValueError):
+                    odd += 1
                     continue
                 for tab, key in ((agg, (r.get("repo", ""), r.get("kind", ""), r.get("model", ""))),
                                  (tracks, (r.get("repo", ""), r.get("track", "")))):
@@ -453,6 +456,8 @@ def g_spend(w, repos, outbox, missing):
                     a["v"] = [x + y for x, y in zip(a["v"], v)]
     if not files:
         missing.append("state/spend")
+    elif odd and not agg:                      # cc-spend's columns changed under us: say so rather than report no spend
+        missing.append("state/spend (no row matched the #ts/session/.../est_usd columns)")
 
     def row(by, key, a):
         return {"by": by, **key, "sessions": len(a["sessions"]), **dict(zip(nums, a["v"][:4])), "usd": round(a["v"][4], 2)}
@@ -513,6 +518,12 @@ def prune_and_link(root, name):
     os.replace(tmp, os.path.join(root, "latest"))
 
 
+def default_name(until):
+    """The default 24 h window is named for the day that holds most of it, its midpoint: the 23:50 run names its own
+    day, and a catch-up run at boot just after midnight names the day before."""
+    return iso(until - timedelta(hours=12))[:10]
+
+
 def cmd_collect(argv):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     opts = parse_opts(argv, ("--since", "--until", "--out"))
@@ -522,7 +533,7 @@ def cmd_collect(argv):
         raise SystemExit("cc-collect: --since must be before --until")
     w = Window(since, until)
     default = "--since" not in opts and "--until" not in opts
-    name = w.until[:10] if default else f"{w.since[:10]}..{w.until[:10]}"
+    name = default_name(until) if default else f"{w.since[:10]}..{w.until[:10]}"
     root = home("state", "improve", "snapshots")
     out = opts.get("--out") or os.path.join(root, name)
     index = collect(w, out)
@@ -549,23 +560,33 @@ def parse_opts(argv, allowed):
 
 # ---- backfill ----------------------------------------------------------------------------------------------------
 
+LOOKBACK_DAYS = 30      # how far before --since a thread's parent is looked for, to catch replies that fall inside the window
+
 def backfill(api, token, owner, chats, since, until, pause=1.2):
     """The owner's messages in [since, until) from every chat in `chats` (id -> repo), via conversations.history and,
-    for a thread, conversations.replies. Returns (rows, {chat: error})."""
+    for a thread, conversations.replies. A thread whose parent is up to LOOKBACK_DAYS before `since` but has a reply
+    inside the window is followed too. Returns (rows, {chat: error})."""
     rows, errors = [], {}
     oldest, latest = str(since.timestamp()), str(until.timestamp())
 
-    def pages(method, **kw):
+    def pages(method, lo=oldest, hi=latest, **kw):
         cursor = None
         while True:
-            r = api(method, token, limit="200", oldest=oldest, latest=latest, **kw, **({"cursor": cursor} if cursor else {}))
+            r = api(method, token, limit="200", oldest=lo, latest=hi, **kw, **({"cursor": cursor} if cursor else {}))
+            if r.get("ok") is False:           # cc-slack's api raises on this; if it ever returned the body, still name the chat
+                raise RuntimeError(str(r.get("error") or "not ok"))
             yield from r.get("messages") or []
             cursor = ((r.get("response_metadata") or {}).get("next_cursor")) or None
             if not cursor:
                 return
             time.sleep(pause)
 
+    seen = set()
+
     def keep(m, chat):
+        if (chat, m.get("ts")) in seen or not since.timestamp() <= float(m.get("ts") or 0) < until.timestamp():
+            return
+        seen.add((chat, m.get("ts")))
         if m.get("user") == owner and not m.get("subtype") and not m.get("bot_id"):
             ts = m.get("ts", "")
             rows.append({"ts": ts, "thread_ts": m.get("thread_ts") or ts, "chat": chat, "channel": "", "user": owner,
@@ -577,6 +598,13 @@ def backfill(api, token, owner, chats, since, until, pause=1.2):
             for m in pages("conversations.history", channel=chat):
                 keep(m, chat)
                 if m.get("reply_count"):
+                    time.sleep(pause)
+                    for rm in pages("conversations.replies", channel=chat, ts=m["ts"]):
+                        if rm.get("ts") != m.get("ts"):
+                            keep(rm, chat)
+            early = str((since - timedelta(days=LOOKBACK_DAYS)).timestamp())
+            for m in pages("conversations.history", lo=early, hi=oldest, channel=chat):
+                if m.get("reply_count") and float(m.get("latest_reply") or 0) >= since.timestamp():
                     time.sleep(pause)
                     for rm in pages("conversations.replies", channel=chat, ts=m["ts"]):
                         if rm.get("ts") != m.get("ts"):
@@ -612,6 +640,8 @@ def cmd_backfill(argv):
     if "--since" not in opts or "--until" not in opts:
         raise SystemExit("cc-collect backfill-slack: --since and --until are both required")
     since, until = parse_when(opts["--since"], now), parse_when(opts["--until"], now)
+    if since >= until:
+        raise SystemExit("cc-collect backfill-slack: --since must be before --until")
     sl = load_slack()
     cfg = sl.load_cfg()
     token, owner = cfg.get("SLACK_BOT_TOKEN"), cfg.get("SLACK_OWNER_ID")
