@@ -607,6 +607,56 @@ class Tree(Env):
         with self.assertRaises(RUN.G.GitError):
             RUN.G.objects_dir(wt)
 
+    def test_a_ref_under_a_symlinked_directory_is_never_read(self):
+        # #1078's security read: _ref opened the ref O_NOFOLLOW, which covers its last component only, so a worker's
+        # <admin>/refs/worktree (or a dir under the common refs/) made a link sent the read to a file elsewhere
+        wt, gd, base, marks, filt = self.hostile()
+        t = RUN.G.host_tree(wt)
+        other = git(self.repo, "commit-tree", "-m", "o", f"{base}^{{tree}}")
+        out = os.path.join(self.tmp, "elsewhere")
+        write(out, {"x": other + "\n"})
+        for top, ref in ((gd, "refs/worktree/x"), (t.common, "refs/heads/evil/x")):
+            with self.subTest(ref):
+                d = os.path.join(top, os.path.dirname(ref))
+                write(d, {"x": other + "\n"})   # kept: the same ref in a real directory is read
+                self.assertEqual(RUN.G._ref(t, ref), other)
+                shutil.rmtree(d)
+                os.symlink(out, d)   # suppressed: the directory a link to one elsewhere
+                with open(os.path.join(top, ref)) as f:
+                    self.assertEqual(f.read().strip(), other)   # the plant is real
+                self.assertEqual(RUN.G._ref(t, ref), "")
+                os.unlink(d)
+        os.symlink(out, os.path.join(gd, "refs", "worktree"))   # a symbolic HEAD names it: refused at the link too
+        write(gd, {"HEAD": "ref: refs/worktree/x\n"})
+        self.assertEqual(RUN.G._ref(t, "HEAD"), "")
+
+    def test_a_rewritten_loose_commit_does_not_move_the_merge_base(self):
+        # #1078's security read: the worker writes the host's objects, and merge-base ran FENCED on them, so its own
+        # commit's loose file rewritten under the old name with main's tip as parent moved check's base onto main.
+        # Not the tip: git re-hashes the object a name resolves to, but not the parents a history walk opens
+        import zlib
+        wt, gd, base, marks, filt = self.hostile()
+        git(wt, "commit", "-q", "--allow-empty", "-m", "c1")
+        c1 = git(wt, "rev-parse", "HEAD")
+        git(wt, "commit", "-q", "--allow-empty", "-m", "c2")
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", "m1")
+        c2, m1 = git(wt, "rev-parse", "HEAD"), git(self.repo, "rev-parse", "HEAD")
+        main = git(self.repo, "symbolic-ref", "--short", "HEAD")
+        t = RUN.G.host_tree(wt)
+        self.assertEqual(RUN.G.merge_base(t, "HEAD", main), base)   # kept: the honest objects give the honest base
+        self.assertEqual(CK.default_base(wt), base)
+        body = git(wt, "cat-file", "commit", c1).replace(f"parent {base}", f"parent {m1}", 1).encode() + b"\n"
+        loose = os.path.join(t.common, "objects", c1[:2], c1[2:])
+        os.chmod(loose, 0o644)
+        with open(loose, "wb") as f:
+            f.write(zlib.compress(b"commit %d\0" % len(body) + body))
+        self.assertEqual(git(self.repo, "merge-base", c2, m1), m1)   # the plant is real: git takes the forged parent
+        with RUN.G.fenced(t, bare=True) as env:   # and so did the FENCED reader merge_base ran in
+            self.assertEqual(subprocess.run(["git", "merge-base", c2, m1], cwd=env["GIT_DIR"], env=env, text=True,
+                                            capture_output=True).stdout.strip(), m1)
+        self.assertEqual(RUN.G.merge_base(t, "HEAD", main), "")   # suppressed: the sealed fetch re-hashes it
+        self.assertEqual(CK.default_base(wt), "")
+
     def test_an_objects_session_that_outlives_its_timer_fails_closed(self):
         wt, gd, base, marks, filt = self.hostile()
         with mock.patch.object(RUN.G, "OBJECTS_SECS", 0.05):

@@ -63,8 +63,8 @@ def _opts(argv, flags, multi=("--only",), bools=()):
 
 def default_base(wt: str) -> str:
     """The merge-base of the tree's HEAD and the first of origin's HEAD, origin/main, main and master it names, by
-    git.merge_base: every ref read as files and git run in a bare scratch git dir, so no git opens the worker's
-    config.worktree (an include.path FIFO there hung `merge-base` run in the tree) or lets it steer the base."""
+    git.merge_base: every ref read as files and merge-base run sealed, so no git opens the worker's config.worktree
+    (an include.path FIFO there hung `merge-base` run in the tree) and no object it rewrote steers the base."""
     t = G.host_tree(wt)
     for ref in ("refs/remotes/origin/HEAD", "refs/remotes/origin/main", "main", "master"):
         b = G.merge_base(t, "HEAD", ref)

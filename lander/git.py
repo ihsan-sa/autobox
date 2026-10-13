@@ -480,8 +480,9 @@ def has_workflows(root, rev) -> bool:
 
 # git on a worktree someone else wrote (`lander check` on a fenced worker's tree): no git runs with GIT_DIR its admin
 # dir, whose config.worktree the worker can rewrite after host_tree looked (an include.path FIFO hung merge-base and
-# cat-file there). Its refs are read as files (_ref, _name); merge-base, rev-parse and cat-file run in a bare FENCED
-# reader on the host's objects (merge_base, Objects); indexing and hashing its files run FENCED (worktree_tree,
+# cat-file there). Its refs are read as files (_ref, _name), with no link followed in any component (_small_in);
+# rev-parse and cat-file run in a bare FENCED reader on the host's objects (_name, Objects); merge-base runs sealed
+# (merge_base), since a worker writes those objects; indexing and hashing its files run FENCED (worktree_tree,
 # fenced_names); sealed() fetches from the host's common dir. Each has a timeout.
 
 
@@ -574,10 +575,10 @@ def at(root) -> dict:
     return pin(taken(root))
 
 
-def _small(path, cap=4096):
+def _small(path, cap=4096, dir_fd=None):
     """A regular file's first `cap` bytes as text, or None: a link is not followed and a FIFO is never waited on."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=dir_fd)
     except OSError:
         return None
     try:
@@ -590,6 +591,30 @@ def _small(path, cap=4096):
                 break
             got += b
         return got.decode("utf-8", "surrogateescape")
+    finally:
+        os.close(fd)
+
+
+def _small_in(top, rel, cap=4096):
+    """_small(top/rel) with no link followed in any component, top's own last one included: O_NOFOLLOW alone covers
+    only the file's own name, so a worker's <admin>/refs/worktree made a link to a dir elsewhere had the lander read
+    a ref out of that dir. Each directory is opened O_NOFOLLOW at the one before it (an openat walk), so a component
+    swapped for a link between two steps is refused too. None on any doubt, a "", "." or ".." component as well."""
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    try:
+        fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except (OSError, ValueError):
+        return None
+    try:
+        for p in parts[:-1]:
+            nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return _small(parts[-1], cap, dir_fd=fd)
+    except (OSError, ValueError):
+        return None
     finally:
         os.close(fd)
 
@@ -663,9 +688,9 @@ def _ref(t: Tree, ref: str) -> str:
         if ref != "HEAD" and not REF_RE.fullmatch(ref):
             return ""
         own = ref == "HEAD" or ref.startswith(PER_WORKTREE)
-        v = _small(os.path.join(t.git_dir if own else t.common, ref))
+        v = _small_in(t.git_dir if own else t.common, ref)
         if v is None and not own:   # a ref packed away: `<id> <name>` lines, a peeled `^<id>` after a tag
-            packed = _small(os.path.join(t.common, "packed-refs"), 1 << 26) or ""
+            packed = _small_in(t.common, "packed-refs", 1 << 26) or ""
             v = next((ln[:40] for ln in packed.splitlines() if ln[41:] == ref and ln[40:41] == " "), None)
         if v is None:
             return ""
@@ -690,7 +715,7 @@ def fenced(t: Tree, bare=False):
             os.mkdir(os.path.join(d, n))
         config = FENCE_CONFIG.replace("bare = false", "bare = true") if bare else FENCE_CONFIG
         for n, body in (("HEAD", "ref: refs/heads/fence\n"), ("config", config),
-                        ("info/exclude", _small(os.path.join(t.common, "info", "exclude"), 1 << 20) or "")):
+                        ("info/exclude", _small_in(t.common, "info/exclude", 1 << 20) or "")):
             with open(os.path.join(d, n), "w", encoding="utf-8", errors="surrogateescape") as f:
                 f.write(body)
         env = hookless_env(GIT_DIR=d, GIT_OBJECT_DIRECTORY=os.path.join(t.common, "objects"),
@@ -726,16 +751,17 @@ def _name(t: Tree, env, rev, sh=None):
 
 def merge_base(t: Tree, a, b) -> str:
     """The merge-base of a and b (names or ids) in Tree t, or "" when there is none or git cannot say: each name is
-    read by _name and merge-base runs in a bare FENCED reader, so git opens no config of t's and finds no replace
-    ref, graft or commit-graph of the checkout's."""
+    read by _name and merge-base runs sealed(), so git opens no config of t's and finds no replace ref, graft or
+    commit-graph of the checkout's. Sealed, not FENCED: a worker writes the host's objects, so a loose commit it
+    rewrote under its old name (with new parents) moved the merge-base, and with it the base `lander check` plans
+    on. The fetch re-hashes every object, so such a file fails it and the answer is ""."""
     if t.refused:
         return ""
-    with fenced(t, bare=True) as env:
-        ids = [_name(t, env, r) for r in (a, b)]
-        if any(rc for rc, _ in ids):
+    with sealed(t.work_tree, a, b) as ((rc, out), run):
+        if run is None:
             return ""
-        rc, out = _sh(["git", "merge-base", *(i for _, i in ids)], cwd=env["GIT_DIR"], env=env, timeout=120)
-    return out.strip() if rc == 0 and SHA_RE.fullmatch(out.strip()) else ""
+        rc, mb = run("merge-base", *out)
+    return mb.strip() if rc == 0 and SHA_RE.fullmatch(mb.strip()) else ""
 
 
 def worktree_tree(t: Tree) -> str:
